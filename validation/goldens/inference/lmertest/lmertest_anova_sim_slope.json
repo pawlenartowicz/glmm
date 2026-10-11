@@ -1,0 +1,89 @@
+{
+  "r_formula": "y ~ 1 + x + (1 + x | g1) + (1 | g2)",
+  "reml": true,
+  "boundary": "none",
+  "twin": "lmertest_sim_slope",
+  "assign": [0, 1],
+  "assign_names": ["(Intercept)", "x"],
+  "term_labels": ["x"],
+  "type3": {
+    "terms": ["x"],
+    "sum_sq": [12.5925589232919],
+    "mean_sq": [12.5925589232919],
+    "NumDF": [1],
+    "DenDF": [17.7042264843871],
+    "F": [22.0240662101699],
+    "p_value": [0.00018890825727692],
+    "hypotheses": [
+      {
+        "term": "x",
+        "L": [
+          [0, 1]
+        ],
+        "row_names": ["x"],
+        "col_names": ["(Intercept)", "x"]
+      }
+    ],
+    "DenDF_second": [
+      [17.704226472355, 17.704226492674]
+    ]
+  },
+  "type2": {
+    "terms": ["x"],
+    "sum_sq": [12.5925589232919],
+    "mean_sq": [12.5925589232919],
+    "NumDF": [1],
+    "DenDF": [17.7042264843871],
+    "F": [22.0240662101699],
+    "p_value": [0.00018890825727692],
+    "hypotheses": [
+      {
+        "term": "x",
+        "L": [
+          [0, 1]
+        ],
+        "row_names": ["x"],
+        "col_names": ["(Intercept)", "x"]
+      }
+    ],
+    "DenDF_second": [
+      [17.704226472355, 17.704226492674]
+    ]
+  },
+  "fd_settings": [
+    {
+      "hessian_d": 0.05,
+      "jacobian_d": 5e-05,
+      "r": 4
+    },
+    {
+      "hessian_d": 0.2,
+      "jacobian_d": 0.0002,
+      "r": 4
+    }
+  ],
+  "conditions": [],
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_lmertest.R"
+  },
+  "name": "lmertest_anova_sim_slope"
+}

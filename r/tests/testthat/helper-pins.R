@@ -6,9 +6,10 @@
 # a different build of the same sources. It is the crate kernel's measured
 # cross-architecture band for the iterative fit paths.
 #
-# One number, three homes: TOL$ci_ref_rel in the grid's tolerance table, the
-# CI_REF_REL constant in the crate's own reference check, and this one. Change
-# all three together. The grid's table carries the measurement.
+# One number, four homes: TOL$ci_ref_rel in the grid's tolerance table, the
+# CI_REF_REL constant in the crate's own reference check, _CONFINT_PIN_REL in
+# the Python port's tests (python/tests/test_warnings.py), and this one. Change
+# all four together. The grid's table carries the measurement.
 #
 # Never widened to turn a red run green. A pin outside this band means the
 # answer moved or the band does not cover the machine, and both are reported,

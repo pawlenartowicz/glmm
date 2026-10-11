@@ -1,0 +1,89 @@
+{
+  "r_formula": "Reaction ~ 1 + Days + (1 + Days | Subject)",
+  "reml": false,
+  "boundary": "none",
+  "twin": "lmertest_sleepstudy_ml",
+  "assign": [0, 1],
+  "assign_names": ["(Intercept)", "Days"],
+  "term_labels": ["Days"],
+  "type3": {
+    "terms": ["Days"],
+    "sum_sq": [31798.0502886292],
+    "mean_sq": [31798.0502886292],
+    "NumDF": [1],
+    "DenDF": [18.0001769285147],
+    "F": [48.5506661220524],
+    "p_value": [1.65222790511593e-06],
+    "hypotheses": [
+      {
+        "term": "Days",
+        "L": [
+          [0, 1]
+        ],
+        "row_names": ["Days"],
+        "col_names": ["(Intercept)", "Days"]
+      }
+    ],
+    "DenDF_second": [
+      [18.0001771651879, 18.0001769535256]
+    ]
+  },
+  "type2": {
+    "terms": ["Days"],
+    "sum_sq": [31798.0502886292],
+    "mean_sq": [31798.0502886292],
+    "NumDF": [1],
+    "DenDF": [18.0001769285147],
+    "F": [48.5506661220524],
+    "p_value": [1.65222790511593e-06],
+    "hypotheses": [
+      {
+        "term": "Days",
+        "L": [
+          [0, 1]
+        ],
+        "row_names": ["Days"],
+        "col_names": ["(Intercept)", "Days"]
+      }
+    ],
+    "DenDF_second": [
+      [18.0001771651879, 18.0001769535256]
+    ]
+  },
+  "fd_settings": [
+    {
+      "hessian_d": 0.05,
+      "jacobian_d": 5e-05,
+      "r": 4
+    },
+    {
+      "hessian_d": 0.2,
+      "jacobian_d": 0.0002,
+      "r": 4
+    }
+  ],
+  "conditions": [],
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_lmertest.R"
+  },
+  "name": "lmertest_anova_sleepstudy_ml"
+}

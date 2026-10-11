@@ -131,6 +131,12 @@ fit = glmm.fit(data, "s ~ x1 + (1 | group)", "binomial", link="probit", nagq=7)
   The formula also accepts an `offset(expr)` term (see
   [`formula.md`](formula.md)); passing both this argument and a formula
   `offset()` term is an error asking you to use one.
+- `satterthwaite`: `True` (default) computes lmerTest's Satterthwaite degrees
+  of freedom for a Gaussian mixed model's t tests, in one pass after the fit.
+  `False` skips that pass: the summary then tests with z and says "df not
+  computed (satterthwaite=False)", `fit.confint()` gives normal intervals, and
+  `fit.df_method` is `"disabled"`. OLS and the gamma and inverse-gaussian GLMs
+  keep their residual df `n − p` whatever it says; no other family reads it.
 
 **Error vs. warning.** An *invalid* value — unknown family, a link the family
 doesn't offer, even `nagq` (`ValueError`), a non-dict `warm_start`
@@ -151,12 +157,16 @@ them). It is returned by `fit`, never constructed by callers.
 |---|---|
 | `beta` | `(p,)` fixed-effect estimates |
 | `se` | `(p,)` standard errors; `NaN` where unavailable |
+| `coef_df` | `(p,)` degrees of freedom of each coefficient's t test: lmerTest's Satterthwaite df on a Gaussian mixed model, `n − p` on OLS and on a gamma or inverse-gaussian GLM with φ estimated; `NaN` where the test is z, on aliased columns, and on an OLS or dispersion-GLM fit that did not converge. Not `df`, which is the AIC parameter count |
+| `coef_p` | `(p,)` two-sided p-value of that t test, computed by the kernel; `NaN` where there is no df |
+| `df_method` | where `coef_df` comes from: `"satterthwaite"`, `"residual"` (OLS and the dispersion GLMs), `"none"` (the families with no df: z), `"disabled"` (a Gaussian mixed model fitted with `satterthwaite=False`: z) or `"failed"` (its Satterthwaite pass failed: z, with a `SatterthwaiteCurvatureWarning`) |
+| `rss`, `r_squared`, `adj_r_squared` | OLS only: the weighted residual sum of squares and `summary.lm`'s multiple and adjusted R² (0 on an intercept-only model); `NaN` on every other fit and on a non-converged one |
 | `vcov` | `(p, p)` full Cov(β̂) — `se` is the sqrt of its diagonal; use it for contrasts/confidence intervals, where the off-diagonals matter |
 | `names` | coefficient names, aligned with `beta` |
 | `aliased` | `(p,)` bool — rank-deficient columns dropped (lme4's `NA` coefficients) |
 | `varcorr` | per grouping, in the order the groupings appear in the formula (lme4 instead sorts by decreasing number of levels): vech-packed lower-triangular RE covariance D̂ |
 | `tau2` | legacy per-element RE variances (q=1 only) — prefer `varcorr` |
-| `stddev_se` | SE of each RE stddev, θ layout (not beta-aligned): at the stddev's diagonal slot, `NaN` at the off-diagonal slots and where unavailable |
+| `stddev_se` | SE of each RE stddev, θ layout (not beta-aligned): at the stddev's diagonal slot, `NaN` at the off-diagonal slots and where unavailable; not printed by `summary()` |
 | `dispersion` | φ (gamma / inverse-gaussian) / θ (negbin) / residual σ² (gaussian) / 1.0 (binomial, poisson) |
 | `re_groups` | per grouping, in `varcorr` order (formula order): `(name, [term names])` — what `summary()` labels the RE block with |
 | `n_eval` | optimizer objective evaluations (0 on the closed-form/IRLS paths) |
@@ -206,18 +216,48 @@ it cannot answer anything about two coefficients jointly. A contrast like
 β₁ − β₂ needs `Var(β₁) + Var(β₂) − 2·Cov(β₁, β₂)`, and that covariance lives
 only in `vcov`. Both are `NaN` in the same places.
 
-`summary()` builds the coefficient table — **name, estimate, std. error, z,
-p** — prints it, and returns it as a string. Aliased columns show `NaN`
-estimates, as lme4 prints `NA`. A footer carries `dispersion`,
-`converged` and `singular`, and when `varcorr` is non-empty an RE block shows each grouping
-by name with its per-term stddev / correlation (lme4's `VarCorr` layout) and
-`stddev_se` alongside where populated (the names come from `re_groups`). When the fit
-raised any warnings, the text summary ends with a `Warnings:` section listing each one's
-tier, title and message; the HTML, LaTeX and Typst renderers do not include it. The z/p
-columns are derived in Python from `beta`/`se` as a
-Wald test (`z = beta/se`, `p = 2·(1 − Φ(|z|))`); Wald-z (not t) matches the
-GLM/GLMM convention and the absence of a residual-df field on the kernel
-output.
+`summary()` builds the coefficient table, prints it, and returns it as a
+string. Its test follows lmerTest, `lm` and `glm`:
+
+- **Gaussian mixed model:** `Estimate`, `Std. Error`, `df`, `t value`,
+  `Pr(>|t|)`, with each coefficient's Satterthwaite df (`coef_df`) and the
+  kernel's p (`coef_p`), on lmerTest's layout. The footer says "t tests use
+  Satterthwaite degrees of freedom (finite-difference θ-Hessian).".
+- **OLS, and gamma or inverse-gaussian GLMs with φ estimated:** `t value` and
+  `Pr(>|t|)` on the residual df `n − p`, printed in the footer (on OLS as
+  `summary.lm`'s "Residual standard error: … on n − p degrees of freedom" and
+  its R² line).
+- **Everything else** (binomial, Poisson, negative binomial, a held
+  dispersion, every GLMM): `z value` and `Pr(>|z|)`, a Wald test on the
+  normal, as `glm` and `glmer` print. A Gaussian mixed model fitted with
+  `satterthwaite=False`, or one whose pass failed, is tested with z too; the
+  first says "df not computed (satterthwaite=False)" in the footer.
+
+```python
+fit = glmm.fit(data, "y ~ x1 + (1 | group)")
+fit.summary()     # Estimate, Std. Error, df, t value, Pr(>|t|)
+fit.coef_df       # the df column, aligned with fit.names
+fit.coef_p        # the Pr(>|t|) column
+
+fit.confint()            # (p, 2) array of 95% bounds, rows in fit.names order
+fit.confint(level=0.9)   # any level strictly between 0 and 1
+```
+
+`confint(level=0.95)` follows `summary()` coefficient by coefficient: the t
+quantile on the row's `coef_df` where the summary tests with t, the normal
+quantile where it tests with z. It returns a plain `(p, 2)` array (lower,
+upper) in the order of `names`, with no `parm` argument; index the rows you
+want. Aliased coefficients give `NaN` rows. The R port's `confint()` computes
+the same intervals through the same kernel function.
+
+Aliased columns show `NaN` estimates, as lme4 prints `NA`. A footer carries
+`dispersion`, `converged` and `singular`, and when `varcorr` is non-empty an
+RE block shows each grouping by name with its per-term variance, stddev and
+correlation (lme4's `VarCorr` layout; the names come from `re_groups`).
+`stddev_se` is not printed; read it off the fit. When the fit raised any
+warnings, the text summary ends with a `Warnings:` section listing each one's
+tier, title and message; the HTML, LaTeX and Typst renderers do not include
+it.
 
 To work with a grouping's covariance numerically rather than as printed text,
 `stddev_corr(group_idx)` splits its vech-packed block into a `(q,)` stddev

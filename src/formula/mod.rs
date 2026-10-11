@@ -40,12 +40,18 @@
 //! `default-features = false` and link no `regex`.
 
 mod error;
+pub(crate) mod hypotheses;
 mod materialize;
 mod parse;
+
+#[cfg(all(test, feature = "oracle-tests"))]
+mod hypotheses_oracle_tests;
+#[cfg(test)]
+pub(crate) mod hypotheses_tests;
 
 pub use error::{Error, ParseError};
 pub use materialize::{
     label_ranef, lower, materialize, numeric_only_columns, referenced_columns, unresolved_columns,
-    Column, Lowered, RanefBlock, ReGroupInfo, Table,
+    Column, FixedTerm, Lowered, RanefBlock, ReGroupInfo, Table,
 };
 pub use parse::{parse, ParsedFormula, RandomEffect, Term};

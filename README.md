@@ -78,7 +78,7 @@ README's own copy of the essentials, not the whole set.
 | [`documentation/installation.md`](documentation/installation.md) | Installing the Rust crate, Python package, and R package |
 | [`documentation/formula.md`](documentation/formula.md) | What the formula parser accepts and rejects, with workarounds |
 | [`documentation/conventions.md`](documentation/conventions.md) | Estimation, standard-error, dispersion, and variance-component conventions, and the flags on a fit result |
-| [`documentation/validation.md`](documentation/validation.md) | How glmm is validated: the accuracy grid, its four pinned oracles, the four gates, and what's covered |
+| [`documentation/validation.md`](documentation/validation.md) | How glmm is validated: the accuracy grid, its four pinned oracles, the five gates, and what's covered |
 | [`documentation/coming-from-lme4.md`](documentation/coming-from-lme4.md) | Call mapping from lme4, what's deliberately missing, and behavioral differences to watch (covers both the R and Python surface) |
 | [`documentation/coming-from-statsmodels.md`](documentation/coming-from-statsmodels.md) | Migrating from `statsmodels` `MixedLM`/`GLM` to `glmm.fit` (Python only) |
 | [`documentation/troubleshooting.md`](documentation/troubleshooting.md) | Fixes for singular fits, non-convergence, NotImplementedError, and rejected formulas |
@@ -87,7 +87,7 @@ README's own copy of the essentials, not the whole set.
 
 ```rust
 use glmm::formula::{lower, Column, Table};
-use glmm::{fit_cold, BinomialLink, Family, FitOptions};
+use glmm::{fit_cold, BinomialLink, Family};
 
 let table = Table {
     columns: vec![
@@ -112,7 +112,8 @@ let lmm = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
 // GLMM: binomial with a probit link, 7-node adaptive quadrature
 let probit = Family::Binomial { link: BinomialLink::Probit };
 let lo = lower("passed ~ x1 + (1 | school)", &table, probit)?;
-let opts = FitOptions { nagq: 7, ..lo.opts };
+let mut opts = lo.opts.clone();
+opts.nagq = 7;
 let glmm = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &opts);
 
 println!("{:?} {:?}", glmm.beta, glmm.se);           // estimates and standard errors

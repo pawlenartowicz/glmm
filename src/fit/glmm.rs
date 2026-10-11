@@ -124,6 +124,8 @@ pub(super) fn degenerate_glmm_fit(p: usize, n_theta: usize) -> Fit {
         fitted: vec![],
         ranef: vec![],
         ranef_levels: vec![],
+        coef_df: vec![f64::NAN; p],
+        satterthwaite: None,
     }
 }
 
@@ -1107,6 +1109,8 @@ pub(crate) fn glmm_view_to_fit(
         fitted,
         ranef,
         ranef_levels,
+        coef_df: vec![f64::NAN; p],
+        satterthwaite: None,
     };
     // A capped (`MaxFunReached`) endpoint is reported as a point, not an
     // accepted optimum, even though `varcorr` is now finite there — so the

@@ -201,7 +201,8 @@ glmmTMB, GLMMadaptive and R's own `glm` references.
 ## Limits
 
 The trade is inference machinery and breadth: no `predict`, no
-profile/bootstrap CIs, no small-sample df corrections; fewer families than
+profile/bootstrap CIs, no small-sample df beyond Satterthwaite's for Gaussian
+mixed models (no Kenward-Roger); fewer families than
 glmmTMB/GLMMadaptive; REML-only LMMs; and past a few dozen θ parameters,
 gradient-based engines are expected to win. For one interactive model on one
 dataset, lme4 or its neighbours remain the right tool.

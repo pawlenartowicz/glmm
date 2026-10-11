@@ -190,7 +190,8 @@ impl FitView<'_> {
                         Note::NbShapeUnsettled { .. }
                         | Note::UnusedGroupingLevels { .. }
                         | Note::NonIntegerResponse { .. }
-                        | Note::SingleLevelGroupingDropped { .. } => {}
+                        | Note::SingleLevelGroupingDropped { .. }
+                        | Note::SatterthwaiteCurvature { .. } => {}
                     }
                 }
                 d
@@ -483,6 +484,9 @@ pub struct FitWorkspace {
     /// `opts.target_indices.len()`: the OLS/GLM result slots are sized off it, so
     /// a later call asking for more targets would overrun them.
     n_targets: usize,
+    /// The last `fit_on` call's `opts.target_indices`, refilled in place (the
+    /// count is frozen at build): [`satterthwaite`] fills these columns.
+    targets: Vec<u32>,
     has_weights: bool,
     has_offset: bool,
     parallel_inner: bool,
@@ -677,6 +681,14 @@ impl FitWorkspace {
     pub(crate) fn is_glmm(&self) -> bool {
         matches!(self.kind, FitKind::Glmm { .. })
     }
+    /// The LMM workspace and this draw's column map, for tests that read what
+    /// a fit left there. `None` on every non-LMM workspace.
+    pub(crate) fn lmm_parts(&mut self) -> Option<(&mut LmmWorkspace, &ColumnScaling)> {
+        match &mut self.kind {
+            FitKind::Lmm { ws, .. } => Some((ws, &self.scaling)),
+            _ => None,
+        }
+    }
     pub(crate) fn is_prebuilt(&self) -> bool {
         matches!(self.kind, FitKind::Prebuilt(_))
     }
@@ -837,6 +849,7 @@ pub fn build_workspace(
         build_extra_capacity,
         nagq: opts.nagq,
         n_targets: t,
+        targets: opts.target_indices.clone(),
         has_weights: opts.weights.is_some(),
         has_offset: opts.offset.is_some(),
         parallel_inner: opts.parallel_inner,
@@ -919,6 +932,132 @@ pub fn curvature_hint(ws: &mut FitWorkspace) -> Option<CurvatureHint> {
     }
 }
 
+/// The Satterthwaite df of each target coefficient of the last fit on `ws`,
+/// into `df_out` (length `p`, NaN off the last `fit_on` call's
+/// `target_indices`): the stable path's [`Fit::coef_df`], run on demand. Call
+/// it after [`fit_on`] or [`fit_on_hinted`], with the view dropped; nothing
+/// runs it otherwise. It reads θ̂ and never writes it, and it leaves the
+/// kernel's factor and `σ̂²` off θ̂, at its last stencil point, as
+/// [`curvature_hint`] does, so the two give the same answers in either order
+/// and the next `fit_on` refits from scratch. The pass's buffers live on the
+/// workspace, built on the first call, so each later call allocates only the
+/// pseudo-inverse's blocks: the same count whichever variance parameters the
+/// draw pins at zero while at least one stays free, and none when the draw
+/// pins them all (its df is then ν). On a rank-deficient draw the df are as
+/// untrustworthy as β̂ (they can be finite on aliased columns, where the
+/// stable path refits the reduced design and gives NaN): read
+/// `ill_conditioned` off [`FitView::diagnostics`] first, as for [`fit_on`].
+///
+/// # Errors
+///
+/// `df_out` is then all NaN: [`NoDfReason::NotGaussianMixed`] on any
+/// workspace but a Gaussian LMM's (OLS included); [`NoDfReason::Failed`]
+/// when the pass failed (a stencil deviance, `C` or `σ̂²` not finite) or the
+/// fit had no finite endpoint to run it at.
+///
+/// # Panics
+///
+/// When `df_out.len()` is not the workspace's `p`, or when `ws` is a sparse
+/// Gaussian LMM's and no `fit_on` has run on it. A dense one no `fit_on` has
+/// filled gives [`NoDfReason::Failed`], as a fit with no endpoint does.
+///
+/// [`NoDfReason::NotGaussianMixed`]: crate::inference::contrast::NoDfReason::NotGaussianMixed
+/// [`NoDfReason::Failed`]: crate::inference::contrast::NoDfReason::Failed
+pub fn satterthwaite(
+    ws: &mut FitWorkspace,
+    df_out: &mut [f64],
+) -> Result<(), crate::inference::contrast::ContrastError> {
+    use crate::inference::contrast::{ContrastError, NoDfReason};
+    assert_eq!(
+        df_out.len(),
+        ws.p,
+        "satterthwaite: df_out.len() must be the workspace's p"
+    );
+    df_out.fill(f64::NAN);
+    let FitKind::Lmm { ws: lmm, .. } = &mut ws.kind else {
+        return Err(ContrastError::NoDf(NoDfReason::NotGaussianMixed));
+    };
+    // β̂ holds a NaN whenever `fit_lmm` found no finite endpoint (it NaN-fills
+    // β̂ there), the case the stable path records as a failed pass without
+    // running one. `n_rows ≤ p` (a dense `p = 0` design accumulates no rows,
+    // and neither does a workspace no `fit_on` has filled) has no endpoint
+    // either, and the pass's `N − p` would wrap there in a release build.
+    if lmm.recovery.betas.iter().any(|b| b.is_nan())
+        || lmm.kernel.n_rows() <= lmm.recovery.betas.len()
+    {
+        return Err(ContrastError::NoDf(NoDfReason::Failed));
+    }
+    if !crate::lmm::satterthwaite::pass_targets(lmm, &ws.scaling, &ws.targets, df_out) {
+        return Err(ContrastError::NoDf(NoDfReason::Failed));
+    }
+    Ok(())
+}
+
+/// The stable path's Satterthwaite step, run by `fit_warm` right after
+/// [`FitView::into_fit`] while `ws` still holds the fit's kernel: on a
+/// Gaussian LMM workspace it stores the switched-off record when
+/// `opts.satterthwaite` is `false`; otherwise, when the fit has a finite
+/// deviance, it runs the pass at θ̂, fills [`Fit::coef_df`] on the target
+/// columns, stores the state and pushes [`Note::SatterthwaiteCurvature`] when
+/// [`curvature_note`] says so; without one, it records a failed pass
+/// ([`record_failed_pass`]). A no-op on every other workspace kind. It
+/// writes no other field of `fit`.
+pub(crate) fn attach_satterthwaite(ws: &mut FitWorkspace, fit: &mut Fit, opts: &FitOptions) {
+    use crate::lmm::satterthwaite::{pass, SatterthwaiteState};
+    let FitKind::Lmm { ws: lmm, .. } = &mut ws.kind else {
+        return;
+    };
+    if !opts.satterthwaite {
+        fit.satterthwaite = Some(SatterthwaiteState::switched_off());
+        return;
+    }
+    // A finite deviance is the fit's re-evaluation at `ws.theta`, the θ̂ the
+    // pass runs at (a `MaxFunReached` endpoint included), and the one place
+    // `beta_tilde` is written, so the pass's response shift uses this fit's
+    // β̂. A NaN-filled fit (no endpoint, or a non-finite re-evaluation there)
+    // has neither: no pass runs, and the fit records a failed one.
+    if !fit.deviance.is_finite() {
+        record_failed_pass(fit);
+        return;
+    }
+    let state = pass(lmm, &ws.scaling);
+    let df = state.coef_df();
+    for &t in &opts.target_indices {
+        fit.coef_df[t as usize] = df[t as usize];
+    }
+    if let Some(note) = curvature_note(&state, fit.converged()) {
+        fit.diagnostics.notes.push(note);
+    }
+    fit.satterthwaite = Some(state);
+}
+
+/// Record on a Gaussian LMM fit with no finite endpoint (a non-finite
+/// endpoint, in the note's terms) a failed pass without running one: the
+/// failed record and its note, `nonfinite` set.
+pub(crate) fn record_failed_pass(fit: &mut Fit) {
+    let record = crate::lmm::satterthwaite::SatterthwaiteState::failed_record();
+    if let Some(note) = curvature_note(&record, fit.converged()) {
+        fit.diagnostics.notes.push(note);
+    }
+    fit.satterthwaite = Some(record);
+}
+
+/// The note a pass's state raises at an endpoint that did or did not
+/// converge: when a direction of `H_p` was dropped or negative, when the
+/// endpoint did not converge, or when the pass failed; `None` otherwise.
+pub(crate) fn curvature_note(
+    state: &crate::lmm::satterthwaite::SatterthwaiteState,
+    converged: bool,
+) -> Option<Note> {
+    let raise = state.dropped > 0 || state.negative > 0 || !converged || state.failed;
+    raise.then_some(Note::SatterthwaiteCurvature {
+        dropped: state.dropped as u32,
+        negative: state.negative as u32,
+        converged,
+        nonfinite: state.failed,
+    })
+}
+
 /// [`fit_on`] with a [`CurvatureHint`] for the gradient search, taken from a
 /// pilot fit by [`curvature_hint`] and passed with every draw. The fit only
 /// reads it, so results depend on (data, start, hint) and not on the order of
@@ -978,6 +1117,8 @@ pub fn fit_on_hinted<'a>(
         ws.n_targets,
         "fit_on: target count is frozen at build"
     );
+    ws.targets.clear();
+    ws.targets.extend_from_slice(&opts.target_indices);
     assert_eq!(
         opts.weights.is_some(),
         ws.has_weights,

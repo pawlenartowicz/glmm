@@ -1,0 +1,91 @@
+{
+  "r_formula": "score ~ 1 + Machine + (1 + Machine | Worker)",
+  "reml": true,
+  "boundary": "none",
+  "twin": "lmertest_Machines",
+  "assign": [0, 1, 1],
+  "assign_names": ["(Intercept)", "MachineB", "MachineC"],
+  "term_labels": ["Machine"],
+  "type3": {
+    "terms": ["Machine"],
+    "sum_sq": [75.8151304010551],
+    "mean_sq": [37.9075652005275],
+    "NumDF": [2],
+    "DenDF": [4.99853812773823],
+    "F": [40.9988868356456],
+    "p_value": [0.000792980050621092],
+    "hypotheses": [
+      {
+        "term": "Machine",
+        "L": [
+          [0, 1, -0.5],
+          [0, 0, 1]
+        ],
+        "row_names": ["MachineB", "MachineC"],
+        "col_names": ["(Intercept)", "MachineB", "MachineC"]
+      }
+    ],
+    "DenDF_second": [
+      [4.99853810752291, 4.99853810122796]
+    ]
+  },
+  "type2": {
+    "terms": ["Machine"],
+    "sum_sq": [75.8151304010551],
+    "mean_sq": [37.9075652005275],
+    "NumDF": [2],
+    "DenDF": [4.99853812773823],
+    "F": [40.9988868356456],
+    "p_value": [0.000792980050621092],
+    "hypotheses": [
+      {
+        "term": "Machine",
+        "L": [
+          [0, 1, -0.5],
+          [0, 0, 1]
+        ],
+        "row_names": ["MachineB", "MachineC"],
+        "col_names": ["(Intercept)", "MachineB", "MachineC"]
+      }
+    ],
+    "DenDF_second": [
+      [4.99853810752291, 4.99853810122796]
+    ]
+  },
+  "fd_settings": [
+    {
+      "hessian_d": 0.05,
+      "jacobian_d": 5e-05,
+      "r": 4
+    },
+    {
+      "hessian_d": 0.2,
+      "jacobian_d": 0.0002,
+      "r": 4
+    }
+  ],
+  "conditions": [],
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_lmertest.R"
+  },
+  "name": "lmertest_anova_Machines"
+}

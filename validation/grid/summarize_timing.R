@@ -137,7 +137,8 @@ main <- function() {
     return(invisible(NULL))
   }
 
-  cat("NOTE: glmm's wall_seconds times the fit only (model-matrix lowering excluded);\n",
+  cat("NOTE: glmm's wall_seconds times the fit only (model-matrix lowering and the\n",
+      "Satterthwaite pass excluded);\n",
       "the R/Julia engines time the whole fit call, lowering included.\n", sep = "")
 
   cells_all <- grid_cells_by_id(file.path(GRID, "manifest.json"))

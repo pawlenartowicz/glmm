@@ -13,13 +13,18 @@
 //! see the [`divergence`] module for the registry and the rules that keep it from
 //! decaying into a blanket exemption.
 
-use glmm::formula::{lower, Column, Table};
+use glmm::formula::{lower, Column, Lowered, Table};
 use glmm::{
     fit_cold, BinomialLink, Family, Fit, GammaLink, InverseGaussianLink, NegBinomialLink,
     PoissonLink, WaldSe,
 };
 use serde::Deserialize;
 use serde_json::Value;
+
+// The inference reference reader (`src/inference/test_refs.rs`, included). Each
+// test crate that declares this module uses only part of it.
+#[allow(dead_code)]
+pub mod inference;
 
 // ── Tolerances — mirrors `validation/grid/tol.R`, change together ────────────────
 //
@@ -53,6 +58,21 @@ pub mod tol {
     /// thin a base to calibrate a second constant on.
     pub const AGQ_CORR_ABS: f64 = 4e-3;
     pub const AGQ_SE_HESSIAN_REL: f64 = 2e-2;
+
+    // Inference (0.6.0): mirrors `TOL_INFERENCE` in `grid/tol.R`, where each step
+    // enters the bands it sets. A band read by an integration gate in
+    // `tests/inference_oracle.rs` gets its constant here; one read by an in-crate
+    // test sits beside that test. Change together; the measurement, rule and date
+    // stay in `grid/tol.R`, as for every band above.
+    /// Gate 1 end to end: the per-coefficient Satterthwaite df at glmm's own
+    /// theta-hat against lmerTest's (`df_e2e_rel`).
+    #[allow(dead_code)] // read by tests/inference_oracle.rs only
+    pub const DF_E2E_REL: f64 = SE_REL;
+    /// Gate 1's interval comparison: the bounds of the Satterthwaite t interval
+    /// at glmm's own theta-hat against lmerTest's `contest1D(confint = TRUE)`,
+    /// in units of lmerTest's interval width (`confint_rel`).
+    #[allow(dead_code)] // read by tests/inference_oracle.rs only
+    pub const CONFINT_REL: f64 = SE_REL;
 }
 
 // ── Golden schema ────────────────────────────────────────────────────────────
@@ -191,7 +211,12 @@ const NEAR_ZERO_ABS: f64 = 1e-3;
 /// Relative difference against the larger magnitude, matching `grid/tol.R::rel_max`
 /// (`|x-y| / max(|x|,|y|,1e-12)`, exempting coordinates under `NEAR_ZERO_ABS`)
 /// so a Rust failure and an R failure mean the same thing on the same pair.
+/// A NaN on either side gives NaN, which no band passes (`f64::max` would drop
+/// it and let the near-zero exemption return 0).
 fn rel(got: f64, want: f64) -> f64 {
+    if got.is_nan() || want.is_nan() {
+        return f64::NAN;
+    }
     let scale = got.abs().max(want.abs()).max(1e-12);
     if scale <= NEAR_ZERO_ABS {
         return 0.0;
@@ -227,6 +252,15 @@ pub fn assert_rel(got: f64, want: f64, band: f64, ctx: &str) {
     let r = rel(got, want);
     adjudicate(r, band, ctx, &|| {
         format!("{ctx}: glmm={got} oracle={want} (rel {r:.3e} > {band:.0e})")
+    });
+}
+
+/// `|got − want|` in units of `scale` (positive), within `band`.
+#[allow(dead_code)] // used by tests/inference_oracle.rs only
+pub fn assert_rel_to(got: f64, want: f64, scale: f64, band: f64, ctx: &str) {
+    let d = (got - want).abs() / scale;
+    adjudicate(d, band, ctx, &|| {
+        format!("{ctx}: glmm={got} oracle={want} (|diff| / {scale} = {d:.3e} > {band:.0e})")
     });
 }
 
@@ -289,10 +323,23 @@ pub mod divergence {
     const SCOPE: &str = "oracle-tier";
 
     impl Registry {
+        /// A registry over `entries`, with nothing fired yet.
+        pub fn new(entries: Vec<Entry>) -> Registry {
+            Registry {
+                entries,
+                fired: Mutex::new(BTreeSet::new()),
+            }
+        }
+
         /// Adjudicate one over-band comparison. `ctx` is `"<fixture>: <quantity>"`,
         /// optionally with an `[i]` coefficient-index suffix, as every assertion in
         /// this module formats it.
         pub fn covers(&self, ctx: &str, observed: f64) -> Coverage {
+            // A NaN difference means the comparison itself broke: no entry
+            // documents it and none fires (as `grid/compare.R::div_mark`).
+            if observed.is_nan() {
+                return Coverage::NotDocumented;
+            }
             let Some((fixture, rest)) = ctx.split_once(": ") else {
                 return Coverage::NotDocumented;
             };
@@ -344,10 +391,7 @@ pub mod divergence {
             );
             let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
             let f: File = serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{path}: {e}"));
-            Registry {
-                entries: f.entries,
-                fired: Mutex::new(BTreeSet::new()),
-            }
+            Registry::new(f.entries)
         })
     }
 }
@@ -593,6 +637,48 @@ fn csv_for(g: &Golden) -> String {
     )
 }
 
+/// An inference reference's formula lowered on its data: the CSV under
+/// `validation/` (the entry's `data`), the entry's `factors` as factor columns
+/// and every other column that parses as numbers numeric (X1, the goldens'
+/// `refit_with` rule), and the entry's `weights` column, when it names one, as
+/// the prior weights.
+#[allow(dead_code)] // used by tests/inference_oracle.rs only
+pub fn inference_lowered(e: &inference::Entry) -> Lowered {
+    let data = e.data.as_ref().expect("the entry has data");
+    let path = format!("{}/validation/{data}", env!("CARGO_MANIFEST_DIR"));
+    let raw = std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("{path}: {err}"));
+    let mut lines = raw.lines().filter(|l| !l.trim().is_empty());
+    let header = split_line(lines.next().expect("CSV has a header"));
+    let rows: Vec<Vec<String>> = lines.map(split_line).collect();
+    let mut columns = Vec::new();
+    for (j, name) in header.iter().enumerate() {
+        let cells: Vec<String> = rows.iter().map(|r| r[j].clone()).collect();
+        // As the in-crate reader (`test_support::table_from_rows`): a listed
+        // column, or one with a cell that is not a number, is a factor.
+        let numeric: Result<Vec<f64>, _> = cells.iter().map(|c| c.parse::<f64>()).collect();
+        let col = match numeric {
+            Ok(v) if !e.factors.contains(name) => Column::Numeric(v),
+            _ => Column::factor_from_labels(&cells),
+        };
+        columns.push((name.clone(), col));
+    }
+    let weights = e.raw["weights"].as_str().map(|w| {
+        let wi = col_index(&header, w);
+        rows.iter()
+            .map(|r| r[wi].parse().expect("weight parse"))
+            .collect()
+    });
+    let table = Table {
+        columns,
+        n: rows.len(),
+    };
+    let formula = e.r_formula.as_ref().expect("the entry has a formula");
+    let mut lo =
+        lower(formula, &table, Family::Gaussian).unwrap_or_else(|err| panic!("{}: {err}", e.name));
+    lo.opts.weights = weights;
+    lo
+}
+
 /// Split a CSV line on commas, trimming whitespace and surrounding quotes.
 /// Mirrors the hand-parse the in-crate kernel tests use — no CSV crate, and no
 /// quoted-comma fields anywhere in the validation corpus.
@@ -771,12 +857,10 @@ pub fn refit_with(
     // unexpected extra or missing column fails there.
     let lo = lower(&formula, &table, family_of(g)).unwrap_or_else(|e| panic!("{formula}: {e:?}"));
 
-    let opts = glmm::FitOptions {
-        nagq: g.nagq,
-        wald_se,
-        weights,
-        ..lo.opts
-    };
+    let mut opts = lo.opts.clone();
+    opts.nagq = g.nagq;
+    opts.wald_se = wald_se;
+    opts.weights = weights;
     let fit = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &opts);
     let group_names = lo.re_groups.iter().map(|r| r.name.clone()).collect();
     (fit, lo.col_names, group_names)

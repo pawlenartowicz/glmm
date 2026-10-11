@@ -1,0 +1,94 @@
+{
+  "r_formula": "strength ~ 1 + (1 | batch/cask)",
+  "reml": true,
+  "boundary": "none",
+  "theta": [3.52690178773174, 1.56346140209686],
+  "theta_names": ["cask:batch.(Intercept)", "batch.(Intercept)"],
+  "cnms": [
+    ["(Intercept)"],
+    ["(Intercept)"]
+  ],
+  "group_names": ["cask:batch", "batch"],
+  "group_levels": [30, 10],
+  "sigma": 0.823407523446778,
+  "beta": [60.0533333333354],
+  "coef_names": ["(Intercept)"],
+  "cols_dropped": [],
+  "vcov_beta": [
+    [0.458153288054365]
+  ],
+  "reml_criterion": 246.990745853487,
+  "estimate": [60.0533333333354],
+  "std_error": [0.676870215074031],
+  "df": [8.99999754463259],
+  "t_value": [88.7220799437411],
+  "p_value": [1.48784721703534e-14],
+  "level": 0.95,
+  "lower": [58.5221464643431],
+  "upper": [61.5845202023278],
+  "varpar_names": ["cask:batch.(Intercept)", "batch.(Intercept)", "sigma"],
+  "vcov_varpar": [
+    [0.560797128832716, -0.157415224154808, -0.0503468272180669],
+    [-0.157415224154808, 1.26879555797961, -0.0214561119311528],
+    [-0.0503468272180669, -0.0214561119311528, 0.0112999987337564]
+  ],
+  "Jac_list": [
+    [
+      [0.159415949414651]
+    ],
+    [
+      [0.212005350502695]
+    ],
+    [
+      [1.11282269109413]
+    ]
+  ],
+  "fd_settings": [
+    {
+      "hessian_d": 0.05,
+      "jacobian_d": 5e-05,
+      "r": 4
+    },
+    {
+      "hessian_d": 0.2,
+      "jacobian_d": 0.0002,
+      "r": 4
+    }
+  ],
+  "df_second": [
+    [8.99999753582793, 8.99999755378849]
+  ],
+  "conditions": [],
+  "contest_1d": {
+    "seed": 2,
+    "l": [-0.896914546624981],
+    "estimate": -53.8627082399874,
+    "std_error": 0.607094742077078,
+    "df": 8.99999754463259,
+    "t_value": -88.7220799437411,
+    "p_value": 1.48784721703534e-14
+  },
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_lmertest.R"
+  },
+  "name": "lmertest_Pastes"
+}

@@ -12,8 +12,10 @@ Everything under `validation/` is dev-only and never shipped: the nested
 | `data/simulated/` | committed fixed-seed CSVs, regenerable byte-identically by `tools/prep/`. Also read by `include_str!`, including in CI, so the bytes are the fixture. |
 | `manifest.json` | the per-rung model list for the in-crate tiers: one entry per dataset with its formula, family, link, factors and tier. Read by `tests/validation_oracle.rs`, `tools/bit_identity/dump.rs` and `tools/goldens_agq.R`. |
 | `goldens/` | frozen reference results, one JSON per fixture, from lme4, R `glm` / `MASS::glm.nb`, glmmTMB (`*_tmb.json`) and GLMMadaptive. Read at run time by the `oracle-tests` tier. Regenerated only by `tools/goldens_agq.R`. |
+| `goldens/inference/` | frozen inference references (lmerTest df and tests, the exact RLRT, ANOVA tables), one subdirectory per kind (`lmertest/`, `rlrt/`, `anova/`), one JSON per reference. Each is registered in `manifest.json`'s `inference_references` block and written only by its step's generator under `tools/`, through the shared setup `tools/inference_common.R`. |
 | `results/lme4_simulated/` | the frozen `lme4` results for the weights tier, read by the `oracle-tests` tier. |
 | `tools/` | tools and generators, no gates: `bit_identity/` (a "what moved" report: dump the per-rung results before and after a change and diff them; the dumps are machine-local and not committed), `lanewidth/` (SIMD lane-width sensitivity), `memory/` (peak RSS), `goldens_agq.R` (the goldens generator), `prep/` (the fixed-seed generators of `data/`, plus `gamma_agq_reference.R`, a from-scratch Gamma AGQ reference run unweighted at the console and with `--weights` to freeze `gamma_agq_reference_wts.json`), `common.rs` (the shared reader the manifest-shaped examples include). A bare run of `goldens_agq.R` or of a `prep/` script overwrites committed artifacts, so both are deliberate acts, not routine steps. |
+| `tools/prep/gen_inference_data.R` | the fixed-seed generator of the inference references' shared input data: `data/empirical/Dyestuff2.csv` and the simulated designs it writes to `data/simulated/`. Run once; the CSVs are committed, and a re-run must reproduce them byte for byte. |
 | `campaigns/` | two finished studies, kept rerunnable: `speed-campaign/` (optimizer cost and wall time) and `monte_carlo/` (accuracy against known truth). See `campaigns/README.md`. |
 
 ## Running the grid
@@ -25,7 +27,9 @@ From `grid/`:
 ```
 
 - `engine` is one of `glmm`, `glmm_python`, `glmm_r`, `lme4`, `glmmtmb`,
-  `glmmadaptive`, `mixedmodels`.
+  `glmmadaptive`, `mixedmodels`, `lmertest`. `lmertest` fits the Gaussian cells
+  with a random effect with `lmerTest::lmer` and records its per-coefficient
+  Satterthwaite df; its run is kept and found like an oracle's.
 - `--fast` restricts the run to the cells tagged `fast` in `manifest.json` (116 of
   794).
 - `--timed[=N]` times every fit: N samples, the first discarded, median of the
@@ -72,8 +76,19 @@ A fresh machine reaches the pinned oracle set with `Rscript install_oracles.R`.
   error, not a fallback, and a `fast` or timed run is never an accuracy
   reference.
 - **Pins** — `grid/versions.json`: `lme4` 2.0-6, `glmmTMB` 1.1.14,
-  `GLMMadaptive` 0.9-7, `MixedModels` 5.9.0, R 4.5.3, Julia 1.12.6. A bump reruns
-  that oracle into a new `last/`.
+  `GLMMadaptive` 0.9-7, `MixedModels` 5.9.0, `lmerTest` 3.2-1 (also the
+  inference generators' pin), R 4.5.3, Julia 1.12.6. A bump reruns that oracle
+  (or `lmertest`) into a new `last/`.
+- **Satterthwaite df** (`compare.R` gate 5): glmm's per-coefficient df against
+  `runs/lmertest/last/` on every Gaussian cell with a random effect, at
+  `coef_df_rel` in `grid/tol.R`, registry-backed in gate 2's scope with the
+  quantity `coef_df`. A cell where glmm's Satterthwaite pass failed (every
+  `coef_df` null) is left out of the band and listed, not failed. While
+  `coef_df_rel` is NA, gate 5 prints `NOT RUN (pending: <reason>)` (with or
+  without a `lmertest` run), every other gate runs, and the exit status is
+  theirs. lmerTest is
+  not one of gates 1 to 3's oracles: its fit is lme4's. The port gate also holds
+  `coef_df` at `port_rel`.
 - **Bands** — `grid/tol.R`, every one with the measurement and the date that set
   it. `grid/dev_align.R` holds the per-engine, per-family deviance constants, each
   a closed form with its source.
@@ -97,6 +112,14 @@ A fresh machine reaches the pinned oracle set with `Rscript install_oracles.R`.
   `dev_eps_agq_vec` in `grid/tol.R`, not `dev_eps`.
 - **In-crate references** — `goldens/` and `results/lme4_simulated/`, frozen, read
   by `cargo test --features oracle-tests`.
+- **Inference references**: `goldens/inference/<kind>/<name>.json`, frozen, each
+  registered in `manifest.json`'s `inference_references` (an entry carrying
+  `pending_reference` is registered but not yet frozen). Only the generators
+  write them (`VALIDATION_ONLY=<name>` writes one entry; a bare run rewrites
+  every reference of its kind). `tests/inference_references.rs` checks the
+  block against the tree. Their bands are `TOL_INFERENCE` in `grid/tol.R`, and
+  an over-band end-to-end difference passes only under an `oracle-tier` entry of
+  `grid/divergences.json` whose `cell` is the reference's name.
 
 ## What runs where
 
@@ -105,15 +128,18 @@ A fresh machine reaches the pinned oracle set with `Rscript install_oracles.R`.
 | `cargo test` (six feature configs) | `goldens/`, `data/empirical/`, `data/simulated/` via `include_str!` | **yes** — every push |
 | `cargo test --test grid_reference` | `grid/manifest.json`, `grid/data/fast/`, `data/`, `grid/runs/glmm/last/` | **yes** — part of the `cargo test` matrix |
 | `port-gate` (Rust vs Python vs R on the `fast` subset) | `grid/manifest.json`, `grid/data/fast/`, `data/`, `grid/compare.R --ports-only` | **yes** — its own job; installs `jsonlite`, no statistics package |
+| `cargo test --test inference_references` (the inference references' registration) | `manifest.json`, `goldens/inference/`, `data/`, `tools/` | **yes**: every push, part of the `cargo test` matrix |
 | `cargo test --features oracle-tests` (the cross-engine tier) | `goldens/`, `results/lme4_simulated/`, `data/`, `grid/divergences.json` | no — local only |
+| `tests/inference_oracle.rs` and the in-crate inference tests under `oracle-tests` (the inference end-to-end tier) | `goldens/inference/`, `manifest.json`, `data/`, `grid/divergences.json` | no: local only; whether it gets a CI job is decided again from the tier's measured runtime on the release tree |
+| `cargo test --features montecarlo-tests` (seeded Monte Carlo level studies) | its own seeded draws | no: local only; whether it gets a CI leg is decided from the measured runtime of its first study (the level of the exact RLRT), and this row changes with that decision |
 | `grid/run.sh <oracle>` (an oracle reference run) | everything | no — local only; needs R, Julia and the pinned oracle versions |
 | `grid/run.sh … --timed` | the `fast` subset | no — local only, and only on a clock-locked machine |
-| `grid/compare.R` (the four gates) | the committed oracle runs plus a chosen glmm run | no — local only |
+| `grid/compare.R` (the five gates) | the committed oracle runs plus a chosen glmm run | no — local only |
 | campaigns | own manifests and results | no — finished studies, rerun by hand |
 | `tools/memory/memory.sh`, `tools/lanewidth/` | `data/`, their own models | no — local only, measurement not gate |
 
 Two rules hold that table together. **CI never runs an external statistics package**: the
 two checks that do run there compare the crate against numbers this repo already holds — the
 committed glmm run and the two ports. **An oracle comparison is local**, because it needs
-lme4, glmmTMB, GLMMadaptive and MixedModels.jl at their pinned versions, and because its
+lme4, glmmTMB, GLMMadaptive, MixedModels.jl and lmerTest at their pinned versions, and because its
 verdict is a finding to read rather than a build to break.

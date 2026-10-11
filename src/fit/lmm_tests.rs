@@ -2746,3 +2746,184 @@ fn curvature_hint_is_none_off_the_gradient_route() {
     let _ = fit_on(&mut ws, &x, &y, &sized_ids, None, &opts);
     assert!(curvature_hint(&mut ws).is_none());
 }
+
+/// `y ~ 1 + x + (1 | g)`, 10 groups of 6: the fixture of the Satterthwaite
+/// note tests. Returns `(x, y, ids, n, p)`.
+fn satterthwaite_note_data() -> (Vec<f64>, Vec<f64>, GroupIds, usize, usize) {
+    let mut st = 21u64;
+    let (mut x, mut y, mut g) = (vec![], vec![], vec![]);
+    for grp in 0..10u32 {
+        let b = lcg(&mut st);
+        for _ in 0..6 {
+            let x1 = lcg(&mut st);
+            x.extend([1.0, x1]);
+            y.push(0.3 + 0.5 * x1 + b + 0.5 * lcg(&mut st));
+            g.push(grp);
+        }
+    }
+    let n = y.len();
+    let ids = GroupIds {
+        primary: g,
+        extra: vec![],
+    };
+    (x, y, ids, n, 2)
+}
+
+/// A `MaxFunReached` endpoint gets its df, and the note says the endpoint
+/// did not converge.
+#[test]
+fn note_on_maxfun_endpoint() {
+    use bobyqa::{Bobyqa, Config};
+
+    let (x, y, ids, n, p) = satterthwaite_note_data();
+    let model = intercept_only_spec(Sizing::FixedClusters { n_clusters: 1 });
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        ..FitOptions::default()
+    };
+    let (sized, ids, perm) = spec_sized_from_ids(&model, &ids);
+    let mut ws = build_workspace(&sized, perm, n, p, &opts);
+    {
+        let (lmm, _) = ws.lmm_parts().expect("a Gaussian mixed workspace");
+        // One θ, so the search is BOBYQA's; five evaluations stop it short.
+        let mut config = Config::new(1);
+        config.max_fun = 5;
+        lmm.solver = Bobyqa::new(1, config).expect("legal minimal config");
+    }
+    let mut fit =
+        fit_on(&mut ws, &x, &y, &ids, None, &opts).into_fit(&x, &y, &ids, n, p, &model, &opts);
+    assert_eq!(fit.diagnostics.boundary, Boundary::NoOptimum);
+    assert!(fit.deviance.is_finite());
+    super::core::attach_satterthwaite(&mut ws, &mut fit, &opts);
+    assert!(
+        fit.coef_df.iter().all(|d| d.is_finite()),
+        "{:?}",
+        fit.coef_df
+    );
+    let note = fit
+        .diagnostics
+        .notes
+        .iter()
+        .find(|n| matches!(n, Note::SatterthwaiteCurvature { .. }));
+    assert!(
+        matches!(
+            note,
+            Some(Note::SatterthwaiteCurvature {
+                converged: false,
+                nonfinite: false,
+                ..
+            })
+        ),
+        "{note:?}"
+    );
+}
+
+/// A direction of `H_p` the pseudo-inverse drops raises the note; a positive
+/// definite `H_p` at a converged endpoint raises none. `H_p` is read off an
+/// exact quadratic at steps of 1/2, so every difference is exact.
+#[test]
+fn note_on_dropped_direction() {
+    use crate::lmm::satterthwaite::{assemble, Collected};
+
+    let state = |h: [[f64; 2]; 2]| {
+        let f = |a: f64, b: f64| 0.5 * (h[0][0] * a * a + 2.0 * h[0][1] * a * b + h[1][1] * b * b);
+        let s = 0.5;
+        assemble(&Collected {
+            free: vec![0, 1],
+            h: vec![s, s],
+            f0: 0.0,
+            f_axis: vec![[f(s, 0.0), f(-s, 0.0)], [f(0.0, s), f(0.0, -s)]],
+            f_mixed: vec![[f(s, s), f(-s, -s)]],
+            g_axis: None,
+            c0: Mat::identity(1, 1),
+            c_axis: vec![
+                [Mat::identity(1, 1), Mat::identity(1, 1)],
+                [Mat::identity(1, 1), Mat::identity(1, 1)],
+            ],
+            tau: 1.0,
+            nu: 10.0,
+        })
+    };
+    let singular = state([[1.0, 1.0], [1.0, 1.0]]);
+    assert!(
+        matches!(
+            super::core::curvature_note(&singular, true),
+            Some(Note::SatterthwaiteCurvature {
+                dropped: 1,
+                negative: 0,
+                converged: true,
+                nonfinite: false,
+            })
+        ),
+        "dropped {} negative {}",
+        singular.dropped,
+        singular.negative
+    );
+    let clean = state([[2.0, 1.0], [1.0, 2.0]]);
+    assert!(super::core::curvature_note(&clean, true).is_none());
+}
+
+/// A non-finite deviance on the stencil (here forced through θ̂ itself) fails
+/// the pass for the whole fit: every `coef_df` NaN, the note with `nonfinite`,
+/// and the contrasts' `NoDf(Failed)`.
+#[test]
+fn failed_pass_gives_no_df_failed() {
+    use crate::inference::contrast::{ContrastError, NoDfReason};
+
+    let (x, y, ids, n, p) = satterthwaite_note_data();
+    let model = intercept_only_spec(Sizing::FixedClusters { n_clusters: 1 });
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        ..FitOptions::default()
+    };
+    let (mut fit, mut ws) = fit_cold_keep_workspace(&x, &y, n, p, &model, &ids, &opts);
+    assert!(fit.converged());
+    ws.lmm_parts().expect("a Gaussian mixed workspace").0.theta[0] = f64::NAN;
+    super::core::attach_satterthwaite(&mut ws, &mut fit, &opts);
+    assert!(fit.coef_df.iter().all(|d| d.is_nan()));
+    assert!(fit.diagnostics.notes.iter().any(|n| matches!(
+        n,
+        Note::SatterthwaiteCurvature {
+            nonfinite: true,
+            ..
+        }
+    )));
+    assert_eq!(
+        fit.contrast_t(&[0.0, 1.0]),
+        Err(ContrastError::NoDf(NoDfReason::Failed))
+    );
+    assert_eq!(
+        fit.contrast_f(&[1.0, 0.0, 0.0, 1.0], 2),
+        Err(ContrastError::NoDf(NoDfReason::Failed))
+    );
+}
+
+/// What the ports read after a failed pass (a forced non-finite stencil
+/// point, as `failed_pass_gives_no_df_failed`): `df_method = "failed"`, no t
+/// p-value, and normal intervals on every coefficient although the SEs are
+/// finite.
+#[cfg(feature = "orchestrate")]
+#[test]
+fn failed_pass_gives_failed_port_fields_and_normal_intervals() {
+    use crate::inference::tails::normal_quantile;
+
+    let (x, y, ids, n, p) = satterthwaite_note_data();
+    let model = intercept_only_spec(Sizing::FixedClusters { n_clusters: 1 });
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        ..FitOptions::default()
+    };
+    let (mut fit, mut ws) = fit_cold_keep_workspace(&x, &y, n, p, &model, &ids, &opts);
+    ws.lmm_parts().expect("a Gaussian mixed workspace").0.theta[0] = f64::NAN;
+    super::core::attach_satterthwaite(&mut ws, &mut fit, &opts);
+
+    let (coef_p, df_method) = crate::orchestrate::t_tests(&fit, &opts.target_indices);
+    assert_eq!(df_method, "failed");
+    assert!(coef_p.iter().all(|v| v.is_nan()));
+    assert!(fit.se.iter().all(|s| s.is_finite()));
+    let ci = crate::orchestrate::confint(&fit.beta, &fit.se, &fit.coef_df, 0.95).unwrap();
+    for (i, [lo, hi]) in ci.into_iter().enumerate() {
+        assert_eq!(lo, fit.beta[i] + normal_quantile(0.025) * fit.se[i]);
+        assert_eq!(hi, fit.beta[i] + normal_quantile(0.975) * fit.se[i]);
+    }
+}

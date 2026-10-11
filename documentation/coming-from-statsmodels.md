@@ -87,10 +87,10 @@ rather than lumping everything into one "blocked" bucket.
 | `.fittedvalues` | `.fitted` | Same story: `AttributeError` on the statsmodels name (verified); `.fitted` holds the in-sample μ̂ per row. |
 | `.predict(new_data)` | — | `AttributeError: 'Fit' object has no attribute 'predict'` (verified) — no method under this or any other name. This is the one clean, total loss in this table: there is no out-of-sample prediction on any path, converged or not. |
 | `.bse` | `.se` | Exists, just renamed — the `(p,)` array of Wald standard errors. |
-| `.pvalues` | — | No stored field. `fit.summary()` computes Wald z/p on the fly (`z = beta/se`, `p = erfc(\|z\|/sqrt(2))`) and prints them, but doesn't save them anywhere on `Fit`; recompute the same two-line formula from `.beta`/`.se` if you need the numbers back. |
+| `.pvalues` | `.coef_p` (t tests only) | Where `summary()` tests with t (a Gaussian mixed model on its Satterthwaite df, OLS and the gamma and inverse-gaussian GLMs on `n - p`), `fit.coef_p` holds the kernel's two-sided p-values and `fit.coef_df` the df. Where it tests with z, `coef_p` is `NaN` and `summary()` computes Wald z/p on the fly (`z = beta/se`, `p = erfc(\|z\|/sqrt(2))`); recompute that from `.beta`/`.se` if you need the numbers back. |
 | `.aic` | — | No stored field, and (per the section above) not really comparable across fixed-effect specifications while `glmm`'s LMM path is REML-only anyway. `-2 * fit.loglik + 2 * fit.df` reproduces the usual formula for GLM/GLMM fits (`fit.reml` is `False` there). |
 | `.llf` | `.loglik` | Exists, renamed, with the same caveat as above: for an LMM, `.loglik` is the **REML criterion**, not an ordinary log-likelihood — check `fit.reml` before comparing it to anything. |
-| `.conf_int()` | — | No method. Build a Wald interval from `fit.beta ± z_crit * fit.se` (or the full `fit.vcov` for a joint contrast) — the same recipe `coming-from-lme4.md`'s `confint()` row gives for `lme4`. |
+| `.conf_int()` | `.confint()` | `fit.confint(level=0.95)` returns a `(p, 2)` array of Wald bounds in `fit.names` order, on the t quantile where `summary()` tests with t and the normal quantile where it tests with z. Like statsmodels' `alpha`, it takes the level; unlike `.conf_int()` it returns an array, not a DataFrame. |
 
 ## What you gain
 
@@ -111,15 +111,18 @@ rather than lumping everything into one "blocked" bucket.
 `fit.summary()` prints an lme4-shaped summary, not a statsmodels one. Its
 coefficient table has the same four columns you'd expect from
 `MixedLMResults.summary()` or `GLMResults.summary()` — name, estimate,
-standard error, and a test statistic with its p-value — but three things are
-different, all checked against the installed package:
+standard error, and a test statistic with its p-value (plus a `df` column on
+a Gaussian mixed model), but three things are different, all checked against
+the installed package:
 
-- **The test column is always Wald z, never `t`.** Wald z matches the
-  GLM/GLMM convention, and the kernel has no residual degrees of freedom to
-  base a `t` test on. This applies uniformly, including on the Gaussian LMM
-  path, where `MixedLMResults` already also reports `z`/`P>|z|` (not `t`) — so
-  this one is not actually a difference from `MixedLM`, only from a plain
-  OLS/GLM `t`-table intuition.
+- **The test column is t or z, by model.** A Gaussian mixed model gets t
+  with a `df` column, on lmerTest's Satterthwaite degrees of freedom, where
+  `MixedLMResults` reports `z`/`P>|z|`; OLS and the gamma and inverse-gaussian
+  GLMs with φ estimated get t on the residual df `n - p` (printed in the
+  footer), as `OLSResults` does (statsmodels' `GLMResults` prints z unless
+  fitted with `use_t=True`); binomial,
+  Poisson, negative binomial and every GLMM get Wald z. `satterthwaite=False`
+  on `glmm.fit` turns the mixed model's t back into z.
 - **The criterion line depends on the estimator.** An LMM prints
   `REML criterion at convergence: <value>` and no AIC/BIC (see the REML
   section above). Every other fit prints one row with `AIC`, `BIC`, `logLik`,

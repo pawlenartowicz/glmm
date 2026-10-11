@@ -1,0 +1,129 @@
+{
+  "r_formula": "angle ~ 1 + recipe*temp + (1 | recipe:replicate)",
+  "reml": true,
+  "boundary": "none",
+  "twin": "lmertest_cake",
+  "assign": [0, 1, 1, 2, 3, 3],
+  "assign_names": ["(Intercept)", "recipeB", "recipeC", "temp", "recipeB:temp", "recipeC:temp"],
+  "term_labels": ["recipe", "temp", "recipe:temp"],
+  "type3": {
+    "terms": ["recipe", "temp", "recipe:temp"],
+    "sum_sq": [3.9966839904066, 1966.70506861877, 1.74158730158326],
+    "mean_sq": [1.9983419952033, 1966.70506861877, 0.870793650791629],
+    "NumDF": [2, 1, 2],
+    "DenDF": [254.015760410188, 222.000001437066, 222.000002114707],
+    "F": [0.0956779631310828, 94.1632290652416, 0.0416924445441314],
+    "p_value": [0.908789356199217, 8.74684124406057e-19, 0.959172239968328],
+    "hypotheses": [
+      {
+        "term": "recipe",
+        "L": [
+          [0, 1, 0, -0, 0, 0],
+          [-0, -0, 1, -0, -0, 0]
+        ],
+        "row_names": ["recipeB", "recipeC"],
+        "col_names": ["(Intercept)", "recipeB", "recipeC", "temp", "recipeB:temp", "recipeC:temp"]
+      },
+      {
+        "term": "temp",
+        "L": [
+          [0, 0, 0, 1, 0.3333333, 0.3333333]
+        ],
+        "row_names": ["temp"],
+        "col_names": ["(Intercept)", "recipeB", "recipeC", "temp", "recipeB:temp", "recipeC:temp"]
+      },
+      {
+        "term": "recipe:temp",
+        "L": [
+          [0, 0, -0, 0, 1, -0],
+          [0, 0, -0, 0, 0, 1]
+        ],
+        "row_names": ["recipeB:temp", "recipeC:temp"],
+        "col_names": ["(Intercept)", "recipeB", "recipeC", "temp", "recipeB:temp", "recipeC:temp"]
+      }
+    ],
+    "DenDF_second": [
+      [254.015763042247, 254.015760181904],
+      [222.000006324527, 222.0000026262],
+      [222.000006815347, 222.000002656418]
+    ]
+  },
+  "type2": {
+    "terms": ["recipe", "temp", "recipe:temp"],
+    "sum_sq": [3.9966839904066, 1966.70507936497, 1.74158730158326],
+    "mean_sq": [1.9983419952033, 1966.70507936497, 0.870793650791629],
+    "NumDF": [2, 1, 2],
+    "DenDF": [254.015760410188, 222.000001437065, 222.000002114707],
+    "F": [0.0956779631310828, 94.1632295797552, 0.0416924445441314],
+    "p_value": [0.908789356199217, 8.7468396477504e-19, 0.959172239968328],
+    "hypotheses": [
+      {
+        "term": "recipe",
+        "L": [
+          [0, 1, 0, 0, 0, 0],
+          [0, 0, 1, 0, 0, 0]
+        ],
+        "row_names": ["recipeB", "recipeC"],
+        "col_names": ["(Intercept)", "recipeB", "recipeC", "temp", "recipeB:temp", "recipeC:temp"]
+      },
+      {
+        "term": "temp",
+        "L": [
+          [0, 0, 0, 1, 0.333333333333327, 0.333333333333327]
+        ],
+        "row_names": ["temp"],
+        "col_names": ["(Intercept)", "recipeB", "recipeC", "temp", "recipeB:temp", "recipeC:temp"]
+      },
+      {
+        "term": "recipe:temp",
+        "L": [
+          [0, 0, 0, 0, 1, 0],
+          [0, 0, 0, 0, 0, 1]
+        ],
+        "row_names": ["recipeB:temp", "recipeC:temp"],
+        "col_names": ["(Intercept)", "recipeB", "recipeC", "temp", "recipeB:temp", "recipeC:temp"]
+      }
+    ],
+    "DenDF_second": [
+      [254.015763042247, 254.015760181904],
+      [222.000006324527, 222.0000026262],
+      [222.000006815347, 222.000002656418]
+    ]
+  },
+  "fd_settings": [
+    {
+      "hessian_d": 0.05,
+      "jacobian_d": 5e-05,
+      "r": 4
+    },
+    {
+      "hessian_d": 0.2,
+      "jacobian_d": 0.0002,
+      "r": 4
+    }
+  ],
+  "conditions": [],
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_lmertest.R"
+  },
+  "name": "lmertest_anova_cake"
+}

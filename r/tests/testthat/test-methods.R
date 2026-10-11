@@ -234,13 +234,15 @@ test_that("summary prints lme4's blocks in lme4's order", {
     "Number of obs: 600, groups:  g, 60",
     "Fixed effects:", "Pr(>|z|)",
     "Correlation of Fixed Effects:",
-    "Optimizer evaluations:", "Wald z"
+    "Optimizer evaluations:"
   )
   pos <- vapply(order, function(s) regexpr(s, sout, fixed = TRUE)[1], 0)
   expect_true(all(pos > 0), info = paste(names(pos)[pos <= 0], collapse = ", "))
   expect_equal(pos, sort(pos))
-  # No REML line on an ML fit.
+  # No REML line on an ML fit, and no test footer: z is a GLMM's test.
   expect_false(grepl("REML criterion", sout, fixed = TRUE))
+  expect_false(grepl("Satterthwaite", sout, fixed = TRUE))
+  expect_false(grepl("Wald z", sout, fixed = TRUE))
 })
 
 test_that("a declared, unused grouping level is not counted as a group", {
@@ -623,4 +625,184 @@ test_that("wald.se = \"rx\" is marshalled through to the kernel", {
   expect_true(all(is.finite(fit_rx$se)))
   expect_equal(unname(fixef(fit_rx)), unname(fixef(fit_hessian)), tolerance = 1e-8)
   expect_false(isTRUE(all.equal(unname(fit_rx$se), unname(fit_hessian$se))))
+})
+
+# A Gaussian random-intercept fixture: 40 groups of 8.
+lmm_data <- function(seed = 131) {
+  set.seed(seed)
+  g <- factor(rep(1:40, each = 8))
+  x <- rnorm(320)
+  data.frame(y = 1 + 0.5 * x + rnorm(40, sd = 0.9)[as.integer(g)] + rnorm(320, sd = 0.6),
+             x = x, z = rnorm(320), g = g)
+}
+
+test_that("a Gaussian LMM summary has lmerTest's columns with the crate's df and p", {
+  fit <- fastglmm(y ~ x + z + (1 | g), lmm_data())
+  expect_identical(fit$df_method, "satterthwaite")
+  s <- summary(fit)
+  expect_identical(colnames(s$coefficients),
+                   c("Estimate", "Std. Error", "df", "t value", "Pr(>|t|)"))
+  expect_equal(s$coefficients[, "df"], fit$coef_df)
+  expect_equal(s$coefficients[, "Pr(>|t|)"], fit$coef_p)
+  expect_equal(s$coefficients[, "t value"], fixef(fit) / fit$se)
+  expect_true(all(is.finite(fit$coef_df) & fit$coef_df > 0))
+  # The crate's p is the t tail on the row's df.
+  expect_equal(unname(fit$coef_p),
+               unname(2 * pt(-abs(fixef(fit) / fit$se), fit$coef_df)), tolerance = 1e-10)
+  out <- capture.output(print(s))
+  expect_true(any(grepl("^ +Estimate Std. Error +df t value Pr\\(>\\|t\\|\\)", out)))
+  expect_identical(tail(out, 1L),
+                   "t tests use Satterthwaite degrees of freedom (finite-difference θ-Hessian).")
+})
+
+test_that("tidy() has a df column exactly where summary() has one", {
+  lmm <- fastglmm(y ~ x + (1 | g), lmm_data())
+  td <- tidy(lmm)
+  expect_named(td, c("term", "estimate", "std.error", "statistic", "df", "p.value"))
+  cf <- summary(lmm)$coefficients
+  expect_equal(td$df, unname(cf[, "df"]))
+  expect_equal(td$statistic, unname(cf[, "t value"]))
+  expect_equal(td$p.value, unname(cf[, "Pr(>|t|)"]))
+
+  ols <- fastglmm(y ~ x, lmm_data())
+  td <- tidy(ols)
+  expect_named(td, c("term", "estimate", "std.error", "statistic", "p.value"))
+  cf <- summary(ols)$coefficients
+  expect_equal(td$statistic, unname(cf[, "t value"]))
+  expect_equal(td$p.value, unname(cf[, "Pr(>|t|)"]))
+})
+
+test_that("an OLS summary is summary.lm's: t on n - p, sigma and R-squared footer", {
+  d <- lmm_data()
+  fit <- fastglmm(y ~ x + z, d)
+  ref <- lm(y ~ x + z, d)
+  expect_identical(fit$df_method, "residual")
+  cf <- summary(fit)$coefficients
+  expect_identical(colnames(cf), c("Estimate", "Std. Error", "t value", "Pr(>|t|)"))
+  expect_equal(unname(cf), unname(coef(summary(ref))), tolerance = 1e-8)
+  expect_equal(unname(fit$coef_df), rep(317, 3))
+  out <- trimws(capture.output(print(summary(fit))))
+  lm_out <- trimws(capture.output(print(summary(ref))))
+  for (start in c("Residual standard error:", "Multiple R-squared:")) {
+    expect_identical(out[startsWith(out, start)], lm_out[startsWith(lm_out, start)],
+                     info = start)
+  }
+  expect_false(any(grepl("Satterthwaite|Wald z|df not computed", out)))
+})
+
+test_that("R-squared matches summary.lm on weighted, no-intercept and offset fits", {
+  d <- lmm_data()
+  d$w <- rep(c(0.5, 1, 2, 4), length.out = nrow(d))
+  d$o <- 0.3 * d$z
+  cases <- list(
+    weighted = list(fit = fastglmm(y ~ x + z, d, weights = w),
+                    ref = lm(y ~ x + z, d, weights = w)),
+    no_intercept = list(fit = fastglmm(y ~ 0 + x + z, d), ref = lm(y ~ 0 + x + z, d)),
+    offset = list(fit = fastglmm(y ~ x, d, offset = o), ref = lm(y ~ x, d, offset = o)),
+    offset_term = list(fit = fastglmm(y ~ x + offset(o), d), ref = lm(y ~ x + offset(o), d))
+  )
+  for (nm in names(cases)) {
+    fit <- cases[[nm]]$fit
+    s_ref <- summary(cases[[nm]]$ref)
+    expect_equal(fit$r_squared, s_ref$r.squared, tolerance = 1e-10, info = nm)
+    expect_equal(fit$adj_r_squared, s_ref$adj.r.squared, tolerance = 1e-10, info = nm)
+    expect_equal(fit$rss, sum(stats::weighted.residuals(cases[[nm]]$ref)^2),
+                 tolerance = 1e-10, info = nm)
+  }
+  one <- fastglmm(y ~ 1, d)
+  expect_identical(c(one$r_squared, one$adj_r_squared), c(0, 0))
+  lmm <- fastglmm(y ~ x + (1 | g), d)
+  expect_true(is.nan(lmm$r_squared) && is.nan(lmm$adj_r_squared) && is.nan(lmm$rss))
+})
+
+test_that("a Gamma GLM prints t on n - p, with its df in the dispersion line", {
+  set.seed(24)
+  d <- data.frame(x = rnorm(80))
+  d$y <- rgamma(80, shape = 4, rate = 4 / exp(0.3 + 0.5 * d$x))
+  fit <- fastglmm(y ~ x, d, family = "gamma")
+  ref <- glm(y ~ x, data = d, family = Gamma(link = "log"))
+  cf <- summary(fit)$coefficients
+  expect_identical(colnames(cf), c("Estimate", "Std. Error", "t value", "Pr(>|t|)"))
+  # glm's own fit differs from the kernel's at about 1e-6 relative, which the
+  # small p-value amplifies; the df are glm's exactly.
+  expect_equal(unname(cf[, "t value"]), unname(coef(summary(ref))[, "t value"]),
+               tolerance = 1e-5)
+  expect_equal(unname(cf[, "Pr(>|t|)"]), unname(coef(summary(ref))[, "Pr(>|t|)"]),
+               tolerance = 1e-3)
+  expect_equal(unname(fit$coef_df), rep(df.residual(ref), 2))
+  out <- paste(capture.output(print(summary(fit))), collapse = "\n")
+  expect_match(out, "Dispersion \\(phi, Pearson\\): [0-9.]+ on 78 degrees of freedom")
+  expect_false(grepl("R-squared", out, fixed = TRUE))
+  held <- fastglmm(y ~ x, d, family = "gamma", dispersion = 0.25)
+  expect_identical(held$df_method, "none")
+  expect_identical(colnames(summary(held)$coefficients)[3:4], c("z value", "Pr(>|z|)"))
+})
+
+test_that("satterthwaite = FALSE: an LMM tests with z and says so; OLS and Gamma keep t", {
+  d <- lmm_data()
+  expect_no_warning(fit <- fastglmm(y ~ x + (1 | g), d, satterthwaite = FALSE))
+  expect_identical(fit$df_method, "disabled")
+  expect_true(all(is.nan(fit$coef_df)) && all(is.nan(fit$coef_p)))
+  s <- summary(fit)
+  expect_identical(colnames(s$coefficients),
+                   c("Estimate", "Std. Error", "z value", "Pr(>|z|)"))
+  expect_equal(s$coefficients[, "Pr(>|z|)"], 2 * pnorm(-abs(fixef(fit) / fit$se)))
+  expect_identical(tail(capture.output(print(s)), 1L), "df not computed (satterthwaite = FALSE)")
+  expect_message(ci <- confint(fit), "df not computed (satterthwaite = FALSE)", fixed = TRUE)
+  expect_equal(ci[, 2], fixef(fit) + qnorm(0.975) * fit$se, tolerance = 1e-12)
+  on <- fastglmm(y ~ x + (1 | g), d)
+  expect_identical(fixef(fit), fixef(on))
+
+  ols <- fastglmm(y ~ x, d, satterthwaite = FALSE)
+  expect_identical(ols$df_method, "residual")
+  expect_identical(colnames(summary(ols)$coefficients)[3], "t value")
+  set.seed(24)
+  dg <- data.frame(x = rnorm(80))
+  dg$y <- rgamma(80, shape = 4, rate = 4 / exp(0.3 + 0.5 * dg$x))
+  expect_identical(fastglmm(y ~ x, dg, family = "gamma", satterthwaite = FALSE)$df_method,
+                   "residual")
+  expect_error(fastglmm(y ~ x, d, satterthwaite = NA),
+               "satterthwaite must be TRUE or FALSE", fixed = TRUE)
+})
+
+test_that("after a failed pass the summary tests with z and the intervals are normal", {
+  fit <- fastglmm(y ~ x + (1 | g), lmm_data())
+  fit$df_method <- "failed"
+  fit$coef_df[] <- NaN
+  fit$coef_p[] <- NaN
+  cf <- summary(fit)$coefficients
+  expect_identical(colnames(cf), c("Estimate", "Std. Error", "z value", "Pr(>|z|)"))
+  expect_silent(ci <- confint(fit))
+  expect_equal(ci[, 1], fixef(fit) - qnorm(0.975) * fit$se, tolerance = 1e-12)
+  out <- capture.output(print(summary(fit)))
+  expect_false(any(grepl("Satterthwaite degrees of freedom|df not computed", out)))
+})
+
+test_that("confint takes the t quantile on each row's df, as confint.lm does", {
+  d <- lmm_data()
+  ols <- fastglmm(y ~ x + z, d)
+  expect_equal(confint(ols), confint(lm(y ~ x + z, d)), tolerance = 1e-8)
+  expect_equal(confint(fastglmm(y ~ x, d, weights = rep(1:2, 160))),
+               confint(lm(y ~ x, d, weights = rep(1:2, 160))), tolerance = 1e-8)
+  expect_equal(confint(ols, parm = "x", level = 0.9),
+               confint(lm(y ~ x + z, d), parm = "x", level = 0.9), tolerance = 1e-8)
+
+  lmm <- fastglmm(y ~ x + z + (1 | g), d)
+  a <- c(0.025, 0.975)
+  want <- fixef(lmm) + lmm$se * t(vapply(lmm$coef_df, function(v) qt(a, v), a))
+  expect_equal(unname(confint(lmm)), unname(want), tolerance = 1e-10)
+  expect_identical(colnames(confint(lmm)), c("2.5 %", "97.5 %"))
+  expect_error(confint(lmm, level = 1), "level must be a number strictly between 0 and 1",
+               fixed = TRUE)
+  expect_error(confint(lmm, level = NA), "level must be a number strictly between 0 and 1",
+               fixed = TRUE)
+})
+
+test_that("an aliased coefficient gives an NA interval", {
+  d <- lmm_data()
+  d$x2 <- 2 * d$x
+  fit <- suppressWarnings(fastglmm(y ~ x + x2, d))
+  ci <- confint(fit)
+  expect_true(all(is.na(ci["x2", ])))
+  expect_true(all(is.finite(ci[c("(Intercept)", "x"), ])))
 })

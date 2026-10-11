@@ -1,0 +1,46 @@
+{
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0",
+      "glmmTMB": "1.1.14"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_anova.R"
+  },
+  "case": "ranova",
+  "reference": "mixture",
+  "full": {
+    "formula": "y ~ x + (1 | g)",
+    "logLik": -377.622614425438,
+    "npar": 4
+  },
+  "rows": [
+    {
+      "label": "(1 | g)",
+      "reduced_formula": "y ~ x",
+      "logLik": -524.038072228058,
+      "npar": 3,
+      "LRT": 292.83091560524,
+      "Df": 1,
+      "p_chisq": 1.20153264145679e-65,
+      "mixture_k": 0,
+      "p_mixture": 6.00766320728395e-66
+    }
+  ],
+  "name": "anova_ranova_lmm_intercept"
+}

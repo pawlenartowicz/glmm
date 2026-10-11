@@ -1,11 +1,13 @@
 #!/usr/bin/env Rscript
-# The accuracy grid's four gates, over one glmm run and the pinned oracle runs.
+# The accuracy grid's five gates, over one glmm run and the pinned oracle runs.
 #
 #   1. deviance vs the BEST oracle on the cell's estimator arm (hard)
 #   2. parameters vs the NEAREST oracle, backed by divergences.json
 #   3. truth error per family and arm, backed by divergences.json (reported
 #      only under --fast)
 #   4. the two port gates, glmm vs glmm_python and glmm vs glmm_r (round-off)
+#   5. per-coefficient Satterthwaite df vs lmerTest on the Gaussian LMM cells,
+#      backed by divergences.json in gate 2's scope (skipped by --ports-only)
 #
 # No engine is "the" reference. Gate 1 takes the best converged oracle on the
 # cell's arm, gate 2 passes a quantity that is in band against AT LEAST ONE
@@ -23,13 +25,16 @@
 # closest to glmm. It is reported and written up outside the gates.
 #
 # EXIT CODES. 0 every gate passed (or diverged as documented), 1 at least one
-# gate FAILED, 2 a precondition error: no matching oracle run, an oracle run
+# gate FAILED, 2 a precondition error: no matching oracle or lmerTest run, a run
 # whose engine_version does not match versions.json, an unmeasured tol.R
-# constant, an unreadable run directory. 2 is deliberately not 1 -- "the gate
-# says no" and "the gate could not run" are different statements. Every one of
-# those conditions reaches 2 by being CAUGHT, not by propagating: the whole body
-# runs inside one tryCatch, so a stop() from newest_oracle_run or tol_for prints
-# its message and exits 2 rather than an R traceback and a status of 1.
+# constant, an unreadable run directory. 2 is deliberately not 1 -- "the gate says no" and
+# "the gate could not run" are different statements. Every one of those
+# conditions reaches 2 by being CAUGHT, not by propagating: the whole body runs
+# inside one tryCatch, so a stop() from newest_oracle_run or tol_for prints its
+# message and exits 2 rather than an R traceback and a status of 1. Gate 5 is
+# the exception while coef_df_rel is NA (its reference pending): it prints NOT
+# RUN with the reason, a missing lmertest run included, every other gate runs,
+# and the status is the other gates'.
 
 suppressMessages(library(jsonlite))
 
@@ -73,8 +78,9 @@ cell <- function(d, m, w = 10) sprintf(sprintf("%%-%ds", w),
                                        if (is.na(d)) m else sprintf("%.0e/%s", d, m))
 
 # ── documented-divergence registry ───────────────────────────────────────────
-# Gates 2 and 3 read the registry, each in its own scope: "glmm-vs-oracle" for
-# gate 2, "glmm-vs-truth" for gate 3, so an entry for one never covers the other.
+# Gates 2, 3 and 5 read the registry, each gate in its scope: "glmm-vs-oracle"
+# for gate 2 and for gate 5 (quantity "coef_df"), "glmm-vs-truth" for gate 3, so
+# an entry for one scope never covers the other.
 # The four outcomes (no entry / covered / past max_rel / stale) are written out
 # once in the "//" string of divergences.json -- read them there rather than from
 # a copy here that can drift out of step.
@@ -290,8 +296,9 @@ port_gate <- function(grid_dir, rust, engine, known) {
     return(invisible(NULL))
   }
   cat(sprintf("\n=== glmm (Rust)  vs  %s (port) ===\n", engine))
-  cat(sprintf("%-34s  %-10s %-10s %-10s %-10s %-10s %-10s  %s\n",
-              "cell", "beta", "se_rx", "se_hess", "stddev", "deviance", "loglik", "coef"))
+  cat(sprintf("%-34s  %-10s %-10s %-10s %-10s %-10s %-10s %-10s  %s\n",
+              "cell", "beta", "se_rx", "se_hess", "stddev", "coef_df", "deviance",
+              "loglik", "coef"))
   compared <- 0L
   for (name in names(rust$recs)) {
     a <- rust$recs[[name]]; b <- pr$recs[[name]]
@@ -318,6 +325,11 @@ port_gate <- function(grid_dir, rust, engine, known) {
     no_sd <- length(stddevs_of(a)) == 0 && length(stddevs_of(b)) == 0
     d_sd <- if (no_sd) NA_real_ else port_rel_max(stddevs_of(a), stddevs_of(b))
     m_sd <- gate(d_sd, no_sd)
+    # coef_df like the SEs: n/a when neither side has a df (a GLMM cell records
+    # every entry null), a length mismatch when only one side does.
+    no_df_both <- no_df(a) && no_df(b)
+    d_df <- if (no_df_both) NA_real_ else port_rel_max(a$coef_df, b$coef_df)
+    m_df <- gate(d_df, no_df_both)
     no_dev <- is.null(a$deviance) || is.null(b$deviance)
     d_dev <- if (no_dev) NA_real_ else port_rel_max(a$deviance, b$deviance)
     m_dev <- gate(d_dev, no_dev)
@@ -329,7 +341,7 @@ port_gate <- function(grid_dir, rust, engine, known) {
     m_ll <- gate(d_ll, no_ll)
     coef_ok <- identical(a$coef_names, b$coef_names)
 
-    marks <- c(m_beta, m_se_rx, m_se_h, m_sd, m_dev, m_ll)
+    marks <- c(m_beta, m_se_rx, m_se_h, m_sd, m_df, m_dev, m_ll)
     failed <- any(marks %in% c("FAIL", "FAIL(len)")) || !coef_ok
     if (name %in% known) {
       # Relabel FAIL -> KNOWN for display; do NOT count toward any_fail.
@@ -337,10 +349,10 @@ port_gate <- function(grid_dir, rust, engine, known) {
     } else {
       any_fail <<- any_fail || failed
     }
-    cat(sprintf("%-34s  %s %s %s %s %s %s  %s\n", name,
+    cat(sprintf("%-34s  %s %s %s %s %s %s %s  %s\n", name,
                 cell(d_beta, marks[1]), cell(d_se_rx, marks[2]), cell(d_se_h, marks[3]),
-                cell(d_sd, marks[4]), cell(d_dev, marks[5]), cell(d_ll, marks[6]),
-                if (coef_ok) "ok" else "MISMATCH"))
+                cell(d_sd, marks[4]), cell(d_df, marks[5]), cell(d_dev, marks[6]),
+                cell(d_ll, marks[7]), if (coef_ok) "ok" else "MISMATCH"))
   }
   # Every port run says how much of the glmm run it actually covered. A port run
   # from a different cell selection shares no cell with this one, prints an empty
@@ -353,6 +365,139 @@ port_gate <- function(grid_dir, rust, engine, known) {
     cat(sprintf(paste0("FAIL: the %s run shares no cell with the glmm run, so its port ",
                        "gate compared nothing. Run that port over the same cells.\n"),
                 engine))
+    any_fail <<- TRUE
+  }
+}
+
+# ── gate 5: Satterthwaite df vs lmerTest ─────────────────────────────────────
+# glmm's per-coefficient `coef_df` against lmerTest's, on every selected cell
+# whose manifest `oracles` name lmerTest (the Gaussian cells with a random
+# effect), by rel_max_by_coef against tol_for(cell, "coef_df_rel"). lmerTest is
+# not in ORACLES: its fit is lme4's, so gates 1 to 3 never read it, and this gate
+# reads nothing else of its record. Registry-backed like gate 2 and in gate 2's
+# scope, quantity "coef_df", so it runs before div_stale("glmm-vs-oracle").
+#
+# Each cell gets one mark:
+#   ok / FAIL / DOC  both records converged and carry df: compared.
+#   glmm-fail        glmm has no converged fit; gate 2's loop has failed it already.
+#   FAIL(no-df)      glmm converged and its record has no `coef_df` (absent, null
+#                    or empty): an engine that never wrote the field. A converged
+#                    Gaussian LMM fit owes df, so a cell that cannot be compared
+#                    for that reason fails rather than passing in silence.
+#   failed-pass      glmm converged and wrote `coef_df` with every entry null: its
+#                    Satterthwaite pass ran and failed (the crate's failed record,
+#                    every df NaN). Left out of the band, counted and listed in
+#                    the gate's summary, not failed: the crate reports the failure
+#                    itself (a note on the fit), so there is no df to hold to a band.
+#   no-ref           lmerTest did not converge or reported no df: nothing to compare
+#                    against, listed loudly and not failed, gate 2's no-ref rule.
+# The note column names the singular flag of each side whenever either is set: a
+# boundary cell is read against both fits' state.
+LMERTEST <- "lmerTest"
+
+# The newest complete, full, untimed lmertest run at the pinned version, by the
+# rule every oracle reference is found with (runs.R::newest_oracle_run). With no
+# such run while coef_df_rel is NA, the reason gate 5 is pending, as a string;
+# with the band measured, a missing run stops (exit 2), as a version mismatch
+# always does.
+load_lmertest_run <- function(grid_dir, cells_all) {
+  required <- names(Filter(function(cl) LMERTEST %in% cl[["oracles"]], cells_all))
+  r <- newest_oracle_run(grid_dir, LMERTEST, grid_versions(grid_dir)[[LMERTEST]], required)
+  if (is.null(r)) {
+    if (!is.na(TOL$coef_df_rel)) {
+      stop(sprintf(paste0("no run under runs/%s/ is a reference for gate 5: it needs ",
+                          "subset \"full\", no timing, and a record for all %d cells whose ",
+                          "manifest `oracles` name lmerTest. Run ./run.sh lmertest first."),
+                   ENGINE_DIR[[LMERTEST]], length(required)), call. = FALSE)
+    }
+    return(sprintf(paste0("no run under runs/%s/ is a reference: gate 5 needs subset ",
+                          "\"full\", no timing, and a record for all %d cells whose manifest ",
+                          "`oracles` name lmerTest (./run.sh lmertest)"),
+                   ENGINE_DIR[[LMERTEST]], length(required)))
+  }
+  cat(sprintf("%-14s %s  (version %s, %d cells required)\n", "lmerTest:", r$dir,
+              r$meta$engine_version, length(required)))
+  r
+}
+
+# Why gate 5 did not run (NULL when it ran), for the closing summary.
+gate5_pending <- NULL
+
+# No df to read: the field is absent, null or empty, or every entry is null.
+no_df <- function(rec) is.null(rec$coef_df) || all(is.na(rec$coef_df))
+# The field was never written (absent, null or empty), as against written with
+# every entry null.
+df_unwritten <- function(rec) is.null(rec$coef_df) || !length(rec$coef_df)
+
+# "" when neither fit is singular, else both flags.
+singular_note <- function(g, r) {
+  if (!isTRUE(g$singular) && !isTRUE(r$singular)) return("")
+  sprintf("singular: glmm=%s lmerTest=%s", isTRUE(g$singular), isTRUE(r$singular))
+}
+
+df_gate <- function(cells, glmm_recs, lt_run) {
+  ids <- names(Filter(function(cl) LMERTEST %in% cl[["oracles"]], cells))
+  cat(sprintf("\n=== gate 5: per-coefficient Satterthwaite df vs lmerTest (%d cell(s)) ===\n",
+              length(ids)))
+  if (!length(ids)) return(invisible(NULL))
+  # Pending, not failed: the reference run or the band it measures is not there
+  # yet. Read as tol_for reads the band, so an NA never reaches mark().
+  pending <- if (is.character(lt_run)) lt_run
+             else if (is.na(TOL$coef_df_rel))
+               "TOL$coef_df_rel is not measured yet (grid/tol.R; the full lmertest run measures it)"
+  if (!is.null(pending)) {
+    gate5_pending <<- pending
+    cat(sprintf("gate 5 NOT RUN (pending: %s)\n", pending))
+    return(invisible(NULL))
+  }
+  cat(sprintf("%-34s %-6s %-12s %s\n", "cell", "reml", "coef_df", "note"))
+  compared <- 0L
+  no_ref <- character(0)
+  failed_pass <- character(0)
+  for (cid in ids) {
+    g <- glmm_recs[[cid]]; r <- lt_run$recs[[cid]]
+    d <- NA_real_; note <- ""
+    if (!isTRUE(g$converged)) {
+      m <- "glmm-fail"
+    } else if (df_unwritten(g)) {
+      m <- "FAIL(no-df)"; note <- "glmm recorded no coef_df"
+    } else if (no_df(g)) {
+      m <- "failed-pass"; note <- "glmm's Satterthwaite pass failed (every coef_df null)"
+      failed_pass <- c(failed_pass, cid)
+    } else if (!isTRUE(r$converged) || no_df(r)) {
+      m <- "no-ref"
+      # lme4's convergence messages span lines; one row per cell.
+      msg <- if (is.null(r$message)) "" else paste0(" message=", gsub("\\s+", " ", r$message))
+      note <- sprintf("lmerTest status=%s%s", if (is.null(r$status)) "-" else r$status, msg)
+      no_ref <- c(no_ref, sprintf("%s: %s", cid, note))
+    } else {
+      # A glmm vector with SOME entries null (a non-finite stencil on one column,
+      # or a column one engine keeps and the other drops) is a shape disagreement
+      # to rel_max_by_coef: NA, so FAIL(len). div_mark re-marks only FAIL, so such
+      # a cell is never registrable: it is investigated, not documented.
+      d <- rel_max_by_coef(g$coef_df, g$coef_names, r$coef_df, r$coef_names)
+      compared <- compared + 1L
+      div_seen <<- union(div_seen, paste("glmm-vs-oracle", cid, "coef_df"))
+      m <- div_mark(mark(d, tol_for(cid, "coef_df_rel")), d, cid, "coef_df",
+                    "glmm-vs-oracle")
+    }
+    sing <- singular_note(g, r)
+    if (nzchar(sing)) note <- if (nzchar(note)) paste0(note, "; ", sing) else sing
+    if (m %in% c("FAIL", "FAIL(len)", "FAIL(no-df)")) any_fail <<- TRUE
+    cat(sprintf("%-34s %-6s %s %s\n", cid, isTRUE(cells[[cid]][["reml"]]),
+                cell(d, m, 12), note))
+  }
+  cat(sprintf("compared: %d of %d cells\n", compared, length(ids)))
+  cat(sprintf(paste0("\n=== gate 5 failed-pass (%d cell(s): glmm's Satterthwaite pass ",
+                     "failed, left out of the band, not failed) ===\n"),
+              length(failed_pass)))
+  if (length(failed_pass)) for (cid in failed_pass) cat(sprintf("  %s\n", cid)) else cat("  none\n")
+  cat(sprintf("\n=== gate 5 no-ref (%d cell(s): lmerTest gave no df to compare against) ===\n",
+              length(no_ref)))
+  if (length(no_ref)) for (line in no_ref) cat(sprintf("  %s\n", line)) else cat("  none\n")
+  # A gate that compared nothing has not passed, the rule the port gate follows.
+  if (compared == 0L) {
+    cat("FAIL: gate 5 compared no cell\n")
     any_fail <<- TRUE
   }
 }
@@ -692,7 +837,7 @@ load_inputs <- function(grid_dir) {
     Filter(Negate(is.null),
            setNames(lapply(ORACLES, function(o) runs[[o]]$recs[[cid]]), ORACLES))),
     names(cells))
-  list(grid_dir = grid_dir, glmm_run = glmm_run, cells = cells,
+  list(grid_dir = grid_dir, glmm_run = glmm_run, cells = cells, cells_all = cells_all,
        orec_by_cell = orec_by_cell, no_record = no_record)
 }
 
@@ -712,6 +857,11 @@ run_gates <- function() {
 
   inp <- load_inputs(grid_dir)
   glmm_run <- inp$glmm_run; cells <- inp$cells; orec_by_cell <- inp$orec_by_cell
+  # Loaded before any gate prints, so a missing or mismatched lmerTest run is a
+  # precondition error (exit 2) like a missing oracle run, except that while
+  # coef_df_rel is NA a missing one leaves gate 5 pending (the reason string)
+  # and the other gates run.
+  lmertest_run <- load_lmertest_run(grid_dir, inp$cells_all)
 
   # Deviance-gate summary accumulators, printed as three blocks below.
   dev_win <- character(0)   # DEV-WIN cells (Delta <= 0), informational
@@ -914,6 +1064,9 @@ run_gates <- function() {
               length(no_mle)))
   if (length(no_mle)) for (line in no_mle) cat(sprintf("  %s\n", line)) else cat("  none\n")
 
+  # Before the registry's staleness check: gate 5 shares gate 2's scope.
+  df_gate(cells, glmm_run$recs, lmertest_run)
+
   # Printed unconditionally when anything fired, so a DOC cell above always has a
   # named reason next to it in the same output.
   if (length(div_fired)) {
@@ -953,6 +1106,8 @@ status <- tryCatch({
     run_dev_floor()
   } else {
     run_gates()
+    if (!is.null(gate5_pending))
+      cat(sprintf("\ngate 5 NOT RUN (pending: %s); not counted as a failure\n", gate5_pending))
     cat(sprintf("\n%s\n",
                 if (any_fail) "RESULT: disagreements found -- investigate (flag, do not relax tolerance)"
                 else "RESULT: all gated quantities agree, or diverge as documented"))

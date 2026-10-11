@@ -12,6 +12,8 @@
 //! - [`formula`] (cargo feature, on by default): the R-style formula frontend —
 //!   `formula::lower("y ~ x + (1|g)", &table, family)` builds the kernel's inputs
 //!   from a formula string and a data table instead of by hand.
+//! - [`inference`]: the hypothesis tests on fitted models. Like
+//!   `loop_advanced`, outside the semver promise until the 1.0 surface review.
 //!
 //! - `orchestrate` (cargo feature, off by default): the string-typed fit
 //!   orchestration the FFI ports (`glmm-python`, `glmm-r`) share — like
@@ -31,6 +33,8 @@
 //! - `oracle-tests` (cargo feature, off by default, dev-only): the cross-engine
 //!   tier that checks the crate against the frozen lme4 / MixedModels /
 //!   GLMMadaptive goldens.
+//! - `montecarlo-tests` (cargo feature, off by default, dev-only): the Monte
+//!   Carlo tier, level studies checked against seeded bands.
 
 // Every fit route (OLS, GLM, LMM, GLMM) is wired into the stable `fit` module
 // regardless of this feature — see `documentation/algorithms.md` for the full
@@ -47,6 +51,7 @@
 
 pub mod consts;
 pub mod dual;
+pub mod inference;
 pub mod linalg;
 pub mod scalar;
 pub mod simd_transcendental;

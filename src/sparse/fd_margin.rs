@@ -53,6 +53,7 @@ use crate::glmm::{
     fd_mixed_diff, fd_second_diff, fill_packed_cols, glmm_laplace_deviance, pirls_tol_fd,
     GlmmLayout, GlmmWorkspace, StructuredSchur, FD_STEP_BASE, SPARSE_FD_STEP_REL,
 };
+use crate::test_support::table_from_rows;
 use crate::{
     BinomialLink, Family, FitOptions, GammaLink, GroupIds, ModelSpec, NegBinomialLink, PoissonLink,
     WaldSe,
@@ -116,25 +117,15 @@ fn read_csv(path: &str) -> (Vec<String>, Vec<Vec<String>>) {
 
 /// Manifest `factors` become `Column::Factor`; a column that fails to parse as
 /// `f64` anywhere falls back to `Factor` (the corpus carries categorical helper
-/// columns no formula references). Mirrors the validation harness's `build_table`.
+/// columns no formula references), by [`table_from_rows`]; a `.` in a column
+/// name becomes `_`. Mirrors the validation harness's `build_table`.
 fn build_table(header: &[String], rows: &[Vec<String>], factors: &[String]) -> Table {
-    let n = rows.len();
-    let columns = header
-        .iter()
-        .enumerate()
-        .map(|(j, name)| {
-            let is_factor = factors.iter().any(|f| f == name)
-                || rows.iter().any(|r| r[j].parse::<f64>().is_err());
-            let col = if is_factor {
-                let labels: Vec<String> = rows.iter().map(|r| r[j].clone()).collect();
-                Column::factor_from_labels(&labels)
-            } else {
-                Column::Numeric(rows.iter().map(|r| r[j].parse().unwrap()).collect())
-            };
-            (name.replace('.', "_"), col)
-        })
-        .collect();
-    Table { columns, n }
+    let factors: Vec<&str> = factors.iter().map(String::as_str).collect();
+    let mut table = table_from_rows(header, rows, &factors);
+    for (name, _) in &mut table.columns {
+        *name = name.replace('.', "_");
+    }
+    table
 }
 
 fn family_of(spec: &Value) -> Family {

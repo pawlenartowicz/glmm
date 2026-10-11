@@ -53,10 +53,12 @@ def _dispersion_label(fit):
     return "Dispersion (phi, Pearson)"
 
 
-# Same sentence the R port prints - change together.
-FOOTNOTE = (
-    "z value / Pr(>|z|) are Wald z on the asymptotic normal; no t or residual df is reported."
-)
+# The footer of a Gaussian mixed model's t tests. Same sentence the R port prints -
+# change together.
+FOOTNOTE = "t tests use Satterthwaite degrees of freedom (finite-difference θ-Hessian)."
+# The footer of a Gaussian mixed model fitted with satterthwaite=False; the R port
+# prints "df not computed (satterthwaite = FALSE)", its own argument spelling.
+DF_NOT_COMPUTED = "df not computed (satterthwaite=False)"
 
 
 def fmt(x, digits=4):
@@ -163,12 +165,36 @@ def build_summary(fit):
     se = np.asarray(fit.se, dtype=float)
     aliased = np.asarray(fit.aliased, dtype=bool)
     with np.errstate(invalid="ignore", divide="ignore"):
-        z = beta / se
-    p = np.array([math.erfc(abs(v) / math.sqrt(2.0)) if math.isfinite(v) else math.nan for v in z])
+        statistic = beta / se
+    # t (with the kernel's p) where the fit has a df, Wald z on the normal
+    # elsewhere; a df column only for the Satterthwaite df, which differs per
+    # row. Mirrors the R port's .coef_tests - change together.
+    # getattr, not fit.df_method: a Fit pickled before this attribute existed
+    # still summarizes, as the z table its version printed.
+    df_method = getattr(fit, "df_method", "none")
+    t_test = df_method in ("satterthwaite", "residual")
+    if t_test:
+        p = np.asarray(fit.coef_p, dtype=float)
+    else:
+        p = np.array(
+            [
+                math.erfc(abs(v) / math.sqrt(2.0)) if math.isfinite(v) else math.nan
+                for v in statistic
+            ]
+        )
+    coef_df = np.asarray(fit.coef_df, dtype=float) if df_method == "satterthwaite" else None
     beta = np.where(aliased, math.nan, beta)
     se = np.where(aliased, math.nan, se)
-    z = np.where(aliased, math.nan, z)
+    statistic = np.where(aliased, math.nan, statistic)
     p = np.where(aliased, math.nan, p)
+    if coef_df is not None:
+        coef_df = np.where(aliased, math.nan, coef_df)
+    footnote = {"satterthwaite": FOOTNOTE, "disabled": DF_NOT_COMPUTED}.get(df_method)
+    # n - p, the residual df of OLS and the dispersion GLMs' footers. The kernel's
+    # coef_df carries the same n - p on these fits but NaN on a non-converged one,
+    # whose footer still prints n - p; R's .residual_df counts the same way -
+    # change together.
+    residual_df = int(fit.nobs - np.count_nonzero(~aliased)) if df_method == "residual" else None
 
     if fit.reml:
         criterion = {"REML criterion at convergence": -2.0 * fit.loglik}
@@ -185,26 +211,18 @@ def build_summary(fit):
     if len(fit.fitted) == len(fit.y) and len(fit.fitted) > 0:
         scaled = np.quantile(pearson_residuals(fit), [0.0, 0.25, 0.5, 0.75, 1.0])
 
+    # No `se` column: lme4 and the R port print none, and `Fit.stddev_se` keeps
+    # the numbers.
     random_effects = []
-    theta_off = 0
     for g in range(len(fit.varcorr)):
         sd, corr = fit.stddev_corr(g)
-        q = len(sd)
         group, terms = fit.re_groups[g]
-        # stddev_se is theta-layout: one entry per vech element per grouping;
-        # a stddev's SE sits at its diagonal vech position.
-        se_sd = []
-        for i in range(q):
-            di = theta_off + (i * q - (i * i - i) // 2)
-            se_sd.append(fit.stddev_se[di] if di < len(fit.stddev_se) else math.nan)
-        theta_off += q * (q + 1) // 2
         random_effects.append(
             {
                 "group": group,
                 "terms": list(terms),
                 "variance": sd * sd,
                 "stddev": sd,
-                "se": np.array(se_sd),
                 "corr": corr,
             }
         )
@@ -246,8 +264,14 @@ def build_summary(fit):
         coef_names=list(fit.names),
         estimate=beta,
         std_error=se,
-        z_value=z,
+        coef_df=coef_df,
+        statistic=statistic,
+        test="t" if t_test else "z",
         p_value=p,
+        residual_df=residual_df,
+        rss=getattr(fit, "rss", math.nan),
+        r_squared=getattr(fit, "r_squared", math.nan),
+        adj_r_squared=getattr(fit, "adj_r_squared", math.nan),
         aliased=aliased,
         corr_fixed=corr_fixed,
         dispersion_label=_dispersion_label(fit),
@@ -256,7 +280,7 @@ def build_summary(fit):
         converged=fit.converged,
         singular=fit.singular,
         n_aliased=int(aliased.sum()),
-        footnote=FOOTNOTE,
+        footnote=footnote,
         # getattr, not fit.warnings: a Fit pickled before this attribute existed
         # still needs to summarize.
         warnings=list(getattr(fit, "warnings", [])),
@@ -279,8 +303,14 @@ class Summary:
     coef_names: list
     estimate: np.ndarray
     std_error: np.ndarray
-    z_value: np.ndarray
+    coef_df: np.ndarray | None  # the df column, printed on Satterthwaite t tests only
+    statistic: np.ndarray
+    test: str  # "t" or "z": the statistic's column names
     p_value: np.ndarray
+    residual_df: int | None  # n - p on OLS and the dispersion GLMs, else None
+    rss: float
+    r_squared: float
+    adj_r_squared: float
     aliased: np.ndarray
     corr_fixed: np.ndarray | None
     dispersion_label: str | None
@@ -289,7 +319,7 @@ class Summary:
     converged: bool
     singular: bool
     n_aliased: int
-    footnote: str
+    footnote: str | None
     warnings: list = field(default_factory=list)
 
     def __repr__(self):
@@ -337,20 +367,23 @@ class Summary:
         out.append("Fixed effects:")
         header, rows = by_title["Fixed effects"]
         name_w = max(12, max((len(n) for n in self.coef_names), default=4))
-        widths = [12, 12, 10, 10]
+        widths = [12, 12] + ([10] if self.coef_df is not None else []) + [10, 10]
+        k = len(widths)
         out.append(
-            f"{'':<{name_w}} " + " ".join(f"{h:>{wi}}" for h, wi in zip(header[1:5], widths))
+            f"{'':<{name_w}} " + " ".join(f"{h:>{wi}}" for h, wi in zip(header[1 : k + 1], widths))
         )
         for r in rows:
             out.append(
                 f"{r[0]:<{name_w}} "
-                + " ".join(f"{c:>{wi}}" for c, wi in zip(r[1:5], widths))
-                + f" {r[5]}"
+                + " ".join(f"{c:>{wi}}" for c, wi in zip(r[1 : k + 1], widths))
+                + f" {r[k + 1]}"
             )
         out.append("---")
         out.append("Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1")
         if self.n_aliased:
             out.append(f"({self.n_aliased} coefficient(s) not defined because of singularities)")
+        if self._lm_lines():
+            out += ["", *self._lm_lines()]
         out.append("")
 
         if "Correlation of Fixed Effects" in by_title:
@@ -367,11 +400,12 @@ class Summary:
             out.append("")
 
         if self.dispersion_label is not None:
-            out.append(f"{self.dispersion_label}: {fmt(self.dispersion, 6)}")
+            out.append(self._dispersion_line())
         out.append(f"Optimizer evaluations: {self.n_eval}, converged: {self.converged}")
         if self.singular:
             out.append("boundary (singular) fit: see help('isSingular')")
-        out.append(self.footnote)
+        if self.footnote is not None:
+            out.append(self.footnote)
         if self.warnings:
             # Mirrors print.summary.fastglmm (r/R/fastglmm-methods.R) - change together.
             out += ["", "Warnings:"]
@@ -381,6 +415,31 @@ class Summary:
         return "\n".join(out)
 
     # -- shared block decomposition ---------------------------------------
+
+    def _lm_lines(self):
+        """`summary.lm`'s two footer lines on an OLS fit (it has an R-squared),
+        nothing otherwise. Same lines as the R port's print.summary.fastglmm -
+        change together - except that R prints a residual standard error of 1e4
+        or more in fixed notation (`format(signif(x, 4))`, "12350") where `fmt`
+        switches to e-notation ("1.235e+04")."""
+        if self.residual_df is None or self.family != "gaussian":
+            return []
+        sigma = math.sqrt(self.rss / self.residual_df) if self.residual_df > 0 else math.nan
+        return [
+            f"Residual standard error: {fmt(sigma)} on {self.residual_df} degrees of freedom",
+            (
+                f"Multiple R-squared:  {fmt(self.r_squared)},\t"
+                f"Adjusted R-squared:  {fmt(self.adj_r_squared)}"
+            ),
+        ]
+
+    def _dispersion_line(self):
+        """The dispersion row, with the residual df its t tests use on a
+        dispersion GLM with phi estimated."""
+        line = f"{self.dispersion_label}: {fmt(self.dispersion, 6)}"
+        if self.residual_df is not None:
+            line += f" on {self.residual_df} degrees of freedom"
+        return line
 
     def _tables(self):
         """Blocks as (title, header, rows) with every cell already a string via
@@ -422,7 +481,6 @@ class Summary:
                             re["terms"][i] if i < len(re["terms"]) else "",
                             fmt(re["variance"][i]),
                             fmt(re["stddev"][i]),
-                            fmt(re["se"][i]),
                             corr,
                         ]
                     )
@@ -434,26 +492,36 @@ class Summary:
                         fmt(self.residual_variance),
                         fmt(math.sqrt(self.residual_variance)),
                         "",
-                        "",
                     ]
                 )
             tables.append(
-                ("Random effects", ["Groups", "Name", "Variance", "Std.Dev.", "se", "Corr"], rows)
+                ("Random effects", ["Groups", "Name", "Variance", "Std.Dev.", "Corr"], rows)
             )
+        df_cells = (
+            (lambda i: [fmt(self.coef_df[i])]) if self.coef_df is not None else (lambda i: [])
+        )
         rows = [
             [
                 n,
                 fmt(self.estimate[i]),
                 fmt(self.std_error[i]),
-                fmt(self.z_value[i]),
+                *df_cells(i),
+                fmt(self.statistic[i]),
                 fmt_p(self.p_value[i]),
                 stars(self.p_value[i]).strip(),
             ]
             for i, n in enumerate(self.coef_names)
         ]
-        tables.append(
-            ("Fixed effects", ["", "Estimate", "Std. Error", "z value", "Pr(>|z|)", ""], rows)
-        )
+        header = [
+            "",
+            "Estimate",
+            "Std. Error",
+            *(["df"] if self.coef_df is not None else []),
+            f"{self.test} value",
+            f"Pr(>|{self.test}|)",
+            "",
+        ]
+        tables.append(("Fixed effects", header, rows))
         if self.corr_fixed is not None:
             names = self.coef_names
             rows = [
@@ -482,14 +550,16 @@ class Summary:
         # cross-renderer numeric-parity test checks every number in `text()`
         # shows up somewhere in each render.
         lines = ["Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1"]
+        lines += self._lm_lines()
         if self.dispersion_label is not None:
-            lines.append(f"{self.dispersion_label}: {fmt(self.dispersion, 6)}")
+            lines.append(self._dispersion_line())
         lines.append(f"Optimizer evaluations: {self.n_eval}, converged: {self.converged}")
         if self.singular:
             lines.append("boundary (singular) fit: see help('isSingular')")
         if self.n_aliased:
             lines.append(f"{self.n_aliased} coefficient(s) not defined because of singularities")
-        lines.append(self.footnote)
+        if self.footnote is not None:
+            lines.append(self.footnote)
         return lines
 
     # -- html --------------------------------------------------------------

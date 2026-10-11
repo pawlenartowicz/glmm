@@ -36,8 +36,9 @@ use grid_common::fit_cell;
 use serde_json::Value;
 
 /// The band every quantity here is compared at. Mirrors `TOL$ci_ref_rel` in
-/// `validation/grid/tol.R` and `CI_REF_REL` in
-/// `r/tests/testthat/helper-pins.R` -- change all three together. `tol.R`
+/// `validation/grid/tol.R`, `CI_REF_REL` in `r/tests/testthat/helper-pins.R`
+/// and `_CONFINT_PIN_REL` in `python/tests/test_warnings.py`: change all four
+/// together. `tol.R`
 /// carries the provenance: it is the crate's cross-architecture pin band for the
 /// iterative fit paths, plus the release-versus-test build profile difference,
 /// and the measurement on CI's own runner pool is still pending.
@@ -174,13 +175,16 @@ fn cmp_json(got: &Value, want: &Value, ctx: &str, fails: &mut Vec<String>, worst
     }
 }
 
-/// The keys compared. Every fitted quantity the record carries, and nothing
-/// else.
+/// The keys compared. Every fitted quantity the record carries but `coef_df`,
+/// and nothing else.
 ///
 /// `n_eval` is deliberately OUT: the optimizer's evaluation count is a path
 /// length, and a different build or CPU can reach the same optimum by a
 /// different route, so gating it would report a rounding difference as a
-/// regression. `wall_seconds` is null on an untimed run, `message` is prose,
+/// regression. `coef_df` is OUT because its Satterthwaite df come from a
+/// finite-difference pass whose round-off across CPUs is likely above
+/// `ci_ref_rel`; compare.R's port gate and its gate 5 (against lmerTest) hold
+/// it instead. `wall_seconds` is null on an untimed run, `message` is prose,
 /// and `engine`/`engine_version`/`cell`/`status`/`fits_per_sample` are
 /// provenance the test checks separately or not at all. `deviance` is kept even
 /// though `set_loglik` derives it from `loglik`: it costs nothing and it is the

@@ -78,11 +78,9 @@ fn main() {
         primary: dense_ids(&fac[0]),
         extra: fac[1..].iter().map(|f| dense_ids(f)).collect(),
     };
-    let opts = FitOptions {
-        target_indices: vec![0, 1],
-        wald_se: WaldSe::Rx,
-        ..FitOptions::default()
-    };
+    let mut opts = FitOptions::default();
+    opts.target_indices = vec![0, 1];
+    opts.wald_se = WaldSe::Rx;
     let f = glmm::fit_cold(&x, &y, n, p, &model, &ids, &opts);
     println!("converged      = {:?}", f.converged());
     println!("beta           = {:?}", f.beta);

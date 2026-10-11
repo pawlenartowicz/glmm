@@ -26,7 +26,11 @@ use glmm::{fit_cold, Family, FitOptions, GroupIds, ModelSpec, ReStructure, Sizin
 let n = 12;
 let p = 2;
 let x: Vec<f64> = (0..n).flat_map(|i| [1.0, i as f64 * 0.1]).collect();
-let y: Vec<f64> = (0..n).map(|i| 1.0 + 0.3 * (i as f64 * 0.1) + (i % 6) as f64 * 0.05).collect();
+// y = 1 + 0.3·x1, plus a shift per group and a term that varies within a group
+// (so the model does not fit y exactly).
+let y: Vec<f64> = (0..n)
+    .map(|i| 1.0 + 0.3 * (i as f64 * 0.1) + (i % 6) as f64 * 0.05 + ((i * 7) % 5) as f64 * 0.02)
+    .collect();
 
 // y ~ x1 + (1 | group) — Gaussian, random intercept.
 let model = ModelSpec {
@@ -39,7 +43,8 @@ let model = ModelSpec {
 };
 let ids = GroupIds { primary: (0..n as u32).map(|i| i % 6).collect(), extra: vec![] };
 
-let opts = FitOptions { target_indices: vec![0, 1], ..Default::default() }; // SE for both columns
+let mut opts = FitOptions::default();
+opts.target_indices = vec![0, 1]; // SE for both columns
 
 let fit = fit_cold(&x, &y, n, p, &model, &ids, &opts);
 assert!(fit.converged());
@@ -66,7 +71,7 @@ Points worth knowing at this layer:
   `fit.diagnostics`, with `converged()`/`singular()`/`aliased()` kept as
   forwarding accessors for the three most-read ones.
 - **Experimental: in-fit parallelism.** Building with the `parallel` cargo
-  feature *and* setting `FitOptions { parallel_inner: true, .. }` runs the AGQ
+  feature *and* setting `opts.parallel_inner = true` runs the AGQ
   cluster loop and the FD-Hessian SE grid on rayon threads. Both default to
   off — the flag alone does nothing in a default build, and the feature alone
   spawns nothing until the flag is set. Results are bit-identical to serial;
@@ -82,6 +87,53 @@ Points worth knowing at this layer:
   mixed model with any extra grouping carrying a random slope, or a design
   with too many crossed levels, is likewise routed to the sparse solver
   automatically — every family fits either way, with no reachable panic.
+
+**Degrees of freedom and contrasts.** A Gaussian mixed fit also carries
+lmerTest's Satterthwaite degrees of freedom: one derivative pass after the
+fit, with no refit, on by default (`FitOptions::satterthwaite`). They give t
+tests where `se` alone gives only z:
+
+```rust
+use glmm::inference::contrast::{ContrastError, NoDfReason};
+
+// Satterthwaite df of each target coefficient: the `df` column of lmerTest's
+// `summary()`.
+println!("df = {:?}", fit.coef_df);
+
+// t test of one contrast lᵀβ = 0, `l` over all p columns: here the slope.
+let t = fit.contrast_t(&[0.0, 1.0]).expect("a Gaussian LMM fit carries df");
+println!("t = {} on {} df, p = {}", t.t, t.df, t.p_value);
+
+// F test of Lβ = 0, `L` row-major (rows × p): here both coefficients.
+let f = fit.contrast_f(&[1.0, 0.0, 0.0, 1.0], 2).expect("df");
+println!("F({}, {}) = {}, p = {}", f.num_df, f.den_df, f.f, f.p_value);
+
+// With the pass switched off, the contrasts say why there is no df.
+let mut off = opts.clone();
+off.satterthwaite = false;
+let fit_off = fit_cold(&x, &y, n, p, &model, &ids, &off);
+assert!(fit_off.coef_df.iter().all(|d| d.is_nan()));
+assert_eq!(
+    fit_off.contrast_t(&[0.0, 1.0]),
+    Err(ContrastError::NoDf(NoDfReason::Disabled))
+);
+```
+
+- `coef_df` is NaN on columns outside `target_indices`, on aliased columns,
+  and on every family without a df (binomial, Poisson, negative binomial,
+  every GLMM). OLS and the Gamma and inverse-Gaussian GLMs with φ estimated
+  carry the residual df `n − p` instead, whatever `satterthwaite` says, and
+  their contrasts are the classical t and F.
+- `contrast_t` returns lmerTest's `contest1D` (`estimate`, `se`, `t`, `df`,
+  `p_value`), `contrast_f` its `contestMD` (`f`, `num_df`, `den_df`,
+  `p_value`). Both read only what the pass left on the `Fit`. A contrast that
+  touches an aliased column gives NaN fields and a
+  `ContrastNote::AliasedColumn` in `notes`; a fit with no df gives
+  `ContrastError::NoDf` with the reason, never a silent z test.
+- When the pass cannot take the curvature at face value, the fit carries
+  `Note::SatterthwaiteCurvature` in `diagnostics.notes`
+  ([`warnings.md`](warnings.md) has the cases). The method is in
+  [`algorithms-lmm.md`](algorithms-lmm.md#satterthwaite-degrees-of-freedom).
 
 ## 2. Warm fit — reusing a previous solution
 
@@ -148,6 +200,32 @@ for draw in draws {
     // let fit = view.into_fit(&draw.x, &draw.y, &sized_ids, n, p, &model, &opts);
 }
 ```
+
+The loop tier runs no Satterthwaite pass by itself: a `Fit` that
+`FitView::into_fit` assembles from an LMM workspace carries no df, and its
+contrasts return `NoDfReason::StateMissing`. Ask for the df on the draws that
+need them, after `fit_on` (or `fit_on_hinted`) and with the view dropped:
+
+```rust
+use glmm::loop_advanced::satterthwaite;
+
+let mut df_out = vec![0.0; p];
+let view = fit_on(&mut ws, &draw.x, &draw.y, &sized_ids, start.as_ref(), &opts);
+let converged = view.converged();
+drop(view);
+if converged {
+    // Gaussian LMM workspaces only; NaN off the target columns.
+    satterthwaite(&mut ws, &mut df_out)?;
+}
+```
+
+It gives the stable path's `coef_df` for the draw, reads θ̂ without writing
+it (so it and `curvature_hint` answer the same in either order), and keeps
+its buffers on the workspace: a call after the first allocates only the
+pseudo-inverse's blocks. Any other workspace returns
+`Err(ContrastError::NoDf(NoDfReason::NotGaussianMixed))`, and a failed pass
+returns `NoDfReason::Failed` with `df_out` all NaN. On a rank-deficient draw
+the df are as untrustworthy as β̂, so read the diagnostics first, as below.
 
 `fit_on` panics rather than misroutes: the design shape (rows, predictors, RE
 level counts) and the options frozen at build (`nagq`, whether weights and

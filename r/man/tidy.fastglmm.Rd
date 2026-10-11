@@ -15,6 +15,9 @@
 A \code{data.frame}.
 }
 \description{
-One row per fixed effect: \code{term}, \code{estimate}, \code{std.error}, \code{statistic}
-(Wald z) and \code{p.value} (normal). Aliased coefficients are \code{NA} rows.
+One row per fixed effect: \code{term}, \code{estimate}, \code{std.error}, \code{statistic},
+\code{df} (only where \link[=summary.fastglmm]{summary()} has a df column: the
+Satterthwaite df of a Gaussian mixed model) and \code{p.value}. The statistic
+and p-value are the summary's: t where it tests with t, Wald z on the
+normal otherwise. Aliased coefficients are \code{NA} rows.
 }

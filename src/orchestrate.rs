@@ -15,7 +15,9 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use crate::fit::theta_width;
 use crate::formula::{label_ranef, lower, Column, Table};
-use crate::{fit_warm, Boundary, Family, Note, OuterStop, StartValues, WaldSe};
+use crate::inference::contrast::{ContrastError, NoDfReason};
+use crate::inference::tails::{normal_quantile, t_quantile};
+use crate::{fit_warm, Boundary, Family, Fit, Note, OuterStop, StartValues, WaldSe};
 use crate::{BinomialLink, GammaLink, InverseGaussianLink, NegBinomialLink, PoissonLink};
 
 /// Maps the ports' `family`/`link` strings to [`Family`]. `family` and `link`
@@ -239,6 +241,21 @@ fn note_infos(notes: Vec<Note>) -> Vec<NoteInfo> {
                 final_eval: false,
                 detail: String::new(),
             },
+            Note::SatterthwaiteCurvature {
+                dropped,
+                negative,
+                converged,
+                nonfinite,
+            } => NoteInfo {
+                kind: "satterthwaite_curvature",
+                columns: Vec::new(),
+                pivot: f64::NAN,
+                evals: 0,
+                final_eval: false,
+                detail: format!(
+                    "dropped {dropped}, negative {negative}, converged {converged}, nonfinite {nonfinite}"
+                ),
+            },
         })
         .collect()
 }
@@ -343,11 +360,39 @@ pub struct FitResult {
     pub pinned: Vec<Vec<bool>>,
     /// Solver observations with no dedicated field (`crate::Diagnostics::notes`).
     pub notes: Vec<NoteInfo>,
+    /// Degrees of freedom per coefficient (`crate::Fit::coef_df`): the
+    /// Satterthwaite df on a Gaussian LMM, `n − p` on OLS and on a Gamma or
+    /// inverse Gaussian GLM with φ estimated, NaN where the test is z and on
+    /// an OLS or dispersion GLM fit that did not converge (still a t test,
+    /// `df_method` `"residual"`).
+    pub coef_df: Vec<f64>,
+    /// The t test's two-sided p-value per coefficient, from
+    /// `crate::Fit::contrast_t` on the unit vector; NaN where there is no df.
+    pub coef_p: Vec<f64>,
+    /// Where `coef_df` comes from: `"satterthwaite"` (Gaussian LMM),
+    /// `"residual"` (OLS and the dispersion GLMs with φ estimated, whatever
+    /// `satterthwaite` says), `"none"` (the families with no df),
+    /// `"disabled"` (a Gaussian LMM fitted with `satterthwaite = false`) or
+    /// `"failed"` (a Gaussian LMM whose Satterthwaite pass failed). The ports
+    /// print t (with a df column on `"satterthwaite"`) on the first two and z
+    /// on the rest.
+    pub df_method: &'static str,
+    /// Weighted residual sum of squares `Σwᵢ(yᵢ − μ̂ᵢ)²` of an OLS fit; NaN on
+    /// every other fit and on a non-converged one.
+    pub rss: f64,
+    /// `summary.lm`'s multiple R² of an OLS fit (0 on an intercept-only
+    /// model); NaN on every other fit and on a non-converged one.
+    pub r_squared: f64,
+    /// `summary.lm`'s adjusted R², with the same NaN and 0 cases as
+    /// `r_squared`.
+    pub adj_r_squared: f64,
 }
 
 /// Fit `formula` against pre-marshalled columns and return the flattened
 /// [`FitResult`], with every kernel panic caught and returned as `Err` — the
-/// one entry point both FFI ports call.
+/// one entry point both FFI ports call. `satterthwaite` is
+/// `crate::FitOptions::satterthwaite`: `false` skips the Gaussian LMM's
+/// Satterthwaite pass (its df are then not computed and it is tested with z).
 #[allow(clippy::too_many_arguments)]
 pub fn run_fit(
     formula: &str,
@@ -361,6 +406,7 @@ pub fn run_fit(
     weights: Option<Vec<f64>>,
     offset: Option<Vec<f64>>,
     warm_start: Option<(Vec<f64>, Vec<f64>, Option<f64>)>,
+    satterthwaite: bool,
 ) -> Result<FitResult, String> {
     let fam = family_from_str(family, link)?;
     // `fit_warm`'s own checks of `dispersion` and the warm start name kernel
@@ -466,6 +512,7 @@ pub fn run_fit(
     }
     lowered.opts.nagq = nagq;
     lowered.opts.dispersion = dispersion;
+    lowered.opts.satterthwaite = satterthwaite;
     // Mirrors `formula::materialize`'s `opts` construction — change together:
     // lowering sets `weights`/`offset` only for a `cbind()` response /
     // `offset()` formula term, so a value here AND the matching argument is
@@ -542,6 +589,19 @@ pub fn run_fit(
     }))
     .map_err(panic_message)?;
 
+    let (coef_p, df_method) = t_tests(&fit, &lowered.opts.target_indices);
+    let (rss, r_squared, adj_r_squared) = if lowered.model.re.is_none() && fam == Family::Gaussian {
+        ols_r_squared(
+            &fit,
+            &lowered.y,
+            lowered.opts.weights.as_deref(),
+            lowered.opts.offset.as_deref(),
+            lowered.has_intercept,
+        )
+    } else {
+        (f64::NAN, f64::NAN, f64::NAN)
+    };
+
     // `varcorr` and `re_groups` are both emitted in RE declaration order
     // (primary, then each extra), so index i of one names index i of the other.
     // Check rather than trust it: a silent misalignment relabels a variance
@@ -617,7 +677,129 @@ pub fn run_fit(
         // The lowering's own observations (unused grouping levels) join the
         // solver's in one channel: the user does not care which layer noticed.
         notes: note_infos(lowered_notes.into_iter().chain(diagnostics.notes).collect()),
+        coef_df: fit.coef_df,
+        coef_p,
+        df_method,
+        rss,
+        r_squared,
+        adj_r_squared,
     })
+}
+
+/// The t test of each target coefficient (`Fit::contrast_t` on its unit
+/// vector) as `(coef_p, df_method)`; see [`FitResult::df_method`]. The label
+/// keys on the fit's df record, not on its notes: a failed pass is the
+/// `NoDfReason::Failed` record.
+pub(crate) fn t_tests(fit: &Fit, targets: &[u32]) -> (Vec<f64>, &'static str) {
+    let p = fit.beta.len();
+    let mut coef_p = vec![f64::NAN; p];
+    let df_method = match fit.df_state() {
+        Ok(st) if st.residual_only() => "residual",
+        Ok(_) => "satterthwaite",
+        Err(ContrastError::NoDf(reason)) => match reason {
+            NoDfReason::NotGaussianMixed => "none",
+            NoDfReason::Disabled => "disabled",
+            // No state on a Gaussian LMM is the loop tier's, which `run_fit`
+            // never builds; were it to happen, its df are missing as after a
+            // failed pass.
+            NoDfReason::Failed | NoDfReason::StateMissing => "failed",
+        },
+    };
+    if matches!(df_method, "residual" | "satterthwaite") {
+        let mut e = vec![0.0; p];
+        for &j in targets {
+            let j = j as usize;
+            e[j] = 1.0;
+            if let Ok(t) = fit.contrast_t(&e) {
+                coef_p[j] = t.p_value;
+            }
+            e[j] = 0.0;
+        }
+    }
+    (coef_p, df_method)
+}
+
+/// `(rss, R², adjusted R²)` of an OLS fit in `summary.lm`'s form: `rss =
+/// Σwᵢ(yᵢ − μ̂ᵢ)²`; `mss` from the fitted values less the offset, centred on
+/// their weighted mean when the formula has an intercept and uncentred
+/// otherwise; `R² = mss/(mss + rss)`, adjusted `1 − (1 − R²)(n − df.int)/(n −
+/// p)` with `p` the retained columns. 0 for both R² when `p` is only the
+/// intercept (or nothing); NaN for all three on a non-converged fit.
+fn ols_r_squared(
+    fit: &Fit,
+    y: &[f64],
+    weights: Option<&[f64]>,
+    offset: Option<&[f64]>,
+    has_intercept: bool,
+) -> (f64, f64, f64) {
+    let n = y.len();
+    if !fit.converged() || fit.fitted.len() != n {
+        return (f64::NAN, f64::NAN, f64::NAN);
+    }
+    let w = |i: usize| weights.map_or(1.0, |w| w[i]);
+    let f = |i: usize| fit.fitted[i] - offset.map_or(0.0, |o| o[i]);
+    let rss: f64 = (0..n).map(|i| w(i) * (y[i] - fit.fitted[i]).powi(2)).sum();
+    let rank = fit.aliased().iter().filter(|a| !**a).count();
+    let df_int = usize::from(has_intercept);
+    if rank == df_int {
+        return (rss, 0.0, 0.0);
+    }
+    let mss: f64 = if has_intercept {
+        let sw: f64 = (0..n).map(w).sum();
+        let m = (0..n).map(|i| w(i) * f(i)).sum::<f64>() / sw;
+        (0..n).map(|i| w(i) * (f(i) - m).powi(2)).sum()
+    } else {
+        (0..n).map(|i| w(i) * f(i).powi(2)).sum()
+    };
+    let r2 = mss / (mss + rss);
+    let adj = 1.0 - (1.0 - r2) * ((n - df_int) as f64 / (n - rank) as f64);
+    (rss, r2, adj)
+}
+
+/// Confidence intervals for the fixed effects, the one rule both ports'
+/// `confint` call: per coefficient `β̂ ± q·se`, with `q` the Student t
+/// quantile on `coef_df[i]` where that df is finite and positive (the rows
+/// `summary()` tests with t: the Satterthwaite df of a Gaussian LMM, `n − p`
+/// on OLS and the dispersion GLMs) and the standard normal quantile
+/// otherwise (z rows, a pass switched off or failed). The quantiles are taken
+/// at `(1 − level)/2` and `1 − (1 − level)/2`, as `confint.lm` takes them.
+/// An interval is NaN only where `β̂` or `se` is (an aliased column).
+///
+/// # Errors
+///
+/// When `level` is not strictly between 0 and 1, or the three slices differ
+/// in length.
+pub fn confint(
+    beta: &[f64],
+    se: &[f64],
+    coef_df: &[f64],
+    level: f64,
+) -> Result<Vec<[f64; 2]>, String> {
+    if !(level > 0.0 && level < 1.0) {
+        return Err(format!(
+            "level must be a number strictly between 0 and 1, got {level}"
+        ));
+    }
+    if se.len() != beta.len() || coef_df.len() != beta.len() {
+        return Err(format!(
+            "beta, se and coef_df must have the same length, got {}, {} and {}",
+            beta.len(),
+            se.len(),
+            coef_df.len()
+        ));
+    }
+    let a = (1.0 - level) / 2.0;
+    Ok((0..beta.len())
+        .map(|i| {
+            let df = coef_df[i];
+            let (lo, hi) = if df.is_finite() && df > 0.0 {
+                (t_quantile(a, df), t_quantile(1.0 - a, df))
+            } else {
+                (normal_quantile(a), normal_quantile(1.0 - a))
+            };
+            [beta[i] + lo * se[i], beta[i] + hi * se[i]]
+        })
+        .collect())
 }
 
 fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
@@ -633,6 +815,7 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inference::tails::t_two_sided_p;
     use std::collections::HashMap;
 
     #[test]
@@ -788,6 +971,7 @@ mod tests {
         let (numeric, factor) = toy_ols();
         let result = run_fit(
             "y ~ x", numeric, factor, "gaussian", "identity", "hessian", 1, None, None, None, None,
+            true,
         )
         .expect("fit should succeed");
         assert_eq!(
@@ -811,6 +995,7 @@ mod tests {
         let (numeric, factor) = toy_ols();
         let err = run_fit(
             "y ~ z", numeric, factor, "gaussian", "identity", "hessian", 1, None, None, None, None,
+            true,
         )
         .unwrap_err();
         assert_eq!(err, "unknown column: z");
@@ -832,6 +1017,7 @@ mod tests {
             None,
             Some(vec![0.0; n]),
             None,
+            true,
         )
         .unwrap_err();
         assert!(err.contains("use one"), "{err}");
@@ -856,6 +1042,7 @@ mod tests {
             Some(vec![1.0; n]),
             None,
             None,
+            true,
         )
         .unwrap_err();
         assert!(err.contains("use one"), "{err}");
@@ -886,6 +1073,7 @@ mod tests {
             None,
             None,
             None,
+            true,
         )
         .expect("ineligible nagq must be stripped, not an error");
         let msg = result.agq_warning.as_deref().expect("warning expected");
@@ -925,6 +1113,7 @@ mod tests {
             None,
             None,
             None,
+            true,
         )
         .expect("over-cap nagq must be stripped, not an error");
         let msg = result.agq_warning.as_deref().expect("warning expected");
@@ -938,7 +1127,7 @@ mod tests {
         let (mut numeric, factor) = toy_ols();
         numeric.get_mut("y").unwrap()[3] = -1.0;
         let err = run_fit(
-            "y ~ x", numeric, factor, "poisson", "log", "hessian", 1, None, None, None, None,
+            "y ~ x", numeric, factor, "poisson", "log", "hessian", 1, None, None, None, None, true,
         )
         .unwrap_err();
         assert!(err.contains("Poisson response must be >= 0"), "{err}");
@@ -961,6 +1150,7 @@ mod tests {
             None,
             None,
             None,
+            true,
         )
         .unwrap_err();
         assert!(err.contains("x"), "{err}");
@@ -971,6 +1161,7 @@ mod tests {
         numeric.insert("junk".to_string(), vec![0.0; 1000]);
         let err = run_fit(
             "y ~ x", numeric, factor, "gaussian", "identity", "hessian", 1, None, None, None, None,
+            true,
         )
         .unwrap_err();
         assert!(err.contains("junk"), "{err}");
@@ -1002,6 +1193,7 @@ mod tests {
             None,
             None,
             None,
+            true,
         )
         .expect("cold mixed fit should converge");
         assert!(cold.converged);
@@ -1022,6 +1214,7 @@ mod tests {
             None,
             None,
             Some((cold.beta.clone(), vec![5.0], None)),
+            true,
         )
         .expect("warm-started mixed fit should converge");
         assert!(warm.converged);
@@ -1032,6 +1225,246 @@ mod tests {
             warm.n_eval, cold.n_eval,
             "a far-off warm start must change the evaluation count"
         );
+    }
+
+    /// A Gaussian random-intercept fixture: 8 groups of 6 rows, `y = 1 + 0.5x +
+    /// b_g + e` with deterministic `b_g` and `e`.
+    #[allow(clippy::type_complexity)] // test fixture: the numeric+factor column maps run_fit takes
+    fn toy_lmm() -> (
+        HashMap<String, Vec<f64>>,
+        HashMap<String, (Vec<String>, Vec<u32>)>,
+    ) {
+        let (mut x, mut y, mut g) = (Vec::new(), Vec::new(), Vec::new());
+        let labels = ["a", "b", "c", "d", "e", "f", "g", "h"];
+        for (k, label) in labels.iter().enumerate() {
+            let b = ((k * 5) % 8) as f64 / 4.0 - 0.9;
+            for j in 0..6 {
+                let xi = j as f64 - 2.5 + 0.1 * k as f64;
+                let e = (((k * 7 + j * 3) % 11) as f64 - 5.0) / 6.0;
+                x.push(xi);
+                y.push(1.0 + 0.5 * xi + b + e);
+                g.push(*label);
+            }
+        }
+        let mut numeric = HashMap::new();
+        numeric.insert("y".to_string(), y);
+        numeric.insert("x".to_string(), x);
+        let mut factor = HashMap::new();
+        factor.insert("g".to_string(), factor_col(&g));
+        (numeric, factor)
+    }
+
+    #[allow(clippy::type_complexity)] // test fixture: the numeric+factor column maps run_fit takes
+    fn fit_with(
+        formula: &str,
+        (numeric, factor): (
+            HashMap<String, Vec<f64>>,
+            HashMap<String, (Vec<String>, Vec<u32>)>,
+        ),
+        family: &str,
+        link: &str,
+        dispersion: Option<f64>,
+        satterthwaite: bool,
+    ) -> FitResult {
+        run_fit(
+            formula,
+            numeric,
+            factor,
+            family,
+            link,
+            "hessian",
+            1,
+            dispersion,
+            None,
+            None,
+            None,
+            satterthwaite,
+        )
+        .expect("fit should succeed")
+    }
+
+    fn has_curvature_note(r: &FitResult) -> bool {
+        r.notes.iter().any(|n| n.kind == "satterthwaite_curvature")
+    }
+
+    /// `coef_p` is the t test on each row's df (`contrast_t`'s df agrees with
+    /// `coef_df` to rounding).
+    fn assert_t_p(r: &FitResult) {
+        for i in 0..r.beta.len() {
+            let want = t_two_sided_p(r.beta[i] / r.se[i], r.coef_df[i]);
+            assert!(
+                (r.coef_p[i] - want).abs() < 1e-12,
+                "coef_p[{i}] = {}, want {want}",
+                r.coef_p[i]
+            );
+        }
+    }
+
+    #[test]
+    fn lmm_carries_satterthwaite_df_and_p_unless_switched_off() {
+        let on = fit_with(
+            "y ~ x + (1 | g)",
+            toy_lmm(),
+            "gaussian",
+            "identity",
+            None,
+            true,
+        );
+        assert!(on.converged);
+        assert_eq!(on.df_method, "satterthwaite");
+        assert_eq!(on.coef_df.len(), 2);
+        assert!(on.coef_df.iter().all(|d| d.is_finite() && *d > 0.0));
+        assert_t_p(&on);
+        assert!(on.rss.is_nan() && on.r_squared.is_nan() && on.adj_r_squared.is_nan());
+
+        let off = fit_with(
+            "y ~ x + (1 | g)",
+            toy_lmm(),
+            "gaussian",
+            "identity",
+            None,
+            false,
+        );
+        assert_eq!(off.df_method, "disabled");
+        assert!(off.coef_df.iter().all(|d| d.is_nan()));
+        assert!(off.coef_p.iter().all(|v| v.is_nan()));
+        assert!(!has_curvature_note(&off));
+        assert_eq!(off.beta, on.beta);
+        assert_eq!(off.se, on.se);
+    }
+
+    #[test]
+    fn ols_and_dispersion_glm_keep_residual_df_whatever_the_switch() {
+        for switch in [true, false] {
+            let ols = fit_with("y ~ x", toy_ols(), "gaussian", "identity", None, switch);
+            assert_eq!(ols.df_method, "residual");
+            assert_eq!(ols.coef_df, vec![8.0, 8.0]);
+            assert_t_p(&ols);
+
+            let gamma = fit_with("y ~ x", toy_gamma(), "gamma", "log", None, switch);
+            assert_eq!(gamma.df_method, "residual");
+            assert_eq!(gamma.coef_df, vec![98.0, 98.0]);
+            assert_t_p(&gamma);
+        }
+        // A held φ keeps z, as `summary.glm(dispersion = v)` does.
+        let held = fit_with("y ~ x", toy_gamma(), "gamma", "log", Some(2.5), true);
+        assert_eq!(held.df_method, "none");
+        assert!(held.coef_df.iter().chain(&held.coef_p).all(|v| v.is_nan()));
+        let glmm = fit_with(
+            "cbind(incidence, healthy) ~ period + (1 | herd)",
+            cbpp_columns(),
+            "binomial",
+            "logit",
+            None,
+            true,
+        );
+        assert_eq!(glmm.df_method, "none");
+        assert!(glmm.coef_df.iter().chain(&glmm.coef_p).all(|v| v.is_nan()));
+        assert!(glmm.rss.is_nan() && glmm.r_squared.is_nan());
+    }
+
+    /// A Gaussian LMM with no finite endpoint (a random slope on an aliased
+    /// column) carries the failed record and the note; switched off, neither.
+    #[test]
+    fn degenerate_lmm_is_failed_with_the_curvature_note() {
+        let data = || {
+            let (mut numeric, factor) = toy_lmm();
+            let x2: Vec<f64> = numeric["x"].iter().map(|v| 2.0 * v).collect();
+            numeric.insert("x2".to_string(), x2);
+            (numeric, factor)
+        };
+        let formula = "y ~ x + x2 + (1 + x2 | g)";
+        let r = fit_with(formula, data(), "gaussian", "identity", None, true);
+        assert!(!r.converged);
+        assert_eq!(r.df_method, "failed");
+        let note = r
+            .notes
+            .iter()
+            .find(|n| n.kind == "satterthwaite_curvature")
+            .expect("the failed pass carries the note");
+        assert!(note.detail.ends_with("nonfinite true"), "{}", note.detail);
+        let off = fit_with(formula, data(), "gaussian", "identity", None, false);
+        assert_eq!(off.df_method, "disabled");
+        assert!(!has_curvature_note(&off));
+    }
+
+    /// `summary.lm`'s R² on closed forms: simple regression (R² is the squared
+    /// correlation of x and y), intercept only (0), no intercept (uncentred).
+    /// The weighted and offset fixtures are checked against `summary.lm` itself
+    /// in the R port's tests.
+    #[test]
+    fn ols_r_squared_follows_summary_lm() {
+        let (numeric, _) = toy_ols();
+        let (x, y) = (numeric["x"].clone(), numeric["y"].clone());
+        let n = y.len() as f64;
+        let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+        let (mx, my) = (mean(&x), mean(&y));
+        let sxx: f64 = x.iter().map(|v| (v - mx).powi(2)).sum();
+        let syy: f64 = y.iter().map(|v| (v - my).powi(2)).sum();
+        let sxy: f64 = x.iter().zip(&y).map(|(a, b)| (a - mx) * (b - my)).sum();
+        let close = |a: f64, b: f64| (a - b).abs() <= 1e-12 * b.abs().max(1.0);
+
+        let r = fit_with("y ~ x", toy_ols(), "gaussian", "identity", None, true);
+        let r2 = sxy * sxy / (sxx * syy);
+        assert!(close(r.r_squared, r2), "{} vs {r2}", r.r_squared);
+        let adj = 1.0 - (1.0 - r2) * (n - 1.0) / (n - 2.0);
+        assert!(close(r.adj_r_squared, adj), "{} vs {adj}", r.adj_r_squared);
+        assert!(close(r.rss, syy - sxy * sxy / sxx), "{}", r.rss);
+
+        let one = fit_with("y ~ 1", toy_ols(), "gaussian", "identity", None, true);
+        assert_eq!((one.r_squared, one.adj_r_squared), (0.0, 0.0));
+        assert!(close(one.rss, syy), "{}", one.rss);
+
+        let origin = fit_with("y ~ 0 + x", toy_ols(), "gaussian", "identity", None, true);
+        let (sxx0, syy0) = (
+            x.iter().map(|v| v * v).sum::<f64>(),
+            y.iter().map(|v| v * v).sum::<f64>(),
+        );
+        let sxy0: f64 = x.iter().zip(&y).map(|(a, b)| a * b).sum();
+        let r2 = sxy0 * sxy0 / (sxx0 * syy0);
+        assert!(close(origin.r_squared, r2), "{} vs {r2}", origin.r_squared);
+        let adj = 1.0 - (1.0 - r2) * n / (n - 1.0);
+        assert!(
+            close(origin.adj_r_squared, adj),
+            "{} vs {adj}",
+            origin.adj_r_squared
+        );
+
+        let mut tiny = HashMap::new();
+        tiny.insert("y".to_string(), vec![1.0, 3.0]);
+        tiny.insert("x".to_string(), vec![0.0, 1.0]);
+        let unfit = fit_with(
+            "y ~ x",
+            (tiny, HashMap::new()),
+            "gaussian",
+            "identity",
+            None,
+            true,
+        );
+        assert!(!unfit.converged);
+        assert!(unfit.rss.is_nan() && unfit.r_squared.is_nan() && unfit.adj_r_squared.is_nan());
+    }
+
+    #[test]
+    fn confint_takes_t_on_a_finite_df_and_normal_elsewhere() {
+        // qt(0.975, 8), qnorm(0.975) and qnorm(0.95) in R.
+        let (qt8, qn, qn90) = (2.3060041352041654, 1.9599639845400534, 1.6448536269514715);
+        let close = |a: f64, b: f64| (a - b).abs() <= 1e-12 * b.abs().max(1.0);
+        let beta = [1.0, 2.0, f64::NAN, 3.0];
+        let se = [0.5, 0.5, f64::NAN, 0.25];
+        let df = [8.0, f64::NAN, f64::NAN, 0.0];
+        let ci = confint(&beta, &se, &df, 0.95).unwrap();
+        assert!(close(ci[0][0], 1.0 - qt8 * 0.5) && close(ci[0][1], 1.0 + qt8 * 0.5));
+        assert!(close(ci[1][0], 2.0 - qn * 0.5) && close(ci[1][1], 2.0 + qn * 0.5));
+        assert!(ci[2][0].is_nan() && ci[2][1].is_nan());
+        // A df of 0 has no t distribution: normal, never NaN while se is finite.
+        assert!(close(ci[3][0], 3.0 - qn * 0.25) && close(ci[3][1], 3.0 + qn * 0.25));
+        let ci90 = confint(&beta, &se, &df, 0.9).unwrap();
+        assert!(close(ci90[1][1], 2.0 + qn90 * 0.5));
+        for bad in [0.0, 1.0, 1.5, -0.1, f64::NAN] {
+            assert!(confint(&beta, &se, &df, bad).is_err(), "level {bad}");
+        }
+        assert!(confint(&beta, &se[..2], &df, 0.95).is_err());
     }
 
     /// Deterministic fixed-effects-only Gamma(log) fixture: `y = exp(1 +
@@ -1077,6 +1510,7 @@ mod tests {
             None,
             None,
             None,
+            true,
         )
         .expect("gamma fit should converge");
         assert!(result.converged);
@@ -1142,6 +1576,7 @@ mod tests {
             None,
             None,
             None,
+            true,
         )
         .expect("hessian-SE fit should converge");
         assert!(hessian.converged);
@@ -1159,6 +1594,7 @@ mod tests {
             None,
             None,
             None,
+            true,
         )
         .expect("rx-SE fit should converge");
         assert!(rx.converged);

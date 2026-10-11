@@ -87,7 +87,8 @@
 #' `"fastglmm_single_level_grouping_dropped"`, `"fastglmm_hessian_se_fallback"`,
 #' `"fastglmm_se_unavailable"`, `"fastglmm_exact_profile_fallback"`,
 #' `"fastglmm_gradient_search_fallback"`,
-#' `"fastglmm_precision_limited"`, `"fastglmm_non_integer_response"`, `"fastglmm_rows_dropped_na"`; a note from
+#' `"fastglmm_precision_limited"`, `"fastglmm_non_integer_response"`, `"fastglmm_rows_dropped_na"`,
+#' `"fastglmm_satterthwaite_curvature"`; a note from
 #' a newer kernel than this package arrives as `"fastglmm_unknown_note"`),
 #' so `withCallingHandlers()` and `suppressWarnings(classes = )` can select
 #' them without matching message text.
@@ -152,6 +153,12 @@
 #'   `MASS::glm.nb(init.theta=)`: the starting value of the shape search
 #'   (the same slot as `start$dispersion`; give one of the two). `NULL`
 #'   cold-starts it from the no-random-effect negative-binomial fit.
+#' @param satterthwaite compute lmerTest's Satterthwaite degrees of freedom
+#'   for a Gaussian mixed model's t tests (default `TRUE`). `FALSE` skips that
+#'   pass: [summary()][summary.fastglmm] and [confint()][confint.fastglmm]
+#'   then use z and normal quantiles and say "df not computed", and
+#'   `$df_method` is `"disabled"`. OLS and the Gamma and inverse-Gaussian GLMs
+#'   keep their residual df whatever it says.
 #' @param ... intercepted, never silently swallowed. `REML` is checked against
 #'   the model: `REML = TRUE` is accepted only on a Gaussian mixed model (the
 #'   one model with a REML objective) and errors elsewhere, `REML = FALSE` is
@@ -166,7 +173,12 @@
 #'   `diagnostics` list (the solver's own report: `boundary`, `pinned`,
 #'   `notes`, plus the three flags above), a `warnings` data.frame (one row
 #'   per warning the call raised: `tier`, `kind`, `title`, `message`; match on
-#'   `kind`), plus
+#'   `kind`), the per-coefficient `coef_df` (the t test's degrees of freedom,
+#'   `NaN` where the test is z and on an OLS or dispersion-GLM fit that did not
+#'   converge) and `coef_p` (its p-value), `df_method`
+#'   (`"satterthwaite"`, `"residual"`, `"none"`, `"disabled"` or `"failed"`),
+#'   `rss`, `r_squared` and `adj_r_squared` (OLS fits only, `NaN` otherwise),
+#'   plus
 #'   `print()`, [summary()][summary.fastglmm], [confint()][confint.fastglmm]
 #'   (Wald), `nobs()`, [formula()][formula.fastglmm] (returns the formula
 #'   **string**), `family()`, `model.frame()`, [ranef()][ranef.fastglmm],
@@ -196,8 +208,13 @@ fastglmm <- function(formula, data, family = gaussian(),
                      wald.se = "hessian",
                      dispersion = NULL,
                      init.theta = NULL,
+                     satterthwaite = TRUE,
                      ...) {
   .check_dots(...)
+  if (!(is.logical(satterthwaite) && length(satterthwaite) == 1L && !is.na(satterthwaite))) {
+    stop(sprintf("satterthwaite must be TRUE or FALSE, got %s", .arg_repr(satterthwaite)),
+         call. = FALSE)
+  }
   # Captured before `data` is touched: the header's `Data:` line, as lme4
   # deparses it.
   data_name <- paste(deparse(substitute(data), width.cutoff = 500L), collapse = " ")
@@ -444,7 +461,8 @@ fastglmm <- function(formula, data, family = gaussian(),
     if (is.null(o)) double() else as.double(o),
     as.double(start$beta %||% double()),
     as.double(start$theta %||% double()),
-    as.double(start$dispersion %||% double())
+    as.double(start$dispersion %||% double()),
+    satterthwaite
   )
 
   # Whether the FITTED model actually has random effects - not `mixed`, which
@@ -506,6 +524,8 @@ fastglmm <- function(formula, data, family = gaussian(),
   beta <- stats::setNames(r$beta, r$names)
   se <- stats::setNames(r$se, r$names)
   aliased <- stats::setNames(r$aliased, r$names)
+  coef_df <- stats::setNames(r$coef_df, r$names)
+  coef_p <- stats::setNames(r$coef_p, r$names)
   # Aliased (rank-deficient) slots print as NA, lme4/lm-style, not NaN.
   beta[aliased] <- NA_real_
   se[aliased] <- NA_real_
@@ -518,6 +538,18 @@ fastglmm <- function(formula, data, family = gaussian(),
     varcorr = r$varcorr,
     stddev_se = r$stddev_se,
     aliased = aliased,
+    # Per coefficient: the t test's degrees of freedom (Satterthwaite on a
+    # Gaussian LMM, n - p on OLS and the dispersion GLMs; NaN where the test is
+    # z) and its two-sided p-value, computed by the kernel. `df_method` says
+    # which: "satterthwaite", "residual", "none", "disabled" (satterthwaite =
+    # FALSE) or "failed". Mirrors the Python port's Fit fields - change together.
+    coef_df = coef_df,
+    coef_p = coef_p,
+    df_method = r$df_method,
+    # OLS fits only (NaN otherwise): weighted RSS and summary.lm's R-squared pair.
+    rss = r$rss,
+    r_squared = r$r_squared,
+    adj_r_squared = r$adj_r_squared,
     dispersion = r$dispersion,
     # The numeric dispersion= argument the caller passed (Gamma or
     # inverse-Gaussian only; NULL when left to estimate). print.summary's
@@ -637,6 +669,7 @@ fastglmm <- function(formula, data, family = gaussian(),
   agq_fallback = c("caution", "Adaptive quadrature not used"),
   non_integer_response = c("caution", "Non-integer response"),
   rows_dropped_na = c("caution", "Rows dropped for missing values"),
+  satterthwaite_curvature = c("caution", "Satterthwaite df uncertain"),
   argument_ignored = c("note", "Argument ignored"),
   unused_grouping_levels = c("note", "Unused grouping levels"),
   single_level_grouping_dropped = c("note", "Random effect dropped (single level)")
@@ -709,7 +742,7 @@ fastglmm <- function(formula, data, family = gaussian(),
 # "fastglmm_se_unavailable", "fastglmm_exact_profile_fallback",
 # "fastglmm_gradient_search_fallback",
 # "fastglmm_precision_limited", "fastglmm_nb_shape_unsettled",
-# "fastglmm_unknown_note" - all inheriting
+# "fastglmm_satterthwaite_curvature", "fastglmm_unknown_note" - all inheriting
 # "fastglmm_diagnostic", so one handler catches the whole channel. Not every
 # note comes from the solver: "unused_grouping_levels" and
 # "single_level_grouping_dropped" are raised by the formula lowering, which is
@@ -812,6 +845,9 @@ fastglmm <- function(formula, data, family = gaussian(),
       "(binomial: the number of successes, y * weights). The fit still ran, but check",
       "whether this is the right family for the data."), .count(note$evals, "row"))
     cls <- c("fastglmm_non_integer_response", "fastglmm_diagnostic")
+  } else if (identical(note$kind, "satterthwaite_curvature")) {
+    msg <- .satterthwaite_message(note$detail)
+    cls <- c("fastglmm_satterthwaite_curvature", "fastglmm_diagnostic")
   } else {
     msg <- sprintf(paste(
       "The solver reported something ('%s') that this installed version does not",
@@ -820,6 +856,35 @@ fastglmm <- function(formula, data, family = gaussian(),
     cls <- c("fastglmm_unknown_note", "fastglmm_diagnostic")
   }
   list(msg = msg, cls = cls)
+}
+
+# The satterthwaite_curvature message from the kernel's detail string,
+# "dropped <n>, negative <n>, converged <bool>, nonfinite <bool>"
+# (src/orchestrate.rs). Mirrors the Python port's _satterthwaite_message -
+# change together.
+.satterthwaite_message <- function(detail) {
+  parts <- strsplit(strsplit(detail, ", ", fixed = TRUE)[[1L]], " ", fixed = TRUE)
+  fields <- stats::setNames(vapply(parts, `[[`, character(1), 2L),
+                            vapply(parts, `[[`, character(1), 1L))
+  if (identical(fields[["nonfinite"]], "true")) {
+    return(paste(
+      "The Satterthwaite degrees of freedom could not be computed: the fit has no finite",
+      "end point, or the deviance near it was not finite. Every coefficient is tested with",
+      "z, and its confidence interval uses the normal distribution."))
+  }
+  dropped <- as.integer(fields[["dropped"]])
+  negative <- as.integer(fields[["negative"]])
+  reasons <- c(
+    if (dropped > 0L) paste0("the curvature of the deviance in the variance parameters has ",
+                             .count(dropped, "flat direction"), ", left out"),
+    if (negative > 0L) paste0("it has ", .count(negative, "negative direction"),
+                              ", so the fit may not be at a minimum"),
+    if (!identical(fields[["converged"]], "true")) paste(
+      "the variance search stopped at its step limit, so they are computed at its last point")
+  )
+  paste0("The Satterthwaite degrees of freedom are approximate: ",
+         paste(reasons, collapse = "; "),
+         ". The t tests and confidence intervals use them as computed.")
 }
 
 .INNER_STEPS <- "Some of its inner steps ran out of iterations."

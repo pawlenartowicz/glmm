@@ -334,9 +334,12 @@ across the active families and to be exactly zero outside it — any hole in the
 prefix silently disarms the collapse (`collapse_n_active = 0`) rather than
 producing a wrong answer. The collapse is a reassociation of the same
 criterion, not a different one, so it moves the deviance only in its last
-ulps. No derivative reads it: the shortcut needs an intercept-only primary,
-and the per-group gradient route needs slopes, so a collapsed fit always
-searches θ with BOBYQA. When armed,
+ulps. No analytic gradient reads it: the shortcut needs an intercept-only
+primary, and the per-group gradient route needs slopes, so a collapsed fit
+always searches θ with BOBYQA. The value finite differences of the
+[Satterthwaite pass](#satterthwaite-degrees-of-freedom) do evaluate on it, at
+every stencil point: the arming depends only on the level counts, so a pass
+runs on one route from its first point to its last. When armed,
 it accumulates the θ-independent
 cross-Grams `G_rr′` once; each θ-evaluation then replaces the per-family loop
 with three cheap pieces: a single Crout of the common block `A(θ)`, an
@@ -649,7 +652,187 @@ the same forward-solve columns `C_T = [L_XX⁻¹bₜ]`, so no Gram is formed.
 lme4's profiled fixed-effect covariance `σ̂²·(X'V⁻¹X)⁻¹`; all engines compute
 the LMM SE identically. **Validation**: the LMM `se` gate is tight (~1e-3)
 across Dyestuff, sleepstudy, Penicillin, Pastes; on the grid lme4, glmmTMB
-and MixedModels.jl all report it.
+and MixedModels.jl all report it. The t test on this SE takes its degrees of
+freedom from the next section.
+
+## Satterthwaite degrees of freedom
+
+The t test of a fixed-effect contrast `lᵀβ` uses lmerTest's Satterthwaite
+degrees of freedom (Satterthwaite 1946; Giesbrecht & Burns 1985; Fai &
+Cornelius 1996; Kuznetsova et al. 2017), computed by one derivative pass at θ̂
+after the fit, with no refit. The pass fills `Fit::coef_df` (the df of each
+unit contrast `e_j`, the `df` column of the summaries) and leaves a private
+state that `Fit::contrast_t` (one contrast) and `Fit::contrast_f` (a contrast
+matrix) read. It runs by default on the stable path (`fit_cold`, `fit_warm`)
+while the fit's workspace still lives; `FitOptions::satterthwaite = false`
+skips it. On the loop tier it runs only when called:
+`loop_advanced::satterthwaite(&mut ws, &mut df_out)` after `fit_on` or
+`fit_on_hinted`, with the view dropped; its buffers live on the workspace, so
+a call after the first allocates only the pseudo-inverse's blocks.
+
+**The identity.** lmerTest differentiates the REML deviance in `(θ, σ)` with
+σ not profiled: for `v = lᵀCl`, `C = Var(β̂)`, it takes `g_k = lᵀ(∂C/∂φ_k)l`
+over the variance parameters `φ = (θ, σ)`, `A = 2H⁻¹` from the Hessian `H` of
+that deviance, and `df = 2v²/(gᵀAg)`. The crate minimizes the deviance with
+`τ = σ²` profiled out, `d_p(θ)` (see
+[Profiled REML objective](#profiled-reml-objective)), and the two are related
+exactly. `τ̂(θ)` is the exact minimizer at every θ, so the Schur complement of
+the τ block of `H` is the profiled Hessian `H_p = ∇²d_p`, and τ's own term
+has a closed form (`g_τ = v/τ̂` and `H_ττ = ν/τ̂²` at τ̂). Together:
+
+```text
+df = v² / ( g_pᵀ H_p⁺ g_p + v²/ν ),     g_p = ∇_θ (lᵀ C_p(θ) l)
+```
+
+with `C_p(θ) = σ̂²(θ)·(X′V⁻¹X)⁻¹` the profiled covariance the fit reports and
+`ν` the divisor of `σ̂²`: `N − P` on the REML criterion, `P` the retained
+(non-aliased) columns. So the pass differentiates only the profiled deviance
+the search minimized, and needs no derivative coordinate for σ. `1/df` is
+`g_pᵀH_p⁺g_p/v² + 1/ν`, so `0 < df ≤ ν` whenever `H_p⁺` is positive
+semidefinite; a fit with no free variance parameter gets `ν` exactly (the
+code returns it directly), and every other df is capped at `ν`, which the
+division does not always round back to. The state stores the equivalent
+lmerTest form over `(θ_free, τ)`: `A_eff = 2·blockdiag(H_p⁺, τ̂²/ν)` and
+`Jac_eff = [∂C_p/∂θ_k …, C/τ̂]`, so lmerTest's `contest1D`, `contestMD` and
+`get_Fstat_ddf` port line for line with `A_eff` and `Jac_eff` in place of its
+`vcov_varpar` and `Jac_list`. Every `p × p` matrix in the state is in the
+caller's column order, with the standardization and the fixed-effect
+orthogonalization mapped out.
+
+**Two derivative routes.** Both run on the kernel's θ̃ (the relative Cholesky
+factor on the standardized design, see
+[Random-effect design column scaling](#random-effect-design-column-scaling)),
+a fixed smooth reparameterization of the caller's θ; at a stationary θ̂ the
+quantity `gᵀH⁻¹g` does not depend on it. Each coordinate's step is
+`h_k = η·max(|θ̃_k|, 1)`, one η per route because θ̃ is unit-free.
+
+- **Value route** (every kernel and every shape; the reference). `H_p` comes
+  from central finite differences of the same `f64` profiled deviance the
+  search minimized (`LmmKernel::deviance`), and `∂C_p/∂θ_k` from central
+  differences of `C_p` at the axis points. The stencil is the axis pairs
+  `θ̃ ± h_k e_k` plus, for each pair of coordinates, the two points
+  `θ̃ ± (h_i e_i + h_j e_j)` (numDeriv's `genD` pairing without its Richardson
+  ladder): `n² + n + 1` deviances for `n` free coordinates, `θ̂` included,
+  re-evaluated at the start so the pass never depends on what an earlier call
+  left in the kernel. The step factor is `ETA = 3e-4`, pinned by a step sweep
+  over which the df stay flat.
+- **Gradient route** (where the per-group gradient is armed for the fit: the
+  dense kernel on the
+  [per-group regression route](#random-slopes-on-the-primary-alone-per-group-regressions),
+  the shapes the search runs BFGS on). Column `k` of `H_p` is
+  `(∇d_p(θ̃ + h_k e_k) − ∇d_p(θ̃ − h_k e_k))/(2h_k)` on the free coordinates,
+  symmetrized, from the analytic gradient of
+  [Gradient search on the per-group route](#gradient-search-on-the-per-group-route-bfgs)
+  (`pg_gradient`). Each axis point is one deviance, which leaves the factor
+  and `σ̂²` the gradient reads, and one gradient, so `∂C_p/∂θ_k` comes from the
+  same points: `2n + 1` evaluations and no mixed points. Its step factor is
+  its own, `ETA_GRAD`, set by the gradient route's step sweep. A non-finite
+  deviance or an unavailable gradient at any axis point sends the whole pass
+  to the value route.
+
+The route is chosen per fit, from the kernel's arming for that dataset, so
+loop draws of one shape can take different routes. On the dense kernel the
+balanced collapse and the per-group route stay armed after the fit, so every
+stencil point evaluates on the route the search used.
+
+**What each point evaluates.** `C_p` at a point is
+`C̃ = σ̂²(L̃_XX L̃_XXᵀ)⁻¹`, formed from the augmented factor and `σ̂²` the
+kernel's evaluation left, in the kernel's coordinates, and mapped once to the
+caller's columns (`C = M·C̃·Mᵀ`, `M` the standardization times the inverse of
+the orthogonalization factor `U`); the pass never maps the factor in place.
+No prior-weight factor enters `C`: the kernel's `σ̂²` and its
+`(L̃_XX L̃_XXᵀ)⁻¹` carry the weight scale in opposite directions. The stencil
+evaluates on the response shifted by the fit's own fitted fixed part
+(`y − X̃β̂`, exact algebra on the sufficient statistics): the profiled deviance
+does not depend on the shift, but its round-off does, because each
+evaluation reads `r²` off a downdate of `y′y`, and the second differences
+divide that round-off by `h²`. The statistics are restored bit for bit
+afterwards. The pass reads θ̂ from `LmmWorkspace::theta` and never writes it,
+like the curvature hint, so the two run in either order. Steps across zero
+are interior evaluations: the box is symmetric
+([Covariance parameterization](#covariance-parameterization-θ-cholesky)) and
+the deviance is even in each Λ column. A step past `THETA_HI` is evaluated as
+is.
+
+**Boundary fits and the note.** The deviance and `C_p` depend on Λ only
+through `ΛΛᵀ`, so both are even in each Λ column. At a column that is exactly
+zero in θ̂ (a pinned component after
+[the canonical Λ](#canonical-λ-after-the-pin)), the gradient on that column's
+coordinates and every mixed second derivative between them and the rest
+vanish, so the pass drops those coordinates, leaving `gᵀH⁺g` unchanged; their
+own curvature block can be singular, which is the second reason to drop them.
+The test is on the value of the column, not on the pinned bit. The remaining
+`H_p` is inverted by an eigendecomposition that keeps only eigenvalues above
+`1e-8·λ_max`, counts those below `−1e-8·λ_max` as negative and the rest as
+dropped, as lmerTest inverts only its positive eigenvalues (lmerTest's own
+threshold is absolute, `1e-8` on its `(θ, σ)` Hessian). On a block wider
+than `MAX_PRIMARY_Q`, which the canonical form skips, a pinned diagonal can
+sit above a live entry; the flat rotation direction there is a zero
+eigenvalue that the pseudo-inverse removes. The pass raises
+`Note::SatterthwaiteCurvature { dropped, negative, converged, nonfinite }`
+when a direction was dropped or negative, when the endpoint did not converge
+(a `MaxFunReached` endpoint, where the df are computed at the last point), and
+when the pass failed. It fails for the whole fit when a deviance or `C` on
+the stencil is not finite, when the eigendecomposition fails, or when the fit
+has no finite endpoint at all (no pass runs then): every `coef_df` is NaN,
+`nonfinite` is set, and the contrasts return `NoDfReason::Failed`. The ports
+then test with z and give normal intervals (`df_method = "failed"`).
+
+**Contrasts.** `contrast_t(l)` and `contrast_f(l, rows)` take `l` over all
+`p` caller columns (row-major for `L`) and read only the state: no data, no
+refit. `contrast_t` returns lmerTest's `contest1D`: the estimate, its SE, t,
+`df = 2v²/(gᵀ·A_eff·g)` and the two-sided p. For `e_j` this equals
+`coef_df[j]` to rounding (the latter is the pass's own form, capped at ν).
+`contrast_f` is `contestMD`: one row gives `F = t²`; otherwise
+`L·C·Lᵀ = P·D·Pᵀ`, the rank `q` counts the eigenvalues above
+`√ε_mach·d₁`, `F = Σ_m (PᵀLβ̂)_m²/d_m/q`, each retained direction has its own
+`ν_m`, and the denominator df follows `get_Fstat_ddf`: one ν gives ν, equal
+ν (within `1e-8`) give their mean, any `ν_m ≤ 2` gives 2, otherwise
+`2E/(E − q)` with `E = Σ ν_m/(ν_m − 2)`. A rank below the row count adds
+`ContrastNote::RankDeficientL`. The denominator df depends on the basis of
+`L`, not only on its row space, so an F row matches lmerTest only on
+lmerTest's own hypothesis matrix. On a rank-deficient fit the state covers
+the retained columns: a contrast with a non-zero entry on an aliased column
+gives NaN fields and `ContrastNote::AliasedColumn` (estimability is not
+tested). Where there is no df the methods return `ContrastError::NoDf` with
+the reason (`NotGaussianMixed`, `Disabled`, `StateMissing` for a Gaussian LMM
+`Fit` the loop tier's `FitView::into_fit` built, `Failed`), never a z test.
+
+**Other families.** OLS and the Gamma and inverse-Gaussian GLMs with φ
+estimated carry a residual-only record: the full `C` and `ν = n − P`, no
+variance parameters, so every `coef_df` is `n − P`, `contrast_t` is the
+classical t and `contrast_f` the classical F, whatever
+`FitOptions::satterthwaite` says. A dispersion held through
+`FitOptions::dispersion` keeps z, as `summary.glm(dispersion = )` does.
+Binomial, Poisson, negative binomial and every GLMM have no df.
+
+**Intervals.** The ports' `confint` (R `confint()`, Python `Fit.confint()`)
+call one Rust function, `orchestrate::confint`: `β̂_j ± q·se_j`, with `q` the
+Student t quantile on `coef_df[j]` where that df is finite and positive and
+the normal quantile otherwise (a z row, a pass switched off or failed),
+taken at `(1 − level)/2` and its complement as `confint.lm` takes them.
+
+**Code**: `pass`, `pass_targets`, `stencil`, `assemble`, `ETA`, `ETA_GRAD`
+(`src/lmm/satterthwaite.rs`); `contest_1d`, `contest_md`, `fstat_ddf`
+(`src/inference/contest.rs`); `Fit::contrast_t`, `Fit::contrast_f`
+(`src/inference/contrast.rs`); `attach_satterthwaite`, `satterthwaite`
+(`src/fit/core.rs`); `confint` (`src/orchestrate.rs`). **Convention**:
+lmerTest 3.2-1's `summary()`, `contest()` and `anova()` df; its Hessian is
+numDeriv's Richardson extrapolation on `(θ, σ)`, the crate's a single-step
+central stencil on the profiled θ̃. **Validation**: the contest layer
+reproduces lmerTest's frozen `contest1D`, `contestMD` and `get_Fstat_ddf`
+outputs from its own frozen inputs (`src/inference/contest_tests.rs`); the
+pass at lme4's θ̂ is checked against lmerTest's df on every frozen REML
+fixture, within a band that adds lmerTest's own finite-difference spread, and
+on the three boundary fixtures the directions it drops are checked against
+lmerTest's (`gate1_at_lme4_theta`, `--features oracle-tests`); the df and
+the interval bounds at the crate's own θ̂ are gated end to end in
+`tests/inference_oracle.rs`, registry-backed like the SEs; the two routes
+agree on the same fit (`gradient_route_agrees_with_value_route`), the dense
+and sparse kernels agree (`dense_and_sparse_kernels_agree`), and the step
+sweep pins `ETA` (`step_sweep_is_flat_at_eta`). On the accuracy grid the
+`lmerTest` engine fits every Gaussian mixed cell, and `compare.R` gates
+`coef_df` against it. Every band is in `validation/grid/tol.R`.
 
 ## Validation
 
@@ -718,10 +901,29 @@ list of differences from the other engines, with justification, is in
 - Bates, D. et al. *MixedModels.jl* (Julia package). — the second reference
   engine; same profiled objective, ML default; NEWUOA over unconstrained θ
   since v5.0.0 (BOBYQA retained for scalar RE).
+- Fai, A. H.-T. & Cornelius, P. L. (1996). Approximate F-tests of multiple
+  degree of freedom hypotheses in generalized least squares analyses of
+  unbalanced split-plot experiments. *Journal of Statistical Computation and
+  Simulation*, 54(4), 363–378. The multi-df F test's denominator df from
+  per-direction Satterthwaite df, which lmerTest's `contestMD` follows.
+- Giesbrecht, F. G. & Burns, J. C. (1985). Two-stage analysis based on a
+  mixed model: large-sample asymptotic theory and small-sample simulation
+  results. *Biometrics*, 41(2), 477–486. The Satterthwaite df of a fixed-effect
+  contrast in a mixed model, through the covariance of the variance
+  parameters.
 - Henderson, H. V. & Searle, S. R. (1981). On deriving the inverse of a sum
   of matrices. *SIAM Review*, 23(1), 53–60. — the Woodbury forms behind the
   per-group regression route.
+- Kuznetsova, A., Brockhoff, P. B. & Christensen, R. H. B. (2017). lmerTest
+  package: Tests in linear mixed effects models. *Journal of Statistical
+  Software*, 82(13), 1–26. The `summary()`, `contest()` and `anova()` df the
+  Satterthwaite pass reproduces, and the reference engine it is gated
+  against.
 - Powell, M. J. D. (2009). *The BOBYQA algorithm for bound constrained
   optimization without derivatives*. Report DAMTP 2009/NA06, University of
   Cambridge. — the θ optimizer; the `npt` bounds cited in the schedule table
   are Powell's.
+- Satterthwaite, F. E. (1946). An approximate distribution of estimates of
+  variance components. *Biometrics Bulletin*, 2(6), 110–114. The approximate
+  degrees of freedom of a linear combination of variance estimates, behind
+  every df of [Satterthwaite degrees of freedom](#satterthwaite-degrees-of-freedom).

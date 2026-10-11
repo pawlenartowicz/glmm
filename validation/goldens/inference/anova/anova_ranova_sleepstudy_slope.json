@@ -1,0 +1,46 @@
+{
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0",
+      "glmmTMB": "1.1.14"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_anova.R"
+  },
+  "case": "ranova",
+  "reference": "mixture",
+  "full": {
+    "formula": "Reaction ~ Days + (Days | Subject)",
+    "logLik": -871.814135979976,
+    "npar": 6
+  },
+  "rows": [
+    {
+      "label": "Days in (Days | Subject)",
+      "reduced_formula": "Reaction ~ Days + (1 | Subject)",
+      "logLik": -893.232542697461,
+      "npar": 4,
+      "LRT": 42.8368134349691,
+      "Df": 2,
+      "p_chisq": 4.99004143060735e-10,
+      "mixture_k": 1,
+      "p_mixture": 2.79252981711487e-10
+    }
+  ],
+  "name": "anova_ranova_sleepstudy_slope"
+}

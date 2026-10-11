@@ -1,7 +1,7 @@
 # Shared cell loop, record shape and JSONL writer for the accuracy grid's R
-# engines. lme4.R, glmmtmb.R, glmmadaptive.R and glmm_r.R all source this file,
-# so the record every one of them emits is built by one piece of code and the
-# four cannot drift apart field by field.
+# engines. lme4.R, glmmtmb.R, glmmadaptive.R, glmm_r.R and lmertest.R all source
+# this file, so the record every one of them emits is built by one piece of code
+# and the five cannot drift apart field by field.
 #
 # The environment contract, the same five variables every engine of this grid
 # reads (the Rust and Julia engines cannot share this code, so the five are
@@ -137,7 +137,7 @@ grid_record <- function(cell, engine, engine_version) {
   list(cell = cell[["cell"]], engine = engine, engine_version = engine_version,
        converged = FALSE, singular = FALSE, status = "engine-fail",
        message = NULL, coef_names = I(character(0)), beta = I(numeric(0)),
-       varcomp = list(), sigma = NULL, nb_theta = NULL,
+       coef_df = NULL, varcomp = list(), sigma = NULL, nb_theta = NULL,
        loglik = NULL, deviance = NULL, n_eval = NULL,
        wall_seconds = NULL, fits_per_sample = 1L)
 }

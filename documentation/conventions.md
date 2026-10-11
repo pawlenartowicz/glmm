@@ -71,8 +71,25 @@ For GLMM, two genuinely different Wald covariances are offered, selected by
   cheaper but assumes β–θ orthogonality — exact for the Gaussian LMM, but
   anticonservative for a GLMM, where the IRLS weights couple β and θ.
 
-Coefficient tables report a Wald z-statistic and a two-sided `Pr(>|z|)`
-p-value (the R and Python ports; see `tutorial-r.md` §3).
+Coefficient tables (the R and Python ports; see `tutorial-r.md` §3) report
+the test lmerTest, `lm` and `glm` report for the same model:
+
+- **Gaussian mixed model:** t on lmerTest's Satterthwaite degrees of freedom,
+  one df per coefficient (`Fit::coef_df`, the `df` column), with a two-sided
+  `Pr(>|t|)`. The df come from one derivative pass after the fit; see
+  [`algorithms-lmm.md`](algorithms-lmm.md#satterthwaite-degrees-of-freedom).
+  Switched off (`satterthwaite = FALSE` / `satterthwaite=False`), or when the
+  pass fails, the table falls back to Wald z.
+- **OLS, and Gamma or inverse-Gaussian GLMs with φ estimated:** t on the
+  residual df `n − p` (`p` the retained columns), as `summary.lm` and
+  `summary.glm` do.
+- **Everything else** (binomial, Poisson, negative binomial, a held
+  dispersion, every GLMM): a Wald z-statistic and a two-sided `Pr(>|z|)`.
+
+Confidence intervals (`confint`) follow the table row by row: the t quantile
+on the row's df where it tests with t, the normal quantile where it tests
+with z. Both ports compute them with one Rust function, so they give the same
+intervals.
 
 SEs are computed only for the columns the caller asks for: in Rust,
 `FitOptions::target_indices` selects which predictor columns get an SE (every

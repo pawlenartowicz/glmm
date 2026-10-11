@@ -162,9 +162,11 @@ TOL <- list(
   truth_floor = 0.04,
   # ci_ref_rel  the band the saved-reference checks gate at: tests/grid_reference.rs
   #          (the `fast` cells against the newest committed glmm run) and the R
-  #          package's pins in r/tests/testthat/test-acceptance-pins.R. Both
-  #          restate this number as a constant of their own -- change all three
-  #          together.
+  #          package's pins in r/tests/testthat/test-acceptance-pins.R. Four
+  #          homes hold this number: this entry, CI_REF_REL in
+  #          tests/grid_reference.rs, CI_REF_REL in
+  #          r/tests/testthat/helper-pins.R and _CONFINT_PIN_REL in
+  #          python/tests/test_warnings.py. Change all four together.
   #
   #          It has to cover two different gaps at once.
   #          (a) A DIFFERENT CPU. This is the crate's own cross-architecture pin
@@ -188,7 +190,13 @@ TOL <- list(
   #          measured here. If a CI reference check goes red on this band, the
   #          band is what is wrong -- record the deviation the run prints and
   #          re-measure. Never widen it to turn a run green.
-  ci_ref_rel  = 1e-7
+  ci_ref_rel  = 1e-7,
+  # coef_df_rel  compare.R gate 5: glmm's per-coefficient Satterthwaite df against
+  #          lmerTest's on the Gaussian LMM cells, by rel_max_by_coef. NA until the
+  #          first full lmertest run measures it; it is entered from that run with
+  #          the measurement, the cell it occurred on and the date. While it is
+  #          NA, compare.R prints gate 5 NOT RUN and gates nothing against it.
+  coef_df_rel = NA_real_
 )
 
 # ── truth-error band, per family ─────────────────────────────────────────────
@@ -260,8 +268,9 @@ tol_for <- function(cell_id, quantity) {
   band <- TOL[[quantity]]
   if (is.null(band)) stop(sprintf("tol_for: no such tolerance `%s`", quantity))
   if (is.na(band))
-    stop(sprintf(paste0("tol_for: TOL$%s has not been measured yet. Run the pilot ",
-                        "and write the number into grid/tol.R with its measurement."),
+    stop(sprintf(paste0("tol_for: TOL$%s has not been measured yet. Its comment in ",
+                        "grid/tol.R names the run that measures it; write the number ",
+                        "there with its measurement."),
                  quantity))
   ov <- TOL_PER_CELL[[cell_id]]
   if (!is.null(ov) && !is.null(ov[[quantity]])) return(ov[[quantity]])
@@ -389,6 +398,200 @@ validate_tol_per_cell <- function() {
   invisible(TRUE)
 }
 validate_tol_per_cell()
+
+# ── inference (0.6.0) ────────────────────────────────────────────────────────
+# The bands of the inference tests (df, p-values, test statistics), which fall in
+# three classes:
+#   fit-free arithmetic  a formula evaluated on frozen inputs: a hard band, and
+#                        no registry entry excuses a miss.
+#   end-to-end           a fit compared with a frozen reference under
+#                        goldens/inference/: a miss passes only under an
+#                        'oracle-tier' entry of divergences.json whose `cell` is
+#                        the reference's name and whose `quantities` list the
+#                        quantity's own label (`df`, `p_value`, `lrt`, `f` or
+#                        `confint` end to end; `df_at_lme4`, `dendf_at_lme4` or
+#                        `f_at_lme4` for gate 1 at lme4's theta-hat). Each driver
+#                        reads only the entries under its labels.
+#   Monte Carlo          seeded draws: the band comes from a DKW or binomial
+#                        standard error.
+# Each step that sets a band enters it here with its measurement, its rule and
+# its date, in the house style of every band above.
+# "Gate N" in this list is the inference tier's: 1 df and F against lmerTest,
+# 2 the contest layer's arithmetic, 3 step stability, 4 dense against sparse.
+# compare.R's grid gates (TOL above; its gate 5 is coef_df_rel) are numbered apart.
+# A SEPARATE LIST FROM TOL: `tol_for` never reads it, so no grid gate can pick
+# up an inference band. Mirrored in tests/oracle_support/mod.rs::tol for the
+# integration gates and, for a gate on a crate-private item, beside the in-crate
+# test that reads it. Change together.
+TOL_INFERENCE <- list(
+  # Floor of lmerTest's own FD spread in the per-coefficient Satterthwaite df
+  # (end-to-end class; the gate at lme4's theta-hat, whose per-fixture band is
+  # max(spread, floor) + df_fd_rel + nonstat on the value route and
+  # max(spread, floor) + df_gd_rel + nonstat on the gradient route, which the
+  # gate also runs on every reference whose fit arms the per-group gradient).
+  # The spread is |df - df_second| / df,
+  # the larger of the two settings, read from each reference's frozen `df` and
+  # `df_second` (goldens/inference/lmertest/, tools/goldens_lmertest.R: the df
+  # recomputed after vcov_varpar and Jac_list are re-derived at numDeriv Hessian
+  # d = 0.05 and 0.2, Jacobian d = 5e-5 and 2e-4, r = 4, around lmerTest's
+  # d = 0.1 and 1e-4). MEASURED (2026-10-11) over the 52 lmertest references (142
+  # coefficients): maximum 2.96e-6 on lmertest_sim_dynrange_lmm_ml, (Intercept);
+  # REML maximum 7.56e-7 on lmertest_sim_dynrange_lmm, u; every fixture other
+  # than sim_dynrange_lmm at or below 1.5e-7 (lmertest_sim_unbalanced_nested_ml).
+  # 1e-6 is a set floor, not derived from the spread: a fixture above it carries
+  # its own spread in its band. nonstat = |df(theta0) - df(theta0 - H_p^+ g)|,
+  # theta0 lme4's theta-hat mapped to the kernel, is the df's move over one
+  # Newton step toward glmm's stationary point. Gated in
+  # src/lmm/satterthwaite_tests.rs (gate1_at_lme4_theta, per coefficient,
+  # registry quantity `df_at_lme4`), which holds the Rust copy, and
+  # src/formula/hypotheses_oracle_tests.rs (the per-term DenDF and F,
+  # `dendf_at_lme4` and `f_at_lme4`, the spread read from `DenDF_second`). Its own
+  # labels keep an end-to-end `df` or `f` entry from excusing a miss here. MEASURED (2026-10-11, pawel,
+  # x86_64) over the 26 REML per-coefficient references (71 coefficients): worst
+  # |df - df_lmerTest| / df_lmerTest 9.10e-6 (lmertest_sim_dynrange_lmm, u; band
+  # 2.73e-5) and 8.83e-6 (lmertest_sim_nested_crossed_mix, (Intercept); band
+  # 2.80e-5), every other reference at or below 1.88e-6
+  # (lmertest_sim_wide_crossed, (Intercept)); nonstat up to 2.99e-4
+  # (lmertest_Machines, MachineC, where the df error is 5.4e-8). Per-term rows
+  # (8 REML references, Type III and II): DenDF worst 1.25e-6
+  # (lmertest_anova_sleepstudy, Days), F worst 1.3e-12. The gradient route,
+  # MEASURED (2026-10-11, pawel, x86_64) on the 7 references whose fit arms it
+  # (sleepstudy, Machines, sim_max_q_slope, lmm_slope, all_ones,
+  # sim_corr_boundary, sim_factorial): worst 1.01e-6 (lmertest_all_ones, x; band
+  # 7.48e-5), and the closest to its band 9.97e-7 against 1.04e-6
+  # (lmertest_sleepstudy, Days: spread 1.36e-8, nonstat 4.1e-8, so the floor
+  # carries it). That gap is shared by both routes (value 1.25e-6, gradient
+  # 9.97e-7) and lies outside the crate's FD: the routes agree to 4e-9 there once
+  # Richardson removes the value route's truncation. lmerTest's df does not move
+  # across its numDeriv settings (spread 1.36e-8), so the cause is open; the
+  # floor carries it. Per-term rows on the gradient
+  # route: DenDF worst 9.97e-7 (lmertest_anova_sleepstudy, Days; band 1.04e-6),
+  # F worst 1.3e-12.
+  df_lmertest_floor_rel = 1e-6,
+  # Value-route finite-difference band of the per-coefficient Satterthwaite df
+  # (hard class, no registry entry). Gate 3, step stability: the df at the pass's
+  # step eta = 3e-4 (h_k = eta * max(|theta_k|, 1), ETA in src/lmm/satterthwaite.rs)
+  # against the df at 1e-3, per coefficient; also gate 4 (dense against sparse
+  # kernel at one theta; the sparse kernel has the value route only, so on a
+  # per-group design both the dense gradient route and the dense value route
+  # are held to this band against it), the df_fd_rel term of the gate at
+  # lme4's theta-hat (band max(spread, floor) + df_fd_rel + nonstat), and the
+  # gradient route against the value route on the same fit
+  # (gradient_route_agrees_with_value_route: every df, and each H_p entry (i, j)
+  # at df_fd_rel x sqrt(H_ii H_jj); MEASURED 2026-10-11 at ETA_GRAD = 3e-6, df
+  # 4.5e-7 on q3s near-zero, H_p 5.1e-7 on sim_max_q_slope). Gated in
+  # src/lmm/satterthwaite_tests.rs, which holds the Rust copy. MEASURED
+  # (2026-10-11, pawel, x86_64) by step_sweep_is_flat_at_eta over its 17 fixtures
+  # (the toy 300 + y/4; sim_dynrange_lmm, sim_nested_crossed_mix,
+  # sim_near_singular, sim_corr_boundary; the speed-campaign shapes int1, nest2,
+  # q2s, q3s, cross4 and cross6, a base and a near-zero draw each): maximum 8.7e-6
+  # (sim_nested_crossed_mix), every speed-campaign shape at or below 5.9e-6 (q3s
+  # near-zero). Rule ceil1(2 x 8.7e-6) = 2e-5. The smaller steps are not gated:
+  # round-off from the random effects moves the df by 2.9e-5 between 1e-4 and
+  # 3e-4 (sim_nested_crossed_mix) and 1.5e-3 between 3e-5 and 1e-4
+  # (sim_dynrange_lmm). As a diagnostic only, Richardson extrapolation from the
+  # steps 5e-4 and 1e-3 puts the error at 3e-4 at 3.0e-6 or below.
+  df_fd_rel = 2e-5,
+  # Gradient-route band of the per-coefficient Satterthwaite df (hard class, no
+  # registry entry): H_p from central differences of the per-group analytic
+  # gradient, on the fits that arm it. Gate 3, step stability: the df at the
+  # route's step eta = 3e-6 (h_k = eta * max(|theta_k|, 1), ETA_GRAD in
+  # src/lmm/satterthwaite.rs) against the df at 1e-5, per coefficient; also the
+  # df_gd_rel term of the gate at lme4's theta-hat on that route (band
+  # max(spread, floor) + df_gd_rel + nonstat). Gated in
+  # src/lmm/satterthwaite_tests.rs, which holds the Rust copy. Guessed a priori
+  # at 1e-9.
+  # MEASURED (2026-10-11, pawel, x86_64) by gradient_step_sweep_is_flat_at_eta_grad
+  # over the steps 1e-6, 3e-6, 1e-5, 3e-5 and 1e-4 on 9 per-group fixtures
+  # (sleepstudy, sim_max_q_slope, the weighted lmm_slope and all_ones,
+  # sim_corr_boundary; the speed-campaign shapes q2s and q3s, a base and a
+  # near-zero draw each), the largest change of a df per pair of steps: 1.5e-9
+  # (1e-6 to 3e-6, sim_max_q_slope), 1.2e-9 (3e-6 to 1e-5, q3s near-zero), 6.9e-9
+  # (1e-5 to 3e-5) and 7.8e-8 (3e-5 to 1e-4, both q3s near-zero): round-off below
+  # 3e-6, truncation growing as eta^2 above 1e-5. Rule ceil1(2 x 1.2e-9) = 3e-9,
+  # above the a-priori 1e-9: no pinned step holds 1e-9 against either
+  # neighbour. As a diagnostic only, Richardson extrapolation from the steps 1e-5
+  # and 3e-5 puts the error at 3e-6 at 3.1e-10 or below (8.7e-10 at 1e-5). On the
+  # same fits the gradient route's df is within 4.5e-7 of the value route's (q3s
+  # near-zero), inside df_fd_rel: the gap is the value route's error.
+  df_gd_rel = 3e-9,
+  # Contest layer, fit-free class (gate 2, src/inference/contest_tests.rs, which
+  # holds the Rust copies). The crate's contest1D and get_Fstat_ddf, fed lmerTest's
+  # frozen beta, vcov_beta, vcov_varpar and Jac_list, against lmerTest's own
+  # estimate, std error, df and t and the get_Fstat_ddf case table: the same
+  # arithmetic in another language. The inputs carry jsonlite's 15 significant
+  # digits, and rounding them to 15 digits moves contest1D's df by at most 1.2e-14
+  # relative (MEASURED 2026-10-11 on sleepstudy, sim_factorial, Machines,
+  # sim_wide_slopes, sim_max_q_slope). MEASURED (2026-10-11, pawel, x86_64) by the
+  # gate over the 52 per-coefficient references (142 coefficients and 26 seeded
+  # l): df maximum 1.23e-14 (lmertest_Machines, (Intercept)); t maximum 6.68e-15
+  # (lmertest_lmm_crossed, seeded l); case table maximum 1.17e-16 (`general`).
+  # The band is set a priori (the same arithmetic), with about 80x room over the
+  # df maximum.
+  contest_rel = 1e-12,
+  # contest1D's p on the same rows. p composes the tail function (itself gated at
+  # 1e-12 against R, tests/fixtures/tail_values.json) with t and df, at relative
+  # condition numbers kappa_t = |d ln p / d ln t| and kappa_nu = |d ln p / d ln df|
+  # read in R off the frozen rows with a finite nonzero p (pt(log.p = TRUE), the
+  # df derivative by central differences): kappa_t maximum 268.4
+  # (lmertest_sim_unbalanced_nested_ml, x: t = 24.9, df = 473, p = 6.8e-88),
+  # kappa_nu maximum 68.5 (lmertest_sim_wide_crossed_ml, x). Budget
+  # 1e-12 + 268.4 x 6.68e-15 + 68.5 x 1.23e-14 = 3.64e-12 (the t and df maxima
+  # above); rule ceil1(2 x 3.64e-12) = 8e-12. MEASURED (2026-10-11, pawel) worst
+  # 5.34e-13 (lmertest_sim_unbalanced_nested_ml, x). The two frozen p of exactly 0
+  # (lmertest_sim_dynrange_lmm and _ml, w: t = 313.53 and 313.69, both sides
+  # underflow) are
+  # compared exactly, not under this band.
+  contest_p_rel = 8e-12,
+  # contestMD's F, DenDF, p and per-direction nu_m on the same inputs and on the
+  # frozen L. The nu_m depend on the eigenvectors of L C L', whose error is about
+  # eps * d1 / gap, so every frozen L has a minimum relative eigen-gap of at
+  # least 1e-4 (about 2e-12 at that gap); rounding the inputs to 15 digits moves
+  # contestMD's DenDF by at most 7.6e-15 relative (MEASURED 2026-10-11, the same
+  # five fixtures). MEASURED (2026-10-11, pawel) by the gate over the 67 frozen
+  # cases (every REML reference with p >= 2, plus lmertest_anova_sim_factorial's
+  # basis pair): F maximum 2.36e-14 (lmertest_sim_wide_crossed, identity L);
+  # DenDF maximum 3.02e-14 (lmertest_anova_sim_factorial, basis pair, lmerTest's
+  # L); nu_m maximum 4.87e-14 (lmertest_sim_factorial, identity L, sixth nu_m);
+  # p maximum 8.14e-13 (lmertest_sim_wide_crossed, identity L). The band is set
+  # a priori, about 50x over the eigenvector error at the smallest admitted gap
+  # (2e-12 at 1e-4) and about 120x over the largest measured (p, 8.14e-13).
+  contest_md_rel = 1e-10,
+  # Gate 1 end to end (end-to-end class, registry quantity `df`, and `f` for the
+  # per-term F): glmm's per-coefficient Satterthwaite df at its own theta-hat
+  # against lmerTest's (tests/inference_oracle.rs::lmertest_end_to_end), and the
+  # per-term DenDF and F end to end (src/formula/hypotheses_oracle_tests.rs,
+  # which holds its own Rust copy). df moves with theta-hat as the SE does, and
+  # the two engines agree on theta-hat only to their optimizers' tolerance, so the
+  # band is the cross-engine LMM SE band. MEASURED (2026-10-11, pawel, x86_64)
+  # over the 26 REML per-coefficient references (71 coefficients): maximum
+  # 2.96e-4 (lmertest_Machines, MachineC; its df at lme4's theta-hat agrees to
+  # 5.4e-8, so the gap is the two theta-hats'), every other reference at or below
+  # 1.64e-4 (lmertest_sim_wide_crossed, (Intercept)). Per-term rows: DenDF
+  # maximum 2.91e-4 and F 1.18e-4 (lmertest_anova_Machines, Machine). Each fit
+  # takes its own derivative route here, the gradient route on the 7 fits that
+  # arm the per-group gradient; RE-MEASURED (2026-10-11, pawel) on those routes:
+  # maximum unchanged at 2.96e-4 (lmertest_Machines, gradient route), the
+  # value-route fits at or below 1.64e-4.
+  df_e2e_rel = TOL$se_rel,
+  # Gate 1's interval comparison (end-to-end class, registry quantity
+  # `confint`): the bounds beta-hat -/+ qt(1 - (1 - level)/2, df) * SE at glmm's
+  # own theta-hat against lmerTest's contest1D(m, L, confint = TRUE) lower and
+  # upper (tests/inference_oracle.rs::lmertest_confint). Each bound's difference
+  # is measured in units of lmerTest's interval width, since a bound may sit near
+  # 0, where a difference relative to the bound has no fixed scale. A bound moves
+  # by d(beta) + q d(SE) + SE d(q); over the width 2 q SE each term is half a
+  # relative move of beta (on the SE scale), of SE or of q, each of the SE band's
+  # order, so the band is the SE band. MEASURED (2026-10-11, pawel, x86_64)
+  # over the same 71 coefficients: maximum 8.61e-5 (lmertest_Machines,
+  # MachineB), every other reference at or below 2.61e-5 (lmertest_Penicillin).
+  # On the scale of the bound itself the maximum is 6.14e-4 (the same bound,
+  # 1.74 against a width of 12.4). RE-MEASURED (2026-10-11, pawel) with each fit
+  # on its own derivative route: maximum 8.60e-5 (lmertest_Machines, MachineB,
+  # gradient route), the value-route fits at or below 2.61e-5
+  # (lmertest_Penicillin).
+  confint_rel = TOL$se_rel
+)
 
 # Max relative difference over two aligned numeric vectors; NA on length mismatch
 # so it shows up as a hard failure rather than a silently-recycled false pass.

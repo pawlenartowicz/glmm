@@ -1,0 +1,57 @@
+{
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0",
+      "glmmTMB": "1.1.14"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_anova.R"
+  },
+  "case": "ranova",
+  "reference": "mixture",
+  "full": {
+    "formula": "diameter ~ 1 + (1 | plate) + (1 | sample)",
+    "logLik": -165.430294499802,
+    "npar": 4
+  },
+  "rows": [
+    {
+      "label": "(1 | plate)",
+      "reduced_formula": "diameter ~ (1 | sample)",
+      "logLik": -217.958930822271,
+      "npar": 3,
+      "LRT": 105.057272644938,
+      "Df": 1,
+      "p_chisq": 1.18656152763166e-24,
+      "mixture_k": 0,
+      "p_mixture": 5.93280763815828e-25
+    },
+    {
+      "label": "(1 | sample)",
+      "reduced_formula": "diameter ~ (1 | plate)",
+      "logLik": -306.628012003603,
+      "npar": 3,
+      "LRT": 282.395435007602,
+      "Df": 1,
+      "p_chisq": 2.25734086708434e-63,
+      "mixture_k": 0,
+      "p_mixture": 1.12867043354217e-63
+    }
+  ],
+  "name": "anova_ranova_penicillin"
+}

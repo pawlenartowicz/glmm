@@ -1,7 +1,7 @@
 {
   "schema": "glmm-accuracy-grid/1",
   "generated_by": "grid/gen_manifest.R",
-  "generated": "2026-10-05",
+  "generated": "2026-10-11",
   "cells": [
     {
       "cell": "lmm_int1_g3000p20_bal_base",
@@ -22,7 +22,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1))",
       "glmm_formula": "y ~ x1 + (1 | g1)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": ["pilot", "fast"],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -61,7 +61,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -108,7 +108,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": ["fast"],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -155,7 +155,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 + x1 | g1))",
       "glmm_formula": "y ~ x1 + (1 + x1 | g1)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": ["fast"],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -195,7 +195,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -250,7 +250,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -305,7 +305,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": ["fast"],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -368,7 +368,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 + x1 | g1) + (1 | g2))",
       "glmm_formula": "y ~ x1 + (1 + x1 | g1) + (1 | g2)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -416,7 +416,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 + x1 | g1) + (1 | g2) + (1 | g3))",
       "glmm_formula": "y ~ x1 + (1 + x1 | g1) + (1 | g2) + (1 | g3)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -472,7 +472,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + x2 + (1 + x1 + x2 | g1))",
       "glmm_formula": "y ~ x1 + x2 + (1 + x1 + x2 | g1)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1", "x2"],
@@ -513,7 +513,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -592,7 +592,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 + x1 | g1) + (1 + x1 | g2))",
       "glmm_formula": "y ~ x1 + (1 + x1 | g1) + (1 + x1 | g2)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -641,7 +641,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6) + (1 | g7) + (1 | g8))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6) + (1 | g7) + (1 | g8)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -736,7 +736,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + x2 + (1 + x1 + x2 | g1) + (1 | g2) + (1 | g3))",
       "glmm_formula": "y ~ x1 + x2 + (1 + x1 + x2 | g1) + (1 | g2) + (1 | g3)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1", "x2"],
@@ -793,7 +793,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1))",
       "glmm_formula": "y ~ x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1", "x2", "x3"],
@@ -835,7 +835,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3))",
       "glmm_formula": "y ~ x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1", "x2", "x3"],
@@ -893,7 +893,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + x4 + (1 + x1 + x2 + x3 + x4 | g1) + (1 + x1 | g2))",
       "glmm_formula": "y ~ x1 + x2 + x3 + x4 + (1 + x1 + x2 + x3 + x4 | g1) + (1 + x1 | g2)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1", "x2", "x3", "x4"],
@@ -945,7 +945,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + x4 + x5 + (1 + x1 + x2 + x3 + x4 + x5 | g1))",
       "glmm_formula": "y ~ x1 + x2 + x3 + x4 + x5 + (1 + x1 + x2 + x3 + x4 + x5 | g1)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1", "x2", "x3", "x4", "x5"],
@@ -989,7 +989,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + x4 + x5 + (1 + x1 + x2 + x3 + x4 + x5 | g1) + (1 + x1 | g2) + (1 | g3) + (1 | g4) + (1 | g5))",
       "glmm_formula": "y ~ x1 + x2 + x3 + x4 + x5 + (1 + x1 + x2 + x3 + x4 + x5 | g1) + (1 + x1 | g2) + (1 | g3) + (1 | g4) + (1 | g5)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1", "x2", "x3", "x4", "x5"],
@@ -1066,7 +1066,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + x4 + x5 + x6 + x7 + (1 + x1 + x2 + x3 + x4 + x5 + x6 + x7 | g1))",
       "glmm_formula": "y ~ x1 + x2 + x3 + x4 + x5 + x6 + x7 + (1 + x1 + x2 + x3 + x4 + x5 + x6 + x7 | g1)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": ["fast"],
       "truth": {
         "coef_names": ["(Intercept)", "x1", "x2", "x3", "x4", "x5", "x6", "x7"],
@@ -1112,7 +1112,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + x4 + x5 + x6 + x7 + (1 + x1 + x2 + x3 + x4 + x5 + x6 + x7 | g1) + (1 + x1 | g2) + (1 | g3))",
       "glmm_formula": "y ~ x1 + x2 + x3 + x4 + x5 + x6 + x7 + (1 + x1 + x2 + x3 + x4 + x5 + x6 + x7 | g1) + (1 + x1 | g2) + (1 | g3)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1", "x2", "x3", "x4", "x5", "x6", "x7"],
@@ -12894,7 +12894,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1))",
       "glmm_formula": "y ~ x1 + (1 | g1)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": ["fast"],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -12933,7 +12933,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1))",
       "glmm_formula": "y ~ x1 + (1 | g1)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -12972,7 +12972,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1))",
       "glmm_formula": "y ~ x1 + (1 | g1)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -13011,7 +13011,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1))",
       "glmm_formula": "y ~ x1 + (1 | g1)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -13050,7 +13050,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1))",
       "glmm_formula": "y ~ x1 + (1 | g1)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -13089,7 +13089,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1))",
       "glmm_formula": "y ~ x1 + (1 | g1)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -13128,7 +13128,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1))",
       "glmm_formula": "y ~ x1 + (1 | g1)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": ["fast"],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -13167,7 +13167,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1))",
       "glmm_formula": "y ~ x1 + (1 | g1)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -13206,7 +13206,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 + x1 | g1))",
       "glmm_formula": "y ~ x1 + (1 + x1 | g1)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": ["fast"],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -13246,7 +13246,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 + x1 | g1))",
       "glmm_formula": "y ~ x1 + (1 + x1 | g1)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -13286,7 +13286,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 + x1 | g1))",
       "glmm_formula": "y ~ x1 + (1 + x1 | g1)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -13326,7 +13326,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 + x1 | g1))",
       "glmm_formula": "y ~ x1 + (1 + x1 | g1)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -13366,7 +13366,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 + x1 | g1))",
       "glmm_formula": "y ~ x1 + (1 + x1 | g1)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -13406,7 +13406,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 + x1 | g1))",
       "glmm_formula": "y ~ x1 + (1 + x1 | g1)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -13446,7 +13446,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 + x1 | g1))",
       "glmm_formula": "y ~ x1 + (1 + x1 | g1)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -13486,7 +13486,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 + x1 | g1))",
       "glmm_formula": "y ~ x1 + (1 + x1 | g1)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -13526,7 +13526,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": ["fast"],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -13573,7 +13573,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -13620,7 +13620,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -13667,7 +13667,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -13714,7 +13714,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -13769,7 +13769,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -13824,7 +13824,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -13879,7 +13879,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -13934,7 +13934,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": ["fast"],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -13997,7 +13997,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -14060,7 +14060,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -14123,7 +14123,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -14186,7 +14186,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -14249,7 +14249,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -14312,7 +14312,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": ["fast"],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -14375,7 +14375,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -14438,7 +14438,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -14517,7 +14517,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -14596,7 +14596,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -14675,7 +14675,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -14754,7 +14754,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -14833,7 +14833,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -14912,7 +14912,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -14991,7 +14991,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -15070,7 +15070,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3))",
       "glmm_formula": "y ~ x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1", "x2", "x3"],
@@ -15128,7 +15128,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3))",
       "glmm_formula": "y ~ x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1", "x2", "x3"],
@@ -15186,7 +15186,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3))",
       "glmm_formula": "y ~ x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1", "x2", "x3"],
@@ -15244,7 +15244,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3))",
       "glmm_formula": "y ~ x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1", "x2", "x3"],
@@ -15302,7 +15302,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3))",
       "glmm_formula": "y ~ x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": ["pilot"],
       "truth": {
         "coef_names": ["(Intercept)", "x1", "x2", "x3"],
@@ -15360,7 +15360,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3))",
       "glmm_formula": "y ~ x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1", "x2", "x3"],
@@ -15418,7 +15418,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3))",
       "glmm_formula": "y ~ x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1", "x2", "x3"],
@@ -25128,7 +25128,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1))",
       "glmm_formula": "y ~ x1 + (1 | g1)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -25167,7 +25167,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1))",
       "glmm_formula": "y ~ x1 + (1 | g1)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -25206,7 +25206,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 + x1 | g1))",
       "glmm_formula": "y ~ x1 + (1 + x1 | g1)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -25246,7 +25246,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 + x1 | g1))",
       "glmm_formula": "y ~ x1 + (1 + x1 | g1)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -25286,7 +25286,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -25333,7 +25333,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -25380,7 +25380,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -25435,7 +25435,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -25490,7 +25490,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -25553,7 +25553,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -25616,7 +25616,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -25695,7 +25695,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -25774,7 +25774,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3))",
       "glmm_formula": "y ~ x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1", "x2", "x3"],
@@ -25832,7 +25832,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3))",
       "glmm_formula": "y ~ x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1", "x2", "x3"],
@@ -28732,7 +28732,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1))",
       "glmm_formula": "y ~ x1 + (1 | g1)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -28771,7 +28771,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1))",
       "glmm_formula": "y ~ x1 + (1 | g1)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -28810,7 +28810,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1))",
       "glmm_formula": "y ~ x1 + (1 | g1)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -28849,7 +28849,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 + x1 | g1))",
       "glmm_formula": "y ~ x1 + (1 + x1 | g1)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -28889,7 +28889,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 + x1 | g1))",
       "glmm_formula": "y ~ x1 + (1 + x1 | g1)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -28929,7 +28929,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 + x1 | g1))",
       "glmm_formula": "y ~ x1 + (1 + x1 | g1)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -28969,7 +28969,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 + x1 | g1))",
       "glmm_formula": "y ~ x1 + (1 + x1 | g1)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -29009,7 +29009,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -29056,7 +29056,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -29103,7 +29103,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -29150,7 +29150,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -29205,7 +29205,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -29260,7 +29260,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -29315,7 +29315,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -29378,7 +29378,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -29441,7 +29441,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -29504,7 +29504,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -29583,7 +29583,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -29662,7 +29662,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6))",
       "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -29741,7 +29741,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3))",
       "glmm_formula": "y ~ x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1", "x2", "x3"],
@@ -29799,7 +29799,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3))",
       "glmm_formula": "y ~ x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1", "x2", "x3"],
@@ -29857,7 +29857,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3))",
       "glmm_formula": "y ~ x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1", "x2", "x3"],
@@ -29915,7 +29915,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3))",
       "glmm_formula": "y ~ x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1", "x2", "x3"],
@@ -36711,7 +36711,7 @@
       "glmm_formula": "y ~ x1 + (1 | g1)",
       "weights_col": "w",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": ["pilot"],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -36751,7 +36751,7 @@
       "glmm_formula": "y ~ x1 + (1 + x1 | g1)",
       "weights_col": "w",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1"],
@@ -36947,7 +36947,7 @@
       "jl_formula": "@formula(Yield ~ 1 + (1 | Batch))",
       "glmm_formula": "Yield ~ (1 | Batch)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": ["fast"],
       "truth_why": "empirical data; no generating parameter vector"
     },
@@ -36964,7 +36964,7 @@
       "jl_formula": "@formula(Reaction ~ 1 + Days + (1 + Days | Subject))",
       "glmm_formula": "Reaction ~ Days + (1 + Days | Subject)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": ["pilot", "fast"],
       "truth_why": "empirical data; no generating parameter vector"
     },
@@ -36981,7 +36981,7 @@
       "jl_formula": "@formula(diameter ~ 1 + (1 | plate) + (1 | sample))",
       "glmm_formula": "diameter ~ (1 | plate) + (1 | sample)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": ["fast"],
       "truth_why": "empirical data; no generating parameter vector"
     },
@@ -36998,7 +36998,7 @@
       "jl_formula": "@formula(strength ~ 1 + (1 | batch) + (1 | batch & cask))",
       "glmm_formula": "strength ~ (1 | batch) + (1 | batch:cask)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": ["fast"],
       "truth_why": "empirical data; no generating parameter vector"
     },
@@ -37050,7 +37050,7 @@
       "jl_formula": "@formula(score ~ 1 + Machine + (1 + Machine | Worker))",
       "glmm_formula": "score ~ Machine + (1 + Machine | Worker)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": ["fast"],
       "truth_why": "empirical data; no generating parameter vector"
     },
@@ -37067,7 +37067,7 @@
       "jl_formula": "@formula(yield ~ 1 + Variety + nitro + (1 | Block/Variety))",
       "glmm_formula": "yield ~ Variety + nitro + (1 | Block/Variety)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": ["fast"],
       "truth_why": "empirical data; no generating parameter vector"
     },
@@ -37101,7 +37101,7 @@
       "jl_formula": "@formula(angle ~ 1 + recipe*temp + (1 | recipe & replicate))",
       "glmm_formula": "angle ~ recipe*temp + (1 | recipe:replicate)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": ["fast"],
       "truth_why": "empirical data; no generating parameter vector"
     },
@@ -37153,7 +37153,7 @@
       "jl_formula": "@formula(y ~ 1 + x + (1 + x | g1) + (1 + x | g2))",
       "glmm_formula": "y ~ x + (1 + x | g1) + (1 + x | g2)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x"],
@@ -37375,7 +37375,7 @@
       "jl_formula": "@formula(y ~ 1 + x + (1 | g1/g2))",
       "glmm_formula": "y ~ x + (1 | g1/g2)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x"],
@@ -37416,7 +37416,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + x4 + x5 + x6 + x7 + (1 + x1 + x2 + x3 + x4 + x5 + x6 + x7 | g1))",
       "glmm_formula": "y ~ x1 + x2 + x3 + x4 + x5 + x6 + x7 + (1 + x1 + x2 + x3 + x4 + x5 + x6 + x7 | g1)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": ["fast"],
       "truth": {
         "coef_names": ["(Intercept)", "x1", "x2", "x3", "x4", "x5", "x6", "x7"],
@@ -37622,7 +37622,7 @@
       "jl_formula": "@formula(y ~ 1 + x + (1 | g1/g2))",
       "glmm_formula": "y ~ x + (1 | g1/g2)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x"],
@@ -37663,7 +37663,7 @@
       "jl_formula": "@formula(y ~ 1 + x + (1 | g1/g2) + (1 | c1))",
       "glmm_formula": "y ~ x + (1 | g1/g2) + (1 | c1)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x"],
@@ -38058,7 +38058,7 @@
       "glmm_formula": "y ~ x + (1 | g)",
       "weights_col": "w",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x"],
@@ -38092,7 +38092,7 @@
       "glmm_formula": "y ~ x + (1 + x | g)",
       "weights_col": "w",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x"],
@@ -38127,7 +38127,7 @@
       "glmm_formula": "y ~ x + (1 + x | g1) + (1 + x | g2)",
       "weights_col": "w",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x"],
@@ -38340,7 +38340,7 @@
       "glmm_formula": "y ~ x + (1 | g)",
       "weights_col": "w",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x"],
@@ -38400,7 +38400,7 @@
       "glmm_formula": "y ~ x + (1 + x | g)",
       "weights_col": "w",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x"],
@@ -38689,7 +38689,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + (1 | g))",
       "glmm_formula": "y ~ x1 + x2 + x3 + (1 | g)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth_why": "near-collinear design (x3 = x1 + x2 + 1e-13 jitter) on a mixed model; the aliased column has no true beta"
     },
@@ -38706,7 +38706,7 @@
       "jl_formula": "@formula(y ~ 1 + u + w + (1 | g))",
       "glmm_formula": "y ~ u + w + (1 | g)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth_why": "tools/prep/gen_illcond_data.R draws the random effect and the residual from a deterministic 16-bit LCG uniform, not from normals, so the variance parameters have no generating value"
     },
@@ -39009,7 +39009,7 @@
       "jl_formula": "@formula(y ~ 1 + x + (1 + x | g1) + (1 | g2))",
       "glmm_formula": "y ~ x + (1 + x | g1) + (1 | g2)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": ["pilot"],
       "truth": {
         "coef_names": ["(Intercept)", "x"],
@@ -39140,7 +39140,7 @@
       "jl_formula": "@formula(y ~ 1 + x + (1|g1) + (1|c1) + (1|c2) + (1|c3) + (1|c4) + (1|c5) + (1|c6) + (1|c7))",
       "glmm_formula": "y ~ x + (1|g1) + (1|c1) + (1|c2) + (1|c3) + (1|c4) + (1|c5) + (1|c6) + (1|c7)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x"],
@@ -39229,7 +39229,7 @@
       "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + x4 + (1|gp) + (1 + x1 + x2 + x3 + x4 | ge))",
       "glmm_formula": "y ~ x1 + x2 + x3 + x4 + (1|gp) + (1 + x1 + x2 + x3 + x4 | ge)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth": {
         "coef_names": ["(Intercept)", "x1", "x2", "x3", "x4"],
@@ -39308,7 +39308,7 @@
       "jl_formula": "@formula(y ~ 1 + t + v + z + (1 | g))",
       "glmm_formula": "y ~ t + v + z + (1 | g)",
       "reml": true,
-      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
       "tags": [],
       "truth_why": "tools/prep/gen_illcond_data.R: the same LCG uniform draws as sim_dynrange_lmm, and t and v are entangled to 3e-6 so neither slope is separately identified",
       "dev_ref": "t and v are entangled to 3e-6 (tools/prep/gen_illcond_data.R), so lme4, glmmTMB and glmm each converge to a slightly different theta and their own reported REML criterion carries round-off of 1e-4 to 7e-4 against the true optimum -- above dev_eps even though all three theta agree with each other to 1e-10 on the true objective"

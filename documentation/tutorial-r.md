@@ -152,6 +152,13 @@ The knobs:
   Evaluated in `data`, so an expression works. The formula also accepts an
   `offset(expr)` term (see [`formula.md`](formula.md)); passing both this
   argument and a formula `offset()` term is an error asking you to use one.
+- `satterthwaite`: `TRUE` (default) computes lmerTest's Satterthwaite
+  degrees of freedom for a Gaussian mixed model's t tests, in one pass after
+  the fit. `FALSE` skips that pass: `summary()` then tests with z and says
+  "df not computed (satterthwaite = FALSE)", `confint()` gives normal
+  intervals with the same message, and `fit$df_method` is `"disabled"`. OLS
+  and the Gamma and inverse-Gaussian GLMs keep their residual df `n - p`
+  whatever it says; no other family reads it.
 - `start` — warm start; see §4.
 - `init.theta` — negative-binomial shape seed, named for
   `MASS::glm.nb(init.theta=)`: the starting value of the shape search, the
@@ -186,20 +193,32 @@ shaped like lme4's. These **work**:
 
 | accessor | what it returns |
 |---|---|
-| `summary(fit)` | lme4's blocks in lme4's order: the criterion (`REML criterion at convergence` on an LMM, an `AIC BIC logLik deviance df.resid` row on an ML fit), scaled residuals, the RE block, the coefficient table (estimate, std. error, Wald **z**, `Pr(>|z|)`), the correlation of fixed effects, and a dispersion/shape footer. When the fit raised any warnings, the printed summary ends with a `Warnings:` section listing each one's tier, title and message. |
+| `summary(fit)` | lme4's blocks in lme4's order: the criterion (`REML criterion at convergence` on an LMM, an `AIC BIC logLik deviance df.resid` row on an ML fit), scaled residuals, the RE block, the coefficient table, the correlation of fixed effects, and a dispersion/shape footer. The coefficient table follows lmerTest, `lm` and `glm`: on a Gaussian mixed model `Estimate`, `Std. Error`, `df` (Satterthwaite), `t value`, `Pr(>|t|)`; on OLS and the Gamma and inverse-Gaussian GLMs with an estimated dispersion, t on the residual df `n - p`, printed in the footer (on OLS with `summary.lm`'s residual standard error and R-squared lines); everywhere else Wald **z** and `Pr(>|z|)`. When the fit raised any warnings, the printed summary ends with a `Warnings:` section listing each one's tier, title and message. |
 | `fixef(fit)` | named fixed-effect estimates; aliased (rank-deficient) columns are `NA`, as in `lm`/lme4. |
 | `vcov(fit)` | full `p × p` Wald covariance of β̂. |
 | `VarCorr(fit)` | variance components on the **SD/correlation** scale, one covariance per grouping, lme4-shaped; a `Residual` row (= `sigma()`) is printed for a gaussian mixed fit. Groups are listed in the order they appear in the formula — lme4's own `VarCorr` instead sorts by decreasing number of levels. |
-| `confint(fit)` | Wald intervals off `vcov()`. `method = "profile"`/`"boot"` are not available and say so. |
+| `confint(fit)` | Wald intervals off `vcov()` that follow `summary()` row by row: the t quantile on the row's df where the summary tests with t (Satterthwaite df on a Gaussian mixed model, `n - p` as `confint.lm` on OLS and the dispersion GLMs), the normal quantile where it tests with z. `parm` and `level` as in `stats::confint`. The Python port's `fit.confint()` gives the same intervals. `method = "profile"`/`"boot"` are not available and say so. |
 | `isSingular(fit)` | boundary-fit flag — lme4's condition, computed by the kernel. |
 | `sigma(fit)` | residual SD for gaussian fits, `sqrt(phi)` for Gamma/inverse-Gaussian; `1` for binomial/Poisson/negative-binomial (fixed scale, as in lme4). |
 | `nobs`, `formula`, `family`, `model.frame`, `print` | the usual; `formula()` returns the formula **string** as given (the parser is Rust-side, so there is no R `terms` object to hand back). |
 | `ranef(fit)` | conditional modes (BLUPs), one data frame per grouping, lme4-shaped. Conditional variances (`condVar`) are not computed. |
 | `fitted(fit)` | conditional means per row, including the random-effect contribution and any offset. |
 | `residuals(fit)` | `type = "response"` (default, `y - fitted`) or `type = "pearson"`. Deviance and working residuals are not offered. |
-| `tidy(fit)`, `glance(fit)` | broom-shaped data frames: one row per fixed effect (`term`, `estimate`, `std.error`, `statistic`, `p.value`), and one row of fit statistics (`nobs`, `logLik`, `AIC`, `BIC`, `deviance`, `df.residual`, `REML`). |
+| `tidy(fit)`, `glance(fit)` | broom-shaped data frames: one row per fixed effect (`term`, `estimate`, `std.error`, `statistic`, then `df` where `summary()` has a df column, then `p.value`; the statistic and p-value are the summary's, t or z), and one row of fit statistics (`nobs`, `logLik`, `AIC`, `BIC`, `deviance`, `df.residual`, `REML`). |
+| `fit$coef_df`, `fit$coef_p`, `fit$df_method` | per coefficient, the df of its t test (Satterthwaite on a Gaussian mixed model, `n - p` on OLS and the dispersion GLMs, `NaN` where the test is z and on an OLS or dispersion-GLM fit that did not converge) and that test's p-value; `df_method` says which (`"satterthwaite"`, `"residual"`, `"none"`, `"disabled"`, `"failed"`). |
+| `fit$rss`, `fit$r_squared`, `fit$adj_r_squared` | OLS only: the weighted residual sum of squares and `summary.lm`'s multiple and adjusted R-squared (0 on an intercept-only model); `NaN` on every other fit and on a non-converged one. |
 | `logLik(fit)` | log-likelihood on `stats::logLik`'s scale, so `AIC()`/`BIC()` work; on the LMM paths this is the REML criterion (`REML = TRUE` attribute). |
 | `fit$diagnostics` | list with `converged`, `singular`, `aliased`, `boundary`, `pinned`, `notes` — the solver's own report; the top-level `fit$converged`/`fit$singular`/`fit$aliased` are unchanged and mirror the same values. |
+
+On the Gaussian mixed model of §1:
+
+```r
+summary(fit)                  # Estimate, Std. Error, df, t value, Pr(>|t|)
+fit$coef_df                   # the df column, named by coefficient
+confint(fit)                  # 2.5 % and 97.5 % bounds on t quantiles
+confint(fit, "x1", level = 0.9)
+tidy(fit)                     # term, estimate, std.error, statistic, df, p.value
+```
 
 **Diagnostic conditions.** `fit` raises a warning for anything worth knowing
 about the fit (a kernel note such as ill-conditioning, an ignored argument,

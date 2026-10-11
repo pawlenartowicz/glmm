@@ -1,0 +1,45 @@
+{
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0",
+      "glmmTMB": "1.1.14"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_anova.R"
+  },
+  "case": "ranova",
+  "reference": "envelope",
+  "full": {
+    "formula": "Yield ~ 1 + (1 | Batch)",
+    "logLik": -159.827138421129,
+    "npar": 3
+  },
+  "rows": [
+    {
+      "label": "(1 | Batch)",
+      "reduced_formula": "Yield ~ 1",
+      "logLik": -163.011616077939,
+      "npar": 2,
+      "LRT": 6.36895531362126,
+      "Df": 1,
+      "p_chisq": 0.0116133944354532,
+      "envelope": true
+    }
+  ],
+  "name": "anova_ranova_dyestuff"
+}

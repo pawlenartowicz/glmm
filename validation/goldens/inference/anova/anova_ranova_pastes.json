@@ -1,0 +1,57 @@
+{
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0",
+      "glmmTMB": "1.1.14"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_anova.R"
+  },
+  "case": "ranova",
+  "reference": "mixture",
+  "full": {
+    "formula": "strength ~ 1 + (1 | batch/cask)",
+    "logLik": -123.495372926744,
+    "npar": 4
+  },
+  "rows": [
+    {
+      "label": "(1 | cask:batch)",
+      "reduced_formula": "strength ~ (1 | batch)",
+      "logLik": -150.797705365492,
+      "npar": 3,
+      "LRT": 54.6046648774961,
+      "Df": 1,
+      "p_chisq": 1.47385370218874e-13,
+      "mixture_k": 0,
+      "p_mixture": 7.36926851094372e-14
+    },
+    {
+      "label": "(1 | batch)",
+      "reduced_formula": "strength ~ (1 | cask:batch)",
+      "logLik": -123.82420089018,
+      "npar": 3,
+      "LRT": 0.657655926872565,
+      "Df": 1,
+      "p_chisq": 0.417388710959074,
+      "mixture_k": 0,
+      "p_mixture": 0.208694355479537
+    }
+  ],
+  "name": "anova_ranova_pastes"
+}

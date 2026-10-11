@@ -6,6 +6,11 @@ FIXED <- data.frame(x = x, y = yy)
 g <- factor(sprintf("g%d", (seq_along(x) - 1L) %% 5L))
 off <- c(g0 = -3, g1 = -1.5, g2 = 0, g3 = 1.5, g4 = 3)
 MIXED <- data.frame(x = x, g = g, y = yy + off[as.character(g)])
+# MIXED with groups of rows (i %/% 2) %% 5, so y - 0.3x is not constant within a
+# group (in MIXED it is, and the LMM fit rides the theta cap): theta-hat is
+# interior and sigma-hat^2 is not tiny.
+g_pairs <- factor(sprintf("g%d", ((seq_along(x) - 1L) %/% 2L) %% 5L))
+MIXED_PAIRS <- data.frame(x = x, g = g_pairs, y = yy + off[as.character(g_pairs)])
 
 printed <- function(row) {
   sprintf("%s%s: %s. %s", toupper(substr(row$tier, 1L, 1L)), substring(row$tier, 2L),
@@ -140,6 +145,23 @@ test_that("constructed notes store with their tier and title", {
                      "limit of 25 rounds before it settled. The coefficients and standard",
                      "errors are computed at the last value it reached, which may not be",
                      "the best one.")),
+    list(note = modifyList(base, list(
+           kind = "satterthwaite_curvature",
+           detail = "dropped 0, negative 0, converged false, nonfinite true")),
+         cls = "fastglmm_satterthwaite_curvature",
+         msg = paste("The Satterthwaite degrees of freedom could not be computed: the fit",
+                     "has no finite end point, or the deviance near it was not finite. Every",
+                     "coefficient is tested with z, and its confidence interval uses the",
+                     "normal distribution.")),
+    list(note = modifyList(base, list(
+           kind = "satterthwaite_curvature",
+           detail = "dropped 1, negative 2, converged false, nonfinite false")),
+         cls = "fastglmm_satterthwaite_curvature",
+         msg = paste("The Satterthwaite degrees of freedom are approximate: the curvature of",
+                     "the deviance in the variance parameters has 1 flat direction, left out;",
+                     "it has 2 negative directions, so the fit may not be at a minimum; the",
+                     "variance search stopped at its step limit, so they are computed at its",
+                     "last point. The t tests and confidence intervals use them as computed.")),
     list(note = modifyList(base, list(kind = "from_the_future")),
          cls = "fastglmm_unknown_note",
          msg = paste("The solver reported something ('from_the_future') that this installed",
@@ -446,6 +468,7 @@ test_that("the kind table matches the Python port", {
     agq_fallback = c("caution", "Adaptive quadrature not used"),
     non_integer_response = c("caution", "Non-integer response"),
     rows_dropped_na = c("caution", "Rows dropped for missing values"),
+    satterthwaite_curvature = c("caution", "Satterthwaite df uncertain"),
     argument_ignored = c("note", "Argument ignored"),
     unused_grouping_levels = c("note", "Unused grouping levels"),
     single_level_grouping_dropped = c("note", "Random effect dropped (single level)")
@@ -506,4 +529,44 @@ test_that("port parity non_integer_response", {
   expect_identical(fit$warnings$tier, "caution")
   expect_identical(fit$warnings$kind, "non_integer_response")
   expect_identical(fit$warnings$title, "Non-integer response")
+})
+
+test_that("a degenerate Gaussian LMM carries the Satterthwaite note", {
+  # Same fixture and call in python/tests/test_warnings.py - change together. A
+  # random slope on an aliased column (x2 = 2x) leaves a NaN-filled fit with no
+  # finite end point, so the Satterthwaite pass is recorded as failed.
+  d <- MIXED
+  d$x2 <- 2 * d$x
+  got <- fit_catching(fastglmm(y ~ x + x2 + (1 + x2 | g), d),
+                      "fastglmm_satterthwaite_curvature")
+  expect_false(is.null(got$cond))
+  expect_match(conditionMessage(got$cond), "could not be computed", fixed = TRUE)
+  expect_false(got$fit$converged)
+  expect_identical(got$fit$df_method, "failed")
+  expect_identical(got$fit$warnings$kind, c("satterthwaite_curvature", "fit_failed"))
+  off <- suppressWarnings(fastglmm(y ~ x + x2 + (1 + x2 | g), d, satterthwaite = FALSE))
+  expect_identical(off$df_method, "disabled")
+  expect_identical(off$warnings$kind, "fit_failed")
+})
+
+test_that("port parity confint", {
+  # Pinned 90% intervals on MIXED_PAIRS from orchestrate::confint, the one function
+  # both ports call, for the LMM (Satterthwaite t, df about 4.0 and 14.1) and the
+  # OLS fit (t on n - p = 18). Produced on x86_64 Linux from these sources
+  # (release builds of both ports gave the same digits). Same numbers and band in
+  # python/tests/test_warnings.py - change together. Band: CI_REF_REL
+  # (helper-pins.R).
+  pins <- list(
+    "y ~ x + (1 | g)" = rbind(c(-2.423532479928109, 2.4235324799281277),
+                              c(0.26110360172792885, 0.3444701274625301)),
+    "y ~ x" = rbind(c(-0.8530566754329614, 0.8530566754329608),
+                    c(0.3287512344979612, 0.6037162979695715))
+  )
+  for (f in names(pins)) {
+    expect_no_warning(fit <- fastglmm(stats::as.formula(f), MIXED_PAIRS))
+    expect_identical(fit$df_method,
+                     if (grepl("|", f, fixed = TRUE)) "satterthwaite" else "residual")
+    expect_equal(unname(unclass(confint(fit, level = 0.9))), pins[[f]],
+                 tolerance = CI_REF_REL, info = f)
+  }
 })

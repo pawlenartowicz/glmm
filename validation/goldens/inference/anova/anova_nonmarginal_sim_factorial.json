@@ -1,0 +1,116 @@
+{
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0",
+      "glmmTMB": "1.1.14"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_anova.R"
+  },
+  "case": "nonmarginal",
+  "term_labels": ["x", "x:g"],
+  "coef_names": ["(Intercept)", "x", "x:gb", "x:gc"],
+  "lmertest_type3": {
+    "rows": [
+      {
+        "term": "x",
+        "Sum Sq": 23.2418131889362,
+        "Mean Sq": 23.2418131889362,
+        "NumDF": 1,
+        "DenDF": 24.2048917308079,
+        "F value": 11.4243028672118,
+        "Pr(>F)": 0.00245637253864655
+      },
+      {
+        "term": "x:g",
+        "Sum Sq": 5.37319669357019,
+        "Mean Sq": 2.6865983467851,
+        "NumDF": 2,
+        "DenDF": 55.4132332457399,
+        "F value": 1.32057309585614,
+        "Pr(>F)": 0.275252176579421
+      }
+    ],
+    "conditions": []
+  },
+  "lmertest_type2": {
+    "rows": [
+      {
+        "term": "x",
+        "Sum Sq": 23.2418131889362,
+        "Mean Sq": 23.2418131889362,
+        "NumDF": 1,
+        "DenDF": 24.2048917308079,
+        "F value": 11.4243028672118,
+        "Pr(>F)": 0.00245637253864655
+      },
+      {
+        "term": "x:g",
+        "Sum Sq": 5.37319669357019,
+        "Mean Sq": 2.6865983467851,
+        "NumDF": 2,
+        "DenDF": 55.4132332457399,
+        "F value": 1.32057309585614,
+        "Pr(>F)": 0.275252176579421
+      }
+    ],
+    "conditions": []
+  },
+  "car_type2_lmer": {
+    "rows": [
+      {
+        "term": "x",
+        "Chisq": 20.1419881751586,
+        "Df": 1,
+        "Pr(>Chisq)": 7.19007862576265e-06
+      },
+      {
+        "term": "x:g",
+        "Chisq": 2.64114619171227,
+        "Df": 2,
+        "Pr(>Chisq)": 0.266982251691694
+      }
+    ],
+    "conditions": []
+  },
+  "car_type2_lm": {
+    "rows": [
+      {
+        "term": "x",
+        "Sum Sq": 55.4975173870235,
+        "Df": 1,
+        "F value": 16.2062574058748,
+        "Pr(>F)": 0.000101685865279306
+      },
+      {
+        "term": "x:g",
+        "Sum Sq": 18.4473075556631,
+        "Df": 2,
+        "F value": 2.69347016558905,
+        "Pr(>F)": 0.0718769133292405
+      },
+      {
+        "term": "Residuals",
+        "Sum Sq": 397.236194370271,
+        "Df": 116
+      }
+    ],
+    "conditions": []
+  },
+  "name": "anova_nonmarginal_sim_factorial"
+}

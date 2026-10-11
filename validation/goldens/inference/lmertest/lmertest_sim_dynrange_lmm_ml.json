@@ -1,0 +1,104 @@
+{
+  "r_formula": "y ~ 1 + u + w + (1 | g)",
+  "reml": false,
+  "boundary": "none",
+  "theta": [14.1511320337908],
+  "theta_names": ["g.(Intercept)"],
+  "cnms": [
+    ["(Intercept)"]
+  ],
+  "group_names": ["g"],
+  "group_levels": [25],
+  "sigma": 0.291564617613065,
+  "beta": [-1.17366666559301, 9706846.67653542, 0.501109529266097],
+  "coef_names": ["(Intercept)", "u", "w"],
+  "cols_dropped": [],
+  "vcov_beta": [
+    [2.89437728621704, -14188123.9522372, 2.93533546755696e-17],
+    [-14188123.9522372, 90949512511207.8, -7.63145579085816e-11],
+    [2.93533546755696e-17, -7.63145579085816e-11, 2.55189272026575e-06]
+  ],
+  "deviance": 597.604654788605,
+  "estimate": [-1.17366666559301, 9706846.67653542, 0.501109529266097],
+  "std_error": [1.70128694999316, 9536745.3835786, 0.00159746446604165],
+  "df": [25.000067954799, 25.0000504011091, 974.999996315319],
+  "t_value": [-0.689869904426013, 1.01783640918522, 313.690563964651],
+  "p_value": [0.496630573335568, 0.318505334756955, 0],
+  "level": 0.95,
+  "lower": [-4.67753224547163, -9934446.10091288, 0.49797466490991],
+  "upper": [2.33019891428562, 29348139.4539837, 0.504244393622284],
+  "varpar_names": ["g.(Intercept)", "sigma"],
+  "vcov_varpar": [
+    [4.10880929499966, -0.00211614558806666],
+    [-0.00211614558806666, 4.35948341358367e-05]
+  ],
+  "Jac_list": [
+    [
+      [0.409015009371141, -2004975.62584963, -1.95127918399039e-14],
+      [-2004975.62584963, 12852411794769.8, -1.07842734372273e-11],
+      [-1.95127918399039e-14, -1.07842734372273e-11, 0]
+    ],
+    [
+      [19.8541051373844, -97324044.7926957, 2.01350595390938e-16],
+      [-97324044.7926957, 623872081981802, -5.23482983177091e-10],
+      [2.01350595390938e-16, -5.23482983177091e-10, 1.75048175677882e-05]
+    ]
+  ],
+  "fd_settings": [
+    {
+      "hessian_d": 0.05,
+      "jacobian_d": 5e-05,
+      "r": 4
+    },
+    {
+      "hessian_d": 0.2,
+      "jacobian_d": 0.0002,
+      "r": 4
+    }
+  ],
+  "df_second": [
+    [25.0000966119063, 24.9999939139345],
+    [25.0000609316193, 24.99999103459],
+    [974.999996333662, 974.999994873578]
+  ],
+  "conditions": [
+    {
+      "stage": "fit",
+      "type": "warning",
+      "text": "Some predictor variables are on very different scales: consider rescaling. \nYou may also use (g)lmerControl(autoscale = TRUE) to improve numerical stability."
+    },
+    {
+      "stage": "fit",
+      "type": "warning",
+      "text": "Some predictor variables are on very different scales: consider rescaling. \nYou may also use (g)lmerControl(autoscale = TRUE) to improve numerical stability."
+    },
+    {
+      "stage": "devfun",
+      "type": "warning",
+      "text": "Some predictor variables are on very different scales: consider rescaling. \nYou may also use (g)lmerControl(autoscale = TRUE) to improve numerical stability."
+    }
+  ],
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_lmertest.R"
+  },
+  "name": "lmertest_sim_dynrange_lmm_ml"
+}

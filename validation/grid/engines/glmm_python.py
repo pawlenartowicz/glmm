@@ -150,6 +150,7 @@ def base_record(cell_id, engine, engine_version):
         "message": None,
         "coef_names": [],
         "beta": [],
+        "coef_df": None,
         "varcomp": [],
         "sigma": None,
         "nb_theta": None,
@@ -264,9 +265,11 @@ def fit_one(cell):
             times, first sample discarded, `rec["wall_seconds"]` set to the
             median of the rest. Returns the last (or only) sample's Fit --
             `call` is deterministic (BOBYQA on a fixed input), so every
-            sample agrees. Mirrors common.rs's separate untimed report fit
-            plus timed wall-clock loop, folded into one helper because the
-            port has one call to re-run rather than two Wald-SE arms."""
+            sample agrees. Unlike common.rs, which reports an untimed fit and
+            times separate samples with the Satterthwaite pass switched off,
+            the port times the reported fit itself, pass included: it has one
+            call to re-run rather than two Wald-SE arms, and no port timing is
+            set beside glmm's (summarize_timing.R has no port column)."""
             if TIMED is None:
                 return call()
             fh = None
@@ -287,6 +290,7 @@ def fit_one(cell):
             rec["se_rx"] = nums(fr.se)
         rec["coef_names"] = list(fh.names)
         rec["beta"] = nums(fh.beta)
+        rec["coef_df"] = nums(fh.coef_df)  # verbatim, NaN as null per entry (common.rs)
         rec["varcomp"] = varcomp(fh)  # by group NAME; no ref_order
         set_loglik(rec, fh.loglik)
         rec["sigma"] = num(math.sqrt(fh.dispersion)) if cell["family"] in ("gaussian", "gamma") else None

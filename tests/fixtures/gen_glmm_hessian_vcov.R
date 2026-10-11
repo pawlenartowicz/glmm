@@ -33,7 +33,8 @@ fx$beta <- as.numeric(fixef(m))
 fx$vcov_hessian <- unname(as.matrix(vcov(m, use.hessian = TRUE)))
 fx$vcov_rx <- unname(suppressWarnings(as.matrix(vcov(m, use.hessian = FALSE))))
 
-# digits = NA: full double precision -- an oracle fixture, not a display.
+# digits = NA: jsonlite's maximum, 15 significant digits (not a full 17-digit
+# round trip), so each value carries up to 5e-15 relative rounding.
 write(toJSON(fx, auto_unbox = TRUE, pretty = TRUE, digits = NA), path)
 cat(sprintf("rewrote %s: theta %.10f, beta %s\n", path, fx$theta,
             paste(sprintf("%.10f", fx$beta), collapse = " ")))

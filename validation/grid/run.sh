@@ -5,8 +5,10 @@
 #            [--complete-from DIR] [cell ...]
 #
 #   engine   glmm | glmm_wasm | glmm_python | glmm_r | lme4 | glmmtmb | glmmadaptive | mixedmodels
+#            | lmertest
 #            (glmm_wasm: the glmm engine built for wasm32-wasip1 with simd128, run
-#            under wasmtime)
+#            under wasmtime; lmertest: lmerTest's Satterthwaite df on the Gaussian
+#            LMM cells, kept and found like an oracle run, read by compare.R gate 5)
 #   --fast   restrict to the cells tagged `fast` in manifest.json
 #   --timed[=N]  time every fit: N samples (default 4), first discarded, median of
 #            the rest. IMPLIES --fast and --jobs=1. Records no_turbo and REFUSES to
@@ -144,6 +146,7 @@ case "$ENGINE" in
   glmmtmb)      ENGINE_MANIFEST_NAME=glmmTMB ;;
   glmmadaptive) ENGINE_MANIFEST_NAME=GLMMadaptive ;;
   mixedmodels)  ENGINE_MANIFEST_NAME=MixedModels ;;
+  lmertest)     ENGINE_MANIFEST_NAME=lmerTest ;;
   glmm|glmm_wasm|glmm_python|glmm_r) ENGINE_MANIFEST_NAME="" ;;
   *) echo "unknown engine: $ENGINE" >&2; exit 2 ;;
 esac
@@ -209,8 +212,8 @@ part_cells() {   # $1 = part index
 # ---- engine version, resolved BEFORE the run (it is in the directory name) --
 # Mirrors the engine list of the ENGINE_MANIFEST_NAME case above.
 case "$ENGINE" in
-  lme4|glmmtmb|glmmadaptive)
-    PKG=$(case "$ENGINE" in lme4) echo lme4;; glmmtmb) echo glmmTMB;; glmmadaptive) echo GLMMadaptive;; esac)
+  lme4|glmmtmb|glmmadaptive|lmertest)
+    PKG=$(case "$ENGINE" in lme4) echo lme4;; glmmtmb) echo glmmTMB;; glmmadaptive) echo GLMMadaptive;; lmertest) echo lmerTest;; esac)
     ENGINE_VERSION="$(Rscript -e "cat(as.character(packageVersion('$PKG')))")" ;;
   mixedmodels)
     ENGINE_VERSION="$(julia --project="$GRID" -e 'using MixedModels; print(pkgversion(MixedModels))')" ;;
@@ -343,6 +346,7 @@ case "$ENGINE" in
   glmmtmb)      CMD=(Rscript "$GRID/engines/glmmtmb.R") ;;
   glmmadaptive) CMD=(Rscript "$GRID/engines/glmmadaptive.R") ;;
   mixedmodels)  CMD=(julia --project="$GRID" "$GRID/engines/mixedmodels.jl") ;;
+  lmertest)     CMD=(Rscript "$GRID/engines/lmertest.R") ;;
 esac
 # Compile OUTSIDE the watchdog: a first build takes minutes with no output
 # writes, which the mtime test would read as a hung cell and kill the compiler.
@@ -406,7 +410,7 @@ run_worker() {   # $1 = part index
         if [[ -n "${CELL:-}" ]]; then
           # EFF, not the budget: a launch killed during the startup grace waited
           # that long, and the message has to say what was actually spent.
-          printf '{"cell":"%s","engine":"%s","engine_version":"%s","converged":false,"singular":false,"status":"timeout","message":"watchdog killed the engine after %ss","coef_names":[],"beta":[],"varcomp":[],"sigma":null,"nb_theta":null,"loglik":null,"deviance":null,"n_eval":null,"wall_seconds":null,"fits_per_sample":1}\n' \
+          printf '{"cell":"%s","engine":"%s","engine_version":"%s","converged":false,"singular":false,"status":"timeout","message":"watchdog killed the engine after %ss","coef_names":[],"beta":[],"coef_df":null,"varcomp":[],"sigma":null,"nb_theta":null,"loglik":null,"deviance":null,"n_eval":null,"wall_seconds":null,"fits_per_sample":1}\n' \
             "$CELL" "$ENGINE" "$ENGINE_VERSION" "$EFF" >> "$out"
         fi
         KILLED=1
@@ -434,7 +438,7 @@ run_worker() {   # $1 = part index
         echo ">> (build failure or OOM; nothing is recorded for this cell)" >&2
         return 1
       else
-        printf '{"cell":"%s","engine":"%s","engine_version":"%s","converged":false,"singular":false,"status":"engine-fail","message":"launch declined the cell","coef_names":[],"beta":[],"varcomp":[],"sigma":null,"nb_theta":null,"loglik":null,"deviance":null,"n_eval":null,"wall_seconds":null,"fits_per_sample":1}\n' \
+        printf '{"cell":"%s","engine":"%s","engine_version":"%s","converged":false,"singular":false,"status":"engine-fail","message":"launch declined the cell","coef_names":[],"beta":[],"coef_df":null,"varcomp":[],"sigma":null,"nb_theta":null,"loglik":null,"deviance":null,"n_eval":null,"wall_seconds":null,"fits_per_sample":1}\n' \
           "$CELL" "$ENGINE" "$ENGINE_VERSION" >> "$out"
         LAST_STUCK=""
       fi

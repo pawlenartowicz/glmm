@@ -20,6 +20,17 @@ NULL
 #'
 #' @usage NULL
 #' @keywords internal
-fastglmm_fit <- function(formula, numeric, factor_levels, factor_codes, family, link, wald_se, nagq, dispersion, weights, offset, start_beta, start_theta, start_dispersion) .Call(wrap__fastglmm_fit, formula, numeric, factor_levels, factor_codes, family, link, wald_se, nagq, dispersion, weights, offset, start_beta, start_theta, start_dispersion)
+fastglmm_fit <- function(formula, numeric, factor_levels, factor_codes, family, link, wald_se, nagq, dispersion, weights, offset, start_beta, start_theta, start_dispersion, satterthwaite) .Call(wrap__fastglmm_fit, formula, numeric, factor_levels, factor_codes, family, link, wald_se, nagq, dispersion, weights, offset, start_beta, start_theta, start_dispersion, satterthwaite)
+
+#' `glmm::orchestrate::confint` for `confint.fastglmm`: the lower and upper
+#' bounds per coefficient, the t quantile on a finite df and the normal one
+#' elsewhere, so both ports give the same intervals from one rule. `NaN`
+#' entries (aliased coefficients, z rows' df) cross as plain doubles. `level`
+#' crosses as a vector, so an `NA` reaches the shared check (and its message)
+#' instead of extendr's scalar NA rejection.
+#'
+#' @usage NULL
+#' @keywords internal
+fastglmm_confint <- function(beta, se, coef_df, level) .Call(wrap__fastglmm_confint, beta, se, coef_df, level)
 
 # nolint end

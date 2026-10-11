@@ -1,0 +1,94 @@
+{
+  "r_formula": "diameter ~ 1 + (1 | plate) + (1 | sample)",
+  "reml": true,
+  "boundary": "none",
+  "theta": [1.53967555430648, 3.51251885988167],
+  "theta_names": ["plate.(Intercept)", "sample.(Intercept)"],
+  "cnms": [
+    ["(Intercept)"],
+    ["(Intercept)"]
+  ],
+  "group_names": ["plate", "sample"],
+  "group_levels": [24, 6],
+  "sigma": 0.549922682062881,
+  "beta": [22.9722222222219],
+  "coef_names": ["(Intercept)"],
+  "cols_dropped": [],
+  "vcov_beta": [
+    [0.653826458455512]
+  ],
+  "reml_criterion": 330.860588999604,
+  "estimate": [22.9722222222219],
+  "std_error": [0.808595361386344],
+  "df": [5.48659236245505],
+  "t_value": [28.4100346344256],
+  "p_value": [3.62352024057688e-07],
+  "level": 0.95,
+  "lower": [20.9479027038844],
+  "upper": [24.9965417405594],
+  "varpar_names": ["plate.(Intercept)", "sample.(Intercept)", "sigma"],
+  "vcov_varpar": [
+    [0.0708426790165908, 0.0252524352277848, -0.00394012187019731],
+    [0.0252524352277848, 1.2962411677204, -0.00842691648469309],
+    [-0.00394012187019731, -0.00842691648469309, 0.00131484657549785]
+  ],
+  "Jac_list": [
+    [
+      [0.0388017512650477]
+    ],
+    [
+      [0.354079409527744]
+    ],
+    [
+      [2.37788503654193]
+    ]
+  ],
+  "fd_settings": [
+    {
+      "hessian_d": 0.05,
+      "jacobian_d": 5e-05,
+      "r": 4
+    },
+    {
+      "hessian_d": 0.2,
+      "jacobian_d": 0.0002,
+      "r": 4
+    }
+  ],
+  "df_second": [
+    [5.48659207518366, 5.48659214753331]
+  ],
+  "conditions": [],
+  "contest_1d": {
+    "seed": 2,
+    "l": [-0.896914546624981],
+    "estimate": -20.6041202794125,
+    "std_error": 0.725240941960896,
+    "df": 5.48659236245505,
+    "t_value": -28.4100346344256,
+    "p_value": 3.62352024057689e-07
+  },
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_lmertest.R"
+  },
+  "name": "lmertest_Penicillin"
+}

@@ -113,9 +113,9 @@ Random effects:
 Number of obs: 180, groups:  Subject, 18
 
 Fixed effects:
-            Estimate Std. Error z value Pr(>|z|)    
-(Intercept)  251.405      6.825  36.838  < 2e-16 ***
-Days          10.467      1.546   6.771 1.27e-11 ***
+            Estimate Std. Error      df t value Pr(>|t|)    
+(Intercept)  251.405      6.825  17.000  36.838  < 2e-16 ***
+Days          10.467      1.546  17.000   6.771 3.26e-06 ***
 ---
 Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
 
@@ -124,7 +124,7 @@ Correlation of Fixed Effects:
 Days      -0.138
 
 Optimizer evaluations: 12, converged: TRUE
-z value / Pr(>|z|) are Wald z on the asymptotic normal; no t or residual df is reported.
+t tests use Satterthwaite degrees of freedom (finite-difference θ-Hessian).
 
 Subject stddevs: 24.74046 5.922132 
 Subject corr[1,2]: 0.06555151 
@@ -192,13 +192,13 @@ Random effects:
 Number of obs: 144, groups:  plate, 24; sample, 6
 
 Fixed effects:
-            Estimate Std. Error z value Pr(>|z|)    
-(Intercept)  22.9722     0.8086   28.41   <2e-16 ***
+            Estimate Std. Error      df t value Pr(>|t|)    
+(Intercept)  22.9722     0.8086  5.4870   28.41 3.62e-07 ***
 ---
 Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
 
 Optimizer evaluations: 46, converged: TRUE
-z value / Pr(>|z|) are Wald z on the asymptotic normal; no t or residual df is reported.
+t tests use Satterthwaite degrees of freedom (finite-difference θ-Hessian).
 
 plate stddev: 0.8467045 
 sample stddev: 1.931558 
@@ -261,13 +261,13 @@ Random effects:
 Number of obs: 60, groups:  batch, 10; batch:cask, 30
 
 Fixed effects:
-            Estimate Std. Error z value Pr(>|z|)    
-(Intercept)  60.0533     0.6769   88.72   <2e-16 ***
+            Estimate Std. Error      df t value Pr(>|t|)    
+(Intercept)  60.0533     0.6769  9.0000   88.72 1.49e-14 ***
 ---
 Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
 
 Optimizer evaluations: 31, converged: TRUE
-z value / Pr(>|z|) are Wald z on the asymptotic normal; no t or residual df is reported.
+t tests use Satterthwaite degrees of freedom (finite-difference θ-Hessian).
 
 loglik (REML crit): -123.4954 
 
@@ -350,7 +350,6 @@ period3      -0.340   0.278
 period4      -0.261   0.212   0.196
 
 Optimizer evaluations: 12, converged: TRUE
-z value / Pr(>|z|) are Wald z on the asymptotic normal; no t or residual df is reported.
 
 herd stddev: 0.6422614 
 loglik: -92.02628 
@@ -435,7 +434,6 @@ YEAR97      -0.152  0.513
 HEIGHT      -0.991  0.034  0.064
 
 Optimizer evaluations: 11, converged: TRUE
-z value / Pr(>|z|) are Wald z on the asymptotic normal; no t or residual df is reported.
 
 BROOD stddev: 0.9496951 
 loglik: -989.0377 
@@ -508,7 +506,6 @@ period3      -0.340   0.278
 period4      -0.261   0.212   0.196
 
 Optimizer evaluations: 12, converged: TRUE
-z value / Pr(>|z|) are Wald z on the asymptotic normal; no t or residual df is reported.
 loglik: -92.02628 
 
 === nAGQ=7 (adaptive Gauss-Hermite) ===
@@ -544,28 +541,27 @@ period2      -0.362
 period3      -0.339   0.279        
 period4      -0.260   0.212   0.197
 
-Optimizer evaluations: 59, converged: TRUE
-z value / Pr(>|z|) are Wald z on the asymptotic normal; no t or residual df is reported.
+Optimizer evaluations: 14, converged: TRUE
 loglik: -91.98335 
 
 Laplace -> AGQ(7) movement on this data:
-  beta[(Intercept)]: laplace=-1.398532142 agq7=-1.399232215 delta=-0.0007 rel=0.000501
-  beta[period2]: laplace=-0.9923327348 agq7=-0.9914025657 delta=0.00093 rel=0.000937
-  beta[period3]: laplace=-1.128672084 agq7=-1.127819278 delta=0.000853 rel=0.000756
-  beta[period4]: laplace=-1.580313885 agq7=-1.579468938 delta=0.000845 rel=0.000535
+  beta[(Intercept)]: laplace=-1.398532142 agq7=-1.399231866 delta=-0.0007 rel=0.0005
+  beta[period2]: laplace=-0.9923327348 agq7=-0.9914026767 delta=0.00093 rel=0.000937
+  beta[period3]: laplace=-1.128672084 agq7=-1.127818447 delta=0.000854 rel=0.000756
+  beta[period4]: laplace=-1.580313885 agq7=-1.579469096 delta=0.000845 rel=0.000535
   loglik: laplace=-92.02628186 agq7=-91.98335427 delta=0.0429
 
 oracle cross-check vs goldens/cbpp_agq_k7.json (manifest rung 5 at nAGQ=7):
 (beta, se_hessian, herd stddev only -- see header comment on why loglik is excluded)
-  beta[(Intercept)]            got=-1.399232215       ref=-1.399229755       rel_err=1.76e-06  tol=0.001  [PASS]
-  beta[period2]                got=-0.9914025657      ref=-0.9913961245      rel_err=6.5e-06  tol=0.001  [PASS]
-  beta[period3]                got=-1.127819278       ref=-1.127832892       rel_err=1.21e-05  tol=0.001  [PASS]
-  beta[period4]                got=-1.579468938       ref=-1.579443908       rel_err=1.58e-05  tol=0.001  [PASS]
-  se_hessian[(Intercept)]      got=0.2335124545       ref=0.2335116086       rel_err=3.62e-06  tol=0.001  [PASS]
-  se_hessian[period2]          got=0.3067679783       ref=0.3067673681       rel_err=1.99e-06  tol=0.001  [PASS]
-  se_hessian[period3]          got=0.3267684638       ref=0.3267697654       rel_err=3.98e-06  tol=0.001  [PASS]
-  se_hessian[period4]          got=0.4275944626       ref=0.4275906557       rel_err=8.9e-06  tol=0.001  [PASS]
-  herd stddev                  got=0.6475210584       ref=0.6475178183       rel_err=5e-06  tol=0.001  [PASS]
+  beta[(Intercept)]            got=-1.399231866       ref=-1.399229755       rel_err=1.51e-06  tol=0.001  [PASS]
+  beta[period2]                got=-0.9914026767      ref=-0.9913961245      rel_err=6.61e-06  tol=0.001  [PASS]
+  beta[period3]                got=-1.127818447       ref=-1.127832892       rel_err=1.28e-05  tol=0.001  [PASS]
+  beta[period4]                got=-1.579469096       ref=-1.579443908       rel_err=1.59e-05  tol=0.001  [PASS]
+  se_hessian[(Intercept)]      got=0.2335123435       ref=0.2335116086       rel_err=3.15e-06  tol=0.001  [PASS]
+  se_hessian[period2]          got=0.306767977        ref=0.3067673681       rel_err=1.98e-06  tol=0.001  [PASS]
+  se_hessian[period3]          got=0.3267683724       ref=0.3267697654       rel_err=4.26e-06  tol=0.001  [PASS]
+  se_hessian[period4]          got=0.4275944715       ref=0.4275906557       rel_err=8.92e-06  tol=0.001  [PASS]
+  herd stddev                  got=0.6475206353       ref=0.6475178183       rel_err=4.35e-06  tol=0.001  [PASS]
 ```
 
 The thing a newcomer misreads: the answer *does* move relative to Laplace,
@@ -629,13 +625,13 @@ Random effects:
 Number of obs: 270, groups:  recipe:replicate, 45
 
 Fixed effects:
-              Estimate Std. Error z value Pr(>|z|)    
-(Intercept)   2.379365   5.902802   0.403    0.687    
-recipeB      -3.649206   8.347822  -0.437    0.662    
-recipeC      -1.941270   8.347822  -0.233    0.816    
-temp          0.153714   0.028207   5.449 5.05e-08 ***
-recipeB:temp  0.010857   0.039891   0.272    0.785    
-recipeC:temp  0.002095   0.039891   0.053    0.958    
+               Estimate Std. Error         df t value Pr(>|t|)    
+(Intercept)    2.379365   5.902802 254.020000   0.403    0.687    
+recipeB       -3.649206   8.347822 254.020000  -0.437    0.662    
+recipeC       -1.941270   8.347822 254.020000  -0.233    0.816    
+temp           0.153714   0.028207 222.000000   5.449 1.34e-07 ***
+recipeB:temp   0.010857   0.039891 222.000000   0.272    0.786    
+recipeC:temp   0.002095   0.039891 222.000000   0.053    0.958    
 ---
 Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
 
@@ -648,7 +644,7 @@ recipeB:temp       0.676  -0.956  -0.478 -0.707
 recipeC:temp       0.676  -0.478  -0.956 -0.707        0.500
 
 Optimizer evaluations: 12, converged: TRUE
-z value / Pr(>|z|) are Wald z on the asymptotic normal; no t or residual df is reported.
+t tests use Satterthwaite degrees of freedom (finite-difference θ-Hessian).
 
 === base = B (relevel(cake$recipe, ref = "B")) ===
 Linear mixed model fit by REML [fastglmm] 
@@ -669,13 +665,13 @@ Random effects:
 Number of obs: 270, groups:  recipe:replicate, 45
 
 Fixed effects:
-              Estimate Std. Error z value Pr(>|z|)    
-(Intercept)  -1.269841   5.902802  -0.215    0.830    
-recipeA       3.649206   8.347822   0.437    0.662    
-recipeC       1.707937   8.347822   0.205    0.838    
-temp          0.164571   0.028207   5.834  5.4e-09 ***
-recipeA:temp -0.010857   0.039891  -0.272    0.785    
-recipeC:temp -0.008762   0.039891  -0.220    0.826    
+               Estimate Std. Error         df t value Pr(>|t|)    
+(Intercept)   -1.269841   5.902802 254.020000  -0.215    0.830    
+recipeA        3.649206   8.347822 254.020000   0.437    0.662    
+recipeC        1.707937   8.347822 254.020000   0.205    0.838    
+temp           0.164571   0.028207 222.000000   5.834  1.9e-08 ***
+recipeA:temp  -0.010857   0.039891 222.000000  -0.272    0.786    
+recipeC:temp  -0.008762   0.039891 222.000000  -0.220    0.826    
 ---
 Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
 
@@ -688,7 +684,7 @@ recipeA:temp       0.676  -0.956  -0.478 -0.707
 recipeC:temp       0.676  -0.478  -0.956 -0.707        0.500
 
 Optimizer evaluations: 12, converged: TRUE
-z value / Pr(>|z|) are Wald z on the asymptotic normal; no t or residual df is reported.
+t tests use Satterthwaite degrees of freedom (finite-difference θ-Hessian).
 
 Same fit, different parameterization: fitted values and loglik agree (loglik A=-851.63374, loglik B=-851.63374, delta=-6.82e-13); only which contrasts are directly readable off fixef() changes.
 
@@ -761,7 +757,6 @@ grpb      -0.769  0.043
 
 Shape (theta): 1.011
 Optimizer evaluations: 0, converged: TRUE
-z value / Pr(>|z|) are Wald z on the asymptotic normal; no t or residual df is reported.
 theta (NB shape): 1.010522 
 loglik: -497.3251 
 
@@ -840,7 +835,6 @@ Correlation of Fixed Effects:
 x      -0.047
 
 Optimizer evaluations: 15, converged: TRUE
-z value / Pr(>|z|) are Wald z on the asymptotic normal; no t or residual df is reported.
 cluster stddev: 0.5269485 
 
 === without the offset (exposure variation folded into the fit) ===
@@ -873,7 +867,6 @@ Correlation of Fixed Effects:
 x      -0.047
 
 Optimizer evaluations: 14, converged: TRUE
-z value / Pr(>|z|) are Wald z on the asymptotic normal; no t or residual df is reported.
 cluster stddev: 0.5377164 
 
 Dropping a real offset does not just bias the intercept: here the slope on x moves from 0.4935 (with offset) to 0.5224 (without), and the cluster standard deviation moves from 0.5269 to 0.5377 -- the unexplained exposure variation is absorbed by both the fixed and the random-effect side, not cleanly by either alone.

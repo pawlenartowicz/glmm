@@ -1,0 +1,85 @@
+{
+  "r_formula": "strength ~ 1 + (1 | batch/cask)",
+  "reml": false,
+  "boundary": "none",
+  "theta": [3.52688587144813, 1.3299230211355],
+  "theta_names": ["cask:batch.(Intercept)", "batch.(Intercept)"],
+  "cnms": [
+    ["(Intercept)"],
+    ["(Intercept)"]
+  ],
+  "group_names": ["cask:batch", "batch"],
+  "group_levels": [30, 10],
+  "sigma": 0.823408839530518,
+  "beta": [60.0533333333337],
+  "coef_names": ["(Intercept)"],
+  "cols_dropped": [],
+  "vcov_beta": [
+    [0.412338506192343]
+  ],
+  "deviance": 247.994465862897,
+  "estimate": [60.0533333333337],
+  "std_error": [0.642135893866978],
+  "df": [9.99999505791469],
+  "t_value": [93.521221764585],
+  "p_value": [4.78333273074175e-16],
+  "level": 0.95,
+  "lower": [58.6225653041077],
+  "upper": [61.4841013625598],
+  "varpar_names": ["cask:batch.(Intercept)", "batch.(Intercept)", "sigma"],
+  "vcov_varpar": [
+    [0.5607886118286, -0.21611699327822, -0.0503466489588077],
+    [-0.21611699327822, 1.33799878168912, -0.0182513774558958],
+    [-0.0503466489588077, -0.0182513774558958, 0.0113000536718778]
+  ],
+  "Jac_list": [
+    [
+      [0.159415738849744]
+    ],
+    [
+      [0.180338124582674]
+    ],
+    [
+      [1.00154014967025]
+    ]
+  ],
+  "fd_settings": [
+    {
+      "hessian_d": 0.05,
+      "jacobian_d": 5e-05,
+      "r": 4
+    },
+    {
+      "hessian_d": 0.2,
+      "jacobian_d": 0.0002,
+      "r": 4
+    }
+  ],
+  "df_second": [
+    [9.99999504857323, 9.99999503944941]
+  ],
+  "conditions": [],
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_lmertest.R"
+  },
+  "name": "lmertest_Pastes_ml"
+}

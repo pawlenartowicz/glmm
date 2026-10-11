@@ -18,6 +18,10 @@ Four external engines are the oracles, each pinned to an exact version:
 | Julia `MixedModels.jl` | 5.9.0 | gaussian, binomial logit/probit, Poisson (458 of 794 cells) | Laplace |
 | R `GLMMadaptive` | 0.9-7 | non-gaussian, one grouping factor (28 of 794 cells, all AGQ) | AGQ |
 
+A fifth engine, R `lmerTest` 3.2-1, fits the 130 Gaussian mixed-model cells
+for one quantity only, the per-coefficient Satterthwaite degrees of freedom.
+Its fit is lme4's, so the deviance and parameter checks below never read it.
+
 The pins are in `validation/grid/versions.json`. A version bump is a deliberate
 event: that oracle is rerun over the whole grid into a **new** run directory, and
 no existing run is ever edited.
@@ -25,7 +29,7 @@ no existing run is ever edited.
 ## No engine is "the" reference
 
 `glmm` is not gated against one chosen engine. `validation/grid/compare.R` applies
-four checks:
+five checks:
 
 1. **Deviance against the best oracle (hard).** On a cell's estimator arm every
    engine minimises the same objective, so after convention alignment a converged
@@ -47,6 +51,9 @@ four checks:
 4. **Port gates (hard).** The Python and R packages wrap the same Rust kernel, so
    they are compared against the Rust engine at a round-off band. A miss is a
    wiring bug, never a divergence.
+5. **Satterthwaite df against lmerTest.** On every Gaussian mixed-model cell,
+   `glmm`'s per-coefficient df are compared with lmerTest's. Out of band passes
+   only under a registered entry, as in check 2.
 
 Where two oracles disagree with **each other**, that is recorded as a flag to
 investigate. It is never resolved by picking whichever one sits closer to `glmm`.
@@ -73,7 +80,7 @@ From `validation/grid/`:
 ```sh
 ./run.sh glmm --fast              # fit the fast subset with glmm
 ./run.sh lme4                     # fit the whole grid with an oracle
-Rscript compare.R                 # the four gates over the newest runs
+Rscript compare.R                 # the five gates over the newest runs
 Rscript summarize_accuracy.R      # per-cell and per-family report, no gate
 ```
 

@@ -1,0 +1,176 @@
+{
+  "r_formula": "y ~ 1 + u + w + (1 | g)",
+  "reml": true,
+  "boundary": "none",
+  "theta": [14.7460841528587],
+  "theta_names": ["g.(Intercept)"],
+  "cnms": [
+    ["(Intercept)"]
+  ],
+  "group_names": ["g"],
+  "group_levels": [25],
+  "sigma": 0.291714251023172,
+  "beta": [-1.17366666568569, 9706846.67701253, 0.501109529266097],
+  "coef_names": ["(Intercept)", "u", "w"],
+  "cols_dropped": [],
+  "vcov_beta": [
+    [3.14606403389301, -15421882.5192718, 7.58720658687997e-18],
+    [-15421882.5192718, 98858221272730.7, -8.29506529725718e-11],
+    [7.58720658687997e-18, -8.29506529725718e-11, 2.55451269793652e-06]
+  ],
+  "reml_criterion": 573.129785582227,
+  "estimate": [-1.17366666568569, 9706846.67701253, 0.501109529266097],
+  "std_error": [1.77371475550411, 9942747.16930541, 0.00159828429821997],
+  "df": [22.9999643885127, 22.9999635959555, 974.00000314104],
+  "t_value": [-0.661699781232368, 0.976274113353588, 313.529657911417],
+  "p_value": [0.514738935595276, 0.339085995905527, 0],
+  "level": 0.95,
+  "lower": [-4.84287550773115, -10861294.7246366, 0.497973052068872],
+  "upper": [2.49554217635976, 30274988.0786617, 0.504246006463322],
+  "varpar_names": ["g.(Intercept)", "sigma"],
+  "vcov_varpar": [
+    [4.83984901226962, -0.00220848973467446],
+    [-0.00220848973467446, 4.36843962919265e-05]
+  ],
+  "Jac_list": [
+    [
+      [0.426649427566513, -2091418.90834509, -4.39782107132188e-14],
+      [-2091418.90834509, 13406530759886.1, -1.12492098531089e-11],
+      [-4.39782107132188e-14, -1.12492098531089e-11, 0]
+    ],
+    [
+      [21.5694915337547, -105732801.637612, 5.20180728929272e-17],
+      [-105732801.637612, 677774369438686, -5.68711694277388e-10],
+      [5.20180728929272e-17, -5.68711694277388e-10, 1.75138011870199e-05]
+    ]
+  ],
+  "fd_settings": [
+    {
+      "hessian_d": 0.05,
+      "jacobian_d": 5e-05,
+      "r": 4
+    },
+    {
+      "hessian_d": 0.2,
+      "jacobian_d": 0.0002,
+      "r": 4
+    }
+  ],
+  "df_second": [
+    [22.9999486820519, 22.9999762730931],
+    [22.9999568343587, 22.9999809817712],
+    [974.000003547187, 974.000001496778]
+  ],
+  "conditions": [
+    {
+      "stage": "fit",
+      "type": "warning",
+      "text": "Some predictor variables are on very different scales: consider rescaling. \nYou may also use (g)lmerControl(autoscale = TRUE) to improve numerical stability."
+    },
+    {
+      "stage": "fit",
+      "type": "warning",
+      "text": "Some predictor variables are on very different scales: consider rescaling. \nYou may also use (g)lmerControl(autoscale = TRUE) to improve numerical stability."
+    },
+    {
+      "stage": "devfun",
+      "type": "warning",
+      "text": "Some predictor variables are on very different scales: consider rescaling. \nYou may also use (g)lmerControl(autoscale = TRUE) to improve numerical stability."
+    }
+  ],
+  "contest_md": [
+    {
+      "label": "identity",
+      "L": [
+        [1, 0, 0],
+        [0, 1, 0],
+        [0, 0, 1]
+      ],
+      "row_names": ["(Intercept)", "u", "w"],
+      "col_names": ["(Intercept)", "u", "w"],
+      "rhs": 0,
+      "frozen": true,
+      "F": 0.953111144404324,
+      "NumDF": 1,
+      "DenDF": 22.9999635959555,
+      "p_value": 0.339085995905529,
+      "sum_sq": 0.0811070937283357,
+      "mean_sq": 0.0811070937283357,
+      "eigenvalues": [98858221272733.1],
+      "nu_m": [22.9999635959555]
+    },
+    {
+      "label": "seeded",
+      "seed": 1,
+      "L": [
+        [-0.626453810742332, -0.835628612410047, 0.329507771815361],
+        [0.183643324222082, 1.59528080213779, -0.820468384118015]
+      ],
+      "row_names": ["seeded_1", "seeded_2"],
+      "col_names": ["(Intercept)", "u", "w"],
+      "rhs": 0,
+      "frozen": true,
+      "F": 0.953111113172847,
+      "NumDF": 1,
+      "DenDF": 22.9999635959557,
+      "p_value": 0.3390860036609,
+      "sum_sq": 0.0811070910706244,
+      "mean_sq": 0.0811070910706244,
+      "eigenvalues": [320616564153608],
+      "nu_m": [22.9999635959557]
+    },
+    {
+      "label": "rank_deficient",
+      "seed": 1,
+      "L": [
+        [-0.626453810742332, -0.835628612410047, 0.329507771815361],
+        [0.183643324222082, 1.59528080213779, -0.820468384118015],
+        [-0.44281048652025, 0.759652189727744, -0.490960612302655]
+      ],
+      "row_names": ["seeded_1", "seeded_2", "seeded_1+seeded_2"],
+      "col_names": ["(Intercept)", "u", "w"],
+      "rhs": 0,
+      "frozen": true,
+      "F": 0.95311110239382,
+      "NumDF": 1,
+      "DenDF": 22.9999635959556,
+      "p_value": 0.339086006337538,
+      "sum_sq": 0.0811070901533593,
+      "mean_sq": 0.0811070901533593,
+      "eigenvalues": [377664831559719],
+      "nu_m": [22.9999635959556]
+    }
+  ],
+  "contest_1d": {
+    "seed": 2,
+    "l": [-0.896914546624981, 0.184849184646742, 1.58784533120882],
+    "estimate": 1794304.54209984,
+    "std_error": 1837910.09857093,
+    "df": 22.9999635959519,
+    "t_value": 0.976274380066255,
+    "p_value": 0.339085866588594
+  },
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_lmertest.R"
+  },
+  "name": "lmertest_sim_dynrange_lmm"
+}

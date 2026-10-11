@@ -1,0 +1,90 @@
+{
+  "r_formula": "Yield ~ 1 + (1 | Batch)",
+  "reml": false,
+  "boundary": "singular",
+  "theta": [0],
+  "theta_names": ["Batch.(Intercept)"],
+  "cnms": [
+    ["(Intercept)"]
+  ],
+  "group_names": ["Batch"],
+  "group_levels": [6],
+  "sigma": 3.65323135137465,
+  "beta": [5.6656],
+  "coef_names": ["(Intercept)"],
+  "cols_dropped": [],
+  "vcov_beta": [
+    [0.444869976888889]
+  ],
+  "deviance": 162.873036653826,
+  "estimate": [5.6656],
+  "std_error": [0.666985739644326],
+  "df": [29.9999999992517],
+  "t_value": [8.4943345310819],
+  "p_value": [1.76922642763311e-09],
+  "level": 0.95,
+  "lower": [4.30343339517726],
+  "upper": [7.02776660482274],
+  "varpar_names": ["Batch.(Intercept)", "sigma"],
+  "vcov_varpar": [
+    [0.069519725949184, 1.6245084960188e-10],
+    [1.6245084960188e-10, 0.222434988446794]
+  ],
+  "Jac_list": [
+    [
+      [0]
+    ],
+    [
+      [0.243548756760061]
+    ]
+  ],
+  "h": [
+    [28.7688130626682, -2.10107148911332e-08],
+    [-2.10107148911332e-08, 8.99139121037333]
+  ],
+  "fd_settings": [
+    {
+      "hessian_d": 0.05,
+      "jacobian_d": 5e-05,
+      "r": 4
+    },
+    {
+      "hessian_d": 0.2,
+      "jacobian_d": 0.0002,
+      "r": 4
+    }
+  ],
+  "df_second": [
+    [30.0000000010466, 29.9999998920707]
+  ],
+  "conditions": [
+    {
+      "stage": "fit",
+      "type": "message",
+      "text": "boundary (singular) fit: see help('isSingular')"
+    }
+  ],
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_lmertest.R"
+  },
+  "name": "lmertest_Dyestuff2_ml"
+}

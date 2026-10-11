@@ -8,8 +8,99 @@ shares these entries; Python-specific notes are called out where they differ.
 
 ## [Unreleased]
 
+### Added
+
+- **The `commonstats` dependency** (`0.2`, floor 0.2.1, `default-features =
+  false`, features `dist` and `rng`; it brings `rand_philox` 0.2 with it):
+  statistical distributions and the counter-based RNG the inference tests
+  use. The t and F tests and `confint` below take their tails and quantiles
+  from it; no estimate depends on it.
+- **Satterthwaite degrees of freedom for the fixed effects of a Gaussian LMM,
+  as lmerTest computes them.** One derivative pass at θ̂ after the fit, with
+  no refit. lmerTest's `2v²/(gᵀAg)` over `(θ, σ)` is computed exactly from the
+  profiled deviance the search minimized, as `v²/(g_pᵀH_p⁺g_p + v²/ν)`, `ν`
+  the divisor of σ̂² (`N − p` on REML). The Hessian `H_p` comes from central
+  differences of the deviance on every kernel, or of the analytic θ-gradient
+  where the per-group route is armed (the fits the θ search runs BFGS on),
+  which falls back to the deviance route when a gradient is unavailable. The
+  coordinates of a Λ column that is exactly zero (a pinned boundary) are
+  dropped, and the rest of `H_p` is inverted over its eigenvalues above
+  `1e-8` of the largest. The method is in `documentation/algorithms-lmm.md`,
+  "Satterthwaite degrees of freedom".
+  - `Fit::coef_df` (length p): the df of each target coefficient. NaN on
+    non-target and aliased columns, when the pass was switched off or
+    failed, on a non-converged OLS or GLM fit, and on the families without a
+    df (binomial, Poisson, negative binomial, every GLMM, a Gamma or
+    inverse-Gaussian GLM with φ held). Not `Fit::df`, which stays the AIC
+    parameter count.
+  - `Fit::contrast_t(l)` and `Fit::contrast_f(l, rows)`: lmerTest's
+    `contest1D` and `contestMD` (with `get_Fstat_ddf`) for any contrast, `l`
+    over all p caller columns, row-major for `L`. They return
+    `inference::contrast::{ContrastT, ContrastF}`, with
+    `ContrastNote::AliasedColumn` (NaN fields) and
+    `ContrastNote::RankDeficientL`, or `ContrastError::NoDf(NoDfReason)`
+    (`NotGaussianMixed`, `Disabled`, `StateMissing`, `Failed`), never a z
+    test. The `inference` module is outside the semver promise until 1.0.
+  - `FitOptions::satterthwaite`, default `true`: `false` skips the pass.
+  - `loop_advanced::satterthwaite(&mut ws, &mut df_out)` (no semver
+    guarantee): the same df for the last `fit_on` draw, on demand; the loop
+    tier runs no pass otherwise. Its buffers live on the workspace, so a call
+    after the first allocates only the pseudo-inverse's blocks.
+  - `Note::SatterthwaiteCurvature { dropped, negative, converged, nonfinite }`
+    (kind `satterthwaite_curvature`, Python `SatterthwaiteCurvatureWarning`, R
+    `fastglmm_satterthwaite_curvature`, tier caution): raised when the
+    pseudo-inverse left out flat or negative directions, when the df were
+    computed at an endpoint that did not converge, and when the pass failed
+    (a non-finite deviance or covariance on its stencil, or no finite
+    endpoint), which leaves every df NaN.
+  - OLS and the Gamma and inverse-Gaussian GLMs with φ estimated carry the
+    residual df `n − p` in `coef_df` whatever `satterthwaite` says, and their
+    contrasts are the classical t and F.
+  - Checked against frozen lmerTest 3.2-1 references
+    (`validation/goldens/inference/lmertest/`), and on the accuracy grid by a
+    new `lmertest` engine, whose per-coefficient df `compare.R` checks on the
+    130 Gaussian mixed cells.
+- **The ports carry the df.** `orchestrate::FitResult` gains `coef_df`,
+  `coef_p` (the kernel's t-test p-value, NaN where there is no df),
+  `df_method` (`"satterthwaite"`, `"residual"`, `"none"`, `"disabled"` or
+  `"failed"`), and `rss`, `r_squared` and `adj_r_squared` (OLS only);
+  `orchestrate::run_fit` takes a trailing `satterthwaite: bool`; and
+  `orchestrate::confint` computes both ports' intervals. Python:
+  `glmm.fit(..., satterthwaite=True)`, `Fit.coef_df`, `Fit.coef_p`,
+  `Fit.df_method`, `Fit.rss`, `Fit.r_squared`, `Fit.adj_r_squared`, and
+  `Fit.confint(level=0.95)`, a `(p, 2)` array of bounds in the order of
+  `Fit.names`, with no `parm` argument. R: `fastglmm(..., satterthwaite =
+  TRUE)` and `$coef_df`, `$coef_p`, `$df_method`, `$rss`, `$r_squared`,
+  `$adj_r_squared`.
+- **`formula::Lowered::terms` and `Lowered::has_intercept`**: the fixed terms
+  in R's order as `formula::FixedTerm { label, vars, numeric, columns }` (R's
+  `assign`, as column ranges, the intercept excluded), and whether the formula
+  keeps the intercept.
+
 ### Changed
 
+- **Coefficient tables test with t where lmerTest, `lm` and `glm` do.** A
+  Gaussian mixed model prints `Estimate`, `Std. Error`, `df`, `t value` and
+  `Pr(>|t|)`, with the footer "t tests use Satterthwaite degrees of freedom
+  (finite-difference θ-Hessian).". OLS prints `t value` and `Pr(>|t|)` on
+  `n − p`, with `summary.lm`'s "Residual standard error: … on n − p degrees
+  of freedom" and "Multiple R-squared: …, Adjusted R-squared: …" lines. A Gamma or
+  inverse-Gaussian GLM with φ estimated prints t on `n − p`, the df on its
+  dispersion line. Binomial, Poisson, negative binomial, a held dispersion
+  and every GLMM keep Wald z. A Gaussian mixed model fitted with
+  `satterthwaite = FALSE` (Python `satterthwaite=False`) prints z and "df not
+  computed", and one whose pass failed prints z with the warning. The footnote
+  "z value / Pr(>|z|) are Wald z on the asymptotic normal; no t or residual
+  df is reported" is gone. Both ports, all four Python renders.
+- **R's `confint()` uses the t quantile where `summary()` tests with t**: each
+  row's Satterthwaite df on a Gaussian mixed model, `n − p` on OLS and the
+  dispersion GLMs (as `confint.lm`), and the normal quantile on the z rows. So
+  those intervals are wider than 0.5.0's normal ones. With `satterthwaite =
+  FALSE` the intervals stay normal and a message says the df were not
+  computed. Python's new `Fit.confint()` gives the same intervals.
+- **R's `tidy()` gains a `df` column**, between `statistic` and `p.value`,
+  where `summary()` has one; its statistic and p-value are the summary's, so
+  they move to t with it.
 - **Binomial and Poisson GLMMs with a random intercept only and small groups
   search with BFGS under adaptive quadrature too: about a fifth less time per
   fit (0.783 of it cold, 0.825 warm, geometric means).** An AGQ fit
@@ -57,6 +148,20 @@ shares these entries; Python-specific notes are called out where they differ.
     `Note::GradientSearchFallback` (Python `GradientSearchFallbackWarning`, R
     `fastglmm_gradient_search_fallback`) where 0.5.0 raised nothing. The fit
     then ends 4.6e-5 deviance units (3e-15 relative) from 0.5.0's optimum.
+- **`FitOptions` and `formula::Lowered` are `#[non_exhaustive]`.** Build
+  `FitOptions` from `FitOptions::default()` and assign fields; struct
+  literals and `..` update syntax no longer compile outside the crate. No
+  result changes.
+- **The dev-only `oracle-tests` feature turns on `orchestrate`** (and so
+  `formula`): the inference tier gates the ports' interval function, which
+  lives there.
+
+### Removed
+
+- **Python's `summary()` no longer prints the `se` column of the
+  random-effects block**, in the text output or the HTML, LaTeX and Typst
+  renders, so both ports print the same block. `Fit.stddev_se` keeps the
+  numbers.
 
 ## [0.5.0] — 2026-10-10
 

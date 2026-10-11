@@ -236,6 +236,7 @@ fit_one <- function(cell) {
     }
     rec$coef_names <- as.list(names(fh$beta))
     rec$beta <- nums(fh$beta)
+    rec$coef_df <- nums(fh$coef_df)  # verbatim, NaN as null per entry (common.rs)
     rec$varcomp <- varcomp(fh)  # by group NAME; no ref_order
     rec <- grid_set_loglik(rec, fh$loglik)
     # Assign only on the branch that applies; grid_record() already seeded

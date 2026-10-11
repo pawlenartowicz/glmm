@@ -215,15 +215,9 @@ pub fn lower_dataset_generic(
 /// would silently run the Rx arm at Laplace while the Hessian arm ran
 /// quadrature.
 pub fn rx_options(opts: &FitOptions) -> FitOptions {
-    FitOptions {
-        target_indices: opts.target_indices.clone(),
-        wald_se: WaldSe::Rx,
-        weights: opts.weights.clone(),
-        offset: opts.offset.clone(),
-        nagq: opts.nagq,
-        parallel_inner: opts.parallel_inner,
-        ..FitOptions::default()
-    }
+    let mut o = opts.clone();
+    o.wald_se = WaldSe::Rx;
+    o
 }
 
 /// Cell ids already present in `path`, so a killed worker resumes where it
@@ -249,8 +243,8 @@ pub fn base_record(cell_id: &str, engine: &str, engine_version: &str) -> Value {
         "cell": cell_id, "engine": engine, "engine_version": engine_version,
         "converged": false, "singular": false, "status": "engine-fail",
         "message": Value::Null, "coef_names": Value::Array(vec![]),
-        "beta": Value::Array(vec![]), "varcomp": Value::Array(vec![]),
-        "sigma": Value::Null, "nb_theta": Value::Null,
+        "beta": Value::Array(vec![]), "coef_df": Value::Null,
+        "varcomp": Value::Array(vec![]), "sigma": Value::Null, "nb_theta": Value::Null,
         "loglik": Value::Null, "deviance": Value::Null, "n_eval": Value::Null,
         "wall_seconds": Value::Null, "fits_per_sample": 1
     })
@@ -296,10 +290,10 @@ pub fn fit_cell(cell: &Value, grid_dir: &str, timed: Option<usize>, engine_versi
         let fit = |o: &FitOptions| fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, o);
 
         // The shipped configuration (`WaldSe::Hessian`) is the primary fit: its
-        // estimates are the ones reported, and it is the one the timing loop
-        // below re-runs. On a gaussian cell `wald_se` is not read at all -- the
-        // LMM path has a single profiled SE -- so the same fit serves as the
-        // `se_rx` value.
+        // estimates are the ones reported, and the timing loop below re-runs it
+        // with the Satterthwaite pass switched off. On a gaussian cell `wald_se`
+        // is not read at all -- the LMM path has a single profiled SE -- so the
+        // same fit serves as the `se_rx` value.
         let f = fit(&lo.opts);
         if gaussian {
             rec["se_rx"] = nums(&f.se);
@@ -309,12 +303,17 @@ pub fn fit_cell(cell: &Value, grid_dir: &str, timed: Option<usize>, engine_versi
         }
 
         // Lowering stays outside the timed region: the reference engines are
-        // already holding a typed data frame when their own timer starts.
+        // already holding a typed data frame when their own timer starts. The
+        // samples skip the Satterthwaite pass: the lme4 engine times plain
+        // `lmer`, so a sample that ran the pass would time more than the fit it
+        // is compared with. The pass's cost is measured on its own, not here.
         if let Some(n) = timed {
+            let mut timed_opts = lo.opts.clone();
+            timed_opts.satterthwaite = false;
             let mut samples = Vec::with_capacity(n);
             for _ in 0..n {
                 let t0 = Instant::now();
-                let _ = fit(&lo.opts);
+                let _ = fit(&timed_opts);
                 samples.push(t0.elapsed().as_secs_f64());
             }
             rec["wall_seconds"] = num(median(&samples[1..]));
@@ -322,6 +321,11 @@ pub fn fit_cell(cell: &Value, grid_dir: &str, timed: Option<usize>, engine_versi
 
         rec["coef_names"] = json!(lo.col_names);
         rec["beta"] = nums(&f.beta);
+        // Verbatim, NaN as null per entry: the Satterthwaite df on a Gaussian
+        // LMM, `n - p` on OLS and the dispersion GLMs, null where the test is z.
+        // A Gaussian LMM whose pass failed records every entry null, which
+        // compare.R's gate 5 tells apart from a record with no `coef_df` at all.
+        rec["coef_df"] = nums(&f.coef_df);
         // `Fit::dispersion` is σ̂² on gaussian and φ̂ on gamma, while the
         // schema's `sigma` is a standard deviation / scale, so the square root
         // is what makes the two families one convention. It is the estimated

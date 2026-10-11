@@ -3,9 +3,12 @@
 #
 # SIDE EFFECT, read before running: this installs into the FIRST entry of
 # .libPaths() (the user library) and REPLACES whatever version of lme4 / glmmTMB /
-# GLMMadaptive is there. Nothing else on the machine is consulted about that.
+# GLMMadaptive is there, and of the inference reference generators' pins
+# (INFERENCE_PKGS: lmerTest / RLRsim / car / numDeriv / MASS / jsonlite). MASS
+# ships with R, so the loop skips it when the system library's copy already
+# matches the pin. Nothing else on the machine is consulted about that.
 #
-# remotes::install_version(pkg, version) is used for all three even where the pin
+# remotes::install_version(pkg, version) is used for every package even where the pin
 # happens to be CRAN's current version: it pins exactly, resolving against the
 # current version first and src/contrib/Archive/ afterwards, so this script keeps
 # reaching the same set after the next CRAN release.
@@ -44,7 +47,8 @@ if (is.na(have_rcpp) || have_rcpp < RCPP_FLOOR) {
 }
 
 PKGS <- c("lme4", "glmmTMB", "GLMMadaptive")
-for (pkg in PKGS) {
+INFERENCE_PKGS <- c("lmerTest", "RLRsim", "car", "numDeriv", "MASS", "jsonlite")
+for (pkg in c(PKGS, INFERENCE_PKGS)) {
   want <- V[[pkg]]
   have <- tryCatch(as.character(utils::packageVersion(pkg)),
                    error = function(e) NA_character_)
@@ -60,8 +64,8 @@ for (pkg in PKGS) {
 
 # Assert rather than trust the installer: install_version can succeed and still
 # leave an older copy earlier on .libPaths().
-for (pkg in PKGS) {
-  cat(sprintf("%-13s pinned %-8s installed %s  OK\n", pkg, V[[pkg]],
+for (pkg in c(PKGS, INFERENCE_PKGS)) {
+  cat(sprintf("%-13s pinned %-10s installed %s  OK\n", pkg, V[[pkg]],
               assert_pkg_version(pkg, V[[pkg]])))
 }
 cat(sprintf("R runtime: pinned %s, running %s (recorded, not asserted)\n",

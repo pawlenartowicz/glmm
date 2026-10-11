@@ -1,0 +1,65 @@
+{
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0",
+      "glmmTMB": "1.1.14"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_anova.R"
+  },
+  "case": "glm_pair",
+  "reference": "chisq",
+  "members": [
+    {
+      "logLik": -2740.19193467074,
+      "npar": 3,
+      "nobs": 403,
+      "deviance": 4549.38518939455,
+      "AIC": 5486.38386934149,
+      "BIC": 5498.38067902733
+    },
+    {
+      "logLik": -2187.40552083455,
+      "npar": 4,
+      "nobs": 403,
+      "deviance": 3443.81236172215,
+      "AIC": 4382.81104166909,
+      "BIC": 4398.80678791688
+    }
+  ],
+  "statistic": 1105.57282767239,
+  "df": 1,
+  "p_chisq": 2.03079106766598e-242,
+  "anova_glm": {
+    "resid_df": [400, 399],
+    "resid_dev": [4549.38518939455, 3443.81236172215],
+    "df": 1,
+    "deviance": 1105.57282767239,
+    "p": 2.03079106766552e-242
+  },
+  "coef_names": ["(Intercept)", "YEAR96", "YEAR97", "cHEIGHT"],
+  "coef": [1.61599798052329, 0.409645768793675, -1.68514104774929, -0.0214518421117811],
+  "vcov": [
+    [0.00161166763528005, -0.00135499613718136, -0.00140759290999726, 9.39462616231278e-06],
+    [-0.00135499613718136, 0.00205642236791766, 0.0014504304763751, 4.39334140242074e-06],
+    [-0.00140759290999726, 0.0014504304763751, 0.00806416842566759, 1.5679299213357e-06],
+    [9.39462616231278e-06, 4.39334140242074e-06, 1.5679299213357e-06, 5.04663750234391e-07]
+  ],
+  "tested": ["cHEIGHT"],
+  "name": "anova_glm_pair_grouseticks"
+}

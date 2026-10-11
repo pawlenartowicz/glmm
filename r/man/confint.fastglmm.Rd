@@ -18,11 +18,18 @@
 \item{...}{unused.}
 }
 \value{
-A matrix with one row per coefficient.
+A matrix with one row per coefficient; aliased coefficients are
+\code{NaN} rows.
 }
 \description{
-Normal-approximation intervals off the full Wald covariance matrix
-(\code{vcov()}). \code{method = "profile"} and \code{method = "boot"} are not
-available: the engine has no profiling machinery, and bootstrap needs
-refitting infrastructure not built yet.
+Intervals off the Wald standard errors that follow \link[=summary.fastglmm]{summary()}
+coefficient by coefficient: the t quantile on the row's degrees of freedom
+where the summary tests with t (Satterthwaite df on a Gaussian mixed model,
+\code{n - p} on OLS and the Gamma and inverse-Gaussian GLMs, as \link[stats:confint]{stats::confint.lm}),
+the normal quantile where it tests with z. On a Gaussian mixed model fitted
+with \code{satterthwaite = FALSE} the intervals are normal and a message says the
+df were not computed. The Python port's \code{Fit.confint()} computes the same
+intervals through the same kernel function. \code{method = "profile"} and
+\code{method = "boot"} are not available: the engine has no profiling
+machinery, and bootstrap needs refitting infrastructure not built yet.
 }

@@ -360,17 +360,28 @@ DEV_REF <- list(
   sim_entangled_pair_lmm = "t and v are entangled to 3e-6 (tools/prep/gen_illcond_data.R), so lme4, glmmTMB and glmm each converge to a slightly different theta and their own reported REML criterion carries round-off of 1e-4 to 7e-4 against the true optimum -- above dev_eps even though all three theta agree with each other to 1e-10 on the true objective"
 )
 
+INFERENCE_DATA_REASON <- "inference reference data (tools/prep/gen_inference_data.R), gated by the inference tier, not a grid cell"
+
 FIXTURE_SKIPPED <- list(
   # data/simulated/ or data/empirical/ CSV stems that become no cell at all,
   # with the reason. The self-checks below assert this list plus the cells
   # covers every CSV under both directories, so a fixture cannot vanish
   # quietly.
   #
-  # EXPECTED TO HOLD EXACTLY ONE ENTRY. Every simulated fixture -- including
-  # sim_binomial_zerosd and sim_entangled_pair_lmm -- becomes a cell. A second
+  # EXPECTED TO HOLD EXACTLY NINE ENTRIES: InstEval and the eight inference
+  # reference datasets below. Every other simulated fixture -- including
+  # sim_binomial_zerosd and sim_entangled_pair_lmm -- becomes a cell. A further
   # entry here would mean dropping a committed fixture from the grid; add the
   # cell instead.
-  InstEval = "not one of the eleven empirical datasets the grid covers; 73421 rows x a crossed d/s/dept design would take a large share of the one-night oracle budget"
+  InstEval = "not one of the eleven empirical datasets the grid covers; 73421 rows x a crossed d/s/dept design would take a large share of the one-night oracle budget",
+  Dyestuff2 = INFERENCE_DATA_REASON,
+  sim_corr_boundary = INFERENCE_DATA_REASON,
+  sim_factorial = INFERENCE_DATA_REASON,
+  sim_factorial_bern = INFERENCE_DATA_REASON,
+  sim_factorial_empty = INFERENCE_DATA_REASON,
+  sim_near_singular = INFERENCE_DATA_REASON,
+  sim_rlrt_few_unbal = INFERENCE_DATA_REASON,
+  sim_rlrt_large_k = INFERENCE_DATA_REASON
 )
 
 # ---- per-cell oracles --------------------------------------------------------
@@ -470,6 +481,11 @@ oracles_of <- function(cell) {
            !(cell$family == "gamma" && cell$link != "log") &&
            n_groups == 1L && is.null(cell$weights_col)
   if (ma_ok) o <- c(o, "GLMMadaptive")
+
+  # lmerTest: every Gaussian cell with a random effect, for the per-coefficient
+  # Satterthwaite df of compare.R's gate 5. Not an oracle of gates 1 to 3 (its
+  # fit is lme4's), so runs.R keeps it out of ORACLES.
+  if (cell$family == "gaussian" && n_groups > 0L) o <- c(o, "lmerTest")
   o
 }
 
@@ -688,8 +704,8 @@ add_readin <- function(entry, subdir, name = entry[["name"]]) {
   emit_cell(c0)
 }
 
-# 9. Empirical cells: every non-sim entry of the crate's own manifest except the
-# one named in FIXTURE_SKIPPED. Family, link, reml, factors, weights and the two
+# 9. Empirical cells: every non-sim entry of the crate's own manifest except
+# those named in FIXTURE_SKIPPED. Family, link, reml, factors, weights and the two
 # formulas are copied, not re-derived.
 for (entry in old$datasets) {
   if (identical(entry[["source"]], "sim")) next
@@ -1011,7 +1027,7 @@ stopifnot("pilot misses a family" =
            unique(vapply(cells, `[[`, "", "family"))))
 stopifnot("pilot misses an oracle" =
   setequal(unique(unlist(lapply(pilot, `[[`, "oracles"))),
-           c("lme4", "glmmTMB", "MixedModels", "GLMMadaptive")))
+           c("lme4", "glmmTMB", "MixedModels", "GLMMadaptive", "lmerTest")))
 
 # The fast set: size, the empirical members the subset is required to carry, and
 # the two spans it is chosen for.

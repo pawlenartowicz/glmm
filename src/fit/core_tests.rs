@@ -1212,6 +1212,53 @@ fn lmm_slope_case() -> (
     (x, y, n, p, model, ids, opts)
 }
 
+/// `lmm_slope_case`'s per-level slopes move with its intercepts (both linear
+/// in the level), so θ̂ pins Λ's slope column at zero: the pass has two free
+/// θ. This response swaps them for slopes unrelated to the intercepts, which
+/// leave all three free.
+fn slope_free_response(x: &[f64], y: &[f64]) -> Vec<f64> {
+    (0..y.len())
+        .map(|i| {
+            let c = i % 6;
+            let slope = 0.1 * [1.0, -1.0, 0.5, -0.5, 0.0, 0.0][c] - 0.05 * (c as f64 - 2.0);
+            y[i] + slope * x[i * 2 + 1]
+        })
+        .collect()
+}
+
+/// `lmm_slope_case`'s fixed part plus noise from which each level's own
+/// `[1, x]` fit is projected out: the levels agree exactly, so θ̂ pins every Λ
+/// column and the pass has no free θ (its df is ν).
+fn all_pinned_response(x: &[f64]) -> Vec<f64> {
+    let n = x.len() / 2;
+    let mut st = 99u64;
+    let mut e: Vec<f64> = (0..n).map(|_| lcg(&mut st) - 0.5).collect();
+    for c in 0..6 {
+        let rows: Vec<usize> = (0..n).filter(|i| i % 6 == c).collect();
+        let m = rows.len() as f64;
+        let xm = rows.iter().map(|&i| x[i * 2 + 1]).sum::<f64>() / m;
+        let em = rows.iter().map(|&i| e[i]).sum::<f64>() / m;
+        let sxx: f64 = rows.iter().map(|&i| (x[i * 2 + 1] - xm).powi(2)).sum();
+        let sxe: f64 = rows
+            .iter()
+            .map(|&i| (x[i * 2 + 1] - xm) * (e[i] - em))
+            .sum();
+        let b = sxe / sxx;
+        for &i in &rows {
+            e[i] -= em + b * (x[i * 2 + 1] - xm);
+        }
+    }
+    (0..n)
+        .map(|i| 0.5 + 0.4 * x[i * 2 + 1] + 0.1 * e[i])
+        .collect()
+}
+
+/// The free θ the pass sees after the last fit on `ws`.
+fn n_free(ws: &mut super::FitWorkspace) -> usize {
+    let lmm = ws.lmm_parts().expect("an LMM workspace").0;
+    crate::lmm::satterthwaite::free_coordinates(lmm.kernel.groupings(), &lmm.theta).len()
+}
+
 /// Intercept-only crossed design whose EXTRA factor outnumbers the primary, so
 /// `spec_sized_from_ids` swaps the two and the workspace carries a non-identity
 /// `Perm` — the state that makes a warm start arrive in the wrong slot order.
@@ -1899,4 +1946,335 @@ fn fitview_reports_the_gradient_search() {
     let pd = fit_cold(&x, &y, n, p, &model, &ids, &opts).diagnostics;
     assert_eq!((pd.n_grad, pd.outer_stop), (0, None));
     assert!(pd.outer_decrement.is_nan());
+}
+
+// --- loop-tier Satterthwaite ---
+
+/// The bits of what a materialized fit reports, for bitwise comparisons.
+fn fit_bits(f: &crate::Fit) -> Vec<u64> {
+    let vcov = f.vcov.iter().flatten();
+    let varcorr = f.varcorr.iter().flatten();
+    f.beta
+        .iter()
+        .chain(&f.se)
+        .chain(vcov)
+        .chain(&f.tau2)
+        .chain(varcorr)
+        .chain([&f.dispersion, &f.deviance])
+        .map(|v| v.to_bits())
+        .collect()
+}
+
+/// `df_out` equal to `want` bit for bit, NaN matching NaN.
+fn assert_df_bits(got: &[f64], want: &[f64], ctx: &str) {
+    assert_eq!(got.len(), want.len(), "{ctx}: length");
+    for (j, (g, w)) in got.iter().zip(want).enumerate() {
+        assert!(
+            g.to_bits() == w.to_bits() || (g.is_nan() && w.is_nan()),
+            "{ctx}[{j}]: {g} vs {w}"
+        );
+    }
+}
+
+#[test]
+fn loop_satterthwaite_matches_stable_coef_df() {
+    let (x, y, n, p, model, ids, mut opts) = lmm_slope_case();
+    // One target of two, so the NaN off the targets is checked too.
+    opts.target_indices = vec![1];
+    let cases = [
+        ("slope (dense)", (x, y, n, p, model, ids, opts)),
+        ("intercept (dense)", lmm_intercept_case()),
+        ("crossed slope (sparse)", crossed_extra_case(vec![1])),
+    ];
+    for (tag, (x, y, n, p, model, ids, opts)) in cases {
+        let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+        assert!(
+            opts.target_indices
+                .iter()
+                .all(|&t| cold.coef_df[t as usize].is_finite()),
+            "{tag}: the stable df is not finite on the targets"
+        );
+        let (sized, ids, perm) = spec_sized_from_ids_pub(&model, &ids);
+        let mut ws = build_workspace(&sized, perm, n, p, &opts);
+        drop(fit_on(&mut ws, &x, &y, &ids, None, &opts));
+        let mut df = vec![0.0; p];
+        assert_eq!(super::satterthwaite(&mut ws, &mut df), Ok(()), "{tag}");
+        assert_df_bits(&df, &cold.coef_df, tag);
+    }
+
+    // One workspace over draws with two, none, three, none and two free θ: the
+    // pass's buffers, reused across the calls, carry nothing from one to the
+    // next (an all-pinned draw parks every pooled buffer and takes none). Then
+    // the derivative route switches: a design one level of which has a constant
+    // slope disarms the per-group gradient (the value route), and the next
+    // draw arms it again, so the per-axis gradients are handed back and forth.
+    let (x, y, n, p, model, ids, opts) = lmm_slope_case();
+    let y_free = slope_free_response(&x, &y);
+    let y_pinned = all_pinned_response(&x);
+    let mut x_disarmed = x.clone();
+    for i in (0..n).step_by(6) {
+        x_disarmed[i * 2 + 1] = x[1];
+    }
+    let (sized, sized_ids, perm) = spec_sized_from_ids_pub(&model, &ids);
+    let mut ws = build_workspace(&sized, perm, n, p, &opts);
+    let mut df = vec![0.0; p];
+    for (tag, x, y, free, armed) in [
+        ("two free", &x, &y, 2, true),
+        ("none free", &x, &y_pinned, 0, true),
+        ("three free", &x, &y_free, 3, true),
+        ("none free again", &x, &y_pinned, 0, true),
+        ("two free again", &x, &y, 2, true),
+        ("value route", &x_disarmed, &y_free, 2, false),
+        ("gradient route again", &x, &y_free, 3, true),
+    ] {
+        drop(fit_on(&mut ws, x, y, &sized_ids, None, &opts));
+        assert_eq!(n_free(&mut ws), free, "{tag}");
+        let lmm = ws.lmm_parts().expect("an LMM workspace").0;
+        assert_eq!(
+            crate::lmm::per_group_gradient_armed(&lmm.kernel),
+            armed,
+            "{tag}"
+        );
+        assert_eq!(super::satterthwaite(&mut ws, &mut df), Ok(()), "{tag}");
+        let cold = fit_cold(x, y, n, p, &model, &ids, &opts);
+        assert_df_bits(&df, &cold.coef_df, tag);
+    }
+}
+
+#[test]
+fn satterthwaite_and_curvature_hint_commute() {
+    let (x, y, n, p, model, ids, opts) = lmm_slope_case();
+    let (sized, ids, perm) = spec_sized_from_ids_pub(&model, &ids);
+    let fresh = || build_workspace(&sized, perm, n, p, &opts);
+    let (mut ws_a, mut ws_b) = (fresh(), fresh());
+    drop(fit_on(&mut ws_a, &x, &y, &ids, None, &opts));
+    drop(fit_on(&mut ws_b, &x, &y, &ids, None, &opts));
+    let (mut df_a, mut df_b) = (vec![0.0; p], vec![0.0; p]);
+
+    super::satterthwaite(&mut ws_a, &mut df_a).unwrap();
+    let hint_a = super::curvature_hint(&mut ws_a).expect("the per-group route gives a hint");
+    let hint_b = super::curvature_hint(&mut ws_b).expect("the per-group route gives a hint");
+    super::satterthwaite(&mut ws_b, &mut df_b).unwrap();
+
+    assert_df_bits(&df_a, &df_b, "df, either order");
+    let bits = |h: &crate::optim::CurvatureHint| -> Vec<u64> {
+        h.inv_hessian().iter().map(|v| v.to_bits()).collect()
+    };
+    assert_eq!(bits(&hint_a), bits(&hint_b), "hint, either order");
+
+    // The next fit on a workspace the pass ran on is a fresh workspace's.
+    let y2: Vec<f64> = y
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| v + 0.2 * ((i % 7) as f64 - 3.0))
+        .collect();
+    let mut ws_c = fresh();
+    for ws in [&mut ws_a, &mut ws_b] {
+        let after =
+            fit_on(ws, &x, &y2, &ids, None, &opts).into_fit(&x, &y2, &ids, n, p, &model, &opts);
+        let clean = fit_on(&mut ws_c, &x, &y2, &ids, None, &opts)
+            .into_fit(&x, &y2, &ids, n, p, &model, &opts);
+        assert_eq!(fit_bits(&after), fit_bits(&clean), "the fit after the pass");
+        ws_c = fresh();
+    }
+}
+
+#[test]
+fn satterthwaite_on_non_lmm_workspace_is_no_df() {
+    use crate::inference::contrast::{ContrastError, NoDfReason};
+    for (tag, (x, y, n, p, model, ids, opts)) in [("ols", ols_case()), ("glm", glm_case())] {
+        let mut ws = build_workspace(&model, Perm::IDENTITY, n, p, &opts);
+        drop(fit_on(&mut ws, &x, &y, &ids, None, &opts));
+        let mut df = vec![0.0; p];
+        assert_eq!(
+            super::satterthwaite(&mut ws, &mut df),
+            Err(ContrastError::NoDf(NoDfReason::NotGaussianMixed)),
+            "{tag}"
+        );
+        assert!(df.iter().all(|v| v.is_nan()), "{tag}: {df:?}");
+    }
+}
+
+#[test]
+#[should_panic(expected = "satterthwaite: df_out")]
+fn satterthwaite_df_out_shape_checked() {
+    let (x, y, n, p, model, ids, opts) = lmm_intercept_case();
+    let (sized, ids, perm) = spec_sized_from_ids_pub(&model, &ids);
+    let mut ws = build_workspace(&sized, perm, n, p, &opts);
+    drop(fit_on(&mut ws, &x, &y, &ids, None, &opts));
+    let _ = super::satterthwaite(&mut ws, &mut vec![0.0; p + 1]);
+}
+
+#[test]
+fn satterthwaite_failed_pass_is_no_df_failed() {
+    use crate::inference::contrast::{ContrastError, NoDfReason};
+    let (x, y, n, p, model, ids, opts) = lmm_slope_case();
+    let (sized, ids, perm) = spec_sized_from_ids_pub(&model, &ids);
+    let mut ws = build_workspace(&sized, perm, n, p, &opts);
+    drop(fit_on(&mut ws, &x, &y, &ids, None, &opts));
+    // A non-finite stencil point: the pass's centre, θ̂'s first coordinate.
+    ws.lmm_parts().expect("an LMM workspace").0.theta[0] = f64::NAN;
+    let mut df = vec![0.0; p];
+    assert_eq!(
+        super::satterthwaite(&mut ws, &mut df),
+        Err(ContrastError::NoDf(NoDfReason::Failed))
+    );
+    assert!(df.iter().all(|v| v.is_nan()), "{df:?}");
+}
+
+#[test]
+fn satterthwaite_no_endpoint_is_no_df_failed() {
+    use crate::inference::contrast::{ContrastError, NoDfReason};
+    let (x, y, n, p, model, ids, opts) = lmm_slope_case();
+    let (sized, ids, perm) = spec_sized_from_ids_pub(&model, &ids);
+    let fresh = || build_workspace(&sized, perm, n, p, &opts);
+    let mut ws = fresh();
+    let mut df = vec![0.0; p];
+    drop(fit_on(&mut ws, &x, &y, &ids, None, &opts));
+    assert_eq!(super::satterthwaite(&mut ws, &mut df), Ok(()));
+
+    // One NaN response: `fit_lmm` finds no finite endpoint and NaN-fills β̂.
+    let mut y_nan = y.clone();
+    y_nan[3] = f64::NAN;
+    drop(fit_on(&mut ws, &x, &y_nan, &ids, None, &opts));
+    assert_eq!(
+        super::satterthwaite(&mut ws, &mut df),
+        Err(ContrastError::NoDf(NoDfReason::Failed))
+    );
+    assert!(df.iter().all(|v| v.is_nan()), "{df:?}");
+
+    // The next clean draw carries nothing from the failed one.
+    let y2: Vec<f64> = y
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| v + 0.2 * ((i % 7) as f64 - 3.0))
+        .collect();
+    drop(fit_on(&mut ws, &x, &y2, &ids, None, &opts));
+    super::satterthwaite(&mut ws, &mut df).unwrap();
+    let mut clean = fresh();
+    drop(fit_on(&mut clean, &x, &y2, &ids, None, &opts));
+    let mut df_clean = vec![0.0; p];
+    super::satterthwaite(&mut clean, &mut df_clean).unwrap();
+    assert_df_bits(&df, &df_clean, "the draw after the failed one");
+
+    // `y ~ 0 + (1 | g)` on the dense kernel: at p = 0 `fit_lmm` has no
+    // endpoint, and the dense kernel accumulates no rows.
+    let (_, y0, n0, _, _, ids0, _) = lmm_slope_case();
+    let model0 = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 1 },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let opts0 = FitOptions {
+        target_indices: vec![],
+        ..FitOptions::default()
+    };
+    let (sized0, ids0, perm0) = spec_sized_from_ids_pub(&model0, &ids0);
+    let mut ws0 = build_workspace(&sized0, perm0, n0, 0, &opts0);
+    assert!(!ws0.is_lmm_sparse());
+    drop(fit_on(&mut ws0, &[], &y0, &ids0, None, &opts0));
+    assert_eq!(
+        super::satterthwaite(&mut ws0, &mut []),
+        Err(ContrastError::NoDf(NoDfReason::Failed))
+    );
+}
+
+#[test]
+fn satterthwaite_nan_beta_is_no_df_failed() {
+    use crate::inference::contrast::{ContrastError, NoDfReason};
+    let (x, y, n, p, model, ids, opts) = lmm_slope_case();
+    let (sized, ids, perm) = spec_sized_from_ids_pub(&model, &ids);
+    let mut ws = build_workspace(&sized, perm, n, p, &opts);
+    drop(fit_on(&mut ws, &x, &y, &ids, None, &opts));
+    // The no-endpoint mark on otherwise finite statistics: without the β̂ guard
+    // the pass would run at this θ̂ and return finite df.
+    ws.lmm_parts().expect("an LMM workspace").0.recovery.betas[0] = f64::NAN;
+    let mut df = vec![0.0; p];
+    assert_eq!(
+        super::satterthwaite(&mut ws, &mut df),
+        Err(ContrastError::NoDf(NoDfReason::Failed))
+    );
+    assert!(df.iter().all(|v| v.is_nan()), "{df:?}");
+}
+
+/// Repeated loop-tier Satterthwaite calls cost a fixed allocation count, the
+/// same whichever θ the draw pins while one stays free: after a first `fit_on`
+/// plus `satterthwaite` on each of three draws (two free θ with Λ's slope
+/// column pinned, three, and none), the count over `N_CALLS` further warm
+/// `fit_on` plus `satterthwaite` calls on each is pinned at the measurement
+/// with no slack, as
+/// `fit_on_theta_marshalling_bounded_alloc` pins `fit_on`'s.
+///
+/// Run: `RAYON_NUM_THREADS=1 cargo test -p glmm --features alloc-tests
+/// satterthwaite_repeat_calls_bounded_alloc -- --ignored --test-threads=1`
+/// (`alloc-tests` installs the dhat allocator; `alloc_test_guard` serializes
+/// test bodies, but libtest's own per-test thread spawn still needs
+/// `--test-threads=1`).
+#[cfg(feature = "alloc-tests")]
+#[test]
+#[ignore]
+fn satterthwaite_repeat_calls_bounded_alloc() {
+    let _serial = crate::test_support::alloc_test_guard();
+    const N_CALLS: usize = 100;
+    // Measured 5 blocks (2026-10-11, pawel) per `satterthwaite` call under this
+    // test's own `RAYON_NUM_THREADS=1` + `--test-threads=1` protocol, on the two
+    // draws with a free θ: the pseudo-inverse's blocks (its eigendecomposition's
+    // workspace, eigenvalues and their copy, eigenvectors, the inverse); the
+    // pass's other buffers live on the workspace from the first call. Measured
+    // 0 blocks per call on the all-pinned draw (the pseudo-inverse of an
+    // empty `H_p` allocates nothing). None come from the warm `fit_on` calls.
+    // Pinned at the measurement with no slack: if a count moves, re-measure and
+    // update, do not relax.
+    const PER_CALL: u64 = 5;
+    const PER_CALL_NONE_FREE: u64 = 0;
+
+    let (x, y, n, p, model, ids, opts) = lmm_slope_case();
+    let y_free = slope_free_response(&x, &y);
+    let y_pinned = all_pinned_response(&x);
+    let (sized, ids, perm) = spec_sized_from_ids_pub(&model, &ids);
+    let mut ws = build_workspace(&sized, perm, n, p, &opts);
+    let mut df = vec![0.0; p];
+    let mut pilot = |ws: &mut super::FitWorkspace, y: &[f64], free: usize| {
+        let start = {
+            let v = fit_on(ws, &x, y, &ids, None, &opts);
+            crate::StartValues {
+                beta: v.betas().to_vec(),
+                theta: v.theta().to_vec(),
+                dispersion: None,
+            }
+        };
+        assert_eq!(n_free(ws), free, "free θ");
+        super::satterthwaite(ws, &mut df).unwrap();
+        start
+    };
+    let start = pilot(&mut ws, &y, 2);
+    let start_free = pilot(&mut ws, &y_free, 3);
+    let start_pinned = pilot(&mut ws, &y_pinned, 0);
+    crate::test_support::settle_background_allocs();
+
+    let profiler = dhat::Profiler::builder().testing().build();
+    let mut window = |ws: &mut super::FitWorkspace, y: &[f64], start: &crate::StartValues| {
+        for _ in 0..N_CALLS {
+            drop(fit_on(ws, &x, y, &ids, Some(start), &opts));
+            std::hint::black_box(super::satterthwaite(ws, &mut df)).unwrap();
+        }
+        dhat::HeapStats::get().total_blocks
+    };
+    let two_free = window(&mut ws, &y, &start);
+    let three_free = window(&mut ws, &y_free, &start_free) - two_free;
+    let none_free = window(&mut ws, &y_pinned, &start_pinned) - two_free - three_free;
+    drop(profiler);
+    assert!(df.iter().all(|v| v.is_finite()), "{df:?}");
+    let (bound, bound_none) = (
+        N_CALLS as u64 * PER_CALL,
+        N_CALLS as u64 * PER_CALL_NONE_FREE,
+    );
+    assert_eq!(
+        (two_free, three_free, none_free),
+        (bound, bound, bound_none),
+        "{N_CALLS} fit_on plus satterthwaite calls on each draw allocated these blocks"
+    );
 }

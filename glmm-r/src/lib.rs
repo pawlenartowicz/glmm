@@ -101,6 +101,7 @@ fn fastglmm_fit(
     start_beta: &[f64],
     start_theta: &[f64],
     start_dispersion: &[f64],
+    satterthwaite: bool,
 ) -> Result<List> {
     let nagq = u8::try_from(nagq)
         .map_err(|_| Error::Other(format!("nagq {nagq} is out of range for u8")))?;
@@ -135,6 +136,7 @@ fn fastglmm_fit(
         weights,
         offset,
         warm_start,
+        satterthwaite,
     )
     .map_err(Error::Other)?;
 
@@ -218,11 +220,39 @@ fn fastglmm_fit(
         nobs = r.nobs as f64,
         boundary = r.boundary,
         pinned = pinned,
-        notes = notes
+        notes = notes,
+        coef_df = r.coef_df,
+        coef_p = r.coef_p,
+        df_method = r.df_method,
+        rss = r.rss,
+        r_squared = r.r_squared,
+        adj_r_squared = r.adj_r_squared
     ))
+}
+
+/// `glmm::orchestrate::confint` for `confint.fastglmm`: the lower and upper
+/// bounds per coefficient, the t quantile on a finite df and the normal one
+/// elsewhere, so both ports give the same intervals from one rule. `NaN`
+/// entries (aliased coefficients, z rows' df) cross as plain doubles. `level`
+/// crosses as a vector, so an `NA` reaches the shared check (and its message)
+/// instead of extendr's scalar NA rejection.
+///
+/// @usage NULL
+/// @keywords internal
+#[extendr]
+fn fastglmm_confint(beta: &[f64], se: &[f64], coef_df: &[f64], level: &[f64]) -> Result<List> {
+    let level = match level {
+        [v] => *v,
+        _ => f64::NAN,
+    };
+    let ci = orchestrate::confint(beta, se, coef_df, level).map_err(Error::Other)?;
+    let lower: Vec<f64> = ci.iter().map(|b| b[0]).collect();
+    let upper: Vec<f64> = ci.iter().map(|b| b[1]).collect();
+    Ok(list!(lower = lower, upper = upper))
 }
 
 extendr_module! {
     mod glmm_r;
     fn fastglmm_fit;
+    fn fastglmm_confint;
 }

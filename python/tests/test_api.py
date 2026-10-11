@@ -4,7 +4,7 @@ import glmm
 
 
 def test_module_surface():
-    # `fit`, `Fit`, and the twenty-one warning categories the diagnostics
+    # `fit`, `Fit`, and the twenty-four warning categories the diagnostics
     # channel raises — a user has to be able to name them to filter on them.
     assert glmm.__all__ == [
         "AgqFallbackWarning",
@@ -25,6 +25,7 @@ def test_module_surface():
         "PirlsExhaustedWarning",
         "PrecisionLimitedWarning",
         "RowsDroppedWarning",
+        "SatterthwaiteCurvatureWarning",
         "SeUnavailableWarning",
         "SearchLimitWarning",
         "SingleLevelGroupingDroppedWarning",
@@ -52,6 +53,7 @@ def test_fit_signature_matches_spec():
         "wald_se",
         "nagq",
         "warm_start",
+        "satterthwaite",
     ]
     p = sig.parameters
     assert p["family"].default == "gaussian"
@@ -65,8 +67,10 @@ def test_fit_signature_matches_spec():
         "wald_se",
         "nagq",
         "warm_start",
+        "satterthwaite",
     ]:
         assert p[name].kind is inspect.Parameter.KEYWORD_ONLY, name
     assert p["link"].default is None
     assert p["wald_se"].default == "hessian"
     assert p["nagq"].default == 1
+    assert p["satterthwaite"].default is True

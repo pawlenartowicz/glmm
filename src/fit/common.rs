@@ -988,8 +988,13 @@ fn remap_spec_slopes(model: &ModelSpec, to_reduced: &[usize]) -> Option<ModelSpe
 /// every β NaN already says "unfittable"; the mask says which columns caused it,
 /// which is the only diagnostic the caller can act on, and it is the same field
 /// `fit_rank_deficient` fills on the successful path.
-fn unfittable_random_slope_fit(p: usize, model: &ModelSpec, aliased: &[bool]) -> Fit {
-    Fit {
+fn unfittable_random_slope_fit(
+    p: usize,
+    model: &ModelSpec,
+    aliased: &[bool],
+    opts: &FitOptions,
+) -> Fit {
+    let mut fit = Fit {
         beta: vec![f64::NAN; p],
         se: vec![f64::NAN; p],
         vcov: nan_vcov(p),
@@ -1014,7 +1019,19 @@ fn unfittable_random_slope_fit(p: usize, model: &ModelSpec, aliased: &[bool]) ->
         fitted: vec![],
         ranef: vec![],
         ranef_levels: vec![],
+        coef_df: vec![f64::NAN; p],
+        satterthwaite: None,
+    };
+    // A Gaussian LMM without an endpoint: the Satterthwaite record
+    // `fit_warm`'s step would have stored (it never runs here).
+    if matches!(model.family, Family::Gaussian) {
+        if opts.satterthwaite {
+            super::core::record_failed_pass(&mut fit);
+        } else {
+            fit.satterthwaite = Some(crate::lmm::satterthwaite::SatterthwaiteState::switched_off());
+        }
     }
+    fit
 }
 
 /// Fit the reduced (aliased-columns-dropped) model and scatter β/se back to full
@@ -1070,7 +1087,7 @@ pub(super) fn fit_rank_deficient(
     // slope makes the model unfittable, and there is no point paying for the
     // O(n·pk) copy to discover that.
     let Some(model_r) = remap_spec_slopes(model, &to_reduced) else {
-        return unfittable_random_slope_fit(p, model, aliased);
+        return unfittable_random_slope_fit(p, model, aliased, opts);
     };
     // Reduced design (drop aliased columns), row-major.
     let mut xr = vec![0.0f64; n * pk];
@@ -1119,11 +1136,23 @@ pub(super) fn fit_rank_deficient(
     let mut aliased_out = aliased.to_vec();
     let mut beta = vec![f64::NAN; p];
     let mut se = vec![f64::NAN; p];
+    let mut coef_df = vec![f64::NAN; p];
     for (r, &orig) in kept.iter().enumerate() {
         beta[orig] = fr.beta[r];
         se[orig] = fr.se[r];
+        coef_df[orig] = fr.coef_df[r];
         aliased_out[orig] |= fr.diagnostics.aliased[r];
     }
+    // The Satterthwaite state stays in the reduced column space; its map to
+    // the caller's columns goes through `kept` (composed with the reduced
+    // fit's own map, should that fit have salvaged again).
+    let satterthwaite = fr.satterthwaite.map(|mut st| {
+        st.retained = Some(match st.retained.take() {
+            Some(inner) => inner.into_iter().map(|r| kept[r]).collect(),
+            None => kept.clone(),
+        });
+        st
+    });
     // Every other diagnostic passes through from the reduced fit, but its note
     // column indices are REDUCED-design indices — translate them back through
     // `kept` so a caller can index them into the `x` it passed in.
@@ -1147,7 +1176,8 @@ pub(super) fn fit_rank_deficient(
             | Note::GradientSearchFallback
             | Note::SeUnavailable
             | Note::PrecisionLimited
-            | Note::Separated => {}
+            | Note::Separated
+            | Note::SatterthwaiteCurvature { .. } => {}
         }
     }
     // Same scatter in two dimensions: an aliased column has no coefficient, so
@@ -1183,6 +1213,8 @@ pub(super) fn fit_rank_deficient(
         fitted: fr.fitted,
         ranef: fr.ranef,
         ranef_levels: fr.ranef_levels,
+        coef_df,
+        satterthwaite,
     }
 }
 /// Engine-invariant shape check for the data-shaped ids (mirrors `fit_grouped`'s
@@ -1423,6 +1455,43 @@ pub(super) fn fill_se_by_predictor(var_diag: &[f64], target_indices: &[u32], se:
 /// whole of what a non-converged fit reports (mirroring how `se` NaN-fills).
 pub(crate) fn nan_vcov(p: usize) -> Vec<Vec<f64>> {
     vec![vec![f64::NAN; p]; p]
+}
+
+/// The residual df of OLS and of a Gamma or inverse Gaussian GLM with φ
+/// estimated (`ν = n − p`, `p` this fit's columns, the retained ones on a
+/// rank-deficient design): `coef_df` is ν on the target columns, NaN
+/// elsewhere, and the record holds the full `C`, [`vcov_from_chol`] over
+/// every column whatever the targets. A fit that did not converge keeps the
+/// residual record, with ν and an all-NaN `C` (its contrasts are NaN, not
+/// `NoDf`), and `coef_df` stays NaN, as `se` does; the non-convergence is
+/// reported through `converged`, since no pass ran that could fail.
+pub(crate) fn residual_df(
+    l: faer::MatRef<'_, f64>,
+    n: usize,
+    p: usize,
+    scale: f64,
+    map: &ColumnScaling,
+    target_indices: &[u32],
+    converged: bool,
+) -> (Vec<f64>, crate::lmm::satterthwaite::SatterthwaiteState) {
+    use crate::lmm::satterthwaite::SatterthwaiteState;
+    let mut coef_df = vec![f64::NAN; p];
+    let nu = n as f64 - p as f64;
+    if !converged {
+        return (
+            coef_df,
+            SatterthwaiteState::residual(Mat::full(p, p, f64::NAN), nu),
+        );
+    }
+    let every: Vec<u32> = (0..p as u32).collect();
+    let c = vcov_from_chol(l, p, &every, scale, map);
+    for &t in target_indices {
+        if let Some(d) = coef_df.get_mut(t as usize) {
+            *d = nu;
+        }
+    }
+    let c = Mat::from_fn(p, p, |i, j| c[i][j]);
+    (coef_df, SatterthwaiteState::residual(c, nu))
 }
 
 /// Full `p×p` [`Fit::vcov`] from `l`, the lower-triangular Cholesky factor of a

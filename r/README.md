@@ -56,11 +56,11 @@ fit <- fastglmm(y ~ x1 + (1 + x1 | subject), data)
 fit <- fastglmm(passed ~ x1 + (1 | school), data,
                 family = binomial(link = "probit"), nAGQ = 7)
 
-summary(fit)     # Wald z table + variance components
+summary(fit)     # coefficient table (lmerTest's Satterthwaite t on an LMM) + variance components
 fixef(fit)       # fixed effects
 vcov(fit)        # full Wald covariance
 VarCorr(fit)     # SD/correlation-scale variance components, lme4-shaped
-confint(fit)     # Wald intervals
+confint(fit)     # Wald intervals on the summary's t or z quantiles
 isSingular(fit)  # boundary-fit flag, lme4's condition
 ```
 

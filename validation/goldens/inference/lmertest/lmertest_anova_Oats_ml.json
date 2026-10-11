@@ -1,0 +1,109 @@
+{
+  "r_formula": "yield ~ 1 + Variety + nitro + (1 | Block/Variety)",
+  "reml": false,
+  "boundary": "none",
+  "twin": "lmertest_Oats_ml",
+  "assign": [0, 1, 1, 2],
+  "assign_names": ["(Intercept)", "VarietyMarvellous", "VarietyVictory", "nitro"],
+  "term_labels": ["Variety", "nitro"],
+  "type3": {
+    "terms": ["Variety", "nitro"],
+    "sum_sq": [579.256329412411, 19536.4000000001],
+    "mean_sq": [289.628164706205, 19536.4000000001],
+    "NumDF": [2, 1],
+    "DenDF": [11.9999803508357, 53.9999798038314],
+    "F": [1.78240708643258, 120.229390807708],
+    "p_value": [0.210002260044003, 2.37260182512511e-15],
+    "hypotheses": [
+      {
+        "term": "Variety",
+        "L": [
+          [-0, 1, 0, 0],
+          [-0, -0, 1, 0]
+        ],
+        "row_names": ["VarietyMarvellous", "VarietyVictory"],
+        "col_names": ["(Intercept)", "VarietyMarvellous", "VarietyVictory", "nitro"]
+      },
+      {
+        "term": "nitro",
+        "L": [
+          [-0, 0, -0, 1]
+        ],
+        "row_names": ["nitro"],
+        "col_names": ["(Intercept)", "VarietyMarvellous", "VarietyVictory", "nitro"]
+      }
+    ],
+    "DenDF_second": [
+      [11.9999803558739, 11.9999803535844],
+      [53.9999798042123, 53.9999797856385]
+    ]
+  },
+  "type2": {
+    "terms": ["Variety", "nitro"],
+    "sum_sq": [579.256329412411, 19536.4000000001],
+    "mean_sq": [289.628164706205, 19536.4000000001],
+    "NumDF": [2, 1],
+    "DenDF": [11.9999803508357, 53.9999798038314],
+    "F": [1.78240708643258, 120.229390807708],
+    "p_value": [0.210002260044003, 2.37260182512511e-15],
+    "hypotheses": [
+      {
+        "term": "Variety",
+        "L": [
+          [0, 1, 0, 0],
+          [0, 0, 1, 0]
+        ],
+        "row_names": ["VarietyMarvellous", "VarietyVictory"],
+        "col_names": ["(Intercept)", "VarietyMarvellous", "VarietyVictory", "nitro"]
+      },
+      {
+        "term": "nitro",
+        "L": [
+          [0, 0, 0, 1]
+        ],
+        "row_names": ["nitro"],
+        "col_names": ["(Intercept)", "VarietyMarvellous", "VarietyVictory", "nitro"]
+      }
+    ],
+    "DenDF_second": [
+      [11.9999803558739, 11.9999803535844],
+      [53.9999798042123, 53.9999797856385]
+    ]
+  },
+  "fd_settings": [
+    {
+      "hessian_d": 0.05,
+      "jacobian_d": 5e-05,
+      "r": 4
+    },
+    {
+      "hessian_d": 0.2,
+      "jacobian_d": 0.0002,
+      "r": 4
+    }
+  ],
+  "conditions": [],
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_lmertest.R"
+  },
+  "name": "lmertest_anova_Oats_ml"
+}

@@ -1,0 +1,80 @@
+{
+  "r_formula": "Yield ~ 1 + (1 | Batch)",
+  "reml": false,
+  "boundary": "none",
+  "theta": [0.752580695252293],
+  "theta_names": ["Batch.(Intercept)"],
+  "cnms": [
+    ["(Intercept)"]
+  ],
+  "group_names": ["Batch"],
+  "group_levels": [6],
+  "sigma": 49.5100999511903,
+  "beta": [1527.5],
+  "coef_names": ["(Intercept)"],
+  "cols_dropped": [],
+  "vcov_beta": [
+    [313.097223664621]
+  ],
+  "deviance": 327.327059881135,
+  "estimate": [1527.5],
+  "std_error": [17.694553502833],
+  "df": [5.99999996293324],
+  "t_value": [86.3259985483915],
+  "p_value": [1.62755865448585e-10],
+  "level": 0.95,
+  "lower": [1484.20298726836],
+  "upper": [1570.79701273164],
+  "varpar_names": ["Batch.(Intercept)", "sigma"],
+  "vcov_varpar": [
+    [0.108021037248615, -1.05037010587083],
+    [-1.05037010587083, 51.0677082361613]
+  ],
+  "Jac_list": [
+    [
+      [614.921142381123]
+    ],
+    [
+      [12.6478122230868]
+    ]
+  ],
+  "fd_settings": [
+    {
+      "hessian_d": 0.05,
+      "jacobian_d": 5e-05,
+      "r": 4
+    },
+    {
+      "hessian_d": 0.2,
+      "jacobian_d": 0.0002,
+      "r": 4
+    }
+  ],
+  "df_second": [
+    [5.99999996329343, 5.99999996407431]
+  ],
+  "conditions": [],
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_lmertest.R"
+  },
+  "name": "lmertest_Dyestuff_ml"
+}

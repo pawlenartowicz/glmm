@@ -9,7 +9,7 @@ use crate::glm::{glm_irls_fit_mapped, GlmFitView, GlmScratch};
 use crate::standardize::ColumnScaling;
 use crate::{Family, NegBinomialLink};
 
-use super::common::{fill_se_compact, nan_vcov, vcov_from_chol, FitDiagnostics};
+use super::common::{fill_se_compact, nan_vcov, residual_df, vcov_from_chol, FitDiagnostics};
 use super::{Diagnostics, Fit, FitOptions};
 
 impl GlmFitView<'_> {
@@ -55,6 +55,8 @@ fn fit_unsupported_family(p: usize) -> Fit {
         fitted: vec![],
         ranef: vec![],
         ranef_levels: vec![],
+        coef_df: vec![f64::NAN; p],
+        satterthwaite: None,
     }
 }
 // ---------------------------------------------------------------------------
@@ -351,6 +353,25 @@ pub(crate) fn glm_view_to_fit(
         (vec![], f64::NAN)
     };
 
+    // Gamma and inverse Gaussian with the Pearson φ̂ take t on its divisor
+    // `n − p` (`summary.glm`'s `df.residual`), whatever `opts.satterthwaite`
+    // says; a held φ, and the families with φ ≡ 1 or an NB shape, keep z.
+    let (coef_df, satterthwaite) = match family {
+        Family::Gamma { .. } | Family::InverseGaussian { .. } if opts.dispersion.is_none() => {
+            let (df, state) = residual_df(
+                view.l,
+                n,
+                p,
+                dispersion,
+                map,
+                &opts.target_indices,
+                converged,
+            );
+            (df, Some(state))
+        }
+        _ => (vec![f64::NAN; p], None),
+    };
+
     Fit {
         beta,
         se,
@@ -376,6 +397,8 @@ pub(crate) fn glm_view_to_fit(
         fitted,
         ranef: vec![],
         ranef_levels: vec![],
+        coef_df,
+        satterthwaite,
     }
 }
 // ---------------------------------------------------------------------------

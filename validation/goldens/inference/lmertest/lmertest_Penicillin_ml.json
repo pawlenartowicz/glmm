@@ -1,0 +1,85 @@
+{
+  "r_formula": "diameter ~ 1 + (1 | plate) + (1 | sample)",
+  "reml": false,
+  "boundary": "none",
+  "theta": [1.53759428030748, 3.21975622454087],
+  "theta_names": ["plate.(Intercept)", "sample.(Intercept)"],
+  "cnms": [
+    ["(Intercept)"],
+    ["(Intercept)"]
+  ],
+  "group_names": ["plate", "sample"],
+  "group_levels": [24, 6],
+  "sigma": 0.549932139516881,
+  "beta": [22.9722222222232],
+  "coef_names": ["(Intercept)"],
+  "cols_dropped": [],
+  "vcov_beta": [
+    [0.554423598966529]
+  ],
+  "deviance": 332.188348668514,
+  "estimate": [22.9722222222232],
+  "std_error": [0.744596265748445],
+  "df": [6.68905325555386],
+  "t_value": [30.8519170441075],
+  "p_value": [1.83083715425291e-08],
+  "level": 0.95,
+  "lower": [21.1948032453506],
+  "upper": [24.7496411990958],
+  "varpar_names": ["plate.(Intercept)", "sample.(Intercept)", "sigma"],
+  "vcov_varpar": [
+    [0.0703944487077456, 0.0241951660920877, -0.00393587768705926],
+    [0.0241951660920877, 0.916794114898095, -0.00773454443137598],
+    [-0.00393587768705926, -0.00773454443137598, 0.00131497953645789]
+  ],
+  "Jac_list": [
+    [
+      [0.0387506307936054]
+    ],
+    [
+      [0.324578642416083]
+    ],
+    [
+      [2.01633459520114]
+    ]
+  ],
+  "fd_settings": [
+    {
+      "hessian_d": 0.05,
+      "jacobian_d": 5e-05,
+      "r": 4
+    },
+    {
+      "hessian_d": 0.2,
+      "jacobian_d": 0.0002,
+      "r": 4
+    }
+  ],
+  "df_second": [
+    [6.68905294852426, 6.68905323062663]
+  ],
+  "conditions": [],
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_lmertest.R"
+  },
+  "name": "lmertest_Penicillin_ml"
+}

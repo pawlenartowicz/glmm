@@ -1404,11 +1404,9 @@ mod api {
             primary: d.ids_primary.clone(),
             extra: d.ids_extra.clone(),
         };
-        let opts = FitOptions {
-            target_indices: (1..d.p as u32).collect(),
-            nagq: d.nagq,
-            ..FitOptions::default()
-        };
+        let mut opts = FitOptions::default();
+        opts.target_indices = (1..d.p as u32).collect();
+        opts.nagq = d.nagq;
         let (sized, sized_ids, perm) = if model.re.is_some() {
             let (s, i, p) = spec_sized_from_ids_pub(&model, &ids);
             (s, i.into_owned(), p)

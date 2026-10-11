@@ -112,6 +112,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
+name = "commonstats"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "45549cef81a30681148034fc5398d15defad7ddaea0543b00d5589c022bf6c6b"
+dependencies = [
+ "libm",
+ "rand_philox",
+]
+
+[[package]]
 name = "crossbeam"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -527,6 +537,7 @@ name = "glmm"
 version = "0.5.0"
 dependencies = [
  "bobyqa",
+ "commonstats",
  "dhat",
  "faer",
  "pulp",
@@ -1115,6 +1126,12 @@ dependencies = [
  "num-traits",
  "rand 0.9.5",
 ]
+
+[[package]]
+name = "rand_philox"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "58bdd129512111be1936edc001113ba844f0fd1aa58b34b2752af62454788805"
 
 [[package]]
 name = "raw-cpuid"

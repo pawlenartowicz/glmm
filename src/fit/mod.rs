@@ -276,6 +276,28 @@ pub struct Fit {
     /// (primary, then each extra). `ranef.len() = Σ_g levels[g]·q_g`. Empty
     /// exactly when `ranef` is.
     pub ranef_levels: Vec<usize>,
+    /// Degrees of freedom of each coefficient `β̂_j`, length p: lmerTest's
+    /// Satterthwaite df of the contrast `e_j` on a Gaussian LMM, and the
+    /// residual df `n − p` (`p` the retained columns) on OLS and on a Gamma or
+    /// inverse Gaussian GLM with φ estimated, whatever
+    /// [`FitOptions::satterthwaite`] says. Filled on the target columns
+    /// ([`FitOptions::target_indices`]) of a Gaussian mixed fit whose pass ran
+    /// and of a converged OLS or dispersion GLM fit; NaN on non-target and
+    /// aliased columns (as `se`), on an OLS or dispersion GLM fit that did not
+    /// converge (as `se`), on every other family (binomial, Poisson, negative
+    /// binomial, every GLMM, a Gamma or inverse Gaussian GLM with φ held), when
+    /// the pass was switched off, and when it failed
+    /// ([`Note::SatterthwaiteCurvature`] with `nonfinite` set). Not `df`, which
+    /// is the AIC parameter count.
+    pub coef_df: Vec<f64>,
+    /// What the Satterthwaite pass (or the residual df) left for
+    /// [`Fit::contrast_t`] and [`Fit::contrast_f`]: on OLS and on a Gamma or
+    /// inverse Gaussian GLM with φ estimated, the residual-only record (the
+    /// full `C` and `ν = n − p`); on a Gaussian LMM, the pass's state, its
+    /// switched-off record, or the failed record of a fit with no finite
+    /// endpoint; `None` where neither applies (every other family, and a
+    /// Gaussian LMM `Fit` the loop tier's `FitView::into_fit` built).
+    pub(crate) satterthwaite: Option<crate::lmm::satterthwaite::SatterthwaiteState>,
 }
 
 /// Everything a fit reports about itself, reached as `fit.diagnostics`.
@@ -572,6 +594,30 @@ pub enum Note {
     /// the trillions). A model that captures the missing effect removes the
     /// first source.
     PrecisionLimited,
+    /// The Satterthwaite pass of a Gaussian LMM ([`Fit::coef_df`]) met a
+    /// curvature it cannot take at face value. Raised when the Hessian of the
+    /// profiled deviance over the free variance parameters had directions the
+    /// pseudo-inverse left out (flat to `1e-8` of its largest eigenvalue, or
+    /// negative), as lmerTest warns; when the df were computed at an endpoint
+    /// that did not converge (`MaxFunReached`); and when the pass failed: a
+    /// deviance or covariance on the pass's stencil was not finite, the
+    /// eigendecomposition of that Hessian failed, or the fit has no finite
+    /// endpoint at all. A failed pass fails for the whole fit: every `coef_df`
+    /// is NaN and the contrasts return
+    /// [`crate::inference::contrast::NoDfReason::Failed`].
+    SatterthwaiteCurvature {
+        /// Directions of the Hessian dropped as flat.
+        dropped: u32,
+        /// Directions of the Hessian below `−1e-8` of its largest eigenvalue,
+        /// not inverted.
+        negative: u32,
+        /// Whether the endpoint the df were computed at converged.
+        converged: bool,
+        /// The pass failed: a deviance or covariance on the stencil was not
+        /// finite, the Hessian's eigendecomposition failed, or the fit has no
+        /// finite endpoint.
+        nonfinite: bool,
+    },
     /// The fixed-effects IRLS stopped on separation: the deviance settled
     /// while the last step still moved some linear predictor by a large
     /// amount, so at least one coefficient runs off to ±∞ (binomial, Poisson,
@@ -723,6 +769,23 @@ impl Fit {
 
 /// Options for `fit`. Carries the safe, defaulted method knobs: unlike
 /// a warm start these do not silently move the estimate based on a caller's guess.
+///
+/// `FitOptions` is `#[non_exhaustive]`: outside this crate a struct literal,
+/// including `..` update syntax, does not compile.
+///
+/// ```compile_fail
+/// let o = glmm::FitOptions { target_indices: vec![0], ..Default::default() };
+/// ```
+///
+/// Start from [`FitOptions::default()`] (or a clone of existing options) and
+/// assign fields instead:
+///
+/// ```rust
+/// let mut o = glmm::FitOptions::default();
+/// o.target_indices = vec![0];
+/// ```
+// Non-exhaustive so a new knob is an additive change, not a break.
+#[non_exhaustive]
 #[derive(Clone)]
 pub struct FitOptions {
     /// Predictor column indices for which SE is computed.
@@ -867,6 +930,15 @@ pub struct FitOptions {
     /// batch loop is safe (one shared work-stealing pool) in a way naive OS-thread
     /// or BLAS-thread nesting is not.
     pub parallel_inner: bool,
+    /// Run the Satterthwaite pass on a Gaussian LMM fit ([`Fit::coef_df`],
+    /// [`Fit::contrast_t`], [`Fit::contrast_f`]): one finite-difference pass
+    /// at θ̂, over the profiled deviance (or over its analytic gradient where
+    /// the fit's per-group gradient is armed), after the fit and without a
+    /// refit.
+    /// Default `true`. `false` skips it: `coef_df` stays NaN and the contrasts
+    /// return [`crate::inference::contrast::NoDfReason::Disabled`]. No other
+    /// family reads it, and no other field of the fit depends on it.
+    pub satterthwaite: bool,
 }
 
 impl Default for FitOptions {
@@ -879,6 +951,7 @@ impl Default for FitOptions {
             weights: None,
             offset: None,
             parallel_inner: false,
+            satterthwaite: true,
         }
     }
 }
@@ -921,7 +994,8 @@ impl Default for FitOptions {
 /// let x = vec![1.0, 0.0, 1.0, 1.0, 1.0, 2.0]; // n=3, p=2, row-major [intercept, x]
 /// let y = vec![0.0, 2.0, 4.0];
 /// let model = ModelSpec { family: Family::Gaussian, re: None };
-/// let opts = FitOptions { target_indices: vec![1], ..FitOptions::default() };
+/// let mut opts = FitOptions::default();
+/// opts.target_indices = vec![1];
 /// let fit = fit_cold(&x, &y, 3, 2, &model, &GroupIds::default(), &opts);
 /// assert!(fit.converged());
 /// assert!((fit.beta[1] - 2.0).abs() < 1e-9);
@@ -1130,6 +1204,10 @@ pub fn fit_warm(
     let mut ws = core::build_workspace(&sized, perm, n, p, opts);
     let view = core::fit_on(&mut ws, x, y, &ids, start, opts);
     let mut fit = view.into_fit(x, y, &ids, n, p, model, opts);
+    // After `into_fit`, which is the last read of the kernel's factor for the
+    // fit's own outputs: the pass leaves that factor at its last stencil
+    // point (on the shifted response), and nothing reads `ws` after it.
+    core::attach_satterthwaite(&mut ws, &mut fit, opts);
     if non_integer_response_rows > 0 {
         fit.diagnostics.notes.push(Note::NonIntegerResponse {
             rows: non_integer_response_rows,
@@ -1257,9 +1335,31 @@ pub(crate) use glmm::glm_warm_start_beta;
 pub(crate) use glmm::fit_glmm_packed;
 #[cfg(test)]
 pub(crate) use lmm::{fit_mle_noz_pub, fit_mle_sparse_pub};
+
+/// Test-only: [`fit_cold`]'s fit of a full-rank mixed design, returned with the
+/// workspace it ran on, so a test can read what the fit left there
+/// (`FitWorkspace::lmm_parts`).
+#[cfg(test)]
+pub(crate) fn fit_cold_keep_workspace(
+    x: &[f64],
+    y: &[f64],
+    n: usize,
+    p: usize,
+    model: &ModelSpec,
+    ids: &GroupIds,
+    opts: &FitOptions,
+) -> (Fit, core::FitWorkspace) {
+    let (sized, ids, perm) = spec_sized_from_ids(model, ids);
+    let mut ws = core::build_workspace(&sized, perm, n, p, opts);
+    let fit = core::fit_on(&mut ws, x, y, &ids, None, opts).into_fit(x, y, &ids, n, p, model, opts);
+    (fit, ws)
+}
+
 // Unified fit-core surface for the loop tier.
 #[cfg(feature = "loop_advanced")]
-pub use core::{build_workspace, curvature_hint, fit_on, fit_on_hinted, FitView, FitWorkspace};
+pub use core::{
+    build_workspace, curvature_hint, fit_on, fit_on_hinted, satterthwaite, FitView, FitWorkspace,
+};
 
 // `pub(crate)` only so `src/sparse/tests.rs` can reach the shared Tier 1 pin
 // bands; the module is `cfg(test)` either way.

@@ -1,0 +1,69 @@
+{
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0",
+      "glmmTMB": "1.1.14"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_anova.R"
+  },
+  "case": "gamma_glmm_vs_glm",
+  "reference": "mixture",
+  "members": [
+    {
+      "logLik": -489.621879558824,
+      "npar": 4,
+      "nobs": 288,
+      "deviance": 254.453326740699,
+      "AIC": 987.243759117648,
+      "BIC": 1001.89560103819
+    },
+    {
+      "logLik": -449.514968265169,
+      "npar": 5,
+      "nobs": 288,
+      "deviance": 157.422872083603,
+      "AIC": 909.029936530338,
+      "BIC": 927.344738931018
+    },
+    {
+      "logLik": -490.80909764798,
+      "npar": 4,
+      "nobs": 288,
+      "deviance": 254.453326741254,
+      "AIC": 989.618195295961,
+      "BIC": 1004.2700372165
+    },
+    {
+      "logLik": -445.173519506366,
+      "npar": 5,
+      "nobs": 288,
+      "deviance": 158.900924399185,
+      "AIC": 900.347039012732,
+      "BIC": 918.661841413412
+    }
+  ],
+  "neg_devfun_half": -491.80909764798,
+  "offset": 0.999999999999773,
+  "statistic": 80.21382258731,
+  "df": 1,
+  "p_chisq": 3.36008435723544e-19,
+  "mixture_k": 0,
+  "p_mixture": 1.68004217861772e-19,
+  "name": "anova_gamma_glmm_vs_glm_sim_gamma"
+}

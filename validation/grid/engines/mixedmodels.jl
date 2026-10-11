@@ -181,7 +181,7 @@ function fit_mixed_cell(cell, df, gaussian, timed)
                    "not converged: optsum.returnvalue = $(m.optsum.returnvalue)",
          coef_names = collect(coefnames(m)), beta = collect(coef(m)),
          se_rx = collect(stderror(m)), varcomp = varcomp_of(m, gaussian),
-         sigma = gaussian ? m.σ : nothing, nb_theta = nothing,
+         sigma = gaussian ? m.σ : nothing, nb_theta = nothing, coef_df = nothing,
          n_eval = m.optsum.feval, wall_seconds = wall, fits_per_sample = 1),
         loglik_pair(ll))
 end
@@ -234,7 +234,7 @@ function fit_glm_cell(cell, df, timed)
             # loglikelihood, which StatsModels delegates through the wrapper
             # automatically).
             sigma = gaussian ? dispersion(m.model) : nothing, nb_theta = nothing,
-            n_eval = nothing, wall_seconds = wall, fits_per_sample = 1)
+            coef_df = nothing, n_eval = nothing, wall_seconds = wall, fits_per_sample = 1)
     # GLM.jl has exactly one SE method, so a non-gaussian GLM cell fills BOTH
     # slots with it -- matching the Rust engine, which fits a fixed-only
     # non-gaussian cell under both WaldSe::Hessian and WaldSe::Rx and gets the
@@ -256,11 +256,13 @@ function fit_cell(cell, grid_dir, timed)
 end
 
 # Seeded on an engine-fail: se_rx is NOT included, matching the schema's
-# "absent when the engine has none" rule -- it was never computed.
+# "absent when the engine has none" rule -- it was never computed. coef_df is
+# null on every record of this engine, as common.R::grid_record seeds it for the
+# R oracles: only glmm's and lmerTest's df are read.
 fail_record(msg = nothing) = (
     converged = false, singular = false, status = "engine-fail", message = msg,
     coef_names = String[], beta = Float64[], varcomp = NamedTuple[],
-    sigma = nothing, nb_theta = nothing, loglik = nothing, deviance = nothing,
+    sigma = nothing, nb_theta = nothing, coef_df = nothing, loglik = nothing, deviance = nothing,
     n_eval = nothing, wall_seconds = nothing, fits_per_sample = 1)
 
 # Cell lookup by id, and the fit order: GRID_CELLS's own order (manifest order

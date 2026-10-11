@@ -15,6 +15,11 @@ FIXED = {"x": _X, "y": _Y}
 _G = [f"g{i % 5}" for i in range(20)]
 _OFF = {"g0": -3.0, "g1": -1.5, "g2": 0.0, "g3": 1.5, "g4": 3.0}
 MIXED = {"x": _X, "g": _G, "y": [y + _OFF[g] for y, g in zip(_Y, _G)]}
+# MIXED with groups of rows (i // 2) % 5, so y - 0.3x is not constant within a
+# group (in MIXED it is, and the LMM fit rides the theta cap): theta-hat is
+# interior and sigma-hat^2 is not tiny.
+_G_PAIRS = [f"g{(i // 2) % 5}" for i in range(20)]
+MIXED_PAIRS = {"x": _X, "g": _G_PAIRS, "y": [y + _OFF[g] for y, g in zip(_Y, _G_PAIRS)]}
 
 # A single fixture that raises three notes of two kinds from one call: two
 # argument_ignored notes (dispersion=, nagq=, both inapplicable on a Gaussian
@@ -235,6 +240,34 @@ def test_constructed_notes_store_with_their_tier_and_title():
                 "The search for the negative binomial shape parameter stopped at its limit of 25 "
                 "rounds before it settled. The coefficients and standard errors are computed at the "
                 "last value it reached, which may not be the best one."
+            ),
+        ),
+        (
+            dict(
+                base,
+                kind="satterthwaite_curvature",
+                detail="dropped 0, negative 0, converged false, nonfinite true",
+            ),
+            glmm.SatterthwaiteCurvatureWarning,
+            (
+                "The Satterthwaite degrees of freedom could not be computed: the fit has no "
+                "finite end point, or the deviance near it was not finite. Every coefficient is "
+                "tested with z, and its confidence interval uses the normal distribution."
+            ),
+        ),
+        (
+            dict(
+                base,
+                kind="satterthwaite_curvature",
+                detail="dropped 1, negative 2, converged false, nonfinite false",
+            ),
+            glmm.SatterthwaiteCurvatureWarning,
+            (
+                "The Satterthwaite degrees of freedom are approximate: the curvature of the "
+                "deviance in the variance parameters has 1 flat direction, left out; it has 2 "
+                "negative directions, so the fit may not be at a minimum; the variance search "
+                "stopped at its step limit, so they are computed at its last point. The t tests "
+                "and confidence intervals use them as computed."
             ),
         ),
         (
@@ -901,4 +934,55 @@ def test_port_parity_rows_dropped_na():
     (entry,) = m.warnings
     assert entry["message"] == (
         "Dropped 1 of 4 row(s): a column the formula uses had a missing value there."
+    )
+
+
+def test_degenerate_gaussian_lmm_carries_the_satterthwaite_note():
+    # Same fixture and call in r/tests/testthat/test-warnings.R - change together.
+    # A random slope on an aliased column (x2 = 2x) leaves a NaN-filled fit with no
+    # finite end point, so the Satterthwaite pass is recorded as failed.
+    data = dict(MIXED, x2=[2.0 * v for v in _X])
+    with (
+        pytest.warns(glmm.FitFailedWarning),
+        pytest.warns(glmm.SatterthwaiteCurvatureWarning, match="could not be computed"),
+    ):
+        m = glmm.fit(data, "y ~ x + x2 + (1 + x2 | g)")
+    assert not m.converged
+    assert m.df_method == "failed"
+    assert [w["kind"] for w in m.warnings] == ["satterthwaite_curvature", "fit_failed"]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        off = glmm.fit(data, "y ~ x + x2 + (1 + x2 | g)", satterthwaite=False)
+    assert off.df_method == "disabled"
+    assert [w["kind"] for w in off.warnings] == ["fit_failed"]
+
+
+# Pinned 90% intervals on MIXED_PAIRS from orchestrate::confint, the one function
+# both ports call: [lower, upper] per coefficient for the LMM (Satterthwaite t, df
+# about 4.0 and 14.1) and the OLS fit (t on n - p = 18). Produced on x86_64 Linux
+# from these sources (release builds of both ports gave the same digits). Same
+# numbers and band in r/tests/testthat/test-warnings.R - change together. The band
+# is the R suite's CI_REF_REL (helper-pins.R), the package's same-answer band
+# across CPUs and builds.
+_CONFINT_PIN_REL = 1e-7
+_MIXED_PAIRS_CONFINT_90 = {
+    "y ~ x + (1 | g)": [
+        [-2.423532479928109, 2.4235324799281277],
+        [0.26110360172792885, 0.3444701274625301],
+    ],
+    "y ~ x": [
+        [-0.8530566754329614, 0.8530566754329608],
+        [0.3287512344979612, 0.6037162979695715],
+    ],
+}
+
+
+@pytest.mark.parametrize("formula", list(_MIXED_PAIRS_CONFINT_90))
+def test_port_parity_confint(formula):
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        m = glmm.fit(MIXED_PAIRS, formula)
+    assert m.df_method == ("satterthwaite" if "|" in formula else "residual")
+    np.testing.assert_allclose(
+        m.confint(level=0.9), _MIXED_PAIRS_CONFINT_90[formula], rtol=_CONFINT_PIN_REL, atol=0.0
     )

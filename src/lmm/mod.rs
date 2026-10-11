@@ -38,6 +38,7 @@ use crate::standardize::ColumnScaling;
 mod kernel;
 pub(crate) mod pg_grad;
 mod re_map;
+pub(crate) mod satterthwaite;
 #[cfg(test)]
 mod tests;
 
@@ -968,7 +969,11 @@ impl LmmKernel {
             }
             LmmKernel::Sparse { ws, .. } => {
                 let ws = Self::sparse_ws_mut(ws);
-                match crate::sparse::sparse_recover_u(ws, betas) {
+                let u = crate::sparse::sparse_recover_u(ws, betas);
+                // Armed for this one back-substitution: later evaluations at
+                // other θ (the Satterthwaite pass's) copy nothing into it.
+                ws.rec = None;
+                match u {
                     Some(u) => {
                         ws.ranef_u = u;
                         true
@@ -1081,6 +1086,10 @@ pub struct LmmWorkspace {
     /// until the first weighted draw, then refilled in place, so a weighted
     /// loop allocates it once.
     pub(crate) w_scaled: Vec<f64>,
+    /// The loop tier's Satterthwaite pass buffers
+    /// ([`satterthwaite::pass_targets`]), built on its first call on the
+    /// workspace. The stable path's pass builds its own.
+    pub(crate) pass_scratch: Option<Box<satterthwaite::PassScratch>>,
 }
 
 impl LmmWorkspace {
@@ -1176,6 +1185,7 @@ impl LmmWorkspace {
             upper,
             weight_scale: 1.0,
             w_scaled: Vec::new(),
+            pass_scratch: None,
         }
     }
 
@@ -1206,6 +1216,7 @@ impl LmmWorkspace {
             upper,
             weight_scale: 1.0,
             w_scaled: Vec::new(),
+            pass_scratch: None,
         }
     }
 
@@ -2236,6 +2247,16 @@ fn warm_bobyqa<'a>(slot: &'a mut Option<Bobyqa>, config: &Config, n: usize) -> &
         c.rho_begin = RHO_BEGIN_WARM;
         Bobyqa::new(n, c).expect("warm BOBYQA config is valid by construction")
     })
+}
+
+/// Whether the per-group θ-gradient ([`pg_grad::pg_gradient`]) is armed on
+/// `kernel` for the accumulated dataset: the dense kernel with the per-group
+/// regression route on. The condition [`LmmObjective::gradient`] and
+/// [`lmm_outer_optimizer`] test (the route admits `q_p ≥ 2` only, so its
+/// `n_θ ≥ 3` holds wherever this does); the Satterthwaite pass reads it to
+/// choose its derivative route.
+pub(crate) fn per_group_gradient_armed(kernel: &LmmKernel) -> bool {
+    matches!(kernel, LmmKernel::Dense { fit, .. } if fit.pg_n_active > 0)
 }
 
 /// The outer optimizer a fit's θ search runs: BFGS where the per-group

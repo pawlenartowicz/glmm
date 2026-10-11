@@ -56,13 +56,19 @@ alloc-tests = []
 counters = []
 # Tier 2, the cross-engine tier: asserts the crate against the frozen lme4 /
 # MixedModels / GLMMadaptive goldens in `validation/goldens/` at `validation/grid/tol.R`'s
-# agreement bands. OFF by default because it is slow — it refits all 50 goldens
+# agreement bands. OFF by default because it is slow — it refits every golden
 # — and because CI runs the validated-answer tier instead. Reads frozen
 # JSON, so it needs neither R nor Julia. Named for the claim, not the cost, and
 # NOT an oracle run of the accuracy grid, which refits the references themselves
 # — a different act. Preferred over `#[ignore]` so the tier is
-# greppable and its absence from a run is visible rather than silent.
-oracle-tests = []
+# greppable and its absence from a run is visible rather than silent. Implies
+# `orchestrate`: the inference tier (`tests/inference_oracle.rs`) gates the
+# ports' interval function, which lives there.
+oracle-tests = ["orchestrate"]
+# The Monte Carlo tier: level studies checked against seeded bands. OFF by
+# default because it is slow. Compile-time gated rather than `#[ignore]`, so a
+# run without it is visible, never a silent skip. Runs locally at release.
+montecarlo-tests = []
 # In-fit parallelism (AGQ cluster loop, FD-Hessian grid) via rayon's global pool.
 # OFF by default: a batch/MCPower caller running its own outer rayon loop over
 # many fits should pay nothing for this, not even rayon's per-split overhead.
@@ -78,6 +84,13 @@ pulp = "=0.22.2"
 # Formula-parser only (`src/formula/parse.rs`); optional so the default-off kernel
 # never links it. Its MSRV (1.65) clears this crate's 1.85 floor.
 regex = { version = "1", optional = true }
+# p-value tails (`dist`) and the Philox stream (`rng`, through `rand_philox`):
+# they feed validated p-values and pinned Monte Carlo values. Caret on purpose,
+# floor 0.2.1 (whose `rng` resolves `rand_philox` 0.2); a release that moves those
+# values gets the values re-pinned (not the crate version), with a provenance line
+# naming both crate versions, never absorbed by widening a band. Unconditional;
+# its MSRV (1.85) matches this crate's floor.
+commonstats = { version = "0.2.1", default-features = false, features = ["dist", "rng"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 faer = "0.24"

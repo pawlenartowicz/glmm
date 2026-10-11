@@ -3741,3 +3741,145 @@ fn fit_glm_nb_large_counts_settle_theta() {
         );
     }
 }
+
+/// Every coefficient's t test on a fit whose df is `nu`: `coef_df` is `nu`
+/// on every (target) column, and `contrast_t(e_j)` is `β̂_j / se_j` on `nu`.
+fn assert_residual_t(f: &Fit, nu: f64) {
+    let p = f.beta.len();
+    assert_eq!(f.coef_df, vec![nu; p]);
+    for j in 0..p {
+        let mut e = vec![0.0; p];
+        e[j] = 1.0;
+        let t = f.contrast_t(&e).expect("a residual df");
+        assert_eq!(t.estimate, f.beta[j]);
+        assert!((t.se - f.se[j]).abs() <= 1e-12 * f.se[j], "se {j}");
+        assert_eq!(t.df, nu);
+        assert_eq!(t.p_value, crate::inference::tails::t_two_sided_p(t.t, nu));
+    }
+}
+
+/// A Gamma GLM with the Pearson φ̂ reports t on `n − p`, as `summary.glm`
+/// pairs it with `df.residual`, whatever `FitOptions::satterthwaite` says.
+#[test]
+fn gamma_glm_estimated_phi_has_t_df() {
+    let (x, y, n) = sim_gamma_xy();
+    let p = 3;
+    let model = ModelSpec {
+        family: Family::Gamma {
+            link: crate::GammaLink::Log,
+        },
+        re: None,
+    };
+    for satterthwaite in [true, false] {
+        let opts = FitOptions {
+            target_indices: vec![0, 1, 2],
+            satterthwaite,
+            ..FitOptions::default()
+        };
+        let f = fit_cold(&x, &y, n, p, &model, &GroupIds::default(), &opts);
+        assert!(f.converged());
+        assert_residual_t(&f, (n - p) as f64);
+    }
+}
+
+/// The inverse-Gaussian GLM with the Pearson φ̂, as the Gamma one.
+#[test]
+fn inverse_gaussian_glm_estimated_phi_has_t_df() {
+    let (x, y, n) = sim_igauss_xy();
+    let p = 3;
+    let model = ModelSpec {
+        family: Family::InverseGaussian {
+            link: crate::InverseGaussianLink::Log,
+        },
+        re: None,
+    };
+    let opts = FitOptions {
+        target_indices: vec![0, 1, 2],
+        ..FitOptions::default()
+    };
+    let f = fit_cold(&x, &y, n, p, &model, &GroupIds::default(), &opts);
+    assert!(f.converged());
+    assert_residual_t(&f, (n - p) as f64);
+}
+
+/// A φ held through `FitOptions::dispersion` keeps z (`summary.glm(dispersion
+/// = v)`): no `coef_df` and no contrast df.
+#[test]
+fn held_dispersion_keeps_z() {
+    let no_df = crate::inference::contrast::ContrastError::NoDf(
+        crate::inference::contrast::NoDfReason::NotGaussianMixed,
+    );
+    let gamma = Family::Gamma {
+        link: crate::GammaLink::Log,
+    };
+    let ig = Family::InverseGaussian {
+        link: crate::InverseGaussianLink::Log,
+    };
+    for (family, (x, y, n)) in [(gamma, sim_gamma_xy()), (ig, sim_igauss_xy())] {
+        let model = ModelSpec { family, re: None };
+        let opts = FitOptions {
+            target_indices: vec![0, 1, 2],
+            dispersion: Some(1.5),
+            ..FitOptions::default()
+        };
+        let f = fit_cold(&x, &y, n, 3, &model, &GroupIds::default(), &opts);
+        assert!(f.converged());
+        assert!(f.coef_df.iter().all(|d| d.is_nan()), "{family:?}");
+        assert_eq!(f.contrast_t(&[0.0, 1.0, 0.0]), Err(no_df));
+        assert_eq!(f.contrast_f(&[0.0, 1.0, 0.0, 0.0, 0.0, 1.0], 2), Err(no_df));
+    }
+}
+
+/// Binomial, Poisson and negative binomial GLMs have no df (φ fixed at 1,
+/// or the NB shape): NaN `coef_df` and a typed error from the contrasts.
+#[test]
+fn binomial_poisson_nb_glm_have_no_df() {
+    let no_df = Err(crate::inference::contrast::ContrastError::NoDf(
+        crate::inference::contrast::NoDfReason::NotGaussianMixed,
+    ));
+    let mut s = 23u64;
+    let n = 80;
+    let (mut x, mut yb, mut yc) = (vec![], vec![], vec![]);
+    for i in 0..n {
+        let x1 = lcg(&mut s);
+        x.extend([1.0, x1]);
+        let prob = 1.0 / (1.0 + (-(0.3 + 0.8 * x1)).exp());
+        yb.push(if 0.5 * (lcg(&mut s) + 1.0) < prob {
+            1.0
+        } else {
+            0.0
+        });
+        yc.push(((i % 5) as f64 + 3.0 * (lcg(&mut s) + 1.0)).floor());
+    }
+    let families = [
+        (
+            Family::Binomial {
+                link: BinomialLink::Logit,
+            },
+            &yb,
+        ),
+        (
+            Family::Poisson {
+                link: crate::PoissonLink::Log,
+            },
+            &yc,
+        ),
+        (
+            Family::NegativeBinomial {
+                link: NegBinomialLink::Log,
+            },
+            &yc,
+        ),
+    ];
+    for (family, y) in families {
+        let model = ModelSpec { family, re: None };
+        let opts = FitOptions {
+            target_indices: vec![0, 1],
+            ..FitOptions::default()
+        };
+        let f = fit_cold(&x, y, n, 2, &model, &GroupIds::default(), &opts);
+        assert!(f.converged(), "{family:?}");
+        assert!(f.coef_df.iter().all(|d| d.is_nan()), "{family:?}");
+        assert_eq!(f.contrast_t(&[0.0, 1.0]), no_df, "{family:?}");
+    }
+}

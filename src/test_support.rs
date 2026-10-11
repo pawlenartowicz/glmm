@@ -225,6 +225,52 @@ pub(crate) fn extra_level_of_row(spec: &crate::ModelSpec, g: usize, i: usize) ->
     crate::ids::extra_level_of_row(re, g, i) as usize
 }
 
+/// A CSV in the validation corpus's format (`,`-split, quotes trimmed) as a
+/// formula `Table`, by [`table_from_rows`].
+#[cfg(feature = "formula")]
+pub(crate) fn csv_table(csv: &str, factors: &[&str]) -> crate::formula::Table {
+    let split = |l: &str| -> Vec<String> {
+        l.split(',')
+            .map(|c| c.trim().trim_matches('"').to_string())
+            .collect()
+    };
+    let mut lines = csv.lines().filter(|l| !l.trim().is_empty());
+    let header = split(lines.next().expect("a CSV header"));
+    let rows: Vec<Vec<String>> = lines.map(split).collect();
+    table_from_rows(&header, &rows, factors)
+}
+
+/// CSV cells as a formula `Table`: the columns named in `factors`, and any
+/// column with a cell that does not parse as `f64`, are factors; every other
+/// column is numeric.
+#[cfg(feature = "formula")]
+pub(crate) fn table_from_rows(
+    header: &[String],
+    rows: &[Vec<String>],
+    factors: &[&str],
+) -> crate::formula::Table {
+    use crate::formula::Column;
+    let columns = header
+        .iter()
+        .enumerate()
+        .map(|(j, name)| {
+            let cells: Vec<String> = rows.iter().map(|r| r[j].clone()).collect();
+            let col = if factors.contains(&name.as_str())
+                || cells.iter().any(|c| c.parse::<f64>().is_err())
+            {
+                Column::factor_from_labels(&cells)
+            } else {
+                Column::Numeric(cells.iter().map(|c| c.parse().unwrap()).collect())
+            };
+            (name.clone(), col)
+        })
+        .collect();
+    crate::formula::Table {
+        columns,
+        n: rows.len(),
+    }
+}
+
 /// Primary cluster owning row `i` under the positional layout: rows dealt
 /// round-robin (`i % n_clusters`) under `FixedClusters`, contiguous blocks
 /// (`i / cluster_size`) under `FixedSize`. Mirrors

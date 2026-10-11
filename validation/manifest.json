@@ -1424,5 +1424,2015 @@
     {"name": "sim_scale_gamma_inv_glm", "kind": "glm", "data": "sim_scale_gamma_inv", "family": "gamma", "link": "inverse", "r_formula": "y ~ 1 + x"},
     {"name": "sim_scale_gamma_inv_glm_ml", "kind": "glm", "oracle": "glm_ml", "data": "sim_scale_gamma_inv", "family": "gamma", "link": "inverse", "r_formula": "y ~ 1 + x"}
   ],
-  "//weights_tier": "WEIGHTS validation suite, fit by the same engines/compare as every other rung. Conventions on top of the main manifest: `weights_col` names a plain per-row prior-weight CSV column (mutually exclusive with the aggregated-binomial `weights` field); rungs WITHOUT a jl_formula are lme4-only (fixed-only models MixedModels cannot fit, or R-only pathologicals) and fit.jl skips them; `gate` marks the two fit-time special gates (dropped_rows in fit.R, unit_identity in fit.rs)."
+  "//weights_tier": "WEIGHTS validation suite, fit by the same engines/compare as every other rung. Conventions on top of the main manifest: `weights_col` names a plain per-row prior-weight CSV column (mutually exclusive with the aggregated-binomial `weights` field); rungs WITHOUT a jl_formula are lme4-only (fixed-only models MixedModels cannot fit, or R-only pathologicals) and fit.jl skips them; `gate` marks the two fit-time special gates (dropped_rows in fit.R, unit_identity in fit.rs).",
+  "//inference_references": "Inference reference JSONs (lmerTest tests, RLRT, ANOVA tables) for the inference layer. One tree, goldens/inference/{lmertest,rlrt,anova}/<name>.json, and this one block; an entry's `kind` (lmertest, rlrt or anova) picks its directory. Entry fields: `name`; `kind`; `data`, the CSV path relative to validation/ (e.g. data/simulated/lmm_intercept.csv, data/empirical/Dyestuff2.csv; a rung dataset is cited by its CSV path, not by its `datasets` name), or null for a fit-free entry, one with no model fit, whose `r_formula` is null too; `r_formula`; optional `factors`, the `data` columns read as factors (as an `m3_goldens` entry's `factors`; each must be a column of the CSV; absent means none); `generator`, the bare file name of the script under tools/ that writes the JSON (e.g. goldens_rlrt.R, not a path; it sources tools/inference_common.R); optional `pending_reference`, a non-empty reason, set while the JSON does not exist yet (generate it with VALIDATION_ONLY=<name> and drop the field in the same change); any further field is kind-specific and owned by the generator that reads it. These are never rows in `datasets` (nor in `m3_goldens`), so the curated sweep, the bit-identity dump and goldens_agq.R see nothing new. Names are unique across kinds and disjoint from the `datasets` and `m3_goldens` names. Checked by tests/inference_references.rs.",
+  "inference_references": [
+    {
+      "name": "rlrt_dyestuff",
+      "kind": "rlrt",
+      "data": "data/empirical/Dyestuff.csv",
+      "r_formula": "Yield ~ 1 + (1 | Batch)",
+      "factors": [
+        "Batch"
+      ],
+      "generator": "goldens_rlrt.R",
+      "seed": 20261001,
+      "nsim": 100000,
+      "paired_draws": 500
+    },
+    {
+      "name": "rlrt_dyestuff2",
+      "kind": "rlrt",
+      "data": "data/empirical/Dyestuff2.csv",
+      "r_formula": "Yield ~ 1 + (1 | Batch)",
+      "factors": [
+        "Batch"
+      ],
+      "generator": "goldens_rlrt.R",
+      "seed": 20261002,
+      "nsim": 100000,
+      "paired_draws": 0
+    },
+    {
+      "name": "rlrt_sleepstudy",
+      "kind": "rlrt",
+      "data": "data/empirical/sleepstudy.csv",
+      "r_formula": "Reaction ~ 1 + Days + (1 | Subject)",
+      "factors": [
+        "Subject"
+      ],
+      "generator": "goldens_rlrt.R",
+      "seed": 20261003,
+      "nsim": 100000,
+      "paired_draws": 500
+    },
+    {
+      "name": "rlrt_cake",
+      "kind": "rlrt",
+      "data": "data/empirical/cake.csv",
+      "r_formula": "angle ~ 1 + recipe*temp + (1 | recipe:replicate)",
+      "factors": [
+        "recipe",
+        "replicate"
+      ],
+      "generator": "goldens_rlrt.R",
+      "seed": 20261004,
+      "nsim": 100000,
+      "paired_draws": 500
+    },
+    {
+      "name": "rlrt_few_unbal",
+      "kind": "rlrt",
+      "data": "data/simulated/sim_rlrt_few_unbal.csv",
+      "r_formula": "y ~ 1 + x + z + (1 | g)",
+      "factors": [
+        "g"
+      ],
+      "generator": "goldens_rlrt.R",
+      "seed": 20261005,
+      "nsim": 100000,
+      "paired_draws": 500
+    },
+    {
+      "name": "rlrt_large_k",
+      "kind": "rlrt",
+      "data": "data/simulated/sim_rlrt_large_k.csv",
+      "r_formula": "y ~ 1 + x + (1 | g)",
+      "factors": [
+        "g"
+      ],
+      "generator": "goldens_rlrt.R",
+      "seed": 20261006,
+      "nsim": 100000,
+      "paired_draws": 0
+    },
+    {
+      "name": "rlrt_reml0_weighted",
+      "kind": "rlrt",
+      "data": "data/simulated/lmm_intercept.csv",
+      "r_formula": "y ~ 1 + x + (1 | g)",
+      "factors": [
+        "g"
+      ],
+      "generator": "goldens_rlrt.R",
+      "nsim": 0,
+      "paired_draws": 0,
+      "weights_col": "w"
+    },
+    {
+      "name": "lmertest_Dyestuff",
+      "kind": "lmertest",
+      "data": "data/empirical/Dyestuff.csv",
+      "r_formula": "Yield ~ 1 + (1 | Batch)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "Batch"
+      ],
+      "reml": true,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_Dyestuff_ml",
+      "kind": "lmertest",
+      "data": "data/empirical/Dyestuff.csv",
+      "r_formula": "Yield ~ 1 + (1 | Batch)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "Batch"
+      ],
+      "reml": false,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_sleepstudy",
+      "kind": "lmertest",
+      "data": "data/empirical/sleepstudy.csv",
+      "r_formula": "Reaction ~ 1 + Days + (1 + Days | Subject)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "Subject"
+      ],
+      "reml": true,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_sleepstudy_ml",
+      "kind": "lmertest",
+      "data": "data/empirical/sleepstudy.csv",
+      "r_formula": "Reaction ~ 1 + Days + (1 + Days | Subject)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "Subject"
+      ],
+      "reml": false,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_Penicillin",
+      "kind": "lmertest",
+      "data": "data/empirical/Penicillin.csv",
+      "r_formula": "diameter ~ 1 + (1 | plate) + (1 | sample)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "plate",
+        "sample"
+      ],
+      "reml": true,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_Penicillin_ml",
+      "kind": "lmertest",
+      "data": "data/empirical/Penicillin.csv",
+      "r_formula": "diameter ~ 1 + (1 | plate) + (1 | sample)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "plate",
+        "sample"
+      ],
+      "reml": false,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_Pastes",
+      "kind": "lmertest",
+      "data": "data/empirical/Pastes.csv",
+      "r_formula": "strength ~ 1 + (1 | batch/cask)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "batch",
+        "cask"
+      ],
+      "reml": true,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_Pastes_ml",
+      "kind": "lmertest",
+      "data": "data/empirical/Pastes.csv",
+      "r_formula": "strength ~ 1 + (1 | batch/cask)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "batch",
+        "cask"
+      ],
+      "reml": false,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_sim_slope_extra",
+      "kind": "lmertest",
+      "data": "data/simulated/sim_slope_extra.csv",
+      "r_formula": "y ~ 1 + x + (1 + x | g1) + (1 + x | g2)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "g1",
+        "g2"
+      ],
+      "reml": true,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_sim_slope_extra_ml",
+      "kind": "lmertest",
+      "data": "data/simulated/sim_slope_extra.csv",
+      "r_formula": "y ~ 1 + x + (1 + x | g1) + (1 + x | g2)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "g1",
+        "g2"
+      ],
+      "reml": false,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_Machines",
+      "kind": "lmertest",
+      "data": "data/empirical/Machines.csv",
+      "r_formula": "score ~ 1 + Machine + (1 + Machine | Worker)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "Worker",
+        "Machine"
+      ],
+      "reml": true,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_Machines_ml",
+      "kind": "lmertest",
+      "data": "data/empirical/Machines.csv",
+      "r_formula": "score ~ 1 + Machine + (1 + Machine | Worker)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "Worker",
+        "Machine"
+      ],
+      "reml": false,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_Oats",
+      "kind": "lmertest",
+      "data": "data/empirical/Oats.csv",
+      "r_formula": "yield ~ 1 + Variety + nitro + (1 | Block/Variety)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "Block",
+        "Variety"
+      ],
+      "reml": true,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_Oats_ml",
+      "kind": "lmertest",
+      "data": "data/empirical/Oats.csv",
+      "r_formula": "yield ~ 1 + Variety + nitro + (1 | Block/Variety)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "Block",
+        "Variety"
+      ],
+      "reml": false,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_cake",
+      "kind": "lmertest",
+      "data": "data/empirical/cake.csv",
+      "r_formula": "angle ~ 1 + recipe*temp + (1 | recipe:replicate)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "recipe",
+        "replicate"
+      ],
+      "reml": true,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_cake_ml",
+      "kind": "lmertest",
+      "data": "data/empirical/cake.csv",
+      "r_formula": "angle ~ 1 + recipe*temp + (1 | recipe:replicate)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "recipe",
+        "replicate"
+      ],
+      "reml": false,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_sim_three_level",
+      "kind": "lmertest",
+      "data": "data/simulated/sim_three_level.csv",
+      "r_formula": "y ~ 1 + x + (1 | g1/g2)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "g1",
+        "g2"
+      ],
+      "reml": true,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_sim_three_level_ml",
+      "kind": "lmertest",
+      "data": "data/simulated/sim_three_level.csv",
+      "r_formula": "y ~ 1 + x + (1 | g1/g2)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "g1",
+        "g2"
+      ],
+      "reml": false,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_sim_max_q_slope",
+      "kind": "lmertest",
+      "data": "data/simulated/sim_max_q_slope.csv",
+      "r_formula": "y ~ 1 + x1 + x2 + x3 + x4 + x5 + x6 + x7 + (1 + x1 + x2 + x3 + x4 + x5 + x6 + x7 | g1)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "g1"
+      ],
+      "reml": true,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_sim_max_q_slope_ml",
+      "kind": "lmertest",
+      "data": "data/simulated/sim_max_q_slope.csv",
+      "r_formula": "y ~ 1 + x1 + x2 + x3 + x4 + x5 + x6 + x7 + (1 + x1 + x2 + x3 + x4 + x5 + x6 + x7 | g1)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "g1"
+      ],
+      "reml": false,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_sim_unbalanced_nested",
+      "kind": "lmertest",
+      "data": "data/simulated/sim_unbalanced_nested.csv",
+      "r_formula": "y ~ 1 + x + (1 | g1/g2)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "g1",
+        "g2"
+      ],
+      "reml": true,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_sim_unbalanced_nested_ml",
+      "kind": "lmertest",
+      "data": "data/simulated/sim_unbalanced_nested.csv",
+      "r_formula": "y ~ 1 + x + (1 | g1/g2)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "g1",
+        "g2"
+      ],
+      "reml": false,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_sim_nested_crossed_mix",
+      "kind": "lmertest",
+      "data": "data/simulated/sim_nested_crossed_mix.csv",
+      "r_formula": "y ~ 1 + x + (1 | g1/g2) + (1 | c1)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "g1",
+        "g2",
+        "c1"
+      ],
+      "reml": true,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_sim_nested_crossed_mix_ml",
+      "kind": "lmertest",
+      "data": "data/simulated/sim_nested_crossed_mix.csv",
+      "r_formula": "y ~ 1 + x + (1 | g1/g2) + (1 | c1)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "g1",
+        "g2",
+        "c1"
+      ],
+      "reml": false,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_lmm_intercept",
+      "kind": "lmertest",
+      "data": "data/simulated/lmm_intercept.csv",
+      "r_formula": "y ~ 1 + x + (1 | g)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "g"
+      ],
+      "reml": true,
+      "weights": "w",
+      "boundary": "none",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_lmm_intercept_ml",
+      "kind": "lmertest",
+      "data": "data/simulated/lmm_intercept.csv",
+      "r_formula": "y ~ 1 + x + (1 | g)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "g"
+      ],
+      "reml": false,
+      "weights": "w",
+      "boundary": "none",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_lmm_slope",
+      "kind": "lmertest",
+      "data": "data/simulated/lmm_slope.csv",
+      "r_formula": "y ~ 1 + x + (1 + x | g)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "g"
+      ],
+      "reml": true,
+      "weights": "w",
+      "boundary": "none",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_lmm_slope_ml",
+      "kind": "lmertest",
+      "data": "data/simulated/lmm_slope.csv",
+      "r_formula": "y ~ 1 + x + (1 + x | g)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "g"
+      ],
+      "reml": false,
+      "weights": "w",
+      "boundary": "none",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_lmm_crossed",
+      "kind": "lmertest",
+      "data": "data/simulated/lmm_crossed.csv",
+      "r_formula": "y ~ 1 + x + (1 + x | g1) + (1 + x | g2)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "g1",
+        "g2"
+      ],
+      "reml": true,
+      "weights": "w",
+      "boundary": "none",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_lmm_crossed_ml",
+      "kind": "lmertest",
+      "data": "data/simulated/lmm_crossed.csv",
+      "r_formula": "y ~ 1 + x + (1 + x | g1) + (1 + x | g2)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "g1",
+        "g2"
+      ],
+      "reml": false,
+      "weights": "w",
+      "boundary": "none",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_path_huge_int",
+      "kind": "lmertest",
+      "data": "data/simulated/path_huge_int.csv",
+      "r_formula": "y ~ 1 + x + (1 | g)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "g"
+      ],
+      "reml": true,
+      "weights": "w",
+      "boundary": "none",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_path_huge_int_ml",
+      "kind": "lmertest",
+      "data": "data/simulated/path_huge_int.csv",
+      "r_formula": "y ~ 1 + x + (1 | g)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "g"
+      ],
+      "reml": false,
+      "weights": "w",
+      "boundary": "none",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_all_ones",
+      "kind": "lmertest",
+      "data": "data/simulated/all_ones.csv",
+      "r_formula": "y ~ 1 + x + (1 + x | g)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "g"
+      ],
+      "reml": true,
+      "weights": "w",
+      "boundary": "none",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_all_ones_ml",
+      "kind": "lmertest",
+      "data": "data/simulated/all_ones.csv",
+      "r_formula": "y ~ 1 + x + (1 + x | g)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "g"
+      ],
+      "reml": false,
+      "weights": "w",
+      "boundary": "none",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_sim_collinear_lmm",
+      "kind": "lmertest",
+      "data": "data/simulated/sim_collinear_lmm.csv",
+      "r_formula": "y ~ 1 + x1 + x2 + x3 + (1 | g)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "g"
+      ],
+      "reml": true,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_sim_collinear_lmm_ml",
+      "kind": "lmertest",
+      "data": "data/simulated/sim_collinear_lmm.csv",
+      "r_formula": "y ~ 1 + x1 + x2 + x3 + (1 | g)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "g"
+      ],
+      "reml": false,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_sim_slope",
+      "kind": "lmertest",
+      "data": "data/simulated/sim_slope.csv",
+      "r_formula": "y ~ 1 + x + (1 + x | g1) + (1 | g2)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "g1",
+        "g2"
+      ],
+      "reml": true,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_sim_slope_ml",
+      "kind": "lmertest",
+      "data": "data/simulated/sim_slope.csv",
+      "r_formula": "y ~ 1 + x + (1 + x | g1) + (1 | g2)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "g1",
+        "g2"
+      ],
+      "reml": false,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_sim_dynrange_lmm",
+      "kind": "lmertest",
+      "data": "data/simulated/sim_dynrange_lmm.csv",
+      "r_formula": "y ~ 1 + u + w + (1 | g)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "g"
+      ],
+      "reml": true,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_sim_dynrange_lmm_ml",
+      "kind": "lmertest",
+      "data": "data/simulated/sim_dynrange_lmm.csv",
+      "r_formula": "y ~ 1 + u + w + (1 | g)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "g"
+      ],
+      "reml": false,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_sim_wide_crossed",
+      "kind": "lmertest",
+      "data": "data/simulated/sim_wide_crossed.csv",
+      "r_formula": "y ~ 1 + x + (1|g1) + (1|c1) + (1|c2) + (1|c3) + (1|c4) + (1|c5) + (1|c6) + (1|c7)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "g1",
+        "c1",
+        "c2",
+        "c3",
+        "c4",
+        "c5",
+        "c6",
+        "c7"
+      ],
+      "reml": true,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_sim_wide_crossed_ml",
+      "kind": "lmertest",
+      "data": "data/simulated/sim_wide_crossed.csv",
+      "r_formula": "y ~ 1 + x + (1|g1) + (1|c1) + (1|c2) + (1|c3) + (1|c4) + (1|c5) + (1|c6) + (1|c7)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "g1",
+        "c1",
+        "c2",
+        "c3",
+        "c4",
+        "c5",
+        "c6",
+        "c7"
+      ],
+      "reml": false,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_sim_wide_slopes",
+      "kind": "lmertest",
+      "data": "data/simulated/sim_wide_slopes.csv",
+      "r_formula": "y ~ 1 + x1 + x2 + x3 + x4 + (1|gp) + (1 + x1 + x2 + x3 + x4 | ge)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "gp",
+        "ge"
+      ],
+      "reml": true,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_sim_wide_slopes_ml",
+      "kind": "lmertest",
+      "data": "data/simulated/sim_wide_slopes.csv",
+      "r_formula": "y ~ 1 + x1 + x2 + x3 + x4 + (1|gp) + (1 + x1 + x2 + x3 + x4 | ge)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "gp",
+        "ge"
+      ],
+      "reml": false,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_Dyestuff2",
+      "kind": "lmertest",
+      "data": "data/empirical/Dyestuff2.csv",
+      "r_formula": "Yield ~ 1 + (1 | Batch)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "Batch"
+      ],
+      "reml": true,
+      "weights": null,
+      "boundary": "singular",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_Dyestuff2_ml",
+      "kind": "lmertest",
+      "data": "data/empirical/Dyestuff2.csv",
+      "r_formula": "Yield ~ 1 + (1 | Batch)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "Batch"
+      ],
+      "reml": false,
+      "weights": null,
+      "boundary": "singular",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_sim_corr_boundary",
+      "kind": "lmertest",
+      "data": "data/simulated/sim_corr_boundary.csv",
+      "r_formula": "y ~ x + (x | g)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "g"
+      ],
+      "reml": true,
+      "weights": null,
+      "boundary": "correlation",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_sim_corr_boundary_ml",
+      "kind": "lmertest",
+      "data": "data/simulated/sim_corr_boundary.csv",
+      "r_formula": "y ~ x + (x | g)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "g"
+      ],
+      "reml": false,
+      "weights": null,
+      "boundary": "correlation",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_sim_factorial",
+      "kind": "lmertest",
+      "data": "data/simulated/sim_factorial.csv",
+      "r_formula": "y ~ g * h + x + (1 + x | subj)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "subj",
+        "g",
+        "h"
+      ],
+      "reml": true,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_sim_factorial_ml",
+      "kind": "lmertest",
+      "data": "data/simulated/sim_factorial.csv",
+      "r_formula": "y ~ g * h + x + (1 + x | subj)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "subj",
+        "g",
+        "h"
+      ],
+      "reml": false,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_sim_near_singular",
+      "kind": "lmertest",
+      "data": "data/simulated/sim_near_singular.csv",
+      "r_formula": "y ~ x + (1 | g)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "g"
+      ],
+      "reml": true,
+      "weights": null,
+      "boundary": "near_singular",
+      "proposal_dependent": false
+    },
+    {
+      "name": "lmertest_sim_near_singular_ml",
+      "kind": "lmertest",
+      "data": "data/simulated/sim_near_singular.csv",
+      "r_formula": "y ~ x + (1 | g)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "g"
+      ],
+      "reml": false,
+      "weights": null,
+      "boundary": "near_singular",
+      "proposal_dependent": false
+    },
+    {
+      "name": "anova_random_pair_sleepstudy",
+      "kind": "anova",
+      "data": "data/empirical/sleepstudy.csv",
+      "r_formula": "Reaction ~ Days + (Days | Subject)",
+      "factors": [
+        "Subject"
+      ],
+      "generator": "goldens_anova.R",
+      "case": "random_pair",
+      "members": [
+        {
+          "fun": "lme4::lmer",
+          "formula": "Reaction ~ Days + (1 | Subject)",
+          "family": "gaussian",
+          "link": "identity",
+          "REML": true,
+          "nAGQ": null,
+          "weights": null
+        },
+        {
+          "fun": "lme4::lmer",
+          "formula": "Reaction ~ Days + (Days | Subject)",
+          "family": "gaussian",
+          "link": "identity",
+          "REML": true,
+          "nAGQ": null,
+          "weights": null
+        }
+      ],
+      "reference": "mixture",
+      "mixture_k": 1
+    },
+    {
+      "name": "anova_random_pair_penicillin",
+      "kind": "anova",
+      "data": "data/empirical/Penicillin.csv",
+      "r_formula": "diameter ~ 1 + (1 | plate) + (1 | sample)",
+      "factors": [
+        "plate",
+        "sample"
+      ],
+      "generator": "goldens_anova.R",
+      "case": "random_pair",
+      "members": [
+        {
+          "fun": "lme4::lmer",
+          "formula": "diameter ~ 1 + (1 | plate)",
+          "family": "gaussian",
+          "link": "identity",
+          "REML": true,
+          "nAGQ": null,
+          "weights": null
+        },
+        {
+          "fun": "lme4::lmer",
+          "formula": "diameter ~ 1 + (1 | plate) + (1 | sample)",
+          "family": "gaussian",
+          "link": "identity",
+          "REML": true,
+          "nAGQ": null,
+          "weights": null
+        }
+      ],
+      "reference": "mixture",
+      "mixture_k": 0
+    },
+    {
+      "name": "anova_random_pair_pastes",
+      "kind": "anova",
+      "data": "data/empirical/Pastes.csv",
+      "r_formula": "strength ~ 1 + (1 | batch/cask)",
+      "factors": [
+        "batch",
+        "cask"
+      ],
+      "generator": "goldens_anova.R",
+      "case": "random_pair",
+      "members": [
+        {
+          "fun": "lme4::lmer",
+          "formula": "strength ~ 1 + (1 | batch)",
+          "family": "gaussian",
+          "link": "identity",
+          "REML": true,
+          "nAGQ": null,
+          "weights": null
+        },
+        {
+          "fun": "lme4::lmer",
+          "formula": "strength ~ 1 + (1 | batch/cask)",
+          "family": "gaussian",
+          "link": "identity",
+          "REML": true,
+          "nAGQ": null,
+          "weights": null
+        }
+      ],
+      "reference": "mixture",
+      "mixture_k": 0
+    },
+    {
+      "name": "anova_ml_pair_sleepstudy_fixed",
+      "kind": "anova",
+      "data": "data/empirical/sleepstudy.csv",
+      "r_formula": "Reaction ~ Days + (Days | Subject)",
+      "factors": [
+        "Subject"
+      ],
+      "generator": "goldens_anova.R",
+      "case": "ml_pair",
+      "members": [
+        {
+          "fun": "lme4::lmer",
+          "formula": "Reaction ~ 1 + (Days | Subject)",
+          "family": "gaussian",
+          "link": "identity",
+          "REML": false,
+          "nAGQ": null,
+          "weights": null
+        },
+        {
+          "fun": "lme4::lmer",
+          "formula": "Reaction ~ Days + (Days | Subject)",
+          "family": "gaussian",
+          "link": "identity",
+          "REML": false,
+          "nAGQ": null,
+          "weights": null
+        }
+      ],
+      "reference": "chisq"
+    },
+    {
+      "name": "anova_ml_pair_sim_factorial",
+      "kind": "anova",
+      "data": "data/simulated/sim_factorial.csv",
+      "r_formula": "y ~ g * h + x + (1 + x | subj)",
+      "factors": [
+        "subj",
+        "g",
+        "h"
+      ],
+      "generator": "goldens_anova.R",
+      "case": "ml_pair",
+      "members": [
+        {
+          "fun": "lme4::lmer",
+          "formula": "y ~ g + h + x + (1 + x | subj)",
+          "family": "gaussian",
+          "link": "identity",
+          "REML": false,
+          "nAGQ": null,
+          "weights": null
+        },
+        {
+          "fun": "lme4::lmer",
+          "formula": "y ~ g * h + x + (1 + x | subj)",
+          "family": "gaussian",
+          "link": "identity",
+          "REML": false,
+          "nAGQ": null,
+          "weights": null
+        }
+      ],
+      "reference": "chisq"
+    },
+    {
+      "name": "anova_ml_pair_sleepstudy_both",
+      "kind": "anova",
+      "data": "data/empirical/sleepstudy.csv",
+      "r_formula": "Reaction ~ Days + (Days | Subject)",
+      "factors": [
+        "Subject"
+      ],
+      "generator": "goldens_anova.R",
+      "case": "ml_pair",
+      "members": [
+        {
+          "fun": "lme4::lmer",
+          "formula": "Reaction ~ 1 + (1 | Subject)",
+          "family": "gaussian",
+          "link": "identity",
+          "REML": false,
+          "nAGQ": null,
+          "weights": null
+        },
+        {
+          "fun": "lme4::lmer",
+          "formula": "Reaction ~ Days + (Days | Subject)",
+          "family": "gaussian",
+          "link": "identity",
+          "REML": false,
+          "nAGQ": null,
+          "weights": null
+        }
+      ],
+      "reference": "mixture",
+      "mixture_k": 2
+    },
+    {
+      "name": "anova_ranova_sleepstudy_int",
+      "kind": "anova",
+      "data": "data/empirical/sleepstudy.csv",
+      "r_formula": "Reaction ~ Days + (1 | Subject)",
+      "factors": [
+        "Subject"
+      ],
+      "generator": "goldens_anova.R",
+      "case": "ranova",
+      "members": [
+        {
+          "fun": "lme4::lmer",
+          "formula": "Reaction ~ Days + (1 | Subject)",
+          "family": "gaussian",
+          "link": "identity",
+          "REML": true,
+          "nAGQ": null,
+          "weights": null
+        }
+      ],
+      "reference": "envelope",
+      "rlrt_entry": "rlrt_sleepstudy"
+    },
+    {
+      "name": "anova_ranova_sleepstudy_slope",
+      "kind": "anova",
+      "data": "data/empirical/sleepstudy.csv",
+      "r_formula": "Reaction ~ Days + (Days | Subject)",
+      "factors": [
+        "Subject"
+      ],
+      "generator": "goldens_anova.R",
+      "case": "ranova",
+      "members": [
+        {
+          "fun": "lme4::lmer",
+          "formula": "Reaction ~ Days + (Days | Subject)",
+          "family": "gaussian",
+          "link": "identity",
+          "REML": true,
+          "nAGQ": null,
+          "weights": null
+        }
+      ],
+      "reference": "mixture",
+      "mixture_k": 1
+    },
+    {
+      "name": "anova_ranova_penicillin",
+      "kind": "anova",
+      "data": "data/empirical/Penicillin.csv",
+      "r_formula": "diameter ~ 1 + (1 | plate) + (1 | sample)",
+      "factors": [
+        "plate",
+        "sample"
+      ],
+      "generator": "goldens_anova.R",
+      "case": "ranova",
+      "members": [
+        {
+          "fun": "lme4::lmer",
+          "formula": "diameter ~ 1 + (1 | plate) + (1 | sample)",
+          "family": "gaussian",
+          "link": "identity",
+          "REML": true,
+          "nAGQ": null,
+          "weights": null
+        }
+      ],
+      "reference": "mixture",
+      "mixture_k": 0
+    },
+    {
+      "name": "anova_ranova_pastes",
+      "kind": "anova",
+      "data": "data/empirical/Pastes.csv",
+      "r_formula": "strength ~ 1 + (1 | batch/cask)",
+      "factors": [
+        "batch",
+        "cask"
+      ],
+      "generator": "goldens_anova.R",
+      "case": "ranova",
+      "members": [
+        {
+          "fun": "lme4::lmer",
+          "formula": "strength ~ 1 + (1 | batch/cask)",
+          "family": "gaussian",
+          "link": "identity",
+          "REML": true,
+          "nAGQ": null,
+          "weights": null
+        }
+      ],
+      "reference": "mixture",
+      "mixture_k": 0
+    },
+    {
+      "name": "anova_ranova_dyestuff",
+      "kind": "anova",
+      "data": "data/empirical/Dyestuff.csv",
+      "r_formula": "Yield ~ 1 + (1 | Batch)",
+      "factors": [
+        "Batch"
+      ],
+      "generator": "goldens_anova.R",
+      "case": "ranova",
+      "members": [
+        {
+          "fun": "lme4::lmer",
+          "formula": "Yield ~ 1 + (1 | Batch)",
+          "family": "gaussian",
+          "link": "identity",
+          "REML": true,
+          "nAGQ": null,
+          "weights": null
+        }
+      ],
+      "reference": "envelope",
+      "rlrt_entry": "rlrt_dyestuff"
+    },
+    {
+      "name": "anova_ranova_lmm_intercept",
+      "kind": "anova",
+      "data": "data/simulated/lmm_intercept.csv",
+      "r_formula": "y ~ x + (1 | g)",
+      "factors": [
+        "g"
+      ],
+      "generator": "goldens_anova.R",
+      "case": "ranova",
+      "members": [
+        {
+          "fun": "lme4::lmer",
+          "formula": "y ~ x + (1 | g)",
+          "family": "gaussian",
+          "link": "identity",
+          "REML": true,
+          "nAGQ": null,
+          "weights": "w"
+        }
+      ],
+      "reference": "mixture",
+      "mixture_k": 0,
+      "rlrt_entry": "rlrt_reml0_weighted"
+    },
+    {
+      "name": "anova_ols_pair_machines",
+      "kind": "anova",
+      "data": "data/empirical/Machines.csv",
+      "r_formula": "score ~ Machine",
+      "factors": [
+        "Machine"
+      ],
+      "generator": "goldens_anova.R",
+      "case": "ols_pair",
+      "members": [
+        {
+          "fun": "stats::lm",
+          "formula": "score ~ 1",
+          "family": "gaussian",
+          "link": "identity",
+          "REML": null,
+          "nAGQ": null,
+          "weights": null
+        },
+        {
+          "fun": "stats::lm",
+          "formula": "score ~ Machine",
+          "family": "gaussian",
+          "link": "identity",
+          "REML": null,
+          "nAGQ": null,
+          "weights": null
+        }
+      ],
+      "reference": "f"
+    },
+    {
+      "name": "anova_ols_pair_wls_basic",
+      "kind": "anova",
+      "data": "data/simulated/wls_basic.csv",
+      "r_formula": "y ~ x1 + x2",
+      "factors": [],
+      "generator": "goldens_anova.R",
+      "case": "ols_pair",
+      "members": [
+        {
+          "fun": "stats::lm",
+          "formula": "y ~ x1",
+          "family": "gaussian",
+          "link": "identity",
+          "REML": null,
+          "nAGQ": null,
+          "weights": "w"
+        },
+        {
+          "fun": "stats::lm",
+          "formula": "y ~ x1 + x2",
+          "family": "gaussian",
+          "link": "identity",
+          "REML": null,
+          "nAGQ": null,
+          "weights": "w"
+        }
+      ],
+      "reference": "f"
+    },
+    {
+      "name": "anova_glm_pair_cbpp",
+      "kind": "anova",
+      "data": "data/empirical/cbpp.csv",
+      "r_formula": "cbind(incidence, size - incidence) ~ period",
+      "factors": [
+        "period"
+      ],
+      "generator": "goldens_anova.R",
+      "case": "glm_pair",
+      "members": [
+        {
+          "fun": "stats::glm",
+          "formula": "cbind(incidence, size - incidence) ~ 1",
+          "family": "binomial",
+          "link": "logit",
+          "REML": null,
+          "nAGQ": null,
+          "weights": null
+        },
+        {
+          "fun": "stats::glm",
+          "formula": "cbind(incidence, size - incidence) ~ period",
+          "family": "binomial",
+          "link": "logit",
+          "REML": null,
+          "nAGQ": null,
+          "weights": null
+        }
+      ],
+      "reference": "chisq"
+    },
+    {
+      "name": "anova_glm_pair_grouseticks",
+      "kind": "anova",
+      "data": "data/empirical/grouseticks.csv",
+      "r_formula": "TICKS ~ YEAR + cHEIGHT",
+      "factors": [
+        "YEAR"
+      ],
+      "generator": "goldens_anova.R",
+      "case": "glm_pair",
+      "members": [
+        {
+          "fun": "stats::glm",
+          "formula": "TICKS ~ YEAR",
+          "family": "poisson",
+          "link": "log",
+          "REML": null,
+          "nAGQ": null,
+          "weights": null
+        },
+        {
+          "fun": "stats::glm",
+          "formula": "TICKS ~ YEAR + cHEIGHT",
+          "family": "poisson",
+          "link": "log",
+          "REML": null,
+          "nAGQ": null,
+          "weights": null
+        }
+      ],
+      "reference": "chisq"
+    },
+    {
+      "name": "anova_glm_pair_glm_gamma",
+      "kind": "anova",
+      "data": "data/simulated/glm_gamma.csv",
+      "r_formula": "y ~ 1 + x + grp",
+      "factors": [
+        "grp"
+      ],
+      "generator": "goldens_anova.R",
+      "case": "glm_pair",
+      "members": [
+        {
+          "fun": "stats::glm",
+          "formula": "y ~ 1 + x",
+          "family": "gamma",
+          "link": "log",
+          "REML": null,
+          "nAGQ": null,
+          "weights": "w"
+        },
+        {
+          "fun": "stats::glm",
+          "formula": "y ~ 1 + x + grp",
+          "family": "gamma",
+          "link": "log",
+          "REML": null,
+          "nAGQ": null,
+          "weights": "w"
+        }
+      ],
+      "reference": "wald_f"
+    },
+    {
+      "name": "anova_glmm_pair_cbpp",
+      "kind": "anova",
+      "data": "data/empirical/cbpp.csv",
+      "r_formula": "cbind(incidence, size - incidence) ~ period + (1 | herd)",
+      "factors": [
+        "herd",
+        "period"
+      ],
+      "generator": "goldens_anova.R",
+      "case": "glmm_pair",
+      "members": [
+        {
+          "fun": "lme4::glmer",
+          "formula": "cbind(incidence, size - incidence) ~ 1 + (1 | herd)",
+          "family": "binomial",
+          "link": "logit",
+          "REML": null,
+          "nAGQ": 1,
+          "weights": null,
+          "tolPwrss": 1e-13
+        },
+        {
+          "fun": "lme4::glmer",
+          "formula": "cbind(incidence, size - incidence) ~ period + (1 | herd)",
+          "family": "binomial",
+          "link": "logit",
+          "REML": null,
+          "nAGQ": 1,
+          "weights": null,
+          "tolPwrss": 1e-13
+        }
+      ],
+      "reference": "chisq"
+    },
+    {
+      "name": "anova_glmm_vs_glm_cbpp",
+      "kind": "anova",
+      "data": "data/empirical/cbpp.csv",
+      "r_formula": "cbind(incidence, size - incidence) ~ period + (1 | herd)",
+      "factors": [
+        "herd",
+        "period"
+      ],
+      "generator": "goldens_anova.R",
+      "case": "glmm_vs_glm",
+      "members": [
+        {
+          "fun": "stats::glm",
+          "formula": "cbind(incidence, size - incidence) ~ period",
+          "family": "binomial",
+          "link": "logit",
+          "REML": null,
+          "nAGQ": null,
+          "weights": null
+        },
+        {
+          "fun": "lme4::glmer",
+          "formula": "cbind(incidence, size - incidence) ~ period + (1 | herd)",
+          "family": "binomial",
+          "link": "logit",
+          "REML": null,
+          "nAGQ": 1,
+          "weights": null,
+          "tolPwrss": 1e-13
+        }
+      ],
+      "reference": "mixture",
+      "mixture_k": 0
+    },
+    {
+      "name": "anova_glmm_vs_glm_sim_binomial_slope1",
+      "kind": "anova",
+      "data": "data/simulated/sim_binomial_slope1.csv",
+      "r_formula": "y ~ x + (1 | g)",
+      "factors": [
+        "g"
+      ],
+      "generator": "goldens_anova.R",
+      "case": "glmm_vs_glm",
+      "members": [
+        {
+          "fun": "stats::glm",
+          "formula": "y ~ x",
+          "family": "binomial",
+          "link": "logit",
+          "REML": null,
+          "nAGQ": null,
+          "weights": null
+        },
+        {
+          "fun": "lme4::glmer",
+          "formula": "y ~ x + (1 | g)",
+          "family": "binomial",
+          "link": "logit",
+          "REML": null,
+          "nAGQ": 7,
+          "weights": null,
+          "tolPwrss": 1e-13
+        }
+      ],
+      "reference": "mixture",
+      "mixture_k": 0
+    },
+    {
+      "name": "anova_glmm_pair_grouseticks",
+      "kind": "anova",
+      "data": "data/empirical/grouseticks.csv",
+      "r_formula": "TICKS ~ YEAR + cHEIGHT + (1 | BROOD)",
+      "factors": [
+        "YEAR",
+        "BROOD"
+      ],
+      "generator": "goldens_anova.R",
+      "case": "glmm_pair",
+      "members": [
+        {
+          "fun": "lme4::glmer",
+          "formula": "TICKS ~ YEAR + (1 | BROOD)",
+          "family": "poisson",
+          "link": "log",
+          "REML": null,
+          "nAGQ": 1,
+          "weights": null,
+          "tolPwrss": 1e-13
+        },
+        {
+          "fun": "lme4::glmer",
+          "formula": "TICKS ~ YEAR + cHEIGHT + (1 | BROOD)",
+          "family": "poisson",
+          "link": "log",
+          "REML": null,
+          "nAGQ": 1,
+          "weights": null,
+          "tolPwrss": 1e-13
+        }
+      ],
+      "reference": "chisq"
+    },
+    {
+      "name": "anova_glmm_pair_sim_binomial_slope1",
+      "kind": "anova",
+      "data": "data/simulated/sim_binomial_slope1.csv",
+      "r_formula": "y ~ x + (1 + x | g)",
+      "factors": [
+        "g"
+      ],
+      "generator": "goldens_anova.R",
+      "case": "glmm_pair",
+      "members": [
+        {
+          "fun": "lme4::glmer",
+          "formula": "y ~ x + (1 | g)",
+          "family": "binomial",
+          "link": "logit",
+          "REML": null,
+          "nAGQ": 1,
+          "weights": null,
+          "tolPwrss": 1e-13
+        },
+        {
+          "fun": "lme4::glmer",
+          "formula": "y ~ x + (1 + x | g)",
+          "family": "binomial",
+          "link": "logit",
+          "REML": null,
+          "nAGQ": 1,
+          "weights": null,
+          "tolPwrss": 1e-13
+        }
+      ],
+      "reference": "mixture",
+      "mixture_k": 1
+    },
+    {
+      "name": "anova_glmm_vs_glm_sim_nb",
+      "kind": "anova",
+      "data": "data/simulated/sim_nb.csv",
+      "r_formula": "y ~ 1 + x + grp + (1 | cluster)",
+      "factors": [
+        "cluster",
+        "grp"
+      ],
+      "generator": "goldens_anova.R",
+      "case": "glmm_vs_glm",
+      "members": [
+        {
+          "fun": "MASS::glm.nb",
+          "formula": "y ~ 1 + x + grp",
+          "family": "negativebinomial",
+          "link": "log",
+          "REML": null,
+          "nAGQ": null,
+          "weights": null
+        },
+        {
+          "fun": "lme4::glmer.nb",
+          "formula": "y ~ 1 + x + grp + (1 | cluster)",
+          "family": "negativebinomial",
+          "link": "log",
+          "REML": null,
+          "nAGQ": 1,
+          "weights": null,
+          "tolPwrss": 1e-13
+        }
+      ],
+      "reference": "mixture",
+      "mixture_k": 0
+    },
+    {
+      "name": "anova_gamma_glmm_vs_glm_sim_gamma",
+      "kind": "anova",
+      "data": "data/simulated/sim_gamma.csv",
+      "r_formula": "y ~ 1 + x + grp + (1 | cluster)",
+      "factors": [
+        "cluster",
+        "grp"
+      ],
+      "generator": "goldens_anova.R",
+      "case": "gamma_glmm_vs_glm",
+      "members": [
+        {
+          "fun": "glmmTMB::glmmTMB",
+          "formula": "y ~ 1 + x + grp",
+          "family": "gamma",
+          "link": "log",
+          "REML": false,
+          "nAGQ": null,
+          "weights": null
+        },
+        {
+          "fun": "glmmTMB::glmmTMB",
+          "formula": "y ~ 1 + x + grp + (1 | cluster)",
+          "family": "gamma",
+          "link": "log",
+          "REML": false,
+          "nAGQ": null,
+          "weights": null
+        },
+        {
+          "fun": "stats::glm",
+          "formula": "y ~ 1 + x + grp",
+          "family": "gamma",
+          "link": "log",
+          "REML": null,
+          "nAGQ": null,
+          "weights": null
+        },
+        {
+          "fun": "lme4::glmer",
+          "formula": "y ~ 1 + x + grp + (1 | cluster)",
+          "family": "gamma",
+          "link": "log",
+          "REML": null,
+          "nAGQ": 1,
+          "weights": null,
+          "tolPwrss": 1e-13
+        }
+      ],
+      "reference": "mixture",
+      "mixture_k": 0
+    },
+    {
+      "name": "anova_mixture_points",
+      "kind": "anova",
+      "data": null,
+      "r_formula": null,
+      "generator": "goldens_anova.R",
+      "case": "mixture_points",
+      "k": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "t": [
+        0,
+        1e-14,
+        0.5,
+        2.7,
+        6.84,
+        42.837,
+        107.2,
+        300
+      ]
+    },
+    {
+      "name": "lmertest_anova_sim_factorial",
+      "kind": "lmertest",
+      "data": "data/simulated/sim_factorial.csv",
+      "r_formula": "y ~ g * h + x + (1 + x | subj)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "subj",
+        "g",
+        "h"
+      ],
+      "reml": true,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": true
+    },
+    {
+      "name": "lmertest_anova_sim_factorial_ml",
+      "kind": "lmertest",
+      "data": "data/simulated/sim_factorial.csv",
+      "r_formula": "y ~ g * h + x + (1 + x | subj)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "subj",
+        "g",
+        "h"
+      ],
+      "reml": false,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": true
+    },
+    {
+      "name": "lmertest_anova_sim_factorial_empty",
+      "kind": "lmertest",
+      "data": "data/simulated/sim_factorial_empty.csv",
+      "r_formula": "y ~ g * h + x + (1 + x | subj)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "subj",
+        "g",
+        "h"
+      ],
+      "reml": true,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": true
+    },
+    {
+      "name": "lmertest_anova_Machines",
+      "kind": "lmertest",
+      "data": "data/empirical/Machines.csv",
+      "r_formula": "score ~ 1 + Machine + (1 + Machine | Worker)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "Worker",
+        "Machine"
+      ],
+      "reml": true,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": true
+    },
+    {
+      "name": "lmertest_anova_Machines_ml",
+      "kind": "lmertest",
+      "data": "data/empirical/Machines.csv",
+      "r_formula": "score ~ 1 + Machine + (1 + Machine | Worker)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "Worker",
+        "Machine"
+      ],
+      "reml": false,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": true
+    },
+    {
+      "name": "lmertest_anova_Oats",
+      "kind": "lmertest",
+      "data": "data/empirical/Oats.csv",
+      "r_formula": "yield ~ 1 + Variety + nitro + (1 | Block/Variety)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "Block",
+        "Variety"
+      ],
+      "reml": true,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": true
+    },
+    {
+      "name": "lmertest_anova_Oats_ml",
+      "kind": "lmertest",
+      "data": "data/empirical/Oats.csv",
+      "r_formula": "yield ~ 1 + Variety + nitro + (1 | Block/Variety)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "Block",
+        "Variety"
+      ],
+      "reml": false,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": true
+    },
+    {
+      "name": "lmertest_anova_cake",
+      "kind": "lmertest",
+      "data": "data/empirical/cake.csv",
+      "r_formula": "angle ~ 1 + recipe*temp + (1 | recipe:replicate)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "recipe",
+        "replicate"
+      ],
+      "reml": true,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": true
+    },
+    {
+      "name": "lmertest_anova_cake_ml",
+      "kind": "lmertest",
+      "data": "data/empirical/cake.csv",
+      "r_formula": "angle ~ 1 + recipe*temp + (1 | recipe:replicate)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "recipe",
+        "replicate"
+      ],
+      "reml": false,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": true
+    },
+    {
+      "name": "lmertest_anova_sleepstudy",
+      "kind": "lmertest",
+      "data": "data/empirical/sleepstudy.csv",
+      "r_formula": "Reaction ~ 1 + Days + (1 + Days | Subject)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "Subject"
+      ],
+      "reml": true,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": true
+    },
+    {
+      "name": "lmertest_anova_sleepstudy_ml",
+      "kind": "lmertest",
+      "data": "data/empirical/sleepstudy.csv",
+      "r_formula": "Reaction ~ 1 + Days + (1 + Days | Subject)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "Subject"
+      ],
+      "reml": false,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": true
+    },
+    {
+      "name": "lmertest_anova_sim_slope",
+      "kind": "lmertest",
+      "data": "data/simulated/sim_slope.csv",
+      "r_formula": "y ~ 1 + x + (1 + x | g1) + (1 | g2)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "g1",
+        "g2"
+      ],
+      "reml": true,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": true
+    },
+    {
+      "name": "lmertest_anova_sim_slope_ml",
+      "kind": "lmertest",
+      "data": "data/simulated/sim_slope.csv",
+      "r_formula": "y ~ 1 + x + (1 + x | g1) + (1 | g2)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "g1",
+        "g2"
+      ],
+      "reml": false,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": true
+    },
+    {
+      "name": "lmertest_anova_sim_factorial_gx",
+      "kind": "lmertest",
+      "data": "data/simulated/sim_factorial.csv",
+      "r_formula": "y ~ g * x + (1 | subj)",
+      "generator": "goldens_lmertest.R",
+      "factors": [
+        "subj",
+        "g",
+        "h"
+      ],
+      "reml": true,
+      "weights": null,
+      "boundary": "none",
+      "proposal_dependent": true
+    },
+    {
+      "name": "anova_car_glmm_sim_factorial_bern",
+      "kind": "anova",
+      "data": "data/simulated/sim_factorial_bern.csv",
+      "r_formula": "y ~ g * h + x + (1 | subj)",
+      "factors": [
+        "subj",
+        "g",
+        "h"
+      ],
+      "generator": "goldens_anova.R",
+      "case": "car_glmm",
+      "members": [
+        {
+          "fun": "lme4::glmer",
+          "formula": "y ~ g * h + x + (1 | subj)",
+          "family": "binomial",
+          "link": "logit",
+          "REML": null,
+          "nAGQ": 1,
+          "weights": null,
+          "tolPwrss": 1e-13
+        }
+      ],
+      "contr_sum": [
+        "g",
+        "h"
+      ]
+    },
+    {
+      "name": "anova_car_glm_sim_factorial_bern",
+      "kind": "anova",
+      "data": "data/simulated/sim_factorial_bern.csv",
+      "r_formula": "y ~ g * h + x",
+      "factors": [
+        "g",
+        "h"
+      ],
+      "generator": "goldens_anova.R",
+      "case": "car_glm",
+      "members": [
+        {
+          "fun": "stats::glm",
+          "formula": "y ~ g * h + x",
+          "family": "binomial",
+          "link": "logit",
+          "REML": null,
+          "nAGQ": null,
+          "weights": null
+        }
+      ],
+      "contr_sum": [
+        "g",
+        "h"
+      ]
+    },
+    {
+      "name": "anova_car_lm_sim_factorial",
+      "kind": "anova",
+      "data": "data/simulated/sim_factorial.csv",
+      "r_formula": "y ~ g * h + x",
+      "factors": [
+        "g",
+        "h"
+      ],
+      "generator": "goldens_anova.R",
+      "case": "car_lm",
+      "members": [
+        {
+          "fun": "stats::lm",
+          "formula": "y ~ g * h + x",
+          "family": "gaussian",
+          "link": "identity",
+          "REML": null,
+          "nAGQ": null,
+          "weights": null
+        }
+      ],
+      "contr_sum": [
+        "g",
+        "h"
+      ]
+    },
+    {
+      "name": "anova_linear_hypothesis_glm_gamma",
+      "kind": "anova",
+      "data": "data/simulated/glm_gamma.csv",
+      "r_formula": "y ~ 1 + x + grp",
+      "factors": [
+        "grp"
+      ],
+      "generator": "goldens_anova.R",
+      "case": "linear_hypothesis",
+      "members": [
+        {
+          "fun": "stats::glm",
+          "formula": "y ~ 1 + x + grp",
+          "family": "gamma",
+          "link": "log",
+          "REML": null,
+          "nAGQ": null,
+          "weights": "w"
+        }
+      ],
+      "tested": [
+        "grpb"
+      ]
+    },
+    {
+      "name": "anova_nonmarginal_sim_factorial",
+      "kind": "anova",
+      "data": "data/simulated/sim_factorial.csv",
+      "r_formula": "y ~ x + x:g + (1 + x | subj)",
+      "factors": [
+        "subj",
+        "g"
+      ],
+      "generator": "goldens_anova.R",
+      "case": "nonmarginal",
+      "members": [
+        {
+          "fun": "lme4::lmer",
+          "formula": "y ~ x + x:g + (1 + x | subj)",
+          "family": "gaussian",
+          "link": "identity",
+          "REML": true,
+          "nAGQ": null,
+          "weights": null
+        },
+        {
+          "fun": "stats::lm",
+          "formula": "y ~ x + x:g",
+          "family": "gaussian",
+          "link": "identity",
+          "REML": null,
+          "nAGQ": null,
+          "weights": null
+        }
+      ]
+    }
+  ]
 }

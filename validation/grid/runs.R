@@ -51,9 +51,14 @@ source(file.path(runs_script_dir, "engines", "versions.R"))
 # is never an accuracy reference, which is what the subset test and the `timed`
 # test below enforce. In practice that is runs/<oracle>/last/: promote.sh moves
 # every older run to scratch/, which this search does not read.
+#
+# lmerTest has a run directory and is found the same way, but it is not in
+# ORACLES: its fit is lme4's, so gates 1 to 3 never read it, and only compare.R's
+# gate 5 (the per-coefficient Satterthwaite df) does.
 ORACLES <- c("lme4", "glmmTMB", "GLMMadaptive", "MixedModels")
 ENGINE_DIR <- c(lme4 = "lme4", glmmTMB = "glmmtmb",
-                GLMMadaptive = "glmmadaptive", MixedModels = "mixedmodels")
+                GLMMadaptive = "glmmadaptive", MixedModels = "mixedmodels",
+                lmerTest = "lmertest")
 
 # Both files are checked before either is parsed: jsonlite treats a missing path
 # as a JSON string and reports a lexical error pointing at the path, which tells

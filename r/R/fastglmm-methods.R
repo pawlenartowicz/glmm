@@ -103,32 +103,39 @@ print.fastglmm <- function(x, digits = max(3L, getOption("digits") - 3L), ...) {
 #' lme4's blocks in lme4's order: method line, formula, data, the criterion
 #' (`REML criterion at convergence` on an LMM, the `AIC BIC logLik deviance
 #' df.resid` row on an ML fit), scaled residuals, random effects with
-#' variances, the observation/group counts, the Wald-z coefficient table,
-#' the correlation of fixed effects, and a footer. The Python port's
+#' variances, the observation/group counts, the coefficient table, the
+#' correlation of fixed effects, and a footer. The Python port's
 #' `Fit.summary()` prints the same blocks - change together.
 #'
-#' The coefficient table carries Wald z statistics and normal-based p-values
-#' for all families: the kernel surfaces no residual df, so there is no t and
-#' no Satterthwaite/Kenward-Roger. The REML criterion is printed on LMMs
-#' where lme4 prints it; the AIC row is printed only on ML fits, because a
-#' REML AIC invites exactly the across-models comparison it is not valid for.
+#' The coefficient table follows lmerTest, `lm` and `glm`. A Gaussian mixed
+#' model gets t tests on lmerTest's Satterthwaite degrees of freedom, with a
+#' `df` column, on REML and ML fits. OLS and the Gamma and inverse-Gaussian
+#' GLMs with an estimated dispersion get t tests on the residual df `n - p`,
+#' printed in the footer (with `summary.lm`'s residual standard error and
+#' R-squared lines on OLS). Binomial, Poisson and negative-binomial models, a
+#' held dispersion and every GLMM get Wald z tests on the normal, as `glm` and
+#' `glmer` do. A Gaussian mixed model fitted with `satterthwaite = FALSE`
+#' gets z tests too, and the footer says the df were not computed. The t
+#' p-values are the kernel's. The REML criterion is printed on LMMs where lme4
+#' prints it; the AIC row is printed only on ML fits, because a REML AIC
+#' invites exactly the across-models comparison it is not valid for.
 #' `glance()` returns AIC/BIC on request either way.
 #'
 #' @param object a [fastglmm] fit.
 #' @param ... unused.
 #' @return An object of class `"summary.fastglmm"` with `coefficients`
-#'   (`Estimate`, `Std. Error`, `z value`, `Pr(>|z|)`), `criterion`,
+#'   (`Estimate`, `Std. Error`, `df` on a Gaussian mixed model, then
+#'   `t value` and `Pr(>|t|)`, or `z value` and `Pr(>|z|)`), `criterion`,
 #'   `scaled_residuals` (`NULL` when the fit did not converge) and
 #'   `corr_fixed` (`NULL` when there is one coefficient).
 #' @export
 summary.fastglmm <- function(object, ...) {
-  wald <- .wald(object)
-  coefficients <- cbind(
-    Estimate = object$beta,
-    `Std. Error` = object$se,
-    `z value` = wald$z,
-    `Pr(>|z|)` = wald$p
-  )
+  tests <- .coef_tests(object)
+  coefficients <- cbind(Estimate = object$beta, `Std. Error` = object$se)
+  if (tests$df_column) coefficients <- cbind(coefficients, df = tests$df)
+  coefficients <- cbind(coefficients, tests$statistic, tests$p)
+  colnames(coefficients)[ncol(coefficients) - 1:0] <-
+    c(paste(tests$test, "value"), sprintf("Pr(>|%s|)", tests$test))
   ll <- object$loglik
   criterion <- if (object$reml) {
     c("REML criterion at convergence" = -2 * ll)
@@ -189,10 +196,28 @@ print.summary.fastglmm <- function(x,
     cat("Number of obs:", object$nobs, "\n\n")
   }
   cat("Fixed effects:\n")
-  stats::printCoefmat(x$coefficients, digits = digits, na.print = "NA")
+  # The df column is zapped as lme4's print.summary.merMod zaps it.
+  if ("df" %in% colnames(x$coefficients)) {
+    stats::printCoefmat(x$coefficients, digits = digits, na.print = "NA", zap.ind = 3L)
+  } else {
+    stats::printCoefmat(x$coefficients, digits = digits, na.print = "NA")
+  }
   if (any(object$aliased)) {
     cat("(", sum(object$aliased),
         " coefficient(s) not defined because of singularities)\n", sep = "")
+  }
+  rdf <- .residual_df(object)
+  if (!is.null(rdf) && identical(object$family_name, "gaussian")) {
+    # summary.lm's two lines, printed as print.summary.lm prints them, except
+    # that a value that is not finite prints NA. The Python port prints the
+    # same - change together.
+    num <- function(v, f) if (is.finite(v)) f(v) else "NA"
+    sigma <- if (rdf > 0) sqrt(object$rss / rdf) else NaN
+    cat("\nResidual standard error: ", num(sigma, function(v) format(signif(v, digits))),
+        " on ", rdf, " degrees of freedom\n", sep = "")
+    cat("Multiple R-squared: ", num(object$r_squared, function(v) formatC(v, digits = digits)))
+    cat(",\tAdjusted R-squared: ",
+        num(object$adj_r_squared, function(v) formatC(v, digits = digits)), "\n")
   }
   if (!is.null(x$corr_fixed)) {
     # Full names on both axes (lme4 abbreviates the columns) - the Python
@@ -206,13 +231,14 @@ print.summary.fastglmm <- function(x,
   cat("\n")
   label <- .dispersion_label(object)
   if (!is.null(label)) {
-    cat(label, ": ", format(object$dispersion, digits = digits), "\n", sep = "")
+    cat(label, ": ", format(object$dispersion, digits = digits),
+        if (!is.null(rdf)) paste(" on", rdf, "degrees of freedom"), "\n", sep = "")
   }
   cat("Optimizer evaluations: ", object$n_eval,
       ", converged: ", object$converged, "\n", sep = "")
   if (object$singular) cat("boundary (singular) fit: see help('isSingular')\n")
-  cat("z value / Pr(>|z|) are Wald z on the asymptotic normal; no t or ",
-      "residual df is reported.\n", sep = "")
+  footer <- .df_footer(object)
+  if (!is.null(footer)) cat(footer, "\n", sep = "")
   # Mirrors Summary.text() (python/glmm/summary.py) - change together. NROW()
   # keeps objects saved before `warnings` existed printable.
   w <- object$warnings
@@ -383,17 +409,24 @@ model.frame.fastglmm <- function(formula, ...) formula$frame
 
 #' Wald confidence intervals
 #'
-#' Normal-approximation intervals off the full Wald covariance matrix
-#' (`vcov()`). `method = "profile"` and `method = "boot"` are not
-#' available: the engine has no profiling machinery, and bootstrap needs
-#' refitting infrastructure not built yet.
+#' Intervals off the Wald standard errors that follow [summary()][summary.fastglmm]
+#' coefficient by coefficient: the t quantile on the row's degrees of freedom
+#' where the summary tests with t (Satterthwaite df on a Gaussian mixed model,
+#' `n - p` on OLS and the Gamma and inverse-Gaussian GLMs, as [stats::confint.lm]),
+#' the normal quantile where it tests with z. On a Gaussian mixed model fitted
+#' with `satterthwaite = FALSE` the intervals are normal and a message says the
+#' df were not computed. The Python port's `Fit.confint()` computes the same
+#' intervals through the same kernel function. `method = "profile"` and
+#' `method = "boot"` are not available: the engine has no profiling
+#' machinery, and bootstrap needs refitting infrastructure not built yet.
 #'
 #' @param object a [fastglmm] fit.
 #' @param parm coefficients to include (names or indices; default all).
 #' @param level confidence level.
 #' @param method only `"Wald"`.
 #' @param ... unused.
-#' @return A matrix with one row per coefficient.
+#' @return A matrix with one row per coefficient; aliased coefficients are
+#'   `NaN` rows.
 #' @export
 confint.fastglmm <- function(object, parm, level = 0.95,
                              method = "Wald", ...) {
@@ -404,13 +437,18 @@ confint.fastglmm <- function(object, parm, level = 0.95,
   }
   est <- object$beta
   if (missing(parm)) parm <- names(est)
-  q <- stats::qnorm((1 + level) / 2)
-  lo <- est[parm] - q * object$se[parm]
-  hi <- est[parm] + q * object$se[parm]
-  out <- cbind(lo, hi)
-  dimnames(out) <- list(names(est[parm]),
-                        sprintf("%.1f %%", 100 * c((1 - level) / 2,
-                                                   (1 + level) / 2)))
+  # A fit saved before `coef_df` existed has no df: normal intervals, as such a
+  # fit's summary() tests with z.
+  coef_df <- object$coef_df %||% rep(NaN, length(est))
+  ci <- fastglmm_confint(as.double(est), as.double(object$se),
+                         as.double(coef_df), as.double(level))
+  out <- cbind(stats::setNames(ci$lower, names(est)),
+               stats::setNames(ci$upper, names(est)))[parm, , drop = FALSE]
+  a <- (1 - level) / 2
+  colnames(out) <- paste(format(100 * c(a, 1 - a), trim = TRUE, scientific = FALSE,
+                                digits = 3), "%")
+  footer <- .df_footer(object)
+  if (identical(.df_method(object), "disabled")) message(footer)
   out
 }
 
@@ -649,23 +687,28 @@ generics::glance
 
 #' Tidy the fixed effects
 #'
-#' One row per fixed effect: `term`, `estimate`, `std.error`, `statistic`
-#' (Wald z) and `p.value` (normal). Aliased coefficients are `NA` rows.
+#' One row per fixed effect: `term`, `estimate`, `std.error`, `statistic`,
+#' `df` (only where [summary()][summary.fastglmm] has a df column: the
+#' Satterthwaite df of a Gaussian mixed model) and `p.value`. The statistic
+#' and p-value are the summary's: t where it tests with t, Wald z on the
+#' normal otherwise. Aliased coefficients are `NA` rows.
 #'
 #' @param x a [fastglmm] fit.
 #' @param ... unused.
 #' @return A `data.frame`.
 #' @export
 tidy.fastglmm <- function(x, ...) {
-  wald <- .wald(x)
-  data.frame(
+  tests <- .coef_tests(x)
+  out <- data.frame(
     term = names(x$beta),
     estimate = unname(x$beta),
     std.error = unname(x$se),
-    statistic = unname(wald$z),
-    p.value = unname(wald$p),
+    statistic = unname(tests$statistic),
     stringsAsFactors = FALSE
   )
+  if (tests$df_column) out$df <- unname(tests$df)
+  out$p.value <- unname(tests$p)
+  out
 }
 
 #' One-row model summary
@@ -694,11 +737,45 @@ glance.fastglmm <- function(x, ...) {
   )
 }
 
-# Wald z and normal p per fixed effect - summary() and tidy() both print
-# these; one site so they cannot drift apart.
-.wald <- function(object) {
-  z <- object$beta / object$se
-  list(z = z, p = 2 * stats::pnorm(-abs(z)))
+# The test of each fixed effect - summary() and tidy() both print it; one site
+# so they cannot drift apart. t with the kernel's p where the fit has a df
+# (df_method "satterthwaite" or "residual"), Wald z with the normal p
+# otherwise; a df column only for the Satterthwaite df, which differ per row.
+# Mirrors the Python port's build_summary - change together. .df_method()
+# keeps objects saved before `df_method` existed printable, as z tables.
+.df_method <- function(object) object$df_method %||% "none"
+
+.coef_tests <- function(object) {
+  statistic <- object$beta / object$se
+  t_test <- .df_method(object) %in% c("satterthwaite", "residual")
+  list(
+    test = if (t_test) "t" else "z",
+    statistic = statistic,
+    df = object$coef_df,
+    df_column = identical(.df_method(object), "satterthwaite"),
+    p = if (t_test) object$coef_p else 2 * stats::pnorm(-abs(statistic))
+  )
+}
+
+# n - p, the residual df of OLS and the dispersion GLMs' t tests, or NULL. The
+# kernel's coef_df carries the same n - p on these fits but NaN on a
+# non-converged one, whose footer still prints n - p; the Python port's
+# build_summary counts the same way - change together.
+.residual_df <- function(object) {
+  if (!identical(.df_method(object), "residual")) return(NULL)
+  as.integer(object$nobs - sum(!object$aliased))
+}
+
+# The footer line that says how the t tests' df were formed, or NULL. The
+# Python port prints the same sentences (summary.FOOTNOTE, DF_NOT_COMPUTED),
+# with its own argument spelling - change together.
+.df_footer <- function(object) {
+  switch(.df_method(object),
+    satterthwaite = paste0("t tests use Satterthwaite degrees of freedom ",
+                           "(finite-difference \u03b8-Hessian)."),
+    disabled = "df not computed (satterthwaite = FALSE)",
+    NULL
+  )
 }
 
 # AIC / BIC / deviance (-2 logLik) / residual df - summary()'s criterion row

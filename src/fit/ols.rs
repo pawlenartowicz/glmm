@@ -7,7 +7,7 @@ use faer::Mat;
 use crate::ols::{OlsFitView, OlsScratch, OlsSuffStats, PANEL_ROWS};
 use crate::standardize::ColumnScaling;
 
-use super::common::{fill_se_compact, nan_vcov, vcov_from_chol, FitDiagnostics};
+use super::common::{fill_se_compact, nan_vcov, residual_df, vcov_from_chol, FitDiagnostics};
 use super::{Fit, FitOptions};
 
 impl OlsFitView<'_> {
@@ -288,6 +288,17 @@ pub(crate) fn ols_view_to_fit(
         (vec![], f64::NAN)
     };
 
+    // t on the residual df `n − p`, whatever `opts.satterthwaite` says.
+    let (coef_df, satterthwaite) = residual_df(
+        view.factor,
+        n,
+        p,
+        view.sigma_sq,
+        map,
+        &opts.target_indices,
+        converged,
+    );
+
     Fit {
         beta,
         se,
@@ -316,5 +327,7 @@ pub(crate) fn ols_view_to_fit(
         fitted,
         ranef: vec![],
         ranef_levels: vec![],
+        coef_df,
+        satterthwaite: Some(satterthwaite),
     }
 }

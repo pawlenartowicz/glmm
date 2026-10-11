@@ -1,0 +1,51 @@
+{
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0",
+      "glmmTMB": "1.1.14"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_anova.R"
+  },
+  "case": "glmm_vs_glm",
+  "reference": "mixture",
+  "members": [
+    {
+      "logLik": -320.205070575406,
+      "npar": 2,
+      "nobs": 480,
+      "deviance": 640.410141150811,
+      "AIC": 644.410141150811,
+      "BIC": 652.757713358615
+    },
+    {
+      "logLik": -310.136640085969,
+      "npar": 3,
+      "nobs": 480,
+      "deviance": 542.179043495493,
+      "AIC": 626.273280171937,
+      "BIC": 638.794638483643
+    }
+  ],
+  "statistic": 20.1368609788738,
+  "df": 1,
+  "p_chisq": 7.20937812902818e-06,
+  "mixture_k": 0,
+  "p_mixture": 3.60468906451409e-06,
+  "name": "anova_glmm_vs_glm_sim_binomial_slope1"
+}

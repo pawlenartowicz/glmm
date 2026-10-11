@@ -77,6 +77,12 @@ fn fit_dict<'py>(py: Python<'py>, r: orchestrate::FitResult) -> PyResult<Bound<'
         notes.append(nd)?;
     }
     d.set_item("notes", notes)?;
+    d.set_item("coef_df", r.coef_df)?;
+    d.set_item("coef_p", r.coef_p)?;
+    d.set_item("df_method", r.df_method)?;
+    d.set_item("rss", r.rss)?;
+    d.set_item("r_squared", r.r_squared)?;
+    d.set_item("adj_r_squared", r.adj_r_squared)?;
     Ok(d)
 }
 
@@ -84,7 +90,7 @@ fn fit_dict<'py>(py: Python<'py>, r: orchestrate::FitResult) -> PyResult<Bound<'
 #[pyfunction]
 #[pyo3(signature = (
     formula, numeric_columns, factor_columns, family, link, wald_se, nagq,
-    dispersion, weights, offset, warm_start,
+    dispersion, weights, offset, warm_start, satterthwaite,
 ))]
 fn fit<'py>(
     py: Python<'py>,
@@ -102,6 +108,7 @@ fn fit<'py>(
     weights: Option<Vec<f64>>,
     offset: Option<Vec<f64>>,
     warm_start: Option<(Vec<f64>, Vec<f64>, Option<f64>)>,
+    satterthwaite: bool,
 ) -> PyResult<Bound<'py, PyDict>> {
     let result = orchestrate::run_fit(
         formula,
@@ -115,9 +122,18 @@ fn fit<'py>(
         weights,
         offset,
         warm_start,
+        satterthwaite,
     )
     .map_err(PyValueError::new_err)?;
     fit_dict(py, result)
+}
+
+/// `glmm::orchestrate::confint`: per coefficient `[lower, upper]`, the t
+/// quantile on a finite df and the normal one elsewhere. `Fit.confint` calls
+/// it, so both ports give the same intervals from one rule.
+#[pyfunction]
+fn confint(beta: Vec<f64>, se: Vec<f64>, coef_df: Vec<f64>, level: f64) -> PyResult<Vec<[f64; 2]>> {
+    orchestrate::confint(&beta, &se, &coef_df, level).map_err(PyValueError::new_err)
 }
 
 /// What `formula` reads from a dataset whose column names are `available`, from
@@ -156,5 +172,6 @@ fn formula_columns(
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(fit, m)?)?;
     m.add_function(wrap_pyfunction!(formula_columns, m)?)?;
+    m.add_function(wrap_pyfunction!(confint, m)?)?;
     Ok(())
 }

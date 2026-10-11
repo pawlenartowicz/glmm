@@ -108,6 +108,28 @@ pub struct ReGroupInfo {
 }
 
 /// The lowered fit inputs — a one-shot front door to `crate::fit_cold`.
+///
+/// `Lowered` is `#[non_exhaustive]`: outside this crate it cannot be built by
+/// struct literal, not even by struct update from a lowered value. Build one
+/// with [`lower`] and assign its public fields. It also carries a private
+/// field (the data cross-product the Type III hypotheses need), which on its
+/// own forbids construction outside the crate, so the example below fails
+/// whatever the attribute says; the attribute keeps a new public field an
+/// additive change.
+///
+/// ```compile_fail
+/// use glmm::formula::{lower, Column, Lowered, Table};
+/// use glmm::Family;
+///
+/// let table = Table {
+///     columns: vec![("y".into(), Column::Numeric(vec![0.5, 1.5]))],
+///     n: 2,
+/// };
+/// let lo = lower("y ~ 1", &table, Family::Gaussian).unwrap();
+/// let _copy = Lowered { ..lo };
+/// ```
+// Non-exhaustive so a new field is an additive change, not a break.
+#[non_exhaustive]
 pub struct Lowered {
     /// Row-major n×p design (intercept column first when the formula has one).
     pub x: Vec<f64>,
@@ -141,6 +163,40 @@ pub struct Lowered {
     /// `target_indices = 0..p`; `offset` set from an `offset()` formula term
     /// when present, else `None`; other knobs defaulted. Caller may override.
     pub opts: FitOptions,
+    /// The fixed terms in R's order (`attr(terms, "term.labels")`), the
+    /// intercept excluded. Their `columns` partition the design columns after
+    /// the intercept: R's `assign`, as ranges.
+    pub terms: Vec<FixedTerm>,
+    /// The formula keeps the intercept (column 0 of [`Lowered::x`]).
+    pub has_intercept: bool,
+    /// `Xᵀ·rdX` for the Type III hypotheses (`formula::hypotheses::type3`).
+    pub(crate) rdx: RdxCross,
+}
+
+/// One fixed term of the formula, as R's `terms.formula` lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FixedTerm {
+    /// R's term label: the variables joined by `:` (`"g:h"`, `"x:f"`).
+    pub label: String,
+    /// The term's variables, in the order of their first appearance in the
+    /// fixed part of the formula (R's order inside a term label).
+    pub vars: Vec<String>,
+    /// Per variable of `vars`: `true` for a numeric column (or a transform of
+    /// one), `false` for a factor.
+    pub numeric: Vec<bool>,
+    /// The term's design columns in [`Lowered::x`] and [`Lowered::col_names`].
+    pub columns: std::ops::Range<usize>,
+}
+
+/// lmerTest's `rdX` (`get_rdX`: the intercept, then per term the full
+/// indicator coding `model.matrix(~ 0 + term)`), kept as its cross-product
+/// with the design, since the data are gone after lowering.
+pub(crate) struct RdxCross {
+    /// The `rdX` column names (`"(Intercept)"` first when the formula has one).
+    pub(crate) names: Vec<String>,
+    /// `Xᵀ·rdX`, `p × names.len()`.
+    pub(crate) xt_rdx: faer::Mat<f64>,
 }
 
 /// Parses `formula` and lowers it against `data` in one call, producing the
@@ -244,7 +300,9 @@ pub fn materialize(ast: &ParsedFormula, data: &Table, family: Family) -> Result<
     // contrasts the fixed-effect side already computed).
     let mut factor_main_cols: HashMap<String, Vec<(String, ColumnId)>> = HashMap::new();
 
+    let mut fixed_terms: Vec<FixedTerm> = Vec::with_capacity(terms.len());
     for (vars, keep_base) in terms.iter().zip(&full) {
+        let start = cols.len();
         match vars[..] {
             [name] => match data.get(name) {
                 Some(Column::Factor { levels, codes }) => {
@@ -286,6 +344,15 @@ pub fn materialize(ast: &ParsedFormula, data: &Table, family: Family) -> Result<
                 }
             }
         }
+        fixed_terms.push(FixedTerm {
+            label: vars.join(":"),
+            vars: vars.iter().map(|v| v.to_string()).collect(),
+            numeric: vars
+                .iter()
+                .map(|v| !matches!(data.get(v), Some(Column::Factor { .. })))
+                .collect(),
+            columns: start..cols.len(),
+        });
     }
 
     if cols.is_empty() {
@@ -300,6 +367,8 @@ pub fn materialize(ast: &ParsedFormula, data: &Table, family: Family) -> Result<
             x[i * p + j] = v;
         }
     }
+
+    let rdx = rdx_cross(&terms, ast.has_intercept, data, &x, n, p)?;
 
     // 3. Random effects → ReStructure + GroupIds (declaration order; first = primary).
     let (model, ids, re_groups, notes) =
@@ -342,7 +411,46 @@ pub fn materialize(ast: &ParsedFormula, data: &Table, family: Family) -> Result<
         re_groups,
         notes,
         opts,
+        terms: fixed_terms,
+        has_intercept: ast.has_intercept,
+        rdx,
     })
+}
+
+/// lmerTest's `rdX` columns (see [`RdxCross`]) multiplied into the row-major
+/// `n × p` design `x`. A factor is coded with every level in every term,
+/// which is what `model.matrix(~ 0 + term)` does for a lone term; names
+/// follow [`interaction_columns`], so each design column's name is also an
+/// `rdX` name.
+fn rdx_cross(
+    terms: &[Vec<&str>],
+    has_intercept: bool,
+    data: &Table,
+    x: &[f64],
+    n: usize,
+    p: usize,
+) -> Result<RdxCross, Error> {
+    let mut names = Vec::new();
+    let mut cols: Vec<Vec<f64>> = Vec::new();
+    if has_intercept {
+        names.push("(Intercept)".to_string());
+        cols.push(vec![1.0; n]);
+    }
+    for vars in terms {
+        for (name, col) in interaction_columns(vars, &vec![true; vars.len()], data)? {
+            names.push(name);
+            cols.push(col);
+        }
+    }
+    let mut xt_rdx = faer::Mat::<f64>::zeros(p, cols.len());
+    for (c, col) in cols.iter().enumerate() {
+        for (i, &r) in col.iter().enumerate() {
+            for (j, &v) in x[i * p..(i + 1) * p].iter().enumerate() {
+                xt_rdx[(j, c)] += v * r;
+            }
+        }
+    }
+    Ok(RdxCross { names, xt_rdx })
 }
 
 /// Sorted-unique levels (lexicographic) and per-row codes — the ordering

@@ -17,6 +17,7 @@ fastglmm(
   wald.se = "hessian",
   dispersion = NULL,
   init.theta = NULL,
+  satterthwaite = TRUE,
   ...
 )
 }
@@ -87,6 +88,13 @@ quasi-likelihood - not implemented, errors.}
 (the same slot as \code{start$dispersion}; give one of the two). \code{NULL}
 cold-starts it from the no-random-effect negative-binomial fit.}
 
+\item{satterthwaite}{compute lmerTest's Satterthwaite degrees of freedom
+for a Gaussian mixed model's t tests (default \code{TRUE}). \code{FALSE} skips that
+pass: \link[=summary.fastglmm]{summary()} and \link[=confint.fastglmm]{confint()}
+then use z and normal quantiles and say "df not computed", and
+\verb{$df_method} is \code{"disabled"}. OLS and the Gamma and inverse-Gaussian GLMs
+keep their residual df whatever it says.}
+
 \item{...}{intercepted, never silently swallowed. \code{REML} is checked against
 the model: \code{REML = TRUE} is accepted only on a Gaussian mixed model (the
 one model with a REML objective) and errors elsewhere, \code{REML = FALSE} is
@@ -96,13 +104,18 @@ and errors there. The other known lme4 arguments (\code{control}, \code{verbose}
 error as unused arguments.}
 }
 \value{
-An object of class \code{"fastglmm"}: fixed effects (\link[nlme:fixed.effects]{nlme::fixef}), Wald
+An object of class \code{"fastglmm"}: fixed effects (\link{fixef}), Wald
 covariance (\code{vcov()}), variance components on the SD/correlation scale
-(\link[nlme:VarCorr]{nlme::VarCorr}), \code{converged} and \code{singular} flags (\link{isSingular}), a
+(\link{VarCorr}), \code{converged} and \code{singular} flags (\link{isSingular}), a
 \code{diagnostics} list (the solver's own report: \code{boundary}, \code{pinned},
 \code{notes}, plus the three flags above), a \code{warnings} data.frame (one row
 per warning the call raised: \code{tier}, \code{kind}, \code{title}, \code{message}; match on
-\code{kind}), plus
+\code{kind}), the per-coefficient \code{coef_df} (the t test's degrees of freedom,
+\code{NaN} where the test is z and on an OLS or dispersion-GLM fit that did not
+converge) and \code{coef_p} (its p-value), \code{df_method}
+(\code{"satterthwaite"}, \code{"residual"}, \code{"none"}, \code{"disabled"} or \code{"failed"}),
+\code{rss}, \code{r_squared} and \code{adj_r_squared} (OLS fits only, \code{NaN} otherwise),
+plus
 \code{print()}, \link[=summary.fastglmm]{summary()}, \link[=confint.fastglmm]{confint()}
 (Wald), \code{nobs()}, \link[=formula.fastglmm]{formula()} (returns the formula
 \strong{string}), \code{family()}, \code{model.frame()}, \link[=ranef.fastglmm]{ranef()},
@@ -164,7 +177,8 @@ as a warning of class \code{"fastglmm_diagnostic"} with a per-kind subclass
 \code{"fastglmm_single_level_grouping_dropped"}, \code{"fastglmm_hessian_se_fallback"},
 \code{"fastglmm_se_unavailable"}, \code{"fastglmm_exact_profile_fallback"},
 \code{"fastglmm_gradient_search_fallback"},
-\code{"fastglmm_precision_limited"}, \code{"fastglmm_non_integer_response"}, \code{"fastglmm_rows_dropped_na"}; a note from
+\code{"fastglmm_precision_limited"}, \code{"fastglmm_non_integer_response"}, \code{"fastglmm_rows_dropped_na"},
+\code{"fastglmm_satterthwaite_curvature"}; a note from
 a newer kernel than this package arrives as \code{"fastglmm_unknown_note"}),
 so \code{withCallingHandlers()} and \code{suppressWarnings(classes = )} can select
 them without matching message text.

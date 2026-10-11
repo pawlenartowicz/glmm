@@ -387,3 +387,114 @@ fn fit_ols_entangled_columns_keep_their_digits() {
         f.se[2]
     );
 }
+
+/// `y ~ 1 + x1 + x2` on 30 rows, with optional weights and an optional
+/// fourth column `2·x1` (aliased). Returns `(x, y, weights, n, p)`.
+fn residual_df_data(dup: bool) -> (Vec<f64>, Vec<f64>, Vec<f64>, usize, usize) {
+    let mut s = 17u64;
+    let n = 30;
+    let (mut x, mut y, mut w) = (vec![], vec![], vec![]);
+    for _ in 0..n {
+        let x1 = super::common_tests::lcg(&mut s);
+        let x2 = 2.0 * super::common_tests::lcg(&mut s);
+        x.extend([1.0, x1, x2]);
+        if dup {
+            x.push(2.0 * x1);
+        }
+        y.push(0.4 + 1.1 * x1 - 0.6 * x2 + 0.5 * super::common_tests::lcg(&mut s));
+        w.push(1.5 + super::common_tests::lcg(&mut s));
+    }
+    (x, y, w, n, if dup { 4 } else { 3 })
+}
+
+/// OLS reports `coef_df = n − p` on the target columns (raw rows, `p` the
+/// retained columns) and its t tests take that df, weighted or not and
+/// whatever `FitOptions::satterthwaite` says. The contrasts read the full
+/// `C`, so a non-target column is still testable.
+#[test]
+fn ols_coef_df_is_n_minus_p() {
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: None,
+    };
+    let all = |p: usize| FitOptions {
+        target_indices: (0..p as u32).collect(),
+        ..FitOptions::default()
+    };
+    let (x, y, w, n, p) = residual_df_data(false);
+    let nu = (n - p) as f64;
+    let weighted = FitOptions {
+        weights: Some(w.clone()),
+        ..all(p)
+    };
+    let switched_off = FitOptions {
+        satterthwaite: false,
+        ..all(p)
+    };
+    for opts in [all(p), weighted, switched_off] {
+        let f = fit_cold(&x, &y, n, p, &model, &GroupIds::default(), &opts);
+        assert!(f.converged());
+        assert_eq!(f.coef_df, vec![nu; p]);
+        for j in 0..p {
+            let mut e = vec![0.0; p];
+            e[j] = 1.0;
+            let t = f.contrast_t(&e).expect("OLS has a residual df");
+            assert_eq!(t.df, nu);
+            assert_eq!(t.estimate, f.beta[j]);
+            assert!((t.se - f.se[j]).abs() <= 1e-12 * f.se[j], "se {j}");
+            assert_eq!(t.p_value, crate::inference::tails::t_two_sided_p(t.t, nu));
+            assert!(t.notes.is_empty());
+        }
+    }
+
+    // One target: coef_df on it only, the contrast on another column from
+    // the full C.
+    let full = fit_cold(&x, &y, n, p, &model, &GroupIds::default(), &all(p));
+    let one = FitOptions {
+        target_indices: vec![1],
+        ..FitOptions::default()
+    };
+    let f = fit_cold(&x, &y, n, p, &model, &GroupIds::default(), &one);
+    assert!(f.coef_df[0].is_nan() && f.coef_df[2].is_nan());
+    assert_eq!(f.coef_df[1], nu);
+    let t = f.contrast_t(&[1.0, 0.0, 0.0]).expect("full C");
+    assert!((t.se - full.se[0]).abs() <= 1e-12 * full.se[0]);
+    assert_eq!(t.df, nu);
+
+    // Rank-deficient: the aliased column has no df and `p` is the retained
+    // count, as in σ̂².
+    let (x, y, _, n, p) = residual_df_data(true);
+    let f = fit_cold(&x, &y, n, p, &model, &GroupIds::default(), &all(p));
+    assert!(f.converged());
+    assert_eq!(f.diagnostics.aliased, vec![false, false, false, true]);
+    let nu = (n - 3) as f64;
+    assert_eq!(&f.coef_df[..3], &[nu; 3]);
+    assert!(f.coef_df[3].is_nan());
+    let t = f
+        .contrast_t(&[0.0, 1.0, 0.0, 0.0])
+        .expect("retained column");
+    assert_eq!(t.df, nu);
+    let t = f.contrast_t(&[0.0, 0.0, 0.0, 1.0]).expect("aliased column");
+    assert!(t.df.is_nan());
+    assert_eq!(
+        t.notes,
+        vec![crate::inference::contrast::ContrastNote::AliasedColumn { column: 3 }]
+    );
+
+    // n = p does not converge: no coef_df (as se), but the residual record
+    // stays, so the contrasts are NaN numbers on ν = 0, never `NoDf`.
+    let x = [1.0, 0.3, -1.2, 1.0, -0.7, 0.4, 1.0, 1.1, 0.9];
+    let y = [0.5, -0.2, 1.3];
+    let f = fit_cold(&x, &y, 3, 3, &model, &GroupIds::default(), &all(3));
+    assert!(!f.converged());
+    assert!(f.coef_df.iter().all(|d| d.is_nan()));
+    let t = f
+        .contrast_t(&[0.0, 1.0, 0.0])
+        .expect("the residual record, not NoDf");
+    assert!(t.estimate.is_nan() && t.se.is_nan() && t.t.is_nan() && t.p_value.is_nan());
+    assert_eq!(t.df, 0.0);
+    let fs = f
+        .contrast_f(&[0.0, 1.0, 0.0, 0.0, 0.0, 1.0], 2)
+        .expect("the residual record, not NoDf");
+    assert!(fs.f.is_nan() && fs.p_value.is_nan());
+}

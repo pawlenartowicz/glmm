@@ -1,5 +1,6 @@
 import math
 import re
+import warnings
 
 import numpy as np
 import pytest
@@ -46,6 +47,13 @@ def make_fit(**kw):
         "nobs": 4,
         "y": np.array([1.0, 2.0, 3.0, 4.0]),
         "weights": None,
+        # A z table (the families with no df) unless a test says otherwise.
+        "coef_df": np.array([math.nan, math.nan]),
+        "coef_p": np.array([math.nan, math.nan]),
+        "df_method": "none",
+        "rss": math.nan,
+        "r_squared": math.nan,
+        "adj_r_squared": math.nan,
     }
     # converged / singular / aliased are diagnostics entries, not Fit fields —
     # accept them as flat kwargs anyway so the tests below read the way the
@@ -90,6 +98,9 @@ def _mixed_fit(**kw):
         "dispersion": 654.94,
         "fitted": np.array([1.5, 1.5, 3.5, 3.5]),
         "n_eval": 12,
+        "coef_df": np.array([15.0, 16.25]),
+        "coef_p": np.array([0.0632, 0.0526]),
+        "df_method": "satterthwaite",
     }
     base.update(kw)
     return make_fit(**base)
@@ -105,7 +116,6 @@ def test_summary_object_blocks_lmm():
     assert re["group"] == "Subject"
     np.testing.assert_allclose(re["variance"], [4.0, 1.25])
     np.testing.assert_allclose(re["stddev"], [2.0, math.sqrt(1.25)])
-    np.testing.assert_allclose(re["se"], [0.5, 0.3])
     assert re["corr"][1, 0] == pytest.approx(1.0 / (2.0 * math.sqrt(1.25)))
     # Scaled residuals: (y - fitted) / sqrt(dispersion), quantiles type 7.
     r = (np.array([1.0, 2.0, 3.0, 4.0]) - np.array([1.5, 1.5, 3.5, 3.5])) / math.sqrt(654.94)
@@ -166,17 +176,17 @@ def test_summary_text_has_lme4_blocks_in_order():
         "Residual",
         "Number of obs: 4, groups:  Subject, 18",
         "Fixed effects:",
-        "Pr(>|z|)",
+        "Pr(>|t|)",
         "Correlation of Fixed Effects:",
         "Optimizer evaluations: 12, converged: True",
-        "Wald z",
+        "t tests use Satterthwaite degrees of freedom",
     ]
     pos = [text.index(s) for s in order]
     assert pos == sorted(pos), text
 
 
 def test_summary_text_wald_z_p_and_stars():
-    text = make_fit().summary()
+    text = make_fit(family="poisson", link="log").summary()
     # z = 2.0/1.0 = 2, p = erfc(2/sqrt(2)) = 0.0455 -> one star.
     row = next(ln for ln in text.splitlines() if ln.startswith("(Intercept)"))
     assert "0.0455" in row and row.rstrip().endswith("*")
@@ -377,3 +387,222 @@ def test_summary_works_on_a_fit_pickled_before_the_warnings_attribute():
     del fit.__dict__["warnings"]
     text = build_summary(fit).text()
     assert "Warnings:" not in text
+
+
+def _fixed_header(text):
+    lines = text.splitlines()
+    return lines[lines.index("Fixed effects:") + 1].split()
+
+
+def _ols_fit(**kw):
+    # n - p = 4 - 2 = 2 residual df.
+    base = {
+        "coef_df": np.array([2.0, 2.0]),
+        "coef_p": np.array([0.18, 0.057]),
+        "df_method": "residual",
+        "rss": 0.5,
+        "r_squared": 0.8125,
+        "adj_r_squared": 0.71875,
+        "fitted": np.array([1.0, 2.0, 3.0, 4.0]),
+    }
+    base.update(kw)
+    return make_fit(**base)
+
+
+def test_lmm_summary_has_lmertest_columns_with_the_crates_df_and_p():
+    s = _mixed_fit().summary_object()
+    text = s.text()
+    assert _fixed_header(text) == ["Estimate", "Std.", "Error", "df", "t", "value", "Pr(>|t|)"]
+    row = next(ln for ln in text.splitlines() if ln.startswith("(Intercept)"))
+    # Estimate 2, se 1, df 15, t 2, and the crate's p (not a normal one).
+    assert row.split()[1:6] == ["2", "1", "15", "2", "0.0632"]
+    assert row.rstrip().endswith(".")
+    x_row = next(ln for ln in text.splitlines() if ln.startswith("x "))
+    assert "16.25" in x_row and "0.0526" in x_row
+    assert text.splitlines()[-1] == glmm.summary.FOOTNOTE
+    for render in (s.html(), s.latex(), s.typst()):
+        assert "t value" in render
+        assert "t tests use Satterthwaite degrees of freedom" in render
+
+
+def test_coef_df_column_in_every_render():
+    s = _mixed_fit().summary_object()
+    assert ("<th>df</th>") in s.html()
+    assert " & df & " in s.latex()
+    assert 'strong("df")' in s.typst()
+    assert re.search(r"Std\. Error\s+df\s+t value", s.text())
+
+
+def test_ols_summary_prints_t_without_df_and_the_lm_footer():
+    s = _ols_fit().summary_object()
+    text = s.text()
+    assert _fixed_header(text) == ["Estimate", "Std.", "Error", "t", "value", "Pr(>|t|)"]
+    row = next(ln for ln in text.splitlines() if ln.startswith("(Intercept)"))
+    assert "0.18" in row
+    lines = text.splitlines()
+    # sqrt(rss / (n - p)) = sqrt(0.5 / 2) = 0.5.
+    i = lines.index("Residual standard error: 0.5 on 2 degrees of freedom")
+    assert lines[i + 1] == "Multiple R-squared:  0.8125,\tAdjusted R-squared:  0.7188"
+    assert "Satterthwaite" not in text and "Wald z" not in text and "df not computed" not in text
+    for render in (s.html(), s.latex(), s.typst()):
+        assert "Residual standard error: 0.5 on 2 degrees of freedom" in render
+        assert "Adjusted R-squared:  0.7188" in render
+
+
+def test_dispersion_glm_prints_t_and_its_residual_df():
+    text = _ols_fit(family="gamma", link="log", dispersion=2.5, rss=math.nan).summary()
+    assert _fixed_header(text)[-3:] == ["t", "value", "Pr(>|t|)"]
+    assert "Dispersion (phi, Pearson): 2.5 on 2 degrees of freedom" in text
+    assert "Residual standard error" not in text and "R-squared" not in text
+
+
+def test_glmm_and_glm_keep_z_with_no_test_footer():
+    for f in (
+        _mixed_fit(
+            family="binomial",
+            link="logit",
+            df_method="none",
+            coef_df=np.full(2, np.nan),
+            # A binomial fit's fitted values lie in (0, 1); the Pearson residuals need it.
+            y=np.array([0.0, 1.0, 0.0, 1.0]),
+            fitted=np.array([0.2, 0.4, 0.6, 0.8]),
+        ),
+        make_fit(family="poisson", link="log"),
+    ):
+        text = f.summary()
+        assert _fixed_header(text)[-3:] == ["z", "value", "Pr(>|z|)"]
+        assert "Satterthwaite" not in text and "Wald z" not in text
+        assert "df not computed" not in text
+
+
+def test_switched_off_lmm_prints_z_and_says_df_not_computed():
+    nan2 = np.full(2, np.nan)
+    s = _mixed_fit(df_method="disabled", coef_df=nan2, coef_p=nan2).summary_object()
+    text = s.text()
+    assert _fixed_header(text)[-3:] == ["z", "value", "Pr(>|z|)"]
+    # z = 2 -> normal p 0.0455, not the (absent) crate p.
+    row = next(ln for ln in text.splitlines() if ln.startswith("(Intercept)"))
+    assert "0.0455" in row
+    assert text.splitlines()[-1] == "df not computed (satterthwaite=False)"
+    for render in (s.html(), s.latex(), s.typst()):
+        assert "df not computed (satterthwaite=False)" in render
+
+
+def test_failed_pass_prints_z():
+    nan2 = np.full(2, np.nan)
+    text = _mixed_fit(df_method="failed", coef_df=nan2, coef_p=nan2).summary()
+    assert _fixed_header(text)[-3:] == ["z", "value", "Pr(>|z|)"]
+    assert "Satterthwaite degrees of freedom" not in text
+
+
+def test_random_effects_block_has_no_se_column():
+    f = _mixed_fit()
+    stddev_se = f.stddev_se.copy()
+    s = f.summary_object()
+    (header,) = [h for t, h, _ in s._tables() if t == "Random effects"]
+    assert header == ["Groups", "Name", "Variance", "Std.Dev.", "Corr"]
+    lines = s.text().splitlines()
+    re_header = lines[lines.index("Random effects:") + 1].split()
+    assert re_header == ["Groups", "Name", "Variance", "Std.Dev.", "Corr"]
+    assert "<th>se</th>" not in s.html()
+    assert " & se & " not in s.latex()
+    assert 'strong("se")' not in s.typst()
+    # The data stays on the fit.
+    np.testing.assert_array_equal(f.stddev_se, stddev_se)
+
+
+def test_confint_is_a_p_by_2_array_in_names_order():
+    # df 2: qt(0.975, 2) = 4.3026527297494619 in R.
+    ci = _ols_fit().confint()
+    assert ci.shape == (2, 2)
+    np.testing.assert_allclose(
+        ci[:, 0], [2.0 - 4.3026527297494619, -0.5 - 0.25 * 4.3026527297494619]
+    )
+    np.testing.assert_allclose(
+        ci[:, 1], [2.0 + 4.3026527297494619, -0.5 + 0.25 * 4.3026527297494619]
+    )
+    # z rows (no df) take qnorm: qnorm(0.95) = 1.6448536269514715.
+    ci90 = make_fit(family="poisson", link="log").confint(level=0.9)
+    np.testing.assert_allclose(
+        ci90[:, 1], [2.0 + 1.6448536269514715, -0.5 + 0.25 * 1.6448536269514715]
+    )
+
+
+@pytest.mark.parametrize("df_method", ["disabled", "failed"])
+def test_confint_is_normal_when_the_lmm_df_were_not_computed(df_method):
+    nan2 = np.full(2, np.nan)
+    ci = _mixed_fit(df_method=df_method, coef_df=nan2, coef_p=nan2).confint()
+    # qnorm(0.975) = 1.9599639845400534; the SEs are finite, so no NaN.
+    np.testing.assert_allclose(
+        ci[:, 0], [2.0 - 1.9599639845400534, -0.5 - 0.25 * 1.9599639845400534]
+    )
+
+
+def test_confint_aliased_row_is_nan_and_bad_level_raises():
+    f = _ols_fit(
+        aliased=np.array([False, True]),
+        beta=np.array([2.0, math.nan]),
+        se=np.array([1.0, math.nan]),
+        coef_df=np.array([3.0, math.nan]),
+    )
+    ci = f.confint()
+    assert np.isfinite(ci[0]).all() and np.isnan(ci[1]).all()
+    for bad in (0.0, 1.0, 1.5, math.nan):
+        with pytest.raises(ValueError, match="level must be a number strictly between 0 and 1"):
+            f.confint(level=bad)
+
+
+# Fits through the port (the same MIXED-style fixture as test_warnings.py).
+_EX = [float(v) for v in range(-10, 11) if v != 0]
+_EG = [f"g{i % 5}" for i in range(20)]
+_EOFF = {"g0": -3.0, "g1": -1.5, "g2": 0.0, "g3": 1.5, "g4": 3.0}
+_EY = [0.3 * x + ((i * 7) % 5 - 2) * 0.4 + _EOFF[g] for i, (x, g) in enumerate(zip(_EX, _EG))]
+_EMIXED = {"x": _EX, "g": _EG, "y": _EY}
+
+
+def test_lmm_fit_carries_coef_df_and_the_switch_turns_it_off():
+    m = glmm.fit(_EMIXED, "y ~ x + (1 | g)")
+    assert m.df_method == "satterthwaite"
+    assert np.all(np.isfinite(m.coef_df)) and np.all(m.coef_df > 0)
+    assert np.all(np.isfinite(m.coef_p))
+    s = m.summary_object()
+    np.testing.assert_array_equal(s.coef_df, m.coef_df)
+    np.testing.assert_array_equal(s.p_value, m.coef_p)
+    # The interval is the t interval on each row's df: wider than the normal one.
+    ci = m.confint()
+    half = (ci[:, 1] - ci[:, 0]) / (2.0 * m.se)
+    assert np.all(half > 1.9599639845400534)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", glmm.SatterthwaiteCurvatureWarning)
+        off = glmm.fit(_EMIXED, "y ~ x + (1 | g)", satterthwaite=False)
+    assert off.df_method == "disabled"
+    assert np.all(np.isnan(off.coef_df)) and np.all(np.isnan(off.coef_p))
+    np.testing.assert_array_equal(off.beta, m.beta)
+    assert off.summary_object().text().splitlines()[-1] == "df not computed (satterthwaite=False)"
+    np.testing.assert_allclose((off.confint()[:, 1] - off.beta) / off.se, 1.9599639845400534)
+
+
+def test_ols_and_glmm_fits_label_their_test():
+    ols = glmm.fit(_EMIXED, "y ~ x", satterthwaite=False)
+    assert ols.df_method == "residual"
+    np.testing.assert_array_equal(ols.coef_df, [18.0, 18.0])
+    assert 0.0 < ols.r_squared < 1.0 and ols.adj_r_squared < ols.r_squared
+    # qt(0.975, 18) = 2.1009220402410382 in R.
+    np.testing.assert_allclose((ols.confint()[:, 1] - ols.beta) / ols.se, 2.1009220402410382)
+    y = [float(v > 0) for v in _EY]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        m = glmm.fit(dict(_EMIXED, y=y), "y ~ x + (1 | g)", "binomial")
+    assert m.df_method == "none"
+    assert np.all(np.isnan(m.coef_df)) and np.all(np.isnan(m.coef_p))
+
+
+def test_satterthwaite_must_be_a_bool():
+    with pytest.raises(TypeError, match="satterthwaite must be True or False"):
+        glmm.fit(_EMIXED, "y ~ x + (1 | g)", satterthwaite="no")
+
+
+def test_satterthwaite_takes_a_numpy_bool():
+    off = glmm.fit(_EMIXED, "y ~ x + (1 | g)", satterthwaite=np.False_)
+    assert off.df_method == "disabled"

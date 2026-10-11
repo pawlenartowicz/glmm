@@ -8,8 +8,8 @@
 // lands in every caller identically. Prefer it over the individual kernels below,
 // which do not classify the design for you.
 pub use crate::fit::{
-    build_workspace, curvature_hint, fit_on, fit_on_hinted, FitDiagnostics, FitView, FitWorkspace,
-    OuterStop,
+    build_workspace, curvature_hint, fit_on, fit_on_hinted, satterthwaite, FitDiagnostics, FitView,
+    FitWorkspace, OuterStop,
 };
 pub use crate::optim::CurvatureHint;
 // The RE-level-count normalizer `build_workspace` expects its `sized` spec to have

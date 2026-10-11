@@ -110,10 +110,9 @@ fn design(n: usize, cols: &[Vec<f64>]) -> Vec<f64> {
 /// `target_indices = 0..p`, everything else defaulted — what `lower()` fills
 /// `Lowered::opts` with.
 fn opts_for(p: usize) -> FitOptions {
-    FitOptions {
-        target_indices: (0..p as u32).collect(),
-        ..FitOptions::default()
-    }
+    let mut o = FitOptions::default();
+    o.target_indices = (0..p as u32).collect();
+    o
 }
 
 /// `|a-b| <= atol + rtol*|b|`.
@@ -1347,6 +1346,7 @@ fn run_fit_returns_lowered_response_and_nobs() {
         None,
         None,
         None,
+        true,
     )
     .unwrap();
     assert_eq!(r.nobs, 6);

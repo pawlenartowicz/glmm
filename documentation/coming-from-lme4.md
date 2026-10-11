@@ -10,11 +10,11 @@ own page.
 | lme4 | fastglmm (R) | glmm (Python) |
 |---|---|---|
 | `lmer(f, d)` / `glmer(f, d, family)` | `fastglmm(f, d, family = ...)` | `glmm.fit(d, "f", family)` |
-| `summary(fit)` | `summary(fit)` — lme4-shaped: the REML criterion (LMM) or the `AIC`/`BIC`/`logLik`/`deviance`/`df.resid` row (ML fits), scaled residuals, variance components, a Wald z table | `fit.summary()` — the same lme4-shaped layout, printed and returned as a string |
+| `summary(fit)` (lmerTest's on an LMM) | `summary(fit)`: lme4-shaped, with the REML criterion (LMM) or the `AIC`/`BIC`/`logLik`/`deviance`/`df.resid` row (ML fits), scaled residuals, variance components, and a coefficient table as lmerTest, `lm` and `glm` print it: t with a Satterthwaite `df` column on a Gaussian mixed model, t on `n - p` on OLS and on the Gamma and inverse-Gaussian GLMs with an estimated dispersion, Wald z elsewhere | `fit.summary()`: the same layout, printed and returned as a string; the df and p-values are also `fit.coef_df` and `fit.coef_p` |
 | `fixef(fit)` | `fixef(fit)` — named fixed-effect estimates; aliased columns `NA` | `fit.beta` (estimates) with `fit.names` (aligned coefficient names); `fit.aliased` flags rank-deficient columns |
 | `vcov(fit)` | `vcov(fit)` — full `p × p` Wald covariance | `fit.vcov` — `(p, p)` full Cov(β̂) |
 | `VarCorr(fit)` | `VarCorr(fit)` — SD/correlation-scale variance components, lme4-shaped, with a `Residual` row for a Gaussian mixed fit | `fit.varcorr` (vech-packed per grouping) plus `fit.stddev_corr(group_idx)`, which splits a grouping's block into a stddev vector and a correlation matrix |
-| `confint(fit)` | `confint(fit)` — Wald intervals off `vcov()`; `method = "profile"`/`"boot"` are not available and say so | Build from `fit.beta` and `fit.se` (or `fit.vcov` for joint contrasts) — no dedicated `confint` call |
+| `confint(fit)` | `confint(fit)`: Wald intervals off `vcov()`, on the t quantile where `summary()` tests with t (lmerTest's `contest1D(..., confint = TRUE)` on a Gaussian mixed model) and the normal quantile where it tests with z; `method = "profile"`/`"boot"` are not available and say so | `fit.confint(level=0.95)`: the same intervals as a `(p, 2)` array in `fit.names` order, no `parm` argument |
 | `isSingular(fit)` | `isSingular(fit)` — boundary-fit flag, lme4's condition, computed by the kernel | `fit.singular` |
 | `ranef(fit)` | `ranef(fit)` — named list of data frames, one per grouping, rows named by level | `fit.ranef_blocks` — a list of `{group, terms, levels, values}`, `values` an `(n_levels, n_terms)` array (not a DataFrame; the package's only dependency is numpy) |
 | `fitted(fit)` | `fitted(fit)` — named numeric vector over the model frame's rows | `fit.fitted` — `(n,)` array |

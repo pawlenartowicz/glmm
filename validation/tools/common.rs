@@ -309,15 +309,9 @@ pub fn lower_rung(spec: &Value, manifest_dir: &str) -> (Lowered, Table, Family, 
 /// arm at Laplace while the Hessian arm ran quadrature.
 #[allow(dead_code)]
 pub fn rx_options(opts: &FitOptions) -> FitOptions {
-    FitOptions {
-        target_indices: opts.target_indices.clone(),
-        wald_se: WaldSe::Rx,
-        weights: opts.weights.clone(),
-        offset: opts.offset.clone(),
-        nagq: opts.nagq,
-        parallel_inner: opts.parallel_inner,
-        ..FitOptions::default()
-    }
+    let mut o = opts.clone();
+    o.wald_se = WaldSe::Rx;
+    o
 }
 
 /// Manifest's per-rung AGQ order (`spec["agq"]`), present only on the

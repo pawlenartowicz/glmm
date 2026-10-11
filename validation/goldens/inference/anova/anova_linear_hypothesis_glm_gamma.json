@@ -1,0 +1,43 @@
+{
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0",
+      "glmmTMB": "1.1.14"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_anova.R"
+  },
+  "case": "linear_hypothesis",
+  "coef_names": ["(Intercept)", "x", "grpb"],
+  "coef": [0.544828724608307, 0.541585460021296, 0.39683144372329],
+  "vcov": [
+    [0.00391100842707292, -6.99464821366206e-05, -0.00390810982048683],
+    [-6.99464821366206e-05, 0.00196674100569877, -1.15559502675868e-05],
+    [-0.00390810982048683, -1.15559502675868e-05, 0.00826879952839998]
+  ],
+  "L": [
+    [0, 0, 1]
+  ],
+  "row_names": ["grpb"],
+  "col_names": ["(Intercept)", "x", "grpb"],
+  "F": 19.0445050925043,
+  "num_df": 1,
+  "den_df": 197,
+  "p": 2.05938493875192e-05,
+  "name": "anova_linear_hypothesis_glm_gamma"
+}

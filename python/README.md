@@ -44,6 +44,7 @@ fit = glmm.fit(df, "passed ~ x1 + (1 | school)", "binomial", link="probit", nagq
 
 fit.summary()                     # coefficient table + variance components
 fit.beta, fit.se                  # estimates and standard errors
+fit.coef_df, fit.confint()        # t-test df (Satterthwaite on an LMM), intervals
 fit.converged, fit.singular       # result flags
 ```
 

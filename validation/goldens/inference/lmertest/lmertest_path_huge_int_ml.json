@@ -1,0 +1,84 @@
+{
+  "r_formula": "y ~ 1 + x + (1 | g)",
+  "reml": false,
+  "boundary": "none",
+  "theta": [0.0315934641288388],
+  "theta_names": ["g.(Intercept)"],
+  "cnms": [
+    ["(Intercept)"]
+  ],
+  "group_names": ["g"],
+  "group_levels": [20],
+  "sigma": 23.1513158405488,
+  "beta": [0.815091422311056, 0.578332819342211],
+  "coef_names": ["(Intercept)", "x"],
+  "cols_dropped": [],
+  "vcov_beta": [
+    [0.027685377007757, -1.11490576279396e-05],
+    [-1.11490576279396e-05, 0.000995617520081251]
+  ],
+  "deviance": 315.0613826643,
+  "estimate": [0.815091422311056, 0.578332819342211],
+  "std_error": [0.166389233449034, 0.0315534074242585],
+  "df": [20.0596880636196, 182.144095877899],
+  "t_value": [4.89870291133185, 18.3286962186399],
+  "p_value": [8.6090764804258e-05, 3.2998413638665e-43],
+  "level": 0.95,
+  "lower": [0.468075758217357, 0.51607562322059],
+  "upper": [1.16210708640475, 0.640590015463831],
+  "varpar_names": ["g.(Intercept)", "sigma"],
+  "vcov_varpar": [
+    [2.96005832627479e-05, -0.00209576566088947],
+    [-0.00209576566088947, 1.48834191286132]
+  ],
+  "Jac_list": [
+    [
+      [1.69339655320481, -3.34036838551927e-05],
+      [-3.34036838551927e-05, 0.000359988108395739]
+    ],
+    [
+      [0.00239168928440127, -9.63146777900261e-07],
+      [-9.63146777900261e-07, 8.60095838127246e-05]
+    ]
+  ],
+  "fd_settings": [
+    {
+      "hessian_d": 0.05,
+      "jacobian_d": 5e-05,
+      "r": 4
+    },
+    {
+      "hessian_d": 0.2,
+      "jacobian_d": 0.0002,
+      "r": 4
+    }
+  ],
+  "df_second": [
+    [20.0596880824468, 20.059688032122],
+    [182.144095877459, 182.144096431888]
+  ],
+  "conditions": [],
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_lmertest.R"
+  },
+  "name": "lmertest_path_huge_int_ml"
+}

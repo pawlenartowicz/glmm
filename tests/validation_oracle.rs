@@ -18,7 +18,7 @@
 //!
 //! This is NOT `validation/grid/run.sh`, which refits the external oracles to check
 //! what they say today. Different claims, both kept.
-#![cfg(all(feature = "oracle-tests", feature = "formula"))]
+#![cfg(feature = "oracle-tests")]
 
 mod oracle_support;
 
@@ -861,7 +861,9 @@ fn assert_documented_divergences_all_fired() {
     let mut expected = std::collections::BTreeSet::new();
     for e in reg.scoped() {
         if !in_corpus.contains(&e.cell) {
-            continue; // this tier has no golden for it; grid/compare.R owns that entry
+            // This tier has no golden for it; an inference driver or
+            // grid/compare.R owns that entry.
+            continue;
         }
         expected.insert(e.id.clone());
         if fired.contains(&e.id) {

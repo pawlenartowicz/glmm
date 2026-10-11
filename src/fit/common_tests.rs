@@ -1006,6 +1006,8 @@ fn fit_with_varcorr(vech: Vec<f64>) -> Fit {
         fitted: vec![],
         ranef: vec![],
         ranef_levels: vec![],
+        coef_df: vec![],
+        satterthwaite: None,
     }
 }
 

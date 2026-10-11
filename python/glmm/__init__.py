@@ -13,7 +13,7 @@ channel raises (`DiagnosticWarning`, `AgqFallbackWarning`,
 `FitFailedWarning`, `GradientSearchFallbackWarning`, `GlmDivergedWarning`, `HessianSeFallbackWarning`,
 `IllConditionedWarning`, `NbShapeUnsettledWarning`, `NoCoefficientsWarning`,
 `NonIntegerResponseWarning`, `PirlsExhaustedWarning`, `PrecisionLimitedWarning`,
-`RowsDroppedWarning`,
+`RowsDroppedWarning`, `SatterthwaiteCurvatureWarning`,
 `SearchLimitWarning`, `SeUnavailableWarning`, `SingleLevelGroupingDroppedWarning`,
 `SingularFitWarning`,
 `TooFewRowsWarning`, `UnusedGroupingLevelsWarning`).
@@ -47,6 +47,7 @@ __all__ = [
     "PirlsExhaustedWarning",
     "PrecisionLimitedWarning",
     "RowsDroppedWarning",
+    "SatterthwaiteCurvatureWarning",
     "SeUnavailableWarning",
     "SearchLimitWarning",
     "SingleLevelGroupingDroppedWarning",
@@ -174,6 +175,19 @@ class PrecisionLimitedWarning(DiagnosticWarning):
     the billions or more, either through the deviance itself (a model that
     misses a large effect) or, with more than one grouping factor, through the
     log-determinant of the random-effect system.
+    """
+
+
+class SatterthwaiteCurvatureWarning(DiagnosticWarning):
+    """The Satterthwaite degrees of freedom of a Gaussian linear mixed model are
+    approximate or could not be computed.
+
+    They are approximate when the curvature of the deviance in the variance
+    parameters has flat directions (left out) or negative ones, or when the
+    search stopped at its step limit. They could not be computed when the fit
+    has no finite end point or the deviance near it was not finite: then
+    `Fit.df_method` is "failed", every coefficient is tested with z and
+    `Fit.confint` gives normal intervals.
     """
 
 
@@ -608,6 +622,24 @@ class Fit:
     # kernel, not the `weights=` argument: a `cbind(s, f)` response lowers to
     # trial-count weights the caller never passed.
     weights: np.ndarray | None
+    # Per coefficient, aligned with `names`: the degrees of freedom of its t test
+    # (the Satterthwaite df on a Gaussian linear mixed model, n - p on OLS and on
+    # a Gamma or inverse-Gaussian GLM with phi estimated), NaN where the test is
+    # z and on an OLS or dispersion-GLM fit that did not converge; and that t
+    # test's two-sided p-value, computed by the kernel, NaN where there is no df.
+    coef_df: np.ndarray
+    coef_p: np.ndarray
+    # Where `coef_df` comes from: "satterthwaite", "residual" (OLS and the
+    # dispersion GLMs, whatever `satterthwaite=` says), "none" (the families
+    # with no df: z), "disabled" (a Gaussian mixed model fitted with
+    # `satterthwaite=False`: z) or "failed" (its Satterthwaite pass failed: z).
+    df_method: str
+    # OLS fits only (NaN on every other fit and on a non-converged one): the
+    # weighted residual sum of squares, and R's `summary.lm` multiple and
+    # adjusted R-squared (0 on an intercept-only model).
+    rss: float
+    r_squared: float
+    adj_r_squared: float
     # Every warning `fit` raised, in raise order: dicts with "tier" ("severe" |
     # "caution" | "note"), "kind" (stable; match on this), "title" and "message".
     # The texts are in documentation/warnings.md.
@@ -673,6 +705,30 @@ class Fit:
 
         return build_summary(self)
 
+    def confint(self, level=0.95):
+        """Confidence intervals for the fixed effects as a `(p, 2)` array of
+        lower and upper bounds, in the order of `names`. Each row follows
+        `summary()`: the t quantile on the row's `coef_df` where the summary
+        tests with t, the normal quantile where it tests with z (including a
+        Gaussian mixed model fitted with `satterthwaite=False`, whose summary
+        says "df not computed"). Aliased coefficients give NaN. The R port's
+        `confint()` computes the same intervals through the same kernel
+        function."""
+        # A Fit saved before `coef_df` existed has no df: normal intervals,
+        # as such a fit's summary tests with z.
+        coef_df = getattr(self, "coef_df", None)
+        if coef_df is None:
+            coef_df = np.full(len(self.beta), np.nan)
+        return np.asarray(
+            _native.confint(
+                [float(v) for v in self.beta],
+                [float(v) for v in self.se],
+                [float(v) for v in coef_df],
+                float(level),
+            ),
+            dtype=float,
+        ).reshape(len(self.beta), 2)
+
     def residuals(self, type="response"):
         """Response (`y - fitted`) or Pearson residuals. Deviance and working
         residuals are not offered: they need per-family deviance formulas
@@ -715,6 +771,7 @@ _WARNING_KINDS = {
     "agq_fallback": ("caution", "Adaptive quadrature not used"),
     "non_integer_response": ("caution", "Non-integer response"),
     "rows_dropped_na": ("caution", "Rows dropped for missing values"),
+    "satterthwaite_curvature": ("caution", "Satterthwaite df uncertain"),
     "argument_ignored": ("note", "Argument ignored"),
     "unused_grouping_levels": ("note", "Unused grouping levels"),
     "single_level_grouping_dropped": ("note", "Random effect dropped (single level)"),
@@ -894,12 +951,47 @@ def _note_warning(note, names, converged):
             ),
             NonIntegerResponseWarning,
         )
+    if kind == "satterthwaite_curvature":
+        return _satterthwaite_message(note["detail"]), SatterthwaiteCurvatureWarning
     return (
         (
             f"The solver reported something ('{kind}') that this installed version does not "
             "recognize. Please report it at https://github.com/pawlenartowicz/glmm/issues."
         ),
         DiagnosticWarning,
+    )
+
+
+def _satterthwaite_message(detail):
+    """The `satterthwaite_curvature` message from the kernel's detail string,
+    "dropped <n>, negative <n>, converged <bool>, nonfinite <bool>"
+    (src/orchestrate.rs). Mirrors the R port's .satterthwaite_message - change
+    together."""
+    fields = dict(part.split(" ", 1) for part in detail.split(", "))
+    if fields["nonfinite"] == "true":
+        return (
+            "The Satterthwaite degrees of freedom could not be computed: the fit has no finite "
+            "end point, or the deviance near it was not finite. Every coefficient is tested with "
+            "z, and its confidence interval uses the normal distribution."
+        )
+    parts = []
+    dropped, negative = int(fields["dropped"]), int(fields["negative"])
+    if dropped:
+        parts.append(
+            "the curvature of the deviance in the variance parameters has "
+            f"{_count(dropped, 'flat direction')}, left out"
+        )
+    if negative:
+        parts.append(
+            f"it has {_count(negative, 'negative direction')}, so the fit may not be at a minimum"
+        )
+    if fields["converged"] != "true":
+        parts.append(
+            "the variance search stopped at its step limit, so they are computed at its last point"
+        )
+    return (
+        f"The Satterthwaite degrees of freedom are approximate: {'; '.join(parts)}. The t tests "
+        "and confidence intervals use them as computed."
     )
 
 
@@ -1059,6 +1151,7 @@ def fit(
     wald_se="hessian",
     nagq=1,
     warm_start=None,
+    satterthwaite=True,
 ):
     """Fit `formula` against `data`'s columns and return a `Fit`.
 
@@ -1086,6 +1179,11 @@ def fit(
         dispersion as a previous fit reports it (`Fit.dispersion`): the shape
         for negative binomial, phi for Gamma. See `init_theta` above for why
         "theta" here is NOT the negative-binomial shape.
+    satterthwaite: compute lmerTest's Satterthwaite degrees of freedom for a
+        Gaussian mixed model's t tests (default True). False skips that pass:
+        the summary then tests with z and says "df not computed", and
+        `Fit.df_method` is "disabled". OLS and the Gamma and inverse-Gaussian
+        GLMs keep their residual df whatever it says.
 
     A categorical column's level order is honored: level 0 is the
     treatment-contrast base, so `pd.Categorical(x, categories=[…])` fits against
@@ -1140,6 +1238,10 @@ def fit(
         and nagq % 2 == 1
     ):
         raise ValueError(f"nagq must be an odd integer in 1..={_MAX_NAGQ}, got {nagq!r}")
+
+    if not isinstance(satterthwaite, (bool, np.bool_)):
+        raise TypeError(f"satterthwaite must be True or False, got {satterthwaite!r}")
+    satterthwaite = bool(satterthwaite)
 
     store = []
 
@@ -1368,6 +1470,7 @@ def fit(
         [float(w) for w in weights] if weights is not None else None,
         [float(v) for v in offset] if offset is not None else None,
         warm_start_pair,
+        satterthwaite,
     )
     # nagq's shape eligibility (single grouping factor, binomial/Poisson/NB/Gamma,
     # q <= 3) is only decidable after the Rust-side formula lowering, so the
@@ -1453,6 +1556,12 @@ def fit(
         nobs=int(r["nobs"]),
         y=np.asarray(r["y"], dtype=float),
         weights=np.asarray(r["weights"], dtype=float) if r["weights"] is not None else None,
+        coef_df=np.asarray(r["coef_df"], dtype=float),
+        coef_p=np.asarray(r["coef_p"], dtype=float),
+        df_method=r["df_method"],
+        rss=r["rss"],
+        r_squared=r["r_squared"],
+        adj_r_squared=r["adj_r_squared"],
         warnings=store,
         dispersion_held=dispersion,
     )
