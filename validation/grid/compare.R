@@ -798,7 +798,14 @@ load_inputs <- function(grid_dir) {
                         "a full run."), subset), call. = FALSE)
   }
   cells_all <- grid_cells_by_id(file.path(grid_dir, "manifest.json"))
-  cells <- if (opt_fast) Filter(function(cl) "fast" %in% cl[["tags"]], cells_all) else cells_all
+  # `--fast` selects what a `run.sh --fast` run fits: the `fast` cells, plus the
+  # `ml` twins when the run was made with `--ml` (run_meta `ml`; a run made
+  # before the flag existed has no such field and fitted no twins).
+  run_ml <- isTRUE(glmm_run$meta[["ml"]])
+  if (opt_fast && run_ml) cat("  ml:      the run was made with --ml, so the ML twins are selected too\n")
+  cells <- if (opt_fast) {
+    Filter(function(cl) "fast" %in% cl[["tags"]] || (run_ml && "ml" %in% cl[["tags"]]), cells_all)
+  } else cells_all
   if (!length(cells)) stop("no cell selected -- the manifest tags no cell `fast`", call. = FALSE)
   have <- intersect(names(cells), names(glmm_run$recs))
   cat(sprintf("  cells:   %d selected, %d with a glmm record, %d without\n",

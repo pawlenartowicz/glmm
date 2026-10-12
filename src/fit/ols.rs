@@ -7,7 +7,9 @@ use faer::Mat;
 use crate::ols::{OlsFitView, OlsScratch, OlsSuffStats, PANEL_ROWS};
 use crate::standardize::ColumnScaling;
 
-use super::common::{fill_se_compact, nan_vcov, residual_df, vcov_from_chol, FitDiagnostics};
+use super::common::{
+    fill_se_compact, lmm_loglik, nan_vcov, residual_df, vcov_from_chol, FitDiagnostics,
+};
 use super::{Fit, FitOptions};
 
 impl OlsFitView<'_> {
@@ -230,11 +232,16 @@ pub(crate) fn fit_ols_prebuilt<'a>(
 }
 
 /// Maps an [`OlsFitView`] to the full stable `Fit`. Needs the raw `x`/`y`/`n`
-/// because `fitted = o + Xβ̂` (raw rows) and the weighted ML Gaussian loglik are
+/// because `fitted = o + Xβ̂` (raw rows) and the weighted Gaussian loglik are
 /// recomputed from the original-scale data, not the √wᵢ-scaled accumulators.
 /// `beta` is the caller's β̂, `B·β̃` of the view's, with `map` the column map
 /// the view was fitted through: `x` is the caller's design, so `fitted` is
 /// formed with the caller's β.
+///
+/// `opts.reml` is read here and nowhere else on this route: `Some(true)`
+/// reports the REML log-likelihood and `Fit::reml`, every other value the ML
+/// one. The solve does not depend on it, so a `FitWorkspace` does not freeze
+/// it: the value of the `opts` this receives is the one reported.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn ols_view_to_fit(
     view: &OlsFitView<'_>,
@@ -262,7 +269,9 @@ pub(crate) fn ols_view_to_fit(
 
     // Fitted means Xβ̂ (raw rows — the √wᵢ scaling above is a solver device,
     // not part of the mean) and the ML Gaussian log-likelihood off the weighted
-    // RSS, R `logLik.lm`: ½(Σlog wᵢ − n(ln 2π + 1 − ln n + ln Σwᵢrᵢ²)).
+    // RSS, R `logLik.lm`: ½(Σlog wᵢ − n(ln 2π + 1 − ln n + ln Σwᵢrᵢ²)); under
+    // `reml = Some(true)` the REML one, R `logLik(lm, REML = TRUE)`.
+    let reml = opts.reml == Some(true);
     let (fitted, loglik) = if converged && n > 0 {
         let fitted: Vec<f64> = (0..n)
             .map(|i| {
@@ -280,9 +289,33 @@ pub(crate) fn ols_view_to_fit(
             .weights
             .as_ref()
             .map_or(0.0, |w| w.iter().map(|v| v.ln()).sum());
-        let nf = n as f64;
-        let ll =
-            0.5 * (sum_log_w - nf * ((2.0 * std::f64::consts::PI).ln() + 1.0 - nf.ln() + rss.ln()));
+        let ll = if reml {
+            // `ln|XᵀWX| + (n − p)·ln(RSS_w/(n − p)) − Σ ln wᵢ` on the caller's
+            // X: the deviance a REML Gaussian LMM with this fixed part reports
+            // when pinned at θ = 0, put through the LMM's own `lmm_loglik`, so
+            // the two share one scale (the ML branch below is likewise an ML
+            // LMM's logLik at θ = 0).
+            // `view.factor` is the Cholesky factor of the weighted Gram of the
+            // standardized X̃ (on the `DesignQr` route mapped back from
+            // `X̃·U⁻¹`, and `det U = 1`), so its log-determinant gets the
+            // standardization shift, as the LMM deviance does. `−Σ ln wᵢ` is
+            // the term the ML branch carries as `+½Σ ln wᵢ`. `converged`
+            // implies `n > p`.
+            let nu = (n - p) as f64;
+            let log_det = (0..p).map(|j| 2.0 * view.factor[(j, j)].ln()).sum::<f64>()
+                + map.reml_deviance_shift();
+            // An exact fit (`RSS_w = 0`) has deviance −∞ and log-likelihood +∞,
+            // as R's `logLik(lm, REML = TRUE)` and the ML branch below report;
+            // `lmm_loglik` would turn the non-finite deviance into NaN.
+            if rss == 0.0 {
+                f64::INFINITY
+            } else {
+                lmm_loglik(log_det + nu * (rss / nu).ln() - sum_log_w, n - p)
+            }
+        } else {
+            let nf = n as f64;
+            0.5 * (sum_log_w - nf * ((2.0 * std::f64::consts::PI).ln() + 1.0 - nf.ln() + rss.ln()))
+        };
         (fitted, ll)
     } else {
         (vec![], f64::NAN)
@@ -323,7 +356,7 @@ pub(crate) fn ols_view_to_fit(
         loglik,
         // p fixed effects + σ² (R logLik.lm's df).
         df: if converged { p + 1 } else { 0 },
-        reml: false,
+        reml,
         fitted,
         ranef: vec![],
         ranef_levels: vec![],

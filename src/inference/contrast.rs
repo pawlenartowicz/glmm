@@ -93,8 +93,8 @@ pub enum NoDfReason {
     NotGaussianMixed,
     /// The pass was switched off (`FitOptions::satterthwaite = false`).
     Disabled,
-    /// A Gaussian LMM `Fit` that carries no pass, such as one built by the
-    /// loop tier's `FitView::into_fit`.
+    /// A Gaussian LMM `Fit` no pass ran on, such as one built by the loop
+    /// tier's `FitView::into_fit`, REML or ML.
     StateMissing,
     /// The pass failed: a deviance or covariance on its stencil was not
     /// finite, the eigendecomposition of its Hessian failed, or the fit has no
@@ -257,14 +257,16 @@ impl Fit {
     }
 
     /// The pass's state (or the residual-only record of OLS and the
-    /// dispersion GLMs) when it carries df, or why there are none. `reml`
-    /// marks the Gaussian LMM routes, the only ones that run the pass.
+    /// dispersion GLMs) when it carries df, or why there are none. Every
+    /// Gaussian LMM `Fit` carries a record (its state, or a switched-off,
+    /// failed or not-run one) on either criterion; no record means a family
+    /// with no df.
     pub(crate) fn df_state(&self) -> Result<&SatterthwaiteState, ContrastError> {
         let reason = match &self.satterthwaite {
-            Some(st) if st.disabled => NoDfReason::Disabled,
-            Some(st) if st.failed => NoDfReason::Failed,
+            Some(st) if st.is_not_run() => NoDfReason::StateMissing,
+            Some(st) if st.is_disabled() => NoDfReason::Disabled,
+            Some(st) if st.is_failed() => NoDfReason::Failed,
             Some(st) => return Ok(st),
-            None if self.reml => NoDfReason::StateMissing,
             None => NoDfReason::NotGaussianMixed,
         };
         Err(ContrastError::NoDf(reason))

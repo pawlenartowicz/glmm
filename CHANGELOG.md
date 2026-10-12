@@ -10,7 +10,7 @@ shares these entries; Python-specific notes are called out where they differ.
 
 ### Added
 
-- **The `commonstats` dependency** (`0.2`, floor 0.2.1, `default-features =
+- **The `commonstats` dependency** (`0.2`, floor 0.2.2, `default-features =
   false`, features `dist` and `rng`; it brings `rand_philox` 0.2 with it):
   statistical distributions and the counter-based RNG the inference tests
   use. The t and F tests and `confint` below take their tails and quantiles
@@ -59,12 +59,12 @@ shares these entries; Python-specific notes are called out where they differ.
   - Checked against frozen lmerTest 3.2-1 references
     (`validation/goldens/inference/lmertest/`), and on the accuracy grid by a
     new `lmertest` engine, whose per-coefficient df `compare.R` checks on the
-    130 Gaussian mixed cells.
+    130 Gaussian mixed cells and their 129 ML twins.
 - **The ports carry the df.** `orchestrate::FitResult` gains `coef_df`,
   `coef_p` (the kernel's t-test p-value, NaN where there is no df),
   `df_method` (`"satterthwaite"`, `"residual"`, `"none"`, `"disabled"` or
   `"failed"`), and `rss`, `r_squared` and `adj_r_squared` (OLS only);
-  `orchestrate::run_fit` takes a trailing `satterthwaite: bool`; and
+  `orchestrate::run_fit` takes `satterthwaite: bool` after `warm_start`; and
   `orchestrate::confint` computes both ports' intervals. Python:
   `glmm.fit(..., satterthwaite=True)`, `Fit.coef_df`, `Fit.coef_p`,
   `Fit.df_method`, `Fit.rss`, `Fit.r_squared`, `Fit.adj_r_squared`, and
@@ -72,6 +72,60 @@ shares these entries; Python-specific notes are called out where they differ.
   `Fit.names`, with no `parm` argument. R: `fastglmm(..., satterthwaite =
   TRUE)` and `$coef_df`, `$coef_p`, `$df_method`, `$rss`, `$r_squared`,
   `$adj_r_squared`.
+- **Gaussian mixed models fit by maximum likelihood on request: a `reml`
+  argument, REML by default.** `FitOptions::reml: Option<bool>`, default
+  `None`: `None` and `Some(true)` fit a Gaussian mixed model by REML, bit for
+  bit as before, and `Some(false)` fits it by ML, on every kernel (dense,
+  blocked, sparse) and every route (the balanced collapse, BOBYQA, and BFGS on
+  the per-group gradient, whose ML form drops the `log|X'V⁻¹X|` term). The
+  value is frozen on the workspace at `build_workspace`, and `Fit::reml`
+  reports the criterion the kernel minimized. On an ML fit `Fit::deviance`,
+  `Fit::loglik` and `Fit::dispersion` are the ML ones (`σ̂² = r²/N`, no
+  standardization shift), and the Satterthwaite pass divides by `ν = N`, as
+  lmerTest does on a `REML = FALSE` fit. Python: `glmm.fit(..., reml=None)`;
+  R: `fastglmm(..., REML = NULL)`. The method is in
+  `documentation/algorithms-lmm.md`, "Profiled REML and ML objectives".
+  - The summary of an ML fit is titled "Linear mixed model fit by maximum
+    likelihood [glmm]" (R `[fastglmm]`), prints the AIC, BIC, logLik,
+    deviance and df.resid row, and prints "Note: p-values can be somewhat
+    anticonservative." directly under the title, in Python's text, HTML (a
+    callout), LaTeX and Typst (a boxed paragraph) renders and in R's
+    `print()` and `summary()`. The note cannot be switched off; REML, OLS,
+    GLM and GLMM fits print none.
+  - Checked against frozen lmerTest 3.2-1 `REML = FALSE` references (26
+    models and 6 per-term `anova` twins, `validation/goldens/inference/lmertest/`):
+    the ML deviance at glmm's own θ̂ is within 1.5e-9 (relative) of lme4's and
+    the Satterthwaite df within 3.5e-4 end to end, every row inside the REML
+    bands. The accuracy grid gains ML twins of 129 of its 130 Gaussian mixed
+    cells (tag `ml`), fitted by lme4, glmmTMB, MixedModels.jl and lmerTest with
+    their own ML switch; `validation/grid/run.sh --ml` adds them to a `--fast`
+    or `--timed` run.
+- **`reml = Some(true)` on OLS reports the REML log-likelihood**, as R's
+  `logLik(lm, REML = TRUE)`, and sets `Fit::reml`; β̂, the SEs and σ̂² do not
+  move. It is on the scale of an LMM pinned at zero variance (5.5e-16
+  relative on Dyestuff2). A formula whose every grouping was dropped as
+  single-level is OLS here too.
+- **The ports warn when `reml` is ignored.** `reml = Some(true)` on a GLM or
+  GLMM is the ML fit, as `None` is: the kernel ignores it without a note,
+  and `orchestrate::run_fit`, which gains a trailing `reml: Option<bool>`,
+  strips it and sets the new `FitResult::reml_warning`. The ports raise it as
+  an `argument_ignored` note, "reml=True applies only to Gaussian models; it
+  was ignored and the model was fitted by maximum likelihood." (R spelling
+  `REML = TRUE`; Python `ArgumentIgnoredWarning`, R class
+  `fastglmm_argument_ignored`). `reml = Some(false)` there changes nothing
+  and raises nothing.
+- **R `AIC.fastglmm` and `BIC.fastglmm`.** On one fit, and on ML fits, the
+  `stats` values and tables. A REML fit beside an ML fit (another package's
+  fit is read as lme4's `isREML()`, an `lm` or `glm` as ML, anything else by
+  its `logLik()`'s `REML` attribute) and fastglmm REML fits with different
+  fixed effects stop with an error naming the fits. The fixed effects are
+  compared as the sets of fixed terms, intercept included, of the stored
+  formulas, by the new `orchestrate::same_fixed_part`. `?AIC.fastglmm` lists
+  the four uses the methods cannot check.
+- **Python `Fit.aic` and `Fit.bic`**: properties, `-2·loglik + 2·df` and
+  `-2·loglik + df·ln(nobs)`, on every fit; the summary's ML criterion row
+  prints the same numbers. On a REML fit they are built on the REML
+  criterion and compare only fits with the same fixed effects.
 - **`formula::Lowered::terms` and `Lowered::has_intercept`**: the fixed terms
   in R's order as `formula::FixedTerm { label, vars, numeric, columns }` (R's
   `assign`, as column ranges, the intercept excluded), and whether the formula
@@ -79,6 +133,16 @@ shares these entries; Python-specific notes are called out where they differ.
 
 ### Changed
 
+- **R's `REML` is a formal argument of `fastglmm()`, and its refusals are
+  gone.** It is no longer intercepted in `...`. `REML = FALSE` on a Gaussian
+  mixed model fits by ML instead of stopping; `REML = TRUE` on a GLM or GLMM
+  warns and fits by ML instead of stopping; `REML = TRUE` on a Gaussian
+  formula whose every grouping was dropped reports the OLS REML
+  log-likelihood instead of stopping after the fit. A value that is not
+  `NULL` or one `TRUE` or `FALSE` still errors.
+- **R's `AIC()` and `BIC()` on REML fits with different fixed effects, or on a
+  REML fit beside an ML one, now stop with an error**, where 0.5.0 returned
+  the `stats` table.
 - **Coefficient tables test with t where lmerTest, `lm` and `glm` do.** A
   Gaussian mixed model prints `Estimate`, `Std. Error`, `df`, `t value` and
   `Pr(>|t|)`, with the footer "t tests use Satterthwaite degrees of freedom

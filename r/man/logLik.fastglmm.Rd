@@ -16,17 +16,21 @@ A \code{"logLik"} object with \code{df}, \code{nobs} and \code{REML} attributes.
 wherever the fit failed, matching \verb{$loglik}.
 }
 \description{
-On \code{stats::logLik}'s scale, so \code{AIC()} and \code{BIC()} work directly. This is
-\verb{glmm::Fit::loglik}, not \verb{$deviance} - the latter is the optimizer
-criterion. For an LMM it is lme4's REMLcrit minus a data-independent
-constant. For a GLMM it differs from \code{-2*logLik} by a data-only saturated
-constant on binomial/Poisson fits, and equals \code{-2*logLik} exactly on Gamma
-and negative-binomial fits.
+On \code{stats::logLik}'s scale, which \link[=AIC.fastglmm]{AIC()} and \code{BIC()} read.
+This is \verb{glmm::Fit::loglik}, not \verb{$deviance} - the latter is the optimizer
+criterion. For an LMM it is lme4's REMLcrit (on an ML fit, lme4's ML
+deviance) minus a data-independent constant. For a GLMM it differs from
+\code{-2*logLik} by a data-only saturated constant on binomial/Poisson fits, and
+equals \code{-2*logLik} exactly on Gamma and negative-binomial fits.
 }
 \details{
-For an LMM the value is the \strong{REML criterion}, matching \code{lme4::logLik} on a
-REML fit, and the returned object carries \code{REML = TRUE}. REML criteria are
-comparable only between models with identical fixed effects; an AIC across
-LMMs with different fixed effects is invalid. The LMM path is REML-only by
-design, so there is no ML value to return instead.
+On a REML fit (a Gaussian mixed model fitted with the default \code{REML}, or an
+OLS fit made with \code{REML = TRUE}) the value is the \strong{REML criterion},
+matching \code{lme4::logLik} on a REML fit (and \code{logLik(lm, REML = TRUE)} on
+OLS), and the returned object carries \code{REML = TRUE}. It stays the REML value
+because that is the quantity for comparing random-effect structures with the
+same fixed effects. REML criteria are comparable only between models with
+identical fixed effects: \code{AIC()} and \code{BIC()} refuse REML fits with different
+fixed effects. To compare fixed effects, fit both models with
+\code{REML = FALSE}; an ML fit returns the ML log-likelihood, with \code{REML = FALSE}.
 }

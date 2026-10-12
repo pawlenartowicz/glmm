@@ -10,7 +10,8 @@ wrapper, and R CMD check flags non-ASCII R sources.}
 \description{
 Optionals use in-band absent values (the raw bridge is not the user API):
 an empty vector means absent - for \code{dispersion} too (a scalar \code{f64} would
-force NA/NaN through extendr's NA check, which rejects it).
+force NA/NaN through extendr's NA check, which rejects it), and for
+\code{reml} (\code{logical(0)} is \code{None}, one \code{TRUE}/\code{FALSE} is \code{Some}).
 \code{vcov} crosses flattened row-major with \code{names} carrying p; the R wrapper
 rebuilds the p x p matrix (it is symmetric, so the order is moot).
 }

@@ -431,7 +431,16 @@ fn ols_coef_df_is_n_minus_p() {
         satterthwaite: false,
         ..all(p)
     };
-    for opts in [all(p), weighted, switched_off] {
+    // ν is the residual df on either criterion: `reml` moves OLS's
+    // log-likelihood, never its df.
+    let criterion = |reml| FitOptions { reml, ..all(p) };
+    for opts in [
+        all(p),
+        weighted,
+        switched_off,
+        criterion(Some(false)),
+        criterion(Some(true)),
+    ] {
         let f = fit_cold(&x, &y, n, p, &model, &GroupIds::default(), &opts);
         assert!(f.converged());
         assert_eq!(f.coef_df, vec![nu; p]);
@@ -497,4 +506,317 @@ fn ols_coef_df_is_n_minus_p() {
         .contrast_f(&[0.0, 1.0, 0.0, 0.0, 0.0, 1.0], 2)
         .expect("the residual record, not NoDf");
     assert!(fs.f.is_nan() && fs.p_value.is_nan());
+}
+
+// --- `reml = Some(true)`: the REML log-likelihood ---
+
+/// The closed-form REML deviance `ln|XᵀWX| + (n − p)·ln(RSS_w/(n − p)) − Σ ln wᵢ`
+/// on the caller's X, from the normal equations solved here with a plain
+/// Cholesky (no standardization, no fit). `x` is row-major `n × p`.
+fn closed_form_reml_deviance(
+    x: &[f64],
+    y: &[f64],
+    n: usize,
+    p: usize,
+    w: Option<&[f64]>,
+    o: Option<&[f64]>,
+) -> f64 {
+    let wt = |i: usize| w.map_or(1.0, |w| w[i]);
+    let z = |i: usize| y[i] - o.map_or(0.0, |o| o[i]);
+    let (mut a, mut b) = (vec![0.0; p * p], vec![0.0; p]);
+    for i in 0..n {
+        let row = &x[i * p..(i + 1) * p];
+        for j in 0..p {
+            b[j] += wt(i) * row[j] * z(i);
+            for k in 0..p {
+                a[j * p + k] += wt(i) * row[j] * row[k];
+            }
+        }
+    }
+    let mut l = vec![0.0; p * p];
+    for j in 0..p {
+        for i in j..p {
+            let s = a[i * p + j] - (0..j).map(|k| l[i * p + k] * l[j * p + k]).sum::<f64>();
+            l[i * p + j] = if i == j { s.sqrt() } else { s / l[j * p + j] };
+        }
+    }
+    for i in 0..p {
+        b[i] = (b[i] - (0..i).map(|k| l[i * p + k] * b[k]).sum::<f64>()) / l[i * p + i];
+    }
+    for i in (0..p).rev() {
+        b[i] = (b[i] - (i + 1..p).map(|k| l[k * p + i] * b[k]).sum::<f64>()) / l[i * p + i];
+    }
+    let rss: f64 = (0..n)
+        .map(|i| {
+            let r = z(i) - (0..p).map(|j| x[i * p + j] * b[j]).sum::<f64>();
+            wt(i) * r * r
+        })
+        .sum();
+    let nu = (n - p) as f64;
+    let log_det: f64 = (0..p).map(|j| 2.0 * l[j * p + j].ln()).sum();
+    log_det + nu * (rss / nu).ln() - (0..n).map(|i| wt(i).ln()).sum::<f64>()
+}
+
+/// `−½·(d + (n − p)(1 + ln 2π))`: a REML deviance on the `logLik()` scale.
+fn reml_loglik(d: f64, n: usize, p: usize) -> f64 {
+    -0.5 * (d + (n - p) as f64 * (1.0 + (2.0 * std::f64::consts::PI).ln()))
+}
+
+/// `reml = Some(true)` on OLS moves only the log-likelihood and the flag: β̂,
+/// the SEs, `vcov` and `σ̂² = RSS/(n − p)` are the `None` fit's bit for bit,
+/// `reml` is `true`, `deviance` stays NaN, and `loglik` is R's
+/// `logLik(lm, REML = TRUE)`, the closed form computed here. Plain, weighted
+/// and with an offset, on a standardized design (so the standardization shift
+/// is exercised); then once on the `DesignQr` route.
+#[test]
+fn ols_reml_reports_the_closed_form_reml_loglik() {
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: None,
+    };
+    let bits = |v: &[f64]| v.iter().map(|t| t.to_bits()).collect::<Vec<_>>();
+    let (x, y, w, n, p) = residual_df_data(false);
+    let o: Vec<f64> = (0..n).map(|i| 0.3 * (i % 4) as f64).collect();
+    let base = FitOptions {
+        target_indices: (0..p as u32).collect(),
+        ..FitOptions::default()
+    };
+    let variants = [
+        ("plain", base.clone()),
+        (
+            "weights",
+            FitOptions {
+                weights: Some(w),
+                ..base.clone()
+            },
+        ),
+        (
+            "offset",
+            FitOptions {
+                offset: Some(o),
+                ..base
+            },
+        ),
+    ];
+    for (tag, opts) in variants {
+        let ml = fit_cold(&x, &y, n, p, &model, &GroupIds::default(), &opts);
+        let f = fit_cold(
+            &x,
+            &y,
+            n,
+            p,
+            &model,
+            &GroupIds::default(),
+            &FitOptions {
+                reml: Some(true),
+                ..opts.clone()
+            },
+        );
+        assert!(ml.converged() && f.converged(), "{tag}");
+        assert_eq!(bits(&f.beta), bits(&ml.beta), "{tag}: beta");
+        assert_eq!(bits(&f.se), bits(&ml.se), "{tag}: se");
+        assert_eq!(
+            bits(&f.vcov.concat()),
+            bits(&ml.vcov.concat()),
+            "{tag}: vcov"
+        );
+        assert_eq!(f.dispersion.to_bits(), ml.dispersion.to_bits(), "{tag}: σ̂²");
+        assert!(f.reml && !ml.reml, "{tag}: reml");
+        assert!(f.deviance.is_nan(), "{tag}: deviance");
+        let d = closed_form_reml_deviance(
+            &x,
+            &y,
+            n,
+            p,
+            opts.weights.as_deref(),
+            opts.offset.as_deref(),
+        );
+        let want = reml_loglik(d, n, p);
+        assert!(
+            (f.loglik - want).abs() <= 1e-10 * want.abs(),
+            "{tag}: loglik {} vs the closed form {want}",
+            f.loglik
+        );
+    }
+
+    // The `DesignQr` route (`fit_ols_entangled_columns_keep_their_digits`):
+    // `X = Xr·T` with `det T = δ`, so `ln|XᵀX|` is `ln|XrᵀXr| + 2 ln δ`, the
+    // RSS is the same, and the REML log-likelihood moves by exactly `−ln δ`.
+    let n = 200;
+    let (x, xr, delta) = super::common_tests::entangled_dyadic_designs(n);
+    let mut st = 5u64;
+    let y: Vec<f64> = (0..n)
+        .map(|i| {
+            0.5 + 0.3 * xr[3 * i + 1] + 0.2 * xr[3 * i + 2] + super::common_tests::lcg(&mut st)
+        })
+        .collect();
+    let opts = FitOptions {
+        target_indices: vec![0, 1, 2],
+        reml: Some(true),
+        ..FitOptions::default()
+    };
+    let f = fit_cold(&x, &y, n, 3, &model, &GroupIds::default(), &opts);
+    let r = fit_cold(&xr, &y, n, 3, &model, &GroupIds::default(), &opts);
+    let want = r.loglik - delta.ln();
+    assert!(
+        (f.loglik - want).abs() <= 1e-10 * want.abs(),
+        "DesignQr route: loglik {} vs {want}",
+        f.loglik
+    );
+}
+
+/// `None` and `Some(false)` on OLS are the same path: the ML log-likelihood,
+/// `reml` false, every field bit for bit.
+#[test]
+fn ols_reml_none_and_false_give_the_same_fit() {
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: None,
+    };
+    let (x, y, w, n, p) = residual_df_data(false);
+    let opts = FitOptions {
+        target_indices: (0..p as u32).collect(),
+        weights: Some(w),
+        ..FitOptions::default()
+    };
+    let none = fit_cold(&x, &y, n, p, &model, &GroupIds::default(), &opts);
+    let ml = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &GroupIds::default(),
+        &FitOptions {
+            reml: Some(false),
+            ..opts
+        },
+    );
+    assert!(!none.reml);
+    super::core::core_tests::assert_fits_bitwise_equal(&ml, &none, "reml = Some(false)");
+}
+
+/// An aliased OLS design under `Some(true)` reports `reml` true and the
+/// reduced fit's REML log-likelihood (`fit_rank_deficient` passes both through).
+#[test]
+fn ols_reml_survives_an_aliased_column() {
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: None,
+    };
+    let opts = |p: usize| FitOptions {
+        target_indices: (0..p as u32).collect(),
+        reml: Some(true),
+        ..FitOptions::default()
+    };
+    let (x, y, _, n, p) = residual_df_data(true);
+    let f = fit_cold(&x, &y, n, p, &model, &GroupIds::default(), &opts(p));
+    assert_eq!(f.diagnostics.aliased, vec![false, false, false, true]);
+    assert!(f.reml);
+    let (xr, yr, _, nr, pr) = residual_df_data(false);
+    let r = fit_cold(&xr, &yr, nr, pr, &model, &GroupIds::default(), &opts(pr));
+    assert!(r.loglik.is_finite());
+    assert_eq!(f.loglik.to_bits(), r.loglik.to_bits());
+}
+
+/// The scale test: the OLS fit's REML log-likelihood, put on the deviance
+/// scale by the inverse of `fit::common::lmm_loglik`, equals the deviance of
+/// the mixed fit `y ~ 1 + (1 | Batch)` pinned at zero variance, to round-off.
+/// Dyestuff2 (lme4's data), where the REML fit is singular. Three variants:
+/// plain; prior weights `1 + 0.5·k`; an offset `0.4·(k − 2)`, with `k` the row's
+/// place in its batch (0 to 4). lme4 pins every variant too (R 2026-10-12,
+/// lme4 2.0.6, `getME(m, "theta")` 0). The fixed part is the intercept
+/// alone, so the standardization shift is 0 here;
+/// `ols_reml_reports_the_closed_form_reml_loglik` is the test that catches a
+/// missing shift.
+#[test]
+fn ols_reml_loglik_is_on_the_lmm_deviance_scale() {
+    // Band: an error bound, not the measured gap. Measured 2026-10-12 on
+    // validation/data/empirical/Dyestuff2.csv, relative to the deviance (about
+    // 80): 3.6e-16 plain, 3.5e-16 weights, 5.5e-16 offset (2 to 3 ulps), the
+    // same bits on x86_64 Linux and on wasm32-wasip1 (plain and simd128). The
+    // round-off of the two routes (the LMM tail's cancellation and the OLS
+    // route's log-determinant and `ln`) bounds the gap at about 1.4e-15
+    // relative; the band is that bound, rounded up.
+    const BAND: f64 = 2e-15;
+    let csv = include_str!("../../validation/data/empirical/Dyestuff2.csv");
+    let (mut y, mut g, mut k) = (vec![], vec![], vec![]);
+    let mut seen = [0u32; 6];
+    for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+        let (batch, yield_) = line.split_once(',').unwrap();
+        let b = u32::from(batch.trim_matches('"').as_bytes()[0] - b'A');
+        g.push(b);
+        k.push(f64::from(seen[b as usize]));
+        seen[b as usize] += 1;
+        y.push(yield_.parse::<f64>().unwrap());
+    }
+    let (n, p) = (y.len(), 1);
+    assert_eq!((n, seen), (30, [5; 6]));
+    let x = vec![1.0; n];
+    let mixed = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(crate::ReStructure {
+            sizing: crate::Sizing::FixedClusters { n_clusters: 6 },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let ols = ModelSpec {
+        family: Family::Gaussian,
+        re: None,
+    };
+    let ids = GroupIds {
+        primary: g,
+        extra: vec![],
+    };
+    let base = FitOptions {
+        target_indices: vec![0],
+        ..FitOptions::default()
+    };
+    let variants = [
+        ("plain", base.clone()),
+        (
+            "weights",
+            FitOptions {
+                weights: Some(k.iter().map(|k| 1.0 + 0.5 * k).collect()),
+                ..base.clone()
+            },
+        ),
+        (
+            "offset",
+            FitOptions {
+                offset: Some(k.iter().map(|k| 0.4 * (k - 2.0)).collect()),
+                ..base
+            },
+        ),
+    ];
+    for (tag, opts) in variants {
+        let m = fit_cold(&x, &y, n, p, &mixed, &ids, &opts);
+        assert!(m.converged(), "{tag}: the mixed fit converges");
+        assert_eq!(
+            m.tau2,
+            [0.0],
+            "{tag}: the mixed fit is pinned at zero variance"
+        );
+        let f = fit_cold(
+            &x,
+            &y,
+            n,
+            p,
+            &ols,
+            &GroupIds::default(),
+            &FitOptions {
+                reml: Some(true),
+                ..opts
+            },
+        );
+        assert!(f.converged() && f.reml, "{tag}: the OLS REML fit");
+        let closed = -2.0 * f.loglik - (n - p) as f64 * (1.0 + (2.0 * std::f64::consts::PI).ln());
+        let gap = (closed - m.deviance).abs() / m.deviance.abs();
+        assert!(
+            gap <= BAND,
+            "{tag}: closed form {closed} vs the pinned fit's deviance {} (relative gap {gap:e})",
+            m.deviance
+        );
+    }
 }

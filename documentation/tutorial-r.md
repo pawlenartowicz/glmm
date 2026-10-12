@@ -75,8 +75,9 @@ Points worth knowing at this layer:
   logical `x` has levels `FALSE`/`TRUE` and fits a coefficient `xTRUE`, as in
   lme4); a factor's declared level order is honored.
 - The default `family = gaussian()` with no `(… | g)` term fits **OLS**; adding a
-  random-effect term makes it an **LMM** (REML). The same split holds for every
-  family: fixed-only ⇒ GLM, `(… | g)` present ⇒ GLMM.
+  random-effect term makes it an **LMM** (REML by default, maximum likelihood
+  with `REML = FALSE`). The same split holds for every family: fixed-only ⇒
+  GLM, `(… | g)` present ⇒ GLMM.
 - The formula follows R conventions: `+`, `:`, `*` (main effects +
   interaction), `A/B` nesting, `- 1`/`0 +` (drops the intercept),
   `log()`/`sqrt()`/`exp()`/`I(x^k)` on one bare column, `offset()`,
@@ -159,6 +160,17 @@ The knobs:
   intervals with the same message, and `fit$df_method` is `"disabled"`. OLS
   and the Gamma and inverse-Gaussian GLMs keep their residual df `n - p`
   whatever it says; no other family reads it.
+- `REML`: `NULL` (default) or `TRUE` fits a Gaussian mixed model by REML,
+  `FALSE` by maximum likelihood, as `lmer(REML = FALSE)`. The summary of an ML
+  fit is titled "Linear mixed model fit by maximum likelihood", prints the
+  `AIC BIC logLik deviance df.resid` row in place of the REML criterion, and
+  prints one line under the title: "Note: p-values can be somewhat
+  anticonservative." On OLS (also when every grouping was dropped as
+  single-level) the estimates are the same under every value: `TRUE` reports
+  the REML log-likelihood, as `logLik(lm, REML = TRUE)`, and `NULL` and `FALSE`
+  the ML one. Every other family is fitted by maximum likelihood; `FALSE` there
+  changes nothing, and `TRUE` is ignored with an `argument_ignored` warning.
+  `fit$reml` says which criterion the fit's log-likelihood is.
 - `start` — warm start; see §4.
 - `init.theta` — negative-binomial shape seed, named for
   `MASS::glm.nb(init.theta=)`: the starting value of the shape search, the
@@ -168,20 +180,17 @@ The knobs:
 
 **Error vs. warning.** An *invalid* value — unknown family, a link the family
 doesn't offer, a non-odd or out-of-range `nAGQ`, a `start` that isn't a list —
-**errors**. A *valid but inapplicable* option — `dispersion=` on gaussian,
+**errors**. A *valid but inapplicable* option (`dispersion=` on gaussian,
 `init.theta=` off negative-binomial, quasi-dispersion on a mixed
-binomial/Poisson formula — **warns and is stripped**, so it never reaches the
-kernel: loud enough to catch the mistake, lenient enough for exploration.
+binomial/Poisson formula, `REML = TRUE` off the Gaussian family) **warns and
+is stripped**, so it never reaches the kernel: loud enough to catch the
+mistake, lenient enough for exploration.
 
 Three things error *naming the reason* rather than fitting a silently different
 model. Known lme4 arguments passed through `...` (`control=`, `verbose=`,
-`contrasts=`) each explain why they can't be honored. `REML =` is checked
-against the model: `REML = FALSE` on a Gaussian mixed model errors, because the
-LMM path is REML-only by design, and `REML = TRUE` on any other model errors,
-because that model is fitted by maximum likelihood. `REML = FALSE` on a model
-that is not a Gaussian mixed model is accepted and changes nothing. A
-random-effect term on `family = inverse.gaussian()` errors — the kernel is
-GLM-only for that family — and the remaining open gap, quasi-likelihood
+`contrasts=`) each explain why they can't be honored. A random-effect term
+on `family = inverse.gaussian()` errors — the kernel is GLM-only for that
+family — and the remaining open gap, quasi-likelihood
 dispersion on binomial/Poisson, errors until the kernel implements it.
 (`init.theta=` off negative-binomial is the harmless warn-and-strip case
 above.)
@@ -193,7 +202,7 @@ shaped like lme4's. These **work**:
 
 | accessor | what it returns |
 |---|---|
-| `summary(fit)` | lme4's blocks in lme4's order: the criterion (`REML criterion at convergence` on an LMM, an `AIC BIC logLik deviance df.resid` row on an ML fit), scaled residuals, the RE block, the coefficient table, the correlation of fixed effects, and a dispersion/shape footer. The coefficient table follows lmerTest, `lm` and `glm`: on a Gaussian mixed model `Estimate`, `Std. Error`, `df` (Satterthwaite), `t value`, `Pr(>|t|)`; on OLS and the Gamma and inverse-Gaussian GLMs with an estimated dispersion, t on the residual df `n - p`, printed in the footer (on OLS with `summary.lm`'s residual standard error and R-squared lines); everywhere else Wald **z** and `Pr(>|z|)`. When the fit raised any warnings, the printed summary ends with a `Warnings:` section listing each one's tier, title and message. |
+| `summary(fit)` | lme4's blocks in lme4's order: the criterion (`REML criterion at convergence` on a REML fit, an `AIC BIC logLik deviance df.resid` row on an ML fit; an LMM fitted with `REML = FALSE` is titled "Linear mixed model fit by maximum likelihood" and prints "Note: p-values can be somewhat anticonservative." under the title), scaled residuals, the RE block, the coefficient table, the correlation of fixed effects, and a dispersion/shape footer. The coefficient table follows lmerTest, `lm` and `glm`: on a Gaussian mixed model `Estimate`, `Std. Error`, `df` (Satterthwaite), `t value`, `Pr(>|t|)`; on OLS and the Gamma and inverse-Gaussian GLMs with an estimated dispersion, t on the residual df `n - p`, printed in the footer (on OLS with `summary.lm`'s residual standard error and R-squared lines); everywhere else Wald **z** and `Pr(>|z|)`. When the fit raised any warnings, the printed summary ends with a `Warnings:` section listing each one's tier, title and message. |
 | `fixef(fit)` | named fixed-effect estimates; aliased (rank-deficient) columns are `NA`, as in `lm`/lme4. |
 | `vcov(fit)` | full `p × p` Wald covariance of β̂. |
 | `VarCorr(fit)` | variance components on the **SD/correlation** scale, one covariance per grouping, lme4-shaped; a `Residual` row (= `sigma()`) is printed for a gaussian mixed fit. Groups are listed in the order they appear in the formula — lme4's own `VarCorr` instead sorts by decreasing number of levels. |
@@ -207,7 +216,8 @@ shaped like lme4's. These **work**:
 | `tidy(fit)`, `glance(fit)` | broom-shaped data frames: one row per fixed effect (`term`, `estimate`, `std.error`, `statistic`, then `df` where `summary()` has a df column, then `p.value`; the statistic and p-value are the summary's, t or z), and one row of fit statistics (`nobs`, `logLik`, `AIC`, `BIC`, `deviance`, `df.residual`, `REML`). |
 | `fit$coef_df`, `fit$coef_p`, `fit$df_method` | per coefficient, the df of its t test (Satterthwaite on a Gaussian mixed model, `n - p` on OLS and the dispersion GLMs, `NaN` where the test is z and on an OLS or dispersion-GLM fit that did not converge) and that test's p-value; `df_method` says which (`"satterthwaite"`, `"residual"`, `"none"`, `"disabled"`, `"failed"`). |
 | `fit$rss`, `fit$r_squared`, `fit$adj_r_squared` | OLS only: the weighted residual sum of squares and `summary.lm`'s multiple and adjusted R-squared (0 on an intercept-only model); `NaN` on every other fit and on a non-converged one. |
-| `logLik(fit)` | log-likelihood on `stats::logLik`'s scale, so `AIC()`/`BIC()` work; on the LMM paths this is the REML criterion (`REML = TRUE` attribute). |
+| `logLik(fit)` | log-likelihood on `stats::logLik`'s scale; on a REML fit (a Gaussian mixed model with the default `REML`, or OLS with `REML = TRUE`) this is the REML criterion (`REML = TRUE` attribute), on every other fit the ML log-likelihood (`REML = FALSE`). |
+| `AIC(fit)`, `BIC(fit)` | `stats`'s values and tables, read from `logLik()`. Two comparisons stop with an error instead: a REML fit beside an ML fit (the error names which is which), and REML fits with different fixed effects, whose REML criteria are not comparable (the error points to `REML = FALSE`). ML fits compare across fixed effects as in `stats`. See `?AIC.fastglmm` for the uses it cannot check. |
 | `fit$diagnostics` | list with `converged`, `singular`, `aliased`, `boundary`, `pinned`, `notes` — the solver's own report; the top-level `fit$converged`/`fit$singular`/`fit$aliased` are unchanged and mirror the same values. |
 
 On the Gaussian mixed model of §1:

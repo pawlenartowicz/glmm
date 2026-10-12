@@ -173,8 +173,9 @@ standard deviation 1, and the results map back exactly:
   on θ̃: `Σ_kk` is a polynomial in θ̃, so one formula serves every block and
   no factorization is differentiated.
 - **REML deviance.** `ln|X̃ᵀV⁻¹X̃| = ln|XᵀV⁻¹X| − 2·Σⱼ ln sⱼ` (a shift has
-  determinant 1), so the LMM adds `2·Σⱼ ln sⱼ` back to its deviance and
-  log-likelihood. No other deviance contains an `X` term.
+  determinant 1), so a REML LMM fit adds `2·Σⱼ ln sⱼ` back to its deviance
+  and log-likelihood (the ML criterion has no `X` term), and the OLS REML
+  log-likelihood adds it as well. No other criterion contains an `X` term.
 - **Warm starts.** A `StartValues` is in the caller's units and is mapped
   forward per draw: `β̃ = B⁻¹β`, and `Λ̃` the lower factor of
   `N⁻¹·ΛΛᵀ·N⁻ᵀ`. Its `dispersion` (NB shape, Gamma φ) needs no map: neither
@@ -243,6 +244,7 @@ and are not user-facing.
 | `offset` | per-row offset `oᵢ` added to the linear predictor | every path — [OLS](#ordinary-least-squares-ols)/[GLM](#generalised-linear-models-glm) here, mixed paths in the LMM/GLMM pages |
 | `parallel_inner` | experimental opt-in to parallel inner kernels | GLMM only — AGQ/FD-Hessian, [`algorithms-glmm.md`](algorithms-glmm.md#standard-errors) (off by default, bit-identical to serial) |
 | `satterthwaite` | run the Satterthwaite pass after a Gaussian LMM fit (`Fit::coef_df`, `Fit::contrast_t`, `Fit::contrast_f`); default `true`, `false` leaves `coef_df` NaN and the contrasts return `NoDfReason::Disabled` | LMM only, [`algorithms-lmm.md`](algorithms-lmm.md#satterthwaite-degrees-of-freedom); OLS and the dispersion GLMs keep their residual df `n − p` whatever it says |
+| `reml` | the Gaussian criterion: `None` (default) and `Some(true)` fit a Gaussian mixed model by REML, `Some(false)` by ML; frozen on the workspace at build, and `Fit::reml` reports the resolved value. On OLS the estimates are the same under every value and `Some(true)` reports the REML log-likelihood. On a GLM or GLMM every value is the ML fit (`Some(true)` is ignored silently; the ports' `orchestrate::run_fit` strips it and sets `FitResult::reml_warning`) | LMM, [`algorithms-lmm.md`](algorithms-lmm.md#profiled-reml-and-ml-objectives); OLS, [OLS](#ordinary-least-squares-ols) here |
 
 ### Loop-tier settings (`loop_advanced`, no semver guarantee)
 
@@ -331,6 +333,16 @@ and, below `PIVOT_MIN = 1e-12`, recorded as an `IllConditioned` note on
 `eps_rank` parameter. `Fit::dispersion` carries `σ̂²` on this path (`NaN` on
 any non-converged return); `Fit::deviance` is **always** `NaN` on the OLS
 path — it is never populated, converged or not.
+
+**Log-likelihood.** `Fit::loglik` is the ML log-likelihood of `logLik(lm)` by
+default. Under `FitOptions::reml = Some(true)` it is the REML one, as
+`logLik(lm, REML = TRUE)`: the profiled REML deviance
+`2·Σⱼ ln L_jj + (n − p)·ln(RSS_w/(n − p)) − Σ ln wᵢ` (with the standardization
+shift added back, as on the LMM), through the LMM's own `lmm_loglik` with
+`ν = n − p`, so it sits on the scale of a Gaussian mixed fit pinned at zero
+variance. `Fit::reml` is `true` then. β̂, the SEs, σ̂² and the RSS do not
+depend on it. The value is read at assembly (`ols_view_to_fit`), so an OLS
+workspace is not frozen on it.
 
 **Offset.** A `FitOptions::offset` is applied as an exact response pre-shift:
 the accumulator sees `y − o`, applied *before* any weight scaling so the two

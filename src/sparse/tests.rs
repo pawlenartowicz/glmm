@@ -501,16 +501,30 @@ fn run_sparse_deviance_equals_dense_crossed() {
     suff.add_rows_multi(x.as_ref(), &y, &cl, &extra_ids, None);
     let mut fit = crate::lmm::LmmFitScratch::with_groupings(p, &g);
 
-    let mut ws = super::SparseLmmWorkspace::new(&g, x.as_ref(), &cl, &extra_ids, &y, n, p, None);
+    let mut ws = super::SparseLmmWorkspace::new(
+        &g,
+        x.as_ref(),
+        &cl,
+        &extra_ids,
+        &y,
+        n,
+        p,
+        None,
+        crate::lmm::Criterion::Reml,
+    );
 
     // θ has 2 scalar components here (primary intercept var, crossed var).
-    for theta in [[0.5f64, 0.7], [1.0, 0.2], [0.1, 1.3]] {
-        let dense = crate::lmm::reml_deviance(&theta, &suff, &mut fit);
-        let sparse = super::sparse_reml_deviance(&theta, &mut ws);
-        assert!(
-            (dense - sparse).abs() < 1e-8 * (1.0 + dense.abs()),
-            "θ={theta:?}: dense {dense} vs sparse {sparse}"
-        );
+    for criterion in [crate::lmm::Criterion::Reml, crate::lmm::Criterion::Ml] {
+        fit.criterion = criterion;
+        ws.criterion = criterion;
+        for theta in [[0.5f64, 0.7], [1.0, 0.2], [0.1, 1.3]] {
+            let dense = crate::lmm::reml_deviance(&theta, &suff, &mut fit);
+            let sparse = super::sparse_reml_deviance(&theta, &mut ws);
+            assert!(
+                (dense - sparse).abs() < 1e-8 * (1.0 + dense.abs()),
+                "{criterion:?} θ={theta:?}: dense {dense} vs sparse {sparse}"
+            );
+        }
     }
 }
 
@@ -575,7 +589,17 @@ fn sparse_deviance_equals_dense_primary_slope_balanced_zero() {
     suff.add_rows_multi(x.as_ref(), &y, &cl, &extra_ids, None);
     let mut fit = crate::lmm::LmmFitScratch::with_groupings(p, &g);
 
-    let mut ws = super::SparseLmmWorkspace::new(&g, x.as_ref(), &cl, &extra_ids, &y, n, p, None);
+    let mut ws = super::SparseLmmWorkspace::new(
+        &g,
+        x.as_ref(),
+        &cl,
+        &extra_ids,
+        &y,
+        n,
+        p,
+        None,
+        crate::lmm::Criterion::Reml,
+    );
 
     // θ = vech(Λ) with all three components nonzero → Λ genuinely non-diagonal.
     for theta in [[0.8f64, 0.3, 0.6], [1.0, 0.5, 0.4], [0.2, 0.7, 0.9]] {
@@ -629,7 +653,17 @@ fn sparse_tail_pattern_two_family_cliques_unobserved_level() {
     assert_eq!(g.k_crossed(), 5, "unobserved levels counted from the spec");
 
     let mut ws_sparse = with_forced_sparse_tail(|| {
-        super::SparseLmmWorkspace::new(&g, x.as_ref(), &cl, &extra_ids, &y, n, p, None)
+        super::SparseLmmWorkspace::new(
+            &g,
+            x.as_ref(),
+            &cl,
+            &extra_ids,
+            &y,
+            n,
+            p,
+            None,
+            crate::lmm::Criterion::Reml,
+        )
     });
     let tail = ws_sparse.tail.as_ref().expect("forced sparse tail");
     let sym = tail.axx.symbolic();
@@ -645,8 +679,17 @@ fn sparse_tail_pattern_two_family_cliques_unobserved_level() {
     );
 
     // Deviance equality vs the dense-tail branch at several θ …
-    let mut ws_dense =
-        super::SparseLmmWorkspace::new(&g, x.as_ref(), &cl, &extra_ids, &y, n, p, None);
+    let mut ws_dense = super::SparseLmmWorkspace::new(
+        &g,
+        x.as_ref(),
+        &cl,
+        &extra_ids,
+        &y,
+        n,
+        p,
+        None,
+        crate::lmm::Criterion::Reml,
+    );
     assert!(ws_dense.tail.is_none(), "e=5 stays on the dense tail bare");
     for theta in [[0.5f64, 0.7], [1.0, 0.2], [0.1, 1.3]] {
         let d = super::sparse_reml_deviance(&theta, &mut ws_dense);
@@ -733,8 +776,17 @@ fn sparse_tail_natural_over_cutover_matches_noz() {
     {
         let g = crate::lmm::LmmGroupings::from_cluster_spec_ext(&model, n, &[], &[vec![]]);
         let x = Mat::<f64>::from_fn(n, p, |i, j| xflat[i * p + j]);
-        let ws =
-            super::SparseLmmWorkspace::new(&g, x.as_ref(), &cl, &cr_as_extra(&cr), &y, n, p, None);
+        let ws = super::SparseLmmWorkspace::new(
+            &g,
+            x.as_ref(),
+            &cl,
+            &cr_as_extra(&cr),
+            &y,
+            n,
+            p,
+            None,
+            crate::lmm::Criterion::Reml,
+        );
         assert!(ws.tail.is_some(), "e=150 routes sparse naturally");
     }
     let sp = crate::fit::fit_mle_sparse_pub(
@@ -1278,6 +1330,7 @@ fn family_downdate_dense_route_matches_scatter_route() {
                 n,
                 p,
                 None,
+                crate::lmm::Criterion::Reml,
             )
         })
     });
@@ -1323,7 +1376,17 @@ fn family_downdate_dense_route_matches_scatter_route() {
     assert_eq!(g2.primary_q, 2, "w == 2 arm needs a primary slope");
     let (w2, r2s, r2d) = with_forced_sparse_tail(|| {
         worst_rel(4, 0xB77, || {
-            super::SparseLmmWorkspace::new(&g2, xs.as_ref(), &cl, &extra2, &ys, nn, pp, None)
+            super::SparseLmmWorkspace::new(
+                &g2,
+                xs.as_ref(),
+                &cl,
+                &extra2,
+                &ys,
+                nn,
+                pp,
+                None,
+                crate::lmm::Criterion::Reml,
+            )
         })
     });
     assert!(
@@ -1373,7 +1436,17 @@ fn family_downdate_dense_route_vetoed_above_the_memory_cap() {
         };
         let x = Mat::<f64>::from_fn(n, p, |i, j| xflat[i * p + j]);
         let g = crate::lmm::LmmGroupings::from_cluster_spec_ext(&model, n, &[], &[vec![]]);
-        super::SparseLmmWorkspace::new(&g, x.as_ref(), &pid, &cr_as_extra(&eid), &y, n, p, None)
+        super::SparseLmmWorkspace::new(
+            &g,
+            x.as_ref(),
+            &pid,
+            &cr_as_extra(&eid),
+            &y,
+            n,
+            p,
+            None,
+            crate::lmm::Criterion::Reml,
+        )
     };
     let is_dense = |ws: &super::SparseLmmWorkspace| {
         matches!(
@@ -2089,8 +2162,9 @@ fn noz_sparse_ranef_agrees() {
 /// Dense and sparse deviance agree here to rel ~1e-15 at arbitrary θ, which
 /// is the evidence behind `noz_sparse_grid_agrees`' frozen 1e-4 tolerance:
 /// the fit-level gap on this cell (2.4e-5) is BOBYQA termination scatter,
-/// not a path bug. Cheap (8 deviance evals, no optimization) — stays in the
-/// default gate as the standing witness for that calibration argument.
+/// not a path bug. Cheap (8 deviance evals per criterion, no optimization),
+/// so it stays in the default gate as the standing witness for that
+/// calibration argument.
 #[test]
 fn crossover_worst_cell_deviance_parity() {
     use faer::Mat;
@@ -2114,24 +2188,43 @@ fn crossover_worst_cell_deviance_parity() {
     let mut suff = crate::lmm::LmmSuffStats::with_groupings(p, g.clone());
     suff.add_rows_multi(x.as_ref(), &y, &ids.primary, &ids.extra, None);
     let mut fit = crate::lmm::LmmFitScratch::with_groupings(p, &g);
-    let mut ws =
-        super::SparseLmmWorkspace::new(&g, x.as_ref(), &ids.primary, &ids.extra, &y, n, p, None);
-    let n_theta = 3 + 2 * 10; // vech(2x2) + 2·vech(4x4)
-    let mut st = 99u64;
-    let mut max_rel = 0.0f64;
-    for t in 0..8 {
-        let theta: Vec<f64> = (0..n_theta).map(|_| 0.3 + 0.6 * lcg(&mut st)).collect();
-        let dense = crate::lmm::reml_deviance(&theta, &suff, &mut fit);
-        let sparse = super::sparse_reml_deviance(&theta, &mut ws);
-        let rel = (dense - sparse).abs() / (1.0 + dense.abs());
-        eprintln!("θ set {t}: dense={dense:.12e} sparse={sparse:.12e} rel={rel:.3e}");
-        max_rel = max_rel.max(rel);
-    }
-    eprintln!("worst-cell deviance parity: max rel = {max_rel:.3e}");
-    assert!(
-        max_rel < 1e-8,
-        "deviance functions disagree — real path bug"
+    let mut ws = super::SparseLmmWorkspace::new(
+        &g,
+        x.as_ref(),
+        &ids.primary,
+        &ids.extra,
+        &y,
+        n,
+        p,
+        None,
+        crate::lmm::Criterion::Reml,
     );
+    let n_theta = 3 + 2 * 10; // vech(2x2) + 2·vech(4x4)
+
+    // The dense side is `reml_deviance_blocked` (slopes on the extras), so this
+    // is also its parity with the sparse kernel under each criterion.
+    assert!(g.extra_slopes_any);
+    for criterion in [crate::lmm::Criterion::Reml, crate::lmm::Criterion::Ml] {
+        fit.criterion = criterion;
+        ws.criterion = criterion;
+        let mut st = 99u64;
+        let mut max_rel = 0.0f64;
+        for t in 0..8 {
+            let theta: Vec<f64> = (0..n_theta).map(|_| 0.3 + 0.6 * lcg(&mut st)).collect();
+            let dense = crate::lmm::reml_deviance(&theta, &suff, &mut fit);
+            let sparse = super::sparse_reml_deviance(&theta, &mut ws);
+            let rel = (dense - sparse).abs() / (1.0 + dense.abs());
+            eprintln!(
+                "{criterion:?} θ set {t}: dense={dense:.12e} sparse={sparse:.12e} rel={rel:.3e}"
+            );
+            max_rel = max_rel.max(rel);
+        }
+        eprintln!("{criterion:?} worst-cell deviance parity: max rel = {max_rel:.3e}");
+        assert!(
+            max_rel < 1e-8,
+            "{criterion:?}: deviance functions disagree, a real path bug"
+        );
+    }
 }
 
 /// OVER-WIDTH lme4 REML golden: `y ~ 1 + x1+x2+x3+x4 + (1|gp) + (1 + x1+x2+x3+x4 | ge)`.

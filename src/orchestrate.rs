@@ -14,7 +14,9 @@ use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use crate::fit::theta_width;
-use crate::formula::{label_ranef, lower, Column, Table};
+use crate::formula::{
+    fixed_part_relation, label_ranef, lower, parse, Column, FixedPartRelation, Table,
+};
 use crate::inference::contrast::{ContrastError, NoDfReason};
 use crate::inference::tails::{normal_quantile, t_quantile};
 use crate::{fit_warm, Boundary, Family, Fit, Note, OuterStop, StartValues, WaldSe};
@@ -313,6 +315,11 @@ pub struct FitResult {
     /// proceeded with Laplace); surfaced by each port as a Python
     /// `UserWarning` / R `warning()`.
     pub agq_warning: Option<String>,
+    /// Set when `reml = Some(true)` was given on a non-Gaussian family (GLM or
+    /// GLMM), where the argument has no meaning: it was ignored and the model
+    /// fitted by ML, as under `None`. Each port raises its own warning, with
+    /// its own spelling of the argument, when this is set.
+    pub reml_warning: Option<String>,
     /// Log-likelihood at the fitted parameters (`crate::Fit::loglik`).
     pub loglik: f64,
     /// Parameters counted for AIC/BIC (`crate::Fit::df`).
@@ -393,6 +400,18 @@ pub struct FitResult {
 /// one entry point both FFI ports call. `satterthwaite` is
 /// `crate::FitOptions::satterthwaite`: `false` skips the Gaussian LMM's
 /// Satterthwaite pass (its df are then not computed and it is tested with z).
+///
+/// `reml` is resolved on the lowered model, after a single-level grouping has
+/// been dropped:
+/// - a non-Gaussian family (GLM or GLMM): `Some(true)` is ignored, the model is
+///   fitted by ML exactly as under `None`, and [`FitResult::reml_warning`] is
+///   set; `Some(false)` gives the `None` fit with no warning;
+/// - Gaussian with no random part (OLS): `Some(true)` gives the same estimates
+///   and reports the REML log-likelihood; `Some(false)` gives the `None` fit;
+/// - Gaussian mixed model: `None` and `Some(true)` fit by REML, `Some(false)`
+///   by ML.
+///
+/// Every value but the stripped one reaches `crate::FitOptions::reml`.
 #[allow(clippy::too_many_arguments)]
 pub fn run_fit(
     formula: &str,
@@ -407,6 +426,7 @@ pub fn run_fit(
     offset: Option<Vec<f64>>,
     warm_start: Option<(Vec<f64>, Vec<f64>, Option<f64>)>,
     satterthwaite: bool,
+    reml: Option<bool>,
 ) -> Result<FitResult, String> {
     let fam = family_from_str(family, link)?;
     // `fit_warm`'s own checks of `dispersion` and the warm start name kernel
@@ -511,6 +531,24 @@ pub fn run_fit(
         }
     }
     lowered.opts.nagq = nagq;
+    // `reml` is resolved here too, on the lowered model, so both ports follow
+    // one rule; a single-level grouping the lowering dropped has already made a
+    // mixed formula an OLS or GLM fit. A GLM or GLMM has no REML/ML split:
+    // `Some(true)` there is stripped with a warning (the fit is ML, the `None`
+    // fit), and `Some(false)` is the `None` fit, silently. Every other value
+    // goes to `FitOptions::reml`, which resolves it on a Gaussian model.
+    let mut reml_warning: Option<String> = None;
+    lowered.opts.reml = match reml {
+        Some(true) if lowered.model.family != Family::Gaussian => {
+            reml_warning = Some(
+                "reml=true applies only to Gaussian models; it was ignored and the model \
+                 fitted by maximum likelihood"
+                    .to_string(),
+            );
+            None
+        }
+        other => other,
+    };
     lowered.opts.dispersion = dispersion;
     lowered.opts.satterthwaite = satterthwaite;
     // Mirrors `formula::materialize`'s `opts` construction — change together:
@@ -662,6 +700,7 @@ pub fn run_fit(
         names: lowered.col_names,
         re_groups,
         agq_warning,
+        reml_warning,
         loglik: fit.loglik,
         df: fit.df,
         reml: fit.reml,
@@ -699,9 +738,9 @@ pub(crate) fn t_tests(fit: &Fit, targets: &[u32]) -> (Vec<f64>, &'static str) {
         Err(ContrastError::NoDf(reason)) => match reason {
             NoDfReason::NotGaussianMixed => "none",
             NoDfReason::Disabled => "disabled",
-            // No state on a Gaussian LMM is the loop tier's, which `run_fit`
-            // never builds; were it to happen, its df are missing as after a
-            // failed pass.
+            // The not-run record is the loop tier's, which `run_fit` never
+            // builds; were it to happen, its df are missing as after a failed
+            // pass.
             NoDfReason::Failed | NoDfReason::StateMissing => "failed",
         },
     };
@@ -800,6 +839,20 @@ pub fn confint(
             [beta[i] + lo * se[i], beta[i] + hi * se[i]]
         })
         .collect())
+}
+
+/// Whether two formula strings have the same fixed part, for the ports'
+/// `AIC` and `BIC` on two fits: [`crate::formula::fixed_part_relation`]
+/// answers [`FixedPartRelation::Same`] (the same fixed terms, compared as sets
+/// of variable names, and the same fixed intercept). The response, the offset
+/// and the random part are not read.
+///
+/// # Errors
+///
+/// When either formula does not parse; the message quotes it.
+pub fn same_fixed_part(f0: &str, f1: &str) -> Result<bool, String> {
+    let parsed = |f: &str| parse(f).map_err(|e| format!("formula {f:?} does not parse: {e}"));
+    Ok(fixed_part_relation(&parsed(f0)?, &parsed(f1)?) == FixedPartRelation::Same)
 }
 
 fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
@@ -971,7 +1024,7 @@ mod tests {
         let (numeric, factor) = toy_ols();
         let result = run_fit(
             "y ~ x", numeric, factor, "gaussian", "identity", "hessian", 1, None, None, None, None,
-            true,
+            true, None,
         )
         .expect("fit should succeed");
         assert_eq!(
@@ -995,7 +1048,7 @@ mod tests {
         let (numeric, factor) = toy_ols();
         let err = run_fit(
             "y ~ z", numeric, factor, "gaussian", "identity", "hessian", 1, None, None, None, None,
-            true,
+            true, None,
         )
         .unwrap_err();
         assert_eq!(err, "unknown column: z");
@@ -1018,6 +1071,7 @@ mod tests {
             Some(vec![0.0; n]),
             None,
             true,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("use one"), "{err}");
@@ -1043,6 +1097,7 @@ mod tests {
             None,
             None,
             true,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("use one"), "{err}");
@@ -1074,6 +1129,7 @@ mod tests {
             None,
             None,
             true,
+            None,
         )
         .expect("ineligible nagq must be stripped, not an error");
         let msg = result.agq_warning.as_deref().expect("warning expected");
@@ -1114,6 +1170,7 @@ mod tests {
             None,
             None,
             true,
+            None,
         )
         .expect("over-cap nagq must be stripped, not an error");
         let msg = result.agq_warning.as_deref().expect("warning expected");
@@ -1128,6 +1185,7 @@ mod tests {
         numeric.get_mut("y").unwrap()[3] = -1.0;
         let err = run_fit(
             "y ~ x", numeric, factor, "poisson", "log", "hessian", 1, None, None, None, None, true,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("Poisson response must be >= 0"), "{err}");
@@ -1151,6 +1209,7 @@ mod tests {
             None,
             None,
             true,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("x"), "{err}");
@@ -1161,7 +1220,7 @@ mod tests {
         numeric.insert("junk".to_string(), vec![0.0; 1000]);
         let err = run_fit(
             "y ~ x", numeric, factor, "gaussian", "identity", "hessian", 1, None, None, None, None,
-            true,
+            true, None,
         )
         .unwrap_err();
         assert!(err.contains("junk"), "{err}");
@@ -1194,6 +1253,7 @@ mod tests {
             None,
             None,
             true,
+            None,
         )
         .expect("cold mixed fit should converge");
         assert!(cold.converged);
@@ -1215,6 +1275,7 @@ mod tests {
             None,
             Some((cold.beta.clone(), vec![5.0], None)),
             true,
+            None,
         )
         .expect("warm-started mixed fit should converge");
         assert!(warm.converged);
@@ -1279,6 +1340,7 @@ mod tests {
             None,
             None,
             satterthwaite,
+            None,
         )
         .expect("fit should succeed")
     }
@@ -1446,6 +1508,17 @@ mod tests {
     }
 
     #[test]
+    fn same_fixed_part_reads_the_fixed_terms_and_intercept_only() {
+        assert_eq!(
+            same_fixed_part("y ~ a * b + (1 | g)", "y ~ b:a + b + a"),
+            Ok(true)
+        );
+        assert_eq!(same_fixed_part("y ~ x", "y ~ 0 + x"), Ok(false));
+        let err = same_fixed_part("y ~ x", "y ~ x - z").unwrap_err();
+        assert!(err.contains("\"y ~ x - z\""), "{err}");
+    }
+
+    #[test]
     fn confint_takes_t_on_a_finite_df_and_normal_elsewhere() {
         // qt(0.975, 8), qnorm(0.975) and qnorm(0.95) in R.
         let (qt8, qn, qn90) = (2.3060041352041654, 1.9599639845400534, 1.6448536269514715);
@@ -1511,6 +1584,7 @@ mod tests {
             None,
             None,
             true,
+            None,
         )
         .expect("gamma fit should converge");
         assert!(result.converged);
@@ -1577,6 +1651,7 @@ mod tests {
             None,
             None,
             true,
+            None,
         )
         .expect("hessian-SE fit should converge");
         assert!(hessian.converged);
@@ -1595,6 +1670,7 @@ mod tests {
             None,
             None,
             true,
+            None,
         )
         .expect("rx-SE fit should converge");
         assert!(rx.converged);

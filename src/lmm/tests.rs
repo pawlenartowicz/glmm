@@ -730,11 +730,17 @@ fn suff_stats_multi_accumulators() {
     }
 }
 
-/// Textbook REML deviance on the explicit n×n V — the oracle for the
-/// family-blocked elimination. dev = ln|V| + ln|X'V⁻¹X| + (N−P)·ln σ̂²,
-/// σ̂² = (y'V⁻¹y − β̂'X'V⁻¹y)/(N−P).  `groups[g]` = grouping g's global
-/// level ids (primary first); `theta[g]` the matching component.
-fn brute_force_deviance(theta: &[f64], x: &Mat<f64>, y: &[f64], groups: &[&[u32]]) -> f64 {
+/// Textbook deviance on the explicit n×n V under `criterion` (see
+/// [`profile_from_v`]), the oracle for the family-blocked elimination.
+/// `groups[g]` = grouping g's global level ids (primary first); `theta[g]`
+/// the matching component.
+fn brute_force_deviance(
+    theta: &[f64],
+    x: &Mat<f64>,
+    y: &[f64],
+    groups: &[&[u32]],
+    criterion: Criterion,
+) -> f64 {
     let n = x.nrows();
     let mut v = Mat::<f64>::zeros(n, n);
     for i in 0..n {
@@ -750,7 +756,7 @@ fn brute_force_deviance(theta: &[f64], x: &Mat<f64>, y: &[f64], groups: &[&[u32]
             }
         }
     }
-    reml_profile_from_v(&v, x, y)
+    profile_from_v(&v, x, y, criterion)
 }
 
 fn assert_deviance_matches_oracle(with_nested: bool, thetas: &[Vec<f64>]) {
@@ -768,27 +774,32 @@ fn assert_deviance_matches_oracle(with_nested: bool, thetas: &[Vec<f64>]) {
     for e in &eids {
         groups.push(e);
     }
-    for th in thetas {
-        let dev = reml_deviance(th, &suff, &mut fit);
-        let oracle = brute_force_deviance(th, &x, &y, &groups);
-        assert!(dev.is_finite(), "θ={th:?}");
-        let tol = 1e-8 * oracle.abs().max(1.0);
-        assert!(
-            (dev - oracle).abs() <= tol,
-            "θ={th:?}: family-blocked {dev} vs oracle {oracle}"
-        );
-        // Collapse arm: same θ through the balanced path — reassociation
-        // band vs the loop, oracle band absolute.
-        let dev_c = reml_deviance(th, &suff, &mut fit_c);
-        let band = 1e-9 * dev.abs().max(1.0);
-        assert!(
-            (dev_c - dev).abs() <= band,
-            "θ={th:?}: collapse {dev_c} vs loop {dev}"
-        );
-        assert!(
-            (dev_c - oracle).abs() <= tol,
-            "θ={th:?}: collapse vs oracle"
-        );
+    // The collapse precompute holds no criterion term, so it serves both.
+    for criterion in [Criterion::Reml, Criterion::Ml] {
+        fit.criterion = criterion;
+        fit_c.criterion = criterion;
+        for th in thetas {
+            let dev = reml_deviance(th, &suff, &mut fit);
+            let oracle = brute_force_deviance(th, &x, &y, &groups, criterion);
+            assert!(dev.is_finite(), "{criterion:?} θ={th:?}");
+            let tol = 1e-8 * oracle.abs().max(1.0);
+            assert!(
+                (dev - oracle).abs() <= tol,
+                "{criterion:?} θ={th:?}: family-blocked {dev} vs oracle {oracle}"
+            );
+            // Collapse arm: same θ through the balanced path; reassociation
+            // band vs the loop, oracle band absolute.
+            let dev_c = reml_deviance(th, &suff, &mut fit_c);
+            let band = 1e-9 * dev.abs().max(1.0);
+            assert!(
+                (dev_c - dev).abs() <= band,
+                "{criterion:?} θ={th:?}: collapse {dev_c} vs loop {dev}"
+            );
+            assert!(
+                (dev_c - oracle).abs() <= tol,
+                "{criterion:?} θ={th:?}: collapse vs oracle"
+            );
+        }
     }
 }
 
@@ -894,7 +905,7 @@ fn nested_regime_b_deviance_matches_brute_force() {
     assert!(precompute_balanced_collapse(&suff, &mut fit_c));
     for th in [[0.6, 0.4], [1.0, 1.0], [0.2, 0.0], [0.0, 0.0]] {
         let dev = reml_deviance(&th, &suff, &mut fit);
-        let oracle = brute_force_deviance(&th, &x, &y, &[&pid, &cid]);
+        let oracle = brute_force_deviance(&th, &x, &y, &[&pid, &cid], Criterion::Reml);
         let tol = 1e-8 * oracle.abs().max(1.0);
         assert!((dev - oracle).abs() <= tol, "θ={th:?}: {dev} vs {oracle}");
         // Collapse arm — reassociation band vs the loop incl. the θ=0 edge.
@@ -1076,7 +1087,7 @@ fn two_crossed_factors_deviance_matches_brute_force() {
     assert!(precompute_balanced_collapse(&suff, &mut fit_c));
     for th in [[0.5, 0.4, 0.3], [1.0, 1.0, 1.0], [0.3, 0.0, 0.8]] {
         let dev = reml_deviance(&th, &suff, &mut fit);
-        let oracle = brute_force_deviance(&th, &x, &y, &[&pid, &e0, &e1]);
+        let oracle = brute_force_deviance(&th, &x, &y, &[&pid, &e0, &e1], Criterion::Reml);
         let tol = 1e-8 * oracle.abs().max(1.0);
         assert!((dev - oracle).abs() <= tol, "θ={th:?}: {dev} vs {oracle}");
         // Collapse arm — reassociation band vs the loop.
@@ -1319,11 +1330,11 @@ fn multislope_dataset() -> (Mat<f64>, Vec<f64>, Vec<u32>) {
     (x, y, ids)
 }
 
-/// Textbook REML deviance with a q×q D over the slope columns of Z_p.
-/// `theta` is the column-major vech of Λ (q×q lower-tri); D_rel = ΛΛ′
-/// (σ-relative); V = I + Z·D_rel·Z′ with Z_i = [1, x[i, slope_cols]]. The
-/// f32 data is widened to f64 so the oracle reads the same bytes the suff
-/// stats accumulated.
+/// Textbook deviance under `criterion` with a q×q D over the slope columns
+/// of Z_p. `theta` is the column-major vech of Λ (q×q lower-tri); D_rel =
+/// ΛΛ′ (σ-relative); V = I + Z·D_rel·Z′ with Z_i = [1, x[i, slope_cols]].
+/// The f32 data is widened to f64 so the oracle reads the same bytes the
+/// suff stats accumulated.
 fn brute_force_slope_deviance(
     theta: &[f64],
     x: &Mat<f64>,
@@ -1331,6 +1342,7 @@ fn brute_force_slope_deviance(
     ids: &[u32],
     slope_cols: &[usize],
     q: usize,
+    criterion: Criterion,
 ) -> f64 {
     let n = x.nrows();
     // Λ (q×q lower-tri) from column-major vech, then D = ΛΛ′.
@@ -1378,7 +1390,7 @@ fn brute_force_slope_deviance(
             }
         }
     }
-    reml_profile_from_v(&v, x, y)
+    profile_from_v(&v, x, y, criterion)
 }
 
 fn slope_groupings() -> LmmGroupings {
@@ -1407,10 +1419,11 @@ fn multislope_groupings() -> LmmGroupings {
     LmmGroupings::from_cluster_spec(&cluster, 96, &[1, 2])
 }
 
-/// Both slope-primary eliminations against the dense oracle at fixed θ: the
-/// family loop (an unarmed scratch) and the per-group regression route
-/// (`precompute_group_regressions`), which must also agree with each other on
-/// the tail the β̂/SE code factors.
+/// Both slope-primary eliminations against the dense oracle at fixed θ, under
+/// each criterion: the family loop (an unarmed scratch) and the per-group
+/// regression route (`precompute_group_regressions`, whose precompute holds no
+/// criterion term), which must also agree with each other on the tail the
+/// β̂/SE code factors.
 fn check_slope_routes_against_brute_force(
     x: &Mat<f64>,
     y: &[f64],
@@ -1425,31 +1438,35 @@ fn check_slope_routes_against_brute_force(
     let mut loop_fit = LmmFitScratch::with_groupings(p, g);
     let mut route_fit = LmmFitScratch::with_groupings(p, g);
     assert!(precompute_group_regressions(&suff, &mut route_fit));
-    for th in thetas {
-        let oracle = brute_force_slope_deviance(th, x, y, ids, slope_cols, q);
-        let d_loop = reml_deviance(th, &suff, &mut loop_fit);
-        let d_route = reml_deviance(th, &suff, &mut route_fit);
-        for dev in [d_loop, d_route] {
-            assert!(dev.is_finite(), "θ={th:?}");
-            assert!(
-                (dev - oracle).abs() <= 1e-8 * oracle.abs().max(1.0),
-                "θ={th:?}: {dev} vs {oracle}"
-            );
-        }
-        // The tails, [X y]′V⁻¹[X y], agree to rounding of the Gram they are
-        // built from. Not the factors entrywise: at θ near THETA_HI the
-        // family loop's `[X y]′[X y] − ΣB′B` cancels to ~1e-9 relative.
-        for j in 0..=p {
-            for i in j..=p {
-                let (a, b) = (
-                    route_fit.tail[j * (p + 1) + i],
-                    loop_fit.tail[j * (p + 1) + i],
-                );
-                let scale = (suff.c[(i, i)] * suff.c[(j, j)]).sqrt();
+    for criterion in [Criterion::Reml, Criterion::Ml] {
+        loop_fit.criterion = criterion;
+        route_fit.criterion = criterion;
+        for th in thetas {
+            let oracle = brute_force_slope_deviance(th, x, y, ids, slope_cols, q, criterion);
+            let d_loop = reml_deviance(th, &suff, &mut loop_fit);
+            let d_route = reml_deviance(th, &suff, &mut route_fit);
+            for dev in [d_loop, d_route] {
+                assert!(dev.is_finite(), "{criterion:?} θ={th:?}");
                 assert!(
-                    (a - b).abs() <= 1e-12 * scale,
-                    "θ={th:?} tail ({i},{j}): {a} vs {b}"
+                    (dev - oracle).abs() <= 1e-8 * oracle.abs().max(1.0),
+                    "{criterion:?} θ={th:?}: {dev} vs {oracle}"
                 );
+            }
+            // The tails, [X y]′V⁻¹[X y], agree to rounding of the Gram they
+            // are built from. Not the factors entrywise: at θ near THETA_HI
+            // the family loop's `[X y]′[X y] − ΣB′B` cancels to ~1e-9 relative.
+            for j in 0..=p {
+                for i in j..=p {
+                    let (a, b) = (
+                        route_fit.tail[j * (p + 1) + i],
+                        loop_fit.tail[j * (p + 1) + i],
+                    );
+                    let scale = (suff.c[(i, i)] * suff.c[(j, j)]).sqrt();
+                    assert!(
+                        (a - b).abs() <= 1e-12 * scale,
+                        "{criterion:?} θ={th:?} tail ({i},{j}): {a} vs {b}"
+                    );
+                }
             }
         }
     }
@@ -1489,6 +1506,88 @@ fn multislope_deviance_matches_brute_force() {
         vec![THETA_HI, 0.0, 0.0, THETA_HI, 0.0, THETA_HI],
     ];
     check_slope_routes_against_brute_force(&x, &y, &ids, &multislope_groupings(), &[1, 2], &thetas);
+}
+
+/// Balanced one-way `(1 | g)`, `a` groups of `m`, interior optimum: σ̂² = MSW
+/// on both criteria, τ̂² = ((1 − 1/a)·MSB − MSW)/m under ML and
+/// (MSB − MSW)/m under REML (Searle, Casella and McCulloch 1992, ch. 3). The
+/// kernel at the analytic θ̂ = √(τ̂²/σ̂²) gives σ̂² to round-off. The
+/// optimizer's θ̂ is accurate only to `RHO_END`, so it enters through its
+/// deviance (equal to the analytic one: the gap is second order in δθ) and
+/// through σ̂² and τ̂² in a 1e-5 band.
+#[test]
+fn balanced_one_way_matches_the_anova_estimators() {
+    let (a, m) = (6usize, 5usize);
+    let n = a * m;
+    let mut st = 29u64;
+    let u: Vec<f64> = (0..a).map(|_| 2.0 * lcg(&mut st)).collect();
+    let mut x = Mat::<f64>::zeros(n, 1);
+    let mut y = vec![0.0f64; n];
+    let mut ids = vec![0u32; n];
+    for i in 0..n {
+        ids[i] = (i % a) as u32;
+        x[(i, 0)] = 1.0;
+        y[i] = 1.0 + u[i % a] + 0.5 * lcg(&mut st);
+    }
+    let mean = y.iter().sum::<f64>() / n as f64;
+    let mut group_mean = vec![0.0f64; a];
+    for i in 0..n {
+        group_mean[i % a] += y[i] / m as f64;
+    }
+    let ssw: f64 = (0..n).map(|i| (y[i] - group_mean[i % a]).powi(2)).sum();
+    let ssb: f64 = group_mean
+        .iter()
+        .map(|g| m as f64 * (g - mean).powi(2))
+        .sum();
+    let (msw, msb) = (ssw / (n - a) as f64, ssb / (a - 1) as f64);
+    let rel = |got: f64, want: f64| (got - want).abs() / want.abs();
+    for (criterion, tau2) in [
+        (Criterion::Reml, (msb - msw) / m as f64),
+        (
+            Criterion::Ml,
+            ((1.0 - 1.0 / a as f64) * msb - msw) / m as f64,
+        ),
+    ] {
+        assert!(tau2 > 0.0, "{criterion:?}: the optimum is not interior");
+        let theta = (tau2 / msw).sqrt();
+        let mut ws = LmmWorkspace::new(1, a);
+        ws.fit_mut().criterion = criterion;
+        ws.suff_mut().add_rows(x.as_ref(), &y, &ids);
+        let LmmKernel::Dense { suff, fit } = &mut ws.kernel else {
+            unreachable!("LmmWorkspace::new builds the dense kernel")
+        };
+        let d_analytic = reml_deviance(&[theta], suff, fit);
+        assert!(
+            rel(fit.sigma_sq, msw) <= 1e-10,
+            "{criterion:?}: σ̂² {} vs MSW {msw}",
+            fit.sigma_sq
+        );
+        assert!(
+            rel(theta * theta * fit.sigma_sq, tau2) <= 1e-10,
+            "{criterion:?}: τ̂² vs {tau2}"
+        );
+
+        let lf = fit_lmm_unhinted(&mut ws, &[0], None, ColumnScaling::IDENTITY);
+        assert!(lf.converged && lf.boundary_hit == 0, "{criterion:?}");
+        let theta_opt = ws.theta[0];
+        let LmmKernel::Dense { suff, fit } = &mut ws.kernel else {
+            unreachable!()
+        };
+        let d_opt = reml_deviance(&[theta_opt], suff, fit);
+        assert!(
+            (d_opt - d_analytic).abs() <= 1e-10 * d_analytic.abs().max(1.0),
+            "{criterion:?}: deviance at the optimizer's θ̂ {d_opt} vs analytic {d_analytic}"
+        );
+        assert!(
+            rel(lf.sigma_sq, msw) <= 1e-5,
+            "{criterion:?}: optimizer σ̂² {} vs {msw}",
+            lf.sigma_sq
+        );
+        assert!(
+            rel(theta_opt * theta_opt * lf.sigma_sq, tau2) <= 1e-5,
+            "{criterion:?}: optimizer τ̂² vs {tau2}"
+        );
+    }
 }
 
 /// A group whose random-effect Gram is singular (here: one row against a
@@ -1872,13 +1971,14 @@ fn brute_force_composed_deviance(
             }
         }
     }
-    reml_profile_from_v(&v, x, y)
+    profile_from_v(&v, x, y, Criterion::Reml)
 }
 
-/// REML profiled deviance from an explicit n×n marginal V (in residual-σ²
-/// units): `log|V| + log|XᵀV⁻¹X| + (N−P)·log σ̂²`. The shared V→deviance back
-/// end for every brute-force oracle (composed, crossed-slope, …).
-fn reml_profile_from_v(v: &Mat<f64>, x: &Mat<f64>, y: &[f64]) -> f64 {
+/// Profiled deviance from an explicit n×n marginal V (in residual-σ²
+/// units), r² = y′V⁻¹y − β̂′X′V⁻¹y: under REML `log|V| + log|XᵀV⁻¹X| +
+/// (N−P)·log(r²/(N−P))`, under ML `log|V| + N·log(r²/N)`. The shared
+/// V→deviance back end for every brute-force oracle (composed, crossed-slope, …).
+fn profile_from_v(v: &Mat<f64>, x: &Mat<f64>, y: &[f64], criterion: Criterion) -> f64 {
     use faer::linalg::solvers::Solve;
     let (n, p) = (x.nrows(), x.ncols());
     let vc = v.as_ref().llt(faer::Side::Lower).unwrap();
@@ -1929,9 +2029,14 @@ fn reml_profile_from_v(v: &Mat<f64>, x: &Mat<f64>, y: &[f64]) -> f64 {
     for aa in 0..p {
         bxy += beta[(aa, 0)] * xtviy[aa];
     }
-    let df = (n - p) as f64;
-    let s2 = (ytviy - bxy) / df;
-    ldv + ldk + df * s2.ln()
+    let r_sq = ytviy - bxy;
+    match criterion {
+        Criterion::Reml => {
+            let df = (n - p) as f64;
+            ldv + ldk + df * (r_sq / df).ln()
+        }
+        Criterion::Ml => ldv + n as f64 * (r_sq / n as f64).ln(),
+    }
 }
 
 /// Brute-force REML deviance for a CROSSED-SLOPE model
@@ -1965,7 +2070,7 @@ fn brute_force_crossed_slope_deviance(
             }
         }
     }
-    reml_profile_from_v(&v, x, y)
+    profile_from_v(&v, x, y, Criterion::Reml)
 }
 
 /// Slope + crossed: the composed deviance matches the brute-force oracle to
@@ -2250,7 +2355,7 @@ fn brute_force_slopes_deviance(x: &Mat<f64>, y: &[f64], factors: &[(&[u32], [f64
             }
         }
     }
-    reml_profile_from_v(&v, x, y)
+    profile_from_v(&v, x, y, Criterion::Reml)
 }
 
 /// TWO crossed factors with slopes:
@@ -3005,6 +3110,7 @@ fn reml_deviance_infinity_guards() {
         n,
         2,
         None,
+        crate::lmm::Criterion::Reml,
     );
     for th in [0.0, 0.5, 1.0] {
         assert_eq!(
@@ -3248,7 +3354,13 @@ fn pg_dataset(
     (x, y, ids, g)
 }
 
-/// The gradient against central differences of the deviance at each θ.
+/// The gradient against central differences of the deviance at each θ,
+/// under `criterion`. The differences are read off three evaluators of the
+/// same deviance, each checked against the route's value first: the route's
+/// own dense scratch, the dense blocked elimination (`reml_deviance_blocked`,
+/// reached by setting `extra_slopes_any` on the same groupings) and the
+/// sparse workspace.
+#[allow(clippy::too_many_arguments)]
 fn check_pg_gradient(
     x: &Mat<f64>,
     y: &[f64],
@@ -3256,30 +3368,64 @@ fn check_pg_gradient(
     w: Option<&[f64]>,
     g: &LmmGroupings,
     thetas: &[Vec<f64>],
+    criterion: Criterion,
 ) {
-    let p = x.ncols();
+    let (n_rows, p) = (x.nrows(), x.ncols());
     let mut suff = LmmSuffStats::with_groupings(p, g.clone());
     suff.add_rows_multi(x.as_ref(), y, ids, &[], w);
     let mut fit = LmmFitScratch::with_groupings(p, g);
+    fit.criterion = criterion;
     assert!(precompute_group_regressions(&suff, &mut fit));
+    let mut gb = g.clone();
+    gb.extra_slopes_any = true;
+    let mut suff_b = LmmSuffStats::with_groupings(p, gb.clone());
+    suff_b.add_rows_multi(x.as_ref(), y, ids, &[], w);
+    let mut fit_b = LmmFitScratch::with_groupings(p, &gb);
+    fit_b.criterion = criterion;
+    let sqrt_w: Option<Vec<f64>> = w.map(|w| w.iter().map(|v| v.sqrt()).collect());
+    let mut sp = crate::sparse::SparseLmmWorkspace::new(
+        g,
+        x.as_ref(),
+        ids,
+        &[],
+        y,
+        n_rows,
+        p,
+        sqrt_w.as_deref(),
+        criterion,
+    );
     for th in thetas {
         let n = th.len();
         let f0 = reml_deviance(th, &suff, &mut fit);
-        assert!(f0.is_finite(), "θ={th:?}");
+        assert!(f0.is_finite(), "{criterion:?} θ={th:?}");
         let mut grad = vec![0.0; n];
-        assert!(pg_grad::pg_gradient(&suff, &mut fit, &mut grad), "θ={th:?}");
-        for i in 0..n {
-            let h = 1e-5 * th[i].abs().max(1.0);
-            let (mut tp, mut tm) = (th.clone(), th.clone());
-            tp[i] += h;
-            tm[i] -= h;
-            let fd = (reml_deviance(&tp, &suff, &mut fit) - reml_deviance(&tm, &suff, &mut fit))
-                / (2.0 * h);
+        assert!(
+            pg_grad::pg_gradient(&suff, &mut fit, &mut grad),
+            "{criterion:?} θ={th:?}"
+        );
+        let mut eval = |kernel: usize, t: &[f64]| match kernel {
+            0 => reml_deviance(t, &suff, &mut fit),
+            1 => reml_deviance(t, &suff_b, &mut fit_b),
+            _ => crate::sparse::sparse_reml_deviance(t, &mut sp),
+        };
+        for (kernel, name) in ["route", "blocked", "sparse"].into_iter().enumerate() {
+            let fk = eval(kernel, th);
             assert!(
-                (grad[i] - fd).abs() <= 2e-5 * fd.abs().max(1.0),
-                "θ={th:?} ∂{i}: analytic {} vs FD {fd}",
-                grad[i]
+                (fk - f0).abs() <= 1e-8 * f0.abs().max(1.0),
+                "{criterion:?} θ={th:?} {name}: {fk} vs route {f0}"
             );
+            for i in 0..n {
+                let h = 1e-5 * th[i].abs().max(1.0);
+                let (mut tp, mut tm) = (th.clone(), th.clone());
+                tp[i] += h;
+                tm[i] -= h;
+                let fd = (eval(kernel, &tp) - eval(kernel, &tm)) / (2.0 * h);
+                assert!(
+                    (grad[i] - fd).abs() <= 2e-5 * fd.abs().max(1.0),
+                    "{criterion:?} θ={th:?} {name} ∂{i}: analytic {} vs FD {fd}",
+                    grad[i]
+                );
+            }
         }
     }
 }
@@ -3330,7 +3476,9 @@ fn pg_gradient_matches_finite_differences() {
             vech_identity(q, 1e-3),
             vech_identity(q, 40.0),
         ];
-        check_pg_gradient(&x, &y, &ids, None, &g, &thetas);
+        for criterion in [Criterion::Reml, Criterion::Ml] {
+            check_pg_gradient(&x, &y, &ids, None, &g, &thetas, criterion);
+        }
     }
 }
 
@@ -3339,14 +3487,17 @@ fn pg_gradient_matches_finite_differences_weighted() {
     let (x, y, ids, g) = pg_dataset(3, 10, 12, 29);
     let mut st = 41u64;
     let w: Vec<f64> = (0..y.len()).map(|_| 1.25 + 0.75 * lcg(&mut st)).collect();
-    check_pg_gradient(
-        &x,
-        &y,
-        &ids,
-        Some(&w),
-        &g,
-        &[vech_identity(3, 1.0), vech_random(3, 7)],
-    );
+    for criterion in [Criterion::Reml, Criterion::Ml] {
+        check_pg_gradient(
+            &x,
+            &y,
+            &ids,
+            Some(&w),
+            &g,
+            &[vech_identity(3, 1.0), vech_random(3, 7)],
+            criterion,
+        );
+    }
 }
 
 /// The gradient is taken at the LAST evaluation's θ: evaluating θ₁ then θ₂
@@ -3379,5 +3530,86 @@ fn pg_gradient_reads_the_last_evaluation() {
 fn pg_gradient_spans_solve_blocks() {
     let nc = pg_grad::PG_GRAD_BLOCK + 37;
     let (x, y, ids, g) = pg_dataset(2, nc, 4, 43);
-    check_pg_gradient(&x, &y, &ids, None, &g, &[vech_random(2, 9)]);
+    for criterion in [Criterion::Reml, Criterion::Ml] {
+        check_pg_gradient(&x, &y, &ids, None, &g, &[vech_random(2, 9)], criterion);
+    }
+}
+
+/// Under ML the BFGS route's endpoint is equal to or better than the BOBYQA
+/// route's on the same data: its deviance is at most BOBYQA's `+ 1e-6`
+/// (absolute), the band of
+/// `glmm::tests::gradient_route_matches_or_beats_the_bobyqa_route`. Each
+/// search runs from the blind start through [`search_theta`], as `fit_lmm`
+/// drives it: once with the per-group route armed
+/// (`precompute_group_regressions`, so BFGS at `n_θ ≥ 3`) and once unarmed
+/// (`pg_n_active = 0`, so BOBYQA). It guards the endpoint only; the gradient
+/// itself is pinned by `pg_gradient_matches_finite_differences` (and its
+/// weighted and `pg_gradient_spans_solve_blocks` twins).
+#[test]
+fn ml_bfgs_route_matches_or_beats_the_bobyqa_route() {
+    let nc = 30usize;
+    for q in [2usize, 3, 4] {
+        let (x, y, ids, _) = pg_dataset(q, nc, 10, 53 + q as u64);
+        let model = ModelSpec {
+            family: Family::Gaussian,
+            re: Some(ReStructure {
+                sizing: Sizing::FixedClusters {
+                    n_clusters: nc as u32,
+                },
+                slopes: (0..q as u32 - 1).collect(),
+                extra_groupings: vec![],
+            }),
+        };
+        let slope_cols: Vec<usize> = (1..q).collect();
+        let search = |armed: bool| -> f64 {
+            let mut ws = LmmWorkspace::for_cluster_spec(x.ncols(), &model, y.len(), &slope_cols);
+            ws.suff_mut()
+                .add_rows_multi(x.as_ref(), &y, &ids, &[], None);
+            let LmmWorkspace {
+                solver,
+                solver_warm,
+                config,
+                bfgs,
+                kernel,
+                theta,
+                lower,
+                upper,
+                ..
+            } = &mut ws;
+            let LmmKernel::Dense { suff, fit } = &mut *kernel else {
+                unreachable!("for_cluster_spec builds the dense kernel")
+            };
+            fit.criterion = Criterion::Ml;
+            if armed {
+                assert!(precompute_group_regressions(suff, fit), "q={q}");
+            }
+            let mut counters = crate::counters::EvalCounters::new();
+            let (out, _, _, report) = search_theta(
+                kernel,
+                solver,
+                solver_warm,
+                config,
+                bfgs,
+                theta,
+                lower,
+                upper,
+                false,
+                None,
+                &mut counters,
+                &mut 0,
+            );
+            assert_eq!(report.is_some(), armed, "q={q}: the route");
+            assert!(
+                matches!(out.status, Status::Converged),
+                "q={q}: {:?}",
+                out.status
+            );
+            out.f
+        };
+        let (f_bfgs, f_bobyqa) = (search(true), search(false));
+        assert!(
+            f_bfgs <= f_bobyqa + 1e-6,
+            "q={q}: BFGS route {f_bfgs} vs BOBYQA {f_bobyqa}"
+        );
+    }
 }

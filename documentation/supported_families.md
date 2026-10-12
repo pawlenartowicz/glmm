@@ -8,7 +8,7 @@ fixed-only and faults at the model-shape gate for `re: Some`. There are no
 
 | Family | Links | Canonical | Fixed-only | Mixed | Validated against |
 |---|---|---|---|---|---|
-| `Gaussian` | identity (implicit) | yes | OLS | LMM (REML) | R `lm` / `lme4::lmer` |
+| `Gaussian` | identity (implicit) | yes | OLS | LMM (REML; ML with `reml=False`) | R `lm` / `lme4::lmer`, `lmerTest` (both criteria) |
 | `Binomial` | `Logit`, `Probit`, `Cloglog` | `Logit` | logistic/probit/cloglog GLM | GLMM | R `glm(binomial)` / `lme4::glmer`; `glmmTMB` on probit and cloglog GLMMs (cloglog goldens `sim_cloglog_glm`, `sim_cloglog_glmm`) |
 | `Poisson` | `Log` | yes | GLM | GLMM | R `glm(poisson)` / `lme4::glmer` (goldens `grouseticks_glm`, `grouseticks`) |
 | `Gamma` | `Log`, `Inverse` | neither¹ | GLM | GLMM | R `glm(Gamma(link))` / `lme4::glmer(Gamma)` and `glmmTMB` (goldens `sim_gamma_*`) |
@@ -35,8 +35,8 @@ Newton steps (observed weights), with the Fisher step as fallback.
 **Which algorithm fits your model?** The table's row and column pick the
 path: fixed-only rows go through OLS or IRLS-based GLM (both in
 [`algorithms.md`](algorithms.md), which also carries the full dispatch graph
-and the tuning-knob index), Gaussian mixed models go through the profiled-REML
-LMM machinery ([`algorithms-lmm.md`](algorithms-lmm.md)), and non-Gaussian
+and the tuning-knob index), Gaussian mixed models go through the profiled
+REML or ML LMM machinery ([`algorithms-lmm.md`](algorithms-lmm.md)), and non-Gaussian
 mixed models go through PIRLS with Laplace/AGQ
 ([`algorithms-glmm.md`](algorithms-glmm.md)).
 

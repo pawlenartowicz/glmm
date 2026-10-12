@@ -20,7 +20,7 @@ An object of class \code{"summary.fastglmm"} with \code{coefficients}
 }
 \description{
 lme4's blocks in lme4's order: method line, formula, data, the criterion
-(\verb{REML criterion at convergence} on an LMM, the \verb{AIC BIC logLik deviance df.resid} row on an ML fit), scaled residuals, random effects with
+(\verb{REML criterion at convergence} on a REML fit, the \verb{AIC BIC logLik deviance df.resid} row on an ML fit), scaled residuals, random effects with
 variances, the observation/group counts, the coefficient table, the
 correlation of fixed effects, and a footer. The Python port's
 \code{Fit.summary()} prints the same blocks - change together.
@@ -35,8 +35,15 @@ R-squared lines on OLS). Binomial, Poisson and negative-binomial models, a
 held dispersion and every GLMM get Wald z tests on the normal, as \code{glm} and
 \code{glmer} do. A Gaussian mixed model fitted with \code{satterthwaite = FALSE}
 gets z tests too, and the footer says the df were not computed. The t
-p-values are the kernel's. The REML criterion is printed on LMMs where lme4
-prints it; the AIC row is printed only on ML fits, because a REML AIC
+p-values are the kernel's. The REML criterion is printed on REML fits (a
+Gaussian mixed model fitted by REML, and an OLS fit made with
+\code{REML = TRUE}); the AIC row is printed only on ML fits, because a REML AIC
 invites exactly the across-models comparison it is not valid for.
 \code{glance()} returns AIC/BIC on request either way.
+
+A Gaussian mixed model fitted with \code{REML = FALSE} is titled "Linear mixed
+model fit by maximum likelihood", and \code{print()} and \code{summary()} print one
+note on a line of its own directly under the title: "Note: p-values can be
+somewhat anticonservative." It is a printed note, not a warning, and cannot
+be switched off. REML, OLS, GLM and GLMM fits print no note.
 }

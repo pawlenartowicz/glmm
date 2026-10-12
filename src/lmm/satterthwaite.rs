@@ -3,20 +3,26 @@
 //!
 //! lmerTest's df of a contrast `l` is `2v² / (gᵀAg)` over the variance
 //! parameters `(θ, σ)`, with `v = lᵀCl`, `C = Var(β̂)`, `g_k = lᵀ(∂C/∂φ_k)l`
-//! and `A = 2H⁻¹`, `H` the Hessian of the REML deviance with σ not profiled
-//! (Satterthwaite, 1946; Kuznetsova, Brockhoff and Christensen, 2017). The
-//! crate minimizes the deviance `d_p(θ)` with the residual variance `τ = σ²`
-//! profiled out, and the two are related exactly: eliminating `τ` from `H` by
-//! its Schur complement gives the profiled Hessian `H_p = ∇²d_p`, and `τ`'s own
-//! term is `v²/ν` in closed form (`g_τ = v/τ̂`, `H_ττ = ν/τ̂²` at τ̂). So
+//! and `A = 2H⁻¹`, `H` the Hessian of the deviance (REML or ML, the criterion
+//! the fit minimized) with σ not profiled (Satterthwaite, 1946; Kuznetsova,
+//! Brockhoff and Christensen, 2017). The crate minimizes the deviance `d_p(θ)`
+//! with the residual variance `τ = σ²` profiled out, and the two are related
+//! exactly: eliminating `τ` from `H` by its Schur complement gives the
+//! profiled Hessian `H_p = ∇²d_p`, and `τ`'s own term is `v²/ν` in closed form
+//! (`g_τ = v/τ̂`, `H_ττ = ν/τ̂²` at τ̂). So
 //!
 //! `df = v² / (g_pᵀ H_p⁺ g_p + v²/ν)`, `g_p = ∇_θ (lᵀ C_p(θ) l)`,
 //!
 //! with `C_p(θ) = σ̂²(θ)·(X'V⁻¹X)⁻¹` the profiled covariance the fit reports
-//! and `ν` the divisor of `σ̂²` (`N − p` under REML). `0 < df ≤ ν` whenever
-//! `H_p⁺` is PSD, and a fit with no free variance parameter gets `ν`. The
-//! equivalent lmerTest form, which the state stores, has coordinates
-//! `(θ_free, τ)`, `A_eff = 2·blockdiag(H_p⁺, τ̂²/ν)` and
+//! and `ν` the divisor of `σ̂²`: `N − p` under REML and `N` under ML, read from
+//! the kernel's criterion ([`LmmKernel::criterion`]), never from the fit's
+//! options. The pass evaluates whatever criterion the kernel carries, and the
+//! gradient route's [`pg_gradient`] differentiates that criterion too. The
+//! residual-only record of OLS and the dispersion GLMs
+//! ([`SatterthwaiteState::residual`]) keeps `ν = n − p` on either criterion.
+//! `0 < df ≤ ν` whenever `H_p⁺` is PSD, and a fit with no free variance
+//! parameter gets `ν`. The equivalent lmerTest form, which the state stores,
+//! has coordinates `(θ_free, τ)`, `A_eff = 2·blockdiag(H_p⁺, τ̂²/ν)` and
 //! `Jac_eff = [∂C_p/∂θ_k …, C/τ̂]`.
 //!
 //! **The value route.** `H_p` comes from central finite differences of the
@@ -116,7 +122,9 @@ pub(crate) struct SatterthwaiteState {
     pub(crate) c: Mat<f64>,
     /// τ̂ = σ̂², on the scale the fit reports it (prior weights' scale undone).
     pub(crate) tau: f64,
-    /// The divisor of σ̂²: `N − p` (retained columns) on a REML fit.
+    /// The divisor of σ̂², from the kernel's criterion: `N − p` (retained
+    /// columns) on a REML fit, `N` on an ML fit. The residual-only record of
+    /// OLS and the dispersion GLMs carries `n − p` whatever the criterion.
     pub(crate) nu: f64,
     /// Directions of `H_p` dropped by the pseudo-inverse as null.
     pub(crate) dropped: usize,
@@ -128,16 +136,30 @@ pub(crate) struct SatterthwaiteState {
     // success) and records it here; no non-test code branches on it.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) route: DerivRoute,
-    /// The pass failed: a stencil value, `C` or τ̂ was not finite (or the
-    /// eigendecomposition of `H_p` failed). Every df is then NaN.
-    pub(crate) failed: bool,
-    /// The pass was switched off (`FitOptions::satterthwaite = false`): the
-    /// record holds no numbers (ν is NaN, so every df is NaN).
-    pub(crate) disabled: bool,
+    /// Which record this is; one status, so no two of failed, switched off
+    /// and not run can hold at once.
+    status: Status,
     /// On a rank-deficient fit, the caller columns the state's `p × p`
     /// matrices cover, ascending (the state lives in the reduced column
     /// space); `None` when every column was retained.
     pub(crate) retained: Option<Vec<usize>>,
+}
+
+/// Which record a [`SatterthwaiteState`] is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Status {
+    /// A pass that succeeded, or a residual-only record.
+    Live,
+    /// The pass failed: a stencil value, `C` or τ̂ was not finite (or the
+    /// eigendecomposition of `H_p` failed). Every df is then NaN.
+    Failed,
+    /// The pass was switched off (`FitOptions::satterthwaite = false`): the
+    /// record holds no numbers (ν is NaN, so every df is NaN).
+    SwitchedOff,
+    /// No pass ran on this Gaussian LMM fit (the loop tier's
+    /// `FitView::into_fit`): the record holds no numbers, as a switched-off
+    /// one.
+    NotRun,
 }
 
 /// What the stencil collected at θ̂; [`assemble`] is a pure function of it.
@@ -180,9 +202,19 @@ impl SatterthwaiteState {
             dropped: 0,
             negative: 0,
             route: DerivRoute::Value,
-            failed: false,
-            disabled: true,
+            status: Status::SwitchedOff,
             retained: None,
+        }
+    }
+
+    /// The record of a Gaussian LMM fit no pass ran on (the loop tier's
+    /// `FitView::into_fit`, whether or not the loop tier's `satterthwaite`
+    /// later runs on the workspace: it writes only its `df_out`, never the
+    /// `Fit`): no numbers, and no heap allocation, as [`Self::switched_off`].
+    pub(crate) fn not_run() -> Self {
+        SatterthwaiteState {
+            status: Status::NotRun,
+            ..Self::switched_off()
         }
     }
 
@@ -190,8 +222,7 @@ impl SatterthwaiteState {
     /// pass can run: failed, with no numbers.
     pub(crate) fn failed_record() -> Self {
         SatterthwaiteState {
-            failed: true,
-            disabled: false,
+            status: Status::Failed,
             ..Self::switched_off()
         }
     }
@@ -203,7 +234,7 @@ impl SatterthwaiteState {
         SatterthwaiteState {
             c,
             nu,
-            disabled: false,
+            status: Status::Live,
             ..Self::switched_off()
         }
     }
@@ -211,7 +242,22 @@ impl SatterthwaiteState {
     /// Whether this is a [`Self::residual`] record: a live state with no
     /// variance parameters (a Gaussian LMM's `a_eff` always has τ's row).
     pub(crate) fn residual_only(&self) -> bool {
-        !self.disabled && !self.failed && self.a_eff.nrows() == 0
+        self.status == Status::Live && self.a_eff.nrows() == 0
+    }
+
+    /// Whether the pass failed: every df is NaN.
+    pub(crate) fn is_failed(&self) -> bool {
+        self.status == Status::Failed
+    }
+
+    /// Whether the pass was switched off by `FitOptions::satterthwaite`.
+    pub(crate) fn is_disabled(&self) -> bool {
+        self.status == Status::SwitchedOff
+    }
+
+    /// Whether this is the [`Self::not_run`] record.
+    pub(crate) fn is_not_run(&self) -> bool {
+        self.status == Status::NotRun
     }
 
     /// The Satterthwaite df of the contrast `l` (over the state's columns: the
@@ -219,7 +265,7 @@ impl SatterthwaiteState {
     /// `v²/(g_pᵀH_p⁺g_p + v²/ν)`, capped at ν; ν exactly when no coordinate is
     /// free; NaN after a failed pass. `g` is the buffer of `g_p`.
     fn df_into(&self, l: &[f64], g: &mut Vec<f64>) -> f64 {
-        if self.failed {
+        if self.is_failed() {
             return f64::NAN;
         }
         let n = self.jac_theta.len();
@@ -327,7 +373,7 @@ pub(crate) fn pass_targets(
         &mut s.stencil,
     );
     assemble_into(&s.col, &mut s.state, &mut s.hess, &mut s.spare_jac);
-    if s.state.failed {
+    if s.state.is_failed() {
         return false;
     }
     for &t in targets {
@@ -488,10 +534,14 @@ pub(crate) fn pass_value_at(
     ))
 }
 
-/// ν, the divisor of σ̂²: `N − p` on the REML criterion the kernel evaluates.
-/// An ML fit's ν is `N`.
+/// ν, the divisor of σ̂², by the criterion the kernel evaluates
+/// ([`LmmKernel::criterion`]): `N − p` under REML, `N` under ML (`p` the
+/// retained columns).
 fn residual_nu(ws: &LmmWorkspace) -> f64 {
-    (ws.kernel.n_rows() - ws.recovery.betas.len()) as f64
+    let kernel = &ws.kernel;
+    kernel
+        .criterion()
+        .nu(kernel.n_rows(), ws.recovery.betas.len()) as f64
 }
 
 /// The θ̃ indices of every Λ column that is not exactly zero in `theta`, in
@@ -948,8 +998,7 @@ fn assemble_into(
     } else {
         DerivRoute::Value
     };
-    st.failed = failed;
-    st.disabled = false;
+    st.status = if failed { Status::Failed } else { Status::Live };
     st.retained = None;
 }
 

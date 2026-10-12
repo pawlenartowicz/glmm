@@ -1,4 +1,4 @@
-//! General-machine LMM solver core — family-blocked profiled-REML deviance
+//! General-machine LMM solver core: family-blocked profiled REML or ML deviance
 //! (primary + nested children eliminated family-by-family, crossed factors in
 //! a dense tail Cholesky with [X y]) + BOBYQA θ-search over one diagonal θ
 //! component per grouping. A degenerate single-intercept `ClusterSpec`
@@ -639,6 +639,27 @@ impl LmmGroupings {
 // LmmFitScratch
 // ---------------------------------------------------------------------------
 
+/// The criterion an LMM kernel minimizes over θ: the profiled REML deviance
+/// or the profiled ML deviance. Set when the workspace is built and frozen
+/// with it, so one workspace never fits under two criteria.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Criterion {
+    Reml,
+    Ml,
+}
+
+impl Criterion {
+    /// The residual degrees of freedom `ν` the criterion's σ̂² divides by and
+    /// its log-likelihood constant counts: `n − p` under REML, `n` under ML.
+    /// `n ≤ p` gives 0 under REML (no fit there).
+    pub(crate) fn nu(self, n: usize, p: usize) -> usize {
+        match self {
+            Criterion::Reml => n.saturating_sub(p),
+            Criterion::Ml => n,
+        }
+    }
+}
+
 /// Per-fit scratch, allocated once per (p, max_clusters). All `f64`: the LMM
 /// deviance is evaluated at `f64` only (its θ-gradient on the per-group
 /// regression route is the closed form in [`pg_grad`]); the dual-number
@@ -738,6 +759,8 @@ pub struct LmmFitScratch {
     /// entry is overwritten before it is read, so no per-fit reset is needed.
     pub ranef_ux: Vec<f64>,
     pub ranef_rhs: Vec<f64>,
+    /// σ̂² at the last evaluation's θ, by the criterion: `r²/(n − p)` under
+    /// REML, `r²/n` under ML (`r² = L[p,p]²` off the augmented factor).
     pub sigma_sq: f64,
     // --- crossed/nested-slopes blocked path (`reml_deviance_blocked`) ---
     // All empty unless `extra_slopes_any`; sized once here so the blocked warm
@@ -756,6 +779,9 @@ pub struct LmmFitScratch {
     /// dim×dim Cholesky factor of `blocked_p`, filled per θ-eval by a copy +
     /// in-place factor at `Par::Seq` (see `reml_deviance_blocked` in kernel.rs).
     pub blocked_l: Vec<f64>,
+    /// The criterion the deviance evaluates. `Criterion::Reml` from
+    /// [`Self::with_groupings`]; the fit core sets it at build.
+    pub(crate) criterion: Criterion,
 }
 
 impl LmmFitScratch {
@@ -831,6 +857,7 @@ impl LmmFitScratch {
             blocked_tmp: vec![0.0; blocked_kk],
             blocked_p: vec![0.0; blocked_dim * blocked_dim],
             blocked_l: vec![0.0; blocked_dim * blocked_dim],
+            criterion: Criterion::Reml,
         }
     }
 }
@@ -880,9 +907,10 @@ impl LmmRecovery {
     }
 }
 
-/// The REML objective and the augmented factor it leaves: dense sufficient
-/// statistics with the family-blocked Cholesky, or the sparse-Z Gram/Schur
-/// workspace. [`fit_lmm`] reads both through the same five calls.
+/// The profiled objective (REML or ML) and the augmented factor it leaves:
+/// dense sufficient statistics with the family-blocked Cholesky, or the
+/// sparse-Z Gram/Schur workspace. [`fit_lmm`] reads both through the same five
+/// calls.
 pub(crate) enum LmmKernel {
     Dense {
         suff: Box<LmmSuffStats>,
@@ -899,8 +927,9 @@ pub(crate) enum LmmKernel {
 }
 
 impl LmmKernel {
-    /// Profiled-REML deviance at `theta`, leaving the augmented `[X y]` factor
-    /// [`Self::factor`] reads. `f64::INFINITY` is the failure surface.
+    /// Profiled deviance at `theta` under the kernel's criterion (REML or ML),
+    /// leaving the augmented `[X y]` factor [`Self::factor`] reads.
+    /// `f64::INFINITY` is the failure surface.
     pub(crate) fn deviance(&mut self, theta: &[f64]) -> f64 {
         match self {
             LmmKernel::Dense { suff, fit } => reml_deviance(theta, suff, fit),
@@ -1028,6 +1057,14 @@ impl LmmKernel {
         }
     }
 
+    /// The criterion the deviance evaluates, frozen at the workspace build.
+    pub(crate) fn criterion(&self) -> Criterion {
+        match self {
+            LmmKernel::Dense { fit, .. } => fit.criterion,
+            LmmKernel::Sparse { ws, .. } => Self::sparse_ws(ws).criterion,
+        }
+    }
+
     fn sparse_ws(
         ws: &Option<Box<crate::sparse::SparseLmmWorkspace>>,
     ) -> &crate::sparse::SparseLmmWorkspace {
@@ -1050,9 +1087,9 @@ const SPARSE_NOT_ACCUMULATED: &str = "sparse LMM kernel used before accumulate_l
 // LmmWorkspace — everything a fit needs, allocated once per problem shape.
 // ---------------------------------------------------------------------------
 
-/// Per-problem-shape scratch: the REML objective and its buffers, the once-at-θ̂
-/// recovery buffers, and θ-solver state, allocated once and reused across fits
-/// of the same shape.
+/// Per-problem-shape scratch: the profiled objective and its buffers, the
+/// once-at-θ̂ recovery buffers, and θ-solver state, allocated once and reused
+/// across fits of the same shape.
 pub struct LmmWorkspace {
     /// The objective and the augmented factor it leaves.
     pub(crate) kernel: LmmKernel,
@@ -1706,8 +1743,8 @@ fn fam_forward_solve(bt_fam: &mut [f64], t_dim: usize, w: usize, fam_a: &[f64]) 
 /// Recover the spherical conditional modes `û` at θ̂ into `fit.ranef_u`, setting
 /// `fit.ranef_ok`.
 ///
-/// **Why this is a separate pass at all.** The profiled REML criterion is a
-/// determinant-and-quadratic-form identity computable straight off the factors,
+/// **Why this is a separate pass at all.** The profiled criterion (REML or ML)
+/// is a determinant-and-quadratic-form identity computable straight off the factors,
 /// so no evaluation ever forms `u` — never forming it is what makes each
 /// evaluation cost O(clusters) instead of O(rows), and this does not touch that.
 /// The modes are recovered afterwards by back-substitution: with `[u; β]`
@@ -1976,8 +2013,9 @@ pub struct LmmFit {
     /// pinned for FP stability. u64 mask: over-envelope sparse designs can
     /// exceed the 32-component NoZ ceiling (up to 64).
     pub pinned_components: u64,
-    /// Minimized profiled REML deviance at the accepted (or capped) θ̂ (the
-    /// `reml_deviance` value after the pin re-eval). NaN only on
+    /// Minimized profiled deviance of the kernel's criterion (REML or ML) at
+    /// the accepted (or capped) θ̂ (the `reml_deviance` value after the pin
+    /// re-eval), on the standardized design. NaN only on
     /// optimizer/numerical failure — finite on a `MaxFunReached` endpoint.
     pub deviance: f64,
     /// Scale-invariant per-column pivot ratio of X'V⁻¹X at θ̂
@@ -2075,14 +2113,15 @@ pub(crate) fn joint_wald_chi_sq(
     w / sigma_sq
 }
 
-/// The profiled REML deviance as the optimizer layer's objective
+/// The profiled deviance under the kernel's criterion (REML or ML) as the
+/// optimizer layer's objective
 /// ([`crate::optim::Objective`]): every evaluation is counted, and the finite
 /// ones too (`fit_lmm`'s `converged` needs two). The profiled criterion has
 /// no inner solve, so the optimizer's resolution is not used.
 ///
 /// On the per-group regression route it is also a
-/// [`crate::optim::GradObjective`]: the gradient comes off the state the last
-/// evaluation left ([`pg_grad::pg_gradient`]).
+/// [`crate::optim::GradObjective`]: the gradient of the same criterion comes
+/// off the state the last evaluation left ([`pg_grad::pg_gradient`]).
 struct LmmObjective<'a> {
     kernel: &'a mut LmmKernel,
     counters: &'a mut crate::counters::EvalCounters,
@@ -2213,7 +2252,11 @@ pub(crate) fn search_theta(
 /// `ws.theta`, for the per-group route's gradient search; `None` off that
 /// route (no gradient) or when the finite-difference Hessian there is not
 /// positive definite. It re-evaluates the deviance `n_θ + 1` times, so the
-/// kernel's state no longer describes θ̂ afterwards.
+/// kernel's state no longer describes θ̂ afterwards. The hint is the
+/// curvature of the kernel's criterion. A hint taken on a fit of the other
+/// criterion is accepted by [`search_theta`] and only seeds the BFGS inverse
+/// Hessian: the search and its gradient are the kernel's criterion's; the
+/// seeded inverse Hessian enters only as a start (and the first decrement).
 pub(crate) fn lmm_curvature_hint(ws: &mut LmmWorkspace) -> Option<crate::optim::CurvatureHint> {
     use crate::optim::{GradObjective, Objective};
     let LmmWorkspace {
@@ -2263,7 +2306,9 @@ pub(crate) fn per_group_gradient_armed(kernel: &LmmKernel) -> bool {
 /// regression route is armed for this dataset, which admits random slopes on
 /// the primary grouping only (`q_p ≥ 2`, so `n_θ ≥ 3`), and BOBYQA everywhere
 /// else. A function of the shape and the data's level
-/// Grams, not of the start: cold and warm fits route alike.
+/// Grams, not of the start or the criterion: cold and warm fits, REML and
+/// ML, route alike, and on BFGS the search minimizes the kernel's criterion
+/// with that criterion's gradient.
 ///
 /// Measured on the route's cells (2026-10-07, pawel, locked P-core, search
 /// wall against BOBYQA from the same start): 3 θ cold geo 0.42 (none slower),
@@ -2277,8 +2322,9 @@ fn lmm_outer_optimizer(kernel: &LmmKernel, n_theta: usize) -> crate::optim::Oute
     }
 }
 
-/// Fit by BOBYQA minimisation of the REML profiled deviance over the box-
-/// bounded θ, with β̂ / σ̂² / Var(β̂_target) recovered once at θ̂.
+/// Fit by minimising the profiled deviance of the kernel's criterion (REML or
+/// ML) over the box-bounded θ, by BOBYQA or, on the per-group regression route,
+/// BFGS, with β̂ / σ̂² / Var(β̂_target) recovered once at θ̂.
 ///
 /// Caller contract: `ws.suff` holds the accumulated rows (reset + add_rows
 /// per dataset); `target_indices` index design columns.

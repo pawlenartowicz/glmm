@@ -16,7 +16,7 @@
 // structured crossed-Schur path (`glmm/pirls/blocked_extras.rs`) and the LMM
 // sparse-tail branch (`SparseTail`); the small-e LMM eval loop stays
 // faer-sparse-free (blocked kernel with the dense tail).
-use crate::lmm::LmmGroupings;
+use crate::lmm::{Criterion, LmmGroupings};
 use faer::dyn_stack::{MemBuffer, MemStack};
 use faer::linalg::cholesky::llt::factor::{
     cholesky_in_place, cholesky_in_place_scratch, LltRegularization,
@@ -369,7 +369,8 @@ pub(crate) struct SparseLmmWorkspace {
     pub(crate) factor_llt_mem: MemBuffer,
     pub(crate) m: usize,
     pub(crate) p: usize,
-    /// Row count N — REML df is `N − p` (mirrors `reml_deviance`, `src/lmm/kernel.rs`).
+    /// Row count N: `ν` is `N − p` under REML and `N` under ML (`Criterion::nu`,
+    /// as in `reml_deviance`, `src/lmm/kernel.rs`).
     pub(crate) n: usize,
     /// `Some` only for the one post-fit evaluation that feeds
     /// [`sparse_recover_u`]; see [`SparseRecovery`].
@@ -392,6 +393,8 @@ pub(crate) struct SparseLmmWorkspace {
     /// Pass-2 row scratch: one row of `x·U⁻¹` (`p`) and one row's z entries.
     pub(crate) xt: Vec<f64>,
     pub(crate) row: Vec<(usize, f64)>,
+    /// The criterion the deviance evaluates, fixed at construction.
+    pub(crate) criterion: Criterion,
 }
 
 /// Per-family factor state that [`sparse_schur_factor`] otherwise throws away,
@@ -437,7 +440,8 @@ impl SparseLmmWorkspace {
     /// (`for_each_z_entry`) and pass 2's raw x/y reads below, so every packed
     /// Gram ends up carrying exactly `wᵢ` per row (see `for_each_z_entry`'s
     /// doc). `None` is the unit-weight fast path (no per-row multiply).
-    #[allow(clippy::too_many_arguments)] // marshals (g, x, cluster_ids, extra_ids, y, n, p, sqrt_w)
+    /// `criterion`: the one the deviance evaluates, frozen with the workspace.
+    #[allow(clippy::too_many_arguments)] // marshals (g, x, cluster_ids, extra_ids, y, n, p, sqrt_w, criterion)
     pub(crate) fn new(
         g: &LmmGroupings,
         x: MatRef<f64>,
@@ -447,6 +451,7 @@ impl SparseLmmWorkspace {
         n: usize,
         p: usize,
         sqrt_w: Option<&[f64]>,
+        criterion: Criterion,
     ) -> Self {
         let m = p + 1;
 
@@ -690,6 +695,7 @@ impl SparseLmmWorkspace {
             a22_off,
             xt: vec![0.0f64; p],
             row: Vec::with_capacity(q_p + g.extra_q.iter().sum::<usize>()),
+            criterion,
         };
         ws.fill_values(x, cluster_ids, extra_ids, y, sqrt_w);
         ws
@@ -1230,23 +1236,25 @@ fn fold_packed_col(
     }
 }
 
-/// Profiled-REML deviance on the sparse path. Numerically equal to
-/// `lmm::reml_deviance` at the same θ (same argmin, same dropped additive
-/// constants — the both-paths cross-check is the guarantee). Steps:
+/// Profiled deviance on the sparse path under `ws.criterion`. Numerically equal
+/// to `lmm::reml_deviance` at the same θ and criterion (same argmin, same dropped
+/// additive constants; the both-paths cross-check is the guarantee). Steps:
 ///   1. blocked Cholesky of A = Λ'Z'ZΛ + I → log|L_ZZ|² (`sparse_schur_factor`);
 ///   2. forward-solve U = L⁻¹B, B = Λ'Z'[X y];
 ///   3. S = C_xy − UᵀU (dense m×m, C_xy = ws.cxy = [X y]'[X y]), Crout → L_XX;
-///   4. σ̂² = L_XX[p,p]² / (N−p); deviance = log|L_ZZ|² + log|L_XX|² + (N−p)·ln σ̂².
+///   4. REML: σ̂² = L_XX[p,p]² / (N−p), deviance = log|L_ZZ|² + log|L_XX|² + (N−p)·ln σ̂²;
+///      ML: σ̂² = L_XX[p,p]² / N, deviance = log|L_ZZ|² + N·ln σ̂².
 ///
-/// Normalization transcribed from `reml_deviance` (`src/lmm/kernel.rs`): REML
-/// df = N−p, `σ̂² = L[p,p]²/df`, `log|L_XX|² = 2Σ_{j<p} ln L[j,j]`; drops the same
-/// additive constants (2π, …). Returns INFINITY on any non-PD factor / non-finite
-/// σ̂² (mirrors the dense diagonal guards, same function).
+/// Normalization transcribed from `reml_deviance` (`src/lmm/kernel.rs`): df = N−p
+/// (REML) or N (ML), `σ̂² = L[p,p]²/df`, `log|L_XX|² = 2Σ_{j<p} ln L[j,j]` (its
+/// pivots checked on both criteria); drops the same additive constants (2π, …).
+/// Returns INFINITY on any non-PD factor / non-finite σ̂² (mirrors the dense
+/// diagonal guards, same function).
 pub(crate) fn sparse_reml_deviance(theta: &[f64], ws: &mut SparseLmmWorkspace) -> f64 {
     let p = ws.p;
     ws.sigma_sq = f64::NAN;
     // Same shape guard as the dense twin (`reml_deviance`, `src/lmm/kernel.rs`):
-    // at `n <= p` the REML df is not positive and the `ws.n - p` below underflows,
+    // at `n <= p` the REML df is not positive, so neither criterion fits there,
     // and a width-0 fixed block has no `L_XX` to read the deviance off.
     if ws.n <= p || p == 0 {
         return f64::INFINITY;
@@ -1269,7 +1277,8 @@ pub(crate) fn sparse_reml_deviance(theta: &[f64], ws: &mut SparseLmmWorkspace) -
     log_lxx_sq *= 2.0;
 
     let lyy = l[(p, p)];
-    let df = (ws.n - p) as f64;
+    let criterion = ws.criterion;
+    let df = criterion.nu(ws.n, p) as f64;
     let r_sq = lyy * lyy;
     let sigma_sq = r_sq / df;
     // Exact-fit floor: mirrors `reml_deviance_blocked`'s (`src/lmm/kernel.rs`,
@@ -1279,7 +1288,10 @@ pub(crate) fn sparse_reml_deviance(theta: &[f64], ws: &mut SparseLmmWorkspace) -
         return f64::INFINITY;
     }
     ws.sigma_sq = sigma_sq;
-    log_lzz_sq + log_lxx_sq + df * sigma_sq.ln()
+    match criterion {
+        Criterion::Reml => log_lzz_sq + log_lxx_sq + df * sigma_sq.ln(),
+        Criterion::Ml => log_lzz_sq + df * sigma_sq.ln(),
+    }
 }
 
 /// Two-level blocked Cholesky of `A = Λ'Z'ZΛ + I` plus the augmented Schur

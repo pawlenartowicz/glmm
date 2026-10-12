@@ -14,7 +14,7 @@ generalized linear mixed models.
 - **Fast.** Faster than every other engine on every model, usually 10 to 100 times,
   without RAM blowup.
 
-On all tested models: a 794-model validation grid, checked for every release.
+On all tested models: a 923-model validation grid, checked for every release.
 
 Deliberately scoped to **fast fitting**: fixed effects, Wald standard errors,
 variance components on the SD/correlation scale, conditional modes, fitted
@@ -51,6 +51,9 @@ fit <- fastglmm(y ~ x1 * x2, data)
 
 # LMM: correlated random intercept and slope (REML)
 fit <- fastglmm(y ~ x1 + (1 + x1 | subject), data)
+
+# The same LMM by maximum likelihood, as lmer(REML = FALSE)
+fit_ml <- fastglmm(y ~ x1 + (1 + x1 | subject), data, REML = FALSE)
 
 # GLMM: binomial with a probit link, 7-node adaptive quadrature
 fit <- fastglmm(passed ~ x1 + (1 | school), data,

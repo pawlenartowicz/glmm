@@ -192,11 +192,26 @@ TOL <- list(
   #          re-measure. Never widen it to turn a run green.
   ci_ref_rel  = 1e-7,
   # coef_df_rel  compare.R gate 5: glmm's per-coefficient Satterthwaite df against
-  #          lmerTest's on the Gaussian LMM cells, by rel_max_by_coef. NA until the
-  #          first full lmertest run measures it; it is entered from that run with
-  #          the measurement, the cell it occurred on and the date. While it is
-  #          NA, compare.R prints gate 5 NOT RUN and gates nothing against it.
-  coef_df_rel = NA_real_
+  #          lmerTest's on the Gaussian LMM cells, by rel_max_by_coef. The df moves
+  #          with theta-hat as the SE does, and the two engines agree on theta-hat
+  #          only to their optimizers' tolerance, so this is an agreement band
+  #          between two fits, not a round-off band on one.
+  #          Rule: ceil1(2 x max rel_max_by_coef) over the cells gate 5 compares.
+  #          Measured 2026-10-12 (dell-fedora) on the 19 fast Gaussian LMM cells,
+  #          every one compared (no failed-pass, no no-ref), a --fast glmm run of the
+  #          0.6.0 tree with coef_df (scratch, not kept; any --fast run of that
+  #          tree re-measures it) against the first full lmertest run (lmerTest
+  #          3.2.1, ra-ml-twins): 3.30e-04 on lmm_cross4_g3000p20_bal_base,
+  #          (Intercept) (glmm 87.934, lmerTest 87.905); next Machines 2.96e-04
+  #          (MachineC), sim_max_q_slope 1.43e-04, Penicillin 9.2e-05,
+  #          lmm_q8_g3000p20_bal_base 6.9e-05, the other 14 cells at or below
+  #          1.6e-05. On the seven largest, lmerTest's df evaluated at glmm's own
+  #          theta-hat agrees with glmm's to 5.1e-07 or better (Penicillin; the
+  #          others at or below 3.2e-07), so the spread is the two theta-hats',
+  #          not the df computation. ceil1(2 x 3.30e-04) = 7e-04. These 19 cells
+  #          are REML; the other 111 REML cells and the 129 ML twins are first
+  #          compared by a full glmm run.
+  coef_df_rel = 7e-04
 )
 
 # ── truth-error band, per family ─────────────────────────────────────────────
@@ -479,8 +494,9 @@ TOL_INFERENCE <- list(
   # gradient route against the value route on the same fit
   # (gradient_route_agrees_with_value_route: every df, and each H_p entry (i, j)
   # at df_fd_rel x sqrt(H_ii H_jj); MEASURED 2026-10-11 at ETA_GRAD = 3e-6, df
-  # 4.5e-7 on q3s near-zero, H_p 5.1e-7 on sim_max_q_slope). Gated in
-  # src/lmm/satterthwaite_tests.rs, which holds the Rust copy. MEASURED
+  # 4.5e-7 on q3s near-zero, H_p 5.1e-7 on sim_max_q_slope; MEASURED 2026-10-12
+  # under ML on its 9 fixtures, df 1.7e-6 and H_p 1.5e-6 on q3s near-zero).
+  # Gated in src/lmm/satterthwaite_tests.rs, which holds the Rust copy. MEASURED
   # (2026-10-11, pawel, x86_64) by step_sweep_is_flat_at_eta over its 17 fixtures
   # (the toy 300 + y/4; sim_dynrange_lmm, sim_nested_crossed_mix,
   # sim_near_singular, sim_corr_boundary; the speed-campaign shapes int1, nest2,

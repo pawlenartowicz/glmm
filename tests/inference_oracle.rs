@@ -24,6 +24,15 @@
 //! did not fire, because the goldens tier's stale-entry check skips every `cell`
 //! that is not one of its goldens.
 //!
+//! The lmerTest references come on both criteria: the REML ones and the `_ml`
+//! ones (`REML = FALSE`), each fitted with `FitOptions::reml` from the entry's
+//! `reml`. On an ML reference [`lmertest_end_to_end`] also checks glmm's ML
+//! criterion against lme4's frozen `deviance`, hard and two-sided as the goldens
+//! tier's deviance gate (`tests/validation_oracle.rs`): `−2·Fit::loglik` minus
+//! the reference at most `DEV_EPS`, and at most `DEV_BIG` in absolute value (a
+//! larger gap below the reference is a constants bug). It has no registry
+//! quantity.
+//!
 //! Where a gate goes: an integration gate on the public surface joins [`GATES`].
 //! A gate on a `pub(crate)` item cannot be reached from here, so it lives in an
 //! in-crate test file with its own driver, which asserts the same `stale_entries`
@@ -76,11 +85,12 @@ fn numbers(v: &Value, what: &str) -> Vec<f64> {
 /// its coefficients.
 type RefFit = (String, Value, Fit, Vec<usize>);
 
-/// The REML per-coefficient lmerTest references (X7: kind `lmertest` with
-/// `proposal_dependent` false), each fitted end to end by `fit_cold` on its
-/// lowered formula, with its JSON and the caller column of each of the
+/// The per-coefficient lmerTest references of both criteria (X7: kind
+/// `lmertest` with `proposal_dependent` false; `reml` true or false), each
+/// fitted end to end by `fit_cold` on its lowered formula (the ML ones with
+/// `reml = Some(false)`), with its JSON and the caller column of each of the
 /// reference's coefficients. Fitted once per process, for every gate that
-/// reads them. The `_ml` references are compared with the ML gates.
+/// reads them.
 fn lmertest_fits() -> &'static [RefFit] {
     static FITS: OnceLock<Vec<RefFit>> = OnceLock::new();
     FITS.get_or_init(fit_lmertest_references)
@@ -97,13 +107,19 @@ fn fit_lmertest_references() -> Vec<RefFit> {
                 "{}: proposal_dependent or reml is not a bool",
                 e.name
             );
-            flag == Some(false) && reml == Some(true)
+            flag == Some(false)
         })
         .map(|e| {
             assert!(!e.is_pending(), "{}: not frozen", e.name);
             let json = inference::load(inference::Kind::Lmertest, &e.name);
             let lo = inference_lowered(&e);
             let fit = glmm::fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+            assert_eq!(
+                Some(fit.reml),
+                e.raw["reml"].as_bool(),
+                "{}: the fit's criterion",
+                e.name
+            );
             let cols = json["coef_names"]
                 .as_array()
                 .unwrap_or_else(|| panic!("{}: coef_names", e.name))
@@ -119,11 +135,21 @@ fn fit_lmertest_references() -> Vec<RefFit> {
             (e.name, json, fit, cols)
         })
         .collect();
+    let n_ml = out.iter().filter(|(_, json, _, _)| is_ml(json)).count();
+    eprintln!(
+        "LMERTEST {} per-coefficient references fitted, {n_ml} of them ML",
+        out.len()
+    );
     assert!(
-        !out.is_empty(),
-        "no REML per-coefficient lmertest reference"
+        n_ml > 0 && n_ml < out.len(),
+        "the per-coefficient lmertest references of both criteria"
     );
     out
+}
+
+/// An `_ml` reference: lmerTest fitted with `REML = FALSE`.
+fn is_ml(json: &Value) -> bool {
+    json["reml"].as_bool() == Some(false)
 }
 
 /// Gate 1 end to end: glmm's `coef_df` at its own θ̂ against lmerTest's df,
@@ -131,10 +157,34 @@ fn fit_lmertest_references() -> Vec<RefFit> {
 /// with θ̂ as the SE does). t and p follow from df, β̂ and SE. Each fit's pass
 /// takes the derivative route the fit arms (the gradient route where the
 /// per-group gradient is armed, the value route elsewhere), here and in
-/// [`lmertest_confint`]; the in-crate gate at lme4's θ̂ runs both routes.
+/// [`lmertest_confint`]; the in-crate gate at lme4's θ̂ runs both routes. On
+/// an ML reference, first the ML criterion against lme4's: `−2·Fit::loglik`
+/// against the frozen `deviance`, two-sided (see the module doc).
 fn lmertest_end_to_end(compared: &mut BTreeSet<String>) {
     for (name, json, fit, cols) in lmertest_fits() {
+        if is_ml(json) {
+            let dev_ref = json["deviance"].as_f64().expect("deviance");
+            let d = -2.0 * fit.loglik - dev_ref;
+            eprintln!("LMERTEST {name}: ML deviance gap {d:.3e}");
+            assert!(
+                d.abs() <= oracle_support::DEV_BIG,
+                "{name}: |Δdev|={d:.3e} > DEV_BIG, suspected convention mismatch"
+            );
+            assert!(
+                d <= oracle_support::DEV_EPS,
+                "{name}: Δdev={d:.3e} > DEV_EPS, worse optimum than lme4"
+            );
+        }
         let want = numbers(&json["df"], name);
+        let worst = cols
+            .iter()
+            .enumerate()
+            .map(|(i, &j)| ((fit.coef_df[j] - want[i]) / want[i]).abs())
+            .fold(0.0, f64::max);
+        eprintln!(
+            "LMERTEST {name}: df max rel {worst:.2e} (band {:.0e})",
+            tol::DF_E2E_REL
+        );
         for (i, &j) in cols.iter().enumerate() {
             assert_rel(
                 fit.coef_df[j],
@@ -161,6 +211,18 @@ fn lmertest_confint(compared: &mut BTreeSet<String>) {
         let (lower, upper) = (numbers(&json["lower"], name), numbers(&json["upper"], name));
         let ci = glmm::orchestrate::confint(&fit.beta, &fit.se, &fit.coef_df, level)
             .unwrap_or_else(|err| panic!("{name}: {err}"));
+        let worst = cols
+            .iter()
+            .enumerate()
+            .flat_map(|(i, &j)| {
+                let width = upper[i] - lower[i];
+                [ci[j][0] - lower[i], ci[j][1] - upper[i]].map(|d| (d / width).abs())
+            })
+            .fold(0.0, f64::max);
+        eprintln!(
+            "LMERTEST {name}: confint max |diff|/width {worst:.2e} (band {:.0e})",
+            tol::CONFINT_REL
+        );
         for (i, &j) in cols.iter().enumerate() {
             let [lo, hi] = ci[j];
             let width = upper[i] - lower[i];

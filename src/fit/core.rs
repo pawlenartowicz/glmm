@@ -15,13 +15,13 @@
 use faer::Mat;
 
 use crate::glmm::GlmmWorkspace;
-use crate::lmm::{LmmGroupings, LmmWorkspace};
+use crate::lmm::{Criterion, LmmGroupings, LmmWorkspace};
 use crate::standardize::ColumnScaling;
 use crate::{BinomialLink, Family, GroupIds, GroupingRelation, ModelSpec, Note, StartValues};
 
 use super::common::{
-    assert_group_ids, assert_model_shape, fill_col_major_std, start_to_design, theta_width,
-    unpermute_fit, warm_theta, FitDiagnostics, Perm,
+    assert_group_ids, assert_model_shape, fill_col_major_std, resolve_criterion, start_to_design,
+    theta_width, unpermute_fit, warm_theta, FitDiagnostics, Perm,
 };
 use super::glm::GlmScratchBuf;
 use super::lmm::LmmResultView;
@@ -481,6 +481,9 @@ pub struct FitWorkspace {
     // Frozen options — a per-call `opts` must match these (buffer presence / grid
     // size are baked into the allocated workspace).
     nagq: u8,
+    /// `opts.reml` resolved on `sized` ([`resolve_criterion`]): the LMM
+    /// kernel's criterion, `None` off the LMM path.
+    criterion: Option<Criterion>,
     /// `opts.target_indices.len()`: the OLS/GLM result slots are sized off it, so
     /// a later call asking for more targets would overrun them.
     n_targets: usize,
@@ -651,7 +654,7 @@ impl FitWorkspace {
     pub(crate) fn is_lmm(&self) -> bool {
         matches!(self.kind, FitKind::Lmm { .. })
     }
-    /// Which REML kernel the LMM arm built — the routing bit `classify_design`
+    /// Which LMM kernel the LMM arm built: the routing bit `classify_design`
     /// handed [`build_workspace`], readable again after the fact. Both are
     /// `false` on every non-LMM workspace.
     pub(crate) fn is_lmm_dense(&self) -> bool {
@@ -680,6 +683,17 @@ impl FitWorkspace {
     }
     pub(crate) fn is_glmm(&self) -> bool {
         matches!(self.kind, FitKind::Glmm { .. })
+    }
+    /// The criterion the LMM kernel carries: `None` on every non-LMM
+    /// workspace, and on a sparse one no `fit_on` has built the kernel of.
+    pub(crate) fn kernel_criterion(&self) -> Option<Criterion> {
+        let FitKind::Lmm { ws, .. } = &self.kind else {
+            return None;
+        };
+        match &ws.kernel {
+            crate::lmm::LmmKernel::Dense { fit, .. } => Some(fit.criterion),
+            crate::lmm::LmmKernel::Sparse { ws, .. } => ws.as_ref().map(|s| s.criterion),
+        }
     }
     /// The LMM workspace and this draw's column map, for tests that read what
     /// a fit left there. `None` on every non-LMM workspace.
@@ -737,6 +751,7 @@ pub fn build_workspace(
     // not count nestings, so without this a second nested grouping would route
     // `NoZ` and silently share the first one's RE-column block.
     assert_model_shape(sized, p, opts.nagq);
+    let criterion = resolve_criterion(sized, opts);
     let t = opts.target_indices.len();
     let kind = match (&sized.family, sized.re.as_ref()) {
         (Family::Gaussian, None) => FitKind::Ols {
@@ -762,18 +777,27 @@ pub fn build_workspace(
             match family {
                 // Every mixed design reaches one entry point per family and
                 // picks its kernel behind it: `fit_lmm` over the dense or the
-                // sparse-Z REML objective, `fit_glmm` over its three `A`-layouts.
-                Family::Gaussian => FitKind::Lmm {
-                    ws: LmmWorkspace::for_cluster_spec_ext(
+                // sparse-Z profiled objective, `fit_glmm` over its three
+                // `A`-layouts.
+                Family::Gaussian => {
+                    let mut ws = LmmWorkspace::for_cluster_spec_ext(
                         p,
                         sized,
                         n_max,
                         &slope_cols,
                         &extra_slope_cols,
                         solver == Solver::Sparse,
-                    ),
-                    y_shifted: vec![0.0f64; n_max.max(1)],
-                },
+                    );
+                    // The sparse kernel takes it when `accumulate_lmm_rows`
+                    // builds it.
+                    if let crate::lmm::LmmKernel::Dense { fit, .. } = &mut ws.kernel {
+                        fit.criterion = criterion.expect("a Gaussian mixed model has a criterion");
+                    }
+                    FitKind::Lmm {
+                        ws,
+                        y_shifted: vec![0.0f64; n_max.max(1)],
+                    }
+                }
                 Family::NegativeBinomial { .. } => FitKind::Prebuilt(PrebuiltRoute::GlmmNb(
                     Box::new(GlmmWorkspace::for_cluster_spec_ext(
                         p,
@@ -848,6 +872,7 @@ pub fn build_workspace(
         build_primary_levels,
         build_extra_capacity,
         nagq: opts.nagq,
+        criterion,
         n_targets: t,
         targets: opts.target_indices.clone(),
         has_weights: opts.weights.is_some(),
@@ -878,9 +903,9 @@ pub fn build_workspace(
 
 /// Fit `(x, y, ids)` on a prebuilt workspace and return the lean [`FitView`].
 /// The route is pinned by the build shape: `fit_on` hard-panics on any per-call
-/// shape (n, p, RE level counts) or frozen-option (nagq, weights/offset
-/// presence, parallel_inner) mismatch. The solver is the one `fit_warm` runs;
-/// only the workspace lifecycle differs by caller.
+/// shape (n, p, RE level counts) or frozen-option (nagq, the criterion `reml`
+/// resolves to, weights/offset presence, parallel_inner) mismatch. The solver
+/// is the one `fit_warm` runs; only the workspace lifecycle differs by caller.
 ///
 /// The data, however, is the caller's responsibility — `fit_warm` validates and
 /// salvages where `fit_on` trusts:
@@ -981,7 +1006,7 @@ pub fn satterthwaite(
     // β̂ there), the case the stable path records as a failed pass without
     // running one. `n_rows ≤ p` (a dense `p = 0` design accumulates no rows,
     // and neither does a workspace no `fit_on` has filled) has no endpoint
-    // either, and the pass's `N − p` would wrap there in a release build.
+    // either (no pass can run there).
     if lmm.recovery.betas.iter().any(|b| b.is_nan())
         || lmm.kernel.n_rows() <= lmm.recovery.betas.len()
     {
@@ -1049,12 +1074,12 @@ pub(crate) fn curvature_note(
     state: &crate::lmm::satterthwaite::SatterthwaiteState,
     converged: bool,
 ) -> Option<Note> {
-    let raise = state.dropped > 0 || state.negative > 0 || !converged || state.failed;
+    let raise = state.dropped > 0 || state.negative > 0 || !converged || state.is_failed();
     raise.then_some(Note::SatterthwaiteCurvature {
         dropped: state.dropped as u32,
         negative: state.negative as u32,
         converged,
-        nonfinite: state.failed,
+        nonfinite: state.is_failed(),
     })
 }
 
@@ -1112,6 +1137,11 @@ pub fn fit_on_hinted<'a>(
         n * p
     );
     assert_eq!(opts.nagq, ws.nagq, "fit_on: nagq is frozen at build");
+    assert_eq!(
+        resolve_criterion(&ws.sized, opts),
+        ws.criterion,
+        "fit_on: reml is frozen at build"
+    );
     assert_eq!(
         opts.target_indices.len(),
         ws.n_targets,
@@ -1183,6 +1213,7 @@ pub fn fit_on_hinted<'a>(
         start_permuted,
         perm,
         sized,
+        criterion,
         ..
     } = ws;
     let perm = *perm;
@@ -1283,6 +1314,7 @@ pub fn fit_on_hinted<'a>(
                 &ids.extra,
                 opts.weights.as_deref(),
                 same_design,
+                criterion.expect("an LMM workspace has a criterion"),
             );
             FitViewKind::Lmm(super::lmm::lmm_run_on(
                 lmm_ws,
@@ -1353,4 +1385,4 @@ pub fn fit_on_hinted<'a>(
 
 #[cfg(test)]
 #[path = "core_tests.rs"]
-mod core_tests;
+pub(super) mod core_tests;

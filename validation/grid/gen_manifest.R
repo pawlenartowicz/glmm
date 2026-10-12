@@ -12,11 +12,14 @@
 #            case (gaussian, poisson, gamma).
 #   READ-IN  every empirical dataset and every committed simulated fixture under
 #            the crate's data/ tree, read in place, never regenerated.
+#   ML TWINS a `reml = false` copy of every Gaussian mixed cell above (one
+#            exception, see DEV_REF), on its parent's data.
 #
 # Uncorrelated slopes have no structure code here.
 #
 # THE ENUMERATION ORDER IS COSMETIC: each cell's seed is seed_of(cell$cell), a
-# hash of its own id (an AGQ cell takes its Laplace parent's id, seed and CSV),
+# hash of its own id (an AGQ cell takes its Laplace parent's id, seed and CSV,
+# and an ML twin its parent's seed and CSV),
 # so inserting or removing a cell anywhere leaves every other cell's data
 # byte-identical. Trimming REPRESENTATIVE after the pilot has
 # already measured is what makes that property required rather than nice.
@@ -356,6 +359,9 @@ NO_MLE <- list(
 # dev_eps and the normal sign rule, just against a different reference.
 # Membership is a property of the data (proven when the entry is added), never
 # a way to excuse a fit glmm got wrong.
+# A DEV_REF cell gets no ML twin (the ML twins section below): the frozen value
+# is its REML criterion, no ML value is frozen for it, and whether the oracles'
+# own ML criterion is inside dev_eps on that data is not established.
 DEV_REF <- list(
   sim_entangled_pair_lmm = "t and v are entangled to 3e-6 (tools/prep/gen_illcond_data.R), so lme4, glmmTMB and glmm each converge to a slightly different theta and their own reported REML criterion carries round-off of 1e-4 to 7e-4 against the true optimum -- above dev_eps even though all three theta agree with each other to 1e-10 on the true objective"
 )
@@ -965,6 +971,21 @@ for (i in seq_along(cells))
       cells[[i]]$data <- sprintf("data/fast/%s", basename(cells[[i]]$data))
   }
 
+# ---- ML twins ----------------------------------------------------------------
+# Every Gaussian mixed cell above is fitted by REML. Its twin `<id>_ml` is the
+# same cell fitted by maximum likelihood: every field of the parent kept (its
+# final `data`, seed and truth included) except the id, `reml = false` and the
+# tag `ml` alone, so a twin joins neither the pilot nor the fast set. A fast
+# parent's twin reads the parent's data/fast/ CSV, the only one gen.R writes for
+# it. The DEV_REF cells have no twin (see DEV_REF).
+for (c in Filter(function(c) c$family == "gaussian" && c$n_theta > 0 &&
+                   is.null(DEV_REF[[c$cell]]), cells)) {
+  c$cell <- paste0(c$cell, "_ml")
+  c$reml <- FALSE
+  c$tags <- I("ml")
+  cells[[length(cells) + 1L]] <- c
+}
+
 # ---- self-checks -------------------------------------------------------------
 ids <- vapply(cells, `[[`, "", "cell")
 stopifnot("duplicate cell id" = !anyDuplicated(ids))
@@ -991,8 +1012,10 @@ stopifnot("no cell carries a max_fun field" =
 # every committed CSV is either read by a cell or named in FIXTURE_SKIPPED.
 # Without this, a fixture drops out of the grid silently and the only symptom is
 # a smaller cell count nobody was counting.
-# A read-in AGQ copy carries its parent's truth, so only the parents are checked.
+# A read-in AGQ copy and an ML twin carry their parent's truth, so only the
+# parents are checked.
 fixture_cells <- Filter(function(c) is.null(c$seed) && is.null(c$nagq) &&
+                          !("ml" %in% c$tags) &&
                           startsWith(c$data, "../data/simulated/"), cells)
 fx_ids <- vapply(fixture_cells, `[[`, "", "cell")
 in_truth <- fx_ids %in% names(FIXTURE_TRUTH)
@@ -1045,12 +1068,15 @@ stopifnot("fast misses a structure class" =
                          function(c) st_class(c$structure), ""))))
 # gen.R writes a cell wherever its own `data` field points, so the tag and the
 # directory have to agree in both directions or a cell is fit on a CSV nobody
-# regenerated.
+# regenerated. The one exception is the ML twin of a fast parent, which reads
+# the parent's CSV.
 stopifnot("a fast generated cell does not read data/fast/" =
   all(vapply(fast, function(c) is.null(c$seed) ||
     identical(c$data, sprintf("data/fast/%s.csv", sub("_agq[0-9]+", "", c$cell))), TRUE)))
+fast_ids <- vapply(fast, `[[`, "", "cell")
 stopifnot("a cell outside the fast set reads data/fast/" =
   all(vapply(cells, function(c) "fast" %in% c$tags ||
+    ("ml" %in% c$tags && sub("_ml$", "", c$cell) %in% fast_ids) ||
     !startsWith(c$data, "data/fast/"), TRUE)))
 
 # ---- write -------------------------------------------------------------------

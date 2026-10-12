@@ -218,7 +218,10 @@ fn satterthwaite_false_skips_the_pass() {
         },
     );
     assert!(off.coef_df.iter().all(|d| d.is_nan()));
-    assert!(off.satterthwaite.as_ref().is_some_and(|st| st.disabled));
+    assert!(off
+        .satterthwaite
+        .as_ref()
+        .is_some_and(|st| st.is_disabled()));
     assert_eq!(
         off.contrast_t(&unit(3, 1)),
         Err(ContrastError::NoDf(NoDfReason::Disabled))
@@ -230,17 +233,29 @@ fn satterthwaite_false_skips_the_pass() {
 }
 
 /// A Gaussian LMM `Fit` built by `FitView::into_fit` without the stable
-/// path's pass carries no state.
+/// path's pass carries the not-run record, on a REML and on an ML fit alike
+/// (`Fit::reml` does not decide the reason).
 #[test]
 fn into_fit_without_pass_is_state_missing() {
     let (x, y, ids, n, p) = lmm_data(None);
-    let (fit, _) = fit_cold_keep_workspace(&x, &y, n, p, &lmm_model(), &ids, &all_targets(p));
-    assert!(fit.satterthwaite.is_none());
-    assert!(fit.coef_df.iter().all(|d| d.is_nan()));
-    assert_eq!(
-        fit.contrast_t(&unit(p, 0)),
-        Err(ContrastError::NoDf(NoDfReason::StateMissing))
-    );
+    for reml in [None, Some(false)] {
+        let opts = FitOptions {
+            reml,
+            ..all_targets(p)
+        };
+        let (fit, _) = fit_cold_keep_workspace(&x, &y, n, p, &lmm_model(), &ids, &opts);
+        assert_eq!(fit.reml, reml.is_none(), "reml {reml:?}");
+        assert!(
+            fit.satterthwaite.as_ref().is_some_and(|st| st.is_not_run()),
+            "reml {reml:?}: the not-run record"
+        );
+        assert!(fit.coef_df.iter().all(|d| d.is_nan()), "reml {reml:?}");
+        assert_eq!(
+            fit.contrast_t(&unit(p, 0)),
+            Err(ContrastError::NoDf(NoDfReason::StateMissing)),
+            "reml {reml:?}"
+        );
+    }
 }
 
 /// The aliased column's df is NaN; the retained columns carry the reduced

@@ -2,7 +2,7 @@
 
 ## The accuracy grid
 
-`glmm` is validated against a grid of 794 model cells in `validation/grid/`. Each
+`glmm` is validated against a grid of 923 model cells in `validation/grid/`. Each
 cell fixes a family, a link, a random-effect structure, a size, a balance and a
 regime, and — where the data is simulated — records the parameters it was
 generated from. A cell is fitted by `glmm` and by every external engine that can
@@ -13,14 +13,22 @@ Four external engines are the oracles, each pinned to an exact version:
 
 | Oracle | Version | Cells it fits | Estimator |
 |---|---|---|---|
-| R `lme4` | 2.0-6 | every family; negative binomial through `glmer.nb` (782 of 794 cells) | Laplace, scalar AGQ |
-| R `glmmTMB` | 1.1.14 | every family but inverse-Gaussian, no AGQ cells (763 of 794 cells) | Laplace |
-| Julia `MixedModels.jl` | 5.9.0 | gaussian, binomial logit/probit, Poisson (458 of 794 cells) | Laplace |
-| R `GLMMadaptive` | 0.9-7 | non-gaussian, one grouping factor (28 of 794 cells, all AGQ) | AGQ |
+| R `lme4` | 2.0-6 | every family; negative binomial through `glmer.nb` (911 of 923 cells) | Laplace, scalar AGQ |
+| R `glmmTMB` | 1.1.14 | every family but inverse-Gaussian, no AGQ cells (892 of 923 cells) | Laplace |
+| Julia `MixedModels.jl` | 5.9.0 | gaussian, binomial logit/probit, Poisson (587 of 923 cells) | Laplace |
+| R `GLMMadaptive` | 0.9-7 | non-gaussian, one grouping factor (28 of 923 cells, all AGQ) | AGQ |
 
-A fifth engine, R `lmerTest` 3.2-1, fits the 130 Gaussian mixed-model cells
-for one quantity only, the per-coefficient Satterthwaite degrees of freedom.
-Its fit is lme4's, so the deviance and parameter checks below never read it.
+A fifth engine, R `lmerTest` 3.2-1, fits the 259 Gaussian mixed-model cells
+(the 130 REML cells and their ML twins) for one quantity only, the
+per-coefficient Satterthwaite degrees of freedom. Its fit is lme4's, so the
+deviance and parameter checks below never read it.
+
+129 of the cells are ML twins (tag `ml`): each refits one of the REML Gaussian
+mixed-model cells by maximum likelihood (`reml = false`) on that cell's data,
+and lme4, glmmTMB, MixedModels.jl and lmerTest fit it with their own ML switch.
+Every Gaussian mixed-model cell has a twin except `sim_entangled_pair_lmm`,
+whose deviance check reads a frozen REML value. A full run fits the twins;
+`run.sh --ml` adds them to a `--fast` or `--timed` run.
 
 The pins are in `validation/grid/versions.json`. A version bump is a deliberate
 event: that oracle is rerun over the whole grid into a **new** run directory, and

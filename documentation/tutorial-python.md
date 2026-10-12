@@ -59,8 +59,9 @@ Points worth knowing at this layer:
   read as 1-D float64; grouping columns (the `g` in `(1 + x | g)`) accept
   string / integer / categorical values and are factorized to level ids.
 - The default `family="gaussian"` with no `(… | g)` term fits OLS; adding a
-  random-effect term makes it an LMM. The same split holds for every family:
-  fixed-only ⇒ GLM, `(… | g)` present ⇒ GLMM.
+  random-effect term makes it an LMM (REML by default, maximum likelihood with
+  `reml=False`). The same split holds for every family: fixed-only ⇒ GLM,
+  `(… | g)` present ⇒ GLMM.
 - The formula follows R conventions: `*` desugars to main effects +
   interaction, `A/B` to nesting, `(1 + x | g)` is a correlated random
   intercept + slope, and additional `(… | g2)` terms add crossed/nested
@@ -137,13 +138,24 @@ fit = glmm.fit(data, "s ~ x1 + (1 | group)", "binomial", link="probit", nagq=7)
   computed (satterthwaite=False)", `fit.confint()` gives normal intervals, and
   `fit.df_method` is `"disabled"`. OLS and the gamma and inverse-gaussian GLMs
   keep their residual df `n − p` whatever it says; no other family reads it.
+- `reml`: `None` (default) or `True` fits a Gaussian mixed model by REML,
+  `False` by maximum likelihood, as lme4's `REML = FALSE`. The summary of an
+  ML fit is titled "Linear mixed model fit by maximum likelihood [glmm]",
+  prints the `AIC BIC logLik deviance df.resid` row in place of the REML
+  criterion, and prints one line under the title: "Note: p-values can be
+  somewhat anticonservative." On OLS (also when every grouping was dropped as
+  single-level) the estimates are the same under every value: `True` reports
+  the REML log-likelihood, as R's `logLik(lm, REML = TRUE)`, and `None` and
+  `False` the ML one. Every other family is fitted by maximum likelihood;
+  `False` there changes nothing, and `True` is ignored with an
+  `ArgumentIgnoredWarning`. `fit.reml` says which criterion `fit.loglik` is.
 
 **Error vs. warning.** An *invalid* value — unknown family, a link the family
 doesn't offer, even `nagq` (`ValueError`), a non-dict `warm_start`
-(`TypeError`) — raises. A *valid but inapplicable* option — `dispersion=` on
+(`TypeError`) — raises. A *valid but inapplicable* option (`dispersion=` on
 gaussian, `init_theta=` off negative-binomial, quasi-dispersion on a mixed
-binomial/poisson formula — warns (`UserWarning`) and is stripped, so it never
-reaches the kernel: loud enough to catch the mistake, lenient enough for
+binomial/poisson formula, `reml=True` off the Gaussian family) warns
+(`UserWarning`) and is stripped, so it never reaches the kernel: loud enough to catch the mistake, lenient enough for
 exploration. `family="inversegaussian"` with a random-effect term raises
 `ValueError` before the call reaches the kernel — mixed models are fixed-effect
 GLM only for this family (see status above).
@@ -172,9 +184,10 @@ them). It is returned by `fit`, never constructed by callers.
 | `n_eval` | optimizer objective evaluations (0 on the closed-form/IRLS paths) |
 | `n_grad`, `outer_stop`, `outer_decrement` | the gradient (BFGS) search, on the models `GradientSearchFallbackWarning` names: its gradient evaluations (not in `n_eval`), why it stopped (`"fdelta"`, `"pgrad"`, `"noise_floor"`, `"line_search"`, `"max_iter"`, `"grad_unavailable"`, `"non_finite"`), and its estimate of the deviance decrease left at the endpoint; `0` / `None` / `NaN` on every other fit |
 | `deviance` | minimized optimizer criterion — **not** comparable across models, and not an AIC input (see below) |
-| `loglik` | log-likelihood on `logLik()`'s scale (R/lme4); the REML criterion for an LMM (see `reml`), the ordinary log-likelihood for OLS/GLM/GLMM; `NaN` wherever `deviance`'s failure modes apply |
+| `loglik` | log-likelihood on `logLik()`'s scale (R/lme4); the REML criterion on a REML fit (see `reml`), the ordinary log-likelihood on every other fit; `NaN` wherever `deviance`'s failure modes apply |
 | `df` | parameters counted for AIC/BIC: retained fixed effects + RE parameters + 1 if the family estimates a dispersion/scale; `0` on degenerate NaN-fill paths |
-| `reml` | `True` iff `loglik` is a REML criterion rather than an ML log-likelihood (the Gaussian LMM paths) — AIC/LRT comparisons across fits with different fixed effects are invalid when this is set |
+| `reml` | `True` iff `loglik` is a REML criterion rather than an ML log-likelihood: a Gaussian mixed model fitted with `reml=None` or `True`, or OLS fitted with `reml=True`. AIC/LRT comparisons across fits with different fixed effects are invalid when this is set |
+| `aic`, `bic` | properties, computed on every fit from `loglik`, `df` and `nobs`: `-2·loglik + 2·df` and `-2·loglik + df·ln(nobs)`. On a REML fit they compare only fits with the same fixed effects (see below) |
 | `fitted` | `(n,)` fitted means μ̂ per row; empty on non-converged fits |
 | `ranef` | random-effect conditional modes b̂, one block per grouping in `varcorr`/`re_groups` order, level-major; empty on non-converged fits — prefer `ranef_blocks` for the labelled form, and do not slice this array yourself |
 | `ranef_levels` | level count per grouping, for slicing `ranef`; empty exactly when `ranef` is |
@@ -204,12 +217,24 @@ warnings.filterwarnings("ignore", category=glmm.IllConditionedWarning)  # just t
 
 **`deviance` is not a model-comparison statistic.** It is the criterion the
 optimizer minimized, on that fit's own scale: for an LMM it is lme4's
-`REMLcrit` minus a data-independent constant; for a GLMM it is the marginal
+`REMLcrit` (on an ML fit, lme4's ML deviance) minus a data-independent
+constant; for a GLMM it is the marginal
 Laplace deviance, which differs from −2·logLik by a data-only saturated
 constant on binomial/Poisson fits and equals −2·logLik on Gamma and
 negative-binomial fits. Those constants do not cancel between two different
 models, so differencing `deviance` across fits — or feeding it to an AIC — is a mistake.
 It is `NaN` for OLS/GLM and on numerical failure.
+
+**`aic` and `bic` of a REML fit.** They are computed on every fit, and on a
+REML fit they are built on the REML criterion, as lme4's `AIC()` of a REML
+fit is. The REML criterion depends on the fixed-effects design, so two REML
+fits compare by `aic` or `bic` only when their fixed effects are the same
+(models that differ in their random effects alone). To compare fixed effects,
+fit both models with `reml=False`. Nothing checks this for you in Python:
+R's `AIC()` refuses such a pair; the `aic` property cannot see the other fit.
+`summary()` of a REML fit prints the REML criterion and no AIC for the same
+reason. On a fit that did not converge the value is not an AIC; check
+`converged` first.
 
 **`vcov` and `se` carry different information.** `se` is only the diagonal, so
 it cannot answer anything about two coefficients jointly. A contrast like

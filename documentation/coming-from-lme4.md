@@ -10,7 +10,9 @@ own page.
 | lme4 | fastglmm (R) | glmm (Python) |
 |---|---|---|
 | `lmer(f, d)` / `glmer(f, d, family)` | `fastglmm(f, d, family = ...)` | `glmm.fit(d, "f", family)` |
-| `summary(fit)` (lmerTest's on an LMM) | `summary(fit)`: lme4-shaped, with the REML criterion (LMM) or the `AIC`/`BIC`/`logLik`/`deviance`/`df.resid` row (ML fits), scaled residuals, variance components, and a coefficient table as lmerTest, `lm` and `glm` print it: t with a Satterthwaite `df` column on a Gaussian mixed model, t on `n - p` on OLS and on the Gamma and inverse-Gaussian GLMs with an estimated dispersion, Wald z elsewhere | `fit.summary()`: the same layout, printed and returned as a string; the df and p-values are also `fit.coef_df` and `fit.coef_p` |
+| `summary(fit)` (lmerTest's on an LMM) | `summary(fit)`: lme4-shaped, with the REML criterion (REML fits) or the `AIC`/`BIC`/`logLik`/`deviance`/`df.resid` row (ML fits), scaled residuals, variance components, and a coefficient table as lmerTest, `lm` and `glm` print it: t with a Satterthwaite `df` column on a Gaussian mixed model, t on `n - p` on OLS and on the Gamma and inverse-Gaussian GLMs with an estimated dispersion, Wald z elsewhere | `fit.summary()`: the same layout, printed and returned as a string; the df and p-values are also `fit.coef_df` and `fit.coef_p` |
+| `lmer(f, d, REML = FALSE)` | `fastglmm(f, d, REML = FALSE)` | `glmm.fit(d, "f", reml=False)` |
+| `AIC(m0, m1)`, `BIC(m0, m1)` | `AIC(m0, m1)`, `BIC(m0, m1)`: the `stats` table, except that a REML fit beside an ML fit, and REML fits with different fixed effects, stop with an error | `m.aic`, `m.bic` (properties, one fit each; nothing compares two fits) |
 | `fixef(fit)` | `fixef(fit)` — named fixed-effect estimates; aliased columns `NA` | `fit.beta` (estimates) with `fit.names` (aligned coefficient names); `fit.aliased` flags rank-deficient columns |
 | `vcov(fit)` | `vcov(fit)` — full `p × p` Wald covariance | `fit.vcov` — `(p, p)` full Cov(β̂) |
 | `VarCorr(fit)` | `VarCorr(fit)` — SD/correlation-scale variance components, lme4-shaped, with a `Residual` row for a Gaussian mixed fit | `fit.varcorr` (vech-packed per grouping) plus `fit.stddev_corr(group_idx)`, which splits a grouping's block into a stddev vector and a correlation matrix |
@@ -74,8 +76,19 @@ four oracles (lme4, glmmTMB, MixedModels.jl, GLMMadaptive).
   (`fastglmm_unused_grouping_levels` / `UnusedGroupingLevelsWarning`).
   `droplevels()` removes both the row and the wasted width. A level declared
   after the last observed one costs nothing and never appears.
-- REML is the only fit mode for LMMs (no ML switch), and all reported
-  standard errors are Wald, not profile or bootstrap — see
+- An LMM is fitted by REML unless you ask for ML, as in lme4: `REML = FALSE`
+  (Python `reml=False`) fits it by maximum likelihood, and that summary prints
+  "Note: p-values can be somewhat anticonservative." under its title. On the
+  frozen lmerTest `REML = FALSE` references (26 models) the ML log-likelihood
+  agrees with lme4's to within 1.5e-9 relative, and the Satterthwaite df with
+  lmerTest's to within 3.5e-4. Unlike lme4, `REML = TRUE` on a model that is
+  not Gaussian warns that it was ignored, and `REML = TRUE` on a Gaussian model
+  without random effects reports the REML log-likelihood, as
+  `logLik(lm, REML = TRUE)`. `logLik()` of a REML fit is the REML criterion,
+  as in lme4. `AIC()` and `BIC()` refuse what lme4 lets through: REML fits
+  with different fixed effects (their REML criteria are not comparable; fit
+  both with `REML = FALSE`) and a REML fit beside an ML fit.
+- All reported standard errors are Wald, not profile or bootstrap — see
   [`conventions.md`](conventions.md#flags-on-the-result) for how the
   `converged`/`singular` flags mark when those numbers should be trusted.
 

@@ -277,7 +277,7 @@ fn state_c_matches_fit_vcov() {
             assert!(fit.converged());
             assert_eq!(weighted, ws.weight_scale != 1.0);
             let st = pass(ws, map);
-            assert!(!st.failed);
+            assert!(!st.is_failed());
             assert_eq!(st.route, DerivRoute::Value);
             assert_eq!((st.dropped, st.negative), (0, 0), "an interior fit");
             // τ̂ is on the scale the fit reports σ̂² (the weight scale undone).
@@ -306,7 +306,7 @@ fn pass_reads_theta_and_never_writes() {
         let theta = ws.theta.clone();
         let f_before = ws.kernel.deviance(&theta).to_bits();
         let st = pass(ws, map);
-        assert!(!st.failed);
+        assert!(!st.is_failed());
         let after: Vec<u64> = ws.theta.iter().map(|t| t.to_bits()).collect();
         let before: Vec<u64> = theta.iter().map(|t| t.to_bits()).collect();
         assert_eq!(after, before);
@@ -359,7 +359,7 @@ fn assemble_two_coordinates_matches_closed_form() {
         ),
     ] {
         let st = assemble(&toy_collected(hess, h));
-        assert!(!st.failed);
+        assert!(!st.is_failed());
         assert_eq!((st.dropped, st.negative), (0, 0));
         for (i, row) in h_inv.iter().enumerate() {
             for (j, &hij) in row.iter().enumerate() {
@@ -381,13 +381,13 @@ fn assemble_nonfinite_point_gives_nan_df() {
     let mut col = toy();
     col.f_mixed[0][1] = f64::INFINITY;
     let st = assemble(&col);
-    assert!(st.failed);
+    assert!(st.is_failed());
     assert!(st.coef_df().iter().all(|d| d.is_nan()));
 
     let mut col = toy();
     col.c_axis[1][0][(1, 1)] = f64::NAN;
     let st = assemble(&col);
-    assert!(st.failed);
+    assert!(st.is_failed());
     assert!(st.coef_df().iter().all(|d| d.is_nan()));
 }
 
@@ -481,7 +481,7 @@ fn maxfun_endpoint_gives_finite_df() {
     let fit = fit_lmm_unhinted(&mut ws, &[0, 1, 2], None, ColumnScaling::IDENTITY);
     assert!(!fit.converged, "a capped fit");
     let st = pass(&mut ws, ColumnScaling::IDENTITY);
-    assert!(!st.failed);
+    assert!(!st.is_failed());
     coef_df_in_range(&st);
 }
 
@@ -844,6 +844,7 @@ mod formula_gates {
                         n,
                         p,
                         None,
+                        crate::lmm::Criterion::Reml,
                     )));
                 }
             }
@@ -1026,7 +1027,7 @@ mod formula_gates {
                 "int1: the balanced collapse is armed"
             );
             let before = response_bits(ws);
-            assert!(!pass(ws, map).failed);
+            assert!(!pass(ws, map).is_failed());
             assert_eq!(response_bits(ws), before, "int1");
         });
 
@@ -1047,7 +1048,7 @@ mod formula_gates {
         assert!(matches!(sparse.kernel, LmmKernel::Sparse { .. }));
         let theta = sparse.theta.clone();
         let before = response_bits(&mut sparse);
-        assert!(!pass_at(&mut sparse, &theta, ColumnScaling::IDENTITY).failed);
+        assert!(!pass_at(&mut sparse, &theta, ColumnScaling::IDENTITY).is_failed());
         assert_eq!(response_bits(&mut sparse), before, "cross4, sparse kernel");
     }
 
@@ -1245,7 +1246,7 @@ mod formula_gates {
             theta[diag] = 0.0;
             assert_eq!(free_coordinates(groupings, &theta).len(), 45);
             let st = pass_at(ws, &theta, map);
-            assert!(!st.failed);
+            assert!(!st.is_failed());
             assert_eq!(st.jac_theta.len(), 45);
             assert!(
                 st.dropped + st.negative >= 1,
@@ -1471,26 +1472,27 @@ pub(crate) mod gate1 {
         Mat::from_fn(rows.len(), ncols, |i, j| rows[i][j])
     }
 
-    /// The REML entries of kind `lmertest` whose `proposal_dependent` is
+    /// The entries of kind `lmertest` whose `proposal_dependent` is
     /// `per_term` (X7: `false` the per-coefficient layout, `true` the per-term
-    /// one). The `_ml` entries are compared with the ML gates.
-    pub(crate) fn reml_entries(per_term: bool) -> Vec<Entry> {
+    /// one) and whose `reml` is `reml` (`false` the `_ml` entries, fitted with
+    /// `REML = FALSE`). Never empty.
+    pub(crate) fn lmertest_entries(per_term: bool, reml: bool) -> Vec<Entry> {
         let out: Vec<Entry> = test_refs::entries(Kind::Lmertest)
             .into_iter()
             .filter(|e| {
                 let flag = e.raw["proposal_dependent"].as_bool();
-                let reml = e.raw["reml"].as_bool();
+                let r = e.raw["reml"].as_bool();
                 assert!(
-                    flag.is_some() && reml.is_some(),
+                    flag.is_some() && r.is_some(),
                     "{}: proposal_dependent or reml is not a bool",
                     e.name
                 );
-                flag == Some(per_term) && reml == Some(true)
+                flag == Some(per_term) && r == Some(reml)
             })
             .collect();
         assert!(
             !out.is_empty(),
-            "no REML lmertest entry (per_term {per_term})"
+            "no lmertest entry (per_term {per_term}, reml {reml})"
         );
         assert!(
             out.iter().all(|e| !e.is_pending()),
@@ -1500,7 +1502,8 @@ pub(crate) mod gate1 {
     }
 
     /// The entry's formula lowered on its data, with its prior weights (the
-    /// entry's `weights` column) in the lowered options.
+    /// entry's `weights` column) and its criterion (`FitOptions::reml` from the
+    /// entry's `reml`, `None` on an entry without one) in the lowered options.
     pub(crate) fn lowered(e: &Entry) -> Lowered {
         let table = table_of(e);
         let formula = e
@@ -1516,6 +1519,7 @@ pub(crate) mod gate1 {
             };
             lo.opts.weights = Some(v.clone());
         }
+        lo.opts.reml = e.raw["reml"].as_bool();
         lo
     }
 
@@ -1704,92 +1708,112 @@ pub(crate) mod gate1 {
         );
     }
 
-    /// Gate 1 at lme4's θ̂, per coefficient, on every REML per-coefficient
-    /// reference and on each route the fit can take ([`routes`]: the value
-    /// route everywhere, the gradient route on the per-group fits):
-    /// `|df − df_lmerTest| / df_lmerTest` within the route's [`band`], an
-    /// over-band row excused only by an entry under `df_at_lme4` (the
-    /// end-to-end gate on the same references keeps `df`). Also the
-    /// pseudo-inverse direction check on the boundary references, and the
-    /// mixed-point stencil with unequal steps on a real
-    /// fit with a `q = 2` block (`h_k` differs between coordinates once a
-    /// `|θ̃_k|` exceeds 1).
+    /// Gate 1 at lme4's θ̂, per coefficient, on every per-coefficient
+    /// reference of both criteria (the REML ones and the `_ml` ones, each
+    /// fitted under its own `reml`) and on each route the fit can take
+    /// ([`routes`]: the value route everywhere, the gradient route on the
+    /// per-group fits): `|df − df_lmerTest| / df_lmerTest` within the route's
+    /// [`band`], an over-band row excused only by an entry under `df_at_lme4`
+    /// (the end-to-end gate on the same references keeps `df`). Also the
+    /// pseudo-inverse direction check on the boundary references, the
+    /// mixed-point stencil with unequal steps on a real fit with a `q = 2`
+    /// block (`h_k` differs between coordinates once a `|θ̃_k|` exceeds 1), and
+    /// the direct check of ν on ML: `lmertest_Dyestuff2_ml`, pinned at θ = 0,
+    /// gets `ν = N` exactly.
     #[test]
     fn gate1_at_lme4_theta() {
         let mut driver = Driver::new(&["df_at_lme4"]);
-        let mut unequal_steps = Vec::new();
-        let mut per_group = Vec::new();
-        let mut boundary = 0;
-        for e in reml_entries(false) {
-            let name = e.name.as_str();
-            let json = test_refs::load(Kind::Lmertest, name);
-            let lo = lowered(&e);
-            let want = numbers(&json["df"], name);
-            let second: Vec<Vec<f64>> = json["df_second"]
-                .as_array()
-                .unwrap_or_else(|| panic!("{name}: df_second"))
-                .iter()
-                .map(|r| numbers(r, name))
-                .collect();
-            let coef = strings(&json["coef_names"], name);
-            let q_max = json["cnms"]
-                .as_array()
-                .expect("cnms")
-                .iter()
-                .map(|c| c.as_array().expect("cnms block").len())
-                .max()
-                .unwrap_or(0);
-            at_lme4_theta(name, &lo, &json, |_, ws, map, theta| {
-                let routes = routes(ws);
-                if routes.contains(&DerivRoute::GradientDiff) {
-                    per_group.push(name.to_string());
-                }
-                let mut value_state = None;
-                for route in routes {
-                    let st = route_pass_at(ws, theta, map, route);
-                    let df = coef_df_in_range(&st);
-                    let theta1 = newton_point(ws, &st, theta);
-                    let moved = route_pass_at(ws, &theta1, map, route).coef_df();
-                    assert_eq!(df.len(), want.len(), "{name}: coefficients");
-                    for i in 0..want.len() {
-                        let err = (df[i] - want[i]).abs() / want[i];
-                        let sp = spread(want[i], &second[i]);
-                        let nonstat = (df[i] - moved[i]).abs() / want[i];
-                        let b = band(route, sp, nonstat);
-                        eprintln!(
-                            "GATE1 {name} {route:?} {}: df {} lmerTest {} rel {err:.2e} spread {sp:.2e} nonstat {nonstat:.2e} band {b:.2e} n_free {}",
-                            coef[i], df[i], want[i], st.jac_theta.len()
-                        );
-                        let what = format!(
-                            "{} at lme4's theta, {route:?} route (spread {sp:.2e}, nonstat {nonstat:.2e})",
-                            coef[i]
-                        );
-                        driver.check(name, "df_at_lme4", &what, (df[i], want[i]), b);
+        for reml in [true, false] {
+            let suffix = if reml { "" } else { "_ml" };
+            let entries = lmertest_entries(false, reml);
+            eprintln!(
+                "GATE1 reml {reml}: {} per-coefficient references compared",
+                entries.len()
+            );
+            let mut unequal_steps = Vec::new();
+            let mut per_group = Vec::new();
+            let mut boundary = 0;
+            let mut pinned_nu = None;
+            for e in entries {
+                let name = e.name.as_str();
+                let json = test_refs::load(Kind::Lmertest, name);
+                let lo = lowered(&e);
+                let want = numbers(&json["df"], name);
+                let second: Vec<Vec<f64>> = json["df_second"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("{name}: df_second"))
+                    .iter()
+                    .map(|r| numbers(r, name))
+                    .collect();
+                let coef = strings(&json["coef_names"], name);
+                let q_max = json["cnms"]
+                    .as_array()
+                    .expect("cnms")
+                    .iter()
+                    .map(|c| c.as_array().expect("cnms block").len())
+                    .max()
+                    .unwrap_or(0);
+                at_lme4_theta(name, &lo, &json, |_, ws, map, theta| {
+                    assert_eq!(
+                        ws.kernel.criterion() == crate::lmm::Criterion::Reml,
+                        reml,
+                        "{name}: the workspace's criterion"
+                    );
+                    let routes = routes(ws);
+                    if routes.contains(&DerivRoute::GradientDiff) {
+                        per_group.push(name.to_string());
                     }
-                    if route == DerivRoute::Value {
-                        value_state = Some(st);
+                    let mut value_state = None;
+                    for route in routes {
+                        let st = route_pass_at(ws, theta, map, route);
+                        let df = coef_df_in_range(&st);
+                        let theta1 = newton_point(ws, &st, theta);
+                        let moved = route_pass_at(ws, &theta1, map, route).coef_df();
+                        assert_eq!(df.len(), want.len(), "{name}: coefficients");
+                        for i in 0..want.len() {
+                            let err = (df[i] - want[i]).abs() / want[i];
+                            let sp = spread(want[i], &second[i]);
+                            let nonstat = (df[i] - moved[i]).abs() / want[i];
+                            let b = band(route, sp, nonstat);
+                            eprintln!(
+                                "GATE1 {name} {route:?} {}: df {} lmerTest {} rel {err:.2e} spread {sp:.2e} nonstat {nonstat:.2e} band {b:.2e} n_free {}",
+                                coef[i], df[i], want[i], st.jac_theta.len()
+                            );
+                            let what = format!(
+                                "{} at lme4's theta, {route:?} route (spread {sp:.2e}, nonstat {nonstat:.2e})",
+                                coef[i]
+                            );
+                            driver.check(name, "df_at_lme4", &what, (df[i], want[i]), b);
+                        }
+                        if route == DerivRoute::Value {
+                            value_state = Some(st);
+                        }
                     }
-                }
-                let st = value_state.expect("the value route always runs");
-                let free = free_coordinates(ws.kernel.groupings(), theta);
-                let steps: Vec<f64> = free.iter().map(|&k| theta[k].abs().max(1.0)).collect();
-                if q_max >= 2 && steps.iter().any(|&s| s != steps[0]) {
-                    unequal_steps.push(name.to_string());
-                }
-                if json["boundary"] != "none" {
-                    pseudo_inverse_drops_what_lmertest_drops(name, &json, &st);
-                    boundary += 1;
-                }
-            });
-            driver.compared(name);
-        }
-        driver.finish();
-        eprintln!("GATE1 mixed points with unequal steps on q >= 2 fits: {unequal_steps:?}");
-        eprintln!("GATE1 gradient route also run on: {per_group:?}");
-        per_group.sort();
-        assert_eq!(
-            per_group,
-            [
+                    let st = value_state.expect("the value route always runs");
+                    if name == "lmertest_Dyestuff2_ml" {
+                        assert!(st.jac_theta.is_empty(), "{name}: θ is pinned");
+                        assert_eq!(st.nu, lo.n as f64, "{name}: ν = N on ML");
+                        assert_eq!(st.coef_df(), [lo.n as f64], "{name}: df = N");
+                        pinned_nu = Some(st.nu);
+                    }
+                    let free = free_coordinates(ws.kernel.groupings(), theta);
+                    let steps: Vec<f64> = free.iter().map(|&k| theta[k].abs().max(1.0)).collect();
+                    if q_max >= 2 && steps.iter().any(|&s| s != steps[0]) {
+                        unequal_steps.push(name.to_string());
+                    }
+                    if json["boundary"] != "none" {
+                        pseudo_inverse_drops_what_lmertest_drops(name, &json, &st);
+                        boundary += 1;
+                    }
+                });
+                driver.compared(name);
+            }
+            eprintln!(
+                "GATE1 reml {reml}: mixed points with unequal steps on q >= 2 fits: {unequal_steps:?}"
+            );
+            eprintln!("GATE1 reml {reml}: gradient route also run on: {per_group:?}");
+            per_group.sort();
+            let want_per_group: Vec<String> = [
                 "lmertest_Machines",
                 "lmertest_all_ones",
                 "lmertest_lmm_slope",
@@ -1797,17 +1821,29 @@ pub(crate) mod gate1 {
                 "lmertest_sim_factorial",
                 "lmertest_sim_max_q_slope",
                 "lmertest_sleepstudy",
-            ],
-            "the references whose fit arms the per-group gradient"
-        );
-        assert!(
-            !unequal_steps.is_empty(),
-            "no q >= 2 reference exercises the mixed stencil with unequal steps"
-        );
-        assert_eq!(
-            boundary, 3,
-            "the boundary references (singular, correlation, near-singular)"
-        );
+            ]
+            .iter()
+            .map(|n| format!("{n}{suffix}"))
+            .collect();
+            assert_eq!(
+                per_group, want_per_group,
+                "reml {reml}: the references whose fit arms the per-group gradient"
+            );
+            assert!(
+                !unequal_steps.is_empty(),
+                "reml {reml}: no q >= 2 reference exercises the mixed stencil with unequal steps"
+            );
+            assert_eq!(
+                boundary, 3,
+                "reml {reml}: the boundary references (singular, correlation, near-singular)"
+            );
+            assert_eq!(
+                pinned_nu.is_some(),
+                !reml,
+                "the ML pinned reference is compared on ML only"
+            );
+        }
+        driver.finish();
     }
 }
 
@@ -1825,15 +1861,18 @@ mod gradient_route {
     use crate::test_support::csv_table;
 
     /// Lowers `formula` on `table`, with the prior weights of column `weights`
-    /// when given, fits it the way `fit_cold` does and hands `f` the fit with the
-    /// LMM workspace and column map it left.
+    /// when given and `FitOptions::reml` set to `reml`, fits it the way
+    /// `fit_cold` does and hands `f` the fit with the LMM workspace and column
+    /// map it left.
     fn with_fit_w<R>(
         formula: &str,
         table: &Table,
         weights: Option<&str>,
+        reml: Option<bool>,
         f: impl FnOnce(&Fit, &mut LmmWorkspace, &ColumnScaling) -> R,
     ) -> R {
         let mut lo = lower(formula, table, Family::Gaussian).expect("the fixture lowers");
+        lo.opts.reml = reml;
         if let Some(w) = weights {
             let w = table.columns.iter().find_map(|(name, col)| match col {
                 Column::Numeric(v) if name == w => Some(v.clone()),
@@ -1938,12 +1977,23 @@ mod gradient_route {
     /// the value route's error: the gradient route's own (about `ε^(2/3)`) is
     /// far below it. Measured 2026-10-11 at `ETA_GRAD` = 3e-6, the largest over
     /// the fixtures: df 4.5e-7 (`q3s` near-zero), `H_p` 5.1e-7
-    /// (`sim_max_q_slope`), a 39x margin.
+    /// (`sim_max_q_slope`), a 39x margin. Every fixture is also fitted under
+    /// ML (`reml = Some(false)`), the gradient route then calling the ML
+    /// `pg_gradient`, at the same bands; measured 2026-10-12 the same way:
+    /// df 1.7e-6 and `H_p` 1.5e-6 (both `q3s` near-zero), an 11x margin.
     #[test]
     fn gradient_route_agrees_with_value_route() {
-        for (name, table, formula, weights) in per_group_fixtures() {
-            with_fit_w(&formula, &table, weights, |fit, ws, map| {
+        let fixtures = per_group_fixtures();
+        let both = [None, Some(false)];
+        for ((name, table, formula, weights), reml) in fixtures
+            .iter()
+            .flat_map(|f| both.iter().map(move |&r| (f, r)))
+        {
+            let name = format!("{name} (reml {reml:?})");
+            let weights = *weights;
+            with_fit_w(formula, table, weights, reml, |fit, ws, map| {
                 assert!(fit.converged(), "{name}");
+                assert_eq!(fit.reml, reml.is_none(), "{name}: criterion");
                 assert!(
                     per_group_gradient_armed(&ws.kernel),
                     "{name}: not on the route"
@@ -1953,7 +2003,7 @@ mod gradient_route {
                 assert_eq!(st.route, DerivRoute::GradientDiff, "{name}");
                 let value = pass_value_at(ws, &theta, map);
                 assert_eq!(value.route, DerivRoute::Value, "{name}");
-                assert!(!st.failed && !value.failed, "{name}");
+                assert!(!st.is_failed() && !value.is_failed(), "{name}");
                 let (dg, dv) = (coef_df_in_range(&st), coef_df_in_range(&value));
                 for (i, (&g, &v)) in dg.iter().zip(&dv).enumerate() {
                     assert!(
@@ -2031,7 +2081,7 @@ mod gradient_route {
             fixtures.push((name.to_string(), table, formula, None));
         }
         for (name, table, formula, weights) in fixtures {
-            with_fit_w(&formula, &table, weights, |fit, ws, map| {
+            with_fit_w(&formula, &table, weights, None, |fit, ws, map| {
                 assert!(fit.converged(), "{name}");
                 let theta = ws.theta.clone();
                 let st = pass(ws, map);
@@ -2104,7 +2154,7 @@ mod gradient_route {
             false,
         ));
         for (name, table, formula, weights, armed) in cases {
-            with_fit_w(&formula, &table, weights, |_, ws, _| {
+            with_fit_w(&formula, &table, weights, None, |_, ws, _| {
                 let bfgs = lmm_outer_optimizer(&ws.kernel, ws.theta.len()) == OuterOptimizer::Bfgs;
                 assert_eq!(per_group_gradient_armed(&ws.kernel), bfgs, "{name}");
                 assert_eq!(bfgs, armed, "{name}");
@@ -2120,22 +2170,22 @@ mod gradient_route {
     #[test]
     fn failed_gradient_falls_back_to_value() {
         let (table, formula) = disarmed_q2s();
-        with_fit_w(&formula, &table, None, |fit, ws, map| {
+        with_fit_w(&formula, &table, None, None, |fit, ws, map| {
             assert!(fit.converged());
             assert!(!per_group_gradient_armed(&ws.kernel));
             let st = pass(ws, map);
             assert_eq!(st.route, DerivRoute::Value);
-            assert!(!st.failed);
+            assert!(!st.is_failed());
             coef_df_in_range(&st);
         });
         let (table, formula) = speed_shape(&[3], false, false, 811_001);
-        with_fit_w(&formula, &table, None, |_, ws, map| {
+        with_fit_w(&formula, &table, None, None, |_, ws, map| {
             assert!(per_group_gradient_armed(&ws.kernel));
             let mut theta = ws.theta.clone();
             theta[1] = f64::NAN;
             let st = pass_at(ws, &theta, map);
             assert_eq!(st.route, DerivRoute::Value);
-            assert!(st.failed);
+            assert!(st.is_failed());
             assert!(st.coef_df().iter().all(|d| d.is_nan()));
         });
     }
@@ -2146,7 +2196,7 @@ mod gradient_route {
     #[test]
     fn failed_gradient_hands_over_to_a_value_route_that_succeeds() {
         let (table, formula) = speed_shape(&[3], false, false, 811_001);
-        with_fit_w(&formula, &table, None, |_, ws, map| {
+        with_fit_w(&formula, &table, None, None, |_, ws, map| {
             assert!(per_group_gradient_armed(&ws.kernel));
             let theta = ws.theta.clone();
             let nu = residual_nu(ws);
@@ -2163,7 +2213,7 @@ mod gradient_route {
             assert!(col.g_axis.is_none());
             let st = assemble(&col);
             assert_eq!(st.route, DerivRoute::Value);
-            assert!(!st.failed);
+            assert!(!st.is_failed());
             let value = pass_value_at(ws, &theta, map);
             for (g, v) in st.coef_df().iter().zip(value.coef_df()) {
                 assert_eq!(g.to_bits(), v.to_bits(), "{g} vs {v}");
@@ -2178,7 +2228,7 @@ mod gradient_route {
     #[test]
     fn gradient_route_uses_2n_points() {
         let (table, formula) = speed_shape(&[3], false, false, 811_001);
-        with_fit_w(&formula, &table, None, |_, ws, map| {
+        with_fit_w(&formula, &table, None, None, |_, ws, map| {
             let theta = ws.theta.clone();
             let (grad, value) = both_routes(ws, map);
             let n = grad.free.len();

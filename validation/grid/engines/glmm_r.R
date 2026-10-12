@@ -114,7 +114,7 @@ build_family <- function(cell) {
   )
 }
 
-do_fit <- function(data, formula, family, wald_se, nagq) {
+do_fit <- function(data, formula, family, wald_se, nagq, reml) {
   # One fastglmm() call. weights and offset ride as DATA COLUMNS
   # (validation_wts, validation_off) referenced by name so fastglmm's
   # eval-in-data resolves them deterministically inside the fit call rather
@@ -122,6 +122,7 @@ do_fit <- function(data, formula, family, wald_se, nagq) {
   # instead of assembled with do.call(). No grid cell carries both a
   # weights/weights_col field and an offset_col at once by construction, but
   # the arm exists so one would not silently drop the other's column.
+  # `reml` is FALSE on a cell tagged `ml` and NULL (the default) otherwise.
   # suppressWarnings: the expected singular-boundary / nAGQ-fallback notices
   # are captured on the fit object (singular, converged), not needed on
   # stderr for a run of ~800 cells.
@@ -130,15 +131,15 @@ do_fit <- function(data, formula, family, wald_se, nagq) {
   suppressWarnings(
     if (has_w && has_o)
       fastglmm(formula, data, family, weights = validation_wts,
-               offset = validation_off, wald.se = wald_se, nAGQ = nagq)
+               offset = validation_off, wald.se = wald_se, nAGQ = nagq, REML = reml)
     else if (has_w)
       fastglmm(formula, data, family, weights = validation_wts,
-               wald.se = wald_se, nAGQ = nagq)
+               wald.se = wald_se, nAGQ = nagq, REML = reml)
     else if (has_o)
       fastglmm(formula, data, family, offset = validation_off,
-               wald.se = wald_se, nAGQ = nagq)
+               wald.se = wald_se, nAGQ = nagq, REML = reml)
     else
-      fastglmm(formula, data, family, wald.se = wald_se, nAGQ = nagq)
+      fastglmm(formula, data, family, wald.se = wald_se, nAGQ = nagq, REML = reml)
   )
 }
 
@@ -217,6 +218,9 @@ fit_one <- function(cell) {
     fml <- as.formula(cell[["glmm_formula"]])
     fam <- build_family(cell)
     k   <- if (is.null(cell[["nagq"]])) 1L else as.integer(cell[["nagq"]])
+    # A cell tagged `ml` (an ML twin) is fitted by ML; every other cell keeps
+    # the default estimator, as in common.rs::fit_cell.
+    reml <- if ("ml" %in% unlist(cell[["tags"]])) FALSE else NULL
 
     # Reading and typing the data frame stays outside the timed region: the
     # other engines of this grid are already holding a typed data frame when
@@ -224,14 +228,14 @@ fit_one <- function(cell) {
     # tryCatch, mirroring common.rs's catch_unwind scope -- a grid corner that
     # breaks the port anywhere in setup (a bad formula, an unsupported
     # family/link pair) is one failed cell, not a run-ending crash.
-    timed <- grid_time(env, function() do_fit(df, fml, fam, "hessian", k))
+    timed <- grid_time(env, function() do_fit(df, fml, fam, "hessian", k, reml))
     fh <- timed$value
     if (!is.null(timed$wall_seconds)) rec$wall_seconds <- timed$wall_seconds
     rec$fits_per_sample <- timed$fits_per_sample
     if (gaussian) {
       rec$se_rx <- nums(fh$se)
     } else {
-      fr <- do_fit(df, fml, fam, "rx", k)
+      fr <- do_fit(df, fml, fam, "rx", k, reml)
       rec$se_hessian <- nums(fh$se); rec$se_rx <- nums(fr$se)
     }
     rec$coef_names <- as.list(names(fh$beta))

@@ -640,8 +640,9 @@ fn csv_for(g: &Golden) -> String {
 /// An inference reference's formula lowered on its data: the CSV under
 /// `validation/` (the entry's `data`), the entry's `factors` as factor columns
 /// and every other column that parses as numbers numeric (X1, the goldens'
-/// `refit_with` rule), and the entry's `weights` column, when it names one, as
-/// the prior weights.
+/// `refit_with` rule), the entry's `weights` column, when it names one, as
+/// the prior weights, and `FitOptions::reml` from the entry's `reml` (`None`
+/// on an entry without one).
 #[allow(dead_code)] // used by tests/inference_oracle.rs only
 pub fn inference_lowered(e: &inference::Entry) -> Lowered {
     let data = e.data.as_ref().expect("the entry has data");
@@ -676,6 +677,7 @@ pub fn inference_lowered(e: &inference::Entry) -> Lowered {
     let mut lo =
         lower(formula, &table, Family::Gaussian).unwrap_or_else(|err| panic!("{}: {err}", e.name));
     lo.opts.weights = weights;
+    lo.opts.reml = e.raw["reml"].as_bool();
     lo
 }
 

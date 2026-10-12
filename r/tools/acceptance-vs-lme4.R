@@ -121,8 +121,8 @@ test_that("logLik and AIC match lme4, and the LMM value is lmer's REML criterion
   expect_equal(AIC(fit), AIC(ref), tolerance = 1e-4)
   expect_false(attr(logLik(fit), "REML"))
 
-  # The LMM path is REML-only, so its logLik is lmer's REML criterion, not an ML
-  # value — comparable only across models with identical fixed effects.
+  # An LMM fitted with the default REML has lmer's REML criterion as its logLik,
+  # not an ML value, comparable only across models with identical fixed effects.
   set.seed(207)
   dl <- data.frame(g = factor(rep(1:40, each = 8)), t = stats::rnorm(320))
   dl$y <- 1 + 0.5 * dl$t + stats::rnorm(40)[as.integer(dl$g)] + stats::rnorm(320)

@@ -7,7 +7,7 @@ Everything under `validation/` is dev-only and never shipped: the nested
 
 | path | what it is |
 |---|---|
-| `grid/` | the accuracy grid: 794 model cells, four pinned external oracles, the gates. The main reference system. |
+| `grid/` | the accuracy grid: 923 model cells (794 plus the 129 ML twins of the Gaussian mixed cells), four pinned external oracles, the gates. The main reference system. |
 | `data/empirical/` | committed CSVs from the datasets `lme4` and `nlme` bundle. Read byte-for-byte by every engine and by `cargo test` through `include_str!`. |
 | `data/simulated/` | committed fixed-seed CSVs, regenerable byte-identically by `tools/prep/`. Also read by `include_str!`, including in CI, so the bytes are the fixture. |
 | `manifest.json` | the per-rung model list for the in-crate tiers: one entry per dataset with its formula, family, link, factors and tier. Read by `tests/validation_oracle.rs`, `tools/bit_identity/dump.rs` and `tools/goldens_agq.R`. |
@@ -23,7 +23,7 @@ Everything under `validation/` is dev-only and never shipped: the nested
 From `grid/`:
 
 ```sh
-./run.sh <engine> [--fast] [--timed[=N]] [--jobs N] [--label TEXT] [--keep] [cell ...]
+./run.sh <engine> [--fast] [--timed[=N]] [--ml] [--jobs N] [--label TEXT] [--keep] [cell ...]
 ```
 
 - `engine` is one of `glmm`, `glmm_python`, `glmm_r`, `lme4`, `glmmtmb`,
@@ -31,7 +31,7 @@ From `grid/`:
   with a random effect with `lmerTest::lmer` and records its per-coefficient
   Satterthwaite df; its run is kept and found like an oracle's.
 - `--fast` restricts the run to the cells tagged `fast` in `manifest.json` (116 of
-  794).
+  923).
 - `--timed[=N]` times every fit: N samples, the first discarded, median of the
   rest. It implies `--fast` and `--jobs 1`, records `no_turbo`, and **refuses to
   start on an unlocked clock** unless `--timed-unlocked` is given, in which case
@@ -39,6 +39,16 @@ From `grid/`:
   only records the state. It also refuses to start without `taskset`, which pins
   the one worker to core 0, unless `--timed-unlocked` is given: the worker then
   runs unpinned (macOS) and the run is marked unlocked.
+- `--ml` adds the cells tagged `ml` to a `--fast` or `--timed` run, which runs
+  without them otherwise. They are the 129 ML twins of the Gaussian mixed cells
+  (all but `sim_entangled_pair_lmm`, whose deviance gate reads a frozen REML
+  value), each on its parent's data, which `glmm`, `glmm_python` and `glmm_r` fit with
+  `reml = Some(false)` / `reml=False` / `REML = FALSE` (every other cell keeps the
+  default estimator). A full run fits every cell, twins included, with no flag, and
+  a cell run names the twins it wants, so `--ml` is refused there. The flag is
+  recorded as `ml` in `run_meta.json`, and `compare.R --fast` reads it there: a
+  `--fast --ml` run is gated on the fast cells and the twins. A `--fast` run made
+  to check accuracy adds `--ml`.
 - `--jobs N` splits the cell list into N chunks and pins worker *i* with
   `taskset -c i`. The P-cores on this box are 0–5, so N above 6 is refused.
 - `--label TEXT` is the free-text purpose of the run; it goes into
@@ -83,10 +93,10 @@ A fresh machine reaches the pinned oracle set with `Rscript install_oracles.R`.
   `runs/lmertest/last/` on every Gaussian cell with a random effect, at
   `coef_df_rel` in `grid/tol.R`, registry-backed in gate 2's scope with the
   quantity `coef_df`. A cell where glmm's Satterthwaite pass failed (every
-  `coef_df` null) is left out of the band and listed, not failed. While
-  `coef_df_rel` is NA, gate 5 prints `NOT RUN (pending: <reason>)` (with or
-  without a `lmertest` run), every other gate runs, and the exit status is
-  theirs. lmerTest is
+  `coef_df` null) is left out of the band and listed, not failed. A missing
+  reference `lmertest` run (full, untimed, a record for every cell whose
+  `oracles` name lmerTest) stops `compare.R` with exit 2, as a missing oracle
+  run does. lmerTest is
   not one of gates 1 to 3's oracles: its fit is lme4's. The port gate also holds
   `coef_df` at `port_rel`.
 - **Bands** — `grid/tol.R`, every one with the measurement and the date that set

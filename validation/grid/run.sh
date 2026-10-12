@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The one runner for every accuracy-grid engine.
 #
-#   ./run.sh <engine> [--fast] [--timed[=N]] [--jobs N] [--label TEXT] [--keep]
+#   ./run.sh <engine> [--fast] [--timed[=N]] [--ml] [--jobs N] [--label TEXT] [--keep]
 #            [--complete-from DIR] [cell ...]
 #
 #   engine   glmm | glmm_wasm | glmm_python | glmm_r | lme4 | glmmtmb | glmmadaptive | mixedmodels
@@ -17,6 +17,10 @@
 #            Also REFUSES to start without `taskset`, which pins the one worker,
 #            unless --timed-unlocked is given (the worker then runs unpinned).
 #            The user locks the machine (bench-l); this script only records the state.
+#   --ml     add the cells tagged `ml` (the ML twins of the Gaussian mixed cells) to a
+#            --fast or --timed run, which runs without them otherwise. Recorded as
+#            `ml` in run_meta, where `compare.R --fast` reads it. A full run fits the
+#            twins with no flag and a cell run names them, so --ml is refused there.
 #   --jobs N split the cell list into N chunks and run N workers, worker i pinned
 #            with `taskset -c i`. P-cores on this box are 0-5, so N > 6 is refused.
 #   --label  free text purpose of the run ("release 0.4.0 baseline"), stored in
@@ -62,6 +66,7 @@ ENGINE="${1:-}"
 shift
 
 FAST=0
+ML=0
 TIMED_N=""
 TIMED_UNLOCKED=0
 JOBS=1
@@ -76,6 +81,7 @@ BUDGET="${GRID_WATCHDOG:-600}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --fast) FAST=1; shift ;;
+    --ml) ML=1; shift ;;
     --timed) TIMED_N=4; shift ;;
     --timed=*) TIMED_N="${1#*=}"; shift ;;
     --timed-unlocked) TIMED_UNLOCKED=1; shift ;;
@@ -109,6 +115,10 @@ if   (( ${#CELL_ARGS[@]} )); then SUBSET=cells
 elif [[ "$FAST" == 1 ]];     then SUBSET=fast
 else                              SUBSET=full
 fi
+[[ "$ML" == 0 || "$SUBSET" == fast ]] || {
+  echo "--ml adds the ML twins to a --fast or --timed run; a full run already fits them and a cell run names them" >&2
+  exit 2
+}
 # The array run_meta records as `cell_list`: the positional names, or [].
 if (( ${#CELL_ARGS[@]} )); then
   CELL_LIST_JSON="$(printf '%s\n' "${CELL_ARGS[@]}" | jq -R . | jq -s .)"
@@ -169,10 +179,13 @@ command -v taskset >/dev/null && PIN_CORES="0-$((JOBS - 1))"
 # carries no `fast` tag works. Without the third arm here, a run restricted to
 # one non-fast cell would select nothing -- SUBSET is "cells", and a two-arm
 # filter would demand the `fast` tag of anything that is not "full".
+# --ml (fast runs only) lets the cells tagged `ml` through the same filter.
 select_cells() {
-  jq -r --arg subset "$SUBSET" --arg eng "$ENGINE_MANIFEST_NAME" '
+  jq -r --arg subset "$SUBSET" --arg eng "$ENGINE_MANIFEST_NAME" \
+    --argjson ml "$([[ "$ML" == 1 ]] && echo true || echo false)" '
     [ .cells[]
-      | select(($subset == "full") or ($subset == "cells") or (.tags | index("fast")))
+      | select(($subset == "full") or ($subset == "cells") or (.tags | index("fast"))
+               or ($ml and (.tags | index("ml"))))
       | select(.oracles | index($eng) or ($eng == ""))
       | {c: .cell, a: (-(.n_obs)), b: (-(.n_theta // 0))} ]
     | sort_by([.a, .b, .c]) | .[].c' "$GRID/manifest.json"
@@ -301,10 +314,11 @@ write_run_meta() {   # $1 = the cell_list JSON array
     --arg label "$LABEL" --arg completed_from "${COMPLETED_FROM:-}" \
     --argjson timed "${TIMED_N:-null}" \
     --argjson unlocked "$([[ "$TIMED_UNLOCKED" == 1 ]] && echo true || echo false)" \
+    --argjson ml "$([[ "$ML" == 1 ]] && echo true || echo false)" \
     --argjson jobs "$JOBS" --argjson cells "${#SELECTED[@]}" \
     --argjson cell_list "$cell_list" \
     '{engine: $engine, engine_version: $engine_version, machine: $machine, date: $date,
-      glmm_crate_version: $crate, glmm_git_rev: $rev, subset: $subset,
+      glmm_crate_version: $crate, glmm_git_rev: $rev, subset: $subset, ml: $ml,
       timed: $timed, timed_unlocked: $unlocked, no_turbo: $no_turbo,
       pin_cores: $pin, jobs: $jobs, loadavg_start: $loadavg,
       r_version: $r, julia_version: $jl, label: $label, cells: $cells,

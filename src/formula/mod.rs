@@ -40,6 +40,7 @@
 //! `default-features = false` and link no `regex`.
 
 mod error;
+mod fixed_part;
 pub(crate) mod hypotheses;
 mod materialize;
 mod parse;
@@ -50,6 +51,10 @@ mod hypotheses_oracle_tests;
 pub(crate) mod hypotheses_tests;
 
 pub use error::{Error, ParseError};
+// Crate-private: `orchestrate::same_fixed_part` is the only caller so far.
+// removed by P31-T6
+#[cfg_attr(not(feature = "orchestrate"), allow(unused_imports))]
+pub(crate) use fixed_part::{fixed_part_relation, FixedPartRelation};
 pub use materialize::{
     label_ranef, lower, materialize, numeric_only_columns, referenced_columns, unresolved_columns,
     Column, FixedTerm, Lowered, RanefBlock, ReGroupInfo, Table,

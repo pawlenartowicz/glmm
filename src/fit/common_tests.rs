@@ -794,6 +794,21 @@ fn rank_deficient_random_slope_returns_nonconverged_instead_of_panicking() {
         "singular is a fitted-boundary flag, not a failure flag"
     );
     assert!(f.varcorr.is_empty() && f.fitted.is_empty() && f.ranef.is_empty());
+    // `reml` is the criterion the options resolve to, as on a fitted model.
+    assert!(f.reml, "REML by default");
+    let ml = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &ids,
+        &FitOptions {
+            reml: Some(false),
+            ..opts
+        },
+    );
+    assert!(!ml.converged() && !ml.reml, "ML on request");
 }
 
 /// Rank-deficiency salvage on a fixed-only design: near-collinear
@@ -2472,4 +2487,59 @@ pub(crate) fn fixture_lowered(
         family,
     )
     .unwrap()
+}
+
+/// `resolve_criterion` is `None` off the Gaussian mixed model for every
+/// `reml` value: no value panics there, and `Some(true)` on a GLM or GLMM is
+/// ignored.
+#[test]
+fn resolve_criterion_is_none_off_the_lmm_path() {
+    let re = || nagq_check_spec().re;
+    let binomial = Family::Binomial {
+        link: BinomialLink::Logit,
+    };
+    let cases = [
+        ("OLS", Family::Gaussian, None, 1),
+        ("binomial GLMM, Laplace", binomial, re(), 1),
+        ("binomial GLMM, AGQ", binomial, re(), 7),
+        (
+            "Poisson GLM",
+            Family::Poisson {
+                link: PoissonLink::Log,
+            },
+            None,
+            1,
+        ),
+        (
+            "Gamma GLMM",
+            Family::Gamma {
+                link: GammaLink::Log,
+            },
+            re(),
+            1,
+        ),
+        (
+            "NB GLM",
+            Family::NegativeBinomial {
+                link: NegBinomialLink::Log,
+            },
+            None,
+            1,
+        ),
+    ];
+    for (tag, family, re, nagq) in cases {
+        let model = ModelSpec { family, re };
+        for reml in [None, Some(true), Some(false)] {
+            let opts = FitOptions {
+                nagq,
+                reml,
+                ..FitOptions::default()
+            };
+            assert_eq!(
+                common::resolve_criterion(&model, &opts),
+                None,
+                "{tag}, reml = {reml:?}"
+            );
+        }
+    }
 }

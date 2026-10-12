@@ -806,3 +806,205 @@ test_that("an aliased coefficient gives an NA interval", {
   expect_true(all(is.na(ci["x2", ])))
   expect_true(all(is.finite(ci[c("(Intercept)", "x"), ])))
 })
+
+# AIC()/BIC() refuse only the comparisons that are always wrong: a REML fit
+# beside an ML fit, and REML fits with different fixed effects.
+reml_ic_fits <- function() {
+  d <- lmm_data()
+  d$h <- factor(rep(1:8, 40))
+  d$y <- d$y + rnorm(8, sd = 0.7)[as.integer(d$h)]
+  list(d = d,
+       m0 = fastglmm(y ~ x + (1 | g), d),
+       m1 = fastglmm(y ~ x + (1 | g) + (1 | h), d),
+       m2 = fastglmm(y ~ x + z + (1 | g), d))
+}
+
+test_that("AIC and BIC on one REML fit return the value stats computes", {
+  m <- reml_ic_fits()$m0
+  expect_true(m$reml)
+  expect_equal(AIC(m), getS3method("AIC", "default")(m))
+  expect_equal(AIC(m, k = 3), getS3method("AIC", "default")(m, k = 3))
+  expect_equal(BIC(m), getS3method("BIC", "default")(m))
+})
+
+test_that("AIC and BIC compare REML fits with the same fixed part as stats does", {
+  f <- reml_ic_fits()
+  m0 <- f$m0
+  m1 <- f$m1
+  ic <- AIC(m0, m1)
+  expect_named(ic, c("df", "AIC"))
+  expect_equal(ic, getS3method("AIC", "default")(m0, m1))
+  expect_equal(BIC(m0, m1), getS3method("BIC", "default")(m0, m1))
+  # The fixed part is a set of terms, not a spelling.
+  m1b <- fastglmm(y ~ 1 + x + (1 | g) + (1 | h), f$d)
+  expect_equal(AIC(m0, m1b), getS3method("AIC", "default")(m0, m1b))
+  # Three fits with one fixed part are allowed: one row per fit.
+  ic3 <- AIC(m0, m1, m1b)
+  expect_s3_class(ic3, "data.frame")
+  expect_named(ic3, c("df", "AIC"))
+  expect_identical(rownames(ic3), c("m0", "m1", "m1b"))
+  expect_equal(ic3$df, c(m0$df, m1$df, m1b$df))
+  expect_equal(ic3$AIC, c(AIC(m0), AIC(m1), AIC(m1b)))
+})
+
+test_that("AIC and BIC refuse REML fits with different fixed parts, every pair checked", {
+  f <- reml_ic_fits()
+  m0 <- f$m0
+  m1 <- f$m1
+  m2 <- f$m2
+  msg <- paste0("m0 and m2 are REML fits with different fixed effects, and REML fits ",
+                "with different fixed effects cannot be compared by AIC. Refit both ",
+                "with REML = FALSE.")
+  expect_error(AIC(m0, m2), msg, fixed = TRUE)
+  expect_error(BIC(m0, m2), sub("by AIC", "by BIC", msg, fixed = TRUE), fixed = TRUE)
+  expect_error(AIC(m0, m1, m2), msg, fixed = TRUE)
+  expect_error(AIC(m2, m0, m1), "m2 and m0 are REML fits with different fixed effects",
+               fixed = TRUE)
+  expect_error(BIC(m0, m2, m1), "cannot be compared by BIC", fixed = TRUE)
+  # y ~ x and y ~ 0 + x differ in the intercept.
+  m3 <- fastglmm(y ~ 0 + x + (1 | g), f$d)
+  expect_error(AIC(m0, m3), "REML = FALSE", fixed = TRUE)
+  # Fits passed by value (do.call) are named by position.
+  expect_error(do.call(AIC, list(m0, m2)), "fit 1 and fit 2 are REML fits", fixed = TRUE)
+})
+
+test_that("AIC and BIC refuse a REML fit beside an ML fit, naming which is which", {
+  f <- reml_ic_fits()
+  m_reml <- f$m0
+  m_ml <- fastglmm(y ~ x, f$d)
+  expect_false(m_ml$reml)
+  msg <- "m_reml was fitted by REML and m_ml by ML. Fit both the same way."
+  expect_error(AIC(m_reml, m_ml), msg, fixed = TRUE)
+  expect_error(AIC(m_ml, m_reml), msg, fixed = TRUE)
+  expect_error(BIC(m_reml, m_ml), msg, fixed = TRUE)
+})
+
+test_that("an OLS fit made with REML = TRUE counts as a REML fit", {
+  f <- reml_ic_fits()
+  o_reml <- fastglmm(y ~ x, f$d, REML = TRUE)
+  o_ml <- fastglmm(y ~ x, f$d)
+  o_reml_z <- fastglmm(y ~ x + z, f$d, REML = TRUE)
+  m0 <- f$m0
+  expect_true(o_reml$reml)
+  expect_error(AIC(o_reml, o_ml), "o_reml was fitted by REML and o_ml by ML", fixed = TRUE)
+  expect_error(AIC(o_reml, o_reml_z), "are REML fits with different fixed effects",
+               fixed = TRUE)
+  expect_equal(AIC(o_reml, m0), getS3method("AIC", "default")(o_reml, m0))
+})
+
+test_that("AIC and BIC on ML fits are the stats defaults, across fixed parts too", {
+  d <- lmm_data()
+  m <- fastglmm(y ~ x, d)
+  m2 <- fastglmm(y ~ x + z, d)
+  expect_false(m$reml)
+  expect_equal(AIC(m), getS3method("AIC", "default")(m))
+  expect_equal(AIC(m, m2), getS3method("AIC", "default")(m, m2))
+  expect_equal(AIC(m, k = 3), getS3method("AIC", "default")(m, k = 3))
+  expect_equal(BIC(m), getS3method("BIC", "default")(m))
+  expect_equal(BIC(m, m2), getS3method("BIC", "default")(m, m2))
+})
+
+test_that("AIC and BIC read the estimator of other packages' fits", {
+  f <- reml_ic_fits()
+  m_reml <- f$m0
+  m_lm <- lm(y ~ x, f$d)
+  msg <- "m_reml was fitted by REML and m_lm by ML. Fit both the same way."
+  expect_error(AIC(m_reml, m_lm), msg, fixed = TRUE)
+  expect_error(BIC(m_reml, m_lm), msg, fixed = TRUE)
+  # nlme's logLik() carries no REML attribute: the estimator is unread, so the
+  # REML fit beside it is the stats default (which warns that nlme counts
+  # n - p observations under REML).
+  l <- nlme::lme(y ~ x, random = ~ 1 | g, data = f$d)
+  expect_equal(suppressWarnings(AIC(m_reml, l)),
+               suppressWarnings(getS3method("AIC", "default")(m_reml, l)))
+  # Otherwise the REML attribute of logLik() decides.
+  for (cls in c("ra_fake_reml", "ra_fake_ml")) {
+    registerS3method("logLik", cls, function(object, ...) {
+      structure(-100, df = 3, nobs = 320, REML = inherits(object, "ra_fake_reml"),
+                class = "logLik")
+    })
+  }
+  f_reml <- structure(list(), class = "ra_fake_reml")
+  f_ml <- structure(list(), class = "ra_fake_ml")
+  expect_equal(AIC(m_reml, f_reml), getS3method("AIC", "default")(m_reml, f_reml))
+  expect_error(AIC(m_reml, f_ml), "m_reml was fitted by REML and f_ml by ML", fixed = TRUE)
+  # A glm is read as an ML fit, so it is allowed beside an ML GLMM fit (fixed
+  # parts are compared between REML fits only).
+  d <- benchmark_data(seed = 113, family = "poisson")
+  m_glmm <- fastglmm(y ~ t + (1 | g), d, family = poisson())
+  m_glm <- glm(y ~ t + d, poisson(), d)
+  expect_false(m_glmm$reml)
+  expect_equal(AIC(m_glmm, m_glm), getS3method("AIC", "default")(m_glmm, m_glm))
+})
+
+# The ML note: one printed note, on an ML fit of a Gaussian mixed model only,
+# a line of its own directly under the title. The Python port prints the same
+# title (with its own port tag) and the same note.
+ml_title <- "Linear mixed model fit by maximum likelihood [fastglmm]"
+ml_note <- "Note: p-values can be somewhat anticonservative."
+
+test_that("an ML Gaussian mixed fit prints its title and the ML note under it", {
+  fit <- fastglmm(y ~ x + (1 | g), lmm_data(), REML = FALSE)
+  expect_false(fit$reml)
+  out <- capture.output(print(fit))
+  sout <- capture.output(print(summary(fit)))
+  for (o in list(out, sout)) {
+    expect_identical(trimws(o[1L]), ml_title)
+    expect_identical(o[2L], ml_note)
+    expect_identical(sum(grepl("anticonservative", o, fixed = TRUE)), 1L)
+  }
+})
+
+test_that("the summary of an ML Gaussian mixed fit prints the ML criterion block", {
+  fit <- fastglmm(y ~ x + (1 | g), lmm_data(), REML = FALSE)
+  s <- summary(fit)
+  expect_named(s$criterion, c("AIC", "BIC", "logLik", "deviance", "df.resid"))
+  expect_equal(unname(s$criterion["logLik"]), fit$loglik)
+  sout <- paste(capture.output(print(s)), collapse = "\n")
+  expect_false(grepl("REML criterion", sout, fixed = TRUE))
+  expect_true(grepl("AIC +BIC +logLik +deviance +df.resid", sout))
+})
+
+test_that("AIC, BIC and glance() are filled on an ML Gaussian mixed fit", {
+  fit <- fastglmm(y ~ x + (1 | g), lmm_data(), REML = FALSE)
+  expect_true(is.finite(AIC(fit)))
+  expect_true(is.finite(BIC(fit)))
+  expect_equal(AIC(fit), -2 * fit$loglik + 2 * fit$df)
+  expect_equal(BIC(fit), -2 * fit$loglik + log(nobs(fit)) * fit$df)
+  gl <- glance(fit)
+  expect_false(gl$REML)
+  expect_equal(gl$AIC, AIC(fit))
+  expect_equal(gl$BIC, BIC(fit))
+  expect_true(all(is.finite(unlist(gl[c("logLik", "deviance", "df.residual")]))))
+})
+
+test_that("the ML note is absent on REML, OLS, GLM and GLMM fits", {
+  d <- lmm_data()
+  db <- benchmark_data(seed = 106, family = "binomial")
+  fits <- list(
+    reml = fastglmm(y ~ x + (1 | g), d),
+    reml_true = fastglmm(y ~ x + (1 | g), d, REML = TRUE),
+    ols = fastglmm(y ~ x, d),
+    ols_reml = fastglmm(y ~ x, d, REML = TRUE),
+    glm = fastglmm(y ~ t, db, family = binomial()),
+    glmm = fastglmm(y ~ t + (1 | g), db, family = binomial())
+  )
+  for (nm in names(fits)) {
+    out <- c(capture.output(print(fits[[nm]])), capture.output(print(summary(fits[[nm]]))))
+    expect_false(any(grepl("anticonservative", out, fixed = TRUE)), info = nm)
+    expect_false(any(grepl("^Note:", out)), info = nm)
+  }
+  expect_identical(trimws(capture.output(print(fits$reml))[1L]),
+                   "Linear mixed model fit by REML [fastglmm]")
+})
+
+test_that("the summary of an OLS fit made with REML = TRUE prints the REML criterion block", {
+  fit <- fastglmm(y ~ x, lmm_data(), REML = TRUE)
+  expect_true(fit$reml)
+  s <- summary(fit)
+  expect_named(s$criterion, "REML criterion at convergence")
+  expect_equal(unname(s$criterion), -2 * fit$loglik)
+  sout <- paste(capture.output(print(s)), collapse = "\n")
+  expect_true(grepl("REML criterion at convergence:", sout, fixed = TRUE))
+  expect_false(grepl("AIC", sout, fixed = TRUE))
+})

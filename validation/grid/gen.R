@@ -40,11 +40,11 @@ n_written <- 0L
 for (cell in cells) {
   meta <- sim_cell(cell)
   # `data` already carries the correct relative path (data/<id>.csv or
-  # data/fast/<id>.csv; an AGQ cell's is its Laplace parent's) -- gen_manifest.R
+  # data/fast/<id>.csv; an AGQ cell's or an ML twin's is its parent's) -- gen_manifest.R
   # owns that choice, not this file, so a cell cannot be written to one place and
   # read from another. The seed lives in the cell (seed_of of the id the CSV is
   # named after), so this loop's ORDER is irrelevant to the bytes it writes and
-  # a parent and its AGQ cell write the same bytes to the same file.
+  # a parent and its AGQ cell or ML twin write the same bytes to the same file.
   out <- file.path(here, cell$data)
   dir.create(dirname(out), showWarnings = FALSE, recursive = TRUE)
   write.csv(meta$df, out, row.names = FALSE)

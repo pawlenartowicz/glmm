@@ -1,7 +1,7 @@
 {
   "schema": "glmm-accuracy-grid/1",
   "generated_by": "grid/gen_manifest.R",
-  "generated": "2026-10-11",
+  "generated": "2026-10-12",
   "cells": [
     {
       "cell": "lmm_int1_g3000p20_bal_base",
@@ -40155,6 +40155,6550 @@
           }
         ],
         "sigma": null,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_int1_g3000p20_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "int1",
+      "n_theta": 1,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 565351,
+      "data": "data/fast/lmm_int1_g3000p20_bal_base.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1))",
+      "glmm_formula": "y ~ x1 + (1 | g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_int2x_g3000p20_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "int2x",
+      "n_theta": 2,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 631776,
+      "data": "data/lmm_int2x_g3000p20_bal_base.csv",
+      "factors": ["g1", "g2"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_nest2_g3000p20_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "nest2",
+      "n_theta": 2,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 630082,
+      "data": "data/fast/lmm_nest2_g3000p20_bal_base.csv",
+      "factors": ["g1", "g2"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_q2s_g3000p20_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "q2s",
+      "n_theta": 3,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 506579,
+      "data": "data/fast/lmm_q2s_g3000p20_bal_base.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 + x1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 + x1 | g1))",
+      "glmm_formula": "y ~ x1 + (1 + x1 | g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1"],
+            "stddev": [1, 0.9],
+            "corr": [
+              [1, 0.2],
+              [0.2, 1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_nest3_g3000p20_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "nest3",
+      "n_theta": 3,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 630163,
+      "data": "data/lmm_nest3_g3000p20_bal_base.csv",
+      "factors": ["g1", "g2", "g3"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_nestmix_g3000p20_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "nestmix",
+      "n_theta": 3,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 782205,
+      "data": "data/lmm_nestmix_g3000p20_bal_base.csv",
+      "factors": ["g1", "g2", "g3"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_cross4_g3000p20_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "cross4",
+      "n_theta": 4,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 700135,
+      "data": "data/fast/lmm_cross4_g3000p20_bal_base.csv",
+      "factors": ["g1", "g2", "g3", "g4"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g4",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_nest2s_g3000p20_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "nest2s",
+      "n_theta": 4,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 701237,
+      "data": "data/lmm_nest2s_g3000p20_bal_base.csv",
+      "factors": ["g1", "g2"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 + x1 | g1) + (1 | g2)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 + x1 | g1) + (1 | g2))",
+      "glmm_formula": "y ~ x1 + (1 + x1 | g1) + (1 | g2)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1"],
+            "stddev": [1, 0.9],
+            "corr": [
+              [1, 0.2],
+              [0.2, 1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_q2sx2_g3000p20_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "q2sx2",
+      "n_theta": 5,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 628577,
+      "data": "data/lmm_q2sx2_g3000p20_bal_base.csv",
+      "factors": ["g1", "g2", "g3"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 + x1 | g1) + (1 | g2) + (1 | g3)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 + x1 | g1) + (1 | g2) + (1 | g3))",
+      "glmm_formula": "y ~ x1 + (1 + x1 | g1) + (1 | g2) + (1 | g3)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1"],
+            "stddev": [1, 0.9],
+            "corr": [
+              [1, 0.2],
+              [0.2, 1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_q3s_g3000p20_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "q3s",
+      "n_theta": 6,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 506615,
+      "data": "data/lmm_q3s_g3000p20_bal_base.csv",
+      "factors": ["g1"],
+      "n_x": 2,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + x2 + (1 + x1 + x2 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + x2 + (1 + x1 + x2 | g1))",
+      "glmm_formula": "y ~ x1 + x2 + (1 + x1 + x2 | g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1", "x2"],
+        "beta": [0.5, 0.8, -0.5],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1", "x2"],
+            "stddev": [1, 0.9, 0.81],
+            "corr": [
+              [1, 0.2, 0.2],
+              [0.2, 1, 0.2],
+              [0.2, 0.2, 1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_cross6_g3000p20_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "cross6",
+      "n_theta": 6,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 700335,
+      "data": "data/lmm_cross6_g3000p20_bal_base.csv",
+      "factors": ["g1", "g2", "g3", "g4", "g5", "g6"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g4",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g5",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g6",
+            "terms": ["(Intercept)"],
+            "stddev": [0.5],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_q2sq2s_g3000p20_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "q2sq2s",
+      "n_theta": 6,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 699284,
+      "data": "data/lmm_q2sq2s_g3000p20_bal_base.csv",
+      "factors": ["g1", "g2"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 + x1 | g1) + (1 + x1 | g2)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 + x1 | g1) + (1 + x1 | g2))",
+      "glmm_formula": "y ~ x1 + (1 + x1 | g1) + (1 + x1 | g2)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1"],
+            "stddev": [1, 0.9],
+            "corr": [
+              [1, 0.2],
+              [0.2, 1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)", "x1"],
+            "stddev": [0.8, 0.72],
+            "corr": [
+              [1, 0.2],
+              [0.2, 1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_cross8_g3000p20_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "cross8",
+      "n_theta": 8,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 700535,
+      "data": "data/lmm_cross8_g3000p20_bal_base.csv",
+      "factors": ["g1", "g2", "g3", "g4", "g5", "g6", "g7", "g8"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6) + (1 | g7) + (1 | g8)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6) + (1 | g7) + (1 | g8))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6) + (1 | g7) + (1 | g8)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g4",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g5",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g6",
+            "terms": ["(Intercept)"],
+            "stddev": [0.5],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g7",
+            "terms": ["(Intercept)"],
+            "stddev": [0.5],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g8",
+            "terms": ["(Intercept)"],
+            "stddev": [0.5],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_q3sx2_g3000p20_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "q3sx2",
+      "n_theta": 8,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 628613,
+      "data": "data/lmm_q3sx2_g3000p20_bal_base.csv",
+      "factors": ["g1", "g2", "g3"],
+      "n_x": 2,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + x2 + (1 + x1 + x2 | g1) + (1 | g2) + (1 | g3)",
+      "jl_formula": "@formula(y ~ 1 + x1 + x2 + (1 + x1 + x2 | g1) + (1 | g2) + (1 | g3))",
+      "glmm_formula": "y ~ x1 + x2 + (1 + x1 + x2 | g1) + (1 | g2) + (1 | g3)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1", "x2"],
+        "beta": [0.5, 0.8, -0.5],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1", "x2"],
+            "stddev": [1, 0.9, 0.81],
+            "corr": [
+              [1, 0.2, 0.2],
+              [0.2, 1, 0.2],
+              [0.2, 0.2, 1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_q4_g3000p20_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "q4",
+      "n_theta": 10,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 450403,
+      "data": "data/lmm_q4_g3000p20_bal_base.csv",
+      "factors": ["g1"],
+      "n_x": 3,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1))",
+      "glmm_formula": "y ~ x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1", "x2", "x3"],
+        "beta": [0.5, 0.8, -0.5, 0.3],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1", "x2", "x3"],
+            "stddev": [1, 0.9, 0.81, 0.729],
+            "corr": [
+              [1, 0.2, 0.2, 0.2],
+              [0.2, 1, 0.2, 0.2],
+              [0.2, 0.2, 1, 0.2],
+              [0.2, 0.2, 0.2, 1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_q4sx2_g3000p20_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "q4sx2",
+      "n_theta": 12,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 628649,
+      "data": "data/lmm_q4sx2_g3000p20_bal_base.csv",
+      "factors": ["g1", "g2", "g3"],
+      "n_x": 3,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3)",
+      "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3))",
+      "glmm_formula": "y ~ x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1", "x2", "x3"],
+        "beta": [0.5, 0.8, -0.5, 0.3],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1", "x2", "x3"],
+            "stddev": [1, 0.9, 0.81, 0.729],
+            "corr": [
+              [1, 0.2, 0.2, 0.2],
+              [0.2, 1, 0.2, 0.2],
+              [0.2, 0.2, 1, 0.2],
+              [0.2, 0.2, 0.2, 1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_q5q2_g3000p20_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "q5q2",
+      "n_theta": 18,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 563416,
+      "data": "data/lmm_q5q2_g3000p20_bal_base.csv",
+      "factors": ["g1", "g2"],
+      "n_x": 4,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + x2 + x3 + x4 + (1 + x1 + x2 + x3 + x4 | g1) + (1 + x1 | g2)",
+      "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + x4 + (1 + x1 + x2 + x3 + x4 | g1) + (1 + x1 | g2))",
+      "glmm_formula": "y ~ x1 + x2 + x3 + x4 + (1 + x1 + x2 + x3 + x4 | g1) + (1 + x1 | g2)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1", "x2", "x3", "x4"],
+        "beta": [0.5, 0.8, -0.5, 0.3, -0.2],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1", "x2", "x3", "x4"],
+            "stddev": [1, 0.9, 0.81, 0.729, 0.6561],
+            "corr": [
+              [1, 0.2, 0.2, 0.2, 0.2],
+              [0.2, 1, 0.2, 0.2, 0.2],
+              [0.2, 0.2, 1, 0.2, 0.2],
+              [0.2, 0.2, 0.2, 1, 0.2],
+              [0.2, 0.2, 0.2, 0.2, 1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)", "x1"],
+            "stddev": [0.8, 0.72],
+            "corr": [
+              [1, 0.2],
+              [0.2, 1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_q6_g3000p20_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "q6",
+      "n_theta": 21,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 450475,
+      "data": "data/lmm_q6_g3000p20_bal_base.csv",
+      "factors": ["g1"],
+      "n_x": 5,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + x2 + x3 + x4 + x5 + (1 + x1 + x2 + x3 + x4 + x5 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + x4 + x5 + (1 + x1 + x2 + x3 + x4 + x5 | g1))",
+      "glmm_formula": "y ~ x1 + x2 + x3 + x4 + x5 + (1 + x1 + x2 + x3 + x4 + x5 | g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1", "x2", "x3", "x4", "x5"],
+        "beta": [0.5, 0.8, -0.5, 0.3, -0.2, 0.4],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1", "x2", "x3", "x4", "x5"],
+            "stddev": [1, 0.9, 0.81, 0.729, 0.6561, 0.59049],
+            "corr": [
+              [1, 0.2, 0.2, 0.2, 0.2, 0.2],
+              [0.2, 1, 0.2, 0.2, 0.2, 0.2],
+              [0.2, 0.2, 1, 0.2, 0.2, 0.2],
+              [0.2, 0.2, 0.2, 1, 0.2, 0.2],
+              [0.2, 0.2, 0.2, 0.2, 1, 0.2],
+              [0.2, 0.2, 0.2, 0.2, 0.2, 1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_q6q2x3_g3000p20_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "q6q2x3",
+      "n_theta": 27,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 694568,
+      "data": "data/lmm_q6q2x3_g3000p20_bal_base.csv",
+      "factors": ["g1", "g2", "g3", "g4", "g5"],
+      "n_x": 5,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + x2 + x3 + x4 + x5 + (1 + x1 + x2 + x3 + x4 + x5 | g1) + (1 + x1 | g2) + (1 | g3) + (1 | g4) + (1 | g5)",
+      "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + x4 + x5 + (1 + x1 + x2 + x3 + x4 + x5 | g1) + (1 + x1 | g2) + (1 | g3) + (1 | g4) + (1 | g5))",
+      "glmm_formula": "y ~ x1 + x2 + x3 + x4 + x5 + (1 + x1 + x2 + x3 + x4 + x5 | g1) + (1 + x1 | g2) + (1 | g3) + (1 | g4) + (1 | g5)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1", "x2", "x3", "x4", "x5"],
+        "beta": [0.5, 0.8, -0.5, 0.3, -0.2, 0.4],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1", "x2", "x3", "x4", "x5"],
+            "stddev": [1, 0.9, 0.81, 0.729, 0.6561, 0.59049],
+            "corr": [
+              [1, 0.2, 0.2, 0.2, 0.2, 0.2],
+              [0.2, 1, 0.2, 0.2, 0.2, 0.2],
+              [0.2, 0.2, 1, 0.2, 0.2, 0.2],
+              [0.2, 0.2, 0.2, 1, 0.2, 0.2],
+              [0.2, 0.2, 0.2, 0.2, 1, 0.2],
+              [0.2, 0.2, 0.2, 0.2, 0.2, 1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)", "x1"],
+            "stddev": [0.8, 0.72],
+            "corr": [
+              [1, 0.2],
+              [0.2, 1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g4",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g5",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_q8_g3000p20_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "q8",
+      "n_theta": 36,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 450547,
+      "data": "data/fast/lmm_q8_g3000p20_bal_base.csv",
+      "factors": ["g1"],
+      "n_x": 7,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + x2 + x3 + x4 + x5 + x6 + x7 + (1 + x1 + x2 + x3 + x4 + x5 + x6 + x7 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + x4 + x5 + x6 + x7 + (1 + x1 + x2 + x3 + x4 + x5 + x6 + x7 | g1))",
+      "glmm_formula": "y ~ x1 + x2 + x3 + x4 + x5 + x6 + x7 + (1 + x1 + x2 + x3 + x4 + x5 + x6 + x7 | g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1", "x2", "x3", "x4", "x5", "x6", "x7"],
+        "beta": [0.5, 0.8, -0.5, 0.3, -0.2, 0.4, -0.3, 0.2],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1", "x2", "x3", "x4", "x5", "x6", "x7"],
+            "stddev": [1, 0.9, 0.81, 0.729, 0.6561, 0.59049, 0.531441, 0.4782969],
+            "corr": [
+              [1, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2],
+              [0.2, 1, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2],
+              [0.2, 0.2, 1, 0.2, 0.2, 0.2, 0.2, 0.2],
+              [0.2, 0.2, 0.2, 1, 0.2, 0.2, 0.2, 0.2],
+              [0.2, 0.2, 0.2, 0.2, 1, 0.2, 0.2, 0.2],
+              [0.2, 0.2, 0.2, 0.2, 0.2, 1, 0.2, 0.2],
+              [0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 1, 0.2],
+              [0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_q8q2x_g3000p20_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "q8q2x",
+      "n_theta": 40,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 629885,
+      "data": "data/lmm_q8q2x_g3000p20_bal_base.csv",
+      "factors": ["g1", "g2", "g3"],
+      "n_x": 7,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + x2 + x3 + x4 + x5 + x6 + x7 + (1 + x1 + x2 + x3 + x4 + x5 + x6 + x7 | g1) + (1 + x1 | g2) + (1 | g3)",
+      "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + x4 + x5 + x6 + x7 + (1 + x1 + x2 + x3 + x4 + x5 + x6 + x7 | g1) + (1 + x1 | g2) + (1 | g3))",
+      "glmm_formula": "y ~ x1 + x2 + x3 + x4 + x5 + x6 + x7 + (1 + x1 + x2 + x3 + x4 + x5 + x6 + x7 | g1) + (1 + x1 | g2) + (1 | g3)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1", "x2", "x3", "x4", "x5", "x6", "x7"],
+        "beta": [0.5, 0.8, -0.5, 0.3, -0.2, 0.4, -0.3, 0.2],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1", "x2", "x3", "x4", "x5", "x6", "x7"],
+            "stddev": [1, 0.9, 0.81, 0.729, 0.6561, 0.59049, 0.531441, 0.4782969],
+            "corr": [
+              [1, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2],
+              [0.2, 1, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2],
+              [0.2, 0.2, 1, 0.2, 0.2, 0.2, 0.2, 0.2],
+              [0.2, 0.2, 0.2, 1, 0.2, 0.2, 0.2, 0.2],
+              [0.2, 0.2, 0.2, 0.2, 1, 0.2, 0.2, 0.2],
+              [0.2, 0.2, 0.2, 0.2, 0.2, 1, 0.2, 0.2],
+              [0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 1, 0.2],
+              [0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)", "x1"],
+            "stddev": [0.8, 0.72],
+            "corr": [
+              [1, 0.2],
+              [0.2, 1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_int1_g60p5_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "int1",
+      "n_theta": 1,
+      "n_obs": 60,
+      "per_group": 5,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 414056,
+      "data": "data/fast/lmm_int1_g60p5_bal_base.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1))",
+      "glmm_formula": "y ~ x1 + (1 | g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_int1_g300p5_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "int1",
+      "n_theta": 1,
+      "n_obs": 300,
+      "per_group": 5,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 461752,
+      "data": "data/lmm_int1_g300p5_bal_base.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1))",
+      "glmm_formula": "y ~ x1 + (1 | g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_int1_g300p20_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "int1",
+      "n_theta": 1,
+      "n_obs": 300,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 510559,
+      "data": "data/lmm_int1_g300p20_bal_base.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1))",
+      "glmm_formula": "y ~ x1 + (1 | g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_int1_g3000p5_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "int1",
+      "n_theta": 1,
+      "n_obs": 3000,
+      "per_group": 5,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 513245,
+      "data": "data/lmm_int1_g3000p5_bal_base.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1))",
+      "glmm_formula": "y ~ x1 + (1 | g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_int1_g3000p100_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "int1",
+      "n_theta": 1,
+      "n_obs": 3000,
+      "per_group": 100,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 621457,
+      "data": "data/lmm_int1_g3000p100_bal_base.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1))",
+      "glmm_formula": "y ~ x1 + (1 | g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_int1_g30000p5_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "int1",
+      "n_theta": 1,
+      "n_obs": 30000,
+      "per_group": 5,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 568268,
+      "data": "data/lmm_int1_g30000p5_bal_base.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1))",
+      "glmm_formula": "y ~ x1 + (1 | g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_int1_g30000p20_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "int1",
+      "n_theta": 1,
+      "n_obs": 30000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 623763,
+      "data": "data/fast/lmm_int1_g30000p20_bal_base.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1))",
+      "glmm_formula": "y ~ x1 + (1 | g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_int1_g30000p100_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "int1",
+      "n_theta": 1,
+      "n_obs": 30000,
+      "per_group": 100,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 683420,
+      "data": "data/lmm_int1_g30000p100_bal_base.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1))",
+      "glmm_formula": "y ~ x1 + (1 | g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_q2s_g60p5_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "q2s",
+      "n_theta": 3,
+      "n_obs": 60,
+      "per_group": 5,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 365292,
+      "data": "data/fast/lmm_q2s_g60p5_bal_base.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 + x1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 + x1 | g1))",
+      "glmm_formula": "y ~ x1 + (1 + x1 | g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1"],
+            "stddev": [1, 0.9],
+            "corr": [
+              [1, 0.2],
+              [0.2, 1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_q2s_g300p5_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "q2s",
+      "n_theta": 3,
+      "n_obs": 300,
+      "per_group": 5,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 409713,
+      "data": "data/lmm_q2s_g300p5_bal_base.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 + x1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 + x1 | g1))",
+      "glmm_formula": "y ~ x1 + (1 + x1 | g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1"],
+            "stddev": [1, 0.9],
+            "corr": [
+              [1, 0.2],
+              [0.2, 1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_q2s_g300p20_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "q2s",
+      "n_theta": 3,
+      "n_obs": 300,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 455311,
+      "data": "data/lmm_q2s_g300p20_bal_base.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 + x1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 + x1 | g1))",
+      "glmm_formula": "y ~ x1 + (1 + x1 | g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1"],
+            "stddev": [1, 0.9],
+            "corr": [
+              [1, 0.2],
+              [0.2, 1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_q2s_g3000p5_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "q2s",
+      "n_theta": 3,
+      "n_obs": 3000,
+      "per_group": 5,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 457772,
+      "data": "data/lmm_q2s_g3000p5_bal_base.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 + x1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 + x1 | g1))",
+      "glmm_formula": "y ~ x1 + (1 + x1 | g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1"],
+            "stddev": [1, 0.9],
+            "corr": [
+              [1, 0.2],
+              [0.2, 1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_q2s_g3000p100_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "q2s",
+      "n_theta": 3,
+      "n_obs": 3000,
+      "per_group": 100,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 559228,
+      "data": "data/lmm_q2s_g3000p100_bal_base.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 + x1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 + x1 | g1))",
+      "glmm_formula": "y ~ x1 + (1 + x1 | g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1"],
+            "stddev": [1, 0.9],
+            "corr": [
+              [1, 0.2],
+              [0.2, 1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_q2s_g30000p5_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "q2s",
+      "n_theta": 3,
+      "n_obs": 30000,
+      "per_group": 5,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 509265,
+      "data": "data/lmm_q2s_g30000p5_bal_base.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 + x1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 + x1 | g1))",
+      "glmm_formula": "y ~ x1 + (1 + x1 | g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1"],
+            "stddev": [1, 0.9],
+            "corr": [
+              [1, 0.2],
+              [0.2, 1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_q2s_g30000p20_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "q2s",
+      "n_theta": 3,
+      "n_obs": 30000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 561371,
+      "data": "data/lmm_q2s_g30000p20_bal_base.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 + x1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 + x1 | g1))",
+      "glmm_formula": "y ~ x1 + (1 + x1 | g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1"],
+            "stddev": [1, 0.9],
+            "corr": [
+              [1, 0.2],
+              [0.2, 1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_q2s_g30000p100_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "q2s",
+      "n_theta": 3,
+      "n_obs": 30000,
+      "per_group": 100,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 617477,
+      "data": "data/lmm_q2s_g30000p100_bal_base.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 + x1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 + x1 | g1))",
+      "glmm_formula": "y ~ x1 + (1 + x1 | g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1"],
+            "stddev": [1, 0.9],
+            "corr": [
+              [1, 0.2],
+              [0.2, 1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_nest2_g300p20_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "nest2",
+      "n_theta": 2,
+      "n_obs": 300,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 571670,
+      "data": "data/fast/lmm_nest2_g300p20_bal_base.csv",
+      "factors": ["g1", "g2"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_nest2_g3000p100_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "nest2",
+      "n_theta": 2,
+      "n_obs": 3000,
+      "per_group": 100,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 689739,
+      "data": "data/lmm_nest2_g3000p100_bal_base.csv",
+      "factors": ["g1", "g2"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_nest2_g30000p20_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "nest2",
+      "n_theta": 2,
+      "n_obs": 30000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 692210,
+      "data": "data/lmm_nest2_g30000p20_bal_base.csv",
+      "factors": ["g1", "g2"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_nest2_g30000p100_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "nest2",
+      "n_theta": 2,
+      "n_obs": 30000,
+      "per_group": 100,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 755512,
+      "data": "data/lmm_nest2_g30000p100_bal_base.csv",
+      "factors": ["g1", "g2"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_nest3_g300p20_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "nest3",
+      "n_theta": 3,
+      "n_obs": 300,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 571751,
+      "data": "data/lmm_nest3_g300p20_bal_base.csv",
+      "factors": ["g1", "g2", "g3"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_nest3_g3000p100_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "nest3",
+      "n_theta": 3,
+      "n_obs": 3000,
+      "per_group": 100,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 689820,
+      "data": "data/lmm_nest3_g3000p100_bal_base.csv",
+      "factors": ["g1", "g2", "g3"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_nest3_g30000p20_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "nest3",
+      "n_theta": 3,
+      "n_obs": 30000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 692291,
+      "data": "data/lmm_nest3_g30000p20_bal_base.csv",
+      "factors": ["g1", "g2", "g3"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_nest3_g30000p100_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "nest3",
+      "n_theta": 3,
+      "n_obs": 30000,
+      "per_group": 100,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 755593,
+      "data": "data/lmm_nest3_g30000p100_bal_base.csv",
+      "factors": ["g1", "g2", "g3"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_cross4_g60p5_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "cross4",
+      "n_theta": 4,
+      "n_obs": 60,
+      "per_group": 5,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 527996,
+      "data": "data/fast/lmm_cross4_g60p5_bal_base.csv",
+      "factors": ["g1", "g2", "g3", "g4"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g4",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_cross4_g300p5_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "cross4",
+      "n_theta": 4,
+      "n_obs": 300,
+      "per_group": 5,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 582512,
+      "data": "data/lmm_cross4_g300p5_bal_base.csv",
+      "factors": ["g1", "g2", "g3", "g4"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g4",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_cross4_g300p20_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "cross4",
+      "n_theta": 4,
+      "n_obs": 300,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 638007,
+      "data": "data/lmm_cross4_g300p20_bal_base.csv",
+      "factors": ["g1", "g2", "g3", "g4"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g4",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_cross4_g3000p5_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "cross4",
+      "n_theta": 4,
+      "n_obs": 3000,
+      "per_group": 5,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 641161,
+      "data": "data/lmm_cross4_g3000p5_bal_base.csv",
+      "factors": ["g1", "g2", "g3", "g4"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g4",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_cross4_g3000p100_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "cross4",
+      "n_theta": 4,
+      "n_obs": 3000,
+      "per_group": 100,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 763437,
+      "data": "data/lmm_cross4_g3000p100_bal_base.csv",
+      "factors": ["g1", "g2", "g3", "g4"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g4",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_cross4_g30000p5_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "cross4",
+      "n_theta": 4,
+      "n_obs": 30000,
+      "per_group": 5,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 703532,
+      "data": "data/lmm_cross4_g30000p5_bal_base.csv",
+      "factors": ["g1", "g2", "g3", "g4"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g4",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_cross4_g30000p20_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "cross4",
+      "n_theta": 4,
+      "n_obs": 30000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 766075,
+      "data": "data/fast/lmm_cross4_g30000p20_bal_base.csv",
+      "factors": ["g1", "g2", "g3", "g4"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g4",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_cross4_g30000p100_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "cross4",
+      "n_theta": 4,
+      "n_obs": 30000,
+      "per_group": 100,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 833116,
+      "data": "data/lmm_cross4_g30000p100_bal_base.csv",
+      "factors": ["g1", "g2", "g3", "g4"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g4",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_cross6_g60p5_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "cross6",
+      "n_theta": 6,
+      "n_obs": 60,
+      "per_group": 5,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 528196,
+      "data": "data/lmm_cross6_g60p5_bal_base.csv",
+      "factors": ["g1", "g2", "g3", "g4", "g5", "g6"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g4",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g5",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g6",
+            "terms": ["(Intercept)"],
+            "stddev": [0.5],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_cross6_g300p5_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "cross6",
+      "n_theta": 6,
+      "n_obs": 300,
+      "per_group": 5,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 582712,
+      "data": "data/lmm_cross6_g300p5_bal_base.csv",
+      "factors": ["g1", "g2", "g3", "g4", "g5", "g6"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g4",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g5",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g6",
+            "terms": ["(Intercept)"],
+            "stddev": [0.5],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_cross6_g300p20_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "cross6",
+      "n_theta": 6,
+      "n_obs": 300,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 638207,
+      "data": "data/lmm_cross6_g300p20_bal_base.csv",
+      "factors": ["g1", "g2", "g3", "g4", "g5", "g6"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g4",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g5",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g6",
+            "terms": ["(Intercept)"],
+            "stddev": [0.5],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_cross6_g3000p5_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "cross6",
+      "n_theta": 6,
+      "n_obs": 3000,
+      "per_group": 5,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 641361,
+      "data": "data/lmm_cross6_g3000p5_bal_base.csv",
+      "factors": ["g1", "g2", "g3", "g4", "g5", "g6"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g4",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g5",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g6",
+            "terms": ["(Intercept)"],
+            "stddev": [0.5],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_cross6_g3000p100_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "cross6",
+      "n_theta": 6,
+      "n_obs": 3000,
+      "per_group": 100,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 763637,
+      "data": "data/lmm_cross6_g3000p100_bal_base.csv",
+      "factors": ["g1", "g2", "g3", "g4", "g5", "g6"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g4",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g5",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g6",
+            "terms": ["(Intercept)"],
+            "stddev": [0.5],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_cross6_g30000p5_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "cross6",
+      "n_theta": 6,
+      "n_obs": 30000,
+      "per_group": 5,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 703732,
+      "data": "data/lmm_cross6_g30000p5_bal_base.csv",
+      "factors": ["g1", "g2", "g3", "g4", "g5", "g6"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g4",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g5",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g6",
+            "terms": ["(Intercept)"],
+            "stddev": [0.5],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_cross6_g30000p20_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "cross6",
+      "n_theta": 6,
+      "n_obs": 30000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 766275,
+      "data": "data/lmm_cross6_g30000p20_bal_base.csv",
+      "factors": ["g1", "g2", "g3", "g4", "g5", "g6"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g4",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g5",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g6",
+            "terms": ["(Intercept)"],
+            "stddev": [0.5],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_cross6_g30000p100_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "cross6",
+      "n_theta": 6,
+      "n_obs": 30000,
+      "per_group": 100,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 833316,
+      "data": "data/lmm_cross6_g30000p100_bal_base.csv",
+      "factors": ["g1", "g2", "g3", "g4", "g5", "g6"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g4",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g5",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g6",
+            "terms": ["(Intercept)"],
+            "stddev": [0.5],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_q4sx2_g300p5_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "q4sx2",
+      "n_theta": 12,
+      "n_obs": 300,
+      "per_group": 5,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 518131,
+      "data": "data/lmm_q4sx2_g300p5_bal_base.csv",
+      "factors": ["g1", "g2", "g3"],
+      "n_x": 3,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3)",
+      "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3))",
+      "glmm_formula": "y ~ x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1", "x2", "x3"],
+        "beta": [0.5, 0.8, -0.5, 0.3],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1", "x2", "x3"],
+            "stddev": [1, 0.9, 0.81, 0.729],
+            "corr": [
+              [1, 0.2, 0.2, 0.2],
+              [0.2, 1, 0.2, 0.2],
+              [0.2, 0.2, 1, 0.2],
+              [0.2, 0.2, 0.2, 1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_q4sx2_g300p20_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "q4sx2",
+      "n_theta": 12,
+      "n_obs": 300,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 570237,
+      "data": "data/lmm_q4sx2_g300p20_bal_base.csv",
+      "factors": ["g1", "g2", "g3"],
+      "n_x": 3,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3)",
+      "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3))",
+      "glmm_formula": "y ~ x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1", "x2", "x3"],
+        "beta": [0.5, 0.8, -0.5, 0.3],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1", "x2", "x3"],
+            "stddev": [1, 0.9, 0.81, 0.729],
+            "corr": [
+              [1, 0.2, 0.2, 0.2],
+              [0.2, 1, 0.2, 0.2],
+              [0.2, 0.2, 1, 0.2],
+              [0.2, 0.2, 0.2, 1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_q4sx2_g3000p5_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "q4sx2",
+      "n_theta": 12,
+      "n_obs": 3000,
+      "per_group": 5,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 573154,
+      "data": "data/lmm_q4sx2_g3000p5_bal_base.csv",
+      "factors": ["g1", "g2", "g3"],
+      "n_x": 3,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3)",
+      "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3))",
+      "glmm_formula": "y ~ x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1", "x2", "x3"],
+        "beta": [0.5, 0.8, -0.5, 0.3],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1", "x2", "x3"],
+            "stddev": [1, 0.9, 0.81, 0.729],
+            "corr": [
+              [1, 0.2, 0.2, 0.2],
+              [0.2, 1, 0.2, 0.2],
+              [0.2, 0.2, 1, 0.2],
+              [0.2, 0.2, 0.2, 1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_q4sx2_g3000p100_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "q4sx2",
+      "n_theta": 12,
+      "n_obs": 3000,
+      "per_group": 100,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 688306,
+      "data": "data/lmm_q4sx2_g3000p100_bal_base.csv",
+      "factors": ["g1", "g2", "g3"],
+      "n_x": 3,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3)",
+      "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3))",
+      "glmm_formula": "y ~ x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1", "x2", "x3"],
+        "beta": [0.5, 0.8, -0.5, 0.3],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1", "x2", "x3"],
+            "stddev": [1, 0.9, 0.81, 0.729],
+            "corr": [
+              [1, 0.2, 0.2, 0.2],
+              [0.2, 1, 0.2, 0.2],
+              [0.2, 0.2, 1, 0.2],
+              [0.2, 0.2, 0.2, 1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_q4sx2_g30000p5_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "q4sx2",
+      "n_theta": 12,
+      "n_obs": 30000,
+      "per_group": 5,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 631803,
+      "data": "data/lmm_q4sx2_g30000p5_bal_base.csv",
+      "factors": ["g1", "g2", "g3"],
+      "n_x": 3,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3)",
+      "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3))",
+      "glmm_formula": "y ~ x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1", "x2", "x3"],
+        "beta": [0.5, 0.8, -0.5, 0.3],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1", "x2", "x3"],
+            "stddev": [1, 0.9, 0.81, 0.729],
+            "corr": [
+              [1, 0.2, 0.2, 0.2],
+              [0.2, 1, 0.2, 0.2],
+              [0.2, 0.2, 1, 0.2],
+              [0.2, 0.2, 0.2, 1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_q4sx2_g30000p20_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "q4sx2",
+      "n_theta": 12,
+      "n_obs": 30000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 690777,
+      "data": "data/lmm_q4sx2_g30000p20_bal_base.csv",
+      "factors": ["g1", "g2", "g3"],
+      "n_x": 3,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3)",
+      "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3))",
+      "glmm_formula": "y ~ x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1", "x2", "x3"],
+        "beta": [0.5, 0.8, -0.5, 0.3],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1", "x2", "x3"],
+            "stddev": [1, 0.9, 0.81, 0.729],
+            "corr": [
+              [1, 0.2, 0.2, 0.2],
+              [0.2, 1, 0.2, 0.2],
+              [0.2, 0.2, 1, 0.2],
+              [0.2, 0.2, 0.2, 1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_q4sx2_g30000p100_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "q4sx2",
+      "n_theta": 12,
+      "n_obs": 30000,
+      "per_group": 100,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 754079,
+      "data": "data/lmm_q4sx2_g30000p100_bal_base.csv",
+      "factors": ["g1", "g2", "g3"],
+      "n_x": 3,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3)",
+      "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3))",
+      "glmm_formula": "y ~ x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1", "x2", "x3"],
+        "beta": [0.5, 0.8, -0.5, 0.3],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1", "x2", "x3"],
+            "stddev": [1, 0.9, 0.81, 0.729],
+            "corr": [
+              [1, 0.2, 0.2, 0.2],
+              [0.2, 1, 0.2, 0.2],
+              [0.2, 0.2, 1, 0.2],
+              [0.2, 0.2, 0.2, 1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_int1_g3000p20_skew_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "int1",
+      "n_theta": 1,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "skew",
+      "regime": "base",
+      "seed": 654849,
+      "data": "data/lmm_int1_g3000p20_skew_base.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1))",
+      "glmm_formula": "y ~ x1 + (1 | g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_int1_g3000p20_single_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "int1",
+      "n_theta": 1,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "single",
+      "regime": "base",
+      "seed": 818322,
+      "data": "data/lmm_int1_g3000p20_single_base.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1))",
+      "glmm_formula": "y ~ x1 + (1 | g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_q2s_g3000p20_skew_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "q2s",
+      "n_theta": 3,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "skew",
+      "regime": "base",
+      "seed": 589216,
+      "data": "data/lmm_q2s_g3000p20_skew_base.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 + x1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 + x1 | g1))",
+      "glmm_formula": "y ~ x1 + (1 + x1 | g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1"],
+            "stddev": [1, 0.9],
+            "corr": [
+              [1, 0.2],
+              [0.2, 1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_q2s_g3000p20_single_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "q2s",
+      "n_theta": 3,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "single",
+      "regime": "base",
+      "seed": 741455,
+      "data": "data/lmm_q2s_g3000p20_single_base.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 + x1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 + x1 | g1))",
+      "glmm_formula": "y ~ x1 + (1 + x1 | g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1"],
+            "stddev": [1, 0.9],
+            "corr": [
+              [1, 0.2],
+              [0.2, 1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_nest2_g3000p20_skew_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "nest2",
+      "n_theta": 2,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "skew",
+      "regime": "base",
+      "seed": 726719,
+      "data": "data/lmm_nest2_g3000p20_skew_base.csv",
+      "factors": ["g1", "g2"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_nest2_g3000p20_single_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "nest2",
+      "n_theta": 2,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "single",
+      "regime": "base",
+      "seed": 901826,
+      "data": "data/lmm_nest2_g3000p20_single_base.csv",
+      "factors": ["g1", "g2"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_nest3_g3000p20_skew_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "nest3",
+      "n_theta": 3,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "skew",
+      "regime": "base",
+      "seed": 726800,
+      "data": "data/lmm_nest3_g3000p20_skew_base.csv",
+      "factors": ["g1", "g2", "g3"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_nest3_g3000p20_single_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "nest3",
+      "n_theta": 3,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "single",
+      "regime": "base",
+      "seed": 901907,
+      "data": "data/lmm_nest3_g3000p20_single_base.csv",
+      "factors": ["g1", "g2", "g3"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_cross4_g3000p20_skew_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "cross4",
+      "n_theta": 4,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "skew",
+      "regime": "base",
+      "seed": 804189,
+      "data": "data/lmm_cross4_g3000p20_skew_base.csv",
+      "factors": ["g1", "g2", "g3", "g4"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g4",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_cross4_g3000p20_single_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "cross4",
+      "n_theta": 4,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "single",
+      "regime": "base",
+      "seed": 991330,
+      "data": "data/lmm_cross4_g3000p20_single_base.csv",
+      "factors": ["g1", "g2", "g3", "g4"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g4",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_cross6_g3000p20_skew_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "cross6",
+      "n_theta": 6,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "skew",
+      "regime": "base",
+      "seed": 804389,
+      "data": "data/lmm_cross6_g3000p20_skew_base.csv",
+      "factors": ["g1", "g2", "g3", "g4", "g5", "g6"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g4",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g5",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g6",
+            "terms": ["(Intercept)"],
+            "stddev": [0.5],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_cross6_g3000p20_single_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "cross6",
+      "n_theta": 6,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "single",
+      "regime": "base",
+      "seed": 991530,
+      "data": "data/lmm_cross6_g3000p20_single_base.csv",
+      "factors": ["g1", "g2", "g3", "g4", "g5", "g6"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g4",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g5",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g6",
+            "terms": ["(Intercept)"],
+            "stddev": [0.5],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_q4sx2_g3000p20_skew_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "q4sx2",
+      "n_theta": 12,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "skew",
+      "regime": "base",
+      "seed": 725286,
+      "data": "data/lmm_q4sx2_g3000p20_skew_base.csv",
+      "factors": ["g1", "g2", "g3"],
+      "n_x": 3,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3)",
+      "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3))",
+      "glmm_formula": "y ~ x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1", "x2", "x3"],
+        "beta": [0.5, 0.8, -0.5, 0.3],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1", "x2", "x3"],
+            "stddev": [1, 0.9, 0.81, 0.729],
+            "corr": [
+              [1, 0.2, 0.2, 0.2],
+              [0.2, 1, 0.2, 0.2],
+              [0.2, 0.2, 1, 0.2],
+              [0.2, 0.2, 0.2, 1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_q4sx2_g3000p20_single_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "q4sx2",
+      "n_theta": 12,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "single",
+      "regime": "base",
+      "seed": 900393,
+      "data": "data/lmm_q4sx2_g3000p20_single_base.csv",
+      "factors": ["g1", "g2", "g3"],
+      "n_x": 3,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3)",
+      "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3))",
+      "glmm_formula": "y ~ x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1", "x2", "x3"],
+        "beta": [0.5, 0.8, -0.5, 0.3],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1", "x2", "x3"],
+            "stddev": [1, 0.9, 0.81, 0.729],
+            "corr": [
+              [1, 0.2, 0.2, 0.2],
+              [0.2, 1, 0.2, 0.2],
+              [0.2, 0.2, 1, 0.2],
+              [0.2, 0.2, 0.2, 1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_int1_g3000p20_bal_nearzero_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "int1",
+      "n_theta": 1,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "nearzero",
+      "seed": 935437,
+      "data": "data/lmm_int1_g3000p20_bal_nearzero.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1))",
+      "glmm_formula": "y ~ x1 + (1 | g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [0.02],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_int1_g3000p20_bal_lowsnr_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "int1",
+      "n_theta": 1,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "lowsnr",
+      "seed": 760235,
+      "data": "data/lmm_int1_g3000p20_bal_lowsnr.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1))",
+      "glmm_formula": "y ~ x1 + (1 | g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.2],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 3,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_int1_g3000p20_bal_boundary_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "int1",
+      "n_theta": 1,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "boundary",
+      "seed": 934471,
+      "data": "data/lmm_int1_g3000p20_bal_boundary.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1))",
+      "glmm_formula": "y ~ x1 + (1 | g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [0],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_q2s_g3000p20_bal_nearzero_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "q2s",
+      "n_theta": 3,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "nearzero",
+      "seed": 851088,
+      "data": "data/lmm_q2s_g3000p20_bal_nearzero.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 + x1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 + x1 | g1))",
+      "glmm_formula": "y ~ x1 + (1 + x1 | g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1"],
+            "stddev": [1, 0.02],
+            "corr": [
+              [1, 0.2],
+              [0.2, 1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_q2s_g3000p20_bal_lowsnr_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "q2s",
+      "n_theta": 3,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "lowsnr",
+      "seed": 687345,
+      "data": "data/lmm_q2s_g3000p20_bal_lowsnr.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 + x1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 + x1 | g1))",
+      "glmm_formula": "y ~ x1 + (1 + x1 | g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.2],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1"],
+            "stddev": [1, 0.9],
+            "corr": [
+              [1, 0.2],
+              [0.2, 1]
+            ]
+          }
+        ],
+        "sigma": 3,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_q2s_g3000p20_bal_highcorr_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "q2s",
+      "n_theta": 3,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "highcorr",
+      "seed": 841771,
+      "data": "data/lmm_q2s_g3000p20_bal_highcorr.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 + x1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 + x1 | g1))",
+      "glmm_formula": "y ~ x1 + (1 + x1 | g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1"],
+            "stddev": [1, 0.9],
+            "corr": [
+              [1, 0.9],
+              [0.9, 1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_q2s_g3000p20_bal_boundary_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "q2s",
+      "n_theta": 3,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "boundary",
+      "seed": 850212,
+      "data": "data/lmm_q2s_g3000p20_bal_boundary.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 + x1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 + x1 | g1))",
+      "glmm_formula": "y ~ x1 + (1 + x1 | g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1"],
+            "stddev": [0, 0],
+            "corr": [
+              [1, 0.2],
+              [0.2, 1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_nest2_g3000p20_bal_nearzero_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "nest2",
+      "n_theta": 2,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "nearzero",
+      "seed": 1026663,
+      "data": "data/lmm_nest2_g3000p20_bal_nearzero.csv",
+      "factors": ["g1", "g2"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [0.02],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_nest2_g3000p20_bal_lowsnr_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "nest2",
+      "n_theta": 2,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "lowsnr",
+      "seed": 839616,
+      "data": "data/lmm_nest2_g3000p20_bal_lowsnr.csv",
+      "factors": ["g1", "g2"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.2],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 3,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_nest2_g3000p20_bal_boundary_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "nest2",
+      "n_theta": 2,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "boundary",
+      "seed": 1025603,
+      "data": "data/lmm_nest2_g3000p20_bal_boundary.csv",
+      "factors": ["g1", "g2"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [0],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_nest3_g3000p20_bal_nearzero_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "nest3",
+      "n_theta": 3,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "nearzero",
+      "seed": 1026744,
+      "data": "data/lmm_nest3_g3000p20_bal_nearzero.csv",
+      "factors": ["g1", "g2", "g3"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [0.02],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_nest3_g3000p20_bal_lowsnr_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "nest3",
+      "n_theta": 3,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "lowsnr",
+      "seed": 839697,
+      "data": "data/lmm_nest3_g3000p20_bal_lowsnr.csv",
+      "factors": ["g1", "g2", "g3"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.2],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 3,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_nest3_g3000p20_bal_boundary_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "nest3",
+      "n_theta": 3,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "boundary",
+      "seed": 1025684,
+      "data": "data/lmm_nest3_g3000p20_bal_boundary.csv",
+      "factors": ["g1", "g2", "g3"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [0],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_cross4_g3000p20_bal_nearzero_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "cross4",
+      "n_theta": 4,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "nearzero",
+      "seed": 1124129,
+      "data": "data/lmm_cross4_g3000p20_bal_nearzero.csv",
+      "factors": ["g1", "g2", "g3", "g4"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [0.02],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g4",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_cross4_g3000p20_bal_lowsnr_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "cross4",
+      "n_theta": 4,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "lowsnr",
+      "seed": 924851,
+      "data": "data/lmm_cross4_g3000p20_bal_lowsnr.csv",
+      "factors": ["g1", "g2", "g3", "g4"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.2],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g4",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 3,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_cross4_g3000p20_bal_boundary_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "cross4",
+      "n_theta": 4,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "boundary",
+      "seed": 1122971,
+      "data": "data/lmm_cross4_g3000p20_bal_boundary.csv",
+      "factors": ["g1", "g2", "g3", "g4"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [0],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g4",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_cross6_g3000p20_bal_nearzero_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "cross6",
+      "n_theta": 6,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "nearzero",
+      "seed": 1124329,
+      "data": "data/lmm_cross6_g3000p20_bal_nearzero.csv",
+      "factors": ["g1", "g2", "g3", "g4", "g5", "g6"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [0.02],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g4",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g5",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g6",
+            "terms": ["(Intercept)"],
+            "stddev": [0.5],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_cross6_g3000p20_bal_lowsnr_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "cross6",
+      "n_theta": 6,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "lowsnr",
+      "seed": 925051,
+      "data": "data/lmm_cross6_g3000p20_bal_lowsnr.csv",
+      "factors": ["g1", "g2", "g3", "g4", "g5", "g6"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.2],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g4",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g5",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g6",
+            "terms": ["(Intercept)"],
+            "stddev": [0.5],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 3,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_cross6_g3000p20_bal_boundary_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "cross6",
+      "n_theta": 6,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "boundary",
+      "seed": 1123171,
+      "data": "data/lmm_cross6_g3000p20_bal_boundary.csv",
+      "factors": ["g1", "g2", "g3", "g4", "g5", "g6"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6))",
+      "glmm_formula": "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4) + (1 | g5) + (1 | g6)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [0],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g4",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g5",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g6",
+            "terms": ["(Intercept)"],
+            "stddev": [0.5],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_q4sx2_g3000p20_bal_nearzero_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "q4sx2",
+      "n_theta": 12,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "nearzero",
+      "seed": 1025230,
+      "data": "data/lmm_q4sx2_g3000p20_bal_nearzero.csv",
+      "factors": ["g1", "g2", "g3"],
+      "n_x": 3,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3)",
+      "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3))",
+      "glmm_formula": "y ~ x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1", "x2", "x3"],
+        "beta": [0.5, 0.8, -0.5, 0.3],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1", "x2", "x3"],
+            "stddev": [1, 0.9, 0.81, 0.02],
+            "corr": [
+              [1, 0.2, 0.2, 0.2],
+              [0.2, 1, 0.2, 0.2],
+              [0.2, 0.2, 1, 0.2],
+              [0.2, 0.2, 0.2, 1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_q4sx2_g3000p20_bal_lowsnr_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "q4sx2",
+      "n_theta": 12,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "lowsnr",
+      "seed": 838183,
+      "data": "data/lmm_q4sx2_g3000p20_bal_lowsnr.csv",
+      "factors": ["g1", "g2", "g3"],
+      "n_x": 3,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3)",
+      "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3))",
+      "glmm_formula": "y ~ x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1", "x2", "x3"],
+        "beta": [0.5, 0.2, -0.125, 0.075],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1", "x2", "x3"],
+            "stddev": [1, 0.9, 0.81, 0.729],
+            "corr": [
+              [1, 0.2, 0.2, 0.2],
+              [0.2, 1, 0.2, 0.2],
+              [0.2, 0.2, 1, 0.2],
+              [0.2, 0.2, 0.2, 1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 3,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_q4sx2_g3000p20_bal_highcorr_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "q4sx2",
+      "n_theta": 12,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "highcorr",
+      "seed": 1014301,
+      "data": "data/lmm_q4sx2_g3000p20_bal_highcorr.csv",
+      "factors": ["g1", "g2", "g3"],
+      "n_x": 3,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3)",
+      "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3))",
+      "glmm_formula": "y ~ x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1", "x2", "x3"],
+        "beta": [0.5, 0.8, -0.5, 0.3],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1", "x2", "x3"],
+            "stddev": [1, 0.9, 0.81, 0.729],
+            "corr": [
+              [1, 0.9, 0.9, 0.9],
+              [0.9, 1, 0.9, 0.9],
+              [0.9, 0.9, 1, 0.9],
+              [0.9, 0.9, 0.9, 1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_q4sx2_g3000p20_bal_boundary_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "q4sx2",
+      "n_theta": 12,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "boundary",
+      "seed": 1024170,
+      "data": "data/lmm_q4sx2_g3000p20_bal_boundary.csv",
+      "factors": ["g1", "g2", "g3"],
+      "n_x": 3,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3)",
+      "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3))",
+      "glmm_formula": "y ~ x1 + x2 + x3 + (1 + x1 + x2 + x3 | g1) + (1 | g2) + (1 | g3)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1", "x2", "x3"],
+        "beta": [0.5, 0.8, -0.5, 0.3],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1", "x2", "x3"],
+            "stddev": [0, 0, 0, 0],
+            "corr": [
+              [1, 0.2, 0.2, 0.2],
+              [0.2, 1, 0.2, 0.2],
+              [0.2, 0.2, 1, 0.2],
+              [0.2, 0.2, 0.2, 1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_int1_g3000p20_bal_base_wts_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "int1",
+      "n_theta": 1,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 928958,
+      "data": "data/lmm_int1_g3000p20_bal_base_wts.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 | g1))",
+      "glmm_formula": "y ~ x1 + (1 | g1)",
+      "weights_col": "w",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_q2s_g3000p20_bal_base_wts_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "q2s",
+      "n_theta": 3,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 845209,
+      "data": "data/lmm_q2s_g3000p20_bal_base_wts.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (1 + x1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (1 + x1 | g1))",
+      "glmm_formula": "y ~ x1 + (1 + x1 | g1)",
+      "weights_col": "w",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1"],
+            "stddev": [1, 0.9],
+            "corr": [
+              [1, 0.2],
+              [0.2, 1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "Dyestuff_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "n_theta": 1,
+      "n_obs": 30,
+      "data": "../data/empirical/Dyestuff.csv",
+      "factors": ["Batch"],
+      "response": "Yield",
+      "r_formula": "Yield ~ 1 + (1 | Batch)",
+      "jl_formula": "@formula(Yield ~ 1 + (1 | Batch))",
+      "glmm_formula": "Yield ~ (1 | Batch)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth_why": "empirical data; no generating parameter vector"
+    },
+    {
+      "cell": "sleepstudy_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "n_theta": 3,
+      "n_obs": 180,
+      "data": "../data/empirical/sleepstudy.csv",
+      "factors": ["Subject"],
+      "response": "Reaction",
+      "r_formula": "Reaction ~ 1 + Days + (1 + Days | Subject)",
+      "jl_formula": "@formula(Reaction ~ 1 + Days + (1 + Days | Subject))",
+      "glmm_formula": "Reaction ~ Days + (1 + Days | Subject)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth_why": "empirical data; no generating parameter vector"
+    },
+    {
+      "cell": "Penicillin_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "n_theta": 2,
+      "n_obs": 144,
+      "data": "../data/empirical/Penicillin.csv",
+      "factors": ["plate", "sample"],
+      "response": "diameter",
+      "r_formula": "diameter ~ 1 + (1 | plate) + (1 | sample)",
+      "jl_formula": "@formula(diameter ~ 1 + (1 | plate) + (1 | sample))",
+      "glmm_formula": "diameter ~ (1 | plate) + (1 | sample)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth_why": "empirical data; no generating parameter vector"
+    },
+    {
+      "cell": "Pastes_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "n_theta": 2,
+      "n_obs": 60,
+      "data": "../data/empirical/Pastes.csv",
+      "factors": ["batch", "cask"],
+      "response": "strength",
+      "r_formula": "strength ~ 1 + (1 | batch/cask)",
+      "jl_formula": "@formula(strength ~ 1 + (1 | batch) + (1 | batch & cask))",
+      "glmm_formula": "strength ~ (1 | batch) + (1 | batch:cask)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth_why": "empirical data; no generating parameter vector"
+    },
+    {
+      "cell": "Machines_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "n_theta": 3,
+      "n_obs": 54,
+      "data": "../data/empirical/Machines.csv",
+      "factors": ["Worker", "Machine"],
+      "response": "score",
+      "r_formula": "score ~ 1 + Machine + (1 + Machine | Worker)",
+      "jl_formula": "@formula(score ~ 1 + Machine + (1 + Machine | Worker))",
+      "glmm_formula": "score ~ Machine + (1 + Machine | Worker)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth_why": "empirical data; no generating parameter vector"
+    },
+    {
+      "cell": "Oats_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "n_theta": 2,
+      "n_obs": 72,
+      "data": "../data/empirical/Oats.csv",
+      "factors": ["Block", "Variety"],
+      "response": "yield",
+      "r_formula": "yield ~ 1 + Variety + nitro + (1 | Block/Variety)",
+      "jl_formula": "@formula(yield ~ 1 + Variety + nitro + (1 | Block/Variety))",
+      "glmm_formula": "yield ~ Variety + nitro + (1 | Block/Variety)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth_why": "empirical data; no generating parameter vector"
+    },
+    {
+      "cell": "cake_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "n_theta": 1,
+      "n_obs": 270,
+      "data": "../data/empirical/cake.csv",
+      "factors": ["recipe", "replicate"],
+      "response": "angle",
+      "r_formula": "angle ~ 1 + recipe*temp + (1 | recipe:replicate)",
+      "jl_formula": "@formula(angle ~ 1 + recipe*temp + (1 | recipe & replicate))",
+      "glmm_formula": "angle ~ recipe*temp + (1 | recipe:replicate)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth_why": "empirical data; no generating parameter vector"
+    },
+    {
+      "cell": "sim_slope_extra_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "n_theta": 6,
+      "n_obs": 360,
+      "data": "../data/simulated/sim_slope_extra.csv",
+      "factors": ["g1", "g2"],
+      "response": "y",
+      "r_formula": "y ~ 1 + x + (1 + x | g1) + (1 + x | g2)",
+      "jl_formula": "@formula(y ~ 1 + x + (1 + x | g1) + (1 + x | g2))",
+      "glmm_formula": "y ~ x + (1 + x | g1) + (1 + x | g2)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x"],
+        "beta": [1, 0.5],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x"],
+            "stddev": [1.1, 0.6],
+            "corr": [
+              [1, 0.3],
+              [0.3, 1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)", "x"],
+            "stddev": [0.9, 0.5],
+            "corr": [
+              [1, 0.2],
+              [0.2, 1]
+            ]
+          }
+        ],
+        "sigma": 0.7,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "sim_three_level_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "n_theta": 2,
+      "n_obs": 400,
+      "data": "../data/simulated/sim_three_level.csv",
+      "factors": ["g1", "g2"],
+      "response": "y",
+      "r_formula": "y ~ 1 + x + (1 | g1/g2)",
+      "jl_formula": "@formula(y ~ 1 + x + (1 | g1/g2))",
+      "glmm_formula": "y ~ x + (1 | g1/g2)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x"],
+        "beta": [1.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g1:g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "sim_max_q_slope_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "n_theta": 36,
+      "n_obs": 1500,
+      "data": "../data/simulated/sim_max_q_slope.csv",
+      "factors": ["g1"],
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + x2 + x3 + x4 + x5 + x6 + x7 + (1 + x1 + x2 + x3 + x4 + x5 + x6 + x7 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + x4 + x5 + x6 + x7 + (1 + x1 + x2 + x3 + x4 + x5 + x6 + x7 | g1))",
+      "glmm_formula": "y ~ x1 + x2 + x3 + x4 + x5 + x6 + x7 + (1 + x1 + x2 + x3 + x4 + x5 + x6 + x7 | g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1", "x2", "x3", "x4", "x5", "x6", "x7"],
+        "beta": [1.5, 0.8, -0.5, 0.3, -0.2, 0.4, -0.3, 0.2],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1", "x2", "x3", "x4", "x5", "x6", "x7"],
+            "stddev": [1, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3],
+            "corr": [
+              [1, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2],
+              [0.2, 1, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2],
+              [0.2, 0.2, 1, 0.2, 0.2, 0.2, 0.2, 0.2],
+              [0.2, 0.2, 0.2, 1, 0.2, 0.2, 0.2, 0.2],
+              [0.2, 0.2, 0.2, 0.2, 1, 0.2, 0.2, 0.2],
+              [0.2, 0.2, 0.2, 0.2, 0.2, 1, 0.2, 0.2],
+              [0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 1, 0.2],
+              [0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 1]
+            ]
+          }
+        ],
+        "sigma": 0.5,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "sim_unbalanced_nested_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "n_theta": 2,
+      "n_obs": 496,
+      "data": "../data/simulated/sim_unbalanced_nested.csv",
+      "factors": ["g1", "g2"],
+      "response": "y",
+      "r_formula": "y ~ 1 + x + (1 | g1/g2)",
+      "jl_formula": "@formula(y ~ 1 + x + (1 | g1/g2))",
+      "glmm_formula": "y ~ x + (1 | g1/g2)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x"],
+        "beta": [1, 0.6],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g1:g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.5,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "sim_nested_crossed_mix_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "n_theta": 3,
+      "n_obs": 288,
+      "data": "../data/simulated/sim_nested_crossed_mix.csv",
+      "factors": ["g1", "g2", "c1"],
+      "response": "y",
+      "r_formula": "y ~ 1 + x + (1 | g1/g2) + (1 | c1)",
+      "jl_formula": "@formula(y ~ 1 + x + (1 | g1/g2) + (1 | c1))",
+      "glmm_formula": "y ~ x + (1 | g1/g2) + (1 | c1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x"],
+        "beta": [1.2, 0.6],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "g1:g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "c1",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.5,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_intercept_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "n_theta": 1,
+      "n_obs": 300,
+      "data": "../data/simulated/lmm_intercept.csv",
+      "factors": ["g"],
+      "response": "y",
+      "r_formula": "y ~ 1 + x + (1 | g)",
+      "jl_formula": "@formula(y ~ 1 + x + (1 | g))",
+      "glmm_formula": "y ~ x + (1 | g)",
+      "weights_col": "w",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x"],
+        "beta": [1, 0.6],
+        "varcomp": [
+          {
+            "group": "g",
+            "terms": ["(Intercept)"],
+            "stddev": [0.9],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.7,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_slope_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "n_theta": 3,
+      "n_obs": 288,
+      "data": "../data/simulated/lmm_slope.csv",
+      "factors": ["g"],
+      "response": "y",
+      "r_formula": "y ~ 1 + x + (1 + x | g)",
+      "jl_formula": "@formula(y ~ 1 + x + (1 + x | g))",
+      "glmm_formula": "y ~ x + (1 + x | g)",
+      "weights_col": "w",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x"],
+        "beta": [1, 0.5],
+        "varcomp": [
+          {
+            "group": "g",
+            "terms": ["(Intercept)", "x"],
+            "stddev": [1.1, 0.6],
+            "corr": [
+              [1, 0.3],
+              [0.3, 1]
+            ]
+          }
+        ],
+        "sigma": 0.7,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_crossed_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "n_theta": 6,
+      "n_obs": 360,
+      "data": "../data/simulated/lmm_crossed.csv",
+      "factors": ["g1", "g2"],
+      "response": "y",
+      "r_formula": "y ~ 1 + x + (1 + x | g1) + (1 + x | g2)",
+      "jl_formula": "@formula(y ~ 1 + x + (1 + x | g1) + (1 + x | g2))",
+      "glmm_formula": "y ~ x + (1 + x | g1) + (1 + x | g2)",
+      "weights_col": "w",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x"],
+        "beta": [1, 0.5],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x"],
+            "stddev": [1.1, 0.6],
+            "corr": [
+              [1, 0.3],
+              [0.3, 1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)", "x"],
+            "stddev": [0.9, 0.5],
+            "corr": [
+              [1, 0.2],
+              [0.2, 1]
+            ]
+          }
+        ],
+        "sigma": 0.7,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "path_huge_int_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "n_theta": 1,
+      "n_obs": 200,
+      "data": "../data/simulated/path_huge_int.csv",
+      "factors": ["g"],
+      "response": "y",
+      "r_formula": "y ~ 1 + x + (1 | g)",
+      "jl_formula": "@formula(y ~ 1 + x + (1 | g))",
+      "glmm_formula": "y ~ x + (1 | g)",
+      "weights_col": "w",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x"],
+        "beta": [1, 0.6],
+        "varcomp": [
+          {
+            "group": "g",
+            "terms": ["(Intercept)"],
+            "stddev": [0.9],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 25,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "all_ones_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "n_theta": 3,
+      "n_obs": 200,
+      "data": "../data/simulated/all_ones.csv",
+      "factors": ["g"],
+      "response": "y",
+      "r_formula": "y ~ 1 + x + (1 + x | g)",
+      "jl_formula": "@formula(y ~ 1 + x + (1 + x | g))",
+      "glmm_formula": "y ~ x + (1 + x | g)",
+      "weights_col": "w",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x"],
+        "beta": [1, 0.5],
+        "varcomp": [
+          {
+            "group": "g",
+            "terms": ["(Intercept)", "x"],
+            "stddev": [1, 0.6],
+            "corr": [
+              [1, 0.25],
+              [0.25, 1]
+            ]
+          }
+        ],
+        "sigma": 0.7,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "sim_collinear_lmm_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "n_theta": 1,
+      "n_obs": 180,
+      "data": "../data/simulated/sim_collinear_lmm.csv",
+      "factors": ["g"],
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + x2 + x3 + (1 | g)",
+      "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + (1 | g))",
+      "glmm_formula": "y ~ x1 + x2 + x3 + (1 | g)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth_why": "near-collinear design (x3 = x1 + x2 + 1e-13 jitter) on a mixed model; the aliased column has no true beta"
+    },
+    {
+      "cell": "sim_dynrange_lmm_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "n_theta": 1,
+      "n_obs": 1000,
+      "data": "../data/simulated/sim_dynrange_lmm.csv",
+      "factors": ["g"],
+      "response": "y",
+      "r_formula": "y ~ 1 + u + w + (1 | g)",
+      "jl_formula": "@formula(y ~ 1 + u + w + (1 | g))",
+      "glmm_formula": "y ~ u + w + (1 | g)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth_why": "tools/prep/gen_illcond_data.R draws the random effect and the residual from a deterministic 16-bit LCG uniform, not from normals, so the variance parameters have no generating value"
+    },
+    {
+      "cell": "sim_slope_lmm_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "n_theta": 4,
+      "n_obs": 120,
+      "data": "../data/simulated/sim_slope.csv",
+      "factors": ["g1", "g2"],
+      "response": "y",
+      "r_formula": "y ~ 1 + x + (1 + x | g1) + (1 | g2)",
+      "jl_formula": "@formula(y ~ 1 + x + (1 + x | g1) + (1 | g2))",
+      "glmm_formula": "y ~ x + (1 + x | g1) + (1 | g2)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x"],
+        "beta": [1, 0.5],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x"],
+            "stddev": [1.2, 0.7],
+            "corr": [
+              [1, 0],
+              [0, 1]
+            ]
+          },
+          {
+            "group": "g2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.9],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.8,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "sim_wide_crossed_lmm_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "n_theta": 8,
+      "n_obs": 420,
+      "data": "../data/simulated/sim_wide_crossed.csv",
+      "factors": ["g1", "c1", "c2", "c3", "c4", "c5", "c6", "c7"],
+      "response": "y",
+      "r_formula": "y ~ 1 + x + (1|g1) + (1|c1) + (1|c2) + (1|c3) + (1|c4) + (1|c5) + (1|c6) + (1|c7)",
+      "jl_formula": "@formula(y ~ 1 + x + (1|g1) + (1|c1) + (1|c2) + (1|c3) + (1|c4) + (1|c5) + (1|c6) + (1|c7))",
+      "glmm_formula": "y ~ x + (1|g1) + (1|c1) + (1|c2) + (1|c3) + (1|c4) + (1|c5) + (1|c6) + (1|c7)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x"],
+        "beta": [1.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)"],
+            "stddev": [1],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "c1",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "c2",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "c3",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "c4",
+            "terms": ["(Intercept)"],
+            "stddev": [0.7],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "c5",
+            "terms": ["(Intercept)"],
+            "stddev": [0.6],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "c6",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "c7",
+            "terms": ["(Intercept)"],
+            "stddev": [0.5],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "sim_wide_slopes_lmm_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "n_theta": 16,
+      "n_obs": 1200,
+      "data": "../data/simulated/sim_wide_slopes.csv",
+      "factors": ["gp", "ge"],
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + x2 + x3 + x4 + (1|gp) + (1 + x1 + x2 + x3 + x4 | ge)",
+      "jl_formula": "@formula(y ~ 1 + x1 + x2 + x3 + x4 + (1|gp) + (1 + x1 + x2 + x3 + x4 | ge))",
+      "glmm_formula": "y ~ x1 + x2 + x3 + x4 + (1|gp) + (1 + x1 + x2 + x3 + x4 | ge)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1", "x2", "x3", "x4"],
+        "beta": [1.5, 0.8, -0.5, 0.3, -0.2],
+        "varcomp": [
+          {
+            "group": "gp",
+            "terms": ["(Intercept)"],
+            "stddev": [0.8],
+            "corr": [
+              [1]
+            ]
+          },
+          {
+            "group": "ge",
+            "terms": ["(Intercept)", "x1", "x2", "x3", "x4"],
+            "stddev": [1, 0.9, 0.7, 0.5, 0.3],
+            "corr": [
+              [1, 0.25, 0.25, 0.25, 0.25],
+              [0.25, 1, 0.25, 0.25, 0.25],
+              [0.25, 0.25, 1, 0.25, 0.25],
+              [0.25, 0.25, 0.25, 1, 0.25],
+              [0.25, 0.25, 0.25, 0.25, 1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
         "dispersion": null,
         "nb_theta": null
       }

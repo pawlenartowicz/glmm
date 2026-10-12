@@ -14,13 +14,14 @@ NULL
 #'
 #' Optionals use in-band absent values (the raw bridge is not the user API):
 #' an empty vector means absent - for `dispersion` too (a scalar `f64` would
-#' force NA/NaN through extendr's NA check, which rejects it).
+#' force NA/NaN through extendr's NA check, which rejects it), and for
+#' `reml` (`logical(0)` is `None`, one `TRUE`/`FALSE` is `Some`).
 #' `vcov` crosses flattened row-major with `names` carrying p; the R wrapper
 #' rebuilds the p x p matrix (it is symmetric, so the order is moot).
 #'
 #' @usage NULL
 #' @keywords internal
-fastglmm_fit <- function(formula, numeric, factor_levels, factor_codes, family, link, wald_se, nagq, dispersion, weights, offset, start_beta, start_theta, start_dispersion, satterthwaite) .Call(wrap__fastglmm_fit, formula, numeric, factor_levels, factor_codes, family, link, wald_se, nagq, dispersion, weights, offset, start_beta, start_theta, start_dispersion, satterthwaite)
+fastglmm_fit <- function(formula, numeric, factor_levels, factor_codes, family, link, wald_se, nagq, dispersion, weights, offset, start_beta, start_theta, start_dispersion, satterthwaite, reml) .Call(wrap__fastglmm_fit, formula, numeric, factor_levels, factor_codes, family, link, wald_se, nagq, dispersion, weights, offset, start_beta, start_theta, start_dispersion, satterthwaite, reml)
 
 #' `glmm::orchestrate::confint` for `confint.fastglmm`: the lower and upper
 #' bounds per coefficient, the t quantile on a finite df and the normal one
@@ -32,5 +33,15 @@ fastglmm_fit <- function(formula, numeric, factor_levels, factor_codes, family, 
 #' @usage NULL
 #' @keywords internal
 fastglmm_confint <- function(beta, se, coef_df, level) .Call(wrap__fastglmm_confint, beta, se, coef_df, level)
+
+#' `glmm::orchestrate::same_fixed_part` for `AIC.fastglmm` and
+#' `BIC.fastglmm`: TRUE when the two formula strings have the same fixed
+#' terms (compared as sets of variable names) and the same fixed intercept.
+#' The response, the offset and the random part are not read. A formula that
+#' does not parse is an error.
+#'
+#' @usage NULL
+#' @keywords internal
+fastglmm_same_fixed_part <- function(f0, f1) .Call(wrap__fastglmm_same_fixed_part, f0, f1)
 
 # nolint end

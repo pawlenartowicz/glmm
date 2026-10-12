@@ -47,13 +47,13 @@ its subclasses, such as `IllConditionedWarning`, `PirlsExhaustedWarning`,
 `UnusedGroupingLevelsWarning` and `HessianSeFallbackWarning`; `glmm.__all__`
 lists them all).
 
-## `MixedLM` is REML by default too — but it *can* switch to ML, and glmm can't
+## `MixedLM` is REML by default too, and both switch to ML the same way
 
 It's tempting to assume `statsmodels.MixedLM` is an ML estimator and `glmm`'s
 LMM path is REML, so the two never agree. Checked against the installed
 wheel, that's not quite the shape of the difference. `MixedLM.fit()`
-defaults to `reml=True` — the same objective `glmm.fit`'s LMM path always
-uses. Fit recipe 1's `sleepstudy` model
+defaults to `reml=True`, the same objective `glmm.fit`'s LMM path uses by
+default. Fit recipe 1's `sleepstudy` model
 (`smf.mixedlm("Reaction ~ Days", df, groups=df["Subject"], re_formula="~Days").fit()`,
 no `reml=` argument, so the statsmodels default) and its log-likelihood is
 `-871.8141359795748` — recipe 1's own REML criterion, printed in
@@ -61,18 +61,21 @@ no `reml=` argument, so the statsmodels default) and its log-likelihood is
 is `-871.814135979251`. Same fixed effects too: `251.405`/`10.467` both
 places. A bare, default `MixedLM` call is not the trap.
 
-The trap is the opposite one: `MixedLM.fit(reml=False)` is a real, supported
-switch to ordinary ML — and `glmm.fit` has no argument that reproduces it.
-`glmm`'s LMM path is **profiled REML only, with no ML mode at all** (see
-[`conventions.md`](conventions.md#estimation)). Code that was written
-against, or copied from, a `reml=False` `MixedLM` fit will not match
-`glmm.fit` on the variance components or the log-likelihood, and there is no
-knob to make it match — REML is the only answer `glmm` gives.
+The switch to ordinary ML is spelled the same in both: `MixedLM.fit(reml=False)`
+and `glmm.fit(data, formula, reml=False)` (see
+[`conventions.md`](conventions.md#estimation)). The trap is dropping it in
+one place: code written against a `reml=False` `MixedLM` fit compares a REML
+`glmm` fit with an ML one unless the `glmm.fit` call passes `reml=False` too,
+and the variance components and the log-likelihood then differ. `fit.reml`
+says which criterion a fit used. The summary of a `glmm` ML fit is titled
+"Linear mixed model fit by maximum likelihood [glmm]" and prints "Note:
+p-values can be somewhat anticonservative." under the title.
 
 One more thing this same check turned up: under its own REML default,
 `MixedLM`'s `.aic` is `nan` (confirmed on the wheel above) — AIC isn't a
-well-posed number under REML in general. `glmm`'s summary of an LMM prints the
-REML criterion and no AIC line for the same reason.
+well-posed number under REML in general. `glmm`'s summary of a REML fit prints
+the REML criterion and no AIC line for the same reason; its `fit.aic` property
+still returns a number (see the table below).
 
 ## What you lose
 
@@ -88,8 +91,8 @@ rather than lumping everything into one "blocked" bucket.
 | `.predict(new_data)` | — | `AttributeError: 'Fit' object has no attribute 'predict'` (verified) — no method under this or any other name. This is the one clean, total loss in this table: there is no out-of-sample prediction on any path, converged or not. |
 | `.bse` | `.se` | Exists, just renamed — the `(p,)` array of Wald standard errors. |
 | `.pvalues` | `.coef_p` (t tests only) | Where `summary()` tests with t (a Gaussian mixed model on its Satterthwaite df, OLS and the gamma and inverse-gaussian GLMs on `n - p`), `fit.coef_p` holds the kernel's two-sided p-values and `fit.coef_df` the df. Where it tests with z, `coef_p` is `NaN` and `summary()` computes Wald z/p on the fly (`z = beta/se`, `p = erfc(\|z\|/sqrt(2))`); recompute that from `.beta`/`.se` if you need the numbers back. |
-| `.aic` | — | No stored field, and (per the section above) not really comparable across fixed-effect specifications while `glmm`'s LMM path is REML-only anyway. `-2 * fit.loglik + 2 * fit.df` reproduces the usual formula for GLM/GLMM fits (`fit.reml` is `False` there). |
-| `.llf` | `.loglik` | Exists, renamed, with the same caveat as above: for an LMM, `.loglik` is the **REML criterion**, not an ordinary log-likelihood — check `fit.reml` before comparing it to anything. |
+| `.aic` | `.aic` (and `.bic`) | Properties, computed on every fit: `-2 * fit.loglik + 2 * fit.df` (`.bic`: `+ fit.df * log(fit.nobs)`). Unlike `MixedLM`, a REML fit gets a number, not `nan`: it is built on the REML criterion, so (per the section above) it compares only fits with the same fixed effects. To compare fixed-effect specifications, fit both models with `reml=False`. |
+| `.llf` | `.loglik` | Exists, renamed, with the same caveat as above: for a REML fit, `.loglik` is the **REML criterion**, not an ordinary log-likelihood: check `fit.reml` before comparing it to anything. |
 | `.conf_int()` | `.confint()` | `fit.confint(level=0.95)` returns a `(p, 2)` array of Wald bounds in `fit.names` order, on the t quantile where `summary()` tests with t and the normal quantile where it tests with z. Like statsmodels' `alpha`, it takes the level; unlike `.conf_int()` it returns an array, not a DataFrame. |
 
 ## What you gain
@@ -123,9 +126,10 @@ the installed package:
   fitted with `use_t=True`); binomial,
   Poisson, negative binomial and every GLMM get Wald z. `satterthwaite=False`
   on `glmm.fit` turns the mixed model's t back into z.
-- **The criterion line depends on the estimator.** An LMM prints
+- **The criterion line depends on the estimator.** A REML fit prints
   `REML criterion at convergence: <value>` and no AIC/BIC (see the REML
-  section above). Every other fit prints one row with `AIC`, `BIC`, `logLik`,
+  section above). Every other fit, an LMM fitted with `reml=False` included,
+  prints one row with `AIC`, `BIC`, `logLik`,
   `deviance` and `df.resid`. `df.resid` is the number of observations minus
   the number of estimated parameters; no test uses it.
 - **The footer is lme4's, not statsmodels'.** After the fixed-effect

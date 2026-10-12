@@ -285,7 +285,16 @@ pub fn fit_cell(cell: &Value, grid_dir: &str, timed: Option<usize>, engine_versi
     let cell_id = cell["cell"].as_str().expect("cell.cell");
     let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut rec = base_record(cell_id, "glmm", engine_version);
-        let (lo, gaussian) = lower_grid_cell(cell, grid_dir);
+        let (mut lo, gaussian) = lower_grid_cell(cell, grid_dir);
+        // A cell tagged `ml` (the ML twin of a Gaussian mixed cell, on its
+        // parent's data) is fitted by ML; every other cell keeps the default
+        // estimator. The tag decides, not the manifest's `reml` field: that
+        // field is `true` on the OLS cells, where `Some(true)` would report the
+        // REML log-likelihood instead of the ML one the oracles report.
+        let ml = cell["tags"]
+            .as_array()
+            .is_some_and(|t| t.iter().any(|v| v == "ml"));
+        lo.opts.reml = if ml { Some(false) } else { None };
         let family = family_of(cell);
         let fit = |o: &FitOptions| fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, o);
 

@@ -1767,7 +1767,7 @@ its own.
 ## Validation
 
 The GLMM paths are held to the accuracy grid (`validation/grid/`, see
-`validation/README.md`): 794 cells, each fitted on the same CSV by glmm and by
+`validation/README.md`): 923 cells, each fitted on the same CSV by glmm and by
 the pinned oracles that can fit it — lme4, glmmTMB, MixedModels.jl and
 GLMMadaptive. glmm's deviance gates hard against the best converged oracle on
 the cell; a worse deviance fails, with no escape. β, the SEs and the variance

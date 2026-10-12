@@ -9,6 +9,7 @@ use std::borrow::Cow;
 
 use faer::Mat;
 
+use crate::lmm::Criterion;
 use crate::standardize::ColumnScaling;
 
 use crate::{
@@ -414,18 +415,19 @@ pub(crate) fn assemble_varcorr(
     }
     out
 }
-/// [`Fit::loglik`] for the Gaussian LMM paths: the REML criterion
-/// `−½(deviance + (n−p)(1 + ln 2π))` — the stripped constant restored (see
-/// `Fit::deviance`'s LMM contract), then onto the `logLik()` scale. Call AFTER
-/// any weighted `−Σlog wᵢ` deviance correction (the correction is part of
-/// lme4's REMLcrit, so it belongs inside the criterion). NaN in ⇒ NaN out.
-pub(crate) fn lmm_loglik(deviance: f64, n: usize, p: usize) -> f64 {
-    // The NaN gate also protects the `n − p` residual df from underflowing on
-    // the degenerate n ≤ p short-circuit (which always reports a NaN deviance).
-    if !deviance.is_finite() || n <= p {
+/// [`Fit::loglik`] for the Gaussian LMM paths: `−½(deviance + ν(1 + ln 2π))`,
+/// the stripped constant restored (see `Fit::deviance`'s LMM contract), then
+/// onto the `logLik()` scale. `ν` is the criterion's ([`Criterion::nu`]):
+/// `n − p` gives the REML criterion `−REMLcrit/2`, `n` the ML log-likelihood.
+/// Call AFTER any weighted `−Σlog wᵢ` deviance correction (the correction is
+/// part of lme4's criterion on both, so it belongs inside it). NaN in ⇒ NaN
+/// out, and `ν = 0` (REML on the degenerate `n ≤ p` short-circuit, which
+/// always reports a NaN deviance) gives NaN too.
+pub(crate) fn lmm_loglik(deviance: f64, nu: usize) -> f64 {
+    if !deviance.is_finite() || nu == 0 {
         return f64::NAN;
     }
-    -0.5 * (deviance + (n - p) as f64 * (1.0 + (2.0 * std::f64::consts::PI).ln()))
+    -0.5 * (deviance + nu as f64 * (1.0 + (2.0 * std::f64::consts::PI).ln()))
 }
 
 /// [`Fit::loglik`] for the GLMM paths (dense and sparse, Laplace and AGQ):
@@ -1012,10 +1014,9 @@ fn unfittable_random_slope_fit(
         deviance: f64::NAN,
         loglik: f64::NAN,
         df: 0,
-        // Only the Gaussian mixed (LMM) routes report a REML criterion; every
-        // GLMM route reports `reml: false`. Reached with `re: Some` only, so the
-        // family alone decides.
-        reml: matches!(model.family, Family::Gaussian),
+        // The criterion `opts.reml` resolves to, as a fitted Gaussian mixed
+        // model reports it; every GLMM route reports `reml: false`.
+        reml: resolve_criterion(model, opts) == Some(Criterion::Reml),
         fitted: vec![],
         ranef: vec![],
         ranef_levels: vec![],
@@ -1235,6 +1236,21 @@ pub(super) fn assert_group_ids(re: &ReStructure, ids: &GroupIds, n: usize) {
     );
     for (g, e) in ids.extra.iter().enumerate() {
         assert_eq!(e.len(), n, "GroupIds.extra[{g}] must have n elements");
+    }
+}
+
+/// The LMM criterion `opts.reml` resolves to on `model` (the
+/// [`FitOptions::reml`] table): `Some` on a Gaussian mixed model, REML for
+/// `None` and `Some(true)` and ML for `Some(false)`; `None` off the LMM path,
+/// whatever the value, so no value panics and `Some(true)` on a GLM or GLMM is
+/// ignored.
+pub(crate) fn resolve_criterion(model: &ModelSpec, opts: &FitOptions) -> Option<Criterion> {
+    match (model.family, &model.re) {
+        (Family::Gaussian, Some(_)) => Some(match opts.reml {
+            Some(false) => Criterion::Ml,
+            None | Some(true) => Criterion::Reml,
+        }),
+        _ => None,
     }
 }
 

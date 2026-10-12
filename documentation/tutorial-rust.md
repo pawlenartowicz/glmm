@@ -53,7 +53,8 @@ println!("beta = {:?}, se = {:?}", fit.beta, fit.se);
 
 Points worth knowing at this layer:
 
-- `family: Family::Gaussian` + `re: None` fits OLS; `re: Some(..)` fits an LMM.
+- `family: Family::Gaussian` + `re: None` fits OLS; `re: Some(..)` fits an LMM,
+  by REML unless `FitOptions::reml` is `Some(false)` (ML).
   The same shape (`Family::Binomial{..}` / `Poisson{..}` / `Gamma{..}` /
   `NegativeBinomial{..}`) selects GLM (`re: None`) or GLMM (`re: Some`) —
   see the family table in [`supported_families.md`](supported_families.md).
@@ -228,8 +229,9 @@ returns `NoDfReason::Failed` with `df_out` all NaN. On a rank-deficient draw
 the df are as untrustworthy as β̂, so read the diagnostics first, as below.
 
 `fit_on` panics rather than misroutes: the design shape (rows, predictors, RE
-level counts) and the options frozen at build (`nagq`, whether weights and
-offsets are present, `parallel_inner`) must match the workspace every call. Row
+level counts) and the options frozen at build (`nagq`, the criterion `reml`
+resolves to on an LMM, whether weights and offsets are present,
+`parallel_inner`) must match the workspace every call. Row
 counts may vary below the `n_max` you built at.
 
 What it does **not** do is validate your data. `fit_warm` checks start-value

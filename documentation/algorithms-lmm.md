@@ -9,12 +9,19 @@ see [`supported_families.md`](supported_families.md). The page ends with a
 MixedModels.jl.
 
 An LMM here is a Gaussian response with one or more grouping factors, each
-carrying an intercept and optionally random slopes. Estimation is **REML only**
-(there is no ML switch on this path — `src/fit/lmm.rs` hardcodes
-`reml: true`): every objective below is the profiled REML deviance, so the
-validation rungs are all fit `reml = true`. The fixed effects β and the residual
-scale σ² are profiled out analytically; the optimiser sees only the relative
-covariance parameter θ.
+carrying an intercept and optionally random slopes. Estimation is **REML by
+default and ML on request**: `FitOptions::reml` (`None` or `Some(true)` for
+REML, `Some(false)` for ML; Python `reml=`, R `REML =`) is resolved once per
+workspace by `resolve_criterion` (`src/fit/common.rs`) into
+`lmm::Criterion::{Reml, Ml}`, frozen at `build_workspace` (a later `fit_on`
+with a value that resolves differently panics), and carried by every kernel.
+`Fit::reml` reports the criterion the kernel minimized. Every objective below
+is the profiled deviance of that criterion; the two differ only in the tail
+term and the divisor of σ̂² (see
+[Profiled REML and ML objectives](#profiled-reml-and-ml-objectives)), so the
+routes, kernels and optimisers are the same for both. The fixed effects β and
+the residual scale σ² are profiled out analytically; the optimiser sees only
+the relative covariance parameter θ.
 
 ## Notation
 
@@ -52,8 +59,8 @@ Three real routing decisions sit between `fit_cold`/`fit_warm` and a returned
    Otherwise `NoZ`.
 2. **Kernel** — every Gaussian design goes to `accumulate_lmm_rows` +
    `lmm_run_on` (`src/fit/lmm.rs`) → `fit_lmm` (`src/lmm/mod.rs`), which
-   evaluates the profiled-REML objective through the dense sufficient
-   statistics (`NoZ`) or the sparse-Z Gram/Schur workspace (`Sparse`,
+   evaluates the profiled objective of the fit's criterion through the dense
+   sufficient statistics (`NoZ`) or the sparse-Z Gram/Schur workspace (`Sparse`,
    `src/sparse/mod.rs`). One seed, one θ search, one recovery block over both;
    the sparse kernel is a superset that reproduces the
    dense fit to machine precision on any in-envelope design (see
@@ -96,7 +103,7 @@ extras), forms the raw RE Gram `G = ZᵀZ`, and takes **one dense Cholesky** of
 `sparse_reml_deviance` (`src/sparse/mod.rs`); caps in `src/consts.rs`.
 **Convention**: the NoZ/Sparse split is a scratch-capacity boundary, not a model
 limit — lme4 and MixedModels.jl fit any of these designs with one solver; `glmm`
-picks the faster kernel per shape and both give the same REML fit.
+picks the faster kernel per shape and both give the same fit, on either criterion.
 **Validation**: Dyestuff (rung 1, single intercept), sleepstudy (rung 2,
 intercept+slope), Penicillin (rung 3, crossed), Pastes (rung 4, nested) exercise
 the NoZ kernel; sim_slope_extra (rung 7, a slope-carrying crossed extra) is the
@@ -168,7 +175,8 @@ sd ~10³ against an intercept of 1 puts the two fitting θ components four decad
 apart, and the search freezes the intercept directions before the slope
 direction becomes resolvable at all. The fixed-effect side of the same column
 is mapped back by `B` (`βⱼ = β̃ⱼ/sⱼ`), and the LMM's REML deviance adds back
-`2·ln sⱼ` for it as for every scaled column.
+`2·ln sⱼ` for it as for every scaled column (the ML deviance has no
+`log|X'V⁻¹X|` term, so nothing is added back there).
 
 Everything derived from θ̂ is mapped back on the way out by the block's column
 map `N`: for a slope that is only scaled, `varcorr` as
@@ -263,31 +271,44 @@ criteria of lme4 and glmmTMB are off the 60-digit value by −1.4e-4 and
 collinear to 3e-6) and pins its REML criterion to the 60-digit value in
 `validation/grid/dev_ref.json` and β_t to its 60-digit value.
 
-## Profiled REML objective
+## Profiled REML and ML objectives
 
-Given θ, β̂ and σ̂² are their closed-form REML solutions, so the objective is a
-function of θ alone:
+Given θ, β̂ and σ̂² are their closed-form solutions under the fit's criterion,
+so the objective is a function of θ alone:
 
 ```
-dev(θ) = log|V| + log|X'V⁻¹X| + (N − P)·log(σ̂²)
+REML:  dev(θ) = log|V| + log|X'V⁻¹X| + (N − P)·log(σ̂²),    σ̂² = r²/(N − P)
+ML:    dev(θ) = log|V|               +       N·log(σ̂²),    σ̂² = r²/N
 ```
 
-read directly off an augmented Cholesky rather than by forming the `N×N` marginal
+with `r²` the penalized residual sum of squares at β̂(θ). β̂(θ) is the same
+generalized least-squares solution under both; the ML criterion drops the
+`log|X'V⁻¹X|` term and divides `r²` by `N`. Adding `(N − P)(1 + ln 2π)` to the
+REML value gives lme4's REML criterion, and `N(1 + ln 2π)` to the ML value
+gives lme4's ML deviance (Bates et al. 2015). The log-likelihood is
+`−(dev + ν(1 + ln 2π))/2` with `ν` the divisor of σ̂² (`N − P` on REML, `N` on
+ML), `fit::common::lmm_loglik`.
+
+Both criteria are read directly off an augmented Cholesky rather than by forming the `N×N` marginal
 covariance V. The kernel factors Ω_θ over the stacked
 `[primary | nested children | crossed | X̃ y]` system (`X̃` is the
 orthogonalized design of
 [the section above](#fixed-effect-orthogonalization); `log|X̃'V⁻¹X̃| =
 log|X'V⁻¹X|` because `det U = 1`): `log|V|` comes from the
 random-effect pivots (family blocks plus the crossed-tail diagonal),
-`log|X'V⁻¹X|` from the trailing fixed-effect factor `L_XX`, and `(N − P)·log σ̂²`
-from the residual entry `L[p,p]²` — no per-evaluation β backsolve. `N − P` is
-the raw-row residual degrees of freedom.
+`log|X'V⁻¹X|` from the trailing fixed-effect factor `L_XX` (REML only; its
+pivots are checked for positivity on both criteria, since β̂ and `Var(β̂)` are
+read off them), and `ν·log σ̂²` from the residual entry `L[p,p]²` — no
+per-evaluation β backsolve. `N − P` is the raw-row residual degrees of
+freedom.
 
 The design the kernel fits is the standardized one, and
 `log|X̃'V⁻¹X̃| = log|X'V⁻¹X| − 2·Σⱼ ln sⱼ` against the caller's `X` (a shift has
 determinant 1). The criterion is reported for the caller's design:
-`lmm_view_to_fit` adds `2·Σⱼ ln sⱼ` to the deviance and the loglik
+on a REML fit `lmm_view_to_fit` adds `2·Σⱼ ln sⱼ` to the deviance and the loglik
 ([internal standardization](algorithms.md#internal-standardization-of-the-design)).
+The ML criterion reads X only through its column space (`r²` and `|V|`), so
+an ML fit needs no such shift.
 
 **Prior weights.** With `FitOptions::weights`, the sufficient-statistics
 accumulator (`LmmSuffStats::add_rows_multi`, `src/lmm/kernel.rs`) folds `√wᵢ` into
@@ -299,7 +320,8 @@ when unweighted. This keeps θ's internal box (`PIN_THETA`, `THETA_HI`)
 meaningful whatever the raw scale of `w`. Only σ̂² moves with that scale, so
 `lmm_view_to_fit` reports `σ̂²·s`; β̂, the SEs, τ² and varcorr need no
 correction, since the factors of `s` in the internal θ̂ and σ̂² cancel. The weighted
-Gaussian deviance needs one further θ-independent term, `−Σ log wᵢ`; because it
+Gaussian deviance needs one further θ-independent term, `−Σ log wᵢ` (on both
+criteria); because it
 does not move the optimum, `lmm_view_to_fit` (`src/fit/lmm.rs`) applies it to
 the deviance (and recomputes the loglik) *after* optimization rather than paying
 it per evaluation. It sits in the `Fit` assembly, the one site every caller
@@ -314,13 +336,19 @@ The objective returns `f64::INFINITY` on any Cholesky failure or non-positive σ
 an exact fit whose last pivot is round-off of either sign) — that value is the deviance failure surface BOBYQA is driven over.
 
 **Code**: `reml_deviance`, `reml_deviance_blocked`, `LmmSuffStats::add_rows_multi`
-(`src/lmm/kernel.rs`); `accumulate_lmm_rows` (`src/fit/lmm.rs`); `sparse_reml_deviance`
-(`src/sparse/mod.rs`).
-**Convention**: lme4's profiled REML `devfun` — β and σ² profiled out, optimiser
-on θ. **Validation**: the loglik gate is near-exact for LMM rungs (absolute
+(`src/lmm/kernel.rs`); `accumulate_lmm_rows`, `lmm_view_to_fit` (`src/fit/lmm.rs`); `sparse_reml_deviance`
+(`src/sparse/mod.rs`); `resolve_criterion`, `lmm_loglik` (`src/fit/common.rs`).
+The three tails (`reml_deviance`, `reml_deviance_blocked`,
+`sparse_reml_deviance`) evaluate either criterion; their names predate ML.
+**Convention**: lme4's profiled `devfun`, REML or ML: β and σ² profiled out,
+optimiser on θ. **Validation**: the loglik gate is near-exact for LMM rungs (absolute
 `2e-6` on the shared scale, `loglik_abs_lmm` in `validation/grid/tol.R`; ~1e-9 observed) across Dyestuff, sleepstudy,
 Penicillin, Pastes; sim_slope_extra pins the sparse objective against the same
-references.
+references. The ML criterion is checked against a brute-force
+`ln|V| + N·ln(r²/N)` on the dense routes, the dense, blocked and sparse
+kernels against each other, and against the balanced one-way ANOVA estimators
+(`balanced_one_way_matches_the_anova_estimators`); an ML fit pinned at zero
+has the OLS ML log-likelihood (`ml_fit_pinned_at_zero_has_the_ols_loglik`).
 
 ## Closed-form single-intercept shortcut
 
@@ -400,13 +428,19 @@ the start, so cold and warm fits route alike (`lmm_outer_optimizer`).
 
 **Gradient.** With `K_g = L_gL_gᵀ`, `M_g = L_g⁻¹A_g` (the value pass's `bt`
 block), `L_xx` the leading block of the tail factor, `N_g = M_{g,x}L_xx⁻ᵀ`,
-`m_g = M_g e` with `e = [−β̂; 1]`, `r² = l_yy²` and `ν = n − p`:
+`m_g = M_g e` with `e = [−β̂; 1]`, `r² = l_yy²` and `ν` the divisor of σ̂²
+(`n − p` on REML, `n` on ML):
 
 ```text
-∂f/∂D = Σ_g L_g⁻ᵀ (I − N_g N_gᵀ − (ν/r²) m_g m_gᵀ) L_g⁻¹,    ∂f/∂Λ = 2 (∂f/∂D) Λ
+REML:  ∂f/∂D = Σ_g L_g⁻ᵀ (I − N_g N_gᵀ − (ν/r²) m_g m_gᵀ) L_g⁻¹,    ∂f/∂Λ = 2 (∂f/∂D) Λ
+ML:    ∂f/∂D = Σ_g L_g⁻ᵀ (I            − (ν/r²) m_g m_gᵀ) L_g⁻¹
 ```
 
-read off the lower triangle in vech order. It is taken from the state the
+The `N_g N_gᵀ` term is the derivative of `log|X'V⁻¹X|`, so the ML gradient
+drops it and skips the triangular solve that forms `N_g`.
+
+The θ-gradient is `∂f/∂Λ` (`2 (∂f/∂D) Λ` on both criteria) read off the lower
+triangle in vech order. It is taken from the state the
 last value evaluation left (`L_g` kept in `pg_l`, `bt`, the tail factor): one
 stacked triangular solve for every `N_g`, in blocks of `PG_GRAD_BLOCK = 512`
 groups so its scratch does not grow with the group count, plus a per-group
@@ -636,7 +670,8 @@ by in-crate cross-checks.
 
 ## Standard errors
 
-The LMM standard error is the profiled REML SE — one method, not the
+The LMM standard error is the profiled SE of the fit's criterion (σ̂² below is
+`r²/(N − P)` on REML and `r²/N` on ML, as lme4's `vcov` on each): one method, not the
 Hessian/Rx split that the GLMM path carries (`Fit.stddev_se` is empty for an LMM,
 and `FitOptions::wald_se` is ignored here). At θ̂, `Var(β̂_j) = σ̂²·‖L_XX⁻¹ e_j‖²`
 from a forward solve against the fixed-effect Cholesky factor, and the squared
@@ -670,13 +705,14 @@ skips it. On the loop tier it runs only when called:
 `fit_on_hinted`, with the view dropped; its buffers live on the workspace, so
 a call after the first allocates only the pseudo-inverse's blocks.
 
-**The identity.** lmerTest differentiates the REML deviance in `(θ, σ)` with
+**The identity.** lmerTest differentiates the deviance of the fit's criterion
+(the REML deviance, or the ML deviance on a `REML = FALSE` fit) in `(θ, σ)` with
 σ not profiled: for `v = lᵀCl`, `C = Var(β̂)`, it takes `g_k = lᵀ(∂C/∂φ_k)l`
 over the variance parameters `φ = (θ, σ)`, `A = 2H⁻¹` from the Hessian `H` of
 that deviance, and `df = 2v²/(gᵀAg)`. The crate minimizes the deviance with
 `τ = σ²` profiled out, `d_p(θ)` (see
-[Profiled REML objective](#profiled-reml-objective)), and the two are related
-exactly. `τ̂(θ)` is the exact minimizer at every θ, so the Schur complement of
+[Profiled REML and ML objectives](#profiled-reml-and-ml-objectives)), and the
+two are related exactly, on either criterion. `τ̂(θ)` is the exact minimizer at every θ, so the Schur complement of
 the τ block of `H` is the profiled Hessian `H_p = ∇²d_p`, and τ's own term
 has a closed form (`g_τ = v/τ̂` and `H_ττ = ν/τ̂²` at τ̂). Together:
 
@@ -685,8 +721,9 @@ df = v² / ( g_pᵀ H_p⁺ g_p + v²/ν ),     g_p = ∇_θ (lᵀ C_p(θ) l)
 ```
 
 with `C_p(θ) = σ̂²(θ)·(X′V⁻¹X)⁻¹` the profiled covariance the fit reports and
-`ν` the divisor of `σ̂²`: `N − P` on the REML criterion, `P` the retained
-(non-aliased) columns. So the pass differentiates only the profiled deviance
+`ν` the divisor of `σ̂²`: `N − P` on the REML criterion, `N` on the ML
+criterion (`Criterion::nu`, read off the kernel by `residual_nu`, never off the
+options), `P` the retained (non-aliased) columns. So the pass differentiates only the profiled deviance
 the search minimized, and needs no derivative coordinate for σ. `1/df` is
 `g_pᵀH_p⁺g_p/v² + 1/ν`, so `0 < df ≤ ν` whenever `H_p⁺` is positive
 semidefinite; a fit with no free variance parameter gets `ν` exactly (the
@@ -716,8 +753,8 @@ quantity `gᵀH⁻¹g` does not depend on it. Each coordinate's step is
   re-evaluated at the start so the pass never depends on what an earlier call
   left in the kernel. The step factor is `ETA = 3e-4`, pinned by a step sweep
   over which the df stay flat.
-- **Gradient route** (where the per-group gradient is armed for the fit: the
-  dense kernel on the
+- **Gradient route** (where the per-group gradient is armed for the fit, on
+  either criterion: the dense kernel on the
   [per-group regression route](#random-slopes-on-the-primary-alone-per-group-regressions),
   the shapes the search runs BFGS on). Column `k` of `H_p` is
   `(∇d_p(θ̃ + h_k e_k) − ∇d_p(θ̃ − h_k e_k))/(2h_k)` on the free coordinates,
@@ -796,7 +833,7 @@ the retained columns: a contrast with a non-zero entry on an aliased column
 gives NaN fields and `ContrastNote::AliasedColumn` (estimability is not
 tested). Where there is no df the methods return `ContrastError::NoDf` with
 the reason (`NotGaussianMixed`, `Disabled`, `StateMissing` for a Gaussian LMM
-`Fit` the loop tier's `FitView::into_fit` built, `Failed`), never a z test.
+`Fit` the loop tier's `FitView::into_fit` built, REML or ML, `Failed`), never a z test.
 
 **Other families.** OLS and the Gamma and inverse-Gaussian GLMs with φ
 estimated carry a residual-only record: the full `C` and `ν = n − P`, no
@@ -822,17 +859,25 @@ numDeriv's Richardson extrapolation on `(θ, σ)`, the crate's a single-step
 central stencil on the profiled θ̃. **Validation**: the contest layer
 reproduces lmerTest's frozen `contest1D`, `contestMD` and `get_Fstat_ddf`
 outputs from its own frozen inputs (`src/inference/contest_tests.rs`); the
-pass at lme4's θ̂ is checked against lmerTest's df on every frozen REML
-fixture, within a band that adds lmerTest's own finite-difference spread, and
+pass at lme4's θ̂ is checked against lmerTest's df on every frozen fixture,
+REML and `REML = FALSE` alike, within a band that adds lmerTest's own finite-difference spread, and
 on the three boundary fixtures the directions it drops are checked against
 lmerTest's (`gate1_at_lme4_theta`, `--features oracle-tests`); the df and
 the interval bounds at the crate's own θ̂ are gated end to end in
-`tests/inference_oracle.rs`, registry-backed like the SEs; the two routes
-agree on the same fit (`gradient_route_agrees_with_value_route`), the dense
+`tests/inference_oracle.rs`, registry-backed like the SEs, which also gates
+each ML fixture's deviance against lmerTest's hard; the two routes
+agree on the same fit under both criteria (`gradient_route_agrees_with_value_route`), the dense
 and sparse kernels agree (`dense_and_sparse_kernels_agree`), and the step
-sweep pins `ETA` (`step_sweep_is_flat_at_eta`). On the accuracy grid the
-`lmerTest` engine fits every Gaussian mixed cell, and `compare.R` gates
-`coef_df` against it. Every band is in `validation/grid/tol.R`.
+sweep pins `ETA` (`step_sweep_is_flat_at_eta`). On the 26 frozen
+`REML = FALSE` references (lmerTest 3.2-1) the ML rows sit inside the REML
+bands, with no registered exception: at lme4's θ̂ the worst df is 0.38 of its
+band (relative 1.65e-5), end to end the df agree to 3.5e-4 (band 1e-3) and the
+interval bounds to 4.0e-5 of the width, the per-term F denominator df to
+2.5e-5, and a pinned fit (`Dyestuff2`, `REML = FALSE`) gets `df = ν = N`
+exactly. On
+the accuracy grid the `lmerTest` engine fits every Gaussian mixed cell and its
+ML twin, and `compare.R` gates `coef_df` against it. Every band is in
+`validation/grid/tol.R`.
 
 ## Validation
 
@@ -862,6 +907,19 @@ interaction grouping, sim_three_level, sim_max_q_slope at the `q = 8`
 `MAX_PRIMARY_Q` boundary, sim_unbalanced_nested, sim_nested_crossed_mix) are
 landed and green — they exercise the same kernels through the same gates.
 
+**ML.** The rungs above are REML fits. The ML criterion is checked in two
+places. The frozen lmerTest `REML = FALSE` references
+(`validation/goldens/inference/lmertest/`, 26 models plus 6 per-term `anova`
+twins) carry lme4's ML deviance, and on glmm's own θ̂ the ML deviance agrees
+with it to 1.5e-9 relative (glmm is lower on the largest gap,
+`sim_max_q_slope`, by 5.6e-6 deviance units, and never above it by more than
+6e-10 units); β, the SEs and σ agree to 1.2e-5, 6.9e-5 and 6.7e-6 relative, the
+gaps that the θ̂ differences at each engine's optimizer tolerance leave. At
+lme4's own θ̂ the deviance agrees to 7.2e-12. On the accuracy grid 129 of the
+130 Gaussian mixed cells have an ML twin (tagged `ml`), which lme4, glmmTMB,
+MixedModels.jl and lmerTest fit with their own ML switch; `run.sh --ml` adds
+the twins to a `--fast` or `--timed` run, and a full run fits them.
+
 ## How the other engines fit an LMM
 
 All three engines that fit LMMs share Doug Bates' formulation: the relative
@@ -874,16 +932,17 @@ targets non-Gaussian GLMMs and defers Gaussian LMMs to nlme/lme4.)
 
 | | lme4 (`lmer`) | MixedModels.jl | `glmm` |
 |---|---|---|---|
-| Criterion default | REML (ML switch) | **ML** (REML switch) | **REML, locked** — no switch |
+| Criterion default | REML (ML switch) | **ML** (REML switch) | REML (ML switch: `FitOptions::reml = Some(false)`) |
 | Optimiser | BOBYQA via nloptwrap (default) | NEWUOA via NLopt (v5.0.0 default; θ unconstrained, Λ canonicalised to non-negative diagonals post-fit; BOBYQA kept for scalar RE) | BFGS on the analytic gradient where the per-group route is armed (slopes on the primary only, `n_θ ≥ 3`); BOBYQA (PRIMA) elsewhere and as its polish/fallback, tuned `npt`/ρ schedule |
 | Linear algebra per eval | sparse Cholesky of `ΛᵀZᵀZΛ + I` (CHOLMOD), Z materialised | blocked/amalgamated Cholesky, Z materialised | dense path: **no Z at all** — sufficient statistics + family-block elimination, with a closed-form collapse for balanced single-intercept designs; sparse path: Schur-block Cholesky (AMD sparse tail) |
 | Singular fit | fits, `isSingular` warns | fits, flags | pins diagonal components ≤ `1e-4` to exact `0`, still `converged`, sets `Diagnostics::singular`/`Diagnostics::pinned` |
 | Optimiser cap-out | warns, returns last point | warns, returns last point | returns the best finite point, `converged: false`, `Diagnostics::boundary == Boundary::NoOptimum` (the same on the dense and the sparse kernel, since `fit_lmm` sets it once with no kernel branch); the Python and R packages raise a `search_limit` warning there |
 | BLUPs / `ranef` | yes | yes | yes — `Fit::ranef`, recovered once at θ̂ by back-substitution on converged fits (`lmm_view_to_fit` → `assemble_ranef_sparse`) |
 
-The rows that matter in practice: the **criterion lock** (comparing `glmm` to
-MixedModels.jl at defaults differs by REML-vs-ML variance-component bias, not
-by a bug — set `REML=true` on the Julia side to match), and the
+The rows that matter in practice: the **criterion default** (comparing `glmm`
+to MixedModels.jl at defaults differs by REML-vs-ML variance-component bias,
+not by a bug: set `REML=true` on the Julia side, or fit `glmm` with
+`reml = Some(false)`, to match), and the
 **singular-fit reporting** (the information lme4 puts in a warning, `glmm`
 puts in flags a caller must read; the estimate itself is the same pinned-zero
 fit all engines return). The no-Z sufficient-statistics evaluation is why

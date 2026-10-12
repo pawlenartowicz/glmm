@@ -1214,6 +1214,206 @@ fn fit_lmm_scalar_crossed_varying_weights_noz_matches_sparse() {
     }
 }
 
+/// The test-only `fit_mle` baseline fits the criterion `opts.reml` resolves
+/// to, on both kernels: its σ̂² is the one `fit_cold` reports under the same
+/// option, so a forced-route parity test under ML compares ML with ML.
+#[test]
+fn fit_mle_baseline_honours_reml() {
+    let (x, y, n, p) = super::common_tests::lmm_hand_dataset();
+    let model = intercept_only_spec(Sizing::FixedClusters { n_clusters: 6 });
+    let ids = GroupIds {
+        primary: (0..n).map(|i| (i % 6) as u32).collect(),
+        extra: vec![],
+    };
+    let (sized, ids, _perm) = spec_sized_from_ids(&model, &ids);
+    let rel = |a: f64, b: f64| (a - b).abs() / b.abs();
+    for reml in [None, Some(false)] {
+        let opts = FitOptions {
+            target_indices: vec![1, 2],
+            reml,
+            ..FitOptions::default()
+        };
+        let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+        let noz = fit_mle_noz_pub(&x, &y, n, p, &sized, &ids.primary, &ids.extra, None, &opts);
+        let sp = fit_mle_sparse_pub(&x, &y, n, p, &sized, &ids.primary, &ids.extra, None, &opts);
+        for (route, fit) in [("noz", noz), ("sparse", sp)] {
+            assert!(
+                rel(fit.dispersion, cold.dispersion) < 1e-5,
+                "reml = {reml:?}, {route}: σ̂² {} vs fit_cold {}",
+                fit.dispersion,
+                cold.dispersion
+            );
+        }
+    }
+}
+
+/// `y ~ 1 + x1 + (1 | g)` whose ML variance pins at exactly zero: within each
+/// cluster the residuals alternate ±0.8 and cancel (the design of
+/// `fit_lmm_weighted_boundary_matches_wls`), and `x1` is on a scale of 100 so
+/// the column standardization is far from the identity.
+fn ml_pinned_design() -> (Vec<f64>, Vec<f64>, Vec<u32>, Vec<f64>, usize, usize) {
+    let (n, n_clusters, p) = (48usize, 6usize, 2usize);
+    let mut st = 7u64;
+    let mut x = vec![0.0f64; n * p];
+    let mut y = vec![0.0f64; n];
+    let mut ids = vec![0u32; n];
+    let mut w = vec![0.0f64; n];
+    for i in 0..n {
+        ids[i] = (i % n_clusters) as u32;
+        let x1 = 100.0 * lcg(&mut st);
+        x[i * p] = 1.0;
+        x[i * p + 1] = x1;
+        let e = if (i / n_clusters) % 2 == 0 { 0.8 } else { -0.8 };
+        y[i] = 0.5 + 0.004 * x1 + e;
+        w[i] = 1.0 + (i % 3) as f64;
+    }
+    (x, y, ids, w, n, p)
+}
+
+/// An ML Gaussian mixed fit pinned at θ̂ = 0 is the fixed-effects model, so its
+/// log-likelihood is the OLS (ML) log-likelihood on the same X: `ln|L_ZZ|² = 0`,
+/// `r²` is the (weighted) RSS and `ν = n`. A REML standardization shift, the
+/// REML `ν = n − p`, or a weighted correction on the wrong scale each move it by
+/// O(1). The ML fit reports `reml == false` and the REML fit's `df`.
+#[test]
+fn ml_fit_pinned_at_zero_has_the_ols_loglik() {
+    let (x, y, ids, w, n, p) = ml_pinned_design();
+    let ids = GroupIds {
+        primary: ids,
+        extra: vec![],
+    };
+    let fixed_only = ModelSpec {
+        family: Family::Gaussian,
+        re: None,
+    };
+    for weights in [None, Some(w)] {
+        let tag = if weights.is_some() {
+            "weighted"
+        } else {
+            "plain"
+        };
+        let opts = |reml: Option<bool>| FitOptions {
+            target_indices: vec![0, 1],
+            weights: weights.clone(),
+            reml,
+            ..FitOptions::default()
+        };
+        let ml = fit_cold(
+            &x,
+            &y,
+            n,
+            p,
+            &intercept_only_lmm(),
+            &ids,
+            &opts(Some(false)),
+        );
+        let reml = fit_cold(&x, &y, n, p, &intercept_only_lmm(), &ids, &opts(None));
+        let ols = fit_cold(&x, &y, n, p, &fixed_only, &GroupIds::default(), &opts(None));
+        assert!(ml.converged() && ols.converged(), "{tag}: both fit");
+        assert_eq!(ml.tau2, vec![0.0], "{tag}: the ML fit must pin at θ̂ = 0");
+        assert!(
+            (ml.loglik - ols.loglik).abs() <= 1e-10 * ols.loglik.abs(),
+            "{tag}: ML logLik {} vs OLS {}",
+            ml.loglik,
+            ols.loglik
+        );
+        // σ̂²_ML = RSS_w/n: the OLS dispersion RSS_w/(n − p) times (n − p)/n,
+        // and each SE the OLS one times √((n − p)/n).
+        let shrink = (n - p) as f64 / n as f64;
+        assert!(
+            (ml.dispersion - ols.dispersion * shrink).abs() <= 1e-10 * ols.dispersion,
+            "{tag}: ML dispersion {} vs OLS {} · (n − p)/n",
+            ml.dispersion,
+            ols.dispersion
+        );
+        for j in 0..p {
+            assert!(
+                (ml.se[j] - ols.se[j] * shrink.sqrt()).abs() <= 1e-10 * ols.se[j],
+                "{tag}: ML se[{j}] {} vs OLS {} · √((n − p)/n)",
+                ml.se[j],
+                ols.se[j]
+            );
+        }
+        assert!(!ml.reml && reml.reml, "{tag}: reml flags");
+        assert_eq!(ml.df, p + 2, "{tag}: ML df");
+        assert_eq!(ml.df, reml.df, "{tag}: df is the same on both criteria");
+    }
+}
+
+/// The ML fit's deviance is the ML criterion's minimum: no larger than the ML
+/// deviance at the REML fit's θ̂. On this design (group-level covariate, 8
+/// groups) the two θ̂ differ by far more than `lmm::RHO_END`, and `x1` on a
+/// scale of 100 gives the column standardization a large REML shift, which
+/// the ML deviance must not carry. The ML deviance at a θ is evaluated on a
+/// dense kernel over the caller's X (ML is invariant to the standardization),
+/// and first checked against the fit's own deviance at its θ̂.
+#[test]
+fn ml_deviance_at_ml_theta_is_below_ml_deviance_at_reml_theta() {
+    let (a, m, p) = (8usize, 5usize, 3usize);
+    let n = a * m;
+    let mut st = 61u64;
+    let u: Vec<f64> = (0..a).map(|_| 0.6 * lcg(&mut st)).collect();
+    let zg: Vec<f64> = (0..a).map(|_| lcg(&mut st)).collect();
+    let mut x = vec![0.0f64; n * p];
+    let mut y = vec![0.0f64; n];
+    let mut ids = vec![0u32; n];
+    for i in 0..n {
+        let g = i % a;
+        ids[i] = g as u32;
+        let x1 = 100.0 * lcg(&mut st);
+        x[i * p] = 1.0;
+        x[i * p + 1] = x1;
+        x[i * p + 2] = zg[g];
+        y[i] = 1.0 + 0.003 * x1 + 0.5 * zg[g] + u[g] + 0.5 * lcg(&mut st);
+    }
+    let ids = GroupIds {
+        primary: ids,
+        extra: vec![],
+    };
+    let opts = |reml: Option<bool>| FitOptions {
+        target_indices: (0..p as u32).collect(),
+        reml,
+        ..FitOptions::default()
+    };
+    let ml = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &intercept_only_lmm(),
+        &ids,
+        &opts(Some(false)),
+    );
+    let reml = fit_cold(&x, &y, n, p, &intercept_only_lmm(), &ids, &opts(None));
+    assert!(ml.converged() && reml.converged(), "both fit");
+    assert!(!ml.singular() && !reml.singular(), "both optima interior");
+    assert!(!ml.reml && reml.reml, "reml flags");
+    assert_eq!(ml.df, reml.df, "df is the same on both criteria");
+    let theta = |f: &Fit| (f.tau2[0] / f.dispersion).sqrt();
+    let (theta_ml, theta_reml) = (theta(&ml), theta(&reml));
+    assert!(
+        (theta_reml - theta_ml).abs() > 1e3 * crate::lmm::RHO_END * theta_reml,
+        "θ̂_ML {theta_ml} and θ̂_REML {theta_reml} must differ beyond the optimizer's accuracy"
+    );
+
+    let mut ws = LmmWorkspace::new(p, a);
+    ws.fit_mut().criterion = crate::lmm::Criterion::Ml;
+    let x_mat = Mat::<f64>::from_fn(n, p, |i, j| x[i * p + j]);
+    ws.suff_mut().add_rows(x_mat.as_ref(), &y, &ids.primary);
+    let at_ml = ws.kernel.deviance(&[theta_ml]);
+    let at_reml = ws.kernel.deviance(&[theta_reml]);
+    assert!(
+        (ml.deviance - at_ml).abs() <= 1e-8 * at_ml.abs(),
+        "the ML fit's deviance {} vs the ML criterion at its θ̂ {at_ml}",
+        ml.deviance
+    );
+    assert!(
+        ml.deviance <= at_reml,
+        "ML deviance at θ̂_ML {} above the ML deviance at θ̂_REML {at_reml}",
+        ml.deviance
+    );
+}
+
 /// Varying prior weights on a design where the EXTRA (crossed) grouping
 /// itself carries a random slope: `y ~ 1 + x1 + (1+x1 | primary) + (1+x1 |
 /// extra)`. `extra_slopes_any` is true, so the dense kernel's `zx` fill takes
@@ -1364,10 +1564,11 @@ fn fit_lmm_weight_scale_invariant_dense_and_sparse() {
     };
     let (sized, ids, _perm) = spec_sized_from_ids(&cluster, &ids);
 
-    let fit_at = |c: f64| {
+    let fit_at = |c: f64, reml: Option<bool>| {
         let opts = FitOptions {
             target_indices: vec![0, 1],
             weights: Some(w.iter().map(|&wi| wi * c).collect()),
+            reml,
             ..FitOptions::default()
         };
         let dense = fit_mle_noz_pub(&x, &y, n, p, &sized, &ids.primary, &ids.extra, None, &opts);
@@ -1376,63 +1577,67 @@ fn fit_lmm_weight_scale_invariant_dense_and_sparse() {
         (dense, sparse)
     };
 
-    let (base_dense, base_sparse) = fit_at(1.0);
-    assert!(
-        base_dense.converged() && base_sparse.converged(),
-        "c=1 baseline must converge (dense={} sparse={})",
-        base_dense.converged(),
-        base_sparse.converged()
-    );
+    // Both criteria: the weighted correction and the scale cancellation are
+    // the same argument under REML and ML.
+    for reml in [None, Some(false)] {
+        let (base_dense, base_sparse) = fit_at(1.0, reml);
+        assert!(
+            base_dense.converged() && base_sparse.converged(),
+            "{reml:?} c=1 baseline must converge (dense={} sparse={})",
+            base_dense.converged(),
+            base_sparse.converged()
+        );
 
-    let rel = |a: f64, b: f64| (a - b).abs() / (1.0 + b.abs());
-    for &(c, tol) in &[
-        (2f64.powi(20), 1e-6),
-        (2f64.powi(-20), 1e-6),
-        (1e8, 1e-4),
-        (1e-8, 1e-4),
-    ] {
-        let (dense, sparse) = fit_at(c);
-        for (name, base, scaled) in [
-            ("dense", &base_dense, &dense),
-            ("sparse", &base_sparse, &sparse),
+        let rel = |a: f64, b: f64| (a - b).abs() / (1.0 + b.abs());
+        for &(c, tol) in &[
+            (2f64.powi(20), 1e-6),
+            (2f64.powi(-20), 1e-6),
+            (1e8, 1e-4),
+            (1e-8, 1e-4),
         ] {
-            assert!(scaled.converged(), "{name} c={c} must converge");
-            for j in 0..p {
+            let (dense, sparse) = fit_at(c, reml);
+            for (name, base, scaled) in [
+                ("dense", &base_dense, &dense),
+                ("sparse", &base_sparse, &sparse),
+            ] {
+                assert!(scaled.converged(), "{name} {reml:?} c={c} must converge");
+                for j in 0..p {
+                    assert!(
+                        rel(scaled.beta[j], base.beta[j]) < tol,
+                        "{name} {reml:?} c={c} β[{j}] {} vs base {}",
+                        scaled.beta[j],
+                        base.beta[j]
+                    );
+                    assert!(
+                        rel(scaled.se[j], base.se[j]) < tol,
+                        "{name} {reml:?} c={c} se[{j}] {} vs base {}",
+                        scaled.se[j],
+                        base.se[j]
+                    );
+                }
+                assert_eq!(scaled.tau2.len(), base.tau2.len());
+                for k in 0..base.tau2.len() {
+                    assert!(
+                        rel(scaled.tau2[k], base.tau2[k]) < tol,
+                        "{name} {reml:?} c={c} tau2[{k}] {} vs base {}",
+                        scaled.tau2[k],
+                        base.tau2[k]
+                    );
+                }
+                // σ̂² is NOT invariant: it moves with the weight scale itself.
                 assert!(
-                    rel(scaled.beta[j], base.beta[j]) < tol,
-                    "{name} c={c} β[{j}] {} vs base {}",
-                    scaled.beta[j],
-                    base.beta[j]
+                    rel(scaled.dispersion, c * base.dispersion) < tol,
+                    "{name} {reml:?} c={c} dispersion {} vs c*base {}",
+                    scaled.dispersion,
+                    c * base.dispersion
                 );
                 assert!(
-                    rel(scaled.se[j], base.se[j]) < tol,
-                    "{name} c={c} se[{j}] {} vs base {}",
-                    scaled.se[j],
-                    base.se[j]
+                    rel(scaled.loglik, base.loglik) < tol,
+                    "{name} {reml:?} c={c} loglik {} vs base {}",
+                    scaled.loglik,
+                    base.loglik
                 );
             }
-            assert_eq!(scaled.tau2.len(), base.tau2.len());
-            for k in 0..base.tau2.len() {
-                assert!(
-                    rel(scaled.tau2[k], base.tau2[k]) < tol,
-                    "{name} c={c} tau2[{k}] {} vs base {}",
-                    scaled.tau2[k],
-                    base.tau2[k]
-                );
-            }
-            // σ̂² is NOT invariant — it moves with the weight scale itself.
-            assert!(
-                rel(scaled.dispersion, c * base.dispersion) < tol,
-                "{name} c={c} dispersion {} vs c*base {}",
-                scaled.dispersion,
-                c * base.dispersion
-            );
-            assert!(
-                rel(scaled.loglik, base.loglik) < tol,
-                "{name} c={c} loglik {} vs base {}",
-                scaled.loglik,
-                base.loglik
-            );
         }
     }
 }
@@ -2356,6 +2561,7 @@ fn accumulate_lmm_rows_gram_route_matches_the_givens_route() {
             &[],
             w.as_deref(),
             false,
+            crate::lmm::Criterion::Reml,
         );
         let b = givens.suff_mut();
         b.reset();
@@ -2446,7 +2652,18 @@ fn accumulate_lmm_rows_weighted_reuse_allocates_nothing() {
     let (mut ws, x, y, ids, w) = dense_accumulation_case(n, false, true);
     let w = w.unwrap();
     let run = |ws: &mut LmmWorkspace| {
-        accumulate_lmm_rows(ws, x.as_ref(), &y, n, p, &ids, &[], Some(&w), false);
+        accumulate_lmm_rows(
+            ws,
+            x.as_ref(),
+            &y,
+            n,
+            p,
+            &ids,
+            &[],
+            Some(&w),
+            false,
+            crate::lmm::Criterion::Reml,
+        );
     };
     run(&mut ws);
     crate::test_support::settle_background_allocs();
@@ -2524,9 +2741,31 @@ fn accumulate_lmm_rows_sparse_reuse_matches_a_fresh_workspace() {
         let (x, y, ids, extra, w) = sparse_accumulation_draw(n, shift, seed);
         let w = weighted.then_some(&w[..]);
         let ws = reused.get_or_insert_with(|| sparse_accumulation_workspace(n, &ids, &extra));
-        accumulate_lmm_rows(ws, x.as_ref(), &y, n, p, &ids, &extra, w, false);
+        accumulate_lmm_rows(
+            ws,
+            x.as_ref(),
+            &y,
+            n,
+            p,
+            &ids,
+            &extra,
+            w,
+            false,
+            crate::lmm::Criterion::Reml,
+        );
         let mut fresh = sparse_accumulation_workspace(n, &ids, &extra);
-        accumulate_lmm_rows(&mut fresh, x.as_ref(), &y, n, p, &ids, &extra, w, false);
+        accumulate_lmm_rows(
+            &mut fresh,
+            x.as_ref(),
+            &y,
+            n,
+            p,
+            &ids,
+            &extra,
+            w,
+            false,
+            crate::lmm::Criterion::Reml,
+        );
         let (a, b) = (ws.kernel.deviance(&theta), fresh.kernel.deviance(&theta));
         assert!(a.is_finite(), "shift={shift} seed={seed}: deviance {a}");
         assert_eq!(
@@ -2553,7 +2792,18 @@ fn accumulate_lmm_rows_sparse_weighted_reuse_allocates_nothing() {
     let (x, y, ids, extra, w) = sparse_accumulation_draw(n, 3, 1);
     let mut ws = sparse_accumulation_workspace(n, &ids, &extra);
     let run = |ws: &mut LmmWorkspace| {
-        accumulate_lmm_rows(ws, x.as_ref(), &y, n, p, &ids, &extra, Some(&w), false);
+        accumulate_lmm_rows(
+            ws,
+            x.as_ref(),
+            &y,
+            n,
+            p,
+            &ids,
+            &extra,
+            Some(&w),
+            false,
+            crate::lmm::Criterion::Reml,
+        );
     };
     run(&mut ws);
     crate::test_support::settle_background_allocs();

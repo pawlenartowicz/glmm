@@ -103,7 +103,8 @@ pub struct Fit {
     /// estimated shape `θ` for negative-binomial, the residual variance `σ̂²`
     /// for Gaussian — `RSS/(n−p)` for OLS (raw-row df, matching R
     /// `summary.lm`'s `sigma²`; the same `sigma_sq` that scales `se`/`vcov`)
-    /// and the REML `pwrss/(n−p)` for LMM (matching lme4 `sigma()²`; oracle:
+    /// and the criterion's `pwrss/ν` for LMM, `pwrss/(n−p)` under REML and
+    /// `pwrss/n` under ML (matching lme4 `sigma()²` on the same fit; oracle:
     /// `validation/goldens/sleepstudy_lmm.json` `sigma`, asserted in
     /// `fit_sleepstudy_slope_varcorr_matches_lme4`) — and `1.0` for
     /// binomial/Poisson (where dispersion is fixed by the family, not
@@ -172,9 +173,11 @@ pub struct Fit {
     #[cfg(feature = "counters")]
     pub counters: crate::counters::EvalCounters,
     /// Minimized optimizer criterion at the accepted point. LMM: the profiled
-    /// REML deviance as computed by `reml_deviance` — equals lme4's REMLcrit
-    /// minus the data-independent constant df·(1 + ln 2π), df = n − p
-    /// (validated against the frozen lme4 sleepstudy reference). GLMM: the
+    /// deviance of the fit's criterion ([`Fit::reml`]) as computed by
+    /// `reml_deviance`, on the caller's design. A REML fit's equals lme4's
+    /// REMLcrit minus the data-independent constant ν·(1 + ln 2π), ν = n − p
+    /// (validated against the frozen lme4 sleepstudy reference); an ML fit's
+    /// equals lme4's ML `deviance()` minus the same constant with ν = n. GLMM: the
     /// marginal Laplace deviance `d(y,ũ) + ‖ũ‖² + log|A|` (see
     /// `GlmmFit::deviance`), which differs from −2·logLik by a data-only
     /// saturated constant on binomial/Poisson fits and equals −2·logLik
@@ -200,12 +203,23 @@ pub struct Fit {
     ///   `logLik(fg)` (measured: −47.27 vs −118.21 on
     ///   `fit_glm_gamma_weighted_matches_r`'s data). On a fit that reproduces
     ///   the data exactly the likelihood rises without bound as φ → 0, so a
-    ///   deviance that rounds to zero gives `+∞`.
-    /// - **LMM** — the **REML criterion** `−REMLcrit/2` (this path is
-    ///   REML-only): `−½(deviance + (n−p)·(1 + ln 2π))`. REML criteria are
-    ///   comparable only between models with IDENTICAL fixed effects — an
-    ///   AIC/LRT across different fixed parts is meaningless; check [`Fit::reml`]
-    ///   before comparing. Matches `lme4::logLik` on a `REML=TRUE` fit.
+    ///   deviance that rounds to zero gives `+∞`. An OLS fit made with
+    ///   [`FitOptions::reml`] `= Some(true)` reports the REML log-likelihood
+    ///   instead, R's `logLik(lm, REML = TRUE)`: `−½(d + (n−p)·(1 + ln 2π))`
+    ///   with `d = ln|XᵀWX| + (n−p)·ln(RSS_w/(n−p)) − Σ ln wᵢ` on the caller's
+    ///   X (`RSS_w` the weighted residual sum of squares). `d` is the REML
+    ///   `deviance` an LMM with the same fixed part reports when its variance
+    ///   is pinned at zero, so the two are on one scale (`deviance` itself
+    ///   stays NaN on OLS).
+    /// - **LMM**: the fit's criterion ([`Fit::reml`]). Under REML (the
+    ///   default) the **REML criterion** `−REMLcrit/2`,
+    ///   `−½(deviance + (n−p)·(1 + ln 2π))`, matching `lme4::logLik` on a
+    ///   `REML=TRUE` fit. REML criteria are comparable only between models with
+    ///   IDENTICAL fixed effects: an AIC/LRT across different fixed parts is
+    ///   meaningless, so check [`Fit::reml`] before comparing. Under ML
+    ///   ([`FitOptions::reml`] `= Some(false)`) the ML log-likelihood
+    ///   `−½(deviance + n·(1 + ln 2π))`, matching `lme4::logLik` on a
+    ///   `REML=FALSE` fit.
     /// - **GLMM** — the marginal Laplace/AGQ log-likelihood:
     ///   `−½·deviance + saturated_loglik` (binomial/Poisson, see
     ///   `family::saturated_loglik`), `−½·deviance` alone for Gamma and NB
@@ -237,8 +251,11 @@ pub struct Fit {
     /// AIC/BIC identity in [`Fit::loglik`] does not apply at that endpoint. An
     /// LMM `MaxFunReached` endpoint reports its usual nonzero `df` instead.
     pub df: usize,
-    /// `true` iff `loglik` is a REML criterion (the Gaussian LMM paths — REML
-    /// is this engine's locked LMM objective) rather than an ML log-likelihood.
+    /// `true` iff `loglik` is a REML criterion rather than an ML
+    /// log-likelihood: a Gaussian mixed fit under REML (the default; a fit
+    /// made with [`FitOptions::reml`] `= Some(false)` is by ML and reports
+    /// `false`), read off the criterion the fit minimized, and an OLS fit made
+    /// with [`FitOptions::reml`] `= Some(true)`.
     /// Model comparisons (AIC/LRT) across fits with different fixed effects are
     /// invalid when this is set — mirror of lme4's REML-fit `anova` warning.
     pub reml: bool,
@@ -267,8 +284,8 @@ pub struct Fit {
     /// grouping lands in is a data-dependent speed decision, so a consumer that
     /// inferred it would be wrong on a dataset nobody tested.
     ///
-    /// The Gaussian LMM paths never form these during the fit — the profiled
-    /// REML criterion does not need them — and recover them once at θ̂ by
+    /// The Gaussian LMM paths never form these during the fit (the profiled
+    /// criterion, REML or ML, does not need them) and recover them once at θ̂ by
     /// back-substitution afterwards, which is why they are here without the
     /// per-evaluation cost of forming them.
     pub ranef: Vec<f64>,
@@ -293,10 +310,10 @@ pub struct Fit {
     /// What the Satterthwaite pass (or the residual df) left for
     /// [`Fit::contrast_t`] and [`Fit::contrast_f`]: on OLS and on a Gamma or
     /// inverse Gaussian GLM with φ estimated, the residual-only record (the
-    /// full `C` and `ν = n − p`); on a Gaussian LMM, the pass's state, its
-    /// switched-off record, or the failed record of a fit with no finite
-    /// endpoint; `None` where neither applies (every other family, and a
-    /// Gaussian LMM `Fit` the loop tier's `FitView::into_fit` built).
+    /// full `C` and `ν = n − p`); on a Gaussian LMM (REML or ML), the pass's
+    /// state, its switched-off record, the failed record of a fit with no
+    /// finite endpoint, or the not-run record of a `Fit` the loop tier's
+    /// `FitView::into_fit` built; `None` on every other family.
     pub(crate) satterthwaite: Option<crate::lmm::satterthwaite::SatterthwaiteState>,
 }
 
@@ -866,26 +883,29 @@ pub struct FitOptions {
     ///   `fit_glmm_poisson_weighted_matches_lme4`, and
     ///   `fit_glmm_gamma_weighted_matches_glmmtmb` (lme4 `glmer` for the
     ///   first two, glmmTMB with a dispersion offset for the Gamma one; all dense).
-    /// - Dense (`Solver::NoZ`) mixed Gaussian LMM (weighted REML): every
+    /// - Dense (`Solver::NoZ`) mixed Gaussian LMM (weighted REML or ML): every
     ///   row of `[X y Z]` is conceptually √wᵢ-scaled before hitting the unit-
     ///   weight suff-stats/deviance kernel (`LmmSuffStats::add_rows_multi`),
     ///   which folds `wᵢ` straight into the Gram accumulators (`c`, `s`,
-    ///   `counts` — the last now `Σ z²·wᵢ`, not a row count; `df = n − p` still
-    ///   comes from the raw row count). `σ̂² = pwrss_w/(n−p)` (raw df) falls out
-    ///   of the weighted Grams automatically; `tau2 = θ²·σ̂²` and SEs inherit.
+    ///   `counts`: the last now `Σ z²·wᵢ`, not a row count; `ν`, `n − p`
+    ///   under REML and `n` under ML, still comes from the raw row count).
+    ///   `σ̂² = pwrss_w/ν` (raw ν) falls out of the weighted Grams
+    ///   automatically; `tau2 = θ²·σ̂²` and SEs inherit.
     ///   The reported deviance carries an extra `−Σlog wᵢ` (the weighted
     ///   Gaussian log-density's `+½Σlog wᵢ` per row, on the −2ℓ scale) atop the
-    ///   usual stripped-constant convention, matching lme4's weighted
-    ///   `lmer(weights=)` REMLcrit up to that same stripped constant.
-    ///   Validated against `fit_lmm_weighted_matches_lme4` (lme4 `lmer`, dense),
-    ///   `fit_lmm_weight_scale_invariant_dense_and_sparse`, and
+    ///   usual stripped-constant convention, on both criteria, matching lme4's
+    ///   weighted `lmer(weights=)` REMLcrit (ML: `deviance()`) up to that same
+    ///   stripped constant.
+    ///   Validated against `fit_lmm_weighted_matches_lme4` (lme4 `lmer`, dense,
+    ///   REML), `fit_lmm_weight_scale_invariant_dense_and_sparse` (both
+    ///   criteria), and
     ///   `fit_lmm_weighted_boundary_matches_wls`.
     /// - Sparse (`Solver::Sparse`) Gaussian LMM: identical √wᵢ scaling threaded
     ///   through the sparse-Z accumulator instead — `for_each_z_entry`'s
     ///   emitted z values and every raw x/y read in `SparseLmmWorkspace::new`'s
     ///   pass 2 each carry one `√wᵢ` factor, so every Gram product (`ztxy`,
     ///   `cxy`, the packed `pk_*` raw-Gram streams) ends up carrying exactly
-    ///   `wᵢ`. Deviance/df stay raw (`n − p`); the `−Σlog wᵢ` constant is added
+    ///   `wᵢ`. Deviance/ν stay raw (`n − p` or `n`); the `−Σlog wᵢ` constant is added
     ///   in `lmm_view_to_fit`, the one site both kernels reach. Validated against
     ///   `fit_sparse_lmm_weighted_matches_lme4` (lme4 `lmer`, sparse) and
     ///   `fit_lmm_weight_scale_invariant_dense_and_sparse`.
@@ -939,6 +959,30 @@ pub struct FitOptions {
     /// return [`crate::inference::contrast::NoDfReason::Disabled`]. No other
     /// family reads it, and no other field of the fit depends on it.
     pub satterthwaite: bool,
+    /// The estimator of a Gaussian mixed model: restricted maximum likelihood
+    /// (REML) or maximum likelihood (ML). Default `None`, which resolves to
+    /// the usual estimator for the model:
+    ///
+    /// | Model | `None` | `Some(true)` | `Some(false)` |
+    /// |---|---|---|---|
+    /// | Gaussian, random part | REML | REML | ML |
+    /// | Gaussian, no random part (OLS) | ML log-likelihood | REML log-likelihood | ML log-likelihood |
+    /// | any other family | ML | ML | ML |
+    ///
+    /// On OLS the value moves only the reported log-likelihood (see
+    /// [`Fit::loglik`]) and [`Fit::reml`]: β̂, the SEs and `σ̂² = RSS/(n − p)`
+    /// are the same under all three. It is read when the `Fit` is assembled,
+    /// from the options handed to `FitView::into_fit`, and is not frozen on an
+    /// OLS `FitWorkspace`, since the solve does not depend on it. On a GLM or
+    /// GLMM (Laplace or AGQ) the fit is by maximum likelihood whatever the
+    /// value, so `Some(true)` is ignored there, as [`FitOptions::dispersion`]
+    /// is on the families with no dispersion. `Some(false)` off the Gaussian
+    /// mixed model, and `Some(true)` on a GLM or GLMM, give a `Fit` bitwise
+    /// identical to the `None` fit, with no note attached: the ports warn
+    /// about an ignored value, the kernel does not. "Random part" means the
+    /// model actually fitted: a grouping dropped for having one level leaves
+    /// an OLS or GLM fit, and its row applies.
+    pub reml: Option<bool>,
 }
 
 impl Default for FitOptions {
@@ -952,6 +996,7 @@ impl Default for FitOptions {
             offset: None,
             parallel_inner: false,
             satterthwaite: true,
+            reml: None,
         }
     }
 }

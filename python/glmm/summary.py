@@ -8,6 +8,10 @@ depending on where it was pasted.
 Block order follows lme4's `print.summary.merMod`; the R port's
 `print.summary.fastglmm` prints the same blocks in the same order — change
 together.
+
+The renderers read four hooks on `Summary`: `_header_lines`, `_notes`,
+`_tables` and `_footer_lines`. `_notes` holds the printed notes each render
+puts directly under the title.
 """
 
 import html as _html
@@ -56,6 +60,9 @@ def _dispersion_label(fit):
 # The footer of a Gaussian mixed model's t tests. Same sentence the R port prints -
 # change together.
 FOOTNOTE = "t tests use Satterthwaite degrees of freedom (finite-difference θ-Hessian)."
+# The note under the title of a Gaussian mixed model fitted by ML. Same line the
+# R port prints - change together.
+ML_NOTE = "Note: p-values can be somewhat anticonservative."
 # The footer of a Gaussian mixed model fitted with satterthwaite=False; the R port
 # prints "df not computed (satterthwaite = FALSE)", its own argument spelling.
 DF_NOT_COMPUTED = "df not computed (satterthwaite=False)"
@@ -103,7 +110,9 @@ def method_line(fit):
             return "Linear model fit by least squares [glmm]"
         return "Generalized linear model fit by IRLS [glmm]"
     if fit.family == "gaussian":
-        return "Linear mixed model fit by REML [glmm]"
+        if fit.reml:
+            return "Linear mixed model fit by REML [glmm]"
+        return "Linear mixed model fit by maximum likelihood [glmm]"
     if fit.nagq > 1:
         return (
             "Generalized linear mixed model fit by maximum likelihood "
@@ -200,8 +209,8 @@ def build_summary(fit):
         criterion = {"REML criterion at convergence": -2.0 * fit.loglik}
     else:
         criterion = {
-            "AIC": -2.0 * fit.loglik + 2.0 * fit.df,
-            "BIC": -2.0 * fit.loglik + fit.df * math.log(fit.nobs) if fit.nobs > 0 else math.nan,
+            "AIC": fit.aic,
+            "BIC": fit.bic,
             "logLik": fit.loglik,
             "deviance": -2.0 * fit.loglik,
             "df.resid": fit.nobs - fit.df,
@@ -329,7 +338,13 @@ class Summary:
 
     def text(self):
         by_title = {t: (h, r) for t, h, r in self._tables()}
-        out = [self.method, f"Formula: {self.formula}", f" Family: {self.family} ({self.link})", ""]
+        out = [
+            self.method,
+            *self._notes(),
+            f"Formula: {self.formula}",
+            f" Family: {self.family} ({self.link})",
+            "",
+        ]
 
         def stacked(header, row):
             # One header line over one value line, each column right-aligned.
@@ -533,6 +548,13 @@ class Summary:
             tables.append(("Correlation of Fixed Effects", [""] + names[:-1], rows))
         return tables
 
+    def _notes(self):
+        """The notes printed directly under the title: the ML note on an ML fit
+        of a Gaussian mixed model, else none. It cannot be switched off."""
+        if self.family == "gaussian" and self.random_effects and not self.reml:
+            return [ML_NOTE]
+        return []
+
     def _header_lines(self):
         lines = [self.method, f"Formula: {self.formula}", f"Family: {self.family} ({self.link})"]
         if self.groups:
@@ -574,11 +596,16 @@ class Summary:
                 ".glmm-summary td:first-child,.glmm-summary th:first-child{text-align:left}"
                 ".glmm-summary caption{text-align:left;font-weight:bold}"
                 ".glmm-summary p{margin:0.2em 0}"
+                ".glmm-summary .glmm-note{margin:0.4em 0;padding:0.3em 0.6em;"
+                "border-left:4px solid #c88a00;background:rgba(200,138,0,0.12)}"
                 "</style>"
             ),
             '<div class="glmm-summary">',
         ]
-        out += [f"<p>{e(l)}</p>" for l in self._header_lines()]
+        title, *rest = self._header_lines()
+        out.append(f"<p>{e(title)}</p>")
+        out += [f'<div class="glmm-note" role="note">{e(n)}</div>' for n in self._notes()]
+        out += [f"<p>{e(l)}</p>" for l in rest]
         for title, header, rows in self._tables():
             out.append(f"<table><caption>{e(title)}</caption>")
             out.append("<tr>" + "".join(f"<th>{e(h)}</th>" for h in header) + "</tr>")
@@ -594,8 +621,17 @@ class Summary:
     def latex(self):
         """booktabs fragments; the caller's preamble must load `booktabs`.
         Fixed effects first, random effects second, then the rest, header and
-        footer as `%` comments — a table goes into a document, a header does not."""
-        out = [f"% {l}" for l in self._header_lines()]
+        footer as `%` comments — a table goes into a document, a header does not.
+        A note is a boxed paragraph under the title, in the document, ended
+        with `\\par\\medskip` so the first table starts below it with a gap."""
+        title, *rest = self._header_lines()
+        out = [f"% {title}"]
+        out += [
+            "\\noindent\\fbox{\\parbox{\\dimexpr\\linewidth-2\\fboxsep-2\\fboxrule\\relax}"
+            f"{{{_tex_escape(n)}}}}}\\par\\medskip"
+            for n in self._notes()
+        ]
+        out += [f"% {l}" for l in rest]
         tables = self._tables()
         order = ["Fixed effects", "Random effects"] + [
             t for t, _, _ in tables if t not in ("Fixed effects", "Random effects")
@@ -624,7 +660,10 @@ class Summary:
     def typst(self):
         """`#table(...)` fragments. Written and tested against Typst 0.14.2 —
         table syntax has moved between Typst versions; re-check on bump."""
-        out = [f"// {l}" for l in self._header_lines()]
+        title, *rest = self._header_lines()
+        out = [f"// {title}"]
+        out += [f"#block(stroke: 0.5pt, inset: 6pt, {_typst_str(n)})" for n in self._notes()]
+        out += [f"// {l}" for l in rest]
         tables = self._tables()
         order = ["Fixed effects", "Random effects"] + [
             t for t, _, _ in tables if t not in ("Fixed effects", "Random effects")

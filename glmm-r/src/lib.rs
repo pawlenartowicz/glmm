@@ -78,7 +78,8 @@ fn factor_map(
 ///
 /// Optionals use in-band absent values (the raw bridge is not the user API):
 /// an empty vector means absent - for `dispersion` too (a scalar `f64` would
-/// force NA/NaN through extendr's NA check, which rejects it).
+/// force NA/NaN through extendr's NA check, which rejects it), and for
+/// `reml` (`logical(0)` is `None`, one `TRUE`/`FALSE` is `Some`).
 /// `vcov` crosses flattened row-major with `names` carrying p; the R wrapper
 /// rebuilds the p x p matrix (it is symmetric, so the order is moot).
 ///
@@ -102,6 +103,7 @@ fn fastglmm_fit(
     start_theta: &[f64],
     start_dispersion: &[f64],
     satterthwaite: bool,
+    reml: &[Rbool],
 ) -> Result<List> {
     let nagq = u8::try_from(nagq)
         .map_err(|_| Error::Other(format!("nagq {nagq} is out of range for u8")))?;
@@ -117,6 +119,11 @@ fn fastglmm_fit(
         Some(offset.to_vec())
     };
     let start_dispersion = start_dispersion.first().copied();
+    let reml = match reml {
+        [] => None,
+        [v] if !v.is_na() => Some(v.is_true()),
+        _ => return Err(Error::Other("reml must be empty or one TRUE/FALSE".into())),
+    };
     let warm_start =
         if start_beta.is_empty() && start_theta.is_empty() && start_dispersion.is_none() {
             None
@@ -137,6 +144,7 @@ fn fastglmm_fit(
         offset,
         warm_start,
         satterthwaite,
+        reml,
     )
     .map_err(Error::Other)?;
 
@@ -145,6 +153,10 @@ fn fastglmm_fit(
     let re_group_names: Vec<String> = r.re_groups.iter().map(|(n, _)| n.clone()).collect();
     let re_group_terms = List::from_values(r.re_groups.iter().map(|(_, t)| r!(t.clone())));
     let agq_warning: Robj = match r.agq_warning {
+        Some(msg) => r!(msg),
+        None => r!(NULL),
+    };
+    let reml_warning: Robj = match r.reml_warning {
         Some(msg) => r!(msg),
         None => r!(NULL),
     };
@@ -204,6 +216,7 @@ fn fastglmm_fit(
         re_group_names = re_group_names,
         re_group_terms = re_group_terms,
         agq_warning = agq_warning,
+        reml_warning = reml_warning,
         loglik = r.loglik,
         df = r.df as f64,
         reml = r.reml,
@@ -251,8 +264,22 @@ fn fastglmm_confint(beta: &[f64], se: &[f64], coef_df: &[f64], level: &[f64]) ->
     Ok(list!(lower = lower, upper = upper))
 }
 
+/// `glmm::orchestrate::same_fixed_part` for `AIC.fastglmm` and
+/// `BIC.fastglmm`: TRUE when the two formula strings have the same fixed
+/// terms (compared as sets of variable names) and the same fixed intercept.
+/// The response, the offset and the random part are not read. A formula that
+/// does not parse is an error.
+///
+/// @usage NULL
+/// @keywords internal
+#[extendr]
+fn fastglmm_same_fixed_part(f0: &str, f1: &str) -> Result<bool> {
+    orchestrate::same_fixed_part(f0, f1).map_err(Error::Other)
+}
+
 extendr_module! {
     mod glmm_r;
     fn fastglmm_fit;
     fn fastglmm_confint;
+    fn fastglmm_same_fixed_part;
 }

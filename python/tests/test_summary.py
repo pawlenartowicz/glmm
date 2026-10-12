@@ -163,6 +163,21 @@ def test_summary_object_criterion_row_ml():
     assert c["df.resid"] == 51
 
 
+def test_summary_aic_and_bic_are_the_fit_properties():
+    for f in (
+        make_fit(family="poisson", link="log", loglik=-92.0, df=5, nobs=56),
+        _mixed_fit(reml=False),
+    ):
+        c = f.summary_object().criterion
+        assert (c["AIC"], c["BIC"]) == (f.aic, f.bic)
+    # A REML fit: the property returns the value; the summary keeps the REML
+    # criterion and has no AIC or BIC row.
+    reml = _mixed_fit()
+    assert reml.aic == -2 * reml.loglik + 2 * reml.df
+    assert reml.bic == -2 * reml.loglik + reml.df * math.log(reml.nobs)
+    assert list(reml.summary_object().criterion) == ["REML criterion at convergence"]
+
+
 def test_summary_text_has_lme4_blocks_in_order():
     text = _mixed_fit().summary()
     order = [
@@ -606,3 +621,78 @@ def test_satterthwaite_must_be_a_bool():
 def test_satterthwaite_takes_a_numpy_bool():
     off = glmm.fit(_EMIXED, "y ~ x + (1 | g)", satterthwaite=np.False_)
     assert off.df_method == "disabled"
+
+
+# The ML note: one line, on an ML fit of a Gaussian mixed model only, directly
+# under the title in every render.
+_ML_TITLE = "Linear mixed model fit by maximum likelihood [glmm]"
+_ML_NOTE = "Note: p-values can be somewhat anticonservative."
+
+
+def _renders(s):
+    return {"text": s.text(), "html": s.html(), "latex": s.latex(), "typst": s.typst()}
+
+
+def test_ml_mixed_fit_prints_its_title_and_the_note_under_it():
+    m = glmm.fit(_EMIXED, "y ~ x + (1 | g)", reml=False)
+    assert m.reml is False
+    s = m.summary_object()
+    assert s.method == _ML_TITLE
+    r = _renders(s)
+    for rendered in r.values():
+        assert rendered.count(_ML_NOTE) == 1
+    # text: the title, then the note on a line of its own.
+    assert r["text"].splitlines()[:2] == [_ML_TITLE, _ML_NOTE]
+    # html: a styled callout right after the title paragraph, before any table.
+    h = r["html"].splitlines()
+    i = h.index(f"<p>{_ML_TITLE}</p>")
+    assert h[i + 1].startswith('<div class="glmm-note"') and _ML_NOTE in h[i + 1]
+    assert ".glmm-note{" in r["html"]
+    assert i + 1 < next(k for k, ln in enumerate(h) if ln.startswith("<table"))
+    # latex and typst: a boxed paragraph right after the title comment.
+    tex = r["latex"].splitlines()
+    assert tex[0] == f"% {_ML_TITLE}"
+    assert "\\fbox{" in tex[1] and _ML_NOTE in tex[1]
+    assert tex[1].endswith("\\par\\medskip")  # a gap before the first tabular
+    typ = r["typst"].splitlines()
+    assert typ[0] == f"// {_ML_TITLE}"
+    assert typ[1].startswith("#block(stroke:") and _ML_NOTE in typ[1]
+    # The ML criterion block, with the fit's aic and bic.
+    assert list(s.criterion) == ["AIC", "BIC", "logLik", "deviance", "df.resid"]
+    assert math.isfinite(m.aic) and math.isfinite(m.bic)
+    assert (s.criterion["AIC"], s.criterion["BIC"]) == (m.aic, m.bic)
+    assert "REML criterion" not in r["text"]
+
+
+@pytest.mark.parametrize(
+    "fit",
+    [
+        _mixed_fit(),  # REML
+        make_fit(),  # OLS
+        make_fit(reml=True),  # OLS with reml=True
+        make_fit(family="poisson", link="log"),  # GLM
+        _mixed_fit(
+            family="binomial",
+            link="logit",
+            reml=False,
+            df_method="none",
+            y=np.array([0.0, 1.0, 0.0, 1.0]),
+            fitted=np.array([0.2, 0.4, 0.6, 0.8]),
+        ),  # GLMM
+    ],
+    ids=["reml_mixed", "ols", "ols_reml", "glm", "glmm"],
+)
+def test_ml_note_is_only_on_an_ml_gaussian_mixed_fit(fit):
+    s = fit.summary_object()
+    assert s.method != _ML_TITLE
+    for rendered in _renders(s).values():
+        assert "anticonservative" not in rendered
+
+
+def test_ols_fit_with_reml_true_prints_the_reml_criterion_block():
+    m = glmm.fit(_EMIXED, "y ~ x", reml=True)
+    s = m.summary_object()
+    assert s.criterion == {"REML criterion at convergence": -2.0 * m.loglik}
+    text = s.text()
+    assert f"REML criterion at convergence: {glmm.summary.fmt(-2.0 * m.loglik, 5)}" in text
+    assert "AIC" not in text

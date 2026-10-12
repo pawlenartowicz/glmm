@@ -3,7 +3,7 @@
 //! live in `src/lmm/mod.rs` and `src/sparse/mod.rs`; this module only builds
 //! the workspace, accumulates the design, and maps `LmmFit` back to `Fit`.
 
-use crate::lmm::{fit_lmm, LmmFit, LmmGroupings, LmmKernel, LmmWorkspace};
+use crate::lmm::{fit_lmm, Criterion, LmmFit, LmmGroupings, LmmKernel, LmmWorkspace};
 use crate::standardize::ColumnScaling;
 // Used only by the test-only `fit_mle`/`fit_lmm_into` baselines. The stable core
 // reaches the LMM path via `accumulate_lmm_rows`/`lmm_run_on`, which take neither.
@@ -30,6 +30,8 @@ use super::{Fit, FitOptions};
 /// path can fill a build-once `n_max`-sized buffer and pass a `subrows(0, n)`
 /// view in, instead of allocating a fresh `Mat` every call; the test-only
 /// `fit_mle` baseline builds its own throwaway `Mat` via `as_given_design`.
+/// `criterion` is the workspace's frozen one: a sparse kernel built here
+/// takes it (the dense scratch has carried it since the build).
 #[allow(clippy::too_many_arguments)] // marshals the kernel's (x_mat, y, n, p, ids…) surface
 pub(super) fn accumulate_lmm_rows(
     ws: &mut LmmWorkspace,
@@ -41,6 +43,7 @@ pub(super) fn accumulate_lmm_rows(
     extra_ids: &[Vec<u32>],
     weights: Option<&[f64]>,
     same_design: bool,
+    criterion: Criterion,
 ) {
     // The θ-search runs on ŵ = w/s (s = `family::weight_scale`), the same
     // precision-weight renormalisation the Gamma dispersion path applies
@@ -68,6 +71,17 @@ pub(super) fn accumulate_lmm_rows(
         None => None,
     };
 
+    // The kernel carries the criterion the workspace froze: set at build on the
+    // dense kernel, taken from `criterion` below when the sparse one is built.
+    debug_assert!(
+        match &ws.kernel {
+            LmmKernel::Dense { fit, .. } => fit.criterion == criterion,
+            LmmKernel::Sparse { ws: sw, .. } => {
+                sw.as_ref().is_none_or(|sw| sw.criterion == criterion)
+            }
+        },
+        "accumulate_lmm_rows: the kernel's criterion is not the frozen {criterion:?}"
+    );
     match &mut ws.kernel {
         // Fixed-design opt-in: the design part of the statistics is the last
         // call's (same x, ids, weights), only the response part is rebuilt.
@@ -122,6 +136,7 @@ pub(super) fn accumulate_lmm_rows(
                         n,
                         p,
                         sqrt_w,
+                        criterion,
                     )));
                 }
             }
@@ -149,6 +164,10 @@ pub(crate) struct LmmResultView<'a> {
     ranef_u: &'a [f64],
     /// The workspace's `weight_scale` s: `fit.sigma_sq` is σ̂²/s.
     weight_scale: f64,
+    /// The criterion the kernel minimized. `Fit::reml`, the standardization
+    /// shift and the log-likelihood's `ν` follow it, not `FitOptions::reml`,
+    /// so a fit cannot report one criterion and have minimized the other.
+    criterion: Criterion,
     /// The column standardization the rows were accumulated under
     /// (`β = B·β̃`): `factor` is on the standardized design, so `vcov` is read
     /// through it, and so are θ̂, `varcorr` and the conditional modes.
@@ -188,8 +207,8 @@ impl LmmResultView<'_> {
             pivot: self.fit.pivot,
             pivot_col: self.fit.pivot_col,
             ill_conditioned: self.fit.pivot < crate::lmm::PIVOT_MIN,
-            // No PIRLS on the Gaussian LMM path (profiled REML, no IRLS inner
-            // loop) — always 0/false.
+            // No PIRLS on the Gaussian LMM path (profiled REML or ML, no IRLS
+            // inner loop): always 0/false.
             pirls_exhausted: 0,
             final_pirls_exhausted: false,
             // No FD-Hessian SE pass on the Gaussian LMM path (no PIRLS to
@@ -253,6 +272,7 @@ pub(crate) fn lmm_run_on<'a>(
 
     LmmResultView {
         weight_scale: ws.weight_scale,
+        criterion: ws.kernel.criterion(),
         map,
         ranef_u: ws.kernel.ranef_u(),
         fit,
@@ -267,9 +287,9 @@ pub(crate) fn lmm_run_on<'a>(
 }
 
 /// Maps an [`LmmResultView`] to the full stable `Fit`: SE from `var_diag`, tau2
-/// from θ̂, varcorr, vcov from the augmented factor, the REML criterion loglik,
-/// the conditional modes + per-row means, and — when `opts.weights` is set — the
-/// −Σlog wᵢ weighted-deviance correction.
+/// from θ̂, varcorr, vcov from the augmented factor, the deviance and loglik of
+/// the kernel's criterion (REML or ML), the conditional modes + per-row means,
+/// and, when `opts.weights` is set, the −Σlog wᵢ weighted-deviance correction.
 ///
 /// `x`/`ids` are here for `fitted` alone (`Xβ̂ + Zb̂` needs the design rows and
 /// the per-row levels), the same way `ols_view_to_fit` already takes `x`/`y`.
@@ -372,16 +392,26 @@ pub(crate) fn lmm_view_to_fit(
         diag.pinned_components = mask;
     }
     let diagnostics = super::common::materialize_diagnostics(&diag, p, &varcorr);
-    // `2·Σⱼ ln sⱼ` of the column standardization: what the REML criterion of
-    // the fitted design is short of the caller's.
-    let reml_shift = view.map.reml_deviance_shift();
+    let criterion = view.criterion;
+    // The kernel's deviance on the caller's design. The REML criterion contains
+    // ln|X̃ᵀV⁻¹X̃| on the standardized design, which is the caller's ln|XᵀV⁻¹X|
+    // minus 2·Σ ln sⱼ (a shift has determinant 1); the shift puts it back. The
+    // ML criterion has no such term, and r² and |V| depend on X only through
+    // its column space (and on the RE slope scaling through the exact Z̃Λ̃ = ZΛ
+    // identity), so it needs none. The weighted correction below then applies
+    // to the caller's value.
+    let deviance = match criterion {
+        Criterion::Reml => lmm_fit.deviance + view.map.reml_deviance_shift(),
+        Criterion::Ml => lmm_fit.deviance,
+    };
     let mut fit = Fit {
         beta,
         se,
         vcov,
         tau2,
-        // REML σ̂² (NaN-filled by the kernel alongside var_diag on the
-        // degenerate path, so this stays honest without an endpoint gate).
+        // The criterion's σ̂², r²/(n − p) under REML and r²/n under ML
+        // (NaN-filled by the kernel alongside var_diag on the degenerate path,
+        // so this stays honest without an endpoint gate).
         dispersion: sigma_sq,
         diagnostics,
         varcorr,
@@ -389,22 +419,20 @@ pub(crate) fn lmm_view_to_fit(
         n_eval: lmm_fit.n_eval,
         #[cfg(feature = "counters")]
         counters: lmm_fit.counters,
-        // The kernel's REML criterion contains ln|X̃ᵀV⁻¹X̃| on the standardized
-        // design, which is the caller's ln|XᵀV⁻¹X| minus 2·Σ ln sⱼ (a shift has
-        // determinant 1); the shift puts it back. The weighted correction below
-        // then applies to the caller's value.
-        deviance: lmm_fit.deviance + reml_shift,
-        // REML criterion on the logLik scale, from the base (unweighted) deviance;
-        // the weighted correction below rewrites both together (using `n`, not
-        // `n_rows` — see note above `n_rows`).
-        loglik: super::common::lmm_loglik(lmm_fit.deviance + reml_shift, n_rows, p),
+        deviance,
+        // The criterion on the logLik scale, from the base (unweighted)
+        // deviance; the weighted correction below rewrites both together
+        // (using `n`, not `n_rows`: see the note above `n_rows`).
+        loglik: super::common::lmm_loglik(deviance, criterion.nu(n_rows, p)),
         df: if has_endpoint { p + n_theta + 1 } else { 0 },
-        reml: true,
+        reml: criterion == Criterion::Reml,
         fitted,
         ranef,
         ranef_levels,
         coef_df: vec![f64::NAN; p],
-        satterthwaite: None,
+        // No pass has run: the stable path's `attach_satterthwaite` replaces
+        // the record; a loop-tier `Fit` keeps it.
+        satterthwaite: Some(crate::lmm::satterthwaite::SatterthwaiteState::not_run()),
     };
     // A capped (`MaxFunReached`) endpoint is reported as a point, not an
     // accepted optimum, even though `varcorr` is finite there — so the
@@ -415,19 +443,25 @@ pub(crate) fn lmm_view_to_fit(
             && fit.has_negligible_component(&view.groupings.kernel_stddevs(view.theta)));
 
     // Weighted Gaussian log-density carries +½Σlog wᵢ per row; on the −2ℓ scale
-    // the REML deviance gains −Σlog wᵢ (θ-independent — added post-optimization,
-    // argmin unchanged), and the criterion-scale loglik is recomputed from the
-    // corrected deviance. Matches lme4's weighted REMLcrit up to the additive
-    // constant the engine strips from its deviance convention (documented on
-    // `lmm::reml_deviance`). This is the single site every caller reaches, so
-    // no caller applies the correction itself.
+    // the deviance gains −Σlog wᵢ on both criteria (θ-independent: added
+    // post-optimization, argmin unchanged), and the loglik is recomputed from
+    // the corrected deviance with the criterion's ν. Matches lme4's weighted
+    // REMLcrit (REML) and deviance (ML) up to the additive constant the engine
+    // strips from its deviance convention (documented on `lmm::reml_deviance`).
+    // This is the single site every caller reaches, so no caller applies the
+    // correction itself.
     //
     // The kernel was accumulated on ŵ = w/s (`accumulate_lmm_rows`), so its
     // deviance is already stripped of −Σlog ŵᵢ, not −Σlog wᵢ; the two differ
-    // by n·ln(s), which exactly cancels the n·ln(s) that `s` introduces between
-    // σ̂²_int and σ̂²_raw, so no additional correction is needed beyond using ŵ
-    // here — using raw `w` instead would leave a spurious n·ln(s) in `deviance`
-    // and `loglik`. `fit.dispersion` (σ̂²_int off the ŵ-accumulated kernel) is
+    // by n·ln(s), which exactly cancels the n·ln(s) that `s` introduces into
+    // the kernel's criterion (its θ̂ carries √s, so ln|L_ZZ|² does not move).
+    // Under ML the cancellation is direct: n·ln σ̂²_int = n·ln σ̂²_raw − n·ln s.
+    // Under REML, (n − p)·ln σ̂²_int gives −(n − p)·ln s and ln|L_XX|² (the
+    // relative X̃ᵀV⁻¹X̃, scaled by 1/s) the other −p·ln s. So no additional
+    // correction is needed beyond using ŵ here; using raw `w` instead would
+    // leave a spurious n·ln(s) in `deviance` and `loglik`.
+    //
+    // `fit.dispersion` (σ̂²_int off the ŵ-accumulated kernel) is
     // converted to the raw scale by the same `s` here and in
     // `LmmResultView::dispersion` (change together) — every other field above
     // (β, se, vcov, tau2, varcorr) is already correct on σ̂²_int, since their
@@ -436,7 +470,7 @@ pub(crate) fn lmm_view_to_fit(
         let s = view.weight_scale;
         fit.dispersion *= s;
         fit.deviance -= w.iter().map(|v| (v / s).ln()).sum::<f64>();
-        fit.loglik = super::common::lmm_loglik(fit.deviance, n, p);
+        fit.loglik = super::common::lmm_loglik(fit.deviance, criterion.nu(n, p));
     }
     fit
 }
@@ -511,9 +545,16 @@ fn fit_mle(
         .map(|g| g.slopes.iter().map(|&c| c as usize).collect())
         .collect();
 
+    let criterion = super::common::resolve_criterion(model, opts)
+        .expect("fit_mle requires a Gaussian mixed model");
     // Build workspace — allocates solver, suff-stats, fit scratch for this model shape
     let mut ws =
         LmmWorkspace::for_cluster_spec_ext(p, model, n, &slope_cols, &extra_slope_cols, sparse);
+    // As `fit::core::build_workspace` sets it; the sparse kernel takes it from
+    // `accumulate_lmm_rows`.
+    if let LmmKernel::Dense { fit, .. } = &mut ws.kernel {
+        fit.criterion = criterion;
+    }
     // Identity-link offset is an exact y-shift before accumulation (the Grams
     // are the only place raw y enters) — the same convention `fit_ols_prebuilt` applies.
     // Mirrored by `fit::core`'s `Lmm` arm; change together.
@@ -536,6 +577,7 @@ fn fit_mle(
         extra_ids,
         opts.weights.as_deref(),
         false,
+        criterion,
     );
 
     let ids = crate::GroupIds {

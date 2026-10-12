@@ -14,8 +14,9 @@
 \description{
 The residual standard deviation for \strong{gaussian} fits (\code{sqrt} of the
 kernel's dispersion: \code{RSS/(n-p)} for a linear model, matching
-\code{summary.lm}'s sigma; the REML residual variance for a mixed model,
-matching \code{lme4::sigma}), \code{sqrt(phi)} for Gamma and inverse-Gaussian, and
+\code{summary.lm}'s sigma; for a mixed model the residual variance of the
+fitted criterion, REML or ML with \code{REML = FALSE}, matching \code{lme4::sigma}),
+\code{sqrt(phi)} for Gamma and inverse-Gaussian, and
 \code{1} for binomial/poisson/negative-binomial (the scale is fixed, as in
 lme4).
 }

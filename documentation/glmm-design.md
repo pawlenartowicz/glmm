@@ -188,7 +188,7 @@ reach.
 
 Every difference above is held to four pinned reference engines: R/lme4,
 R/glmmTMB, Julia/MixedModels.jl and R/GLMMadaptive. Each fits the cells it can on
-a 794-cell accuracy grid (`validation/grid/`), from single-intercept LMMs
+a 923-cell accuracy grid (`validation/grid/`), from single-intercept LMMs
 to crossed/nested/sparse GLMMs. glmmTMB fits every family but
 inverse-Gaussian, and GLMMadaptive fits AGQ on one grouping factor. A converged deviance worse than the best reference on a cell
 fails. Parameter differences are reported; one beyond the agreement band is
@@ -203,6 +203,6 @@ glmmTMB, GLMMadaptive and R's own `glm` references.
 The trade is inference machinery and breadth: no `predict`, no
 profile/bootstrap CIs, no small-sample df beyond Satterthwaite's for Gaussian
 mixed models (no Kenward-Roger); fewer families than
-glmmTMB/GLMMadaptive; REML-only LMMs; and past a few dozen θ parameters,
+glmmTMB/GLMMadaptive; and past a few dozen θ parameters,
 gradient-based engines are expected to win. For one interactive model on one
 dataset, lme4 or its neighbours remain the right tool.

@@ -16,7 +16,7 @@ generalized linear mixed models.
 - **Fast.** Faster than every other engine on every model, usually 10 to 100 times,
   without RAM blowup.
 
-On all tested models: a 794-model validation grid, checked for every release.
+On all tested models: a 923-model validation grid, checked for every release.
 
 ## Install
 
@@ -38,6 +38,9 @@ fit = glmm.fit(df, "y ~ x1 * x2")
 
 # LMM: correlated random intercept and slope (REML)
 fit = glmm.fit(df, "y ~ x1 + (1 + x1 | subject)")
+
+# The same LMM by maximum likelihood, as lme4's REML = FALSE
+fit_ml = glmm.fit(df, "y ~ x1 + (1 + x1 | subject)", reml=False)
 
 # GLMM: binomial with a probit link, 7-node adaptive quadrature
 fit = glmm.fit(df, "passed ~ x1 + (1 | school)", "binomial", link="probit", nagq=7)

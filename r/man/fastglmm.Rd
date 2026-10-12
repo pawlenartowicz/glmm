@@ -18,6 +18,7 @@ fastglmm(
   dispersion = NULL,
   init.theta = NULL,
   satterthwaite = TRUE,
+  REML = NULL,
   ...
 )
 }
@@ -95,13 +96,18 @@ then use z and normal quantiles and say "df not computed", and
 \verb{$df_method} is \code{"disabled"}. OLS and the Gamma and inverse-Gaussian GLMs
 keep their residual df whatever it says.}
 
-\item{...}{intercepted, never silently swallowed. \code{REML} is checked against
-the model: \code{REML = TRUE} is accepted only on a Gaussian mixed model (the
-one model with a REML objective) and errors elsewhere, \code{REML = FALSE} is
-accepted everywhere else (those models are fitted by maximum likelihood)
-and errors there. The other known lme4 arguments (\code{control}, \code{verbose},
-\code{contrasts}) raise errors saying why they cannot be honored; unknown names
-error as unused arguments.}
+\item{REML}{\code{NULL} (the default), \code{TRUE} or \code{FALSE}; \verb{$reml} reports the
+value used. A Gaussian mixed model is fitted by REML under \code{NULL} and
+\code{TRUE} and by maximum likelihood under \code{FALSE}. A Gaussian model with no
+random effects (OLS, including a formula whose every grouping was dropped
+as single-level) has the same estimates under every value: \code{TRUE} reports
+the REML log-likelihood (as \code{logLik(lm, REML = TRUE)}), \code{NULL} and \code{FALSE}
+the ML one. Every other family is fitted by maximum likelihood, and
+\code{TRUE} there is ignored with a \code{"fastglmm_argument_ignored"} warning.}
+
+\item{...}{intercepted, never silently swallowed. The known lme4 arguments
+(\code{control}, \code{verbose}, \code{contrasts}) raise errors saying why they cannot
+be honored; unknown names error as unused arguments.}
 }
 \value{
 An object of class \code{"fastglmm"}: fixed effects (\link{fixef}), Wald
@@ -119,16 +125,18 @@ plus
 \code{print()}, \link[=summary.fastglmm]{summary()}, \link[=confint.fastglmm]{confint()}
 (Wald), \code{nobs()}, \link[=formula.fastglmm]{formula()} (returns the formula
 \strong{string}), \code{family()}, \code{model.frame()}, \link[=ranef.fastglmm]{ranef()},
-\code{fitted()}, \code{residuals()}, and \link[=logLik.fastglmm]{logLik()} (so \code{AIC()}
-and \code{BIC()} work). The blocked accessors (\code{predict}, \code{coef}, \code{terms})
+\code{fitted()}, \code{residuals()}, \link[=logLik.fastglmm]{logLik()}, and
+\link[=AIC.fastglmm]{AIC()} and \code{BIC()} (which refuse a REML fit beside an ML
+one, and REML fits with different fixed effects). The blocked accessors (\code{predict}, \code{coef}, \code{terms})
 error with the reason.
 }
 \description{
 One entry point for the whole \code{glmm} engine, dispatching on \code{family} the way
 the kernel itself does: OLS (\code{gaussian} without random effects), GLM
-(binomial/poisson/gamma/negative-binomial without random effects), REML LMM
-(\code{gaussian} with random effects), and GLMM (Laplace or adaptive
-Gauss-Hermite) - there is no \code{lmer}/\code{glmer} split.
+(binomial/poisson/gamma/negative-binomial without random effects), LMM
+(\code{gaussian} with random effects; REML by default, ML with \code{REML = FALSE}),
+and GLMM (Laplace or adaptive Gauss-Hermite) - there is no \code{lmer}/\code{glmer}
+split.
 }
 \details{
 The formula is parsed by the same Rust parser the Python port uses. Besides
@@ -184,10 +192,10 @@ so \code{withCallingHandlers()} and \code{suppressWarnings(classes = )} can sele
 them without matching message text.
 
 Anything the engine cannot do is an error naming the reason - never a
-silently different model. That includes \code{REML = FALSE} on a Gaussian mixed
-model (the LMM path is REML-only \strong{by design}), \code{REML = TRUE} on any other
-model (fitted by maximum likelihood), \verb{control=}/\verb{verbose=}, and quasi-likelihood
-\verb{dispersion=} on binomial/poisson.
+silently different model. That includes \verb{control=}/\verb{verbose=} and
+quasi-likelihood \verb{dispersion=} on binomial/poisson. \code{REML = TRUE} on a model
+that is not Gaussian does not apply (the model is fitted by maximum
+likelihood): it is ignored with a warning, as an inapplicable \code{nAGQ} is.
 }
 \examples{
 set.seed(1)

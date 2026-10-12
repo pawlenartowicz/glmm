@@ -7,12 +7,25 @@ coded, and what the two boundary/convergence flags on the result mean.
 
 ## Estimation
 
-Gaussian mixed models (LMM) are fit by **profiled REML only** — there is no ML
-switch on this path. The fixed effects β and the residual scale σ² are
-profiled out analytically; the optimizer searches only the relative covariance
-parameter θ. See [`algorithms-lmm.md`](algorithms-lmm.md) for the objective
-and the search that minimizes it: BOBYQA, or BFGS on the per-group route
-(random slopes on the only grouping factor).
+Gaussian mixed models (LMM) are fit by **profiled REML** by default, and by
+**profiled ML** on request (`FitOptions::reml = Some(false)`, Python
+`reml=False`, R `REML = FALSE`), as lme4's `REML` argument does. The fixed
+effects β and the residual scale σ² are profiled out analytically; the
+optimizer searches only the relative covariance parameter θ, with the same
+kernels and routes on both criteria. `Fit::reml` (Python `fit.reml`, R
+`fit$reml`) says which criterion the log-likelihood is. On a REML fit it is
+the REML criterion, which compares only fits with the same fixed effects; to
+compare fixed effects, fit by ML. The summary of an ML fit of a Gaussian mixed
+model carries the printed note "p-values can be somewhat anticonservative." See
+[`algorithms-lmm.md`](algorithms-lmm.md) for the two objectives and the search
+that minimizes them: BOBYQA, or BFGS on the per-group route (random slopes on
+the only grouping factor).
+
+A Gaussian model without random effects (OLS) has the same estimates on both
+criteria. Its log-likelihood is the ML one by default and the REML one, as R's
+`logLik(lm, REML = TRUE)`, under `reml = Some(true)`. Every other family is
+fitted by maximum likelihood; `reml = Some(true)` there is ignored (the Python
+and R surfaces warn).
 
 Non-Gaussian mixed models (GLMM) are fit by **PIRLS + Laplace** by default
 (`nAGQ = 1`): `glmer`'s objective on the canonical links (logit, Poisson log),

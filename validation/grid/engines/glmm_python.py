@@ -257,6 +257,10 @@ def fit_one(cell):
         kw = {"link": cell["link"], "weights": weights, "offset": offset}
         if cell.get("nagq") is not None:
             kw["nagq"] = int(cell["nagq"])
+        # A cell tagged `ml` (an ML twin) is fitted by ML; every other cell
+        # keeps the default estimator, as in common.rs::fit_cell.
+        if "ml" in cell.get("tags", []):
+            kw["reml"] = False
 
         gaussian = cell["family"] == "gaussian"
 

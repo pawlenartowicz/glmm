@@ -51,7 +51,8 @@
     if (fam == "gaussian") "Linear model fit by least squares [fastglmm]"
     else "Generalized linear model fit by IRLS [fastglmm]"
   } else if (fam == "gaussian") {
-    "Linear mixed model fit by REML [fastglmm]"
+    if (object$reml) "Linear mixed model fit by REML [fastglmm]"
+    else "Linear mixed model fit by maximum likelihood [fastglmm]"
   } else if (object$nAGQ > 1L) {
     paste0("Generalized linear mixed model fit by maximum likelihood ",
            "(Adaptive Gauss-Hermite Quadrature, nAGQ = ", object$nAGQ,
@@ -59,6 +60,18 @@
   } else {
     paste0("Generalized linear mixed model fit by maximum likelihood ",
            "(Laplace Approximation) [fastglmm]")
+  }
+}
+
+# The title, then on an ML fit of a Gaussian mixed model the ML note, a line
+# of its own directly under it and before any table. print() and summary()
+# both open with it; the note cannot be switched off. The Python port's
+# method_line and Summary._notes() print the same - change together.
+.print_title <- function(object) {
+  cat(.method_line(object), "\n")
+  if (identical(object$family_name, "gaussian") && length(object$varcorr) > 0L &&
+      !object$reml) {
+    cat("Note: p-values can be somewhat anticonservative.\n")
   }
 }
 
@@ -79,7 +92,7 @@
 
 #' @export
 print.fastglmm <- function(x, digits = max(3L, getOption("digits") - 3L), ...) {
-  cat(.method_line(x), "\n")
+  .print_title(x)
   cat("Formula: ", x$formula, "\n", sep = "")
   cat(" Family: ", x$family$family, " (", x$family$link, ")\n", sep = "")
   if (length(x$varcorr)) {
@@ -101,7 +114,7 @@ print.fastglmm <- function(x, digits = max(3L, getOption("digits") - 3L), ...) {
 #' Summarize a fastglmm fit
 #'
 #' lme4's blocks in lme4's order: method line, formula, data, the criterion
-#' (`REML criterion at convergence` on an LMM, the `AIC BIC logLik deviance
+#' (`REML criterion at convergence` on a REML fit, the `AIC BIC logLik deviance
 #' df.resid` row on an ML fit), scaled residuals, random effects with
 #' variances, the observation/group counts, the coefficient table, the
 #' correlation of fixed effects, and a footer. The Python port's
@@ -116,10 +129,17 @@ print.fastglmm <- function(x, digits = max(3L, getOption("digits") - 3L), ...) {
 #' held dispersion and every GLMM get Wald z tests on the normal, as `glm` and
 #' `glmer` do. A Gaussian mixed model fitted with `satterthwaite = FALSE`
 #' gets z tests too, and the footer says the df were not computed. The t
-#' p-values are the kernel's. The REML criterion is printed on LMMs where lme4
-#' prints it; the AIC row is printed only on ML fits, because a REML AIC
+#' p-values are the kernel's. The REML criterion is printed on REML fits (a
+#' Gaussian mixed model fitted by REML, and an OLS fit made with
+#' `REML = TRUE`); the AIC row is printed only on ML fits, because a REML AIC
 #' invites exactly the across-models comparison it is not valid for.
 #' `glance()` returns AIC/BIC on request either way.
+#'
+#' A Gaussian mixed model fitted with `REML = FALSE` is titled "Linear mixed
+#' model fit by maximum likelihood", and `print()` and `summary()` print one
+#' note on a line of its own directly under the title: "Note: p-values can be
+#' somewhat anticonservative." It is a printed note, not a warning, and cannot
+#' be switched off. REML, OLS, GLM and GLMM fits print no note.
 #'
 #' @param object a [fastglmm] fit.
 #' @param ... unused.
@@ -168,7 +188,7 @@ print.summary.fastglmm <- function(x,
                                    digits = max(3L, getOption("digits") - 3L),
                                    ...) {
   object <- x$object
-  cat(.method_line(object), "\n")
+  .print_title(object)
   cat("Formula: ", object$formula, "\n", sep = "")
   cat("   Data: ", object$data_name, "\n", sep = "")
   cat(" Family: ", object$family$family, " (", object$family$link, ")\n\n",
@@ -285,8 +305,9 @@ nlme::VarCorr
 #' straight from the kernel's `varcorr` (validated against lme4's `VarCorr`).
 #'
 #' For a **gaussian** mixed fit a `Residual` row is printed after the group
-#' components, as in lme4, carrying `sigma()` (the REML residual standard
-#' deviation the kernel reports as `dispersion`).
+#' components, as in lme4, carrying `sigma()` (the residual standard deviation
+#' of the fitted criterion, REML or ML with `REML = FALSE`, that the kernel
+#' reports as `dispersion`).
 #'
 #' Adds a method to `nlme::VarCorr`, the generic `lme4::VarCorr` also uses
 #' (lme4 adds methods to nlme's generic rather than declaring its own), so a
@@ -367,8 +388,9 @@ print.VarCorr.fastglmm <- function(x,
 #'
 #' The residual standard deviation for **gaussian** fits (`sqrt` of the
 #' kernel's dispersion: `RSS/(n-p)` for a linear model, matching
-#' `summary.lm`'s sigma; the REML residual variance for a mixed model,
-#' matching `lme4::sigma`), `sqrt(phi)` for Gamma and inverse-Gaussian, and
+#' `summary.lm`'s sigma; for a mixed model the residual variance of the
+#' fitted criterion, REML or ML with `REML = FALSE`, matching `lme4::sigma`),
+#' `sqrt(phi)` for Gamma and inverse-Gaussian, and
 #' `1` for binomial/poisson/negative-binomial (the scale is fixed, as in
 #' lme4).
 #'
@@ -643,18 +665,22 @@ coef.fastglmm <- function(object, ...) {
 
 #' Log-likelihood of a fastglmm fit
 #'
-#' On `stats::logLik`'s scale, so `AIC()` and `BIC()` work directly. This is
-#' `glmm::Fit::loglik`, not `$deviance` - the latter is the optimizer
-#' criterion. For an LMM it is lme4's REMLcrit minus a data-independent
-#' constant. For a GLMM it differs from `-2*logLik` by a data-only saturated
-#' constant on binomial/Poisson fits, and equals `-2*logLik` exactly on Gamma
-#' and negative-binomial fits.
+#' On `stats::logLik`'s scale, which [AIC()][AIC.fastglmm] and `BIC()` read.
+#' This is `glmm::Fit::loglik`, not `$deviance` - the latter is the optimizer
+#' criterion. For an LMM it is lme4's REMLcrit (on an ML fit, lme4's ML
+#' deviance) minus a data-independent constant. For a GLMM it differs from
+#' `-2*logLik` by a data-only saturated constant on binomial/Poisson fits, and
+#' equals `-2*logLik` exactly on Gamma and negative-binomial fits.
 #'
-#' For an LMM the value is the **REML criterion**, matching `lme4::logLik` on a
-#' REML fit, and the returned object carries `REML = TRUE`. REML criteria are
-#' comparable only between models with identical fixed effects; an AIC across
-#' LMMs with different fixed effects is invalid. The LMM path is REML-only by
-#' design, so there is no ML value to return instead.
+#' On a REML fit (a Gaussian mixed model fitted with the default `REML`, or an
+#' OLS fit made with `REML = TRUE`) the value is the **REML criterion**,
+#' matching `lme4::logLik` on a REML fit (and `logLik(lm, REML = TRUE)` on
+#' OLS), and the returned object carries `REML = TRUE`. It stays the REML value
+#' because that is the quantity for comparing random-effect structures with the
+#' same fixed effects. REML criteria are comparable only between models with
+#' identical fixed effects: `AIC()` and `BIC()` refuse REML fits with different
+#' fixed effects. To compare fixed effects, fit both models with
+#' `REML = FALSE`; an ML fit returns the ML log-likelihood, with `REML = FALSE`.
 #'
 #' @param object a [fastglmm] fit.
 #' @param ... unused.
@@ -668,6 +694,112 @@ logLik.fastglmm <- function(object, ...) {
   attr(val, "REML") <- object$reml
   class(val) <- "logLik"
   val
+}
+
+#' AIC and BIC of fastglmm fits
+#'
+#' On one fit, the value, as [stats::AIC()] and [stats::BIC()] compute it from
+#' [logLik()][logLik.fastglmm]: `-2 * logLik + k * df`, with `k = 2` for AIC
+#' and `log(nobs)` for BIC. On a REML fit (a Gaussian mixed model fitted by
+#' REML, or an OLS fit made with `REML = TRUE`) the value is built on the REML
+#' log-likelihood, as lme4's `AIC()` on a REML fit.
+#'
+#' On several fits, the `stats` table (`df` and `AIC` or `BIC`), except for the
+#' two comparisons that are always wrong, which stop with an error:
+#'
+#' * a REML fit beside an ML fit: the two log-likelihoods are on different
+#'   scales. The error names which fit is which. This holds for the fits of
+#'   other packages in the call too: an lme4 fit is REML when
+#'   `lme4::isREML()` says so, an `lm` or `glm` fit is ML, and any other fit
+#'   whose `logLik()` carries a `REML` attribute is read from it.
+#' * REML fits with different fixed effects: the REML log-likelihood depends on
+#'   the fixed-effects design. The error says to refit both with
+#'   `REML = FALSE`.
+#'
+#' The fixed effects are compared as the sets of fixed terms of the stored
+#' formulas: term order and the spelling of an interaction do not matter, and
+#' `y ~ x` and `y ~ 0 + x` differ. With more than two fits both rules apply to
+#' every pair, the fixed-effects rule to every pair of fastglmm REML fits. ML
+#' fits compare as in `stats`, whatever their fixed parts.
+#'
+#' Four uses are not checked: an AIC built from `logLik()` by hand or by a
+#' package that does not call `AIC()` (`logLik()` returns the REML value with a
+#' `REML = TRUE` attribute); a call whose first argument is not a fastglmm
+#' fit, such as `AIC(m_lm, m_reml)`, which `stats` dispatches to its default
+#' method; the fixed effects of another package's REML fit, such as
+#' `AIC(m_reml, m_lmer)` with different fixed effects (its formula is not
+#' compared); and the estimator of another package's fit that is neither an
+#' lme4, `lm` nor `glm` fit and whose `logLik()` carries no `REML` attribute,
+#' such as an nlme `lme` fit.
+#'
+#' @param object a [fastglmm] fit.
+#' @param ... further fitted models.
+#' @param k the penalty per parameter (AIC only), as in [stats::AIC()].
+#' @return A number for one fit; for several, a `data.frame` with columns `df`
+#'   and `AIC` (or `BIC`), one row per fit.
+#' @export
+AIC.fastglmm <- function(object, ..., k = 2) {
+  .check_ic_fits(list(object, ...), as.list(substitute(list(object, ...)))[-1L], "AIC")
+  NextMethod()
+}
+
+#' @rdname AIC.fastglmm
+#' @export
+BIC.fastglmm <- function(object, ...) {
+  .check_ic_fits(list(object, ...), as.list(substitute(list(object, ...)))[-1L], "BIC")
+  NextMethod()
+}
+
+# Stops on the two comparisons AIC()/BIC() refuse. `exprs` are the call's
+# unevaluated argument expressions; only an error deparses them, so a
+# do.call() with fits passed by value never deparses a whole fit. The stored
+# formula is one string (fastglmm()'s f_str), as the Rust check needs.
+.check_ic_fits <- function(fits, exprs, what) {
+  if (length(fits) < 2L) return(invisible())
+  label <- function(i) {
+    e <- exprs[[i]]
+    if (is.symbol(e) || is.call(e)) {
+      s <- deparse1(e)
+      if (nchar(s) <= 60L) return(s)
+    }
+    paste("fit", i)
+  }
+  reml <- vapply(fits, .fit_is_reml, NA)
+  if (any(reml, na.rm = TRUE) && !all(reml, na.rm = TRUE)) {
+    stop(sprintf("%s was fitted by REML and %s by ML. Fit both the same way.",
+                 label(which(reml)[1L]), label(which(!reml)[1L])), call. = FALSE)
+  }
+  # The fixed parts are compared on fastglmm REML fits only: another
+  # package's formula is not in the form the Rust check reads.
+  ours <- which(vapply(fits, inherits, NA, what = "fastglmm") & reml %in% TRUE)
+  # "Same fixed part" is an equivalence, so checking each fit against the
+  # first checks every pair.
+  for (i in ours[-1L]) {
+    if (!fastglmm_same_fixed_part(fits[[ours[1L]]]$formula, fits[[i]]$formula)) {
+      stop(sprintf(paste0("%s and %s are REML fits with different fixed effects, and ",
+                          "REML fits with different fixed effects cannot be compared ",
+                          "by %s. Refit both with REML = FALSE."),
+                   label(ours[1L]), label(i), what), call. = FALSE)
+    }
+  }
+  invisible()
+}
+
+# TRUE for a REML fit, FALSE for an ML fit, NA when the estimator cannot be
+# read. lme4's logLik() carries no REML attribute, so a merMod is read with
+# lme4's isREML(). lme4 is not a dependency and is never loaded from here:
+# its isREML() is used only when lme4 is already loaded, as it must be for
+# stats::AIC() to reach logLik() on a merMod at all. stats' logLik() of an
+# lm or glm fit is the ML value.
+.fit_is_reml <- function(x) {
+  if (inherits(x, "fastglmm")) return(isTRUE(x$reml))
+  if (inherits(x, "merMod")) {
+    if (!isNamespaceLoaded("lme4")) return(NA)
+    return(isTRUE(getExportedValue("lme4", "isREML")(x)))
+  }
+  if (inherits(x, "lm")) return(FALSE)
+  r <- attr(stats::logLik(x), "REML")
+  if (isTRUE(r)) TRUE else if (isFALSE(r)) FALSE else NA
 }
 
 # -- broom-shaped accessors. Registered on `generics::tidy`/`generics::glance`

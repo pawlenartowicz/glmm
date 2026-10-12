@@ -33,8 +33,9 @@ straight from the kernel's \code{varcorr} (validated against lme4's \code{VarCor
 }
 \details{
 For a \strong{gaussian} mixed fit a \code{Residual} row is printed after the group
-components, as in lme4, carrying \code{sigma()} (the REML residual standard
-deviation the kernel reports as \code{dispersion}).
+components, as in lme4, carrying \code{sigma()} (the residual standard deviation
+of the fitted criterion, REML or ML with \code{REML = FALSE}, that the kernel
+reports as \code{dispersion}).
 
 Adds a method to \code{nlme::VarCorr}, the generic \code{lme4::VarCorr} also uses
 (lme4 adds methods to nlme's generic rather than declaring its own), so a

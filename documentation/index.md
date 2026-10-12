@@ -11,14 +11,14 @@ an analytic gradient where one is available (LMMs with random slopes on
 their only grouping factor; binomial, Poisson and Gamma GLMMs fitted by the
 Laplace approximation; logit and probit binomial and Poisson GLMMs with a
 random intercept only and fewer than 50 rows per group, fitted by adaptive
-quadrature). It is REML-locked for Gaussian mixed models (no ML switch),
-validation-pinned against those frozen oracles, which are never
+quadrature). It fits Gaussian mixed models by REML by default and by ML on
+request, is validation-pinned against those frozen oracles, which are never
 relaxed to match a disagreement, and WASM-ready (the fit
 path carries no `unsafe`, no RNG, no global state, no I/O, and compiles
 unmodified to `wasm32`). It deliberately is **not** a general inference
 toolkit: no `predict`, no conditional variances for the random effects, no
 profile or bootstrap confidence intervals, no
-small-sample degrees-of-freedom corrections, and fewer families than
+Kenward-Roger df and no small-sample correction off Gaussian LMMs, and fewer families than
 glmmTMB/GLMMadaptive — anything the engine cannot compute honestly errors with
 the reason instead of guessing, and for one interactive model on one dataset,
 lme4 or its neighbours remain the right tool. What it is built for instead is
@@ -52,6 +52,6 @@ a zero-allocation, warm-startable workspace.
 | Reference | [`warnings.md`](warnings.md) | Every warning a fit raises (tier, title, message, and the stored `m.warnings` / `m$warnings` entry) and every error a call can raise |
 | Reference | [`validation.md`](validation.md) | How glmm is validated against lme4, glmmTMB, MixedModels.jl and GLMMadaptive, what's covered, and known tolerances/exemptions |
 | Internals | [`algorithms.md`](algorithms.md) | Algorithm map entry point: full dispatch graph, knob index, OLS/GLM paths |
-| Internals | [`algorithms-lmm.md`](algorithms-lmm.md) | LMM: θ-Cholesky, profiled REML, closed-form shortcut, BOBYQA, boundary handling |
+| Internals | [`algorithms-lmm.md`](algorithms-lmm.md) | LMM: θ-Cholesky, profiled REML and ML, closed-form shortcut, BOBYQA, boundary handling |
 | Internals | [`algorithms-glmm.md`](algorithms-glmm.md) | GLMM: PIRLS, Laplace vs AGQ, dense vs sparse Z, NB outer loop, warm starts |
 | Internals | [`glmm-design.md`](glmm-design.md) | Algorithmic design rationale: the differences from lme4/MixedModels.jl and why each one is faster |

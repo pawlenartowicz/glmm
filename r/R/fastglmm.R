@@ -37,9 +37,10 @@
 #'
 #' One entry point for the whole `glmm` engine, dispatching on `family` the way
 #' the kernel itself does: OLS (`gaussian` without random effects), GLM
-#' (binomial/poisson/gamma/negative-binomial without random effects), REML LMM
-#' (`gaussian` with random effects), and GLMM (Laplace or adaptive
-#' Gauss-Hermite) - there is no `lmer`/`glmer` split.
+#' (binomial/poisson/gamma/negative-binomial without random effects), LMM
+#' (`gaussian` with random effects; REML by default, ML with `REML = FALSE`),
+#' and GLMM (Laplace or adaptive Gauss-Hermite) - there is no `lmer`/`glmer`
+#' split.
 #'
 #' The formula is parsed by the same Rust parser the Python port uses. Besides
 #' bare column names, it accepts `log(x)`, `sqrt(x)`, `exp(x)`, and `I(x^k)`
@@ -94,10 +95,10 @@
 #' them without matching message text.
 #'
 #' Anything the engine cannot do is an error naming the reason - never a
-#' silently different model. That includes `REML = FALSE` on a Gaussian mixed
-#' model (the LMM path is REML-only **by design**), `REML = TRUE` on any other
-#' model (fitted by maximum likelihood), `control=`/`verbose=`, and quasi-likelihood
-#' `dispersion=` on binomial/poisson.
+#' silently different model. That includes `control=`/`verbose=` and
+#' quasi-likelihood `dispersion=` on binomial/poisson. `REML = TRUE` on a model
+#' that is not Gaussian does not apply (the model is fitted by maximum
+#' likelihood): it is ignored with a warning, as an inapplicable `nAGQ` is.
 #'
 #' @param formula an lme4-style model formula (or a string), e.g.
 #'   `y ~ t + d + t:d + (1 + t | g)`. See Details for what the shared parser
@@ -159,13 +160,17 @@
 #'   then use z and normal quantiles and say "df not computed", and
 #'   `$df_method` is `"disabled"`. OLS and the Gamma and inverse-Gaussian GLMs
 #'   keep their residual df whatever it says.
-#' @param ... intercepted, never silently swallowed. `REML` is checked against
-#'   the model: `REML = TRUE` is accepted only on a Gaussian mixed model (the
-#'   one model with a REML objective) and errors elsewhere, `REML = FALSE` is
-#'   accepted everywhere else (those models are fitted by maximum likelihood)
-#'   and errors there. The other known lme4 arguments (`control`, `verbose`,
-#'   `contrasts`) raise errors saying why they cannot be honored; unknown names
-#'   error as unused arguments.
+#' @param REML `NULL` (the default), `TRUE` or `FALSE`; `$reml` reports the
+#'   value used. A Gaussian mixed model is fitted by REML under `NULL` and
+#'   `TRUE` and by maximum likelihood under `FALSE`. A Gaussian model with no
+#'   random effects (OLS, including a formula whose every grouping was dropped
+#'   as single-level) has the same estimates under every value: `TRUE` reports
+#'   the REML log-likelihood (as `logLik(lm, REML = TRUE)`), `NULL` and `FALSE`
+#'   the ML one. Every other family is fitted by maximum likelihood, and
+#'   `TRUE` there is ignored with a `"fastglmm_argument_ignored"` warning.
+#' @param ... intercepted, never silently swallowed. The known lme4 arguments
+#'   (`control`, `verbose`, `contrasts`) raise errors saying why they cannot
+#'   be honored; unknown names error as unused arguments.
 #'
 #' @return An object of class `"fastglmm"`: fixed effects ([fixef]), Wald
 #'   covariance (`vcov()`), variance components on the SD/correlation scale
@@ -182,8 +187,9 @@
 #'   `print()`, [summary()][summary.fastglmm], [confint()][confint.fastglmm]
 #'   (Wald), `nobs()`, [formula()][formula.fastglmm] (returns the formula
 #'   **string**), `family()`, `model.frame()`, [ranef()][ranef.fastglmm],
-#'   `fitted()`, `residuals()`, and [logLik()][logLik.fastglmm] (so `AIC()`
-#'   and `BIC()` work). The blocked accessors (`predict`, `coef`, `terms`)
+#'   `fitted()`, `residuals()`, [logLik()][logLik.fastglmm], and
+#'   [AIC()][AIC.fastglmm] and `BIC()` (which refuse a REML fit beside an ML
+#'   one, and REML fits with different fixed effects). The blocked accessors (`predict`, `coef`, `terms`)
 #'   error with the reason.
 #'
 #' @examples
@@ -209,12 +215,14 @@ fastglmm <- function(formula, data, family = gaussian(),
                      dispersion = NULL,
                      init.theta = NULL,
                      satterthwaite = TRUE,
+                     REML = NULL,
                      ...) {
   .check_dots(...)
   if (!(is.logical(satterthwaite) && length(satterthwaite) == 1L && !is.na(satterthwaite))) {
     stop(sprintf("satterthwaite must be TRUE or FALSE, got %s", .arg_repr(satterthwaite)),
          call. = FALSE)
   }
+  .check_reml(REML)
   # Captured before `data` is touched: the header's `Data:` line, as lme4
   # deparses it.
   data_name <- paste(deparse(substitute(data), width.cutoff = 500L), collapse = " ")
@@ -229,8 +237,6 @@ fastglmm <- function(formula, data, family = gaussian(),
   fam <- .normalize_family(family)
 
   mixed <- grepl("|", f_str, fixed = TRUE)
-  reml <- list(...)[["REML"]]
-  .check_reml(reml, fam$name, mixed)
   if (identical(fam$name, "inversegaussian") && mixed) {
     stop("family 'inversegaussian' is GLM-only: random-effect terms are not supported",
          call. = FALSE)
@@ -462,7 +468,8 @@ fastglmm <- function(formula, data, family = gaussian(),
     as.double(start$beta %||% double()),
     as.double(start$theta %||% double()),
     as.double(start$dispersion %||% double()),
-    satterthwaite
+    satterthwaite,
+    if (is.null(REML)) logical() else REML
   )
 
   # Whether the FITTED model actually has random effects - not `mixed`, which
@@ -490,6 +497,14 @@ fastglmm <- function(formula, data, family = gaussian(),
       "without adaptive quadrature."), nAGQ, .AGQ_FAMILIES),
       c("fastglmm_agq_fallback", "fastglmm_diagnostic"))
   }
+  if (!is.null(r$reml_warning)) {
+    # Decided by the shared rule in run_fit (src/orchestrate.rs), on the model
+    # actually fitted; worded here, as for nAGQ above, in this port's spelling.
+    # Mirrors the Python port's reml_warning block - change together.
+    .warn_keep(store, "argument_ignored", paste(
+      "REML = TRUE applies only to Gaussian models; it was ignored and the model was",
+      "fitted by maximum likelihood."), ignored)
+  }
   # Singularity is not assessed on a fit that did not converge: the kernel never sets
   # `singular` there (the post-hoc check and the boundary flags are gated on
   # `converged`), so `r$singular` reads FALSE on a non-converged fit. `isTRUE(r$converged)`
@@ -506,13 +521,6 @@ fastglmm <- function(formula, data, family = gaussian(),
   for (note in r$notes) {
     out <- .note_warning(note, r$names, r$converged)
     if (!is.null(out)) .warn_keep(store, note$kind, out$msg, out$cls)
-  }
-  # .check_reml() let REML = TRUE through on the formula; the fitted model has
-  # the last word (after the notes, so the dropped-grouping warning explains it).
-  if (isTRUE(reml) && !fitted_mixed) {
-    stop("REML = TRUE applies only to Gaussian mixed models; this model is ",
-         "fitted by maximum likelihood (every random-effect term was dropped).",
-         call. = FALSE)
   }
   if (!isTRUE(r$converged)) {
     out <- .nonconvergence(fam$name, fitted_mixed, r$notes, r$beta, r$aliased, r$deviance, r$y,
@@ -611,8 +619,9 @@ fastglmm <- function(formula, data, family = gaussian(),
     outer_stop = r$outer_stop,
     outer_decrement = r$outer_decrement,
     deviance = r$deviance,
-    # logLik()/AIC()/BIC() inputs. `reml` marks the LMM paths, whose `loglik`
-    # is a REML criterion rather than an ML one - see logLik.fastglmm().
+    # logLik()/AIC()/BIC() inputs. `reml` says the `loglik` is a REML criterion
+    # (a Gaussian mixed model fitted by REML, or an OLS fit made with
+    # REML = TRUE) rather than an ML one; see logLik.fastglmm().
     loglik = r$loglik,
     df = as.integer(r$df),
     reml = r$reml,
@@ -1014,8 +1023,6 @@ fastglmm <- function(formula, data, family = gaussian(),
   nms <- names(dots) %||% rep("", length(dots))
   for (nm in nms) {
     switch(nm,
-      # Checked by .check_reml() once the family and RE terms are known.
-      REML = NULL,
       control = stop("control= is not supported: the optimizer (BOBYQA) ",
                      "settings are compiled into the glmm kernel; ",
                      "accepting-and-ignoring them is not acceptable",
@@ -1034,32 +1041,15 @@ fastglmm <- function(formula, data, family = gaussian(),
   invisible()
 }
 
-# lme4's `REML =`, checked against the model: only a Gaussian mixed model has
-# a REML objective, and REML is the only criterion it is fitted by. Every other
-# model is fitted by maximum likelihood, so there `REML = FALSE` is a no-op and
-# `REML = TRUE` an error (Decision 5: error, never silently differ).
-#
-# `mixed` is read off the formula, before lowering. A formula whose every
-# grouping has a single level is dropped to a fixed-effects fit, which only
-# the fitted model shows: fastglmm() re-checks REML = TRUE against it after
-# the fit. REML = FALSE on such a formula is still refused here, before the
-# fit, so asking for ML on a real LMM never pays for a fit to learn it is
-# unsupported; the cost is a spurious (never a silent) error in that rare
-# all-groupings-dropped case.
-.check_reml <- function(reml, fam_name, mixed) {
+# lme4's `REML =`: only the type is checked here. What each value means on
+# the model actually fitted (after lowering, so a formula whose every grouping
+# was dropped counts as OLS) is decided once, by the shared rule in run_fit
+# (src/orchestrate.rs), for both ports.
+.check_reml <- function(reml) {
   if (is.null(reml)) return(invisible())
   if (!(is.logical(reml) && length(reml) == 1L && !is.na(reml))) {
-    stop(sprintf("REML must be TRUE or FALSE, got %s", .arg_repr(reml)),
+    stop(sprintf("REML must be NULL, TRUE or FALSE, got %s", .arg_repr(reml)),
          call. = FALSE)
-  }
-  lmm <- identical(fam_name, "gaussian") && mixed
-  if (reml && !lmm) {
-    stop("REML = TRUE applies only to Gaussian mixed models; this model is ",
-         "fitted by maximum likelihood.", call. = FALSE)
-  }
-  if (!reml && lmm) {
-    stop("REML = FALSE is not supported: the glmm LMM path is REML-only ",
-         "by design, a permanent choice, not a gap", call. = FALSE)
   }
   invisible()
 }

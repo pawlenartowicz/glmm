@@ -22,7 +22,7 @@ generalized linear mixed models.
 - **Fast.** Faster than every other engine on every model, usually 10 to 100 times,
   without RAM blowup.
 
-On all tested models: a 794-model validation grid, checked for every release.
+On all tested models: a 923-model validation grid, checked for every release.
 
 **Beta.** Some lme4 features are still missing (see [`docs`](documentation/)).
 Version 1.0 will add a built-in test for whether a random effect matters —
@@ -47,7 +47,7 @@ flowchart LR
     FAM1 -- "Gaussian" --> OLS["OLS - WLS with weights"]
     FAM1 -- "other" --> GLM["GLM - IRLS"]
     RE -- "Some" --> FAM2{"family?"}
-    FAM2 -- "Gaussian" --> LMM["LMM - profiled REML"]
+    FAM2 -- "Gaussian" --> LMM["LMM - profiled REML (default) or ML"]
     FAM2 -- "other" --> GLMM["GLMM - PIRLS, Laplace/AGQ"]
 ```
 
@@ -72,7 +72,7 @@ README's own copy of the essentials, not the whole set.
 | [`documentation/tutorial-r.md`](documentation/tutorial-r.md) | The R package (`fastglmm`) walkthrough |
 | [`documentation/supported_families.md`](documentation/supported_families.md) | Family × link support matrix, canonical-link notes, dispersion conventions |
 | [`documentation/algorithms.md`](documentation/algorithms.md) | Algorithm map entry point: full dispatch graph, knob index, OLS/GLM paths |
-| [`documentation/algorithms-lmm.md`](documentation/algorithms-lmm.md) | LMM: θ-Cholesky, profiled REML, closed-form shortcut, BOBYQA, boundary handling |
+| [`documentation/algorithms-lmm.md`](documentation/algorithms-lmm.md) | LMM: θ-Cholesky, profiled REML and ML, closed-form shortcut, BOBYQA, boundary handling |
 | [`documentation/algorithms-glmm.md`](documentation/algorithms-glmm.md) | GLMM: PIRLS, Laplace vs AGQ, dense vs sparse Z, NB outer loop, warm starts |
 | [`documentation/glmm-design.md`](documentation/glmm-design.md) | Algorithmic design rationale: the differences from lme4/MixedModels.jl and why each one is faster |
 | [`documentation/installation.md`](documentation/installation.md) | Installing the Rust crate, Python package, and R package |
@@ -169,7 +169,7 @@ See the [R README](r/README.md) and
 |----------------|--------------------------------------------------------------------|
 | No `unsafe`    | zero `unsafe` (workspace baseline `unsafe_code = "warn"`)           |
 | Deterministic  | no RNG, no global state, no I/O in the fit path                     |
-| Reproducible   | the same model fitted on Linux (x86-64), macOS (Apple silicon) or in WebAssembly gives the same fit: across the 794 validation models the log-likelihoods differ by at most 3e-7 (typically 1e-11), and estimates typically agree to 8 significant digits. A WebAssembly build gives bit-identical results on both machines tested. |
+| Reproducible   | the same model fitted on Linux (x86-64), macOS (Apple silicon) or in WebAssembly gives the same fit: across the 794 validation models measured (the grid before its 129 ML twins) the log-likelihoods differ by at most 3e-7 (typically 1e-11), and estimates typically agree to 8 significant digits. A WebAssembly build gives bit-identical results on both machines tested. |
 | Linear algebra | [`faer`](https://crates.io/crates/faer) 0.24, pinned               |
 | MSRV           | Rust 1.85 (floor set by the `bobyqa` dep)                          |
 

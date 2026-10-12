@@ -1981,10 +1981,26 @@ fn loop_satterthwaite_matches_stable_coef_df() {
     let (x, y, n, p, model, ids, mut opts) = lmm_slope_case();
     // One target of two, so the NaN off the targets is checked too.
     opts.target_indices = vec![1];
+    // Each case also as an ML draw: the loop tier reads ν from the
+    // workspace's criterion as the stable path does.
+    let ml = |(x, y, n, p, model, ids, opts): (_, _, _, _, _, _, FitOptions)| {
+        let opts = FitOptions {
+            reml: Some(false),
+            ..opts
+        };
+        (x, y, n, p, model, ids, opts)
+    };
+    let slope = (x, y, n, p, model, ids, opts);
     let cases = [
-        ("slope (dense)", (x, y, n, p, model, ids, opts)),
+        ("slope (dense)", slope.clone()),
         ("intercept (dense)", lmm_intercept_case()),
         ("crossed slope (sparse)", crossed_extra_case(vec![1])),
+        ("slope (dense), ML", ml(slope)),
+        ("intercept (dense), ML", ml(lmm_intercept_case())),
+        (
+            "crossed slope (sparse), ML",
+            ml(crossed_extra_case(vec![1])),
+        ),
     ];
     for (tag, (x, y, n, p, model, ids, opts)) in cases {
         let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
@@ -2077,6 +2093,46 @@ fn satterthwaite_and_curvature_hint_commute() {
         assert_eq!(fit_bits(&after), fit_bits(&clean), "the fit after the pass");
         ws_c = fresh();
     }
+}
+
+/// A curvature hint taken on a REML pilot only seeds the BFGS search of an ML
+/// fit (`lmm::lmm_curvature_hint`): the hinted fit is by ML and reaches the
+/// unhinted ML fit's optimum.
+#[test]
+fn a_reml_curvature_hint_seeds_an_ml_fit() {
+    let (x, y, n, p, model, ids, opts) = lmm_slope_case();
+    let y = slope_free_response(&x, &y);
+    let (sized, ids, perm) = spec_sized_from_ids_pub(&model, &ids);
+    let mut pilot = build_workspace(&sized, perm, n, p, &opts);
+    let reml =
+        fit_on(&mut pilot, &x, &y, &ids, None, &opts).into_fit(&x, &y, &ids, n, p, &model, &opts);
+    let hint = super::curvature_hint(&mut pilot).expect("the per-group route gives a hint");
+    let ml = FitOptions {
+        reml: Some(false),
+        ..opts.clone()
+    };
+    let fit_ml = |hint: Option<&crate::optim::CurvatureHint>| {
+        let mut ws = build_workspace(&sized, perm, n, p, &ml);
+        super::fit_on_hinted(&mut ws, &x, &y, &ids, None, hint, &ml)
+            .into_fit(&x, &y, &ids, n, p, &model, &ml)
+    };
+    let (hinted, plain) = (fit_ml(Some(&hint)), fit_ml(None));
+    assert!(reml.reml && !hinted.reml && !plain.reml);
+    assert!(hinted.converged() && plain.converged());
+    assert!(
+        hinted.deviance <= plain.deviance + 1e-6,
+        "hinted {} vs unhinted {}",
+        hinted.deviance,
+        plain.deviance
+    );
+    // The criterion moved the optimum: a search that read the hint's criterion
+    // would land on the REML θ̂.
+    assert!(
+        (hinted.loglik - reml.loglik).abs() > 1e-3,
+        "{} {}",
+        hinted.loglik,
+        reml.loglik
+    );
 }
 
 #[test]
@@ -2277,4 +2333,190 @@ fn satterthwaite_repeat_calls_bounded_alloc() {
         (bound, bound, bound_none),
         "{N_CALLS} fit_on plus satterthwaite calls on each draw allocated these blocks"
     );
+}
+
+// --- the `reml` option and the frozen criterion ---
+
+/// Every field of two fits equal, each `f64` by its bits.
+pub(in crate::fit) fn assert_fits_bitwise_equal(a: &crate::Fit, b: &crate::Fit, ctx: &str) {
+    let bits = |v: &[f64]| v.iter().map(|t| t.to_bits()).collect::<Vec<_>>();
+    assert_eq!(
+        fit_bits(a),
+        fit_bits(b),
+        "{ctx}: β, SE, vcov, τ², varcorr, φ, deviance"
+    );
+    for (name, u, v) in [
+        ("stddev_se", &a.stddev_se, &b.stddev_se),
+        ("fitted", &a.fitted, &b.fitted),
+        ("ranef", &a.ranef, &b.ranef),
+        ("coef_df", &a.coef_df, &b.coef_df),
+    ] {
+        assert_eq!(bits(u), bits(v), "{ctx}: {name}");
+    }
+    assert_eq!(a.loglik.to_bits(), b.loglik.to_bits(), "{ctx}: loglik");
+    assert_eq!(
+        (a.n_eval, a.df, a.reml, &a.ranef_levels),
+        (b.n_eval, b.df, b.reml, &b.ranef_levels),
+        "{ctx}: n_eval, df, reml, ranef_levels"
+    );
+    assert_eq!(
+        format!("{:?}", a.diagnostics),
+        format!("{:?}", b.diagnostics),
+        "{ctx}: diagnostics"
+    );
+    #[cfg(feature = "counters")]
+    assert_eq!(
+        format!("{:?}", a.counters),
+        format!("{:?}", b.counters),
+        "{ctx}: counters"
+    );
+    assert_eq!(
+        a.satterthwaite.is_some(),
+        b.satterthwaite.is_some(),
+        "{ctx}: Satterthwaite state"
+    );
+}
+
+/// `reml` is never read on a GLMM: an AGQ binomial fit under `Some(true)`
+/// (ignored) and under `Some(false)` does not panic and is bitwise the
+/// `None` fit.
+#[test]
+fn reml_on_an_agq_glmm_gives_the_none_fit() {
+    let (x, y, primary, n) = crate::fit::glmm_tests::cbpp_design();
+    let p = 4;
+    let model = crate::fit::glmm_tests::cbpp_model();
+    let ids = GroupIds {
+        primary,
+        extra: vec![],
+    };
+    let mut opts = FitOptions {
+        target_indices: (0..p as u32).collect(),
+        nagq: 5,
+        ..FitOptions::default()
+    };
+    let base = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    assert!(base.converged());
+    for reml in [Some(true), Some(false)] {
+        opts.reml = reml;
+        let fit = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+        assert_fits_bitwise_equal(&fit, &base, &format!("reml = {reml:?}"));
+    }
+}
+
+/// The criterion is frozen at build, as `nagq` is: a Gaussian mixed
+/// workspace built under `Some(false)` refuses a call under `None`.
+#[test]
+#[should_panic(expected = "fit_on: reml is frozen at build")]
+fn fit_on_panics_when_the_criterion_moves_off_its_build() {
+    let (x, y, n, p, model, ids, mut opts) = lmm_intercept_case();
+    let (sized, ids, perm) = spec_sized_from_ids_pub(&model, &ids);
+    opts.reml = Some(false);
+    let mut ws = build_workspace(&sized, perm, n, p, &opts);
+    opts.reml = None;
+    let _ = fit_on(&mut ws, &x, &y, &ids, None, &opts);
+}
+
+/// On a Gaussian mixed spec `reml` resolves to REML for `None` and
+/// `Some(true)` and to ML for `Some(false)`, and the LMM kernel carries it,
+/// dense and sparse.
+#[test]
+fn reml_resolves_to_the_criterion_the_lmm_kernel_carries() {
+    use crate::lmm::Criterion;
+    let cases = [
+        ("dense", lmm_intercept_case()),
+        ("sparse", crossed_extra_case(vec![1])),
+    ];
+    for (tag, (x, y, n, p, model, ids, mut opts)) in cases {
+        let (sized, ids, perm) = spec_sized_from_ids_pub(&model, &ids);
+        for (reml, want) in [
+            (None, Criterion::Reml),
+            (Some(true), Criterion::Reml),
+            (Some(false), Criterion::Ml),
+        ] {
+            opts.reml = reml;
+            let mut ws = build_workspace(&sized, perm, n, p, &opts);
+            assert_eq!(ws.criterion, Some(want), "{tag}, reml = {reml:?}: build");
+            let _ = fit_on(&mut ws, &x, &y, &ids, None, &opts);
+            assert_eq!(
+                ws.kernel_criterion(),
+                Some(want),
+                "{tag}, reml = {reml:?}: kernel"
+            );
+        }
+    }
+}
+
+/// What is frozen is the resolved criterion, not the raw option: a workspace
+/// built under `None` takes `Some(true)` and `Some(false)` on a GLM and a GLMM,
+/// and `Some(true)` on a Gaussian mixed model, without the frozen-option panic,
+/// and gives the fit of a call under `None`, bit for bit.
+#[test]
+fn reml_values_resolving_alike_pass_the_frozen_check() {
+    let cases = [
+        ("glm", glm_case(), vec![Some(true), Some(false)]),
+        (
+            "glmm",
+            glmm_binomial_intercept_case(),
+            vec![Some(true), Some(false)],
+        ),
+        ("lmm", lmm_intercept_case(), vec![Some(true)]),
+    ];
+    for (tag, (x, y, n, p, model, ids, opts), calls) in cases {
+        let (sized, ids, perm) = spec_sized_from_ids_pub(&model, &ids);
+        let fit = |call: &FitOptions| {
+            let mut ws = build_workspace(&sized, perm, n, p, &opts);
+            fit_on(&mut ws, &x, &y, &ids, None, call).into_fit(&x, &y, &ids, n, p, &model, call)
+        };
+        let base = fit(&opts);
+        for reml in calls {
+            let call = FitOptions {
+                reml,
+                ..opts.clone()
+            };
+            assert_fits_bitwise_equal(&fit(&call), &base, &format!("{tag}, reml = {reml:?}"));
+        }
+    }
+}
+
+/// On OLS `reml` is read when the `Fit` is assembled, from the `opts` handed to
+/// `into_fit`, and nothing is frozen at build: the solve does not depend on it.
+/// A workspace built under one value and called under another gives the fit of
+/// a workspace built under the called value, bit for bit.
+#[test]
+fn ols_workspace_reads_reml_at_assembly() {
+    let (x, y, n, p, model, ids, opts) = ols_case();
+    let fit = |built: Option<bool>, called: Option<bool>| {
+        let mut ws = build_workspace(
+            &model,
+            Perm::IDENTITY,
+            n,
+            p,
+            &FitOptions {
+                reml: built,
+                ..opts.clone()
+            },
+        );
+        let call = FitOptions {
+            reml: called,
+            ..opts.clone()
+        };
+        fit_on(&mut ws, &x, &y, &ids, None, &call).into_fit(&x, &y, &ids, n, p, &model, &call)
+    };
+    for (built, called) in [
+        (None, Some(true)),
+        (Some(true), None),
+        (Some(false), Some(true)),
+    ] {
+        let got = fit(built, called);
+        assert_eq!(
+            got.reml,
+            called == Some(true),
+            "built {built:?}, called {called:?}"
+        );
+        assert_fits_bitwise_equal(
+            &got,
+            &fit(called, called),
+            &format!("built {built:?}, called {called:?}"),
+        );
+    }
 }

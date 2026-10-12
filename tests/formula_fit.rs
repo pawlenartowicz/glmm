@@ -1347,6 +1347,7 @@ fn run_fit_returns_lowered_response_and_nobs() {
         None,
         None,
         true,
+        None,
     )
     .unwrap();
     assert_eq!(r.nobs, 6);
@@ -1356,4 +1357,295 @@ fn run_fit_returns_lowered_response_and_nobs() {
         .map(|(s, f)| s / (s + f))
         .collect();
     assert_eq!(r.y, expected);
+}
+
+/// The `reml` rule of `run_fit`, decided on the lowered model: `Some(true)` on a
+/// non-Gaussian family is stripped with `reml_warning` set, and every other
+/// value reaches `FitOptions::reml`. "The same fit" here means bitwise.
+#[cfg(feature = "orchestrate")]
+mod reml_rule {
+    use super::*;
+    use glmm::orchestrate::FitResult;
+
+    const GLMM: &str = "cbind(incidence, healthy) ~ period + (1 | herd)";
+    const LMM: &str = "Reaction ~ Days + (1 | Subject)";
+    const OLS: &str = "Reaction ~ Days";
+
+    /// A factor column of `n` rows and a single level.
+    fn one_level(n: usize) -> Column {
+        Column::factor_from_labels(&vec!["a".to_string(); n])
+    }
+
+    /// sleepstudy, plus `one`, a grouping column of a single level.
+    fn sleepstudy() -> Table {
+        let data = rows(include_str!("../validation/data/empirical/sleepstudy.csv"));
+        let n = data.len();
+        Table {
+            columns: vec![
+                ("Reaction".into(), numeric(&data, 0)),
+                ("Days".into(), numeric(&data, 1)),
+                ("Subject".into(), factor(&data, 2)),
+                ("one".into(), one_level(n)),
+            ],
+            n,
+        }
+    }
+
+    /// cbpp in its aggregated form (`healthy = size − incidence`), plus `one`.
+    fn cbpp() -> Table {
+        let data = rows(include_str!("../validation/data/empirical/cbpp.csv"));
+        let n = data.len();
+        let incidence = nums(&data, 1);
+        let healthy = nums(&data, 2)
+            .iter()
+            .zip(&incidence)
+            .map(|(s, i)| s - i)
+            .collect();
+        Table {
+            columns: vec![
+                ("incidence".into(), Column::Numeric(incidence)),
+                ("healthy".into(), Column::Numeric(healthy)),
+                ("period".into(), factor(&data, 3)),
+                ("herd".into(), factor(&data, 0)),
+                ("one".into(), one_level(n)),
+            ],
+            n,
+        }
+    }
+
+    /// `run_fit` on `table`'s columns with Hessian SEs, Laplace and the
+    /// Satterthwaite pass on.
+    fn run(
+        formula: &str,
+        table: &Table,
+        family: &str,
+        link: &str,
+        reml: Option<bool>,
+    ) -> FitResult {
+        let (mut numeric, mut factors) = (HashMap::new(), HashMap::new());
+        for (name, col) in &table.columns {
+            match col {
+                Column::Numeric(v) => {
+                    numeric.insert(name.clone(), v.clone());
+                }
+                Column::Factor { levels, codes } => {
+                    factors.insert(name.clone(), (levels.clone(), codes.clone()));
+                }
+            }
+        }
+        run_fit(
+            formula, numeric, factors, family, link, "hessian", 1, None, None, None, None, true,
+            reml,
+        )
+        .unwrap_or_else(|e| panic!("{formula}, reml {reml:?}: {e}"))
+    }
+
+    fn gaussian(formula: &str, reml: Option<bool>) -> FitResult {
+        run(formula, &sleepstudy(), "gaussian", "identity", reml)
+    }
+
+    fn binomial(formula: &str, reml: Option<bool>) -> FitResult {
+        run(formula, &cbpp(), "binomial", "logit", reml)
+    }
+
+    /// `fit_cold` on the lowered formula with `FitOptions::reml` set.
+    fn cold(formula: &str, table: &Table, family: Family, reml: Option<bool>) -> Fit {
+        let mut lo = lower(formula, table, family).unwrap();
+        lo.opts.reml = reml;
+        fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts)
+    }
+
+    fn bits(v: &[f64]) -> Vec<u64> {
+        v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    /// Every `f64` a `FitResult` carries, in a fixed order.
+    fn result_f64s(r: &FitResult) -> Vec<f64> {
+        let scalars = [
+            r.dispersion,
+            r.outer_decrement,
+            r.deviance,
+            r.loglik,
+            r.rss,
+            r.r_squared,
+            r.adj_r_squared,
+        ];
+        let vectors = [
+            &r.beta,
+            &r.se,
+            &r.tau2,
+            &r.stddev_se,
+            &r.fitted,
+            &r.ranef,
+            &r.y,
+            &r.coef_df,
+            &r.coef_p,
+        ];
+        scalars
+            .iter()
+            .chain(vectors.into_iter().flatten())
+            .chain(r.vcov.iter().flatten())
+            .chain(r.varcorr.iter().flatten())
+            .chain(r.ranef_blocks.iter().flat_map(|b| &b.3))
+            .chain(r.weights.iter().flatten())
+            .chain(r.notes.iter().map(|n| &n.pivot))
+            .copied()
+            .collect()
+    }
+
+    /// `got` is the fit `want` is: every `f64` by bits, every other field
+    /// through `Debug`, `reml_warning` aside.
+    fn assert_same_result(mut got: FitResult, want: &FitResult, ctx: &str) {
+        assert_eq!(
+            bits(&result_f64s(&got)),
+            bits(&result_f64s(want)),
+            "{ctx}: f64 bits"
+        );
+        got.reml_warning.clone_from(&want.reml_warning);
+        assert_eq!(format!("{got:?}"), format!("{want:?}"), "{ctx}");
+    }
+
+    fn has_dropped_note(r: &FitResult) -> bool {
+        r.notes
+            .iter()
+            .any(|n| n.kind == "single_level_grouping_dropped")
+    }
+
+    #[test]
+    fn run_fit_reml_true_ignored_with_warning_on_binomial_glmm() {
+        let on = binomial(GLMM, Some(true));
+        assert!(on.reml_warning.is_some(), "Some(true) on a GLMM must warn");
+        assert!(!on.reml);
+        assert_same_result(on, &binomial(GLMM, None), "GLMM Some(true) vs None");
+    }
+
+    #[test]
+    fn run_fit_reml_false_silent_on_binomial_glmm() {
+        let off = binomial(GLMM, Some(false));
+        assert_eq!(off.reml_warning, None);
+        assert_same_result(off, &binomial(GLMM, None), "GLMM Some(false) vs None");
+    }
+
+    #[test]
+    fn run_fit_reml_true_on_ols_reports_reml_loglik() {
+        let on = gaussian(OLS, Some(true));
+        let none = gaussian(OLS, None);
+        assert!(on.reml && !none.reml);
+        assert_eq!(on.reml_warning, None);
+        assert_eq!(bits(&on.beta), bits(&none.beta));
+        assert_eq!(bits(&on.se), bits(&none.se));
+        assert_eq!(on.dispersion.to_bits(), none.dispersion.to_bits());
+        let want = cold(OLS, &sleepstudy(), Family::Gaussian, Some(true));
+        assert_eq!(on.loglik.to_bits(), want.loglik.to_bits());
+        assert_ne!(
+            on.loglik, none.loglik,
+            "the REML and ML log-likelihoods differ"
+        );
+    }
+
+    #[test]
+    fn run_fit_reml_true_accepted_on_gaussian_mixed() {
+        let on = gaussian(LMM, Some(true));
+        assert!(on.reml);
+        assert_eq!(on.reml_warning, None);
+        assert_same_result(on, &gaussian(LMM, None), "LMM Some(true) vs None");
+    }
+
+    #[test]
+    fn run_fit_reml_accepted_when_grouping_dropped() {
+        // Gaussian: fitted as OLS, so the OLS row applies.
+        let f = "Reaction ~ Days + (1 | one)";
+        let (none, on, off) = (
+            gaussian(f, None),
+            gaussian(f, Some(true)),
+            gaussian(f, Some(false)),
+        );
+        for r in [&none, &on, &off] {
+            assert!(has_dropped_note(r), "{:?}", r.notes);
+            assert_eq!(r.reml_warning, None);
+        }
+        assert!(on.reml);
+        let want = cold(OLS, &sleepstudy(), Family::Gaussian, Some(true));
+        assert_eq!(on.loglik.to_bits(), want.loglik.to_bits());
+        assert_eq!(bits(&on.beta), bits(&none.beta));
+        assert_eq!(on.dispersion.to_bits(), none.dispersion.to_bits());
+        assert!(!off.reml);
+        assert_same_result(off, &none, "dropped Gaussian Some(false) vs None");
+
+        // Binomial: fitted as a GLM, so the GLM rule applies.
+        let g = "cbind(incidence, healthy) ~ period + (1 | one)";
+        let none = binomial(g, None);
+        let (on, off) = (binomial(g, Some(true)), binomial(g, Some(false)));
+        assert!(has_dropped_note(&none) && has_dropped_note(&on) && has_dropped_note(&off));
+        assert!(on.reml_warning.is_some(), "Some(true) on a GLM must warn");
+        assert_eq!(off.reml_warning, None);
+        assert_same_result(on, &none, "dropped binomial Some(true) vs None");
+        assert_same_result(off, &none, "dropped binomial Some(false) vs None");
+    }
+
+    /// An enum variant as the ports' snake-case string, underscores dropped
+    /// (`AtBoundary` and `"at_boundary"` both give `"atboundary"`).
+    fn flat(name: &str) -> String {
+        name.replace('_', "").to_lowercase()
+    }
+
+    #[test]
+    fn run_fit_reml_false_on_gaussian_mixed_fits_ml() {
+        let r = gaussian(LMM, Some(false));
+        let want = cold(LMM, &sleepstudy(), Family::Gaussian, Some(false));
+        let d = &want.diagnostics;
+        assert!(!r.reml && !want.reml);
+        assert_eq!(r.reml_warning, None);
+        assert_eq!(r.converged, d.converged);
+        assert_eq!(
+            (r.singular, &r.aliased, &r.pinned),
+            (d.singular, &d.aliased, &d.pinned)
+        );
+        assert_eq!((r.n_eval, r.n_grad, r.df), (want.n_eval, d.n_grad, want.df));
+        assert_eq!(r.outer_decrement.to_bits(), d.outer_decrement.to_bits());
+        assert_eq!(flat(r.boundary), flat(&format!("{:?}", d.boundary)));
+        assert_eq!(
+            r.outer_stop.map(flat),
+            d.outer_stop.map(|s| flat(&format!("{s:?}")))
+        );
+        assert_eq!(r.notes.len(), d.notes.len());
+        assert_eq!(bits(&r.beta), bits(&want.beta));
+        assert_eq!(bits(&r.se), bits(&want.se));
+        assert_eq!(bits(&r.tau2), bits(&want.tau2));
+        assert_eq!(bits(&r.stddev_se), bits(&want.stddev_se));
+        assert_eq!(bits(&r.fitted), bits(&want.fitted));
+        assert_eq!(bits(&r.ranef), bits(&want.ranef));
+        assert_eq!(bits(&r.coef_df), bits(&want.coef_df));
+        assert_eq!(r.ranef_levels, want.ranef_levels);
+        // Row by row, so a missing or extra row fails rather than zipping away.
+        let rows = |m: &[Vec<f64>]| m.iter().map(|v| bits(v)).collect::<Vec<_>>();
+        assert_eq!(rows(&r.vcov), rows(&want.vcov));
+        assert_eq!(rows(&r.varcorr), rows(&want.varcorr));
+        assert!(!r.vcov.is_empty() && !r.varcorr.is_empty());
+        for (g, w) in [
+            (r.dispersion, want.dispersion),
+            (r.deviance, want.deviance),
+            (r.loglik, want.loglik),
+        ] {
+            assert_eq!(g.to_bits(), w.to_bits());
+        }
+        // `coef_p` is the t test on each unit vector; `rss` is OLS only.
+        let p = want.beta.len();
+        let coef_p: Vec<f64> = (0..p)
+            .map(|j| {
+                let mut e = vec![0.0; p];
+                e[j] = 1.0;
+                want.contrast_t(&e).map_or(f64::NAN, |t| t.p_value)
+            })
+            .collect();
+        assert_eq!(bits(&r.coef_p), bits(&coef_p));
+        assert!(r.rss.is_nan());
+        assert_eq!(r.df_method, "satterthwaite");
+        assert!(r
+            .coef_df
+            .iter()
+            .all(|&v| v.is_finite() && v <= r.nobs as f64));
+        // The ML fit is not the REML one.
+        assert_ne!(r.loglik, gaussian(LMM, None).loglik);
+    }
 }

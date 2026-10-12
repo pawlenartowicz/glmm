@@ -1,5 +1,6 @@
 //! Gate 1's per-term rows: lmerTest's Type III and Type II tables (the
-//! REML `lmertest_anova_*` references, `proposal_dependent: true`) against the
+//! `lmertest_anova_*` references, `proposal_dependent: true`, on REML fits and,
+//! as the `_ml` ones, on ML fits, each fitted under its own `reml`) against the
 //! crate's hypothesis matrices through the contest layer, in both parts of
 //! gate 1. At lme4's θ̂: the pass at the reference's θ̂ (its twin's) on each
 //! route the fit can take (the value route, and the gradient route on a
@@ -23,7 +24,7 @@ use super::hypotheses::{type2_xtx, type3, TermHypothesis};
 use crate::inference::contest::{contest_md, ContestInputs};
 use crate::inference::test_refs::{self, Kind};
 use crate::lmm::satterthwaite::tests::gate1::{
-    at_lme4_theta, band, lowered, newton_point, numbers, reml_entries, route_pass_at, routes,
+    at_lme4_theta, band, lmertest_entries, lowered, newton_point, numbers, route_pass_at, routes,
     spread, strings, Driver,
 };
 use crate::lmm::satterthwaite::{DerivRoute, SatterthwaiteState};
@@ -121,7 +122,16 @@ fn per_term_f_matches_anova() {
     let mut at_lme4 = Driver::new(&["dendf_at_lme4", "f_at_lme4"]);
     let mut per_group = Vec::new();
     let mut end_to_end = Driver::new(&["df", "f"]);
-    for e in reml_entries(true) {
+    let entries: Vec<_> = [true, false]
+        .into_iter()
+        .flat_map(|reml| lmertest_entries(true, reml))
+        .collect();
+    let n_ml = entries.iter().filter(|e| e.name.ends_with("_ml")).count();
+    eprintln!(
+        "PERTERM {} per-term references compared, {n_ml} of them ML",
+        entries.len()
+    );
+    for e in entries {
         let name = e.name.as_str();
         let json = test_refs::load(Kind::Lmertest, name);
         let fit_json = match json.get("twin") {
@@ -200,6 +210,11 @@ fn per_term_f_matches_anova() {
         // End to end, at the crate's own θ̂.
         let fit = crate::fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
         assert!(fit.converged(), "{name}: the fit converges");
+        assert_eq!(
+            Some(fit.reml),
+            e.raw["reml"].as_bool(),
+            "{name}: the fit's criterion"
+        );
         let retained: Vec<usize> = (0..lo.p).filter(|&j| !fit.aliased()[j]).collect();
         assert_eq!(
             retained, kept,
@@ -244,9 +259,12 @@ fn per_term_f_matches_anova() {
         per_group,
         [
             "lmertest_anova_Machines",
+            "lmertest_anova_Machines_ml",
             "lmertest_anova_sim_factorial",
             "lmertest_anova_sim_factorial_empty",
+            "lmertest_anova_sim_factorial_ml",
             "lmertest_anova_sleepstudy",
+            "lmertest_anova_sleepstudy_ml",
         ],
         "the references whose fit arms the per-group gradient"
     );

@@ -68,11 +68,6 @@ test_that("double-bar and intercept-free RE terms name the kernel property", {
 
 test_that("intercepted lme4 arguments raise designed errors", {
   d <- err_data()
-  expect_error(fastglmm(y ~ x + (1 | g), d, REML = FALSE),
-               "REML-only by design")
-  # REML = TRUE matches what the engine does — no error (warnings, e.g. a
-  # boundary fit on this null-effect data, are fine).
-  expect_no_error(suppressWarnings(fastglmm(y ~ x + (1 | g), d, REML = TRUE)))
   expect_error(fastglmm(y ~ x, d, control = list()), "compiled into")
   expect_error(fastglmm(y ~ x, d, verbose = TRUE), "verbose")
   expect_error(fastglmm(y ~ x, d, contrasts = list(g = "contr.sum")),
@@ -80,28 +75,131 @@ test_that("intercepted lme4 arguments raise designed errors", {
   expect_error(fastglmm(y ~ x, d, bogus = 1), "unused argument")
 })
 
-test_that("REML is checked against the model, not the engine", {
+# 20 groups of 10 with a real between-group variance: the Gaussian, binomial
+# and Poisson mixed fits and the Gamma GLM on it raise no warning, so a warning
+# in the REML tests below can only come from the argument.
+reml_data <- function() {
+  set.seed(11)
+  g <- factor(rep(seq_len(20L), each = 10L))
+  x <- rnorm(200)
+  u <- rnorm(20, sd = 0.8)[as.integer(g)]
+  data.frame(y = 1 + 0.5 * x + u + rnorm(200), x = x, g = g,
+             yb = rbinom(200, 1L, plogis(-0.3 + 0.6 * x + u)),
+             yc = rpois(200, exp(0.2 + 0.4 * x + u)),
+             yp = rgamma(200, shape = 5, rate = 5 / exp(0.5 + 0.3 * x)),
+             g1 = factor(rep("a", 200)))
+}
+
+# Every field of the two fits identical, bitwise. Not compared: `call`, and
+# the family object, whose closures differ between two `binomial()` calls (its
+# family and link are compared); `warnings` too when `same_warnings` is FALSE.
+expect_same_fit <- function(f1, f0, same_warnings = TRUE) {
+  a <- unclass(f1)
+  b <- unclass(f0)
+  expect_identical(names(a), names(b))
+  skip <- c("call", "family", if (!same_warnings) "warnings")
+  for (field in setdiff(names(b), skip)) {
+    expect_identical(a[[field]], b[[field]], label = field)
+  }
+  expect_identical(f1$family[c("family", "link")], f0$family[c("family", "link")])
+}
+
+test_that("REML = FALSE on a Gaussian mixed model fits by ML", {
+  d <- reml_data()
+  f0 <- fastglmm(y ~ x + (1 | g), d)
+  expect_no_warning(f1 <- fastglmm(y ~ x + (1 | g), d, REML = FALSE))
+  expect_false(f1$reml)
+  expect_false(attr(logLik(f1), "REML"))
+  # ML shrinks the between-group SD below the REML one on this design.
+  sd <- function(f) attr(VarCorr(f)$g, "stddev")
+  expect_lt(sd(f1), sd(f0))
+})
+
+test_that("REML = FALSE on OLS and on a GLM is the default fit", {
+  d <- reml_data()
+  expect_no_warning(f1 <- fastglmm(y ~ x, d, REML = FALSE))
+  expect_same_fit(f1, fastglmm(y ~ x, d))
+  expect_false(f1$reml)
+  expect_no_warning(f1 <- fastglmm(yb ~ x, d, family = binomial(), REML = FALSE))
+  expect_same_fit(f1, fastglmm(yb ~ x, d, family = binomial()))
+  expect_false(f1$reml)
+})
+
+test_that("REML = TRUE on a Gaussian mixed model is the default fit", {
+  d <- reml_data()
+  f0 <- fastglmm(y ~ x + (1 | g), d)
+  expect_no_warning(f1 <- fastglmm(y ~ x + (1 | g), d, REML = TRUE))
+  expect_true(f1$reml)
+  expect_same_fit(f1, f0)
+})
+
+test_that("REML on a binomial GLMM: TRUE is ignored with a warning, FALSE silently", {
+  d <- reml_data()
+  f0 <- fastglmm(yb ~ x + (1 | g), d, family = binomial())
+  msg <- paste("REML = TRUE applies only to Gaussian models; it was ignored and the",
+               "model was fitted by maximum likelihood.")
+  w <- expect_warning(
+    f_true <- fastglmm(yb ~ x + (1 | g), d, family = binomial(), REML = TRUE),
+    class = "fastglmm_argument_ignored")
+  expect_identical(conditionMessage(w), paste("Note: Argument ignored.", msg))
+  expect_no_warning(
+    f_false <- fastglmm(yb ~ x + (1 | g), d, family = binomial(), REML = FALSE))
+  expect_same_fit(f_true, f0, same_warnings = FALSE)
+  expect_same_fit(f_false, f0)
+  expect_identical(f_true$warnings$kind, "argument_ignored")
+  expect_identical(f_true$warnings$message, msg)
+  expect_false(f_true$reml)
+})
+
+test_that("REML = FALSE on a Poisson GLMM and a Gamma GLM is the default fit", {
+  d <- reml_data()
+  for (case in list(list(yc ~ x + (1 | g), poisson()),
+                    list(yp ~ x, Gamma(link = "log")))) {
+    f0 <- fastglmm(case[[1]], d, family = case[[2]])
+    expect_no_warning(f1 <- fastglmm(case[[1]], d, family = case[[2]], REML = FALSE))
+    expect_same_fit(f1, f0)
+    expect_false(f1$reml)
+  }
+})
+
+test_that("REML = TRUE on OLS reports the REML log-likelihood, as logLik(lm, REML = TRUE)", {
+  d <- reml_data()
+  f0 <- fastglmm(y ~ x, d)
+  expect_no_warning(f1 <- fastglmm(y ~ x, d, REML = TRUE))
+  expect_true(f1$reml)
+  expect_identical(f1$beta, f0$beta)
+  expect_identical(f1$se, f0$se)
+  expect_identical(f1$dispersion, f0$dispersion)
+  ll <- stats::logLik(stats::lm(y ~ x, d), REML = TRUE)
+  expect_equal(as.numeric(logLik(f1)), as.numeric(ll), tolerance = 1e-10)
+  expect_equal(attr(logLik(f1), "df"), attr(ll, "df"))
+})
+
+test_that("REML is accepted on a formula whose only grouping is dropped", {
+  d <- reml_data()
+  f0 <- suppressWarnings(fastglmm(y ~ x + (1 | g1), d))
+  for (reml in c(TRUE, FALSE)) {
+    expect_warning(f <- fastglmm(y ~ x + (1 | g1), d, REML = reml),
+                   class = "fastglmm_single_level_grouping_dropped")
+    expect_identical(f$warnings$kind, "single_level_grouping_dropped")
+    expect_identical(f$reml, reml)
+    expect_identical(f$beta, f0$beta)
+    # Fitted as OLS, so the OLS row applies: TRUE reports the REML log-likelihood.
+    ll <- stats::logLik(stats::lm(y ~ x, d), REML = reml)
+    expect_equal(as.numeric(logLik(f)), as.numeric(ll), tolerance = 1e-10)
+  }
+})
+
+test_that("REML must be one non-NA logical", {
   d <- err_data()
-  d$yb <- as.integer(d$y > 0)
-  d$yc <- rep(0:3, 10)
-  # No REML objective outside a Gaussian mixed model: TRUE is refused, not ignored.
-  msg <- "only to Gaussian mixed models"
-  expect_error(fastglmm(y ~ x, d, REML = TRUE), msg)
-  expect_error(fastglmm(yc ~ x, d, family = poisson(), REML = TRUE), msg)
-  expect_error(fastglmm(yb ~ x + (1 | g), d, family = binomial(), REML = TRUE), msg)
-  # Those models are fitted by maximum likelihood, so FALSE is the default fit.
-  f0 <- suppressWarnings(fastglmm(yb ~ x + (1 | g), d, family = binomial()))
-  f1 <- suppressWarnings(fastglmm(yb ~ x + (1 | g), d, family = binomial(), REML = FALSE))
-  expect_identical(fixef(f1), fixef(f0))
-  expect_identical(vcov(f1), vcov(f0))
-  expect_identical(f1$loglik, f0$loglik)
-  # A single-level grouping is dropped after lowering: the formula says mixed,
-  # the fitted model is OLS, and REML = TRUE is decided on the fitted model.
-  d$g1 <- factor(rep("a", 40))
-  expect_error(suppressWarnings(fastglmm(y ~ x + (1 | g1), d, REML = TRUE)),
-               "every random-effect term was dropped")
-  expect_error(fastglmm(y ~ x + (1 | g), d, REML = NA), "TRUE or FALSE")
+  expect_error(fastglmm(y ~ x + (1 | g), d, REML = NA),
+               "REML must be NULL, TRUE or FALSE, got NA", fixed = TRUE)
   expect_error(fastglmm(y ~ x + (1 | g), d, REML = c(TRUE, FALSE)), "TRUE or FALSE")
+  # No coercion: a number or a string is not a logical, and an empty one is
+  # not "absent".
+  for (bad in list(1, "TRUE", logical(0))) {
+    expect_error(fastglmm(y ~ x + (1 | g), d, REML = bad), "TRUE or FALSE")
+  }
 })
 
 test_that("non-treatment contrasts on a fixed-effect factor error instead of fitting silently", {

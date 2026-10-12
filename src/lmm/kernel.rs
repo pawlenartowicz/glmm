@@ -17,7 +17,7 @@ use super::*;
 /// conditioning enters only through `R`, which a QR computes to working
 /// accuracy (Golub & Van Loan, *Matrix Computations*, 4th ed., §5.3).
 ///
-/// Why `U` and not `R`: `det U = 1`, so the REML criterion needs no correction
+/// Why `U` and not `R`: `det U = 1`, so neither criterion needs a correction
 /// term, and a leading intercept column stays exactly 1. With `R` itself the
 /// intercept becomes `1/√N`, whose Gram entry `Σ 1/N` picks up a rounding error
 /// of order `N·ε` that the fitted mean then multiplies into the RSS (measured on
@@ -1326,16 +1326,17 @@ fn group_regression_tail(fit: &mut LmmFitScratch, q: usize, m: usize) -> Option<
 // reml_deviance — the blocked-Cholesky objective.
 // ---------------------------------------------------------------------------
 
-/// Crossed/nested random-slopes REML deviance — the gated `extra_slopes_any`
-/// path. Builds the full penalized augmented matrix
+/// Crossed/nested random-slopes profiled deviance under the scratch's
+/// criterion: the gated `extra_slopes_any` path. Builds the full penalized augmented matrix
 /// `P = [[ΛᵀZᵀZΛ + I, ΛᵀZᵀ[Xy]], [·, [Xy]ᵀ[Xy]]]` over `[all RE cols | X y]`
 /// and takes ONE dense Cholesky. The crossed dimension is bounded (crossed forces
 /// a FixedClusters primary), so `k = k_total` is independent of N. The block-
 /// diagonal `Λ` carries each grouping's `q_g×q_g` relative-covariance factor; the
 /// raw RE Gram `ZᵀZ` is recovered from the suff stats (per-level diagonal blocks
 /// from `s_raw`/`counts`, cross-factor blocks from the weighted `zx`). Same deviance
-/// normalization as [`reml_deviance`] (`log|L_ZZ|² + log|L_XX|² + (N−P)·log σ̂²`),
-/// so it reduces to the scalar value (to FP reassociation) when every `q_g == 1`.
+/// normalization as [`reml_deviance`] (REML `log|L_ZZ|² + log|L_XX|² + (N−P)·log σ̂²`,
+/// ML `log|L_ZZ|² + N·log σ̂²`), so it reduces to the scalar value (to FP
+/// reassociation) when every `q_g == 1`.
 ///
 /// Zero-alloc warm path: every buffer lives in `LmmFitScratch` (`blocked_*`),
 /// sized once when `extra_slopes_any`. Returns INFINITY on any Cholesky failure
@@ -1585,7 +1586,8 @@ fn reml_deviance_blocked(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScr
     }
     let lyy = fit.factor[(p, p)];
     let r_sq = lyy * lyy;
-    let df = (suff.n_rows - p) as f64;
+    let criterion = fit.criterion;
+    let df = criterion.nu(suff.n_rows, p) as f64;
     let sigma_sq = r_sq / df;
     // An exact fit (X spans y) leaves r² as pure round-off: the last pivot is
     // P_yy minus the other squared entries of its row, so it is known only to
@@ -1598,10 +1600,15 @@ fn reml_deviance_blocked(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScr
         return f64::INFINITY;
     }
     fit.sigma_sq = sigma_sq;
-    2.0 * log_lzz_half + log_lxx_sq + df * sigma_sq.ln()
+    match criterion {
+        Criterion::Reml => 2.0 * log_lzz_half + log_lxx_sq + df * sigma_sq.ln(),
+        Criterion::Ml => 2.0 * log_lzz_half + df * sigma_sq.ln(),
+    }
 }
 
-/// REML profiled deviance at θ via the family-blocked augmented Cholesky.
+/// Profiled deviance at θ under the scratch's criterion
+/// (`LmmFitScratch::criterion`: REML or ML) via the family-blocked augmented
+/// Cholesky. The name predates ML; one function evaluates both.
 ///
 /// Ω_θ over [primary | nested children | crossed | X y]. The leading block is
 /// block-diagonal per FAMILY (a primary level + its nested children — nested
@@ -1635,10 +1642,19 @@ fn reml_deviance_blocked(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScr
 ///
 /// The deviance reads OFF THE FACTORS — log|L_ZZ|² from the family pivots +
 /// the crossed tail diagonal, log|L_XX|², r² = L[p,p]² from the trailing m×m
-/// block — no β backsolve per evaluation. Normalization convention:
-///   dev(θ) = log|V| + log|X'V⁻¹X| + (N−P)·log(σ̂²),
+/// block, with no β backsolve per evaluation. Normalization convention, with
+/// r² = L[p,p]²:
+///   REML: dev(θ) = log|V| + log|X'V⁻¹X| + (N−P)·log(σ̂²),  σ̂² = r²/(N−P)
+///   ML:   dev(θ) = log|V|                + N·log(σ̂²),      σ̂² = r²/N
 /// so the collapse and general paths agree to FP error, not up to a
-/// constant. Returns INFINITY on any Cholesky failure / non-positive σ̂².
+/// constant. Adding `N(1 + ln 2π)` to the ML value gives lme4's ML deviance
+/// (Bates et al. 2015, "Fitting linear mixed-effects models using lme4", JSS
+/// 67(1)), as `(N−P)(1 + ln 2π)` does for its REML criterion; on a weighted
+/// fit each also needs the `−Σ ln ŵ` that `fit::lmm::lmm_view_to_fit` adds,
+/// since this value works on the √ŵ-weighted Grams. The `L_XX`
+/// pivots are checked for positivity under both criteria, since β̂ and
+/// `Var(β̂)` are read off them. Returns INFINITY on any Cholesky failure /
+/// non-positive σ̂².
 ///
 /// θ is vech-packed per grouping — [primary, extras in declaration order]. The
 /// primary block is width-general: `Λ_p` is the column-major vech θ prefix
@@ -1951,7 +1967,11 @@ pub fn reml_deviance(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScratch
 
     let lyy = fit.tail_l[(kx + p) * t_dim + (kx + p)];
     let r_sq = lyy * lyy;
-    let df = (suff.n_rows - p) as f64;
+    // The criterion, read once: REML's residual df is n − p and its sum keeps
+    // ln|L_XX|²; ML's is n and drops it. The L_XX pivots are checked above on
+    // both, since β̂ and Var(β̂) are read off them.
+    let criterion = fit.criterion;
+    let df = criterion.nu(suff.n_rows, p) as f64;
     let sigma_sq = r_sq / df;
     // Exact-fit floor: mirrors `reml_deviance_blocked`'s (see the reason there)
     // and `sparse_reml_deviance`'s — change together.
@@ -1961,5 +1981,8 @@ pub fn reml_deviance(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScratch
     }
     fit.sigma_sq = sigma_sq;
 
-    log_lzz_sq + log_lxx_sq + df * sigma_sq.ln()
+    match criterion {
+        Criterion::Reml => log_lzz_sq + log_lxx_sq + df * sigma_sq.ln(),
+        Criterion::Ml => log_lzz_sq + df * sigma_sq.ln(),
+    }
 }

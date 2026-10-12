@@ -497,7 +497,9 @@ class Fit:
 
     `converged`, `singular` and `aliased` are properties over `diagnostics`,
     not dataclass fields: read them off the Fit as before, but reach for
-    `diagnostics` when reflecting over the dataclass (`asdict`, `fields`)."""
+    `diagnostics` when reflecting over the dataclass (`asdict`, `fields`).
+    `aic` and `bic` are properties too, computed from `loglik`, `df` and
+    `nobs`."""
 
     beta: np.ndarray  # (p,) fixed-effect estimates
     se: np.ndarray  # (p,) standard errors; NaN where unavailable
@@ -564,23 +566,25 @@ class Fit:
     outer_decrement: float
     # Minimized optimizer criterion. NOT comparable across models and NOT an AIC
     # input — it carries the Rust `Fit::deviance` caveat: for an LMM it is lme4's
-    # REMLcrit minus a data-independent constant; for a GLMM it is the marginal
+    # REMLcrit (on an ML fit, lme4's ML deviance) minus a data-independent
+    # constant; for a GLMM it is the marginal
     # Laplace deviance, which differs from -2*logLik by a data-only saturated
     # constant on binomial/Poisson fits and equals -2*logLik exactly on Gamma
     # and negative-binomial fits. NaN for OLS/GLM and on numerical failure.
     deviance: float
     # Log-likelihood at the fitted parameters, on the logLik() scale (R/lme4).
-    # For an LMM this is the REML criterion (see `reml` below); for OLS/GLM/GLMM
+    # On a REML fit this is the REML criterion (see `reml` below); otherwise
     # it is the ordinary log-likelihood. NaN wherever `deviance`'s failure modes
     # apply.
     loglik: float
     # Parameters counted for AIC/BIC: retained fixed effects + RE parameters +
     # 1 if the family estimates a dispersion/scale. 0 on degenerate NaN-fill
-    # paths.
+    # paths, and on a GLMM that stopped at MaxFunReached (finite `loglik`).
     df: int
     # True iff `loglik` is a REML criterion rather than an ML log-likelihood
-    # (the Gaussian LMM paths). Model comparisons (AIC/LRT) across fits with
-    # different fixed effects are invalid when this is set.
+    # (a Gaussian mixed model fitted by REML, or OLS with reml=True). Model
+    # comparisons (AIC/LRT) across fits with different fixed effects are
+    # invalid when this is set.
     reml: bool
     # Fitted means mu-hat per row (n,). Empty on non-converged fits.
     fitted: np.ndarray
@@ -666,6 +670,33 @@ class Fit:
     def aliased(self):
         """`diagnostics["aliased"]`."""
         return self.diagnostics["aliased"]
+
+    @property
+    def aic(self):
+        """Akaike information criterion, `-2 * loglik + 2 * df`, on every fit.
+
+        On a REML fit (`reml` is True) `loglik` is the REML criterion, so this
+        AIC compares only fits with the same fixed part; to compare fixed
+        parts, fit both models with `reml=False`. `summary()` of a REML fit
+        prints the REML criterion and no AIC.
+
+        On a fit that did not converge the value is not an AIC: a GLMM that
+        stopped at MaxFunReached has a finite `loglik` and `df` 0, so this is
+        `-2 * loglik` (as R's `AIC()` gives); check `converged` first."""
+        return -2.0 * self.loglik + 2.0 * self.df
+
+    @property
+    def bic(self):
+        """Bayesian information criterion, `-2 * loglik + df * log(nobs)`, on
+        every fit (NaN when `nobs` is 0).
+
+        The REML caveat of `aic` applies: on a REML fit this BIC compares only
+        fits with the same fixed part; fit with `reml=False` to compare fixed
+        parts. The non-converged caveat of `aic` applies too: at MaxFunReached
+        on a GLMM `df` is 0 and this is `-2 * loglik`."""
+        if self.nobs <= 0:
+            return math.nan
+        return -2.0 * self.loglik + self.df * math.log(self.nobs)
 
     def stddev_corr(self, group_idx):
         """Split grouping `group_idx`'s vech-packed covariance into
@@ -1152,6 +1183,7 @@ def fit(
     nagq=1,
     warm_start=None,
     satterthwaite=True,
+    reml=None,
 ):
     """Fit `formula` against `data`'s columns and return a `Fit`.
 
@@ -1184,6 +1216,17 @@ def fit(
         the summary then tests with z and says "df not computed", and
         `Fit.df_method` is "disabled". OLS and the Gamma and inverse-Gaussian
         GLMs keep their residual df whatever it says.
+    reml: None, True or False; `Fit.reml` reports the value used.
+        Gaussian with random effects (after any single-level grouping is
+        dropped): None and True fit by REML, False by ML.
+        The summary of an ML fit is titled "Linear mixed model fit by maximum
+        likelihood", prints AIC, BIC, logLik, deviance and df.resid, and
+        carries the note "p-values can be somewhat anticonservative" under
+        the title; a REML fit prints the REML criterion and no AIC.
+        Gaussian without (OLS, also when every grouping was dropped): same
+        estimates; True reports the REML log-likelihood (the summary prints
+        the REML criterion), None and False the ML one.
+        Any other family: ML; True is ignored with an ArgumentIgnoredWarning.
 
     A categorical column's level order is honored: level 0 is the
     treatment-contrast base, so `pd.Categorical(x, categories=[…])` fits against
@@ -1242,6 +1285,9 @@ def fit(
     if not isinstance(satterthwaite, (bool, np.bool_)):
         raise TypeError(f"satterthwaite must be True or False, got {satterthwaite!r}")
     satterthwaite = bool(satterthwaite)
+    if reml is not None and not isinstance(reml, (bool, np.bool_)):
+        raise TypeError(f"reml must be None, True or False, got {reml!r}")
+    reml = None if reml is None else bool(reml)
 
     store = []
 
@@ -1471,6 +1517,7 @@ def fit(
         [float(v) for v in offset] if offset is not None else None,
         warm_start_pair,
         satterthwaite,
+        reml,
     )
     # nagq's shape eligibility (single grouping factor, binomial/Poisson/NB/Gamma,
     # q <= 3) is only decidable after the Rust-side formula lowering, so the
@@ -1507,6 +1554,18 @@ def fit(
                 "model was fitted without adaptive quadrature.",
                 AgqFallbackWarning,
             )
+    if r["reml_warning"] is not None:
+        # Worded here, as `agq_warning` above: the shared rule in
+        # src/orchestrate.rs decides, each port spells its own argument. The R
+        # port (r/R/fastglmm.R, `fastglmm`) words the same sentence with
+        # `REML = TRUE`; change together.
+        _warn(
+            store,
+            "argument_ignored",
+            "reml=True applies only to Gaussian models; it was ignored and the model was "
+            "fitted by maximum likelihood.",
+            ArgumentIgnoredWarning,
+        )
     # Wrap the native dict's plain lists back into the array types Fit's
     # dataclass documents (no numpy Rust dep — the native call returns lists).
     res = Fit(
