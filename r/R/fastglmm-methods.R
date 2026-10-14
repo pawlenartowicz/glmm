@@ -678,8 +678,9 @@ coef.fastglmm <- function(object, ...) {
 #' OLS), and the returned object carries `REML = TRUE`. It stays the REML value
 #' because that is the quantity for comparing random-effect structures with the
 #' same fixed effects. REML criteria are comparable only between models with
-#' identical fixed effects: `AIC()` and `BIC()` refuse REML fits with different
-#' fixed effects. To compare fixed effects, fit both models with
+#' identical fixed effects: `AIC()`, `BIC()` and `anova(m0, m1)` refuse REML
+#' fits with different fixed effects. To compare fixed effects, use
+#' [compare()], which fits both models by ML, or fit both models with
 #' `REML = FALSE`; an ML fit returns the ML log-likelihood, with `REML = FALSE`.
 #'
 #' @param object a [fastglmm] fit.
@@ -708,13 +709,14 @@ logLik.fastglmm <- function(object, ...) {
 #' two comparisons that are always wrong, which stop with an error:
 #'
 #' * a REML fit beside an ML fit: the two log-likelihoods are on different
-#'   scales. The error names which fit is which. This holds for the fits of
+#'   scales. The error names which fit is which and points to [compare()],
+#'   which fits both models the same way. This holds for the fits of
 #'   other packages in the call too: an lme4 fit is REML when
 #'   `lme4::isREML()` says so, an `lm` or `glm` fit is ML, and any other fit
 #'   whose `logLik()` carries a `REML` attribute is read from it.
 #' * REML fits with different fixed effects: the REML log-likelihood depends on
-#'   the fixed-effects design. The error says to refit both with
-#'   `REML = FALSE`.
+#'   the fixed-effects design. The error points to [compare()], which fits
+#'   both models by ML, or says to refit both with `REML = FALSE`.
 #'
 #' The fixed effects are compared as the sets of fixed terms of the stored
 #' formulas: term order and the spelling of an interaction do not matter, and
@@ -766,7 +768,8 @@ BIC.fastglmm <- function(object, ...) {
   }
   reml <- vapply(fits, .fit_is_reml, NA)
   if (any(reml, na.rm = TRUE) && !all(reml, na.rm = TRUE)) {
-    stop(sprintf("%s was fitted by REML and %s by ML. Fit both the same way.",
+    stop(sprintf(paste("%s was fitted by REML and %s by ML. Fit both the same way, or use",
+                       "compare(data, f0, f1)."),
                  label(which(reml)[1L]), label(which(!reml)[1L])), call. = FALSE)
   }
   # The fixed parts are compared on fastglmm REML fits only: another
@@ -778,7 +781,8 @@ BIC.fastglmm <- function(object, ...) {
     if (!fastglmm_same_fixed_part(fits[[ours[1L]]]$formula, fits[[i]]$formula)) {
       stop(sprintf(paste0("%s and %s are REML fits with different fixed effects, and ",
                           "REML fits with different fixed effects cannot be compared ",
-                          "by %s. Refit both with REML = FALSE."),
+                          "by %s. Use compare(data, f0, f1), which fits both models by ",
+                          "ML, or refit both with REML = FALSE."),
                    label(ours[1L]), label(i), what), call. = FALSE)
     }
   }

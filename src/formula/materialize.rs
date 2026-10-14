@@ -993,8 +993,9 @@ fn grouping_ids(re: &RandomEffect, data: &Table) -> Result<GroupingLayout, Error
 /// term) is `SlopeVarNotInDesign` — the crate does not support slope-only
 /// factors (factors appearing only in random slopes, not fixed main effects),
 /// as that would require on-demand dummy computation outside the main-effects
-/// pass. This is unreached by the current validation corpus where every factor
-/// slope variable is also a fixed main term.
+/// pass. The validation corpus reaches this through the anova ML pair
+/// `y ~ 1 + (x | g)` against `y ~ x + (x | g)` (sleepstudy), and the frontend
+/// refuses the first member.
 fn slope_cols(
     re: &RandomEffect,
     numeric_main_col: &HashMap<String, ColumnId>,

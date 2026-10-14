@@ -11,11 +11,15 @@ import glmm
 
 
 def test_module_surface():
-    # `fit`, `Fit`, and the twenty-four warning categories the diagnostics
-    # channel raises — a user has to be able to name them to filter on them.
+    # `fit`, `Fit`, the tests of `glmm.anova` (`anova`, `compare` and their
+    # three result classes), and the twenty-four warning categories the
+    # diagnostics channel raises; a user has to be able to name them to filter
+    # on them.
     assert glmm.__all__ == [
         "AgqFallbackWarning",
         "ArgumentIgnoredWarning",
+        "Comparison",
+        "ComparisonTable",
         "ConstantResponseWarning",
         "DesignUnsolvableWarning",
         "DiagnosticWarning",
@@ -37,8 +41,11 @@ def test_module_surface():
         "SearchLimitWarning",
         "SingleLevelGroupingDroppedWarning",
         "SingularFitWarning",
+        "TermTable",
         "TooFewRowsWarning",
         "UnusedGroupingLevelsWarning",
+        "anova",
+        "compare",
         "fit",
     ]
     assert issubclass(glmm.IllConditionedWarning, glmm.DiagnosticWarning)

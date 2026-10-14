@@ -6,7 +6,8 @@ fourth is a short note on warm starts. The R surface is deliberately small:
 **one function** — `fastglmm()` — plus the `"fastglmm"` object it returns, read
 through lme4-shaped accessors (`summary`, `fixef`, `vcov`, `VarCorr`, `confint`,
 `isSingular`). There is no `lmer`/`glmer` split — `fastglmm()` dispatches on the
-family the way the kernel does.
+family the way the kernel does. Two more calls test hypotheses: `anova()`, on
+one fit or two, and `compare()`, on one data set and two formulas (§3).
 
 Two R conventions differ from the Python port. The **formula comes first**,
 `data` second (as in `lm`/`lme4`), the reverse of `glmm.fit(data, formula)`. And
@@ -217,7 +218,10 @@ shaped like lme4's. These **work**:
 | `fit$coef_df`, `fit$coef_p`, `fit$df_method` | per coefficient, the df of its t test (Satterthwaite on a Gaussian mixed model, `n - p` on OLS and the dispersion GLMs, `NaN` where the test is z and on an OLS or dispersion-GLM fit that did not converge) and that test's p-value; `df_method` says which (`"satterthwaite"`, `"residual"`, `"none"`, `"disabled"`, `"failed"`). |
 | `fit$rss`, `fit$r_squared`, `fit$adj_r_squared` | OLS only: the weighted residual sum of squares and `summary.lm`'s multiple and adjusted R-squared (0 on an intercept-only model); `NaN` on every other fit and on a non-converged one. |
 | `logLik(fit)` | log-likelihood on `stats::logLik`'s scale; on a REML fit (a Gaussian mixed model with the default `REML`, or OLS with `REML = TRUE`) this is the REML criterion (`REML = TRUE` attribute), on every other fit the ML log-likelihood (`REML = FALSE`). |
-| `AIC(fit)`, `BIC(fit)` | `stats`'s values and tables, read from `logLik()`. Two comparisons stop with an error instead: a REML fit beside an ML fit (the error names which is which), and REML fits with different fixed effects, whose REML criteria are not comparable (the error points to `REML = FALSE`). ML fits compare across fixed effects as in `stats`. See `?AIC.fastglmm` for the uses it cannot check. |
+| `AIC(fit)`, `BIC(fit)` | `stats`'s values and tables, read from `logLik()`. Two comparisons stop with an error instead: a REML fit beside an ML fit (the error names which is which), and REML fits with different fixed effects, whose REML criteria are not comparable (the error points to `compare()` and to `REML = FALSE`). ML fits compare across fixed effects as in `stats`. See `?AIC.fastglmm` for the uses it cannot check. |
+| `anova(fit)` | the per-term tests, one row per fixed term, built when the model was fitted (no refit): Type III by default, `type = "II"` on request; lmerTest's F with Satterthwaite df on a Gaussian mixed model, F on `n - p` on OLS and the Gamma and inverse-Gaussian GLMs with an estimated dispersion, Wald chi-squared elsewhere. See the end of this section. |
+| `anova(m0, m1)` | two fits compared as they are, with no refit; see the end of this section. |
+| `fit$offset` | the offset the model was fitted with, `NULL` without one. |
 | `fit$diagnostics` | list with `converged`, `singular`, `aliased`, `boundary`, `pinned`, `notes` — the solver's own report; the top-level `fit$converged`/`fit$singular`/`fit$aliased` are unchanged and mirror the same values. |
 
 On the Gaussian mixed model of §1:
@@ -273,6 +277,43 @@ vc <- VarCorr(fit)
 attr(vc$group, "stddev")       # per-term random-effect standard deviations
 attr(vc$group, "correlation")  # their correlation matrix
 ```
+
+**Tests: `anova()` and `compare()`.** `anova(fit)` tests each fixed term of
+one fit, from the table the fit stored when it was made. Two models are
+compared in one of two ways:
+
+```r
+# Fixed-term tests of one fit (Type III unless type = "II").
+anova(fit)
+
+# Two formulas: compare() fits both on the same rows, picking the estimator.
+cmp <- compare(data, y ~ x1, y ~ x1 + (1 | group))
+cmp            # the comparison table
+cmp$fit1       # the fit of the second formula
+
+# Two fits you already have, compared as they are (no refit).
+m0 <- fastglmm(y ~ x1, data, REML = TRUE)   # REML = TRUE: see below
+m1 <- fastglmm(y ~ x1 + (1 | group), data)
+anova(m0, m1)
+# On this toy data the group variance is estimated at exactly 0, so the
+# statistic is 0 and p = 1 (no draws are needed); hypothesis-tests.md shows a
+# comparison on sleepstudy.
+```
+
+`compare()` has no `REML` argument: on a Gaussian model it fits both models
+by REML when only their random parts differ and by ML when their fixed parts
+differ. `anova(m0, m1)` never refits, so the two fits must be comparable as
+they stand: two REML fits with different fixed parts are an error there
+(lme4 refits them by ML; use `compare()`, or refit both with `REML = FALSE`),
+and a REML mixed fit compares with an OLS fit only when that one was made with
+`REML = TRUE`. A test of a variance component uses a reference that respects
+the boundary at zero: the exact restricted likelihood-ratio test for a
+Gaussian model's single random intercept, otherwise the 50:50 mixture of
+chi-squared distributions,
+which is conservative. Both calls take `nsim` and `seed` for the exact test;
+the default seed is fixed, so a call gives the same p-value every time and
+`set.seed()` does not change it. The full rules, every reference and every
+refusal are in [`hypothesis-tests.md`](hypothesis-tests.md).
 
 ## 4. Warm starts
 

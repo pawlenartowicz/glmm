@@ -32,13 +32,14 @@ On several fits, the \code{stats} table (\code{df} and \code{AIC} or \code{BIC})
 two comparisons that are always wrong, which stop with an error:
 \itemize{
 \item a REML fit beside an ML fit: the two log-likelihoods are on different
-scales. The error names which fit is which. This holds for the fits of
+scales. The error names which fit is which and points to \code{\link[=compare]{compare()}},
+which fits both models the same way. This holds for the fits of
 other packages in the call too: an lme4 fit is REML when
 \code{lme4::isREML()} says so, an \code{lm} or \code{glm} fit is ML, and any other fit
 whose \code{logLik()} carries a \code{REML} attribute is read from it.
 \item REML fits with different fixed effects: the REML log-likelihood depends on
-the fixed-effects design. The error says to refit both with
-\code{REML = FALSE}.
+the fixed-effects design. The error points to \code{\link[=compare]{compare()}}, which fits
+both models by ML, or says to refit both with \code{REML = FALSE}.
 }
 
 The fixed effects are compared as the sets of fixed terms of the stored

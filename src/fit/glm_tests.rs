@@ -3883,3 +3883,67 @@ fn binomial_poisson_nb_glm_have_no_df() {
         assert_eq!(f.contrast_t(&[0.0, 1.0]), no_df, "{family:?}");
     }
 }
+
+/// `nobs` is the row count on every GLM fit, a non-converged one included, and
+/// `objective` is maximum likelihood, on the IRLS route and on the negative
+/// binomial's θ alternation alike. The weighted Gamma fit counts its rows, not
+/// the sum of its weights.
+#[test]
+fn glm_fit_reports_nobs_and_maximum_likelihood() {
+    let (x, y, n) = sim_gamma_xy();
+    let counts: Vec<f64> = y.iter().map(|v| v.round()).collect();
+    let w: Vec<f64> = (0..n).map(|i| 0.5 + (i % 4) as f64).collect();
+    let families = [
+        (
+            Family::Gamma {
+                link: crate::GammaLink::Log,
+            },
+            &y,
+            Some(w),
+        ),
+        (
+            Family::NegativeBinomial {
+                link: NegBinomialLink::Log,
+            },
+            &counts,
+            None,
+        ),
+    ];
+    for (family, y, weights) in families {
+        let model = ModelSpec { family, re: None };
+        let opts = FitOptions {
+            target_indices: vec![0, 1, 2],
+            weights,
+            ..FitOptions::default()
+        };
+        let f = fit_cold(&x, y, n, 3, &model, &GroupIds::default(), &opts);
+        assert!(f.converged(), "{family:?}");
+        assert_eq!(
+            (f.nobs, f.objective),
+            (n, Objective::MaximumLikelihood),
+            "{family:?}"
+        );
+    }
+    // `n == p`: refused before any solve.
+    let model = ModelSpec {
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        re: None,
+    };
+    let (n, p) = (4, 4);
+    let x: Vec<f64> = (0..n * p)
+        .map(|t| if t % p <= t / p { 1.0 } else { 0.0 })
+        .collect();
+    let f = fit_cold(
+        &x,
+        &[1.0; 4],
+        n,
+        p,
+        &model,
+        &GroupIds::default(),
+        &FitOptions::default(),
+    );
+    assert!(!f.converged());
+    assert_eq!((f.nobs, f.objective), (n, Objective::MaximumLikelihood));
+}

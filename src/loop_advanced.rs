@@ -25,3 +25,12 @@ pub use crate::lmm::{primary_lambda, LmmFit, LmmGroupings, LmmSuffStats};
 pub use crate::ols::{
     fit_suff_stats_t_sq, ols_contrast_t_sq, OlsFitView, OlsScratch, OlsSuffStats, PANEL_ROWS,
 };
+// Direct access to the hypothesis tests, for a caller that decides per draw
+// which tests it pays for: the likelihood-ratio p-value of a statistic, the
+// Wald χ² of `Lβ = 0` on a fit's estimates and covariance, and, with
+// `formula`, lmerTest's Type III hypothesis matrices of a design, built once
+// per design. Like the rest of this module, no semver promise.
+#[cfg(feature = "formula")]
+pub use crate::formula::hypotheses::{type3_pub, TermHypothesis};
+pub use crate::inference::lr::lr_p_value_pub;
+pub use crate::inference::wald::wald_chisq_pub;

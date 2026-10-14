@@ -25,9 +25,10 @@ generalized linear mixed models.
 On all tested models: a 923-model validation grid, checked for every release.
 
 **Beta.** Some lme4 features are still missing (see [`docs`](documentation/)).
-Version 1.0 will add a built-in test for whether a random effect matters —
-currently you need the separate RLRsim package, and it only works for normal
-(Gaussian) outcomes.
+It tests fixed terms and compares two nested models (`anova`, `compare` in the
+R and Python packages), with the exact restricted likelihood-ratio test for one
+Gaussian random intercept and a boundary-aware reference for other variance
+components (see [`hypothesis-tests.md`](documentation/hypothesis-tests.md)).
 
 **New to the crate? Start with [`tutorial-rust.md`](documentation/tutorial-rust.md)** — a
 single-page, three-layer walkthrough (cold fit → warm fit → advanced loop)
@@ -170,7 +171,7 @@ See the [R README](r/README.md) and
 | No `unsafe`    | zero `unsafe` (workspace baseline `unsafe_code = "warn"`)           |
 | Deterministic  | no RNG, no global state, no I/O in the fit path                     |
 | Reproducible   | the same model fitted on Linux (x86-64), macOS (Apple silicon) or in WebAssembly gives the same fit: across the 794 validation models measured (the grid before its 129 ML twins) the log-likelihoods differ by at most 3e-7 (typically 1e-11), and estimates typically agree to 8 significant digits. A WebAssembly build gives bit-identical results on both machines tested. |
-| Linear algebra | [`faer`](https://crates.io/crates/faer) 0.24, pinned               |
+| Linear algebra | [`faer`](https://crates.io/crates/faer) 0.24                       |
 | MSRV           | Rust 1.85 (floor set by the `bobyqa` dep)                          |
 
 ## Origin

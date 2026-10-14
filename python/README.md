@@ -49,6 +49,8 @@ fit.summary()                     # coefficient table + variance components
 fit.beta, fit.se                  # estimates and standard errors
 fit.coef_df, fit.confint()        # t-test df (Satterthwaite on an LMM), intervals
 fit.converged, fit.singular       # result flags
+glmm.anova(fit)                   # tests of the fixed terms (Type III)
+glmm.compare(df, "y ~ x1", "y ~ x1 + (1 | subject)")  # two nested models, fitted and compared
 ```
 
 ## Documentation
@@ -62,6 +64,8 @@ code in
 
 What the formula accepts:
 [`formula.md`](https://github.com/pawlenartowicz/glmm/blob/main/documentation/formula.md).
+Tests of fixed terms and model comparisons:
+[`hypothesis-tests.md`](https://github.com/pawlenartowicz/glmm/blob/main/documentation/hypothesis-tests.md).
 Fixes for common errors:
 [`troubleshooting.md`](https://github.com/pawlenartowicz/glmm/blob/main/documentation/troubleshooting.md).
 

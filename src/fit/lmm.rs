@@ -3,7 +3,8 @@
 //! live in `src/lmm/mod.rs` and `src/sparse/mod.rs`; this module only builds
 //! the workspace, accumulates the design, and maps `LmmFit` back to `Fit`.
 
-use crate::lmm::{fit_lmm, Criterion, LmmFit, LmmGroupings, LmmKernel, LmmWorkspace};
+use crate::inference::Objective;
+use crate::lmm::{fit_lmm, Criterion, LmmFit, LmmGroupings, LmmKernel, LmmSuffStats, LmmWorkspace};
 use crate::standardize::ColumnScaling;
 // Used only by the test-only `fit_mle`/`fit_lmm_into` baselines. The stable core
 // reaches the LMM path via `accumulate_lmm_rows`/`lmm_run_on`, which take neither.
@@ -18,7 +19,7 @@ use super::common::{
 // takes a caller-filled `x_mat` directly.
 #[cfg(test)]
 use super::common::{as_given_design, start_to_design, warm_theta};
-use super::{Fit, FitOptions};
+use super::{DesignSummary, Fit, FitOptions};
 
 // ---------------------------------------------------------------------------
 // LMM dispatch (Estimator::Mle)
@@ -172,6 +173,9 @@ pub(crate) struct LmmResultView<'a> {
     /// (`β = B·β̃`): `factor` is on the standardized design, so `vcov` is read
     /// through it, and so are θ̂, `varcorr` and the conditional modes.
     map: &'a ColumnScaling,
+    /// The dense kernel's accumulated statistics, which `lmm_view_to_fit`
+    /// copies the design summary out of; `None` on the sparse kernel.
+    suff: Option<&'a LmmSuffStats>,
 }
 
 // Loop-tier read accessors (via the `FitView`/`loop_advanced` surface); the
@@ -283,6 +287,28 @@ pub(crate) fn lmm_run_on<'a>(
         theta: &ws.theta,
         groupings: ws.kernel.groupings(),
         n_rows: ws.kernel.n_rows(),
+        suff: match &ws.kernel {
+            LmmKernel::Dense { suff, .. } => Some(&**suff),
+            LmmKernel::Sparse { .. } => None,
+        },
+    }
+}
+
+/// The design summary of [`Fit::design_summary`], copied out of the dense
+/// accumulator: `counts` and the `x` rows of `s` over the `n_clusters` levels
+/// seen (both are sized for the workspace's level capacity, which can be
+/// larger), and the leading `p × p` block of `c` with its upper triangle
+/// mirrored from the lower one the accumulator fills.
+fn design_summary(suff: &LmmSuffStats) -> DesignSummary {
+    let (p, k) = (suff.m - 1, suff.n_clusters);
+    DesignSummary {
+        counts: suff.counts[..k].to_vec(),
+        s: (0..k)
+            .flat_map(|a| suff.s.col_as_slice(a)[..p].iter().copied())
+            .collect(),
+        c: (0..p)
+            .flat_map(|j| (0..p).map(move |i| suff.c[(i.max(j), i.min(j))]))
+            .collect(),
     }
 }
 
@@ -290,6 +316,9 @@ pub(crate) fn lmm_run_on<'a>(
 /// from θ̂, varcorr, vcov from the augmented factor, the deviance and loglik of
 /// the kernel's criterion (REML or ML), the conditional modes + per-row means,
 /// and, when `opts.weights` is set, the −Σlog wᵢ weighted-deviance correction.
+/// On an unweighted fit whose only random term is one random intercept and
+/// which has a fixed-effect column, it also copies the design summary out of
+/// the accumulator.
 ///
 /// `x`/`ids` are here for `fitted` alone (`Xβ̂ + Zb̂` needs the design rows and
 /// the per-row levels), the same way `ols_view_to_fit` already takes `x`/`y`.
@@ -426,6 +455,11 @@ pub(crate) fn lmm_view_to_fit(
         loglik: super::common::lmm_loglik(deviance, criterion.nu(n_rows, p)),
         df: if has_endpoint { p + n_theta + 1 } else { 0 },
         reml: criterion == Criterion::Reml,
+        nobs: n,
+        objective: match criterion {
+            Criterion::Reml => Objective::Reml,
+            Criterion::Ml => Objective::MaximumLikelihood,
+        },
         fitted,
         ranef,
         ranef_levels,
@@ -433,6 +467,22 @@ pub(crate) fn lmm_view_to_fit(
         // No pass has run: the stable path's `attach_satterthwaite` replaces
         // the record; a loop-tier `Fit` keeps it.
         satterthwaite: Some(crate::lmm::satterthwaite::SatterthwaiteState::not_run()),
+        // The family is Gaussian on this path; the rest of the envelope is one
+        // random intercept, no prior weights and at least one fixed-effect
+        // column (with none, the accumulator holds nothing). A `(1 | g)`
+        // design always routes to the dense kernel.
+        design_summary: match view.suff {
+            Some(suff)
+                if suff.m > 1
+                    && opts.weights.is_none()
+                    && view.groupings.primary_q == 1
+                    && view.groupings.nested.is_none()
+                    && view.groupings.crossed.is_empty() =>
+            {
+                Some(design_summary(suff))
+            }
+            _ => None,
+        },
     };
     // A capped (`MaxFunReached`) endpoint is reported as a point, not an
     // accepted optimum, even though `varcorr` is finite there — so the

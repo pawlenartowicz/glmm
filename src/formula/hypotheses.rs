@@ -1,13 +1,16 @@
-//! lmerTest's per-term hypothesis matrices (Type III and the `XᵀX` Type II),
-//! built from a [`Lowered`] design.
+//! The per-term hypothesis matrices (lmerTest's Type III and `XᵀX` Type II,
+//! car's covariance-metric Type II), built from a [`Lowered`] design, with
+//! the marginal-term check and the missing-cell note of the per-term tests.
 //!
 //! Ports of lmerTest 3.2.1's `extract_contrasts_type3` (what
 //! `get_contrasts_type3` runs on an all-treatment-contrast design, the only
 //! coding the formula frontend emits), `get_contrasts_type2_unfolded` and,
 //! for the fallback both take on a design with at most one column or one
 //! term, `get_contrasts_type1` (Kuznetsova, Brockhoff & Christensen 2017,
-//! *J. Stat. Softw.* 82(13)). lmerTest works on lme4's column-dropped design,
-//! so both builders take the fit's retained columns, build on those, and
+//! *J. Stat. Softw.* 82(13)), and of car 3.1.5's Type II (`Anova_II_default`,
+//! `Anova_II_lm`, `Anova_II_mer`; Fox & Weisberg 2019, *An R Companion to
+//! Applied Regression*, 3rd ed.). lmerTest and car work on the column-dropped
+//! design, so the builders take the fit's retained columns, build on those, and
 //! return each matrix over all `p` caller columns with zeros on the aliased
 //! ones.
 
@@ -19,8 +22,6 @@ use super::materialize::Lowered;
 use crate::linalg::SeqLlt;
 
 /// One term's hypothesis matrix, in lmerTest's basis.
-// removed by P31-T8
-#[cfg_attr(not(test), allow(dead_code))]
 pub struct TermHypothesis {
     /// The term label ([`super::FixedTerm::label`]).
     pub term: String,
@@ -42,8 +43,6 @@ pub struct TermHypothesis {
 /// lmerTest; when the retained design is the intercept alone, each term gets
 /// a 0-row entry, where lmerTest returns one unnamed 0-row matrix. A design
 /// that is singular on `retained` (outside the contract) gives NaN entries.
-// removed by P31-T8
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn type3(lo: &Lowered, retained: &[usize]) -> Vec<TermHypothesis> {
     let d = Design::new(lo, retained);
     if d.type1_fallback() {
@@ -104,6 +103,15 @@ pub(crate) fn type3(lo: &Lowered, retained: &[usize]) -> Vec<TermHypothesis> {
         .collect()
 }
 
+/// [`type3`] for the loop tier (`crate::loop_advanced`, no semver promise):
+/// the matrices depend on the design and `retained` only, so one build serves
+/// every fit of the design that keeps the same columns.
+#[cfg(feature = "loop_advanced")]
+#[doc(hidden)]
+pub fn type3_pub(lo: &Lowered, retained: &[usize]) -> Vec<TermHypothesis> {
+    type3(lo, retained)
+}
+
 /// lmerTest's Type II hypothesis matrices in the `XᵀX` metric
 /// (`get_contrasts_type2_unfolded`), one per term of [`Lowered::terms`] in
 /// that order, on the retained columns as [`type3`]: identity rows for a term
@@ -111,8 +119,6 @@ pub(crate) fn type3(lo: &Lowered, retained: &[usize]) -> Vec<TermHypothesis> {
 /// `t(doolittle(crossprod(Xnew))$L)`, `Xnew` the design with the term's and
 /// its containers' columns moved last. Type I with at most one retained
 /// column or one term.
-// removed by P31-T8
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn type2_xtx(lo: &Lowered, retained: &[usize]) -> Vec<TermHypothesis> {
     let d = Design::new(lo, retained);
     if d.type1_fallback() {
@@ -151,6 +157,125 @@ pub(crate) fn type2_xtx(lo: &Lowered, retained: &[usize]) -> Vec<TermHypothesis>
             d.hypothesis(&term.label, &rows)
         })
         .collect()
+}
+
+/// car's Type II hypothesis matrices in the covariance metric
+/// (`Anova_II_default`, `Anova_II_lm`, `Anova_II_mer`), one per term of
+/// [`Lowered::terms`] in that order, on the retained columns as [`type3`].
+///
+/// A term's relatives are the other terms whose variables include all of its
+/// own (`car:::relatives`: every variable `attr(terms, "factors")` marks,
+/// numeric or not). With none, the rows are the identity on the term's
+/// columns. With some, they span what `ConjComp(t(H1), t(H2), vcov.)`
+/// returns: the vectors on the term's and its relatives' columns that are
+/// `vcov`-orthogonal to every relative column (`lᵀ·V·e_r = 0`). They are
+/// built in the basis that is the identity on the term's columns,
+/// `[−V_tr·V_rr⁻¹ | I]`, which spans the same rows as car's QR basis; Wald
+/// χ² and F do not depend on the basis. `vcov` is `p × p` over all caller
+/// columns (as [`crate::Fit::vcov`]) and only its retained block is read; a
+/// relatives block that is not positive definite gives NaN entries.
+pub(crate) fn type2_vcov(
+    lo: &Lowered,
+    retained: &[usize],
+    vcov: &[Vec<f64>],
+) -> Vec<TermHypothesis> {
+    let d = Design::new(lo, retained);
+    let v = |a: usize, b: usize| vcov[retained[a]][retained[b]];
+    lo.terms
+        .iter()
+        .enumerate()
+        .map(|(t, term)| {
+            let rel: Vec<usize> = (0..lo.terms.len())
+                .filter(|&u| u != t && term.vars.iter().all(|x| lo.terms[u].vars.contains(x)))
+                .flat_map(|u| d.map[u].iter().copied())
+                .collect();
+            let cols = &d.map[t];
+            // V_rr⁻¹·V_rt, |rel| × |cols|.
+            let mut b = Mat::from_fn(rel.len(), cols.len(), |i, j| v(rel[i], cols[j]));
+            if !rel.is_empty() {
+                let vrr = Mat::from_fn(rel.len(), rel.len(), |i, j| v(rel[i], rel[j]));
+                match SeqLlt::new(vrr.as_ref()) {
+                    Some(llt) => llt.solve_in_place(b.as_mut()),
+                    None => b.fill(f64::NAN),
+                }
+            }
+            let rows: Vec<Vec<f64>> = cols
+                .iter()
+                .enumerate()
+                .map(|(j, &c)| {
+                    let mut row = vec![0.0; retained.len()];
+                    row[c] = 1.0;
+                    for (i, &r) in rel.iter().enumerate() {
+                        row[r] = -b[(i, j)];
+                    }
+                    row
+                })
+                .collect();
+            d.hypothesis(&term.label, &rows)
+        })
+        .collect()
+}
+
+/// The per-term tests' refusal of a formula whose interaction lacks a
+/// marginal term: lmerTest's containment and both Type II constructions
+/// presuppose the margins, and without them the rows test hypotheses that
+/// depend on the coding. Each interaction needs every term made of all but
+/// one of its variables (so, recursively, every lower-order margin). `Err`
+/// is the refusal, naming each missing term once with the first interaction
+/// that needs it.
+pub(crate) fn check_marginal(lo: &Lowered) -> Result<(), String> {
+    let mut missing: Vec<(String, &str)> = Vec::new();
+    for term in lo.terms.iter().filter(|t| t.vars.len() > 1) {
+        for v in &term.vars {
+            let rest: Vec<&str> = term
+                .vars
+                .iter()
+                .filter(|&u| u != v)
+                .map(String::as_str)
+                .collect();
+            let present = lo.terms.iter().any(|u| {
+                u.vars.len() == rest.len() && rest.iter().all(|r| u.vars.iter().any(|x| x == r))
+            });
+            let label = rest.join(":");
+            if !present && missing.iter().all(|(m, _)| *m != label) {
+                missing.push((label, &term.label));
+            }
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let list: Vec<String> = missing
+        .iter()
+        .map(|(m, t)| format!("`{m}` (a margin of `{t}`)"))
+        .collect();
+    Err(format!(
+        "per-term tests need every marginal term of each interaction in the \
+         formula; it lacks {}",
+        list.join(", ")
+    ))
+}
+
+/// lmerTest's missing-cell note (`get_rdX`): the `rdX` columns that are zero
+/// on every row, named, or `None` when there is none. A column counts as zero
+/// when its cross-product with the design is: an `rdX` column lies in the
+/// span of the design columns (the full coding of a term whose margins are
+/// in the formula), so `Xᵀ·c = 0` only when `c = 0`.
+pub(crate) fn missing_cells_note(lo: &Lowered) -> Option<String> {
+    let cells: Vec<&str> = lo
+        .rdx
+        .names
+        .iter()
+        .enumerate()
+        .filter(|&(c, _)| lo.rdx.xt_rdx.col(c).iter().all(|&v| v == 0.0))
+        .map(|(_, name)| name.as_str())
+        .collect();
+    (!cells.is_empty()).then(|| {
+        format!(
+            "Missing cells for: {}. Interpret type III hypotheses with care.",
+            cells.join(", ")
+        )
+    })
 }
 
 /// The pieces every builder shares, on the retained columns.

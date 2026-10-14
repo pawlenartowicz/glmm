@@ -2355,9 +2355,9 @@ pub(in crate::fit) fn assert_fits_bitwise_equal(a: &crate::Fit, b: &crate::Fit, 
     }
     assert_eq!(a.loglik.to_bits(), b.loglik.to_bits(), "{ctx}: loglik");
     assert_eq!(
-        (a.n_eval, a.df, a.reml, &a.ranef_levels),
-        (b.n_eval, b.df, b.reml, &b.ranef_levels),
-        "{ctx}: n_eval, df, reml, ranef_levels"
+        (a.n_eval, a.df, a.reml, a.nobs, a.objective, &a.ranef_levels),
+        (b.n_eval, b.df, b.reml, b.nobs, b.objective, &b.ranef_levels),
+        "{ctx}: n_eval, df, reml, nobs, objective, ranef_levels"
     );
     assert_eq!(
         format!("{:?}", a.diagnostics),

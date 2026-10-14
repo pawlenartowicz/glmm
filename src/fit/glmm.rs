@@ -14,7 +14,8 @@ use crate::standardize::ColumnScaling;
 use crate::{Family, ModelSpec, NegBinomialLink, StartValues};
 
 use super::common::{
-    assemble_varcorr, fill_se_by_predictor, nan_vcov, start_to_design, warm_theta, FitDiagnostics,
+    assemble_varcorr, fill_se_by_predictor, glmm_objective, nan_vcov, start_to_design, warm_theta,
+    FitDiagnostics,
 };
 use super::{Diagnostics, Fit, FitOptions};
 
@@ -103,8 +104,9 @@ pub(crate) fn glm_warm_start_beta(
 /// effects are not estimable, so every estimate is NaN. Returned by the
 /// per-call guards of [`fit_glmm_nb`] and the unified core's `FitKind::Glmm`
 /// arm (both build their workspace once per shape, so the check runs per
-/// call), and by the test-only [`build_on_workspace`].
-pub(super) fn degenerate_glmm_fit(p: usize, n_theta: usize) -> Fit {
+/// call), and by the test-only [`build_on_workspace`]. `nagq` is the
+/// workspace's, for the route's [`Fit::objective`].
+pub(super) fn degenerate_glmm_fit(n: usize, p: usize, n_theta: usize, nagq: u8) -> Fit {
     Fit {
         beta: vec![f64::NAN; p],
         se: vec![f64::NAN; p],
@@ -121,11 +123,14 @@ pub(super) fn degenerate_glmm_fit(p: usize, n_theta: usize) -> Fit {
         loglik: f64::NAN,
         df: 0,
         reml: false,
+        nobs: n,
+        objective: glmm_objective(nagq),
         fitted: vec![],
         ranef: vec![],
         ranef_levels: vec![],
         coef_df: vec![f64::NAN; p],
         satterthwaite: None,
+        design_summary: None,
     }
 }
 
@@ -207,7 +212,7 @@ fn build_on_workspace(
     // Degenerate guard (mirrors the kernel's n≤p short-circuit contract).
     if n <= p || p == 0 {
         return Err(Box::new((
-            degenerate_glmm_fit(p, ws.n_theta),
+            degenerate_glmm_fit(n, p, ws.n_theta, ws.nagq),
             vec![],
             f64::INFINITY,
         )));
@@ -1106,11 +1111,14 @@ pub(crate) fn glmm_view_to_fit(
             0
         },
         reml: false,
+        nobs: n,
+        objective: glmm_objective(ws.nagq),
         fitted,
         ranef,
         ranef_levels,
         coef_df: vec![f64::NAN; p],
         satterthwaite: None,
+        design_summary: None,
     };
     // A capped (`MaxFunReached`) endpoint is reported as a point, not an
     // accepted optimum, even though `varcorr` is now finite there — so the
@@ -1197,7 +1205,7 @@ pub(super) fn fit_glmm_nb(
     // Degenerate guard, the same as `build_on_workspace`'s and the core's
     // `FitKind::Glmm` arm's.
     if n <= p || p == 0 {
-        return degenerate_glmm_fit(p, ws.n_theta);
+        return degenerate_glmm_fit(n, p, ws.n_theta, ws.nagq);
     }
     prep_glmm_design(ws, cluster_ids, extra_ids, n, opts);
     let nb_spec = nb_spec(model);

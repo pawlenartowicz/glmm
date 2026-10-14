@@ -6,6 +6,7 @@
 use faer::Mat;
 
 use crate::glm::{glm_irls_fit_mapped, GlmFitView, GlmScratch};
+use crate::inference::Objective;
 use crate::standardize::ColumnScaling;
 use crate::{Family, NegBinomialLink};
 
@@ -35,7 +36,7 @@ impl GlmFitView<'_> {
 /// `dispersion: NaN` included — the loop only overwrites `dispersion` with the
 /// alternation's θ when the final fit converged; in practice `max_outer >= 1`
 /// always, so the first iteration replaces it before it's read.
-fn fit_unsupported_family(p: usize) -> Fit {
+fn fit_unsupported_family(n: usize, p: usize) -> Fit {
     Fit {
         beta: vec![f64::NAN; p],
         se: vec![f64::NAN; p],
@@ -52,11 +53,14 @@ fn fit_unsupported_family(p: usize) -> Fit {
         loglik: f64::NAN,
         df: 0,
         reml: false,
+        nobs: n,
+        objective: Objective::MaximumLikelihood,
         fitted: vec![],
         ranef: vec![],
         ranef_levels: vec![],
         coef_df: vec![f64::NAN; p],
         satterthwaite: None,
+        design_summary: None,
     }
 }
 // ---------------------------------------------------------------------------
@@ -394,11 +398,14 @@ pub(crate) fn glm_view_to_fit(
             0
         },
         reml: false,
+        nobs: n,
+        objective: Objective::MaximumLikelihood,
         fitted,
         ranef: vec![],
         ranef_levels: vec![],
         coef_df,
         satterthwaite,
+        design_summary: None,
     }
 }
 // ---------------------------------------------------------------------------
@@ -660,7 +667,7 @@ pub(super) fn fit_glm_nb_capped(
     // two values (5e-5 apart on a 20-row fit at μ ≈ 1.6e5) and never settles.
     // From the last β the rounds continue one iteration instead.
     let mut beta_start: Vec<f64> = Vec::with_capacity(p);
-    let mut fit_result = fit_unsupported_family(p);
+    let mut fit_result = fit_unsupported_family(n, p);
     let mut settled = false;
     let mut rounds: u32 = 0;
     for _ in 0..max_outer {

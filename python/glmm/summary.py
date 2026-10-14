@@ -9,9 +9,12 @@ Block order follows lme4's `print.summary.merMod`; the R port's
 `print.summary.fastglmm` prints the same blocks in the same order — change
 together.
 
-The renderers read four hooks on `Summary`: `_header_lines`, `_notes`,
-`_tables` and `_footer_lines`. `_notes` holds the printed notes each render
-puts directly under the title.
+The `html`, `latex` and `typst` renderers live on `Rendered`, a base that
+reads four hooks: `_header_lines`, `_notes`, `_tables` and `_footer_lines`.
+`_notes` holds the printed notes each render puts directly under the title;
+`_LEAD_TABLES` names the tables the LaTeX and Typst renders put first, the
+others following in `_tables` order. `Summary` and the two tables of
+`glmm.anova` (`glmm/anova.py`) share it; each keeps its own `text`.
 """
 
 import html as _html
@@ -74,6 +77,25 @@ def fmt(x, digits=4):
     if math.isnan(x):
         return "NA"
     return f"{x:.{digits}g}"
+
+
+def fmt_df(x):
+    """The one degrees-of-freedom formatter, for the df cells and every
+    reference string: a whole df (a residual df, a numerator df, a chi-squared
+    df) prints as an integer at any size, a Satterthwaite df with four
+    significant digits, or as the nearest whole number from 10000 up, always
+    in fixed notation. NaN prints as NA and an infinite df as Inf or -Inf,
+    as R prints them."""
+    x = float(x)
+    if math.isnan(x):
+        return "NA"
+    if math.isinf(x):
+        return "Inf" if x > 0 else "-Inf"
+    if x == round(x):
+        return str(int(x))
+    if abs(x) >= 1e4:
+        return f"{x:.0f}"
+    return np.format_float_positional(x, precision=4, unique=False, fractional=False, trim="-")
 
 
 def fmt_p(p):
@@ -167,6 +189,120 @@ def _tex_escape(s):
 
 def _typst_str(s):
     return '"' + str(s).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+class Rendered:
+    """The `html`, `latex` and `typst` renders of a report, read from four
+    hooks a subclass defines: `_header_lines()` (the title, then the lines
+    under it), `_notes()` (the boxed notes under the title), `_tables()` (the
+    blocks as `(title, header, rows)`, every cell already a string) and
+    `_footer_lines()`. `_LEAD_TABLES` names the blocks the LaTeX and Typst
+    renders put first."""
+
+    _LEAD_TABLES = ()
+
+    # -- html --------------------------------------------------------------
+
+    def html(self):
+        e = _html.escape
+        out = [
+            (
+                "<style>"
+                ".glmm-summary table{border-collapse:collapse;margin:0.5em 0;font-family:monospace}"
+                ".glmm-summary th,.glmm-summary td{padding:0.1em 0.6em;text-align:right}"
+                ".glmm-summary td:first-child,.glmm-summary th:first-child{text-align:left}"
+                ".glmm-summary caption{text-align:left;font-weight:bold}"
+                ".glmm-summary p{margin:0.2em 0}"
+                ".glmm-summary .glmm-note{margin:0.4em 0;padding:0.3em 0.6em;"
+                "border-left:4px solid #c88a00;background:rgba(200,138,0,0.12)}"
+                "</style>"
+            ),
+            '<div class="glmm-summary">',
+        ]
+        title, *rest = self._header_lines()
+        out.append(f"<p>{e(title)}</p>")
+        out += [f'<div class="glmm-note" role="note">{e(n)}</div>' for n in self._notes()]
+        out += [f"<p>{e(l)}</p>" for l in rest]
+        for title, header, rows in self._tables():
+            out.append(f"<table><caption>{e(title)}</caption>")
+            out.append("<tr>" + "".join(f"<th>{e(h)}</th>" for h in header) + "</tr>")
+            for r in rows:
+                out.append("<tr>" + "".join(f"<td>{e(c)}</td>" for c in r) + "</tr>")
+            out.append("</table>")
+        out += [f"<p>{e(l)}</p>" for l in self._footer_lines()]
+        out.append("</div>")
+        return "\n".join(out)
+
+    # -- latex ---------------------------------------------------------------
+
+    def latex(self):
+        """booktabs fragments; the caller's preamble must load `booktabs`.
+        The `_LEAD_TABLES` first (on a summary: fixed effects, then random
+        effects), then the rest, header and
+        footer as `%` comments: a table goes into a document, a header does not.
+        A note is a boxed paragraph under the title, in the document, ended
+        with `\\par\\medskip` so the first table starts below it with a gap."""
+        title, *rest = self._header_lines()
+        out = [f"% {title}"]
+        out += [
+            "\\noindent\\fbox{\\parbox{\\dimexpr\\linewidth-2\\fboxsep-2\\fboxrule\\relax}"
+            f"{{{_tex_escape(n)}}}}}\\par\\medskip"
+            for n in self._notes()
+        ]
+        out += [f"% {l}" for l in rest]
+        tables = self._tables()
+        order = list(self._LEAD_TABLES) + [t for t, _, _ in tables if t not in self._LEAD_TABLES]
+        by_title = {t: (h, r) for t, h, r in tables}
+        for title in order:
+            if title not in by_title:
+                continue
+            header, rows = by_title[title]
+            spec = "l" + "r" * (len(header) - 1)
+            out.append(f"% {title}")
+            out.append(f"\\begin{{tabular}}{{{spec}}}")
+            out.append("\\toprule")
+            out.append(" & ".join(_tex_escape(h) for h in header) + " \\\\")
+            out.append("\\midrule")
+            for r in rows:
+                out.append(" & ".join(_tex_escape(c) for c in r) + " \\\\")
+            out.append("\\bottomrule")
+            out.append("\\end{tabular}")
+            out.append("")
+        out += [f"% {l}" for l in self._footer_lines()]
+        return "\n".join(out)
+
+    # -- typst -----------------------------------------------------------
+
+    def typst(self):
+        """`#table(...)` fragments. Written and tested against Typst 0.14.2 —
+        table syntax has moved between Typst versions; re-check on bump."""
+        title, *rest = self._header_lines()
+        out = [f"// {title}"]
+        out += [f"#block(stroke: 0.5pt, inset: 6pt, {_typst_str(n)})" for n in self._notes()]
+        out += [f"// {l}" for l in rest]
+        tables = self._tables()
+        order = list(self._LEAD_TABLES) + [t for t, _, _ in tables if t not in self._LEAD_TABLES]
+        by_title = {t: (h, r) for t, h, r in tables}
+        for title in order:
+            if title not in by_title:
+                continue
+            header, rows = by_title[title]
+            n = len(header)
+            align = "(left," + ",".join(["right"] * (n - 1)) + ")"
+            out.append(f"// {title}")
+            out.append(f"#table(columns: {n}, align: {align},")
+            # Cells are Typst strings, not `[...]` content blocks: a name like
+            # `x_1` or `a*b` is markup inside a content block and plain text
+            # inside a string.
+            out.append(
+                "  " + ", ".join(f"strong({_typst_str(h)})" if h else '""' for h in header) + ","
+            )
+            for r in rows:
+                out.append("  " + ", ".join(_typst_str(c) for c in r) + ",")
+            out.append(")")
+            out.append("")
+        out += [f"// {l}" for l in self._footer_lines()]
+        return "\n".join(out)
 
 
 def build_summary(fit):
@@ -297,7 +433,9 @@ def build_summary(fit):
 
 
 @dataclass
-class Summary:
+class Summary(Rendered):
+    _LEAD_TABLES = ("Fixed effects", "Random effects")
+
     method: str
     formula: str
     family: str
@@ -513,7 +651,7 @@ class Summary:
                 ("Random effects", ["Groups", "Name", "Variance", "Std.Dev.", "Corr"], rows)
             )
         df_cells = (
-            (lambda i: [fmt(self.coef_df[i])]) if self.coef_df is not None else (lambda i: [])
+            (lambda i: [fmt_df(self.coef_df[i])]) if self.coef_df is not None else (lambda i: [])
         )
         rows = [
             [
@@ -583,109 +721,3 @@ class Summary:
         if self.footnote is not None:
             lines.append(self.footnote)
         return lines
-
-    # -- html --------------------------------------------------------------
-
-    def html(self):
-        e = _html.escape
-        out = [
-            (
-                "<style>"
-                ".glmm-summary table{border-collapse:collapse;margin:0.5em 0;font-family:monospace}"
-                ".glmm-summary th,.glmm-summary td{padding:0.1em 0.6em;text-align:right}"
-                ".glmm-summary td:first-child,.glmm-summary th:first-child{text-align:left}"
-                ".glmm-summary caption{text-align:left;font-weight:bold}"
-                ".glmm-summary p{margin:0.2em 0}"
-                ".glmm-summary .glmm-note{margin:0.4em 0;padding:0.3em 0.6em;"
-                "border-left:4px solid #c88a00;background:rgba(200,138,0,0.12)}"
-                "</style>"
-            ),
-            '<div class="glmm-summary">',
-        ]
-        title, *rest = self._header_lines()
-        out.append(f"<p>{e(title)}</p>")
-        out += [f'<div class="glmm-note" role="note">{e(n)}</div>' for n in self._notes()]
-        out += [f"<p>{e(l)}</p>" for l in rest]
-        for title, header, rows in self._tables():
-            out.append(f"<table><caption>{e(title)}</caption>")
-            out.append("<tr>" + "".join(f"<th>{e(h)}</th>" for h in header) + "</tr>")
-            for r in rows:
-                out.append("<tr>" + "".join(f"<td>{e(c)}</td>" for c in r) + "</tr>")
-            out.append("</table>")
-        out += [f"<p>{e(l)}</p>" for l in self._footer_lines()]
-        out.append("</div>")
-        return "\n".join(out)
-
-    # -- latex ---------------------------------------------------------------
-
-    def latex(self):
-        """booktabs fragments; the caller's preamble must load `booktabs`.
-        Fixed effects first, random effects second, then the rest, header and
-        footer as `%` comments — a table goes into a document, a header does not.
-        A note is a boxed paragraph under the title, in the document, ended
-        with `\\par\\medskip` so the first table starts below it with a gap."""
-        title, *rest = self._header_lines()
-        out = [f"% {title}"]
-        out += [
-            "\\noindent\\fbox{\\parbox{\\dimexpr\\linewidth-2\\fboxsep-2\\fboxrule\\relax}"
-            f"{{{_tex_escape(n)}}}}}\\par\\medskip"
-            for n in self._notes()
-        ]
-        out += [f"% {l}" for l in rest]
-        tables = self._tables()
-        order = ["Fixed effects", "Random effects"] + [
-            t for t, _, _ in tables if t not in ("Fixed effects", "Random effects")
-        ]
-        by_title = {t: (h, r) for t, h, r in tables}
-        for title in order:
-            if title not in by_title:
-                continue
-            header, rows = by_title[title]
-            spec = "l" + "r" * (len(header) - 1)
-            out.append(f"% {title}")
-            out.append(f"\\begin{{tabular}}{{{spec}}}")
-            out.append("\\toprule")
-            out.append(" & ".join(_tex_escape(h) for h in header) + " \\\\")
-            out.append("\\midrule")
-            for r in rows:
-                out.append(" & ".join(_tex_escape(c) for c in r) + " \\\\")
-            out.append("\\bottomrule")
-            out.append("\\end{tabular}")
-            out.append("")
-        out += [f"% {l}" for l in self._footer_lines()]
-        return "\n".join(out)
-
-    # -- typst -----------------------------------------------------------
-
-    def typst(self):
-        """`#table(...)` fragments. Written and tested against Typst 0.14.2 —
-        table syntax has moved between Typst versions; re-check on bump."""
-        title, *rest = self._header_lines()
-        out = [f"// {title}"]
-        out += [f"#block(stroke: 0.5pt, inset: 6pt, {_typst_str(n)})" for n in self._notes()]
-        out += [f"// {l}" for l in rest]
-        tables = self._tables()
-        order = ["Fixed effects", "Random effects"] + [
-            t for t, _, _ in tables if t not in ("Fixed effects", "Random effects")
-        ]
-        by_title = {t: (h, r) for t, h, r in tables}
-        for title in order:
-            if title not in by_title:
-                continue
-            header, rows = by_title[title]
-            n = len(header)
-            align = "(left," + ",".join(["right"] * (n - 1)) + ")"
-            out.append(f"// {title}")
-            out.append(f"#table(columns: {n}, align: {align},")
-            # Cells are Typst strings, not `[...]` content blocks: a name like
-            # `x_1` or `a*b` is markup inside a content block and plain text
-            # inside a string.
-            out.append(
-                "  " + ", ".join(f"strong({_typst_str(h)})" if h else '""' for h in header) + ","
-            )
-            for r in rows:
-                out.append("  " + ", ".join(_typst_str(c) for c in r) + ",")
-            out.append(")")
-            out.append("")
-        out += [f"// {l}" for l in self._footer_lines()]
-        return "\n".join(out)

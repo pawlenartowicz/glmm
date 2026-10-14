@@ -73,6 +73,40 @@ pub mod tol {
     /// in units of lmerTest's interval width (`confint_rel`).
     #[allow(dead_code)] // read by tests/inference_oracle.rs only
     pub const CONFINT_REL: f64 = SE_REL;
+    /// A two-fit comparison's likelihood-ratio statistic, absolute:
+    /// twice this tier's deviance band [`super::DEV_EPS`] (`lrt_abs`).
+    #[allow(dead_code)] // read by tests/inference_oracle.rs only
+    pub const LRT_ABS: f64 = 2.0 * super::DEV_EPS;
+    /// A likelihood-ratio p-value, relative: `LRT_ABS` carried
+    /// through the reference's tail (`lr_p_rel`).
+    #[allow(dead_code)] // read by tests/inference_oracle.rs only
+    pub const LR_P_REL: f64 = 4e-4;
+    /// An OLS or Wald F and a GLM Wald chi-square, relative: the
+    /// beta/SE band (`wald_rel`).
+    #[allow(dead_code)] // read by tests/inference_oracle.rs only
+    pub const WALD_REL: f64 = SE_REL;
+    /// A GLMM Wald chi-square against car's, relative: twice the
+    /// frozen fit's measured floor (`wald_glmm_rel`).
+    #[allow(dead_code)] // read by tests/inference_oracle.rs only
+    pub const WALD_GLMM_REL: f64 = 2e-3;
+    /// The p-value of an F or Wald row, relative: the statistic's
+    /// band carried through the tail (`wald_p_rel`).
+    #[allow(dead_code)] // read by tests/inference_oracle.rs only
+    pub const WALD_P_REL: f64 = 4e-2;
+    /// The p-value of a Satterthwaite per-term row, relative: `DF_E2E_REL`
+    /// on F and on DenDF carried through the tail (`satt_p_rel`).
+    #[allow(dead_code)] // read by tests/inference_oracle.rs only
+    pub const SATT_P_REL: f64 = 4e-2;
+    /// lmerTest's `Sum Sq` and `Mean Sq` on a Satterthwaite per-term row,
+    /// relative: `DF_E2E_REL` on F (written as `SE_REL`, as tol.R writes
+    /// it) plus twice `STDDEV_REL` on σ̂² (`sum_sq_rel`).
+    #[allow(dead_code)] // read by tests/inference_oracle.rs only
+    pub const SUM_SQ_REL: f64 = SE_REL + 2.0 * STDDEV_REL;
+    /// The reduced REML log-likelihood against R's `logLik(lm, REML = TRUE)`,
+    /// absolute (`reml0_loglik_abs`, the band of
+    /// `src/inference/rlrt_oracle_tests.rs::ols_reml_loglik_matches_lm_reml`).
+    #[allow(dead_code)] // read by tests/inference_oracle.rs only
+    pub const REML0_LOGLIK_ABS: f64 = 1e-9;
 }
 
 // ── Golden schema ────────────────────────────────────────────────────────────
@@ -642,9 +676,33 @@ fn csv_for(g: &Golden) -> String {
 /// and every other column that parses as numbers numeric (X1, the goldens'
 /// `refit_with` rule), the entry's `weights` column, when it names one, as
 /// the prior weights, and `FitOptions::reml` from the entry's `reml` (`None`
-/// on an entry without one).
+/// on an entry without one). A Gaussian model; [`lower_on_entry`] takes any.
 #[allow(dead_code)] // used by tests/inference_oracle.rs only
 pub fn inference_lowered(e: &inference::Entry) -> Lowered {
+    let formula = e.r_formula.as_ref().expect("the entry has a formula");
+    let mut lo = lower_on_entry(e, formula, Family::Gaussian, e.raw["weights"].as_str())
+        .unwrap_or_else(|err| panic!("{}: {err}", e.name));
+    lo.opts.reml = e.raw["reml"].as_bool();
+    lo
+}
+
+/// `formula` of `family` lowered on an inference reference's data, as
+/// [`inference_lowered`] reads it (the entry's `factors` as factor columns),
+/// with the `weights` column, when one is named, as the prior weights. The
+/// other options are the lowering's defaults. R's aggregated-binomial
+/// response `cbind(s, n - s)` is fitted as [`refit_with`] fits it: the
+/// proportion `s / n` as the response of [`glmm_formula`], the trial counts
+/// as the prior weights.
+///
+/// # Errors
+/// The lowering's refusal of `formula` on this data.
+#[allow(dead_code)] // used by tests/inference_oracle.rs only
+pub fn lower_on_entry(
+    e: &inference::Entry,
+    formula: &str,
+    family: Family,
+    weights: Option<&str>,
+) -> Result<Lowered, glmm::formula::Error> {
     let data = e.data.as_ref().expect("the entry has data");
     let path = format!("{}/validation/{data}", env!("CARGO_MANIFEST_DIR"));
     let raw = std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("{path}: {err}"));
@@ -663,22 +721,40 @@ pub fn inference_lowered(e: &inference::Entry) -> Lowered {
         };
         columns.push((name.clone(), col));
     }
-    let weights = e.raw["weights"].as_str().map(|w| {
+    let mut weights: Option<Vec<f64>> = weights.map(|w| {
         let wi = col_index(&header, w);
         rows.iter()
             .map(|r| r[wi].parse().expect("weight parse"))
             .collect()
     });
+    let spec = parse_formula(formula);
+    if let Some((succ, total)) = &spec.aggregated {
+        assert!(weights.is_none(), "{}: weights beside cbind()", e.name);
+        let (si, ti) = (col_index(&header, succ), col_index(&header, total));
+        let cell = |r: &Vec<String>, j: usize| r[j].parse::<f64>().expect("a count");
+        let n: Vec<f64> = rows.iter().map(|r| cell(r, ti)).collect();
+        let y = rows.iter().zip(&n).map(|(r, n)| cell(r, si) / n).collect();
+        columns.push((spec.response.clone(), Column::Numeric(y)));
+        weights = Some(n);
+    }
     let table = Table {
         columns,
         n: rows.len(),
     };
-    let formula = e.r_formula.as_ref().expect("the entry has a formula");
-    let mut lo =
-        lower(formula, &table, Family::Gaussian).unwrap_or_else(|err| panic!("{}: {err}", e.name));
+    let mut lo = lower(&glmm_formula(formula), &table, family)?;
     lo.opts.weights = weights;
-    lo.opts.reml = e.raw["reml"].as_bool();
-    lo
+    Ok(lo)
+}
+
+/// `r_formula` as glmm fits it: R's `cbind(s, n - s) ~ rhs` as `y ~ rhs` (the
+/// proportion, [`refit_with`]'s rule), any other formula unchanged.
+#[allow(dead_code)] // used by tests/inference_oracle.rs only
+pub fn glmm_formula(r_formula: &str) -> String {
+    let spec = parse_formula(r_formula);
+    match spec.aggregated {
+        Some(_) => format!("{} ~ {}", spec.response, spec.rhs),
+        None => r_formula.to_string(),
+    }
 }
 
 /// Split a CSV line on commas, trimming whitespace and surrounding quotes.

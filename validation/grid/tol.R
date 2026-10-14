@@ -606,7 +606,220 @@ TOL_INFERENCE <- list(
   # on its own derivative route: maximum 8.60e-5 (lmertest_Machines, MachineB,
   # gradient route), the value-route fits at or below 2.61e-5
   # (lmertest_Penicillin).
-  confint_rel = TOL$se_rel
+  confint_rel = TOL$se_rel,
+  # Exact RLRT, the design eigenvalues (hard: no registry entry excuses a miss).
+  # glmm's normalized nonzero eigenvalues of Z'P0Z, from a (1 | g) fit's design
+  # summary, against RLRsim's frozen `mu` (goldens/inference/rlrt/,
+  # tools/goldens_rlrt.R), per value in units of the largest, with the same
+  # count below 1e-10 (src/inference/rlrt_oracle_tests.rs::rlrt_mu_matches_rlrsim,
+  # which reads the Rust copy in src/inference/rlrt_refs.rs::bands). Both routes
+  # give the eigenvalues of one symmetric matrix to about K * eps, so the band is
+  # set a priori, three to five decades above that. MEASURED (2026-10-12, pawel,
+  # x86_64) over the six RLRsim references: worst 8.99e-15 (rlrt_large_k,
+  # K = 1000), every other reference at or below 9.99e-16 (rlrt_sleepstudy).
+  rlrt_mu_rel = 1e-10,
+  # Exact RLRT, the grid kernel against RLRsim's paired draws (hard: no
+  # registry entry excuses a miss). RLRsim's frozen `mu` (zeros kept), grid and
+  # per-draw `Chi1` and `ChiK` fed to glmm's profile, RLRsim's first-decrease
+  # rule applied to it, against RLRsim's `res` within
+  # rlrt_paired_rel * |res| + rlrt_paired_abs, and the 1-based index equal to
+  # `lambdaind` (src/inference/rlrt_oracle_tests.rs::paired_profile_matches_rlrsim,
+  # which reads the Rust copies in src/inference/rlrt_refs.rs::bands). Set from
+  # the R replay of the same draws (4.3e-14) and the 15 significant digits the
+  # JSONs keep. MEASURED (2026-10-12, pawel, x86_64) over the 2000 paired draws
+  # of rlrt_dyestuff, rlrt_sleepstudy, rlrt_cake and rlrt_few_unbal: worst
+  # absolute difference 5.91e-14, worst use of the band 5.0% (rlrt_cake, draw
+  # 206); the index agrees on every draw, and the global maximum equals the
+  # first decrease on every draw. The internal grid against the frozen grid:
+  # worst relative difference 4.46e-15, the JSON's 15-digit rounding.
+  rlrt_paired_rel = 1e-12,
+  rlrt_paired_abs = 1e-13,
+  # Exact RLRT, the simulated null against RLRsim's frozen null (Monte Carlo).
+  # Per RLRsim reference, glmm's null at B = 1e5 draws (seed 20261021 + the
+  # entry's index among the manifest's rlrt entries) against RLRsim's 1e5
+  # (src/inference/rlrt_oracle_tests.rs::ks_null_matches_rlrsim, which reads the
+  # Rust copies in src/inference/rlrt_refs.rs::bands): the two-sample KS
+  # distance within rlrt_ks_coef * sqrt((B + B_ref) / (B * B_ref)), the
+  # asymptotic critical value at alpha = 0.001 (0.0087 at 1e5 against 1e5; the
+  # atom at zero makes the KS conservative), and the mass at zero within
+  # rlrt_zero_mass_se pooled two-proportion standard errors. MEASURED
+  # (2026-10-12, pawel, x86_64) over the six RLRsim references: worst KS
+  # 4.90e-3, 56% of the band (rlrt_cake), every other reference at or below
+  # 4.04e-3 (rlrt_large_k); worst mass-at-zero gap 1.77 standard errors
+  # (rlrt_cake), every other reference at or below 1.34 (rlrt_few_unbal).
+  rlrt_ks_coef = 1.95,
+  rlrt_zero_mass_se = 4,
+  # Exact RLRT, the observed statistic against RLRsim's (gate 5,
+  # registry-backed, quantity `rlrt`). glmm's statistic, 2 (l_R1 - l_R0) from
+  # the (1 | g) fit and the OLS fit made with reml = TRUE, against RLRsim's
+  # frozen statistic, absolute (src/inference/rlrt_oracle_tests.rs::
+  # rlrt_observed_matches_rlrsim, which reads the Rust copy in
+  # src/inference/rlrt_refs.rs::bands). Twice loglik_abs_lmm, since the
+  # statistic is twice a difference of REML log-likelihoods. MEASURED
+  # (2026-10-12, pawel, x86_64) over the six RLRsim references: worst 8.19e-12
+  # (rlrt_sleepstudy), every other reference at or below 5.49e-12
+  # (rlrt_large_k); on rlrt_dyestuff2 glmm's pinned fit gives exactly 0 against
+  # RLRsim's 5.68e-14, inside the band, so the statistic needs no entry.
+  rlrt_stat_abs = 4e-6,
+  # Exact RLRT, gate 1's fit-free part (Monte Carlo): on four balanced
+  # intercept-only designs, (K, J) = (6, 5), (3, 4), (4, 5) and (10, 3) with
+  # seeds 20261011 to 20261014, glmm's null at B = 1e5 against the one-way
+  # ANOVA F test, of which the RLRT is a function there: |ECDF(g(F_q)) - q|
+  # at the F quantiles above the atom, and the mass at zero against
+  # P(F <= 1), each within the DKW band sqrt(log(2 / alpha) / (2 B)) at
+  # alpha = rlrt_dkw_alpha, 6.165e-3 at B = 1e5
+  # (src/inference/rlrt_tests.rs::balanced_null_matches_anova_f, which reads
+  # the Rust copy in src/inference/rlrt_refs.rs::bands). MEASURED
+  # (2026-10-12, pawel, x86_64): worst 1.76e-3, 29% of the band (the mass at
+  # zero of (K, J) = (10, 3)); every quantile gap at or below 1.48e-3.
+  rlrt_dkw_alpha = 1e-3,
+  # Exact RLRT, the simulated p-value (Monte Carlo): within rlrt_p_se
+  # binomial standard errors plus 1 / (B + 1), the p-value's own floor, at
+  # B = 1e5. Against RLRsim's frozen p (gate 6, registry-backed, quantity
+  # `p_value`; src/inference/rlrt_oracle_tests.rs::rlrt_observed_matches_rlrsim,
+  # seed 20261021 + the entry's index among the manifest's rlrt entries), the
+  # standard error of two independent nulls, sqrt(2 p (1 - p) / B) with p
+  # RLRsim's, so where RLRsim's p is 0 the band is 1 / (B + 1) and glmm's p
+  # must be exactly 1 / (B + 1). Against Dyestuff's exact F-test p (gate 1,
+  # hard; src/inference/rlrt_tests.rs::rlrt_dyestuff_p_matches_anova_f, seed
+  # 20261015), sqrt(p (1 - p) / B) with p the F test's. Both read the Rust copy
+  # in src/inference/rlrt_refs.rs::bands. MEASURED (2026-10-12, pawel, x86_64):
+  # against RLRsim, worst 44% of the band (rlrt_few_unbal, 2.540e-3 against
+  # 2.170e-3), rlrt_dyestuff 10% (4.380e-3 against 4.260e-3); rlrt_sleepstudy,
+  # rlrt_cake and rlrt_large_k at exactly 1 / (B + 1) against RLRsim's 0;
+  # rlrt_dyestuff2 exactly 1 against RLRsim's 0.4392, the registered oracle
+  # defect (|1 - 0.4392| / 0.4392 = 1.2769). Against the F test, 9% of the
+  # band (4.470e-3 against 4.398e-3).
+  rlrt_p_se = 4,
+  # Exact RLRT, gate 7, the level at nominal alpha (Monte Carlo, feature
+  # montecarlo-tests). On three designs under H0, the X and groups of
+  # rlrt_dyestuff, rlrt_few_unbal and rlrt_cake with y iid N(0, 1), R = 2000
+  # datasets each (seeds 20261051 to 20261053), every statistic against one
+  # null of B = 1e5 draws per design (seeds 20261041 to 20261043): the
+  # rejection rate at alpha in {0.01, 0.05, 0.10} within
+  # rlrt_level_se * sqrt(alpha (1 - alpha) / R_kept) of alpha, R_kept the
+  # datasets kept (R less those whose (1 | g) fit did not converge or whose
+  # statistic is NaN, at most 1%), +-0.0146 at alpha = 0.05 with all R kept
+  # (src/inference/rlrt_montecarlo_tests.rs::level_rejection_rates, which reads
+  # the Rust copy in src/inference/rlrt_refs.rs::bands). The shared null's own
+  # error at B = 1e5 adds at most sqrt(alpha (1 - alpha) / B), about 7e-4 at
+  # alpha = 0.05. Set a priori; the study runs at release.
+  rlrt_level_se = 3,
+  # The REML log-likelihood at theta = 0 against R (gates 5 and 11, hard): the
+  # OLS fit made with reml = TRUE against the frozen
+  # logLik(lm, REML = TRUE) on every rlrt reference, the weighted
+  # rlrt_reml0_weighted included, absolute
+  # (src/inference/rlrt_oracle_tests.rs::ols_reml_loglik_matches_lm_reml, which
+  # reads the Rust copy in src/inference/rlrt_refs.rs::bands; the other copy is
+  # tests/oracle_support/mod.rs::tol, so a change reaches both). One closed form
+  # on both sides, so the band is set a priori. MEASURED (2026-10-12, pawel,
+  # x86_64) over the seven references: worst 9.09e-13 (rlrt_large_k,
+  # n = 3000), the weighted reference 1.14e-13, every other reference at or
+  # below 3.13e-13 (rlrt_dyestuff). Also read end to end on the formula
+  # route by tests/inference_oracle.rs::anova_pairs on the three ranova rows
+  # that reduce to no random effects, each against its entry's rlrt_entry.
+  # MEASURED (2026-10-12, pawel, x86_64): worst 3.13e-13 (rlrt_dyestuff),
+  # 1.14e-13 on rlrt_sleepstudy and on the weighted rlrt_reml0_weighted.
+  reml0_loglik_abs = 1e-9,
+  # The model comparisons end to end (end-to-end class, registry quantities
+  # `lrt`, `p_value`, `f`): every pair of goldens/inference/anova/ and every
+  # ranova row (full formula against the row's reduced one), both sides fitted
+  # by glmm and compared through formula::anova::compare
+  # (tests/inference_oracle.rs::anova_pairs). The deviance gate is read first,
+  # per side, on -2 logLik from the frozen `logLik`: glmm at most the oracle
+  # tier's DEV_EPS = 2e-4 (tests/oracle_support/mod.rs) above it. MEASURED
+  # (2026-10-12, pawel, x86_64) over 48 sides: worst |gap| 1.30e-5
+  # (anova_glmm_pair_grouseticks, glmm below lme4 on both sides by 1.30e-5 and
+  # 1.15e-5), every other side at or below 1.6e-7. Two pairs are not read
+  # against their own logLik: anova_glmm_vs_glm_sim_nb's glmer.nb side is read
+  # against the glmmTMB fit of the same model (goldens/sim_nb_glmm_tmb.json; gap
+  # -1.2e-9), since glmer.nb maximises another objective (lme4's reported
+  # deviance 0.0243 below glmm's, the goldens tier's registered sim_nb_glmm
+  # entries); the Gamma GLM pair, whose reference is a Wald F, has no deviance
+  # gate (R's logLik of a weighted Gamma glm multiplies each log-density by its
+  # weight and takes phi as the mean deviance: -358.999 against glmm's
+  # precision-weight maximum -330.523, which R reproduces by optimising
+  # sum(dgamma(y, w / phi, scale = mu phi / w, log = TRUE)) over phi).
+  # anova_ml_pair_sleepstudy_fixed is not compared: its smaller model Reaction ~
+  # 1 + (Days | Subject) is refused by the formula frontend (a random slope
+  # whose variable is no fixed term, SlopeVarNotInDesign), and the gate asserts
+  # that refusal. The statistic, absolute: twice DEV_EPS, the sum of the two
+  # sides' gaps the deviance gate admits. MEASURED (2026-10-12, pawel, x86_64)
+  # over the 22 likelihood-ratio rows: worst 1.49e-6
+  # (anova_glmm_pair_grouseticks), every other row at or below 1.5e-7
+  # (anova_glmm_pair_sim_binomial_slope1); anova_glmm_vs_glm_sim_nb 2.43e-2
+  # (glmm's statistic the smaller), the registered objective gap above.
+  lrt_abs = 4e-4,
+  # The likelihood-ratio p-value against the one the entry's `reference` names
+  # (p_chisq or p_mixture; none on the two rows inside the exact test's
+  # envelope, whose p is gated against RLRsim above), relative. lrt_abs carried
+  # through the tail: |d ln p| = h dT, h = -d ln p / dT read in R off the frozen
+  # statistic and reference of each gated row: maximum 0.848
+  # (anova_ranova_pastes, row 1: T = 0.658, the mixture with k = 0), every other
+  # row at or below 0.577. Rule ceil1(0.848 x 4e-4 = 3.39e-4) = 4e-4. MEASURED
+  # (2026-10-12, pawel) over 20 rows: worst 7.60e-7
+  # (anova_glmm_pair_grouseticks); anova_glmm_vs_glm_sim_nb 1.26e-2, registered.
+  lr_p_rel = 4e-4,
+  # The F and Wald rows (end-to-end class, registry quantities `f` and
+  # `p_value`): the OLS pairs' F against anova.lm's and the Gamma GLM pair's
+  # Wald F against car::linearHypothesis(test = "F") (anova_pairs), and per term
+  # through formula::anova::term_tests against car's Type II table and the Type
+  # III table of its contr.sum refit (car's (Intercept) rows and the
+  # treatment-coded Type III recorded only), on the glm and lm twins, the
+  # weighted lm on glm_gamma and the Gamma GLM's one linear hypothesis
+  # (tests/inference_oracle.rs::anova_term_rows). The statistic, relative: the
+  # beta/SE band, as for every other Wald quantity. MEASURED (2026-10-13, pawel,
+  # x86_64): worst 2.46e-5 (the Gamma Wald F, 19.04497 against 19.04451, on the
+  # pair and on the linear hypothesis alike: glm's IRLS stop); GLM Wald
+  # chi-square at or below 9.2e-7; OLS F at or below 3.8e-14 (the weighted lm on
+  # glm_gamma at or below 5.7e-15), except car_lm's contr.sum Type III h on
+  # sim_factorial at 5.74e-8, where term_tests' Type III L carries lmerTest's
+  # zapsmall rounding (7 digits) and car's contr.sum row is exact.
+  wald_rel = TOL$se_rel,
+  # The GLMM Wald chi-square rows (anova_car_glmm_sim_factorial_bern), relative.
+  # An oracle-side floor: the frozen treatment fit (Nelder_Mead, max|grad|
+  # 9.7e-4) stops short of lme4's tight optimum (bobyqa, rhoend 1e-12) by, for
+  # g, h, x and g:h, 7.1e-5, 5.1e-5, 2.9e-4 and 9.2e-4 on the Type II rows and
+  # 3.4e-6, 2.5e-4, 3.4e-5 and 3.6e-5 on the contr.sum Type III rows (MEASURED
+  # 2026-10-12 when the reference was frozen), and no logLik of the model is
+  # frozen, so no deviance gate can adjudicate. Rule 2 x 9.2e-4, ceil1: 2e-3.
+  # MEASURED (2026-10-12, pawel, x86_64), glmm against car: Type II 6.1e-5,
+  # 4.3e-5, 2.8e-4 and 9.41e-4; contr.sum Type III 1.0e-5, 2.5e-4, 3.8e-5 and
+  # 3.3e-5. Each within 2.2e-5 of the floor: glmm sits on lme4's tight optimum.
+  # The fit keeps the default wald_se and no HessianSeFallback note (car's vcov
+  # is lme4's finite-difference Hessian; the RX route moves the chi-square by 5
+  # to 13%).
+  wald_glmm_rel = 2e-3,
+  # The p-value of an F or Wald row, relative: the statistic's band carried
+  # through the tail, |d ln p| = kappa |d ln s|, kappa = |d ln p / d ln s| read
+  # in R off the frozen rows (the df are compared exactly): maximum 33.1
+  # (anova_car_lm_glm_gamma, contr.sum Type III x, F = 98.47 on 1 and 196 df;
+  # Type II x 30.5) over the wald_rel rows, 3.31e-2 at wald_rel; maximum 5.74
+  # (contr.sum Type III g) over the GLMM rows, 1.15e-2 at wald_glmm_rel. Rule
+  # ceil1 of the larger: 4e-2, the value of satt_p_rel. MEASURED (2026-10-13,
+  # pawel, x86_64): worst 2.24e-4 (the Gamma Wald F); GLMM rows at or below
+  # 3.39e-4 (Type II g); GLM rows at or below 5.0e-6; OLS rows at or below
+  # 1.1e-7 (the weighted lm on glm_gamma at or below 2.8e-14).
+  wald_p_rel = 4e-2,
+  # The Satterthwaite per-term rows of the lmerTest tables through term_tests
+  # (hard: these names are registry-gated by the in-crate driver of
+  # src/formula/hypotheses_oracle_tests.rs alone; tests/inference_oracle.rs::
+  # lmertest_term_rows_match_anova): F and DenDF at df_e2e_rel, Sum Sq and
+  # Mean Sq at sum_sq_rel, NumDF exactly, and the p-value relative. df_e2e_rel
+  # on F and on DenDF carried through the
+  # tail: kappa_F + kappa_nu, read in R off the frozen rows (kappa_nu = |d ln p
+  # / d ln DenDF| by central differences): maximum 31.7
+  # (lmertest_anova_sim_factorial_ml, Type II g: 23.6 + 8.1), 3.17e-2 at 1e-3.
+  # Rule ceil1: 4e-2. MEASURED (2026-10-12, pawel, x86_64) over sim_factorial,
+  # its _ml twin and sim_factorial_empty, Type III and II (24 rows): F worst
+  # 6.21e-6 and DenDF worst 4.41e-6 (_ml, x), p worst 3.02e-5 (Type II g).
+  satt_p_rel = 4e-2,
+  # lmerTest's Sum Sq and Mean Sq (F times sigma-hat squared, times NumDF) on
+  # the Satterthwaite per-term rows, relative: df_e2e_rel on F (written as
+  # se_rel, which df_e2e_rel is; a list cannot read its own entries) plus
+  # twice stddev_rel on sigma-hat squared. MEASURED (2026-10-13, pawel, x86_64) over
+  # the same 24 rows: worst 7.40e-6 on both (_ml, x).
+  sum_sq_rel = TOL$se_rel + 2 * TOL$stddev_rel
 )
 
 # Max relative difference over two aligned numeric vectors; NA on length mismatch

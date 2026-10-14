@@ -7,7 +7,6 @@ use super::parse::{ParsedFormula, Term};
 
 /// How the fixed parts of two formulas relate (see [`fixed_part_relation`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(feature = "orchestrate"), allow(dead_code))] // removed by P31-T6
 pub(crate) enum FixedPartRelation {
     /// The same fixed terms and the same fixed intercept.
     Same,
@@ -32,7 +31,6 @@ pub(crate) enum FixedPartRelation {
 /// never the data.
 ///
 /// The response, the offset and the random part are not read.
-#[cfg_attr(not(feature = "orchestrate"), allow(dead_code))] // removed by P31-T6
 pub(crate) fn fixed_part_relation(a: &ParsedFormula, b: &ParsedFormula) -> FixedPartRelation {
     let (a, b) = (fixed_terms(a), fixed_terms(b));
     match (a.is_subset(&b), b.is_subset(&a)) {
@@ -44,7 +42,6 @@ pub(crate) fn fixed_part_relation(a: &ParsedFormula, b: &ParsedFormula) -> Fixed
 }
 
 /// The fixed terms as sets of variable names, the intercept as the empty set.
-#[cfg_attr(not(feature = "orchestrate"), allow(dead_code))] // removed by P31-T6
 fn fixed_terms(f: &ParsedFormula) -> BTreeSet<BTreeSet<&str>> {
     let mut terms: BTreeSet<BTreeSet<&str>> = f
         .terms

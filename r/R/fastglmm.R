@@ -183,7 +183,9 @@
 #'   converge) and `coef_p` (its p-value), `df_method`
 #'   (`"satterthwaite"`, `"residual"`, `"none"`, `"disabled"` or `"failed"`),
 #'   `rss`, `r_squared` and `adj_r_squared` (OLS fits only, `NaN` otherwise),
-#'   plus
+#'   `offset` (the offset fitted with, `NULL` without one), plus
+#'   [anova()][anova.fastglmm] (the per-term tests, built at fit time, or a
+#'   comparison of two fits),
 #'   `print()`, [summary()][summary.fastglmm], [confint()][confint.fastglmm]
 #'   (Wald), `nobs()`, [formula()][formula.fastglmm] (returns the formula
 #'   **string**), `family()`, `model.frame()`, [ranef()][ranef.fastglmm],
@@ -247,13 +249,7 @@ fastglmm <- function(formula, data, family = gaussian(),
          call. = FALSE)
   }
 
-  if (!(is.numeric(nAGQ) && length(nAGQ) == 1L && !is.na(nAGQ) &&
-        nAGQ == as.integer(nAGQ) && nAGQ >= 1L && nAGQ <= .MAX_NAGQ &&
-        nAGQ %% 2L == 1L)) {
-    stop(sprintf("nAGQ must be an odd integer in 1..=%d, got %s", .MAX_NAGQ, .arg_repr(nAGQ)),
-         call. = FALSE)
-  }
-  nAGQ <- as.integer(nAGQ)
+  nAGQ <- .check_nagq(nAGQ)
 
   store <- new.env(parent = emptyenv())
   store$rows <- list()
@@ -329,66 +325,12 @@ fastglmm <- function(formula, data, family = gaussian(),
 
   # --- data prep: row filtering (subset, na.action) happens HERE, on the
   # data.frame, before marshalling - data prep, not parsing (spec section 3.1). ---
-  if (!is.data.frame(data)) {
-    # as.data.frame() recycles a short list column whose length divides the
-    # longest one; model.frame() (glm, lme4) refuses that, and so does this.
-    # Same message as run_fit's length check in src/orchestrate.rs - change
-    # together.
-    if (is.list(data)) {
-      len <- vapply(data[intersect(all.vars(formula), names(data))], NROW, integer(1))
-      if (length(unique(len)) > 1L) {
-        len <- len[order(names(len), method = "radix")]
-        stop(sprintf(
-          "columns have mismatched lengths (%s); all columns must have the same length",
-          paste(sprintf('"%s": %d', names(len), len), collapse = ", ")
-        ), call. = FALSE)
-      }
-    }
-    data <- as.data.frame(data)
-  }
+  data <- .as_data_frame(data, all.vars(formula))
   vars <- all.vars(formula)
-  missing_cols <- setdiff(vars, names(data))
-  if (length(missing_cols)) {
-    stop("column(s) not found in data: ", paste(missing_cols, collapse = ", "),
-         call. = FALSE)
-  }
-  frame <- data[vars]
+  frame <- .data_columns(data, vars)
   .check_contrasts(formula, frame)
-
-  w <- eval(substitute(weights), data, parent.frame())
-  if (!is.null(w)) {
-    if (!is.numeric(w) || length(w) != nrow(data) || anyNA(w)) {
-      stop("weights must be a numeric array with one entry per row of data",
-           call. = FALSE)
-    }
-    if (!all(is.finite(w))) {
-      stop("weights must be finite: no NaN, inf, or missing entries", call. = FALSE)
-    }
-    if (any(w <= 0)) {
-      # The kernel requires strictly positive weights; a zero weight is a row
-      # that should not be in the fit at all.
-      stop("weights must be positive; drop zero-weight rows from data instead",
-           call. = FALSE)
-    }
-    frame[["(weights)"]] <- as.double(w)
-  }
-
-  # An offset is normally written as an expression over the data
-  # (offset = log(exposure)), so it is evaluated like weights= and parked in
-  # the frame: subset= and na.action must drop its entries in lockstep with
-  # the rows, and reading it off `data` after the filtering would misalign it
-  # against a subset fit with no error anywhere.
-  o <- eval(substitute(offset), data, parent.frame())
-  if (!is.null(o)) {
-    if (!is.numeric(o) || length(o) != nrow(data) || anyNA(o)) {
-      stop("offset must be a numeric array with one entry per row of data",
-           call. = FALSE)
-    }
-    if (!all(is.finite(o))) {
-      stop("offset must be finite: no NaN, inf, or missing entries", call. = FALSE)
-    }
-    frame[["(offset)"]] <- as.double(o)
-  }
+  frame <- .add_weights(frame, eval(substitute(weights), data, parent.frame()), nrow(data))
+  frame <- .add_offset(frame, eval(substitute(offset), data, parent.frame()), nrow(data))
 
   s <- eval(substitute(subset), data, parent.frame())
   if (!is.null(s)) frame <- frame[s, , drop = FALSE]
@@ -430,37 +372,10 @@ fastglmm <- function(formula, data, family = gaussian(),
   w <- frame[["(weights)"]]
   o <- frame[["(offset)"]]
 
-  # --- marshalling: factors cross as (levels, 0-based codes) so the caller's
-  # declared level order (the treatment base) survives into Rust's
-  # Column::Factor - the declared-order path. ---
-  # A logical predictor or grouping column is a factor, as lme4 builds it
-  # (model.matrix() and mkReTrms() both go through factor()): levels
-  # "FALSE"/"TRUE", a dummy named xTRUE, and indicator columns (xFALSE:z,
-  # xTRUE:z) wherever R's marginality rule codes it without a contrast. The
-  # response and offset() stay 0/1 numerics, as glm() reads them.
-  numeric_only <- c(all.vars(formula[[2L]]), .offset_vars(formula))
-  numeric_cols <- list()
-  factor_levels <- list()
-  factor_codes <- list()
-  for (nm in vars) {
-    col <- frame[[nm]]
-    if (is.character(col) || (is.logical(col) && !(nm %in% numeric_only))) {
-      col <- factor(col) # lexicographic (FALSE < TRUE), as factor() does
-    }
-    if (is.factor(col)) {
-      factor_levels[[nm]] <- as.character(levels(col))
-      factor_codes[[nm]] <- as.integer(col) - 1L
-    } else if (is.numeric(col) || is.logical(col)) {
-      numeric_cols[[nm]] <- as.double(col)
-    } else {
-      stop("column '", nm, "' has unsupported type ", class(col)[1L],
-           "; pass numeric, logical, factor, or character columns",
-           call. = FALSE)
-    }
-  }
+  cols <- .marshal(frame, vars, c(all.vars(formula[[2L]]), .offset_vars(formula)))
 
   r <- fastglmm_fit(
-    f_str, numeric_cols, factor_levels, factor_codes,
+    f_str, cols$numeric, cols$levels, cols$codes,
     fam$name, fam$link, wald.se, nAGQ,
     if (is.null(dispersion)) double() else as.double(dispersion),
     if (is.null(w)) double() else as.double(w),
@@ -472,6 +387,15 @@ fastglmm <- function(formula, data, family = gaussian(),
     if (is.null(REML)) logical() else REML
   )
 
+  .fit_object(r, store, fam, nAGQ, dispersion, f_str, frame, match.call(), data_name)
+}
+
+# The fit object from the kernel's raw list `r`: raises the fit's warnings
+# (into `store`, which already holds the data-prep ones) and builds the
+# "fastglmm" list. fastglmm() and compare() share it, so a fit made by
+# compare() is the object fastglmm() makes.
+.fit_object <- function(r, store, fam, nAGQ, dispersion, f_str, frame, call, data_name) {
+  ignored <- c("fastglmm_argument_ignored", "fastglmm_diagnostic")
   # Whether the FITTED model actually has random effects - not `mixed`, which
   # only says the formula asked for some: a single-level grouping is dropped
   # after lowering ("single_level_grouping_dropped"), and once every
@@ -640,12 +564,42 @@ fastglmm <- function(formula, data, family = gaussian(),
     # kernel, not `weights=`: a cbind() LHS lowers to trial-count weights the
     # caller never passed, and Pearson residuals need them.
     weights = r$weights,
-    call = match.call(),
+    # The design summary of a Gaussian fit whose only random term is one
+    # random intercept (1 | g), with no prior weights and at least one
+    # fixed-effect column; NULL on every other fit. list(counts, s, c), with
+    # K = the highest observed level code + 1 (a level below it with no rows
+    # counts 0; unused levels after it are not counted, so K can be less than
+    # nlevels(g)) and p retained fixed-effect columns, on the fit's
+    # orthogonalized design X~ (it spans the column space of the fixed-effect
+    # design): counts (K, rows per level), s (p * K, the
+    # p x K matrix X~'Z column-major, so matrix(s, p, K)) and c (p * p, the
+    # p x p matrix X~'X~, symmetric). Mirrors the Python port's
+    # Fit.design_summary - change together.
+    design_summary = r$design_summary,
+    # The offset the kernel fitted with (offset= or an offset() term), NULL
+    # without one: anova(m0, m1) checks that two fits share it. Mirrors the
+    # Python port's Fit.offset - change together.
+    offset = r$offset,
+    # What the fit maximised, as the crate labels it ("least_squares",
+    # "maximum_likelihood", "reml", "laplace", "agq") with its quadrature
+    # node count (1 on "laplace", the count on "agq", 0 elsewhere).
+    objective = r$objective,
+    objective_nodes = r$objective_nodes,
+    # The per-term tables anova(m) prints, built by the crate at fit time:
+    # list(error = NULL, ss_type, label, kind, statistic, num_df, den_df,
+    # den_df_kind, p_value, sum_sq, mean_sq, row_notes, notes), one entry per
+    # term in each column, or list(error = <message>) when the formula gets no
+    # table (an interaction without its marginal terms).
+    term_table_type3 = r$term_table_type3,
+    term_table_type2 = r$term_table_type2,
+    call = call,
     formula = f_str,
     family = fam$object,
     # Port-vocabulary family name ("gamma", not R's "Gamma") - what the
     # methods dispatch on; `family` above is the R-facing object.
     family_name = fam$name,
+    # The port-vocabulary link ("inverse_squared", not R's "1/mu^2").
+    link = fam$link,
     frame = frame,
     nobs = nrow(frame),
     data_name = data_name,
@@ -653,6 +607,115 @@ fastglmm <- function(formula, data, family = gaussian(),
     # (with the warning surfaced above), so record what actually ran.
     nAGQ = if (is.null(r$agq_warning)) nAGQ else 1L
   ), class = "fastglmm")
+}
+
+# `data` as a data.frame, refusing a list whose columns among `vars` have
+# different lengths.
+.as_data_frame <- function(data, vars) {
+  if (is.data.frame(data)) return(data)
+  # as.data.frame() recycles a short list column whose length divides the
+  # longest one; model.frame() (glm, lme4) refuses that, and so does this.
+  # Same message as run_fit's length check in src/orchestrate.rs - change
+  # together.
+  if (is.list(data)) {
+    len <- vapply(data[intersect(vars, names(data))], NROW, integer(1))
+    if (length(unique(len)) > 1L) {
+      len <- len[order(names(len), method = "radix")]
+      stop(sprintf(
+        "columns have mismatched lengths (%s); all columns must have the same length",
+        paste(sprintf('"%s": %d', names(len), len), collapse = ", ")
+      ), call. = FALSE)
+    }
+  }
+  as.data.frame(data)
+}
+
+# The columns `vars` of `data`, every one of them present.
+.data_columns <- function(data, vars) {
+  missing_cols <- setdiff(vars, names(data))
+  if (length(missing_cols)) {
+    stop("column(s) not found in data: ", paste(missing_cols, collapse = ", "),
+         call. = FALSE)
+  }
+  data[vars]
+}
+
+# `frame` with the evaluated weights= argument `w` parked as "(weights)", or
+# unchanged when `w` is NULL; `n` is the row count of the data. With
+# `missing_ok` (compare()), an NA entry is kept for the row mask to drop.
+.add_weights <- function(frame, w, n, missing_ok = FALSE) {
+  if (is.null(w)) return(frame)
+  if (!is.numeric(w) || length(w) != n || (!missing_ok && anyNA(w))) {
+    stop("weights must be a numeric array with one entry per row of data",
+         call. = FALSE)
+  }
+  if (!all(is.finite(w[!is.na(w)]))) {
+    # Mirrors the Python port's wording - change together.
+    stop(if (missing_ok) "weights must be finite or missing: no inf entries"
+         else "weights must be finite: no NaN, inf, or missing entries", call. = FALSE)
+  }
+  if (any(w <= 0, na.rm = TRUE)) {
+    # The kernel requires strictly positive weights; a zero weight is a row
+    # that should not be in the fit at all.
+    stop("weights must be positive; drop zero-weight rows from data instead",
+         call. = FALSE)
+  }
+  frame[["(weights)"]] <- as.double(w)
+  frame
+}
+
+# `frame` with the evaluated offset= argument `o` parked as "(offset)". An
+# offset is normally written as an expression over the data
+# (offset = log(exposure)), so it is evaluated like weights= and parked in
+# the frame: subset= and na.action must drop its entries in lockstep with the
+# rows, and reading it off `data` after the filtering would misalign it
+# against a subset fit with no error anywhere. `missing_ok` as for weights.
+.add_offset <- function(frame, o, n, missing_ok = FALSE) {
+  if (is.null(o)) return(frame)
+  if (!is.numeric(o) || length(o) != n || (!missing_ok && anyNA(o))) {
+    stop("offset must be a numeric array with one entry per row of data",
+         call. = FALSE)
+  }
+  if (!all(is.finite(o[!is.na(o)]))) {
+    # Mirrors the Python port's wording - change together.
+    stop(if (missing_ok) "offset must be finite or missing: no inf entries"
+         else "offset must be finite: no NaN, inf, or missing entries", call. = FALSE)
+  }
+  frame[["(offset)"]] <- as.double(o)
+  frame
+}
+
+# The columns `vars` of `frame` marshalled for the kernel: list(numeric =,
+# levels =, codes =). Factors cross as (levels, 0-based codes) so the
+# caller's declared level order (the treatment base) survives into Rust's
+# Column::Factor - the declared-order path.
+# A logical predictor or grouping column is a factor, as lme4 builds it
+# (model.matrix() and mkReTrms() both go through factor()): levels
+# "FALSE"/"TRUE", a dummy named xTRUE, and indicator columns (xFALSE:z,
+# xTRUE:z) wherever R's marginality rule codes it without a contrast. The
+# response and offset() variables (`numeric_only`) stay 0/1 numerics, as
+# glm() reads them.
+.marshal <- function(frame, vars, numeric_only) {
+  numeric_cols <- list()
+  factor_levels <- list()
+  factor_codes <- list()
+  for (nm in vars) {
+    col <- frame[[nm]]
+    if (is.character(col) || (is.logical(col) && !(nm %in% numeric_only))) {
+      col <- factor(col) # lexicographic (FALSE < TRUE), as factor() does
+    }
+    if (is.factor(col)) {
+      factor_levels[[nm]] <- as.character(levels(col))
+      factor_codes[[nm]] <- as.integer(col) - 1L
+    } else if (is.numeric(col) || is.logical(col)) {
+      numeric_cols[[nm]] <- as.double(col)
+    } else {
+      stop("column '", nm, "' has unsupported type ", class(col)[1L],
+           "; pass numeric, logical, factor, or character columns",
+           call. = FALSE)
+    }
+  }
+  list(numeric = numeric_cols, levels = factor_levels, codes = factor_codes)
 }
 
 # kind -> c(tier, title), one fixed pair per kind. Mirrors the Python port's
@@ -1039,6 +1102,17 @@ fastglmm <- function(formula, data, family = gaussian(),
     )
   }
   invisible()
+}
+
+# nAGQ as an integer, or an error.
+.check_nagq <- function(nAGQ) {
+  if (!(is.numeric(nAGQ) && length(nAGQ) == 1L && !is.na(nAGQ) &&
+        nAGQ == as.integer(nAGQ) && nAGQ >= 1L && nAGQ <= .MAX_NAGQ &&
+        nAGQ %% 2L == 1L)) {
+    stop(sprintf("nAGQ must be an odd integer in 1..=%d, got %s", .MAX_NAGQ, .arg_repr(nAGQ)),
+         call. = FALSE)
+  }
+  as.integer(nAGQ)
 }
 
 # lme4's `REML =`: only the type is checked here. What each value means on

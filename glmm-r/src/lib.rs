@@ -12,6 +12,10 @@
 
 use std::collections::HashMap;
 
+use glmm::formula::anova::{
+    compare, CompareError, Comparison, ComparisonTest, Differs, Model, ModelInfo, Side,
+};
+use glmm::inference::Reference;
 use glmm::orchestrate;
 
 use extendr_api::error::Result;
@@ -108,16 +112,8 @@ fn fastglmm_fit(
     let nagq = u8::try_from(nagq)
         .map_err(|_| Error::Other(format!("nagq {nagq} is out of range for u8")))?;
     let dispersion = dispersion.first().copied();
-    let weights = if weights.is_empty() {
-        None
-    } else {
-        Some(weights.to_vec())
-    };
-    let offset = if offset.is_empty() {
-        None
-    } else {
-        Some(offset.to_vec())
-    };
+    let weights = optional(weights);
+    let offset = optional(offset);
     let start_dispersion = start_dispersion.first().copied();
     let reml = match reml {
         [] => None,
@@ -147,7 +143,17 @@ fn fastglmm_fit(
         reml,
     )
     .map_err(Error::Other)?;
+    Ok(fit_list(r))
+}
 
+/// The empty-means-absent decoding of an optional vector argument.
+fn optional(values: &[f64]) -> Option<Vec<f64>> {
+    (!values.is_empty()).then(|| values.to_vec())
+}
+
+/// A `FitResult` as the named R list `fastglmm_fit` returns; `fastglmm_compare`
+/// returns its two fits the same way.
+fn fit_list(r: orchestrate::FitResult) -> List {
     let vcov_flat: Vec<f64> = r.vcov.iter().flatten().copied().collect();
     let varcorr = List::from_values(r.varcorr.iter().map(|v| r!(v.clone())));
     let re_group_names: Vec<String> = r.re_groups.iter().map(|(n, _)| n.clone()).collect();
@@ -162,6 +168,10 @@ fn fastglmm_fit(
     };
     let weights: Robj = match r.weights {
         Some(w) => r!(w),
+        None => r!(NULL),
+    };
+    let design_summary: Robj = match r.design_summary {
+        Some((counts, s, c)) => r!(list!(counts = counts, s = s, c = c)),
         None => r!(NULL),
     };
     let pinned = List::from_values(r.pinned.iter().map(|flags| r!(flags.clone())));
@@ -196,7 +206,13 @@ fn fastglmm_fit(
             ))
         }));
 
-    Ok(list!(
+    let offset: Robj = match r.offset {
+        Some(o) => r!(o),
+        None => r!(NULL),
+    };
+    let (objective, objective_nodes) = orchestrate::objective_parts(r.objective);
+
+    list!(
         beta = r.beta,
         se = r.se,
         vcov = vcov_flat,
@@ -230,6 +246,7 @@ fn fastglmm_fit(
         ranef_blocks = ranef_blocks,
         y = r.y,
         weights = weights,
+        design_summary = design_summary,
         nobs = r.nobs as f64,
         boundary = r.boundary,
         pinned = pinned,
@@ -239,8 +256,40 @@ fn fastglmm_fit(
         df_method = r.df_method,
         rss = r.rss,
         r_squared = r.r_squared,
-        adj_r_squared = r.adj_r_squared
-    ))
+        adj_r_squared = r.adj_r_squared,
+        offset = offset,
+        objective = objective,
+        objective_nodes = objective_nodes as i32,
+        term_table_type3 = term_list(&r.term_table_type3),
+        term_table_type2 = term_list(&r.term_table_type2)
+    )
+}
+
+/// A stored per-term result as a named list: `error` is the refusal's
+/// message, or `NULL` beside the table's columns (`orchestrate::TermColumns`,
+/// one entry per row; `row_notes` a list of character vectors).
+fn term_list(result: &std::result::Result<glmm::formula::anova::TermTable, String>) -> List {
+    match result {
+        Err(message) => list!(error = message.clone()),
+        Ok(table) => {
+            let c = orchestrate::term_columns(table);
+            list!(
+                error = r!(NULL),
+                ss_type = c.ss_type,
+                label = c.label,
+                kind = c.kind,
+                statistic = c.statistic,
+                num_df = c.num_df,
+                den_df = c.den_df,
+                den_df_kind = c.den_df_kind,
+                p_value = c.p_value,
+                sum_sq = c.sum_sq,
+                mean_sq = c.mean_sq,
+                row_notes = List::from_values(c.row_notes.iter().map(|n| r!(n.clone()))),
+                notes = c.notes
+            )
+        }
+    }
 }
 
 /// `glmm::orchestrate::confint` for `confint.fastglmm`: the lower and upper
@@ -277,9 +326,317 @@ fn fastglmm_same_fixed_part(f0: &str, f1: &str) -> Result<bool> {
     orchestrate::same_fixed_part(f0, f1).map_err(Error::Other)
 }
 
+/// `nsim` and `seed` of a comparison, decoded for
+/// `orchestrate::compare_options`, which checks the range of `nsim`: an
+/// empty vector is `None`. The R wrapper has checked that each is one whole
+/// number.
+fn nsim_seed(nsim: &[f64], seed: &[f64]) -> Result<(Option<usize>, Option<u64>)> {
+    let whole = |v: f64, max: f64| v >= 0.0 && v.fract() == 0.0 && v <= max;
+    let nsim = match nsim {
+        [] => None,
+        [v] if whole(*v, 1e15) => Some(*v as usize),
+        [v] => {
+            return Err(Error::Other(format!(
+                "nsim must be a whole number from 1 to {}, got {v}",
+                orchestrate::MAX_NSIM
+            )))
+        }
+        _ => return Err(Error::Other("nsim must be empty or one number".into())),
+    };
+    let seed = match seed {
+        [] => None,
+        [v] if whole(*v, 9_007_199_254_740_992.0) => Some(*v as u64),
+        _ => {
+            return Err(Error::Other(
+                "seed must be empty or one whole number from 0 to 2^53".into(),
+            ))
+        }
+    };
+    Ok((nsim, seed))
+}
+
+/// `glmm::orchestrate::run_compare` for `compare()`: fits the two formulas on
+/// the same pre-marshalled columns (the R wrapper has dropped every row with
+/// a missing value in a variable of either formula, the weights or the
+/// offset) and returns `list(comparison, fit0, fit1, nsim, seed)`: the
+/// comparison as `comparison_list` flattens it, each fit as `fastglmm_fit`
+/// returns one, and the draws requested and the seed of the exact test.
+/// Empty `weights`, `offset`, `nsim` and `seed` are absent.
+///
+/// @usage NULL
+/// @keywords internal
+#[extendr]
+#[allow(clippy::too_many_arguments)]
+fn fastglmm_compare(
+    f0: &str,
+    f1: &str,
+    numeric: List,
+    factor_levels: List,
+    factor_codes: List,
+    family: &str,
+    link: &str,
+    nagq: i32,
+    weights: &[f64],
+    offset: &[f64],
+    nsim: &[f64],
+    seed: &[f64],
+) -> Result<List> {
+    let nagq = u8::try_from(nagq)
+        .map_err(|_| Error::Other(format!("nagq {nagq} is out of range for u8")))?;
+    let (nsim, seed) = nsim_seed(nsim, seed)?;
+    let r = orchestrate::run_compare(
+        f0,
+        f1,
+        numeric_map(numeric)?,
+        factor_map(factor_levels, factor_codes)?,
+        family,
+        link,
+        nagq,
+        optional(weights),
+        optional(offset),
+        nsim,
+        seed,
+    )
+    .map_err(Error::Other)?;
+    Ok(list!(
+        comparison = comparison_list(&r.comparison)?,
+        fit0 = fit_list(r.fit0),
+        fit1 = fit_list(r.fit1),
+        nsim = r.nsim as f64,
+        seed = r.seed as f64
+    ))
+}
+
+/// `glmm::formula::anova::compare` for `anova(m0, m1)`: compares two stored
+/// fits as they are, with no refit and no data. `m0` and `m1` are named lists
+/// of the fields a fit object stores (the R wrapper's `.compare_side()`
+/// builds them). Returns `list(comparison, nsim, seed)` as `fastglmm_compare`
+/// does, or, when the pair cannot be compared, `list(refusal, kind)`: the
+/// refusal's message and its kind, so the wrapper can point to its own
+/// `compare()` where the kind calls for it (`kind` is `"other"` for the
+/// refusals that need no pointer).
+///
+/// @usage NULL
+/// @keywords internal
+#[extendr]
+fn fastglmm_anova_pair(m0: List, m1: List, nsim: &[f64], seed: &[f64]) -> Result<List> {
+    let (nsim, seed) = nsim_seed(nsim, seed)?;
+    let opts = orchestrate::compare_options(nsim, seed).map_err(Error::Other)?;
+    match compare(&model_of(&m0)?, &model_of(&m1)?, &opts) {
+        Ok(c) => Ok(list!(
+            comparison = comparison_list(&c)?,
+            nsim = opts.nsim as f64,
+            seed = opts.seed as f64
+        )),
+        Err(e) => Ok(list!(refusal = e.to_string(), kind = refusal_kind(&e))),
+    }
+}
+
+/// The refusals whose R message points to `compare()`, by kind.
+fn refusal_kind(e: &CompareError) -> &'static str {
+    match e {
+        CompareError::DifferentRows { .. } => "different_rows",
+        CompareError::DifferentY => "different_y",
+        CompareError::DifferentWeights => "different_weights",
+        CompareError::DifferentOffset => "different_offset",
+        CompareError::DifferentFamily { .. } => "different_family",
+        CompareError::MixedEstimators { .. } => "mixed_estimators",
+        CompareError::RemlDifferentFixed => "reml_different_fixed",
+        _ => "other",
+    }
+}
+
+/// One side of `anova(m0, m1)`: a `Model` from a fit object's stored fields,
+/// named as in `Model` (`family` and `link` in the ports' vocabulary,
+/// `objective` and `objective_nodes` as `orchestrate::objective_parts` gives
+/// them, `re_group_names` and `re_group_terms` for `re_groups`, `vcov`
+/// flattened row-major, `design_summary` `NULL` or `list(counts, s, c)`).
+/// An empty `weights`, `offset` or `dispersion_held` is absent.
+fn model_of(side: &List) -> Result<Model> {
+    let fields: HashMap<&str, Robj> = side.iter().collect();
+    let bad = |name: &str| Error::Other(format!("fit field {name:?} is missing or malformed"));
+    let get = |name: &str| fields.get(name).ok_or_else(|| bad(name));
+    let reals = |name: &str| get(name)?.as_real_vector().ok_or_else(|| bad(name));
+    let real = |name: &str| -> Result<f64> {
+        match reals(name)?.as_slice() {
+            [v] => Ok(*v),
+            _ => Err(bad(name)),
+        }
+    };
+    let count = |name: &str| -> Result<usize> {
+        let v = real(name)?;
+        if v >= 0.0 && v.fract() == 0.0 {
+            Ok(v as usize)
+        } else {
+            Err(bad(name))
+        }
+    };
+    let text = |name: &str| {
+        get(name)?
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| bad(name))
+    };
+    let flag = |name: &str| get(name)?.as_bool().ok_or_else(|| bad(name));
+    let list = |name: &str| List::try_from(get(name)?).map_err(|_| bad(name));
+    let flags = |name: &str| -> Result<Vec<bool>> {
+        let v = get(name)?.as_logical_vector().ok_or_else(|| bad(name))?;
+        Ok(v.iter().map(|b| b.is_true()).collect())
+    };
+
+    let family =
+        orchestrate::family_from_str(&text("family")?, &text("link")?).map_err(Error::Other)?;
+    let nodes = u8::try_from(count("objective_nodes")?).map_err(|_| bad("objective_nodes"))?;
+    let objective =
+        orchestrate::objective_from_parts(&text("objective")?, nodes).map_err(Error::Other)?;
+    let varcorr = list("varcorr")?
+        .values()
+        .map(|b| b.as_real_vector().ok_or_else(|| bad("varcorr")))
+        .collect::<Result<Vec<_>>>()?;
+    let names = get("re_group_names")?
+        .as_string_vector()
+        .ok_or_else(|| bad("re_group_names"))?;
+    let terms = list("re_group_terms")?
+        .values()
+        .map(|t| t.as_string_vector().ok_or_else(|| bad("re_group_terms")))
+        .collect::<Result<Vec<_>>>()?;
+    let design_summary = match get("design_summary")? {
+        d if d.is_null() => None,
+        d => {
+            let d: HashMap<&str, Robj> = List::try_from(d)
+                .map_err(|_| bad("design_summary"))?
+                .iter()
+                .collect();
+            let part = |name: &str| {
+                d.get(name)
+                    .and_then(|v| v.as_real_vector())
+                    .ok_or_else(|| bad("design_summary"))
+            };
+            Some((part("counts")?, part("s")?, part("c")?))
+        }
+    };
+    let coef = reals("coef")?;
+    let p = coef.len();
+    let vcov_flat = reals("vcov")?;
+    if vcov_flat.len() != p * p {
+        return Err(bad("vcov"));
+    }
+    Ok(Model {
+        formula: text("formula")?,
+        family,
+        loglik: real("loglik")?,
+        df: count("df")?,
+        nobs: count("nobs")?,
+        reml: flag("reml")?,
+        objective,
+        converged: flag("converged")?,
+        varcorr,
+        re_groups: names.into_iter().zip(terms).collect(),
+        y: reals("y")?,
+        weights: optional(&reals("weights")?),
+        offset: optional(&reals("offset")?),
+        dispersion_held: reals("dispersion_held")?.first().copied(),
+        design_summary,
+        rss: real("rss")?,
+        coef_names: get("coef_names")?
+            .as_string_vector()
+            .ok_or_else(|| bad("coef_names"))?,
+        coef,
+        vcov: vcov_flat.chunks(p.max(1)).map(<[f64]>::to_vec).collect(),
+        aliased: flags("aliased")?,
+    })
+}
+
+/// A `Comparison` as a named list for the R wrapper:
+/// - `larger`: `"m0"` or `"m1"`, the side whose model is the larger;
+/// - `differs`: `"fixed"`, `"random"` or `"both"`, the parts that differ;
+/// - `m0`, `m1`: each side's `formula`, `npar`, `nobs`, `loglik`, `aic` and
+///   `bic` (`NULL` on a REML fit) and `objective` (`objective_parts`' label);
+/// - the test: `test` (`"lr"` or `"linear"`), `statistic`, `df` (the LR
+///   test's df or the F's numerator df), `p_value`, and on an LR test the
+///   `objective` and `objective_nodes` it is labelled with (`""` and 0 on an
+///   F);
+/// - the reference: `reference` (`"chisq"`, `"chibar"`, `"exact"` or `"F"`),
+///   `ref_df` (the chi-squared df, the mixture's lower df, the F's numerator
+///   df), `den_df` (the F's), and on the exact test `draws`, the draws made
+///   (0 when none were needed), and `seed`;
+/// - `notes`: the test's notes as sentences.
+fn comparison_list(c: &Comparison) -> Result<List> {
+    let side = |m: &ModelInfo| {
+        let opt = |v: Option<f64>| v.map_or(r!(NULL), |v| r!(v));
+        list!(
+            formula = m.formula_label.clone(),
+            npar = m.npar as f64,
+            nobs = m.nobs as f64,
+            loglik = m.loglik,
+            aic = opt(m.aic),
+            bic = opt(m.bic),
+            objective = orchestrate::objective_parts(m.objective).0
+        )
+    };
+    let (test, statistic, df, p_value, reference, objective) = match &c.test {
+        ComparisonTest::Lr(t) => (
+            "lr",
+            t.statistic,
+            t.df as f64,
+            t.p_value,
+            t.reference,
+            orchestrate::objective_parts(t.objective),
+        ),
+        ComparisonTest::Linear(t) => (
+            "linear",
+            t.statistic,
+            t.num_df,
+            t.p_value,
+            t.reference,
+            ("", 0),
+        ),
+        _ => {
+            return Err(Error::Other(
+                "a comparison test this port does not know".into(),
+            ))
+        }
+    };
+    let nan = f64::NAN;
+    let (kind, ref_df, den_df, draws, seed) = match reference {
+        Reference::ChiSquared { df } => ("chisq", df as f64, nan, nan, nan),
+        Reference::ChiBarSquared { df_low } => ("chibar", df_low as f64, nan, nan, nan),
+        Reference::ExactRlrt { nsim, seed } => ("exact", nan, nan, nsim as f64, seed as f64),
+        Reference::F { num_df, den_df, .. } => ("F", num_df, den_df, nan, nan),
+        _ => return Err(Error::Other("a reference this port does not know".into())),
+    };
+    Ok(list!(
+        larger = match c.larger {
+            Side::First => "m0",
+            Side::Second => "m1",
+        },
+        differs = match c.differs {
+            Differs::Fixed => "fixed",
+            Differs::Random => "random",
+            Differs::Both => "both",
+        },
+        m0 = side(&c.m0),
+        m1 = side(&c.m1),
+        test = test,
+        statistic = statistic,
+        df = df,
+        p_value = p_value,
+        objective = objective.0,
+        objective_nodes = objective.1 as i32,
+        reference = kind,
+        ref_df = ref_df,
+        den_df = den_df,
+        draws = draws,
+        seed = seed,
+        notes = c.note_lines()
+    ))
+}
+
 extendr_module! {
     mod glmm_r;
     fn fastglmm_fit;
     fn fastglmm_confint;
     fn fastglmm_same_fixed_part;
+    fn fastglmm_compare;
+    fn fastglmm_anova_pair;
 }

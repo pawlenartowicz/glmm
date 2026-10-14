@@ -15,11 +15,14 @@ publish = false
 # No lib/bin — this package exists only to own the example targets below (examples
 # satisfy Cargo's at-least-one-target requirement).
 
-# `formula`: the drivers lower R-style formulas. Enabled here on the dep rather
-# than per-example `required-features` so every example always builds (and stays under the
-# workspace clippy deny gate) in `cargo clippy --workspace --all-targets`.
+# `formula`: the drivers lower R-style formulas. `orchestrate`: the anova port
+# gate's Rust front end calls the ports' own entry points (`run_fit`,
+# `run_compare`). Both are enabled here on the dep rather than per-example
+# `required-features` so every example always builds (and stays under the
+# workspace clippy deny gate) in `cargo clippy --workspace --all-targets`; the
+# workspace members glmm-python and glmm-r turn `orchestrate` on already.
 [dependencies]
-glmm = { path = "..", features = ["formula"] }
+glmm = { path = "..", features = ["formula", "orchestrate"] }
 
 # Dev-only pass-through of the kernel's optimizer counters, for the speed
 # grid's counter pass. OFF by default: the counters perturb wall time
@@ -98,3 +101,11 @@ path = "grid/engines/glmm.rs"
 name = "loop_bench"
 path = "campaigns/speed-campaign/loop_bench.rs"
 required-features = ["loop_advanced"]
+
+# The anova port gate's Rust front end (tools/anova_ports/): one fixed list of
+# model comparisons and per-term tables, one JSONL row per table cell on
+# stdout, compared against the Python and R ports by
+# tools/anova_ports/compare_anova_ports.R.
+[[example]]
+name = "anova_ports"
+path = "tools/anova_ports/anova_ports.rs"

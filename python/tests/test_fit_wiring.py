@@ -23,6 +23,54 @@ def test_gaussian_lmm():
     assert abs(result.beta[1] - 2.0) < 0.3
 
 
+def test_design_summary_is_kept_on_an_unweighted_random_intercept_fit_only():
+    y = 1.0 + 2.0 * _X + np.sin(_GROUPS) + _rng.normal(scale=0.5, size=_N)
+    data = _data(y.tolist())
+    ds = glmm.fit(data, "y ~ x + (1 | g)").design_summary
+    k, p = 30, 2
+    assert [len(ds[name]) for name in ("counts", "s", "c")] == [k, p * k, p * p]
+    assert all(isinstance(v, np.ndarray) for v in ds.values())
+    np.testing.assert_array_equal(ds["counts"], np.full(k, _N // k, dtype=float))
+    assert glmm.fit(data, "y ~ x").design_summary is None
+    weighted = glmm.fit(data, "y ~ x + (1 | g)", weights=np.linspace(0.5, 1.5, _N))
+    assert weighted.design_summary is None
+
+
+def test_native_fit_carries_offset_objective_and_term_tables():
+    # The raw `_native.fit` dict, before `glmm.Fit` stores these fields.
+    y = (1.0 + 2.0 * _X + _rng.normal(scale=0.5, size=_N)).tolist()
+    off = (0.1 * _X).tolist()
+    groups = ([f"g{i}" for i in range(30)], _GROUPS.tolist())
+
+    def native(formula, offset):
+        return glmm._native.fit(
+            formula,
+            {"x": _X.tolist(), "y": y},
+            {"g": groups},
+            "gaussian",
+            "identity",
+            "hessian",
+            1,
+            None,
+            None,
+            offset,
+            None,
+            True,
+            None,
+        )
+
+    r = native("y ~ x + (1 | g)", off)
+    assert r["offset"] == off
+    assert (r["objective"], r["objective_nodes"]) == ("reml", 0)
+    t3 = r["term_table_type3"]
+    assert (t3["error"], t3["ss_type"], t3["label"]) == (None, "III", ["x"])
+    assert (t3["kind"], t3["den_df_kind"], t3["row_notes"]) == (["F"], ["satterthwaite"], [[]])
+    refused = native("y ~ x + x:g", None)
+    assert refused["offset"] is None
+    assert list(refused["term_table_type2"]) == ["error"]
+    assert refused["term_table_type2"]["error"]
+
+
 def test_binomial_glmm():
     p = 1.0 / (1.0 + np.exp(-(0.2 + 0.8 * _X)))
     y = _rng.binomial(1, p).astype(float)

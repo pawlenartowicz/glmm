@@ -82,7 +82,8 @@ pub enum ContrastNote {
     },
 }
 
-/// Why a contrast has no Satterthwaite df.
+/// Why a contrast has no Satterthwaite df. The `Display` text names no Rust
+/// option or type, so a port shows it as given.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NoDfReason {
@@ -107,13 +108,13 @@ impl fmt::Display for NoDfReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             NoDfReason::NotGaussianMixed => {
-                "the fit's family has no df (binomial, Poisson, negative binomial, a non-Gaussian GLMM, or a Gamma or inverse Gaussian GLM with φ held); the loop tier's satterthwaite serves Gaussian LMM workspaces only"
+                "this kind of fit has no denominator df (a binomial, Poisson or negative binomial fit, a non-Gaussian GLMM, or a Gamma or inverse Gaussian GLM with φ held)"
             }
             NoDfReason::Disabled => {
-                "the Satterthwaite pass was switched off (FitOptions::satterthwaite = false)"
+                "Satterthwaite degrees of freedom were not computed for this fit"
             }
             NoDfReason::StateMissing => {
-                "the fit carries no Satterthwaite record (a Gaussian LMM fit assembled by the loop tier's FitView::into_fit, which runs no pass)"
+                "the fit carries no Satterthwaite record (a Gaussian LMM fit assembled without the Satterthwaite pass)"
             }
             NoDfReason::Failed => {
                 "the Satterthwaite pass failed: the fit has no finite endpoint, or a deviance or covariance on its stencil was not finite"

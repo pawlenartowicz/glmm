@@ -3378,6 +3378,31 @@
       ]
     },
     {
+      "name": "anova_car_lm_glm_gamma",
+      "kind": "anova",
+      "data": "data/simulated/glm_gamma.csv",
+      "r_formula": "y ~ x * grp",
+      "factors": [
+        "grp"
+      ],
+      "generator": "goldens_anova.R",
+      "case": "car_lm",
+      "members": [
+        {
+          "fun": "stats::lm",
+          "formula": "y ~ x * grp",
+          "family": "gaussian",
+          "link": "identity",
+          "REML": null,
+          "nAGQ": null,
+          "weights": "w"
+        }
+      ],
+      "contr_sum": [
+        "grp"
+      ]
+    },
+    {
       "name": "anova_linear_hypothesis_glm_gamma",
       "kind": "anova",
       "data": "data/simulated/glm_gamma.csv",

@@ -696,3 +696,14 @@ def test_ols_fit_with_reml_true_prints_the_reml_criterion_block():
     text = s.text()
     assert f"REML criterion at convergence: {glmm.summary.fmt(-2.0 * m.loglik, 5)}" in text
     assert "AIC" not in text
+
+
+def test_summary_df_column_prints_a_large_satterthwaite_df_in_fixed_notation():
+    s = _mixed_fit(coef_df=np.array([12345.6, 10000.0])).summary_object()
+    text = s.text()
+    row = next(ln for ln in text.splitlines() if ln.startswith("(Intercept)"))
+    x_row = next(ln for ln in text.splitlines() if ln.startswith("x "))
+    assert row.split()[3] == "12346"
+    assert x_row.split()[3] == "10000"
+    for render in (s.html(), s.latex(), s.typst()):
+        assert "e+04" not in render

@@ -44,4 +44,29 @@ fastglmm_confint <- function(beta, se, coef_df, level) .Call(wrap__fastglmm_conf
 #' @keywords internal
 fastglmm_same_fixed_part <- function(f0, f1) .Call(wrap__fastglmm_same_fixed_part, f0, f1)
 
+#' `glmm::orchestrate::run_compare` for `compare()`: fits the two formulas on
+#' the same pre-marshalled columns (the R wrapper has dropped every row with
+#' a missing value in a variable of either formula, the weights or the
+#' offset) and returns `list(comparison, fit0, fit1, nsim, seed)`: the
+#' comparison as `comparison_list` flattens it, each fit as `fastglmm_fit`
+#' returns one, and the draws requested and the seed of the exact test.
+#' Empty `weights`, `offset`, `nsim` and `seed` are absent.
+#'
+#' @usage NULL
+#' @keywords internal
+fastglmm_compare <- function(f0, f1, numeric, factor_levels, factor_codes, family, link, nagq, weights, offset, nsim, seed) .Call(wrap__fastglmm_compare, f0, f1, numeric, factor_levels, factor_codes, family, link, nagq, weights, offset, nsim, seed)
+
+#' `glmm::formula::anova::compare` for `anova(m0, m1)`: compares two stored
+#' fits as they are, with no refit and no data. `m0` and `m1` are named lists
+#' of the fields a fit object stores (the R wrapper's `.compare_side()`
+#' builds them). Returns `list(comparison, nsim, seed)` as `fastglmm_compare`
+#' does, or, when the pair cannot be compared, `list(refusal, kind)`: the
+#' refusal's message and its kind, so the wrapper can point to its own
+#' `compare()` where the kind calls for it (`kind` is `"other"` for the
+#' refusals that need no pointer).
+#'
+#' @usage NULL
+#' @keywords internal
+fastglmm_anova_pair <- function(m0, m1, nsim, seed) .Call(wrap__fastglmm_anova_pair, m0, m1, nsim, seed)
+
 # nolint end

@@ -39,6 +39,9 @@
 //! formula-free kernel — the parse-once/fit-many hot path — take
 //! `default-features = false` and link no `regex`.
 
+pub mod anova;
+#[cfg(test)]
+mod anova_tests;
 mod error;
 mod fixed_part;
 pub(crate) mod hypotheses;
@@ -51,9 +54,8 @@ mod hypotheses_oracle_tests;
 pub(crate) mod hypotheses_tests;
 
 pub use error::{Error, ParseError};
-// Crate-private: `orchestrate::same_fixed_part` is the only caller so far.
-// removed by P31-T6
-#[cfg_attr(not(feature = "orchestrate"), allow(unused_imports))]
+// Crate-private: the nesting check of `anova::nesting` and
+// `orchestrate::same_fixed_part` call it.
 pub(crate) use fixed_part::{fixed_part_relation, FixedPartRelation};
 pub use materialize::{
     label_ranef, lower, materialize, numeric_only_columns, referenced_columns, unresolved_columns,

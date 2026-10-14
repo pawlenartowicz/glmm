@@ -853,7 +853,8 @@ test_that("AIC and BIC refuse REML fits with different fixed parts, every pair c
   m1 <- f$m1
   m2 <- f$m2
   msg <- paste0("m0 and m2 are REML fits with different fixed effects, and REML fits ",
-                "with different fixed effects cannot be compared by AIC. Refit both ",
+                "with different fixed effects cannot be compared by AIC. Use ",
+                "compare(data, f0, f1), which fits both models by ML, or refit both ",
                 "with REML = FALSE.")
   expect_error(AIC(m0, m2), msg, fixed = TRUE)
   expect_error(BIC(m0, m2), sub("by AIC", "by BIC", msg, fixed = TRUE), fixed = TRUE)
@@ -873,7 +874,8 @@ test_that("AIC and BIC refuse a REML fit beside an ML fit, naming which is which
   m_reml <- f$m0
   m_ml <- fastglmm(y ~ x, f$d)
   expect_false(m_ml$reml)
-  msg <- "m_reml was fitted by REML and m_ml by ML. Fit both the same way."
+  msg <- paste("m_reml was fitted by REML and m_ml by ML. Fit both the same way, or use",
+               "compare(data, f0, f1).")
   expect_error(AIC(m_reml, m_ml), msg, fixed = TRUE)
   expect_error(AIC(m_ml, m_reml), msg, fixed = TRUE)
   expect_error(BIC(m_reml, m_ml), msg, fixed = TRUE)
@@ -908,7 +910,8 @@ test_that("AIC and BIC read the estimator of other packages' fits", {
   f <- reml_ic_fits()
   m_reml <- f$m0
   m_lm <- lm(y ~ x, f$d)
-  msg <- "m_reml was fitted by REML and m_lm by ML. Fit both the same way."
+  msg <- paste("m_reml was fitted by REML and m_lm by ML. Fit both the same way, or use",
+               "compare(data, f0, f1).")
   expect_error(AIC(m_reml, m_lm), msg, fixed = TRUE)
   expect_error(BIC(m_reml, m_lm), msg, fixed = TRUE)
   # nlme's logLik() carries no REML attribute: the estimator is unread, so the

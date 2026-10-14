@@ -1,10 +1,14 @@
 //! The term map and the hypothesis matrices against lmerTest's, frozen in the
 //! `lmertest_anova_*` references (`proposal_dependent: true` entries of kind
-//! `lmertest`).
+//! `lmertest`), and against car's (the `anova_car_*` entries of kind
+//! `anova`); the marginal-term check and the missing-cell note.
 
+use faer::Mat;
 use serde_json::Value;
 
-use super::hypotheses::{type2_xtx, type3, TermHypothesis};
+use super::hypotheses::{
+    check_marginal, missing_cells_note, type2_vcov, type2_xtx, type3, TermHypothesis,
+};
 use super::{lower, Lowered, Table};
 use crate::inference::test_refs::{self, Entry, Kind};
 use crate::test_support::csv_table;
@@ -286,4 +290,328 @@ fn type3_rank_deficient_scatters_zeros() {
     assert!(got
         .iter()
         .all(|h| h.l.col(aliased).iter().all(|&v| v == 0.0)));
+}
+
+/// car's GLM and GLMM entries on `sim_factorial_bern`, whose `g`, `h` and
+/// `x` columns are `sim_factorial`'s, so their design is
+/// `lmertest_anova_sim_factorial`'s.
+const CAR_BERN: [&str; 2] = [
+    "anova_car_glm_sim_factorial_bern",
+    "anova_car_glmm_sim_factorial_bern",
+];
+
+/// Projector band of gate 2: equal row spaces.
+const PROJ_ABS: f64 = 1e-10;
+
+fn anova_entry(name: &str) -> Entry {
+    test_refs::entries(Kind::Anova)
+        .into_iter()
+        .find(|e| e.name == name)
+        .unwrap_or_else(|| panic!("{name} is registered"))
+}
+
+fn matrix_rows(v: &Value) -> Vec<Vec<f64>> {
+    v.as_array()
+        .expect("matrix as row arrays")
+        .iter()
+        .map(|r| {
+            r.as_array()
+                .expect("row array")
+                .iter()
+                .map(|x| x.as_f64().expect("number"))
+                .collect()
+        })
+        .collect()
+}
+
+/// A frozen `L` (rows over the named columns) in the caller layout of `lo`.
+fn frozen_l(rows: &Value, cols: &[String], lo: &Lowered) -> Mat<f64> {
+    let rows = matrix_rows(rows);
+    let pos: Vec<usize> = cols
+        .iter()
+        .map(|c| lo.col_names.iter().position(|n| n == c).unwrap())
+        .collect();
+    let mut l = Mat::<f64>::zeros(rows.len(), lo.p);
+    for (i, row) in rows.iter().enumerate() {
+        assert_eq!(row.len(), pos.len(), "frozen row width");
+        for (&v, &c) in row.iter().zip(&pos) {
+            l[(i, c)] = v;
+        }
+    }
+    l
+}
+
+/// The orthogonal projector `L'(LL')⁻¹L` on the row space of `L`.
+fn projector(l: &Mat<f64>) -> Mat<f64> {
+    let mut x = l.clone();
+    let gram = l * l.transpose();
+    crate::linalg::SeqLlt::new(gram.as_ref())
+        .expect("L has full row rank")
+        .solve_in_place(x.as_mut());
+    l.transpose() * x
+}
+
+fn max_abs_diff(a: &Mat<f64>, b: &Mat<f64>) -> f64 {
+    let mut d = 0.0_f64;
+    for j in 0..a.ncols() {
+        for i in 0..a.nrows() {
+            d = d.max((a[(i, j)] - b[(i, j)]).abs());
+        }
+    }
+    d
+}
+
+/// Gate 2, car's Type II: `type2_vcov` fed the frozen treatment-fit `vcov`
+/// (car's metric, not glmm's own fit) spans each term's car `L` (built by
+/// `car:::ConjComp` over `car:::relatives`) on the GLM and the GLMM.
+#[test]
+fn type2_vcov_spans_car_type2_rows() {
+    for name in CAR_BERN {
+        let e = anova_entry(name);
+        let json = test_refs::load(Kind::Anova, name);
+        let lo = lowered(&e);
+        assert_eq!(
+            lo.col_names,
+            strings(&json["treatment"]["coef_names"]),
+            "{name}: columns"
+        );
+        let all: Vec<usize> = (0..lo.p).collect();
+        let vcov = matrix_rows(&json["treatment"]["vcov"]);
+        let got = type2_vcov(&lo, &all, &vcov);
+        let want = json["type2"]["rows"].as_array().unwrap();
+        let labels: Vec<&str> = got.iter().map(|h| h.term.as_str()).collect();
+        let want_labels: Vec<&str> = want.iter().map(|w| w["term"].as_str().unwrap()).collect();
+        assert_eq!(labels, want_labels, "{name}: terms");
+        for (h, w) in got.iter().zip(want) {
+            let l = frozen_l(&w["L"], &strings(&w["col_names"]), &lo);
+            assert_eq!(h.l.nrows(), l.nrows(), "{name} {}: rows", h.term);
+            let d = max_abs_diff(&projector(&h.l), &projector(&l));
+            assert!(d <= PROJ_ABS, "{name} {}: projector off by {d:e}", h.term);
+        }
+    }
+}
+
+/// Relative band of `V`-orthogonality, on `Σ_j |L[i, j]·V[j][c]|`.
+const ORTH_REL: f64 = 1e-12;
+
+fn column(lo: &Lowered, name: &str) -> usize {
+    lo.col_names
+        .iter()
+        .position(|n| n == name)
+        .unwrap_or_else(|| panic!("no design column {name}"))
+}
+
+/// Every row of `h` is `V`-orthogonal to each column named in `cols`
+/// (`L·V·e_c = 0` over the `retained` columns), as car's Type II rows are to
+/// every relative column.
+fn assert_v_orthogonal(
+    h: &TermHypothesis,
+    vcov: &[Vec<f64>],
+    lo: &Lowered,
+    retained: &[usize],
+    cols: &[&str],
+) {
+    for name in cols {
+        let c = column(lo, name);
+        for i in 0..h.l.nrows() {
+            let (dot, scale) = retained
+                .iter()
+                .map(|&j| h.l[(i, j)] * vcov[j][c])
+                .fold((0.0, 0.0), |(d, s), t: f64| (d + t, s + t.abs()));
+            assert!(
+                dot.abs() <= ORTH_REL * scale,
+                "{}: row {i}·V·e({name}) = {dot:e} on a scale of {scale:e}",
+                h.term
+            );
+        }
+    }
+}
+
+/// car's relatives count numeric variables (`car:::relatives` reads every
+/// variable `attr(terms, "factors")` marks), lmerTest's containment does
+/// not: on `y ~ g * x` (`lmertest_anova_sim_factorial_gx`, `g` a 3-level
+/// factor, `x` numeric) `g:x` is a relative of `g` for car and does not
+/// contain `g` for lmerTest. Fed that entry's frozen `vcov`, `g`'s rows are
+/// `V`-orthogonal to the `gb:x` and `gc:x` columns, and not zero on them.
+#[test]
+fn type2_vcov_counts_numeric_relatives() {
+    let e = anova_entries()
+        .into_iter()
+        .find(|e| e.name == "lmertest_anova_sim_factorial_gx")
+        .expect("the g * x anova entry is registered");
+    let json = test_refs::load(Kind::Lmertest, &e.name);
+    let lo = lowered(&e);
+    assert_eq!(lo.col_names, strings(&json["coef_names"]), "columns");
+    let all: Vec<usize> = (0..lo.p).collect();
+    let vcov = matrix_rows(&json["vcov_beta"]);
+    let got = type2_vcov(&lo, &all, &vcov);
+    let g = got.iter().find(|h| h.term == "g").expect("term g");
+    assert_eq!(g.l.nrows(), 2);
+    let relatives = ["gb:x", "gc:x"];
+    assert_v_orthogonal(g, &vcov, &lo, &all, &relatives);
+    for name in relatives {
+        let c = column(&lo, name);
+        assert!(
+            (0..g.l.nrows()).any(|i| g.l[(i, c)] != 0.0),
+            "g: zero on {name}"
+        );
+    }
+}
+
+/// `type2_vcov` reads only the retained block of the `p × p` `vcov`. On
+/// `y ~ g * h * x` over `sim_factorial_empty` (no `gc:hq` cell) the all-zero
+/// `gc:hq` and `gc:hq:x` columns are aliased, `gc:hq` before retained ones,
+/// and their `vcov` rows and columns are NaN; the retained block is
+/// `(XᵀX)⁻¹` there. Every row is finite and zero on the aliased columns, and
+/// `g`'s and `h`'s rows are `V`-orthogonal to their retained relative
+/// columns.
+#[test]
+fn type2_vcov_reads_the_retained_block() {
+    let e = anova_entries()
+        .into_iter()
+        .find(|e| e.name == "lmertest_anova_sim_factorial_empty")
+        .unwrap();
+    let lo = lower(
+        "y ~ g * h * x + (1 | subj)",
+        &table_of(&e),
+        Family::Gaussian,
+    )
+    .unwrap();
+    let (n, p) = (lo.n, lo.p);
+    let aliased: Vec<usize> = (0..p)
+        .filter(|&c| (0..n).all(|i| lo.x[i * p + c] == 0.0))
+        .collect();
+    let names: Vec<&str> = aliased.iter().map(|&c| lo.col_names[c].as_str()).collect();
+    assert_eq!(names, ["gc:hq", "gc:hq:x"]);
+    let kept: Vec<usize> = (0..p).filter(|c| !aliased.contains(c)).collect();
+    let pr = kept.len();
+    let gram = Mat::from_fn(pr, pr, |a, b| {
+        (0..n)
+            .map(|i| lo.x[i * p + kept[a]] * lo.x[i * p + kept[b]])
+            .sum::<f64>()
+    });
+    let mut inv = Mat::<f64>::identity(pr, pr);
+    crate::linalg::SeqLlt::new(gram.as_ref())
+        .expect("full column rank on the kept columns")
+        .solve_in_place(inv.as_mut());
+    let mut vcov = vec![vec![f64::NAN; p]; p];
+    for (a, &ca) in kept.iter().enumerate() {
+        for (b, &cb) in kept.iter().enumerate() {
+            vcov[ca][cb] = inv[(a, b)];
+        }
+    }
+    let got = type2_vcov(&lo, &kept, &vcov);
+    for h in &got {
+        for i in 0..h.l.nrows() {
+            for j in 0..p {
+                let v = h.l[(i, j)];
+                if aliased.contains(&j) {
+                    assert_eq!(v, 0.0, "{}: aliased column {j}, row {i}", h.term);
+                } else {
+                    assert!(v.is_finite(), "{}: L[{i}, {j}] = {v}", h.term);
+                }
+            }
+        }
+    }
+    for (term, relatives) in [
+        ("g", &["gb:hq", "gb:x", "gc:x", "gb:hq:x"][..]),
+        ("h", &["gb:hq", "hq:x", "gb:hq:x"][..]),
+    ] {
+        let h = got.iter().find(|h| h.term == term).expect("term");
+        assert_v_orthogonal(h, &vcov, &lo, &kept, relatives);
+    }
+}
+
+/// Gate 2, Type III: on the `sim_factorial_bern` design, `type3` spans
+/// lmerTest's Type III rows (`lmertest_anova_sim_factorial`) at
+/// [`PROJ_ABS`]: `type3` rounds with `zapsmall` as lmerTest does, so its rows
+/// equal lmerTest's rounded ones.
+#[test]
+fn type3_spans_lmertest_type3_rows_on_bern_design() {
+    let lt = test_refs::load(Kind::Lmertest, "lmertest_anova_sim_factorial");
+    let cols = strings(&lt["assign_names"]);
+    let want = lt["type3"]["hypotheses"].as_array().unwrap();
+    for name in CAR_BERN {
+        let lo = lowered(&anova_entry(name));
+        let all: Vec<usize> = (0..lo.p).collect();
+        let got = type3(&lo, &all);
+        let labels: Vec<&str> = got.iter().map(|h| h.term.as_str()).collect();
+        let want_labels: Vec<&str> = want.iter().map(|w| w["term"].as_str().unwrap()).collect();
+        assert_eq!(labels, want_labels, "{name}: terms");
+        for (h, w) in got.iter().zip(want) {
+            let l = frozen_l(&w["L"], &cols, &lo);
+            assert_eq!(h.l.nrows(), l.nrows(), "{name} {}: rows", h.term);
+            let d = max_abs_diff(&projector(&h.l), &projector(&l));
+            assert!(d <= PROJ_ABS, "{name} {}: projector off by {d:e}", h.term);
+        }
+    }
+}
+
+/// Gate 2, row order: `Lowered::terms` arrives in R's
+/// `attr(terms, "term.labels")` order on every per-term `anova` entry (the
+/// `lmertest` entries: [`lowered_terms_match_r_assign`]); nothing sorts it.
+#[test]
+fn lowered_terms_follow_r_term_labels() {
+    let mut seen = 0;
+    for e in test_refs::entries(Kind::Anova) {
+        let json = test_refs::load(Kind::Anova, &e.name);
+        let Some(want) = json.get("term_labels") else {
+            continue;
+        };
+        let lo = lowered(&e);
+        let labels: Vec<&str> = lo.terms.iter().map(|t| t.label.as_str()).collect();
+        assert_eq!(labels, strings(want), "{}: term labels", e.name);
+        seen += 1;
+    }
+    assert!(
+        seen >= 3,
+        "the car and non-marginal entries carry term labels"
+    );
+}
+
+/// The per-term tests refuse a formula whose interaction lacks a marginal
+/// term, naming it: `anova_nonmarginal_sim_factorial` records lmerTest and
+/// car disagreeing on `y ~ x + x:g` (Type III F(x) 11.4243 against car's Type
+/// II χ² 20.14) with no condition from either, so the refusal stands.
+#[test]
+fn marginal_check_names_the_missing_term() {
+    let e = anova_entry("anova_nonmarginal_sim_factorial");
+    let msg = check_marginal(&lowered(&e)).expect_err("y ~ x + x:g is refused");
+    assert!(msg.contains("`g`") && msg.contains("`x:g`"), "{msg}");
+    let lo = lower(
+        "y ~ g + g:h + x + (1 | subj)",
+        &table_of(&e),
+        Family::Gaussian,
+    )
+    .unwrap();
+    let msg = check_marginal(&lo).expect_err("y ~ g + g:h + x is refused");
+    assert!(msg.contains("`h`") && !msg.contains("`g`"), "{msg}");
+    for name in CAR_BERN {
+        assert_eq!(
+            check_marginal(&lowered(&anova_entry(name))),
+            Ok(()),
+            "{name}"
+        );
+    }
+}
+
+/// lmerTest's missing-cell message on `sim_factorial_empty` (frozen among
+/// the entry's conditions), whitespace aside; none on `sim_factorial`.
+#[test]
+fn missing_cells_note_on_empty_cell() {
+    for e in anova_entries() {
+        let json = test_refs::load(Kind::Lmertest, &e.name);
+        let frozen = json["conditions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|c| c["text"].as_str())
+            .find(|t| t.starts_with("Missing cells"))
+            .map(|t| t.split_whitespace().collect::<Vec<_>>().join(" "));
+        let got = missing_cells_note(&lowered(&e));
+        assert_eq!(got, frozen, "{}", e.name);
+        if e.name == "lmertest_anova_sim_factorial_empty" {
+            assert!(got.is_some_and(|n| n.contains("gc:hq")), "{}", e.name);
+        }
+    }
 }

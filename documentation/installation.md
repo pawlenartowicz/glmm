@@ -7,7 +7,7 @@ cargo add glmm
 ```
 
 MSRV is Rust 1.85 — the floor is set by the `bobyqa` dependency. Linear
-algebra runs on [`faer`](https://crates.io/crates/faer) 0.24, pinned.
+algebra runs on [`faer`](https://crates.io/crates/faer) 0.24.
 
 The semver-covered surface is `fit_cold`/`fit_warm` + `ModelSpec` +
 `GroupIds`.

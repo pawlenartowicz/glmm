@@ -9,6 +9,7 @@ use std::borrow::Cow;
 
 use faer::Mat;
 
+use crate::inference::Objective;
 use crate::lmm::Criterion;
 use crate::standardize::ColumnScaling;
 
@@ -433,14 +434,20 @@ pub(crate) fn lmm_loglik(deviance: f64, nu: usize) -> f64 {
 /// [`Fit::loglik`] for the GLMM paths (dense and sparse, Laplace and AGQ):
 /// restore the data-only saturated constant the marginal deviance drops.
 /// Binomial/Poisson: `−½·deviance + saturated_loglik` (the deviance's data
-/// term is the weighted `dev_resid` sum). Gamma and NB: `−½·deviance` with NO
-/// correction — for Gamma, lme4's `logLik(glmer fit)` is literally
-/// `−devfun/2`, and the `+2` its `Gamma()$aic` data term carries stays inside
-/// (so glmer's Gamma logLik sits 1 below `Σwᵢ·log f`; R's `logLik.glm`
-/// subtracts that 2 back out, glmer does not — pinned against the sim_gamma
-/// validation loglik). For NB, `deviance` is `dev(θ̂) − 2·saturated_loglik(θ̂)`
-/// (see `fit_glmm`'s `nb_dev_term`), which already carries the saturated term,
-/// so adding it again here would count it twice. NaN in ⇒ NaN out (the
+/// term is the weighted `dev_resid` sum). Gamma and NB: `−½·deviance` with no
+/// correction, because their deviance already carries every normalising
+/// term. For Gamma, beside the Laplace or quadrature terms, it holds `D/φ̂`
+/// plus `family::gamma_dispersion_term` at the ML φ̂, which together are the
+/// whole `−2·Σᵢ log f(yᵢ)` with the Gamma density's constants, so
+/// `−½·deviance` is the marginal log-likelihood on glmmTMB's scale. The Gamma
+/// GLM's `loglik` (`fit::glm::glm_view_to_fit`) is built from the same
+/// `gamma_dispersion_term` at its own ML φ̂, so a Gamma GLMM and its GLM sit
+/// on one likelihood and compare by likelihood ratio: on
+/// `validation/data/simulated/sim_gamma.csv` both agree with glmmTMB's to
+/// within 1e-9. lme4's `logLik` of a Gamma `glmer` fit is a different
+/// function. For NB, `deviance` is `dev(θ̂) − 2·saturated_loglik(θ̂)` (see
+/// `fit_glmm`'s `nb_dev_term`), which already carries the saturated term, so
+/// adding it again here would count it twice. NaN in ⇒ NaN out (the
 /// non-converged contract).
 pub(crate) fn glmm_loglik(
     family: Family,
@@ -978,6 +985,16 @@ fn remap_spec_slopes(model: &ModelSpec, to_reduced: &[usize]) -> Option<ModelSpe
     })
 }
 
+/// The objective of a GLMM fit at `nagq` quadrature nodes: the Laplace
+/// approximation at 1, adaptive Gauss-Hermite quadrature above it.
+pub(super) fn glmm_objective(nagq: u8) -> Objective {
+    if nagq == 1 {
+        Objective::Laplace
+    } else {
+        Objective::Agq { nodes: nagq }
+    }
+}
+
 /// The "unfittable model" return: an aliased fixed column is also used as an RE
 /// slope, so no reduced spec exists (see [`remap_spec_slopes`]). Carries the
 /// crate's standard numerical-failure convention — NaN β/se/vcov/dispersion,
@@ -991,11 +1008,13 @@ fn remap_spec_slopes(model: &ModelSpec, to_reduced: &[usize]) -> Option<ModelSpe
 /// which is the only diagnostic the caller can act on, and it is the same field
 /// `fit_rank_deficient` fills on the successful path.
 fn unfittable_random_slope_fit(
+    n: usize,
     p: usize,
     model: &ModelSpec,
     aliased: &[bool],
     opts: &FitOptions,
 ) -> Fit {
+    let criterion = resolve_criterion(model, opts);
     let mut fit = Fit {
         beta: vec![f64::NAN; p],
         se: vec![f64::NAN; p],
@@ -1016,12 +1035,22 @@ fn unfittable_random_slope_fit(
         df: 0,
         // The criterion `opts.reml` resolves to, as a fitted Gaussian mixed
         // model reports it; every GLMM route reports `reml: false`.
-        reml: resolve_criterion(model, opts) == Some(Criterion::Reml),
+        reml: criterion == Some(Criterion::Reml),
+        nobs: n,
+        // The route's objective: the aliased column is a random slope, so
+        // the model is mixed (a criterion on Gaussian, the quadrature on
+        // every other family).
+        objective: match criterion {
+            Some(Criterion::Reml) => Objective::Reml,
+            Some(Criterion::Ml) => Objective::MaximumLikelihood,
+            None => glmm_objective(opts.nagq),
+        },
         fitted: vec![],
         ranef: vec![],
         ranef_levels: vec![],
         coef_df: vec![f64::NAN; p],
         satterthwaite: None,
+        design_summary: None,
     };
     // A Gaussian LMM without an endpoint: the Satterthwaite record
     // `fit_warm`'s step would have stored (it never runs here).
@@ -1088,7 +1117,7 @@ pub(super) fn fit_rank_deficient(
     // slope makes the model unfittable, and there is no point paying for the
     // O(n·pk) copy to discover that.
     let Some(model_r) = remap_spec_slopes(model, &to_reduced) else {
-        return unfittable_random_slope_fit(p, model, aliased, opts);
+        return unfittable_random_slope_fit(n, p, model, aliased, opts);
     };
     // Reduced design (drop aliased columns), row-major.
     let mut xr = vec![0.0f64; n * pk];
@@ -1211,11 +1240,15 @@ pub(super) fn fit_rank_deficient(
         loglik: fr.loglik,
         df: fr.df,
         reml: fr.reml,
+        nobs: fr.nobs,
+        objective: fr.objective,
         fitted: fr.fitted,
         ranef: fr.ranef,
         ranef_levels: fr.ranef_levels,
         coef_df,
         satterthwaite,
+        // On the reduced design, so its `p` is the retained column count.
+        design_summary: fr.design_summary,
     }
 }
 /// Engine-invariant shape check for the data-shaped ids (mirrors `fit_grouped`'s

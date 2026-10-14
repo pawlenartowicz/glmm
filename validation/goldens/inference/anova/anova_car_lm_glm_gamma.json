@@ -1,0 +1,202 @@
+{
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0",
+      "glmmTMB": "1.1.14"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_anova.R"
+  },
+  "case": "car_lm",
+  "term_labels": ["x", "grp", "x:grp"],
+  "treatment": {
+    "coef_names": ["(Intercept)", "x", "grpb", "x:grpb"],
+    "coef": [1.93659026806102, 0.782981808493297, 1.09413913974053, 1.05721142246736],
+    "vcov": [
+      [0.0335030276150639, -0.00100669093574238, -0.0335030276150639, 0.00100669093574238],
+      [-0.00100669093574238, 0.0283059316624764, 0.00100669093574238, -0.0283059316624764],
+      [-0.0335030276150639, 0.00100669093574238, 0.0709093062392344, -0.00272960694204874],
+      [0.00100669093574238, -0.0283059316624764, -0.00272960694204874, 0.0698817406171372]
+    ]
+  },
+  "contr_sum": {
+    "contrasts": ["grp"],
+    "coef_names": ["(Intercept)", "x", "grp1", "x:grp1"],
+    "coef": [2.48365983793129, 1.31158751972698, -0.547069569870263, -0.528605711233681],
+    "vcov": [
+      [0.0177273265598086, -0.000682401735512187, -0.000975812752276666, 0.000179056267640994],
+      [-0.000682401735512187, 0.0174704351542843, 0.000179056267640995, -0.0033174693230461],
+      [-0.000975812752276666, 0.000179056267640995, 0.0177273265598086, -0.000682401735512186],
+      [0.000179056267640994, -0.0033174693230461, -0.000682401735512186, 0.0174704351542843]
+    ]
+  },
+  "type2": {
+    "fit": "treatment",
+    "gated": true,
+    "test": "F",
+    "rows": [
+      {
+        "term": "x",
+        "statistic": 87.1133433851811,
+        "df": 1,
+        "res_df": 196,
+        "p": 2.26659617144274e-17,
+        "L": [
+          [0, 0.92685238375486, 0, 0.37542596970366]
+        ],
+        "row_names": ["x"],
+        "col_names": ["(Intercept)", "x", "grpb", "x:grpb"]
+      },
+      {
+        "term": "grp",
+        "statistic": 18.2085018541674,
+        "df": 1,
+        "res_df": 196,
+        "p": 3.08021903778897e-05,
+        "L": [
+          [0, 0, 0.999238015398048, 0.0390306108505924]
+        ],
+        "row_names": ["grpb"],
+        "col_names": ["(Intercept)", "x", "grpb", "x:grpb"]
+      },
+      {
+        "term": "x:grp",
+        "statistic": 15.9941063563229,
+        "df": 1,
+        "res_df": 196,
+        "p": 8.99818281860988e-05,
+        "L": [
+          [0, 0, 0, 1]
+        ],
+        "row_names": ["x:grpb"],
+        "col_names": ["(Intercept)", "x", "grpb", "x:grpb"]
+      }
+    ]
+  },
+  "type3": {
+    "fit": "treatment",
+    "gated": false,
+    "test": "F",
+    "rows": [
+      {
+        "term": "(Intercept)",
+        "statistic": 111.941580606954,
+        "df": 1,
+        "res_df": 196,
+        "p": 5.52630407312095e-21,
+        "L": [
+          [1, 0, 0, 0]
+        ],
+        "row_names": ["(Intercept)"],
+        "col_names": ["(Intercept)", "x", "grpb", "x:grpb"]
+      },
+      {
+        "term": "x",
+        "statistic": 21.6583760514103,
+        "df": 1,
+        "res_df": 196,
+        "p": 5.99032650760012e-06,
+        "L": [
+          [0, 1, 0, 0]
+        ],
+        "row_names": ["x"],
+        "col_names": ["(Intercept)", "x", "grpb", "x:grpb"]
+      },
+      {
+        "term": "grp",
+        "statistic": 16.8826987683847,
+        "df": 1,
+        "res_df": 196,
+        "p": 5.83998566456633e-05,
+        "L": [
+          [0, 0, 1, 0]
+        ],
+        "row_names": ["grpb"],
+        "col_names": ["(Intercept)", "x", "grpb", "x:grpb"]
+      },
+      {
+        "term": "x:grp",
+        "statistic": 15.9941063563229,
+        "df": 1,
+        "res_df": 196,
+        "p": 8.99818281860988e-05,
+        "L": [
+          [0, 0, 0, 1]
+        ],
+        "row_names": ["x:grpb"],
+        "col_names": ["(Intercept)", "x", "grpb", "x:grpb"]
+      }
+    ]
+  },
+  "type3_sum": {
+    "fit": "contr_sum",
+    "gated": true,
+    "test": "F",
+    "rows": [
+      {
+        "term": "(Intercept)",
+        "statistic": 347.969343811731,
+        "df": 1,
+        "res_df": 196,
+        "p": 2.54594621538086e-45,
+        "L": [
+          [1, 0, 0, 0]
+        ],
+        "row_names": ["(Intercept)"],
+        "col_names": ["(Intercept)", "x", "grp1", "x:grp1"]
+      },
+      {
+        "term": "x",
+        "statistic": 98.4670276791419,
+        "df": 1,
+        "res_df": 196,
+        "p": 4.61710298386373e-19,
+        "L": [
+          [0, 1, 0, 0]
+        ],
+        "row_names": ["x"],
+        "col_names": ["(Intercept)", "x", "grp1", "x:grp1"]
+      },
+      {
+        "term": "grp",
+        "statistic": 16.8826987683847,
+        "df": 1,
+        "res_df": 196,
+        "p": 5.83998566456633e-05,
+        "L": [
+          [0, 0, 1, 0]
+        ],
+        "row_names": ["grp1"],
+        "col_names": ["(Intercept)", "x", "grp1", "x:grp1"]
+      },
+      {
+        "term": "x:grp",
+        "statistic": 15.9941063563229,
+        "df": 1,
+        "res_df": 196,
+        "p": 8.99818281860988e-05,
+        "L": [
+          [0, 0, 0, 1]
+        ],
+        "row_names": ["x:grp1"],
+        "col_names": ["(Intercept)", "x", "grp1", "x:grp1"]
+      }
+    ]
+  },
+  "name": "anova_car_lm_glm_gamma"
+}

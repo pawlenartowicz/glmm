@@ -1018,11 +1018,14 @@ fn fit_with_varcorr(vech: Vec<f64>) -> Fit {
         loglik: f64::NAN,
         df: 0,
         reml: false,
+        nobs: 0,
+        objective: crate::inference::Objective::Laplace,
         fitted: vec![],
         ranef: vec![],
         ranef_levels: vec![],
         coef_df: vec![],
         satterthwaite: None,
+        design_summary: None,
     }
 }
 
@@ -1518,6 +1521,11 @@ fn fit_glmm_degenerate_width_never_panics() {
         assert!(
             !fit.converged() && fit.beta.iter().all(|b| b.is_nan()),
             "{family:?} n == p: degenerate fit is NaN and does not report converged"
+        );
+        assert_eq!(
+            (fit.nobs, fit.objective),
+            (n, Objective::Laplace),
+            "{family:?} n == p"
         );
     }
 }
@@ -2541,5 +2549,86 @@ fn resolve_criterion_is_none_off_the_lmm_path() {
                 "{tag}, reml = {reml:?}"
             );
         }
+    }
+}
+
+/// `fit_rank_deficient` copies `nobs` and `objective` from its reduced fit (an
+/// ML fit here, so the copy is not the REML default), and the unfittable
+/// return carries the route's: the criterion on a Gaussian mixed model, the
+/// quadrature on a GLMM.
+#[test]
+fn rank_deficient_fits_carry_nobs_and_the_route_objective() {
+    let (n_clusters, per) = (8usize, 12usize);
+    let n = n_clusters * per;
+    let p = 3usize;
+    let mut st = 29u64;
+    let mut x = vec![0.0f64; n * p];
+    let mut y = vec![0.0f64; n];
+    for i in 0..n {
+        let x1 = lcg(&mut st);
+        x[i * p] = 1.0;
+        x[i * p + 1] = x1;
+        x[i * p + 2] = 1.0 + x1; // col2 = col0 + col1 exactly
+        y[i] = 0.5 + 0.4 * x1 + 0.3 * lcg(&mut st);
+    }
+    let yb: Vec<f64> = y.iter().map(|&v| if v > 0.5 { 1.0 } else { 0.0 }).collect();
+    let ids = GroupIds {
+        primary: (0..n).map(|i| (i % n_clusters) as u32).collect(),
+        extra: vec![],
+    };
+    let spec = |family: Family, slopes: Vec<u32>| ModelSpec {
+        family,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters as u32,
+            },
+            slopes,
+            extra_groupings: vec![],
+        }),
+    };
+    let opts = |reml: Option<bool>, nagq: u8| FitOptions {
+        target_indices: vec![0, 1, 2],
+        reml,
+        nagq,
+        ..FitOptions::default()
+    };
+
+    // Salvaged: column 2 dropped, the reduced ML fit's values.
+    let f = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &spec(Family::Gaussian, vec![]),
+        &ids,
+        &opts(Some(false), 1),
+    );
+    assert_eq!(f.aliased(), vec![false, false, true]);
+    assert_eq!((f.nobs, f.objective), (n, Objective::MaximumLikelihood));
+
+    // Unfittable: the aliased column is also a random slope.
+    let binomial = Family::Binomial {
+        link: BinomialLink::Logit,
+    };
+    let cases = [
+        (Family::Gaussian, &y, None, 1, Objective::Reml),
+        (
+            Family::Gaussian,
+            &y,
+            Some(false),
+            1,
+            Objective::MaximumLikelihood,
+        ),
+        (binomial, &yb, None, 1, Objective::Laplace),
+        (binomial, &yb, None, 3, Objective::Agq { nodes: 3 }),
+    ];
+    for (family, y, reml, nagq, want) in cases {
+        let f = fit_cold(&x, y, n, p, &spec(family, vec![2]), &ids, &opts(reml, nagq));
+        assert!(!f.converged(), "{family:?}, nagq {nagq}");
+        assert_eq!(
+            (f.nobs, f.objective),
+            (n, want),
+            "{family:?}, reml {reml:?}, nagq {nagq}"
+        );
     }
 }

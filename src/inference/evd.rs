@@ -42,8 +42,8 @@ pub(crate) struct PseudoInverse {
     /// `Σ vᵢ vᵢᵀ / λᵢ` over the kept directions; zero when none is kept.
     pub inv: Mat<f64>,
     /// Kept directions: `λ > rel_tol · λ_max`.
-    // removed by P31-T8
-    #[cfg_attr(not(test), allow(dead_code))]
+    // Read only by the Wald χ², whose callers are in the formula frontend.
+    #[cfg_attr(not(feature = "formula"), allow(dead_code))]
     pub rank: usize,
     /// Directions with `|λ| ≤ rel_tol · λ_max`, round-off negatives included.
     pub dropped: usize,

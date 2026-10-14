@@ -12,7 +12,10 @@ own page.
 | `lmer(f, d)` / `glmer(f, d, family)` | `fastglmm(f, d, family = ...)` | `glmm.fit(d, "f", family)` |
 | `summary(fit)` (lmerTest's on an LMM) | `summary(fit)`: lme4-shaped, with the REML criterion (REML fits) or the `AIC`/`BIC`/`logLik`/`deviance`/`df.resid` row (ML fits), scaled residuals, variance components, and a coefficient table as lmerTest, `lm` and `glm` print it: t with a Satterthwaite `df` column on a Gaussian mixed model, t on `n - p` on OLS and on the Gamma and inverse-Gaussian GLMs with an estimated dispersion, Wald z elsewhere | `fit.summary()`: the same layout, printed and returned as a string; the df and p-values are also `fit.coef_df` and `fit.coef_p` |
 | `lmer(f, d, REML = FALSE)` | `fastglmm(f, d, REML = FALSE)` | `glmm.fit(d, "f", reml=False)` |
-| `AIC(m0, m1)`, `BIC(m0, m1)` | `AIC(m0, m1)`, `BIC(m0, m1)`: the `stats` table, except that a REML fit beside an ML fit, and REML fits with different fixed effects, stop with an error | `m.aic`, `m.bic` (properties, one fit each; nothing compares two fits) |
+| `AIC(m0, m1)`, `BIC(m0, m1)` | `AIC(m0, m1)`, `BIC(m0, m1)`: the `stats` table, except that a REML fit beside an ML fit, and REML fits with different fixed effects, stop with an error | `m.aic`, `m.bic` (properties, one fit each); the `AIC` and `BIC` columns of `glmm.anova(m0, m1)` on ML fits |
+| `anova(fit)` (lmerTest's), `car::Anova(fit)` | `anova(fit)`: one row per fixed term, built at fit time with no refit; Type III by lmerTest's construction by default, `type = "II"` on request; lmerTest's F with Satterthwaite df on a Gaussian mixed model, F on `n - p` on OLS and the Gamma and inverse-Gaussian GLMs with an estimated dispersion, car's Wald chi-squared elsewhere | `glmm.anova(fit)`, `glmm.anova(fit, type="II")`: the same table, a `TermTable` |
+| `anova(m0, m1)` | `anova(m0, m1)`: the two fits compared as they are, never refitted; lme4's columns on a likelihood-ratio test, `anova.lm`'s on two OLS fits | `glmm.anova(m0, m1)`: the same table, a `ComparisonTable` |
+| `anova(m0, m1)` with lme4's ML refit; `lmerTest::ranova(fit)`; `RLRsim::exactRLRT()` | `compare(data, f0, f1)`: fits both formulas on the same rows by the estimator the comparison needs (REML when only the random part differs, ML when the fixed part does), with a boundary-aware reference for a variance component (the exact RLRT for a Gaussian model's single random intercept, else the 50:50 mixture) | `glmm.compare(data, f0, f1)`: the same, a `Comparison` with `table`, `fit0`, `fit1` |
 | `fixef(fit)` | `fixef(fit)` — named fixed-effect estimates; aliased columns `NA` | `fit.beta` (estimates) with `fit.names` (aligned coefficient names); `fit.aliased` flags rank-deficient columns |
 | `vcov(fit)` | `vcov(fit)` — full `p × p` Wald covariance | `fit.vcov` — `(p, p)` full Cov(β̂) |
 | `VarCorr(fit)` | `VarCorr(fit)` — SD/correlation-scale variance components, lme4-shaped, with a `Residual` row for a Gaussian mixed fit | `fit.varcorr` (vech-packed per grouping) plus `fit.stddev_corr(group_idx)`, which splits a grouping's block into a stddev vector and a correlation matrix |
@@ -24,9 +27,12 @@ own page.
 ## What is deliberately missing
 
 `fastglmm` is deliberately scoped to **fast fitting**: fixed effects, Wald
-standard errors, variance components on the SD/correlation scale, and the
-conditional modes with the per-row means they imply. Anything the engine
-cannot compute honestly — `predict`, profiling — is an
+standard errors, variance components on the SD/correlation scale, the
+conditional modes with the per-row means they imply, and the tests of fixed
+terms and of two nested models (`anova()`, `compare()`; see
+[`hypothesis-tests.md`](hypothesis-tests.md)). There is no parametric
+bootstrap test and no `ranova()`-style table of every random term at once.
+Anything the engine cannot compute honestly (`predict`, profiling) is an
 error naming the reason, never a silently different answer. `predict()` needs
 a design matrix built from rows the fit never saw, and the formula machinery
 is Rust-side. `residuals()` gives response and Pearson residuals; deviance and
@@ -86,8 +92,34 @@ four oracles (lme4, glmmTMB, MixedModels.jl, GLMMadaptive).
   without random effects reports the REML log-likelihood, as
   `logLik(lm, REML = TRUE)`. `logLik()` of a REML fit is the REML criterion,
   as in lme4. `AIC()` and `BIC()` refuse what lme4 lets through: REML fits
-  with different fixed effects (their REML criteria are not comparable; fit
-  both with `REML = FALSE`) and a REML fit beside an ML fit.
+  with different fixed effects (their REML criteria are not comparable; use
+  `compare()` or fit both with `REML = FALSE`) and a REML fit beside an ML fit.
+- **`anova(m0, m1)` never refits.** lme4's `anova()` refits two REML fits by
+  ML, even when only their random parts differ. Here two REML fits with
+  different fixed parts are an error that points to `compare(data, f0, f1)`
+  (which fits both by ML) or to `REML = FALSE`, and two REML fits with the
+  same fixed part are compared on the REML criterion, as `ranova()` and
+  `anova(refit = FALSE)` do. To test `(1 | g)` against no random effects, make
+  the OLS fit with `REML = TRUE` (lmerTest's `ranova()` uses that REML value;
+  lme4's `anova(lmer, lm)` uses the `lm` fit's ML one).
+- **A variance component is not tested against plain chi-squared.** lme4's
+  `anova()` and `ranova()` use chi-squared on the parameter difference, which
+  ignores the boundary at zero and roughly doubles the p-value. Here a
+  Gaussian model whose only random term is one unweighted random intercept,
+  compared by REML against the same fixed part, gets the exact restricted
+  likelihood-ratio test (RLRsim's `exactRLRT()` method, with a fixed default
+  seed), any other single dropped random effect the 50:50 mixture of
+  chi-squared distributions (still conservative, and labelled so), and only a
+  comparison that drops more than one random effect falls back to
+  chi-squared, labelled "ignores the boundary; conservative". When the random
+  parts alone differ, a component the larger fit puts at exactly zero gives a
+  statistic of exactly 0 and p = 1.
+- **Per-term tables follow lmerTest on Gaussian mixed models and car on the
+  rest.** Type III is lmerTest's construction on every family, so it does not
+  depend on the treatment coding (car's Type III on a treatment-coded `glm`
+  tests a different hypothesis); Type II uses lmerTest's `X'X` metric on
+  Gaussian mixed models and car's covariance metric on OLS, GLMs and GLMMs.
+  An interaction without its marginal terms gets no table.
 - All reported standard errors are Wald, not profile or bootstrap — see
   [`conventions.md`](conventions.md#flags-on-the-result) for how the
   `converged`/`singular` flags mark when those numbers should be trusted.

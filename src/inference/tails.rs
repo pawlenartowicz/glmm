@@ -46,7 +46,6 @@ pub(crate) fn f_upper_p(f: f64, num_df: f64, den_df: f64) -> f64 {
 
 /// Upper-tail p-value `P(χ²_df > x)` (R: `pchisq(x, df, lower.tail = FALSE)`).
 /// `x ≤ 0` (including `−∞`) gives 1 and `x = +∞` gives 0.
-#[cfg_attr(not(test), allow(dead_code))] // removed by P31-T2
 pub(crate) fn chisq_upper_p(x: f64, df: f64) -> f64 {
     if x.is_nan() || !valid_df(df) {
         return f64::NAN;

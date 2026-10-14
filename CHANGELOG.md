@@ -120,8 +120,8 @@ shares these entries; Python-specific notes are called out where they differ.
   its `logLik()`'s `REML` attribute) and fastglmm REML fits with different
   fixed effects stop with an error naming the fits. The fixed effects are
   compared as the sets of fixed terms, intercept included, of the stored
-  formulas, by the new `orchestrate::same_fixed_part`. `?AIC.fastglmm` lists
-  the four uses the methods cannot check.
+  formulas, by the new `orchestrate::same_fixed_part`. Both errors point to
+  `compare()`. `?AIC.fastglmm` lists the four uses the methods cannot check.
 - **Python `Fit.aic` and `Fit.bic`**: properties, `-2·loglik + 2·df` and
   `-2·loglik + df·ln(nobs)`, on every fit; the summary's ML criterion row
   prints the same numbers. On a REML fit they are built on the REML
@@ -130,6 +130,102 @@ shares these entries; Python-specific notes are called out where they differ.
   in R's order as `formula::FixedTerm { label, vars, numeric, columns }` (R's
   `assign`, as column ranges, the intercept excluded), and whether the formula
   keeps the intercept.
+- **Hypothesis tests in both ports: `anova` and `compare`.** The crate computes
+  every statistic and p-value; the ports lay out the same tables, with R's
+  column names. The names of the calls and result classes are provisional
+  until 1.0. The rules are in `documentation/hypothesis-tests.md`.
+  - **Per-term tests of one fit**, R `anova(m, type = c("III", "II"))`,
+    Python `glmm.anova(m, type="III")`: one row per fixed term, in R's term
+    order, with no random-effect rows. lmerTest's F on Satterthwaite df on a
+    Gaussian mixed model (REML or ML), F on `n − p` on OLS and the Gamma and
+    inverse-Gaussian GLMs with φ estimated, Wald χ² everywhere else. Type III
+    is lmerTest's construction on every family, so it does not depend on the
+    treatment coding. Type II uses lmerTest's `XᵀX` metric on Gaussian mixed
+    models and car's covariance metric on OLS, GLMs, GLMMs and the dispersion
+    GLMs (on OLS without weights the two agree). Both tables are built after
+    every fit by
+    `orchestrate::run_fit` and stored on the fit (`FitResult::term_table_type3`
+    and `term_table_type2`; Python `Fit.term_table_type3` / `type2`, R
+    `$term_table_type3` / `$term_table_type2`), so the call computes nothing.
+    A formula whose interaction lacks a marginal term is fitted as before
+    but gets no table: `anova(m)` stops with the reason. A Type III table on
+    a design with an empty cell carries lmerTest's "Missing cells" note.
+  - **Two existing fits compared**, R `anova(m0, m1)`, Python
+    `glmm.anova(m0, m1)`, in either order, with no refit and without reading
+    the data. The fits must have converged, share the row count, the
+    response (bitwise), the weights, the offset, the family and link and the
+    held dispersion, be nested by their formulas, and differ in parameter
+    count. Two OLS fits get `anova.lm`'s F, two Gamma or inverse-Gaussian GLMs
+    with φ estimated the Wald F on `(r, n − p)`, every other pair the
+    likelihood-ratio test `max(0, 2(ℓ₁ − ℓ₀))` (with lme4's columns, and AIC
+    and BIC on ML fits). Two REML fits with different fixed parts, and a REML
+    fit beside an ML fit (not two OLS fits), stop with an error pointing to
+    `compare`.
+  - **Two formulas compared**, R `compare(data, f0, f1, ...)`, Python
+    `glmm.compare(data, f0, f1, ...)`: fits both models on the same rows
+    (a row with a missing value in either formula, the weights or the offset
+    is dropped from both) with `family`, `weights`, `offset` and `nAGQ` given
+    once, and picks the estimator: REML when only the random part of a
+    Gaussian model differs (the OLS side made with `reml = TRUE`), ML when
+    the fixed part differs. It returns the table and both fits (R class
+    `fastglmm_comparison` with `$table`, `$fit0`, `$fit1`; Python
+    `Comparison` with `table`, `fit0`, `fit1`).
+  - **The boundary rule for variance components.** Random parts that differ
+    by one dimension get the 50:50 mixture of χ²(d − 1) and χ²(d), labelled
+    conservative, or, for a Gaussian REML fit whose only random term is one
+    unweighted `(1 | g)` with at least one fixed-effect column against its
+    OLS reduction, the exact restricted likelihood-ratio test of
+    Crainiceanu & Ruppert (2004): its null is simulated from the design
+    summary the fit keeps, with no refit. Random parts more than one
+    dimension apart get χ²(Δnpar), labelled as ignoring the boundary. When
+    the random parts alone differ, a component the larger fit puts at exactly
+    zero gives `T = 0` and p = 1 on every reference, and a non-finite
+    log-likelihood gives NaN, never p = 1.
+    `nsim` (default 10000, at most 1,000,000) and `seed` (a fixed default,
+    so one call gives the same p-value on every run, in both ports and
+    whatever R's `set.seed()`; R takes 0 to 2^53, Python 0 to 2^64 − 1) are
+    arguments of both comparison calls. The exact test is checked against
+    frozen RLRsim 3.1-9 references (`validation/goldens/inference/rlrt/`).
+  - Python: `glmm.anova`, `glmm.compare` and the classes `TermTable`,
+    `ComparisonTable` and `Comparison`; both tables are indexed by column
+    name, print as text, render to `html()`, `latex()` and `typst()` (with a
+    `Reference` column) and convert with `to_pandas()` (pandas imported only
+    there). R: `anova.fastglmm`, returning a `c("anova", "data.frame")`
+    table with a `heading` attribute, and `compare`, returning a
+    `fastglmm_comparison` whose `$table` is one.
+  - Every fit now stores the offset it was fitted with (`FitResult::offset`,
+    Python `Fit.offset`, R `$offset`), its objective (Python `Fit.objective`
+    and `Fit.objective_nodes`, R `$objective` and `$objective_nodes`) and,
+    inside the exact test's envelope, its design summary
+    (`FitResult::design_summary`, Python `Fit.design_summary`, R
+    `$design_summary`).
+  - Checked against frozen lme4 2.0-6, lmerTest 3.2-1, car 3.1-5 and glmmTMB
+    1.1-14 references (`validation/goldens/inference/anova/`), and the two ports'
+    tables against the Rust ones in CI.
+- **The Rust comparison surface** (outside the semver promise until 1.0):
+  `formula::anova::{nesting, compare, term_tests}` with `Model` (a fitted
+  model as plain numbers, `Model::from_fit`), `CompareOptions`, `Comparison`,
+  `ComparisonTest::{Lr, Linear}`, `ModelInfo`, `CompareError`, `TermTable`,
+  `FixedRow`, `TermTestOptions`, `SsType`, `TermTestError`, `Side`, `Differs`
+  and `Nesting`; `inference::{LrTest, LrNote, LinearTest, LinearKind,
+  LinearNote, Reference, DenDf, Objective}`; and, under `orchestrate`,
+  `run_compare`, `CompareResult`, `compare_options`, `DEFAULT_SEED`,
+  `DEFAULT_NSIM` and `MAX_NSIM`. `TermTable` and `ModelInfo` carry the
+  fit's `coef_names`, one per fixed-effect column, and a note on an aliased
+  column names the coefficient, never an index: "The coefficient x2 is
+  aliased, so the hypothesis was not tested." (the ports print it after the
+  row label, "x2: The coefficient x2 is aliased, ...").
+- **`Fit::nobs` and `Fit::objective`**: the row count the fit was given (on
+  every route, a non-converged fit included) and what it maximised
+  (`Objective::{LeastSquares, MaximumLikelihood, Reml, Laplace, Agq { nodes }}`).
+  Both are new fields of the `#[non_exhaustive]` `Fit`; no fitted number
+  moves.
+- **`loop_advanced` wrappers for build-once callers** (no semver promise,
+  `#[doc(hidden)]`): `lr_p_value_pub` (the p-value of a likelihood-ratio
+  statistic on a `Reference`), `wald_chisq_pub` (the Wald χ² of an `L` set on
+  β̂ and its covariance) and `type3_pub` (the Type III hypothesis matrices of
+  a design, with `TermHypothesis`), so a power simulation builds the
+  hypotheses once per design and pays only the Wald form per draw.
 
 ### Changed
 

@@ -5,7 +5,8 @@
 //! abort across an FFI boundary. Plain-Rust types only — no `pyo3`/`extendr`
 //! types — so everything here runs under plain `cargo test`, and the two
 //! ports flatten the same fit the same way from one definition instead of
-//! two mirrored copies.
+//! two mirrored copies. [`run_fit`] fits one formula; [`run_compare`] fits
+//! two on the same rows and compares them.
 //!
 //! Behind the default-off `orchestrate` cargo feature. Like `loop_advanced`
 //! it carries NO semver guarantees: its shape follows the ports' needs.
@@ -14,11 +15,16 @@ use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use crate::fit::theta_width;
+use crate::formula::anova::{
+    compare, linear_note_line, nesting, term_tests, CompareError, CompareOptions, Comparison,
+    Differs, FixedRow, Model, Nesting, SsType, TermTable, TermTestOptions,
+};
 use crate::formula::{
-    fixed_part_relation, label_ranef, lower, parse, Column, FixedPartRelation, Table,
+    fixed_part_relation, label_ranef, lower, parse, Column, FixedPartRelation, Lowered, Table,
 };
 use crate::inference::contrast::{ContrastError, NoDfReason};
 use crate::inference::tails::{normal_quantile, t_quantile};
+use crate::inference::{DenDf, LinearKind, Objective, Reference};
 use crate::{fit_warm, Boundary, Family, Fit, Note, OuterStop, StartValues, WaldSe};
 use crate::{BinomialLink, GammaLink, InverseGaussianLink, NegBinomialLink, PoissonLink};
 
@@ -353,6 +359,21 @@ pub struct FitResult {
     /// made up, which the caller never passed — the ports' Pearson residuals
     /// need them, and `weights=` alone cannot say.
     pub weights: Option<Vec<f64>>,
+    /// The offset the kernel fitted with, from the `offset=` argument or an
+    /// `offset()` term of the formula; `None` without one. Kept so a
+    /// comparison of two stored fits can check that their offsets agree.
+    /// Coupled sites, as for `y`.
+    pub offset: Option<Vec<f64>>,
+    /// The design summary `(counts, s, c)` of a Gaussian fit whose only random
+    /// term is one random intercept, with no prior weights and at least one
+    /// fixed-effect column; `None` on every other fit. With `K` the highest
+    /// observed level code plus one (a level below it with no rows counts 0)
+    /// and `p` retained fixed-effect columns, `counts` has `K` entries, `s` is
+    /// the `p × K` matrix `X̃ᵀZ` and `c` the `p × p` matrix `X̃ᵀX̃`, both flat
+    /// and column-major, on the fit's orthogonalized design `X̃`
+    /// (`crate::fit::DesignSummary` has the detail). Coupled sites, as for
+    /// `y`: `fit_dict` and the R port's returned list flatten it.
+    pub design_summary: Option<(Vec<f64>, Vec<f64>, Vec<f64>)>,
     /// Row count the kernel fitted (`Lowered::n`). NOT `fitted.len()`: `fitted`
     /// is empty on a non-converged fit and the ports' headers print on those.
     pub nobs: usize,
@@ -393,6 +414,139 @@ pub struct FitResult {
     /// `summary.lm`'s adjusted R², with the same NaN and 0 cases as
     /// `r_squared`.
     pub adj_r_squared: f64,
+    /// What the fit maximised (`crate::Fit::objective`); [`objective_parts`]
+    /// flattens it to a label and a node count, [`objective_from_parts`]
+    /// rebuilds it from them. Coupled sites, as for `y`.
+    pub objective: Objective,
+    /// The Type III per-term table ([`term_tests`]), built at fit time so a
+    /// port's `anova(m)` reads it and computes nothing; with an empty cell,
+    /// the missing-cell note is among its notes. `Err` holds the refusal's
+    /// message (a formula whose interaction lacks a marginal term), which the
+    /// fit itself does not raise, or, after a panic while the table was
+    /// built, a message that starts "internal error". [`term_columns`]
+    /// flattens a table. Coupled sites, as for `y`.
+    pub term_table_type3: Result<TermTable, String>,
+    /// The Type II per-term table, as `term_table_type3`.
+    pub term_table_type2: Result<TermTable, String>,
+}
+
+/// A per-term table as the plain columns a port stores, one entry per row
+/// in each vector, flattened from [`TermTable`] by [`term_columns`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct TermColumns {
+    /// `"III"` or `"II"`.
+    pub ss_type: &'static str,
+    /// The term labels, as R writes them (`"g:h"`).
+    pub label: Vec<String>,
+    /// `"F"` for an F row, `"chisq"` for a Wald χ² row.
+    pub kind: Vec<&'static str>,
+    /// The F statistic or the Wald χ².
+    pub statistic: Vec<f64>,
+    /// The numerator df (the χ² df on a Wald row); NaN when not tested.
+    pub num_df: Vec<f64>,
+    /// The denominator df of an F row; NaN on a Wald χ² row.
+    pub den_df: Vec<f64>,
+    /// Where an F row's denominator df comes from: `"satterthwaite"` or
+    /// `"residual"`; `""` on a Wald χ² row.
+    pub den_df_kind: Vec<&'static str>,
+    /// The p-value.
+    pub p_value: Vec<f64>,
+    /// lmerTest's `Sum Sq` on an F row; NaN on a Wald χ² row.
+    pub sum_sq: Vec<f64>,
+    /// lmerTest's `Mean Sq` on an F row; NaN on a Wald χ² row.
+    pub mean_sq: Vec<f64>,
+    /// Each row's notes as plain sentences (an aliased column, a rank below
+    /// the row count, no denominator df and why).
+    pub row_notes: Vec<Vec<String>>,
+    /// The table's notes as plain sentences (the missing-cell note).
+    pub notes: Vec<String>,
+}
+
+/// A [`TermTable`] as [`TermColumns`], for both FFI ports.
+pub fn term_columns(table: &TermTable) -> TermColumns {
+    let rows = &table.fixed;
+    let col = |f: fn(&FixedRow) -> f64| rows.iter().map(f).collect();
+    TermColumns {
+        ss_type: match table.ss_type {
+            SsType::Type3 => "III",
+            SsType::Type2 => "II",
+        },
+        label: rows.iter().map(|r| r.label.clone()).collect(),
+        kind: rows
+            .iter()
+            .map(|r| match r.test.kind {
+                LinearKind::F => "F",
+                LinearKind::ChiSquared => "chisq",
+            })
+            .collect(),
+        statistic: col(|r| r.test.statistic),
+        num_df: col(|r| r.test.num_df),
+        den_df: col(|r| match r.test.reference {
+            Reference::F { den_df, .. } => den_df,
+            _ => f64::NAN,
+        }),
+        den_df_kind: rows
+            .iter()
+            .map(|r| match r.test.reference {
+                Reference::F { den_df_kind, .. } => match den_df_kind {
+                    DenDf::Satterthwaite => "satterthwaite",
+                    DenDf::Residual => "residual",
+                },
+                _ => "",
+            })
+            .collect(),
+        p_value: col(|r| r.test.p_value),
+        sum_sq: col(|r| r.sum_sq.unwrap_or(f64::NAN)),
+        mean_sq: col(|r| r.mean_sq.unwrap_or(f64::NAN)),
+        row_notes: rows
+            .iter()
+            .map(|r| {
+                r.test
+                    .notes
+                    .iter()
+                    .map(|n| linear_note_line(*n, &table.coef_names))
+                    .collect()
+            })
+            .collect(),
+        notes: table.notes.clone(),
+    }
+}
+
+/// An [`Objective`] as `(label, node count)` for both FFI ports: the label is
+/// one of `"least_squares"`, `"maximum_likelihood"`, `"reml"`, `"laplace"`
+/// and `"agq"`; the node count is 1 on `"laplace"`, the quadrature's on
+/// `"agq"` and 0 elsewhere.
+pub fn objective_parts(objective: Objective) -> (&'static str, u8) {
+    match objective {
+        Objective::LeastSquares => ("least_squares", 0),
+        Objective::MaximumLikelihood => ("maximum_likelihood", 0),
+        Objective::Reml => ("reml", 0),
+        Objective::Laplace => ("laplace", 1),
+        Objective::Agq { nodes } => ("agq", nodes),
+    }
+}
+
+/// The inverse of [`objective_parts`], for a port that rebuilds a fit's
+/// [`Objective`] from the two stored fields.
+///
+/// # Errors
+///
+/// When `(label, nodes)` is not a pair [`objective_parts`] gives: an unknown
+/// label, a node count other than 0 on `"least_squares"`,
+/// `"maximum_likelihood"` and `"reml"` or other than 1 on `"laplace"`, or
+/// fewer than 2 nodes on `"agq"`.
+pub fn objective_from_parts(label: &str, nodes: u8) -> Result<Objective, String> {
+    match (label, nodes) {
+        ("least_squares", 0) => Ok(Objective::LeastSquares),
+        ("maximum_likelihood", 0) => Ok(Objective::MaximumLikelihood),
+        ("reml", 0) => Ok(Objective::Reml),
+        ("laplace", 1) => Ok(Objective::Laplace),
+        ("agq", 2..) => Ok(Objective::Agq { nodes }),
+        _ => Err(format!(
+            "no fit stores the objective {label:?} with {nodes} quadrature {}",
+            if nodes == 1 { "node" } else { "nodes" }
+        )),
+    }
 }
 
 /// Fit `formula` against pre-marshalled columns and return the flattened
@@ -437,7 +591,197 @@ pub fn run_fit(
             return Err(format!("dispersion must be a finite number > 0, got {d}"));
         }
     }
+    let table = table_of(numeric_columns, factor_columns)?;
+    let prepared = lower_with(
+        formula,
+        &table,
+        fam,
+        wald_se,
+        nagq,
+        dispersion,
+        weights,
+        offset,
+        satterthwaite,
+        reml,
+    )?;
+    let lowered = &prepared.lowered;
 
+    // Widths as `fit_warm` checks them: exact, or empty to cold-start that part.
+    if let Some((beta, theta, disp)) = &warm_start {
+        if let Some(d) = disp {
+            if !(d.is_finite() && *d > 0.0) {
+                return Err(format!(
+                    "warm-start dispersion must be a finite number > 0, got {d}"
+                ));
+            }
+        }
+        if !beta.is_empty() && beta.len() != lowered.p {
+            return Err(format!(
+                "warm-start beta has {} entries but the model has {} fixed-effect \
+                 coefficients; give {}, or none to cold-start beta",
+                beta.len(),
+                lowered.p,
+                lowered.p
+            ));
+        }
+        let n_theta = theta_width(lowered.model.re.as_ref());
+        if !theta.is_empty() && theta.len() != n_theta {
+            return Err(format!(
+                "warm-start theta has {} entries but the model has {} random-effect \
+                 Cholesky entries; give {}, or none to cold-start theta",
+                theta.len(),
+                n_theta,
+                n_theta
+            ));
+        }
+    }
+    let start = warm_start.map(|(beta, theta, dispersion)| StartValues {
+        beta,
+        theta,
+        dispersion,
+    });
+
+    let fit = fit_lowered(lowered, start.as_ref())?;
+    flatten(prepared, fit)
+}
+
+/// The default seed of the exact restricted likelihood-ratio test in a
+/// comparison ([`run_compare`], and the ports' `anova(m0, m1)`): the same call
+/// gives the same p-value on every run and in both ports, whatever the caller's
+/// own random state. The value is a date, 2026-10-08, the day the default was
+/// decided; any fixed value serves.
+pub const DEFAULT_SEED: u64 = 20_261_008;
+
+/// The default number of draws of the exact test's simulated null, RLRsim's
+/// default (Monte Carlo standard error about 2.2e-3 at p = 0.05).
+pub const DEFAULT_NSIM: usize = 10_000;
+
+/// The largest `nsim` [`compare_options`] accepts: 10⁶ draws, a hundred times
+/// the default. The null keeps every draw in memory (16 bytes each), and the
+/// time grows linearly with the draws and the group count.
+pub const MAX_NSIM: usize = 1_000_000;
+
+/// The options of a comparison from the ports' optional arguments: `None`
+/// takes [`DEFAULT_NSIM`] and [`DEFAULT_SEED`].
+///
+/// # Errors
+///
+/// When `nsim` is 0 or above [`MAX_NSIM`].
+pub fn compare_options(nsim: Option<usize>, seed: Option<u64>) -> Result<CompareOptions, String> {
+    let nsim = nsim.unwrap_or(DEFAULT_NSIM);
+    if !(1..=MAX_NSIM).contains(&nsim) {
+        return Err(format!(
+            "nsim must be a whole number from 1 to {MAX_NSIM}, got {nsim}"
+        ));
+    }
+    Ok(CompareOptions {
+        nsim,
+        seed: seed.unwrap_or(DEFAULT_SEED),
+    })
+}
+
+/// What [`run_compare`] returns: the comparison and the two fits, `fit0` the
+/// fit of `f0` and `fit1` that of `f1`, as given.
+#[derive(Debug)]
+pub struct CompareResult {
+    /// The comparison of the two fits.
+    pub comparison: Comparison,
+    /// The fit of the first formula.
+    pub fit0: FitResult,
+    /// The fit of the second formula.
+    pub fit1: FitResult,
+    /// The draws requested of the exact test (the comparison's reference
+    /// carries the draws made, 0 when none were needed).
+    pub nsim: usize,
+    /// The seed of the exact test.
+    pub seed: u64,
+}
+
+/// `compare(data, f0, f1)` of the ports: fits two nested formulas on the same
+/// columns and compares the two fits ([`crate::formula::anova::compare`]).
+/// `family`, `link`, `nagq`, `weights` and `offset` are given once and used
+/// for both fits, which are made as [`run_fit`] makes them with
+/// `wald_se = "hessian"`, `satterthwaite = true` and no warm start. The
+/// caller drops the rows with a missing value in any variable of either
+/// formula, the weights or the offset before the call.
+///
+/// The estimator follows from what differs, so there is no `reml` argument:
+/// on a Gaussian model, both fits are REML fits when only the random part
+/// differs (the OLS side made with `reml = true`, so its log-likelihood is
+/// the REML value) and ML fits when the fixed part differs, alone or with
+/// the random part; a GLM or GLMM is fitted by ML. `nsim` and `seed` are the
+/// exact test's ([`compare_options`]).
+///
+/// # Errors
+///
+/// An `nsim` out of range; formulas that are not nested, or that have the
+/// same fixed and random parts and the same `offset()` term
+/// ([`CompareError::SameParts`]), refused before either fit is made; any
+/// error of [`run_fit`] on either fit; and every refusal of the comparison
+/// (a fit that did not converge, different offsets, nothing to test).
+#[allow(clippy::too_many_arguments)]
+pub fn run_compare(
+    f0: &str,
+    f1: &str,
+    numeric_columns: HashMap<String, Vec<f64>>,
+    factor_columns: HashMap<String, (Vec<String>, Vec<u32>)>,
+    family: &str,
+    link: &str,
+    nagq: u8,
+    weights: Option<Vec<f64>>,
+    offset: Option<Vec<f64>>,
+    nsim: Option<usize>,
+    seed: Option<u64>,
+) -> Result<CompareResult, String> {
+    let opts = compare_options(nsim, seed)?;
+    let fam = family_from_str(family, link)?;
+    let nested = nesting(f0, f1).map_err(|e| e.to_string())?;
+    // The comparison's own refusal of two equal parts, made before either
+    // fit. `nesting` does not read the offset, so formulas whose `offset()`
+    // terms differ are fitted, and the comparison names the offsets first.
+    if nested == Nesting::Same && same_offset_term(f0, f1) {
+        return Err(CompareError::SameParts.to_string());
+    }
+    let reml = (fam == Family::Gaussian).then_some(matches!(
+        nested,
+        Nesting::Nested {
+            differs: Differs::Random,
+            ..
+        }
+    ));
+    let table = table_of(numeric_columns, factor_columns)?;
+    let side = |formula: &str, weights, offset| -> Result<_, String> {
+        let prepared = lower_with(
+            formula, &table, fam, "hessian", nagq, None, weights, offset, true, reml,
+        )?;
+        let fit = fit_lowered(&prepared.lowered, None)?;
+        let model = Model::from_fit(formula, &prepared.lowered, &fit);
+        Ok((model, prepared, fit))
+    };
+    let (m0, prepared0, fit0) = side(f0, weights.clone(), offset.clone())?;
+    let (m1, prepared1, fit1) = side(f1, weights, offset)?;
+    let comparison = compare(&m0, &m1, &opts).map_err(|e| e.to_string())?;
+    Ok(CompareResult {
+        comparison,
+        fit0: flatten(prepared0, fit0)?,
+        fit1: flatten(prepared1, fit1)?,
+        nsim: opts.nsim,
+        seed: opts.seed,
+    })
+}
+
+/// Whether two formulas, both of which parse, have the same `offset()` term
+/// (or none).
+fn same_offset_term(f0: &str, f1: &str) -> bool {
+    let offset = |f: &str| parse(f).map(|p| p.offset).ok();
+    offset(f0) == offset(f1)
+}
+
+/// The ports' columns as a [`Table`], every column the same length.
+fn table_of(
+    numeric_columns: HashMap<String, Vec<f64>>,
+    factor_columns: HashMap<String, (Vec<String>, Vec<u32>)>,
+) -> Result<Table, String> {
     let mut columns: Vec<(String, Column)> = Vec::new();
     let mut lengths: Vec<(String, usize)> = Vec::new();
     for (name, values) in numeric_columns {
@@ -484,9 +828,37 @@ pub fn run_fit(
         }
         None => 0,
     };
-    let table = Table { columns, n };
+    Ok(Table { columns, n })
+}
 
-    let mut lowered = catch_unwind(AssertUnwindSafe(|| lower(formula, &table, fam)))
+/// A lowered model with every fit argument applied ([`lower_with`]), and the
+/// two warn-and-strip messages.
+struct Prepared {
+    lowered: Lowered,
+    agq_warning: Option<String>,
+    reml_warning: Option<String>,
+}
+
+/// `formula` lowered on `table`, with the fit arguments applied to its
+/// options: `wald_se`, `nagq` (warn-and-strip), `reml` (resolved as
+/// [`run_fit`] states), `dispersion`, `satterthwaite`, and the
+/// `weights=`/`offset=` arguments (an error when the formula gives the same
+/// thing). [`run_fit`] and [`run_compare`] share it, so a model lowers the
+/// same way in both.
+#[allow(clippy::too_many_arguments)]
+fn lower_with(
+    formula: &str,
+    table: &Table,
+    fam: Family,
+    wald_se: &str,
+    nagq: u8,
+    dispersion: Option<f64>,
+    weights: Option<Vec<f64>>,
+    offset: Option<Vec<f64>>,
+    satterthwaite: bool,
+    reml: Option<bool>,
+) -> Result<Prepared, String> {
+    let mut lowered = catch_unwind(AssertUnwindSafe(|| lower(formula, table, fam)))
         .map_err(panic_message)?
         .map_err(|e| e.to_string())?;
 
@@ -573,47 +945,16 @@ pub fn run_fit(
     if offset.is_some() {
         lowered.opts.offset = offset;
     }
+    Ok(Prepared {
+        lowered,
+        agq_warning,
+        reml_warning,
+    })
+}
 
-    // Taken before the fit so the borrow below is clean; these are the
-    // LOWERING's observations, decided before any solver ran.
-    let lowered_notes = std::mem::take(&mut lowered.notes);
-
-    // Widths as `fit_warm` checks them: exact, or empty to cold-start that part.
-    if let Some((beta, theta, disp)) = &warm_start {
-        if let Some(d) = disp {
-            if !(d.is_finite() && *d > 0.0) {
-                return Err(format!(
-                    "warm-start dispersion must be a finite number > 0, got {d}"
-                ));
-            }
-        }
-        if !beta.is_empty() && beta.len() != lowered.p {
-            return Err(format!(
-                "warm-start beta has {} entries but the model has {} fixed-effect \
-                 coefficients; give {}, or none to cold-start beta",
-                beta.len(),
-                lowered.p,
-                lowered.p
-            ));
-        }
-        let n_theta = theta_width(lowered.model.re.as_ref());
-        if !theta.is_empty() && theta.len() != n_theta {
-            return Err(format!(
-                "warm-start theta has {} entries but the model has {} random-effect \
-                 Cholesky entries; give {}, or none to cold-start theta",
-                theta.len(),
-                n_theta,
-                n_theta
-            ));
-        }
-    }
-    let start = warm_start.map(|(beta, theta, dispersion)| StartValues {
-        beta,
-        theta,
-        dispersion,
-    });
-
-    let fit = catch_unwind(AssertUnwindSafe(|| {
+/// The kernel fit of `lowered`, a panic caught and returned as `Err`.
+fn fit_lowered(lowered: &Lowered, start: Option<&StartValues>) -> Result<Fit, String> {
+    catch_unwind(AssertUnwindSafe(|| {
         fit_warm(
             &lowered.x,
             &lowered.y,
@@ -621,24 +962,54 @@ pub fn run_fit(
             lowered.p,
             &lowered.model,
             &lowered.ids,
-            start.as_ref(),
+            start,
             &lowered.opts,
         )
     }))
-    .map_err(panic_message)?;
+    .map_err(panic_message)
+}
+
+/// `fit` of `prepared` as a [`FitResult`], with its two per-term tables.
+fn flatten(prepared: Prepared, fit: Fit) -> Result<FitResult, String> {
+    let Prepared {
+        mut lowered,
+        agq_warning,
+        reml_warning,
+    } = prepared;
+    // The LOWERING's observations, decided before any solver ran.
+    let lowered_notes = std::mem::take(&mut lowered.notes);
 
     let (coef_p, df_method) = t_tests(&fit, &lowered.opts.target_indices);
-    let (rss, r_squared, adj_r_squared) = if lowered.model.re.is_none() && fam == Family::Gaussian {
-        ols_r_squared(
-            &fit,
-            &lowered.y,
-            lowered.opts.weights.as_deref(),
-            lowered.opts.offset.as_deref(),
-            lowered.has_intercept,
-        )
-    } else {
-        (f64::NAN, f64::NAN, f64::NAN)
+    let (rss, r_squared, adj_r_squared) =
+        if lowered.model.re.is_none() && lowered.model.family == Family::Gaussian {
+            ols_r_squared(
+                &fit,
+                &lowered.y,
+                lowered.opts.weights.as_deref(),
+                lowered.opts.offset.as_deref(),
+                lowered.has_intercept,
+            )
+        } else {
+            (f64::NAN, f64::NAN, f64::NAN)
+        };
+
+    // Both per-term tables, while `lowered` and `fit` are whole. A panic in
+    // them is stored in the table's slot, marked as an internal error so a
+    // port never shows a bug as a refusal: the fit itself stands.
+    let term_table = |ss_type| {
+        catch_unwind(AssertUnwindSafe(|| {
+            term_tests(&lowered, &fit, &TermTestOptions { ss_type })
+        }))
+        .map_err(|payload| {
+            format!(
+                "internal error while building the per-term table (please report it): {}",
+                panic_message(payload)
+            )
+        })?
+        .map_err(|e| e.to_string())
     };
+    let term_table_type3 = term_table(SsType::Type3);
+    let term_table_type2 = term_table(SsType::Type2);
 
     // `varcorr` and `re_groups` are both emitted in RE declaration order
     // (primary, then each extra), so index i of one names index i of the other.
@@ -710,6 +1081,8 @@ pub fn run_fit(
         ranef_blocks,
         y: lowered.y,
         weights: lowered.opts.weights,
+        offset: lowered.opts.offset,
+        design_summary: fit.design_summary.map(|d| (d.counts, d.s, d.c)),
         nobs: lowered.n,
         boundary: boundary_name(diagnostics.boundary),
         pinned: diagnostics.pinned,
@@ -722,6 +1095,9 @@ pub fn run_fit(
         rss,
         r_squared,
         adj_r_squared,
+        objective: fit.objective,
+        term_table_type3,
+        term_table_type2,
     })
 }
 
@@ -842,8 +1218,8 @@ pub fn confint(
 }
 
 /// Whether two formula strings have the same fixed part, for the ports'
-/// `AIC` and `BIC` on two fits: [`crate::formula::fixed_part_relation`]
-/// answers [`FixedPartRelation::Same`] (the same fixed terms, compared as sets
+/// `AIC` and `BIC` on two fits: `crate::formula::fixed_part_relation`
+/// answers `FixedPartRelation::Same` (the same fixed terms, compared as sets
 /// of variable names, and the same fixed intercept). The response, the offset
 /// and the random part are not read.
 ///
@@ -868,7 +1244,10 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::formula::anova::{ComparisonTest, Side};
     use crate::inference::tails::t_two_sided_p;
+    use crate::inference::LrNote;
+    use crate::test_support::csv_table;
     use std::collections::HashMap;
 
     #[test]
@@ -1395,6 +1774,54 @@ mod tests {
         assert_eq!(off.se, on.se);
     }
 
+    /// `run_fit` hands a `(1 | g)` fit's design summary through unchanged, and
+    /// none for a fit with no random effect or with prior weights.
+    #[test]
+    fn run_fit_carries_the_design_summary_inside_the_envelope() {
+        let formula = "y ~ x + (1 | g)";
+        let r = fit_with(formula, toy_lmm(), "gaussian", "identity", None, true);
+        let (numeric, factor) = toy_lmm();
+        let mut columns: Vec<(String, Column)> = numeric
+            .into_iter()
+            .map(|(name, v)| (name, Column::Numeric(v)))
+            .collect();
+        columns.extend(
+            factor
+                .into_iter()
+                .map(|(name, (levels, codes))| (name, Column::Factor { levels, codes })),
+        );
+        let table = Table { columns, n: 48 };
+        let lo = lower(formula, &table, Family::Gaussian).expect("lowers");
+        let fit = fit_warm(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, None, &lo.opts);
+        let want = fit.design_summary.expect("a (1 | g) fit keeps it");
+        let (counts, s, c) = r.design_summary.expect("run_fit carries it");
+        assert_eq!(counts, want.counts);
+        assert_eq!(s, want.s);
+        assert_eq!(c, want.c);
+        assert_eq!((counts.len(), s.len(), c.len()), (8, 2 * 8, 2 * 2));
+
+        let ols = fit_with("y ~ x", toy_lmm(), "gaussian", "identity", None, true);
+        assert!(ols.design_summary.is_none());
+        let (numeric, factor) = toy_lmm();
+        let weighted = run_fit(
+            formula,
+            numeric,
+            factor,
+            "gaussian",
+            "identity",
+            "hessian",
+            1,
+            None,
+            Some((0..48).map(|i| 0.75 + 0.1 * (i % 6) as f64).collect()),
+            None,
+            None,
+            true,
+            None,
+        )
+        .expect("fit should succeed");
+        assert!(weighted.design_summary.is_none());
+    }
+
     #[test]
     fn ols_and_dispersion_glm_keep_residual_df_whatever_the_switch() {
         for switch in [true, false] {
@@ -1691,5 +2118,901 @@ mod tests {
             "hessian={:?} rx={:?} must differ, or wald_se=\"rx\" is a silent no-op",
             hessian.se, rx.se
         );
+    }
+
+    // ── run_compare, the stored per-term tables, the offset ───────────────
+
+    type Columns = (
+        HashMap<String, Vec<f64>>,
+        HashMap<String, (Vec<String>, Vec<u32>)>,
+    );
+
+    /// A committed simulated dataset (`validation/data/simulated/<name>.csv`)
+    /// as the column maps `run_fit` takes, `subj`, `g` and `h` as factors.
+    fn sim(name: &str) -> Columns {
+        let path = format!(
+            "{}/validation/data/simulated/{name}.csv",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        let mut numeric = HashMap::new();
+        let mut factor = HashMap::new();
+        for (col, values) in csv_table(&raw, &["subj", "g", "h"]).columns {
+            match values {
+                Column::Numeric(v) => {
+                    numeric.insert(col, v);
+                }
+                Column::Factor { levels, codes } => {
+                    factor.insert(col, (levels, codes));
+                }
+            }
+        }
+        (numeric, factor)
+    }
+
+    /// The same columns as a `Table`, for the direct kernel path.
+    fn table((numeric, factor): &Columns) -> Table {
+        table_of(numeric.clone(), factor.clone()).expect("a table")
+    }
+
+    /// `formula` lowered and fitted straight through the kernel, with the
+    /// options `run_fit` and `run_compare` set (`wald_se = "hessian"`,
+    /// `satterthwaite = true`): the reference the stored results must equal.
+    fn direct(
+        formula: &str,
+        data: &Columns,
+        family: Family,
+        nagq: u8,
+        reml: Option<bool>,
+        offset: Option<Vec<f64>>,
+    ) -> (Lowered, Fit) {
+        let mut lo = lower(formula, &table(data), family).expect("lowers");
+        lo.opts.wald_se = WaldSe::Hessian;
+        lo.opts.nagq = nagq;
+        lo.opts.reml = reml;
+        lo.opts.satterthwaite = true;
+        if offset.is_some() {
+            lo.opts.offset = offset;
+        }
+        let fit = fit_warm(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, None, &lo.opts);
+        (lo, fit)
+    }
+
+    fn run(
+        formula: &str,
+        (numeric, factor): Columns,
+        family: &str,
+        link: &str,
+        nagq: u8,
+        offset: Option<Vec<f64>>,
+        reml: Option<bool>,
+    ) -> FitResult {
+        run_fit(
+            formula, numeric, factor, family, link, "hessian", nagq, None, None, offset, None,
+            true, reml,
+        )
+        .unwrap_or_else(|e| panic!("{formula}: {e}"))
+    }
+
+    /// Every `FitResult` field read off the kernel's `Fit`, as one string
+    /// (`{:?}` of an `f64` round-trips, so equal strings are equal bits).
+    fn kernel_fields(r: &FitResult) -> String {
+        format!(
+            "{:?}",
+            (
+                (&r.beta, &r.se, &r.vcov, &r.tau2, &r.varcorr, &r.stddev_se),
+                (&r.aliased, r.dispersion, r.converged, r.n_eval, r.deviance),
+                (r.loglik, r.df, r.reml, &r.fitted, &r.ranef, &r.ranef_levels),
+                (&r.coef_df, &r.design_summary, r.nobs),
+            )
+        )
+    }
+
+    fn fit_fields(lo: &Lowered, fit: &Fit) -> String {
+        let ds = fit
+            .design_summary
+            .as_ref()
+            .map(|d| (d.counts.clone(), d.s.clone(), d.c.clone()));
+        format!(
+            "{:?}",
+            (
+                (
+                    &fit.beta,
+                    &fit.se,
+                    &fit.vcov,
+                    &fit.tau2,
+                    &fit.varcorr,
+                    &fit.stddev_se
+                ),
+                (
+                    fit.aliased(),
+                    fit.dispersion,
+                    fit.converged(),
+                    fit.n_eval,
+                    fit.deviance
+                ),
+                (
+                    fit.loglik,
+                    fit.df,
+                    fit.reml,
+                    &fit.fitted,
+                    &fit.ranef,
+                    &fit.ranef_levels
+                ),
+                (&fit.coef_df, &ds, lo.n),
+            )
+        )
+    }
+
+    fn bits(v: &Option<Vec<f64>>) -> Option<Vec<u64>> {
+        v.as_ref().map(|v| v.iter().map(|x| x.to_bits()).collect())
+    }
+
+    /// `run_fit` hands on the kernel's fit bit for bit, with its objective
+    /// (an AGQ fit's node count included) and the offset it fitted with,
+    /// from `offset=` or from `offset()` in the formula.
+    #[test]
+    fn run_fit_keeps_the_kernel_fit_bitwise_with_its_objective_and_offset() {
+        let (mut numeric, factor) = toy_ols();
+        let off: Vec<f64> = (0..10).map(|i| 0.1 * i as f64).collect();
+        numeric.insert("o".to_string(), off.clone());
+        let ols = (numeric, factor);
+        let gaussian = Family::Gaussian;
+        let binomial = Family::Binomial {
+            link: BinomialLink::Logit,
+        };
+        let cbpp = "cbind(incidence, healthy) ~ period + (1 | herd)";
+        let lmm = "y ~ g * h + x + (1 + x | subj)";
+        let cases = [
+            (
+                lmm,
+                sim("sim_factorial"),
+                "gaussian",
+                gaussian,
+                1,
+                None,
+                Objective::Reml,
+            ),
+            (
+                cbpp,
+                cbpp_columns(),
+                "binomial",
+                binomial,
+                5,
+                None,
+                Objective::Agq { nodes: 5 },
+            ),
+            (
+                "y ~ x",
+                ols.clone(),
+                "gaussian",
+                gaussian,
+                1,
+                Some(off.clone()),
+                Objective::LeastSquares,
+            ),
+            (
+                "y ~ x + offset(o)",
+                ols,
+                "gaussian",
+                gaussian,
+                1,
+                None,
+                Objective::LeastSquares,
+            ),
+        ];
+        for (formula, data, family, fam, nagq, offset, objective) in cases {
+            let link = if family == "binomial" {
+                "logit"
+            } else {
+                "identity"
+            };
+            let want = (offset.is_some() || formula.contains("offset(")).then(|| off.clone());
+            let r = run(
+                formula,
+                data.clone(),
+                family,
+                link,
+                nagq,
+                offset.clone(),
+                None,
+            );
+            let (lo, fit) = direct(formula, &data, fam, nagq, None, offset);
+            assert_eq!(kernel_fields(&r), fit_fields(&lo, &fit), "{formula}");
+            assert_eq!(r.objective, fit.objective, "{formula}");
+            assert_eq!(r.objective, objective, "{formula}");
+            assert_eq!(bits(&r.offset), bits(&lo.opts.offset), "{formula}");
+            assert_eq!(bits(&r.offset), bits(&want), "{formula}");
+        }
+    }
+
+    fn table_string(t: &Result<TermTable, String>) -> String {
+        format!("{t:?}")
+    }
+
+    /// The stored tables are `term_tests` on the fit's own `Lowered` and
+    /// `Fit`, both types, bit for bit: an LMM, its OLS twin, a GLMM; the
+    /// refusal of a formula without its marginal term is stored for both
+    /// types; an empty cell puts the missing-cell note on the Type III table.
+    #[test]
+    fn run_fit_stores_both_per_term_tables_as_term_tests_gives_them() {
+        let gaussian = Family::Gaussian;
+        let binomial = Family::Binomial {
+            link: BinomialLink::Logit,
+        };
+        let cases = [
+            ("y ~ g * h + x + (1 + x | subj)", "sim_factorial", gaussian),
+            ("y ~ g * h + x", "sim_factorial", gaussian),
+            ("y ~ g * h + x + (1 | subj)", "sim_factorial_bern", binomial),
+            ("y ~ x + x:g", "sim_factorial", gaussian),
+            (
+                "y ~ g * h + x + (1 + x | subj)",
+                "sim_factorial_empty",
+                gaussian,
+            ),
+        ];
+        for (formula, data, fam) in cases {
+            let (family, link) = if fam == gaussian {
+                ("gaussian", "identity")
+            } else {
+                ("binomial", "logit")
+            };
+            let r = run(formula, sim(data), family, link, 1, None, None);
+            let (lo, fit) = direct(formula, &sim(data), fam, 1, None, None);
+            for (stored, ss_type) in [
+                (&r.term_table_type3, SsType::Type3),
+                (&r.term_table_type2, SsType::Type2),
+            ] {
+                let want =
+                    term_tests(&lo, &fit, &TermTestOptions { ss_type }).map_err(|e| e.to_string());
+                assert_eq!(
+                    table_string(stored),
+                    table_string(&want),
+                    "{formula} on {data}"
+                );
+            }
+        }
+        // What the cases above hold: a refusal for both types, and the note.
+        let nonmarginal = run(
+            "y ~ x + x:g",
+            sim("sim_factorial"),
+            "gaussian",
+            "identity",
+            1,
+            None,
+            None,
+        );
+        assert!(nonmarginal.term_table_type3.is_err() && nonmarginal.term_table_type2.is_err());
+        let empty = run(
+            "y ~ g * h + x + (1 + x | subj)",
+            sim("sim_factorial_empty"),
+            "gaussian",
+            "identity",
+            1,
+            None,
+            None,
+        );
+        let t3 = empty.term_table_type3.as_ref().expect("a table");
+        assert!(
+            t3.notes.iter().any(|n| n.contains("Missing cells")),
+            "{:?}",
+            t3.notes
+        );
+        let lmm = run(
+            "y ~ g * h + x + (1 + x | subj)",
+            sim("sim_factorial"),
+            "gaussian",
+            "identity",
+            1,
+            None,
+            None,
+        );
+        let cols = term_columns(lmm.term_table_type3.as_ref().expect("a table"));
+        assert_eq!(cols.label, ["g", "h", "x", "g:h"]);
+        assert!(cols.den_df_kind.iter().all(|k| *k == "satterthwaite"));
+    }
+
+    /// The four estimator cases of `run_compare`: each pair fitted the way
+    /// its case needs, and the comparison equal, bit for bit, to the two-fit
+    /// `compare` on the same two fits made directly.
+    #[test]
+    fn run_compare_picks_the_estimator_from_what_differs() {
+        let gaussian = Family::Gaussian;
+        let binomial = Family::Binomial {
+            link: BinomialLink::Logit,
+        };
+        // (f0, f1, data, family, the fits' `reml` argument, `Fit::reml`)
+        let cases = [
+            (
+                "y ~ g * h + x",
+                "y ~ g * h + x + (1 | subj)",
+                "sim_factorial",
+                gaussian,
+                Some(true),
+                true,
+            ),
+            (
+                "y ~ g * h + x + (1 | subj)",
+                "y ~ g + h + x + (1 | subj)",
+                "sim_factorial",
+                gaussian,
+                Some(false),
+                false,
+            ),
+            (
+                "y ~ g + h + x + (1 | subj)",
+                "y ~ g * h + x + (1 + x | subj)",
+                "sim_factorial",
+                gaussian,
+                Some(false),
+                false,
+            ),
+            (
+                "y ~ g * h + x + (1 | subj)",
+                "y ~ g * h + x",
+                "sim_factorial_bern",
+                binomial,
+                None,
+                false,
+            ),
+        ];
+        for (f0, f1, data, fam, reml, fit_reml) in cases {
+            let (family, link) = if fam == gaussian {
+                ("gaussian", "identity")
+            } else {
+                ("binomial", "logit")
+            };
+            let (numeric, factor) = sim(data);
+            let got = run_compare(
+                f0, f1, numeric, factor, family, link, 1, None, None, None, None,
+            )
+            .unwrap_or_else(|e| panic!("{f0} vs {f1}: {e}"));
+            for fit in [&got.fit0, &got.fit1] {
+                assert_eq!(fit.reml, fit_reml, "{f0} vs {f1}");
+                assert!(fit.reml_warning.is_none());
+                // satterthwaite = true: a Gaussian mixed side's table has its F rows.
+                if fam == gaussian && !fit.varcorr.is_empty() {
+                    let cols = term_columns(fit.term_table_type3.as_ref().expect("a table"));
+                    assert!(cols.den_df_kind.iter().all(|k| *k == "satterthwaite"));
+                }
+            }
+            let (lo0, fit0) = direct(f0, &sim(data), fam, 1, reml, None);
+            let (lo1, fit1) = direct(f1, &sim(data), fam, 1, reml, None);
+            let want = compare(
+                &Model::from_fit(f0, &lo0, &fit0),
+                &Model::from_fit(f1, &lo1, &fit1),
+                &compare_options(None, None).unwrap(),
+            )
+            .expect("comparable");
+            assert_eq!(
+                format!("{:?}", got.comparison),
+                format!("{want:?}"),
+                "{f0} vs {f1}"
+            );
+        }
+    }
+
+    /// The OLS side of a random-part-only pair is the OLS fit made with
+    /// `reml = true`: its log-likelihood is the REML value.
+    #[test]
+    fn run_compare_fits_the_ols_side_by_reml() {
+        let (f0, f1) = ("y ~ g * h + x", "y ~ g * h + x + (1 | subj)");
+        let (numeric, factor) = sim("sim_factorial");
+        let got = run_compare(
+            f0, f1, numeric, factor, "gaussian", "identity", 1, None, None, None, None,
+        )
+        .expect("compares");
+        let ols = run(
+            f0,
+            sim("sim_factorial"),
+            "gaussian",
+            "identity",
+            1,
+            None,
+            Some(true),
+        );
+        assert!(got.fit0.reml);
+        assert_eq!(got.fit0.loglik.to_bits(), ols.loglik.to_bits());
+        assert_ne!(
+            got.fit0.loglik.to_bits(),
+            run(
+                f0,
+                sim("sim_factorial"),
+                "gaussian",
+                "identity",
+                1,
+                None,
+                None
+            )
+            .loglik
+            .to_bits()
+        );
+    }
+
+    /// The formulas swapped give the same test; the fits follow the
+    /// formulas as given.
+    #[test]
+    fn run_compare_takes_the_formulas_in_either_order() {
+        let (f0, f1) = (
+            "y ~ g + h + x + (1 | subj)",
+            "y ~ g * h + x + (1 + x | subj)",
+        );
+        let go = |a: &str, b: &str| {
+            let (numeric, factor) = sim("sim_factorial");
+            run_compare(
+                a, b, numeric, factor, "gaussian", "identity", 1, None, None, None, None,
+            )
+            .expect("compares")
+        };
+        let (ab, ba) = (go(f0, f1), go(f1, f0));
+        assert_eq!(
+            format!("{:?}", ab.comparison.test),
+            format!("{:?}", ba.comparison.test)
+        );
+        assert_eq!(ab.comparison.larger, Side::Second);
+        assert_eq!(ba.comparison.larger, Side::First);
+        assert_eq!(ba.comparison.m0.formula_label, f1);
+        assert_eq!(kernel_fields(&ab.fit0), kernel_fields(&ba.fit1));
+        assert_eq!(kernel_fields(&ab.fit1), kernel_fields(&ba.fit0));
+    }
+
+    /// Formulas that are not nested refuse before either fit (an unknown
+    /// column would be the fit's error); a fit that does not converge
+    /// refuses the comparison.
+    #[test]
+    fn run_compare_refuses_unnested_formulas_and_an_unconverged_fit() {
+        let (numeric, factor) = sim("sim_factorial");
+        let (f0, f1) = ("y ~ g + nosuch", "y ~ h");
+        let err = run_compare(
+            f0, f1, numeric, factor, "gaussian", "identity", 1, None, None, None, None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            CompareError::NotNested {
+                m0: f0.to_string(),
+                m1: f1.to_string()
+            }
+            .to_string()
+        );
+
+        let (mut numeric, factor) = toy_lmm();
+        let x2: Vec<f64> = numeric["x"].iter().map(|v| 2.0 * v).collect();
+        numeric.insert("x2".to_string(), x2);
+        let err = run_compare(
+            "y ~ x + x2 + (1 | g)",
+            "y ~ x + x2 + (1 + x2 | g)",
+            numeric,
+            factor,
+            "gaussian",
+            "identity",
+            1,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            CompareError::NotConverged {
+                m0: false,
+                m1: true
+            }
+            .to_string()
+        );
+    }
+
+    /// A `cbind()` response sets the weights without tripping the
+    /// double specification, and `nagq` is stripped per model as `run_fit`
+    /// strips it: `Agq{5}` against `Laplace`, with the node-count note.
+    #[test]
+    fn run_compare_strips_nagq_per_model_and_reads_a_cbind_response() {
+        let (numeric, mut factor) = cbpp_columns();
+        let blk: Vec<String> = factor["herd"]
+            .1
+            .iter()
+            .map(|c| format!("b{}", c % 3))
+            .collect();
+        let blk: Vec<&str> = blk.iter().map(String::as_str).collect();
+        factor.insert("blk".to_string(), factor_col(&blk));
+        let f0 = "cbind(incidence, healthy) ~ period + (1 | herd)";
+        let f1 = "cbind(incidence, healthy) ~ period + (1 | herd) + (1 | blk)";
+        let got = run_compare(
+            f0, f1, numeric, factor, "binomial", "logit", 5, None, None, None, None,
+        )
+        .expect("compares");
+        assert_eq!(got.fit0.objective, Objective::Agq { nodes: 5 });
+        assert!(got.fit0.agq_warning.is_none());
+        assert_eq!(got.fit1.objective, Objective::Laplace);
+        assert!(got.fit1.agq_warning.as_deref().unwrap().contains("nagq=5"));
+        assert!(got.fit0.weights.is_some());
+        let ComparisonTest::Lr(t) = &got.comparison.test else {
+            panic!("an LR test")
+        };
+        assert!(
+            t.notes.contains(&LrNote::NodeCounts { m0: 5, m1: 1 }),
+            "{:?}",
+            t.notes
+        );
+    }
+
+    /// `seed = None` takes `DEFAULT_SEED`: the same p-value as passing it.
+    /// The result carries `nsim` and the seed; `nsim` is bounded.
+    #[test]
+    fn run_compare_defaults_the_seed_to_the_constant() {
+        let (f0, f1) = ("y ~ g * h + x", "y ~ g * h + x + (1 | subj)");
+        let go = |seed: Option<u64>| {
+            let (numeric, factor) = sim("sim_factorial");
+            run_compare(
+                f0,
+                f1,
+                numeric,
+                factor,
+                "gaussian",
+                "identity",
+                1,
+                None,
+                None,
+                Some(999),
+                seed,
+            )
+            .expect("compares")
+        };
+        let p = |r: &CompareResult| match &r.comparison.test {
+            ComparisonTest::Lr(t) => (t.p_value, t.reference),
+            other => panic!("{other:?}"),
+        };
+        let (default, given) = (go(None), go(Some(DEFAULT_SEED)));
+        assert_eq!(p(&default).0.to_bits(), p(&given).0.to_bits());
+        assert_eq!((default.nsim, default.seed), (999, DEFAULT_SEED));
+        assert_eq!(
+            p(&default).1,
+            Reference::ExactRlrt {
+                nsim: 999,
+                seed: DEFAULT_SEED
+            }
+        );
+        for bad in [0, MAX_NSIM + 1] {
+            let (numeric, factor) = sim("sim_factorial");
+            let err = run_compare(
+                f0,
+                f1,
+                numeric,
+                factor,
+                "gaussian",
+                "identity",
+                1,
+                None,
+                None,
+                Some(bad),
+                None,
+            )
+            .unwrap_err();
+            assert!(err.starts_with("nsim must be"), "{err}");
+        }
+    }
+
+    /// `x` and `y` are the same `f64`, a NaN equal to any NaN.
+    fn same(x: f64, y: f64) -> bool {
+        x.to_bits() == y.to_bits() || (x.is_nan() && y.is_nan())
+    }
+
+    /// `term_columns` puts each `FixedRow` field in its column, row by row,
+    /// on an F table with Satterthwaite df, an F table with the residual df,
+    /// a Wald χ² table, and a table with row notes and a table note.
+    #[test]
+    fn term_columns_flattens_each_row_into_its_columns() {
+        let gaussian = Family::Gaussian;
+        let binomial = Family::Binomial {
+            link: BinomialLink::Logit,
+        };
+        let lmm = "y ~ g * h + x + (1 + x | subj)";
+        // `x2` is `x` doubled: its column is aliased, its row untested.
+        let (mut numeric, factor) = sim("sim_factorial");
+        let x2: Vec<f64> = numeric["x"].iter().map(|v| 2.0 * v).collect();
+        numeric.insert("x2".to_string(), x2);
+        let aliased = (numeric, factor);
+        // (formula, data, family, ss type, each row's kind and den_df_kind)
+        let cases = [
+            (
+                lmm,
+                "sim_factorial",
+                gaussian,
+                SsType::Type3,
+                "F",
+                "satterthwaite",
+            ),
+            (
+                "y ~ g * h + x",
+                "sim_factorial",
+                gaussian,
+                SsType::Type2,
+                "F",
+                "residual",
+            ),
+            (
+                "y ~ g * h + x + (1 | subj)",
+                "sim_factorial_bern",
+                binomial,
+                SsType::Type3,
+                "chisq",
+                "",
+            ),
+            (
+                lmm,
+                "sim_factorial_empty",
+                gaussian,
+                SsType::Type3,
+                "F",
+                "satterthwaite",
+            ),
+            (
+                "y ~ g * h + x + x2",
+                "",
+                gaussian,
+                SsType::Type3,
+                "F",
+                "residual",
+            ),
+        ];
+        let (mut multi_df_f_rows, mut row_notes, mut table_notes) = (0, 0, 0);
+        for (formula, data, fam, ss_type, kind, den_df_kind) in cases {
+            let columns = if data.is_empty() {
+                aliased.clone()
+            } else {
+                sim(data)
+            };
+            let (lo, fit) = direct(formula, &columns, fam, 1, None, None);
+            let t = term_tests(&lo, &fit, &TermTestOptions { ss_type }).expect("a table");
+            let c = term_columns(&t);
+            let n = t.fixed.len();
+            assert!(n > 0, "{formula} on {data}");
+            let ss = if ss_type == SsType::Type3 {
+                "III"
+            } else {
+                "II"
+            };
+            assert_eq!(c.ss_type, ss);
+            let lens = [
+                c.label.len(),
+                c.kind.len(),
+                c.statistic.len(),
+                c.num_df.len(),
+                c.den_df.len(),
+                c.den_df_kind.len(),
+                c.p_value.len(),
+                c.sum_sq.len(),
+                c.mean_sq.len(),
+                c.row_notes.len(),
+            ];
+            assert_eq!(lens, [n; 10], "{formula} on {data}");
+            for (i, row) in t.fixed.iter().enumerate() {
+                let at = format!("{formula} on {data}, row {i}");
+                assert_eq!(c.label[i], row.label, "{at}");
+                assert_eq!(c.kind[i], kind, "{at}");
+                assert_eq!(c.den_df_kind[i], den_df_kind, "{at}");
+                assert!(same(c.statistic[i], row.test.statistic), "{at}");
+                assert!(same(c.num_df[i], row.test.num_df), "{at}");
+                assert!(same(c.p_value[i], row.test.p_value), "{at}");
+                match row.test.reference {
+                    Reference::F { den_df, .. } => {
+                        assert_eq!(kind, "F", "{at}");
+                        assert!(same(c.den_df[i], den_df), "{at}");
+                    }
+                    _ => {
+                        assert_eq!(kind, "chisq", "{at}");
+                        assert!(c.den_df[i].is_nan(), "{at}");
+                    }
+                }
+                match (row.sum_sq, row.mean_sq) {
+                    (Some(ss), Some(ms)) => {
+                        assert!(same(c.sum_sq[i], ss) && same(c.mean_sq[i], ms), "{at}");
+                        multi_df_f_rows += usize::from(row.test.num_df > 1.0 && ss != ms);
+                    }
+                    (None, None) => {
+                        assert!(c.sum_sq[i].is_nan() && c.mean_sq[i].is_nan(), "{at}");
+                    }
+                    other => panic!("{at}: {other:?}"),
+                }
+                let lines: Vec<String> = row
+                    .test
+                    .notes
+                    .iter()
+                    .map(|note| linear_note_line(*note, &t.coef_names))
+                    .collect();
+                assert_eq!(c.row_notes[i], lines, "{at}");
+                row_notes += lines.len();
+            }
+            assert_eq!(c.notes, t.notes, "{formula} on {data}");
+            table_notes += t.notes.len();
+        }
+        // What the cases hold: an F row on more than one df (its Sum Sq is
+        // not its Mean Sq), a row note and a table note.
+        assert!(
+            multi_df_f_rows > 0 && row_notes > 0 && table_notes > 0,
+            "{multi_df_f_rows} multi-df F rows, {row_notes} row notes, {table_notes} table notes"
+        );
+    }
+
+    /// `objective_parts` on every objective, and `objective_from_parts`
+    /// back; a pair `objective_parts` never gives is refused.
+    #[test]
+    fn objective_parts_round_trip_on_every_objective() {
+        let cases = [
+            (Objective::LeastSquares, ("least_squares", 0)),
+            (Objective::MaximumLikelihood, ("maximum_likelihood", 0)),
+            (Objective::Reml, ("reml", 0)),
+            (Objective::Laplace, ("laplace", 1)),
+            (Objective::Agq { nodes: 5 }, ("agq", 5)),
+        ];
+        for (objective, (label, nodes)) in cases {
+            assert_eq!(objective_parts(objective), (label, nodes));
+            assert_eq!(objective_from_parts(label, nodes), Ok(objective));
+        }
+        assert_eq!(
+            objective_from_parts("reml", 1),
+            Err("no fit stores the objective \"reml\" with 1 quadrature node".to_string())
+        );
+        for (label, nodes) in [
+            ("least_squares", 1),
+            ("reml", 1),
+            ("laplace", 0),
+            ("laplace", 2),
+            ("agq", 0),
+            ("agq", 1),
+            ("ml", 0),
+        ] {
+            assert!(
+                objective_from_parts(label, nodes).is_err(),
+                "{label}, {nodes}"
+            );
+        }
+    }
+
+    /// `nsim` from 1 to `MAX_NSIM` is taken; 0 and `MAX_NSIM + 1` are refused.
+    #[test]
+    fn compare_options_takes_nsim_from_1_to_max_nsim() {
+        assert_eq!(
+            compare_options(None, None),
+            Ok(CompareOptions {
+                nsim: DEFAULT_NSIM,
+                seed: DEFAULT_SEED
+            })
+        );
+        for nsim in [1, MAX_NSIM] {
+            assert_eq!(
+                compare_options(Some(nsim), Some(7)),
+                Ok(CompareOptions { nsim, seed: 7 })
+            );
+        }
+        for nsim in [0, MAX_NSIM + 1] {
+            assert_eq!(
+                compare_options(Some(nsim), None),
+                Err(format!(
+                    "nsim must be a whole number from 1 to {MAX_NSIM}, got {nsim}"
+                ))
+            );
+        }
+    }
+
+    /// Two formulas with the same fixed and random parts are refused before
+    /// either fit (an unknown column would be the fit's error).
+    #[test]
+    fn run_compare_refuses_equal_parts_before_any_fit() {
+        let (numeric, factor) = sim("sim_factorial");
+        let err = run_compare(
+            "y ~ g + nosuch + (1 | subj)",
+            "y ~ nosuch + g + (1 | subj)",
+            numeric,
+            factor,
+            "gaussian",
+            "identity",
+            1,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(err, CompareError::SameParts.to_string());
+    }
+
+    /// The early refusal of two equal parts is the comparison's own refusal
+    /// of two fits of one formula, word for word.
+    #[test]
+    fn run_compare_refuses_equal_parts_in_the_words_of_compare() {
+        let (numeric, factor) = sim("sim_factorial");
+        let data = table_of(numeric.clone(), factor.clone()).expect("a table");
+        let f = "y ~ g + (1 | subj)";
+        let prepared = lower_with(
+            f,
+            &data,
+            Family::Gaussian,
+            "hessian",
+            1,
+            None,
+            None,
+            None,
+            true,
+            Some(false),
+        )
+        .expect("lowers");
+        let fit = fit_lowered(&prepared.lowered, None).expect("fits");
+        let m = Model::from_fit(f, &prepared.lowered, &fit);
+        let opts = compare_options(None, None).expect("the defaults");
+        let refused = compare(&m, &m, &opts).unwrap_err();
+        assert_eq!(refused, CompareError::SameParts);
+        let err = run_compare(
+            f,
+            "y ~ (1 | subj) + g",
+            numeric,
+            factor,
+            "gaussian",
+            "identity",
+            1,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(err, refused.to_string());
+    }
+
+    /// Two formulas that differ only by an `offset()` term have the same
+    /// parts, but the refusal names the offsets, as `compare` does.
+    #[test]
+    fn run_compare_names_the_offset_when_only_the_offset_term_differs() {
+        let (numeric, factor) = sim("sim_factorial");
+        let err = run_compare(
+            "y ~ g + offset(x) + (1 | subj)",
+            "y ~ g + (1 | subj)",
+            numeric,
+            factor,
+            "gaussian",
+            "identity",
+            1,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(err, CompareError::DifferentOffset.to_string());
+    }
+
+    /// A panic while a per-term table is built is stored as that table's
+    /// internal error, never as a refusal, and the fit stands.
+    #[test]
+    fn a_panic_in_the_term_tables_is_stored_as_an_internal_error() {
+        let (numeric, factor) = toy_ols();
+        let data = table_of(numeric, factor).expect("a table");
+        let prepared = lower_with(
+            "y ~ x",
+            &data,
+            Family::Gaussian,
+            "hessian",
+            1,
+            None,
+            None,
+            None,
+            true,
+            None,
+        )
+        .expect("lowers");
+        let mut fit = fit_lowered(&prepared.lowered, None).expect("fits");
+        // `term_tests` reads `aliased` at each column, past its end now.
+        fit.diagnostics.aliased.clear();
+        let r = flatten(prepared, fit).expect("the fit stands");
+        for t in [&r.term_table_type3, &r.term_table_type2] {
+            let err = t.as_ref().unwrap_err();
+            assert!(
+                err.starts_with(
+                    "internal error while building the per-term table (please report it): "
+                ),
+                "{err}"
+            );
+        }
     }
 }

@@ -820,3 +820,47 @@ fn ols_reml_loglik_is_on_the_lmm_deviance_scale() {
         );
     }
 }
+
+/// `nobs` is the row count on every OLS fit, a non-converged one included, and
+/// `objective` is least squares whatever `reml` asks for: an OLS fit made with
+/// `reml = Some(true)` reports the REML `loglik` (`Fit::reml`) under the same
+/// label. A weighted fit counts its rows, not the sum of its weights.
+#[test]
+fn ols_fit_reports_nobs_and_least_squares() {
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: None,
+    };
+    let (x, y, w, n, p) = residual_df_data(false);
+    for (reml, weights) in [(None, None), (Some(true), Some(w))] {
+        let opts = FitOptions {
+            target_indices: (0..p as u32).collect(),
+            reml,
+            weights,
+            ..FitOptions::default()
+        };
+        let f = fit_cold(&x, &y, n, p, &model, &GroupIds::default(), &opts);
+        assert!(f.converged(), "reml = {reml:?}");
+        assert_eq!(
+            (f.nobs, f.objective),
+            (n, Objective::LeastSquares),
+            "reml = {reml:?}"
+        );
+    }
+    // `n == p`: refused before any solve.
+    let (n, p) = (4, 4);
+    let x: Vec<f64> = (0..n * p)
+        .map(|t| if t % p <= t / p { 1.0 } else { 0.0 })
+        .collect();
+    let f = fit_cold(
+        &x,
+        &[1.0; 4],
+        n,
+        p,
+        &model,
+        &GroupIds::default(),
+        &FitOptions::default(),
+    );
+    assert!(!f.converged());
+    assert_eq!((f.nobs, f.objective), (n, Objective::LeastSquares));
+}

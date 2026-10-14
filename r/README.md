@@ -18,9 +18,11 @@ On all tested models: a 923-model validation grid, checked for every release.
 
 Deliberately scoped to **fast fitting**: fixed effects, Wald standard errors,
 variance components on the SD/correlation scale, conditional modes, fitted
-values, and log-likelihood. Anything the engine cannot compute honestly
-(`predict`, `coef`, profiling) is an error naming the reason —
-never a silently different answer.
+values, log-likelihood, and tests of fixed terms and of two nested models
+(`anova()`, `compare()`; see
+[`hypothesis-tests.md`](../documentation/hypothesis-tests.md)). Anything the
+engine cannot compute honestly (`predict`, `coef`, profiling) is an error
+naming the reason, never a silently different answer.
 
 ## Installation
 
@@ -65,6 +67,8 @@ vcov(fit)        # full Wald covariance
 VarCorr(fit)     # SD/correlation-scale variance components, lme4-shaped
 confint(fit)     # Wald intervals on the summary's t or z quantiles
 isSingular(fit)  # boundary-fit flag, lme4's condition
+anova(fit)       # tests of the fixed terms (Type III)
+compare(data, y ~ x1, y ~ x1 + (1 | subject))  # two nested models, fitted and compared
 ```
 
 `nAGQ = k` (odd, up to 25) turns on adaptive quadrature for binomial, Poisson,

@@ -30,7 +30,8 @@ matching \code{lme4::logLik} on a REML fit (and \code{logLik(lm, REML = TRUE)} o
 OLS), and the returned object carries \code{REML = TRUE}. It stays the REML value
 because that is the quantity for comparing random-effect structures with the
 same fixed effects. REML criteria are comparable only between models with
-identical fixed effects: \code{AIC()} and \code{BIC()} refuse REML fits with different
-fixed effects. To compare fixed effects, fit both models with
+identical fixed effects: \code{AIC()}, \code{BIC()} and \code{anova(m0, m1)} refuse REML
+fits with different fixed effects. To compare fixed effects, use
+\code{\link[=compare]{compare()}}, which fits both models by ML, or fit both models with
 \code{REML = FALSE}; an ML fit returns the ML log-likelihood, with \code{REML = FALSE}.
 }

@@ -4,6 +4,8 @@
 
 use std::collections::HashMap;
 
+use glmm::formula::anova::{self, CompareError, Comparison, ComparisonTest, Differs, Model, Side};
+use glmm::inference::Reference;
 use glmm::orchestrate;
 
 use pyo3::exceptions::PyValueError;
@@ -47,6 +49,18 @@ fn fit_dict<'py>(py: Python<'py>, r: orchestrate::FitResult) -> PyResult<Bound<'
     d.set_item("ranef_levels", r.ranef_levels)?;
     d.set_item("y", r.y)?;
     d.set_item("weights", r.weights)?;
+    // `(counts, s, c)` as a dict of three flat lists, `None` outside the
+    // `(1 | g)` envelope.
+    match r.design_summary {
+        Some((counts, s, c)) => {
+            let ds = PyDict::new(py);
+            ds.set_item("counts", counts)?;
+            ds.set_item("s", s)?;
+            ds.set_item("c", c)?;
+            d.set_item("design_summary", ds)?;
+        }
+        None => d.set_item("design_summary", py.None())?,
+    }
     d.set_item("nobs", r.nobs)?;
     // Labelled blocks as their own dicts, same reason the notes below are: the
     // Python layer reshapes each into `(n_levels, n_terms)` and never has to
@@ -84,6 +98,42 @@ fn fit_dict<'py>(py: Python<'py>, r: orchestrate::FitResult) -> PyResult<Bound<'
     d.set_item("rss", r.rss)?;
     d.set_item("r_squared", r.r_squared)?;
     d.set_item("adj_r_squared", r.adj_r_squared)?;
+    d.set_item("offset", r.offset)?;
+    let (objective, nodes) = orchestrate::objective_parts(r.objective);
+    d.set_item("objective", objective)?;
+    d.set_item("objective_nodes", nodes)?;
+    d.set_item("term_table_type3", term_dict(py, &r.term_table_type3)?)?;
+    d.set_item("term_table_type2", term_dict(py, &r.term_table_type2)?)?;
+    Ok(d)
+}
+
+/// A stored per-term result as a `dict`: `error` is the refusal's message,
+/// or `None` beside the table's columns (`orchestrate::TermColumns`, one list
+/// entry per row).
+fn term_dict<'py>(
+    py: Python<'py>,
+    result: &Result<glmm::formula::anova::TermTable, String>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    match result {
+        Err(message) => d.set_item("error", message)?,
+        Ok(table) => {
+            let c = orchestrate::term_columns(table);
+            d.set_item("error", py.None())?;
+            d.set_item("ss_type", c.ss_type)?;
+            d.set_item("label", c.label)?;
+            d.set_item("kind", c.kind)?;
+            d.set_item("statistic", c.statistic)?;
+            d.set_item("num_df", c.num_df)?;
+            d.set_item("den_df", c.den_df)?;
+            d.set_item("den_df_kind", c.den_df_kind)?;
+            d.set_item("p_value", c.p_value)?;
+            d.set_item("sum_sq", c.sum_sq)?;
+            d.set_item("mean_sq", c.mean_sq)?;
+            d.set_item("row_notes", c.row_notes)?;
+            d.set_item("notes", c.notes)?;
+        }
+    }
     Ok(d)
 }
 
@@ -139,6 +189,246 @@ fn confint(beta: Vec<f64>, se: Vec<f64>, coef_df: Vec<f64>, level: f64) -> PyRes
     orchestrate::confint(&beta, &se, &coef_df, level).map_err(PyValueError::new_err)
 }
 
+/// One side of `glmm.anova(m0, m1)`: what a stored `glmm.Fit` keeps, keyed as
+/// `glmm/anova.py::_side` sends it, read into an `anova::Model` with no refit.
+#[derive(FromPyObject)]
+#[pyo3(from_item_all)]
+struct StoredFit {
+    formula: String,
+    family: String,
+    link: String,
+    loglik: f64,
+    df: usize,
+    nobs: usize,
+    reml: bool,
+    objective: String,
+    objective_nodes: u8,
+    converged: bool,
+    varcorr: Vec<Vec<f64>>,
+    re_groups: Vec<(String, Vec<String>)>,
+    y: Vec<f64>,
+    weights: Option<Vec<f64>>,
+    offset: Option<Vec<f64>>,
+    dispersion_held: Option<f64>,
+    design_summary: Option<(Vec<f64>, Vec<f64>, Vec<f64>)>,
+    rss: f64,
+    coef_names: Vec<String>,
+    coef: Vec<f64>,
+    vcov: Vec<Vec<f64>>,
+    aliased: Vec<bool>,
+}
+
+impl StoredFit {
+    fn model(self) -> PyResult<Model> {
+        Ok(Model {
+            family: orchestrate::family_from_str(&self.family, &self.link)
+                .map_err(PyValueError::new_err)?,
+            objective: orchestrate::objective_from_parts(&self.objective, self.objective_nodes)
+                .map_err(PyValueError::new_err)?,
+            formula: self.formula,
+            loglik: self.loglik,
+            df: self.df,
+            nobs: self.nobs,
+            reml: self.reml,
+            converged: self.converged,
+            varcorr: self.varcorr,
+            re_groups: self.re_groups,
+            y: self.y,
+            weights: self.weights,
+            offset: self.offset,
+            dispersion_held: self.dispersion_held,
+            design_summary: self.design_summary,
+            rss: self.rss,
+            coef_names: self.coef_names,
+            coef: self.coef,
+            vcov: self.vcov,
+            aliased: self.aliased,
+        })
+    }
+}
+
+/// A refusal of `glmm.anova(m0, m1)` in Python's words: the crate's text says
+/// what is wrong and what to do with no call syntax, and the seven refusals
+/// that `glmm.compare` avoids gain the pointer to it (and to `reml=False`).
+fn refusal(e: &CompareError) -> String {
+    const COMPARE: &str = "glmm.compare(data, f0, f1)";
+    let pointer = match e {
+        CompareError::DifferentRows { .. } => {
+            format!("Or use {COMPARE}, which drops those rows once for both fits.")
+        }
+        CompareError::DifferentY => format!("Or use {COMPARE}, which fits both to the same data."),
+        CompareError::DifferentWeights => {
+            format!("Or use {COMPARE}, which takes the weights once.")
+        }
+        CompareError::DifferentOffset => format!("Or use {COMPARE}, which takes the offset once."),
+        CompareError::DifferentFamily { .. } => {
+            format!("Or use {COMPARE}, which takes the family and link once.")
+        }
+        CompareError::MixedEstimators { .. } => {
+            format!("Or use {COMPARE}, which picks the estimator itself.")
+        }
+        CompareError::RemlDifferentFixed => {
+            format!("Pass reml=False to both fits, or use {COMPARE}, which fits both by ML.")
+        }
+        _ => return e.to_string(),
+    };
+    format!("{e} {pointer}")
+}
+
+/// A [`Comparison`] as a `dict` for `glmm/anova.py`: `sides` holds `m0` and
+/// `m1` as given (each with its residual sum of squares from `rss`, NaN off
+/// OLS), `larger` the index of the larger one, and the test, its reference
+/// and notes beside the `nsim` and `seed` the call used.
+fn comparison_dict<'py>(
+    py: Python<'py>,
+    c: &Comparison,
+    rss: [f64; 2],
+    nsim: usize,
+    seed: u64,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    let sides = PyList::empty(py);
+    for (info, rss) in [(&c.m0, rss[0]), (&c.m1, rss[1])] {
+        let s = PyDict::new(py);
+        s.set_item("formula", &info.formula_label)?;
+        s.set_item("npar", info.npar)?;
+        s.set_item("nobs", info.nobs)?;
+        s.set_item("loglik", info.loglik)?;
+        s.set_item("aic", info.aic)?;
+        s.set_item("bic", info.bic)?;
+        s.set_item("rss", rss)?;
+        sides.append(s)?;
+    }
+    d.set_item("sides", sides)?;
+    d.set_item(
+        "larger",
+        match c.larger {
+            Side::First => 0,
+            Side::Second => 1,
+        },
+    )?;
+    d.set_item(
+        "differs",
+        match c.differs {
+            Differs::Fixed => "fixed",
+            Differs::Random => "random",
+            Differs::Both => "both",
+        },
+    )?;
+    let (test, statistic, df, p_value, reference) = match &c.test {
+        ComparisonTest::Lr(t) => {
+            let (objective, nodes) = orchestrate::objective_parts(t.objective);
+            d.set_item("objective", objective)?;
+            d.set_item("objective_nodes", nodes)?;
+            ("lr", t.statistic, t.df as f64, t.p_value, t.reference)
+        }
+        ComparisonTest::Linear(t) => ("f", t.statistic, t.num_df, t.p_value, t.reference),
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "no Python rendering for the comparison test {other:?}"
+            )))
+        }
+    };
+    d.set_item("test", test)?;
+    d.set_item("statistic", statistic)?;
+    d.set_item("df", df)?;
+    d.set_item("p_value", p_value)?;
+    // The exact reference's `nsim` is the draws made (0 at a zero statistic),
+    // not the draws requested, which `nsim` below carries.
+    let r = PyDict::new(py);
+    match reference {
+        Reference::ChiSquared { df } => {
+            r.set_item("kind", "chisq")?;
+            r.set_item("df", df)?;
+        }
+        Reference::ChiBarSquared { df_low } => {
+            r.set_item("kind", "chibar")?;
+            r.set_item("df", df_low)?;
+        }
+        Reference::ExactRlrt { nsim, seed } => {
+            r.set_item("kind", "exact")?;
+            r.set_item("nsim", nsim)?;
+            r.set_item("seed", seed)?;
+        }
+        Reference::F { num_df, den_df, .. } => {
+            r.set_item("kind", "f")?;
+            r.set_item("df", num_df)?;
+            r.set_item("den_df", den_df)?;
+        }
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "no Python rendering for the reference {other:?}"
+            )))
+        }
+    }
+    d.set_item("reference", r)?;
+    d.set_item("notes", c.note_lines())?;
+    d.set_item("nsim", nsim)?;
+    d.set_item("seed", seed)?;
+    Ok(d)
+}
+
+/// `glmm.anova(m0, m1)`: the two stored fits compared as they are, with no
+/// refit (`glmm::formula::anova::compare`). `nsim` and `seed` are the exact
+/// test's, `None` taking `orchestrate::compare_options`' defaults.
+#[pyfunction]
+#[pyo3(signature = (m0, m1, nsim, seed))]
+fn compare_fits<'py>(
+    py: Python<'py>,
+    m0: StoredFit,
+    m1: StoredFit,
+    nsim: Option<usize>,
+    seed: Option<u64>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let opts = orchestrate::compare_options(nsim, seed).map_err(PyValueError::new_err)?;
+    let rss = [m0.rss, m1.rss];
+    let (a, b) = (m0.model()?, m1.model()?);
+    let c = anova::compare(&a, &b, &opts).map_err(|e| PyValueError::new_err(refusal(&e)))?;
+    comparison_dict(py, &c, rss, opts.nsim, opts.seed)
+}
+
+/// `glmm.compare(data, f0, f1)`: `orchestrate::run_compare` on columns the
+/// caller has already masked to the rows both formulas can use. The comparison
+/// as `comparison_dict` gives it, plus `fit0` and `fit1` as `fit` gives them.
+#[allow(clippy::too_many_arguments)]
+#[pyfunction]
+#[pyo3(signature = (
+    f0, f1, numeric_columns, factor_columns, family, link, nagq, weights, offset, nsim, seed,
+))]
+fn compare<'py>(
+    py: Python<'py>,
+    f0: &str,
+    f1: &str,
+    numeric_columns: HashMap<String, Vec<f64>>,
+    factor_columns: HashMap<String, (Vec<String>, Vec<u32>)>,
+    family: &str,
+    link: &str,
+    nagq: u8,
+    weights: Option<Vec<f64>>,
+    offset: Option<Vec<f64>>,
+    nsim: Option<usize>,
+    seed: Option<u64>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let r = orchestrate::run_compare(
+        f0,
+        f1,
+        numeric_columns,
+        factor_columns,
+        family,
+        link,
+        nagq,
+        weights,
+        offset,
+        nsim,
+        seed,
+    )
+    .map_err(PyValueError::new_err)?;
+    let d = comparison_dict(py, &r.comparison, [r.fit0.rss, r.fit1.rss], r.nsim, r.seed)?;
+    d.set_item("fit0", fit_dict(py, r.fit0)?)?;
+    d.set_item("fit1", fit_dict(py, r.fit1)?)?;
+    Ok(d)
+}
+
 /// What `formula` reads from a dataset whose column names are `available`, from
 /// one parse: `(used, missing, numeric_only)`.
 ///
@@ -176,5 +466,10 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(fit, m)?)?;
     m.add_function(wrap_pyfunction!(formula_columns, m)?)?;
     m.add_function(wrap_pyfunction!(confint, m)?)?;
+    m.add_function(wrap_pyfunction!(compare_fits, m)?)?;
+    m.add_function(wrap_pyfunction!(compare, m)?)?;
+    // The bound `orchestrate::compare_options` puts on `nsim`, for the
+    // Python-side message on a value below 1 (which cannot cross as a usize).
+    m.add("MAX_NSIM", orchestrate::MAX_NSIM)?;
     Ok(())
 }

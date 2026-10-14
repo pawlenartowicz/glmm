@@ -879,6 +879,289 @@ the accuracy grid the `lmerTest` engine fits every Gaussian mixed cell and its
 ML twin, and `compare.R` gates `coef_df` against it. Every band is in
 `validation/grid/tol.R`.
 
+## Exact RLRT for one random intercept
+
+A Gaussian LMM whose only random term is one random intercept `(1 | g)` can be
+tested against the OLS model with the same fixed part by the restricted
+likelihood ratio test (RLRT) under its exact finite-sample null, simulated
+from the spectral representation of Crainiceanu & Ruppert (2004). The null
+hypothesis is `λ = σ_b²/σ² = 0`, where `σ_b²` is the between-level variance and
+`σ²` the residual one; in this page's parameterization `λ = θ²`. Nothing is
+refitted: the test reads the design summary the `(1 | g)` fit keeps and two
+REML log-likelihoods, and it reads no `Fit`, no `x` and no `y`. Every item is
+crate-internal; the entry point is `exact_rlrt` (`src/inference/rlrt.rs`).
+Users reach it through the comparison calls, which take `nsim` and `seed`
+(see [`hypothesis-tests.md`](hypothesis-tests.md)).
+
+**The representation.** Let `n` be the row count, `p` the retained
+fixed-effect column count (the Notation's `N` and `P`, with `p` counted after
+aliased columns are dropped), `P₀ = I − X(XᵀX)⁻¹Xᵀ` the residual projection of
+the fixed part, `Z` the `n × K` level indicators, and `μ_1 ≥ … ≥ μ_k > 0` the
+nonzero eigenvalues of `ZᵀP₀Z`. Under the null, the RLRT has the distribution
+of
+
+```text
+T = sup over λ ≥ 0 of  f(λ) = (n − p)·log1p(N(λ)/D(λ)) − Σ_s log1p(λ·μ_s)
+
+N(λ) = Σ_s  λμ_s/(1 + λμ_s) · χ_s
+D(λ) = Σ_s  χ_s/(1 + λμ_s)  +  χ_tail
+```
+
+with `s = 1..k`, the `χ_s` independent `χ²₁` and `χ_tail` an independent `χ²`
+on `n − p − k` degrees of freedom (Crainiceanu & Ruppert 2004, the RLRT
+representation that follows Theorem 1). The response does not enter: the
+null depends on the design alone, through `n − p` and `μ`. `GridTables::at`
+evaluates `f` at one grid point from three precomputed tables,
+`fN[i][s] = λ_iμ_s/(1 + λ_iμ_s)`, `fD[i][s] = 1/(1 + λ_iμ_s)` and
+`SL[i] = Σ_s log1p(λ_iμ_s)` (`GridTables::new`), so a draw costs two dot
+products and one `log1p` per grid point.
+
+**The design summary a fit keeps.** A fit has `Fit::design_summary` (a
+crate-internal field, `src/fit/mod.rs`, struct `DesignSummary`) exactly when
+the fit is a Gaussian LMM whose only random term is one random intercept, with
+no prior weights and at least one fixed-effect column. An offset is allowed,
+and a `(1 | a:b)` interaction grouping is one grouping. The summary is there
+whatever the criterion (REML or ML) and whether or not the fit converged,
+since it depends on the design alone. `lmm_view_to_fit` (`src/fit/lmm.rs`)
+copies it out of the dense accumulator (`design_summary` there), which such a
+fit always uses, so no fit computes anything extra for it. Its three flat
+arrays, on the design the fit ran on (aliased columns dropped, so `p` is the
+retained count, and in the orthogonalized basis `X̃` of
+[Fixed-effect orthogonalization](#fixed-effect-orthogonalization)):
+
+- `counts`, length `K` (the highest level id with rows, plus one): the row
+  count of each level, 0 for a level id with no rows;
+- `s`, length `p·K`, `X̃ᵀZ` column-major: `s[a·p + j]` is the sum of column `j`
+  of `X̃` over the rows of level `a`;
+- `c`, length `p·p`, `X̃ᵀX̃` column-major with both triangles filled.
+
+**`μ` without `Z`** (`rlrt_design`). With `ZᵀZ = diag(counts)`,
+
+```text
+ZᵀP₀Z = ZᵀZ − ZᵀX(XᵀX)⁻¹XᵀZ = diag(counts) − sᵀc⁻¹s
+```
+
+`P₀` depends on `X` only through its column space, and `X̃ = X·B·U⁻¹` (`B` the
+column standardization, `U` the fixed-effect factor, both invertible) spans
+the same space, so the summary's `s` and `c` give the same matrix as the
+caller's `XᵀZ` and `XᵀX`. `rlrt_design` takes `n = Σ counts` (row counts, as
+there are no weights) and `p` from the size of `c`, then:
+
+1. factors `c = LLᵀ` (`SeqLlt`) and solves `G = L⁻¹s` over the levels with
+   rows only (an empty level adds a zero row and column, hence only a zero
+   eigenvalue);
+2. forms `M = diag(counts) − GᵀG` (`K' × K'` over the `K'` non-empty levels)
+   and its eigenvalues (`sym_eigen`, `src/inference/evd.rs`);
+3. clamps negative round-off to 0, sorts descending, divides by the largest,
+   and drops every value below `MU_ZERO_REL = 1e-10`. The result is
+   `RlrtDesign { mu, n_minus_p, tail_df }`: `mu[0] = 1`, `k = mu.len()`,
+   `n_minus_p = n − p` and `tail_df = n − p − k`.
+
+The division is free because `T` is invariant to a common rescaling of `μ`
+(`λ` absorbs it), and the grid below is in units of `1/μ_max`. The drop is
+exact: a zero `μ_s` adds its `χ_s` to `D` and nothing to `N` or to the log
+term, so it merges into the tail, which is why the tail has `n − p − k`
+degrees of freedom. Zero eigenvalues are structural: with an intercept in
+`X`, one for the intercept and one per group-level covariate. The work is
+`K·p` numbers in and a `K' × K'` eigendecomposition, in place of an `n × K`
+design.
+
+**The θ = 0 value.** At `θ = 0` the REML criterion of the `(1 | g)` model is
+that of the OLS model with the same `X`. An OLS fit made with
+`FitOptions::reml = Some(true)` reports that value as `Fit::loglik`
+(`ols_view_to_fit`, `src/fit/ols.rs`; see
+[OLS](algorithms.md#ordinary-least-squares-ols)): the profiled REML deviance,
+on the caller's `X`
+
+```text
+d = ln|XᵀX| + (n − p)·ln(RSS/(n − p))
+```
+
+(the code takes `ln|XᵀX|` from the OLS fit's Cholesky factor of the
+standardized Gram plus the standardization shift, the same number), put
+through the LMM's own `lmm_loglik(d, ν) = −½·(d + ν·(1 + ln 2π))` with
+`ν = n − p`. So it sits on the scale of the `(1 | g)` fit's `Fit::loglik` and
+the constants cancel in the difference. An exact OLS fit (`RSS = 0`) reports
+`+∞`.
+
+**The observed statistic** (`rlrt_statistic`). It takes `loglik_full`, the
+REML `Fit::loglik` of the `(1 | g)` fit; `loglik_reduced`, the θ = 0 value
+above; and `pinned`, whether the `(1 | g)` fit pinned its one component at
+zero (`Diagnostics::pinned`, see
+[Boundary handling](#boundary-handling-pin_theta)). The rules, in the order
+the code applies them:
+
+| case | statistic |
+|---|---|
+| `loglik_full` or `loglik_reduced` is NaN or `−∞` (a fit that failed or collapsed) | NaN, pinned or not |
+| `pinned` | `0.0`, by rule |
+| otherwise | `t = 2·(loglik_full − loglik_reduced)`; `t` if `t > 0` or NaN, else `0.0`: so `+∞` when only `loglik_full` is `+∞`, `0.0` when only `loglik_reduced` is |
+
+A NaN or `−∞` log-likelihood on either side gives NaN, never `0.0`, whether
+or not the fit is pinned. On a pinned fit the statistic is otherwise `0.0`,
+whatever the two log-likelihoods are (`+∞` included): the two agree to
+round-off, and the sign of that round-off must not decide a test whose null
+has an atom at 0. The floor at `0.0`: a search that ended at a lower
+log-likelihood than at `θ = 0` still tests as 0, and so does a finite
+`loglik_full` against `loglik_reduced = +∞` (an exact OLS fit). The mirror,
+`loglik_full = +∞` against a finite `loglik_reduced`, gives `+∞` and so
+`p = 1/(nsim + 1)`, but no `(1 | g)` fit reports `+∞`: `lmm_loglik` maps a
+non-finite deviance to NaN. On an exact fit (`y` in the column space of `X`)
+the OLS fit reports `+∞` and the `(1 | g)` fit's deviance is non-finite, so
+the pair tests as NaN (`statistic_rules` checks this on a constant `y`); a
+pair where only the OLS residual is exactly 0 would test as 0.
+
+**The λ grid** (`LAMBDA_GRID`). `λ = 0`, then `exp` of 199 points equally
+spaced on `[−10, 8]`, 200 points in all, in units of `1/μ_max`. These are
+RLRsim 3.1-9's `make.lambdagrid` defaults (Scheipl, Greven & Küchenhoff 2008),
+`c(0, exp(seq(-10, 8, length = 199)))`, built with R's `seq` arithmetic:
+grid index 0 is 0, and grid index `j ≥ 1` holds `exp(−10 + (j − 1)·(18/198))`,
+with the exponents at `j = 1` and `j = 199` exactly −10 and 8, so the grid
+matches RLRsim's to `exp`'s rounding. One draw's `T` is the global maximum of
+`f` over the 200 grid points, never a walk that stops at the first decrease,
+and ties keep the first index (`max_on_grid`). There is no refinement between
+grid points.
+
+**The atom at zero.** At `λ = 0`, `N = 0` and `SL[0] = 0`, so `f(0) = +0.0`
+exactly whenever `D > 0`, and every `T` is at least `+0.0`. A draw whose
+maximum sits at index 0 is an exact zero of the null, and any other draw is
+positive; `rlrt_null` keeps the positive draws sorted (`draws_pos`) and
+counts the rest as the null's mass at zero. `D > 0` always holds: each `χ_s`
+is a squared normal, and `commonstats`' `Normal` takes the normal quantile at
+`(w + 0.5)/2³²` for a 32-bit word `w`, which is never exactly 1/2, so
+`|z| ≥ 2.9e-10` and `χ_s > 0`; and a design has `k ≥ 1`. A draw whose
+maximum is at the last grid point is an edge hit, where the supremum may lie
+beyond the grid (counted in tests only).
+
+**The p-value** (`RlrtNull::p_value`, after Phipson & Smyth 2010). For an
+observed `t > 0` against `nsim` draws `T_b`,
+
+```text
+p = (1 + #{b : T_b ≥ t}) / (nsim + 1)
+```
+
+never below `1/(nsim + 1)`. For `t = 0` the p-value is exactly 1, since the
+atom holds every draw at least the observed value; `exact_rlrt` then makes no
+draws at all and reports `nsim = 0`, so no caller prints a draw count that
+was never made. A NaN statistic gives a NaN p-value, also with no draws, and
+a positive one against `nsim = 0` (a caller error) gives NaN.
+
+**The draws and the stream tag** (`null_draws`). `RlrtConfig` carries `nsim`
+and `seed`, both chosen by the caller (`rlrt.rs` keeps no default and no RNG
+state), and `parallel_inner`. Draw `b` (`b = 0, …, nsim − 1`) reads only its
+own stream, `CommonStatsRng::new_tagged(seed, b, STREAM_TAG_RLRT)` from
+`commonstats` (the tag is `0x524C_5254_4E55_4C4C`, ASCII `RLRTNULL`):
+
+1. one standard normal per `μ_s`, in the descending-`μ` order of
+   `RlrtDesign::mu`, each squared to `χ_s` (`commonstats`' `Normal` takes the
+   normal quantile of one 32-bit word `w`, at `(w + 0.5)/2³²`);
+2. then, when `tail_df > 0`, one `χ²` on `tail_df` degrees of freedom
+   (`ChiSquared`, a Gamma draw by Marsaglia and Tsang's method, which takes a
+   variable number of words); when `tail_df = 0` the tail is `0.0` and no
+   word is drawn.
+
+So a draw is a pure function of `(seed, b)` and the design: the first `B`
+draws of a longer run are the same values, and the draws run in fixed chunks
+of `NULL_CHUNK = 1024`, each writing its own slice of the output, so
+`parallel_inner` (live only in a `parallel` build on a non-`wasm32` target)
+is bitwise the serial loop. Of the result (`RlrtResult`), a caller reads
+`statistic`, `p_value`, `nsim` (the draws made) and `seed`; the null's
+diagnostics (its mass at zero, the Monte Carlo standard error, `k`, the edge
+hits) exist in tests only.
+
+**The envelope and the refusals.** `exact_rlrt` checks neither the criterion
+nor convergence, nor that the two fits share their data: its caller passes
+the summary and REML `Fit::loglik` of a converged `(1 | g)` fit and the
+`Fit::loglik` of the OLS fit with the same `X`, `y` and offset made with
+`reml = Some(true)`. A fit with no summary (weights, another random term, a
+non-Gaussian family, no fixed-effect column) is outside the envelope before
+the core is called. From the summary, `rlrt_design` refuses with an
+`RlrtRefusal` (never a panic), in this order, and the caller falls back to
+another reference and reports `RlrtRefusal::reason`:
+
+| refusal | when |
+|---|---|
+| `MalformedSummary` | sizes that disagree, a non-finite entry, or a count that is not a non-negative whole number |
+| `NoResidualDf` | `n − p < 1` |
+| `MalformedSummary` | the Cholesky factorization refuses `c` |
+| `Eigen` | the eigendecomposition of `M` fails |
+| `NoGroupVariation` | the largest eigenvalue is at most `MU_ZERO_REL` times the largest count: the fixed effects absorb the grouping factor (`M ⪯ diag(counts)`, so `M` is zero up to round-off) |
+| `MalformedSummary` | more nonzero `μ` than `n − p` (`rank(ZᵀP₀Z) ≤ n − p` on every real design) |
+
+A refusal comes before the statistic is read, so a pinned fit on a design the
+test cannot handle is still refused.
+
+**Worked example: Dyestuff.** Thirty rows, `K = 6` batches of five, `X = 1`,
+so `p = 1` and `n − p = 29`.
+
+- `μ`. In the caller's basis `XᵀZ = (5, …, 5)` and `XᵀX = 30`, so
+  `ZᵀP₀Z = 5·I₆ − (25/30)·11ᵀ`, with eigenvalue 5 five times (the contrasts
+  between batches) and 0 once (the constant vector, which the intercept
+  absorbs). Normalized and with the zero dropped: `μ = (1, 1, 1, 1, 1)`,
+  `k = 5`, `tail_df = 29 − 5 = 24`.
+- The observed statistic. The REML log-likelihood of `Yield ~ 1 + (1 | Batch)`
+  is −159.827138421129 and that of the OLS fit at `θ = 0` is
+  −163.011616077939 (lme4 and R's `logLik(lm, REML = TRUE)`), so
+  `t = 2·(−159.827138421129 + 163.011616077939) = 6.368955313620`; the
+  crate's own two fits give the same `t` to its printed digits. The fit is
+  not pinned, so `t` stands. On this balanced design `T` is an increasing
+  function of the one-way ANOVA `F` on 5 and 24 degrees of freedom, so the
+  exact p-value is the `F` test's, 4.398e-3 at the observed `F = 4.598`, and
+  the null's mass at zero is `P(F ≤ 1) = 0.561`; `exact_rlrt` at
+  `seed = 20261015` and `nsim = 10⁵` gives 4.470e-3.
+- One draw. At `seed = 20261031`, draw `b = 0` reads five normals
+  `1.0859566885495353, 1.3947187453664207, 1.022981022282418,
+  0.44803347687547923, 2.171780465147319`, so `χ_s` = their squares
+  (1.17930…, 1.94524…, 1.04649…, 0.200734…, 4.71663…), then the tail
+  `χ²₂₄ = 23.256923763947288`. On the grid, `f` peaks at index 110,
+  `λ = exp(−10 + 109·18/198) = 0.913101`, where `T_0 = 0.932251448882816`.
+  On this balanced design the continuous supremum has a closed form,
+  `29·ln((24 + 5F)/29) − 5·ln F = 0.933052` at
+  `F = (Σ χ_s/5)/(χ_tail/24) = 1.875756`, so the grid maximum sits `8.0e-4`
+  below it, the price of taking the supremum on the grid.
+
+The draw values depend on `commonstats`' streams; `determinism`
+(`src/inference/rlrt_tests.rs`) pins this draw and the sum of the first
+thousand, and a release that moves the streams moves the pins with it.
+
+**Cost.** Per call, from the code: the eigenvalues cost a `p × p` Cholesky,
+a `p × K'` triangular solve, the `K' × K'` product `GᵀG` and a `K' × K'`
+symmetric eigendecomposition (order `K'³`); `GridTables::new` fills
+`2·200·k` table entries and `200·k` `log1p` once per null; each draw costs
+`k` normals, at most one `χ²`, and on each of the 200 grid points `2k`
+multiply-adds, one division and one `log1p`. No `n`-sized work is done at
+all. Timings: not yet recorded.
+
+| `k` | one `fit_cold` | `rlrt_design` (`M`, eigenvalues) | `rlrt_null`, `nsim = 10⁴` (draws, grid) |
+|---|---|---|---|
+| 5 to 5000 | not yet recorded | | |
+
+**Code**: `rlrt_design`, `rlrt_statistic`, `LAMBDA_GRID`, `GridTables`,
+`max_on_grid`, `null_draws`, `rlrt_null`, `RlrtNull::p_value`, `exact_rlrt`,
+`RlrtRefusal` (`src/inference/rlrt.rs`); `DesignSummary` (`src/fit/mod.rs`);
+`design_summary`, `lmm_view_to_fit` (`src/fit/lmm.rs`); `ols_view_to_fit`
+(`src/fit/ols.rs`). **Convention**: RLRsim's `exactRLRT` (Scheipl, Greven &
+Küchenhoff 2008), with the same normalization and grid, and four
+departures: the supremum is the global grid maximum (RLRsim's walk stops at
+the first decrease); zero eigenvalues are merged into the tail (RLRsim keeps
+them with their own `χ²₁`, the same distribution); the p-value is
+`(1 + #{T_b ≥ t})/(nsim + 1)` (RLRsim's is the share of draws above `t`, which
+can be 0); and a pinned fit tests as exactly 0 with `p = 1`, where RLRsim
+simulates on any positive statistic, round-off included. On Dyestuff2, whose
+between-batch variance is estimated at exactly 0, RLRsim's statistic is
+`5.68e-14` and its p-value 0.4392 (one minus the null's mass at zero); the
+crate gives 0 and 1. **Validation**: the `Z`-free `μ` against the spectrum of
+an explicit `ZᵀP₀Z` (`explicit_z_matches_z_free_route`); on balanced designs,
+where the RLRT is an increasing function of the one-way ANOVA `F`, the
+simulated null against the `F` distribution (`balanced_null_matches_anova_f`)
+and Dyestuff's p-value against the `F` test's
+(`rlrt_dyestuff_p_matches_anova_f`); and, in the oracle tier
+(`src/inference/rlrt_oracle_tests.rs`, `--features oracle-tests`), `μ`, single
+draws on RLRsim's own `χ²` values, the simulated null, the θ = 0 value, and
+the observed statistic and p-value against frozen RLRsim and R references,
+with the Dyestuff2 p-value a registered oracle defect. Every band is in
+`validation/grid/tol.R`.
+
 ## Validation
 
 The accuracy grid (`validation/grid/`) fits each Gaussian cell on the same CSV
@@ -960,6 +1243,12 @@ list of differences from the other engines, with justification, is in
 - Bates, D. et al. *MixedModels.jl* (Julia package). — the second reference
   engine; same profiled objective, ML default; NEWUOA over unconstrained θ
   since v5.0.0 (BOBYQA retained for scalar RE).
+- Crainiceanu, C. M. & Ruppert, D. (2004). Likelihood ratio tests in linear
+  mixed models with one variance component. *Journal of the Royal Statistical
+  Society: Series B (Statistical Methodology)*, 66(1), 165–185. The spectral
+  representation of the RLRT's finite-sample null that
+  [Exact RLRT for one random intercept](#exact-rlrt-for-one-random-intercept)
+  simulates.
 - Fai, A. H.-T. & Cornelius, P. L. (1996). Approximate F-tests of multiple
   degree of freedom hypotheses in generalized least squares analyses of
   unbalanced split-plot experiments. *Journal of Statistical Computation and
@@ -978,6 +1267,11 @@ list of differences from the other engines, with justification, is in
   Software*, 82(13), 1–26. The `summary()`, `contest()` and `anova()` df the
   Satterthwaite pass reproduces, and the reference engine it is gated
   against.
+- Phipson, B. & Smyth, G. K. (2010). Permutation p-values should never be
+  zero: calculating exact p-values when permutations are randomly drawn.
+  *Statistical Applications in Genetics and Molecular Biology*, 9(1),
+  Article 39. The Monte Carlo p-value `(1 + #{T_b ≥ t})/(nsim + 1)` of the
+  exact RLRT.
 - Powell, M. J. D. (2009). *The BOBYQA algorithm for bound constrained
   optimization without derivatives*. Report DAMTP 2009/NA06, University of
   Cambridge. — the θ optimizer; the `npt` bounds cited in the schedule table
@@ -986,3 +1280,8 @@ list of differences from the other engines, with justification, is in
   variance components. *Biometrics Bulletin*, 2(6), 110–114. The approximate
   degrees of freedom of a linear combination of variance estimates, behind
   every df of [Satterthwaite degrees of freedom](#satterthwaite-degrees-of-freedom).
+- Scheipl, F., Greven, S. & Küchenhoff, H. (2008). Size and power of tests
+  for a zero random effect variance or polynomial regression in additive and
+  linear mixed models. *Computational Statistics & Data Analysis*, 52(7),
+  3283–3299. The RLRsim package, whose `exactRLRT` the exact RLRT is compared
+  against and whose λ grid it uses.

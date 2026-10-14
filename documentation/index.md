@@ -15,7 +15,9 @@ quadrature). It fits Gaussian mixed models by REML by default and by ML on
 request, is validation-pinned against those frozen oracles, which are never
 relaxed to match a disagreement, and WASM-ready (the fit
 path carries no `unsafe`, no RNG, no global state, no I/O, and compiles
-unmodified to `wasm32`). It deliberately is **not** a general inference
+unmodified to `wasm32`). It tests fixed terms and two nested models
+(`anova`, `compare`), with a reference that respects the boundary when a
+variance component is tested. It deliberately is **not** a general inference
 toolkit: no `predict`, no conditional variances for the random effects, no
 profile or bootstrap confidence intervals, no
 Kenward-Roger df and no small-sample correction off Gaussian LMMs, and fewer families than
@@ -49,6 +51,7 @@ a zero-allocation, warm-startable workspace.
 | Reference | [`formula.md`](formula.md) | What the formula parser accepts and rejects, with workarounds |
 | Reference | [`conventions.md`](conventions.md) | Estimation, standard-error, dispersion, and variance-component conventions, and the flags on a fit result |
 | Reference | [`troubleshooting.md`](troubleshooting.md) | Fixes for singular fits, non-convergence, `NotImplementedError`, and rejected formulas |
+| Reference | [`hypothesis-tests.md`](hypothesis-tests.md) | The tests: per-term `anova(m)`, `anova(m0, m1)` on two fits and `compare(data, f0, f1)` on two formulas, which reference each comparison gets and how far to trust it, and every refusal |
 | Reference | [`warnings.md`](warnings.md) | Every warning a fit raises (tier, title, message, and the stored `m.warnings` / `m$warnings` entry) and every error a call can raise |
 | Reference | [`validation.md`](validation.md) | How glmm is validated against lme4, glmmTMB, MixedModels.jl and GLMMadaptive, what's covered, and known tolerances/exemptions |
 | Internals | [`algorithms.md`](algorithms.md) | Algorithm map entry point: full dispatch graph, knob index, OLS/GLM paths |

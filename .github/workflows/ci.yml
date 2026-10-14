@@ -370,6 +370,7 @@ jobs:
         # Rcpp: compiles the strtod shim in engines/glmm_r.R, not a statistics engine.
         run: Rscript -e 'install.packages(c("jsonlite", "generics", "Rcpp"))'
       - name: Install fastglmm from source
+        id: fastglmm
         # Straight from the checkout: r/configure writes src/Makevars and
         # r/src/rust's path dependency on ../../../glmm-r resolves here. The
         # CRAN-shaped tarball (r/tools/cran-tarball.sh) is the r job's business,
@@ -400,3 +401,20 @@ jobs:
             exit 1
           fi
           Rscript validation/grid/compare.R --ports-only --glmm-run="$run"
+      - name: Anova port gate
+        # The model comparisons and per-term tables (anova, compare) on one
+        # fixed call list through all three front ends, compared cell by cell
+        # at the round-off band of the gate above; a call outside the pinned
+        # list, an unexpected refusal, a missing cell, or a table whose column
+        # or row names differ between front ends, fails. Base R and jsonlite
+        # only, plus Rcpp for the R front end's strtod shim. Runs when the
+        # step above fails too, so one gate's failure does not hide the other's.
+        if: ${{ !cancelled() && steps.fastglmm.outcome == 'success' }}
+        run: |
+          out="$RUNNER_TEMP/anova_ports"
+          mkdir -p "$out"
+          cargo run --release -p validation --example anova_ports > "$out/rust.jsonl"
+          python/venv/bin/python validation/tools/anova_ports/anova_ports.py > "$out/python.jsonl"
+          Rscript validation/tools/anova_ports/anova_ports.R > "$out/r.jsonl"
+          Rscript validation/tools/anova_ports/compare_anova_ports.R \
+            "$out/rust.jsonl" "$out/python.jsonl" "$out/r.jsonl"

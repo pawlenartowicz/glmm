@@ -300,6 +300,12 @@ test_that("inf in weights= or offset= is refused up front, not by the kernel", {
   o <- rep(0, 40)
   o[1] <- -Inf
   expect_error(fastglmm(y ~ x, d, offset = o), "no NaN, inf, or missing entries")
+  # compare() drops a row with a missing weight or offset, so its text names
+  # inf alone, as the Python port's does.
+  expect_error(compare(d, y ~ 1, y ~ x, weights = w),
+               "^weights must be finite or missing: no inf entries$")
+  expect_error(compare(d, y ~ 1, y ~ x, offset = o),
+               "^offset must be finite or missing: no inf entries$")
 })
 
 test_that("quasi-likelihood dispersion on binomial errors as not implemented", {

@@ -3,7 +3,8 @@
 One page, four sections. The first walks the single entry point — `glmm.fit` —
 end to end; the next two go deeper into the knobs and the returned `Fit`; the
 fourth is a short note on warm starts. The Python surface is deliberately
-tiny: `glmm.fit`, `glmm.Fit`, and a family of warning categories, all
+tiny: `glmm.fit`, `glmm.Fit`, the tests `glmm.anova` and `glmm.compare` with
+their result classes (§3), and a family of warning categories, all
 subclasses of `glmm.DiagnosticWarning`, that `fit` can raise. Every warning it
 raises is also appended to `fit.warnings`; see
 [`warnings.md`](warnings.md) for the full list of kinds, tiers and messages
@@ -194,6 +195,9 @@ them). It is returned by `fit`, never constructed by callers.
 | `ranef_blocks` | the same conditional modes, labelled: a list of dicts per grouping (`group`, `terms`, `levels`, `values`); empty exactly when `ranef` is |
 | `converged` | numerical failure signals here (not an exception) — check before trusting `beta`/`se` |
 | `singular` | boundary (singular) fit — `>=1` RE variance component pinned at 0; mirrors lme4's `isSingular` |
+| `offset` | `(n,)` the offset the model was fitted with; `None` without one |
+| `objective`, `objective_nodes` | what the fit maximised: `"least_squares"` (OLS), `"maximum_likelihood"` (a GLM, or a Gaussian mixed model fitted by ML), `"reml"`, `"laplace"` or `"agq"`, and the quadrature node count (`0` off a GLMM); `glmm.anova(m0, m1)` labels its test with it |
+| `term_table_type3`, `term_table_type2`, `design_summary` | what `glmm.anova` reads: the per-term tables built when the fit was made, and the design summary the exact random-intercept test needs (`None` off its envelope); read them through `glmm.anova` |
 | `dispersion_held` | the number passed as `dispersion=` (gamma / inverse-gaussian only); `None` when φ was estimated or the argument does not apply. When it is set, `summary()` labels the dispersion "fixed" |
 | `diagnostics` | dict with `converged`, `singular`, `aliased`, `boundary`, `pinned`, `notes` — the solver's own report; `converged`/`singular`/`aliased` above are `@property` forwarders over `diagnostics[...]`, kept at the top level for the most-read fields |
 
@@ -230,8 +234,10 @@ REML fit they are built on the REML criterion, as lme4's `AIC()` of a REML
 fit is. The REML criterion depends on the fixed-effects design, so two REML
 fits compare by `aic` or `bic` only when their fixed effects are the same
 (models that differ in their random effects alone). To compare fixed effects,
-fit both models with `reml=False`. Nothing checks this for you in Python:
-R's `AIC()` refuses such a pair; the `aic` property cannot see the other fit.
+fit both models with `reml=False`. The `aic` property cannot see the other
+fit, so nothing checks this for you there (R's `AIC()` refuses such a pair);
+`glmm.anova(m0, m1)` does check, and refuses two REML fits with different
+fixed effects.
 `summary()` of a REML fit prints the REML criterion and no AIC for the same
 reason. On a fit that did not converge the value is not an AIC; check
 `converged` first.
@@ -291,6 +297,45 @@ vector and a `(q, q)` correlation matrix:
 ```python
 sd, corr = fit.stddev_corr(0)   # grouping 0: stddevs + correlation matrix
 ```
+
+**Tests: `glmm.anova` and `glmm.compare`.** `glmm.anova(fit)` tests each
+fixed term of one fit, from the table the fit stored when it was made, and
+returns a `TermTable`. Two models are compared in one of two ways:
+
+```python
+# Fixed-term tests of one fit (Type III unless type="II").
+glmm.anova(fit)
+
+# Two formulas: glmm.compare fits both on the same rows, picking the estimator.
+cmp = glmm.compare(data, "y ~ x1", "y ~ x1 + (1 | group)")
+cmp.table                  # a ComparisonTable; cmp.table["Pr(>Chisq)"]
+cmp.fit1                   # the Fit of the second formula
+
+# Two fits you already have, compared as they are (no refit).
+m0 = glmm.fit(data, "y ~ x1", reml=True)   # reml=True: see below
+m1 = glmm.fit(data, "y ~ x1 + (1 | group)")
+glmm.anova(m0, m1)
+# On this toy data the group variance is estimated at exactly 0, so the
+# statistic is 0 and p = 1 (no draws are needed); hypothesis-tests.md shows a
+# comparison on sleepstudy.
+```
+
+Both tables are indexed by R's column names, print as text, render to
+`html()`, `latex()` and `typst()`, and convert with `to_pandas()` (pandas is
+imported only then). `glmm.compare` has no `reml` argument: on a Gaussian
+model it fits both models by REML when only their random parts differ and by
+ML when their fixed parts differ. `glmm.anova(m0, m1)` never refits, so the
+two fits must be comparable as they stand: two REML fits with different fixed
+parts raise `ValueError` (lme4 refits them by ML; use `glmm.compare`, or
+refit both with `reml=False`), and a REML mixed fit compares with an OLS fit
+only when that one was made with `reml=True`. A test of a variance component
+uses a reference that respects the boundary at zero: the exact restricted
+likelihood-ratio test for a Gaussian model's single random intercept,
+otherwise the 50:50 mixture of chi-squared distributions, which is
+conservative. Both calls take `nsim`
+and `seed` for the exact test; the default seed is fixed, so a call gives the
+same p-value every time. The full rules, every reference and every refusal
+are in [`hypothesis-tests.md`](hypothesis-tests.md).
 
 ## 4. Warm starts
 

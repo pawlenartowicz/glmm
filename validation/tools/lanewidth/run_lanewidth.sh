@@ -3,7 +3,7 @@
 #
 # Measures how much of a fit result is SIMD-lane-width / summation-order
 # dependent by running the crate's tests twice from a scratch copy of the
-# source tree: once against the normal, registry pulp =0.22.2 (whatever
+# source tree: once against the normal, registry pulp 0.22.2 (whatever
 # lane width this host's runtime CPU detection picks), and once against a
 # vendored, patched copy of the SAME pulp version with `Arch::new()` forced
 # to always return `Scalar` (lane width 1), so every pulp::WithSimd kernel
@@ -12,8 +12,8 @@
 #
 # HARD CONSTRAINT: the patch is applied ONLY inside a
 # scratch copy this script creates. It never touches the real tree's
-# Cargo.toml/Cargo.lock, and the real pulp pin (`=0.22.2` in the crate's
-# Cargo.toml) is never edited. Running this script must leave the real
+# Cargo.toml/Cargo.lock, and the real pulp version (0.22.2 in the crate's
+# Cargo.lock) is never edited. Running this script must leave the real
 # tree bit-for-bit as it found it.
 #
 #   ./run_lanewidth.sh                       default filter (NB/sparse fit tests)

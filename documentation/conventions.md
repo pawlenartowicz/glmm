@@ -99,6 +99,9 @@ the test lmerTest, `lm` and `glm` report for the same model:
 - **Everything else** (binomial, Poisson, negative binomial, a held
   dispersion, every GLMM): a Wald z-statistic and a two-sided `Pr(>|z|)`.
 
+Tests of whole terms and of two nested models (`anova`, `compare`) are on
+[`hypothesis-tests.md`](hypothesis-tests.md).
+
 Confidence intervals (`confint`) follow the table row by row: the t quantile
 on the row's df where it tests with t, the normal quantile where it tests
 with z. Both ports compute them with one Rust function, so they give the same

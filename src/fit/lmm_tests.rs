@@ -2316,6 +2316,8 @@ fn fit_lmm_p_zero_weighted_reaches_nan_fill() {
     let f = fit_cold(&x, &y, n, p, &model, &ids, &opts);
 
     assert!(!f.converged(), "p=0 is refused, not fit");
+    // The caller's row count, not the accumulator's `n_rows` (0 here).
+    assert_eq!((f.nobs, f.objective), (n, Objective::Reml));
     assert_eq!(f.beta.len(), 0);
     assert_eq!(f.se.len(), 0);
     assert!(f.deviance.is_nan(), "deviance {}", f.deviance);
@@ -3175,5 +3177,373 @@ fn failed_pass_gives_failed_port_fields_and_normal_intervals() {
     for (i, [lo, hi]) in ci.into_iter().enumerate() {
         assert_eq!(lo, fit.beta[i] + normal_quantile(0.025) * fit.se[i]);
         assert_eq!(hi, fit.beta[i] + normal_quantile(0.975) * fit.se[i]);
+    }
+}
+
+/// A `(1 | g)` design for the design-summary tests: `sizes[a]` rows in level
+/// `a`, each row's design columns from `row(a, state)`, and a response with a
+/// level effect. Returns row-major `x`, `y`, the primary ids and `p`.
+fn summary_design(
+    sizes: &[usize],
+    row: impl Fn(usize, &mut u64) -> Vec<f64>,
+) -> (Vec<f64>, Vec<f64>, Vec<u32>, usize) {
+    let mut st = 17u64;
+    let (mut x, mut y, mut ids, mut p) = (vec![], vec![], vec![], 0);
+    for (a, &na) in sizes.iter().enumerate() {
+        let b = lcg(&mut st);
+        for _ in 0..na {
+            let r = row(a, &mut st);
+            p = r.len();
+            y.push(0.4 + 0.3 * r[1..].iter().sum::<f64>() + b + 0.5 * lcg(&mut st));
+            x.extend(r);
+            ids.push(a as u32);
+        }
+    }
+    (x, y, ids, p)
+}
+
+/// Checks `fit`'s design summary against `ZᵀP₀Z` formed densely from
+/// `x_ref` (row-major, `p` columns spanning the fit's column space): the
+/// counts exactly, the sizes, `c` symmetric, and `diag(counts) − sᵀc⁻¹s`
+/// entrywise within `100·ε·κ(x_ref)` of the largest count, and prints
+/// `κ(x_ref)` beside the measured gap.
+fn check_design_summary(tag: &str, fit: &Fit, x_ref: &[f64], p: usize, ids: &[u32]) {
+    use faer::linalg::solvers::Solve;
+
+    let n = ids.len();
+    let k = ids.iter().map(|&a| a as usize + 1).max().unwrap();
+    let mut counts = vec![0.0; k];
+    for &a in ids {
+        counts[a as usize] += 1.0;
+    }
+    let ds = fit
+        .design_summary
+        .as_ref()
+        .unwrap_or_else(|| panic!("{tag}: no design summary"));
+    assert_eq!(ds.counts, counts, "{tag}: counts");
+    assert_eq!(ds.s.len(), p * k, "{tag}: s is p_eff x K");
+    assert_eq!(ds.c.len(), p * p, "{tag}: c is p_eff x p_eff");
+    let c = Mat::<f64>::from_fn(p, p, |i, j| ds.c[j * p + i]);
+    let s = Mat::<f64>::from_fn(p, k, |j, a| ds.s[a * p + j]);
+    for i in 0..p {
+        for j in 0..p {
+            assert_eq!(c[(i, j)], c[(j, i)], "{tag}: c symmetric");
+        }
+    }
+    let mut c_inv_s = s.clone();
+    c.as_ref()
+        .llt(faer::Side::Lower)
+        .unwrap_or_else(|_| panic!("{tag}: c is not positive definite"))
+        .solve_in_place(c_inv_s.as_mut());
+    // The reference: Householder Q of the raw design, `ZᵀP₀Z = ZᵀZ − (QᵀZ)ᵀQᵀZ`.
+    let xm = Mat::<f64>::from_fn(n, p, |i, j| x_ref[i * p + j]);
+    let q = xm.as_ref().qr().compute_thin_Q();
+    let mut qz = Mat::<f64>::zeros(p, k);
+    for (i, &a) in ids.iter().enumerate() {
+        for j in 0..p {
+            qz[(j, a as usize)] += q[(i, j)];
+        }
+    }
+    let sv = xm.as_ref().singular_values().expect("SVD of the design");
+    let (lo, hi) = sv.iter().fold((f64::INFINITY, 0.0f64), |(lo, hi), &v| {
+        (lo.min(v), hi.max(v))
+    });
+    let kappa = hi / lo;
+    let scale = counts.iter().copied().fold(0.0, f64::max);
+    let band = 100.0 * f64::EPSILON * kappa;
+    let mut worst = 0.0f64;
+    for a in 0..k {
+        for b in 0..k {
+            let d = if a == b { counts[a] } else { 0.0 };
+            let got = d - (0..p).map(|j| s[(j, a)] * c_inv_s[(j, b)]).sum::<f64>();
+            let want = d - (0..p).map(|j| qz[(j, a)] * qz[(j, b)]).sum::<f64>();
+            worst = worst.max((got - want).abs() / scale);
+        }
+    }
+    eprintln!("{tag}: kappa(X) = {kappa:.3e}, max |dM| / max count = {worst:.3e}, band {band:.3e}");
+    assert!(
+        worst <= band,
+        "{tag}: max |dM| / max count {worst:e} > {band:e}"
+    );
+}
+
+/// A Gaussian `(1 | g)` fit with no weights keeps its design summary, and the
+/// summary gives `ZᵀP₀Z` of the raw design: on balanced and unbalanced
+/// levels, an empty level, a group-level covariate, an offset, a duplicated
+/// column (the summary is on the `p − 1` retained columns) and a design that
+/// takes the Givens pass. An ML fit and a fit stopped at its evaluation cap
+/// keep it too.
+#[test]
+fn design_summary_kept_inside_envelope() {
+    let model = intercept_only_spec(Sizing::FixedClusters { n_clusters: 1 });
+    let opts = FitOptions::default();
+    let x1 = |_: usize, st: &mut u64| vec![1.0, lcg(st)];
+    let fit_of = |x: &[f64], y: &[f64], ids: &[u32], p: usize, opts: &FitOptions| {
+        let gids = GroupIds {
+            primary: ids.to_vec(),
+            extra: vec![],
+        };
+        fit_cold(x, y, ids.len(), p, &model, &gids, opts)
+    };
+
+    let (x, y, ids, p) = summary_design(&[5; 6], x1);
+    let balanced = fit_of(&x, &y, &ids, p, &opts);
+    check_design_summary("balanced", &balanced, &x, p, &ids);
+
+    let (x, y, ids, p) = summary_design(&[2, 7, 3, 9, 4], x1);
+    let fit = fit_of(&x, &y, &ids, p, &opts);
+    check_design_summary("unbalanced", &fit, &x, p, &ids);
+
+    // Level 2 has no rows.
+    let (x, y, ids, p) = summary_design(&[4, 6, 0, 5, 3], x1);
+    let fit = fit_of(&x, &y, &ids, p, &opts);
+    check_design_summary("empty level", &fit, &x, p, &ids);
+
+    let (x, y, ids, p) = summary_design(&[4, 6, 5, 3, 7, 5], |a, st| {
+        vec![1.0, lcg(st), (a as f64 - 2.5) * 0.7]
+    });
+    let fit = fit_of(&x, &y, &ids, p, &opts);
+    check_design_summary("group-level covariate", &fit, &x, p, &ids);
+
+    let (x, y, ids, p) = summary_design(&[5; 6], x1);
+    let offset: Vec<f64> = (0..ids.len()).map(|i| 0.1 * (i % 7) as f64).collect();
+    let with_offset = FitOptions {
+        offset: Some(offset),
+        ..FitOptions::default()
+    };
+    let fit = fit_of(&x, &y, &ids, p, &with_offset);
+    check_design_summary("offset", &fit, &x, p, &ids);
+
+    // `x1` twice: the fit drops one copy and keeps the summary of the rest.
+    let (x, y, ids, p) = summary_design(&[4, 6, 5, 3, 7], |_, st| {
+        let v = lcg(st);
+        vec![1.0, v, v]
+    });
+    let fit = fit_of(&x, &y, &ids, p, &opts);
+    assert_eq!(fit.diagnostics.aliased.iter().filter(|&&a| a).count(), 1);
+    let x_kept: Vec<f64> = x.chunks(p).flat_map(|r| [r[0], r[1]]).collect();
+    check_design_summary("duplicated column", &fit, &x_kept, p - 1, &ids);
+
+    // `x2 = x1 + 1e-4·noise`: a pivot ratio far under `GRAM_PIVOT_MIN`.
+    let (x, y, ids, p) = summary_design(&[6, 8, 5, 7, 6, 9], |_, st| {
+        let v = lcg(st);
+        vec![1.0, v, v + 1e-4 * lcg(st)]
+    });
+    let n = ids.len();
+    let gram = Mat::<f64>::from_fn(p, p, |i, j| {
+        (0..n).map(|r| x[r * p + i] * x[r * p + j]).sum()
+    });
+    let l = gram.as_ref().llt(faer::Side::Lower).expect("full rank");
+    let pivot = (0..p)
+        .map(|j| l.L()[(j, j)].powi(2) / gram[(j, j)])
+        .fold(f64::INFINITY, f64::min);
+    assert!(pivot < crate::lmm::GRAM_PIVOT_MIN, "pivot ratio {pivot:e}");
+    let fit = fit_of(&x, &y, &ids, p, &opts);
+    assert!(fit.diagnostics.aliased.iter().all(|&a| !a));
+    check_design_summary("givens", &fit, &x, p, &ids);
+
+    // ML: the same design summary as the REML fit, bit for bit.
+    let (x, y, ids, p) = summary_design(&[5; 6], x1);
+    let ml = fit_of(
+        &x,
+        &y,
+        &ids,
+        p,
+        &FitOptions {
+            reml: Some(false),
+            ..FitOptions::default()
+        },
+    );
+    assert!(!ml.reml);
+    check_design_summary("ml", &ml, &x, p, &ids);
+    let (a, b) = (
+        ml.design_summary.as_ref().unwrap(),
+        balanced.design_summary.as_ref().unwrap(),
+    );
+    assert!(a.counts == b.counts && a.s == b.s && a.c == b.c);
+
+    // Stopped at five evaluations: not converged, the summary kept.
+    {
+        use bobyqa::{Bobyqa, Config};
+        let gids = GroupIds {
+            primary: ids.clone(),
+            extra: vec![],
+        };
+        let n = ids.len();
+        let (sized, gids, perm) = spec_sized_from_ids(&model, &gids);
+        let mut ws = build_workspace(&sized, perm, n, p, &opts);
+        {
+            let (lmm, _) = ws.lmm_parts().expect("a Gaussian mixed workspace");
+            let mut config = Config::new(1);
+            config.max_fun = 5;
+            lmm.solver = Bobyqa::new(1, config).expect("legal minimal config");
+        }
+        let fit = fit_on(&mut ws, &x, &y, &gids, None, &opts)
+            .into_fit(&x, &y, &gids, n, p, &model, &opts);
+        assert!(!fit.converged());
+        check_design_summary("max_fun", &fit, &x, p, &ids);
+    }
+
+    // A kernel with room for nine levels accumulated on data with six (the
+    // loop tier's `fit_on` refuses that shape, so the kernel is driven
+    // directly): the summary has the six levels seen, not the capacity.
+    {
+        let n = ids.len();
+        let wide = intercept_only_spec(Sizing::FixedClusters { n_clusters: 9 });
+        let mut ws = LmmWorkspace::for_cluster_spec_ext(p, &wide, n, &[], &[], false);
+        let x_mat = Mat::<f64>::from_fn(n, p, |i, j| x[i * p + j]);
+        accumulate_lmm_rows(
+            &mut ws,
+            x_mat.as_ref(),
+            &y,
+            n,
+            p,
+            &ids,
+            &[],
+            None,
+            false,
+            crate::lmm::Criterion::Reml,
+        );
+        assert_eq!(ws.suff_mut().counts.len(), 9, "the kernel's capacity");
+        let gids = GroupIds {
+            primary: ids.clone(),
+            extra: vec![],
+        };
+        let fit = {
+            let v = lmm_run_on(
+                &mut ws,
+                &opts.target_indices,
+                None,
+                None,
+                ColumnScaling::IDENTITY,
+            );
+            lmm_view_to_fit(&v, &x, &gids, n, p, &opts)
+        };
+        check_design_summary("capacity above the levels", &fit, &x, p, &ids);
+    }
+}
+
+/// Every fit outside the envelope keeps no design summary: a binomial GLMM,
+/// a Gaussian fit with no random effect, a random slope, an extra grouping,
+/// a weighted `(1 | g)` fit and a `(1 | g)` fit with no fixed effects.
+#[test]
+fn design_summary_absent_outside_envelope() {
+    let (x, y, ids, p) = summary_design(&[5, 6, 4, 7, 5, 6], |_, st| vec![1.0, lcg(st)]);
+    let n = ids.len();
+    let one = GroupIds {
+        primary: ids.clone(),
+        extra: vec![],
+    };
+    let intercept = intercept_only_spec(Sizing::FixedClusters { n_clusters: 1 });
+    let re_with = |slopes: Vec<u32>, extra_groupings: Vec<Grouping>| {
+        Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 1 },
+            slopes,
+            extra_groupings,
+        })
+    };
+    let opts = FitOptions::default();
+
+    // The same design inside the envelope keeps one.
+    assert!(fit_cold(&x, &y, n, p, &intercept, &one, &opts)
+        .design_summary
+        .is_some());
+
+    let yb: Vec<f64> = y.iter().map(|&v| if v > 0.4 { 1.0 } else { 0.0 }).collect();
+    let binomial = ModelSpec {
+        family: Family::Binomial {
+            link: crate::BinomialLink::Logit,
+        },
+        re: intercept.re.clone(),
+    };
+    let ols = ModelSpec {
+        family: Family::Gaussian,
+        re: None,
+    };
+    let slope = ModelSpec {
+        family: Family::Gaussian,
+        re: re_with(vec![1], vec![]),
+    };
+    let crossed = ModelSpec {
+        family: Family::Gaussian,
+        re: re_with(
+            vec![],
+            vec![Grouping {
+                relation: GroupingRelation::Crossed { n_clusters: 1 },
+                slopes: vec![],
+            }],
+        ),
+    };
+    let nested = ModelSpec {
+        family: Family::Gaussian,
+        re: re_with(
+            vec![],
+            vec![Grouping {
+                relation: GroupingRelation::NestedWithin { n_per_parent: 1 },
+                slopes: vec![],
+            }],
+        ),
+    };
+    // Two children per level, ids unique across levels.
+    let child = GroupIds {
+        primary: ids.clone(),
+        extra: vec![(0..n).map(|i| ids[i] * 2 + (i % 2) as u32).collect()],
+    };
+    let two = GroupIds {
+        primary: ids.clone(),
+        extra: vec![(0..n).map(|i| (i % 4) as u32).collect()],
+    };
+    let weighted = FitOptions {
+        weights: Some((0..n).map(|i| 0.75 + 0.1 * (i % 6) as f64).collect()),
+        ..FitOptions::default()
+    };
+    let none = GroupIds::default();
+    for (tag, fit) in [
+        ("binomial", fit_cold(&x, &yb, n, p, &binomial, &one, &opts)),
+        ("ols", fit_cold(&x, &y, n, p, &ols, &none, &opts)),
+        ("slope", fit_cold(&x, &y, n, p, &slope, &one, &opts)),
+        (
+            "extra grouping",
+            fit_cold(&x, &y, n, p, &crossed, &two, &opts),
+        ),
+        (
+            "nested grouping",
+            fit_cold(&x, &y, n, p, &nested, &child, &opts),
+        ),
+        (
+            "weighted",
+            fit_cold(&x, &y, n, p, &intercept, &one, &weighted),
+        ),
+        (
+            "no fixed effects",
+            fit_cold(&[], &y, n, 0, &intercept, &one, &opts),
+        ),
+    ] {
+        assert!(fit.design_summary.is_none(), "{tag}: a design summary");
+    }
+}
+
+/// `nobs` is the row count and `objective` follows the criterion `Fit::reml`
+/// reports: REML by default, ML under `reml = Some(false)`.
+#[test]
+fn lmm_fit_reports_nobs_and_its_criterion() {
+    let (x, y, n, p) = super::common_tests::lmm_hand_dataset();
+    let model = intercept_only_spec(Sizing::FixedClusters { n_clusters: 6 });
+    let ids = GroupIds {
+        primary: (0..n).map(|i| (i % 6) as u32).collect(),
+        extra: vec![],
+    };
+    for (reml, want) in [
+        (None, Objective::Reml),
+        (Some(false), Objective::MaximumLikelihood),
+    ] {
+        let opts = FitOptions {
+            target_indices: vec![1, 2],
+            reml,
+            ..FitOptions::default()
+        };
+        let f = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+        assert!(f.converged(), "reml = {reml:?}");
+        assert_eq!((f.nobs, f.objective), (n, want), "reml = {reml:?}");
     }
 }

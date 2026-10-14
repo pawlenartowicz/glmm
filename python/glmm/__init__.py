@@ -6,8 +6,9 @@ PyO3 extension), and returns a `Fit`. One option is not yet implemented
 in the kernel and raises a clean `NotImplementedError`: quasi-likelihood
 `dispersion=` on binomial/poisson.
 
-Public surface is `fit`, `Fit`, and the warning categories the diagnostics
-channel raises (`DiagnosticWarning`, `AgqFallbackWarning`,
+Public surface is `fit`, `Fit`, the tests of `glmm.anova` (`anova`,
+`compare`, `TermTable`, `ComparisonTable`, `Comparison`, in `glmm/anova.py`),
+and the warning categories the diagnostics channel raises (`DiagnosticWarning`, `AgqFallbackWarning`,
 `ArgumentIgnoredWarning`, `ConstantResponseWarning`, `DesignUnsolvableWarning`,
 `ExactProfileFallbackWarning`,
 `FitFailedWarning`, `GradientSearchFallbackWarning`, `GlmDivergedWarning`, `HessianSeFallbackWarning`,
@@ -20,7 +21,9 @@ channel raises (`DiagnosticWarning`, `AgqFallbackWarning`,
 """
 
 import math
+import os
 import re
+import sys
 import warnings
 from dataclasses import dataclass, field
 
@@ -28,9 +31,14 @@ import numpy as np
 
 from glmm import _native
 
+# This package's directory, with the separator: `_warn` skips its frames.
+_PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__)) + os.sep
+
 __all__ = [
     "AgqFallbackWarning",
     "ArgumentIgnoredWarning",
+    "Comparison",
+    "ComparisonTable",
     "ConstantResponseWarning",
     "DesignUnsolvableWarning",
     "DiagnosticWarning",
@@ -52,8 +60,11 @@ __all__ = [
     "SearchLimitWarning",
     "SingleLevelGroupingDroppedWarning",
     "SingularFitWarning",
+    "TermTable",
     "TooFewRowsWarning",
     "UnusedGroupingLevelsWarning",
+    "anova",
+    "compare",
     "fit",
 ]
 
@@ -456,14 +467,15 @@ def _formula_columns(formula, names):
     return _native.formula_columns(formula, list(names))
 
 
-def _row_array(values, name, n):
+def _row_array(values, name, n, missing_ok=False):
     """`weights=`/`offset=` as a float array of one finite entry per data row.
 
     Mirrors the R port's checks in `fastglmm()` (`r/R/fastglmm.R`): a wrong
     length or a missing entry is refused as R refuses it, here rather than by
     the kernel's entry assert, which reaches Python as a Rust panic. Inf is
     refused too, as that assert would. `n` is None when no data column was
-    read; the kernel then reports the missing column first."""
+    read; the kernel then reports the missing column first. `missing_ok`
+    lets a missing entry through as NaN, for a caller that drops its row."""
     try:
         arr = np.asarray(values, dtype=float)
     except (TypeError, ValueError):
@@ -472,7 +484,9 @@ def _row_array(values, name, n):
         raise ValueError(f"{name} must be a numeric array with one entry per row of data")
     # `np.asarray(..., dtype=float)` turns a None entry into NaN, so this also
     # catches a missing value, which R's anyNA() rejects the same way.
-    if not np.all(np.isfinite(arr)):
+    if not np.all(np.isfinite(arr) | (missing_ok & np.isnan(arr))):
+        if missing_ok:
+            raise ValueError(f"{name} must be finite or missing: no inf entries")
         raise ValueError(f"{name} must be finite: no NaN, inf, or missing entries")
     return arr
 
@@ -654,6 +668,40 @@ class Fit:
     # "fixed" instead of "ML"/"Pearson". Defaulted, and last, because a
     # dataclass field with a default must follow every field without one.
     dispersion_held: float | None = None
+    # The design summary of a Gaussian fit whose only random term is one random
+    # intercept `(1 | g)`, with no prior weights and at least one fixed-effect
+    # column; None on every other fit. A dict of three flat float arrays, with
+    # K = the highest observed level code + 1 (a level below it with no rows
+    # counts 0; unused levels after it are not counted) and p retained
+    # fixed-effect columns, on the fit's orthogonalized design X~ (it spans the
+    # column space of the fixed-effect design):
+    #   counts  (K,)    rows per level
+    #   s       (p*K,)  the p x K matrix X~'Z, column-major (level a at [a*p:(a+1)*p])
+    #   c       (p*p,)  the p x p matrix X~'X~, column-major, symmetric
+    design_summary: dict | None = None
+    # (n,) offset the kernel fitted with, None if there is none; read from the
+    # kernel like `weights`, so `glmm.anova(m0, m1)` can check that two fits
+    # share it. With `y` and `weights` it is everything `glmm.anova(m0, m1)`
+    # reads per row: the fit keeps no data column. Defaulted, like the fields
+    # below, only because a dataclass field with a default comes last.
+    offset: np.ndarray | None = None
+    # What the fit maximised, and its quadrature node count: "least_squares"
+    # (OLS), "maximum_likelihood" (GLM, or a Gaussian mixed model fitted by
+    # ML), "reml", "laplace" (1 node) or "agq" (`objective_nodes` nodes); the
+    # count is 0 on the first three. `glmm.anova(m0, m1)` labels its test with
+    # it.
+    objective: str | None = None
+    objective_nodes: int = 0
+    # The per-term tables `glmm.anova(m)` reads (Type III and Type II), built
+    # when the fit was made. Each is a dict: "error" holds the message when the
+    # fit gets no table (an interaction without its marginal terms), else None
+    # beside the columns, one entry per term in formula order: "ss_type",
+    # "label", "kind" ("F" or "chisq"), "statistic", "num_df", "den_df",
+    # "den_df_kind" ("satterthwaite", "residual" or "" on a chi-squared row),
+    # "p_value", "sum_sq", "mean_sq" (NaN on a chi-squared row), "row_notes"
+    # (a list of sentences per row) and "notes" (the table's sentences).
+    term_table_type3: dict | None = None
+    term_table_type2: dict | None = None
 
     @property
     def converged(self):
@@ -677,8 +725,9 @@ class Fit:
 
         On a REML fit (`reml` is True) `loglik` is the REML criterion, so this
         AIC compares only fits with the same fixed part; to compare fixed
-        parts, fit both models with `reml=False`. `summary()` of a REML fit
-        prints the REML criterion and no AIC.
+        parts, fit both models with `reml=False`, or use
+        `glmm.compare(data, f0, f1)`, which fits both by ML. `summary()` of a
+        REML fit prints the REML criterion and no AIC.
 
         On a fit that did not converge the value is not an AIC: a GLMM that
         stopped at MaxFunReached has a finite `loglik` and `df` 0, so this is
@@ -691,9 +740,10 @@ class Fit:
         every fit (NaN when `nobs` is 0).
 
         The REML caveat of `aic` applies: on a REML fit this BIC compares only
-        fits with the same fixed part; fit with `reml=False` to compare fixed
-        parts. The non-converged caveat of `aic` applies too: at MaxFunReached
-        on a GLMM `df` is 0 and this is `-2 * loglik`."""
+        fits with the same fixed part; fit with `reml=False`, or use
+        `glmm.compare(data, f0, f1)`, to compare fixed parts. The
+        non-converged caveat of `aic` applies too: at MaxFunReached on a GLMM
+        `df` is 0 and this is `-2 * loglik`."""
         if self.nobs <= 0:
             return math.nan
         return -2.0 * self.loglik + self.df * math.log(self.nobs)
@@ -813,11 +863,15 @@ _UNKNOWN_KIND = ("caution", "Unrecognized solver message")
 
 def _warn(store, kind, message, category):
     """Raise one warning as `<Tier>: <title>. <message>` and append it to `store`,
-    the list that becomes `Fit.warnings`. stacklevel 3: this frame, then `fit`, then
-    the line that called `fit`."""
+    the list that becomes `Fit.warnings`. The warning points at the line that
+    called into glmm (`fit`, `compare`), however deep in the package it is
+    raised: the stack level is the first frame outside this directory."""
     tier, title = _WARNING_KINDS.get(kind, _UNKNOWN_KIND)
     store.append({"tier": tier, "kind": kind, "title": title, "message": message})
-    warnings.warn(f"{tier.capitalize()}: {title}. {message}", category=category, stacklevel=3)
+    level, frame = 1, sys._getframe()
+    while frame is not None and frame.f_code.co_filename.startswith(_PACKAGE_DIR):
+        level, frame = level + 1, frame.f_back
+    warnings.warn(f"{tier.capitalize()}: {title}. {message}", category=category, stacklevel=level)
 
 
 def _pinned_detail(res):
@@ -1169,76 +1223,10 @@ def _nonconvergence(family, mixed, notes, beta, aliased, deviance, y, link=None)
     return "fit_failed", " ".join(sentences), FitFailedWarning
 
 
-def fit(
-    data,
-    formula,
-    family="gaussian",
-    *,
-    link=None,
-    dispersion=None,
-    init_theta=None,
-    weights=None,
-    offset=None,
-    wald_se="hessian",
-    nagq=1,
-    warm_start=None,
-    satterthwaite=True,
-    reml=None,
-):
-    """Fit `formula` against `data`'s columns and return a `Fit`.
-
-    data: dict[str, array-like]; DataFrame / Arrow Table also accepted (duck-typed).
-    formula: R-style string, e.g. "y ~ x + z + (1 + x | g)".
-    family: gaussian | binomial | poisson | gamma | negativebinomial | inversegaussian.
-    nagq: adaptive Gauss-Hermite quadrature nodes per random-effect dimension
-        (odd, 1..=25; default 1 = Laplace). k>1 applies to binomial, Poisson,
-        negative-binomial and Gamma models with a single grouping factor and
-        q <= 3 random effects per
-        group (temporary cap); any other shape warns and falls back to Laplace.
-    init_theta: negative-binomial shape seed, named for `MASS::glm.nb(init.theta=)`
-        — the same knob, and the name the R port exposes: the starting value of
-        the shape search (the same slot as `warm_start["dispersion"]`; give one
-        of the two). None cold-starts it from the no-random-effect
-        negative-binomial fit. Distinct from `warm_start["theta"]`, which is the
-        random-effect Cholesky vector (lme4's `start=list(theta=)`); they are
-        unrelated parameters and both may be passed in one call.
-    offset: per-row additive offset on the linear-predictor scale, length n
-        (R's `offset=`): eta = offset + X*beta (+ Z*b). A fixed known
-        contribution, not a parameter — the canonical use is a Poisson
-        exposure, offset = log(exposure). None = no offset.
-    warm_start: {"beta": …, "theta": …, "dispersion": …} optimizer start; any key
-        may be left out to cold-start that part. "dispersion" is the estimated
-        dispersion as a previous fit reports it (`Fit.dispersion`): the shape
-        for negative binomial, phi for Gamma. See `init_theta` above for why
-        "theta" here is NOT the negative-binomial shape.
-    satterthwaite: compute lmerTest's Satterthwaite degrees of freedom for a
-        Gaussian mixed model's t tests (default True). False skips that pass:
-        the summary then tests with z and says "df not computed", and
-        `Fit.df_method` is "disabled". OLS and the Gamma and inverse-Gaussian
-        GLMs keep their residual df whatever it says.
-    reml: None, True or False; `Fit.reml` reports the value used.
-        Gaussian with random effects (after any single-level grouping is
-        dropped): None and True fit by REML, False by ML.
-        The summary of an ML fit is titled "Linear mixed model fit by maximum
-        likelihood", prints AIC, BIC, logLik, deviance and df.resid, and
-        carries the note "p-values can be somewhat anticonservative" under
-        the title; a REML fit prints the REML criterion and no AIC.
-        Gaussian without (OLS, also when every grouping was dropped): same
-        estimates; True reports the REML log-likelihood (the summary prints
-        the REML criterion), None and False the ML one.
-        Any other family: ML; True is ignored with an ArgumentIgnoredWarning.
-
-    A categorical column's level order is honored: level 0 is the
-    treatment-contrast base, so `pd.Categorical(x, categories=[…])` fits against
-    the first category you list. A plain string column has no declared order and
-    is sorted lexicographically (R's `factor()` default). A bool column (Python
-    `bool`, `numpy.bool_`, pandas `bool`/nullable `boolean`, pyarrow `bool_`) is
-    treated the same way, with levels `FALSE`/`TRUE` — so a bool `x` gives a
-    coefficient `xTRUE`, as in lme4 — except as the response or the `offset()`
-    column, which stay 0/1 numbers.
-
-    See the API spec for the remaining knobs.
-    """
+def _check_call(formula, family, link):
+    """The checks `fit` and `compare` make on a formula, the family and the
+    link before any data is read; returns the link, the family's default when
+    `link` is None."""
     # Formula-shape checks the shared Rust parser has no dedicated message for
     # (it would fall through to a generic syntax error): caught here with the
     # same wording the R port uses (r/R/fastglmm.R's .check_formula) — change
@@ -1262,18 +1250,14 @@ def fit(
             f"expected one of {', '.join(fam['links'])}"
         )
 
-    # `|` marks a random-effect term, so its presence is the mixed/GLM split
-    # — decidable without the (Rust-side) formula parser.
-    mixed = "|" in formula
-
-    if family == "inversegaussian" and mixed:
+    if family == "inversegaussian" and "|" in formula:
         raise ValueError(
             "family 'inversegaussian' is GLM-only: random-effect terms are not supported"
         )
+    return link
 
-    if wald_se not in ("hessian", "rx"):
-        raise ValueError(f"wald_se must be 'hessian' or 'rx', got {wald_se!r}")
 
+def _check_nagq(nagq):
     if not (
         isinstance(nagq, int)
         and not isinstance(nagq, bool)
@@ -1282,103 +1266,27 @@ def fit(
     ):
         raise ValueError(f"nagq must be an odd integer in 1..={_MAX_NAGQ}, got {nagq!r}")
 
-    if not isinstance(satterthwaite, (bool, np.bool_)):
-        raise TypeError(f"satterthwaite must be True or False, got {satterthwaite!r}")
-    satterthwaite = bool(satterthwaite)
-    if reml is not None and not isinstance(reml, (bool, np.bool_)):
-        raise TypeError(f"reml must be None, True or False, got {reml!r}")
-    reml = None if reml is None else bool(reml)
 
-    store = []
-
-    # Valid-but-inapplicable options: warn and strip. The kernel
-    # boundary-faults on inapplicable options and a Rust panic across the FFI
-    # is not an acceptable user error, so nothing inapplicable may reach it.
-    if dispersion is not None and family not in _DISPERSION_FAMILIES:
-        _warn(
-            store,
-            "argument_ignored",
-            f"dispersion= has no effect for family '{family}'.",
-            ArgumentIgnoredWarning,
-        )
-        dispersion = None
-    if dispersion is not None:
-        if not (
-            dispersion == "estimate"
-            or (isinstance(dispersion, (int, float)) and not isinstance(dispersion, bool))
-        ):
-            raise ValueError(
-                f"dispersion must be None, 'estimate', or a number, got {dispersion!r}"
-            )
-        if family in ("binomial", "poisson") and mixed:
-            _warn(
-                store,
-                "argument_ignored",
-                "Quasi-likelihood dispersion= is not supported yet for binomial or Poisson "
-                "models. The default dispersion of 1 was used.",
-                ArgumentIgnoredWarning,
-            )
-            dispersion = None
-    if init_theta is not None and family != "negativebinomial":
-        _warn(
-            store,
-            "argument_ignored",
-            f"init_theta= is not used for family '{family}'.",
-            ArgumentIgnoredWarning,
-        )
-        init_theta = None
-    if warm_start is not None:
-        if not isinstance(warm_start, dict):
-            raise TypeError(
-                "warm_start must be a dict with keys 'beta', 'theta' and/or 'dispersion' (theta "
-                "is the random-effect Cholesky vector, not the negative-binomial shape - that is "
-                f"init_theta or dispersion), got {type(warm_start).__name__}"
-            )
-        allowed = ("beta", "theta", "dispersion")
-        unknown = [k for k in warm_start if k not in allowed]
-        if unknown:
-            _warn(
-                store,
-                "argument_ignored",
-                "warm_start accepts only 'beta', 'theta' and 'dispersion'; these entries were "
-                "ignored: " + ", ".join(map(str, unknown)) + ".",
-                ArgumentIgnoredWarning,
-            )
-            warm_start = {k: v for k, v in warm_start.items() if k in allowed}
-
-    if dispersion == "estimate" and family in ("gamma", "inversegaussian"):
-        # The phi families' default (dispersion=None) already estimates phi
-        # (Pearson on a Gamma GLM, maximum likelihood on a Gamma GLMM, Pearson
-        # on inversegaussian), so "estimate" needs no distinct kernel state.
-        dispersion = None
-    if family in ("binomial", "poisson") and dispersion is not None:
-        raise NotImplementedError(
-            f"quasi-likelihood dispersion on family {family!r} is not yet implemented in the kernel"
-        )
-    # init_theta is the negative-binomial shape seed: the same kernel slot as
-    # warm_start["dispersion"], so giving both is ambiguous.
-    if init_theta is not None:
-        if warm_start is not None and warm_start.get("dispersion") is not None:
-            raise ValueError(
-                "give the negative-binomial shape seed once: init_theta= or "
-                'warm_start["dispersion"], not both'
-            )
-        warm_start = dict(warm_start or {}, dispersion=init_theta)
-    if warm_start is not None and warm_start.get("dispersion") is not None:
-        d = warm_start["dispersion"]
-        if (
-            isinstance(d, bool)
-            or not isinstance(d, (int, float))
-            or not (math.isfinite(d) and d > 0)
-        ):
-            raise ValueError(
-                f'warm_start["dispersion"] (or init_theta) must be one finite number > 0, got {d!r}'
-            )
-
+def _prepare_columns(data, formulas, weights, offset, store, drop_missing_arguments=False):
+    """The columns of `data` that `formulas` use, as `_native.fit` takes them,
+    with `weights=`/`offset=` checked: `(numeric_columns, factor_columns,
+    weights, offset)`. A row with a missing value in a column any of the
+    formulas uses is dropped once, from every column and from the weights and
+    the offset, so two formulas (`compare`) are fitted on the same rows. With
+    `drop_missing_arguments` (`compare`), a row whose weight or offset is
+    missing is dropped the same way; otherwise a missing entry is refused."""
     # Only the columns the formula actually uses are read from here on — see
     # `_formula_columns`.
     used_columns = _columns(data)
-    used_names, missing, numeric_only = _formula_columns(formula, used_columns.keys())
+    used_names, missing, numeric_only = [], [], []
+    for formula in formulas:
+        for into, names in zip(
+            (used_names, missing, numeric_only), _formula_columns(formula, used_columns.keys())
+        ):
+            into += [name for name in names if name not in into]
+    where = "a column the formula uses"
+    if drop_missing_arguments:
+        where = "a column either formula uses, the weights or the offset"
 
     # A name the formula references but `data` does not have resolves to
     # nothing in `used_names` above (it is a filter, not a validator), so it
@@ -1447,25 +1355,26 @@ def fit(
     # argument, not a missing value.
     n_rows = len(na_mask) if na_mask is not None else None
     if weights is not None:
-        weights = _row_array(weights, "weights", n_rows)
+        weights = _row_array(weights, "weights", n_rows, drop_missing_arguments)
         if np.any(weights <= 0):
             # The kernel requires strictly positive weights; a zero weight is a
             # row that should not be in the fit at all.
             raise ValueError("weights must be positive; drop zero-weight rows from data instead")
     if offset is not None:
-        offset = _row_array(offset, "offset", n_rows)
+        offset = _row_array(offset, "offset", n_rows, drop_missing_arguments)
+    for arr in (weights, offset):
+        if drop_missing_arguments and arr is not None and na_mask is not None:
+            na_mask = [k and not math.isnan(v) for k, v in zip(na_mask, arr)]
 
     if na_mask is not None and not all(na_mask):
         n_kept = sum(na_mask)
         if n_kept == 0:
-            raise ValueError(
-                "every row has a missing value in a column the formula uses; no rows left to fit"
-            )
+            raise ValueError(f"every row has a missing value in {where}; no rows left to fit")
         _warn(
             store,
             "rows_dropped_na",
-            f"Dropped {len(na_mask) - n_kept} of {len(na_mask)} row(s): a column "
-            "the formula uses had a missing value there.",
+            f"Dropped {len(na_mask) - n_kept} of {len(na_mask)} row(s): {where} had "
+            "a missing value there.",
             RowsDroppedWarning,
         )
         for name, entry in parsed.items():
@@ -1494,31 +1403,21 @@ def fit(
             factor_columns[name] = _sorted_levels_and_codes([str(v) for v in values])
         else:
             numeric_columns[name] = [float(v) for v in values]
+    return numeric_columns, factor_columns, weights, offset
 
-    warm_start_pair = None
-    if warm_start is not None:
-        d = warm_start.get("dispersion")
-        warm_start_pair = (
-            [float(v) for v in warm_start.get("beta", [])],
-            [float(v) for v in warm_start.get("theta", [])],
-            None if d is None else float(d),
-        )
 
-    r = _native.fit(
-        formula,
-        numeric_columns,
-        factor_columns,
-        family,
-        link,
-        wald_se,
-        nagq,
-        dispersion,
-        [float(w) for w in weights] if weights is not None else None,
-        [float(v) for v in offset] if offset is not None else None,
-        warm_start_pair,
-        satterthwaite,
-        reml,
-    )
+def _term_result(t):
+    """A stored per-term result (`_native.fit`'s dict) with its numeric columns
+    as float arrays; see `Fit.term_table_type3`."""
+    if t["error"] is not None:
+        return {"error": t["error"]}
+    numeric = ("statistic", "num_df", "den_df", "p_value", "sum_sq", "mean_sq")
+    return {k: np.asarray(v, dtype=float) if k in numeric else v for k, v in t.items()}
+
+
+def _fit_from_native(r, formula, family, link, nagq, dispersion, store):
+    """The `Fit` of `_native.fit`'s dict `r`, with the fit's warnings raised
+    and appended to `store`; the other arguments are the call's own."""
     # nagq's shape eligibility (single grouping factor, binomial/Poisson/NB/Gamma,
     # q <= 3) is only decidable after the Rust-side formula lowering, so the
     # warn-and-strip for it lives in the shared glmm::orchestrate module
@@ -1623,6 +1522,14 @@ def fit(
         adj_r_squared=r["adj_r_squared"],
         warnings=store,
         dispersion_held=dispersion,
+        design_summary=None
+        if r["design_summary"] is None
+        else {k: np.asarray(v, dtype=float) for k, v in r["design_summary"].items()},
+        offset=np.asarray(r["offset"], dtype=float) if r["offset"] is not None else None,
+        objective=r["objective"],
+        objective_nodes=int(r["objective_nodes"]),
+        term_table_type3=_term_result(r["term_table_type3"]),
+        term_table_type2=_term_result(r["term_table_type2"]),
     )
     # Singularity is not assessed on a fit that did not converge: the kernel never sets
     # `singular` there (the post-hoc check and the boundary flags are gated on
@@ -1657,3 +1564,211 @@ def fit(
             ),
         )
     return res
+
+
+def fit(
+    data,
+    formula,
+    family="gaussian",
+    *,
+    link=None,
+    dispersion=None,
+    init_theta=None,
+    weights=None,
+    offset=None,
+    wald_se="hessian",
+    nagq=1,
+    warm_start=None,
+    satterthwaite=True,
+    reml=None,
+):
+    """Fit `formula` against `data`'s columns and return a `Fit`.
+
+    data: dict[str, array-like]; DataFrame / Arrow Table also accepted (duck-typed).
+    formula: R-style string, e.g. "y ~ x + z + (1 + x | g)".
+    family: gaussian | binomial | poisson | gamma | negativebinomial | inversegaussian.
+    nagq: adaptive Gauss-Hermite quadrature nodes per random-effect dimension
+        (odd, 1..=25; default 1 = Laplace). k>1 applies to binomial, Poisson,
+        negative-binomial and Gamma models with a single grouping factor and
+        q <= 3 random effects per
+        group (temporary cap); any other shape warns and falls back to Laplace.
+    init_theta: negative-binomial shape seed, named for `MASS::glm.nb(init.theta=)`
+        — the same knob, and the name the R port exposes: the starting value of
+        the shape search (the same slot as `warm_start["dispersion"]`; give one
+        of the two). None cold-starts it from the no-random-effect
+        negative-binomial fit. Distinct from `warm_start["theta"]`, which is the
+        random-effect Cholesky vector (lme4's `start=list(theta=)`); they are
+        unrelated parameters and both may be passed in one call.
+    offset: per-row additive offset on the linear-predictor scale, length n
+        (R's `offset=`): eta = offset + X*beta (+ Z*b). A fixed known
+        contribution, not a parameter — the canonical use is a Poisson
+        exposure, offset = log(exposure). None = no offset.
+    warm_start: {"beta": …, "theta": …, "dispersion": …} optimizer start; any key
+        may be left out to cold-start that part. "dispersion" is the estimated
+        dispersion as a previous fit reports it (`Fit.dispersion`): the shape
+        for negative binomial, phi for Gamma. See `init_theta` above for why
+        "theta" here is NOT the negative-binomial shape.
+    satterthwaite: compute lmerTest's Satterthwaite degrees of freedom for a
+        Gaussian mixed model's t tests (default True). False skips that pass:
+        the summary then tests with z and says "df not computed", and
+        `Fit.df_method` is "disabled". OLS and the Gamma and inverse-Gaussian
+        GLMs keep their residual df whatever it says.
+    reml: None, True or False; `Fit.reml` reports the value used.
+        Gaussian with random effects (after any single-level grouping is
+        dropped): None and True fit by REML, False by ML.
+        The summary of an ML fit is titled "Linear mixed model fit by maximum
+        likelihood", prints AIC, BIC, logLik, deviance and df.resid, and
+        carries the note "p-values can be somewhat anticonservative" under
+        the title; a REML fit prints the REML criterion and no AIC.
+        Gaussian without (OLS, also when every grouping was dropped): same
+        estimates; True reports the REML log-likelihood (the summary prints
+        the REML criterion), None and False the ML one.
+        Any other family: ML; True is ignored with an ArgumentIgnoredWarning.
+
+    A categorical column's level order is honored: level 0 is the
+    treatment-contrast base, so `pd.Categorical(x, categories=[…])` fits against
+    the first category you list. A plain string column has no declared order and
+    is sorted lexicographically (R's `factor()` default). A bool column (Python
+    `bool`, `numpy.bool_`, pandas `bool`/nullable `boolean`, pyarrow `bool_`) is
+    treated the same way, with levels `FALSE`/`TRUE` — so a bool `x` gives a
+    coefficient `xTRUE`, as in lme4 — except as the response or the `offset()`
+    column, which stay 0/1 numbers.
+
+    See the API spec for the remaining knobs.
+    """
+    link = _check_call(formula, family, link)
+    # `|` marks a random-effect term, so its presence is the mixed/GLM split
+    # — decidable without the (Rust-side) formula parser.
+    mixed = "|" in formula
+
+    if wald_se not in ("hessian", "rx"):
+        raise ValueError(f"wald_se must be 'hessian' or 'rx', got {wald_se!r}")
+
+    _check_nagq(nagq)
+
+    if not isinstance(satterthwaite, (bool, np.bool_)):
+        raise TypeError(f"satterthwaite must be True or False, got {satterthwaite!r}")
+    satterthwaite = bool(satterthwaite)
+    if reml is not None and not isinstance(reml, (bool, np.bool_)):
+        raise TypeError(f"reml must be None, True or False, got {reml!r}")
+    reml = None if reml is None else bool(reml)
+
+    store = []
+
+    # Valid-but-inapplicable options: warn and strip. The kernel
+    # boundary-faults on inapplicable options and a Rust panic across the FFI
+    # is not an acceptable user error, so nothing inapplicable may reach it.
+    if dispersion is not None and family not in _DISPERSION_FAMILIES:
+        _warn(
+            store,
+            "argument_ignored",
+            f"dispersion= has no effect for family '{family}'.",
+            ArgumentIgnoredWarning,
+        )
+        dispersion = None
+    if dispersion is not None:
+        if not (
+            dispersion == "estimate"
+            or (isinstance(dispersion, (int, float)) and not isinstance(dispersion, bool))
+        ):
+            raise ValueError(
+                f"dispersion must be None, 'estimate', or a number, got {dispersion!r}"
+            )
+        if family in ("binomial", "poisson") and mixed:
+            _warn(
+                store,
+                "argument_ignored",
+                "Quasi-likelihood dispersion= is not supported yet for binomial or Poisson "
+                "models. The default dispersion of 1 was used.",
+                ArgumentIgnoredWarning,
+            )
+            dispersion = None
+    if init_theta is not None and family != "negativebinomial":
+        _warn(
+            store,
+            "argument_ignored",
+            f"init_theta= is not used for family '{family}'.",
+            ArgumentIgnoredWarning,
+        )
+        init_theta = None
+    if warm_start is not None:
+        if not isinstance(warm_start, dict):
+            raise TypeError(
+                "warm_start must be a dict with keys 'beta', 'theta' and/or 'dispersion' (theta "
+                "is the random-effect Cholesky vector, not the negative-binomial shape - that is "
+                f"init_theta or dispersion), got {type(warm_start).__name__}"
+            )
+        allowed = ("beta", "theta", "dispersion")
+        unknown = [k for k in warm_start if k not in allowed]
+        if unknown:
+            _warn(
+                store,
+                "argument_ignored",
+                "warm_start accepts only 'beta', 'theta' and 'dispersion'; these entries were "
+                "ignored: " + ", ".join(map(str, unknown)) + ".",
+                ArgumentIgnoredWarning,
+            )
+            warm_start = {k: v for k, v in warm_start.items() if k in allowed}
+
+    if dispersion == "estimate" and family in ("gamma", "inversegaussian"):
+        # The phi families' default (dispersion=None) already estimates phi
+        # (Pearson on a Gamma GLM, maximum likelihood on a Gamma GLMM, Pearson
+        # on inversegaussian), so "estimate" needs no distinct kernel state.
+        dispersion = None
+    if family in ("binomial", "poisson") and dispersion is not None:
+        raise NotImplementedError(
+            f"quasi-likelihood dispersion on family {family!r} is not yet implemented in the kernel"
+        )
+    # init_theta is the negative-binomial shape seed: the same kernel slot as
+    # warm_start["dispersion"], so giving both is ambiguous.
+    if init_theta is not None:
+        if warm_start is not None and warm_start.get("dispersion") is not None:
+            raise ValueError(
+                "give the negative-binomial shape seed once: init_theta= or "
+                'warm_start["dispersion"], not both'
+            )
+        warm_start = dict(warm_start or {}, dispersion=init_theta)
+    if warm_start is not None and warm_start.get("dispersion") is not None:
+        d = warm_start["dispersion"]
+        if (
+            isinstance(d, bool)
+            or not isinstance(d, (int, float))
+            or not (math.isfinite(d) and d > 0)
+        ):
+            raise ValueError(
+                f'warm_start["dispersion"] (or init_theta) must be one finite number > 0, got {d!r}'
+            )
+
+    numeric_columns, factor_columns, weights, offset = _prepare_columns(
+        data, [formula], weights, offset, store
+    )
+
+    warm_start_pair = None
+    if warm_start is not None:
+        d = warm_start.get("dispersion")
+        warm_start_pair = (
+            [float(v) for v in warm_start.get("beta", [])],
+            [float(v) for v in warm_start.get("theta", [])],
+            None if d is None else float(d),
+        )
+
+    r = _native.fit(
+        formula,
+        numeric_columns,
+        factor_columns,
+        family,
+        link,
+        wald_se,
+        nagq,
+        dispersion,
+        [float(w) for w in weights] if weights is not None else None,
+        [float(v) for v in offset] if offset is not None else None,
+        warm_start_pair,
+        satterthwaite,
+        reml,
+    )
+    return _fit_from_native(r, formula, family, link, nagq, dispersion, store)
+
+
+# Last: `glmm/anova.py` reads `Fit` and the helpers above from this module.
+from glmm.anova import Comparison, ComparisonTable, TermTable, anova, compare

@@ -4,6 +4,7 @@
 
 use faer::Mat;
 
+use crate::inference::Objective;
 use crate::ols::{OlsFitView, OlsScratch, OlsSuffStats, PANEL_ROWS};
 use crate::standardize::ColumnScaling;
 
@@ -357,10 +358,13 @@ pub(crate) fn ols_view_to_fit(
         // p fixed effects + σ² (R logLik.lm's df).
         df: if converged { p + 1 } else { 0 },
         reml,
+        nobs: n,
+        objective: Objective::LeastSquares,
         fitted,
         ranef: vec![],
         ranef_levels: vec![],
         coef_df,
         satterthwaite: Some(satterthwaite),
+        design_summary: None,
     }
 }

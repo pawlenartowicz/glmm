@@ -10984,3 +10984,41 @@ fn fit_view_dispersion_start_is_the_fit_dispersion() {
     let fit = view.into_fit(&x, &y, &ids_s, n, p, &model, &opts);
     assert_eq!(carried.map(f64::to_bits), Some(fit.dispersion.to_bits()));
 }
+
+/// `nobs` is the row count and `objective` the quadrature that ran: Laplace at
+/// `nagq = 1`, AGQ on 7 nodes at `nagq = 7`, on a fitted model and on the
+/// degenerate `n == p` return alike.
+#[test]
+fn glmm_fit_reports_nobs_and_its_quadrature() {
+    let (x, y, w, cluster_ids, n) = cbpp_design_aggregated();
+    let ids = GroupIds {
+        primary: cluster_ids,
+        extra: vec![],
+    };
+    let (nd, pd) = (4, 4);
+    let xd: Vec<f64> = (0..nd * pd)
+        .map(|t| if t % pd <= t / pd { 1.0 } else { 0.0 })
+        .collect();
+    let ids_d = GroupIds {
+        primary: vec![0, 1, 0, 1],
+        extra: vec![],
+    };
+    for (nagq, want) in [(1, Objective::Laplace), (7, Objective::Agq { nodes: 7 })] {
+        let opts = FitOptions {
+            target_indices: vec![0, 1, 2, 3],
+            nagq,
+            weights: Some(w.clone()),
+            ..FitOptions::default()
+        };
+        let f = fit_cold(&x, &y, n, 4, &cbpp_model(), &ids, &opts);
+        assert!(f.converged(), "nagq {nagq}");
+        assert_eq!((f.nobs, f.objective), (n, want), "nagq {nagq}");
+        let opts_d = FitOptions {
+            nagq,
+            ..FitOptions::default()
+        };
+        let d = fit_cold(&xd, &[1.0; 4], nd, pd, &cbpp_model(), &ids_d, &opts_d);
+        assert!(!d.converged(), "n == p, nagq {nagq}");
+        assert_eq!((d.nobs, d.objective), (nd, want), "n == p, nagq {nagq}");
+    }
+}

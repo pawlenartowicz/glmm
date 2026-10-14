@@ -68,7 +68,9 @@ oracle-tests = ["orchestrate"]
 # The Monte Carlo tier: level studies checked against seeded bands. OFF by
 # default because it is slow. Compile-time gated rather than `#[ignore]`, so a
 # run without it is visible, never a silent skip. Runs locally at release.
-montecarlo-tests = []
+# Implies `formula`: the level study reads its designs through the formula
+# lowering, so the feature alone always compiles it.
+montecarlo-tests = ["formula"]
 # In-fit parallelism (AGQ cluster loop, FD-Hessian grid) via rayon's global pool.
 # OFF by default: a batch/MCPower caller running its own outer rayon loop over
 # many fits should pay nothing for this, not even rayon's per-split overhead.
@@ -78,9 +80,10 @@ montecarlo-tests = []
 parallel = ["dep:rayon"]
 
 [dependencies]
-# Validation-stable numerics depend on these pins.
+# Validation-stable numerics depend on these crates; `Cargo.lock` holds the
+# validated versions, and moving either in the lockfile re-runs validation.
 bobyqa = "0.3.2"   # `Bobyqa::minimize_with_radius` (the radius-tied stage-1 tolerance), `Config::prima_parity`
-pulp = "=0.22.2"
+pulp = "0.22.2"
 # Formula-parser only (`src/formula/parse.rs`); optional so the default-off kernel
 # never links it. Its MSRV (1.65) clears this crate's 1.85 floor.
 regex = { version = "1", optional = true }

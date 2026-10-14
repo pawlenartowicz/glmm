@@ -10,7 +10,10 @@ Description: Fits linear models, generalized linear models, and (generalized)
     binomial, Poisson, negative-binomial, and Gamma mixed models, using
     'lme4'-style formulas. Estimates are validated against 'lme4', 'glmmTMB',
     and 'MixedModels.jl'. Deliberately scoped to fast fitting - fixed effects,
-    Wald standard errors, and variance components; anything the backend
+    Wald standard errors, variance components, and tests of fixed terms and
+    of two nested models (anova(), compare()), with an exact restricted
+    likelihood-ratio test for one random intercept (Crainiceanu and Ruppert
+    (2004) <doi:10.1111/j.1467-9868.2004.00438.x>); anything the backend
     cannot compute honestly (random-effect predictions, profiling) is a
     documented error, never a silently different answer.
 License: LGPL (>= 3)

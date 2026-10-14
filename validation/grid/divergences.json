@@ -1,6 +1,6 @@
 {
   "//": "Documented divergences from the reference engines, read by validation/grid/compare.R when it compares parameters against an oracle (gate 2) or Satterthwaite df against lmerTest (gate 5, quantity coef_df, in the glmm-vs-oracle scope) and when it scores truth error (gate 3), and by the in-crate goldens tier (tests/oracle_support) for entries scoped to it. Gate 3 judges a group of cells -- one family, estimator arm and quantity -- so there an entry on any cell of the group covers the whole group, and is stale when the group was scored and did not need it. The rules: a difference over band with no entry here FAILS; a difference over band that an entry covers is reported as DOC and passes; a difference that has grown past its entry's max_rel FAILS, so a divergence is never silently absorbed; and an entry whose cell was compared but whose divergence did not fire FAILS as stale, so this file lists only what is still true. `summary` is the standalone short form, so an entry means something without the long form.",
-  "//fields": "id: stable key. cell: which fixture -- a grid cell id for the grid's own consumers, a golden's or an inference reference's name for an 'oracle-tier' entry. comparison: 'glmm-vs-oracle' for a glmm-against-an-oracle difference, 'glmm-vs-truth' for a truth-gate group where glmm's mean error against the generating truth is above the best oracle's by more than the band, 'oracle-vs-oracle' for a difference between two oracles, 'oracle-tier' for the in-crate oracle-tests tiers (the goldens and the inference references); an entry may list several. quantities: the comparison labels each consumer uses. max_rel: the largest relative difference the entry covers (for 'glmm-vs-truth', the largest amount by which glmm's mean truth error may sit above the best oracle's plus the band) — an observation exceeding it FAILS, so a divergence that grows is not silently absorbed. direction: which way the criterion moved.",
+  "//fields": "id: stable key. cell: which fixture -- a grid cell id for the grid's own consumers, a golden's or an inference reference's name for an 'oracle-tier' entry. comparison: 'glmm-vs-oracle' for a glmm-against-an-oracle difference, 'glmm-vs-truth' for a truth-gate group where glmm's mean error against the generating truth is above the best oracle's by more than the band, 'oracle-vs-oracle' for a difference between two oracles, 'oracle-tier' for the in-crate oracle-tests tiers (the goldens and the inference references); an entry may list several. quantities: the comparison labels each consumer uses. max_rel: the largest relative difference the entry covers (the largest absolute difference for a quantity its consumer compares absolutely, such as the oracle tier's 'lrt'; for 'glmm-vs-truth', the largest amount by which glmm's mean truth error may sit above the best oracle's plus the band) — an observation exceeding it FAILS, so a divergence that grows is not silently absorbed. direction: which way the criterion moved.",
   "//scope": "Every entry here is an oracle defect, a parameter the data does not determine, or (oracle-tier only) an oracle that maximises a different objective from glmm's; an entry of that third kind is admitted only for a golden whose twin on glmm's own objective (a glmmTMB `_tmb` golden) is gated at the ordinary bands in the same tier. A real glmm defect is never registered — it stays red and is tracked as a bug — because an entry would let it pass.",
   "entries": [
     {
@@ -614,6 +614,45 @@
       "max_rel": 0.013,
       "direction": "glmm's deviance is 0.04883 below lme4's reported one, which is not the same function of the parameters; glmm's agrees with glmmTMB's (sim_sparse_nb_tmb) to 1.9e-06",
       "summary": "lme4's glmer.nb builds the Laplace log-determinant from the expected (Fisher) weight, which on the negative-binomial log link is not the curvature of the integrand at the mode, so it maximises a different objective from the Laplace approximation to the marginal likelihood. The variance components therefore differ by up to 0.0127 relative while glmm's fit matches the glmmTMB twin sim_sparse_nb_tmb, which this tier gates at the ordinary bands. Measured 2026-09-24."
+    },
+    {
+      "id": "oracle-rlrt-dyestuff2-p-value-rlrsim-round-off-statistic",
+      "cell": "rlrt_dyestuff2",
+      "comparison": [
+        "oracle-tier"
+      ],
+      "quantities": [
+        "p_value"
+      ],
+      "max_rel": 1.3,
+      "direction": "glmm's p is exactly 1 (its pinned fit gives a statistic of exactly 0, so no null is drawn); RLRsim's is 0.4392, a simulation on a statistic of 5.68e-14",
+      "summary": "On Dyestuff2 the between-batch variance is estimated at exactly 0: lme4 reports a singular fit at theta = 0 and glmm pins the component. lme4's REML logLik then equals logLik(lm, REML = TRUE) to the last digit (-80.914138906144217 both in R 4.5.3 with lme4 2.0-6, checked 2026-10-12; the frozen rlrt_dyestuff2.json stores 15 digits, -80.9141389061442), but RLRsim's exactRLRT recomputes the theta = 0 value through its own QR (reml.H0) and takes the difference, 5.68e-14 (2^-44, round-off). That is not 0, so it simulates and reports p = mean(5.68e-14 < sample) = 0.4392 (nsim 1e5, set.seed(20261002)), one minus the share of its null's draws that are exactly 0 (56080 of 1e5). The exact p-value at a zero statistic is 1, and RLRsim itself gives 1 without simulating when its statistic is exactly 0. glmm's statistic agrees with RLRsim's within the statistic's band (4e-6), so only the p-value is registered: |1 - 0.4392| / 0.4392 = 1.2769, an oracle defect. Measured 2026-10-12 against the frozen rlrt_dyestuff2.json."
+    },
+    {
+      "id": "oracle-anova-glmm-vs-glm-sim-nb-lrt-lme4-objective",
+      "cell": "anova_glmm_vs_glm_sim_nb",
+      "comparison": [
+        "oracle-tier"
+      ],
+      "quantities": [
+        "lrt"
+      ],
+      "max_rel": 0.025,
+      "direction": "glmm's deviance is 0.0243 above lme4's reported one, which is not the same function of the parameters; glmm's agrees with glmmTMB's (sim_nb_glmm_tmb) to 1.2e-09",
+      "summary": "The larger model of this pair is lme4's glmer.nb fit of y ~ 1 + x + grp + (1 | cluster) on sim_nb, the model of the goldens tier's sim_nb_glmm. lme4's glmer.nb builds the Laplace log-determinant from the expected (Fisher) weight, which on the negative-binomial log link is not the curvature of the integrand at the mode, so its logLik is not the Laplace approximation glmm and glmmTMB maximise. The smaller model (MASS::glm.nb) agrees with glmm to 1.7e-12 in deviance, so the comparison carries the whole gap. The deviance gate reads the glmer.nb side against the frozen glmmTMB fit of the same model instead (sim_nb_glmm_tmb, gap 1.2e-09). glmm's likelihood-ratio statistic is 31.71512 against lme4's 31.73942, an absolute difference of 0.0243 (the quantity lrt is compared absolutely). Measured 2026-10-12."
+    },
+    {
+      "id": "oracle-anova-glmm-vs-glm-sim-nb-p-value-lme4-objective",
+      "cell": "anova_glmm_vs_glm_sim_nb",
+      "comparison": [
+        "oracle-tier"
+      ],
+      "quantities": [
+        "p_value"
+      ],
+      "max_rel": 0.013,
+      "direction": "glmm's deviance is 0.0243 above lme4's reported one, which is not the same function of the parameters; glmm's agrees with glmmTMB's (sim_nb_glmm_tmb) to 1.2e-09",
+      "summary": "The larger model of this pair is lme4's glmer.nb fit of y ~ 1 + x + grp + (1 | cluster) on sim_nb, the model of the goldens tier's sim_nb_glmm. lme4's glmer.nb builds the Laplace log-determinant from the expected (Fisher) weight, which on the negative-binomial log link is not the curvature of the integrand at the mode, so its logLik is not the Laplace approximation glmm and glmmTMB maximise. The smaller model (MASS::glm.nb) agrees with glmm to 1.7e-12 in deviance, so the comparison carries the whole gap. The deviance gate reads the glmer.nb side against the frozen glmmTMB fit of the same model instead (sim_nb_glmm_tmb, gap 1.2e-09). The 50:50 mixture p-value (k = 0) moves with the statistic: glmm 8.926e-09 against lme4's 8.815e-09, 0.0126 relative. Measured 2026-10-12."
     }
   ]
 }

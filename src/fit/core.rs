@@ -1327,9 +1327,9 @@ pub fn fit_on_hinted<'a>(
         // Degenerate guard, the twin of `build_on_workspace`'s: the PIRLS
         // kernels take no width-0 fixed block, and at `n <= p` the fixed
         // effects are not estimable.
-        FitKind::Glmm { ws: glmm_ws } if n <= p || p == 0 => {
-            prebuilt_kind(super::glmm::degenerate_glmm_fit(p, glmm_ws.n_theta))
-        }
+        FitKind::Glmm { ws: glmm_ws } if n <= p || p == 0 => prebuilt_kind(
+            super::glmm::degenerate_glmm_fit(n, p, glmm_ws.n_theta, glmm_ws.nagq),
+        ),
         FitKind::Glmm { ws: glmm_ws } => {
             // Per-draw option state, packed M columns and crossed-Schur
             // symbolic factors — what `accumulate_lmm_rows` does

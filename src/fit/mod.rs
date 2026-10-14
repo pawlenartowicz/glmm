@@ -28,6 +28,7 @@
 //! helpers shared by 2+ of those modules.
 
 use crate::consts::{MAX_EXTRA_GROUPINGS, MAX_EXTRA_Q, MAX_PRIMARY_Q};
+use crate::inference::Objective;
 use crate::{Family, GroupIds, GroupingRelation, ModelSpec, StartValues, WaldSe};
 
 mod common;
@@ -259,6 +260,23 @@ pub struct Fit {
     /// Model comparisons (AIC/LRT) across fits with different fixed effects are
     /// invalid when this is set — mirror of lme4's REML-fit `anova` warning.
     pub reml: bool,
+    /// The number of rows the fit was given, `n`, on every route and whatever
+    /// the outcome: a non-converged or degenerate fit reports it too (where
+    /// `fitted` is empty), and the rank-deficient salvage reports its reduced
+    /// fit's, which is the same `n`.
+    pub nobs: usize,
+    /// The objective the fit maximised, the label a likelihood-ratio
+    /// comparison carries: [`Objective::LeastSquares`] on OLS (also on an OLS
+    /// fit made with [`FitOptions::reml`] `= Some(true)`, whose `loglik` is
+    /// the REML value), [`Objective::MaximumLikelihood`] on a GLM,
+    /// [`Objective::Reml`] or [`Objective::MaximumLikelihood`] on a Gaussian
+    /// mixed fit from its criterion ([`Fit::reml`]), and on a GLMM
+    /// [`Objective::Laplace`] at [`FitOptions::nagq`] `= 1` or
+    /// [`Objective::Agq`] with the node count `nagq` above it. Set on every
+    /// fit, a non-converged or degenerate one included. Whether `loglik` is a
+    /// REML criterion is [`Fit::reml`]'s answer; this field adds the label and
+    /// the node count.
+    pub objective: Objective,
     /// Fitted means μ̂ per row (length `n`): the conditional means through the
     /// inverse link — `g⁻¹(Xβ̂ + Zb̂)` for mixed fits (lme4 `fitted()`),
     /// `g⁻¹(Xβ̂)` for fixed-only. Empty on non-converged fits. Always on the
@@ -315,6 +333,40 @@ pub struct Fit {
     /// finite endpoint, or the not-run record of a `Fit` the loop tier's
     /// `FitView::into_fit` built; `None` on every other family.
     pub(crate) satterthwaite: Option<crate::lmm::satterthwaite::SatterthwaiteState>,
+    /// The design summary of a Gaussian fit whose only random term is one
+    /// random intercept `(1 | g)`, which has no prior weights (an offset is
+    /// allowed) and at least one fixed-effect column: `Some` on every such
+    /// fit, whatever its criterion (REML or ML) and whether or not it
+    /// converged, since the arrays depend on the design alone; `None` on
+    /// every other fit, a `(1 | g)` fit with no fixed effects included.
+    /// Copied out of the dense LMM accumulator where the `Fit` is assembled,
+    /// so no fit computes anything extra for it. The arrays and their flat
+    /// layout are on [`DesignSummary`].
+    pub(crate) design_summary: Option<DesignSummary>,
+}
+
+/// The aggregates a `(1 | g)` fit's dense accumulator holds, as three flat
+/// arrays. They are on the design the fit ran on: after aliased columns are
+/// dropped, so `p` here is the retained column count, and in the fit's
+/// orthogonalized basis `X̃ = X·B·U⁻¹` (`B` the column standardization, `U`
+/// the fixed-effect factor), which spans the column space of the caller's `X`.
+/// `K` is the highest primary level id with rows plus one, and a level below
+/// it with no rows holds zeros.
+///
+/// - `counts`, length `K`: the row count of each level.
+/// - `s`, length `p·K`, the `p × K` matrix `X̃ᵀZ` column-major:
+///   `s[a·p + j] = Σ X̃ᵢⱼ` over the rows `i` of level `a`.
+/// - `c`, length `p·p`, the `p × p` matrix `X̃ᵀX̃` column-major, both triangles
+///   filled (it is symmetric): `c[j·p + k] = c[k·p + j] = Σᵢ X̃ᵢⱼ·X̃ᵢₖ`.
+///
+/// With `P₀` the residual projection of `X`, `ZᵀP₀Z = diag(counts) − sᵀc⁻¹s`.
+// Read by the two-fit comparison (`formula::anova::Model::from_fit`), so a
+// build without `formula` (or tests) holds the arrays unread.
+#[cfg_attr(not(any(test, feature = "formula")), allow(dead_code))]
+pub(crate) struct DesignSummary {
+    pub(crate) counts: Vec<f64>,
+    pub(crate) s: Vec<f64>,
+    pub(crate) c: Vec<f64>,
 }
 
 /// Everything a fit reports about itself, reached as `fit.diagnostics`.
