@@ -69,6 +69,7 @@ def test_fit_signature_matches_spec():
         "warm_start",
         "satterthwaite",
         "reml",
+        "anova_test",
     ]
     p = sig.parameters
     assert p["family"].default == "gaussian"
@@ -84,6 +85,7 @@ def test_fit_signature_matches_spec():
         "warm_start",
         "satterthwaite",
         "reml",
+        "anova_test",
     ]:
         assert p[name].kind is inspect.Parameter.KEYWORD_ONLY, name
     assert p["link"].default is None
@@ -91,6 +93,7 @@ def test_fit_signature_matches_spec():
     assert p["nagq"].default == 1
     assert p["satterthwaite"].default is True
     assert p["reml"].default is None
+    assert p["anova_test"].default == "auto"
 
 
 # `reml=`: twelve groups of eight rows with a random intercept, a Gaussian, a

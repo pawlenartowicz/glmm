@@ -41,5 +41,16 @@ mod rlrt_oracle_tests;
 // through the formula lowering, which `montecarlo-tests` implies.
 #[cfg(all(test, feature = "montecarlo-tests"))]
 mod rlrt_montecarlo_tests;
+// The Monte Carlo calibration tier's design: the grid of cells, the
+// generating truth, the seeds and the generator of its datasets, and its
+// default-matrix tests (the grid, the layout, the pinned first datasets).
+#[cfg(all(test, feature = "formula"))]
+mod mc_data;
+#[cfg(all(test, feature = "formula"))]
+mod mc_data_tests;
+// The Monte Carlo calibration tier's driver: per cell and dataset every
+// quantity of the tier, counted, printed and written per cell.
+#[cfg(all(test, feature = "montecarlo-tests"))]
+mod mc_calibration_tests;
 #[cfg(test)]
 mod rlrt_tests;

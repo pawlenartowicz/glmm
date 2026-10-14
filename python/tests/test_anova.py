@@ -2,6 +2,7 @@
 of two, and the renders of both tables."""
 
 import dataclasses
+import inspect
 import math
 import pickle
 import subprocess
@@ -112,7 +113,7 @@ def test_a_table_iterates_and_tests_membership_over_its_column_names(lmm):
 
 
 def test_anova_of_a_glmm_is_a_wald_chisq_table():
-    tab = glmm.anova(quiet_fit("n ~ x + f + (1 | g)", family="poisson"))
+    tab = glmm.anova(quiet_fit("n ~ x + f + (1 | g)", family="poisson"), test="Wald")
     assert tab.heading == "Type III Analysis of Deviance Table (Wald χ² tests)"
     assert tab.columns == ["Chisq", "Df", "Pr(>Chisq)"]
     assert tab["Df"].tolist() == [1.0, 2.0]
@@ -212,6 +213,239 @@ def test_anova_raises_a_stored_internal_error_as_an_error_not_a_refusal(lmm):
     )
     with pytest.raises(RuntimeError, match="internal error"):
         glmm.anova(broken)
+
+
+# -- the test argument ----------------------------------------------------------
+
+_POIS = "n ~ x + f + (1 | g)"
+_LRT_LINE = "Likelihood-ratio chi-squared tests (each term's model refitted without it)"
+_AUTO_REASON = 'test = "auto": Poisson model with random effects'
+
+
+@pytest.fixture(scope="module")
+def pois():
+    """A Poisson GLMM fitted with the default `anova_test`, and the same model
+    fitted with `anova_test="LRT"`."""
+    return quiet_fit(_POIS, family="poisson"), quiet_fit(_POIS, family="poisson", anova_test="LRT")
+
+
+def _f_refusal(den_df, name):
+    return (
+        f"per-term tests on this fit are F tests with {den_df} denominator df; {name} rows "
+        "are not available, so leave the test at its default"
+    )
+
+
+def test_anova_signature_takes_test_after_type():
+    p = inspect.signature(glmm.anova).parameters
+    assert list(p) == ["fits", "type", "test", "nsim", "seed"]
+    assert p["test"].default == "auto"
+    assert p["test"].kind is inspect.Parameter.KEYWORD_ONLY
+
+
+def test_wald_gives_the_stored_wald_table_whatever_the_fit_stored(pois):
+    plain, asked = pois
+    wald = quiet_fit(_POIS, family="poisson", anova_test="Wald")
+    assert wald.term_table_type3_lrt is None and wald.term_table_type2_lrt is None
+    for ss, field in (("III", "term_table_type3"), ("II", "term_table_type2")):
+        base = glmm.anova(wald, type=ss, test="Wald")
+        assert base.heading == f"Type {ss} Analysis of Deviance Table (Wald χ² tests)"
+        for m in (plain, wald, asked):
+            tab = glmm.anova(m, type=ss, test="Wald")
+            assert tab.text() == base.text() and tab.html() == base.html()
+            # Storing the likelihood-ratio tables moves no Wald number.
+            np.testing.assert_array_equal(tab["Chisq"], getattr(wald, field)["statistic"])
+            np.testing.assert_array_equal(tab["Pr(>Chisq)"], getattr(wald, field)["p_value"])
+    np.testing.assert_array_equal(asked.beta, plain.beta)
+    np.testing.assert_array_equal(wald.beta, plain.beta)
+
+
+def test_auto_gives_a_poisson_glmm_the_likelihood_ratio_table(pois):
+    plain, asked = pois
+    assert plain.term_test_auto == {"test": "lrt", "reason": "poisson_mixed"}
+    for ss, design in (("III", " on the reduced design"), ("II", "")):
+        lrt_field = "term_table_type3_lrt" if ss == "III" else "term_table_type2_lrt"
+        stored = getattr(plain, lrt_field)
+        assert (stored["test"], stored["reason"]) == ("lrt", "poisson_mixed")
+        heading = [f"Type {ss} Analysis of Deviance Table", f"{_LRT_LINE}{design}; {_AUTO_REASON}"]
+        for m in (plain, asked):
+            tab = glmm.anova(m, type=ss)
+            assert glmm.anova(m, type=ss, test="auto").text() == tab.text()
+            assert tab.heading.split("\n") == heading
+            assert tab.text().splitlines()[:2] == heading
+            # The rows of test="LRT", on the fit made with either value.
+            lrt = glmm.anova(m, type=ss, test="LRT")
+            assert tab.columns == lrt.columns and tab.row_names == lrt.row_names
+            for c in tab.columns:
+                np.testing.assert_array_equal(tab[c], lrt[c])
+            np.testing.assert_array_equal(tab["Chisq"], stored["statistic"])
+            assert lrt.heading.split("\n")[1] == f'{_LRT_LINE}{design}; test = "LRT"'
+            assert tab.notes == lrt.notes
+            # Both heading lines in every render.
+            assert tab.latex().splitlines()[:2] == [f"% {h}" for h in heading]
+            assert tab.typst().splitlines()[:2] == [f"// {h}" for h in heading]
+            assert lrt.latex().splitlines()[1] == f'% {_LRT_LINE}{design}; test = "LRT"'
+            assert lrt.typst().splitlines()[1] == f'// {_LRT_LINE}{design}; test = "LRT"'
+
+
+def test_auto_on_a_poisson_glmm_fitted_with_wald_says_so():
+    m = quiet_fit(_POIS, family="poisson", anova_test="Wald")
+    assert m.term_test_auto == {"test": "lrt", "reason": "poisson_mixed"}
+    message = (
+        "test='auto' gives likelihood-ratio tests on a Poisson model with random effects, "
+        "and this fit stored none: it was made with anova_test='Wald'. Use test='Wald', or "
+        "refit with glmm.fit(..., anova_test='auto')."
+    )
+    for ss in ("III", "II"):
+        with pytest.raises(ValueError) as err:
+            glmm.anova(m, type=ss)
+        assert str(err.value) == message
+
+
+def test_auto_names_the_wald_test_and_its_reason_on_every_other_chi_squared_fit():
+    d = _data(
+        b=(_Y > np.median(_Y)).astype(float).tolist(),
+        pos=np.exp(0.3 * _X + 0.3 * _Z).tolist(),
+    )
+    other = "model with random effects, not binomial, Poisson or negative binomial"
+    cases = (
+        (quiet_fit("b ~ x + f + (1 | g)", d, family="binomial"), "binomial_mixed",
+         "binomial model with random effects"),
+        (quiet_fit(_POIS, family="negativebinomial"), "negative_binomial_mixed",
+         "negative binomial model with random effects"),
+        (quiet_fit("pos ~ x + f + (1 | g)", d, family="gamma"), "other_mixed", other),
+        (quiet_fit("n ~ x + f", family="poisson"), "no_random_effects",
+         "model without random effects"),
+    )  # fmt: skip
+    for m, tag, reason in cases:
+        assert m.term_test_auto == {"test": "chisq", "reason": tag}
+        assert m.term_table_type3_lrt is None and m.term_table_type2_lrt is None
+        for ss in ("III", "II"):
+            heading = [
+                f"Type {ss} Analysis of Deviance Table",
+                f'Wald chi-squared tests; test = "auto": {reason}',
+            ]
+            tab = glmm.anova(m, type=ss)
+            assert glmm.anova(m, type=ss, test="auto").text() == tab.text()
+            assert tab.heading.split("\n") == heading
+            assert tab.text().splitlines()[:2] == heading
+            assert tab.latex().splitlines()[:2] == [f"% {h}" for h in heading]
+            assert tab.typst().splitlines()[:2] == [f"// {h}" for h in heading]
+            # Explicit Wald keeps today's heading; the numbers are the same.
+            wald = glmm.anova(m, type=ss, test="Wald")
+            assert wald.heading == f"Type {ss} Analysis of Deviance Table (Wald χ² tests)"
+            assert (tab.columns, tab.row_names, tab.notes) == (
+                wald.columns, wald.row_names, wald.notes,
+            )  # fmt: skip
+            for c in tab.columns:
+                np.testing.assert_array_equal(tab[c], wald[c])
+
+
+def test_a_fit_without_the_auto_choice_still_takes_an_explicit_test(pois):
+    # A fit made before the auto choice was stored refuses only "auto".
+    old = dataclasses.replace(pois[1], term_test_auto=None)
+    assert glmm.anova(old, test="Wald").text() == glmm.anova(pois[1], test="Wald").text()
+    assert glmm.anova(old, test="LRT").text() == glmm.anova(pois[1], test="LRT").text()
+    with pytest.raises(ValueError, match="this fit has no term_test_auto"):
+        glmm.anova(old)
+
+
+def test_lrt_reads_the_stored_likelihood_ratio_tables(pois):
+    _, m = pois
+    for ss, design in (("III", " on the reduced design"), ("II", "")):
+        stored = getattr(m, "term_table_type3_lrt" if ss == "III" else "term_table_type2_lrt")
+        assert (stored["test"], stored["reason"], stored["kind"]) == (
+            "lrt", "requested", ["lrt", "lrt"],
+        )  # fmt: skip
+        tab = glmm.anova(m, type=ss, test="LRT")
+        assert tab.row_names == ["x", "f"]
+        assert tab.columns == ["Chisq", "Df", "Pr(>Chisq)"]
+        np.testing.assert_array_equal(tab["Chisq"], stored["statistic"])
+        np.testing.assert_array_equal(tab["Df"], [1.0, 2.0])
+        np.testing.assert_array_equal(tab["Pr(>Chisq)"], stored["p_value"])
+        heading = [f"Type {ss} Analysis of Deviance Table", f'{_LRT_LINE}{design}; test = "LRT"']
+        assert tab.heading.split("\n") == heading
+        assert tab.text().splitlines()[:2] == heading
+        assert tab.text().splitlines()[2].split() == ["Chisq", "Df", "Pr(>Chisq)"]
+        html = tab.html()
+        assert all(
+            f"<p>{line}</p>" in html.replace("&#x27;", "'").replace("&quot;", '"')
+            for line in heading
+        )
+        assert "<td>χ²(1)</td>" in html and "<td>χ²(2)</td>" in html
+    again = pickle.loads(pickle.dumps(m))
+    assert glmm.anova(again, test="LRT").text() == glmm.anova(m, test="LRT").text()
+
+
+def test_lrt_on_a_fit_that_stored_none_names_the_fit_argument():
+    message = (
+        "this fit stored no likelihood-ratio tables, which are built only when the fit "
+        "asks for them: refit with glmm.fit(..., anova_test='LRT')."
+    )
+    for m in (
+        quiet_fit(_POIS, family="poisson", anova_test="Wald"),
+        quiet_fit("n ~ x + f", family="poisson"),
+    ):
+        for ss in ("III", "II"):
+            with pytest.raises(ValueError) as err:
+                glmm.anova(m, type=ss, test="LRT")
+            assert str(err.value) == message
+
+
+def test_a_stored_refusal_comes_before_the_choice_of_table():
+    # As the R port: a formula without its marginal term gets its refusal,
+    # never advice to refit with other tables, whatever test is asked.
+    m = quiet_fit("n ~ x + x:f + (1 | g)", family="poisson", anova_test="Wald")
+    refusal = m.term_table_type3["error"]
+    assert "x:f" in refusal
+    for test in ("auto", "Wald", "LRT"):
+        with pytest.raises(ValueError) as err:
+            glmm.anova(m, test=test)
+        assert str(err.value) == refusal
+
+
+def test_wald_or_lrt_on_an_f_table_is_refused_naming_its_test(lmm):
+    for test, name in (("Wald", "Wald chi-squared"), ("LRT", "likelihood-ratio")):
+        for ss in ("III", "II"):
+            with pytest.raises(ValueError) as err:
+                glmm.anova(lmm, type=ss, test=test)
+            assert str(err.value) == _f_refusal("Satterthwaite's", name)
+    ols = quiet_fit("y ~ x + f")
+    with pytest.raises(ValueError) as err:
+        glmm.anova(ols, test="Wald")
+    assert str(err.value) == _f_refusal("the residual", "Wald chi-squared")
+    # A fit that asked for the likelihood-ratio tables stands, and stores the
+    # same refusal in their place.
+    asked = quiet_fit("y ~ x + f + (1 | g)", anova_test="LRT")
+    assert asked.term_table_type3_lrt == {
+        "error": _f_refusal("Satterthwaite's", "likelihood-ratio")
+    }
+    with pytest.raises(ValueError) as err:
+        glmm.anova(asked, test="LRT")
+    assert str(err.value) == _f_refusal("Satterthwaite's", "likelihood-ratio")
+    assert glmm.anova(asked).text() == glmm.anova(lmm).text()
+
+
+def test_a_term_whose_column_carries_a_random_slope_keeps_its_wald_row():
+    m = quiet_fit("n ~ x + f + (1 + x | g)", family="poisson", anova_test="LRT")
+    stored = m.term_table_type3_lrt
+    assert stored["kind"] == ["chisq", "lrt"]
+    (note,) = stored["row_notes"][0]
+    assert "random slope" in note
+    tab = glmm.anova(m, test="LRT")
+    assert f"x: {note}" in tab.notes
+    assert tab["Chisq"][0] == m.term_table_type3["statistic"][0]
+
+
+def test_test_and_anova_test_are_checked(exact_pair):
+    m0, m1 = exact_pair
+    for t in ("auto", "Wald", "LRT"):
+        with pytest.raises(TypeError, match=r"two fits takes no test"):
+            glmm.anova(m0, m1, test=t)
+    with pytest.raises(ValueError, match=r"test must be 'auto', 'Wald' or 'LRT', got 'lrt'"):
+        glmm.anova(m1, test="lrt")
+    with pytest.raises(ValueError, match=r"anova_test must be 'auto', 'Wald' or 'LRT', got 'lrt'"):
+        glmm.fit(D, "y ~ x", anova_test="lrt")
 
 
 # -- the comparison of two fits -------------------------------------------------
@@ -693,3 +927,10 @@ def test_comparison_table_renders():
     ols = quiet_fit("Yield ~ 1", DYESTUFF2, reml=True)
     tab = glmm.anova(ols, quiet_fit("Yield ~ 1 + (1 | Batch)", DYESTUFF2))
     _snapshot(tab, _COMPARISON_TEXT, _COMPARISON_HTML, _COMPARISON_LATEX, _COMPARISON_TYPST)
+
+
+def test_test_none_is_the_default_as_type_none_is(pois, exact_pair):
+    m, _ = pois
+    assert glmm.anova(m, test=None).text() == glmm.anova(m).text()
+    m0, m1 = exact_pair
+    assert glmm.anova(m0, m1, test=None).text() == glmm.anova(m0, m1).text()

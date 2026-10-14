@@ -38,9 +38,10 @@ mod glmm;
 mod lmm;
 mod ols;
 
-use common::{
-    assert_group_ids, assert_model_shape, detect_aliased, fit_rank_deficient, spec_sized_from_ids,
-};
+use common::{assert_group_ids, assert_model_shape, fit_rank_deficient, spec_sized_from_ids};
+// `pub(crate)` so the calibration tier decides a design's aliasing with the
+// alias gate's own test.
+pub(crate) use common::detect_aliased;
 // `pub(crate)` so `orchestrate::run_fit` can check a port's warm-start θ width
 // before the fit, the way `fit_warm` checks it.
 pub(crate) use common::theta_width;

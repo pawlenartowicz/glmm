@@ -4,7 +4,7 @@
 # SIDE EFFECT, read before running: this installs into the FIRST entry of
 # .libPaths() (the user library) and REPLACES whatever version of lme4 / glmmTMB /
 # GLMMadaptive is there, and of the inference reference generators' pins
-# (INFERENCE_PKGS: lmerTest / RLRsim / car / numDeriv / MASS / jsonlite). MASS
+# (INFERENCE_PKGS: lmerTest / RLRsim / car / numDeriv / MASS / jsonlite / afex). MASS
 # ships with R, so the loop skips it when the system library's copy already
 # matches the pin. Nothing else on the machine is consulted about that.
 #
@@ -47,7 +47,13 @@ if (is.na(have_rcpp) || have_rcpp < RCPP_FLOOR) {
 }
 
 PKGS <- c("lme4", "glmmTMB", "GLMMadaptive")
-INFERENCE_PKGS <- c("lmerTest", "RLRsim", "car", "numDeriv", "MASS", "jsonlite")
+# afex is installed here and asserted by tools/inference_common.R's
+# assert_inference_versions(), but the generators do not attach it, so the
+# INFERENCE_PKGS of tools/inference_common.R leaves it out on purpose: keep the
+# two lists different. On a fresh machine install_version() pulls any missing
+# afex Import at CRAN's current version; versions.json records the versions
+# afex was frozen with and does not pin them.
+INFERENCE_PKGS <- c("lmerTest", "RLRsim", "car", "numDeriv", "MASS", "jsonlite", "afex")
 for (pkg in c(PKGS, INFERENCE_PKGS)) {
   want <- V[[pkg]]
   have <- tryCatch(as.character(utils::packageVersion(pkg)),

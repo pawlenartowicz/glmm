@@ -69,7 +69,10 @@ test_that("anova(m) has the Wald chi-squared columns on a GLMM and the residual 
   expect_identical(class(tab), c("anova", "data.frame"))
   expect_identical(names(tab), c("Chisq", "Df", "Pr(>Chisq)"))
   expect_identical(rownames(tab), c("t", "d", "t:d"))
-  expect_identical(attr(tab, "heading")[1L],
+  expect_identical(attr(tab, "heading"), c(
+    "Type III Analysis of Deviance Table",
+    'Wald chi-squared tests; test = "auto": binomial model with random effects'))
+  expect_identical(attr(anova(m, test = "Wald"), "heading"),
                    "Type III Analysis of Deviance Table (Wald \u03c7\u00b2 tests)")
   expect_identical(tab$Chisq, m$term_table_type3$statistic)
 
@@ -446,4 +449,203 @@ test_that("the fit stores the offset, the objective and both per-term results", 
   b <- benchmark_data(seed = 325, family = "binomial")
   g5 <- fastglmm(y ~ t + (1 | g), b, family = binomial(), nAGQ = 5)
   expect_identical(c(g5$objective, as.character(g5$objective_nodes)), c("agq", "5"))
+})
+
+# anova(m, test): "auto" and "Wald" read the stored Wald tables, "LRT" the
+# likelihood-ratio tables a fit stores when fastglmm(..., anova_test = "LRT")
+# asks for them.
+lrt_fits <- function() {
+  d <- benchmark_data(seed = 321, family = "binomial")
+  list(wald = fastglmm(y ~ t * d + (1 | g), d, family = binomial()),
+       lrt = fastglmm(y ~ t * d + (1 | g), d, family = binomial(), anova_test = "LRT"))
+}
+
+test_that("test picks the stored table: auto and Wald the Wald table, LRT the likelihood-ratio one", {
+  fits <- lrt_fits()
+  m <- fits$wald
+  m_lrt <- fits$lrt
+  # The default stores no likelihood-ratio table, and asking moves nothing
+  # of the fit.
+  expect_null(m$term_table_type3_lrt)
+  expect_null(m$term_table_type2_lrt)
+  expect_identical(m$term_test_auto, list(test = "chisq", reason = "binomial_mixed"))
+  expect_identical(m_lrt$beta, m$beta)
+  expect_identical(m_lrt$vcov, m$vcov)
+  expect_identical(m_lrt$loglik, m$loglik)
+  for (type in c("III", "II")) {
+    wald <- anova(m, type = type, test = "Wald")
+    auto <- anova(m, type = type)
+    expect_identical(anova(m, type = type, test = "auto"), auto)
+    expect_identical(anova(m_lrt, type = type), auto)
+    expect_identical(anova(m_lrt, type = type, test = "Wald"), wald)
+    # auto gives the Wald numbers under a heading that names auto's reason.
+    expect_identical(columns(auto), columns(wald))
+    expect_identical(rownames(auto), rownames(wald))
+    expect_identical(attr(auto, "heading"), c(
+      sprintf("Type %s Analysis of Deviance Table", type),
+      'Wald chi-squared tests; test = "auto": binomial model with random effects'))
+    expect_identical(attr(wald, "heading"),
+                     sprintf("Type %s Analysis of Deviance Table (Wald \u03c7\u00b2 tests)", type))
+    lrt <- anova(m_lrt, type = type, test = "LRT")
+    stored <- m_lrt[[if (type == "III") "term_table_type3_lrt" else "term_table_type2_lrt"]]
+    expect_identical(class(lrt), c("anova", "data.frame"))
+    expect_identical(names(lrt), c("Chisq", "Df", "Pr(>Chisq)"))
+    expect_identical(rownames(lrt), c("t", "d", "t:d"))
+    expect_identical(stored$kind, rep("lrt", 3L))
+    expect_identical(lrt$Chisq, stored$statistic)
+    expect_identical(lrt$Df, stored$num_df)
+    expect_identical(lrt[["Pr(>Chisq)"]], stored$p_value)
+    expect_false(isTRUE(all.equal(lrt$Chisq, wald$Chisq)))
+  }
+  expect_error(anova(m, test = "lrt"), "'arg' should be one of")
+  d <- benchmark_data(seed = 321, family = "binomial")
+  expect_error(fastglmm(y ~ t + (1 | g), d, family = binomial(), anova_test = "lrt"),
+               "'arg' should be one of")
+})
+
+test_that("test comes after type, nsim and seed stay, and test applies to one fit only", {
+  args <- formals(getS3method("anova", "fastglmm"))
+  expect_identical(names(args), c("object", "...", "type", "test", "nsim", "seed"))
+  expect_identical(eval(args$test), c("auto", "Wald", "LRT"))
+  expect_identical(eval(formals(fastglmm)$anova_test), c("auto", "Wald", "LRT"))
+  d <- anova_data()
+  m0 <- fastglmm(y ~ x + (1 | g), d)
+  m1 <- fastglmm(y ~ x + (1 + x | g), d)
+  two <- "test applies to one fit's per-term table, not to a comparison of two fits."
+  expect_error(anova(m0, m1, test = "Wald"), two, fixed = TRUE)
+  expect_error(anova(m0, m1, test = "auto"), two, fixed = TRUE)
+  expect_error(anova(m0, test = "auto", nsim = 10), "nsim and seed", fixed = TRUE)
+})
+
+test_that("LRT on a fit that stored no likelihood-ratio table names the fit argument", {
+  m <- lrt_fits()$wald
+  msg <- paste("this fit stored no likelihood-ratio tables, which are built only when the fit",
+               'asks for them: refit with fastglmm(..., anova_test = "LRT").')
+  expect_error(anova(m, test = "LRT"), msg, fixed = TRUE)
+  expect_error(anova(m, type = "II", test = "LRT"), msg, fixed = TRUE)
+})
+
+test_that("the heading names the likelihood-ratio test and why; Wald keeps its heading", {
+  m_lrt <- lrt_fits()$lrt
+  expect_identical(attr(anova(m_lrt, test = "LRT"), "heading"), c(
+    "Type III Analysis of Deviance Table",
+    paste("Likelihood-ratio chi-squared tests (each term's model refitted without it)",
+          'on the reduced design; test = "LRT"')))
+  expect_identical(attr(anova(m_lrt, type = "II", test = "LRT"), "heading"), c(
+    "Type II Analysis of Deviance Table",
+    paste("Likelihood-ratio chi-squared tests (each term's model refitted without it);",
+          'test = "LRT"')))
+  expect_identical(attr(anova(m_lrt, test = "Wald"), "heading"),
+                   "Type III Analysis of Deviance Table (Wald χ² tests)")
+  # A fit that did not converge says so first, then the table's own notes.
+  m_lrt$converged <- FALSE
+  expect_identical(attr(anova(m_lrt, test = "LRT"), "heading")[3L], paste(
+    "The fit did not converge, so its estimates are not at a maximum and these tests",
+    "are not reliable. Refit until the fit converges, then test again."))
+  # A stored refusal is an error with its own text.
+  m_lrt$term_table_type2_lrt <- list(error = "internal error while building the per-term table")
+  expect_error(anova(m_lrt, type = "II", test = "LRT"),
+               "internal error while building the per-term table", fixed = TRUE)
+})
+
+test_that("Wald or LRT on a fit with F rows is an error naming its F test; the fit stands", {
+  d <- anova_data()
+  lmm <- fastglmm(y ~ x * f + (1 | g), d, anova_test = "LRT")
+  expect_true(lmm$converged)
+  satt <- "per-term tests on this fit are F tests with Satterthwaite's denominator df; "
+  advice <- "rows are not available, so leave the test at its default"
+  expect_error(anova(lmm, test = "Wald"), paste0(satt, "Wald chi-squared ", advice),
+               fixed = TRUE)
+  expect_error(anova(lmm, type = "II", test = "LRT"),
+               paste0(satt, "likelihood-ratio ", advice), fixed = TRUE)
+  # The same text the crate stored when the fit asked.
+  expect_identical(lmm$term_table_type3_lrt$error, paste0(satt, "likelihood-ratio ", advice))
+  expect_identical(anova(lmm, test = "auto"), anova(fastglmm(y ~ x * f + (1 | g), d)))
+  ols <- fastglmm(y ~ x + f, d)
+  expect_error(anova(ols, test = "LRT"), paste0(
+    "per-term tests on this fit are F tests with the residual denominator df; ",
+    "likelihood-ratio ", advice), fixed = TRUE)
+})
+
+# A Poisson GLMM, whose "auto" is the likelihood-ratio test, fitted with each
+# anova_test.
+pois_fits <- function() {
+  d <- benchmark_data(seed = 323, family = "poisson")
+  lapply(c(auto = "auto", Wald = "Wald", LRT = "LRT"), function(a) {
+    fastglmm(y ~ t * d + (1 | g), d, family = poisson(), anova_test = a)
+  })
+}
+
+test_that("auto gives a Poisson GLMM the likelihood-ratio table, under its own heading", {
+  fits <- pois_fits()
+  reason <- 'test = "auto": Poisson model with random effects'
+  lr_line <- "Likelihood-ratio chi-squared tests (each term's model refitted without it)"
+  for (m in fits) {
+    expect_identical(m$term_test_auto, list(test = "lrt", reason = "poisson_mixed"))
+  }
+  expect_identical(fits$auto$term_table_type3_lrt$reason, "poisson_mixed")
+  expect_null(fits$Wald$term_table_type3_lrt)
+  for (type in c("III", "II")) {
+    design <- if (type == "III") " on the reduced design" else ""
+    for (m in fits[c("auto", "LRT")]) {
+      auto <- anova(m, type = type)
+      lrt <- anova(m, type = type, test = "LRT")
+      expect_identical(anova(m, type = type, test = "auto"), auto)
+      expect_identical(attr(auto, "heading"), c(
+        sprintf("Type %s Analysis of Deviance Table", type),
+        paste0(lr_line, design, "; ", reason)))
+      expect_identical(attr(lrt, "heading")[2L], paste0(lr_line, design, '; test = "LRT"'))
+      expect_identical(columns(auto), columns(lrt))
+      expect_identical(rownames(auto), c("t", "d", "t:d"))
+    }
+    # The Wald table is the same whatever the fit stored.
+    wald <- anova(fits$Wald, type = type, test = "Wald")
+    expect_identical(attr(wald, "heading"),
+                     sprintf("Type %s Analysis of Deviance Table (Wald \u03c7\u00b2 tests)", type))
+    expect_identical(anova(fits$auto, type = type, test = "Wald"), wald)
+    expect_identical(anova(fits$LRT, type = type, test = "Wald"), wald)
+  }
+})
+
+test_that("auto on a Poisson GLMM fitted with anova_test = \"Wald\" says so", {
+  m <- pois_fits()$Wald
+  msg <- paste('test = "auto" gives likelihood-ratio tests on a Poisson model with random',
+               'effects, and this fit stored none: it was made with anova_test = "Wald".',
+               'Use test = "Wald", or refit with fastglmm(..., anova_test = "auto").')
+  expect_error(anova(m), msg, fixed = TRUE)
+  expect_error(anova(m, type = "II"), msg, fixed = TRUE)
+  glm <- fastglmm(y ~ t * d, benchmark_data(seed = 323, family = "poisson"), family = poisson())
+  expect_identical(glm$term_test_auto, list(test = "chisq", reason = "no_random_effects"))
+  expect_null(glm$term_table_type3_lrt)
+  expect_identical(attr(anova(glm), "heading"), c(
+    "Type III Analysis of Deviance Table",
+    'Wald chi-squared tests; test = "auto": model without random effects'))
+})
+
+test_that("auto names the Wald test and the reason on every other chi-squared fit", {
+  d <- benchmark_data(seed = 323, family = "poisson")
+  d$pos <- exp(0.3 * d$t + 0.2 * d$d + rnorm(nrow(d), sd = 0.3))
+  other <- "model with random effects, not binomial, Poisson or negative binomial"
+  cases <- list(
+    list(fastglmm(y ~ t * d + (1 | g), d, family = "negativebinomial"),
+         "negative_binomial_mixed", "negative binomial model with random effects"),
+    list(fastglmm(pos ~ t * d + (1 | g), d, family = Gamma(link = "log")), "other_mixed", other))
+  for (k in cases) {
+    m <- k[[1L]]
+    expect_identical(m$term_test_auto, list(test = "chisq", reason = k[[2L]]))
+    expect_null(m$term_table_type3_lrt)
+    for (type in c("III", "II")) {
+      auto <- anova(m, type = type)
+      wald <- anova(m, type = type, test = "Wald")
+      expect_identical(attr(auto, "heading"), c(
+        sprintf("Type %s Analysis of Deviance Table", type),
+        paste0('Wald chi-squared tests; test = "auto": ', k[[3L]])))
+      expect_identical(columns(auto), columns(wald))
+    }
+  }
+  # A fit made before the auto choice was stored refuses only "auto".
+  old <- cases[[1L]][[1L]]
+  old$term_test_auto <- NULL
+  expect_identical(anova(old, test = "Wald"), anova(cases[[1L]][[1L]], test = "Wald"))
+  expect_error(anova(old), "this fit has no term_test_auto", fixed = TRUE)
 })

@@ -90,12 +90,15 @@ inference_setup <- function() {
   invisible(NULL)
 }
 
-# lme4 and the six pins against grid/versions.json; a mismatch stops the run.
+# lme4, the six pins and afex against grid/versions.json; a mismatch stops the
+# run. afex is asserted here but neither attached by inference_setup() nor in
+# provenance()'s default list: only goldens_anova.R's likelihood-ratio entries
+# use it, and they name it in their own provenance.
 assert_inference_versions <- function() {
   grid_dir <- file.path(dirname(INFERENCE_COMMON_DIR), "grid")
   source(file.path(grid_dir, "engines", "versions.R"), local = TRUE)
   V <- grid_versions(grid_dir)
-  for (pkg in c("lme4", INFERENCE_PKGS)) assert_pkg_version(pkg, V[[pkg]])
+  for (pkg in c("lme4", INFERENCE_PKGS, "afex")) assert_pkg_version(pkg, V[[pkg]])
   invisible(NULL)
 }
 

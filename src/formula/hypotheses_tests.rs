@@ -7,12 +7,13 @@ use faer::Mat;
 use serde_json::Value;
 
 use super::hypotheses::{
-    check_marginal, missing_cells_note, type2_vcov, type2_xtx, type3, TermHypothesis,
+    check_marginal, missing_cells_note, remap_slopes, type2_lr_sets, type2_vcov, type2_xtx, type3,
+    type3_null_basis, type3_unrounded, untouched_columns, ReducedDesignError, TermHypothesis,
 };
 use super::{lower, Lowered, Table};
 use crate::inference::test_refs::{self, Entry, Kind};
 use crate::test_support::csv_table;
-use crate::Family;
+use crate::{ColumnId, Family};
 
 /// Entry-by-entry band on the frozen matrices: lmerTest rounds them with
 /// `zapsmall` (7 significant digits of the largest entry), which this port
@@ -552,12 +553,17 @@ fn type3_spans_lmertest_type3_rows_on_bern_design() {
 /// `lmertest` entries: [`lowered_terms_match_r_assign`]); nothing sorts it.
 #[test]
 fn lowered_terms_follow_r_term_labels() {
+    // The cases whose `term_labels` this reads, by name (not the
+    // likelihood-ratio tables: the two cbpp ones have a cbind() response,
+    // which `lower` refuses).
+    const CASES: [&str; 4] = ["car_glmm", "car_glm", "car_lm", "nonmarginal"];
     let mut seen = 0;
     for e in test_refs::entries(Kind::Anova) {
         let json = test_refs::load(Kind::Anova, &e.name);
-        let Some(want) = json.get("term_labels") else {
+        if !CASES.contains(&json["case"].as_str().expect("case")) {
             continue;
-        };
+        }
+        let want = json.get("term_labels").expect("term_labels");
         let lo = lowered(&e);
         let labels: Vec<&str> = lo.terms.iter().map(|t| t.label.as_str()).collect();
         assert_eq!(labels, strings(want), "{}: term labels", e.name);
@@ -614,4 +620,268 @@ fn missing_cells_note_on_empty_cell() {
             assert!(got.is_some_and(|n| n.contains("gc:hq")), "{}", e.name);
         }
     }
+}
+
+/// `‖m‖_F`.
+fn frobenius(m: &Mat<f64>) -> f64 {
+    m.col_iter()
+        .flat_map(|c| c.iter().copied())
+        .map(|v| v * v)
+        .sum::<f64>()
+        .sqrt()
+}
+
+/// Gate 1, Type III: on `y ~ g * h + x` (the `sim_factorial_bern` design, all
+/// columns retained) each term's `N` is an orthonormal basis of the null
+/// space of its unrounded `L` ([`type3_unrounded`]): `‖L·N‖ ≤ 1e-12·‖L‖`,
+/// `NᵀN = I`, the columns the rounded `L` ([`type3`]) does not touch lead `N`
+/// as unit columns, and `N` has `p − r` columns (`r` = 2, 1, 1, 2 for `g`,
+/// `h`, `x`, `g:h`). A row that is the sum of `L`'s rows adds no rank. `x`'s
+/// `L` touches `x` alone, so its `N` is the column drop.
+#[test]
+fn type3_null_basis_spans_the_null_space() {
+    let lo = lowered(&anova_entry(CAR_BERN[0]));
+    let p = lo.p;
+    assert_eq!(p, 7, "columns");
+    let all: Vec<usize> = (0..p).collect();
+    let hyp = type3(&lo, &all);
+    let exact = type3_unrounded(&lo, &all);
+    let labels: Vec<&str> = hyp.iter().map(|h| h.term.as_str()).collect();
+    assert_eq!(labels, ["g", "h", "x", "g:h"]);
+    let stack = |l: &Mat<f64>| {
+        let rows = l.nrows();
+        Mat::from_fn(rows + 1, p, |i, j| {
+            if i < rows {
+                l[(i, j)]
+            } else {
+                (0..rows).map(|k| l[(k, j)]).sum()
+            }
+        })
+    };
+    for ((h, e), r) in hyp.iter().zip(&exact).zip([2, 1, 1, 2]) {
+        assert_eq!(e.term, h.term);
+        let (stacked, stacked_exact) = (stack(&h.l), stack(&e.l));
+        for (l, el) in [(&h.l, &e.l), (&stacked, &stacked_exact)] {
+            let ctx = format!("{} ({} rows)", h.term, l.nrows());
+            let n = type3_null_basis(l.as_ref(), el.as_ref(), &[])
+                .unwrap_or_else(|e| panic!("{ctx}: {e:?}"));
+            assert_eq!(n.ncols(), p - r, "{ctx}: p − r columns");
+            let ln = el * &n;
+            assert!(
+                frobenius(&ln) <= 1e-12 * frobenius(el),
+                "{ctx}: ‖L·N‖ = {:e}, ‖L‖ = {:e}",
+                frobenius(&ln),
+                frobenius(el)
+            );
+            let gram = n.transpose() * &n;
+            let d = max_abs_diff(&gram, &Mat::identity(p - r, p - r));
+            assert!(d <= 1e-12, "{ctx}: NᵀN off the identity by {d:e}");
+            let kept = untouched_columns(l.as_ref());
+            assert!(kept.contains(&0), "{ctx}: the intercept is untouched");
+            for (j, &c) in kept.iter().enumerate() {
+                for i in 0..p {
+                    let unit = f64::from(u8::from(i == c));
+                    assert_eq!(n[(i, j)], unit, "{ctx}: N[{i}, {j}], unit column {c}");
+                }
+            }
+            if h.term == "x" {
+                assert_eq!(kept.len(), p - 1, "{ctx}: the column drop");
+            }
+        }
+    }
+}
+
+/// Gate 1, Type III against afex's column drop (fit-free): on an unbalanced
+/// `y ~ a * b + z` (`a` 2 levels, `b` 3, `z` numeric, cells of 1 to 4 rows),
+/// each term's `X·N` spans the same columns as the sum-coded design without
+/// the term's columns, the reduced design afex fits under `contr.sum`, at
+/// [`PROJ_ABS`] on every term: the null basis comes from the unrounded
+/// hypothesis ([`type3_unrounded`]). From `type3`'s, which rounds `L` with
+/// `zapsmall` as lmerTest does (`a`'s weights 1/3 become 0.3333333), `a`'s
+/// span would move by about 5e-8.
+#[test]
+fn type3_reduced_design_spans_the_sum_coded_drop() {
+    let mut csv = String::from("y,a,b,z\n");
+    let mut cells: Vec<(usize, usize, f64)> = Vec::new();
+    let mut i = 0usize;
+    for (cell, &m) in [2usize, 3, 1, 4, 2, 3].iter().enumerate() {
+        let (a, b) = (cell / 3, cell % 3);
+        for _ in 0..m {
+            i += 1;
+            let z = ((i * 7) % 11) as f64 / 3.0;
+            let y = ((i * 5) % 13) as f64;
+            csv.push_str(&format!(
+                "{y},{},{},{z}\n",
+                ["p", "q"][a],
+                ["u", "v", "w"][b]
+            ));
+            cells.push((a, b, z));
+        }
+    }
+    let lo = lower(
+        "y ~ a * b + z",
+        &csv_table(&csv, &["a", "b"]),
+        Family::Gaussian,
+    )
+    .unwrap();
+    let (n, p) = (lo.n, lo.p);
+    assert_eq!(
+        lo.col_names,
+        ["(Intercept)", "aq", "bv", "bw", "z", "aq:bv", "aq:bw"]
+    );
+    let x = Mat::from_fn(n, p, |i, j| lo.x[i * p + j]);
+    // contr.sum: the last level codes −1 on every column.
+    let sum_a = |a: usize| [1.0, -1.0][a];
+    let sum_b = |b: usize| [[1.0, 0.0], [0.0, 1.0], [-1.0, -1.0]][b];
+    let sum_cols = |term: &str, (a, b, z): (usize, usize, f64)| -> Vec<f64> {
+        match term {
+            "a" => vec![sum_a(a)],
+            "b" => sum_b(b).to_vec(),
+            "z" => vec![z],
+            "a:b" => sum_b(b).iter().map(|v| sum_a(a) * v).collect(),
+            other => panic!("term {other}"),
+        }
+    };
+    let all: Vec<usize> = (0..p).collect();
+    for (h, e) in type3(&lo, &all).into_iter().zip(type3_unrounded(&lo, &all)) {
+        let nb = type3_null_basis(h.l.as_ref(), e.l.as_ref(), &[]).expect("a null basis");
+        let xn = &x * &nb;
+        let rows: Vec<Vec<f64>> = cells
+            .iter()
+            .map(|&cell| {
+                let mut row = vec![1.0];
+                for t in lo.terms.iter().filter(|t| t.label != h.term) {
+                    row.extend(sum_cols(&t.label, cell));
+                }
+                row
+            })
+            .collect();
+        let xs = Mat::from_fn(n, rows[0].len(), |i, j| rows[i][j]);
+        assert_eq!(xs.ncols(), xn.ncols(), "{}: widths", h.term);
+        let d = max_abs_diff(
+            &projector(&xn.transpose().to_owned()),
+            &projector(&xs.transpose().to_owned()),
+        );
+        assert!(d <= PROJ_ABS, "{}: column spaces differ by {d:e}", h.term);
+    }
+}
+
+/// [`type3_null_basis`] refuses what it cannot check: a hypothesis with a NaN
+/// entry (as [`type3`] gives on a design singular on the retained columns),
+/// one too ill-conditioned for the bound (`diag(1, 1e-6)`: the eigenvalue
+/// 1e-12 falls under the cut and `‖L·e₂‖ = 1e-6`), and an unrounded
+/// hypothesis of another rank than the rounded one.
+#[test]
+fn type3_null_basis_refuses_what_it_cannot_check() {
+    let nan = Mat::from_fn(1, 3, |_, j| [1.0, f64::NAN, 0.0][j]);
+    let ill = Mat::from_fn(2, 2, |i, j| if i == j { [1.0, 1e-6][i] } else { 0.0 });
+    let rank1 = Mat::from_fn(1, 2, |_, j| [1.0, 2.0][j]);
+    let rank2 = Mat::from_fn(2, 2, |i, j| [[1.0, 2.0], [1.0, 3.0]][i][j]);
+    for (l, exact) in [(&nan, &nan), (&ill, &ill), (&rank1, &rank2)] {
+        assert_eq!(
+            type3_null_basis(l.as_ref(), exact.as_ref(), &[]),
+            Err(ReducedDesignError::NoNullBasis),
+            "{exact:?}"
+        );
+    }
+}
+
+/// Gate 1, random slopes, on `y ~ g * h + x` with a slope on `x` (columns
+/// `(Intercept)`, `gb`, `gc`, `hq`, `x`, `gb:hq`, `gc:hq`): `x`'s Type III `L`
+/// touches the slope column and is refused; `g`'s leaves it a unit column of
+/// `N`, and [`remap_slopes`] moves the slope to that column, past `g`'s
+/// mixed columns, on the same variable. Type II likewise: `g`'s reduced set
+/// drops `gb` and `gc` before `x` and the slope follows `x`; `x`'s reduced set
+/// drops the slope column and is refused.
+#[test]
+fn reduced_designs_keep_or_refuse_slope_columns() {
+    let lo = lowered(&anova_entry(CAR_BERN[0]));
+    let all: Vec<usize> = (0..lo.p).collect();
+    let x = column(&lo, "x");
+    assert_eq!(x, 4);
+    let slope = [ColumnId::try_from(x).unwrap()];
+    let hyp = type3(&lo, &all);
+    let exact = type3_unrounded(&lo, &all);
+    let at = |term: &str| hyp.iter().position(|h| h.term == term).unwrap();
+
+    assert_eq!(
+        type3_null_basis(hyp[at("x")].l.as_ref(), exact[at("x")].l.as_ref(), &[x]),
+        Err(ReducedDesignError::SlopeTouched)
+    );
+    let lg = &hyp[at("g")].l;
+    let n = type3_null_basis(lg.as_ref(), exact[at("g")].l.as_ref(), &[x])
+        .expect("g's L leaves x alone");
+    let kept = untouched_columns(lg.as_ref());
+    let j = remap_slopes(&slope, &kept).expect("x is kept")[0] as usize;
+    assert!(j < x, "the slope moves left past g's columns: {j}");
+    assert_eq!(lo.col_names[kept[j]], "x");
+    for i in 0..lo.p {
+        assert_eq!(n[(i, j)], f64::from(u8::from(i == x)), "N[{i}, {j}]");
+    }
+
+    let sets = type2_lr_sets(&lo, &all);
+    let (full, reduced) = &sets[0];
+    assert_eq!(remap_slopes(&slope, full), Ok(vec![4]));
+    assert_eq!(remap_slopes(&slope, reduced), Ok(vec![2]));
+    assert_eq!(lo.col_names[reduced[2]], "x");
+    assert_eq!(
+        remap_slopes(&slope, &sets[2].1),
+        Err(ReducedDesignError::SlopeTouched)
+    );
+}
+
+/// Gate 1, Type II sets by hand: on `y ~ g * h + x` car's marginality tests
+/// `g` and `h` in `g + h + x` (their relative `g:h` left out), and `x` and
+/// `g:h` in the full model; an aliased column leaves every set.
+#[test]
+fn type2_lr_sets_follow_car_marginality() {
+    let lo = lowered(&anova_entry(CAR_BERN[0]));
+    assert_eq!(
+        lo.col_names,
+        ["(Intercept)", "gb", "gc", "hq", "x", "gb:hq", "gc:hq"]
+    );
+    let all: Vec<usize> = (0..lo.p).collect();
+    let want: Vec<(Vec<usize>, Vec<usize>)> = vec![
+        (vec![0, 1, 2, 3, 4], vec![0, 3, 4]),
+        (vec![0, 1, 2, 3, 4], vec![0, 1, 2, 4]),
+        (vec![0, 1, 2, 3, 4, 5, 6], vec![0, 1, 2, 3, 5, 6]),
+        (vec![0, 1, 2, 3, 4, 5, 6], vec![0, 1, 2, 3, 4]),
+    ];
+    assert_eq!(type2_lr_sets(&lo, &all), want);
+    let retained = [0, 1, 2, 3, 4, 5];
+    let want: Vec<(Vec<usize>, Vec<usize>)> = vec![
+        (vec![0, 1, 2, 3, 4], vec![0, 3, 4]),
+        (vec![0, 1, 2, 3, 4], vec![0, 1, 2, 4]),
+        (vec![0, 1, 2, 3, 4, 5], vec![0, 1, 2, 3, 5]),
+        (vec![0, 1, 2, 3, 4, 5], vec![0, 1, 2, 3, 4]),
+    ];
+    assert_eq!(type2_lr_sets(&lo, &retained), want);
+}
+
+/// Gate 1, Type II sets follow car's containment, not lmerTest's: on
+/// `y ~ x * g` (`x` numeric, `g` a 3-level factor: the `time * group` shape)
+/// `x:g` contains `g` under car's rule, which counts every variable, so `g`
+/// is tested in `x + g` against `x`. Under lmerTest's numeric-aware rule
+/// ([`type2_xtx`]) `x:g` does not contain `g`, which would test `g` in the
+/// full model.
+#[test]
+fn type2_lr_sets_follow_car_containment_on_numeric_time() {
+    let e = anova_entries()
+        .into_iter()
+        .find(|e| e.name == "lmertest_anova_sim_factorial_gx")
+        .expect("the g * x anova entry is registered");
+    let lo = lower("y ~ x * g + (1 | subj)", &table_of(&e), Family::Gaussian).unwrap();
+    assert_eq!(
+        lo.col_names,
+        ["(Intercept)", "x", "gb", "gc", "x:gb", "x:gc"]
+    );
+    let labels: Vec<&str> = lo.terms.iter().map(|t| t.label.as_str()).collect();
+    assert_eq!(labels, ["x", "g", "x:g"]);
+    let all: Vec<usize> = (0..lo.p).collect();
+    let want: Vec<(Vec<usize>, Vec<usize>)> = vec![
+        (vec![0, 1, 2, 3], vec![0, 2, 3]),
+        (vec![0, 1, 2, 3], vec![0, 1]),
+        (vec![0, 1, 2, 3, 4, 5], vec![0, 1, 2, 3]),
+    ];
+    assert_eq!(type2_lr_sets(&lo, &all), want);
 }

@@ -21,7 +21,7 @@ NULL
 #'
 #' @usage NULL
 #' @keywords internal
-fastglmm_fit <- function(formula, numeric, factor_levels, factor_codes, family, link, wald_se, nagq, dispersion, weights, offset, start_beta, start_theta, start_dispersion, satterthwaite, reml) .Call(wrap__fastglmm_fit, formula, numeric, factor_levels, factor_codes, family, link, wald_se, nagq, dispersion, weights, offset, start_beta, start_theta, start_dispersion, satterthwaite, reml)
+fastglmm_fit <- function(formula, numeric, factor_levels, factor_codes, family, link, wald_se, nagq, dispersion, weights, offset, start_beta, start_theta, start_dispersion, satterthwaite, reml, anova_test) .Call(wrap__fastglmm_fit, formula, numeric, factor_levels, factor_codes, family, link, wald_se, nagq, dispersion, weights, offset, start_beta, start_theta, start_dispersion, satterthwaite, reml, anova_test)
 
 #' `glmm::orchestrate::confint` for `confint.fastglmm`: the lower and upper
 #' bounds per coefficient, the t quantile on a finite df and the normal one
@@ -68,5 +68,14 @@ fastglmm_compare <- function(f0, f1, numeric, factor_levels, factor_codes, famil
 #' @usage NULL
 #' @keywords internal
 fastglmm_anova_pair <- function(m0, m1, nsim, seed) .Call(wrap__fastglmm_anova_pair, m0, m1, nsim, seed)
+
+#' The refusal of `anova(m, test = "Wald")` or `test = "LRT"` on a fit
+#' whose per-term rows are F tests, in the crate's words, so both ports say
+#' the same. `satterthwaite` is TRUE when the F rows' denominator df are
+#' Satterthwaite's (a mixed model), FALSE for the residual df.
+#'
+#' @usage NULL
+#' @keywords internal
+fastglmm_term_test_refusal <- function(test, satterthwaite) .Call(wrap__fastglmm_term_test_refusal, test, satterthwaite)
 
 # nolint end

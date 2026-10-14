@@ -10,7 +10,9 @@
 # --ports-only applies): round-off, diagnostic at 0, never widened. A value is
 # a number or one of the strings "NaN", "Inf", "-Inf"; two non-finite cells
 # agree only when they are the same of the three, and a number against a
-# non-finite value does not. The gate fails on:
+# non-finite value does not. A text cell (a `text` in place of the `value`:
+# a per-term table's heading with its notes, and the fit's term_test_auto
+# tags) agrees only when the texts are identical. The gate fails on:
 #   - a front end whose calls are not exactly EXPECTED_CALLS (a call missing
 #     from all three, or one all three added, fails too);
 #   - a refused call (one `error` cell) outside EXPECTED_REFUSED, and a call in
@@ -18,14 +20,24 @@
 #   - a cell one front end wrote and another did not (a missing cell);
 #   - a cell written twice by one front end;
 #   - a value that is neither a number nor "NaN", "Inf", "-Inf";
-#   - a value past the band;
+#   - a per-term table (a `terms:` call not refused) without its three text
+#     cells: [heading | text], [term_test_auto | test], [term_test_auto |
+#     reason];
+#   - a value past the band, or two texts that differ;
 #   - a table whose column names, or row names, differ in name or order between
 #     any two front ends (both ports give R's column names, and the Rust front
 #     end lays its tables out the same way).
 #
-# Not compared here: the exact test's `nsim` and `seed` and the heading's model
-# order; the per-port tests pin them (python/tests/test_anova.py,
-# r/tests/testthat/test-anova.R).
+# Not compared here: the exact test's `nsim` and `seed`, a comparison's
+# heading (its model order among others), and the refusal messages, whose
+# differences between the ports are allowed: the message for `test = "LRT"`
+# on a fit that stored no likelihood-ratio table, and for `test = "auto"` on
+# a Poisson GLMM fitted with `anova_test = "Wald"`, differ only in each
+# port's call syntax; `test` with two fits and a bad `test` value follow
+# each port's messages for `type` (two fits: an R error, a Python
+# `TypeError`; a bad value: R's `match.arg`, a Python `ValueError`). The
+# per-port tests pin them
+# (python/tests/test_anova.py, r/tests/testthat/test-anova.R).
 #
 # Base R and jsonlite only: the CI port-gate job installs no statistics
 # package.
@@ -57,9 +69,24 @@ TERM_LABELS <- c("lmer_sim_factorial", "lm_sim_factorial", "glmer_sim_factorial_
 EXPECTED_CALLS <- c(
   paste0(c("compare:", "anova:"), rep(PAIR_NAMES, each = 2L)),
   paste0("terms:", rep(TERM_LABELS, each = 2L), c(":III", ":II")),
+  # test = "LRT" on fits made with anova_test = "LRT": the likelihood-ratio
+  # tables of a binomial GLMM, a binomial GLM and a binomial GLMM with trials.
+  paste0("terms:", rep(c("glmer_sim_factorial_bern", "glm_sim_factorial_bern", "glmer_cbpp"),
+                       each = 2L), c(":III:LRT", ":II:LRT")),
+  # test = "LRT" on a binomial GLMM whose random slope is a fixed term: that
+  # row keeps its Wald test with the crate's note, so the heading cell
+  # compares a note.
+  "terms:glmer_sim_binomial_slope1:III:LRT",
+  # anova(m) at test = "auto" on a Poisson GLMM: the likelihood-ratio table;
+  # at an explicit "Wald": the Wald table.
+  "terms:glmer_poisson_grouseticks:III:auto", "terms:glmer_poisson_grouseticks:III:Wald",
+  # test = "auto" on a negative binomial and a Gamma GLMM: Wald, each with its
+  # reason in the heading (the TERM_LABELS tables carry the binomial GLMM's
+  # and the GLM's).
+  "terms:glmer_nb_sim_nb:III:auto", "terms:glmer_gamma_sim_gamma:III:auto",
   "compare:missing_x2_wls_basic", "compare:missing_x2_wls_basic:nobs",
   "compare:rlrt_dyestuff", "anova:rlrt_dyestuff")
-stopifnot(length(EXPECTED_CALLS) == 48L, !anyDuplicated(EXPECTED_CALLS))
+stopifnot(length(EXPECTED_CALLS) == 59L, !anyDuplicated(EXPECTED_CALLS))
 
 # The non-finite cells (NaN, Inf, -Inf) each front end writes over EXPECTED_CALLS:
 # row 0's test columns of every compare/anova pair table, the Df column of the
@@ -76,7 +103,7 @@ EXPECTED_REFUSED <- c("compare:anova_ml_pair_sleepstudy_fixed",
                       "anova:anova_ml_pair_sleepstudy_fixed")
 
 read_cells <- function(path) {
-  lines <- readLines(path, warn = FALSE)
+  lines <- readLines(path, warn = FALSE, encoding = "UTF-8")
   lines <- lines[nzchar(trimws(lines))]
   if (!length(lines)) stop(sprintf("%s: no cells", path), call. = FALSE)
   recs <- lapply(lines, jsonlite::fromJSON)
@@ -88,9 +115,13 @@ read_cells <- function(path) {
       if (is.character(v) && length(v) == 1L && v %in% c("NaN", "Inf", "-Inf")) as.double(v) else
         NA_real_
   }, 0)
+  text <- vapply(recs, function(r) {
+    t <- r$text
+    if (is.character(t) && length(t) == 1L) enc2utf8(t) else NA_character_
+  }, "")
   d <- data.frame(call = field("call", as.character), row = field("row", as.character),
                   col = field("col", as.character), row_index = field("row_index", as.integer),
-                  col_index = field("col_index", as.integer), value = value,
+                  col_index = field("col_index", as.integer), value = value, text = text,
                   stringsAsFactors = FALSE)
   d$key <- paste(d$call, d$row, d$col, sep = " | ")
   d
@@ -117,7 +148,14 @@ for (name in names(fronts)) {
     fail(paste("%s no longer refuses %s: if it now fits, take it out of EXPECTED_REFUSED",
                "together with REFUSED_PAIRS in tests/inference_oracle.rs"), name, k)
   }
-  for (k in d$key[is.na(d$value) & !is.nan(d$value)]) {
+  for (k in setdiff(unique(d$call[startsWith(d$call, "terms:")]), refused)) {
+    for (cell in c("heading | text", "term_test_auto | test", "term_test_auto | reason")) {
+      if (!paste(k, cell, sep = " | ") %in% d$key[!is.na(d$text)]) {
+        fail("%s wrote no text cell [%s | %s]", name, k, cell)
+      }
+    }
+  }
+  for (k in d$key[is.na(d$value) & !is.nan(d$value) & is.na(d$text)]) {
     fail("%s wrote the cell [%s] with a value that is not a number, \"NaN\", \"Inf\" or \"-Inf\"",
          name, k)
   }
@@ -158,28 +196,41 @@ for (call in shared_calls) {
 }
 
 # Values, cell by cell; per call the largest relative difference of each
-# comparison.
+# comparison (0 for two identical texts, Inf for two that differ).
 common <- Reduce(intersect, lapply(fronts, `[[`, "key"))
 vals <- lapply(fronts, function(d) d$value[match(common, d$key)])
+texts <- lapply(fronts, function(d) d$text[match(common, d$key)])
 calls <- fronts$Rust$call[match(common, fronts$Rust$key)]
-diff_of <- function(a, b) {
+is_text <- Reduce(`|`, lapply(texts, Negate(is.na)))
+diff_of <- function(p) {
+  a <- vals[[p[1]]]
+  b <- vals[[p[2]]]
   vapply(seq_along(a), function(i) {
+    if (is_text[i]) return(if (identical(texts[[p[1]]][i], texts[[p[2]]][i])) 0 else Inf)
     x <- a[i]
     y <- b[i]
     if (is.finite(x) && is.finite(y)) port_rel_max(x, y) else
       if ((is.nan(x) && is.nan(y)) || (is.infinite(x) && identical(x, y))) 0 else Inf
   }, 0)
 }
-diffs <- lapply(pairs, function(p) diff_of(vals[[p[1]]], vals[[p[2]]]))
+diffs <- lapply(pairs, diff_of)
 names(diffs) <- vapply(pairs, paste, "", collapse = "-")
 
+shown <- function(side, i) {
+  if (is_text[i]) encodeString(texts[[side]][i], quote = '"') else
+    format(vals[[side]][i], digits = 17)
+}
 for (p in names(diffs)) {
   bad <- which(diffs[[p]] > band)
   for (i in bad) {
     sides <- strsplit(p, "-", fixed = TRUE)[[1]]
-    fail("%s, cell [%s]: %s %s, %s %s (rel %.3g, band %.0e)", p, common[i],
-         sides[1], format(vals[[sides[1]]][i], digits = 17),
-         sides[2], format(vals[[sides[2]]][i], digits = 17), diffs[[p]][i], band)
+    if (is_text[i]) {
+      fail("%s, cell [%s]: the texts differ: %s %s, %s %s", p, common[i],
+           sides[1], shown(sides[1], i), sides[2], shown(sides[2], i))
+    } else {
+      fail("%s, cell [%s]: %s %s, %s %s (rel %.3g, band %.0e)", p, common[i],
+           sides[1], shown(sides[1], i), sides[2], shown(sides[2], i), diffs[[p]][i], band)
+    }
   }
 }
 
@@ -196,9 +247,10 @@ for (call in unique(calls)) {
 }
 cat(sprintf("expected refusals (each front end checked above): %s\n",
             paste(EXPECTED_REFUSED, collapse = ", ")))
-cat(sprintf("compared: %d cells in %d calls (expected %d); cells per front end: Rust %d, Python %d, R %d\n",
-            length(common), length(unique(calls)), length(EXPECTED_CALLS), nrow(fronts$Rust),
-            nrow(fronts$Python), nrow(fronts$R)))
+cat(sprintf(paste("compared: %d cells (%d of them text) in %d calls (expected %d);",
+                  "cells per front end: Rust %d, Python %d, R %d\n"),
+            length(common), sum(is_text), length(unique(calls)), length(EXPECTED_CALLS),
+            nrow(fronts$Rust), nrow(fronts$Python), nrow(fronts$R)))
 if (any_fail) {
   cat("anova port gate: FAIL\n")
   quit(status = 1L)

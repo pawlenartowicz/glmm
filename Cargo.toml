@@ -107,6 +107,10 @@ faer = { version = "0.24", default-features = false, features = ["std", "sparse-
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
 dhat       = "0.3"
+# The Monte Carlo tier's inverse links: `libm::exp` gives the same last bit on
+# every platform, where `f64::exp` follows the platform's libm. Adds no
+# package: `commonstats` already brings `libm` into the lockfile.
+libm       = "0.2.16"
 
 # ───────────────────────── standalone workspace root ─────────────────────────
 # glmm was carved out of the mcpower workspace (Stage 2). It is now its own

@@ -19,11 +19,13 @@ dir.create(OUT, FALSE, TRUE)
 ACC_SKIP_AGQ <- nzchar(Sys.getenv("ACC_SKIP_AGQ", ""))
 GLMM_BLOWUP <- 20
 
+# anova_test = "Wald": `secs` times the fit, not the likelihood-ratio refits
+# "auto" stores for a Poisson GLMM.
 fit_rep <- function(cell, nAGQ) function(df, i) {
   est <- NA_EST; good <- FALSE; err <- TRUE; secs <- NA_real_; sing <- NA
   tm <- system.time(fit <- tryCatch(suppressWarnings(
     fastglmm(cell_formula(cell$slope), data = df, family = cell_family(cell$family),
-             nAGQ = nAGQ)), error = function(e) e))["elapsed"]
+             nAGQ = nAGQ, anova_test = "Wald")), error = function(e) e))["elapsed"]
   if (!inherits(fit, "error")) {
     err <- FALSE; secs <- tm; sing <- isTRUE(fit$singular)
     vc <- fastglmm::VarCorr(fit)$id; sd <- attr(vc, "stddev"); cr <- attr(vc, "correlation")

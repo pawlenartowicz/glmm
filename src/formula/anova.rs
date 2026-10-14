@@ -42,9 +42,13 @@
 //! likelihood-ratio pair, with one note naming the cause.
 //!
 //! **The per-term tests of one fit.** [`term_tests`] tests each fixed term of
-//! one fit from that fit alone, with no refit: Type III by default, Type II
-//! on request, an F row or a Wald χ² row by family. Its table has no
-//! random-effect rows: random effects are tested by comparing two models.
+//! one fit: Type III by default, Type II on request. An F row or a Wald χ²
+//! row, by family, is read off the fit alone, with no refit; on a fit whose
+//! rows are χ² tests, [`TermTest::Lrt`] asks for likelihood-ratio rows
+//! instead, each refitting the model under its term's hypothesis, and the
+//! default [`TermTest::Auto`] gives them to a Poisson model with random
+//! effects. Its table has no random-effect rows: random effects are tested
+//! by comparing two models.
 //!
 //! The public items of this module are outside the crate's semver promise
 //! until the 1.0 surface review: their names and signatures may change in any
@@ -53,8 +57,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use faer::Mat;
+
 use super::hypotheses::{
-    check_marginal, missing_cells_note, type2_vcov, type2_xtx, type3, TermHypothesis,
+    check_marginal, missing_cells_note, remap_slopes, type2_lr_sets, type2_vcov, type2_xtx, type3,
+    type3_null_basis, type3_unrounded, untouched_columns, ReducedDesignError, TermHypothesis,
 };
 use super::parse::{parse, ParsedFormula, RandomEffect};
 use super::{fixed_part_relation, FixedPartRelation, FixedTerm, Lowered, ParseError};
@@ -68,7 +75,8 @@ use crate::inference::{
     DenDf, LinearKind, LinearNote, LinearTest, LrNote, LrTest, Objective, Reference,
 };
 use crate::{
-    BinomialLink, Family, Fit, GammaLink, InverseGaussianLink, NegBinomialLink, PoissonLink,
+    fit_warm, BinomialLink, ColumnId, Family, Fit, GammaLink, InverseGaussianLink, NegBinomialLink,
+    PoissonLink, StartValues, WaldSe,
 };
 
 /// One of the two sides of a comparison, as given: `First` is `m0`, the first
@@ -511,7 +519,35 @@ pub(crate) fn linear_note_line(note: LinearNote, names: &[String]) -> String {
         LinearNote::NoDf { reason } => {
             format!("No denominator df ({reason}), so the hypothesis was not tested.")
         }
+        LinearNote::ReducedNotConverged => "The model refitted for this term's \
+             likelihood-ratio test did not converge, so the statistic and its p-value are NaN."
+            .into(),
+        LinearNote::RandomSlopeColumn => "Likelihood-ratio test not available: the term's \
+             column carries a random slope, so the row is the Wald chi-squared test."
+            .into(),
+        LinearNote::NegativeStatistic => "The model refitted under the term's hypothesis \
+             reached a higher log-likelihood than the larger model, by more than round-off, so \
+             the statistic is set to 0: the larger model's fit did not reach its optimum; refit \
+             it."
+        .into(),
     }
+}
+
+/// The table note of a likelihood-ratio table on a fit that did not
+/// converge.
+pub(super) fn lrt_not_converged_note() -> String {
+    "The fit did not converge, so no model was refitted and the likelihood-ratio statistics \
+     are NaN."
+        .into()
+}
+
+/// The table note of a likelihood-ratio row whose reduced design could not
+/// be built: the null basis of the term's hypothesis failed its check.
+pub(super) fn lrt_no_basis_note(term: &str) -> String {
+    format!(
+        "The model under the hypothesis of {term} could not be built (the hypothesis is too \
+         ill-conditioned), so its likelihood-ratio statistic is NaN."
+    )
 }
 
 /// Why two models cannot be compared. Each message says what is wrong and
@@ -847,12 +883,7 @@ fn case(
             None => notes.push(LrNote::NoWaldF),
         }
     }
-    let nodes = |o: Objective| match o {
-        Objective::Laplace => Some(1),
-        Objective::Agq { nodes } => Some(nodes),
-        _ => None,
-    };
-    if let (Some(k0), Some(k1)) = (nodes(a.objective), nodes(b.objective)) {
+    if let (Some(k0), Some(k1)) = (quadrature_nodes(a.objective), quadrature_nodes(b.objective)) {
         if k0 != k1 {
             notes.push(LrNote::NodeCounts { m0: k0, m1: k1 });
         }
@@ -1089,6 +1120,28 @@ pub enum SsType {
     Type3,
 }
 
+/// Which test the rows of a per-term table run on a fit whose rows are χ²
+/// tests: binomial, Poisson and negative binomial fits, a dispersion GLM
+/// with φ held, every GLMM. A fit whose rows are F tests (OLS, the Gaussian
+/// LMM, a Gamma or inverse Gaussian GLM with φ estimated) has only its F
+/// rows: it takes `Auto` and refuses the other two
+/// ([`TermTestError::FTable`]).
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TermTest {
+    /// The default: the F rows on a fit that has them, the likelihood-ratio
+    /// χ² on a Poisson model with random effects (whatever its number of
+    /// clusters, groupings or term df), and the Wald χ² on every other
+    /// fit. [`TermTable::choice`] says which ran and why ([`ChoiceReason`]).
+    #[default]
+    Auto,
+    /// The Wald χ² of each term's hypothesis, on the fit's covariance of β̂.
+    Wald,
+    /// The likelihood-ratio χ² of each term's hypothesis, from a refit of
+    /// the model under it.
+    Lrt,
+}
+
 /// The options of [`term_tests`]. Start from `TermTestOptions::default()` and
 /// set the fields.
 #[non_exhaustive]
@@ -1096,6 +1149,54 @@ pub enum SsType {
 pub struct TermTestOptions {
     /// Which hypotheses the rows test; Type III by default.
     pub ss_type: SsType,
+    /// Which test the rows run on a fit whose rows are χ² tests;
+    /// [`TermTest::Auto`] by default.
+    pub test: TermTest,
+}
+
+/// The test a per-term table ran, and why ([`TermTable::choice`]).
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TestChoice {
+    /// The rows' test: [`LinearKind::F`], the Wald χ²
+    /// ([`LinearKind::ChiSquared`]) or the likelihood-ratio χ²
+    /// ([`LinearKind::LikelihoodRatio`]). On a likelihood-ratio table, a row
+    /// whose term carries a random slope is the Wald χ² with
+    /// [`LinearNote::RandomSlopeColumn`].
+    pub test: LinearKind,
+    /// Why the table runs `test`.
+    pub reason: ChoiceReason,
+}
+
+/// Why a per-term table runs its test ([`TestChoice`]).
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ChoiceReason {
+    /// The options asked for it ([`TermTest::Wald`] or [`TermTest::Lrt`]).
+    Requested,
+    /// [`TermTest::Auto`] on a fit whose rows are F tests: the F is the only
+    /// test its table has.
+    FTest,
+    /// [`TermTest::Auto`] on a Poisson model with random effects: the
+    /// likelihood-ratio χ². In the Monte Carlo calibration of the per-term
+    /// tests (both tests on the same simulated datasets), the Wald χ² of a
+    /// Poisson GLMM was never closer to the nominal level than the
+    /// likelihood-ratio χ², and rejected a between-cluster term too often at
+    /// few clusters.
+    PoissonMixed,
+    /// [`TermTest::Auto`] on a binomial model with random effects (Bernoulli
+    /// or with trials): the Wald χ². The same calibration found neither test
+    /// closer to the nominal level across binomial GLMM designs.
+    BinomialMixed,
+    /// [`TermTest::Auto`] on a negative binomial model with random effects:
+    /// the Wald χ².
+    NegativeBinomialMixed,
+    /// [`TermTest::Auto`] on a model with random effects of any other family
+    /// whose rows are χ² tests (a Gamma GLMM): the Wald χ².
+    OtherMixed,
+    /// [`TermTest::Auto`] on a model with no random effects whose rows are χ²
+    /// tests: the Wald χ².
+    NoRandomEffects,
 }
 
 /// One fixed term's row of a [`TermTable`].
@@ -1104,13 +1205,13 @@ pub struct TermTestOptions {
 pub struct FixedRow {
     /// The term's label, as R writes it (`"g:h"`).
     pub label: String,
-    /// The term's test: an F test, or a Wald χ² ([`term_tests`] says which
-    /// fits get which).
+    /// The term's test: an F test, a Wald χ² or a likelihood-ratio χ²
+    /// ([`term_tests`] says which fits get which).
     pub test: LinearTest,
     /// lmerTest's `Sum Sq`, `F·σ̂²·num_df` with `σ̂²` the fit's
-    /// [`Fit::dispersion`], on an F row; `None` on a Wald χ² row.
+    /// [`Fit::dispersion`], on an F row; `None` on a χ² row.
     pub sum_sq: Option<f64>,
-    /// lmerTest's `Mean Sq`, `F·σ̂²`, on an F row; `None` on a Wald χ² row.
+    /// lmerTest's `Mean Sq`, `F·σ̂²`, on an F row; `None` on a χ² row.
     pub mean_sq: Option<f64>,
 }
 
@@ -1120,6 +1221,8 @@ pub struct FixedRow {
 pub struct TermTable {
     /// Which hypotheses the rows test.
     pub ss_type: SsType,
+    /// The test the rows run and why ([`TermTestOptions::test`]).
+    pub choice: TestChoice,
     /// One row per fixed term, in R's term order; no intercept row and no
     /// random-effect rows.
     pub fixed: Vec<FixedRow>,
@@ -1139,21 +1242,98 @@ pub enum TermTestError {
     /// rows would test hypotheses that depend on the coding. The message
     /// names each missing term.
     NotMarginal(String),
+    /// [`TermTest::Wald`] or [`TermTest::Lrt`] asked of a fit whose rows are
+    /// F tests, whose table has only its F rows. The message names the F
+    /// test.
+    FTable {
+        /// The test asked for.
+        asked: TermTest,
+        /// Where the F rows' denominator df come from.
+        den_df: DenDf,
+    },
+    /// Likelihood-ratio rows asked of a fit made at another quadrature node
+    /// count than `lowered.opts.nagq`, the count the rows' refits use, so
+    /// each row would compare two approximations of the likelihood.
+    RefitNodeCount {
+        /// The fit's node count (1, the Laplace approximation).
+        fit: u8,
+        /// The node count of the refits, `lowered.opts.nagq`.
+        refits: u8,
+    },
 }
 
 impl fmt::Display for TermTestError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             TermTestError::NotMarginal(message) => f.write_str(message),
+            TermTestError::FTable { asked, den_df } => {
+                let default = ", so leave the test at its default";
+                let (asked, advice) = match asked {
+                    TermTest::Wald => ("Wald chi-squared", default),
+                    TermTest::Lrt => ("likelihood-ratio", default),
+                    TermTest::Auto => ("chi-squared", ""),
+                };
+                let den_df = match den_df {
+                    DenDf::Satterthwaite => "Satterthwaite's",
+                    DenDf::Residual => "the residual",
+                };
+                write!(
+                    f,
+                    "per-term tests on this fit are F tests with {den_df} denominator df; \
+                     {asked} rows are not available{advice}"
+                )
+            }
+            TermTestError::RefitNodeCount { fit, refits } => write!(
+                f,
+                "the fit used {fit} quadrature nodes and the refits of its likelihood-ratio \
+                 rows would use {refits} (1 is the Laplace approximation), so each row would \
+                 compare two approximations of the likelihood; fit the model with {refits} \
+                 nodes, or ask for the Wald test"
+            ),
         }
     }
 }
 
 impl std::error::Error for TermTestError {}
 
-/// The per-term tests of `fit`, the fit of `lowered`: one row per fixed term
-/// of [`Lowered::terms`], in that order (R's), each the test of the term's
-/// hypothesis set of `opts.ss_type`, read off the one fit with no refit.
+/// The quadrature node count of a GLMM objective (1, the Laplace
+/// approximation); `None` for every other objective.
+fn quadrature_nodes(objective: Objective) -> Option<u8> {
+    match objective {
+        Objective::Laplace => Some(1),
+        Objective::Agq { nodes } => Some(nodes),
+        _ => None,
+    }
+}
+
+/// The test [`TermTest::Auto`] runs on `fit`, the fit of `lowered`, and why:
+/// one choice for the whole table, from whether the fit's rows are F tests,
+/// its family and whether it has random effects, never from its size.
+pub(crate) fn auto_choice(lowered: &Lowered, fit: &Fit) -> TestChoice {
+    // F rows on exactly the fits that keep a record for `contrast_f`, as in
+    // `term_tests_cached`.
+    let (test, reason) = if fit.satterthwaite.is_some() {
+        (LinearKind::F, ChoiceReason::FTest)
+    } else if lowered.model.re.is_none() {
+        (LinearKind::ChiSquared, ChoiceReason::NoRandomEffects)
+    } else {
+        match lowered.model.family {
+            Family::Poisson { .. } => (LinearKind::LikelihoodRatio, ChoiceReason::PoissonMixed),
+            Family::Binomial { .. } => (LinearKind::ChiSquared, ChoiceReason::BinomialMixed),
+            Family::NegativeBinomial { .. } => {
+                (LinearKind::ChiSquared, ChoiceReason::NegativeBinomialMixed)
+            }
+            _ => (LinearKind::ChiSquared, ChoiceReason::OtherMixed),
+        }
+    };
+    TestChoice { test, reason }
+}
+
+/// The per-term tests of `fit`, the fit of `lowered` made with
+/// `lowered.opts`: one row per fixed term of [`Lowered::terms`], in that
+/// order (R's), each the test of the term's hypothesis set of
+/// `opts.ss_type`, read off the one fit (a likelihood-ratio row also refits
+/// the model under its hypothesis).
 ///
 /// Which fits get which row is read from the fit (the residual or
 /// Satterthwaite record it keeps for [`Fit::contrast_f`]), never from
@@ -1167,7 +1347,35 @@ impl std::error::Error for TermTestError {}
 ///   with [`LinearNote::NoDf`] and the reason, never a z test.
 /// - Every other fit (binomial, Poisson and negative binomial, a dispersion
 ///   GLM with φ held, every GLMM) gets the Wald χ² of `L β = 0` on
-///   [`Fit::vcov`].
+///   [`Fit::vcov`] under [`TermTest::Wald`], and the likelihood-ratio χ²
+///   under [`TermTest::Lrt`]. Under [`TermTest::Auto`] (the default) a
+///   Poisson model with random effects gets the likelihood-ratio χ² and
+///   every other fit the Wald χ² ([`ChoiceReason`]).
+///
+/// [`TermTable::choice`] records the test run and why. A fit with F rows
+/// takes only [`TermTest::Auto`].
+///
+/// A likelihood-ratio row refits the model under the term's hypothesis with
+/// [`fit_warm`], from the fit's β̂, θ̂ and estimated dispersion, by
+/// `lowered.opts` (node count, weights, offset, held dispersion; a negative
+/// binomial θ is re-estimated). These rows therefore need `fit` made with
+/// `lowered.opts`: a fit made at another node count is refused
+/// ([`TermTestError::RefitNodeCount`]), and weights, an offset or a held
+/// dispersion cannot be read back from a [`Fit`], so a caller that fits with
+/// other ones gets rows that compare two different likelihoods. The Wald and
+/// F rows read the fit alone. Type III fits the reduced design
+/// `X·N`, `N` an orthonormal basis of the null space of the term's `L` (the
+/// hypothesis its Wald row tests); Type II, car's `Anova(type = 2,
+/// test.statistic = "LR")`, fits two column subsets of the design, the model
+/// of every term that does not contain the term with and without it, each
+/// distinct subset once. The statistic `2(ℓ₁ − ℓ₀)`, floored at 0, is
+/// referred to χ² on the term's rank; a raw value below zero by more than
+/// round-off takes [`LinearNote::NegativeStatistic`]. A refit that does not
+/// converge gives a NaN row with [`LinearNote::ReducedNotConverged`]; a term
+/// whose reduced design would leave out or mix a column carrying a random
+/// slope gets its Wald row with [`LinearNote::RandomSlopeColumn`]; on a fit
+/// that did not converge every row is NaN, nothing is refitted, and a table
+/// note says why.
 ///
 /// A term with no hypothesis row (its columns aliased) gets a NaN row with
 /// [`LinearNote::AliasedColumn`] for each of its aliased columns, in its
@@ -1177,11 +1385,38 @@ impl std::error::Error for TermTestError {}
 ///
 /// # Errors
 /// [`TermTestError::NotMarginal`] when an interaction of the formula lacks
-/// one of its marginal terms (`y ~ x + x:g` lacks `g`).
+/// one of its marginal terms (`y ~ x + x:g` lacks `g`),
+/// [`TermTestError::FTable`] when `opts.test` is [`TermTest::Wald`] or
+/// [`TermTest::Lrt`] on a fit with F rows, and
+/// [`TermTestError::RefitNodeCount`] when the rows are likelihood-ratio rows
+/// ([`TermTest::Lrt`], or [`TermTest::Auto`] on a Poisson model with random
+/// effects) and the fit's quadrature node count is not `lowered.opts.nagq`.
 pub fn term_tests(
     lowered: &Lowered,
     fit: &Fit,
     opts: &TermTestOptions,
+) -> Result<TermTable, TermTestError> {
+    term_tests_cached(lowered, fit, opts, &mut RefitCache::default())
+}
+
+/// Refits of column subsets of one fit's design, each keyed by its subset
+/// (caller columns of [`Lowered::x`], ascending), so the likelihood-ratio
+/// tables of one fit fit each subset once between them
+/// ([`term_tests_cached`]). A cache belongs to the `(lowered, fit)` pair it
+/// was filled for.
+#[derive(Default)]
+pub(crate) struct RefitCache(Vec<(Vec<usize>, Fit)>);
+
+/// [`term_tests`], with the likelihood-ratio rows' refits of column subsets
+/// kept in `cache`: a caller that builds both types' likelihood-ratio tables
+/// of one fit passes one cache to both, and a Type III hypothesis that drops
+/// columns reads the Type II design with the same columns, built and fitted
+/// the same way. The rows are those of [`term_tests`] bit for bit.
+pub(crate) fn term_tests_cached(
+    lowered: &Lowered,
+    fit: &Fit,
+    opts: &TermTestOptions,
+    cache: &mut RefitCache,
 ) -> Result<TermTable, TermTestError> {
     check_marginal(lowered).map_err(TermTestError::NotMarginal)?;
     let mixed = lowered.model.re.is_some();
@@ -1193,17 +1428,61 @@ pub fn term_tests(
     } else {
         DenDf::Residual
     };
+    let choice = match (opts.test, f_rows) {
+        (TermTest::Auto, _) => auto_choice(lowered, fit),
+        (asked, true) => {
+            return Err(TermTestError::FTable {
+                asked,
+                den_df: den_df_kind,
+            })
+        }
+        (TermTest::Wald, false) => TestChoice {
+            test: LinearKind::ChiSquared,
+            reason: ChoiceReason::Requested,
+        },
+        (TermTest::Lrt, false) => TestChoice {
+            test: LinearKind::LikelihoodRatio,
+            reason: ChoiceReason::Requested,
+        },
+    };
+    // The likelihood-ratio rows refit by `lowered.opts`: a fit made at another
+    // node count would be compared with refits of another approximation.
+    if choice.test == LinearKind::LikelihoodRatio {
+        if let Some(nodes) = quadrature_nodes(fit.objective) {
+            if nodes != lowered.opts.nagq {
+                return Err(TermTestError::RefitNodeCount {
+                    fit: nodes,
+                    refits: lowered.opts.nagq,
+                });
+            }
+        }
+    }
     let retained: Vec<usize> = (0..lowered.p).filter(|&j| !fit.aliased()[j]).collect();
     let hypotheses = match opts.ss_type {
         SsType::Type3 => type3(lowered, &retained),
         SsType::Type2 if gaussian && mixed => type2_xtx(lowered, &retained),
         SsType::Type2 => type2_vcov(lowered, &retained, &fit.vcov),
     };
+    let mut notes: Vec<String> = match opts.ss_type {
+        SsType::Type3 => missing_cells_note(lowered).into_iter().collect(),
+        SsType::Type2 => Vec::new(),
+    };
+    let tests: Vec<LinearTest> = if choice.test == LinearKind::LikelihoodRatio {
+        let (tests, lrt_notes) =
+            lrt_rows(lowered, fit, &retained, opts.ss_type, &hypotheses, cache);
+        notes.extend(lrt_notes);
+        tests
+    } else {
+        hypotheses
+            .iter()
+            .zip(&lowered.terms)
+            .map(|(h, term)| term_test(fit, h, term, f_rows, den_df_kind))
+            .collect()
+    };
     let fixed = hypotheses
         .into_iter()
-        .zip(&lowered.terms)
-        .map(|(h, term)| {
-            let test = term_test(fit, &h, term, f_rows, den_df_kind);
+        .zip(tests)
+        .map(|(h, test)| {
             let ms = f_rows.then_some(test.statistic * fit.dispersion);
             FixedRow {
                 label: h.term,
@@ -1213,16 +1492,380 @@ pub fn term_tests(
             }
         })
         .collect();
-    let notes = match opts.ss_type {
-        SsType::Type3 => missing_cells_note(lowered).into_iter().collect(),
-        SsType::Type2 => Vec::new(),
-    };
     Ok(TermTable {
         ss_type: opts.ss_type,
+        choice,
         fixed,
         notes,
         coef_names: lowered.col_names.clone(),
     })
+}
+
+/// The likelihood-ratio rows of [`term_tests`], one per hypothesis of
+/// `hypotheses` (the Wald rows' sets of `ss_type`, on `retained`), and the
+/// table notes they bring.
+///
+/// Type III refits the model on `X·N`, `N` the null basis of the term's
+/// hypothesis ([`type3_null_basis`], from [`type3`]'s rounded `L` and
+/// [`type3_unrounded`]'s), or, when `N` is all unit columns, on the column
+/// subset it keeps; Type II fits the column subsets of [`type2_lr_sets`],
+/// and reads the column sets only, never the fit's covariance. Each distinct
+/// subset is fitted once per `cache` ([`fit_subset`]), the retained design
+/// itself being `fit`.
+/// A term with no column left to test gets the NaN row of the Wald table with
+/// its aliased-column notes; a Type III hypothesis with a non-finite entry, a
+/// NaN row; a term whose reduced design would leave out or mix a random-slope
+/// column, its Wald row with [`LinearNote::RandomSlopeColumn`]; a basis that
+/// fails its check, a NaN row and the table note [`lrt_no_basis_note`]. A fit
+/// that did not converge gets NaN rows and the table note
+/// [`lrt_not_converged_note`], and nothing is refitted.
+fn lrt_rows(
+    lowered: &Lowered,
+    fit: &Fit,
+    retained: &[usize],
+    ss_type: SsType,
+    hypotheses: &[TermHypothesis],
+    cache: &mut RefitCache,
+) -> (Vec<LinearTest>, Vec<String>) {
+    let wald = |t: usize| {
+        term_test(
+            fit,
+            &hypotheses[t],
+            &lowered.terms[t],
+            false,
+            DenDf::Residual,
+        )
+    };
+    let slope_wald = |t: usize| {
+        let mut row = wald(t);
+        row.notes.push(LinearNote::RandomSlopeColumn);
+        row
+    };
+    // A term with no column left to test: the Wald table's NaN row (its
+    // hypothesis has no row, so no covariance is read), with its notes.
+    let aliased = |t: usize| {
+        let mut row = wald(t);
+        row.kind = LinearKind::LikelihoodRatio;
+        row
+    };
+    if !fit.converged() {
+        let rows = (0..hypotheses.len())
+            .map(|t| {
+                if hypotheses[t].l.nrows() == 0 {
+                    aliased(t)
+                } else {
+                    nan_lrt_row()
+                }
+            })
+            .collect();
+        return (rows, vec![lrt_not_converged_note()]);
+    }
+    let slopes = slope_lists(lowered);
+    match ss_type {
+        SsType::Type3 => {
+            let exact = type3_unrounded(lowered, retained);
+            // The slope columns as positions in `retained`: an aliased one
+            // stays in no reduced design.
+            let on_retained = remap_all(&slopes, retained);
+            let restrict =
+                |m: &Mat<f64>| Mat::from_fn(m.nrows(), retained.len(), |i, a| m[(i, retained[a])]);
+            let mut notes = Vec::new();
+            let rows = (0..hypotheses.len())
+                .map(|t| {
+                    let h = &hypotheses[t];
+                    if h.l.nrows() == 0 {
+                        return aliased(t);
+                    }
+                    if h.l.col_iter().any(|c| c.iter().any(|v| !v.is_finite())) {
+                        return nan_lrt_row();
+                    }
+                    let Some(retained_slopes) = &on_retained else {
+                        return slope_wald(t);
+                    };
+                    let flat: Vec<usize> = retained_slopes
+                        .iter()
+                        .flatten()
+                        .map(|&c| c as usize)
+                        .collect();
+                    let l = restrict(&h.l);
+                    let basis =
+                        match type3_null_basis(l.as_ref(), restrict(&exact[t].l).as_ref(), &flat) {
+                            Ok(basis) => basis,
+                            Err(ReducedDesignError::SlopeTouched) => return slope_wald(t),
+                            Err(ReducedDesignError::NoNullBasis) => {
+                                notes.push(lrt_no_basis_note(&h.term));
+                                return nan_lrt_row();
+                            }
+                        };
+                    let k = basis.ncols();
+                    let kept = untouched_columns(l.as_ref());
+                    if k == kept.len() {
+                        // `N` is the unit columns of `kept`: a column drop,
+                        // fitted as the Type II subset of the same columns.
+                        let set: Vec<usize> = kept.iter().map(|&a| retained[a]).collect();
+                        let set_slopes = remap_all(&slopes, &set)
+                            .expect("the basis keeps every slope column as a unit column");
+                        fit_subset(lowered, fit, retained, &set, &set_slopes, cache);
+                        return lrt_test(
+                            fit,
+                            fitted(&set, retained, fit, cache),
+                            retained.len() - k,
+                        );
+                    }
+                    let moved = remap_all(retained_slopes, &kept)
+                        .expect("the basis keeps every slope column as a unit column");
+                    let reduced = refit_on_basis(lowered, fit, retained, &basis, &moved);
+                    lrt_test(fit, &reduced, retained.len() - k)
+                })
+                .collect();
+            (rows, notes)
+        }
+        SsType::Type2 => {
+            let mut rows = Vec::with_capacity(hypotheses.len());
+            for (t, (full, reduced)) in type2_lr_sets(lowered, retained).iter().enumerate() {
+                if full.len() == reduced.len() {
+                    rows.push(aliased(t));
+                    continue;
+                }
+                let (Some(on_full), Some(on_reduced)) =
+                    (remap_all(&slopes, full), remap_all(&slopes, reduced))
+                else {
+                    rows.push(slope_wald(t));
+                    continue;
+                };
+                fit_subset(lowered, fit, retained, full, &on_full, cache);
+                fit_subset(lowered, fit, retained, reduced, &on_reduced, cache);
+                rows.push(lrt_test(
+                    fitted(full, retained, fit, cache),
+                    fitted(reduced, retained, fit, cache),
+                    full.len() - reduced.len(),
+                ));
+            }
+            (rows, Vec::new())
+        }
+    }
+}
+
+/// Fits the column subset `set` of [`Lowered::x`] (caller columns,
+/// ascending) into `cache`, unless it is there already or is the retained
+/// design, whose fit is `fit`: the design of those columns as they are,
+/// warm-started from their `β̂`, its random slopes on `set_slopes` (positions
+/// in `set`).
+fn fit_subset(
+    lowered: &Lowered,
+    fit: &Fit,
+    retained: &[usize],
+    set: &[usize],
+    set_slopes: &[Vec<ColumnId>],
+    cache: &mut RefitCache,
+) {
+    if set == retained || cache.0.iter().any(|(s, _)| s == set) {
+        return;
+    }
+    let (n, p) = (lowered.n, lowered.p);
+    let x: Vec<f64> = (0..n)
+        .flat_map(|i| set.iter().map(move |&c| lowered.x[i * p + c]))
+        .collect();
+    let beta = set.iter().map(|&c| fit.beta[c]).collect();
+    let refitted = refit(lowered, fit, &x, set.len(), set_slopes, beta);
+    cache.0.push((set.to_vec(), refitted));
+}
+
+/// The fit of the column subset `set`: `fit` itself when `set` is the
+/// retained design, else its refit in `cache` ([`fit_subset`]).
+fn fitted<'a>(set: &[usize], retained: &[usize], fit: &'a Fit, cache: &'a RefitCache) -> &'a Fit {
+    if set == retained {
+        return fit;
+    }
+    &cache
+        .0
+        .iter()
+        .find(|(s, _)| s.as_slice() == set)
+        .expect("every subset is fitted before its row")
+        .1
+}
+
+/// A likelihood-ratio row with no statistic: NaN, with no note.
+fn nan_lrt_row() -> LinearTest {
+    LinearTest {
+        statistic: f64::NAN,
+        kind: LinearKind::LikelihoodRatio,
+        num_df: f64::NAN,
+        reference: Reference::ChiSquared { df: 0 },
+        p_value: f64::NAN,
+        notes: Vec::new(),
+    }
+}
+
+/// The likelihood-ratio row of a term from the fit of the larger model and
+/// that of the smaller (the model under the term's hypothesis), on `df`, the
+/// term's rank: `2(ℓ_larger − ℓ_smaller)` floored at 0 ([`lr_statistic`])
+/// against χ²(`df`), a raw value below zero by more than round-off with
+/// [`LinearNote::NegativeStatistic`]. A fit that did not converge, or whose
+/// log-likelihood is not finite, gives NaN with
+/// [`LinearNote::ReducedNotConverged`]: the caller passes a converged fit of
+/// the user's model, so that fit is a refit.
+pub(super) fn lrt_test(larger: &Fit, smaller: &Fit, df: usize) -> LinearTest {
+    let reference = Reference::ChiSquared { df };
+    let usable = |f: &Fit| f.converged() && f.loglik.is_finite();
+    let (statistic, notes) = if usable(larger) && usable(smaller) {
+        let (statistic, floor) = lr_statistic(smaller.loglik, larger.loglik);
+        let note = floor.is_some().then_some(LinearNote::NegativeStatistic);
+        (statistic, note.into_iter().collect())
+    } else {
+        (f64::NAN, vec![LinearNote::ReducedNotConverged])
+    };
+    LinearTest {
+        statistic,
+        kind: LinearKind::LikelihoodRatio,
+        num_df: df as f64,
+        reference,
+        p_value: lr_p_value(statistic, &reference),
+        notes,
+    }
+}
+
+/// The refit of a Type III likelihood-ratio row on `X·N`: the columns
+/// `retained` of `lowered`'s design times `basis` (`retained.len() × k`,
+/// [`type3_null_basis`]), its random slopes on `slopes` (positions among the
+/// `k` columns), warm-started from `Nᵀβ̂` ([`refit`]).
+pub(super) fn refit_on_basis(
+    lowered: &Lowered,
+    fit: &Fit,
+    retained: &[usize],
+    basis: &Mat<f64>,
+    slopes: &[Vec<ColumnId>],
+) -> Fit {
+    let (n, p, k) = (lowered.n, lowered.p, basis.ncols());
+    let combine = |v: &[f64], j: usize| -> f64 {
+        retained
+            .iter()
+            .enumerate()
+            .map(|(a, &c)| v[c] * basis[(a, j)])
+            .sum()
+    };
+    let x: Vec<f64> = (0..n)
+        .flat_map(|i| {
+            let row = &lowered.x[i * p..(i + 1) * p];
+            (0..k).map(move |j| combine(row, j))
+        })
+        .collect();
+    let beta = (0..k).map(|j| combine(&fit.beta, j)).collect();
+    refit(lowered, fit, &x, k, slopes, beta)
+}
+
+/// A refit of a likelihood-ratio row: `lowered`'s model on the design `x`
+/// (`n × k`, row-major), its random slopes on the columns `slopes`
+/// ([`slope_lists`]'s layout), by `lowered.opts`, the options
+/// [`term_tests`] requires `fit` to be made with (node count, weights,
+/// offset, held dispersion), warm-started from `beta`, the fit's θ̂
+/// ([`theta_start`]) and its estimated dispersion ([`dispersion_start`]),
+/// which the refit estimates again. Its standard errors are not computed.
+fn refit(
+    lowered: &Lowered,
+    fit: &Fit,
+    x: &[f64],
+    k: usize,
+    slopes: &[Vec<ColumnId>],
+    beta: Vec<f64>,
+) -> Fit {
+    let mut model = lowered.model.clone();
+    if let Some(re) = &mut model.re {
+        let mut lists = slopes.iter().cloned();
+        re.slopes = lists.next().expect("one slope list per grouping");
+        for g in &mut re.extra_groupings {
+            g.slopes = lists.next().expect("one slope list per grouping");
+        }
+    }
+    // Only the log-likelihood is read: no SE targets and the Rx covariance,
+    // so a GLMM refit skips the joint Hessian (the optimum does not depend on
+    // the curvature read after it).
+    let mut opts = lowered.opts.clone();
+    opts.target_indices = Vec::new();
+    opts.wald_se = WaldSe::Rx;
+    let start = StartValues {
+        beta,
+        theta: theta_start(fit),
+        dispersion: dispersion_start(lowered, fit),
+    };
+    fit_warm(
+        x,
+        &lowered.y,
+        lowered.n,
+        k,
+        &model,
+        &lowered.ids,
+        Some(&start),
+        &opts,
+    )
+}
+
+/// Every grouping's random-slope columns in `lowered`'s model: the primary
+/// grouping's, then each extra grouping's; none without random effects.
+fn slope_lists(lowered: &Lowered) -> Vec<Vec<ColumnId>> {
+    lowered
+        .model
+        .re
+        .iter()
+        .flat_map(|re| {
+            std::iter::once(re.slopes.clone())
+                .chain(re.extra_groupings.iter().map(|g| g.slopes.clone()))
+        })
+        .collect()
+}
+
+/// [`remap_slopes`] on each list of `slopes`: `None` when a slope column is
+/// not in `kept`.
+fn remap_all(slopes: &[Vec<ColumnId>], kept: &[usize]) -> Option<Vec<Vec<ColumnId>>> {
+    slopes.iter().map(|s| remap_slopes(s, kept).ok()).collect()
+}
+
+/// `fit`'s θ̂ as a warm start ([`StartValues::theta`]): each `varcorr` block
+/// `D̂` (`Λ̂Λ̂ᵀ` on a GLMM, whose σ² is 1) as its lower Cholesky factor,
+/// vech-packed column-major, a pivot at or below `q·ε·tr D̂` (a variance at
+/// zero) leaving its column zero. Empty, a cold start, without random effects
+/// or with a block that is not finite.
+pub(super) fn theta_start(fit: &Fit) -> Vec<f64> {
+    let mut theta = Vec::new();
+    for block in &fit.varcorr {
+        if block.iter().any(|v| !v.is_finite()) {
+            return Vec::new();
+        }
+        let q = vech_q(block.len());
+        // Column-major vech: column `c` holds rows `c..q`.
+        let at = |r: usize, c: usize| block[c * q - c * c.saturating_sub(1) / 2 + r - c];
+        let floor = q as f64 * f64::EPSILON * diagonal(block).sum::<f64>();
+        let mut l = vec![0.0; q * q];
+        for c in 0..q {
+            let pivot = at(c, c) - (0..c).map(|k| l[c * q + k] * l[c * q + k]).sum::<f64>();
+            if pivot <= floor {
+                continue;
+            }
+            let d = pivot.sqrt();
+            l[c * q + c] = d;
+            for r in c + 1..q {
+                let dot: f64 = (0..c).map(|k| l[r * q + k] * l[c * q + k]).sum();
+                l[r * q + c] = (at(r, c) - dot) / d;
+            }
+        }
+        for c in 0..q {
+            theta.extend((c..q).map(|r| l[r * q + c]));
+        }
+    }
+    theta
+}
+
+/// `fit`'s estimated dispersion as a warm start
+/// ([`StartValues::dispersion`]): the negative binomial θ, or the Gamma or
+/// inverse Gaussian φ when the fit estimated it. `None`, a cold start, when
+/// the family has none, φ is held, or the value is not finite and positive.
+fn dispersion_start(lowered: &Lowered, fit: &Fit) -> Option<f64> {
+    let estimated = lowered.opts.dispersion.is_none()
+        && matches!(
+            lowered.model.family,
+            Family::NegativeBinomial { .. } | Family::Gamma { .. } | Family::InverseGaussian { .. }
+        );
+    (estimated && fit.dispersion.is_finite() && fit.dispersion > 0.0).then_some(fit.dispersion)
 }
 
 /// One term's test: the F of [`Fit::contrast_f`] on an F row, labelled

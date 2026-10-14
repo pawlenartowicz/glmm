@@ -88,7 +88,10 @@ A fresh machine reaches the pinned oracle set with `Rscript install_oracles.R`.
 - **Pins** — `grid/versions.json`: `lme4` 2.0-6, `glmmTMB` 1.1.14,
   `GLMMadaptive` 0.9-7, `MixedModels` 5.9.0, `lmerTest` 3.2-1 (also the
   inference generators' pin), R 4.5.3, Julia 1.12.6. A bump reruns that oracle
-  (or `lmertest`) into a new `last/`.
+  (or `lmertest`) into a new `last/`. The inference reference generators also
+  pin `RLRsim` 3.1-9, `car` 3.1-5, `afex` 1.5-1, `numDeriv` 2016.8-1.1,
+  `MASS` 7.3-65 and `jsonlite` 2.0.0; bumping one of these regenerates no
+  frozen reference by itself.
 - **Satterthwaite df** (`compare.R` gate 5): glmm's per-coefficient df against
   `runs/lmertest/last/` on every Gaussian cell with a random effect, at
   `coef_df_rel` in `grid/tol.R`, registry-backed in gate 2's scope with the
@@ -138,10 +141,11 @@ A fresh machine reaches the pinned oracle set with `Rscript install_oracles.R`.
 | `cargo test` (six feature configs) | `goldens/`, `data/empirical/`, `data/simulated/` via `include_str!` | **yes** — every push |
 | `cargo test --test grid_reference` | `grid/manifest.json`, `grid/data/fast/`, `data/`, `grid/runs/glmm/last/` | **yes** — part of the `cargo test` matrix |
 | `port-gate` (Rust vs Python vs R on the `fast` subset) | `grid/manifest.json`, `grid/data/fast/`, `data/`, `grid/compare.R --ports-only` | **yes** — its own job; installs `jsonlite`, no statistics package |
+| Anova port gate (the per-term tables and model comparisons of a fixed call list through Rust, Python and R) | `tools/anova_ports/` (`anova_ports.rs`, `anova_ports.py`, `anova_ports.R`, `compare_anova_ports.R`) | **yes**: a step of the port-gate job, run even when the grid port gate fails |
 | `cargo test --test inference_references` (the inference references' registration) | `manifest.json`, `goldens/inference/`, `data/`, `tools/` | **yes**: every push, part of the `cargo test` matrix |
 | `cargo test --features oracle-tests` (the cross-engine tier) | `goldens/`, `results/lme4_simulated/`, `data/`, `grid/divergences.json` | no — local only |
 | `tests/inference_oracle.rs` and the in-crate inference tests under `oracle-tests` (the inference end-to-end tier) | `goldens/inference/`, `manifest.json`, `data/`, `grid/divergences.json` | no: local only; whether it gets a CI job is decided again from the tier's measured runtime on the release tree |
-| `cargo test --features montecarlo-tests` (seeded Monte Carlo level studies) | its own seeded draws | no: local only; whether it gets a CI leg is decided from the measured runtime of its first study (the level of the exact RLRT), and this row changes with that decision |
+| `cargo test --features montecarlo-tests` (the seeded Monte Carlo studies: the level of the exact RLRT, and `calibration_gates`, the calibration of glmm's tests and intervals against the truth on 216 simulated designs; see [`../documentation/validation.md`](../documentation/validation.md#calibration-against-the-truth)) | its own seeded draws | no: local only; about 50 minutes on eight cores (`calibration_gates` alone took 48 on 2026-10-14), nearly all of it the calibration study |
 | `grid/run.sh <oracle>` (an oracle reference run) | everything | no — local only; needs R, Julia and the pinned oracle versions |
 | `grid/run.sh … --timed` | the `fast` subset | no — local only, and only on a clock-locked machine |
 | `grid/compare.R` (the five gates) | the committed oracle runs plus a chosen glmm run | no — local only |

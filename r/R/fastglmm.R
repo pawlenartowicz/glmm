@@ -168,6 +168,17 @@
 #'   the REML log-likelihood (as `logLik(lm, REML = TRUE)`), `NULL` and `FALSE`
 #'   the ML one. Every other family is fitted by maximum likelihood, and
 #'   `TRUE` there is ignored with a `"fastglmm_argument_ignored"` warning.
+#' @param anova_test which per-term tables the fit stores for
+#'   [anova()][anova.fastglmm]. Every fit stores its Wald chi-squared (or F)
+#'   tables, with no refit. `"auto"` (the default) also stores the
+#'   likelihood-ratio tables of a Poisson model with random effects, which
+#'   `anova(m)` gives by default; `"LRT"` stores them on every fit with
+#'   chi-squared rows (any GLMM, and every GLM but a Gamma or inverse-Gaussian
+#'   one with an estimated dispersion), refitting the model under each term's
+#'   hypothesis after the fit, so that `anova(m, test = "LRT")` can read them;
+#'   `"Wald"` stores none. The fit itself is the same under every value. A
+#'   simulation that must use one test on every model it fits names the test
+#'   here and in `anova()`.
 #' @param ... intercepted, never silently swallowed. The known lme4 arguments
 #'   (`control`, `verbose`, `contrasts`) raise errors saying why they cannot
 #'   be honored; unknown names error as unused arguments.
@@ -218,6 +229,7 @@ fastglmm <- function(formula, data, family = gaussian(),
                      init.theta = NULL,
                      satterthwaite = TRUE,
                      REML = NULL,
+                     anova_test = c("auto", "Wald", "LRT"),
                      ...) {
   .check_dots(...)
   if (!(is.logical(satterthwaite) && length(satterthwaite) == 1L && !is.na(satterthwaite))) {
@@ -225,6 +237,7 @@ fastglmm <- function(formula, data, family = gaussian(),
          call. = FALSE)
   }
   .check_reml(REML)
+  anova_test <- match.arg(anova_test)
   # Captured before `data` is touched: the header's `Data:` line, as lme4
   # deparses it.
   data_name <- paste(deparse(substitute(data), width.cutoff = 500L), collapse = " ")
@@ -384,7 +397,8 @@ fastglmm <- function(formula, data, family = gaussian(),
     as.double(start$theta %||% double()),
     as.double(start$dispersion %||% double()),
     satterthwaite,
-    if (is.null(REML)) logical() else REML
+    if (is.null(REML)) logical() else REML,
+    anova_test
   )
 
   .fit_object(r, store, fam, nAGQ, dispersion, f_str, frame, match.call(), data_name)
@@ -586,12 +600,20 @@ fastglmm <- function(formula, data, family = gaussian(),
     objective = r$objective,
     objective_nodes = r$objective_nodes,
     # The per-term tables anova(m) prints, built by the crate at fit time:
-    # list(error = NULL, ss_type, label, kind, statistic, num_df, den_df,
-    # den_df_kind, p_value, sum_sq, mean_sq, row_notes, notes), one entry per
-    # term in each column, or list(error = <message>) when the formula gets no
-    # table (an interaction without its marginal terms).
+    # list(error = NULL, ss_type, test, reason, label, kind, statistic,
+    # num_df, den_df, den_df_kind, p_value, sum_sq, mean_sq, row_notes,
+    # notes), one entry per term in each column, or list(error = <message>)
+    # when the formula gets no table (an interaction without its marginal
+    # terms). The likelihood-ratio tables anova(m, test = "LRT") prints are
+    # the same lists, NULL unless the fit asked with anova_test = "LRT" or is
+    # a Poisson model with random effects fitted with anova_test = "auto".
+    # term_test_auto is list(test, reason): what anova(m)'s default
+    # test = "auto" gives ("lrt" on a Poisson model with random effects).
     term_table_type3 = r$term_table_type3,
     term_table_type2 = r$term_table_type2,
+    term_table_type3_lrt = r$term_table_type3_lrt,
+    term_table_type2_lrt = r$term_table_type2_lrt,
+    term_test_auto = r$term_test_auto,
     call = call,
     formula = f_str,
     family = fam$object,

@@ -19,6 +19,7 @@ fastglmm(
   init.theta = NULL,
   satterthwaite = TRUE,
   REML = NULL,
+  anova_test = c("auto", "Wald", "LRT"),
   ...
 )
 }
@@ -104,6 +105,18 @@ as single-level) has the same estimates under every value: \code{TRUE} reports
 the REML log-likelihood (as \code{logLik(lm, REML = TRUE)}), \code{NULL} and \code{FALSE}
 the ML one. Every other family is fitted by maximum likelihood, and
 \code{TRUE} there is ignored with a \code{"fastglmm_argument_ignored"} warning.}
+
+\item{anova_test}{which per-term tables the fit stores for
+\link[=anova.fastglmm]{anova()}. Every fit stores its Wald chi-squared (or F)
+tables, with no refit. \code{"auto"} (the default) also stores the
+likelihood-ratio tables of a Poisson model with random effects, which
+\code{anova(m)} gives by default; \code{"LRT"} stores them on every fit with
+chi-squared rows (any GLMM, and every GLM but a Gamma or inverse-Gaussian
+one with an estimated dispersion), refitting the model under each term's
+hypothesis after the fit, so that \code{anova(m, test = "LRT")} can read them;
+\code{"Wald"} stores none. The fit itself is the same under every value. A
+simulation that must use one test on every model it fits names the test
+here and in \code{anova()}.}
 
 \item{...}{intercepted, never silently swallowed. The known lme4 arguments
 (\code{control}, \code{verbose}, \code{contrasts}) raise errors saying why they cannot

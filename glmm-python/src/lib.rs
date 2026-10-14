@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 use glmm::formula::anova::{self, CompareError, Comparison, ComparisonTest, Differs, Model, Side};
-use glmm::inference::Reference;
+use glmm::inference::{DenDf, Reference};
 use glmm::orchestrate;
 
 use pyo3::exceptions::PyValueError;
@@ -104,6 +104,18 @@ fn fit_dict<'py>(py: Python<'py>, r: orchestrate::FitResult) -> PyResult<Bound<'
     d.set_item("objective_nodes", nodes)?;
     d.set_item("term_table_type3", term_dict(py, &r.term_table_type3)?)?;
     d.set_item("term_table_type2", term_dict(py, &r.term_table_type2)?)?;
+    // `None` unless the fit asked for the likelihood-ratio tables.
+    let lrt = |t: &Option<Result<glmm::formula::anova::TermTable, String>>| {
+        t.as_ref().map(|t| term_dict(py, t)).transpose()
+    };
+    d.set_item("term_table_type3_lrt", lrt(&r.term_table_type3_lrt)?)?;
+    d.set_item("term_table_type2_lrt", lrt(&r.term_table_type2_lrt)?)?;
+    // What `"auto"` gives on this fit: {"test", "reason"}.
+    let (test, reason) = orchestrate::choice_tags(&r.term_test_auto);
+    let auto = PyDict::new(py);
+    auto.set_item("test", test)?;
+    auto.set_item("reason", reason)?;
+    d.set_item("term_test_auto", auto)?;
     Ok(d)
 }
 
@@ -121,6 +133,8 @@ fn term_dict<'py>(
             let c = orchestrate::term_columns(table);
             d.set_item("error", py.None())?;
             d.set_item("ss_type", c.ss_type)?;
+            d.set_item("test", c.test)?;
+            d.set_item("reason", c.reason)?;
             d.set_item("label", c.label)?;
             d.set_item("kind", c.kind)?;
             d.set_item("statistic", c.statistic)?;
@@ -141,7 +155,7 @@ fn term_dict<'py>(
 #[pyfunction]
 #[pyo3(signature = (
     formula, numeric_columns, factor_columns, family, link, wald_se, nagq,
-    dispersion, weights, offset, warm_start, satterthwaite, reml,
+    dispersion, weights, offset, warm_start, satterthwaite, reml, anova_test = "auto",
 ))]
 fn fit<'py>(
     py: Python<'py>,
@@ -161,6 +175,8 @@ fn fit<'py>(
     warm_start: Option<(Vec<f64>, Vec<f64>, Option<f64>)>,
     satterthwaite: bool,
     reml: Option<bool>,
+    // "auto", "Wald" or "LRT": "LRT" also stores the likelihood-ratio tables.
+    anova_test: &str,
 ) -> PyResult<Bound<'py, PyDict>> {
     let result = orchestrate::run_fit(
         formula,
@@ -176,9 +192,37 @@ fn fit<'py>(
         warm_start,
         satterthwaite,
         reml,
+        anova_test,
     )
     .map_err(PyValueError::new_err)?;
     fit_dict(py, result)
+}
+
+/// The crate's refusal of `glmm.anova(m, test=...)` asking for `"Wald"` or
+/// `"LRT"` rows of a fit whose per-term rows are F tests, so both ports give
+/// one text. `den_df_kind` is the F rows' df source, `"satterthwaite"` or
+/// `"residual"`, as a stored table names it.
+#[pyfunction]
+fn f_table_refusal(asked: &str, den_df_kind: &str) -> PyResult<String> {
+    let asked = match asked {
+        "Wald" => anova::TermTest::Wald,
+        "LRT" => anova::TermTest::Lrt,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "no refusal for test {other:?}"
+            )))
+        }
+    };
+    let den_df = match den_df_kind {
+        "satterthwaite" => DenDf::Satterthwaite,
+        "residual" => DenDf::Residual,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "unknown df source {other:?}"
+            )))
+        }
+    };
+    Ok(anova::TermTestError::FTable { asked, den_df }.to_string())
 }
 
 /// `glmm::orchestrate::confint`: per coefficient `[lower, upper]`, the t
@@ -466,6 +510,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(fit, m)?)?;
     m.add_function(wrap_pyfunction!(formula_columns, m)?)?;
     m.add_function(wrap_pyfunction!(confint, m)?)?;
+    m.add_function(wrap_pyfunction!(f_table_refusal, m)?)?;
     m.add_function(wrap_pyfunction!(compare_fits, m)?)?;
     m.add_function(wrap_pyfunction!(compare, m)?)?;
     // The bound `orchestrate::compare_options` puts on `nsim`, for the

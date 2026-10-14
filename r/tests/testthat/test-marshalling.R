@@ -128,7 +128,7 @@ test_that("the raw fit carries the offset, the objective and both term tables", 
                             list(g = letters[1:8]), list(g = as.integer(g)),
                             "gaussian", "identity", "hessian", 1L, numeric(0),
                             numeric(0), offset, numeric(0), numeric(0),
-                            numeric(0), TRUE, logical(0))
+                            numeric(0), TRUE, logical(0), "auto")
   }
   r <- raw("y ~ x + (1 | g)", 0.1 * x)
   expect_equal(r$offset, 0.1 * x)

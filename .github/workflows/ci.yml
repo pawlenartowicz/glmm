@@ -335,6 +335,10 @@ jobs:
   # --ports-only skips every oracle lookup, and jsonlite and Rcpp (compiler
   # glue, not a statistics engine) are the only R dependencies it has.
   #
+  # A second step, the anova port gate, runs the per-term tables and model
+  # comparisons of a fixed call list through the same three front ends, with
+  # the same R dependencies.
+  #
   # This is the one job that builds the `validation` crate.
   port-gate:
     name: port-gate (Rust vs Python vs R)
@@ -409,6 +413,7 @@ jobs:
         # or row names differ between front ends, fails. Base R and jsonlite
         # only, plus Rcpp for the R front end's strtod shim. Runs when the
         # step above fails too, so one gate's failure does not hide the other's.
+        # Per-term headings (with their notes) and auto tags compare as text.
         if: ${{ !cancelled() && steps.fastglmm.outcome == 'success' }}
         run: |
           out="$RUNNER_TEMP/anova_ports"

@@ -98,27 +98,10 @@ fn check_pair(
 
 #[test]
 fn pairs_reproduce_the_frozen_statistics_and_p_values() {
-    let mut cases = BTreeSet::new();
-    for e in test_refs::entries(Kind::Anova) {
-        assert!(!e.is_pending(), "{}: pending", e.name);
-        let json = test_refs::load(Kind::Anova, &e.name);
-        let case = json["case"].as_str().expect("case").to_string();
-        if let Some(rows) = json["rows"].as_array() {
-            // `ranova`: each row drops one term from the full model.
-            for (i, row) in rows.iter().enumerate() {
-                let what = format!("{}[{i}]", e.name);
-                check_pair(&what, row, &json["full"], "LRT", "Df", row);
-            }
-        } else if json.get("statistic").is_some() {
-            // The first two members are the compared pair, smaller first.
-            let m = json["members"].as_array().expect("members");
-            check_pair(&e.name, &m[0], &m[1], "statistic", "df", &json);
-        } else {
-            continue;
-        }
-        cases.insert(case);
-    }
-    let expected: BTreeSet<String> = [
+    // The cases read here, by name, and the cases skipped on purpose (the
+    // per-term tables, the linear hypothesis and the fit-free grid have other
+    // layouts). Any other case panics, so a new one is never skipped silently.
+    const PAIR_CASES: [&str; 7] = [
         "gamma_glmm_vs_glm",
         "glm_pair",
         "glmm_pair",
@@ -126,11 +109,47 @@ fn pairs_reproduce_the_frozen_statistics_and_p_values() {
         "ml_pair",
         "ols_pair",
         "random_pair",
-        "ranova",
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect();
+    ];
+    const SKIPPED_CASES: [&str; 7] = [
+        "car_glm",
+        "car_glmm",
+        "car_lm",
+        "linear_hypothesis",
+        "lrt_terms",
+        "mixture_points",
+        "nonmarginal",
+    ];
+    let mut cases = BTreeSet::new();
+    for e in test_refs::entries(Kind::Anova) {
+        assert!(!e.is_pending(), "{}: pending", e.name);
+        let json = test_refs::load(Kind::Anova, &e.name);
+        let case = json["case"].as_str().expect("case").to_string();
+        if case == "ranova" {
+            // Each row drops one term from the full model.
+            let rows = json["rows"].as_array().expect("rows");
+            for (i, row) in rows.iter().enumerate() {
+                let what = format!("{}[{i}]", e.name);
+                check_pair(&what, row, &json["full"], "LRT", "Df", row);
+            }
+        } else if PAIR_CASES.contains(&case.as_str()) {
+            // The first two members are the compared pair, smaller first.
+            let m = json["members"].as_array().expect("members");
+            check_pair(&e.name, &m[0], &m[1], "statistic", "df", &json);
+        } else {
+            assert!(
+                SKIPPED_CASES.contains(&case.as_str()),
+                "{}: case `{case}` is neither read here nor listed as skipped",
+                e.name
+            );
+            continue;
+        }
+        cases.insert(case);
+    }
+    let expected: BTreeSet<String> = PAIR_CASES
+        .into_iter()
+        .chain(["ranova"])
+        .map(String::from)
+        .collect();
     assert_eq!(cases, expected);
 }
 

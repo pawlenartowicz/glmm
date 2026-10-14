@@ -925,7 +925,7 @@ pub(super) fn spec_sized_from_ids<'a>(
 /// Lower-tri Gram `G = XᵀX` (from row-major X) → `aliased_columns` mask. `p` is
 /// tiny, so the extra `O(N·p²)` reduction for the drop decision is negligible
 /// (the reduced fit recomputes its own suff stats).
-pub(super) fn detect_aliased(x: &[f64], n: usize, p: usize) -> Vec<bool> {
+pub(crate) fn detect_aliased(x: &[f64], n: usize, p: usize) -> Vec<bool> {
     let mut gram = Mat::<f64>::zeros(p, p);
     for i in 0..n {
         for a in 0..p {

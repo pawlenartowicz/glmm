@@ -13,7 +13,8 @@ own page.
 | `summary(fit)` (lmerTest's on an LMM) | `summary(fit)`: lme4-shaped, with the REML criterion (REML fits) or the `AIC`/`BIC`/`logLik`/`deviance`/`df.resid` row (ML fits), scaled residuals, variance components, and a coefficient table as lmerTest, `lm` and `glm` print it: t with a Satterthwaite `df` column on a Gaussian mixed model, t on `n - p` on OLS and on the Gamma and inverse-Gaussian GLMs with an estimated dispersion, Wald z elsewhere | `fit.summary()`: the same layout, printed and returned as a string; the df and p-values are also `fit.coef_df` and `fit.coef_p` |
 | `lmer(f, d, REML = FALSE)` | `fastglmm(f, d, REML = FALSE)` | `glmm.fit(d, "f", reml=False)` |
 | `AIC(m0, m1)`, `BIC(m0, m1)` | `AIC(m0, m1)`, `BIC(m0, m1)`: the `stats` table, except that a REML fit beside an ML fit, and REML fits with different fixed effects, stop with an error | `m.aic`, `m.bic` (properties, one fit each); the `AIC` and `BIC` columns of `glmm.anova(m0, m1)` on ML fits |
-| `anova(fit)` (lmerTest's), `car::Anova(fit)` | `anova(fit)`: one row per fixed term, built at fit time with no refit; Type III by lmerTest's construction by default, `type = "II"` on request; lmerTest's F with Satterthwaite df on a Gaussian mixed model, F on `n - p` on OLS and the Gamma and inverse-Gaussian GLMs with an estimated dispersion, car's Wald chi-squared elsewhere | `glmm.anova(fit)`, `glmm.anova(fit, type="II")`: the same table, a `TermTable` |
+| `anova(fit)` (lmerTest's), `car::Anova(fit)` | `anova(fit)`: one row per fixed term, built at fit time, with no refit when called; Type III by lmerTest's construction by default, `type = "II"` on request; lmerTest's F with Satterthwaite df on a Gaussian mixed model, F on `n - p` on OLS and the Gamma and inverse-Gaussian GLMs with an estimated dispersion, car's Wald chi-squared elsewhere, but likelihood-ratio chi-squared on a Poisson GLMM (next row) | `glmm.anova(fit)`, `glmm.anova(fit, type="II")`: the same table, a `TermTable` |
+| `afex::mixed(f, d, family = ..., method = "LRT")` on a GLMM; `car::Anova(glm_fit, type = 2, test.statistic = "LR")` on a GLM (on a `glmer` fit car gives only Wald chi-squared rows) | `fastglmm(f, d, family = ..., anova_test = "LRT")`, then `anova(fit, test = "LRT")` (Type III, afex's default type) or `anova(fit, type = "II", test = "LRT")` (car's Type II rule, on a GLM or a GLMM); a Poisson GLMM stores these rows by default, and `anova(fit)` gives them. Not on a Gaussian model, whose rows are Satterthwaite F tests: for a likelihood-ratio test of fixed terms there, use `compare(data, f0, f1)`, which fits both models by ML | `glmm.fit(d, "f", family, anova_test="LRT")`, then `glmm.anova(fit, test="LRT")` or `glmm.anova(fit, type="II", test="LRT")` |
 | `anova(m0, m1)` | `anova(m0, m1)`: the two fits compared as they are, never refitted; lme4's columns on a likelihood-ratio test, `anova.lm`'s on two OLS fits | `glmm.anova(m0, m1)`: the same table, a `ComparisonTable` |
 | `anova(m0, m1)` with lme4's ML refit; `lmerTest::ranova(fit)`; `RLRsim::exactRLRT()` | `compare(data, f0, f1)`: fits both formulas on the same rows by the estimator the comparison needs (REML when only the random part differs, ML when the fixed part does), with a boundary-aware reference for a variance component (the exact RLRT for a Gaussian model's single random intercept, else the 50:50 mixture) | `glmm.compare(data, f0, f1)`: the same, a `Comparison` with `table`, `fit0`, `fit1` |
 | `fixef(fit)` | `fixef(fit)` — named fixed-effect estimates; aliased columns `NA` | `fit.beta` (estimates) with `fit.names` (aligned coefficient names); `fit.aliased` flags rank-deficient columns |
@@ -120,6 +121,28 @@ four oracles (lme4, glmmTMB, MixedModels.jl, GLMMadaptive).
   tests a different hypothesis); Type II uses lmerTest's `X'X` metric on
   Gaussian mixed models and car's covariance metric on OLS, GLMs and GLMMs.
   An interaction without its marginal terms gets no table.
+- **Likelihood-ratio rows of the fixed terms are refitted at fit time, and
+  Type II is car's.** afex's `mixed(method = "LRT")` on a GLMM, and car's
+  `Anova(test.statistic = "LR")` on a GLM, refit when they are called; here
+  the refits are made when the model is fitted, with `anova_test = "LRT"` (or
+  by default on a Poisson GLMM), and `anova(fit, test = "LRT")` reads them.
+  The Type III rows are afex's at its default `type = 3`. For Type II glmm
+  follows the rule of car's `Anova(type = 2, test.statistic = "LR")`, which
+  car computes on a GLM only (on a `glmer` fit car gives only Wald
+  chi-squared rows); glmm applies the same rule to GLMMs. It is not
+  afex's `type = 2`, which is sequential: on `y ~ g * h + x` afex tests `x`
+  as `g + h + x` against `g + h`, glmm (car's rule) as `g * h + x` against
+  `g * h`. The statistic column is `Chisq`, as in the Wald table (car
+  names it `LR Chisq`). A term whose columns carry a random slope keeps its
+  Wald row, with a note. The default differs from car's: `Anova()` on a
+  `glmer` fit gives Wald rows, while `anova(fit)` here gives a Poisson GLMM
+  the likelihood-ratio rows and every other fit its Wald or F rows (see
+  [`hypothesis-tests.md`](hypothesis-tests.md#wald-or-likelihood-ratio-rows-test-and-anova_test)).
+- **A model with no more observations than random effects is fitted.** lme4
+  stops on such a fit by default (`check.nobs.vs.nRE = "stop"`; for example a
+  random intercept and slope on two observations per subject); glmm fits it
+  and says nothing. The model is weakly identified there; see
+  [`validation.md`](validation.md#what-is-gated).
 - All reported standard errors are Wald, not profile or bootstrap — see
   [`conventions.md`](conventions.md#flags-on-the-result) for how the
   `converged`/`singular` flags mark when those numbers should be trusted.

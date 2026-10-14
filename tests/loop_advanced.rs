@@ -5,7 +5,7 @@
 
 #[cfg(feature = "formula")]
 use glmm::formula::anova::{
-    compare, term_tests, CompareOptions, ComparisonTest, Model, TermTestOptions,
+    compare, term_tests, CompareOptions, ComparisonTest, Model, TermTest, TermTestOptions,
 };
 #[cfg(feature = "formula")]
 use glmm::formula::{lower, Column, Lowered, Table};
@@ -109,7 +109,9 @@ fn the_lr_p_value_is_the_one_compare_reports() {
 #[cfg(feature = "formula")]
 fn type3_and_the_wald_chisq_give_the_term_tests_rows() {
     let (lo, fit) = fitted("k ~ x + a * b", poisson(), None);
-    let table = term_tests(&lo, &fit, &TermTestOptions::default()).unwrap();
+    let mut opts = TermTestOptions::default();
+    opts.test = TermTest::Wald;
+    let table = term_tests(&lo, &fit, &opts).unwrap();
     let retained: Vec<usize> = (0..lo.p).filter(|&j| !fit.aliased()[j]).collect();
     let hypotheses = type3_pub(&lo, &retained);
     assert_eq!(hypotheses.len(), table.fixed.len());

@@ -29,10 +29,35 @@ from glmm.summary import Rendered, fmt, fmt_df, fmt_p, stars
 
 _LEGEND = "Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1"
 _RLRT = "exact RLRT null distribution (Crainiceanu & Ruppert 2004)"
+# The per-term heading and note texts (_NOT_CONVERGED, _LRT_LINE,
+# _AUTO_REASONS, _WALD_LINE, and `_term_table`'s heading) are copied in
+# validation/tools/anova_ports/anova_ports.rs, which the anova port gate
+# compares with both ports - change together.
 _NOT_CONVERGED = (
     "The fit did not converge, so its estimates are not at a maximum and these tests "
     "are not reliable. Refit until the fit converges, then test again."
 )
+_LRT_LINE = "Likelihood-ratio chi-squared tests (each term's model refitted without it)"
+_TESTS = ("auto", "Wald", "LRT")
+# Why "auto" gave a chi-squared table its test, by the fit's `term_test_auto`
+# reason. Mirrors the R port's .AUTO_REASONS and
+# validation/tools/anova_ports/anova_ports.rs - change together.
+_AUTO_REASONS = {
+    "poisson_mixed": "Poisson model with random effects",
+    "binomial_mixed": "binomial model with random effects",
+    "negative_binomial_mixed": "negative binomial model with random effects",
+    "other_mixed": "model with random effects, not binomial, Poisson or negative binomial",
+    "no_random_effects": "model without random effects",
+}
+_WALD_LINE = "Wald chi-squared tests"
+
+
+class _Default(str):
+    """`glmm.anova`'s default `test`, "auto", told apart from a `test` the
+    caller passed, which two fits refuse."""
+
+
+_AUTO = _Default("auto")
 
 
 class _Table(Rendered):
@@ -93,9 +118,11 @@ class TermTable(_Table):
     """The per-term tests of one fit, `glmm.anova(m)`: one row per fixed term,
     in formula order. F tables have lmerTest's columns (`Sum Sq`, `Mean Sq`,
     `NumDF`, `DenDF`, `F value`, `Pr(>F)`), Wald chi-squared tables car's
-    (`Chisq`, `Df`, `Pr(>Chisq)`). The html, latex and typst renders add a
-    `Reference` column naming each row's distribution, `F(NumDF, DenDF)` or
-    `χ²(Df)`, built from the row's df. Name is provisional until 1.0.0."""
+    (`Chisq`, `Df`, `Pr(>Chisq)`), and likelihood-ratio tables the same
+    columns under a two-line `heading` that names the test. The html, latex
+    and typst renders add a `Reference` column naming each row's
+    distribution, `F(NumDF, DenDF)` or `χ²(Df)`, built from the row's df.
+    Name is provisional until 1.0.0."""
 
     _values: dict
     row_names: list
@@ -121,7 +148,7 @@ class TermTable(_Table):
         return "\n".join(out + self.notes)
 
     def _header_lines(self):
-        return [self.heading]
+        return self.heading.split("\n")
 
     def _tables(self):
         header, cells, marks = self._cells()
@@ -219,7 +246,7 @@ class Comparison:
         return self.table.text()
 
 
-def anova(*fits, type=None, nsim=None, seed=None):
+def anova(*fits, type=None, test=_AUTO, nsim=None, seed=None):
     """One fit: its per-term tests, a `TermTable`. Two fits: the two models
     compared as they are, with no refit, a `ComparisonTable`.
 
@@ -229,11 +256,35 @@ def anova(*fits, type=None, nsim=None, seed=None):
     does not depend on the contrast coding; `type="II"` is the one
     alternative. OLS, a Gaussian mixed model and the Gamma and inverse
     Gaussian GLMs with phi estimated get F tests (the residual df, or
-    Satterthwaite's on a mixed model); every other fit Wald chi-squared tests.
+    Satterthwaite's on a mixed model); every other fit Wald chi-squared tests,
+    but a Poisson model with random effects likelihood-ratio tests (`test`).
     There are no random-effect rows: random effects are tested by comparing
     two models. A formula whose interaction lacks one of its marginal terms
     raises `ValueError`. A fit that did not converge gets its table with a
     note saying so.
+
+    `test` chooses the rows' test on one fit (None, as with `type`, is the
+    default). "auto" (the default) gives the F
+    rows on a fit that has them, the likelihood-ratio rows on a Poisson model
+    with random effects whatever its size (in simulation the Wald test of a
+    Poisson GLMM was never closer to the nominal level than the
+    likelihood-ratio test, and rejected too often at few clusters), and the
+    Wald chi-squared rows on every other fit. "Wald" gives the Wald chi-squared
+    rows; "LRT" the likelihood-ratio rows, each term's hypothesis tested by
+    refitting the model under it (Type II by the rule of car's
+    `Anova(test.statistic = "LR")` on a GLM, applied to GLMMs too; Type III on
+    the reduced design of the same hypothesis as the Wald row, as afex's
+    `mixed(method = "LRT")` on a GLMM), in the Wald table's columns. The refits
+    are made when the fit is: a fit made with `glmm.fit(..., anova_test="LRT")`
+    has these rows, and so does a Poisson model with random effects made with
+    the default `anova_test="auto"`; on a fit without them "LRT", and "auto" on
+    a Poisson GLMM, raise `ValueError` naming the fit argument. A term whose
+    column carries a random slope keeps its Wald row, with a note. "Wald" and
+    "LRT" apply to every fit with chi-squared rows: any GLMM, and every GLM but
+    a Gamma or inverse Gaussian one with phi estimated; on a fit with F rows
+    they raise `ValueError` naming the F test. The heading names the test;
+    under "auto" a chi-squared table's heading also names why "auto" chose it
+    (the family, or no random effects).
 
     Two fits, `glmm.anova(m0, m1)`, in either order: the fits must be on the
     same rows (the same row count, response, weights and offset), with the
@@ -258,14 +309,16 @@ def anova(*fits, type=None, nsim=None, seed=None):
 
     Three or more fits raise `TypeError`: a comparison takes two models. So
     do the arguments of the other form: `nsim` or `seed` with one fit, `type`
-    with two. A fit made by a glmm version without these tests raises
-    `ValueError` naming the fields it lacks: refit it. The name and the table
-    layouts are provisional until 1.0.0."""
+    or `test` other than None with two. A fit made by a glmm version without these tests
+    raises `ValueError` naming the fields it lacks: refit it. The name and
+    the table layouts are provisional until 1.0.0."""
     if len(fits) not in (1, 2):
         raise TypeError(f"glmm.anova takes one fit or two, got {len(fits)}")
     for m in fits:
         if not isinstance(m, Fit):
             raise TypeError(f"glmm.anova takes glmm.Fit objects, got {_type_name(m)}")
+    if test is None:
+        test = _AUTO
     if len(fits) == 1:
         if nsim is not None or seed is not None:
             raise TypeError(
@@ -276,14 +329,45 @@ def anova(*fits, type=None, nsim=None, seed=None):
             type = "III"
         if type not in ("III", "II"):
             raise ValueError(f"type must be 'III' or 'II', got {type!r}")
+        if test not in _TESTS:
+            raise ValueError(f"test must be 'auto', 'Wald' or 'LRT', got {test!r}")
         (m,) = fits
         field = "term_table_type3" if type == "III" else "term_table_type2"
-        _check_fields(m, [field])
-        return _term_table(m, getattr(m, field))
+        # Only "auto" reads the fit's auto choice: a fit stored before it
+        # still takes an explicit test.
+        _check_fields(m, [field, "term_test_auto"] if test == "auto" else [field])
+        stored = getattr(m, field)
+        if stored["error"] is not None:
+            # The formula's refusal comes first, whatever `test` asks, as in
+            # the R port.
+            return _term_table(m, stored, test)
+        if test != "auto" and stored.get("reason") == "f_test":
+            den_df = "residual" if m.df_method == "residual" else "satterthwaite"
+            raise ValueError(_native.f_table_refusal(test, den_df))
+        if test == "LRT" or (test == "auto" and m.term_test_auto["test"] == "lrt"):
+            stored = getattr(m, field + "_lrt", None)
+            if stored is None and test == "LRT":
+                raise ValueError(
+                    "this fit stored no likelihood-ratio tables, which are built only when "
+                    "the fit asks for them: refit with glmm.fit(..., anova_test='LRT')."
+                )
+            if stored is None:
+                raise ValueError(
+                    "test='auto' gives likelihood-ratio tests on a Poisson model with "
+                    "random effects, and this fit stored none: it was made with "
+                    "anova_test='Wald'. Use test='Wald', or refit with "
+                    "glmm.fit(..., anova_test='auto')."
+                )
+        return _term_table(m, stored, test)
     if type is not None:
         raise TypeError(
             "glmm.anova of two fits takes no type: a comparison of two models has no "
             "sum-of-squares type; type applies to one fit, glmm.anova(m)"
+        )
+    if test is not _AUTO:
+        raise TypeError(
+            "glmm.anova of two fits takes no test: a comparison's test follows from "
+            "the two models; test applies to one fit, glmm.anova(m)"
         )
     _check_draws(nsim, seed)
     r = _native.compare_fits(_side(fits[0]), _side(fits[1]), nsim, seed)
@@ -314,7 +398,11 @@ def compare(
     given once and used for both fits, as `glmm.fit` takes them. A row with a
     missing value in any column either formula uses, in the weights or in the
     offset is dropped from both fits. The two formulas can be given in either order; the table lists the
-    smaller model first. `nsim` and `seed` are as in `glmm.anova`.
+    smaller model first. `nsim` and `seed` are as in `glmm.anova`. Both fits
+    are made with `anova_test="auto"`: `glmm.anova` of `fit0` or `fit1` with
+    `test="LRT"` works only on a Poisson model with random effects. For the
+    likelihood-ratio rows of another model with chi-squared rows, fit its
+    formula with `glmm.fit(..., anova_test="LRT")`.
 
     Formulas that are not nested, or that give the same model, raise
     `ValueError`. A third formula raises `TypeError`, and so do fits instead
@@ -430,8 +518,9 @@ def _side(m):
     }
 
 
-def _term_table(m, stored):
-    """The `TermTable` of a stored per-term result (`Fit.term_table_type3`)."""
+def _term_table(m, stored, test):
+    """The `TermTable` of a stored per-term result (`Fit.term_table_type3`),
+    read for `glmm.anova(m, test=test)`."""
     error = stored["error"]
     if error is not None:
         # A panic caught while the table was built is the crate's fault, not
@@ -463,7 +552,21 @@ def _term_table(m, stored):
             "Pr(>F)": stored["p_value"],
         }
     else:
-        heading = f"Type {ss} Analysis of Deviance Table (Wald χ² tests)"
+        if stored.get("test") == "lrt" or test == "auto":
+            # The second line names the test and why it ran, as the R port's;
+            # an explicit "Wald" keeps the one-line heading.
+            if stored.get("test") == "lrt":
+                line = _LRT_LINE + (" on the reduced design" if ss == "III" else "")
+            else:
+                line = _WALD_LINE
+            why = (
+                'test = "LRT"'
+                if test == "LRT"
+                else f'test = "auto": {_AUTO_REASONS[m.term_test_auto["reason"]]}'
+            )
+            heading = f"Type {ss} Analysis of Deviance Table\n{line}; {why}"
+        else:
+            heading = f"Type {ss} Analysis of Deviance Table (Wald χ² tests)"
         values = {
             "Chisq": stored["statistic"],
             "Df": stored["num_df"],

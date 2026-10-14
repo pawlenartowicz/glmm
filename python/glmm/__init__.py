@@ -695,13 +695,28 @@ class Fit:
     # The per-term tables `glmm.anova(m)` reads (Type III and Type II), built
     # when the fit was made. Each is a dict: "error" holds the message when the
     # fit gets no table (an interaction without its marginal terms), else None
-    # beside the columns, one entry per term in formula order: "ss_type",
-    # "label", "kind" ("F" or "chisq"), "statistic", "num_df", "den_df",
-    # "den_df_kind" ("satterthwaite", "residual" or "" on a chi-squared row),
-    # "p_value", "sum_sq", "mean_sq" (NaN on a chi-squared row), "row_notes"
-    # (a list of sentences per row) and "notes" (the table's sentences).
+    # beside "ss_type", the table's "test" ("F", "chisq" or "lrt") and its
+    # "reason" ("requested", "f_test", or what "auto" found: "poisson_mixed",
+    # "binomial_mixed", "negative_binomial_mixed", "other_mixed" or
+    # "no_random_effects"; see `term_test_auto`), and the columns, one
+    # entry per term in formula order: "label", "kind" ("F", "chisq" or
+    # "lrt"), "statistic", "num_df", "den_df", "den_df_kind" ("satterthwaite",
+    # "residual" or "" on a chi-squared row), "p_value", "sum_sq", "mean_sq"
+    # (NaN on a chi-squared row), "row_notes" (a list of sentences per row) and
+    # "notes" (the table's sentences).
     term_table_type3: dict | None = None
     term_table_type2: dict | None = None
+    # The likelihood-ratio tables `glmm.anova(m, test="LRT")` reads, as the two
+    # above, stored by a fit made with `anova_test="LRT"`, and by a Poisson
+    # model with random effects made with `anova_test="auto"` (None
+    # otherwise); on a fit with F rows each holds the refusal as its "error".
+    term_table_type3_lrt: dict | None = None
+    term_table_type2_lrt: dict | None = None
+    # What `glmm.anova(m)`'s default test="auto" gives on this fit:
+    # {"test": "lrt", "reason": "poisson_mixed"} on a Poisson model with random
+    # effects (the likelihood-ratio tables above), else the test and reason of
+    # `term_table_type3`.
+    term_test_auto: dict | None = None
 
     @property
     def converged(self):
@@ -1415,6 +1430,12 @@ def _term_result(t):
     return {k: np.asarray(v, dtype=float) if k in numeric else v for k, v in t.items()}
 
 
+def _lrt_result(t):
+    """`_term_result` of a stored likelihood-ratio table, None when the fit
+    stored none."""
+    return None if t is None else _term_result(t)
+
+
 def _fit_from_native(r, formula, family, link, nagq, dispersion, store):
     """The `Fit` of `_native.fit`'s dict `r`, with the fit's warnings raised
     and appended to `store`; the other arguments are the call's own."""
@@ -1530,6 +1551,9 @@ def _fit_from_native(r, formula, family, link, nagq, dispersion, store):
         objective_nodes=int(r["objective_nodes"]),
         term_table_type3=_term_result(r["term_table_type3"]),
         term_table_type2=_term_result(r["term_table_type2"]),
+        term_table_type3_lrt=_lrt_result(r["term_table_type3_lrt"]),
+        term_table_type2_lrt=_lrt_result(r["term_table_type2_lrt"]),
+        term_test_auto=dict(r["term_test_auto"]),
     )
     # Singularity is not assessed on a fit that did not converge: the kernel never sets
     # `singular` there (the post-hoc check and the boundary flags are gated on
@@ -1581,6 +1605,7 @@ def fit(
     warm_start=None,
     satterthwaite=True,
     reml=None,
+    anova_test="auto",
 ):
     """Fit `formula` against `data`'s columns and return a `Fit`.
 
@@ -1624,6 +1649,18 @@ def fit(
         estimates; True reports the REML log-likelihood (the summary prints
         the REML criterion), None and False the ML one.
         Any other family: ML; True is ignored with an ArgumentIgnoredWarning.
+    anova_test: the per-term tables the fit stores for `glmm.anova(m, test=)`,
+        which reads them and computes nothing. Every fit stores its Wald
+        chi-squared (or F) tables, with no refit. "auto" (default) also
+        stores the likelihood-ratio tables of a Poisson model with random
+        effects, which `glmm.anova(m)` gives by default; "LRT" stores them on
+        every fit with chi-squared rows (any GLMM, and every GLM but a Gamma
+        or inverse Gaussian one with phi estimated), refitting the model once
+        per distinct reduced design after the fit, so
+        `glmm.anova(m, test="LRT")` can read them (on a fit with F rows the
+        fit stands and `glmm.anova(m, test="LRT")` raises); "Wald" stores
+        none. A simulation that must use one test on every model it fits
+        names the test here and in `glmm.anova`.
 
     A categorical column's level order is honored: level 0 is the
     treatment-contrast base, so `pd.Categorical(x, categories=[…])` fits against
@@ -1643,6 +1680,8 @@ def fit(
 
     if wald_se not in ("hessian", "rx"):
         raise ValueError(f"wald_se must be 'hessian' or 'rx', got {wald_se!r}")
+    if anova_test not in ("auto", "Wald", "LRT"):
+        raise ValueError(f"anova_test must be 'auto', 'Wald' or 'LRT', got {anova_test!r}")
 
     _check_nagq(nagq)
 
@@ -1766,6 +1805,7 @@ def fit(
         warm_start_pair,
         satterthwaite,
         reml,
+        anova_test,
     )
     return _fit_from_native(r, formula, family, link, nagq, dispersion, store)
 

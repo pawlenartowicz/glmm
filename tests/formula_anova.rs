@@ -19,7 +19,7 @@ use std::mem::discriminant;
 
 use glmm::formula::anova::{
     compare, nesting, term_tests, CompareError, CompareOptions, Comparison, ComparisonTest,
-    Differs, Model, Nesting, Side, SsType, TermTable, TermTestError, TermTestOptions,
+    Differs, Model, Nesting, Side, SsType, TermTable, TermTest, TermTestError, TermTestOptions,
 };
 use glmm::formula::{lower, Column, Lowered, Table};
 use glmm::inference::contrast::NoDfReason;
@@ -1730,8 +1730,35 @@ fn options(ss_type: SsType) -> TermTestOptions {
     opts
 }
 
+/// The per-term table `opts` asks for, its χ² rows pinned to the Wald test so
+/// they stay Wald whatever the default test gives; a fit whose rows are F
+/// tests refuses an explicit test, so its table takes the default, which must
+/// be its F table (a χ² fit that refused the Wald test fails here).
+fn term_table(
+    lo: &Lowered,
+    fit: &Fit,
+    mut opts: TermTestOptions,
+) -> Result<TermTable, TermTestError> {
+    opts.test = TermTest::Wald;
+    match term_tests(lo, fit, &opts) {
+        Err(TermTestError::FTable { .. }) => {
+            opts.test = TermTest::Auto;
+            let table = term_tests(lo, fit, &opts);
+            if let Ok(t) = &table {
+                assert_eq!(
+                    t.choice.test,
+                    LinearKind::F,
+                    "a χ² fit refused the Wald test"
+                );
+            }
+            table
+        }
+        other => other,
+    }
+}
+
 fn tables(lo: &Lowered, fit: &Fit) -> [TermTable; 2] {
-    [SsType::Type3, SsType::Type2].map(|ss_type| term_tests(lo, fit, &options(ss_type)).unwrap())
+    [SsType::Type3, SsType::Type2].map(|ss_type| term_table(lo, fit, options(ss_type)).unwrap())
 }
 
 fn labels(t: &TermTable) -> Vec<&str> {
@@ -1847,7 +1874,7 @@ fn a_one_df_type_iii_row_of_an_uncontained_term_is_the_summary_statistic_squared
     // row is t² on t's df (z² on a Wald χ² row).
     for (name, lo, fit, kind, _) in fits() {
         let j = lo.col_names.iter().position(|c| c == "x").unwrap();
-        let t3 = term_tests(&lo, &fit, &TermTestOptions::default()).unwrap();
+        let t3 = term_table(&lo, &fit, TermTestOptions::default()).unwrap();
         assert_eq!(t3.ss_type, SsType::Type3);
         let row = t3.fixed.iter().find(|r| r.label == "x").unwrap();
         let z = fit.beta[j] / fit.se[j];
@@ -1940,7 +1967,7 @@ fn an_interaction_without_its_marginal_term_is_refused() {
         None,
     );
     for ss_type in [SsType::Type3, SsType::Type2] {
-        let e = term_tests(&lo, &fit, &options(ss_type)).unwrap_err();
+        let e = term_table(&lo, &fit, options(ss_type)).unwrap_err();
         let TermTestError::NotMarginal(message) = &e else {
             panic!("{e:?}")
         };
@@ -2069,7 +2096,7 @@ fn type_ii_on_a_glm_or_glmm_is_cars_covariance_metric() {
     for formula in [FIXED, GLMM] {
         let (lo, fit) = lowered_fit(formula, &b, binomial(), None);
         assert!(gh.iter().all(|n| lo.col_names.iter().any(|c| c == n)));
-        let t2 = term_tests(&lo, &fit, &options(SsType::Type2)).unwrap();
+        let t2 = term_table(&lo, &fit, options(SsType::Type2)).unwrap();
         for (term, cols) in [("g", vec!["gb", "gc"]), ("h", vec!["hq"])] {
             let row = t2.fixed.iter().find(|r| r.label == term).unwrap();
             let with: Vec<&str> = cols.iter().copied().chain(gh).collect();
@@ -2098,7 +2125,7 @@ fn type_ii_on_weighted_ols_is_cars_covariance_metric() {
     assert!(fit.converged());
     let rel = ["x:grpb"];
     assert!(lo.col_names.iter().any(|c| c == rel[0]));
-    let t2 = term_tests(&lo, &fit, &options(SsType::Type2)).unwrap();
+    let t2 = term_table(&lo, &fit, options(SsType::Type2)).unwrap();
     for (term, col) in [("x", "x"), ("grp", "grpb")] {
         let row = t2.fixed.iter().find(|r| r.label == term).unwrap();
         let want = wald_of(&fit, &lo, &[col, rel[0]]) - wald_of(&fit, &lo, &rel);

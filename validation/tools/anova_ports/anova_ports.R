@@ -15,19 +15,55 @@ validation_dir <- normalizePath(file.path(here, "..", ".."))
 PAIR_CASES <- c("random_pair", "ml_pair", "ols_pair", "glm_pair", "glmm_pair",
                 "glmm_vs_glm", "gamma_glmm_vs_glm")
 
+# The models whose per-term tables are compared, by label.
 TERM_MODELS <- list(
-  list(label = "lmer_sim_factorial", data = "data/simulated/sim_factorial.csv",
+  lmer_sim_factorial = list(data = "data/simulated/sim_factorial.csv",
        factors = c("subj", "g", "h"), formula = "y ~ g * h + x + (1 + x | subj)",
        family = "gaussian", link = "identity"),
-  list(label = "lm_sim_factorial", data = "data/simulated/sim_factorial.csv",
+  lm_sim_factorial = list(data = "data/simulated/sim_factorial.csv",
        factors = c("subj", "g", "h"), formula = "y ~ g * h + x",
        family = "gaussian", link = "identity"),
-  list(label = "glmer_sim_factorial_bern", data = "data/simulated/sim_factorial_bern.csv",
+  glmer_sim_factorial_bern = list(data = "data/simulated/sim_factorial_bern.csv",
        factors = c("subj", "g", "h"), formula = "y ~ g * h + x + (1 | subj)",
        family = "binomial", link = "logit"),
-  list(label = "glm_sim_factorial_bern", data = "data/simulated/sim_factorial_bern.csv",
+  glm_sim_factorial_bern = list(data = "data/simulated/sim_factorial_bern.csv",
        factors = c("subj", "g", "h"), formula = "y ~ g * h + x",
-       family = "binomial", link = "logit"))
+       family = "binomial", link = "logit"),
+  glmer_sim_binomial_slope1 = list(data = "data/simulated/sim_binomial_slope1.csv",
+       factors = "g", formula = "y ~ x + (1 + x | g)", family = "binomial", link = "logit"),
+  glmer_cbpp = list(data = "data/empirical/cbpp.csv", factors = c("herd", "period"),
+       formula = "cbind(incidence, size - incidence) ~ period + (1 | herd)",
+       family = "binomial", link = "logit"),
+  glmer_poisson_grouseticks = list(data = "data/empirical/grouseticks.csv",
+       factors = c("YEAR", "BROOD"), formula = "TICKS ~ YEAR + cHEIGHT + (1 | BROOD)",
+       family = "poisson", link = "log"),
+  glmer_nb_sim_nb = list(data = "data/simulated/sim_nb.csv", factors = c("cluster", "grp"),
+       formula = "y ~ 1 + x + grp + (1 | cluster)", family = "negativebinomial",
+       link = "log"),
+  glmer_gamma_sim_gamma = list(data = "data/simulated/sim_gamma.csv",
+       factors = c("cluster", "grp"), formula = "y ~ 1 + x + grp + (1 | cluster)",
+       family = "gamma", link = "log"))
+
+# One fit's per-term calls, as anova_ports.rs's TERM_CALLS. The fit is made
+# with anova_test = "LRT" for test = "LRT" and at the default "auto"
+# otherwise; a call is named terms:<label>:<type>, with :<test> appended when
+# named.
+term_call <- function(model, types, test, named) {
+  list(model = model, types = types, test = test, named = named)
+}
+TERM_CALLS <- list(
+  term_call("lmer_sim_factorial", c("III", "II"), "auto", FALSE),
+  term_call("lm_sim_factorial", c("III", "II"), "auto", FALSE),
+  term_call("glmer_sim_factorial_bern", c("III", "II"), "auto", FALSE),
+  term_call("glm_sim_factorial_bern", c("III", "II"), "auto", FALSE),
+  term_call("glmer_sim_factorial_bern", c("III", "II"), "LRT", TRUE),
+  term_call("glm_sim_factorial_bern", c("III", "II"), "LRT", TRUE),
+  term_call("glmer_cbpp", c("III", "II"), "LRT", TRUE),
+  term_call("glmer_sim_binomial_slope1", "III", "LRT", TRUE),
+  term_call("glmer_poisson_grouseticks", "III", "auto", TRUE),
+  term_call("glmer_poisson_grouseticks", "III", "Wald", TRUE),
+  term_call("glmer_nb_sim_nb", "III", "auto", TRUE),
+  term_call("glmer_gamma_sim_gamma", "III", "auto", TRUE))
 
 MISSING_ROW <- 5L  # 1-based row of wls_basic.csv whose x2 is made missing
 
@@ -114,6 +150,15 @@ emit <- function(call, rows, cols) {
   }
 }
 
+# One text cell (a heading, a tag) at `at`, c(row_index, col_index), written
+# as UTF-8 whatever the locale.
+emit_text <- function(call, row, col, at, text) {
+  cell <- list(call = call, row = row, col = col, row_index = at[[1]],
+               col_index = at[[2]], text = enc2utf8(text))
+  writeLines(enc2utf8(as.character(jsonlite::toJSON(cell, auto_unbox = TRUE))),
+             useBytes = TRUE)
+}
+
 refused <- function(call, why) {
   message(sprintf("%s: refused: %s", call, conditionMessage(why)))
   emit(call, "", list(error = NA_real_))
@@ -126,14 +171,15 @@ port_table <- function(call, tab) {
 
 # One fit, the weights (a column of `data` or NULL) riding as the data column
 # validation_wts, referenced by name as the grid's R engine does.
-fit <- function(data, m, weights) {
+fit <- function(data, m, weights, anova_test = "auto") {
   fam <- family_arg(m$family, m$link)
   f <- stats::as.formula(m$formula)
   if (is.null(weights)) {
-    fastglmm(f, data, fam, nAGQ = m$nagq, REML = m$reml)
+    fastglmm(f, data, fam, nAGQ = m$nagq, REML = m$reml, anova_test = anova_test)
   } else {
     data$validation_wts <- weights
-    fastglmm(f, data, fam, weights = validation_wts, nAGQ = m$nagq, REML = m$reml)
+    fastglmm(f, data, fam, weights = validation_wts, nAGQ = m$nagq, REML = m$reml,
+             anova_test = anova_test)
   }
 }
 
@@ -186,18 +232,34 @@ pairs <- function() {
   }
 }
 
-term_tables <- function() {
-  for (t in TERM_MODELS) {
-    data <- read_data(t$data, t$factors)
-    m <- list(formula = t$formula, family = t$family, link = t$link, reml = NULL, nagq = 1L)
-    f <- tryCatch(fit(data, m, NULL), error = function(e) e)
-    for (ss in c("III", "II")) {
-      call <- sprintf("terms:%s:%s", t$label, ss)
+# anova(m, type, test) per TERM_CALLS, each table followed by its text cells:
+# the heading (with the notes), and the fit's term_test_auto.
+term_calls <- function() {
+  for (cl in TERM_CALLS) {
+    t <- TERM_MODELS[[cl$model]]
+    a <- aggregated(t$formula, read_data(t$data, t$factors))
+    m <- list(formula = a$formula, family = t$family, link = t$link, reml = NULL, nagq = 1L)
+    calls <- sprintf("terms:%s:%s%s", cl$model, cl$types,
+                     if (cl$named) paste0(":", cl$test) else "")
+    f <- tryCatch(fit(a$data, m, NULL, if (identical(cl$test, "LRT")) "LRT" else "auto"),
+                  error = function(e) e)
+    for (i in seq_along(calls)) {
+      call <- calls[[i]]
       if (inherits(f, "error")) {
         refused(call, f)
         next
       }
-      tryCatch(port_table(call, anova(f, type = ss)), error = function(e) refused(call, e))
+      tab <- tryCatch(anova(f, type = cl$types[[i]], test = cl$test), error = function(e) e)
+      if (inherits(tab, "error")) {
+        refused(call, tab)
+        next
+      }
+      port_table(call, tab)
+      n <- nrow(tab)
+      k <- ncol(tab)
+      emit_text(call, "heading", "text", c(n, k), paste(attr(tab, "heading"), collapse = "\n"))
+      emit_text(call, "term_test_auto", "test", c(n + 1L, k + 1L), f$term_test_auto$test)
+      emit_text(call, "term_test_auto", "reason", c(n + 1L, k + 2L), f$term_test_auto$reason)
     }
   }
 }
@@ -221,6 +283,6 @@ rlrt_calls <- function() {
 }
 
 pairs()
-term_tables()
+term_calls()
 missing_value_call()
 rlrt_calls()

@@ -3,4 +3,6 @@
   "_note": "Check CRAN and github.com/JuliaStats/MixedModels.jl/releases at each glmm release. A bump is a deliberate event: rerun that oracle on the full grid into a new run directory, never edit an old run.",
   "lmerTest": "3.2-1", "RLRsim": "3.1-9", "car": "3.1-5",
   "numDeriv": "2016.8-1.1", "MASS": "7.3-65", "jsonlite": "2.0.0",
+  "afex": "1.5-1",
+  "_afex_note": "afex is installed without its dependencies. It resolved its Imports against the pinned lme4, lmerTest and car and against pbkrtest 0.5.5, reshape2 1.4.5, reformulas 0.4.4 and rlang 1.2.0, recorded here and not asserted.",
   "_inference_note": "Pins of the inference reference generators; the lmerTest pin also serves the lmertest grid engine. Bumping one is a deliberate event that regenerates no frozen reference by itself." }

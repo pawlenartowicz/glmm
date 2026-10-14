@@ -58,6 +58,24 @@
 # car's Type II Wald on the lmer fit, car's Type II on the lm): each has the
 # table `rows` (R's column names as keys, NA cells left out) or the `error`
 # message, and `conditions`, the warning and message texts the call raised.
+#
+# The likelihood-ratio case (lrt_terms) has one member, a glmer or a glm fit,
+# and the entry's `engine` and `ss_type` (2 or 3). Engine afex::mixed (a glmer
+# member) runs afex with method = "LRT" and check_contrasts = TRUE (contr.sum
+# on every factor), its refits through lme4's glmer. At type 3 afex refits the
+# model without each term's columns. At type 2 afex is sequential, not car's
+# Type II: a term is tested in the model of the terms up to its own order, so
+# on y ~ g * h + x the row x compares g + h + x with g + h. Engine lme4::glmer
+# (a glmer member, ss_type 2) is car's Type II as explicit glmer refit pairs:
+# term A is tested by the model of every term that does not contain A, with
+# and without A (on y ~ g * h + x, x compares g * h + x with g * h), and each
+# row also records its `full_formula` and `reduced_formula`. Engine car::Anova
+# (a glm member) runs car::Anova(test.statistic = "LR") on the fit with
+# contr.sum on the entry's `factors`. The JSON has the formula's fixed
+# `term_labels` and one row per term in that order: `term`, `statistic` (the
+# likelihood-ratio chi-square), `df` and `p`. A warning from any fit stops the
+# run, and so does any message but afex's notes on the contrasts it set and on
+# uncentred numeric variables. These entries' provenance also names afex.
 
 suite_dir <- normalizePath(file.path(dirname(sub(
   "--file=", "", grep("--file=", commandArgs(FALSE), value = TRUE))), ".."))
@@ -516,6 +534,125 @@ case_nonmarginal <- function(entry) {
        car_type2_lm = record_call(function() car::Anova(twin, type = 2)))
 }
 
+# car's Type II on a glmer member as likelihood-ratio pairs of glmer refits,
+# with the member's family, link, nAGQ and tolPwrss and contr.sum on the
+# entry's factors in each formula. Term A is tested by the model of every
+# fixed term that does not contain A (car:::relatives, the containment car's
+# Type II reads: a term contains A when it has every variable of A), with and
+# without A, the random terms kept. Each distinct formula is fitted once.
+lrt_containment_pairs <- function(entry, mem, data) {
+  f <- as.formula(mem$formula)
+  all_labels <- attr(terms(f), "term.labels")
+  bars <- all_labels[grepl("|", all_labels, fixed = TRUE)]
+  labels <- setdiff(all_labels, bars)
+  fac <- attr(terms(reformulate(labels, response = f[[2]])), "factors")
+  fits <- list()
+  fit_of <- function(keep) {
+    fixed <- reformulate(if (length(keep) == 0L) "1" else keep, response = f[[2]])
+    form <- reformulate(c(if (length(keep) == 0L) "1" else keep, sprintf("(%s)", bars)),
+                        response = f[[2]])
+    key <- paste(deparse(form, width.cutoff = 500L), collapse = "")
+    if (is.null(fits[[key]])) {
+      m <- mem
+      m$formula <- key
+      fit <- fit_member_sum(m, data, intersect(unlist(entry$factors), all.vars(fixed)))
+      ll <- logLik(fit)
+      fits[[key]] <<- list(logLik = as.numeric(ll), npar = as.integer(attr(ll, "df")))
+    }
+    c(list(formula = key), fits[[key]])
+  }
+  rows <- lapply(seq_along(labels), function(i) {
+    rel <- car:::relatives(labels[i], labels, fac)
+    keep <- if (length(rel) == 0L) labels else labels[-rel]
+    full <- fit_of(keep)
+    reduced <- fit_of(setdiff(keep, labels[i]))
+    stat <- 2 * (full$logLik - reduced$logLik)
+    df <- full$npar - reduced$npar
+    data.frame(statistic = stat, df = df, p = pchisq(stat, df, lower.tail = FALSE),
+               full_formula = full$formula, reduced_formula = reduced$formula,
+               row.names = labels[i])
+  })
+  do.call(rbind, rows)
+}
+
+# The per-term likelihood-ratio table of the entry's one member, by its
+# `engine`: afex::mixed or lme4::glmer (car's Type II as refit pairs) on a
+# glmer member, car::Anova on a glm member refitted with contr.sum on the
+# entry's factors. A warning stops the run, and so does a message other than
+# afex's notes on the contrasts it set and on uncentred numeric variables.
+case_lrt_terms <- function(entry) {
+  data <- read_entry_data(entry)
+  mem <- entry$members[[1]]
+  type <- as.integer(entry$ss_type)
+  if (length(entry$members) != 1L || !identical(type, 2L) && !identical(type, 3L)) {
+    stop(sprintf("%s: lrt_terms needs one member and ss_type 2 or 3", entry$name), call. = FALSE)
+  }
+  tab <- withCallingHandlers(switch(entry$engine,
+    "afex::mixed" = {
+      if (!identical(mem$fun, "lme4::glmer") || !is.null(mem$weights)) {
+        stop(sprintf("%s: afex::mixed takes an unweighted glmer member", entry$name),
+             call. = FALSE)
+      }
+      mc <- member_call(mem, data)
+      cl <- mc$call
+      cl[[1]] <- quote(afex::mixed)
+      cl$weights <- NULL
+      cl$method <- "LRT"
+      cl$type <- type
+      cl$check_contrasts <- TRUE
+      cl$progress <- FALSE
+      a <- eval(cl, mc$env)$anova_table
+      data.frame(statistic = a[["Chisq"]], df = a[["Chi Df"]], p = a[["Pr(>Chisq)"]],
+                 row.names = rownames(a))
+    },
+    "lme4::glmer" = {
+      if (!identical(mem$fun, "lme4::glmer") || !identical(type, 2L)) {
+        stop(sprintf("%s: engine lme4::glmer takes a glmer member at ss_type 2", entry$name),
+             call. = FALSE)
+      }
+      lrt_containment_pairs(entry, mem, data)
+    },
+    "car::Anova" = {
+      if (!identical(mem$fun, "stats::glm")) {
+        stop(sprintf("%s: car::Anova takes a glm member", entry$name), call. = FALSE)
+      }
+      m <- fit_member_sum(mem, data, unlist(entry$factors))
+      a <- car::Anova(m, type = type, test.statistic = "LR")
+      data.frame(statistic = a[["LR Chisq"]], df = a[["Df"]], p = a[["Pr(>Chisq)"]],
+                 row.names = rownames(a))
+    },
+    stop(sprintf("%s: unknown engine %s", entry$name, entry$engine), call. = FALSE)),
+    warning = function(w) {
+      stop(sprintf("%s: %s", entry$name, conditionMessage(w)), call. = FALSE)
+    },
+    message = function(mm) {
+      if (!grepl("^(Contrasts set to contr.sum|Numerical variables NOT centered on 0)",
+                 conditionMessage(mm))) {
+        stop(sprintf("%s: %s", entry$name, trimws(conditionMessage(mm))), call. = FALSE)
+      }
+      invokeRestart("muffleMessage")
+    })
+  labels <- attr(terms(as.formula(mem$formula)), "term.labels")
+  labels <- labels[!grepl("|", labels, fixed = TRUE)]
+  if (!identical(rownames(tab), labels)) {
+    stop(sprintf("%s: rows are %s, the terms %s", entry$name,
+                 paste(rownames(tab), collapse = ", "), paste(labels, collapse = ", ")),
+         call. = FALSE)
+  }
+  if (any(tab$statistic < 0) || any(tab$df != round(tab$df))) {
+    stop(sprintf("%s: a negative statistic or a fractional df", entry$name), call. = FALSE)
+  }
+  list(case = entry$case, engine = entry$engine, ss_type = type, term_labels = I(labels),
+       rows = lapply(labels, function(t) {
+         c(list(term = t, statistic = tab[t, "statistic"], df = as.integer(tab[t, "df"]),
+                p = tab[t, "p"]),
+           if (!is.null(tab$full_formula)) {
+             list(full_formula = tab[t, "full_formula"],
+                  reduced_formula = tab[t, "reduced_formula"])
+           })
+       }))
+}
+
 CASES <- list(
   random_pair = case_random_pair,
   ml_pair = case_ml_pair,
@@ -530,14 +667,16 @@ CASES <- list(
   car_glm = case_car_glm,
   car_lm = case_car_lm,
   linear_hypothesis = case_linear_hypothesis,
-  nonmarginal = case_nonmarginal
+  nonmarginal = case_nonmarginal,
+  lrt_terms = case_lrt_terms
 )
 
 for (entry in select_entries("anova")) {
   cat(sprintf("%s ...\n", entry$name))
   build <- CASES[[entry$case]]
   if (is.null(build)) stop(sprintf("%s: unknown case %s", entry$name, entry$case), call. = FALSE)
-  obj <- c(list(provenance = provenance(GENERATOR, extra = "glmmTMB")),
+  extra <- if (identical(entry$case, "lrt_terms")) c("glmmTMB", "afex") else "glmmTMB"
+  obj <- c(list(provenance = provenance(GENERATOR, extra = extra)),
            check_finite(build(entry), entry$name))
   write_reference(obj, file.path(out_dir, paste0(entry$name, ".json")))
 }

@@ -37,7 +37,10 @@
 //! fits both sides of each pair, and of each `ranova` row, and compares them
 //! through [`compare`], the deviance gate first; [`anova_term_rows`] reads
 //! car's tables through [`term_tests`]. A per-term statistic, an F or a Wald
-//! χ², is the quantity `f`.
+//! χ², is the quantity `f`. [`anova_lrt_rows`] reads the likelihood-ratio
+//! term tables (afex, car, and car's Type II as `glmer` refit pairs) stored by
+//! [`run_fit`] under `anova_test = "LRT"`; their statistic is the quantity
+//! `lrt`.
 //!
 //! Where a gate goes: an integration gate on the public surface joins [`GATES`].
 //! A gate on a `pub(crate)` item cannot be reached from here, so it lives in an
@@ -60,14 +63,16 @@
 mod oracle_support;
 
 use glmm::formula::anova::{
-    compare, term_tests, CompareOptions, ComparisonTest, Model, SsType, TermTestOptions,
+    compare, term_tests, ChoiceReason, CompareOptions, ComparisonTest, Model, SsType, TermTable,
+    TermTest, TermTestError, TermTestOptions,
 };
-use glmm::formula::Lowered;
-use glmm::inference::{LinearTest, LrTest, Reference};
+use glmm::formula::{Column, Lowered};
+use glmm::inference::{LinearKind, LinearTest, LrTest, Reference};
+use glmm::orchestrate::run_fit;
 use glmm::{BinomialLink, Family, Fit, GammaLink, NegBinomialLink, Note, PoissonLink, WaldSe};
 use oracle_support::{assert_rel, assert_rel_to, divergence, inference, inference_lowered, tol};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::OnceLock;
 
 /// The registry quantities this driver adjudicates; an entry under any other
@@ -84,6 +89,7 @@ const GATES: &[(&str, Gate)] = &[
     ("lmertest_confint", lmertest_confint),
     ("anova_pairs", anova_pairs),
     ("anova_term_rows", anova_term_rows),
+    ("anova_lrt_rows", anova_lrt_rows),
 ];
 
 fn numbers(v: &Value, what: &str) -> Vec<f64> {
@@ -609,11 +615,29 @@ fn anova_pairs(compared: &mut BTreeSet<String>) {
     }
 }
 
-/// The options of a `term_tests` call asking for `ss_type`.
-fn options(ss_type: SsType) -> TermTestOptions {
+/// The per-term table of `ss_type`, its χ² rows pinned to the Wald test so
+/// they stay Wald whatever the default test gives; a fit whose rows are F
+/// tests refuses an explicit test, so its table takes the default, which must
+/// be its F table (a χ² fit that refused the Wald test fails here).
+fn term_table(lo: &Lowered, fit: &Fit, ss_type: SsType) -> Result<TermTable, TermTestError> {
     let mut opts = TermTestOptions::default();
     opts.ss_type = ss_type;
-    opts
+    opts.test = TermTest::Wald;
+    match term_tests(lo, fit, &opts) {
+        Err(TermTestError::FTable { .. }) => {
+            opts.test = TermTest::Auto;
+            let table = term_tests(lo, fit, &opts);
+            if let Ok(t) = &table {
+                assert_eq!(
+                    t.choice.test,
+                    LinearKind::F,
+                    "a χ² fit refused the Wald test"
+                );
+            }
+            table
+        }
+        other => other,
+    }
 }
 
 /// A per-term statistic, relative to car's within `band` (quantity `f`).
@@ -671,7 +695,7 @@ fn anova_term_rows(compared: &mut BTreeSet<String>) {
             vec![("type2", SsType::Type2), ("type3_sum", SsType::Type3)]
         };
         for (table, ss_type) in tables {
-            let got = term_tests(&side.lo, &side.fit, &options(ss_type))
+            let got = term_table(&side.lo, &side.fit, ss_type)
                 .unwrap_or_else(|err| panic!("{name}: {err}"));
             let rows: Vec<Value> = if table.is_empty() {
                 // The linear hypothesis as the row of the term owning its columns.
@@ -752,6 +776,198 @@ fn anova_term_rows(compared: &mut BTreeSet<String>) {
     }
 }
 
+/// The likelihood-ratio term tables' case: afex `mixed(method = "LRT")` on
+/// the GLMMs, car `Anova(test.statistic = "LR")` under `contr.sum` on the
+/// GLMs, and car's Type II containment as explicit `glmer` refit pairs
+/// (engine `lme4::glmer`).
+const LRT_CASE: &str = "lrt_terms";
+
+/// afex's `type = 2` table on `sim_factorial_bern`, which is sequential, not
+/// car's Type II: its row `x` compares `g + h + x` with `g + h`, leaving out
+/// `g:h`, which car's containment keeps. It is no reference for glmm's Type
+/// II rows and is not gated. [`LRT_TYPE2_COMPANION`] is: on `g`, `h` and
+/// `g:h` the two rules give the same pair of models, so the companion gates
+/// those hypotheses too, and on `x` it gates car's.
+const LRT_SEQUENTIAL: &str = "anova_lrt2_glmm_sim_factorial_bern";
+
+/// The Type II likelihood-ratio reference of the GLMM on `sim_factorial_bern`:
+/// car's containment as `glmer` refit pairs.
+const LRT_TYPE2_COMPANION: &str = "anova_lrt2car_glmm_sim_factorial_bern";
+
+/// Factor columns as [`run_fit`] takes them: `(levels, codes)` by name.
+type Factors = HashMap<String, (Vec<String>, Vec<u32>)>;
+
+/// `e`'s data as [`run_fit`] takes it: `oracle_support::entry_data`'s
+/// columns split into the numeric and factor maps. R's response
+/// `cbind(s, n - s)` becomes the ports' `cbind(s, failures)` on an added
+/// column `n − s`, so the formula returned is the one to fit.
+fn entry_columns(
+    e: &inference::Entry,
+    r_formula: &str,
+) -> (String, HashMap<String, Vec<f64>>, Factors) {
+    let (header, _, columns) = oracle_support::entry_data(e);
+    let (mut numeric, mut factors) = (HashMap::new(), Factors::new());
+    for (name, col) in columns {
+        match col {
+            Column::Numeric(v) => {
+                numeric.insert(name, v);
+            }
+            Column::Factor { levels, codes } => {
+                factors.insert(name, (levels, codes));
+            }
+        }
+    }
+    let Some((succ, total, rhs)) = oracle_support::aggregated_response(r_formula) else {
+        return (r_formula.to_string(), numeric, factors);
+    };
+    assert!(
+        r_formula.starts_with(&format!("cbind({succ}, {total} - {succ}) ~ ")),
+        "{}: not cbind(s, n - s): {r_formula}",
+        e.name
+    );
+    let failures = numeric[&total]
+        .iter()
+        .zip(&numeric[&succ])
+        .map(|(n, s)| n - s)
+        .collect();
+    assert!(!header.iter().any(|h| h == "failures"), "{}", e.name);
+    numeric.insert("failures".to_string(), failures);
+    (format!("cbind({succ}, failures) ~ {rhs}"), numeric, factors)
+}
+
+/// The likelihood-ratio term rows, end to end through
+/// [`run_fit`] with `anova_test = "LRT"`, the ports' route: each
+/// [`LRT_CASE`] entry's one member fitted with Hessian SEs and its `nAGQ`,
+/// and the stored likelihood-ratio table of the entry's `ss_type` read
+/// against the frozen rows: the same terms in the same order, every row a
+/// likelihood-ratio χ² with no note, referred to χ² on the frozen df exactly,
+/// the statistic within `LRT_ABS` (quantity `lrt`) and the p-value within
+/// `LT_LR_P_REL` (quantity `p_value`). No frozen model has a random slope, so no
+/// row may fall back to the Wald χ². The registry may excuse a miss (no
+/// deviance gate can: these entries freeze no `logLik`). [`LRT_SEQUENTIAL`]
+/// is left out; its model's Type II rows are read from
+/// [`LRT_TYPE2_COMPANION`].
+fn anova_lrt_rows(compared: &mut BTreeSet<String>) {
+    let mut sequential_seen = false;
+    for e in inference::entries(inference::Kind::Anova) {
+        if e.raw["case"].as_str() != Some(LRT_CASE) {
+            continue;
+        }
+        let name = e.name.as_str();
+        if name == LRT_SEQUENTIAL {
+            sequential_seen = true;
+            continue;
+        }
+        assert!(!e.is_pending(), "{name}: not frozen");
+        let json = inference::load(inference::Kind::Anova, name);
+        let members = e.raw["members"].as_array().map(Vec::len);
+        assert_eq!(members, Some(1), "{name}: one member");
+        let member = &e.raw["members"][0];
+        assert!(member["weights"].is_null(), "{name}: weights");
+        let text = |key: &str| {
+            member[key]
+                .as_str()
+                .unwrap_or_else(|| panic!("{name}: {key}"))
+        };
+        let (formula, numeric, factors) = entry_columns(&e, text("formula"));
+        let nagq = member["nAGQ"]
+            .as_u64()
+            .map_or(1, |k| u8::try_from(k).expect("nAGQ fits a u8"));
+        let r = run_fit(
+            &formula,
+            numeric,
+            factors,
+            text("family"),
+            text("link"),
+            "hessian",
+            nagq,
+            None,
+            None,
+            None,
+            None,
+            true,
+            None,
+            "LRT",
+        )
+        .unwrap_or_else(|err| panic!("{name} ({formula}): {err}"));
+        assert!(r.converged, "{name}: the fit did not converge");
+        let stored = match e.raw["ss_type"].as_u64() {
+            Some(2) => &r.term_table_type2_lrt,
+            Some(3) => &r.term_table_type3_lrt,
+            other => panic!("{name}: ss_type {other:?}"),
+        };
+        let table = stored
+            .as_ref()
+            .expect("asked for")
+            .as_ref()
+            .unwrap_or_else(|err| panic!("{name}: {err}"));
+        assert_eq!(table.choice.test, LinearKind::LikelihoodRatio, "{name}");
+        assert!(
+            matches!(table.choice.reason, ChoiceReason::Requested),
+            "{name}: {:?}",
+            table.choice.reason
+        );
+        let rows = json["rows"].as_array().expect("frozen rows");
+        let labels: Vec<&str> = table.fixed.iter().map(|r| r.label.as_str()).collect();
+        let want: Vec<&str> = rows
+            .iter()
+            .map(|r| r["term"].as_str().expect("a term"))
+            .collect();
+        assert_eq!(labels, want, "{name}: the rows");
+        for (got, row) in table.fixed.iter().zip(rows) {
+            let term = &got.label;
+            let at = format!("{name}: [{term}]");
+            let df = number(&row["df"], &at);
+            let t = &got.test;
+            assert_eq!(t.kind, LinearKind::LikelihoodRatio, "{at}: {t:?}");
+            assert!(t.notes.is_empty(), "{at}: {:?}", t.notes);
+            assert_eq!(t.num_df, df, "{at}: df");
+            assert_eq!(
+                t.reference,
+                Reference::ChiSquared { df: df as usize },
+                "{at}: the reference"
+            );
+            let want = number(&row["statistic"], &at);
+            let d = (t.statistic - want).abs();
+            eprintln!(
+                "ANOVA {at}: lrt glmm {:.10e} oracle {want:.10e} diff {d:.3e} (band {:.0e})",
+                t.statistic,
+                tol::LRT_ABS
+            );
+            assert_rel_to(
+                t.statistic,
+                want,
+                1.0,
+                tol::LRT_ABS,
+                &format!("{name}: lrt[{term}]"),
+            );
+            let want_p = number(&row["p"], &at);
+            eprintln!(
+                "ANOVA {at}: p glmm {:.10e} oracle {want_p:.10e} rel {:.3e} (band {:.0e})",
+                t.p_value,
+                (t.p_value - want_p).abs() / want_p,
+                tol::LT_LR_P_REL
+            );
+            assert_rel_to(
+                t.p_value,
+                want_p,
+                want_p,
+                tol::LT_LR_P_REL,
+                &format!("{name}: p_value[{term}]"),
+            );
+        }
+        compared.insert(e.name.clone());
+    }
+    assert!(
+        sequential_seen,
+        "{LRT_SEQUENTIAL}: no longer in the manifest; drop it here"
+    );
+    assert!(
+        compared.contains(LRT_TYPE2_COMPANION),
+        "{LRT_TYPE2_COMPANION}: not gated"
+    );
+}
+
 /// The per-term rows of the lmerTest tables through [`term_tests`]: Type III
 /// and Type II on the REML and ML `sim_factorial` fits and on
 /// `sim_factorial_empty`, F and DenDF at the end-to-end band `DF_E2E_REL`,
@@ -780,8 +996,7 @@ fn lmertest_term_rows_match_anova() {
         for (table, ss_type) in [("type3", SsType::Type3), ("type2", SsType::Type2)] {
             let frozen = &json[table];
             let terms = frozen["terms"].as_array().expect("terms");
-            let got = term_tests(&lo, &fit, &options(ss_type))
-                .unwrap_or_else(|err| panic!("{name}: {err}"));
+            let got = term_table(&lo, &fit, ss_type).unwrap_or_else(|err| panic!("{name}: {err}"));
             assert_eq!(got.fixed.len(), terms.len(), "{name} {table}: rows");
             for (k, r) in got.fixed.iter().enumerate() {
                 let at = format!("{name} {table} {}", r.label);

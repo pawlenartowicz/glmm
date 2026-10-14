@@ -285,6 +285,9 @@ def fit_one(cell):
             rec["wall_seconds"] = statistics.median(samples[1:])
             return fh
 
+        # anova_test="Wald": the grid times the fit, not the likelihood-ratio
+        # refits "auto" stores for a Poisson GLMM.
+        kw["anova_test"] = "Wald"
         fh = timed_fit(lambda: glmm.fit(data, formula, _FAMILY[cell["family"]], wald_se="hessian", **kw))
         if gaussian:
             rec["se_rx"] = nums(fh.se)  # one profiled SE, no method split

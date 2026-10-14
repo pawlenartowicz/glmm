@@ -11,11 +11,21 @@
 //!   `members`, the smaller model first), through `compare(data, f0, f1)` and
 //!   through `anova(m0, m1)` on the two members fitted one by one, each with
 //!   its own `REML` and `nAGQ`;
-//! - the Type III and Type II per-term tables of the four models in
-//!   [`TERM_MODELS`] (`y ~ g * h + x` with and without a random intercept,
-//!   gaussian on `sim_factorial` and binomial on `sim_factorial_bern`: the
-//!   lmer F layout with Satterthwaite's DenDF, the OLS F layout on the
-//!   residual df, and the Wald chi-squared layout of a GLMM and of a GLM);
+//! - the per-term tables of [`TERM_CALLS`], on the models of [`TERM_MODELS`]:
+//!   the Type III and Type II tables of `y ~ g * h + x` with and without a
+//!   random intercept, gaussian on `sim_factorial` and binomial on
+//!   `sim_factorial_bern`, at the default test `"auto"` (the lmer F layout
+//!   with Satterthwaite's DenDF, the OLS F layout on the residual df, and the
+//!   Wald chi-squared layout of a GLMM and of a GLM); the likelihood-ratio
+//!   tables (`test = "LRT"` on a fit made with `anova_test = "LRT"`), Type III
+//!   and II, of both binomial models and of a binomial GLMM with trials
+//!   (`cbpp`); and Type III tables of a Poisson GLMM at `"auto"` (its
+//!   likelihood-ratio table) and at an explicit `"Wald"`, and of a negative
+//!   binomial and a Gamma GLMM at `"auto"` (Wald), so that every reason
+//!   `"auto"` gives a chi-squared table is in some heading; and the Type III
+//!   likelihood-ratio table of a binomial GLMM whose random slope is a fixed
+//!   term, whose row keeps its Wald test with the crate's note, so that a
+//!   note is in some heading;
 //! - one `compare` on `wls_basic` with a missing value in `x2`, which only the
 //!   larger formula uses, with each fit's `nobs` as two more cells;
 //! - one exact restricted likelihood-ratio test on Dyestuff, at the default
@@ -25,13 +35,19 @@
 //! value a number, or the string `"NaN"`, `"Inf"` or `"-Inf"` where the table
 //! has no finite number (the smaller model's test cells are NaN). A call the
 //! front end refuses writes one cell, column `error`, in place of its table.
+//! A per-term table is followed by three text cells, `{"call", "row", "col",
+//! "row_index", "col_index", "text"}`: row `heading`, column `text`, the
+//! table's heading and notes as the port prints them, one line each, joined
+//! by newlines; and row `term_test_auto`, columns `test` and `reason`, the
+//! fit's tags of the test `"auto"` gives it.
 //! `compare_anova_ports.R` pins the call list and the expected refusals.
 //!
 //! The Rust side has no table object, so this file lays each table out the
 //! way both ports do (`python/glmm/anova.py`, `r/R/fastglmm-anova.R`): R's
 //! column names, one row per model with the smaller model first, rows named
 //! after the models as given (`m0`/`m1` from `anova`, `f0`/`f1` from
-//! `compare`).
+//! `compare`); and it writes a per-term table's heading as both ports do,
+//! from copies of their texts.
 //!
 //! Run from the repository root:
 //! `cargo run --release -p validation --example anova_ports > anova_rust.jsonl`
@@ -67,7 +83,7 @@ struct TermModel {
     link: &'static str,
 }
 
-/// The models whose Type III and Type II per-term tables are compared.
+/// The models whose per-term tables are compared, by label.
 const TERM_MODELS: &[TermModel] = &[
     TermModel {
         label: "lmer_sim_factorial",
@@ -101,6 +117,156 @@ const TERM_MODELS: &[TermModel] = &[
         family: "binomial",
         link: "logit",
     },
+    TermModel {
+        label: "glmer_sim_binomial_slope1",
+        data: "data/simulated/sim_binomial_slope1.csv",
+        factors: &["g"],
+        formula: "y ~ x + (1 + x | g)",
+        family: "binomial",
+        link: "logit",
+    },
+    TermModel {
+        label: "glmer_cbpp",
+        data: "data/empirical/cbpp.csv",
+        factors: &["herd", "period"],
+        formula: "cbind(incidence, size - incidence) ~ period + (1 | herd)",
+        family: "binomial",
+        link: "logit",
+    },
+    TermModel {
+        label: "glmer_poisson_grouseticks",
+        data: "data/empirical/grouseticks.csv",
+        factors: &["YEAR", "BROOD"],
+        formula: "TICKS ~ YEAR + cHEIGHT + (1 | BROOD)",
+        family: "poisson",
+        link: "log",
+    },
+    TermModel {
+        label: "glmer_nb_sim_nb",
+        data: "data/simulated/sim_nb.csv",
+        factors: &["cluster", "grp"],
+        formula: "y ~ 1 + x + grp + (1 | cluster)",
+        family: "negativebinomial",
+        link: "log",
+    },
+    TermModel {
+        label: "glmer_gamma_sim_gamma",
+        data: "data/simulated/sim_gamma.csv",
+        factors: &["cluster", "grp"],
+        formula: "y ~ 1 + x + grp + (1 | cluster)",
+        family: "gamma",
+        link: "log",
+    },
+];
+
+/// One fit's per-term calls: the model (a label in [`TERM_MODELS`]), the
+/// tables' types, and `anova`'s `test`. The fit is made with
+/// `anova_test = "LRT"` for `test = "LRT"` and at the default `"auto"`
+/// otherwise. A call is named `terms:<label>:<type>`, with `:<test>`
+/// appended when `named`.
+struct TermCall {
+    model: &'static str,
+    types: &'static [&'static str],
+    test: &'static str,
+    named: bool,
+}
+
+const TERM_CALLS: &[TermCall] = &[
+    TermCall {
+        model: "lmer_sim_factorial",
+        types: &["III", "II"],
+        test: "auto",
+        named: false,
+    },
+    TermCall {
+        model: "lm_sim_factorial",
+        types: &["III", "II"],
+        test: "auto",
+        named: false,
+    },
+    TermCall {
+        model: "glmer_sim_factorial_bern",
+        types: &["III", "II"],
+        test: "auto",
+        named: false,
+    },
+    TermCall {
+        model: "glm_sim_factorial_bern",
+        types: &["III", "II"],
+        test: "auto",
+        named: false,
+    },
+    TermCall {
+        model: "glmer_sim_factorial_bern",
+        types: &["III", "II"],
+        test: "LRT",
+        named: true,
+    },
+    TermCall {
+        model: "glm_sim_factorial_bern",
+        types: &["III", "II"],
+        test: "LRT",
+        named: true,
+    },
+    TermCall {
+        model: "glmer_cbpp",
+        types: &["III", "II"],
+        test: "LRT",
+        named: true,
+    },
+    TermCall {
+        model: "glmer_sim_binomial_slope1",
+        types: &["III"],
+        test: "LRT",
+        named: true,
+    },
+    TermCall {
+        model: "glmer_poisson_grouseticks",
+        types: &["III"],
+        test: "auto",
+        named: true,
+    },
+    TermCall {
+        model: "glmer_poisson_grouseticks",
+        types: &["III"],
+        test: "Wald",
+        named: true,
+    },
+    TermCall {
+        model: "glmer_nb_sim_nb",
+        types: &["III"],
+        test: "auto",
+        named: true,
+    },
+    TermCall {
+        model: "glmer_gamma_sim_gamma",
+        types: &["III"],
+        test: "auto",
+        named: true,
+    },
+];
+
+// The per-term headings' texts as both ports write them
+// (`python/glmm/anova.py`, `r/R/fastglmm-anova.R`), copied so that the gate
+// compares each port's heading with this one: change together with both.
+const LRT_LINE: &str = "Likelihood-ratio chi-squared tests (each term's model refitted without it)";
+const WALD_LINE: &str = "Wald chi-squared tests";
+const NOT_CONVERGED: &str = "The fit did not converge, so its estimates are not at a maximum \
+     and these tests are not reliable. Refit until the fit converges, then test again.";
+/// Why `"auto"` gave a chi-squared table its test, by the fit's
+/// `term_test_auto` reason (the ports' `_AUTO_REASONS` and `.AUTO_REASONS`).
+const AUTO_REASONS: &[(&str, &str)] = &[
+    ("poisson_mixed", "Poisson model with random effects"),
+    ("binomial_mixed", "binomial model with random effects"),
+    (
+        "negative_binomial_mixed",
+        "negative binomial model with random effects",
+    ),
+    (
+        "other_mixed",
+        "model with random effects, not binomial, Poisson or negative binomial",
+    ),
+    ("no_random_effects", "model without random effects"),
 ];
 
 /// The row of `wls_basic.csv` (0-based) whose `x2` is made missing.
@@ -305,7 +471,12 @@ fn model_of(m: &Member, r: &FitResult) -> Model {
     }
 }
 
-fn fit(data: &Data, m: &Member, weights: Option<Vec<f64>>) -> Result<FitResult, String> {
+fn fit(
+    data: &Data,
+    m: &Member,
+    weights: Option<Vec<f64>>,
+    anova_test: &str,
+) -> Result<FitResult, String> {
     orchestrate::run_fit(
         &m.formula,
         data.numeric.clone(),
@@ -320,12 +491,16 @@ fn fit(data: &Data, m: &Member, weights: Option<Vec<f64>>) -> Result<FitResult, 
         None,
         true,
         m.reml,
+        anova_test,
     )
 }
 
 /// `anova(m0, m1)` on the two members fitted one by one.
 fn anova_call(call: &str, data: &Data, m: [&Member; 2], weights: Option<Vec<f64>>) {
-    let fits = match (fit(data, m[0], weights.clone()), fit(data, m[1], weights)) {
+    let fits = match (
+        fit(data, m[0], weights.clone(), "Wald"),
+        fit(data, m[1], weights, "Wald"),
+    ) {
         (Ok(a), Ok(b)) => [a, b],
         (Err(e), _) | (_, Err(e)) => return refused(call, &e),
     };
@@ -405,54 +580,184 @@ fn pairs() {
     }
 }
 
-fn term_tables() {
-    for t in TERM_MODELS {
-        let data = read_data(t.data, t.factors);
+fn term_calls() {
+    for c in TERM_CALLS {
+        let t = TERM_MODELS
+            .iter()
+            .find(|t| t.label == c.model)
+            .expect("a model of TERM_MODELS");
+        let mut data = read_data(t.data, t.factors);
         let m = Member {
-            formula: t.formula.to_string(),
+            formula: aggregated(t.formula, &mut data),
             family: t.family.to_string(),
             link: t.link.to_string(),
             reml: None,
             nagq: 1,
         };
-        let r = fit(&data, &m, None);
-        for (ss, which) in [("III", 3), ("II", 2)] {
-            let call = format!("terms:{}:{ss}", t.label);
-            let stored = match &r {
-                Ok(r) if which == 3 => &r.term_table_type3,
-                Ok(r) => &r.term_table_type2,
-                Err(e) => {
-                    refused(&call, e);
-                    continue;
-                }
-            };
-            let tc = match stored {
-                Ok(t) => orchestrate::term_columns(t),
-                Err(e) => {
-                    refused(&call, e);
-                    continue;
-                }
-            };
-            let rows: Vec<&str> = tc.label.iter().map(String::as_str).collect();
-            let cols = if tc.kind.first() == Some(&"F") {
-                vec![
-                    ("Sum Sq", tc.sum_sq),
-                    ("Mean Sq", tc.mean_sq),
-                    ("NumDF", tc.num_df),
-                    ("DenDF", tc.den_df),
-                    ("F value", tc.statistic),
-                    ("Pr(>F)", tc.p_value),
-                ]
+        let anova_test = if c.test == "LRT" { "LRT" } else { "auto" };
+        let r = fit(&data, &m, None, anova_test);
+        for ss in c.types {
+            let call = if c.named {
+                format!("terms:{}:{ss}:{}", t.label, c.test)
             } else {
-                vec![
-                    ("Chisq", tc.statistic),
-                    ("Df", tc.num_df),
-                    ("Pr(>Chisq)", tc.p_value),
-                ]
+                format!("terms:{}:{ss}", t.label)
             };
-            table(&call, &rows, &cols);
+            match &r {
+                Ok(r) => term_table(&call, r, ss, c.test),
+                Err(e) => refused(&call, e),
+            }
         }
     }
+}
+
+/// `anova(m, type = ss, test = test)` on a stored fit, as both ports read it:
+/// the formula's refusal (the Wald slot's) first, then the refusal of an
+/// explicit `"Wald"` or `"LRT"` on F rows; then the likelihood-ratio table
+/// for `"LRT"`, and for `"auto"` where the fit's auto choice is the
+/// likelihood-ratio test; the Wald table otherwise. Laid out as both ports
+/// lay it out (lmerTest's columns on F rows, car's on chi-squared rows, Wald
+/// or likelihood-ratio), then the text cells: the heading and the fit's
+/// `term_test_auto` tags.
+fn term_table(call: &str, r: &FitResult, ss: &str, test: &str) {
+    let (wald, lrt) = if ss == "III" {
+        (&r.term_table_type3, &r.term_table_type3_lrt)
+    } else {
+        (&r.term_table_type2, &r.term_table_type2_lrt)
+    };
+    let (auto_test, auto_reason) = orchestrate::choice_tags(&r.term_test_auto);
+    let wald = match wald {
+        Ok(t) => t,
+        Err(e) => return refused(call, e),
+    };
+    if test != "auto" && f_rows(&orchestrate::term_columns(wald), r.df_method) {
+        // Both ports refuse with the crate's text, which no cell carries.
+        return refused(call, "an explicit test on F rows");
+    }
+    let stored = if test == "LRT" || (test == "auto" && auto_test == "lrt") {
+        match lrt {
+            Some(Ok(t)) => t,
+            Some(Err(e)) => return refused(call, e),
+            None => return refused(call, "no likelihood-ratio table stored"),
+        }
+    } else {
+        wald
+    };
+    let tc = orchestrate::term_columns(stored);
+    let heading = heading(&tc, r.df_method, test, auto_reason, r.converged);
+    let rows: Vec<&str> = tc.label.iter().map(String::as_str).collect();
+    let cols = if f_rows(&tc, r.df_method) {
+        vec![
+            ("Sum Sq", tc.sum_sq),
+            ("Mean Sq", tc.mean_sq),
+            ("NumDF", tc.num_df),
+            ("DenDF", tc.den_df),
+            ("F value", tc.statistic),
+            ("Pr(>F)", tc.p_value),
+        ]
+    } else {
+        vec![
+            ("Chisq", tc.statistic),
+            ("Df", tc.num_df),
+            ("Pr(>Chisq)", tc.p_value),
+        ]
+    };
+    let (n, k) = (rows.len(), cols.len());
+    table(call, &rows, &cols);
+    text(call, "heading", "text", [n, k], &heading);
+    text(call, "term_test_auto", "test", [n + 1, k + 1], auto_test);
+    text(
+        call,
+        "term_test_auto",
+        "reason",
+        [n + 1, k + 2],
+        auto_reason,
+    );
+}
+
+/// Whether a per-term table has F rows, as both ports tell: by its rows, or
+/// on a table with none by the fit's `df_method`.
+fn f_rows(tc: &orchestrate::TermColumns, df_method: &str) -> bool {
+    match tc.kind.first() {
+        Some(kind) => *kind == "F",
+        None => df_method != "none",
+    }
+}
+
+/// A per-term table's heading and notes, one line each, as both ports print
+/// them: the title (an F table names Satterthwaite's method when some row
+/// has its df, or on a table with no rows when the fit's `df_method` is
+/// Satterthwaite's; a likelihood-ratio table, or any chi-squared table under
+/// `"auto"`, takes a second line naming the test and why it ran; an explicit
+/// `"Wald"` keeps one line), then the not-converged note, the table's notes
+/// and each row's notes.
+fn heading(
+    tc: &orchestrate::TermColumns,
+    df_method: &str,
+    test: &str,
+    auto_reason: &str,
+    converged: bool,
+) -> String {
+    let ss = tc.ss_type;
+    let mut lines = Vec::new();
+    if f_rows(tc, df_method) {
+        let satterthwaite = if tc.label.is_empty() {
+            df_method == "satterthwaite"
+        } else {
+            tc.den_df_kind
+                .iter()
+                .zip(&tc.den_df)
+                .any(|(kind, d)| *kind == "satterthwaite" && d.is_finite())
+        };
+        let method = if satterthwaite {
+            " with Satterthwaite's method"
+        } else {
+            ""
+        };
+        lines.push(format!("Type {ss} Analysis of Variance Table{method}"));
+    } else if tc.test == "lrt" || test == "auto" {
+        let line = if tc.test == "lrt" {
+            let reduced = if ss == "III" {
+                " on the reduced design"
+            } else {
+                ""
+            };
+            format!("{LRT_LINE}{reduced}")
+        } else {
+            WALD_LINE.to_string()
+        };
+        let why = if test == "LRT" {
+            "test = \"LRT\"".to_string()
+        } else {
+            let reason = AUTO_REASONS
+                .iter()
+                .find(|(tag, _)| *tag == auto_reason)
+                .unwrap_or_else(|| panic!("no text for the reason {auto_reason}"));
+            format!("test = \"auto\": {}", reason.1)
+        };
+        lines.push(format!("Type {ss} Analysis of Deviance Table"));
+        lines.push(format!("{line}; {why}"));
+    } else {
+        lines.push(format!(
+            "Type {ss} Analysis of Deviance Table (Wald χ² tests)"
+        ));
+    }
+    if !converged {
+        lines.push(NOT_CONVERGED.to_string());
+    }
+    lines.extend(tc.notes.iter().cloned());
+    for (label, notes) in tc.label.iter().zip(&tc.row_notes) {
+        lines.extend(notes.iter().map(|n| format!("{label}: {n}")));
+    }
+    lines.join("\n")
+}
+
+/// One text cell (a heading, a tag) at `[row_index, col_index]`.
+fn text(call: &str, row: &str, col: &str, at: [usize; 2], s: &str) {
+    println!(
+        "{}",
+        json!({"call": call, "row": row, "col": col, "row_index": at[0],
+               "col_index": at[1], "text": s})
+    );
 }
 
 /// `compare` on `wls_basic` with `x2` missing at [`MISSING_ROW`]: the caller
@@ -497,7 +802,7 @@ fn rlrt_calls() {
 
 fn main() {
     pairs();
-    term_tables();
+    term_calls();
     missing_value_call();
     rlrt_calls();
 }

@@ -24,7 +24,8 @@ const RANK_REL_TOL: f64 = 1e-8;
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq)]
 pub struct LinearTest {
-    /// The F statistic or the Wald χ², as `kind` says.
+    /// The F statistic, the Wald χ² or the likelihood-ratio χ², as `kind`
+    /// says.
     pub statistic: f64,
     /// Which statistic `statistic` is.
     pub kind: LinearKind,
@@ -32,10 +33,10 @@ pub struct LinearTest {
     /// the hypothesis was not tested.
     pub num_df: f64,
     /// What `statistic` is referred to: [`Reference::F`] for an F test,
-    /// [`Reference::ChiSquared`] for a Wald χ². On a Wald χ² that was not
-    /// run (`num_df` NaN) or has rank 0, `ChiSquared { df: 0 }` is a
-    /// placeholder and the p-value is NaN: read the df from `num_df` and the
-    /// reason from `notes`.
+    /// [`Reference::ChiSquared`] for a Wald or likelihood-ratio χ². On a
+    /// Wald χ² that was not run (`num_df` NaN) or has rank 0,
+    /// `ChiSquared { df: 0 }` is a placeholder and the p-value is NaN: read
+    /// the df from `num_df` and the reason from `notes`.
     pub reference: Reference,
     /// `P(X ≥ statistic)` for `X` drawn from `reference`.
     pub p_value: f64,
@@ -51,6 +52,9 @@ pub enum LinearKind {
     F,
     /// A Wald χ².
     ChiSquared,
+    /// A likelihood-ratio χ², `2(ℓ̂ − ℓ̂₀)`, of the fit against its refit
+    /// under `Lβ = 0`.
+    LikelihoodRatio,
 }
 
 /// An observation about one linear test. Match the variant, never a message.
@@ -80,6 +84,19 @@ pub enum LinearNote {
         /// Why the fit has no df.
         reason: NoDfReason,
     },
+    /// A model refitted for a likelihood-ratio row (the model under
+    /// `Lβ = 0`, or on Type II the larger model too) did not converge, or its
+    /// log-likelihood is not finite, so the statistic and p-value are NaN.
+    ReducedNotConverged,
+    /// `L` touches a column that carries a random slope, which the refit
+    /// under `Lβ = 0` cannot leave out, so the row is the Wald χ² in place
+    /// of the likelihood-ratio test.
+    RandomSlopeColumn,
+    /// The likelihood-ratio statistic `2(ℓ₁ − ℓ₀)` came out below zero by
+    /// more than round-off: the model under `Lβ = 0` ended above the larger
+    /// model's fit, so that fit did not reach its own optimum. The statistic
+    /// is set to 0 (p-value 1).
+    NegativeStatistic,
 }
 
 /// The Wald χ² of `Lβ = 0`: `W = (Lβ̂)ᵀ (L V Lᵀ)⁺ (Lβ̂)` on

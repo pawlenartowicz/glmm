@@ -1348,6 +1348,7 @@ fn run_fit_returns_lowered_response_and_nobs() {
         None,
         true,
         None,
+        "Wald",
     )
     .unwrap();
     assert_eq!(r.nobs, 6);
@@ -1435,7 +1436,7 @@ mod reml_rule {
         }
         run_fit(
             formula, numeric, factors, family, link, "hessian", 1, None, None, None, None, true,
-            reml,
+            reml, "Wald",
         )
         .unwrap_or_else(|e| panic!("{formula}, reml {reml:?}: {e}"))
     }

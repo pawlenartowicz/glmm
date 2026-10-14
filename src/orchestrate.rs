@@ -16,8 +16,9 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use crate::fit::theta_width;
 use crate::formula::anova::{
-    compare, linear_note_line, nesting, term_tests, CompareError, CompareOptions, Comparison,
-    Differs, FixedRow, Model, Nesting, SsType, TermTable, TermTestOptions,
+    auto_choice, compare, linear_note_line, nesting, term_tests_cached, ChoiceReason, CompareError,
+    CompareOptions, Comparison, Differs, FixedRow, Model, Nesting, RefitCache, SsType, TermTable,
+    TermTest, TermTestOptions, TestChoice,
 };
 use crate::formula::{
     fixed_part_relation, label_ranef, lower, parse, Column, FixedPartRelation, Lowered, Table,
@@ -418,16 +419,39 @@ pub struct FitResult {
     /// flattens it to a label and a node count, [`objective_from_parts`]
     /// rebuilds it from them. Coupled sites, as for `y`.
     pub objective: Objective,
-    /// The Type III per-term table ([`term_tests`]), built at fit time so a
+    /// The Type III per-term table
+    /// ([`term_tests`](crate::formula::anova::term_tests)), built at fit time so a
     /// port's `anova(m)` reads it and computes nothing; with an empty cell,
     /// the missing-cell note is among its notes. `Err` holds the refusal's
     /// message (a formula whose interaction lacks a marginal term), which the
     /// fit itself does not raise, or, after a panic while the table was
     /// built, a message that starts "internal error". [`term_columns`]
-    /// flattens a table. Coupled sites, as for `y`.
+    /// flattens a table. The F or Wald χ² table: built under
+    /// [`TermTest::Auto`], so its [`TermTable::choice`] is the test `"auto"`
+    /// gives and why, except on a Poisson model with random effects, whose
+    /// `"auto"` is the likelihood-ratio table (`term_table_type3_lrt`), and
+    /// whose table here is built under [`TermTest::Wald`]. Coupled sites, as
+    /// for `y`.
     pub term_table_type3: Result<TermTable, String>,
     /// The Type II per-term table, as `term_table_type3`.
     pub term_table_type2: Result<TermTable, String>,
+    /// The Type III likelihood-ratio table
+    /// ([`term_tests`](crate::formula::anova::term_tests) under
+    /// [`TermTest::Lrt`]): `None` unless the fit stores it, under
+    /// [`run_fit`]'s `anova_test = "LRT"`, and under `"auto"` on a Poisson
+    /// model with random effects (built under [`TermTest::Auto`]: the same
+    /// rows, with its reason). `Err` as for `term_table_type3`, and also the
+    /// refusal of a fit whose rows are F tests. Coupled sites, as for `y`.
+    pub term_table_type3_lrt: Option<Result<TermTable, String>>,
+    /// The Type II likelihood-ratio table, as `term_table_type3_lrt`.
+    pub term_table_type2_lrt: Option<Result<TermTable, String>>,
+    /// What `"auto"`, the default test of a port's `anova(m)`, gives on this
+    /// fit and why: the F or Wald χ² of `term_table_type3` and
+    /// `term_table_type2`, or, on a Poisson model with random effects, the
+    /// likelihood-ratio χ² of `term_table_type3_lrt` and
+    /// `term_table_type2_lrt`. [`choice_tags`] flattens it. Coupled sites, as
+    /// for `y`.
+    pub term_test_auto: TestChoice,
 }
 
 /// A per-term table as the plain columns a port stores, one entry per row
@@ -436,49 +460,87 @@ pub struct FitResult {
 pub struct TermColumns {
     /// `"III"` or `"II"`.
     pub ss_type: &'static str,
+    /// The table's test ([`TermTable::choice`]), named as in `kind`.
+    pub test: &'static str,
+    /// Why the table runs `test`: `"requested"` (the test was asked for),
+    /// `"f_test"` (the F is the only test the fit's table has), or what
+    /// `"auto"` found: `"poisson_mixed"` (a Poisson model with random effects:
+    /// the likelihood-ratio χ²), and the Wald χ² on `"binomial_mixed"`,
+    /// `"negative_binomial_mixed"` and `"other_mixed"` (a model of that
+    /// family, or of another family with χ² rows, with random effects) and
+    /// `"no_random_effects"` (χ² rows and no random effects).
+    pub reason: &'static str,
     /// The term labels, as R writes them (`"g:h"`).
     pub label: Vec<String>,
-    /// `"F"` for an F row, `"chisq"` for a Wald χ² row.
+    /// `"F"` for an F row, `"chisq"` for a Wald χ² row, `"lrt"` for a
+    /// likelihood-ratio χ² row.
     pub kind: Vec<&'static str>,
-    /// The F statistic or the Wald χ².
+    /// The F statistic, or the χ² (Wald or likelihood-ratio).
     pub statistic: Vec<f64>,
-    /// The numerator df (the χ² df on a Wald row); NaN when not tested.
+    /// The numerator df (the χ² df on a χ² row); NaN when not tested.
     pub num_df: Vec<f64>,
-    /// The denominator df of an F row; NaN on a Wald χ² row.
+    /// The denominator df of an F row; NaN on a χ² row.
     pub den_df: Vec<f64>,
     /// Where an F row's denominator df comes from: `"satterthwaite"` or
-    /// `"residual"`; `""` on a Wald χ² row.
+    /// `"residual"`; `""` on a χ² row.
     pub den_df_kind: Vec<&'static str>,
     /// The p-value.
     pub p_value: Vec<f64>,
-    /// lmerTest's `Sum Sq` on an F row; NaN on a Wald χ² row.
+    /// lmerTest's `Sum Sq` on an F row; NaN on a χ² row.
     pub sum_sq: Vec<f64>,
-    /// lmerTest's `Mean Sq` on an F row; NaN on a Wald χ² row.
+    /// lmerTest's `Mean Sq` on an F row; NaN on a χ² row.
     pub mean_sq: Vec<f64>,
     /// Each row's notes as plain sentences (an aliased column, a rank below
-    /// the row count, no denominator df and why).
+    /// the row count, no denominator df and why; on a likelihood-ratio
+    /// table, a refit that did not converge, a refit above the larger model
+    /// by more than round-off (its statistic set to 0), and a random-slope
+    /// term kept on its Wald row).
     pub row_notes: Vec<Vec<String>>,
-    /// The table's notes as plain sentences (the missing-cell note).
+    /// The table's notes as plain sentences (the missing-cell note; on a
+    /// likelihood-ratio table, a fit that did not converge, with nothing
+    /// refitted, and a term whose model under its hypothesis could not be
+    /// built).
     pub notes: Vec<String>,
+}
+
+/// A row's or a table's test as [`TermColumns::kind`] names it.
+fn kind_tag(kind: LinearKind) -> &'static str {
+    match kind {
+        LinearKind::F => "F",
+        LinearKind::ChiSquared => "chisq",
+        LinearKind::LikelihoodRatio => "lrt",
+    }
+}
+
+/// A [`TestChoice`] as the two tags both FFI ports store: the test, named as
+/// in [`TermColumns::kind`], and the reason, as in [`TermColumns::reason`].
+pub fn choice_tags(choice: &TestChoice) -> (&'static str, &'static str) {
+    let reason = match choice.reason {
+        ChoiceReason::Requested => "requested",
+        ChoiceReason::FTest => "f_test",
+        ChoiceReason::PoissonMixed => "poisson_mixed",
+        ChoiceReason::BinomialMixed => "binomial_mixed",
+        ChoiceReason::NegativeBinomialMixed => "negative_binomial_mixed",
+        ChoiceReason::OtherMixed => "other_mixed",
+        ChoiceReason::NoRandomEffects => "no_random_effects",
+    };
+    (kind_tag(choice.test), reason)
 }
 
 /// A [`TermTable`] as [`TermColumns`], for both FFI ports.
 pub fn term_columns(table: &TermTable) -> TermColumns {
     let rows = &table.fixed;
     let col = |f: fn(&FixedRow) -> f64| rows.iter().map(f).collect();
+    let (test, reason) = choice_tags(&table.choice);
     TermColumns {
         ss_type: match table.ss_type {
             SsType::Type3 => "III",
             SsType::Type2 => "II",
         },
+        test,
+        reason,
         label: rows.iter().map(|r| r.label.clone()).collect(),
-        kind: rows
-            .iter()
-            .map(|r| match r.test.kind {
-                LinearKind::F => "F",
-                LinearKind::ChiSquared => "chisq",
-            })
-            .collect(),
+        kind: rows.iter().map(|r| kind_tag(r.test.kind)).collect(),
         statistic: col(|r| r.test.statistic),
         num_df: col(|r| r.test.num_df),
         den_df: col(|r| match r.test.reference {
@@ -566,6 +628,15 @@ pub fn objective_from_parts(label: &str, nodes: u8) -> Result<Objective, String>
 ///   by ML.
 ///
 /// Every value but the stripped one reaches `crate::FitOptions::reml`.
+///
+/// `anova_test` says which per-term tables the fit stores, with the values
+/// of the ports' `anova(m, test)`. Every fit stores its F or Wald χ² tables
+/// ([`FitResult::term_table_type3`], `term_table_type2`). `"LRT"` stores the
+/// likelihood-ratio tables as well ([`FitResult::term_table_type3_lrt`],
+/// `term_table_type2_lrt`), which refit the model once per distinct reduced
+/// design after the fit, and so does `"auto"` where `"auto"` gives them (a
+/// Poisson model with random effects, [`FitResult::term_test_auto`]);
+/// `"Wald"` stores none. Any other value is an error, raised before the fit.
 #[allow(clippy::too_many_arguments)]
 pub fn run_fit(
     formula: &str,
@@ -581,7 +652,18 @@ pub fn run_fit(
     warm_start: Option<(Vec<f64>, Vec<f64>, Option<f64>)>,
     satterthwaite: bool,
     reml: Option<bool>,
+    anova_test: &str,
 ) -> Result<FitResult, String> {
+    let anova_test = match anova_test {
+        "auto" => TermTest::Auto,
+        "Wald" => TermTest::Wald,
+        "LRT" => TermTest::Lrt,
+        other => {
+            return Err(format!(
+                r#"anova_test must be "auto", "Wald" or "LRT", got {other:?}"#
+            ))
+        }
+    };
     let fam = family_from_str(family, link)?;
     // `fit_warm`'s own checks of `dispersion` and the warm start name kernel
     // struct fields (`FitOptions.dispersion`, `StartValues.beta`) a port user
@@ -642,7 +724,7 @@ pub fn run_fit(
     });
 
     let fit = fit_lowered(lowered, start.as_ref())?;
-    flatten(prepared, fit)
+    flatten(prepared, fit, anova_test)
 }
 
 /// The default seed of the exact restricted likelihood-ratio test in a
@@ -701,7 +783,8 @@ pub struct CompareResult {
 /// columns and compares the two fits ([`crate::formula::anova::compare`]).
 /// `family`, `link`, `nagq`, `weights` and `offset` are given once and used
 /// for both fits, which are made as [`run_fit`] makes them with
-/// `wald_se = "hessian"`, `satterthwaite = true` and no warm start. The
+/// `wald_se = "hessian"`, `satterthwaite = true`, no warm start and
+/// `anova_test = "auto"`. The
 /// caller drops the rows with a missing value in any variable of either
 /// formula, the weights or the offset before the call.
 ///
@@ -763,8 +846,8 @@ pub fn run_compare(
     let comparison = compare(&m0, &m1, &opts).map_err(|e| e.to_string())?;
     Ok(CompareResult {
         comparison,
-        fit0: flatten(prepared0, fit0)?,
-        fit1: flatten(prepared1, fit1)?,
+        fit0: flatten(prepared0, fit0, TermTest::Auto)?,
+        fit1: flatten(prepared1, fit1, TermTest::Auto)?,
         nsim: opts.nsim,
         seed: opts.seed,
     })
@@ -969,8 +1052,10 @@ fn fit_lowered(lowered: &Lowered, start: Option<&StartValues>) -> Result<Fit, St
     .map_err(panic_message)
 }
 
-/// `fit` of `prepared` as a [`FitResult`], with its two per-term tables.
-fn flatten(prepared: Prepared, fit: Fit) -> Result<FitResult, String> {
+/// `fit` of `prepared` as a [`FitResult`], with its two per-term tables, and
+/// the two likelihood-ratio tables when `anova_test` ([`run_fit`]'s) gives
+/// them.
+fn flatten(prepared: Prepared, fit: Fit, anova_test: TermTest) -> Result<FitResult, String> {
     let Prepared {
         mut lowered,
         agq_warning,
@@ -993,12 +1078,16 @@ fn flatten(prepared: Prepared, fit: Fit) -> Result<FitResult, String> {
             (f64::NAN, f64::NAN, f64::NAN)
         };
 
-    // Both per-term tables, while `lowered` and `fit` are whole. A panic in
-    // them is stored in the table's slot, marked as an internal error so a
-    // port never shows a bug as a refusal: the fit itself stands.
-    let term_table = |ss_type| {
+    // The per-term tables, while `lowered` and `fit` are whole: the F or
+    // Wald χ² tables of both types, and both likelihood-ratio tables when
+    // `anova_test` gives them, which share their refits. A panic in one is
+    // stored in its slot, marked as an internal error so a port never shows a
+    // bug as a refusal: the fit itself stands.
+    let mut cache = RefitCache::default();
+    let mut term_table = |ss_type, test| {
         catch_unwind(AssertUnwindSafe(|| {
-            term_tests(&lowered, &fit, &TermTestOptions { ss_type })
+            let opts = TermTestOptions { ss_type, test };
+            term_tests_cached(&lowered, &fit, &opts, &mut cache)
         }))
         .map_err(|payload| {
             format!(
@@ -1008,8 +1097,22 @@ fn flatten(prepared: Prepared, fit: Fit) -> Result<FitResult, String> {
         })?
         .map_err(|e| e.to_string())
     };
-    let term_table_type3 = term_table(SsType::Type3);
-    let term_table_type2 = term_table(SsType::Type2);
+    let term_test_auto = auto_choice(&lowered, &fit);
+    let auto_lrt = term_test_auto.test == LinearKind::LikelihoodRatio;
+    let wald = if auto_lrt {
+        TermTest::Wald
+    } else {
+        TermTest::Auto
+    };
+    let lrt = match anova_test {
+        TermTest::Lrt => Some(TermTest::Lrt),
+        TermTest::Auto if auto_lrt => Some(TermTest::Auto),
+        _ => None,
+    };
+    let term_table_type3 = term_table(SsType::Type3, wald);
+    let term_table_type2 = term_table(SsType::Type2, wald);
+    let term_table_type3_lrt = lrt.map(|test| term_table(SsType::Type3, test));
+    let term_table_type2_lrt = lrt.map(|test| term_table(SsType::Type2, test));
 
     // `varcorr` and `re_groups` are both emitted in RE declaration order
     // (primary, then each extra), so index i of one names index i of the other.
@@ -1098,6 +1201,9 @@ fn flatten(prepared: Prepared, fit: Fit) -> Result<FitResult, String> {
         objective: fit.objective,
         term_table_type3,
         term_table_type2,
+        term_table_type3_lrt,
+        term_test_auto,
+        term_table_type2_lrt,
     })
 }
 
@@ -1244,7 +1350,7 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::formula::anova::{ComparisonTest, Side};
+    use crate::formula::anova::{term_tests, ComparisonTest, Side};
     use crate::inference::tails::t_two_sided_p;
     use crate::inference::LrNote;
     use crate::test_support::csv_table;
@@ -1403,7 +1509,7 @@ mod tests {
         let (numeric, factor) = toy_ols();
         let result = run_fit(
             "y ~ x", numeric, factor, "gaussian", "identity", "hessian", 1, None, None, None, None,
-            true, None,
+            true, None, "Wald",
         )
         .expect("fit should succeed");
         assert_eq!(
@@ -1427,7 +1533,7 @@ mod tests {
         let (numeric, factor) = toy_ols();
         let err = run_fit(
             "y ~ z", numeric, factor, "gaussian", "identity", "hessian", 1, None, None, None, None,
-            true, None,
+            true, None, "Wald",
         )
         .unwrap_err();
         assert_eq!(err, "unknown column: z");
@@ -1451,6 +1557,7 @@ mod tests {
             None,
             true,
             None,
+            "Wald",
         )
         .unwrap_err();
         assert!(err.contains("use one"), "{err}");
@@ -1477,6 +1584,7 @@ mod tests {
             None,
             true,
             None,
+            "Wald",
         )
         .unwrap_err();
         assert!(err.contains("use one"), "{err}");
@@ -1509,6 +1617,7 @@ mod tests {
             None,
             true,
             None,
+            "Wald",
         )
         .expect("ineligible nagq must be stripped, not an error");
         let msg = result.agq_warning.as_deref().expect("warning expected");
@@ -1550,6 +1659,7 @@ mod tests {
             None,
             true,
             None,
+            "Wald",
         )
         .expect("over-cap nagq must be stripped, not an error");
         let msg = result.agq_warning.as_deref().expect("warning expected");
@@ -1564,7 +1674,7 @@ mod tests {
         numeric.get_mut("y").unwrap()[3] = -1.0;
         let err = run_fit(
             "y ~ x", numeric, factor, "poisson", "log", "hessian", 1, None, None, None, None, true,
-            None,
+            None, "Wald",
         )
         .unwrap_err();
         assert!(err.contains("Poisson response must be >= 0"), "{err}");
@@ -1589,6 +1699,7 @@ mod tests {
             None,
             true,
             None,
+            "Wald",
         )
         .unwrap_err();
         assert!(err.contains("x"), "{err}");
@@ -1599,7 +1710,7 @@ mod tests {
         numeric.insert("junk".to_string(), vec![0.0; 1000]);
         let err = run_fit(
             "y ~ x", numeric, factor, "gaussian", "identity", "hessian", 1, None, None, None, None,
-            true, None,
+            true, None, "Wald",
         )
         .unwrap_err();
         assert!(err.contains("junk"), "{err}");
@@ -1633,6 +1744,7 @@ mod tests {
             None,
             true,
             None,
+            "Wald",
         )
         .expect("cold mixed fit should converge");
         assert!(cold.converged);
@@ -1655,6 +1767,7 @@ mod tests {
             Some((cold.beta.clone(), vec![5.0], None)),
             true,
             None,
+            "Wald",
         )
         .expect("warm-started mixed fit should converge");
         assert!(warm.converged);
@@ -1720,6 +1833,7 @@ mod tests {
             None,
             satterthwaite,
             None,
+            "Wald",
         )
         .expect("fit should succeed")
     }
@@ -1817,6 +1931,7 @@ mod tests {
             None,
             true,
             None,
+            "Wald",
         )
         .expect("fit should succeed");
         assert!(weighted.design_summary.is_none());
@@ -2012,6 +2127,7 @@ mod tests {
             None,
             true,
             None,
+            "Wald",
         )
         .expect("gamma fit should converge");
         assert!(result.converged);
@@ -2079,6 +2195,7 @@ mod tests {
             None,
             true,
             None,
+            "Wald",
         )
         .expect("hessian-SE fit should converge");
         assert!(hessian.converged);
@@ -2098,6 +2215,7 @@ mod tests {
             None,
             true,
             None,
+            "Wald",
         )
         .expect("rx-SE fit should converge");
         assert!(rx.converged);
@@ -2189,7 +2307,7 @@ mod tests {
     ) -> FitResult {
         run_fit(
             formula, numeric, factor, family, link, "hessian", nagq, None, None, offset, None,
-            true, reml,
+            true, reml, "Wald",
         )
         .unwrap_or_else(|e| panic!("{formula}: {e}"))
     }
@@ -2363,8 +2481,11 @@ mod tests {
                 (&r.term_table_type3, SsType::Type3),
                 (&r.term_table_type2, SsType::Type2),
             ] {
-                let want =
-                    term_tests(&lo, &fit, &TermTestOptions { ss_type }).map_err(|e| e.to_string());
+                let opts = TermTestOptions {
+                    ss_type,
+                    test: TermTest::Auto,
+                };
+                let want = term_tests(&lo, &fit, &opts).map_err(|e| e.to_string());
                 assert_eq!(
                     table_string(stored),
                     table_string(&want),
@@ -2410,6 +2531,217 @@ mod tests {
         let cols = term_columns(lmm.term_table_type3.as_ref().expect("a table"));
         assert_eq!(cols.label, ["g", "h", "x", "g:h"]);
         assert!(cols.den_df_kind.iter().all(|k| *k == "satterthwaite"));
+        assert_eq!(choice_tags(&lmm.term_test_auto), ("F", "f_test"));
+    }
+
+    /// `run_fit` as [`run`] makes it at `nagq = 1`, with `anova_test` given.
+    fn run_asking(
+        formula: &str,
+        (numeric, factor): Columns,
+        family: &str,
+        link: &str,
+        anova_test: &str,
+    ) -> FitResult {
+        run_fit(
+            formula, numeric, factor, family, link, "hessian", 1, None, None, None, None, true,
+            None, anova_test,
+        )
+        .unwrap_or_else(|e| panic!("{formula}: {e}"))
+    }
+
+    /// With `anova_test = "LRT"` the stored likelihood-ratio tables are
+    /// `term_tests` under `TermTest::Lrt` on the fit's own `Lowered` and
+    /// `Fit`, both types, bit for bit, although the two tables share their
+    /// refits: a GLMM (two of its four Type III refits are Type II designs),
+    /// its GLM twin, and a Gaussian LMM, whose two slots hold the refusal of
+    /// a fit with F rows. `term_columns` names the table's test and reason.
+    #[test]
+    fn run_fit_stores_the_likelihood_ratio_tables_as_term_tests_gives_them() {
+        let binomial = Family::Binomial {
+            link: BinomialLink::Logit,
+        };
+        let glmm = "y ~ g * h + x + (1 | subj)";
+        let cases = [
+            (glmm, "sim_factorial_bern", binomial),
+            ("y ~ g * h + x", "sim_factorial_bern", binomial),
+            (
+                "y ~ g * h + x + (1 + x | subj)",
+                "sim_factorial",
+                Family::Gaussian,
+            ),
+        ];
+        for (formula, data, fam) in cases {
+            let (family, link) = if fam == Family::Gaussian {
+                ("gaussian", "identity")
+            } else {
+                ("binomial", "logit")
+            };
+            let r = run_asking(formula, sim(data), family, link, "LRT");
+            let (lo, fit) = direct(formula, &sim(data), fam, 1, None, None);
+            for (stored, ss_type) in [
+                (&r.term_table_type3_lrt, SsType::Type3),
+                (&r.term_table_type2_lrt, SsType::Type2),
+            ] {
+                let stored = stored.as_ref().expect("asked for");
+                assert_eq!(stored.is_ok(), fam != Family::Gaussian, "{formula}");
+                let opts = TermTestOptions {
+                    ss_type,
+                    test: TermTest::Lrt,
+                };
+                let want = term_tests(&lo, &fit, &opts).map_err(|e| e.to_string());
+                assert_eq!(
+                    table_string(stored),
+                    table_string(&want),
+                    "{formula} on {data}"
+                );
+            }
+        }
+        let r = run_asking(glmm, sim("sim_factorial_bern"), "binomial", "logit", "LRT");
+        let t3 = r.term_table_type3_lrt.as_ref().expect("asked for");
+        let cols = term_columns(t3.as_ref().expect("a table"));
+        assert_eq!((cols.test, cols.reason), ("lrt", "requested"));
+        assert!(cols.kind.iter().all(|k| *k == "lrt"), "{:?}", cols.kind);
+    }
+
+    /// A fit other than a Poisson GLMM (here a binomial GLMM and GLM, whose
+    /// `"auto"` is the Wald χ²) stores no likelihood-ratio table unless it
+    /// asks with `anova_test = "LRT"`, and asking moves nothing else: the fit
+    /// and its two Wald tables are the same bits under `"auto"`, `"Wald"` and
+    /// `"LRT"`. Any other value is refused.
+    #[test]
+    fn no_fit_stores_a_likelihood_ratio_table_unless_asked() {
+        let glm = run_asking(
+            "y ~ g * h + x",
+            sim("sim_factorial_bern"),
+            "binomial",
+            "logit",
+            "auto",
+        );
+        assert_eq!(
+            choice_tags(&glm.term_test_auto),
+            ("chisq", "no_random_effects")
+        );
+        assert!(glm.term_table_type3_lrt.is_none() && glm.term_table_type2_lrt.is_none());
+        let formula = "y ~ g * h + x + (1 | subj)";
+        let data = || sim("sim_factorial_bern");
+        let asked = run_asking(formula, data(), "binomial", "logit", "LRT");
+        assert!(asked.term_table_type3_lrt.is_some() && asked.term_table_type2_lrt.is_some());
+        assert_eq!(
+            choice_tags(&asked.term_test_auto),
+            ("chisq", "binomial_mixed")
+        );
+        for anova_test in ["auto", "Wald"] {
+            let r = run_asking(formula, data(), "binomial", "logit", anova_test);
+            assert_eq!(
+                choice_tags(&r.term_test_auto),
+                ("chisq", "binomial_mixed"),
+                "{anova_test}"
+            );
+            assert!(
+                r.term_table_type3_lrt.is_none() && r.term_table_type2_lrt.is_none(),
+                "{anova_test}"
+            );
+            assert_eq!(kernel_fields(&r), kernel_fields(&asked), "{anova_test}");
+            for (t, u) in [
+                (&r.term_table_type3, &asked.term_table_type3),
+                (&r.term_table_type2, &asked.term_table_type2),
+            ] {
+                assert_eq!(table_string(t), table_string(u), "{anova_test}");
+            }
+        }
+        let (numeric, factor) = data();
+        let err = run_fit(
+            formula, numeric, factor, "binomial", "logit", "hessian", 1, None, None, None, None,
+            true, None, "lrt",
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            r#"anova_test must be "auto", "Wald" or "LRT", got "lrt""#
+        );
+    }
+
+    /// A Poisson GLMM's `"auto"` is the likelihood-ratio χ², so the fit
+    /// stores the likelihood-ratio tables under `"auto"` (built under
+    /// `TermTest::Auto`) as under `"LRT"`, with the same rows; `"Wald"`
+    /// stores none. Its two other slots hold the Wald tables under every
+    /// value, and the fit is the same bits under all three.
+    #[test]
+    fn auto_stores_the_likelihood_ratio_tables_of_a_poisson_glmm() {
+        let formula = "y ~ x + (1 | g)";
+        let poisson = Family::Poisson {
+            link: PoissonLink::Log,
+        };
+        let (lo, fit) = direct(formula, &sim("glmm_poisson"), poisson, 1, None, None);
+        let want = |ss_type, test| {
+            let opts = TermTestOptions { ss_type, test };
+            table_string(&term_tests(&lo, &fit, &opts).map_err(|e| e.to_string()))
+        };
+        let values = ["auto", "Wald", "LRT"];
+        let fits = values.map(|t| run_asking(formula, sim("glmm_poisson"), "poisson", "log", t));
+        for (r, anova_test) in fits.iter().zip(values) {
+            assert_eq!(
+                choice_tags(&r.term_test_auto),
+                ("lrt", "poisson_mixed"),
+                "{anova_test}"
+            );
+            assert_eq!(kernel_fields(r), kernel_fields(&fits[0]), "{anova_test}");
+            for (wald, lrt, ss_type) in [
+                (&r.term_table_type3, &r.term_table_type3_lrt, SsType::Type3),
+                (&r.term_table_type2, &r.term_table_type2_lrt, SsType::Type2),
+            ] {
+                assert_eq!(
+                    table_string(wald),
+                    want(ss_type, TermTest::Wald),
+                    "{anova_test}"
+                );
+                let asked = match anova_test {
+                    "auto" => TermTest::Auto,
+                    "LRT" => TermTest::Lrt,
+                    _ => {
+                        assert!(lrt.is_none(), "{anova_test}");
+                        continue;
+                    }
+                };
+                let lrt = lrt.as_ref().expect("stored");
+                assert_eq!(table_string(lrt), want(ss_type, asked), "{anova_test}");
+            }
+        }
+        let cols = |r: &FitResult| {
+            term_columns(r.term_table_type3_lrt.as_ref().unwrap().as_ref().unwrap())
+        };
+        let (auto, asked) = (cols(&fits[0]), cols(&fits[2]));
+        assert_eq!((auto.test, auto.reason), ("lrt", "poisson_mixed"));
+        assert_eq!((asked.test, asked.reason), ("lrt", "requested"));
+        let rows =
+            |c: &TermColumns| format!("{:?}", (&c.label, &c.statistic, &c.p_value, &c.notes));
+        assert_eq!(rows(&auto), rows(&asked));
+    }
+
+    /// `compare()`'s two fits are made as `"auto"` makes them: on a Poisson
+    /// GLMM pair both store the likelihood-ratio tables `anova(fit)` reads by
+    /// default.
+    #[test]
+    fn run_compare_makes_its_fits_as_auto() {
+        let (numeric, factor) = sim("glmm_poisson");
+        let r = run_compare(
+            "y ~ 1 + (1 | g)",
+            "y ~ x + (1 | g)",
+            numeric,
+            factor,
+            "poisson",
+            "log",
+            1,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("compares");
+        for f in [&r.fit0, &r.fit1] {
+            assert_eq!(choice_tags(&f.term_test_auto), ("lrt", "poisson_mixed"));
+            assert!(f.term_table_type3_lrt.is_some() && f.term_table_type2_lrt.is_some());
+        }
     }
 
     /// The four estimator cases of `run_compare`: each pair fitted the way
@@ -2764,8 +3096,18 @@ mod tests {
                 sim(data)
             };
             let (lo, fit) = direct(formula, &columns, fam, 1, None, None);
-            let t = term_tests(&lo, &fit, &TermTestOptions { ss_type }).expect("a table");
+            let opts = TermTestOptions {
+                ss_type,
+                test: TermTest::Auto,
+            };
+            let t = term_tests(&lo, &fit, &opts).expect("a table");
             let c = term_columns(&t);
+            let reason = if kind == "F" {
+                "f_test"
+            } else {
+                "binomial_mixed"
+            };
+            assert_eq!((c.test, c.reason), (kind, reason), "{formula} on {data}");
             let n = t.fixed.len();
             assert!(n > 0, "{formula} on {data}");
             let ss = if ss_type == SsType::Type3 {
@@ -2982,16 +3324,18 @@ mod tests {
         assert_eq!(err, CompareError::DifferentOffset.to_string());
     }
 
-    /// A panic while a per-term table is built is stored as that table's
-    /// internal error, never as a refusal, and the fit stands.
+    /// A panic while a per-term table is built, a likelihood-ratio table
+    /// included, is stored as that table's internal error, never as a
+    /// refusal, and the fit stands.
     #[test]
     fn a_panic_in_the_term_tables_is_stored_as_an_internal_error() {
-        let (numeric, factor) = toy_ols();
-        let data = table_of(numeric, factor).expect("a table");
+        let data = table(&sim("sim_factorial_bern"));
         let prepared = lower_with(
-            "y ~ x",
+            "y ~ g + x",
             &data,
-            Family::Gaussian,
+            Family::Binomial {
+                link: BinomialLink::Logit,
+            },
             "hessian",
             1,
             None,
@@ -3004,8 +3348,13 @@ mod tests {
         let mut fit = fit_lowered(&prepared.lowered, None).expect("fits");
         // `term_tests` reads `aliased` at each column, past its end now.
         fit.diagnostics.aliased.clear();
-        let r = flatten(prepared, fit).expect("the fit stands");
-        for t in [&r.term_table_type3, &r.term_table_type2] {
+        let r = flatten(prepared, fit, TermTest::Lrt).expect("the fit stands");
+        let lrt = [&r.term_table_type3_lrt, &r.term_table_type2_lrt]
+            .map(|t| t.as_ref().expect("asked for"));
+        for t in [&r.term_table_type3, &r.term_table_type2]
+            .into_iter()
+            .chain(lrt)
+        {
             let err = t.as_ref().unwrap_err();
             assert!(
                 err.starts_with(

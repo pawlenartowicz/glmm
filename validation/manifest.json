@@ -3458,6 +3458,243 @@
           "weights": null
         }
       ]
+    },
+    {
+      "name": "anova_lrt3_glmm_cbpp",
+      "kind": "anova",
+      "data": "data/empirical/cbpp.csv",
+      "r_formula": "cbind(incidence, size - incidence) ~ period + (1 | herd)",
+      "factors": [
+        "herd",
+        "period"
+      ],
+      "generator": "goldens_anova.R",
+      "case": "lrt_terms",
+      "engine": "afex::mixed",
+      "ss_type": 3,
+      "members": [
+        {
+          "fun": "lme4::glmer",
+          "formula": "cbind(incidence, size - incidence) ~ period + (1 | herd)",
+          "family": "binomial",
+          "link": "logit",
+          "REML": null,
+          "nAGQ": 1,
+          "weights": null,
+          "tolPwrss": 1e-13
+        }
+      ]
+    },
+    {
+      "name": "anova_lrt2_glmm_cbpp",
+      "kind": "anova",
+      "data": "data/empirical/cbpp.csv",
+      "r_formula": "cbind(incidence, size - incidence) ~ period + (1 | herd)",
+      "factors": [
+        "herd",
+        "period"
+      ],
+      "generator": "goldens_anova.R",
+      "case": "lrt_terms",
+      "engine": "afex::mixed",
+      "ss_type": 2,
+      "members": [
+        {
+          "fun": "lme4::glmer",
+          "formula": "cbind(incidence, size - incidence) ~ period + (1 | herd)",
+          "family": "binomial",
+          "link": "logit",
+          "REML": null,
+          "nAGQ": 1,
+          "weights": null,
+          "tolPwrss": 1e-13
+        }
+      ]
+    },
+    {
+      "name": "anova_lrt3_glmm_grouseticks",
+      "kind": "anova",
+      "data": "data/empirical/grouseticks.csv",
+      "r_formula": "TICKS ~ YEAR + cHEIGHT + (1 | BROOD)",
+      "factors": [
+        "YEAR",
+        "BROOD"
+      ],
+      "generator": "goldens_anova.R",
+      "case": "lrt_terms",
+      "engine": "afex::mixed",
+      "ss_type": 3,
+      "members": [
+        {
+          "fun": "lme4::glmer",
+          "formula": "TICKS ~ YEAR + cHEIGHT + (1 | BROOD)",
+          "family": "poisson",
+          "link": "log",
+          "REML": null,
+          "nAGQ": 1,
+          "weights": null,
+          "tolPwrss": 1e-13
+        }
+      ]
+    },
+    {
+      "name": "anova_lrt2_glmm_grouseticks",
+      "kind": "anova",
+      "data": "data/empirical/grouseticks.csv",
+      "r_formula": "TICKS ~ YEAR + cHEIGHT + (1 | BROOD)",
+      "factors": [
+        "YEAR",
+        "BROOD"
+      ],
+      "generator": "goldens_anova.R",
+      "case": "lrt_terms",
+      "engine": "afex::mixed",
+      "ss_type": 2,
+      "members": [
+        {
+          "fun": "lme4::glmer",
+          "formula": "TICKS ~ YEAR + cHEIGHT + (1 | BROOD)",
+          "family": "poisson",
+          "link": "log",
+          "REML": null,
+          "nAGQ": 1,
+          "weights": null,
+          "tolPwrss": 1e-13
+        }
+      ]
+    },
+    {
+      "name": "anova_lrt3_glmm_sim_factorial_bern",
+      "kind": "anova",
+      "data": "data/simulated/sim_factorial_bern.csv",
+      "r_formula": "y ~ g * h + x + (1 | subj)",
+      "factors": [
+        "subj",
+        "g",
+        "h"
+      ],
+      "generator": "goldens_anova.R",
+      "case": "lrt_terms",
+      "engine": "afex::mixed",
+      "ss_type": 3,
+      "members": [
+        {
+          "fun": "lme4::glmer",
+          "formula": "y ~ g * h + x + (1 | subj)",
+          "family": "binomial",
+          "link": "logit",
+          "REML": null,
+          "nAGQ": 1,
+          "weights": null,
+          "tolPwrss": 1e-13
+        }
+      ]
+    },
+    {
+      "name": "anova_lrt2_glmm_sim_factorial_bern",
+      "//": "afex type = 2 is sequential, not car's Type II: the row x compares g + h + x with g + h (g:h left out). Not the Type II likelihood-ratio reference; that is anova_lrt2car_glmm_sim_factorial_bern.",
+      "kind": "anova",
+      "data": "data/simulated/sim_factorial_bern.csv",
+      "r_formula": "y ~ g * h + x + (1 | subj)",
+      "factors": [
+        "subj",
+        "g",
+        "h"
+      ],
+      "generator": "goldens_anova.R",
+      "case": "lrt_terms",
+      "engine": "afex::mixed",
+      "ss_type": 2,
+      "members": [
+        {
+          "fun": "lme4::glmer",
+          "formula": "y ~ g * h + x + (1 | subj)",
+          "family": "binomial",
+          "link": "logit",
+          "REML": null,
+          "nAGQ": 1,
+          "weights": null,
+          "tolPwrss": 1e-13
+        }
+      ]
+    },
+    {
+      "name": "anova_lrt2car_glmm_sim_factorial_bern",
+      "//": "car's Type II containment as explicit glmer refit pairs: a term is tested in the model of every term that does not contain it (the row x compares g * h + x with g * h).",
+      "kind": "anova",
+      "data": "data/simulated/sim_factorial_bern.csv",
+      "r_formula": "y ~ g * h + x + (1 | subj)",
+      "factors": [
+        "subj",
+        "g",
+        "h"
+      ],
+      "generator": "goldens_anova.R",
+      "case": "lrt_terms",
+      "engine": "lme4::glmer",
+      "ss_type": 2,
+      "members": [
+        {
+          "fun": "lme4::glmer",
+          "formula": "y ~ g * h + x + (1 | subj)",
+          "family": "binomial",
+          "link": "logit",
+          "REML": null,
+          "nAGQ": 1,
+          "weights": null,
+          "tolPwrss": 1e-13
+        }
+      ]
+    },
+    {
+      "name": "anova_lrt3_glm_sim_factorial_bern",
+      "kind": "anova",
+      "data": "data/simulated/sim_factorial_bern.csv",
+      "r_formula": "y ~ g * h + x",
+      "factors": [
+        "g",
+        "h"
+      ],
+      "generator": "goldens_anova.R",
+      "case": "lrt_terms",
+      "engine": "car::Anova",
+      "ss_type": 3,
+      "members": [
+        {
+          "fun": "stats::glm",
+          "formula": "y ~ g * h + x",
+          "family": "binomial",
+          "link": "logit",
+          "REML": null,
+          "nAGQ": null,
+          "weights": null
+        }
+      ]
+    },
+    {
+      "name": "anova_lrt2_glm_sim_factorial_bern",
+      "kind": "anova",
+      "data": "data/simulated/sim_factorial_bern.csv",
+      "r_formula": "y ~ g * h + x",
+      "factors": [
+        "g",
+        "h"
+      ],
+      "generator": "goldens_anova.R",
+      "case": "lrt_terms",
+      "engine": "car::Anova",
+      "ss_type": 2,
+      "members": [
+        {
+          "fun": "stats::glm",
+          "formula": "y ~ g * h + x",
+          "family": "binomial",
+          "link": "logit",
+          "REML": null,
+          "nAGQ": null,
+          "weights": null
+        }
+      ]
     }
   ]
 }

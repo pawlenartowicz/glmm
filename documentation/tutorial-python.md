@@ -150,6 +150,13 @@ fit = glmm.fit(data, "s ~ x1 + (1 | group)", "binomial", link="probit", nagq=7)
   `False` the ML one. Every other family is fitted by maximum likelihood;
   `False` there changes nothing, and `True` is ignored with an
   `ArgumentIgnoredWarning`. `fit.reml` says which criterion `fit.loglik` is.
+- `anova_test`: which per-term tables the fit stores for `glmm.anova`. Every
+  fit stores its Wald or F tables. `"auto"` (default) also stores the
+  likelihood-ratio tables of a Poisson model with random effects, the rows
+  `glmm.anova(fit)` gives it by default; `"LRT"` stores them on every fit
+  with chi-squared rows, so that `glmm.anova(fit, test="LRT")` can read them;
+  `"Wald"` stores none. A likelihood-ratio table costs one refit per reduced
+  model, made after the fit; the fit itself is the same under every value.
 
 **Error vs. warning.** An *invalid* value — unknown family, a link the family
 doesn't offer, even `nagq` (`ValueError`), a non-dict `warm_start`
@@ -197,7 +204,7 @@ them). It is returned by `fit`, never constructed by callers.
 | `singular` | boundary (singular) fit — `>=1` RE variance component pinned at 0; mirrors lme4's `isSingular` |
 | `offset` | `(n,)` the offset the model was fitted with; `None` without one |
 | `objective`, `objective_nodes` | what the fit maximised: `"least_squares"` (OLS), `"maximum_likelihood"` (a GLM, or a Gaussian mixed model fitted by ML), `"reml"`, `"laplace"` or `"agq"`, and the quadrature node count (`0` off a GLMM); `glmm.anova(m0, m1)` labels its test with it |
-| `term_table_type3`, `term_table_type2`, `design_summary` | what `glmm.anova` reads: the per-term tables built when the fit was made, and the design summary the exact random-intercept test needs (`None` off its envelope); read them through `glmm.anova` |
+| `term_table_type3`, `term_table_type2`, `term_table_type3_lrt`, `term_table_type2_lrt`, `term_test_auto`, `design_summary` | what `glmm.anova` reads: the per-term tables built when the fit was made (the likelihood-ratio ones `None` unless `anova_test` stored them), what `test="auto"` gives on this fit, and the design summary the exact random-intercept test needs (`None` off its envelope); read them through `glmm.anova` |
 | `dispersion_held` | the number passed as `dispersion=` (gamma / inverse-gaussian only); `None` when φ was estimated or the argument does not apply. When it is set, `summary()` labels the dispersion "fixed" |
 | `diagnostics` | dict with `converged`, `singular`, `aliased`, `boundary`, `pinned`, `notes` — the solver's own report; `converged`/`singular`/`aliased` above are `@property` forwarders over `diagnostics[...]`, kept at the top level for the most-read fields |
 
@@ -319,6 +326,14 @@ glmm.anova(m0, m1)
 # statistic is 0 and p = 1 (no draws are needed); hypothesis-tests.md shows a
 # comparison on sleepstudy.
 ```
+
+On a fit with chi-squared rows, `glmm.anova(fit, test="Wald")` or
+`glmm.anova(fit, test="LRT")` picks the test of the rows. The default,
+`test="auto"`, gives a Poisson model with random effects the
+likelihood-ratio rows and every other fit its Wald or F rows. The
+likelihood-ratio rows are refitted when the model is fitted, by default only
+on a Poisson GLMM; on any other fit, ask for them with
+`glmm.fit(..., anova_test="LRT")` first.
 
 Both tables are indexed by R's column names, print as text, render to
 `html()`, `latex()` and `typst()`, and convert with `to_pandas()` (pandas is

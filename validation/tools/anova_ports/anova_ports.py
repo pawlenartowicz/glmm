@@ -61,6 +61,65 @@ TERM_MODELS = [
         "binomial",
         "logit",
     ),
+    (
+        "glmer_sim_binomial_slope1",
+        "data/simulated/sim_binomial_slope1.csv",
+        ["g"],
+        "y ~ x + (1 + x | g)",
+        "binomial",
+        "logit",
+    ),
+    (
+        "glmer_cbpp",
+        "data/empirical/cbpp.csv",
+        ["herd", "period"],
+        "cbind(incidence, size - incidence) ~ period + (1 | herd)",
+        "binomial",
+        "logit",
+    ),
+    (
+        "glmer_poisson_grouseticks",
+        "data/empirical/grouseticks.csv",
+        ["YEAR", "BROOD"],
+        "TICKS ~ YEAR + cHEIGHT + (1 | BROOD)",
+        "poisson",
+        "log",
+    ),
+    (
+        "glmer_nb_sim_nb",
+        "data/simulated/sim_nb.csv",
+        ["cluster", "grp"],
+        "y ~ 1 + x + grp + (1 | cluster)",
+        "negativebinomial",
+        "log",
+    ),
+    (
+        "glmer_gamma_sim_gamma",
+        "data/simulated/sim_gamma.csv",
+        ["cluster", "grp"],
+        "y ~ 1 + x + grp + (1 | cluster)",
+        "gamma",
+        "log",
+    ),
+]
+
+# One fit's per-term calls, as anova_ports.rs's TERM_CALLS: (model label,
+# types, test, named). The fit is made with anova_test="LRT" for test="LRT"
+# and at the default "auto" otherwise; a call is named terms:<label>:<type>,
+# with :<test> appended when named.
+TERM_CALLS = [
+    ("lmer_sim_factorial", ["III", "II"], "auto", False),
+    ("lm_sim_factorial", ["III", "II"], "auto", False),
+    ("glmer_sim_factorial_bern", ["III", "II"], "auto", False),
+    ("glm_sim_factorial_bern", ["III", "II"], "auto", False),
+    ("glmer_sim_factorial_bern", ["III", "II"], "LRT", True),
+    ("glm_sim_factorial_bern", ["III", "II"], "LRT", True),
+    ("glmer_cbpp", ["III", "II"], "LRT", True),
+    ("glmer_sim_binomial_slope1", ["III"], "LRT", True),
+    ("glmer_poisson_grouseticks", ["III"], "auto", True),
+    ("glmer_poisson_grouseticks", ["III"], "Wald", True),
+    ("glmer_nb_sim_nb", ["III"], "auto", True),
+    ("glmer_gamma_sim_gamma", ["III"], "auto", True),
 ]
 
 MISSING_ROW = 4  # 0-based row of wls_basic.csv whose x2 is made missing
@@ -139,6 +198,22 @@ def table(call, rows, cols):
             )
 
 
+def text(call, row, col, at, s):
+    """One text cell (a heading, a tag) at `at`, (row_index, col_index)."""
+    print(
+        json.dumps(
+            {
+                "call": call,
+                "row": row,
+                "col": col,
+                "row_index": at[0],
+                "col_index": at[1],
+                "text": s,
+            }
+        )
+    )
+
+
 def refused(call, why):
     print(f"{call}: refused: {why}", file=sys.stderr)
     table(call, [""], [("error", [math.nan])])
@@ -150,7 +225,7 @@ def port_table(call, tab):
     table(call, list(tab.row_names), [(c, list(tab[c])) for c in tab.columns])
 
 
-def fit(data, m, weights):
+def fit(data, m, weights, anova_test="auto"):
     return glmm.fit(
         data,
         m["formula"],
@@ -159,6 +234,7 @@ def fit(data, m, weights):
         weights=weights,
         nagq=m["nagq"],
         reml=m["reml"],
+        anova_test=anova_test,
     )
 
 
@@ -204,22 +280,38 @@ def pairs():
         anova_call(f"anova:{name}", data, m, weights)
 
 
-def term_tables():
-    for label, path, factors, formula, family, link in TERM_MODELS:
+def term_calls():
+    """`glmm.anova(m, type=, test=)` per TERM_CALLS, each table followed by
+    its text cells: the heading and notes, and the fit's `term_test_auto`."""
+    models = {t[0]: t[1:] for t in TERM_MODELS}
+    for label, types, test, named in TERM_CALLS:
+        path, factors, formula, family, link = models[label]
         data = read_data(path, factors)
-        m = {"formula": formula, "family": family, "link": link, "reml": None, "nagq": 1}
+        m = {
+            "formula": aggregated(formula, data),
+            "family": family,
+            "link": link,
+            "reml": None,
+            "nagq": 1,
+        }
+        calls = [f"terms:{label}:{ss}" + (f":{test}" if named else "") for ss in types]
         try:
-            f = fit(data, m, None)
+            f = fit(data, m, None, anova_test="LRT" if test == "LRT" else "auto")
         except ValueError as e:
-            for ss in ("III", "II"):
-                refused(f"terms:{label}:{ss}", e)
+            for call in calls:
+                refused(call, e)
             continue
-        for ss in ("III", "II"):
-            call = f"terms:{label}:{ss}"
+        for ss, call in zip(types, calls):
             try:
-                port_table(call, glmm.anova(f, type=ss))
+                tab = glmm.anova(f, type=ss, test=test)
             except ValueError as e:
                 refused(call, e)
+                continue
+            port_table(call, tab)
+            n, k = len(tab.row_names), len(tab.columns)
+            text(call, "heading", "text", (n, k), "\n".join([tab.heading, *tab.notes]))
+            text(call, "term_test_auto", "test", (n + 1, k + 1), f.term_test_auto["test"])
+            text(call, "term_test_auto", "reason", (n + 1, k + 2), f.term_test_auto["reason"])
 
 
 def missing_value_call():
@@ -244,6 +336,6 @@ def rlrt_calls():
 
 if __name__ == "__main__":
     pairs()
-    term_tables()
+    term_calls()
     missing_value_call()
     rlrt_calls()

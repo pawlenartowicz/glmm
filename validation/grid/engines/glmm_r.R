@@ -123,6 +123,8 @@ do_fit <- function(data, formula, family, wald_se, nagq, reml) {
   # weights/weights_col field and an offset_col at once by construction, but
   # the arm exists so one would not silently drop the other's column.
   # `reml` is FALSE on a cell tagged `ml` and NULL (the default) otherwise.
+  # anova_test = "Wald": the grid times the fit, not the likelihood-ratio
+  # refits "auto" stores for a Poisson GLMM.
   # suppressWarnings: the expected singular-boundary / nAGQ-fallback notices
   # are captured on the fit object (singular, converged), not needed on
   # stderr for a run of ~800 cells.
@@ -131,15 +133,17 @@ do_fit <- function(data, formula, family, wald_se, nagq, reml) {
   suppressWarnings(
     if (has_w && has_o)
       fastglmm(formula, data, family, weights = validation_wts,
-               offset = validation_off, wald.se = wald_se, nAGQ = nagq, REML = reml)
+               offset = validation_off, wald.se = wald_se, nAGQ = nagq, REML = reml,
+               anova_test = "Wald")
     else if (has_w)
       fastglmm(formula, data, family, weights = validation_wts,
-               wald.se = wald_se, nAGQ = nagq, REML = reml)
+               wald.se = wald_se, nAGQ = nagq, REML = reml, anova_test = "Wald")
     else if (has_o)
       fastglmm(formula, data, family, offset = validation_off,
-               wald.se = wald_se, nAGQ = nagq, REML = reml)
+               wald.se = wald_se, nAGQ = nagq, REML = reml, anova_test = "Wald")
     else
-      fastglmm(formula, data, family, wald.se = wald_se, nAGQ = nagq, REML = reml)
+      fastglmm(formula, data, family, wald.se = wald_se, nAGQ = nagq, REML = reml,
+               anova_test = "Wald")
   )
 }
 

@@ -16,10 +16,12 @@
 
 use std::cmp::Reverse;
 
-use faer::Mat;
+use faer::{Mat, MatRef};
 
 use super::materialize::Lowered;
+use crate::inference::evd::sym_eigen;
 use crate::linalg::SeqLlt;
+use crate::ColumnId;
 
 /// One term's hypothesis matrix, in lmerTest's basis.
 pub struct TermHypothesis {
@@ -44,6 +46,21 @@ pub struct TermHypothesis {
 /// a 0-row entry, where lmerTest returns one unnamed 0-row matrix. A design
 /// that is singular on `retained` (outside the contract) gives NaN entries.
 pub(crate) fn type3(lo: &Lowered, retained: &[usize]) -> Vec<TermHypothesis> {
+    type3_with(lo, retained, zapsmall)
+}
+
+/// [`type3`] with each `zapsmall` replaced by [`zap`]: the entries
+/// `zapsmall` would round to zero set to zero, the rest unrounded. A Type III
+/// likelihood-ratio row takes its reduced design's null basis from these
+/// ([`type3_null_basis`]): where the Type III weights do not terminate (1/3
+/// on an unbalanced design), the 7-digit rounding tilts the hypothesis by
+/// about 5e-8, and a refit would carry the tilt into its statistic.
+pub(crate) fn type3_unrounded(lo: &Lowered, retained: &[usize]) -> Vec<TermHypothesis> {
+    type3_with(lo, retained, zap)
+}
+
+/// [`type3`]'s construction, each rounding step done by `round`.
+fn type3_with(lo: &Lowered, retained: &[usize], round: fn(&mut Mat<f64>)) -> Vec<TermHypothesis> {
     let d = Design::new(lo, retained);
     if d.type1_fallback() {
         return d.type1();
@@ -56,7 +73,7 @@ pub(crate) fn type3(lo: &Lowered, retained: &[usize]) -> Vec<TermHypothesis> {
         None => a.fill(f64::NAN),
     }
     let mut l = a.transpose().to_owned();
-    zapsmall(&mut l);
+    round(&mut l);
 
     let mut order: Vec<usize> = (0..lo.terms.len()).collect();
     order.sort_by_key(|&t| Reverse(lo.terms[t].vars.len()));
@@ -69,7 +86,7 @@ pub(crate) fn type3(lo: &Lowered, retained: &[usize]) -> Vec<TermHypothesis> {
             .flat_map(|&u| d.map[u].iter().copied())
             .collect();
         let mut res = residuals(&l, &basis, &d.map[t]);
-        zapsmall(&mut res);
+        round(&mut res);
         for (j, &c) in d.map[t].iter().enumerate() {
             for r in 0..k {
                 l[(r, c)] = res[(r, j)];
@@ -185,8 +202,7 @@ pub(crate) fn type2_vcov(
         .iter()
         .enumerate()
         .map(|(t, term)| {
-            let rel: Vec<usize> = (0..lo.terms.len())
-                .filter(|&u| u != t && term.vars.iter().all(|x| lo.terms[u].vars.contains(x)))
+            let rel: Vec<usize> = relatives(lo, t)
                 .flat_map(|u| d.map[u].iter().copied())
                 .collect();
             let cols = &d.map[t];
@@ -212,6 +228,185 @@ pub(crate) fn type2_vcov(
                 })
                 .collect();
             d.hypothesis(&term.label, &rows)
+        })
+        .collect()
+}
+
+/// car's relatives of term `t` (`car:::relatives`), the containment of
+/// [`type2_vcov`] and [`type2_lr_sets`]: the other terms whose variables
+/// include all of its own, numeric or not, in term order.
+fn relatives(lo: &Lowered, t: usize) -> impl Iterator<Item = usize> + '_ {
+    let vars = &lo.terms[t].vars;
+    (0..lo.terms.len())
+        .filter(move |&u| u != t && vars.iter().all(|x| lo.terms[u].vars.contains(x)))
+}
+
+/// Why a term has no reduced design for a likelihood-ratio row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReducedDesignError {
+    /// The term's hypothesis touches a column that carries a random slope
+    /// (Type III), or its reduced design drops one (Type II): `Grouping::slopes`
+    /// indexes design columns, so the kernel cannot fit a design that mixes or
+    /// drops such a column.
+    SlopeTouched,
+    /// No basis meets `‖E·N‖ ≤ 1e-12·‖E‖` ([`type3_null_basis`]): the
+    /// hypothesis has a non-finite entry, the eigensolver failed, the
+    /// hypothesis is too ill-conditioned for the bound, or its unrounded and
+    /// rounded forms differ in rank.
+    NoNullBasis,
+}
+
+/// The column sets of car's Type II likelihood-ratio tests
+/// (`Anova(type = 2, test.statistic = "LR")`), one `(full, reduced)` pair per
+/// term of [`Lowered::terms`] in that order. `full` is the model of every term
+/// that is not one of the term's relatives (the containment [`type2_vcov`]
+/// reads, so on `y ~ time * group` with a numeric `time`, `time:group`
+/// contains `group`), the term itself included; `reduced` is `full` without
+/// the term's columns. Both list caller columns of `retained` in ascending
+/// order, the intercept kept, so each design is a column subset of
+/// [`Lowered::x`]. A term without relatives has the whole retained design as
+/// `full`; equal sets recur across terms, and the caller fits each once.
+pub(crate) fn type2_lr_sets(lo: &Lowered, retained: &[usize]) -> Vec<(Vec<usize>, Vec<usize>)> {
+    (0..lo.terms.len())
+        .map(|t| {
+            let dropped: Vec<usize> = relatives(lo, t)
+                .flat_map(|u| lo.terms[u].columns.clone())
+                .collect();
+            let full: Vec<usize> = retained
+                .iter()
+                .copied()
+                .filter(|c| !dropped.contains(c))
+                .collect();
+            let reduced = full
+                .iter()
+                .copied()
+                .filter(|c| !lo.terms[t].columns.contains(c))
+                .collect();
+            (full, reduced)
+        })
+        .collect()
+}
+
+/// Eigenvalues of `LᵀL` at most this fraction of the largest belong to null
+/// directions of `L` ([`type3_null_basis`]).
+const NULL_REL_TOL: f64 = 1e-8;
+
+/// The bound on `‖L·N‖_F / ‖L‖_F` that [`type3_null_basis`] checks.
+const NULL_CHECK_REL: f64 = 1e-12;
+
+/// The columns of `l` that are zero in every row, ascending: the columns a
+/// hypothesis does not touch. They lead [`type3_null_basis`]'s `N` as unit
+/// columns, in this order.
+pub(crate) fn untouched_columns(l: MatRef<'_, f64>) -> Vec<usize> {
+    (0..l.ncols())
+        .filter(|&c| l.col(c).iter().all(|&v| v == 0.0))
+        .collect()
+}
+
+/// The basis of a Type III reduced design (afex's `mixed(type = 3, method =
+/// "LRT")`): `N`, `p × (p − r)` with orthonormal columns spanning the null
+/// space of the term's hypothesis (`r` its rank), so the fit on `X·N` is the
+/// model under the `Lβ = 0` the Wald row tests, and `p − N.ncols()` is the
+/// test's df.
+///
+/// `l` is the hypothesis as [`type3`] gives it, rounded as lmerTest rounds
+/// it, and `exact` the same hypothesis from [`type3_unrounded`]. `l` decides
+/// what needs exact zeros: the columns it does not touch come first in `N`,
+/// as unit columns in the order of [`untouched_columns`], so their meaning
+/// and any random slope on them are kept ([`remap_slopes`] with that list);
+/// the slope check; and the rank `r`. The rest of `N` is the null space of
+/// `exact` on the touched columns, `E`: the eigenvectors of `EᵀE`
+/// ([`sym_eigen`]) whose eigenvalue is at most `1e-8` of the largest, as many
+/// as `l` leaves on those columns. The result is checked:
+/// `‖E·N‖_F ≤ 1e-12·‖E‖_F`.
+///
+/// Both are over the columns of the design the reduced fit is built from
+/// (the fit's retained columns), and `slope_cols` lists that design's
+/// random-slope columns. Errors: [`ReducedDesignError::SlopeTouched`] when
+/// `l` touches a slope column, [`ReducedDesignError::NoNullBasis`] when no
+/// decomposition exists, the two ranks differ or the check fails.
+pub(crate) fn type3_null_basis(
+    l: MatRef<'_, f64>,
+    exact: MatRef<'_, f64>,
+    slope_cols: &[usize],
+) -> Result<Mat<f64>, ReducedDesignError> {
+    let p = l.ncols();
+    assert_eq!(exact.ncols(), p, "l and exact are over the same columns");
+    let kept = untouched_columns(l);
+    let touched: Vec<usize> = (0..p).filter(|c| !kept.contains(c)).collect();
+    if slope_cols.iter().any(|c| touched.contains(c)) {
+        return Err(ReducedDesignError::SlopeTouched);
+    }
+    let on_touched =
+        |m: MatRef<'_, f64>| Mat::from_fn(m.nrows(), touched.len(), |i, a| m[(i, touched[a])]);
+    let e = on_touched(exact);
+    let rank = touched.len() - null_directions(on_touched(l).as_ref())?.ncols();
+    let null = null_directions(e.as_ref())?;
+    if touched.len() - null.ncols() != rank {
+        return Err(ReducedDesignError::NoNullBasis);
+    }
+    let frobenius = |m: MatRef<'_, f64>| {
+        m.col_iter()
+            .flat_map(|c| c.iter().copied())
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt()
+    };
+    let resid = frobenius((&e * &null).as_ref());
+    if !resid.is_finite() || resid > NULL_CHECK_REL * frobenius(e.as_ref()) {
+        return Err(ReducedDesignError::NoNullBasis);
+    }
+    let mut n = Mat::<f64>::zeros(p, kept.len() + null.ncols());
+    for (j, &c) in kept.iter().enumerate() {
+        n[(c, j)] = 1.0;
+    }
+    for j in 0..null.ncols() {
+        for (a, &c) in touched.iter().enumerate() {
+            n[(c, kept.len() + j)] = null[(a, j)];
+        }
+    }
+    Ok(n)
+}
+
+/// The null directions of `m` (`rows × k`): the eigenvectors of `mᵀm` whose
+/// eigenvalue is at most [`NULL_REL_TOL`] of the largest, as the columns of a
+/// `k × (k − rank)` matrix; none when `k` is 0.
+fn null_directions(m: MatRef<'_, f64>) -> Result<Mat<f64>, ReducedDesignError> {
+    let k = m.ncols();
+    if k == 0 {
+        return Ok(Mat::zeros(0, 0));
+    }
+    let gram = Mat::from_fn(k, k, |a, b| {
+        m.col(a)
+            .iter()
+            .zip(m.col(b).iter())
+            .map(|(u, v)| u * v)
+            .sum::<f64>()
+    });
+    let eig = sym_eigen(gram.as_ref(), true).map_err(|_| ReducedDesignError::NoNullBasis)?;
+    let vectors = eig.vectors.expect("eigenvectors were asked for");
+    let cut = NULL_REL_TOL * eig.values[k - 1];
+    let null: Vec<usize> = (0..k).filter(|&i| eig.values[i] <= cut).collect();
+    Ok(Mat::from_fn(k, null.len(), |a, j| vectors[(a, null[j])]))
+}
+
+/// A grouping's random-slope columns (`Grouping::slopes`) on a reduced design
+/// whose column `j` is caller column `kept[j]` (a Type II set of
+/// [`type2_lr_sets`], or the [`untouched_columns`] that lead a Type III `N`):
+/// each slope moves to its column's new position, so it stays on the same
+/// variable. [`ReducedDesignError::SlopeTouched`] when a slope column is not
+/// kept.
+pub(crate) fn remap_slopes(
+    slopes: &[ColumnId],
+    kept: &[usize],
+) -> Result<Vec<ColumnId>, ReducedDesignError> {
+    slopes
+        .iter()
+        .map(|&s| {
+            kept.iter()
+                .position(|&c| c == s as usize)
+                .map(|j| ColumnId::try_from(j).expect("a design column index fits a ColumnId"))
+                .ok_or(ReducedDesignError::SlopeTouched)
         })
         .collect()
 }
@@ -449,19 +644,44 @@ fn doolittle_l(x: &Mat<f64>) -> Mat<f64> {
 /// `max(0, 7 − ⌈log10(max|x|)⌉)` decimal places (not R's rounding algorithm
 /// bit for bit). An all-zero or all-NaN matrix is left alone.
 fn zapsmall(m: &mut Mat<f64>) {
+    let Some(scale) = zapsmall_scale(m) else {
+        return;
+    };
+    for j in 0..m.ncols() {
+        for i in 0..m.nrows() {
+            m[(i, j)] = (m[(i, j)] * scale).round() / scale;
+        }
+    }
+}
+
+/// `10^d`, the scale of [`zapsmall`]'s rounding to `d = max(0, 7 −
+/// ⌈log10 max|·|⌉)` decimal places; `None` on an all-zero or all-NaN matrix.
+fn zapsmall_scale(m: &Mat<f64>) -> Option<f64> {
     let mx = m
         .col_iter()
         .flat_map(|c| c.iter().copied())
         .filter(|v| !v.is_nan())
         .fold(0.0_f64, |a, v| a.max(v.abs()));
     if mx <= 0.0 || !mx.is_finite() {
-        return;
+        return None;
     }
     let digits = (7.0 - mx.log10().ceil()).max(0.0);
-    let scale = 10f64.powf(digits);
+    Some(10f64.powf(digits))
+}
+
+/// The zeros of [`zapsmall`] without its rounding: every entry `zapsmall`
+/// rounds to zero (`|v|·10^d` rounding to 0, so below `0.5·10^-d`, between
+/// 5e-8 and 5e-7 of the largest `|·|`) set to zero, every other entry left
+/// unrounded. An all-zero or all-NaN matrix is left alone.
+fn zap(m: &mut Mat<f64>) {
+    let Some(scale) = zapsmall_scale(m) else {
+        return;
+    };
     for j in 0..m.ncols() {
         for i in 0..m.nrows() {
-            m[(i, j)] = (m[(i, j)] * scale).round() / scale;
+            if (m[(i, j)] * scale).round() == 0.0 {
+                m[(i, j)] = 0.0;
+            }
         }
     }
 }

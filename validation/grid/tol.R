@@ -705,6 +705,340 @@ TOL_INFERENCE <- list(
   # error at B = 1e5 adds at most sqrt(alpha (1 - alpha) / B), about 7e-4 at
   # alpha = 0.05. Set a priori; the study runs at release.
   rlrt_level_se = 3,
+  # The Monte Carlo calibration tier against the generating truth (Monte
+  # Carlo class, feature montecarlo-tests): rejection rates under a true null
+  # and interval coverage at the truth, per cell of the 216-cell grid of
+  # src/inference/mc_data.rs, whose `bands` module holds the Rust copy of
+  # every mc_* row (mc_data_tests::bands_match_tol_r reads this file and
+  # checks each value and list; change together). Every mc_* row is fixed
+  # before the measurement, from theory and an independent pilot run
+  # (R = 1000 per cell, its own seeds and stream tag, so no pilot dataset is
+  # a measurement dataset). A rate q over R_kept datasets passes against its
+  # nominal q0 (alpha for a rejection rate; for a coverage, the miss rate
+  # 1 - coverage against 1 - level) when
+  # |q - q0| <= delta * q0 + k * sqrt(q0 (1 - q0) / R_kept),
+  # at alpha 0.01, 0.05, 0.10 and level 0.90, 0.95, 0.99; a one-sided gate
+  # uses one side of it. The run is deterministic, so a noise failure can
+  # appear only at the measurement, where it is investigated (a bug first),
+  # never re-rolled with another seed.
+  # Datasets per cell. With every dataset kept the binomial SE is 0.0049 at
+  # alpha = 0.05 and at coverage 0.95 (0.0022 at 0.01, 0.0067 at 0.10).
+  # R = 5000 would narrow the noise band at alpha = 0.05 to +-0.014 for 2.5
+  # times the run.
+  mc_r = 2000,
+  # The band's noise multiple k on a rejection rate. At R = 2000 the noise
+  # part is +-0.010, +-0.022 and +-0.030 at alpha = 0.01, 0.05 and 0.10.
+  # Exact binomial tails at R = 2000 (arithmetic): a check calibrated exactly
+  # fails with probability 2.3e-5, 1.3e-5 and 8.3e-6 at the three alpha
+  # (two-sided, delta = 0; the normal value is 6.8e-6), so about 0.065
+  # expected noise failures over the 4416 checks of mc_gated (4446 when
+  # frozen, before two Deviations) if all had delta = 0, and 0.014 with the
+  # declared delta (the Satterthwaite rows keep delta = 0 and carry nearly
+  # all of it); at k = 4 about 0.55, at k = 3 about 11 (delta = 0). At
+  # delta = 0 the lower bound at alpha = 0.01 is 0.000, so a conservative
+  # error is caught only at 0.05 and 0.10.
+  mc_level_k = 4.5,
+  # The same multiple on a coverage's miss rate: the same widths around
+  # coverage 0.99, 0.95 and 0.90.
+  mc_cover_k = 4.5,
+  # The equivalence margin delta of the methods calibrated only in the limit
+  # (GLMM Wald and LRT, the two variance-component mixtures, the Gaussian ML
+  # LRT): 0.0025, 0.0125 and 0.025 at alpha = 0.01, 0.05 and 0.10 before
+  # noise. Without it the band tests exact calibration, and a finite-sample
+  # error of fixed size grows in SE units as R grows (the pilot's GLMM gated
+  # cells had 4 Wald cells at 4.2 to 5.1 SE and 2 LRT cells at 4.1 to 4.4 SE
+  # at R = 1000), so the gate would be red at the measurement or green only by
+  # re-selecting cells on the data it gates. The Satterthwaite rows, built to
+  # be near nominal at small samples, use delta = 0.
+  mc_asym_rel = 0.25,
+  # The failed-fit cap. A dataset whose fixed-effects design is aliased,
+  # decided from the lowered design alone by the aliasing test fit_cold
+  # applies (never from a NaN row or from the fit's aliased mask): group
+  # constant, or time:group aliased because one group's rows share a single
+  # time. Such a dataset is left out of every quantity whose fits use that
+  # design, out of its rate's R_kept and out of this cap's count, and is
+  # counted and printed per (cell, quantity) apart from failed fits: the
+  # dropped column moves the other coefficients' targets, and since the
+  # design is drawn independently of every response, leaving it out changes
+  # no null distribution and no coverage target. Expected (arithmetic, from
+  # simulated designs): 2.6%, 1.1% and 0.9% of datasets at K = 10 and
+  # M = 3, 9, 17, 0.04% or less at K = 20, none at K >= 30. A level of f3
+  # absent (5.2% of datasets at K = 10, 0.09% at K = 20) is not such a case:
+  # its all-zero column is kept as aliased and the f3 row is tested with the
+  # df it carries, 1 instead of 2. Among the other datasets a gated (cell,
+  # quantity) fails when more than this fraction of them lose the quantity:
+  # a fit that did not converge, or a quantity that is not finite on a
+  # converged fit. A reported cell prints the fraction beside its rate.
+  # Pilot: no Gaussian LMM fit failed to converge (its losses were aliased
+  # designs); GLMM losses (aliased designs and failed fits together) at most
+  # 0.7% on the GLMM gated cells, up to 19% on the K = 10 mixture candidates
+  # now reported. At R = 2000 a quantity whose fits fail on 0.7% of datasets
+  # exceeds the cap with probability 0.05, on 0.9% with 0.27.
+  mc_fail_max = 0.01,
+  # The aliased guard. A gated (cell, quantity) also fails when more than
+  # this fraction of its datasets are aliased by design (above): about four
+  # times the largest expected rate (2.6% at K = 10, M = 3), so a generator
+  # change that inflates aliasing, and so shrinks R_kept and widens the band,
+  # fails instead of passing on fewer datasets.
+  mc_aliased_max = 0.10,
+  # The gated set, frozen before the measurement and never re-selected on
+  # it: per family the side of the band, delta (mc_asym_rel or 0), the only
+  # alpha when not all three, the quantities and the cells (the grid's names,
+  # k<K>_m<M>_<response>_<rdi|rdis>). Every (cell, quantity) not listed is
+  # reported: power, bias and RMSE everywhere, the AGQ arm, the
+  # profile-interval coverage, the GLM rows, every cell outside these
+  # regimes, the failed-dataset fractions. Built from theory, then screened
+  # against the pilot: each candidate (cell, quantity) was checked against
+  # its declared band (its delta, k = 4.5, the pilot's R_kept) and against
+  # mc_fail_max (failed fits only), and a candidate the pilot fails moved to
+  # reported. The band moved none; the cap moved 21 mixture candidates, named
+  # under their families. The f3 rows were not piloted: the Gaussian one
+  # (satt_f_f3) follows its family's cells, and the GLMM ones (wald_f3,
+  # lrt_f3) are reported, as the unpiloted GLM rows are, because an
+  # out-of-sample run (datasets r >= 100000) lost 0.75% to 1.5% of the f3
+  # fits to separation on gated sparse binary cells (an f3 level with no
+  # events), near or above mc_fail_max.
+  # Quantities. Satterthwaite (Gaussian LMM, REML): satt_t_tg (t,
+  # time:group on y_0), satt_f_group and satt_f_tg00 (Type III F, group and
+  # time:group on y_00; the Type II rows equal them on this design and are
+  # counted once), satt_f_f3 (F, the 2-df null factor f3), satt_f_joint (F,
+  # group and time:group jointly), satt_ci_b0 to satt_ci_b3 (t intervals at
+  # the truth). GLMM (Laplace): wald_tg, wald3_group (z), wald2_group (Type
+  # II Wald chi-square), wald_tg00, wald_ci_b0 to wald_ci_b3 (z intervals),
+  # lrt_tg, lrt3_group, lrt2_group (Type II, marginality respected),
+  # lrt_tg00, lrt_2df (time against the full model on y_00); the GLMM f3
+  # rows wald_f3 and lrt_f3 are reported. ml_lrt_2df: the Gaussian ML LRT of the same 2-df null.
+  # mix_slope: the random-slope variance on the rdi cells (50:50 mixture of
+  # chi-square 1 and 2). mix_intercept: the random-intercept variance, GLMM
+  # against GLM (50:50 mixture of chi-square 0 and 1).
+  # Deviations after the measurement (approved 2026-10-13) moved cells to
+  # reported, named under satt_two_f3 and mix_intercept; the set then holds
+  # 4416 checks (0.0143 expected noise failures with the declared delta).
+  mc_gated = list(
+    # Satterthwaite t and F rows and t intervals on the Gaussian cells with
+    # K >= 20: two-sided, delta = 0. The t and F references with Satterthwaite's
+    # df are built to be near nominal at small samples (Kuznetsova, Brockhoff &
+    # Christensen 2017; Luke 2017). Pilot: no check beyond 4 SE, the largest
+    # errors conservative and at K = 10. At K >= 20 this gate cannot tell
+    # Satterthwaite's t from z on these designs (a normal reference gives 0.066
+    # at alpha = 0.05 for df 18, inside the band); the df themselves are checked
+    # against lmerTest in the oracle tier.
+    satt_two = list(side = "two", delta = 0,
+      quantities = c(
+        "satt_t_tg", "satt_f_group", "satt_f_tg00", "satt_f_joint",
+        "satt_ci_b0", "satt_ci_b1", "satt_ci_b2", "satt_ci_b3"),
+      cells = c(
+        "k20_m3_gauss_rdi", "k20_m9_gauss_rdi", "k20_m17_gauss_rdi",
+        "k30_m3_gauss_rdi", "k30_m9_gauss_rdi", "k30_m17_gauss_rdi",
+        "k50_m3_gauss_rdi", "k50_m9_gauss_rdi", "k50_m17_gauss_rdi",
+        "k100_m3_gauss_rdi", "k100_m9_gauss_rdi", "k100_m17_gauss_rdi",
+        "k200_m3_gauss_rdi", "k200_m9_gauss_rdi", "k200_m17_gauss_rdi",
+        "k20_m3_gauss_rdis", "k20_m9_gauss_rdis", "k20_m17_gauss_rdis",
+        "k30_m3_gauss_rdis", "k30_m9_gauss_rdis", "k30_m17_gauss_rdis",
+        "k50_m3_gauss_rdis", "k50_m9_gauss_rdis", "k50_m17_gauss_rdis",
+        "k100_m3_gauss_rdis", "k100_m9_gauss_rdis", "k100_m17_gauss_rdis",
+        "k200_m3_gauss_rdis", "k200_m9_gauss_rdis", "k200_m17_gauss_rdis")),
+    # The Satterthwaite F of the null factor f3 (2 df, between clusters) on the
+    # satt_two cells, two-sided, delta = 0, less the random-slope cells with
+    # K <= 30. Those moved to reported after the measurement (a Deviation
+    # approved 2026-10-13): on (1 + time | id) at K <= 30 the row is
+    # anti-conservative (0.059 to 0.098 at alpha = 0.05, R = 2000; five cells
+    # outside the band), and lmerTest's Satterthwaite F gives the same rates on
+    # the same datasets, so the error is the method's at few clusters
+    # (Kenward-Roger: conservative at K = 10, slightly above nominal at K = 30).
+    # The whole regime moved (K = 10, 20, 30, every M), not only the cells that
+    # missed: k10_m3_gauss_rdis, k10_m9_gauss_rdis, k10_m17_gauss_rdis,
+    # k20_m3_gauss_rdis, k20_m9_gauss_rdis, k20_m17_gauss_rdis,
+    # k30_m3_gauss_rdis, k30_m9_gauss_rdis, k30_m17_gauss_rdis.
+    satt_two_f3 = list(side = "two", delta = 0,
+      quantities = c(
+        "satt_f_f3"),
+      cells = c(
+        "k20_m3_gauss_rdi", "k20_m9_gauss_rdi", "k20_m17_gauss_rdi",
+        "k30_m3_gauss_rdi", "k30_m9_gauss_rdi", "k30_m17_gauss_rdi",
+        "k50_m3_gauss_rdi", "k50_m9_gauss_rdi", "k50_m17_gauss_rdi",
+        "k100_m3_gauss_rdi", "k100_m9_gauss_rdi", "k100_m17_gauss_rdi",
+        "k200_m3_gauss_rdi", "k200_m9_gauss_rdi", "k200_m17_gauss_rdi",
+        "k50_m3_gauss_rdis", "k50_m9_gauss_rdis", "k50_m17_gauss_rdis",
+        "k100_m3_gauss_rdis", "k100_m9_gauss_rdis", "k100_m17_gauss_rdis",
+        "k200_m3_gauss_rdis", "k200_m9_gauss_rdis", "k200_m17_gauss_rdis")),
+    # satt_two's quantities at K = 10, one-sided: not anti-conservative (a rate
+    # at most alpha plus the band, a coverage at least the level minus it). The
+    # pilot's largest Satterthwaite errors are conservative and here (coverage
+    # 0.936 at 0.90 with random slopes; the Type III time:group row 0.066 at
+    # alpha = 0.10). This side sees t against z: a normal reference gives 0.086
+    # at df 8 against the upper bound 0.072 at alpha = 0.05.
+    satt_upper = list(side = "upper", delta = 0,
+      quantities = c(
+        "satt_t_tg", "satt_f_group", "satt_f_tg00", "satt_f_joint",
+        "satt_ci_b0", "satt_ci_b1", "satt_ci_b2", "satt_ci_b3"),
+      cells = c(
+        "k10_m3_gauss_rdi", "k10_m9_gauss_rdi", "k10_m17_gauss_rdi",
+        "k10_m3_gauss_rdis", "k10_m9_gauss_rdis", "k10_m17_gauss_rdis")),
+    # The f3 F row at K = 10, one-sided, on the (1 | id) cells only: the
+    # random-slope cells moved to reported with satt_two_f3's regime.
+    satt_upper_f3 = list(side = "upper", delta = 0,
+      quantities = c(
+        "satt_f_f3"),
+      cells = c(
+        "k10_m3_gauss_rdi", "k10_m9_gauss_rdi", "k10_m17_gauss_rdi")),
+    # GLMM Wald (z rows, the Type II Wald chi-square, z intervals) and GLMM
+    # LRT (per term, 2 df), Laplace: two-sided with delta on the 78 cells
+    # with K >= 50 and at least 0.49 minority events per cluster (Bernoulli
+    # min(sum y, N - sum y) / K, Poisson sum y / K, the pilot's means). Both are
+    # asymptotic in the number of clusters (Bolker et al. 2009; Pinheiro & Bates
+    # 2000, 2.4.2) and rest on the Laplace approximation, whose error is of the
+    # order of one over the information per cluster and does not shrink as K
+    # grows with clusters held small (Breslow & Lin 1995; Joe 2008): hence K
+    # with an information floor. Left out at K >= 50 by the floor:
+    # k50_m3_bern22_rdi, k50_m3_bern10_rdi, k100_m3_bern22_rdi,
+    # k100_m3_bern10_rdi, k200_m3_bern22_rdi, k200_m3_bern10_rdi,
+    # k50_m3_bern22_rdis, k50_m3_bern10_rdis, k100_m3_bern22_rdis,
+    # k100_m3_bern10_rdis, k200_m3_bern22_rdis, k200_m3_bern10_rdis. Pilot,
+    # declared band: closest k50_m17_pois165_rdi wald_ci_b0, miss rate 0.026 at
+    # level 0.99, 0.96 of its band (5.1 SE: at R = 2000 the same error would
+    # fail); every lost fraction at or below 0.7%.
+    glmm = list(side = "two", delta = 0.25,
+      quantities = c(
+        "wald_tg", "wald3_group", "wald2_group", "wald_tg00", "wald_ci_b0",
+        "wald_ci_b1", "wald_ci_b2", "wald_ci_b3", "lrt_tg", "lrt3_group",
+        "lrt2_group", "lrt_tg00", "lrt_2df"),
+      cells = c(
+        "k50_m3_bern54_rdi", "k50_m3_pois165_rdi", "k50_m3_pois034_rdi",
+        "k50_m9_bern54_rdi", "k50_m9_bern22_rdi", "k50_m9_bern10_rdi",
+        "k50_m9_pois165_rdi", "k50_m9_pois034_rdi", "k50_m17_bern54_rdi",
+        "k50_m17_bern22_rdi", "k50_m17_bern10_rdi", "k50_m17_pois165_rdi",
+        "k50_m17_pois034_rdi", "k100_m3_bern54_rdi", "k100_m3_pois165_rdi",
+        "k100_m3_pois034_rdi", "k100_m9_bern54_rdi", "k100_m9_bern22_rdi",
+        "k100_m9_bern10_rdi", "k100_m9_pois165_rdi", "k100_m9_pois034_rdi",
+        "k100_m17_bern54_rdi", "k100_m17_bern22_rdi", "k100_m17_bern10_rdi",
+        "k100_m17_pois165_rdi", "k100_m17_pois034_rdi", "k200_m3_bern54_rdi",
+        "k200_m3_pois165_rdi", "k200_m3_pois034_rdi", "k200_m9_bern54_rdi",
+        "k200_m9_bern22_rdi", "k200_m9_bern10_rdi", "k200_m9_pois165_rdi",
+        "k200_m9_pois034_rdi", "k200_m17_bern54_rdi", "k200_m17_bern22_rdi",
+        "k200_m17_bern10_rdi", "k200_m17_pois165_rdi",
+        "k200_m17_pois034_rdi", "k50_m3_bern54_rdis", "k50_m3_pois165_rdis",
+        "k50_m3_pois034_rdis", "k50_m9_bern54_rdis", "k50_m9_bern22_rdis",
+        "k50_m9_bern10_rdis", "k50_m9_pois165_rdis", "k50_m9_pois034_rdis",
+        "k50_m17_bern54_rdis", "k50_m17_bern22_rdis", "k50_m17_bern10_rdis",
+        "k50_m17_pois165_rdis", "k50_m17_pois034_rdis",
+        "k100_m3_bern54_rdis", "k100_m3_pois165_rdis",
+        "k100_m3_pois034_rdis", "k100_m9_bern54_rdis", "k100_m9_bern22_rdis",
+        "k100_m9_bern10_rdis", "k100_m9_pois165_rdis",
+        "k100_m9_pois034_rdis", "k100_m17_bern54_rdis",
+        "k100_m17_bern22_rdis", "k100_m17_bern10_rdis",
+        "k100_m17_pois165_rdis", "k100_m17_pois034_rdis",
+        "k200_m3_bern54_rdis", "k200_m3_pois165_rdis",
+        "k200_m3_pois034_rdis", "k200_m9_bern54_rdis", "k200_m9_bern22_rdis",
+        "k200_m9_bern10_rdis", "k200_m9_pois165_rdis",
+        "k200_m9_pois034_rdis", "k200_m17_bern54_rdis",
+        "k200_m17_bern22_rdis", "k200_m17_bern10_rdis",
+        "k200_m17_pois165_rdis", "k200_m17_pois034_rdis")),
+    # Gaussian ML LRT for the fixed part (2 df): two-sided with delta at
+    # K >= 30. Anti-conservative at few clusters (Pinheiro & Bates 2000, 2.4.2);
+    # pilot: 0.074 to 0.099 at alpha = 0.05 at K = 10, up to 0.081 at K = 20
+    # with slopes, every cell beyond 4 SE at K <= 20.
+    ml_lrt = list(side = "two", delta = 0.25,
+      quantities = c(
+        "ml_lrt_2df"),
+      cells = c(
+        "k30_m3_gauss_rdi", "k30_m9_gauss_rdi", "k30_m17_gauss_rdi",
+        "k50_m3_gauss_rdi", "k50_m9_gauss_rdi", "k50_m17_gauss_rdi",
+        "k100_m3_gauss_rdi", "k100_m9_gauss_rdi", "k100_m17_gauss_rdi",
+        "k200_m3_gauss_rdi", "k200_m9_gauss_rdi", "k200_m17_gauss_rdi",
+        "k30_m3_gauss_rdis", "k30_m9_gauss_rdis", "k30_m17_gauss_rdis",
+        "k50_m3_gauss_rdis", "k50_m9_gauss_rdis", "k50_m17_gauss_rdis",
+        "k100_m3_gauss_rdis", "k100_m9_gauss_rdis", "k100_m17_gauss_rdis",
+        "k200_m3_gauss_rdis", "k200_m9_gauss_rdis", "k200_m17_gauss_rdis")),
+    # The random-slope variance test, 50:50 mixture of chi-square 1 and 2
+    # (labelled conservative): one-sided upper with delta (not
+    # anti-conservative; Self & Liang 1987, Stram & Lee 1994) on the rdi cells,
+    # Gaussian all, Poisson except mean 0.34 at M = 3, Bernoulli at M >= 9
+    # except prevalence 0.10 at M = 9. Reported on the cells of least
+    # information, where the pilot's rates rise with K (prevalence 0.10, M = 9:
+    # 0.011 at K = 10 to 0.074 at K = 200 at alpha = 0.05; Laplace on sparse
+    # binary data with two observations per cluster). Moved to reported by
+    # mc_fail_max, with the pilot's lost fraction: k10_m3_pois165_rdi 8.0%,
+    # k10_m9_bern54_rdi 4.7%, k10_m9_bern22_rdi 13.2%, k10_m9_pois165_rdi 1.1%,
+    # k10_m9_pois034_rdi 10.1%, k10_m17_bern54_rdi 2.1%, k10_m17_bern22_rdi
+    # 3.6%, k10_m17_bern10_rdi 18.0%, k10_m17_pois034_rdi 2.4%,
+    # k20_m9_bern22_rdi 1.5%, k20_m9_pois034_rdi 1.1%, k20_m17_bern10_rdi 2.3%.
+    mix_slope = list(side = "upper", delta = 0.25,
+      quantities = c(
+        "mix_slope"),
+      cells = c(
+        "k10_m3_gauss_rdi", "k10_m9_gauss_rdi", "k10_m17_pois165_rdi",
+        "k10_m17_gauss_rdi", "k20_m3_pois165_rdi", "k20_m3_gauss_rdi",
+        "k20_m9_bern54_rdi", "k20_m9_pois165_rdi", "k20_m9_gauss_rdi",
+        "k20_m17_bern54_rdi", "k20_m17_bern22_rdi", "k20_m17_pois165_rdi",
+        "k20_m17_pois034_rdi", "k20_m17_gauss_rdi", "k30_m3_pois165_rdi",
+        "k30_m3_gauss_rdi", "k30_m9_bern54_rdi", "k30_m9_bern22_rdi",
+        "k30_m9_pois165_rdi", "k30_m9_pois034_rdi", "k30_m9_gauss_rdi",
+        "k30_m17_bern54_rdi", "k30_m17_bern22_rdi", "k30_m17_bern10_rdi",
+        "k30_m17_pois165_rdi", "k30_m17_pois034_rdi", "k30_m17_gauss_rdi",
+        "k50_m3_pois165_rdi", "k50_m3_gauss_rdi", "k50_m9_bern54_rdi",
+        "k50_m9_bern22_rdi", "k50_m9_pois165_rdi", "k50_m9_pois034_rdi",
+        "k50_m9_gauss_rdi", "k50_m17_bern54_rdi", "k50_m17_bern22_rdi",
+        "k50_m17_bern10_rdi", "k50_m17_pois165_rdi", "k50_m17_pois034_rdi",
+        "k50_m17_gauss_rdi", "k100_m3_pois165_rdi", "k100_m3_gauss_rdi",
+        "k100_m9_bern54_rdi", "k100_m9_bern22_rdi", "k100_m9_pois165_rdi",
+        "k100_m9_pois034_rdi", "k100_m9_gauss_rdi", "k100_m17_bern54_rdi",
+        "k100_m17_bern22_rdi", "k100_m17_bern10_rdi", "k100_m17_pois165_rdi",
+        "k100_m17_pois034_rdi", "k100_m17_gauss_rdi", "k200_m3_pois165_rdi",
+        "k200_m3_gauss_rdi", "k200_m9_bern54_rdi", "k200_m9_bern22_rdi",
+        "k200_m9_pois165_rdi", "k200_m9_pois034_rdi", "k200_m9_gauss_rdi",
+        "k200_m17_bern54_rdi", "k200_m17_bern22_rdi", "k200_m17_bern10_rdi",
+        "k200_m17_pois165_rdi", "k200_m17_pois034_rdi", "k200_m17_gauss_rdi")),
+    # The random-intercept variance test, GLMM against GLM, 50:50 mixture of
+    # chi-square 0 and 1: one-sided upper with delta on the same rule's GLMM
+    # cells (pilot, mean 0.34 at M = 3: 0.003 at K = 10 to 0.070 at K = 200).
+    # Moved to reported by mc_fail_max, with the pilot's lost fraction:
+    # k10_m3_pois165_rdi 4.9%, k10_m9_bern54_rdi 3.9%, k10_m9_bern22_rdi 13.2%,
+    # k10_m9_pois034_rdi 11.5%, k10_m17_bern54_rdi 1.5%, k10_m17_bern22_rdi
+    # 3.6%, k10_m17_bern10_rdi 19.2%, k10_m17_pois034_rdi 2.2%,
+    # k20_m17_bern10_rdi 1.8%. Moved to reported after the measurement (a
+    # Deviation approved 2026-10-13): k20_m9_bern22_rdi, whose boundary-test
+    # fits failed on 21 of 2000 datasets (1.05%, above mc_fail_max), every one
+    # separated (no maximum-likelihood estimate); its rate passes.
+    mix_intercept = list(side = "upper", delta = 0.25,
+      quantities = c(
+        "mix_intercept"),
+      cells = c(
+        "k10_m9_pois165_rdi", "k10_m17_pois165_rdi", "k20_m3_pois165_rdi",
+        "k20_m9_bern54_rdi", "k20_m9_pois165_rdi",
+        "k20_m9_pois034_rdi", "k20_m17_bern54_rdi", "k20_m17_bern22_rdi",
+        "k20_m17_pois165_rdi", "k20_m17_pois034_rdi", "k30_m3_pois165_rdi",
+        "k30_m9_bern54_rdi", "k30_m9_bern22_rdi", "k30_m9_pois165_rdi",
+        "k30_m9_pois034_rdi", "k30_m17_bern54_rdi", "k30_m17_bern22_rdi",
+        "k30_m17_bern10_rdi", "k30_m17_pois165_rdi", "k30_m17_pois034_rdi",
+        "k50_m3_pois165_rdi", "k50_m9_bern54_rdi", "k50_m9_bern22_rdi",
+        "k50_m9_pois165_rdi", "k50_m9_pois034_rdi", "k50_m17_bern54_rdi",
+        "k50_m17_bern22_rdi", "k50_m17_bern10_rdi", "k50_m17_pois165_rdi",
+        "k50_m17_pois034_rdi", "k100_m3_pois165_rdi", "k100_m9_bern54_rdi",
+        "k100_m9_bern22_rdi", "k100_m9_pois165_rdi", "k100_m9_pois034_rdi",
+        "k100_m17_bern54_rdi", "k100_m17_bern22_rdi", "k100_m17_bern10_rdi",
+        "k100_m17_pois165_rdi", "k100_m17_pois034_rdi",
+        "k200_m3_pois165_rdi", "k200_m9_bern54_rdi", "k200_m9_bern22_rdi",
+        "k200_m9_pois165_rdi", "k200_m9_pois034_rdi", "k200_m17_bern54_rdi",
+        "k200_m17_bern22_rdi", "k200_m17_bern10_rdi", "k200_m17_pois165_rdi",
+        "k200_m17_pois034_rdi")),
+    # A lower bound, delta = 0, at alpha = 0.10 only, on the Gaussian
+    # random-slope mixture with K >= 50, where the 50:50 mixture is
+    # asymptotically exact (Stram & Lee 1994) and the pilot near nominal (0.079
+    # to 0.107 at alpha = 0.10): a chi-square 2 reference in place of the
+    # mixture (about 0.066) fails it (bound 0.070). At alpha = 0.05 the same
+    # bound would not catch that (about 0.032 against 0.028) and would carry
+    # most of this side's false-miss risk, so it is not applied there. The GLMM
+    # mixtures get no lower bound: they are mostly conservative in the pilot
+    # even at high information.
+    mix_slope_lower = list(side = "lower", delta = 0, alpha = 0.10,
+      quantities = c(
+        "mix_slope"),
+      cells = c(
+        "k50_m3_gauss_rdi", "k50_m9_gauss_rdi", "k50_m17_gauss_rdi",
+        "k100_m3_gauss_rdi", "k100_m9_gauss_rdi", "k100_m17_gauss_rdi",
+        "k200_m3_gauss_rdi", "k200_m9_gauss_rdi", "k200_m17_gauss_rdi"))
+  ),
   # The REML log-likelihood at theta = 0 against R (gates 5 and 11, hard): the
   # OLS fit made with reml = TRUE against the frozen
   # logLik(lm, REML = TRUE) on every rlrt reference, the weighted
@@ -749,6 +1083,10 @@ TOL_INFERENCE <- list(
   # (anova_glmm_pair_grouseticks), every other row at or below 1.5e-7
   # (anova_glmm_pair_sim_binomial_slope1); anova_glmm_vs_glm_sim_nb 2.43e-2
   # (glmm's statistic the smaller), the registered objective gap above.
+  # Also read, hard, by the in-crate check of the per-term likelihood-ratio
+  # rows against afex (src/formula/anova_tests.rs::
+  # type_iii_lrt_rows_match_afex_on_the_frozen_glmm, which holds a third copy;
+  # anova_lrt3_glmm_sim_factorial_bern: worst 8.9e-8, g). Change together.
   lrt_abs = 4e-4,
   # The likelihood-ratio p-value against the one the entry's `reference` names
   # (p_chisq or p_mixture; none on the two rows inside the exact test's
@@ -760,6 +1098,60 @@ TOL_INFERENCE <- list(
   # (2026-10-12, pawel) over 20 rows: worst 7.60e-7
   # (anova_glmm_pair_grouseticks); anova_glmm_vs_glm_sim_nb 1.26e-2, registered.
   lr_p_rel = 4e-4,
+  # The per-term likelihood-ratio rows' p-value against the frozen afex, car
+  # and car-containment glmer tables (tests/inference_oracle.rs::
+  # anova_lrt_rows, the lrt_terms references), relative. The rule of
+  # lr_p_rel: lrt_abs carried through the tail, |d ln p| = h dT with
+  # h = dchisq(T, df) / pchisq(T, df, lower.tail = FALSE) at each gated row's
+  # frozen statistic. These rows hold null-term statistics near 0 on 1 df,
+  # where the tail is steep: maximum 7.046 (anova_lrt2_glm_sim_factorial_bern
+  # and anova_lrt3_glm_sim_factorial_bern, row x: T = 0.00352), then 3.180
+  # (the GLMM x rows, T = 0.0195), 2.877 (anova_lrt3_glmm_sim_factorial_bern,
+  # h), 2.445 (anova_lrt2car_glmm_sim_factorial_bern, h), 1.192 and 1.081 (the
+  # GLM h rows), every other row at or below 0.51. Rule ceil1(7.046 x 4e-4 =
+  # 2.82e-3) = 3e-3. lr_p_rel stays for its own readers (h at or below
+  # 0.848). MEASURED (2026-10-13, pawel, x86_64) over the 22 rows of the 8
+  # gated references: p worst 7.60e-7 (anova_lrt3_glmm_grouseticks and
+  # anova_lrt2_glmm_grouseticks, cHEIGHT); the statistic, read against lrt_abs
+  # by the same gate, worst 1.49e-6 (the same rows); the GLM rows at or below
+  # 2e-13 on both.
+  lt_lr_p_rel = 3e-3,
+  # The per-term likelihood-ratio rows against formula::anova::compare on the
+  # formula pair each row stands for (hard, fit-free of any oracle: both sides
+  # are glmm's own fits; src/formula/anova_tests.rs::
+  # likelihood_ratio_rows_equal_compare_on_their_formula_pairs, which holds the
+  # Rust copies). Every Type II row, and every Type III row whose reduced
+  # design X N is a column drop, within lt_compare_abs + lt_compare_rel * |T|,
+  # T compare's statistic. The row's refits start warm from the full fit,
+  # compare's fits cold, so the two land on the same optimum to the
+  # optimizer's stopping rule: an absolute residue on 2 (l1 - l0) that does
+  # not shrink with T, and a relative one on the large statistics. Null-term
+  # statistics sit below 0.1, so a relative band alone means nothing there.
+  # MEASURED (2026-10-13, pawel) over 40 rows (binomial GLM; binomial GLMM by
+  # Laplace, by AGQ with 5 nodes and with a random slope on x; weighted
+  # negative binomial GLM; negative binomial GLMM; Gamma GLM with phi held;
+  # Gamma GLMM; Poisson GLMM with an offset; Type II and III), on x86_64 and
+  # on wasm32-wasip1 plain and +simd128 (the CI lib legs): rows with T < 1
+  # worst 8.92e-12 absolute (wasm simd128; x86_64 8.75e-12; binomial GLMM with
+  # the slope, Type II h, T = 0.044), rows with T >= 1 worst 1.58e-12 relative
+  # (wasm plain; x86_64 1.57e-12; binomial GLMM nAGQ 5, Type II g, T = 12.84,
+  # 2.02e-11 absolute); the GLM rows agree exactly. Rule ceil1(2 x worst):
+  # lt_compare_abs from the T < 1 rows, lt_compare_rel from the T >= 1 rows.
+  # Measured far below the 1e-7 to 1e-6 the plan guessed for two optimizations
+  # from different starts. The Type III null basis is taken from the
+  # unrounded hypothesis (formula::hypotheses::type3_unrounded): from the
+  # zapsmall-rounded one the statistic of anova_lrt3_glmm_sim_factorial_bern's
+  # h row is 0.02446281944 against 0.02446285055, a move of 3.1e-8 (afex
+  # 0.02446285427: 3.5e-8 from the rounded basis, 3.7e-9 from the unrounded).
+  # Limits: aarch64 (NEON) is not measured; and the absolute residue is the
+  # optimizer's stopping residue on these fixtures (it scales with |l|, the
+  # curvature and the stopping rule), so a new gate-2 fixture with a much
+  # larger |l| needs its own measurement rather than this constant.
+  # RE-MEASURED (2026-10-13, pawel, x86_64) after the refits dropped their
+  # standard errors (Rx covariance, no SE targets): all 40 statistics
+  # unchanged bit for bit.
+  lt_compare_abs = 2e-11,
+  lt_compare_rel = 4e-12,
   # The F and Wald rows (end-to-end class, registry quantities `f` and
   # `p_value`): the OLS pairs' F against anova.lm's and the Gamma GLM pair's
   # Wald F against car::linearHypothesis(test = "F") (anova_pairs), and per term

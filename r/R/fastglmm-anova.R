@@ -2,21 +2,46 @@
 # two models. The crate computes every statistic and p-value (the per-term
 # tables at fit time, the comparison in fastglmm_anova_pair and
 # fastglmm_compare); this file only lays them out. Mirrors the Python port's
-# glmm/anova.py - change together.
+# glmm/anova.py - change together. The per-term heading and note texts are
+# also copied in validation/tools/anova_ports/anova_ports.rs, which the anova
+# port gate compares with both ports.
 
 #' Tests of fixed terms, and comparisons of two fits
 #'
-#' With one fit, `anova()` gives one row per fixed term, read from the table
-#' the crate built when the model was fitted: nothing is refitted. Type III by
-#' default, built the way lmerTest builds it, so it does not depend on the
-#' contrast coding; Type II with `type = "II"`. A Gaussian mixed model gets
-#' lmerTest's F with Satterthwaite's denominator df (columns `Sum Sq`,
+#' With one fit, `anova()` gives one row per fixed term, read from the table the
+#' crate built when the model was fitted: nothing is refitted when it is called.
+#' Type III by default, built the way lmerTest builds it, so it does not depend
+#' on the contrast coding; Type II with `type = "II"`. A Gaussian mixed model
+#' gets lmerTest's F with Satterthwaite's denominator df (columns `Sum Sq`,
 #' `Mean Sq`, `NumDF`, `DenDF`, `F value`, `Pr(>F)`); OLS and the Gamma and
-#' inverse-Gaussian GLMs with an estimated dispersion get the F on the
-#' residual df `n - p`; every other fit (binomial, Poisson and
-#' negative-binomial GLMs, every GLMM) gets the Wald chi-squared test (columns
-#' `Chisq`, `Df`, `Pr(>Chisq)`). There are no random-effect rows: random
-#' effects are tested by comparing two models. A formula whose interaction
+#' inverse-Gaussian GLMs with an estimated dispersion get the F on the residual
+#' df `n - p`; every other fit (binomial, Poisson and negative-binomial GLMs,
+#' every GLMM) gets the Wald chi-squared test (columns `Chisq`, `Df`,
+#' `Pr(>Chisq)`), but a Poisson model with random effects the likelihood-ratio
+#' test, in the same columns (below). There are no random-effect rows: random
+#' effects are tested by comparing two models.
+#'
+#' On a fit with Wald chi-squared rows, `test = "LRT"` gives likelihood-ratio
+#' chi-squared rows, in the Wald table's columns: each term's row compares the
+#' model with the model refitted under the term's hypothesis (Type III: the
+#' reduced design of the hypothesis its Wald row tests, as afex's
+#' `mixed(method = "LRT")` on a GLMM; Type II: the model of every term that does
+#' not contain the term, with and without it, the rule of car's
+#' `Anova(test.statistic = "LR")` on a GLM, applied to GLMMs too). These refits
+#' are made when the model is fitted: when the fit asks for them with
+#' `fastglmm(..., anova_test = "LRT")`, and on a Poisson model with random
+#' effects under the default `anova_test = "auto"`. A term whose columns carry a
+#' random slope keeps its Wald row, with a note.
+#'
+#' The default `test = "auto"` gives the likelihood-ratio rows to a Poisson
+#' model with random effects, whatever its size: in simulation the Wald test
+#' of a Poisson GLMM was never closer to the nominal level than the
+#' likelihood-ratio test, and rejected too often at few clusters. Every other
+#' fit gets its Wald chi-squared or F rows. The heading names the test;
+#' under `test = "auto"` a chi-squared table's heading also names why `"auto"`
+#' chose it (the family, or no random effects).
+#'
+#' A formula whose interaction
 #' lacks one of its marginal terms (`y ~ x + x:f`) gets no table: the fit
 #' stands, and `anova()` stops with the reason.
 #'
@@ -57,6 +82,16 @@
 #' @param ... a second [fastglmm] fit to compare `object` with; at most one.
 #' @param type `"III"` (the default) or `"II"`: the hypotheses of one fit's
 #'   per-term table.
+#' @param test for one fit, the test of the per-term rows: `"auto"` (the
+#'   default) gives the likelihood-ratio rows on a Poisson model with random
+#'   effects and the Wald chi-squared (or F) rows on every other fit;
+#'   `"Wald"` the Wald chi-squared rows; `"LRT"` the likelihood-ratio rows.
+#'   The likelihood-ratio rows are those the fit stored: a fit made with
+#'   `fastglmm(..., anova_test = "LRT")` stores them, and so does a Poisson
+#'   model with random effects fitted with the default `anova_test = "auto"`
+#'   (an error otherwise). On a fit whose rows are F tests (a Gaussian model,
+#'   a Gamma or inverse-Gaussian GLM with an estimated dispersion), `"Wald"`
+#'   and `"LRT"` are errors.
 #' @param nsim for two fits, the number of draws of the exact test's null
 #'   distribution: `NULL` (10000) or a whole number from 1 to 1000000.
 #' @param seed for two fits, the seed of those draws: `NULL` takes a fixed
@@ -80,8 +115,13 @@
 #' m <- fastglmm(y ~ x * f + (1 | g), d)
 #' anova(m)
 #' anova(fastglmm(y ~ x, d, REML = TRUE), fastglmm(y ~ x + (1 | g), d))
+#' n <- rpois(240, exp(0.5 + 0.3 * x + rnorm(30, sd = 0.5)[as.integer(g)]))
+#' p <- fastglmm(n ~ x + f + (1 | g), data.frame(n, x, f, g), family = poisson)
+#' anova(p)                  # a Poisson GLMM: likelihood-ratio rows by default
+#' anova(p, test = "Wald")
 #' @export
-anova.fastglmm <- function(object, ..., type = c("III", "II"), nsim = NULL, seed = NULL) {
+anova.fastglmm <- function(object, ..., type = c("III", "II"), test = c("auto", "Wald", "LRT"),
+                           nsim = NULL, seed = NULL) {
   fits <- c(list(object), .positional(list(...)))
   for (i in seq_along(fits)[-1L]) {
     if (!inherits(fits[[i]], "fastglmm")) {
@@ -94,7 +134,7 @@ anova.fastglmm <- function(object, ..., type = c("III", "II"), nsim = NULL, seed
       stop("nsim and seed apply to a comparison of two fits, not to one fit's ",
            "per-term table.", call. = FALSE)
     }
-    return(.term_table(object, match.arg(type)))
+    return(.term_table(object, match.arg(type), match.arg(test)))
   }
   if (length(fits) > 2L) {
     stop(sprintf(paste("anova() takes one fit (the per-term table) or two fits",
@@ -102,6 +142,10 @@ anova.fastglmm <- function(object, ..., type = c("III", "II"), nsim = NULL, seed
   }
   if (!missing(type)) {
     stop("type applies to one fit's per-term table, not to a comparison of two fits.",
+         call. = FALSE)
+  }
+  if (!missing(test)) {
+    stop("test applies to one fit's per-term table, not to a comparison of two fits.",
          call. = FALSE)
   }
   .check_nsim_seed(nsim, seed)
@@ -150,7 +194,11 @@ anova.fastglmm <- function(object, ..., type = c("III", "II"), nsim = NULL, seed
 #' @return A list of class `"fastglmm_comparison"`: `table`, the comparison
 #'   table of [anova()][anova.fastglmm] with its rows named `f0` and `f1`
 #'   (the smaller model first), and `fit0` and `fit1`, the fits of `f0` and
-#'   `f1`. Printing it prints the table.
+#'   `f1`. Printing it prints the table. Both fits are made with
+#'   `anova_test = "auto"` (see [fastglmm()]): `anova()` of `fit0` or `fit1`
+#'   with `test = "LRT"` works only on a Poisson model with random effects.
+#'   For the likelihood-ratio rows of another model with chi-squared rows, fit
+#'   its formula with `fastglmm(..., anova_test = "LRT")`.
 #' @seealso [anova()][anova.fastglmm]
 #' @examples
 #' set.seed(1)
@@ -282,8 +330,19 @@ print.fastglmm_comparison <- function(x, ...) {
 }
 .chisq_reference <- function(df) if (is.nan(df)) "" else sprintf("\u03c7\u00b2(%s)", .fmt_df(df))
 
+# Why "auto" gave a chi-squared table its test, by the fit's term_test_auto
+# reason. Mirrors the Python port's _AUTO_REASONS and
+# validation/tools/anova_ports/anova_ports.rs - change together.
+.AUTO_REASONS <- c(
+  poisson_mixed = "Poisson model with random effects",
+  binomial_mixed = "binomial model with random effects",
+  negative_binomial_mixed = "negative binomial model with random effects",
+  other_mixed = "model with random effects, not binomial, Poisson or negative binomial",
+  no_random_effects = "model without random effects")
+
 # The first note of a fit that did not converge. Mirrors the Python port's
-# _NOT_CONVERGED - change together.
+# _NOT_CONVERGED and validation/tools/anova_ports/anova_ports.rs - change
+# together.
 .NOT_CONVERGED <- paste(
   "The fit did not converge, so its estimates are not at a maximum and these tests",
   "are not reliable. Refit until the fit converges, then test again.")
@@ -318,16 +377,43 @@ print.fastglmm_comparison <- function(x, ...) {
   invisible()
 }
 
-# One fit's stored per-term result as lmerTest's (F) or car's (Wald
-# chi-squared) table, or the stored refusal as an error. A table's rows are
-# all F or all chi-squared; an empty table takes its kind from df_method.
-.term_table <- function(object, type) {
+# One fit's stored per-term result as lmerTest's (F) or car's (Wald or
+# likelihood-ratio chi-squared) table, or the stored refusal as an error. A
+# Wald table's rows are all F or all chi-squared; an empty table takes its
+# kind from df_method. `test` "LRT", and "auto" where the fit's
+# term_test_auto is the likelihood-ratio test (a Poisson model with random
+# effects), read the likelihood-ratio table the fit stored (a row whose term
+# carries a random slope is its Wald row, with a note); "Wald" and "LRT" on F
+# rows are the crate's refusal.
+.term_table <- function(object, type, test) {
   field <- if (identical(type, "III")) "term_table_type3" else "term_table_type2"
-  .check_fields(object, field)
+  # Only "auto" reads the fit's auto choice: a fit stored before it still
+  # takes an explicit test.
+  .check_fields(object, c(field, if (identical(test, "auto")) "term_test_auto"))
   res <- object[[field]]
   if (!is.null(res$error)) stop(res$error, call. = FALSE)
   dm <- .df_method(object)
   f_rows <- if (length(res$kind)) res$kind[[1L]] == "F" else dm != "none"
+  if (f_rows && !identical(test, "auto")) {
+    stop(fastglmm_term_test_refusal(test, !identical(dm, "residual")), call. = FALSE)
+  }
+  lrt <- identical(test, "LRT") ||
+    (identical(test, "auto") && identical(object$term_test_auto$test, "lrt"))
+  if (lrt) {
+    res <- object[[paste0(field, "_lrt")]]
+    if (is.null(res) && identical(test, "LRT")) {
+      stop(paste("this fit stored no likelihood-ratio tables, which are built only when the",
+                 'fit asks for them: refit with fastglmm(..., anova_test = "LRT").'),
+           call. = FALSE)
+    }
+    if (is.null(res)) {
+      stop(paste('test = "auto" gives likelihood-ratio tests on a Poisson model with random',
+                 'effects, and this fit stored none: it was made with anova_test = "Wald".',
+                 'Use test = "Wald", or refit with fastglmm(..., anova_test = "auto").'),
+           call. = FALSE)
+    }
+    if (!is.null(res$error)) stop(res$error, call. = FALSE)
+  }
   # Satterthwaite's method is named only when some row has its df: on a fit
   # with the pass switched off or failed, no row does.
   satterthwaite <- if (length(res$label)) {
@@ -335,7 +421,24 @@ print.fastglmm_comparison <- function(x, ...) {
   } else {
     dm == "satterthwaite"
   }
-  title <- if (!f_rows) {
+  # The likelihood-ratio heading's second line names the test and why it
+  # ran. Mirrors the Python port's heading and
+  # validation/tools/anova_ports/anova_ports.rs - change together.
+  # An explicit "Wald" keeps the one-line heading.
+  title <- if (lrt || (!f_rows && identical(test, "auto"))) {
+    why <- if (identical(test, "LRT")) {
+      'test = "LRT"'
+    } else {
+      paste0('test = "auto": ', .AUTO_REASONS[[object$term_test_auto$reason]])
+    }
+    line <- if (lrt) {
+      paste0("Likelihood-ratio chi-squared tests (each term's model refitted without it)",
+             if (identical(type, "III")) " on the reduced design")
+    } else {
+      "Wald chi-squared tests"
+    }
+    c("Analysis of Deviance Table", paste0(line, "; ", why))
+  } else if (!f_rows) {
     "Analysis of Deviance Table (Wald \u03c7\u00b2 tests)"
   } else if (satterthwaite) {
     "Analysis of Variance Table with Satterthwaite's method"
@@ -358,7 +461,8 @@ print.fastglmm_comparison <- function(x, ...) {
   row_notes <- unlist(Map(function(label, notes) {
     if (length(notes)) paste0(label, ": ", notes)
   }, res$label, res$row_notes), use.names = FALSE)
-  structure(tab, heading = c(paste("Type", res$ss_type, title),
+  title[1L] <- paste("Type", res$ss_type, title[1L])
+  structure(tab, heading = c(title,
                             if (!isTRUE(object$converged)) .NOT_CONVERGED, res$notes, row_notes),
             class = c("anova", "data.frame"))
 }

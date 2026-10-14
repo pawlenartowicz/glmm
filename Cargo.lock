@@ -540,6 +540,7 @@ dependencies = [
  "commonstats",
  "dhat",
  "faer",
+ "libm",
  "pulp",
  "rayon",
  "regex",

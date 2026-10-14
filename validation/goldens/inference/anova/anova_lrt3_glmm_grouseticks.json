@@ -1,0 +1,45 @@
+{
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0",
+      "glmmTMB": "1.1.14",
+      "afex": "1.5.1"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_anova.R"
+  },
+  "case": "lrt_terms",
+  "engine": "afex::mixed",
+  "ss_type": 3,
+  "term_labels": ["YEAR", "cHEIGHT"],
+  "rows": [
+    {
+      "term": "YEAR",
+      "statistic": 60.3990390720671,
+      "df": 2,
+      "p": 7.66505559873367e-14
+    },
+    {
+      "term": "cHEIGHT",
+      "statistic": 52.5120508742218,
+      "df": 1,
+      "p": 4.27616330514237e-13
+    }
+  ],
+  "name": "anova_lrt3_glmm_grouseticks"
+}

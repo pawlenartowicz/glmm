@@ -138,7 +138,8 @@ shares these entries; Python-specific notes are called out where they differ.
     Python `glmm.anova(m, type="III")`: one row per fixed term, in R's term
     order, with no random-effect rows. lmerTest's F on Satterthwaite df on a
     Gaussian mixed model (REML or ML), F on `n − p` on OLS and the Gamma and
-    inverse-Gaussian GLMs with φ estimated, Wald χ² everywhere else. Type III
+    inverse-Gaussian GLMs with φ estimated, the likelihood-ratio χ² on a
+    Poisson GLMM (next item), Wald χ² everywhere else. Type III
     is lmerTest's construction on every family, so it does not depend on the
     treatment coding. Type II uses lmerTest's `XᵀX` metric on Gaussian mixed
     models and car's covariance metric on OLS, GLMs, GLMMs and the dispersion
@@ -150,6 +151,41 @@ shares these entries; Python-specific notes are called out where they differ.
     A formula whose interaction lacks a marginal term is fitted as before
     but gets no table: `anova(m)` stops with the reason. A Type III table on
     a design with an empty cell carries lmerTest's "Missing cells" note.
+  - **Wald or likelihood-ratio rows: `test` and `anova_test`.** R
+    `anova(m, test = c("auto", "Wald", "LRT"))`, Python
+    `glmm.anova(m, test="auto")`, picks the test of the rows on a fit with χ²
+    rows. The default `"auto"` reads the family and whether the model has
+    random effects, never the data's size: a Poisson model with random
+    effects gets the likelihood-ratio rows, every other fit its
+    Wald χ² or F rows. Under `"auto"` every χ² table's heading has a second
+    line naming the test and the reason (for example `Wald chi-squared tests;
+    test = "auto": binomial model with random effects`); an explicit
+    `"Wald"` keeps the one-line heading. A likelihood-ratio row compares the
+    fit with the model refitted under the term's hypothesis, from the fit's
+    estimates and with its own settings: Type III on the reduced design of
+    the hypothesis the Wald row tests (afex's `mixed(method = "LRT")` on a
+    GLMM), Type II by the rule of `car::Anova(type = 2, test.statistic =
+    "LR")`, which car computes on a GLM, applied to GLMMs too (afex's
+    sequential `type = 2` differs). A term with a random slope keeps its Wald
+    row, with a note. The rows keep the Wald table's columns.
+    The refits are made at fit time: R `fastglmm(..., anova_test = c("auto",
+    "Wald", "LRT"))`, Python `glmm.fit(..., anova_test="auto")`. `"auto"`
+    stores the likelihood-ratio tables of a Poisson GLMM, `"LRT"` those of
+    every fit with χ² rows, `"Wald"` none; the fit itself is the same under
+    every value (`FitResult::term_table_type3_lrt` and `term_table_type2_lrt`,
+    Python `Fit.term_table_type3_lrt` / `Fit.term_table_type2_lrt`, R
+    `$term_table_type3_lrt` / `$term_table_type2_lrt`; what `"auto"` gives is
+    `FitResult::term_test_auto`, Python `Fit.term_test_auto`, R
+    `$term_test_auto`). `compare` makes its two fits with `"auto"`.
+    `test = "Wald"` or `"LRT"` on a fit with F rows, `"LRT"` on a fit that
+    stored no likelihood-ratio tables, and `"auto"` on a Poisson GLMM fitted
+    with `anova_test = "Wald"` stop with an error naming the fix. Checked
+    against frozen references (`validation/goldens/inference/anova/`): afex
+    1.5-1 and pairs of lme4 2.0-6 `glmer` fits for the GLMM rows, car 3.1-5
+    for the GLM rows. The default rests on a Monte Carlo calibration study of
+    glmm's tests against the truth, summarized in
+    `documentation/hypothesis-tests.md` ("How well calibrated are these
+    tests").
   - **Two existing fits compared**, R `anova(m0, m1)`, Python
     `glmm.anova(m0, m1)`, in either order, with no refit and without reading
     the data. The fits must have converged, share the row count, the
@@ -206,11 +242,18 @@ shares these entries; Python-specific notes are called out where they differ.
   `formula::anova::{nesting, compare, term_tests}` with `Model` (a fitted
   model as plain numbers, `Model::from_fit`), `CompareOptions`, `Comparison`,
   `ComparisonTest::{Lr, Linear}`, `ModelInfo`, `CompareError`, `TermTable`,
-  `FixedRow`, `TermTestOptions`, `SsType`, `TermTestError`, `Side`, `Differs`
-  and `Nesting`; `inference::{LrTest, LrNote, LinearTest, LinearKind,
-  LinearNote, Reference, DenDf, Objective}`; and, under `orchestrate`,
-  `run_compare`, `CompareResult`, `compare_options`, `DEFAULT_SEED`,
-  `DEFAULT_NSIM` and `MAX_NSIM`. `TermTable` and `ModelInfo` carry the
+  `FixedRow`, `TermTestOptions` (with `test: TermTest`, `Auto` by default),
+  `TermTest::{Auto, Wald, Lrt}`, `TestChoice` and `ChoiceReason` (on
+  `TermTable::choice`), `SsType`, `TermTestError` (with `FTable` and
+  `RefitNodeCount`), `Side`, `Differs` and `Nesting`; `inference::{LrTest,
+  LrNote, LinearTest, LinearKind, LinearNote, Reference, DenDf,
+  Objective}`, with
+  `LinearKind::LikelihoodRatio` and the likelihood-ratio row notes
+  `LinearNote::{ReducedNotConverged, RandomSlopeColumn, NegativeStatistic}`;
+  and, under `orchestrate`, `run_compare`, `CompareResult`, `compare_options`,
+  `DEFAULT_SEED`, `DEFAULT_NSIM` and `MAX_NSIM`. `orchestrate::run_fit`
+  takes a trailing `anova_test: &str` (`"auto"`, `"Wald"` or `"LRT"`).
+  `TermTable` and `ModelInfo` carry the
   fit's `coef_names`, one per fixed-effect column, and a note on an aliased
   column names the coefficient, never an index: "The coefficient x2 is
   aliased, so the hypothesis was not tested." (the ports print it after the

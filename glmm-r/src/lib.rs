@@ -13,9 +13,10 @@
 use std::collections::HashMap;
 
 use glmm::formula::anova::{
-    compare, CompareError, Comparison, ComparisonTest, Differs, Model, ModelInfo, Side,
+    compare, CompareError, Comparison, ComparisonTest, Differs, Model, ModelInfo, Side, TermTest,
+    TermTestError,
 };
-use glmm::inference::Reference;
+use glmm::inference::{DenDf, Reference};
 use glmm::orchestrate;
 
 use extendr_api::error::Result;
@@ -108,6 +109,7 @@ fn fastglmm_fit(
     start_dispersion: &[f64],
     satterthwaite: bool,
     reml: &[Rbool],
+    anova_test: &str,
 ) -> Result<List> {
     let nagq = u8::try_from(nagq)
         .map_err(|_| Error::Other(format!("nagq {nagq} is out of range for u8")))?;
@@ -141,6 +143,7 @@ fn fastglmm_fit(
         warm_start,
         satterthwaite,
         reml,
+        anova_test,
     )
     .map_err(Error::Other)?;
     Ok(fit_list(r))
@@ -155,6 +158,8 @@ fn optional(values: &[f64]) -> Option<Vec<f64>> {
 /// returns its two fits the same way.
 fn fit_list(r: orchestrate::FitResult) -> List {
     let vcov_flat: Vec<f64> = r.vcov.iter().flatten().copied().collect();
+    // What `"auto"` gives on this fit: list(test, reason).
+    let (auto_test, auto_reason) = orchestrate::choice_tags(&r.term_test_auto);
     let varcorr = List::from_values(r.varcorr.iter().map(|v| r!(v.clone())));
     let re_group_names: Vec<String> = r.re_groups.iter().map(|(n, _)| n.clone()).collect();
     let re_group_terms = List::from_values(r.re_groups.iter().map(|(_, t)| r!(t.clone())));
@@ -261,8 +266,17 @@ fn fit_list(r: orchestrate::FitResult) -> List {
         objective = objective,
         objective_nodes = objective_nodes as i32,
         term_table_type3 = term_list(&r.term_table_type3),
-        term_table_type2 = term_list(&r.term_table_type2)
+        term_table_type2 = term_list(&r.term_table_type2),
+        term_table_type3_lrt = lrt_list(&r.term_table_type3_lrt),
+        term_table_type2_lrt = lrt_list(&r.term_table_type2_lrt),
+        term_test_auto = list!(test = auto_test, reason = auto_reason)
     )
+}
+
+/// A likelihood-ratio table's slot: `NULL` unless the fit asked for the
+/// table, else as `term_list`.
+fn lrt_list(slot: &Option<std::result::Result<glmm::formula::anova::TermTable, String>>) -> Robj {
+    slot.as_ref().map_or(r!(NULL), |t| term_list(t).into())
 }
 
 /// A stored per-term result as a named list: `error` is the refusal's
@@ -276,6 +290,8 @@ fn term_list(result: &std::result::Result<glmm::formula::anova::TermTable, Strin
             list!(
                 error = r!(NULL),
                 ss_type = c.ss_type,
+                test = c.test,
+                reason = c.reason,
                 label = c.label,
                 kind = c.kind,
                 statistic = c.statistic,
@@ -632,6 +648,28 @@ fn comparison_list(c: &Comparison) -> Result<List> {
     ))
 }
 
+/// The refusal of `anova(m, test = "Wald")` or `test = "LRT"` on a fit
+/// whose per-term rows are F tests, in the crate's words, so both ports say
+/// the same. `satterthwaite` is TRUE when the F rows' denominator df are
+/// Satterthwaite's (a mixed model), FALSE for the residual df.
+///
+/// @usage NULL
+/// @keywords internal
+#[extendr]
+fn fastglmm_term_test_refusal(test: &str, satterthwaite: bool) -> Result<String> {
+    let asked = match test {
+        "Wald" => TermTest::Wald,
+        "LRT" => TermTest::Lrt,
+        other => return Err(Error::Other(format!("no refusal for test {other:?}"))),
+    };
+    let den_df = if satterthwaite {
+        DenDf::Satterthwaite
+    } else {
+        DenDf::Residual
+    };
+    Ok(TermTestError::FTable { asked, den_df }.to_string())
+}
+
 extendr_module! {
     mod glmm_r;
     fn fastglmm_fit;
@@ -639,4 +677,5 @@ extendr_module! {
     fn fastglmm_same_fixed_part;
     fn fastglmm_compare;
     fn fastglmm_anova_pair;
+    fn fastglmm_term_test_refusal;
 }

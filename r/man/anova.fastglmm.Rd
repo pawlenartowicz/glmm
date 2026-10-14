@@ -4,7 +4,14 @@
 \alias{anova.fastglmm}
 \title{Tests of fixed terms, and comparisons of two fits}
 \usage{
-\method{anova}{fastglmm}(object, ..., type = c("III", "II"), nsim = NULL, seed = NULL)
+\method{anova}{fastglmm}(
+  object,
+  ...,
+  type = c("III", "II"),
+  test = c("auto", "Wald", "LRT"),
+  nsim = NULL,
+  seed = NULL
+)
 }
 \arguments{
 \item{object}{a \link{fastglmm} fit.}
@@ -13,6 +20,17 @@
 
 \item{type}{\code{"III"} (the default) or \code{"II"}: the hypotheses of one fit's
 per-term table.}
+
+\item{test}{for one fit, the test of the per-term rows: \code{"auto"} (the
+default) gives the likelihood-ratio rows on a Poisson model with random
+effects and the Wald chi-squared (or F) rows on every other fit;
+\code{"Wald"} the Wald chi-squared rows; \code{"LRT"} the likelihood-ratio rows.
+The likelihood-ratio rows are those the fit stored: a fit made with
+\code{fastglmm(..., anova_test = "LRT")} stores them, and so does a Poisson
+model with random effects fitted with the default \code{anova_test = "auto"}
+(an error otherwise). On a fit whose rows are F tests (a Gaussian model,
+a Gamma or inverse-Gaussian GLM with an estimated dispersion), \code{"Wald"}
+and \code{"LRT"} are errors.}
 
 \item{nsim}{for two fits, the number of draws of the exact test's null
 distribution: \code{NULL} (10000) or a whole number from 1 to 1000000.}
@@ -31,21 +49,44 @@ draws requested and their seed, on every two-fit table, also when the
 test made no draw.
 }
 \description{
-With one fit, \code{anova()} gives one row per fixed term, read from the table
-the crate built when the model was fitted: nothing is refitted. Type III by
-default, built the way lmerTest builds it, so it does not depend on the
-contrast coding; Type II with \code{type = "II"}. A Gaussian mixed model gets
-lmerTest's F with Satterthwaite's denominator df (columns \verb{Sum Sq},
+With one fit, \code{anova()} gives one row per fixed term, read from the table the
+crate built when the model was fitted: nothing is refitted when it is called.
+Type III by default, built the way lmerTest builds it, so it does not depend
+on the contrast coding; Type II with \code{type = "II"}. A Gaussian mixed model
+gets lmerTest's F with Satterthwaite's denominator df (columns \verb{Sum Sq},
 \verb{Mean Sq}, \code{NumDF}, \code{DenDF}, \verb{F value}, \verb{Pr(>F)}); OLS and the Gamma and
-inverse-Gaussian GLMs with an estimated dispersion get the F on the
-residual df \code{n - p}; every other fit (binomial, Poisson and
-negative-binomial GLMs, every GLMM) gets the Wald chi-squared test (columns
-\code{Chisq}, \code{Df}, \verb{Pr(>Chisq)}). There are no random-effect rows: random
-effects are tested by comparing two models. A formula whose interaction
-lacks one of its marginal terms (\code{y ~ x + x:f}) gets no table: the fit
-stands, and \code{anova()} stops with the reason.
+inverse-Gaussian GLMs with an estimated dispersion get the F on the residual
+df \code{n - p}; every other fit (binomial, Poisson and negative-binomial GLMs,
+every GLMM) gets the Wald chi-squared test (columns \code{Chisq}, \code{Df},
+\verb{Pr(>Chisq)}), but a Poisson model with random effects the likelihood-ratio
+test, in the same columns (below). There are no random-effect rows: random
+effects are tested by comparing two models.
 }
 \details{
+On a fit with Wald chi-squared rows, \code{test = "LRT"} gives likelihood-ratio
+chi-squared rows, in the Wald table's columns: each term's row compares the
+model with the model refitted under the term's hypothesis (Type III: the
+reduced design of the hypothesis its Wald row tests, as afex's
+\code{mixed(method = "LRT")} on a GLMM; Type II: the model of every term that does
+not contain the term, with and without it, the rule of car's
+\code{Anova(test.statistic = "LR")} on a GLM, applied to GLMMs too). These refits
+are made when the model is fitted: when the fit asks for them with
+\code{fastglmm(..., anova_test = "LRT")}, and on a Poisson model with random
+effects under the default \code{anova_test = "auto"}. A term whose columns carry a
+random slope keeps its Wald row, with a note.
+
+The default \code{test = "auto"} gives the likelihood-ratio rows to a Poisson
+model with random effects, whatever its size: in simulation the Wald test
+of a Poisson GLMM was never closer to the nominal level than the
+likelihood-ratio test, and rejected too often at few clusters. Every other
+fit gets its Wald chi-squared or F rows. The heading names the test;
+under \code{test = "auto"} a chi-squared table's heading also names why \code{"auto"}
+chose it (the family, or no random effects).
+
+A formula whose interaction
+lacks one of its marginal terms (\code{y ~ x + x:f}) gets no table: the fit
+stands, and \code{anova()} stops with the reason.
+
 With two fits, \code{anova(m0, m1)} compares them as they are, with no refit and
 without reading their data: the two fits must have the same rows, the same
 response, weights, offset, family, link and held dispersion, and one
@@ -90,6 +131,10 @@ d <- data.frame(y, x, f, g)
 m <- fastglmm(y ~ x * f + (1 | g), d)
 anova(m)
 anova(fastglmm(y ~ x, d, REML = TRUE), fastglmm(y ~ x + (1 | g), d))
+n <- rpois(240, exp(0.5 + 0.3 * x + rnorm(30, sd = 0.5)[as.integer(g)]))
+p <- fastglmm(n ~ x + f + (1 | g), data.frame(n, x, f, g), family = poisson)
+anova(p)                  # a Poisson GLMM: likelihood-ratio rows by default
+anova(p, test = "Wald")
 }
 \seealso{
 \code{\link[=compare]{compare()}}

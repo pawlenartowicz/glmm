@@ -1,0 +1,65 @@
+{
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0",
+      "glmmTMB": "1.1.14",
+      "afex": "1.5.1"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_anova.R"
+  },
+  "case": "lrt_terms",
+  "engine": "lme4::glmer",
+  "ss_type": 2,
+  "term_labels": ["g", "h", "x", "g:h"],
+  "rows": [
+    {
+      "term": "g",
+      "statistic": 12.9120117370962,
+      "df": 2,
+      "p": 0.00157105820845161,
+      "full_formula": "y ~ g + h + x + (1 | subj)",
+      "reduced_formula": "y ~ h + x + (1 | subj)"
+    },
+    {
+      "term": "h",
+      "statistic": 0.0355255017926197,
+      "df": 1,
+      "p": 0.850498746649519,
+      "full_formula": "y ~ g + h + x + (1 | subj)",
+      "reduced_formula": "y ~ g + x + (1 | subj)"
+    },
+    {
+      "term": "x",
+      "statistic": 0.0195325636634323,
+      "df": 1,
+      "p": 0.888850449292764,
+      "full_formula": "y ~ g + h + x + g:h + (1 | subj)",
+      "reduced_formula": "y ~ g + h + g:h + (1 | subj)"
+    },
+    {
+      "term": "g:h",
+      "statistic": 0.479877955666666,
+      "df": 2,
+      "p": 0.786675864267611,
+      "full_formula": "y ~ g + h + x + g:h + (1 | subj)",
+      "reduced_formula": "y ~ g + h + x + (1 | subj)"
+    }
+  ],
+  "name": "anova_lrt2car_glmm_sim_factorial_bern"
+}

@@ -81,6 +81,11 @@ pub mod tol {
     /// through the reference's tail (`lr_p_rel`).
     #[allow(dead_code)] // read by tests/inference_oracle.rs only
     pub const LR_P_REL: f64 = 4e-4;
+    /// A per-term likelihood-ratio row's p-value against the frozen
+    /// `lrt_terms` tables, relative: `LRT_ABS` carried through the steep tail
+    /// of their near-zero 1-df statistics (`lt_lr_p_rel`).
+    #[allow(dead_code)] // read by tests/inference_oracle.rs only
+    pub const LT_LR_P_REL: f64 = 3e-3;
     /// An OLS or Wald F and a GLM Wald chi-square, relative: the
     /// beta/SE band (`wald_rel`).
     #[allow(dead_code)] // read by tests/inference_oracle.rs only
@@ -703,24 +708,7 @@ pub fn lower_on_entry(
     family: Family,
     weights: Option<&str>,
 ) -> Result<Lowered, glmm::formula::Error> {
-    let data = e.data.as_ref().expect("the entry has data");
-    let path = format!("{}/validation/{data}", env!("CARGO_MANIFEST_DIR"));
-    let raw = std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("{path}: {err}"));
-    let mut lines = raw.lines().filter(|l| !l.trim().is_empty());
-    let header = split_line(lines.next().expect("CSV has a header"));
-    let rows: Vec<Vec<String>> = lines.map(split_line).collect();
-    let mut columns = Vec::new();
-    for (j, name) in header.iter().enumerate() {
-        let cells: Vec<String> = rows.iter().map(|r| r[j].clone()).collect();
-        // As the in-crate reader (`test_support::table_from_rows`): a listed
-        // column, or one with a cell that is not a number, is a factor.
-        let numeric: Result<Vec<f64>, _> = cells.iter().map(|c| c.parse::<f64>()).collect();
-        let col = match numeric {
-            Ok(v) if !e.factors.contains(name) => Column::Numeric(v),
-            _ => Column::factor_from_labels(&cells),
-        };
-        columns.push((name.clone(), col));
-    }
+    let (header, rows, mut columns) = entry_data(e);
     let mut weights: Option<Vec<f64>> = weights.map(|w| {
         let wi = col_index(&header, w);
         rows.iter()
@@ -744,6 +732,45 @@ pub fn lower_on_entry(
     let mut lo = lower(&glmm_formula(formula), &table, family)?;
     lo.opts.weights = weights;
     Ok(lo)
+}
+
+/// [`entry_data`]'s result: the CSV header, its rows as text, and its
+/// columns by name.
+#[allow(dead_code)] // used by tests/inference_oracle.rs only
+pub type EntryData = (Vec<String>, Vec<Vec<String>>, Vec<(String, Column)>);
+
+/// An inference entry's data: the CSV header, its rows as text, and its
+/// columns by name in file order. As the in-crate reader
+/// (`test_support::table_from_rows`): a column the entry lists as a factor,
+/// or one with a cell that is not a number, is a factor on its sorted labels;
+/// every other column is numeric.
+#[allow(dead_code)] // used by tests/inference_oracle.rs only
+pub fn entry_data(e: &inference::Entry) -> EntryData {
+    let data = e.data.as_ref().expect("the entry has data");
+    let path = format!("{}/validation/{data}", env!("CARGO_MANIFEST_DIR"));
+    let raw = std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("{path}: {err}"));
+    let mut lines = raw.lines().filter(|l| !l.trim().is_empty());
+    let header = split_line(lines.next().expect("CSV has a header"));
+    let rows: Vec<Vec<String>> = lines.map(split_line).collect();
+    let mut columns = Vec::new();
+    for (j, name) in header.iter().enumerate() {
+        let cells: Vec<String> = rows.iter().map(|r| r[j].clone()).collect();
+        let numeric: Result<Vec<f64>, _> = cells.iter().map(|c| c.parse::<f64>()).collect();
+        let col = match numeric {
+            Ok(v) if !e.factors.contains(name) => Column::Numeric(v),
+            _ => Column::factor_from_labels(&cells),
+        };
+        columns.push((name.clone(), col));
+    }
+    (header, rows, columns)
+}
+
+/// R's aggregated-binomial response `cbind(s, n - s) ~ rhs` as the successes
+/// column, the total column and `rhs`; `None` for any other response.
+#[allow(dead_code)] // used by tests/inference_oracle.rs only
+pub fn aggregated_response(r_formula: &str) -> Option<(String, String, String)> {
+    let spec = parse_formula(r_formula);
+    spec.aggregated.map(|(succ, total)| (succ, total, spec.rhs))
 }
 
 /// `r_formula` as glmm fits it: R's `cbind(s, n - s) ~ rhs` as `y ~ rhs` (the
