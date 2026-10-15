@@ -1,6 +1,6 @@
 [package]
 name = "glmm"
-version = "0.5.0"
+version = "0.6.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -96,7 +96,7 @@ regex = { version = "1", optional = true }
 # (not the crate version), with a provenance line naming both crate versions,
 # never absorbed by widening a band. Unconditional;
 # its MSRV (1.85) matches this crate's floor.
-commonstats = { version = "0.2.2", default-features = false, features = ["dist", "rng"] }
+commonstats = { version = "0.2", default-features = false, features = ["dist", "rng"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 faer = "0.24"
