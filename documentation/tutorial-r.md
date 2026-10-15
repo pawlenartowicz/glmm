@@ -217,7 +217,7 @@ shaped like lme4's. These **work**:
 | `confint(fit)` | Wald intervals off `vcov()` that follow `summary()` row by row: the t quantile on the row's df where the summary tests with t (Satterthwaite df on a Gaussian mixed model, `n - p` as `confint.lm` on OLS and the dispersion GLMs), the normal quantile where it tests with z. `parm` and `level` as in `stats::confint`. The Python port's `fit.confint()` gives the same intervals. `method = "profile"`/`"boot"` are not available and say so. |
 | `isSingular(fit)` | boundary-fit flag — lme4's condition, computed by the kernel. |
 | `sigma(fit)` | residual SD for gaussian fits, `sqrt(phi)` for Gamma/inverse-Gaussian; `1` for binomial/Poisson/negative-binomial (fixed scale, as in lme4). |
-| `nobs`, `formula`, `family`, `model.frame`, `print` | the usual; `formula()` returns the formula **string** as given (the parser is Rust-side, so there is no R `terms` object to hand back). |
+| `nobs`, `formula`, `family`, `model.frame`, `print` | the usual; `formula()` returns the model formula as given, as a formula object, so `update(m, . ~ . + z)` works (the parser is Rust-side, so there is no R `terms` object to hand back). |
 | `ranef(fit)` | conditional modes (BLUPs), one data frame per grouping, lme4-shaped. Conditional variances (`condVar`) are not computed. |
 | `fitted(fit)` | conditional means per row, including the random-effect contribution and any offset. |
 | `residuals(fit)` | `type = "response"` (default, `y - fitted`) or `type = "pearson"`. Deviance and working residuals are not offered. |

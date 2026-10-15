@@ -1491,6 +1491,7 @@ mod api {
                     glmm::Boundary::Interior => "interior",
                     glmm::Boundary::AtBoundary => "at_boundary",
                     glmm::Boundary::NoOptimum => "no_optimum",
+                    glmm::Boundary::UpperLimit => "upper_limit",
                     _ => "other",
                 },
                 dispersion: fit.dispersion,

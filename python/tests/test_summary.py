@@ -594,7 +594,9 @@ def test_lmm_fit_carries_coef_df_and_the_switch_turns_it_off():
     assert off.df_method == "disabled"
     assert np.all(np.isnan(off.coef_df)) and np.all(np.isnan(off.coef_p))
     np.testing.assert_array_equal(off.beta, m.beta)
-    assert off.summary_object().text().splitlines()[-1] == "df not computed (satterthwaite=False)"
+    # _EMIXED rides the theta limit, so a Warnings section follows the footnote.
+    footer = off.summary_object().text().split("\n\nWarnings:\n")[0]
+    assert footer.splitlines()[-1] == "df not computed (satterthwaite=False)"
     np.testing.assert_allclose((off.confint()[:, 1] - off.beta) / off.se, 1.9599639845400534)
 
 

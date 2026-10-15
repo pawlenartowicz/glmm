@@ -11,7 +11,8 @@
 //!   exposing the kernels and [`StartValues`]. NO semver guarantees.
 //! - [`formula`] (cargo feature, on by default): the R-style formula frontend —
 //!   `formula::lower("y ~ x + (1|g)", &table, family)` builds the kernel's inputs
-//!   from a formula string and a data table instead of by hand.
+//!   from a formula string and a data table instead of by hand. Outside the
+//!   semver promise until the 1.0.0 surface review.
 //! - [`inference`]: the hypothesis tests on fitted models. Like
 //!   `loop_advanced`, outside the semver promise until the 1.0 surface review.
 //!

@@ -420,7 +420,10 @@ pub(crate) fn lmm_view_to_fit(
     if let Some(mask) = caller_pins {
         diag.pinned_components = mask;
     }
-    let diagnostics = super::common::materialize_diagnostics(&diag, p, &varcorr);
+    let mut diagnostics = super::common::materialize_diagnostics(&diag, p, &varcorr);
+    if has_endpoint {
+        super::common::note_theta_at_limit(&mut diagnostics, view.theta, 1.0);
+    }
     let criterion = view.criterion;
     // The kernel's deviance on the caller's design. The REML criterion contains
     // ln|X̃ᵀV⁻¹X̃| on the standardized design, which is the caller's ln|XᵀV⁻¹X|

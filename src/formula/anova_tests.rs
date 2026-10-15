@@ -22,7 +22,7 @@ use crate::formula::{lower, Column, Lowered, Table};
 use crate::inference::contrast::{ContrastError, NoDfReason};
 use crate::inference::evd::EvdError;
 use crate::inference::lr::lr_p_value;
-use crate::inference::rlrt::{exact_rlrt, RlrtConfig, RlrtRefusal};
+use crate::inference::rlrt::{exact_rlrt, RlrtConfig, RlrtRefusal, RLRT_MAX_LEVELS};
 use crate::inference::{
     DenDf, LinearKind, LinearNote, LinearTest, LrNote, LrTest, Objective, Reference,
 };
@@ -178,6 +178,107 @@ fn groups_the_fixed_part_absorbs_get_the_mixture_with_the_refusal_reason() {
     assert!(c.note_lines()[0].contains(reason));
 }
 
+/// `levels` declared levels of `g`, three rows each except the levels in
+/// `empty`, which have none; a numeric `x` and a response with a group
+/// effect.
+fn three_per_level(levels: usize, empty: &[usize]) -> Table {
+    let mut st = 29u64;
+    let mut unif = || {
+        st = st
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((st >> 33) as f64 / (1u64 << 31) as f64) - 1.0
+    };
+    let (mut x, mut y, mut codes) = (Vec::new(), Vec::new(), Vec::new());
+    for a in (0..levels).filter(|a| !empty.contains(a)) {
+        let re = 0.6 * unif();
+        for _ in 0..3 {
+            let xi = unif();
+            x.push(xi);
+            y.push(0.5 + 0.4 * xi + re + 0.3 * unif());
+            codes.push(a as u32);
+        }
+    }
+    let n = y.len();
+    let levels = (0..levels).map(|a| format!("g{a:03}")).collect();
+    Table {
+        columns: vec![
+            ("y".into(), Column::Numeric(y)),
+            ("x".into(), Column::Numeric(x)),
+            ("g".into(), Column::Factor { levels, codes }),
+        ],
+        n,
+    }
+}
+
+const FEW_DRAWS: CompareOptions = CompareOptions {
+    nsim: 200,
+    seed: OPTS.seed,
+};
+
+/// The larger side of `y ~ x` against `y ~ x + (1 | g)`, and the comparison.
+fn level_pair(d: &Table) -> (Model, Comparison) {
+    let ols = side("y ~ x", d, Some(true), None);
+    let full = side("y ~ x + (1 | g)", d, None, None);
+    let c = compare(&ols, &full, &FEW_DRAWS).unwrap();
+    (full, c)
+}
+
+/// The exact test runs up to 100 levels with rows. A declared level with no
+/// rows does not count: an interior one keeps its slot in the summary as a
+/// 0 count, so 101 slots with one empty are 100 levels with rows.
+#[test]
+fn the_exact_test_runs_up_to_100_levels_with_rows() {
+    let exact = Reference::ExactRlrt {
+        nsim: FEW_DRAWS.nsim,
+        seed: FEW_DRAWS.seed,
+    };
+    for (d, slots) in [
+        (three_per_level(100, &[]), 100),
+        (three_per_level(101, &[50]), 101),
+    ] {
+        let (full, c) = level_pair(&d);
+        let (counts, _, _) = full.design_summary.as_ref().expect("inside the envelope");
+        assert_eq!(counts.len(), slots);
+        assert_eq!(counts.iter().filter(|&&n| n > 0.0).count(), 100);
+        let t = lr(&c);
+        assert_eq!(t.reference, exact);
+        assert!(t.statistic > 0.0);
+        assert!(t.notes.is_empty(), "{:?}", t.notes);
+    }
+}
+
+/// Above 100 levels with rows the pair gets the 50:50 mixture, with the
+/// refusal's reason in the note.
+#[test]
+fn above_100_levels_with_rows_the_mixture_is_used_with_the_reason() {
+    let (full, c) = level_pair(&three_per_level(101, &[]));
+    assert!(full.design_summary.is_some());
+    let t = lr(&c);
+    let reason = RlrtRefusal::TooManyLevels.reason();
+    assert!(reason.contains(&format!("more than {RLRT_MAX_LEVELS} levels")));
+    assert_eq!(t.reference, Reference::ChiBarSquared { df_low: 0 });
+    assert_eq!(
+        t.notes,
+        vec![
+            LrNote::ExactRlrtRefused { reason },
+            LrNote::BoundaryMixture { approximate: false }
+        ]
+    );
+    assert!(t.statistic > 0.0);
+    assert_eq!(
+        t.p_value.to_bits(),
+        lr_p_value(t.statistic, &t.reference).to_bits()
+    );
+    assert_eq!(
+        c.note_lines()[0],
+        format!(
+            "The exact restricted likelihood-ratio test cannot be computed: {reason}. \
+             The 50:50 mixture is used."
+        )
+    );
+}
+
 #[test]
 fn a_mixture_row_takes_its_references_tail() {
     let d = csv_table(
@@ -195,6 +296,39 @@ fn a_mixture_row_takes_its_references_tail() {
     assert_eq!(
         t.p_value.to_bits(),
         lr_p_value(t.statistic, &t.reference).to_bits()
+    );
+}
+
+/// A side whose `re_groups` does not describe its random part (one grouping
+/// per variance block, one term per block dimension) is refused by name,
+/// never compared on the raw statistic.
+#[test]
+fn groupings_that_do_not_match_the_variance_blocks_are_refused() {
+    let (ols, full) = dyestuff();
+    let refusal = |a: &Model, b: &Model| compare(a, b, &OPTS).err();
+    let mut cleared = full.clone();
+    cleared.re_groups.clear();
+    assert_eq!(
+        refusal(&ols, &cleared),
+        Some(CompareError::ReGroups { side: Side::Second })
+    );
+    let mut wide = full.clone();
+    wide.re_groups[0].1.push("x".into());
+    assert_eq!(
+        refusal(&ols, &wide),
+        Some(CompareError::ReGroups { side: Side::Second })
+    );
+    let mut stray = ols.clone();
+    stray.re_groups = full.re_groups.clone();
+    assert_eq!(
+        refusal(&stray, &full),
+        Some(CompareError::ReGroups { side: Side::First })
+    );
+    let mut odd = full.clone();
+    odd.varcorr[0] = vec![1.0, 0.0];
+    assert_eq!(
+        refusal(&ols, &odd),
+        Some(CompareError::ReGroups { side: Side::Second })
     );
 }
 
@@ -241,6 +375,7 @@ fn every_refusal() -> Vec<CompareError> {
         CompareError::RemlDifferentFixed,
         CompareError::SameParts,
         CompareError::NothingToTest { m0: 3, m1: 3 },
+        CompareError::ReGroups { side: Side::First },
     ];
     let kind = |e: &CompareError| match e {
         CompareError::NotConverged { .. } => 0,
@@ -257,9 +392,10 @@ fn every_refusal() -> Vec<CompareError> {
         CompareError::RemlDifferentFixed => 11,
         CompareError::SameParts => 12,
         CompareError::NothingToTest { .. } => 13,
+        CompareError::ReGroups { .. } => 14,
     };
     let kinds: BTreeSet<usize> = every.iter().map(kind).collect();
-    assert_eq!(kinds, (0..14).collect(), "one refusal of each kind");
+    assert_eq!(kinds, (0..15).collect(), "one refusal of each kind");
     every
 }
 
@@ -339,17 +475,19 @@ fn every_note_text() -> Vec<String> {
         RlrtRefusal::NoGroupVariation,
         RlrtRefusal::Eigen(EvdError::NoConvergence),
         RlrtRefusal::MalformedSummary,
+        RlrtRefusal::TooManyLevels,
     ];
     let refusal_kind = |r: &RlrtRefusal| match r {
         RlrtRefusal::NoResidualDf => 0,
         RlrtRefusal::NoGroupVariation => 1,
         RlrtRefusal::Eigen(_) => 2,
         RlrtRefusal::MalformedSummary => 3,
+        RlrtRefusal::TooManyLevels => 4,
     };
     let kinds: BTreeSet<usize> = refusals.iter().map(refusal_kind).collect();
     assert_eq!(
         kinds,
-        (0..4).collect(),
+        (0..5).collect(),
         "one exact-test refusal of each kind"
     );
     let mut lr_notes = vec![

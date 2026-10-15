@@ -87,7 +87,12 @@ cargo's single-`TESTNAME` argument), so you can pass more than one.
 ### What the script does, step by step
 
 1. Copies the crate source (`GLMM/`) into two scratch trees, `normal/` and
-   `scalar/`, excluding build artifacts and venvs (never source files).
+   `scalar/`, excluding build artifacts, venvs, `.git` and
+   `validation/grid/data` (the grid's generated CSVs, about 200 MB), then
+   copies back the git-tracked files under `validation/grid/data` (about
+   13 MB, among them the CSVs the lib tests embed with `include_str!`), as
+   `git ls-files` lists them. The script therefore needs a git checkout and
+   exits 2 when the crate root is not one.
 2. Fetches pulp 0.22.2's source: reuses the local `~/.cargo/registry/src/`
    cache if present, otherwise runs `cargo vendor` from the `normal/`
    scratch tree (network fetch, expected and fine per the task's scope).
@@ -101,10 +106,22 @@ cargo's single-`TESTNAME` argument), so you can pass more than one.
    lanewidth_probe`), capturing stdout to `results/<ts>/probe_{normal,
    scalar}.txt`.
 6. Runs `cargo test --lib -- <filters> --nocapture` in both scratch trees,
-   capturing full logs to `results/<ts>/test_{normal,scalar}.log`.
+   capturing full logs to `results/<ts>/test_{normal,scalar}.log`. Both
+   trees compile the whole lib test target, so the filter runs only when
+   every lib test compiles.
 7. Writes `results/<ts>/summary.txt`: host arch/OS, which pulp-source path
    was used, the two probe lines side by side, and both `cargo test` exit
    statuses.
+
+### Exit status
+
+The script exits 1, after writing the summary, when the normal tree's
+`cargo test` fails or either test log shows `could not compile`: either
+means the run measured nothing. A non-zero scalar-forced status alone is
+the evidence the harness exists to collect (see below) and leaves the exit
+status at 0. Exit 2 is a refused start (missing patch file, no crate root,
+not a git checkout, an existing `SCRATCH`); exit 3 is a pulp vendoring or
+patching failure.
 
 ## How to interpret the output
 

@@ -18,8 +18,8 @@
 \item{...}{unused.}
 }
 \description{
-\code{formula()} returns the formula \strong{string} as given: the R side never
-builds a \code{terms} object (the parser is Rust-side), and
-synthesizing one would disagree with how the model was actually built -
-which is also why \code{terms()} errors.
+\code{formula()} returns the model formula as given, as a formula object, so
+\code{update(m, . ~ . + z)} works. The R side never builds a \code{terms} object
+(the parser is Rust-side), and synthesizing one would disagree with how
+the model was actually built, which is also why \code{terms()} errors.
 }

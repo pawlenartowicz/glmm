@@ -176,14 +176,15 @@ shares these entries; Python-specific notes are called out where they differ.
     Python `Fit.term_table_type3_lrt` / `Fit.term_table_type2_lrt`, R
     `$term_table_type3_lrt` / `$term_table_type2_lrt`; what `"auto"` gives is
     `FitResult::term_test_auto`, Python `Fit.term_test_auto`, R
-    `$term_test_auto`). `compare` makes its two fits with `"auto"`.
-    `test = "Wald"` or `"LRT"` on a fit with F rows, `"LRT"` on a fit that
-    stored no likelihood-ratio tables, and `"auto"` on a Poisson GLMM fitted
-    with `anova_test = "Wald"` stop with an error naming the fix. Checked
-    against frozen references (`validation/goldens/inference/anova/`): afex
-    1.5-1 and pairs of lme4 2.0-6 `glmer` fits for the GLMM rows, car 3.1-5
-    for the GLM rows. The default rests on a Monte Carlo calibration study of
-    glmm's tests against the truth, summarized in
+    `$term_test_auto`). `compare` makes its two fits with `"Wald"`: they store
+    no likelihood-ratio tables (`anova()` of a Poisson GLMM among them needs
+    `test = "Wald"`). `test = "Wald"` or `"LRT"` on a fit with F rows, `"LRT"`
+    on a fit that stored no likelihood-ratio tables, and `"auto"` on a Poisson
+    GLMM fitted with `anova_test = "Wald"` stop with an error naming the fix.
+    Checked against frozen references (`validation/goldens/inference/anova/`):
+    afex 1.5-1 and pairs of lme4 2.0-6 `glmer` fits for the GLMM rows, car
+    3.1-5 for the GLM rows. The default rests on a Monte Carlo calibration
+    study of glmm's tests against the truth, summarized in
     `documentation/hypothesis-tests.md` ("How well calibrated are these
     tests").
   - **Two existing fits compared**, R `anova(m0, m1)`, Python
@@ -209,8 +210,9 @@ shares these entries; Python-specific notes are called out where they differ.
   - **The boundary rule for variance components.** Random parts that differ
     by one dimension get the 50:50 mixture of χ²(d − 1) and χ²(d), labelled
     conservative, or, for a Gaussian REML fit whose only random term is one
-    unweighted `(1 | g)` with at least one fixed-effect column against its
-    OLS reduction, the exact restricted likelihood-ratio test of
+    unweighted `(1 | g)` with at least one fixed-effect column and at most
+    100 grouping levels with rows (above that the 50:50 mixture, with a note)
+    against its OLS reduction, the exact restricted likelihood-ratio test of
     Crainiceanu & Ruppert (2004): its null is simulated from the design
     summary the fit keeps, with no refit. Random parts more than one
     dimension apart get χ²(Δnpar), labelled as ignoring the boundary. When
@@ -257,7 +259,9 @@ shares these entries; Python-specific notes are called out where they differ.
   fit's `coef_names`, one per fixed-effect column, and a note on an aliased
   column names the coefficient, never an index: "The coefficient x2 is
   aliased, so the hypothesis was not tested." (the ports print it after the
-  row label, "x2: The coefficient x2 is aliased, ...").
+  row label, "x2: The coefficient x2 is aliased, ..."). `compare` refuses a
+  `Model` whose `re_groups` does not match its `varcorr`
+  (`CompareError::ReGroups`).
 - **`Fit::nobs` and `Fit::objective`**: the row count the fit was given (on
   every route, a non-converged fit included) and what it maximised
   (`Objective::{LeastSquares, MaximumLikelihood, Reml, Laplace, Agq { nodes }}`).
@@ -358,6 +362,16 @@ shares these entries; Python-specific notes are called out where they differ.
 - **The dev-only `oracle-tests` feature turns on `orchestrate`** (and so
   `formula`): the inference tier gates the ports' interval function, which
   lives there.
+- **The `formula` feature is documented as outside the semver promise until
+  the 1.0.0 surface review.** `Cargo.toml` described it as semver-covered;
+  `Cargo.toml`, the crate docs and `documentation/installation.md` now agree
+  that semver covers `fit_cold`/`fit_warm`, `ModelSpec` and `GroupIds`, and
+  that the `formula` module, on by default, may change before 1.0.0. No code
+  changes.
+- **R's `formula()` of a fit returns a formula object** (it returned the
+  formula string), so `update(m, <new formula>)` works, for example
+  `update(m, . ~ . + z)`. The fit's `$formula` field stays the string. The
+  `terms()` error now ends "formula() returns the model formula as given.".
 
 ### Removed
 
@@ -365,6 +379,40 @@ shares these entries; Python-specific notes are called out where they differ.
   random-effects block**, in the text output or the HTML, LaTeX and Typst
   renders, so both ports print the same block. `Fit.stddev_se` keeps the
   numbers.
+
+### Fixed
+
+- **A formula that ends with `+` is refused** with `ParseError::Syntax`:
+  "the formula ends with '+': a term is missing after it". It was fitted as
+  if the `+` were absent, from a Python formula string and from the Rust
+  parser (`formula::parse`); an R formula object cannot end in `+`.
+- **The `^` crossing operator is refused with an error that names it**
+  (`ParseError::Syntax`): "the crossing operator '^' is not supported: write
+  the terms out (for example (a + b)^2 as a + b + a:b)". A formula such as
+  `y ~ (a + b + c)^2` failed with "expected identifier, got '(a'". `I(x^k)`
+  is unchanged.
+- **A fit with no more rows than a term's random effects now warns** (fewer
+  rows, on a family other than Gaussian), where lme4 stops by default
+  (`check.nobs.vs.nRE`): such variance parameters are probably not
+  identifiable. A term's random effects are its observed levels times its
+  columns (the intercept, one per numeric slope, one per non-base level of a
+  factor slope), and each term is checked against all rows on its own. The
+  formula lowering raises `Note::FewRowsForRandomEffects`, which the ports
+  show as a Caution, "Too few rows for the random effects": the Python
+  `FewRowsForRandomEffectsWarning` and the R condition class
+  `fastglmm_few_rows_for_random_effects`. The fit itself is unchanged.
+- **A fit whose variance parameter ends on the search limit is no longer
+  reported as interior with no warning.** When some θ coordinate of a fit
+  with a finite end point sits on the upper limit of its search box (1000 on
+  the internal scale), as on a Gaussian model whose response the predictors
+  and groups explain exactly, the fit carries the new `Note::VarianceAtLimit`
+  and its `Diagnostics::boundary` reads the new `Boundary::UpperLimit` where
+  it read `Interior` (an `AtBoundary` or `NoOptimum` fit keeps its state and
+  still gets the note). The ports show it as a Caution, "Variance at its
+  search limit": the Python `VarianceAtLimitWarning` and the R condition
+  class `fastglmm_variance_at_limit`, with `diagnostics` boundary
+  `"upper_limit"`. `converged`, `singular` and every estimate are unchanged,
+  and the loop tier's `FitDiagnostics` does not report it.
 
 ## [0.5.0] — 2026-10-10
 

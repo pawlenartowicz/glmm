@@ -136,14 +136,14 @@ converge) and \code{coef_p} (its p-value), \code{df_method}
 \code{rss}, \code{r_squared} and \code{adj_r_squared} (OLS fits only, \code{NaN} otherwise),
 \code{offset} (the offset fitted with, \code{NULL} without one), plus
 \link[=anova.fastglmm]{anova()} (the per-term tests, built at fit time, or a
-comparison of two fits),
-\code{print()}, \link[=summary.fastglmm]{summary()}, \link[=confint.fastglmm]{confint()}
-(Wald), \code{nobs()}, \link[=formula.fastglmm]{formula()} (returns the formula
-\strong{string}), \code{family()}, \code{model.frame()}, \link[=ranef.fastglmm]{ranef()},
+comparison of two fits), \code{print()}, \link[=summary.fastglmm]{summary()},
+\link[=confint.fastglmm]{confint()} (Wald), \code{nobs()},
+\link[=formula.fastglmm]{formula()} (returns the model formula as given, so
+\code{update()} works), \code{family()}, \code{model.frame()}, \link[=ranef.fastglmm]{ranef()},
 \code{fitted()}, \code{residuals()}, \link[=logLik.fastglmm]{logLik()}, and
 \link[=AIC.fastglmm]{AIC()} and \code{BIC()} (which refuse a REML fit beside an ML
-one, and REML fits with different fixed effects). The blocked accessors (\code{predict}, \code{coef}, \code{terms})
-error with the reason.
+one, and REML fits with different fixed effects). The blocked accessors
+(\code{predict}, \code{coef}, \code{terms}) error with the reason.
 }
 \description{
 One entry point for the whole \code{glmm} engine, dispatching on \code{family} the way
@@ -197,11 +197,12 @@ Python port so the two ports agree.
 as a warning of class \code{"fastglmm_diagnostic"} with a per-kind subclass
 (\code{"fastglmm_ill_conditioned"}, \code{"fastglmm_pirls_exhausted"},
 \code{"fastglmm_unused_grouping_levels"},
-\code{"fastglmm_single_level_grouping_dropped"}, \code{"fastglmm_hessian_se_fallback"},
+\code{"fastglmm_single_level_grouping_dropped"},
+\code{"fastglmm_few_rows_for_random_effects"}, \code{"fastglmm_hessian_se_fallback"},
 \code{"fastglmm_se_unavailable"}, \code{"fastglmm_exact_profile_fallback"},
 \code{"fastglmm_gradient_search_fallback"},
 \code{"fastglmm_precision_limited"}, \code{"fastglmm_non_integer_response"}, \code{"fastglmm_rows_dropped_na"},
-\code{"fastglmm_satterthwaite_curvature"}; a note from
+\code{"fastglmm_satterthwaite_curvature"}, \code{"fastglmm_variance_at_limit"}; a note from
 a newer kernel than this package arrives as \code{"fastglmm_unknown_note"}),
 so \code{withCallingHandlers()} and \code{suppressWarnings(classes = )} can select
 them without matching message text.

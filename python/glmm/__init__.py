@@ -10,14 +10,14 @@ Public surface is `fit`, `Fit`, the tests of `glmm.anova` (`anova`,
 `compare`, `TermTable`, `ComparisonTable`, `Comparison`, in `glmm/anova.py`),
 and the warning categories the diagnostics channel raises (`DiagnosticWarning`, `AgqFallbackWarning`,
 `ArgumentIgnoredWarning`, `ConstantResponseWarning`, `DesignUnsolvableWarning`,
-`ExactProfileFallbackWarning`,
+`ExactProfileFallbackWarning`, `FewRowsForRandomEffectsWarning`,
 `FitFailedWarning`, `GradientSearchFallbackWarning`, `GlmDivergedWarning`, `HessianSeFallbackWarning`,
 `IllConditionedWarning`, `NbShapeUnsettledWarning`, `NoCoefficientsWarning`,
 `NonIntegerResponseWarning`, `PirlsExhaustedWarning`, `PrecisionLimitedWarning`,
 `RowsDroppedWarning`, `SatterthwaiteCurvatureWarning`,
 `SearchLimitWarning`, `SeUnavailableWarning`, `SingleLevelGroupingDroppedWarning`,
 `SingularFitWarning`,
-`TooFewRowsWarning`, `UnusedGroupingLevelsWarning`).
+`TooFewRowsWarning`, `UnusedGroupingLevelsWarning`, `VarianceAtLimitWarning`).
 """
 
 import math
@@ -43,6 +43,7 @@ __all__ = [
     "DesignUnsolvableWarning",
     "DiagnosticWarning",
     "ExactProfileFallbackWarning",
+    "FewRowsForRandomEffectsWarning",
     "Fit",
     "FitFailedWarning",
     "GlmDivergedWarning",
@@ -63,6 +64,7 @@ __all__ = [
     "TermTable",
     "TooFewRowsWarning",
     "UnusedGroupingLevelsWarning",
+    "VarianceAtLimitWarning",
     "anova",
     "compare",
     "fit",
@@ -126,6 +128,19 @@ class SingleLevelGroupingDroppedWarning(DiagnosticWarning):
     """
 
 
+class FewRowsForRandomEffectsWarning(DiagnosticWarning):
+    """A random-effect term has at least as many random effects as the fit has
+    rows (more than the rows, on a family other than Gaussian), so its variance
+    parameters are probably not identifiable.
+
+    A term's random effects are its observed levels times its columns (the
+    intercept, one per numeric slope, one per non-base level of a factor
+    slope): `(1 + x | g)` on 10 levels has 20. Each term is checked on its own
+    against all rows. lme4 stops on such a model by default
+    (`check.nobs.vs.nRE`); this port fits it as usual and warns.
+    """
+
+
 class HessianSeFallbackWarning(DiagnosticWarning):
     """`wald_se="hessian"` was requested, but the joint Hessian was not usable
     (not positive definite, or the fit took the finite-difference Hessian and a
@@ -186,6 +201,19 @@ class PrecisionLimitedWarning(DiagnosticWarning):
     the billions or more, either through the deviance itself (a model that
     misses a large effect) or, with more than one grouping factor, through the
     log-determinant of the random-effect system.
+    """
+
+
+class VarianceAtLimitWarning(DiagnosticWarning):
+    """A random-effect parameter ended on the upper limit of the variance search
+    (1000 on glmm's internal scale), so the estimates sit at that limit, not at
+    an optimum.
+
+    On a Gaussian model this usually means the residual variance is estimated
+    at or near zero; on other families the random effect has no finite
+    estimate. `converged` and `singular` are the search's own, and
+    `diagnostics["boundary"]` reads "upper_limit" when it would otherwise read
+    "interior".
     """
 
 
@@ -528,9 +556,11 @@ class Fit:
     #                     (lme4's isSingular)
     #   aliased    (p,) bool — rank-deficient columns dropped (lme4's NA
     #                     coefficients)
-    #   boundary   "interior" | "at_boundary" | "no_optimum" — where the
-    #                     accepted theta sits. Every theta-carrying
-    #                     route distinguishes all three (LMM over either
+    #   boundary   "interior" | "at_boundary" | "no_optimum" | "upper_limit":
+    #                     where the accepted theta sits ("upper_limit": on the
+    #                     upper limit of the search, otherwise interior).
+    #                     Every theta-carrying route distinguishes all four
+    #                     (LMM over either
     #                     kernel, GLMM over every layout, negative binomial
     #                     included). OLS and GLM (no theta) always report
     #                     "interior", and so does a fit that failed before any
@@ -868,6 +898,8 @@ _WARNING_KINDS = {
     "non_integer_response": ("caution", "Non-integer response"),
     "rows_dropped_na": ("caution", "Rows dropped for missing values"),
     "satterthwaite_curvature": ("caution", "Satterthwaite df uncertain"),
+    "few_rows_for_random_effects": ("caution", "Too few rows for the random effects"),
+    "variance_at_limit": ("caution", "Variance at its search limit"),
     "argument_ignored": ("note", "Argument ignored"),
     "unused_grouping_levels": ("note", "Unused grouping levels"),
     "single_level_grouping_dropped": ("note", "Random effect dropped (single level)"),
@@ -920,8 +952,9 @@ def _pinned_detail(res):
     return parts
 
 
-def _note_warning(note, names, converged):
+def _note_warning(note, names, converged, nobs):
     """One kernel note as (message, warning category), or None to raise nothing.
+    `nobs` is the fit's row count.
 
     The `kind` string, not the English text, is the stable identifier — an
     unrecognized kind comes from a kernel newer than this wrapper (the Rust
@@ -988,6 +1021,31 @@ def _note_warning(note, names, converged):
                 "the rest of the model was fitted without it."
             ),
             SingleLevelGroupingDroppedWarning,
+        )
+    if kind == "few_rows_for_random_effects":
+        # The kernel's Note::FewRowsForRandomEffects (src/fit/mod.rs): `detail` is the
+        # term as "<terms> | <grouping>" and `evals` its random-effect count
+        # (src/orchestrate.rs); the rows are the fit's own.
+        return (
+            (
+                f"The term ({note['detail']}) has {note['evals']} random effects for "
+                f"{_count(nobs, 'row')}, so its variance parameters are probably not "
+                "identifiable; lme4 stops on such a model by default. The estimates are "
+                "shown; read the variance components with care, or simplify the "
+                "random-effects structure."
+            ),
+            FewRowsForRandomEffectsWarning,
+        )
+    if kind == "variance_at_limit":
+        return (
+            (
+                "A random-effect parameter reached the upper limit of the search (1000 on "
+                "glmm's internal scale). On a Gaussian model this usually means the residual "
+                "variance is estimated at or near zero; on other families the random effect "
+                "has no finite estimate. The estimates sit at that limit, not at an optimum: "
+                "check for a response the predictors and groups explain exactly."
+            ),
+            VarianceAtLimitWarning,
         )
     if kind == "hessian_se_fallback":
         return (
@@ -1570,7 +1628,7 @@ def _fit_from_native(r, formula, family, link, nagq, dispersion, store):
             SingularFitWarning,
         )
     for note in res.diagnostics["notes"]:
-        out = _note_warning(note, res.names, res.converged)
+        out = _note_warning(note, res.names, res.converged, res.nobs)
         if out is not None:
             _warn(store, note["kind"], *out)
     if not res.converged:

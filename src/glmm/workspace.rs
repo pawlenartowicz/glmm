@@ -980,8 +980,10 @@ pub struct GlmmWorkspace {
     /// Hessian at least once, so `bfgs` holds an estimate a curvature hint can
     /// be taken from. Reset at the top of every `fit_glmm`.
     pub(crate) grad_hint_ready: bool,
-    /// The response units `c` the last `fit_glmm` ran in (the kernel fits
-    /// `y/c`), set by `fit::glmm::fit_glmm_in_units`; 1 otherwise.
+    /// The response units `c` (the kernel fits `y/c`) of the search whose
+    /// state the workspace holds: set by `fit::glmm::fit_glmm_in_units`, put
+    /// back with that state when `fit::glmm::gamma_inverse_retry` keeps an
+    /// earlier search; 1 otherwise.
     pub(crate) search_units: f64,
     /// PIRLS scratch (sized max_n / k) — see [`PirlsScratch`].
     pub(crate) pirls: PirlsScratch<f64>,

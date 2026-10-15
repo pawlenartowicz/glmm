@@ -106,13 +106,13 @@ with an OLS fit made with \code{REML = TRUE}.
 }
 
 When the random parts differ, the reference is the exact restricted
-likelihood-ratio test (Crainiceanu and Ruppert 2004) when the larger model
-is a Gaussian REML fit whose only random term is one unweighted \code{(1 | g)},
-with at least one fixed-effect column, and the smaller is OLS with the same
-fixed part; otherwise the 50:50
+likelihood-ratio test (Crainiceanu and Ruppert 2004) when the larger model is
+a Gaussian REML fit whose only random term is one unweighted \code{(1 | g)}, with
+at least one fixed-effect column and a grouping with at most 100 levels with
+rows, and the smaller is OLS with the same fixed part; otherwise the 50:50
 mixture of chi-squared distributions when one random dimension is dropped,
-and chi-squared on the parameter difference, labelled conservative, when
-more are. The heading names the reference and carries the notes.
+and chi-squared on the parameter difference, labelled conservative, when more
+are. The heading names the reference and carries the notes.
 
 Two REML fits with different fixed parts, and a REML fit beside an ML fit,
 are errors: lme4 refits such fits by ML, \code{anova()} here does not. Use

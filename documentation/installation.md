@@ -10,7 +10,8 @@ MSRV is Rust 1.85 — the floor is set by the `bobyqa` dependency. Linear
 algebra runs on [`faer`](https://crates.io/crates/faer) 0.24.
 
 The semver-covered surface is `fit_cold`/`fit_warm` + `ModelSpec` +
-`GroupIds`.
+`GroupIds`. The `formula` frontend, on by default, is outside it until the
+1.0.0 surface review.
 
 Default features build the `formula` frontend (R-style formula strings, the
 only thing that pulls in `regex`) — everything else is off by default. The

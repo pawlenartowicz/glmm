@@ -614,7 +614,16 @@ test_that("auto on a Poisson GLMM fitted with anova_test = \"Wald\" says so", {
                'Use test = "Wald", or refit with fastglmm(..., anova_test = "auto").')
   expect_error(anova(m), msg, fixed = TRUE)
   expect_error(anova(m, type = "II"), msg, fixed = TRUE)
-  glm <- fastglmm(y ~ t * d, benchmark_data(seed = 323, family = "poisson"), family = poisson())
+  # compare() makes its two fits as anova_test = "Wald" makes them.
+  d <- benchmark_data(seed = 323, family = "poisson")
+  cmp <- compare(d, y ~ t + d + (1 | g), y ~ t * d + (1 | g), family = poisson())
+  expect_error(anova(cmp$fit1), msg, fixed = TRUE)
+  expect_error(anova(cmp$fit1, type = "II"), msg, fixed = TRUE)
+  for (type in c("III", "II")) {
+    expect_identical(anova(cmp$fit1, type = type, test = "Wald"),
+                     anova(m, type = type, test = "Wald"))
+  }
+  glm <- fastglmm(y ~ t * d, d, family = poisson())
   expect_identical(glm$term_test_auto, list(test = "chisq", reason = "no_random_effects"))
   expect_null(glm$term_table_type3_lrt)
   expect_identical(attr(anova(glm), "heading"), c(

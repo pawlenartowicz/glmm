@@ -296,10 +296,15 @@ def test_auto_on_a_poisson_glmm_fitted_with_wald_says_so():
         "and this fit stored none: it was made with anova_test='Wald'. Use test='Wald', or "
         "refit with glmm.fit(..., anova_test='auto')."
     )
+    # glmm.compare makes its two fits as anova_test="Wald" makes them.
+    fit1 = quiet_compare("n ~ x + (1 | g)", _POIS, family="poisson").fit1
     for ss in ("III", "II"):
-        with pytest.raises(ValueError) as err:
-            glmm.anova(m, type=ss)
-        assert str(err.value) == message
+        for f in (m, fit1):
+            with pytest.raises(ValueError) as err:
+                glmm.anova(f, type=ss)
+            assert str(err.value) == message
+        wald = glmm.anova(m, type=ss, test="Wald")
+        assert glmm.anova(fit1, type=ss, test="Wald").text() == wald.text()
 
 
 def test_auto_names_the_wald_test_and_its_reason_on_every_other_chi_squared_fit():

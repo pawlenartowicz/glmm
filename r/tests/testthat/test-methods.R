@@ -167,11 +167,12 @@ test_that("VarCorr omits the Residual row on a non-gaussian mixed fit", {
   expect_false(grepl("Residual", paste(capture.output(print(vc)), collapse = "\n")))
 })
 
-test_that("accessors: nobs, formula string, family, model.frame", {
+test_that("accessors: nobs, formula, family, model.frame", {
   d <- benchmark_data(seed = 105, family = "binomial")
   fit <- fastglmm(y ~ t + d + (1 | g), d, family = binomial())
   expect_equal(nobs(fit), nrow(d))
-  expect_equal(formula(fit), "y ~ t + d + (1 | g)")
+  expect_s3_class(formula(fit), "formula")
+  expect_equal(deparse(formula(fit)), "y ~ t + d + (1 | g)")
   expect_s3_class(family(fit), "family")
   expect_equal(family(fit)$family, "binomial")
   mf <- model.frame(fit)
@@ -179,6 +180,24 @@ test_that("accessors: nobs, formula string, family, model.frame", {
   # isSingular() dispatch is covered separately - it is lme4's own generic
   # (see the fixef/ranef/VarCorr/isSingular masking test below), so it needs
   # library(lme4), not just library(fastglmm).
+})
+
+test_that("update() takes a new formula or a changed argument", {
+  set.seed(1)
+  g <- factor(rep(1:10, each = 6))
+  x <- rnorm(60)
+  z <- rnorm(60)
+  y <- 1 + 0.5 * x + rnorm(10)[as.integer(g)] + rnorm(60)
+  d <- data.frame(y, x, z, g)
+  m <- fastglmm(y ~ x + (1 | g), d)
+  m_z <- update(m, . ~ . + z)
+  expect_equal(deparse(formula(m_z)), "y ~ x + (1 | g) + z")
+  expect_identical(m_z$beta, fastglmm(y ~ x + (1 | g) + z, d)$beta)
+  # The updated fit's call must not carry the previous fit along.
+  expect_identical(environment(m_z$call$formula), globalenv())
+  m_ml <- update(m, REML = FALSE)
+  expect_s3_class(m_ml, "fastglmm")
+  expect_false(m_ml$reml)
 })
 
 test_that("isSingular(fastglmm fit) works with no other package attached", {

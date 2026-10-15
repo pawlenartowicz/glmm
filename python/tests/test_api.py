@@ -12,7 +12,7 @@ import glmm
 
 def test_module_surface():
     # `fit`, `Fit`, the tests of `glmm.anova` (`anova`, `compare` and their
-    # three result classes), and the twenty-four warning categories the
+    # three result classes), and the twenty-six warning categories the
     # diagnostics channel raises; a user has to be able to name them to filter
     # on them.
     assert glmm.__all__ == [
@@ -24,6 +24,7 @@ def test_module_surface():
         "DesignUnsolvableWarning",
         "DiagnosticWarning",
         "ExactProfileFallbackWarning",
+        "FewRowsForRandomEffectsWarning",
         "Fit",
         "FitFailedWarning",
         "GlmDivergedWarning",
@@ -44,6 +45,7 @@ def test_module_surface():
         "TermTable",
         "TooFewRowsWarning",
         "UnusedGroupingLevelsWarning",
+        "VarianceAtLimitWarning",
         "anova",
         "compare",
         "fit",

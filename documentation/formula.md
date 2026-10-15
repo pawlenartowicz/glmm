@@ -63,6 +63,7 @@ not a positive, finite number is a clear error naming the row.
 | `(x || g)` | Clear error — the double-pipe form (uncorrelated random effects) matches none of the random-effect patterns and is rejected as invalid syntax | Not available; random slopes are always fit with a full correlation structure via `(1 + x | g)` |
 | `(0 + x | g)` | Clear error — intercept suppression inside a random-effects term is not supported | Not available; a random slope always carries a random intercept: `(x | g)` or `(1 + x | g)` |
 | `.` | Clear error — `.` (all other columns) is not a valid identifier | Spell out the predictors explicitly |
+| `^` outside `I(x^k)` (e.g. `(a + b + c)^2`) | Clear parse error naming the `^` crossing operator | Write the terms out: `a + b + c + a:b + a:c + b:c` for `(a + b + c)^2` |
 | `contrasts=` | Not an argument the R or Python wrapper accepts | Relevel the factor (`relevel()` in R; reorder before building a `pandas.Categorical`) so the level you want as base sorts first |
 
 Every one of these is a clear error at parse or fit time, never a silent

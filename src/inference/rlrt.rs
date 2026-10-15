@@ -53,8 +53,18 @@ use crate::linalg::SeqLlt;
 /// the `λ` grid. Also the scale of an all-zero `ZᵀP₀Z` (see [`rlrt_design`]).
 pub(crate) const MU_ZERO_REL: f64 = 1e-10;
 
+/// The most levels with rows (`K'`, the positive `counts` entries) a grouping
+/// may have for the comparison to run the exact test. As `K'` grows the
+/// exact null approaches the 50:50 mixture, while its cost grows (a
+/// `K' × K'` eigendecomposition and a grid sweep over up to `K'` eigenvalues
+/// per draw), so above this the comparison refuses with
+/// [`RlrtRefusal::TooManyLevels`]. The functions here take any `K`.
+pub(crate) const RLRT_MAX_LEVELS: usize = 100;
+
 /// Why the exact RLRT cannot be computed from a design summary. The caller
 /// falls back to another reference and reports [`RlrtRefusal::reason`].
+/// [`RlrtRefusal::TooManyLevels`] comes from the comparison
+/// (`formula::anova`), never from [`rlrt_design`]; the core returns the rest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RlrtRefusal {
     /// `n − p_eff < 1` after the aliased columns are dropped.
@@ -67,6 +77,9 @@ pub(crate) enum RlrtRefusal {
     /// entry, a count that is not a row count, a `c` the Cholesky refuses, or
     /// more nonzero `μ` than `n − p_eff`.
     MalformedSummary,
+    /// The grouping has more than [`RLRT_MAX_LEVELS`] levels with rows. The
+    /// comparison returns it before the core is called.
+    TooManyLevels,
 }
 
 impl RlrtRefusal {
@@ -82,6 +95,9 @@ impl RlrtRefusal {
             Self::Eigen(_) => "the eigendecomposition of the design's Z'P0Z failed",
             Self::MalformedSummary => {
                 "the design summary is not one a fit gives (sizes that disagree, a non-finite entry, a count that is not a row count, an X'X that is not positive definite, or more nonzero eigenvalues than n - p)"
+            }
+            Self::TooManyLevels => {
+                "the grouping factor has more than 100 levels with rows, where the exact null is close to the 50:50 mixture and costs more to simulate than it gains"
             }
         }
     }

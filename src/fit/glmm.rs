@@ -812,6 +812,7 @@ struct SearchState {
     pirls_exhausted: u32,
     final_pirls_exhausted: bool,
     grad_report: Option<(crate::optim::bfgs::BfgsStop, usize, f64, u8)>,
+    search_units: f64,
 }
 
 impl SearchState {
@@ -832,6 +833,7 @@ impl SearchState {
             pirls_exhausted: ws.pirls_exhausted,
             final_pirls_exhausted: ws.final_pirls_exhausted,
             grad_report: ws.grad_report,
+            search_units: ws.search_units,
         }
     }
 
@@ -851,6 +853,7 @@ impl SearchState {
         ws.pirls_exhausted = self.pirls_exhausted;
         ws.final_pirls_exhausted = self.final_pirls_exhausted;
         ws.grad_report = self.grad_report;
+        ws.search_units = self.search_units;
     }
 }
 
@@ -1086,7 +1089,16 @@ pub(crate) fn glmm_view_to_fit(
     if let Some(mask) = caller_pins {
         diag.pinned_components = mask;
     }
-    let diagnostics = super::common::materialize_diagnostics(&diag, p, &varcorr);
+    let mut diagnostics = super::common::materialize_diagnostics(&diag, p, &varcorr);
+    if has_endpoint {
+        // The box applies to the search's θ, `search_units` times the θ in
+        // y's units held here (`fit_glmm_in_units`).
+        super::common::note_theta_at_limit(
+            &mut diagnostics,
+            &ws.params[..n_theta],
+            ws.search_units,
+        );
+    }
     let mut fit = Fit {
         beta,
         se,
@@ -1327,6 +1339,7 @@ mod retry_tests {
             fast.converged = false;
             let _ = gamma_inverse_retry(&mut ws, fast, u.fast, &u, fit_in);
             assert_eq!(reports.len(), 4, "kept c = {kept}");
+            assert_eq!(ws.search_units, kept, "kept c = {kept}: search units");
             assert!(
                 crate::glmm::glmm_curvature_hint(&ws).is_none(),
                 "kept c = {kept}: a hint is left"

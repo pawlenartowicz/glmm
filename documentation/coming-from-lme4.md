@@ -106,15 +106,15 @@ four oracles (lme4, glmmTMB, MixedModels.jl, GLMMadaptive).
 - **A variance component is not tested against plain chi-squared.** lme4's
   `anova()` and `ranova()` use chi-squared on the parameter difference, which
   ignores the boundary at zero and roughly doubles the p-value. Here a
-  Gaussian model whose only random term is one unweighted random intercept,
-  compared by REML against the same fixed part, gets the exact restricted
-  likelihood-ratio test (RLRsim's `exactRLRT()` method, with a fixed default
-  seed), any other single dropped random effect the 50:50 mixture of
-  chi-squared distributions (still conservative, and labelled so), and only a
-  comparison that drops more than one random effect falls back to
-  chi-squared, labelled "ignores the boundary; conservative". When the random
-  parts alone differ, a component the larger fit puts at exactly zero gives a
-  statistic of exactly 0 and p = 1.
+  Gaussian model whose only random term is one unweighted random intercept
+  with at most 100 grouping levels with rows, compared by REML against the
+  same fixed part, gets the exact restricted likelihood-ratio test (RLRsim's
+  `exactRLRT()` method, with a fixed default seed), any other single dropped
+  random effect the 50:50 mixture of chi-squared distributions (still
+  conservative, and labelled so), and only a comparison that drops more than
+  one random effect falls back to chi-squared, labelled "ignores the boundary;
+  conservative". When the random parts alone differ, a component the larger
+  fit puts at exactly zero gives a statistic of exactly 0 and p = 1.
 - **Per-term tables follow lmerTest on Gaussian mixed models and car on the
   rest.** Type III is lmerTest's construction on every family, so it does not
   depend on the treatment coding (car's Type III on a treatment-coded `glm`

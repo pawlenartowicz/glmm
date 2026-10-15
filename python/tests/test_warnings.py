@@ -27,10 +27,12 @@ MIXED_PAIRS = {"x": _X, "g": _G_PAIRS, "y": [y + _OFF[g] for y, g in zip(_Y, _G_
 # declared-but-empty group level ("g_mid", between two used ones). Five
 # groups, eight rows each, with a random slope on z, whose values sit far from
 # zero. All three are lowering-time or argument-clearing checks, not solver
-# convergence. The fit adds one caution of its own: y has no random slope, so
+# convergence. The fit adds two cautions of its own: y has no random slope, so
 # the slope's variance comes out at zero, and glmm compares standard
 # deviations on its internally standardized design, where that is a singular
-# fit (on the raw design z's distance from zero hid it).
+# fit (on the raw design z's distance from zero hid it); and y is exact in z
+# and g, so the residual variance goes to zero and the intercept's theta ends
+# on the upper limit of its search.
 _PARITY_Z_SCALE = 1.0e4
 _PARITY_N_GROUPS = 5
 _PARITY_PER_GROUP = 8
@@ -62,9 +64,10 @@ def only(fit, kind):
 
 
 def test_clean_fit_stores_an_empty_list():
+    # MIXED_PAIRS, not MIXED: MIXED rides the theta limit and warns.
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        m = glmm.fit(MIXED, "y ~ x + (1 | g)")
+        m = glmm.fit(MIXED_PAIRS, "y ~ x + (1 | g)")
     assert m.warnings == []
 
 
@@ -125,7 +128,7 @@ def test_agq_fallback_is_stored_and_printed():
 @pytest.mark.parametrize(
     ("data", "formula", "family", "reason"),
     [
-        (MIXED, "y ~ x + (1 | g)", "gaussian", "a Gaussian model"),
+        (MIXED_PAIRS, "y ~ x + (1 | g)", "gaussian", "a Gaussian model"),
         (
             {"x": _X, "y": [float(v > 0) for v in _Y]},
             "y ~ x",
@@ -281,7 +284,7 @@ def test_constructed_notes_store_with_their_tier_and_title():
         ),
     ]
     for note, category, message in cases:
-        msg, cat = glmm._note_warning(note, [], True)
+        msg, cat = glmm._note_warning(note, [], True, 0)
         assert (msg, cat) == (message, category), note["kind"]
         store = []
         with pytest.warns(category) as caught:
@@ -337,10 +340,10 @@ def test_pirls_exhausted_is_raised_only_on_a_converged_final_eval():
         "final_eval": False,
         "detail": "",
     }
-    assert glmm._note_warning(note, [], True) is None  # rejected trial point
-    assert glmm._note_warning(note, [], False) is None  # folded into search_limit / fit_failed
-    assert glmm._note_warning(dict(note, final_eval=True), [], False) is None
-    assert glmm._note_warning(dict(note, final_eval=True), [], True)[1] is (
+    assert glmm._note_warning(note, [], True, 0) is None  # rejected trial point
+    assert glmm._note_warning(note, [], False, 0) is None  # folded into search_limit / fit_failed
+    assert glmm._note_warning(dict(note, final_eval=True), [], False, 0) is None
+    assert glmm._note_warning(dict(note, final_eval=True), [], True, 0)[1] is (
         glmm.PirlsExhaustedWarning
     )
 
@@ -354,7 +357,7 @@ def test_unused_levels_splits_on_the_first_separator():
         "final_eval": False,
         "detail": "g: a: b, c",
     }
-    msg, _ = glmm._note_warning(note, [], True)
+    msg, _ = glmm._note_warning(note, [], True, 0)
     assert msg.startswith("Grouping factor 'g' has levels with no rows (a: b, c).")
 
 
@@ -380,9 +383,10 @@ def test_store_is_per_fit():
 
 
 def test_argument_order_is_the_documented_one():
+    # MIXED_PAIRS, not MIXED: MIXED rides the theta limit and warns.
     with pytest.warns(glmm.DiagnosticWarning):
         m = glmm.fit(
-            MIXED,
+            MIXED_PAIRS,
             "y ~ x + (1 | g)",
             dispersion=2.0,
             init_theta=1.5,
@@ -872,11 +876,12 @@ def test_kind_table_matches_warnings_md():
     assert rows == expected
 
 
-def test_port_parity_sequence_adds_three_more_kinds():
+def test_port_parity_sequence_adds_four_more_kinds():
     # Same PARITY fixture and call in r/tests/testthat/test-warnings.R —
     # change together. One fixture, three notes across two kinds
     # (argument_ignored fires twice, from two different arguments;
-    # unused_grouping_levels), plus the fit's own singular caution.
+    # unused_grouping_levels), plus the fit's own singular and
+    # variance_at_limit cautions.
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         m = glmm.fit(PARITY, "y ~ z + (1 + z | g)", dispersion=2.0, nagq=3)
@@ -886,6 +891,7 @@ def test_port_parity_sequence_adds_three_more_kinds():
         ("note", "argument_ignored", "Argument ignored"),
         ("caution", "singular", "Singular fit"),
         ("note", "unused_grouping_levels", "Unused grouping levels"),
+        ("caution", "variance_at_limit", "Variance at its search limit"),
     ]
 
 
@@ -899,6 +905,55 @@ def test_port_parity_non_integer_response():
     assert [(w["tier"], w["kind"], w["title"]) for w in m.warnings] == [
         ("caution", "non_integer_response", "Non-integer response"),
     ]
+
+
+# A random intercept and slope on 10 subjects, two of them with one row: 20
+# random effects for 18 rows. Same fixture and call in
+# r/tests/testthat/test-warnings.R - change together.
+_FEW_ROWS_ID = [1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 7, 7, 8, 8, 9, 9, 10, 10]
+_FEW_ROWS_Y = [0.26, -0.09, 0.46, -1.73, -0.38, -0.91, -0.86, 0.91, -1.42]
+_FEW_ROWS_Y += [-0.40, -1.23, -1.62, -1.46, -0.49, 1.31, 0.85, 0.06, 0.36]
+FEW_ROWS = {
+    "y": _FEW_ROWS_Y,
+    "time": [float(t) for t in (0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 1, 0, 1)],
+    "id": [f"s{i}" for i in _FEW_ROWS_ID],
+}
+
+
+def test_port_parity_few_rows_for_random_effects():
+    with pytest.warns(glmm.FewRowsForRandomEffectsWarning) as caught:
+        m = glmm.fit(FEW_ROWS, "y ~ time + (1 + time | id)")
+    entry = only(m, "few_rows_for_random_effects")
+    assert (entry["tier"], entry["title"]) == ("caution", "Too few rows for the random effects")
+    assert entry["message"] == (
+        "The term (1 + time | id) has 20 random effects for 18 rows, so its variance "
+        "parameters are probably not identifiable; lme4 stops on such a model by default. "
+        "The estimates are shown; read the variance components with care, or simplify the "
+        "random-effects structure."
+    )
+    assert printed(entry) in [str(w.message) for w in caught]
+
+
+def test_port_parity_variance_at_limit():
+    # Same fixture and call in r/tests/testthat/test-warnings.R - change together.
+    # On MIXED, y - 0.3x is constant within each group, so the residual variance
+    # goes to zero and theta ends on the upper limit of its search.
+    with pytest.warns(glmm.VarianceAtLimitWarning) as caught:
+        m = glmm.fit(MIXED, "y ~ x + (1 | g)")
+    assert m.converged
+    assert not m.singular
+    assert m.diagnostics["boundary"] == "upper_limit"
+    assert [w["kind"] for w in m.warnings] == ["variance_at_limit"]
+    entry = only(m, "variance_at_limit")
+    assert (entry["tier"], entry["title"]) == ("caution", "Variance at its search limit")
+    assert entry["message"] == (
+        "A random-effect parameter reached the upper limit of the search (1000 on glmm's "
+        "internal scale). On a Gaussian model this usually means the residual variance is "
+        "estimated at or near zero; on other families the random effect has no finite "
+        "estimate. The estimates sit at that limit, not at an optimum: check for a response "
+        "the predictors and groups explain exactly."
+    )
+    assert printed(entry) in [str(w.message) for w in caught]
 
 
 def test_port_parity_ill_conditioned():

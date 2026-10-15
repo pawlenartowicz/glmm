@@ -196,5 +196,6 @@ test_that("unused data columns are never marshalled", {
 
 test_that("formula strings are accepted", {
   fit <- fastglmm("y ~ x", ols_data())
-  expect_equal(formula(fit), "y ~ x")
+  expect_s3_class(formula(fit), "formula")
+  expect_equal(deparse(formula(fit)), "y ~ x")
 })

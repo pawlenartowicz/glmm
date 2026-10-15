@@ -154,8 +154,9 @@ pub struct Lowered {
     pub re_groups: Vec<ReGroupInfo>,
     /// Observations the LOWERING made about the data, which no solver can make
     /// because no solver sees the labels —
-    /// [`crate::Note::UnusedGroupingLevels`] and
-    /// [`crate::Note::SingleLevelGroupingDropped`]. Empty on a clean
+    /// [`crate::Note::UnusedGroupingLevels`],
+    /// [`crate::Note::SingleLevelGroupingDropped`] and
+    /// [`crate::Note::FewRowsForRandomEffects`]. Empty on a clean
     /// lowering. Carried here rather than on `Fit` because it is decided
     /// before any fit runs; the ports fold it into the same warning channel as
     /// `Fit`'s own notes.
@@ -1091,13 +1092,17 @@ fn lower_random_effects(
     // dropped one.
     let mut notes: Vec<crate::Note> = Vec::new();
     let mut terms: Vec<&RandomEffect> = Vec::with_capacity(ast.random_effects.len());
+    // Observed level count per kept term, for the row check at the end.
+    let mut level_counts: Vec<usize> = Vec::with_capacity(ast.random_effects.len());
     for re in &ast.random_effects {
-        if grouping_level_count(re, data)? < 2 {
+        let levels = grouping_level_count(re, data)?;
+        if levels < 2 {
             notes.push(crate::Note::SingleLevelGroupingDropped {
                 grouping: re_group_name(re),
             });
         } else {
             terms.push(re);
+            level_counts.push(levels);
         }
     }
     let Some((&re0, rest)) = terms.split_first() else {
@@ -1182,6 +1187,25 @@ fn lower_random_effects(
         extra_groupings.push(Grouping { relation, slopes });
         extra_ids.push(layout.ids);
         re_groups.push(re_group_info(re, factor_main_cols, layout.slot_labels));
+    }
+
+    // lme4's `check.nobs.vs.nRE`: each term's random effects, its observed
+    // levels times its columns (the intercept, one per numeric slope, one per
+    // non-base level of a factor slope), against all rows, not summed across
+    // terms. A Gaussian model is noted at `n <= count` (`lmer`), any other
+    // family at `n < count` (`glmer`, which allows an observation-level
+    // intercept).
+    let gaussian = matches!(family, Family::Gaussian);
+    for ((&re, &levels), info) in terms.iter().zip(&level_counts).zip(&re_groups) {
+        let random_effects = levels * info.terms.len();
+        if n < random_effects || (gaussian && n == random_effects) {
+            notes.push(crate::Note::FewRowsForRandomEffects {
+                terms: re_terms_spelling(re),
+                grouping: info.name.clone(),
+                random_effects: u32::try_from(random_effects).unwrap_or(u32::MAX),
+                rows: u32::try_from(n).unwrap_or(u32::MAX),
+            });
+        }
     }
 
     // No envelope cap here: the MAX_* caps are the engine's NoZ↔Sparse ROUTING
@@ -1483,6 +1507,15 @@ pub fn numeric_only_columns(ast: &ParsedFormula, available: &[String]) -> Vec<St
         push_resolved(&mut out, expr, available);
     }
     out
+}
+
+/// A random-effect term's left-hand side as a formula spells it: `"1"`, or
+/// `"1 + x + z"` for slopes (the intercept is never suppressed).
+fn re_terms_spelling(re: &RandomEffect) -> String {
+    match re {
+        RandomEffect::Intercept { .. } => "1".to_string(),
+        RandomEffect::Slope { vars, .. } => format!("1 + {}", vars.join(" + ")),
+    }
 }
 
 /// The grouping factor a random effect is written against — the name

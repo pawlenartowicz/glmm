@@ -515,7 +515,7 @@ pub(crate) fn pass_at(
 
 /// [`pass_at`] on the value route, whatever the kernel's arming: the reference
 /// the gradient route is checked against.
-#[cfg(test)]
+#[cfg(all(test, feature = "formula"))]
 pub(crate) fn pass_value_at(
     ws: &mut LmmWorkspace,
     theta: &[f64],
@@ -1003,7 +1003,7 @@ fn assemble_into(
 }
 
 /// [`hessian_into`] on a fresh matrix.
-#[cfg(test)]
+#[cfg(all(test, feature = "formula"))]
 fn hessian(col: &Collected) -> Mat<f64> {
     let mut hess = Mat::zeros(0, 0);
     hessian_into(col, &mut hess);

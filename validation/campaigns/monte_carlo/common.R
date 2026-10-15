@@ -46,6 +46,15 @@ derive_singular <- function(d, slope) {
     !is.finite(d$rho01) | (is.finite(d$rho01) & abs(d$rho01) > COR_TOL)
   s
 }
+# A fit is blown up when an estimate ran off: a fixed effect with |beta| >= GLMM_BLOWUP
+# or a random-effect SD >= GLMM_BLOWUP. fit_glmm.R marks such fits good = FALSE, and
+# the summary keeps them out of the metric set even when they sit on the boundary.
+GLMM_BLOWUP <- 20
+blown_up <- function(d) {
+  big <- function(x) is.finite(x) & x >= GLMM_BLOWUP
+  big(abs(d$beta0)) | big(abs(d$beta1)) | big(abs(d$beta2)) | big(abs(d$beta3)) |
+    big(d$tau0) | big(d$tau1)
+}
 NA_EST <- c(beta0=NA_real_, beta1=NA_real_, beta2=NA_real_, beta3=NA_real_,
             tau0=NA_real_, tau1=NA_real_, rho01=NA_real_)
 

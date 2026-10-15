@@ -305,7 +305,9 @@ fn refusal_cases() -> Vec<RefusalCase> {
 
 /// Every refusal the core returns, each from an input that reaches it, and
 /// every `reason()` non-empty and distinct. Each call returns, so no input
-/// here panics.
+/// here panics. `TooManyLevels` comes from the comparison, never from
+/// `rlrt_design`, so it has a reason here and no input (its case is in
+/// `formula::anova`'s tests).
 #[test]
 fn refusals() {
     use RlrtRefusal::*;
@@ -340,10 +342,11 @@ fn refusals() {
         NoGroupVariation,
         Eigen(EvdError::NoConvergence),
         MalformedSummary,
+        TooManyLevels,
     ]
     .iter()
     .map(|r| match r {
-        NoResidualDf | NoGroupVariation | Eigen(_) | MalformedSummary => r.reason(),
+        NoResidualDf | NoGroupVariation | Eigen(_) | MalformedSummary | TooManyLevels => r.reason(),
     })
     .collect();
     for (i, a) in reasons.iter().enumerate() {

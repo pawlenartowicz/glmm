@@ -295,12 +295,12 @@ def anova(*fits, type=None, test=_AUTO, nsim=None, seed=None):
     when they are the same, the 50:50 mixture when one random dimension is
     dropped (the exact restricted likelihood-ratio test when the larger model's
     only random term is one unweighted `(1 | g)`, with at least one
-    fixed-effect column, and the smaller is an OLS fit made with
-    `reml=True`), chi-squared ignoring the boundary otherwise. Two REML fits
-    with different fixed parts, or one REML and one ML fit, are refused
-    (lme4 refits such fits by ML; this does not): `glmm.compare(data, f0, f1)`
-    fits both the right way. Every refusal raises `ValueError` naming the
-    fix.
+    fixed-effect column and a grouping with at most 100 levels with rows, and
+    the smaller is an OLS fit made with `reml=True`), chi-squared ignoring the
+    boundary otherwise. Two REML fits with different fixed parts, or one REML
+    and one ML fit, are refused (lme4 refits such fits by ML; this does not):
+    `glmm.compare(data, f0, f1)` fits both the right way. Every refusal raises
+    `ValueError` naming the fix.
 
     nsim: draws of the exact test's simulated null, a whole number from 1 to
         1,000,000 (default 10,000).
@@ -399,10 +399,10 @@ def compare(
     missing value in any column either formula uses, in the weights or in the
     offset is dropped from both fits. The two formulas can be given in either order; the table lists the
     smaller model first. `nsim` and `seed` are as in `glmm.anova`. Both fits
-    are made with `anova_test="auto"`: `glmm.anova` of `fit0` or `fit1` with
-    `test="LRT"` works only on a Poisson model with random effects. For the
-    likelihood-ratio rows of another model with chi-squared rows, fit its
-    formula with `glmm.fit(..., anova_test="LRT")`.
+    are made with `anova_test="Wald"`: they store no likelihood-ratio tables,
+    so `glmm.anova` of a Poisson model with random effects among them needs
+    `test="Wald"`. For the likelihood-ratio rows, fit the formula with
+    `glmm.fit(..., anova_test="LRT")`.
 
     Formulas that are not nested, or that give the same model, raise
     `ValueError`. A third formula raises `TypeError`, and so do fits instead

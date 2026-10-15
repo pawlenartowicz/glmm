@@ -36,7 +36,8 @@ only <- function(fit, kind) {
 }
 
 test_that("a clean fit stores a zero-row data.frame", {
-  expect_no_warning(fit <- fastglmm(y ~ x + (1 | g), MIXED))
+  # MIXED_PAIRS, not MIXED: MIXED rides the theta limit and warns.
+  expect_no_warning(fit <- fastglmm(y ~ x + (1 | g), MIXED_PAIRS))
   expect_s3_class(fit$warnings, "data.frame")
   expect_named(fit$warnings, c("tier", "kind", "title", "message"))
   expect_equal(nrow(fit$warnings), 0L)
@@ -257,7 +258,7 @@ test_that("the store is per fit", {
 
 test_that("nAGQ that changes nothing is an ignored argument", {
   cases <- list(
-    list(fit = function() fastglmm(y ~ x + (1 | g), MIXED, nAGQ = 3),
+    list(fit = function() fastglmm(y ~ x + (1 | g), MIXED_PAIRS, nAGQ = 3),
          reason = "a Gaussian model"),
     list(fit = function() fastglmm(y ~ x, data.frame(x = x, y = as.numeric(yy > 0)),
                                    family = binomial(), nAGQ = 3),
@@ -274,7 +275,8 @@ test_that("nAGQ that changes nothing is an ignored argument", {
 })
 
 test_that("argument notes come in the documented order", {
-  fit <- suppressWarnings(fastglmm(y ~ x + (1 | g), MIXED, dispersion = 2,
+  # MIXED_PAIRS, not MIXED: MIXED rides the theta limit and warns.
+  fit <- suppressWarnings(fastglmm(y ~ x + (1 | g), MIXED_PAIRS, dispersion = 2,
                                    init.theta = 1.5, start = list(phi = 1), nAGQ = 3))
   expect_identical(fit$warnings$kind, rep("argument_ignored", 4L))
   expect_identical(substr(fit$warnings$message, 1L, 10L),
@@ -469,6 +471,8 @@ test_that("the kind table matches the Python port", {
     non_integer_response = c("caution", "Non-integer response"),
     rows_dropped_na = c("caution", "Rows dropped for missing values"),
     satterthwaite_curvature = c("caution", "Satterthwaite df uncertain"),
+    few_rows_for_random_effects = c("caution", "Too few rows for the random effects"),
+    variance_at_limit = c("caution", "Variance at its search limit"),
     argument_ignored = c("note", "Argument ignored"),
     unused_grouping_levels = c("note", "Unused grouping levels"),
     single_level_grouping_dropped = c("note", "Random effect dropped (single level)")
@@ -481,12 +485,13 @@ test_that("the kind table matches the Python port", {
 # Gaussian model, from two different arguments) plus the formula lowering's
 # own unused_grouping_levels, from one declared-but-empty group level
 # ("g_mid", between two used ones). Five groups, eight rows each, with a
-# random slope on z, whose values sit far from zero. The fit adds one caution
+# random slope on z, whose values sit far from zero. The fit adds two cautions
 # of its own: y has no random slope, so the slope's variance comes out at
 # zero, and glmm compares standard deviations on its internally standardized
 # design, where that is a singular fit (on the raw design z's distance from
-# zero hid it). Same fixture and call in python/tests/test_warnings.py -
-# change together.
+# zero hid it); and y is exact in z and g, so the residual variance goes to
+# zero and the intercept's theta ends on the upper limit of its search. Same
+# fixture and call in python/tests/test_warnings.py - change together.
 PARITY <- local({
   n_groups <- 5L
   per_group <- 8L
@@ -505,17 +510,17 @@ PARITY <- local({
              g = factor(g, levels = c("g0", "g1", "g2", "g_mid", "g3", "g4")))
 })
 
-test_that("port parity sequence adds three more kinds", {
+test_that("port parity sequence adds four more kinds", {
   fit <- suppressWarnings(fastglmm(y ~ z + (1 + z | g), PARITY, dispersion = 2, nAGQ = 3))
   expect_true(fit$converged)
-  expect_identical(fit$warnings$tier, c("note", "note", "caution", "note"))
+  expect_identical(fit$warnings$tier, c("note", "note", "caution", "note", "caution"))
   expect_identical(fit$warnings$kind, c(
     "argument_ignored", "argument_ignored", "singular",
-    "unused_grouping_levels"
+    "unused_grouping_levels", "variance_at_limit"
   ))
   expect_identical(fit$warnings$title, c(
     "Argument ignored", "Argument ignored", "Singular fit",
-    "Unused grouping levels"
+    "Unused grouping levels", "Variance at its search limit"
   ))
 })
 
@@ -529,6 +534,51 @@ test_that("port parity non_integer_response", {
   expect_identical(fit$warnings$tier, "caution")
   expect_identical(fit$warnings$kind, "non_integer_response")
   expect_identical(fit$warnings$title, "Non-integer response")
+})
+
+test_that("port parity few_rows_for_random_effects", {
+  # A random intercept and slope on 10 subjects, two of them with one row: 20
+  # random effects for 18 rows. Same fixture and call in
+  # python/tests/test_warnings.py - change together.
+  d <- data.frame(
+    y = c(0.26, -0.09, 0.46, -1.73, -0.38, -0.91, -0.86, 0.91, -1.42,
+          -0.40, -1.23, -1.62, -1.46, -0.49, 1.31, 0.85, 0.06, 0.36),
+    time = c(0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 1, 0, 1),
+    id = factor(sprintf("s%d", c(1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 7, 7, 8, 8, 9, 9, 10, 10)))
+  )
+  res <- fit_catching(fastglmm(y ~ time + (1 + time | id), d),
+                      "fastglmm_few_rows_for_random_effects")
+  expect_false(is.null(res$cond))
+  row <- only(res$fit, "few_rows_for_random_effects")
+  expect_identical(c(row$tier, row$title), c("caution", "Too few rows for the random effects"))
+  expect_identical(row$message, paste(
+    "The term (1 + time | id) has 20 random effects for 18 rows, so its variance",
+    "parameters are probably not identifiable; lme4 stops on such a model by default.",
+    "The estimates are shown; read the variance components with care, or simplify the",
+    "random-effects structure."))
+  expect_identical(conditionMessage(res$cond), printed(row))
+})
+
+test_that("port parity variance_at_limit", {
+  # Same fixture and call in python/tests/test_warnings.py - change together. On
+  # MIXED, y - 0.3x is constant within each group, so the residual variance goes
+  # to zero and theta ends on the upper limit of its search.
+  res <- fit_catching(fastglmm(y ~ x + (1 | g), MIXED), "fastglmm_variance_at_limit")
+  expect_false(is.null(res$cond))
+  expect_s3_class(res$cond, "fastglmm_diagnostic")
+  expect_true(res$fit$converged)
+  expect_false(res$fit$singular)
+  expect_identical(res$fit$diagnostics$boundary, "upper_limit")
+  expect_identical(res$fit$warnings$kind, "variance_at_limit")
+  row <- only(res$fit, "variance_at_limit")
+  expect_identical(c(row$tier, row$title), c("caution", "Variance at its search limit"))
+  expect_identical(row$message, paste(
+    "A random-effect parameter reached the upper limit of the search (1000 on glmm's",
+    "internal scale). On a Gaussian model this usually means the residual variance is",
+    "estimated at or near zero; on other families the random effect has no finite",
+    "estimate. The estimates sit at that limit, not at an optimum: check for a response",
+    "the predictors and groups explain exactly."))
+  expect_identical(conditionMessage(res$cond), printed(row))
 })
 
 test_that("a degenerate Gaussian LMM carries the Satterthwaite note", {

@@ -7,7 +7,8 @@
 //! no refit and no data. Its checks run in this order, each a refusal
 //! ([`CompareError`]):
 //!
-//! 1. both fits converged;
+//! 1. both fits converged, and each side's [`Model::re_groups`] lists one
+//!    grouping per `varcorr` block, each with one term per block dimension;
 //! 2. the same data: the same row count, a bitwise-equal `y`, equal weights
 //!    and offsets, the same family and link, and the same held dispersion;
 //! 3. one formula nested in the other ([`nesting`]);
@@ -30,8 +31,9 @@
 //!   parts one dimension apart give the 50:50 mixture of χ²_{Δnpar−1} and
 //!   χ²_{Δnpar}, or the exact restricted likelihood-ratio test when both
 //!   fits are REML fits, the smaller is OLS and the larger keeps the design
-//!   summary of one unweighted `(1 | g)`; random parts more than one
-//!   dimension apart give χ²(Δnpar), which ignores the boundary.
+//!   summary of one unweighted `(1 | g)`, and a grouping with at most 100
+//!   levels with rows; random parts more than one dimension apart give
+//!   χ²(Δnpar), which ignores the boundary.
 //!
 //! **A dropped component at zero.** When the random parts alone differ and
 //! every variance the smaller model drops is exactly `0.0` on the diagonal
@@ -68,7 +70,7 @@ use super::{fixed_part_relation, FixedPartRelation, FixedTerm, Lowered, ParseErr
 use crate::fit::vech_q;
 use crate::inference::contrast::ContrastError;
 use crate::inference::lr::{lr_p_value, lr_statistic};
-use crate::inference::rlrt::{exact_rlrt, RlrtConfig};
+use crate::inference::rlrt::{exact_rlrt, RlrtConfig, RlrtRefusal, RLRT_MAX_LEVELS};
 use crate::inference::tails::f_upper_p;
 use crate::inference::wald::wald_chisq;
 use crate::inference::{
@@ -236,9 +238,10 @@ pub struct Model {
     pub varcorr: Vec<Vec<f64>>,
     /// Each `varcorr` block's grouping name and term names, in the same
     /// order ([`Lowered::re_groups`]); empty when there is no random part.
-    /// The zero-component rule reads it to match blocks and terms by name;
-    /// left empty beside a random part, it switches the rule off (the raw
-    /// statistic is used), so fill it from the fit's `re_groups`.
+    /// The zero-component rule reads it to match blocks and terms by name.
+    /// [`compare`] refuses a side whose `re_groups` does not list one
+    /// grouping per `varcorr` block, each with one term per block dimension
+    /// ([`CompareError::ReGroups`]), so fill it from the fit's `re_groups`.
     pub re_groups: Vec<(String, Vec<String>)>,
     /// The response as fitted ([`Lowered::y`]).
     pub y: Vec<f64>,
@@ -631,6 +634,13 @@ pub enum CompareError {
         /// `m1`'s parameter count.
         m1: usize,
     },
+    /// A side's [`Model::re_groups`] does not describe its random part: it
+    /// does not list one grouping per [`Model::varcorr`] block, each with one
+    /// term per dimension of its block.
+    ReGroups {
+        /// The side whose groupings do not match its variance blocks.
+        side: Side,
+    },
 }
 
 impl fmt::Display for CompareError {
@@ -734,6 +744,14 @@ impl fmt::Display for CompareError {
                  test: the larger formula adds no parameter to the smaller one. Compare two \
                  models that differ by at least one parameter."
             ),
+            CompareError::ReGroups { side } => write!(
+                f,
+                "{}'s random-effect groupings do not describe its random part: a comparison \
+                 needs one grouping per variance block, each listing one term per dimension of \
+                 its block, as the fit's lowering gives them. Fill them from the lowered model \
+                 the fit was made on, then compare again.",
+                side.label()
+            ),
         }
     }
 }
@@ -790,6 +808,22 @@ pub fn compare(a: &Model, b: &Model, opts: &CompareOptions) -> Result<Comparison
             m0: !a.converged,
             m1: !b.converged,
         });
+    }
+    // Each side's groupings describe its variance blocks. Checked after
+    // convergence: a fit that did not converge may have no blocks (an empty
+    // `varcorr`) beside its groupings.
+    for (side, m) in [(Side::First, a), (Side::Second, b)] {
+        let described = m.re_groups.len() == m.varcorr.len()
+            && m.re_groups
+                .iter()
+                .zip(&m.varcorr)
+                .all(|((_, terms), block)| {
+                    let t = terms.len();
+                    t * (t + 1) / 2 == block.len()
+                });
+        if !described {
+            return Err(CompareError::ReGroups { side });
+        }
     }
     // 2. The same data.
     if a.nobs != b.nobs {
@@ -934,13 +968,22 @@ fn lr_test(
             if small.is_ols() && small.reml && large.reml && differs == Differs::Random {
                 match &large.design_summary {
                     Some((counts, s, c)) => {
-                        let cfg = RlrtConfig {
-                            nsim: opts.nsim,
-                            seed: opts.seed,
-                            parallel_inner: false,
+                        // The level cap is the comparison's, so the exact
+                        // test's functions stay callable at any `K`.
+                        let with_rows = counts.iter().filter(|&&n| n > 0.0).count();
+                        let exact = if with_rows > RLRT_MAX_LEVELS {
+                            Err(RlrtRefusal::TooManyLevels)
+                        } else {
+                            let cfg = RlrtConfig {
+                                nsim: opts.nsim,
+                                seed: opts.seed,
+                                parallel_inner: false,
+                            };
+                            let pinned =
+                                large.varcorr.first().and_then(|b| b.first()) == Some(&0.0);
+                            exact_rlrt(counts, s, c, large.loglik, small.loglik, pinned, &cfg)
                         };
-                        let pinned = large.varcorr.first().and_then(|b| b.first()) == Some(&0.0);
-                        match exact_rlrt(counts, s, c, large.loglik, small.loglik, pinned, &cfg) {
+                        match exact {
                             Ok(r) => {
                                 return LrTest {
                                     statistic: r.statistic,
@@ -992,6 +1035,8 @@ fn lr_test(
 /// `b:a`). A grouping lowering dropped (one level) has a block on neither
 /// side.
 fn dropped_at_zero(small: &Model, large: &Model) -> bool {
+    // Defensive: `compare` has already refused groupings that do not match
+    // the variance blocks (`CompareError::ReGroups`), here and below.
     if large.re_groups.len() != large.varcorr.len() {
         return false;
     }

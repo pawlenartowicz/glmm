@@ -13,7 +13,8 @@ use std::fmt;
 pub enum ParseError {
     /// The formula (or its RHS) is empty.
     EmptyFormula,
-    /// A token on the RHS is not a valid identifier.
+    /// A token on the RHS is not a valid identifier, or a term is malformed
+    /// (see [`parse`](super::parse())'s Errors list).
     Syntax {
         /// 0-based position of the offending token in the formula string.
         pos: usize,

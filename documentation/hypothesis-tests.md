@@ -238,10 +238,12 @@ rows; `"Wald"` stores none. The fit itself (estimates, standard errors,
 log-likelihood) is the same under every value. What changes is the time:
 each reduced model is one more fit, so a default fit of a Poisson GLMM takes
 longer than the same fit with `anova_test = "Wald"`. `compare()` makes its
-two fits with `anova_test = "auto"`, so `anova()` of a Poisson GLMM it fitted
-(`cmp$fit1`, Python `cmp.fit1`) gives the likelihood-ratio rows. On a fit
-with F rows, `anova_test = "LRT"` leaves the fit as it is, and
-`anova(m, test = "LRT")` is refused.
+two fits with `anova_test = "Wald"`, so they store no likelihood-ratio
+tables: `anova()` of a Poisson GLMM it fitted (`cmp$fit1`, Python
+`cmp.fit1`) needs `test = "Wald"`, and the likelihood-ratio rows come from
+`fastglmm(..., anova_test = "LRT")` (Python
+`glmm.fit(..., anova_test="LRT")`). On a fit with F rows, `anova_test =
+"LRT"` leaves the fit as it is, and `anova(m, test = "LRT")` is refused.
 
 **What `test` refuses.** Each refusal names its fix; the texts are in
 [`warnings.md`](warnings.md#test-and-comparison-errors).
@@ -440,9 +442,10 @@ Gaussian REML fits (the smaller an OLS fit made with `REML = TRUE`), the
 larger model's only random term is one random intercept `(1 | g)` (an
 interaction grouping such as `(1 | a:b)` counts as one), the larger fit has
 no prior weights (weights all equal to 1 count as weights) and at least one
-fixed-effect column (`p ≥ 1`), and the two fixed parts are the same. An
-offset is allowed. Outside that envelope a pair that differs by one dimension
-gets the 50:50 mixture, with a note that says why. The method is in
+fixed-effect column (`p ≥ 1`), the two fixed parts are the same, and at most
+100 levels of the grouping factor have rows. An offset is allowed. Outside that
+envelope a pair that differs by one dimension gets the 50:50 mixture, with a
+note that says why. The method is in
 [`algorithms-lmm.md`](algorithms-lmm.md#exact-rlrt-for-one-random-intercept).
 
 - `nsim` (default 10000, from 1 to 1,000,000) is the number of simulated
@@ -722,7 +725,7 @@ A note about one row is printed after that row's label, for example
 | Derived for one variance component at zero with every other parameter away from its boundary; with other groupings or components at zero it is approximate. | a mixture reference with other groupings or components at zero |
 | The random parts differ by more than one dimension: the chi-squared reference ignores the boundary; conservative. | χ²(Δnpar) on random parts more than one dimension apart |
 | The exact restricted likelihood-ratio test needs the larger model to be a Gaussian REML fit whose only random term is one unweighted (1 \| g) … so the 50:50 mixture is used. | a one-dimension REML pair outside the exact test's envelope |
-| The exact restricted likelihood-ratio test cannot be computed: `<reason>`. The 50:50 mixture is used. | the design leaves no residual df, or the fixed effects absorb the grouping |
+| The exact restricted likelihood-ratio test cannot be computed: `<reason>`. The 50:50 mixture is used. | the grouping has more than 100 levels with rows, the design leaves no residual df, or the fixed effects absorb the grouping |
 | `<side>`, the larger model, did not reach its optimum: … The statistic is set to 0; refit `<side>`. | a raw statistic below zero beyond round-off |
 | The two fits use different quadrature node counts, … | two GLMM fits with different `nAGQ` |
 | The Wald F cannot be formed from the two fits' coefficients: … The likelihood-ratio test is used, with an asymptotic chi-squared reference. | a dispersion-GLM pair whose coefficient names do not nest |

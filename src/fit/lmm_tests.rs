@@ -3547,3 +3547,53 @@ fn lmm_fit_reports_nobs_and_its_criterion() {
         assert_eq!((f.nobs, f.objective), (n, want), "reml = {reml:?}");
     }
 }
+
+/// The ports' warning fixtures (`python/tests/test_warnings.py`), fitted as
+/// `y ~ x + (1 | g)`. On MIXED (groups `i % 5`) y − 0.3x is constant within
+/// each group, so the residual variance goes to zero and θ̂ = τ̂/σ̂ ends on the
+/// upper limit of its search box; MIXED_PAIRS (groups `(i / 2) % 5`) breaks
+/// that and its θ̂ is interior.
+fn ports_mixed_fit(pairs: bool) -> Fit {
+    let xs: Vec<f64> = (-10..=10).filter(|&v| v != 0).map(f64::from).collect();
+    let n = xs.len();
+    let off = [-3.0, -1.5, 0.0, 1.5, 3.0];
+    let g: Vec<u32> = (0..n)
+        .map(|i| if pairs { (i / 2) % 5 } else { i % 5 } as u32)
+        .collect();
+    let y: Vec<f64> = (0..n)
+        .map(|i| 0.3 * xs[i] + (((i * 7) % 5) as f64 - 2.0) * 0.4 + off[g[i] as usize])
+        .collect();
+    let x: Vec<f64> = xs.iter().flat_map(|&v| [1.0, v]).collect();
+    let model = intercept_only_spec(Sizing::FixedClusters { n_clusters: 5 });
+    let ids = GroupIds {
+        primary: g,
+        extra: vec![],
+    };
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        ..FitOptions::default()
+    };
+    fit_cold(&x, &y, n, 2, &model, &ids, &opts)
+}
+
+/// A θ on its upper search limit is reported as such, with a note, and the
+/// rest of the fit is left as the search ended it.
+#[test]
+fn theta_on_its_upper_limit_is_reported_not_interior() {
+    let at_limit = |f: &Fit| {
+        f.diagnostics
+            .notes
+            .iter()
+            .any(|n| matches!(n, Note::VarianceAtLimit))
+    };
+    let f = ports_mixed_fit(false);
+    assert!(f.converged());
+    assert!(!f.singular());
+    assert_eq!(f.diagnostics.boundary, Boundary::UpperLimit);
+    assert!(at_limit(&f), "notes: {:?}", f.diagnostics.notes);
+
+    let f = ports_mixed_fit(true);
+    assert!(f.converged());
+    assert_eq!(f.diagnostics.boundary, Boundary::Interior);
+    assert!(!at_limit(&f), "notes: {:?}", f.diagnostics.notes);
+}

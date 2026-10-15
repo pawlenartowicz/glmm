@@ -40,10 +40,10 @@ A list of class \code{"fastglmm_comparison"}: \code{table}, the comparison
 table of \link[=anova.fastglmm]{anova()} with its rows named \code{f0} and \code{f1}
 (the smaller model first), and \code{fit0} and \code{fit1}, the fits of \code{f0} and
 \code{f1}. Printing it prints the table. Both fits are made with
-\code{anova_test = "auto"} (see \code{\link[=fastglmm]{fastglmm()}}): \code{anova()} of \code{fit0} or \code{fit1}
-with \code{test = "LRT"} works only on a Poisson model with random effects.
-For the likelihood-ratio rows of another model with chi-squared rows, fit
-its formula with \code{fastglmm(..., anova_test = "LRT")}.
+\code{anova_test = "Wald"} (see \code{\link[=fastglmm]{fastglmm()}}): they store no likelihood-ratio
+tables, so \code{anova()} of a Poisson model with random effects among them
+needs \code{test = "Wald"}. For the likelihood-ratio rows, fit the formula with
+\code{fastglmm(..., anova_test = "LRT")}.
 }
 \description{
 \code{compare()} takes one data set and two formulas, fits both models on the

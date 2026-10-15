@@ -9,7 +9,7 @@
 //!
 //! Pure — no data table.
 
-use glmm::formula::{parse, ParsedFormula, RandomEffect, Term};
+use glmm::formula::{parse, ParseError, ParsedFormula, RandomEffect, Term};
 
 /// (id, formula, dependent, fixed effects, random effects).
 type SuccessCase = (
@@ -707,4 +707,47 @@ fn non_ascii_names_parse_wherever_a_bare_name_does() {
     let p = parse("cbind(sukces, porażka) ~ x + offset(log(ekspozycja_ś))").unwrap();
     assert_eq!(p.cbind, Some(("sukces".into(), "porażka".into())));
     assert_eq!(p.offset.as_deref(), Some("log(ekspozycja_ś)"));
+}
+
+// ── A dangling `+` and the `^` operator ─────────────────────────────────────
+
+/// `pos` is the character index of the `+` or `^` in the formula string, not
+/// its byte offset (`ł` is two bytes).
+fn syntax_error(pos: usize, msg: &str) -> Result<ParsedFormula, ParseError> {
+    Err(ParseError::Syntax {
+        pos,
+        msg: msg.to_string(),
+    })
+}
+
+#[test]
+fn a_formula_ending_in_plus_is_a_syntax_error() {
+    let msg = "the formula ends with '+': a term is missing after it";
+    for (f, pos) in [
+        ("y ~ x + ", 6),
+        ("y ~ x + (1 | g) + ", 16),
+        ("y ~ x + offset(z) +", 18),
+        ("y ~ ł + ", 6),
+    ] {
+        assert_eq!(parse(f), syntax_error(pos, msg), "{f}");
+    }
+    // R accepts a leading and a doubled `+`.
+    assert_eq!(parse("y ~ + x").unwrap(), parse("y ~ x").unwrap());
+    assert_eq!(parse("y ~ x + + z").unwrap(), parse("y ~ x + z").unwrap());
+}
+
+#[test]
+fn the_crossing_operator_is_a_syntax_error_outside_i() {
+    let msg = "the crossing operator '^' is not supported: write the terms out \
+               (for example (a + b)^2 as a + b + a:b)";
+    for (f, pos) in [
+        ("y ~ (a + b + c)^2 + (1 | g)", 15),
+        ("y ~ a^2", 5),
+        ("y ~ (a + b)^2", 11),
+        ("y ~ (ł + b)^2", 11),
+    ] {
+        assert_eq!(parse(f), syntax_error(pos, msg), "{f}");
+    }
+    let (_, fixed, _) = canonical(&parse("y ~ I(a^2)").unwrap());
+    assert_eq!(fixed, ["I(a^2)"]);
 }

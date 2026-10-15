@@ -2877,7 +2877,7 @@ fn take_packed_bufs(ws: &mut GlmmWorkspace, p: usize, n: usize) -> Box<PackedGra
 /// The workspace comes back as found in `u`; `eta`, `prob`, `w`, `mu`,
 /// `beta_rhs`, `ws.packed.m_vals` and the packed factor are left at the mode
 /// solve's values, exactly as `laplace_gradient` leaves the blocked ones.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(all(test, feature = "formula"))]
 pub(crate) fn packed_gradient(
     ws: &mut GlmmWorkspace,
     x: MatRef<f64>,

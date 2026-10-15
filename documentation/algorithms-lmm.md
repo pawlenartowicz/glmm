@@ -130,7 +130,11 @@ stop on from the wrong sign half (every in-box move raises the deviance there).
 A diagonal that ends the search negative has its whole column negated at exit
 (`fix_column_signs`, `src/lmm/mod.rs`; same Σ, same deviance), so the reported
 Λ has non-negative diagonals. MixedModels.jl searches the same unbounded box;
-lme4 keeps the diagonals at `≥ 0`.
+lme4 keeps the diagonals at `≥ 0`. A fit whose θ ends on the wall of this box
+(some entry with `|θ| ≥ THETA_HI·(1 − 1e-6)`, in the units the search ran in) is
+not at an optimum: it carries `Note::VarianceAtLimit` and reports
+`Boundary::UpperLimit` where it would otherwise read `Interior`
+([`conventions.md`](conventions.md), [`warnings.md`](warnings.md)).
 
 After the fit, the absolute covariance is recovered per grouping factor by
 `assemble_varcorr` (`src/fit/common.rs`): it walks the θ vector in
@@ -1075,7 +1079,11 @@ the summary and REML `Fit::loglik` of a converged `(1 | g)` fit and the
 `Fit::loglik` of the OLS fit with the same `X`, `y` and offset made with
 `reml = Some(true)`. A fit with no summary (weights, another random term, a
 non-Gaussian family, no fixed-effect column) is outside the envelope before
-the core is called. From the summary, `rlrt_design` refuses with an
+the core is called. Before the core, the comparison refuses `K' > 100`
+(`K'` the levels with rows, `RLRT_MAX_LEVELS`) with `TooManyLevels`, so that
+reason wins over the ones below: a design with more than 100 levels with
+rows that `rlrt_design` would also refuse reports `TooManyLevels`. From the
+summary, `rlrt_design` refuses with an
 `RlrtRefusal` (never a panic), in this order, and the caller falls back to
 another reference and reports `RlrtRefusal::reason`:
 
@@ -1090,6 +1098,16 @@ another reference and reports `RlrtRefusal::reason`:
 
 A refusal comes before the statistic is read, so a pinned fit on a design the
 test cannot handle is still refused.
+
+Why the comparison caps `K'`: the exact null approaches the 50:50 mixture as
+`K'` grows, while its cost grows with `K'`. In RLRsim's simulated nulls of
+the frozen references (10⁵ draws each), the mass at zero is 0.563 at `K = 6`
+(`rlrt_dyestuff`), 0.525 at 45 (`rlrt_cake`) and 0.501 at 1000
+(`rlrt_large_k`), and the upper 5% point is 2.31, 2.51 and 2.71, against the
+mixture's 0.5 and 2.71. The cost is a `K' × K'` eigendecomposition, `8K'²`
+bytes of `M`, and per draw a grid sweep over up to `K'` eigenvalues. The cap
+is the comparison's alone: `rlrt_design`, `rlrt_null` and `exact_rlrt` take
+any `K`, and the oracle tests run them at `K = 1000`.
 
 **Worked example: Dyestuff.** Thirty rows, `K = 6` batches of five, `X = 1`,
 so `p = 1` and `n − p = 29`.

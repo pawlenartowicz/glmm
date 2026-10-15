@@ -271,6 +271,25 @@ pub(super) fn materialize_diagnostics(
     }
 }
 
+/// Flag a θ on the upper limit of its search box: some coordinate with
+/// `|units·θ| ≥ THETA_HI·(1 − 1e-6)` (`crate::lmm::THETA_HI`, the box both
+/// mixed kernels search in) pushes [`Note::VarianceAtLimit`] and turns an
+/// `Interior` boundary into [`Boundary::UpperLimit`]; `AtBoundary` and
+/// `NoOptimum` stay. `units·θ` is the kernel θ in the units the search ran in,
+/// which the box applies to: `units` is 1 except on a Gamma inverse-link GLMM
+/// searched on rescaled data (`GlmmWorkspace::search_units`). The two mixed
+/// view mappers call this on a fit with a finite endpoint, after
+/// [`materialize_diagnostics`].
+pub(super) fn note_theta_at_limit(diagnostics: &mut Diagnostics, theta: &[f64], units: f64) {
+    let edge = crate::lmm::THETA_HI * (1.0 - 1e-6);
+    if theta.iter().any(|t| (units * t).abs() >= edge) {
+        diagnostics.notes.push(Note::VarianceAtLimit);
+        if diagnostics.boundary == Boundary::Interior {
+            diagnostics.boundary = Boundary::UpperLimit;
+        }
+    }
+}
+
 /// Reshape a `diagonal_theta`-ordered pin bitmask into [`Diagnostics::pinned`]'s
 /// varcorr-aligned flags. Single source for that placement: every route reaches
 /// it through [`materialize_diagnostics`], which each of the four view mappers
@@ -1202,11 +1221,13 @@ pub(super) fn fit_rank_deficient(
             | Note::NbShapeUnsettled { .. }
             | Note::NonIntegerResponse { .. }
             | Note::SingleLevelGroupingDropped { .. }
+            | Note::FewRowsForRandomEffects { .. }
             | Note::ExactProfileFallback
             | Note::GradientSearchFallback
             | Note::SeUnavailable
             | Note::PrecisionLimited
             | Note::Separated
+            | Note::VarianceAtLimit
             | Note::SatterthwaiteCurvature { .. } => {}
         }
     }

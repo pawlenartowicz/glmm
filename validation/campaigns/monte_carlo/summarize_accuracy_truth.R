@@ -32,15 +32,18 @@ summarize_arm <- function(dir, arm, cells = NULL) {
     # derive_singular (native flags ignored - they only relabel the same fits:
     # per-rep cross-check found glmm and lme4 on the same boundary set, 600/600
     # RI reps and 465/469 slope reps), and a boundary optimum counts as
-    # converged for everyone - it is the constrained MLE, and glmm's boundary
+    # converged for everyone unless it is blown up (blown_up: the blow-up
+    # filter wins over the boundary rule, so a runaway fit pinned at
+    # |rho| = 1 stays out): it is the constrained MLE, and glmm's boundary
     # fits beat GLMMadaptive's interior ones on 91% of disagreeing slope reps
-    # by likelihood. The !err guard matters: on slope cells derive_singular
-    # flags every errored rep via rho01=NA.
+    # by likelihood.
+    # The !err guard matters: on slope cells derive_singular flags every
+    # errored rep via rho01=NA.
     # The frozen published rows keep the paper's own convention (lme4 boundary
     # fits excluded via its warnings), so the gate |diff| now includes that
     # convention gap on top of Monte Carlo error.
     sing <- derive_singular(d, slope) & !err
-    conv <- (d$good %in% TRUE | sing) & !err
+    conv <- (d$good %in% TRUE | (sing & !blown_up(d))) & !err
     bound <- sing
     gm <- d[conv, , drop = FALSE]   # metric set = same-rule converged (boundary included)
     row <- list(cell = cid, n_tot = nrow(d), n_good = sum(conv), n_metric = nrow(gm),
@@ -117,9 +120,10 @@ cat("\n################  BATCH: reps 1..", CAP, "  ################\n", sep="")
 
 cat("\n--- FITS (same rule for every engine; err=threw) ---\n")
 cat("    conv and boundary use ONE shared rule for all engines: singular = derived from the\n")
-cat("    estimates (tau < 1e-3, |rho| > 0.99), and a boundary optimum counts as converged -\n")
-cat("    it is the constrained MLE (glmm and lme4 land on the same boundary set per-rep; the\n")
-cat("    old conv% gap was purely each engine's labeling). Bias/RMSE use this same set. The\n")
+cat("    estimates (tau < 1e-3, |rho| > 0.99), and a boundary optimum counts as converged\n")
+cat(sprintf("    unless it is blown up (|beta| or tau >= %g): it is the constrained MLE (glmm\n", GLMM_BLOWUP))
+cat("    and lme4 land on the same boundary set per-rep; the old conv% gap was purely each\n")
+cat("    engine's labeling). Bias/RMSE use this same set. The\n")
 cat("    frozen published rows keep the paper's own convention (lme4 excludes boundary fits),\n")
 cat("    so the gate |diff| includes that convention gap on top of Monte Carlo error.\n")
 for (nm in names(A)) {

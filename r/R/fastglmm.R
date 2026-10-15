@@ -85,11 +85,12 @@
 #' as a warning of class `"fastglmm_diagnostic"` with a per-kind subclass
 #' (`"fastglmm_ill_conditioned"`, `"fastglmm_pirls_exhausted"`,
 #' `"fastglmm_unused_grouping_levels"`,
-#' `"fastglmm_single_level_grouping_dropped"`, `"fastglmm_hessian_se_fallback"`,
+#' `"fastglmm_single_level_grouping_dropped"`,
+#' `"fastglmm_few_rows_for_random_effects"`, `"fastglmm_hessian_se_fallback"`,
 #' `"fastglmm_se_unavailable"`, `"fastglmm_exact_profile_fallback"`,
 #' `"fastglmm_gradient_search_fallback"`,
 #' `"fastglmm_precision_limited"`, `"fastglmm_non_integer_response"`, `"fastglmm_rows_dropped_na"`,
-#' `"fastglmm_satterthwaite_curvature"`; a note from
+#' `"fastglmm_satterthwaite_curvature"`, `"fastglmm_variance_at_limit"`; a note from
 #' a newer kernel than this package arrives as `"fastglmm_unknown_note"`),
 #' so `withCallingHandlers()` and `suppressWarnings(classes = )` can select
 #' them without matching message text.
@@ -196,14 +197,14 @@
 #'   `rss`, `r_squared` and `adj_r_squared` (OLS fits only, `NaN` otherwise),
 #'   `offset` (the offset fitted with, `NULL` without one), plus
 #'   [anova()][anova.fastglmm] (the per-term tests, built at fit time, or a
-#'   comparison of two fits),
-#'   `print()`, [summary()][summary.fastglmm], [confint()][confint.fastglmm]
-#'   (Wald), `nobs()`, [formula()][formula.fastglmm] (returns the formula
-#'   **string**), `family()`, `model.frame()`, [ranef()][ranef.fastglmm],
+#'   comparison of two fits), `print()`, [summary()][summary.fastglmm],
+#'   [confint()][confint.fastglmm] (Wald), `nobs()`,
+#'   [formula()][formula.fastglmm] (returns the model formula as given, so
+#'   `update()` works), `family()`, `model.frame()`, [ranef()][ranef.fastglmm],
 #'   `fitted()`, `residuals()`, [logLik()][logLik.fastglmm], and
 #'   [AIC()][AIC.fastglmm] and `BIC()` (which refuse a REML fit beside an ML
-#'   one, and REML fits with different fixed effects). The blocked accessors (`predict`, `coef`, `terms`)
-#'   error with the reason.
+#'   one, and REML fits with different fixed effects). The blocked accessors
+#'   (`predict`, `coef`, `terms`) error with the reason.
 #'
 #' @examples
 #' set.seed(1)
@@ -457,7 +458,7 @@ fastglmm <- function(formula, data, family = gaussian(),
       c("fastglmm_singular", "fastglmm_diagnostic"))
   }
   for (note in r$notes) {
-    out <- .note_warning(note, r$names, r$converged)
+    out <- .note_warning(note, r$names, r$converged, r$nobs)
     if (!is.null(out)) .warn_keep(store, note$kind, out$msg, out$cls)
   }
   if (!isTRUE(r$converged)) {
@@ -507,9 +508,10 @@ fastglmm <- function(formula, data, family = gaussian(),
     # `Diagnostics` (src/fit/mod.rs) and the Python port's `Fit$diagnostics` -
     # change together. `converged`, `singular` and `aliased` stay at the top
     # level as well; this element is additive.
-    #   boundary  "interior" / "at_boundary" / "no_optimum": where the
-    #             accepted theta sits. Every theta-carrying route
-    #             distinguishes all three (LMM over either kernel, GLMM over
+    #   boundary  "interior" / "at_boundary" / "no_optimum" / "upper_limit":
+    #             where the accepted theta sits ("upper_limit": on the upper
+    #             limit of the search, otherwise interior). Every theta-carrying
+    #             route distinguishes all four (LMM over either kernel, GLMM over
     #             every layout, negative binomial included). OLS and GLM (no
     #             theta) always report "interior", and so does a fit that
     #             failed before any search ran (a degenerate guard), reported
@@ -764,6 +766,8 @@ fastglmm <- function(formula, data, family = gaussian(),
   non_integer_response = c("caution", "Non-integer response"),
   rows_dropped_na = c("caution", "Rows dropped for missing values"),
   satterthwaite_curvature = c("caution", "Satterthwaite df uncertain"),
+  few_rows_for_random_effects = c("caution", "Too few rows for the random effects"),
+  variance_at_limit = c("caution", "Variance at its search limit"),
   argument_ignored = c("note", "Argument ignored"),
   unused_grouping_levels = c("note", "Unused grouping levels"),
   single_level_grouping_dropped = c("note", "Random effect dropped (single level)")
@@ -832,16 +836,19 @@ fastglmm <- function(formula, data, family = gaussian(),
 #
 # Classes: "fastglmm_ill_conditioned", "fastglmm_pirls_exhausted",
 # "fastglmm_unused_grouping_levels",
-# "fastglmm_single_level_grouping_dropped", "fastglmm_hessian_se_fallback",
+# "fastglmm_single_level_grouping_dropped",
+# "fastglmm_few_rows_for_random_effects", "fastglmm_hessian_se_fallback",
 # "fastglmm_se_unavailable", "fastglmm_exact_profile_fallback",
 # "fastglmm_gradient_search_fallback",
 # "fastglmm_precision_limited", "fastglmm_nb_shape_unsettled",
-# "fastglmm_satterthwaite_curvature", "fastglmm_unknown_note" - all inheriting
+# "fastglmm_satterthwaite_curvature", "fastglmm_variance_at_limit",
+# "fastglmm_unknown_note" - all inheriting
 # "fastglmm_diagnostic", so one handler catches the whole channel. Not every
-# note comes from the solver: "unused_grouping_levels" and
-# "single_level_grouping_dropped" are raised by the formula lowering, which is
-# the only layer that sees both the declared levels and the per-row codes.
-.note_warning <- function(note, coef_names, converged) {
+# note comes from the solver: "unused_grouping_levels",
+# "single_level_grouping_dropped" and "few_rows_for_random_effects" are raised
+# by the formula lowering, which is the only layer that sees both the declared
+# levels and the per-row codes. `nobs` is the fit's row count.
+.note_warning <- function(note, coef_names, converged, nobs) {
   # Only on a non-converged fit, whose one warning (.nonconvergence) names it.
   if (identical(note$kind, "separated")) return(NULL)
   if (identical(note$kind, "ill_conditioned")) {
@@ -896,6 +903,24 @@ fastglmm <- function(formula, data, family = gaussian(),
       "estimated from it. Its random effect was dropped; the rest of the model was",
       "fitted without it."), note$detail)
     cls <- c("fastglmm_single_level_grouping_dropped", "fastglmm_diagnostic")
+  } else if (identical(note$kind, "few_rows_for_random_effects")) {
+    # The kernel's Note::FewRowsForRandomEffects (src/fit/mod.rs): `detail` is the
+    # term as "<terms> | <grouping>" and `evals` its random-effect count
+    # (src/orchestrate.rs); the rows are the fit's own.
+    msg <- sprintf(paste(
+      "The term (%s) has %d random effects for %s, so its variance parameters are",
+      "probably not identifiable; lme4 stops on such a model by default. The estimates",
+      "are shown; read the variance components with care, or simplify the",
+      "random-effects structure."), note$detail, as.integer(note$evals), .count(nobs, "row"))
+    cls <- c("fastglmm_few_rows_for_random_effects", "fastglmm_diagnostic")
+  } else if (identical(note$kind, "variance_at_limit")) {
+    msg <- paste(
+      "A random-effect parameter reached the upper limit of the search (1000 on glmm's",
+      "internal scale). On a Gaussian model this usually means the residual variance is",
+      "estimated at or near zero; on other families the random effect has no finite",
+      "estimate. The estimates sit at that limit, not at an optimum: check for a response",
+      "the predictors and groups explain exactly.")
+    cls <- c("fastglmm_variance_at_limit", "fastglmm_diagnostic")
   } else if (identical(note$kind, "hessian_se_fallback")) {
     msg <- paste(
       "The usual standard errors could not be computed, so a simpler method was used.",

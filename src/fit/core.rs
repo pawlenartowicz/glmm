@@ -191,6 +191,8 @@ impl FitView<'_> {
                         | Note::UnusedGroupingLevels { .. }
                         | Note::NonIntegerResponse { .. }
                         | Note::SingleLevelGroupingDropped { .. }
+                        | Note::FewRowsForRandomEffects { .. }
+                        | Note::VarianceAtLimit
                         | Note::SatterthwaiteCurvature { .. } => {}
                     }
                 }

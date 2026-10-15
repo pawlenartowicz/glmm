@@ -24,6 +24,14 @@
 # Output: a timestamped results/<ts>/ directory next to this script holding
 # the two lane probes, the two cargo-test logs, and a summary.txt. Nothing
 # under results/ is committed (see .gitignore); it is regenerated per run.
+#
+# Needs a git checkout: the git-tracked files under validation/grid/data
+# (among them the CSVs the lib tests embed with include_str!) are copied
+# from `git ls-files`; anything else exits 2.
+#
+# Exit status: 1 when the normal tree's test filter fails or either tree's
+# lib tests do not compile; a failing scalar-forced filter alone is evidence
+# of lane-width drift (see README.md) and still exits 0.
 set -euo pipefail
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -33,6 +41,8 @@ PULP_VERSION="0.22.2"
 
 [[ -f "$PATCH_FILE" ]] || { echo "missing patch file: $PATCH_FILE" >&2; exit 2; }
 [[ -f "$CRATE_ROOT/Cargo.toml" ]] || { echo "cannot find crate root from $SELF" >&2; exit 2; }
+git -C "$CRATE_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+  || { echo "$CRATE_ROOT is not a git checkout: the tracked grid data cannot be listed" >&2; exit 2; }
 
 # Default test filter: the sparse NB fit tests, the crate's most
 # lane-width-sensitive pin (per its own doc comment in src/sparse/tests.rs).
@@ -78,18 +88,22 @@ HOST_OS="$(uname -s)"
 echo "host: $HOST_OS/$HOST_ARCH"
 
 # --- 1. copy the crate source into two scratch trees (normal, scalar) -----
-# Excludes: build artifacts and venvs only, never source. The two copies
-# start identical; only scalar/Cargo.toml gets the extra [patch.crates-io]
-# table appended in step 4.
+# Excludes: build artifacts, venvs, .git and grid/data (see below); never
+# tracked source. The two copies start identical; only scalar/Cargo.toml
+# gets the extra [patch.crates-io] table appended in step 4.
 echo "== copying crate source into scratch =="
 # grid/data and .git are excluded too: the grid's generated CSVs are 200 MB and
 # regenerable, and SCRATCH defaults to a tmpfs, so the copies must stay small.
+# The git-tracked files under grid/data (a few MB, among them the CSVs the lib
+# tests embed with include_str!) are copied back in before the duplication.
 RSYNC_EXCLUDES=(--exclude=/target --exclude=/python/venv --exclude=/python/build
                 --exclude=/python/*.egg-info --exclude=/python/.pytest_cache
                 --exclude=.DS_Store --exclude=/validation/tools/memory/results
                 --exclude=/validation/tools/lanewidth/results
                 --exclude=/validation/grid/data --exclude=/.git)
 rsync -a "${RSYNC_EXCLUDES[@]}" "$CRATE_ROOT/" "$SCRATCH/normal/"
+git -C "$CRATE_ROOT" ls-files -z validation/grid/data \
+  | rsync -a --from0 --files-from=- "$CRATE_ROOT/" "$SCRATCH/normal/"
 cp -R "$SCRATCH/normal" "$SCRATCH/scalar"
 
 # --- 2. get pulp 0.22.2 source: prefer the local registry cache, else vendor ---
@@ -201,3 +215,11 @@ tail -n 20 "$RESULTS_DIR/test_scalar.log"
 
 echo
 echo "results written to: $RESULTS_DIR"
+
+# A scalar-forced test failure alone is evidence (exit 0); a failing normal
+# tree or a lib that does not compile is a harness failure.
+if [[ "$NORMAL_STATUS" -ne 0 ]] \
+   || grep -q "could not compile" "$RESULTS_DIR/test_normal.log" "$RESULTS_DIR/test_scalar.log"; then
+  echo "FAILED: the normal tree's test filter failed or a tree's lib tests did not compile" >&2
+  exit 1
+fi

@@ -214,11 +214,14 @@ R), but they are three of nine: the full report is `diagnostics.converged`,
 `.outer_stop`, `.outer_decrement`. In Python and R the last three sit on the
 fit itself, not in `diagnostics`.
 
-- `boundary` says where the accepted θ sits — `Interior`, `AtBoundary` (≥ 1
-  variance component pinned at 0), or `NoOptimum` (the optimizer capped out at
+- `boundary` says where the accepted θ sits: `Interior`, `AtBoundary` (≥ 1
+  variance component pinned at 0), `NoOptimum` (the optimizer capped out at
   a finite endpoint, reported as a point rather than accepted onto the
-  boundary). Every θ-carrying route distinguishes all three — LMM over either
-  kernel, GLMM over every layout, negative binomial included. OLS and GLM
+  boundary), or `UpperLimit` (a θ entry ended on the upper limit of the search
+  box, 1000 on the internal scale, on a fit that would otherwise be
+  `Interior`; the `VarianceAtLimit` note comes with it). Every θ-carrying
+  route distinguishes all four: LMM over either kernel, GLMM over every
+  layout, negative binomial included. OLS and GLM
   (no θ) always report `Interior`, and so does a fit that failed before any
   search ran (a degenerate guard), which says so through `converged: false`.
 - `pinned` names which variance components were pinned, aligned with the
@@ -230,7 +233,7 @@ fit itself, not in `diagnostics`.
   decrease left. They are 0, `None` (R: `NA`) and NaN on a fit that ran no
   gradient search.
 - `notes` carries solver observations that have no dedicated flag. There are
-  twelve kinds; [`warnings.md`](warnings.md) gives the warning each one
+  fifteen kinds; [`warnings.md`](warnings.md) gives the warning each one
   raises. Four of them in more detail:
   - `IllConditioned`: two or more fixed-effect columns are entangled —
     near-collinear but not exactly redundant. That design is **fitted, not

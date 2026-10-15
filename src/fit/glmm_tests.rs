@@ -6857,6 +6857,7 @@ fn packed_glmm_nb_budget_stop_reports_dispersion() {
 /// aggregated-binomial `cbind(s, n - s)` response becomes the synthesized
 /// `prop` column, which with the trial count as prior weights IS lme4's own
 /// objective for that response.
+#[cfg(feature = "formula")]
 struct DenseLaplaceRung {
     rung: u32,
     csv: &'static str,
@@ -6881,6 +6882,7 @@ struct DenseLaplaceRung {
 /// produces today. The AGQ orders some of these carry in the manifest are not
 /// applied: quadrature keeps the packed second-order pass and is out of this
 /// comparison's scope.
+#[cfg(feature = "formula")]
 const DENSE_LAPLACE_RUNGS: &[DenseLaplaceRung] = &[
     DenseLaplaceRung {
         rung: 5,
@@ -7090,6 +7092,7 @@ const DENSE_LAPLACE_RUNGS: &[DenseLaplaceRung] = &[
 
 /// Header + row cells of an embedded CSV, quotes stripped. Mirrors the
 /// validation harness's own reader; the corpus CSVs carry no embedded commas.
+#[cfg(feature = "formula")]
 fn rung_csv(csv: &'static str) -> (Vec<String>, Vec<Vec<String>>) {
     let unquote = |s: &str| s.trim().trim_matches('"').to_string();
     let mut lines = csv.lines().filter(|l| !l.trim().is_empty());
@@ -11021,4 +11024,52 @@ fn glmm_fit_reports_nobs_and_its_quadrature() {
         assert!(!d.converged(), "n == p, nagq {nagq}");
         assert_eq!((d.nobs, d.objective), (nd, want), "n == p, nagq {nagq}");
     }
+}
+
+/// A Gamma inverse-link GLMM whose search runs on y/c with c = 2⁻¹¹
+/// (`gamma_inverse_units`): `y ~ 1 + (1 | g)`, 6 groups of 10, group means
+/// `1/(1 + 1e4·k/5)`. Its random-effect SD is about 3400 in y's units and
+/// under 2 in the search's, so the fit is interior and carries no
+/// [`Note::VarianceAtLimit`]: the θ limit applies in the search's units.
+#[test]
+fn gamma_inverse_theta_is_checked_against_the_limit_in_search_units() {
+    let (mut y, mut g) = (Vec::new(), Vec::new());
+    for k in 0..6u32 {
+        let mu = 1.0 / (1.0 + 1e4 * f64::from(k) / 5.0);
+        for j in 0..10u32 {
+            y.push(mu * (1.0 + 0.05 * (f64::from((j * 7) % 5) - 2.0)));
+            g.push(k);
+        }
+    }
+    let n = y.len();
+    let model = ModelSpec {
+        family: Family::Gamma {
+            link: crate::GammaLink::Inverse,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 6 },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: g,
+        extra: vec![],
+    };
+    let opts = FitOptions {
+        target_indices: vec![0],
+        ..FitOptions::default()
+    };
+    let f = fit_cold(&vec![1.0; n], &y, n, 1, &model, &ids, &opts);
+    assert!(f.converged());
+    assert!(f.tau2[0].sqrt() > 1e3, "tau2 = {:?}", f.tau2);
+    assert_eq!(f.diagnostics.boundary, Boundary::Interior);
+    assert!(
+        !f.diagnostics
+            .notes
+            .iter()
+            .any(|n| matches!(n, Note::VarianceAtLimit)),
+        "notes: {:?}",
+        f.diagnostics.notes
+    );
 }

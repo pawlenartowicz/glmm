@@ -493,7 +493,7 @@ pub struct Diagnostics {
 
 /// Where the accepted θ sits in its parameter space.
 ///
-/// Every θ-carrying route distinguishes all three — the LMM over either kernel
+/// Every θ-carrying route distinguishes all four: the LMM over either kernel
 /// and the GLMM over every layout report the state the search reached, cap-out
 /// (`NoOptimum`) included. OLS and GLM have no θ and always report `Interior`,
 /// and so does a `Fit` that failed before any search ran (the degenerate `n`/`p`
@@ -508,6 +508,16 @@ pub enum Boundary {
     /// The optimizer capped out at a finite endpoint — reported as a point, not
     /// accepted onto the boundary. `deviance` still carries that endpoint.
     NoOptimum,
+    /// ≥ 1 θ coordinate ended on the upper limit of its search box
+    /// (`crate::lmm::THETA_HI`, 1000 on the internal scale), on a fit that
+    /// would otherwise read `Interior`: the search stopped on that wall, not at
+    /// an optimum. Always comes with [`Note::VarianceAtLimit`], which an
+    /// `AtBoundary` or `NoOptimum` fit also carries when it reaches the limit.
+    /// `converged`, `singular` and the estimates are the search's own.
+    ///
+    /// Cold path only: the loop tier's `FitDiagnostics` carrier has no code for
+    /// it, so a loop-tier read of such a fit says interior.
+    UpperLimit,
 }
 
 /// A solver observation about the fit that has no dedicated field. The enum
@@ -652,6 +662,32 @@ pub enum Note {
         /// The grouping factor, as the formula spells it.
         grouping: String,
     },
+    /// A random-effect term has at least as many random effects as the fit
+    /// has rows (more than the rows, on a family other than Gaussian), so its
+    /// variance parameters are probably not identifiable. The count is the
+    /// term's observed levels times its columns (the intercept, one per
+    /// numeric slope, one per non-base level of a factor slope): `(1 + x | g)`
+    /// on 10 levels has 20. lme4 stops on such a model by default
+    /// (`check.nobs.vs.nRE`: `lmer` when the rows are at most the count,
+    /// `glmer` when they are below it, so an observation-level `(1 | obs)`
+    /// passes on a GLMM). Each term is checked against all rows on its own;
+    /// the counts are not summed across terms. The fit runs as usual.
+    ///
+    /// Raised by the formula frontend, not by a solver, for the same reason
+    /// [`Note::UnusedGroupingLevels`] is. A term dropped by
+    /// [`Note::SingleLevelGroupingDropped`] is not checked. Reached through
+    /// [`crate::formula::Lowered::notes`].
+    FewRowsForRandomEffects {
+        /// The term's left-hand side with its intercept written out, `"1"` or
+        /// `"1 + x"`.
+        terms: String,
+        /// The grouping factor, as the formula spells it.
+        grouping: String,
+        /// The term's random effects: observed levels times columns.
+        random_effects: u32,
+        /// The rows of the fit.
+        rows: u32,
+    },
     /// A GLMM's deviance is too large for `f64` to resolve its optimum: its
     /// estimated rounding error at the endpoint exceeds 1e-2 deviance units,
     /// which moves θ̂ by about a tenth of its standard error, and the search
@@ -696,6 +732,17 @@ pub enum Note {
     /// the search starts from, so the search never ran: the random-effect
     /// outputs, the SEs and the deviance are NaN.
     Separated,
+    /// A random-effect parameter ended on the upper limit of the θ search box
+    /// (`crate::lmm::THETA_HI`, 1000 on the search's internal scale, which on
+    /// a Gamma inverse-link GLMM is θ in the units of the rescaled response
+    /// the search ran on, not the reported θ): the estimates sit
+    /// on that limit, not at an optimum. On a Gaussian model this usually means
+    /// the residual variance is estimated at or near zero (θ is a standard
+    /// deviation relative to the residual one); on other families the random
+    /// effect has no finite estimate. Raised on any fit with a finite endpoint
+    /// (sets [`Boundary::UpperLimit`] when the boundary would otherwise read
+    /// `Interior`); `converged` and `singular` are not changed.
+    VarianceAtLimit,
 }
 
 impl Diagnostics {

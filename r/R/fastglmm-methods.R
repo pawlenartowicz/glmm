@@ -411,15 +411,22 @@ nobs.fastglmm <- function(object, ...) object$nobs
 
 #' Formula, family, and model frame accessors
 #'
-#' `formula()` returns the formula **string** as given: the R side never
-#' builds a `terms` object (the parser is Rust-side), and
-#' synthesizing one would disagree with how the model was actually built -
-#' which is also why `terms()` errors.
+#' `formula()` returns the model formula as given, as a formula object, so
+#' `update(m, . ~ . + z)` works. The R side never builds a `terms` object
+#' (the parser is Rust-side), and synthesizing one would disagree with how
+#' the model was actually built, which is also why `terms()` errors.
 #'
 #' @param x,formula,object a [fastglmm] fit.
 #' @param ... unused.
 #' @export
-formula.fastglmm <- function(x, ...) x$formula
+formula.fastglmm <- function(x, ...) {
+  # The fit keeps the formula as a string (print, summary, anova and the
+  # comparison read it). The global environment is safe because the formula
+  # reaches Rust as a string and every variable is read from `data`; any
+  # calling frame could hold a fit, which update() would then carry along in
+  # the new fit's call.
+  stats::as.formula(x$formula, env = globalenv())
+}
 
 #' @rdname formula.fastglmm
 #' @export
@@ -931,5 +938,5 @@ terms.fastglmm <- function(x, ...) {
   stop("terms() is not implemented: the formula machinery is Rust-side (one ",
        "parser shared with the Python port), and a ",
        "synthesized R terms object could disagree with how the model was ",
-       "actually built. formula() returns the formula string.", call. = FALSE)
+       "actually built. formula() returns the model formula as given.", call. = FALSE)
 }

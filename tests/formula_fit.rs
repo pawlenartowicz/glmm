@@ -18,7 +18,7 @@ use glmm::formula::{lower, Column, Table};
 #[cfg(feature = "orchestrate")]
 use glmm::orchestrate::run_fit;
 use glmm::{
-    fit_cold, Family, Fit, FitOptions, GroupIds, Grouping, GroupingRelation, ModelSpec,
+    fit_cold, Family, Fit, FitOptions, GroupIds, Grouping, GroupingRelation, ModelSpec, Note,
     ReStructure, Sizing,
 };
 #[cfg(feature = "orchestrate")]
@@ -1097,6 +1097,163 @@ fn interaction_grouping_produces_dense_composite_ids() {
     // (A:1), row5 repeats row3's (B:2).
     assert_eq!(lo.ids.primary, vec![0, 1, 2, 3, 0, 3]);
     assert!(lo.ids.extra.is_empty());
+}
+
+// ── Too few rows for a term's random effects ────────────────────────────────
+//
+// lme4 stops when the rows are at most a term's random effects (`lmer`) or
+// below them (`glmer`), checking each term on its own (`check.nobs.vs.nRE`).
+// glmm fits these models and notes them.
+
+/// A factor column with labels `s<code>`.
+fn coded(codes: &[usize]) -> Column {
+    let labels: Vec<String> = codes.iter().map(|c| format!("s{c}")).collect();
+    Column::factor_from_labels(&labels)
+}
+
+/// `y`, `time` and `id`, with `rows_per_id[i]` rows for subject `i` at times
+/// `0, 1, ...`: the data for `(1 + time | id)`, which has `2 * rows_per_id.len()`
+/// random effects.
+fn slope_table(rows_per_id: &[usize]) -> Table {
+    let id: Vec<usize> = rows_per_id
+        .iter()
+        .enumerate()
+        .flat_map(|(i, &k)| std::iter::repeat_n(i, k))
+        .collect();
+    let time = rows_per_id
+        .iter()
+        .flat_map(|&k| (0..k).map(|t| t as f64))
+        .collect();
+    let n = id.len();
+    Table {
+        columns: vec![
+            (
+                "y".into(),
+                Column::Numeric((0..n).map(|i| ((i * 7) % 5) as f64).collect()),
+            ),
+            ("time".into(), Column::Numeric(time)),
+            ("id".into(), coded(&id)),
+        ],
+        n,
+    }
+}
+
+/// The lowering's `FewRowsForRandomEffects` notes, as
+/// `(terms, grouping, random_effects, rows)`.
+fn few_rows_notes(formula: &str, table: &Table, family: Family) -> Vec<(String, String, u32, u32)> {
+    lower(formula, table, family)
+        .unwrap()
+        .notes
+        .into_iter()
+        .filter_map(|note| match note {
+            Note::FewRowsForRandomEffects {
+                terms,
+                grouping,
+                random_effects,
+                rows,
+            } => Some((terms, grouping, random_effects, rows)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_term_with_more_random_effects_than_rows_is_noted() {
+    // 10 subjects, two with one row: 18 rows for 20 random effects, a model
+    // lme4's lmer stops on.
+    let table = slope_table(&[1, 2, 2, 2, 2, 1, 2, 2, 2, 2]);
+    assert_eq!(
+        few_rows_notes("y ~ time + (1 + time | id)", &table, Family::Gaussian),
+        vec![("1 + time".to_string(), "id".to_string(), 20, 18)]
+    );
+}
+
+#[test]
+fn a_gaussian_model_is_noted_up_to_as_many_rows_as_random_effects() {
+    let formula = "y ~ time + (1 + time | id)";
+    let twenty = slope_table(&[2; 10]);
+    assert_eq!(
+        few_rows_notes(formula, &twenty, Family::Gaussian),
+        vec![("1 + time".to_string(), "id".to_string(), 20, 20)]
+    );
+    let mut one_more = [2; 10];
+    one_more[0] = 3;
+    assert!(few_rows_notes(formula, &slope_table(&one_more), Family::Gaussian).is_empty());
+}
+
+#[test]
+fn an_observation_level_intercept_on_a_glmm_is_not_noted() {
+    // One level per row: as many random effects as rows, which glmer allows.
+    let n = 40;
+    let table = Table {
+        columns: vec![
+            (
+                "y".into(),
+                Column::Numeric((0..n).map(|i| (i % 4) as f64).collect()),
+            ),
+            (
+                "x".into(),
+                Column::Numeric((0..n).map(|i| i as f64 / 10.0).collect()),
+            ),
+            ("obs".into(), coded(&(0..n).collect::<Vec<_>>())),
+        ],
+        n,
+    };
+    let poisson = Family::Poisson {
+        link: glmm::PoissonLink::Log,
+    };
+    assert!(few_rows_notes("y ~ x + (1 | obs)", &table, poisson).is_empty());
+}
+
+#[test]
+fn crossed_terms_are_checked_one_at_a_time() {
+    // 15 rows; 9 levels of s and 8 of i, 17 together. lme4 fits this model.
+    let n = 15;
+    let table = Table {
+        columns: vec![
+            (
+                "y".into(),
+                Column::Numeric((0..n).map(|i| ((i * 3) % 7) as f64).collect()),
+            ),
+            (
+                "s".into(),
+                coded(&(0..n).map(|i| i % 9).collect::<Vec<_>>()),
+            ),
+            (
+                "i".into(),
+                coded(&(0..n).map(|i| i % 8).collect::<Vec<_>>()),
+            ),
+        ],
+        n,
+    };
+    assert!(few_rows_notes("y ~ 1 + (1 | s) + (1 | i)", &table, Family::Gaussian).is_empty());
+}
+
+#[test]
+fn a_dropped_single_level_grouping_is_not_checked() {
+    // `(1 + f | one)` has 1 level times 5 terms, as many as the rows, but the
+    // term is dropped for its single level, so only that note is raised.
+    let n = 5;
+    let table = Table {
+        columns: vec![
+            (
+                "y".into(),
+                Column::Numeric((0..n).map(|i| i as f64).collect()),
+            ),
+            ("f".into(), coded(&(0..n).collect::<Vec<_>>())),
+            ("one".into(), coded(&[0; 5])),
+        ],
+        n,
+    };
+    let lo = lower("y ~ f + (1 + f | one)", &table, Family::Gaussian).unwrap();
+    assert!(
+        matches!(
+            lo.notes.as_slice(),
+            [Note::SingleLevelGroupingDropped { grouping }] if grouping == "one"
+        ),
+        "{:?}",
+        lo.notes
+    );
 }
 
 /// `re_groups` must line up index-for-index with `varcorr`, since `summary()`

@@ -21,13 +21,15 @@ workspace = true
 # gets the API the Rust tutorial documents. `regex` — the only dep it adds — is
 # pulled in solely by this feature, so `default-features = false` gives the
 # formula-free kernel the parse-once/fit-many hot path wants, linking no regex.
-# CI asserts that (ci.yml "kernel links no regex"). Unlike `loop_advanced`, this
-# IS part of the semver-covered surface.
+# CI asserts that (ci.yml "kernel links no regex"). Like `loop_advanced`, it is
+# outside the semver-covered surface (`fit_cold`/`fit_warm`, `ModelSpec`,
+# `GroupIds`) until the 1.0.0 surface review.
 default = ["formula"]
 formula = ["dep:regex"]
 # Unstable scratch-explicit hot-path surface (the loop tier: scratch-explicit
 # kernels + `StartValues` warm-start). Capability-named, multi-consumer. OFF by
-# default so the semver-covered public API is just `fit` + `ModelSpec`.
+# default so the semver-covered public API is just `fit_cold`/`fit_warm` +
+# `ModelSpec` + `GroupIds`.
 loop_advanced = []
 # String-typed fit orchestration shared by the FFI ports (`glmm-python`,
 # `glmm-r`): one definition of the family/link string vocabulary and the

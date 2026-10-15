@@ -17,7 +17,6 @@ source(file.path(dirname(sub("^--file=", "",
 OUT <- Sys.getenv("ACC_OUT", ""); if (!nzchar(OUT)) OUT <- file.path(ACC_DIR, "results", "glmm")
 dir.create(OUT, FALSE, TRUE)
 ACC_SKIP_AGQ <- nzchar(Sys.getenv("ACC_SKIP_AGQ", ""))
-GLMM_BLOWUP <- 20
 
 # anova_test = "Wald": `secs` times the fit, not the likelihood-ratio refits
 # "auto" stores for a Poisson GLMM.

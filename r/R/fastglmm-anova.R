@@ -63,13 +63,13 @@
 #'   with an OLS fit made with `REML = TRUE`.
 #'
 #' When the random parts differ, the reference is the exact restricted
-#' likelihood-ratio test (Crainiceanu and Ruppert 2004) when the larger model
-#' is a Gaussian REML fit whose only random term is one unweighted `(1 | g)`,
-#' with at least one fixed-effect column, and the smaller is OLS with the same
-#' fixed part; otherwise the 50:50
+#' likelihood-ratio test (Crainiceanu and Ruppert 2004) when the larger model is
+#' a Gaussian REML fit whose only random term is one unweighted `(1 | g)`, with
+#' at least one fixed-effect column and a grouping with at most 100 levels with
+#' rows, and the smaller is OLS with the same fixed part; otherwise the 50:50
 #' mixture of chi-squared distributions when one random dimension is dropped,
-#' and chi-squared on the parameter difference, labelled conservative, when
-#' more are. The heading names the reference and carries the notes.
+#' and chi-squared on the parameter difference, labelled conservative, when more
+#' are. The heading names the reference and carries the notes.
 #'
 #' Two REML fits with different fixed parts, and a REML fit beside an ML fit,
 #' are errors: lme4 refits such fits by ML, `anova()` here does not. Use
@@ -195,10 +195,10 @@ anova.fastglmm <- function(object, ..., type = c("III", "II"), test = c("auto", 
 #'   table of [anova()][anova.fastglmm] with its rows named `f0` and `f1`
 #'   (the smaller model first), and `fit0` and `fit1`, the fits of `f0` and
 #'   `f1`. Printing it prints the table. Both fits are made with
-#'   `anova_test = "auto"` (see [fastglmm()]): `anova()` of `fit0` or `fit1`
-#'   with `test = "LRT"` works only on a Poisson model with random effects.
-#'   For the likelihood-ratio rows of another model with chi-squared rows, fit
-#'   its formula with `fastglmm(..., anova_test = "LRT")`.
+#'   `anova_test = "Wald"` (see [fastglmm()]): they store no likelihood-ratio
+#'   tables, so `anova()` of a Poisson model with random effects among them
+#'   needs `test = "Wald"`. For the likelihood-ratio rows, fit the formula with
+#'   `fastglmm(..., anova_test = "LRT")`.
 #' @seealso [anova()][anova.fastglmm]
 #' @examples
 #' set.seed(1)

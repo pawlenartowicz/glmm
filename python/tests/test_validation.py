@@ -1,4 +1,5 @@
 import datetime
+import re
 import warnings
 
 import numpy as _np
@@ -418,6 +419,31 @@ def test_all_rows_missing_in_a_used_column_is_a_plain_error():
     data = {"y": [1.0, 2.0, 3.0], "x": [float("nan"), float("nan"), float("nan")]}
     with pytest.raises(ValueError, match="no rows left to fit"):
         glmm.fit(data, "y ~ x")
+
+
+@pytest.mark.parametrize(
+    "formula, message",
+    [
+        (
+            "y ~ x + ",
+            (
+                "formula syntax error at position 6: "
+                "the formula ends with '+': a term is missing after it"
+            ),
+        ),
+        (
+            "y ~ (a + b + c)^2 + (1 | g)",
+            (
+                "formula syntax error at position 15: the crossing operator '^' is not supported: "
+                "write the terms out (for example (a + b)^2 as a + b + a:b)"
+            ),
+        ),
+    ],
+)
+def test_dangling_plus_and_crossing_operator_raise(formula, message):
+    # The R port tests only `^`: R's own parser refuses a formula ending in `+`.
+    with pytest.raises(ValueError, match=f"^{re.escape(message)}$"):
+        glmm.fit(DATA, formula)
 
 
 def test_bad_formula_syntax_surfaces_the_parse_error_not_an_unrelated_column_error():

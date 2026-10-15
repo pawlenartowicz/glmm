@@ -75,7 +75,9 @@ pub enum LrNote {
     /// weights keeps none, even all equal to 1). The mixture is used.
     NoDesignSummary,
     /// The exact test refused the larger fit's design summary, for
-    /// `reason`. The mixture is used.
+    /// `reason`. The mixture is used. A grouping with more than 100 levels
+    /// with rows is refused by the comparison (`TooManyLevels`), never by
+    /// the core's `rlrt_design`; the core refuses the rest.
     ExactRlrtRefused {
         /// The refusal's reason, one plain sentence.
         reason: &'static str,

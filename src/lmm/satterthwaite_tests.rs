@@ -31,12 +31,14 @@ const ROUTE_REL: f64 = 1e-9;
 /// finite-difference band on a df, measured by
 /// `formula_gates::step_sweep_is_flat_at_eta`.
 /// Change together.
+#[cfg(feature = "formula")]
 pub(crate) const DF_FD_REL: f64 = 2e-5;
 
 /// `df_gd_rel` in `validation/grid/tol.R` (`TOL_INFERENCE`): the gradient
 /// route's band on a df, measured by
 /// `gradient_route::gradient_step_sweep_is_flat_at_eta_grad`.
 /// Change together.
+#[cfg(feature = "formula")]
 pub(crate) const DF_GD_REL: f64 = 3e-9;
 
 fn rel(got: f64, want: f64) -> f64 {

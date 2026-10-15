@@ -167,7 +167,8 @@ pub enum RandomEffect {
 /// Returns a [`ParseError`] for malformed formulas:
 /// - [`ParseError::EmptyFormula`] if the formula is empty or has no RHS.
 /// - [`ParseError::Syntax`] if a token is not a valid identifier (e.g. contains
-///   parentheses or other invalid characters).
+///   parentheses or other invalid characters), the formula ends with `+`, or
+///   the `^` crossing operator appears outside an `I(...)` call.
 /// - [`ParseError::TermRemovalUnsupported`] if the formula contains a `-` term
 ///   removal (e.g. `y ~ x - z`).
 /// - [`ParseError::DuplicateGroupingVar`] if the same grouping factor appears
@@ -212,6 +213,26 @@ pub fn parse(input: &str) -> Result<ParsedFormula, ParseError> {
     }
     if rhs.is_empty() {
         return Err(ParseError::EmptyFormula);
+    }
+
+    // Both checks read the formula as written: the `+` cleaning below would
+    // drop a dangling `+`, and a `^` would fail later with a message that
+    // does not name it. `pos` counts characters, as identifiers may be
+    // non-ASCII.
+    let written = input.trim_end();
+    if written.ends_with('+') {
+        return Err(ParseError::Syntax {
+            pos: written.chars().count() - 1,
+            msg: "the formula ends with '+': a term is missing after it".into(),
+        });
+    }
+    if let Some(pos) = find_crossing_operator(input) {
+        return Err(ParseError::Syntax {
+            pos,
+            msg: "the crossing operator '^' is not supported: write the terms out \
+                  (for example (a + b)^2 as a + b + a:b)"
+                .into(),
+        });
     }
 
     // Extract random-effect terms first so the remaining RHS is a plain
@@ -535,6 +556,48 @@ fn split_at_separator(s: &str) -> (String, String) {
     } else {
         ("explained_variable".to_string(), s.to_string())
     }
+}
+
+/// The character index in `input` of the first `^` on the right-hand side
+/// that is not inside an `I(...)` call, where `I(x^k)` is a whitelisted
+/// transform. Whitespace is skipped, as `parse` strips it, so `I (x^2)` is
+/// still an `I(...)` call.
+fn find_crossing_operator(input: &str) -> Option<usize> {
+    let rhs_start = input
+        .find('~')
+        .or_else(|| input.find('='))
+        .map_or(0, |sep| sep + 1);
+    let mut depth = 0usize;
+    // The paren depth of the open `I(` call, if inside one.
+    let mut i_call: Option<usize> = None;
+    let mut word = String::new();
+    for (pos, (byte, c)) in input.char_indices().enumerate() {
+        if byte < rhs_start || c.is_whitespace() {
+            continue;
+        }
+        match c {
+            '(' => {
+                depth += 1;
+                if i_call.is_none() && word == "I" {
+                    i_call = Some(depth);
+                }
+            }
+            ')' => {
+                if i_call == Some(depth) {
+                    i_call = None;
+                }
+                depth = depth.saturating_sub(1);
+            }
+            '^' if i_call.is_none() => return Some(pos),
+            _ => {}
+        }
+        if c.is_alphanumeric() || c == '_' {
+            word.push(c);
+        } else {
+            word.clear();
+        }
+    }
+    None
 }
 
 // The only legitimate `-` is the fixed-intercept removal (`- 1`), which the

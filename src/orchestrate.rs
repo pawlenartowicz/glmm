@@ -105,9 +105,9 @@ pub struct NoteInfo {
     pub pivot: f64,
     /// `PirlsExhausted` payload: how many fit-path evals hit the inner-PIRLS
     /// cap (that variant's `evals`). Also carries `NbShapeUnsettled`'s
-    /// `rounds` and `NonIntegerResponse`'s `rows`, which need the same "small
-    /// count" shape and no variant needs more than one at once. 0 for every
-    /// other variant.
+    /// `rounds`, `NonIntegerResponse`'s `rows` and `FewRowsForRandomEffects`'s
+    /// `random_effects`, which need the same "small count" shape and no
+    /// variant needs more than one at once. 0 for every other variant.
     pub evals: u32,
     /// `PirlsExhausted` payload: whether the final re-evaluation at the
     /// converged fit itself hit the cap, so the truncated solve's ũ/W̃ feed
@@ -117,8 +117,10 @@ pub struct NoteInfo {
     pub final_eval: bool,
     /// Free text a variant needs and the fields above cannot carry (the
     /// grouping and level names of `UnusedGroupingLevels`, the grouping name
-    /// of `SingleLevelGroupingDropped`). Empty otherwise; the `kind`, not this
-    /// string, stays the stable identifier.
+    /// of `SingleLevelGroupingDropped`, and `FewRowsForRandomEffects`'s term
+    /// as `"<terms> | <grouping>"`, whose row count the ports read from
+    /// `FitResult::nobs`). Empty otherwise; the `kind`, not this string, stays
+    /// the stable identifier.
     pub detail: String,
 }
 
@@ -133,6 +135,7 @@ fn boundary_name(boundary: Boundary) -> &'static str {
         Boundary::Interior => "interior",
         Boundary::AtBoundary => "at_boundary",
         Boundary::NoOptimum => "no_optimum",
+        Boundary::UpperLimit => "upper_limit",
     }
 }
 
@@ -210,6 +213,19 @@ fn note_infos(notes: Vec<Note>) -> Vec<NoteInfo> {
                 final_eval: false,
                 detail: grouping,
             },
+            Note::FewRowsForRandomEffects {
+                terms,
+                grouping,
+                random_effects,
+                rows: _,
+            } => NoteInfo {
+                kind: "few_rows_for_random_effects",
+                columns: Vec::new(),
+                pivot: f64::NAN,
+                evals: random_effects,
+                final_eval: false,
+                detail: format!("{terms} | {grouping}"),
+            },
             Note::ExactProfileFallback => NoteInfo {
                 kind: "exact_profile_fallback",
                 columns: Vec::new(),
@@ -244,6 +260,14 @@ fn note_infos(notes: Vec<Note>) -> Vec<NoteInfo> {
             },
             Note::Separated => NoteInfo {
                 kind: "separated",
+                columns: Vec::new(),
+                pivot: f64::NAN,
+                evals: 0,
+                final_eval: false,
+                detail: String::new(),
+            },
+            Note::VarianceAtLimit => NoteInfo {
+                kind: "variance_at_limit",
                 columns: Vec::new(),
                 pivot: f64::NAN,
                 evals: 0,
@@ -784,7 +808,7 @@ pub struct CompareResult {
 /// `family`, `link`, `nagq`, `weights` and `offset` are given once and used
 /// for both fits, which are made as [`run_fit`] makes them with
 /// `wald_se = "hessian"`, `satterthwaite = true`, no warm start and
-/// `anova_test = "auto"`. The
+/// `anova_test = "Wald"`, so neither stores a likelihood-ratio table. The
 /// caller drops the rows with a missing value in any variable of either
 /// formula, the weights or the offset before the call.
 ///
@@ -846,8 +870,8 @@ pub fn run_compare(
     let comparison = compare(&m0, &m1, &opts).map_err(|e| e.to_string())?;
     Ok(CompareResult {
         comparison,
-        fit0: flatten(prepared0, fit0, TermTest::Auto)?,
-        fit1: flatten(prepared1, fit1, TermTest::Auto)?,
+        fit0: flatten(prepared0, fit0, TermTest::Wald)?,
+        fit1: flatten(prepared1, fit1, TermTest::Wald)?,
         nsim: opts.nsim,
         seed: opts.seed,
     })
@@ -2058,6 +2082,8 @@ mod tests {
         assert_eq!(same_fixed_part("y ~ x", "y ~ 0 + x"), Ok(false));
         let err = same_fixed_part("y ~ x", "y ~ x - z").unwrap_err();
         assert!(err.contains("\"y ~ x - z\""), "{err}");
+        let err = same_fixed_part("y ~ x + ", "y ~ x").unwrap_err();
+        assert!(err.contains("ends with '+'"), "{err}");
     }
 
     #[test]
@@ -2718,11 +2744,11 @@ mod tests {
         assert_eq!(rows(&auto), rows(&asked));
     }
 
-    /// `compare()`'s two fits are made as `"auto"` makes them: on a Poisson
-    /// GLMM pair both store the likelihood-ratio tables `anova(fit)` reads by
-    /// default.
+    /// `compare()`'s two fits are made as `"Wald"` makes them: on a Poisson
+    /// GLMM pair, whose `"auto"` is still the likelihood-ratio test, neither
+    /// stores a likelihood-ratio table.
     #[test]
-    fn run_compare_makes_its_fits_as_auto() {
+    fn run_compare_makes_its_fits_as_wald() {
         let (numeric, factor) = sim("glmm_poisson");
         let r = run_compare(
             "y ~ 1 + (1 | g)",
@@ -2740,7 +2766,7 @@ mod tests {
         .expect("compares");
         for f in [&r.fit0, &r.fit1] {
             assert_eq!(choice_tags(&f.term_test_auto), ("lrt", "poisson_mixed"));
-            assert!(f.term_table_type3_lrt.is_some() && f.term_table_type2_lrt.is_some());
+            assert!(f.term_table_type3_lrt.is_none() && f.term_table_type2_lrt.is_none());
         }
     }
 
