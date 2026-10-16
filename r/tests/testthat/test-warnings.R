@@ -553,9 +553,9 @@ test_that("port parity few_rows_for_random_effects", {
   expect_identical(c(row$tier, row$title), c("caution", "Too few rows for the random effects"))
   expect_identical(row$message, paste(
     "The term (1 + time | id) has 20 random effects for 18 rows, so its variance",
-    "parameters are probably not identifiable; lme4 stops on such a model by default.",
-    "The estimates are shown; read the variance components with care, or simplify the",
-    "random-effects structure."))
+    "parameters probably cannot be estimated from these data; lme4 stops on such a model",
+    "by default. The estimates are shown; read the variance components with care, or",
+    "simplify the random-effects structure."))
   expect_identical(conditionMessage(res$cond), printed(row))
 })
 
@@ -575,9 +575,9 @@ test_that("port parity variance_at_limit", {
   expect_identical(row$message, paste(
     "A random-effect parameter reached the upper limit of the search (1000 on glmm's",
     "internal scale). On a Gaussian model this usually means the residual variance is",
-    "estimated at or near zero; on other families the random effect has no finite",
-    "estimate. The estimates sit at that limit, not at an optimum: check for a response",
-    "the predictors and groups explain exactly."))
+    "estimated at or near zero; on other families the random-effect variance has no",
+    "finite estimate. The estimates are at that limit, not at an optimum. Check for a",
+    "response that the predictors and groups explain exactly."))
   expect_identical(conditionMessage(res$cond), printed(row))
 })
 

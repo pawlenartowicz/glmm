@@ -1148,11 +1148,7 @@ symmetric eigendecomposition (order `K'³`); `GridTables::new` fills
 `2·200·k` table entries and `200·k` `log1p` once per null; each draw costs
 `k` normals, at most one `χ²`, and on each of the 200 grid points `2k`
 multiply-adds, one division and one `log1p`. No `n`-sized work is done at
-all. Timings: not yet recorded.
-
-| `k` | one `fit_cold` | `rlrt_design` (`M`, eigenvalues) | `rlrt_null`, `nsim = 10⁴` (draws, grid) |
-|---|---|---|---|
-| 5 to 5000 | not yet recorded | | |
+all.
 
 **Code**: `rlrt_design`, `rlrt_statistic`, `LAMBDA_GRID`, `GridTables`,
 `max_on_grid`, `null_draws`, `rlrt_null`, `RlrtNull::p_value`, `exact_rlrt`,

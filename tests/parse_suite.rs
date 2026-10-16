@@ -738,8 +738,8 @@ fn a_formula_ending_in_plus_is_a_syntax_error() {
 
 #[test]
 fn the_crossing_operator_is_a_syntax_error_outside_i() {
-    let msg = "the crossing operator '^' is not supported: write the terms out \
-               (for example (a + b)^2 as a + b + a:b)";
+    let msg = "'^' is accepted only in I(x^k), a power of one column; to cross terms, \
+               write them out (for example (a + b)^2 as a + b + a:b)";
     for (f, pos) in [
         ("y ~ (a + b + c)^2 + (1 | g)", 15),
         ("y ~ a^2", 5),

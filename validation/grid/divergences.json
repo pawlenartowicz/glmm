@@ -4,7 +4,7 @@
   "//scope": "Every entry here is an oracle defect, a parameter the data does not determine, or (oracle-tier only) an oracle that maximises a different objective from glmm's; an entry of that third kind is admitted only for a golden whose twin on glmm's own objective (a glmmTMB `_tmb` golden) is gated at the ordinary bands in the same tier. A real glmm defect is never registered — it stays red and is tracked as a bug — because an entry would let it pass.",
   "entries": [
     {
-      "id": "grid-pois-q2sx2-se-rx-mixedmodels-fallback-start",
+      "id": "grid-pois-q2sx2-se-rx-mixedmodels-worse-optimum",
       "cell": "pois_q2sx2_g3000p20_bal_base",
       "comparison": [
         "glmm-vs-oracle"
@@ -14,10 +14,10 @@
       ],
       "max_rel": 0.421,
       "direction": "glmm's se_rx is below MixedModels'; glmm holds the lower deviance by 46.554",
-      "summary": "MixedModels is the only oracle reporting se_rx here (glmmTMB reports none, lme4 does not converge) and it is at a much worse point: it warns that evaluation at its default initial parameter vector failed and restarts from very small variances, converging 46.554 deviance units above glmm and glmmTMB, which agree to 2e-12. Its standard errors are the standard errors of that point. Measured 2026-09-23 on the accuracy grid."
+      "summary": "MixedModels is the only oracle reporting se_rx here (glmmTMB reports none, lme4 does not converge) and it is at a much worse point: it converged 46.554 deviance units above glmm and glmmTMB, which agree to 2e-12. Its standard errors are the standard errors of that point. Measured 2026-09-23 on the accuracy grid."
     },
     {
-      "id": "grid-pois-q4sx2-se-rx-mixedmodels-fallback-start",
+      "id": "grid-pois-q4sx2-se-rx-mixedmodels-worse-optimum",
       "cell": "pois_q4sx2_g3000p20_bal_base",
       "comparison": [
         "glmm-vs-oracle"
@@ -27,7 +27,7 @@
       ],
       "max_rel": 0.217,
       "direction": "glmm's se_rx is below MixedModels'; glmm holds the lower deviance by 16.615",
-      "summary": "Same mechanism as pois_q2sx2_g3000p20_bal_base: MixedModels is the only oracle reporting se_rx and it converged 16.615 deviance units above glmm and glmmTMB after its very-small-variances fallback start. Measured 2026-09-23 on the accuracy grid."
+      "summary": "Same as pois_q2sx2_g3000p20_bal_base: MixedModels is the only oracle reporting se_rx and it converged 16.615 deviance units above glmm and glmmTMB. Measured 2026-09-23 on the accuracy grid."
     },
     {
       "id": "grid-binb-cross4-rare-stddev-pinned-to-zero",
@@ -189,6 +189,45 @@
       "max_rel": 0.075,
       "direction": "glmm's correlation is exactly 1 and GLMMadaptive's 0.999995; under GLMMadaptive's own quadrature rule glmm's estimates hold the lower deviance by 1.2e-04",
       "summary": "On this cell glmm puts the two-term g1 block on the boundary, with correlation exactly 1. GLMMadaptive stops at 0.999995 and warns that its Hessian at convergence is not positive definite. Evaluated under GLMMadaptive's own quadrature rule at glmm's estimates, with the correlation taken toward 1, the deviance is 78.59599802: 1.2e-04 below GLMMadaptive's reported optimum (78.59611657) and equal to glmm's own deviance to 4e-12. So GLMMadaptive stops short of its own optimum. The differences are 3.2e-03 on beta, 5.0e-02 on se_hessian and 7.5e-02 on the intercept SD (0.0589 against 0.0545); the slope SD agrees to 8e-04. GLMMadaptive is the only oracle on the AGQ arm for this cell. Measured 2026-10-05 against the 2026-10-05 grid run, GLMMadaptive run of 2026-10-05."
+    },
+    {
+      "id": "grid-lmm-q4sx2-boundary-coef-df-lme4-short-stop",
+      "cell": "lmm_q4sx2_g3000p20_bal_boundary",
+      "comparison": [
+        "glmm-vs-oracle"
+      ],
+      "quantities": [
+        "coef_df"
+      ],
+      "max_rel": 0.3,
+      "direction": "glmm's x1 df is below lmerTest's (990.94 against 1354.92); glmm holds the lower REML criterion by 0.134",
+      "summary": "lmerTest computes its df at lme4's θ̂, and on this cell lme4 stops 0.134 REML units short of its own optimum: lme4's REML criterion is 5760.22414040 at its own θ̂ and 5760.09016793 at glmm's. MixedModels reaches glmm's point (5760.09016829, 3.6e-07 above glmm). The truth puts all four g1 SDs at 0 and the fitted 4x4 g1 block is singular in every engine. lme4's own grid record is not converged because the fit is singular; the lmertest engine keeps singular fits on purpose, so gate 5 compares this cell. The x1 df moves most, 2.69e-01 relative; the other three coefficients differ by 4.3e-02 or less. Evaluated at glmm's θ̂, lmerTest's df agree with glmm's to 1.7e-06 or better, so the gap comes from lme4's point, not from the df computation. max_rel is about 10% above the measured gap, for round-off in glmm's θ̂; measured on one machine only. Measured 2026-10-16 on the accuracy grid (dell-fedora x86), lmerTest run of 2026-10-12."
+    },
+    {
+      "id": "grid-lmm-q8q2x-ml-coef-df-lme4-short-stop",
+      "cell": "lmm_q8q2x_g3000p20_bal_base_ml",
+      "comparison": [
+        "glmm-vs-oracle"
+      ],
+      "quantities": [
+        "coef_df"
+      ],
+      "max_rel": 0.014,
+      "direction": "glmm's (Intercept) df is below lmerTest's (74.40 against 75.37); glmm holds the lower ML deviance by 1.09e-02",
+      "summary": "lmerTest computes its df at lme4's θ̂, and on this cell lme4 stops 1.09e-02 ML deviance units short of its own optimum and still reports converged with no warning: lme4's ML criterion is 9420.95459151 at its own θ̂ and 9420.94373480 at glmm's. glmmTMB (9420.94373489) and MixedModels (9420.94375666) reach glmm's point. The largest gap is on (Intercept), 1.29e-02 relative. Evaluated at glmm's θ̂, lmerTest's df agree with glmm's to 8.9e-06 or better, so the gap comes from lme4's point, not from the df computation. max_rel is about 10% above the measured gap, for round-off in glmm's θ̂; measured on one machine only. Measured 2026-10-16 on the accuracy grid (dell-fedora x86), lmerTest run of 2026-10-12."
+    },
+    {
+      "id": "grid-lmm-q4sx2-g30000-ml-coef-df-lme4-short-stop",
+      "cell": "lmm_q4sx2_g30000p20_bal_base_ml",
+      "comparison": [
+        "glmm-vs-oracle"
+      ],
+      "quantities": [
+        "coef_df"
+      ],
+      "max_rel": 0.00085,
+      "direction": "glmm's (Intercept) df is above lmerTest's (58.954 against 58.909); glmm holds the lower ML deviance by 1.05e-05",
+      "summary": "lmerTest computes its df at lme4's θ̂, and on this 30000-row cell lme4 stops 1.05e-05 ML deviance units above glmm: lme4's ML criterion is 76344.53586217 at its own θ̂ and 76344.53585166 at glmm's; glmmTMB reaches 76344.53585278. This small difference in θ̂ moves the (Intercept) df by 7.50e-04 relative, just above the 7e-04 band; the three slope df agree to 4.5e-05 or better. Evaluated at glmm's θ̂, lmerTest's df agree with glmm's to 4.9e-06 or better, so the gap comes from lme4's point, not from the df computation. max_rel is about 10% above the measured gap, for round-off in glmm's θ̂; measured on one machine only. Measured 2026-10-16 on the accuracy grid (dell-fedora x86), lmerTest run of 2026-10-12."
     },
     {
       "id": "oracle-cbpp-probit-glmm-beta-lme4-objective",

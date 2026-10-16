@@ -434,8 +434,9 @@ def test_all_rows_missing_in_a_used_column_is_a_plain_error():
         (
             "y ~ (a + b + c)^2 + (1 | g)",
             (
-                "formula syntax error at position 15: the crossing operator '^' is not supported: "
-                "write the terms out (for example (a + b)^2 as a + b + a:b)"
+                "formula syntax error at position 15: '^' is accepted only in I(x^k), a power "
+                "of one column; to cross terms, write them out (for example (a + b)^2 as "
+                "a + b + a:b)"
             ),
         ),
     ],

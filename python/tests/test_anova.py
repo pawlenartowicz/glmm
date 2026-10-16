@@ -114,7 +114,7 @@ def test_a_table_iterates_and_tests_membership_over_its_column_names(lmm):
 
 def test_anova_of_a_glmm_is_a_wald_chisq_table():
     tab = glmm.anova(quiet_fit("n ~ x + f + (1 | g)", family="poisson"), test="Wald")
-    assert tab.heading == "Type III Analysis of Deviance Table (Wald χ² tests)"
+    assert tab.heading == "Type III Analysis of Deviance Table (Wald chi-squared tests)"
     assert tab.columns == ["Chisq", "Df", "Pr(>Chisq)"]
     assert tab["Df"].tolist() == [1.0, 2.0]
     # The renders add each row's reference, built from its Df.
@@ -187,7 +187,8 @@ def test_anova_of_a_fit_that_did_not_converge_says_so(lmm):
     stalled = dataclasses.replace(lmm, diagnostics={**lmm.diagnostics, "converged": False})
     assert glmm.anova(stalled).notes[0] == (
         "The fit did not converge, so its estimates are not at a maximum and these tests "
-        "are not reliable. Refit until the fit converges, then test again."
+        "are not reliable. Change the model until it converges (a simpler random part often "
+        "helps), then test again."
     )
     assert not any("converge" in n for n in glmm.anova(lmm).notes)
 
@@ -229,10 +230,13 @@ def pois():
     return quiet_fit(_POIS, family="poisson"), quiet_fit(_POIS, family="poisson", anova_test="LRT")
 
 
-def _f_refusal(den_df, name):
+_MIXED_F = "a Gaussian mixed model are F tests"
+_RESIDUAL_F = "this fit are F tests on the residual df"
+
+
+def _f_refusal(fit, name):
     return (
-        f"per-term tests on this fit are F tests with {den_df} denominator df; {name} rows "
-        "are not available, so leave the test at its default"
+        f"per-term tests on {fit}; {name} rows are not available, so leave the test at its default."
     )
 
 
@@ -249,7 +253,7 @@ def test_wald_gives_the_stored_wald_table_whatever_the_fit_stored(pois):
     assert wald.term_table_type3_lrt is None and wald.term_table_type2_lrt is None
     for ss, field in (("III", "term_table_type3"), ("II", "term_table_type2")):
         base = glmm.anova(wald, type=ss, test="Wald")
-        assert base.heading == f"Type {ss} Analysis of Deviance Table (Wald χ² tests)"
+        assert base.heading == f"Type {ss} Analysis of Deviance Table (Wald chi-squared tests)"
         for m in (plain, wald, asked):
             tab = glmm.anova(m, type=ss, test="Wald")
             assert tab.text() == base.text() and tab.html() == base.html()
@@ -312,7 +316,7 @@ def test_auto_names_the_wald_test_and_its_reason_on_every_other_chi_squared_fit(
         b=(_Y > np.median(_Y)).astype(float).tolist(),
         pos=np.exp(0.3 * _X + 0.3 * _Z).tolist(),
     )
-    other = "model with random effects, not binomial, Poisson or negative binomial"
+    other = "Gamma model with random effects"
     cases = (
         (quiet_fit("b ~ x + f + (1 | g)", d, family="binomial"), "binomial_mixed",
          "binomial model with random effects"),
@@ -338,7 +342,7 @@ def test_auto_names_the_wald_test_and_its_reason_on_every_other_chi_squared_fit(
             assert tab.typst().splitlines()[:2] == [f"// {h}" for h in heading]
             # Explicit Wald keeps today's heading; the numbers are the same.
             wald = glmm.anova(m, type=ss, test="Wald")
-            assert wald.heading == f"Type {ss} Analysis of Deviance Table (Wald χ² tests)"
+            assert wald.heading == f"Type {ss} Analysis of Deviance Table (Wald chi-squared tests)"
             assert (tab.columns, tab.row_names, tab.notes) == (
                 wald.columns, wald.row_names, wald.notes,
             )  # fmt: skip
@@ -414,20 +418,18 @@ def test_wald_or_lrt_on_an_f_table_is_refused_naming_its_test(lmm):
         for ss in ("III", "II"):
             with pytest.raises(ValueError) as err:
                 glmm.anova(lmm, type=ss, test=test)
-            assert str(err.value) == _f_refusal("Satterthwaite's", name)
+            assert str(err.value) == _f_refusal(_MIXED_F, name)
     ols = quiet_fit("y ~ x + f")
     with pytest.raises(ValueError) as err:
         glmm.anova(ols, test="Wald")
-    assert str(err.value) == _f_refusal("the residual", "Wald chi-squared")
+    assert str(err.value) == _f_refusal(_RESIDUAL_F, "Wald chi-squared")
     # A fit that asked for the likelihood-ratio tables stands, and stores the
     # same refusal in their place.
     asked = quiet_fit("y ~ x + f + (1 | g)", anova_test="LRT")
-    assert asked.term_table_type3_lrt == {
-        "error": _f_refusal("Satterthwaite's", "likelihood-ratio")
-    }
+    assert asked.term_table_type3_lrt == {"error": _f_refusal(_MIXED_F, "likelihood-ratio")}
     with pytest.raises(ValueError) as err:
         glmm.anova(asked, test="LRT")
-    assert str(err.value) == _f_refusal("Satterthwaite's", "likelihood-ratio")
+    assert str(err.value) == _f_refusal(_MIXED_F, "likelihood-ratio")
     assert glmm.anova(asked).text() == glmm.anova(lmm).text()
 
 
@@ -656,8 +658,10 @@ def test_each_refusal_of_two_fits_raises_value_error_with_its_fix():
         message = _refusal(m0, m1)
         assert _POINTER in message, name
     reml_fixed = _refusal(*cases["reml_fixed"])
-    assert "reml=False" in reml_fixed and reml_fixed.count("Refit both") == 1
-    assert _refusal(*cases["estimators"]).startswith("m0 was fitted by REML and m1 by ML")
+    assert "reml=False" in reml_fixed and reml_fixed.count("Fit both") == 1
+    assert _refusal(*cases["estimators"]).startswith(
+        "the first model was fitted by REML and the second by ML"
+    )
 
 
 def test_refusals_with_no_pointer():
@@ -669,7 +673,7 @@ def test_refusals_with_no_pointer():
     assert "neither formula is nested" in _refusal(quiet_fit("y ~ x"), quiet_fit("y ~ z"))
     w = quiet_fit("w ~ x + z", _data(w=_Y.tolist()))
     assert "different responses" in _refusal(quiet_fit("y ~ x"), w)
-    same = "m0 and m1 have the same fixed and random parts, so there is nothing to test."
+    same = "the two models have the same fixed and random parts, so there is nothing to test."
     assert same in _refusal(quiet_fit("y ~ x"), quiet_fit("y ~ x", reml=True))
     one = quiet_fit("y ~ x")
     assert _refusal(one, one) == f"{same} Compare two models that differ by at least one parameter."

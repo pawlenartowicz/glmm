@@ -265,30 +265,29 @@ def fit_one(cell):
         gaussian = cell["family"] == "gaussian"
 
         def timed_fit(call):
-            """Run `call` once when GRID_TIMED is off; otherwise GRID_TIMED
-            times, first sample discarded, `rec["wall_seconds"]` set to the
-            median of the rest. Returns the last (or only) sample's Fit --
-            `call` is deterministic (BOBYQA on a fixed input), so every
-            sample agrees. Unlike common.rs, which reports an untimed fit and
-            times separate samples with the Satterthwaite pass switched off,
-            the port times the reported fit itself, pass included: it has one
-            call to re-run rather than two Wald-SE arms, and no port timing is
-            set beside glmm's (summarize_timing.R has no port column)."""
-            if TIMED is None:
-                return call()
-            fh = None
-            samples = []
-            for _ in range(TIMED):
-                t0 = time.perf_counter()
-                fh = call()
-                samples.append(time.perf_counter() - t0)
-            rec["wall_seconds"] = statistics.median(samples[1:])
-            return fh
+            """Return the reported Fit, `call(True)`, untimed. When GRID_TIMED
+            is on, first time GRID_TIMED samples of `call(False)`, first sample
+            discarded, `rec["wall_seconds"]` set to the median of the rest.
+            The samples skip the Satterthwaite pass for the reason common.rs
+            gives (the lme4 engine times plain `lmer`); the reported fit keeps
+            it, so its `coef_df` is recorded."""
+            if TIMED is not None:
+                samples = []
+                for _ in range(TIMED):
+                    t0 = time.perf_counter()
+                    call(False)
+                    samples.append(time.perf_counter() - t0)
+                rec["wall_seconds"] = statistics.median(samples[1:])
+            return call(True)
 
         # anova_test="Wald": the grid times the fit, not the likelihood-ratio
         # refits "auto" stores for a Poisson GLMM.
         kw["anova_test"] = "Wald"
-        fh = timed_fit(lambda: glmm.fit(data, formula, _FAMILY[cell["family"]], wald_se="hessian", **kw))
+        fh = timed_fit(
+            lambda sat: glmm.fit(
+                data, formula, _FAMILY[cell["family"]], wald_se="hessian", satterthwaite=sat, **kw
+            )
+        )
         if gaussian:
             rec["se_rx"] = nums(fh.se)  # one profiled SE, no method split
         else:

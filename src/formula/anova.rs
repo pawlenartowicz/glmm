@@ -94,8 +94,8 @@ pub enum Side {
 impl Side {
     fn label(self) -> &'static str {
         match self {
-            Side::First => "m0",
-            Side::Second => "m1",
+            Side::First => "the first model",
+            Side::Second => "the second model",
         }
     }
 }
@@ -423,8 +423,8 @@ pub struct Comparison {
 
 impl Comparison {
     /// The test's notes as plain sentences, in order, for a port to print
-    /// under the table. A note on a fit names its side (`m0` or `m1`), and a
-    /// note on a column of the larger fit names its coefficient.
+    /// under the table. A note on a fit names it as the smaller or the larger
+    /// model, and a note on a column of the larger fit names its coefficient.
     pub fn note_lines(&self) -> Vec<String> {
         let names = match self.larger {
             Side::First => &self.m0.coef_names,
@@ -446,12 +446,10 @@ impl Comparison {
 }
 
 fn lr_note_lines(note: LrNote, c: &Comparison) -> Vec<String> {
-    let side = c.larger.label();
     let line = match note {
         LrNote::NegativeStatistic { raw } => format!(
-            "{side}, the larger model, did not reach its optimum: its log-likelihood is below the \
-             smaller model's, 2(l1 - l0) = {raw:e}, by more than round-off. The statistic is set \
-             to 0; refit {side}."
+            "The larger model did not reach its optimum: its log-likelihood is below the smaller \
+             model's by more than round-off, 2(l1 - l0) = {raw:e}. The statistic is set to 0."
         ),
         LrNote::BoundaryMixture { approximate } => {
             let mut lines = vec!["Conservative: the true p-value is usually smaller.".to_string()];
@@ -468,13 +466,14 @@ fn lr_note_lines(note: LrNote, c: &Comparison) -> Vec<String> {
         LrNote::BoundaryIgnored => "The random parts differ by more than one dimension: the \
              chi-squared reference ignores the boundary; conservative."
             .to_string(),
-        LrNote::NoDesignSummary => "The exact restricted likelihood-ratio test needs the larger \
-             model to be a Gaussian REML fit whose only random term is one unweighted (1 | g), \
-             which keeps a summary of its design; this fit keeps none (a fit given weights keeps \
-             none, even weights all equal to 1), so the 50:50 mixture is used."
+        LrNote::NoDesignSummary => "The exact restricted likelihood-ratio test needs a summary \
+             of the larger model's design. A fit keeps one only when it is a Gaussian REML fit \
+             with at least one fixed-effect column and one unweighted (1 | g) as its only random \
+             term (weights all equal to 1 count as weights). This fit keeps none, so the 50:50 \
+             mixture is used."
             .to_string(),
         LrNote::ExactRlrtRefused { reason } => format!(
-            "The exact restricted likelihood-ratio test cannot be computed: {reason}. The 50:50 \
+            "The exact restricted likelihood-ratio test was not computed: {reason}. The 50:50 \
              mixture is used."
         ),
         LrNote::NodeCounts { m0, m1 } => format!(
@@ -488,15 +487,18 @@ fn lr_note_lines(note: LrNote, c: &Comparison) -> Vec<String> {
              an asymptotic chi-squared reference."
             .to_string(),
         LrNote::NonFiniteLoglik => {
-            let bad: Vec<&str> = [(&c.m0, "m0"), (&c.m1, "m1")]
-                .into_iter()
-                .filter(|(m, _)| !m.loglik.is_finite())
-                .map(|(_, label)| label)
-                .collect();
+            let (smaller, larger) = match c.larger {
+                Side::First => (&c.m1, &c.m0),
+                Side::Second => (&c.m0, &c.m1),
+            };
+            let who = match (smaller.loglik.is_finite(), larger.loglik.is_finite()) {
+                (false, false) => "both models",
+                (false, true) => "the smaller model",
+                _ => "the larger model",
+            };
             format!(
-                "The log-likelihood of {} is not finite (a fit that failed or collapsed), so \
-                 the statistic and its p-value are NaN.",
-                bad.join(" and ")
+                "The log-likelihood of {who} is not finite (a fit that failed or collapsed), so \
+                 the statistic and its p-value are NaN."
             )
         }
     };
@@ -522,26 +524,24 @@ pub(crate) fn linear_note_line(note: LinearNote, names: &[String]) -> String {
         LinearNote::NoDf { reason } => {
             format!("No denominator df ({reason}), so the hypothesis was not tested.")
         }
-        LinearNote::ReducedNotConverged => "The model refitted for this term's \
-             likelihood-ratio test did not converge, so the statistic and its p-value are NaN."
+        LinearNote::ReducedNotConverged => "A model refitted for this term's likelihood-ratio \
+             test did not converge, or its log-likelihood is not finite, so the statistic and its \
+             p-value are NaN."
             .into(),
         LinearNote::RandomSlopeColumn => "Likelihood-ratio test not available: the term's \
              column carries a random slope, so the row is the Wald chi-squared test."
             .into(),
         LinearNote::NegativeStatistic => "The model refitted under the term's hypothesis \
-             reached a higher log-likelihood than the larger model, by more than round-off, so \
-             the statistic is set to 0: the larger model's fit did not reach its optimum; refit \
-             it."
-        .into(),
+             reached a higher log-likelihood than the larger model of this row, by more than \
+             round-off: the larger model did not reach its optimum. The statistic is set to 0."
+            .into(),
     }
 }
 
 /// The table note of a likelihood-ratio table on a fit that did not
 /// converge.
 pub(super) fn lrt_not_converged_note() -> String {
-    "The fit did not converge, so no model was refitted and the likelihood-ratio statistics \
-     are NaN."
-        .into()
+    "No model was refitted, so every likelihood-ratio statistic and p-value is NaN.".into()
 }
 
 /// The table note of a likelihood-ratio row whose reduced design could not
@@ -549,14 +549,15 @@ pub(super) fn lrt_not_converged_note() -> String {
 pub(super) fn lrt_no_basis_note(term: &str) -> String {
     format!(
         "The model under the hypothesis of {term} could not be built (the hypothesis is too \
-         ill-conditioned), so its likelihood-ratio statistic is NaN."
+         ill-conditioned), so its statistic and its p-value are NaN."
     )
 }
 
 /// Why two models cannot be compared. Each message says what is wrong and
-/// what to do in plain words; `m0` and `m1` are the two sides as given. The
-/// messages name no call syntax: a port that names its own comparison
-/// function or REML argument renders that from the variant's fields.
+/// what to do in plain words; the first model and the second model are the
+/// two sides as given. The messages name no call syntax: a port that names
+/// its own comparison function or REML argument renders that from the
+/// variant's fields.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq)]
 pub enum CompareError {
@@ -648,42 +649,43 @@ impl fmt::Display for CompareError {
         match self {
             CompareError::NotConverged { m0, m1 } => {
                 let who = match (m0, m1) {
-                    (true, true) => "m0 and m1 did not converge, so their log-likelihoods are",
-                    (true, false) => "m0 did not converge, so its log-likelihood is",
-                    _ => "m1 did not converge, so its log-likelihood is",
+                    (true, true) => "neither model converged, so their log-likelihoods are",
+                    (true, false) => "the first model did not converge, so its log-likelihood is",
+                    _ => "the second model did not converge, so its log-likelihood is",
                 };
                 write!(
                     f,
-                    "{who} not at a maximum and cannot be compared. Refit until the fit \
+                    "{who} not at a maximum and cannot be compared. Change the model until it \
                      converges (a simpler random part often helps), then compare again."
                 )
             }
             CompareError::DifferentRows { m0, m1 } => write!(
                 f,
-                "m0 has {m0} rows and m1 has {m1}; a comparison needs both fits on the same \
-                 rows. Fit both models to the same rows, dropping the rows with a missing \
-                 value in any variable of either formula first."
+                "the first model has {m0} rows and the second has {m1}; a comparison needs \
+                 both fits on the same rows. Fit both models to the same rows, dropping the \
+                 rows with a missing value in any variable of either formula first."
             ),
             CompareError::DifferentY => write!(
                 f,
-                "m0 and m1 have different responses y (the same row count, different values); \
-                 a comparison needs both fits on the same data. Fit both models to the same \
-                 data."
+                "the two models have different responses y (the same row count, different \
+                 values); a comparison needs both fits on the same data. Fit both models to the \
+                 same data."
             ),
             CompareError::DifferentWeights => write!(
                 f,
-                "m0 and m1 were fitted with different weights; a comparison needs the same \
-                 weights in both. Refit both models with the same weights."
+                "the two models were fitted with different weights; a comparison needs the \
+                 same weights in both. Fit both models with the same weights."
             ),
             CompareError::DifferentOffset => write!(
                 f,
-                "m0 and m1 were fitted with different offsets; a comparison needs the same \
-                 offset in both. Refit both models with the same offset."
+                "the two models were fitted with different offsets; a comparison needs the \
+                 same offset in both. Fit both models with the same offset."
             ),
             CompareError::DifferentFamily { m0, m1 } => write!(
                 f,
-                "m0 was fitted as {} and m1 as {}; a comparison needs the same family and \
-                 link in both. Refit both models with the same family and link.",
+                "the first model was fitted as {} and the second as {}; a comparison needs \
+                 the same family and link in both. Fit both models with the same family and \
+                 link.",
                 family_words(*m0),
                 family_words(*m1)
             ),
@@ -694,8 +696,8 @@ impl fmt::Display for CompareError {
                 };
                 write!(
                     f,
-                    "m0 {} and m1 {}; a comparison needs the same held dispersion in both. \
-                     Refit both with the same dispersion argument.",
+                    "the first model {} and the second {}; a comparison needs the same held \
+                     dispersion in both. Fit both models with the same held dispersion.",
                     held(m0),
                     held(m1)
                 )
@@ -722,34 +724,33 @@ impl fmt::Display for CompareError {
                 };
                 write!(
                     f,
-                    "m0 was fitted by {m0} and m1 by {m1}; a comparison needs both fitted the \
-                     same way. Refit both models by maximum likelihood (ML), or both by REML \
-                     when their fixed parts are the same."
+                    "the first model was fitted by {m0} and the second by {m1}; a comparison \
+                     needs both fitted the same way. Fit both models by maximum likelihood \
+                     (ML), or both by REML when their fixed parts are the same."
                 )
             }
             CompareError::RemlDifferentFixed => write!(
                 f,
-                "m0 and m1 are REML fits with different fixed effects, and REML fits with \
-                 different fixed effects cannot be compared by likelihood ratio. Refit both \
-                 models by maximum likelihood (ML)."
+                "the two models are REML fits with different fixed effects; the REML \
+                 likelihood depends on the fixed effects, so a comparison needs ML fits. Fit \
+                 both models by maximum likelihood (ML)."
             ),
             CompareError::SameParts => write!(
                 f,
-                "m0 and m1 have the same fixed and random parts, so there is nothing to test. \
-                 Compare two models that differ by at least one parameter."
+                "the two models have the same fixed and random parts, so there is nothing to \
+                 test. Compare two models that differ by at least one parameter."
             ),
             CompareError::NothingToTest { m0, .. } => write!(
                 f,
-                "m0 and m1 have the same number of parameters ({m0}), so there is nothing to \
-                 test: the larger formula adds no parameter to the smaller one. Compare two \
-                 models that differ by at least one parameter."
+                "the two models have the same number of parameters ({m0}), so there is \
+                 nothing to test: the larger formula adds no parameter to the smaller one. \
+                 Compare two models that differ by at least one parameter."
             ),
             CompareError::ReGroups { side } => write!(
                 f,
-                "{}'s random-effect groupings do not describe its random part: a comparison \
-                 needs one grouping per variance block, each listing one term per dimension of \
-                 its block, as the fit's lowering gives them. Fill them from the lowered model \
-                 the fit was made on, then compare again.",
+                "{}'s random-effect groupings do not match its variance blocks: a comparison \
+                 needs one grouping per block, with one term per dimension of the block. Copy \
+                 them from the lowered model the fit was made on, then compare again.",
                 side.label()
             ),
         }
@@ -1318,22 +1319,22 @@ impl fmt::Display for TermTestError {
                     TermTest::Lrt => ("likelihood-ratio", default),
                     TermTest::Auto => ("chi-squared", ""),
                 };
-                let den_df = match den_df {
-                    DenDf::Satterthwaite => "Satterthwaite's",
-                    DenDf::Residual => "the residual",
+                let fit = match den_df {
+                    DenDf::Satterthwaite => "a Gaussian mixed model are F tests",
+                    DenDf::Residual => "this fit are F tests on the residual df",
                 };
                 write!(
                     f,
-                    "per-term tests on this fit are F tests with {den_df} denominator df; \
-                     {asked} rows are not available{advice}"
+                    "per-term tests on {fit}; {asked} rows are not available{advice}."
                 )
             }
             TermTestError::RefitNodeCount { fit, refits } => write!(
                 f,
-                "the fit used {fit} quadrature nodes and the refits of its likelihood-ratio \
-                 rows would use {refits} (1 is the Laplace approximation), so each row would \
-                 compare two approximations of the likelihood; fit the model with {refits} \
-                 nodes, or ask for the Wald test"
+                "the fit's quadrature node count is {fit} and the refits of its \
+                 likelihood-ratio rows would use {refits} (a count of 1 is the Laplace \
+                 approximation), so each row would compare two approximations of the \
+                 likelihood. Fit the model with a node count of {refits}, or ask for the Wald \
+                 test."
             ),
         }
     }

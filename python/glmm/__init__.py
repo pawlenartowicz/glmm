@@ -131,7 +131,7 @@ class SingleLevelGroupingDroppedWarning(DiagnosticWarning):
 class FewRowsForRandomEffectsWarning(DiagnosticWarning):
     """A random-effect term has at least as many random effects as the fit has
     rows (more than the rows, on a family other than Gaussian), so its variance
-    parameters are probably not identifiable.
+    parameters probably cannot be estimated from these data.
 
     A term's random effects are its observed levels times its columns (the
     intercept, one per numeric slope, one per non-base level of a factor
@@ -206,12 +206,12 @@ class PrecisionLimitedWarning(DiagnosticWarning):
 
 class VarianceAtLimitWarning(DiagnosticWarning):
     """A random-effect parameter ended on the upper limit of the variance search
-    (1000 on glmm's internal scale), so the estimates sit at that limit, not at
+    (1000 on glmm's internal scale), so the estimates are at that limit, not at
     an optimum.
 
     On a Gaussian model this usually means the residual variance is estimated
-    at or near zero; on other families the random effect has no finite
-    estimate. `converged` and `singular` are the search's own, and
+    at or near zero; on other families the random-effect variance has no
+    finite estimate. `converged` and `singular` are the search's own, and
     `diagnostics["boundary"]` reads "upper_limit" when it would otherwise read
     "interior".
     """
@@ -1029,10 +1029,10 @@ def _note_warning(note, names, converged, nobs):
         return (
             (
                 f"The term ({note['detail']}) has {note['evals']} random effects for "
-                f"{_count(nobs, 'row')}, so its variance parameters are probably not "
-                "identifiable; lme4 stops on such a model by default. The estimates are "
-                "shown; read the variance components with care, or simplify the "
-                "random-effects structure."
+                f"{_count(nobs, 'row')}, so its variance parameters probably cannot be "
+                "estimated from these data; lme4 stops on such a model by default. The "
+                "estimates are shown; read the variance components with care, or simplify "
+                "the random-effects structure."
             ),
             FewRowsForRandomEffectsWarning,
         )
@@ -1041,9 +1041,9 @@ def _note_warning(note, names, converged, nobs):
             (
                 "A random-effect parameter reached the upper limit of the search (1000 on "
                 "glmm's internal scale). On a Gaussian model this usually means the residual "
-                "variance is estimated at or near zero; on other families the random effect "
-                "has no finite estimate. The estimates sit at that limit, not at an optimum: "
-                "check for a response the predictors and groups explain exactly."
+                "variance is estimated at or near zero; on other families the random-effect "
+                "variance has no finite estimate. The estimates are at that limit, not at an "
+                "optimum. Check for a response that the predictors and groups explain exactly."
             ),
             VarianceAtLimitWarning,
         )

@@ -229,8 +229,8 @@ pub fn parse(input: &str) -> Result<ParsedFormula, ParseError> {
     if let Some(pos) = find_crossing_operator(input) {
         return Err(ParseError::Syntax {
             pos,
-            msg: "the crossing operator '^' is not supported: write the terms out \
-                  (for example (a + b)^2 as a + b + a:b)"
+            msg: "'^' is accepted only in I(x^k), a power of one column; to cross terms, \
+                  write them out (for example (a + b)^2 as a + b + a:b)"
                 .into(),
         });
     }

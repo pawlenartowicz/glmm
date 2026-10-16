@@ -1143,6 +1143,12 @@ TOL_INFERENCE <- list(
   # zapsmall-rounded one the statistic of anova_lrt3_glmm_sim_factorial_bern's
   # h row is 0.02446281944 against 0.02446285055, a move of 3.1e-8 (afex
   # 0.02446285427: 3.5e-8 from the rounded basis, 3.7e-9 from the unrounded).
+  # On wasm32-wasip1 (2026-10-16, pawel) the same row is 0.024462850554584747
+  # (plain) and 0.02446285055461317 (+simd128) on the unrounded basis against
+  # 0.02446281944392581 and 0.02446281944395423 on the rounded one: the same
+  # 3.1e-8 move, above the 1e-8 the pin guard
+  # type_iii_lrt_h_row_refits_on_the_unrounded_null_basis needs to tell the
+  # two bases apart.
   # Limits: aarch64 (NEON) is not measured; and the absolute residue is the
   # optimizer's stopping residue on these fixtures (it scales with |l|, the
   # curvature and the stopping rule), so a new gate-2 fixture with a much

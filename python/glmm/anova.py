@@ -35,7 +35,8 @@ _RLRT = "exact RLRT null distribution (Crainiceanu & Ruppert 2004)"
 # compares with both ports - change together.
 _NOT_CONVERGED = (
     "The fit did not converge, so its estimates are not at a maximum and these tests "
-    "are not reliable. Refit until the fit converges, then test again."
+    "are not reliable. Change the model until it converges (a simpler random part often "
+    "helps), then test again."
 )
 _LRT_LINE = "Likelihood-ratio chi-squared tests (each term's model refitted without it)"
 _TESTS = ("auto", "Wald", "LRT")
@@ -46,7 +47,7 @@ _AUTO_REASONS = {
     "poisson_mixed": "Poisson model with random effects",
     "binomial_mixed": "binomial model with random effects",
     "negative_binomial_mixed": "negative binomial model with random effects",
-    "other_mixed": "model with random effects, not binomial, Poisson or negative binomial",
+    "other_mixed": "Gamma model with random effects",
     "no_random_effects": "model without random effects",
 }
 _WALD_LINE = "Wald chi-squared tests"
@@ -251,10 +252,10 @@ def anova(*fits, type=None, test=_AUTO, nsim=None, seed=None):
     compared as they are, with no refit, a `ComparisonTable`.
 
     One fit, `glmm.anova(m)`: one row per fixed term, read from the table the
-    fit stored when it was made, so nothing is computed here. `type="III"`
-    (the default when `type` is not given) builds each term's hypothesis the way lmerTest does, so it
-    does not depend on the contrast coding; `type="II"` is the one
-    alternative. OLS, a Gaussian mixed model and the Gamma and inverse
+    fit stored when it was made, so nothing is computed here. `type="III"` (the
+    default, also taken for None) builds each term's hypothesis the way
+    lmerTest does, so it does not depend on the contrast coding; `type="II"` is
+    the one alternative. OLS, a Gaussian mixed model and the Gamma and inverse
     Gaussian GLMs with phi estimated get F tests (the residual df, or
     Satterthwaite's on a mixed model); every other fit Wald chi-squared tests,
     but a Poisson model with random effects likelihood-ratio tests (`test`).
@@ -263,17 +264,16 @@ def anova(*fits, type=None, test=_AUTO, nsim=None, seed=None):
     raises `ValueError`. A fit that did not converge gets its table with a
     note saying so.
 
-    `test` chooses the rows' test on one fit (None, as with `type`, is the
-    default). "auto" (the default) gives the F
-    rows on a fit that has them, the likelihood-ratio rows on a Poisson model
-    with random effects whatever its size (in simulation the Wald test of a
-    Poisson GLMM was never closer to the nominal level than the
-    likelihood-ratio test, and rejected too often at few clusters), and the
-    Wald chi-squared rows on every other fit. "Wald" gives the Wald chi-squared
-    rows; "LRT" the likelihood-ratio rows, each term's hypothesis tested by
-    refitting the model under it (Type II by the rule of car's
-    `Anova(test.statistic = "LR")` on a GLM, applied to GLMMs too; Type III on
-    the reduced design of the same hypothesis as the Wald row, as afex's
+    `test` chooses the rows' test on one fit. "auto" (the default, also taken
+    for None) gives the F rows on a fit that has them, the likelihood-ratio
+    rows on a Poisson model with random effects whatever its size (in
+    simulation the Wald test of a Poisson GLMM was never closer to the nominal
+    level than the likelihood-ratio test, and rejected too often at few
+    clusters), and the Wald chi-squared rows on every other fit. "Wald" gives
+    the Wald chi-squared rows; "LRT" the likelihood-ratio rows, each term's
+    hypothesis tested by refitting the model under it (Type II by the rule of
+    car's `Anova(test.statistic = "LR")` on a GLM, applied to GLMMs too; Type
+    III on the reduced design of the same hypothesis as the Wald row, as afex's
     `mixed(method = "LRT")` on a GLMM), in the Wald table's columns. The refits
     are made when the fit is: a fit made with `glmm.fit(..., anova_test="LRT")`
     has these rows, and so does a Poisson model with random effects made with
@@ -309,9 +309,9 @@ def anova(*fits, type=None, test=_AUTO, nsim=None, seed=None):
 
     Three or more fits raise `TypeError`: a comparison takes two models. So
     do the arguments of the other form: `nsim` or `seed` with one fit, `type`
-    or `test` other than None with two. A fit made by a glmm version without these tests
-    raises `ValueError` naming the fields it lacks: refit it. The name and
-    the table layouts are provisional until 1.0.0."""
+    or `test` other than None with two. A fit made by a glmm version without
+    these tests raises `ValueError` naming the fields it lacks: refit it. The
+    name and the table layouts are provisional until 1.0.0."""
     if len(fits) not in (1, 2):
         raise TypeError(f"glmm.anova takes one fit or two, got {len(fits)}")
     for m in fits:
@@ -397,12 +397,12 @@ def compare(
     GLMM is fitted by ML. `family`, `link`, `weights`, `offset` and `nagq` are
     given once and used for both fits, as `glmm.fit` takes them. A row with a
     missing value in any column either formula uses, in the weights or in the
-    offset is dropped from both fits. The two formulas can be given in either order; the table lists the
-    smaller model first. `nsim` and `seed` are as in `glmm.anova`. Both fits
-    are made with `anova_test="Wald"`: they store no likelihood-ratio tables,
-    so `glmm.anova` of a Poisson model with random effects among them needs
-    `test="Wald"`. For the likelihood-ratio rows, fit the formula with
-    `glmm.fit(..., anova_test="LRT")`.
+    offset is dropped from both fits. The two formulas can be given in either
+    order; the table lists the smaller model first. `nsim` and `seed` are as in
+    `glmm.anova`. Both fits are made with `anova_test="Wald"`: they store no
+    likelihood-ratio tables, so `glmm.anova` of a Poisson model with random
+    effects among them needs `test="Wald"`. For the likelihood-ratio rows, fit
+    the formula with `glmm.fit(..., anova_test="LRT")`.
 
     Formulas that are not nested, or that give the same model, raise
     `ValueError`. A third formula raises `TypeError`, and so do fits instead
@@ -566,7 +566,7 @@ def _term_table(m, stored, test):
             )
             heading = f"Type {ss} Analysis of Deviance Table\n{line}; {why}"
         else:
-            heading = f"Type {ss} Analysis of Deviance Table (Wald χ² tests)"
+            heading = f"Type {ss} Analysis of Deviance Table (Wald chi-squared tests)"
         values = {
             "Chisq": stored["statistic"],
             "Df": stored["num_df"],

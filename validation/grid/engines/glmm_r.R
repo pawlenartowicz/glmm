@@ -114,7 +114,7 @@ build_family <- function(cell) {
   )
 }
 
-do_fit <- function(data, formula, family, wald_se, nagq, reml) {
+do_fit <- function(data, formula, family, wald_se, nagq, reml, satterthwaite = TRUE) {
   # One fastglmm() call. weights and offset ride as DATA COLUMNS
   # (validation_wts, validation_off) referenced by name so fastglmm's
   # eval-in-data resolves them deterministically inside the fit call rather
@@ -123,6 +123,7 @@ do_fit <- function(data, formula, family, wald_se, nagq, reml) {
   # weights/weights_col field and an offset_col at once by construction, but
   # the arm exists so one would not silently drop the other's column.
   # `reml` is FALSE on a cell tagged `ml` and NULL (the default) otherwise.
+  # `satterthwaite` is FALSE only for the timed samples (see the caller).
   # anova_test = "Wald": the grid times the fit, not the likelihood-ratio
   # refits "auto" stores for a Poisson GLMM.
   # suppressWarnings: the expected singular-boundary / nAGQ-fallback notices
@@ -134,16 +135,18 @@ do_fit <- function(data, formula, family, wald_se, nagq, reml) {
     if (has_w && has_o)
       fastglmm(formula, data, family, weights = validation_wts,
                offset = validation_off, wald.se = wald_se, nAGQ = nagq, REML = reml,
-               anova_test = "Wald")
+               satterthwaite = satterthwaite, anova_test = "Wald")
     else if (has_w)
       fastglmm(formula, data, family, weights = validation_wts,
-               wald.se = wald_se, nAGQ = nagq, REML = reml, anova_test = "Wald")
+               wald.se = wald_se, nAGQ = nagq, REML = reml,
+               satterthwaite = satterthwaite, anova_test = "Wald")
     else if (has_o)
       fastglmm(formula, data, family, offset = validation_off,
-               wald.se = wald_se, nAGQ = nagq, REML = reml, anova_test = "Wald")
+               wald.se = wald_se, nAGQ = nagq, REML = reml,
+               satterthwaite = satterthwaite, anova_test = "Wald")
     else
       fastglmm(formula, data, family, wald.se = wald_se, nAGQ = nagq, REML = reml,
-               anova_test = "Wald")
+               satterthwaite = satterthwaite, anova_test = "Wald")
   )
 }
 
@@ -232,10 +235,14 @@ fit_one <- function(cell) {
     # tryCatch, mirroring common.rs's catch_unwind scope -- a grid corner that
     # breaks the port anywhere in setup (a bad formula, an unsupported
     # family/link pair) is one failed cell, not a run-ending crash.
-    timed <- grid_time(env, function() do_fit(df, fml, fam, "hessian", k, reml))
-    fh <- timed$value
-    if (!is.null(timed$wall_seconds)) rec$wall_seconds <- timed$wall_seconds
-    rec$fits_per_sample <- timed$fits_per_sample
+    # The timed samples skip the Satterthwaite pass for the reason common.rs
+    # gives (the lme4 engine times plain `lmer`); the reported fit is a
+    # separate untimed one that keeps it, so its `coef_df` is recorded.
+    if (!is.null(env$timed)) {
+      timed <- grid_time(env, function() do_fit(df, fml, fam, "hessian", k, reml, FALSE))
+      rec$wall_seconds <- timed$wall_seconds
+    }
+    fh <- do_fit(df, fml, fam, "hessian", k, reml)
     if (gaussian) {
       rec$se_rx <- nums(fh$se)
     } else {

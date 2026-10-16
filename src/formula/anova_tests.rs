@@ -256,7 +256,7 @@ fn above_100_levels_with_rows_the_mixture_is_used_with_the_reason() {
     assert!(full.design_summary.is_some());
     let t = lr(&c);
     let reason = RlrtRefusal::TooManyLevels.reason();
-    assert!(reason.contains(&format!("more than {RLRT_MAX_LEVELS} levels")));
+    assert!(reason.contains(&format!("more than {RLRT_MAX_LEVELS} groups")));
     assert_eq!(t.reference, Reference::ChiBarSquared { df_low: 0 });
     assert_eq!(
         t.notes,
@@ -273,7 +273,7 @@ fn above_100_levels_with_rows_the_mixture_is_used_with_the_reason() {
     assert_eq!(
         c.note_lines()[0],
         format!(
-            "The exact restricted likelihood-ratio test cannot be computed: {reason}. \
+            "The exact restricted likelihood-ratio test was not computed: {reason}. \
              The 50:50 mixture is used."
         )
     );
@@ -973,16 +973,22 @@ fn an_explicit_test_on_an_f_table_is_refused() {
             &d,
             Family::Gaussian,
             DenDf::Satterthwaite,
-            "Satterthwaite's",
+            "a Gaussian mixed model are F tests",
         ),
         (
             "y ~ g * h + x",
             &d,
             Family::Gaussian,
             DenDf::Residual,
-            "the residual",
+            "this fit are F tests on the residual df",
         ),
-        ("y ~ x + grp", &g, gamma, DenDf::Residual, "the residual"),
+        (
+            "y ~ x + grp",
+            &g,
+            gamma,
+            DenDf::Residual,
+            "this fit are F tests on the residual df",
+        ),
     ];
     for (formula, table, family, den_df, df_words) in cases {
         let lo = lower(formula, table, family).unwrap();
@@ -1001,7 +1007,7 @@ fn an_explicit_test_on_an_f_table_is_refused() {
                 let e = term_tests(&lo, &fit, &term_options(ss_type, asked)).unwrap_err();
                 assert_eq!(e, TermTestError::FTable { asked, den_df }, "{at}");
                 let text = e.to_string();
-                let f_test = format!("F tests with {df_words} denominator df");
+                let f_test = format!("per-term tests on {df_words};");
                 assert!(text.contains(&f_test), "{at}: {text}");
                 assert!(text.contains(test_words), "{at}: {text}");
             }

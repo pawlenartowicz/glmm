@@ -908,18 +908,18 @@ fastglmm <- function(formula, data, family = gaussian(),
     # term as "<terms> | <grouping>" and `evals` its random-effect count
     # (src/orchestrate.rs); the rows are the fit's own.
     msg <- sprintf(paste(
-      "The term (%s) has %d random effects for %s, so its variance parameters are",
-      "probably not identifiable; lme4 stops on such a model by default. The estimates",
-      "are shown; read the variance components with care, or simplify the",
+      "The term (%s) has %d random effects for %s, so its variance parameters probably",
+      "cannot be estimated from these data; lme4 stops on such a model by default. The",
+      "estimates are shown; read the variance components with care, or simplify the",
       "random-effects structure."), note$detail, as.integer(note$evals), .count(nobs, "row"))
     cls <- c("fastglmm_few_rows_for_random_effects", "fastglmm_diagnostic")
   } else if (identical(note$kind, "variance_at_limit")) {
     msg <- paste(
       "A random-effect parameter reached the upper limit of the search (1000 on glmm's",
       "internal scale). On a Gaussian model this usually means the residual variance is",
-      "estimated at or near zero; on other families the random effect has no finite",
-      "estimate. The estimates sit at that limit, not at an optimum: check for a response",
-      "the predictors and groups explain exactly.")
+      "estimated at or near zero; on other families the random-effect variance has no",
+      "finite estimate. The estimates are at that limit, not at an optimum. Check for a",
+      "response that the predictors and groups explain exactly.")
     cls <- c("fastglmm_variance_at_limit", "fastglmm_diagnostic")
   } else if (identical(note$kind, "hessian_se_fallback")) {
     msg <- paste(

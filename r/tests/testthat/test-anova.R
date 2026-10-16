@@ -52,7 +52,8 @@ test_that("anova(m) is the stored Type III table, an anova data frame with no wr
   m$converged <- FALSE
   expect_identical(attr(anova(m), "heading")[2L], paste(
     "The fit did not converge, so its estimates are not at a maximum and these tests",
-    "are not reliable. Refit until the fit converges, then test again."))
+    "are not reliable. Change the model until it converges (a simpler random part often",
+    "helps), then test again."))
   # A fit saved by a version without these tests is refused by name.
   m$term_table_type3 <- NULL
   expect_error(anova(m), "this fit has no term_table_type3", fixed = TRUE)
@@ -73,7 +74,7 @@ test_that("anova(m) has the Wald chi-squared columns on a GLMM and the residual 
     "Type III Analysis of Deviance Table",
     'Wald chi-squared tests; test = "auto": binomial model with random effects'))
   expect_identical(attr(anova(m, test = "Wald"), "heading"),
-                   "Type III Analysis of Deviance Table (Wald \u03c7\u00b2 tests)")
+                   "Type III Analysis of Deviance Table (Wald chi-squared tests)")
   expect_identical(tab$Chisq, m$term_table_type3$statistic)
 
   o <- fastglmm(y ~ x + f, anova_data())
@@ -321,53 +322,58 @@ test_that("every refusal of anova(m0, m1) says why, and names compare() where it
   o0 <- fastglmm(y ~ x, d)
 
   expect_error(anova(reml0, reml1), paste(
-    "m0 and m1 are REML fits with different fixed effects, and REML fits with different",
-    "fixed effects cannot be compared by likelihood ratio. Use compare(data, f0, f1),",
-    "which fits both models by ML, or refit both with REML = FALSE."), fixed = TRUE)
+    "the two models are REML fits with different fixed effects; the REML likelihood",
+    "depends on the fixed effects, so a comparison needs ML fits. Fit both models by",
+    "maximum likelihood (ML). Pass REML = FALSE to both fits, or use compare(data, f0,",
+    "f1), which fits both by ML."), fixed = TRUE)
   expect_error(anova(reml0, ml1), paste(
-    "m0 was fitted by REML and m1 by ML. Fit both the same way, or use",
-    "compare(data, f0, f1)."), fixed = TRUE)
-  expect_error(anova(ml1, reml0), "m0 was fitted by ML and m1 by REML.", fixed = TRUE)
+    "the first model was fitted by REML and the second by ML; a comparison needs both",
+    "fitted the same way. Fit both models by maximum likelihood (ML), or both by REML",
+    "when their fixed parts are the same. Or use compare(data, f0, f1), which picks the",
+    "estimator itself."), fixed = TRUE)
+  expect_error(anova(ml1, reml0), "the first model was fitted by ML and the second by REML;",
+               fixed = TRUE)
 
   expect_error(anova(o0, fastglmm(y ~ x + z, d[-1, ])), paste(
-    "m0 has 320 rows and m1 has 319; a comparison needs both fits on the same rows.",
-    "Fit both models to the same rows, dropping the rows with a missing value in any",
-    "variable of either formula first. compare(data, f0, f1) does that and fits both",
-    "models in one call."), fixed = TRUE)
+    "the first model has 320 rows and the second has 319; a comparison needs both fits on",
+    "the same rows. Fit both models to the same rows, dropping the rows with a missing",
+    "value in any variable of either formula first. Or use compare(data, f0, f1), which",
+    "drops those rows once for both fits."), fixed = TRUE)
   d2 <- d
   d2$y[1L] <- d2$y[1L] + 1
   expect_error(anova(o0, fastglmm(y ~ x + z, d2)), paste(
-    "m0 and m1 have different responses y (the same row count, different values); a",
-    "comparison needs both fits on the same data. Fit both models to the same data.",
-    "compare(data, f0, f1) fits both models to one data set."), fixed = TRUE)
+    "the two models have different responses y (the same row count, different values);",
+    "a comparison needs both fits on the same data. Fit both models to the same data.",
+    "Or use compare(data, f0, f1), which fits both to the same data."), fixed = TRUE)
   expect_error(anova(o0, fastglmm(y ~ x + z, d, weights = rep(2, 320))), paste(
-    "m0 and m1 were fitted with different weights; a comparison needs the same weights",
-    "in both. Refit both models with the same weights. compare(data, f0, f1) takes the",
-    "weights once, for both models."), fixed = TRUE)
+    "the two models were fitted with different weights; a comparison needs the same",
+    "weights in both. Fit both models with the same weights. Or use compare(data, f0,",
+    "f1), which takes the weights once."), fixed = TRUE)
   expect_error(anova(o0, fastglmm(y ~ x + z, d, offset = d$z)), paste(
-    "m0 and m1 were fitted with different offsets; a comparison needs the same offset",
-    "in both. Refit both models with the same offset. compare(data, f0, f1) takes the",
-    "offset once, for both models."), fixed = TRUE)
+    "the two models were fitted with different offsets; a comparison needs the same",
+    "offset in both. Fit both models with the same offset. Or use compare(data, f0,",
+    "f1), which takes the offset once."), fixed = TRUE)
   b <- benchmark_data(seed = 323, family = "binomial")
   expect_error(anova(fastglmm(y ~ t, b, family = binomial()),
                      fastglmm(y ~ t + d, b, family = poisson())), paste(
-    "m0 was fitted as binomial with logit link and m1 as poisson with log link; a",
-    "comparison needs the same family and link in both. Refit both models with the",
-    "same family and link. compare(data, f0, f1) takes the family once, for both",
-    "models."), fixed = TRUE)
+    "the first model was fitted as binomial with logit link and the second as poisson",
+    "with log link; a comparison needs the same family and link in both. Fit both models",
+    "with the same family and link. Or use compare(data, f0, f1), which takes the family",
+    "and link once."), fixed = TRUE)
 
   # The refusals that need no pointer carry the crate's text unchanged.
   bad <- reml1
   bad$converged <- FALSE
-  expect_error(anova(reml0, bad), "m1 did not converge, so its log-likelihood is",
-               fixed = TRUE)
+  expect_error(anova(reml0, bad),
+               "the second model did not converge, so its log-likelihood is", fixed = TRUE)
   set.seed(324)
   gd <- data.frame(x = rnorm(200))
   gd$y <- rgamma(200, shape = 3, rate = 3 / exp(0.2 + 0.4 * gd$x))
   gd$z <- rnorm(200)
   expect_error(anova(fastglmm(y ~ x, gd, family = "gamma", dispersion = 0.5),
                      fastglmm(y ~ x + z, gd, family = "gamma")),
-               "m0 holds the dispersion at 0.5 and m1 does not hold the dispersion",
+               paste("the first model holds the dispersion at 0.5 and the second does not",
+                     "hold the dispersion"),
                fixed = TRUE)
   d$y2 <- d$y
   expect_error(anova(o0, fastglmm(y2 ~ x + z, d)),
@@ -377,11 +383,12 @@ test_that("every refusal of anova(m0, m1) says why, and names compare() where it
                "neither formula is nested in the other", fixed = TRUE)
   # The crate's text as it is, with nothing appended.
   expect_identical(tryCatch(anova(o0, o0), error = conditionMessage),
-                   paste("m0 and m1 have the same fixed and random parts, so there is nothing",
-                         "to test. Compare two models that differ by at least one parameter."))
+                   paste("the two models have the same fixed and random parts, so there is",
+                         "nothing to test. Compare two models that differ by at least one",
+                         "parameter."))
   broken <- o0
   broken$formula <- "y ~ (x"
-  expect_error(anova(broken, fastglmm(y ~ x + z, d)), "m0's formula does not parse",
+  expect_error(anova(broken, fastglmm(y ~ x + z, d)), "the first model's formula does not parse",
                fixed = TRUE)
 })
 
@@ -485,7 +492,7 @@ test_that("test picks the stored table: auto and Wald the Wald table, LRT the li
       sprintf("Type %s Analysis of Deviance Table", type),
       'Wald chi-squared tests; test = "auto": binomial model with random effects'))
     expect_identical(attr(wald, "heading"),
-                     sprintf("Type %s Analysis of Deviance Table (Wald \u03c7\u00b2 tests)", type))
+                     sprintf("Type %s Analysis of Deviance Table (Wald chi-squared tests)", type))
     lrt <- anova(m_lrt, type = type, test = "LRT")
     stored <- m_lrt[[if (type == "III") "term_table_type3_lrt" else "term_table_type2_lrt"]]
     expect_identical(class(lrt), c("anova", "data.frame"))
@@ -536,12 +543,13 @@ test_that("the heading names the likelihood-ratio test and why; Wald keeps its h
     paste("Likelihood-ratio chi-squared tests (each term's model refitted without it);",
           'test = "LRT"')))
   expect_identical(attr(anova(m_lrt, test = "Wald"), "heading"),
-                   "Type III Analysis of Deviance Table (Wald χ² tests)")
+                   "Type III Analysis of Deviance Table (Wald chi-squared tests)")
   # A fit that did not converge says so first, then the table's own notes.
   m_lrt$converged <- FALSE
   expect_identical(attr(anova(m_lrt, test = "LRT"), "heading")[3L], paste(
     "The fit did not converge, so its estimates are not at a maximum and these tests",
-    "are not reliable. Refit until the fit converges, then test again."))
+    "are not reliable. Change the model until it converges (a simpler random part often",
+    "helps), then test again."))
   # A stored refusal is an error with its own text.
   m_lrt$term_table_type2_lrt <- list(error = "internal error while building the per-term table")
   expect_error(anova(m_lrt, type = "II", test = "LRT"),
@@ -552,8 +560,8 @@ test_that("Wald or LRT on a fit with F rows is an error naming its F test; the f
   d <- anova_data()
   lmm <- fastglmm(y ~ x * f + (1 | g), d, anova_test = "LRT")
   expect_true(lmm$converged)
-  satt <- "per-term tests on this fit are F tests with Satterthwaite's denominator df; "
-  advice <- "rows are not available, so leave the test at its default"
+  satt <- "per-term tests on a Gaussian mixed model are F tests; "
+  advice <- "rows are not available, so leave the test at its default."
   expect_error(anova(lmm, test = "Wald"), paste0(satt, "Wald chi-squared ", advice),
                fixed = TRUE)
   expect_error(anova(lmm, type = "II", test = "LRT"),
@@ -563,7 +571,7 @@ test_that("Wald or LRT on a fit with F rows is an error naming its F test; the f
   expect_identical(anova(lmm, test = "auto"), anova(fastglmm(y ~ x * f + (1 | g), d)))
   ols <- fastglmm(y ~ x + f, d)
   expect_error(anova(ols, test = "LRT"), paste0(
-    "per-term tests on this fit are F tests with the residual denominator df; ",
+    "per-term tests on this fit are F tests on the residual df; ",
     "likelihood-ratio ", advice), fixed = TRUE)
 })
 
@@ -601,7 +609,7 @@ test_that("auto gives a Poisson GLMM the likelihood-ratio table, under its own h
     # The Wald table is the same whatever the fit stored.
     wald <- anova(fits$Wald, type = type, test = "Wald")
     expect_identical(attr(wald, "heading"),
-                     sprintf("Type %s Analysis of Deviance Table (Wald \u03c7\u00b2 tests)", type))
+                     sprintf("Type %s Analysis of Deviance Table (Wald chi-squared tests)", type))
     expect_identical(anova(fits$auto, type = type, test = "Wald"), wald)
     expect_identical(anova(fits$LRT, type = type, test = "Wald"), wald)
   }
@@ -634,7 +642,7 @@ test_that("auto on a Poisson GLMM fitted with anova_test = \"Wald\" says so", {
 test_that("auto names the Wald test and the reason on every other chi-squared fit", {
   d <- benchmark_data(seed = 323, family = "poisson")
   d$pos <- exp(0.3 * d$t + 0.2 * d$d + rnorm(nrow(d), sd = 0.3))
-  other <- "model with random effects, not binomial, Poisson or negative binomial"
+  other <- "Gamma model with random effects"
   cases <- list(
     list(fastglmm(y ~ t * d + (1 | g), d, family = "negativebinomial"),
          "negative_binomial_mixed", "negative binomial model with random effects"),

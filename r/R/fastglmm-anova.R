@@ -152,7 +152,7 @@ anova.fastglmm <- function(object, ..., type = c("III", "II"), test = c("auto", 
   for (fit in fits) .check_fields(fit, c("objective", "link", "rss"))
   res <- fastglmm_anova_pair(.compare_side(fits[[1L]]), .compare_side(fits[[2L]]),
                              .optional(nsim), .optional(seed))
-  if (!is.null(res$refusal)) stop(.pair_refusal(res, fits[[1L]], fits[[2L]]), call. = FALSE)
+  if (!is.null(res$refusal)) stop(.pair_refusal(res), call. = FALSE)
   .comparison_table(res$comparison, c("m0", "m1"), fits, res$nsim, res$seed, NULL)
 }
 
@@ -337,7 +337,7 @@ print.fastglmm_comparison <- function(x, ...) {
   poisson_mixed = "Poisson model with random effects",
   binomial_mixed = "binomial model with random effects",
   negative_binomial_mixed = "negative binomial model with random effects",
-  other_mixed = "model with random effects, not binomial, Poisson or negative binomial",
+  other_mixed = "Gamma model with random effects",
   no_random_effects = "model without random effects")
 
 # The first note of a fit that did not converge. Mirrors the Python port's
@@ -345,7 +345,8 @@ print.fastglmm_comparison <- function(x, ...) {
 # together.
 .NOT_CONVERGED <- paste(
   "The fit did not converge, so its estimates are not at a maximum and these tests",
-  "are not reliable. Refit until the fit converges, then test again.")
+  "are not reliable. Change the model until it converges (a simpler random part often",
+  "helps), then test again.")
 
 # Stops on a fit made by a fastglmm version without these tests, naming the
 # fields it lacks.
@@ -439,7 +440,7 @@ print.fastglmm_comparison <- function(x, ...) {
     }
     c("Analysis of Deviance Table", paste0(line, "; ", why))
   } else if (!f_rows) {
-    "Analysis of Deviance Table (Wald \u03c7\u00b2 tests)"
+    "Analysis of Deviance Table (Wald chi-squared tests)"
   } else if (satterthwaite) {
     "Analysis of Variance Table with Satterthwaite's method"
   } else {
@@ -499,27 +500,21 @@ print.fastglmm_comparison <- function(x, ...) {
 }
 
 # The message of a refusal of anova(m0, m1). The crate's text says what is
-# wrong in words common to both ports; for the refusals compare() avoids,
-# this port names its own call. The two estimator refusals are worded as
-# AIC()'s (.check_ic_fits).
-.pair_refusal <- function(res, m0, m1) {
-  estimator <- function(fit) if (isTRUE(fit$reml)) "REML" else "ML"
-  switch(res$kind,
-    mixed_estimators = sprintf(paste(
-      "m0 was fitted by %s and m1 by %s. Fit both the same way, or use",
-      "compare(data, f0, f1)."), estimator(m0), estimator(m1)),
+# wrong in words common to both ports; the seven refusals compare() avoids
+# gain this port's pointer to it (and to REML = FALSE), in the Python port's
+# words with this port's call.
+.pair_refusal <- function(res) {
+  paste(c(res$refusal, switch(res$kind,
+    different_rows = "Or use compare(data, f0, f1), which drops those rows once for both fits.",
+    different_y = "Or use compare(data, f0, f1), which fits both to the same data.",
+    different_weights = "Or use compare(data, f0, f1), which takes the weights once.",
+    different_offset = "Or use compare(data, f0, f1), which takes the offset once.",
+    different_family = "Or use compare(data, f0, f1), which takes the family and link once.",
+    mixed_estimators = "Or use compare(data, f0, f1), which picks the estimator itself.",
     reml_different_fixed = paste(
-      "m0 and m1 are REML fits with different fixed effects, and REML fits with different",
-      "fixed effects cannot be compared by likelihood ratio. Use compare(data, f0, f1),",
-      "which fits both models by ML, or refit both with REML = FALSE."),
-    paste(c(res$refusal, switch(res$kind,
-      different_rows = "compare(data, f0, f1) does that and fits both models in one call.",
-      different_y = "compare(data, f0, f1) fits both models to one data set.",
-      different_weights = "compare(data, f0, f1) takes the weights once, for both models.",
-      different_offset = "compare(data, f0, f1) takes the offset once, for both models.",
-      different_family = "compare(data, f0, f1) takes the family once, for both models.",
-      NULL)), collapse = " ")
-  )
+      "Pass REML = FALSE to both fits, or use compare(data, f0, f1), which fits both",
+      "by ML."),
+    NULL)), collapse = " ")
 }
 
 # The comparison table from fastglmm_anova_pair's or fastglmm_compare's

@@ -295,13 +295,14 @@ fn a_side_that_did_not_converge_refuses() {
             m1: true
         }
     );
-    assert!(e.to_string().starts_with("m1 did not converge"), "{e}");
-    m0ml.converged = false;
-    let e = refusal(&m0ml, &m1);
     assert!(
-        e.to_string().starts_with("m0 and m1 did not converge"),
+        e.to_string()
+            .starts_with("the second model did not converge"),
         "{e}"
     );
+    m0ml.converged = false;
+    let e = refusal(&m0ml, &m1);
+    assert!(e.to_string().starts_with("neither model converged"), "{e}");
     // Checked first: before the estimator check that this pair also fails.
     let e = refusal(&m0, &m1);
     assert_eq!(
@@ -323,9 +324,9 @@ fn different_row_counts_refuse() {
     assert_eq!(e, CompareError::DifferentRows { m0: 30, m1: 29 });
     assert_eq!(
         e.to_string(),
-        "m0 has 30 rows and m1 has 29; a comparison needs both fits on the same rows. \
-         Fit both models to the same rows, dropping the rows with a missing value in any \
-         variable of either formula first."
+        "the first model has 30 rows and the second has 29; a comparison needs both fits \
+         on the same rows. Fit both models to the same rows, dropping the rows with a \
+         missing value in any variable of either formula first."
     );
 }
 
@@ -338,8 +339,9 @@ fn a_response_differing_in_one_entry_refuses() {
     assert_eq!(e, CompareError::DifferentY);
     assert_eq!(
         e.to_string(),
-        "m0 and m1 have different responses y (the same row count, different values); a \
-         comparison needs both fits on the same data. Fit both models to the same data."
+        "the two models have different responses y (the same row count, different \
+         values); a comparison needs both fits on the same data. Fit both models to the \
+         same data."
     );
 }
 
@@ -357,8 +359,8 @@ fn different_weights_refuse() {
     assert_eq!(e, CompareError::DifferentWeights);
     assert_eq!(
         e.to_string(),
-        "m0 and m1 were fitted with different weights; a comparison needs the same weights \
-         in both. Refit both models with the same weights."
+        "the two models were fitted with different weights; a comparison needs the same \
+         weights in both. Fit both models with the same weights."
     );
 }
 
@@ -375,8 +377,8 @@ fn different_offsets_refuse() {
     assert_eq!(e, CompareError::DifferentOffset);
     assert_eq!(
         e.to_string(),
-        "m0 and m1 were fitted with different offsets; a comparison needs the same offset \
-         in both. Refit both models with the same offset."
+        "the two models were fitted with different offsets; a comparison needs the same \
+         offset in both. Fit both models with the same offset."
     );
 }
 
@@ -391,9 +393,9 @@ fn a_different_family_or_link_refuses() {
     assert!(matches!(e, CompareError::DifferentFamily { .. }), "{e:?}");
     assert_eq!(
         e.to_string(),
-        "m0 was fitted as gaussian with identity link and m1 as poisson with log link; a \
-         comparison needs the same family and link in both. Refit both models with the same \
-         family and link."
+        "the first model was fitted as gaussian with identity link and the second as \
+         poisson with log link; a comparison needs the same family and link in both. Fit \
+         both models with the same family and link."
     );
 }
 
@@ -441,14 +443,14 @@ fn one_reml_fit_and_one_ml_fit_refuse() {
     assert_eq!(e, CompareError::MixedEstimators { reml: Side::First });
     assert_eq!(
         e.to_string(),
-        "m0 was fitted by REML and m1 by ML; a comparison needs both fitted the same way. \
-         Refit both models by maximum likelihood (ML), or both by REML when their fixed \
-         parts are the same."
+        "the first model was fitted by REML and the second by ML; a comparison needs both \
+         fitted the same way. Fit both models by maximum likelihood (ML), or both by REML \
+         when their fixed parts are the same."
     );
     let e = refusal(&ml, &reml);
     assert!(
         e.to_string()
-            .starts_with("m0 was fitted by ML and m1 by REML;"),
+            .starts_with("the first model was fitted by ML and the second by REML;"),
         "{e}"
     );
 }
@@ -471,9 +473,9 @@ fn two_reml_fits_with_different_fixed_parts_refuse() {
     assert_eq!(e, CompareError::RemlDifferentFixed);
     assert_eq!(
         e.to_string(),
-        "m0 and m1 are REML fits with different fixed effects, and REML fits with \
-         different fixed effects cannot be compared by likelihood ratio. Refit both \
-         models by maximum likelihood (ML)."
+        "the two models are REML fits with different fixed effects; the REML likelihood \
+         depends on the fixed effects, so a comparison needs ML fits. Fit both models by \
+         maximum likelihood (ML)."
     );
     // Both parts differing is a different fixed part too.
     let m1 = model("y ~ x + z + (1 + x | g)", None);
@@ -528,9 +530,9 @@ fn the_same_parameter_count_has_nothing_to_test() {
     assert_eq!(
         e.to_string(),
         format!(
-            "m0 and m1 have the same number of parameters ({}), so there is nothing to test: \
-             the larger formula adds no parameter to the smaller one. Compare two models that \
-             differ by at least one parameter.",
+            "the two models have the same number of parameters ({}), so there is nothing to \
+             test: the larger formula adds no parameter to the smaller one. Compare two models \
+             that differ by at least one parameter.",
             m0.df
         )
     );
@@ -568,8 +570,8 @@ fn one_formula_on_both_sides_has_the_same_parts_whatever_the_parameter_counts() 
         assert_eq!(e, CompareError::SameParts);
         assert_eq!(
             e.to_string(),
-            "m0 and m1 have the same fixed and random parts, so there is nothing to test. \
-             Compare two models that differ by at least one parameter."
+            "the two models have the same fixed and random parts, so there is nothing to \
+             test. Compare two models that differ by at least one parameter."
         );
         m1.df += 1;
     }
@@ -865,9 +867,10 @@ fn a_raw_statistic_below_zero_is_floored_with_a_note_naming_the_larger_fit() {
     let t = lr(&c);
     assert_eq!((t.statistic, t.p_value), (0.0, 1.0));
     assert_eq!(t.notes, vec![LrNote::NegativeStatistic { raw }, MIXTURE]);
-    assert!(c.note_lines()[0].starts_with("m1, the larger model, did not reach its optimum"));
+    let negative = "The larger model did not reach its optimum";
+    assert!(c.note_lines()[0].starts_with(negative));
     let back = compare(&large, &small, &opts()).unwrap();
-    assert!(back.note_lines()[0].starts_with("m0, the larger model,"));
+    assert!(back.note_lines()[0].starts_with(negative));
     // Within round-off: the floor, with no note.
     large.loglik = small.loglik - 1e-5;
     let t = lr(&cmp(&small, &large).unwrap()).clone();
@@ -1043,7 +1046,11 @@ fn a_failed_fit_gives_nan_even_with_the_dropped_variance_at_zero() {
                 assert!(t.p_value.is_nan(), "{what}: {t:?}");
                 assert_eq!(t.reference, finite.reference, "{what}");
                 assert_eq!(t.notes, vec![LrNote::NonFiniteLoglik], "{what}");
-                let side = if on_larger { "m1" } else { "m0" };
+                let side = if on_larger {
+                    "the larger model"
+                } else {
+                    "the smaller model"
+                };
                 assert_eq!(
                     c.note_lines(),
                     vec![format!(

@@ -6,7 +6,7 @@ All notable changes to the `glmm` crate are recorded here. Format follows
 The Python package (`glmm` on PyPI) is versioned in lockstep with the crate and
 shares these entries; Python-specific notes are called out where they differ.
 
-## [Unreleased]
+## [0.6.0] — 2026-10-16
 
 ### Added
 
@@ -144,10 +144,10 @@ shares these entries; Python-specific notes are called out where they differ.
     treatment coding. Type II uses lmerTest's `XᵀX` metric on Gaussian mixed
     models and car's covariance metric on OLS, GLMs, GLMMs and the dispersion
     GLMs (on OLS without weights the two agree). Both tables are built after
-    every fit by
-    `orchestrate::run_fit` and stored on the fit (`FitResult::term_table_type3`
-    and `term_table_type2`; Python `Fit.term_table_type3` / `type2`, R
-    `$term_table_type3` / `$term_table_type2`), so the call computes nothing.
+    every fit by `orchestrate::run_fit` and stored on the fit
+    (`FitResult::term_table_type3` and `term_table_type2`; Python
+    `Fit.term_table_type3` / `type2`, R `$term_table_type3` /
+    `$term_table_type2`), so the call computes nothing.
     A formula whose interaction lacks a marginal term is fitted as before
     but gets no table: `anova(m)` stops with the reason. A Type III table on
     a design with an empty cell carries lmerTest's "Missing cells" note.
@@ -158,9 +158,8 @@ shares these entries; Python-specific notes are called out where they differ.
     random effects, never the data's size: a Poisson model with random
     effects gets the likelihood-ratio rows, every other fit its
     Wald χ² or F rows. Under `"auto"` every χ² table's heading has a second
-    line naming the test and the reason (for example `Wald chi-squared tests;
-    test = "auto": binomial model with random effects`); an explicit
-    `"Wald"` keeps the one-line heading. A likelihood-ratio row compares the
+    line that names the test and the reason; an explicit `"Wald"` keeps the
+    one-line heading. A likelihood-ratio row compares the
     fit with the model refitted under the term's hypothesis, from the fit's
     estimates and with its own settings: Type III on the reduced design of
     the hypothesis the Wald row tests (afex's `mixed(method = "LRT")` on a
@@ -248,20 +247,18 @@ shares these entries; Python-specific notes are called out where they differ.
   `TermTest::{Auto, Wald, Lrt}`, `TestChoice` and `ChoiceReason` (on
   `TermTable::choice`), `SsType`, `TermTestError` (with `FTable` and
   `RefitNodeCount`), `Side`, `Differs` and `Nesting`; `inference::{LrTest,
-  LrNote, LinearTest, LinearKind, LinearNote, Reference, DenDf,
-  Objective}`, with
-  `LinearKind::LikelihoodRatio` and the likelihood-ratio row notes
+  LrNote, LinearTest, LinearKind, LinearNote, Reference, DenDf, Objective}`,
+  with `LinearKind::LikelihoodRatio` and the likelihood-ratio row notes
   `LinearNote::{ReducedNotConverged, RandomSlopeColumn, NegativeStatistic}`;
   and, under `orchestrate`, `run_compare`, `CompareResult`, `compare_options`,
   `DEFAULT_SEED`, `DEFAULT_NSIM` and `MAX_NSIM`. `orchestrate::run_fit`
   takes a trailing `anova_test: &str` (`"auto"`, `"Wald"` or `"LRT"`).
-  `TermTable` and `ModelInfo` carry the
-  fit's `coef_names`, one per fixed-effect column, and a note on an aliased
-  column names the coefficient, never an index: "The coefficient x2 is
-  aliased, so the hypothesis was not tested." (the ports print it after the
-  row label, "x2: The coefficient x2 is aliased, ..."). `compare` refuses a
-  `Model` whose `re_groups` does not match its `varcorr`
-  (`CompareError::ReGroups`).
+  `TermTable` and `ModelInfo` carry the fit's `coef_names`, one per
+  fixed-effect column, and a note on an aliased column names the coefficient,
+  never an index: "The coefficient x2 is aliased, so the hypothesis was not
+  tested." (the ports print it after the row label, "x2: The coefficient x2 is
+  aliased, ..."). `compare` refuses a `Model` whose `re_groups` does not match
+  its `varcorr` (`CompareError::ReGroups`).
 - **`Fit::nobs` and `Fit::objective`**: the row count the fit was given (on
   every route, a non-converged fit included) and what it maximised
   (`Objective::{LeastSquares, MaximumLikelihood, Reml, Laplace, Agq { nodes }}`).
@@ -387,8 +384,9 @@ shares these entries; Python-specific notes are called out where they differ.
   if the `+` were absent, from a Python formula string and from the Rust
   parser (`formula::parse`); an R formula object cannot end in `+`.
 - **The `^` crossing operator is refused with an error that names it**
-  (`ParseError::Syntax`): "the crossing operator '^' is not supported: write
-  the terms out (for example (a + b)^2 as a + b + a:b)". A formula such as
+  (`ParseError::Syntax`): "'^' is accepted only in I(x^k), a power of one
+  column; to cross terms, write them out (for example (a + b)^2 as
+  a + b + a:b)". A formula such as
   `y ~ (a + b + c)^2` failed with "expected identifier, got '(a'". `I(x^k)`
   is unchanged.
 - **A fit with no more rows than a term's random effects now warns** (fewer

@@ -59,7 +59,7 @@ Variance Table with Satterthwaite's method", or "Type III Analysis of
 Variance Table" on an OLS fit or a GLM with φ estimated. A χ² table's heading
 is "Type III Analysis of Deviance Table" with a second line naming the test
 and why it ran (below), or the one line "Type III Analysis of Deviance Table
-(Wald χ² tests)" when `test = "Wald"` was asked for.
+(Wald chi-squared tests)" when `test = "Wald"` was asked for.
 Each row's reference distribution follows from its own df columns, `F(NumDF,
 DenDF)` or `χ²(Df)`, so the table carries no separate reference column (R's
 `print.anova` would print a text column as codes). Python's html, latex and
@@ -107,8 +107,9 @@ note naming each aliased column (lmerTest moves such a row last).
 its marginal terms (`y ~ x + x:g` lacks `g`) is fitted as usual, but gets no
 table: `anova(m)` stops (Python: `ValueError`) with "per-term tests need every
 marginal term of each interaction in the formula; it lacks `g` (a margin of
-`x:g`)". Both constructions assume the margins are present; without them the
-rows would test hypotheses that depend on the coding. Add the missing terms.
+`x:g`). Add the missing terms." Both constructions assume the margins are
+present; without them the rows would test hypotheses that depend on the
+coding. Add the missing terms.
 
 A Gaussian mixed model fitted with `satterthwaite = FALSE` (Python
 `satterthwaite=False`), or one whose Satterthwaite pass failed, has no
@@ -184,13 +185,12 @@ Deviance Table" ("Type II …" with `type = "II"`); the second line is:
   "auto": Poisson model with random effects`;
 - `test = "auto"` on any other fit with χ² rows: `Wald chi-squared tests;
   test = "auto": ` and the reason, one of "binomial model with random
-  effects", "negative binomial model with random effects", "model with random
-  effects, not binomial, Poisson or negative binomial" and "model without
-  random effects";
+  effects", "negative binomial model with random effects", "Gamma model with
+  random effects" and "model without random effects";
 - `test = "LRT"`: `Likelihood-ratio chi-squared tests (each term's model
   refitted without it) on the reduced design; test = "LRT"`;
 - `test = "Wald"`: none; the heading is the one line "Type III Analysis of
-  Deviance Table (Wald χ² tests)".
+  Deviance Table (Wald chi-squared tests)".
 
 A Type II likelihood-ratio heading has no " on the reduced design". Each
 second line is one line of text, wrapped here. Python's html, latex and typst
@@ -260,8 +260,8 @@ tables: `anova()` of a Poisson GLMM it fitted (`cmp$fit1`, Python
 **Simulations: name the test in both calls.** `"auto"` reads only the family
 and whether the model has random effects, so one model gets the same test at
 every sample size. A simulation that fits more than one kind of model (a
-power analysis such as MCPower's over Poisson and binomial GLMMs, or a GLMM
-against its GLM) gets likelihood-ratio rows for some models and Wald rows for
+power analysis over Poisson and binomial GLMMs, or a GLMM against its GLM)
+gets likelihood-ratio rows for some models and Wald rows for
 others, under the same column names. To keep one test, name it at fit time
 and in `anova()`: `anova_test = "Wald"` with `test = "Wald"` (no refits, the
 fastest), or `anova_test = "LRT"` with `test = "LRT"`.
@@ -402,8 +402,8 @@ model and 0 the smaller (whatever the argument order), as lme4 floors it.
 `Δnpar` is the difference of the parameter counts (`npar`, the AIC count).
 
 - **A raw value below zero** beyond round-off (`8e-5`) means the larger fit
-  did not reach its optimum. The statistic is still 0, and a note names that
-  fit, shows the raw value and says to refit it.
+  did not reach its optimum. The statistic is still 0, and a note says so and
+  shows the raw value.
 - **A dropped component at exactly zero.** When the random parts alone differ
   and every variance the smaller model drops is exactly 0 in the larger fit
   (the fit pinned it on the boundary), the larger optimum lies in the smaller
@@ -413,7 +413,7 @@ model and 0 the smaller (whatever the argument order), as lme4 floors it.
   at ±1 with a non-zero slope variance is not this case.
 - **A failed fit never reads as p = 1.** A log-likelihood that is NaN or `−∞`
   on either side makes the statistic and the p-value NaN, with one note naming
-  the side; the notes about the quality of the p-value are dropped then.
+  the model; the notes about the quality of the p-value are dropped then.
 
 ### The reference: the boundary rule
 
@@ -607,9 +607,8 @@ that showed:
   the 72 count designs is Wald closer to nominal than the likelihood-ratio
   test by more than twice the Monte Carlo standard error, and the
   likelihood-ratio test is closer in 48. The gap is large at few clusters
-  (above), still there at
-  `K = 50` (the likelihood-ratio test closer in 17 of the 36 count designs
-  with `K ≥ 50`; Wald differs from the likelihood-ratio test by up to 0.014,
+  (above), still there at `K = 50` (the likelihood-ratio test closer in 17 of
+  the 36 count designs with `K ≥ 50`; Wald differs from the likelihood-ratio test by up to 0.014,
   mostly on the conservative side: the Type III row of `group` on
   `k50_m3_pois034_rdi` rejects 0.031 under Wald, 0.045 under the
   likelihood-ratio test), and by about 0.01 at most at `K ≥ 100` (0.011, the
@@ -687,10 +686,10 @@ full texts are in [`warnings.md`](warnings.md#test-and-comparison-errors).
 
 | Refusal | Fix |
 |---|---|
-| a fit did not converge | refit until it converges (a simpler random part often helps) |
+| a fit did not converge | change the model until it converges (a simpler random part often helps) |
 | different row counts, responses, weights or offsets | fit both models to the same rows; `compare(data, f0, f1)` drops missing rows once for both |
-| different families or links | refit both with the same family and link, or use `compare()`, which takes them once |
-| different held dispersions | refit both with the same `dispersion` argument (`compare()` cannot hold the dispersion) |
+| different families or links | fit both with the same family and link, or use `compare()`, which takes them once |
+| different held dispersions | fit both with the same held dispersion (`compare()` cannot hold the dispersion) |
 | different responses, or neither formula nested in the other | compare two nested models of the same response (two non-nested models can be compared by AIC and BIC) |
 | one REML fit and one ML fit | fit both the same way, or use `compare()`, which picks the estimator |
 | two REML fits with different fixed parts | `compare()`, which fits both by ML, or refit both with `REML = FALSE` (`reml=False`) |
@@ -716,20 +715,20 @@ A note about one row is printed after that row's label, for example
 | The coefficient `<name>` is aliased, so the hypothesis was not tested. | a term with an aliased column (NaN row), one note per aliased coefficient, named as in the fit's coefficient names |
 | No denominator df (`<reason>`), so the hypothesis was not tested. | an F row with no df: Satterthwaite switched off or failed |
 | The `<rows>` tested coefficients span `<rank>` directions of their covariance; the F is on those `<rank>`. | a rank-deficient hypothesis |
-| The model refitted for this term's likelihood-ratio test did not converge, so the statistic and its p-value are NaN. | a likelihood-ratio row whose refit did not converge, or whose log-likelihood is not finite |
+| A model refitted for this term's likelihood-ratio test did not converge, or its log-likelihood is not finite, so the statistic and its p-value are NaN. | a likelihood-ratio row whose refit did not converge, or whose log-likelihood is not finite |
 | Likelihood-ratio test not available: the term's column carries a random slope, so the row is the Wald chi-squared test. | a likelihood-ratio table's row for a term with a random slope |
-| The model refitted under the term's hypothesis reached a higher log-likelihood than the larger model, by more than round-off, so the statistic is set to 0: the larger model's fit did not reach its optimum; refit it. | a likelihood-ratio row whose statistic came out below zero |
-| The fit did not converge, so no model was refitted and the likelihood-ratio statistics are NaN. | a likelihood-ratio table of a fit that did not converge (after the first note) |
-| The model under the hypothesis of `<term>` could not be built (the hypothesis is too ill-conditioned), so its likelihood-ratio statistic is NaN. | a Type III likelihood-ratio row whose reduced design could not be built |
+| The model refitted under the term's hypothesis reached a higher log-likelihood than the larger model of this row, by more than round-off: the larger model did not reach its optimum. The statistic is set to 0. | a likelihood-ratio row whose statistic came out below zero |
+| No model was refitted, so every likelihood-ratio statistic and p-value is NaN. | a likelihood-ratio table of a fit that did not converge (after the first note) |
+| The model under the hypothesis of `<term>` could not be built (the hypothesis is too ill-conditioned), so its statistic and its p-value are NaN. | a Type III likelihood-ratio row whose reduced design could not be built |
 | Conservative: the true p-value is usually smaller. | every 50:50 mixture reference |
 | Derived for one variance component at zero with every other parameter away from its boundary; with other groupings or components at zero it is approximate. | a mixture reference with other groupings or components at zero |
 | The random parts differ by more than one dimension: the chi-squared reference ignores the boundary; conservative. | χ²(Δnpar) on random parts more than one dimension apart |
-| The exact restricted likelihood-ratio test needs the larger model to be a Gaussian REML fit whose only random term is one unweighted (1 \| g) … so the 50:50 mixture is used. | a one-dimension REML pair outside the exact test's envelope |
-| The exact restricted likelihood-ratio test cannot be computed: `<reason>`. The 50:50 mixture is used. | the grouping has more than 100 levels with rows, the design leaves no residual df, or the fixed effects absorb the grouping |
-| `<side>`, the larger model, did not reach its optimum: … The statistic is set to 0; refit `<side>`. | a raw statistic below zero beyond round-off |
+| The exact restricted likelihood-ratio test needs a summary of the larger model's design. … This fit keeps none, so the 50:50 mixture is used. | a one-dimension REML pair outside the exact test's envelope |
+| The exact restricted likelihood-ratio test was not computed: `<reason>`. The 50:50 mixture is used. | the grouping has more than 100 levels with rows, the design leaves no residual df, or the fixed effects absorb the grouping |
+| The larger model did not reach its optimum: … The statistic is set to 0. | a raw statistic below zero beyond round-off |
 | The two fits use different quadrature node counts, … | two GLMM fits with different `nAGQ` |
 | The Wald F cannot be formed from the two fits' coefficients: … The likelihood-ratio test is used, with an asymptotic chi-squared reference. | a dispersion-GLM pair whose coefficient names do not nest |
-| The log-likelihood of `<side>` is not finite (a fit that failed or collapsed), so the statistic and its p-value are NaN. | a NaN or infinite log-likelihood |
+| The log-likelihood of `<the smaller model \| the larger model \| both models>` is not finite (a fit that failed or collapsed), so the statistic and its p-value are NaN. | a NaN or infinite log-likelihood |
 | Both models were fitted by ML because their fixed parts differ. | `compare()` on a Gaussian pair whose fixed parts differ (not two OLS fits) |
 
 ## From Rust

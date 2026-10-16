@@ -59,8 +59,9 @@ test_that("the crossing operator ^ errors with the Python port's message", {
   # R's own parser refuses a formula ending in `+`, so only `^` is tested here.
   d <- transform(err_data(), a = x, b = s, c = f)
   expect_error(fastglmm(y ~ (a + b + c)^2 + (1 | g), d),
-               paste("formula syntax error at position 15: the crossing operator '^' is not",
-                     "supported: write the terms out (for example (a + b)^2 as a + b + a:b)"),
+               paste("formula syntax error at position 15: '^' is accepted only in I(x^k), a",
+                     "power of one column; to cross terms, write them out (for example",
+                     "(a + b)^2 as a + b + a:b)"),
                fixed = TRUE)
 })
 

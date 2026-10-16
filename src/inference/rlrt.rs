@@ -97,7 +97,7 @@ impl RlrtRefusal {
                 "the design summary is not one a fit gives (sizes that disagree, a non-finite entry, a count that is not a row count, an X'X that is not positive definite, or more nonzero eigenvalues than n - p)"
             }
             Self::TooManyLevels => {
-                "the grouping factor has more than 100 levels with rows, where the exact null is close to the 50:50 mixture and costs more to simulate than it gains"
+                "the grouping factor has more than 100 groups (levels with rows); there the exact test is close to the 50:50 mixture and takes more time than it gains"
             }
         }
     }

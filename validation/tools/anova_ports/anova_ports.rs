@@ -252,7 +252,8 @@ const TERM_CALLS: &[TermCall] = &[
 const LRT_LINE: &str = "Likelihood-ratio chi-squared tests (each term's model refitted without it)";
 const WALD_LINE: &str = "Wald chi-squared tests";
 const NOT_CONVERGED: &str = "The fit did not converge, so its estimates are not at a maximum \
-     and these tests are not reliable. Refit until the fit converges, then test again.";
+     and these tests are not reliable. Change the model until it converges (a simpler random \
+     part often helps), then test again.";
 /// Why `"auto"` gave a chi-squared table its test, by the fit's
 /// `term_test_auto` reason (the ports' `_AUTO_REASONS` and `.AUTO_REASONS`).
 const AUTO_REASONS: &[(&str, &str)] = &[
@@ -262,10 +263,7 @@ const AUTO_REASONS: &[(&str, &str)] = &[
         "negative_binomial_mixed",
         "negative binomial model with random effects",
     ),
-    (
-        "other_mixed",
-        "model with random effects, not binomial, Poisson or negative binomial",
-    ),
+    ("other_mixed", "Gamma model with random effects"),
     ("no_random_effects", "model without random effects"),
 ];
 
@@ -738,7 +736,7 @@ fn heading(
         lines.push(format!("{line}; {why}"));
     } else {
         lines.push(format!(
-            "Type {ss} Analysis of Deviance Table (Wald χ² tests)"
+            "Type {ss} Analysis of Deviance Table (Wald chi-squared tests)"
         ));
     }
     if !converged {

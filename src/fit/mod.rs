@@ -664,10 +664,10 @@ pub enum Note {
     },
     /// A random-effect term has at least as many random effects as the fit
     /// has rows (more than the rows, on a family other than Gaussian), so its
-    /// variance parameters are probably not identifiable. The count is the
-    /// term's observed levels times its columns (the intercept, one per
-    /// numeric slope, one per non-base level of a factor slope): `(1 + x | g)`
-    /// on 10 levels has 20. lme4 stops on such a model by default
+    /// variance parameters probably cannot be estimated from these data. The
+    /// count is the term's observed levels times its columns (the intercept,
+    /// one per numeric slope, one per non-base level of a factor slope):
+    /// `(1 + x | g)` on 10 levels has 20. lme4 stops on such a model by default
     /// (`check.nobs.vs.nRE`: `lmer` when the rows are at most the count,
     /// `glmer` when they are below it, so an observation-level `(1 | obs)`
     /// passes on a GLMM). Each term is checked against all rows on its own;

@@ -775,9 +775,11 @@ BIC.fastglmm <- function(object, ...) {
   }
   reml <- vapply(fits, .fit_is_reml, NA)
   if (any(reml, na.rm = TRUE) && !all(reml, na.rm = TRUE)) {
-    stop(sprintf(paste("%s was fitted by REML and %s by ML. Fit both the same way, or use",
-                       "compare(data, f0, f1)."),
-                 label(which(reml)[1L]), label(which(!reml)[1L])), call. = FALSE)
+    stop(sprintf(paste("%s was fitted by REML and %s by ML; comparing their %s needs both",
+                       "fitted the same way. Refit %s with REML = FALSE, or use",
+                       "compare(data, f0, f1), which picks the estimator itself."),
+                 label(which(reml)[1L]), label(which(!reml)[1L]), what,
+                 label(which(reml)[1L])), call. = FALSE)
   }
   # The fixed parts are compared on fastglmm REML fits only: another
   # package's formula is not in the form the Rust check reads.
@@ -786,10 +788,10 @@ BIC.fastglmm <- function(object, ...) {
   # first checks every pair.
   for (i in ours[-1L]) {
     if (!fastglmm_same_fixed_part(fits[[ours[1L]]]$formula, fits[[i]]$formula)) {
-      stop(sprintf(paste0("%s and %s are REML fits with different fixed effects, and ",
-                          "REML fits with different fixed effects cannot be compared ",
-                          "by %s. Use compare(data, f0, f1), which fits both models by ",
-                          "ML, or refit both with REML = FALSE."),
+      stop(sprintf(paste0("%s and %s are REML fits with different fixed effects; the ",
+                          "REML likelihood depends on the fixed effects, so comparing ",
+                          "their %s needs ML fits. Refit both with REML = FALSE, or use ",
+                          "compare(data, f0, f1), which fits both models by ML."),
                    label(ours[1L]), label(i), what), call. = FALSE)
     }
   }

@@ -134,7 +134,7 @@ pub enum ContrastError {
 impl fmt::Display for ContrastError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ContrastError::NoDf(reason) => write!(f, "no Satterthwaite df: {reason}"),
+            ContrastError::NoDf(reason) => write!(f, "{reason}"),
         }
     }
 }

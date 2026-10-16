@@ -446,7 +446,7 @@ pub(crate) fn check_marginal(lo: &Lowered) -> Result<(), String> {
         .collect();
     Err(format!(
         "per-term tests need every marginal term of each interaction in the \
-         formula; it lacks {}",
+         formula; it lacks {}. Add the missing terms.",
         list.join(", ")
     ))
 }
