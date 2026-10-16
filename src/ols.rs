@@ -11,10 +11,8 @@
 //! `OlsFitView<'_>` borrowing the same storage — no per-fit heap allocations
 //! on our side of the warm path apart from what faer's `llt` does internally.
 
-use faer::linalg::matmul::triangular::BlockStructure;
-use faer::linalg::matmul::{matmul, triangular};
 use faer::reborrow::{IntoConst, Reborrow, ReborrowMut};
-use faer::{Accum, MatMut, MatRef, Par};
+use faer::{MatMut, MatRef};
 
 use crate::standardize::ColumnScaling;
 
@@ -121,7 +119,8 @@ impl<'w> OlsSuffStats<'w> {
     /// Panel-GEMM: each ≤PANEL_ROWS slice of the block is repacked densely
     /// (column-major) into `panel_x`/`panel_y` once, then X'X/X'y accumulate through
     /// faer GEMM (`Accum::Add`, `Par::Seq` — per-fit parallelism is the outer
-    /// rayon loop). GEMM's blocked accumulation keeps the FP-add chain off the
+    /// rayon loop) on x86_64, column dot products elsewhere ([`Self::add_panel`]).
+    /// GEMM's blocked accumulation keeps the FP-add chain off the
     /// critical path, unlike a per-row rank-1 triangle update, which serializes
     /// one add per row (mirrors glm.rs's X'WX conversion). `yty`/`sum_y` stay
     /// scalar in row order.
@@ -152,30 +151,86 @@ impl<'w> OlsSuffStats<'w> {
                 *self.yty += y_row * y_row;
                 *self.sum_y += y_row;
             }
-            let xp = MatRef::from_column_major_slice(&self.panel_x[..rows * p], rows, p);
-            triangular::matmul(
-                self.xtx.rb_mut(),
-                BlockStructure::TriangularLower,
-                Accum::Add,
-                xp.transpose(),
-                BlockStructure::Rectangular,
-                xp,
-                BlockStructure::Rectangular,
-                1.0,
-                Par::Seq,
-            );
-            matmul(
-                MatMut::from_column_major_slice_mut(&mut *self.xty, p, 1),
-                Accum::Add,
-                xp.transpose(),
-                MatRef::from_column_major_slice(&self.panel_y[..rows], rows, 1),
-                1.0,
-                Par::Seq,
-            );
+            self.add_panel(rows);
             off += rows;
         }
         *self.n_rows += m;
     }
+
+    /// `X'X += Xₚ'Xₚ` (lower triangle) and `X'y += Xₚ'yₚ` for the packed panel
+    /// of `rows` rows, through faer GEMM.
+    ///
+    /// x86_64 only: there faer runs its own GEMM kernels, which do not
+    /// allocate. On every other target (aarch64, wasm32) faer hands a product
+    /// past 16³ to the `gemm` crate, whose `gemm_basic_generic` (gemm-common
+    /// 0.19) heap-allocates a packing buffer and a flag vector on every call,
+    /// so the warm path would allocate twice per panel.
+    #[cfg(target_arch = "x86_64")]
+    fn add_panel(&mut self, rows: usize) {
+        use faer::linalg::matmul::matmul;
+        use faer::linalg::matmul::triangular::{self, BlockStructure};
+        use faer::{Accum, Par};
+        let p = self.xty.len();
+        let xp = MatRef::from_column_major_slice(&self.panel_x[..rows * p], rows, p);
+        triangular::matmul(
+            self.xtx.rb_mut(),
+            BlockStructure::TriangularLower,
+            Accum::Add,
+            xp.transpose(),
+            BlockStructure::Rectangular,
+            xp,
+            BlockStructure::Rectangular,
+            1.0,
+            Par::Seq,
+        );
+        matmul(
+            MatMut::from_column_major_slice_mut(&mut *self.xty, p, 1),
+            Accum::Add,
+            xp.transpose(),
+            MatRef::from_column_major_slice(&self.panel_y[..rows], rows, 1),
+            1.0,
+            Par::Seq,
+        );
+    }
+
+    /// The x86_64 [`Self::add_panel`] off x86_64: one column dot product per
+    /// lower-triangle entry and per `X'y` entry, allocation-free on any target.
+    #[cfg(not(target_arch = "x86_64"))]
+    fn add_panel(&mut self, rows: usize) {
+        let p = self.xty.len();
+        let col = |j: usize| &self.panel_x[j * rows..(j + 1) * rows];
+        let yp = &self.panel_y[..rows];
+        for j in 0..p {
+            for i in j..p {
+                self.xtx[(i, j)] += panel_dot(col(i), col(j));
+            }
+            self.xty[j] += panel_dot(col(j), yp);
+        }
+    }
+}
+
+/// `Σ aᵢbᵢ` on eight accumulators, reduced pairwise. Eight, not four: on
+/// the entangled design of `ols_reml_reports_the_closed_form_reml_loglik`
+/// (columns `a` and `a + 2⁻²⁰·b`, whose Gram entry needs about 59 bits),
+/// four accumulators move the REML log-likelihood 1.3e-10 relative off the
+/// closed form; eight reach the 2.4e-11 a compensated (Dot2) sum gives, the
+/// same as faer's GEMM there (measured 2026-10-16, aarch64-apple-darwin).
+#[cfg(not(target_arch = "x86_64"))]
+fn panel_dot(a: &[f64], b: &[f64]) -> f64 {
+    let mut s = [0.0f64; 8];
+    let (ac, bc) = (a.chunks_exact(8), b[..a.len()].chunks_exact(8));
+    let tail: f64 = ac
+        .remainder()
+        .iter()
+        .zip(bc.remainder())
+        .map(|(x, y)| x * y)
+        .sum();
+    for (x, y) in ac.zip(bc) {
+        for k in 0..8 {
+            s[k] += x[k] * y[k];
+        }
+    }
+    (((s[0] + s[1]) + (s[2] + s[3])) + ((s[4] + s[5]) + (s[6] + s[7]))) + tail
 }
 
 // ---------------------------------------------------------------------------

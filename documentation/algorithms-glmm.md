@@ -437,10 +437,12 @@ means decades apart) the deviance rises by tens of units over 1e-4 along one
 in that valley, units above the optimum. So after a converged joint search one
 check runs at the incumbent: a Laplace solve at its θ and dispersion with β
 re-solved jointly with the modes (PQL), and on AGQ one solve of the AGQ
-objective at that β. At an optimum this is no lower than the incumbent, since
-the PQL β is not the Laplace or AGQ one. When it is lower by more than
-`JOINT_RECHECK_TOL` (1e-9 relative), the search runs a second time from that
-point, on β̃ scaled by the β information there instead of the design
+objective at that β, started from the modes the PQL solve left there. At an
+optimum this is no lower than the incumbent, since the PQL β is not the
+Laplace or AGQ one. When it is lower by more than `JOINT_RECHECK_TOL` (1e-9
+relative), capped at `JOINT_RECHECK_ABS` (one deviance unit), the search runs
+a second time from that point, its incumbent modes the check's, on β̃ scaled
+by the β information there instead of the design
 (`BetaScale::set_info`: `L·Lᵀ = S_β/Σw`, `S_β = X'WX − X'WM·A⁻¹·M'WX` the
 factor the PQL solve leaves in `border.schur`), so the deviance is isotropic in
 β̃ to second order. On AGQ the check and its second pass also run after a
@@ -462,8 +464,17 @@ ends 4.6e-5 units from the joint search's former optimum. On a second
 twelve-decade design the second pass alone ended 2.93 units above the
 exact-profile optimum, and the extra pass reaches it (measured 2026-10-11). On the
 grid's AGQ and packed cells the check never fired after the joint search
-(largest value 2e-14 relative). **Validation:**
-`joint_search_reaches_the_optimum_when_working_weights_span_decades`
+(largest value 2e-14 relative). Over 13.75 and 14 decades (|f| from 7.4e11 to
+2.4e12, five designs each) the 7-node AGQ fit had stopped 1090 to 1460 units
+above the exact-profile optimum, still converged: the check found the
+incumbent 679 to 937 units above its point, under a relative band of 737 to
+2438 units, and at 14 decades its AGQ solve, then started from the
+incumbent's modes, failed outright. With the cap and the check's own modes
+every fit ends within +0.31 of the exact profile, which itself stops up to
+10.7 units above the Laplace optimum at 14 decades (measured 2026-10-16).
+**Validation:**
+`joint_search_reaches_the_optimum_when_working_weights_span_decades` and
+`agq_search_reaches_the_optimum_when_working_weights_span_fourteen_decades`
 (`src/fit/glmm_tests.rs`).
 
 Whichever search gates convergence, its `Converged` status counts only when the

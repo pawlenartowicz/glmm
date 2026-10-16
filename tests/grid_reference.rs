@@ -48,6 +48,50 @@ use serde_json::Value;
 /// `cfg(test)`, so an integration test cannot reach `PIN_REL_ITER` either.
 const CI_REF_REL: f64 = 1e-7;
 
+/// Cells whose parameters drift off the anchor machine's run by more than
+/// `CI_REF_REL` on a different CPU, each with its own band. Every other cell,
+/// and `deviance` and `loglik` on every cell, stay at `CI_REF_REL`.
+///
+/// The drift is the cross-architecture one `assert_pinned` in
+/// `src/fit/common_tests.rs` accounts for: it tracks how much iteration sits
+/// downstream of a reduction that rounds differently, so it is sized per cell
+/// against its own measurement, never corpus-wide. These cells are the ones
+/// with long outer searches on flat directions (four-way crossed and nested
+/// fits, the NB θ search, vector AGQ): on aarch64-apple-darwin they reach the same
+/// deviance as the anchor's run within `CI_REF_REL` while β, SEs, stddevs and
+/// θ sit further off. Measured 2026-10-16 on an Apple Silicon Mac against the
+/// 0.6.0 release run (`runs/glmm/last/`, fitted on the anchor), worst
+/// relative gap per cell (10 of the 116 records; the 2026-10-11 measurement
+/// against the 0.5.0 run had the same 3.8e-6 top). Band = 10x the measured gap,
+/// rounded up to one significant digit. A cell not listed here that drifts
+/// past `CI_REF_REL` on a new CPU is measured and added with its own line,
+/// never absorbed by raising `CI_REF_REL`.
+const CROSS_CPU_CELL_BANDS: [(&str, f64); 10] = [
+    ("binb_cross4_g60p5_bal_base", 2e-6), // 1.54e-7 varcomp[2].stddev
+    ("binb_q2s_g60p5_bal_base_agq7", 5e-6), // 4.71e-7 beta[0]
+    ("gami_cross4_g3000p20_bal_base", 1e-5), // 9.43e-7 varcomp[3].stddev
+    ("gami_nest2_g3000p20_bal_base", 4e-6), // 3.18e-7 beta[1]
+    ("lmm_cross4_g3000p20_bal_base", 1e-5), // 9.46e-7 varcomp[1].stddev
+    ("lmm_cross4_g30000p20_bal_base", 9e-6), // 8.53e-7 varcomp[1].stddev
+    ("nb_cross4_g60p5_bal_base", 4e-6),   // 3.26e-7 nb_theta
+    ("nb_cross4_g30000p20_bal_base", 4e-5), // 3.37e-6 varcomp[1].stddev
+    ("pois_q2s_g60p5_bal_base_agq7", 4e-5), // 3.76e-6 beta[0]
+    ("sim_nb_hightheta_glm", 4e-6),       // 3.68e-7 nb_theta
+];
+
+/// The band `key` of cell `id` is compared at: `CI_REF_REL` for the
+/// likelihood on every cell (the grid's hard gate reads it), the cell's
+/// cross-CPU band for its other quantities where it has one.
+fn band_for(id: &str, key: &str) -> f64 {
+    if matches!(key, "deviance" | "loglik") {
+        return CI_REF_REL;
+    }
+    CROSS_CPU_CELL_BANDS
+        .iter()
+        .find(|(c, _)| *c == id)
+        .map_or(CI_REF_REL, |&(_, b)| b)
+}
+
 /// The grid directory, absolute at compile time so the test does not depend on
 /// the working directory. Mirrors how `tests/oracle_support` resolves
 /// `validation/goldens/`.
@@ -105,8 +149,8 @@ fn read_records(path: &str) -> std::collections::HashMap<String, Value> {
 /// off-diagonal that sits at 3e-9 in both runs has no relative question to
 /// answer, and `CI_REF_REL` in absolute terms is far below anything a
 /// correlation carries as signal.
-fn close(got: f64, want: f64) -> bool {
-    (got - want).abs() <= CI_REF_REL * (1.0 + want.abs())
+fn close(got: f64, want: f64, band: f64) -> bool {
+    (got - want).abs() <= band * (1.0 + want.abs())
 }
 
 /// The relative difference reported for a pair, for the worst-gap line the test
@@ -124,7 +168,14 @@ fn rel(got: f64, want: f64) -> f64 {
 /// compare equal on either side, because the caller already turned a missing
 /// key into `Value::Null` before this function sees it: a schema change from
 /// omitting a key to writing `null` for it, or the reverse, passes unnoticed.
-fn cmp_json(got: &Value, want: &Value, ctx: &str, fails: &mut Vec<String>, worst: &mut f64) {
+fn cmp_json(
+    got: &Value,
+    want: &Value,
+    ctx: &str,
+    band: f64,
+    fails: &mut Vec<String>,
+    worst: &mut f64,
+) {
     match (got, want) {
         (Value::Null, Value::Null) => {}
         (Value::Bool(a), Value::Bool(b)) => {
@@ -143,7 +194,7 @@ fn cmp_json(got: &Value, want: &Value, ctx: &str, fails: &mut Vec<String>, worst
             if r > *worst {
                 *worst = r;
             }
-            if !close(a, b) {
+            if !close(a, b, band) {
                 fails.push(format!("{ctx}: {a} vs reference {b} (rel {r:.2e})"));
             }
         }
@@ -157,7 +208,7 @@ fn cmp_json(got: &Value, want: &Value, ctx: &str, fails: &mut Vec<String>, worst
                 return;
             }
             for (i, (x, y)) in a.iter().zip(b).enumerate() {
-                cmp_json(x, y, &format!("{ctx}[{i}]"), fails, worst);
+                cmp_json(x, y, &format!("{ctx}[{i}]"), band, fails, worst);
             }
         }
         (Value::Object(a), Value::Object(b)) => {
@@ -168,7 +219,7 @@ fn cmp_json(got: &Value, want: &Value, ctx: &str, fails: &mut Vec<String>, worst
                 return;
             }
             for k in ka {
-                cmp_json(&a[k], &b[k], &format!("{ctx}.{k}"), fails, worst);
+                cmp_json(&a[k], &b[k], &format!("{ctx}.{k}"), band, fails, worst);
             }
         }
         _ => fails.push(format!("{ctx}: shape changed -- {got} vs reference {want}")),
@@ -287,6 +338,7 @@ fn fast_cells_match_the_committed_glmm_run() {
                 got.get(key).unwrap_or(&Value::Null),
                 want.get(key).unwrap_or(&Value::Null),
                 &format!("{id}.{key}"),
+                band_for(id, key),
                 &mut fails,
                 &mut worst,
             );

@@ -190,6 +190,13 @@ TOL <- list(
   #          measured here. If a CI reference check goes red on this band, the
   #          band is what is wrong -- record the deviation the run prints and
   #          re-measure. Never widen it to turn a run green.
+  #
+  #          aarch64-apple-darwin, measured 2026-10-16 against the 0.6.0 release
+  #          run: deviance and loglik stay inside this band on every fast cell,
+  #          but the parameters of 10 of the 116 records (four-way crossed and
+  #          nested fits, the NB theta search, vector AGQ) drift 1.5e-7 to
+  #          3.8e-6. Those cells carry their own measured band in
+  #          CROSS_CPU_CELL_BANDS in tests/grid_reference.rs; this number stays.
   ci_ref_rel  = 1e-7,
   # coef_df_rel  compare.R gate 5: glmm's per-coefficient Satterthwaite df against
   #          lmerTest's on the Gaussian LMM cells, by rel_max_by_coef. The df moves

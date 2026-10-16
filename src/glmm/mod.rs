@@ -2519,9 +2519,13 @@ pub fn fit_glmm(
                     // The check: one Laplace solve at the incumbent's θ and
                     // dispersion with β re-solved jointly with the modes (PQL),
                     // then, on AGQ, one solve of the search's own objective at
-                    // that β. Neither is a search evaluation: own counters,
-                    // `n_eval` unchanged. When it does not fire, the incumbent's β
-                    // is restored and the fit is the one-pass fit bit for bit.
+                    // that β, started from the modes the PQL solve left there
+                    // (the incumbent's modes belong to its own β: where counts
+                    // are huge, a solve started from them at the re-solved β
+                    // can run out of step halvings). Neither is a search
+                    // evaluation: own counters, `n_eval` unchanged. When it does
+                    // not fire, the incumbent's β is restored and the fit is the
+                    // one-pass fit bit for bit.
                     let ((nb, phi), coord) = if n_disp == 1 {
                         disp_at(params[nb_col])
                     } else {
@@ -2558,7 +2562,6 @@ pub fn fit_glmm(
                     beta_seed[..p].copy_from_slice(&params[n_theta..nb_col]);
                     params[n_theta..nb_col].copy_from_slice(&beta_prof[..p]);
                     if info_ok && nagq > 1 {
-                        pirls.u[..k].copy_from_slice(&u_seed[..k]);
                         check = laplace_deviance(
                             &data,
                             nb,
@@ -2588,9 +2591,7 @@ pub fn fit_glmm(
                     // After a second pass the check is reached only on a
                     // hand-over fit (`max_info_passes`), whose third pass runs
                     // whatever the check found.
-                    if info_ok
-                        && (info_pass || check < read.2 - JOINT_RECHECK_TOL * read.2.abs().max(1.0))
-                    {
+                    if info_ok && (info_pass || check < read.2 - joint_recheck_band(read.2)) {
                         // The previous pass's incumbent, for the restore above:
                         // `start_point` and `guard_u` are not read again once the
                         // search has begun. Its β is in `beta_seed`; the check has
@@ -2598,6 +2599,9 @@ pub fn fit_glmm(
                         start_point[..total_dim].copy_from_slice(&params[..total_dim]);
                         start_point[n_theta..nb_col].copy_from_slice(&beta_seed[..p]);
                         guard_u[..k].copy_from_slice(&u_seed[..k]);
+                        // The next pass starts at the check's point, so its
+                        // incumbent modes are the check's, solved there.
+                        u_seed[..k].copy_from_slice(&pirls.u[..k]);
                         first_obj = Some(read.2);
                         info_pass = true;
                         info_passes += 1;
@@ -3398,7 +3402,8 @@ const NON_FINITE_RADIUS: f64 = 0.1;
 const PIN_DEVIANCE_SLACK: f64 = 1e-6;
 
 /// Relative deviance drop at which the check after the joint `[θ | β̃]`
-/// search (`fit_glmm`) sends it into a second pass. The check re-solves β at
+/// search (`fit_glmm`) sends it into a second pass, capped at
+/// [`JOINT_RECHECK_ABS`] deviance units (`joint_recheck_band`). The check re-solves β at
 /// the incumbent's θ jointly with the modes (one PQL step, on AGQ followed by
 /// one solve of the AGQ objective at that β). At an optimum that β is no
 /// better than the incumbent's, since the PQL β is not the Laplace or AGQ
@@ -3418,6 +3423,25 @@ const PIN_DEVIANCE_SLACK: f64 = 1e-6;
 /// accuracy grid's AGQ and packed cells the largest value was 2e-14 (a σ = 0
 /// fit, PQL and Laplace alike); every other was negative.
 const JOINT_RECHECK_TOL: f64 = 1e-9;
+/// Cap on the check's band, in deviance units: [`JOINT_RECHECK_TOL`] relative,
+/// but never more than this. The relative band grows with |f|, and where a few
+/// clusters with huge counts carry nearly all of a large deviance it outgrows
+/// the misses it is there to catch. Measured 2026-10-16: six Poisson-log
+/// clusters of five rows with log-means spread over 13.75 and 14 decades
+/// (|f| from 7.4e11 to 2.4e12), seeds 12345 and 1 to 4: the 7-node AGQ search
+/// stopped 1090 to 1460 units above the exact-profile optimum, the check found
+/// it 679 to 937 units lower, and the band (737 to 2438 units) kept the
+/// second pass from running. One unit stays above the deviance's own rounding
+/// (`16·ε·|f|`, the gradient search's floor) for |f| up to 2.8e14, and changes
+/// nothing where |f| ≤ 1e9.
+const JOINT_RECHECK_ABS: f64 = 1.0;
+
+/// The drop below the incumbent at which the check after the joint search
+/// sends it into a second pass: `min(JOINT_RECHECK_TOL·max(|f|, 1),
+/// JOINT_RECHECK_ABS)`.
+fn joint_recheck_band(f: f64) -> f64 {
+    (JOINT_RECHECK_TOL * f.abs().max(1.0)).min(JOINT_RECHECK_ABS)
+}
 
 /// How far below the search's best objective the pinned point must land to
 /// run `fit_glmm`'s trough polish, in deviance units. Measured 2026-10-05 on

@@ -10698,6 +10698,45 @@ fn gamma_inverse_gradient_route_matches_bobyqa_in_any_units() {
     }
 }
 
+/// Six Poisson-log clusters of five rows, `[1, x]` with x from the LCG at
+/// `seed`, whose log-means are spread evenly over `decades` (cluster `c` at
+/// `c/5 · decades · ln 10`, plus `0.3·x` and a uniform ±0.1 row noise), so the
+/// working weights `W = μ` run from about 1 to 10^decades. Returns
+/// `(x, y, model, ids)` for a scalar random intercept.
+fn poisson_decades_design(seed: u64, decades: f64) -> (Vec<f64>, Vec<f64>, ModelSpec, GroupIds) {
+    let (nc, m) = (6usize, 5usize);
+    let n = nc * m;
+    let mut st = seed;
+    let mut x = vec![0.0; n * 2];
+    let mut y = vec![0.0; n];
+    for i in 0..n {
+        let xv = lcg(&mut st);
+        let noise = 0.1 * lcg(&mut st);
+        x[2 * i] = 1.0;
+        x[2 * i + 1] = xv;
+        let eta =
+            (i / m) as f64 / (nc - 1) as f64 * decades * std::f64::consts::LN_10 + 0.3 * xv + noise;
+        y[i] = eta.exp().round();
+    }
+    let model = ModelSpec {
+        family: Family::Poisson {
+            link: PoissonLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: nc as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: (0..n as u32).map(|i| i / m as u32).collect(),
+        extra: vec![],
+    };
+    (x, y, model, ids)
+}
+
 /// The joint `[θ | β̃]` search on working weights that span many decades:
 /// six Poisson-log clusters of five rows whose log-means are spread evenly
 /// over `decades`, so `W = μ` runs from about 1 to 10^decades. The blocked
@@ -10716,38 +10755,9 @@ fn gamma_inverse_gradient_route_matches_bobyqa_in_any_units() {
 /// information-metric pass reaches the optimum (measured 2026-10-11).
 #[test]
 fn joint_search_reaches_the_optimum_when_working_weights_span_decades() {
-    let (nc, m) = (6usize, 5usize);
-    let n = nc * m;
     for (seed, decades) in [(12345u64, 8.0), (12345, 12.0), (3, 12.0)] {
-        let mut st = seed;
-        let mut x = vec![0.0; n * 2];
-        let mut y = vec![0.0; n];
-        for i in 0..n {
-            let xv = lcg(&mut st);
-            let noise = 0.1 * lcg(&mut st);
-            x[2 * i] = 1.0;
-            x[2 * i + 1] = xv;
-            let eta = (i / m) as f64 / (nc - 1) as f64 * decades * std::f64::consts::LN_10
-                + 0.3 * xv
-                + noise;
-            y[i] = eta.exp().round();
-        }
-        let model = ModelSpec {
-            family: Family::Poisson {
-                link: PoissonLink::Log,
-            },
-            re: Some(ReStructure {
-                sizing: Sizing::FixedClusters {
-                    n_clusters: nc as u32,
-                },
-                slopes: vec![],
-                extra_groupings: vec![],
-            }),
-        };
-        let ids = GroupIds {
-            primary: (0..n as u32).map(|i| i / m as u32).collect(),
-            extra: vec![],
-        };
+        let (x, y, model, ids) = poisson_decades_design(seed, decades);
+        let n = y.len();
         let opts = |nagq| FitOptions {
             target_indices: vec![0, 1],
             nagq,
@@ -10801,6 +10811,49 @@ fn joint_search_reaches_the_optimum_when_working_weights_span_decades() {
             agq.deviance,
             exact.deviance
         );
+    }
+}
+
+/// 7-node AGQ on the design of the test above at 13.75 and 14 decades, where
+/// |f| runs from 7.4e11 to 2.4e12, seeds 12345 and 1 to 4. The joint search
+/// stopped 1090 to 1460 units above the exact-profile optimum, still
+/// converged: its check found the incumbent 679 to 937 units above the point
+/// it re-solves, below a band of 1e-9·|f| (737 to 2438 units), so no second
+/// pass ran; at 14 decades the check's AGQ solve failed outright, started from
+/// modes at the incumbent's β rather than at the re-solved one (measured
+/// 2026-10-16). With the band capped at one unit (`JOINT_RECHECK_ABS`) and the
+/// check and second pass started from the re-solved modes, every fit ends
+/// within +0.31 of the exact profile. At this |f| the objective resolves to
+/// about 0.1 unit (its spread under θ nudges of 1e-9 relative), so the upper
+/// band is the check's one unit. The lower band only catches a gross error:
+/// at 14 decades the exact profile itself stops up to 10.7 units above the
+/// Laplace optimum (the Laplace objective at the AGQ endpoint is that much
+/// lower), so AGQ can land that far below it.
+#[test]
+fn agq_search_reaches_the_optimum_when_working_weights_span_fourteen_decades() {
+    for seed in [12345u64, 1, 2, 3, 4] {
+        for decades in [13.75, 14.0] {
+            let (x, y, model, ids) = poisson_decades_design(seed, decades);
+            let n = y.len();
+            let opts = |nagq| FitOptions {
+                target_indices: vec![0, 1],
+                nagq,
+                ..FitOptions::default()
+            };
+            let exact = fit_cold(&x, &y, n, 2, &model, &ids, &opts(1));
+            let agq = fit_cold(&x, &y, n, 2, &model, &ids, &opts(7));
+            assert!(
+                exact.converged() && agq.converged(),
+                "seed {seed}, {decades}: not converged"
+            );
+            let d = agq.deviance - exact.deviance;
+            assert!(
+                d < 1.0 && d > -50.0,
+                "seed {seed}, {decades}: AGQ {} vs exact profile {} ({d:+})",
+                agq.deviance,
+                exact.deviance
+            );
+        }
     }
 }
 

@@ -6,6 +6,32 @@ All notable changes to the `glmm` crate are recorded here. Format follows
 The Python package (`glmm` on PyPI) is versioned in lockstep with the crate and
 shares these entries; Python-specific notes are called out where they differ.
 
+## [Unreleased]
+
+### Fixed
+
+- **GLMM fits on counts that span many orders of magnitude no longer stop
+  far above the optimum while reporting convergence.** After the joint search
+  over the variance and fixed-effect parameters (AGQ fits, and Laplace fits on
+  the packed layout), a check re-solves the fixed effects at the variance
+  found and searches again from there when that point is lower. Its threshold
+  was relative to the deviance, so where a few clusters with huge counts make
+  the deviance very large (about 1e12) it grew to thousands of deviance units
+  and let misses of several hundred units through; on such data the check's
+  own AGQ solve could also fail. The threshold is now capped at one deviance
+  unit, and the check and the search after it start from the random-effect
+  modes solved at the check's point. On six Poisson-log clusters with means
+  spread over 14 orders of magnitude, 7-node AGQ fits that ended 1090 to 1460
+  units above the optimum now end within 0.31 units of the exact-profile
+  Laplace fit. A fit whose check does not fire is unchanged bit for bit; on
+  the accuracy grid's AGQ and packed cells it never fires.
+- **OLS fits through the sufficient-statistics path no longer allocate on
+  every call on Apple Silicon and WebAssembly.** Accumulating X'X and X'y
+  went through faer's matrix product, which off x86_64 hands larger products
+  to the `gemm` crate, and that allocates a packing buffer on each call. There
+  the sums are now plain dot products on eight accumulators, so the warm loop
+  stays allocation-free as on x86_64, where nothing changes.
+
 ## [0.6.0] — 2026-10-16
 
 ### Added
