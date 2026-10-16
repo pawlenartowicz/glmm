@@ -1,0 +1,38 @@
+Package: fastglmm
+Title: Fast (Generalized) Linear Mixed Models via the 'glmm' Rust Kernel
+Version: 0.6.0
+Authors@R:
+    person("Paweł", "Lenartowicz", role = c("aut", "cre"), email = "pawellenartowicz@europe.com",
+           comment = c(ORCID = "0000-0002-6906-7217"))
+Description: Fits linear models, generalized linear models, and (generalized)
+    linear mixed models with a compiled Rust backend (the 'glmm' crate): linear
+    mixed models by REML or maximum likelihood, and Laplace or adaptive Gauss-Hermite quadrature for
+    binomial, Poisson, negative-binomial, and Gamma mixed models, using
+    'lme4'-style formulas. Estimates are validated against 'lme4', 'glmmTMB',
+    and 'MixedModels.jl'. Deliberately scoped to fast fitting - fixed effects,
+    Wald standard errors, variance components, and tests of fixed terms and
+    of two nested models (anova(), compare()), with an exact restricted
+    likelihood-ratio test for one random intercept (Crainiceanu and Ruppert
+    (2004) <doi:10.1111/j.1467-9868.2004.00438.x>); anything the backend
+    cannot compute honestly (random-effect predictions, profiling) is a
+    documented error, never a silently different answer.
+License: LGPL (>= 3)
+URL: https://github.com/pawlenartowicz/glmm
+BugReports: https://github.com/pawlenartowicz/glmm/issues
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.3
+Config/rextendr/version: 0.5.0
+Config/build/extra-sources: ../glmm-r/src, ../glmm-r/Cargo.toml, ../src,
+    ../Cargo.toml
+SystemRequirements: Cargo (Rust's package manager), rustc >= 1.85
+Depends:
+    R (>= 4.2)
+Imports:
+    generics,
+    nlme,
+    stats
+Suggests:
+    broom,
+    testthat (>= 3.0.0)
+Config/testthat/edition: 3

@@ -1,0 +1,144 @@
+# Coming from statsmodels
+
+Python-only: nobody moves from `statsmodels` to R for this, so this page
+doesn't try to cover `fastglmm`. If you're coming from lme4 instead — R or
+Python — see [`coming-from-lme4.md`](coming-from-lme4.md).
+
+`statsmodels` gives you `MixedLM` (Gaussian linear mixed models only) and the
+ordinary `GLM`/`GLMM`-adjacent estimators via `smf.glm`. `glmm.fit` covers
+both from one call. The two libraries part ways in three places: the formula
+grammar is not patsy, there is no construct-then-fit split, and the
+attribute surface on the result is smaller — deliberately, and each gap below
+was checked against the installed wheel rather than assumed.
+
+## Formulas are not patsy
+
+The formula string looks like patsy's — `~` separates response from
+predictors, `+` adds terms — but the grammar underneath is a separate, much
+smaller parser (`glmm::formula`, shared by Rust, Python and R) with a small,
+closed whitelist of function calls (`log()`/`sqrt()`/`exp()`/`I(x^k)`,
+`offset()`, `cbind()`) rather than patsy's general call syntax. Every claim
+below is the literal, verified output of `glmm.fit` on the installed wheel.
+
+| patsy construct | Result | Workaround |
+|---|---|---|
+| `C(group)` | `ValueError: formula syntax error at position 0: expected identifier, got 'C(group)'` | Don't wrap it. A plain string (or `pandas.Categorical`) column is *always* treatment-coded — just write the bare column name, `y ~ group`. Control the base level by sorting (`pandas.Categorical(x, categories=[...])`); its first category is the base. See [`formula.md#factor-coding`](formula.md#factor-coding). |
+| `np.log(x)` | `ValueError: formula syntax error at position 0: expected identifier, got 'np.log(x2)'` | The dotted `np.`/`scipy.` spelling isn't in the whitelist. Write the bare-column form instead — `log(x2)`, `sqrt(x2)`, `exp(x2)`, or `I(x2^2)` — which does work; see [`formula.md`](formula.md). |
+| `y ~ x - 1` (intercept suppression) | **Works.** `- 1` and `0 +` both drop the fixed-effect intercept. | None needed. |
+| `bs(x, df=3)` (spline basis) | `ValueError: formula syntax error at position 0: expected identifier, got 'bs(x,df=3)'` | No basis-expansion support in the formula. Build the basis columns yourself outside the fit (e.g. `patsy.dmatrix("bs(x, df=3)", data)` or `scipy.interpolate`) and add each resulting column as its own bare fixed-effect term. |
+| `x:y` interaction | **Works unchanged.** `glmm.fit(data, "y ~ x:x2")` fits — `:` means pure interaction (no main effects added) in both patsy and this parser, and `*` desugars to main effects + interaction in both too. | None needed. |
+
+See [`formula.md`](formula.md) for the full accepted/rejected grammar.
+
+## Call mapping
+
+| statsmodels | `glmm.fit` |
+|---|---|
+| `sm.MixedLM(endog, exog, groups=g).fit()` — construct the model from arrays, then fit it as a second step | `glmm.fit(data, "y ~ x + (1 \| g)")` — one call. There is no model object to build first: `fit` parses the formula, builds the design, and fits in the same step. |
+| `smf.mixedlm("y ~ x", data, groups=data["g"]).fit()` — formula for the fixed effects, but grouping is still a separate `groups=` argument | `glmm.fit(data, "y ~ x + (1 \| g)")` — grouping is a formula term, `(1 \| g)`, not a side argument. Passing `groups=` to `glmm.fit` is a hard error: `TypeError: fit() got an unexpected keyword argument 'groups'` (verified). |
+| `smf.mixedlm("y ~ x", data, groups=data["g"], re_formula="~x")` — a correlated random slope needs a second formula, `re_formula` | `glmm.fit(data, "y ~ x + (1 + x \| g)")` — the random-slope term lives in the same formula string as everything else. |
+| `smf.glm("y ~ x", data, family=sm.families.Poisson()).fit()` — construct-then-fit again, family from `statsmodels.api.families` | `glmm.fit(data, "y ~ x", family="poisson")` — `family` is a string on the same call, from `{"gaussian", "binomial", "poisson", "gamma", "negativebinomial", "inversegaussian"}`. |
+| no equivalent (`MixedLM` is Gaussian-only) | `glmm.fit(data, "y ~ x + (1 \| g)", family="binomial")` (or any other family) — a GLMM in the same call shape as the LMM above; nothing about the call changes except `family`. |
+
+`glmm`'s Python surface is small on purpose: `glmm.fit`, `glmm.Fit` (the
+result type — returned by `fit`, never constructed by the caller), and the
+warning categories the diagnostics channel raises (`DiagnosticWarning` and
+its subclasses, such as `IllConditionedWarning`, `PirlsExhaustedWarning`,
+`UnusedGroupingLevelsWarning` and `HessianSeFallbackWarning`; `glmm.__all__`
+lists them all).
+
+## `MixedLM` is REML by default too, and both switch to ML the same way
+
+It's tempting to assume `statsmodels.MixedLM` is an ML estimator and `glmm`'s
+LMM path is REML, so the two never agree. Checked against the installed
+wheel, that's not quite the shape of the difference. `MixedLM.fit()`
+defaults to `reml=True`, the same objective `glmm.fit`'s LMM path uses by
+default. Fit recipe 1's `sleepstudy` model
+(`smf.mixedlm("Reaction ~ Days", df, groups=df["Subject"], re_formula="~Days").fit()`,
+no `reml=` argument, so the statsmodels default) and its log-likelihood is
+`-871.8141359795748` — recipe 1's own REML criterion, printed in
+[`examples-python.md`](examples-python.md#1-correlated-random-slope-sleepstudy),
+is `-871.814135979251`. Same fixed effects too: `251.405`/`10.467` both
+places. A bare, default `MixedLM` call is not the trap.
+
+The switch to ordinary ML is spelled the same in both: `MixedLM.fit(reml=False)`
+and `glmm.fit(data, formula, reml=False)` (see
+[`conventions.md`](conventions.md#estimation)). The trap is dropping it in
+one place: code written against a `reml=False` `MixedLM` fit compares a REML
+`glmm` fit with an ML one unless the `glmm.fit` call passes `reml=False` too,
+and the variance components and the log-likelihood then differ. `fit.reml`
+says which criterion a fit used. The summary of a `glmm` ML fit is titled
+"Linear mixed model fit by maximum likelihood [glmm]" and prints "Note:
+p-values can be somewhat anticonservative." under the title.
+
+One more thing this same check turned up: under its own REML default,
+`MixedLM`'s `.aic` is `nan` (confirmed on the wheel above) — AIC isn't a
+well-posed number under REML in general. `glmm`'s summary of a REML fit prints
+the REML criterion and no AIC line for the same reason; its `fit.aic` property
+still returns a number (see the table below).
+
+## What you lose
+
+Checked against the installed `glmm.Fit` object on a real fit — not every
+missing statsmodels name means the underlying number doesn't exist; some are
+just named, or shaped, differently. Where that's the case, this says so
+rather than lumping everything into one "blocked" bucket.
+
+| statsmodels | `glmm.Fit` | What actually happens |
+|---|---|---|
+| `.random_effects` (dict of per-group BLUPs) | `.ranef` / `.ranef_levels` | `fit.random_effects` raises `AttributeError: 'Fit' object has no attribute 'random_effects'` (verified) — the name doesn't exist. The conditional modes themselves do, under `.ranef`/`.ranef_levels`. |
+| `.fittedvalues` | `.fitted` | Same story: `AttributeError` on the statsmodels name (verified); `.fitted` holds the in-sample μ̂ per row. |
+| `.predict(new_data)` | — | `AttributeError: 'Fit' object has no attribute 'predict'` (verified) — no method under this or any other name. This is the one clean, total loss in this table: there is no out-of-sample prediction on any path, converged or not. |
+| `.bse` | `.se` | Exists, just renamed — the `(p,)` array of Wald standard errors. |
+| `.pvalues` | `.coef_p` (t tests only) | Where `summary()` tests with t (a Gaussian mixed model on its Satterthwaite df, OLS and the gamma and inverse-gaussian GLMs on `n - p`), `fit.coef_p` holds the kernel's two-sided p-values and `fit.coef_df` the df. Where it tests with z, `coef_p` is `NaN` and `summary()` computes Wald z/p on the fly (`z = beta/se`, `p = erfc(\|z\|/sqrt(2))`); recompute that from `.beta`/`.se` if you need the numbers back. |
+| `.aic` | `.aic` (and `.bic`) | Properties, computed on every fit: `-2 * fit.loglik + 2 * fit.df` (`.bic`: `+ fit.df * log(fit.nobs)`). Unlike `MixedLM`, a REML fit gets a number, not `nan`: it is built on the REML criterion, so (per the section above) it compares only fits with the same fixed effects. To compare fixed-effect specifications, fit both models with `reml=False`. |
+| `.llf` | `.loglik` | Exists, renamed, with the same caveat as above: for a REML fit, `.loglik` is the **REML criterion**, not an ordinary log-likelihood: check `fit.reml` before comparing it to anything. |
+| `.conf_int()` | `.confint()` | `fit.confint(level=0.95)` returns a `(p, 2)` array of Wald bounds in `fit.names` order, on the t quantile where `summary()` tests with t and the normal quantile where it tests with z. Like statsmodels' `alpha`, it takes the level; unlike `.conf_int()` it returns an array, not a DataFrame. |
+
+## What you gain
+
+- **Non-Gaussian mixed models at all.** `MixedLM` is Gaussian-only; `glmm.fit`
+  covers binomial (logit/probit/cloglog), Poisson, Gamma, and negative-binomial GLMMs
+  through the same call, just `family=...`.
+- **Crossed and nested groupings as ordinary formula terms.** `(1 | g1) + (1 | g2)`
+  for crossed factors, `(1 | g1/g2)` for nesting — see recipes 2 and 3 in
+  [`examples-python.md`](examples-python.md). `statsmodels` has no formula
+  shorthand for either shape on `MixedLM`.
+- **Adaptive Gauss–Hermite quadrature.** `nagq=<odd integer, 1..25>` on
+  binomial, Poisson, negative-binomial and Gamma GLMMs with a single grouping
+  factor and up to 3 random effects per group (`nagq=1`, the default, is
+  Laplace) — `statsmodels` has no quadrature option for mixed models.
+
+## Reading `.summary()` against statsmodels'
+
+`fit.summary()` prints an lme4-shaped summary, not a statsmodels one. Its
+coefficient table has the same four columns you'd expect from
+`MixedLMResults.summary()` or `GLMResults.summary()` — name, estimate,
+standard error, and a test statistic with its p-value (plus a `df` column on
+a Gaussian mixed model), but three things are different, all checked against
+the installed package:
+
+- **The test column is t or z, by model.** A Gaussian mixed model gets t
+  with a `df` column, on lmerTest's Satterthwaite degrees of freedom, where
+  `MixedLMResults` reports `z`/`P>|z|`; OLS and the gamma and inverse-gaussian
+  GLMs with φ estimated get t on the residual df `n - p` (printed in the
+  footer), as `OLSResults` does (statsmodels' `GLMResults` prints z unless
+  fitted with `use_t=True`); binomial,
+  Poisson, negative binomial and every GLMM get Wald z. `satterthwaite=False`
+  on `glmm.fit` turns the mixed model's t back into z.
+- **The criterion line depends on the estimator.** A REML fit prints
+  `REML criterion at convergence: <value>` and no AIC/BIC (see the REML
+  section above). Every other fit, an LMM fitted with `reml=False` included,
+  prints one row with `AIC`, `BIC`, `logLik`,
+  `deviance` and `df.resid`. `df.resid` is the number of observations minus
+  the number of estimated parameters; no test uses it.
+- **The footer is lme4's, not statsmodels'.** After the fixed-effect
+  correlations, `summary()` prints a dispersion line on Gamma,
+  inverse-Gaussian and negative-binomial fits (`Dispersion (phi, ML): <value>`,
+  `Dispersion (phi, Pearson): …`, `Dispersion (phi, fixed): …` or
+  `Shape (theta): …`; see [`conventions.md`](conventions.md)), then
+  `Optimizer evaluations: <n>, converged: <bool>`, and on a singular fit
+  `boundary (singular) fit: see help('isSingular')`. A Gaussian mixed fit
+  shows σ² as the `Residual` row of the random-effects table instead.
+  `converged` and the singular flag are covered in more depth in
+  [`coming-from-lme4.md`](coming-from-lme4.md#behavioral-differences-to-watch).

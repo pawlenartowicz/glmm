@@ -1,0 +1,8 @@
+^src/\.cargo$
+^src/rust/vendor$
+^src/rust/target$
+^src/Makevars$
+^src/Makevars\.win$
+^tools/cran-tarball\.sh$
+^tools/acceptance-vs-lme4\.R$
+^tools/generic-load-order\.R$
