@@ -68,7 +68,7 @@ fn type3_with(lo: &Lowered, retained: &[usize], round: fn(&mut Mat<f64>)) -> Vec
     let (pr, k) = (retained.len(), lo.rdx.names.len());
     // ginv(X)·rdX on the retained columns, pr × k.
     let mut a = Mat::from_fn(pr, k, |i, c| lo.rdx.xt_rdx[(retained[i], c)]);
-    match SeqLlt::new(d.gram.as_ref()) {
+    match SeqLlt::new(d.gram().as_ref()) {
         Some(llt) => llt.solve_in_place(a.as_mut()),
         None => a.fill(f64::NAN),
     }
@@ -142,6 +142,7 @@ pub(crate) fn type2_xtx(lo: &Lowered, retained: &[usize]) -> Vec<TermHypothesis>
         return d.type1();
     }
     let pr = retained.len();
+    let gram = d.gram();
     lo.terms
         .iter()
         .enumerate()
@@ -165,7 +166,7 @@ pub(crate) fn type2_xtx(lo: &Lowered, retained: &[usize]) -> Vec<TermHypothesis>
             for (s, &c) in perm.iter().enumerate() {
                 pos[c] = s;
             }
-            let g = Mat::from_fn(pr, pr, |i, j| d.gram[(perm[i], perm[j])]);
+            let g = Mat::from_fn(pr, pr, |i, j| gram[(perm[i], perm[j])]);
             let ld = doolittle_l(&g);
             let rows: Vec<Vec<f64>> = d.map[t]
                 .iter()
@@ -477,8 +478,6 @@ pub(crate) fn missing_cells_note(lo: &Lowered) -> Option<String> {
 struct Design<'a> {
     lo: &'a Lowered,
     retained: &'a [usize],
-    /// `XᵀX` on the retained columns.
-    gram: Mat<f64>,
     /// Per term, its retained columns as positions in `retained`
     /// (`term2colX`).
     map: Vec<Vec<usize>>,
@@ -494,16 +493,7 @@ impl<'a> Design<'a> {
             retained.windows(2).all(|w| w[0] < w[1]) && retained.iter().all(|&c| c < lo.p),
             "retained columns must be ascending and below p"
         );
-        let (n, p, pr) = (lo.n, lo.p, retained.len());
-        let mut gram = Mat::<f64>::zeros(pr, pr);
-        for i in 0..n {
-            let row = &lo.x[i * p..(i + 1) * p];
-            for (b, &cb) in retained.iter().enumerate() {
-                for (a, &ca) in retained.iter().enumerate() {
-                    gram[(a, b)] += row[ca] * row[cb];
-                }
-            }
-        }
+        let pr = retained.len();
         let map = lo
             .terms
             .iter()
@@ -558,10 +548,16 @@ impl<'a> Design<'a> {
         Design {
             lo,
             retained,
-            gram,
             map,
             contains,
         }
+    }
+
+    /// `XᵀX` on the retained columns.
+    fn gram(&self) -> Mat<f64> {
+        let xtx = xtx(self.lo);
+        let pr = self.retained.len();
+        Mat::from_fn(pr, pr, |a, b| xtx[(self.retained[a], self.retained[b])])
     }
 
     /// lmerTest's `ncol(X) <= 1L || length(term_names) <= 1L`.
@@ -571,7 +567,7 @@ impl<'a> Design<'a> {
 
     /// `get_contrasts_type1`: each term's rows of `t(doolittle(XᵀX)$L)`.
     fn type1(&self) -> Vec<TermHypothesis> {
-        let ld = doolittle_l(&self.gram);
+        let ld = doolittle_l(&self.gram());
         let pr = self.retained.len();
         self.lo
             .terms
@@ -600,6 +596,66 @@ impl<'a> Design<'a> {
             l,
         }
     }
+}
+
+/// `XᵀX` over all `p` columns of the design, built on first use and kept in
+/// [`Lowered`]. Each entry sums `x[i][a]·x[i][b]` over the rows in order; only
+/// `a ≤ b` is accumulated and the lower triangle mirrored, which is exact
+/// because the two products are the same double.
+fn xtx(lo: &Lowered) -> &Mat<f64> {
+    lo.xtx.get_or_init(|| {
+        let p = lo.p;
+        let x = &lo.x[..lo.n * p];
+        let acc = match p {
+            1 => xtx_upper::<1>(x),
+            2 => xtx_upper::<2>(x),
+            3 => xtx_upper::<3>(x),
+            4 => xtx_upper::<4>(x),
+            5 => xtx_upper::<5>(x),
+            6 => xtx_upper::<6>(x),
+            7 => xtx_upper::<7>(x),
+            8 => xtx_upper::<8>(x),
+            _ => {
+                // Same sums, in the same order, as `xtx_upper` — change together.
+                let mut acc = vec![0.0f64; p * p];
+                for i in 0..lo.n {
+                    let row = &lo.x[i * p..(i + 1) * p];
+                    for (b, &xb) in row.iter().enumerate() {
+                        for (slot, &xa) in acc[b * p..=b * p + b].iter_mut().zip(row) {
+                            *slot += xa * xb;
+                        }
+                    }
+                }
+                acc
+            }
+        };
+        Mat::from_fn(p, p, |a, b| {
+            if a <= b {
+                acc[b * p + a]
+            } else {
+                acc[a * p + b]
+            }
+        })
+    })
+}
+
+/// [`xtx`]'s accumulation for a design `P` columns wide, row-major `x`, as
+/// the flat `P × P` array with entry `(a, b)`, `a ≤ b`, at `b·P + a` (the
+/// lower triangle stays 0). With the width fixed at compile time the
+/// accumulators live in registers instead of a load-add-store through memory
+/// on every row, about 5× faster at `P = 2`; each entry is still one serial
+/// sum over the rows in order, so the bits match the general loop in [`xtx`].
+fn xtx_upper<const P: usize>(x: &[f64]) -> Vec<f64> {
+    let mut acc = [[0.0f64; P]; P];
+    for row in x.chunks_exact(P) {
+        let row: &[f64; P] = row.try_into().expect("chunks_exact yields P values");
+        for b in 0..P {
+            for a in 0..=b {
+                acc[b][a] += row[a] * row[b];
+            }
+        }
+    }
+    acc.concat()
 }
 
 /// The unit lower factor `L` of lmerTest's `doolittle(x, eps = 1e-6)`: a

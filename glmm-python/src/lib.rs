@@ -10,7 +10,82 @@ use glmm::orchestrate;
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::pybacked::PyBackedBytes;
+use pyo3::types::{PyBytes, PyDict, PyList};
+
+/// A per-row vector sent from Python as the raw bytes of a native-endian numpy
+/// array (`ndarray.tobytes()`), the counterpart of `values_bytes` below. Bytes
+/// rather than a list: building and extracting one Python float per row is a
+/// large share of a large Gaussian model's fit time. Refuses a length that is
+/// not a whole number of `N`-byte values, which only a caller other than
+/// `glmm/__init__.py` can send.
+fn from_bytes<T, const N: usize>(
+    b: &[u8],
+    what: &str,
+    decode: fn([u8; N]) -> T,
+) -> PyResult<Vec<T>> {
+    let chunks = b.chunks_exact(N);
+    if !chunks.remainder().is_empty() {
+        return Err(PyValueError::new_err(format!(
+            "{what}: {} bytes is not a whole number of {N}-byte values",
+            b.len()
+        )));
+    }
+    Ok(chunks
+        .map(|c| decode(c.try_into().expect("chunks_exact yields N bytes")))
+        .collect())
+}
+
+type NumericColumns = HashMap<String, Vec<f64>>;
+type FactorColumns = HashMap<String, (Vec<String>, Vec<u32>)>;
+
+/// The columns `glmm/__init__.py::_prepare_columns` sends: numeric columns as
+/// `float64` bytes, factor codes as `uint32` bytes beside their levels.
+fn columns(
+    numeric: HashMap<String, PyBackedBytes>,
+    factor: HashMap<String, (Vec<String>, PyBackedBytes)>,
+) -> PyResult<(NumericColumns, FactorColumns)> {
+    let numeric = numeric
+        .into_iter()
+        .map(|(name, b)| {
+            let v = from_bytes(&b, &format!("column {name:?}"), f64::from_ne_bytes)?;
+            Ok((name, v))
+        })
+        .collect::<PyResult<_>>()?;
+    let factor = factor
+        .into_iter()
+        .map(|(name, (levels, b))| {
+            let codes = from_bytes(&b, &format!("column {name:?}"), u32::from_ne_bytes)?;
+            Ok((name, (levels, codes)))
+        })
+        .collect::<PyResult<_>>()?;
+    Ok((numeric, factor))
+}
+
+fn opt_f64s(b: Option<PyBackedBytes>, what: &str) -> PyResult<Option<Vec<f64>>> {
+    b.map(|b| from_bytes(&b, what, f64::from_ne_bytes))
+        .transpose()
+}
+
+/// Per-row output as the raw bytes of a native-endian array, read back by
+/// `np.frombuffer` in `glmm/__init__.py::_fit_from_native`, for the same
+/// reason inputs arrive as bytes (`from_bytes`).
+fn values_bytes<'py, T: Copy, const N: usize>(
+    py: Python<'py>,
+    v: &[T],
+    encode: fn(T) -> [u8; N],
+) -> PyResult<Bound<'py, PyBytes>> {
+    PyBytes::new_with(py, v.len() * N, |buf| {
+        for (c, &x) in buf.chunks_exact_mut(N).zip(v) {
+            c.copy_from_slice(&encode(x));
+        }
+        Ok(())
+    })
+}
+
+fn f64_bytes<'py>(py: Python<'py>, v: &[f64]) -> PyResult<Bound<'py, PyBytes>> {
+    values_bytes(py, v, f64::to_ne_bytes)
+}
 
 /// `FitResult` → a `dict` keyed by field name, unpacked in `glmm/__init__.py::fit`.
 ///
@@ -44,11 +119,15 @@ fn fit_dict<'py>(py: Python<'py>, r: orchestrate::FitResult) -> PyResult<Bound<'
     d.set_item("loglik", r.loglik)?;
     d.set_item("df", r.df)?;
     d.set_item("reml", r.reml)?;
-    d.set_item("fitted", r.fitted)?;
-    d.set_item("ranef", r.ranef)?;
-    d.set_item("ranef_levels", r.ranef_levels)?;
-    d.set_item("y", r.y)?;
-    d.set_item("weights", r.weights)?;
+    d.set_item("fitted", f64_bytes(py, &r.fitted)?)?;
+    d.set_item("ranef", f64_bytes(py, &r.ranef)?)?;
+    d.set_item(
+        "ranef_levels",
+        values_bytes(py, &r.ranef_levels, |n| (n as u64).to_ne_bytes())?,
+    )?;
+    d.set_item("y", f64_bytes(py, &r.y)?)?;
+    let weights = r.weights.as_deref().map(|w| f64_bytes(py, w)).transpose()?;
+    d.set_item("weights", weights)?;
     // `(counts, s, c)` as a dict of three flat lists, `None` outside the
     // `(1 | g)` envelope.
     match r.design_summary {
@@ -98,7 +177,8 @@ fn fit_dict<'py>(py: Python<'py>, r: orchestrate::FitResult) -> PyResult<Bound<'
     d.set_item("rss", r.rss)?;
     d.set_item("r_squared", r.r_squared)?;
     d.set_item("adj_r_squared", r.adj_r_squared)?;
-    d.set_item("offset", r.offset)?;
+    let offset = r.offset.as_deref().map(|o| f64_bytes(py, o)).transpose()?;
+    d.set_item("offset", offset)?;
     let (objective, nodes) = orchestrate::objective_parts(r.objective);
     d.set_item("objective", objective)?;
     d.set_item("objective_nodes", nodes)?;
@@ -160,24 +240,27 @@ fn term_dict<'py>(
 fn fit<'py>(
     py: Python<'py>,
     formula: &str,
-    numeric_columns: HashMap<String, Vec<f64>>,
+    numeric_columns: HashMap<String, PyBackedBytes>,
     // Each factor arrives as (levels, per-row codes): `glmm.fit` states the
     // level order, so the caller's reference level survives instead of being
     // re-derived by a sort here. See `glmm::formula::Column::Factor`.
-    factor_columns: HashMap<String, (Vec<String>, Vec<u32>)>,
+    factor_columns: HashMap<String, (Vec<String>, PyBackedBytes)>,
     family: &str,
     link: &str,
     wald_se: &str,
     nagq: u8,
     dispersion: Option<f64>,
-    weights: Option<Vec<f64>>,
-    offset: Option<Vec<f64>>,
+    weights: Option<PyBackedBytes>,
+    offset: Option<PyBackedBytes>,
     warm_start: Option<(Vec<f64>, Vec<f64>, Option<f64>)>,
     satterthwaite: bool,
     reml: Option<bool>,
     // "auto", "Wald" or "LRT": "LRT" also stores the likelihood-ratio tables.
     anova_test: &str,
 ) -> PyResult<Bound<'py, PyDict>> {
+    let (numeric_columns, factor_columns) = columns(numeric_columns, factor_columns)?;
+    let weights = opt_f64s(weights, "weights")?;
+    let offset = opt_f64s(offset, "offset")?;
     let result = orchestrate::run_fit(
         formula,
         numeric_columns,
@@ -443,16 +526,19 @@ fn compare<'py>(
     py: Python<'py>,
     f0: &str,
     f1: &str,
-    numeric_columns: HashMap<String, Vec<f64>>,
-    factor_columns: HashMap<String, (Vec<String>, Vec<u32>)>,
+    numeric_columns: HashMap<String, PyBackedBytes>,
+    factor_columns: HashMap<String, (Vec<String>, PyBackedBytes)>,
     family: &str,
     link: &str,
     nagq: u8,
-    weights: Option<Vec<f64>>,
-    offset: Option<Vec<f64>>,
+    weights: Option<PyBackedBytes>,
+    offset: Option<PyBackedBytes>,
     nsim: Option<usize>,
     seed: Option<u64>,
 ) -> PyResult<Bound<'py, PyDict>> {
+    let (numeric_columns, factor_columns) = columns(numeric_columns, factor_columns)?;
+    let weights = opt_f64s(weights, "weights")?;
+    let offset = opt_f64s(offset, "offset")?;
     let r = orchestrate::run_compare(
         f0,
         f1,

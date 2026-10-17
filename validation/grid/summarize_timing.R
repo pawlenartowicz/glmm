@@ -17,16 +17,22 @@
 # dropped -- its numbers are still shown, with a loud warning naming it, both
 # in the provenance block and right above the table.
 #
+# --pipeline: the same report over the --pipeline runs of glmm_r, lmertest and
+# glmmtmb, which time fit + t tests + F tests (run.sh). The default report skips
+# every pipeline run, so the two tables never mix.
+#
 # NEVER FAILS THE BUILD: the whole body runs inside one tryCatch that always
 # ends in quit(status = 0).
 
 suppressMessages(library(jsonlite))
 
 opt_glmm_run <- NULL
+opt_pipeline <- FALSE
 parse_args <- function() {
   for (a in commandArgs(TRUE)) {
     if (startsWith(a, "--glmm-run=")) opt_glmm_run <<- sub("^--glmm-run=", "", a)
-    else stop(sprintf("unknown argument `%s`. Usage: summarize_timing.R [--glmm-run=DIR]", a),
+    else if (a == "--pipeline") opt_pipeline <<- TRUE
+    else stop(sprintf("unknown argument `%s`. Usage: summarize_timing.R [--glmm-run=DIR] [--pipeline]", a),
               call. = FALSE)
   }
 }
@@ -47,7 +53,11 @@ safe <- function(expr, what) tryCatch(expr, error = function(e) {
 # contributed a cell, including the runs a kept last-timed/ run lists under
 # `carried` (promote.sh): provenance, the unlocked warning and the one-machine
 # check below read all of them.
-merged_timed_runs <- function(grid_dir, dir_name) {
+#
+# `pipeline` picks which timed runs count: a --pipeline run (fit + tests) or a
+# fit-only one. Both kinds sit under runs/<engine>/ (last-pipeline/ beside
+# last-timed/), so without this test one table would mix the two.
+merged_timed_runs <- function(grid_dir, dir_name, pipeline = FALSE) {
   root <- file.path(grid_dir, "runs", dir_name)
   dirs <- c(list.dirs(root, recursive = FALSE),
             list.dirs(file.path(root, "scratch"), recursive = FALSE))
@@ -57,6 +67,7 @@ merged_timed_runs <- function(grid_dir, dir_name) {
   for (d in dirs) {
     m <- jsonlite::fromJSON(file.path(d, "run_meta.json"), simplifyVector = TRUE)
     if (is.null(m$timed) || is.na(m$timed)) next
+    if (isTRUE(m$pipeline) != pipeline) next
     ok[[length(ok) + 1L]] <- list(dir = d, date = m$date)
   }
   if (!length(ok)) return(NULL)
@@ -79,7 +90,8 @@ merged_timed_runs <- function(grid_dir, dir_name) {
 }
 
 LABEL <- c(glmm = "glmm", lme4 = "lme4", glmmTMB = "glmmTMB",
-           GLMMadaptive = "MA", MixedModels = "mmjl")
+           GLMMadaptive = "MA", MixedModels = "mmjl",
+           glmm_r = "glmm", lmertest = "lmerTest")
 
 fmt_t <- function(x) if (is.null(x) || is.na(x)) "-" else sprintf("%.6f", x)
 fmt_x <- function(other, mine) if (is.na(other) || is.na(mine) || mine == 0) "-" else sprintf("%.1fx", other / mine)
@@ -91,16 +103,27 @@ fmt_x <- function(other, mine) if (is.na(other) || is.na(mine) || mine == 0) "-"
 is_unlocked <- function(m) isTRUE(m$timed_unlocked) || !identical(as.character(m$no_turbo), "1")
 
 main <- function() {
+  # `ref` is both the run key and the runs/ directory of the engine every
+  # speedup is taken against; `others` maps each other run key to its runs/
+  # directory. The pipeline table's reference is the R port, glmm_r, which
+  # starts from a typed data frame exactly as lmerTest and glmmTMB do.
+  if (opt_pipeline) {
+    ref <- "glmm_r"
+    others <- c(lmertest = "lmertest", glmmTMB = "glmmtmb")
+  } else {
+    ref <- "glmm"
+    # One column per ORACLE that actually has a timed run -- whichever of the
+    # four are present -- never a fixed engine list and never a port
+    # (glmm_python/glmm_r) column: a port's time is the same kernel plus FFI
+    # tax, not a speed comparison this table is answering.
+    others <- setNames(ENGINE_DIR[ORACLES], ORACLES)
+  }
   glmm_run <- safe(if (!is.null(opt_glmm_run)) {
                      r <- read_run(opt_glmm_run); r$metas <- list(r$meta); r
-                   } else merged_timed_runs(GRID, "glmm"), "glmm")
-  # One column per ORACLE that actually has a timed run -- whichever of the
-  # four are present -- never a fixed engine list and never a port
-  # (glmm_python/glmm_r) column: a port's time is the same kernel plus FFI
-  # tax, not a speed comparison this table is answering.
-  oracle_runs <- setNames(lapply(ORACLES, function(o)
-    safe(merged_timed_runs(GRID, ENGINE_DIR[[o]]), o)), ORACLES)
-  runs <- c(list(glmm = glmm_run), oracle_runs)
+                   } else merged_timed_runs(GRID, ref, opt_pipeline), LABEL[[ref]])
+  oracle_runs <- setNames(lapply(names(others), function(o)
+    safe(merged_timed_runs(GRID, others[[o]], opt_pipeline), o)), names(others))
+  runs <- c(setNames(list(glmm_run), ref), oracle_runs)
   # "Timed run" means run_meta.json$timed is set -- a run object that slipped
   # through with timed == NULL (e.g. a bad --glmm-run= override) is dropped
   # here rather than trusted.
@@ -132,30 +155,31 @@ main <- function() {
     return(invisible(NULL))
   }
 
-  if (!("glmm" %in% names(runs))) {
-    cat("no glmm timed run -- nothing to report a speedup against\n")
+  if (!(ref %in% names(runs))) {
+    cat(sprintf("no %s timed run -- nothing to report a speedup against\n", LABEL[[ref]]))
     return(invisible(NULL))
   }
 
-  cat("NOTE: glmm's wall_seconds times the fit only (model-matrix lowering and the\n",
-      "Satterthwaite pass excluded);\n",
-      "the R/Julia engines time the whole fit call, lowering included.\n", sep = "")
+  if (!opt_pipeline)
+    cat("NOTE: glmm's wall_seconds times the fit only (model-matrix lowering and the\n",
+        "Satterthwaite pass excluded);\n",
+        "the R/Julia engines time the whole fit call, lowering included.\n", sep = "")
 
   cells_all <- grid_cells_by_id(file.path(GRID, "manifest.json"))
   # Only the manifest's current fast cells: an older merged run can still hold
   # a cell that has since left the fast set.
   fast_ids <- names(Filter(function(cl) "fast" %in% cl$tags, cells_all))
-  cids <- intersect(fast_ids, names(runs[["glmm"]]$recs))
+  cids <- intersect(fast_ids, names(runs[[ref]]$recs))
   if (!length(cids)) {
-    cat("\nno cell in the glmm timed run is a known manifest cell\n")
+    cat(sprintf("\nno cell in the %s timed run is a known manifest cell\n", LABEL[[ref]]))
     return(invisible(NULL))
   }
 
   # Every engine with a timed run gets a column -- unlocked ones included,
-  # per the warning already printed above. `runs`'s own key order (glmm, then
-  # ORACLES order) is what both this list and the header below follow.
+  # per the warning already printed above. `runs`'s own key order (ref, then
+  # `others` order) is what both this list and the header below follow.
   timing_engines <- names(runs)
-  speedup_vs <- setdiff(timing_engines, "glmm")
+  speedup_vs <- setdiff(timing_engines, ref)
   unlocked_here <- Filter(function(e) any(vapply(runs[[e]]$metas, is_unlocked, TRUE)),
                           timing_engines)
   if (length(unlocked_here)) {
@@ -164,10 +188,13 @@ main <- function() {
                   LABEL[[e]]))
   }
 
-  cat("\n== median seconds per fit (fast subset) ==\n")
+  cat(if (opt_pipeline) "\n== median seconds per pipeline (fast Gaussian mixed cells) ==\n"
+      else "\n== median seconds per fit (fast subset) ==\n")
+  # A speedup column is as wide as its header: vs_lmerTest is 11 characters.
+  vs_width <- setNames(pmax(10L, nchar(paste0("vs_", LABEL[speedup_vs]))), speedup_vs)
   header <- sprintf("%-34s %-17s", "cell", "family")
   for (e in timing_engines) header <- paste0(header, sprintf(" %9s", LABEL[[e]]))
-  for (e in speedup_vs) header <- paste0(header, sprintf(" %10s", paste0("vs_", LABEL[[e]])))
+  for (e in speedup_vs) header <- paste0(header, sprintf(" %*s", vs_width[[e]], paste0("vs_", LABEL[[e]])))
   cat(header, "\n")
 
   # fits_per_sample is always 1 in the grid; dividing by it keeps
@@ -180,7 +207,7 @@ main <- function() {
     secs <- secs_of(cid)
     row <- sprintf("%-34s %-17s", label, cells_all[[cid]]$family)
     for (e in timing_engines) row <- paste0(row, sprintf(" %9s", fmt_t(secs[[e]])))
-    for (e in speedup_vs) row <- paste0(row, sprintf(" %10s", fmt_x(secs[[e]], secs[["glmm"]])))
+    for (e in speedup_vs) row <- paste0(row, sprintf(" %*s", vs_width[[e]], fmt_x(secs[[e]], secs[[ref]])))
     cat(row, "\n")
   }
 
@@ -195,7 +222,7 @@ main <- function() {
   heads <- setdiff(cids, copies)
   empirical <- vapply(heads, function(cid)
     startsWith(cells_all[[cid]]$data, "../data/empirical/"), TRUE)
-  glmm_secs <- vapply(heads, function(cid) secs_of(cid)[["glmm"]], 0)
+  glmm_secs <- vapply(heads, function(cid) secs_of(cid)[[ref]], 0)
   heads <- heads[order(!empirical, glmm_secs)]
 
   block <- ""
@@ -205,6 +232,15 @@ main <- function() {
     print_row(cid, cid)
     for (cp in copies[parent_of(copies) == cid]) print_row(cp, "    above_agq")
   }
+
+  # The timed steps per engine, mirroring the timed closures in
+  # engines/glmm_r.R, lmertest.R and glmmtmb.R -- change together.
+  if (opt_pipeline)
+    cat("\nTimed per sample, each engine starting from a typed data frame:\n",
+        "  glmm      fastglmm() with its defaults, summary(), anova()  (Type III F, Satterthwaite DenDF)\n",
+        "  lmerTest  lmerTest::lmer(), summary(), anova()              (Type III F, Satterthwaite DenDF)\n",
+        "  glmmTMB   glmmTMB(), summary(), dof_satt()                  (per-coefficient Satterthwaite df)\n",
+        "glmmTMB runs no F tests: it has no per-term F test with Satterthwaite df.\n", sep = "")
 }
 
 # GRID is this script's own directory, resolved from `--file=` exactly as

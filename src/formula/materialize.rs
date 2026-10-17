@@ -26,6 +26,7 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
+use std::sync::OnceLock;
 
 use super::error::Error;
 use super::parse::{parse, parse_transform, ParsedFormula, RandomEffect, Transform};
@@ -111,9 +112,9 @@ pub struct ReGroupInfo {
 ///
 /// `Lowered` is `#[non_exhaustive]`: outside this crate it cannot be built by
 /// struct literal, not even by struct update from a lowered value. Build one
-/// with [`lower`] and assign its public fields. It also carries a private
-/// field (the data cross-product the Type III hypotheses need), which on its
-/// own forbids construction outside the crate, so the example below fails
+/// with [`lower`] and assign its public fields. It also carries private
+/// fields (the data cross-products the hypothesis matrices need), which on
+/// their own forbid construction outside the crate, so the example below fails
 /// whatever the attribute says; the attribute keeps a new public field an
 /// additive change.
 ///
@@ -172,6 +173,10 @@ pub struct Lowered {
     pub has_intercept: bool,
     /// `Xᵀ·rdX` for the Type III hypotheses (`formula::hypotheses::type3`).
     pub(crate) rdx: RdxCross,
+    /// `XᵀX` over all `p` columns, filled by the first hypothesis builder
+    /// that reads it (`formula::hypotheses`), so the Type II and Type III
+    /// tables of one fit, and every fit of the design in a loop, share one.
+    pub(crate) xtx: OnceLock<faer::Mat<f64>>,
 }
 
 /// One fixed term of the formula, as R's `terms.formula` lists it.
@@ -415,6 +420,7 @@ pub fn materialize(ast: &ParsedFormula, data: &Table, family: Family) -> Result<
         terms: fixed_terms,
         has_intercept: ast.has_intercept,
         rdx,
+        xtx: OnceLock::new(),
     })
 }
 
@@ -887,7 +893,23 @@ fn grouping_level_count(re: &RandomEffect, data: &Table) -> Result<usize, Error>
         return Ok(distinct.len());
     }
     let (_, codes) = grouping_factor(&group, data)?;
-    Ok(codes.iter().collect::<BTreeSet<_>>().len())
+    Ok(observed_codes(&codes).into_iter().filter(|&o| o).count())
+}
+
+/// Per code `0..=max(codes)`, whether some row carries it (empty when
+/// `codes` is).
+fn observed_codes(codes: &[u32]) -> Vec<bool> {
+    let width = codes
+        .iter()
+        .copied()
+        .max()
+        .map(|m| m as usize + 1)
+        .unwrap_or(0);
+    let mut observed = vec![false; width];
+    for &c in codes {
+        observed[c as usize] = true;
+    }
+    observed
 }
 
 /// Dense per-row ids for one grouping, plus the label of every slot of its RE
@@ -964,16 +986,8 @@ fn grouping_ids(re: &RandomEffect, data: &Table) -> Result<GroupingLayout, Error
             // filtering, so a level declared after the last observed one has no
             // slot to label. A level with a slot but no row DOES cost RE width
             // and gets a labelled (fully shrunk) row plus a note.
-            let width = codes
-                .iter()
-                .copied()
-                .max()
-                .map(|m| m as usize + 1)
-                .unwrap_or(0);
-            let mut observed = vec![false; width];
-            for &c in codes.iter() {
-                observed[c as usize] = true;
-            }
+            let observed = observed_codes(&codes);
+            let width = observed.len();
             Ok(GroupingLayout {
                 ids: codes.to_vec(),
                 slot_labels: levels[..width].iter().cloned().map(Some).collect(),

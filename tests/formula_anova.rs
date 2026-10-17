@@ -586,6 +586,91 @@ fn formulas_that_differ_only_by_an_offset_refuse_by_the_offset() {
     assert_eq!(refusal(&m0, &m1), CompareError::DifferentOffset);
 }
 
+// ── Grouping parentheses ────────────────────────────────────────────────────
+
+/// A grouped fixed part lowers to R's design columns: the names, in order,
+/// are `colnames(model.matrix(f, d))` from R 4.5 on the data of `table()`.
+#[test]
+fn a_grouped_fixed_part_lowers_to_rs_design_columns() {
+    for (f, r_cols) in [
+        (
+            "y ~ a*(x + z)",
+            &["(Intercept)", "aa1", "x", "z", "aa1:x", "aa1:z"][..],
+        ),
+        (
+            "y ~ a:(x + z)",
+            &["(Intercept)", "aa0:x", "aa1:x", "aa0:z", "aa1:z"],
+        ),
+        (
+            "y ~ (a + x)*(b + z)",
+            &[
+                "(Intercept)",
+                "aa1",
+                "x",
+                "bb1",
+                "bb2",
+                "z",
+                "aa1:bb1",
+                "aa1:bb2",
+                "aa1:z",
+                "x:bb1",
+                "x:bb2",
+                "x:z",
+            ],
+        ),
+        (
+            "y ~ x*(a + z*b)",
+            &[
+                "(Intercept)",
+                "x",
+                "aa1",
+                "z",
+                "bb1",
+                "bb2",
+                "z:bb1",
+                "z:bb2",
+                "x:aa1",
+                "x:z",
+                "x:bb1",
+                "x:bb2",
+                "x:z:bb1",
+                "x:z:bb2",
+            ],
+        ),
+        (
+            "y ~ (x:z + a)*b",
+            &[
+                "(Intercept)",
+                "aa1",
+                "bb1",
+                "bb2",
+                "x:z",
+                "aa1:bb1",
+                "aa1:bb2",
+                "x:z:bb1",
+                "x:z:bb2",
+            ],
+        ),
+        (
+            "y ~ 0 + a*(x + z)",
+            &["aa0", "aa1", "x", "z", "aa1:x", "aa1:z"],
+        ),
+    ] {
+        let lo = lower(f, &table(), Family::Gaussian).unwrap_or_else(|e| panic!("{f}: {e}"));
+        assert_eq!(lo.col_names, r_cols, "{f}");
+    }
+}
+
+/// `compare` tests the block of interactions `a*(x + z)` adds as it tests
+/// the same block written out.
+#[test]
+fn compare_tests_a_grouped_block_as_its_written_out_form() {
+    let m0 = model("y ~ a + x + z", None);
+    let grouped = cmp(&m0, &model("y ~ a*(x + z)", None)).unwrap();
+    let written = cmp(&m0, &model("y ~ a + x + z + a:x + a:z", None)).unwrap();
+    assert_eq!(outcome(&grouped), outcome(&written));
+}
+
 // ── The cases and their references ──────────────────────────────────────────
 
 /// A CSV of the validation corpus as a `Table`: the columns named in

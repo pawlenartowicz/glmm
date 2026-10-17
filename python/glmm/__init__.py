@@ -367,7 +367,7 @@ def _levels_and_codes(col):
         # pandas marks a missing value as code -1; there is no level to fit it
         # against, so the caller drops that row the same way it drops a plain
         # column's missing value, rather than raising here.
-        codes = [int(c) for c in cat.codes]
+        codes = np.asarray(cat.codes, dtype=np.int64)
         return levels, codes
     # A pyarrow ChunkedArray has no `.dictionary`/`.indices` of its own, and
     # each chunk may carry a different dictionary. `unify_dictionaries()`
@@ -408,6 +408,66 @@ def _values(col):
     return list(col)
 
 
+# Element types `_plain_column` converts in one numpy call: what the per-row
+# path below would pass to `float()` (None as missing), and plain strings.
+_NUMBER_TYPES = {float, int, bool, type(None), np.float64}
+_STRING_TYPES = {str, np.str_}
+# Below this many elements numpy's fixed per-call cost exceeds the per-row
+# loop's, so a short column without a numeric dtype keeps the per-row path.
+_PLAIN_MIN_ROWS = 64
+
+
+def _plain_column(col):
+    """`col` vectorised, when it is all numbers or all strings, reading each
+    value exactly as `_prepare_columns`' per-row path (`_values`, `_is_na`,
+    `float()`, `str()`) would:
+
+    - `("num", values, keep)`: a numeric dtype, or elements that are all
+      `_NUMBER_TYPES`; `values` a float64 array with NaN where missing.
+    - `("str", codes, keys, keep)`: non-missing elements all strings; `keys`
+      the distinct values in first-seen order, `codes` each row's index into
+      them. `_is_na` runs once per distinct value, not once per row.
+
+    `keep` is the bool mask of present rows. None for anything else (mixed
+    types, dates, pyarrow, which `_values` unwraps) and for a column of fewer
+    than `_PLAIN_MIN_ROWS` elements without a numeric dtype: the caller keeps
+    the per-row path for it, so its result never depends on which path ran."""
+    dtype = getattr(col, "dtype", None)
+    if getattr(dtype, "kind", None) in ("i", "u", "f"):
+        try:
+            if hasattr(col, "to_numpy"):  # pandas, incl. nullable Int64/Float64
+                values = col.to_numpy(dtype=float, na_value=np.nan)
+            else:
+                values = np.asarray(col, dtype=float)
+        except (TypeError, ValueError):
+            return None
+        return ("num", values, ~np.isnan(values))
+    if hasattr(col, "to_pylist") or hasattr(col, "dictionary"):
+        return None
+    if isinstance(col, list):
+        elements = col
+    elif dtype is not None and hasattr(col, "tolist"):
+        elements = col.tolist()
+    elif dtype is not None or isinstance(col, tuple):
+        elements = list(col)
+    else:
+        return None
+    if len(elements) < _PLAIN_MIN_ROWS:
+        return None
+    if set(map(type, elements)) <= _NUMBER_TYPES:
+        values = np.array(elements, dtype=float)
+        return ("num", values, ~np.isnan(values))
+    index = {}
+    codes = np.fromiter(
+        (index.setdefault(v, len(index)) for v in elements), dtype=np.intp, count=len(elements)
+    )
+    keys = list(index)
+    missing = np.array([_is_na(k) for k in keys], dtype=bool)
+    if not all(type(k) in _STRING_TYPES for k, m in zip(keys, missing) if not m):
+        return None
+    return ("str", codes, keys, ~missing[codes])
+
+
 def _is_bool_column(col):
     """True for a bool column: `numpy.bool_`, pandas `bool` or the nullable
     `boolean` extension dtype, pyarrow `bool_`, or a plain list/tuple of
@@ -426,8 +486,14 @@ def _is_bool_column(col):
     if arrow_type is not None:
         return str(arrow_type) == "bool"
     if isinstance(col, (list, tuple)):
-        present = [v for v in col if v is not None]
-        return bool(present) and all(isinstance(v, (bool, np.bool_)) for v in present)
+        seen = False
+        for v in col:
+            if v is None:
+                continue
+            if not isinstance(v, (bool, np.bool_)):
+                return False
+            seen = True
+        return seen
     return False
 
 
@@ -1390,38 +1456,44 @@ def _prepare_columns(data, formulas, weights, offset, store, drop_missing_argume
     # categorical's missing rows (pandas code -1, pyarrow null) feed the same
     # `na_mask` as a plain column's missing values: `_levels_and_codes` never
     # raises on them, it just leaves the sentinel in `codes` for this loop to
-    # find. `na_mask` stays None until a missing value is seen anywhere.
+    # find. `na_mask` is None only when the formulas read no column at all.
+    #
+    # Numeric and plain-string columns go through `_plain_column` in one numpy
+    # pass; any other column keeps the per-row path ("values" below). Both
+    # read every value the same way, so the result never depends on the path.
     parsed = {}
-    na_mask = None
+    keeps = {}
     for name in used_names:
-        if name not in numeric_only and _is_bool_column(used_columns[name]):
-            values = _bool_values(used_columns[name])
-            parsed[name] = ("values", values)
-            keep = [not _is_na(v) for v in values]
-            na_mask = keep if na_mask is None else [a and b for a, b in zip(na_mask, keep)]
-            continue
-        declared = _levels_and_codes(used_columns[name])
-        if declared is not None:
-            levels, codes = declared
-            parsed[name] = ("factor", levels, codes)
-            keep = [c != -1 for c in codes]
-            na_mask = keep if na_mask is None else [a and b for a, b in zip(na_mask, keep)]
-            continue
-        values = _values(used_columns[name])
-        parsed[name] = ("values", values)
-        keep = [not _is_na(v) for v in values]
-        na_mask = keep if na_mask is None else [a and b for a, b in zip(na_mask, keep)]
+        col = used_columns[name]
+        if name not in numeric_only and _is_bool_column(col):
+            col = _bool_values(col)
+        else:
+            declared = _levels_and_codes(col)
+            if declared is not None:
+                levels, codes = declared
+                codes = np.asarray(codes, dtype=np.int64)
+                parsed[name] = ("factor", levels, codes)
+                keeps[name] = codes != -1
+                continue
+        entry = _plain_column(col)
+        if entry is None:
+            values = _values(col)
+            keep = np.fromiter((not _is_na(v) for v in values), dtype=bool, count=len(values))
+            entry = ("values", values, keep)
+        parsed[name] = entry
+        keeps[name] = entry[-1]
 
-    # A dict's columns can differ in length, and the `zip`s above stop at the
-    # shortest one, so a ragged dict is refused here, before `na_mask` is used.
+    # A dict's columns can differ in length, so a ragged dict is refused here,
+    # before the per-column masks are combined.
     # Same message as `run_fit`'s length check in `src/orchestrate.rs` — change
     # together.
-    lengths = sorted((name, len(entry[-1])) for name, entry in parsed.items())
+    lengths = sorted((name, len(keep)) for name, keep in keeps.items())
     if len({n for _, n in lengths}) > 1:
         detail = ", ".join(f'"{name}": {n}' for name, n in lengths)
         raise ValueError(
             f"columns have mismatched lengths ({detail}); all columns must have the same length"
         )
+    na_mask = np.logical_and.reduce(list(keeps.values())) if keeps else None
 
     # Checked against data's original rows, before the NA row drop below, as
     # R's fastglmm() checks them before na.action: a NaN weight is a bad
@@ -1437,10 +1509,11 @@ def _prepare_columns(data, formulas, weights, offset, store, drop_missing_argume
         offset = _row_array(offset, "offset", n_rows, drop_missing_arguments)
     for arr in (weights, offset):
         if drop_missing_arguments and arr is not None and na_mask is not None:
-            na_mask = [k and not math.isnan(v) for k, v in zip(na_mask, arr)]
+            na_mask = na_mask & ~np.isnan(arr)
 
-    if na_mask is not None and not all(na_mask):
-        n_kept = sum(na_mask)
+    drop = na_mask is not None and not na_mask.all()
+    if drop:
+        n_kept = int(na_mask.sum())
         if n_kept == 0:
             raise ValueError(f"every row has a missing value in {where}; no rows left to fit")
         _warn(
@@ -1450,32 +1523,51 @@ def _prepare_columns(data, formulas, weights, offset, store, drop_missing_argume
             "a missing value there.",
             RowsDroppedWarning,
         )
-        for name, entry in parsed.items():
-            if entry[0] == "factor":
-                _, levels, codes = entry
-                parsed[name] = ("factor", levels, [c for c, k in zip(codes, na_mask) if k])
-            else:
-                _, values = entry
-                parsed[name] = ("values", [v for v, k in zip(values, na_mask) if k])
         # weights=/offset= are caller-supplied arrays aligned to data's original
-        # rows, not columns of `data` itself, so the row drop above must repeat
-        # here.
+        # rows, not columns of `data` itself, so the row drop must repeat here.
         if weights is not None:
             weights = weights[na_mask]
         if offset is not None:
             offset = offset[na_mask]
 
+    # Columns cross as the raw bytes of float64 values and uint32 factor codes
+    # (`from_bytes` in glmm-python/src/lib.rs).
     numeric_columns = {}
     factor_columns = {}
     for name, entry in parsed.items():
-        if entry[0] == "factor":
-            factor_columns[name] = (entry[1], entry[2])
-            continue
-        values = entry[1]
-        if values and isinstance(values[0], str):
-            factor_columns[name] = _sorted_levels_and_codes([str(v) for v in values])
+        kind = entry[0]
+        if kind == "factor":
+            codes = entry[2][na_mask] if drop else entry[2]
+            factor_columns[name] = (entry[1], codes.astype(np.uint32).tobytes())
+        elif kind == "num":
+            values = entry[1][na_mask] if drop else entry[1]
+            numeric_columns[name] = values.tobytes()
+        elif kind == "str":
+            _, codes, keys, _ = entry
+            if drop:
+                codes = codes[na_mask]
+            if len(codes) == 0:
+                numeric_columns[name] = b""
+                continue
+            # Levels from the kept rows only, sorted as `_sorted_levels_and_codes`
+            # sorts them.
+            present = np.bincount(codes, minlength=len(keys)) > 0
+            # .tolist(): iterating the numpy array yields numpy integers, which
+            # index the `keys` list more slowly than Python ints.
+            levels = sorted({str(keys[i]) for i in np.flatnonzero(present).tolist()})
+            position = {level: i for i, level in enumerate(levels)}
+            # A key with no kept row is never indexed, so its 0 is a placeholder.
+            remap = np.array([position.get(str(k), 0) for k in keys], dtype=np.uint32)
+            factor_columns[name] = (levels, remap[codes].tobytes())
         else:
-            numeric_columns[name] = [float(v) for v in values]
+            values = entry[1]
+            if drop:
+                values = [v for v, k in zip(values, na_mask.tolist()) if k]
+            if values and isinstance(values[0], str):
+                levels, codes = _sorted_levels_and_codes([str(v) for v in values])
+                factor_columns[name] = (levels, np.asarray(codes, dtype=np.uint32).tobytes())
+            else:
+                numeric_columns[name] = np.array([float(v) for v in values], dtype=float).tobytes()
     return numeric_columns, factor_columns, weights, offset
 
 
@@ -1492,6 +1584,13 @@ def _lrt_result(t):
     """`_term_result` of a stored likelihood-ratio table, None when the fit
     stored none."""
     return None if t is None else _term_result(t)
+
+
+def _f64(b):
+    """A per-row vector `_native` returns as float64 bytes, as an array that
+    owns its data and is writable (`np.frombuffer` alone is a read-only view
+    of the bytes)."""
+    return np.frombuffer(b, dtype=np.float64).copy()
 
 
 def _fit_from_native(r, formula, family, link, nagq, dispersion, store):
@@ -1545,7 +1644,8 @@ def _fit_from_native(r, formula, family, link, nagq, dispersion, store):
             ArgumentIgnoredWarning,
         )
     # Wrap the native dict's plain lists back into the array types Fit's
-    # dataclass documents (no numpy Rust dep — the native call returns lists).
+    # dataclass documents (no numpy Rust dep — the native call returns lists,
+    # and the per-row vectors as bytes).
     res = Fit(
         beta=np.asarray(r["beta"], dtype=float),
         se=np.asarray(r["se"], dtype=float),
@@ -1572,9 +1672,9 @@ def _fit_from_native(r, formula, family, link, nagq, dispersion, store):
         loglik=r["loglik"],
         df=r["df"],
         reml=r["reml"],
-        fitted=np.asarray(r["fitted"], dtype=float),
-        ranef=np.asarray(r["ranef"], dtype=float),
-        ranef_levels=np.asarray(r["ranef_levels"], dtype=int),
+        fitted=_f64(r["fitted"]),
+        ranef=_f64(r["ranef"]),
+        ranef_levels=np.frombuffer(r["ranef_levels"], dtype=np.uint64).astype(int),
         ranef_blocks=[
             {
                 "group": b["group"],
@@ -1591,8 +1691,8 @@ def _fit_from_native(r, formula, family, link, nagq, dispersion, store):
         link=link,
         nagq=nagq if r["agq_warning"] is None else 1,
         nobs=int(r["nobs"]),
-        y=np.asarray(r["y"], dtype=float),
-        weights=np.asarray(r["weights"], dtype=float) if r["weights"] is not None else None,
+        y=_f64(r["y"]),
+        weights=_f64(r["weights"]) if r["weights"] is not None else None,
         coef_df=np.asarray(r["coef_df"], dtype=float),
         coef_p=np.asarray(r["coef_p"], dtype=float),
         df_method=r["df_method"],
@@ -1604,7 +1704,7 @@ def _fit_from_native(r, formula, family, link, nagq, dispersion, store):
         design_summary=None
         if r["design_summary"] is None
         else {k: np.asarray(v, dtype=float) for k, v in r["design_summary"].items()},
-        offset=np.asarray(r["offset"], dtype=float) if r["offset"] is not None else None,
+        offset=_f64(r["offset"]) if r["offset"] is not None else None,
         objective=r["objective"],
         objective_nodes=int(r["objective_nodes"]),
         term_table_type3=_term_result(r["term_table_type3"]),
@@ -1858,8 +1958,8 @@ def fit(
         wald_se,
         nagq,
         dispersion,
-        [float(w) for w in weights] if weights is not None else None,
-        [float(v) for v in offset] if offset is not None else None,
+        weights.tobytes() if weights is not None else None,
+        offset.tobytes() if offset is not None else None,
         warm_start_pair,
         satterthwaite,
         reml,

@@ -199,3 +199,71 @@ test_that("formula strings are accepted", {
   expect_s3_class(formula(fit), "formula")
   expect_equal(deparse(formula(fit)), "y ~ x")
 })
+
+frame_data <- function() {
+  set.seed(31)
+  n <- 40
+  data.frame(y = rnorm(n), x = rnorm(n), g = factor(rep(letters[1:8], each = 5)))
+}
+
+test_that("model.frame(fit) is the formula's columns after subset= and na.action", {
+  d <- frame_data()
+  n <- nrow(d)
+  vars <- c("y", "x", "g")
+  with_na <- d
+  with_na$x[3] <- NA
+  char_rows <- d
+  rownames(char_rows) <- paste0("r", seq_len(n))
+  labelled <- d
+  attr(labelled$x, "label") <- "the x"
+  factor_attr <- d
+  attr(factor_attr$g, "note") <- 1
+  named_col <- d
+  names(named_col$x) <- paste0("n", seq_len(n))
+  df_attr <- d
+  attr(df_attr, "note") <- "not carried into the frame"
+  # `ref` is the data.frame the expected frame is cut from, when `data` is not one.
+  cases <- list(
+    plain = list(data = d),
+    character_row_names = list(data = char_rows),
+    permuted_row_names = list(data = d[c(5:n, 1:4), ]),
+    # na.omit rebuilds every column with `[`, which drops a plain attribute.
+    label_attribute = list(data = labelled),
+    factor_with_extra_attribute = list(data = factor_attr),
+    named_column = list(data = named_col),
+    data_frame_attribute = list(data = df_attr),
+    list_input = list(data = as.list(d), ref = d),
+    missing_value = list(data = with_na),
+    na_exclude = list(data = with_na, na.action = stats::na.exclude),
+    na_exclude_complete = list(data = d, na.action = stats::na.exclude),
+    subset = list(data = d, subset = seq(1, n, 2))
+  )
+  for (nm in names(cases)) {
+    cs <- cases[[nm]]
+    naf <- if (is.null(cs$na.action)) stats::na.omit else cs$na.action
+    fit <- suppressWarnings(
+      fastglmm(y ~ x + (1 | g), cs$data, na.action = naf, subset = cs$subset)
+    )
+    expected <- (if (is.null(cs$ref)) cs$data else cs$ref)[vars]
+    if (!is.null(cs$subset)) expected <- expected[cs$subset, , drop = FALSE]
+    expect_true(identical(model.frame(fit), naf(expected)), label = nm)
+  }
+})
+
+test_that("a tibble keeps its class in model.frame(fit)", {
+  skip_if_not_installed("tibble")
+  d <- frame_data()
+  tb <- tibble::as_tibble(d)
+  fit <- fastglmm(y ~ x + (1 | g), tb)
+  expect_identical(class(model.frame(fit)), class(tb))
+  expect_identical(fit$beta, fastglmm(y ~ x + (1 | g), d)$beta)
+})
+
+test_that("a data.table keeps its class in model.frame(fit)", {
+  skip_if_not_installed("data.table")
+  d <- frame_data()
+  dt <- data.table::as.data.table(d)
+  fit <- fastglmm(y ~ x + (1 | g), dt)
+  expect_identical(class(model.frame(fit)), class(dt))
+  expect_identical(fit$beta, fastglmm(y ~ x + (1 | g), d)$beta)
+})

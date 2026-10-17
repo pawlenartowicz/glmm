@@ -76,6 +76,31 @@ negative-binomial and Gamma models with a single grouping factor and up to 3
 random effects per group; any other shape **warns and falls back to Laplace**
 (lme4 errors instead — watch for the warning).
 
+## Speed: from data to p-values
+
+The time from a data frame to a table with p-values, on Gaussian mixed models.
+Each package runs the steps a user runs:
+
+| package | steps timed |
+|---|---|
+| fastglmm 0.6.0 | `fastglmm()`, `summary()`, `anova()` |
+| lmerTest 3.2-1 | `lmerTest::lmer()`, `summary()`, `anova()` |
+| glmmTMB 1.1.14 | `glmmTMB()`, `summary()`, `dof_satt()` |
+
+All three give t tests per coefficient with Satterthwaite df. fastglmm and
+lmerTest also give Type III F tests with Satterthwaite denominator df. glmmTMB
+has no such F test, so it runs none.
+
+On 19 models (7 classic datasets, 12 simulated), fastglmm was 19 to 758 times
+faster than lmerTest (median 25). It was 107 to 876 times faster than glmmTMB
+(median 249) on 17 models; glmmTMB did not finish the other two within the
+600 s limit.
+
+Measured on 2026-10-16 on one core of an Intel Core Ultra 7 265H with the clock
+locked, R 4.5.3. Each time is the median of 3 runs after one warm-up run. To
+repeat it, see `run.sh --pipeline` and `summarize_timing.R --pipeline` in
+[`validation/README.md`](../validation/README.md).
+
 ## Development
 
 The Rust surface lives in the repo's `glmm-r` crate; `src/rust` is a thin

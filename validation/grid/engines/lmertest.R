@@ -68,7 +68,7 @@ make_fit <- function(cell, df) {
 # gate 5 has to see it; `singular` carries the fact instead.
 SINGULAR_NOTE <- "boundary (singular) fit"
 
-record_fit <- function(m, warns, rec) {
+record_fit <- function(m, warns, rec, s = with_warnings(summary(m))) {
   msgs <- as.character(unlist(m@optinfo$conv$lme4$messages))
   # The optimizer's own return code and warnings, read as lme4.R reads them:
   # lme4 skips its gradient checks above check.conv.nobsmax rows, so these are
@@ -90,9 +90,8 @@ record_fit <- function(m, warns, rec) {
   rec$coef_names <- I(names(fe))
   rec$beta <- I(unname(fe))
   # summary() computes the Satterthwaite df per retained coefficient, placed
-  # here by name. Its warnings are lmerTest's too and go to `message` with the
-  # fit's.
-  s <- with_warnings(summary(m))
+  # here by name; pipeline mode passes the one it timed. Its warnings are
+  # lmerTest's too and go to `message` with the fit's.
   notes <- c(notes, s$warnings)
   co <- s$value$coefficients
   rec["coef_df"] <- if ("df" %in% colnames(co)) {
@@ -107,18 +106,33 @@ record_fit <- function(m, warns, rec) {
   rec
 }
 
+# Pipeline mode times the fit, summary() and anova() (Type III, Satterthwaite
+# DenDF, lmerTest's defaults) together, and the record is read from what the
+# timed call returned.
 fit_cell <- function(env, cell) {
   rec <- grid_record(cell, "lmerTest", ENGINE_VERSION)
+  if (env$pipeline) grid_check_pipeline_cell(cell)
   df <- grid_read_cell(env, cell)
-  timed <- grid_time(env, make_fit(cell, df))
+  fit <- make_fit(cell, df)
+  timed <- grid_time(env, if (!env$pipeline) fit else function() {
+    f <- fit()
+    list(fit = f, summary = with_warnings(summary(f$value)),
+         anova = with_warnings(anova(f$value)))
+  })
   if (!is.null(timed$wall_seconds)) rec$wall_seconds <- timed$wall_seconds
   rec$fits_per_sample <- timed$fits_per_sample
-  record_fit(timed$value$value, timed$value$warnings, rec)
+  if (!env$pipeline) return(record_fit(timed$value$value, timed$value$warnings, rec))
+  v <- timed$value
+  a <- v$anova$value
+  rec$term_ddf <- as.list(setNames(a[["DenDF"]], rownames(a)))
+  record_fit(v$fit$value, c(v$fit$warnings, v$anova$warnings), rec, v$summary)
 }
 
 con <- grid_open_out(env)
 for (cell in grid_cells(env)) {
-  if (!("lmerTest" %in% unlist(cell[["oracles"]]))) next
+  # Pipeline mode lets every cell through to fit_cell, which fails one that is
+  # not Gaussian mixed rather than leave it without a record.
+  if (!env$pipeline && !("lmerTest" %in% unlist(cell[["oracles"]]))) next
   rec <- tryCatch(fit_cell(env, cell), error = function(e)
     grid_fail(grid_record(cell, "lmerTest", ENGINE_VERSION), conditionMessage(e)))
   grid_write(con, rec)

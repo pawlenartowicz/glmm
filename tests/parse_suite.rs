@@ -751,3 +751,136 @@ fn the_crossing_operator_is_a_syntax_error_outside_i() {
     let (_, fixed, _) = canonical(&parse("y ~ I(a^2)").unwrap());
     assert_eq!(fixed, ["I(a^2)"]);
 }
+
+// ── Grouping parentheses in the fixed part ──────────────────────────────────
+
+/// A grouped formula parses to its written-out form, terms in R's order:
+/// the term labels are `attr(terms(f), "term.labels")` from R 4.5.
+#[test]
+fn a_grouped_formula_parses_like_its_written_out_form() {
+    for (grouped, written, r_labels) in [
+        (
+            "y ~ a*(b + c)",
+            "y ~ a + b + c + a:b + a:c",
+            &["a", "b", "c", "a:b", "a:c"][..],
+        ),
+        ("y ~ a:(b + c)", "y ~ a:b + a:c", &["a:b", "a:c"]),
+        (
+            "y ~ (a + b)*(c + d)",
+            "y ~ a + b + c + d + a:c + a:d + b:c + b:d",
+            &["a", "b", "c", "d", "a:c", "a:d", "b:c", "b:d"],
+        ),
+        (
+            "y ~ (a + b)*c*d",
+            "y ~ a + b + c + d + a:c + b:c + a:d + b:d + c:d + a:c:d + b:c:d",
+            &[
+                "a", "b", "c", "d", "a:c", "b:c", "a:d", "b:d", "c:d", "a:c:d", "b:c:d",
+            ],
+        ),
+        ("y ~ (a + b)", "y ~ a + b", &["a", "b"]),
+        (
+            "y ~ a*(b + c*d)",
+            "y ~ a + b + c + d + c:d + a:b + a:c + a:d + a:c:d",
+            &["a", "b", "c", "d", "c:d", "a:b", "a:c", "a:d", "a:c:d"],
+        ),
+        ("y ~ c:(a + b)", "y ~ c:a + c:b", &["c:a", "c:b"]),
+        (
+            "y ~ x + a*(b + c) + a:b",
+            "y ~ x + a + b + c + a:b + a:c",
+            &["x", "a", "b", "c", "a:b", "a:c"],
+        ),
+        (
+            "y ~ a*(log(x) + z)",
+            "y ~ a + log(x) + z + a:log(x) + a:z",
+            &["a", "log(x)", "z", "a:log(x)", "a:z"],
+        ),
+        (
+            "y ~ (a*b*c)",
+            "y ~ a*b*c",
+            &["a", "b", "c", "a:b", "a:c", "b:c", "a:b:c"],
+        ),
+        (
+            "y ~ a*((b + c))",
+            "y ~ a*(b + c)",
+            &["a", "b", "c", "a:b", "a:c"],
+        ),
+        (
+            "y ~ a*(b + c) - 1",
+            "y ~ a + b + c + a:b + a:c - 1",
+            &["a", "b", "c", "a:b", "a:c"],
+        ),
+        (
+            "y ~ 0 + a*(b + c)",
+            "y ~ 0 + a + b + c + a:b + a:c",
+            &["a", "b", "c", "a:b", "a:c"],
+        ),
+        (
+            "y ~ a*(b + c) + (1 + b | g)",
+            "y ~ a + b + c + a:b + a:c + (1 + b | g)",
+            &["a", "b", "c", "a:b", "a:c"],
+        ),
+    ] {
+        let p = parse(grouped).unwrap_or_else(|e| panic!("{grouped}: {e}"));
+        assert_eq!(p, parse(written).unwrap(), "{grouped}");
+        assert_eq!(canonical(&p).1, r_labels, "{grouped}");
+    }
+}
+
+/// R numbers the variables by first appearance as written, where no
+/// written-out form of the terms can: `a:c` would number `c` before `b`.
+/// A term lists its variables in that order even where the degree sort
+/// moves it ahead of one written before it: in `(a:b + c)*d` the term
+/// `a:b:d` keeps `a` and `b` first, as R labels it.
+#[test]
+fn a_grouped_terms_variables_keep_their_written_order() {
+    for (f, r_labels) in [
+        ("y ~ (a + b):(c + d)", &["a:c", "a:d", "b:c", "b:d"][..]),
+        ("y ~ (a:b + c)*d", &["c", "d", "a:b", "c:d", "a:b:d"]),
+    ] {
+        let p = parse(f).unwrap();
+        assert_eq!(p.predictors, ["a", "b", "c", "d"], "{f}");
+        assert_eq!(canonical(&p).1, r_labels, "{f}");
+    }
+}
+
+#[test]
+fn an_unbalanced_or_empty_group_is_a_syntax_error() {
+    for (f, msg) in [
+        ("y ~ a*(b + c", "unbalanced parentheses in term 'a*(b+c'"),
+        (
+            "y ~ a*(b + c))",
+            "unbalanced parentheses in term 'a*(b+c))'",
+        ),
+        ("y ~ a*()", "empty parentheses in term 'a*()'"),
+        ("y ~ a*(b + ())", "empty parentheses in term 'a*(b+())'"),
+    ] {
+        assert_eq!(parse(f), syntax_error(0, msg), "{f}");
+    }
+}
+
+#[test]
+fn a_group_refuses_what_the_fixed_part_refuses() {
+    for f in ["y ~ a*(b - c)", "y ~ (a + b - c):d"] {
+        assert_eq!(parse(f), Err(ParseError::TermRemovalUnsupported), "{f}");
+    }
+    let msg = "the intercept (`1`, `0` or `- 1`) cannot be written inside parentheses";
+    for f in [
+        "y ~ a*(b + 1)",
+        "y ~ a*(0 + b)",
+        "y ~ a*(b - 1 + c)",
+        "y ~ (1 + a)*b",
+    ] {
+        assert_eq!(parse(f), syntax_error(0, msg), "{f}");
+    }
+    for (f, needle) in [
+        (
+            "y ~ a*(b + poly(x, 2))",
+            "expected identifier, got 'poly(x,2)'",
+        ),
+        ("y ~ a*(b + 2c)", "expected identifier, got '2c'"),
+        ("y ~ a*(b + c:)", "missing variable name in term 'a*(b+c:)'"),
+    ] {
+        let msg = parse(f).expect_err(f).to_string();
+        assert!(msg.contains(needle), "{f}: {msg}");
+    }
+}

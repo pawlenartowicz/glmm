@@ -37,15 +37,16 @@ def test_design_summary_is_kept_on_an_unweighted_random_intercept_fit_only():
 
 
 def test_native_fit_carries_offset_objective_and_term_tables():
-    # The raw `_native.fit` dict, before `glmm.Fit` stores these fields.
-    y = (1.0 + 2.0 * _X + _rng.normal(scale=0.5, size=_N)).tolist()
-    off = (0.1 * _X).tolist()
-    groups = ([f"g{i}" for i in range(30)], _GROUPS.tolist())
+    # The raw `_native.fit` dict, before `glmm.Fit` stores these fields. Per-row
+    # vectors cross as the bytes of float64 (uint32 for factor codes) arrays.
+    y = 1.0 + 2.0 * _X + _rng.normal(scale=0.5, size=_N)
+    off = 0.1 * _X
+    groups = ([f"g{i}" for i in range(30)], _GROUPS.astype(np.uint32).tobytes())
 
     def native(formula, offset):
         return glmm._native.fit(
             formula,
-            {"x": _X.tolist(), "y": y},
+            {"x": _X.tobytes(), "y": y.tobytes()},
             {"g": groups},
             "gaussian",
             "identity",
@@ -59,8 +60,8 @@ def test_native_fit_carries_offset_objective_and_term_tables():
             None,
         )
 
-    r = native("y ~ x + (1 | g)", off)
-    assert r["offset"] == off
+    r = native("y ~ x + (1 | g)", off.tobytes())
+    np.testing.assert_array_equal(np.frombuffer(r["offset"]), off)
     assert (r["objective"], r["objective_nodes"]) == ("reml", 0)
     t3 = r["term_table_type3"]
     assert (t3["error"], t3["ss_type"], t3["label"]) == (None, "III", ["x"])
@@ -69,6 +70,43 @@ def test_native_fit_carries_offset_objective_and_term_tables():
     assert refused["offset"] is None
     assert list(refused["term_table_type2"]) == ["error"]
     assert refused["term_table_type2"]["error"]
+
+
+def test_native_fit_refuses_bytes_that_are_not_whole_values():
+    def native(x, weights):
+        return glmm._native.fit(
+            "y ~ x",
+            {"x": x, "y": np.ones(4).tobytes()},
+            {},
+            "gaussian",
+            "identity",
+            "hessian",
+            1,
+            None,
+            weights,
+            None,
+            None,
+            False,
+            None,
+        )
+
+    with pytest.raises(ValueError, match=r'column "x": 31 bytes is not a whole number of 8-byte'):
+        native(b"\0" * 31, None)
+    with pytest.raises(ValueError, match=r"weights: 7 bytes is not a whole number of 8-byte"):
+        native(np.arange(4.0).tobytes(), b"\0" * 7)
+
+
+def test_per_row_fields_are_writable_float_arrays():
+    y = 1.0 + 2.0 * _X + _rng.normal(scale=0.5, size=_N)
+    m = glmm.fit(_data(y.tolist()), "y ~ x + (1 | g)", weights=np.ones(_N))
+    for name in ("fitted", "y", "ranef", "weights"):
+        a = getattr(m, name)
+        assert a.dtype == np.float64 and a.flags.writeable and a.flags.owndata, name
+    o = glmm.fit(_data(y.tolist()), "y ~ x", offset=0.1 * _X).offset
+    assert o.dtype == np.float64 and o.flags.writeable and o.flags.owndata
+    np.testing.assert_array_equal(o, 0.1 * _X)
+    assert m.ranef_levels.dtype == np.dtype(int)
+    assert m.ranef_levels.tolist() == [30]
 
 
 def test_binomial_glmm():

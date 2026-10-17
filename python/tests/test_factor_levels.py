@@ -186,6 +186,63 @@ def test_pandas_categorical_round_trips():
     assert glmm.fit(df2, "y ~ f").names == ["(Intercept)", "flow", "fmed"]
 
 
+# Columns of 6 and 66 rows: `glmm.fit` reads a short list row by row and a long
+# one through numpy, and both must give the same model.
+_REPS = pytest.mark.parametrize("reps", [1, 11], ids=["short", "long"])
+
+
+@_REPS
+@pytest.mark.parametrize("make", [list, np.array], ids=["list", "numpy"])
+def test_integer_column_is_a_numeric_predictor_not_a_factor(make, reps):
+    result = glmm.fit({"y": _Y * reps, "x": make([0, 1, 2, 0, 1, 2] * reps)}, "y ~ x")
+    assert result.names == ["(Intercept)", "x"]
+
+
+@_REPS
+@pytest.mark.parametrize("dtype", [None, "string"], ids=["default", "string"])
+def test_pandas_string_column_missing_value_drops_the_row(dtype, reps):
+    pd = pytest.importorskip("pandas")
+    labels = _LABELS * reps
+    labels[3] = None  # was "low"
+    df = pd.DataFrame({"y": _Y * reps, "f": pd.Series(labels, dtype=dtype)})
+    with pytest.warns(glmm.RowsDroppedWarning, match=rf"Dropped 1 of {6 * reps} row"):
+        result = glmm.fit(df, "y ~ f")
+    assert result.names == ["(Intercept)", "flow", "fmed"]
+    assert result.nobs == 6 * reps - 1
+
+
+@_REPS
+def test_polars_string_column_missing_value_drops_the_row(reps):
+    pl = pytest.importorskip("polars")
+    labels = _LABELS * reps
+    labels[3] = None  # was "low"
+    with pytest.warns(glmm.RowsDroppedWarning, match=rf"Dropped 1 of {6 * reps} row"):
+        result = glmm.fit(pl.DataFrame({"y": _Y * reps, "f": labels}), "y ~ f")
+    assert result.names == ["(Intercept)", "flow", "fmed"]
+    assert result.nobs == 6 * reps - 1
+
+
+@_REPS
+def test_level_seen_only_on_a_dropped_row_is_not_a_level(reps):
+    # Row 0 is dropped for its missing y, and with it the only "zz".
+    y = [None] + (_Y * reps)[1:]
+    f = ["zz"] + (_LABELS * reps)[1:]
+    with pytest.warns(glmm.RowsDroppedWarning, match=rf"Dropped 1 of {6 * reps} row"):
+        result = glmm.fit({"y": y, "f": f}, "y ~ f")
+    assert result.names == ["(Intercept)", "flow", "fmed"]
+
+
+@_REPS
+def test_mixed_object_column_reads_each_value_through_str(reps):
+    # 1 and True are equal as dict keys, but their labels "1" and "True" are
+    # two levels.
+    f = ["a", 1, True, "b"] * 2 * reps
+    y = [1.0, 2.0, 3.0, 4.0, 1.1, 2.1, 3.1, 4.1] * reps
+    result = glmm.fit({"y": y, "f": f}, "y ~ f")
+    assert result.names == ["(Intercept)", "fTrue", "fa", "fb"]
+    assert result.beta[0] == pytest.approx(2.05, abs=1e-6)  # mean of "1"
+
+
 def test_vcov_matches_se_and_is_symmetric():
     # vcov is the full p×p, se is its diagonal.
     result = glmm.fit({"y": _Y, "f": _LABELS}, "y ~ f")

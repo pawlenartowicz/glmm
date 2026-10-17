@@ -182,6 +182,11 @@ newest_glmm_run <- function(grid_dir, engine = "glmm", override = NULL) {
   if (!length(dirs)) return(NULL)
   metas <- lapply(dirs, function(d)
     jsonlite::fromJSON(file.path(d, "run_meta.json"), simplifyVector = TRUE))
+  # A --pipeline run times fit + tests for summarize_timing.R --pipeline only,
+  # and is never the run a gate or the accuracy report reads.
+  keep <- !vapply(metas, function(m) isTRUE(m$pipeline), TRUE)
+  dirs <- dirs[keep]; metas <- metas[keep]
+  if (!length(dirs)) return(NULL)
   full <- vapply(metas, function(m) identical(m$subset, "full"), TRUE)
   dates <- vapply(metas, `[[`, "", "date")
   # order(): full runs first, then newest date first within each group.

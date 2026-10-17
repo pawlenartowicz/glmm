@@ -199,8 +199,8 @@ fn fit_list(r: orchestrate::FitResult) -> List {
         ))
     }));
     // Labelled conditional modes, one entry per grouping. `ranef.fastglmm`
-    // reshapes each into lme4's named data.frame; nothing on the R side slices
-    // the flat `ranef` vector, because only the kernel knows the block layout.
+    // reshapes each into lme4's named data.frame. The flat `ranef` vector is
+    // not sent, because only the kernel knows the block layout.
     let ranef_blocks =
         List::from_values(r.ranef_blocks.iter().map(|(g, terms, levels, values)| {
             r!(list!(
@@ -221,7 +221,6 @@ fn fit_list(r: orchestrate::FitResult) -> List {
         beta = r.beta,
         se = r.se,
         vcov = vcov_flat,
-        tau2 = r.tau2,
         varcorr = varcorr,
         stddev_se = r.stddev_se,
         aliased = r.aliased,
@@ -242,12 +241,6 @@ fn fit_list(r: orchestrate::FitResult) -> List {
         df = r.df as f64,
         reml = r.reml,
         fitted = r.fitted,
-        ranef = r.ranef,
-        ranef_levels = r
-            .ranef_levels
-            .iter()
-            .map(|&v| v as f64)
-            .collect::<Vec<f64>>(),
         ranef_blocks = ranef_blocks,
         y = r.y,
         weights = weights,

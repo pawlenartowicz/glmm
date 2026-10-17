@@ -225,21 +225,40 @@ record_glmmtmb <- function(cell, m, fit_warnings, rec) {
   rec
 }
 
+# Pipeline mode times the fit, summary() and dof_satt() together: glmmTMB's
+# per-coefficient Satterthwaite df, taken by numDeriv Jacobians over the
+# variance parameters. glmmTMB has no per-term F test with Satterthwaite DenDF,
+# so `term_ddf` stays null.
 fit_cell <- function(env, cell) {
   rec <- grid_record(cell, "glmmTMB", ENGINE_VERSION)
+  if (env$pipeline) grid_check_pipeline_cell(cell)
   df <- grid_read_cell(env, cell)
+  fit <- make_fit(cell, df)
   # Reading and typing the data frame stays outside the timed region: the
   # other engines are also holding typed data when their own timer starts.
-  timed <- grid_time(env, make_fit(cell, df))
+  timed <- grid_time(env, if (!env$pipeline) fit else function() {
+    f <- fit()
+    list(fit = f, summary = with_warnings(summary(f$value)),
+         dof = with_warnings(glmmTMB::dof_satt(f$value)))
+  })
   if (!is.null(timed$wall_seconds)) rec$wall_seconds <- timed$wall_seconds
   rec$fits_per_sample <- timed$fits_per_sample
-  fit <- timed$value   # with_warnings() result: list(value = <model>, warnings = <chr>)
-  record_glmmtmb(cell, fit$value, fit$warnings, rec)
+  if (!env$pipeline) {
+    fit <- timed$value   # with_warnings() result: list(value = <model>, warnings = <chr>)
+    return(record_glmmtmb(cell, fit$value, fit$warnings, rec))
+  }
+  v <- timed$value
+  rec$coef_df <- I(as.numeric(v$dof$value))
+  rec["term_ddf"] <- list(NULL)
+  record_glmmtmb(cell, v$fit$value,
+                 c(v$fit$warnings, v$summary$warnings, v$dof$warnings), rec)
 }
 
 con <- grid_open_out(env)
 for (cell in grid_cells(env)) {
-  if (!("glmmTMB" %in% unlist(cell[["oracles"]]))) next
+  # Pipeline mode lets every cell through to fit_cell, which fails one that is
+  # not Gaussian mixed rather than leave it without a record.
+  if (!env$pipeline && !("glmmTMB" %in% unlist(cell[["oracles"]]))) next
   rec <- tryCatch(fit_cell(env, cell),
                   error = function(e) grid_fail(
                     grid_record(cell, "glmmTMB", ENGINE_VERSION), conditionMessage(e)))

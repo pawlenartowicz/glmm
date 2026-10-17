@@ -3,8 +3,9 @@
 //! error substrings against them, so both must stay stable across changes to
 //! this file.
 //!
-//! `*` is desugared into main effects + all interactions and `A/B` into a
-//! nesting relation *while parsing* — there is no separate normalize pass.
+//! `*` is desugared into main effects + all interactions, a grouped fixed
+//! part (`a*(b + c)`) into the terms it stands for, and `A/B` into a nesting
+//! relation *while parsing* — there is no separate normalize pass.
 
 use super::error::ParseError;
 use regex::Regex;
@@ -167,8 +168,9 @@ pub enum RandomEffect {
 /// Returns a [`ParseError`] for malformed formulas:
 /// - [`ParseError::EmptyFormula`] if the formula is empty or has no RHS.
 /// - [`ParseError::Syntax`] if a token is not a valid identifier (e.g. contains
-///   parentheses or other invalid characters), the formula ends with `+`, or
-///   the `^` crossing operator appears outside an `I(...)` call.
+///   invalid characters), the formula ends with `+`, the `^` crossing
+///   operator appears outside an `I(...)` call, a group's parentheses are
+///   unbalanced or empty, or a group holds the intercept (`a*(b + 1)`).
 /// - [`ParseError::TermRemovalUnsupported`] if the formula contains a `-` term
 ///   removal (e.g. `y ~ x - z`).
 /// - [`ParseError::DuplicateGroupingVar`] if the same grouping factor appears
@@ -268,6 +270,10 @@ pub fn parse(input: &str) -> Result<ParsedFormula, ParseError> {
         offset = Some(expr);
         rhs_stripped = clean_residual_plusses(&OFFSET_TERM.replace(&rhs_stripped, "+"));
     }
+
+    // Before the intercept regexes below, which would read a `1`, `0` or `-1`
+    // inside a group as the whole formula's intercept.
+    check_no_intercept_in_groups(&rhs_stripped)?;
 
     let mut has_intercept = true;
     let explicit_intercept = EXPLICIT_INTERCEPT.is_match(&rhs_stripped);
@@ -626,7 +632,47 @@ fn parse_rhs(rhs: &str) -> Result<(Vec<String>, Vec<Term>), ParseError> {
     let mut terms: Vec<Term> = Vec::new();
     let mut seen_term: BTreeSet<String> = BTreeSet::new();
 
-    for raw_term in rhs.split('+') {
+    // A piece with a group goes through `expand_group`; every other piece is
+    // split on `+` and read term by term, exactly as before grouping existed,
+    // so a formula without a group parses (and fails) as it always has. A
+    // piece with a `|` is a random-effect term no regex took, left to fail
+    // below as a plain syntax error.
+    for piece in split_outside_parens(rhs) {
+        if !has_group(piece) || piece.contains('|') {
+            parse_plain_terms(
+                piece,
+                &mut predictors,
+                &mut seen_pred,
+                &mut terms,
+                &mut seen_term,
+            )?;
+            continue;
+        }
+        let (vars, expanded) = expand_group(piece)?;
+        register_vars(&vars, &mut predictors, &mut seen_pred);
+        for t in expanded {
+            if seen_term.insert(interaction_key(&t)) {
+                terms.push(match <[String; 1]>::try_from(t) {
+                    Ok([name]) => Term::Main { name },
+                    Err(vars) => Term::Interaction { vars },
+                });
+            }
+        }
+    }
+
+    Ok((predictors, terms))
+}
+
+/// The `+`-separated terms of a piece with no group: a main effect, an
+/// `a:b` interaction, or an `a*b` product.
+fn parse_plain_terms(
+    piece: &str,
+    predictors: &mut Vec<String>,
+    seen_pred: &mut std::collections::BTreeSet<String>,
+    terms: &mut Vec<Term>,
+    seen_term: &mut std::collections::BTreeSet<String>,
+) -> Result<(), ParseError> {
+    for raw_term in piece.split('+') {
         let term = raw_term.trim();
         if term.is_empty() {
             continue;
@@ -634,7 +680,7 @@ fn parse_rhs(rhs: &str) -> Result<(Vec<String>, Vec<Term>), ParseError> {
 
         if term.contains('*') {
             let vars = distinct(parse_identifier_list(term, &['*'])?);
-            register_vars(&vars, &mut predictors, &mut seen_pred);
+            register_vars(&vars, predictors, seen_pred);
             for v in &vars {
                 if seen_term.insert(v.clone()) {
                     terms.push(Term::Main { name: v.clone() });
@@ -649,7 +695,7 @@ fn parse_rhs(rhs: &str) -> Result<(Vec<String>, Vec<Term>), ParseError> {
             }
         } else if term.contains(':') {
             let vars = distinct(parse_identifier_list(term, &[':'])?);
-            register_vars(&vars, &mut predictors, &mut seen_pred);
+            register_vars(&vars, predictors, seen_pred);
             if let [name] = &vars[..] {
                 if seen_term.insert(name.clone()) {
                     terms.push(Term::Main { name: name.clone() });
@@ -667,8 +713,232 @@ fn parse_rhs(rhs: &str) -> Result<(Vec<String>, Vec<Term>), ParseError> {
             }
         }
     }
+    Ok(())
+}
 
-    Ok((predictors, terms))
+/// `s` split on the `+` signs outside any parentheses. A stray `)` does not
+/// take the depth below zero, so the piece it ends stays apart from the next.
+fn split_outside_parens(s: &str) -> Vec<&str> {
+    let mut pieces = Vec::new();
+    let (mut depth, mut start) = (0usize, 0);
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            '+' if depth == 0 => {
+                pieces.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    pieces.push(&s[start..]);
+    pieces
+}
+
+fn is_name_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Whether `s` has a grouping `(`: one not directly after a name, where it
+/// would open a call (`log(x)`, `I(x^2)`).
+fn has_group(s: &str) -> bool {
+    let mut prev = None;
+    s.chars().any(|c| {
+        let group = c == '(' && !prev.is_some_and(is_name_char);
+        prev = Some(c);
+        group
+    })
+}
+
+/// Refuses a `1`, `0` or `-1` term directly inside a group. R's term algebra
+/// carries such an intercept through `*` and `:`; this parser has no
+/// intercept term to carry, and the intercept regexes in [`parse`] would read
+/// it as the whole formula's. A group holding a `|` is a random-effect term
+/// no regex took, left to fail as a plain syntax error.
+fn check_no_intercept_in_groups(s: &str) -> Result<(), ParseError> {
+    // Per open `(`: the byte its contents start at, `None` for a call.
+    let mut open: Vec<Option<usize>> = Vec::new();
+    let mut prev = None;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => open.push((!prev.is_some_and(is_name_char)).then_some(i + 1)),
+            ')' => {
+                if let Some(Some(start)) = open.pop() {
+                    let inner = &s[start..i];
+                    if !inner.contains('|')
+                        && (NO_INTERCEPT_MINUS.is_match(inner)
+                            || NO_INTERCEPT_ZERO.is_match(inner)
+                            || EXPLICIT_INTERCEPT.is_match(inner))
+                    {
+                        return Err(ParseError::Syntax {
+                            pos: 0,
+                            msg: "the intercept (`1`, `0` or `- 1`) cannot be written inside \
+                                  parentheses"
+                                .into(),
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+        prev = Some(c);
+    }
+    Ok(())
+}
+
+/// One fixed term as its variable names.
+type TermVars = Vec<String>;
+
+/// A piece with grouping parentheses, desugared by R's term algebra
+/// (`EncodeVars` in R's `model.c`): `+` joins two term lists, `l:r` is every
+/// term of `l` with every term of `r`, and `l*r` is `l + r + l:r`, each step
+/// dropping a term already listed. `:` binds tighter than `*`, and `*`
+/// tighter than `+`, as in R. Returns the variables in written order, which
+/// is how R numbers them, and the terms stably sorted by degree, so that
+/// `(a*b*c)` gives the terms of `a*b*c` in the order its `*` lists them.
+fn expand_group(piece: &str) -> Result<(Vec<String>, Vec<TermVars>), ParseError> {
+    let mut p = GroupParser {
+        s: piece,
+        pos: 0,
+        vars: Vec::new(),
+    };
+    let mut terms = p.sum()?;
+    if p.pos < piece.len() {
+        // `sum` stops early only at a `)`, here one with no `(`.
+        return Err(p.unbalanced());
+    }
+    terms.sort_by_key(Vec::len);
+    Ok((distinct(p.vars), terms))
+}
+
+/// A recursive-descent reader of one piece, one method per precedence level.
+struct GroupParser<'a> {
+    s: &'a str,
+    /// Byte offset of the next unread character.
+    pos: usize,
+    /// Every variable name read, in written order, repeats included.
+    vars: Vec<String>,
+}
+
+impl GroupParser<'_> {
+    fn peek(&self) -> Option<char> {
+        self.s[self.pos..].chars().next()
+    }
+
+    fn syntax(&self, what: &str) -> ParseError {
+        ParseError::Syntax {
+            pos: 0,
+            msg: format!("{what} in term '{}'", self.s),
+        }
+    }
+
+    fn unbalanced(&self) -> ParseError {
+        self.syntax("unbalanced parentheses")
+    }
+
+    fn sum(&mut self) -> Result<Vec<TermVars>, ParseError> {
+        let mut out = self.product()?;
+        while self.peek() == Some('+') {
+            self.pos += 1;
+            out.extend(self.product()?);
+        }
+        if self.peek() == Some('-') {
+            return Err(ParseError::TermRemovalUnsupported);
+        }
+        Ok(drop_repeats(out))
+    }
+
+    fn product(&mut self) -> Result<Vec<TermVars>, ParseError> {
+        let mut out = self.interaction()?;
+        while self.peek() == Some('*') {
+            self.pos += 1;
+            let right = self.interaction()?;
+            let both = interact(&out, &right);
+            out.extend(right);
+            out.extend(both);
+            out = drop_repeats(out);
+        }
+        Ok(out)
+    }
+
+    fn interaction(&mut self) -> Result<Vec<TermVars>, ParseError> {
+        let mut out = self.atom()?;
+        while self.peek() == Some(':') {
+            self.pos += 1;
+            out = interact(&out, &self.atom()?);
+        }
+        Ok(out)
+    }
+
+    fn atom(&mut self) -> Result<Vec<TermVars>, ParseError> {
+        match self.peek() {
+            Some('-') => Err(ParseError::TermRemovalUnsupported),
+            Some('(') => {
+                self.pos += 1;
+                if self.peek() == Some(')') {
+                    return Err(self.syntax("empty parentheses"));
+                }
+                let inner = self.sum()?;
+                if self.peek() != Some(')') {
+                    return Err(self.unbalanced());
+                }
+                self.pos += 1;
+                Ok(inner)
+            }
+            _ => {
+                let name = self.name()?;
+                self.vars.push(name.clone());
+                Ok(vec![vec![name]])
+            }
+        }
+    }
+
+    /// A variable name or a call (`log(x)`), checked as a plain term is.
+    fn name(&mut self) -> Result<String, ParseError> {
+        let start = self.pos;
+        // Only a call's `(` gets here: `atom` takes a group's.
+        let mut depth = 0usize;
+        while let Some(c) = self.peek() {
+            match c {
+                '(' => depth += 1,
+                ')' if depth == 0 => break,
+                ')' => depth -= 1,
+                '+' | '*' | ':' | '-' if depth == 0 => break,
+                _ => {}
+            }
+            self.pos += c.len_utf8();
+        }
+        if depth > 0 {
+            return Err(self.unbalanced());
+        }
+        match &self.s[start..self.pos] {
+            "" => Err(self.syntax("missing variable name")),
+            name => parse_single_identifier(name),
+        }
+    }
+}
+
+/// Every term of `left` with every term of `right`, `left` in the outer loop
+/// (R's `InteractTerms`). A variable in both is listed once.
+fn interact(left: &[TermVars], right: &[TermVars]) -> Vec<TermVars> {
+    let both = left
+        .iter()
+        .flat_map(|l| {
+            right
+                .iter()
+                .map(move |r| distinct(l.iter().chain(r).cloned().collect()))
+        })
+        .collect();
+    drop_repeats(both)
+}
+
+/// `terms` without the repeat listings of a term, the first kept (R's
+/// `TrimRepeats`).
+fn drop_repeats(mut terms: Vec<TermVars>) -> Vec<TermVars> {
+    let mut seen = std::collections::BTreeSet::new();
+    terms.retain(|t| seen.insert(interaction_key(t)));
+    terms
 }
 
 /// An interaction's identity for deduplication. R's `terms.formula` codes a

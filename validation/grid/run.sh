@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # The one runner for every accuracy-grid engine.
 #
-#   ./run.sh <engine> [--fast] [--timed[=N]] [--ml] [--jobs N] [--label TEXT] [--keep]
-#            [--complete-from DIR] [cell ...]
+#   ./run.sh <engine> [--fast] [--timed[=N]] [--pipeline] [--ml] [--jobs N] [--label TEXT]
+#            [--keep] [--complete-from DIR] [cell ...]
 #
 #   engine   glmm | glmm_wasm | glmm_python | glmm_r | lme4 | glmmtmb | glmmadaptive | mixedmodels
 #            | lmertest
@@ -17,6 +17,12 @@
 #            Also REFUSES to start without `taskset`, which pins the one worker,
 #            unless --timed-unlocked is given (the worker then runs unpinned).
 #            The user locks the machine (bench-l); this script only records the state.
+#   --pipeline  time the inference pipeline instead of the fit: fit, per-coefficient
+#            t tests and per-term F tests, Satterthwaite df. IMPLIES --timed (so
+#            --fast and --jobs 1; --timed=N still sets N). glmm_r, lmertest and
+#            glmmtmb only, on the fast cells whose `oracles` name lmerTest (the
+#            Gaussian mixed cells). Recorded as `pipeline` in run_meta; a kept run
+#            goes to last-pipeline/, and summarize_timing.R --pipeline reports it.
 #   --ml     add the cells tagged `ml` (the ML twins of the Gaussian mixed cells) to a
 #            --fast or --timed run, which runs without them otherwise. Recorded as
 #            `ml` in run_meta, where `compare.R --fast` reads it. A full run fits the
@@ -69,6 +75,7 @@ FAST=0
 ML=0
 TIMED_N=""
 TIMED_UNLOCKED=0
+PIPELINE=0
 JOBS=1
 LABEL=""
 KEEP=0
@@ -85,6 +92,7 @@ while [[ $# -gt 0 ]]; do
     --timed) TIMED_N=4; shift ;;
     --timed=*) TIMED_N="${1#*=}"; shift ;;
     --timed-unlocked) TIMED_UNLOCKED=1; shift ;;
+    --pipeline) PIPELINE=1; shift ;;
     --jobs) JOBS="${2:?--jobs needs a count}"; shift 2 ;;
     --jobs=*) JOBS="${1#*=}"; shift ;;
     --label) LABEL="${2:?--label needs text}"; shift 2 ;;
@@ -99,9 +107,15 @@ while [[ $# -gt 0 ]]; do
 done
 CELL_ARGS=("$@")
 
-# --timed implies --fast and --jobs 1: it raises the SAME flag --fast raises, so
-# there is one path to SUBSET=fast rather than two.
+# --pipeline implies --timed, and --timed implies --fast and --jobs 1: it raises
+# the SAME flag --fast raises, so there is one path to SUBSET=fast rather than two.
+[[ "$PIPELINE" == 1 && -z "$TIMED_N" ]] && TIMED_N=4
 [[ -n "$TIMED_N" ]] && { FAST=1; JOBS=1; }
+case "$ENGINE" in
+  glmm_r|lmertest|glmmtmb) ;;
+  *) [[ "$PIPELINE" == 0 ]] \
+       || { echo "--pipeline runs glmm_r, lmertest or glmmtmb only (got $ENGINE)" >&2; exit 2; } ;;
+esac
 
 # SUBSET is THREE-VALUED and derived HERE, after parsing, never assigned by a
 # flag handler. The narrowest claim wins:
@@ -180,13 +194,18 @@ command -v taskset >/dev/null && PIN_CORES="0-$((JOBS - 1))"
 # one non-fast cell would select nothing -- SUBSET is "cells", and a two-arm
 # filter would demand the `fast` tag of anything that is not "full".
 # --ml (fast runs only) lets the cells tagged `ml` through the same filter.
+# --pipeline keeps the cells whose `oracles` name lmerTest: gen_manifest.R names it
+# on every Gaussian cell with a random effect (mirrors common.R's
+# grid_check_pipeline_cell -- change together).
 select_cells() {
   jq -r --arg subset "$SUBSET" --arg eng "$ENGINE_MANIFEST_NAME" \
-    --argjson ml "$([[ "$ML" == 1 ]] && echo true || echo false)" '
+    --argjson ml "$([[ "$ML" == 1 ]] && echo true || echo false)" \
+    --argjson pipe "$([[ "$PIPELINE" == 1 ]] && echo true || echo false)" '
     [ .cells[]
       | select(($subset == "full") or ($subset == "cells") or (.tags | index("fast"))
                or ($ml and (.tags | index("ml"))))
       | select(.oracles | index($eng) or ($eng == ""))
+      | select(($pipe | not) or (.oracles | index("lmerTest")))
       | {c: .cell, a: (-(.n_obs)), b: (-(.n_theta // 0))} ]
     | sort_by([.a, .b, .c]) | .[].c' "$GRID/manifest.json"
 }
@@ -315,11 +334,12 @@ write_run_meta() {   # $1 = the cell_list JSON array
     --argjson timed "${TIMED_N:-null}" \
     --argjson unlocked "$([[ "$TIMED_UNLOCKED" == 1 ]] && echo true || echo false)" \
     --argjson ml "$([[ "$ML" == 1 ]] && echo true || echo false)" \
+    --argjson pipeline "$([[ "$PIPELINE" == 1 ]] && echo true || echo false)" \
     --argjson jobs "$JOBS" --argjson cells "${#SELECTED[@]}" \
     --argjson cell_list "$cell_list" \
     '{engine: $engine, engine_version: $engine_version, machine: $machine, date: $date,
       glmm_crate_version: $crate, glmm_git_rev: $rev, subset: $subset, ml: $ml,
-      timed: $timed, timed_unlocked: $unlocked, no_turbo: $no_turbo,
+      timed: $timed, pipeline: $pipeline, timed_unlocked: $unlocked, no_turbo: $no_turbo,
       pin_cores: $pin, jobs: $jobs, loadavg_start: $loadavg,
       r_version: $r, julia_version: $jl, label: $label, cells: $cells,
       cell_list: $cell_list,
@@ -331,13 +351,16 @@ write_run_meta() {   # $1 = the cell_list JSON array
 write_run_meta "$CELL_LIST_JSON"
 
 # ---- engine dispatch -------------------------------------------------------
-# Exactly the three run-wide variables of the engine environment contract, plus
-# per-worker GRID_OUT and GRID_CELLS below -- and no others. The version pins are
+# Exactly the four run-wide variables of the engine environment contract, plus
+# per-worker GRID_OUT and GRID_CELLS below -- and no others. The fourth,
+# GRID_PIPELINE, is read only by glmm_r, lmertest and glmmtmb, and is unset
+# unless --pipeline is given. The version pins are
 # not passed either (each engine reads versions.json out of the grid directory),
 # and neither is the watchdog budget: no engine caps its own fits, killing the
 # process from outside is the only cell cap.
 export GRID_DIR="$GRID" GRID_MANIFEST="$GRID/manifest.json" \
        GRID_TIMED="${TIMED_N:-}"
+if [[ "$PIPELINE" == 1 ]]; then export GRID_PIPELINE=1; else unset GRID_PIPELINE; fi
 # Thread counts: every engine fits SERIAL so six workers do not oversubscribe the
 # machine. Exported here rather than set in seven scripts. RAYON_NUM_THREADS is
 # in the list because faer's default features pull rayon in. Mirrored in

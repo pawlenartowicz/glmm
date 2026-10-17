@@ -507,6 +507,18 @@ def test_pyarrow_null_in_a_used_string_column_drops_its_row():
     assert result.nobs == 5
 
 
+@pytest.mark.parametrize("dtype", ["Int64", "Float64"])
+def test_pandas_nullable_numeric_missing_value_drops_its_row(dtype):
+    pd = pytest.importorskip("pandas")
+    x = pd.array([0, 1, None, 3, 4], dtype=dtype)
+    df = pd.DataFrame({"y": [1.0, 2.0, 3.5, 4.0, 6.0], "x": x})
+    with pytest.warns(glmm.RowsDroppedWarning, match=r"Dropped 1 of 5 row"):
+        result = glmm.fit(df, "y ~ x")
+    plain = glmm.fit({"y": [1.0, 2.0, 4.0, 6.0], "x": [0.0, 1.0, 3.0, 4.0]}, "y ~ x")
+    assert result.names == ["(Intercept)", "x"]
+    _np.testing.assert_array_equal(result.beta, plain.beta)
+
+
 def test_polars_null_in_a_used_column_drops_its_row():
     pl = pytest.importorskip("polars")
     df = pl.DataFrame({"y": [1.0, 2.0, 3.0, 4.0], "x": [0.0, 1.0, None, 3.0]})

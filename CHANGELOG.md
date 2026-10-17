@@ -8,6 +8,20 @@ shares these entries; Python-specific notes are called out where they differ.
 
 ## [Unreleased]
 
+### Added
+
+- **Parentheses group terms in the fixed part of a formula, as in R.** `*`
+  and `:` distribute over a parenthesized sum: `y ~ a*(b + c)` is
+  `y ~ a + b + c + a:b + a:c`, `y ~ a:(b + c)` is `y ~ a:b + a:c`, and
+  `(a + b)*(c + d)` crosses every term on the left with every term on the
+  right. A grouped formula fits the same model as its written-out form, with
+  the same design columns in R's order, so `compare()` tests a block such as
+  `sex*(pc1 + pc2 + pc3)` against `sex + pc1 + pc2 + pc3` in one go. Groups
+  can nest and can hold transforms (`a*(log(x) + z)`). Python and R get this
+  through the shared parser. Every formula that parsed before parses to the
+  same result. `(a + b)^2` is still refused, and so are an intercept (`1`,
+  `0`, `- 1`) and `-` term removal inside parentheses.
+
 ### Fixed
 
 - **GLMM fits on counts that span many orders of magnitude no longer stop

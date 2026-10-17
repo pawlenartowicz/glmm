@@ -11,10 +11,13 @@
 #   GRID_OUT       the JSONL file to append to (default <GRID_DIR>/results.jsonl)
 #   GRID_CELLS     comma-separated cell ids this worker must fit; empty = all
 #   GRID_TIMED     "" or "0" = untimed, else the sample count, an integer >= 2
+# plus one read only by glmm_r.R, lmertest.R and glmmtmb.R, so not mirrored:
+#   GRID_PIPELINE  "1" = each timed sample is the whole inference pipeline (fit,
+#                  per-coefficient t tests, per-term F tests), not the fit alone
 
 suppressMessages(library(jsonlite))
 
-# Reads the five environment variables and nothing else. No budget field: no
+# Reads the six environment variables and nothing else. No budget field: no
 # engine caps its own fits, the run harness's watchdog is the only cell cap and
 # it works by killing the process from outside.
 grid_env <- function() {
@@ -29,7 +32,17 @@ grid_env <- function() {
        manifest_path = grid_getenv("GRID_MANIFEST", file.path(grid_dir, "manifest.json")),
        out_path = grid_getenv("GRID_OUT", file.path(grid_dir, "results.jsonl")),
        cells = if (length(cells[nzchar(cells)]) == 0) NULL else cells[nzchar(cells)],
-       timed = grid_timed())
+       timed = grid_timed(),
+       pipeline = identical(Sys.getenv("GRID_PIPELINE"), "1"))
+}
+
+# Pipeline mode fits the Gaussian mixed cells only, which gen_manifest.R marks by
+# naming lmerTest among a cell's oracles; run.sh selects them by the same test --
+# change together. Any other cell is an error, so it is recorded as a failed cell.
+grid_check_pipeline_cell <- function(cell) {
+  if (!("lmerTest" %in% unlist(cell[["oracles"]])))
+    stop("pipeline mode fits only the Gaussian mixed cells (oracles naming lmerTest); ",
+         cell[["cell"]], " is not one", call. = FALSE)
 }
 
 # Sys.getenv's own default fires only when the variable is UNSET; a variable

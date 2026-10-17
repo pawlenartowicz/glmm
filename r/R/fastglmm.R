@@ -339,14 +339,17 @@ fastglmm <- function(formula, data, family = gaussian(),
 
   # --- data prep: row filtering (subset, na.action) happens HERE, on the
   # data.frame, before marshalling - data prep, not parsing (spec section 3.1). ---
-  data <- .as_data_frame(data, all.vars(formula))
   vars <- all.vars(formula)
+  data <- .as_data_frame(data, vars)
   frame <- .data_columns(data, vars)
   .check_contrasts(formula, frame)
-  frame <- .add_weights(frame, eval(substitute(weights), data, parent.frame()), nrow(data))
-  frame <- .add_offset(frame, eval(substitute(offset), data, parent.frame()), nrow(data))
+  e <- substitute(weights)
+  if (!is.null(e)) frame <- .add_weights(frame, eval(e, data, parent.frame()), nrow(data))
+  e <- substitute(offset)
+  if (!is.null(e)) frame <- .add_offset(frame, eval(e, data, parent.frame()), nrow(data))
 
-  s <- eval(substitute(subset), data, parent.frame())
+  e <- substitute(subset)
+  s <- if (is.null(e)) NULL else eval(e, data, parent.frame())
   if (!is.null(s)) frame <- frame[s, , drop = FALSE]
 
   naf <- if (is.character(na.action)) {
@@ -356,11 +359,13 @@ fastglmm <- function(formula, data, family = gaussian(),
   }
   if (!is.function(naf)) stop("invalid na.action", call. = FALSE)
   n_before_na <- nrow(frame)
-  frame <- naf(frame)
-  if (anyNA(frame[vars])) {
-    stop("missing values remain in the model columns after na.action; ",
-         "the kernel cannot fit NA - use na.action = na.omit or complete ",
-         "the data", call. = FALSE)
+  if (!(identical(naf, stats::na.omit) && .na_omit_is_identity(frame))) {
+    frame <- naf(frame)
+    if (anyNA(frame[vars])) {
+      stop("missing values remain in the model columns after na.action; ",
+           "the kernel cannot fit NA - use na.action = na.omit or complete ",
+           "the data", call. = FALSE)
+    }
   }
   if (nrow(frame) == 0L) {
     # Mirrors the Python port's fit(), which raises the same text when its own
@@ -468,11 +473,11 @@ fastglmm <- function(formula, data, family = gaussian(),
   }
 
   p <- length(r$beta)
-  beta <- stats::setNames(r$beta, r$names)
-  se <- stats::setNames(r$se, r$names)
-  aliased <- stats::setNames(r$aliased, r$names)
-  coef_df <- stats::setNames(r$coef_df, r$names)
-  coef_p <- stats::setNames(r$coef_p, r$names)
+  beta <- r$beta; names(beta) <- r$names
+  se <- r$se; names(se) <- r$names
+  aliased <- r$aliased; names(aliased) <- r$names
+  coef_df <- r$coef_df; names(coef_df) <- r$names
+  coef_p <- r$coef_p; names(coef_p) <- r$names
   # Aliased (rank-deficient) slots print as NA, lme4/lm-style, not NaN.
   beta[aliased] <- NA_real_
   se[aliased] <- NA_real_
@@ -661,7 +666,30 @@ fastglmm <- function(formula, data, family = gaussian(),
     stop("column(s) not found in data: ", paste(missing_cols, collapse = ", "),
          call. = FALSE)
   }
+  # Builds what `[.data.frame` returns, without its dispatch overhead. Only for
+  # a plain data.frame: a subclass (tibble, data.table, sf) has its own `[`,
+  # and model.frame(fit) keeps whatever class that returns.
+  if (identical(oldClass(data), "data.frame")) {
+    return(structure(.subset(data, vars), names = vars,
+                     row.names = .row_names_info(data, 0L), class = "data.frame"))
+  }
   data[vars]
+}
+
+# Whether na.omit(frame) would return `frame` unchanged (identical()), so
+# the call can be skipped: no missing value anywhere, and every column passes
+# through `[` untouched - no attributes, or a plain factor's levels + class.
+# `[` drops other attributes, such as a "label".
+.na_omit_is_identity <- function(frame) {
+  for (x in frame) {
+    # anyNA() on a classed vector runs any(is.na(x)), allocating a logical
+    # vector; a factor's missing values are its NA codes, so the codes are
+    # scanned directly.
+    if (anyNA(if (is.factor(x)) unclass(x) else x)) return(FALSE)
+    a <- attributes(x)
+    if (!is.null(a) && !identical(names(a), c("levels", "class"))) return(FALSE)
+  }
+  TRUE
 }
 
 # `frame` with the evaluated weights= argument `w` parked as "(weights)", or
@@ -724,7 +752,7 @@ fastglmm <- function(formula, data, family = gaussian(),
   factor_levels <- list()
   factor_codes <- list()
   for (nm in vars) {
-    col <- frame[[nm]]
+    col <- .subset2(frame, nm)
     if (is.character(col) || (is.logical(col) && !(nm %in% numeric_only))) {
       col <- factor(col) # lexicographic (FALSE < TRUE), as factor() does
     }
@@ -795,8 +823,8 @@ fastglmm <- function(formula, data, family = gaussian(),
 # clean fit. Mirrors the Python port's `Fit.warnings` - change together.
 .warnings_frame <- function(store) {
   col <- function(name) vapply(store$rows, `[[`, character(1), name)
-  data.frame(tier = col("tier"), kind = col("kind"), title = col("title"),
-             message = col("message"), stringsAsFactors = FALSE)
+  list2DF(list(tier = col("tier"), kind = col("kind"), title = col("title"),
+               message = col("message")))
 }
 
 # Names of the RE components the optimizer pinned at the boundary, as
@@ -1249,7 +1277,7 @@ fastglmm <- function(formula, data, family = gaussian(),
   if (is.null(fixed_rhs)) return(invisible())
   has_unordered_factor <- FALSE
   for (nm in all.vars(fixed_rhs)) {
-    col <- frame[[nm]]
+    col <- .subset2(frame, nm)
     if (is.null(col)) next
     if (is.ordered(col)) {
       stop("column '", nm, "' is an ordered factor: glmm codes factors ",

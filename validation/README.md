@@ -23,7 +23,7 @@ Everything under `validation/` is dev-only and never shipped: the nested
 From `grid/`:
 
 ```sh
-./run.sh <engine> [--fast] [--timed[=N]] [--ml] [--jobs N] [--label TEXT] [--keep] [cell ...]
+./run.sh <engine> [--fast] [--timed[=N]] [--pipeline] [--ml] [--jobs N] [--label TEXT] [--keep] [cell ...]
 ```
 
 - `engine` is one of `glmm`, `glmm_python`, `glmm_r`, `lme4`, `glmmtmb`,
@@ -39,6 +39,15 @@ From `grid/`:
   only records the state. It also refuses to start without `taskset`, which pins
   the one worker to core 0, unless `--timed-unlocked` is given: the worker then
   runs unpinned (macOS) and the run is marked unlocked.
+- `--pipeline` times the inference pipeline instead of the fit alone: the fit,
+  the per-coefficient t tests and the per-term F tests, with Satterthwaite df. It
+  implies `--timed` (`--timed=N` still sets N) and runs on the `fast` cells whose
+  `oracles` name lmerTest, the Gaussian mixed cells. Only `glmm_r`
+  (`fastglmm()`, `summary()`, `anova()`), `lmertest` (`lmerTest::lmer()`,
+  `summary()`, `anova()`) and `glmmtmb` (`glmmTMB()`, `summary()`, `dof_satt()`)
+  accept it; glmmTMB has no per-term F test with Satterthwaite df, so it runs
+  none. Records add `term_ddf` (term → F denominator df, null for glmmTMB). The
+  flag is recorded as `pipeline` in `run_meta.json`.
 - `--ml` adds the cells tagged `ml` to a `--fast` or `--timed` run, which runs
   without them otherwise. They are the 129 ML twins of the Gaussian mixed cells
   (all but `sim_entangled_pair_lmm`, whose deviance gate reads a frozen REML
@@ -63,7 +72,7 @@ Then:
 ```sh
 Rscript compare.R [--glmm-run=DIR] [--fast] [--ports-only] [--dev-floor]   # the gates; exit 0 pass, 1 fail, 2 could not run
 Rscript summarize_accuracy.R [--glmm-run=DIR] [--fast]       # per-cell and per-family report
-Rscript summarize_timing.R [--glmm-run=DIR]                  # timed runs only, provenance first
+Rscript summarize_timing.R [--glmm-run=DIR] [--pipeline]     # timed runs only, provenance first
 Rscript gen_manifest.R && Rscript gen.R                      # regenerate the cell list and its data
 ```
 
@@ -75,10 +84,13 @@ A fresh machine reaches the pinned oracle set with `Rscript install_oracles.R`.
   `grid/runs/<engine>/scratch/<date>_<version>_<machine>[_<label>]/`, holding
   `results.jsonl` and `run_meta.json`; a second run on the same day gets a
   counter. `scratch/` is not in git. When a kept run finishes, `grid/promote.sh`
-  moves it into one of two fixed folders, the only ones git tracks:
+  moves it into one of three fixed folders, the only ones git tracks:
   `runs/<engine>/last/` for a full untimed run, `runs/<engine>/last-timed/` for a
-  timed run. A new timed run replaces only the cells it fitted and carries the
-  rest over, listing their runs under `carried` in `run_meta.json`. The run a
+  timed run, `runs/<engine>/last-pipeline/` for a `--pipeline` run. A new timed or
+  pipeline run replaces only the cells it fitted and carries the
+  rest over, listing their runs under `carried` in `run_meta.json`.
+  `summarize_timing.R` reports the fit-only timed runs and skips pipeline runs;
+  `summarize_timing.R --pipeline` reports only the pipeline runs. The run a
   slot held before moves back to `scratch/`, and git history keeps every
   committed one: `git log -p -- grid/runs/glmm/last/` is the run history.
 - **Oracle references** — an oracle's reference is `runs/<oracle>/last/`, and

@@ -6,6 +6,8 @@
 #
 #   runs/<engine>/last/        the newest full, untimed run -- the accuracy reference
 #   runs/<engine>/last-timed/  the newest timed run, plus the cells it did not fit
+#   runs/<engine>/last-pipeline/  the newest --pipeline run (timed inference
+#                              pipelines), plus the cells it did not fit
 #
 # run.sh calls this at the end of every oracle run and every --keep run, once all
 # workers finished, so a run that dies never replaces the run before it. A fast or
@@ -15,8 +17,9 @@
 # under its own name (`run_name` in its run_meta.json), and git history keeps every
 # committed version -- `git log -p -- runs/glmm/last/` is the run history.
 #
-# TIMED MERGE. An oracle timed run is often a few named cells (the ones added to
-# the manifest), so a new timed run replaces only the cells it fitted: the slot's
+# TIMED MERGE, for last-timed/ and last-pipeline/ alike. An oracle timed run is
+# often a few named cells (the ones added to the manifest), so a new timed run
+# replaces only the cells it fitted: the slot's
 # records for every other manifest cell are carried into it, and its run_meta.json
 # lists the runs they came from under `carried`. summarize_timing.R reads that
 # list for provenance and for its one-machine check. It can name a run whose cells
@@ -27,8 +30,11 @@ RUN="$(cd "${1:?usage: ./promote.sh <run dir>}" && pwd)"
 [[ -f "$RUN/run_meta.json" && -f "$RUN/results.jsonl" ]] \
   || { echo "promote.sh: $RUN is not a run directory" >&2; exit 2; }
 
-read -r ENGINE SUBSET TIMED < <(jq -r '[.engine, .subset, (.timed // "null")] | @tsv' "$RUN/run_meta.json")
-if   [[ "$TIMED" != null ]]; then SLOT=last-timed
+read -r ENGINE SUBSET TIMED PIPELINE < <(jq -r \
+  '[.engine, .subset, (.timed // "null"), (.pipeline // false)] | @tsv' "$RUN/run_meta.json")
+# pipeline before timed: a pipeline run is also timed.
+if   [[ "$PIPELINE" == true ]]; then SLOT=last-pipeline
+elif [[ "$TIMED" != null ]]; then SLOT=last-timed
 elif [[ "$SUBSET" == full ]]; then SLOT=last
 else
   echo ">> $ENGINE: a $SUBSET untimed run has no kept slot -- it stays in $RUN"
@@ -39,7 +45,7 @@ DEST="$ROOT/$SLOT"
 [[ "$RUN" != "$DEST" ]] || { echo "promote.sh: $RUN already is the $SLOT slot" >&2; exit 2; }
 
 if [[ -d "$DEST" ]]; then
-  if [[ "$SLOT" == last-timed ]]; then
+  if [[ "$SLOT" == last-timed || "$SLOT" == last-pipeline ]]; then
     have="$(jq -rR 'fromjson? | .cell' "$RUN/results.jsonl" | jq -R . | jq -sc .)"
     known="$(jq -c '[.cells[].cell]' "$GRID/manifest.json")"
     carried="$(jq -cR --argjson have "$have" --argjson known "$known" \

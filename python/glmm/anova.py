@@ -437,8 +437,8 @@ def compare(
         family,
         link,
         nagq,
-        None if weights is None else [float(w) for w in weights],
-        None if offset is None else [float(v) for v in offset],
+        None if weights is None else weights.tobytes(),
+        None if offset is None else offset.tobytes(),
         nsim,
         seed,
     )
