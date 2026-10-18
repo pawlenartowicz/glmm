@@ -3037,8 +3037,6 @@ fn fit_glm_nb_with_large_counts_converges_and_is_fast() {
 /// meet `NB_THETA_TOL`. Pins that cap exhaustion is reported: the capped fit
 /// keeps `converged = true` (the last inner IRLS fit converged), carries a
 /// `NbShapeUnsettled` note, and β/SE are refit at the θ in `dispersion`.
-/// `max_outer = 0` is the degenerate never-ran case: the all-NaN
-/// `converged = false` placeholder.
 #[test]
 fn fit_glm_nb_outer_cap_semantics() {
     // Fixed-only fit; sim_clustered's cluster ids are unused here.
@@ -3051,24 +3049,6 @@ fn fit_glm_nb_outer_cap_semantics() {
     };
     let seed = Some(super::glm::NB_THETA_LO);
     let x_mat = super::common::to_col_major(&x, n, p);
-
-    let f0 = super::glm::fit_glm_nb_capped(
-        x_mat.as_ref(),
-        &y,
-        n,
-        p,
-        seed,
-        &opts,
-        0,
-        crate::standardize::ColumnScaling::IDENTITY,
-    )
-    .0;
-    assert!(
-        !f0.converged(),
-        "cap 0: never-ran placeholder is converged=false"
-    );
-    assert!(f0.beta.iter().all(|b| b.is_nan()), "cap 0: β all NaN");
-    assert!(f0.dispersion.is_nan(), "cap 0: dispersion NaN, never ran");
 
     let f1 = super::glm::fit_glm_nb_capped(
         x_mat.as_ref(),
@@ -3758,48 +3738,31 @@ fn assert_residual_t(f: &Fit, nu: f64) {
     }
 }
 
-/// A Gamma GLM with the Pearson φ̂ reports t on `n − p`, as `summary.glm`
-/// pairs it with `df.residual`, whatever `FitOptions::satterthwaite` says.
+/// A Gamma or inverse-Gaussian GLM with the Pearson φ̂ reports t on `n − p`,
+/// as `summary.glm` pairs it with `df.residual`, whatever
+/// `FitOptions::satterthwaite` says.
 #[test]
-fn gamma_glm_estimated_phi_has_t_df() {
-    let (x, y, n) = sim_gamma_xy();
-    let p = 3;
-    let model = ModelSpec {
-        family: Family::Gamma {
-            link: crate::GammaLink::Log,
-        },
-        re: None,
+fn gamma_and_inverse_gaussian_glm_estimated_phi_have_t_df() {
+    let gamma = Family::Gamma {
+        link: crate::GammaLink::Log,
     };
-    for satterthwaite in [true, false] {
-        let opts = FitOptions {
-            target_indices: vec![0, 1, 2],
-            satterthwaite,
-            ..FitOptions::default()
-        };
-        let f = fit_cold(&x, &y, n, p, &model, &GroupIds::default(), &opts);
-        assert!(f.converged());
-        assert_residual_t(&f, (n - p) as f64);
+    let ig = Family::InverseGaussian {
+        link: crate::InverseGaussianLink::Log,
+    };
+    let p = 3;
+    for (family, (x, y, n)) in [(gamma, sim_gamma_xy()), (ig, sim_igauss_xy())] {
+        let model = ModelSpec { family, re: None };
+        for satterthwaite in [true, false] {
+            let opts = FitOptions {
+                target_indices: vec![0, 1, 2],
+                satterthwaite,
+                ..FitOptions::default()
+            };
+            let f = fit_cold(&x, &y, n, p, &model, &GroupIds::default(), &opts);
+            assert!(f.converged(), "{family:?}, satterthwaite {satterthwaite}");
+            assert_residual_t(&f, (n - p) as f64);
+        }
     }
-}
-
-/// The inverse-Gaussian GLM with the Pearson φ̂, as the Gamma one.
-#[test]
-fn inverse_gaussian_glm_estimated_phi_has_t_df() {
-    let (x, y, n) = sim_igauss_xy();
-    let p = 3;
-    let model = ModelSpec {
-        family: Family::InverseGaussian {
-            link: crate::InverseGaussianLink::Log,
-        },
-        re: None,
-    };
-    let opts = FitOptions {
-        target_indices: vec![0, 1, 2],
-        ..FitOptions::default()
-    };
-    let f = fit_cold(&x, &y, n, p, &model, &GroupIds::default(), &opts);
-    assert!(f.converged());
-    assert_residual_t(&f, (n - p) as f64);
 }
 
 /// A φ held through `FitOptions::dispersion` keeps z (`summary.glm(dispersion

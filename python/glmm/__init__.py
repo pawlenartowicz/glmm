@@ -357,9 +357,9 @@ def _levels_and_codes(col):
 
     Duck-typed on `.categories`/`.codes` — no hard pandas dependency, matching
     `_columns`' `hasattr(data, "column_names")` style. Covers pandas
-    `Categorical`/`Series[category]` (via `.cat`) and pyarrow dictionary
-    columns, bare `DictionaryArray` or the `ChunkedArray` a Table's `.column()`
-    returns. A plain string column has no declared order and is handled by the
+    `Categorical`/`Series[category]` (via `.cat`), polars `Enum`, and pyarrow
+    dictionary columns, bare `DictionaryArray` or the `ChunkedArray` a Table's
+    `.column()` returns. A plain string column has no declared order and is handled by the
     caller."""
     cat = getattr(col, "cat", col)  # pandas Series[category] -> .cat accessor
     if hasattr(cat, "categories") and hasattr(cat, "codes"):
@@ -369,6 +369,14 @@ def _levels_and_codes(col):
         # column's missing value, rather than raising here.
         codes = np.asarray(cat.codes, dtype=np.int64)
         return levels, codes
+    # A polars Enum declares its levels on the dtype; `to_physical()` gives
+    # each row's index into them, None for a missing value. A polars
+    # Categorical has no declared order (its dtype's `categories` is a string
+    # cache, not a level list), so it takes the plain-string path below.
+    dtype = getattr(col, "dtype", None)
+    if str(dtype).startswith("Enum") and hasattr(col, "to_physical"):
+        codes = [-1 if c is None else c for c in col.to_physical().to_list()]
+        return [str(v) for v in dtype.categories], codes
     # A pyarrow ChunkedArray has no `.dictionary`/`.indices` of its own, and
     # each chunk may carry a different dictionary. `unify_dictionaries()`
     # rewrites every chunk against one shared dictionary (first chunk's values
@@ -408,10 +416,13 @@ def _values(col):
     return list(col)
 
 
-# Element types `_plain_column` converts in one numpy call: what the per-row
-# path below would pass to `float()` (None as missing), and plain strings.
+# Element types `_plain_column` converts in one pass: what the per-row path
+# below would pass to `float()` (None as missing), and plain strings. The
+# tuples are what `_native.plain_column` takes.
 _NUMBER_TYPES = {float, int, bool, type(None), np.float64}
 _STRING_TYPES = {str, np.str_}
+_NUMBER_TYPES_T = tuple(_NUMBER_TYPES)
+_STRING_TYPES_T = tuple(_STRING_TYPES)
 # Below this many elements numpy's fixed per-call cost exceeds the per-row
 # loop's, so a short column without a numeric dtype keeps the per-row path.
 _PLAIN_MIN_ROWS = 64
@@ -431,7 +442,10 @@ def _plain_column(col):
     `keep` is the bool mask of present rows. None for anything else (mixed
     types, dates, pyarrow, which `_values` unwraps) and for a column of fewer
     than `_PLAIN_MIN_ROWS` elements without a numeric dtype: the caller keeps
-    the per-row path for it, so its result never depends on which path ran."""
+    the per-row path for it, so its result never depends on which path ran.
+
+    A list is read by `_native.plain_column` in one pass in Rust; when it
+    answers None, the numpy and dict code below reads the list instead."""
     dtype = getattr(col, "dtype", None)
     if getattr(dtype, "kind", None) in ("i", "u", "f"):
         try:
@@ -454,14 +468,22 @@ def _plain_column(col):
         return None
     if len(elements) < _PLAIN_MIN_ROWS:
         return None
-    if set(map(type, elements)) <= _NUMBER_TYPES:
+    native = _native.plain_column(elements, _NUMBER_TYPES_T, _STRING_TYPES_T)
+    if native is not None and native[0] == "num":
+        values = np.frombuffer(native[1], dtype=np.float64).copy()
+        return ("num", values, ~np.isnan(values))
+    if native is not None:
+        _, codes, keys = native
+        codes = np.frombuffer(codes, dtype=np.intp)
+    elif set(map(type, elements)) <= _NUMBER_TYPES:
         values = np.array(elements, dtype=float)
         return ("num", values, ~np.isnan(values))
-    index = {}
-    codes = np.fromiter(
-        (index.setdefault(v, len(index)) for v in elements), dtype=np.intp, count=len(elements)
-    )
-    keys = list(index)
+    else:
+        index = {}
+        codes = np.fromiter(
+            (index.setdefault(v, len(index)) for v in elements), dtype=np.intp, count=len(elements)
+        )
+        keys = list(index)
     missing = np.array([_is_na(k) for k in keys], dtype=bool)
     if not all(type(k) in _STRING_TYPES for k, m in zip(keys, missing) if not m):
         return None
@@ -470,14 +492,15 @@ def _plain_column(col):
 
 def _is_bool_column(col):
     """True for a bool column: `numpy.bool_`, pandas `bool` or the nullable
-    `boolean` extension dtype, pyarrow `bool_`, or a plain list/tuple of
-    Python `bool` (an `object`-dtype array unwraps to the same check).
+    `boolean` extension dtype, polars `Boolean`, pyarrow `bool_`, or a plain
+    list/tuple of Python `bool` (an `object`-dtype array unwraps to the same
+    check).
 
     Checked on the column object, the way `_levels_and_codes` inspects it
     before `_values` flattens it into scalars that no longer carry a dtype."""
     dtype = getattr(col, "dtype", None)
     if dtype is not None:
-        if str(dtype) in ("bool", "boolean"):
+        if str(dtype) in ("bool", "boolean", "Boolean"):
             return True
         if str(dtype) != "object":
             return False
@@ -1458,7 +1481,7 @@ def _prepare_columns(data, formulas, weights, offset, store, drop_missing_argume
     # raises on them, it just leaves the sentinel in `codes` for this loop to
     # find. `na_mask` is None only when the formulas read no column at all.
     #
-    # Numeric and plain-string columns go through `_plain_column` in one numpy
+    # Numeric and plain-string columns go through `_plain_column` in one
     # pass; any other column keeps the per-row path ("values" below). Both
     # read every value the same way, so the result never depends on the path.
     parsed = {}

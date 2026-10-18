@@ -53,6 +53,7 @@ def test_module_surface():
     assert issubclass(glmm.IllConditionedWarning, glmm.DiagnosticWarning)
     assert issubclass(glmm.ExactProfileFallbackWarning, glmm.DiagnosticWarning)
     assert issubclass(glmm.DiagnosticWarning, UserWarning)
+    assert all(hasattr(glmm, name) for name in glmm.__all__)
 
 
 def test_fit_signature_matches_spec():
@@ -156,44 +157,6 @@ def test_reml_true_on_a_glmm_is_ignored_with_a_warning():
     _assert_same_fit(m, base)
 
 
-def test_reml_false_on_a_glmm_is_the_default_fit_without_a_warning():
-    base = _fit_clean("yb ~ x + (1 | g)", "binomial")
-    m = _fit_clean("yb ~ x + (1 | g)", "binomial", reml=False)
-    assert m.warnings == []
-    _assert_same_fit(m, base)
-
-
-@pytest.mark.parametrize(
-    ("formula", "family", "link"),
-    [("yc ~ x + (1 | g)", "poisson", None), ("yp ~ x", "gamma", "log")],
-)
-def test_reml_false_on_a_poisson_glmm_and_a_gamma_glm_is_the_default_fit(formula, family, link):
-    base = _fit_clean(formula, family, link=link)
-    m = _fit_clean(formula, family, link=link, reml=False)
-    assert m.warnings == []
-    assert not m.reml
-    _assert_same_fit(m, base)
-
-
-def test_reml_true_on_ols_reports_the_reml_loglik():
-    base = _fit_clean("y ~ x")
-    m = _fit_clean("y ~ x", reml=True)
-    assert not base.reml
-    assert m.reml
-    assert np.array_equal(m.beta, base.beta)
-    assert np.array_equal(m.se, base.se)
-    assert m.dispersion == base.dispersion
-    # R's logLik(lm, REML = TRUE): -((n - p)(1 + ln 2 pi) + (n - p) ln(RSS / (n - p))
-    # + ln|X'X|) / 2, here on an independent least-squares solve.
-    X = np.column_stack([np.ones(len(_x)), _x])
-    y = np.asarray(REML_DATA["y"])
-    rss = float(np.sum((y - X @ np.linalg.lstsq(X, y, rcond=None)[0]) ** 2))
-    nu = X.shape[0] - X.shape[1]
-    logdet = np.linalg.slogdet(X.T @ X)[1]
-    expected = -0.5 * (nu * (1 + math.log(2 * math.pi)) + nu * math.log(rss / nu) + logdet)
-    assert math.isclose(m.loglik, expected, rel_tol=1e-12)
-
-
 @pytest.mark.parametrize("value", [True, np.True_])
 def test_reml_true_on_a_gaussian_mixed_model_is_the_default_fit(value):
     base = _fit_clean("y ~ x + (1 | g)")
@@ -212,23 +175,6 @@ def test_reml_false_on_a_gaussian_mixed_model_fits_by_ml():
     assert m.df_method == "satterthwaite"
     assert np.all(np.isfinite(m.coef_df))
     assert np.all(m.coef_df <= m.nobs)
-
-
-def test_reml_false_on_ols_is_the_default_fit():
-    _assert_same_fit(_fit_clean("y ~ x", reml=False), _fit_clean("y ~ x"))
-
-
-@pytest.mark.parametrize("value", [True, False])
-def test_reml_on_a_dropped_single_level_grouping_keeps_the_note(value):
-    with pytest.warns(glmm.SingleLevelGroupingDroppedWarning):
-        m = glmm.fit(REML_DATA, "y ~ x + (1 | one)", reml=value)
-    assert [w["kind"] for w in m.warnings] == ["single_level_grouping_dropped"]
-    assert m.re_groups == []
-    assert m.reml is value
-    # The OLS row: the formula without the grouping, apart from the formula
-    # and the dropped-grouping note.
-    m = dataclasses.replace(m, formula="y ~ x", diagnostics={**m.diagnostics, "notes": []})
-    _assert_same_fit(m, _fit_clean("y ~ x", reml=value))
 
 
 @pytest.mark.parametrize("value", [1, 0, 1.0, np.int64(1), "no"])

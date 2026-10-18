@@ -183,7 +183,7 @@ its datasets lose a fit.
 | ML likelihood-ratio test of a Gaussian fixed part | Gaussian cells, `K ≥ 30` | two-sided, `δ = 0.25` |
 | 50:50 mixture tests of a variance component | the cells with enough information per cluster: Gaussian; counts except mean 0.34 at `M = 3`; binary at `M ≥ 9` except prevalence 0.10 at `M = 9`; less the cells whose fits failed too often in a pilot | not anti-conservative, `δ = 0.25`; on the Gaussian random-slope test at `K ≥ 50` also not conservative at α = 0.10, `δ = 0` |
 
-The cell lists are `mc_gated` in `validation/grid/tol.R`. Everything else is
+The cell lists are `mc_data::bands` in `src/inference/mc_data.rs`. Everything else is
 reported only: the GLMM rows of the two-df factor `f3`, the GLM rows, the AGQ arm,
 the profile intervals, power, bias and RMSE, and every cell outside the table. The
 set was fixed from theory and a pilot (on other seeds) before the measurement and
@@ -286,5 +286,5 @@ The run prints one `CELL` line per cell, then one `TEST` line per test (`R_kept`
 aliased and failed datasets, the rates at α = 0.01, 0.05, 0.10 and their distance
 from nominal in standard errors) and one `COVER` line per interval, so
 `grep '^TEST k50_m3_bern10_rdi '` gives one cell's rejection rates. The bands are
-the `mc_*` rows of `validation/grid/tol.R`, mirrored in `src/inference/mc_data.rs`,
-which also holds the grid and the generator.
+`mc_data::bands` in `src/inference/mc_data.rs`, which also holds the grid and the
+generator.

@@ -609,42 +609,6 @@ fn fitview_diagnostics_zero_alloc() {
     );
 }
 
-// --- build_workspace routing ---
-
-#[test]
-fn build_workspace_routes_fixed_only_to_ols_and_mixed_to_lmm() {
-    let opts = FitOptions::default();
-    let fixed = ModelSpec {
-        family: Family::Gaussian,
-        re: None,
-    };
-    let ws_fixed = build_workspace(&fixed, Perm::IDENTITY, 100, 3, &opts);
-    assert!(ws_fixed.is_ols());
-
-    let (_, _, n, p, mixed, ids, _) = lmm_intercept_case();
-    let (sized, _ids, perm) = spec_sized_from_ids_pub(&mixed, &ids);
-    let ws_mix = build_workspace(&sized, perm, n, p, &FitOptions::default());
-    assert!(ws_mix.is_lmm());
-
-    let glm = ModelSpec {
-        family: Family::Poisson {
-            link: crate::PoissonLink::Log,
-        },
-        re: None,
-    };
-    assert!(build_workspace(&glm, Perm::IDENTITY, 50, 2, &opts).is_glm());
-
-    let nb = ModelSpec {
-        family: Family::NegativeBinomial {
-            link: crate::NegBinomialLink::Log,
-        },
-        re: None,
-    };
-    assert!(build_workspace(&nb, Perm::IDENTITY, 50, 2, &opts).is_prebuilt());
-}
-
-// --- pin the absence of the scalar-Brent route ---
-
 // --- reuse gate + shape pin ---
 
 #[test]
@@ -806,7 +770,7 @@ fn fit_on_glmm_nb_reused_ws_matches_fit_cold() {
 }
 
 #[test]
-#[should_panic(expected = "shape")]
+#[should_panic(expected = "primary level count")]
 fn fit_on_panics_on_level_count_mismatch() {
     let (x, y, n, p, model, ids, opts) = lmm_intercept_case();
     let (sized, _ids, perm) = spec_sized_from_ids_pub(&model, &ids);
@@ -1008,25 +972,7 @@ fn build_workspace_rejects_two_nested_groupings() {
     let _ = build_workspace(&sized, Perm::IDENTITY, n, p, &opts);
 }
 
-// --- reuse-gate completeness (varying n, weighted reuse) ---
-
-#[test]
-fn fit_on_varying_n_below_n_max_matches_fit_cold() {
-    // Build the ws at n_max; refit at several n < n_max. Each must equal a fresh
-    // fit_cold at that n (guards n_max-sized buffers being read past n).
-    let (full_x, full_y, n_max, p, model, _ids, opts) = ols_case();
-    let mut ws = build_workspace(&model, Perm::IDENTITY, n_max, p, &opts);
-    for &n in &[10usize, 21, n_max] {
-        let x = &full_x[..n * p];
-        let y = &full_y[..n];
-        let ids = GroupIds::default();
-        let cold = fit_cold(x, y, n, p, &model, &ids, &opts);
-        let via =
-            fit_on(&mut ws, x, y, &ids, None, &opts).into_fit(x, y, &ids, n, p, &model, &opts);
-        assert_near(&cold.beta, &via.beta, &format!("n={n} beta"));
-        assert_near(&cold.se, &via.se, &format!("n={n} se"));
-    }
-}
+// --- reuse-gate completeness (weighted reuse) ---
 
 #[test]
 fn fit_on_weighted_reuse_matches_fit_cold() {
@@ -1061,34 +1007,15 @@ fn fit_on_weighted_reuse_matches_fit_cold() {
 // `fit_on` fills in place instead of allocating fresh every call: workspace
 // `x_mat` reuse across different n must equal fresh single-shot fits. Rows
 // past the CURRENT call's `n` keep the PREVIOUS call's values and are never
-// read — the tests above already
-// cover ascending n for OLS; the tests below add the direction most likely to
-// surface a stale-row bug (shrinking n leaves more of the buffer stale than
-// growing it does), for every arm that gained a buffer (the LMM's is the
+// read — each test below grows n and then shrinks it (shrinking leaves more of
+// the buffer stale), for every arm that gained a buffer (the LMM's is the
 // offset round trip at the end of this block).
 
 #[test]
 fn fit_on_ols_larger_then_smaller_matches_fit_cold() {
     let (full_x, full_y, n_max, p, model, _ids, opts) = ols_case();
     let mut ws = build_workspace(&model, Perm::IDENTITY, n_max, p, &opts);
-    for &n in &[n_max, 12usize] {
-        let x = &full_x[..n * p];
-        let y = &full_y[..n];
-        let ids = GroupIds::default();
-        let cold = fit_cold(x, y, n, p, &model, &ids, &opts);
-        let via =
-            fit_on(&mut ws, x, y, &ids, None, &opts).into_fit(x, y, &ids, n, p, &model, &opts);
-        assert_near(&cold.beta, &via.beta, &format!("n={n} beta"));
-        assert_near(&cold.se, &via.se, &format!("n={n} se"));
-    }
-}
-
-#[test]
-fn fit_on_glm_smaller_then_larger_matches_fit_cold() {
-    let (full_x, full_y, n_max, p, model, _ids, opts) = glm_case();
-    let mut ws = build_workspace(&model, Perm::IDENTITY, n_max, p, &opts);
-    assert!(ws.is_glm());
-    for &n in &[12usize, n_max] {
+    for &n in &[10usize, 21, n_max, 12] {
         let x = &full_x[..n * p];
         let y = &full_y[..n];
         let ids = GroupIds::default();
@@ -1104,7 +1031,8 @@ fn fit_on_glm_smaller_then_larger_matches_fit_cold() {
 fn fit_on_glm_larger_then_smaller_matches_fit_cold() {
     let (full_x, full_y, n_max, p, model, _ids, opts) = glm_case();
     let mut ws = build_workspace(&model, Perm::IDENTITY, n_max, p, &opts);
-    for &n in &[n_max, 12usize] {
+    assert!(ws.is_glm());
+    for &n in &[12usize, n_max, 12] {
         let x = &full_x[..n * p];
         let y = &full_y[..n];
         let ids = GroupIds::default();

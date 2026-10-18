@@ -87,6 +87,8 @@ def test_binomial_glm_link_fits(link):
     assert result.converged
     assert len(result.beta) == 2
     assert result.dispersion == 1.0
+    logit = glmm.fit(FIT_DATA, "y_bin ~ x", "binomial")
+    assert not _np.allclose(result.beta, logit.beta), "the link never reached the kernel"
 
 
 def test_inversegaussian_mixed_raises():
@@ -102,6 +104,7 @@ def test_inversegaussian_glm_fits():
     assert result.dispersion > 0
     result_inv_sq = glmm.fit(FIT_DATA, "y_invgauss ~ x", "inversegaussian", link="inverse_squared")
     assert result_inv_sq.converged
+    assert not _np.allclose(result.beta, result_inv_sq.beta)
 
 
 def test_inversegaussian_dispersion_estimate_is_accepted():
@@ -135,6 +138,8 @@ def test_nagq_invalid_raises(nagq):
 def test_nagq_max_odd_fits():
     result = glmm.fit(FIT_DATA, "y_bin ~ x + (1 | g)", "binomial", nagq=25)
     assert result.converged
+    assert result.nagq == 25
+    assert (result.objective, result.objective_nodes) == ("agq", 25)
 
 
 @pytest.mark.parametrize(
@@ -230,6 +235,7 @@ def test_warm_start_dispersion_reaches_the_cold_gamma_optimum():
     assert warm.converged
     assert abs(warm.deviance - cold.deviance) < 1e-6
     assert abs(warm.dispersion / cold.dispersion - 1.0) < 1e-4
+    assert warm.n_eval != cold.n_eval, "the warm dispersion never reached the kernel"
 
 
 def test_init_theta_and_warm_start_theta_are_independent(recwarn):
@@ -245,6 +251,13 @@ def test_init_theta_and_warm_start_theta_are_independent(recwarn):
     )
     assert result.converged
     assert any("init_theta" in str(w.message) for w in recwarn)
+    alone = glmm.fit(
+        FIT_DATA, "y_gauss ~ x + (1 | g)", warm_start={"beta": [0.0, 0.0], "theta": [1.0]}
+    )
+    assert result.n_eval == alone.n_eval
+    _np.testing.assert_array_equal(result.beta, alone.beta)
+    cold = glmm.fit(FIT_DATA, "y_gauss ~ x + (1 | g)")
+    assert alone.n_eval != cold.n_eval, "the warm start never reached the kernel"
 
 
 def test_warm_start_not_dict_message_matches_the_r_port():
@@ -267,6 +280,8 @@ def test_warm_start_not_dict_message_matches_the_r_port():
             {"theta": [1.0, 0.0]},
             r"^warm-start theta has 2 entries but the model has 1 random-effect",
         ),
+        ({"beta": [float("nan"), 0.0]}, r"^warm-start beta must be finite numbers, got NaN$"),
+        ({"theta": [float("inf")]}, r"^warm-start theta must be finite numbers, got inf$"),
     ],
 )
 def test_wrong_width_warm_start_names_the_argument(warm_start, message, capfd):
@@ -279,6 +294,14 @@ def test_non_finite_offset_term_names_the_term():
     data = dict(DATA, o=[0.0, float("inf"), 0.0])
     with pytest.raises(ValueError, match=r"^term 'offset\(o\)' is not finite at row 1$"):
         glmm.fit(data, "y ~ x + offset(o)")
+
+
+@pytest.mark.parametrize("column", ["x", "y"])
+def test_infinite_response_or_predictor_names_the_column(column, capfd):
+    data = dict(DATA, **{column: [0.0, float("inf"), 1.0]})
+    with pytest.raises(ValueError, match=rf"^term '{column}' is not finite at row 1$"):
+        glmm.fit(data, "y ~ x")
+    assert "panicked" not in capfd.readouterr().err
 
 
 def test_clean_call_emits_no_warnings_and_fits():
@@ -303,12 +326,6 @@ def test_missing_formula_column_is_reported_even_with_wrong_length_weights():
     data = {"y": [1.0, 2.0, 3.0], "x": [0.0, 1.0, 2.0]}
     with pytest.raises(ValueError, match=r"^column\(s\) not found in data: z$"):
         glmm.fit(data, "y ~ x + z", weights=[1.0, 2.0])
-
-
-def test_missing_formula_column_with_no_weights_is_still_reported():
-    data = {"y": [1.0, 2.0, 3.0], "x": [0.0, 1.0, 2.0]}
-    with pytest.raises(ValueError, match=r"^column\(s\) not found in data: z$"):
-        glmm.fit(data, "y ~ x + z")
 
 
 def test_missing_column_through_a_transform_names_the_underlying_column():

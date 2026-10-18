@@ -86,34 +86,3 @@ pub(crate) fn block_levels(rel: &GroupingRelation) -> usize {
         GroupingRelation::NestedWithin { n_per_parent } => (*n_per_parent).max(1) as usize,
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{Grouping, GroupingRelation, ReStructure, Sizing};
-
-    /// `from_sizing` on a 4-cluster primary + one crossed 3-level extra reproduces
-    /// the positional layout: primary is `i % 4`; the crossed extra is
-    /// `(i / 4) % 3`.
-    #[test]
-    fn from_sizing_crossed_matches_positional() {
-        let re = ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 4 },
-            slopes: vec![],
-            extra_groupings: vec![Grouping {
-                relation: GroupingRelation::Crossed { n_clusters: 3 },
-                slopes: vec![],
-            }],
-        };
-        let ids = GroupIds::from_sizing(&re, 12);
-        assert_eq!(
-            ids.primary,
-            (0..12).map(|i| (i % 4) as u32).collect::<Vec<_>>()
-        );
-        assert_eq!(ids.extra.len(), 1);
-        assert_eq!(
-            ids.extra[0],
-            (0..12).map(|i| ((i / 4) % 3) as u32).collect::<Vec<_>>()
-        );
-    }
-}

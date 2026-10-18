@@ -696,16 +696,21 @@ check and second pass (`JOINT_RECHECK_TOL`, see
 does; on a Laplace shape the finish is the fit's result. Where the working
 weights span decades, the design-metric β̃ that leaves the joint BOBYQA search
 short leaves BFGS short too, with an endpoint its certificate accepts; the
-second pass is what reaches the optimum there. After a hand-over on AGQ, a
-second pass is followed by one more information-metric pass, from the check's
+second pass is what reaches the optimum there. On AGQ a second pass is
+followed by one more information-metric pass, from the check's
 re-solved β at the second pass's θ and at `GLMM_RHO_BEGIN`, and the lower of
 the two passes is kept. Where the working weights span many decades (|f| near
 1e10) the deviance's rounding noise defeats BOBYQA's local model at small
 radii, so a pass ends where its start leads it, and the fresh pass recovers
 most of those ends: measured 2026-10-11 on 125 such designs, failures fell
 from 31 to 16 on x86_64 and from 30 to 17 on aarch64, none worse, at about 29
-evaluations more per hand-over fit. A fit that did not hand over runs no
-extra pass.
+evaluations more per hand-over fit. A fit that steps 2 or 3 finish runs it
+too: which step a decade design ends on follows the platform's rounding, and
+on aarch64 two fits of the fourteen-decade regression test ended their second
+pass 1.65 and 8.77 units high after step 3. Measured 2026-10-18 over 420
+decade designs (8 to 14 decades), fits more than one unit above the exact
+profile fell from 16 to 3 on aarch64 and from 17 to 4 on x86_64, none worse,
+at about 40 evaluations more where the pass runs. A fit whose check finds no lower point runs no extra pass.
 
 A warm fit whose θ start has a diagonal above `GRAD_WARM_THETA_MAX = 10` takes
 the BOBYQA route: from such far starts the joint search ended in a worse local
@@ -749,10 +754,9 @@ logit, probit and Poisson random intercepts at 7 nodes, logit at 11, and
 of the Poisson case and `sim_binomial_zerosd`, whose optima are at θ = 0, keep
 BOBYQA),
 `gradient_route_plan_follows_the_rule`,
-`gradient_route_keeps_bobyqa_on_cold_agq_fits_from_50_rows_per_level` (49 rows
-per level route, 50 give the BOBYQA fit bit for bit, cold and warm),
-`gradient_route_keeps_bobyqa_on_warm_agq_fits_starting_near_zero` (a warm
-θ₀ = 0.02 gives the BOBYQA fit bit for bit, 0.06 routes),
+`gradient_route_keeps_bobyqa_at_the_agq_gate_thresholds` (49 rows per level
+route, 50 give the BOBYQA fit bit for bit, cold and warm; a warm θ₀ = 0.02
+gives the BOBYQA fit bit for bit, 0.06 routes),
 `gradient_route_matches_the_bobyqa_route_at_a_held_gamma_dispersion`,
 `gradient_route_seeds_ln_phi_on_the_inverse_link_only`,
 `gradient_route_hands_over_on_the_iteration_cap`,

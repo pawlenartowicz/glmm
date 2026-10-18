@@ -288,43 +288,71 @@ fn draw(
     }
 }
 
-/// The calibration tier's bands and its frozen gated set: mirrors the `mc_*`
-/// rows of `TOL_INFERENCE` in `validation/grid/tol.R`, change together
-/// (`mc_data_tests::bands_match_tol_r` checks every value and list against
-/// that file, where each row's reasoning is). Fixed before the measurement,
-/// from theory and an independent pilot run. A rate `q̂` over `R_kept`
-/// datasets passes against its nominal `q0` (α for a rejection rate; for a
-/// coverage, the miss rate `1 − q̂` against `1 − level`) when
-/// `|q̂ − q0| ≤ δ·q0 + k·√(q0(1 − q0)/R_kept)`; a one-sided gate uses one side.
+/// The calibration tier's bands and its frozen gated set: rejection rates
+/// under a true null and interval coverage at the truth, per cell of
+/// [`super::CELLS`]. Every value is fixed before the measurement, from theory
+/// and an independent pilot run (`R = 1000` per cell, its own seeds and
+/// stream tag, so no pilot dataset is a measurement dataset). A rate `q̂` over
+/// `R_kept` datasets passes against its nominal `q0` (α for a rejection rate;
+/// for a coverage, the miss rate `1 − q̂` against `1 − level`) when
+/// `|q̂ − q0| ≤ δ·q0 + k·√(q0(1 − q0)/R_kept)`, at α = 0.01, 0.05, 0.10 and
+/// level 0.90, 0.95, 0.99; a one-sided gate uses one side. The run is
+/// deterministic, so a noise failure can appear only at the measurement,
+/// where it is investigated (a bug first), never re-rolled with another seed.
+#[cfg_attr(not(feature = "montecarlo-tests"), allow(dead_code))]
 pub(crate) mod bands {
     /// `mc_r`: datasets per cell. With every dataset kept the binomial SE is
     /// 0.0049 at α = 0.05 and at coverage 0.95 (0.0022 at 0.01, 0.0067 at
-    /// 0.10).
+    /// 0.10). `R = 5000` would narrow the noise band at α = 0.05 to ±0.014
+    /// for 2.5 times the run.
     pub(crate) const MC_R: usize = 2000;
     /// `mc_level_k`: the noise multiple `k` on a rejection rate, so the noise
     /// band is ±0.022 at α = 0.05 and `R = 2000` (±0.010 at 0.01, ±0.030 at
     /// 0.10). From exact binomial tails a check calibrated exactly fails with
-    /// probability 2.3e-5, 1.3e-5 and 8.3e-6 at the three α, so about 0.065
-    /// expected noise failures over the 4416 gated checks of [`GATED`] (4446
-    /// when frozen, before two Deviations) at δ = 0, and 0.014 with the
-    /// declared δ.
+    /// probability 2.3e-5, 1.3e-5 and 8.3e-6 at the three α (two-sided,
+    /// δ = 0; the normal value is 6.8e-6), so about 0.065 expected noise
+    /// failures over the 4416 gated checks of [`GATED`] (4446 when frozen,
+    /// before two Deviations) if all had δ = 0, and 0.014 with the declared δ
+    /// (the Satterthwaite rows keep δ = 0 and carry nearly all of it); at
+    /// `k = 4` about 0.55, at `k = 3` about 11 (δ = 0). At δ = 0 the lower
+    /// bound at α = 0.01 is 0.000, so a conservative error is caught only at
+    /// 0.05 and 0.10.
     pub(crate) const MC_LEVEL_K: f64 = 4.5;
-    /// `mc_cover_k`: the same multiple on a coverage's miss rate.
+    /// `mc_cover_k`: the same multiple on a coverage's miss rate, so the same
+    /// widths around coverage 0.99, 0.95 and 0.90.
     pub(crate) const MC_COVER_K: f64 = 4.5;
     /// `mc_asym_rel`: the margin δ of the methods calibrated only in the limit
     /// (GLMM Wald and LRT, the two mixtures, the Gaussian ML LRT), 0.0025,
-    /// 0.0125 and 0.025 at α = 0.01, 0.05 and 0.10; the Satterthwaite rows use
-    /// δ = 0.
+    /// 0.0125 and 0.025 at α = 0.01, 0.05 and 0.10 before noise. Without it
+    /// the band tests exact calibration, and a finite-sample error of fixed
+    /// size grows in SE units as `R` grows (the pilot's GLMM gated cells had 4
+    /// Wald cells at 4.2 to 5.1 SE and 2 LRT cells at 4.1 to 4.4 SE at
+    /// `R = 1000`), so the gate would be red at the measurement or green only
+    /// by re-selecting cells on the data it gates. The Satterthwaite rows,
+    /// built to be near nominal at small samples, use δ = 0.
     pub(crate) const MC_ASYM_REL: f64 = 0.25;
     /// `mc_fail_max`: a gated (cell, quantity) fails when more than this
     /// fraction of its datasets lose it to a fit that did not converge or to a
     /// value that is not finite on a converged fit. A dataset whose
     /// fixed-effects design is aliased, decided from the lowered design by
-    /// `fit_cold`'s own aliasing test (`group` constant, or `time:group`
-    /// aliased because one group's rows share one time), is left out of the
-    /// cap and of `R_kept` for every quantity of that fit, and counted apart.
-    /// A level of `f3` absent is not such a case: its zero column is kept as
-    /// aliased and the `f3` row has 1 df.
+    /// `fit_cold`'s own aliasing test and never from a NaN row or from the
+    /// fit's aliased mask (`group` constant, or `time:group` aliased because
+    /// one group's rows share one time), is left out of the cap and of
+    /// `R_kept` for every quantity of that fit, and counted and printed apart:
+    /// the dropped column moves the other coefficients' targets, and since the
+    /// design is drawn independently of every response, leaving it out changes
+    /// no null distribution and no coverage target. Expected (arithmetic, from
+    /// simulated designs): 2.6%, 1.1% and 0.9% of datasets at `K = 10` and
+    /// `M = 3, 9, 17`, 0.04% or less at `K = 20`, none at `K ≥ 30`. A level of
+    /// `f3` absent (5.2% of datasets at `K = 10`, 0.09% at `K = 20`) is not
+    /// such a case: its zero column is kept as aliased and the `f3` row has
+    /// 1 df. A reported cell prints the failed fraction beside its rate.
+    /// Pilot: no Gaussian LMM fit failed to converge (its losses were aliased
+    /// designs); GLMM losses (aliased designs and failed fits together) at
+    /// most 0.7% on the GLMM gated cells, up to 19% on the `K = 10` mixture
+    /// candidates, which are reported. At `R = 2000` a quantity whose fits
+    /// fail on 0.7% of datasets exceeds the cap with probability 0.05, on 0.9%
+    /// with 0.27.
     pub(crate) const MC_FAIL_MAX: f64 = 0.01;
     /// `mc_aliased_max`: a gated (cell, quantity) also fails when more than
     /// this fraction of its datasets are aliased by design, about four times
@@ -348,7 +376,7 @@ pub(crate) mod bands {
     /// of its cells.
     #[derive(Debug)]
     pub(crate) struct Gate {
-        /// The family's row in `mc_gated`.
+        /// The family's name.
         pub(crate) family: &'static str,
         /// The side of the band.
         pub(crate) side: Side,
@@ -356,7 +384,8 @@ pub(crate) mod bands {
         pub(crate) delta: f64,
         /// The only α gated, when not all three.
         pub(crate) alpha: Option<f64>,
-        /// The quantities, by the names `tol.R` defines.
+        /// The quantities, by the names the calibration tier's driver records
+        /// them under.
         pub(crate) quantities: &'static [&'static str],
         /// The cells, by [`super::Cell::name`].
         pub(crate) cells: &'static [&'static str],
@@ -376,8 +405,11 @@ pub(crate) mod bands {
     ];
 
     /// The GLMM Wald and LRT quantities. The `f3` rows (`wald_f3`, `lrt_f3`)
-    /// are reported: unpiloted, and they lose fits to separation on sparse
-    /// binary cells.
+    /// are reported, as the unpiloted GLM rows are: they were not piloted, and
+    /// an out-of-sample run (datasets `r ≥ 100000`) lost 0.75% to 1.5% of the
+    /// `f3` fits to separation on gated sparse binary cells (an `f3` level
+    /// with no events), near or above [`MC_FAIL_MAX`]. The Gaussian `f3` row
+    /// (`satt_f_f3`) follows its family's cells.
     const GLMM: [&str; 13] = [
         "wald_tg",
         "wald3_group",
@@ -395,14 +427,31 @@ pub(crate) mod bands {
     ];
 
     /// The gated set, frozen before the measurement and never re-selected on
-    /// it; every (cell, quantity) not listed is reported. The pilot screen
-    /// moved 21 mixture candidates to reported, all by [`MC_FAIL_MAX`]. Two
-    /// Deviations approved after the measurement moved the `f3` F row on the
+    /// it. Every (cell, quantity) not listed is reported: power, bias and RMSE
+    /// everywhere, the AGQ arm, the profile-interval coverage, the GLM rows,
+    /// every cell outside these regimes, the failed-dataset fractions. Built
+    /// from theory, then screened against the pilot: each candidate (cell,
+    /// quantity) was checked against its declared band (its δ, `k = 4.5`, the
+    /// pilot's `R_kept`) and against [`MC_FAIL_MAX`] (failed fits only), and a
+    /// candidate the pilot fails is reported. The band moved none; the cap
+    /// moved 21 mixture candidates, named under their families. Two Deviations
+    /// approved after the measurement (2026-10-13) moved the `f3` F row on the
     /// random-slope Gaussian cells with `K ≤ 30` (Satterthwaite's F on a
     /// 3-level between-cluster factor is anti-conservative there, as
     /// lmerTest's is on the same data) and the boundary test on
-    /// `k20_m9_bern22_rdi` (21 of 2000 datasets separated) to reported.
+    /// `k20_m9_bern22_rdi` (21 of 2000 datasets separated) to reported; the
+    /// set holds 4416 checks (0.0143 expected noise failures with the declared
+    /// δ).
     pub(crate) const GATED: [Gate; 9] = [
+        // Satterthwaite t and F rows and t intervals on the Gaussian cells
+        // with K ≥ 20: two-sided, δ = 0. The t and F references with
+        // Satterthwaite's df are built to be near nominal at small samples
+        // (Kuznetsova, Brockhoff & Christensen 2017; Luke 2017). Pilot: no
+        // check beyond 4 SE, the largest errors conservative and at K = 10.
+        // At K ≥ 20 this gate cannot tell Satterthwaite's t from z on these
+        // designs (a normal reference gives 0.066 at α = 0.05 for df 18,
+        // inside the band); the df themselves are checked against lmerTest in
+        // the oracle tier.
         Gate {
             family: "satt_two",
             side: Side::Two,
@@ -442,6 +491,16 @@ pub(crate) mod bands {
                 "k200_m17_gauss_rdis",
             ],
         },
+        // The Satterthwaite F of the null factor `f3` (2 df, between
+        // clusters) on the satt_two cells, two-sided, δ = 0, less the
+        // random-slope cells with K ≤ 30, which are reported (a Deviation
+        // approved 2026-10-13, after the measurement): on `(1 + time | id)` at
+        // K ≤ 30 the row is anti-conservative (0.059 to 0.098 at α = 0.05,
+        // R = 2000; five cells outside the band), and lmerTest's Satterthwaite
+        // F gives the same rates on the same datasets, so the error is the
+        // method's at few clusters (Kenward-Roger: conservative at K = 10,
+        // slightly above nominal at K = 30). The whole regime is reported
+        // (K = 10, 20, 30, every M), not only the cells that missed.
         Gate {
             family: "satt_two_f3",
             side: Side::Two,
@@ -475,6 +534,13 @@ pub(crate) mod bands {
                 "k200_m17_gauss_rdis",
             ],
         },
+        // satt_two's quantities at K = 10, one-sided: not anti-conservative (a
+        // rate at most α plus the band, a coverage at least the level minus
+        // it). The pilot's largest Satterthwaite errors are conservative and
+        // here (coverage 0.936 at 0.90 with random slopes; the Type III
+        // time:group row 0.066 at α = 0.10). This side sees t against z: a
+        // normal reference gives 0.086 at df 8 against the upper bound 0.072
+        // at α = 0.05.
         Gate {
             family: "satt_upper",
             side: Side::Upper,
@@ -490,6 +556,8 @@ pub(crate) mod bands {
                 "k10_m17_gauss_rdis",
             ],
         },
+        // The `f3` F row at K = 10, one-sided, on the `(1 | id)` cells only:
+        // the random-slope cells are reported with satt_two_f3's regime.
         Gate {
             family: "satt_upper_f3",
             side: Side::Upper,
@@ -498,6 +566,20 @@ pub(crate) mod bands {
             quantities: &["satt_f_f3"],
             cells: &["k10_m3_gauss_rdi", "k10_m9_gauss_rdi", "k10_m17_gauss_rdi"],
         },
+        // GLMM Wald (z rows, the Type II Wald chi-square, z intervals) and
+        // GLMM LRT (per term, 2 df), Laplace: two-sided with δ on the 78
+        // cells with K ≥ 50 and at least 0.49 minority events per cluster
+        // (Bernoulli min(Σy, N − Σy)/K, Poisson Σy/K, the pilot's means). Both
+        // are asymptotic in the number of clusters (Bolker et al. 2009;
+        // Pinheiro & Bates 2000, 2.4.2) and rest on the Laplace
+        // approximation, whose error is of the order of one over the
+        // information per cluster and does not shrink as K grows with
+        // clusters held small (Breslow & Lin 1995; Joe 2008): hence K with an
+        // information floor. The floor leaves out the 12 Bernoulli cells with
+        // K ≥ 50, M = 3 and prevalence 0.22 or 0.10. Pilot, declared band:
+        // closest k50_m17_pois165_rdi wald_ci_b0, miss rate 0.026 at level
+        // 0.99, 0.96 of its band (5.1 SE: at R = 2000 the same error would
+        // fail); every lost fraction at or below 0.7%.
         Gate {
             family: "glmm",
             side: Side::Two,
@@ -585,6 +667,10 @@ pub(crate) mod bands {
                 "k200_m17_pois034_rdis",
             ],
         },
+        // Gaussian ML LRT for the fixed part (2 df): two-sided with δ at
+        // K ≥ 30. Anti-conservative at few clusters (Pinheiro & Bates 2000,
+        // 2.4.2); pilot: 0.074 to 0.099 at α = 0.05 at K = 10, up to 0.081 at
+        // K = 20 with slopes, every cell beyond 4 SE at K ≤ 20.
         Gate {
             family: "ml_lrt",
             side: Side::Two,
@@ -618,6 +704,20 @@ pub(crate) mod bands {
                 "k200_m17_gauss_rdis",
             ],
         },
+        // The random-slope variance test, 50:50 mixture of chi-square 1 and 2
+        // (labelled conservative): one-sided upper with δ (not
+        // anti-conservative; Self & Liang 1987, Stram & Lee 1994) on the rdi
+        // cells, Gaussian all, Poisson except mean 0.34 at M = 3, Bernoulli at
+        // M ≥ 9 except prevalence 0.10 at M = 9. Reported on the cells of
+        // least information, where the pilot's rates rise with K (prevalence
+        // 0.10, M = 9: 0.011 at K = 10 to 0.074 at K = 200 at α = 0.05;
+        // Laplace on sparse binary data with two observations per cluster).
+        // Reported by MC_FAIL_MAX, with the pilot's lost fraction:
+        // k10_m3_pois165_rdi 8.0%, k10_m9_bern54_rdi 4.7%, k10_m9_bern22_rdi
+        // 13.2%, k10_m9_pois165_rdi 1.1%, k10_m9_pois034_rdi 10.1%,
+        // k10_m17_bern54_rdi 2.1%, k10_m17_bern22_rdi 3.6%, k10_m17_bern10_rdi
+        // 18.0%, k10_m17_pois034_rdi 2.4%, k20_m9_bern22_rdi 1.5%,
+        // k20_m9_pois034_rdi 1.1%, k20_m17_bern10_rdi 2.3%.
         Gate {
             family: "mix_slope",
             side: Side::Upper,
@@ -693,6 +793,18 @@ pub(crate) mod bands {
                 "k200_m17_gauss_rdi",
             ],
         },
+        // The random-intercept variance test, GLMM against GLM, 50:50 mixture
+        // of chi-square 0 and 1: one-sided upper with δ on the same rule's
+        // GLMM cells (pilot, mean 0.34 at M = 3: 0.003 at K = 10 to 0.070 at
+        // K = 200). Reported by MC_FAIL_MAX, with the pilot's lost fraction:
+        // k10_m3_pois165_rdi 4.9%, k10_m9_bern54_rdi 3.9%, k10_m9_bern22_rdi
+        // 13.2%, k10_m9_pois034_rdi 11.5%, k10_m17_bern54_rdi 1.5%,
+        // k10_m17_bern22_rdi 3.6%, k10_m17_bern10_rdi 19.2%,
+        // k10_m17_pois034_rdi 2.2%, k20_m17_bern10_rdi 1.8%. Reported after
+        // the measurement (a Deviation approved 2026-10-13):
+        // k20_m9_bern22_rdi, whose boundary-test fits failed on 21 of 2000
+        // datasets (1.05%, above MC_FAIL_MAX), every one separated (no
+        // maximum-likelihood estimate); its rate passes.
         Gate {
             family: "mix_intercept",
             side: Side::Upper,
@@ -752,6 +864,15 @@ pub(crate) mod bands {
                 "k200_m17_pois034_rdi",
             ],
         },
+        // A lower bound, δ = 0, at α = 0.10 only, on the Gaussian random-slope
+        // mixture with K ≥ 50, where the 50:50 mixture is asymptotically exact
+        // (Stram & Lee 1994) and the pilot near nominal (0.079 to 0.107 at
+        // α = 0.10): a chi-square 2 reference in place of the mixture (about
+        // 0.066) fails it (bound 0.070). At α = 0.05 the same bound would not
+        // catch that (about 0.032 against 0.028) and would carry most of this
+        // side's false-miss risk, so it is not applied there. The GLMM
+        // mixtures get no lower bound: they are mostly conservative in the
+        // pilot even at high information.
         Gate {
             family: "mix_slope_lower",
             side: Side::Lower,

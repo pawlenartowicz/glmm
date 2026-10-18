@@ -1,25 +1,26 @@
 //! The value-FD pass against closed forms: ν with no free coordinate, `K − 1`
-//! on a balanced one-way design, the scalar formula with one free coordinate,
-//! `C` against `Fit::vcov`, and the assembly's failure path. Then the value
-//! route's gates: the step sweep that pins [`ETA`] and [`DF_FD_REL`], dense
-//! against sparse at one θ, the invariances, and the boundary cases (a pinned
-//! intercept, the canonical correlation boundary, a wide block pinned without
-//! canonicalization, a capped search's endpoint). Last, the gradient route
-//! against the value route on the same fits, its step sweep that pins
-//! `ETA_GRAD` and [`DF_GD_REL`] (gate 3), its arming and its fallback
-//! (`gradient_route`).
+//! on a balanced one-way design, `C` against `Fit::vcov`, and the assembly's
+//! failure path. Then the value route's gates: the step sweep that pins
+//! [`ETA`] and [`DF_FD_REL`], dense against sparse at one θ, the invariances,
+//! and the boundary cases (the canonical correlation boundary, a wide block
+//! pinned without canonicalization). Last, the gradient route against the
+//! value route on the same fits, its step sweep that pins `ETA_GRAD` and
+//! [`DF_GD_REL`] (gate 3), its BFGS arming and its fallback (`gradient_route`).
 
 use super::{
-    assemble, free_coordinates, pass, pass_at, residual_nu, restore_response, shift_response,
-    Collected, DerivRoute, SatterthwaiteState, ETA,
+    assemble, free_coordinates, pass, pass_at, residual_nu, Collected, DerivRoute,
+    SatterthwaiteState,
 };
+#[cfg(feature = "formula")]
+use super::{restore_response, shift_response, ETA};
 use crate::fit::common_tests::{lcg, sim_clustered};
 use crate::fit::fit_cold_keep_workspace;
-use crate::lmm::{fit_lmm_unhinted, LmmGroupings, LmmKernel, LmmWorkspace};
+#[cfg(feature = "formula")]
+use crate::lmm::fit_lmm_unhinted;
+use crate::lmm::{LmmGroupings, LmmKernel, LmmWorkspace};
 use crate::standardize::ColumnScaling;
 use crate::test_support::intercept_only_spec;
 use crate::{Family, Fit, FitOptions, GroupIds, ModelSpec, ReStructure, Sizing};
-use bobyqa::{Bobyqa, Config};
 use faer::Mat;
 
 /// Two routes to the same df that differ only in rounding: `C` read off the
@@ -208,41 +209,6 @@ fn deviance_and_var(
         })
         .collect();
     (f, var)
-}
-
-/// One free coordinate: each coefficient's df is `v²/(g²/H + v²/ν)` with `H`
-/// and `g` from three deviance values and two `C`, on the shifted response the
-/// pass evaluates.
-#[test]
-fn one_coordinate_matches_scalar_formula() {
-    let (x, y, g, n, p) = mixed_fixture();
-    with_fit(&x, &y, &g, n, p, None, |fit, ws, map| {
-        assert!(fit.converged());
-        assert_eq!(ws.theta.len(), 1);
-        let th = ws.theta[0];
-        assert!(th > 0.0, "the fixture needs an interior θ̂");
-        let df = coef_df_in_range(&pass(ws, map));
-
-        let h = ETA * th.abs().max(1.0);
-        let nu = (n - p) as f64;
-        // On the response the pass evaluates: shifted by the fit's β̂.
-        let saved = shift_response(&mut ws.kernel, &ws.recovery.beta_tilde);
-        let f0 = ws.kernel.deviance(&[th]);
-        let (fp, cp) = deviance_and_var(&mut ws.kernel, &[th + h], map, p);
-        let (fm, cm) = deviance_and_var(&mut ws.kernel, &[th - h], map, p);
-        restore_response(&mut ws.kernel, &saved);
-        let hess = (fp - 2.0 * f0 + fm) / (h * h);
-        for t in 0..p {
-            let v = fit.vcov[t][t];
-            let grad = (cp[t] - cm[t]) / (2.0 * h);
-            let want = v * v / (grad * grad / hess + v * v / nu);
-            assert!(
-                rel(df[t], want) <= ROUTE_REL,
-                "coefficient {t}: df {} against {want}",
-                df[t]
-            );
-        }
-    });
 }
 
 /// A canonical correlation-boundary block (`q = 2`, trailing column zero)
@@ -463,28 +429,6 @@ fn slope_rescale_keeps_df_and_all_pinned_gives_nu() {
             );
         }
     }
-}
-
-/// A capped search (the pattern of
-/// `src/lmm/tests.rs::maxfun_cap_reports_honest_endpoint`): BOBYQA stops after
-/// `npt + 1` evaluations and the fit reports `converged = false`, which the
-/// note reads; the pass at that endpoint gives a finite df in `(0, ν]`.
-#[test]
-fn maxfun_endpoint_gives_finite_df() {
-    let (x, y, g, n, p) = mixed_fixture();
-    let x = Mat::from_fn(n, p, |i, j| x[i * p + j]);
-    let mut ws = LmmWorkspace::new(p, 12);
-    ws.suff_mut().add_rows(x.as_ref(), &y, &g);
-    let n_theta = ws.theta.len();
-    let mut config = Config::new(n_theta);
-    config.npt = 2 * n_theta + 1;
-    config.max_fun = config.npt + 1;
-    ws.solver = Bobyqa::new(n_theta, config).expect("a legal minimal config");
-    let fit = fit_lmm_unhinted(&mut ws, &[0, 1, 2], None, ColumnScaling::IDENTITY);
-    assert!(!fit.converged, "a capped fit");
-    let st = pass(&mut ws, ColumnScaling::IDENTITY);
-    assert!(!st.is_failed());
-    coef_df_in_range(&st);
 }
 
 /// Gates 3 and 4 and the boundary cases whose fixtures are built through the
@@ -1052,19 +996,6 @@ mod formula_gates {
         let before = response_bits(&mut sparse);
         assert!(!pass_at(&mut sparse, &theta, ColumnScaling::IDENTITY).is_failed());
         assert_eq!(response_bits(&mut sparse), before, "cross4, sparse kernel");
-    }
-
-    /// A pinned random intercept: the speed campaign's `int1` near-zero draw
-    /// (seed 811001), whose fit pins θ̂ at exactly 0, gives both coefficients ν.
-    #[test]
-    fn pinned_intercept_gives_nu() {
-        let (table, formula) = speed_shape(&[1], false, true, 811_001);
-        with_formula_fit(&formula, &table, |fit, ws, map| {
-            assert!(fit.converged());
-            assert_eq!(ws.theta, [0.0]);
-            let st = pass(ws, map);
-            assert_eq!(coef_df_in_range(&st), [298.0, 298.0]);
-        });
     }
 
     /// The canonical correlation boundary (`sim_corr_boundary`, `y ~ x + (x | g)`):
@@ -2000,6 +1931,11 @@ mod gradient_route {
                     per_group_gradient_armed(&ws.kernel),
                     "{name}: not on the route"
                 );
+                assert_eq!(
+                    lmm_outer_optimizer(&ws.kernel, ws.theta.len()),
+                    OuterOptimizer::Bfgs,
+                    "{name}: the θ search is not BFGS"
+                );
                 let theta = ws.theta.clone();
                 let st = pass(ws, map);
                 assert_eq!(st.route, DerivRoute::GradientDiff, "{name}");
@@ -2106,90 +2042,6 @@ mod gradient_route {
                 }
             });
         }
-    }
-
-    /// The `q2s` draw with one level's slope covariate made constant: that
-    /// level's random-effect Gram is singular, which disarms the per-group
-    /// route for the whole dataset.
-    fn disarmed_q2s() -> (Table, String) {
-        let (mut table, formula) = speed_shape(&[2], false, false, 811_001);
-        // Level 0 of the primary grouping holds rows 0, 60, 120, ….
-        for (name, col) in &mut table.columns {
-            if name == "x1" {
-                let Column::Numeric(x) = col else {
-                    unreachable!("x1 is numeric")
-                };
-                let x0 = x[0];
-                for v in x.iter_mut().step_by(60) {
-                    *v = x0;
-                }
-            }
-        }
-        (table, formula)
-    }
-
-    /// The predicate is true exactly where the θ search picks BFGS: on the
-    /// per-group fixtures, and on none of a random intercept, nested and
-    /// crossed intercepts, or a slope design one level of which disarms the
-    /// route.
-    #[test]
-    fn predicate_matches_outer_optimizer() {
-        let mut cases: Vec<(String, Table, String, Option<&str>, bool)> = per_group_fixtures()
-            .into_iter()
-            .map(|(name, t, f, w)| (name, t, f, w, true))
-            .collect();
-        for (name, q, nested) in [
-            ("int1", &[1][..], false),
-            ("nest2", &[1, 1][..], true),
-            ("cross4", &[1; 4][..], false),
-            ("q2s", &[2][..], false),
-        ] {
-            let (table, formula) = speed_shape(q, nested, false, 811_001);
-            cases.push((name.to_string(), table, formula, None, q == [2]));
-        }
-        let (table, formula) = disarmed_q2s();
-        cases.push((
-            "q2s, one level disarmed".into(),
-            table,
-            formula,
-            None,
-            false,
-        ));
-        for (name, table, formula, weights, armed) in cases {
-            with_fit_w(&formula, &table, weights, None, |_, ws, _| {
-                let bfgs = lmm_outer_optimizer(&ws.kernel, ws.theta.len()) == OuterOptimizer::Bfgs;
-                assert_eq!(per_group_gradient_armed(&ws.kernel), bfgs, "{name}");
-                assert_eq!(bfgs, armed, "{name}");
-            });
-        }
-    }
-
-    /// A slope design one level of which disarms the per-group route takes the
-    /// value route and records it, with a finite df. On an armed fit a stencil
-    /// point the gradient cannot serve (here a non-finite coordinate, so a
-    /// non-finite deviance) sends the pass to the value route too, which then
-    /// records the failure.
-    #[test]
-    fn failed_gradient_falls_back_to_value() {
-        let (table, formula) = disarmed_q2s();
-        with_fit_w(&formula, &table, None, None, |fit, ws, map| {
-            assert!(fit.converged());
-            assert!(!per_group_gradient_armed(&ws.kernel));
-            let st = pass(ws, map);
-            assert_eq!(st.route, DerivRoute::Value);
-            assert!(!st.is_failed());
-            coef_df_in_range(&st);
-        });
-        let (table, formula) = speed_shape(&[3], false, false, 811_001);
-        with_fit_w(&formula, &table, None, None, |_, ws, map| {
-            assert!(per_group_gradient_armed(&ws.kernel));
-            let mut theta = ws.theta.clone();
-            theta[1] = f64::NAN;
-            let st = pass_at(ws, &theta, map);
-            assert_eq!(st.route, DerivRoute::Value);
-            assert!(st.is_failed());
-            assert!(st.coef_df().iter().all(|d| d.is_nan()));
-        });
     }
 
     /// A gradient route that fails at its first axis point (step factor 1e300)

@@ -785,10 +785,10 @@ mod tests {
 
     /// A dependent column is dropped and the earlier ones kept: col2 = col0 +
     /// col1 exactly → column 2 aliased; an exact duplicate (col1 == col0) → the
-    /// LATER column (1) aliased.
+    /// LATER column (1) aliased; a full-rank design flags none.
     #[test]
-    fn aliased_columns_flags_the_later_dependent_column() {
-        let cases: [(Vec<f64>, usize, usize, Vec<bool>); 2] = [
+    fn aliased_columns_flags_only_the_later_dependent_column() {
+        let cases: [(Vec<f64>, usize, usize, Vec<bool>); 3] = [
             // rows: [1, days, 1+days]
             (
                 vec![
@@ -802,6 +802,12 @@ mod tests {
                 vec![false, false, true],
             ),
             (vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0], 3, 2, vec![false, true]),
+            (
+                vec![1.0, 0.0, 1.0, 1.0, 1.0, 2.0, 1.0, 3.0],
+                4,
+                2,
+                vec![false, false],
+            ),
         ];
         for (x, n, p, want) in cases {
             let g = gram_of(&x, n, p);
@@ -810,81 +816,16 @@ mod tests {
         }
     }
 
-    /// Full-rank design → no column aliased.
-    #[test]
-    fn aliased_columns_full_rank_none() {
-        let n = 4;
-        let p = 2;
-        let x = vec![1.0, 0.0, 1.0, 1.0, 1.0, 2.0, 1.0, 3.0];
-        let g = gram_of(&x, n, p);
-        let a = super::aliased_columns(g.as_ref(), p, super::ALIAS_EPS);
-        assert_eq!(a, vec![false, false]);
-    }
-
     // ---------------------------------------------------------------------
     // Suff-stats path tests
     // ---------------------------------------------------------------------
-
-    /// `OlsSuffStats::add_rows` is batch-split invariant — adding the
-    /// rows in two segments accumulates the identical X'X / X'y / y'y / Σy /
-    /// n_rows as adding them in one full pass. No hand-computed reference: the
-    /// invariant compares the kernel against itself under a different split.
-    #[test]
-    fn suff_stats_batch_split_invariance() {
-        let n = 5;
-        let p = 3;
-        let x = build_x(n, p, |i, j| ((i + 1) as f64).powi(j as i32));
-        let y = [1.0_f64, 2.0, 3.0, 4.0, 5.0];
-
-        // Path A: two-segment accumulation.
-        let mut ws_split = TestWs::new(n, p, 0);
-        ws_split.reset_suff_stats();
-        {
-            let mut s = suff_stats(&mut ws_split);
-            s.add_rows(x.as_ref().subrows(0, 2), &y[0..2]);
-            s.add_rows(x.as_ref().subrows(2, 3), &y[2..5]);
-        }
-
-        // Path B: single full accumulation.
-        let mut ws_full = TestWs::new(n, p, 0);
-        ws_full.reset_suff_stats();
-        {
-            let mut s = suff_stats(&mut ws_full);
-            s.add_rows(x.as_ref(), &y);
-        }
-
-        // Lower triangle (the only entries `add_rows` writes) must agree.
-        for j in 0..p {
-            for i in j..p {
-                assert!(
-                    (ws_split.suff_xtx[(i, j)] - ws_full.suff_xtx[(i, j)]).abs() < 1e-12,
-                    "xtx[{i},{j}] split-add != full-add"
-                );
-            }
-        }
-        for k in 0..p {
-            assert!(
-                (ws_split.suff_xty[k] - ws_full.suff_xty[k]).abs() < 1e-12,
-                "xty[{k}] split != full"
-            );
-        }
-        assert!(
-            (ws_split.suff_yty - ws_full.suff_yty).abs() < 1e-12,
-            "yty split != full"
-        );
-        assert!(
-            (ws_split.suff_sum_y - ws_full.suff_sum_y).abs() < 1e-12,
-            "sum_y split != full"
-        );
-        assert_eq!(ws_split.suff_n_rows, ws_full.suff_n_rows);
-        assert_eq!(ws_split.suff_n_rows, n);
-    }
 
     /// `add_rows`'s panel GEMM must match a per-row rank-1 triangle
     /// (inlined below as the oracle). X'X / X'y reassociate under the GEMM —
     /// band 1e-12 relative, measured max 2.0e-15; yty / sum_y stay scalar in
     /// the original row order and must be bit-identical. n = 611 crosses two
-    /// PANEL_ROWS=256 boundaries plus a 99-row tail.
+    /// PANEL_ROWS=256 boundaries plus a 99-row tail; and a two-call split
+    /// accumulates the same statistics.
     #[test]
     fn add_rows_panel_matches_scalar_reference() {
         let n = 611;
@@ -947,6 +888,30 @@ mod tests {
             ref_sum_y.to_bits(),
             "sum_y must stay bit-identical"
         );
+        // Cross-call accumulation: two `add_rows` calls (split mid-panel) accumulate
+        // the same statistics as the per-row oracle; the split reassociates, so banded.
+        let mut ws2 = TestWs::new(n, p, 0);
+        ws2.reset_suff_stats();
+        {
+            let mut s = suff_stats(&mut ws2);
+            s.add_rows(x.as_ref().subrows(0, 300), &y[..300]);
+            s.add_rows(x.as_ref().subrows(300, n - 300), &y[300..]);
+        }
+        let close = |a: f64, b: f64| (a - b).abs() <= 1e-12 * b.abs().max(1.0);
+        for j in 0..p {
+            for i in j..p {
+                assert!(
+                    close(ws2.suff_xtx[(i, j)], ref_xtx[(i, j)]),
+                    "split xtx[{i},{j}]"
+                );
+            }
+            assert!(close(ws2.suff_xty[j], ref_xty[j]), "split xty[{j}]");
+        }
+        assert!(
+            close(ws2.suff_yty, ref_yty) && close(ws2.suff_sum_y, ref_sum_y),
+            "split yty/sum_y"
+        );
+        assert_eq!(ws2.suff_n_rows, n);
         assert_eq!(ws.suff_n_rows, n);
     }
 

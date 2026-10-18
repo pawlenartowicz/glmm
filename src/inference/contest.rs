@@ -58,9 +58,6 @@ pub(crate) struct ContestMD {
     /// The per-direction df `ν_m`, one per retained eigen-direction, largest
     /// eigenvalue first; on the one-direction route the contest1D df.
     pub nu: Vec<f64>,
-    /// The rows of `L`. `num_df < rows` is a rank-deficient `L`, which the
-    /// caller reports.
-    pub rows: usize,
 }
 
 /// `contest1D`: the t test of `lᵀβ = 0`. `v = lᵀCl`, `g_k = lᵀ Jac_k l`,
@@ -104,7 +101,7 @@ pub(crate) fn contest_md(
     debug_assert_eq!(l.ncols(), p, "contest_md: L has the wrong column count");
     let row = |i: usize| -> Vec<f64> { (0..p).map(|j| l[(i, j)]).collect() };
     if rows == 1 {
-        return Ok(from_1d(contest_1d(inp, &row(0)), 1));
+        return Ok(from_1d(contest_1d(inp, &row(0))));
     }
 
     // L C Lᵀ, symmetrized: the two triangles round differently. Plain loops,
@@ -129,7 +126,6 @@ pub(crate) fn contest_md(
             den_df: f64::NAN,
             p_value: f64::NAN,
             nu: Vec::new(),
-            rows,
         });
     }
     // Row m of PtL is eigenvector kept[m] times L.
@@ -142,7 +138,7 @@ pub(crate) fn contest_md(
         })
         .collect();
     if q == 1 {
-        return Ok(from_1d(contest_1d(inp, &ptl[0]), rows));
+        return Ok(from_1d(contest_1d(inp, &ptl[0])));
     }
 
     let mut t2 = 0.0;
@@ -162,7 +158,6 @@ pub(crate) fn contest_md(
         den_df,
         p_value: f_upper_p(f_value, q as f64, den_df),
         nu,
-        rows,
     })
 }
 
@@ -188,14 +183,13 @@ pub(crate) fn fstat_ddf(nu: &[f64], tol: f64) -> f64 {
 
 /// The contestMD row of a one-direction test: `F = t²`, NumDF 1, the t
 /// test's df and p.
-fn from_1d(t: Contest1D, rows: usize) -> ContestMD {
+fn from_1d(t: Contest1D) -> ContestMD {
     ContestMD {
         f_value: t.t_value * t.t_value,
         num_df: 1,
         den_df: t.df,
         p_value: t.p_value,
         nu: vec![t.df],
-        rows,
     }
 }
 

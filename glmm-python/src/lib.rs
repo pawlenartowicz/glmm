@@ -11,7 +11,7 @@ use glmm::orchestrate;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
-use pyo3::types::{PyBytes, PyDict, PyList};
+use pyo3::types::{PyBytes, PyDict, PyFloat, PyList, PyString, PyTuple};
 
 /// A per-row vector sent from Python as the raw bytes of a native-endian numpy
 /// array (`ndarray.tobytes()`), the counterpart of `values_bytes` below. Bytes
@@ -591,10 +591,103 @@ fn formula_columns(
     ))
 }
 
+/// The per-element pass of `glmm/__init__.py::_plain_column` over a plain list,
+/// which decides everything else (the type sets, what is missing, the cutoff,
+/// the fallback). Returns:
+///
+/// - `("num", values)` when every element's type is one of `number_types`:
+///   `values` the float64 bytes, each element converted as
+///   `np.array(elements, dtype=float)` converts it (`None` is NaN, the rest go
+///   through `PyFloat_AsDouble`, which rounds an int correctly).
+/// - `("str", codes, keys)` when every element is a string whose type is one of
+///   `string_types`, or missing: `None`, or a NaN whose type is a float type in
+///   `number_types`. `keys` are the distinct strings as the original objects,
+///   in first-seen order; when a row is missing, one `None` key follows them
+///   and every missing row takes its code. `codes` are intp bytes.
+/// - `None` for anything else, including an int too large for a double and a
+///   string with no UTF-8 form (a lone surrogate): the caller then runs its own
+///   per-element code, which raises or converts as it always has.
+///
+/// Types match by identity, as `type(v) in _NUMBER_TYPES` does, so a subclass
+/// is never matched and no element's own Python code runs. Strings are keyed
+/// by their UTF-8 bytes, so `"a"` and `np.str_("a")` are one key, as they are
+/// in a dict.
+#[pyfunction]
+fn plain_column<'py>(
+    py: Python<'py>,
+    elements: &Bound<'py, PyList>,
+    number_types: &Bound<'py, PyTuple>,
+    string_types: &Bound<'py, PyTuple>,
+) -> PyResult<Option<Bound<'py, PyTuple>>> {
+    if elements.is_empty() {
+        return Ok(None);
+    }
+    let ptrs = |types: &Bound<'py, PyTuple>| types.iter().map(|t| t.as_ptr()).collect::<Vec<_>>();
+    let (numbers, strings) = (ptrs(number_types), ptrs(string_types));
+    let type_of = |v: &Bound<'py, PyAny>| v.get_type_ptr().cast::<pyo3::ffi::PyObject>();
+
+    let mut values = Vec::with_capacity(elements.len());
+    for v in elements.iter() {
+        if !numbers.contains(&type_of(&v)) {
+            break;
+        }
+        if v.is_none() {
+            values.push(f64::NAN);
+        } else if let Ok(x) = v.extract::<f64>() {
+            values.push(x);
+        } else {
+            return Ok(None);
+        }
+    }
+    if values.len() == elements.len() {
+        return Ok(Some(("num", f64_bytes(py, &values)?).into_pyobject(py)?));
+    }
+
+    // Each distinct string allocates its key once; the codes depend only on
+    // first-seen order, so the hasher does not matter.
+    let mut index: HashMap<Box<str>, isize> = HashMap::new();
+    let keys = PyList::empty(py);
+    let mut codes = Vec::with_capacity(elements.len());
+    let mut any_missing = false;
+    for v in elements.iter() {
+        let t = type_of(&v);
+        if strings.contains(&t) {
+            let Some(s) = v.cast::<PyString>().ok().and_then(|s| s.to_str().ok()) else {
+                return Ok(None);
+            };
+            let code = match index.get(s) {
+                Some(&code) => code,
+                None => {
+                    let code = index.len() as isize;
+                    index.insert(s.into(), code);
+                    keys.append(&v)?;
+                    code
+                }
+            };
+            codes.push(code);
+        } else if v.is_none()
+            || (numbers.contains(&t) && v.cast::<PyFloat>().is_ok_and(|f| f.value().is_nan()))
+        {
+            codes.push(-1);
+            any_missing = true;
+        } else {
+            return Ok(None);
+        }
+    }
+    if any_missing {
+        let code = keys.len() as isize;
+        codes.iter_mut().filter(|c| **c < 0).for_each(|c| *c = code);
+        keys.append(py.None())?;
+    }
+    let codes = values_bytes(py, &codes, isize::to_ne_bytes)?;
+    Ok(Some(("str", codes, keys).into_pyobject(py)?))
+}
+
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(fit, m)?)?;
     m.add_function(wrap_pyfunction!(formula_columns, m)?)?;
+    m.add_function(wrap_pyfunction!(plain_column, m)?)?;
     m.add_function(wrap_pyfunction!(confint, m)?)?;
     m.add_function(wrap_pyfunction!(f_table_refusal, m)?)?;
     m.add_function(wrap_pyfunction!(compare_fits, m)?)?;

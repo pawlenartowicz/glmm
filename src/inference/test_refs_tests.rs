@@ -75,15 +75,6 @@ fn pending_flag_is_the_field_being_present() {
 }
 
 #[test]
-fn each_kind_has_its_own_directory_under_goldens_inference() {
-    let root =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("validation/goldens/inference");
-    for kind in Kind::ALL {
-        assert_eq!(kind.dir(), root.join(kind.as_str()));
-    }
-}
-
-#[test]
 fn covers_matches_cell_quantity_and_scope() {
     let entries = [
         div("other-scope", "ref_a", "glmm-vs-oracle", &["df"], 0.5),

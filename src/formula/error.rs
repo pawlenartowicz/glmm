@@ -28,7 +28,7 @@ pub enum ParseError {
         /// The grouping factor name that appears more than once.
         name: String,
     },
-    /// A slope term `(1+|g)` with no slope variables.
+    /// A slope term with nothing but `+` signs after its `1+`, e.g. `(1++|g)`.
     EmptySlopeTerm {
         /// The grouping factor of the empty slope term.
         group: String,
@@ -103,10 +103,13 @@ pub enum Error {
     /// design would have zero columns.
     EmptyDesign,
     /// A transform term evaluated to a non-finite value (e.g. `log(x)` on a
-    /// non-positive `x`, which R would silently drop via `na.omit`), or an
-    /// `offset()` term holds one. Either is an error naming the row.
+    /// non-positive `x`, which R would silently drop via `na.omit`), or the
+    /// response, a design column or an `offset()` term holds one (NaN
+    /// included: missing rows are dropped before lowering). Each is an error
+    /// naming the row.
     TransformNotFinite {
-        /// The term as spelled, e.g. `log(x)`.
+        /// The term as spelled, e.g. `log(x)`, the response's name, or a
+        /// design column's name (`x`, `x:z`).
         term: String,
         /// 0-based row of the first non-finite value.
         row: usize,

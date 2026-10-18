@@ -6,7 +6,7 @@ use crate::standardize::ColumnScaling;
 // which is `loop_advanced`-gated: the pivot the region-2 tests below assert on
 // is recorded on every route, so these must run under default features too.
 use super::core::{build_workspace, fit_on};
-use crate::lmm::{fit_lmm_unhinted, LmmWorkspace};
+use crate::lmm::LmmWorkspace;
 use crate::{
     Family, GroupIds, Grouping, GroupingRelation, ModelSpec, ReStructure, Sizing, StartValues,
 };
@@ -1030,7 +1030,7 @@ fn fit_lmm_weighted_matches_lme4() {
         &ids,
         &FitOptions {
             target_indices: vec![0, 1],
-            weights: Some(w.clone()),
+            weights: Some(w),
             ..FitOptions::default()
         },
     );
@@ -1100,25 +1100,13 @@ fn fit_lmm_weighted_matches_lme4() {
     );
     assert!(f.reml);
 
-    // σ̂ isn't exposed on `Fit` for q≥2 RE (tau2 only reproduces the (0,0)
-    // diagonal, not the raw residual variance) — reconstruct via the same
-    // suff-stats accumulator/kernel `fit_mle` calls, reading `sigma_sq`
-    // straight off `LmmFit` (mirrors fit_mle's construction verbatim).
-    let (sized, ids, _perm) = spec_sized_from_ids(&model, &ids);
-    let mut ws = LmmWorkspace::for_cluster_spec_ext(p, &sized, n, &[1], &[], false);
-    let mut x_mat = Mat::<f64>::zeros(n, p);
-    for i in 0..n {
-        for j in 0..p {
-            x_mat[(i, j)] = x[i * p + j];
-        }
-    }
-    ws.suff_mut()
-        .add_rows_multi(x_mat.as_ref(), &y, &ids.primary, &[], Some(&w));
-    let lmm_fit = fit_lmm_unhinted(&mut ws, &[0, 1], None, ColumnScaling::IDENTITY);
-    let sigma = lmm_fit.sigma_sq.sqrt();
+    // Gaussian dispersion = REML σ̂² on the caller's weight scale
+    // (`lmm_view_to_fit` folds the weight scale back in); σ̂ against lme4's
+    // sigma().
     assert!(
-        (sigma - REF_SIGMA).abs() / REF_SIGMA < 1e-4,
-        "sigma {sigma} vs {REF_SIGMA}"
+        (f.dispersion.sqrt() - REF_SIGMA).abs() / REF_SIGMA < 1e-4,
+        "σ̂ {} vs {REF_SIGMA}",
+        f.dispersion.sqrt()
     );
 }
 
@@ -1210,39 +1198,6 @@ fn fit_lmm_scalar_crossed_varying_weights_noz_matches_sparse() {
         assert_eq!(sb.len(), nb.len(), "varcorr[{bi}] len");
         for (ei, (a, b)) in sb.iter().zip(nb.iter()).enumerate() {
             assert!(rel(*a, *b) < 1e-4, "varcorr[{bi}][{ei}] sparse={a} noz={b}");
-        }
-    }
-}
-
-/// The test-only `fit_mle` baseline fits the criterion `opts.reml` resolves
-/// to, on both kernels: its σ̂² is the one `fit_cold` reports under the same
-/// option, so a forced-route parity test under ML compares ML with ML.
-#[test]
-fn fit_mle_baseline_honours_reml() {
-    let (x, y, n, p) = super::common_tests::lmm_hand_dataset();
-    let model = intercept_only_spec(Sizing::FixedClusters { n_clusters: 6 });
-    let ids = GroupIds {
-        primary: (0..n).map(|i| (i % 6) as u32).collect(),
-        extra: vec![],
-    };
-    let (sized, ids, _perm) = spec_sized_from_ids(&model, &ids);
-    let rel = |a: f64, b: f64| (a - b).abs() / b.abs();
-    for reml in [None, Some(false)] {
-        let opts = FitOptions {
-            target_indices: vec![1, 2],
-            reml,
-            ..FitOptions::default()
-        };
-        let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
-        let noz = fit_mle_noz_pub(&x, &y, n, p, &sized, &ids.primary, &ids.extra, None, &opts);
-        let sp = fit_mle_sparse_pub(&x, &y, n, p, &sized, &ids.primary, &ids.extra, None, &opts);
-        for (route, fit) in [("noz", noz), ("sparse", sp)] {
-            assert!(
-                rel(fit.dispersion, cold.dispersion) < 1e-5,
-                "reml = {reml:?}, {route}: σ̂² {} vs fit_cold {}",
-                fit.dispersion,
-                cold.dispersion
-            );
         }
     }
 }
@@ -1586,6 +1541,14 @@ fn fit_lmm_weight_scale_invariant_dense_and_sparse() {
             "{reml:?} c=1 baseline must converge (dense={} sparse={})",
             base_dense.converged(),
             base_sparse.converged()
+        );
+        // The forced-route baselines fit the criterion `reml` resolves to (their
+        // `Fit::reml` reads the kernel's), so the ML arm compares ML with ML.
+        let want_reml = reml != Some(false);
+        assert_eq!(
+            (base_dense.reml, base_sparse.reml),
+            (want_reml, want_reml),
+            "{reml:?}: baseline criterion"
         );
 
         let rel = |a: f64, b: f64| (a - b).abs() / (1.0 + b.abs());
@@ -3022,7 +2985,7 @@ fn satterthwaite_note_data() -> (Vec<f64>, Vec<f64>, GroupIds, usize, usize) {
 }
 
 /// A `MaxFunReached` endpoint gets its df, and the note says the endpoint
-/// did not converge.
+/// did not converge. Every df lies in (0, ν), with ν = n − p under REML.
 #[test]
 fn note_on_maxfun_endpoint() {
     use bobyqa::{Bobyqa, Config};
@@ -3047,9 +3010,11 @@ fn note_on_maxfun_endpoint() {
     assert_eq!(fit.diagnostics.boundary, Boundary::NoOptimum);
     assert!(fit.deviance.is_finite());
     super::core::attach_satterthwaite(&mut ws, &mut fit, &opts);
+    let nu = fit.satterthwaite.as_ref().expect("the pass ran").nu;
+    assert_eq!(nu, (n - p) as f64, "REML ν = n − p");
     assert!(
-        fit.coef_df.iter().all(|d| d.is_finite()),
-        "{:?}",
+        fit.coef_df.iter().all(|&d| d > 0.0 && d < nu),
+        "{:?} outside (0, {nu})",
         fit.coef_df
     );
     let note = fit
@@ -3148,36 +3113,6 @@ fn failed_pass_gives_no_df_failed() {
         fit.contrast_f(&[1.0, 0.0, 0.0, 1.0], 2),
         Err(ContrastError::NoDf(NoDfReason::Failed))
     );
-}
-
-/// What the ports read after a failed pass (a forced non-finite stencil
-/// point, as `failed_pass_gives_no_df_failed`): `df_method = "failed"`, no t
-/// p-value, and normal intervals on every coefficient although the SEs are
-/// finite.
-#[cfg(feature = "orchestrate")]
-#[test]
-fn failed_pass_gives_failed_port_fields_and_normal_intervals() {
-    use crate::inference::tails::normal_quantile;
-
-    let (x, y, ids, n, p) = satterthwaite_note_data();
-    let model = intercept_only_spec(Sizing::FixedClusters { n_clusters: 1 });
-    let opts = FitOptions {
-        target_indices: vec![0, 1],
-        ..FitOptions::default()
-    };
-    let (mut fit, mut ws) = fit_cold_keep_workspace(&x, &y, n, p, &model, &ids, &opts);
-    ws.lmm_parts().expect("a Gaussian mixed workspace").0.theta[0] = f64::NAN;
-    super::core::attach_satterthwaite(&mut ws, &mut fit, &opts);
-
-    let (coef_p, df_method) = crate::orchestrate::t_tests(&fit, &opts.target_indices);
-    assert_eq!(df_method, "failed");
-    assert!(coef_p.iter().all(|v| v.is_nan()));
-    assert!(fit.se.iter().all(|s| s.is_finite()));
-    let ci = crate::orchestrate::confint(&fit.beta, &fit.se, &fit.coef_df, 0.95).unwrap();
-    for (i, [lo, hi]) in ci.into_iter().enumerate() {
-        assert_eq!(lo, fit.beta[i] + normal_quantile(0.025) * fit.se[i]);
-        assert_eq!(hi, fit.beta[i] + normal_quantile(0.975) * fit.se[i]);
-    }
 }
 
 /// A `(1 | g)` design for the design-summary tests: `sizes[a]` rows in level

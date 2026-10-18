@@ -105,45 +105,6 @@ test_that("offset= is honored as an expression and stays aligned under subset=",
                "one entry")
 })
 
-test_that("the design summary is kept on an unweighted (1 | g) fit only", {
-  set.seed(21)
-  d <- data.frame(x = rnorm(40), g = factor(rep(letters[1:8], each = 5)))
-  d$y <- 1 + d$x + rep(rnorm(8), each = 5) + rnorm(40, sd = 0.5)
-  ds <- fastglmm(y ~ x + (1 | g), d)$design_summary
-  expect_equal(lengths(ds), c(counts = 8L, s = 2L * 8L, c = 4L))
-  expect_equal(ds$counts, rep(5, 8))
-  expect_null(fastglmm(y ~ x, d)$design_summary)
-  w <- seq(0.5, 1.5, length.out = 40)
-  expect_null(fastglmm(y ~ x + (1 | g), d, weights = w)$design_summary)
-})
-
-test_that("the raw fit carries the offset, the objective and both term tables", {
-  # fastglmm_fit's list, before the fit object stores these fields.
-  set.seed(22)
-  x <- rnorm(40)
-  g <- rep(0:7, each = 5)
-  y <- 1 + x + rep(rnorm(8), each = 5) + rnorm(40, sd = 0.5)
-  raw <- function(formula, offset) {
-    fastglmm:::fastglmm_fit(formula, list(x = x, y = y),
-                            list(g = letters[1:8]), list(g = as.integer(g)),
-                            "gaussian", "identity", "hessian", 1L, numeric(0),
-                            numeric(0), offset, numeric(0), numeric(0),
-                            numeric(0), TRUE, logical(0), "auto")
-  }
-  r <- raw("y ~ x + (1 | g)", 0.1 * x)
-  expect_equal(r$offset, 0.1 * x)
-  expect_equal(c(r$objective, r$objective_nodes), c("reml", "0"))
-  t3 <- r$term_table_type3
-  expect_null(t3$error)
-  expect_equal(c(t3$ss_type, t3$label, t3$kind, t3$den_df_kind),
-               c("III", "x", "F", "satterthwaite"))
-  expect_equal(t3$row_notes, list(character(0)))
-  refused <- raw("y ~ x + x:g", numeric(0))
-  expect_null(refused$offset)
-  expect_named(refused$term_table_type2, "error")
-  expect_true(nzchar(refused$term_table_type2$error))
-})
-
 test_that("missing and unsupported columns are clean errors", {
   expect_error(fastglmm(y ~ z, ols_data()), "not found in data.*z")
   d <- ols_data()

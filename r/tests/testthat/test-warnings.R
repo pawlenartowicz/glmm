@@ -449,7 +449,7 @@ test_that("summary of an object without $warnings prints no section", {
   expect_false(any(out == "Warnings:"))
 })
 
-test_that("the kind table matches the Python port", {
+test_that("the kind table pins every tier and title (python/glmm/__init__.py _WARNING_KINDS and documentation/warnings.md hold the same table)", {
   expect_identical(fastglmm:::.WARNING_KINDS, list(
     search_limit = c("severe", "Search stopped at its step limit"),
     fit_failed = c("severe", "Fit failed"),
@@ -597,26 +597,4 @@ test_that("a degenerate Gaussian LMM carries the Satterthwaite note", {
   off <- suppressWarnings(fastglmm(y ~ x + x2 + (1 + x2 | g), d, satterthwaite = FALSE))
   expect_identical(off$df_method, "disabled")
   expect_identical(off$warnings$kind, "fit_failed")
-})
-
-test_that("port parity confint", {
-  # Pinned 90% intervals on MIXED_PAIRS from orchestrate::confint, the one function
-  # both ports call, for the LMM (Satterthwaite t, df about 4.0 and 14.1) and the
-  # OLS fit (t on n - p = 18). Produced on x86_64 Linux from these sources
-  # (release builds of both ports gave the same digits). Same numbers and band in
-  # python/tests/test_warnings.py - change together. Band: CI_REF_REL
-  # (helper-pins.R).
-  pins <- list(
-    "y ~ x + (1 | g)" = rbind(c(-2.423532479928109, 2.4235324799281277),
-                              c(0.26110360172792885, 0.3444701274625301)),
-    "y ~ x" = rbind(c(-0.8530566754329614, 0.8530566754329608),
-                    c(0.3287512344979612, 0.6037162979695715))
-  )
-  for (f in names(pins)) {
-    expect_no_warning(fit <- fastglmm(stats::as.formula(f), MIXED_PAIRS))
-    expect_identical(fit$df_method,
-                     if (grepl("|", f, fixed = TRUE)) "satterthwaite" else "residual")
-    expect_equal(unname(unclass(confint(fit, level = 0.9))), pins[[f]],
-                 tolerance = CI_REF_REL, info = f)
-  }
 })

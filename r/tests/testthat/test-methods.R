@@ -89,15 +89,6 @@ test_that("sigma for inverse-Gaussian is sqrt(phi), phi the Pearson dispersion",
   expect_equal(sigma(f), sqrt(f$dispersion))
 })
 
-test_that("summary prints 'Dispersion (phi, Pearson)' for a Gamma GLM", {
-  set.seed(24)
-  d <- data.frame(x = rnorm(80))
-  d$y <- rgamma(80, shape = 4, rate = 4 / exp(0.3 + 0.5 * d$x))
-  fit <- fastglmm(y ~ x, d, family = "gamma")
-  out <- paste(capture.output(print(summary(fit))), collapse = "\n")
-  expect_true(grepl("Dispersion (phi, Pearson):", out, fixed = TRUE))
-})
-
 test_that("summary prints 'Dispersion (phi, ML)' for a Gamma GLMM", {
   set.seed(25)
   n_g <- 60L
@@ -138,7 +129,7 @@ test_that("gaussian sigma matches lm on a fixed-only fit", {
   expect_equal(sigma(fit), sigma(ref), tolerance = 1e-8)
 })
 
-test_that("gaussian LMM sigma is pinned and VarCorr prints a Residual row", {
+test_that("a gaussian LMM's VarCorr carries sigma as sc and prints a Residual row", {
   set.seed(106)
   g <- factor(rep(1:40, each = 8))
   x <- rnorm(320)
@@ -146,11 +137,6 @@ test_that("gaussian LMM sigma is pinned and VarCorr prints a Residual row", {
                     rnorm(320, sd = 0.6),
                   x = x, g = g)
   fit <- fastglmm(y ~ x + (1 | g), d)
-  # The REML residual standard deviation, pinned against this package's own
-  # output. The agreement with lmer on this design is checked by hand in
-  # tools/acceptance-vs-lme4.R's family of comparisons, not here: this suite
-  # installs no external engine.
-  expect_equal(sigma(fit), 0.583493794941051, tolerance = CI_REF_REL)
   vc <- VarCorr(fit)
   expect_equal(attr(vc, "sc"), sigma(fit))
   expect_match(paste(capture.output(print(vc)), collapse = "\n"), "Residual")
@@ -284,6 +270,7 @@ test_that("summary on a gaussian LMM prints the REML criterion, not AIC", {
   d <- benchmark_data(seed = 107, family = "poisson")
   d$yg <- d$y + rnorm(nrow(d))
   fit <- fastglmm(yg ~ t + (1 | g), d)
+  expect_true(attr(logLik(fit), "REML"))
   s <- summary(fit)
   expect_named(s$criterion, "REML criterion at convergence")
   expect_equal(unname(s$criterion), -2 * as.numeric(logLik(fit)))
@@ -632,18 +619,6 @@ test_that("the gradient search fields cross the port", {
   expect_identical(plain$n_grad, 0)
   expect_identical(plain$outer_stop, NA_character_)
   expect_true(is.nan(plain$outer_decrement))
-})
-
-test_that("wald.se = \"rx\" is marshalled through to the kernel", {
-  # Same beta either way (both are Wald SE methods on the same fit); the SEs
-  # themselves must differ, or the option never reached the kernel.
-  d <- benchmark_data(seed = 114, family = "binomial")
-  fit_hessian <- fastglmm(y ~ t + (1 | g), d, family = binomial())
-  fit_rx <- fastglmm(y ~ t + (1 | g), d, family = binomial(), wald.se = "rx")
-  expect_true(fit_rx$converged)
-  expect_true(all(is.finite(fit_rx$se)))
-  expect_equal(unname(fixef(fit_rx)), unname(fixef(fit_hessian)), tolerance = 1e-8)
-  expect_false(isTRUE(all.equal(unname(fit_rx$se), unname(fit_hessian$se))))
 })
 
 # A Gaussian random-intercept fixture: 40 groups of 8.

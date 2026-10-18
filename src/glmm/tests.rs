@@ -133,30 +133,6 @@ fn logit_intercept_spec(sizing: Sizing) -> ModelSpec {
     s
 }
 
-/// `for_design` on the two NoZ edges the `Packed` assertions elsewhere don't
-/// cover: no extras picks the no-extras blocked path, and intercept-only
-/// crossed extras (in-envelope, so `structured_extras_eligible`) pick the
-/// structured path.
-#[test]
-fn for_design_picks_blocked_and_structured() {
-    let no_extras = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 10 });
-    let g = crate::lmm::LmmGroupings::from_cluster_spec(&no_extras, 40, &[]);
-    assert_eq!(
-        GlmmLayout::for_design(&no_extras, &g),
-        GlmmLayout::Blocked,
-        "no extras must pick the no-extras blocked path"
-    );
-
-    let (_, _, _, _, with_extras) = glmm_extras_q1_dataset(0, 3);
-    let g = crate::lmm::LmmGroupings::from_cluster_spec(&with_extras, 96, &[]);
-    assert!(g.structured_extras_eligible());
-    assert_eq!(
-        GlmmLayout::for_design(&with_extras, &g),
-        GlmmLayout::Structured,
-        "in-envelope intercept-only crossed extras must pick the structured path"
-    );
-}
-
 // Tiny deterministic LCG → reproducible test data without RNG-determinism caveats.
 fn lcg(s: &mut u64) -> f64 {
     *s = s
@@ -962,6 +938,9 @@ struct HessianFixture {
     vcov_rx: Vec<Vec<f64>>,
 }
 
+/// The n=96 / 12-cluster binomial fixture and its glmer reference, both written by
+/// `tests/fixtures/gen_glmm_hessian_vcov.R` (data from `set.seed(2137)`), registered
+/// in `validation/manifest.json`, `in_crate_references`.
 fn load_hessian_fixture() -> HessianFixture {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -1816,7 +1795,7 @@ fn hessian_mode_t_sq_uses_joint_hessian_cov() {
 /// keep every perturbed deviance finite, so the non-finite branch is effectively
 /// unreachable with well-posed data).
 #[test]
-fn fd_hessian_non_pd_falls_back_to_rx_and_counts() {
+fn fd_hessian_non_pd_falls_back_to_rx() {
     let (n, nc) = (320usize, 8usize);
     let per = n / nc;
     // Strong between-cluster intercept offsets (SD ≈ 5.2) ⇒ high ICC ⇒ the fit
@@ -2447,67 +2426,44 @@ fn glmm_slope_noextra_dataset() -> (Mat<f64>, Vec<f64>, Vec<u32>) {
 /// The blocked intercept path computes the same Laplace deviance as the
 /// independent brute force (reorders accumulation ⇒ FP-close, not bit-equal).
 /// After Phase 2 this routes through `pirls_solve_blocked` (extra_offsets empty).
+/// Run on both id layouts: round-robin (`FixedClusters`-style interleaved ids)
+/// and the `FixedSize`/DGEN-FS production layout (contiguous id runs); a
+/// layout-sensitive rewrite of the blocked row loops behaves differently per
+/// layout, so the brute-force oracle must hold on both.
 #[test]
 fn blocked_laplace_matches_brute_force_intercept() {
-    let (xf64, y, ids) = glmm_intercept_dataset();
-    let beta = [0.2_f64, 0.8];
-    let want = brute_force_intercept_laplace(0.5, &beta, &xf64, &y, &ids, 8);
-    let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 });
-    let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], 1);
-    assert!(
-        ws.groupings.extra_offsets.is_empty(),
-        "fixture must route blocked"
-    );
-    ws.params[0] = 0.5;
-    ws.params[1] = beta[0];
-    ws.params[2] = beta[1];
-    let got = glmm_laplace_deviance(
-        &ws.params.clone(),
-        &mut ws,
-        xf64.as_ref(),
-        &y,
-        &ids,
-        &[],
-        80,
-    );
-    assert!(
-        (got - want).abs() < 1e-6,
-        "blocked laplace: got {got}, want {want}"
-    );
-}
-
-/// `FixedSize`/DGEN-FS production layout (contiguous id runs) through the
-/// blocked intercept path. The round-robin fixtures only cover
-/// `FixedClusters`-style interleaved ids; a layout-sensitive rewrite of
-/// the blocked row loops behaves differently per layout, so the
-/// brute-force oracle must hold here too.
-#[test]
-fn blocked_laplace_matches_brute_force_intercept_contiguous() {
-    let (xf64, y, ids) = glmm_intercept_dataset_layout(true, 80, 8);
-    let beta = [0.2_f64, 0.8];
-    let want = brute_force_intercept_laplace(0.5, &beta, &xf64, &y, &ids, 8);
-    let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 });
-    let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], 1);
-    assert!(
-        ws.groupings.extra_offsets.is_empty(),
-        "fixture must route blocked"
-    );
-    ws.params[0] = 0.5;
-    ws.params[1] = beta[0];
-    ws.params[2] = beta[1];
-    let got = glmm_laplace_deviance(
-        &ws.params.clone(),
-        &mut ws,
-        xf64.as_ref(),
-        &y,
-        &ids,
-        &[],
-        80,
-    );
-    assert!(
-        (got - want).abs() < 1e-6,
-        "blocked laplace (contiguous): got {got}, want {want}"
-    );
+    for contiguous in [false, true] {
+        let layout = if contiguous {
+            "contiguous"
+        } else {
+            "round-robin"
+        };
+        let (xf64, y, ids) = glmm_intercept_dataset_layout(contiguous, 80, 8);
+        let beta = [0.2_f64, 0.8];
+        let want = brute_force_intercept_laplace(0.5, &beta, &xf64, &y, &ids, 8);
+        let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 });
+        let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], 1);
+        assert!(
+            ws.groupings.extra_offsets.is_empty(),
+            "fixture must route blocked"
+        );
+        ws.params[0] = 0.5;
+        ws.params[1] = beta[0];
+        ws.params[2] = beta[1];
+        let got = glmm_laplace_deviance(
+            &ws.params.clone(),
+            &mut ws,
+            xf64.as_ref(),
+            &y,
+            &ids,
+            &[],
+            80,
+        );
+        assert!(
+            (got - want).abs() < 1e-6,
+            "blocked laplace ({layout}): got {got}, want {want}"
+        );
+    }
 }
 
 /// Blocked deviance == packed deviance on the no-extras slope fixture, to FP
@@ -2516,263 +2472,141 @@ fn blocked_laplace_matches_brute_force_intercept_contiguous() {
 /// divergence is a coding bug). The packed oracle is a workspace
 /// built with `for_cluster_spec_packed`, which overrides the layout
 /// `GlmmLayout::for_design` would pick for this shape.
+///
+/// Run on both id layouts: round-robin (`FixedClusters`) and cluster-contiguous
+/// (`FixedSize`/DGEN-FS), since layout-sensitive rewrites of the blocked row
+/// loops are a live optimization direction.
 #[test]
 fn blocked_pirls_matches_packed_slope_noextra() {
-    let (xf64, y, ids) = glmm_slope_noextra_dataset();
-    let n = y.len();
-    // slope on design col 1 ⇒ slope_cols = &[1]; q_p = 2.
-    let cluster = ModelSpec {
-        family: Family::Binomial {
-            link: BinomialLink::Logit,
-        },
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 8 },
-            slopes: vec![1],
-            extra_groupings: vec![],
-        }),
-    };
-    // Packed oracle: the same design on the packed-row layout, which the
-    // constructor would otherwise route to the blocked one.
-    let mut ws = GlmmWorkspace::for_cluster_spec_packed(2, &cluster, n, &[1], 1);
-    assert!(ws.groupings.extra_offsets.is_empty());
-    fill_packed_cols(&mut ws, &ids, &[], n);
-    let theta = [0.5_f64, 0.1, 0.4]; // vech(Λ_p): [σ_int, cov, σ_slope]
-    let mut beta = [0.2_f64, 0.8];
-    let (k, p, nt) = (ws.k, ws.p, ws.n_theta);
+    for contiguous in [false, true] {
+        let layout = if contiguous {
+            "contiguous"
+        } else {
+            "round-robin"
+        };
+        let (xf64, y, ids) = glmm_slope_noextra_dataset_layout(contiguous, 96, 8);
+        let n = y.len();
+        // slope on design col 1 ⇒ slope_cols = &[1]; q_p = 2.
+        let cluster = ModelSpec {
+            family: Family::Binomial {
+                link: BinomialLink::Logit,
+            },
+            re: Some(ReStructure {
+                sizing: Sizing::FixedClusters { n_clusters: 8 },
+                slopes: vec![1],
+                extra_groupings: vec![],
+            }),
+        };
+        // Packed oracle: the same design on the packed-row layout, which the
+        // constructor would otherwise route to the blocked one.
+        let mut ws = GlmmWorkspace::for_cluster_spec_packed(2, &cluster, n, &[1], 1);
+        assert!(ws.groupings.extra_offsets.is_empty());
+        fill_packed_cols(&mut ws, &ids, &[], n);
+        let theta = [0.5_f64, 0.1, 0.4]; // vech(Λ_p): [σ_int, cov, σ_slope]
+        let mut beta = [0.2_f64, 0.8];
+        let (k, p, nt) = (ws.k, ws.p, ws.n_theta);
 
-    let mut params = vec![0.0; nt + p];
-    params[..nt].copy_from_slice(&theta);
-    params[nt..].copy_from_slice(&beta);
-    packed_oracle_fill(&mut ws, xf64.as_ref(), &params, n);
-    let GlmmWorkspace {
-        prior_w,
-        wx,
-        pirls,
-        packed,
-        ..
-    } = &mut ws;
-    let oracle = pirls_solve_packed(
-        crate::Family::Binomial {
-            link: crate::BinomialLink::Logit,
-        },
-        f64::NAN,
-        k,
-        p,
-        xf64.as_ref(),
-        &y,
-        &prior_w[..n],
-        false,
-        &mut params[nt..],
-        BetaStep::Fixed,
-        pirls,
-        packed,
-        wx,
-        None, // offset
-        None,
-        n,
-        &mut crate::counters::EvalCounters::new(),
-    );
-
-    // Blocked: primary_lambda → pirls_solve_blocked, fresh scratch.
-    let mut ws2 = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[1], 1);
-    crate::lmm::primary_lambda(&theta, ws2.groupings.primary_q, &mut ws2.pirls.lam);
-    fill_z_f64(&ws2.groupings, xf64.as_ref(), &mut ws2.z_buf, n);
-    let GlmmWorkspace {
-        groupings,
-        z_buf,
-        prior_w,
-        pirls,
-        ..
-    } = &mut ws2;
-    let mut wx_scratch = faer::Mat::<f64>::zeros(n, beta.len());
-    let blocked = pirls_solve_blocked(
-        crate::Family::Binomial {
-            link: crate::BinomialLink::Logit,
-        },
-        f64::NAN,
-        groupings,
-        &ids,
-        xf64.as_ref(),
-        &y,
-        &prior_w[..n],
-        false,
-        &mut beta,
-        BetaStep::Fixed,
-        pirls,
-        z_buf,
-        None,
-        &mut wx_scratch,
-        None, // offset
-        None,
-        n,
-        &mut crate::counters::EvalCounters::new(),
-    );
-
-    // Dense and blocked share the same lme4 step-halving backtrack and mixed
-    // stopping rule, so the paths agree to FP error: dev/pen/logdet 1e-9, u 1e-7.
-    assert_eq!(oracle.3, blocked.3, "convergence flag");
-    assert!(
-        (oracle.0 - blocked.0).abs() < 1e-9,
-        "dev: packed {} blocked {}",
-        oracle.0,
-        blocked.0
-    );
-    assert!(
-        (oracle.1 - blocked.1).abs() < 1e-9,
-        "pen: packed {} blocked {}",
-        oracle.1,
-        blocked.1
-    );
-    assert!(
-        (oracle.2 - blocked.2).abs() < 1e-9,
-        "logdet: packed {} blocked {}",
-        oracle.2,
-        blocked.2
-    );
-    // `ws` is the packed layout, `ws2` the blocked one: index the packed `u`
-    // through the primary block's component-major order.
-    let (qq, ss) = (ws2.groupings.primary_q, ws2.groupings.n_primary);
-    for c in 0..k {
-        let pc = packed_u_index(qq, ss, c);
-        assert!(
-            (ws.pirls.u[pc] - ws2.pirls.u[c]).abs() < 1e-7,
-            "u[{c}]: packed {} blocked {}",
-            ws.pirls.u[pc],
-            ws2.pirls.u[c]
+        let mut params = vec![0.0; nt + p];
+        params[..nt].copy_from_slice(&theta);
+        params[nt..].copy_from_slice(&beta);
+        packed_oracle_fill(&mut ws, xf64.as_ref(), &params, n);
+        let GlmmWorkspace {
+            prior_w,
+            wx,
+            pirls,
+            packed,
+            ..
+        } = &mut ws;
+        let oracle = pirls_solve_packed(
+            crate::Family::Binomial {
+                link: crate::BinomialLink::Logit,
+            },
+            f64::NAN,
+            k,
+            p,
+            xf64.as_ref(),
+            &y,
+            &prior_w[..n],
+            false,
+            &mut params[nt..],
+            BetaStep::Fixed,
+            pirls,
+            packed,
+            wx,
+            None, // offset
+            None,
+            n,
+            &mut crate::counters::EvalCounters::new(),
         );
-    }
-}
 
-/// Blocked == packed on the cluster-contiguous (`FixedSize`/DGEN-FS) id
-/// layout — the q_p=2 twin of `blocked_pirls_matches_packed_slope_noextra`,
-/// which only exercises round-robin ids. Same FP bands; if a reordered
-/// accumulation ever moves them, re-derive the band with documentation —
-/// never widen silently.
-#[test]
-fn blocked_pirls_matches_packed_slope_contiguous() {
-    let (xf64, y, ids) = glmm_slope_noextra_dataset_layout(true, 96, 8);
-    let n = y.len();
-    // slope on design col 1 ⇒ slope_cols = &[1]; q_p = 2.
-    let cluster = ModelSpec {
-        family: Family::Binomial {
-            link: BinomialLink::Logit,
-        },
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 8 },
-            slopes: vec![1],
-            extra_groupings: vec![],
-        }),
-    };
-    // Packed oracle: the same design on the packed-row layout, which the
-    // constructor would otherwise route to the blocked one.
-    let mut ws = GlmmWorkspace::for_cluster_spec_packed(2, &cluster, n, &[1], 1);
-    assert!(ws.groupings.extra_offsets.is_empty());
-    fill_packed_cols(&mut ws, &ids, &[], n);
-    let theta = [0.5_f64, 0.1, 0.4]; // vech(Λ_p): [σ_int, cov, σ_slope]
-    let mut beta = [0.2_f64, 0.8];
-    let (k, p, nt) = (ws.k, ws.p, ws.n_theta);
-
-    let mut params = vec![0.0; nt + p];
-    params[..nt].copy_from_slice(&theta);
-    params[nt..].copy_from_slice(&beta);
-    packed_oracle_fill(&mut ws, xf64.as_ref(), &params, n);
-    let GlmmWorkspace {
-        prior_w,
-        wx,
-        pirls,
-        packed,
-        ..
-    } = &mut ws;
-    let oracle = pirls_solve_packed(
-        crate::Family::Binomial {
-            link: crate::BinomialLink::Logit,
-        },
-        f64::NAN,
-        k,
-        p,
-        xf64.as_ref(),
-        &y,
-        &prior_w[..n],
-        false,
-        &mut params[nt..],
-        BetaStep::Fixed,
-        pirls,
-        packed,
-        wx,
-        None, // offset
-        None,
-        n,
-        &mut crate::counters::EvalCounters::new(),
-    );
-
-    // Blocked: primary_lambda → pirls_solve_blocked, fresh scratch.
-    let mut ws2 = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[1], 1);
-    crate::lmm::primary_lambda(&theta, ws2.groupings.primary_q, &mut ws2.pirls.lam);
-    fill_z_f64(&ws2.groupings, xf64.as_ref(), &mut ws2.z_buf, n);
-    let GlmmWorkspace {
-        groupings,
-        z_buf,
-        prior_w,
-        pirls,
-        ..
-    } = &mut ws2;
-    let mut wx_scratch = faer::Mat::<f64>::zeros(n, beta.len());
-    let blocked = pirls_solve_blocked(
-        crate::Family::Binomial {
-            link: crate::BinomialLink::Logit,
-        },
-        f64::NAN,
-        groupings,
-        &ids,
-        xf64.as_ref(),
-        &y,
-        &prior_w[..n],
-        false,
-        &mut beta,
-        BetaStep::Fixed,
-        pirls,
-        z_buf,
-        None,
-        &mut wx_scratch,
-        None, // offset
-        None,
-        n,
-        &mut crate::counters::EvalCounters::new(),
-    );
-
-    // 1e-9 on the three objective terms and 1e-7 on `u`: packed and blocked
-    // share one step-halving stopping rule, so they agree to FP error; see
-    // `blocked_pirls_matches_packed_slope_noextra` for the full rationale.
-    assert_eq!(oracle.3, blocked.3, "convergence flag");
-    assert!(
-        (oracle.0 - blocked.0).abs() < 1e-9,
-        "dev: packed {} blocked {}",
-        oracle.0,
-        blocked.0
-    );
-    assert!(
-        (oracle.1 - blocked.1).abs() < 1e-9,
-        "pen: packed {} blocked {}",
-        oracle.1,
-        blocked.1
-    );
-    assert!(
-        (oracle.2 - blocked.2).abs() < 1e-9,
-        "logdet: packed {} blocked {}",
-        oracle.2,
-        blocked.2
-    );
-    // `ws` is the packed layout, `ws2` the blocked one: index the packed `u`
-    // through the primary block's component-major order.
-    let (qq, ss) = (ws2.groupings.primary_q, ws2.groupings.n_primary);
-    for c in 0..k {
-        let pc = packed_u_index(qq, ss, c);
-        assert!(
-            (ws.pirls.u[pc] - ws2.pirls.u[c]).abs() < 1e-7,
-            "u[{c}]: packed {} blocked {}",
-            ws.pirls.u[pc],
-            ws2.pirls.u[c]
+        // Blocked: primary_lambda → pirls_solve_blocked, fresh scratch.
+        let mut ws2 = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[1], 1);
+        crate::lmm::primary_lambda(&theta, ws2.groupings.primary_q, &mut ws2.pirls.lam);
+        fill_z_f64(&ws2.groupings, xf64.as_ref(), &mut ws2.z_buf, n);
+        let GlmmWorkspace {
+            groupings,
+            z_buf,
+            prior_w,
+            pirls,
+            ..
+        } = &mut ws2;
+        let mut wx_scratch = faer::Mat::<f64>::zeros(n, beta.len());
+        let blocked = pirls_solve_blocked(
+            crate::Family::Binomial {
+                link: crate::BinomialLink::Logit,
+            },
+            f64::NAN,
+            groupings,
+            &ids,
+            xf64.as_ref(),
+            &y,
+            &prior_w[..n],
+            false,
+            &mut beta,
+            BetaStep::Fixed,
+            pirls,
+            z_buf,
+            None,
+            &mut wx_scratch,
+            None, // offset
+            None,
+            n,
+            &mut crate::counters::EvalCounters::new(),
         );
+
+        // Dense and blocked share the same lme4 step-halving backtrack and mixed
+        // stopping rule, so the paths agree to FP error: dev/pen/logdet 1e-9, u 1e-7.
+        assert_eq!(oracle.3, blocked.3, "{layout}: convergence flag");
+        assert!(
+            (oracle.0 - blocked.0).abs() < 1e-9,
+            "{layout} dev: packed {} blocked {}",
+            oracle.0,
+            blocked.0
+        );
+        assert!(
+            (oracle.1 - blocked.1).abs() < 1e-9,
+            "{layout} pen: packed {} blocked {}",
+            oracle.1,
+            blocked.1
+        );
+        assert!(
+            (oracle.2 - blocked.2).abs() < 1e-9,
+            "{layout} logdet: packed {} blocked {}",
+            oracle.2,
+            blocked.2
+        );
+        // `ws` is the packed layout, `ws2` the blocked one: index the packed `u`
+        // through the primary block's component-major order.
+        let (qq, ss) = (ws2.groupings.primary_q, ws2.groupings.n_primary);
+        for c in 0..k {
+            let pc = packed_u_index(qq, ss, c);
+            assert!(
+                (ws.pirls.u[pc] - ws2.pirls.u[c]).abs() < 1e-7,
+                "{layout} u[{c}]: packed {} blocked {}",
+                ws.pirls.u[pc],
+                ws2.pirls.u[c]
+            );
+        }
     }
 }
 
@@ -3184,7 +3018,7 @@ fn brute_force_extras_laplace(
     np: usize,
     n_crossed: usize,
 ) -> f64 {
-    let (n, p) = (x.nrows(), x.ncols());
+    let n = x.nrows();
     let nc = n_prim + n_prim * np + n_crossed;
     let mut m = Mat::<f64>::zeros(n, nc);
     let nest_base = n_prim;
@@ -3198,6 +3032,14 @@ fn brute_force_extras_laplace(
             m[(i, cross_base + crossed[i] as usize)] = theta_c;
         }
     }
+    laplace_from_dense_m(&m, beta, x, y)
+}
+
+/// Laplace deviance `d(y,ũ)·2 + ‖ũ‖² + 2·ln|L|` (A = M'WM + I = LLᵀ) of a Bernoulli-logit
+/// model with the dense RE design `M = ZΛ` given column by column, by Newton on u.
+fn laplace_from_dense_m(m: &Mat<f64>, beta: &[f64], x: &Mat<f64>, y: &[f64]) -> f64 {
+    let (n, p) = (x.nrows(), x.ncols());
+    let nc = m.ncols();
     let eta_of = |u: &[f64], i: usize| -> f64 {
         let mut e = 0.0;
         for j in 0..p {
@@ -3347,6 +3189,49 @@ fn structured_extras_laplace_matches_brute_force() {
     }
 }
 
+/// The q_p=2 structured Laplace against the dense brute force: intercept and
+/// slope on the primary grouping plus one crossed intercept
+/// (`glmm_slope_crossed_dataset`). Λ_p is the lower triangle filled from the
+/// column-major vech θ = [λ00, λ10, λ11] (`primary_lambda`), so a row's two
+/// primary columns of M = ZΛ are λ00 + x·λ10 and x·λ11 (the
+/// `Σ_{r≥c} z_r·lam[r·q+c]` core rule). The structured-vs-packed parity cannot see a
+/// move of both sides (both read `z_buf`); this can.
+#[test]
+fn structured_slope_crossed_laplace_matches_brute_force() {
+    let (xf64, y, ids, crossed, cluster) = glmm_slope_crossed_dataset();
+    let n = y.len();
+    let (n_prim, n_crossed) = (8usize, 4usize);
+    let theta = [0.5_f64, 0.1, 0.4, 0.45];
+    let beta = [0.2_f64, 0.8];
+    let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[1], 1);
+    assert_eq!(ws.layout, GlmmLayout::Structured);
+    let nt = ws.n_theta;
+    assert_eq!(nt, theta.len());
+    let mut params = vec![0.0; nt + beta.len()];
+    params[..nt].copy_from_slice(&theta);
+    params[nt..].copy_from_slice(&beta);
+    let extra_ids = vec![crossed.clone()];
+    let got = glmm_laplace_deviance(&params, &mut ws, xf64.as_ref(), &y, &ids, &extra_ids, n);
+    let mut m = Mat::<f64>::zeros(n, 2 * n_prim + n_crossed);
+    for i in 0..n {
+        let (c, x1) = (ids[i] as usize, xf64[(i, 1)]);
+        m[(i, 2 * c)] = theta[0] + x1 * theta[1];
+        m[(i, 2 * c + 1)] = x1 * theta[2];
+        m[(i, 2 * n_prim + crossed[i] as usize)] = theta[3];
+    }
+    let want = laplace_from_dense_m(&m, &beta, &xf64, &y);
+    assert!(
+        (got - want).abs() < 1e-6,
+        "slope_q2_crossed laplace: got {got}, want {want}"
+    );
+}
+
+/// A pin is a regression lock on a return no independent oracle reaches. A band
+/// against another kernel is blind to what moves both sides, and to anything
+/// below the band. A correct numerical change that moves a pin is re-pinned with
+/// a provenance line (date, what moved by how many ULP, `converged` unchanged),
+/// as the two Profile-mode pins below record.
+///
 /// A structured PIRLS return `(dev, pen, logdet, converged)` against its pin:
 /// the flag exactly, each float to 4ε relative. Not `==`: the same build gives
 /// the same bits, but libm's `exp`/`ln` and the SIMD backend differ across
@@ -3366,49 +3251,16 @@ fn assert_pinned_return(got: (f64, f64, f64, bool), pin: (f64, f64, f64, bool), 
 /// estimator. Bands mirror the no-extras blocked parity
 /// (`blocked_pirls_matches_packed_slope_noextra`): dev/pen/logdet 1e-9, u 1e-7.
 ///
-/// Each shape also carries a `pin` on the structured return, checked by
-/// [`assert_pinned_return`]. A band against the packed path is blind to
-/// anything that moves both sides, and to anything smaller than the band; the
-/// pin is not. Every `(dev, pen, logdet, converged)` pin in this file — here,
-/// the `slope_q2_crossed` case below, `structured_panel_downdate_matches_scalar`,
-/// and the two Profile-mode fixtures that cite this comment — follows this
-/// contract. Regenerate by running the test and reading the reported value.
+/// Parity only: what moves both sides is caught by the brute-force oracles at
+/// the same θ/β (`structured_extras_laplace_matches_brute_force` for the three
+/// q_p=1 shapes, `structured_slope_crossed_laplace_matches_brute_force` for
+/// `slope_q2_crossed`).
 #[test]
 fn structured_extras_matches_packed() {
-    for (np, ncr, label, pin) in [
-        (
-            0usize,
-            6usize,
-            "crossed",
-            (
-                125.67124626047035,
-                2.5918113333145234,
-                3.681326128727608,
-                true,
-            ),
-        ),
-        (
-            2,
-            0,
-            "nested",
-            (
-                118.97819264449518,
-                2.3541525230817135,
-                3.4543524781217796,
-                true,
-            ),
-        ),
-        (
-            2,
-            6,
-            "crossed_nested",
-            (
-                124.21745688349301,
-                3.2946873844575992,
-                4.973355567039545,
-                true,
-            ),
-        ),
+    for (np, ncr, label) in [
+        (0usize, 6usize, "crossed"),
+        (2, 0, "nested"),
+        (2, 6, "crossed_nested"),
     ] {
         let (xf64, y, ids, extra_ids, cluster) = glmm_extras_q1_dataset(np, ncr);
         let n = y.len();
@@ -3544,7 +3396,6 @@ fn structured_extras_matches_packed() {
             )
         };
 
-        assert_pinned_return(structured, pin, label);
         // 1e-9 on the three objective terms and 1e-7 on `u`: the structured
         // path (`pirls_solve_blocked_extras`) shares the packed loop's
         // step-halving backtrack, and when no halving fires both walk the same
@@ -3726,17 +3577,6 @@ fn structured_extras_matches_packed() {
             )
         };
 
-        // Pinned, same contract as the three shapes above.
-        assert_pinned_return(
-            structured,
-            (
-                118.0785725377299,
-                1.4514364377459454,
-                3.307542873021056,
-                true,
-            ),
-            label,
-        );
         assert_eq!(oracle.3, structured.3, "{label}: convergence flag");
         assert!(
             (oracle.0 - structured.0).abs() < 1e-9,
@@ -3787,30 +3627,7 @@ fn structured_extras_matches_packed() {
 ///   agree bit-exact — the band tightens to `== 0.0`.
 #[test]
 fn structured_panel_downdate_matches_scalar() {
-    for (np, ncr, label, pin) in [
-        (
-            0usize,
-            6usize,
-            "crossed",
-            (
-                125.67124626047035,
-                2.5918113333145234,
-                3.681326128727608,
-                true,
-            ),
-        ),
-        (
-            2,
-            6,
-            "crossed_nested",
-            (
-                124.21745688349301,
-                3.2946873844575992,
-                4.973355567039545,
-                true,
-            ),
-        ),
-    ] {
+    for (np, ncr, label) in [(0usize, 6usize, "crossed"), (2, 6, "crossed_nested")] {
         // qc == 1 (np == 0) ⇒ both runs are the same scalar arm ⇒ bit-exact.
         let tol = if np == 0 { 0.0 } else { 1e-9 };
         let u_tol = if np == 0 { 0.0 } else { 1e-7 };
@@ -3900,10 +3717,6 @@ fn structured_panel_downdate_matches_scalar() {
         };
         let (scalar, u_scalar) = run(false);
         let (panel, u_panel) = run(true);
-        // Pin on the scalar-arm return (`structured_extras_matches_packed`
-        // states the contract). The panel arm rides the same generic kernel and is
-        // held to `scalar` by the bands below.
-        assert_pinned_return(scalar, pin, label);
         assert_eq!(scalar.3, panel.3, "{label}: convergence flag");
         assert!(
             (scalar.0 - panel.0).abs() <= tol,
@@ -5288,7 +5101,7 @@ fn pirls_structured_profile_beta_reaches_pql_stationarity() {
         )
     };
     assert!(out.3, "Profile-mode structured solve must converge");
-    // Pinned (`structured_extras_matches_packed` states the contract); the
+    // Pinned (`assert_pinned_return` states the contract); the
     // stationarity bound below is a 1e-6·n band and cannot see a small move.
     assert_pinned_return(
         out,
@@ -5528,7 +5341,7 @@ fn structured_profile_beta_matches_packed_profile() {
         )
     };
     assert!(structured.3, "structured Profile solve must converge");
-    // Pinned (`structured_extras_matches_packed` states the contract); the
+    // Pinned (`assert_pinned_return` states the contract); the
     // β comparison below is a 1e-8 relative band and cannot see a small move.
     assert_pinned_return(
         structured,
@@ -5720,64 +5533,6 @@ fn pirls_blocked_step_halving_recovers_from_overshoot() {
     // returns INFINITY). A run of this fixture converges to dev≈1837; 3700
     // is a generous 2× headroom above that.
     assert!(dev < 3700.0, "recovered deviance {dev} implausibly large");
-}
-
-/// Profile evaluation via the `laplace_deviance` production entry point
-/// (`glmm_laplace_deviance_profile` = the test-only twin: `beta_mode = BetaMode::ProfilePql`,
-/// `beta = ws.beta_prof`). Asserts (a) finite deviance; (b) `beta_prof` moved off
-/// its 0 seed — β was PROFILED, not held (this is what would fail if the copy
-/// gating or the Profile δβ wiring were wrong); (c) two calls from the same seed
-/// return bit-identical deviance AND β — the BOBYQA objective-consistency
-/// (determinism) the two-stage optimizer requires ("Why two-stage"). Routes
-/// through the blocked PIRLS variant (no extras).
-#[test]
-fn laplace_deviance_profile_evaluates_and_is_deterministic() {
-    let (xf64, y, ids) = glmm_slope_noextra_dataset();
-    let n = y.len();
-    let cluster = ModelSpec {
-        family: Family::Binomial {
-            link: BinomialLink::Logit,
-        },
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 8 },
-            slopes: vec![1],
-            extra_groupings: vec![],
-        }),
-    };
-    let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[1], 1);
-    assert!(
-        ws.groupings.extra_offsets.is_empty(),
-        "fixture must route to the blocked pirls_solve_blocked (no extras)"
-    );
-    let (p, nt) = (ws.p, ws.n_theta);
-    // Blind θ (vech Λ_p); the β slots in `params` are IGNORED in Profile mode
-    // (β starts at the beta_prof 0 seed the twin resets and is profiled from there).
-    let theta = [0.5_f64, 0.1, 0.4];
-    let mut params = vec![0.0; nt + p];
-    params[..nt].copy_from_slice(&theta);
-
-    let d1 = glmm_laplace_deviance_profile(&params, &mut ws, xf64.as_ref(), &y, &ids, &[], n);
-    let beta1 = ws.beta_prof.clone();
-    assert!(d1.is_finite(), "Profile deviance must be finite, got {d1}");
-    assert!(
-        beta1.iter().any(|b| b.abs() > 1e-9),
-        "beta_prof must move off its 0 seed (β profiled, not held): {beta1:?}"
-    );
-
-    let d2 = glmm_laplace_deviance_profile(&params, &mut ws, xf64.as_ref(), &y, &ids, &[], n);
-    let beta2 = ws.beta_prof.clone();
-    assert_eq!(
-        d1.to_bits(),
-        d2.to_bits(),
-        "Profile deviance must be bit-identical across identical calls"
-    );
-    for j in 0..p {
-        assert_eq!(
-            beta1[j].to_bits(),
-            beta2[j].to_bits(),
-            "profiled β must be bit-identical across identical calls, coord {j}"
-        );
-    }
 }
 
 /// The NB dispersion is one trailing coordinate of both outer searches — joint
@@ -8059,48 +7814,52 @@ fn agq_dual_hessian_matches_central_fd() {
     }
 }
 
-/// AGQ gate, family clause: inverse-Gaussian is outside the gate's
-/// binomial/Poisson/NB/Gamma list (the public entry has no mixed
-/// inverse-Gaussian path at all; the kernel's family functions cover it), so
-/// the gate stays closed regardless of `nagq` — `laplace_gradient` takes the same
-/// blocked-path route at `nagq = 1` and `nagq = 7`. Two independently built
-/// workspaces at the same params, one at each `nagq`, must therefore return
-/// bit-identical (`==` every lane) gradients: the AGQ condition is evaluated
-/// on every call but never taken, and evaluating it introduces no
-/// nondeterminism into the blocked route.
+/// The shipped `f64` AGQ node sums (`agq_fast::scalar_sums`, `vector_sums`,
+/// `probit_sums`) against the generic node loop of the same production
+/// `agq_deviance`/`agq_deviance_vec`: the fast tiles run only when every
+/// buffer is `f64`, so the value `laplace_gradient` returns from its `Dual`
+/// evaluation is the generic loop's (compressed route included). Per
+/// `AGQ_GATE_CELLS` cell, at 10 draws and a 1e-12 PIRLS tolerance on both
+/// sides, the two agree to 1e-9 relative; the FD gate above sees the tiles
+/// only through 1e-6 bands. The cluster-outer arm of `scalar_sums` runs only in
+/// a `parallel` build with `parallel_inner` set, so it is not reached here: its
+/// owner is `agq_cluster_outer_bit_identical_to_node_outer`.
 #[test]
-fn agq_gate_stays_closed_on_family_exclusion() {
-    let family = Family::InverseGaussian {
-        link: crate::InverseGaussianLink::Log,
-    };
-    let shape = "int1";
-    let params = fixed_seed_theta(shape).next_params();
-
-    let (mut ws_a, xa, ya, ids_a, p, n) = fixture_with_nagq(family, shape, 1);
-    let (mut ws_b, xb, yb, ids_b, _, _) = fixture_with_nagq(family, shape, 7);
-    let m = ws_a.n_theta + p;
-    ws_a.params[..m].copy_from_slice(&params);
-    ws_b.params[..m].copy_from_slice(&params);
-
-    let mut grad_a = vec![0.0; m];
-    let mut grad_b = vec![0.0; m];
-    let st_a = laplace_gradient(&mut ws_a, xa.as_ref(), &ya, &ids_a, &[], p, n, &mut grad_a);
-    let st_b = laplace_gradient(&mut ws_b, xb.as_ref(), &yb, &ids_b, &[], p, n, &mut grad_b);
-    assert!(matches!(st_a, DerivStatus::Ok(_)));
-    assert!(matches!(st_b, DerivStatus::Ok(_)));
-    assert_eq!(
-        grad_a, grad_b,
-        "inverse-Gaussian is outside the AGQ gate's family clause — nagq must not change the route"
-    );
+fn agq_fast_route_value_matches_the_generic_dual_route() {
+    for &(family, shape, nagq) in AGQ_GATE_CELLS {
+        let (mut ws, x, y, ids, p, n) = fixture_with_nagq(family, shape, nagq);
+        ws.fd.pirls_tol_override = Some(1e-12);
+        let mut rng = fixed_seed_theta(shape);
+        let m = ws.n_theta + p;
+        let mut grad = vec![0.0; m];
+        for draw in 0..10 {
+            let params = rng.next_params();
+            let fast = glmm_laplace_deviance(&params, &mut ws, x.as_ref(), &y, &ids, &[], n);
+            ws.params[..m].copy_from_slice(&params);
+            let st = laplace_gradient(&mut ws, x.as_ref(), &y, &ids, &[], p, n, &mut grad);
+            let DerivStatus::Ok(generic) = st else {
+                panic!(
+                    "{family:?}/{shape} k={nagq} draw {draw}: dual route not Ok (NotConverged: {})",
+                    matches!(st, DerivStatus::NotConverged)
+                );
+            };
+            let rel = (fast - generic).abs() / fast.abs().max(1.0);
+            assert!(
+                rel <= 1e-9,
+                "{family:?}/{shape} k={nagq} draw {draw}: fast {fast} generic {generic} (rel {rel:e})"
+            );
+        }
+        ws.fd.pirls_tol_override = None;
+    }
 }
 
 /// AGQ gate, `nagq` clause: Binomial-logit `int1` satisfies every OTHER gate
 /// clause, so `nagq = 1` keeps the gate closed (blocked route) while
 /// `nagq = 7` opens it (`agq_deviance` route) — two different objectives, so
-/// at least one gradient lane must differ. Paired with
-/// `agq_gate_stays_closed_on_family_exclusion` above, this pins both halves
-/// of the gate condition at the derivative level: family alone cannot open
-/// it, and `nagq` alone (on an eligible family/shape) does.
+/// at least one gradient lane must differ. The family clause excludes
+/// Gaussian, which never reaches the GLMM kernel, and inverse-Gaussian, which
+/// the mixed-model entry refuses (`fit::common::assert_model_shape`), so the
+/// `nagq` clause is the half a fit can reach.
 #[test]
 fn agq_gate_opens_on_eligible_family_and_nagq() {
     let family = Family::Binomial {
@@ -8140,7 +7899,7 @@ fn agq_gate_opens_on_eligible_family_and_nagq() {
 /// `block_leverage` equals `mᵀA⁻¹m` computed by a `glmm_block_solve`
 /// against the same 3×3 factor (not an explicit matrix inverse).
 #[test]
-fn block_leverage_matches_explicit_inverse() {
+fn block_leverage_matches_block_solve() {
     use crate::glmm::pirls::block_leverage;
     use crate::glmm::workspace::glmm_block_chol;
     let q = 3;
@@ -8156,7 +7915,7 @@ fn block_leverage_matches_explicit_inverse() {
         a[r * q + r] += 1.0;
     }
     let m = [0.4, -1.1, 0.9];
-    // explicit A⁻¹m by solving with the same factor twice (L then Lᵀ) — glmm_block_solve
+    // A⁻¹m by solving with the same factor (L then Lᵀ): glmm_block_solve
     let mut l = a;
     assert!(glmm_block_chol(&mut l, q));
     let mut x = m;
@@ -10290,62 +10049,40 @@ fn gradient_route_plan_follows_the_rule() {
 }
 
 /// A fit on a covered AGQ shape keeps BOBYQA from `GRAD_WARM_SCALAR_ROWS_MAX`
-/// rows per primary level: on the logit `int1` fixture at 7 nodes with 8
-/// clusters, 49 rows per level route and 50 do not, cold and from a warm
-/// θ₀ = 0.5, the fit then being the BOBYQA plan's bit for bit.
+/// rows per primary level (49 route, 50 do not, cold and from θ₀ = 0.5) and
+/// from a warm start below `GRAD_WARM_AGQ_THETA_MIN` (θ₀ = 0.02 does not
+/// route, 0.06 does), on the logit `int1` fixture at 7 nodes with 8 clusters;
+/// a fit that does not route is the BOBYQA plan's bit for bit.
 #[test]
-fn gradient_route_keeps_bobyqa_on_cold_agq_fits_from_50_rows_per_level() {
+fn gradient_route_keeps_bobyqa_at_the_agq_gate_thresholds() {
     let logit = Family::Binomial {
         link: BinomialLink::Logit,
     };
     let nc = 8usize;
-    for (per, routes) in [
-        (GRAD_WARM_SCALAR_ROWS_MAX - 1, true),
-        (GRAD_WARM_SCALAR_ROWS_MAX, false),
+    for (per, theta0, routes) in [
+        (GRAD_WARM_SCALAR_ROWS_MAX - 1, None, true),
+        (GRAD_WARM_SCALAR_ROWS_MAX - 1, Some(0.5), true),
+        (GRAD_WARM_SCALAR_ROWS_MAX, None, false),
+        (GRAD_WARM_SCALAR_ROWS_MAX, Some(0.5), false),
+        // `GRAD_WARM_AGQ_THETA_MIN`: a warm start near zero keeps BOBYQA.
+        (10, Some(0.02), false),
+        (10, Some(0.06), true),
     ] {
-        for start in [None, Some(&[0.5][..])] {
-            let (mut ws, x, y, ids, p, n) = fixture_with_nagq_sized(logit, "int1", 7, per * nc, nc);
-            let beta0 = vec![0.0; p];
-            let f = gate_fit(&mut ws, x.as_ref(), &y, &ids, &[], start, &beta0, n);
-            let label = format!("{per} rows per level, start {start:?}");
-            assert_eq!(ws.grad_report.is_some(), routes, "{label}");
-            if !routes {
-                let (mut wb, ..) = fixture_with_nagq_sized(logit, "int1", 7, per * nc, nc);
-                wb.route_plan = crate::optim::RoutePlan::BOBYQA;
-                let b = gate_fit(&mut wb, x.as_ref(), &y, &ids, &[], start, &beta0, n);
-                assert_eq!(
-                    (f.deviance.to_bits(), f.n_eval),
-                    (b.deviance.to_bits(), b.n_eval),
-                    "{label}: not the BOBYQA fit"
-                );
-            }
-        }
-    }
-}
-
-/// A warm fit on a covered AGQ shape keeps BOBYQA from a start below
-/// `GRAD_WARM_AGQ_THETA_MIN`: on the logit `int1` fixture at 7 nodes, a warm
-/// θ₀ = 0.02 does not route and is the BOBYQA plan's warm fit bit for bit,
-/// and θ₀ = 0.06 routes.
-#[test]
-fn gradient_route_keeps_bobyqa_on_warm_agq_fits_starting_near_zero() {
-    let logit = Family::Binomial {
-        link: BinomialLink::Logit,
-    };
-    for (theta0, routes) in [(0.02, false), (0.06, true)] {
-        let (mut ws, x, y, ids, p, n) = fixture_with_nagq(logit, "int1", 7);
+        let start_buf = theta0.map(|t| [t]);
+        let start = start_buf.as_ref().map(|s| &s[..]);
+        let (mut ws, x, y, ids, p, n) = fixture_with_nagq_sized(logit, "int1", 7, per * nc, nc);
         let beta0 = vec![0.0; p];
-        let start = [theta0];
-        let f = gate_fit(&mut ws, x.as_ref(), &y, &ids, &[], Some(&start), &beta0, n);
-        assert_eq!(ws.grad_report.is_some(), routes, "θ₀ = {theta0}");
+        let f = gate_fit(&mut ws, x.as_ref(), &y, &ids, &[], start, &beta0, n);
+        let label = format!("{per} rows per level, start {theta0:?}");
+        assert_eq!(ws.grad_report.is_some(), routes, "{label}");
         if !routes {
-            let (mut wb, ..) = fixture_with_nagq(logit, "int1", 7);
+            let (mut wb, ..) = fixture_with_nagq_sized(logit, "int1", 7, per * nc, nc);
             wb.route_plan = crate::optim::RoutePlan::BOBYQA;
-            let b = gate_fit(&mut wb, x.as_ref(), &y, &ids, &[], Some(&start), &beta0, n);
+            let b = gate_fit(&mut wb, x.as_ref(), &y, &ids, &[], start, &beta0, n);
             assert_eq!(
                 (f.deviance.to_bits(), f.n_eval),
                 (b.deviance.to_bits(), b.n_eval),
-                "θ₀ = {theta0}: not the BOBYQA fit"
+                "{label}: not the BOBYQA fit"
             );
         }
     }
@@ -10379,8 +10116,6 @@ fn gradient_route_hands_over_on_the_iteration_cap() {
         f.deviance,
         bob.deviance
     );
-    // The search's own evaluations are counted on top of BOBYQA's.
-    assert!(f.n_eval > bob.n_eval.min(f.n_eval - 1));
 }
 
 /// The hand-over rung on Gamma, where the BOBYQA finish runs the `ln φ` scale

@@ -739,6 +739,13 @@ mod tests {
             assert_eq!(Scalar::sqrt(a).v, Scalar::sqrt(x));
             assert_eq!(Scalar::ln_gamma(a).v, Scalar::ln_gamma(x));
         }
+        // `ln_1p` (the probit tail rows, family.rs) needs x > −1.
+        for &x in &[-0.7_f64, 0.0, 0.4, 1.0, 4.0] {
+            let a = Dual::<1> { v: x, d: [1.0] };
+            let want = fd(|t| Scalar::ln_1p(t), x);
+            assert!((Scalar::ln_1p(a).d[0] - want).abs() <= 1e-8 * want.abs().max(1.0));
+            assert_eq!(Scalar::ln_1p(a).v, Scalar::ln_1p(x));
+        }
     }
 
     /// `clamp_f64` and `max_f64` zero every derivative lane when the bound
@@ -870,6 +877,9 @@ mod tests {
             check!(ln, x, 1e-7);
             check!(sqrt, x, 1e-7);
             check!(ln_gamma, x, 1e-6);
+        }
+        for &x in &[-0.7_f64, 0.4, 1.0, 4.0] {
+            check!(ln_1p, x, 1e-7);
         }
     }
 

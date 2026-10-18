@@ -73,6 +73,15 @@ def test_pyarrow_table_dictionary_column_keeps_its_declared_level_order():
     assert result.beta[0] == pytest.approx(1.05, abs=1e-6)  # mean of "low"
 
 
+def test_polars_enum_column_keeps_its_declared_level_order():
+    pl = pytest.importorskip("polars")
+    f = pl.Series(_LABELS, dtype=pl.Enum(["low", "med", "high"]))
+    result = glmm.fit(pl.DataFrame({"y": _Y, "f": f}), "y ~ f")
+    # Sorted, "high" would be the base; the Enum declares "low" first.
+    assert result.names == ["(Intercept)", "fmed", "fhigh"]
+    assert result.beta[0] == pytest.approx(1.05, abs=1e-6)  # mean of "low"
+
+
 def test_pyarrow_multi_chunk_dictionary_column_with_different_dictionaries():
     # Each chunk of a ChunkedArray carries its own dictionary. Rows are
     # _LABELS: chunk 1 codes them against [low, med, high], chunk 2 against
@@ -126,28 +135,51 @@ def test_plain_string_column_still_sorts_lexicographically():
     assert result.beta[0] == pytest.approx(3.05, abs=1e-6)  # mean of "high"
 
 
-def test_missing_value_in_a_plain_string_column_drops_the_row_not_a_level():
+# Columns of 6 and 66 rows: `glmm.fit` reads a short list row by row and a long
+# one in one pass (`_plain_column`), and both must give the same model.
+_REPS = pytest.mark.parametrize("reps", [1, 11], ids=["short", "long"])
+_MISSING = pytest.mark.parametrize(
+    "missing", [float("nan"), np.float64("nan"), None], ids=["nan", "np.nan", "None"]
+)
+
+
+@_REPS
+@_MISSING
+def test_missing_value_in_a_plain_string_column_drops_the_row_not_a_level(missing, reps):
     # A missing value must drop that row, the way R's na.action = na.omit
     # does, not get stringified into a spurious "fnan" level
     # (`str(float("nan"))` would otherwise become a dummy).
-    labels = list(_LABELS)
-    labels[3] = float("nan")  # was "low"
-    with pytest.warns(glmm.RowsDroppedWarning, match=r"Dropped 1 of 6 row"):
-        result = glmm.fit({"y": _Y, "f": labels}, "y ~ f")
+    labels = _LABELS * reps
+    labels[3] = missing  # was "low"
+    with pytest.warns(glmm.RowsDroppedWarning, match=rf"Dropped 1 of {6 * reps} row"):
+        result = glmm.fit({"y": _Y * reps, "f": labels}, "y ~ f")
     assert result.names == ["(Intercept)", "flow", "fmed"]  # still just the 3 real levels
-    assert result.nobs == 5
+    assert result.nobs == 6 * reps - 1
 
 
-def test_missing_value_in_the_first_row_does_not_misclassify_the_column():
+@_REPS
+@_MISSING
+def test_missing_value_in_the_first_row_does_not_misclassify_the_column(missing, reps):
     # Numeric-vs-factor classification cannot key off `values[0]` alone: a
     # missing first value (a float NaN) would make a string column look
     # numeric and crash float() on the rest of it.
-    labels = list(_LABELS)
-    labels[0] = float("nan")  # was "low"
+    labels = _LABELS * reps
+    labels[0] = missing  # was "low"
     with pytest.warns(glmm.RowsDroppedWarning):
-        result = glmm.fit({"y": _Y, "f": labels}, "y ~ f")
+        result = glmm.fit({"y": _Y * reps, "f": labels}, "y ~ f")
     assert result.names == ["(Intercept)", "flow", "fmed"]
-    assert result.nobs == 5
+    assert result.nobs == 6 * reps - 1
+
+
+@_REPS
+@pytest.mark.parametrize("sentinel", ["NA", "NaT"])
+def test_pandas_missing_sentinel_in_a_plain_list_drops_the_row(sentinel, reps):
+    pd = pytest.importorskip("pandas")
+    labels = _LABELS * reps
+    labels[3] = getattr(pd, sentinel)  # was "low"
+    with pytest.warns(glmm.RowsDroppedWarning, match=rf"Dropped 1 of {6 * reps} row"):
+        result = glmm.fit({"y": _Y * reps, "f": labels}, "y ~ f")
+    assert result.names == ["(Intercept)", "flow", "fmed"]
 
 
 def test_categorical_of_non_strings_is_not_fit_as_numeric():
@@ -184,11 +216,6 @@ def test_pandas_categorical_round_trips():
     # The same frame with a plain object dtype has no declared order -> sorted.
     df2 = pd.DataFrame({"y": _Y, "f": _LABELS})
     assert glmm.fit(df2, "y ~ f").names == ["(Intercept)", "flow", "fmed"]
-
-
-# Columns of 6 and 66 rows: `glmm.fit` reads a short list row by row and a long
-# one through numpy, and both must give the same model.
-_REPS = pytest.mark.parametrize("reps", [1, 11], ids=["short", "long"])
 
 
 @_REPS
@@ -241,6 +268,47 @@ def test_mixed_object_column_reads_each_value_through_str(reps):
     result = glmm.fit({"y": y, "f": f}, "y ~ f")
     assert result.names == ["(Intercept)", "fTrue", "fa", "fb"]
     assert result.beta[0] == pytest.approx(2.05, abs=1e-6)  # mean of "1"
+
+
+@_REPS
+def test_str_and_numpy_str_with_equal_values_are_one_level(reps):
+    labels = [np.str_(v) if i % 2 else v for i, v in enumerate(_LABELS * reps)]
+    result = glmm.fit({"y": _Y * reps, "f": labels}, "y ~ f")
+    assert result.names == ["(Intercept)", "flow", "fmed"]
+    assert result.beta[0] == pytest.approx(3.05, abs=1e-6)  # mean of "high"
+
+
+@_REPS
+def test_non_ascii_and_empty_labels_sort_by_code_point(reps):
+    labels = ["", "ä", "日", "", "ä", "日"] * reps
+    result = glmm.fit({"y": _Y * reps, "f": labels}, "y ~ f")
+    assert result.names == ["(Intercept)", "fä", "f日"]
+
+
+@_REPS
+def test_lone_surrogate_label_is_refused(reps):
+    labels = _LABELS * reps
+    labels[3] = "\ud800"
+    with pytest.raises(UnicodeEncodeError):
+        glmm.fit({"y": _Y * reps, "f": labels}, "y ~ f")
+
+
+@_REPS
+def test_ints_above_2_63_convert_as_numpy_converts_them(reps):
+    # Mixed signs past both int64 and uint64, so a saturating cast shows.
+    x = [(-1) ** i * (2**63 + 2**60 * i + 1) for i in range(6 * reps)]
+    from_list = glmm.fit({"y": _Y * reps, "x": x}, "y ~ 0 + x")
+    from_array = glmm.fit({"y": _Y * reps, "x": np.array(x, dtype=float)}, "y ~ 0 + x")
+    assert np.isfinite(from_list.beta).all()
+    assert np.array_equal(from_list.beta, from_array.beta)
+
+
+@_REPS
+def test_int_too_large_for_a_double_is_refused(reps):
+    x = [0, 1, 2, 0, 1, 2] * reps
+    x[3] = 2**1024
+    with pytest.raises(OverflowError, match="int too large to convert to float"):
+        glmm.fit({"y": _Y * reps, "x": x}, "y ~ x")
 
 
 def test_vcov_matches_se_and_is_symmetric():
@@ -338,4 +406,11 @@ def test_pyarrow_bool_array_crosses_as_a_false_true_factor():
     pa = pytest.importorskip("pyarrow")
     data = {"y": _Y, "b": pa.array(_B, type=pa.bool_())}
     result = glmm.fit(data, "y ~ b")
+    assert result.names == ["(Intercept)", "bTRUE"]
+
+
+def test_polars_boolean_dtype_crosses_as_a_false_true_factor():
+    pl = pytest.importorskip("polars")
+    df = pl.DataFrame({"y": _Y, "b": pl.Series(_B, dtype=pl.Boolean)})
+    result = glmm.fit(df, "y ~ b")
     assert result.names == ["(Intercept)", "bTRUE"]

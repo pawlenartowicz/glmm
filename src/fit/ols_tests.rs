@@ -188,9 +188,10 @@ fn fit_ols_offset_matches_r_lm() {
 /// This class is invisible to every check upstream of the solve. The
 /// pre-dispatch alias gate (`detect_aliased`) tests the UNWEIGHTED `X'X`, where
 /// column 2 has a healthy pivot ratio — the two predictor columns differ by a
-/// full unit on the last third of the rows. But that third carries weight 1e-14,
-/// so in `X'WX` — the matrix β̂ and its SEs actually come from — the columns are
-/// very nearly the same column, and the pivot ratio falls below 1e-12.
+/// full unit on the last third of the rows. But that third carries weight
+/// `WSMALL` (1e-11, `weighted_collinear_ols_fixture`), so in `X'WX` — the
+/// matrix β̂ and its SEs actually come from — the columns are very nearly the
+/// same column, and the pivot ratio falls below 1e-12.
 ///
 /// The `min|L_ii| / max|L_ii|` statistic conflates collinearity with column
 /// scale and never fires here (measured 4.8e-8, four orders above its own
@@ -564,10 +565,11 @@ fn reml_loglik(d: f64, n: usize, p: usize) -> f64 {
 
 /// `reml = Some(true)` on OLS moves only the log-likelihood and the flag: β̂,
 /// the SEs, `vcov` and `σ̂² = RSS/(n − p)` are the `None` fit's bit for bit,
-/// `reml` is `true`, `deviance` stays NaN, and `loglik` is R's
-/// `logLik(lm, REML = TRUE)`, the closed form computed here. Plain, weighted
-/// and with an offset, on a standardized design (so the standardization shift
-/// is exercised); then once on the `DesignQr` route.
+/// `Some(false)` gives the `None` fit bit for bit, `reml` is `true`,
+/// `deviance` stays NaN, and `loglik` is R's `logLik(lm, REML = TRUE)`, the
+/// closed form computed here. Plain, weighted and with an offset, on a
+/// standardized design (so the standardization shift is exercised); then once
+/// on the `DesignQr` route.
 #[test]
 fn ols_reml_reports_the_closed_form_reml_loglik() {
     let model = ModelSpec {
@@ -613,6 +615,24 @@ fn ols_reml_reports_the_closed_form_reml_loglik() {
             },
         );
         assert!(ml.converged() && f.converged(), "{tag}");
+        // `Some(false)` is the `None` path: every field bit for bit.
+        let ml_false = fit_cold(
+            &x,
+            &y,
+            n,
+            p,
+            &model,
+            &GroupIds::default(),
+            &FitOptions {
+                reml: Some(false),
+                ..opts.clone()
+            },
+        );
+        super::core::core_tests::assert_fits_bitwise_equal(
+            &ml_false,
+            &ml,
+            &format!("{tag}: reml = Some(false)"),
+        );
         assert_eq!(bits(&f.beta), bits(&ml.beta), "{tag}: beta");
         assert_eq!(bits(&f.se), bits(&ml.se), "{tag}: se");
         assert_eq!(
@@ -663,37 +683,6 @@ fn ols_reml_reports_the_closed_form_reml_loglik() {
         "DesignQr route: loglik {} vs {want}",
         f.loglik
     );
-}
-
-/// `None` and `Some(false)` on OLS are the same path: the ML log-likelihood,
-/// `reml` false, every field bit for bit.
-#[test]
-fn ols_reml_none_and_false_give_the_same_fit() {
-    let model = ModelSpec {
-        family: Family::Gaussian,
-        re: None,
-    };
-    let (x, y, w, n, p) = residual_df_data(false);
-    let opts = FitOptions {
-        target_indices: (0..p as u32).collect(),
-        weights: Some(w),
-        ..FitOptions::default()
-    };
-    let none = fit_cold(&x, &y, n, p, &model, &GroupIds::default(), &opts);
-    let ml = fit_cold(
-        &x,
-        &y,
-        n,
-        p,
-        &model,
-        &GroupIds::default(),
-        &FitOptions {
-            reml: Some(false),
-            ..opts
-        },
-    );
-    assert!(!none.reml);
-    super::core::core_tests::assert_fits_bitwise_equal(&ml, &none, "reml = Some(false)");
 }
 
 /// An aliased OLS design under `Some(true)` reports `reml` true and the

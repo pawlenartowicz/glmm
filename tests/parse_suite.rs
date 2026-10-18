@@ -233,49 +233,6 @@ fn canonical_suite_matches_mirror() {
 // ── The random-effects cases (random_effects_parse.rs), as direct AST asserts ──
 
 #[test]
-fn parses_random_intercept() {
-    let f = parse("y ~ x + (1|g)").unwrap();
-    assert_eq!(
-        f.random_effects,
-        vec![RandomEffect::Intercept {
-            group: "g".into(),
-            parent: None,
-        }]
-    );
-    assert_eq!(f.predictors, vec!["x".to_string()]); // group var is NOT a predictor
-}
-
-#[test]
-fn parses_nested_intercept_expands_to_pair() {
-    let f = parse("y ~ x + (1|A/B)").unwrap();
-    assert_eq!(
-        f.random_effects,
-        vec![
-            RandomEffect::Intercept {
-                group: "A".into(),
-                parent: None,
-            },
-            RandomEffect::Intercept {
-                group: "A:B".into(),
-                parent: Some("A".into()),
-            },
-        ]
-    );
-}
-
-#[test]
-fn parses_interaction_grouping() {
-    let f = parse("y ~ x + (1|recipe:replicate)").unwrap();
-    assert_eq!(
-        f.random_effects,
-        vec![RandomEffect::Intercept {
-            group: "recipe:replicate".into(),
-            parent: None,
-        }]
-    );
-}
-
-#[test]
 fn interaction_grouping_combined_with_plain_intercept() {
     let f = parse("y ~ x + (1|recipe:replicate) + (1|g)").unwrap();
     assert_eq!(
@@ -337,6 +294,17 @@ fn intercept_suppression_rejected() {
     }
 }
 
+/// Whitespace is stripped before matching, so `(1+ + |g)` is the same
+/// term as `(1++|g)`.
+#[test]
+fn a_slope_term_of_only_plus_signs_is_an_empty_slope_term() {
+    for f in ["y ~ x + (1++|g)", "y ~ x + (1+ + |g)"] {
+        let err = parse(f).unwrap_err();
+        assert_eq!(err, ParseError::EmptySlopeTerm { group: "g".into() }, "{f}");
+        assert_eq!(err.to_string(), "empty slope term for group g", "{f}");
+    }
+}
+
 #[test]
 fn implicit_intercept_multivar_slope() {
     let p = parse("y ~ x + z + (x+z|g)").unwrap();
@@ -385,30 +353,14 @@ fn nested_term_sorts_first_even_when_written_last() {
     );
 }
 
+/// Degenerate input: an RE term embedded in another. The nested stage removes
+/// `(1|a/b)` and the slope stage then matches across the seam (`(1+x+|g)`),
+/// whose text does not occur in the original RHS: the position lookup must
+/// fall back (parse.rs `extract_stage`), not panic. What this input parses
+/// to is not a contract.
 #[test]
-fn seam_match_from_embedded_re_term_still_parses() {
-    // Degenerate input: an RE term embedded in another. The nested stage
-    // removes `(1|a/b)` and the slope stage then matches across the seam
-    // (`(1+x+|g)`), whose text does not occur in the original RHS — the
-    // position lookup must fall back (sort to the end), not panic.
-    let f = parse("y ~ (1+x+(1|a/b)|g)").unwrap();
-    assert_eq!(
-        f.random_effects,
-        vec![
-            RandomEffect::Intercept {
-                group: "a".into(),
-                parent: None,
-            },
-            RandomEffect::Intercept {
-                group: "a:b".into(),
-                parent: Some("a".into()),
-            },
-            RandomEffect::Slope {
-                group: "g".into(),
-                vars: vec!["x".into()],
-            },
-        ]
-    );
+fn seam_match_from_embedded_re_term_does_not_panic() {
+    let _ = parse("y ~ (1+x+(1|a/b)|g)");
 }
 
 // ── Fixed-intercept removal ─────────────────────────────────────────────────

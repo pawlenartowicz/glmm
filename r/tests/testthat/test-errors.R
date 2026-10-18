@@ -125,24 +125,6 @@ test_that("REML = FALSE on a Gaussian mixed model fits by ML", {
   expect_lt(sd(f1), sd(f0))
 })
 
-test_that("REML = FALSE on OLS and on a GLM is the default fit", {
-  d <- reml_data()
-  expect_no_warning(f1 <- fastglmm(y ~ x, d, REML = FALSE))
-  expect_same_fit(f1, fastglmm(y ~ x, d))
-  expect_false(f1$reml)
-  expect_no_warning(f1 <- fastglmm(yb ~ x, d, family = binomial(), REML = FALSE))
-  expect_same_fit(f1, fastglmm(yb ~ x, d, family = binomial()))
-  expect_false(f1$reml)
-})
-
-test_that("REML = TRUE on a Gaussian mixed model is the default fit", {
-  d <- reml_data()
-  f0 <- fastglmm(y ~ x + (1 | g), d)
-  expect_no_warning(f1 <- fastglmm(y ~ x + (1 | g), d, REML = TRUE))
-  expect_true(f1$reml)
-  expect_same_fit(f1, f0)
-})
-
 test_that("REML on a binomial GLMM: TRUE is ignored with a warning, FALSE silently", {
   d <- reml_data()
   f0 <- fastglmm(yb ~ x + (1 | g), d, family = binomial())
@@ -159,17 +141,6 @@ test_that("REML on a binomial GLMM: TRUE is ignored with a warning, FALSE silent
   expect_identical(f_true$warnings$kind, "argument_ignored")
   expect_identical(f_true$warnings$message, msg)
   expect_false(f_true$reml)
-})
-
-test_that("REML = FALSE on a Poisson GLMM and a Gamma GLM is the default fit", {
-  d <- reml_data()
-  for (case in list(list(yc ~ x + (1 | g), poisson()),
-                    list(yp ~ x, Gamma(link = "log")))) {
-    f0 <- fastglmm(case[[1]], d, family = case[[2]])
-    expect_no_warning(f1 <- fastglmm(case[[1]], d, family = case[[2]], REML = FALSE))
-    expect_same_fit(f1, f0)
-    expect_false(f1$reml)
-  }
 })
 
 test_that("REML = TRUE on OLS reports the REML log-likelihood, as logLik(lm, REML = TRUE)", {
@@ -513,6 +484,10 @@ test_that("a wrong-width start names the argument, not a kernel struct", {
                "warm-start beta has 1 entries but the model has 2 fixed-effect", fixed = TRUE)
   expect_error(fastglmm(y ~ x + (1 | g), d, start = list(theta = c(1, 0))),
                "warm-start theta has 2 entries but the model has 1 random-effect", fixed = TRUE)
+  expect_error(fastglmm(y ~ x + (1 | g), d, start = list(beta = c(NA, 0))),
+               "warm-start beta must be finite numbers, got NaN", fixed = TRUE)
+  expect_error(fastglmm(y ~ x + (1 | g), d, start = list(theta = Inf)),
+               "warm-start theta must be finite numbers, got inf", fixed = TRUE)
 })
 
 test_that("an infinite offset() term names the term, not a kernel struct", {
@@ -521,6 +496,15 @@ test_that("an infinite offset() term names the term, not a kernel struct", {
   d$o[2] <- Inf
   expect_error(fastglmm(y ~ x + offset(o), d), "term 'offset(o)' is not finite at row 1",
                fixed = TRUE)
+})
+
+test_that("an infinite response or predictor names the column, not a kernel argument", {
+  for (col in c("x", "y")) {
+    d <- err_data()
+    d[[col]][2] <- Inf
+    expect_error(fastglmm(y ~ x + (1 | g), d),
+                 sprintf("term '%s' is not finite at row 1", col), fixed = TRUE)
+  }
 })
 
 test_that("wald.se must be 'hessian' or 'rx' - mirrors the Python port's wald_se check", {

@@ -425,17 +425,6 @@ fn a_different_held_dispersion_refuses() {
 }
 
 #[test]
-fn formulas_not_nested_refuse() {
-    let e = refusal(&model("y ~ x", None), &model("y ~ z", None));
-    assert!(matches!(e, CompareError::NotNested { .. }), "{e:?}");
-    let e = refusal(
-        &model("y ~ x + (1 + x | g)", None),
-        &model("y ~ x + z + (1 | g)", None),
-    );
-    assert!(matches!(e, CompareError::NotNested { .. }), "{e:?}");
-}
-
-#[test]
 fn one_reml_fit_and_one_ml_fit_refuse() {
     let reml = model("y ~ x + (1 | g)", None);
     let ml = model("y ~ x + z + (1 | g)", Some(false));
@@ -489,32 +478,6 @@ fn two_reml_fits_with_different_fixed_parts_refuse() {
 }
 
 #[test]
-fn two_ols_fits_pass_the_estimator_check_whatever_their_reml() {
-    let want = Ok(nested(Side::Second, Differs::Fixed));
-    assert_eq!(
-        shape(cmp(
-            &model("y ~ x", Some(true)),
-            &model("y ~ x + z", Some(true))
-        )),
-        want
-    );
-    assert_eq!(
-        shape(cmp(&model("y ~ x", None), &model("y ~ x + z", Some(true)))),
-        want
-    );
-    assert_eq!(
-        shape(cmp(&model("y ~ x", None), &model("y ~ x + z", None))),
-        want
-    );
-}
-
-#[test]
-fn the_same_ols_fixed_part_has_nothing_to_test() {
-    let e = refusal(&model("y ~ x", None), &model("y ~ x", Some(true)));
-    assert_eq!(e, CompareError::SameParts);
-}
-
-#[test]
 fn the_same_parameter_count_has_nothing_to_test() {
     // With two factors, `a:b` spans the columns of `a * b`.
     let (m0, m1) = (model("y ~ a:b", None), model("y ~ a * b", None));
@@ -548,6 +511,11 @@ fn the_data_checks_come_before_the_nesting_check() {
     // Not nested, and fitted on different data: the data refusal is reported.
     let m0 = model("y ~ x", None);
     let mut m1 = model("y ~ z", None);
+    // The premise: unmodified, the pair is refused as not nested.
+    assert!(
+        matches!(refusal(&m0, &m1), CompareError::NotNested { .. }),
+        "the pair is not nested"
+    );
     m1.y[17] = f64::from_bits(m1.y[17].to_bits() + 1);
     assert_eq!(refusal(&m0, &m1), CompareError::DifferentY);
     m1.nobs -= 1;
@@ -575,6 +543,12 @@ fn one_formula_on_both_sides_has_the_same_parts_whatever_the_parameter_counts() 
         );
         m1.df += 1;
     }
+    // An OLS pair whose reml settings differ: OLS skips the estimator check,
+    // so the same parts are reported.
+    assert_eq!(
+        refusal(&model("y ~ x", None), &model("y ~ x", Some(true))),
+        CompareError::SameParts
+    );
 }
 
 #[test]
@@ -790,6 +764,11 @@ fn a_random_slope_dropped_gets_the_mixture_on_one_and_two_df() {
         c.note_lines(),
         vec!["Conservative: the true p-value is usually smaller."]
     );
+    // REML fits: no AIC or BIC, the REML objective on both sides.
+    for info in [&c.m0, &c.m1] {
+        assert_eq!((info.aic, info.bic), (None, None));
+        assert_eq!(info.objective, Objective::Reml);
+    }
 }
 
 #[test]
@@ -1409,30 +1388,6 @@ fn two_gaussian_ml_fits_get_chi_squared_or_the_boundary_rule_with_aic_and_bic() 
     assert_eq!(t.objective, Objective::MaximumLikelihood);
 }
 
-#[test]
-fn aic_and_bic_are_left_out_on_reml_fits() {
-    let d = sleepstudy();
-    let c = cmp(
-        &side(
-            "Reaction ~ Days + (1 | Subject)",
-            &d,
-            Family::Gaussian,
-            None,
-        ),
-        &side(
-            "Reaction ~ Days + (Days | Subject)",
-            &d,
-            Family::Gaussian,
-            None,
-        ),
-    )
-    .unwrap();
-    for info in [&c.m0, &c.m1] {
-        assert_eq!((info.aic, info.bic), (None, None));
-        assert_eq!(info.objective, Objective::Reml);
-    }
-}
-
 fn slope1() -> Table {
     csv_table(
         include_str!("../validation/data/simulated/sim_binomial_slope1.csv"),
@@ -1532,6 +1487,7 @@ fn two_ols_fits_get_the_exact_f_whatever_their_reml() {
     let mut answers = Vec::new();
     for (r0, r1) in [(None, None), (Some(true), Some(true)), (None, Some(true))] {
         let c = cmp(&model("y ~ x", r0), &model("y ~ x + z", r1)).unwrap();
+        assert_eq!((c.larger, c.differs), (Side::Second, Differs::Fixed));
         answers.push(outcome(&c));
         let t = linear(&c);
         assert_eq!(t.kind, LinearKind::F);

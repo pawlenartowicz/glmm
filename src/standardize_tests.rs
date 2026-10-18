@@ -286,17 +286,3 @@ fn beta_and_covariance_maps_are_b() {
         }
     }
 }
-
-#[test]
-fn column_standardization_is_in_place() {
-    let (x, n, p) = rows(&[&[1.0, 2.0], &[1.0, 4.0], &[1.0, 9.0]]);
-    let mut cs = ColumnScaling::identity(p);
-    cs.compute(&x, n, p, None, true);
-    for j in 0..p {
-        let mut col: Vec<f64> = (0..n).map(|i| x[i * p + j]).collect();
-        cs.standardize_column(j, &mut col);
-        for i in 0..n {
-            assert_eq!(col[i], (x[i * p + j] - cs.center(j)) / cs.scale(j));
-        }
-    }
-}

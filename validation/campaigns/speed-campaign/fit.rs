@@ -112,7 +112,7 @@ fn done_case_ids(path: &str) -> std::collections::HashSet<String> {
         .collect()
 }
 
-/// config_tag: `<site>:<npt formula or shipped>[:<GRID_CONFIG_TAG>]`. The site
+/// config_tag: `<site>:shipped[:<GRID_CONFIG_TAG>]`. The site
 /// is derived from the LOWERED model — relations (`Crossed` vs `NestedWithin`,
 /// which reflects the frontend's flat-nesting detection outcome) and slope
 /// widths from `lo.model.re`, crossed level counts from `lo.ids.extra[g]`
@@ -149,11 +149,10 @@ fn config_tag(lo: &glmm::formula::Lowered, gaussian: bool, user_tag: &str) -> St
         (false, true) => "glmm-sparse",
         (false, false) => "glmm",
     };
-    let npt = std::env::var("LMM_NPT_FORMULA").unwrap_or_else(|_| "shipped".into());
     if user_tag.is_empty() {
-        format!("{site}:{npt}")
+        format!("{site}:shipped")
     } else {
-        format!("{site}:{npt}:{user_tag}")
+        format!("{site}:shipped:{user_tag}")
     }
 }
 

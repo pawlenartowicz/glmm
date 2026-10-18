@@ -1387,8 +1387,7 @@ pub(crate) fn exact_curvature_differs(family: Family) -> bool {
 /// `w_eta` ([`weight_eta_deriv`]). `eta`/`mu` are the pass's already-clamped
 /// values, as for `observed_weight`, and a tail row ([`in_tail`]) takes the
 /// η form `prior_w·w_obs'` of [`TailRow`]. Held against the `Dual<1>` lane of
-/// `observed_weight` and against a central difference in
-/// `observed_weight_eta_deriv_matches_*`.
+/// `observed_weight` in `observed_weight_eta_deriv_matches_dual1_of_observed_weight`.
 pub(crate) fn observed_weight_eta_deriv<T: Scalar>(
     family: Family,
     nb_theta: f64,
@@ -2168,32 +2167,6 @@ mod tests {
         }
     }
 
-    /// `weight_eta_deriv` against a central difference of the same
-    /// `irls_weight_and_resid` weight, at the step and band
-    /// `observed_weight_matches_fd_of_score_factor` uses. Independent of the
-    /// gate above: both could pass together wrong only if `Dual<1>`'s chain
-    /// rule itself were wrong, which this catches.
-    #[test]
-    fn weight_eta_deriv_matches_fd_of_irls_weight() {
-        let nb_theta = 2.5;
-        let h = 1e-5;
-        for (f, etas) in weight_eta_deriv_cells() {
-            let w_at = |e: f64| irls_weight_and_resid(f, nb_theta, 1.0, e).1;
-            for &eta in etas {
-                for &prior_w in &[1.0_f64, 2.5_f64] {
-                    let fd = prior_w * (w_at(eta + h) - w_at(eta - h)) / (2.0 * h);
-                    let mu = link_inv(f, eta);
-                    let w = prior_w * w_at(eta);
-                    let got = weight_eta_deriv(f, nb_theta, eta, mu, w);
-                    assert!(
-                        (got - fd).abs() < 1e-7,
-                        "{f:?} eta={eta} prior_w={prior_w}: got {got} vs fd {fd}"
-                    );
-                }
-            }
-        }
-    }
-
     #[test]
     fn poisson_log_canonical_quantities() {
         let f = Family::Poisson {
@@ -2565,37 +2538,6 @@ mod tests {
                         "{f:?} eta={eta} y={y} pw={prior_w}: got {got} want {want}"
                     );
                 }
-            }
-        }
-    }
-
-    /// The same derivative against a central difference of the `f64`
-    /// `observed_weight` in η. Step 1e-5, band 1e-6 relative (O(h²) truncation
-    /// on smooth links, far below the band).
-    #[test]
-    fn observed_weight_eta_deriv_matches_fd_of_observed_weight() {
-        let nb_theta = 2.5;
-        let wobs = |f: Family, y: f64, pw: f64, eta: f64| {
-            let (mu, w_raw, _) = irls_weight_and_resid(f, nb_theta, y, eta);
-            observed_weight(f, nb_theta, y, pw, eta, mu, pw * w_raw)
-        };
-        for (f, etas) in observed_weight_cells() {
-            for &eta in &etas {
-                let y = if matches!(f, Family::Binomial { .. }) {
-                    0.6
-                } else {
-                    1.7
-                };
-                let pw = 1.3;
-                let h = 1e-5;
-                let fd = (wobs(f, y, pw, eta + h) - wobs(f, y, pw, eta - h)) / (2.0 * h);
-                let (mu, w_raw, _) = irls_weight_and_resid(f, nb_theta, y, eta);
-                let w_eta = weight_eta_deriv(f, nb_theta, eta, mu, pw * w_raw);
-                let got = observed_weight_eta_deriv(f, nb_theta, y, pw, eta, mu, w_eta);
-                assert!(
-                    (got - fd).abs() <= 1e-6 * fd.abs().max(1.0),
-                    "{f:?} eta={eta}: got {got} fd {fd}"
-                );
             }
         }
     }

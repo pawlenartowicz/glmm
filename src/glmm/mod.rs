@@ -1343,7 +1343,7 @@ pub fn fit_glmm(
         // guard's profiled β̂ at the chosen θ. On AGQ (no stage 1) the guard
         // compares on the fixed-β AGQ objective at β₀ and keeps no
         // `guard_cache`, so the gradient route starts from β₀ at the guard's θ.
-        let guard_mode = stage1_mode.filter(|_| nagq == 1).unwrap_or(BetaMode::Fixed);
+        let guard_mode = stage1_mode.unwrap_or(BetaMode::Fixed);
         let cacheable = guard_mode != BetaMode::Fixed;
         // `laplace_deviance`'s Fixed mode reads β off `params[n_theta..n_theta
         // + p]` itself (see its doc), not off the `beta` argument's incoming
@@ -1464,8 +1464,7 @@ pub fn fit_glmm(
     //
     // `converged` is always the status of whichever optimizer finished.
     let mut grad_done: Option<(bool, usize, bool, f64)> = None;
-    // AGQ fits search with no stage 1, whatever `outer_search` says: the keys
-    // below read the order, not the route field a test may override.
+    // AGQ fits search with no stage 1: the keys below read the order.
     let agq_finish = nagq > 1;
     let mut grad_spent = 0usize;
     let mut grad_fell_back = false;
@@ -1745,12 +1744,10 @@ pub fn fit_glmm(
             // and never gates convergence; on `ExactProfile` this IS the search — its
             // status alone gates convergence (the `route ==` split after this block).
             // Skipped bit-identically when `stage1_mode` is `None` (the `Joint` route; the
-            // A/B tests pin this as the single-stage reference) and when `nagq > 1` —
-            // Profile deviance is undefined on the AGQ early-return path
-            // (`debug_assert!(beta_mode == BetaMode::Fixed || nagq == 1)`), and AGQ fits must bypass stage 1
-            // unchanged. A Laplace-pass warm start for AGQ was measured on the 33 diligent
-            // AGQ cells (2026-07-14) and reverted: total eval count was a wash (−0.3%),
-            // not worth the added code path for that little a gain.
+            // A/B tests pin this as the single-stage reference). A Laplace-pass warm start
+            // for AGQ was measured on the 33 diligent AGQ cells (2026-07-14) and reverted:
+            // total eval count was a wash (−0.3%), not worth the added code path for that
+            // little a gain.
             let mut n_eval_stage1 = 0usize;
             let mut stage1_out = None;
             // Hoisted out of the `if let` below (rather than left local to it) so it is
@@ -1778,7 +1775,7 @@ pub fn fit_glmm(
             // Evaluations the search walked away from (a far warm start, a failed
             // first step) leave the check silent.
             let mut finite_evals1 = 0usize;
-            if let Some(mode) = stage1_mode.filter(|_| nagq == 1) {
+            if let Some(mode) = stage1_mode {
                 params_stage1[..n_theta].copy_from_slice(&params[..n_theta]); // θ₀ unchanged from the caller's params
                 if n_disp == 1 {
                     params_stage1[n_theta] = params[nb_col]; // ln θ_NB / ln φ start, set before the search
@@ -2312,19 +2309,27 @@ pub fn fit_glmm(
                 // finds a lower point (`JOINT_RECHECK_TOL`); the second pass
                 // starts there.
                 //
-                // An AGQ fit the gradient search handed over runs one more
-                // information-metric pass after a second pass, from the check's
-                // re-solved β at the second pass's θ and at `GLMM_RHO_BEGIN`, and
-                // keeps the lower of the two. Where working weights span many
-                // decades (|f| near 1e10) the deviance's rounding noise defeats
-                // BOBYQA's local model at small radii, so a pass ends where its
-                // start leads it; the fresh pass recovers most of those ends.
-                // Measured 2026-10-11 on 125 decade designs: failures 31 to 16
-                // on x86_64 and 30 to 17 on aarch64, none worse, about 29
-                // evaluations more per hand-over fit.
+                // An AGQ fit runs one more information-metric pass after a
+                // second pass, from the check's re-solved β at the second pass's
+                // θ and at `GLMM_RHO_BEGIN`, and keeps the lower of the two.
+                // Where working weights span many decades (|f| near 1e10) the
+                // deviance's rounding noise defeats BOBYQA's local model at small
+                // radii, so a pass ends where its start leads it; the fresh pass
+                // recovers most of those ends. Measured 2026-10-11 on 125 decade
+                // designs, hand-over fits: failures 31 to 16 on x86_64 and 30 to
+                // 17 on aarch64, none worse, about 29 evaluations more per fit.
+                // A fit the gradient route finishes through its polish needs it
+                // as much: which of the two routes a decade design takes follows
+                // the platform's rounding, and on aarch64 two of the fourteen
+                // decades test's fits ended their second pass 1.65 and 8.77
+                // units high on the polish route. Measured 2026-10-18 on 420
+                // decade designs (60 seeds, 8 to 14 decades): fits more than one
+                // unit above the exact profile 16 to 3 on aarch64 and 17 to 4 on
+                // x86_64, none worse beyond 6e-6 units, no convergence flag
+                // flipped, about 40 evaluations more where it runs.
                 let mut info_pass = false;
                 let mut info_passes = 0usize;
-                let max_info_passes = if agq_finish && grad_fell_back { 2 } else { 1 };
+                let max_info_passes = if agq_finish { 2 } else { 1 };
                 let mut n_eval_prev = 0usize;
                 let mut first_obj: Option<f64> = None;
                 let (read, exhausted) = loop {
@@ -2588,9 +2593,9 @@ pub fn fit_glmm(
                     if let Some(c) = coord {
                         check += nb_term(c);
                     }
-                    // After a second pass the check is reached only on a
-                    // hand-over fit (`max_info_passes`), whose third pass runs
-                    // whatever the check found.
+                    // After a second pass the check is reached only on an AGQ
+                    // fit (`max_info_passes`), whose third pass runs whatever
+                    // the check found.
                     if info_ok && (info_pass || check < read.2 - joint_recheck_band(read.2)) {
                         // The previous pass's incumbent, for the restore above:
                         // `start_point` and `guard_u` are not read again once the

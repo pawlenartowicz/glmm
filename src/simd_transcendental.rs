@@ -188,14 +188,21 @@ fn simd_z_mask<S: Simd, const FUSED: bool>(simd: S, eta: S::f64s) -> (S::f64s, S
 /// `exp` and one `log1p` of the same argument shared across all three.
 /// `p = sigmoid(η)` (branchless `glm::sigmoid_stable`),
 /// `w = max(p(1-p), WEIGHT_CLAMP)`, `lp = log(1 + exp(η))` (stable in both tails).
+///
+/// The branch mask is `η < 0`, not `η ≥ 0`, so a NaN η (false under both)
+/// takes the `η + log1p(z)` side and `lp` comes out NaN on every backend,
+/// whatever its `max` does with NaN in the clamp. `p` and `w` can still come
+/// out finite there; the NaN sum is what flags the row. Every non-NaN η, ±∞
+/// included, gives the same bits under either mask.
 #[inline(always)]
 fn simd_fused<S: Simd, const FUSED: bool>(simd: S, eta: S::f64s) -> (S::f64s, S::f64s, S::f64s) {
     let one = simd.splat_f64s(1.0);
-    let (z, mask) = simd_z_mask::<S, FUSED>(simd, eta);
+    let (z, _) = simd_z_mask::<S, FUSED>(simd, eta);
+    let neg = simd.less_than_f64s(eta, simd.splat_f64s(0.0));
     let l = simd_log1p_unit::<S, FUSED>(simd, z);
     let opz = simd.add_f64s(one, z);
-    let p = simd.select_f64s(mask, simd.div_f64s(one, opz), simd.div_f64s(z, opz));
-    let lp = simd.select_f64s(mask, simd.add_f64s(eta, l), l);
+    let p = simd.select_f64s(neg, simd.div_f64s(z, opz), simd.div_f64s(one, opz));
+    let lp = simd.select_f64s(neg, l, simd.add_f64s(eta, l));
     let w = simd.max_f64s(
         simd.mul_f64s(p, simd.sub_f64s(one, p)),
         simd.splat_f64s(crate::glm::WEIGHT_CLAMP),
@@ -243,10 +250,11 @@ fn scalar_z<const FUSED: bool>(eta: f64) -> f64 {
 fn scalar_fused<const FUSED: bool>(eta: f64) -> (f64, f64, f64) {
     let z = scalar_z::<FUSED>(eta);
     let lp = scalar_log1pexp_from_z::<FUSED>(z, eta);
-    let p = if eta >= 0.0 {
-        1.0 / (1.0 + z)
-    } else {
+    // `η < 0` as in `simd_fused`: a NaN η takes the `η ≥ 0` side.
+    let p = if eta < 0.0 {
         z / (1.0 + z)
+    } else {
+        1.0 / (1.0 + z)
     };
     let w = (p * (1.0 - p)).max(crate::glm::WEIGHT_CLAMP);
     (p, w, lp)
@@ -258,10 +266,11 @@ fn scalar_fused<const FUSED: bool>(eta: f64) -> (f64, f64, f64) {
 #[inline]
 fn scalar_log1pexp_from_z<const FUSED: bool>(z: f64, eta: f64) -> f64 {
     let l = scalar_log1p_unit::<FUSED>(z);
-    if eta >= 0.0 {
-        eta + l
-    } else {
+    // `η < 0` as in `simd_fused`, so a NaN η comes out NaN.
+    if eta < 0.0 {
         l
+    } else {
+        eta + l
     }
 }
 
@@ -1229,7 +1238,7 @@ fn scalar_sigmoid_owned<const FUSED: bool>(eta: f64) -> f64 {
 /// floored IRLS working weight `(wᵢ·W_raw).max(WEIGHT_CLAMP)`; fills `z` with the
 /// working response `η + r` when non-empty (the GLM IRLS site needs it, the three
 /// PIRLS sites do not). Returns `(Σ wᵢ·dᵢ, any raw η the link does not evaluate)`
-/// (`family::eta_infeasible`).
+/// (`family::eta_infeasible`, or a NaN η on a link that clamps η).
 ///
 /// - `prior_w` empty ⇒ unit prior weights.
 /// - `weighted` selects between the two logit forms: unweighted
@@ -1274,7 +1283,10 @@ pub(crate) fn family_pass(
                 z[i] = eta[i] + (y[i] - prob[i]) / w[i];
             }
         }
-        return (2.0 * (lp_sum - yeta), false);
+        return (
+            crate::scalar::logit_fused_deviance(lp_sum, yeta, eta, y),
+            false,
+        );
     }
 
     // Gaussian never routes here (the OLS/LMM paths own it); keep the scalar
@@ -1298,6 +1310,10 @@ pub(crate) fn family_pass(
     // Raw η past the link's clamp bounds (`family::eta_infeasible`), read
     // before the arms overwrite η with its projection. The two inverse-link
     // arms also count their `η ≤ 0` rows lane-wise; this covers them too.
+    // A NaN η counts here as well: the arms' SIMD clamp is a `max`/`min`
+    // pair, which on x86 and on pulp's scalar backend drops the NaN and
+    // projects the row onto the lower bound, so its μ, weight and deviance
+    // come out finite, as if the row had sat at that bound.
     let out_of_range = !matches!(
         family,
         Family::Binomial {
@@ -1306,7 +1322,7 @@ pub(crate) fn family_pass(
     ) && eta
         .iter()
         .zip(y)
-        .any(|(&e, &yi)| crate::family::eta_infeasible(family, yi, e));
+        .any(|(&e, &yi)| e.is_nan() || crate::family::eta_infeasible(family, yi, e));
     let infeasible = pulp::Arch::new().dispatch(FamilyMuWOp::<{ FUSED_DEFAULT }> {
         family,
         nb_theta,
@@ -2551,6 +2567,64 @@ mod tests {
         }
     }
 
+    /// A NaN η on a link that clamps η is flagged as not evaluable, wherever
+    /// it lands: row 0 of a 17-row call is a SIMD lane on every backend, row
+    /// 16 and a 1-row call are the scalar tail on lane widths 2, 4 and 8. The
+    /// SIMD clamp drops the NaN on x86 and on pulp's scalar backend, so without
+    /// the flag that row would give a finite μ and deviance at the lower clamp
+    /// bound.
+    #[test]
+    fn family_pass_flags_nan_eta_on_clamped_links() {
+        use crate::spec::{NegBinomialLink, PoissonLink};
+        let fams = [
+            Family::Binomial {
+                link: BinomialLink::Cloglog,
+            },
+            Family::Poisson {
+                link: PoissonLink::Log,
+            },
+            Family::NegativeBinomial {
+                link: NegBinomialLink::Log,
+            },
+            Family::Gamma {
+                link: GammaLink::Log,
+            },
+            Family::Gamma {
+                link: GammaLink::Inverse,
+            },
+            Family::InverseGaussian {
+                link: InverseGaussianLink::Log,
+            },
+            Family::InverseGaussian {
+                link: InverseGaussianLink::InverseSquared,
+            },
+        ];
+        let mut checked = 0;
+        for fam in fams {
+            for (len, at) in [(1usize, 0usize), (17, 0), (17, 16)] {
+                let mut eta = vec![0.3; len];
+                eta[at] = f64::NAN;
+                let y = vec![1.0; len];
+                let (mut prob, mut w) = (vec![0.0; len], vec![0.0; len]);
+                let (dev, infeasible) = family_pass(
+                    fam,
+                    5.0,
+                    &mut eta,
+                    &y,
+                    &[],
+                    false,
+                    0.0,
+                    &mut prob,
+                    &mut w,
+                    &mut [],
+                );
+                assert!(infeasible, "{fam:?} len {len}, NaN at {at}: deviance {dev}");
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 21);
+    }
+
     #[test]
     fn sigmoid_fill_nonfinite_input() {
         // +inf saturates to 1.0 (the η ≥ 0 branch). -inf falls through the
@@ -2606,31 +2680,22 @@ mod tests {
         assert_eq!(long[2], 1.0);
     }
 
+    /// A NaN η makes `Σ log1pexp` NaN wherever it lands: the scalar tail (a
+    /// 1-row call, the last row of a 17-row call on lane widths 2, 4 and 8)
+    /// and a SIMD lane (row 0 of the 17-row call). So the unweighted-logit
+    /// deviance `2·(Σ log1pexp − Σ y·η)` is NaN through this sum as well as
+    /// through `Σ y·η`. `+∞` gives `+∞`.
     #[test]
-    fn pw_and_log1pexp_sum_nan_eta_launders_into_a_finite_deviance_row() {
-        // Pins the gap the divergence guard in `glm.rs` cannot see: `ae >
-        // max_abs` is false whenever `ae` is NaN, so a NaN η never raises
-        // `max_abs` and never trips that cap. This kernel does not reject NaN
-        // either — `scalar_fused`/`simd_fused` treat it exactly like a very
-        // negative η (see `sigmoid_fill_nonfinite_input`), so the row comes out
-        // as a finite p ≈ exp(-700), w = WEIGHT_CLAMP, and a finite, near-zero
-        // deviance contribution: indistinguishable from a legitimate confident
-        // η → -∞ row. `family_pass`'s unweighted-logit arm calls this function
-        // directly on an unclamped η, so this is reachable from a live fit, not
-        // just from this test.
-        let (expect_p, expect_w, expect_lp) = scalar_fused::<{ FUSED_DEFAULT }>(f64::NAN);
-        assert!(expect_p.is_finite() && expect_w.is_finite() && expect_lp.is_finite());
+    fn pw_and_log1pexp_sum_nan_eta_gives_nan_sum() {
+        assert!(scalar_log1pexp(f64::NAN).is_nan());
+        for (len, at) in [(1usize, 0usize), (17, 0), (17, 16)] {
+            let mut eta = vec![0.3; len];
+            eta[at] = f64::NAN;
+            let (mut p, mut w) = (vec![0.0; len], vec![0.0; len]);
+            let sum = pw_and_log1pexp_sum(&eta, &mut p, &mut w);
+            assert!(sum.is_nan(), "len {len}, NaN at {at}: sum {sum}");
+        }
 
-        let eta = [f64::NAN];
-        let mut p = [0.0];
-        let mut w = [0.0];
-        let sum = pw_and_log1pexp_sum(&eta, &mut p, &mut w);
-        assert_eq!(p[0].to_bits(), expect_p.to_bits());
-        assert_eq!(w[0].to_bits(), expect_w.to_bits());
-        assert_eq!(sum.to_bits(), expect_lp.to_bits());
-
-        // Contrast: +inf does NOT launder — it produces an infinite deviance
-        // contribution, which a finite-value check downstream would catch.
         let eta = [f64::INFINITY];
         let mut p = [0.0];
         let mut w = [0.0];
@@ -2638,6 +2703,56 @@ mod tests {
         assert_eq!(p[0], 1.0);
         assert_eq!(w[0], crate::glm::WEIGHT_CLAMP);
         assert!(sum.is_infinite() && sum > 0.0);
+    }
+
+    /// Separated rows at `|η|` up to 3e296: `Σ log1pexp(η)` and `Σ y·η` are
+    /// both near 5e297 and agree to their last bit, so the fused
+    /// `2·(Σ log1pexp − Σ y·η)` keeps only rounding noise. The exact deviance
+    /// is `2·ln 2`, all from the `η = 0, y = 0` row, and both the SIMD route
+    /// and its generic mirror must return it.
+    #[test]
+    fn unweighted_logit_deviance_survives_cancelling_sums() {
+        let fam = Family::Binomial {
+            link: BinomialLink::Logit,
+        };
+        let n = 61;
+        let eta0: Vec<f64> = (0..n).map(|i| 1e295 * (i as f64 - 30.0)).collect();
+        let y: Vec<f64> = (0..n).map(|i| f64::from(u8::from(i > 30))).collect();
+        let yeta: f64 = eta0.iter().zip(&y).map(|(e, yi)| e * yi).sum();
+        let want = 2.0 * std::f64::consts::LN_2;
+        let (mut prob, mut w) = (vec![0.0; n], vec![0.0; n]);
+        let mut eta = eta0.clone();
+        let (simd, _) = family_pass(
+            fam,
+            f64::NAN,
+            &mut eta,
+            &y,
+            &[],
+            false,
+            yeta,
+            &mut prob,
+            &mut w,
+            &mut [],
+        );
+        let mut eta = eta0;
+        let (generic, _) = crate::scalar::generic_family_pass(
+            fam,
+            f64::NAN,
+            &mut eta,
+            &y,
+            &[],
+            false,
+            yeta,
+            &mut prob,
+            &mut w,
+            &mut [],
+        );
+        for (route, dev) in [("simd", simd), ("generic", generic)] {
+            assert!(
+                (dev - want).abs() < 1e-12,
+                "{route}: deviance {dev:e}, want {want}"
+            );
+        }
     }
 }
 

@@ -529,10 +529,6 @@ measured dimension ≥ 3; below that it *is* `2n+1`. PRIMA requires
 One alternate seed exists alongside the shipped schedule: `bobyqa_config`
 (tests only), `RHO_BEGIN` with PRIMA's default `npt = 2n+1`.
 
-The dev-only env campaign hooks are no-ops unless set, and are not part of the
-shipped behaviour. `LMM_NPT_FORMULA` and `LMM_MAX_FUN_FORMULA` override single
-numeric knobs.
-
 **Code**: `fit_lmm`, `LmmWorkspace::for_cluster_spec_ext`,
 `bobyqa_config`, constants `RHO_BEGIN`/`RHO_BEGIN_WARM`/`RHO_END`/`THETA0`
 (`src/lmm/mod.rs`); the external `bobyqa` crate supplies the solver.

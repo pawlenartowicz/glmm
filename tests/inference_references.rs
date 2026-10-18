@@ -8,10 +8,10 @@
 //! neither a golden nor an inference reference: no driver compares that cell,
 //! so none can find the entry stale. The rules are pure functions over the
 //! manifest entries, the registry and the files on disk, with synthetic
-//! cases beside them, so they are exercised while the real block is empty. No
-//! feature gate, so this runs in CI on the default and `--no-default-features`
-//! builds. It reads the reader by `#[path]`, not through `mod oracle_support`,
-//! which imports `glmm::formula`.
+//! cases beside them, so each rule is shown to fire. No feature gate, so this
+//! runs in CI on the default and `--no-default-features` builds. It reads the
+//! reader by `#[path]`, not through `mod oracle_support`, which imports
+//! `glmm::formula`.
 
 #[allow(dead_code)]
 #[path = "oracle_support/inference.rs"]

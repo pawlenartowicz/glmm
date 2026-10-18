@@ -288,14 +288,13 @@ pub(crate) struct ExactProfileBufs {
     /// stay zero. Length 1 (unread) when `e == 0` and on the blocked path.
     pub(crate) tail_inv: Vec<f64>,
     /// len `e`. Per-row crossed residual `r_i = C_f'(A_f⁻¹ m_c) − m_x`, indexed
-    /// by crossed column. Filled and read only under `cfg(test)`, by the row
-    /// site's equality oracle, which needs `r_i` as a vector; the shipped row
-    /// term is the three-term form over `tail_g` and `tail_h`, so a release
-    /// build allocates this and never touches it. Only cluster `f`'s coupling
-    /// columns are ever written or read in one row, and each is written before
-    /// it is read, so it needs no clearing between rows. A stack array cannot
-    /// serve: `e` is a data dimension (181 on grouseticks), not a compile-time
-    /// cap.
+    /// by crossed column. Test-only: the row site's equality oracle needs `r_i`
+    /// as a vector; the shipped row term is the three-term form over `tail_g`
+    /// and `tail_h`. Only cluster `f`'s coupling columns are ever written or
+    /// read in one row, and each is written before it is read, so it needs no
+    /// clearing between rows. A stack array cannot serve: `e` is a data
+    /// dimension (181 on grouseticks), not a compile-time cap.
+    #[cfg(test)]
     pub(crate) tail_r: Vec<f64>,
     /// `s·q_core²`, cluster `f` at `f·q_core²`, row-major: `G_f = C_f S⁻¹ C_f'`,
     /// the full square rather than a triangle (`q_core ≤ MAX_PRIMARY_Q`, and a

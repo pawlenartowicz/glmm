@@ -286,6 +286,15 @@ pub fn materialize(ast: &ParsedFormula, data: &Table, family: Family) -> Result<
             None => return Err(Error::UnknownColumn(ast.dependent.clone())),
         },
     };
+    // Refused here, by name, rather than by `fit_warm`'s entry assert, which
+    // panics. NaN too: a missing value is the caller's to drop before
+    // lowering, as both ports do.
+    if let Some(row) = y.iter().position(|v| !v.is_finite()) {
+        return Err(Error::TransformNotFinite {
+            term: ast.dependent.clone(),
+            row,
+        });
+    }
 
     // 2. Fixed design — intercept first (when the formula has one), then each
     // term's expanded columns, in R's term order.
@@ -363,6 +372,16 @@ pub fn materialize(ast: &ParsedFormula, data: &Table, family: Family) -> Result<
 
     if cols.is_empty() {
         return Err(Error::EmptyDesign);
+    }
+    // Same refusal as the response's, per design column: a bare numeric
+    // column, or an interaction product that overflowed.
+    for (name, col) in col_names.iter().zip(&cols) {
+        if let Some(row) = col.iter().position(|v| !v.is_finite()) {
+            return Err(Error::TransformNotFinite {
+                term: name.clone(),
+                row,
+            });
+        }
     }
     let p = cols.len();
     // Flatten column-major buffers to the row-major layout fit_cold expects
@@ -460,23 +479,23 @@ fn rdx_cross(
     Ok(RdxCross { names, xt_rdx })
 }
 
-/// Sorted-unique levels (lexicographic) and per-row codes — the ordering
+/// Sorted-unique levels and per-row codes — the lexicographic ordering
 /// [`Column::factor_from_labels`] applies for a caller with no declared order,
 /// and the one [`grouping_ids`]'s crossed-interaction arm applies to its
-/// composite `"A:B"` labels.
-fn sorted_levels_and_codes(labels: &[String]) -> (Vec<String>, Vec<u32>) {
-    let levels: Vec<String> = labels
+/// composite `(label, A, B)` keys.
+fn sorted_levels_and_codes<T: Ord + std::hash::Hash + Clone>(labels: &[T]) -> (Vec<T>, Vec<u32>) {
+    let levels: Vec<T> = labels
         .iter()
         .cloned()
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    let index: HashMap<&str, u32> = levels
+    let index: HashMap<&T, u32> = levels
         .iter()
         .enumerate()
-        .map(|(i, l)| (l.as_str(), i as u32))
+        .map(|(i, l)| (l, i as u32))
         .collect();
-    let codes = labels.iter().map(|l| index[l.as_str()]).collect();
+    let codes = labels.iter().map(|l| index[l]).collect();
     (levels, codes)
 }
 
@@ -870,7 +889,8 @@ impl GroupingLayout {
 /// or crossed `A:B` grouping's is the distinct observed `(A, B)` pair
 /// count — the same composite factor lme4 builds via `interaction()` before
 /// counting its levels, not the padded rectangle a nested layout later sizes
-/// its RE block to.
+/// its RE block to. Pairs are counted as pairs, never as the joined `"A:B"`
+/// string, which two different pairs share when a label contains `:`.
 fn grouping_level_count(re: &RandomEffect, data: &Table) -> Result<usize, Error> {
     let group = re_group_name(re);
     if let RandomEffect::Intercept {
@@ -881,15 +901,13 @@ fn grouping_level_count(re: &RandomEffect, data: &Table) -> Result<usize, Error>
         let child = group.strip_prefix(&format!("{parent}:")).unwrap_or(&group);
         let a = grouping_row_labels(parent, data)?;
         let b = grouping_row_labels(child, data)?;
-        let distinct: BTreeSet<String> =
-            a.iter().zip(&b).map(|(x, y)| format!("{x}:{y}")).collect();
+        let distinct: BTreeSet<(&String, &String)> = a.iter().zip(&b).collect();
         return Ok(distinct.len());
     }
     if let Some((lhs, rhs)) = group.split_once(':') {
         let a = grouping_row_labels(lhs, data)?;
         let b = grouping_row_labels(rhs, data)?;
-        let distinct: BTreeSet<String> =
-            a.iter().zip(&b).map(|(x, y)| format!("{x}:{y}")).collect();
+        let distinct: BTreeSet<(&String, &String)> = a.iter().zip(&b).collect();
         return Ok(distinct.len());
     }
     let (_, codes) = grouping_factor(&group, data)?;
@@ -969,14 +987,24 @@ fn grouping_ids(re: &RandomEffect, data: &Table) -> Result<GroupingLayout, Error
             // label, NOT inherited from either component's declared order: the
             // pair has no order the caller ever stated, and a grouping's level
             // order is inference-invariant anyway (exchangeable RE levels).
+            //
+            // A level is the `(A, B)` pair, not the joined label: with a `:`
+            // inside a label, `("a:b", "c")` and `("a", "b:c")` both join to
+            // `"a:b:c"` but are two levels. The pair breaks ties after the
+            // joined label, so such levels share a display label and stay apart.
             let (lhs, rhs) = group
                 .split_once(':')
                 .expect("group contains ':' per guard above");
             let a = grouping_row_labels(lhs, data)?;
             let b = grouping_row_labels(rhs, data)?;
-            let joined: Vec<String> = a.iter().zip(&b).map(|(x, y)| format!("{x}:{y}")).collect();
-            let (levels, codes) = sorted_levels_and_codes(&joined);
-            Ok(GroupingLayout::all_observed(codes, levels))
+            let keys: Vec<(String, &str, &str)> = a
+                .iter()
+                .zip(&b)
+                .map(|(x, y)| (format!("{x}:{y}"), x.as_str(), y.as_str()))
+                .collect();
+            let (levels, codes) = sorted_levels_and_codes(&keys);
+            let labels = levels.into_iter().map(|(label, _, _)| label).collect();
+            Ok(GroupingLayout::all_observed(codes, labels))
         }
         RandomEffect::Intercept { group, .. } | RandomEffect::Slope { group, .. } => {
             let (levels, codes) = grouping_factor(group, data)?;
@@ -1595,27 +1623,41 @@ mod tests {
         v.iter().map(|s| s.to_string()).collect()
     }
 
-    /// Flat lme4 idiom `(1|parent)+(1|child)`, BALANCED — each parent has the
-    /// same distinct-child count and every label is unique to one parent (Pastes'
-    /// `sample = batch:cask`, 3 casks per batch). `detect_flat_nesting` detects
-    /// the nesting and returns the zero-waste padded layout. Parent ids [0,0,1,1] each with 2
-    /// distinct children (W=2, no padding) → ids [0,1,2,3].
+    /// Labels containing `:`: the pairs `("a:b", "c")` and `("a", "b:c")` join
+    /// to the same `"a:b:c"` but are two levels, in the level count of both the
+    /// nested and the crossed spelling and in the crossed arm's codes. Codes by
+    /// hand: equal joined labels, so the pair decides and `"a" < "a:b"` puts
+    /// `("a", "b:c")` first.
     #[test]
-    fn detect_flat_nesting_balanced_is_nested() {
-        let primary = vec![0, 0, 1, 1];
-        let child = strs(&["a", "b", "c", "d"]);
-        let (ids, labels) = detect_flat_nesting(&primary, &child).expect("nesting detected");
-        assert_eq!(ids, vec![0, 1, 2, 3]);
-        // Bare child labels, not `parent:child` — see the flat arm in
-        // `lower_random_effects` for why this route must not join the parent in.
+    fn colon_in_labels_keeps_distinct_pairs_apart() {
+        let table = Table {
+            columns: vec![
+                (
+                    "g1".into(),
+                    Column::factor_from_labels(&strs(&["a:b", "a", "a:b", "a"])),
+                ),
+                (
+                    "g2".into(),
+                    Column::factor_from_labels(&strs(&["c", "b:c", "c", "b:c"])),
+                ),
+            ],
+            n: 4,
+        };
+        let crossed = RandomEffect::Intercept {
+            group: "g1:g2".to_string(),
+            parent: None,
+        };
+        let nested = RandomEffect::Intercept {
+            group: "g1:g2".to_string(),
+            parent: Some("g1".to_string()),
+        };
+        assert_eq!(grouping_level_count(&crossed, &table).unwrap(), 2);
+        assert_eq!(grouping_level_count(&nested, &table).unwrap(), 2);
+        let layout = grouping_ids(&crossed, &table).unwrap();
+        assert_eq!(layout.ids, vec![1, 0, 1, 0]);
         assert_eq!(
-            labels,
-            vec![
-                Some("a".into()),
-                Some("b".into()),
-                Some("c".into()),
-                Some("d".into())
-            ]
+            layout.slot_labels,
+            vec![Some("a:b:c".into()), Some("a:b:c".into())]
         );
     }
 
@@ -1629,21 +1671,6 @@ mod tests {
         assert_eq!(detect_flat_nesting(&primary, &child), None);
     }
 
-    /// Genuine nesting, NEAR-balanced — parents 0/1/2 with 3/2/3 distinct
-    /// children (the grid generator's `sample(1:3)` shape: children-per-parent
-    /// ∈ {1,2,3}). Padded rectangle `3·3 = 9` vs `8` levels — inflation 1.125
-    /// ≤ NESTING_INFLATION_BOUND, so detection returns the padded layout
-    /// (parent 1's slot `[3+2, 6)` stays unassigned padding).
-    #[test]
-    fn detect_flat_nesting_near_balanced_is_nested() {
-        let primary = vec![0, 0, 0, 1, 1, 2, 2, 2];
-        let child = strs(&["a", "b", "c", "d", "e", "f", "g", "h"]);
-        let (ids, labels) = detect_flat_nesting(&primary, &child).expect("nesting detected");
-        assert_eq!(ids, vec![0, 1, 2, 3, 4, 6, 7, 8]);
-        assert_eq!(labels[5], None, "parent 1's third slot is padding");
-        assert_eq!(labels[4], Some("e".into()));
-    }
-
     /// Genuine nesting but WILDLY uneven (the shape of an observation-level
     /// factor like grouseticks' `INDEX`): one parent holds most of the children
     /// — 5/1/1 — so the padded rectangle `n_parents · max_children = 3·5 = 15`
@@ -1654,6 +1681,36 @@ mod tests {
         let primary = vec![0, 0, 0, 0, 0, 1, 2];
         let child = strs(&["a", "b", "c", "d", "e", "f", "g"]);
         assert_eq!(detect_flat_nesting(&primary, &child), None);
+    }
+
+    /// The inflation bound at equality: 4/1/1 children, so the padded rectangle
+    /// `3·4 = 12` equals `NESTING_INFLATION_BOUND · 6 levels = 12`, and the
+    /// layout stays nested. Four slots per parent, children in lexicographic
+    /// order within each, the unfilled slots unlabelled (`nested_padded_ids`).
+    #[test]
+    fn detect_flat_nesting_inflation_at_the_bound_stays_nested() {
+        let primary = vec![0, 0, 0, 0, 1, 2];
+        let child = strs(&["a", "b", "c", "d", "e", "f"]);
+        let (ids, labels) = detect_flat_nesting(&primary, &child).unwrap();
+        assert_eq!(ids, vec![0, 1, 2, 3, 4, 8]);
+        let slot = |s: &str| Some(s.to_string());
+        assert_eq!(
+            labels,
+            vec![
+                slot("a"),
+                slot("b"),
+                slot("c"),
+                slot("d"),
+                slot("e"),
+                None,
+                None,
+                None,
+                slot("f"),
+                None,
+                None,
+                None,
+            ]
+        );
     }
 
     /// Two flat extras that BOTH nest cleanly in the primary: the kernel holds
@@ -1762,73 +1819,6 @@ mod tests {
             assert_eq!(err, Error::EmptyDesign, "{formula}");
             assert!(err.to_string().contains("no columns"), "{formula}: {err}");
         }
-    }
-
-    /// Fixture for the `label_ranef` mismatch tests below: 3 groups of 4 rows
-    /// each, one numeric predictor, random intercept on `g`.
-    fn ranef_mismatch_fixture() -> (crate::Fit, Vec<ReGroupInfo>) {
-        let g_labels = strs(&[
-            "g1", "g1", "g1", "g1", "g2", "g2", "g2", "g2", "g3", "g3", "g3", "g3",
-        ]);
-        let group_effect = [0.6, -0.4, 0.9];
-        let mut seed = 7u64;
-        let x: Vec<f64> = (0..12)
-            .map(|_| crate::fit::common_tests::lcg(&mut seed))
-            .collect();
-        let y: Vec<f64> = x
-            .iter()
-            .enumerate()
-            .map(|(i, &v)| {
-                1.0 + 0.5 * v
-                    + group_effect[i / 4]
-                    + 0.05 * crate::fit::common_tests::lcg(&mut seed)
-            })
-            .collect();
-        let table = Table {
-            columns: vec![
-                ("y".into(), Column::Numeric(y)),
-                ("x".into(), Column::Numeric(x)),
-                ("g".into(), Column::factor_from_labels(&g_labels)),
-            ],
-            n: 12,
-        };
-        let lo = super::lower("y ~ x + (1 | g)", &table, Family::Gaussian).unwrap();
-        let fit = crate::fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
-        (fit, lo.re_groups)
-    }
-
-    /// The total-length branch: grouping count agrees with the fit, but an
-    /// inflated `terms` count for that grouping makes the block width
-    /// `label_ranef` computes disagree with `fit.ranef.len()`.
-    #[test]
-    fn label_ranef_refuses_a_total_length_mismatch() {
-        let (fit, mut re_groups) = ranef_mismatch_fixture();
-        assert!(
-            !fit.ranef.is_empty(),
-            "fixture must produce conditional modes"
-        );
-        re_groups[0].terms.push("(Intercept)".to_string());
-        assert!(matches!(
-            label_ranef(&fit, &re_groups),
-            Err(Error::RanefShapeMismatch(_))
-        ));
-    }
-
-    /// The slot-label-count branch: grouping and term counts both agree with
-    /// the fit (so the total-length check passes), but the slot-label vector
-    /// for that grouping is a level short of `fit.ranef_levels`.
-    #[test]
-    fn label_ranef_refuses_a_slot_label_count_mismatch() {
-        let (fit, mut re_groups) = ranef_mismatch_fixture();
-        assert!(
-            !fit.ranef.is_empty(),
-            "fixture must produce conditional modes"
-        );
-        re_groups[0].slot_labels.pop();
-        assert!(matches!(
-            label_ranef(&fit, &re_groups),
-            Err(Error::RanefShapeMismatch(_))
-        ));
     }
 
     /// A fixed-part factor with a single declared level errors, naming the

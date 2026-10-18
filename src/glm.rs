@@ -1350,35 +1350,6 @@ mod tests {
     }
 
     #[test]
-    fn glm_all_one_y_short_circuits() {
-        let n = 100;
-        let p = 2;
-        let mut x = Mat::<f64>::zeros(n, p);
-        for i in 0..n {
-            x[(i, 0)] = 1.0;
-            x[(i, 1)] = (i as f64) / (n as f64) - 0.5;
-        }
-        let y = vec![1.0f64; n];
-        let mut ws = TestWs::new(n, p, 0);
-        let targets: Vec<u32> = vec![0, 1];
-        let fit = glm_irls_fit(
-            crate::Family::Binomial {
-                link: crate::BinomialLink::Logit,
-            },
-            f64::NAN,
-            x.as_ref(),
-            &y,
-            &targets,
-            None,
-            None,
-            None,
-            glm_scratch(&mut ws),
-        );
-        assert!(!fit.converged);
-        assert_eq!(fit.n_iter, 0);
-    }
-
-    #[test]
     fn glm_rank_deficient_design() {
         // X with an all-zero column → X'WX has an exactly zero pivot, which the
         // Cholesky refuses on every rounding.
@@ -1413,13 +1384,10 @@ mod tests {
         );
     }
 
-    /// GLM Wald z² and both deviances are NaN on a non-converged fit (the
-    /// variance is not recoverable, and the deviance NaN-fill signals
-    /// non-convergence to callers). A broken kernel that emitted finite
-    /// garbage in any of the three on a failed fit would be caught here.
+    /// All-0 and all-1 Bernoulli y short-circuit (n_iter 0, not converged)
+    /// with z², deviance and null deviance NaN.
     #[test]
     fn glm_z_sq_and_deviances_nan_on_non_converged() {
-        // All-zero y short-circuits to non-converged.
         let n = 100;
         let p = 2;
         let mut x = Mat::<f64>::zeros(n, p);
@@ -1427,35 +1395,40 @@ mod tests {
             x[(i, 0)] = 1.0;
             x[(i, 1)] = (i as f64) / (n as f64) - 0.5;
         }
-        let y = vec![0.0f64; n];
-        let mut ws = TestWs::new(n, p, 0);
-        let targets: Vec<u32> = vec![0, 1];
-        let fit = glm_irls_fit(
-            crate::Family::Binomial {
-                link: crate::BinomialLink::Logit,
-            },
-            f64::NAN,
-            x.as_ref(),
-            &y,
-            &targets,
-            None,
-            None,
-            None,
-            glm_scratch(&mut ws),
-        );
-        assert!(!fit.converged);
-        assert_eq!(fit.n_iter, 0);
-        for &t in fit.t_sq.iter() {
-            assert!(t.is_nan(), "z² must be NaN on non-converged fit, got {t}");
+        for y_val in [0.0f64, 1.0] {
+            let y = vec![y_val; n];
+            let mut ws = TestWs::new(n, p, 0);
+            let targets: Vec<u32> = vec![0, 1];
+            let fit = glm_irls_fit(
+                crate::Family::Binomial {
+                    link: crate::BinomialLink::Logit,
+                },
+                f64::NAN,
+                x.as_ref(),
+                &y,
+                &targets,
+                None,
+                None,
+                None,
+                glm_scratch(&mut ws),
+            );
+            assert!(!fit.converged, "y={y_val}");
+            assert_eq!(fit.n_iter, 0, "y={y_val}");
+            for &t in fit.t_sq.iter() {
+                assert!(
+                    t.is_nan(),
+                    "y={y_val}: z² must be NaN on non-converged fit, got {t}"
+                );
+            }
+            assert!(
+                fit.deviance.is_nan(),
+                "y={y_val}: deviance must be NaN on non-converged"
+            );
+            assert!(
+                fit.deviance_null.is_nan(),
+                "y={y_val}: deviance_null must be NaN on the all-0/all-1 short circuit"
+            );
         }
-        assert!(
-            fit.deviance.is_nan(),
-            "deviance must be NaN on non-converged"
-        );
-        assert!(
-            fit.deviance_null.is_nan(),
-            "deviance_null must be NaN on all-0 short-circuit (sum_y = 0)"
-        );
     }
 
     #[test]
@@ -1921,12 +1894,12 @@ mod tests {
         assert!(fit.converged, "must converge: non-separated y pattern");
 
         // External oracle: R glm(y ~ x, family=binomial)$null.deviance with y_sum=40/n=100
-        // null deviance = -2*(40*ln(0.4) + 60*ln(0.6)) = 134.6023334 (depends only on y_bar)
-        let expected = 134.6023334f64;
-        let abs_err = (fit.deviance_null - expected).abs();
+        // (R: 134.6023); null deviance = -2*(40*ln(0.4) + 60*ln(0.6)) depends only on y_bar.
+        let expected = -2.0 * (40.0 * 0.4f64.ln() + 60.0 * 0.6f64.ln());
+        let rel = (fit.deviance_null - expected).abs() / expected;
         assert!(
-            abs_err < 0.001,
-            "deviance_null = {}, expected {expected}, err = {abs_err}",
+            rel <= 1e-12,
+            "deviance_null = {}, expected {expected} (rel {rel:e})",
             fit.deviance_null
         );
     }

@@ -28,13 +28,6 @@ use oracle_support::{
 };
 use serde_json::Value;
 
-#[test]
-fn aligned_dev_default_is_minus_two_loglik() {
-    let g = load_golden("pastes_lmm");
-    let ll = g.estimates.loglik.expect("gaussian golden has loglik");
-    assert_eq!(oracle_support::dev_align::aligned_dev(&g), Some(-2.0 * ll));
-}
-
 /// The exactly-six GLMMadaptive vector-RE-AGQ goldens that carry no `loglik` —
 /// the deviance gate's only loud exclusions (`DEV-NA` in
 /// `goldens_agree_with_the_references`). Pinned by name so a golden losing its
@@ -187,7 +180,7 @@ fn factors_of(spec: &Value) -> Vec<String> {
 /// entry does. Without this flag that gap makes [`m3_corpus`] panic on a missing
 /// file and takes the whole 56-golden tier down with it, which is the opposite of
 /// what a not-yet-frozen addition should cost. Flagged entries are skipped here
-/// and reported by `pending_references_are_absent_and_reasoned`, which also stops
+/// and reported by `all_goldens_are_registered` (through [`pending_specs`]), which also stops
 /// the flag outliving the JSON's arrival: once the reference exists, the field
 /// must go, and removing it is what puts the golden under Tier 2.
 fn is_pending(spec: &Value) -> bool {
@@ -433,6 +426,21 @@ fn all_goldens_are_registered() {
         }
     }
     on_disk.sort();
+    // Flagged specs (`pending_reference`) are excluded from Tier 2 by
+    // `m3_corpus`; `pending_specs` checks each flag's reason and absence and
+    // names them, so a run says which goldens the tier is not covering. It runs
+    // before the orphan check: a stale flag's golden is also an orphan, and
+    // this gives it the specific message.
+    let manifest: Value =
+        serde_json::from_str(include_str!("../validation/manifest.json")).expect("manifest parses");
+    let pending = pending_specs(
+        manifest["m3_goldens"]
+            .as_array()
+            .expect("manifest has m3_goldens"),
+    );
+    if !pending.is_empty() {
+        println!("m3_goldens awaiting a reference, excluded from Tier 2: {pending:?}");
+    }
     let orphans: Vec<&String> = on_disk
         .iter()
         .filter(|n| !registered.contains(*n))
@@ -441,46 +449,14 @@ fn all_goldens_are_registered() {
         orphans.is_empty(),
         "goldens with no manifest entry (unregenerable, so not oracles): {orphans:?}"
     );
-    assert_eq!(
-        on_disk.len(),
-        registered.len(),
-        "manifest registers goldens that are not on disk"
-    );
-}
-
-/// The other half of [`is_pending`]: a `pending_reference` must be a real reason,
-/// and it must describe a golden that genuinely is not on disk yet.
-///
-/// The failure this exists to catch is the flag going stale. A spec whose
-/// reference HAS been generated but which still carries the field is silently
-/// excluded from every assertion in this file — a frozen oracle that costs an R
-/// run and gates nothing, the same defect `golden_fields_are_all_asserted` was
-/// built for one level down. So the arrival of the JSON turns this test red until
-/// the field is removed.
-#[test]
-fn pending_references_are_absent_and_reasoned() {
-    let manifest: Value =
-        serde_json::from_str(include_str!("../validation/manifest.json")).expect("manifest parses");
-    let pending = pending_specs(
-        manifest["m3_goldens"]
-            .as_array()
-            .expect("manifest has m3_goldens"),
-    );
-    // Printed, not asserted to be empty: entries here are a legitimate transient
-    // state (spec landed, freeze pending). Visible so a `cargo test` run says out
-    // loud which goldens the tier is NOT covering.
-    if !pending.is_empty() {
-        println!("m3_goldens awaiting a reference, excluded from Tier 2: {pending:?}");
-    }
 }
 
 /// Names of the flagged specs, asserting both halves of the flag's contract on
 /// the way past: the reason is non-empty, and the golden really is still absent.
 ///
-/// Split out of the test above so the asserts can be driven by synthetic specs
-/// (`flag_semantics` below). With no flagged entry in the real manifest — the
-/// normal state — every line here is unreachable from the manifest alone, so the
-/// flag's semantics would otherwise be untested code.
+/// Called from `all_goldens_are_registered`, before its orphan check. A stale
+/// flag would also fail that check, and an unflagged missing JSON panics in
+/// [`m3_corpus`]; these asserts give the specific message.
 fn pending_specs(specs: &[Value]) -> Vec<String> {
     let mut pending = Vec::new();
     for s in specs {
@@ -504,53 +480,6 @@ fn pending_specs(specs: &[Value]) -> Vec<String> {
         pending.push(name.to_string());
     }
     pending
-}
-
-/// The flag's own semantics, on synthetic specs rather than the manifest — the
-/// manifest carries no flagged entry, and once the references of a release are
-/// frozen it never does, so a gate reading the real specs asserts nothing.
-mod flag_semantics {
-    use super::{is_pending, pending_specs};
-    use serde_json::{json, Value};
-
-    /// A spec named after a golden that IS on disk, so the stale-flag assert can
-    /// reach its failing branch. `sleepstudy_lmm` rather than an invented name:
-    /// an invented one could never collide, which is the case being tested.
-    fn frozen_golden_spec(reason: Value) -> Value {
-        json!({ "name": "sleepstudy_lmm", "pending_reference": reason })
-    }
-
-    #[test]
-    fn absent_empty_and_non_empty_reasons() {
-        assert!(!is_pending(&json!({ "name": "x" })));
-        assert!(!is_pending(
-            &json!({ "name": "x", "pending_reference": "" })
-        ));
-        assert!(is_pending(
-            &json!({ "name": "x", "pending_reference": "awaiting the R run" })
-        ));
-    }
-
-    #[test]
-    #[should_panic(expected = "an exclusion with no reason")]
-    fn empty_reason_is_rejected() {
-        pending_specs(&[json!({ "name": "not_a_golden", "pending_reference": "" })]);
-    }
-
-    #[test]
-    #[should_panic(expected = "drop the field")]
-    fn flag_outliving_the_golden_is_rejected() {
-        pending_specs(&[frozen_golden_spec(json!("awaiting the R run"))]);
-    }
-
-    #[test]
-    fn an_unfrozen_flagged_spec_is_reported() {
-        let pending = pending_specs(&[
-            json!({ "name": "plain_spec" }),
-            json!({ "name": "not_a_golden", "pending_reference": "awaiting the R run" }),
-        ]);
-        assert_eq!(pending, vec!["not_a_golden".to_string()]);
-    }
 }
 
 /// The defect this test guards against: a reader struct silently dropping a

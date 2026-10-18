@@ -296,9 +296,9 @@ port_gate <- function(grid_dir, rust, engine, known) {
     return(invisible(NULL))
   }
   cat(sprintf("\n=== glmm (Rust)  vs  %s (port) ===\n", engine))
-  cat(sprintf("%-34s  %-10s %-10s %-10s %-10s %-10s %-10s %-10s  %s\n",
-              "cell", "beta", "se_rx", "se_hess", "stddev", "coef_df", "deviance",
-              "loglik", "coef"))
+  cat(sprintf("%-34s  %-10s %-10s %-10s %-10s %-10s %-10s %-10s %-10s %-10s %-10s  %s\n",
+              "cell", "beta", "se_rx", "se_hess", "stddev", "corr", "sigma", "nb_theta",
+              "coef_df", "deviance", "loglik", "coef"))
   compared <- 0L
   for (name in names(rust$recs)) {
     a <- rust$recs[[name]]; b <- pr$recs[[name]]
@@ -325,6 +325,18 @@ port_gate <- function(grid_dir, rust, engine, known) {
     no_sd <- length(stddevs_of(a)) == 0 && length(stddevs_of(b)) == 0
     d_sd <- if (no_sd) NA_real_ else port_rel_max(stddevs_of(a), stddevs_of(b))
     m_sd <- gate(d_sd, no_sd)
+    no_corr <- length(corrs_of(a)) == 0 && length(corrs_of(b)) == 0
+    d_corr <- if (no_corr) NA_real_ else port_rel_max(corrs_of(a), corrs_of(b))
+    m_corr <- gate(d_corr, no_corr)
+    # sigma and nb_theta are null for the families that have none, on every
+    # port alike, so only both-null is "nothing to compare"; one-sided is a
+    # length mismatch.
+    no_sig <- is.null(a$sigma) && is.null(b$sigma)
+    d_sig <- if (no_sig) NA_real_ else port_rel_max(a$sigma, b$sigma)
+    m_sig <- gate(d_sig, no_sig)
+    no_th <- is.null(a$nb_theta) && is.null(b$nb_theta)
+    d_th <- if (no_th) NA_real_ else port_rel_max(a$nb_theta, b$nb_theta)
+    m_th <- gate(d_th, no_th)
     # coef_df like the SEs: n/a when neither side has a df (a GLMM cell records
     # every entry null), a length mismatch when only one side does.
     no_df_both <- no_df(a) && no_df(b)
@@ -341,7 +353,7 @@ port_gate <- function(grid_dir, rust, engine, known) {
     m_ll <- gate(d_ll, no_ll)
     coef_ok <- identical(a$coef_names, b$coef_names)
 
-    marks <- c(m_beta, m_se_rx, m_se_h, m_sd, m_df, m_dev, m_ll)
+    marks <- c(m_beta, m_se_rx, m_se_h, m_sd, m_corr, m_sig, m_th, m_df, m_dev, m_ll)
     failed <- any(marks %in% c("FAIL", "FAIL(len)")) || !coef_ok
     if (name %in% known) {
       # Relabel FAIL -> KNOWN for display; do NOT count toward any_fail.
@@ -349,10 +361,11 @@ port_gate <- function(grid_dir, rust, engine, known) {
     } else {
       any_fail <<- any_fail || failed
     }
-    cat(sprintf("%-34s  %s %s %s %s %s %s %s  %s\n", name,
+    cat(sprintf("%-34s  %s %s %s %s %s %s %s %s %s %s  %s\n", name,
                 cell(d_beta, marks[1]), cell(d_se_rx, marks[2]), cell(d_se_h, marks[3]),
-                cell(d_sd, marks[4]), cell(d_df, marks[5]), cell(d_dev, marks[6]),
-                cell(d_ll, marks[7]), if (coef_ok) "ok" else "MISMATCH"))
+                cell(d_sd, marks[4]), cell(d_corr, marks[5]), cell(d_sig, marks[6]),
+                cell(d_th, marks[7]), cell(d_df, marks[8]), cell(d_dev, marks[9]),
+                cell(d_ll, marks[10]), if (coef_ok) "ok" else "MISMATCH"))
   }
   # Every port run says how much of the glmm run it actually covered. A port run
   # from a different cell selection shares no cell with this one, prints an empty

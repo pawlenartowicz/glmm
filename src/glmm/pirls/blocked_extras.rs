@@ -1103,6 +1103,7 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
         m_core_buf,
         cross_theta,
     } = structured;
+    let force_dense = pattern.force_dense_schur();
     let StructuredPattern {
         cross_col,
         n_cross,
@@ -1110,11 +1111,9 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
         coup_ptr,
         coup_pos,
         structured_schur,
-        force_dense_schur,
         ..
     } = pattern;
     let structured_schur = structured_schur.as_mut();
-    let force_dense = *force_dense_schur;
     let g_cap = crate::lmm::MAX_EXTRA_GROUPINGS;
     let q = g.primary_q;
     let np = g.nested_per_parent;
@@ -1577,10 +1576,8 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                     logdet_u,
                     logdet_beta,
                     tail_inv,
-                    // Only the `#[cfg(test)]` equality oracle in the row loop
-                    // reads `rᵢ` itself; the shipped row term is formed from
-                    // `tail_g` and `tail_h`, hence the underscore.
-                    tail_r: _tail_r_buf,
+                    #[cfg(test)]
+                    tail_r,
                     tail_g,
                     tail_h,
                     fac_f64,
@@ -1588,8 +1585,6 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
                     curv_sdot,
                     ..
                 } = &mut **ex;
-                #[cfg(test)]
-                let tail_r = &mut _tail_r_buf[..];
                 let logdet_u = &mut logdet_u[..k];
                 let logdet_beta = &mut logdet_beta[..p];
                 logdet_u.fill(0.0);
@@ -2690,6 +2685,7 @@ pub(crate) fn structured_stream_deviance<T: TailKernel>(
         cross_theta,
         ..
     } = structured;
+    let force_dense = pattern.force_dense_schur();
     let StructuredPattern {
         cross_col,
         n_cross,
@@ -2697,10 +2693,8 @@ pub(crate) fn structured_stream_deviance<T: TailKernel>(
         coup_ptr,
         coup_pos,
         structured_schur,
-        force_dense_schur,
         ..
     } = pattern;
-    let force_dense = *force_dense_schur;
     let np = g.nested_per_parent;
     let qc = q + np;
     let s = g.n_primary;

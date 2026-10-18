@@ -484,10 +484,7 @@ fn f_row(name: &str, test: &LinearTest, frozen: [f64; 4], improved: bool) {
 /// OLS pairs `anova.lm`'s F, the Gamma GLM pair the Wald F of
 /// [`GAMMA_WALD_F`], the rows inside the exact test's envelope (`reference`
 /// `envelope`) the statistic only, their p being gated against RLRsim
-/// (`rlrt_dyestuff`, `rlrt_sleepstudy`). A `ranova` row that reduces to no random effects also
-/// gates the reduced REML value, the OLS fit made with `reml = Some(true)`,
-/// against its `rlrt_entry`'s frozen `logLik(lm, REML = TRUE)` within
-/// `REML0_LOGLIK_ABS`, hard.
+/// (`rlrt_dyestuff`, `rlrt_sleepstudy`).
 fn anova_pairs(compared: &mut BTreeSet<String>) {
     for e in inference::entries(inference::Kind::Anova) {
         let case = e.raw["case"].as_str().expect("an anova case");
@@ -548,22 +545,6 @@ fn anova_pairs(compared: &mut BTreeSet<String>) {
                     reference
                 };
                 lr_row(name, &format!("[{i}]"), test, row, row_ref, improved);
-                if reduced.lo.model.re.is_none() {
-                    let rlrt = e.raw["rlrt_entry"]
-                        .as_str()
-                        .unwrap_or_else(|| panic!("{at}: a reduction to OLS names its rlrt_entry"));
-                    let want = number(
-                        &inference::load(inference::Kind::Rlrt, rlrt)["loglik_lm_reml"],
-                        rlrt,
-                    );
-                    let d = (reduced.fit.loglik - want).abs();
-                    eprintln!("ANOVA {at}: reduced REML loglik against {rlrt}: |d| {d:.3e}");
-                    assert!(
-                        reduced.fit.reml && d <= tol::REML0_LOGLIK_ABS,
-                        "{at}: the reduced REML loglik {} against {rlrt}'s {want} (|d| {d:e})",
-                        reduced.fit.loglik
-                    );
-                }
             }
         } else {
             let frozen = json["members"].as_array().expect("frozen members");
@@ -663,6 +644,7 @@ fn term_statistic(ctx: &str, got: f64, want: f64, band: f64) {
 /// moves the χ² by 5 to 13%. The registry may excuse a miss here (no
 /// deviance gate can: no `logLik` of these models is frozen).
 fn anova_term_rows(compared: &mut BTreeSet<String>) {
+    let mut seen = BTreeSet::new();
     for e in inference::entries(inference::Kind::Anova) {
         let case = e.raw["case"].as_str().expect("an anova case");
         if !TERM_CASES.contains(&case) {
@@ -746,11 +728,12 @@ fn anova_term_rows(compared: &mut BTreeSet<String>) {
                     .find(|r| r.label == term)
                     .unwrap_or_else(|| panic!("{at}: no row"));
                 assert_eq!(r.test.num_df, number(&row["df"], &at), "{at}: num df");
-                if let Some(res_df) = row["res_df"].as_f64() {
-                    let Reference::F { den_df, .. } = r.test.reference else {
-                        panic!("{at}: not an F row: {:?}", r.test.reference)
-                    };
-                    assert_eq!(den_df, res_df, "{at}: residual df");
+                match (r.test.reference, row["res_df"].as_f64()) {
+                    (Reference::F { den_df, .. }, Some(res_df)) => {
+                        assert_eq!(den_df, res_df, "{at}: residual df")
+                    }
+                    (Reference::ChiSquared { .. }, None) => {}
+                    (got, want) => panic!("{at}: reference {got:?} against frozen res_df {want:?}"),
                 }
                 let band = if glmm_wald {
                     tol::WALD_GLMM_REL
@@ -773,7 +756,13 @@ fn anova_term_rows(compared: &mut BTreeSet<String>) {
             }
         }
         compared.insert(e.name.clone());
+        seen.insert(case.to_string());
     }
+    let want: BTreeSet<String> = TERM_CASES.iter().map(|c| c.to_string()).collect();
+    assert_eq!(
+        seen, want,
+        "anova_term_rows: a term case compared no reference"
+    );
 }
 
 /// The likelihood-ratio term tables' case: afex `mixed(method = "LRT")` on

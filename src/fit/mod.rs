@@ -1169,7 +1169,8 @@ pub fn fit_cold(
 ///
 /// As [`fit_cold`], plus: with `start = Some`, `start.beta.len()` outside
 /// `{0, p}`, `start.theta.len()` outside `{0, n_theta}` (the model's RE θ
-/// width), or a `start.dispersion` that is not finite and `> 0` — a malformed
+/// width), a non-finite entry in `start.beta` or `start.theta`, or a
+/// `start.dispersion` that is not finite and `> 0` — a malformed
 /// stable input faults at the entry, not deep in a kernel.
 /// Either field may be left empty to cold-start that component alone
 /// (see [`crate::StartValues`]).
@@ -1227,11 +1228,19 @@ pub fn fit_warm(
             s.beta.is_empty() || s.beta.len() == p,
             "StartValues.beta must have p elements, or be empty to cold-start β"
         );
+        assert!(
+            s.beta.iter().all(|v| v.is_finite()),
+            "StartValues.beta must be finite"
+        );
         let n_theta = theta_width(model.re.as_ref());
         assert!(
             s.theta.is_empty() || s.theta.len() == n_theta,
             "StartValues.theta must have n_theta elements for this RE structure, \
              or be empty to cold-start θ"
+        );
+        assert!(
+            s.theta.iter().all(|v| v.is_finite()),
+            "StartValues.theta must be finite"
         );
         assert!(
             s.dispersion.is_none_or(|d| d.is_finite() && d > 0.0),

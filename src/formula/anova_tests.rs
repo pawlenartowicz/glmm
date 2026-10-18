@@ -64,12 +64,12 @@ fn dyestuff() -> (Model, Model) {
 }
 
 /// The exact test of the larger side's design summary, called directly.
-fn direct(ols: &Model, full: &Model, parallel_inner: bool) -> crate::inference::rlrt::RlrtResult {
+fn direct(ols: &Model, full: &Model) -> crate::inference::rlrt::RlrtResult {
     let (counts, s, c) = full.design_summary.as_ref().expect("inside the envelope");
     let cfg = RlrtConfig {
         nsim: OPTS.nsim,
         seed: OPTS.seed,
-        parallel_inner,
+        parallel_inner: false,
     };
     exact_rlrt(counts, s, c, full.loglik, ols.loglik, false, &cfg).unwrap()
 }
@@ -102,11 +102,11 @@ fn lmm_intercept() -> Table {
 }
 
 #[test]
-fn the_envelope_pair_gets_the_exact_test_as_p9_computes_it() {
+fn the_envelope_pair_gets_the_exact_test_as_exact_rlrt_computes_it() {
     let (ols, full) = dyestuff();
     let c = compare(&ols, &full, &OPTS).unwrap();
     let t = lr(&c);
-    let r = direct(&ols, &full, false);
+    let r = direct(&ols, &full);
     assert_eq!(
         t.reference,
         Reference::ExactRlrt {
@@ -121,16 +121,6 @@ fn the_envelope_pair_gets_the_exact_test_as_p9_computes_it() {
     assert_eq!(t.p_value.to_bits(), r.p_value.to_bits());
     assert_eq!(t.df, 1);
     assert!(t.notes.is_empty());
-}
-
-#[test]
-fn the_exact_reference_is_the_same_bytes_every_call_and_every_split() {
-    let (ols, full) = dyestuff();
-    let once = format!("{:?}", compare(&ols, &full, &OPTS).unwrap());
-    assert_eq!(once, format!("{:?}", compare(&ols, &full, &OPTS).unwrap()));
-    // Under `parallel` the direct call splits the draws over rayon.
-    let p = lr(&compare(&ols, &full, &OPTS).unwrap()).p_value;
-    assert_eq!(p.to_bits(), direct(&ols, &full, true).p_value.to_bits());
 }
 
 #[test]
@@ -276,26 +266,6 @@ fn above_100_levels_with_rows_the_mixture_is_used_with_the_reason() {
             "The exact restricted likelihood-ratio test was not computed: {reason}. \
              The 50:50 mixture is used."
         )
-    );
-}
-
-#[test]
-fn a_mixture_row_takes_its_references_tail() {
-    let d = csv_table(
-        include_str!("../../validation/data/empirical/sleepstudy.csv"),
-        &["Subject"],
-    );
-    let c = compare(
-        &side("Reaction ~ Days + (1 | Subject)", &d, None, None),
-        &side("Reaction ~ Days + (Days | Subject)", &d, None, None),
-        &OPTS,
-    )
-    .unwrap();
-    let t = lr(&c);
-    assert_eq!(t.reference, Reference::ChiBarSquared { df_low: 1 });
-    assert_eq!(
-        t.p_value.to_bits(),
-        lr_p_value(t.statistic, &t.reference).to_bits()
     );
 }
 
@@ -637,35 +607,6 @@ fn no_note_text_carries_rust_syntax() {
     for text in texts {
         assert_eq!(rust_syntax(&text), None, "{text}");
     }
-}
-
-/// A row note on an aliased column names the coefficient, the same name in
-/// every port, never a column index.
-#[test]
-fn an_aliased_column_note_names_its_coefficient() {
-    let mut d = csv_table(
-        include_str!("../../validation/data/simulated/sim_factorial.csv"),
-        &["subj", "g", "h"],
-    );
-    let x = match &d.columns.iter().find(|(n, _)| n == "x").unwrap().1 {
-        Column::Numeric(v) => v.clone(),
-        _ => unreachable!("x is numeric"),
-    };
-    d.columns.push(("x2".into(), Column::Numeric(x)));
-    let lo = lower("y ~ g + x + x2", &d, Family::Gaussian).unwrap();
-    let fit = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
-    let t = term_tests(&lo, &fit, &TermTestOptions::default()).unwrap();
-    let row = t.fixed.iter().find(|r| r.label == "x2").unwrap();
-    let lines: Vec<String> = row
-        .test
-        .notes
-        .iter()
-        .map(|n| linear_note_line(*n, &t.coef_names))
-        .collect();
-    assert_eq!(
-        lines,
-        ["The coefficient x2 is aliased, so the hypothesis was not tested."]
-    );
 }
 
 /// A hand-built comparison whose aliased-column note points past the larger

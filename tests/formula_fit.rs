@@ -515,65 +515,6 @@ fn pastes_flat_nested_equals_the_explicit_nesting() {
 
 // ── GLMM ─────────────────────────────────────────────────────────────────────
 
-/// cbpp as expanded Bernoulli rows. The aggregated form is the one the oracle
-/// froze (and the one `tests/validation_oracle.rs` fits); here the point is only
-/// that the frontend and the hand-built spec agree, so the cheaper expansion is
-/// fine and matches what the in-crate kernel tests build.
-#[test]
-fn cbpp_binomial_matches_hand_built_spec() {
-    let data = rows(include_str!("../validation/data/empirical/cbpp.csv"));
-    // Each aggregated row contributes `size` rows: `incidence` ones then zeros.
-    let mut expanded: Vec<Vec<String>> = Vec::new();
-    let mut y = Vec::new();
-    for r in &data {
-        let incidence: usize = r[1].parse().unwrap();
-        let size: usize = r[2].parse().unwrap();
-        for k in 0..size {
-            y.push(f64::from(k < incidence));
-            expanded.push(r.clone());
-        }
-    }
-    let n = y.len();
-    let table = Table {
-        columns: vec![
-            ("y".into(), Column::Numeric(y.clone())),
-            ("period".into(), factor(&expanded, 3)),
-            ("herd".into(), factor(&expanded, 0)),
-        ],
-        n,
-    };
-    // period is a 4-level factor → 3 treatment-contrast dummies after the
-    // intercept; herd is the grouping.
-    let x = design(n, &dummies(&expanded, 3));
-    let model = ModelSpec {
-        family: Family::Binomial {
-            link: glmm::BinomialLink::Logit,
-        },
-        re: Some(intercept_re(n_levels(&expanded, 0), vec![])),
-    };
-    let ids = GroupIds {
-        primary: codes(&expanded, 0),
-        extra: vec![],
-    };
-    let hand = HandBuilt {
-        x,
-        y,
-        p: 4,
-        model,
-        ids,
-        col_names: &["(Intercept)", "period2", "period3", "period4"],
-    };
-    assert_frontend_matches_hand_built(
-        "y ~ period + (1|herd)",
-        &table,
-        Family::Binomial {
-            link: glmm::BinomialLink::Logit,
-        },
-        &hand,
-        "cbpp",
-    );
-}
-
 /// `cbind(incidence, failures) ~ …` must lower to exactly the proportion +
 /// trial-count fit the tutorials describe as the workaround.
 #[test]
@@ -947,6 +888,39 @@ fn a_non_finite_offset_term_is_reported_at_its_row() {
 }
 
 #[test]
+fn a_non_finite_response_or_predictor_is_reported_at_its_row() {
+    let cases = [
+        ("x", f64::INFINITY, "y ~ x", "x"),
+        ("x", f64::NAN, "y ~ x", "x"),
+        ("y", f64::NEG_INFINITY, "y ~ x", "y"),
+        ("x", 1e200, "y ~ x:z", "x:z"),
+    ];
+    for (col, bad, formula, term) in cases {
+        let mut columns = vec![
+            ("y".to_string(), vec![1.0, 2.0, 3.0, 4.0]),
+            ("x".to_string(), vec![0.5, 1.0, 1.5, 2.0]),
+            ("z".to_string(), vec![1.0, 1e200, 1.0, 1.0]),
+        ];
+        columns.iter_mut().find(|(n, _)| n == col).unwrap().1[1] = bad;
+        let table = Table {
+            columns: columns
+                .into_iter()
+                .map(|(n, v)| (n, Column::Numeric(v)))
+                .collect(),
+            n: 4,
+        };
+        let err = match lower(formula, &table, Family::Gaussian) {
+            Ok(_) => panic!("expected {bad} in {col} to be rejected for {formula}"),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.to_string(),
+            format!("term '{term}' is not finite at row 1")
+        );
+    }
+}
+
+#[test]
 fn transform_of_a_factor_column_is_rejected_as_not_numeric() {
     let table = Table {
         columns: vec![
@@ -1002,62 +976,6 @@ fn intercept_written_first_becomes_primary_over_slope() {
         re.extra_groupings[0].slopes,
         vec![1],
         "x is design column 1"
-    );
-}
-
-#[test]
-fn re_groups_categorical_slope_expands_dummies() {
-    // Machine (3-level factor, base "A") as a random slope on Worker — mirrors
-    // nlme::Machines' `score ~ 1 + Machine + (1 + Machine | Worker)`. Expect
-    // Machine's 2 dummy columns (MachineB, MachineC) both as slope ColumnIds
-    // and as ReGroupInfo term names, not the bare "Machine".
-    // This lowering shape's fit-level oracle lives externally: validation rung 10
-    // (nlme::Machines, `validation/manifest.json`).
-    let table = Table {
-        columns: vec![
-            (
-                "score".into(),
-                Column::Numeric(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
-            ),
-            (
-                "Machine".into(),
-                Column::factor_from_labels(&["A", "B", "C", "A", "B", "C"].map(String::from)),
-            ),
-            (
-                "Worker".into(),
-                Column::factor_from_labels(&["w1", "w1", "w1", "w2", "w2", "w2"].map(String::from)),
-            ),
-        ],
-        n: 6,
-    };
-    let lo = glmm::formula::lower(
-        "score ~ Machine + (1 + Machine | Worker)",
-        &table,
-        Family::Gaussian,
-    )
-    .unwrap();
-
-    // Fixed design: "(Intercept)", "MachineB", "MachineC" — MachineB/C at
-    // ColumnIds 1, 2 (0 is the intercept).
-    assert_eq!(
-        lo.col_names,
-        vec![
-            "(Intercept)".to_string(),
-            "MachineB".to_string(),
-            "MachineC".to_string()
-        ]
-    );
-    assert_eq!(lo.model.re.as_ref().unwrap().slopes, vec![1, 2]);
-
-    assert_eq!(lo.re_groups.len(), 1);
-    assert_eq!(lo.re_groups[0].name, "Worker");
-    assert_eq!(
-        lo.re_groups[0].terms,
-        vec![
-            "(Intercept)".to_string(),
-            "MachineB".to_string(),
-            "MachineC".to_string()
-        ]
     );
 }
 

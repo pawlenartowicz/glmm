@@ -96,7 +96,6 @@ The lme4 pass only fits the cells named in a file passed through `GRID_TODO`
 - `GRID_PIN_CORE` — CPU core number passed to `taskset -c`. Default: 1.
 - `GRID_STARTUP_GRACE` — seconds of no-output grace given to a fresh engine launch before the watchdog treats it as stuck. Default: `TIMEOUT + 180`.
 - `GRID_TODO` — path to a file of `case_id`s, one per line, for the lme4 pass. Required for the lme4 engine; `fit.R` falls back to `GRID_ONLY` if `GRID_TODO` is empty.
-- `LMM_NPT_FORMULA` — `fit.rs` only, and the one variable here without the `GRID_` prefix. Its value is written into `config_tag`. Default: `shipped`.
 - `GRID_TOLPWRSS` — `fit.R` only. Overrides `glmer`'s `tolPwrss` PIRLS tolerance. Default: `1e-13`.
 
 ## Pass tags and where results land

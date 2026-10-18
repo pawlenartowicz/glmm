@@ -36,9 +36,7 @@ use grid_common::fit_cell;
 use serde_json::Value;
 
 /// The band every quantity here is compared at. Mirrors `TOL$ci_ref_rel` in
-/// `validation/grid/tol.R`, `CI_REF_REL` in `r/tests/testthat/helper-pins.R`
-/// and `_CONFINT_PIN_REL` in `python/tests/test_warnings.py`: change all four
-/// together. `tol.R`
+/// `validation/grid/tol.R`: change both together. `tol.R`
 /// carries the provenance: it is the crate's cross-architecture pin band for the
 /// iterative fit paths, plus the release-versus-test build profile difference,
 /// and the measurement on CI's own runner pool is still pending.
@@ -300,6 +298,9 @@ fn fast_cells_match_the_committed_glmm_run() {
     let mut fail_cells: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut worst = 0.0f64;
     let mut worst_cell = String::new();
+    // Worst gap of each `CROSS_CPU_CELL_BANDS` cell, printed so a run on a
+    // new CPU measures the bands as well as checking them.
+    let mut banded_gaps: Vec<(&str, f64)> = Vec::new();
     for cell in &cells {
         let id = cell["cell"].as_str().expect("cell.cell");
         let Some(want) = reference.get(id) else {
@@ -331,8 +332,8 @@ fn fast_cells_match_the_committed_glmm_run() {
             fail_cells.insert(id);
             continue;
         }
-        let before = worst;
         let fails_before_cell = fails.len();
+        let mut cell_worst = 0.0f64;
         for key in GATED {
             cmp_json(
                 got.get(key).unwrap_or(&Value::Null),
@@ -340,14 +341,18 @@ fn fast_cells_match_the_committed_glmm_run() {
                 &format!("{id}.{key}"),
                 band_for(id, key),
                 &mut fails,
-                &mut worst,
+                &mut cell_worst,
             );
         }
         if fails.len() > fails_before_cell {
             fail_cells.insert(id);
         }
-        if worst > before {
+        if cell_worst > worst {
+            worst = cell_worst;
             worst_cell = id.to_string();
+        }
+        if CROSS_CPU_CELL_BANDS.iter().any(|(c, _)| *c == id) {
+            banded_gaps.push((id, cell_worst));
         }
     }
 
@@ -358,6 +363,12 @@ fn fast_cells_match_the_committed_glmm_run() {
         "{} fast cells compared; worst relative gap {worst:.2e} ({worst_cell}), band {CI_REF_REL:.0e}",
         cells.len()
     );
+    for (id, gap) in &banded_gaps {
+        println!(
+            "  banded cell {id}: worst relative gap {gap:.2e}, band {:.0e}",
+            band_for(id, "beta")
+        );
+    }
     assert!(
         fails.is_empty(),
         "{} of {} fast cells differ from the committed glmm run {run_dir}:\n{}",

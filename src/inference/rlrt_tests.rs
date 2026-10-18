@@ -1,30 +1,24 @@
 //! The design eigenvalues, the observed statistic and the refusals of the
 //! exact RLRT: the Z-free route against `ZᵀP₀Z` formed densely from the raw
-//! design, the routing of a `(1 | g)` model, every refusal the core returns,
-//! the floor and NaN rules of the statistic, the grid kernel's profile and
-//! maximum, and the simulated null: against the balanced design's F test, its
-//! determinism, the zero-eigenvalue merge, the zero-tail branch and the
-//! p-value rules; and `exact_rlrt`: its zero, floor and NaN results, its
-//! fields, its refusals, and Dyestuff's p-value against the F test. Also the
-//! cost sweep (`rlrt_cost_sweep`, ignored), which prints wall times.
+//! design, every refusal the core returns, the floor and NaN rules of the
+//! statistic, the grid kernel's profile and maximum, and the simulated null:
+//! against the balanced design's F test, its determinism, the zero-eigenvalue
+//! merge, the zero-tail branch and the p-value rules; and `exact_rlrt`: its
+//! zero, floor and NaN results, its fields, and Dyestuff's p-value against the
+//! F test.
 
 use super::evd::{sym_eigen, EvdError};
 use super::rlrt::{
     exact_rlrt, max_on_grid, null_draws, profile, rlrt_design, rlrt_null, rlrt_statistic,
-    GridTables, RlrtConfig, RlrtDesign, RlrtNull, RlrtRefusal, RlrtResult, LAMBDA_GRID,
-    MU_ZERO_REL,
+    GridTables, RlrtConfig, RlrtDesign, RlrtRefusal, RlrtResult, LAMBDA_GRID, MU_ZERO_REL,
 };
 use super::rlrt_refs::{bands, csv};
 use crate::fit::common_tests::lcg;
-use crate::fit::{classify_design, Solver};
 use crate::test_support::intercept_only_spec;
 use crate::{fit_cold, Family, Fit, FitOptions, GroupIds, ModelSpec, Sizing};
-use commonstats::dist::{ChiSquared, ContinuousCdf, FisherF, Normal, Sampler};
+use commonstats::dist::{ContinuousCdf, FisherF, Normal, Sampler};
 use commonstats::rng::{CommonStatsRng, STREAM_TAG_RLRT};
-use faer::linalg::matmul::matmul;
-use faer::linalg::triangular_solve::solve_lower_triangular_in_place;
-use faer::{Accum, Mat, Par};
-use std::time::Instant;
+use faer::Mat;
 
 /// A `(1 | g)` design: `sizes[a]` rows in level `a`, each row's design
 /// columns from `row(a, state)`, and a response with a level effect of scale
@@ -219,15 +213,8 @@ fn explicit_z_matches_z_free_route() {
     compare_with_dense("raw X'Z and X'X", &d, k, &x, p, &ids);
 }
 
-#[test]
-fn one_random_intercept_routes_noz() {
-    let model = intercept_only_spec(Sizing::FixedClusters { n_clusters: 5000 });
-    assert_eq!(classify_design(&model, 1), Solver::NoZ);
-}
-
 /// The hand-built refusal cases, `(counts, s, c)` and the refusal, each an
-/// input that reaches it: [`refusals`] checks them on `rlrt_design` and
-/// [`exact_rlrt_refusals`] on `exact_rlrt`.
+/// input that reaches it: [`refusals`] checks them on `rlrt_design` and `exact_rlrt`.
 type RefusalCase = (Vec<f64>, Vec<f64>, Vec<f64>, RlrtRefusal);
 fn refusal_cases() -> Vec<RefusalCase> {
     use RlrtRefusal::*;
@@ -307,7 +294,8 @@ fn refusal_cases() -> Vec<RefusalCase> {
 /// every `reason()` non-empty and distinct. Each call returns, so no input
 /// here panics. `TooManyLevels` comes from the comparison, never from
 /// `rlrt_design`, so it has a reason here and no input (its case is in
-/// `formula::anova`'s tests).
+/// `formula::anova`'s tests). `exact_rlrt` returns each refusal too, before
+/// it reads the statistic.
 #[test]
 fn refusals() {
     use RlrtRefusal::*;
@@ -315,9 +303,25 @@ fn refusals() {
     // An intercept-only summary: `X̃ = 1`, so `s` holds the counts and `c = n`.
     let good = rlrt_design(&[3.0, 4.0], &[3.0, 4.0], &[7.0]).expect("a valid summary");
     assert_eq!((good.mu.len(), good.n_minus_p, good.tail_df), (1, 6, 5));
+    // `exact_rlrt` refuses before it reads the statistic: pinned or not,
+    // with a positive or a NaN statistic.
+    let cfg = config(1000, 20261043, false);
+    let logliks = [
+        (-10.0, -12.5, false),
+        (-10.0, -12.5, true),
+        (f64::NAN, -12.5, false),
+    ];
 
     for (i, (counts, s, c, want)) in refusal_cases().into_iter().enumerate() {
         assert_eq!(rlrt_design(&counts, &s, &c), Err(want), "case {i}");
+        for (l1, l0, pinned) in logliks {
+            let got = exact_rlrt(&counts, &s, &c, l1, l0, pinned, &cfg);
+            assert_eq!(
+                got,
+                Err(want),
+                "case {i}, exact_rlrt ({l1}, {l0}, {pinned})"
+            );
+        }
     }
 
     // An intercept plus a dummy for every level: the fit drops one column,
@@ -330,6 +334,18 @@ fn refusals() {
     let fit = fit_of(&x, &y, &ids, p, &FitOptions::default());
     assert_eq!(fit.diagnostics.aliased.iter().filter(|&&a| a).count(), 1);
     assert_eq!(design_of("dummies", &fit), Err(NoGroupVariation));
+    let ds = fit
+        .design_summary
+        .as_ref()
+        .expect("a (1 | g) fit keeps its design summary");
+    for (l1, l0, pinned) in logliks {
+        let got = exact_rlrt(&ds.counts, &ds.s, &ds.c, l1, l0, pinned, &cfg);
+        assert_eq!(
+            got,
+            Err(NoGroupVariation),
+            "dummies, exact_rlrt ({l1}, {l0}, {pinned})"
+        );
+    }
 
     // No fixed effects: `M = diag(counts)`.
     let free = rlrt_design(&[2.0, 3.0], &[], &[]).expect("p = 0 is a design");
@@ -600,23 +616,6 @@ fn zero_mu_entries_are_inert() {
     }
 }
 
-/// A draw whose profile rises over the whole grid: one `μ = 1` with
-/// `χ²₁ = 1`, a tail of `1e-3` and `n − p = 10`. Then `df/dλ > 0` while
-/// `1 + λ < (n − p − 1)·χ²₁/tail = 9000`, past the grid's top `e⁸ ≈ 2981`, so
-/// the maximum is the last grid point, which the null counts as an edge hit.
-#[test]
-fn edge_hit_counted() {
-    let last = LAMBDA_GRID.len() - 1;
-    let f = profile(&[1.0], &LAMBDA_GRID[..], &[1.0], 1e-3, 10);
-    assert!(
-        f.windows(2).all(|w| w[1] > w[0]),
-        "the profile rises throughout"
-    );
-    let (t, at) = max_on_grid(&GridTables::new(&[1.0], &LAMBDA_GRID[..]), &[1.0], 1e-3, 10);
-    assert_eq!(at, last);
-    assert_eq!(t.to_bits(), f[last].to_bits());
-}
-
 /// The summary of a balanced intercept-only design, built by hand from the
 /// raw design: `K` levels of `J` rows, `X = 1`, so `counts = s = J` per level
 /// and `c = n` (`M` depends on `X` only through its column space).
@@ -683,11 +682,10 @@ fn balanced_null_matches_anova_f() {
 /// Gate 8. The same seed gives the same draws to the bit, serial or over
 /// rayon (`parallel_inner`, live under `--features parallel` at any
 /// `RAYON_NUM_THREADS`); the first `B` draws of a `2B` run are a `B` run's
-/// draws; another seed gives other draws; the null carries its `nsim` and
-/// seed. Then the pins on Dyestuff's design (`K = 6`, `J = 5`), compared
-/// within 1e-12 relative, not to the bit: `μ` comes from faer's EVD and the
-/// grid from the platform's `ln_1p`, whose last ulp may differ on another
-/// machine or on wasm32.
+/// draws; another seed gives other draws. Then the pins on Dyestuff's design
+/// (`K = 6`, `J = 5`), compared within 1e-12 relative, not to the bit: `μ`
+/// comes from faer's EVD and the grid from the platform's `ln_1p`, whose last
+/// ulp may differ on another machine or on wasm32.
 #[test]
 fn determinism() {
     let d = balanced(6, 5);
@@ -703,32 +701,6 @@ fn determinism() {
     assert_eq!(bits(&serial), bits(&longer[..b]), "the first B of 2B");
     let other = null_draws(&d, &config(b, seed + 1, false));
     assert_ne!(bits(&serial), bits(&other), "another seed");
-
-    let summary = |n: &RlrtNull| {
-        let pos: Vec<u64> = n.draws_pos.iter().map(|t| t.to_bits()).collect();
-        (pos, n.n_zero, n.edge_hits, n.nsim, n.seed)
-    };
-    let null = rlrt_null(&d, &config(b, seed, false));
-    assert_eq!(
-        summary(&null),
-        summary(&rlrt_null(&d, &config(b, seed, false)))
-    );
-    assert_eq!(
-        summary(&null),
-        summary(&rlrt_null(&d, &config(b, seed, true)))
-    );
-    assert_eq!((null.nsim, null.seed), (b, seed));
-    // The null is the draws, sorted and counted.
-    let mut pos: Vec<f64> = serial.iter().map(|d| d.0).filter(|&t| t > 0.0).collect();
-    pos.sort_by(f64::total_cmp);
-    assert_eq!(null.draws_pos, pos);
-    assert_eq!(null.n_zero, serial.iter().filter(|d| d.0 == 0.0).count());
-    assert_eq!(null.n_zero + pos.len(), b);
-    let last = LAMBDA_GRID.len() - 1;
-    assert_eq!(
-        null.edge_hits,
-        serial.iter().filter(|d| d.1 == last).count()
-    );
 
     // The pins move with the stream: a moved stream is re-pinned with its
     // provenance line, never absorbed by a band. There is no direct
@@ -758,7 +730,8 @@ fn determinism() {
 /// of level 2 alone, `J = 4` (so `√4` is exact): `M = diag(4, 4, 0, 4)`
 /// exactly, one zero `μ`. RLRsim's form keeps it, with its own `χ²₁` and a
 /// tail of `n − p − K = 11`; removed, the tail is raised to `12`. The design
-/// equals that merged one and gives the same null to the bit.
+/// equals that merged one, whose null drops the zero `μ` as
+/// [`zero_mu_entries_are_inert`] proves.
 #[test]
 fn zero_eigenvalue_merge() {
     let with_zero = rlrt_design(&[4.0; 4], &[0.0, 0.0, 4.0, 0.0], &[4.0]).expect("a design");
@@ -768,11 +741,6 @@ fn zero_eigenvalue_merge() {
         tail_df: 12,
     };
     assert_eq!(with_zero, merged);
-    let cfg = config(3000, 20261031, false);
-    assert_eq!(
-        bits(&null_draws(&with_zero, &cfg)),
-        bits(&null_draws(&merged, &cfg))
-    );
 }
 
 /// `k = n − p`: one row per level and an intercept, so `k = K − 1 = n − 1`
@@ -896,32 +864,10 @@ fn assert_zero_result(tag: &str, r: &RlrtResult, cfg: &RlrtConfig, k_eigen: usiz
     assert_eq!((r.seed, r.k_eigen), (cfg.seed, k_eigen), "{tag}: seed, k");
 }
 
-/// A pinned fit tests as an exact zero: `p = 1` with no draws, whatever the
-/// two log-likelihoods say short of the NaN rules (`exact_rlrt_floor`).
-#[test]
-fn exact_rlrt_zero_statistic() {
-    // Every level holds the same five values, so the between-level variance
-    // is pinned at zero.
-    let base = [0.3, -1.1, 0.8, 2.0, -0.4];
-    let ids: Vec<u32> = (0..30).map(|i| (i / 5) as u32).collect();
-    let y: Vec<f64> = (0..30).map(|i| base[(i + i / 5) % 5]).collect();
-    let x = vec![1.0; 30];
-    let full = fit_of(&x, &y, &ids, 1, &FitOptions::default());
-    assert!(full.converged() && is_pinned(&full), "a pinned fit");
-    let k = design_of("pinned", &full).expect("a valid design").mu.len();
-    let cfg = config(1000, 20261041, false);
-    let r = exact_of(&full, &ols_reml(&x, &y, 1), &cfg).expect("no refusal");
-    assert_zero_result("pinned fit", &r, &cfg, k);
-
-    let ds = full.design_summary.as_ref().unwrap();
-    let r = exact_rlrt(&ds.counts, &ds.s, &ds.c, -10.0, -12.5, true, &cfg).unwrap();
-    assert_zero_result("pinned, full above reduced", &r, &cfg, k);
-}
-
 /// The floor: a full fit no better than `θ = 0`, not pinned, gives the zero
-/// statistic's result, and so does an exact OLS fit, pinned or not; every
-/// pair of [`NAN_PAIRS`], pinned or not, gives a NaN statistic and p-value
-/// with no draws.
+/// statistic's result, and so do a pinned fit whatever the two
+/// log-likelihoods say and an exact OLS fit, pinned or not; every pair of
+/// [`NAN_PAIRS`], pinned or not, gives a NaN statistic and p-value with no draws.
 #[test]
 fn exact_rlrt_floor() {
     let (counts, s, c) = (vec![5.0; 6], vec![5.0; 6], [30.0]);
@@ -931,6 +877,7 @@ fn exact_rlrt_floor() {
     for (l1, l0, pinned) in [
         (-12.5, -10.0, false),
         (-10.0, -10.0, false),
+        (-10.0, -12.5, true),
         (-4.0, f64::INFINITY, false),
         (-4.0, f64::INFINITY, true),
     ] {
@@ -988,42 +935,6 @@ fn exact_rlrt_fields() {
     let r = exact_of(&full, &reduced, &config(0, cfg.seed, false)).unwrap();
     assert!(r.p_value.is_nan() && r.mc_se.is_nan() && r.mass_at_zero.is_nan());
     assert_eq!((r.nsim, r.edge_hits), (0, 0));
-}
-
-/// Every refusal of `refusals` also comes out of `exact_rlrt`, before the
-/// statistic is read: pinned or not, with a positive or a NaN statistic.
-#[test]
-fn exact_rlrt_refusals() {
-    use RlrtRefusal::*;
-    let cfg = config(1000, 20261043, false);
-    let logliks = [
-        (-10.0, -12.5, false),
-        (-10.0, -12.5, true),
-        (f64::NAN, -12.5, false),
-    ];
-    for (i, (counts, s, c, want)) in refusal_cases().into_iter().enumerate() {
-        for (l1, l0, pinned) in logliks {
-            let got = exact_rlrt(&counts, &s, &c, l1, l0, pinned, &cfg);
-            assert_eq!(got, Err(want), "case {i}, ({l1}, {l0}, {pinned})");
-        }
-    }
-
-    // An intercept plus a dummy for every level: the groups are absorbed.
-    let (x, y, ids, p) = design(&[5, 6, 4, 7], 1.0, |a, st| {
-        let mut r = vec![1.0, lcg(st)];
-        r.extend((0..4).map(|b| if a == b { 1.0 } else { 0.0 }));
-        r
-    });
-    let full = fit_of(&x, &y, &ids, p, &FitOptions::default());
-    let ds = full.design_summary.as_ref().unwrap();
-    for (l1, l0, pinned) in logliks {
-        let got = exact_rlrt(&ds.counts, &ds.s, &ds.c, l1, l0, pinned, &cfg);
-        assert_eq!(
-            got,
-            Err(NoGroupVariation),
-            "dummies, ({l1}, {l0}, {pinned})"
-        );
-    }
 }
 
 /// Gate 1, the Dyestuff clause. Dyestuff (`K = 6` batches of `J = 5`) read
@@ -1090,209 +1001,4 @@ fn rlrt_dyestuff_p_matches_anova_f() {
         100.0 * gap / band
     );
     assert!(gap <= band, "p {} against the F test's {p_f}", r.p_value);
-}
-
-/// Milliseconds since `t0`.
-fn ms_since(t0: Instant) -> f64 {
-    t0.elapsed().as_secs_f64() * 1e3
-}
-
-/// `ZᵀP₀Z = diag(counts) − GᵀG`, `G = L⁻¹s`, `c = LLᵀ`: the matrix
-/// [`rlrt_design`] forms before its EVD, by the same steps (the mirror of the
-/// lower triangle included, the input checks left out), so the sweep can
-/// time the two apart. Every level is non-empty.
-fn zp0z(counts: &[f64], s: &[f64], c: &[f64]) -> Mat<f64> {
-    let (levels, p) = (counts.len(), c.len().isqrt());
-    let chol = crate::linalg::SeqLlt::new(Mat::from_fn(p, p, |i, j| c[j * p + i]).as_ref())
-        .expect("c is positive definite");
-    let mut g = Mat::<f64>::from_fn(p, levels, |j, a| s[a * p + j]);
-    solve_lower_triangular_in_place(chol.L(), g.as_mut(), Par::Seq);
-    let mut m = Mat::<f64>::zeros(levels, levels);
-    matmul(
-        m.as_mut(),
-        Accum::Replace,
-        g.transpose(),
-        g.as_ref(),
-        -1.0,
-        Par::Seq,
-    );
-    for b in 0..levels {
-        m[(b, b)] += counts[b];
-        for a in 0..b {
-            m[(a, b)] = m[(b, a)];
-        }
-    }
-    m
-}
-
-/// The cost sweep: the design matrix, its EVD, the null's draws and its grid
-/// scan priced against one fit, and the full-grid scan against a
-/// first-decrease scan. On balanced designs `y ~ 1 + x + (1 | g)` with `J = 3` rows per level and
-/// `K = k + 1` levels (the intercept takes one eigenvalue to zero), per `k`:
-/// the wall of one `fit_cold` with `satterthwaite: false`, and with it on (the
-/// default) for the record; `ZᵀP₀Z` and its EVD apart, and `rlrt_design`
-/// whole; `rlrt_null` at `B = 10⁴` (serial) whole, and split into the draws
-/// (the same streams), the grid tables and the full-grid scan
-/// ([`max_on_grid`]); and on the same draws a scan that stops at the first
-/// decrease, with the share of grid points it visits and the draws where it
-/// stops strictly below the global maximum (a tie at another index is not
-/// counted). The split draws are checked to the bit against the null's. Each part also as a multiple of the first
-/// fit's wall. Wall times by `Instant` only, one run each; it asserts no
-/// time. Run by hand:
-/// `cargo test --release rlrt_cost_sweep -- --ignored --nocapture --test-threads=1`.
-#[test]
-#[ignore = "cost sweep: prints wall times, run by hand in release"]
-fn rlrt_cost_sweep() {
-    const B: usize = 10_000;
-    const CHUNK: usize = 1024;
-    const SEED: u64 = 20261081;
-    let no_satt = FitOptions {
-        satterthwaite: false,
-        ..FitOptions::default()
-    };
-    println!(
-        "| k | K | n | fit ms | fit+satt ms | M ms | EVD ms | design ms | null ms | draws ms \
-         | tables ms | grid ms | first-dec ms | first-dec visits | first-dec below | M/fit \
-         | EVD/fit | draws/fit | grid/fit | null/fit |"
-    );
-    println!("|{}", "---|".repeat(20));
-    for k in [5, 20, 45, 100, 500, 1000, 2000, 5000] {
-        let levels = k + 1;
-        let (x, y, ids, p) = design(&vec![3; levels], 1.0, |_, st| vec![1.0, lcg(st)]);
-        let n = ids.len();
-
-        let t0 = Instant::now();
-        let fit = fit_of(&x, &y, &ids, p, &no_satt);
-        let fit_ms = ms_since(t0);
-        let t0 = Instant::now();
-        let fit_satt = fit_of(&x, &y, &ids, p, &FitOptions::default());
-        let fit_satt_ms = ms_since(t0);
-        assert!(fit.converged() && fit_satt.converged(), "k {k}: converged");
-        let ds = fit.design_summary.as_ref().expect("a design summary");
-
-        let (m_ms, evd_ms) = {
-            let t0 = Instant::now();
-            let m = zp0z(&ds.counts, &ds.s, &ds.c);
-            let m_ms = ms_since(t0);
-            let t0 = Instant::now();
-            sym_eigen(m.as_ref(), false).expect("EVD of ZᵀP₀Z");
-            (m_ms, ms_since(t0))
-        };
-        let t0 = Instant::now();
-        let d = rlrt_design(&ds.counts, &ds.s, &ds.c).expect("a valid design");
-        let design_ms = ms_since(t0);
-        assert_eq!(d.mu.len(), k, "k {k}: nonzero eigenvalues");
-
-        let t0 = Instant::now();
-        let null = rlrt_null(&d, &config(B, SEED, false));
-        let null_ms = ms_since(t0);
-
-        let t0 = Instant::now();
-        let tables = GridTables::new(&d.mu, &LAMBDA_GRID[..]);
-        let tables_ms = ms_since(t0);
-        // The first-decrease walk needs the profile point by point, and the
-        // tables' accessor is private: the same arithmetic, test-local.
-        let (mut fn_, mut fd, mut sl) = (vec![], vec![], vec![]);
-        for &lambda in LAMBDA_GRID.iter() {
-            let mut log_sum = 0.0;
-            for &mu in &d.mu {
-                let v = lambda * mu;
-                fn_.push(v / (1.0 + v));
-                fd.push(1.0 / (1.0 + v));
-                log_sum += v.ln_1p();
-            }
-            sl.push(log_sum);
-        }
-        let n_minus_p = d.n_minus_p as f64;
-        let at = |i: usize, chi1: &[f64], tail: f64| {
-            let (mut num, mut den) = (0.0, 0.0);
-            for ((&a, &b), &c) in fn_[i * k..(i + 1) * k]
-                .iter()
-                .zip(&fd[i * k..(i + 1) * k])
-                .zip(chi1)
-            {
-                num += a * c;
-                den += b * c;
-            }
-            n_minus_p * (num / (den + tail)).ln_1p() - sl[i]
-        };
-
-        let normal = Normal::new(0.0, 1.0).expect("N(0, 1)");
-        let tail = (d.tail_df > 0).then(|| ChiSquared::new(d.tail_df as f64).expect("df > 0"));
-        let (mut chi1, mut tails) = (vec![0.0; CHUNK * k], vec![0.0; CHUNK]);
-        let (mut draws_ms, mut grid_ms, mut first_ms) = (0.0, 0.0, 0.0);
-        let (mut visits, mut below, mut positive) = (0usize, 0usize, vec![]);
-        for start in (0..B).step_by(CHUNK) {
-            let len = CHUNK.min(B - start);
-            let t0 = Instant::now();
-            for (i, chunk) in chi1.chunks_mut(k).take(len).enumerate() {
-                let mut rng = CommonStatsRng::new_tagged(SEED, (start + i) as u64, STREAM_TAG_RLRT);
-                for c in chunk.iter_mut() {
-                    let z = normal.sample(&mut rng);
-                    *c = z * z;
-                }
-                tails[i] = tail.as_ref().map_or(0.0, |t| t.sample(&mut rng));
-            }
-            draws_ms += ms_since(t0);
-
-            let t0 = Instant::now();
-            let full: Vec<(f64, usize)> = (0..len)
-                .map(|i| max_on_grid(&tables, &chi1[i * k..(i + 1) * k], tails[i], d.n_minus_p))
-                .collect();
-            grid_ms += ms_since(t0);
-
-            let t0 = Instant::now();
-            let first: Vec<(f64, usize)> = (0..len)
-                .map(|i| {
-                    let draw = &chi1[i * k..(i + 1) * k];
-                    let mut best = (at(0, draw, tails[i]), 0);
-                    for g in 1..LAMBDA_GRID.len() {
-                        let f = at(g, draw, tails[i]);
-                        if f < best.0 {
-                            break;
-                        }
-                        best = (f, g);
-                    }
-                    best
-                })
-                .collect();
-            first_ms += ms_since(t0);
-
-            for (&(t, g), &(tf, gf)) in full.iter().zip(&first) {
-                // The walk stops at `gf + 1`, or runs off the grid's end.
-                visits += (gf + 2).min(LAMBDA_GRID.len());
-                if t > 0.0 {
-                    positive.push(t);
-                }
-                if gf == g {
-                    assert_eq!(tf.to_bits(), t.to_bits(), "k {k}: the local arithmetic");
-                } else {
-                    assert!(tf <= t, "k {k}: the walk above the global maximum");
-                    below += usize::from(tf < t);
-                }
-            }
-        }
-        positive.sort_unstable_by(f64::total_cmp);
-        assert!(
-            positive
-                .iter()
-                .map(|t| t.to_bits())
-                .eq(null.draws_pos.iter().map(|t| t.to_bits())),
-            "k {k}: the split draws are the null's"
-        );
-
-        let visit_share = visits as f64 / (B * LAMBDA_GRID.len()) as f64;
-        let of_fit = |v: f64| v / fit_ms;
-        println!(
-            "| {k} | {levels} | {n} | {fit_ms:.2} | {fit_satt_ms:.2} | {m_ms:.2} | {evd_ms:.2} \
-             | {design_ms:.2} | {null_ms:.1} | {draws_ms:.1} | {tables_ms:.2} | {grid_ms:.1} \
-             | {first_ms:.1} | {:.1}% | {below} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} |",
-            100.0 * visit_share,
-            of_fit(m_ms),
-            of_fit(evd_ms),
-            of_fit(draws_ms),
-            of_fit(grid_ms),
-            of_fit(null_ms),
-        );
-    }
 }

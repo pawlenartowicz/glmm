@@ -366,7 +366,7 @@ fn sparse_llt_spike_logdet_and_solve() {
 /// `logdet_llt`'s supernodal arm on the spike test's fixture: same 3×3 SPD
 /// matrix, `FORCE_SUPERNODAL` symbolic — the diagonal now lives in dense
 /// supernode panels, not the simplicial CSC. Same oracle (det = 18) ⇒ the
-/// two arms agree; zeroed `l_values` (every diagonal 0) exercises the
+/// two arms agree; one zeroed diagonal (the last read) exercises the
 /// non-PD `+INFINITY` sentinel on the supernodal read.
 #[test]
 fn sparse_llt_supernodal_logdet() {
@@ -422,9 +422,31 @@ fn sparse_llt_supernodal_logdet() {
         "supernodal logdet {logdet} vs ln 18"
     );
 
-    // Non-PD sentinel: zeroed factor values ⇒ first diagonal read is 0 ⇒ +∞.
-    let zeros = vec![0.0f64; symbolic.len_val()];
-    assert_eq!(logdet_llt(&symbolic, &zeros), f64::INFINITY);
+    // Non-PD sentinel, supernodal arm: zero ONE stored diagonal, the last
+    // supernode's last column, so the healthy diagonals are read first (the
+    // simplicial arm's reasoning above). The slot is found through the same
+    // `SupernodalLltRef` view `logdet_llt` reads, not a layout formula.
+    use faer::sparse::linalg::cholesky::supernodal::SupernodalLltRef;
+    let sup = match symbolic.raw() {
+        faer::sparse::linalg::cholesky::SymbolicCholeskyRaw::Supernodal(s) => s,
+        _ => unreachable!("asserted supernodal above"),
+    };
+    let last = sup.n_supernodes() - 1;
+    let jl = SupernodalLltRef::new(sup, &l_values)
+        .supernode(last)
+        .val()
+        .ncols()
+        - 1;
+    let slot = (0..l_values.len())
+        .find(|&k| {
+            let mut z = l_values.clone();
+            z[k] = 0.0;
+            SupernodalLltRef::new(sup, &z).supernode(last).val()[(jl, jl)] == 0.0
+        })
+        .expect("the last supernode's last diagonal is a stored value");
+    let mut zeroed = l_values.clone();
+    zeroed[slot] = 0.0;
+    assert_eq!(logdet_llt(&symbolic, &zeroed), f64::INFINITY);
 }
 
 /// Explicit sparse design `Z` (`n × k_total`) in `for_each_z_entry`'s column
@@ -1571,25 +1593,32 @@ fn fit_warm_sparse_wide_crossed_matches_cold_optimum() {
 /// `start − kf` offsets are taken over a `kf` that the nested children
 /// widened. Run for both tail branches — the forced-sparse pass covers the
 /// non-diagonal-Λ crossed tail (`primary_slope_plus_crossed`) and the
-/// widened-`kf` tail through the fill-reducing factor; the e=0 topologies
-/// are unaffected by the flag (no tail exists).
+/// widened-`kf` tail through the fill-reducing factor; the forced-tail pass
+/// runs only the three topologies with a crossed tail (e > 0); at e = 0 the
+/// flag is inert.
 #[test]
 fn sparse_vs_noz_cross_check_table() {
-    run_sparse_vs_noz_cross_check_table();
+    run_sparse_vs_noz_cross_check_table(&SPARSE_VS_NOZ_CASES);
 }
 #[test]
 fn sparse_vs_noz_cross_check_table_sparse_tail() {
-    with_forced_sparse_tail(run_sparse_vs_noz_cross_check_table);
+    with_forced_sparse_tail(|| {
+        run_sparse_vs_noz_cross_check_table(&[
+            "crossed_two_intercepts",
+            "primary_slope_plus_crossed",
+            "crossed_plus_nested",
+        ])
+    });
 }
-fn run_sparse_vs_noz_cross_check_table() {
-    let cases: &[&str] = &[
-        "scalar_intercept_primary",   // (1 | g)
-        "primary_random_slope_q2",    // (1 + x | g), q_p=2 runtime gate
-        "crossed_two_intercepts",     // (1 | g1) + (1 | g2)
-        "nested_intercept",           // (1 | g1/g2)
-        "primary_slope_plus_crossed", // (1 + x | g1) + (1 | g2)
-        "crossed_plus_nested",        // (1 | g1/g2) + (1 | g3), tail offset over a widened kf
-    ];
+const SPARSE_VS_NOZ_CASES: [&str; 6] = [
+    "scalar_intercept_primary",   // (1 | g)
+    "primary_random_slope_q2",    // (1 + x | g), q_p=2 runtime gate
+    "crossed_two_intercepts",     // (1 | g1) + (1 | g2)
+    "nested_intercept",           // (1 | g1/g2)
+    "primary_slope_plus_crossed", // (1 + x | g1) + (1 | g2)
+    "crossed_plus_nested",        // (1 | g1/g2) + (1 | g3), tail offset over a widened kf
+];
+fn run_sparse_vs_noz_cross_check_table(cases: &[&str]) {
     for label in cases {
         let (xflat, y, n, p, model, ids, opts) = build_case(label);
         let noz = crate::fit_cold(&xflat, &y, n, p, &model, &ids, &opts);
@@ -2394,30 +2423,6 @@ fn fit_wide_slopes_sparse_is_pinned() {
 
 // ── Sparse non-Gaussian goldens (gamma over-width, NB over-count) ─
 
-/// Shared serde shape for the sparse gamma glmmTMB golden (goldens_agq.R's
-/// glmm schema). serde ignores unread fields (loglik, corr, …). Gated with
-/// the tests that read it — those are the only two cross-engine checks left
-/// in this file, everything else here is pinned against glmm's own values.
-#[cfg(feature = "oracle-tests")]
-#[derive(serde::Deserialize)]
-struct SgVcBlock {
-    group: String,
-    stddev: Vec<f64>,
-}
-#[cfg(feature = "oracle-tests")]
-#[derive(serde::Deserialize)]
-struct SgEst {
-    beta: Vec<f64>,
-    se_hessian: Vec<f64>,
-    varcomp: Vec<SgVcBlock>,
-    dispersion: Option<f64>,
-}
-#[cfg(feature = "oracle-tests")]
-#[derive(serde::Deserialize)]
-struct SgGolden {
-    estimates: SgEst,
-}
-
 /// Map string factor labels to dense 0-based ids (first-seen order) —
 /// the `dense_str` pattern shared by the over-cap golden tests above.
 fn dense_ids(raw: &[String]) -> Vec<u32> {
@@ -2527,234 +2532,21 @@ fn fit_sparse_gamma_shifted_x1_reaches_the_optimum() {
     assert!((f.loglik - base.loglik).abs() < 1e-6);
 }
 
-/// OVER-WIDTH gamma GLMM golden: `y ~ 1 + x1..x4 + (1|gp) + (1 + x1..x4 | ge)`,
-/// gamma/log — `ge` carries q_g = 5 > MAX_EXTRA_Q, so the design routes to the
-/// packed-row GLMM layout; no blocked or structured twin exists.
-/// Gated against frozen `glmmTMB(Gamma("log"))`
-/// (`validation/goldens/sim_sparse_gamma_tmb.json`); not lme4, which fits the
-/// Gamma scale at its `pwrss/n` plug-in and builds the log-determinant from the
-/// expected weight, a different objective. The oracle is sacred.
-///
-/// Only the Hessian arm (glmm's default) has a cross-engine reference: glmmTMB
-/// reports no Rx SE, and glmm's `φ̂·RX⁻¹` is its own quantity.
-/// Tier 2 (cross-engine): compiled only under `oracle-tests`, so its absence
-/// is visible in the test count — a runtime skip under default features would
-/// still report PASS, which is strictly worse than `#[ignore]`, a golden that
-/// asserts nothing while being counted as covered.
-/// Also ~8 min release (n=1200, 21-dim joint BOBYQA + FD-Hessian SE), so the
-/// off-by-default tier is where the cost belongs anyway.
-///
-/// Not subsumed by the corpus-driven Tier 2 cell of the same name: that one
-/// goes through the formula frontend, which orders the slope RE first and so
-/// routes the DENSE kernel (`manifest.json` `//gamma_rungs`). This builds the
-/// `ModelSpec` by hand to pin the SPARSE orientation. Different claim, both
-/// worth having.
-#[cfg(feature = "oracle-tests")]
-#[test]
-fn fit_sparse_gamma_glmm_matches_glmmtmb() {
-    let raw = include_str!("../../validation/goldens/sim_sparse_gamma_tmb.json");
-    let gold: SgGolden = serde_json::from_str(raw).expect("golden JSON parses");
-
-    let (x, y, n, p, model, ids) = sparse_gamma_design();
-    assert!(matches!(
-        crate::fit::classify_design(&model, 1),
-        crate::fit::Solver::Sparse
-    ));
-    let opts = crate::FitOptions {
-        target_indices: vec![0, 1, 2, 3, 4],
-        ..crate::FitOptions::default() // default WaldSe::Hessian (see doc)
-    };
-    let f = crate::fit_cold(&x, &y, n, p, &model, &ids, &opts);
-    assert!(f.converged(), "sparse gamma GLMM must converge");
-    // Every PIRLS solve of this fit converges inside PIRLS_MAX_ITERS, so no
-    // trial point ever exhausts it and no PirlsExhausted note is carried.
-    assert!(
-        !f.diagnostics
-            .notes
-            .iter()
-            .any(|n| matches!(n, crate::Note::PirlsExhausted { .. })),
-        "expected no PirlsExhausted note, got {:?}",
-        f.diagnostics.notes
-    );
-
-    // `validation/grid/tol.R`'s cross-engine bands, all 1e-3, kept AT the
-    // harness band so the in-crate gate and the cross-engine table cannot
-    // drift apart — except β, whose intercept is the design's least
-    // identified coefficient (t ≈ 1.2): the log-likelihood is flat enough along
-    // it that two points 5.8e-6 apart in logLik (aarch64-apple-darwin against
-    // glmmTMB) sit 1.2e-3 apart in β₀. The sharp claim is the logLik gate below.
-    const SE_REL: f64 = 1e-3;
-    const REL: f64 = 1e-3;
-    const BETA_REL: f64 = 5e-3;
-    // glmmTMB's logLik; 1e-4 is the oracle tier's DEV_EPS on the deviance, halved.
-    const REF_LOGLIK: f64 = -1769.53887862751;
-    assert!(
-        (f.loglik - REF_LOGLIK).abs() < 1e-4,
-        "loglik glmm={} glmmTMB={REF_LOGLIK}",
-        f.loglik
-    );
-    for j in 0..p {
-        let rb = gold.estimates.beta[j];
-        let rs = gold.estimates.se_hessian[j];
-        assert!(
-            (f.beta[j] - rb).abs() / rb.abs().max(1e-6) < BETA_REL,
-            "β[{j}] glmm={} glmmTMB={rb}",
-            f.beta[j]
-        );
-        assert!(
-            (f.se[j] - rs).abs() / rs.abs().max(1e-6) < SE_REL,
-            "se[{j}] glmm={} glmmTMB={rs}",
-            f.se[j]
-        );
-    }
-    // Dispersion: the ML φ̂, glmmTMB's sigma()².
-    let rd = gold
-        .estimates
-        .dispersion
-        .expect("gamma golden carries dispersion");
-    assert!(
-        (f.dispersion - rd).abs() / rd < REL,
-        "φ̂ glmm={} glmmTMB={rd}",
-        f.dispersion
-    );
-    // Varcomp via stddev_corr, on the linear-predictor scale glmmTMB's VarCorr
-    // reports. glmm order [gp (primary), ge (extra)]; map by group NAME.
-    let gold_of = |name: &str| {
-        gold.estimates
-            .varcomp
-            .iter()
-            .find(|b| b.group == name)
-            .expect("golden block")
-    };
-    let (gp_sds, _) = f.stddev_corr(0);
-    let gp_ref = gold_of("gp").stddev[0];
-    assert!(
-        (gp_sds[0] - gp_ref).abs() / gp_ref.max(1e-6) < REL,
-        "gp stddev glmm={:.6} glmmTMB={gp_ref:.6}",
-        gp_sds[0]
-    );
-    let (ge_sds, _) = f.stddev_corr(1);
-    let ge_ref = gold_of("ge");
-    for (t, &got) in ge_sds.iter().enumerate() {
-        let rf = ge_ref.stddev[t];
-        assert!(
-            (got - rf).abs() / rf.max(1e-6) < REL,
-            "ge stddev[{t}] glmm={got:.6} glmmTMB={rf:.6}"
-        );
-    }
-}
-
-/// Rung 46 (`sim_sparse_binomial_bigsd`) must reach the SPARSE solver when it
-/// is fitted the way the validation harness fits it — from the formula
-/// string, not from a hand-built `ModelSpec`.
-///
-/// This is a separate assertion from the hand-built ones above on purpose.
-/// Random-effect lowering order decides which grouping becomes primary:
-/// extracting slope random effects before intercept ones can mis-route a
-/// sparse rung to the dense kernel.
-/// Rung 46 is all-intercept, so that particular reordering cannot change the
-/// answer — seven extras stay seven extras, over `MAX_EXTRA_GROUPINGS` either
-/// way — but "cannot" is the claim this test exists to check rather than assert
-/// in prose.
-///
-/// The fixture is Bernoulli, not Poisson: a Poisson design in this large-θ̂,
-/// seven-crossed-extra regime pushes counts into the tens of thousands, and
-/// at that scale the deviance-sum rounding noise dominates the FD Hessian's
-/// step regardless of solver tuning (see the fixture's own comment block in
-/// `validation/tools/prep/gen_large_theta_data.R`, block R4). A Bernoulli response
-/// keeps the working weight bounded (`μ(1−μ) ≤ 1/4`) at any θ̂, which removes
-/// that noise floor at its source.
-///
-/// The formula string below is character-for-character the rung's `r_formula`
-/// in `validation/manifest.json`. If one changes, both change.
-#[cfg(feature = "formula")]
-#[test]
-fn sparse_binomial_bigsd_formula_routes_sparse() {
-    use crate::formula::{Column, Table};
-
-    let csv = include_str!("../../validation/data/simulated/sim_sparse_binomial_bigsd.csv");
-    // Columns: y, x, z, g1, c1..c7 (indices 0..10).
-    let rows: Vec<Vec<String>> = csv
-        .lines()
-        .skip(1)
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| {
-            l.split(',')
-                .map(|s| s.trim().trim_matches('"').to_string())
-                .collect()
-        })
-        .collect();
-    let numeric =
-        |col: usize| Column::Numeric(rows.iter().map(|r| r[col].parse().unwrap()).collect());
-    let factor = |col: usize| {
-        let labels: Vec<String> = rows.iter().map(|r| r[col].clone()).collect();
-        Column::factor_from_labels(&labels)
-    };
-    let mut columns = vec![
-        ("y".to_string(), numeric(0)),
-        ("x".to_string(), numeric(1)),
-        ("z".to_string(), numeric(2)),
-        ("g1".to_string(), factor(3)),
-    ];
-    for k in 0..7 {
-        columns.push((format!("c{}", k + 1), factor(4 + k)));
-    }
-    let table = Table {
-        n: rows.len(),
-        columns,
-    };
-
-    // The manifest's r_formula, character-for-character. Lower it the same way
-    // validation/tools/common.rs does: that harness strips the literal "1 + "
-    // intercept token before calling `lower()`, because this crate's parser
-    // treats the intercept as always-implicit and has no
-    // term for a literal `1` — `validation/tools/common.rs`'s
-    // `formula_str.replacen(" ~ 1 + ", " ~ ", 1)`. Then size the spec from the
-    // ids before classifying — the crossed-level clause reads
-    // `Crossed { n_clusters }`, and frontend placeholders carry 1.
-    let r_formula = "y ~ 1 + x + z + (1 | g1) + (1 | c1) + (1 | c2) + (1 | c3) + (1 | c4) + (1 | c5) + (1 | c6) + (1 | c7)";
-    let formula_str = r_formula.replacen(" ~ 1 + ", " ~ ", 1);
-    let lo = crate::formula::lower(
-        &formula_str,
-        &table,
-        crate::Family::Binomial {
-            link: crate::BinomialLink::Logit,
-        },
-    )
-    .unwrap();
-    let (sized, _ids, _perm) = crate::fit::spec_sized_from_ids_pub(&lo.model, &lo.ids);
-    assert!(
-        matches!(
-            crate::fit::classify_design(&sized, 1),
-            crate::fit::Solver::Sparse
-        ),
-        "rung 46 must route sparse through the formula frontend"
-    );
-    assert_eq!(
-        lo.model.re.as_ref().unwrap().extra_groupings.len(),
-        7,
-        "the sparse trigger is the extra-grouping count; if this is not 7 the \
-         route is being reached for some other reason"
-    );
-}
-
 /// Default-tier in-crate gate of `sim_sparse_gamma`'s `WaldSe::Hessian` arm —
-/// glmm's default SE method. The full cross-engine comparison exists just
-/// above (`fit_sparse_gamma_glmm_matches_glmmtmb`), but that test is
-/// `#[cfg(feature = "oracle-tests")]` and does not run under plain
+/// glmm's default SE method. The full cross-engine comparison is the corpus
+/// cell `sim_sparse_gamma_tmb` in `tests/validation_oracle.rs`
+/// (`goldens_agree_with_the_references`), but that tier does not run under plain
 /// `cargo test`; here `se_hessian` is checked against the same frozen glmmTMB
 /// values at `validation/grid/tol.R`'s 1e-3, and `stddev_se`, which no engine
 /// reports, is pinned to glmm's own values. This pin catches an FD-Hessian seeding regression class that
 /// moves `se_hessian` by −27% and `stddev_se` to NaN — a class the rest of the
 /// default tier cannot see, since this cell has no other default-tier
-/// Hessian coverage. It is self-referential (glmm's own values, not
-/// lme4's), so it needs no oracle and catches movement in `cargo test`
-/// alone. (Since 2026-09-24 `se_hessian` is the glmmTMB comparison instead:
+/// Hessian coverage. (Since 2026-09-24 `se_hessian` is the glmmTMB comparison:
 /// the ML objective made one possible.)
 ///
-/// Same design/data/`ModelSpec` construction as
-/// `fit_sparse_gamma_glmm_matches_glmmtmb` above (hand-built to force the
-/// sparse orientation — `ge` carries q_g = 5 > `MAX_EXTRA_Q`).
+/// Same design and data as the corpus cell `sim_sparse_gamma_tmb` (there
+/// lowered from its formula), built here by hand in the sparse orientation —
+/// `ge` carries q_g = 5 > `MAX_EXTRA_Q`.
 ///
 /// Values are the x86_64 anchor's (`x86_64-unknown-linux-gnu`, Intel Core
 /// Ultra 7 265H — see `fit::common_tests::assert_pinned`, "which machine the
@@ -2850,6 +2642,23 @@ fn fit_sparse_gamma_hessian_is_pinned() {
     };
     let f = crate::fit_cold(&x, &y, n, p, &model, &ids, &opts);
     assert!(f.converged(), "sparse gamma GLMM (Hessian) must converge");
+    // Every PIRLS solve of this fit converges inside PIRLS_MAX_ITERS, so no
+    // trial point exhausts it and no PirlsExhausted note is carried.
+    assert!(
+        !f.diagnostics
+            .notes
+            .iter()
+            .any(|n| matches!(n, crate::Note::PirlsExhausted { .. })),
+        "expected no PirlsExhausted note, got {:?}",
+        f.diagnostics.notes
+    );
+    // glmmTMB's logLik (`sim_sparse_gamma_tmb.json`); 1e-4 is the oracle tier's DEV_EPS halved.
+    const REF_LOGLIK: f64 = -1769.53887862751;
+    assert!(
+        (f.loglik - REF_LOGLIK).abs() < 1e-4,
+        "loglik glmm={} glmmTMB={REF_LOGLIK}",
+        f.loglik
+    );
     assert_pinned(&f.se, &REF_SE_HESSIAN, SE_REL, "se_hessian vs glmmTMB");
     assert_eq!(f.stddev_se.len(), 16);
     let (sd_slots, off): (Vec<_>, Vec<_>) = (0..16).partition(|k| STDDEV_SLOTS.contains(k));
@@ -3321,30 +3130,20 @@ fn fit_sparse_nb_glmm_is_pinned() {
 /// still exercising the same weighted code path. Closes the sparse Gamma
 /// weighting gap — the dispersion term's `ŵ = w/s` and the weighted PIRLS
 /// on `ŵᵢ/φ` both take `ws.prior_w`. Tier 2, gated behind `oracle-tests` like
-/// its unweighted sibling — same cross-engine claim. The reference is
+/// the unweighted design's corpus cell (`sim_sparse_gamma_tmb` in
+/// `validation/manifest.json`, run by `tests/validation_oracle.rs`) — same
+/// cross-engine claim. The reference is
 /// glmmTMB with the precision-weight dispersion offset (R 4.5.3, glmmTMB
-/// 1.1.14; convergence 0, `pdHess` TRUE):
-/// ```r
-///   d$w <- 1 + 0.2 * (((seq_len(nrow(d)) - 1) %% 3) - 1)
-///   f <- glmmTMB(y ~ 1 + x1 + x2 + x3 + x4 + (1|gp) + (1 + x1 + x2 + x3 + x4 | ge),
-///                family = Gamma("log"), dispformula = ~ offset(log(w)), data = d,
-///                control = glmmTMBControl(optCtrl = list(iter.max = 1e4, eval.max = 1e4)))
-///   print(fixef(f)$cond, digits = 15); print(sqrt(diag(vcov(f)$cond)), digits = 15)
-///   print(sigma(f)^2, digits = 15); print(logLik(f), digits = 15)
-/// ```
-/// output:
-/// ```text
-/// beta:    0.295912775669746  0.508461803716775 -0.347704656168806
-///          0.238633869112513 -0.226315847894931
-/// se:      0.1802913215231824 0.0856742354061799 0.0795019375880269
-///          0.0542931663260338 0.0415417443508002
-/// sigma^2: 0.484896859444173
-/// logLik:  -1772.54828929148
-/// ```
-/// β at the sibling's 5e-3 (same flat-intercept reason), SE and dispersion at
-/// `validation/grid/tol.R`'s 1e-3, plus a logLik gate at `loglik_abs_glmm` —
-/// this design is well-conditioned (no boundary), so the point checks the
-/// unweighted sibling runs still apply.
+/// 1.1.14; convergence 0, `pdHess` TRUE), from
+/// `tests/fixtures/gen_sparse_gamma_weighted_tmb.R`, registered in
+/// `validation/manifest.json`, `in_crate_references`.
+///
+/// β at 5e-3: the intercept is this design's least identified coefficient
+/// (t ≈ 1.2 unweighted), and the log-likelihood is flat enough along it that
+/// two points 5.8e-6 apart in logLik sit 1.2e-3 apart in β₀ (aarch64-apple-darwin
+/// against glmmTMB, unweighted). SE and dispersion at `validation/grid/tol.R`'s
+/// 1e-3, plus a logLik gate at `loglik_abs_glmm`, the sharp claim — this design
+/// is well-conditioned (no boundary), so the point checks still apply.
 #[cfg(feature = "oracle-tests")]
 #[test]
 fn fit_sparse_gamma_glmm_weighted_matches_glmmtmb() {
@@ -4785,27 +4584,10 @@ fn sparse_glmm_over_envelope_converges_gamma() {
 /// routes any slope-carrying extra grouping Sparse regardless of size,
 /// so this over-envelope classification is a structural property of the
 /// design, not a size accident. Weights `w_i = 1 + (i mod 3)` (0-based
-/// CSV row order), same convention as the dense Task 5 golden. Generated
-/// with (R 4.5.3, lme4 1.1-38):
-/// ```r
-/// library(lme4)
-/// set.seed(2026)
-/// n <- 400; n_g1 <- 20; n_g2 <- 15
-/// g1 <- rep(0:(n_g1 - 1), each = n / n_g1)
-/// g2 <- (seq_len(n) - 1) %% n_g2
-/// x1 <- rnorm(n); x2 <- rnorm(n)
-/// b1 <- rnorm(n_g1, sd = 1.5)
-/// b2_int <- rnorm(n_g2, sd = 1.0); b2_slope <- rnorm(n_g2, sd = 0.8)
-/// y <- 2 + 0.7 * x1 + 1.2 * x2 + b1[g1 + 1] + b2_int[g2 + 1] +
-///      b2_slope[g2 + 1] * x2 + rnorm(n, sd = 1.0)
-/// w <- 1 + (seq_len(n) - 1) %% 3
-/// d <- data.frame(y, x1, x2, g1, g2)
-/// f <- lmer(y ~ x1 + x2 + (1 | g1) + (1 + x2 | g2), data = d,
-///           weights = w, REML = TRUE)
-/// print(summary(f)$coefficients, digits = 15)
-/// print(as.data.frame(VarCorr(f)), digits = 15)
-/// print(sigma(f), digits = 15); print(REMLcrit(f), digits = 15)
-/// ```
+/// CSV row order), same convention as the dense Task 5 golden. The data and
+/// the reference come from `tests/fixtures/gen_sparse_lmm_weighted_lme4.R`
+/// (`set.seed(2026)`; frozen with R 4.5.3, lme4 1.1-38), registered in
+/// `validation/manifest.json`, `in_crate_references`.
 #[test]
 fn fit_sparse_lmm_weighted_matches_lme4() {
     const REF_B0: f64 = 2.266552572193687;
@@ -4820,7 +4602,7 @@ fn fit_sparse_lmm_weighted_matches_lme4() {
     const REF_CORR_G2: f64 = -0.28713485636041; // g2 (Intercept)~x2 corr
     const REF_REMLCRIT: f64 = 1331.89208648957;
 
-    // y,x1,x2,g1,g2 — printed by the R generator above, row order preserved.
+    // y,x1,x2,g1,g2 — printed by the generator named above, row order preserved.
     const CSV: &str = "\
 2.26569271686515,0.520589072918523,1.33689257455037,0,0
 -1.5186057959394,-1.07969076235228,0.552710403069674,0,1

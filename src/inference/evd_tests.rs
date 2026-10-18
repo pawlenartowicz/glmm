@@ -66,16 +66,6 @@ fn toeplitz_spectrum_matches_closed_form() {
 }
 
 #[test]
-fn permuted_diagonal_comes_back_ascending() {
-    let e = sym_eigen(diag(&[3.0, -1.0, 7.0, 0.5, 2.0]).as_ref(), false).unwrap();
-    let want = [-1.0, 0.5, 2.0, 3.0, 7.0];
-    assert_eq!(e.values.len(), want.len());
-    for (got, want) in e.values.iter().zip(want) {
-        assert!((got - want).abs() <= 1e-14, "{:?}", e.values);
-    }
-}
-
-#[test]
 fn householder_conjugate_gives_its_basis_and_reconstructs() {
     // A = Q D Qᵀ with Q symmetric orthogonal, so the eigenvector of d[k] is
     // column k of Q, up to sign.

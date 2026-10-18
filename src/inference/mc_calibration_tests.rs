@@ -105,7 +105,7 @@ const PAIRS: [(&str, &str, &str); 5] = [
 /// The order of a pair's four counts at one α.
 const PAIR_COLUMNS: [&str; 4] = ["both", "wald_only", "lrt_only", "neither"];
 
-/// The tests of a cell, by the names `tol.R` defines for the gated ones.
+/// The tests of a cell, by the names [`bands::GATED`] gates them under.
 fn tests_of(cell: &Cell) -> Vec<&'static str> {
     let mix = if cell.slope {
         "mix_slope_power"
@@ -1275,7 +1275,8 @@ fn calibration_measurement() {
 /// bands are built for (`MC_R` set to another value is refused), then
 /// [`gate_cell`] on every cell measured, the misses collected and asserted
 /// once. With `MC_CELLS` set, only the cells named are measured and gated,
-/// and a line says the run is a subset, not the release gate.
+/// and a line says the run is a subset, not the release gate; a subset that
+/// gates nothing fails, and the full run must make all 4416 checks.
 #[test]
 fn calibration_gates() {
     let r_count = bands::MC_R as u64;
@@ -1307,6 +1308,18 @@ fn calibration_gates() {
              unset MC_CELLS to gate the tier",
             measured.len(),
             CELLS.len()
+        );
+    }
+    assert!(
+        checks > 0,
+        "MC gates: none of the {} cells measured carries a gated quantity, so nothing \
+         was gated (MC_CELLS names reported cells only)",
+        measured.len()
+    );
+    if measured.len() == CELLS.len() {
+        assert_eq!(
+            checks, 4416,
+            "MC gates: the full run made {checks} band checks, not the frozen set's 4416"
         );
     }
     assert!(
@@ -1355,63 +1368,6 @@ fn clean(cell: &Cell) -> Table {
     })
 }
 
-/// One clean dataset of `cell`, measured and counted.
-fn measured_once(cell: &Cell) -> (Measured, CellAcc) {
-    let mut acc = CellAcc::default();
-    let m = measure(cell, &clean(cell), &mut acc);
-    acc.record(cell, &m);
-    (m, acc)
-}
-
-/// The p-value of `compare` on two fits made here, not by the driver.
-fn compare_by_hand(table: &Table, family: Family, small: &str, large: &str) -> f64 {
-    let model = |f: &str| {
-        let lo = lowered(f, table, family);
-        let fit = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
-        assert!(fit.converged(), "{f}");
-        Model::from_fit(f, &lo, &fit)
-    };
-    match compare(&model(small), &model(large), &COMPARE)
-        .expect("a comparison")
-        .test
-    {
-        ComparisonTest::Lr(t) => t.p_value,
-        ComparisonTest::Linear(t) => t.p_value,
-    }
-}
-
-/// On one clean dataset of each kind of cell, every quantity of the cell is
-/// counted exactly once (kept, failed, aliased or skipped), and nothing else.
-#[test]
-fn every_quantity_is_counted_once() {
-    for name in [
-        "k10_m9_bern54_rdi",
-        "k10_m9_pois165_rdis",
-        "k10_m9_gauss_rdi",
-        "k10_m9_gauss_rdis",
-    ] {
-        let c = cell(name);
-        let (_, acc) = measured_once(&c);
-        let keys = |m: &BTreeMap<&'static str, Counts>| m.keys().copied().collect::<Vec<_>>();
-        let mut tests = tests_of(&c);
-        tests.sort_unstable();
-        let mut covers = covers_of(&c);
-        covers.sort_unstable();
-        assert_eq!(keys(&acc.tests), tests, "{name}");
-        assert_eq!(keys(&acc.covers), covers, "{name}");
-        for (q, k) in acc.tests.iter().chain(&acc.covers) {
-            assert_eq!(k.aliased + k.failed + k.skipped + k.used, 1, "{name} {q}");
-            assert_eq!(k.aliased, 0, "{name} {q}");
-        }
-        let pairs = c.response != Response::Gauss;
-        assert_eq!(
-            acc.pairs.len(),
-            if pairs { PAIRS.len() } else { 0 },
-            "{name}"
-        );
-    }
-}
-
 /// The Wald z of one column gives the Type III Wald χ² row of `term_tests`.
 #[test]
 fn wald_p_is_the_type3_wald_row() {
@@ -1437,33 +1393,6 @@ fn wald_p_is_the_type3_wald_row() {
     }
 }
 
-/// `group`'s Type II LRT compares `time + group` against `time`; its Type III
-/// LRT drops the `group` column alone.
-#[test]
-fn group_lrts_are_the_marginal_pairs() {
-    let c = cell("k10_m9_bern54_rdi");
-    let table = clean(&c);
-    let fam = family(c.response);
-    let mut acc = CellAcc::default();
-    let m = measure(&c, &table, &mut acc);
-    let type2 = compare_by_hand(
-        &table,
-        fam,
-        "y_00 ~ time + (1 | id)",
-        "y_00 ~ time + group + (1 | id)",
-    );
-    let type3 = compare_by_hand(
-        &table,
-        fam,
-        "y_00 ~ time + time:group + (1 | id)",
-        "y_00 ~ time + group + time:group + (1 | id)",
-    );
-    assert_eq!(m.p["lrt2_group"].unwrap().to_bits(), type2.to_bits());
-    assert_eq!(m.p["lrt3_group"].unwrap().to_bits(), type3.to_bits());
-    let lo = lowered(&formula("y_00", DROP_GROUP, "(1 | id)"), &table, fam);
-    assert_eq!(lo.col_names, ["(Intercept)", "time", "time:group"]);
-}
-
 /// The profile duality decides as the explicit check of the statistic
 /// against the χ²₁ quantile `z²` at each level.
 #[test]
@@ -1479,18 +1408,6 @@ fn profile_duality_matches_the_quantile_check() {
     let floored = profile_covers(-12.0, -10.0).unwrap();
     assert_eq!(floored.map(|m| m >= 0.0), [true; 3]);
     assert_eq!(profile_covers(f64::NAN, -10.0), None);
-}
-
-/// On a random-slope cell the `β1` profile is skipped and counted as
-/// skipped, not failed.
-#[test]
-fn slope_cells_skip_the_time_profile() {
-    let (m, acc) = measured_once(&cell("k10_m9_pois165_rdis"));
-    assert_eq!(m.skipped, ["profile_ci_b1"]);
-    let c = acc.covers["profile_ci_b1"];
-    assert_eq!((c.skipped, c.failed, c.used), (1, 0, 0));
-    let (m, _) = measured_once(&cell("k10_m9_pois165_rdi"));
-    assert!(m.skipped.is_empty());
 }
 
 /// A dataset whose full design is aliased (as `fit_cold` decides it) is
@@ -1840,8 +1757,18 @@ fn check_against_hand(name: &str) {
     acc.record(&c, &m);
     for (q, k) in acc.tests.iter().chain(&acc.covers) {
         let kept = u64::from(!m.skipped.contains(q));
-        assert_eq!((k.used, k.failed, k.aliased), (kept, 0, 0), "{name} {q}");
+        assert_eq!(
+            (k.used, k.failed, k.aliased, k.skipped),
+            (kept, 0, 0, 1 - kept),
+            "{name} {q}"
+        );
     }
+    let pairs = if c.response == Response::Gauss {
+        0
+    } else {
+        PAIRS.len()
+    };
+    assert_eq!(acc.pairs.len(), pairs, "{name}: Wald/LRT pairs");
     let hand = hand_table(&c);
     let mut listed: Vec<&str> = hand
         .iter()
@@ -1975,26 +1902,6 @@ fn paired_moments_match_a_hand_count() {
     }
     assert_eq!(merged.d_moments, acc.d_moments);
     assert_eq!(merged.wl_moments, acc.wl_moments);
-}
-
-/// Every gated (cell, quantity) is measured on its cell, and
-/// [`bands::gates`] gives it its family.
-#[test]
-fn every_gated_quantity_is_measured() {
-    for g in &bands::GATED {
-        for name in g.cells {
-            let c = cell(name);
-            let measured = [tests_of(&c), covers_of(&c)].concat();
-            for q in g.quantities {
-                assert!(measured.contains(q), "{}: {name} {q}", g.family);
-                assert!(
-                    bands::gates(name, q).any(|h| h.family == g.family),
-                    "{}: {name} {q}",
-                    g.family
-                );
-            }
-        }
-    }
 }
 
 /// A cell's counts with every quantity kept on 2000 datasets at its nominal

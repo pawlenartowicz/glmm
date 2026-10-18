@@ -37,7 +37,10 @@ use crate::{BinomialLink, GammaLink, InverseGaussianLink, NegBinomialLink, Poiss
 /// only for direct callers.
 pub fn family_from_str(family: &str, link: &str) -> Result<Family, String> {
     match family {
-        "gaussian" => Ok(Family::Gaussian),
+        "gaussian" => match link {
+            "identity" => Ok(Family::Gaussian),
+            other => Err(format!("unsupported gaussian link {other:?}")),
+        },
         "binomial" => match link {
             "logit" => Ok(Family::Binomial {
                 link: BinomialLink::Logit,
@@ -740,6 +743,11 @@ pub fn run_fit(
                 n_theta
             ));
         }
+        for (name, values) in [("beta", beta), ("theta", theta)] {
+            if let Some(v) = values.iter().find(|v| !v.is_finite()) {
+                return Err(format!("warm-start {name} must be finite numbers, got {v}"));
+            }
+        }
     }
     let start = warm_start.map(|(beta, theta, dispersion)| StartValues {
         beta,
@@ -1235,7 +1243,7 @@ fn flatten(prepared: Prepared, fit: Fit, anova_test: TermTest) -> Result<FitResu
 /// vector) as `(coef_p, df_method)`; see [`FitResult::df_method`]. The label
 /// keys on the fit's df record, not on its notes: a failed pass is the
 /// `NoDfReason::Failed` record.
-pub(crate) fn t_tests(fit: &Fit, targets: &[u32]) -> (Vec<f64>, &'static str) {
+fn t_tests(fit: &Fit, targets: &[u32]) -> (Vec<f64>, &'static str) {
     let p = fit.beta.len();
     let mut coef_p = vec![f64::NAN; p];
     let df_method = match fit.df_state() {
@@ -1457,29 +1465,8 @@ mod tests {
         }
         let err = family_from_str("inversegaussian", "identity").unwrap_err();
         assert!(err.contains("unsupported inversegaussian link"), "{err}");
-    }
-
-    #[test]
-    fn pirls_exhausted_payload_survives_flattening() {
-        // No known dataset reaches `final_eval == true` end-to-end, so the
-        // ports' message branch is asserted from constructed notes; this pins
-        // the payload they branch on.
-        let notes = note_infos(vec![
-            Note::PirlsExhausted {
-                evals: 3,
-                final_eval: false,
-            },
-            Note::PirlsExhausted {
-                evals: 0,
-                final_eval: true,
-            },
-        ]);
-        assert_eq!(notes[0].kind, "pirls_exhausted");
-        assert_eq!(notes[0].evals, 3);
-        assert!(!notes[0].final_eval);
-        assert_eq!(notes[1].kind, "pirls_exhausted");
-        assert_eq!(notes[1].evals, 0);
-        assert!(notes[1].final_eval);
+        let err = family_from_str("gaussian", "log").unwrap_err();
+        assert!(err.contains("unsupported gaussian link"), "{err}");
     }
 
     #[test]
@@ -1491,6 +1478,16 @@ mod tests {
             Note::HessianSeFallback,
             Note::NbShapeUnsettled { rounds: 25 },
             Note::ExactProfileFallback,
+            // No known dataset reaches `final_eval == true` end to end, so the
+            // ports' message branch is pinned from constructed notes.
+            Note::PirlsExhausted {
+                evals: 3,
+                final_eval: false,
+            },
+            Note::PirlsExhausted {
+                evals: 0,
+                final_eval: true,
+            },
         ]);
         assert_eq!(notes[0].kind, "single_level_grouping_dropped");
         assert_eq!(notes[0].detail, "Subject");
@@ -1500,6 +1497,10 @@ mod tests {
         assert_eq!(notes[2].evals, 25);
         assert_eq!(notes[3].kind, "exact_profile_fallback");
         assert_eq!(notes[3].detail, "");
+        assert_eq!(notes[4].kind, "pirls_exhausted");
+        assert_eq!((notes[4].evals, notes[4].final_eval), (3, false));
+        assert_eq!(notes[5].kind, "pirls_exhausted");
+        assert_eq!((notes[5].evals, notes[5].final_eval), (0, true));
     }
 
     /// A factor column in the `(levels, codes)` form `run_fit` takes, with the
@@ -1526,30 +1527,6 @@ mod tests {
         numeric.insert("y".to_string(), y);
         numeric.insert("x".to_string(), x);
         (numeric, HashMap::new())
-    }
-
-    #[test]
-    fn gaussian_ols_end_to_end() {
-        let (numeric, factor) = toy_ols();
-        let result = run_fit(
-            "y ~ x", numeric, factor, "gaussian", "identity", "hessian", 1, None, None, None, None,
-            true, None, "Wald",
-        )
-        .expect("fit should succeed");
-        assert_eq!(
-            result.names,
-            vec!["(Intercept)".to_string(), "x".to_string()]
-        );
-        assert_eq!(result.beta.len(), 2);
-        assert!(result.converged);
-        // Closed-form OLS slope for this fixture: Sxy/Sxx with x̄=4.5, ȳ=5.53
-        // gives 83.55/82.5 = 1.0127272727272727; the fit matches it to
-        // machine precision (measured gap ~7e-16).
-        assert!(
-            (result.beta[1] - 1.0127272727272727).abs() < 1e-9,
-            "slope = {}",
-            result.beta[1]
-        );
     }
 
     #[test]
@@ -1584,7 +1561,10 @@ mod tests {
             "Wald",
         )
         .unwrap_err();
-        assert!(err.contains("use one"), "{err}");
+        assert_eq!(
+            err,
+            "offset given both as an offset() formula term and as the offset= argument; use one"
+        );
     }
 
     #[test]
@@ -1611,7 +1591,10 @@ mod tests {
             "Wald",
         )
         .unwrap_err();
-        assert!(err.contains("use one"), "{err}");
+        assert_eq!(
+            err,
+            "weights given both as a cbind() response and as the weights= argument; use one"
+        );
     }
 
     #[test]
@@ -1976,6 +1959,11 @@ mod tests {
         }
         // A held φ keeps z, as `summary.glm(dispersion = v)` does.
         let held = fit_with("y ~ x", toy_gamma(), "gamma", "log", Some(2.5), true);
+        assert!(held.converged);
+        assert_eq!(
+            held.dispersion, 2.5,
+            "dispersion: Some(v) holds phi at v, not estimated"
+        );
         assert_eq!(held.df_method, "none");
         assert!(held.coef_df.iter().chain(&held.coef_p).all(|v| v.is_nan()));
         let glmm = fit_with(
@@ -2033,6 +2021,9 @@ mod tests {
         let close = |a: f64, b: f64| (a - b).abs() <= 1e-12 * b.abs().max(1.0);
 
         let r = fit_with("y ~ x", toy_ols(), "gaussian", "identity", None, true);
+        assert_eq!(r.names, vec!["(Intercept)".to_string(), "x".to_string()]);
+        assert!(r.converged);
+        assert!(close(r.beta[1], sxy / sxx), "slope {}", r.beta[1]);
         let r2 = sxy * sxy / (sxx * syy);
         assert!(close(r.r_squared, r2), "{} vs {r2}", r.r_squared);
         let adj = 1.0 - (1.0 - r2) * (n - 1.0) / (n - 2.0);
@@ -2079,6 +2070,8 @@ mod tests {
             same_fixed_part("y ~ a * b + (1 | g)", "y ~ b:a + b + a"),
             Ok(true)
         );
+        // The response and the offset are not read.
+        assert_eq!(same_fixed_part("y ~ x + offset(z)", "w ~ x"), Ok(true));
         assert_eq!(same_fixed_part("y ~ x", "y ~ 0 + x"), Ok(false));
         let err = same_fixed_part("y ~ x", "y ~ x - z").unwrap_err();
         assert!(err.contains("\"y ~ x - z\""), "{err}");
@@ -2133,36 +2126,6 @@ mod tests {
         (numeric, HashMap::new())
     }
 
-    /// `dispersion: Some(v)` must hold φ fixed at exactly `v` instead of
-    /// estimating it — the only way `FitOptions::dispersion`
-    /// reaches the kernel from a port is through this string/option layer.
-    #[test]
-    fn gamma_end_to_end_holds_dispersion_fixed() {
-        let (numeric, factor) = toy_gamma();
-        let result = run_fit(
-            "y ~ x",
-            numeric,
-            factor,
-            "gamma",
-            "log",
-            "hessian",
-            1,
-            Some(2.5),
-            None,
-            None,
-            None,
-            true,
-            None,
-            "Wald",
-        )
-        .expect("gamma fit should converge");
-        assert!(result.converged);
-        assert_eq!(
-            result.dispersion, 2.5,
-            "dispersion: Some(v) must hold phi fixed at v, not estimate it"
-        );
-    }
-
     /// The committed `cbpp` herd dataset (`validation/data/empirical/cbpp.csv`)
     /// through `run_fit`'s `cbind()` aggregated-binomial path: `incidence`
     /// successes out of `size` trials per herd/period. `healthy = size −
@@ -2201,7 +2164,7 @@ mod tests {
     /// `wald_se="rx"` is the only route by which the Python/R ports select
     /// `WaldSe::Rx`; a bad string→enum hand-off (or a no-op enum arm) would
     /// leave `se` identical to the `"hessian"` default and pass silently.
-    /// Same herd/period random-intercept model `fit_grouped_honors_opts_wald_se`
+    /// Same herd/period random-intercept model `fit_glmm_cbpp_hessian_rx_agree_on_fitted`
     /// (`fit/glmm_tests.rs`) checks at the kernel-struct layer — this is the
     /// string-typed orchestration layer above it.
     #[test]
@@ -2850,43 +2813,6 @@ mod tests {
         }
     }
 
-    /// The OLS side of a random-part-only pair is the OLS fit made with
-    /// `reml = true`: its log-likelihood is the REML value.
-    #[test]
-    fn run_compare_fits_the_ols_side_by_reml() {
-        let (f0, f1) = ("y ~ g * h + x", "y ~ g * h + x + (1 | subj)");
-        let (numeric, factor) = sim("sim_factorial");
-        let got = run_compare(
-            f0, f1, numeric, factor, "gaussian", "identity", 1, None, None, None, None,
-        )
-        .expect("compares");
-        let ols = run(
-            f0,
-            sim("sim_factorial"),
-            "gaussian",
-            "identity",
-            1,
-            None,
-            Some(true),
-        );
-        assert!(got.fit0.reml);
-        assert_eq!(got.fit0.loglik.to_bits(), ols.loglik.to_bits());
-        assert_ne!(
-            got.fit0.loglik.to_bits(),
-            run(
-                f0,
-                sim("sim_factorial"),
-                "gaussian",
-                "identity",
-                1,
-                None,
-                None
-            )
-            .loglik
-            .to_bits()
-        );
-    }
-
     /// The formulas swapped give the same test; the fits follow the
     /// formulas as given.
     #[test]
@@ -3284,48 +3210,6 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, CompareError::SameParts.to_string());
-    }
-
-    /// The early refusal of two equal parts is the comparison's own refusal
-    /// of two fits of one formula, word for word.
-    #[test]
-    fn run_compare_refuses_equal_parts_in_the_words_of_compare() {
-        let (numeric, factor) = sim("sim_factorial");
-        let data = table_of(numeric.clone(), factor.clone()).expect("a table");
-        let f = "y ~ g + (1 | subj)";
-        let prepared = lower_with(
-            f,
-            &data,
-            Family::Gaussian,
-            "hessian",
-            1,
-            None,
-            None,
-            None,
-            true,
-            Some(false),
-        )
-        .expect("lowers");
-        let fit = fit_lowered(&prepared.lowered, None).expect("fits");
-        let m = Model::from_fit(f, &prepared.lowered, &fit);
-        let opts = compare_options(None, None).expect("the defaults");
-        let refused = compare(&m, &m, &opts).unwrap_err();
-        assert_eq!(refused, CompareError::SameParts);
-        let err = run_compare(
-            f,
-            "y ~ (1 | subj) + g",
-            numeric,
-            factor,
-            "gaussian",
-            "identity",
-            1,
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap_err();
-        assert_eq!(err, refused.to_string());
     }
 
     /// Two formulas that differ only by an `offset()` term have the same

@@ -403,11 +403,9 @@ fn mode_solve_f64(
     if extras {
         // Keep the mode solve off the cached sparse factor — see
         // `laplace_gradient`'s structured mode solve (`derivative.rs`) for
-        // why, and why `pattern.structured_schur`/`force_dense_schur` are
-        // taken out and restored around this one f64 call.
+        // why, and why `pattern.structured_schur` is taken out and restored
+        // around this one f64 call.
         let saved_schur = pattern.structured_schur.take();
-        let saved_force_dense = pattern.force_dense_schur;
-        pattern.force_dense_schur = false;
         let (dev, _pen_dev, conv, _raw_finite) = structured_laplace_deviance::<f64>(
             family,
             nb_theta,
@@ -433,7 +431,6 @@ fn mode_solve_f64(
             &mut mode_counters,
         );
         pattern.structured_schur = saved_schur;
-        pattern.force_dense_schur = saved_force_dense;
         conv && dev.is_finite()
     } else {
         let (dev, _pen_dev, conv, _raw_finite) = blocked_laplace_deviance::<f64>(
@@ -843,6 +840,7 @@ pub(crate) fn gradient_at_mode(
         m_core_buf,
         cross_theta,
     } = structured;
+    let force_dense = pattern.force_dense_schur();
     let StructuredPattern {
         cross_col,
         n_cross,
@@ -850,12 +848,11 @@ pub(crate) fn gradient_at_mode(
         coup_ptr,
         coup_pos,
         structured_schur,
-        force_dense_schur,
         ..
     } = pattern;
     // The factor the value pass used: the sparse one exactly when the
     // structured solve took it (`Some(ss) if !force_dense`, blocked_extras.rs).
-    let mut ss = if extras && e > 0 && !*force_dense_schur {
+    let mut ss = if extras && e > 0 && !force_dense {
         structured_schur.as_mut()
     } else {
         None
@@ -1120,7 +1117,7 @@ pub(crate) fn joint_hessian_columns(
     // every cluster, the solve and the assembly stream their row values block
     // by block while the cluster- and pair-level accumulators stay whole (the
     // streamed pass). Below one block, the whole-data pass runs unchanged.
-    let block_rows = ws.fd.se_row_block;
+    let block_rows = ws.fd.se_row_block();
     let coup_pairs = super::derivative::dual_coupling_pairs(&ws.pattern, s);
     let row_blocked = ws.layout == GlmmLayout::Blocked && !extras && n > block_rows;
     let streamed = ws.layout == GlmmLayout::Structured && extras && n > block_rows;
@@ -1328,8 +1325,7 @@ pub(crate) fn joint_hessian_columns(
 /// the binomial and Gamma blocked series from 30k to 3M rows, and 4096 is the
 /// fastest or within noise of it on each. The gain is cache residency and the
 /// first-touch page faults the block-sized scratch no longer takes, not less
-/// work: user instructions move by under 2%. Evidence: pawel
-/// `~/.cache/claude-scratch/mmjl-rethink/b3/` and `.../a-impl/`.
+/// work: user instructions move by under 2%.
 ///
 /// A pinned constant, the same on every target, so a fit splits its rows the
 /// same way, and its Hessian moves by the same round-off, on every host and

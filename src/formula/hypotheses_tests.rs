@@ -174,6 +174,11 @@ fn type3_matches_lmertest_hypotheses() {
         let json = test_refs::load(Kind::Lmertest, &e.name);
         let lo = lowered(&e);
         let kept = retained(&lo, &json, &e.name);
+        if e.name == "lmertest_anova_sim_factorial_empty" {
+            // No gc:hq cell: lme4 drops that column, so the exact-zero check
+            // of `assert_hypotheses` covers the scatter onto an aliased column.
+            assert_eq!((lo.p, kept.len()), (7, 6), "{}: one aliased column", e.name);
+        }
         let got = type3(&lo, &kept);
         assert_hypotheses(
             &e.name,
@@ -262,35 +267,6 @@ fn nonmarginal_terms_contain_nothing() {
             }
         }
     }
-}
-
-/// `sim_factorial_empty` has no `gc:hq` cell, so lme4 drops that column:
-/// lmerTest's matrices live on the six retained columns, and `type3` puts
-/// them in the seven-column caller layout with zeros on `gc:hq`.
-#[test]
-fn type3_rank_deficient_scatters_zeros() {
-    let e = anova_entries()
-        .into_iter()
-        .find(|e| e.name == "lmertest_anova_sim_factorial_empty")
-        .unwrap();
-    let json = test_refs::load(Kind::Lmertest, &e.name);
-    let lo = lowered(&e);
-    let kept = retained(&lo, &json, &e.name);
-    let aliased = lo.col_names.iter().position(|c| c == "gc:hq").unwrap();
-    assert_eq!((lo.p, kept.len()), (7, 6));
-    assert!(!kept.contains(&aliased));
-    let got = type3(&lo, &kept);
-    assert_hypotheses(
-        &e.name,
-        "type3",
-        &got,
-        &json["type3"]["hypotheses"],
-        &kept,
-        lo.p,
-    );
-    assert!(got
-        .iter()
-        .all(|h| h.l.col(aliased).iter().all(|&v| v == 0.0)));
 }
 
 /// car's GLM and GLMM entries on `sim_factorial_bern`, whose `g`, `h` and

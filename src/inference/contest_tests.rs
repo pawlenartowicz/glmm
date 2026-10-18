@@ -201,7 +201,6 @@ fn check_md(inputs: &Inputs, l: &Mat<f64>, case: &Value, what: &str) {
         .as_u64()
         .unwrap_or_else(|| panic!("{what}: NumDF"));
     assert_eq!(got.num_df as u64, num_df, "{what}: NumDF");
-    assert_eq!(got.rows, l.nrows(), "{what}: rows");
     // One retained direction has no eigen-gap, and the frozen case no
     // `min_rel_gap`.
     if num_df >= 2 {

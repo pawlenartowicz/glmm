@@ -1,9 +1,9 @@
 # Using `glmm` from Rust
 
-One page, four sections. The first three add complexity in layers — cold fit,
-warm fit, advanced hot loop — each building on the last. The fourth is a
-shorter, self-contained note on skipping the hand-built inputs via a formula
-string.
+One page: a quick start, then four sections. The first three add complexity in
+layers — cold fit, warm fit, advanced hot loop — each building on the last. The
+fourth is a shorter, self-contained note on skipping the hand-built inputs via a
+formula string.
 
 (This page covers the Rust crate only — for the Python port, see
 [`tutorial-python.md`](tutorial-python.md); for the R port,
@@ -11,6 +11,50 @@ string.
 
 All inputs use **row-major** `f64` for the design matrix: `x[i * p + j]` is
 row `i`, column `j`.
+
+## Quick start
+
+```bash
+cargo add glmm
+```
+
+```rust
+use glmm::formula::{lower, Column, Table};
+use glmm::{fit_cold, BinomialLink, Family};
+
+let table = Table {
+    columns: vec![
+        ("y".into(), Column::Numeric(y)),
+        ("passed".into(), Column::Numeric(passed)),
+        ("x1".into(), Column::Numeric(x1)),
+        ("x2".into(), Column::Numeric(x2)),
+        ("subject".into(), Column::factor_from_labels(&subject)),
+        ("school".into(), Column::factor_from_labels(&school)),
+    ],
+    n,
+};
+
+// OLS: fixed effects only
+let lo = lower("y ~ x1 * x2", &table, Family::Gaussian)?;
+let ols = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+
+// LMM: correlated random intercept and slope (REML)
+let lo = lower("y ~ x1 + (1 + x1 | subject)", &table, Family::Gaussian)?;
+let lmm = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+
+// GLMM: binomial with a probit link, 7-node adaptive quadrature
+let probit = Family::Binomial { link: BinomialLink::Probit };
+let lo = lower("passed ~ x1 + (1 | school)", &table, probit)?;
+let mut opts = lo.opts.clone();
+opts.nagq = 7;
+let glmm = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &opts);
+
+println!("{:?} {:?}", glmm.beta, glmm.se);           // estimates and standard errors
+println!("{} {}", glmm.converged(), glmm.singular()); // result flags
+```
+
+The sections below build the same inputs by hand, add warm starts, and show
+the advanced hot-loop surface.
 
 ## 1. Cold fit — one call, one answer
 

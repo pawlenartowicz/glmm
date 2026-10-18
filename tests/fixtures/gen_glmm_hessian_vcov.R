@@ -1,9 +1,15 @@
 #!/usr/bin/env Rscript
 # Generator for glmm_hessian_vcov.json -- the n=96 / 12-cluster `y ~ x1 + (1|grp)`
 # glmer fixture behind `joint_hessian_cov_matches_glmer_use_hessian_true` (and the
-# pipeline test that cites its band). Reads the committed JSON's data block
-# (x / y / cluster_ids are the fixture's identity and never change), refits, and
-# rewrites the derived fields: theta, beta, vcov_hessian, vcov_rx.
+# pipeline test that cites its band). Rebuilds the data block (x / y / cluster_ids)
+# from its seed, stops unless it equals the committed one (the data are the
+# fixture's identity and never change), refits, and rewrites the derived fields:
+# theta, beta, vcov_hessian, vcov_rx.
+#
+# The data recipe is set.seed(2137), 12 clusters x 8 rows,
+# eta = -0.4 + 0.5 * x1 + u (u normal with variance 0.3, one per cluster), y ~ Bernoulli(plogis(eta)).
+# x1 is stored as jsonlite writes it at digits = 12, so it is rounded the same way
+# here before the comparison and the fit.
 #
 # tolPwrss = 1e-13, matching validation/tools/goldens_agq.R (change together): at glmer's
 # default 1e-7 the ldL2 term uses working weights one PIRLS iteration behind the
@@ -19,11 +25,18 @@ suppressMessages({ library(lme4); library(jsonlite) })
 path <- file.path("tests", "fixtures", "glmm_hessian_vcov.json")
 fx <- fromJSON(path, simplifyVector = TRUE, simplifyMatrix = TRUE)
 
-df <- data.frame(
-  y = as.numeric(fx$y),
-  x1 = fx$x[, 2],                      # x column 1 is the intercept
-  grp = factor(fx$cluster_ids)
-)
+set.seed(2137)
+n_grp <- 12; per <- 8; n <- n_grp * per
+grp <- rep(seq_len(n_grp), each = per)
+x1  <- rnorm(n)
+eta <- -0.4 + 0.5 * x1 + rnorm(n_grp, sd = sqrt(0.3))[grp]
+y   <- rbinom(n, 1, plogis(eta))
+x1  <- fromJSON(toJSON(x1, digits = 12))
+stopifnot(fx$n == n, identical(fx$x[, 1], rep(1, n)), identical(fx$x[, 2], x1),
+          identical(as.numeric(fx$y), as.numeric(y)),
+          identical(as.numeric(fx$cluster_ids), as.numeric(grp - 1L)))
+
+df <- data.frame(y = y, x1 = x1, grp = factor(grp))
 
 m <- glmer(y ~ x1 + (1 | grp), data = df, family = binomial(), nAGQ = 1,
            control = glmerControl(tolPwrss = 1e-13))

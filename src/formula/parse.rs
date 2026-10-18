@@ -175,8 +175,10 @@ pub enum RandomEffect {
 ///   removal (e.g. `y ~ x - z`).
 /// - [`ParseError::DuplicateGroupingVar`] if the same grouping factor appears
 ///   in multiple random-effect terms.
-/// - [`ParseError::EmptySlopeTerm`] if a random-slope term has no slope
-///   variables (e.g. `(1+ |g)` with nothing between `+` and `|`).
+/// - [`ParseError::EmptySlopeTerm`] if a random-slope term has nothing but
+///   `+` signs after its `1+` (e.g. `(1++|g)`). `(1+|g)` is a
+///   [`ParseError::Syntax`] error instead: whitespace is stripped first, and
+///   the slope pattern needs at least one character before the `|`.
 /// - [`ParseError::RandomInterceptSuppressionUnsupported`] if a random-effect
 ///   term suppresses the intercept (e.g. `(0+x|g)` or `(-1+x|g)`).
 pub fn parse(input: &str) -> Result<ParsedFormula, ParseError> {

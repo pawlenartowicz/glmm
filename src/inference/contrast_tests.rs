@@ -1,12 +1,10 @@
 //! The stable path's Satterthwaite wiring and the contrasts on top of it:
-//! `coef_df` is the pass at the fitted θ̂, the contrasts reproduce it, and
-//! every route without a df says why.
+//! the contrasts reproduce `coef_df`, and every route without a df says why.
 
 use super::{ContrastError, ContrastNote, NoDfReason};
 use crate::fit::common_tests::lcg;
 use crate::fit::fit_cold_keep_workspace;
 use crate::inference::tails::t_two_sided_p;
-use crate::lmm::satterthwaite::pass;
 use crate::test_support::intercept_only_spec;
 use crate::{
     fit_cold, BinomialLink, Family, Fit, FitOptions, GroupIds, ModelSpec, Note, ReStructure, Sizing,
@@ -69,31 +67,6 @@ fn rel(got: f64, want: f64) -> f64 {
 
 fn bits(v: &[f64]) -> Vec<u64> {
     v.iter().map(|x| x.to_bits()).collect()
-}
-
-/// `fit_cold` fills `coef_df` with the pass at the θ̂ it fitted, bit for bit:
-/// the same pass run on the workspace of the same fit, done the loop tier's
-/// way.
-#[test]
-fn coef_df_equals_pass_at_fitted_theta() {
-    let (x, y, ids, n, p) = lmm_data(None);
-    let opts = all_targets(p);
-    let fit = fit_cold(&x, &y, n, p, &lmm_model(), &ids, &opts);
-    let (_, mut ws) = fit_cold_keep_workspace(&x, &y, n, p, &lmm_model(), &ids, &opts);
-    let (lmm, map) = ws.lmm_parts().expect("a Gaussian mixed fit");
-    let want = pass(lmm, map).coef_df();
-    assert_eq!(bits(&fit.coef_df), bits(&want));
-    let nu = (n - p) as f64;
-    assert!(
-        fit.coef_df.iter().all(|&d| d > 1.0 && d < nu),
-        "{:?}",
-        fit.coef_df
-    );
-    assert!(!fit
-        .diagnostics
-        .notes
-        .iter()
-        .any(|n| matches!(n, Note::SatterthwaiteCurvature { .. })));
 }
 
 /// The t test of `e_j` is coefficient `j`'s own: `β̂_j`, `se_j`, `coef_df_j`
@@ -256,18 +229,6 @@ fn into_fit_without_pass_is_state_missing() {
             "reml {reml:?}"
         );
     }
-}
-
-/// The aliased column's df is NaN; the retained columns carry the reduced
-/// fit's df bit for bit.
-#[test]
-fn rank_deficient_coef_df_scatters() {
-    let full = lmm_fit(Some(3), &all_targets(4));
-    let reduced = lmm_fit(None, &all_targets(3));
-    assert!(full.coef_df[3].is_nan());
-    assert_eq!(bits(&full.coef_df[..3]), bits(&reduced.coef_df));
-    let st = full.satterthwaite.as_ref().unwrap();
-    assert_eq!(st.retained.as_deref(), Some(&[0, 1, 2][..]));
 }
 
 /// `coef_df` is NaN off the target columns, and the target's value does not

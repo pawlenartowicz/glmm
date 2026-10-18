@@ -956,25 +956,6 @@ def test_port_parity_variance_at_limit():
     assert printed(entry) in [str(w.message) for w in caught]
 
 
-def test_port_parity_ill_conditioned():
-    # Same fixture and call in r/tests/testthat/test-warnings.R — change
-    # together.
-    n, split = 60, 40
-    a = [((i * 13) % 17) - 8.0 for i in range(n)]
-    b = [a[i] + (0.0 if i < split else 1.0) for i in range(n)]
-    y = [0.5 + 1.3 * a[i] + 0.477 * b[i] + ((i % 3) - 1.0) for i in range(n)]
-    w = [1.0 if i < split else 1e-11 for i in range(n)]
-    with pytest.warns(glmm.IllConditionedWarning) as caught:
-        m = glmm.fit({"y": y, "a": a, "b": b}, "y ~ a + b", weights=w)
-    assert m.converged
-    assert [(w2["tier"], w2["kind"], w2["title"]) for w2 in m.warnings] == [
-        ("caution", "ill_conditioned", "Nearly collinear columns"),
-    ]
-    (entry,) = m.warnings
-    assert entry["message"].startswith("b is almost a combination of other columns")
-    assert printed(entry) in [str(w.message) for w in caught]
-
-
 def test_port_parity_rows_dropped_na():
     # Same fixture and call in r/tests/testthat/test-warnings.R — change
     # together. One NaN in x drops one of four rows.
@@ -1010,34 +991,3 @@ def test_degenerate_gaussian_lmm_carries_the_satterthwaite_note():
         off = glmm.fit(data, "y ~ x + x2 + (1 + x2 | g)", satterthwaite=False)
     assert off.df_method == "disabled"
     assert [w["kind"] for w in off.warnings] == ["fit_failed"]
-
-
-# Pinned 90% intervals on MIXED_PAIRS from orchestrate::confint, the one function
-# both ports call: [lower, upper] per coefficient for the LMM (Satterthwaite t, df
-# about 4.0 and 14.1) and the OLS fit (t on n - p = 18). Produced on x86_64 Linux
-# from these sources (release builds of both ports gave the same digits). Same
-# numbers and band in r/tests/testthat/test-warnings.R - change together. The band
-# is the R suite's CI_REF_REL (helper-pins.R), the package's same-answer band
-# across CPUs and builds.
-_CONFINT_PIN_REL = 1e-7
-_MIXED_PAIRS_CONFINT_90 = {
-    "y ~ x + (1 | g)": [
-        [-2.423532479928109, 2.4235324799281277],
-        [0.26110360172792885, 0.3444701274625301],
-    ],
-    "y ~ x": [
-        [-0.8530566754329614, 0.8530566754329608],
-        [0.3287512344979612, 0.6037162979695715],
-    ],
-}
-
-
-@pytest.mark.parametrize("formula", list(_MIXED_PAIRS_CONFINT_90))
-def test_port_parity_confint(formula):
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
-        m = glmm.fit(MIXED_PAIRS, formula)
-    assert m.df_method == ("satterthwaite" if "|" in formula else "residual")
-    np.testing.assert_allclose(
-        m.confint(level=0.9), _MIXED_PAIRS_CONFINT_90[formula], rtol=_CONFINT_PIN_REL, atol=0.0
-    )

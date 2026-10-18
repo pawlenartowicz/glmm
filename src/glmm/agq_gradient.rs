@@ -36,7 +36,7 @@
 //! coordinate. Every other AGQ shape keeps the joint BOBYQA search and the
 //! hyper-dual SE rung.
 //!
-//! Measured 2026-10-07 (pawel scratch `mmjl-rethink/b7/`, `probit/`, `agqse/`):
+//! Measured 2026-10-07:
 //! the gradient matches central differences of the AGQ deviance to their noise
 //! floor on the grid's AGQ cells and on clusters of 2, 3 and 5 rows, and costs
 //! about half a value evaluation.

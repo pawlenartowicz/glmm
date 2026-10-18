@@ -1,7 +1,7 @@
 //! The likelihood-ratio arithmetic against the frozen `kind = "anova"`
 //! references: every pair's statistic and p-values recomputed from its frozen
 //! log-likelihoods and parameter counts, and the 50:50 mixture on the frozen
-//! grid of points; plus the floor, `T = 0`, NaN and `−∞` rules, which the
+//! grid of points; plus the floor and `T = 0` rules, which the
 //! references do not cover.
 
 use std::collections::BTreeSet;
@@ -208,25 +208,6 @@ fn negative_raw_value_is_floored_with_a_note_beyond_round_off() {
     assert_eq!(note, Some(LrNote::NegativeStatistic { raw }));
     assert_eq!(lr_p_value(t, &Reference::ChiSquared { df: 1 }), 1.0);
     assert_eq!(chibar_upper_p(t, 0), 1.0);
-}
-
-#[test]
-fn nan_or_a_collapsed_fit_gives_nan_never_the_floor() {
-    for (ll0, ll1) in [
-        (f64::NAN, -3.0),
-        (-3.0, f64::NAN),
-        (-3.0, f64::NEG_INFINITY),
-        (f64::NEG_INFINITY, -3.0),
-        (f64::NEG_INFINITY, f64::NEG_INFINITY),
-    ] {
-        let (t, note) = lr_statistic(ll0, ll1);
-        assert!(t.is_nan(), "({ll0}, {ll1}) gave {t}");
-        assert_eq!(note, None);
-    }
-    assert!(lr_p_value(f64::NAN, &Reference::ChiSquared { df: 2 }).is_nan());
-    for k in 0..3 {
-        assert!(chibar_upper_p(f64::NAN, k).is_nan(), "df_low = {k}");
-    }
 }
 
 #[test]

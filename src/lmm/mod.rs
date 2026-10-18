@@ -30,7 +30,6 @@
 
 use bobyqa::{Bobyqa, Config, RestartConfig, Status};
 use faer::{Mat, MatMut, MatRef};
-use std::sync::OnceLock;
 
 use crate::scalar::Scalar;
 use crate::standardize::ColumnScaling;
@@ -188,7 +187,7 @@ pub const PIN_THETA: f64 = 1e-4;
 pub const PIVOT_MIN: f64 = 1e-12;
 
 /// BOBYQA config for an n_theta-dimensional θ-search. `Config::new` supplies
-/// the PRIMA default npt = 2n+1 (3 at n = 1); `apply_campaign_overrides` sets
+/// the PRIMA default npt = 2n+1 (3 at n = 1); `apply_shipped_schedule` sets
 /// max_fun = 1000·n. Test-only (reached only via the test-gated
 /// [`LmmWorkspace::with_groupings`]); the live path inlines its own config.
 #[cfg(test)]
@@ -196,49 +195,12 @@ pub fn bobyqa_config(n_theta: usize) -> Config {
     let mut config = Config::new(n_theta);
     config.rho_begin = RHO_BEGIN;
     config.rho_end = RHO_END;
-    apply_campaign_overrides(&mut config, n_theta);
+    apply_shipped_schedule(&mut config, n_theta);
     config
 }
 
-/// Dev-only env hooks for sweeping BOBYQA's npt/max_fun without recompiling
-/// (npt and max_fun share this seam).
-/// `LMM_NPT_FORMULA=<mult>n<add>` overrides npt at EVERY BOBYQA config site:
-/// LMM (`for_cluster_spec_ext`), the blind seed (`bobyqa_config`), and the GLMM
-/// joint + stage-1 solvers (`glmm/workspace.rs`) — each evaluated against that
-/// solver's own dimension (joint: n_theta + p).
-/// `LMM_MAX_FUN_FORMULA` does the same for max_fun (unclamped). Formula-shaped
-/// values only: a flat constant would violate `n+2 ≤ npt ≤ (n+1)(n+2)/2` at
-/// small n once n changes between call sites, so flat inputs parse to None
-/// and the shipped value stays instead of silently producing an illegal npt.
-/// Read once per process (OnceLock) — sweeps set them per run via env var.
-pub(crate) fn eval_formula(formula: &str, n: usize) -> Option<usize> {
-    let (mult, add) = formula.split_once('n')?;
-    let mult: f64 = mult.parse().ok()?;
-    let add: usize = add.parse().ok()?;
-    Some((mult * n as f64).ceil() as usize + add)
-}
-
-pub(crate) fn npt_from_formula(formula: &str, n: usize) -> Option<usize> {
-    eval_formula(formula, n).map(|v| v.clamp(n + 2, (n + 1) * (n + 2) / 2))
-}
-
-fn env_formula(var: &'static str, cell: &'static OnceLock<Option<String>>) -> Option<String> {
-    cell.get_or_init(|| std::env::var(var).ok().filter(|s| !s.is_empty()))
-        .clone()
-}
-
-pub(crate) fn npt_override(n: usize) -> Option<usize> {
-    static V: OnceLock<Option<String>> = OnceLock::new();
-    npt_from_formula(&env_formula("LMM_NPT_FORMULA", &V)?, n)
-}
-
-pub(crate) fn max_fun_override(n: usize) -> Option<usize> {
-    static V: OnceLock<Option<String>> = OnceLock::new();
-    eval_formula(&env_formula("LMM_MAX_FUN_FORMULA", &V)?, n)
-}
-
-/// Shared tail for all BOBYQA config sites: the dev-only campaign env hooks
-/// (no-op when unset) and the shipped restart schedule (always on).
+/// Shared tail for all BOBYQA config sites: the evaluation budget, the RESCUE
+/// factor and the restart schedule.
 ///
 /// The restart re-solves from the incumbent θ with a discarded interpolation
 /// model once a cycle has spent an eighth of the evaluation budget that
@@ -265,19 +227,13 @@ pub(crate) fn max_fun_override(n: usize) -> Option<usize> {
 /// The four fields are written out even though they are `RestartConfig::new()`'s
 /// own defaults: the schedule is adopted by value, so a later bobyqa release
 /// changing its defaults cannot silently move this fit path.
-pub(crate) fn apply_campaign_overrides(config: &mut Config, n: usize) {
+pub(crate) fn apply_shipped_schedule(config: &mut Config, n: usize) {
     config.max_fun = 1000 * n;
     // Off: at the full `npt = (n+1)(n+2)/2` (every one-dimensional search) PRIMA's
     // RESCUE test is decided by rounding alone and spends evaluations; Powell's
     // original factor does not. On the accuracy grid's one-θ cells: 15% fewer
     // evaluations, deviance equal to round-off. Other `npt` values are unaffected.
     config.prima_parity = false;
-    if let Some(npt) = npt_override(n) {
-        config.npt = npt;
-    }
-    if let Some(mf) = max_fun_override(n) {
-        config.max_fun = mf.max(config.npt + 1);
-    }
     let mut restart = RestartConfig::new();
     restart.cycle_budget_frac = 0.125;
     restart.max_restarts = 1;
@@ -1192,7 +1148,7 @@ impl LmmWorkspace {
         config.rho_begin = RHO_BEGIN;
         config.rho_end = RHO_END;
         config.npt = npt;
-        apply_campaign_overrides(&mut config, n_theta);
+        apply_shipped_schedule(&mut config, n_theta);
         let (theta, lower, upper) = groupings.blind_theta_and_bounds();
         // The sparse kernel carries no dense O(K) suff-stats / fit scratch —
         // that is what it exists to avoid — and its Gram scatter is its

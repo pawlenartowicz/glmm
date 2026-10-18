@@ -578,8 +578,7 @@ pub(crate) fn laplace_deviance_at(
     )
 }
 
-/// Shared borrow-split body of `laplace_deviance_at` and (test-only)
-/// `glmm_laplace_deviance_profile`: destructures the workspace into the
+/// Borrow-split body of `laplace_deviance_at`: destructures the workspace into the
 /// disjoint borrows `laplace_deviance` needs and calls it. `beta_mode`
 /// selects both `laplace_deviance`'s β mode AND which workspace buffer plays
 /// β vs. the spare `beta_step_rhs` (Fixed: β = `beta_rhs`, spare = `beta_prof`;
@@ -689,44 +688,4 @@ pub(crate) fn glmm_laplace_deviance(
     fill_z_f64(&ws.groupings, x, &mut ws.z_buf, n);
     let mut counters = crate::counters::EvalCounters::new();
     laplace_deviance_at(ws, x, y, cluster_ids, extra_ids, n, &mut counters)
-}
-
-/// Test-only Profile twin of `glmm_laplace_deviance`: drives `laplace_deviance`
-/// with `beta_mode = BetaMode::ProfilePql` and `beta = ws.beta_prof` (the stage-1
-/// in/out β), so it evaluates the PQL objective at θ and leaves the profiled β̂(θ) in
-/// `ws.beta_prof`. Seeds BOTH the conditional mode (`ws.pirls.u`) and `beta_prof` at 0
-/// each call, making the result depend only on `params` — the determinism (BOBYQA
-/// objective-consistency) the two-stage optimizer needs. This is the stage-1
-/// production call shape (`laplace_deviance(beta_mode = BetaMode::ProfilePql, beta =
-/// &mut ws.beta_prof, …)`) exercised from a `&[f64]` in tests.
-#[cfg(test)]
-pub(crate) fn glmm_laplace_deviance_profile(
-    params: &[f64],
-    ws: &mut GlmmWorkspace,
-    x: MatRef<f64>,
-    y: &[f64],
-    cluster_ids: &[u32],
-    extra_ids: &[Vec<u32>],
-    n: usize,
-) -> f64 {
-    ws.params[..params.len()].copy_from_slice(params);
-    fill_z_f64(&ws.groupings, x, &mut ws.z_buf, n);
-    let kk = ws.k.max(1);
-    for v in ws.pirls.u[..kk].iter_mut() {
-        *v = 0.0;
-    }
-    for v in ws.beta_prof.iter_mut() {
-        *v = 0.0;
-    }
-    let mut counters = crate::counters::EvalCounters::new();
-    laplace_deviance_ws(
-        ws,
-        x,
-        y,
-        cluster_ids,
-        extra_ids,
-        n,
-        BetaMode::ProfilePql,
-        &mut counters,
-    )
 }

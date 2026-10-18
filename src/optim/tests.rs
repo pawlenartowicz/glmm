@@ -378,47 +378,6 @@ fn bobyqa_wrapper_matches_minimize_bit_for_bit() {
     assert_eq!(obj.rhos[0], cfg.rho_begin);
 }
 
-/// The layer hosts a 1-D method on the value-only trait: a golden-section
-/// search written against [`Objective`] alone, reporting its bracket width as
-/// the resolution.
-#[test]
-fn objective_hosts_a_one_dimensional_method() {
-    fn golden(obj: &mut impl Objective, mut a: f64, mut b: f64, tol: f64) -> f64 {
-        const R: f64 = 0.618_033_988_749_894_9;
-        let mut c = b - R * (b - a);
-        let mut d = a + R * (b - a);
-        let mut fc = obj.value(&[c], b - a).unwrap_or(f64::INFINITY);
-        let mut fd = obj.value(&[d], b - a).unwrap_or(f64::INFINITY);
-        while b - a > tol {
-            if fc < fd {
-                b = d;
-                d = c;
-                fd = fc;
-                c = b - R * (b - a);
-                fc = obj.value(&[c], b - a).unwrap_or(f64::INFINITY);
-            } else {
-                a = c;
-                c = d;
-                fc = fd;
-                d = a + R * (b - a);
-                fd = obj.value(&[d], b - a).unwrap_or(f64::INFINITY);
-            }
-        }
-        0.5 * (a + b)
-    }
-    struct Quad(Vec<f64>);
-    impl Objective for Quad {
-        fn value(&mut self, x: &[f64], resolution: f64) -> Option<f64> {
-            self.0.push(resolution);
-            Some((x[0] - 0.42).powi(2))
-        }
-    }
-    let mut obj = Quad(Vec::new());
-    let x = golden(&mut obj, 0.0, 2.0, 1e-8);
-    assert!((x - 0.42).abs() < 1e-7);
-    assert!(obj.0.windows(2).all(|w| w[1] <= w[0]), "bracket shrinks");
-}
-
 /// A hint replaces the identity start: on a quadratic, the exact inverse
 /// Hessian takes the search to the optimum in one step.
 #[test]

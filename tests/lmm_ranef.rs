@@ -16,7 +16,7 @@
 //! through a naming bug — so every labelling assertion here checks names, on a
 //! factor whose levels are deliberately not in sorted order.
 
-use glmm::formula::{label_ranef, lower, Column, RanefBlock, Table};
+use glmm::formula::{label_ranef, lower, Column, Error, RanefBlock, ReGroupInfo, Table};
 use glmm::{fit_cold, Family, Fit, Note};
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -734,5 +734,33 @@ fn label_ranef_refuses_a_mismatched_lowering() {
     };
     let lo = lower("y ~ x1 + x2 + (1 | g)", &table, Family::Gaussian).unwrap();
     let fit = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
-    assert!(label_ranef(&fit, &[]).is_err(), "grouping count disagrees");
+    assert!(!fit.ranef.is_empty(), "the fixture has conditional modes");
+    assert!(
+        label_ranef(&fit, &lo.re_groups).is_ok(),
+        "the lowering describes the fit"
+    );
+    let refused =
+        |r: Result<Vec<RanefBlock>, Error>| matches!(r, Err(Error::RanefShapeMismatch(_)));
+    // Grouping count.
+    assert!(refused(label_ranef(&fit, &[])), "grouping count");
+    // Grouping count, one more than the fit: the length check alone would pass
+    // it on to a slot loop that indexes past `ranef_levels`.
+    let copy = |g: &ReGroupInfo| ReGroupInfo {
+        name: g.name.clone(),
+        terms: g.terms.clone(),
+        slot_labels: g.slot_labels.clone(),
+    };
+    let doubled = [copy(&lo.re_groups[0]), copy(&lo.re_groups[0])];
+    assert!(
+        refused(label_ranef(&fit, &doubled)),
+        "grouping count, one extra"
+    );
+    // Total length: one more term than the fit's block.
+    let mut groups = lo.re_groups;
+    groups[0].terms.push("(Intercept)".to_string());
+    assert!(refused(label_ranef(&fit, &groups)), "total length");
+    groups[0].terms.pop();
+    // Slot-label count: one label short of `ranef_levels`.
+    groups[0].slot_labels.pop();
+    assert!(refused(label_ranef(&fit, &groups)), "slot-label count");
 }

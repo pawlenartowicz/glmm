@@ -1,7 +1,8 @@
 #![cfg(feature = "formula")]
 //! materialize's fixed design vs R `model.matrix`. The fixtures are
 //! frozen R output (`fixtures/contrasts_fixtures.rs`, regenerate with
-//! `gen_contrasts_fixtures.R`); the oracle is sacred — a mismatch is a
+//! `tests/gen_contrasts_fixtures.R`; registered in `validation/manifest.json`,
+//! `in_crate_references`); the oracle is sacred — a mismatch is a
 //! formula-frontend bug, never a relaxed fixture.
 
 use glmm::formula::{lower, Column, Table};

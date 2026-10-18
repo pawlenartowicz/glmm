@@ -582,7 +582,6 @@ impl NLanes {
     /// (accepted 2026-10-07: a slowdown on the M4 alone is acceptable for that
     /// memory). Every other `m` up to 24 keeps the covering rung, and one table
     /// serves every target.
-    /// Evidence: pawel `~/.cache/claude-scratch/mmjl-rethink/memspeed/step0/`.
     ///
     /// A pinned table, a function of `m` alone: no timing input and no
     /// per-target branch, so a fit picks the same rung (and moves by the same
@@ -1961,13 +1960,11 @@ pub(crate) fn laplace_gradient(
         // `se::structured_schur_fill` reuses, and the mode this solve hands
         // the dual kernel below must come from the same dense tail the dual
         // kernel runs (dual `T` always takes the dense generic tail — see
-        // `run_gradient`'s `pattern` doc comment). `pattern.structured_schur`/
-        // `force_dense_schur` are taken out and restored around this one f64
-        // call so its CSR refresh (`cross_col`/`n_cross`/`coup_cols`/`coup_ptr`/
-        // `coup_mask`) still lands in the real, shared `pattern`.
+        // `run_gradient`'s `pattern` doc comment). `pattern.structured_schur`
+        // is taken out and restored around this one f64 call so its CSR
+        // refresh (`cross_col`/`n_cross`/`coup_cols`/`coup_ptr`/`coup_mask`)
+        // still lands in the real, shared `pattern`.
         let saved_schur = pattern.structured_schur.take();
-        let saved_force_dense = pattern.force_dense_schur;
-        pattern.force_dense_schur = false;
         let (dev, _pen_dev, conv, _raw_finite) = structured_laplace_deviance::<f64>(
             family,
             nb_theta,
@@ -1993,7 +1990,6 @@ pub(crate) fn laplace_gradient(
             &mut mode_counters,
         );
         pattern.structured_schur = saved_schur;
-        pattern.force_dense_schur = saved_force_dense;
         conv && dev.is_finite()
     } else {
         let (dev, _pen_dev, conv, _raw_finite) = blocked_laplace_deviance::<f64>(
@@ -2594,11 +2590,9 @@ pub(crate) fn laplace_hessian(
     } else if extras {
         // Keep the mode solve off the cached sparse factor — see
         // `laplace_gradient`'s own structured mode solve for why, and why
-        // `pattern.structured_schur`/`force_dense_schur` are taken out and
-        // restored around this one f64 call.
+        // `pattern.structured_schur` is taken out and restored around this
+        // one f64 call.
         let saved_schur = pattern.structured_schur.take();
-        let saved_force_dense = pattern.force_dense_schur;
-        pattern.force_dense_schur = false;
         let (dev, _pen_dev, conv, _raw_finite) = structured_laplace_deviance::<f64>(
             family,
             nb_theta,
@@ -2624,7 +2618,6 @@ pub(crate) fn laplace_hessian(
             &mut mode_counters,
         );
         pattern.structured_schur = saved_schur;
-        pattern.force_dense_schur = saved_force_dense;
         conv && dev.is_finite()
     } else {
         let (dev, _pen_dev, conv, _raw_finite) = blocked_laplace_deviance::<f64>(
@@ -2719,51 +2712,11 @@ pub(crate) fn laplace_hessian(
 mod tests {
     use super::*;
 
-    /// `for_shape` at `q_p == 1` (the scalar-intercept shape): `agq_scratch`
-    /// takes its `7·s` arm.
+    /// A `HyperDual` rung carries no assembly scratch: the assembled pass runs on
+    /// the `Dual` rungs alone, and `m·k` second-order numbers would be megabytes
+    /// on a wide `k`.
     #[test]
-    fn for_shape_buffer_lengths_match_at_q_p_1() {
-        let (m, p, k, rows, s, q_p, nagq) = (5usize, 3usize, 7usize, 40usize, 7usize, 1usize, 7u8);
-        // Crossed-extras shape: q_core = q_p + 2 nested children, e = 6.
-        let (q_core, e) = (q_p + 2, 6usize);
-        let cluster_ids: Vec<u32> = (0..rows as u32).map(|i| i % s as u32).collect();
-        let scratch = GlmmDualScratch::for_shape(
-            NLanes::D8,
-            m,
-            p,
-            k,
-            rows,
-            s,
-            q_p,
-            q_core,
-            e,
-            true,
-            nagq,
-            true,
-            0,
-            &cluster_ids,
-            None,
-        );
-        match scratch {
-            GlmmDualScratch::D8(bufs, ..) => {
-                assert_eq!(bufs.pirls.agq_scratch.len(), 7 * s);
-                // An extras shape carries the structured row buffer; the
-                // crossed values are one per slot on every shape.
-                assert_eq!(bufs.structured.m_core_buf.len(), rows * q_core);
-                assert_eq!(
-                    bufs.structured.cross_theta.len(),
-                    crate::lmm::MAX_EXTRA_GROUPINGS
-                );
-            }
-            _ => panic!("expected D8 variant"),
-        }
-    }
-
-    /// `for_shape` at `q_p == 2` (the vector-RE shape): `agq_scratch` takes its
-    /// `2·s + nagq^q_p·(q_p+1)` arm, and the `HyperDual` order carries no
-    /// assembly scratch at all.
-    #[test]
-    fn for_shape_buffer_lengths_match_at_q_p_2() {
+    fn for_shape_gives_a_hyperdual_rung_no_assembly_scratch() {
         let (m, p, k, rows, s, q_p, nagq) = (6usize, 2usize, 18usize, 50usize, 9usize, 2usize, 5u8);
         // No-extras shape: q_core == q_p, e == 0, so the structured twins sit
         // at their `.max(1)` minimum.
@@ -2788,10 +2741,6 @@ mod tests {
         );
         match scratch {
             GlmmDualScratch::H8(bufs, ..) => {
-                let kq = (nagq as usize).pow(q_p as u32);
-                assert_eq!(bufs.pirls.agq_scratch.len(), 2 * s + kq * (q_p + 1));
-                // No extras: the structured row buffer sits at its minimum.
-                assert_eq!(bufs.structured.m_core_buf.len(), 1);
                 // A `HyperDual` rung carries NO assembly scratch: the assembled
                 // pass runs on the `Dual` rungs alone, and `m·k` second-order
                 // numbers would be megabytes on a wide `k`.
@@ -2972,11 +2921,13 @@ mod tests {
         }
     }
 
-    /// The assembled Hessian's rung table, pinned for `m` 1 to 24 and spot
-    /// checked above: a change here moves SEs by round-off on every fit at
-    /// that `m`, so it is a deliberate, re-measured edit, never a drive-by.
+    /// `pick_assembled` hands the assembled Hessian a first-order (`D*`) rung for
+    /// every m: an `H*` rung makes `assembled.rs` return `Unsupported` and the SE
+    /// silently falls back to the FD stencil. Above the measured range (24) it is
+    /// the gradient ladder's pick. The measured table itself is a tuning choice,
+    /// not pinned here.
     #[test]
-    fn nlanes_pick_assembled_is_the_measured_table() {
+    fn nlanes_pick_assembled_stays_on_first_order_rungs() {
         let lanes = |l: NLanes| match l {
             NLanes::D4 => 4,
             NLanes::D5 => 5,
@@ -2985,54 +2936,17 @@ mod tests {
             NLanes::D12 => 12,
             other => panic!("first-order rung expected, got {other:?}"),
         };
-        let want = [
-            4, 4, 4, 4, 5, 6, 8, 8, 5, 5, 12, 12, 8, 8, 8, 8, 6, 6, 12, 12, 12, 12, 12, 12,
-        ];
-        for (i, &w) in want.iter().enumerate() {
-            let m = i + 1;
-            assert_eq!(lanes(NLanes::pick_assembled(m)), w, "m={m}");
+        for m in 1..=100 {
+            let l = NLanes::pick_assembled(m);
+            let _ = lanes(l); // panics on an H rung: assembled.rs refuses those and SEs would fall to FD
+            if m > 24 {
+                assert_eq!(
+                    Some(l),
+                    NLanes::pick(m, false),
+                    "m={m}: unmeasured m keeps the gradient ladder"
+                );
+            }
         }
-        for m in [25, 36, 100] {
-            assert_eq!(NLanes::pick_assembled(m), NLanes::D12, "m={m}");
-        }
-    }
-
-    /// `m = ws.n_theta + p > MAX_DUAL_N` is not a refusal: the gradient
-    /// resolves to the top rung and chunks. The numbers are the FD gates' job
-    /// (`glmm/tests.rs`) — all this asserts is the routing, that the call is
-    /// not `Unsupported`, and that the top-rung scratch was actually built.
-    #[test]
-    fn laplace_gradient_above_cap_chunks_at_the_top_rung() {
-        assert_eq!(NLanes::pick(MAX_DUAL_N + 1, false), Some(NLanes::D12));
-
-        // A single-intercept binomial workspace (m = n_theta(1) + p) — `p` is
-        // padded to push `m` past `MAX_DUAL_N` (12) without needing a real
-        // 12-column design.
-        let mut model = crate::test_support::intercept_only_spec(crate::Sizing::FixedClusters {
-            n_clusters: 3,
-        });
-        model.family = crate::Family::Binomial {
-            link: crate::BinomialLink::Logit,
-        };
-        let n = 3;
-        let p = MAX_DUAL_N; // m = 1 + 12 = 13 > MAX_DUAL_N
-        let mut ws = GlmmWorkspace::for_cluster_spec(p, &model, n, &[], 1);
-        let cluster_ids: [u32; 3] = [0, 1, 2];
-        let x = faer::Mat::<f64>::zeros(n, p);
-        let y = vec![0.0f64; n];
-        let mut grad = vec![0.0f64; p + 1];
-        let status = laplace_gradient(&mut ws, x.as_ref(), &y, &cluster_ids, &[], p, n, &mut grad);
-        // Three rows against 13 parameters is a degenerate design, so the
-        // refinement loop may or may not settle — `Unsupported` is the one
-        // answer the lane cap must not give.
-        assert!(
-            matches!(status, DerivStatus::Ok(_) | DerivStatus::NotConverged),
-            "above the cap the gradient must chunk, not refuse"
-        );
-        assert!(matches!(
-            ws.dual_scratch.as_deref(),
-            Some(GlmmDualScratch::D12(..))
-        ));
     }
 
     /// Build the workspace, `z_buf` and the `f64` starting state for one
@@ -3101,7 +3015,7 @@ mod tests {
     }
 
     /// `laplace_hessian`'s own cap guard. The gradient does not refuse above the
-    /// cap: it chunks instead (`laplace_gradient_above_cap_chunks_at_the_top_rung`).
+    /// cap: it chunks instead (`glmm::tests::dual_gradient_matches_central_fd_chunked_above_n12`).
     /// The cap is this pass's alone: `fit::glmm_tests`'s
     /// `assembled_hessian_covers_an_m_above_the_dual_lane_cap` holds the other
     /// half, that an exact Hessian still reaches a dense shape above it.

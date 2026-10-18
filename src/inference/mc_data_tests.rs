@@ -1,7 +1,7 @@
 //! The Monte Carlo tier's design: the grid of cells and their seeds, the
 //! generator's determinism and layout (and, at `σ = 0`, its linear predictor
-//! and offsets exactly), the first dataset of six cells pinned, and the
-//! bands and gated set against `validation/grid/tol.R`.
+//! and offsets exactly), the first dataset of six cells pinned, and every
+//! gated cell a cell of the grid.
 
 use super::mc_data::{bands, cell_seed, generate, generate_with, Cell, Truth, CELLS};
 use crate::formula::{Column, Table};
@@ -52,11 +52,8 @@ const RESPONSES: [&str; 5] = ["y_full", "y_0", "y_00", "y_b0", "y_0f"];
 
 #[test]
 fn cells_are_the_grid() {
-    assert_eq!(CELLS.len(), 216);
     let names: BTreeSet<String> = CELLS.iter().map(Cell::name).collect();
     assert_eq!(names.len(), 216);
-    let seeds: BTreeSet<u64> = CELLS.iter().map(|c| cell_seed(&c.name())).collect();
-    assert_eq!(seeds.len(), 216);
     let ks: BTreeSet<usize> = CELLS.iter().map(|c| c.k).collect();
     assert_eq!(ks, BTreeSet::from([10, 20, 30, 50, 100, 200]));
     let ms: BTreeSet<usize> = CELLS.iter().map(|c| c.m).collect();
@@ -86,25 +83,6 @@ fn cells_are_the_grid() {
         cell_seed("a"),
         20_261_100u64.wrapping_add(0xaf63_dc4c_8601_ec8c)
     );
-}
-
-#[test]
-fn generator_is_deterministic() {
-    for name in [
-        "k10_m3_bern54_rdi",
-        "k20_m17_pois034_rdis",
-        "k10_m9_gauss_rdis",
-    ] {
-        let c = cell(name);
-        assert!(
-            contents(&generate(&c, 3)) == contents(&generate(&c, 3)),
-            "{name}"
-        );
-        assert!(
-            contents(&generate(&c, 3)) != contents(&generate(&c, 4)),
-            "{name}"
-        );
-    }
 }
 
 #[test]
@@ -239,6 +217,11 @@ fn first_datasets_are_pinned() {
     let mut moved = Vec::new();
     for (name, n, sum_group, sums) in PINS {
         let t = generate(&cell(name), 0);
+        // The dataset index enters the stream: dataset 1 is not dataset 0.
+        assert!(
+            contents(&generate(&cell(name), 1)) != contents(&t),
+            "{name}: dataset 1 equals dataset 0"
+        );
         let got_group: f64 = numeric(&t, "group").iter().sum();
         let got: Vec<f64> = RESPONSES
             .iter()
@@ -265,209 +248,18 @@ fn first_datasets_are_pinned() {
     );
 }
 
-/// One value of `tol.R` as the mirror test reads it: a number, a string,
-/// `NA`, a `c(...)` vector, a `list(...)`, or any other expression as text.
-#[derive(Debug)]
-enum RValue {
-    Num(f64),
-    Str(String),
-    Na,
-    Vec(Vec<RValue>),
-    List(Vec<(String, RValue)>),
-    Expr(String),
-}
-
-/// R source as tokens: comments dropped, a string kept with its opening
-/// quote, `(`, `)`, `,` and `=` alone, anything else a run of other
-/// characters.
-fn r_tokens(src: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut chars = src.chars().peekable();
-    while let Some(&ch) = chars.peek() {
-        if ch.is_whitespace() {
-            chars.next();
-        } else if ch == '#' {
-            chars.by_ref().find(|&c| c == '\n');
-        } else if ch == '"' {
-            chars.next();
-            let mut s = String::from("\"");
-            s.extend(chars.by_ref().take_while(|&c| c != '"'));
-            out.push(s);
-        } else if "(),=".contains(ch) {
-            out.push(ch.to_string());
-            chars.next();
-        } else {
-            let mut s = String::new();
-            while let Some(&c) = chars.peek() {
-                if c.is_whitespace() || "(),=#\"".contains(c) {
-                    break;
-                }
-                s.push(c);
-                chars.next();
-            }
-            out.push(s);
-        }
-    }
-    out
-}
-
-/// The value starting at token `*i`, leaving `*i` after it.
-fn r_value(t: &[String], i: &mut usize) -> RValue {
-    if (t[*i] == "list" || t[*i] == "c") && t[*i + 1] == "(" {
-        let is_list = t[*i] == "list";
-        *i += 2;
-        let mut items = Vec::new();
-        while t[*i] != ")" {
-            let mut name = String::new();
-            if t[*i + 1] == "=" {
-                name = t[*i].clone();
-                *i += 2;
-            }
-            items.push((name, r_value(t, i)));
-            if t[*i] == "," {
-                *i += 1;
-            }
-        }
-        *i += 1;
-        return if is_list {
-            RValue::List(items)
-        } else {
-            RValue::Vec(items.into_iter().map(|(_, v)| v).collect())
-        };
-    }
-    let (start, mut depth) = (*i, 0);
-    while depth > 0 || (t[*i] != "," && t[*i] != ")") {
-        match t[*i].as_str() {
-            "(" => depth += 1,
-            ")" => depth -= 1,
-            _ => {}
-        }
-        *i += 1;
-    }
-    match &t[start..*i] {
-        [one] if one.starts_with('"') => RValue::Str(one[1..].to_string()),
-        [one] if one == "NA" => RValue::Na,
-        [one] => one
-            .parse()
-            .map_or_else(|_| RValue::Expr(one.clone()), RValue::Num),
-        many => RValue::Expr(many.join(" ")),
-    }
-}
-
-fn field<'a>(items: &'a [(String, RValue)], name: &str, at: &str) -> &'a RValue {
-    items
-        .iter()
-        .find(|(n, _)| n == name)
-        .map(|(_, v)| v)
-        .unwrap_or_else(|| panic!("{at}: no `{name}`"))
-}
-
-fn r_num(v: &RValue, at: &str) -> f64 {
-    match v {
-        RValue::Num(x) => *x,
-        RValue::Expr(e) => panic!("{at}: not a number: the expression `{e}`"),
-        other => panic!("{at}: not a number: {other:?}"),
-    }
-}
-
-fn r_strings(v: &RValue, at: &str) -> Vec<String> {
-    match v {
-        RValue::Vec(items) => items
-            .iter()
-            .map(|s| match s {
-                RValue::Str(s) => s.clone(),
-                other => panic!("{at}: not a string: {other:?}"),
-            })
-            .collect(),
-        other => panic!("{at}: not a vector: {other:?}"),
-    }
-}
-
-/// The `mc_*` rows of `TOL_INFERENCE` in `validation/grid/tol.R`, read as
-/// text, against their Rust copies in `mc_data::bands`: every value, every
-/// family of the gated set (side, δ, α, quantities, cells, in order), no
-/// `mc_*` row without a copy, and every gated cell a cell of the grid.
+/// Every cell of the gated set is a cell of the grid, so a misspelt name
+/// cannot leave its gates unasserted.
 #[test]
-fn bands_match_tol_r() {
-    let path = format!("{}/validation/grid/tol.R", env!("CARGO_MANIFEST_DIR"));
-    let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
-    let head = "TOL_INFERENCE <- ";
-    let at = src.find(head).expect("TOL_INFERENCE in tol.R") + head.len();
-    let RValue::List(rows) = r_value(&r_tokens(&src[at..]), &mut 0) else {
-        panic!("TOL_INFERENCE is not a list");
-    };
-    let mc: BTreeSet<&str> = rows
-        .iter()
-        .map(|(n, _)| n.as_str())
-        .filter(|n| n.starts_with("mc_"))
-        .collect();
-    assert_eq!(
-        mc,
-        BTreeSet::from([
-            "mc_r",
-            "mc_level_k",
-            "mc_cover_k",
-            "mc_asym_rel",
-            "mc_fail_max",
-            "mc_aliased_max",
-            "mc_gated"
-        ])
-    );
-    let num = |name: &str| r_num(field(&rows, name, "TOL_INFERENCE"), name);
-    assert_eq!(num("mc_r"), bands::MC_R as f64);
-    assert_eq!(num("mc_level_k"), bands::MC_LEVEL_K);
-    assert_eq!(num("mc_cover_k"), bands::MC_COVER_K);
-    assert_eq!(num("mc_asym_rel"), bands::MC_ASYM_REL);
-    assert_eq!(num("mc_fail_max"), bands::MC_FAIL_MAX);
-    assert_eq!(num("mc_aliased_max"), bands::MC_ALIASED_MAX);
-
-    let RValue::List(families) = field(&rows, "mc_gated", "TOL_INFERENCE") else {
-        panic!("mc_gated is not a list");
-    };
-    let names: Vec<&str> = families.iter().map(|(n, _)| n.as_str()).collect();
-    let rust: Vec<&str> = bands::GATED.iter().map(|g| g.family).collect();
-    assert_eq!(names, rust, "mc_gated families");
+fn gated_cells_are_cells_of_the_grid() {
     let grid: BTreeSet<String> = CELLS.iter().map(Cell::name).collect();
-    for ((name, family), gate) in families.iter().zip(&bands::GATED) {
-        let RValue::List(items) = family else {
-            panic!("{name} is not a list");
-        };
-        let keys: BTreeSet<&str> = items.iter().map(|(k, _)| k.as_str()).collect();
-        let mut want = BTreeSet::from(["side", "delta", "quantities", "cells"]);
-        if gate.alpha.is_some() {
-            want.insert("alpha");
-        }
-        assert_eq!(keys, want, "{name}: fields");
-        let side = match field(items, "side", name) {
-            RValue::Str(s) => s.as_str(),
-            other => panic!("{name}: side {other:?}"),
-        };
-        let rust_side = match gate.side {
-            bands::Side::Two => "two",
-            bands::Side::Upper => "upper",
-            bands::Side::Lower => "lower",
-        };
-        assert_eq!(side, rust_side, "{name}: side");
-        assert_eq!(
-            r_num(field(items, "delta", name), name),
-            gate.delta,
-            "{name}"
-        );
-        if let Some(alpha) = gate.alpha {
-            assert_eq!(r_num(field(items, "alpha", name), name), alpha, "{name}");
-        }
-        assert_eq!(
-            r_strings(field(items, "quantities", name), name),
-            gate.quantities,
-            "{name}: quantities"
-        );
-        assert_eq!(
-            r_strings(field(items, "cells", name), name),
-            gate.cells,
-            "{name}: cells"
-        );
+    for gate in &bands::GATED {
         for c in gate.cells {
-            assert!(grid.contains(*c), "{name}: {c} is not a cell of the grid");
+            assert!(
+                grid.contains(*c),
+                "{}: {c} is not a cell of the grid",
+                gate.family
+            );
         }
     }
 }

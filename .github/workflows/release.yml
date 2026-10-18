@@ -1,9 +1,9 @@
 name: Publish
 
 # One tag, one release: `v*` ships the crate to crates.io, the Python package to
-# PyPI, AND the fastglmm R package to r-universe from the same run. The Python
-# package is a thin wrapper over the crate with no independent version or
-# changelog, so it has no separate cadence.
+# PyPI, the fastglmm R package to r-universe, AND a GitHub release with the
+# Pyodide wheel from the same run. The Python package is a thin wrapper over the
+# crate with no independent version or changelog, so it has no separate cadence.
 #
 # Folding the r-universe publish into this workflow avoids a concurrency
 # collision: two separate workflows firing on `v*` and both calling ci.yml
@@ -132,7 +132,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install python/dist/*.whl
-          python -m pip install pytest pandas pyarrow
+          python -m pip install pytest pandas pyarrow polars
           # Scratch dir + absolute tests path: `import glmm` must resolve to the
           # installed wheel, never python/glmm/ in the source tree.
           cd "$RUNNER_TEMP"
@@ -167,7 +167,7 @@ jobs:
         shell: bash
         run: |
           python -m pip install python/dist/*.tar.gz
-          python -m pip install pytest pandas pyarrow
+          python -m pip install pytest pandas pyarrow polars
           cd "$RUNNER_TEMP"
           python -m pytest "$GITHUB_WORKSPACE/python/tests" -v
       - uses: actions/upload-artifact@v4
@@ -284,3 +284,60 @@ jobs:
           git push --force "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:r-universe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # PyPI does not take the pyemscripten platform tag, so the Pyodide wheel goes
+  # to the tag's GitHub release only. It uploads no workflow artifact, so
+  # publish-pypi never picks it up. Gated like publish-r-universe: a Pyodide
+  # failure blocks neither PyPI nor crates.io, at the cost that the GitHub
+  # release can exist for a tag whose PyPI upload then fails.
+  build-pyodide:
+    name: Build Pyodide wheel (GitHub release only)
+    needs: [verify, version-check]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # softprops/action-gh-release attaches the wheel
+    env:
+      # The wheel's platform tag (pyemscripten_2026_0) ties it to this
+      # Pyodide release's ABI; 314.0.7 is the version it is built and
+      # smoke-tested against. To move it: set PYODIDE_VERSION to a release
+      # listed by `pyodide xbuildenv search`, PYODIDE_PYTHON to the Python
+      # it ships (`pyodide config get python_version` after `pyodide
+      # xbuildenv install`) and PYODIDE_BUILD to a pyodide-build that
+      # supports it, then build locally and run python/tools/pyodide-smoke.mjs
+      # on the wheel before tagging. The Rust version follows the xbuildenv.
+      PYODIDE_VERSION: "314.0.7"
+      PYODIDE_PYTHON: "3.14.2"
+      PYODIDE_BUILD: "0.39.1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "${{ env.PYODIDE_PYTHON }}" }
+      - uses: actions/setup-node@v4
+        with: { node-version: "22" }
+      - name: Install pyodide-build, the xbuildenv and Emscripten
+        run: |
+          set -euo pipefail
+          pip install "pyodide-build==$PYODIDE_BUILD"
+          pyodide xbuildenv install "$PYODIDE_VERSION"
+          pyodide xbuildenv install-emscripten
+      # RUSTUP_TOOLCHAIN overrides rust-toolchain.toml for the later steps.
+      - name: Install the xbuildenv's Rust toolchain
+        run: |
+          set -euo pipefail
+          RUST=$(pyodide config get rust_toolchain)
+          rustup toolchain install "$RUST" --profile minimal --target wasm32-unknown-emscripten
+          echo "RUSTUP_TOOLCHAIN=$RUST" >> "$GITHUB_ENV"
+      - name: Build the wheel
+        working-directory: python
+        run: pyodide build --outdir pyodide-dist
+      - name: Smoke test under Node
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/smoke"
+          cd "$RUNNER_TEMP/smoke"
+          npm install --no-audit --no-fund "pyodide@$PYODIDE_VERSION"
+          node "$GITHUB_WORKSPACE/python/tools/pyodide-smoke.mjs" "$GITHUB_WORKSPACE"/python/pyodide-dist/*.whl
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: python/pyodide-dist/*.whl

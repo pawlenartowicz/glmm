@@ -107,6 +107,13 @@ jobs:
         # --no-fail-fast: every target reports, so an integration test is not
         # hidden behind a failing lib target.
         run: cargo test --no-fail-fast ${{ matrix.flags }}
+      - name: grid_reference gaps on this runner's CPU
+        # The test's per-cell gaps measure `CROSS_CPU_CELL_BANDS` on the
+        # runner pool; a passing test's output is captured, so print it here.
+        if: matrix.name == 'default'
+        run: |
+          grep -m1 'model name' /proc/cpuinfo
+          cargo test --test grid_reference -- --nocapture
 
   # ── MSRV floor: the bobyqa dep pins rust-version = 1.85 ───────────────────
   msrv:
@@ -269,10 +276,10 @@ jobs:
             echo "::error::R CMD check reported a WARNING: $status"
             exit 1
           fi
-      - name: Fail on any skipped test
-        # R CMD check does not fail its exit code on a skip, only on a real
-        # error — so a missing lme4/broom or a misfired skip_on_cran() would
-        # otherwise pass quietly.
+      - name: Fail on any skipped test or testthat warning
+        # R CMD check does not fail its exit code on a skip or a warning, only
+        # on a real error — so a missing lme4/broom, a misfired skip_on_cran()
+        # or a warning raised inside a test would otherwise pass quietly.
         run: |
           out="$RUNNER_TEMP/r-check/fastglmm.Rcheck/tests/testthat.Rout"
           if [ ! -f "$out" ]; then
@@ -282,6 +289,11 @@ jobs:
           if grep -qE "SKIP [1-9]" "$out"; then
             echo "::error::testthat skipped a test — treating as a job setup error"
             grep -A6 "Skipped tests" "$out" || true
+            exit 1
+          fi
+          if grep -qE "WARN [1-9]" "$out"; then
+            echo "::error::testthat reported a warning"
+            grep -A6 "Warnings" "$out" || true
             exit 1
           fi
 
@@ -307,12 +319,12 @@ jobs:
         run: pip install --find-links python/dist glmm
       - name: Install test + lint deps
         # ruff pinned so a new release's rule/formatter changes can't break CI
-        # mid-release (0.16.0 did exactly that); bump deliberately. pandas and
-        # pyarrow are not package dependencies — they are installed here only
-        # so the pandas-categorical `.cat`-accessor branch and the pyarrow
-        # Table/ChunkedArray branches run under test instead of skipping
-        # themselves.
-        run: pip install pytest pandas pyarrow ruff==0.16.0
+        # mid-release (0.16.0 did exactly that); bump deliberately. pandas,
+        # pyarrow and polars are not package dependencies — they are installed
+        # here only so the pandas-categorical `.cat`-accessor branch, the
+        # pyarrow Table/ChunkedArray branches and the polars tests run under
+        # test instead of skipping themselves.
+        run: pip install pytest pandas pyarrow polars ruff==0.16.0
       - name: pytest against the installed wheel, run outside the source tree
         run: |
           cd "$RUNNER_TEMP"

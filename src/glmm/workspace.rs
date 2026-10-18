@@ -264,11 +264,27 @@ pub(crate) struct StructuredPattern {
     /// packed/blocked/e=0 paths, which never touch it.
     pub(crate) structured_schur: Option<StructuredSchur>,
     /// Test-only: force the dense `glmm_block_chol` Schur factor instead of the
-    /// cached sparse one, so the both-paths cross-check runs both at one θ. Always
-    /// `false` in production (the sparse factor is the only path). The objective
-    /// and the pinned-γ̂ re-evaluation both read this same pattern, so the
-    /// cross-check compares whole fits, not a single deviance evaluation.
+    /// cached sparse one, so the both-paths cross-check runs both at one θ.
+    /// The objective and the pinned-γ̂ re-evaluation both read this same
+    /// pattern, so the cross-check compares whole fits, not a single deviance
+    /// evaluation.
+    #[cfg(test)]
     pub(crate) force_dense_schur: bool,
+}
+
+// Read through these so a release build carries neither the switch nor the
+// branches on it; outside tests the sparse factor is the only path.
+#[cfg(test)]
+impl StructuredPattern {
+    pub(crate) fn force_dense_schur(&self) -> bool {
+        self.force_dense_schur
+    }
+}
+#[cfg(not(test))]
+impl StructuredPattern {
+    pub(crate) fn force_dense_schur(&self) -> bool {
+        false
+    }
 }
 
 /// Packed-row layout scratch (`GlmmLayout::Packed`): the `M = ZΛ` nonzeros in
@@ -706,23 +722,53 @@ pub(crate) struct FdState {
     /// Force the FD stencil on every layout, skipping both exact Hessian
     /// rungs: the blocked and structured shapes land on
     /// `se::joint_hessian_cov`'s own grid, the packed-row layout on
-    /// `se::packed_fd_hessian_cov`. Test-and-A/B only: nothing on a fitting
-    /// path sets it, and it is how the crate's FD-vs-exact comparisons reach
-    /// the stencil — `exact_hessian_matches_fd_on_fixture` on the dense side,
+    /// `se::packed_fd_hessian_cov`. Test-only: it is how the crate's
+    /// FD-vs-exact comparisons reach the stencil —
+    /// `exact_hessian_matches_fd_on_fixture` on the dense side,
     /// `packed_assembled_se_matches_the_packed_stencil` and
     /// `sparse::fd_margin`'s corpus measurement on the packed one.
     /// Mirrors `force_dense_schur`.
+    #[cfg(test)]
     pub(crate) force_fd_hessian: bool,
     /// Skip the AGQ gradient-difference rung (`se::agq_gradient_difference_hessian`)
-    /// so a covered AGQ shape takes the hyper-dual rung. Test-and-A/B only,
-    /// like `force_fd_hessian`: it is how the tests compare the two exact
-    /// rungs on the same fit.
+    /// so a covered AGQ shape takes the hyper-dual rung. Test-only, like
+    /// `force_fd_hessian`: it is how the tests compare the two exact rungs on
+    /// the same fit.
+    #[cfg(test)]
     pub(crate) skip_agq_gradient_difference: bool,
     /// Rows per block of the row-blocked assembled Hessian on the blocked
-    /// layout (`assembled::SE_ROW_BLOCK`, which every fitting path keeps). Test
-    /// and A/B only: a small value sends the crate's small fixtures through
-    /// the row-blocked pass, `usize::MAX` keeps every fit on the whole-data one.
+    /// layout; outside tests the accessor returns `assembled::SE_ROW_BLOCK`.
+    /// Test-only: a small value sends the crate's small fixtures through the
+    /// row-blocked pass, `usize::MAX` keeps every fit on the whole-data one.
+    #[cfg(test)]
     pub(crate) se_row_block: usize,
+}
+
+// The test switches above, read through these so a release build carries
+// neither the fields nor the branches on them.
+#[cfg(test)]
+impl FdState {
+    pub(crate) fn force_fd_hessian(&self) -> bool {
+        self.force_fd_hessian
+    }
+    pub(crate) fn skip_agq_gradient_difference(&self) -> bool {
+        self.skip_agq_gradient_difference
+    }
+    pub(crate) fn se_row_block(&self) -> usize {
+        self.se_row_block
+    }
+}
+#[cfg(not(test))]
+impl FdState {
+    pub(crate) fn force_fd_hessian(&self) -> bool {
+        false
+    }
+    pub(crate) fn skip_agq_gradient_difference(&self) -> bool {
+        false
+    }
+    pub(crate) fn se_row_block(&self) -> usize {
+        super::assembled::SE_ROW_BLOCK
+    }
 }
 
 /// Post-search inference outputs and their scratch: the joint Hessian and
@@ -949,7 +995,7 @@ pub struct GlmmWorkspace {
     /// Outer search route for this shape — see `OuterSearch`. The constructor
     /// sets `solver`'s start radius from it, so a test that overrides this
     /// field keeps the constructor's radius.
-    pub outer_search: OuterSearch,
+    pub(crate) outer_search: OuterSearch,
     /// Which optimizer the outer search runs, per start kind
     /// ([`gradient_route_plan`](super::gradient_route_plan)): projected BFGS
     /// over `[θ | β]` on the gradient route's shapes (Laplace ones, and the
@@ -1316,7 +1362,7 @@ impl GlmmWorkspace {
         } else {
             OuterSearch::PqlThenJoint
         };
-        // Feeds through the shared `apply_campaign_overrides` tail.
+        // Feeds through the shared `apply_shipped_schedule` tail.
         let mut config = Config::new(n_theta + p + n_disp);
         config.rho_begin = if outer_search == OuterSearch::Joint {
             GLMM_RHO_BEGIN
@@ -1324,7 +1370,7 @@ impl GlmmWorkspace {
             GLMM_RHO_POLISH
         };
         config.rho_end = GLMM_RHO_END;
-        crate::lmm::apply_campaign_overrides(&mut config, n_theta + p + n_disp);
+        crate::lmm::apply_shipped_schedule(&mut config, n_theta + p + n_disp);
         // Stage-1 θ-only BOBYQA config: `rho_end` as the joint solver above,
         // `GLMM_RHO_BEGIN` from the blind start, but `npt` mirrors the LMM's mid-model rule
         // (`LmmWorkspace::for_cluster_spec_ext`, `src/lmm/mod.rs`), NOT the
@@ -1332,7 +1378,7 @@ impl GlmmWorkspace {
         // and this crate's precedent for a
         // θ-only search is the LMM one. The dimension fed into that shared
         // rule is `n_stage1` — θ, plus the `ln θ_NB` / `ln φ` coordinate. Both
-        // configs feed through the shared `apply_campaign_overrides` tail.
+        // configs feed through the shared `apply_shipped_schedule` tail.
         let n_stage1 = n_theta + n_disp;
         let npt_stage1 = if n_stage1 >= 3 {
             (3 * n_stage1).div_ceil(2) + 1
@@ -1343,7 +1389,7 @@ impl GlmmWorkspace {
         config_stage1.rho_begin = GLMM_RHO_BEGIN;
         config_stage1.rho_end = GLMM_RHO_END;
         config_stage1.npt = npt_stage1;
-        crate::lmm::apply_campaign_overrides(&mut config_stage1, n_stage1);
+        crate::lmm::apply_shipped_schedule(&mut config_stage1, n_stage1);
         // θ-only incumbent buffer and its box: the θ prefix of the joint start,
         // plus the ln θ_NB / ln φ slot (the joint vector's LAST entry, so the
         // stage-1 box is no longer a prefix of the joint box there).
@@ -1499,6 +1545,7 @@ impl GlmmWorkspace {
                 coup_pos: vec![0u32; (pattern_rows * crate::lmm::MAX_EXTRA_GROUPINGS).max(1)],
                 coup_mask: None,
                 structured_schur: None,
+                #[cfg(test)]
                 force_dense_schur: false,
             },
             design_ids: Vec::new(),
@@ -1527,6 +1574,7 @@ impl GlmmWorkspace {
                 logdet_beta: vec![0.0; p],
                 u_acc: vec![0.0; k.max(1)],
                 tail_inv: vec![0.0; (e_crossed * e_crossed).max(1)],
+                #[cfg(test)]
                 tail_r: vec![0.0; e_crossed.max(1)],
                 tail_g: vec![0.0; (q_core * q_core * n_primary).max(1)],
                 tail_h: vec![0.0; coupling_len(max_n, n_primary, q_core, e_crossed)],
@@ -1566,8 +1614,11 @@ impl GlmmWorkspace {
                 fd_steps: vec![0.0; n_theta + p],
                 warm_seed_active: false,
                 pirls_tol_override: None,
+                #[cfg(test)]
                 force_fd_hessian: false,
+                #[cfg(test)]
                 skip_agq_gradient_difference: false,
+                #[cfg(test)]
                 se_row_block: super::assembled::SE_ROW_BLOCK,
             },
             offset: None,
@@ -1651,7 +1702,10 @@ pub(crate) fn fd_worker_ws(src: &GlmmWorkspace, n: usize) -> GlmmWorkspace {
         .structured_schur
         .as_ref()
         .map(|ss| ss.clone_scratch());
-    w.pattern.force_dense_schur = src.pattern.force_dense_schur;
+    #[cfg(test)]
+    {
+        w.pattern.force_dense_schur = src.pattern.force_dense_schur;
+    }
     w.nb_theta = src.nb_theta;
     w.gamma_phi = src.gamma_phi;
     w.gamma_phi_held = src.gamma_phi_held;

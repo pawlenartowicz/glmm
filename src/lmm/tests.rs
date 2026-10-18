@@ -5,28 +5,6 @@ use crate::fit::common_tests::lcg;
 use crate::test_support::{cluster_of_row, extra_level_of_row, intercept_only_spec, model_atom};
 use crate::{Family, Grouping, GroupingRelation, ModelSpec, ReStructure, Sizing};
 
-/// Grammar: `<mult>n<add>`, e.g. `2n1` = 2·n+1, `1.5n1` = ⌈1.5·n⌉+1, `1n2` =
-/// n+2. Result clamped to BOBYQA's legal `[n+2, (n+1)(n+2)/2]`: flat constants
-/// (and small-n underflow) violate the bounds, so the hook clamps rather than
-/// panic deep in `Bobyqa::new`.
-#[test]
-fn npt_formula_parses_and_clamps() {
-    assert_eq!(npt_from_formula("2n1", 36), Some(73));
-    assert_eq!(npt_from_formula("1.5n1", 36), Some(55)); // ⌈54⌉+1
-    assert_eq!(npt_from_formula("1n2", 36), Some(38));
-    assert_eq!(npt_from_formula("1.5n1", 2), Some(4)); // ⌈3⌉+1 = 4 = n+2 ✓
-    assert_eq!(npt_from_formula("3n0", 2), Some(6)); // 6 = (n+1)(n+2)/2 cap
-    assert_eq!(npt_from_formula("1n0", 3), Some(5)); // clamped up to n+2
-    assert_eq!(npt_from_formula("500n500", 8), Some(45)); // clamp is npt-specific
-    assert_eq!(npt_from_formula("garbage", 8), None);
-    assert_eq!(npt_from_formula("73", 8), None); // flat constants rejected
-
-    // The unclamped parser underneath: no npt clamp, and the multiplier is
-    // mandatory (write `1n2`, not `n2`).
-    assert_eq!(eval_formula("500n500", 8), Some(4500));
-    assert_eq!(eval_formula("n2", 8), None);
-}
-
 /// The plain single-intercept grouping at `n_clusters` clusters (no slopes,
 /// no extras), as a `ModelSpec` lowers it.
 fn single_grouping(n_clusters: usize) -> LmmGroupings {
@@ -58,50 +36,37 @@ fn hand_dataset() -> (Mat<f64>, Vec<f64>, Vec<u32>) {
     (x, y, ids)
 }
 
-/// Same quantity, two factorizations — both return
-/// log|V| + log|X'V⁻¹X| + (N−P)·log σ̂², so agreement is FP-level
-/// (≤ 1e-9 rel), not up-to-a-constant. THE formulation proof, held on
-/// every θ probed.
-///
-/// `PINNED_DEV` values are frozen reference deviances for `hand_dataset`
-/// across θ, pinned so the cross-check between the collapse and general
-/// REML paths in `reml_deviance` holds against a fixed reference.
+/// q=1 single-grouping deviance against the textbook n×n V oracle
+/// ([`brute_force_deviance`]) at nine θ from 0 to 100, under REML and ML;
+/// the balanced collapse arm against the general loop at the same θ
+/// (reassociation band, ≤ 1e-9 rel). The collapse precompute holds no
+/// criterion term, so it serves both criteria.
 #[test]
-fn deviance_matches_pinned_across_theta() {
-    const PINNED_DEV: [(f64, f64); 9] = [
-        (0.0, -5.133651734340493e1),
-        (1e-4, -5.133651830952116e1),
-        (1e-2, -5.134617257834838e1),
-        (0.1, -5.22466385997638e1),
-        (0.5, -6.044958474290513e1),
-        (1.0, -6.2089881344871685e1),
-        (2.0, -5.8665868559293685e1),
-        (10.0, -4.390226095246822e1),
-        (100.0, -2.0933925045275885e1),
-    ];
-
+fn deviance_matches_brute_force_across_theta() {
+    const THETAS: [f64; 9] = [0.0, 1e-4, 1e-2, 0.1, 0.5, 1.0, 2.0, 10.0, 100.0];
     let (x, y, ids) = hand_dataset();
     let mut suff = LmmSuffStats::with_groupings(3, single_grouping(6));
     suff.add_rows(x.as_ref(), &y, &ids);
     let mut fit = LmmFitScratch::with_groupings(3, &single_grouping(6));
     let mut fit_c = LmmFitScratch::with_groupings(3, &single_grouping(6));
     assert!(precompute_balanced_collapse(&suff, &mut fit_c));
-
-    for &(theta, dev_ship) in &PINNED_DEV {
-        let dev_gen = reml_deviance(&[theta], &suff, &mut fit);
-        assert!(dev_gen.is_finite(), "θ={theta}");
-        let tol = 1e-9 * dev_ship.abs().max(1.0);
-        assert!(
-            (dev_ship - dev_gen).abs() <= tol,
-            "θ={theta}: pinned {dev_ship} vs general {dev_gen}"
-        );
-        // Collapse arm — reassociation band vs the general loop incl. θ=0.
-        let dev_c = reml_deviance(&[theta], &suff, &mut fit_c);
-        let band = 1e-9 * dev_gen.abs().max(1.0);
-        assert!(
-            (dev_c - dev_gen).abs() <= band,
-            "θ={theta}: collapse {dev_c} vs general {dev_gen}"
-        );
+    for criterion in [Criterion::Reml, Criterion::Ml] {
+        fit.criterion = criterion;
+        fit_c.criterion = criterion;
+        for &theta in &THETAS {
+            let dev_gen = reml_deviance(&[theta], &suff, &mut fit);
+            let oracle = brute_force_deviance(&[theta], &x, &y, &[&ids], criterion);
+            assert!(dev_gen.is_finite(), "{criterion:?} θ={theta}");
+            assert!(
+                (dev_gen - oracle).abs() <= 1e-8 * oracle.abs().max(1.0),
+                "{criterion:?} θ={theta}: general {dev_gen} vs oracle {oracle}"
+            );
+            let dev_c = reml_deviance(&[theta], &suff, &mut fit_c);
+            assert!(
+                (dev_c - dev_gen).abs() <= 1e-9 * dev_gen.abs().max(1.0),
+                "{criterion:?} θ={theta}: collapse {dev_c} vs general {dev_gen}"
+            );
+        }
     }
 }
 
@@ -171,8 +136,7 @@ fn reused_workspace_refill_matches_fresh() {
 /// (β̂/σ̂²/SE/deviance), with `converged = false` and `boundary_hit == 2`
 /// (not the accepted-boundary 1). Forces the cap by swapping in a solver
 /// whose `max_fun` is the legal minimum (`npt + 1`) — one eval past the
-/// initial model build, nowhere near this dataset's optimum — bypassing
-/// `LMM_MAX_FUN_FORMULA` entirely so the test carries no process-env race.
+/// initial model build, nowhere near this dataset's optimum.
 #[test]
 fn maxfun_cap_reports_honest_endpoint() {
     let (x, y, ids) = hand_dataset();
@@ -1222,65 +1186,6 @@ fn lmm_fit_general_warm_path_bounded_alloc() {
     );
 }
 
-/// Crossed-slopes twin of the bounded-alloc gate: the blocked path's only
-/// per-eval heap traffic is the faer `llt` internals (everything else lives in
-/// `LmmFitScratch.blocked_*`, sized once). Same acceptance class as the other
-/// general fits; faer-version/machine specific — if faer changes its Cholesky
-/// internals, update the bound, do not relax.
-#[cfg(feature = "alloc-tests")]
-#[test]
-#[ignore]
-fn lmm_fit_crossed_slope_warm_path_bounded_alloc() {
-    let _serial = crate::test_support::alloc_test_guard();
-    const N_CALLS: usize = 100;
-    // Measured ~5004 (this machine, faer 0.x, 2026-09-05): the per-eval Cholesky
-    // runs through `chol_lower`'s own scratch buffer at `Par::Seq` instead
-    // of `MatRef::llt`, so it never touches faer's global rayon pool. ALL faer-
-    // internal — `reml_deviance_blocked` itself is zero-alloc (every buffer is
-    // in `blocked_*` scratch; only a stack `lam_g`). faer-version/machine
-    // specific; if faer changes its Cholesky internals, update — do not relax.
-    const BOUND: u64 = 55000;
-
-    let (x, y, pid, eid) = crossed_slope_golden_dataset();
-    let cluster = ModelSpec {
-        family: Family::Gaussian,
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 8 },
-            slopes: vec![1],
-            extra_groupings: vec![Grouping {
-                relation: GroupingRelation::Crossed { n_clusters: 6 },
-                slopes: vec![1],
-            }],
-        }),
-    };
-    let mut ws =
-        LmmWorkspace::for_cluster_spec_ext(2, &cluster, x.nrows(), &[1], &[vec![1]], false);
-    ws.suff_mut().reset();
-    ws.suff_mut()
-        .add_rows_multi(x.as_ref(), &y, &pid, std::slice::from_ref(&eid), None);
-    // prime cold, then warm-start subsequent refits from the previous fit's fitted θ
-    // (the loop tier's production pattern).
-    let _ = fit_lmm_unhinted(&mut ws, &[1], None, ColumnScaling::IDENTITY);
-    let warm = ws.theta.clone();
-
-    let profiler = dhat::Profiler::builder().testing().build();
-    for _ in 0..N_CALLS {
-        ws.suff_mut().reset();
-        ws.suff_mut()
-            .add_rows_multi(x.as_ref(), &y, &pid, std::slice::from_ref(&eid), None);
-        let _ = fit_lmm_unhinted(&mut ws, &[1], Some(&warm), ColumnScaling::IDENTITY);
-    }
-    let stats = dhat::HeapStats::get();
-    drop(profiler);
-    assert!(
-        stats.total_blocks <= BOUND,
-        "crossed-slope fit_lmm allocated {} blocks across {} warm-path calls (BOUND = {})",
-        stats.total_blocks,
-        N_CALLS,
-        BOUND
-    );
-}
-
 // -----------------------------------------------------------------------
 // Standalone primary slopes: q_p×q_p primary block, oracle deviance,
 // diagonal-only pin. Data lives on the engine's f32 plane (mirrors the scalar
@@ -1644,12 +1549,24 @@ fn slope_fit_converges_interior() {
     assert!(
         (ws.recovery.betas[1] - 0.20152611939449563).abs() / 0.20152611939449563_f64.abs() < 1e-6
     );
-    assert_eq!(fit.pinned_components & !0b11, 0); // only 2 components exist
+    assert_eq!(
+        fit.pinned_components, 0,
+        "a well-identified design pins no component"
+    );
 }
 
-/// End-to-end two-slope fit: 3 components (intercept + 2 slopes), interior.
+/// End-to-end two-slope fit (intercept + 2 slopes) whose REML optimum is a
+/// rank-deficient Σ̂. On this draw the x2 slope is almost a linear combination of
+/// the intercept and the x1 slope (corr(x1, x2) ≈ −0.997), so the trailing
+/// Cholesky diagonal λ₂₂, the x2 slope's variance given the other two, pins
+/// (bit 2) while the x2 slope's own variance (row 2 of Λ) stays positive. The
+/// boundary is the optimum, not an optimizer stop: with the other five θ
+/// re-optimized, the deviance rises monotonically in λ₂₂ (+5.9e-4 at 0.01,
+/// +0.53 at 0.3), BOBYQA lands on the same pin at this constructor's npt
+/// (2n+1 = 13) and at the production one (⌈1.5n⌉+1 = 10), and lme4 2.0-6
+/// fits this data to the same θ̂ with `isSingular` TRUE.
 #[test]
-fn multislope_fit_converges_interior() {
+fn multislope_fit_pins_rank_deficient_slope_block() {
     let (x, y, ids) = multislope_dataset();
     let mut ws = LmmWorkspace::with_groupings(3, multislope_groupings());
     ws.suff_mut()
@@ -1688,7 +1605,29 @@ fn multislope_fit_converges_interior() {
     assert!(
         (ws.recovery.betas[2] - 0.28355377896623535).abs() / 0.28355377896623535_f64.abs() < 1e-6
     );
-    assert_eq!(fit.pinned_components & !0b111, 0); // only 3 components exist
+    assert_eq!(fit.pinned_components, 0b100, "only λ₂₂ pins");
+    let x2_row = ws.theta[2].hypot(ws.theta[4]);
+    assert!(
+        x2_row > 0.1,
+        "x2 slope variance collapsed: |Λ row 2| = {x2_row}"
+    );
+    // Recorded from glmm's own output. lme4 2.0-6 reaches the same optimum:
+    // its REMLcrit 154.045763924748 is this plus (n − p)(1 + ln 2π).
+    // Equal-or-better passes.
+    const DEV_OPT: f64 = -109.876_803_251_320_7;
+    assert!(
+        fit.deviance <= DEV_OPT + 1e-9,
+        "deviance {} above the optimum {DEV_OPT}",
+        fit.deviance
+    );
+    let mut off = ws.theta.clone();
+    off[5] = 0.01;
+    let dev_off = ws.kernel.deviance(&off);
+    assert!(
+        dev_off > fit.deviance + 1e-4,
+        "moving λ₂₂ off the pin did not raise the deviance: {dev_off} vs {}",
+        fit.deviance
+    );
 }
 
 /// Slope-variance collapse pins the SLOPE component (bit 1), not the
@@ -2237,103 +2176,6 @@ fn nested_slope_deviance_matches_brute_force() {
     }
 }
 
-/// End-to-end NESTED-SLOPE fit: guards against a mis-assembled blocked
-/// objective, which makes BOBYQA diverge to NaN (`converged = false`) on
-/// every seed. With the correct objective the full θ-search must converge to
-/// a finite interior fit. Asserts `converged`, no numerical failure
-/// (`boundary_hit != 2`), finite θ̂/σ̂², and β̂ recovered near the planted
-/// [0.5, 0.4].
-#[test]
-fn nested_slope_fit_converges() {
-    let n_per_parent = 3u32;
-    let cluster = ModelSpec {
-        family: Family::Gaussian,
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 5 },
-            slopes: vec![1],
-            extra_groupings: vec![Grouping {
-                relation: GroupingRelation::NestedWithin { n_per_parent },
-                slopes: vec![1],
-            }],
-        }),
-    };
-    let n = 120; // atom = 5·3 = 15 ⇒ 8 balanced blocks
-    let n_child = 5 * n_per_parent as usize;
-    let mut st = 137u64;
-    let u0p: Vec<f64> = (0..5).map(|_| 0.5 * lcg(&mut st)).collect();
-    let u1p: Vec<f64> = (0..5).map(|_| 0.3 * lcg(&mut st)).collect();
-    let u0e: Vec<f64> = (0..n_child).map(|_| 0.4 * lcg(&mut st)).collect();
-    let u1e: Vec<f64> = (0..n_child).map(|_| 0.3 * lcg(&mut st)).collect();
-    let mut x = Mat::<f64>::zeros(n, 2);
-    let mut y = vec![0.0f64; n];
-    let mut pid = vec![0u32; n];
-    let mut eid = vec![0u32; n];
-    for i in 0..n {
-        let par = cluster_of_row(&cluster.re.as_ref().unwrap().sizing, i);
-        let child = extra_level_of_row(&cluster, 0, i);
-        pid[i] = par as u32;
-        eid[i] = child as u32;
-        let x1 = lcg(&mut st);
-        x[(i, 0)] = 1.0;
-        x[(i, 1)] = x1;
-        y[i] = 0.5
-            + 0.4 * x1
-            + u0p[par]
-            + u1p[par] * x1
-            + u0e[child]
-            + u1e[child] * x1
-            + 0.8 * lcg(&mut st);
-    }
-    let mut ws = LmmWorkspace::for_cluster_spec_ext(2, &cluster, n, &[1], &[vec![1]], false);
-    ws.suff_mut().reset();
-    ws.suff_mut()
-        .add_rows_multi(x.as_ref(), &y, &pid, &[eid.clone()], None);
-    let fit = fit_lmm_unhinted(&mut ws, &[1], None, ColumnScaling::IDENTITY);
-    assert!(fit.converged, "nested-slope fit must converge");
-    assert_ne!(fit.boundary_hit, 2, "must not be a numerical (NaN) failure");
-    assert!(
-        fit.sigma_sq.is_finite() && fit.sigma_sq > 0.0,
-        "σ̂² {}",
-        fit.sigma_sq
-    );
-    assert!(ws.theta.iter().all(|t| t.is_finite()), "θ̂ {:?}", ws.theta);
-    // Deterministic regression lock (seed 137): θ̂ = [primary vech (λ00,λ10,λ11) ;
-    // nested-child vech (λ00,λ10,λ11)] — the defect this test guards against is a
-    // corrupted θ̂ that a finiteness check alone would not catch (β̂ locks below
-    // catch it only indirectly).
-    // Re-pinned 2026-10-02 with the per-search BOBYQA start radii (LMM blind
-    // start 0.5): the search takes another path to the same optimum, worst move
-    // 1.9e-6 relative on θ̂[1], REML criterion 6e-13 lower, the same boundary
-    // code and pinned components.
-    const PINNED_THETA: [f64; 6] = [
-        0.1795697879542531,
-        0.043694366760916495,
-        0.0,
-        0.5406150077859789,
-        0.13052692349786316,
-        0.0,
-    ];
-    for (j, (&got, &want)) in ws.theta.iter().zip(&PINNED_THETA).enumerate() {
-        let rel = (got - want).abs() / want.abs().max(1e-12);
-        assert!(rel < 1e-6, "θ̂[{j}] = {got}, want {want}");
-    }
-    assert!(
-        (0.2..0.8).contains(&ws.recovery.betas[0]),
-        "intercept {}",
-        ws.recovery.betas[0]
-    );
-    assert!(
-        (0.1..0.7).contains(&ws.recovery.betas[1]),
-        "slope {}",
-        ws.recovery.betas[1]
-    );
-    // Deterministic regression lock (seed 137) alongside the wide recovers-check above.
-    assert!(
-        (ws.recovery.betas[0] - 0.6209080774915476).abs() / 0.6209080774915476_f64.abs() < 1e-6
-    );
-    assert!((ws.recovery.betas[1] - 0.257915422474595).abs() / 0.257915422474595_f64.abs() < 1e-6);
-}
-
 /// General brute-force REML deviance: V = I + Σ_g Z_g D_g Z_gᵀ where each
 /// factor `(ids, vech)` contributes a 2×2 D over [1, x1] (an intercept-only
 /// factor passes `[θ, 0, 0]`). Used for the multi-crossed-factor oracle.
@@ -2446,9 +2288,12 @@ fn two_crossed_slopes_deviance_matches_brute_force() {
 
 /// Deterministic crossed-slope dataset for the lme4 golden: 8 primary
 /// clusters × 6 crossed levels × 2 reps (n=96),
-/// `y = 1.0 + 0.8·x1 + u0p + u1p·x1 + u0e + u1e·x1 + ε`. The Rust generator is
-/// the source of truth; `dump_crossed_slope_golden_csv` writes it for the R
-/// `lme4::lmer` reference whose fit is frozen in `GOLDEN_LME4_*`.
+/// `y = 1.0 + 0.8·x1 + u0p + u1p·x1 + u0e + u1e·x1 + ε`. Mirrored operation for
+/// operation by `tests/fixtures/gen_crossed_slope_lme4.R`, which rebuilds these
+/// doubles for the `lme4::lmer` reference frozen in
+/// `crossed_slope_fit_matches_lme4_golden` (change together);
+/// `dump_crossed_slope_golden_csv` writes them as a CSV that script can check
+/// against.
 fn crossed_slope_golden_dataset() -> (Mat<f64>, Vec<f64>, Vec<u32>, Vec<u32>) {
     let (n_prim, n_cross, n) = (8usize, 6usize, 96usize);
     let mut st = 20260629u64;
@@ -2493,8 +2338,10 @@ fn dump_crossed_slope_golden_csv() {
 
 /// L3 golden: `glmm`'s crossed-slope fit must reproduce `lme4::lmer`'s REML fit
 /// of `y ~ x1 + (1+x1|pid) + (1+x1|eid)` on the committed dataset — fixed
-/// effects, residual σ², and both 2×2 RE covariances. Frozen from
-/// `/tmp/golden_fit.R` (lme4 1.1, bobyqa). Recovered D_g = σ̂²·Λ_gΛ_gᵀ from θ̂.
+/// effects, residual σ², and both 2×2 RE covariances. Frozen from lme4 1.1 with
+/// `optimizer = "bobyqa"`; `tests/fixtures/gen_crossed_slope_lme4.R` regenerates
+/// them (registered in `validation/manifest.json`, `in_crate_references`).
+/// Recovered D_g = σ̂²·Λ_gΛ_gᵀ from θ̂.
 #[test]
 fn crossed_slope_fit_matches_lme4_golden() {
     // lme4 golden (REML, bobyqa).

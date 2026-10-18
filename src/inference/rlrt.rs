@@ -364,7 +364,7 @@ pub(crate) struct RlrtConfig {
 /// The simulated null distribution of the RLRT on one design, built from the
 /// design alone by [`rlrt_null`], so any number of observed statistics on
 /// that design read their p-value from it ([`RlrtNull::p_value`]). The
-/// fields no caller reads (`n_zero`, `seed`, `edge_hits`) exist in tests only.
+/// fields no caller reads (`n_zero`, `edge_hits`) exist in tests only.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RlrtNull {
     /// The positive draws, sorted ascending.
@@ -374,9 +374,6 @@ pub(crate) struct RlrtNull {
     pub(crate) n_zero: usize,
     /// Draws in all, `n_zero + draws_pos.len()`.
     pub(crate) nsim: usize,
-    /// The seed the draws came from.
-    #[cfg(test)]
-    pub(crate) seed: u64,
     /// Draws whose maximum sits on the last grid point, where the supremum
     /// may lie beyond the grid.
     #[cfg(test)]
@@ -463,8 +460,8 @@ pub(crate) fn null_draws(design: &RlrtDesign, cfg: &RlrtConfig) -> Vec<(f64, usi
 }
 
 /// The simulated null of `design` ([`null_draws`]): the positive draws
-/// sorted, the zeros and the grid-edge hits counted, and the `nsim` and seed
-/// of `cfg` carried.
+/// sorted, the zeros and the grid-edge hits counted, and the `nsim` of `cfg`
+/// carried.
 pub(crate) fn rlrt_null(design: &RlrtDesign, cfg: &RlrtConfig) -> RlrtNull {
     let draws = null_draws(design, cfg);
     // An index-0 maximum is exactly `+0.0` and any other is positive.
@@ -475,8 +472,6 @@ pub(crate) fn rlrt_null(design: &RlrtDesign, cfg: &RlrtConfig) -> RlrtNull {
         n_zero: cfg.nsim - draws_pos.len(),
         draws_pos,
         nsim: cfg.nsim,
-        #[cfg(test)]
-        seed: cfg.seed,
         #[cfg(test)]
         edge_hits: draws
             .iter()

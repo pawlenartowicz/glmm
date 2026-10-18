@@ -189,7 +189,7 @@ pub(crate) fn sim_clustered(csv: &str) -> (Vec<f64>, Vec<f64>, Vec<u32>, usize) 
 /// this pins the wrong-length case still faults on an otherwise-open path
 /// (fixed-only OLS), independent of the family/RE capability map above.
 #[test]
-#[should_panic(expected = "n elements")]
+#[should_panic(expected = "FitOptions.weights must have n elements")]
 fn weights_shape_still_asserted() {
     let n = 4;
     let x = vec![1.0f64; n];
@@ -900,7 +900,8 @@ pub(crate) fn entangled_dyadic_designs(n: usize) -> (Vec<f64>, Vec<f64>, f64) {
 
 /// Deterministic pseudo-data (NR LCG), uniform in (−1, 1). The shared LCG
 /// fixture generator for the crate's unit tests, so fixtures seeded alike
-/// draw the same stream.
+/// draw the same stream. Mirrored in R by `tests/fixtures/gen_crossed_slope_lme4.R`
+/// (change together).
 pub(crate) fn lcg(state: &mut u64) -> f64 {
     *state = state
         .wrapping_mul(6364136223846793005)
@@ -1127,46 +1128,14 @@ fn spec_sized_from_ids_derives_counts() {
     );
 }
 
-/// UNBALANCED nesting: 3 parents with 1, 2, and 3 distinct children
-/// respectively, primary ids ascending with the widest parent last
-/// (`0 → {0}`, `1 → {3,4}`, `2 → {6,7,8}` — the contiguous-per-parent-block
-/// layout the formula frontend's `grouping_ids` now emits, padded to width 3).
-#[test]
-fn spec_sized_from_ids_nested_unbalanced_uses_true_max_per_parent() {
-    let re = ReStructure {
-        sizing: Sizing::FixedClusters { n_clusters: 1 },
-        slopes: vec![],
-        extra_groupings: vec![Grouping {
-            relation: GroupingRelation::NestedWithin { n_per_parent: 1 },
-            slopes: vec![],
-        }],
-    };
-    let model = ModelSpec {
-        family: Family::Gaussian,
-        re: Some(re),
-    };
-    // primary id 0: 1 row → child {0}; id 1: 2 rows → children {3,4};
-    // id 2: 3 rows → children {6,7,8}.
-    let ids = GroupIds {
-        primary: vec![0, 1, 1, 2, 2, 2],
-        extra: vec![vec![0, 3, 4, 6, 7, 8]],
-    };
-    let (sized, _ids, _perm) = super::spec_sized_from_ids(&model, &ids);
-    let sre = sized.re.unwrap();
-    assert_eq!(sre.sizing, Sizing::FixedClusters { n_clusters: 3 });
-    assert_eq!(
-        sre.extra_groupings[0].relation,
-        GroupingRelation::NestedWithin { n_per_parent: 3 }
-    );
-}
-
-/// Same unbalanced shape, but the WIDEST parent is first in primary order
-/// (id 0 → 3 children `{0,1,2}`, id 1 → 2 `{3,4}`, id 2 → 1 `{5}`). The old
+/// UNBALANCED nesting (3 parents with 3, 2 and 1 distinct children), the
+/// WIDEST parent first in primary order (id 0 → 3 children `{0,1,2}`, id 1 → 2 `{3,4}`, id 2 → 1 `{5}`). The old
 /// `children.div_ceil(n_primary)` formula computed `⌈6/3⌉ = 2` from the
 /// global `max(extra)+1 = 6` — under-sizing parent 0's true 3-wide block
 /// because the fullest parent isn't the one that sets the global max id.
 /// The true per-parent count (grouping rows by `(primary, extra)` pairs)
 /// gets this right regardless of which parent is fullest.
+/// The mirror layout, widest parent last (`0 → {0}`, `1 → {3,4}`, `2 → {6,7,8}`), is checked too.
 #[test]
 fn spec_sized_from_ids_nested_unbalanced_first_parent_widest() {
     let re = ReStructure {
@@ -1181,16 +1150,34 @@ fn spec_sized_from_ids_nested_unbalanced_first_parent_widest() {
         family: Family::Gaussian,
         re: Some(re),
     };
-    let ids = GroupIds {
-        primary: vec![0, 0, 0, 1, 1, 2],
-        extra: vec![vec![0, 1, 2, 3, 4, 5]],
-    };
-    let (sized, _ids, _perm) = super::spec_sized_from_ids(&model, &ids);
-    let sre = sized.re.unwrap();
-    assert_eq!(
-        sre.extra_groupings[0].relation,
-        GroupingRelation::NestedWithin { n_per_parent: 3 }
-    );
+    // Widest parent first (where the old `div_ceil` formula under-sized it)
+    // and widest parent last (padded contiguous ids, as `grouping_ids` emits):
+    // the width is the true per-parent maximum either way.
+    for ids in [
+        GroupIds {
+            primary: vec![0, 0, 0, 1, 1, 2],
+            extra: vec![vec![0, 1, 2, 3, 4, 5]],
+        },
+        GroupIds {
+            primary: vec![0, 1, 1, 2, 2, 2],
+            extra: vec![vec![0, 3, 4, 6, 7, 8]],
+        },
+    ] {
+        let (sized, _ids, _perm) = super::spec_sized_from_ids(&model, &ids);
+        let sre = sized.re.unwrap();
+        assert_eq!(
+            sre.sizing,
+            Sizing::FixedClusters { n_clusters: 3 },
+            "{:?}",
+            ids.primary
+        );
+        assert_eq!(
+            sre.extra_groupings[0].relation,
+            GroupingRelation::NestedWithin { n_per_parent: 3 },
+            "{:?}",
+            ids.primary
+        );
+    }
 }
 
 /// A `q_g = 5` (intercept + 4 slopes) extra grouping is over the `MAX_EXTRA_Q = 4`
@@ -1633,6 +1620,39 @@ fn classify_routes_at_the_cap_edge() {
     };
     assert!(matches!(
         super::classify_design(&in_env, 1),
+        super::Solver::NoZ
+    ));
+
+    // Exactly MAX_EXTRA_GROUPINGS intercept-only crossed groupings (24 crossed
+    // levels, far under MAX_CROSSED_LEVELS): at the cap ⇒ NoZ.
+    let at_cap_count = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 10 },
+            slopes: vec![],
+            extra_groupings: (0..crate::consts::MAX_EXTRA_GROUPINGS)
+                .map(|_| Grouping {
+                    relation: GroupingRelation::Crossed { n_clusters: 4 },
+                    slopes: vec![],
+                })
+                .collect(),
+        }),
+    };
+    assert!(matches!(
+        super::classify_design(&at_cap_count, 1),
+        super::Solver::NoZ
+    ));
+    // q_p = MAX_PRIMARY_Q exactly: at the cap ⇒ NoZ.
+    let at_cap_q = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 10 },
+            slopes: (1..crate::consts::MAX_PRIMARY_Q as u32).collect(), // q_p = MAX_PRIMARY_Q
+            extra_groupings: vec![],
+        }),
+    };
+    assert!(matches!(
+        super::classify_design(&at_cap_q, 1),
         super::Solver::NoZ
     ));
 
@@ -2495,61 +2515,6 @@ pub(crate) fn fixture_lowered(
         family,
     )
     .unwrap()
-}
-
-/// `resolve_criterion` is `None` off the Gaussian mixed model for every
-/// `reml` value: no value panics there, and `Some(true)` on a GLM or GLMM is
-/// ignored.
-#[test]
-fn resolve_criterion_is_none_off_the_lmm_path() {
-    let re = || nagq_check_spec().re;
-    let binomial = Family::Binomial {
-        link: BinomialLink::Logit,
-    };
-    let cases = [
-        ("OLS", Family::Gaussian, None, 1),
-        ("binomial GLMM, Laplace", binomial, re(), 1),
-        ("binomial GLMM, AGQ", binomial, re(), 7),
-        (
-            "Poisson GLM",
-            Family::Poisson {
-                link: PoissonLink::Log,
-            },
-            None,
-            1,
-        ),
-        (
-            "Gamma GLMM",
-            Family::Gamma {
-                link: GammaLink::Log,
-            },
-            re(),
-            1,
-        ),
-        (
-            "NB GLM",
-            Family::NegativeBinomial {
-                link: NegBinomialLink::Log,
-            },
-            None,
-            1,
-        ),
-    ];
-    for (tag, family, re, nagq) in cases {
-        let model = ModelSpec { family, re };
-        for reml in [None, Some(true), Some(false)] {
-            let opts = FitOptions {
-                nagq,
-                reml,
-                ..FitOptions::default()
-            };
-            assert_eq!(
-                common::resolve_criterion(&model, &opts),
-                None,
-                "{tag}, reml = {reml:?}"
-            );
-        }
-    }
 }
 
 /// `fit_rank_deficient` copies `nobs` and `objective` from its reduced fit (an

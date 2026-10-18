@@ -80,7 +80,7 @@ use crate::standardize::ColumnScaling;
 /// random effects moves it by up to 2.9e-5 between 1e-4 and 3e-4 and 1.5e-3
 /// between 3e-5 and 1e-4. Of the two flat steps 3e-4 has the smaller
 /// truncation error (at most 3.0e-6 against 6.3e-6, a Richardson diagnostic).
-pub(crate) const ETA: f64 = 3e-4;
+const ETA: f64 = 3e-4;
 
 /// The gradient route's step factor, `h_k = ETA_GRAD·max(|θ̃_k|, 1)`. Pinned
 /// 2026-10-11 by the gradient route's step sweep
@@ -90,7 +90,7 @@ pub(crate) const ETA: f64 = 3e-4;
 /// 1.5e-9, above 1e-5 truncation by up to 7.8e-8. Of the two flat steps 3e-6
 /// has the smaller truncation error (at most 3.1e-10 against 8.7e-10, a
 /// Richardson diagnostic).
-pub(crate) const ETA_GRAD: f64 = 3e-6;
+const ETA_GRAD: f64 = 3e-6;
 
 /// The pseudo-inverse threshold on `H_p`, relative to its largest eigenvalue.
 const REL_TOL: f64 = 1e-8;

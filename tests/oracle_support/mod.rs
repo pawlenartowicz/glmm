@@ -107,11 +107,6 @@ pub mod tol {
     /// it) plus twice `STDDEV_REL` on σ̂² (`sum_sq_rel`).
     #[allow(dead_code)] // read by tests/inference_oracle.rs only
     pub const SUM_SQ_REL: f64 = SE_REL + 2.0 * STDDEV_REL;
-    /// The reduced REML log-likelihood against R's `logLik(lm, REML = TRUE)`,
-    /// absolute (`reml0_loglik_abs`, the band of
-    /// `src/inference/rlrt_oracle_tests.rs::ols_reml_loglik_matches_lm_reml`).
-    #[allow(dead_code)] // read by tests/inference_oracle.rs only
-    pub const REML0_LOGLIK_ABS: f64 = 1e-9;
 }
 
 // ── Golden schema ────────────────────────────────────────────────────────────

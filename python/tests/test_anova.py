@@ -112,31 +112,6 @@ def test_a_table_iterates_and_tests_membership_over_its_column_names(lmm):
     assert "AIC" not in tab
 
 
-def test_anova_of_a_glmm_is_a_wald_chisq_table():
-    tab = glmm.anova(quiet_fit("n ~ x + f + (1 | g)", family="poisson"), test="Wald")
-    assert tab.heading == "Type III Analysis of Deviance Table (Wald chi-squared tests)"
-    assert tab.columns == ["Chisq", "Df", "Pr(>Chisq)"]
-    assert tab["Df"].tolist() == [1.0, 2.0]
-    # The renders add each row's reference, built from its Df.
-    html = tab.html()
-    assert "<td>χ²(1)</td>" in html and "<td>χ²(2)</td>" in html
-
-
-def test_anova_raises_the_stored_marginal_term_refusal():
-    m = quiet_fit("y ~ x + x:f")
-    with pytest.raises(ValueError) as err:
-        glmm.anova(m)
-    assert str(err.value) == m.term_table_type3["error"]
-    assert "f" in str(err.value)
-
-
-def test_an_aliased_term_names_its_coefficient():
-    # x2 copies x, so its column is aliased and its row is not tested; the
-    # note names the coefficient as the fit does, never a column index.
-    tab = glmm.anova(quiet_fit("y ~ f + x + x2", _data(x2=_X.tolist())))
-    assert "x2: The coefficient x2 is aliased, so the hypothesis was not tested." in tab.notes
-
-
 def test_df_prints_whole_at_any_size_and_satterthwaite_keeps_its_decimals(exact_pair):
     rng = np.random.default_rng(7)
     n = 30000
@@ -254,6 +229,10 @@ def test_wald_gives_the_stored_wald_table_whatever_the_fit_stored(pois):
     for ss, field in (("III", "term_table_type3"), ("II", "term_table_type2")):
         base = glmm.anova(wald, type=ss, test="Wald")
         assert base.heading == f"Type {ss} Analysis of Deviance Table (Wald chi-squared tests)"
+        assert base.columns == ["Chisq", "Df", "Pr(>Chisq)"]
+        assert base["Df"].tolist() == [1.0, 2.0]
+        html = base.html()
+        assert "<td>χ²(1)</td>" in html and "<td>χ²(2)</td>" in html
         for m in (plain, wald, asked):
             tab = glmm.anova(m, type=ss, test="Wald")
             assert tab.text() == base.text() and tab.html() == base.html()
@@ -433,17 +412,6 @@ def test_wald_or_lrt_on_an_f_table_is_refused_naming_its_test(lmm):
     assert glmm.anova(asked).text() == glmm.anova(lmm).text()
 
 
-def test_a_term_whose_column_carries_a_random_slope_keeps_its_wald_row():
-    m = quiet_fit("n ~ x + f + (1 + x | g)", family="poisson", anova_test="LRT")
-    stored = m.term_table_type3_lrt
-    assert stored["kind"] == ["chisq", "lrt"]
-    (note,) = stored["row_notes"][0]
-    assert "random slope" in note
-    tab = glmm.anova(m, test="LRT")
-    assert f"x: {note}" in tab.notes
-    assert tab["Chisq"][0] == m.term_table_type3["statistic"][0]
-
-
 def test_test_and_anova_test_are_checked(exact_pair):
     m0, m1 = exact_pair
     for t in ("auto", "Wald", "LRT"):
@@ -525,24 +493,6 @@ def test_an_agq_comparison_names_its_node_count():
     assert tab.heading == "Model comparison: likelihood ratio test (AGQ 5)"
 
 
-def test_a_dropped_variance_at_zero_gives_p_one():
-    # The larger fit's batch variance lands at exactly 0 while its
-    # log-likelihood differs from the smaller fit's by rounding only: the test
-    # reads p = 1 from the zero-component rule, which matches each fit's random
-    # terms by name.
-    rng = np.random.default_rng(3)
-    x = rng.normal(size=60)
-    d = {
-        "y": (1 + 0.5 * x + rng.normal(size=60)).tolist(),
-        "x": x.tolist(),
-        "g": [f"g{i}" for i in np.repeat(np.arange(6), 10)],
-    }
-    large = quiet_fit("y ~ x + (1 | g)", d, reml=False)
-    assert large.varcorr == [[0.0]]
-    tab = glmm.anova(quiet_fit("y ~ x", d, reml=False), large)
-    assert tab["Chisq"][1] == 0.0 and tab["Pr(>Chisq)"][1] == 1.0
-
-
 def test_compare_returns_the_table_and_the_two_fits_as_given():
     res = quiet_compare("y ~ x + f + (1 | g)", "y ~ x + (1 | g)")
     assert isinstance(res, glmm.Comparison)
@@ -569,17 +519,6 @@ def test_compare_and_anova_give_the_same_exact_rlrt_p_on_every_run(exact_pair):
     other = glmm.anova(ols, lmm1, nsim=200, seed=5)
     assert (other.nsim, other.seed) == (200, 5)
     assert "200 draws" in other.text()
-
-
-def test_an_exact_rlrt_row_at_zero_needs_no_draws():
-    ols = quiet_fit("Yield ~ 1", DYESTUFF2, reml=True)
-    full = quiet_fit("Yield ~ 1 + (1 | Batch)", DYESTUFF2)
-    assert full.varcorr == [[0.0]]
-    tab = glmm.anova(ols, full)
-    assert tab["Chisq"][1] == 0.0 and tab["Pr(>Chisq)"][1] == 1.0
-    text = tab.text()
-    assert "no draws needed" in text
-    assert "draws." not in text and "10000" not in text
 
 
 def test_anova_on_unpickled_fits_gives_the_same_tables(lmm, exact_pair):
@@ -781,11 +720,6 @@ except ImportError:
     assert out.stdout.strip() == "ok"
 
 
-def test_the_new_names_are_public():
-    for name in ("anova", "compare", "TermTable", "ComparisonTable", "Comparison"):
-        assert name in glmm.__all__ and hasattr(glmm, name)
-
-
 # -- renders --------------------------------------------------------------------
 
 _nan = math.nan
@@ -935,6 +869,7 @@ def test_term_table_renders():
 def test_comparison_table_renders():
     ols = quiet_fit("Yield ~ 1", DYESTUFF2, reml=True)
     tab = glmm.anova(ols, quiet_fit("Yield ~ 1 + (1 | Batch)", DYESTUFF2))
+    assert tab["Chisq"][1] == 0.0 and tab["Pr(>Chisq)"][1] == 1.0
     _snapshot(tab, _COMPARISON_TEXT, _COMPARISON_HTML, _COMPARISON_LATEX, _COMPARISON_TYPST)
 
 

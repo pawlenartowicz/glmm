@@ -15,14 +15,6 @@ def _data(y):
     return {"x": _X.tolist(), "g": [f"g{i}" for i in _GROUPS.tolist()], "y": y}
 
 
-def test_gaussian_lmm():
-    y = 1.0 + 2.0 * _X + _rng.normal(scale=0.5, size=_N)
-    result = glmm.fit(_data(y.tolist()), "y ~ x + (1 | g)")
-    assert result.converged
-    assert result.names == ["(Intercept)", "x"]
-    assert abs(result.beta[1] - 2.0) < 0.3
-
-
 def test_design_summary_is_kept_on_an_unweighted_random_intercept_fit_only():
     y = 1.0 + 2.0 * _X + np.sin(_GROUPS) + _rng.normal(scale=0.5, size=_N)
     data = _data(y.tolist())
@@ -34,42 +26,6 @@ def test_design_summary_is_kept_on_an_unweighted_random_intercept_fit_only():
     assert glmm.fit(data, "y ~ x").design_summary is None
     weighted = glmm.fit(data, "y ~ x + (1 | g)", weights=np.linspace(0.5, 1.5, _N))
     assert weighted.design_summary is None
-
-
-def test_native_fit_carries_offset_objective_and_term_tables():
-    # The raw `_native.fit` dict, before `glmm.Fit` stores these fields. Per-row
-    # vectors cross as the bytes of float64 (uint32 for factor codes) arrays.
-    y = 1.0 + 2.0 * _X + _rng.normal(scale=0.5, size=_N)
-    off = 0.1 * _X
-    groups = ([f"g{i}" for i in range(30)], _GROUPS.astype(np.uint32).tobytes())
-
-    def native(formula, offset):
-        return glmm._native.fit(
-            formula,
-            {"x": _X.tobytes(), "y": y.tobytes()},
-            {"g": groups},
-            "gaussian",
-            "identity",
-            "hessian",
-            1,
-            None,
-            None,
-            offset,
-            None,
-            True,
-            None,
-        )
-
-    r = native("y ~ x + (1 | g)", off.tobytes())
-    np.testing.assert_array_equal(np.frombuffer(r["offset"]), off)
-    assert (r["objective"], r["objective_nodes"]) == ("reml", 0)
-    t3 = r["term_table_type3"]
-    assert (t3["error"], t3["ss_type"], t3["label"]) == (None, "III", ["x"])
-    assert (t3["kind"], t3["den_df_kind"], t3["row_notes"]) == (["F"], ["satterthwaite"], [[]])
-    refused = native("y ~ x + x:g", None)
-    assert refused["offset"] is None
-    assert list(refused["term_table_type2"]) == ["error"]
-    assert refused["term_table_type2"]["error"]
 
 
 def test_native_fit_refuses_bytes_that_are_not_whole_values():
@@ -107,16 +63,6 @@ def test_per_row_fields_are_writable_float_arrays():
     np.testing.assert_array_equal(o, 0.1 * _X)
     assert m.ranef_levels.dtype == np.dtype(int)
     assert m.ranef_levels.tolist() == [30]
-
-
-def test_binomial_glmm():
-    p = 1.0 / (1.0 + np.exp(-(0.2 + 0.8 * _X)))
-    y = _rng.binomial(1, p).astype(float)
-    result = glmm.fit(_data(y.tolist()), "y ~ x + (1 | g)", "binomial")
-    assert result.converged
-    assert result.names == ["(Intercept)", "x"]
-    assert result.dispersion == pytest.approx(1.0)
-    assert abs(result.beta[1] - 0.8) < 0.4
 
 
 def test_diagnostics_exposes_the_fields_and_the_flags_still_read_off_fit():
@@ -197,10 +143,16 @@ def test_ill_conditioned_note_warns_under_its_own_category():
 
     with pytest.warns(
         glmm.IllConditionedWarning, match="b is almost a combination of other columns"
-    ):
+    ) as caught:
         result = glmm.fit(data, "y ~ a + b", weights=w)
     assert result.converged
     assert not result.aliased.any()  # flagged, not dropped
+    assert [(e["tier"], e["kind"], e["title"]) for e in result.warnings] == [
+        ("caution", "ill_conditioned", "Nearly collinear columns"),
+    ]
+    (entry,) = result.warnings
+    printed = f"{entry['tier'].capitalize()}: {entry['title']}. {entry['message']}"
+    assert printed in [str(c.message) for c in caught]
     (note,) = result.diagnostics["notes"]
     assert note["kind"] == "ill_conditioned"
     assert note["columns"] == [2]  # 0-based into `names`
@@ -224,13 +176,6 @@ def test_gamma_glm_fixed_dispersion():
     result = glmm.fit(_data(y.tolist()), "y ~ x", "gamma", dispersion=1.0)
     assert result.converged
     assert result.dispersion == pytest.approx(1.0)
-
-
-def test_negativebinomial_glm_cold_start():
-    y = _rng.negative_binomial(5, 0.5, size=_N).astype(float)
-    result = glmm.fit(_data(y.tolist()), "y ~ x", "negativebinomial")
-    assert result.converged
-    assert result.dispersion > 0  # theta estimate
 
 
 def test_agq_vector_q2_smoke():
@@ -258,16 +203,6 @@ def test_agq_vector_q2_smoke():
     assert np.max(np.abs(np.array(agq.varcorr[0]) - np.array(laplace.varcorr[0]))) > 1e-4
 
 
-def test_gaussian_fixed_only_exposes_loglik_df_reml_fitted():
-    y = 1.0 + 2.0 * _X + _rng.normal(scale=0.5, size=_N)
-    result = glmm.fit(_data(y.tolist()), "y ~ x")
-    assert result.converged
-    assert np.isfinite(result.loglik)
-    assert result.df == len(result.beta) + 1  # p fixed effects + sigma^2
-    assert result.reml is False
-    assert len(result.fitted) == _N
-
-
 def test_mixed_binomial_exposes_ranef_consistent_with_levels():
     p = 1.0 / (1.0 + np.exp(-(0.2 + 0.8 * _X)))
     y = _rng.binomial(1, p).astype(float)
@@ -276,6 +211,8 @@ def test_mixed_binomial_exposes_ranef_consistent_with_levels():
     assert len(result.ranef_levels) == len(result.varcorr)
     q = 1  # scalar random intercept -> q=1 per level
     assert len(result.ranef) == sum(int(lv) * q for lv in result.ranef_levels)
+    assert result.names == ["(Intercept)", "x"]
+    assert result.dispersion == pytest.approx(1.0)
 
 
 def test_lmm_ranef_blocks_label_the_flat_vector():
@@ -432,6 +369,7 @@ def test_fit_carries_header_inputs():
     y = (1.0 + 2.0 * _X + _rng.normal(scale=0.5, size=_N)).tolist()
     w = np.full(_N, 2.0)
     fit = glmm.fit(_data(y), "y ~ x + (1 | g)", weights=w)
+    assert fit.names == ["(Intercept)", "x"]
     assert fit.formula == "y ~ x + (1 | g)"
     assert fit.family == "gaussian"
     assert fit.link == "identity"
@@ -439,4 +377,8 @@ def test_fit_carries_header_inputs():
     assert fit.nobs == _N
     np.testing.assert_array_equal(fit.y, np.asarray(y))
     np.testing.assert_array_equal(fit.weights, w)
-    assert glmm.fit(_data(y), "y ~ x").weights is None
+    ols = glmm.fit(_data(y), "y ~ x")
+    assert ols.weights is None
+    assert ols.df == len(ols.beta) + 1  # p fixed effects + sigma^2
+    assert ols.reml is False
+    assert len(ols.fitted) == _N

@@ -70,14 +70,6 @@ fn main() {
     let mut lo = lower(formula, &table, family).unwrap_or_else(|e| panic!("lower: {e}"));
     lo.opts.nagq = nagq;
 
-    // Peak RSS is reached during workspace construction, well before BOBYQA
-    // converges (models.json's header) -- the wide-q rows (e.g. row 9) can
-    // otherwise take intolerably long to fit for no change in the number this
-    // harness reads. LMM_MAX_FUN_FORMULA is an existing dev-only env hook
-    // (src/lmm/mod.rs, shared by every BOBYQA config site incl. the GLMM joint/
-    // stage-1 solvers in src/glmm/workspace.rs) -- memory.sh may set it before
-    // invoking this binary to cap the optimizer's eval budget; it changes
-    // nothing about the workspace allocation being measured.
     let fit = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
     println!("n={} p={} converged={}", lo.n, lo.p, fit.converged());
 }

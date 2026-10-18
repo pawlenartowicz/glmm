@@ -202,19 +202,6 @@ pub(crate) fn row_consts(
     }
 }
 
-/// One fast row's term at node shift `d` (module docs). The kernels inline
-/// this form per tile; this scalar copy is the tests' reference.
-#[cfg(test)]
-#[inline(always)]
-pub(crate) fn term<const LOG1P: bool>(a: f64, p: f64, s: f64, h: f64, d: f64) -> f64 {
-    let e = (s * d).exp_m1();
-    if LOG1P {
-        a * (p * e).ln_1p() + h * d
-    } else {
-        a * e + h * d
-    }
-}
-
 /// A slow row's `½w·(d(η) − d(η₀))` the generic way.
 #[inline]
 #[allow(clippy::too_many_arguments)]
@@ -1049,11 +1036,26 @@ mod tests {
     use crate::family::{dev_resid_eta, link_inv};
     use crate::spec::{NegBinomialLink, PoissonLink};
 
+    /// The module docs' row term `a·expm1(s·δ) + h·δ` (`LOG1P`: `a·ln(1 + p·expm1(s·δ)) + h·δ`),
+    /// the reference `row_consts` is checked against. The shipped tiles inline their
+    /// own per-tile form; their values are checked against the generic node loop by
+    /// `glmm::tests::agq_fast_route_value_matches_the_generic_dual_route`.
+    fn term<const LOG1P: bool>(a: f64, p: f64, s: f64, h: f64, d: f64) -> f64 {
+        let e = (s * d).exp_m1();
+        if LOG1P {
+            a * (p * e).ln_1p() + h * d
+        } else {
+            a * e + h * d
+        }
+    }
+
     /// The row term against the generic `½w·(dev_resid_eta(η₀+δ) − dev_resid_eta(η₀))`
     /// over a grid of y, η₀ and δ: zero counts, binomial proportions, the logit
     /// tail (`in_tail` past μ = 1 − 1e-4), and log-link rows up to the fast
     /// guard's edge (Poisson's clamp, the NB/Gamma-log tail switch). Within
-    /// 1e-12 of the larger deviance, floored at 1.
+    /// 1e-12 of the larger deviance, floored at 1. This checks `row_consts`
+    /// (production) and the identity; the tiles themselves are checked at the
+    /// value level by `glmm::tests::agq_fast_route_value_matches_the_generic_dual_route`.
     #[test]
     fn row_term_matches_dev_resid_eta() {
         let w = 1.7;

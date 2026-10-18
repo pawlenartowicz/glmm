@@ -13,9 +13,9 @@
 #               testthat::test_file("tools/acceptance-vs-lme4.R")'
 #
 # A live refit rather than frozen numbers, so the comparison is exact-data and
-# does not depend on which generator version produced the data. The frozen
-# counterpart -- this package's own output, pinned -- is
-# tests/testthat/test-acceptance-pins.R, which is what CI runs.
+# does not depend on which generator version produced the data. What CI runs
+# instead: the grid port gate (validation/grid/compare.R) checks the R port's
+# fixed effects, standard deviations and correlations against the Rust kernel.
 #
 # Gamma is expected to disagree. lme4 is not a correct Gamma oracle at any
 # released version, and this package's mixed-Gamma optimum is known to sit above

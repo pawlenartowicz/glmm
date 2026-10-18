@@ -50,6 +50,16 @@ From a checkout — needs Rust (`cargo` and `rustc >= 1.85` on the `PATH`):
 install.packages(".", repos = NULL, type = "source")
 ```
 
-For building a distributable, self-contained source tarball (e.g. for CRAN),
-see the Development section of [r/README.md](../r/README.md), which covers
-`tools/cran-tarball.sh`.
+The Rust surface lives in the repo's `glmm-r` crate; `r/src/rust` is a thin
+staticlib re-export the R build drives. Path dependencies resolve only inside
+the repo checkout — a distributable, self-contained source tarball (with the
+in-repo crates materialized and, optionally, all cargo dependencies vendored
+for offline/CRAN builds) is produced from `r/` by:
+
+```sh
+tools/cran-tarball.sh [--vendor]
+```
+
+`R CMD check --as-cran` is clean on that tarball. Tests: `testthat`, with an
+acceptance suite comparing fixed effects and variance components against
+`lme4::glmer` on the benchmark shapes (skipped when lme4 is absent).

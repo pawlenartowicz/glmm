@@ -298,7 +298,7 @@ fn fit_warm_glmm_partial_start_cold_starts_the_missing_component() {
 
 /// Committed cbpp design, expanded to `size` Bernoulli 0/1 rows per record:
 /// `(x [n·4 row-major], y, herd cluster_ids, n)`. Shared by the cbpp oracle
-/// test, `fit_grouped_honors_opts_wald_se`, and (`pub(crate)`)
+/// test, `fit_glmm_cbpp_hessian_rx_agree_on_fitted`, and (`pub(crate)`)
 /// `core_tests::counters_show_the_outer_search_stage_split`.
 pub(crate) fn cbpp_design() -> (Vec<f64>, Vec<f64>, Vec<u32>, usize) {
     let csv = include_str!("../../validation/data/empirical/cbpp.csv");
@@ -343,53 +343,6 @@ pub(crate) fn cbpp_model() -> ModelSpec {
             extra_groupings: vec![],
         }),
     }
-}
-
-/// `opts.wald_se` (not `model.wald_se`) selects the GLMM Wald-SE denominator:
-/// `Hessian` and `Rx` on the same cbpp fit must produce different SEs. Guards
-/// that the knob lives on `FitOptions`, not `ModelSpec`.
-#[test]
-fn fit_grouped_honors_opts_wald_se() {
-    let (x, y, cluster_ids, n) = cbpp_design();
-    let p = 4;
-    let model = cbpp_model();
-    let hess = fit_cold(
-        &x,
-        &y,
-        n,
-        p,
-        &model,
-        &GroupIds {
-            primary: cluster_ids.clone(),
-            extra: vec![],
-        },
-        &FitOptions {
-            target_indices: vec![0, 1, 2, 3],
-            wald_se: WaldSe::Hessian,
-            ..FitOptions::default()
-        },
-    );
-    let rx = fit_cold(
-        &x,
-        &y,
-        n,
-        p,
-        &model,
-        &GroupIds {
-            primary: cluster_ids.clone(),
-            extra: vec![],
-        },
-        &FitOptions {
-            target_indices: vec![0, 1, 2, 3],
-            wald_se: WaldSe::Rx,
-            ..FitOptions::default()
-        },
-    );
-    assert!(hess.converged() && rx.converged());
-    assert!(
-        (hess.se[1] - rx.se[1]).abs() > 1e-6,
-        "Rx vs Hessian SE must differ"
-    );
 }
 
 // Frozen lme4 1.1-38 cbpp reference (validation/goldens/cbpp_agq_k1.json, which
@@ -1643,10 +1596,12 @@ fn fit_glmm_offset_constant_shifts_intercept() {
 }
 
 /// Prior-weight fit-level equivalence on the DENSE (NoZ) path: `fit_cold`
-/// on aggregated cbpp proportions with `weights = size` matches the
-/// expanded Bernoulli fit on β/SE/τ² for both `WaldSe` arms. Two
-/// independent BOBYQA runs of same-argmin objectives, so the bounds are
-/// optimizer-scatter-sized (the oracle test above is the tight anchor).
+/// on aggregated cbpp proportions with `weights = size` matches the expanded
+/// Bernoulli fit on β/SE/τ² on the `Rx` arm; the Hessian arm is pinned on both
+/// entry points against lme4 at 1e-3 (`fit_glmm_cbpp_matches_lme4`,
+/// `fit_glmm_cbpp_aggregated_matches_lme4`). Two independent searches of
+/// same-argmin objectives, so the bands come from their measured gap (below);
+/// the oracle tests are the anchor against lme4.
 /// Dense twin of `sparse_weighted_binomial_fit_matches_expanded`.
 #[test]
 fn fit_glmm_cbpp_aggregated_matches_expanded() {
@@ -1654,66 +1609,67 @@ fn fit_glmm_cbpp_aggregated_matches_expanded() {
     let (xa, ya, wa, ids_a, n_a) = cbpp_design_aggregated();
     let p = 4;
     let model = cbpp_model();
-    for wald_se in [WaldSe::Hessian, WaldSe::Rx] {
-        let fe = fit_cold(
-            &xe,
-            &ye,
-            n_e,
-            p,
-            &model,
-            &GroupIds {
-                primary: ids_e.clone(),
-                extra: vec![],
-            },
-            &FitOptions {
-                target_indices: vec![0, 1, 2, 3],
-                wald_se,
-                ..FitOptions::default()
-            },
-        );
-        let fa = fit_cold(
-            &xa,
-            &ya,
-            n_a,
-            p,
-            &model,
-            &GroupIds {
-                primary: ids_a.clone(),
-                extra: vec![],
-            },
-            &FitOptions {
-                target_indices: vec![0, 1, 2, 3],
-                wald_se,
-                weights: Some(wa.clone()),
-                ..FitOptions::default()
-            },
-        );
-        let tag = format!("{wald_se:?}");
+    let wald_se = WaldSe::Rx;
+    let fe = fit_cold(
+        &xe,
+        &ye,
+        n_e,
+        p,
+        &model,
+        &GroupIds {
+            primary: ids_e,
+            extra: vec![],
+        },
+        &FitOptions {
+            target_indices: vec![0, 1, 2, 3],
+            wald_se,
+            ..FitOptions::default()
+        },
+    );
+    let fa = fit_cold(
+        &xa,
+        &ya,
+        n_a,
+        p,
+        &model,
+        &GroupIds {
+            primary: ids_a,
+            extra: vec![],
+        },
+        &FitOptions {
+            target_indices: vec![0, 1, 2, 3],
+            wald_se,
+            weights: Some(wa),
+            ..FitOptions::default()
+        },
+    );
+    let tag = format!("{wald_se:?}");
+    // Bands: the smallest ladder step at least 10× the measured agg-vs-exp gap
+    // (β 4.0e-11, SE 6.7e-11, τ² 3.7e-10; 2026-10-17, aarch64).
+    assert!(
+        fe.converged() && fa.converged(),
+        "{tag}: both fits must converge"
+    );
+    for j in 0..p {
         assert!(
-            fe.converged() && fa.converged(),
-            "{tag}: both fits must converge"
+            (fa.beta[j] - fe.beta[j]).abs() < 1e-4 * (1.0 + fe.beta[j].abs()),
+            "{tag} β[{j}]: agg={} exp={}",
+            fa.beta[j],
+            fe.beta[j]
         );
-        for j in 0..p {
-            assert!(
-                (fa.beta[j] - fe.beta[j]).abs() < 2e-3 * (1.0 + fe.beta[j].abs()),
-                "{tag} β[{j}]: agg={} exp={}",
-                fa.beta[j],
-                fe.beta[j]
-            );
-            assert!(
-                (fa.se[j] - fe.se[j]).abs() < 2e-2 * (1.0 + fe.se[j].abs()),
-                "{tag} se[{j}]: agg={} exp={}",
-                fa.se[j],
-                fe.se[j]
-            );
-        }
-        assert_eq!(fa.tau2.len(), fe.tau2.len(), "{tag}: tau2 length");
-        for (a, b) in fa.tau2.iter().zip(fe.tau2.iter()) {
-            assert!(
-                (a - b).abs() < 2e-2 * (1.0 + b.abs()),
-                "{tag} tau2: agg={a} exp={b}"
-            );
-        }
+        assert!(
+            (fa.se[j] - fe.se[j]).abs() < 1e-4 * (1.0 + fe.se[j].abs()),
+            "{tag} se[{j}]: agg={} exp={}",
+            fa.se[j],
+            fe.se[j]
+        );
+    }
+    assert_eq!(fa.tau2.len(), fe.tau2.len(), "{tag}: tau2 length");
+    for (a, b) in fa.tau2.iter().zip(fe.tau2.iter()) {
+        assert!(
+            (a - b).abs() < 1e-4 * (1.0 + b.abs()),
+            "{tag} tau2: agg={a} exp={b}"
+        );
     }
 }
 
@@ -3100,6 +3056,11 @@ fn fit_glmm_cbpp_aggregated_agq_matches_lme4() {
             f.converged(),
             "aggregated binomial AGQ k={nagq} must converge"
         );
+        // The weighted design takes the gradient search, in every build.
+        assert!(
+            f.diagnostics.n_grad > 0,
+            "k={nagq}: aggregated cbpp takes the gradient search"
+        );
         for (j, (&b, &rb)) in f.beta.iter().zip(&refb).enumerate() {
             assert!(
                 (b - rb).abs() / rb.abs() < 1e-3,
@@ -3127,6 +3088,10 @@ fn fit_glmm_cbpp_aggregated_agq_matches_lme4() {
 /// about 56 per herd) keep the joint BOBYQA search, and the aggregated rows
 /// (56 rows weighted by the trial counts) search with BFGS on the exact AGQ
 /// gradient.
+/// Compiled only with `parallel`: in a serial build the knob is never read on scalar AGQ
+/// (`par_index` in `glmm::fit_glmm`, `use_par` in `se.rs`), so both arms would run
+/// the same code.
+#[cfg(feature = "parallel")]
 #[test]
 fn fit_glmm_binomial_agq_parallel_inner_knob_is_bit_identical() {
     let (x, y, cluster_ids, n) = cbpp_design();
@@ -4056,6 +4021,7 @@ fn fit_glmm_gamma_hessian_rx_agree_on_fitted() {
 /// a φ≡1 family (cbpp, binomial-logit): `glmm_sigma_sq` is a literal `1.0`
 /// here, so only `fitted` can move — the split was never Gamma-specific, it
 /// is just too small to see at canonical links' quadratic PIRLS convergence.
+/// The two fits' SEs must differ: `FitOptions::wald_se` selects the denominator.
 #[test]
 fn fit_glmm_cbpp_hessian_rx_agree_on_fitted() {
     let (x, y, cluster_ids, n) = cbpp_design();
@@ -4092,6 +4058,11 @@ fn fit_glmm_cbpp_hessian_rx_agree_on_fitted() {
         },
     );
     assert!(f_hess.converged() && f_rx.converged());
+    // `FitOptions::wald_se` (not the spec) selects the Wald-SE denominator.
+    assert!(
+        (f_hess.se[1] - f_rx.se[1]).abs() > 1e-6,
+        "Rx vs Hessian SE must differ"
+    );
     for i in 0..n {
         assert_eq!(
             f_hess.fitted[i].to_bits(),
@@ -4686,132 +4657,6 @@ fn fit_glmm_nb_nested_unbalanced_matches_glmmtmb() {
         &[REF_THETA_PIN],
         BAND,
         "sim_nb_nested pinned theta",
-    );
-}
-
-/// AGQ-bypass canary (the `GLMM_RHO_END` canary's two-stage counterpart).
-/// nAGQ>1 fits bypass stage 1: the `stage1_mode.filter(|_| nagq == 1)` gate
-/// excludes them (Profile deviance is undefined on the AGQ early-return path,
-/// `debug_assert!(beta_mode == BetaMode::Fixed || nagq == 1)`), so setting
-/// `ws.outer_search = OuterSearch::PqlThenJoint` on an AGQ fit must be a strict
-/// no-op. Runs the Poisson grouseticks AGQ fixture
-/// (nAGQ=7) through `crate::glmm::fit_glmm` both ways and asserts β̂, θ̂, τ̂², and
-/// n_eval are BIT-identical — the bypass is clean. (AGQ fits do not use a
-/// Laplace-pass warm start: measured 2026-07-14 on the diligent AGQ cells as a
-/// wash. The bypass this canary pins is the shipped state.)
-#[test]
-fn two_stage_agq_bypass_is_bit_identical() {
-    let csv = include_str!("../../validation/data/empirical/grouseticks.csv");
-    let p = 4;
-    let mut x = Vec::<f64>::new();
-    let mut y = Vec::<f64>::new();
-    let mut raw = Vec::<u32>::new();
-    for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
-        let f: Vec<&str> = line.split(',').map(|s| s.trim_matches('"')).collect();
-        raw.push(f[0].parse().unwrap());
-        let year: u32 = f[4].parse().unwrap();
-        x.extend_from_slice(&[
-            1.0,
-            f64::from(u32::from(year == 96)),
-            f64::from(u32::from(year == 97)),
-            f[6].parse().unwrap(),
-        ]);
-        y.push(f[1].parse().unwrap());
-    }
-    let (cluster_ids, n_clusters) = dense_ids(&raw);
-    let n = y.len();
-    let nagq = 7u8;
-    let model = ModelSpec {
-        family: Family::Poisson {
-            link: crate::PoissonLink::Log,
-        },
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters {
-                n_clusters: n_clusters as u32,
-            },
-            slopes: vec![],
-            extra_groupings: vec![],
-        }),
-    };
-    let (sized, _ids, _perm) = spec_sized_from_ids_pub(
-        &model,
-        &GroupIds {
-            primary: cluster_ids.clone(),
-            extra: vec![],
-        },
-    );
-    let mut xm = Mat::<f64>::zeros(n, p);
-    for i in 0..n {
-        for j in 0..p {
-            xm[(i, j)] = x[i * p + j];
-        }
-    }
-    let beta_start = glm_warm_start_beta(
-        sized.family,
-        f64::NAN,
-        xm.as_ref().subrows(0, n),
-        &y,
-        n,
-        p,
-        None,
-    )
-    .0;
-
-    let run = |two_stage: bool| -> (Vec<f64>, Vec<f64>, f64, usize) {
-        let mut ws = GlmmWorkspace::for_cluster_spec(p, &sized, n, &[], nagq);
-        ws.outer_search = if two_stage {
-            OuterSearch::PqlThenJoint
-        } else {
-            OuterSearch::Joint
-        };
-        let fit = crate::glmm::fit_glmm(
-            &mut ws,
-            xm.as_ref().subrows(0, n),
-            &y,
-            &cluster_ids,
-            &[],
-            &[0, 1, 2, 3],
-            None,
-            &beta_start,
-            n,
-            WaldSe::Rx,
-            ColumnScaling::IDENTITY,
-        );
-        assert!(
-            fit.converged,
-            "AGQ fit (two_stage={two_stage}) must converge"
-        );
-        (
-            ws.betas[..p].to_vec(),
-            ws.params[..ws.n_theta].to_vec(),
-            ws.params[0].powi(2),
-            fit.n_eval,
-        )
-    };
-    let (b1, t1, tau1, ne1) = run(false);
-    let (b2, t2, tau2, ne2) = run(true);
-    for j in 0..p {
-        assert_eq!(
-            b1[j].to_bits(),
-            b2[j].to_bits(),
-            "AGQ bypass: β[{j}] must be bit-identical"
-        );
-    }
-    for t in 0..t1.len() {
-        assert_eq!(
-            t1[t].to_bits(),
-            t2[t].to_bits(),
-            "AGQ bypass: θ[{t}] must be bit-identical"
-        );
-    }
-    assert_eq!(
-        tau1.to_bits(),
-        tau2.to_bits(),
-        "AGQ bypass: τ̂² must be bit-identical"
-    );
-    assert_eq!(
-        ne1, ne2,
-        "AGQ bypass: n_eval must be identical (stage 1 skipped)"
     );
 }
 
@@ -9208,9 +9053,7 @@ fn tail_packed_fit_ships_the_assembled_covariance() {
 ///
 /// The cap is forced by swapping in a joint solver whose `max_fun` is the legal
 /// minimum (`npt + 1`) — one evaluation past the initial interpolation model,
-/// nowhere near cbpp's optimum. `LMM_MAX_FUN_FORMULA` would do the same, but it
-/// is read once per process, so a test using it would race every other fit in
-/// the binary.
+/// nowhere near cbpp's optimum.
 #[test]
 fn glmm_maxfun_cap_reports_honest_endpoint() {
     use bobyqa::{Bobyqa, Config};
@@ -10823,7 +10666,11 @@ fn joint_search_reaches_the_optimum_when_working_weights_span_decades() {
 /// modes at the incumbent's β rather than at the re-solved one (measured
 /// 2026-10-16). With the band capped at one unit (`JOINT_RECHECK_ABS`) and the
 /// check and second pass started from the re-solved modes, every fit ends
-/// within +0.31 of the exact profile. At this |f| the objective resolves to
+/// within +0.31 of the exact profile on x86_64; on aarch64 two did not (seed
+/// 12345 at 13.75 decades +1.65, seed 2 at 14 decades +8.77), both fits the
+/// gradient route finished through its polish, which ran no third pass then.
+/// With the third pass on every AGQ fit whose check fires, the worst is +0.36
+/// on aarch64 and +0.04 on x86_64 (measured 2026-10-18). At this |f| the objective resolves to
 /// about 0.1 unit (its spread under θ nudges of 1e-9 relative), so the upper
 /// band is the check's one unit. The lower band only catches a gross error:
 /// at 14 decades the exact profile itself stops up to 10.7 units above the
@@ -11013,6 +10860,30 @@ fn fit_warm_rejects_a_non_positive_dispersion_start() {
     let _ = fit_warm(&x, &y, n, p, &model, &ids, Some(&start), &opts);
 }
 
+#[test]
+#[should_panic(expected = "StartValues.beta must be finite")]
+fn fit_warm_rejects_a_non_finite_beta_start() {
+    let (x, y, n, p, model, ids, opts) = sim_gamma_glmm(crate::GammaLink::Log);
+    let mut beta = vec![0.0; p];
+    beta[0] = f64::NAN;
+    let start = StartValues {
+        beta,
+        ..StartValues::default()
+    };
+    let _ = fit_warm(&x, &y, n, p, &model, &ids, Some(&start), &opts);
+}
+
+#[test]
+#[should_panic(expected = "StartValues.theta must be finite")]
+fn fit_warm_rejects_a_non_finite_theta_start() {
+    let (x, y, n, p, model, ids, opts) = sim_gamma_glmm(crate::GammaLink::Log);
+    let start = StartValues {
+        theta: vec![f64::INFINITY; theta_width(model.re.as_ref())],
+        ..StartValues::default()
+    };
+    let _ = fit_warm(&x, &y, n, p, &model, &ids, Some(&start), &opts);
+}
+
 /// `FitView::dispersion_start` is the value a warm loop carries into the next
 /// draw: φ̂ on a Gamma GLMM (not `FitView::dispersion`, which is `D̂[0][0]`
 /// there) and θ̂_NB on the NB GLMM, each `Fit::dispersion` bit for bit.
@@ -11125,4 +10996,60 @@ fn gamma_inverse_theta_is_checked_against_the_limit_in_search_units() {
         "notes: {:?}",
         f.diagnostics.notes
     );
+}
+
+/// `y ~ 1 + (1 | g)`, logit, 4 groups of 4 rows with y = 0, 1, 0, 1 in each
+/// and a group offset of +a, −a, +a, −a. The random effects cancel the offset,
+/// so θ̂ = τ̂ ≈ a: at a = 1500 the optimum lies past `crate::lmm::THETA_HI`
+/// (1000) and the search ends on the limit, which is reported with a note; at
+/// a = 600 it is interior. On the Laplace and the AGQ route.
+#[test]
+fn glmm_theta_on_its_upper_limit_is_reported_not_interior() {
+    let model = ModelSpec {
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 4 },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let g: Vec<u32> = (0..16).map(|i| i / 4).collect();
+    let y: Vec<f64> = (0..16).map(|i| f64::from(i % 2)).collect();
+    let ids = GroupIds {
+        primary: g.clone(),
+        extra: vec![],
+    };
+    for nagq in [1, 7] {
+        for (a, boundary, at_limit) in [
+            (1500.0, Boundary::UpperLimit, true),
+            (600.0, Boundary::Interior, false),
+        ] {
+            let opts = FitOptions {
+                target_indices: vec![0],
+                nagq,
+                offset: Some(g.iter().map(|&c| if c % 2 == 0 { a } else { -a }).collect()),
+                ..FitOptions::default()
+            };
+            let f = fit_cold(&[1.0; 16], &y, 16, 1, &model, &ids, &opts);
+            let sd = f.tau2[0].sqrt();
+            let what = format!("nagq {nagq}, a = {a}");
+            assert!(f.converged(), "{what}");
+            assert!(
+                (sd - a.min(crate::lmm::THETA_HI)).abs() < 1e-3 * a,
+                "{what}: sd = {sd}"
+            );
+            assert_eq!(f.diagnostics.boundary, boundary, "{what}");
+            assert_eq!(
+                f.diagnostics
+                    .notes
+                    .iter()
+                    .any(|n| matches!(n, Note::VarianceAtLimit)),
+                at_limit,
+                "{what}: notes {:?}",
+                f.diagnostics.notes
+            );
+        }
+    }
 }

@@ -48,8 +48,7 @@ fn fd_eval(
 /// near `h ≈ ε^{1/3}` (Nocedal & Wright 2006, §8.1); at 1e-5 the SEs agree
 /// with the hyper-dual rung's to 1e-11 (β) and 1e-10 (θ) relative on the
 /// grid's AGQ cells and at 300k rows, and the same at 1e-4, so the result sits
-/// on the flat part of the step curve (measured 2026-10-07, pawel scratch
-/// `mmjl-rethink/b7/`, `agqse/`).
+/// on the flat part of the step curve (measured 2026-10-07).
 const AGQ_GD_STEP_REL: f64 = 1e-5;
 
 /// Largest relative asymmetry `|H_rc − H_cr| / √(|H_rr·H_cc|)` the
@@ -1052,7 +1051,7 @@ fn joint_hessian_cov_at(
     let mut used_exact = false;
     if (super::assembled::assembly_routes(ws, n)
         || super::derivative::supports_shape(ws.layout, &ws.groupings))
-        && !ws.fd.force_fd_hessian
+        && !ws.fd.force_fd_hessian()
     {
         // `std::mem::replace` (faer's `Mat` implements no `Default`, so
         // `mem::take` does not compile; the swapped-in `Mat::zeros(0, 0)`
@@ -1080,7 +1079,8 @@ fn joint_hessian_cov_at(
             // the f64 AGQ gradient covers, then rung 2 on its own terms for
             // everything else and for what 2a declines.
             DerivStatus::Unsupported => {
-                let st = if super::agq_gradient::covers(ws) && !ws.fd.skip_agq_gradient_difference {
+                let st = if super::agq_gradient::covers(ws) && !ws.fd.skip_agq_gradient_difference()
+                {
                     agq_gradient_difference_hessian(
                         ws,
                         xd,
@@ -1787,7 +1787,7 @@ fn structured_schur_fill(
             &ws.pattern.coup_ptr,
             // force_dense → ss fold: see the structured_ainv_solve calls in
             // pirls_solve_blocked_extras (pirls/blocked_extras.rs).
-            if ws.pattern.force_dense_schur {
+            if ws.pattern.force_dense_schur() {
                 None
             } else {
                 ws.pattern.structured_schur.as_mut()
