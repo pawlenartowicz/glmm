@@ -1,0 +1,1727 @@
+#![cfg(feature = "formula")]
+//! End-to-end: drive the validation datasets through `lower` → `fit_cold` and assert
+//! the formula frontend lowers to the same design, the same grouping ids, and
+//! therefore the same fit as the hand-built `ModelSpec`/`GroupIds` the in-crate
+//! kernel tests use. Closes the loop formula → design → kernel.
+//!
+//! **Cross-engine agreement for these fits is not this file's claim.**
+//! `tests/validation_oracle.rs` refits `sleepstudy_lmm`, `penicillin_lmm`,
+//! `pastes_lmm`, `cbpp_agq_k1` and `grouseticks_agq_k1` from each golden's own
+//! recorded formula — through this same frontend — and gates them against the
+//! frozen lme4 values at `validation/grid/tol.R`'s bands. This file does not repeat
+//! that comparison: doing so would assert nothing the oracle tier does not
+//! already assert more tightly. What is left is the one claim the oracle tier
+//! cannot make, because it only ever fits through the frontend: that the
+//! frontend agrees with the hand-built spec.
+
+use glmm::formula::{lower, Column, Table};
+#[cfg(feature = "orchestrate")]
+use glmm::orchestrate::run_fit;
+use glmm::{
+    fit_cold, Family, Fit, FitOptions, GroupIds, Grouping, GroupingRelation, ModelSpec, Note,
+    ReStructure, Sizing,
+};
+#[cfg(feature = "orchestrate")]
+use std::collections::HashMap;
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Band for the frontend-equivalence assertions below.
+///
+/// Mirrors `PIN_REL_ITER` in `src/fit/common_tests.rs` — change together. It is
+/// restated rather than imported because `common_tests` is `pub(crate)` and
+/// `cfg(test)`, so an integration test cannot reach it, and widening the crate's
+/// surface to relocate a constant is the wrong trade.
+///
+/// In practice every comparison here lands on 0.0: the two routes hand the
+/// kernel byte-identical inputs, and the kernel is deterministic. The band is
+/// margin against a future frontend that legitimately reorders rows or clusters,
+/// which would perturb the last bit without changing the model.
+const PIN_REL_ITER: f64 = 1e-7;
+
+/// Parse a committed validation CSV into trimmed, unquoted string fields (mirrors the
+/// hand-parse the in-crate kernel tests use — no CSV crate).
+fn rows(csv: &str) -> Vec<Vec<String>> {
+    csv.lines()
+        .skip(1)
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            l.split(',')
+                .map(|s| s.trim().trim_matches('"').to_string())
+                .collect()
+        })
+        .collect()
+}
+
+fn numeric(rows: &[Vec<String>], col: usize) -> Column {
+    Column::Numeric(rows.iter().map(|r| r[col].parse().unwrap()).collect())
+}
+fn factor(rows: &[Vec<String>], col: usize) -> Column {
+    let labels: Vec<String> = rows.iter().map(|r| r[col].clone()).collect();
+    Column::factor_from_labels(&labels)
+}
+
+/// Column `col`'s values as f64.
+fn nums(rows: &[Vec<String>], col: usize) -> Vec<f64> {
+    rows.iter().map(|r| r[col].parse().unwrap()).collect()
+}
+
+/// Dense 0-based level codes for column `col`, assigned in the lexicographic
+/// level order `Column::factor_from_labels` uses — so a hand-built `GroupIds`
+/// lines up index-for-index with the one `lower()` produces.
+fn codes(rows: &[Vec<String>], col: usize) -> Vec<u32> {
+    let labels: Vec<String> = rows.iter().map(|r| r[col].clone()).collect();
+    match Column::factor_from_labels(&labels) {
+        Column::Factor { codes, .. } => codes,
+        Column::Numeric(_) => unreachable!("factor_from_labels returns a Factor"),
+    }
+}
+
+/// Distinct level count for column `col`.
+fn n_levels(rows: &[Vec<String>], col: usize) -> u32 {
+    codes(rows, col).iter().max().map_or(0, |m| m + 1)
+}
+
+/// Treatment-contrast dummy columns for column `col`: one per non-base level, in
+/// level order (level 0 is the base). This is the coding the frontend must
+/// reproduce, written out by hand so a contrast bug has something to disagree
+/// with.
+fn dummies(rows: &[Vec<String>], col: usize) -> Vec<Vec<f64>> {
+    let c = codes(rows, col);
+    let k = n_levels(rows, col);
+    (1..k)
+        .map(|lvl| c.iter().map(|&r| f64::from(r == lvl)).collect())
+        .collect()
+}
+
+/// Row-major n×p design from per-column vectors, intercept first.
+fn design(n: usize, cols: &[Vec<f64>]) -> Vec<f64> {
+    let p = cols.len() + 1;
+    let mut x = vec![0.0; n * p];
+    for i in 0..n {
+        x[i * p] = 1.0;
+        for (j, c) in cols.iter().enumerate() {
+            x[i * p + 1 + j] = c[i];
+        }
+    }
+    x
+}
+
+/// `target_indices = 0..p`, everything else defaulted — what `lower()` fills
+/// `Lowered::opts` with.
+fn opts_for(p: usize) -> FitOptions {
+    let mut o = FitOptions::default();
+    o.target_indices = (0..p as u32).collect();
+    o
+}
+
+/// `|a-b| <= atol + rtol*|b|`.
+fn close(a: f64, b: f64, rtol: f64, atol: f64) -> bool {
+    (a - b).abs() <= atol + rtol * b.abs()
+}
+
+fn assert_vec_close(got: &[f64], want: &[f64], ctx: &str) {
+    assert_eq!(got.len(), want.len(), "{ctx}: length");
+    for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
+        assert!(
+            close(g, w, PIN_REL_ITER, 0.0),
+            "{ctx}[{i}]: formula {g} vs hand-built {w}"
+        );
+    }
+}
+
+/// Every fitted quantity the frontend can move: a lowering bug shows up in the
+/// design, the ids, or nowhere. Asserting the whole `Fit` rather than β alone is
+/// what makes "nowhere" checkable.
+fn assert_same_fit(got: &Fit, want: &Fit, ctx: &str) {
+    assert_eq!(got.converged(), want.converged(), "{ctx}: converged");
+    assert_vec_close(&got.beta, &want.beta, &format!("{ctx}: beta"));
+    assert_vec_close(&got.se, &want.se, &format!("{ctx}: se"));
+    assert_vec_close(&got.tau2, &want.tau2, &format!("{ctx}: tau2"));
+    assert_eq!(
+        got.varcorr.len(),
+        want.varcorr.len(),
+        "{ctx}: varcorr block count"
+    );
+    for (k, (g, w)) in got.varcorr.iter().zip(&want.varcorr).enumerate() {
+        assert_vec_close(g, w, &format!("{ctx}: varcorr[{k}]"));
+    }
+    assert!(
+        close(got.dispersion, want.dispersion, PIN_REL_ITER, 0.0),
+        "{ctx}: dispersion {} vs hand-built {}",
+        got.dispersion,
+        want.dispersion
+    );
+    assert!(
+        close(got.loglik, want.loglik, PIN_REL_ITER, 0.0),
+        "{ctx}: loglik {} vs hand-built {}",
+        got.loglik,
+        want.loglik
+    );
+}
+
+/// The by-hand half of a frontend-equivalence case: the design, response, spec
+/// and ids a caller would build without the formula frontend.
+struct HandBuilt {
+    x: Vec<f64>,
+    y: Vec<f64>,
+    p: usize,
+    model: ModelSpec,
+    ids: GroupIds,
+    /// Coefficient names the frontend must emit, in column order.
+    col_names: &'static [&'static str],
+}
+
+/// Lower `formula`, fit it, fit the hand-built spec, and assert the two agree —
+/// on the design and ids first (where a frontend bug actually lives) and then on
+/// every fitted quantity.
+fn assert_frontend_matches_hand_built(
+    formula: &str,
+    table: &Table,
+    family: Family,
+    hand: &HandBuilt,
+    ctx: &str,
+) {
+    let lo = lower(formula, table, family).unwrap();
+    assert_eq!(lo.col_names, hand.col_names, "{ctx}: coef names");
+    assert_eq!(lo.p, hand.p, "{ctx}: design width");
+    assert_eq!(lo.x, hand.x, "{ctx}: design matrix");
+    assert_eq!(lo.y, hand.y, "{ctx}: response");
+    assert_eq!(lo.ids.primary, hand.ids.primary, "{ctx}: primary ids");
+    assert_eq!(lo.ids.extra, hand.ids.extra, "{ctx}: extra grouping ids");
+    assert_eq!(
+        lo.opts.target_indices,
+        (0..hand.p as u32).collect::<Vec<_>>(),
+        "{ctx}: target indices"
+    );
+
+    let via_formula = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+    let by_hand = fit_cold(
+        &hand.x,
+        &hand.y,
+        hand.y.len(),
+        hand.p,
+        &hand.model,
+        &hand.ids,
+        &opts_for(hand.p),
+    );
+    assert!(
+        via_formula.converged(),
+        "{ctx}: formula fit did not converge"
+    );
+    assert!(
+        by_hand.converged(),
+        "{ctx}: hand-built fit did not converge"
+    );
+    assert_same_fit(&via_formula, &by_hand, ctx);
+}
+
+/// A random-intercept `ReStructure` over `extras` additional groupings. Cluster
+/// counts in `ModelSpec` are placeholders — `Lowered::model`'s own doc says the
+/// kernel re-derives real level counts from `ids` — so they are written as the
+/// true counts here only to keep the spec readable.
+fn intercept_re(primary_clusters: u32, extras: Vec<Grouping>) -> ReStructure {
+    ReStructure {
+        sizing: Sizing::FixedClusters {
+            n_clusters: primary_clusters,
+        },
+        slopes: vec![],
+        extra_groupings: extras,
+    }
+}
+
+// ── LMM ──────────────────────────────────────────────────────────────────────
+
+#[test]
+fn sleepstudy_random_slope_matches_hand_built_spec() {
+    let data = rows(include_str!("../validation/data/empirical/sleepstudy.csv"));
+    let table = Table {
+        columns: vec![
+            ("Reaction".into(), numeric(&data, 0)),
+            ("Days".into(), numeric(&data, 1)),
+            ("Subject".into(), factor(&data, 2)),
+        ],
+        n: data.len(),
+    };
+    let y = nums(&data, 0);
+    let days = nums(&data, 1);
+    let x = design(data.len(), &[days]);
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_levels(&data, 2),
+            },
+            slopes: vec![1], // random slope on Days, design column 1
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: codes(&data, 2),
+        extra: vec![],
+    };
+    let hand = HandBuilt {
+        x,
+        y,
+        p: 2,
+        model,
+        ids,
+        col_names: &["(Intercept)", "Days"],
+    };
+    assert_frontend_matches_hand_built(
+        "Reaction ~ Days + (1 + Days | Subject)",
+        &table,
+        Family::Gaussian,
+        &hand,
+        "sleepstudy",
+    );
+}
+
+/// `(1 + log(x) | g)` must lower to the same design and fit as computing the
+/// column by hand and naming it — the transform is a name, not a model.
+#[test]
+fn random_slope_on_a_transform_matches_precomputed_column() {
+    let data = rows(include_str!("../validation/data/empirical/sleepstudy.csv"));
+    let reaction: Vec<f64> = data.iter().map(|r| r[0].parse().unwrap()).collect();
+    let days: Vec<f64> = data
+        .iter()
+        .map(|r| r[1].parse::<f64>().unwrap() + 1.0)
+        .collect();
+    let n = reaction.len();
+    let by_hand = Table {
+        columns: vec![
+            ("Reaction".into(), Column::Numeric(reaction.clone())),
+            (
+                "ld".into(),
+                Column::Numeric(days.iter().map(|d| d.ln()).collect()),
+            ),
+            ("Subject".into(), factor(&data, 2)),
+        ],
+        n,
+    };
+    let via = Table {
+        columns: vec![
+            ("Reaction".into(), Column::Numeric(reaction)),
+            ("Days1".into(), Column::Numeric(days)),
+            ("Subject".into(), factor(&data, 2)),
+        ],
+        n,
+    };
+    let lo_hand = lower(
+        "Reaction ~ ld + (1 + ld | Subject)",
+        &by_hand,
+        Family::Gaussian,
+    )
+    .unwrap();
+    let lo_via = lower(
+        "Reaction ~ log(Days1) + (1 + log(Days1) | Subject)",
+        &via,
+        Family::Gaussian,
+    )
+    .unwrap();
+    assert_eq!(lo_via.col_names, vec!["(Intercept)", "log(Days1)"]);
+    assert_eq!(lo_via.x, lo_hand.x);
+    assert_eq!(lo_via.model, lo_hand.model);
+    assert_eq!(lo_via.re_groups[0].terms, vec!["(Intercept)", "log(Days1)"]);
+    let a = fit_cold(
+        &lo_via.x,
+        &lo_via.y,
+        lo_via.n,
+        lo_via.p,
+        &lo_via.model,
+        &lo_via.ids,
+        &lo_via.opts,
+    );
+    let b = fit_cold(
+        &lo_hand.x,
+        &lo_hand.y,
+        lo_hand.n,
+        lo_hand.p,
+        &lo_hand.model,
+        &lo_hand.ids,
+        &lo_hand.opts,
+    );
+    assert_same_fit(&a, &b, "log slope");
+}
+
+#[test]
+fn penicillin_crossed_matches_hand_built_spec() {
+    let data = rows(include_str!("../validation/data/empirical/Penicillin.csv"));
+    let table = Table {
+        columns: vec![
+            ("diameter".into(), numeric(&data, 0)),
+            ("plate".into(), factor(&data, 1)),
+            ("sample".into(), factor(&data, 2)),
+        ],
+        n: data.len(),
+    };
+    let y = nums(&data, 0);
+    let x = design(data.len(), &[]);
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(intercept_re(
+            n_levels(&data, 1),
+            vec![Grouping {
+                relation: GroupingRelation::Crossed {
+                    n_clusters: n_levels(&data, 2),
+                },
+                slopes: vec![],
+            }],
+        )),
+    };
+    let ids = GroupIds {
+        primary: codes(&data, 1),
+        extra: vec![codes(&data, 2)],
+    };
+    let hand = HandBuilt {
+        x,
+        y,
+        p: 1,
+        model,
+        ids,
+        col_names: &["(Intercept)"],
+    };
+    assert_frontend_matches_hand_built(
+        "diameter ~ (1|plate) + (1|sample)",
+        &table,
+        Family::Gaussian,
+        &hand,
+        "penicillin",
+    );
+}
+
+#[test]
+fn pastes_nested_matches_hand_built_spec() {
+    let data = rows(include_str!("../validation/data/empirical/Pastes.csv"));
+    let table = Table {
+        columns: vec![
+            ("strength".into(), numeric(&data, 0)),
+            ("batch".into(), factor(&data, 1)),
+            ("cask".into(), factor(&data, 2)),
+        ],
+        n: data.len(),
+    };
+    let y = nums(&data, 0);
+    let x = design(data.len(), &[]);
+    // `(1|batch/cask)`'s inner grouping is the batch×cask composite, which the
+    // fixture already carries as its globally-unique `sample` column (col 3) —
+    // so the hand-built ids read that column rather than re-deriving the pairing.
+    let n_batch = n_levels(&data, 1);
+    let n_sample = n_levels(&data, 3);
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(intercept_re(
+            n_batch,
+            vec![Grouping {
+                relation: GroupingRelation::NestedWithin {
+                    n_per_parent: n_sample / n_batch,
+                },
+                slopes: vec![],
+            }],
+        )),
+    };
+    let ids = GroupIds {
+        primary: codes(&data, 1),
+        extra: vec![codes(&data, 3)],
+    };
+    let hand = HandBuilt {
+        x,
+        y,
+        p: 1,
+        model,
+        ids,
+        col_names: &["(Intercept)"],
+    };
+    assert_frontend_matches_hand_built(
+        "strength ~ (1|batch/cask)",
+        &table,
+        Family::Gaussian,
+        &hand,
+        "pastes",
+    );
+}
+
+/// Same Pastes fit as `pastes_nested_matches_hand_built_spec`, but via the FLAT
+/// lme4 idiom `(1|batch)+(1|sample)`: `sample` is the globally-unique
+/// `batch:cask` column, so it genuinely nests in `batch` and must be classified
+/// `NestedWithin` — not `Crossed` — yet produce the identical fit.
+///
+/// The equality is against the explicit `(1|batch/cask)` lowering rather than
+/// against an oracle: "the two idioms name the same model" is a claim about this
+/// frontend, and stating it as glmm-vs-glmm makes it fail on exactly the bug it
+/// is looking for. lme4 agreement for the underlying fit is the `pastes_lmm`
+/// cell in `tests/validation_oracle.rs`.
+#[test]
+fn pastes_flat_nested_equals_the_explicit_nesting() {
+    let data = rows(include_str!("../validation/data/empirical/Pastes.csv"));
+    let flat = Table {
+        columns: vec![
+            ("strength".into(), numeric(&data, 0)),
+            ("batch".into(), factor(&data, 1)),
+            ("sample".into(), factor(&data, 3)),
+        ],
+        n: data.len(),
+    };
+    let explicit = Table {
+        columns: vec![
+            ("strength".into(), numeric(&data, 0)),
+            ("batch".into(), factor(&data, 1)),
+            ("cask".into(), factor(&data, 2)),
+        ],
+        n: data.len(),
+    };
+
+    let lo_flat = lower("strength ~ (1|batch) + (1|sample)", &flat, Family::Gaussian).unwrap();
+    let extra = &lo_flat.model.re.as_ref().unwrap().extra_groupings[0];
+    assert!(
+        matches!(extra.relation, GroupingRelation::NestedWithin { .. }),
+        "flat (1|batch)+(1|sample) should be detected nested, got {:?}",
+        extra.relation
+    );
+
+    let lo_exp = lower("strength ~ (1|batch/cask)", &explicit, Family::Gaussian).unwrap();
+    let f_flat = fit_cold(
+        &lo_flat.x,
+        &lo_flat.y,
+        lo_flat.n,
+        lo_flat.p,
+        &lo_flat.model,
+        &lo_flat.ids,
+        &lo_flat.opts,
+    );
+    let f_exp = fit_cold(
+        &lo_exp.x,
+        &lo_exp.y,
+        lo_exp.n,
+        lo_exp.p,
+        &lo_exp.model,
+        &lo_exp.ids,
+        &lo_exp.opts,
+    );
+    assert!(
+        f_flat.converged() && f_exp.converged(),
+        "pastes did not converge"
+    );
+    assert_same_fit(&f_flat, &f_exp, "pastes flat vs explicit");
+
+    // The two idioms disagree on what to CALL the inner grouping — the flat form
+    // takes the user's column name, the explicit form composes outer:inner — so
+    // the names are checked separately from the fit rather than folded into it.
+    assert_eq!(lo_flat.re_groups[0].name, "batch");
+    assert_eq!(lo_flat.re_groups[1].name, "sample");
+    assert_eq!(lo_exp.re_groups[0].name, "batch");
+    assert_eq!(lo_exp.re_groups[1].name, "batch:cask");
+}
+
+// ── GLMM ─────────────────────────────────────────────────────────────────────
+
+/// `cbind(incidence, failures) ~ …` must lower to exactly the proportion +
+/// trial-count fit the tutorials describe as the workaround.
+#[test]
+fn cbind_response_equals_proportion_plus_weights() {
+    let data = rows(include_str!("../validation/data/empirical/cbpp.csv"));
+    let inc: Vec<f64> = data.iter().map(|r| r[1].parse().unwrap()).collect();
+    let size: Vec<f64> = data.iter().map(|r| r[2].parse().unwrap()).collect();
+    let fail: Vec<f64> = inc.iter().zip(&size).map(|(i, s)| s - i).collect();
+    let prop: Vec<f64> = inc.iter().zip(&size).map(|(i, s)| i / s).collect();
+    let n = inc.len();
+    let table = Table {
+        columns: vec![
+            ("inc".into(), Column::Numeric(inc)),
+            ("fail".into(), Column::Numeric(fail)),
+            ("prop".into(), Column::Numeric(prop)),
+            ("period".into(), factor(&data, 3)),
+            ("herd".into(), factor(&data, 0)),
+        ],
+        n,
+    };
+    let fam = Family::Binomial {
+        link: glmm::BinomialLink::Logit,
+    };
+    let lo_c = lower("cbind(inc, fail) ~ period + (1|herd)", &table, fam).unwrap();
+    let mut lo_w = lower("prop ~ period + (1|herd)", &table, fam).unwrap();
+    lo_w.opts.weights = Some(size);
+    assert_eq!(lo_c.y, lo_w.y);
+    assert_eq!(lo_c.opts.weights, lo_w.opts.weights);
+    let a = fit_cold(
+        &lo_c.x,
+        &lo_c.y,
+        lo_c.n,
+        lo_c.p,
+        &lo_c.model,
+        &lo_c.ids,
+        &lo_c.opts,
+    );
+    let b = fit_cold(
+        &lo_w.x,
+        &lo_w.y,
+        lo_w.n,
+        lo_w.p,
+        &lo_w.model,
+        &lo_w.ids,
+        &lo_w.opts,
+    );
+    assert_same_fit(&a, &b, "cbind");
+}
+
+#[test]
+fn cbind_rejects_zero_trials_and_non_binomial() {
+    let table = Table {
+        columns: vec![
+            ("s".into(), Column::Numeric(vec![1.0, 0.0, 2.0])),
+            ("f".into(), Column::Numeric(vec![1.0, 0.0, 1.0])),
+            ("x".into(), Column::Numeric(vec![0.1, 0.2, 0.3])),
+        ],
+        n: 3,
+    };
+    let fam = Family::Binomial {
+        link: glmm::BinomialLink::Logit,
+    };
+    let err = match lower("cbind(s, f) ~ x", &table, fam) {
+        Ok(_) => panic!("expected the zero-trials row to be rejected"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("row 1"), "{err}");
+    let err = match lower("cbind(s, f) ~ x", &table, Family::Gaussian) {
+        Ok(_) => panic!("expected a non-binomial cbind() response to be rejected"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("binomial"), "{err}");
+    // A negative count passes the positive-sum check (-2 + 10 = 8) and would
+    // lower to a proportion outside [0, 1]; it must be its own rejection.
+    let table = Table {
+        columns: vec![
+            ("s".into(), Column::Numeric(vec![1.0, -2.0, 2.0])),
+            ("f".into(), Column::Numeric(vec![1.0, 10.0, 1.0])),
+            ("x".into(), Column::Numeric(vec![0.1, 0.2, 0.3])),
+        ],
+        n: 3,
+    };
+    let err = match lower("cbind(s, f) ~ x", &table, fam) {
+        Ok(_) => panic!("expected the negative-count row to be rejected"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        err.contains("non-negative") && err.contains("row 1"),
+        "{err}"
+    );
+}
+
+// ── Integer grouping columns ─────────────────────────────────────────────────
+
+/// Lower `formula` against both tables and assert they give the same design,
+/// the same grouping ids and level labels, and the same fit.
+fn assert_same_lowering(formula: &str, a: &Table, b: &Table, family: Family, ctx: &str) {
+    let lo_a = lower(formula, a, family).unwrap();
+    let lo_b = lower(formula, b, family).unwrap_or_else(|e| panic!("{ctx}: lower failed: {e}"));
+    assert_eq!(lo_b.x, lo_a.x, "{ctx}: design matrix");
+    assert_eq!(lo_b.ids.primary, lo_a.ids.primary, "{ctx}: primary ids");
+    let labels = |lo: &glmm::formula::Lowered| -> Vec<Vec<Option<String>>> {
+        lo.re_groups.iter().map(|g| g.slot_labels.clone()).collect()
+    };
+    assert_eq!(labels(&lo_b), labels(&lo_a), "{ctx}: level labels");
+    let fit_a = fit_cold(
+        &lo_a.x,
+        &lo_a.y,
+        lo_a.n,
+        lo_a.p,
+        &lo_a.model,
+        &lo_a.ids,
+        &lo_a.opts,
+    );
+    let fit_b = fit_cold(
+        &lo_b.x,
+        &lo_b.y,
+        lo_b.n,
+        lo_b.p,
+        &lo_b.model,
+        &lo_b.ids,
+        &lo_b.opts,
+    );
+    assert!(fit_b.converged(), "{ctx}: fit did not converge");
+    assert_same_fit(&fit_b, &fit_a, ctx);
+}
+
+/// `read.csv` and `pd.read_csv` load sleepstudy's `Subject` and cbpp's `herd`
+/// as integers, and both ports pass an integer column on as numeric. It must
+/// lower to the grouping lme4 builds with `factor()`: levels in ascending
+/// numeric order, labelled as integers. cbpp's herds `1..15` are the case where
+/// that order differs from the lexicographic one.
+#[test]
+fn integer_grouping_column_lowers_like_its_factor() {
+    let data = rows(include_str!("../validation/data/empirical/sleepstudy.csv"));
+    let sleep = |subject: Column| Table {
+        columns: vec![
+            ("Reaction".into(), numeric(&data, 0)),
+            ("Days".into(), numeric(&data, 1)),
+            ("Subject".into(), subject),
+        ],
+        n: data.len(),
+    };
+    assert_same_lowering(
+        "Reaction ~ Days + (1 + Days | Subject)",
+        &sleep(factor(&data, 2)),
+        &sleep(numeric(&data, 2)),
+        Family::Gaussian,
+        "sleepstudy",
+    );
+
+    let data = rows(include_str!("../validation/data/empirical/cbpp.csv"));
+    let herd = nums(&data, 0);
+    let inc = nums(&data, 1);
+    let fail: Vec<f64> = inc.iter().zip(nums(&data, 2)).map(|(i, s)| s - i).collect();
+    let cbpp = |herd: Column| Table {
+        columns: vec![
+            ("inc".into(), Column::Numeric(inc.clone())),
+            ("fail".into(), Column::Numeric(fail.clone())),
+            ("period".into(), factor(&data, 3)),
+            ("herd".into(), herd),
+        ],
+        n: data.len(),
+    };
+    let numeric_order = Column::Factor {
+        levels: (1..=15).map(|k: u32| k.to_string()).collect(),
+        codes: herd.iter().map(|&h| h as u32 - 1).collect(),
+    };
+    assert_same_lowering(
+        "cbind(inc, fail) ~ period + (1|herd)",
+        &cbpp(numeric_order),
+        &cbpp(Column::Numeric(herd.clone())),
+        Family::Binomial {
+            link: glmm::BinomialLink::Logit,
+        },
+        "cbpp",
+    );
+}
+
+/// Column names are Unicode wherever the formula reads them: a non-ASCII
+/// grouping factor, transform argument and slope lower to the same inputs as
+/// the ASCII spelling of the same model.
+#[test]
+fn non_ascii_column_names_lower_like_ascii_ones() {
+    let data = rows(include_str!("../validation/data/empirical/sleepstudy.csv"));
+    let sleep = |[y, x, g]: [&str; 3]| Table {
+        columns: vec![
+            (y.into(), numeric(&data, 0)),
+            (x.into(), numeric(&data, 1)),
+            (g.into(), factor(&data, 2)),
+        ],
+        n: data.len(),
+    };
+    let ascii = lower(
+        "Reaction ~ sqrt(Days) + (1 + sqrt(Days) | Subject)",
+        &sleep(["Reaction", "Days", "Subject"]),
+        Family::Gaussian,
+    )
+    .unwrap();
+    let polish = lower(
+        "czas_reakcji ~ sqrt(dzień) + (1 + sqrt(dzień) | osoba_ż)",
+        &sleep(["czas_reakcji", "dzień", "osoba_ż"]),
+        Family::Gaussian,
+    )
+    .unwrap();
+    assert_eq!(polish.col_names, ["(Intercept)", "sqrt(dzień)"]);
+    assert_eq!(polish.x, ascii.x);
+    assert_eq!(polish.y, ascii.y);
+    assert_eq!(polish.ids.primary, ascii.ids.primary);
+    assert_eq!(polish.re_groups[0].name, "osoba_ż");
+    assert_eq!(polish.re_groups[0].terms, ["(Intercept)", "sqrt(dzień)"]);
+}
+
+/// A grouping column with a fractional value is not an id column; it is
+/// refused rather than cut into one level per distinct value.
+#[test]
+fn fractional_grouping_column_is_refused() {
+    let table = Table {
+        columns: vec![
+            ("y".into(), Column::Numeric(vec![1.0, 2.0, 3.0, 4.0])),
+            ("g".into(), Column::Numeric(vec![1.0, 1.5, 2.0, 2.0])),
+        ],
+        n: 4,
+    };
+    match lower("y ~ (1|g)", &table, Family::Gaussian) {
+        Err(glmm::formula::Error::WrongColumnKind { name, .. }) => assert_eq!(name, "g"),
+        Err(e) => panic!("wrong error: {e}"),
+        Ok(_) => panic!("a fractional grouping column must be refused"),
+    }
+}
+
+#[test]
+fn grouseticks_poisson_matches_hand_built_spec() {
+    let data = rows(include_str!("../validation/data/empirical/grouseticks.csv"));
+    // cols: INDEX,TICKS,BROOD,HEIGHT,YEAR,LOCATION,cHEIGHT
+    let table = Table {
+        columns: vec![
+            ("TICKS".into(), numeric(&data, 1)),
+            ("YEAR".into(), factor(&data, 4)),
+            ("cHEIGHT".into(), numeric(&data, 6)),
+            ("INDEX".into(), factor(&data, 0)),
+        ],
+        n: data.len(),
+    };
+    let y = nums(&data, 1);
+    // YEAR is a 3-level factor → 2 dummies, then the numeric cHEIGHT, in the
+    // order the formula names the terms.
+    let mut cols = dummies(&data, 4);
+    cols.push(nums(&data, 6));
+    let x = design(data.len(), &cols);
+    let model = ModelSpec {
+        family: Family::Poisson {
+            link: glmm::PoissonLink::Log,
+        },
+        re: Some(intercept_re(n_levels(&data, 0), vec![])),
+    };
+    let ids = GroupIds {
+        primary: codes(&data, 0),
+        extra: vec![],
+    };
+    let hand = HandBuilt {
+        x,
+        y,
+        p: 4,
+        model,
+        ids,
+        col_names: &["(Intercept)", "YEAR96", "YEAR97", "cHEIGHT"],
+    };
+    assert_frontend_matches_hand_built(
+        "TICKS ~ YEAR + cHEIGHT + (1|INDEX)",
+        &table,
+        Family::Poisson {
+            link: glmm::PoissonLink::Log,
+        },
+        &hand,
+        "grouseticks",
+    );
+}
+
+// ── `re_groups` (varcorr/tau2 name+term metadata) ────────────────────────────
+//
+// `lower()` is pure enough not to need a converging fit for this — small
+// fabricated tables are enough to exercise `lower_random_effects`'s
+// primary/extra bookkeeping.
+
+/// The first-factor promotion (`y ~ 0 + f + ...`) is a FIXED-DESIGN coding
+/// convention only. A random slope on the promoted factor must not inherit the
+/// promotion: `(f|g)` should resolve to the same treatment-coded slope block
+/// (intercept + non-base dummies) that `y ~ f + (f|g)` gets, never the
+/// promoted factor's full indicator set (which would make the RE block
+/// structurally singular — intercept + 3 dummies for a 3-level factor).
+#[test]
+fn promoted_factor_re_slope_keeps_treatment_dummies() {
+    let table = Table {
+        columns: vec![
+            (
+                "y".into(),
+                Column::Numeric(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+            ),
+            (
+                "f".into(),
+                Column::factor_from_labels(&["a", "b", "c", "a", "b", "c"].map(String::from)),
+            ),
+            (
+                "g".into(),
+                Column::factor_from_labels(&["g1", "g1", "g1", "g2", "g2", "g2"].map(String::from)),
+            ),
+        ],
+        n: 6,
+    };
+
+    let promoted = lower("y ~ 0 + f + (f|g)", &table, Family::Gaussian).unwrap();
+    assert_eq!(promoted.col_names, vec!["fa", "fb", "fc"]);
+    assert_eq!(promoted.re_groups[0].terms, vec!["(Intercept)", "fb", "fc"]);
+
+    let plain = lower("y ~ f + (f|g)", &table, Family::Gaussian).unwrap();
+    assert_eq!(plain.col_names, vec!["(Intercept)", "fb", "fc"]);
+    assert_eq!(plain.re_groups[0].terms, vec!["(Intercept)", "fb", "fc"]);
+
+    // Same slope columns in both designs — resolve each design's `ColumnId`s
+    // back through its own `col_names` and check they name the same dummies,
+    // rather than assuming identical indices (the intercept column shifts
+    // everything after it by one when present).
+    let promoted_slopes = &promoted.model.re.as_ref().unwrap().slopes;
+    let plain_slopes = &plain.model.re.as_ref().unwrap().slopes;
+    let promoted_names: Vec<&str> = promoted_slopes
+        .iter()
+        .map(|&c| promoted.col_names[c as usize].as_str())
+        .collect();
+    let plain_names: Vec<&str> = plain_slopes
+        .iter()
+        .map(|&c| plain.col_names[c as usize].as_str())
+        .collect();
+    assert_eq!(promoted_names, vec!["fb", "fc"]);
+    assert_eq!(plain_names, vec!["fb", "fc"]);
+}
+
+#[test]
+fn log_of_a_nonpositive_value_is_reported_not_finite_at_its_row() {
+    let table = Table {
+        columns: vec![
+            ("y".into(), Column::Numeric(vec![1.0, 2.0, 3.0, 4.0])),
+            ("x".into(), Column::Numeric(vec![1.0, 2.0, -1.0, 4.0])),
+        ],
+        n: 4,
+    };
+    let err = match lower("y ~ log(x)", &table, Family::Gaussian) {
+        Ok(_) => panic!("expected log(x) on a non-positive x to be rejected"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("not finite at row 2"), "{err}");
+}
+
+#[test]
+fn a_non_finite_offset_term_is_reported_at_its_row() {
+    let table = Table {
+        columns: vec![
+            ("y".into(), Column::Numeric(vec![1.0, 2.0, 3.0, 4.0])),
+            (
+                "o".into(),
+                Column::Numeric(vec![0.0, f64::INFINITY, 0.0, 0.0]),
+            ),
+        ],
+        n: 4,
+    };
+    let err = match lower("y ~ 1 + offset(o)", &table, Family::Gaussian) {
+        Ok(_) => panic!("expected an infinite offset() entry to be rejected"),
+        Err(e) => e,
+    };
+    assert_eq!(err.to_string(), "term 'offset(o)' is not finite at row 1");
+}
+
+#[test]
+fn a_non_finite_response_or_predictor_is_reported_at_its_row() {
+    let cases = [
+        ("x", f64::INFINITY, "y ~ x", "x"),
+        ("x", f64::NAN, "y ~ x", "x"),
+        ("y", f64::NEG_INFINITY, "y ~ x", "y"),
+        ("x", 1e200, "y ~ x:z", "x:z"),
+    ];
+    for (col, bad, formula, term) in cases {
+        let mut columns = vec![
+            ("y".to_string(), vec![1.0, 2.0, 3.0, 4.0]),
+            ("x".to_string(), vec![0.5, 1.0, 1.5, 2.0]),
+            ("z".to_string(), vec![1.0, 1e200, 1.0, 1.0]),
+        ];
+        columns.iter_mut().find(|(n, _)| n == col).unwrap().1[1] = bad;
+        let table = Table {
+            columns: columns
+                .into_iter()
+                .map(|(n, v)| (n, Column::Numeric(v)))
+                .collect(),
+            n: 4,
+        };
+        let err = match lower(formula, &table, Family::Gaussian) {
+            Ok(_) => panic!("expected {bad} in {col} to be rejected for {formula}"),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.to_string(),
+            format!("term '{term}' is not finite at row 1")
+        );
+    }
+}
+
+#[test]
+fn transform_of_a_factor_column_is_rejected_as_not_numeric() {
+    let table = Table {
+        columns: vec![
+            ("y".into(), Column::Numeric(vec![1.0, 2.0, 3.0, 4.0])),
+            (
+                "f".into(),
+                Column::factor_from_labels(&["a", "b", "a", "b"].map(String::from)),
+            ),
+        ],
+        n: 4,
+    };
+    let err = match lower("y ~ log(f)", &table, Family::Gaussian) {
+        Ok(_) => panic!("expected log(f) on a factor column to be rejected"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("is not numeric"), "{err}");
+}
+
+#[test]
+fn intercept_written_first_becomes_primary_over_slope() {
+    // Formula order decides the primary grouping: `(1|g)` written before
+    // `(1+x|h)` makes `g` primary even though the parser's slope stage runs
+    // before its intercept stage. The slope block then sits on the EXTRA
+    // grouping — which is itself a sparse-routing trigger (algorithms-lmm.md),
+    // the orientation validation rung 24 (`sim_sparse_gamma`) exercises.
+    let table = Table {
+        columns: vec![
+            ("y".into(), Column::Numeric(vec![1.0, 2.0, 3.0, 4.0])),
+            ("x".into(), Column::Numeric(vec![0.5, 1.5, 2.5, 3.5])),
+            (
+                "g".into(),
+                Column::factor_from_labels(&["g1", "g1", "g2", "g2"].map(String::from)),
+            ),
+            (
+                "h".into(),
+                Column::factor_from_labels(&["h1", "h2", "h1", "h2"].map(String::from)),
+            ),
+        ],
+        n: 4,
+    };
+    let lo = glmm::formula::lower("y ~ x + (1|g) + (1+x|h)", &table, Family::Gaussian).unwrap();
+    assert_eq!(lo.re_groups[0].name, "g");
+    assert_eq!(lo.re_groups[0].terms, vec!["(Intercept)".to_string()]);
+    assert_eq!(lo.re_groups[1].name, "h");
+    assert_eq!(
+        lo.re_groups[1].terms,
+        vec!["(Intercept)".to_string(), "x".to_string()]
+    );
+    let re = lo.model.re.as_ref().unwrap();
+    assert!(re.slopes.is_empty(), "primary grouping carries no slopes");
+    assert_eq!(re.extra_groupings.len(), 1);
+    assert_eq!(
+        re.extra_groupings[0].slopes,
+        vec![1],
+        "x is design column 1"
+    );
+}
+
+// ── Crossed interaction grouping, `(1|A:B)` ──────────────────────────────────
+
+#[test]
+fn interaction_grouping_produces_dense_composite_ids() {
+    // recipe × replicate: 4 distinct (recipe,replicate) pairs over 6 rows, with
+    // row 4 repeating row 0's pair and row 5 repeating row 3's — crossed, not
+    // nested: replicate "1"/"2" are shared labels across recipes, not unique per
+    // recipe, so this must NOT collapse to the nested `A/B` id scheme.
+    // This id-layout shape's fitted-model oracle lives externally: validation
+    // rung 13 (cake, `validation/manifest.json`) exercises the `(1|recipe:replicate)`
+    // grouping through a real fit.
+    let table = Table {
+        columns: vec![
+            (
+                "y".into(),
+                Column::Numeric(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+            ),
+            (
+                "recipe".into(),
+                Column::factor_from_labels(&["A", "A", "B", "B", "A", "B"].map(String::from)),
+            ),
+            (
+                "replicate".into(),
+                Column::factor_from_labels(&["1", "2", "1", "2", "1", "2"].map(String::from)),
+            ),
+        ],
+        n: 6,
+    };
+    let lo = glmm::formula::lower("y ~ (1|recipe:replicate)", &table, Family::Gaussian).unwrap();
+    assert_eq!(lo.re_groups.len(), 1);
+    assert_eq!(lo.re_groups[0].name, "recipe:replicate");
+    // Levels sorted lexicographically over the joined "recipe:replicate" label
+    // ("A:1","A:2","B:1","B:2") — dense codes 0..3, row4 repeats row0's pair
+    // (A:1), row5 repeats row3's (B:2).
+    assert_eq!(lo.ids.primary, vec![0, 1, 2, 3, 0, 3]);
+    assert!(lo.ids.extra.is_empty());
+}
+
+// ── Too few rows for a term's random effects ────────────────────────────────
+//
+// lme4 stops when the rows are at most a term's random effects (`lmer`) or
+// below them (`glmer`), checking each term on its own (`check.nobs.vs.nRE`).
+// glmm fits these models and notes them.
+
+/// A factor column with labels `s<code>`.
+fn coded(codes: &[usize]) -> Column {
+    let labels: Vec<String> = codes.iter().map(|c| format!("s{c}")).collect();
+    Column::factor_from_labels(&labels)
+}
+
+/// `y`, `time` and `id`, with `rows_per_id[i]` rows for subject `i` at times
+/// `0, 1, ...`: the data for `(1 + time | id)`, which has `2 * rows_per_id.len()`
+/// random effects.
+fn slope_table(rows_per_id: &[usize]) -> Table {
+    let id: Vec<usize> = rows_per_id
+        .iter()
+        .enumerate()
+        .flat_map(|(i, &k)| std::iter::repeat_n(i, k))
+        .collect();
+    let time = rows_per_id
+        .iter()
+        .flat_map(|&k| (0..k).map(|t| t as f64))
+        .collect();
+    let n = id.len();
+    Table {
+        columns: vec![
+            (
+                "y".into(),
+                Column::Numeric((0..n).map(|i| ((i * 7) % 5) as f64).collect()),
+            ),
+            ("time".into(), Column::Numeric(time)),
+            ("id".into(), coded(&id)),
+        ],
+        n,
+    }
+}
+
+/// The lowering's `FewRowsForRandomEffects` notes, as
+/// `(terms, grouping, random_effects, rows)`.
+fn few_rows_notes(formula: &str, table: &Table, family: Family) -> Vec<(String, String, u32, u32)> {
+    lower(formula, table, family)
+        .unwrap()
+        .notes
+        .into_iter()
+        .filter_map(|note| match note {
+            Note::FewRowsForRandomEffects {
+                terms,
+                grouping,
+                random_effects,
+                rows,
+            } => Some((terms, grouping, random_effects, rows)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_term_with_more_random_effects_than_rows_is_noted() {
+    // 10 subjects, two with one row: 18 rows for 20 random effects, a model
+    // lme4's lmer stops on.
+    let table = slope_table(&[1, 2, 2, 2, 2, 1, 2, 2, 2, 2]);
+    assert_eq!(
+        few_rows_notes("y ~ time + (1 + time | id)", &table, Family::Gaussian),
+        vec![("1 + time".to_string(), "id".to_string(), 20, 18)]
+    );
+}
+
+#[test]
+fn a_gaussian_model_is_noted_up_to_as_many_rows_as_random_effects() {
+    let formula = "y ~ time + (1 + time | id)";
+    let twenty = slope_table(&[2; 10]);
+    assert_eq!(
+        few_rows_notes(formula, &twenty, Family::Gaussian),
+        vec![("1 + time".to_string(), "id".to_string(), 20, 20)]
+    );
+    let mut one_more = [2; 10];
+    one_more[0] = 3;
+    assert!(few_rows_notes(formula, &slope_table(&one_more), Family::Gaussian).is_empty());
+}
+
+#[test]
+fn an_observation_level_intercept_on_a_glmm_is_not_noted() {
+    // One level per row: as many random effects as rows, which glmer allows.
+    let n = 40;
+    let table = Table {
+        columns: vec![
+            (
+                "y".into(),
+                Column::Numeric((0..n).map(|i| (i % 4) as f64).collect()),
+            ),
+            (
+                "x".into(),
+                Column::Numeric((0..n).map(|i| i as f64 / 10.0).collect()),
+            ),
+            ("obs".into(), coded(&(0..n).collect::<Vec<_>>())),
+        ],
+        n,
+    };
+    let poisson = Family::Poisson {
+        link: glmm::PoissonLink::Log,
+    };
+    assert!(few_rows_notes("y ~ x + (1 | obs)", &table, poisson).is_empty());
+}
+
+#[test]
+fn crossed_terms_are_checked_one_at_a_time() {
+    // 15 rows; 9 levels of s and 8 of i, 17 together. lme4 fits this model.
+    let n = 15;
+    let table = Table {
+        columns: vec![
+            (
+                "y".into(),
+                Column::Numeric((0..n).map(|i| ((i * 3) % 7) as f64).collect()),
+            ),
+            (
+                "s".into(),
+                coded(&(0..n).map(|i| i % 9).collect::<Vec<_>>()),
+            ),
+            (
+                "i".into(),
+                coded(&(0..n).map(|i| i % 8).collect::<Vec<_>>()),
+            ),
+        ],
+        n,
+    };
+    assert!(few_rows_notes("y ~ 1 + (1 | s) + (1 | i)", &table, Family::Gaussian).is_empty());
+}
+
+#[test]
+fn a_dropped_single_level_grouping_is_not_checked() {
+    // `(1 + f | one)` has 1 level times 5 terms, as many as the rows, but the
+    // term is dropped for its single level, so only that note is raised.
+    let n = 5;
+    let table = Table {
+        columns: vec![
+            (
+                "y".into(),
+                Column::Numeric((0..n).map(|i| i as f64).collect()),
+            ),
+            ("f".into(), coded(&(0..n).collect::<Vec<_>>())),
+            ("one".into(), coded(&[0; 5])),
+        ],
+        n,
+    };
+    let lo = lower("y ~ f + (1 + f | one)", &table, Family::Gaussian).unwrap();
+    assert!(
+        matches!(
+            lo.notes.as_slice(),
+            [Note::SingleLevelGroupingDropped { grouping }] if grouping == "one"
+        ),
+        "{:?}",
+        lo.notes
+    );
+}
+
+/// `re_groups` must line up index-for-index with `varcorr`, since `summary()`
+/// labels block `k` with name `k` — a swap mislabels a variance component, which
+/// is a wrong answer, not a cosmetic slip.
+///
+/// Penicillin is the fixture where a swap is visible: two named crossed
+/// groupings whose variances differ ~2.3×. The stddevs are pinned from glmm's
+/// own output; the same fit is gated against lme4 by the `penicillin_lmm` cell
+/// in `tests/validation_oracle.rs`, which is what makes them valid answers to pin.
+#[test]
+fn re_groups_align_with_varcorr_blocks() {
+    // Pinned from glmm; validated by the `penicillin_lmm` oracle cell.
+    // Re-pinned 2026-10-02 with the per-search BOBYQA start radii (LMM blind
+    // start 0.5): the search takes another path to the same optimum, plate sd
+    // 1.2e-7 and sample sd 1.9e-7 relative, REML criterion 1.5e-12 lower, no
+    // converged, singular or pinned flag changed.
+    const PLATE_SD: f64 = 0.846704534225002;
+    const SAMPLE_SD: f64 = 1.9315579384727732;
+
+    let data = rows(include_str!("../validation/data/empirical/Penicillin.csv"));
+    let table = Table {
+        columns: vec![
+            ("diameter".into(), numeric(&data, 0)),
+            ("plate".into(), factor(&data, 1)),
+            ("sample".into(), factor(&data, 2)),
+        ],
+        n: data.len(),
+    };
+    let lo = lower(
+        "diameter ~ (1|plate) + (1|sample)",
+        &table,
+        Family::Gaussian,
+    )
+    .unwrap();
+    let f = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+    assert!(f.converged());
+
+    // The shim's invariant: one name per varcorr block, same order.
+    assert_eq!(
+        lo.re_groups.len(),
+        f.varcorr.len(),
+        "re_groups and varcorr must agree in length"
+    );
+    let want: [(&str, f64); 2] = [("plate", PLATE_SD), ("sample", SAMPLE_SD)];
+    for (k, (name, sd)) in want.iter().enumerate() {
+        assert_eq!(&lo.re_groups[k].name, name, "block {k} name");
+        assert_eq!(
+            lo.re_groups[k].terms,
+            vec!["(Intercept)".to_string()],
+            "block {k} terms"
+        );
+        // The variance actually sitting in block k must be the one belonging to
+        // the grouping named at index k — this is what a swap breaks.
+        let got = f.varcorr[k][0].sqrt();
+        assert!(
+            close(got, *sd, PIN_REL_ITER, 0.0),
+            "block {k} ({name}) sd {got} vs pinned {sd}"
+        );
+    }
+    // Guard the guard: the two stddevs must actually differ, or a swap would
+    // slip through the check above.
+    assert!(
+        (PLATE_SD - SAMPLE_SD).abs() > 0.5,
+        "fixture no longer distinguishes a swap"
+    );
+}
+
+/// A factor's level order is the caller's, and level
+/// 0 is the treatment-contrast base. Before this, `factor_levels` sorted every
+/// factor through a `BTreeSet`, so `["low","med","high"]` silently based against
+/// `"high"` — same fit quality, different β, a different question answered, and
+/// nothing in the output to reveal it.
+#[test]
+fn declared_factor_level_order_picks_the_reference_level() {
+    let labels = ["low", "high", "med", "low", "high", "med"].map(String::from);
+    let y = Column::Numeric(vec![1.0, 3.0, 2.0, 1.1, 3.1, 2.1]);
+    let declared = Table {
+        columns: vec![
+            (
+                "y".into(),
+                Column::Numeric(vec![1.0, 3.0, 2.0, 1.1, 3.1, 2.1]),
+            ),
+            (
+                "f".into(),
+                Column::Factor {
+                    levels: vec!["low".into(), "med".into(), "high".into()],
+                    codes: vec![0, 2, 1, 0, 2, 1],
+                },
+            ),
+        ],
+        n: 6,
+    };
+    let lo = lower("y ~ f", &declared, Family::Gaussian).unwrap();
+    // Base is "low" (level 0), so the emitted dummies are the OTHER two, in the
+    // caller's order — not lexicographic ("high" would sort first).
+    assert_eq!(lo.col_names, vec!["(Intercept)", "fmed", "fhigh"]);
+
+    // The same labels with no declared order sort lexicographically, base
+    // "high" — the default ordering, not an imposition.
+    let sorted = Table {
+        columns: vec![
+            ("y".into(), y),
+            ("f".into(), Column::factor_from_labels(&labels)),
+        ],
+        n: 6,
+    };
+    let lo2 = lower("y ~ f", &sorted, Family::Gaussian).unwrap();
+    assert_eq!(lo2.col_names, vec!["(Intercept)", "flow", "fmed"]);
+
+    // Not just names: the reference level moved, so the intercept moved with it.
+    let f1 = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+    let f2 = fit_cold(
+        &lo2.x, &lo2.y, lo2.n, lo2.p, &lo2.model, &lo2.ids, &lo2.opts,
+    );
+    assert!(f1.converged() && f2.converged());
+    // Intercept = mean of the base level: "low" ≈ 1.05 vs "high" ≈ 3.05.
+    assert!(
+        close(f1.beta[0], 1.05, 1e-6, 1e-6),
+        "base low: {}",
+        f1.beta[0]
+    );
+    assert!(
+        close(f2.beta[0], 3.05, 1e-6, 1e-6),
+        "base high: {}",
+        f2.beta[0]
+    );
+}
+
+/// `y ~ x:z + xz` with `xz = x * z` is rank deficient. R sorts terms by degree,
+/// so the design is `(Intercept) xz x:z` and the later column, `x:z`, is the
+/// aliased one: lme4 2.0.6 drops it ("dropping 1 column", `col.dropped` 3) and
+/// reports `(Intercept) xz`, as `lm` reports `x:z` as NA. The kept coefficients
+/// are the fit of `y ~ xz`.
+#[test]
+fn rank_deficient_interaction_drops_the_column_r_drops() {
+    let n = 60;
+    let x: Vec<f64> = (0..n).map(|i| (i as f64 * 0.7).sin()).collect();
+    let z: Vec<f64> = (0..n).map(|i| (i as f64 * 0.3).cos() + 0.5).collect();
+    let xz: Vec<f64> = x.iter().zip(&z).map(|(a, b)| a * b).collect();
+    let g: Vec<f64> = (0..n).map(|i| (i / 6) as f64).collect();
+    let y: Vec<f64> = (0..n)
+        .map(|i| 1.0 + 0.8 * xz[i] + 0.3 * (g[i] - 4.5) + (i as f64 * 1.3).sin())
+        .collect();
+    let table = Table {
+        columns: vec![
+            ("y".into(), Column::Numeric(y)),
+            ("x".into(), Column::Numeric(x)),
+            ("z".into(), Column::Numeric(z)),
+            ("xz".into(), Column::Numeric(xz)),
+            ("g".into(), Column::Numeric(g)),
+        ],
+        n,
+    };
+    let lo = lower("y ~ x:z + xz + (1|g)", &table, Family::Gaussian).unwrap();
+    assert_eq!(lo.col_names, vec!["(Intercept)", "xz", "x:z"]);
+    let fit = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+    assert_eq!(fit.aliased(), &[false, false, true]);
+    assert!(fit.beta[2].is_nan());
+
+    let reduced = lower("y ~ xz + (1|g)", &table, Family::Gaussian).unwrap();
+    let want = fit_cold(
+        &reduced.x,
+        &reduced.y,
+        reduced.n,
+        reduced.p,
+        &reduced.model,
+        &reduced.ids,
+        &reduced.opts,
+    );
+    assert!(fit.converged() && want.converged());
+    assert_vec_close(&fit.beta[..2], &want.beta, "kept coefficients");
+}
+
+/// `offset(log(e))` in the formula must produce the same fit as passing the
+/// same vector through `FitOptions.offset`.
+#[test]
+fn offset_term_equals_offset_argument() {
+    let data = rows(include_str!("../validation/data/empirical/grouseticks.csv"));
+    let ticks: Vec<f64> = data.iter().map(|r| r[1].parse().unwrap()).collect();
+    let height: Vec<f64> = data.iter().map(|r| r[3].parse().unwrap()).collect();
+    let n = ticks.len();
+    let table = Table {
+        columns: vec![
+            ("TICKS".into(), Column::Numeric(ticks)),
+            ("HEIGHT".into(), Column::Numeric(height.clone())),
+            ("BROOD".into(), factor(&data, 2)),
+        ],
+        n,
+    };
+    let fam = Family::Poisson {
+        link: glmm::PoissonLink::Log,
+    };
+    let lo_term = lower("TICKS ~ offset(log(HEIGHT)) + (1|BROOD)", &table, fam).unwrap();
+    let mut lo_arg = lower("TICKS ~ (1|BROOD)", &table, fam).unwrap();
+    lo_arg.opts.offset = Some(height.iter().map(|h| h.ln()).collect());
+    assert_eq!(lo_term.col_names, vec!["(Intercept)"]);
+    assert_eq!(lo_term.opts.offset, lo_arg.opts.offset);
+    let a = fit_cold(
+        &lo_term.x,
+        &lo_term.y,
+        lo_term.n,
+        lo_term.p,
+        &lo_term.model,
+        &lo_term.ids,
+        &lo_term.opts,
+    );
+    let b = fit_cold(
+        &lo_arg.x,
+        &lo_arg.y,
+        lo_arg.n,
+        lo_arg.p,
+        &lo_arg.model,
+        &lo_arg.ids,
+        &lo_arg.opts,
+    );
+    assert_same_fit(&a, &b, "offset term");
+}
+
+// ── FitResult carries the response and the row count ─────────────────────────
+
+/// `y` on the result is the response AFTER lowering — for `cbind(s, f)` the
+/// proportion the kernel fitted, not either raw column — and `nobs` is the
+/// lowered row count. Both ports print a header from these on fits where
+/// `fitted` is empty, so they must not be derived from `fitted`.
+///
+/// Behind `orchestrate`: `run_fit` and `FitResult` are gated on that
+/// off-by-default feature, so this test is too — the plain `cargo test`
+/// default-feature build never sees this import.
+#[cfg(feature = "orchestrate")]
+#[test]
+fn run_fit_returns_lowered_response_and_nobs() {
+    let mut numeric = HashMap::new();
+    numeric.insert("s".to_string(), vec![1.0, 2.0, 0.0, 3.0, 1.0, 2.0]);
+    numeric.insert("f".to_string(), vec![3.0, 2.0, 4.0, 1.0, 3.0, 2.0]);
+    numeric.insert("x".to_string(), vec![0.1, 0.5, 0.9, 0.2, 0.6, 0.8]);
+    let factor = HashMap::new();
+    let r = run_fit(
+        "cbind(s, f) ~ x",
+        numeric,
+        factor,
+        "binomial",
+        "logit",
+        "hessian",
+        1,
+        None,
+        None,
+        None,
+        None,
+        true,
+        None,
+        "Wald",
+    )
+    .unwrap();
+    assert_eq!(r.nobs, 6);
+    let expected: Vec<f64> = [1.0, 2.0, 0.0, 3.0, 1.0, 2.0]
+        .iter()
+        .zip([3.0, 2.0, 4.0, 1.0, 3.0, 2.0])
+        .map(|(s, f)| s / (s + f))
+        .collect();
+    assert_eq!(r.y, expected);
+}
+
+/// The `reml` rule of `run_fit`, decided on the lowered model: `Some(true)` on a
+/// non-Gaussian family is stripped with `reml_warning` set, and every other
+/// value reaches `FitOptions::reml`. "The same fit" here means bitwise.
+#[cfg(feature = "orchestrate")]
+mod reml_rule {
+    use super::*;
+    use glmm::orchestrate::FitResult;
+
+    const GLMM: &str = "cbind(incidence, healthy) ~ period + (1 | herd)";
+    const LMM: &str = "Reaction ~ Days + (1 | Subject)";
+    const OLS: &str = "Reaction ~ Days";
+
+    /// A factor column of `n` rows and a single level.
+    fn one_level(n: usize) -> Column {
+        Column::factor_from_labels(&vec!["a".to_string(); n])
+    }
+
+    /// sleepstudy, plus `one`, a grouping column of a single level.
+    fn sleepstudy() -> Table {
+        let data = rows(include_str!("../validation/data/empirical/sleepstudy.csv"));
+        let n = data.len();
+        Table {
+            columns: vec![
+                ("Reaction".into(), numeric(&data, 0)),
+                ("Days".into(), numeric(&data, 1)),
+                ("Subject".into(), factor(&data, 2)),
+                ("one".into(), one_level(n)),
+            ],
+            n,
+        }
+    }
+
+    /// cbpp in its aggregated form (`healthy = size − incidence`), plus `one`.
+    fn cbpp() -> Table {
+        let data = rows(include_str!("../validation/data/empirical/cbpp.csv"));
+        let n = data.len();
+        let incidence = nums(&data, 1);
+        let healthy = nums(&data, 2)
+            .iter()
+            .zip(&incidence)
+            .map(|(s, i)| s - i)
+            .collect();
+        Table {
+            columns: vec![
+                ("incidence".into(), Column::Numeric(incidence)),
+                ("healthy".into(), Column::Numeric(healthy)),
+                ("period".into(), factor(&data, 3)),
+                ("herd".into(), factor(&data, 0)),
+                ("one".into(), one_level(n)),
+            ],
+            n,
+        }
+    }
+
+    /// `run_fit` on `table`'s columns with Hessian SEs, Laplace and the
+    /// Satterthwaite pass on.
+    fn run(
+        formula: &str,
+        table: &Table,
+        family: &str,
+        link: &str,
+        reml: Option<bool>,
+    ) -> FitResult {
+        let (mut numeric, mut factors) = (HashMap::new(), HashMap::new());
+        for (name, col) in &table.columns {
+            match col {
+                Column::Numeric(v) => {
+                    numeric.insert(name.clone(), v.clone());
+                }
+                Column::Factor { levels, codes } => {
+                    factors.insert(name.clone(), (levels.clone(), codes.clone()));
+                }
+            }
+        }
+        run_fit(
+            formula, numeric, factors, family, link, "hessian", 1, None, None, None, None, true,
+            reml, "Wald",
+        )
+        .unwrap_or_else(|e| panic!("{formula}, reml {reml:?}: {e}"))
+    }
+
+    fn gaussian(formula: &str, reml: Option<bool>) -> FitResult {
+        run(formula, &sleepstudy(), "gaussian", "identity", reml)
+    }
+
+    fn binomial(formula: &str, reml: Option<bool>) -> FitResult {
+        run(formula, &cbpp(), "binomial", "logit", reml)
+    }
+
+    /// `fit_cold` on the lowered formula with `FitOptions::reml` set.
+    fn cold(formula: &str, table: &Table, family: Family, reml: Option<bool>) -> Fit {
+        let mut lo = lower(formula, table, family).unwrap();
+        lo.opts.reml = reml;
+        fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts)
+    }
+
+    fn bits(v: &[f64]) -> Vec<u64> {
+        v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    /// Every `f64` a `FitResult` carries, in a fixed order.
+    fn result_f64s(r: &FitResult) -> Vec<f64> {
+        let scalars = [
+            r.dispersion,
+            r.outer_decrement,
+            r.deviance,
+            r.loglik,
+            r.rss,
+            r.r_squared,
+            r.adj_r_squared,
+        ];
+        let vectors = [
+            &r.beta,
+            &r.se,
+            &r.tau2,
+            &r.stddev_se,
+            &r.fitted,
+            &r.ranef,
+            &r.y,
+            &r.coef_df,
+            &r.coef_p,
+        ];
+        scalars
+            .iter()
+            .chain(vectors.into_iter().flatten())
+            .chain(r.vcov.iter().flatten())
+            .chain(r.varcorr.iter().flatten())
+            .chain(r.ranef_blocks.iter().flat_map(|b| &b.3))
+            .chain(r.weights.iter().flatten())
+            .chain(r.notes.iter().map(|n| &n.pivot))
+            .copied()
+            .collect()
+    }
+
+    /// `got` is the fit `want` is: every `f64` by bits, every other field
+    /// through `Debug`, `reml_warning` aside.
+    fn assert_same_result(mut got: FitResult, want: &FitResult, ctx: &str) {
+        assert_eq!(
+            bits(&result_f64s(&got)),
+            bits(&result_f64s(want)),
+            "{ctx}: f64 bits"
+        );
+        got.reml_warning.clone_from(&want.reml_warning);
+        assert_eq!(format!("{got:?}"), format!("{want:?}"), "{ctx}");
+    }
+
+    fn has_dropped_note(r: &FitResult) -> bool {
+        r.notes
+            .iter()
+            .any(|n| n.kind == "single_level_grouping_dropped")
+    }
+
+    #[test]
+    fn run_fit_reml_true_ignored_with_warning_on_binomial_glmm() {
+        let on = binomial(GLMM, Some(true));
+        assert!(on.reml_warning.is_some(), "Some(true) on a GLMM must warn");
+        assert!(!on.reml);
+        assert_same_result(on, &binomial(GLMM, None), "GLMM Some(true) vs None");
+    }
+
+    #[test]
+    fn run_fit_reml_false_silent_on_binomial_glmm() {
+        let off = binomial(GLMM, Some(false));
+        assert_eq!(off.reml_warning, None);
+        assert_same_result(off, &binomial(GLMM, None), "GLMM Some(false) vs None");
+    }
+
+    #[test]
+    fn run_fit_reml_true_on_ols_reports_reml_loglik() {
+        let on = gaussian(OLS, Some(true));
+        let none = gaussian(OLS, None);
+        assert!(on.reml && !none.reml);
+        assert_eq!(on.reml_warning, None);
+        assert_eq!(bits(&on.beta), bits(&none.beta));
+        assert_eq!(bits(&on.se), bits(&none.se));
+        assert_eq!(on.dispersion.to_bits(), none.dispersion.to_bits());
+        let want = cold(OLS, &sleepstudy(), Family::Gaussian, Some(true));
+        assert_eq!(on.loglik.to_bits(), want.loglik.to_bits());
+        assert_ne!(
+            on.loglik, none.loglik,
+            "the REML and ML log-likelihoods differ"
+        );
+    }
+
+    #[test]
+    fn run_fit_reml_true_accepted_on_gaussian_mixed() {
+        let on = gaussian(LMM, Some(true));
+        assert!(on.reml);
+        assert_eq!(on.reml_warning, None);
+        assert_same_result(on, &gaussian(LMM, None), "LMM Some(true) vs None");
+    }
+
+    #[test]
+    fn run_fit_reml_accepted_when_grouping_dropped() {
+        // Gaussian: fitted as OLS, so the OLS row applies.
+        let f = "Reaction ~ Days + (1 | one)";
+        let (none, on, off) = (
+            gaussian(f, None),
+            gaussian(f, Some(true)),
+            gaussian(f, Some(false)),
+        );
+        for r in [&none, &on, &off] {
+            assert!(has_dropped_note(r), "{:?}", r.notes);
+            assert_eq!(r.reml_warning, None);
+        }
+        assert!(on.reml);
+        let want = cold(OLS, &sleepstudy(), Family::Gaussian, Some(true));
+        assert_eq!(on.loglik.to_bits(), want.loglik.to_bits());
+        assert_eq!(bits(&on.beta), bits(&none.beta));
+        assert_eq!(on.dispersion.to_bits(), none.dispersion.to_bits());
+        assert!(!off.reml);
+        assert_same_result(off, &none, "dropped Gaussian Some(false) vs None");
+
+        // Binomial: fitted as a GLM, so the GLM rule applies.
+        let g = "cbind(incidence, healthy) ~ period + (1 | one)";
+        let none = binomial(g, None);
+        let (on, off) = (binomial(g, Some(true)), binomial(g, Some(false)));
+        assert!(has_dropped_note(&none) && has_dropped_note(&on) && has_dropped_note(&off));
+        assert!(on.reml_warning.is_some(), "Some(true) on a GLM must warn");
+        assert_eq!(off.reml_warning, None);
+        assert_same_result(on, &none, "dropped binomial Some(true) vs None");
+        assert_same_result(off, &none, "dropped binomial Some(false) vs None");
+    }
+
+    /// An enum variant as the ports' snake-case string, underscores dropped
+    /// (`AtBoundary` and `"at_boundary"` both give `"atboundary"`).
+    fn flat(name: &str) -> String {
+        name.replace('_', "").to_lowercase()
+    }
+
+    #[test]
+    fn run_fit_reml_false_on_gaussian_mixed_fits_ml() {
+        let r = gaussian(LMM, Some(false));
+        let want = cold(LMM, &sleepstudy(), Family::Gaussian, Some(false));
+        let d = &want.diagnostics;
+        assert!(!r.reml && !want.reml);
+        assert_eq!(r.reml_warning, None);
+        assert_eq!(r.converged, d.converged);
+        assert_eq!(
+            (r.singular, &r.aliased, &r.pinned),
+            (d.singular, &d.aliased, &d.pinned)
+        );
+        assert_eq!((r.n_eval, r.n_grad, r.df), (want.n_eval, d.n_grad, want.df));
+        assert_eq!(r.outer_decrement.to_bits(), d.outer_decrement.to_bits());
+        assert_eq!(flat(r.boundary), flat(&format!("{:?}", d.boundary)));
+        assert_eq!(
+            r.outer_stop.map(flat),
+            d.outer_stop.map(|s| flat(&format!("{s:?}")))
+        );
+        assert_eq!(r.notes.len(), d.notes.len());
+        assert_eq!(bits(&r.beta), bits(&want.beta));
+        assert_eq!(bits(&r.se), bits(&want.se));
+        assert_eq!(bits(&r.tau2), bits(&want.tau2));
+        assert_eq!(bits(&r.stddev_se), bits(&want.stddev_se));
+        assert_eq!(bits(&r.fitted), bits(&want.fitted));
+        assert_eq!(bits(&r.ranef), bits(&want.ranef));
+        assert_eq!(bits(&r.coef_df), bits(&want.coef_df));
+        assert_eq!(r.ranef_levels, want.ranef_levels);
+        // Row by row, so a missing or extra row fails rather than zipping away.
+        let rows = |m: &[Vec<f64>]| m.iter().map(|v| bits(v)).collect::<Vec<_>>();
+        assert_eq!(rows(&r.vcov), rows(&want.vcov));
+        assert_eq!(rows(&r.varcorr), rows(&want.varcorr));
+        assert!(!r.vcov.is_empty() && !r.varcorr.is_empty());
+        for (g, w) in [
+            (r.dispersion, want.dispersion),
+            (r.deviance, want.deviance),
+            (r.loglik, want.loglik),
+        ] {
+            assert_eq!(g.to_bits(), w.to_bits());
+        }
+        // `coef_p` is the t test on each unit vector; `rss` is OLS only.
+        let p = want.beta.len();
+        let coef_p: Vec<f64> = (0..p)
+            .map(|j| {
+                let mut e = vec![0.0; p];
+                e[j] = 1.0;
+                want.contrast_t(&e).map_or(f64::NAN, |t| t.p_value)
+            })
+            .collect();
+        assert_eq!(bits(&r.coef_p), bits(&coef_p));
+        assert!(r.rss.is_nan());
+        assert_eq!(r.df_method, "satterthwaite");
+        assert!(r
+            .coef_df
+            .iter()
+            .all(|&v| v.is_finite() && v <= r.nobs as f64));
+        // The ML fit is not the REML one.
+        assert_ne!(r.loglik, gaussian(LMM, None).loglik);
+    }
+}

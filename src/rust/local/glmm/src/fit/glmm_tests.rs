@@ -1,0 +1,11055 @@
+//! GLMM estimator tests (Binomial/Poisson/Gamma/negative-binomial,
+//! `re: Some`, dense + sparse-Schur equivalence + AGQ + two-stage).
+
+use super::*;
+use crate::glmm::{glmm_laplace_deviance, GlmmWorkspace, OuterSearch, StructuredSchur};
+use crate::standardize::ColumnScaling;
+use crate::{
+    BinomialLink, Family, GroupIds, Grouping, GroupingRelation, ModelSpec, PoissonLink,
+    ReStructure, Sizing, StartValues, WaldSe,
+};
+use faer::Mat;
+
+use super::common_tests::{
+    assert_pinned, dense_ids, dense_str, inf_plateau_exp1, inf_plateau_lcg_next,
+    inf_plateau_normal, inf_plateau_poisson, lcg, sim_clustered,
+};
+
+/// SE of each θ coordinate: the square roots of the θ-block covariance's
+/// diagonal (on a scalar block, the `stddev_se` that
+/// `stddev_se_kernel_to_caller` reports).
+fn theta_se(ws: &GlmmWorkspace) -> Vec<f64> {
+    let cov = &ws.inference.theta_cov;
+    (0..cov.nrows())
+        .map(|k| match cov[(k, k)] {
+            v if v < 0.0 => 0.0,
+            v => v.sqrt(),
+        })
+        .collect()
+}
+
+/// The `f64` β-Profile solves of the blocked and structured kernels read a
+/// row-major copy of `X` (`PirlsScratch::x_rows`) through `const P` row
+/// kernels for `p ≤ 8` and runtime-`p` ones above; a workspace without the
+/// copy takes the `MatRef` passes. Both must reach the same fit, on a
+/// random-intercept (blocked) and a crossed (structured) Poisson design, at
+/// `p = 3` and at `p = 10`, past the `const P` kernels.
+#[test]
+fn profile_row_passes_match_the_matref_passes() {
+    for (crossed, p) in [(false, 3usize), (false, 10), (true, 3), (true, 10)] {
+        let (g1, g2, n) = (24usize, 5usize, 360usize);
+        let mut st = 7u64 + p as u64;
+        let mut x = vec![0.0f64; n * p];
+        let mut y = vec![0.0f64; n];
+        let (mut pid, mut eid) = (vec![0u32; n], vec![0u32; n]);
+        for i in 0..n {
+            let (c1, c2) = (i % g1, (i / g1) % g2);
+            pid[i] = c1 as u32;
+            eid[i] = c2 as u32;
+            x[i * p] = 1.0;
+            let mut eta = 0.4 + 0.2 * (c1 as f64 / g1 as f64 - 0.5);
+            if crossed {
+                eta += 0.3 * (c2 as f64 - 2.0) / 2.0;
+            }
+            for j in 1..p {
+                let v = lcg(&mut st);
+                x[i * p + j] = v;
+                eta += 0.3 * v / j as f64;
+            }
+            y[i] = (eta.exp() * (1.0 + 0.5 * lcg(&mut st))).round();
+        }
+        let model = ModelSpec {
+            family: Family::Poisson {
+                link: PoissonLink::Log,
+            },
+            re: Some(ReStructure {
+                sizing: Sizing::FixedClusters { n_clusters: 1 },
+                slopes: vec![],
+                extra_groupings: if crossed {
+                    vec![Grouping {
+                        relation: GroupingRelation::Crossed { n_clusters: 1 },
+                        slopes: vec![],
+                    }]
+                } else {
+                    vec![]
+                },
+            }),
+        };
+        let ids = GroupIds {
+            primary: pid,
+            extra: if crossed { vec![eid] } else { vec![] },
+        };
+        let opts = FitOptions::default();
+        let (sized, sized_ids, _perm) = super::spec_sized_from_ids(&model, &ids);
+        let label = format!("crossed={crossed} p={p}");
+        let fit = |rows: bool| {
+            let (mut ws, x_mat) = super::glmm::fit_glmm_build(
+                &x,
+                n,
+                p,
+                &sized,
+                &sized_ids.primary,
+                &sized_ids.extra,
+                &opts,
+            )
+            .unwrap_or_else(|_| panic!("{label}: degenerate design"));
+            let want = if crossed {
+                crate::glmm::GlmmLayout::Structured
+            } else {
+                crate::glmm::GlmmLayout::Blocked
+            };
+            assert!(ws.layout == want, "{label}: layout");
+            if !rows {
+                ws.pirls.x_rows = Vec::new();
+            }
+            let view = super::glmm::run_glmm_on(
+                &mut ws,
+                x_mat.as_ref(),
+                &y,
+                n,
+                p,
+                &sized,
+                &sized_ids.primary,
+                &sized_ids.extra,
+                f64::NAN,
+                None,
+                &opts,
+                ColumnScaling::IDENTITY,
+            );
+            let (converged, deviance) = view.converged_deviance();
+            assert!(converged, "{label}: the fixture must converge");
+            let mut est = view.betas().to_vec();
+            est.extend_from_slice(view.theta());
+            (deviance, est)
+        };
+        let (fast, slow) = (fit(true), fit(false));
+        // `C = X'WX` sums in row order on the row-major path and through
+        // faer's GEMM on the `MatRef` path: another product association and
+        // summation order, so the two fits agree to round-off.
+        let rel = |a: f64, b: f64| (a - b).abs() / b.abs().max(1.0);
+        assert!(
+            rel(fast.0, slow.0) < 1e-12,
+            "{label}: deviance {} vs {}",
+            fast.0,
+            slow.0
+        );
+        for (a, b) in fast.1.iter().zip(&slow.1) {
+            assert!(
+                rel(*a, *b) < 1e-7,
+                "{label}: beta/theta {:?} vs {:?}",
+                fast.1,
+                slow.1
+            );
+        }
+    }
+}
+
+/// Warm-start A/B on the realistic cbpp binomial GLMM (dense joint-BOBYQA
+/// path, scalar herd intercept): warm from the cold fit's own solution
+/// (θ̂ = √tau2 — σ²≡1 binomial — and β̂ verbatim) and from a perturbed
+/// (θ, β) must land on the cold optimum — β, SE, herd SD — and never
+/// degrade convergence. Unlike the LMM path, the GLMM start threads β
+/// verbatim (bypassing `glm_warm_start_beta`), so both arms also exercise
+/// PIRLS opening away from the GLM seed.
+#[test]
+fn fit_warm_glmm_cbpp_matches_cold_optimum() {
+    let (x, y, cluster_ids, n) = cbpp_design();
+    let p = 4;
+    let model = cbpp_model();
+    let ids = GroupIds {
+        primary: cluster_ids,
+        extra: vec![],
+    };
+    let opts = FitOptions {
+        target_indices: vec![0, 1, 2, 3],
+        ..FitOptions::default()
+    };
+    let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    assert!(cold.converged(), "cold cbpp GLMM must converge");
+    let starts = [
+        (
+            "truth",
+            StartValues {
+                beta: cold.beta.clone(),
+                theta: vec![cold.tau2[0].sqrt()],
+                dispersion: None,
+            },
+        ),
+        // Halved β̂ + θ=3 (θ̂ ≈ 0.64): far enough to move the joint
+        // optimizer, near enough that PIRLS opens in a sane weight regime
+        // from the verbatim β start.
+        (
+            "perturbed",
+            StartValues {
+                beta: cold.beta.iter().map(|b| 0.5 * b).collect(),
+                theta: vec![3.0],
+                dispersion: None,
+            },
+        ),
+    ];
+    for (label, start) in &starts {
+        let warm = fit_warm(&x, &y, n, p, &model, &ids, Some(start), &opts);
+        assert!(
+            warm.converged(),
+            "{label}: warm must not degrade convergence"
+        );
+        for j in 0..p {
+            let rel = (warm.beta[j] - cold.beta[j]).abs() / cold.beta[j].abs();
+            assert!(
+                rel < 1e-3,
+                "{label}: β[{j}] warm {} vs cold {} (rel {rel})",
+                warm.beta[j],
+                cold.beta[j]
+            );
+            let rel = (warm.se[j] - cold.se[j]).abs() / cold.se[j];
+            assert!(
+                rel < 1e-3,
+                "{label}: se[{j}] warm {} vs cold {} (rel {rel})",
+                warm.se[j],
+                cold.se[j]
+            );
+        }
+        let (w, c) = (warm.tau2[0].sqrt(), cold.tau2[0].sqrt());
+        let rel = (w - c).abs() / c;
+        assert!(
+            rel < 1e-3,
+            "{label}: herd SD warm {w} vs cold {c} (rel {rel})"
+        );
+    }
+}
+
+/// Per-component cold start on the cbpp binomial GLMM: an EMPTY `beta` or
+/// `theta` cold-starts that component alone. The ports need this — lme4's
+/// `start = list(theta = …)` supplies θ and nothing else, and neither the R nor
+/// the Python wrapper can synthesize the missing β (the cold seed is a no-RE GLM
+/// fit computed inside the kernel).
+///
+/// Both-empty is the strict arm: it must be BIT-identical to `fit_cold`, since
+/// it takes every cold branch. The one-sided arms only have to land on the cold
+/// optimum, like the warm arms above.
+#[test]
+fn fit_warm_glmm_partial_start_cold_starts_the_missing_component() {
+    let (x, y, cluster_ids, n) = cbpp_design();
+    let p = 4;
+    let model = cbpp_model();
+    let ids = GroupIds {
+        primary: cluster_ids,
+        extra: vec![],
+    };
+    let opts = FitOptions {
+        target_indices: vec![0, 1, 2, 3],
+        ..FitOptions::default()
+    };
+    let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    assert!(cold.converged(), "cold cbpp GLMM must converge");
+
+    let both_empty = StartValues {
+        beta: vec![],
+        theta: vec![],
+        dispersion: None,
+    };
+    let empty = fit_warm(&x, &y, n, p, &model, &ids, Some(&both_empty), &opts);
+    // Bitwise (not PartialEq): non-target SE slots are NaN and NaN != NaN.
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    assert_eq!(bits(&cold.beta), bits(&empty.beta));
+    assert_eq!(bits(&cold.se), bits(&empty.se));
+    assert_eq!(bits(&cold.tau2), bits(&empty.tau2));
+
+    let starts = [
+        // θ only (lme4's `start = list(theta = …)`), θ̂ ≈ 0.64 perturbed to 3.
+        (
+            "theta-only",
+            StartValues {
+                beta: vec![],
+                theta: vec![3.0],
+                dispersion: None,
+            },
+        ),
+        // β only: halved β̂, θ falls back to the THETA0 blind start.
+        (
+            "beta-only",
+            StartValues {
+                beta: cold.beta.iter().map(|b| 0.5 * b).collect(),
+                theta: vec![],
+                dispersion: None,
+            },
+        ),
+    ];
+    for (label, start) in &starts {
+        let warm = fit_warm(&x, &y, n, p, &model, &ids, Some(start), &opts);
+        assert!(warm.converged(), "{label}: must converge");
+        for j in 0..p {
+            let rel = (warm.beta[j] - cold.beta[j]).abs() / cold.beta[j].abs();
+            assert!(
+                rel < 1e-3,
+                "{label}: β[{j}] warm {} vs cold {} (rel {rel})",
+                warm.beta[j],
+                cold.beta[j]
+            );
+        }
+        let (w, c) = (warm.tau2[0].sqrt(), cold.tau2[0].sqrt());
+        let rel = (w - c).abs() / c;
+        assert!(
+            rel < 1e-3,
+            "{label}: herd SD warm {w} vs cold {c} (rel {rel})"
+        );
+    }
+}
+
+/// Committed cbpp design, expanded to `size` Bernoulli 0/1 rows per record:
+/// `(x [n·4 row-major], y, herd cluster_ids, n)`. Shared by the cbpp oracle
+/// test, `fit_glmm_cbpp_hessian_rx_agree_on_fitted`, and (`pub(crate)`)
+/// `core_tests::counters_show_the_outer_search_stage_split`.
+pub(crate) fn cbpp_design() -> (Vec<f64>, Vec<f64>, Vec<u32>, usize) {
+    let csv = include_str!("../../validation/data/empirical/cbpp.csv");
+    let mut x = Vec::<f64>::new();
+    let mut y = Vec::<f64>::new();
+    let mut cluster_ids = Vec::<u32>::new();
+    for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+        let f: Vec<&str> = line.split(',').map(|s| s.trim_matches('"')).collect();
+        let herd: u32 = f[0].parse::<u32>().unwrap() - 1; // herds 1..15 → ids 0..14
+        let incidence: u32 = f[1].parse().unwrap();
+        let size: u32 = f[2].parse().unwrap();
+        let period: u32 = f[3].parse().unwrap();
+        let row = [
+            1.0,
+            f64::from(u32::from(period == 2)),
+            f64::from(u32::from(period == 3)),
+            f64::from(u32::from(period == 4)),
+        ];
+        // Expand to `size` Bernoulli trials: `incidence` ones, rest zeros.
+        for k in 0..size {
+            x.extend_from_slice(&row);
+            y.push(if k < incidence { 1.0 } else { 0.0 });
+            cluster_ids.push(herd);
+        }
+    }
+    let n = y.len();
+    (x, y, cluster_ids, n)
+}
+
+/// Structure-only cbpp model: `Binomial{Logit}` + a single intercept herd
+/// grouping (15 clusters; explicit ids place each row). Method knobs live in
+/// `FitOptions` now, not here. `pub(crate)`: also used by
+/// `core_tests::counters_show_the_outer_search_stage_split`.
+pub(crate) fn cbpp_model() -> ModelSpec {
+    ModelSpec {
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 15 },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    }
+}
+
+// Frozen lme4 1.1-38 cbpp reference (validation/goldens/cbpp_agq_k1.json, which
+// records tolPwrss = 1e-13). ONE definition, shared by the expanded and
+// aggregated gates below: they assert the same fit through two entry points, and
+// keeping two copies is exactly how both drifted onto lme4's DEFAULT-tolPwrss
+// (1e-7) numbers while still citing this file — SE read 0.231213976143225
+// against the file's 0.232473254781808. That gap is lme4's lagged-ldL2 artifact
+// (glmer builds log|A| from working weights one PIRLS iteration behind the mode
+// — see src/glmm/se.rs), and carrying it forced a 3e-2 SE band that hid a real
+// ~1.3% disagreement. Corrected 2026-07-21; glmm now agrees to 6.0e-6.
+const CBPP_REF_BETA: [f64; 4] = [
+    -1.39853204368263,
+    -0.992315880328946,
+    -1.12866414695346,
+    -1.58031559790095,
+];
+const CBPP_REF_SE: [f64; 4] = [
+    0.232473254781808,
+    0.306641326429934,
+    0.326637242566145,
+    0.427437244644503,
+];
+/// √τ̂²(herd intercept).
+const CBPP_REF_HERD_SD: f64 = 0.642269888687578;
+const CBPP_REF_LOGLIK: f64 = -92.0262818745091;
+
+// Frozen lme4 1.1.38 cbpp AGQ references at nAGQ = 7 and 11, copied from
+// validation/goldens/cbpp_agq_k{7,11}.json (`.estimates.beta` and the herd
+// `stddev`; both record tolPwrss = 1e-13). nAGQ = 1 is `CBPP_REF_*` above.
+// Shared by the expanded and aggregated AGQ gates.
+const CBPP_AGQ_REFS: [(u8, [f64; 4], f64); 2] = [
+    (
+        7,
+        [
+            -1.3992297549519,
+            -0.991396124455949,
+            -1.12783289187442,
+            -1.57944390789621,
+        ],
+        0.647517818318279,
+    ),
+    (
+        11,
+        [
+            -1.39922550901519,
+            -0.991390064884807,
+            -1.12783410600355,
+            -1.57944319299099,
+        ],
+        0.647513140533153,
+    ),
+];
+
+/// cbpp binomial GLMM through the stable `fit_cold` surface with explicit
+/// `GroupIds` (single grouping), gated against the frozen R `lme4::glmer` oracle
+/// (`validation/goldens/cbpp_agq_k1.json`). cbpp is
+/// `cbind(incidence, size−incidence) ~ period + (1 | herd)`; the kernel is
+/// Bernoulli-logit, so each `(incidence, size)` row is expanded to `size` 0/1
+/// rows sharing its design row and herd — value-identical MLE to the aggregated
+/// binomial fit. Herds are unbalanced, so the positional `Sizing` layout cannot
+/// express them: this is the data-shaped-ids path's reason to exist.
+/// SE is compared to **lme4 only** (its Hessian denom keeps the θ–β coupling;
+/// MixedModels.jl drops it ~3%). The oracle is sacred: on
+/// disagreement glmm is presumed wrong.
+#[test]
+fn fit_glmm_cbpp_matches_lme4() {
+    let (x, y, cluster_ids, n) = cbpp_design();
+    let p = 4; // [intercept, period2, period3, period4]
+    let model = cbpp_model();
+    let f = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &GroupIds {
+            primary: cluster_ids.clone(),
+            extra: vec![],
+        },
+        &FitOptions {
+            target_indices: vec![0, 1, 2, 3],
+            ..FitOptions::default()
+        },
+    );
+
+    assert!(f.converged(), "cbpp GLMM must converge");
+    assert!(
+        f.diagnostics.notes.is_empty(),
+        "a well-behaved fit carries no PirlsExhausted note, got {:?}",
+        f.diagnostics.notes
+    );
+    // Bands are validation/grid/tol.R's cross-engine numbers (beta_rel, se_hessian_rel,
+    // stddev_rel = 1e-3) — change together with that file. This is a glmm↔lme4
+    // claim, so grid/tol.R's calibration is the one that applies. Measured agreement
+    // against the artifact-free reference is far inside them: SE worst 6.0e-6.
+    // A looser SE band has no reason to exist: the reference constants above
+    // are the citation-corrected ones, not the default-tolPwrss ones. The
+    // oracle is sacred — these bound glmm to lme4, never the reverse.
+    for j in 0..p {
+        let b_rel = (f.beta[j] - CBPP_REF_BETA[j]).abs() / CBPP_REF_BETA[j].abs();
+        assert!(
+            b_rel < 1e-3,
+            "β[{j}] = {} vs lme4 {} (rel {b_rel})",
+            f.beta[j],
+            CBPP_REF_BETA[j]
+        );
+        let se_rel = (f.se[j] - CBPP_REF_SE[j]).abs() / CBPP_REF_SE[j];
+        assert!(
+            se_rel < 1e-3,
+            "se[{j}] = {} vs lme4 {} (rel {se_rel})",
+            f.se[j],
+            CBPP_REF_SE[j]
+        );
+    }
+    // Herd random-intercept SD = √τ̂²; tau2[0] = θ̂² = τ̂² (σ² = 1 binomial).
+    let herd_sd = f.tau2[0].sqrt();
+    let sd_rel = (herd_sd - CBPP_REF_HERD_SD).abs() / CBPP_REF_HERD_SD;
+    assert!(
+        sd_rel < 1e-3,
+        "herd SD = {herd_sd} vs lme4 {CBPP_REF_HERD_SD} (rel {sd_rel})"
+    );
+}
+
+/// The presence half of the `PirlsExhausted` contract `fit_glmm_cbpp_matches_lme4`
+/// above asserts the absence of: a real solve one of whose trial points runs the
+/// full `PIRLS_MAX_ITERS` cap, so the note's payload is produced by the fit path
+/// rather than by a hand-built `FitDiagnostics` carrier.
+///
+/// The design itself is benign — a crossed negative-binomial GLMM that
+/// cold-fits with no note at all — and the pathology is one trial point the
+/// warm start's search passes through. From θ₀ = 2000 (seed 81, crossed), the
+/// PIRLS solves at a few trial points of the search run out the iteration cap
+/// (with the start guard in place, the guard's own single-point check at θ₀
+/// still finds the warm start worth entering the search from, so these trial
+/// points are ones the search finds on its own, not the entry point itself).
+/// Those evals score `+INFINITY` and are rejected, and the search goes on to
+/// the cold optimum. So `final_eval` stays false and the reported estimates
+/// are the cold ones — this is exactly the "a note with `final_eval == false`
+/// costs nothing observable" case.
+///
+/// The second arm re-fits the same warm start under the RX/Schur SE denominator
+/// instead of the FD joint Hessian. Both arms share one fit path and differ only
+/// in the post-fit SE pass, so an `evals` that moved between them would mean the
+/// SE pass's own tight-tolerance PIRLS solves had leaked into the fit-path
+/// counter that the note is defined over.
+#[test]
+fn pirls_exhausted_note_counts_fit_path_evals_only() {
+    let (x, y, model, ids) = nb_log_four_cluster_design(81, 36, 3);
+    let (n, p) = (y.len(), 2usize);
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        ..FitOptions::default()
+    };
+
+    let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    assert!(
+        cold.converged(),
+        "the cold fit of this design must converge"
+    );
+    assert!(
+        cold.diagnostics.notes.is_empty(),
+        "cold-started, no trial point reaches the cap, got {:?}",
+        cold.diagnostics.notes
+    );
+
+    let start = StartValues {
+        beta: vec![],
+        theta: vec![2000.0, 1.0],
+        dispersion: None,
+    };
+    let warm = fit_warm(&x, &y, n, p, &model, &ids, Some(&start), &opts);
+    assert!(
+        warm.converged(),
+        "the search must still reach the optimum past the degenerate probe"
+    );
+    let [note] = &warm.diagnostics.notes[..] else {
+        panic!(
+            "expected exactly one note, got {:?}",
+            warm.diagnostics.notes
+        );
+    };
+    let Note::PirlsExhausted { evals, final_eval } = note else {
+        panic!("expected PirlsExhausted, got {note:?}");
+    };
+    // Not pinned to the observed 1: how many of BOBYQA's trial points land
+    // where the cap runs out moves with the optimizer. What is pinned is that
+    // fit-path evals are counted at all, and that the solve behind the reported
+    // estimates is not one of them.
+    assert!(*evals > 0, "the exhausted trial evals must be counted");
+    assert!(
+        !*final_eval,
+        "the re-evaluation at γ̂ converges, so the reported estimates are untruncated"
+    );
+    for j in 0..p {
+        let rel = (warm.beta[j] - cold.beta[j]).abs() / cold.beta[j].abs();
+        assert!(
+            rel < 1e-4,
+            "β[{j}] warm {} vs cold {} (rel {rel})",
+            warm.beta[j],
+            cold.beta[j]
+        );
+    }
+    let dev_rel = (warm.deviance - cold.deviance).abs() / cold.deviance.abs();
+    assert!(
+        dev_rel < 1e-9,
+        "deviance warm {} vs cold {} (rel {dev_rel})",
+        warm.deviance,
+        cold.deviance
+    );
+
+    let rx = fit_warm(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &ids,
+        Some(&start),
+        &FitOptions {
+            wald_se: WaldSe::Rx,
+            ..opts.clone()
+        },
+    );
+    let Some(Note::PirlsExhausted {
+        evals: rx_evals, ..
+    }) = rx.diagnostics.notes.first()
+    else {
+        panic!(
+            "expected PirlsExhausted on the Rx arm, got {:?}",
+            rx.diagnostics.notes
+        );
+    };
+    assert_eq!(
+        rx_evals, evals,
+        "the FD-Hessian SE pass must not add to the fit-path eval count"
+    );
+}
+
+/// A small negative-binomial (log link) GLMM design: `n` rows over 4 primary
+/// clusters whose log-mean offsets span ±3, optionally crossed with
+/// `n_crossed` levels of a second grouping (offsets ±0.5), an intercept and one
+/// covariate; y is exp(η) times an Exp(1) draw, rounded to a count, so a cold
+/// fit is ordinary. Row `i` sits in primary cluster `i % 4` and crossed level
+/// `(i / 4) % n_crossed`. Returns `(x, y, model, ids)`, `x` row-major `n × 2`.
+fn nb_log_four_cluster_design(
+    seed: u64,
+    n: usize,
+    n_crossed: usize,
+) -> (Vec<f64>, Vec<f64>, ModelSpec, GroupIds) {
+    let (n_clusters, p) = (4usize, 2usize);
+    let mut st = seed;
+    let u: Vec<f64> = (0..n_clusters).map(|_| 3.0 * lcg(&mut st)).collect();
+    let v: Vec<f64> = (0..n_crossed).map(|_| 0.5 * lcg(&mut st)).collect();
+    let mut x = vec![0.0f64; n * p];
+    let mut y = vec![0.0f64; n];
+    for i in 0..n {
+        let x1 = lcg(&mut st);
+        x[i * p] = 1.0;
+        x[i * p + 1] = x1;
+        let mut eta = 0.5 + 0.8 * x1 + u[i % n_clusters];
+        if n_crossed > 0 {
+            eta += v[(i / n_clusters) % n_crossed];
+        }
+        y[i] = (eta.exp() * inf_plateau_exp1(&mut st)).round();
+    }
+    let extra_groupings = if n_crossed > 0 {
+        vec![Grouping {
+            relation: GroupingRelation::Crossed {
+                n_clusters: n_crossed as u32,
+            },
+            slopes: vec![],
+        }]
+    } else {
+        vec![]
+    };
+    let model = ModelSpec {
+        family: Family::NegativeBinomial {
+            link: crate::NegBinomialLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters as u32,
+            },
+            slopes: vec![],
+            extra_groupings,
+        }),
+    };
+    let extra = if n_crossed > 0 {
+        vec![(0..n)
+            .map(|i| ((i / n_clusters) % n_crossed) as u32)
+            .collect()]
+    } else {
+        vec![]
+    };
+    let ids = GroupIds {
+        primary: (0..n).map(|i| (i % n_clusters) as u32).collect(),
+        extra,
+    };
+    (x, y, model, ids)
+}
+
+/// The exact-profile β border keeps its digits where the fixed effects lie in
+/// the span of `ZΛ`: Poisson `y ~ z + x + (1 | g)` with a cluster-level `z`
+/// and counts near `e³³`, where `X'WX` and `B'T` agree to all but their last
+/// `ε·Σwᵢ` (and `X'ρ` and `B'δu₀` likewise). Formed by those subtractions,
+/// `S_β` came out as rounding noise (non-positive definite), every
+/// exact-profile solve failed and the fit ended not converged. The same counts
+/// scaled down by `e¹³` give the same fit up to the intercept, so the `e²⁰`
+/// fit is the reference.
+#[test]
+fn exact_profile_fits_a_cluster_level_covariate_at_huge_counts() {
+    let (n, n_g, p) = (120usize, 12usize, 3usize);
+    let fit_at = |c: f64| {
+        let mut st = 9u64;
+        let b: Vec<f64> = (0..n_g).map(|_| lcg(&mut st)).collect();
+        let z: Vec<f64> = (0..n_g).map(|_| lcg(&mut st)).collect();
+        let mut x = vec![0.0f64; n * p];
+        let mut y = vec![0.0f64; n];
+        for i in 0..n {
+            let k = i % n_g;
+            x[i * p] = 1.0;
+            x[i * p + 1] = z[k];
+            x[i * p + 2] = lcg(&mut st);
+            y[i] = (c + 0.5 * z[k] + b[k]).exp().round();
+        }
+        let model = ModelSpec {
+            family: Family::Poisson {
+                link: PoissonLink::Log,
+            },
+            re: Some(ReStructure {
+                sizing: Sizing::FixedClusters {
+                    n_clusters: n_g as u32,
+                },
+                slopes: vec![],
+                extra_groupings: vec![],
+            }),
+        };
+        let ids = GroupIds {
+            primary: (0..n).map(|i| (i % n_g) as u32).collect(),
+            extra: vec![],
+        };
+        fit_cold(&x, &y, n, p, &model, &ids, &FitOptions::default())
+    };
+    let low = fit_at(20.0);
+    let high = fit_at(33.0);
+    assert!(low.converged() && low.diagnostics.notes.is_empty());
+    assert!(
+        high.converged() && high.diagnostics.notes.is_empty(),
+        "converged {}, notes {:?}",
+        high.converged(),
+        high.diagnostics.notes
+    );
+    let shift = [13.0, 0.0, 0.0];
+    for (j, s) in shift.iter().enumerate() {
+        let d = (high.beta[j] - low.beta[j] - s).abs();
+        assert!(
+            d < 1e-7,
+            "β[{j}]: e³³ {} vs e²⁰ {}",
+            high.beta[j],
+            low.beta[j]
+        );
+    }
+    let (sd_low, sd_high) = (low.varcorr[0][0].sqrt(), high.varcorr[0][0].sqrt());
+    assert!(
+        (sd_high / sd_low - 1.0).abs() < 1e-7,
+        "SD e³³ {sd_high} vs e²⁰ {sd_low}"
+    );
+}
+
+/// `Note::PrecisionLimited` from each source of its rounding estimate, on
+/// Poisson counts near `e³³` with a crossed effect `h` in the data.
+/// `y ~ z + (1 | g)` leaves `h` out, so its deviance is about 1e15 and σ̂
+/// lands 0.04 off the `e²⁰` fit's. `y ~ z + (1 | g) + (1 | h)` fits `h`, so its deviance stays near 560, but `log|A|` rounds at the
+/// size of the `h` columns' `θ²·Σwᵢ`. At `e²⁰` neither fit carries the note, and
+/// the note leaves `converged` alone.
+#[test]
+fn precision_limited_note_flags_counts_past_f64_resolution() {
+    let (n, n_g, n_h, p) = (120usize, 12usize, 5usize, 2usize);
+    let fit_at = |c: f64, crossed: bool| {
+        let mut st = 9u64;
+        let b: Vec<f64> = (0..n_g).map(|_| lcg(&mut st)).collect();
+        let z: Vec<f64> = (0..n_g).map(|_| lcg(&mut st)).collect();
+        let d: Vec<f64> = (0..n_h).map(|_| 0.3 * lcg(&mut st)).collect();
+        let mut x = vec![0.0f64; n * p];
+        let mut y = vec![0.0f64; n];
+        let mut h = vec![0u32; n];
+        for i in 0..n {
+            let k = i % n_g;
+            h[i] = ((i / n_g) % n_h) as u32;
+            x[i * p] = 1.0;
+            x[i * p + 1] = z[k];
+            y[i] = (c + 0.5 * z[k] + b[k] + d[h[i] as usize]).exp().round();
+        }
+        let model = ModelSpec {
+            family: Family::Poisson {
+                link: PoissonLink::Log,
+            },
+            re: Some(ReStructure {
+                sizing: Sizing::FixedClusters {
+                    n_clusters: n_g as u32,
+                },
+                slopes: vec![],
+                extra_groupings: if crossed {
+                    vec![Grouping {
+                        relation: GroupingRelation::Crossed {
+                            n_clusters: n_h as u32,
+                        },
+                        slopes: vec![],
+                    }]
+                } else {
+                    vec![]
+                },
+            }),
+        };
+        let ids = GroupIds {
+            primary: (0..n).map(|i| (i % n_g) as u32).collect(),
+            extra: if crossed { vec![h] } else { vec![] },
+        };
+        fit_cold(&x, &y, n, p, &model, &ids, &FitOptions::default())
+    };
+    let flagged = |f: &Fit| {
+        f.diagnostics
+            .notes
+            .iter()
+            .any(|note| matches!(note, Note::PrecisionLimited))
+    };
+    for crossed in [false, true] {
+        let low = fit_at(20.0, crossed);
+        let high = fit_at(33.0, crossed);
+        assert!(
+            low.converged() && !flagged(&low),
+            "crossed {crossed}, e²⁰: converged {}, notes {:?}",
+            low.converged(),
+            low.diagnostics.notes
+        );
+        assert!(
+            high.converged() && flagged(&high),
+            "crossed {crossed}, e³³: converged {}, notes {:?}",
+            high.converged(),
+            high.diagnostics.notes
+        );
+    }
+}
+
+/// Warm-starts `design` from each primary θ₀ in `theta0s` (every other θ
+/// component at 1) and requires the cold optimum back: converged, the same
+/// deviance to 1e-9 relative, β to 1e-4 relative — the warm/cold bands of
+/// `pirls_exhausted_note_counts_fit_path_evals_only`.
+fn assert_warm_starts_reach_cold_optimum(
+    (x, y, model, ids): (Vec<f64>, Vec<f64>, ModelSpec, GroupIds),
+    theta0s: &[f64],
+    label: &str,
+) {
+    let (n, p) = (y.len(), 2usize);
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        ..FitOptions::default()
+    };
+    let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    assert!(cold.converged(), "{label}: the cold fit must converge");
+    let n_theta = cold.tau2.len();
+    for &theta0 in theta0s {
+        let mut theta = vec![1.0; n_theta];
+        theta[0] = theta0;
+        let start = StartValues {
+            beta: vec![],
+            theta,
+            dispersion: None,
+        };
+        let warm = fit_warm(&x, &y, n, p, &model, &ids, Some(&start), &opts);
+        assert!(
+            warm.converged(),
+            "{label}, θ₀ = {theta0}: warm fit did not converge ({:?})",
+            warm.diagnostics
+        );
+        let dev_rel = (warm.deviance - cold.deviance).abs() / cold.deviance.abs();
+        assert!(
+            dev_rel < 1e-9,
+            "{label}, θ₀ = {theta0}: deviance warm {} vs cold {} (rel {dev_rel})",
+            warm.deviance,
+            cold.deviance
+        );
+        for j in 0..p {
+            let rel = (warm.beta[j] - cold.beta[j]).abs() / cold.beta[j].abs();
+            assert!(
+                rel < 1e-4,
+                "{label}, θ₀ = {theta0}: β[{j}] warm {} vs cold {} (rel {rel})",
+                warm.beta[j],
+                cold.beta[j]
+            );
+        }
+    }
+}
+
+/// NB-log warm starts far from the mode reach the cold optimum on the exact
+/// β-profile route (`pirls_solve_blocked`). With 4 clusters and θ₀ ≥ 10–20 the
+/// border's S_β is tiny in the intercept direction, and the joint (u, β) step
+/// used to overshoot and have its rises let through by the merit's
+/// first-order slack, so every opening trial point exhausted PIRLS and the fit
+/// ended `NoOptimum`. Seed 3 failed from θ₀ = 20, seed 7 from θ₀ = 50, and
+/// seed 15 failed from θ₀ = 10 and converged 0.045 deviance above the cold
+/// optimum from θ₀ = 5.
+#[test]
+fn nb_log_warm_start_far_from_mode_reaches_cold_optimum() {
+    for seed in [3u64, 7, 15] {
+        assert_warm_starts_reach_cold_optimum(
+            nb_log_four_cluster_design(seed, 24, 0),
+            &[5.0, 10.0, 20.0, 50.0],
+            &format!("seed {seed}"),
+        );
+    }
+}
+
+/// The structured crossed/nested twin (`pirls_solve_blocked_extras`) of
+/// `nb_log_warm_start_far_from_mode_reaches_cold_optimum`: the same 4 primary
+/// clusters crossed with a 3-level factor. Seeds 3 and 9 failed from θ₀ = 20.
+#[test]
+fn nb_log_warm_start_far_from_mode_reaches_cold_optimum_crossed() {
+    for seed in [3u64, 9] {
+        assert_warm_starts_reach_cold_optimum(
+            nb_log_four_cluster_design(seed, 36, 3),
+            &[5.0, 10.0, 20.0, 50.0],
+            &format!("crossed seed {seed}"),
+        );
+    }
+}
+
+/// NB-log warm starts from θ₀ = 200 reach the cold optimum on both exact
+/// β-profile routes. Each of these designs has an all-zero cluster, so at a
+/// large θ the Laplace profile is nearly flat in the intercept, and there
+/// log|A|'s curvature in β is most of the profile's: half the profile's
+/// curvature in the intercept is 22 times `S_β` on seed 19 at θ ≈ 198. A
+/// border step on `S_β` alone overshot on every
+/// iteration, a few halvings brought the trial back inside the accept band on
+/// alternating sides of the mode, and the cycle ran out every iteration cap.
+/// With the curvature in the step (`pirls::logdet_beta_curvature`) the solves
+/// converge.
+#[test]
+fn nb_log_warm_start_from_theta_200_reaches_cold_optimum() {
+    for seed in [17u64, 19, 21] {
+        assert_warm_starts_reach_cold_optimum(
+            nb_log_four_cluster_design(seed, 24, 0),
+            &[200.0],
+            &format!("seed {seed}"),
+        );
+    }
+    for seed in [9u64, 10, 17, 19, 23] {
+        assert_warm_starts_reach_cold_optimum(
+            nb_log_four_cluster_design(seed, 36, 3),
+            &[200.0],
+            &format!("crossed seed {seed}"),
+        );
+    }
+}
+
+/// Far warm starts that need the exact border's trust region
+/// (`pirls::BorderTrust`): the 4-cluster design as Poisson-log (blocked seed
+/// 3, crossed seed 10) and as binary cloglog (blocked seed 27), from
+/// θ₀ = 1000. Measured with the curvature step and a border-step length that
+/// could only shrink: careful mode started in every opening PIRLS solve of the
+/// search and every one failed, so the fit reported no convergence. With a
+/// radius that grows back when a trial agrees with its model, the solves
+/// converge and each start reaches the cold optimum.
+#[test]
+fn far_warm_starts_reach_cold_optimum_with_the_border_trust_region() {
+    let binary = |(x, y, mut model, ids): (Vec<f64>, Vec<f64>, ModelSpec, GroupIds), link| {
+        model.family = Family::Binomial { link };
+        let y = y.iter().map(|&v| if v > 1.0 { 1.0 } else { 0.0 }).collect();
+        (x, y, model, ids)
+    };
+    let poisson = |(x, y, mut model, ids): (Vec<f64>, Vec<f64>, ModelSpec, GroupIds)| {
+        model.family = Family::Poisson {
+            link: PoissonLink::Log,
+        };
+        (x, y, model, ids)
+    };
+    assert_warm_starts_reach_cold_optimum(
+        poisson(nb_log_four_cluster_design(3, 24, 0)),
+        &[1000.0],
+        "Poisson seed 3",
+    );
+    assert_warm_starts_reach_cold_optimum(
+        poisson(nb_log_four_cluster_design(10, 36, 3)),
+        &[1000.0],
+        "Poisson crossed seed 10",
+    );
+    assert_warm_starts_reach_cold_optimum(
+        binary(nb_log_four_cluster_design(27, 24, 0), BinomialLink::Cloglog),
+        &[1000.0],
+        "cloglog seed 27",
+    );
+}
+
+/// A far binary-link warm start where every PIRLS evaluation fails: logit,
+/// the 4-cluster design, seed 2, from θ₀ = 1000. Even with the border trust
+/// region (the test above), this class of start still fails outright — every
+/// evaluation is `+INFINITY`, so there is no trial point for a trust region to
+/// judge. The start guard recovers it a different way: it compares the outer
+/// objective at this θ₀ against the blind cold start before the search ever
+/// runs, and begins from the cold point instead, since the far θ₀'s own
+/// objective cannot even be evaluated.
+#[test]
+fn far_warm_start_recovers_via_the_cold_guard() {
+    let (x, mut y, mut model, ids) = nb_log_four_cluster_design(2, 24, 0);
+    model.family = Family::Binomial {
+        link: BinomialLink::Logit,
+    };
+    for v in y.iter_mut() {
+        *v = if *v > 1.0 { 1.0 } else { 0.0 };
+    }
+    assert_warm_starts_reach_cold_optimum((x, y, model, ids), &[1000.0], "logit seed 2");
+}
+
+/// One design of the far-warm-start scan: `nb_log_four_cluster_design` with
+/// its 4 primary clusters alone (24 rows) or crossed with a 3-level factor
+/// (36 rows), as NB-log, Poisson-log, or binary logit, probit or cloglog
+/// (y > 1 is a success).
+fn far_start_scan_design(
+    family: &str,
+    seed: u64,
+    crossed: bool,
+) -> (Vec<f64>, Vec<f64>, ModelSpec, GroupIds) {
+    let (n, n_crossed) = if crossed { (36, 3) } else { (24, 0) };
+    let (x, mut y, mut model, ids) = nb_log_four_cluster_design(seed, n, n_crossed);
+    let link = match family {
+        "nb" => return (x, y, model, ids),
+        "poisson" => {
+            model.family = Family::Poisson {
+                link: PoissonLink::Log,
+            };
+            return (x, y, model, ids);
+        }
+        "logit" => BinomialLink::Logit,
+        "probit" => BinomialLink::Probit,
+        "cloglog" => BinomialLink::Cloglog,
+        other => panic!("unknown scan family {other}"),
+    };
+    model.family = Family::Binomial { link };
+    for v in y.iter_mut() {
+        *v = if *v > 1.0 { 1.0 } else { 0.0 };
+    }
+    (x, y, model, ids)
+}
+
+/// Far warm starts of the scan that converge above their cold fit, accepted,
+/// each with the reason: `(family, crossed, seed, θ₀, reason)`. At θ of a few
+/// tens these small binary designs have several β branches of the exact
+/// profile, and a search follows the branch its first solve lands on, so a
+/// far start can end at a converged local optimum of the Laplace deviance
+/// above the cold one. A listed fit that comes out at the cold optimum is
+/// reported, not failed: which branch a far start lands on can move with
+/// round-off.
+const FAR_START_SCAN_ABOVE_COLD: &[(&str, bool, u64, f64, &str)] = &[
+    ("cloglog", false, 9, 20.0, "another β branch"),
+    ("cloglog", false, 32, 20.0, "another β branch"),
+    ("cloglog", false, 38, 20.0, "another β branch"),
+    ("cloglog", false, 38, 100.0, "another β branch"),
+    ("cloglog", true, 27, 100.0, "another β branch"),
+    ("probit", false, 9, 100.0, "another β branch"),
+    ("probit", false, 37, 1000.0, "another β branch"),
+    ("probit", true, 14, 20.0, "another β branch"),
+    // The start guard hands its winning solve, with the curvature memory
+    // that solve left, to the search. From θ₀ = 20 these two searches then
+    // follow the guard's β branch to a converged local optimum above the cold
+    // one. A first evaluation that re-solves θ₀ from the blind solve's memory
+    // lands on another branch, which leads to the cold optimum: lower than the
+    // guard's branch on seed 7, higher on seed 23. Over 2800 further far
+    // starts of the scan's designs (θ₀ 5 to 500, measured on aarch64) the
+    // hand-over ends 3 fits worse than such a re-solve and 8 better.
+    ("cloglog", true, 7, 20.0, "follows the guard's β branch"),
+    ("cloglog", true, 23, 20.0, "follows the guard's β branch"),
+];
+
+/// Designs of the scan with no interior optimum, judged on reaching the
+/// boundary rather than on where they stop: `(family, crossed, seed, reason)`.
+/// On these separation-type surfaces the likelihood keeps rising as τ and |β|
+/// grow, and a search stops where the surface has become flat enough along
+/// its own path: each design has two stopping points, a fit reaches one or
+/// the other depending on its start, and round-off moves it between them
+/// (on the design as given, the probit cold fit stops at 9.084 on x86 and at
+/// 8.034 on aarch64).
+/// Each fit of these designs, cold and warm, passes when it converges, its
+/// deviance is finite and τ̂² is at least `FAR_START_RIDGE_TAU2`.
+const FAR_START_ILL_POSED: &[(&str, bool, u64, &str)] = &[
+    (
+        "logit",
+        false,
+        28,
+        "stops at 7.692 (x86_64, aarch64) or 8.657 (aarch64)",
+    ),
+    ("probit", false, 28, "stops at 8.034 or 9.084"),
+    ("cloglog", false, 28, "stops at 6.186 or 8.363"),
+];
+
+/// τ̂² floor of a fit on a `FAR_START_ILL_POSED` design: the search went out
+/// along the descent toward the boundary instead of stopping near the blind
+/// start (τ² = 1). Every stopping point recorded on those designs lies at
+/// τ̂² 164 to 11343.
+const FAR_START_RIDGE_TAU2: f64 = 100.0;
+
+/// The far-warm-start scan: 5 families × {blocked, crossed} × seeds 1 to 40,
+/// one cold fit and warm fits from θ₀ ∈ {20, 100, 1000} (the primary θ; any
+/// other θ at 1), 1200 warm fits. Every cold fit converges, and every warm fit
+/// converges at or below its cold fit's deviance (1e-9 relative), except the
+/// fits of `FAR_START_SCAN_ABOVE_COLD` and the designs of
+/// `FAR_START_ILL_POSED`. A warm fit below its cold fit passes: it found a
+/// better optimum of the same objective. Run it after any change to the start
+/// guard, the exact-profile solve or the stage-1 search:
+/// `cargo test --release --lib far_warm_start_ -- --ignored --nocapture`.
+#[test]
+#[ignore = "1200 far warm starts; run by hand after a change to the GLMM search"]
+fn far_warm_start_scan() {
+    let p = 2usize;
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        ..FitOptions::default()
+    };
+    let on_ridge = |fit: &Fit| {
+        fit.converged() && fit.deviance.is_finite() && fit.tau2[0] >= FAR_START_RIDGE_TAU2
+    };
+    let (mut ok, mut better, mut ridge, mut listed_above, mut listed_at_cold) = (0, 0, 0, 0, 0);
+    let mut failures = Vec::new();
+    for family in ["nb", "poisson", "logit", "probit", "cloglog"] {
+        for crossed in [false, true] {
+            for seed in 1u64..=40 {
+                let (x, y, model, ids) = far_start_scan_design(family, seed, crossed);
+                let n = y.len();
+                let label = format!("{family} crossed={crossed} seed {seed}");
+                let ill_posed = FAR_START_ILL_POSED
+                    .iter()
+                    .any(|&(f, c, s, _)| (f, c, s) == (family, crossed, seed));
+                let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+                if ill_posed && !on_ridge(&cold) {
+                    failures.push(format!(
+                        "{label} (ill-posed): cold fit off the ridge, converged {} deviance {} τ̂² {:?}",
+                        cold.converged(),
+                        cold.deviance,
+                        cold.tau2
+                    ));
+                } else if !ill_posed && !cold.converged() {
+                    failures.push(format!("{label}: cold fit not converged"));
+                    continue;
+                }
+                for theta0 in [20.0, 100.0, 1000.0] {
+                    let mut theta = vec![1.0; cold.tau2.len()];
+                    theta[0] = theta0;
+                    let start = StartValues {
+                        beta: vec![],
+                        theta,
+                        dispersion: None,
+                    };
+                    let warm = fit_warm(&x, &y, n, p, &model, &ids, Some(&start), &opts);
+                    if ill_posed {
+                        if on_ridge(&warm) {
+                            ridge += 1;
+                        } else {
+                            failures.push(format!(
+                                "{label} (ill-posed), θ₀ = {theta0}: off the ridge, converged {} deviance {} τ̂² {:?}",
+                                warm.converged(),
+                                warm.deviance,
+                                warm.tau2
+                            ));
+                        }
+                        continue;
+                    }
+                    let listed = FAR_START_SCAN_ABOVE_COLD
+                        .iter()
+                        .any(|&(f, c, s, t, _)| (f, c, s, t) == (family, crossed, seed, theta0));
+                    let band = 1e-9 * cold.deviance.abs().max(1.0);
+                    let at_or_below = warm.deviance <= cold.deviance + band;
+                    match (warm.converged(), at_or_below, listed) {
+                        (true, true, false) => {
+                            if warm.deviance < cold.deviance - band {
+                                better += 1;
+                            } else {
+                                ok += 1;
+                            }
+                        }
+                        (true, true, true) => {
+                            listed_at_cold += 1;
+                            eprintln!(
+                                "{label}, θ₀ = {theta0}: listed above cold, now at or below it"
+                            );
+                        }
+                        (true, false, true) => listed_above += 1,
+                        _ => failures.push(format!(
+                            "{label}, θ₀ = {theta0}: converged {} deviance warm {} vs cold {}",
+                            warm.converged(),
+                            warm.deviance,
+                            cold.deviance
+                        )),
+                    }
+                }
+            }
+        }
+    }
+    eprintln!(
+        "far-start scan: {ok} at the cold optimum, {better} below it, {ridge} on an ill-posed ridge, \
+         {listed_above} listed above it, {listed_at_cold} listed but at or below it, {} failures",
+        failures.len()
+    );
+    assert!(
+        failures.is_empty(),
+        "far-start scan:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// NB-log far warm starts over a θ₀ sweep: seeds 1 to 24, blocked and crossed,
+/// θ₀ from 5 to 3000 (528 fits). Every warm fit converges to its cold fit's
+/// deviance (1e-9 relative), with no exception. Run with `far_warm_start_scan`.
+#[test]
+#[ignore = "528 NB far warm starts; run by hand after a change to the GLMM search"]
+fn far_warm_start_nb_sweep() {
+    let p = 2usize;
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        ..FitOptions::default()
+    };
+    let mut failures = Vec::new();
+    for crossed in [false, true] {
+        for seed in 1u64..=24 {
+            let (x, y, model, ids) = far_start_scan_design("nb", seed, crossed);
+            let n = y.len();
+            let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+            if !cold.converged() {
+                failures.push(format!(
+                    "crossed={crossed} seed {seed}: cold fit not converged"
+                ));
+                continue;
+            }
+            for theta0 in [
+                5.0, 10.0, 20.0, 30.0, 50.0, 100.0, 200.0, 300.0, 500.0, 1000.0, 3000.0,
+            ] {
+                let mut theta = vec![1.0; cold.tau2.len()];
+                theta[0] = theta0;
+                let start = StartValues {
+                    beta: vec![],
+                    theta,
+                    dispersion: None,
+                };
+                let warm = fit_warm(&x, &y, n, p, &model, &ids, Some(&start), &opts);
+                let rel = (warm.deviance - cold.deviance).abs() / cold.deviance.abs();
+                if !(warm.converged() && rel < 1e-9) {
+                    failures.push(format!(
+                        "crossed={crossed} seed {seed}, θ₀ = {theta0}: converged {} deviance warm {} vs cold {}",
+                        warm.converged(),
+                        warm.deviance,
+                        cold.deviance
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "NB far-start sweep:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// A warm start the start guard rejects runs the cold fit's search. The guard
+/// solves the blind start the way a cold fit's first evaluation does (û = 0,
+/// β₀, the curvature memory cleared), and the search takes that solve, with
+/// the memory it left, as its own first evaluation. NB-log, the 4-cluster
+/// design, seeds 3 and 15, from θ₀ = 20, 100 and 1000: the guard keeps the
+/// blind start on all six (asserted), and each warm fit is the cold fit, bit
+/// for bit. A search that re-solves the guard's pick from the memory of
+/// whichever guard solve ran last ends the seed-3 fits elsewhere in the PIRLS
+/// exit band. On seed 15 BOBYQA moves the start's `ln θ_NB` onto its upper
+/// bound, so the search's first call misses the guard's point and solves its
+/// own from a cleared memory, as the cold fit's first call does.
+#[test]
+fn warm_start_the_guard_rejects_is_the_cold_fit() {
+    use super::core::{build_workspace, fit_on};
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        ..FitOptions::default()
+    };
+    for seed in [3u64, 15] {
+        let (x, y, model, ids) = far_start_scan_design("nb", seed, false);
+        let (n, p) = (y.len(), 2usize);
+        let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+        for theta0 in [20.0, 100.0, 1000.0] {
+            let start = StartValues {
+                beta: vec![],
+                theta: vec![theta0],
+                dispersion: None,
+            };
+            // `fit_warm`'s own path, on a workspace the test can read after.
+            let (sized, ids_s, perm) = spec_sized_from_ids_pub(&model, &ids);
+            let mut ws = build_workspace(&sized, perm, n, p, &opts);
+            let warm = fit_on(&mut ws, &x, &y, &ids_s, Some(&start), &opts)
+                .into_fit(&x, &y, &ids_s, n, p, &model, &opts);
+            let label = format!("seed {seed}, θ₀ = {theta0}");
+            assert!(
+                !ws.glmm_guard_kept_warm_start(),
+                "{label}: the guard kept the warm start"
+            );
+            assert_eq!(warm.n_eval, cold.n_eval, "{label}: evaluations");
+            assert_eq!(
+                warm.deviance.to_bits(),
+                cold.deviance.to_bits(),
+                "{label}: deviance warm {} vs cold {}",
+                warm.deviance,
+                cold.deviance
+            );
+            for j in 0..p {
+                assert_eq!(
+                    warm.beta[j].to_bits(),
+                    cold.beta[j].to_bits(),
+                    "{label}: β[{j}] warm {} vs cold {}",
+                    warm.beta[j],
+                    cold.beta[j]
+                );
+            }
+        }
+    }
+}
+
+/// A far warm start where `ExactProfile` itself ends not converged (not the
+/// all-`+INFINITY` case the guard test above covers) and the `PqlThenJoint`
+/// fallback reaches the cold optimum instead: binary cloglog, the 4-cluster
+/// design, seed 411, from θ₀ = 3000. The design has an interior optimum
+/// (cold fit: deviance 13.6699, τ̂² 6.06, |β̂| ≤ 2.7), so the assertion does
+/// not depend on where a search stops on a flat surface. Found by scanning
+/// the far-start fixture family (5 families, blocked and crossed, seeds 1 to
+/// 600, θ₀ 300 to 10000) for warm fits that carry `Note::ExactProfileFallback`,
+/// converge, and match an interior cold fit; this one does so on x86_64. A
+/// far start reaches the fallback only along a particular search path, so a
+/// change to the path can take a fixture off it. Another start of the same
+/// scan that reaches it on x86_64: probit blocked seed 376 from θ₀ = 3000.
+#[test]
+fn exact_profile_fallback_reruns_on_pql_then_joint() {
+    let (x, y, model, ids) = far_start_scan_design("cloglog", 411, false);
+    let (n, p) = (y.len(), 2usize);
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        ..FitOptions::default()
+    };
+    let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    assert!(
+        cold.converged(),
+        "the cold fit of this design must converge"
+    );
+    let start = StartValues {
+        beta: vec![],
+        theta: vec![3000.0],
+        dispersion: None,
+    };
+    let warm = fit_warm(&x, &y, n, p, &model, &ids, Some(&start), &opts);
+    assert!(
+        warm.diagnostics
+            .notes
+            .iter()
+            .any(|n| matches!(n, Note::ExactProfileFallback)),
+        "expected an ExactProfileFallback note, got {:?}",
+        warm.diagnostics.notes
+    );
+    assert!(
+        warm.converged(),
+        "cloglog seed 411, θ₀ = 3000: expected the PqlThenJoint fallback to \
+         converge, got {:?}",
+        warm.diagnostics
+    );
+    let dev_rel = (warm.deviance - cold.deviance).abs() / cold.deviance.abs();
+    assert!(
+        dev_rel < 1e-6,
+        "deviance warm {} vs cold {} (rel {dev_rel})",
+        warm.deviance,
+        cold.deviance
+    );
+}
+
+/// A PIRLS trial whose deviance overflows to +∞ inside the link's η bounds is
+/// halved back, not accepted. The overshoot band cannot catch it: its bound
+/// `tol·(1+|dev|)` is +∞ too. Overflow needs huge prior weights: here 1e10 on
+/// a Poisson design, at a β₀ where the first full step from û = 0 lands some
+/// cluster's η between about 687 and 700, where `w·μ` passes `f64::MAX` but the
+/// η clamp (700) does not bind. Each layout gets its own β₀, found by scanning
+/// with the clause removed. The Laplace deviance at that point must equal the
+/// one reached by walking β there in small steps, each PIRLS solve seeded at
+/// the previous mode so no step overshoots: the conditional mode at fixed
+/// (θ, β) is unique, so both paths must find it. Each PIRLS variant carries its
+/// own copy of the clause, so each layout is run: no extra grouping (blocked),
+/// a crossed intercept (structured) and a crossed slope (packed). Weights near
+/// 1e20 are out of reach on the last two: there the `+I` of `A` is lost to
+/// round-off and the factor fails before any trial is judged.
+#[test]
+fn pirls_halves_an_overflowing_trial_deviance() {
+    use crate::glmm::GlmmLayout;
+    for (crossed_slopes, layout, b0) in [
+        (None, GlmmLayout::Blocked, -3.45),
+        (Some(vec![]), GlmmLayout::Structured, -4.15),
+        (Some(vec![1]), GlmmLayout::Packed, -3.0),
+    ] {
+        let n_crossed = if crossed_slopes.is_some() { 6 } else { 0 };
+        let (x, y, mut model, ids) = nb_log_four_cluster_design(28, 24, n_crossed);
+        model.family = Family::Poisson {
+            link: crate::PoissonLink::Log,
+        };
+        if let Some(slopes) = crossed_slopes {
+            model.re.as_mut().unwrap().extra_groupings[0].slopes = slopes;
+        }
+        let n = y.len();
+        let opts = FitOptions {
+            target_indices: vec![0, 1],
+            weights: Some(vec![1e10; n]),
+            ..FitOptions::default()
+        };
+        let (sized, sids, _) = spec_sized_from_ids_pub(&model, &ids);
+        let (mut ws, xm) =
+            super::glmm::fit_glmm_build(&x, n, 2, &sized, &sids.primary, &sids.extra, &opts)
+                .unwrap_or_else(|_| panic!("degenerate design"));
+        assert_eq!(ws.layout, layout);
+        let n_theta = ws.n_theta;
+        let dev_at = |ws: &mut GlmmWorkspace, b: f64| {
+            let mut params = vec![1.0; n_theta];
+            params.extend([b, 0.0]);
+            glmm_laplace_deviance(&params, ws, xm.as_ref(), &y, &sids.primary, &sids.extra, n)
+        };
+        let fresh = dev_at(&mut ws, b0);
+        let mut walked = f64::NAN;
+        for s in 0..=40 {
+            walked = dev_at(&mut ws, 1.0 - (1.0 - b0) * f64::from(s) / 40.0);
+            let k = ws.pirls.u.len();
+            ws.u_seed[..k].copy_from_slice(&ws.pirls.u[..k]);
+            ws.fd.warm_seed_active = true;
+        }
+        assert!(walked.is_finite(), "{layout:?}: walked reference {walked}");
+        assert!(
+            (fresh - walked).abs() <= 1e-12 * walked.abs(),
+            "{layout:?}: from û = 0 {fresh} vs walked {walked}"
+        );
+    }
+}
+
+/// cbpp AGGREGATED: 56 rows, y = incidence/size, weights = size. Mirrors
+/// `cbpp_design`'s parsing verbatim; only the Bernoulli expansion loop is
+/// replaced by one row per CSV record.
+fn cbpp_design_aggregated() -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<u32>, usize) {
+    let csv = include_str!("../../validation/data/empirical/cbpp.csv");
+    let mut x = Vec::<f64>::new();
+    let mut y = Vec::<f64>::new();
+    let mut w = Vec::<f64>::new();
+    let mut cluster_ids = Vec::<u32>::new();
+    for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+        let f: Vec<&str> = line.split(',').map(|s| s.trim_matches('"')).collect();
+        let herd: u32 = f[0].parse::<u32>().unwrap() - 1; // herds 1..15 → ids 0..14
+        let incidence: u32 = f[1].parse().unwrap();
+        let size: u32 = f[2].parse().unwrap();
+        let period: u32 = f[3].parse().unwrap();
+        x.extend_from_slice(&[
+            1.0,
+            f64::from(u32::from(period == 2)),
+            f64::from(u32::from(period == 3)),
+            f64::from(u32::from(period == 4)),
+        ]);
+        y.push(f64::from(incidence) / f64::from(size));
+        w.push(f64::from(size));
+        cluster_ids.push(herd);
+    }
+    let n = y.len();
+    (x, y, w, cluster_ids, n)
+}
+
+/// Aggregated cbpp through the DENSE (NoZ) path with prior weights must
+/// reproduce the same frozen lme4 oracle as the expanded fit — lme4 itself
+/// fits cbind(incidence, size−incidence), i.e. the aggregated objective.
+/// Matches lme4 1.1-38 (validation/goldens/cbpp_agq_k1.json freeze).
+#[test]
+fn fit_glmm_cbpp_aggregated_matches_lme4() {
+    // Same frozen reference and bands as fit_glmm_cbpp_matches_lme4 — it asserts
+    // the same lme4 fit through the expanded entry point, so both read the one
+    // CBPP_REF_* definition above rather than each keeping a copy.
+    let (x, y, w, cluster_ids, n) = cbpp_design_aggregated();
+    let p = 4; // [intercept, period2, period3, period4]
+    let model = cbpp_model();
+    let f = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &GroupIds {
+            primary: cluster_ids.clone(),
+            extra: vec![],
+        },
+        &FitOptions {
+            target_indices: vec![0, 1, 2, 3],
+            weights: Some(w),
+            ..FitOptions::default()
+        },
+    );
+    assert!(f.converged(), "aggregated cbpp GLMM must converge");
+    for j in 0..p {
+        let b_rel = (f.beta[j] - CBPP_REF_BETA[j]).abs() / CBPP_REF_BETA[j].abs();
+        assert!(
+            b_rel < 1e-3,
+            "β[{j}] = {} vs lme4 {} (rel {b_rel})",
+            f.beta[j],
+            CBPP_REF_BETA[j]
+        );
+        let se_rel = (f.se[j] - CBPP_REF_SE[j]).abs() / CBPP_REF_SE[j];
+        assert!(
+            se_rel < 1e-3,
+            "se[{j}] = {} vs lme4 {} (rel {se_rel})",
+            f.se[j],
+            CBPP_REF_SE[j]
+        );
+    }
+    let herd_sd = f.tau2[0].sqrt();
+    let sd_rel = (herd_sd - CBPP_REF_HERD_SD).abs() / CBPP_REF_HERD_SD;
+    assert!(
+        sd_rel < 1e-3,
+        "herd SD = {herd_sd} vs lme4 {CBPP_REF_HERD_SD} (rel {sd_rel})"
+    );
+    // lme4 logLik on the same cbind(incidence, size−incidence) fit
+    // (validation/goldens/cbpp_agq_k1.json .estimates.loglik) — the
+    // aggregated-binomial saturated constant (incl. ln C(mᵢ,sᵢ)) restored
+    // under prior weights.
+    assert!(
+        (f.loglik - CBPP_REF_LOGLIK).abs() < 1e-3,
+        "loglik {} vs lme4 {CBPP_REF_LOGLIK}",
+        f.loglik
+    );
+    assert!(!f.reml);
+    assert_eq!(f.df, 5); // 4 β + herd-intercept θ; binomial has no dispersion
+                         // fitted/ranef consistency: b̂ = θ̂û on the natural scale must reproduce μ̂
+                         // through the logit link — pins the dense-path ranef layout AND scale.
+    assert_eq!(f.ranef_levels, vec![15]);
+    assert_eq!(f.ranef.len(), 15);
+    assert_eq!(f.fitted.len(), n);
+    for i in 0..n {
+        let eta: f64 = (0..p).map(|j| x[i * p + j] * f.beta[j]).sum::<f64>()
+            + f.ranef[cluster_ids[i] as usize];
+        let mu = 1.0 / (1.0 + (-eta).exp());
+        assert!(
+            (f.fitted[i] - mu).abs() < 1e-8,
+            "fitted[{i}] = {} vs Xβ̂+Zb̂ → {mu}",
+            f.fitted[i]
+        );
+    }
+}
+
+/// `FitOptions::offset` on the aggregated cbpp binomial GLMM: a constant
+/// per-row offset `o` shifts `η = o + Xβ + Zb`, so at the same argmin the
+/// fitted intercept must absorb it (`β̂₀(offset) ≈ β̂₀(no offset) − o`) while
+/// every other coefficient and the RE variance are unchanged — two
+/// independent BOBYQA runs of the same-argmin-up-to-a-shift objectives, so
+/// the tolerance is optimizer-scatter-sized (5e-4), not the tight oracle
+/// gate above. A zero offset must reproduce the no-offset fit bit-for-bit:
+/// `refresh_eta_fixed`'s `if let Some(o)` gate still runs (unlike `None`),
+/// so this is the one case that actually exercises the offset-add arithmetic
+/// while proving it is a no-op at `o=0`.
+#[test]
+fn fit_glmm_offset_constant_shifts_intercept() {
+    let (x, y, w, cluster_ids, n) = cbpp_design_aggregated();
+    let p = 4;
+    let model = cbpp_model();
+    let ids = GroupIds {
+        primary: cluster_ids.clone(),
+        extra: vec![],
+    };
+    let base_opts = FitOptions {
+        target_indices: vec![0, 1, 2, 3],
+        weights: Some(w.clone()),
+        ..FitOptions::default()
+    };
+
+    let f0 = fit_cold(&x, &y, n, p, &model, &ids, &base_opts);
+    assert!(
+        f0.converged(),
+        "no-offset aggregated cbpp GLMM must converge"
+    );
+
+    const OFFSET_VAL: f64 = 0.7;
+    let f_off = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &ids,
+        &FitOptions {
+            offset: Some(vec![OFFSET_VAL; n]),
+            ..base_opts.clone()
+        },
+    );
+    assert!(
+        f_off.converged(),
+        "offset aggregated cbpp GLMM must converge"
+    );
+
+    assert!(
+        (f_off.beta[0] - (f0.beta[0] - OFFSET_VAL)).abs() < 5e-4,
+        "intercept: offset fit {} vs no-offset {} shifted by -{OFFSET_VAL}",
+        f_off.beta[0],
+        f0.beta[0]
+    );
+    for j in 1..p {
+        assert!(
+            (f_off.beta[j] - f0.beta[j]).abs() < 5e-4,
+            "β[{j}]: offset fit {} vs no-offset {}",
+            f_off.beta[j],
+            f0.beta[j]
+        );
+    }
+    let herd_sd_diff = (f_off.tau2[0].sqrt() - f0.tau2[0].sqrt()).abs();
+    assert!(
+        herd_sd_diff < 5e-4,
+        "herd SD: offset fit {} vs no-offset {}",
+        f_off.tau2[0].sqrt(),
+        f0.tau2[0].sqrt()
+    );
+
+    // Logit consistency: fitted[i] must equal plogis(offset + Xβ̂ + b̂) at the
+    // offset fit's own (β̂, b̂) — mirrors the fitted/ranef check on the
+    // no-offset oracle test above.
+    assert_eq!(f_off.fitted.len(), n);
+    for i in 0..n {
+        let eta: f64 = OFFSET_VAL
+            + (0..p).map(|j| x[i * p + j] * f_off.beta[j]).sum::<f64>()
+            + f_off.ranef[cluster_ids[i] as usize];
+        let mu = 1.0 / (1.0 + (-eta).exp());
+        assert!(
+            (f_off.fitted[i] - mu).abs() < 1e-8,
+            "fitted[{i}] = {} vs offset+Xβ̂+b̂ → {mu}",
+            f_off.fitted[i]
+        );
+    }
+
+    // An all-zeros offset must be bit-identical to no offset: the
+    // `if let Some(o)` gate in `refresh_eta_fixed` runs and adds 0.0 to every
+    // eta_fixed entry, which must not perturb the converged optimum at all.
+    let f_zero = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &ids,
+        &FitOptions {
+            offset: Some(vec![0.0; n]),
+            ..base_opts
+        },
+    );
+    assert_eq!(f_zero.deviance, f0.deviance, "zero-offset deviance");
+    assert_eq!(f_zero.beta, f0.beta, "zero-offset beta");
+}
+
+/// Prior-weight fit-level equivalence on the DENSE (NoZ) path: `fit_cold`
+/// on aggregated cbpp proportions with `weights = size` matches the expanded
+/// Bernoulli fit on β/SE/τ² on the `Rx` arm; the Hessian arm is pinned on both
+/// entry points against lme4 at 1e-3 (`fit_glmm_cbpp_matches_lme4`,
+/// `fit_glmm_cbpp_aggregated_matches_lme4`). Two independent searches of
+/// same-argmin objectives, so the bands come from their measured gap (below);
+/// the oracle tests are the anchor against lme4.
+/// Dense twin of `sparse_weighted_binomial_fit_matches_expanded`.
+#[test]
+fn fit_glmm_cbpp_aggregated_matches_expanded() {
+    let (xe, ye, ids_e, n_e) = cbpp_design();
+    let (xa, ya, wa, ids_a, n_a) = cbpp_design_aggregated();
+    let p = 4;
+    let model = cbpp_model();
+    let wald_se = WaldSe::Rx;
+    let fe = fit_cold(
+        &xe,
+        &ye,
+        n_e,
+        p,
+        &model,
+        &GroupIds {
+            primary: ids_e,
+            extra: vec![],
+        },
+        &FitOptions {
+            target_indices: vec![0, 1, 2, 3],
+            wald_se,
+            ..FitOptions::default()
+        },
+    );
+    let fa = fit_cold(
+        &xa,
+        &ya,
+        n_a,
+        p,
+        &model,
+        &GroupIds {
+            primary: ids_a,
+            extra: vec![],
+        },
+        &FitOptions {
+            target_indices: vec![0, 1, 2, 3],
+            wald_se,
+            weights: Some(wa),
+            ..FitOptions::default()
+        },
+    );
+    let tag = format!("{wald_se:?}");
+    // Bands: the smallest ladder step at least 10× the measured agg-vs-exp gap
+    // (β 4.0e-11, SE 6.7e-11, τ² 3.7e-10; 2026-10-17, aarch64).
+    assert!(
+        fe.converged() && fa.converged(),
+        "{tag}: both fits must converge"
+    );
+    for j in 0..p {
+        assert!(
+            (fa.beta[j] - fe.beta[j]).abs() < 1e-4 * (1.0 + fe.beta[j].abs()),
+            "{tag} β[{j}]: agg={} exp={}",
+            fa.beta[j],
+            fe.beta[j]
+        );
+        assert!(
+            (fa.se[j] - fe.se[j]).abs() < 1e-4 * (1.0 + fe.se[j].abs()),
+            "{tag} se[{j}]: agg={} exp={}",
+            fa.se[j],
+            fe.se[j]
+        );
+    }
+    assert_eq!(fa.tau2.len(), fe.tau2.len(), "{tag}: tau2 length");
+    for (a, b) in fa.tau2.iter().zip(fe.tau2.iter()) {
+        assert!(
+            (a - b).abs() < 1e-4 * (1.0 + b.abs()),
+            "{tag} tau2: agg={a} exp={b}"
+        );
+    }
+}
+
+/// Shared 12-cluster × 10-row single-grouping design for the weighted
+/// dense-GLMM goldens: `(x [n·2 row-major: intercept, x1], ids, n, p)`
+/// assembled from the R-exported x1 slice; y and w are family-specific.
+fn weighted_glmm_design(x1: &[f64]) -> (Vec<f64>, Vec<u32>, usize, usize) {
+    let n = x1.len();
+    let mut x = Vec::with_capacity(n * 2);
+    for &v in x1 {
+        x.push(1.0);
+        x.push(v);
+    }
+    let ids: Vec<u32> = (0..n as u32).map(|i| i / 10).collect();
+    (x, ids, n, 2)
+}
+
+/// Weighted dense Poisson GLMM vs the frozen lme4 golden. Generated with
+/// (R 4.5.3, lme4 1.1-38):
+/// ```r
+/// library(lme4); set.seed(11)
+/// g <- rep(1:12, each = 10); n <- 120
+/// x1 <- round(rnorm(n), 4); w <- sample(1:4, n, TRUE)
+/// b <- rnorm(12, 0, 0.5)
+/// y <- rpois(n, exp(0.3 + 0.5 * x1 + b[g]))
+/// f <- glmer(y ~ x1 + (1 | g), family = poisson, weights = w,
+///            control = glmerControl(tolPwrss = 1e-13))
+/// print(summary(f)$coefficients, digits = 15)
+/// print(as.data.frame(VarCorr(f)), digits = 15)
+/// ```
+/// β (2e-3 abs) and the RE SD (3e-3 rel) mirror `fit_glmm_cbpp_matches_lme4`.
+/// SE band 1e-3, like the other goldens in this file: `tolPwrss = 1e-13` holds
+/// `glmer` to the mode, so its log|A| comes from working weights at the mode
+/// (see src/glmm/se.rs).
+#[test]
+fn fit_glmm_poisson_weighted_matches_lme4() {
+    const X1: [f64; 120] = [
+        -0.591, 0.0266, -1.5166, -1.3627, 1.1785, -0.9342, 1.3236, 0.6249, -0.0457, -1.0041,
+        -0.8284, -0.3484, -1.5383, -0.2556, -1.1499, 0.0123, -0.223, 0.8878, -0.5922, -0.6557,
+        -0.6825, -0.0159, -0.4426, 0.3526, 0.0732, 0.0072, -0.1876, -0.7657, -0.2211, -0.9836,
+        -1.1043, -0.9382, 0.6786, -1.5775, -0.8699, 0.4847, -0.1861, 1.5456, -0.6114, -0.3478,
+        -1.6365, 0.0204, 0.8917, -0.8727, 0.8901, -0.3439, -2.1868, 0.8801, 0.7239, 0.2199, 0.7899,
+        -0.23, -0.8185, 0.4997, 0.1592, 0.5426, -0.1566, 0.4388, 1.4879, 0.0602, -0.849, 2.3397,
+        -0.1212, -1.9502, 0.5387, 1.6935, -0.791, -1.0753, -0.6079, 0.7544, 0.4535, -0.1234,
+        -0.7631, 0.2283, 1.1195, 0.1566, -0.6888, 0.4529, -1.0675, 0.4016, -0.0648, 0.3155,
+        -0.6057, -0.9076, 2.2616, -0.6032, -1.2979, 0.5065, -0.8533, -1.506, 1.2023, -1.0279,
+        0.9383, -0.5432, 0.5131, -0.3526, 1.3265, -1.1402, 1.4131, -0.6022, -0.4417, 0.2436,
+        0.5968, -0.12, -2.0697, 0.5856, 0.4894, -1.0066, 1.2697, 1.1239, 0.8425, 1.6206, 0.4477,
+        -2.2989, -0.0792, -0.5231, -0.4176, 0.3049, -0.0314, 0.1051,
+    ];
+    const W: [f64; 120] = [
+        4., 1., 3., 2., 3., 2., 3., 1., 3., 1., 1., 1., 2., 4., 4., 4., 1., 1., 4., 3., 4., 4., 3.,
+        4., 4., 1., 1., 1., 3., 4., 3., 3., 3., 2., 1., 3., 2., 2., 2., 3., 2., 1., 4., 1., 1., 1.,
+        2., 1., 3., 4., 2., 4., 1., 1., 4., 2., 4., 1., 1., 3., 2., 1., 1., 3., 4., 3., 2., 3., 2.,
+        1., 3., 4., 1., 4., 1., 3., 3., 1., 2., 4., 2., 4., 1., 2., 1., 4., 1., 4., 3., 4., 3., 2.,
+        4., 2., 2., 4., 3., 3., 1., 3., 4., 1., 1., 3., 3., 4., 3., 1., 4., 3., 3., 4., 3., 1., 2.,
+        4., 4., 1., 1., 2.,
+    ];
+    const Y: [f64; 120] = [
+        2., 2., 0., 0., 3., 0., 8., 3., 3., 1., 0., 0., 1., 2., 2., 0., 2., 3., 3., 1., 0., 1., 3.,
+        1., 3., 0., 2., 0., 1., 0., 0., 0., 0., 1., 0., 0., 1., 3., 1., 0., 1., 6., 5., 3., 10.,
+        6., 1., 14., 4., 3., 3., 0., 0., 1., 1., 0., 1., 1., 3., 1., 1., 4., 0., 0., 0., 1., 1.,
+        0., 1., 0., 2., 3., 0., 1., 1., 3., 2., 2., 1., 1., 0., 0., 1., 0., 0., 0., 0., 3., 0., 1.,
+        5., 1., 1., 1., 3., 1., 5., 0., 4., 2., 3., 1., 3., 0., 2., 3., 0., 1., 2., 4., 2., 2., 0.,
+        1., 0., 2., 0., 1., 1., 0.,
+    ];
+    const REF_BETA: [f64; 2] = [0.235917526156541, 0.547943727436689];
+    const REF_SE: [f64; 2] = [0.1758115943204218, 0.0597574539823975];
+    const REF_G_SD: f64 = 0.575373557412504;
+
+    let (x, ids, n, p) = weighted_glmm_design(&X1);
+    let model = ModelSpec {
+        family: Family::Poisson {
+            link: crate::PoissonLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 12 },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let f = fit_cold(
+        &x,
+        &Y,
+        n,
+        p,
+        &model,
+        &GroupIds {
+            primary: ids,
+            extra: vec![],
+        },
+        &FitOptions {
+            target_indices: vec![0, 1],
+            weights: Some(W.to_vec()),
+            ..FitOptions::default()
+        },
+    );
+    assert!(f.converged(), "weighted Poisson GLMM must converge");
+    for j in 0..p {
+        assert!(
+            (f.beta[j] - REF_BETA[j]).abs() < 2e-3,
+            "β[{j}] = {} vs lme4 {} (Δ {})",
+            f.beta[j],
+            REF_BETA[j],
+            (f.beta[j] - REF_BETA[j]).abs()
+        );
+        let se_rel = (f.se[j] - REF_SE[j]).abs() / REF_SE[j];
+        // `validation/grid/tol.R`'s se_hessian_rel, the same band the artifact-free
+        // goldens in this file hold.
+        assert!(
+            se_rel < 1e-3,
+            "se[{j}] = {} vs lme4 {} (rel {se_rel})",
+            f.se[j],
+            REF_SE[j]
+        );
+    }
+    let g_sd = f.tau2[0].sqrt();
+    let sd_rel = (g_sd - REF_G_SD).abs() / REF_G_SD;
+    assert!(
+        sd_rel < 3e-3,
+        "g SD = {g_sd} vs lme4 {REF_G_SD} (rel {sd_rel})"
+    );
+}
+
+/// Weighted dense Gamma GLMM vs glmmTMB with the precision-weight dispersion
+/// offset. On this design the RE variance lands at the zero boundary under
+/// precision weights — θ̂ ≈ 3.4e-5 in glmmTMB itself (`pdHess` TRUE, no
+/// convergence warning), not a glmm artifact — so `varcorr`/`tau2` are not
+/// checked (the boundary is not a number the data determine); β, SE and
+/// dispersion are checked at their usual bands, plus a logLik gate as the
+/// boundary-robust read. The data were generated with (R 4.5.3, lme4 1.1-38):
+/// ```r
+/// library(lme4); set.seed(21)
+/// g <- rep(1:12, each = 10); n <- 120
+/// x1 <- round(rnorm(n), 4); w <- sample(1:4, n, TRUE)
+/// b <- rnorm(12, 0, 0.4)
+/// mu <- exp(0.8 + 0.4 * x1 + b[g])
+/// y <- round(rgamma(n, shape = 3, scale = mu / 3), 6)
+/// ```
+/// and the reference is (R 4.5.3, glmmTMB 1.1.14, same `g`, `x1`, `w`, `y`):
+/// ```r
+/// f <- glmmTMB(y ~ x1 + (1 | g), family = Gamma("log"),
+///              dispformula = ~ offset(log(w)),
+///              control = glmmTMBControl(optCtrl = list(iter.max = 1e4, eval.max = 1e4)))
+/// print(fixef(f)$cond, digits = 15); print(sqrt(diag(vcov(f)$cond)), digits = 15)
+/// print(attr(VarCorr(f)$cond$g, "stddev"), digits = 15); print(sigma(f)^2, digits = 15)
+/// print(logLik(f), digits = 15)
+/// ```
+/// output (convergence 0, `pdHess` TRUE):
+/// ```text
+/// beta:        0.888168822365331  0.373928395762624
+/// se:          0.0547355181205783 0.0537628275197313
+/// g sd:        3.43908104307015e-05
+/// sigma^2:     0.946728824744119
+/// logLik:      -207.651405595216
+/// ```
+/// Bands are `validation/grid/tol.R`'s cross-engine ones (`beta_rel`,
+/// `se_hessian_rel`, both 1e-3 on dispersion too) plus `loglik_abs_glmm` for
+/// logLik.
+// R-generated covariate/weight/response triple for the 12-cluster weighted
+// Gamma GLMM goldens below (`fit_glmm_gamma_weighted_matches_glmmtmb` and its
+// weight-scale-invariance/held-φ twins); 1.1283 in X1 coincidentally
+// approximates 2/√π.
+#[allow(clippy::approx_constant)]
+const WEIGHTED_GAMMA_GLMM_X1: [f64; 120] = [
+    0.793, 0.5223, 1.7462, -1.2713, 2.1974, 0.4331, -1.5702, -0.9349, 0.0635, -0.0024, -2.2768,
+    0.7574, -0.5484, 0.1725, 0.5629, 1.5118, 0.659, 1.122, -0.7846, -0.4257, 0.393, 0.0368,
+    -1.0321, -1.2649, -0.227, 0.7456, 0.3328, -1.124, -0.7061, -0.7275, -1.8343, -0.4077, 0.0269,
+    0.9116, 1.6343, 0.0607, 1.8476, 0.0801, 1.4186, 1.4586, 0.0559, -1.5172, -0.0486, -0.2144,
+    2.0958, 0.2023, 0.5177, 1.6781, 0.3852, -1.2819, -0.5822, 1.7741, -0.2107, -0.3521, 0.5852,
+    1.0137, -0.0226, -0.9032, 0.9078, 1.1619, -0.458, 0.928, -2.1029, -1.6772, 1.7657, 0.7944,
+    -0.4839, 1.9284, -0.3841, -1.5867, 0.2143, -1.1383, 0.4894, -1.7526, 0.501, 0.0868, 0.1911,
+    0.8318, -0.679, 0.2959, 1.1122, 0.3626, -0.2709, -0.1969, 0.067, -0.8678, -0.362, -1.1396,
+    -0.8154, 1.3102, -0.2584, 0.6063, 0.3134, 0.0536, 1.1283, -0.5581, 1.536, -0.0624, 0.0216,
+    -2.0898, -0.8109, -2.9438, -0.0188, -0.3547, 0.0356, 0.4941, -0.6598, 1.0011, 1.0721, 0.7558,
+    -1.4555, 0.9429, -1.8703, -0.2533, -0.2926, 0.2188, -1.3551, -0.1227, -0.4519, 0.0972,
+];
+const WEIGHTED_GAMMA_GLMM_W: [f64; 120] = [
+    2., 2., 2., 1., 2., 4., 2., 3., 3., 3., 4., 4., 4., 4., 2., 4., 3., 3., 2., 2., 1., 1., 4., 1.,
+    1., 1., 4., 4., 3., 4., 3., 2., 4., 3., 4., 2., 4., 2., 2., 2., 1., 1., 1., 1., 1., 3., 2., 1.,
+    2., 2., 4., 4., 2., 3., 4., 4., 4., 3., 2., 4., 4., 2., 3., 4., 2., 4., 2., 2., 2., 1., 1., 1.,
+    4., 4., 4., 1., 3., 4., 4., 3., 2., 1., 1., 4., 4., 4., 1., 2., 2., 2., 4., 3., 3., 1., 1., 1.,
+    4., 3., 4., 3., 3., 2., 2., 3., 4., 4., 3., 4., 2., 1., 3., 1., 3., 2., 3., 3., 4., 3., 1., 3.,
+];
+const WEIGHTED_GAMMA_GLMM_Y: [f64; 120] = [
+    1.027885, 3.568778, 5.059958, 1.829256, 7.572745, 1.888244, 0.638556, 1.352118, 6.460123,
+    1.431433, 0.491063, 1.808875, 1.736458, 2.965294, 4.171528, 2.554423, 2.217066, 0.48551,
+    1.646985, 3.758326, 3.388564, 2.795867, 0.780591, 1.495213, 1.664063, 3.445218, 2.973526,
+    1.700702, 1.031139, 1.852452, 2.514445, 1.04869, 1.757371, 2.407751, 1.232387, 1.211173,
+    7.507012, 3.516693, 3.209465, 1.575613, 1.416005, 0.324474, 1.528727, 1.941835, 9.305071,
+    0.960217, 1.934011, 1.54724, 1.326433, 1.255908, 2.665283, 4.779793, 1.830826, 0.990174,
+    1.892684, 11.248398, 1.851022, 1.273189, 3.905656, 0.905928, 3.315271, 1.126161, 0.465568,
+    1.937359, 4.986676, 5.506185, 0.636041, 5.615351, 0.473084, 0.831148, 1.471093, 2.344402,
+    0.680976, 1.026012, 1.43575, 2.919631, 5.756904, 4.804391, 1.699487, 0.706556, 3.551593,
+    2.787834, 2.280541, 1.685016, 3.503679, 3.911159, 0.424846, 3.080594, 0.663857, 4.361308,
+    3.329871, 3.137527, 7.377112, 2.457973, 4.633516, 3.899755, 5.727707, 1.813578, 2.754815,
+    1.84022, 0.753663, 0.331312, 0.870051, 2.412794, 3.001372, 1.099695, 4.98129, 4.075331,
+    4.525327, 5.201431, 1.504496, 5.951359, 1.258666, 5.439477, 2.243875, 0.603161, 1.000063,
+    2.337211, 0.981631, 0.914213,
+];
+
+fn weighted_gamma_glmm_model() -> ModelSpec {
+    ModelSpec {
+        family: Family::Gamma {
+            link: crate::GammaLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 12 },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    }
+}
+
+#[test]
+fn fit_glmm_gamma_weighted_matches_glmmtmb() {
+    const REF_BETA: [f64; 2] = [0.888168822365331, 0.373928395762624];
+    const REF_SE: [f64; 2] = [0.0547355181205783, 0.0537628275197313];
+    const REF_DISP: f64 = 0.946728824744119; // sigma(f)^2
+    const REF_LOGLIK: f64 = -207.651405595216;
+
+    let (x, ids, n, p) = weighted_glmm_design(&WEIGHTED_GAMMA_GLMM_X1);
+    let model = weighted_gamma_glmm_model();
+    let f = fit_cold(
+        &x,
+        &WEIGHTED_GAMMA_GLMM_Y,
+        n,
+        p,
+        &model,
+        &GroupIds {
+            primary: ids,
+            extra: vec![],
+        },
+        &FitOptions {
+            target_indices: vec![0, 1],
+            weights: Some(WEIGHTED_GAMMA_GLMM_W.to_vec()),
+            ..FitOptions::default()
+        },
+    );
+    assert!(f.converged(), "weighted Gamma GLMM must converge");
+    for j in 0..p {
+        let b_rel = (f.beta[j] - REF_BETA[j]).abs() / REF_BETA[j].abs();
+        assert!(
+            b_rel < 1e-3,
+            "β[{j}] = {} vs glmmTMB {} (rel {b_rel})",
+            f.beta[j],
+            REF_BETA[j]
+        );
+        let se_rel = (f.se[j] - REF_SE[j]).abs() / REF_SE[j];
+        // `validation/grid/tol.R`'s se_hessian_rel.
+        assert!(
+            se_rel < 1e-3,
+            "se[{j}] = {} vs glmmTMB {} (rel {se_rel})",
+            f.se[j],
+            REF_SE[j]
+        );
+    }
+    let disp_rel = (f.dispersion - REF_DISP).abs() / REF_DISP;
+    assert!(
+        disp_rel < 1e-3,
+        "φ̂ = {} vs glmmTMB {REF_DISP} (rel {disp_rel})",
+        f.dispersion
+    );
+    assert!(
+        (f.loglik - REF_LOGLIK).abs() < 1e-3,
+        "loglik {} vs glmmTMB {REF_LOGLIK}",
+        f.loglik
+    );
+}
+
+/// Weight-scale invariance of the dense (`Solver::NoZ`) mixed Gamma GLMM:
+/// `wᵢ → c·wᵢ` leaves β, τ², SE and loglik unchanged (`dispersion` scales by
+/// `c`), the same claim `fit_glm_gamma_weight_scale_invariant` checks for the
+/// GLM. Unlike the GLM's raw-weight IRLS, the whole mixed objective (PIRLS,
+/// the outer search over `[θ|β|ln φ]`, and its `GAMMA_PHI_LO..GAMMA_PHI_HI`
+/// box on `ln φ`) runs on the internal `ŵ = w/s`
+/// (`fit::glmm::prep_glmm_design`), so with bit-exact `ŵ` (powers of two) the
+/// objective itself is bit-identical and every reported quantity but
+/// `dispersion` agrees to 1e-9 relative. `2^20` also exercises that φ box.
+/// Same fixture as `fit_glmm_gamma_weighted_matches_glmmtmb`.
+#[test]
+fn fit_glmm_gamma_weight_scale_invariant_dense() {
+    let (x, ids, ..) = weighted_glmm_design(&WEIGHTED_GAMMA_GLMM_X1);
+    let _ = weighted_gamma_glmm_scale_invariant_check(
+        1,
+        &weighted_gamma_glmm_model(),
+        &x,
+        &WEIGHTED_GAMMA_GLMM_Y,
+        &WEIGHTED_GAMMA_GLMM_W,
+        &ids,
+    );
+}
+
+/// AGQ twin of `fit_glmm_gamma_weight_scale_invariant_dense`, `nagq = 7`: `Gₚ`
+/// has no `u` in it, so it sits outside the AGQ integral and the same
+/// invariance argument applies unchanged.
+#[test]
+fn fit_glmm_gamma_weight_scale_invariant_agq() {
+    let (x, ids, ..) = weighted_glmm_design(&WEIGHTED_GAMMA_GLMM_X1);
+    let _ = weighted_gamma_glmm_scale_invariant_check(
+        7,
+        &weighted_gamma_glmm_model(),
+        &x,
+        &WEIGHTED_GAMMA_GLMM_Y,
+        &WEIGHTED_GAMMA_GLMM_W,
+        &ids,
+    );
+}
+
+/// Gradient-search twin of `fit_glmm_gamma_weight_scale_invariant_dense`, on
+/// `gamma_inverse_slope_design` with prior weights: `(1 + x₁ | g)` (n_θ = 3),
+/// which the gradient search fits over `[θ | β̃ | ln φ]` on the same internal
+/// `ŵ`. Two of its three τ² are interior, so the τ² check compares non-zero
+/// values; the third τ² is 0 and the correlation is −1, both on the boundary.
+#[test]
+fn fit_glmm_gamma_weight_scale_invariant_routed() {
+    use super::core::{build_workspace, curvature_hint, fit_on};
+    let (x, y, ids, model) = gamma_inverse_slope_design();
+    let (n, p) = (y.len(), 2);
+    let w: Vec<f64> = (0..n).map(|i| 0.5 + (i % 5) as f64 * 0.25).collect();
+    // The fit routes: only a gradient search leaves a curvature hint, sized
+    // over `[θ | β̃ | ln φ]`.
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        weights: Some(w.clone()),
+        ..FitOptions::default()
+    };
+    let (sized, sids, perm) = spec_sized_from_ids_pub(&model, &ids);
+    let mut ws = build_workspace(&sized, perm, n, p, &opts);
+    let _ = fit_on(&mut ws, &x, &y, &sids, None, &opts);
+    let hint = curvature_hint(&mut ws).expect("the slope model takes the gradient search");
+    assert_eq!(hint.dim(), 3 + p + 1);
+    let base = weighted_gamma_glmm_scale_invariant_check(1, &model, &x, &y, &w, &ids.primary);
+    assert!(
+        base.tau2.iter().any(|&t| t > 0.0),
+        "every variance at 0: τ² {:?}",
+        base.tau2
+    );
+}
+
+/// `fit_on_hinted` on a Gamma workspace with a free φ: the routed pilot's
+/// hint is sized over `[θ | β̃ | ln φ]` (n_θ + p + 1), the call takes it, and
+/// on two other draws each hinted fit converges at or below the unhinted fit's
+/// deviance within `1e-6`.
+#[test]
+fn fit_on_hinted_takes_a_gamma_hint_with_its_ln_phi_slot() {
+    use super::core::{build_workspace, curvature_hint, fit_on, fit_on_hinted};
+    let mut model = weighted_gamma_glmm_model();
+    if let Some(re) = model.re.as_mut() {
+        re.slopes = vec![1];
+    }
+    let (x, ids, n, p) = weighted_glmm_design(&WEIGHTED_GAMMA_GLMM_X1);
+    let ids = GroupIds {
+        primary: ids,
+        extra: vec![],
+    };
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        weights: Some(WEIGHTED_GAMMA_GLMM_W.to_vec()),
+        ..FitOptions::default()
+    };
+    let (sized, sids, perm) = spec_sized_from_ids_pub(&model, &ids);
+    let mut ws = build_workspace(&sized, perm, n, p, &opts);
+    let _ = fit_on(&mut ws, &x, &WEIGHTED_GAMMA_GLMM_Y, &sids, None, &opts);
+    let hint = curvature_hint(&mut ws).expect("the slope model takes the gradient search");
+    assert_eq!(hint.dim(), 3 + p + 1);
+    for d in 1..=2 {
+        let y: Vec<f64> = WEIGHTED_GAMMA_GLMM_Y
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| if (i + d) % 7 == 0 { 1.5 * v } else { v })
+            .collect();
+        let plain = fit_on(&mut ws, &x, &y, &sids, None, &opts)
+            .into_fit(&x, &y, &sids, n, p, &model, &opts);
+        let hinted = fit_on_hinted(&mut ws, &x, &y, &sids, None, Some(&hint), &opts)
+            .into_fit(&x, &y, &sids, n, p, &model, &opts);
+        assert!(hinted.converged(), "draw {d}: hinted fit not converged");
+        assert!(
+            hinted.deviance <= plain.deviance + 1e-6,
+            "draw {d}: hinted {} vs unhinted {}",
+            hinted.deviance,
+            plain.deviance
+        );
+    }
+}
+
+/// Shared body of the weight-scale-invariance twins above, on the row-major
+/// two-column design `x`, response `y`, prior weights `w` and primary group
+/// ids `ids`. Returns the unit-scale fit.
+fn weighted_gamma_glmm_scale_invariant_check(
+    nagq: u8,
+    model: &ModelSpec,
+    x: &[f64],
+    y: &[f64],
+    w: &[f64],
+    ids: &[u32],
+) -> Fit {
+    let (n, p) = (y.len(), 2);
+    let ids = GroupIds {
+        primary: ids.to_vec(),
+        extra: vec![],
+    };
+    let fit_at = |c: f64| {
+        let w: Vec<f64> = w.iter().map(|&wi| c * wi).collect();
+        fit_cold(
+            x,
+            y,
+            n,
+            p,
+            model,
+            &ids,
+            &FitOptions {
+                target_indices: vec![0, 1],
+                weights: Some(w),
+                nagq,
+                ..FitOptions::default()
+            },
+        )
+    };
+    let base = fit_at(1.0);
+    assert!(base.converged(), "nagq={nagq}: base fit must converge");
+    for &c in &[8.0_f64, 2.0_f64.powi(-6), 2.0_f64.powi(20)] {
+        let f = fit_at(c);
+        assert!(f.converged(), "nagq={nagq} c={c}");
+        for j in 0..p {
+            let b_rel = (f.beta[j] - base.beta[j]).abs() / base.beta[j].abs();
+            assert!(
+                b_rel < 1e-9,
+                "nagq={nagq} c={c}: β[{j}] {} vs {}",
+                f.beta[j],
+                base.beta[j]
+            );
+        }
+        // A τ² may be exactly 0, where a plain relative check divides 0 by 0,
+        // so the check is absolute plus relative.
+        assert_eq!(f.tau2.len(), base.tau2.len());
+        for (k, (&t, &tb)) in f.tau2.iter().zip(&base.tau2).enumerate() {
+            assert!(
+                (t - tb).abs() <= 1e-9 * (1.0 + tb.abs()),
+                "nagq={nagq} c={c}: τ²[{k}] {t} vs {tb}"
+            );
+        }
+        // The intercept-slope correlation of each 2×2 block (vech
+        // `[v₀₀, v₁₀, v₁₁]`); NaN on both fits when a variance is at 0.
+        let corr = |fit: &Fit| -> Vec<f64> {
+            fit.varcorr
+                .iter()
+                .filter(|b| b.len() == 3)
+                .map(|b| b[1] / (b[0] * b[2]).sqrt())
+                .collect()
+        };
+        let (rf, rb) = (corr(&f), corr(&base));
+        assert_eq!(rf.len(), rb.len());
+        for (k, (&r, &r_base)) in rf.iter().zip(&rb).enumerate() {
+            assert!(
+                (r - r_base).abs() <= 1e-9 || (r.is_nan() && r_base.is_nan()),
+                "nagq={nagq} c={c}: correlation[{k}] {r} vs {r_base}"
+            );
+        }
+        for j in 0..p {
+            let se_rel = (f.se[j] - base.se[j]).abs() / base.se[j].abs();
+            assert!(
+                se_rel < 1e-9,
+                "nagq={nagq} c={c}: se[{j}] {} vs {}",
+                f.se[j],
+                base.se[j]
+            );
+        }
+        let ll_rel = (f.loglik - base.loglik).abs() / base.loglik.abs();
+        assert!(
+            ll_rel < 1e-9,
+            "nagq={nagq} c={c}: loglik {} vs {}",
+            f.loglik,
+            base.loglik
+        );
+        let disp_rel = (f.dispersion - c * base.dispersion).abs() / (c * base.dispersion);
+        assert!(
+            disp_rel < 1e-9,
+            "nagq={nagq} c={c}: dispersion {} vs {c}·{}",
+            f.dispersion,
+            base.dispersion
+        );
+    }
+    base
+}
+
+/// Held φ under weights, dense mixed Gamma GLMM: `(w, Some(v))` and `(c·w,
+/// Some(c·v))` must give the same β, τ², SE and loglik — the held φ enters the
+/// objective as `v/s` (`fit::glmm::run_glmm_on`), so it scales exactly like
+/// the free φ̂ does. `Some(free.dispersion)` must reproduce the free fit's
+/// loglik, within the route's own optimizer band (a fresh BOBYQA run from a
+/// cold start, not the bit-exact case above).
+#[test]
+fn fit_glmm_gamma_weighted_held_dispersion_invariant() {
+    let (x, ids, n, p) = weighted_glmm_design(&WEIGHTED_GAMMA_GLMM_X1);
+    let model = weighted_gamma_glmm_model();
+    let ids = GroupIds {
+        primary: ids,
+        extra: vec![],
+    };
+    let fit_at = |c: f64, v: f64| {
+        let w: Vec<f64> = WEIGHTED_GAMMA_GLMM_W.iter().map(|&wi| c * wi).collect();
+        fit_cold(
+            &x,
+            &WEIGHTED_GAMMA_GLMM_Y,
+            n,
+            p,
+            &model,
+            &ids,
+            &FitOptions {
+                target_indices: vec![0, 1],
+                weights: Some(w),
+                dispersion: Some(v),
+                ..FitOptions::default()
+            },
+        )
+    };
+    let v = 0.4_f64;
+    let base = fit_at(1.0, v);
+    assert!(base.converged(), "held φ base fit must converge");
+    assert!((base.dispersion - v).abs() < 1e-12, "held φ must be {v}");
+    for &c in &[8.0_f64, 2.0_f64.powi(-6), 2.0_f64.powi(20)] {
+        let f = fit_at(c, c * v);
+        assert!(f.converged(), "c = {c}");
+        assert!(
+            (f.dispersion - c * v).abs() / (c * v) < 1e-9,
+            "c = {c}: held φ reported {} vs {}",
+            f.dispersion,
+            c * v
+        );
+        for j in 0..p {
+            let b_rel = (f.beta[j] - base.beta[j]).abs() / base.beta[j].abs();
+            assert!(
+                b_rel < 1e-9,
+                "c = {c}: β[{j}] {} vs {}",
+                f.beta[j],
+                base.beta[j]
+            );
+        }
+        let tau_diff = (f.tau2[0] - base.tau2[0]).abs();
+        assert!(
+            tau_diff <= 1e-9 * (1.0 + base.tau2[0].abs()),
+            "c = {c}: τ² {} vs {}",
+            f.tau2[0],
+            base.tau2[0]
+        );
+        for j in 0..p {
+            let se_rel = (f.se[j] - base.se[j]).abs() / base.se[j].abs();
+            assert!(
+                se_rel < 1e-9,
+                "c = {c}: se[{j}] {} vs {}",
+                f.se[j],
+                base.se[j]
+            );
+        }
+        let ll_rel = (f.loglik - base.loglik).abs() / base.loglik.abs();
+        assert!(
+            ll_rel < 1e-9,
+            "c = {c}: loglik {} vs {}",
+            f.loglik,
+            base.loglik
+        );
+    }
+    // A held φ at the free fit's own φ̂ reproduces the free fit's loglik,
+    // within the joint BOBYQA route's own optimizer band — a fresh cold-start
+    // search, not a bit-identical re-evaluation.
+    let free = fit_cold(
+        &x,
+        &WEIGHTED_GAMMA_GLMM_Y,
+        n,
+        p,
+        &model,
+        &ids,
+        &FitOptions {
+            target_indices: vec![0, 1],
+            weights: Some(WEIGHTED_GAMMA_GLMM_W.to_vec()),
+            ..FitOptions::default()
+        },
+    );
+    assert!(free.converged(), "free fit must converge");
+    let at_hat = fit_at(1.0, free.dispersion);
+    assert!(at_hat.converged());
+    let ll_rel = (at_hat.loglik - free.loglik).abs() / free.loglik.abs();
+    assert!(
+        ll_rel < 1e-8,
+        "held free.dispersion loglik {} vs free fit's {}",
+        at_hat.loglik,
+        free.loglik
+    );
+}
+
+/// A single outlier weight (`w[0] = 1e9`, the rest unchanged from
+/// `WEIGHTED_GAMMA_GLMM_W`'s 1..4 range) converges: an arithmetic-mean
+/// normaliser refuses this design (an arithmetic mean of `w` is dragged up by
+/// the outlier, pushing the internal `φ_int = φ/mean(w)` under `GAMMA_PHI_LO`,
+/// `boundary: NoOptimum`, no note), while `weight_scale`'s power-of-two-near-
+/// geometric-mean normaliser fits it. A geometric mean averages
+/// `log₂ wᵢ`, so one row eight-decades-large barely moves it. Scaling every
+/// weight by a power of two (8) then reproduces the same β, τ², SE and loglik
+/// with `dispersion` scaled by exactly 8 — the same invariance the other
+/// weight-scale tests check, now on a design an arithmetic mean would have
+/// refused outright.
+#[test]
+fn fit_glmm_gamma_weighted_outlier_weight_converges() {
+    let (x, ids, n, p) = weighted_glmm_design(&WEIGHTED_GAMMA_GLMM_X1);
+    let model = weighted_gamma_glmm_model();
+    let ids = GroupIds {
+        primary: ids,
+        extra: vec![],
+    };
+    let fit_at = |c: f64| {
+        let mut w = WEIGHTED_GAMMA_GLMM_W.to_vec();
+        w[0] = 1e9;
+        for wi in w.iter_mut() {
+            *wi *= c;
+        }
+        fit_cold(
+            &x,
+            &WEIGHTED_GAMMA_GLMM_Y,
+            n,
+            p,
+            &model,
+            &ids,
+            &FitOptions {
+                target_indices: vec![0, 1],
+                weights: Some(w),
+                ..FitOptions::default()
+            },
+        )
+    };
+    let base = fit_at(1.0);
+    assert!(
+        base.converged(),
+        "a single outlier weight must not refuse the fit: {:?}",
+        base.diagnostics
+    );
+    assert!(
+        base.dispersion.is_finite() && base.dispersion > 0.0,
+        "φ̂ = {}",
+        base.dispersion
+    );
+    let scaled = fit_at(8.0);
+    assert!(scaled.converged(), "scaled outlier fit must converge");
+    for j in 0..p {
+        let b_rel = (scaled.beta[j] - base.beta[j]).abs() / base.beta[j].abs();
+        assert!(
+            b_rel < 1e-9,
+            "β[{j}] {} vs {}",
+            scaled.beta[j],
+            base.beta[j]
+        );
+    }
+    for k in 0..base.tau2.len() {
+        let tau_diff = (scaled.tau2[k] - base.tau2[k]).abs();
+        assert!(
+            tau_diff <= 1e-9 * (1.0 + base.tau2[k].abs()),
+            "τ²[{k}] {} vs {}",
+            scaled.tau2[k],
+            base.tau2[k]
+        );
+    }
+    let ll_rel = (scaled.loglik - base.loglik).abs() / base.loglik.abs();
+    assert!(ll_rel < 1e-9, "loglik {} vs {}", scaled.loglik, base.loglik);
+    let disp_rel = (scaled.dispersion - 8.0 * base.dispersion).abs() / (8.0 * base.dispersion);
+    assert!(
+        disp_rel < 1e-9,
+        "dispersion {} vs 8·{}",
+        scaled.dispersion,
+        base.dispersion
+    );
+}
+
+/// Poisson GLMM `TICKS ~ 1 + YEAR + cHEIGHT + (1|INDEX)` on grouseticks
+/// (observation-level INDEX = 403 size-1 clusters), gated against frozen
+/// `lme4::glmer(family=poisson, nAGQ=1)` (`validation/goldens/grouseticks_agq_k1.json`).
+/// Exercises the blocked PIRLS path for a non-binomial family. lme4-only SE.
+/// The oracle is sacred.
+///
+/// The `REF_*` constants are copied from that golden (lme4 1.1.38, which
+/// records tolPwrss = 1e-13): `.estimates.beta`, `.se_hessian`, the INDEX
+/// `stddev` and `.loglik`. lme4's default tolPwrss (1e-7) gives different
+/// numbers, from its lagged-ldL2 artifact (see `CBPP_REF_*`).
+#[test]
+fn fit_glmm_poisson_grouseticks_matches_lme4() {
+    const REF_BETA: [f64; 4] = [
+        0.439950540917203,
+        1.10083632416174,
+        -0.988054735364959,
+        -0.023698760994204,
+    ];
+    const REF_SE: [f64; 4] = [
+        0.140903050569959,
+        0.168808851901724,
+        0.197676455656272,
+        0.00211173644732308,
+    ];
+    const REF_INDEX_SD: f64 = 1.12937506219049;
+    let csv = include_str!("../../validation/data/empirical/grouseticks.csv");
+    let p = 4;
+    let mut x = Vec::<f64>::new();
+    let mut y = Vec::<f64>::new();
+    let mut raw = Vec::<u32>::new();
+    for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+        let f: Vec<&str> = line.split(',').map(|s| s.trim_matches('"')).collect();
+        raw.push(f[0].parse().unwrap()); // INDEX
+        let year: u32 = f[4].parse().unwrap();
+        x.extend_from_slice(&[
+            1.0,
+            f64::from(u32::from(year == 96)),
+            f64::from(u32::from(year == 97)),
+            f[6].parse().unwrap(), // cHEIGHT
+        ]);
+        y.push(f[1].parse().unwrap()); // TICKS
+    }
+    let (cluster_ids, n_clusters) = dense_ids(&raw);
+    let n = y.len();
+    let model = ModelSpec {
+        family: Family::Poisson {
+            link: crate::PoissonLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let f = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &GroupIds {
+            primary: cluster_ids.clone(),
+            extra: vec![],
+        },
+        &FitOptions {
+            target_indices: vec![0, 1, 2, 3],
+            ..FitOptions::default()
+        },
+    );
+    assert!(f.converged(), "poisson GLMM must converge");
+    for j in 0..p {
+        assert!(
+            (f.beta[j] - REF_BETA[j]).abs() / REF_BETA[j].abs() < 1e-3,
+            "β[{j}] = {} vs lme4 {}",
+            f.beta[j],
+            REF_BETA[j]
+        );
+        let se_rel = (f.se[j] - REF_SE[j]).abs() / REF_SE[j];
+        // `validation/grid/tol.R`'s se_hessian_rel.
+        assert!(se_rel < 1e-3, "se[{j}] = {} vs lme4 {}", f.se[j], REF_SE[j]);
+    }
+    let sd_rel = (f.tau2[0].sqrt() - REF_INDEX_SD).abs() / REF_INDEX_SD;
+    assert!(
+        sd_rel < 1e-3,
+        "INDEX sd = {} vs lme4 {REF_INDEX_SD}",
+        f.tau2[0].sqrt()
+    );
+    // lme4 logLik (grouseticks_agq_k1.json .estimates.loglik) — the Poisson
+    // saturated constant Σ(yᵢln yᵢ − yᵢ − ln yᵢ!) restored.
+    const REF_LOGLIK: f64 = -957.399552786875;
+    assert!(
+        (f.loglik - REF_LOGLIK).abs() < 1e-3,
+        "loglik {} vs lme4 {REF_LOGLIK}",
+        f.loglik
+    );
+    assert_eq!(f.df, 5); // 4 β + INDEX θ; Poisson has no dispersion
+                         // fitted/ranef consistency through the log link (403 size-1 clusters).
+    assert_eq!(f.ranef_levels, vec![n_clusters]);
+    assert_eq!(f.fitted.len(), n);
+    for i in 0..n {
+        let eta: f64 = (0..p).map(|j| x[i * p + j] * f.beta[j]).sum::<f64>()
+            + f.ranef[cluster_ids[i] as usize];
+        assert!(
+            (f.fitted[i] - eta.exp()).abs() < 1e-6 * eta.exp().max(1.0),
+            "fitted[{i}] = {} vs exp(Xβ̂+Zb̂) = {}",
+            f.fitted[i],
+            eta.exp()
+        );
+    }
+}
+
+/// Poisson GLMM with a per-row offset vs R `glmer(offset=)`: grouseticks
+/// `TICKS ~ YEAR + cHEIGHT + (1|INDEX)` with `o_i = 0.1·((i−1) mod 7)`
+/// (0-based CSV row order in Rust). Oracle (R 4.5.3, lme4 1.1-38,
+/// `glmerControl(tolPwrss = 1e-13)`):
+///   fg <- glmer(TICKS ~ YEAR + cHEIGHT + (1|INDEX), poisson, data = gt, offset = og)
+///   print(fixef(fg), digits = 15); print(logLik(fg), digits = 15)
+///   print(as.data.frame(VarCorr(fg))$sdcor[1], digits = 15)
+#[test]
+fn fit_glmm_poisson_offset_matches_lme4() {
+    const REF_BETA: [f64; 4] = [
+        0.128483161410054,
+        1.10179195638099,
+        -0.982969256355447,
+        -0.023819614546972,
+    ];
+    const REF_LOGLIK: f64 = -960.701615612628;
+    const REF_INDEX_SD: f64 = 1.14913810893358;
+    let csv = include_str!("../../validation/data/empirical/grouseticks.csv");
+    let p = 4;
+    let mut x = Vec::<f64>::new();
+    let mut y = Vec::<f64>::new();
+    let mut raw = Vec::<u32>::new();
+    for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+        let f: Vec<&str> = line.split(',').map(|s| s.trim_matches('"')).collect();
+        raw.push(f[0].parse().unwrap()); // INDEX
+        let year: u32 = f[4].parse().unwrap();
+        x.extend_from_slice(&[
+            1.0,
+            f64::from(u32::from(year == 96)),
+            f64::from(u32::from(year == 97)),
+            f[6].parse().unwrap(), // cHEIGHT
+        ]);
+        y.push(f[1].parse().unwrap()); // TICKS
+    }
+    let (cluster_ids, n_clusters) = dense_ids(&raw);
+    let n = y.len();
+    let o: Vec<f64> = (0..n).map(|i| 0.1 * (i % 7) as f64).collect();
+    let model = ModelSpec {
+        family: Family::Poisson {
+            link: crate::PoissonLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let f = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &GroupIds {
+            primary: cluster_ids.clone(),
+            extra: vec![],
+        },
+        &FitOptions {
+            target_indices: vec![0, 1, 2, 3],
+            offset: Some(o.clone()),
+            ..FitOptions::default()
+        },
+    );
+    assert!(f.converged(), "offset poisson GLMM must converge");
+    for (j, (&b, &r)) in f.beta.iter().zip(&REF_BETA).enumerate() {
+        // Intercept is near zero under this offset — absolute band there.
+        let ok = if r.abs() > 0.1 {
+            (b - r).abs() / r.abs() < 2e-3
+        } else {
+            (b - r).abs() < 2e-3
+        };
+        assert!(ok, "β[{j}] = {b} vs lme4 {r}");
+    }
+    let sd_rel = (f.tau2[0].sqrt() - REF_INDEX_SD).abs() / REF_INDEX_SD;
+    assert!(
+        sd_rel < 3e-3,
+        "INDEX sd = {} vs lme4 {REF_INDEX_SD}",
+        f.tau2[0].sqrt()
+    );
+    assert!(
+        (f.loglik - REF_LOGLIK).abs() < 1e-3,
+        "loglik {} vs lme4 {REF_LOGLIK}",
+        f.loglik
+    );
+    // fitted folds the offset: μ̂ = exp(o + Xβ̂ + b̂[cluster]).
+    for i in 0..n {
+        let eta: f64 = o[i]
+            + (0..p).map(|j| x[i * p + j] * f.beta[j]).sum::<f64>()
+            + f.ranef[cluster_ids[i] as usize];
+        assert!(
+            (f.fitted[i] - eta.exp()).abs() < 1e-6 * eta.exp().max(1.0),
+            "fitted[{i}] = {} vs exp(o+Xβ̂+Zb̂) = {}",
+            f.fitted[i],
+            eta.exp()
+        );
+    }
+}
+
+/// Parses `validation/data/empirical/grouseticks.csv` into the 3-crossed `TICKS ~ YEAR +
+/// cHEIGHT + (1|INDEX) + (1|BROOD) + (1|LOCATION)` design (observation-level
+/// INDEX + crossed BROOD, LOCATION). Shared by the lme4 fit gate below and the
+/// both-paths sparse-vs-dense Schur cross-checks (`sparse_schur_*`), which need
+/// direct `GlmmWorkspace`/`StructuredSchur` access that `fit_cold` doesn't expose.
+fn grouseticks_3crossed_inputs() -> (Vec<f64>, Vec<f64>, usize, usize, ModelSpec, GroupIds) {
+    let csv = include_str!("../../validation/data/empirical/grouseticks.csv");
+    // cols: INDEX,TICKS,BROOD,HEIGHT,YEAR,LOCATION,cHEIGHT
+    let p = 4;
+    let mut x = Vec::<f64>::new();
+    let mut y = Vec::<f64>::new();
+    let mut index_raw = Vec::<u32>::new();
+    let mut brood_raw = Vec::<String>::new();
+    let mut loc_raw = Vec::<String>::new();
+    for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+        let f: Vec<&str> = line.split(',').map(|s| s.trim_matches('"')).collect();
+        index_raw.push(f[0].parse().unwrap());
+        let year: u32 = f[4].parse().unwrap();
+        x.extend_from_slice(&[
+            1.0,
+            f64::from(u32::from(year == 96)),
+            f64::from(u32::from(year == 97)),
+            f[6].parse().unwrap(), // cHEIGHT
+        ]);
+        y.push(f[1].parse().unwrap()); // TICKS
+        brood_raw.push(f[2].to_string());
+        loc_raw.push(f[5].to_string());
+    }
+    let n = y.len();
+    let (index_ids, n_index) = dense_ids(&index_raw);
+    let (brood_ids, _n_brood) = dense_str(&brood_raw);
+    let (loc_ids, _n_loc) = dense_str(&loc_raw);
+
+    let model = ModelSpec {
+        family: Family::Poisson {
+            link: crate::PoissonLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_index as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![
+                Grouping {
+                    relation: GroupingRelation::Crossed { n_clusters: 1 },
+                    slopes: vec![],
+                },
+                Grouping {
+                    relation: GroupingRelation::Crossed { n_clusters: 1 },
+                    slopes: vec![],
+                },
+            ],
+        }),
+    };
+    let ids = GroupIds {
+        primary: index_ids,
+        extra: vec![brood_ids, loc_ids],
+    };
+    (x, y, n, p, model, ids)
+}
+
+/// Poisson GLMM, **three crossed groupings**: grouseticks
+/// `TICKS ~ YEAR + cHEIGHT + (1|INDEX) + (1|BROOD) + (1|LOCATION)` (observation-
+/// level INDEX + crossed BROOD, LOCATION), gated against the frozen
+/// `lme4::glmer(family=poisson)` reference, lme4 1.1-38 at `tolPwrss = 1e-13` on the
+/// same formula.
+/// Exercises the structured crossed-extras PIRLS/Schur path (`pirls_solve_blocked_
+/// extras` / `structured_factor`) that the single-grouping test above does not.
+/// This is the regression guard for the degenerate-fit bug: from a β=0 cold start
+/// the first PIRLS step overshot into a ~1e30 weight regime, the crossed Schur
+/// went non-PD, and the fit returned start values reported as converged. The GLM
+/// warm-start of β (`glm_warm_start_beta`) opens PIRLS near the mean and removes
+/// the overshoot; the converged-deviance guard (`glmm/mod.rs`) is the backstop.
+/// The oracle is sacred.
+#[test]
+fn fit_glmm_poisson_grouseticks_3crossed_matches_lme4() {
+    // Frozen lme4 1.1-38 reference, glmer(family = poisson) at tolPwrss = 1e-13.
+    const REF_BETA: [f64; 4] = [
+        0.372776372908808,
+        1.18041688638813,
+        -0.978684717829623,
+        -0.0237606272596611,
+    ];
+    const REF_INDEX_SD: f64 = 0.541508524819898;
+    const REF_BROOD_SD: f64 = 0.750027963921318;
+    const REF_LOCATION_SD: f64 = 0.52872140071578;
+    let (x, y, n, p, model, ids) = grouseticks_3crossed_inputs();
+    let f = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &ids,
+        &FitOptions {
+            target_indices: vec![0, 1, 2, 3],
+            ..FitOptions::default()
+        },
+    );
+
+    assert!(
+        f.converged(),
+        "3-crossed poisson GLMM must converge (not the degenerate start fit)"
+    );
+    // Bands are `validation/grid/tol.R`'s cross-engine ones (beta_rel/stddev_rel 1e-3),
+    // since every constant here is lme4's — mirrors grid/tol.R, change together.
+    // Measured worst against this reference: β 6.9e-5, RE stddev 2.2e-5. The
+    // 3e-2/5e-2 these replaced predate the grid/tol.R calibration and could not fail.
+    // β[3] (cHEIGHT, ~-0.024) took an absolute band while the others took a
+    // relative one; at 2.3e-6 relative it does not need the exception.
+    for (j, &rb) in REF_BETA.iter().enumerate() {
+        assert!(
+            (f.beta[j] - rb).abs() / rb.abs() < 1e-3,
+            "β[{j}] = {} vs lme4 {rb}",
+            f.beta[j]
+        );
+    }
+    // tau2 layout [primary(INDEX) | BROOD | LOCATION].
+    for (k, refsd) in [REF_INDEX_SD, REF_BROOD_SD, REF_LOCATION_SD]
+        .into_iter()
+        .enumerate()
+    {
+        let sd = f.tau2[k].sqrt();
+        assert!(
+            (sd - refsd).abs() / refsd < 1e-3,
+            "grouping {k} sd = {sd} vs lme4 {refsd}"
+        );
+    }
+}
+
+/// Both-paths cross-check: the sparse-S Laplace deviance equals
+/// the dense-Schur deviance at the same θ on the grouseticks 3-crossed design. If
+/// they disagree, exactly one factor path is wrong (the +0.5·logdet_llt convention
+/// is the prime suspect). Not bitwise-equal (AMD reorders the sparse elimination),
+/// so a tight numeric gate, orders below the ~1.5e-4 lme4 β gap we must preserve.
+#[test]
+fn sparse_schur_deviance_equals_dense_grouseticks() {
+    let (x, y, n, p, model, ids) = grouseticks_3crossed_inputs();
+    let (model, ids, _perm) = spec_sized_from_ids_pub(&model, &ids);
+    let slope_cols: Vec<usize> = vec![];
+    let mut ws = GlmmWorkspace::for_cluster_spec(p, &model, n, &slope_cols, 1);
+    // Column-major x + StructuredSchur, as fit_glmm does.
+    let mut xm = Mat::<f64>::zeros(n, p);
+    for i in 0..n {
+        for j in 0..p {
+            xm[(i, j)] = x[i * p + j];
+        }
+    }
+    ws.pattern.structured_schur = StructuredSchur::new(&ws.groupings, &ids.primary, &ids.extra, n);
+    // A representative interior θ (the blind start θ₀ for the 3 groupings) + a β
+    // (the GLM warm start, matching what `fit_glmm` would open PIRLS at).
+    let params: Vec<f64> = {
+        let mut prm = ws.params.clone();
+        let beta = glm_warm_start_beta(
+            model.family,
+            f64::NAN,
+            xm.as_ref().subrows(0, n),
+            &y,
+            n,
+            p,
+            None,
+        )
+        .0;
+        prm[ws.n_theta..ws.n_theta + p].copy_from_slice(&beta);
+        prm
+    };
+
+    ws.pattern.force_dense_schur = true;
+    let dev_dense = glmm_laplace_deviance(
+        &params,
+        &mut ws,
+        xm.as_ref().subrows(0, n),
+        &y,
+        &ids.primary,
+        &ids.extra,
+        n,
+    );
+    ws.pattern.force_dense_schur = false;
+    let dev_sparse = glmm_laplace_deviance(
+        &params,
+        &mut ws,
+        xm.as_ref().subrows(0, n),
+        &y,
+        &ids.primary,
+        &ids.extra,
+        n,
+    );
+
+    assert!(
+        dev_dense.is_finite() && dev_sparse.is_finite(),
+        "both deviances finite"
+    );
+    let rel = (dev_dense - dev_sparse).abs() / (1.0 + dev_dense.abs());
+    assert!(
+        rel < 1e-9,
+        "dense {dev_dense} vs sparse {dev_sparse} (rel {rel})"
+    );
+}
+
+/// SE cross-check: the structured_schur_fill SE (sparse solve) equals the dense-Schur
+/// SE at the converged fit (se.rs routes through structured_ainv_solve).
+/// Unlike `sparse_schur_deviance_equals_dense_grouseticks` (one eval at a fixed θ,
+/// gated at 1e-9), this runs the FULL BOBYQA optimization twice — dense and sparse
+/// factor paths disagree by ~1e-9 per eval (AMD reorders the sparse elimination), so
+/// each run's θ̂ drifts by a path-dependent amount within BOBYQA's `rho_end` trust
+/// region before the Wald SE nonlinearly amplifies it. Gated at 1e-4: orders above
+/// the observed ~6.6e-7 noise floor, still tight enough to catch a real convention
+/// bug (a flipped 0.5×/1.0× logdet would show as a gap orders of magnitude larger).
+#[test]
+fn sparse_schur_se_equals_dense_grouseticks() {
+    let (x, y, n, p, model, ids) = grouseticks_3crossed_inputs();
+    let (model, ids, _perm) = spec_sized_from_ids_pub(&model, &ids);
+    let slope_cols: Vec<usize> = vec![];
+    let mut xm = Mat::<f64>::zeros(n, p);
+    for i in 0..n {
+        for j in 0..p {
+            xm[(i, j)] = x[i * p + j];
+        }
+    }
+    let beta_start = glm_warm_start_beta(
+        model.family,
+        f64::NAN,
+        xm.as_ref().subrows(0, n),
+        &y,
+        n,
+        p,
+        None,
+    )
+    .0;
+
+    let run = |force_dense: bool| -> (Vec<f64>, bool) {
+        let mut ws = GlmmWorkspace::for_cluster_spec(p, &model, n, &slope_cols, 1);
+        ws.pattern.structured_schur = if ws.groupings.structured_extras_eligible() {
+            StructuredSchur::new(&ws.groupings, &ids.primary, &ids.extra, n)
+        } else {
+            None
+        };
+        ws.pattern.force_dense_schur = force_dense;
+        let fit = crate::glmm::fit_glmm(
+            &mut ws,
+            xm.as_ref().subrows(0, n),
+            &y,
+            &ids.primary,
+            &ids.extra,
+            &[0, 1, 2, 3],
+            None,
+            &beta_start,
+            n,
+            WaldSe::Rx,
+            ColumnScaling::IDENTITY,
+        );
+        (ws.inference.var_diag[..p].to_vec(), fit.converged)
+    };
+
+    let (var_dense, conv_dense) = run(true);
+    let (var_sparse, conv_sparse) = run(false);
+    assert!(
+        conv_dense && conv_sparse,
+        "both dense and sparse fits must converge"
+    );
+    for (j, (&vd, &vs)) in var_dense.iter().zip(&var_sparse).enumerate() {
+        assert!(
+            vd.is_finite() && vs.is_finite(),
+            "var_diag[{j}] finite (dense {vd}, sparse {vs})"
+        );
+        let rel = (vd - vs).abs() / (1.0 + vd.abs());
+        assert!(
+            rel < 1e-4,
+            "var_diag[{j}] dense {vd} vs sparse {vs} (rel {rel})"
+        );
+    }
+}
+
+/// Small-`e` guard (no regression on small-`e` GLMMs): a synthetic
+/// crossed binomial GLMM `y ~ x + (1|g1) + (1|g2)`, primary g1 = 4 levels,
+/// extra crossed g2 = 6 levels ⇒ e = 6 — orders below grouseticks' e = 181,
+/// the scale the other `sparse_schur_*_equals_dense_grouseticks` cross-checks
+/// exercise. Runs the full BOBYQA fit twice (dense-forced vs sparse,
+/// mirroring `sparse_schur_se_equals_dense_grouseticks`'s pattern) and
+/// compares both β and the Wald SE. Gated at 1e-7 (tighter than that e=181
+/// test's 1e-4): a 6-wide Schur gives AMD far less elimination-order
+/// freedom, so the dense/sparse per-eval float noise that drives BOBYQA
+/// path-dependent drift is negligible at this scale.
+#[test]
+fn sparse_schur_small_e_matches_dense() {
+    // 4-level primary × 6-level crossed extra, 2 obs/cell ⇒ e = 6, n = 48.
+    let (n_prim, n_extra, reps) = (4usize, 6usize, 2usize);
+    let n = n_prim * n_extra * reps;
+    let p = 2;
+    let prim_eff = [0.4, -0.3, 0.5, -0.2];
+    let extra_eff = [0.3, -0.4, 0.2, -0.1, 0.35, -0.25];
+    let mut xm = Mat::<f64>::zeros(n, p);
+    let mut y = vec![0.0f64; n];
+    let mut cl = vec![0u32; n];
+    let mut cr = vec![0u32; n];
+    let mut st = 42u64;
+    let mut i = 0;
+    for (pi, &pe) in prim_eff.iter().enumerate() {
+        for (ei, &ee) in extra_eff.iter().enumerate() {
+            for _ in 0..reps {
+                let cov = lcg(&mut st);
+                let eta = 0.2 + 0.6 * cov + pe + ee;
+                let prob = 1.0 / (1.0 + (-eta).exp());
+                let draw = (lcg(&mut st) + 1.0) / 2.0;
+                xm[(i, 0)] = 1.0;
+                xm[(i, 1)] = cov;
+                cl[i] = pi as u32;
+                cr[i] = ei as u32;
+                y[i] = if draw < prob { 1.0 } else { 0.0 };
+                i += 1;
+            }
+        }
+    }
+    let ids = GroupIds {
+        primary: cl,
+        extra: vec![cr],
+    };
+    let model = ModelSpec {
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_prim as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![Grouping {
+                relation: GroupingRelation::Crossed {
+                    n_clusters: n_extra as u32,
+                },
+                slopes: vec![],
+            }],
+        }),
+    };
+    let (model, ids, _perm) = spec_sized_from_ids_pub(&model, &ids);
+    let slope_cols: Vec<usize> = vec![];
+    let beta_start = glm_warm_start_beta(
+        model.family,
+        f64::NAN,
+        xm.as_ref().subrows(0, n),
+        &y,
+        n,
+        p,
+        None,
+    )
+    .0;
+
+    let run = |force_dense: bool| -> (Vec<f64>, Vec<f64>, bool) {
+        let mut ws = GlmmWorkspace::for_cluster_spec(p, &model, n, &slope_cols, 1);
+        ws.pattern.structured_schur = if ws.groupings.structured_extras_eligible() {
+            StructuredSchur::new(&ws.groupings, &ids.primary, &ids.extra, n)
+        } else {
+            None
+        };
+        ws.pattern.force_dense_schur = force_dense;
+        let fit = crate::glmm::fit_glmm(
+            &mut ws,
+            xm.as_ref().subrows(0, n),
+            &y,
+            &ids.primary,
+            &ids.extra,
+            &[0, 1],
+            None,
+            &beta_start,
+            n,
+            WaldSe::Rx,
+            ColumnScaling::IDENTITY,
+        );
+        (
+            ws.betas.clone(),
+            ws.inference.var_diag[..p].to_vec(),
+            fit.converged,
+        )
+    };
+
+    let (beta_dense, var_dense, conv_dense) = run(true);
+    let (beta_sparse, var_sparse, conv_sparse) = run(false);
+    assert!(
+        conv_dense && conv_sparse,
+        "both dense and sparse fits must converge"
+    );
+    for j in 0..p {
+        let rel_b = (beta_dense[j] - beta_sparse[j]).abs() / (1.0 + beta_dense[j].abs());
+        assert!(
+            rel_b < 1e-7,
+            "β[{j}] dense {} vs sparse {} (rel {rel_b})",
+            beta_dense[j],
+            beta_sparse[j]
+        );
+        let vd = var_dense[j];
+        let vs = var_sparse[j];
+        assert!(
+            vd.is_finite() && vs.is_finite(),
+            "var_diag[{j}] finite (dense {vd}, sparse {vs})"
+        );
+        let rel_v = (vd - vs).abs() / (1.0 + vd.abs());
+        assert!(
+            rel_v < 1e-7,
+            "var_diag[{j}] dense {vd} vs sparse {vs} (rel {rel_v})"
+        );
+    }
+}
+
+/// Adaptive GH quadrature, binomial GLMM: cbpp `cbind(incidence, size−incidence)
+/// ~ period + (1|herd)` (expanded 0/1) at nAGQ ∈ {7,11}, gated against frozen
+/// `glmer(nAGQ=k)` (`CBPP_AGQ_REFS`, from `validation/goldens/cbpp_agq_k{7,11}.json`).
+/// k>1 shifts β/varcomp off the Laplace fit as the Laplace bias is integrated
+/// out (herd sd 0.642→0.648); nAGQ=1 is `fit_glmm_cbpp_matches_lme4`. The oracle
+/// is sacred.
+///
+/// **β + varcomp only, deliberately.** The `cbpp_agq_k*` goldens *do* carry
+/// `se_hessian` (we agree with them to 6.0e-6 / 1.1e-5 / 1.4e-5 at k = 1/7/11),
+/// so this is a choice about what each test owns, not a gap in the reference:
+/// what k > 1 changes here is the integral, and β/varcomp are where that shows.
+/// The FD-Hessian SE machinery is gated at nAGQ = 1 by
+/// `fit_glmm_cbpp_matches_lme4` on this very fit, and at nAGQ = 7/11 by
+/// `fit_glmm_binomial_bigsd_agq_matches_lme4`.
+///
+/// AGQ does not leave the SE *convention* alone: `joint_hessian_cov` differentiates
+/// the deviance through `ws.nagq`, so at k > 1 it differences the AGQ deviance,
+/// not the Laplace one — the SE is a property of the quadrature order like
+/// everything else. What is true, measured
+/// 2026-07-30 across the FD-θ-step fix, is the *step rule*'s behaviour: the
+/// θ-profile of the AGQ deviance obeys the same O(h²) truncation law as the
+/// Laplace one, with the same constant. Dropping the `max(1, |θ̂|)` scaling
+/// divides the error by θ̂² to within 6% at nAGQ = 1 and 7 and 11 alike, over
+/// θ̂ ∈ [1.13, 5.16]. That is why one step rule serves every k, and why cbpp
+/// (herd sd 0.647, below the `max(1, ·)` floor) is bit-identical across that fix
+/// at all three orders.
+#[test]
+fn fit_glmm_binomial_agq_matches_lme4() {
+    let (x, y, cluster_ids, n) = cbpp_design();
+    let p = 4;
+    let model = cbpp_model();
+    for (nagq, refb, refsd) in CBPP_AGQ_REFS {
+        let f = fit_cold(
+            &x,
+            &y,
+            n,
+            p,
+            &model,
+            &GroupIds {
+                primary: cluster_ids.clone(),
+                extra: vec![],
+            },
+            &FitOptions {
+                target_indices: vec![0, 1, 2, 3],
+                nagq,
+                ..FitOptions::default()
+            },
+        );
+        assert!(f.converged(), "binomial AGQ k={nagq} must converge");
+        for (j, (&b, &rb)) in f.beta.iter().zip(&refb).enumerate() {
+            assert!(
+                (b - rb).abs() / rb.abs() < 1e-3,
+                "k={nagq} β[{j}] = {b} vs lme4 {rb}"
+            );
+        }
+        let sd_rel = (f.tau2[0].sqrt() - refsd).abs() / refsd;
+        assert!(
+            sd_rel < 1e-3,
+            "k={nagq} herd sd = {} vs lme4 {refsd}",
+            f.tau2[0].sqrt()
+        );
+    }
+}
+
+/// Aggregated-form cbpp (56 rows, y = incidence/size, weights = size) through the
+/// weighted AGQ path must reproduce the SAME frozen `glmer(nAGQ=k)` goldens as the
+/// expanded fixture above — the goldens were produced from aggregated cbpp on the
+/// R side, so they are reusable as-is; only the Rust encoding changes. This is the
+/// weighted-AGQ validation rung: it exercises `prior_w` flowing through the AGQ
+/// kernel's PIRLS mode and per-row dev_resid sums end-to-end at nAGQ ∈ {7,11}.
+/// The oracle is sacred.
+#[test]
+fn fit_glmm_cbpp_aggregated_agq_matches_lme4() {
+    let (x, y, w, cluster_ids, n) = cbpp_design_aggregated();
+    let p = 4;
+    let model = cbpp_model();
+    for (nagq, refb, refsd) in CBPP_AGQ_REFS {
+        let f = fit_cold(
+            &x,
+            &y,
+            n,
+            p,
+            &model,
+            &GroupIds {
+                primary: cluster_ids.clone(),
+                extra: vec![],
+            },
+            &FitOptions {
+                target_indices: vec![0, 1, 2, 3],
+                nagq,
+                weights: Some(w.clone()),
+                ..FitOptions::default()
+            },
+        );
+        assert!(
+            f.converged(),
+            "aggregated binomial AGQ k={nagq} must converge"
+        );
+        // The weighted design takes the gradient search, in every build.
+        assert!(
+            f.diagnostics.n_grad > 0,
+            "k={nagq}: aggregated cbpp takes the gradient search"
+        );
+        for (j, (&b, &rb)) in f.beta.iter().zip(&refb).enumerate() {
+            assert!(
+                (b - rb).abs() / rb.abs() < 1e-3,
+                "k={nagq} β[{j}] = {b} vs lme4 {rb}"
+            );
+        }
+        let sd_rel = (f.tau2[0].sqrt() - refsd).abs() / refsd;
+        assert!(
+            sd_rel < 1e-3,
+            "k={nagq} herd sd = {} vs lme4 {refsd}",
+            f.tau2[0].sqrt()
+        );
+    }
+}
+
+/// `FitOptions::parallel_inner` gates the AGQ cluster-outer restructuring
+/// (`agq::agq_deviance`'s `cluster_rows` path) but must never change the fitted
+/// result: cluster-outer and node-outer visit the same operands in the same
+/// per-accumulator order (`ClusterRowIndex`'s ascending-row guarantee), so a
+/// full cbpp AGQ fit through the stable `fit_cold` surface is bit-identical
+/// with the knob on vs off. Exact equality, not tolerance; this is the
+/// end-to-end witness for the same safety argument
+/// `agq_cluster_outer_bit_identical_to_node_outer` (glmm/tests.rs) checks at
+/// the kernel level. On both outer searches: the Bernoulli rows (842 rows,
+/// about 56 per herd) keep the joint BOBYQA search, and the aggregated rows
+/// (56 rows weighted by the trial counts) search with BFGS on the exact AGQ
+/// gradient.
+/// Compiled only with `parallel`: in a serial build the knob is never read on scalar AGQ
+/// (`par_index` in `glmm::fit_glmm`, `use_par` in `se.rs`), so both arms would run
+/// the same code.
+#[cfg(feature = "parallel")]
+#[test]
+fn fit_glmm_binomial_agq_parallel_inner_knob_is_bit_identical() {
+    let (x, y, cluster_ids, n) = cbpp_design();
+    let (xa, ya, wa, ids_a, na) = cbpp_design_aggregated();
+    let designs = [
+        (x, y, None, cluster_ids, n, false),
+        (xa, ya, Some(wa), ids_a, na, true),
+    ];
+    let p = 4;
+    let model = cbpp_model();
+    for (x, y, weights, cluster_ids, n, bfgs) in &designs {
+        let n = *n;
+        for nagq in [7u8, 11] {
+            let ids = GroupIds {
+                primary: cluster_ids.clone(),
+                extra: vec![],
+            };
+            let f_on = fit_cold(
+                x,
+                y,
+                n,
+                p,
+                &model,
+                &ids,
+                &FitOptions {
+                    target_indices: vec![0, 1, 2, 3],
+                    nagq,
+                    parallel_inner: true,
+                    weights: weights.clone(),
+                    ..FitOptions::default()
+                },
+            );
+            let f_off = fit_cold(
+                x,
+                y,
+                n,
+                p,
+                &model,
+                &ids,
+                &FitOptions {
+                    target_indices: vec![0, 1, 2, 3],
+                    nagq,
+                    parallel_inner: false,
+                    weights: weights.clone(),
+                    ..FitOptions::default()
+                },
+            );
+            assert!(f_on.converged() && f_off.converged(), "nagq={nagq}");
+            // The search each design takes, the same way with the knob on and off.
+            assert_eq!(
+                f_on.diagnostics.n_grad > 0,
+                *bfgs,
+                "nagq={nagq} n={n}: gradient search"
+            );
+            assert_eq!(
+                (f_on.n_eval, f_on.diagnostics.n_grad),
+                (f_off.n_eval, f_off.diagnostics.n_grad),
+                "nagq={nagq}: n_eval / n_grad"
+            );
+            for (j, (&b_on, &b_off)) in f_on.beta.iter().zip(&f_off.beta).enumerate() {
+                assert_eq!(
+                    b_on.to_bits(),
+                    b_off.to_bits(),
+                    "nagq={nagq} β[{j}]: on={b_on} off={b_off}"
+                );
+            }
+            for (j, (&s_on, &s_off)) in f_on.se.iter().zip(&f_off.se).enumerate() {
+                assert_eq!(
+                    s_on.to_bits(),
+                    s_off.to_bits(),
+                    "nagq={nagq} se[{j}]: on={s_on} off={s_off}"
+                );
+            }
+            for (j, (&t_on, &t_off)) in f_on.tau2.iter().zip(&f_off.tau2).enumerate() {
+                assert_eq!(
+                    t_on.to_bits(),
+                    t_off.to_bits(),
+                    "nagq={nagq} tau2[{j}]: on={t_on} off={t_off}"
+                );
+            }
+        }
+    }
+}
+
+/// Adaptive GH quadrature, Poisson GLMM: grouseticks single-grouping `TICKS ~
+/// YEAR + cHEIGHT + (1|INDEX)` at nAGQ ∈ {7,11}, gated against frozen
+/// `glmer(family=poisson, nAGQ=k)`. The constants are copied from
+/// `validation/goldens/grouseticks_agq_k{7,11}.json` (lme4 1.1.38, tolPwrss =
+/// 1e-13; `.estimates.beta` and the INDEX `stddev`). nAGQ=1 is
+/// `fit_glmm_poisson_grouseticks_matches_lme4`; k>1 shifts the fit as the
+/// Laplace bias is integrated out. β + varcomp only. The oracle is sacred.
+#[test]
+fn fit_glmm_poisson_agq_matches_lme4() {
+    let refs: [(u8, [f64; 4], f64); 2] = [
+        (
+            7,
+            [
+                0.443736811221243,
+                1.09735630107532,
+                -0.98881903638614,
+                -0.023684480509413,
+            ],
+            1.13482765211698,
+        ),
+        (
+            11,
+            [
+                0.444126051874934,
+                1.09717726828254,
+                -0.988923824923937,
+                -0.0236832889066984,
+            ],
+            1.13407686485781,
+        ),
+    ];
+    let csv = include_str!("../../validation/data/empirical/grouseticks.csv");
+    let p = 4;
+    let mut x = Vec::<f64>::new();
+    let mut y = Vec::<f64>::new();
+    let mut raw = Vec::<u32>::new();
+    for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+        let f: Vec<&str> = line.split(',').map(|s| s.trim_matches('"')).collect();
+        raw.push(f[0].parse().unwrap());
+        let year: u32 = f[4].parse().unwrap();
+        x.extend_from_slice(&[
+            1.0,
+            f64::from(u32::from(year == 96)),
+            f64::from(u32::from(year == 97)),
+            f[6].parse().unwrap(),
+        ]);
+        y.push(f[1].parse().unwrap());
+    }
+    let (cluster_ids, n_clusters) = dense_ids(&raw);
+    let n = y.len();
+    for (nagq, refb, refsd) in refs {
+        let model = ModelSpec {
+            family: Family::Poisson {
+                link: crate::PoissonLink::Log,
+            },
+            re: Some(ReStructure {
+                sizing: Sizing::FixedClusters {
+                    n_clusters: n_clusters as u32,
+                },
+                slopes: vec![],
+                extra_groupings: vec![],
+            }),
+        };
+        let f = fit_cold(
+            &x,
+            &y,
+            n,
+            p,
+            &model,
+            &GroupIds {
+                primary: cluster_ids.clone(),
+                extra: vec![],
+            },
+            &FitOptions {
+                target_indices: vec![0, 1, 2, 3],
+                nagq,
+                ..FitOptions::default()
+            },
+        );
+        assert!(f.converged(), "poisson AGQ k={nagq} must converge");
+        for (j, (&b, &rb)) in f.beta.iter().zip(&refb).enumerate() {
+            assert!(
+                (b - rb).abs() / rb.abs() < 1e-3,
+                "k={nagq} β[{j}] = {b} vs lme4 {rb}"
+            );
+        }
+        let sd_rel = (f.tau2[0].sqrt() - refsd).abs() / refsd;
+        assert!(
+            sd_rel < 1e-3,
+            "k={nagq} INDEX sd = {} vs lme4 {refsd}",
+            f.tau2[0].sqrt()
+        );
+    }
+}
+
+/// Probit binomial GLMM `cbind(incidence, size−incidence) ~ period + (1|herd)`
+/// on cbpp (expanded 0/1), gated against frozen `glmmTMB(binomial("probit"))`
+/// (`validation/goldens/cbpp_probit_glmm_tmb.json`). glmmTMB, not lme4: on a
+/// non-canonical link lme4 builds its Laplace log-determinant from the expected
+/// (Fisher) weight, a different objective from the Laplace approximation glmm and
+/// glmmTMB maximise. The oracle is sacred.
+// FD-Hessian SE (use.hessian=TRUE) for this non-canonical link needs a
+// smooth deviance: PIRLS at a 1e-6 tolerance left the deviance noisy to ~1e-4
+// and the FD second differences amplified it into a 7–41%-wrong SE. `pirls_tol`
+// gives non-canonical links the tight `PIRLS_TOL_REL_NONCANON` (1e-8). (The Φ accuracy — `phi_hp`, Cody erfc —
+// is a separate genuine fix but was NOT the SE cause; verified by spike.)
+#[test]
+fn fit_glmm_probit_cbpp_matches_glmmtmb() {
+    const REF_BETA: [f64; 4] = [
+        -0.831849997522622,
+        -0.526596296838326,
+        -0.615071573251887,
+        -0.797944216833122,
+    ];
+    const REF_SE: [f64; 4] = [
+        0.125983789890752,
+        0.160252153085173,
+        0.169140881188126,
+        0.20443134801754,
+    ];
+    const REF_HERD_SD: f64 = 0.338634475943338;
+    let csv = include_str!("../../validation/data/empirical/cbpp.csv");
+    let p = 4;
+    let mut x = Vec::<f64>::new();
+    let mut y = Vec::<f64>::new();
+    let mut cluster_ids = Vec::<u32>::new();
+    for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+        let f: Vec<&str> = line.split(',').map(|s| s.trim_matches('"')).collect();
+        let herd: u32 = f[0].parse::<u32>().unwrap() - 1;
+        let incidence: u32 = f[1].parse().unwrap();
+        let size: u32 = f[2].parse().unwrap();
+        let period: u32 = f[3].parse().unwrap();
+        let row = [
+            1.0,
+            f64::from(u32::from(period == 2)),
+            f64::from(u32::from(period == 3)),
+            f64::from(u32::from(period == 4)),
+        ];
+        for k in 0..size {
+            x.extend_from_slice(&row);
+            y.push(if k < incidence { 1.0 } else { 0.0 });
+            cluster_ids.push(herd);
+        }
+    }
+    let n = y.len();
+    let model = ModelSpec {
+        family: Family::Binomial {
+            link: BinomialLink::Probit,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 15 },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let f = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &GroupIds {
+            primary: cluster_ids.clone(),
+            extra: vec![],
+        },
+        &FitOptions {
+            target_indices: vec![0, 1, 2, 3],
+            ..FitOptions::default()
+        },
+    );
+    assert!(f.converged(), "probit GLMM must converge");
+    let sd_rel = (f.tau2[0].sqrt() - REF_HERD_SD).abs() / REF_HERD_SD;
+    assert!(
+        sd_rel < 1e-3,
+        "herd sd = {} vs glmmTMB {REF_HERD_SD}",
+        f.tau2[0].sqrt()
+    );
+    // Bands are `validation/grid/tol.R`'s beta_rel and se_hessian_rel.
+    for ((&b, &rb), (&s, &rs)) in f.beta.iter().zip(&REF_BETA).zip(f.se.iter().zip(&REF_SE)) {
+        assert!((b - rb).abs() / rb.abs() < 1e-3, "β = {b} vs glmmTMB {rb}");
+        assert!((s - rs).abs() / rs < 1e-3, "se = {s} vs glmmTMB {rs}");
+    }
+}
+
+/// Cloglog binomial GLMM `y ~ 1 + x1 + x2 + x3 + z + (1 | g)` on the 9,600-row
+/// `sim_probit_large` fixture, gated against frozen `glmmTMB(binomial("cloglog"))`
+/// (`validation/goldens/sim_cloglog_glmm_tmb.json`); not lme4, whose Fisher-weight
+/// Laplace log-determinant is a different objective on this non-canonical link
+/// (see `fit_glmm_probit_cbpp_matches_glmmtmb`). This arm needs no
+/// kernel change: `build_workspace`'s `(family, Some(re))` branch
+/// already catch-alls to the dense GLMM route and PIRLS reaches the link
+/// through `family_pass`. The oracle is sacred.
+#[test]
+fn fit_glmm_cloglog_matches_glmmtmb() {
+    const REF_BETA: [f64; 5] = [
+        0.0662955661130354,
+        0.521187897642843,
+        -0.431703232209686,
+        0.258828881024461,
+        -0.629664238243628,
+    ];
+    const REF_SE: [f64; 5] = [
+        0.0770044566344616,
+        0.0173961290728937,
+        0.0169053816801012,
+        0.0162529730284555,
+        0.0324729691134767,
+    ];
+    const REF_STDDEV: f64 = 0.737196418029706;
+    const REF_LOGLIK: f64 = -4924.14694920773;
+    let csv = include_str!("../../validation/data/simulated/sim_probit_large.csv");
+    let p = 5; // [intercept, x1, x2, x3, z]
+    let mut x = Vec::<f64>::new();
+    let mut y = Vec::<f64>::new();
+    let mut raw_g = Vec::<String>::new();
+    for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+        let f: Vec<&str> = line.split(',').map(|s| s.trim_matches('"')).collect();
+        y.push(f[0].parse().unwrap());
+        x.extend_from_slice(&[
+            1.0,
+            f[1].parse().unwrap(),
+            f[2].parse().unwrap(),
+            f[3].parse().unwrap(),
+            f[4].parse().unwrap(),
+        ]);
+        raw_g.push(f[5].to_string());
+    }
+    let n = y.len();
+    let (cluster_ids, n_clusters) = dense_str(&raw_g);
+    let model = ModelSpec {
+        family: Family::Binomial {
+            link: BinomialLink::Cloglog,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let f = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &GroupIds {
+            primary: cluster_ids,
+            extra: vec![],
+        },
+        &FitOptions {
+            target_indices: vec![0, 1, 2, 3, 4],
+            ..FitOptions::default()
+        },
+    );
+    assert!(f.converged(), "cloglog GLMM must converge");
+    // SE band is `validation/grid/tol.R`'s se_hessian_rel; measured worst 6.9e-6.
+    for ((&b, &rb), (&s, &rs)) in f.beta.iter().zip(&REF_BETA).zip(f.se.iter().zip(&REF_SE)) {
+        assert!((b - rb).abs() / rb.abs() < 1e-3, "β = {b} vs glmmTMB {rb}");
+        assert!((s - rs).abs() / rs < 1e-3, "se = {s} vs glmmTMB {rs}");
+    }
+    let (sd, _corr) = f.stddev_corr(0);
+    assert!(
+        (sd[0] - REF_STDDEV).abs() / REF_STDDEV < 1e-3,
+        "g sd = {} vs glmmTMB {REF_STDDEV}",
+        sd[0]
+    );
+    assert!(
+        (f.loglik - REF_LOGLIK).abs() < 1e-3,
+        "loglik {} vs glmmTMB {REF_LOGLIK}",
+        f.loglik
+    );
+}
+
+/// Gamma INVERSE-link GLMM `y ~ 1 + x + grp + (1|cluster)` on sim_gamma, gated
+/// against frozen `glmmTMB(family=Gamma("inverse"))`
+/// (`validation/goldens/sim_gamma_inv_glmm_tmb.json`). Same data and formula as
+/// the log-link test below — only the link differs, which is what makes it a
+/// controlled pair. glmmTMB, not lme4: lme4 fits the Gamma scale at its
+/// `pwrss/n` plug-in instead of maximising over it, so its optimum is a
+/// different one (the lme4 golden's differences are registered divergences
+/// in the oracle tier).
+///
+/// Regression guard for the FD-Hessian seeding bug: `joint_hessian_cov` reuses
+/// the random-effect mode û(γ̂) the fit already converged to, rather than
+/// re-deriving it by a COLD PIRLS solve. Where the mode problem has more
+/// than one basin a cold solve can land in a different one, and the inverse link is
+/// where that shows: the fit reaches deviance 936.7683 while a cold re-eval at the
+/// same γ̂ returns 1034.5678. Finite differences that straddle the two
+/// branches leave the joint Hessian indefinite, the RX fallback's Schur
+/// indefinite at the same wrong mode, and the whole fit reported failed for
+/// want of a standard error — `converged` false and every estimate NaN.
+///
+/// So `converged` is the assertion that would have caught it, and `loglik` is the
+/// one that keeps catching it: landing on the wrong branch moves the
+/// log-likelihood by ~49, which no band here tolerates. (The deviances quoted
+/// above are from lme4's plug-in-φ objective, where the bug was found.) Bands
+/// are `validation/grid/tol.R`'s cross-engine ones throughout — every constant
+/// below is glmmTMB's.
+#[test]
+fn fit_glmm_gamma_inverse_link_matches_glmmtmb() {
+    const REF_BETA: [f64; 3] = [0.721700542956067, -0.188682569908478, -0.14162326969197];
+    const REF_SE: [f64; 3] = [0.0684969110376061, 0.0181627076440977, 0.0351886329651889];
+    const REF_CLUSTER_SD: f64 = 0.263998505871569;
+    // glmmTMB's sigma()², the ML φ̂ — the same estimator as Fit::dispersion.
+    const REF_DISP: f64 = 0.599211259803431;
+    const REF_LOGLIK: f64 = -471.446978734087;
+
+    let (x, y, cluster_ids, n_clusters) = sim_clustered(include_str!(
+        "../../validation/data/simulated/sim_gamma.csv"
+    ));
+    let (n, p) = (y.len(), 3);
+    let model = ModelSpec {
+        family: Family::Gamma {
+            link: crate::GammaLink::Inverse,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    // Default `WaldSe::Hessian` deliberately — the Rx arm never touches
+    // `joint_hessian_cov` and stayed green all through the bug.
+    let f = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &GroupIds {
+            primary: cluster_ids,
+            extra: vec![],
+        },
+        &FitOptions {
+            target_indices: vec![0, 1, 2],
+            ..FitOptions::default()
+        },
+    );
+
+    assert!(
+        f.converged(),
+        "gamma-inverse GLMM must converge (the FD-Hessian must anchor on the fit's own mode)"
+    );
+    for j in 0..p {
+        assert!(
+            (f.beta[j] - REF_BETA[j]).abs() / REF_BETA[j].abs() < 1e-3,
+            "β[{j}] = {} vs glmmTMB {}",
+            f.beta[j],
+            REF_BETA[j]
+        );
+        assert!(
+            (f.se[j] - REF_SE[j]).abs() / REF_SE[j] < 1e-3,
+            "se_hessian[{j}] = {} vs glmmTMB {}",
+            f.se[j],
+            REF_SE[j]
+        );
+    }
+    let (sd, _corr) = f.stddev_corr(0);
+    assert!(
+        (sd[0] - REF_CLUSTER_SD).abs() / REF_CLUSTER_SD < 1e-3,
+        "cluster sd = {} vs glmmTMB {REF_CLUSTER_SD}",
+        sd[0]
+    );
+    assert!(
+        (f.dispersion - REF_DISP).abs() / REF_DISP < 1e-3,
+        "φ̂ = {} vs glmmTMB {REF_DISP}",
+        f.dispersion
+    );
+    // The branch check: the discarded mode sat ~98 deviance units above this one,
+    // so a wrong-basin fit misses here by ~49 even if it manages to report SEs.
+    assert!(
+        (f.loglik - REF_LOGLIK).abs() < 1e-3,
+        "loglik {} vs glmmTMB {REF_LOGLIK}",
+        f.loglik
+    );
+}
+
+/// The mixed-Gamma dispersion is a maximum-likelihood parameter of the Laplace
+/// objective, not a moment estimate. Writing the objective as
+/// `D(û)/φ + ‖û‖² + log|A| + G(ln φ)` (`G` = `family::gamma_dispersion_term`)
+/// and differentiating in `ψ = ln φ` at the scaled coordinates
+/// `θ/√φ`, where `log|A|` does not move with φ, the stationarity condition is
+/// `G'(ψ̂) = D(û)/φ̂ + ‖û‖²` — the Gamma shape equation with the deviance
+/// replaced by the penalized deviance. `Fit::dispersion` must satisfy it at
+/// the reported optimum, on both links. For `(1 | cluster)`, `b̂ = θ̂·û`, so
+/// `‖û‖² = Σ b̂²/θ̂²` reads off `ranef` and the stddev. Band 1e-4 relative: the
+/// outer search's own stopping accuracy on the `ln φ` coordinate.
+#[test]
+fn fit_glmm_gamma_dispersion_is_the_laplace_ml_value() {
+    let (x, y, cluster_ids, n_clusters) = sim_clustered(include_str!(
+        "../../validation/data/simulated/sim_gamma.csv"
+    ));
+    let (n, p) = (y.len(), 3);
+    for link in [crate::GammaLink::Inverse, crate::GammaLink::Log] {
+        let family = Family::Gamma { link };
+        let model = ModelSpec {
+            family,
+            re: Some(ReStructure {
+                sizing: Sizing::FixedClusters {
+                    n_clusters: n_clusters as u32,
+                },
+                slopes: vec![],
+                extra_groupings: vec![],
+            }),
+        };
+        let f = fit_cold(
+            &x,
+            &y,
+            n,
+            p,
+            &model,
+            &GroupIds {
+                primary: cluster_ids.clone(),
+                extra: vec![],
+            },
+            &FitOptions {
+                target_indices: vec![0, 1, 2],
+                ..FitOptions::default()
+            },
+        );
+        assert!(f.converged(), "{link:?}: gamma GLMM must converge");
+        let phi = f.dispersion;
+        let dev: f64 = (0..n)
+            .map(|i| crate::family::dev_resid(family, f64::NAN, y[i], f.fitted[i]))
+            .sum();
+        let (sd, _) = f.stddev_corr(0);
+        let pen: f64 = f.ranef.iter().map(|b| (b / sd[0]) * (b / sd[0])).sum();
+        let lhs = crate::family::gamma_dispersion_term_d1(phi.ln(), None, n);
+        let rhs = dev / phi + pen;
+        assert!(
+            (lhs - rhs).abs() <= 1e-4 * rhs,
+            "{link:?}: G'(ln φ̂) = {lhs} vs D/φ̂ + ‖û‖² = {rhs} at φ̂ = {phi}"
+        );
+    }
+}
+
+/// Gamma log-link GLMM `y ~ 1 + x + grp + (1|cluster)` on sim_gamma, gated
+/// against the accuracy grid's glmmTMB record for cell `sim_gamma`:
+/// `validation/grid/runs/glmmtmb/last/results.jsonl`
+/// (the same fit as `validation/goldens/sim_gamma_glmm_tmb.json`).
+///
+/// WHY glmmTMB. glmm and glmmTMB maximise the same objective on this cell: the
+/// Laplace approximation to the marginal likelihood, with φ a free parameter
+/// estimated by maximum likelihood. lme4's `glmer` reports a lower deviance here
+/// (890.347 against 899.030), but that is a different function of the
+/// parameters — it builds the log-determinant from the expected (Fisher) weight
+/// and fits at its `pwrss/n` plug-in scale — so it is not a nearer approach to
+/// this maximum, and its record is not this test's reference.
+///
+/// CONVENTIONS. The grid records the random-effect SD on the linear-predictor
+/// scale, which is what `stddev_corr` reports, and `sigma` as glmmTMB's
+/// `sigma()`, whose square is the ML φ̂ that `Fit::dispersion` reports.
+///
+/// The Rx arm (`WaldSe::Rx`, `φ̂·RX⁻¹` at the fit) has no engine that reports
+/// the same quantity — lme4's `se_rx` uses its plug-in scale and glmmTMB reports
+/// none — so it is a pin of glmm's own values instead (see `assert_pinned`).
+#[test]
+fn fit_glmm_gamma_sim_matches_grid_reference() {
+    const REF_BETA: [f64; 3] = [0.33284091591326603, 0.5785178005933063, 0.45738530573369457];
+    const REF_SE: [f64; 3] = [
+        0.13089418981150855,
+        0.04406172234648068,
+        0.09101547652249918,
+    ];
+    const REF_CLUSTER_SD: f64 = 0.5679235972515383;
+    const REF_SIGMA: f64 = 0.7342053645641091; // glmmTMB sigma(); φ̂ = sigma²
+    let (x, y, cluster_ids, n_clusters) = sim_clustered(include_str!(
+        "../../validation/data/simulated/sim_gamma.csv"
+    ));
+    let (n, p) = (y.len(), 3);
+    let model = ModelSpec {
+        family: Family::Gamma {
+            link: crate::GammaLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let f = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &GroupIds {
+            primary: cluster_ids.clone(),
+            extra: vec![],
+        },
+        &FitOptions {
+            target_indices: vec![0, 1, 2],
+            ..FitOptions::default()
+        },
+    );
+    assert!(f.converged(), "gamma GLMM must converge");
+    for j in 0..p {
+        assert!(
+            (f.beta[j] - REF_BETA[j]).abs() / REF_BETA[j].abs() < 1e-3,
+            "β[{j}] = {} vs the grid reference {}",
+            f.beta[j],
+            REF_BETA[j]
+        );
+        let se_rel = (f.se[j] - REF_SE[j]).abs() / REF_SE[j];
+        // `validation/grid/tol.R`'s se_hessian_rel.
+        assert!(
+            se_rel < 1e-3,
+            "se[{j}] = {} vs the grid reference {}",
+            f.se[j],
+            REF_SE[j]
+        );
+    }
+    // Via stddev_corr — the SD on the linear-predictor scale, the grid's
+    // `stddev` convention.
+    let (sd, _corr) = f.stddev_corr(0);
+    let sd_rel = (sd[0] - REF_CLUSTER_SD).abs() / REF_CLUSTER_SD;
+    assert!(
+        sd_rel < 1e-3,
+        "cluster sd (stddev_corr) = {} vs the grid reference {REF_CLUSTER_SD}",
+        sd[0]
+    );
+    assert!(
+        (sd[0] - f.tau2[0].sqrt()).abs() < 1e-12,
+        "stddev_corr and tau2 must report the same sd"
+    );
+    let phi_ref = REF_SIGMA * REF_SIGMA;
+    assert!(
+        (f.dispersion - phi_ref).abs() / phi_ref < 1e-3,
+        "φ̂ = {} vs the grid reference sigma² {phi_ref}",
+        f.dispersion
+    );
+    // The maximised Laplace log-likelihood, Σ log f in full: glmmTMB's logLik.
+    const REF_LOGLIK: f64 = -449.5149682651691;
+    assert!(
+        (f.loglik - REF_LOGLIK).abs() < 1e-4,
+        "loglik {} vs the grid reference {REF_LOGLIK}",
+        f.loglik
+    );
+    assert_eq!(f.df, 5); // 3 β + cluster θ + φ
+
+    // Rx arm on the same design, pinned to glmm's own values (see the doc
+    // comment): x86_64 anchor, frozen 2026-09-26, PIRLS taking the Newton step
+    // and exiting at `PIRLS_TOL_REL_NONCANON`. Re-pinned 2026-09-26: the no-RE
+    // GLM fit that seeds this fit stops on R's relative deviance rule
+    // (`glm::DEVIANCE_TOL`), which moves the cold start. se_rx moves 1.1e-7
+    // relative at most (se_rx[2]); logLik rises by 3.8e-11 to
+    // −449.5149682645562. Re-pinned 2026-09-28: the joint search steps β in
+    // whitened coordinates (`glmm::workspace::BetaScale`), which moves where it stops
+    // inside `GLMM_RHO_END`. se_rx moves 2.6e-7 relative at most (se_rx[0]);
+    // logLik moves by −5.6e-11 to −449.5149682646123.
+    // Re-pinned 2026-10-02 with the per-search BOBYQA start radii (this fit's
+    // blind-start search at `GLMM_RHO_BEGIN` = 0.2): the search takes another
+    // path to the same optimum. se_rx moves 2.1e-7 relative at most (se_rx[0]);
+    // logLik moves by +5.5e-11 to −449.5149682645574 (deviance 1.1e-10 lower);
+    // no converged, singular or pinned flag changed.
+    // Re-pinned 2026-10-03: the Gamma GLMM searches θ and ln φ with β profiled
+    // out exactly (`OuterSearch::ExactProfile`) instead of the joint search.
+    // se_rx moves 1.7e-7 relative at most (se_rx[0]); logLik moves by +4.2e-12
+    // to −449.5149682645532; no converged, singular or pinned flag changed.
+    const REF_SE_RX_PIN: [f64; 3] = [
+        0.13079284270390126,
+        0.044091161147547984,
+        0.09107233265969109,
+    ];
+    let f_rx = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &GroupIds {
+            primary: cluster_ids,
+            extra: vec![],
+        },
+        &FitOptions {
+            target_indices: vec![0, 1, 2],
+            wald_se: WaldSe::Rx,
+            ..FitOptions::default()
+        },
+    );
+    assert!(f_rx.converged(), "gamma GLMM (Rx) must converge");
+    assert_pinned(&f_rx.se, &REF_SE_RX_PIN, 1e-7, "sim_gamma pinned se_rx");
+}
+
+/// A random slope on a column far from zero, dense Gamma: `sim_gamma`
+/// with a random slope on column 1, fitted on `x` and on `x + 1000`. Before the
+/// design was standardized internally, the shifted design took about 3300
+/// evaluations, the random intercept and slope being nearly collinear on it.
+/// Now both designs reach the search as the same centered column. Measured on
+/// dell-fedora (2026-10-01): 122 evaluations on both, logLik equal to 2e-13.
+/// Eval counts move with every search change, so the assertion is the loose
+/// ratio, not the count.
+#[test]
+fn fit_glmm_gamma_slope_on_a_shifted_column_costs_no_more_evals() {
+    let (x, y, cluster_ids, n_clusters) = sim_clustered(include_str!(
+        "../../validation/data/simulated/sim_gamma.csv"
+    ));
+    let (n, p) = (y.len(), 3);
+    let model = ModelSpec {
+        family: Family::Gamma {
+            link: crate::GammaLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters as u32,
+            },
+            slopes: vec![1],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: cluster_ids,
+        extra: vec![],
+    };
+    let opts = FitOptions {
+        target_indices: vec![0, 1, 2],
+        ..FitOptions::default()
+    };
+    let base = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    let mut xs = x.clone();
+    for row in xs.chunks_exact_mut(p) {
+        row[1] += 1000.0;
+    }
+    let f = fit_cold(&xs, &y, n, p, &model, &ids, &opts);
+    eprintln!(
+        "GAMMA_SLOPE_EVALS unshifted {} shifted {} | loglik {} vs {}",
+        base.n_eval, f.n_eval, base.loglik, f.loglik
+    );
+    assert!(base.converged() && f.converged());
+    assert!(
+        f.n_eval < 2 * base.n_eval,
+        "shifted {} evals vs unshifted {}",
+        f.n_eval,
+        base.n_eval
+    );
+}
+
+/// The `dispersion: Some(v)` directive on the GLMM route: the fit runs at the
+/// held φ, which is reported instead of the ML estimate, and φ stops costing a
+/// degree of freedom, so `df` drops to 3 β + 1 θ. Same `sim_gamma` design as
+/// `fit_glmm_gamma_sim_matches_grid_reference`, whose estimate-φ `df` is 5.
+#[test]
+fn fit_glmm_gamma_fixed_dispersion_is_reported_and_costs_no_df() {
+    let (x, y, cluster_ids, n_clusters) = sim_clustered(include_str!(
+        "../../validation/data/simulated/sim_gamma.csv"
+    ));
+    let (n, p) = (y.len(), 3);
+    let model = ModelSpec {
+        family: Family::Gamma {
+            link: crate::GammaLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: cluster_ids,
+        extra: vec![],
+    };
+    const PHI: f64 = 0.75;
+    let held = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &ids,
+        &FitOptions {
+            target_indices: vec![0, 1, 2],
+            dispersion: Some(PHI),
+            ..FitOptions::default()
+        },
+    );
+    let free = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &ids,
+        &FitOptions {
+            target_indices: vec![0, 1, 2],
+            ..FitOptions::default()
+        },
+    );
+    assert!(
+        held.converged() && free.converged(),
+        "gamma GLMM must converge"
+    );
+    assert_eq!(held.dispersion, PHI, "held φ must be reported verbatim");
+    assert!(
+        (free.dispersion - PHI).abs() > 1e-3,
+        "the held value must differ from the estimate {} or this proves nothing",
+        free.dispersion
+    );
+    assert_eq!(free.df, 5); // 3 β + cluster θ + φ
+    assert_eq!(held.df, free.df - 1, "a held φ costs no degree of freedom");
+    // The fit itself runs at the held φ, not at φ̂: holding a φ other than φ̂
+    // moves the optimum and lowers the maximised log-likelihood, and holding
+    // φ̂ itself reproduces the free fit.
+    assert!(
+        held.loglik < free.loglik - 1e-3,
+        "held-φ loglik {} must sit below the free maximum {}",
+        held.loglik,
+        free.loglik
+    );
+    assert!(
+        (held.beta[0] - free.beta[0]).abs() > 1e-4 || (held.tau2[0] - free.tau2[0]).abs() > 1e-4,
+        "a held φ ≠ φ̂ must move (β, θ): β₀ {} vs {}, τ² {} vs {}",
+        held.beta[0],
+        free.beta[0],
+        held.tau2[0],
+        free.tau2[0]
+    );
+    let at_hat = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &ids,
+        &FitOptions {
+            target_indices: vec![0, 1, 2],
+            dispersion: Some(free.dispersion),
+            ..FitOptions::default()
+        },
+    );
+    assert!(at_hat.converged());
+    assert!(
+        (at_hat.loglik - free.loglik).abs() < 1e-6 * free.loglik.abs(),
+        "holding φ̂ reproduces the free loglik: {} vs {}",
+        at_hat.loglik,
+        free.loglik
+    );
+    for j in 0..p {
+        assert!(
+            (at_hat.beta[j] - free.beta[j]).abs() < 1e-4 * (1.0 + free.beta[j].abs()),
+            "holding φ̂ reproduces β[{j}]: {} vs {}",
+            at_hat.beta[j],
+            free.beta[j]
+        );
+    }
+}
+
+/// `WaldSe::Hessian` and `WaldSe::Rx` must report the same fitted point on
+/// `sim_gamma`: `joint_hessian_cov`'s tail re-eval keeps `ws.pirls.prob` and `ws.pirls.u`
+/// at the same pinned re-eval mode, so Gamma's σ̂² (`family::glmm_sigma_sq`)
+/// is built from a matched pair — leaving `ws.pirls.prob` at its own re-solve while
+/// `ws.pirls.u` is put back to the pinned mode would mismatch them.
+/// `tau2`/`varcorr`/`dispersion` derive from that σ̂², and `fitted` IS `ws.pirls.prob`.
+#[test]
+fn fit_glmm_gamma_hessian_rx_agree_on_fitted() {
+    let (x, y, cluster_ids, n_clusters) = sim_clustered(include_str!(
+        "../../validation/data/simulated/sim_gamma.csv"
+    ));
+    let (n, p) = (y.len(), 3);
+    let model = ModelSpec {
+        family: Family::Gamma {
+            link: crate::GammaLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: cluster_ids,
+        extra: vec![],
+    };
+    let f_hess = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &ids,
+        &FitOptions {
+            target_indices: vec![0, 1, 2],
+            wald_se: WaldSe::Hessian,
+            ..FitOptions::default()
+        },
+    );
+    let f_rx = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &ids,
+        &FitOptions {
+            target_indices: vec![0, 1, 2],
+            wald_se: WaldSe::Rx,
+            ..FitOptions::default()
+        },
+    );
+    assert!(f_hess.converged() && f_rx.converged());
+    assert_eq!(
+        f_hess.tau2[0].to_bits(),
+        f_rx.tau2[0].to_bits(),
+        "tau2[0]: {} vs {}",
+        f_hess.tau2[0],
+        f_rx.tau2[0]
+    );
+    assert_eq!(
+        f_hess.varcorr[0][0].to_bits(),
+        f_rx.varcorr[0][0].to_bits(),
+        "varcorr[0][0]: {} vs {}",
+        f_hess.varcorr[0][0],
+        f_rx.varcorr[0][0]
+    );
+    assert_eq!(
+        f_hess.dispersion.to_bits(),
+        f_rx.dispersion.to_bits(),
+        "dispersion: {} vs {}",
+        f_hess.dispersion,
+        f_rx.dispersion
+    );
+    for i in 0..n {
+        assert_eq!(
+            f_hess.fitted[i].to_bits(),
+            f_rx.fitted[i].to_bits(),
+            "fitted[{i}]: {} vs {}",
+            f_hess.fitted[i],
+            f_rx.fitted[i]
+        );
+    }
+}
+
+/// Same fitted-point check as [`fit_glmm_gamma_hessian_rx_agree_on_fitted`] on
+/// a φ≡1 family (cbpp, binomial-logit): `glmm_sigma_sq` is a literal `1.0`
+/// here, so only `fitted` can move — the split was never Gamma-specific, it
+/// is just too small to see at canonical links' quadratic PIRLS convergence.
+/// The two fits' SEs must differ: `FitOptions::wald_se` selects the denominator.
+#[test]
+fn fit_glmm_cbpp_hessian_rx_agree_on_fitted() {
+    let (x, y, cluster_ids, n) = cbpp_design();
+    let p = 4;
+    let model = cbpp_model();
+    let ids = GroupIds {
+        primary: cluster_ids,
+        extra: vec![],
+    };
+    let f_hess = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &ids,
+        &FitOptions {
+            target_indices: vec![0, 1, 2, 3],
+            wald_se: WaldSe::Hessian,
+            ..FitOptions::default()
+        },
+    );
+    let f_rx = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &ids,
+        &FitOptions {
+            target_indices: vec![0, 1, 2, 3],
+            wald_se: WaldSe::Rx,
+            ..FitOptions::default()
+        },
+    );
+    assert!(f_hess.converged() && f_rx.converged());
+    // `FitOptions::wald_se` (not the spec) selects the Wald-SE denominator.
+    assert!(
+        (f_hess.se[1] - f_rx.se[1]).abs() > 1e-6,
+        "Rx vs Hessian SE must differ"
+    );
+    for i in 0..n {
+        assert_eq!(
+            f_hess.fitted[i].to_bits(),
+            f_rx.fitted[i].to_bits(),
+            "fitted[{i}]: {} vs {}",
+            f_hess.fitted[i],
+            f_rx.fitted[i]
+        );
+    }
+}
+
+/// NB GLMM `y ~ 1 + x + grp + (1|cluster)` on sim_nb via the outer-θ loop,
+/// gated against frozen `glmmTMB(family = nbinom2)`
+/// (`validation/goldens/sim_nb_glmm_tmb.json`). `dispersion = θ̂`. glmmTMB, not
+/// `lme4::glmer.nb`: on the NB log link lme4 builds its Laplace log-determinant
+/// from the expected (Fisher) weight, a different objective, and its Hessian SEs
+/// condition on θ̂_NB where glmm's and glmmTMB's carry it. The oracle is sacred.
+///
+/// **Additive Rust-vs-Rust pin (2026-08-06; scope updated 2026-09-06).** Gates
+/// the NB coordinate's read-back (`fit_glmm_nb` → `run_glmm_on` →
+/// `glmm_view_to_fit`) and the marginal objective directly — the cross-engine
+/// bands above (1e-3) are too loose to tell a regression from rounding.
+/// `BAND = 1e-7` is 6× the measured worst-case drift on this fixture: 1.6e-8
+/// relative under a 128-draw 1-ULP sweep on `sim_nb`'s inputs (K=64 on `x`,
+/// K=64 on `y` over the rows with `y > 0`), and 5.16e-11 under the committed
+/// `pulp` lane-width probe (scalar-forced vs normal dispatch, measured with the
+/// seeding GLM θ profile `golden_max_ln_theta` stopping at a 1e-4 `ln θ` width).
+///
+/// Also pins the deviance identity `Fit::deviance = −2·logLik`.
+#[test]
+fn fit_glmm_nb_sim_matches_glmmtmb() {
+    const REF_BETA: [f64; 3] = [-0.00542238218015535, 0.599173398203515, 0.604706321025223];
+    const REF_SE: [f64; 3] = [0.163858508869097, 0.0729385281276674, 0.142897968706243];
+    const REF_CLUSTER_SD: f64 = 0.57503111038558;
+    const REF_THETA: f64 = 1.78348505273966;
+    let (x, y, cluster_ids, n_clusters) =
+        sim_clustered(include_str!("../../validation/data/simulated/sim_nb.csv"));
+    let (n, p) = (y.len(), 3);
+    let model = ModelSpec {
+        family: Family::NegativeBinomial {
+            link: crate::NegBinomialLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let f = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &GroupIds {
+            primary: cluster_ids.clone(),
+            extra: vec![],
+        },
+        &FitOptions {
+            target_indices: vec![0, 1, 2],
+            ..FitOptions::default()
+        },
+    );
+    assert!(f.converged(), "NB GLMM must converge");
+    let th_rel = (f.dispersion - REF_THETA).abs() / REF_THETA;
+    assert!(th_rel < 1e-3, "θ̂ = {} vs glmmTMB {REF_THETA}", f.dispersion);
+    for j in 0..p {
+        assert!(
+            (f.beta[j] - REF_BETA[j]).abs() / REF_BETA[j].abs() < 1e-3,
+            "β[{j}] = {} vs glmmTMB {}",
+            f.beta[j],
+            REF_BETA[j]
+        );
+        let se_rel = (f.se[j] - REF_SE[j]).abs() / REF_SE[j];
+        assert!(
+            se_rel < 1e-3,
+            "se[{j}] = {} vs glmmTMB {}",
+            f.se[j],
+            REF_SE[j]
+        );
+    }
+    let sd_rel = (f.tau2[0].sqrt() - REF_CLUSTER_SD).abs() / REF_CLUSTER_SD;
+    assert!(
+        sd_rel < 2e-2,
+        "cluster sd = {} vs glmmTMB {REF_CLUSTER_SD}",
+        f.tau2[0].sqrt()
+    );
+    // glmmTMB logLik — the θ-dependent NB saturated constant (incl. −ln yᵢ!)
+    // restored at θ̂. 1e-4 is the oracle tier's DEV_EPS on the deviance, halved.
+    const REF_LOGLIK: f64 = -481.467584276256;
+    assert!(
+        (f.loglik - REF_LOGLIK).abs() < 1e-4,
+        "loglik {} vs glmmTMB {REF_LOGLIK}",
+        f.loglik
+    );
+    // `Fit::deviance` is the outer θ search's own objective, `dev(θ̂) −
+    // 2·saturated_loglik(θ̂)`, equal to `−2·logLik` exactly (see `fit_glmm`'s NB
+    // deviance and `fit::common::glmm_loglik`).
+    assert!(
+        (f.deviance + 2.0 * f.loglik).abs() < 1e-9 * f.deviance.abs(),
+        "deviance {} vs -2*loglik {}",
+        f.deviance,
+        -2.0 * f.loglik
+    );
+    assert_eq!(f.df, 5); // 3 β + cluster θ_RE + NB θ
+
+    const BAND: f64 = 1e-7;
+    // Additive bit-exact pin (see doc comment above). What produces these
+    // values: θ_NB is a coordinate of the outer BOBYQA on the marginal
+    // objective — the incumbent is the answer, there is no final fit at θ̂ —
+    // started cold from the no-RE GLM-NB's own θ̂ (a method-of-moments seed
+    // charges the RE variance to the dispersion, which breaks random-slope NB
+    // shapes), and PIRLS returns the data term, `log|A|` and the factor at the
+    // returned iterate. The point meets this test's own lme4 bands (β 5e-3,
+    // se 5e-2, sd 2e-2, θ̂ 5e-2) with 2.8 to four orders to spare: β within
+    // 8.3e-6 absolute, se within 1.3e-5 relative, cluster SD 1.5e-5, θ̂ 4.5e-6.
+    // Re-pinned 2026-09-24, and the reference moved from lme4 to glmmTMB with
+    // it: the Laplace log-determinant now uses the observed weight on the NB
+    // log link, and the joint Hessian carries the `ln θ_NB` row. β[1] moved
+    // 8.8e-3 relative and θ̂ 8.5e-5. The new point meets the glmmTMB bands
+    // (all 1e-3) at β 3.2e-6 absolute, se 2.9e-6 relative, cluster SD 3.7e-6
+    // and θ̂ 4.9e-6.
+    // Frozen 2026-09-26 with PIRLS taking the Newton step on the NB log link
+    // and exiting at `PIRLS_TOL_REL_NONCANON`; logLik sits 6.1e-10 above
+    // glmmTMB's.
+    // Re-pinned 2026-09-30: the exact β-profile's border step computes log|A|'s
+    // curvature in β only on solves where the plain `S_β` step shows trouble
+    // (`pirls::BorderTrust::wants_curvature`), so the stage-1 PIRLS solves take
+    // another path to the same profile. logLik unchanged to 1e-12
+    // (−481.46758427564356); β[0] moved 8.3e-10 absolute (1.5e-7 relative, β[0]
+    // being near zero), the other β, the SEs, τ̂² and θ̂ at most 1.4e-8 relative.
+    // Re-pinned 2026-10-02 with the per-search BOBYQA start radii (stage 1 from
+    // the blind start at `GLMM_RHO_BEGIN` = 0.2): the search takes another path
+    // to the same optimum (24 evaluations, 27 before). β[0] moved 9.5e-9
+    // absolute (1.75e-6 relative, β[0] being near zero), τ̂² 2.9e-7, θ̂ 1.1e-7,
+    // the SEs 8.7e-8, the other β 9.5e-9; deviance +1e-13, no converged,
+    // singular or pinned flag changed.
+    const REF_BETA_PIN: [f64; 3] = [-0.005425220806681147, 0.59917381275413, 0.6047082520023515];
+    const REF_SE_PIN: [f64; 3] = [
+        0.16385870133700017,
+        0.07293864682996168,
+        0.14289817057552456,
+    ];
+    const REF_TAU2_PIN: [f64; 1] = [0.330661013187166];
+    const REF_THETA_PIN: f64 = 1.7834746550273493;
+    assert_pinned(&f.beta, &REF_BETA_PIN, BAND, "sim_nb pinned beta");
+    assert_pinned(&f.se, &REF_SE_PIN, BAND, "sim_nb pinned se");
+    assert_pinned(&f.tau2, &REF_TAU2_PIN, BAND, "sim_nb pinned tau2");
+    assert_pinned(
+        &[f.dispersion],
+        &[REF_THETA_PIN],
+        BAND,
+        "sim_nb pinned theta",
+    );
+}
+
+/// An NB GLMM at counts near 1e10 (`y ~ x + (1|g)`, 20 clusters of 10, θ near
+/// 50) fits as the same draws do at counts near 3e6: the mean scale is
+/// `e^8` larger, so the deviance rises by `2·n·8 = 3200` (the `−ln y` of each
+/// row's density) and θ̂_NB and the slope stay put. Measured gaps: 2.2e-5 on
+/// the deviance, 1.6e-5 relative on θ̂_NB. At these counts both NB pieces of
+/// the objective cancel terms of order `y`: the unit deviance's two logs, a
+/// round-off of 6e-6 on the sum, past the PIRLS exit band, so most solves
+/// end not converged and the fit fails; and the saturated log-likelihood's
+/// `lnΓ` terms, whose 4.4e13 total leaves the objective a resolution of
+/// 1.6e-2, which moves θ̂_NB and spoils the finite-difference Hessian.
+#[test]
+fn nb_glmm_at_counts_near_1e10_fits_as_at_small_scale() {
+    let (n, g) = (200usize, 20usize);
+    let model = ModelSpec {
+        family: Family::NegativeBinomial {
+            link: crate::NegBinomialLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: g as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: (0..n).map(|i| (i % g) as u32).collect(),
+        extra: vec![],
+    };
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        ..FitOptions::default()
+    };
+    let fit_at = |c: f64| {
+        let mut st = 1u64;
+        let b: Vec<f64> = (0..g).map(|_| 0.5 * inf_plateau_normal(&mut st)).collect();
+        let xs: Vec<f64> = (0..n).map(|_| inf_plateau_normal(&mut st)).collect();
+        // NB with θ = 50 at these means: sd ≈ 0.14·μ.
+        let y: Vec<f64> = (0..n)
+            .map(|i| {
+                let mu = (c + 0.3 * xs[i] + b[i % g]).exp();
+                (mu * (1.0 + 0.14 * inf_plateau_normal(&mut st))).round()
+            })
+            .collect();
+        let x: Vec<f64> = xs.iter().flat_map(|&v| [1.0, v]).collect();
+        fit_cold(&x, &y, n, 2, &model, &ids, &opts)
+    };
+    let (small, huge) = (fit_at(15.0), fit_at(23.0));
+    assert!(small.converged(), "counts near 3e6 must converge");
+    assert!(huge.converged(), "counts near 1e10 must converge");
+    assert!(
+        !huge
+            .diagnostics
+            .notes
+            .iter()
+            .any(|n| matches!(n, crate::Note::HessianSeFallback)),
+        "counts near 1e10: exact Hessian SE expected"
+    );
+    let gap = huge.deviance - small.deviance - 3200.0;
+    assert!(gap.abs() < 1e-3, "deviance gap off 3200 by {gap:e}");
+    let th_rel = (huge.dispersion - small.dispersion).abs() / small.dispersion;
+    assert!(
+        th_rel < 1e-4,
+        "θ̂_NB {} vs {}",
+        huge.dispersion,
+        small.dispersion
+    );
+    assert!(
+        (huge.beta[1] - small.beta[1]).abs() < 1e-5,
+        "slope {} vs {}",
+        huge.beta[1],
+        small.beta[1]
+    );
+}
+
+/// The same `deviance = −2·logLik` identity under prior weights. The NB
+/// saturated term enters the reported deviance through
+/// `saturated_loglik(θ̂, y, weights)`, whose weighted branch no other NB GLMM
+/// test reaches. The identity is the whole test: no reference is needed, only
+/// that the deviance's correction and `loglik`'s are the same weighted sum.
+#[test]
+fn fit_glmm_nb_weighted_deviance_is_search_objective() {
+    let (x, y, cluster_ids, n_clusters) =
+        sim_clustered(include_str!("../../validation/data/simulated/sim_nb.csv"));
+    let (n, p) = (y.len(), 3);
+    let weights: Vec<f64> = (0..n).map(|i| 1.0 + 0.5 * ((i % 4) as f64)).collect();
+    let model = ModelSpec {
+        family: Family::NegativeBinomial {
+            link: crate::NegBinomialLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let f = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &GroupIds {
+            primary: cluster_ids.clone(),
+            extra: vec![],
+        },
+        &FitOptions {
+            target_indices: vec![0, 1, 2],
+            weights: Some(weights),
+            ..FitOptions::default()
+        },
+    );
+    assert!(f.converged(), "weighted NB GLMM must converge");
+    assert!(
+        (f.deviance + 2.0 * f.loglik).abs() < 1e-9 * f.deviance.abs(),
+        "weighted deviance {} vs -2*loglik {}",
+        f.deviance,
+        -2.0 * f.loglik
+    );
+}
+
+/// The `ln θ_NB` coordinate of the outer BOBYQA must reach the same optimum
+/// whichever `A`-layout evaluates the marginal objective under it. `sim_nb` is
+/// in the dense envelope, so the same design is fit twice: routed (blocked)
+/// through `fit_cold`, and forced onto the packed-row layout. `loglik` to 1e-5
+/// absolute (optimizer-noise deviance gaps on rungs of this size measured 1e-7
+/// to 1e-10 when the exact β-profile landed, 2026-09-04; two decades of margin)
+/// and θ̂ to 1e-3 relative.
+#[test]
+fn nb_coordinate_agrees_across_layouts() {
+    let (x, y, cluster_ids, n_clusters) =
+        sim_clustered(include_str!("../../validation/data/simulated/sim_nb.csv"));
+    let (n, p) = (y.len(), 3);
+    let model = ModelSpec {
+        family: Family::NegativeBinomial {
+            link: crate::NegBinomialLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: cluster_ids,
+        extra: vec![],
+    };
+    let opts = FitOptions {
+        target_indices: vec![0, 1, 2],
+        wald_se: crate::WaldSe::Rx,
+        ..FitOptions::default()
+    };
+    let blocked = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    let (sized, ids, _perm) = crate::fit::spec_sized_from_ids_pub(&model, &ids);
+    let packed = crate::fit::fit_glmm_packed(
+        &x,
+        &y,
+        n,
+        p,
+        &sized,
+        &ids.primary,
+        &ids.extra,
+        f64::NAN,
+        None,
+        &opts,
+    )
+    .0;
+    assert!(blocked.converged() && packed.converged());
+    assert!(
+        (blocked.loglik - packed.loglik).abs() < 1e-5,
+        "loglik blocked {} vs packed {}",
+        blocked.loglik,
+        packed.loglik
+    );
+    assert!(
+        (blocked.dispersion - packed.dispersion).abs() < 1e-3 * packed.dispersion,
+        "θ̂ blocked {} vs packed {}",
+        blocked.dispersion,
+        packed.dispersion
+    );
+}
+
+/// The GLM outer loop's cold-start seed, pinned against its own formula. The
+/// GLMM `ln θ_NB` coordinate reaches it only through `fit_glm_nb`'s start.
+/// With an offset the moments are taken around the exposure-scaled means:
+/// rows that sit exactly on `r·e^{oᵢ}` carry no overdispersion, however far
+/// apart the exposures are, so the seed is the top of the box; around ȳ their
+/// spread would read as heavy overdispersion.
+#[test]
+fn nb_theta_moment_seed_is_the_glm_seed() {
+    let y = [0.0, 4.0, 1.0, 7.0, 2.0, 0.0, 3.0, 9.0];
+    let ybar = y.iter().sum::<f64>() / 8.0;
+    let var = y.iter().map(|v| (v - ybar).powi(2)).sum::<f64>() / 7.0;
+    let expect = (ybar * ybar / (var - ybar).max(1e-6))
+        .clamp(crate::fit::NB_THETA_LO, crate::fit::NB_THETA_HI);
+    assert_eq!(crate::fit::nb_theta_moment_seed(&y, 8, None), expect);
+    // Underdispersed input pins to the ε floor and the top of the box.
+    let flat = [2.0; 8];
+    assert_eq!(
+        crate::fit::nb_theta_moment_seed(&flat, 8, None),
+        crate::fit::NB_THETA_HI
+    );
+    let exposure = [1.0, 10.0, 100.0, 1000.0, 1.0, 10.0, 100.0, 1000.0];
+    let on_mean: Vec<f64> = exposure.iter().map(|e| 3.0 * e).collect();
+    let offset: Vec<f64> = exposure.iter().map(|e: &f64| e.ln()).collect();
+    assert_eq!(
+        crate::fit::nb_theta_moment_seed(&on_mean, 8, Some(&offset)),
+        crate::fit::NB_THETA_HI
+    );
+}
+
+/// NB GLMM on an UNBALANCED NESTED design: `y ~ 1 + x + (1|g1/g2)` on
+/// sim_nb_nested (per-g1 sizes 8..120 on an exp ladder), gated against
+/// frozen `glmmTMB(family = nbinom2)` (`validation/goldens/sim_nb_nested_glmm_tmb.json`;
+/// not lme4, for the reason `fit_glmm_nb_sim_matches_glmmtmb` gives).
+/// The nested extra rides the Pastes convention: `GroupIds.extra` carries
+/// the globally-unique g1:g2 level, `NestedWithin` is the topology tag,
+/// placeholder counts prove sizing comes from the ids. `dispersion = θ̂`;
+/// Hessian SE, glmm's default. tau2 layout: [primary g1 | nested g2:g1] — the
+/// golden's varcomp lists g2:g1 first. The oracle is sacred.
+///
+/// **Additive Rust-vs-Rust pin (2026-08-06).** Same treatment and same
+/// reasoning as `fit_glmm_nb_sim_matches_glmmtmb`'s pin — see its doc comment.
+/// This fixture is not redundant with that one: two variance blocks instead
+/// of one, and its own independently measured drift, never copied from
+/// `sim_nb`'s. `BAND = 1e-7` is 1.5× the measured worst case at the 1e-7
+/// stopping width: 6.8e-8 relative under the 128-draw 1-ULP sweep (K=64 on
+/// `x`, K=64 on `y` over the rows with `y > 0`), and 7.64e-10 under the
+/// lane-width probe (measured at the 1e-4 width).
+#[test]
+fn fit_glmm_nb_nested_unbalanced_matches_glmmtmb() {
+    const REF_BETA: [f64; 2] = [0.609247442466475, 0.509995504854536];
+    const REF_SE_HESSIAN: [f64; 2] = [0.204671367411326, 0.0542774868674421];
+    const REF_G1_SD: f64 = 0.628100207872542;
+    const REF_NEST_SD: f64 = 0.355387575569245;
+    const REF_THETA: f64 = 1.42908910314355;
+    // sim_nb_nested.csv: y,x,g1,g2 (g2 labels reused across g1 parents).
+    let csv = include_str!("../../validation/data/simulated/sim_nb_nested.csv");
+    let mut y = Vec::<f64>::new();
+    let mut xcol = Vec::<f64>::new();
+    let mut g1_raw = Vec::<String>::new();
+    let mut nest_raw = Vec::<String>::new();
+    for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+        let f: Vec<&str> = line.split(',').map(|s| s.trim_matches('"')).collect();
+        y.push(f[0].parse().unwrap());
+        xcol.push(f[1].parse().unwrap());
+        g1_raw.push(f[2].to_string());
+        // Globally-unique nested level, the Pastes "sample" convention.
+        nest_raw.push(format!("{}:{}", f[2], f[3]));
+    }
+    let n = y.len();
+    let p = 2;
+    let mut x = vec![0.0f64; n * p];
+    for i in 0..n {
+        x[i * p] = 1.0;
+        x[i * p + 1] = xcol[i];
+    }
+    let (g1, _n_g1) = dense_str(&g1_raw);
+    let (nest, _n_nest) = dense_str(&nest_raw);
+    let model = ModelSpec {
+        family: Family::NegativeBinomial {
+            link: crate::NegBinomialLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 1 }, // placeholder — ignored on data path
+            slopes: vec![],
+            extra_groupings: vec![Grouping {
+                relation: GroupingRelation::NestedWithin { n_per_parent: 1 }, // placeholder
+                slopes: vec![],
+            }],
+        }),
+    };
+    let f = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &GroupIds {
+            primary: g1,
+            extra: vec![nest],
+        },
+        &FitOptions {
+            target_indices: vec![0, 1],
+            ..FitOptions::default()
+        },
+    );
+    assert!(f.converged(), "nested NB GLMM must converge");
+    let th_rel = (f.dispersion - REF_THETA).abs() / REF_THETA;
+    assert!(th_rel < 1e-3, "θ̂ = {} vs glmmTMB {REF_THETA}", f.dispersion);
+    for j in 0..p {
+        assert!(
+            (f.beta[j] - REF_BETA[j]).abs() / REF_BETA[j].abs() < 1e-3,
+            "β[{j}] = {} vs glmmTMB {}",
+            f.beta[j],
+            REF_BETA[j]
+        );
+        let se_rel = (f.se[j] - REF_SE_HESSIAN[j]).abs() / REF_SE_HESSIAN[j];
+        assert!(
+            se_rel < 1e-3,
+            "se[{j}] = {} vs glmmTMB {}",
+            f.se[j],
+            REF_SE_HESSIAN[j]
+        );
+    }
+    let g1_rel = (f.tau2[0].sqrt() - REF_G1_SD).abs() / REF_G1_SD;
+    assert!(
+        g1_rel < 1e-3,
+        "g1 sd = {} vs glmmTMB {REF_G1_SD}",
+        f.tau2[0].sqrt()
+    );
+    let nest_rel = (f.tau2[1].sqrt() - REF_NEST_SD).abs() / REF_NEST_SD;
+    assert!(
+        nest_rel < 1e-3,
+        "g2:g1 sd = {} vs glmmTMB {REF_NEST_SD}",
+        f.tau2[1].sqrt()
+    );
+
+    const BAND: f64 = 1e-7;
+    // Additive bit-exact pin (see doc comment above). Re-pinned 2026-09-06 (twice).
+    // First: θ_NB became a coordinate of the outer BOBYQA on the marginal
+    // objective, not a golden-section bracket over re-fits. This fixture takes
+    // `OuterSearch::Joint` (nested extra grouping, non-canonical NB-log,
+    // n_theta = 2, p = 2) rather than the `ExactProfile` arm `sim_nb` takes —
+    // it is the joint-closure pin, where `sim_nb`
+    // (`fit_glmm_nb_sim_matches_glmmtmb`) is the stage-1 pin for the same
+    // coordinate mechanism. That move was 1.3e-5 relative on θ̂ — inside the
+    // bracket's own 1e-4 `ln θ` resolution. Second: the coordinate's cold
+    // start moved from the method-of-moments seed to the no-RE GLM-NB's own
+    // θ̂, for the same reason as `sim_nb`'s second re-pin (the moment seed
+    // charges the RE variance to the dispersion, which breaks random-slope NB
+    // shapes elsewhere in the corpus). That move was 1.79e-4 relative on θ̂,
+    // still inside the bracket's own resolution. Third (2026-09-10): every
+    // θ coordinate is boxed [−THETA_HI, THETA_HI] (`blind_theta_and_bounds`).
+    // This fixture has no off-diagonal, so no sign is in play, but the box
+    // changes BOBYQA's interpolation set and trust-region steps on every
+    // fit. The deviance moved DOWN by 8.6e-3 (605.667764 → 605.659188, 94 →
+    // 110 evaluations, both converged, KKT norm 9.9e-3 → 8.8e-3): the old
+    // endpoint was the less converged one on the flat ln θ_NB direction.
+    // θ̂ moved 3.6e-5 relative, β[0] 2.3e-4, and β̂ sits closer to lme4's
+    // (`REF_BETA`) than before. Fourth (2026-09-13): the structured-extras
+    // kernel's exact Laplace β-profile became available for this shape, so
+    // the outer search is θ-only on that profile instead of the joint
+    // `[θ | β]` search — this fixture moves from `OuterSearch::Joint` to `OuterSearch::ExactProfile`.
+    // The deviance moved UP by 4.686e-3 (605.659188 → 605.663874, 110 → 53
+    // evaluations, both converged), a smaller swing than the Third re-pin's
+    // own 8.6e-3 move on this fixture's flat ln θ_NB direction. The relative
+    // move stays tiny everywhere it is checked: θ̂ 2.0e-5, β[0] 6.7e-5, β[1]
+    // 3.1e-5, the g1 SD 2.0e-4, the g2:g1 SD 5.5e-6 — all far inside this
+    // test's own 5e-3/2e-2/5e-2 lme4 bands. The pin is re-taken at the new
+    // point.
+    // Fifth (2026-09-15): PIRLS returns the data term, `log|A|` and the factor
+    // at the returned iterate, where before the factor and `log|A|` were one
+    // Newton step behind. β[0] moved 5.5e-6, β[1] 8.4e-7, the SEs 1.6e-5 and
+    // 5.0e-6, τ̂² 3.1e-5 and 9.0e-5, θ̂ 2.1e-5 relative — an order smaller than
+    // the Fourth re-pin's own moves on this fixture, and far inside the same
+    // 5e-3/2e-2/5e-2 lme4 bands, which the new point meets at β 1.3e-5
+    // absolute, se 1.2e-5 relative, the two SDs 8.8e-6 and 5.8e-6, and θ̂
+    // 1.9e-6 (2.0e-5 before, so the fit sits closer to lme4's θ̂).
+    // Sixth (2026-09-24), with the reference moved from lme4 to glmmTMB: the
+    // observed weight in the Laplace log-determinant and the joint Hessian's
+    // `ln θ_NB` row, as for `sim_nb`. The new point meets the glmmTMB bands
+    // (all 1e-3) at β 3.9e-6 absolute, se 3.5e-6 relative, the two SDs 2.7e-7
+    // and 9.8e-6, and θ̂ 9.4e-6.
+    // Frozen 2026-09-26 with PIRLS taking the Newton step on the NB log link
+    // and exiting at `PIRLS_TOL_REL_NONCANON`, and with the no-RE GLM-NB cold
+    // start stopping on R's relative deviance rule (`glm::DEVIANCE_TOL`). The
+    // two together land 2.5e-12 below the Newton-step point alone on logLik
+    // (−976.7919162692931, round-off on the same objective from a moved cold
+    // start); θ̂ moved 1.1e-7 relative, τ̂² 6.0e-8, the SEs 3.3e-8, β 7.3e-9.
+    // Re-pinned 2026-09-27: the exact β-profile's border step carries
+    // log|A|'s curvature in β (`pirls::logdet_beta_curvature`), so every
+    // stage-1 PIRLS solve takes a different path to the same profile. logLik
+    // moved up by 7e-13 (−976.7919162692924); τ̂² moved 1.5e-6 and 2.6e-7
+    // relative, θ̂ 3.0e-7, the SEs 5.7e-7 and 7.9e-8, β 7.3e-8 — the outer
+    // search stopping at another point of this fixture's flat directions.
+    // Re-pinned 2026-09-28: the no-RE GLM-NB cold start seeds at ln ȳ, not
+    // ln(ȳ + 0.1), so the β̂ that seeds the GLMM moves at round-off. logLik
+    // moved up by 9.8e-12 (−976.7919162692826, 50 evaluations); τ̂² moved
+    // 1.2e-6 and 1.9e-7 relative, θ̂ 2.6e-7, the SEs 4.6e-7 and 6.9e-8, β
+    // 6.1e-8 — the same flat directions as the re-pin above.
+    // Re-pinned 2026-09-30: the border step's curvature reads `W''` and the
+    // leverage from the border's own pass A (round-off; this fixture has no
+    // crossed tail, so the curvature stays exact), and is computed only on
+    // solves where the plain `S_β` step shows trouble
+    // (`pirls::BorderTrust::wants_curvature`). logLik moved down by 9.8e-12
+    // (−976.7919162692924, 50 evaluations); τ̂² moved 1.8e-7 and 1.3e-7
+    // relative, θ̂ 1.7e-7, the SEs 6.1e-8 and 5.1e-8, β 1.3e-8, along the same
+    // flat directions as the re-pins above.
+    // Re-pinned 2026-10-01: the design is standardized internally before the fit (x̃ = (x − m)/s, results mapped back).
+    // logLik moved up by 1.8e-11 (−976.7919162692747, 50 evaluations); τ̂²
+    // moved 4.4e-7 and 6.4e-8 relative, the SEs 1.8e-7 and 1.7e-8, θ̂ 4.1e-8,
+    // β 1.9e-8, along the same flat directions.
+    // Re-pinned 2026-10-02 with the per-search BOBYQA start radii (stage 1 from
+    // the blind start at `GLMM_RHO_BEGIN` = 0.2): logLik moved by −7e-12
+    // (−976.7919162692818, 42 evaluations, 50 before); τ̂² moved 8.0e-7 and
+    // 1.0e-7 relative, the SEs 3.2e-7 and 8.2e-8, θ̂ 3.0e-7, β 5.3e-8, along
+    // the same flat directions; no converged, singular or pinned flag changed.
+    // Re-pinned 2026-10-02: the β-Profile row pass sums `X'WX` in row order
+    // instead of by a GEMM (round-off). logLik moved up by 2.7e-12
+    // (−976.7919162692791, 42 evaluations); τ̂² moved 4.2e-7 and 1.6e-7
+    // relative, the SEs 1.6e-7 and 1.3e-9, β 1.5e-8, θ̂ 2.8e-10; no converged,
+    // singular or pinned flag changed.
+    // Re-pinned 2026-10-02: log links read `dμ/dη = μ` from the stored mean
+    // (round-off). logLik moved by −2.4e-12 (−976.7919162692815, 42
+    // evaluations); τ̂² moved 6.9e-7 and 8.9e-7 relative, the SEs 3.2e-7 and
+    // 3.6e-8, θ̂ 1.6e-7, β 6.2e-8, along the same flat directions; no
+    // converged, singular or pinned flag changed.
+    // Re-pinned 2026-10-02: the search's NB saturated term is summed once
+    // per distinct count instead of once per row (round-off). logLik moved by
+    // −7.5e-12 (−976.791916269289, 42 evaluations); τ̂² moved 1.6e-7 and
+    // 6.2e-7 relative, the SEs 8.9e-8 and 7.9e-9, θ̂ 5.6e-8, β 2.6e-8, along
+    // the same flat directions; no converged, singular or pinned flag changed.
+    // Re-pinned 2026-10-03: the no-RE GLM-NB θ̂ that seeds the `ln θ_NB`
+    // coordinate is resolved to a golden-section width of 1e-7 on `ln θ`
+    // (`golden_max_ln_theta`) instead of 1e-4, so the search starts from a
+    // moved θ. logLik moved up by 2.8e-12 (−976.7919162692862, 43
+    // evaluations, 42 before); τ̂² moved 1.9e-7 and 1.1e-7 relative, θ̂ 3.4e-8,
+    // the SEs 7.3e-8 and 1.0e-8, β 4.0e-9, along the same flat directions; no
+    // converged, singular or pinned flag changed.
+    const REF_BETA_PIN: [f64; 2] = [0.6092438793133496, 0.5099937809136489];
+    const REF_SE_PIN: [f64; 2] = [0.20467111774679264, 0.054277403174934166];
+    const REF_TAU2_PIN: [f64; 2] = [0.3945093432302897, 0.1262971237785827];
+    const REF_THETA_PIN: f64 = 1.4290925019562253;
+    assert_pinned(&f.beta, &REF_BETA_PIN, BAND, "sim_nb_nested pinned beta");
+    assert_pinned(&f.se, &REF_SE_PIN, BAND, "sim_nb_nested pinned se");
+    assert_pinned(&f.tau2, &REF_TAU2_PIN, BAND, "sim_nb_nested pinned tau2");
+    assert_pinned(
+        &[f.dispersion],
+        &[REF_THETA_PIN],
+        BAND,
+        "sim_nb_nested pinned theta",
+    );
+}
+
+// ── Vector-RE AGQ goldens (GLMMadaptive oracle) ─────────────────────────────
+
+/// One vector-AGQ pin: parse a `y,<covariates...>,g` CSV, fit at `nagq`
+/// (primary grouping factor, random slopes on every covariate → q_p = 1 + n_x,
+/// routed through `agq_deviance_vec`), and check β̂ / Hessian SE / RE stddev /
+/// RE correlation against values recorded from glmm.
+///
+/// `corr_lower` is the strict lower triangle in row order — (1,0) for q=2;
+/// (1,0), (2,0), (2,1) for q=3. The diagonal is 1 by construction and the
+/// upper triangle mirrors, so pinning them would assert nothing.
+///
+/// Cross-engine validation of every one of these fits lives in the
+/// `sim_{binomial,poisson}_slope{1,2}_agq_k{7,11}` cells, against frozen
+/// `GLMMadaptive::mixed_model(nAGQ=k)`. Those cells run at the wider `agq_*`
+/// bands from `validation/grid/tol.R`, because GLMMadaptive's quadrature details differ
+/// from ours (per-step re-adaptation, a different RE-covariance
+/// parameterization) — matched-k agreement is tight but not machine-precision.
+/// That is a fact about the two engines and has no bearing on how tightly glmm
+/// reproduces its own answer, which is what this pins.
+///
+/// No deviance pin: the deviance scale is owned by the in-crate k-convergence
+/// invariants in `glmm/tests.rs`.
+#[allow(clippy::too_many_arguments)]
+fn check_vector_agq_pin(
+    name: &str,
+    csv: &str,
+    nagq: u8,
+    n_x: usize,
+    family: Family,
+    ref_beta: &[f64],
+    ref_se: &[f64],
+    ref_stddev: &[f64],
+    corr_lower: &[f64],
+    band: f64,
+) {
+    let mut y = Vec::<f64>::new();
+    let mut xc: Vec<Vec<f64>> = vec![vec![]; n_x];
+    let mut g_raw = Vec::<u32>::new();
+    for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+        let f: Vec<&str> = line.split(',').map(|s| s.trim_matches('"')).collect();
+        y.push(f[0].parse().unwrap());
+        for (k, col) in xc.iter_mut().enumerate() {
+            col.push(f[1 + k].parse().unwrap());
+        }
+        g_raw.push(f[1 + n_x].parse().unwrap());
+    }
+    let n = y.len();
+    let p = 1 + n_x;
+    let mut x = vec![0.0f64; n * p];
+    for i in 0..n {
+        x[i * p] = 1.0;
+        for k in 0..n_x {
+            x[i * p + 1 + k] = xc[k][i];
+        }
+    }
+    let (primary, n_clusters) = dense_ids(&g_raw);
+    let ids = GroupIds {
+        primary,
+        extra: vec![],
+    };
+    let model = ModelSpec {
+        family,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters as u32,
+            },
+            slopes: (1..=n_x as u32).collect(),
+            extra_groupings: vec![],
+        }),
+    };
+    let opts = FitOptions {
+        target_indices: (0..p as u32).collect(),
+        nagq,
+        ..FitOptions::default() // WaldSe::Hessian — the se_hessian partner
+    };
+    let f = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    assert!(f.converged(), "{name} k={nagq} must converge");
+
+    let what = format!("{name} k={nagq}");
+    assert_pinned(&f.beta, ref_beta, band, &format!("{what} beta"));
+    assert_pinned(&f.se, ref_se, band, &format!("{what} se"));
+    let (stddev, corr) = f.stddev_corr(0);
+    assert_pinned(&stddev, ref_stddev, band, &format!("{what} stddev"));
+    let lower: Vec<f64> = (0..stddev.len())
+        .flat_map(|t| (0..t).map(move |u| (t, u)))
+        .map(|(t, u)| corr[t][u])
+        .collect();
+    assert_pinned(&lower, corr_lower, band, &format!("{what} corr"));
+}
+
+/// Vector AGQ (q=2), binomial: `y ~ x + (1 + x | g)` on sim_binomial_slope1 at
+/// nAGQ ∈ {7, 11}. Validated cross-engine by the
+/// `sim_binomial_slope1_agq_k{7,11}` cells against GLMMadaptive.
+///
+/// Relative-tolerance, not bit-equal. These values reproduce BIT-EXACTLY on the
+/// anchor machine (see `assert_pinned`'s "which machine the pins are frozen on");
+/// BAND is margin for aarch64-apple-darwin, where the k=11 β drifts 1.51e-7
+/// (`beta[0]`) from architecture-dependent SIMD/FMA contraction on this kernel's
+/// long reductions. 5e-6 is ~33x that: loose enough to absorb cross-arch
+/// reassociation, tight enough that a real change in the fit still trips it.
+///
+/// **k=7 `ref_se` re-anchored 2026-07-31.** Both of its elements had been frozen
+/// off-anchor and missed by 3.6e-15 / 1.5e-13 — invisible under BAND, and old
+/// enough that the responsible toolchain or faer bump is not identifiable. Not a
+/// numerical finding at that size; re-pinned only so "bit-exact on the anchor"
+/// holds without exceptions and stays checkable. β, stddev and corr were already
+/// exact and are untouched, as is k=11.
+#[test]
+fn fit_glmm_binomial_slope1_vector_agq_is_pinned() {
+    const BAND: f64 = 5e-6;
+    let csv = include_str!("../../validation/data/simulated/sim_binomial_slope1.csv");
+    let family = Family::Binomial {
+        link: BinomialLink::Logit,
+    };
+    check_vector_agq_pin(
+        "sim_binomial_slope1",
+        csv,
+        7,
+        1,
+        family,
+        &[0.42897645003558754, 0.43458315523970653],
+        // Re-pinned 2026-09-01: the exact hyper-dual joint (θ, β) Hessian
+        // replaced the FD stencil on the
+        // blocked GLMM path, which covers this vector-AGQ shape. The fit
+        // is unchanged — β/stddev/corr keep their constants — so the movement
+        // is the FD stencil's own truncation-plus-noise error, measured at
+        // 1.32e-5 rel (k=7 se[1], worst) against the `se_hessian_rel` band of
+        // 1e-3. Regenerate by running this test and reading the reported value;
+        // the value is glmm's own, not a reference.
+        &[0.1562674235527202, 0.13104931577314224],
+        &[0.8758219936062426, 0.3726397459266911],
+        &[0.5283132632086392],
+        BAND,
+    );
+    check_vector_agq_pin(
+        "sim_binomial_slope1",
+        csv,
+        11,
+        1,
+        family,
+        &[0.42897959050352286, 0.43458759206119546],
+        // Re-pinned 2026-09-01, same exact-Hessian movement as the k=7 row
+        // above (1.32e-5 rel worst) — see the provenance comment there.
+        &[0.15627017032650084, 0.13105173822010058],
+        &[0.8758453743269463, 0.3726611962891021],
+        &[0.5283433982271978],
+        BAND,
+    );
+}
+
+/// Vector AGQ (q=2), Poisson: `y ~ x + (1 + x | g)` on sim_poisson_slope1 at
+/// nAGQ ∈ {7, 11}. Validated cross-engine by the
+/// `sim_poisson_slope1_agq_k{7,11}` cells against GLMMadaptive.
+///
+/// Relative-tolerance, not bit-equal: these values were frozen on a
+/// different machine and reproduce here (aarch64-apple-darwin) only to rel
+/// ~2.05e-6 (k=7 `beta[1]`) and, the binding one, ~7.07e-5 (k=7 `corr[0]`) —
+/// not bit-exactly — architecture-dependent SIMD/FMA contraction on this
+/// kernel's long reductions, not a regression. 1e-3 is ~14x the worst
+/// observed drift: loose enough to absorb cross-arch reassociation, tight
+/// enough that a real change in the fit still trips it.
+///
+/// **`ref_se` re-pinned 2026-07-30 (FD-θ-step fix), then re-anchored
+/// 2026-07-31; β / stddev / corr are untouched throughout.** This fit's leading
+/// Cholesky diagonal is 1.0118, the only θ coordinate here above 1, so dropping
+/// the `max(1, |θ̂|)` scaling from the FD Hessian's θ step (`glmm::FD_STEP_BASE`,
+/// and the step-construction comment in `glmm/se.rs`) shrank exactly one of its
+/// steps, by 1.2%. Across that edit `se_hessian` moves 8.68e-7 (k=7) / 7.80e-7
+/// (k=11) relative — the SAME figure on both machines, which is the cleanest
+/// evidence available that the move is the fix and not the port — and **nothing
+/// else in the fit moves by a bit**. β, the RE stddevs and the correlations are
+/// bit-identical on both sides of the edit, which is why only `se` moved.
+///
+/// The 07-30 re-pin took its values from aarch64, splitting this test across two
+/// reference machines; 07-31 replaced them with the anchor's, which differ from
+/// the aarch64 ones by 5.2e-7 (k=7) / 7.4e-7 (k=11). Both are equally valid
+/// arithmetic and both sit far inside BAND — the point of preferring the anchor
+/// is corpus-wide, not local (`assert_pinned`, "re-freezing rule"). β/stddev/corr
+/// keep their original anchor constants and remain what sizes BAND.
+///
+/// **k=7 re-pinned 2026-10-01**: the design is standardized internally before
+/// the fit (x̃ = (x − m)/s, results mapped back), and vector AGQ on a centered
+/// slope takes its product Gauss–Hermite grid in the centered `u`
+/// coordinates: the same model, a different quadrature approximation of it.
+/// `corr[0]` moved 1.8e-3 relative (0.036892 → 0.036960, 6.8e-5 absolute),
+/// `se[1]` 9.2e-5, `stddev[1]` 4.2e-5, `beta[1]` 3.3e-5; −2·logLik is 2.1e-4
+/// lower (412.49286 → 412.49265). The design fitted as given
+/// (`FitWorkspace::set_prestandardized(true)`) reproduces the old values.
+/// k=11 moves inside BAND (its quadrature error is smaller) and keeps its pins.
+#[test]
+fn fit_glmm_poisson_slope1_vector_agq_is_pinned() {
+    const BAND: f64 = 1e-3;
+    let csv = include_str!("../../validation/data/simulated/sim_poisson_slope1.csv");
+    let family = Family::Poisson {
+        link: crate::PoissonLink::Log,
+    };
+    check_vector_agq_pin(
+        "sim_poisson_slope1",
+        csv,
+        7,
+        1,
+        family,
+        &[-1.3538764775013254, 0.49326592477324127],
+        &[0.2183317905167993, 0.18546115299801458],
+        &[1.011790888288728, 0.3357237524091434],
+        &[0.03695983907845937],
+        BAND,
+    );
+    check_vector_agq_pin(
+        "sim_poisson_slope1",
+        csv,
+        11,
+        1,
+        family,
+        &[-1.353312567495963, 0.493094585284533],
+        &[0.21807763915845102, 0.1853032173193218],
+        &[1.0106390790816442, 0.33617266187700573],
+        &[0.037212955698941674],
+        BAND,
+    );
+}
+
+/// Vector AGQ (q=3), binomial: `y ~ x1 + x2 + (1 + x1 + x2 | g)` on
+/// sim_binomial_slope2 at nAGQ ∈ {7, 11} — the q_p ≤ 3 cap surface and the
+/// kernel's dimensional generality. Validated cross-engine by the
+/// `sim_binomial_slope2_agq_k{7,11}` cells against GLMMadaptive.
+///
+/// Relative-tolerance, not bit-equal. These values reproduce BIT-EXACTLY on the
+/// anchor machine (see `assert_pinned`'s "which machine the pins are frozen on");
+/// BAND is margin for aarch64-apple-darwin, where the k=7 β drifts 3.60e-6
+/// (`beta[2]`) from architecture-dependent SIMD/FMA contraction on this kernel's
+/// long reductions. 5e-5 is ~14x that: loose enough to absorb cross-arch
+/// reassociation, tight enough that a real change in the fit still trips it.
+///
+/// **`ref_se` re-pinned 2026-07-30 (FD-θ-step fix), then re-anchored
+/// 2026-07-31; β / stddev / corr are untouched throughout.** Same mechanism as
+/// the `sim_poisson_slope1` sibling above and documented there: only this fit's
+/// leading Cholesky diagonal (1.0640) is above 1, so exactly one FD θ step shrank,
+/// by 6.4%, and `se_hessian` moves 1.20e-7 relative at both k — again the same
+/// figure on both machines. Everything else in the fit is bit-identical across
+/// the edit. As on the sibling, the 07-30 re-pin took aarch64 values and 07-31
+/// replaced them with the anchor's (differing by 1.78e-6 at k=7, 9.7e-9 at k=11).
+/// The θ-step move is ~15x smaller than that cross-arch spread, so BAND is
+/// unchanged and still sized by `beta[2]`'s 3.60e-6 — both re-pins are
+/// bookkeeping, not a tolerance question.
+///
+/// **Every value re-pinned 2026-09-28** on the anchor: the joint search steps β
+/// in whitened coordinates (`glmm::workspace::BetaScale`), which moves where it
+/// stops inside `GLMM_RHO_END`. Largest move 6.8e-5 relative (k=7 `corr[2]`, a
+/// correlation of −0.031, so 2.1e-6 absolute); logLik −1.5e-10 (k=7) and
+/// +3e-12 (k=11).
+///
+/// k=7 re-pinned 2026-10-01, P45 follow-up simplification: `BetaScale` builds
+/// its factor from `DesignQr`'s Givens QR instead of a Gram Cholesky, which
+/// moves where the search stops inside `GLMM_RHO_END`. Largest move `corr[2]`,
+/// 4.4e-5 relative to the tree before (6.6e-5 from the old pin, 2.0e-6
+/// absolute); logLik −9.0e-11, same eval count, no flag change.
+///
+/// k=7 re-pinned 2026-10-02 with the per-search BOBYQA start radii (the
+/// `Joint` route at `GLMM_RHO_BEGIN` = 0.2): the search takes another path to
+/// the same optimum, 109 evaluations where it took 122. Largest move
+/// `corr[2]`, 6.3e-5 relative (2.0e-6 absolute); deviance 3.2e-10 lower; no
+/// converged, singular or pinned flag changed. k=11 stays inside BAND and
+/// keeps its pin.
+#[test]
+fn fit_glmm_binomial_slope2_vector_agq_is_pinned() {
+    const BAND: f64 = 5e-5;
+    let csv = include_str!("../../validation/data/simulated/sim_binomial_slope2.csv");
+    let family = Family::Binomial {
+        link: BinomialLink::Logit,
+    };
+    check_vector_agq_pin(
+        "sim_binomial_slope2",
+        csv,
+        7,
+        2,
+        family,
+        &[0.3730525694081695, 0.5380988652312747, -0.3654850855787304],
+        &[
+            0.13111389996179618,
+            0.10465299808621646,
+            0.10556892327593076,
+        ],
+        &[1.0640274346582703, 0.6217303639923306, 0.6420947597771685],
+        &[
+            0.21906831864387702,
+            0.13220444899196618,
+            -0.030984358419670927,
+        ],
+        BAND,
+    );
+    check_vector_agq_pin(
+        "sim_binomial_slope2",
+        csv,
+        11,
+        2,
+        family,
+        &[0.3730621309644322, 0.5381094614248145, -0.3654897859420569],
+        &[0.13112090533814835, 0.1046566478846126, 0.105572460888112],
+        &[1.064097720832643, 0.6217680934114852, 0.642136792602007],
+        &[
+            0.21910468191206503,
+            0.1322221463873123,
+            -0.031020080603484254,
+        ],
+        BAND,
+    );
+}
+
+/// Boundary singular flag on a GLMM: a scalar random-intercept
+/// binomial-logit fit with NO cluster signal (`y` drawn from a
+/// fixed-effects-only logit; the grouping factor is present but no cluster
+/// deviation is added to `eta`) must pin θ̂ ≈ 0 and set `Fit::singular`,
+/// mirroring the LMM boundary case
+/// (`fit_lmm_weighted_boundary_matches_wls`'s `mixed.singular` assert) but
+/// for the GLMM path, which sets `singular` from `boundary_hit` OR
+/// `has_negligible_component` (`fit/glmm.rs`'s `SINGULAR_REL_TOL` check) —
+/// neither of which any existing GLMM test exercises. 40 clusters × 10 reps
+/// (n=400): fewer clusters/reps left tau2[0] at a small positive REML
+/// estimate instead of pinning at the boundary (finite-sample cluster-mean
+/// noise still readable as signal) — verified empirically, not a guess.
+#[test]
+fn fit_glmm_binomial_no_cluster_signal_is_singular() {
+    let n_clusters = 40u32;
+    let reps = 10usize;
+    let n = n_clusters as usize * reps;
+    let p = 2;
+    let mut xm = Mat::<f64>::zeros(n, p);
+    let mut y = vec![0.0f64; n];
+    let mut cl = vec![0u32; n];
+    let mut st = 11u64;
+    let mut i = 0;
+    for c in 0..n_clusters {
+        for _ in 0..reps {
+            let cov = lcg(&mut st);
+            // Fixed-effects-only logit — no per-cluster deviation added, so
+            // the true random-intercept variance is exactly zero.
+            let eta = 0.3 + 0.5 * cov;
+            let prob = 1.0 / (1.0 + (-eta).exp());
+            let draw = (lcg(&mut st) + 1.0) / 2.0;
+            xm[(i, 0)] = 1.0;
+            xm[(i, 1)] = cov;
+            cl[i] = c;
+            y[i] = if draw < prob { 1.0 } else { 0.0 };
+            i += 1;
+        }
+    }
+    let mut x = vec![0.0f64; n * p];
+    for row in 0..n {
+        for col in 0..p {
+            x[row * p + col] = xm[(row, col)];
+        }
+    }
+    let ids = GroupIds {
+        primary: cl,
+        extra: vec![],
+    };
+    let model = ModelSpec {
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let f = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &ids,
+        &FitOptions {
+            target_indices: vec![0, 1],
+            ..FitOptions::default()
+        },
+    );
+    assert!(f.converged(), "no-signal GLMM must still converge");
+    assert!(f.singular(), "must flag the θ≈0 boundary as singular");
+    assert!(
+        f.tau2[0] < 1e-4,
+        "tau2[0] must pin near zero, got {}",
+        f.tau2[0]
+    );
+}
+
+/// A real but tiny random-intercept SD under very precise data: Poisson counts
+/// near e¹⁶ (working weights about 9e6), 10 clusters × 100 rows, true SD 9e-5.
+/// The search ends at θ̂ ≈ 7e-5, below `PIN_THETA`. Zeroing it with β held
+/// leaves the fit about 46 deviance units above the search's own optimum and
+/// above the plain GLM, whose likelihood is the θ = 0 corner of the GLMM's.
+/// `fit_glmm`'s incumbent check must undo that pin, on the Laplace route and
+/// on the AGQ route.
+#[test]
+fn glmm_pin_never_ends_above_the_glm() {
+    let (n_g, m) = (10usize, 100usize);
+    let n = n_g * m;
+    let mut st = 7932u64;
+    let b: Vec<f64> = (0..n_g)
+        .map(|_| 9e-5 * 3f64.sqrt() * lcg(&mut st))
+        .collect();
+    let xs: Vec<f64> = (0..n).map(|_| lcg(&mut st)).collect();
+    let x: Vec<f64> = xs.iter().flat_map(|&v| [1.0, v]).collect();
+    let y: Vec<f64> = (0..n)
+        .map(|i| (16.0 + b[i % n_g] + 0.01 * xs[i]).exp().round())
+        .collect();
+    let family = Family::Poisson {
+        link: PoissonLink::Log,
+    };
+    let ids = GroupIds {
+        primary: (0..n).map(|i| (i % n_g) as u32).collect(),
+        extra: vec![],
+    };
+    let glm = fit_cold(
+        &x,
+        &y,
+        n,
+        2,
+        &ModelSpec { family, re: None },
+        &GroupIds {
+            primary: vec![],
+            extra: vec![],
+        },
+        &FitOptions::default(),
+    );
+    assert!(glm.converged());
+    let model = ModelSpec {
+        family,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_g as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    for nagq in [1u8, 7] {
+        let f = fit_cold(
+            &x,
+            &y,
+            n,
+            2,
+            &model,
+            &ids,
+            &FitOptions {
+                nagq,
+                ..FitOptions::default()
+            },
+        );
+        assert!(f.converged(), "nagq {nagq}: not converged");
+        assert!(
+            -2.0 * f.loglik <= -2.0 * glm.loglik + 1e-6,
+            "nagq {nagq}: GLMM -2 loglik {} above the GLM's {}",
+            -2.0 * f.loglik,
+            -2.0 * glm.loglik
+        );
+        assert!(
+            !f.singular() && f.tau2[0] > 0.0,
+            "nagq {nagq}: the variance was pinned (tau2 {})",
+            f.tau2[0]
+        );
+    }
+}
+
+/// A crossed grouping with no variance under very precise data: Poisson
+/// counts near e¹⁴, `y ~ z + (1 | g) + (1 | h)` with no h effect, 12 × 5
+/// levels, 120 rows. Its θ_h sits in the narrow trough log(1 + θ_h²·Σw) at 0,
+/// where the search's trust radius shrinks to its end with σ_g still off the
+/// `(1 | g)` optimum. The crossed fit's θ_h = 0 corner is the `(1 | g)` model,
+/// so the crossed fit must not end above it: `fit_glmm`'s trough polish moves
+/// σ_g from the pinned point. Both outer routes are checked. The BOBYQA
+/// route is where the search starves (σ_g at 0.77 against 0.53, 2.6
+/// deviance units above the optimum), and where its endpoint lands inside
+/// the trough is round-off: on x86 the pin dropped the objective enough to
+/// run the polish, on aarch64 it did not (2026-10-08), so the polish is
+/// keyed on the stationarity probe of the pinned corner as well. The
+/// gradient route, the cold default on this shape, reaches the optimum by
+/// itself.
+#[test]
+fn crossed_zero_variance_reaches_the_single_grouping_optimum() {
+    use super::core::{build_workspace, fit_on};
+    let (n_g, n_h, n) = (12usize, 5usize, 120usize);
+    let mut st = 7932u64;
+    let b: Vec<f64> = (0..n_g).map(|_| lcg(&mut st)).collect();
+    let _slopes: Vec<f64> = (0..n_g).map(|_| lcg(&mut st)).collect();
+    let z: Vec<f64> = (0..n_g).map(|_| lcg(&mut st)).collect();
+    let mut x = vec![0.0f64; n * 2];
+    let mut y = vec![0.0f64; n];
+    let (mut gid, mut hid) = (vec![0u32; n], vec![0u32; n]);
+    for i in 0..n {
+        let g = i % n_g;
+        gid[i] = g as u32;
+        hid[i] = ((i / n_g) % n_h) as u32;
+        x[2 * i] = 1.0;
+        x[2 * i + 1] = z[g];
+        let _ = lcg(&mut st);
+        y[i] = (14.0 + 0.5 * z[g] + b[g]).exp().round();
+    }
+    let family = Family::Poisson {
+        link: PoissonLink::Log,
+    };
+    let fit = |extra: bool, bobyqa: bool| {
+        let model = ModelSpec {
+            family,
+            re: Some(ReStructure {
+                sizing: Sizing::FixedClusters {
+                    n_clusters: n_g as u32,
+                },
+                slopes: vec![],
+                extra_groupings: if extra {
+                    vec![Grouping {
+                        relation: GroupingRelation::Crossed {
+                            n_clusters: n_h as u32,
+                        },
+                        slopes: vec![],
+                    }]
+                } else {
+                    vec![]
+                },
+            }),
+        };
+        let ids = GroupIds {
+            primary: gid.clone(),
+            extra: if extra { vec![hid.clone()] } else { vec![] },
+        };
+        let opts = FitOptions::default();
+        let (sized, sids, perm) = spec_sized_from_ids_pub(&model, &ids);
+        let mut ws = build_workspace(&sized, perm, n, 2, &opts);
+        if bobyqa {
+            super::core::force_bobyqa_route(&mut ws);
+        }
+        fit_on(&mut ws, &x, &y, &sids, None, &opts).into_fit(&x, &y, &sids, n, 2, &model, &opts)
+    };
+    let single = fit(false, false);
+    assert!(single.converged() && !single.singular());
+    for (route, bobyqa) in [("gradient", false), ("BOBYQA", true)] {
+        let crossed = fit(true, bobyqa);
+        assert!(crossed.converged(), "{route}: not converged");
+        assert!(crossed.singular(), "{route}: θ_h must pin");
+        assert!(
+            crossed.deviance <= single.deviance + 1e-6,
+            "{route}: crossed deviance {} above the (1 | g) optimum {}",
+            crossed.deviance,
+            single.deviance
+        );
+    }
+}
+
+/// The ρ = −1 trap on a 3-term block, dense GLMM `ExactProfile` route.
+/// `tests/fixtures/glmm_npt_trap.csv` is one 800-row Bernoulli draw —
+/// `y ~ x1 + x2 + (1 + x1 + x2 | g)`, 40 clusters × 20 rows, true RE
+/// correlation ≈ −0.76 between the intercept and `x1`. Nothing in the 48-rung
+/// validation corpus exits at a boundary, so without this fixture the trap
+/// mechanism would be untested in-crate on this route.
+///
+/// With the diagonal θ boxed at `[0, THETA_HI]` the search stopped on the face
+/// Λ_jj = 0 at 910.3787 with the `x1` diagonal pinned and the entries below
+/// it of the wrong sign — a first-order stationary point of the boxed
+/// problem, since Σ = ΛΛᵀ is even in each block column and the two sign
+/// halves meet only on that face. Under the signed box
+/// (`blind_theta_and_bounds`) the face is an interior point and the search
+/// walks through it to 910.2127 in one search of 148 evaluations (the
+/// retired `npt = n + 2` re-run reached the same basin at 284). lme4 on the
+/// same draw: 910.2151 by default and 910.3823 with `nAGQ0initStep = FALSE`
+/// — the same two basins, so this is a property of the surface, not of one
+/// optimizer. `DEV_BAND` is loose because only the basin is being asserted;
+/// the gap between the basins is 170× it.
+///
+/// The RE stddevs, not the pinned-component flags, are what identifies the
+/// basin here. Which diagonal reads as pinned is not stable: the escaped
+/// optimum leaves that diagonal within a few 1e-5 of `PIN_THETA`, and merely
+/// renumbering the 40 clusters (numeric instead of lexicographic label order —
+/// the same model, the same optimum to 1e-9 in deviance) moves it to the other
+/// side of the threshold. The stddevs agree to 5e-5 relative across that
+/// relabelling and separate the two basins by 8–23%, and they also reproduce
+/// lme4's `0.89153 / 0.10321 / 0.23743` on this draw to 0.1%.
+#[test]
+fn fit_glmm_signed_box_escapes_the_singular_circle() {
+    const DEV_BAND: f64 = 1e-3;
+    const SD_BAND: f64 = 5e-3;
+    const TRAPPED_DEVIANCE: f64 = 910.3787035640;
+    const ESCAPED_DEVIANCE: f64 = 910.2127359705;
+    let csv = include_str!("../../tests/fixtures/glmm_npt_trap.csv");
+    let mut y = Vec::<f64>::new();
+    let mut x1 = Vec::<f64>::new();
+    let mut x2 = Vec::<f64>::new();
+    let mut g_raw = Vec::<String>::new();
+    for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+        let f: Vec<&str> = line.split(',').map(|s| s.trim_matches('"')).collect();
+        y.push(f[0].parse().unwrap());
+        x1.push(f[1].parse().unwrap());
+        x2.push(f[2].parse().unwrap());
+        g_raw.push(f[3].to_string());
+    }
+    let n = y.len();
+    let p = 3;
+    let mut x = vec![0.0f64; n * p];
+    for i in 0..n {
+        x[i * p] = 1.0;
+        x[i * p + 1] = x1[i];
+        x[i * p + 2] = x2[i];
+    }
+    let mut labels: Vec<&str> = g_raw.iter().map(String::as_str).collect();
+    labels.sort_unstable();
+    labels.dedup();
+    let primary: Vec<u32> = g_raw
+        .iter()
+        .map(|l| labels.iter().position(|x| x == l).unwrap() as u32)
+        .collect();
+    let n_clusters = labels.len();
+    let ids = GroupIds {
+        primary,
+        extra: vec![],
+    };
+    let model = ModelSpec {
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters as u32,
+            },
+            slopes: vec![1, 2],
+            extra_groupings: vec![],
+        }),
+    };
+    let f = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &ids,
+        &FitOptions {
+            target_indices: (0..p as u32).collect(),
+            ..FitOptions::default()
+        },
+    );
+    assert!(f.converged(), "trap draw must converge");
+    assert!(
+        (f.deviance - ESCAPED_DEVIANCE).abs() < DEV_BAND,
+        "deviance {} is not the interior basin {ESCAPED_DEVIANCE} (trapped basin is {TRAPPED_DEVIANCE})",
+        f.deviance
+    );
+    assert!(
+        f.deviance < TRAPPED_DEVIANCE - DEV_BAND,
+        "the signed box must beat the boxed search's face, got {} vs {TRAPPED_DEVIANCE}",
+        f.deviance
+    );
+    assert_pinned(
+        &f.stddev_corr(0).0,
+        &[0.8922556154657538, 0.10371641873371715, 0.23757089840392914],
+        SD_BAND,
+        "trap draw stddev",
+    );
+}
+
+/// One measured sign-trap draw per dense GLMM route shape, each a simulated
+/// 300-row draw (30 groups × 10 rows, `g1` the one grouping column) frozen
+/// as a fixture from the 2026-09-10 sign-trap simulation study. `stopped` is
+/// where the search
+/// ended with the diagonal θ boxed at `[0, THETA_HI]` — a diagonal on the
+/// face Λ_jj = 0 with entries below it of the wrong sign, or, on the
+/// "walk-back" and "empty-column" draws, a stop the retired flip / push /
+/// kick re-runs were needed for — and `reached` is what the signed box
+/// reaches in one search. Both are asserted: the fit must land within
+/// `DEV_BAND` of `reached` and below `stopped` by more than `DEV_BAND`.
+/// Convergence, not just the deviance, is checked on every draw.
+#[cfg(feature = "formula")]
+fn assert_sign_trap_escaped(
+    what: &str,
+    csv: &str,
+    formula: &str,
+    family: Family,
+    nagq: u8,
+    stopped: f64,
+    reached: f64,
+) {
+    const DEV_BAND: f64 = 1e-3;
+    let lo = super::common_tests::fixture_lowered(csv, &["g1"], formula, family);
+    let opts = FitOptions {
+        nagq,
+        ..lo.opts.clone()
+    };
+    let f = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &opts);
+    assert!(
+        f.converged(),
+        "{what}: must converge ({:?})",
+        f.diagnostics.boundary
+    );
+    let dev = -2.0 * f.loglik;
+    assert!(
+        (dev - reached).abs() < DEV_BAND,
+        "{what}: −2·loglik {dev} is not the escaped basin {reached} (boxed search stopped at {stopped}; {} evaluations)",
+        f.n_eval
+    );
+    assert!(
+        dev < stopped - DEV_BAND,
+        "{what}: −2·loglik {dev} does not beat the boxed search's stop {stopped}"
+    );
+}
+
+/// Dense GLMM `ExactProfile`: Bernoulli `y ~ x1 + (1 + x1 | g1)`, generated
+/// with a zero random-slope SD. Boxed, the search stopped on Λ₀₀ = 0 with
+/// λ₁₀ = 0.094 (internal) below it, deviance 397.6085, the intercept pinned
+/// (57 evaluations, 105 with the retired re-run); the signed box reaches
+/// 397.4577 in 55, with the slope diagonal at the pin instead.
+#[cfg(feature = "formula")]
+#[test]
+fn fit_glmm_sign_trap_dense_exact_profile() {
+    assert_sign_trap_escaped(
+        "dense ExactProfile",
+        include_str!("../../tests/fixtures/sign_trap_glmm_dense_slope.csv"),
+        "y ~ x1 + (1 + x1 | g1)",
+        Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        1,
+        397.6085441897,
+        397.4576798411,
+    );
+}
+
+/// Dense GLMM `Joint` under AGQ (nAGQ = 3 on a 3-term block, the vector
+/// kernel): Bernoulli `y ~ x1 + x2 + (1 + x1 + x2 | g1)`, generated with a
+/// rank-1 random-effect covariance. Boxed, the search stopped at 387.3085 in
+/// 270 evaluations; the signed box
+/// reaches 387.2703 in 316. lme4 refuses nAGQ > 1 on a vector random effect,
+/// so this shape has no external reference — the two basins are glmm's own.
+/// Re-pinned 2026-10-01: the design is standardized internally before the fit,
+/// and vector AGQ on the centered slopes integrates in the centered `u`
+/// coordinates, a different quadrature approximation of the same model; the
+/// escaped basin now reads 387.2639 (244 evaluations). The design fitted as
+/// given (`FitWorkspace::set_prestandardized(true)`) still reaches 387.2703.
+#[cfg(feature = "formula")]
+#[test]
+fn fit_glmm_sign_trap_dense_joint_agq() {
+    assert_sign_trap_escaped(
+        "dense Joint AGQ",
+        include_str!("../../tests/fixtures/sign_trap_glmm_agq_q3.csv"),
+        "y ~ x1 + x2 + (1 + x1 + x2 | g1)",
+        Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        3,
+        387.3084738547,
+        387.2638828427,
+    );
+}
+
+/// The walk-back case: Poisson `y ~ x1 + x2 + (1 + x1 + x2 | g1)`, generated
+/// with a rank-1 random-effect covariance, dense `ExactProfile`. Boxed, the
+/// first search stopped
+/// at 998.0913 with the `x1` diagonal on the face and both entries below it
+/// non-zero; a flipped warm start alone did not reach the optimum (it needed
+/// the diagonal pushed off the face first). The signed box reaches 994.7496
+/// in 211 evaluations (368 with the retired re-run).
+#[cfg(feature = "formula")]
+#[test]
+fn fit_glmm_sign_trap_walk_back() {
+    assert_sign_trap_escaped(
+        "walk-back",
+        include_str!("../../tests/fixtures/sign_trap_glmm_walkback_q3.csv"),
+        "y ~ x1 + x2 + (1 + x1 + x2 | g1)",
+        Family::Poisson {
+            link: PoissonLink::Log,
+        },
+        1,
+        998.0913393396,
+        994.7495903063,
+    );
+}
+
+/// The empty-column case: Bernoulli, same formula as the walk-back draw,
+/// generated with random-effect correlations of 0.95. Boxed, the first
+/// search stopped at 384.1806 with the
+/// `x1` diagonal on the face and nothing below it to flip (both entries at
+/// or under the pin threshold), so no sign-flip re-run could move it. The
+/// signed box reaches 384.0195 in 110 evaluations (189 with the retired
+/// re-run).
+#[cfg(feature = "formula")]
+#[test]
+fn fit_glmm_sign_trap_empty_column() {
+    assert_sign_trap_escaped(
+        "empty column",
+        include_str!("../../tests/fixtures/sign_trap_glmm_emptycol_q3.csv"),
+        "y ~ x1 + x2 + (1 + x1 + x2 | g1)",
+        Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        1,
+        384.1806428649,
+        384.0194701453,
+    );
+}
+
+/// Large-θ̂ coverage, AGQ arm: binomial GLMM
+/// `y ~ 1 + x + z + (1 | g)` on `sim_binomial_bigsd` at nAGQ ∈ {7, 11}, gated
+/// against the frozen `glmer(nAGQ = k, tolPwrss = 1e-13)` goldens
+/// `validation/goldens/sim_binomial_bigsd_agq_k{7,11}.json`. lme4-only SE
+/// (MixedModels computes no `se_hessian`). The oracle is sacred.
+///
+/// **Why this rung exists.** It is the only in-crate gate that reaches the FD
+/// Hessian at a random-effect SD well above 1 — θ̂ = 4.85 (k=7) and 5.16 (k=11),
+/// against a corpus that otherwise tops out at 1.13. The θ step is
+/// `FD_STEP_BASE`, unscaled by θ̂, so these two fits difference the deviance
+/// over ±0.01 and carry only 1.9e-7 and 1.8e-7 relative truncation error off
+/// our own h→0 stencil limit even at this θ̂ range. Nothing else in the crate
+/// could see a step that scaled with θ̂: every other GLMM rung has θ̂ at or
+/// near 1.
+///
+/// **BAND = 2e-5, and it is reference-limited, not ours.** Measured post-fix
+/// through this test's own lowering on aarch64-apple-darwin 2026-07-30, worst
+/// coordinate of each quantity: `se_hessian` 7.18e-6 (k=7) / 8.35e-6 (k=11),
+/// β 2.13e-6 / 5.51e-6, RE stddev 2.35e-6 / 2.15e-6. `grid/tol.R`'s convention is
+/// ceil-to-one-significant-figure of ~2× the measured worst, which the binding
+/// `se_hessian` figure (2 × 8.35e-6 = 1.67e-5) puts at 2e-5; β and stddev clear
+/// that with ≥3× to spare, so one band serves all three. The residual is **the
+/// golden's own**: lme4's `vcov(use.hessian = TRUE)` is `lme4:::deriv12` at an
+/// ABSOLUTE δ = 1e-4, which carries 8.34e-6 / 8.36e-6 relative error here — i.e.
+/// post-fix the whole remaining disagreement is accounted for by the reference,
+/// and tightening the band further would pin a number lme4 cannot itself
+/// reproduce (two runs of its own stencil differ by 4.5e-7…1.8e-6). Do not read
+/// the band as our accuracy.
+///
+/// **This band is not fail-before/pass-after evidence, and must not be read
+/// as it.** What it measures is against our own h→0 limit, not against lme4.
+/// The release's fail-before/pass-after evidence is the `sim_poisson_bigsd`
+/// fixture's cross-engine `se_hessian` comparison, not this test.
+///
+/// Sizing note: k = 7 → k = 11 still moves
+/// θ̂ by 6.3% on this dataset, so **k = 11 is not the AGQ limit here** and the two
+/// goldens are not expected to agree closely with each other — `se_hessian`
+/// differs between them by up to 6.2% on the intercept. That is the fit moving
+/// with the quadrature order, not disagreement, which is why each k is pinned
+/// against its own golden rather than against the other.
+#[test]
+fn fit_glmm_binomial_bigsd_agq_matches_lme4() {
+    // ceil₁(2 × 8.35e-6 = 1.67e-5); see the doc comment for why it is the reference's floor.
+    const BAND: f64 = 2e-5;
+    // (nAGQ, β, se_hessian, RE stddev) per the frozen golden.
+    let refs: [(u8, [f64; 3], [f64; 3], f64); 2] = [
+        (
+            7,
+            [0.786420873395614, 0.903437833126084, -0.616408180886449],
+            [0.333946011198284, 0.112745333379985, 0.195512460550797],
+            4.85249696634019,
+        ),
+        (
+            11,
+            [0.824994474498218, 0.913561093491045, -0.622307953920597],
+            [0.354539726379712, 0.113789698253031, 0.196816594693318],
+            5.15796068325673,
+        ),
+    ];
+    // Columns are y, x, z, g; `z` is numeric 0/1 and `g` (the grouping) is the
+    // only factor — the same lowering `validation/manifest.json` declares.
+    let csv = include_str!("../../validation/data/simulated/sim_binomial_bigsd.csv");
+    let p = 3;
+    let mut x = Vec::<f64>::new();
+    let mut y = Vec::<f64>::new();
+    let mut g_raw = Vec::<u32>::new();
+    for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+        let f: Vec<&str> = line.split(',').map(|s| s.trim_matches('"')).collect();
+        y.push(f[0].parse().unwrap());
+        x.extend_from_slice(&[1.0, f[1].parse().unwrap(), f[2].parse().unwrap()]);
+        g_raw.push(f[3].parse().unwrap());
+    }
+    let n = y.len();
+    let (cluster_ids, n_clusters) = dense_ids(&g_raw);
+    assert_eq!((n, n_clusters), (1800, 300), "R1 fixture shape");
+    for (nagq, ref_beta, ref_se, ref_sd) in refs {
+        let model = ModelSpec {
+            family: Family::Binomial {
+                link: BinomialLink::Logit,
+            },
+            re: Some(ReStructure {
+                sizing: Sizing::FixedClusters {
+                    n_clusters: n_clusters as u32,
+                },
+                slopes: vec![],
+                extra_groupings: vec![],
+            }),
+        };
+        let f = fit_cold(
+            &x,
+            &y,
+            n,
+            p,
+            &model,
+            &GroupIds {
+                primary: cluster_ids.clone(),
+                extra: vec![],
+            },
+            &FitOptions {
+                target_indices: vec![0, 1, 2],
+                nagq,
+                ..FitOptions::default() // WaldSe::Hessian — the whole point of the rung
+            },
+        );
+        assert!(f.converged(), "bigsd AGQ k={nagq} must converge");
+        assert!(!f.singular(), "bigsd AGQ k={nagq} is an interior fit");
+        let what = format!("sim_binomial_bigsd k={nagq}");
+        assert_pinned(&f.beta, &ref_beta, BAND, &format!("{what} beta"));
+        assert_pinned(&f.se, &ref_se, BAND, &format!("{what} se_hessian"));
+        let (stddev, _) = f.stddev_corr(0);
+        assert_pinned(&stddev, &[ref_sd], BAND, &format!("{what} stddev"));
+    }
+}
+
+/// The θ = 0 end of the large-θ̂ coverage axis, on the **committed**
+/// `sim_binomial_zerosd` fixture rather than a synthetic draw.
+///
+/// This gates a *documented behavioural divergence*, not a number, and it is why
+/// this test is deliberately NOT a curated `datasets` rung (`//large_theta_rungs` in
+/// `validation/manifest.json`). What diverges from lme4 is only the reporting:
+///
+/// - **glmm** pins the component and reports `converged = true` with
+///   `singular = true`.
+/// - **lme4** emits `boundary (singular) fit`, which lands in
+///   `m@optinfo$conv$lme4$messages` — so an oracle script's rule
+///   (`converged = length(messages) == 0`) records `converged = FALSE` for the
+///   very same fit. `isSingular()` is `TRUE` on both sides.
+///
+/// That difference-in-default had no test behind it.
+/// `grid/compare.R` cannot supply one: it compares β, SEs, stddevs, loglik and
+/// coefficient names and reads no convergence flag at all — and both engines land
+/// on a **bit-exact 0.0** stddev, so every numeric gate it does run reports
+/// perfect agreement. Two further reasons the rung track is closed to this test, both
+/// measured 2026-07-30 rather than assumed: lme4's
+/// `vcov(m, use.hessian = TRUE)` — exactly what the oracle scripts
+/// call — **hard-errors** on this fit (`'use.hessian'=TRUE specified, but Hessian
+/// is unavailable`; `m@optinfo$derivs` is `NULL` on a boundary fit), so running it as
+/// a rung would abort the whole oracle run; and at θ̂ = 0 the θ↔β coupling block
+/// vanishes, so `se_hessian` and `se_rx` collapse onto each other (9.4e-6 apart
+/// here, against 9.7e-2 on `fit_glmm_binomial_bigsd_agq_matches_lme4`) — this test
+/// gates nothing about the coupling term.
+///
+/// Hence: in-crate, no oracle JSON, asserting the flags and the exact zero.
+/// The exact zero is the assert that has to be `==`, not a band: `rel_max` floors
+/// its denominator at 1e-12 (`validation/grid/tol.R`), so a *tiny nonzero* θ̂ against
+/// lme4's exact 0.0 would read as a relative difference of exactly 1.0. A
+/// seed sweep found Bernoulli-shaped cells that returned 1.5e-8 / 3.9e-8 **while
+/// still flagging singular** — which is why this fixture is the aggregated
+/// (`incidence`/`size`) shape and why "pinned" is checked as bit-equality.
+///
+/// Sibling of `fit_glmm_binomial_no_cluster_signal_is_singular` above, which makes
+/// the same claim on synthetic data with a `< 1e-4` band; this one is the committed
+/// fixture and the exact pin.
+#[test]
+fn glmm_zerosd_boundary_reports_converged_and_singular() {
+    // Aggregated binomial, lowered the way `validation/tools/common.rs`'s
+    // `lower_dataset_generic` does for a manifest `weights` rung: the response is
+    // `prop = incidence/size` and the trial counts enter as prior weights, one row
+    // per aggregate observation. X = [1, x, z] — `z` is numeric 0/1 in the CSV and
+    // the only declared factor is the grouping `g`.
+    let csv = include_str!("../../validation/data/simulated/sim_binomial_zerosd.csv");
+    let p = 3;
+    let mut x = Vec::<f64>::new();
+    let mut y = Vec::<f64>::new();
+    let mut w = Vec::<f64>::new();
+    let mut cl = Vec::<u32>::new();
+    for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+        let f: Vec<&str> = line.split(',').map(|s| s.trim_matches('"')).collect();
+        let incidence: f64 = f[0].parse().unwrap();
+        let size: f64 = f[1].parse().unwrap();
+        x.extend_from_slice(&[1.0, f[2].parse().unwrap(), f[3].parse().unwrap()]);
+        y.push(incidence / size);
+        w.push(size);
+        // Groups are labelled 1..=20 in the CSV; ids are 0-based and dense.
+        cl.push(f[4].parse::<u32>().unwrap() - 1);
+    }
+    let n = y.len();
+    let n_clusters = cl.iter().max().unwrap() + 1;
+    assert_eq!((n, n_clusters), (160, 20), "committed R3 fixture shape");
+
+    let model = ModelSpec {
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let f = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &GroupIds {
+            primary: cl,
+            extra: vec![],
+        },
+        &FitOptions {
+            target_indices: vec![0, 1, 2],
+            weights: Some(w),
+            ..FitOptions::default()
+        },
+    );
+
+    // The two flags the divergence is about, asserted together: reporting a pinned
+    // boundary as a *converged* fit is the whole claim, so `converged` alone or
+    // `singular` alone would each be satisfiable by the wrong behaviour.
+    assert!(
+        f.converged(),
+        "glmm must report the pinned θ=0 boundary as CONVERGED (lme4 records \
+         converged=FALSE on the same fit — documented divergence)"
+    );
+    assert!(
+        f.singular(),
+        "and must flag it singular, as lme4's isSingular does"
+    );
+
+    // Exact, not near: see the rel_max 1e-12-floor note above.
+    let (stddev, _) = f.stddev_corr(0);
+    assert_eq!(stddev.len(), 1, "one scalar grouping");
+    assert_eq!(
+        stddev[0].to_bits(),
+        0.0f64.to_bits(),
+        "RE stddev must be bit-exact 0.0, got {} (bits 0x{:016x})",
+        stddev[0],
+        stddev[0].to_bits()
+    );
+    assert_eq!(
+        f.tau2[0].to_bits(),
+        0.0f64.to_bits(),
+        "tau2[0] must be bit-exact 0.0, got {}",
+        f.tau2[0]
+    );
+    // A pinned boundary is still a reportable fit: the estimates must be finite,
+    // not the NaN-fill a numerical failure would leave behind.
+    assert!(
+        f.beta.iter().chain(&f.se).all(|v| v.is_finite()) && f.loglik.is_finite(),
+        "β/SE/loglik must be finite at the boundary: β {:?} se {:?} loglik {}",
+        f.beta,
+        f.se,
+        f.loglik
+    );
+}
+
+/// The loop tier must fit the SAME model `fit_cold` does when an extra grouping
+/// carries a random slope. The dense GLMM kernel builds intercept-only extras, so
+/// reaching it with such a design fits a reduced model and reports it as a normal
+/// success; `build_workspace`'s `classify_design` call is what keeps the loop tier
+/// off it. Nothing else pins the loop-tier entry itself — the classifier test
+/// (`classify_routes_slope_extras_to_sparse_all_families`) pins only the routing
+/// decision, not that the built workspace acts on it.
+#[test]
+fn loop_tier_honours_extra_grouping_slope() {
+    let (n_g1, n_g2, per) = (8usize, 6usize, 10usize);
+    let n = n_g1 * per;
+    let mut st = 7u64;
+    let (mut x, mut y) = (vec![0.0f64; n * 2], vec![0.0f64; n]);
+    let (mut g1, mut g2) = (vec![0u32; n], vec![0u32; n]);
+    for i in 0..n {
+        g1[i] = (i % n_g1) as u32;
+        g2[i] = (i % n_g2) as u32;
+        let x1 = lcg(&mut st);
+        x[i * 2] = 1.0;
+        x[i * 2 + 1] = x1;
+        // Extra-grouping slope variance ≈ 0.9 in the fitted model — big enough that
+        // dropping the slope would move β̂ well past any optimizer tolerance.
+        let eta = 0.5 + 0.4 * x1 + 0.25 * (g1[i] as f64 - 4.0) + 0.6 * x1 * (g2[i] as f64 - 3.0);
+        y[i] = eta.exp().round();
+    }
+    let model = ModelSpec {
+        family: Family::Poisson {
+            link: crate::PoissonLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 1 },
+            slopes: vec![],
+            extra_groupings: vec![Grouping {
+                relation: GroupingRelation::Crossed { n_clusters: 1 },
+                slopes: vec![1],
+            }],
+        }),
+    };
+    let ids = GroupIds {
+        primary: g1,
+        extra: vec![g2],
+    };
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        ..FitOptions::default()
+    };
+
+    let cold = fit_cold(&x, &y, n, 2, &model, &ids, &opts);
+    assert!(cold.converged(), "reference fit must converge");
+    // The guard is on the extra grouping's SLOPE VARIANCE, read off `varcorr` —
+    // `D[1][1]`, the last entry of that block's q=2 vech. The θ coordinates are
+    // the wrong place to read it: this draw's extra-grouping intercept variance
+    // is zero by construction (the generating η carries `x1·(g2−3)` and no `g2`
+    // main effect), and once `Λ[0][0] = 0` the Cholesky no longer identifies how
+    // the slope variance splits between `Λ[1][0]` and `Λ[1][1]` — only their sum
+    // of squares, which is exactly `D[1][1]`.
+    assert_eq!(cold.varcorr.len(), 2, "primary + one extra grouping");
+    let d_slope = *cold.varcorr[1].last().unwrap();
+    assert!(
+        d_slope > 0.1,
+        "the draw must actually carry an extra-grouping slope variance: varcorr {:?}",
+        cold.varcorr
+    );
+
+    let (sized, ids, perm) = super::common::spec_sized_from_ids(&model, &ids);
+    let mut ws = super::core::build_workspace(&sized, perm, n, 2, &opts);
+    let view = super::core::fit_on(&mut ws, &x, &y, &ids, None, &opts);
+    for j in 0..2 {
+        assert_eq!(
+            view.betas()[j],
+            cold.beta[j],
+            "loop tier must reach fit_cold's β exactly: β[{j}]"
+        );
+    }
+}
+
+/// Parses `validation/data/simulated/sim_binomial_slope1.csv` into the q=2
+/// random-slope design `y ~ 1 + x + (1 + x | g)` — the same fixture
+/// `check_vector_agq_pin` uses for the AGQ pins above, reused here because it
+/// is already known to converge under a random primary slope. Column 1 (`x`)
+/// is both the fixed-effect covariate and the primary random-slope covariate.
+fn sim_binomial_slope1_design() -> (Vec<f64>, Vec<f64>, usize, usize, ModelSpec, GroupIds) {
+    let csv = include_str!("../../validation/data/simulated/sim_binomial_slope1.csv");
+    let mut y = Vec::<f64>::new();
+    let mut xcol = Vec::<f64>::new();
+    let mut g_raw = Vec::<u32>::new();
+    for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+        let f: Vec<&str> = line.split(',').map(|s| s.trim_matches('"')).collect();
+        y.push(f[0].parse().unwrap());
+        xcol.push(f[1].parse().unwrap());
+        g_raw.push(f[2].parse().unwrap());
+    }
+    let n = y.len();
+    let p = 2;
+    let mut x = vec![0.0f64; n * p];
+    for i in 0..n {
+        x[i * p] = 1.0;
+        x[i * p + 1] = xcol[i];
+    }
+    let (primary, n_clusters) = dense_ids(&g_raw);
+    let model = ModelSpec {
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters as u32,
+            },
+            slopes: vec![1],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary,
+        extra: vec![],
+    };
+    (x, y, n, p, model, ids)
+}
+
+/// `stddev_se` is the delta method of the reported stddev `√varcorr_kk` on the
+/// fit's own θ̃ covariance, with the Jacobian taken by central differences of
+/// the map that reports `varcorr` (`assemble_varcorr`) at the fit's θ̃: on a
+/// block with a centered slope, and on one whose 0/1 slope is only scaled.
+#[test]
+fn stddev_se_is_the_delta_method_of_the_reported_stddev() {
+    let (x, y, n, p, model, ids) = sim_binomial_slope1_design();
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        wald_se: WaldSe::Hessian,
+        ..FitOptions::default()
+    };
+    let mut x01 = x.clone();
+    for i in 0..n {
+        x01[i * p + 1] = if x[i * p + 1] > 0.0 { 1.0 } else { 0.0 };
+    }
+    for (centered, xx) in [(true, &x), (false, &x01)] {
+        let mut cs = ColumnScaling::with_re_slopes(p, [1]);
+        cs.compute(xx, n, p, None, true);
+        assert_eq!(cs.shift(1) != 0.0, centered);
+        let (mut ws, mut x_mat) =
+            super::glmm::fit_glmm_build(xx, n, p, &model, &ids.primary, &ids.extra, &opts)
+                .unwrap_or_else(|_| panic!("design must build"));
+        super::common::fill_col_major_std(&mut x_mat, xx, n, p, &cs);
+        let view = super::glmm::run_glmm_on(
+            &mut ws,
+            x_mat.as_ref(),
+            &y,
+            n,
+            p,
+            &model,
+            &ids.primary,
+            &ids.extra,
+            f64::NAN,
+            None,
+            &opts,
+            &cs,
+        );
+        let fit = super::glmm::glmm_view_to_fit(&view, &y, n, p, &model, &opts).0;
+        assert!(fit.converged(), "centered {centered}: must converge");
+        let theta: Vec<f64> = ws.params[..3].to_vec();
+        let sd = |t: &[f64]| {
+            let vc = super::common::assemble_varcorr(t, &ws.groupings, 1.0, &cs);
+            [vc[0][0].sqrt(), vc[0][2].sqrt()]
+        };
+        let at = sd(&theta);
+        assert_eq!(at, [fit.varcorr[0][0].sqrt(), fit.varcorr[0][2].sqrt()]);
+        let mut jac = [[0.0f64; 3]; 2];
+        for a in 0..3 {
+            let h = 1e-6;
+            let (mut tp, mut tm) = (theta.clone(), theta.clone());
+            tp[a] += h;
+            tm[a] -= h;
+            let (fp, fm) = (sd(&tp), sd(&tm));
+            for k in 0..2 {
+                jac[k][a] = (fp[k] - fm[k]) / (2.0 * h);
+            }
+        }
+        let cov = &ws.inference.theta_cov;
+        for (k, slot) in [(0, 0), (1, 2)] {
+            let v: f64 = (0..3)
+                .flat_map(|a| (0..3).map(move |c| (a, c)))
+                .map(|(a, c)| jac[k][a] * cov[(a, c)] * jac[k][c])
+                .sum();
+            assert!(
+                (fit.stddev_se[slot] - v.sqrt()).abs() <= 1e-6 * v.sqrt(),
+                "centered {centered}: sd[{k}] SE {} vs {}",
+                fit.stddev_se[slot],
+                v.sqrt()
+            );
+        }
+        assert!(fit.stddev_se[1].is_nan());
+    }
+}
+
+/// The stage split must add up to the reported eval count, and the shrink
+/// count must be a real subset of stage 2's evals — counters 1 and 2 in
+/// `crate::counters`' module header, on the dense GLMM route. cbpp (n_theta=1,
+/// p=4) is a logit-link blocked shape, so its default `outer_search` is
+/// `OuterSearch::ExactProfile` (`exact_profile_shape`), which has no stage-2
+/// solve to split evals against. The stage split this test measures only
+/// exists on `PqlThenJoint`, so this drives the kernel entry `crate::glmm::fit_glmm`
+/// directly with `ws.outer_search` forced to `PqlThenJoint`.
+#[cfg(feature = "counters")]
+#[test]
+fn dense_glmm_counters_split_stages_and_count_shrink_evals() {
+    use crate::counters::Stage;
+    let (x, y, cluster_ids, n) = cbpp_design();
+    let model = cbpp_model();
+    let p = 4;
+    let ids = crate::GroupIds {
+        primary: cluster_ids,
+        extra: vec![],
+    };
+    let (sized, ids, _perm) = spec_sized_from_ids_pub(&model, &ids);
+    let mut xm = Mat::<f64>::zeros(n, p);
+    for i in 0..n {
+        for j in 0..p {
+            xm[(i, j)] = x[i * p + j];
+        }
+    }
+    let beta_start = glm_warm_start_beta(
+        sized.family,
+        f64::NAN,
+        xm.as_ref().subrows(0, n),
+        &y,
+        n,
+        p,
+        None,
+    )
+    .0;
+    let targets: Vec<u32> = (0..p as u32).collect();
+
+    let mut ws = GlmmWorkspace::for_cluster_spec(p, &sized, n, &[], 1);
+    ws.nb_theta = f64::NAN; // non-NB families ignore it (mirrors fit_glmm_impl)
+    ws.pattern.structured_schur = if ws.groupings.structured_extras_eligible() {
+        StructuredSchur::new(&ws.groupings, &ids.primary, &ids.extra, n)
+    } else {
+        None
+    };
+    ws.outer_search = OuterSearch::PqlThenJoint;
+    let f = crate::glmm::fit_glmm(
+        &mut ws,
+        xm.as_ref().subrows(0, n),
+        &y,
+        &ids.primary,
+        &ids.extra,
+        &targets,
+        None,
+        &beta_start,
+        n,
+        WaldSe::Rx,
+        ColumnScaling::IDENTITY,
+    );
+    assert!(f.converged, "cbpp (two-stage forced) must converge");
+    let c = f.counters;
+    assert!(
+        c.stage_evals[0] > 0,
+        "two-stage path must record stage-1 evals"
+    );
+    assert!(c.stage_evals[1] > 0, "stage 2 always runs");
+    assert_eq!(
+        (c.stage_evals[0] + c.stage_evals[1]) as usize,
+        f.n_eval,
+        "stage split must reconstruct n_eval"
+    );
+    assert!(
+        c.evals_after_last_improve(Stage::Two) < c.stage_evals[1],
+        "shrink evals are a strict subset of stage-2 evals"
+    );
+}
+
+/// One histogram entry per fit-path outer evaluation, and none from the
+/// FD-Hessian SE pass — the same fit-path-vs-SE-eval discriminator
+/// `Note::PirlsExhausted` already uses. PIRLS never converges in zero
+/// iterations, so bucket 0 must stay empty.
+#[cfg(feature = "counters")]
+#[test]
+fn dense_glmm_counters_histogram_one_entry_per_outer_eval() {
+    let (x, y, ids, n) = cbpp_design();
+    let model = cbpp_model();
+    let ids = crate::GroupIds {
+        primary: ids,
+        extra: vec![],
+    };
+    let opts = crate::FitOptions {
+        target_indices: vec![1],
+        ..crate::FitOptions::default() // WaldSe::Hessian — the FD pass runs
+    };
+    let f = crate::fit_cold(&x, &y, n, 4, &model, &ids, &opts);
+    assert!(f.converged(), "cbpp must converge");
+    let c = f.counters;
+    assert_eq!(
+        c.pirls_hist.iter().sum::<u32>() as usize,
+        f.n_eval,
+        "one PIRLS histogram entry per fit-path eval, SE evals excluded"
+    );
+    assert_eq!(
+        c.pirls_hist[0], 0,
+        "no eval solves PIRLS in zero iterations"
+    );
+}
+
+/// An AGQ fit must report one AGQ evaluation per outer eval and the node cost
+/// they carry: clusters x nagq^q per evaluation. A Laplace fit records none.
+#[cfg(feature = "counters")]
+#[test]
+fn agq_counters_report_evals_times_nodes() {
+    let (x, y, ids, n) = cbpp_design();
+    let model = cbpp_model();
+    let n_clusters = (ids.iter().copied().max().unwrap() as u64) + 1;
+    let ids = crate::GroupIds {
+        primary: ids,
+        extra: vec![],
+    };
+
+    let laplace = crate::fit_cold(
+        &x,
+        &y,
+        n,
+        4,
+        &model,
+        &ids,
+        &crate::FitOptions {
+            target_indices: vec![1],
+            ..crate::FitOptions::default()
+        },
+    );
+    assert_eq!(
+        laplace.counters.agq_evals, 0,
+        "nagq == 1 records no AGQ eval"
+    );
+    assert_eq!(laplace.counters.agq_node_evals, 0);
+
+    let agq = crate::fit_cold(
+        &x,
+        &y,
+        n,
+        4,
+        &model,
+        &ids,
+        &crate::FitOptions {
+            target_indices: vec![1],
+            nagq: 7,
+            ..crate::FitOptions::default()
+        },
+    );
+    assert!(agq.converged(), "cbpp nAGQ=7 must converge");
+    assert_eq!(
+        agq.counters.agq_evals as usize, agq.n_eval,
+        "every AGQ outer eval evaluates the quadrature"
+    );
+    assert_eq!(
+        agq.counters.agq_node_evals,
+        agq.counters.agq_evals as u64 * n_clusters * 7,
+        "node cost is evals x clusters x nagq^1"
+    );
+}
+
+/// Uniform(0,1) off the shared LCG (`lcg` is uniform on (-1,1)).
+fn nb_slope_uniform01(st: &mut u64) -> f64 {
+    (super::common_tests::lcg(st) + 1.0) / 2.0
+}
+
+/// Standard normal via a Box-Muller transform of two `nb_slope_uniform01` draws.
+fn nb_slope_std_normal(st: &mut u64) -> f64 {
+    let u1 = nb_slope_uniform01(st).max(1e-12);
+    let u2 = nb_slope_uniform01(st);
+    (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+}
+
+/// Gamma(shape, scale) via Marsaglia-Tsang (2000): direct rejection sampling
+/// for `shape >= 1`, boosted by one unit and corrected by a
+/// `Uniform(0,1)^(1/shape)` factor below that.
+fn nb_slope_gamma(st: &mut u64, shape: f64, scale: f64) -> f64 {
+    if shape < 1.0 {
+        let u = nb_slope_uniform01(st);
+        return nb_slope_gamma(st, shape + 1.0, scale) * u.powf(1.0 / shape);
+    }
+    let d = shape - 1.0 / 3.0;
+    let c = 1.0 / (9.0 * d).sqrt();
+    loop {
+        let mut x;
+        let mut v;
+        loop {
+            x = nb_slope_std_normal(st);
+            v = 1.0 + c * x;
+            if v > 0.0 {
+                break;
+            }
+        }
+        v = v * v * v;
+        let u = nb_slope_uniform01(st);
+        if u < 1.0 - 0.0331 * x.powi(4) || u.ln() < 0.5 * x * x + d * (1.0 - v + v.ln()) {
+            return d * v * scale;
+        }
+    }
+}
+
+/// Poisson(lambda) via Knuth's multiplicative sampler — exact, and cheap at
+/// the small means this fixture draws.
+fn nb_slope_poisson(st: &mut u64, lambda: f64) -> f64 {
+    let l = (-lambda).exp();
+    let mut k = 0.0;
+    let mut p = 1.0;
+    loop {
+        k += 1.0;
+        p *= nb_slope_uniform01(st);
+        if p <= l {
+            break;
+        }
+    }
+    k - 1.0
+}
+
+/// Negative-binomial counts on an imbalanced correlated random-INTERCEPT-AND-
+/// SLOPE design: `y ~ 1 + x + (1 + x | g)`, 15 groups over 300 rows, 20% of
+/// the groups carrying 80% of the rows. Each group's `(intercept, slope)`
+/// pair is a correlated bivariate normal (correlation 0.2, sd 0.6 on the
+/// intercept and 0.54 on the slope) built from two `nb_slope_std_normal`
+/// draws; `x` is standard normal; counts are a genuine Gamma(θ, μ/θ)-Poisson
+/// mixture at θ = 1.5 (`nb_slope_gamma` + `nb_slope_poisson`), which is
+/// exactly how `MASS::rnegbin` draws negative-binomial counts. Every draw
+/// comes off one seeded LCG, so the fixture is exactly reproducible.
+///
+/// The group-size imbalance is what makes the naive method-of-moments
+/// dispersion seed collapse far enough below θ̂ for a fixed seed to still
+/// reliably trip the bug this file guards against (see the test below): a
+/// balanced version of the same random-slope design usually seeds close
+/// enough to θ̂ that PIRLS still converges from there, so it doesn't
+/// reproduce the failure on every run.
+fn sim_nb_slope_dataset() -> (Vec<f64>, Vec<f64>, Vec<u32>, usize) {
+    const N: usize = 300;
+    const N_CLUSTERS: usize = 15;
+    const BETA0: f64 = 0.4;
+    const BETA1: f64 = 0.8;
+    const SD0: f64 = 0.6;
+    const SD1: f64 = 0.54;
+    const RHO: f64 = 0.2;
+    const THETA_TRUE: f64 = 1.5;
+    const N_HEAVY: usize = 3; // 20% of 15 groups carry 80% of the rows
+
+    let mut st = 900012u64;
+    let mut cluster_ids = vec![0u32; N];
+    for (i, cid) in cluster_ids.iter_mut().enumerate() {
+        // 80% of rows round-robin over the N_HEAVY heavy groups, the
+        // remaining 20% round-robin over the rest — deterministic stand-in
+        // for the weighted multinomial group draw an R simulation would use.
+        let u = nb_slope_uniform01(&mut st);
+        *cid = if u < 0.8 {
+            (i % N_HEAVY) as u32
+        } else {
+            (N_HEAVY + i % (N_CLUSTERS - N_HEAVY)) as u32
+        };
+    }
+    let mut b0 = [0.0f64; N_CLUSTERS];
+    let mut b1 = [0.0f64; N_CLUSTERS];
+    for g in 0..N_CLUSTERS {
+        let z0 = nb_slope_std_normal(&mut st);
+        let z1 = nb_slope_std_normal(&mut st);
+        b0[g] = SD0 * z0;
+        b1[g] = SD1 * (RHO * z0 + (1.0 - RHO * RHO).sqrt() * z1);
+    }
+    let mut x = vec![0.0f64; N * 2];
+    let mut y = vec![0.0f64; N];
+    for i in 0..N {
+        let g = cluster_ids[i] as usize;
+        let xi = nb_slope_std_normal(&mut st);
+        x[i * 2] = 1.0;
+        x[i * 2 + 1] = xi;
+        let mu = (BETA0 + BETA1 * xi + b0[g] + b1[g] * xi).exp();
+        let lambda = nb_slope_gamma(&mut st, THETA_TRUE, mu / THETA_TRUE);
+        y[i] = nb_slope_poisson(&mut st, lambda);
+    }
+    (x, y, cluster_ids, N_CLUSTERS)
+}
+
+/// Pins the fix for the NB dispersion coordinate's cold start on a
+/// random-slope shape. `fit_glmm_nb` searches `ln θ_NB` as a trailing
+/// coordinate of the outer BOBYQA over the marginal objective, and that
+/// coordinate needs a starting value where the exact-profile PIRLS inside it
+/// actually converges. The naive method-of-moments seed
+/// (`nb_theta_moment_seed`, `ȳ²/(s²−ȳ)`) charges every source of variance in
+/// `y` — including random-slope variance — to the NB dispersion, so on a
+/// random-slope shape it can land one to two orders of magnitude below the
+/// fitted θ̂, on a start where PIRLS does not converge. That handed the outer
+/// BOBYQA a `+∞` incumbent it could not climb out of: on this exact fixture,
+/// reverting to the naive seed makes the fit report `converged = false` with
+/// `loglik = NaN` after only a handful of evaluations, stuck at the seed
+/// value. The fix seeds the coordinate from the no-RE NB GLM's own θ̂
+/// (`fit_glm_nb`) instead, which starts inside the basin PIRLS can converge
+/// in.
+///
+/// Every other negative-binomial fixture in this file is intercept-shaped
+/// (one scalar grouping, or two scalar-intercept blocks), so none of them
+/// exercise the random-slope case. This fixture uses `y ~ 1 + x + (1 + x | g)`
+/// — two random-effect variances and a correlation (`n_theta = 3`), `p = 2`
+/// fixed effects — the shape the naive seed breaks. The test checks the
+/// fixture actually reproduces that precondition (the moment seed at least
+/// 10x below θ̂) before trusting anything else, so a fixture whose
+/// random-effect variance or group imbalance drifted over time cannot pass
+/// while silently no longer covering the bug. It then checks the routed fit
+/// converges and agrees with the same design forced onto the packed-row
+/// layout — an independent `A`-layout under the same outer search, on the same
+/// marginal objective.
+#[test]
+fn fit_glmm_nb_random_slope_seed_lands_in_convergent_basin() {
+    let (x, y, cluster_ids, n_clusters) = sim_nb_slope_dataset();
+    let (n, p) = (y.len(), 2);
+    let model = ModelSpec {
+        family: Family::NegativeBinomial {
+            link: crate::NegBinomialLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters as u32,
+            },
+            slopes: vec![1],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: cluster_ids,
+        extra: vec![],
+    };
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        wald_se: crate::WaldSe::Rx,
+        ..FitOptions::default()
+    };
+
+    let blocked = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    assert!(blocked.converged(), "NB random-slope GLMM must converge");
+
+    // The precondition the original bug needed: the naive moment seed must
+    // land at least an order of magnitude below θ̂. A fixture that lost this
+    // property would no longer start the coordinate outside the convergent
+    // basin, so it would stop being a regression test for the bug at all.
+    let moment_seed = crate::fit::nb_theta_moment_seed(&y, n, None);
+    assert!(
+        moment_seed < blocked.dispersion / 10.0,
+        "fixture must put the moment seed >=10x below θ̂: seed={moment_seed} θ̂={}",
+        blocked.dispersion
+    );
+
+    let (sized, ids, _perm) = crate::fit::spec_sized_from_ids_pub(&model, &ids);
+    let packed = crate::fit::fit_glmm_packed(
+        &x,
+        &y,
+        n,
+        p,
+        &sized,
+        &ids.primary,
+        &ids.extra,
+        f64::NAN,
+        None,
+        &opts,
+    )
+    .0;
+    assert!(
+        packed.converged(),
+        "packed NB random-slope reference must converge"
+    );
+    assert!(
+        (blocked.loglik - packed.loglik).abs() < 1e-5,
+        "loglik blocked {} vs packed {}",
+        blocked.loglik,
+        packed.loglik
+    );
+    assert!(
+        (blocked.dispersion - packed.dispersion).abs() < 1e-3 * packed.dispersion,
+        "θ̂ blocked {} vs packed {}",
+        blocked.dispersion,
+        packed.dispersion
+    );
+}
+
+/// Negative-binomial counts (as a Poisson-Exponential(1) mixture, i.e. NB with
+/// shape 1) on a random-INTERCEPT-only design: `y ~ 1 + x + (1 | g)`, 10
+/// clusters x 3 rows. This is the pathological-sweep cell that reproduces the
+/// `+INF` plateau: 15 of the 16 gating-stage BOBYQA evaluations
+/// diverge in PIRLS (`laplace_deviance` returns `+INFINITY`), one evaluation
+/// is finite, and — before the finite-eval-count guard — the run exits
+/// `Status::Converged` at the untouched θ_RE cold start (`THETA0 = 1.0`),
+/// with a KKT residual nowhere near a stationary point. Every draw comes off
+/// one seeded LCG, so the fixture is exactly reproducible.
+fn sim_nb_inf_plateau_dataset() -> (Vec<f64>, Vec<f64>, Vec<u32>, usize) {
+    const N_CLUSTERS: usize = 10;
+    const PER: usize = 3;
+    const SD_INT: f64 = 1.5;
+    const SD_SLOPE: f64 = 4.0;
+    const SEED: u64 = 4;
+
+    let mut state = SEED
+        .wrapping_mul(0x9E3779B97F4A7C15)
+        .wrapping_add(0x1234_5678 ^ (N_CLUSTERS as u64) << 20);
+    let n = N_CLUSTERS * PER;
+    let mut x = Vec::with_capacity(n * 2);
+    let mut y = Vec::with_capacity(n);
+    let mut cluster_ids = Vec::with_capacity(n);
+    for c in 0..N_CLUSTERS {
+        let ui = SD_INT * inf_plateau_normal(&mut state);
+        let us = SD_SLOPE * inf_plateau_normal(&mut state);
+        for _ in 0..PER {
+            let xv = inf_plateau_lcg_next(&mut state) * 2.0 - 1.0;
+            let eta = 0.5 + 0.8 * xv + ui + us * xv;
+            let mu = eta.exp().clamp(1e-8, 1e6);
+            let e = inf_plateau_exp1(&mut state);
+            x.push(1.0);
+            x.push(xv);
+            y.push(inf_plateau_poisson(&mut state, mu * e));
+            cluster_ids.push(c as u32);
+        }
+    }
+    (x, y, cluster_ids, N_CLUSTERS)
+}
+
+/// 30 NB counts in 6 clusters, all in `0..=4`, with an offset of 800 on one
+/// row (cluster 2). No fixed-effect step PIRLS takes from its start and no
+/// random intercept can bring that row's linear predictor back from 800, so at
+/// every candidate θ every PIRLS trial puts that row's raw η past `family::ETA_MAX`
+/// (`family::eta_infeasible`), and the step halves until `PIRLS_MAX_HALVINGS`
+/// runs out: every evaluation of the outer search is `+∞`, a hard failure
+/// rather than an iteration-cap exhaustion. Measured: at offsets of 200, 400
+/// and 650 the fit converges, the row sitting in the NB tail
+/// (`family::in_tail`), where its deviance stays finite.
+fn nb_overflow_dataset() -> (Vec<f64>, Vec<f64>, Vec<u32>, Vec<f64>) {
+    let n = 30;
+    let mut x = Vec::with_capacity(2 * n);
+    let mut y = Vec::with_capacity(n);
+    let mut ids = Vec::with_capacity(n);
+    let mut offset = vec![0.0; n];
+    for i in 0..n {
+        x.push(1.0);
+        x.push(((i * 7) % 11) as f64 / 10.0 - 0.5);
+        ids.push((i / 5) as u32);
+        y.push(((i * 3) % 5) as f64);
+    }
+    offset[10] = 800.0;
+    (x, y, ids, offset)
+}
+
+fn nb_intercept_model(n_clusters: u32) -> ModelSpec {
+    ModelSpec {
+        family: Family::NegativeBinomial {
+            link: crate::NegBinomialLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    }
+}
+
+/// A PIRLS trial the family pass refuses — a non-finite deviance, or here a
+/// raw η past the link's clamp bound — is an overshoot and halves toward the
+/// last accepted iterate; it is never accepted. On [`nb_overflow_dataset`]
+/// every trial lands past the clamp bound, so each solve fails through the
+/// halving cap instead of running its whole `PIRLS_MAX_ITERS` on a poisoned
+/// state, and the fit fails cleanly.
+///
+/// Every evaluation of the outer search is then `+∞`, and BOBYQA's `moderatef`
+/// maps both `NaN` and `+inf` to `FUNCMAX`, so a gating search on which PIRLS
+/// fails at every evaluation is a flat *finite* surface to it: it shrinks to
+/// `rho_end` and exits `Status::Converged` having compared nothing. `fit_glmm`
+/// therefore requires a finite incumbent and at least 2 finite evaluations
+/// before trusting that status, and the fit then NaN-fills.
+#[test]
+fn nb_overflow_fit_fails_cleanly_without_exhausting_pirls() {
+    let (x, y, ids, offset) = nb_overflow_dataset();
+    let ids = GroupIds {
+        primary: ids,
+        extra: vec![],
+    };
+    let opts = FitOptions {
+        offset: Some(offset),
+        ..FitOptions::default()
+    };
+    let f = fit_cold(&x, &y, y.len(), 2, &nb_intercept_model(6), &ids, &opts);
+    assert!(
+        !f.converged(),
+        "the +INF plateau fit must not report converged"
+    );
+    assert!(
+        !f.diagnostics
+            .notes
+            .iter()
+            .any(|n| matches!(n, crate::Note::PirlsExhausted { .. })),
+        "a NaN trial must halve, not run out the iteration cap: {:?}",
+        f.diagnostics.notes
+    );
+    assert!(
+        f.varcorr.iter().all(|row| row.iter().all(|v| v.is_nan())),
+        "varcorr must be NaN-filled on a non-converged fit: {:?}",
+        f.varcorr
+    );
+    assert!(
+        f.tau2.iter().all(|t| t.is_nan()),
+        "tau2 must be NaN-filled on a non-converged fit: {:?}",
+        f.tau2
+    );
+    assert!(
+        f.dispersion.is_nan(),
+        "dispersion must be NaN on a failed fit, not the θ the search stood on: {}",
+        f.dispersion
+    );
+}
+
+/// Mixed Gamma, dense route: a budget-exhausted outer search
+/// ([`nb_budget_exhausted_fit`]) on `sim_gamma` reports φ̂ at its capped
+/// endpoint, with `converged == false` — the plateau policy
+/// `glmm_maxfun_cap_reports_honest_endpoint` pins on binomial, here on a family
+/// that estimates its dispersion.
+#[test]
+fn fit_glmm_gamma_budget_stop_reports_dispersion() {
+    let (x, y, cluster_ids, n_clusters) = sim_clustered(include_str!(
+        "../../validation/data/simulated/sim_gamma.csv"
+    ));
+    let model = ModelSpec {
+        family: Family::Gamma {
+            link: crate::GammaLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: cluster_ids,
+        extra: vec![],
+    };
+    let (f, _) = nb_budget_exhausted_fit(&x, &y, 3, &model, &ids);
+    assert!(
+        !f.converged(),
+        "a budget-exhausted fit must not report converged"
+    );
+    assert!(
+        f.dispersion.is_finite() && f.dispersion > 0.0,
+        "a capped endpoint reports φ̂: {}",
+        f.dispersion
+    );
+}
+
+/// Gamma data lying exactly on the mean curve (`y = exp(0.3 + 0.7·x)` on the
+/// log link, `y = 1/(0.8 + 0.3·x)` on the inverse): the fixed effects
+/// reproduce every row, so the plug-in dispersion seed `D/Σw` of the exact GLM
+/// start is 0 and can round below it. The seed must go to the box floor, not
+/// hand BOBYQA a NaN start (which it refused with `Status::InvalidArgs`,
+/// measured 2026-09-24: D = −1.4e-15). The likelihood keeps rising as φ → 0,
+/// so the fit is refused with φ̂ on the box bound. On the inverse link the
+/// joint search reaches `rho_end` at φ̂ = 1.0015e-6, just short of the bound
+/// (measured 2026-10-02), so this also pins the bound check after the search.
+#[test]
+fn fit_glmm_gamma_exact_fit_data_takes_no_nan_dispersion_seed() {
+    let n = 24;
+    let p = 2;
+    let mut x = vec![0.0f64; n * p];
+    for i in 0..n {
+        x[i * p] = 1.0;
+        x[i * p + 1] = ((i * 7) % 11) as f64 / 10.0 - 0.5;
+    }
+    let cluster_ids: Vec<u32> = (0..n as u32).map(|i| i % 4).collect();
+    for link in [crate::GammaLink::Log, crate::GammaLink::Inverse] {
+        let y: Vec<f64> = (0..n)
+            .map(|i| {
+                let xv = x[i * p + 1];
+                match link {
+                    crate::GammaLink::Log => (0.3 + 0.7 * xv).exp(),
+                    crate::GammaLink::Inverse => 1.0 / (0.8 + 0.3 * xv),
+                }
+            })
+            .collect();
+        let model = ModelSpec {
+            family: Family::Gamma { link },
+            re: Some(ReStructure {
+                sizing: Sizing::FixedClusters { n_clusters: 4 },
+                slopes: vec![],
+                extra_groupings: vec![],
+            }),
+        };
+        let ids = GroupIds {
+            primary: cluster_ids.clone(),
+            extra: vec![],
+        };
+        let f = fit_cold(&x, &y, n, p, &model, &ids, &FitOptions::default());
+        assert!(
+            !f.converged() && f.dispersion.is_nan(),
+            "{link:?}: an exact fit is refused with φ̂ on the box bound, got converged = {}, φ̂ = {}",
+            f.converged(),
+            f.dispersion
+        );
+    }
+}
+
+/// NB GLMM on Poisson data (no overdispersion): the likelihood rises toward the
+/// Poisson limit, so the fit must end on the upper bound of `ln θ_NB`, not
+/// short of it. Without the dispersion bound check after the search, this
+/// fit stops at θ̂_NB ≈ 5.1e3 with a lower likelihood than at the bound.
+#[test]
+fn fit_glmm_nb_on_poisson_data_reaches_the_theta_bound() {
+    let (g, m, p) = (30usize, 20usize, 2usize);
+    let n = g * m;
+    let mut st = 14u64;
+    let b: Vec<f64> = (0..g).map(|_| 0.4 * inf_plateau_normal(&mut st)).collect();
+    let bs: Vec<f64> = (0..g).map(|_| 0.2 * inf_plateau_normal(&mut st)).collect();
+    let mut x = vec![0.0; n * p];
+    let mut y = vec![0.0; n];
+    let primary: Vec<u32> = (0..n).map(|i| (i / m) as u32).collect();
+    for i in 0..n {
+        let xv = 0.5 * lcg(&mut st);
+        x[i * p] = 1.0;
+        x[i * p + 1] = xv;
+        let c = primary[i] as usize;
+        y[i] = inf_plateau_poisson(&mut st, (0.8 + 0.5 * xv + b[c] + bs[c] * xv).exp());
+    }
+    let model = ModelSpec {
+        family: Family::NegativeBinomial {
+            link: crate::NegBinomialLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: g as u32,
+            },
+            slopes: vec![1],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary,
+        extra: vec![],
+    };
+    let f = fit_cold(&x, &y, n, p, &model, &ids, &FitOptions::default());
+    assert!(f.converged(), "the fit converges");
+    assert!(
+        (f.dispersion - crate::fit::NB_THETA_HI).abs() <= 1e-9 * crate::fit::NB_THETA_HI,
+        "θ̂_NB = {} must sit on the upper bound {}",
+        f.dispersion,
+        crate::fit::NB_THETA_HI
+    );
+}
+
+/// Fit an NB or Gamma GLMM through the shipped build and solve, with both outer BOBYQA
+/// solvers capped at their legal minimum budget, and map it to `Fit`. The
+/// budget-exhausted exit is a real non-convergence the kernel reports
+/// (`Status::MaxFunReached`), independent of how well PIRLS behaves on the
+/// data, so the budget-stop contracts below do not depend on a PIRLS defect
+/// to trigger. Dimensions are the workspace's own: `n_theta + p + 1`
+/// joint and `n_theta + 1` stage 1 (the trailing `ln θ_NB` / `ln φ` coordinate).
+fn nb_budget_exhausted_fit(
+    x: &[f64],
+    y: &[f64],
+    p: usize,
+    model: &ModelSpec,
+    ids: &GroupIds,
+) -> (Fit, crate::glmm::GlmmLayout) {
+    use bobyqa::{Bobyqa, Config};
+    let n = y.len();
+    let opts = FitOptions {
+        target_indices: (0..p as u32).collect(),
+        ..FitOptions::default()
+    };
+    let (mut ws, x_mat) =
+        super::glmm::fit_glmm_build(x, n, p, model, &ids.primary, &ids.extra, &opts)
+            .unwrap_or_else(|_| panic!("design must build"));
+    let cap = |dim: usize| {
+        let mut c = Config::new(dim);
+        c.npt = 2 * dim + 1; // PRIMA's default, the legal minimum at dim = 1
+        c.max_fun = c.npt + 1;
+        Bobyqa::new(dim, c).expect("legal minimal config")
+    };
+    ws.solver = cap(ws.n_theta + p + 1);
+    ws.solver_stage1 = cap(ws.n_theta + 1);
+    let layout = ws.layout;
+    let view = super::glmm::run_glmm_on(
+        &mut ws,
+        x_mat.as_ref(),
+        y,
+        n,
+        p,
+        model,
+        &ids.primary,
+        &ids.extra,
+        // θ_NB's start on NB; unread on Gamma, whose `ln φ` seeds itself.
+        if matches!(model.family, Family::NegativeBinomial { .. }) {
+            1.0
+        } else {
+            f64::NAN
+        },
+        None,
+        &opts,
+        ColumnScaling::IDENTITY,
+    );
+    (
+        super::glmm::glmm_view_to_fit(&view, y, n, p, model, &opts).0,
+        layout,
+    )
+}
+
+/// Negative-binomial log link, dense route: a budget-exhausted outer search
+/// ([`nb_budget_exhausted_fit`]) on [`sim_nb_inf_plateau_dataset`]'s counts
+/// reports θ̂_NB at its capped endpoint, with `converged == false`, as
+/// [`fit_glmm_gamma_budget_stop_reports_dispersion`] does for φ̂.
+#[test]
+fn fit_glmm_nb_budget_stop_reports_dispersion() {
+    let (x, y, cluster_ids, n_clusters) = sim_nb_inf_plateau_dataset();
+    let model = ModelSpec {
+        family: Family::NegativeBinomial {
+            link: crate::NegBinomialLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: cluster_ids,
+        extra: vec![],
+    };
+    let (f, layout) = nb_budget_exhausted_fit(&x, &y, 2, &model, &ids);
+    assert_ne!(
+        layout,
+        crate::glmm::GlmmLayout::Packed,
+        "dense layout expected"
+    );
+    assert!(
+        !f.converged(),
+        "a budget-exhausted fit must not report converged"
+    );
+    assert!(
+        f.dispersion.is_finite() && f.dispersion > 0.0,
+        "a capped endpoint reports θ̂_NB: {}",
+        f.dispersion
+    );
+}
+
+/// The packed-row twin of [`fit_glmm_nb_budget_stop_reports_dispersion`]: the
+/// same counts with an intercept-only extra grouping declared at 501 levels
+/// (only 6 populated), which routes the design to the packed-row layout through
+/// the crossed-level-count threshold, not through a slope. It lives here, not
+/// in `sparse::tests`, because the build-and-cap seam lives in `fit`.
+#[test]
+fn packed_glmm_nb_budget_stop_reports_dispersion() {
+    let (x, y, cluster_ids, n_clusters) = sim_nb_inf_plateau_dataset();
+    let extra: Vec<u32> = (0..y.len()).map(|i| (i % 6) as u32).collect();
+    let model = ModelSpec {
+        family: Family::NegativeBinomial {
+            link: crate::NegBinomialLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![Grouping {
+                relation: GroupingRelation::Crossed { n_clusters: 501 },
+                slopes: vec![],
+            }],
+        }),
+    };
+    let ids = GroupIds {
+        primary: cluster_ids,
+        extra: vec![extra],
+    };
+    let (f, layout) = nb_budget_exhausted_fit(&x, &y, 2, &model, &ids);
+    assert_eq!(
+        layout,
+        crate::glmm::GlmmLayout::Packed,
+        "packed-row layout expected"
+    );
+    assert!(
+        !f.converged(),
+        "a budget-exhausted fit must not report converged"
+    );
+    assert!(
+        f.dispersion.is_finite() && f.dispersion > 0.0,
+        "a capped endpoint reports θ̂_NB: {}",
+        f.dispersion
+    );
+}
+
+/// One dense Laplace GLMM rung of the validation corpus, driven from the
+/// committed dataset the harness fits: the CSV, the formula, the family/link
+/// and the per-rung weights/offset the manifest records.
+///
+/// `formula` is the manifest's own formula with the two mechanical rewrites the
+/// validation harness applies before lowering: the `@formula(...)` wrapper and
+/// the explicit `1` intercept term come off a `jl_formula` (this parser treats
+/// the intercept as implicit and has no term for a literal `1`), and an
+/// aggregated-binomial `cbind(s, n - s)` response becomes the synthesized
+/// `prop` column, which with the trial count as prior weights IS lme4's own
+/// objective for that response.
+#[cfg(feature = "formula")]
+struct DenseLaplaceRung {
+    rung: u32,
+    csv: &'static str,
+    formula: &'static str,
+    family: Family,
+    /// Columns lowered as categorical. Everything else is numeric, except a
+    /// column that fails to parse as `f64` anywhere, which falls back to a
+    /// factor — a CSV can carry a categorical helper column no formula names.
+    factors: &'static [&'static str],
+    /// Aggregated binomial `(successes, trials)` column names: the response
+    /// becomes `successes/trials` in a synthesized `prop` column and the trials
+    /// become prior weights.
+    agg: Option<(&'static str, &'static str)>,
+    /// Per-row prior weights read off this column.
+    weights_col: Option<&'static str>,
+    /// Per-row known additive term on the linear-predictor scale.
+    offset_col: Option<&'static str>,
+}
+
+/// Every non-Gaussian dense-routed rung of the validation corpus, at Laplace
+/// (`nagq = 1`) — the set whose standard errors the exact joint Hessian
+/// produces today. The AGQ orders some of these carry in the manifest are not
+/// applied: quadrature keeps the packed second-order pass and is out of this
+/// comparison's scope.
+#[cfg(feature = "formula")]
+const DENSE_LAPLACE_RUNGS: &[DenseLaplaceRung] = &[
+    DenseLaplaceRung {
+        rung: 5,
+        csv: include_str!("../../validation/data/empirical/cbpp.csv"),
+        formula: "prop ~ period + (1 | herd)",
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        factors: &["herd", "period"],
+        agg: Some(("incidence", "size")),
+        weights_col: None,
+        offset_col: None,
+    },
+    DenseLaplaceRung {
+        rung: 6,
+        csv: include_str!("../../validation/data/empirical/grouseticks.csv"),
+        formula: "TICKS ~ YEAR + cHEIGHT + (1 | BROOD) + (1 | INDEX) + (1 | LOCATION)",
+        family: Family::Poisson {
+            link: PoissonLink::Log,
+        },
+        factors: &["BROOD", "INDEX", "LOCATION", "YEAR"],
+        agg: None,
+        weights_col: None,
+        offset_col: None,
+    },
+    DenseLaplaceRung {
+        rung: 12,
+        csv: include_str!("../../validation/data/empirical/VerbAgg.csv"),
+        formula: "y ~ Anger + Gender + btype + situ + mode + (1|id) + (1|item)",
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        factors: &["Gender", "btype", "situ", "mode", "id", "item"],
+        agg: None,
+        weights_col: None,
+        offset_col: None,
+    },
+    DenseLaplaceRung {
+        rung: 14,
+        csv: include_str!("../../validation/data/empirical/Arabidopsis.csv"),
+        formula: "total_fruits ~ nutrient + amd + rack + status + (1 | popu/gen)",
+        family: Family::Poisson {
+            link: PoissonLink::Log,
+        },
+        factors: &["nutrient", "rack", "amd", "status", "popu", "gen"],
+        agg: None,
+        weights_col: None,
+        offset_col: None,
+    },
+    DenseLaplaceRung {
+        rung: 17,
+        csv: include_str!("../../validation/data/simulated/sim_crossed_at_cap.csv"),
+        formula: "y ~ x + (1|g1) + (1|c1) + (1|c2) + (1|c3) + (1|c4) + (1|c5) + (1|c6)",
+        family: Family::Poisson {
+            link: PoissonLink::Log,
+        },
+        factors: &["g1", "c1", "c2", "c3", "c4", "c5", "c6"],
+        agg: None,
+        weights_col: None,
+        offset_col: None,
+    },
+    DenseLaplaceRung {
+        rung: 19,
+        csv: include_str!("../../validation/data/simulated/sim_poisson_nested.csv"),
+        formula: "y ~ x + (1 | g1/g2)",
+        family: Family::Poisson {
+            link: PoissonLink::Log,
+        },
+        factors: &["g1", "g2"],
+        agg: None,
+        weights_col: None,
+        offset_col: None,
+    },
+    DenseLaplaceRung {
+        rung: 22,
+        csv: include_str!("../../validation/data/empirical/cbpp.csv"),
+        formula: "prop ~ period + (1 | herd)",
+        family: Family::Binomial {
+            link: BinomialLink::Probit,
+        },
+        factors: &["herd", "period"],
+        agg: Some(("incidence", "size")),
+        weights_col: None,
+        offset_col: None,
+    },
+    DenseLaplaceRung {
+        rung: 23,
+        csv: include_str!("../../validation/data/simulated/sim_gamma.csv"),
+        formula: "y ~ x + grp + (1 | cluster)",
+        family: Family::Gamma {
+            link: crate::GammaLink::Log,
+        },
+        factors: &["cluster", "grp"],
+        agg: None,
+        weights_col: None,
+        offset_col: None,
+    },
+    DenseLaplaceRung {
+        rung: 25,
+        csv: include_str!("../../validation/data/simulated/sim_binomial_slope1.csv"),
+        formula: "y ~ x + (1 + x | g)",
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        factors: &["g"],
+        agg: None,
+        weights_col: None,
+        offset_col: None,
+    },
+    DenseLaplaceRung {
+        rung: 26,
+        csv: include_str!("../../validation/data/simulated/sim_poisson_slope1.csv"),
+        formula: "y ~ x + (1 + x | g)",
+        family: Family::Poisson {
+            link: PoissonLink::Log,
+        },
+        factors: &["g"],
+        agg: None,
+        weights_col: None,
+        offset_col: None,
+    },
+    DenseLaplaceRung {
+        rung: 27,
+        csv: include_str!("../../validation/data/simulated/sim_binomial_slope2.csv"),
+        formula: "y ~ x1 + x2 + (1 + x1 + x2 | g)",
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        factors: &["g"],
+        agg: None,
+        weights_col: None,
+        offset_col: None,
+    },
+    DenseLaplaceRung {
+        rung: 28,
+        csv: include_str!("../../validation/data/simulated/sim_poisson_offset.csv"),
+        formula: "y ~ x + (1 | cluster)",
+        family: Family::Poisson {
+            link: PoissonLink::Log,
+        },
+        factors: &["cluster"],
+        agg: None,
+        weights_col: None,
+        offset_col: Some("log_exposure"),
+    },
+    DenseLaplaceRung {
+        rung: 37,
+        csv: include_str!("../../validation/data/simulated/glmm_poisson.csv"),
+        formula: "y ~ x + (1 | g)",
+        family: Family::Poisson {
+            link: PoissonLink::Log,
+        },
+        factors: &["g"],
+        agg: None,
+        weights_col: Some("w"),
+        offset_col: None,
+    },
+    DenseLaplaceRung {
+        rung: 44,
+        csv: include_str!("../../validation/data/simulated/sim_binomial_bigsd.csv"),
+        formula: "y ~ x + z + (1 | g)",
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        factors: &["g"],
+        agg: None,
+        weights_col: None,
+        offset_col: None,
+    },
+    DenseLaplaceRung {
+        rung: 45,
+        csv: include_str!("../../validation/data/simulated/sim_poisson_bigsd.csv"),
+        formula: "y ~ x + z + (1 | g)",
+        family: Family::Poisson {
+            link: PoissonLink::Log,
+        },
+        factors: &["g"],
+        agg: None,
+        weights_col: None,
+        offset_col: None,
+    },
+    DenseLaplaceRung {
+        rung: 48,
+        csv: include_str!("../../validation/data/simulated/sim_probit_large.csv"),
+        formula: "y ~ x1 + x2 + x3 + z + (1 | g)",
+        family: Family::Binomial {
+            link: BinomialLink::Probit,
+        },
+        factors: &["g"],
+        agg: None,
+        weights_col: None,
+        offset_col: None,
+    },
+    DenseLaplaceRung {
+        rung: 49,
+        csv: include_str!("../../validation/data/simulated/sim_cloglog_nested_crossed.csv"),
+        formula: "y ~ x + (1 | g1/g2) + (1 | c1)",
+        family: Family::Binomial {
+            link: BinomialLink::Cloglog,
+        },
+        factors: &["g1", "g2", "c1"],
+        agg: None,
+        weights_col: None,
+        offset_col: None,
+    },
+];
+
+/// Header + row cells of an embedded CSV, quotes stripped. Mirrors the
+/// validation harness's own reader; the corpus CSVs carry no embedded commas.
+#[cfg(feature = "formula")]
+fn rung_csv(csv: &'static str) -> (Vec<String>, Vec<Vec<String>>) {
+    let unquote = |s: &str| s.trim().trim_matches('"').to_string();
+    let mut lines = csv.lines().filter(|l| !l.trim().is_empty());
+    let header: Vec<String> = lines
+        .next()
+        .expect("csv header")
+        .split(',')
+        .map(unquote)
+        .collect();
+    let rows: Vec<Vec<String>> = lines.map(|l| l.split(',').map(unquote).collect()).collect();
+    (header, rows)
+}
+
+/// The rung's CSV as a lowering `Table`, plus the prior weights an aggregated
+/// binomial response implies. A column named in `factors`, or one that fails to
+/// parse as `f64` anywhere, becomes a factor at its lexicographic level order —
+/// which is what R's own `factor()` did when the references were frozen.
+/// Header dots become underscores, as this parser cannot read a dot inside an
+/// identifier (`Arabidopsis`'s `total.fruits`).
+#[cfg(feature = "formula")]
+fn rung_table(r: &DenseLaplaceRung) -> (crate::formula::Table, Option<Vec<f64>>, Option<Vec<f64>>) {
+    use crate::formula::{Column, Table};
+    let (header, rows) = rung_csv(r.csv);
+    let n = rows.len();
+    let numeric =
+        |j: usize| -> Vec<f64> { rows.iter().map(|row| row[j].parse().unwrap()).collect() };
+    let mut columns: Vec<(String, Column)> = header
+        .iter()
+        .enumerate()
+        .map(|(j, name)| {
+            let is_factor = r.factors.contains(&name.as_str())
+                || rows.iter().any(|row| row[j].parse::<f64>().is_err());
+            let col = if is_factor {
+                let labels: Vec<String> = rows.iter().map(|row| row[j].clone()).collect();
+                Column::factor_from_labels(&labels)
+            } else {
+                Column::Numeric(numeric(j))
+            };
+            (name.replace('.', "_"), col)
+        })
+        .collect();
+    let col_of = |name: &str| -> Vec<f64> {
+        let j = header
+            .iter()
+            .position(|h| h == name)
+            .unwrap_or_else(|| panic!("rung {}: column {name:?} not in header", r.rung));
+        numeric(j)
+    };
+    let weights = match r.agg {
+        Some((succ, trials)) => {
+            let s = col_of(succ);
+            let t = col_of(trials);
+            let prop: Vec<f64> = s.iter().zip(&t).map(|(a, b)| a / b).collect();
+            columns.push(("prop".into(), Column::Numeric(prop)));
+            Some(t)
+        }
+        None => r.weights_col.map(col_of),
+    };
+    let offset = r.offset_col.map(col_of);
+    (Table { columns, n }, weights, offset)
+}
+
+/// Rows at the workspace's current point that are tail rows
+/// (`family::in_tail`, whose deviance, score and weights come from η), and
+/// rows on the link's η clamp (`family::clamp_eta_bounds`, the table
+/// `clamp_eta` holds η inside): `(tail, η-clamped)`. No corpus rung reaches an
+/// η clamp at γ̂, and one appearing is a regime change worth failing on.
+#[cfg(feature = "formula")]
+fn tail_census(ws: &GlmmWorkspace, family: Family, n: usize) -> (usize, usize) {
+    let (lo_eta, hi_eta) = crate::family::clamp_eta_bounds(family);
+    let mut tail = 0usize;
+    let mut eta_clamped = 0usize;
+    for i in 0..n {
+        let (e, mu) = (ws.pirls.eta[i], ws.pirls.prob[i]);
+        tail += usize::from(crate::family::in_tail(family, e, mu));
+        eta_clamped += usize::from(e <= lo_eta || e >= hi_eta);
+    }
+    (tail, eta_clamped)
+}
+
+/// One rung lowered, fitted to its own γ̂ with `WaldSe::Rx` (so the fit runs
+/// neither Hessian pass), and handed back as the workspace sitting at that γ̂
+/// with everything the two Hessian engines need, plus the Laplace objective
+/// they differentiate there (the fit's deviance, less Gamma's φ-only term).
+#[cfg(feature = "formula")]
+#[allow(clippy::type_complexity)]
+fn rung_at_gamma_hat(
+    r: &DenseLaplaceRung,
+) -> (
+    GlmmWorkspace,
+    Mat<f64>,
+    Vec<f64>,
+    Vec<u32>,
+    Vec<Vec<u32>>,
+    usize,
+    usize,
+    f64,
+) {
+    let (table, weights, offset) = rung_table(r);
+    let lo = crate::formula::lower(r.formula, &table, r.family)
+        .unwrap_or_else(|e| panic!("rung {}: lower: {e}", r.rung));
+    let opts = FitOptions {
+        target_indices: lo.opts.target_indices.clone(),
+        wald_se: WaldSe::Rx,
+        weights: weights.or(lo.opts.weights.clone()),
+        offset: offset.or(lo.opts.offset.clone()),
+        nagq: 1,
+        ..FitOptions::default()
+    };
+    // Level counts come from the ids, exactly as the shipped dispatch derives
+    // them before it builds a workspace; the lowering leaves placeholders.
+    let (sized_model, sized_ids, _perm) = super::spec_sized_from_ids(&lo.model, &lo.ids);
+    let (mut ws, x_mat) = super::glmm::fit_glmm_build(
+        &lo.x,
+        lo.n,
+        lo.p,
+        &sized_model,
+        &sized_ids.primary,
+        &sized_ids.extra,
+        &opts,
+    )
+    .unwrap_or_else(|_| panic!("rung {}: degenerate design", r.rung));
+    // The shipped dispatch's own inner call, so the fit reaches the same γ̂ the
+    // corpus is fitted at — β seeded from the no-RE GLM, θ from the kernel's
+    // blind start.
+    let deviance = {
+        let view = super::glmm::run_glmm_on(
+            &mut ws,
+            x_mat.as_ref(),
+            &lo.y,
+            lo.n,
+            lo.p,
+            &sized_model,
+            &sized_ids.primary,
+            &sized_ids.extra,
+            f64::NAN,
+            None,
+            &opts,
+            ColumnScaling::IDENTITY,
+        );
+        let (converged, deviance) = view.converged_deviance();
+        assert!(converged, "rung {}: fit must converge", r.rung);
+        deviance
+    };
+    // The objective the engines differentiate: on Gamma, `Fit::deviance`
+    // carries the φ-only `family::gamma_dispersion_term(ln φ̂)` on top, which is
+    // a constant at the fixed φ̂ the engines work at.
+    let deviance = if matches!(sized_model.family, Family::Gamma { .. }) {
+        // `ws.prior_w` is already the internal `ŵ = w/s` (`prep_glmm_design`,
+        // inside `fit_glmm_build` above), the same scale `ws.gamma_phi` reads.
+        let w = ws.weighted.then_some(&ws.prior_w[..lo.n]);
+        let sum_ln_y: f64 = lo.y.iter().map(|yi| yi.ln()).sum();
+        deviance - crate::family::gamma_dispersion_term(ws.gamma_phi.ln(), w, lo.n, sum_ln_y)
+    } else {
+        deviance
+    };
+    // Either exact-derivative owner will do: `supports_exact_shape` for a
+    // layout with a dual kernel, `assembly_routes` for the packed-row layout,
+    // which has only the assembled engine. Each rung list fixes which.
+    assert!(
+        crate::glmm::supports_exact_shape(ws.layout, &ws.groupings)
+            || crate::glmm::assembly_routes(&ws, lo.n),
+        "rung {}: exact-derivative shape expected",
+        r.rung
+    );
+    let sized_ids = sized_ids.into_owned();
+    (
+        ws,
+        x_mat,
+        lo.y,
+        sized_ids.primary,
+        sized_ids.extra,
+        lo.p,
+        lo.n,
+        deviance,
+    )
+}
+
+/// One row of the corpus gate's printed table.
+#[cfg(feature = "formula")]
+struct RungReport {
+    rung: u32,
+    m: usize,
+    /// Worst relative gap between the `f64` assembled gradient and the dual one.
+    worst_grad: f64,
+    /// Worst relative gap between the two Hessians, per entry.
+    worst: f64,
+    /// The assembled pass's own pre-symmetrization asymmetry.
+    asym: f64,
+    /// Each pass's exit `‖u − u_prev‖`.
+    step_asm: f64,
+    step_hd: f64,
+    /// Tail rows (`family::in_tail`) at γ̂.
+    tail_rows: usize,
+}
+
+/// Richardson-extrapolated central second difference of the f64 Laplace
+/// deviance, `(4·D_{base/2} − D_base)/3` — an independent arbiter for
+/// the `CLOGLOG_LARGE` fixture, checked against the assembled Hessian without
+/// going through the hyper-dual pass. Step absolute on θ (`k < n_theta`),
+/// relative × `max(|β|, 1)` on β, mirroring `packed_assembled_gradient_matches_richardson_fd`'s
+/// FD shape one derivative order down. `params` is γ̂, captured ONCE by the
+/// caller before any evaluation: `glmm_laplace_deviance` copies its argument
+/// into `ws.params` and leaves it there, so re-reading `ws.params` as the
+/// centre mid-sweep would walk the centre off γ̂ after the first perturbed
+/// call. `ws.pirls.u` is zeroed before every evaluation, so each one is a
+/// cold PIRLS solve at its own perturbed point, never warm-started from the
+/// last.
+#[cfg(feature = "formula")]
+#[allow(clippy::too_many_arguments)]
+fn richardson_fd_hessian(
+    ws: &mut GlmmWorkspace,
+    x: faer::MatRef<f64>,
+    y: &[f64],
+    ids: &[u32],
+    extra_ids: &[Vec<u32>],
+    n: usize,
+    m: usize,
+    n_theta: usize,
+    base: f64,
+    params: &[f64],
+) -> Mat<f64> {
+    let params: Vec<f64> = params.to_vec();
+    let step = |k: usize, b: f64| -> f64 {
+        if k < n_theta {
+            b
+        } else {
+            b * params[k].abs().max(1.0)
+        }
+    };
+    let mut at = |shifts: &[(usize, f64)]| -> f64 {
+        let mut q = params.clone();
+        for &(k, s) in shifts {
+            q[k] += s;
+        }
+        ws.pirls.u.fill(0.0);
+        glmm_laplace_deviance(&q, ws, x, y, ids, extra_ids, n)
+    };
+    let f0 = at(&[]);
+    let mut raw = |b: f64| -> Mat<f64> {
+        let mut h = Mat::<f64>::zeros(m, m);
+        for i in 0..m {
+            let hi = step(i, b);
+            h[(i, i)] = (at(&[(i, hi)]) - 2.0 * f0 + at(&[(i, -hi)])) / (hi * hi);
+            for j in 0..i {
+                let hj = step(j, b);
+                let v =
+                    (at(&[(i, hi), (j, hj)]) - at(&[(i, hi), (j, -hj)]) - at(&[(i, -hi), (j, hj)])
+                        + at(&[(i, -hi), (j, -hj)]))
+                        / (4.0 * hi * hj);
+                h[(i, j)] = v;
+                h[(j, i)] = v;
+            }
+        }
+        h
+    };
+    let h1 = raw(base);
+    let h2 = raw(0.5 * base);
+    let mut out = Mat::<f64>::zeros(m, m);
+    for i in 0..m {
+        for j in 0..m {
+            out[(i, j)] = (4.0 * h2[(i, j)] - h1[(i, j)]) / 3.0;
+        }
+    }
+    out
+}
+
+/// The assembled joint Hessian against the hyper-dual one, entry by entry, at
+/// the same converged γ̂, on every dense Laplace GLMM rung of the validation
+/// corpus — the real datasets, lowered from the manifest's own formula through
+/// the crate's formula frontend, not a stand-in — plus [`CLOGLOG_LARGE`], the
+/// 9,600-row cloglog fixture whose mode state carries tail rows, run at the
+/// same bands as everything else.
+///
+/// Two independent exact routes to the same matrix: one differentiates the
+/// objective twice through packed second-order lanes, the other differentiates
+/// an explicit `F`/`G` adjoint once and reads the second order off first-order
+/// lanes. They share the `f64` mode solve and the PIRLS tolerance and nothing
+/// else.
+///
+/// The run also reports, per rung: the assembled pass's own pre-symmetrization
+/// asymmetry (`max|H_ij − H_ji|` relative, over columns built by different
+/// chunks — a consistency check the packed pass cannot offer, its triangle
+/// being symmetric by construction), and each pass's exit `‖u − u_prev‖`, which
+/// is the size of the iterate mix each one differentiates. `tail_rows` is a
+/// reported count, not a switch: a tail row's quantities are the η forms of
+/// one smooth deviance, so every rung is compared the same way.
+#[cfg(feature = "formula")]
+#[test]
+fn assembled_hessian_matches_hyperdual_per_entry() {
+    // One band per comparison, both fixed from the first run on the real
+    // datasets and neither tuned since. Gradient: every compared rung agrees to
+    // 8.94e-9 or better, the worst being rung 23 (`sim_gamma`), and fifteen of
+    // the sixteen are at or below 1.75e-11. Hessian: every compared rung agrees
+    // to 6.11e-12 or better, the worst being rung 14 (`Arabidopsis`).
+    const GRAD_BAND: f64 = 1e-7;
+    const BAND: f64 = 1e-10;
+
+    let mut rows: Vec<RungReport> = Vec::new();
+    for r in DENSE_LAPLACE_RUNGS
+        .iter()
+        .chain(std::iter::once(&CLOGLOG_LARGE))
+    {
+        let (mut ws, x, y, ids, extra_ids, p, n, dev) = rung_at_gamma_hat(r);
+        let m = ws.n_theta + p;
+        let (tail_rows, eta_clamped) = tail_census(&ws, r.family, n);
+        assert_eq!(
+            eta_clamped, 0,
+            "rung {}: a clamped η at γ̂ is a new regime, not a band",
+            r.rung
+        );
+
+        // Stage 1 on the real data: the `f64` assembled gradient against
+        // `laplace_gradient`, per coordinate. Two ways of differentiating the
+        // same objective once — an explicit `F`/`G` adjoint against the dual
+        // kernel's own lanes — so they must agree to round-off, and a rung
+        // where they do not is a rung where the Hessian comparison below is
+        // measuring the gradient, not the second derivative.
+        let mut g_dual = vec![0.0; m];
+        let st = crate::glmm::laplace_gradient(
+            &mut ws,
+            x.as_ref(),
+            &y,
+            &ids,
+            &extra_ids,
+            p,
+            n,
+            &mut g_dual,
+        );
+        assert!(
+            matches!(st, crate::glmm::DerivStatus::Ok(_)),
+            "rung {}: the dual gradient declined",
+            r.rung
+        );
+        let mut g_f64 = vec![0.0; m];
+        crate::glmm::gradient_f64(&mut ws, x.as_ref(), &y, &ids, &extra_ids, p, n, &mut g_f64)
+            .unwrap_or_else(|| panic!("rung {}: the assembled f64 gradient declined", r.rung));
+        let mut worst_grad = 0.0f64;
+        for c in 0..m {
+            let gap = (g_f64[c] - g_dual[c]).abs() / g_dual[c].abs().max(1.0);
+            worst_grad = worst_grad.max(gap);
+            assert!(
+                gap <= GRAD_BAND,
+                "rung {} coord {c}: assembled {} vs dual {} (relative gap {gap:e})",
+                r.rung,
+                g_f64[c],
+                g_dual[c]
+            );
+        }
+
+        let mut h_asm = Mat::<f64>::zeros(m, m);
+        let mut g_asm = vec![0.0; m];
+        let st = crate::glmm::joint_hessian_columns(
+            &mut ws,
+            x.as_ref(),
+            &y,
+            &ids,
+            &extra_ids,
+            p,
+            n,
+            &mut g_asm,
+            &mut h_asm,
+        );
+        let v_asm = match st {
+            crate::glmm::DerivStatus::Ok(v) => v,
+            _ => panic!("rung {}: the assembled Hessian declined", r.rung),
+        };
+        let step_asm = ws
+            .dual_scratch
+            .as_deref()
+            .expect("the assembled pass sizes the dual scratch")
+            .exit_mode_step();
+        let mut asym = 0.0f64;
+        for i in 0..m {
+            for j in 0..i {
+                asym =
+                    asym.max((h_asm[(i, j)] - h_asm[(j, i)]).abs() / h_asm[(i, j)].abs().max(1.0));
+                let v = 0.5 * (h_asm[(i, j)] + h_asm[(j, i)]);
+                h_asm[(i, j)] = v;
+                h_asm[(j, i)] = v;
+            }
+        }
+
+        let mut h_hd = Mat::<f64>::zeros(m, m);
+        let mut g_hd = vec![0.0; m];
+        let st = crate::glmm::laplace_hessian(
+            &mut ws,
+            x.as_ref(),
+            &y,
+            &ids,
+            &extra_ids,
+            p,
+            n,
+            &mut g_hd,
+            &mut h_hd,
+        );
+        let v_hd = match st {
+            crate::glmm::DerivStatus::Ok(v) => v,
+            _ => panic!("rung {}: the hyper-dual Hessian declined", r.rung),
+        };
+        let step_hd = ws
+            .hyper_scratch
+            .as_deref()
+            .expect("the hyper-dual pass sizes its own scratch")
+            .exit_mode_step();
+
+        // The objective value each pass reports is the same function at the
+        // same point whichever chunk it came out of, and it is the fit's own
+        // minimized deviance. Asserted in release, not only in debug: on a
+        // chunked pass this is what says every chunk differentiated the same
+        // objective.
+        for (what, v) in [("assembled", v_asm), ("hyper-dual", v_hd)] {
+            assert!(
+                (v - dev).abs() <= 1e-6 * (1.0 + dev.abs()),
+                "rung {}: {what} pass reports objective {v}, the fit's deviance is {dev}",
+                r.rung
+            );
+        }
+
+        let mut worst = 0.0f64;
+        for i in 0..m {
+            for j in 0..m {
+                let gap = (h_asm[(i, j)] - h_hd[(i, j)]).abs() / h_hd[(i, j)].abs().max(1.0);
+                worst = worst.max(gap);
+                assert!(
+                    gap <= BAND,
+                    "rung {} entry ({i},{j}): assembled {} vs hyper-dual {} (relative gap {gap:e})",
+                    r.rung,
+                    h_asm[(i, j)],
+                    h_hd[(i, j)]
+                );
+            }
+        }
+        // The asymmetry compares the assembled pass with itself: columns built
+        // by different chunks against each other.
+        assert!(
+            asym <= BAND,
+            "rung {}: pre-symmetrization asymmetry {asym:e} above the band",
+            r.rung
+        );
+
+        // `CLOGLOG_LARGE` only: a second, independent arbiter — the
+        // Richardson-extrapolated central second difference of the f64
+        // Laplace deviance, at base steps 4e-3 and 8e-3 — so the assembled
+        // Hessian is checked against something other than the hyper-dual
+        // pass too. `FD_BAND` is the arbiter's own reproducibility between
+        // those two base steps, not a statement about either engine: nothing
+        // tighter than the arbiter's own drift would be. It sits above the
+        // measured worst and below twice it, and is re-measured whenever γ̂
+        // moves. Measured at the γ̂ PIRLS reaches with the Newton step on
+        // cloglog (`pirls::observed_weights_in_place`): reproducibility (base
+        // 4e-3 vs 8e-3) 1.08e-6 over all entries, 1.95e-8 on the diagonal;
+        // assembled vs the base-4e-3 estimate 8.40e-7 worst entry, below the
+        // arbiter's own drift. Band: 1.5e-6.
+        if std::ptr::eq(r, &CLOGLOG_LARGE) {
+            const FD_BAND: f64 = 1.5e-6;
+            let n_theta = ws.n_theta;
+            ws.fd.pirls_tol_override = Some(1e-12);
+            let gamma_hat: Vec<f64> = ws.params[..m].to_vec();
+            let fd4 = richardson_fd_hessian(
+                &mut ws,
+                x.as_ref(),
+                &y,
+                &ids,
+                &extra_ids,
+                n,
+                m,
+                n_theta,
+                4e-3,
+                &gamma_hat,
+            );
+            let fd8 = richardson_fd_hessian(
+                &mut ws,
+                x.as_ref(),
+                &y,
+                &ids,
+                &extra_ids,
+                n,
+                m,
+                n_theta,
+                8e-3,
+                &gamma_hat,
+            );
+            ws.fd.pirls_tol_override = None;
+            let mut repro_all = 0.0f64;
+            let mut repro_diag = 0.0f64;
+            for i in 0..m {
+                for j in 0..m {
+                    let gap = (fd4[(i, j)] - fd8[(i, j)]).abs()
+                        / fd4[(i, j)].abs().min(fd8[(i, j)].abs()).max(1.0);
+                    repro_all = repro_all.max(gap);
+                    if i == j {
+                        repro_diag = repro_diag.max(gap);
+                    }
+                }
+            }
+            let mut worst_fd = 0.0f64;
+            for i in 0..m {
+                for j in 0..m {
+                    let gap = (h_asm[(i, j)] - fd4[(i, j)]).abs()
+                        / h_asm[(i, j)].abs().min(fd4[(i, j)].abs()).max(1.0);
+                    worst_fd = worst_fd.max(gap);
+                    assert!(
+                        gap <= FD_BAND,
+                        "CLOGLOG_LARGE entry ({i},{j}): assembled {} vs Richardson FD(4e-3) {} \
+                         (relative gap {gap:e})",
+                        h_asm[(i, j)],
+                        fd4[(i, j)]
+                    );
+                }
+            }
+            println!(
+                "CLOGLOG_LARGE: FD reproducibility (4e-3 vs 8e-3) all entries {repro_all:e}, \
+                 diagonal {repro_diag:e}; assembled vs FD(4e-3) worst {worst_fd:e}"
+            );
+        }
+
+        rows.push(RungReport {
+            rung: r.rung,
+            m,
+            worst_grad,
+            worst,
+            asym,
+            step_asm,
+            step_hd,
+            tail_rows,
+        });
+    }
+    assert_eq!(
+        rows.len(),
+        DENSE_LAPLACE_RUNGS.len() + 1,
+        "every rung, plus CLOGLOG_LARGE, must run"
+    );
+    for r in &rows {
+        println!(
+            "rung {}: m {}, gradient {:e}, worst entry {:e}, asymmetry {:e}, \
+             exit |u-u_prev| assembled {:e} hyper-dual {:e}, tail rows {}",
+            r.rung, r.m, r.worst_grad, r.worst, r.asym, r.step_asm, r.step_hd, r.tail_rows
+        );
+    }
+}
+
+/// A small unweighted Bernoulli-logit design whose sigmoid sits past
+/// `1 − PROB_EPS` on a few rows at γ̂ — one primary grouping, no extras, so
+/// the fit is dense (the blocked route), not packed. `y = 1` and a `+30`
+/// offset on three rows out of eighty forces `σ(η) ≥ 1 − PROB_EPS` there while
+/// leaving the rest of the design an ordinary random-intercept logit fit.
+#[cfg(feature = "formula")]
+#[allow(clippy::type_complexity)]
+fn unweighted_logit_saturated_fixture() -> (
+    Vec<f64>,
+    Vec<f64>,
+    Vec<f64>,
+    usize,
+    usize,
+    ModelSpec,
+    GroupIds,
+) {
+    let (n_g, per) = (8usize, 10usize);
+    let n = n_g * per;
+    let p = 2;
+    let mut st = 11u64;
+    let (mut x, mut y) = (vec![0.0f64; n * p], vec![0.0f64; n]);
+    let mut g = vec![0u32; n];
+    for i in 0..n {
+        g[i] = (i % n_g) as u32;
+        let x1 = lcg(&mut st);
+        x[i * p] = 1.0;
+        x[i * p + 1] = x1;
+        let eta = 0.3 + 0.5 * x1 + 0.2 * (g[i] as f64 - 3.5);
+        // A Bernoulli draw, not a threshold on η: thresholding separates the
+        // data, which has no finite optimum.
+        y[i] = if 0.5 * (lcg(&mut st) + 1.0) < eta.exp() / (1.0 + eta.exp()) {
+            1.0
+        } else {
+            0.0
+        };
+    }
+    let mut offset = vec![0.0f64; n];
+    for &i in &[0usize, 1, 2] {
+        offset[i] = 30.0;
+        y[i] = 1.0;
+    }
+    let model = ModelSpec {
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_g as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: g,
+        extra: vec![],
+    };
+    (x, y, offset, n, p, model, ids)
+}
+
+/// Unweighted logit with saturated rows, end to end. On
+/// [`unweighted_logit_saturated_fixture`] the sigmoid sits past `PROB_EPS` on
+/// a few rows at γ̂, so those rows are tail rows (`family::in_tail`) wherever
+/// a deviance is folded outside the fused kernel; the assembled engine takes
+/// the fit, and its gradient and Hessian agree with the hyper-dual pass at
+/// the per-entry gate's own bands — the one end-to-end check of that route.
+#[cfg(feature = "formula")]
+#[test]
+fn unweighted_logit_saturated_rows_assemble() {
+    const GRAD_BAND: f64 = 1e-7;
+    const BAND: f64 = 1e-10;
+
+    let (xf, y, offset, n, p, model, ids) = unweighted_logit_saturated_fixture();
+    let (mut ws, x, ids_p, extra_ids) = ws_at_gamma_hat(
+        &xf,
+        &y,
+        Some(offset),
+        n,
+        p,
+        &model,
+        &ids,
+        "unweighted logit saturated fixture",
+    );
+    assert!(!ws.weighted, "fixture must be unweighted");
+    let family = Family::Binomial {
+        link: BinomialLink::Logit,
+    };
+    let (tail, _eta) = tail_census(&ws, family, n);
+    assert!(tail > 0, "fixture must reach the tail");
+
+    let m = ws.n_theta + p;
+    let mut g_dual = vec![0.0; m];
+    let st = crate::glmm::laplace_gradient(
+        &mut ws,
+        x.as_ref(),
+        &y,
+        &ids_p,
+        &extra_ids,
+        p,
+        n,
+        &mut g_dual,
+    );
+    assert!(
+        matches!(st, crate::glmm::DerivStatus::Ok(_)),
+        "dual gradient declined"
+    );
+    let mut g_f64 = vec![0.0; m];
+    crate::glmm::gradient_f64(
+        &mut ws,
+        x.as_ref(),
+        &y,
+        &ids_p,
+        &extra_ids,
+        p,
+        n,
+        &mut g_f64,
+    )
+    .expect("assembled f64 gradient declined");
+    for c in 0..m {
+        let gap = (g_f64[c] - g_dual[c]).abs() / g_dual[c].abs().max(1.0);
+        assert!(
+            gap <= GRAD_BAND,
+            "coord {c}: assembled {} vs dual {} (relative gap {gap:e})",
+            g_f64[c],
+            g_dual[c]
+        );
+    }
+
+    let mut h_asm = Mat::<f64>::zeros(m, m);
+    let mut g_asm = vec![0.0; m];
+    let st = crate::glmm::joint_hessian_columns(
+        &mut ws,
+        x.as_ref(),
+        &y,
+        &ids_p,
+        &extra_ids,
+        p,
+        n,
+        &mut g_asm,
+        &mut h_asm,
+    );
+    assert!(
+        matches!(st, crate::glmm::DerivStatus::Ok(_)),
+        "assembled Hessian declined"
+    );
+    let mut h_hd = Mat::<f64>::zeros(m, m);
+    let mut g_hd = vec![0.0; m];
+    let st = crate::glmm::laplace_hessian(
+        &mut ws,
+        x.as_ref(),
+        &y,
+        &ids_p,
+        &extra_ids,
+        p,
+        n,
+        &mut g_hd,
+        &mut h_hd,
+    );
+    assert!(
+        matches!(st, crate::glmm::DerivStatus::Ok(_)),
+        "hyper-dual Hessian declined"
+    );
+    for i in 0..m {
+        for j in 0..m {
+            let gap = (h_asm[(i, j)] - h_hd[(i, j)]).abs() / h_hd[(i, j)].abs().max(1.0);
+            assert!(
+                gap <= BAND,
+                "entry ({i},{j}): assembled {} vs hyper-dual {} (relative gap {gap:e})",
+                h_asm[(i, j)],
+                h_hd[(i, j)]
+            );
+        }
+    }
+}
+
+/// Rung 48's dataset read under the cloglog link — the 9,600-row model
+/// `fit_glmm_cloglog_matches_glmmtmb` fits, expressed as a rung so the harness
+/// above can drive it to its own γ̂. Not in `DENSE_LAPLACE_RUNGS`: the corpus
+/// gate's set is the manifest's, one entry per dataset and link, and this is a
+/// second link on a dataset already in it.
+#[cfg(feature = "formula")]
+static CLOGLOG_LARGE: DenseLaplaceRung = DenseLaplaceRung {
+    rung: 48,
+    csv: include_str!("../../validation/data/simulated/sim_probit_large.csv"),
+    formula: "y ~ x1 + x2 + x3 + z + (1 | g)",
+    family: Family::Binomial {
+        link: BinomialLink::Cloglog,
+    },
+    factors: &["g"],
+    agg: None,
+    weights_col: None,
+    offset_col: None,
+};
+
+/// The corpus rung carrying this number.
+#[cfg(feature = "formula")]
+fn rung_by_number(rung: u32) -> &'static DenseLaplaceRung {
+    DENSE_LAPLACE_RUNGS
+        .iter()
+        .find(|r| r.rung == rung)
+        .unwrap_or_else(|| panic!("rung {rung} is in the corpus"))
+}
+
+/// One fixture of [`laplace_gradient_lanes_match_fd_in_one_call`]: the point
+/// to drive, how many tail rows its mode state is expected to carry, and the
+/// band the lanes must meet.
+#[cfg(feature = "formula")]
+struct LaneFixture {
+    what: &'static str,
+    rung: &'static DenseLaplaceRung,
+    tail_rows: usize,
+    band: f64,
+}
+
+/// The dual Laplace gradient's lanes against a Richardson-extrapolated central
+/// difference of the very objective they claim to differentiate, on three
+/// points whose mode state carries tail rows (`family::in_tail`) and on one
+/// that does not.
+///
+/// **What can go wrong here.** The dual PIRLS kernels take the Hessian step
+/// (`pirls::DualStep`), so the lanes reach the implicit-function answer in one
+/// kernel call and the kernels say so through `DualStep::exact`; the caller
+/// then skips its refinement loop. That claim holds only when the kernel's
+/// score is the exact η-slope of the deviance on every row, tail rows
+/// included. If a tail form's score or weight were not the derivative of its
+/// deviance, the lanes read after one call would be part-converged — smooth,
+/// plausible, and only a few digits short — with `exact` still reporting
+/// true.
+///
+/// So both are asserted on every point: `exact` is true, and the lanes meet
+/// the band. The arbiter is the `f64` objective's own central difference,
+/// Richardson extrapolated from base `h` and `h/2`, with `ws.pirls.u` zeroed
+/// before every evaluation so each one is the same cold function of γ. It is
+/// an independent route to the gradient — no dual arithmetic, no adjoint —
+/// and its own resolution is what sets the bands, not taste.
+#[cfg(feature = "formula")]
+#[test]
+fn laplace_gradient_lanes_match_fd_in_one_call() {
+    // Tight enough that the mode solve's last step is at round-off, so the
+    // differentiated objective and the differenced one are the same function
+    // rather than two nearby ones.
+    const TOL: f64 = 1e-12;
+    // Base FD step: absolute on θ, relative × max(|β|, 1) on β.
+    const FD_BASE: f64 = 1e-3;
+    // The two bands, both set from the first run on these four points and
+    // neither tuned since. `SMALL_BAND` covers the two few-hundred-row points,
+    // rung 49 and rung 22, where the arbiter resolves the gradient to ~5e-10
+    // and the lanes land at 2.0e-11 to 2.3e-10. `BIG_BAND` covers the two
+    // 9,600-row ones, where the arbiter's own drift between base steps is up
+    // to 6.4e-8 — nothing tighter than the arbiter's resolution is a
+    // statement about the lanes. There the lanes land at 1.2e-8 to 1.0e-7 on
+    // rung 48 and at 2.8e-9 to 1.1e-7 on the cloglog fixture.
+    const SMALL_BAND: f64 = 1e-8;
+    const BIG_BAND: f64 = 2e-7;
+
+    let fixtures = [
+        LaneFixture {
+            what: "rung 49 sim_cloglog_nested_crossed",
+            rung: rung_by_number(49),
+            tail_rows: 3,
+            band: SMALL_BAND,
+        },
+        LaneFixture {
+            what: "cloglog 9,600-row fixture",
+            rung: &CLOGLOG_LARGE,
+            tail_rows: 76,
+            band: BIG_BAND,
+        },
+        LaneFixture {
+            what: "rung 22 cbpp_probit",
+            rung: rung_by_number(22),
+            tail_rows: 0,
+            band: SMALL_BAND,
+        },
+        LaneFixture {
+            what: "rung 48 sim_probit_large",
+            rung: rung_by_number(48),
+            tail_rows: 1,
+            band: BIG_BAND,
+        },
+    ];
+
+    for f in &fixtures {
+        let (mut ws, x, y, ids, extra_ids, p, n, _dev) = rung_at_gamma_hat(f.rung);
+        let m = ws.n_theta + p;
+        let n_theta = ws.n_theta;
+        let (tail_rows, eta_clamped) = tail_census(&ws, f.rung.family, n);
+        assert_eq!(
+            (tail_rows, eta_clamped),
+            (f.tail_rows, 0),
+            "{}: the tail census at γ̂ moved — this fixture is here for its tail state",
+            f.what
+        );
+
+        ws.fd.pirls_tol_override = Some(TOL);
+        let mut g_dual = vec![0.0; m];
+        let st = crate::glmm::laplace_gradient(
+            &mut ws,
+            x.as_ref(),
+            &y,
+            &ids,
+            &extra_ids,
+            p,
+            n,
+            &mut g_dual,
+        );
+        assert!(
+            matches!(st, crate::glmm::DerivStatus::Ok(_)),
+            "{}: the dual gradient declined",
+            f.what
+        );
+        assert!(
+            ws.dual_scratch
+                .as_deref()
+                .expect("the dual gradient sizes the dual scratch")
+                .exit_exact(),
+            "{}: the kernel must report one-call exactness here",
+            f.what
+        );
+
+        let params: Vec<f64> = ws.params[..m].to_vec();
+        let at = |ws: &mut GlmmWorkspace, k: usize, step: f64| -> f64 {
+            let mut q = params.clone();
+            q[k] += step;
+            ws.pirls.u.fill(0.0);
+            glmm_laplace_deviance(&q, ws, x.as_ref(), &y, &ids, &extra_ids, n)
+        };
+        let mut worst = 0.0f64;
+        let mut gaps = vec![0.0; m];
+        for k in 0..m {
+            let h = if k < n_theta {
+                FD_BASE
+            } else {
+                FD_BASE * params[k].abs().max(1.0)
+            };
+            // Central difference at h and at h/2, combined as
+            // (4·D_{h/2} − D_h)/3 — the O(h⁴) Richardson step for a stencil
+            // whose own error is O(h²).
+            let c1 = (at(&mut ws, k, h) - at(&mut ws, k, -h)) / (2.0 * h);
+            let c2 = (at(&mut ws, k, 0.5 * h) - at(&mut ws, k, -0.5 * h)) / h;
+            let fd = (4.0 * c2 - c1) / 3.0;
+            gaps[k] = (g_dual[k] - fd).abs();
+            worst = worst.max(gaps[k]);
+        }
+        println!(
+            "{}: m {}, tail rows {tail_rows}, \
+             per-coordinate |lane − FD| {:?}, worst {:e}",
+            f.what, m, gaps, worst
+        );
+        for k in 0..m {
+            assert!(
+                gaps[k] <= f.band,
+                "{} coord {k}: lane {} vs central difference (absolute gap {:e}, band {:e})",
+                f.what,
+                g_dual[k],
+                gaps[k],
+                f.band
+            );
+        }
+    }
+}
+
+/// The dense assembled path on a mode state with tail rows (`family::in_tail`),
+/// end to end: the assembled engine takes the fit, and `joint_hessian_cov`
+/// ships its covariance for it.
+///
+/// `CLOGLOG_LARGE`, the cloglog fixture on the 9,600-row `sim_probit_large`
+/// dataset, is that rung — three tail rows — and the corpus gate above
+/// already holds the per-entry agreement with the hyper-dual pass. What is
+/// unexercised without this test is the RESULT through the production entry
+/// point: that `joint_hessian_cov` reports `FdHessianStatus::Ok`, and that
+/// the covariance and the θ-block standard errors it ships are the assembled
+/// arm's own, bit for bit, rather than the hyper-dual pass's or a stencil's.
+///
+/// The reference side drives `joint_hessian` directly at the same γ̂ and
+/// inverts its matrix the way `joint_hessian_cov` inverts it — `cov = 2·H⁻¹`
+/// on the β block, `sqrt(2·H⁻¹_kk)` on the θ diagonal — so the comparison is
+/// bitwise and needs no band.
+///
+/// The take is asserted at the engine: a direct `joint_hessian_columns` call
+/// at this γ̂ must answer `Ok`.
+#[cfg(feature = "formula")]
+#[test]
+fn tail_dense_rung_ships_the_assembled_covariance() {
+    use faer::linalg::solvers::Solve;
+
+    let r = &CLOGLOG_LARGE;
+    let (mut ws, x, y, ids, extra_ids, p, n, _dev) = rung_at_gamma_hat(r);
+    let n_theta = ws.n_theta;
+    let m = n_theta + p;
+    let (tail_rows, _eta) = tail_census(&ws, r.family, n);
+    assert!(
+        tail_rows > 0,
+        "rung {}: this fixture is here for its tail rows ({tail_rows})",
+        r.rung
+    );
+
+    let mut g = vec![0.0; m];
+    let mut hess = Mat::<f64>::zeros(m, m);
+    let st = crate::glmm::joint_hessian_columns(
+        &mut ws,
+        x.as_ref(),
+        &y,
+        &ids,
+        &extra_ids,
+        p,
+        n,
+        &mut g,
+        &mut hess,
+    );
+    assert!(
+        matches!(st, crate::glmm::DerivStatus::Ok(_)),
+        "rung {}: the assembled engine must take a mode state with tail rows",
+        r.rung
+    );
+
+    // The assembled arm on its own, symmetrized, at the same γ̂ — the
+    // reference the production entry point below is compared against.
+    let st = crate::glmm::joint_hessian(
+        &mut ws,
+        x.as_ref(),
+        &y,
+        &ids,
+        &extra_ids,
+        p,
+        n,
+        &mut g,
+        &mut hess,
+    );
+    assert!(
+        matches!(st, crate::glmm::DerivStatus::Ok(_)),
+        "rung {}: the assembled arm must answer",
+        r.rung
+    );
+    let chol = hess
+        .as_ref()
+        .llt(faer::Side::Lower)
+        .expect("the assembled joint Hessian is PD at this γ̂");
+    let mut inv = Mat::<f64>::identity(m, m);
+    chol.solve_in_place(inv.as_mut());
+    let want_cov = Mat::<f64>::from_fn(p, p, |a, b| 2.0 * inv[(n_theta + a, n_theta + b)]);
+    let want_theta_se: Vec<f64> = (0..n_theta)
+        .map(|k| (2.0 * inv[(k, k)]).max(0.0).sqrt())
+        .collect();
+
+    let mut got_cov = Mat::<f64>::zeros(p, p);
+    let st = crate::glmm::joint_hessian_cov(
+        &mut ws,
+        x.as_ref(),
+        &y,
+        &ids,
+        &extra_ids,
+        p,
+        n,
+        &mut got_cov,
+    );
+    assert!(
+        matches!(st, crate::glmm::FdHessianStatus::Ok),
+        "rung {}: expected Ok ({st:?})",
+        r.rung
+    );
+    for a in 0..p {
+        for b in 0..p {
+            assert_eq!(
+                got_cov[(a, b)].to_bits(),
+                want_cov[(a, b)].to_bits(),
+                "rung {}: cov[({a},{b})] {} is not the assembled arm's {}",
+                r.rung,
+                got_cov[(a, b)],
+                want_cov[(a, b)]
+            );
+        }
+    }
+    for (k, &want) in want_theta_se.iter().enumerate() {
+        assert_eq!(
+            theta_se(&ws)[k].to_bits(),
+            want.to_bits(),
+            "rung {}: theta_se[{k}] {} is not the assembled arm's {want}",
+            r.rung,
+            theta_se(&ws)[k]
+        );
+    }
+}
+
+/// Every packed-row-routed GLMM rung of the validation corpus this instrument
+/// can drive, at Laplace — rungs 8, 9, 18, 24, 38 and 46, the manifest's
+/// `Solver::Sparse` rows that are also non-Gaussian and so reach the GLMM
+/// driver rather than the LMM one. Same two mechanical formula rewrites
+/// [`DenseLaplaceRung`] documents.
+///
+/// The manifest's other three `Solver::Sparse` rungs (7, 36, 47) are excluded,
+/// not proxied: they are Gaussian and take the LMM REML path, so no GLMM
+/// engine touches them.
+///
+/// One packed cell is covered by proxy instead of appearing here. The
+/// negative-binomial golden `sim_sparse_nb` is packed-routed and in scope,
+/// but `rung_at_gamma_hat` cannot reach it: an NB fit carries a trailing
+/// `ln θ_NB` coordinate that `run_glmm_on` expects seeded from a no-RE GLM-NB
+/// θ̂, which only the NB dispatch (`fit::glmm::fit_glmm_nb`) supplies, and
+/// with `nb_theta` NaN the outer search rejects its own box. Its packed
+/// engine is exercised through the full dispatch instead — by the
+/// `NegativeBinomial` cell of `sparse::tests`'s cross-engine envelope check,
+/// and by `sparse::tests::fit_sparse_nb_glmm_is_pinned`.
+///
+/// Every rung here is unweighted or carries its prior weights through an
+/// aggregated-binomial response (rungs 8, 18, 38), all three canonical, so
+/// prior weights on a NON-canonical packed fit are not gated from this list.
+/// That combination is covered by the weighted Gamma-log cell of
+/// `sparse::tests::packed_and_dense_assembled_hessians_agree`, against the
+/// dense assembled engine, and corroborated by
+/// `sparse::tests::fit_sparse_gamma_glmm_weighted_matches_glmmtmb`.
+#[cfg(feature = "formula")]
+const PACKED_LAPLACE_RUNGS: &[DenseLaplaceRung] = &[
+    DenseLaplaceRung {
+        rung: 8,
+        csv: include_str!("../../validation/data/simulated/sim_sparse_binomial.csv"),
+        formula: "prop ~ x + (1|g1) + (1|c1) + (1|c2) + (1|c3) + (1|c4) + (1|c5) + (1|c6) + (1|c7)",
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        factors: &["g1", "c1", "c2", "c3", "c4", "c5", "c6", "c7"],
+        agg: Some(("incidence", "size")),
+        weights_col: None,
+        offset_col: None,
+    },
+    DenseLaplaceRung {
+        rung: 9,
+        csv: include_str!("../../validation/data/simulated/sim_sparse_poisson.csv"),
+        formula: "y ~ x + (1|g1) + (1|c1) + (1|c2) + (1|c3) + (1|c4) + (1|c5) + (1|c6) + (1|c7)",
+        family: Family::Poisson {
+            link: PoissonLink::Log,
+        },
+        factors: &["g1", "c1", "c2", "c3", "c4", "c5", "c6", "c7"],
+        agg: None,
+        weights_col: None,
+        offset_col: None,
+    },
+    DenseLaplaceRung {
+        rung: 18,
+        csv: include_str!("../../validation/data/simulated/sim_binomial_slope_crossed.csv"),
+        formula: "prop ~ x + (1 + x | g1) + (1 + x | g2)",
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        factors: &["g1", "g2"],
+        agg: Some(("incidence", "size")),
+        weights_col: None,
+        offset_col: None,
+    },
+    DenseLaplaceRung {
+        rung: 24,
+        csv: include_str!("../../validation/data/simulated/sim_sparse_gamma.csv"),
+        formula: "y ~ x1 + x2 + x3 + x4 + (1 | gp) + (1 + x1 + x2 + x3 + x4 | ge)",
+        family: Family::Gamma {
+            link: crate::GammaLink::Log,
+        },
+        factors: &["gp", "ge"],
+        agg: None,
+        weights_col: None,
+        offset_col: None,
+    },
+    DenseLaplaceRung {
+        rung: 38,
+        csv: include_str!("../../validation/data/simulated/glmm_binomial.csv"),
+        formula: "prop ~ x + (1|g1) + (1|c1) + (1|c2) + (1|c3) + (1|c4) + (1|c5) + (1|c6) + (1|c7)",
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        factors: &["g1", "c1", "c2", "c3", "c4", "c5", "c6", "c7"],
+        agg: Some(("incidence", "size")),
+        weights_col: None,
+        offset_col: None,
+    },
+    DenseLaplaceRung {
+        rung: 46,
+        csv: include_str!("../../validation/data/simulated/sim_sparse_binomial_bigsd.csv"),
+        formula:
+            "y ~ x + z + (1 | g1) + (1 | c1) + (1 | c2) + (1 | c3) + (1 | c4) + (1 | c5) + (1 | c6) + (1 | c7)",
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        factors: &["g1", "c1", "c2", "c3", "c4", "c5", "c6", "c7"],
+        agg: None,
+        weights_col: None,
+        offset_col: None,
+    },
+];
+
+/// The packed assembled gradient at `T = f64` against a Richardson-
+/// extrapolated central difference of the Laplace deviance it differentiates,
+/// at every packed rung's own γ̂ on the corpus's own data.
+///
+/// The oracle differences `glmm_laplace_deviance` on the same workspace with
+/// `ws.fd.pirls_tol_override = Some(1e-12)`, which is where the packed arm of
+/// the deviance cold-seeds `û = 0` on every evaluation, so each `f(γ)` is a
+/// pure function of γ whatever order the coordinates run in. The engine's own
+/// mode solve warm-starts from the fit's `û(γ̂)` instead; at that tolerance
+/// both reach the same mode, so the two sides differentiate one function.
+///
+/// Central differences at `h` and `h/2`, combined as `(4·D(h/2) − D(h))/3`.
+/// That cancels the plain central difference's `O(h²)` truncation and leaves
+/// the deviance's own reproducibility divided by `h` as the floor, so the
+/// step is deliberately LARGE: `h = 1e-3·max(1, |γ̂_k|)`.
+///
+/// Band `1e-6` relative (to `max(1, |FD|)`), fixed from the first
+/// measurement: worst coordinate 2.75e-8, rung 46
+/// (`sim_sparse_binomial_bigsd`, coordinate 1), with rung 24
+/// (`sim_sparse_gamma`) next at 2.57e-8 and every other rung at or below
+/// 2.0e-9. The ~36× margin over the worst is the FD oracle's own scatter,
+/// not a statement about the engine: the engine's own accuracy is pinned
+/// against exact references — the Hessian supply check below, and the
+/// both-layouts Hessian cross-check in `sparse::tests`, which puts this
+/// engine within 2.6e-13 of the dense assembled one on the shapes the dense
+/// engine can also fit (`q_p ≤ 2`, `q_g = 1`, weighted and unweighted).
+/// A canonical packed fit sizes no observed factor (`PackedAsmBufs::obs` is
+/// empty there), so the reuse check must compare `obs` against that same
+/// `obs_len`. Comparing it against a flat `k²` would refuse the stored scratch
+/// on every call and rebuild it silently: the second call would hand back a
+/// different allocation. Rung 8 is binomial-logit, rung 9 Poisson-log.
+#[cfg(feature = "formula")]
+#[test]
+fn packed_gradient_reuses_its_scratch_on_a_canonical_link() {
+    for r in &PACKED_LAPLACE_RUNGS[..2] {
+        let (mut ws, x, y, _ids, _extra_ids, p, n, _dev) = rung_at_gamma_hat(r);
+        assert_eq!(ws.layout, crate::glmm::GlmmLayout::Packed);
+        assert!(crate::family::is_canonical(ws.family));
+        let m = ws.n_theta + p;
+        let mut g = vec![0.0; m];
+        let st = crate::glmm::packed_gradient(&mut ws, x.as_ref(), &y, p, n, &mut g);
+        assert!(
+            matches!(st, crate::glmm::DerivStatus::Ok(_)),
+            "rung {}",
+            r.rung
+        );
+        let first: *const _ = &**ws.packed_asm.as_ref().expect("built on the first call");
+        let st = crate::glmm::packed_gradient(&mut ws, x.as_ref(), &y, p, n, &mut g);
+        assert!(
+            matches!(st, crate::glmm::DerivStatus::Ok(_)),
+            "rung {}",
+            r.rung
+        );
+        let second: *const _ = &**ws.packed_asm.as_ref().expect("put back");
+        assert!(
+            std::ptr::eq(first, second),
+            "rung {}: the packed scratch was rebuilt on a repeat call",
+            r.rung
+        );
+    }
+}
+
+#[cfg(feature = "formula")]
+#[test]
+fn packed_assembled_gradient_matches_richardson_fd() {
+    const BAND: f64 = 1e-6;
+    for r in PACKED_LAPLACE_RUNGS {
+        let (mut ws, x, y, ids, extra_ids, p, n, _dev) = rung_at_gamma_hat(r);
+        assert_eq!(
+            ws.layout,
+            crate::glmm::GlmmLayout::Packed,
+            "rung {}: packed-row layout expected",
+            r.rung
+        );
+        let n_theta = ws.n_theta;
+        let m = n_theta + p;
+        let kk = ws.k.max(1);
+        let saved: Vec<f64> = ws.params[..m].to_vec();
+        let u_hat: Vec<f64> = ws.pirls.u[..kk].to_vec();
+        ws.fd.pirls_tol_override = Some(1e-12);
+
+        let mut g = vec![0.0; m];
+        ws.pirls.u[..kk].copy_from_slice(&u_hat);
+        let st = crate::glmm::packed_gradient(&mut ws, x.as_ref(), &y, p, n, &mut g);
+        assert!(
+            matches!(st, crate::glmm::DerivStatus::Ok(_)),
+            "rung {}: the packed assembled gradient declined",
+            r.rung
+        );
+
+        let mut worst = 0.0f64;
+        let mut worst_coord = 0usize;
+        for coord in 0..m {
+            let h = 1e-3 * saved[coord].abs().max(1.0);
+            let mut at = saved.clone();
+            let ev = |ws: &mut GlmmWorkspace, at: &mut Vec<f64>, d: f64| -> f64 {
+                at[coord] = saved[coord] + d;
+                glmm_laplace_deviance(at, ws, x.as_ref(), &y, &ids, &extra_ids, n)
+            };
+            let d1 = (ev(&mut ws, &mut at, h) - ev(&mut ws, &mut at, -h)) / (2.0 * h);
+            let d2 = (ev(&mut ws, &mut at, 0.5 * h) - ev(&mut ws, &mut at, -0.5 * h)) / h;
+            let fd = (4.0 * d2 - d1) / 3.0;
+            let gap = (g[coord] - fd).abs() / fd.abs().max(1.0);
+            if gap > worst {
+                worst = gap;
+                worst_coord = coord;
+            }
+            assert!(
+                gap <= BAND,
+                "rung {} coord {coord}: assembled {} vs Richardson FD {fd} (relative gap {gap:e})",
+                r.rung,
+                g[coord]
+            );
+        }
+        ws.params[..m].copy_from_slice(&saved);
+        ws.fd.pirls_tol_override = None;
+        println!(
+            "packed gradient rung {}: m {m}, k {}, worst relative gap {worst:e} at coord {worst_coord}",
+            r.rung, ws.k
+        );
+    }
+}
+
+/// The packed assembled Hessian's columns against a central difference of the
+/// packed assembled gradient at `T = f64` — the supply check that every
+/// quantity the assembly reads is differentiated rather than lifted, on the
+/// corpus's own data at each packed rung's γ̂.
+///
+/// Both sides come from one body at two scalars, so a lane-plumbing mistake —
+/// a quantity carried in with `from_f64` that should have been differentiated,
+/// `û`'s response `U` solved against the wrong factor — shows here as a whole
+/// column missing. The pre-symmetrization asymmetry is checked alongside: the
+/// two triangles come out of different chunks, so their agreement is a free
+/// consistency check on the chunk bookkeeping.
+///
+/// Richardson-extrapolated over `h` and `h/2`, as the gradient gate above is:
+/// without that, the plain central difference's `O(h²)` truncation is what
+/// the gate measures.
+///
+/// **The step and the mode tolerance are chosen together, because the
+/// oracle's error is the mode solve's own reproducibility divided by `h`.** A
+/// step too small is that noise; a step too large is what Richardson's
+/// `O(h⁴)` remainder leaves; `h = 1e-3·max(1, |γ̂_k|)` under a `1e-14` mode
+/// solve is the flat middle. Worst gap over all cells of `sim_sparse_gamma`
+/// (rung 24), the corpus's hardest packed shape, scanned over both:
+///
+/// ```text
+///   mode tol \ h_rel      1e-2      1e-3      1e-4      1e-5
+///   1e-8                 5.35e-2   2.59e-1   8.21e-1   2.73e0
+///   1e-12                3.35e-6   1.49e-4   9.97e-4   3.02e-3
+///   1e-14                3.32e-6   4.03e-8   5.06e-5   5.39e-5
+/// ```
+///
+/// Along each tolerance row `gap × h` is roughly constant and the whole row
+/// drops when the mode solve is tightened — round-off over step. Truncation
+/// would go the other way: a decade wider `h` multiplies an `O(h⁴)` remainder
+/// by 1e4, which is the `1e-2` column.
+///
+/// That the ENGINE is not what moves there is settled by an arbiter that
+/// never touches the assembled gradient: a Richardson-extrapolated second
+/// difference of `glmm_laplace_deviance` itself, cold-seeded per evaluation,
+/// against the engine's symmetrized Hessian. On rung 24's four worst θθ cells
+/// that arbiter is stable on `h_rel ∈ [1e-2, 3e-3]` and agrees with the
+/// engine there to 3e-9…6e-7 — its own stability — at mode tolerance `1e-12`
+/// and `1e-14` alike: at `h_rel = 1e-2`, cell (10,9) 1.02e-7, (13,0) 4.28e-8,
+/// (5,7) 5.73e-7, (10,10) 4.75e-8. The engine itself moves 1.17e-9 between
+/// those two tolerances; the oracle moves four orders.
+///
+/// Bands fixed from that measurement. Columns: worst 4.03e-8 (rung 24), with
+/// rungs 8, 9, 18, 38 and 46 at 1.4e-10 to 4.0e-10, so one `BAND = 1e-6`
+/// clears the worst by 25× and every other rung by ~3000×. Asymmetry: worst
+/// 1.6e-13 (rung 24), unchanged by the tolerance, so `ASYM_BAND = 1e-11`
+/// clears it by ~60×.
+#[cfg(feature = "formula")]
+#[test]
+fn packed_assembled_hessian_columns_match_fd_of_f64_gradient() {
+    const BAND: f64 = 1e-6;
+    const ASYM_BAND: f64 = 1e-11;
+    for r in PACKED_LAPLACE_RUNGS {
+        let (mut ws, x, y, ids, extra_ids, p, n, _dev) = rung_at_gamma_hat(r);
+        let n_theta = ws.n_theta;
+        let m = n_theta + p;
+        let kk = ws.k.max(1);
+        let saved: Vec<f64> = ws.params[..m].to_vec();
+        let u_hat: Vec<f64> = ws.pirls.u[..kk].to_vec();
+        ws.fd.pirls_tol_override = Some(1e-14);
+
+        let mut hess = Mat::<f64>::zeros(m, m);
+        let mut hgrad = vec![0.0; m];
+        ws.pirls.u[..kk].copy_from_slice(&u_hat);
+        let st = crate::glmm::joint_hessian_columns(
+            &mut ws,
+            x.as_ref(),
+            &y,
+            &ids,
+            &extra_ids,
+            p,
+            n,
+            &mut hgrad,
+            &mut hess,
+        );
+        assert!(
+            matches!(st, crate::glmm::DerivStatus::Ok(_)),
+            "rung {}: the packed assembled Hessian declined",
+            r.rung
+        );
+        let mut asym = 0.0f64;
+        for i in 0..m {
+            for j in 0..m {
+                let d = (hess[(i, j)] - hess[(j, i)]).abs();
+                asym = asym.max(d / hess[(i, j)].abs().max(1.0));
+            }
+        }
+        assert!(
+            asym <= ASYM_BAND,
+            "rung {}: pre-symmetrization asymmetry {asym:e}",
+            r.rung
+        );
+
+        // The value part of the chunked pass IS the gradient, entry by entry.
+        let mut gref = vec![0.0; m];
+        ws.params[..m].copy_from_slice(&saved);
+        ws.pirls.u[..kk].copy_from_slice(&u_hat);
+        assert!(
+            matches!(
+                crate::glmm::packed_gradient(&mut ws, x.as_ref(), &y, p, n, &mut gref),
+                crate::glmm::DerivStatus::Ok(_)
+            ),
+            "rung {}: the reference gradient declined",
+            r.rung
+        );
+        for a in 0..m {
+            let gap = (hgrad[a] - gref[a]).abs() / gref[a].abs().max(1.0);
+            assert!(
+                gap <= 1e-12,
+                "rung {} coord {a}: the chunked pass's gradient {} vs the f64 gradient {} \
+                 (relative gap {gap:e})",
+                r.rung,
+                hgrad[a],
+                gref[a]
+            );
+        }
+
+        let mut worst = 0.0f64;
+        let mut worst_cell = (0usize, 0usize);
+        for coord in 0..m {
+            let h = 1e-3 * saved[coord].abs().max(1.0);
+            let eval = |ws: &mut GlmmWorkspace, d: f64, out: &mut [f64]| {
+                let mut at = saved.clone();
+                at[coord] = saved[coord] + d;
+                ws.params[..m].copy_from_slice(&at);
+                ws.pirls.u[..kk].copy_from_slice(&u_hat);
+                assert!(
+                    matches!(
+                        crate::glmm::packed_gradient(ws, x.as_ref(), &y, p, n, out),
+                        crate::glmm::DerivStatus::Ok(_)
+                    ),
+                    "rung {} coord {coord}: the assembled gradient declined",
+                    r.rung
+                );
+            };
+            let mut gp = vec![0.0; m];
+            eval(&mut ws, h, &mut gp);
+            let mut gm = vec![0.0; m];
+            eval(&mut ws, -h, &mut gm);
+            let mut gp2 = vec![0.0; m];
+            eval(&mut ws, 0.5 * h, &mut gp2);
+            let mut gm2 = vec![0.0; m];
+            eval(&mut ws, -0.5 * h, &mut gm2);
+            for a in 0..m {
+                let d1 = (gp[a] - gm[a]) / (2.0 * h);
+                let d2 = (gp2[a] - gm2[a]) / h;
+                let fd = (4.0 * d2 - d1) / 3.0;
+                let gap = (hess[(a, coord)] - fd).abs() / fd.abs().max(1.0);
+                if gap > worst {
+                    worst = gap;
+                    worst_cell = (a, coord);
+                }
+                assert!(
+                    gap <= BAND,
+                    "rung {} column {coord} entry {a}: lane {} vs fd {fd} (relative gap {gap:e})",
+                    r.rung,
+                    hess[(a, coord)]
+                );
+            }
+        }
+        ws.params[..m].copy_from_slice(&saved);
+        ws.fd.pirls_tol_override = None;
+        println!(
+            "packed hessian rung {}: m {m}, worst relative gap {worst:e} at {worst_cell:?}, \
+             asymmetry {asym:e}",
+            r.rung
+        );
+    }
+}
+
+/// The packed assembled engine's shipped covariance against the packed FD
+/// stencil's, at every packed rung's γ̂: the `p` fixed-effect standard errors
+/// off `joint_hessian_cov`'s own `out_cov`, and the `n_θ` θ-block standard
+/// errors off the θ-block covariance's diagonal (which `stddev_se` is the
+/// square root of, divided by the fixed positive Λ-row scales, so a relative
+/// gap here is a relative gap there).
+///
+/// The stencil is reached through `ws.fd.force_fd_hessian`, the workspace
+/// switch the other layouts' FD tests already use, so no global state moves
+/// and the two arms run on one workspace at one γ̂.
+///
+/// A MEASUREMENT with a guard rail, not an equality: the stencil is a
+/// single-step central difference at `SPARSE_FD_STEP_REL = 1e-4` relative and
+/// carries its own step error. `src/sparse/fd_margin.rs`'s header records the
+/// size of that error on this very layout — δ-vs-δ/2 standard-error agreement
+/// of 2.0e-5 on `sim_sparse_gamma`, and 1.4e-4 on `sim_sparse_binomial_bigsd`,
+/// whose sequence is truncation-dominated with its two extrapolations 20%
+/// apart.
+///
+/// Measured gaps, worst per rung: 1.65e-4 `se` / 2.16e-5 `theta_se` on rung
+/// 46, 1.43e-5 / 2.50e-6 on rung 24, and ≤1.5e-6 / ≤4.1e-7 on rungs 8, 9, 18
+/// and 38. The two large ones land on exactly the two rungs `fd_margin`
+/// records the stencil's own step error for, and at the size it records — so
+/// the whole gap is the stencil's, and this comparison says nothing about the
+/// assembled engine's accuracy (`sparse::tests`'s both-layouts cross-check
+/// does, at 2.6e-13, on the shapes the dense engine can also fit).
+/// `BAND = 1e-3` clears the worst by ~6× and is a tripwire
+/// for a routing or sign error: a gap far above what the stencil's own step
+/// error explains is a finding to chase, not a band to widen.
+#[cfg(feature = "formula")]
+#[test]
+fn packed_assembled_se_matches_the_packed_stencil() {
+    const BAND: f64 = 1e-3;
+    for r in PACKED_LAPLACE_RUNGS {
+        let (mut ws, x, y, ids, extra_ids, p, n, _dev) = rung_at_gamma_hat(r);
+        let n_theta = ws.n_theta;
+        assert!(
+            crate::glmm::assembly_routes(&ws, n),
+            "rung {}: the assembled engine must route this shape",
+            r.rung
+        );
+        // The exact arm is taken when the assembled engine answers `Ok` at this
+        // γ̂; `joint_hessian_cov` below would otherwise fall through to the
+        // stencil and the comparison would pit the stencil against itself.
+        let mut g = vec![0.0; n_theta + p];
+        let mut hess = Mat::<f64>::zeros(n_theta + p, n_theta + p);
+        let st = crate::glmm::joint_hessian_columns(
+            &mut ws,
+            x.as_ref(),
+            &y,
+            &ids,
+            &extra_ids,
+            p,
+            n,
+            &mut g,
+            &mut hess,
+        );
+        assert!(
+            matches!(st, crate::glmm::DerivStatus::Ok(_)),
+            "rung {}: the assembled engine must take this shape",
+            r.rung
+        );
+        let mut cov_exact = Mat::<f64>::zeros(p, p);
+        let st = crate::glmm::joint_hessian_cov(
+            &mut ws,
+            x.as_ref(),
+            &y,
+            &ids,
+            &extra_ids,
+            p,
+            n,
+            &mut cov_exact,
+        );
+        assert!(
+            matches!(st, crate::glmm::FdHessianStatus::Ok),
+            "rung {}: the exact arm must not fall back",
+            r.rung
+        );
+        let se_exact: Vec<f64> = (0..p).map(|j| cov_exact[(j, j)].sqrt()).collect();
+        let th_exact: Vec<f64> = theta_se(&ws);
+
+        ws.fd.force_fd_hessian = true;
+        let mut cov_fd = Mat::<f64>::zeros(p, p);
+        let st_fd = crate::glmm::joint_hessian_cov(
+            &mut ws,
+            x.as_ref(),
+            &y,
+            &ids,
+            &extra_ids,
+            p,
+            n,
+            &mut cov_fd,
+        );
+        ws.fd.force_fd_hessian = false;
+        assert!(
+            matches!(st_fd, crate::glmm::FdHessianStatus::Ok),
+            "rung {}: the stencil arm must not fall back ({st_fd:?})",
+            r.rung
+        );
+        let se_fd: Vec<f64> = (0..p).map(|j| cov_fd[(j, j)].sqrt()).collect();
+        let th_fd: Vec<f64> = theta_se(&ws);
+
+        let rel = |a: f64, b: f64| (a - b).abs() / b.abs().max(1e-300);
+        let worst_se = (0..p)
+            .map(|j| rel(se_exact[j], se_fd[j]))
+            .fold(0.0, f64::max);
+        let worst_th = (0..n_theta)
+            .map(|j| rel(th_exact[j], th_fd[j]))
+            .fold(0.0, f64::max);
+        println!(
+            "packed se rung {}: worst relative gap vs the stencil — se {worst_se:e}, \
+             theta_se {worst_th:e}",
+            r.rung
+        );
+        assert!(
+            worst_se <= BAND && worst_th <= BAND,
+            "rung {}: se gap {worst_se:e}, theta_se gap {worst_th:e} — both must sit inside \
+             the stencil's own step error",
+            r.rung
+        );
+    }
+}
+
+/// A dense-routed design whose joint coordinate count sits above the dual
+/// kernel's lane cap: `q_p = 4` — an intercept and three random slopes, so
+/// `n_theta = 10` — with `p = 4`, giving `m = 14 > MAX_DUAL_N`. Inside the
+/// dense envelope on every axis (`MAX_PRIMARY_Q` is 8), so the layout stays
+/// blocked and both Hessian passes are asked the same question about it.
+#[cfg(feature = "formula")]
+fn wide_slope_fixture() -> (Vec<f64>, Vec<f64>, usize, usize, ModelSpec, GroupIds) {
+    let (n_clusters, per) = (15usize, 20usize);
+    let n = n_clusters * per;
+    let p = 4;
+    let mut st = 20261u64;
+    let sd = [0.5, 0.4, 0.3, 0.3];
+    let u: Vec<[f64; 4]> = (0..n_clusters)
+        .map(|_| std::array::from_fn(|q| sd[q] * lcg(&mut st)))
+        .collect();
+    let (mut x, mut y) = (vec![0.0f64; n * p], vec![0.0f64; n]);
+    let mut g = vec![0u32; n];
+    for i in 0..n {
+        g[i] = (i % n_clusters) as u32;
+        let uc = &u[g[i] as usize];
+        x[i * p] = 1.0;
+        for j in 1..p {
+            x[i * p + j] = lcg(&mut st);
+        }
+        let fixed = [0.3, 0.5, -0.4, 0.3];
+        let eta: f64 = (0..p).map(|j| (fixed[j] + uc[j]) * x[i * p + j]).sum();
+        y[i] = eta.exp().round();
+    }
+    let model = ModelSpec {
+        family: Family::Poisson {
+            link: PoissonLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters as u32,
+            },
+            slopes: vec![1, 2, 3],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: g,
+        extra: vec![],
+    };
+    (x, y, n, p, model, ids)
+}
+
+/// The assembled engine covers a dense shape the hyper-dual pass refuses for
+/// its lane count — the sibling of
+/// `glmm::derivative::tests::laplace_hessian_m_above_cap_is_unsupported`,
+/// which holds the refusal itself.
+///
+/// Both halves run on ONE workspace at ONE γ̂, so the two passes differ in
+/// nothing but the pass. `laplace_hessian` refuses because a cross-chunk
+/// second-derivative block would need both coordinates' first-order lanes
+/// live in one call; the assembled pass reads second order off FIRST-order
+/// lanes, which chunk, so nothing about `m` reaches its routing gate. What
+/// this asserts is the consequence: at `m = 14` the shipped covariance is the
+/// exact one, not the FD stencil's.
+#[cfg(feature = "formula")]
+#[test]
+fn assembled_hessian_covers_an_m_above_the_dual_lane_cap() {
+    let (xf, y, n, p, model, ids) = wide_slope_fixture();
+    let (mut ws, x, ids_p, extra_ids) = ws_at_gamma_hat(
+        &xf,
+        &y,
+        None,
+        n,
+        p,
+        &model,
+        &ids,
+        "the wide-slope dense fixture",
+    );
+    let ids = ids_p;
+    let m = ws.n_theta + p;
+    // γ̂ captured ONCE, before any evaluation walks `ws.params` off it.
+    let gamma_hat: Vec<f64> = ws.params[..m].to_vec();
+    assert!(
+        m > crate::glmm::MAX_DUAL_N,
+        "this fixture is here for its coordinate count: m {m}"
+    );
+    assert!(
+        crate::glmm::supports_exact_shape(ws.layout, &ws.groupings),
+        "the shape itself must be one the dual kernel has a twin for, so the refusal \
+         below is the lane cap and nothing else"
+    );
+
+    let mut g = vec![0.0; m];
+    let mut hess = Mat::<f64>::zeros(m, m);
+    let st = crate::glmm::laplace_hessian(
+        &mut ws,
+        x.as_ref(),
+        &y,
+        &ids,
+        &extra_ids,
+        p,
+        n,
+        &mut g,
+        &mut hess,
+    );
+    assert!(
+        matches!(st, crate::glmm::DerivStatus::Unsupported),
+        "the hyper-dual pass still refuses above its lane cap"
+    );
+    let st = crate::glmm::joint_hessian_columns(
+        &mut ws,
+        x.as_ref(),
+        &y,
+        &ids,
+        &extra_ids,
+        p,
+        n,
+        &mut g,
+        &mut hess,
+    );
+    assert!(
+        matches!(st, crate::glmm::DerivStatus::Ok(_)),
+        "the assembled engine must not refuse a dense shape for its lane count"
+    );
+
+    let mut cov = Mat::<f64>::zeros(p, p);
+    let st =
+        crate::glmm::joint_hessian_cov(&mut ws, x.as_ref(), &y, &ids, &extra_ids, p, n, &mut cov);
+    assert!(
+        matches!(st, crate::glmm::FdHessianStatus::Ok),
+        "the exact arm must answer at this m ({st:?})"
+    );
+    // Arbiter: the Richardson-extrapolated central second difference of the f64
+    // Laplace deviance, the same independent route
+    // `assembled_hessian_matches_hyperdual_per_entry` puts `CLOGLOG_LARGE`
+    // through. Needed here because this is the ONE dense shape the hyper-dual
+    // pass cannot cross-check, so without it the assembled `hess` and the `cov`
+    // built from it are only asserted to exist.
+    //
+    // Both bands sit above their measured worst and below twice it, the shape
+    // the `CLOGLOG_LARGE` arbiter there uses. Measured on this tree: the
+    // arbiter reproduces itself between base steps 4e-3 and 8e-3 to 9.36e-6,
+    // the assembled Hessian agrees with the base-4e-3 estimate to 6.31e-7, and
+    // the shipped covariance to 1.11e-8 of its own scale. The covariance is the
+    // tighter comparison because inverting the joint Hessian damps the FD step
+    // error the Hessian entries still carry.
+    const FD_BAND: f64 = 1e-6;
+    // Relative to √(cov_aa·cov_bb) — a correlation scale, so the near-zero
+    // off-diagonal entries are held to the same standard as the diagonal
+    // instead of passing on their own smallness.
+    const COV_BAND: f64 = 2e-8;
+    let n_theta = ws.n_theta;
+    ws.fd.pirls_tol_override = Some(1e-12);
+    let fd4 = richardson_fd_hessian(
+        &mut ws,
+        x.as_ref(),
+        &y,
+        &ids,
+        &extra_ids,
+        n,
+        m,
+        n_theta,
+        4e-3,
+        &gamma_hat,
+    );
+    let fd8 = richardson_fd_hessian(
+        &mut ws,
+        x.as_ref(),
+        &y,
+        &ids,
+        &extra_ids,
+        n,
+        m,
+        n_theta,
+        8e-3,
+        &gamma_hat,
+    );
+    ws.fd.pirls_tol_override = None;
+    let rel = |a: f64, b: f64| (a - b).abs() / a.abs().min(b.abs()).max(1.0);
+    let mut repro = 0.0f64;
+    let mut worst_fd = 0.0f64;
+    for i in 0..m {
+        for j in 0..m {
+            repro = repro.max(rel(fd4[(i, j)], fd8[(i, j)]));
+            let gap = rel(hess[(i, j)], fd4[(i, j)]);
+            worst_fd = worst_fd.max(gap);
+            assert!(
+                gap <= FD_BAND,
+                "entry ({i},{j}): assembled {} vs Richardson FD(4e-3) {} (relative gap {gap:e})",
+                hess[(i, j)],
+                fd4[(i, j)]
+            );
+        }
+    }
+
+    // `joint_hessian_cov` ships `cov = 2·(H⁻¹)_ββ` (`src/glmm/se.rs`), so invert
+    // the arbiter's Hessian the same way and compare the shipped covariance
+    // itself — a wrong scale factor, an off-diagonal sign slip or a missing
+    // link-derivative term all survive a positive-diagonal check.
+    let fd_cov = {
+        use faer::linalg::solvers::Solve;
+        let chol = fd4
+            .as_ref()
+            .llt(faer::Side::Lower)
+            .expect("the arbiter Hessian at γ̂ must be PD");
+        let mut inv = Mat::<f64>::identity(m, m);
+        chol.solve_in_place(inv.as_mut());
+        inv
+    };
+    let mut worst_cov = 0.0f64;
+    for a in 0..p {
+        for b in 0..p {
+            let want = 2.0 * fd_cov[(n_theta + a, n_theta + b)];
+            let scale = (cov[(a, a)] * cov[(b, b)]).sqrt();
+            let gap = (cov[(a, b)] - want).abs() / scale;
+            worst_cov = worst_cov.max(gap);
+            assert!(
+                gap <= COV_BAND,
+                "cov[({a},{b})] {} vs Richardson FD {want} (relative gap {gap:e})",
+                cov[(a, b)]
+            );
+        }
+    }
+    println!(
+        "wide-slope fixture: n {n}, m {m}, n_theta {n_theta}; FD reproducibility (4e-3 vs 8e-3) \
+         {repro:e}, assembled vs FD(4e-3) {worst_fd:e}, cov vs FD {worst_cov:e}"
+    );
+}
+
+/// Family of [`packed_tail_fixture`], named once so the fixture, its γ̂
+/// driver and the fit that reads its diagnostics cannot drift apart.
+#[cfg(feature = "formula")]
+const PACKED_TAIL_FAMILY: Family = Family::Binomial {
+    link: BinomialLink::Cloglog,
+};
+
+/// A packed-row design whose converged mode state carries a tail row
+/// (`family::in_tail`): `(x, y, offset, n, p, model, ids)`. No corpus rung is
+/// in that state on this layout, so it needs a constructed cell.
+///
+/// Packed by construction: a random slope on an EXTRA grouping is a shape
+/// `classify_design` answers `Solver::Sparse` for, so `GlmmLayout::for_design`
+/// takes the packed-row layout whatever the row count. The design is the
+/// extra-grouping-slope shape `loop_tier_honours_extra_grouping_slope` fits,
+/// with a Bernoulli cloglog response drawn from it.
+///
+/// The tail row comes from a large negative offset on row 0 and nothing else —
+/// no edited covariate. On cloglog μ ≈ e^η for small μ, so an offset of −30
+/// against an η of order 1 puts μ near 1e-13, past `family::PROB_EPS`
+/// (1e-12), which is what makes the census read one tail row. At `y = 0` that
+/// row's deviance contribution is `2e^η ≈ 2e-13`, so it moves the census
+/// without moving the optimum.
+#[cfg(feature = "formula")]
+#[allow(clippy::type_complexity)]
+fn packed_tail_fixture() -> (
+    Vec<f64>,
+    Vec<f64>,
+    Vec<f64>,
+    usize,
+    usize,
+    ModelSpec,
+    GroupIds,
+) {
+    let (n_g1, n_g2, per) = (8usize, 6usize, 20usize);
+    let n = n_g1 * per;
+    let p = 2;
+    let mut st = 7u64;
+    let (mut x, mut y) = (vec![0.0f64; n * p], vec![0.0f64; n]);
+    let (mut g1, mut g2) = (vec![0u32; n], vec![0u32; n]);
+    for i in 0..n {
+        g1[i] = (i % n_g1) as u32;
+        g2[i] = (i % n_g2) as u32;
+        let x1 = lcg(&mut st);
+        x[i * p] = 1.0;
+        x[i * p + 1] = x1;
+        let eta = -0.3 + 0.4 * x1 + 0.2 * (g1[i] as f64 - 4.0) + 0.4 * x1 * (g2[i] as f64 - 3.0);
+        // A Bernoulli draw, not a threshold on η: thresholding separates the
+        // data, which has no finite optimum.
+        let mu = 1.0 - (-eta.exp()).exp();
+        y[i] = if 0.5 * (lcg(&mut st) + 1.0) < mu {
+            1.0
+        } else {
+            0.0
+        };
+    }
+    let mut offset = vec![0.0f64; n];
+    offset[0] = -30.0;
+    y[0] = 0.0;
+    let model = ModelSpec {
+        family: PACKED_TAIL_FAMILY,
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_g1 as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![Grouping {
+                relation: GroupingRelation::Crossed {
+                    n_clusters: n_g2 as u32,
+                },
+                slopes: vec![1],
+            }],
+        }),
+    };
+    let ids = GroupIds {
+        primary: g1,
+        extra: vec![g2],
+    };
+    (x, y, offset, n, p, model, ids)
+}
+
+/// One design built in memory, fitted to its own γ̂ with `WaldSe::Rx` (so the
+/// fit runs no Hessian pass) and handed back as the workspace sitting at that
+/// γ̂ with the column-major `X` and the sized ids: `rung_at_gamma_hat`'s
+/// contract for a fixture that is not a corpus CSV.
+#[cfg(feature = "formula")]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+fn ws_at_gamma_hat(
+    x: &[f64],
+    y: &[f64],
+    offset: Option<Vec<f64>>,
+    n: usize,
+    p: usize,
+    model: &ModelSpec,
+    ids: &GroupIds,
+    what: &str,
+) -> (GlmmWorkspace, Mat<f64>, Vec<u32>, Vec<Vec<u32>>) {
+    let opts = FitOptions {
+        target_indices: (0..p as u32).collect(),
+        wald_se: WaldSe::Rx,
+        offset,
+        nagq: 1,
+        ..FitOptions::default()
+    };
+    let (sized_model, sized_ids, _perm) = super::spec_sized_from_ids(model, ids);
+    let (mut ws, x_mat) = super::glmm::fit_glmm_build(
+        x,
+        n,
+        p,
+        &sized_model,
+        &sized_ids.primary,
+        &sized_ids.extra,
+        &opts,
+    )
+    .unwrap_or_else(|_| panic!("{what}: degenerate design"));
+    let view = super::glmm::run_glmm_on(
+        &mut ws,
+        x_mat.as_ref(),
+        y,
+        n,
+        p,
+        &sized_model,
+        &sized_ids.primary,
+        &sized_ids.extra,
+        f64::NAN,
+        None,
+        &opts,
+        ColumnScaling::IDENTITY,
+    );
+    assert!(view.converged_deviance().0, "{what}: fit must converge");
+    let sized_ids = sized_ids.into_owned();
+    (ws, x_mat, sized_ids.primary, sized_ids.extra)
+}
+
+/// The packed assembled path on a mode state with a tail row
+/// (`family::in_tail`), end to end: the assembled engine takes the fit, and
+/// `joint_hessian_cov` ships its covariance for it.
+///
+/// The reference side drives `joint_hessian` directly at the same γ̂ and
+/// inverts its matrix the way `joint_hessian_cov` inverts it — `cov = 2·H⁻¹`
+/// on the β block, `sqrt(2·H⁻¹_kk)` on the θ diagonal — so the comparison is
+/// bitwise and needs no band. `packed_gradient` at this γ̂ is checked
+/// separately against a Richardson central difference of
+/// `glmm_laplace_deviance`, the shape
+/// `packed_assembled_gradient_matches_richardson_fd` uses.
+///
+/// The take is asserted at the engine: a direct `joint_hessian_columns` call
+/// at this γ̂ must answer `Ok`.
+#[cfg(feature = "formula")]
+#[test]
+fn tail_packed_fit_ships_the_assembled_covariance() {
+    use faer::linalg::solvers::Solve;
+
+    let (xf, y, offset, n, p, model, ids) = packed_tail_fixture();
+    let (mut ws, x, ids_p, extra_ids) = ws_at_gamma_hat(
+        &xf,
+        &y,
+        Some(offset),
+        n,
+        p,
+        &model,
+        &ids,
+        "the packed tail fixture",
+    );
+    let ids = ids_p;
+    assert_eq!(
+        ws.layout,
+        crate::glmm::GlmmLayout::Packed,
+        "an extra-grouping slope must take the packed-row layout"
+    );
+    let n_theta = ws.n_theta;
+    let m = n_theta + p;
+    let (tail_rows, eta_clamped) = tail_census(&ws, PACKED_TAIL_FAMILY, n);
+    println!(
+        "packed tail fixture: n {n}, m {m}, k {}, census (tail {tail_rows}, η {eta_clamped})",
+        ws.k
+    );
+    assert!(
+        tail_rows > 0,
+        "this fixture is here for its tail row ({tail_rows})"
+    );
+    assert!(
+        crate::glmm::assembly_routes(&ws, n),
+        "the shape and the memory guard must both admit the assembled engine"
+    );
+
+    let mut g = vec![0.0; m];
+    let mut hess = Mat::<f64>::zeros(m, m);
+    let st = crate::glmm::joint_hessian_columns(
+        &mut ws,
+        x.as_ref(),
+        &y,
+        &ids,
+        &extra_ids,
+        p,
+        n,
+        &mut g,
+        &mut hess,
+    );
+    assert!(
+        matches!(st, crate::glmm::DerivStatus::Ok(_)),
+        "the packed assembled engine must take a mode state with a tail row"
+    );
+
+    // The assembled arm on its own, symmetrized, at the same γ̂ — the
+    // reference `joint_hessian_cov` below is compared against.
+    let st = crate::glmm::joint_hessian(
+        &mut ws,
+        x.as_ref(),
+        &y,
+        &ids,
+        &extra_ids,
+        p,
+        n,
+        &mut g,
+        &mut hess,
+    );
+    assert!(
+        matches!(st, crate::glmm::DerivStatus::Ok(_)),
+        "the assembled arm must answer"
+    );
+    let chol = hess
+        .as_ref()
+        .llt(faer::Side::Lower)
+        .expect("the assembled joint Hessian is PD at this γ̂");
+    let mut inv = Mat::<f64>::identity(m, m);
+    chol.solve_in_place(inv.as_mut());
+    let want_cov = Mat::<f64>::from_fn(p, p, |a, b| 2.0 * inv[(n_theta + a, n_theta + b)]);
+    let want_theta_se: Vec<f64> = (0..n_theta)
+        .map(|k| (2.0 * inv[(k, k)]).max(0.0).sqrt())
+        .collect();
+
+    let mut got_cov = Mat::<f64>::zeros(p, p);
+    let st = crate::glmm::joint_hessian_cov(
+        &mut ws,
+        x.as_ref(),
+        &y,
+        &ids,
+        &extra_ids,
+        p,
+        n,
+        &mut got_cov,
+    );
+    assert!(
+        matches!(st, crate::glmm::FdHessianStatus::Ok),
+        "expected Ok ({st:?})"
+    );
+    for a in 0..p {
+        for b in 0..p {
+            assert_eq!(
+                got_cov[(a, b)].to_bits(),
+                want_cov[(a, b)].to_bits(),
+                "cov[({a},{b})] {} is not the assembled arm's {}",
+                got_cov[(a, b)],
+                want_cov[(a, b)]
+            );
+        }
+    }
+    for (k, &want) in want_theta_se.iter().enumerate() {
+        assert_eq!(
+            theta_se(&ws)[k].to_bits(),
+            want.to_bits(),
+            "theta_se[{k}] {} is not the assembled arm's {want}",
+            theta_se(&ws)[k]
+        );
+    }
+
+    // `packed_gradient` at this fixture's γ̂ against a Richardson central
+    // difference of `glmm_laplace_deviance`, the same shape
+    // `packed_assembled_gradient_matches_richardson_fd` uses.
+    const GRAD_BAND: f64 = 1e-6;
+    let kk = ws.k.max(1);
+    let saved: Vec<f64> = ws.params[..m].to_vec();
+    let u_hat: Vec<f64> = ws.pirls.u[..kk].to_vec();
+    ws.fd.pirls_tol_override = Some(1e-12);
+    let mut g_pg = vec![0.0; m];
+    ws.pirls.u[..kk].copy_from_slice(&u_hat);
+    let st = crate::glmm::packed_gradient(&mut ws, x.as_ref(), &y, p, n, &mut g_pg);
+    assert!(
+        matches!(st, crate::glmm::DerivStatus::Ok(_)),
+        "the packed assembled gradient declined"
+    );
+    let mut worst_grad_fd = 0.0f64;
+    for coord in 0..m {
+        let h = 1e-3 * saved[coord].abs().max(1.0);
+        let mut at = saved.clone();
+        let ev = |ws: &mut GlmmWorkspace, at: &mut Vec<f64>, d: f64| -> f64 {
+            at[coord] = saved[coord] + d;
+            glmm_laplace_deviance(at, ws, x.as_ref(), &y, &ids, &extra_ids, n)
+        };
+        let d1 = (ev(&mut ws, &mut at, h) - ev(&mut ws, &mut at, -h)) / (2.0 * h);
+        let d2 = (ev(&mut ws, &mut at, 0.5 * h) - ev(&mut ws, &mut at, -0.5 * h)) / h;
+        let fd = (4.0 * d2 - d1) / 3.0;
+        let gap = (g_pg[coord] - fd).abs() / fd.abs().max(1.0);
+        worst_grad_fd = worst_grad_fd.max(gap);
+        assert!(
+            gap <= GRAD_BAND,
+            "coord {coord}: packed gradient {} vs Richardson FD {fd} (relative gap {gap:e})",
+            g_pg[coord]
+        );
+    }
+    ws.params[..m].copy_from_slice(&saved);
+    ws.fd.pirls_tol_override = None;
+    println!("packed tail fixture gradient: worst relative gap vs Richardson FD {worst_grad_fd:e}");
+
+    // The same fixture through the shipped dispatch — a converged fit with
+    // every target SE finite.
+    let (_, _, offset, _, _, _, ids) = packed_tail_fixture();
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        wald_se: WaldSe::Hessian,
+        offset: Some(offset),
+        ..FitOptions::default()
+    };
+    let f = fit_cold(&xf, &y, n, p, &model, &ids, &opts);
+    assert!(f.converged(), "the packed tail fit must converge");
+    assert!(
+        f.se.iter().all(|v| v.is_finite()),
+        "every target SE is finite: {:?}",
+        f.se
+    );
+
+    // The clean control, unaffected by this flip: the same design and code
+    // path with the offset dropped still converges.
+    let clean = FitOptions {
+        offset: None,
+        ..opts
+    };
+    let fc = fit_cold(&xf, &y, n, p, &model, &ids, &clean);
+    assert!(
+        fc.converged(),
+        "the control fit without the offset must converge"
+    );
+}
+
+/// The plateau policy on the GLMM route — the mirror of `src/lmm/tests.rs`'s
+/// `maxfun_cap_reports_honest_endpoint`. A `Status::MaxFunReached` exit reports
+/// its finite incumbent (β̂/SE/vcov/deviance) instead of NaN-filling, with
+/// `converged() == false`, `Boundary::NoOptimum` and `df == 0`.
+///
+/// The cap is forced by swapping in a joint solver whose `max_fun` is the legal
+/// minimum (`npt + 1`) — one evaluation past the initial interpolation model,
+/// nowhere near cbpp's optimum.
+#[test]
+fn glmm_maxfun_cap_reports_honest_endpoint() {
+    use bobyqa::{Bobyqa, Config};
+
+    let (x, y, cluster_ids, n) = cbpp_design();
+    let p = 4;
+    let model = cbpp_model();
+    let ids = GroupIds {
+        primary: cluster_ids,
+        extra: vec![],
+    };
+    let opts = FitOptions {
+        target_indices: vec![0, 1, 2, 3],
+        ..FitOptions::default()
+    };
+    let (mut ws, x_mat) =
+        super::glmm::fit_glmm_build(&x, n, p, &model, &ids.primary, &ids.extra, &opts)
+            .unwrap_or_else(|_| panic!("cbpp design must build"));
+
+    // Both outer solvers are capped: which one carries the fit's status depends
+    // on `ws.outer_search` (cbpp routes `ExactProfile`, where stage 1 IS the
+    // search), and the contract under test is the same either way. Dimensions are
+    // the workspace's own: n_theta + p joint, n_theta stage 1 — no `ln θ_NB`
+    // coordinate on binomial.
+    let cap = |dim: usize| {
+        let mut c = Config::new(dim);
+        c.npt = 2 * dim + 1; // PRIMA's default, the legal minimum at dim = 1
+        c.max_fun = c.npt + 1;
+        Bobyqa::new(dim, c).expect("legal minimal config")
+    };
+    ws.solver = cap(ws.n_theta + p);
+    ws.solver_stage1 = cap(ws.n_theta);
+
+    let view = super::glmm::run_glmm_on(
+        &mut ws,
+        x_mat.as_ref(),
+        &y,
+        n,
+        p,
+        &model,
+        &ids.primary,
+        &ids.extra,
+        f64::NAN,
+        None,
+        &opts,
+        ColumnScaling::IDENTITY,
+    );
+    let (fit, _mu, _dev) = super::glmm::glmm_view_to_fit(&view, &y, n, p, &model, &opts);
+
+    assert!(!fit.converged(), "a capped fit must not report converged");
+    assert_eq!(
+        fit.diagnostics.boundary,
+        Boundary::NoOptimum,
+        "a capped endpoint is not an accepted boundary"
+    );
+    assert_eq!(fit.df, 0, "df is gated on convergence");
+    assert!(
+        fit.deviance.is_finite(),
+        "plateau policy: capped endpoint must report a finite deviance, got {}",
+        fit.deviance
+    );
+    for &tj in &opts.target_indices {
+        let j = tj as usize;
+        assert!(
+            fit.beta[j].is_finite() && fit.se[j].is_finite(),
+            "plateau policy: capped endpoint must not NaN-fill β/se at j={j}: β {} se {}",
+            fit.beta[j],
+            fit.se[j]
+        );
+        assert!(
+            fit.vcov[j][j].is_finite(),
+            "plateau policy: capped endpoint must not NaN-fill vcov at j={j}"
+        );
+    }
+    // The plateau policy covers the variance side too, as on the LMM route
+    // (`fit/lmm.rs`, `has_endpoint`): τ̂², D̂ and the dispersion at the capped
+    // endpoint, not NaN. What stays gated on convergence: df (above), the θ-block
+    // SEs, fitted values and the conditional modes.
+    assert!(
+        !fit.tau2.is_empty() && fit.tau2.iter().all(|v| v.is_finite()),
+        "plateau policy: capped endpoint must report tau2, got {:?}",
+        fit.tau2
+    );
+    assert!(
+        !fit.varcorr.is_empty() && fit.varcorr.iter().flatten().all(|v| v.is_finite()),
+        "plateau policy: capped endpoint must report varcorr, got {:?}",
+        fit.varcorr
+    );
+    assert_eq!(
+        fit.dispersion, 1.0,
+        "binomial dispersion is 1 at a reported endpoint"
+    );
+    assert!(
+        fit.diagnostics.pinned.is_empty(),
+        "a capped endpoint pins nothing: {:?}",
+        fit.diagnostics.pinned
+    );
+    assert!(
+        !fit.singular(),
+        "a capped endpoint reports singular = false"
+    );
+    assert!(
+        fit.stddev_se.iter().all(|v| v.is_nan()),
+        "θ-block SEs stay converged-only"
+    );
+    assert!(
+        fit.fitted.is_empty() && fit.ranef.is_empty(),
+        "μ̂ and b̂ stay converged-only"
+    );
+}
+
+/// Mixed-Gamma Hessian SEs against a brute-force central-difference Hessian of
+/// the whole fitted objective over `[θ | β | ln φ]`: `laplace_deviance` at φ
+/// plus `family::gamma_dispersion_term(ln φ)`, every cell a fresh PIRLS
+/// re-solve from the fit's own mode at the FD-pass tolerance. Nothing of the
+/// SE path's own construction is reused — no fixed-φ̂ weight swap, no `(ξ, t)`
+/// coordinates, no delta map — so this checks the appended `ln φ` row, the β
+/// block of the inverse and the θ-block SE mapped back to θ at once. Both
+/// links at Laplace and the log link at 7-node AGQ, whose objective does not
+/// separate in φ the way the Laplace one does, blocked layout. Band 1e-3
+/// relative (`grid/tol.R`'s `se_hessian_rel`) on the β SEs and on the cluster
+/// θ's SE.
+#[test]
+fn gamma_hessian_se_matches_fd_of_the_full_objective() {
+    let (xr, y, cluster_ids, n_clusters) = sim_clustered(include_str!(
+        "../../validation/data/simulated/sim_gamma.csv"
+    ));
+    let (n, p) = (y.len(), 3);
+    let ids = GroupIds {
+        primary: cluster_ids,
+        extra: vec![],
+    };
+    let sum_ln_y: f64 = y.iter().map(|v| v.ln()).sum();
+    for (link, nagq) in [
+        (crate::GammaLink::Inverse, 1u8),
+        (crate::GammaLink::Log, 1),
+        (crate::GammaLink::Log, 7),
+    ] {
+        let opts = FitOptions {
+            target_indices: vec![0, 1, 2],
+            nagq,
+            ..FitOptions::default()
+        };
+        let model = ModelSpec {
+            family: Family::Gamma { link },
+            re: Some(ReStructure {
+                sizing: Sizing::FixedClusters {
+                    n_clusters: n_clusters as u32,
+                },
+                slopes: vec![],
+                extra_groupings: vec![],
+            }),
+        };
+        let (mut ws, x_mat) =
+            super::glmm::fit_glmm_build(&xr, n, p, &model, &ids.primary, &ids.extra, &opts)
+                .unwrap_or_else(|_| panic!("sim_gamma design must build"));
+        let view = super::glmm::run_glmm_on(
+            &mut ws,
+            x_mat.as_ref(),
+            &y,
+            n,
+            p,
+            &model,
+            &ids.primary,
+            &ids.extra,
+            f64::NAN,
+            None,
+            &opts,
+            ColumnScaling::IDENTITY,
+        );
+        let diag = view.diagnostics();
+        assert!(diag.converged, "{link:?} nagq={nagq}: must converge");
+        assert!(
+            !diag.hessian_fallback,
+            "{link:?} nagq={nagq}: exact Hessian SE expected"
+        );
+        let se: Vec<f64> = view.var_diag()[..p].iter().map(|v| v.sqrt()).collect();
+        let n_theta = ws.n_theta;
+        let theta_se0 = theta_se(&ws)[0];
+        let m = n_theta + p;
+        let mut q0: Vec<f64> = ws.params[..m].to_vec();
+        q0.push(ws.gamma_phi.ln());
+        // Fixed seed û(γ̂), FD-pass tolerance: the stencil's own discipline.
+        let kk = ws.k.max(1);
+        let u_hat = ws.pirls.u[..kk].to_vec();
+        ws.u_seed[..kk].copy_from_slice(&u_hat);
+        ws.fd.warm_seed_active = true;
+        ws.fd.pirls_tol_override = Some(crate::glmm::pirls_tol_fd(model.family));
+        let md = m + 1;
+        let mut f = |q: &[f64]| -> f64 {
+            ws.gamma_phi = q[m].exp();
+            glmm_laplace_deviance(&q[..m], &mut ws, x_mat.as_ref(), &y, &ids.primary, &[], n)
+                + crate::family::gamma_dispersion_term(q[m], None, n, sum_ln_y)
+        };
+        let h: Vec<f64> = q0.iter().map(|v| 2e-3 * v.abs().max(1.0)).collect();
+        let f0 = f(&q0);
+        let mut hess = Mat::<f64>::zeros(md, md);
+        let at = |d: &[(usize, f64)]| {
+            let mut q = q0.clone();
+            for &(k, s) in d {
+                q[k] += s;
+            }
+            q
+        };
+        for i in 0..md {
+            let fp = f(&at(&[(i, h[i])]));
+            let fm = f(&at(&[(i, -h[i])]));
+            hess[(i, i)] = (fp - 2.0 * f0 + fm) / (h[i] * h[i]);
+            for j in (i + 1)..md {
+                let fpp = f(&at(&[(i, h[i]), (j, h[j])]));
+                let fpm = f(&at(&[(i, h[i]), (j, -h[j])]));
+                let fmp = f(&at(&[(i, -h[i]), (j, h[j])]));
+                let fmm = f(&at(&[(i, -h[i]), (j, -h[j])]));
+                let v = (fpp - fpm - fmp + fmm) / (4.0 * h[i] * h[j]);
+                hess[(i, j)] = v;
+                hess[(j, i)] = v;
+            }
+        }
+        use faer::linalg::solvers::Solve;
+        let chol = hess.as_ref().llt(faer::Side::Lower).unwrap_or_else(|_| {
+            panic!("{link:?} nagq={nagq}: FD Hessian of the full objective must be PD")
+        });
+        let mut inv = Mat::<f64>::identity(md, md);
+        chol.solve_in_place(inv.as_mut());
+        for j in 0..p {
+            let fd = (2.0 * inv[(n_theta + j, n_theta + j)]).sqrt();
+            assert!(
+                (se[j] - fd).abs() <= 1e-3 * fd,
+                "{link:?} nagq={nagq}: se[{j}] = {} vs FD of the full objective {fd}",
+                se[j]
+            );
+        }
+        let fd_theta = (2.0 * inv[(0, 0)]).sqrt();
+        assert!(
+            (theta_se0 - fd_theta).abs() <= 1e-3 * fd_theta,
+            "{link:?} nagq={nagq}: θ SE = {theta_se0} vs FD of the full objective {fd_theta}"
+        );
+    }
+}
+
+/// A crossed negative-binomial cell whose undamped Fisher PIRLS falls into a
+/// 2-cycle around the mode: the Fisher step on the log link overshoots along
+/// a direction where the observed curvature exceeds twice the expected one, the
+/// same-point penalized deviance rises by less than the halving band per step,
+/// and the mixed stopping value alternates by more than its band, so the solve
+/// ran out `PIRLS_MAX_ITERS` on most evaluations and the fit reported
+/// `PirlsExhausted`. The period-2 detector (`glmm::PIRLS_OSC_RATIO`) damps the
+/// rest of such a solve and the fit converges with no exhausted solve.
+///
+/// Data: `tests/fixtures/pirls_2cycle_nb_cross4.csv` is the accuracy grid's
+/// cell `nb_cross4_g300p5_bal_base` (300 rows, four crossed intercepts),
+/// written by `validation/grid/gen.R` from the seed in
+/// `validation/grid/manifest.json`.
+#[cfg(feature = "formula")]
+#[test]
+fn nb_pirls_two_cycle_is_damped_and_the_fit_converges() {
+    let r = DenseLaplaceRung {
+        rung: 0,
+        csv: include_str!("../../tests/fixtures/pirls_2cycle_nb_cross4.csv"),
+        formula: "y ~ x1 + (1 | g1) + (1 | g2) + (1 | g3) + (1 | g4)",
+        family: Family::NegativeBinomial {
+            link: crate::NegBinomialLink::Log,
+        },
+        factors: &["g1", "g2", "g3", "g4"],
+        agg: None,
+        weights_col: None,
+        offset_col: None,
+    };
+    let (table, _, _) = rung_table(&r);
+    let lo =
+        crate::formula::lower(r.formula, &table, r.family).unwrap_or_else(|e| panic!("lower: {e}"));
+    let f = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+    assert!(f.converged(), "the damped fit must converge");
+    assert!(
+        !f.diagnostics
+            .notes
+            .iter()
+            .any(|n| matches!(n, crate::Note::PirlsExhausted { .. })),
+        "no PIRLS solve may exhaust its cap once the 2-cycle is damped: {:?}",
+        f.diagnostics.notes
+    );
+}
+
+/// The NB GLMM seed keeps the no-RE GLM-NB prefit's θ̂ when that prefit
+/// converged inside the box, and falls back to θ = 1 when it did not converge
+/// or landed within a factor of 10 of the box floor `NB_THETA_LO`, where
+/// MASS's `glm.nb` fails on the same data and the `ln θ_NB` search started
+/// there converges to a wrong point (grid cell `nb_q2sx2_g3000p5`, 3808 logLik
+/// below glmmTMB from a 0.014 start; 324 evaluations to glmmTMB's optimum from
+/// 1.0).
+#[test]
+fn nb_glmm_seed_falls_back_off_a_failed_or_floored_prefit() {
+    let lo = super::NB_THETA_LO;
+    assert_eq!(super::glmm::nb_glmm_seed(true, 1.7), 1.7);
+    assert_eq!(super::glmm::nb_glmm_seed(true, 10.0 * lo), 10.0 * lo);
+    assert_eq!(super::glmm::nb_glmm_seed(true, 9.0 * lo), 1.0);
+    assert_eq!(super::glmm::nb_glmm_seed(true, lo), 1.0);
+    assert_eq!(super::glmm::nb_glmm_seed(false, 1.7), 1.0);
+    assert_eq!(super::glmm::nb_glmm_seed(true, f64::NAN), 1.0);
+}
+
+/// Gamma AGQ: with φ a free coordinate of the outer search, the Gamma
+/// integrand at fixed φ is the binomial/Poisson one on prior weights `wᵢ/φ`
+/// (the u-dependent part of `−2·log f` is `D(u)/φ`), and the φ-only rest of the
+/// log-density sits outside the integral, as NB's saturated term does. So a
+/// 25-node fit reaches the exact marginal maximum likelihood. Reference: the
+/// hand-built 25-node adaptive quadrature of the exact Gamma marginal
+/// likelihood on grid cell `gaml_int1_g3000p20_bal_base`
+/// (`validation/tools/prep/gamma_agq_reference.R`, R's own `nlminb` on a
+/// from-scratch quadrature, which also runs 15 and 51 nodes to show the
+/// 25-node value settled): logLik −4152.25553722, β = (0.42095323, 0.77831996),
+/// σ_u = 0.65003893, √φ = 0.69682158.
+/// GLMMadaptive fails on mixed Gamma ("no valid set of coefficients"). Bands:
+/// 1e-4 on the logLik, 1e-5 relative on β, 1e-4 relative on σ_u and √φ — the
+/// outer search's own stopping accuracy.
+#[cfg(feature = "formula")]
+#[test]
+fn gamma_agq_reaches_the_exact_marginal_ml() {
+    let r = DenseLaplaceRung {
+        rung: 0,
+        csv: include_str!("../../validation/grid/data/fast/gaml_int1_g3000p20_bal_base.csv"),
+        formula: "y ~ x1 + (1 | g1)",
+        family: Family::Gamma {
+            link: crate::GammaLink::Log,
+        },
+        factors: &["g1"],
+        agg: None,
+        weights_col: None,
+        offset_col: None,
+    };
+    let (table, _, _) = rung_table(&r);
+    let lo =
+        crate::formula::lower(r.formula, &table, r.family).unwrap_or_else(|e| panic!("lower: {e}"));
+    let opts = FitOptions {
+        nagq: 25,
+        ..lo.opts.clone()
+    };
+    let f = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &opts);
+    assert!(f.converged(), "Gamma AGQ must converge");
+    assert!(
+        (f.loglik - (-4152.25553722)).abs() <= 1e-4,
+        "logLik {} vs exact ML -4152.25553722",
+        f.loglik
+    );
+    for (j, want) in [0.42095323_f64, 0.77831996].iter().enumerate() {
+        assert!(
+            (f.beta[j] - want).abs() <= 1e-5 * want.abs(),
+            "β[{j}] {} vs {want}",
+            f.beta[j]
+        );
+    }
+    let (sd, _) = f.stddev_corr(0);
+    assert!(
+        (sd[0] - 0.65003893).abs() <= 1e-4 * 0.65003893,
+        "σ_u {}",
+        sd[0]
+    );
+    let sq = f.dispersion.sqrt();
+    assert!((sq - 0.69682158).abs() <= 1e-4 * 0.69682158, "√φ {sq}");
+}
+
+#[cfg(feature = "formula")]
+#[derive(serde::Deserialize)]
+struct GammaAgqWtsRef {
+    loglik: f64,
+    beta: [f64; 2],
+    sigma_u: f64,
+    phi: f64,
+}
+
+/// The precision-weighted twin of [`gamma_agq_reaches_the_exact_marginal_ml`]:
+/// same cell shape (`y ~ x1 + (1 | g1)`, Gamma/log) on
+/// `gaml_int1_g3000p20_bal_base_wts.csv`, row `i`'s shape `wᵢ·a` and rate
+/// `wᵢ·a/μᵢ` in place of the unweighted `a`/`a/μᵢ` (`a = 1/φ`). Reference:
+/// `validation/tools/prep/gamma_agq_reference.R --weights`, the same
+/// from-scratch adaptive quadrature with the `wᵢ` factor folded into every
+/// row's shape and rate, frozen at its 25-node value (15 and 51 nodes agree to
+/// 6 significant figures, so 25 has settled) in
+/// `validation/tools/prep/gamma_agq_reference_wts.json`. Bands as the
+/// unweighted twin: 1e-4 on logLik, 1e-5 relative on β, 1e-4 relative on σ_u
+/// and √φ — the outer search's own stopping accuracy.
+#[cfg(feature = "formula")]
+#[test]
+fn weighted_gamma_agq_reaches_the_exact_marginal_ml() {
+    let raw = include_str!("../../validation/tools/prep/gamma_agq_reference_wts.json");
+    let want: GammaAgqWtsRef = serde_json::from_str(raw).expect("weighted AGQ reference parses");
+
+    let r = DenseLaplaceRung {
+        rung: 0,
+        csv: include_str!("../../validation/grid/data/gaml_int1_g3000p20_bal_base_wts.csv"),
+        formula: "y ~ x1 + (1 | g1)",
+        family: Family::Gamma {
+            link: crate::GammaLink::Log,
+        },
+        factors: &["g1"],
+        agg: None,
+        weights_col: Some("w"),
+        offset_col: None,
+    };
+    let (table, weights, _) = rung_table(&r);
+    let lo =
+        crate::formula::lower(r.formula, &table, r.family).unwrap_or_else(|e| panic!("lower: {e}"));
+    let opts = FitOptions {
+        nagq: 25,
+        weights: weights.or(lo.opts.weights.clone()),
+        ..lo.opts.clone()
+    };
+    let f = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &opts);
+    assert!(f.converged(), "weighted Gamma AGQ must converge");
+    assert!(
+        (f.loglik - want.loglik).abs() <= 1e-4,
+        "logLik {} vs exact ML {}",
+        f.loglik,
+        want.loglik
+    );
+    for (j, wj) in want.beta.iter().enumerate() {
+        assert!(
+            (f.beta[j] - wj).abs() <= 1e-5 * wj.abs(),
+            "β[{j}] {} vs {wj}",
+            f.beta[j]
+        );
+    }
+    let (sd, _) = f.stddev_corr(0);
+    assert!(
+        (sd[0] - want.sigma_u).abs() <= 1e-4 * want.sigma_u,
+        "σ_u {} vs {}",
+        sd[0],
+        want.sigma_u
+    );
+    let sqrt_phi = f.dispersion.sqrt();
+    let want_sqrt_phi = want.phi.sqrt();
+    assert!(
+        (sqrt_phi - want_sqrt_phi).abs() <= 1e-4 * want_sqrt_phi,
+        "√φ {sqrt_phi} vs {want_sqrt_phi}"
+    );
+}
+
+/// `WaldSe::Rx` is `2·[∂²P̂/∂β²]⁻¹` at fixed `(θ̂, dispersion)`, with
+/// `P̂(β) = min_u (D/φ + ‖u‖²)` the penalized deviance at the re-solved mode:
+/// the Schur complement of the penalized deviance's exact Hessian in `(u, β)`,
+/// whose weight is the observed one on these non-canonical links. An
+/// independent route to the Rx SE, so it catches a scale factor in it (a φ
+/// counted twice, a Fisher weight where the observed one belongs) that a pin
+/// of glmm's own values cannot. Negative binomial at θ̂_NB and Gamma/log at φ̂.
+/// Band 1e-3 relative, as `nb_hessian_se_matches_fd_of_the_full_objective`.
+#[test]
+fn rx_se_is_the_penalized_deviance_curvature_in_beta() {
+    let cases = [
+        (
+            include_str!("../../validation/data/simulated/sim_nb.csv"),
+            Family::NegativeBinomial {
+                link: crate::NegBinomialLink::Log,
+            },
+        ),
+        (
+            include_str!("../../validation/data/simulated/sim_gamma.csv"),
+            Family::Gamma {
+                link: crate::GammaLink::Log,
+            },
+        ),
+    ];
+    for (csv, family) in cases {
+        let (xr, y, cluster_ids, n_clusters) = sim_clustered(csv);
+        let (n, p) = (y.len(), 3);
+        let ids = GroupIds {
+            primary: cluster_ids,
+            extra: vec![],
+        };
+        let model = ModelSpec {
+            family,
+            re: Some(ReStructure {
+                sizing: Sizing::FixedClusters {
+                    n_clusters: n_clusters as u32,
+                },
+                slopes: vec![],
+                extra_groupings: vec![],
+            }),
+        };
+        let opts = FitOptions {
+            target_indices: vec![0, 1, 2],
+            wald_se: WaldSe::Rx,
+            ..FitOptions::default()
+        };
+        let (mut ws, x_mat) =
+            super::glmm::fit_glmm_build(&xr, n, p, &model, &ids.primary, &ids.extra, &opts)
+                .unwrap_or_else(|_| panic!("{family:?}: design must build"));
+        let view = super::glmm::run_glmm_on(
+            &mut ws,
+            x_mat.as_ref(),
+            &y,
+            n,
+            p,
+            &model,
+            &ids.primary,
+            &ids.extra,
+            1.0,
+            None,
+            &opts,
+            ColumnScaling::IDENTITY,
+        );
+        assert!(view.diagnostics().converged, "{family:?}: must converge");
+        let se: Vec<f64> = view.var_diag()[..p].iter().map(|v| v.sqrt()).collect();
+        let n_theta = ws.n_theta;
+        let m = n_theta + p;
+        let q0: Vec<f64> = ws.params[..m].to_vec();
+        let kk = ws.k.max(1);
+        let u_hat = ws.pirls.u[..kk].to_vec();
+        ws.u_seed[..kk].copy_from_slice(&u_hat);
+        ws.fd.warm_seed_active = true;
+        ws.fd.pirls_tol_override = Some(crate::glmm::pirls_tol_fd(family));
+        let phi = ws.gamma_phi;
+        let mut pen = |q: &[f64]| -> f64 {
+            let _ = glmm_laplace_deviance(q, &mut ws, x_mat.as_ref(), &y, &ids.primary, &[], n);
+            let d: f64 = (0..n)
+                .map(|i| {
+                    ws.prior_w[i]
+                        * crate::family::dev_resid(family, ws.nb_theta, y[i], ws.pirls.prob[i])
+                })
+                .sum();
+            d / phi + ws.pirls.u[..kk].iter().map(|v| v * v).sum::<f64>()
+        };
+        let h: Vec<f64> = (0..p)
+            .map(|j| 2e-3 * q0[n_theta + j].abs().max(1.0))
+            .collect();
+        let at = |d: &[(usize, f64)]| {
+            let mut q = q0.clone();
+            for &(j, s) in d {
+                q[n_theta + j] += s;
+            }
+            q
+        };
+        let f0 = pen(&q0);
+        let mut hess = Mat::<f64>::zeros(p, p);
+        for i in 0..p {
+            let fp = pen(&at(&[(i, h[i])]));
+            let fm = pen(&at(&[(i, -h[i])]));
+            hess[(i, i)] = (fp - 2.0 * f0 + fm) / (h[i] * h[i]);
+            for j in (i + 1)..p {
+                let fpp = pen(&at(&[(i, h[i]), (j, h[j])]));
+                let fpm = pen(&at(&[(i, h[i]), (j, -h[j])]));
+                let fmp = pen(&at(&[(i, -h[i]), (j, h[j])]));
+                let fmm = pen(&at(&[(i, -h[i]), (j, -h[j])]));
+                let v = (fpp - fpm - fmp + fmm) / (4.0 * h[i] * h[j]);
+                hess[(i, j)] = v;
+                hess[(j, i)] = v;
+            }
+        }
+        use faer::linalg::solvers::Solve;
+        let chol = hess
+            .as_ref()
+            .llt(faer::Side::Lower)
+            .unwrap_or_else(|_| panic!("{family:?}: ∂²P̂/∂β² must be PD"));
+        let mut inv = Mat::<f64>::identity(p, p);
+        chol.solve_in_place(inv.as_mut());
+        for j in 0..p {
+            let fd = (2.0 * inv[(j, j)]).sqrt();
+            assert!(
+                (se[j] - fd).abs() <= 1e-3 * fd,
+                "{family:?}: Rx se[{j}] = {} vs 2·[∂²P̂/∂β²]⁻¹ {fd}",
+                se[j]
+            );
+        }
+    }
+}
+
+/// Negative-binomial Hessian SEs against a brute-force central-difference
+/// Hessian of the whole fitted objective over `[θ | β | ln θ_NB]`: the Laplace
+/// deviance at θ_NB plus `−2·nb_profile_loglik(y, y, θ_NB)`, the search's own
+/// objective (the saturated constant is irrelevant to a Hessian). θ_NB is a
+/// coordinate of the outer search, so the β SE must carry its uncertainty, as
+/// glmmTMB's does and as the Gamma dispersion's does
+/// (`gamma_hessian_se_matches_fd_of_the_full_objective`). At Laplace and at
+/// 7-node AGQ. Band 1e-3 relative (`grid/tol.R`'s `se_hessian_rel`).
+#[test]
+fn nb_hessian_se_matches_fd_of_the_full_objective() {
+    let (xr, y, cluster_ids, n_clusters) =
+        sim_clustered(include_str!("../../validation/data/simulated/sim_nb.csv"));
+    let (n, p) = (y.len(), 3);
+    let ids = GroupIds {
+        primary: cluster_ids,
+        extra: vec![],
+    };
+    let model = ModelSpec {
+        family: Family::NegativeBinomial {
+            link: crate::NegBinomialLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    for nagq in [1u8, 7] {
+        let opts = FitOptions {
+            target_indices: vec![0, 1, 2],
+            nagq,
+            ..FitOptions::default()
+        };
+        let (mut ws, x_mat) =
+            super::glmm::fit_glmm_build(&xr, n, p, &model, &ids.primary, &ids.extra, &opts)
+                .unwrap_or_else(|_| panic!("sim_nb design must build"));
+        let view = super::glmm::run_glmm_on(
+            &mut ws,
+            x_mat.as_ref(),
+            &y,
+            n,
+            p,
+            &model,
+            &ids.primary,
+            &ids.extra,
+            1.0,
+            None,
+            &opts,
+            ColumnScaling::IDENTITY,
+        );
+        let diag = view.diagnostics();
+        assert!(diag.converged, "nagq={nagq}: must converge");
+        assert!(
+            !diag.hessian_fallback,
+            "nagq={nagq}: exact Hessian SE expected"
+        );
+        let se: Vec<f64> = view.var_diag()[..p].iter().map(|v| v.sqrt()).collect();
+        let n_theta = ws.n_theta;
+        let theta_se0 = theta_se(&ws)[0];
+        let m = n_theta + p;
+        let mut q0: Vec<f64> = ws.params[..m].to_vec();
+        q0.push(ws.nb_theta.ln());
+        let kk = ws.k.max(1);
+        let u_hat = ws.pirls.u[..kk].to_vec();
+        ws.u_seed[..kk].copy_from_slice(&u_hat);
+        ws.fd.warm_seed_active = true;
+        ws.fd.pirls_tol_override = Some(crate::glmm::pirls_tol_fd(model.family));
+        let md = m + 1;
+        let mut f = |q: &[f64]| -> f64 {
+            ws.nb_theta = q[m].exp();
+            glmm_laplace_deviance(&q[..m], &mut ws, x_mat.as_ref(), &y, &ids.primary, &[], n)
+                - 2.0 * crate::fit::nb_profile_loglik(&y, &y, q[m].exp(), None)
+        };
+        let h: Vec<f64> = q0.iter().map(|v| 2e-3 * v.abs().max(1.0)).collect();
+        let f0 = f(&q0);
+        let mut hess = Mat::<f64>::zeros(md, md);
+        let at = |d: &[(usize, f64)]| {
+            let mut q = q0.clone();
+            for &(k, s) in d {
+                q[k] += s;
+            }
+            q
+        };
+        for i in 0..md {
+            let fp = f(&at(&[(i, h[i])]));
+            let fm = f(&at(&[(i, -h[i])]));
+            hess[(i, i)] = (fp - 2.0 * f0 + fm) / (h[i] * h[i]);
+            for j in (i + 1)..md {
+                let fpp = f(&at(&[(i, h[i]), (j, h[j])]));
+                let fpm = f(&at(&[(i, h[i]), (j, -h[j])]));
+                let fmp = f(&at(&[(i, -h[i]), (j, h[j])]));
+                let fmm = f(&at(&[(i, -h[i]), (j, -h[j])]));
+                let v = (fpp - fpm - fmp + fmm) / (4.0 * h[i] * h[j]);
+                hess[(i, j)] = v;
+                hess[(j, i)] = v;
+            }
+        }
+        use faer::linalg::solvers::Solve;
+        let chol = hess
+            .as_ref()
+            .llt(faer::Side::Lower)
+            .unwrap_or_else(|_| panic!("nagq={nagq}: FD Hessian of the full objective must be PD"));
+        let mut inv = Mat::<f64>::identity(md, md);
+        chol.solve_in_place(inv.as_mut());
+        for j in 0..p {
+            let fd = (2.0 * inv[(n_theta + j, n_theta + j)]).sqrt();
+            assert!(
+                (se[j] - fd).abs() <= 1e-3 * fd,
+                "nagq={nagq}: se[{j}] = {} vs FD of the full objective {fd}",
+                se[j]
+            );
+        }
+        let fd_theta = (2.0 * inv[(0, 0)]).sqrt();
+        assert!(
+            (theta_se0 - fd_theta).abs() <= 1e-3 * fd_theta,
+            "nagq={nagq}: θ SE = {theta_se0} vs FD of the full objective {fd_theta}"
+        );
+    }
+}
+
+/// GLMM twin of `lmm_maxfun_cap_q2_reports_honest_endpoint_and_not_singular`:
+/// the identical gate at `src/fit/glmm.rs` (`fit.diagnostics.singular =
+/// fit.diagnostics.singular || (converged &&
+/// fit.has_negligible_component(...))`) needs its own fixture, since PIRLS
+/// nesting and the Laplace/exact-profile route make the GLMM search behave
+/// differently from the LMM one.
+///
+/// Two SEPARATE crossed groupings, each intercept-only (`(1 | g) + (1 | h)`
+/// in formula terms) — two independent scalar variance components, no
+/// correlation coordinate between them. A single q=2 block (intercept +
+/// slope on one grouping, the LMM fixture's shape) does not work here: probed
+/// with the slope's true effect tiny but nonzero, tied to the same per-cluster
+/// draw as the intercept's and then drawn independently, at every scale from
+/// 60 to 15000 rows the search resolved the weak slope signal by pinning the
+/// CORRELATION near ±1 (a live off-diagonal, boundary_hit fires) rather than
+/// reporting a small independent variance — so on that shape `singular`
+/// always came from the pin, never from the ratio check, whatever the budget.
+/// Splitting the two components into separate groupings removes the
+/// correlation coordinate entirely: nothing to pin them together, so a weak
+/// second-grouping signal is free to land as a genuinely small variance.
+///
+/// Binomial logit, 30×30 crossed grouping, 5 reps/cell (4500 rows). The
+/// primary grouping's true effect is sizeable; the extra grouping's is small
+/// (scaled 0.002 against the primary's 0.9, both from the SAME `lcg` stream
+/// but statistically independent draws — no shared per-row term ties them).
+/// The unlimited-budget optimum (found while writing this test, not asserted
+/// below): `varcorr = [[0.31568505136015795], [0.0]]`, `singular = true` —
+/// the extra grouping's variance is pinned to exactly 0 there. 13 evals short
+/// of that endpoint (`extra = 13` below) BOBYQA has already reached
+/// `varcorr = [[0.31567964584120646], [4.926675807359726e-8]]` — not yet
+/// pinned (`4.93e-8 > 0`, an interior point) but already negligible by the
+/// ratio check (stddev ratio ≈ 3.95e-4, under `SINGULAR_REL_TOL`), and one
+/// eval short of `Converged`.
+#[test]
+fn glmm_maxfun_cap_q2_reports_honest_endpoint_and_not_singular() {
+    use bobyqa::{Bobyqa, Config};
+
+    let n_prim = 30usize;
+    let n_extra = 30usize;
+    let reps = 5usize;
+    let n = n_prim * n_extra * reps;
+    let p = 2usize;
+    let mut st = 11u64;
+    let prim_eff: Vec<f64> = (0..n_prim).map(|_| 0.9 * lcg(&mut st)).collect();
+    let extra_eff: Vec<f64> = (0..n_extra).map(|_| 0.002 * lcg(&mut st)).collect();
+    let mut x = vec![0.0f64; n * p];
+    let mut y = vec![0.0f64; n];
+    let mut cl = vec![0u32; n];
+    let mut cr = vec![0u32; n];
+    let mut i = 0;
+    for (pi, &pe) in prim_eff.iter().enumerate() {
+        for (ei, &ee) in extra_eff.iter().enumerate() {
+            for _ in 0..reps {
+                let cov = lcg(&mut st);
+                let eta = 0.2 + 0.5 * cov + pe + ee;
+                let prob = 1.0 / (1.0 + (-eta).exp());
+                let draw = (lcg(&mut st) + 1.0) / 2.0;
+                x[i * p] = 1.0;
+                x[i * p + 1] = cov;
+                cl[i] = pi as u32;
+                cr[i] = ei as u32;
+                y[i] = if draw < prob { 1.0 } else { 0.0 };
+                i += 1;
+            }
+        }
+    }
+    let model = ModelSpec {
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_prim as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![Grouping {
+                relation: GroupingRelation::Crossed {
+                    n_clusters: n_extra as u32,
+                },
+                slopes: vec![],
+            }],
+        }),
+    };
+    let ids = GroupIds {
+        primary: cl,
+        extra: vec![cr],
+    };
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        ..FitOptions::default()
+    };
+    let (sized_model, sized_ids, _perm) = super::spec_sized_from_ids(&model, &ids);
+    let (mut ws, x_mat) = super::glmm::fit_glmm_build(
+        &x,
+        n,
+        p,
+        &sized_model,
+        &sized_ids.primary,
+        &sized_ids.extra,
+        &opts,
+    )
+    .unwrap_or_else(|_| panic!("degenerate design"));
+    assert_eq!(
+        ws.outer_search,
+        OuterSearch::ExactProfile,
+        "this fixture's convergence status must come from solver_stage1 alone"
+    );
+    let n_stage1 = ws.n_theta; // binomial: no dispersion coordinate
+    let npt = 2 * n_stage1 + 1; // PRIMA's minimum npt (n_stage1 == 2 here)
+    let config = {
+        let mut c = Config::new(n_stage1);
+        c.npt = npt;
+        // 13 evals short of the unlimited-budget optimum — chosen by probing
+        // (see the doc comment above): the reported point already carries a
+        // negligible extra-grouping-to-primary stddev ratio.
+        c.max_fun = npt + 1 + 13;
+        c
+    };
+    ws.solver_stage1 = Bobyqa::new(n_stage1, config).expect("legal minimal config");
+    // The `PqlThenJoint` fallback (`Note::ExactProfileFallback`) reruns any
+    // not-converged `ExactProfile` attempt — including a capped one — once on
+    // `PqlThenJoint`, whose joint stage 2 runs on `ws.solver` with its own,
+    // otherwise uncapped, budget. Left alone that rerun would converge for
+    // real and defeat this fixture's whole point, so it gets the same
+    // eval-starved cap as stage 1. Both polish solvers get it.
+    let n_joint = n_stage1 + p;
+    let npt_joint = 2 * n_joint + 1;
+    let joint_config = {
+        let mut c = Config::new(n_joint);
+        c.npt = npt_joint;
+        c.max_fun = npt_joint + 1;
+        c
+    };
+    ws.solver = Bobyqa::new(n_joint, joint_config).expect("legal minimal config");
+    // This fixture's stage-1 optimum is near-singular, so its polish runs on
+    // the near-singular polish solver (`POLISH_NEAR_SINGULAR`): same cap.
+    ws.solver_polish_wide = Some(Bobyqa::new(n_joint, joint_config).expect("legal minimal config"));
+
+    let view = super::glmm::run_glmm_on(
+        &mut ws,
+        x_mat.as_ref(),
+        &y,
+        n,
+        p,
+        &sized_model,
+        &sized_ids.primary,
+        &sized_ids.extra,
+        f64::NAN,
+        None,
+        &opts,
+        ColumnScaling::IDENTITY,
+    );
+    let fit = super::glmm::glmm_view_to_fit(&view, &y, n, p, &sized_model, &opts).0;
+
+    assert!(!fit.converged(), "a capped fit must not report converged");
+    assert!(
+        !fit.varcorr.is_empty() && fit.varcorr.iter().flatten().all(|v| v.is_finite()),
+        "plateau policy: capped endpoint must report varcorr, got {:?}",
+        fit.varcorr
+    );
+    let sd_prim = fit.varcorr[0][0].sqrt();
+    let sd_extra = fit.varcorr[1][0].sqrt();
+    let ratio = sd_extra / sd_prim;
+    assert!(
+        ratio <= 1e-3,
+        "fixture must be genuinely negligible by SINGULAR_REL_TOL, ratio {ratio}"
+    );
+    assert!(
+        !fit.singular(),
+        "a capped endpoint reports singular = false, even though its varcorr \
+         ratio ({ratio}) is negligible — has_negligible_component must stay \
+         gated on `converged`"
+    );
+}
+
+/// The fixed-β Laplace objective keeps rising as the intercept runs into a
+/// tail, on every family whose μ carries a bound or a tail: no stretch where
+/// it goes flat. Four clusters, θ = 1, β₁ = 0; a fit's whole η column moves
+/// with β₀, so past `ln MU_FLOOR ≈ −23` (log links) or `PROB_EPS` (binomial)
+/// every row is a tail row (`family::in_tail`). A constant objective there
+/// would let PIRLS stop at a point that is not a mode and report converged.
+/// Logit is here as the control that never had a μ bound on its fused route.
+#[test]
+fn fixed_beta_objective_rises_into_the_tail() {
+    let (n, p, s) = (40usize, 2usize, 4usize);
+    let mut x = vec![0.0f64; n * p];
+    let mut st = 7u64;
+    for i in 0..n {
+        x[i * p] = 1.0;
+        x[i * p + 1] = lcg(&mut st);
+    }
+    let xm = Mat::<f64>::from_fn(n, p, |i, j| x[i * p + j]);
+    let ids: Vec<u32> = (0..n).map(|i| (i % s) as u32).collect();
+    let fams = [
+        Family::Poisson {
+            link: PoissonLink::Log,
+        },
+        Family::NegativeBinomial {
+            link: crate::NegBinomialLink::Log,
+        },
+        Family::Gamma {
+            link: crate::GammaLink::Log,
+        },
+        Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        Family::Binomial {
+            link: BinomialLink::Probit,
+        },
+        Family::Binomial {
+            link: BinomialLink::Cloglog,
+        },
+    ];
+    for fam in fams {
+        let y: Vec<f64> = (0..n)
+            .map(|i| match fam {
+                Family::Binomial { .. } => (i % 2) as f64,
+                Family::Gamma { .. } => 0.5 + (i % 5) as f64,
+                _ => 1.0 + (i % 5) as f64,
+            })
+            .collect();
+        let model = ModelSpec {
+            family: fam,
+            re: Some(ReStructure {
+                sizing: Sizing::FixedClusters {
+                    n_clusters: s as u32,
+                },
+                slopes: vec![],
+                extra_groupings: vec![],
+            }),
+        };
+        let mut ws = GlmmWorkspace::for_cluster_spec(p, &model, n, &[], 1);
+        ws.nb_theta = 1.0;
+        let mut at = |b0: f64| {
+            glmm_laplace_deviance(&[1.0, b0, 0.0], &mut ws, xm.as_ref(), &y, &ids, &[], n)
+        };
+        let mut sides: Vec<&[f64]> = vec![&[-10.0, -30.0, -60.0, -100.0]];
+        if matches!(fam, Family::Binomial { .. }) {
+            sides.push(&[10.0, 30.0, 60.0, 100.0]);
+        } else {
+            sides.push(&[10.0, 30.0, 100.0]);
+        }
+        for side in sides {
+            let d: Vec<f64> = side.iter().map(|&b0| at(b0)).collect();
+            for k in 1..d.len() {
+                assert!(
+                    d[k].is_finite() && d[k] > d[k - 1] * (1.0 + 1e-6),
+                    "{fam:?}: objective {d:?} at β₀ {side:?} does not keep rising"
+                );
+            }
+        }
+    }
+}
+
+/// Complete separation by a fixed effect: the fixed-effects-only GLM has no
+/// finite maximum, so neither has the GLMM, on every route. The fit stops
+/// before its outer search with the GLM's last coefficients and no standard
+/// errors, the outcome the GLM itself reports.
+#[test]
+fn separated_fixed_effects_stop_the_glmm_before_its_search() {
+    let (n_g, per) = (10usize, 10usize);
+    let n = n_g * per;
+    let mut st = 6u64;
+    let mut x = Vec::with_capacity(2 * n);
+    let mut y = Vec::with_capacity(n);
+    for _ in 0..n {
+        let xi = lcg(&mut st);
+        x.extend_from_slice(&[1.0, xi]);
+        y.push(f64::from(u8::from(xi > 0.0)));
+    }
+    let ids = GroupIds {
+        primary: (0..n).map(|i| (i / per) as u32).collect(),
+        extra: vec![],
+    };
+    let model = ModelSpec {
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_g as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    for nagq in [1u8, 5] {
+        let f = fit_cold(
+            &x,
+            &y,
+            n,
+            2,
+            &model,
+            &ids,
+            &FitOptions {
+                target_indices: vec![0, 1],
+                nagq,
+                ..FitOptions::default()
+            },
+        );
+        assert!(
+            !f.converged(),
+            "nAGQ {nagq}: separated data must not converge"
+        );
+        assert_eq!(f.n_eval, 0, "nAGQ {nagq}: the outer search must not run");
+        assert!(
+            f.beta.iter().all(|b| b.is_finite()),
+            "nAGQ {nagq}: β {:?}",
+            f.beta
+        );
+        assert!(
+            f.se.iter().all(|s| s.is_nan()) && f.deviance.is_nan(),
+            "nAGQ {nagq}: se {:?}, deviance {}",
+            f.se,
+            f.deviance
+        );
+    }
+}
+
+/// Overlapping data whose GLM maximum puts η past ±30 at the extreme x: 1000
+/// rows evenly on x ∈ [−25, 25], y ~ Bernoulli(logit⁻¹(1.5x)) from `lcg` seed
+/// 11, 21 rows where the classes overlap, 20 clusters i % 20, `(1 | g)`. The
+/// GLM seed crosses `ETA_DIVERGENCE_CAP` on its way to a finite maximum and
+/// must not be read as separated. R 4.5, lme4 2.0-6: `glm` converges at
+/// β = (−0.406425471170286, 1.625701884681146), η from −41.0 to 40.2;
+/// `glmer` converges singular (θ = 0) at β = (−0.406425471167,
+/// 1.625701884666), logLik −40.47320317.
+#[test]
+fn glmm_whose_glm_seed_passes_the_eta_cap_still_fits() {
+    const REF_BETA: [f64; 2] = [-0.406425471167, 1.625701884666];
+    let (n, n_g) = (1000usize, 20usize);
+    let mut st = 11u64;
+    let mut x = Vec::with_capacity(2 * n);
+    let mut y = Vec::with_capacity(n);
+    for i in 0..n {
+        let xi = -25.0 + 50.0 * (i as f64 + 0.5) / n as f64;
+        let u = 0.5 * (lcg(&mut st) + 1.0);
+        x.extend_from_slice(&[1.0, xi]);
+        y.push(f64::from(u8::from(u < 1.0 / (1.0 + (-1.5 * xi).exp()))));
+    }
+    let ids = GroupIds {
+        primary: (0..n).map(|i| (i % n_g) as u32).collect(),
+        extra: vec![],
+    };
+    let model = ModelSpec {
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_g as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let f = fit_cold(
+        &x,
+        &y,
+        n,
+        2,
+        &model,
+        &ids,
+        &FitOptions {
+            target_indices: vec![0, 1],
+            ..FitOptions::default()
+        },
+    );
+    assert!(f.converged(), "must converge; β = {:?}", f.beta);
+    assert!(f.n_eval > 0, "the outer search must run");
+    for (j, &r) in REF_BETA.iter().enumerate() {
+        let rel = (f.beta[j] - r).abs() / r.abs();
+        assert!(rel < 1e-6, "β[{j}] = {} vs glmer {r}", f.beta[j]);
+    }
+}
+
+/// Random-intercept Poisson design `x = [1, a, a + δ·b]` (row-major, `n = 400`,
+/// 20 clusters) with `y` drawn from `0.2 + 0.5·a + u_g`: at small `δ` the last
+/// two columns are nearly collinear, which the column standardization does not
+/// undo (it centers and scales, and both columns carry `a`).
+fn entangled_poisson_glmm(delta: f64) -> (Vec<f64>, Vec<f64>, usize, usize, ModelSpec, GroupIds) {
+    let (n, n_g, p) = (400usize, 20usize, 3usize);
+    let mut st = 20261003u64;
+    let u: Vec<f64> = (0..n_g)
+        .map(|_| 0.5 * inf_plateau_normal(&mut st))
+        .collect();
+    let mut x = vec![0.0; n * p];
+    let mut y = vec![0.0; n];
+    let mut ids = vec![0u32; n];
+    for i in 0..n {
+        let g = i % n_g;
+        ids[i] = g as u32;
+        let a = 2.0 * inf_plateau_lcg_next(&mut st) - 1.0;
+        let b = 2.0 * inf_plateau_lcg_next(&mut st) - 1.0;
+        x[i * p] = 1.0;
+        x[i * p + 1] = a;
+        x[i * p + 2] = a + delta * b;
+        y[i] = inf_plateau_poisson(&mut st, (0.2 + 0.5 * a + u[g]).exp());
+    }
+    let model = ModelSpec {
+        family: Family::Poisson {
+            link: PoissonLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_g as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: ids,
+        extra: vec![],
+    };
+    (x, y, n, p, model, ids)
+}
+
+/// The GLMM route raises `Note::IllConditioned` on both SE arms: the Rx arm
+/// measures the Rx Schur complement, the Hessian arm the β block of the joint
+/// Hessian, and both name the later column of the entangled pair. `δ = 2⁻²¹`
+/// puts the pivot at 2.5e-13 on both arms, under `lmm::PIVOT_MIN`, while the raw design's
+/// ratio stays above the alias gate's `ALIAS_EPS`, so the column is fitted
+/// rather than dropped.
+#[test]
+fn glmm_entangled_design_raises_ill_conditioned() {
+    let (x, y, n, p, model, ids) = entangled_poisson_glmm(2f64.powi(-21));
+    for wald_se in [WaldSe::Hessian, WaldSe::Rx] {
+        let opts = FitOptions {
+            target_indices: vec![1, 2],
+            wald_se,
+            ..FitOptions::default()
+        };
+        let f = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+        assert!(f.converged(), "{wald_se:?}: the design is computable");
+        assert_eq!(f.aliased(), &[false; 3], "{wald_se:?}: nothing is dropped");
+        let cond: Vec<_> = f
+            .diagnostics
+            .notes
+            .iter()
+            .filter_map(|n| match n {
+                Note::IllConditioned { columns, pivot } => Some((columns.clone(), *pivot)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            cond.len(),
+            1,
+            "{wald_se:?}: notes {:?}",
+            f.diagnostics.notes
+        );
+        let (columns, pivot) = &cond[0];
+        assert_eq!(columns, &vec![2], "{wald_se:?}");
+        assert!(*pivot < crate::lmm::PIVOT_MIN, "{wald_se:?}: pivot {pivot}");
+    }
+}
+
+/// Negative control: the same design at `δ = 1` is well conditioned and
+/// carries no `Note::IllConditioned` on either SE arm.
+#[test]
+fn glmm_well_conditioned_design_carries_no_ill_conditioned_note() {
+    let (x, y, n, p, model, ids) = entangled_poisson_glmm(1.0);
+    for wald_se in [WaldSe::Hessian, WaldSe::Rx] {
+        let opts = FitOptions {
+            target_indices: vec![1, 2],
+            wald_se,
+            ..FitOptions::default()
+        };
+        let f = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+        assert!(f.converged(), "{wald_se:?}");
+        assert!(
+            !f.diagnostics
+                .notes
+                .iter()
+                .any(|n| matches!(n, Note::IllConditioned { .. })),
+            "{wald_se:?}: notes {:?}",
+            f.diagnostics.notes
+        );
+    }
+}
+
+/// Gamma-inverse design whose four size-3 clusters have means spanning nine
+/// decades; the second cluster's responses are scaled by `big_scale`. Its
+/// optimum is on the σ = 0 boundary, at the Gamma GLM fit (−2·logLik 145.147
+/// at `big_scale` 1e-3, 198.275 at 1); an interior local minimum lies 8 to 12
+/// units above it. The fitted η is of order 1e-4 to 1e-7.
+fn gamma_inverse_adversarial(big_scale: f64) -> (Vec<f64>, Vec<f64>, ModelSpec, GroupIds) {
+    const X1: [f64; 12] = [
+        -0.2884326052962697,
+        0.15675840297260962,
+        -0.29990566105127503,
+        0.3053648563367106,
+        -0.608001199771249,
+        1.451281361998219,
+        -0.12817918698856592,
+        0.2873778743945057,
+        1.2188666482896826,
+        -1.2520230368147756,
+        -0.01938374443978608,
+        1.0354827975218956,
+    ];
+    const Y: [f64; 12] = [
+        0.013147681629338537,
+        0.022571111060908807,
+        0.009380481267257667,
+        13915684.733974772,
+        16148934.63843452,
+        47449285.58840935,
+        0.03659612272549357,
+        0.03340213953300986,
+        0.16526466878896995,
+        2288.1399088594685,
+        5963.477254271042,
+        19049.155692047607,
+    ];
+    let x: Vec<f64> = X1.iter().flat_map(|&v| [1.0, v]).collect();
+    // Rows 3..6 are the second cluster — the one the scale moves.
+    let y: Vec<f64> = Y
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| {
+            if (3..6).contains(&i) {
+                v * big_scale
+            } else {
+                v
+            }
+        })
+        .collect();
+    let model = ModelSpec {
+        family: Family::Gamma {
+            link: crate::GammaLink::Inverse,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 4 },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: (0..Y.len() as u32).map(|i| i / 3).collect(),
+        extra: vec![],
+    };
+    (x, y, model, ids)
+}
+
+/// `gamma_inverse_adversarial` reaches its boundary optimum, the Gamma GLM's
+/// maximum, on the exact profile (nAGQ = 1) and on 7-node AGQ. Searched in y's
+/// own units, every one of these fits stopped 4.6 to 27 units above it or
+/// failed (measured 2026-10-04).
+#[test]
+fn gamma_inverse_adversarial_reaches_the_glm_optimum() {
+    for big_scale in [1e-3, 1e-2, 0.02, 1.0] {
+        let (x, y, model, ids) = gamma_inverse_adversarial(big_scale);
+        let glm_model = ModelSpec {
+            family: model.family,
+            re: None,
+        };
+        let opts = |nagq| FitOptions {
+            target_indices: vec![0, 1],
+            nagq,
+            ..FitOptions::default()
+        };
+        let glm = fit_cold(&x, &y, 12, 2, &glm_model, &GroupIds::default(), &opts(1));
+        assert!(glm.converged(), "{big_scale}: GLM");
+        for nagq in [1, 7] {
+            let fit = fit_cold(&x, &y, 12, 2, &model, &ids, &opts(nagq));
+            assert!(
+                fit.converged() && fit.singular(),
+                "{big_scale}, nAGQ {nagq}: flags"
+            );
+            let gap = fit.deviance + 2.0 * glm.loglik;
+            assert!(
+                gap.abs() < 1e-6,
+                "{big_scale}, nAGQ {nagq}: deviance {} vs GLM −2·logLik {}",
+                fit.deviance,
+                -2.0 * glm.loglik
+            );
+        }
+    }
+}
+
+/// The same 12 rows with the spread of the cluster means changed: each
+/// response times `g^(span − 1)`, `g` its cluster's geometric mean, so the
+/// cluster geometric means become `g^span`, and the whole response times `k`.
+/// References: the best of a multi-start Laplace fit in R (2026-10-03), in
+/// y's units at k = 1. Up to `span` 0.6 the optimum is interior and the σ = 0
+/// GLM fit a worse local minimum; from 0.8 it is σ = 0. At 0.65 and 0.7 the
+/// interior optimum puts two clusters' η at 1e-5 to 2e-3, where PIRLS fails
+/// next to it: the fit may end not converged, but must not report the σ = 0
+/// point (2.2 and 0.46 units above it) as converged. In y's own units the
+/// exact profile reached these references at k = 1 only, ending converged
+/// short of them (by 3 to 120 units), on σ = 0, or not converged at k = 1e3
+/// and 1e-6 (measured 2026-10-04).
+#[test]
+fn gamma_inverse_span_reaches_the_optimum_in_any_units() {
+    const REF: [(f64, f64); 8] = [
+        (0.3, 83.34517130),
+        (0.4, 101.72665521),
+        (0.55, 128.94209247),
+        (0.6, 137.99264263),
+        (0.65, 147.04344022),
+        (0.7, 156.09716446),
+        (0.8, 170.82168805),
+        (0.9, 184.69834786),
+    ];
+    let (x, y1, model, ids) = gamma_inverse_adversarial(1.0);
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        ..FitOptions::default()
+    };
+    let gm: Vec<f64> = (0..4)
+        .map(|g| ((0..3).map(|j| y1[3 * g + j].ln()).sum::<f64>() / 3.0).exp())
+        .collect();
+    for (span, want) in REF {
+        for k in [1.0, 1e3, 1e-6] {
+            let y: Vec<f64> = (0..12)
+                .map(|i| k * y1[i] * gm[i / 3].powf(span - 1.0))
+                .collect();
+            let fit = fit_cold(&x, &y, 12, 2, &model, &ids, &opts);
+            let dev = fit.deviance - 24.0 * k.ln();
+            if span == 0.65 || span == 0.7 {
+                assert!(
+                    !fit.converged() || dev < want + 1e-6,
+                    "span {span}, k = {k:e}: converged at {dev} above {want}"
+                );
+                continue;
+            }
+            assert!(fit.converged(), "span {span}, k = {k:e}: not converged");
+            assert!(
+                dev < want + 1e-6,
+                "span {span}, k = {k:e}: deviance {dev} (in y's units) vs R {want}"
+            );
+        }
+    }
+}
+
+/// Corpus fit with its optimum on σ = 0 (15 rows, 5 groups, a single slope
+/// pair). Its log-likelihood in y's units must not depend on the units: in
+/// y's own units the fit lost 0.42 at k = 1e3 and failed from k = 1e6
+/// (measured 2026-10-04).
+#[test]
+fn gamma_inverse_singular_fit_is_equivariant_in_the_units_of_y() {
+    const ROWS: [[f64; 3]; 15] = [
+        [0.9102771923475218, -0.3262333607056494, 0.2522234481561323],
+        [1.5395933169335054, 1.3297992629225006, -0.8919211272845686],
+        [4.927053429650447, 1.2724293214294047, 0.43568329935571865],
+        [5.699248516202153, 0.4146414344564082, -1.237538421929958],
+        [
+            1.1995835190695925,
+            -1.5399500419037095,
+            -0.22426788527830935,
+        ],
+        [6.498542728745092, -0.9285670347135381, 0.37739564598170106],
+        [4.518466824524456, -0.2947204467905602, 0.1333363608148414],
+        [
+            1.3361623244390257,
+            -0.005767172747536955,
+            0.8041895097449078,
+        ],
+        [0.6300843760201691, 2.404653388857951, -0.057106774383808755],
+        [3.079848383793103, 0.7635934611404596, 0.5036079722337261],
+        [0.49164045340023066, -0.7990092489893682, 1.085769362145687],
+        [18.32950451779483, -1.1476570092363514, -0.6909538396968303],
+        [
+            3.6633192499540095,
+            -0.28946157368822334,
+            -1.2845993538721883,
+        ],
+        [
+            0.6192614143890676,
+            -0.29921511789731614,
+            0.04672617218835198,
+        ],
+        [
+            0.38674446461759077,
+            -0.411510832795067,
+            -0.23570655643950122,
+        ],
+    ];
+    let x: Vec<f64> = ROWS.iter().flat_map(|r| [1.0, r[1], r[2]]).collect();
+    let model = ModelSpec {
+        family: Family::Gamma {
+            link: crate::GammaLink::Inverse,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 5 },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: (0..15u32).map(|i| i % 5).collect(),
+        extra: vec![],
+    };
+    let opts = FitOptions {
+        target_indices: vec![0, 1, 2],
+        ..FitOptions::default()
+    };
+    let fit_at = |k: f64| {
+        let y: Vec<f64> = ROWS.iter().map(|r| k * r[0]).collect();
+        fit_cold(&x, &y, 15, 3, &model, &ids, &opts)
+    };
+    let base = fit_at(1.0);
+    assert!(base.converged() && base.singular(), "base fit");
+    for k in [1e-30, 1e3, 1e6, 1e60] {
+        let f = fit_at(k);
+        assert!(f.converged() && f.singular(), "k = {k:e}: flags");
+        let ll = f.loglik + 15.0 * k.ln();
+        assert!(
+            (ll - base.loglik).abs() < 1e-8,
+            "k = {k:e}: loglik {ll} vs {}",
+            base.loglik
+        );
+    }
+}
+
+/// A Gamma-inverse design the gradient search fits: `(1 + x₁ | g)` (n_θ = 3),
+/// 10 clusters of 10 rows, p = 2, cluster intercepts and slopes drawn with
+/// SD scales 0.2 and 0.1, so η stays in `[0.4, 1.2]`, and shape-2 Gamma noise
+/// (the mean of two unit exponentials). Returns the row-major design, y, the
+/// group ids and the model.
+pub(super) fn gamma_inverse_slope_design() -> (Vec<f64>, Vec<f64>, GroupIds, ModelSpec) {
+    let (n_g, per) = (10usize, 10usize);
+    let n = n_g * per;
+    let mut st = 4242u64;
+    let b: Vec<(f64, f64)> = (0..n_g)
+        .map(|_| (0.2 * lcg(&mut st), 0.1 * lcg(&mut st)))
+        .collect();
+    let (mut x, mut y, mut gid) = (Vec::with_capacity(2 * n), Vec::with_capacity(n), Vec::new());
+    for i in 0..n {
+        let g = i / per;
+        let x1 = 0.5 * lcg(&mut st);
+        let eta = 0.8 - 0.3 * x1 + b[g].0 + b[g].1 * x1;
+        let e = |st: &mut u64| -(0.5 * (lcg(st) + 1.0)).max(1e-12).ln();
+        let noise = 0.5 * (e(&mut st) + e(&mut st));
+        x.extend([1.0, x1]);
+        y.push(noise / eta);
+        gid.push(g as u32);
+    }
+    let model = ModelSpec {
+        family: Family::Gamma {
+            link: crate::GammaLink::Inverse,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_g as u32,
+            },
+            slopes: vec![1],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: gid,
+        extra: vec![],
+    };
+    (x, y, ids, model)
+}
+
+/// A Gamma-inverse design the gradient search fits, `(1 + x₁ | g)` (n_θ = 3,
+/// 10 clusters of 10 rows), through `fit_cold`, so the units of the first
+/// search and the retry (`gamma_inverse_units`, `gamma_inverse_retry`) run
+/// as for any caller, on y·k for k = 2⁻²⁰ … 2²⁰. At every k the fit is
+/// converged and its deviance in y's units is at or below the BOBYQA route's
+/// on the same data within `dev_eps` (4e-5).
+#[test]
+fn gamma_inverse_gradient_route_matches_bobyqa_in_any_units() {
+    use super::core::{build_workspace, curvature_hint, fit_on};
+    let (x, y1, ids, model) = gamma_inverse_slope_design();
+    let n = y1.len();
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        ..FitOptions::default()
+    };
+    let (sized, sids, perm) = spec_sized_from_ids_pub(&model, &ids);
+    let bobyqa = |y: &[f64]| {
+        let mut ws = build_workspace(&sized, perm, n, 2, &opts);
+        super::core::force_bobyqa_route(&mut ws);
+        fit_on(&mut ws, &x, y, &sids, None, &opts).into_fit(&x, y, &sids, n, 2, &model, &opts)
+    };
+    let mut ws = build_workspace(&sized, perm, n, 2, &opts);
+    let _ = fit_on(&mut ws, &x, &y1, &sids, None, &opts);
+    assert!(
+        curvature_hint(&mut ws).is_some(),
+        "the design does not take the gradient search"
+    );
+    for e in -20..=20 {
+        let k = 2f64.powi(e);
+        let y: Vec<f64> = y1.iter().map(|v| k * v).collect();
+        let shift = 2.0 * n as f64 * k.ln();
+        let f = fit_cold(&x, &y, n, 2, &model, &ids, &opts);
+        let bob = bobyqa(&y);
+        let (dev, dev_bob) = (f.deviance - shift, bob.deviance - shift);
+        assert!(f.converged(), "k = 2^{e}: not converged");
+        assert!(
+            dev <= dev_bob + 4e-5,
+            "k = 2^{e}: gradient route {dev} vs BOBYQA {dev_bob} (in y's units)"
+        );
+    }
+}
+
+/// Six Poisson-log clusters of five rows, `[1, x]` with x from the LCG at
+/// `seed`, whose log-means are spread evenly over `decades` (cluster `c` at
+/// `c/5 · decades · ln 10`, plus `0.3·x` and a uniform ±0.1 row noise), so the
+/// working weights `W = μ` run from about 1 to 10^decades. Returns
+/// `(x, y, model, ids)` for a scalar random intercept.
+fn poisson_decades_design(seed: u64, decades: f64) -> (Vec<f64>, Vec<f64>, ModelSpec, GroupIds) {
+    let (nc, m) = (6usize, 5usize);
+    let n = nc * m;
+    let mut st = seed;
+    let mut x = vec![0.0; n * 2];
+    let mut y = vec![0.0; n];
+    for i in 0..n {
+        let xv = lcg(&mut st);
+        let noise = 0.1 * lcg(&mut st);
+        x[2 * i] = 1.0;
+        x[2 * i + 1] = xv;
+        let eta =
+            (i / m) as f64 / (nc - 1) as f64 * decades * std::f64::consts::LN_10 + 0.3 * xv + noise;
+        y[i] = eta.exp().round();
+    }
+    let model = ModelSpec {
+        family: Family::Poisson {
+            link: PoissonLink::Log,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: nc as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: (0..n as u32).map(|i| i / m as u32).collect(),
+        extra: vec![],
+    };
+    (x, y, model, ids)
+}
+
+/// The joint `[θ | β̃]` search on working weights that span many decades:
+/// six Poisson-log clusters of five rows whose log-means are spread evenly
+/// over `decades`, so `W = μ` runs from about 1 to 10^decades. The blocked
+/// layout fits nAGQ = 1 on the exact profile; the packed layout (Laplace) fits
+/// it on the joint search, and 7-node AGQ on the gradient route (BFGS on the
+/// exact AGQ gradient) followed by the joint search's check. On β̃ scaled by the
+/// design alone the joint search stopped converged above the exact-profile
+/// optimum: packed by 1.05 deviance units at 8 decades, and at 12 decades
+/// packed and AGQ by 800 to 1050 units (measured 2026-10-04). On the gradient
+/// route at 8 decades BFGS finishes 4.58 units above the AGQ optimum, certified,
+/// and the check's second pass moves it there; at 12 decades its line search
+/// fails and the fit hands over to the joint search (with
+/// `Note::GradientSearchFallback`), as designed (measured 2026-10-10). The
+/// third design (LCG seed 3, 12 decades) also hands over; there the second
+/// pass alone ended 2.93 above the exact profile, and the hand-over's extra
+/// information-metric pass reaches the optimum (measured 2026-10-11).
+#[test]
+fn joint_search_reaches_the_optimum_when_working_weights_span_decades() {
+    for (seed, decades) in [(12345u64, 8.0), (12345, 12.0), (3, 12.0)] {
+        let (x, y, model, ids) = poisson_decades_design(seed, decades);
+        let n = y.len();
+        let opts = |nagq| FitOptions {
+            target_indices: vec![0, 1],
+            nagq,
+            ..FitOptions::default()
+        };
+        let exact = fit_cold(&x, &y, n, 2, &model, &ids, &opts(1));
+        let packed = crate::fit::fit_glmm_packed(
+            &x,
+            &y,
+            n,
+            2,
+            &model,
+            &ids.primary,
+            &ids.extra,
+            f64::NAN,
+            None,
+            &opts(1),
+        )
+        .0;
+        let agq = fit_cold(&x, &y, n, 2, &model, &ids, &opts(7));
+        assert!(exact.converged() && packed.converged() && agq.converged());
+        // The AGQ fit searched with BFGS (the gradient route): the joint
+        // BOBYQA search alone, which this test was written for, no longer
+        // passes it. At 8 decades BFGS finishes; at 12 it hands over.
+        assert!(
+            agq.diagnostics.n_grad > 0,
+            "seed {seed}, {decades}: the AGQ fit did not search with BFGS"
+        );
+        if decades == 8.0 {
+            assert!(
+                !agq.diagnostics
+                    .notes
+                    .iter()
+                    .any(|n| matches!(n, Note::GradientSearchFallback)),
+                "seed {seed}, {decades}: the gradient search handed over"
+            );
+        }
+        // The PIRLS exit band, relative 1e-9 (`glmm::PIRLS_TOL_REL`), bounds
+        // how closely two routes can agree; 1e-11 is 0.16 units at 12 decades.
+        assert!(
+            (packed.deviance - exact.deviance).abs() < 1e-11 * exact.deviance,
+            "seed {seed}, {decades}: packed {} vs exact profile {}",
+            packed.deviance,
+            exact.deviance
+        );
+        // AGQ minimizes its own objective; on these 5-row clusters it lies
+        // within 0.03 of the Laplace one at the optimum.
+        assert!(
+            (agq.deviance - exact.deviance).abs() < 0.1,
+            "seed {seed}, {decades}: AGQ {} vs exact profile {}",
+            agq.deviance,
+            exact.deviance
+        );
+    }
+}
+
+/// 7-node AGQ on the design of the test above at 13.75 and 14 decades, where
+/// |f| runs from 7.4e11 to 2.4e12, seeds 12345 and 1 to 4. The joint search
+/// stopped 1090 to 1460 units above the exact-profile optimum, still
+/// converged: its check found the incumbent 679 to 937 units above the point
+/// it re-solves, below a band of 1e-9·|f| (737 to 2438 units), so no second
+/// pass ran; at 14 decades the check's AGQ solve failed outright, started from
+/// modes at the incumbent's β rather than at the re-solved one (measured
+/// 2026-10-16). With the band capped at one unit (`JOINT_RECHECK_ABS`) and the
+/// check and second pass started from the re-solved modes, every fit ends
+/// within +0.31 of the exact profile on x86_64; on aarch64 two did not (seed
+/// 12345 at 13.75 decades +1.65, seed 2 at 14 decades +8.77), both fits the
+/// gradient route finished through its polish, which ran no third pass then.
+/// With the third pass on every AGQ fit whose check fires, the worst is +0.36
+/// on aarch64 and +0.04 on x86_64 (measured 2026-10-18). At this |f| the objective resolves to
+/// about 0.1 unit (its spread under θ nudges of 1e-9 relative), so the upper
+/// band is the check's one unit. The lower band only catches a gross error:
+/// at 14 decades the exact profile itself stops up to 10.7 units above the
+/// Laplace optimum (the Laplace objective at the AGQ endpoint is that much
+/// lower), so AGQ can land that far below it.
+#[test]
+fn agq_search_reaches_the_optimum_when_working_weights_span_fourteen_decades() {
+    for seed in [12345u64, 1, 2, 3, 4] {
+        for decades in [13.75, 14.0] {
+            let (x, y, model, ids) = poisson_decades_design(seed, decades);
+            let n = y.len();
+            let opts = |nagq| FitOptions {
+                target_indices: vec![0, 1],
+                nagq,
+                ..FitOptions::default()
+            };
+            let exact = fit_cold(&x, &y, n, 2, &model, &ids, &opts(1));
+            let agq = fit_cold(&x, &y, n, 2, &model, &ids, &opts(7));
+            assert!(
+                exact.converged() && agq.converged(),
+                "seed {seed}, {decades}: not converged"
+            );
+            let d = agq.deviance - exact.deviance;
+            assert!(
+                d < 1.0 && d > -50.0,
+                "seed {seed}, {decades}: AGQ {} vs exact profile {} ({d:+})",
+                agq.deviance,
+                exact.deviance
+            );
+        }
+    }
+}
+
+// --- StartValues::dispersion (a carried NB shape / Gamma φ) ---
+
+/// `sim_gamma` on a scalar-intercept Gamma GLMM with `link`.
+fn sim_gamma_glmm(
+    link: crate::GammaLink,
+) -> (
+    Vec<f64>,
+    Vec<f64>,
+    usize,
+    usize,
+    ModelSpec,
+    GroupIds,
+    FitOptions,
+) {
+    let (x, y, cluster_ids, n_clusters) = sim_clustered(include_str!(
+        "../../validation/data/simulated/sim_gamma.csv"
+    ));
+    let (n, p) = (y.len(), 3);
+    let model = ModelSpec {
+        family: Family::Gamma { link },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters {
+                n_clusters: n_clusters as u32,
+            },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: cluster_ids,
+        extra: vec![],
+    };
+    let opts = FitOptions {
+        target_indices: vec![0, 1, 2],
+        ..FitOptions::default()
+    };
+    (x, y, n, p, model, ids, opts)
+}
+
+/// A carried dispersion seeds the search's trailing coordinate. Started at the
+/// cold optimum's own (β, θ), a Gamma GLMM returns that optimum on both links
+/// with or without the carried φ, and the carried φ takes no more
+/// evaluations than the cold φ seed does (measured 2026-10-07: 19 against 26
+/// on the log link, 19 against 35 on the inverse, the cold fit 28 on both).
+/// Without it the dispersion still starts from the no-RE plug-in seed, the
+/// case the `ln φ` gate's cold radius is for.
+#[test]
+fn carried_gamma_dispersion_reaches_the_cold_optimum() {
+    for link in [crate::GammaLink::Log, crate::GammaLink::Inverse] {
+        let (x, y, n, p, model, ids, opts) = sim_gamma_glmm(link);
+        let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+        assert!(cold.converged(), "{link:?}: cold fit");
+        let no_disp = StartValues {
+            beta: cold.beta.clone(),
+            theta: vec![cold.tau2[0].sqrt()],
+            dispersion: None,
+        };
+        let with_disp = StartValues {
+            dispersion: Some(cold.dispersion),
+            ..no_disp.clone()
+        };
+        let a = fit_warm(&x, &y, n, p, &model, &ids, Some(&no_disp), &opts);
+        let b = fit_warm(&x, &y, n, p, &model, &ids, Some(&with_disp), &opts);
+        for (f, label) in [(&a, "cold φ seed"), (&b, "carried φ")] {
+            assert!(f.converged(), "{link:?}, {label}: converged");
+            let rel = (f.deviance - cold.deviance).abs() / cold.deviance.abs();
+            assert!(rel < 1e-9, "{link:?}, {label}: deviance rel {rel}");
+            let d = (f.dispersion / cold.dispersion - 1.0).abs();
+            assert!(d < 1e-4, "{link:?}, {label}: dispersion rel {d}");
+        }
+        assert!(
+            b.n_eval <= a.n_eval,
+            "{link:?}: carried φ took {} evaluations, the cold φ seed {}",
+            b.n_eval,
+            a.n_eval
+        );
+    }
+}
+
+/// A carried NB shape is the seed itself (the no-RE GLM-NB prefit that exists
+/// only to produce one is skipped), and the fit returns the cold optimum from
+/// it, on the GLMM and on the NB GLM (whose shape search takes it as its
+/// `theta_seed`).
+#[test]
+fn carried_nb_shape_reaches_the_cold_optimum() {
+    let (x, y, model, ids) = nb_log_four_cluster_design(3, 24, 0);
+    let (n, p) = (y.len(), 2usize);
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        ..FitOptions::default()
+    };
+    let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    assert!(cold.converged());
+    for theta_nb in [cold.dispersion, 0.5 * cold.dispersion, 4.0] {
+        let start = StartValues {
+            dispersion: Some(theta_nb),
+            ..StartValues::default()
+        };
+        let warm = fit_warm(&x, &y, n, p, &model, &ids, Some(&start), &opts);
+        assert!(warm.converged(), "θ_NB start {theta_nb}");
+        let rel = (warm.deviance - cold.deviance).abs() / cold.deviance.abs();
+        assert!(rel < 1e-9, "θ_NB start {theta_nb}: deviance rel {rel}");
+    }
+    let glm = ModelSpec {
+        family: model.family,
+        re: None,
+    };
+    let none = GroupIds::default();
+    let cold_glm = fit_cold(&x, &y, n, p, &glm, &none, &opts);
+    let start = StartValues {
+        dispersion: Some(2.0 * cold_glm.dispersion),
+        ..StartValues::default()
+    };
+    let warm_glm = fit_warm(&x, &y, n, p, &glm, &none, Some(&start), &opts);
+    assert!(warm_glm.converged());
+    let d = (warm_glm.dispersion / cold_glm.dispersion - 1.0).abs();
+    assert!(d < 1e-6, "NB GLM θ̂ from a carried seed: rel {d}");
+}
+
+/// The carried φ is per call: a reused workspace that fitted one draw from a
+/// carried φ fits the next draw without one bit for bit as a fresh workspace
+/// does (`gamma_phi_start` is set on every call, never left over).
+#[test]
+fn carried_gamma_dispersion_does_not_leak_across_fit_on_calls() {
+    use super::core::{build_workspace, fit_on};
+    let (x, y, n, p, model, ids, opts) = sim_gamma_glmm(crate::GammaLink::Log);
+    let (sized, ids_s, perm) = spec_sized_from_ids_pub(&model, &ids);
+    let start = StartValues {
+        dispersion: Some(0.3),
+        ..StartValues::default()
+    };
+    let mut reused = build_workspace(&sized, perm, n, p, &opts);
+    let _ = fit_on(&mut reused, &x, &y, &ids_s, Some(&start), &opts)
+        .into_fit(&x, &y, &ids_s, n, p, &model, &opts);
+    let second = fit_on(&mut reused, &x, &y, &ids_s, None, &opts)
+        .into_fit(&x, &y, &ids_s, n, p, &model, &opts);
+    let (sized, _, perm) = spec_sized_from_ids_pub(&model, &ids);
+    let mut fresh = build_workspace(&sized, perm, n, p, &opts);
+    let alone = fit_on(&mut fresh, &x, &y, &ids_s, None, &opts)
+        .into_fit(&x, &y, &ids_s, n, p, &model, &opts);
+    assert_eq!(second.n_eval, alone.n_eval);
+    assert_eq!(second.deviance.to_bits(), alone.deviance.to_bits());
+    assert_eq!(second.dispersion.to_bits(), alone.dispersion.to_bits());
+}
+
+#[test]
+#[should_panic(expected = "StartValues.dispersion must be finite and > 0")]
+fn fit_warm_rejects_a_non_positive_dispersion_start() {
+    let (x, y, n, p, model, ids, opts) = sim_gamma_glmm(crate::GammaLink::Log);
+    let start = StartValues {
+        dispersion: Some(0.0),
+        ..StartValues::default()
+    };
+    let _ = fit_warm(&x, &y, n, p, &model, &ids, Some(&start), &opts);
+}
+
+#[test]
+#[should_panic(expected = "StartValues.beta must be finite")]
+fn fit_warm_rejects_a_non_finite_beta_start() {
+    let (x, y, n, p, model, ids, opts) = sim_gamma_glmm(crate::GammaLink::Log);
+    let mut beta = vec![0.0; p];
+    beta[0] = f64::NAN;
+    let start = StartValues {
+        beta,
+        ..StartValues::default()
+    };
+    let _ = fit_warm(&x, &y, n, p, &model, &ids, Some(&start), &opts);
+}
+
+#[test]
+#[should_panic(expected = "StartValues.theta must be finite")]
+fn fit_warm_rejects_a_non_finite_theta_start() {
+    let (x, y, n, p, model, ids, opts) = sim_gamma_glmm(crate::GammaLink::Log);
+    let start = StartValues {
+        theta: vec![f64::INFINITY; theta_width(model.re.as_ref())],
+        ..StartValues::default()
+    };
+    let _ = fit_warm(&x, &y, n, p, &model, &ids, Some(&start), &opts);
+}
+
+/// `FitView::dispersion_start` is the value a warm loop carries into the next
+/// draw: φ̂ on a Gamma GLMM (not `FitView::dispersion`, which is `D̂[0][0]`
+/// there) and θ̂_NB on the NB GLMM, each `Fit::dispersion` bit for bit.
+#[test]
+fn fit_view_dispersion_start_is_the_fit_dispersion() {
+    use super::core::{build_workspace, fit_on};
+    let (x, y, n, p, model, ids, opts) = sim_gamma_glmm(crate::GammaLink::Log);
+    let (sized, ids_s, perm) = spec_sized_from_ids_pub(&model, &ids);
+    let mut ws = build_workspace(&sized, perm, n, p, &opts);
+    let view = fit_on(&mut ws, &x, &y, &ids_s, None, &opts);
+    let carried = view.dispersion_start();
+    let fit = view.into_fit(&x, &y, &ids_s, n, p, &model, &opts);
+    assert_eq!(carried.map(f64::to_bits), Some(fit.dispersion.to_bits()));
+
+    let (x, y, model, ids) = nb_log_four_cluster_design(3, 24, 0);
+    let (n, p) = (y.len(), 2usize);
+    let opts = FitOptions {
+        target_indices: vec![0, 1],
+        ..FitOptions::default()
+    };
+    let (sized, ids_s, perm) = spec_sized_from_ids_pub(&model, &ids);
+    let mut ws = build_workspace(&sized, perm, n, p, &opts);
+    let view = fit_on(&mut ws, &x, &y, &ids_s, None, &opts);
+    let carried = view.dispersion_start();
+    let fit = view.into_fit(&x, &y, &ids_s, n, p, &model, &opts);
+    assert_eq!(carried.map(f64::to_bits), Some(fit.dispersion.to_bits()));
+}
+
+/// `nobs` is the row count and `objective` the quadrature that ran: Laplace at
+/// `nagq = 1`, AGQ on 7 nodes at `nagq = 7`, on a fitted model and on the
+/// degenerate `n == p` return alike.
+#[test]
+fn glmm_fit_reports_nobs_and_its_quadrature() {
+    let (x, y, w, cluster_ids, n) = cbpp_design_aggregated();
+    let ids = GroupIds {
+        primary: cluster_ids,
+        extra: vec![],
+    };
+    let (nd, pd) = (4, 4);
+    let xd: Vec<f64> = (0..nd * pd)
+        .map(|t| if t % pd <= t / pd { 1.0 } else { 0.0 })
+        .collect();
+    let ids_d = GroupIds {
+        primary: vec![0, 1, 0, 1],
+        extra: vec![],
+    };
+    for (nagq, want) in [(1, Objective::Laplace), (7, Objective::Agq { nodes: 7 })] {
+        let opts = FitOptions {
+            target_indices: vec![0, 1, 2, 3],
+            nagq,
+            weights: Some(w.clone()),
+            ..FitOptions::default()
+        };
+        let f = fit_cold(&x, &y, n, 4, &cbpp_model(), &ids, &opts);
+        assert!(f.converged(), "nagq {nagq}");
+        assert_eq!((f.nobs, f.objective), (n, want), "nagq {nagq}");
+        let opts_d = FitOptions {
+            nagq,
+            ..FitOptions::default()
+        };
+        let d = fit_cold(&xd, &[1.0; 4], nd, pd, &cbpp_model(), &ids_d, &opts_d);
+        assert!(!d.converged(), "n == p, nagq {nagq}");
+        assert_eq!((d.nobs, d.objective), (nd, want), "n == p, nagq {nagq}");
+    }
+}
+
+/// A Gamma inverse-link GLMM whose search runs on y/c with c = 2⁻¹¹
+/// (`gamma_inverse_units`): `y ~ 1 + (1 | g)`, 6 groups of 10, group means
+/// `1/(1 + 1e4·k/5)`. Its random-effect SD is about 3400 in y's units and
+/// under 2 in the search's, so the fit is interior and carries no
+/// [`Note::VarianceAtLimit`]: the θ limit applies in the search's units.
+#[test]
+fn gamma_inverse_theta_is_checked_against_the_limit_in_search_units() {
+    let (mut y, mut g) = (Vec::new(), Vec::new());
+    for k in 0..6u32 {
+        let mu = 1.0 / (1.0 + 1e4 * f64::from(k) / 5.0);
+        for j in 0..10u32 {
+            y.push(mu * (1.0 + 0.05 * (f64::from((j * 7) % 5) - 2.0)));
+            g.push(k);
+        }
+    }
+    let n = y.len();
+    let model = ModelSpec {
+        family: Family::Gamma {
+            link: crate::GammaLink::Inverse,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 6 },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: g,
+        extra: vec![],
+    };
+    let opts = FitOptions {
+        target_indices: vec![0],
+        ..FitOptions::default()
+    };
+    let f = fit_cold(&vec![1.0; n], &y, n, 1, &model, &ids, &opts);
+    assert!(f.converged());
+    assert!(f.tau2[0].sqrt() > 1e3, "tau2 = {:?}", f.tau2);
+    assert_eq!(f.diagnostics.boundary, Boundary::Interior);
+    assert!(
+        !f.diagnostics
+            .notes
+            .iter()
+            .any(|n| matches!(n, Note::VarianceAtLimit)),
+        "notes: {:?}",
+        f.diagnostics.notes
+    );
+}
+
+/// `y ~ 1 + (1 | g)`, logit, 4 groups of 4 rows with y = 0, 1, 0, 1 in each
+/// and a group offset of +a, −a, +a, −a. The random effects cancel the offset,
+/// so θ̂ = τ̂ ≈ a: at a = 1500 the optimum lies past `crate::lmm::THETA_HI`
+/// (1000) and the search ends on the limit, which is reported with a note; at
+/// a = 600 it is interior. On the Laplace and the AGQ route.
+#[test]
+fn glmm_theta_on_its_upper_limit_is_reported_not_interior() {
+    let model = ModelSpec {
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        re: Some(ReStructure {
+            sizing: Sizing::FixedClusters { n_clusters: 4 },
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let g: Vec<u32> = (0..16).map(|i| i / 4).collect();
+    let y: Vec<f64> = (0..16).map(|i| f64::from(i % 2)).collect();
+    let ids = GroupIds {
+        primary: g.clone(),
+        extra: vec![],
+    };
+    for nagq in [1, 7] {
+        for (a, boundary, at_limit) in [
+            (1500.0, Boundary::UpperLimit, true),
+            (600.0, Boundary::Interior, false),
+        ] {
+            let opts = FitOptions {
+                target_indices: vec![0],
+                nagq,
+                offset: Some(g.iter().map(|&c| if c % 2 == 0 { a } else { -a }).collect()),
+                ..FitOptions::default()
+            };
+            let f = fit_cold(&[1.0; 16], &y, 16, 1, &model, &ids, &opts);
+            let sd = f.tau2[0].sqrt();
+            let what = format!("nagq {nagq}, a = {a}");
+            assert!(f.converged(), "{what}");
+            assert!(
+                (sd - a.min(crate::lmm::THETA_HI)).abs() < 1e-3 * a,
+                "{what}: sd = {sd}"
+            );
+            assert_eq!(f.diagnostics.boundary, boundary, "{what}");
+            assert_eq!(
+                f.diagnostics
+                    .notes
+                    .iter()
+                    .any(|n| matches!(n, Note::VarianceAtLimit)),
+                at_limit,
+                "{what}: notes {:?}",
+                f.diagnostics.notes
+            );
+        }
+    }
+}
