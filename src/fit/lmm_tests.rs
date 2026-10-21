@@ -2881,6 +2881,27 @@ fn curvature_hint_results_do_not_depend_on_call_order() {
     );
 }
 
+/// An LMM hint (the finite-difference path, whose inverse Hessian need not be
+/// bit-symmetric) rebuilds from its parts bit for bit.
+#[test]
+fn curvature_hint_rebuilds_from_its_parts() {
+    use super::core::curvature_hint;
+    let (x, y, n, p, model, ids) = sleepstudy_slope_design();
+    let opts = FitOptions::default();
+    let (sized, sized_ids, perm) = spec_sized_from_ids_pub(&model, &ids);
+    let mut ws = build_workspace(&sized, perm, n, p, &opts);
+    let _ = fit_on(&mut ws, &x, &y, &sized_ids, None, &opts);
+    let hint = curvature_hint(&mut ws).expect("sleepstudy takes the gradient route");
+    let rebuilt =
+        crate::optim::CurvatureHint::from_parts(hint.dim(), hint.inv_hessian(), hint.units())
+            .expect("a hint's own parts are accepted");
+    let bits = |h: &crate::optim::CurvatureHint| {
+        let m: Vec<u64> = h.inv_hessian().iter().map(|v| v.to_bits()).collect();
+        (h.dim(), h.units().to_bits(), m)
+    };
+    assert_eq!(bits(&rebuilt), bits(&hint));
+}
+
 /// The hint only changes the search path: a hinted fit reaches the unhinted
 /// fit's optimum.
 #[test]

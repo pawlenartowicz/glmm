@@ -10088,6 +10088,46 @@ fn gradient_route_keeps_bobyqa_at_the_agq_gate_thresholds() {
     }
 }
 
+/// A warm Laplace fit with no random-slope block takes the gradient route at
+/// any rows per primary level: on a logit fit with 8 primary levels and a
+/// 6-level crossed grouping (two scalar θ, the structured layout), from
+/// θ₀ = 0.5 at 50 and 200 rows per level, each fit routes, converges, and
+/// ends at or below the BOBYQA plan's deviance from the same start within
+/// `1e-6`.
+#[test]
+fn gradient_route_takes_warm_laplace_fits_at_any_rows_per_level() {
+    let nc = 8usize;
+    let theta0 = [0.5, 0.5];
+    for per in [50usize, 200] {
+        let start = Some(&theta0[..]);
+        let build = || {
+            let (x, y, ids, extra_ids, spec) = glmm_extras_q1_dataset_sized(0, 6, nc, per * nc);
+            let n = y.len();
+            let mut ws = GlmmWorkspace::for_cluster_spec(2, &spec, n, &[], 1);
+            ws.pattern.structured_schur =
+                super::workspace::StructuredSchur::new(&ws.groupings, &ids, &extra_ids, n);
+            (ws, x, y, ids, extra_ids, n)
+        };
+        let label = format!("{per} rows per level");
+        let (mut ws, x, y, ids, extra_ids, n) = build();
+        assert_eq!(ws.n_theta, 2, "{label}: two scalar θ");
+        assert_eq!(ws.layout, GlmmLayout::Structured, "{label}: layout");
+        let beta0 = vec![0.0; 2];
+        let f = gate_fit(&mut ws, x.as_ref(), &y, &ids, &extra_ids, start, &beta0, n);
+        assert!(ws.grad_report.is_some(), "{label}: did not route");
+        assert!(f.converged, "{label}: not converged");
+        let (mut wb, ..) = build();
+        wb.route_plan = crate::optim::RoutePlan::BOBYQA;
+        let b = gate_fit(&mut wb, x.as_ref(), &y, &ids, &extra_ids, start, &beta0, n);
+        assert!(
+            f.deviance <= b.deviance + 1e-6,
+            "{label}: gradient route {} vs BOBYQA {}",
+            f.deviance,
+            b.deviance
+        );
+    }
+}
+
 /// The hand-over rung: an iteration cap of 2 ends the gradient search on
 /// `MaxIter`, the BOBYQA route finishes from its incumbent, the fit converges
 /// at the BOBYQA route's optimum within `1e-6`, and the fallback is recorded
@@ -10204,6 +10244,313 @@ fn gradient_route_seeds_ln_phi_on_the_inverse_link_only() {
                 }
             }
         }
+    }
+}
+
+/// The β information the gradient search whitens by on a Laplace fit on the
+/// opt-in,
+/// recomputed outside the fit: one `ProfilePql` solve at `[θ₀ | β₀]` from
+/// `û = 0`, factored by `BetaScale::set_info`, beside the design whitening
+/// `BetaScale::set`. Returns `(info, set)`. φ is 1 (no Gamma here).
+#[allow(clippy::too_many_arguments)]
+fn start_whitenings(
+    ws: &mut GlmmWorkspace,
+    x: MatRef<f64>,
+    y: &[f64],
+    ids: &[u32],
+    extra_ids: &[Vec<u32>],
+    theta0: &[f64],
+    beta0: &[f64],
+    n: usize,
+) -> (BetaScale, BetaScale) {
+    let (nt, p) = (ws.n_theta, ws.p);
+    ws.params[..nt].copy_from_slice(theta0);
+    ws.params[nt..nt + p].copy_from_slice(beta0);
+    ws.beta_prof[..p].copy_from_slice(beta0);
+    ws.pirls.u.fill(0.0);
+    let mut c = EvalCounters::new();
+    let dev = laplace_deviance_ws(ws, x, y, ids, extra_ids, n, BetaMode::ProfilePql, &mut c);
+    assert!(dev.is_finite(), "the start's ProfilePql solve");
+    let sw: f64 = ws.prior_w[..n].iter().sum();
+    let mut info = BetaScale::new(p, ws.params.len());
+    assert!(
+        info.set_info(ws.border.schur.as_mut(), sw),
+        "set_info refused"
+    );
+    let mut set = BetaScale::new(p, ws.params.len());
+    set.set(x, &ws.prior_w[..n], n);
+    (info, set)
+}
+
+/// On a routed Laplace fit on the opt-in (`beta_info_scaling`) without a
+/// hint, the search runs on β̃ whitened by the β information at its start and seeds every β̃ entry with
+/// `1/(2·Σ prior weight)`, cold and warm. With an iteration cap of 0 the
+/// search ends at its start, so `ws.bfgs` holds the start inverse Hessian:
+/// θ's and an unseeded ψ's entries are the identity's, the β̃ entries the
+/// seed, every other entry 0. Cells: a blocked logit random slope, a
+/// structured Poisson fit with a crossed grouping, and a weighted Gamma/log
+/// random slope with an offset (free φ, ψ unseeded). On the logit and
+/// Poisson cells the map the fit keeps for its curvature hint,
+/// `T = L_setᵀ·L_info⁻ᵀ`, takes `L_infoᵀβ` to `L_setᵀβ` for a recomputed
+/// information whitening at the start (`start_whitenings`): cold from the
+/// blind θ₀ and β₀, warm from the BOBYQA optimum's θ (which the start guard
+/// keeps) and the guard's profiled β.
+#[test]
+#[allow(clippy::type_complexity)]
+fn gradient_route_whitens_beta_by_its_information() {
+    let logit = Family::Binomial {
+        link: BinomialLink::Logit,
+    };
+    let poisson = Family::Poisson {
+        link: PoissonLink::Log,
+    };
+    let mut cells: Vec<(
+        String,
+        GlmmWorkspace,
+        Mat<f64>,
+        Vec<f64>,
+        Vec<u32>,
+        Vec<Vec<u32>>,
+        Vec<f64>,
+    )> = Vec::new();
+    let (ws, x, y, ids, p, _) = fixture(logit, "q2s");
+    cells.push(("logit q2s".into(), ws, x, y, ids, Vec::new(), vec![0.0; p]));
+    let (mut ws, x, y, ids, extra_ids, p, n) = extras_fixture(poisson, 0, 6);
+    ws.pattern.structured_schur =
+        super::workspace::StructuredSchur::new(&ws.groupings, &ids, &extra_ids, n);
+    cells.push((
+        "Poisson crossed6".into(),
+        ws,
+        x,
+        y,
+        ids,
+        extra_ids,
+        vec![0.0; p],
+    ));
+    let (ws, x, y, ids, extra_ids, _, _, rng) = gamma_gate_cell(GammaLink::Log, "q2s", 0, 0, true);
+    cells.push((
+        "Gamma/log q2s weighted".into(),
+        ws,
+        x,
+        y,
+        ids,
+        extra_ids,
+        rng.beta,
+    ));
+    let mut checked = 0usize;
+    for (name, mut ws, x, y, ids, extra_ids, beta0) in cells {
+        ws.beta_info_scaling = true;
+        let n = y.len();
+        let (nt, p) = (ws.n_theta, ws.p);
+        let gamma = matches!(ws.family, Family::Gamma { .. });
+        let plan = ws.route_plan;
+        ws.route_plan = crate::optim::RoutePlan::BOBYQA;
+        let _ = gate_fit(&mut ws, x.as_ref(), &y, &ids, &extra_ids, None, &beta0, n);
+        let theta_hat = ws.params[..nt].to_vec();
+        ws.route_plan = plan;
+        ws.grad_cfg.max_iter = 0;
+        let mut blind = vec![0.0; nt];
+        for &i in ws.groupings.diagonal_theta() {
+            blind[i] = THETA0;
+        }
+        for warm in [false, true] {
+            let label = format!("{name}, warm {warm}");
+            let start = warm.then_some(&theta_hat[..]);
+            let _ = gate_fit(&mut ws, x.as_ref(), &y, &ids, &extra_ids, start, &beta0, n);
+            let (stop, ..) = ws.grad_report.expect("routed");
+            assert_eq!(stop, crate::optim::bfgs::BfgsStop::MaxIter, "{label}");
+            assert!(ws.grad_beta_info, "{label}: not information-whitened");
+            let m = nt + p + usize::from(gamma);
+            let h = ws.bfgs.inv_hessian().to_vec();
+            assert_eq!(h.len(), m * m, "{label}");
+            let seed = 1.0 / (2.0 * ws.prior_w[..n].iter().sum::<f64>());
+            for i in 0..m {
+                for j in 0..m {
+                    let want = if i != j {
+                        0.0
+                    } else if (nt..nt + p).contains(&i) {
+                        seed
+                    } else {
+                        1.0
+                    };
+                    assert_eq!(h[i * m + j], want, "{label}: H[{i},{j}]");
+                }
+            }
+            if gamma {
+                continue;
+            }
+            let t = ws.grad_beta_map[..p * p].to_vec();
+            let (theta0, b0) = if warm {
+                // The warm θ₀ as `fit_glmm` floors it.
+                let mut t0 = theta_hat.clone();
+                for &i in ws.groupings.diagonal_theta() {
+                    t0[i] = t0[i].max(THETA_TRUTH_FLOOR);
+                }
+                (t0, ws.guard_beta[..p].to_vec())
+            } else {
+                (blind.clone(), beta0.clone())
+            };
+            let (info, set) =
+                start_whitenings(&mut ws, x.as_ref(), &y, &ids, &extra_ids, &theta0, &b0, n);
+            for k in 0..3 {
+                let b: Vec<f64> = (0..p)
+                    .map(|j| ((k * p + j) as f64 * 0.7).sin() + 0.2)
+                    .collect();
+                let mut bi = b.clone();
+                info.to_search(&mut bi);
+                let mut bs = b.clone();
+                set.to_search(&mut bs);
+                for r in 0..p {
+                    let got: f64 = (0..p).map(|c| t[r * p + c] * bi[c]).sum();
+                    assert!(
+                        (got - bs[r]).abs() <= 1e-10 * bs[r].abs().max(1.0),
+                        "{label}: T·L_infoᵀβ {got} vs L_setᵀβ {}",
+                        bs[r]
+                    );
+                }
+            }
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 4, "map checks run");
+}
+
+/// A routed fit without the opt-in (`beta_info_scaling`) keeps the design
+/// whitening and the identity start: a logit random slope. On the opt-in, a
+/// fit whose start solve or `set_info` fails keeps them too: the same shape
+/// with one more fixed-effect column of zeros, whose β information is
+/// singular. So do AGQ and hinted fits on the opt-in: a 7-node logit AGQ
+/// random intercept starts from the identity, and a hinted logit random
+/// slope from the hint itself, bit for bit. Every fit here has an iteration
+/// cap of 0, so `ws.bfgs` holds the start inverse Hessian.
+#[test]
+fn gradient_route_keeps_the_design_whitening_by_default_and_on_fallback_agq_and_hinted_fits() {
+    let logit = Family::Binomial {
+        link: BinomialLink::Logit,
+    };
+    let identity = |ws: &GlmmWorkspace, label: &str| {
+        assert!(!ws.grad_beta_info, "{label}: information-whitened");
+        let h = ws.bfgs.inv_hessian();
+        let m = ws.n_theta + ws.p;
+        assert_eq!(h.len(), m * m, "{label}");
+        for i in 0..m {
+            for j in 0..m {
+                assert_eq!(
+                    h[i * m + j],
+                    f64::from(u8::from(i == j)),
+                    "{label}: H[{i},{j}]"
+                );
+            }
+        }
+    };
+    let (mut ws, x, y, ids, p, n) = fixture(logit, "q2s");
+    ws.grad_cfg.max_iter = 0;
+    let _ = gate_fit(&mut ws, x.as_ref(), &y, &ids, &[], None, &vec![0.0; p], n);
+    assert!(ws.grad_report.is_some(), "default: did not route");
+    identity(&ws, "default");
+    let (mut ws, mut x, y, ids, p, n) = fixture_padded(logit, "q2s", 1);
+    for i in 0..n {
+        x[(i, p - 1)] = 0.0;
+    }
+    ws.beta_info_scaling = true;
+    ws.grad_cfg.max_iter = 0;
+    let _ = gate_fit(&mut ws, x.as_ref(), &y, &ids, &[], None, &vec![0.0; p], n);
+    assert!(ws.grad_report.is_some(), "zero column: did not route");
+    identity(&ws, "zero column");
+    let (mut ws, x, y, ids, p, n) = fixture_with_nagq(logit, "int1", 7);
+    ws.beta_info_scaling = true;
+    ws.grad_cfg.max_iter = 0;
+    let _ = gate_fit(&mut ws, x.as_ref(), &y, &ids, &[], None, &vec![0.0; p], n);
+    assert!(ws.grad_report.is_some(), "AGQ: did not route");
+    identity(&ws, "AGQ");
+    let (mut pilot, x, y, ids, p, n) = fixture(logit, "q2s");
+    let beta0 = vec![0.0; p];
+    let _ = gate_fit(&mut pilot, x.as_ref(), &y, &ids, &[], None, &beta0, n);
+    let hint = super::glmm_curvature_hint(&pilot).expect("a routed pilot offers a hint");
+    let (mut ws, ..) = fixture(logit, "q2s");
+    ws.beta_info_scaling = true;
+    ws.grad_cfg.max_iter = 0;
+    ws.grad_hint_in = Some(hint.clone());
+    let _ = gate_fit(&mut ws, x.as_ref(), &y, &ids, &[], None, &beta0, n);
+    assert!(!ws.grad_beta_info, "hinted: information-whitened");
+    let got: Vec<u64> = ws.bfgs.inv_hessian().iter().map(|v| v.to_bits()).collect();
+    let want: Vec<u64> = hint.inv_hessian().iter().map(|v| v.to_bits()).collect();
+    assert_eq!(got, want, "hinted: the start is not the hint");
+}
+
+/// The curvature hint after an information-whitened search is that search's
+/// estimate in the design whitening's coordinates: for gradients `g` in the
+/// caller's units, `gᵀHg` with `g` mapped by `L_set⁻¹` and the hint equals
+/// `gᵀHg` with `g` mapped by `L_info⁻¹` and the search's own estimate
+/// (relative 1e-9), on θ-only, β-only and mixed `g`; and a hinted refit of
+/// the same data converges at the pilot's deviance within `1e-6`. On the
+/// cold logit random slope and the structured Poisson crossed fit.
+#[test]
+#[allow(clippy::type_complexity)]
+fn gradient_route_curvature_hint_is_in_the_design_coordinates() {
+    let logit = Family::Binomial {
+        link: BinomialLink::Logit,
+    };
+    let poisson = Family::Poisson {
+        link: PoissonLink::Log,
+    };
+    let mut cells: Vec<(
+        &str,
+        GlmmWorkspace,
+        Mat<f64>,
+        Vec<f64>,
+        Vec<u32>,
+        Vec<Vec<u32>>,
+    )> = Vec::new();
+    let (ws, x, y, ids, ..) = fixture(logit, "q2s");
+    cells.push(("logit q2s", ws, x, y, ids, Vec::new()));
+    let (mut ws, x, y, ids, extra_ids, _, n) = extras_fixture(poisson, 0, 6);
+    ws.pattern.structured_schur =
+        super::workspace::StructuredSchur::new(&ws.groupings, &ids, &extra_ids, n);
+    cells.push(("Poisson crossed6", ws, x, y, ids, extra_ids));
+    for (name, mut ws, x, y, ids, extra_ids) in cells {
+        ws.beta_info_scaling = true;
+        let n = y.len();
+        let (nt, p) = (ws.n_theta, ws.p);
+        let m = nt + p;
+        let beta0 = vec![0.0; p];
+        let pilot = gate_fit(&mut ws, x.as_ref(), &y, &ids, &extra_ids, None, &beta0, n);
+        assert!(ws.grad_beta_info, "{name}: not information-whitened");
+        let hint = super::glmm_curvature_hint(&ws).expect("a routed pilot offers a hint");
+        let h_search = ws.bfgs.inv_hessian().to_vec();
+        let mut blind = vec![0.0; nt];
+        for &i in ws.groupings.diagonal_theta() {
+            blind[i] = THETA0;
+        }
+        let (info, set) =
+            start_whitenings(&mut ws, x.as_ref(), &y, &ids, &extra_ids, &blind, &beta0, n);
+        let quad = |h: &[f64], g: &[f64]| -> f64 {
+            (0..m)
+                .map(|i| (0..m).map(|j| g[i] * h[i * m + j] * g[j]).sum::<f64>())
+                .sum()
+        };
+        for (kind, th, be) in [("θ", 1.0, 0.0), ("β", 0.0, 1.0), ("mixed", 1.0, 1.0)] {
+            let g: Vec<f64> = (0..m)
+                .map(|i| (if i < nt { th } else { be }) * ((i as f64) * 1.3 + 0.4).cos())
+                .collect();
+            let (mut gs, mut gi) = (g.clone(), g.clone());
+            set.to_search_row(&mut gs[nt..]);
+            info.to_search_row(&mut gi[nt..]);
+            let (a, b) = (quad(hint.inv_hessian(), &gs), quad(&h_search, &gi));
+            assert!(
+                (a - b).abs() <= 1e-9 * b.abs(),
+                "{name} {kind}: hint {a} vs search {b}"
+            );
+        }
+        ws.grad_hint_in = Some(hint);
+        let refit = gate_fit(&mut ws, x.as_ref(), &y, &ids, &extra_ids, None, &beta0, n);
+        assert!(refit.converged, "{name}: hinted refit not converged");
+        assert!(
+            (refit.deviance - pilot.deviance).abs() <= 1e-6,
+            "{name}: hinted refit {} vs pilot {}",
+            refit.deviance,
+            pilot.deviance
+        );
     }
 }
 

@@ -11,10 +11,10 @@ import glmm
 
 
 def test_module_surface():
-    # `fit`, `Fit`, the tests of `glmm.anova` (`anova`, `compare` and their
-    # three result classes), and the twenty-six warning categories the
-    # diagnostics channel raises; a user has to be able to name them to filter
-    # on them.
+    # `fit`, `Fit`, `model_matrix`, `term_labels`, the tests of `glmm.anova`
+    # (`anova`, `compare` and their three result classes), and the twenty-six
+    # warning categories the diagnostics channel raises; a user has to be able
+    # to name them to filter on them.
     assert glmm.__all__ == [
         "AgqFallbackWarning",
         "ArgumentIgnoredWarning",
@@ -49,11 +49,19 @@ def test_module_surface():
         "anova",
         "compare",
         "fit",
+        "model_matrix",
+        "term_labels",
     ]
     assert issubclass(glmm.IllConditionedWarning, glmm.DiagnosticWarning)
     assert issubclass(glmm.ExactProfileFallbackWarning, glmm.DiagnosticWarning)
     assert issubclass(glmm.DiagnosticWarning, UserWarning)
     assert all(hasattr(glmm, name) for name in glmm.__all__)
+
+
+def test_term_labels_reads_the_formula_alone():
+    assert glmm.term_labels("~ 0 + a*(b + c)") == (["a", "b", "c", "a:b", "a:c"], False)
+    with pytest.raises(ValueError, match="formula syntax error"):
+        glmm.term_labels("y ~ x + (1 | g")
 
 
 def test_fit_signature_matches_spec():

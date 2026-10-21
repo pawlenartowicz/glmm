@@ -453,6 +453,17 @@ pub enum FdHessianStatus {
 /// 3. `n_θ ≥ 2`. One-θ fits stay on `ExactProfile`, which needs 11 to 24
 ///    evaluations there; 30 of 46 such cells were slower with BFGS.
 ///
+/// Without a caller's hint, that search runs on β whitened by the β
+/// information at its start, cold or warm, with every β̃ start entry seeded
+/// at that whitening's curvature (`fit_glmm`'s gradient-route block,
+/// `GradSearch::start_curvature`). Measured 2026-10-20 against the design
+/// whitening and the identity start, BFGS search time (geometric mean) on
+/// generated cells with 30 levels at 5 to 500 rows each was 0.52 cold and
+/// 0.74 from the generating values on Poisson, 0.75 and 0.89 on binomial,
+/// 0.91 and 0.95 on Gamma; on the grid's cells with 2+ θ 0.84 to 1.02 cold
+/// and 0.93 to 0.99 from the generating values, no endpoint more than 1e-6
+/// above the BOBYQA optimum.
+///
 /// And projected BFGS over `[λ | β]` on the fixed-β AGQ objective, with the
 /// exact AGQ gradient off each value evaluation's modes
 /// ([`agq_gradient::assemble`]), when:
@@ -467,11 +478,12 @@ pub enum FdHessianStatus {
 ///    `GRAD_WARM_AGQ_THETA_MIN` (0.05).
 ///
 /// Every other shape keeps its `OuterSearch` route on both start kinds. On
-/// the Laplace shapes the warm member is BFGS too; `fit_glmm` sends a warm fit with no random-slope
-/// block back to BOBYQA when its primary grouping averages 50 rows per level
-/// or more (the one cell over the speed gate, `pois_cross6_g3000p100`, at
-/// 1.46x; below 50 rows per level a scalar warm fit is 0.69 of warm BOBYQA's
-/// search, summed over 32 cells).
+/// the Laplace shapes the warm member is BFGS too, at any rows per level.
+/// Measured 2026-10-20 from the generating values against warm BOBYQA: the
+/// grid's 360 warm cells with 2+ θ at 0.45 of its fit time (geometric
+/// mean), none above 1.25; `pois_cross6_g3000p100` at 0.70 (locked clock);
+/// and on generated cells at 50 to 500 rows per level, summed fit time 0.53
+/// (binomial), 0.62 (Poisson) and 0.28 (Gamma) of it.
 ///
 /// Measured against the BOBYQA route, every endpoint at or below the BOBYQA
 /// optimum within `dev_eps`. Binomial and Poisson (shadow search against
@@ -515,17 +527,41 @@ pub(crate) fn gradient_route_plan(
 
 /// The curvature hint (`loop_advanced::curvature_hint`) after a `fit_glmm` on
 /// `ws`: the last gradient search's final BFGS inverse-Hessian estimate over
-/// `[θ | β̃]`, and `[θ | β̃ | ln φ]` on a free Gamma dispersion, the search's
-/// own coordinates, on a Laplace fit or a covered AGQ one
-/// ([`gradient_route_plan`]). `None` when that fit did not search with BFGS, never
-/// updated its estimate, or left one that is not positive definite. Free: no
-/// evaluation runs.
+/// `[θ | β̃]`, and `[θ | β̃ | ln φ]` on a free Gamma dispersion, on a Laplace
+/// fit or a covered AGQ one ([`gradient_route_plan`]). β̃ is always the
+/// design whitening's (`BetaScale::set`), the coordinates a hinted fit
+/// searches in, which depend on the design alone. A search that ran on β̃
+/// whitened by the β information (`ws.grad_beta_info`) has its estimate
+/// mapped there: with `β̃_set = T·β̃_info` the β̃ block becomes `T·H·Tᵀ`, the
+/// cross blocks `T·H` and `H·Tᵀ`, θ and ψ unchanged. `None` when that fit did
+/// not search with BFGS, never updated its estimate, or left one (after the
+/// map) that is not positive definite. Free: no evaluation runs.
 pub(crate) fn glmm_curvature_hint(ws: &GlmmWorkspace) -> Option<crate::optim::CurvatureHint> {
     if !ws.grad_hint_ready {
         return None;
     }
     let m = grad_search_dim(ws.family, ws.n_theta, ws.p, ws.gamma_phi_held.is_some());
-    crate::optim::CurvatureHint::from_inverse(m, ws.bfgs.inv_hessian(), ws.search_units)
+    let h = ws.bfgs.inv_hessian();
+    if !ws.grad_beta_info {
+        return crate::optim::CurvatureHint::from_inverse(m, h, ws.search_units);
+    }
+    let (nt, p) = (ws.n_theta, ws.p);
+    let t = &ws.grad_beta_map[..p * p];
+    // M·H with M = diag(I, T, I): the β̃ rows mix.
+    let mut a = h.to_vec();
+    for r in 0..p {
+        for c in 0..m {
+            a[(nt + r) * m + c] = (0..p).map(|k| t[r * p + k] * h[(nt + k) * m + c]).sum();
+        }
+    }
+    // (M·H)·Mᵀ: the β̃ columns mix.
+    let mut mapped = a.clone();
+    for r in 0..m {
+        for c in 0..p {
+            mapped[r * m + nt + c] = (0..p).map(|k| a[r * m + nt + k] * t[c * p + k]).sum();
+        }
+    }
+    crate::optim::CurvatureHint::from_inverse(m, &mapped, ws.search_units)
 }
 
 /// The gradient search's dimension: `[θ | β̃]`, and `[θ | β̃ | ln φ]` on a
@@ -542,8 +578,8 @@ pub(crate) fn grad_search_dim(
     n_theta + p + usize::from(free_phi)
 }
 
-/// Rows per primary level from which a warm fit with no random-slope block,
-/// and an AGQ fit, go back to BOBYQA (see [`gradient_route_plan`]).
+/// Rows per primary level from which an AGQ fit goes back to BOBYQA (see
+/// [`gradient_route_plan`]).
 const GRAD_WARM_SCALAR_ROWS_MAX: usize = 50;
 
 /// A warm fit whose θ start has a diagonal `|θ|` above this takes the BOBYQA
@@ -591,8 +627,11 @@ const GRAD_ASM_KEEP_BYTES: usize = 4 << 20;
 /// Under a held φ the search runs over `[θ | β̃]` at that φ, and a trailing
 /// slot (the joint polish's inert one) is ignored.
 ///
-/// β is searched whitened, `β̃ = Lᵀβ` (`BetaScale`, the joint BOBYQA search's
-/// map), and the β block of the gradient maps by `L⁻¹`. In the caller's units
+/// β is searched whitened, `β̃ = Lᵀβ` (`BetaScale`), and the β block of the
+/// gradient maps by `L⁻¹`. On a Laplace fit without a caller's hint `L` comes
+/// from the β information at the start (`BetaScale::set_info`, see
+/// `fit_glmm`'s gradient-route block), elsewhere from the design (the joint
+/// BOBYQA search's `BetaScale::set`). In the caller's units
 /// the first step's 0.5 cap is not unit-free: with a slope column scaled by
 /// 1e-3 a logit fit stopped 5.5e-4 above the optimum, certified, where the
 /// whitened search reaches it (test `gradient_route_is_unit_invariant_in_beta`,
@@ -649,6 +688,10 @@ struct GradSearch<'a, 'd> {
     /// `Σ ln yᵢ`, the dispersion term's data constant (`fit_glmm`'s
     /// `gamma_sum_ln_y`); read on a free Gamma dispersion only.
     sum_ln_y: f64,
+    /// Every β̃ entry's start inverse curvature, `1/(2·Σ prior weight)`, when
+    /// β̃ is whitened by the β information (`fit_glmm`'s `grad_beta_info`);
+    /// `None` keeps the identity's entries.
+    beta_inv_curv: Option<f64>,
     k: usize,
     n_theta: usize,
 }
@@ -795,31 +838,46 @@ impl crate::optim::GradObjective for GradSearch<'_, '_> {
         true
     }
 
-    /// On a free Gamma dispersion, `ψ`'s curvature at fixed `ξ = θ·e^{−ψ/2}`:
-    /// from `F = e^{−ψ}·P(ξ, β) + log|A| + Gₚ(ψ)`, `∂²F/∂ψ² = P_φ + Gₚ''(ψ)`
-    /// with `P_φ = e^{−ψ}·P` the last value's `dev + pen` (`pirls.pen_dev`).
-    /// The search's start inverse Hessian takes its inverse as `ψ`'s entry:
-    /// the identity's unit entry would treat ψ like θ, while `P_φ` is of
-    /// order n. Inverse link only: on the log link the seed costs warm starts
-    /// more evaluations than it saves cold ones (measured on the grid's routed
-    /// Gamma/log cells), so the search starts from the identity there.
-    fn start_curvature(&self) -> Option<(usize, f64)> {
+    /// The start inverse Hessian's seeded entries; every other entry, θ's
+    /// included (its curvatures are tens), is the identity's.
+    ///
+    /// β̃, when it is whitened by the β information (`beta_inv_curv`): every
+    /// entry `1/(2·Σ prior weight)`, the curvature `set_info` gives each β̃
+    /// axis. The driver keeps these entries out of Shanno's rescaling:
+    /// rescaled from the first secant pair, β̃ ended fits certified up to
+    /// 1.8e-4 above the optimum, the decrement `½·gᵀHg` too small (measured
+    /// 2026-10-20).
+    ///
+    /// ψ, on a free Gamma dispersion: its curvature at fixed
+    /// `ξ = θ·e^{−ψ/2}`. From `F = e^{−ψ}·P(ξ, β) + log|A| + Gₚ(ψ)`,
+    /// `∂²F/∂ψ² = P_φ + Gₚ''(ψ)` with `P_φ = e^{−ψ}·P` the last value's
+    /// `dev + pen` (`pirls.pen_dev`), of order n; the entry is its inverse.
+    /// Inverse link only: on the log link the seed costs warm starts more
+    /// evaluations than it saves cold ones (measured on the grid's routed
+    /// Gamma/log cells), so ψ keeps the identity's entry there.
+    fn start_curvature(&self, inv_curv: &mut [f64]) {
+        let d = self.data;
+        let q = self.n_theta + d.p;
+        if let Some(v) = self.beta_inv_curv {
+            inv_curv[self.n_theta..q].fill(v);
+        }
         let inverse = matches!(
-            self.data.family,
+            d.family,
             crate::Family::Gamma {
                 link: crate::GammaLink::Inverse
             }
         );
         if !self.free_phi || !inverse {
-            return None;
+            return;
         }
-        let d = self.data;
         let c = crate::family::gamma_dispersion_term_d2(
             self.ln_phi,
             d.weighted.then_some(d.prior_w),
             d.n,
         ) + self.pirls.pen_dev;
-        (c > 0.0 && c.is_finite()).then(|| (self.n_theta + d.p, 1.0 / c))
+        if c > 0.0 && c.is_finite() {
+            inv_curv[q] = 1.0 / c;
+        }
     }
 }
 
@@ -1135,11 +1193,10 @@ pub fn fit_glmm(
     // never `ExactProfile` again self-limits the retry to one.
     let mut route = ws.outer_search;
     // The gradient route (`gradient_route_plan`): BFGS over `[θ | β]` on this
-    // fit's start kind, a warm fit with no random-slope block and an AGQ fit
-    // only below `GRAD_WARM_SCALAR_ROWS_MAX` rows per primary level, and a warm
-    // AGQ fit only from a start with every diagonal θ₀ at or above
-    // `GRAD_WARM_AGQ_THETA_MIN`. A warm start at the blind θ₀ is a cold fit
-    // here, as it is for the start guard.
+    // fit's start kind, an AGQ fit only below `GRAD_WARM_SCALAR_ROWS_MAX` rows
+    // per primary level, and a warm AGQ fit only from a start with every
+    // diagonal θ₀ at or above `GRAD_WARM_AGQ_THETA_MIN`. A warm start at the
+    // blind θ₀ is a cold fit here, as it is for the start guard.
     let grad_route = {
         use crate::optim::OuterOptimizer;
         let g = &ws.groupings;
@@ -1148,7 +1205,6 @@ pub fn fit_glmm(
         } else {
             ws.route_plan.cold
         };
-        let slope_block = g.primary_q >= 2 || g.extra_q.iter().any(|&q| q >= 2);
         let near_start = g
             .diagonal_theta()
             .iter()
@@ -1160,7 +1216,7 @@ pub fn fit_glmm(
             .all(|&i| ws.params[i] >= GRAD_WARM_AGQ_THETA_MIN);
         opt == OuterOptimizer::Bfgs
             && (nagq == 1 || few_rows)
-            && (!guard_warm || (near_start && (slope_block || few_rows)))
+            && (!guard_warm || near_start)
             && (nagq == 1 || !guard_warm || off_zero)
     };
     debug_assert!(
@@ -1226,6 +1282,9 @@ pub fn fit_glmm(
         grad_cfg,
         grad_report,
         grad_hint_ready,
+        beta_info_scaling,
+        grad_beta_info,
+        grad_beta_map,
         grad_asm,
         grad_scratch,
         gradient_search_fallback,
@@ -1331,19 +1390,37 @@ pub fn fit_glmm(
     // 1009 such fits are the cold fit bit for bit). The cache is consumed
     // once, so the `PqlThenJoint` retry re-solves its start. On a warm fit
     // with a stage 1 the guard costs one Laplace-deviance solve over a cold
-    // fit on a hit and two on a miss; on the `Joint` route it costs two; all
-    // outside the reported `n_eval`.
+    // fit on a hit and two on a miss; on the `Joint` route it costs two; on
+    // the gradient route's Laplace fits it costs one PQL solve when the warm
+    // start is kept and two when it is not (below); all outside the reported
+    // `n_eval`.
     let mut guard_cache: Option<(f64, u32)> = None;
+    // The guard left the picked start's profiled β̂ in `guard_beta`.
+    let mut guard_beta_kept = false;
+    // The guard's last solve was the kept warm start's `ProfilePql` solve, so
+    // `border` already holds the gradient route's β information (below).
+    let mut info_border_ready = false;
     if guard_warm {
         let disp_coord = if n_disp == 1 { params[nb_col] } else { 0.0 };
-        // The gradient route keeps its shape's own guard (the exact profile):
-        // comparing the starts on the fixed-β objective at β₀ kept a θ₀ on
-        // the box bound that the profile rejects (`far_warm_start_scan`,
-        // logit crossed seed 9, θ₀ = THETA_HI). It then starts from the
+        // The gradient route on a Laplace fit compares the starts on the PQL
+        // profile, not on its shape's stage-1 mode. It has no stage 1 to hand
+        // a solve over to. On 3,370 such warm fits (grid, stress and sweep
+        // cells, 2026-10-20) the PQL profile picked the same start as the
+        // exact profile on all but 4, whose fitted deviances moved by at most
+        // 2e-10; no other fit's deviance moved by more than 1e-6.
+        // On the β-information opt-in, the kept warm start's solve doubles as
+        // the β-information solve (below). The fixed-β objective at β₀ is not enough: it kept a θ₀ on
+        // the box bound that the profile rejects (`far_warm_start_scan`, logit
+        // crossed seed 9, θ₀ = THETA_HI). The route then starts from the
         // guard's profiled β̂ at the chosen θ. On AGQ (no stage 1) the guard
         // compares on the fixed-β AGQ objective at β₀ and keeps no
         // `guard_cache`, so the gradient route starts from β₀ at the guard's θ.
-        let guard_mode = stage1_mode.unwrap_or(BetaMode::Fixed);
+        let pql_guard = grad_route && nagq == 1;
+        let guard_mode = if pql_guard {
+            BetaMode::ProfilePql
+        } else {
+            stage1_mode.unwrap_or(BetaMode::Fixed)
+        };
         let cacheable = guard_mode != BetaMode::Fixed;
         // `laplace_deviance`'s Fixed mode reads β off `params[n_theta..n_theta
         // + p]` itself (see its doc), not off the `beta` argument's incoming
@@ -1409,29 +1486,55 @@ pub fn fit_glmm(
             };
             (obj, guard_exhausted, exact_prof.curv_memory)
         };
-        let (warm_obj, warm_exh, warm_mem) = eval_guard(combined, cacheable);
         // The blind cold θ: the same point the `None` arm above builds.
         // Mirrors the `None` arm and the warm arm's `blind` closure; change
         // together.
-        combined[..n_theta].fill(0.0);
-        for &i in groupings.diagonal_theta() {
-            combined[i] = THETA0;
-        }
-        let (cold_obj, cold_exh, cold_mem) = eval_guard(combined, false);
-        let (obj, exhausted, memory) = if !warm_obj.is_finite() || cold_obj <= warm_obj {
-            params[..n_theta].copy_from_slice(&combined[..n_theta]);
-            if cacheable {
-                guard_u[..k].copy_from_slice(&pirls.u[..k]);
-                guard_beta[..p].copy_from_slice(&beta_prof[..p]);
+        let set_blind = |theta: &mut [f64]| {
+            theta.fill(0.0);
+            for &i in groupings.diagonal_theta() {
+                theta[i] = THETA0;
             }
-            (cold_obj, cold_exh, cold_mem)
-        } else {
-            warm_kept = true;
-            (warm_obj, warm_exh, warm_mem)
         };
-        exact_prof.curv_memory = memory;
-        if cacheable {
-            guard_cache = Some((obj, exhausted));
+        if pql_guard {
+            // Blind first, warm last, so a kept warm start leaves its own
+            // border in `border`. The search never takes a guard solve over
+            // here (no `guard_cache`): a BOBYQA fallback's stage 1 may run
+            // the exact profile, and the cache matches on θ alone.
+            set_blind(&mut combined[..n_theta]);
+            let (cold_obj, _, cold_mem) = eval_guard(combined, true);
+            // `params` takes the blind θ, `combined` the caller's θ₀.
+            params[..n_theta].swap_with_slice(&mut combined[..n_theta]);
+            let (warm_obj, _, warm_mem) = eval_guard(combined, false);
+            if !warm_obj.is_finite() || cold_obj <= warm_obj {
+                exact_prof.curv_memory = cold_mem;
+            } else {
+                params[..n_theta].copy_from_slice(&combined[..n_theta]);
+                guard_beta[..p].copy_from_slice(&beta_prof[..p]);
+                exact_prof.curv_memory = warm_mem;
+                warm_kept = true;
+                info_border_ready = true;
+            }
+            guard_beta_kept = true;
+        } else {
+            let (warm_obj, warm_exh, warm_mem) = eval_guard(combined, cacheable);
+            set_blind(&mut combined[..n_theta]);
+            let (cold_obj, cold_exh, cold_mem) = eval_guard(combined, false);
+            let (obj, exhausted, memory) = if !warm_obj.is_finite() || cold_obj <= warm_obj {
+                params[..n_theta].copy_from_slice(&combined[..n_theta]);
+                if cacheable {
+                    guard_u[..k].copy_from_slice(&pirls.u[..k]);
+                    guard_beta[..p].copy_from_slice(&beta_prof[..p]);
+                }
+                (cold_obj, cold_exh, cold_mem)
+            } else {
+                warm_kept = true;
+                (warm_obj, warm_exh, warm_mem)
+            };
+            exact_prof.curv_memory = memory;
+            if cacheable {
+                guard_cache = Some((obj, exhausted));
+                guard_beta_kept = true;
+            }
         }
     }
     // A kept warm θ₀ runs stage 1 at `RHO_BEGIN_WARM` (see that constant's
@@ -1482,7 +1585,7 @@ pub fn fit_glmm(
         let free_phi = is_gamma && held_phi.is_none();
         let m = grad_search_dim(family, n_theta, p, held_phi.is_some());
         debug_assert!((n_disp == 0 || is_gamma) && params.len() == total_dim);
-        if guard_cache.is_some() {
+        if guard_beta_kept {
             // A warm fit: the guard profiled β at the θ it picked.
             params[n_theta..nb_col].copy_from_slice(&guard_beta[..p]);
         }
@@ -1493,7 +1596,96 @@ pub fn fit_glmm(
         let (grad_start, x_last) = grad_scratch.split_at_mut(m);
         grad_start.copy_from_slice(&params[..m]);
         x_last.fill(0.0);
+        // β̃'s whitening. `BetaScale::set` whitens by the design and the
+        // prior weights, which leaves the deviance's curvature along a β̃
+        // axis at about 2·Σ(working weight), except along the coefficients
+        // the random effects absorb: on four measured cells (2026-10-20) the
+        // intercept's was 30 to 77 where 2·Σw was 5,800 to 81,000. So on the
+        // caller's opt-in (`FitWorkspace::set_beta_info_scaling`), on a
+        // Laplace fit without a caller's hint, one `ProfilePql` solve at the
+        // start fills `border.schur` with the β information net of what the
+        // random effects absorb, and `set_info` whitens by it: every β̃ axis
+        // then has curvature about 2·Σ(prior weight), the value
+        // `GradSearch::start_curvature` seeds. The solve starts from the
+        // search's own first modes (`u_seed`) at the start's θ and β, and is
+        // outside `n_eval`, as the start guard's solves are. A kept warm
+        // start skips it: the guard's last solve was `ProfilePql` at this θ
+        // and dispersion, PIRLS from û = 0 and β₀ rather than from `u_seed`
+        // and β̂, so it stopped at the same modes and β̂ within PIRLS
+        // tolerance and its border is the one this solve would leave. A solve
+        // that is not finite, or an information `set_info` refuses, keeps
+        // the design whitening and the identity start. A hinted fit keeps
+        // them too, since its hint is in the design's coordinates; AGQ keeps
+        // them because its seed was not measured on this whitening. It is
+        // off by default because it costs cold fits more than it saves: on
+        // 144 cold fits of data built unlike the accuracy grid it took 21%
+        // more evaluations, against 2% to 6% fewer on warm ones (2026-10-21).
         beta_scale.set(x, &prior_w[..n], n);
+        *grad_beta_info = false;
+        let mut beta_inv_curv = None;
+        if *beta_info_scaling && nagq == 1 && grad_hint.is_none() {
+            let (t, lset) = grad_beta_map.split_at_mut(p * p);
+            // `L_setᵀ` column by column, for the hint map below.
+            for j in 0..p {
+                beta_rhs[..p].fill(0.0);
+                beta_rhs[j] = 1.0;
+                beta_scale.to_search(&mut beta_rhs[..p]);
+                for i in 0..p {
+                    lset[i * p + j] = beta_rhs[i];
+                }
+            }
+            let ((nb, phi), _) = if n_disp == 1 {
+                disp_at(params[nb_col])
+            } else {
+                ((nb_theta, 1.0), None)
+            };
+            beta_prof[..p].copy_from_slice(&params[n_theta..nb_col]);
+            pirls.u[..k].copy_from_slice(&u_seed[..k]);
+            let mut info_exhausted = 0u32;
+            let mut info_counters = crate::counters::EvalCounters::new();
+            // A kept warm start's guard objective was finite.
+            let finite = info_border_ready
+                || laplace_deviance(
+                    &data,
+                    nb,
+                    phi,
+                    1,
+                    &params[..n_theta],
+                    beta_prof,
+                    wx,
+                    pirls,
+                    structured,
+                    pattern,
+                    packed,
+                    border,
+                    prior_w_phi,
+                    beta_rhs,
+                    exact_prof,
+                    BetaMode::ProfilePql,
+                    None,
+                    cluster_rows.as_ref(),
+                    &mut info_exhausted,
+                    &mut info_counters,
+                )
+                .is_finite();
+            let sw: f64 = prior_w[..n].iter().sum();
+            if finite && beta_scale.set_info(border.schur.as_mut(), sw) {
+                *grad_beta_info = true;
+                beta_inv_curv = Some(1.0 / (2.0 * sw));
+                // T = L_setᵀ·L_info⁻ᵀ: column j is `L_setᵀ` applied to the
+                // caller-units β of the information-whitened unit vector e_j.
+                for j in 0..p {
+                    beta_rhs[..p].fill(0.0);
+                    beta_rhs[j] = 1.0;
+                    beta_scale.to_caller(&mut beta_rhs[..p]);
+                    for i in 0..p {
+                        t[i * p + j] = (0..p).map(|c| lset[i * p + c] * beta_rhs[c]).sum();
+                    }
+                }
+            } else {
+                beta_scale.set(x, &prior_w[..n], n);
+            }
+        }
         beta_scale.to_search(&mut params[n_theta..nb_col]);
         // AGQ: the gradient's row index and buffers, built on the first such
         // fit and kept for the SE step's gradient-difference Hessian; the index
@@ -1533,6 +1725,7 @@ pub fn fit_glmm(
             ln_phi: held_phi.map_or(0.0, f64::ln),
             free_phi,
             sum_ln_y: gamma_sum_ln_y,
+            beta_inv_curv,
             k,
             n_theta,
         };

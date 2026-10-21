@@ -174,6 +174,21 @@ fn fit_dict<'py>(py: Python<'py>, r: orchestrate::FitResult) -> PyResult<Bound<'
     d.set_item("coef_df", r.coef_df)?;
     d.set_item("coef_p", r.coef_p)?;
     d.set_item("df_method", r.df_method)?;
+    // `orchestrate::SatterthwaiteRecord` as a dict of its fields, `None` off a
+    // Satterthwaite fit; `contrast_test` takes it back as `StoredRecord`.
+    match r.satterthwaite_record {
+        Some(rec) => {
+            let sd = PyDict::new(py);
+            sd.set_item("a_eff", rec.a_eff)?;
+            sd.set_item("jac_theta", rec.jac_theta)?;
+            sd.set_item("c", rec.c)?;
+            sd.set_item("tau", rec.tau)?;
+            sd.set_item("nu", rec.nu)?;
+            sd.set_item("retained", rec.retained)?;
+            d.set_item("satterthwaite_record", sd)?;
+        }
+        None => d.set_item("satterthwaite_record", py.None())?,
+    }
     d.set_item("rss", r.rss)?;
     d.set_item("r_squared", r.r_squared)?;
     d.set_item("adj_r_squared", r.adj_r_squared)?;
@@ -314,6 +329,59 @@ fn f_table_refusal(asked: &str, den_df_kind: &str) -> PyResult<String> {
 #[pyfunction]
 fn confint(beta: Vec<f64>, se: Vec<f64>, coef_df: Vec<f64>, level: f64) -> PyResult<Vec<[f64; 2]>> {
     orchestrate::confint(&beta, &se, &coef_df, level).map_err(PyValueError::new_err)
+}
+
+/// A stored `Fit.satterthwaite_record`, keyed as `fit_dict` writes it, read
+/// back into `orchestrate::SatterthwaiteRecord`.
+#[derive(FromPyObject)]
+#[pyo3(from_item_all)]
+struct StoredRecord {
+    a_eff: Vec<f64>,
+    jac_theta: Vec<Vec<f64>>,
+    c: Vec<f64>,
+    tau: f64,
+    nu: f64,
+    retained: Option<Vec<usize>>,
+}
+
+/// `Fit.contrast_test(L)`: `orchestrate::contrast_test` on the fields the fit
+/// stores, `l` the row-major `rows × p` matrix `L`. The one-row table as
+/// `term_dict` gives it.
+#[allow(clippy::too_many_arguments)]
+#[pyfunction]
+fn contrast_test<'py>(
+    py: Python<'py>,
+    df_method: &str,
+    beta: Vec<f64>,
+    vcov: Vec<Vec<f64>>,
+    aliased: Vec<bool>,
+    nobs: usize,
+    dispersion: f64,
+    record: Option<StoredRecord>,
+    names: Vec<String>,
+    l: Vec<f64>,
+    rows: usize,
+) -> PyResult<Bound<'py, PyDict>> {
+    let record = record.map(|r| orchestrate::SatterthwaiteRecord {
+        a_eff: r.a_eff,
+        jac_theta: r.jac_theta,
+        c: r.c,
+        tau: r.tau,
+        nu: r.nu,
+        retained: r.retained,
+    });
+    let table = orchestrate::contrast_test(
+        df_method, &beta, &vcov, &aliased, nobs, dispersion, record, &names, &l, rows,
+    )
+    .map_err(PyValueError::new_err)?;
+    term_dict(py, &Ok(table))
+}
+
+/// `glmm.term_labels(formula)`: `orchestrate::term_labels`, the fixed-term
+/// labels and whether the formula has an intercept.
+#[pyfunction]
+fn term_labels(formula: &str) -> PyResult<(Vec<String>, bool)> {
+    orchestrate::term_labels(formula).map_err(PyValueError::new_err)
 }
 
 /// One side of `glmm.anova(m0, m1)`: what a stored `glmm.Fit` keeps, keyed as
@@ -591,6 +659,36 @@ fn formula_columns(
     ))
 }
 
+/// `formula_columns` for `glmm.model_matrix`: the same `(used, missing,
+/// numeric_only)` triple from `orchestrate::model_matrix_columns`, which
+/// refuses what a design formula may not hold and leaves out the response of
+/// a one-sided formula.
+#[pyfunction]
+fn model_matrix_columns(
+    formula: &str,
+    available: Vec<String>,
+) -> PyResult<(Vec<String>, Vec<String>, Vec<String>)> {
+    orchestrate::model_matrix_columns(formula, &available).map_err(PyValueError::new_err)
+}
+
+/// `glmm.model_matrix(data, formula)`: `orchestrate::run_model_matrix` on the
+/// columns `_prepare_columns` sends, as `(x, n, p, names)` with `x` the
+/// row-major design as float64 bytes.
+#[pyfunction]
+fn model_matrix<'py>(
+    py: Python<'py>,
+    formula: &str,
+    numeric_columns: HashMap<String, PyBackedBytes>,
+    factor_columns: HashMap<String, (Vec<String>, PyBackedBytes)>,
+    n_rows: usize,
+) -> PyResult<(Bound<'py, PyBytes>, usize, usize, Vec<String>)> {
+    let (numeric_columns, factor_columns) = columns(numeric_columns, factor_columns)?;
+    let (x, n, p, names) =
+        orchestrate::run_model_matrix(formula, numeric_columns, factor_columns, n_rows)
+            .map_err(PyValueError::new_err)?;
+    Ok((f64_bytes(py, &x)?, n, p, names))
+}
+
 /// The per-element pass of `glmm/__init__.py::_plain_column` over a plain list,
 /// which decides everything else (the type sets, what is missing, the cutoff,
 /// the fallback). Returns:
@@ -687,8 +785,12 @@ fn plain_column<'py>(
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(fit, m)?)?;
     m.add_function(wrap_pyfunction!(formula_columns, m)?)?;
+    m.add_function(wrap_pyfunction!(model_matrix_columns, m)?)?;
+    m.add_function(wrap_pyfunction!(model_matrix, m)?)?;
     m.add_function(wrap_pyfunction!(plain_column, m)?)?;
     m.add_function(wrap_pyfunction!(confint, m)?)?;
+    m.add_function(wrap_pyfunction!(contrast_test, m)?)?;
+    m.add_function(wrap_pyfunction!(term_labels, m)?)?;
     m.add_function(wrap_pyfunction!(f_table_refusal, m)?)?;
     m.add_function(wrap_pyfunction!(compare_fits, m)?)?;
     m.add_function(wrap_pyfunction!(compare, m)?)?;

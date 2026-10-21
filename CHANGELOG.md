@@ -6,6 +6,66 @@ All notable changes to the `glmm` crate are recorded here. Format follows
 The Python package (`glmm` on PyPI) is versioned in lockstep with the crate and
 shares these entries; Python-specific notes are called out where they differ.
 
+## [0.6.2] — 2026-10-21
+
+### Added
+
+- **Python: `glmm.model_matrix(data, formula)`** returns `(X, names)`: the
+  fixed-effects design and coefficient names `glmm.fit` builds for the same
+  right side. The response is optional (`"~ x + f"`). Random-effect terms,
+  `offset()` and rows with missing values are refused. R users have
+  `model.matrix()`.
+- **Python: `glmm.term_labels(formula)`** returns `(labels, has_intercept)`
+  from the formula alone. `labels` match R's `attr(terms(f), "term.labels")`,
+  without random-effect and `offset()` terms. A formula that does not parse
+  raises `ValueError`. The name is provisional until 1.0.0.
+- **`Fit.contrast_test(L)` (Python) and `contrast_test(object, L)` (R) test
+  `L beta = 0` in one Wald test.** `L` has one column per coefficient (aliased
+  ones included), or is a vector for one row. OLS, Gaussian mixed models and
+  Gamma and inverse Gaussian GLMs get an F test (Satterthwaite df on mixed
+  models); all other fits get Wald chi-squared. The result is one row named
+  `contrast`, laid out as the `anova` table of the same test. Nothing is
+  refitted: Gaussian mixed models with Satterthwaite df now store
+  `satterthwaite_record` (kept by pickle and `saveRDS()`), so such a fit made
+  by 0.6.1 must be refitted first. The names are provisional until 1.0.0.
+- **`loop_advanced`: a `CurvatureHint` can be taken apart into numbers and
+  rebuilt** (no semver promise), to send it between processes or WASM workers.
+  `inv_hessian()` (row-major `n×n`) and `units()` are public, and
+  `CurvatureHint::from_parts(n, inv_hessian, units)` rebuilds it bit for bit,
+  or returns `None` on bad input. `dim()` is now documented: n_θ for an LMM,
+  n_θ + p for a GLMM, + 1 on a Gamma fit with free dispersion.
+- **`loop_advanced`: `FitWorkspace::set_beta_info_scaling(true)` scales each
+  fixed effect of a Laplace BFGS GLMM by how strongly the data pin it** (no
+  semver promise), measured by one extra fit at the start values, instead of
+  by the design, which is far off for coefficients the random effects absorb
+  (the intercept). Off by default; `fit_cold` and `fit_warm` never use it.
+  Measured in evaluations against the default: about 2% to 6% fewer on warm
+  fits and up to a third fewer on crossed and nested shapes, but about 21%
+  more on cold fits of generated data built unlike the accuracy grid. AGQ
+  fits and fits with a curvature hint are unchanged.
+
+### Changed
+
+- **Warm Laplace GLMMs (binomial, Poisson, Gamma) with two or more variance
+  parameters use BFGS at any group size.** Fits with no random slope and 50 or
+  more rows per level used BOBYQA. On generated data at 50 to 500 rows per
+  level, total fit time fell from 44.7 to 23.5 s (binomial), 52.4 to 32.4 s
+  (Poisson) and 170.6 to 47.2 s (Gamma), with no fit more than 1e-6 above the
+  BOBYQA deviance. AGQ fits keep the 50-row rule.
+- **Faster GLMM gradient with several crossed groupings**: it reads positions
+  the fit already stores instead of searching each cluster's column list.
+  Results are bit for bit the same.
+- **Warm Laplace BFGS GLMM fits check their start on the PQL profile.** The
+  caller's start and the default start are now compared on the PQL profile
+  instead of the exact Laplace profile. The chosen start changed on 4 of 3,370
+  fits, by at most 2e-10 in deviance. Cold, AGQ and BOBYQA fits are unchanged.
+- **Gamma inverse-link BFGS GLMM fits with a free dispersion no longer shrink
+  the variance parameters' steps after a first step across a concave
+  stretch.** That first curvature update is skipped, and the next step starts
+  again from the start scale. On 1,035 test fits (the accuracy grid's and 144
+  generated ones) it changed 2, both Gamma inverse link, from 67 to 28 and from
+  348 to 295 evaluations at the same deviance. No other fit changed.
+
 ## [0.6.1] — 2026-10-18
 
 ### Added

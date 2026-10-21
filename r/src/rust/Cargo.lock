@@ -324,7 +324,7 @@ dependencies = [
 
 [[package]]
 name = "fastglmm"
-version = "0.6.0"
+version = "0.6.2"
 dependencies = [
  "extendr-api",
  "glmm-r",
@@ -490,7 +490,7 @@ dependencies = [
 
 [[package]]
 name = "glmm"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "bobyqa",
  "commonstats",
@@ -501,7 +501,7 @@ dependencies = [
 
 [[package]]
 name = "glmm-r"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "extendr-api",
  "glmm",

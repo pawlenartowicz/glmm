@@ -666,3 +666,106 @@ test_that("auto names the Wald test and the reason on every other chi-squared fi
   expect_identical(anova(old, test = "Wald"), anova(cases[[1L]][[1L]], test = "Wald"))
   expect_error(anova(old), "this fit has no term_test_auto", fixed = TRUE)
 })
+
+# contrast_test(m, L): one joint test of a fit's coefficients, from what the
+# fit stores.
+
+contrast_data <- function() {
+  d <- anova_data()
+  set.seed(312)
+  d$n <- rpois(nrow(d), exp(0.2 + 0.3 * d$x + 0.3 * as.integer(d$g) %% 3))
+  d
+}
+
+unit_rows <- function(m, cols) {
+  L <- matrix(0, length(cols), length(fixef(m)))
+  L[cbind(seq_along(cols), match(cols, names(fixef(m))))] <- 1
+  L
+}
+
+test_that("contrast_test() of a term's unit rows is its anova row, bit for bit", {
+  # No interaction, so the Type III hypothesis of each term is its unit rows:
+  # the row read back from the stored fields is the kernel's own row.
+  d <- contrast_data()
+  cases <- list(
+    list(fastglmm(y ~ x + f + (1 | g), d), "auto",
+         "Analysis of Variance Table with Satterthwaite's method"),
+    list(fastglmm(y ~ x + f, d), "auto", "Analysis of Variance Table"),
+    list(fastglmm(n ~ x + f + (1 | g), d, family = poisson()), "Wald",
+         "Analysis of Deviance Table (Wald chi-squared tests)"))
+  for (case in cases) {
+    m <- case[[1L]]
+    tab <- contrast_test(m, unit_rows(m, c("fb", "fc")))
+    term <- anova(m, test = case[[2L]])
+    expect_identical(attr(tab, "heading"), case[[3L]])
+    expect_identical(rownames(tab), "contrast")
+    expect_identical(names(tab), names(term))
+    expect_identical(columns(tab), columns(term["f", ]))
+    # An L given as a vector is a one-row L.
+    expect_identical(columns(contrast_test(m, unit_rows(m, "x")[1, ])), columns(term["x", ]))
+  }
+  expect_identical(class(tab), c("anova", "data.frame"))
+  # The record survives saveRDS().
+  m <- cases[[1L]][[1L]]
+  path <- tempfile(fileext = ".rds")
+  saveRDS(m, path)
+  expect_identical(contrast_test(readRDS(path), unit_rows(m, c("fb", "fc"))),
+                   contrast_test(m, unit_rows(m, c("fb", "fc"))))
+  unlink(path)
+})
+
+test_that("contrast_test() gives an LMM with no Satterthwaite pass the NA F row", {
+  d <- contrast_data()
+  m <- fastglmm(y ~ x + f + (1 | g), d, satterthwaite = FALSE)
+  tab <- contrast_test(m, unit_rows(m, "x"))
+  expect_identical(attr(tab, "heading"), c("Analysis of Variance Table", paste(
+    "contrast: No denominator df (Satterthwaite degrees of freedom were not computed for",
+    "this fit), so the hypothesis was not tested.")))
+  expect_true(all(is.na(unlist(tab))))
+})
+
+test_that("contrast_test() on an aliased coefficient of a Satterthwaite LMM", {
+  d <- contrast_data()
+  d$x2 <- 2 * d$x
+  a <- fastglmm(y ~ x + x2 + f + (1 | g), d)
+  expect_identical(a$df_method, "satterthwaite")
+  expect_identical(unname(a$aliased), c(FALSE, FALSE, TRUE, FALSE, FALSE))
+  expect_identical(a$satterthwaite_record$retained, c(1L, 2L, 4L, 5L))
+  expect_identical(columns(contrast_test(a, unit_rows(a, c("fb", "fc")))),
+                   columns(anova(a)["f", ]))
+  expect_identical(attr(contrast_test(a, unit_rows(a, c("x", "x2"))), "heading")[2L],
+                   "contrast: The coefficient x2 is aliased, so the hypothesis was not tested.")
+})
+
+test_that("contrast_test() runs on a fit stored by 0.6.1 unless it is a Satterthwaite LMM", {
+  d <- contrast_data()
+  m <- fastglmm(y ~ x + f, d)
+  old <- m
+  old$satterthwaite_record <- NULL
+  expect_identical(contrast_test(old, unit_rows(m, c("fb", "fc"))),
+                   contrast_test(m, unit_rows(m, c("fb", "fc"))))
+  m <- fastglmm(y ~ x + f + (1 | g), d)
+  old <- m
+  old$satterthwaite_record <- NULL
+  expect_error(contrast_test(old, unit_rows(m, "x")), "this fit has no satterthwaite_record",
+               fixed = TRUE)
+})
+
+test_that("contrast_test() refuses an L of the wrong shape or not finite", {
+  d <- contrast_data()
+  m <- fastglmm(y ~ x + f + (1 | g), d)
+  p <- length(fixef(m))
+  expect_error(contrast_test(m, numeric(p + 1L)), sprintf("L must have %d columns", p),
+               fixed = TRUE)
+  expect_error(contrast_test(m, matrix(0, 2, p - 1L)), sprintf("L must have %d columns", p),
+               fixed = TRUE)
+  expect_error(contrast_test(m, matrix(0, 0, p)), "L must have at least one row", fixed = TRUE)
+  expect_error(contrast_test(m, array(0, c(1, 1, p))), "L must be a numeric matrix or vector",
+               fixed = TRUE)
+  expect_error(contrast_test(m, letters[seq_len(p)]), "L must be a numeric matrix or vector",
+               fixed = TRUE)
+  expect_error(contrast_test(m, rep(NA_real_, p)), "L must be finite numbers", fixed = TRUE)
+  expect_error(contrast_test(m, rep(Inf, p)), "L must be finite numbers, got inf", fixed = TRUE)
+  expect_error(contrast_test(list(), numeric(p)), "contrast_test() takes a fastglmm fit",
+               fixed = TRUE)
+})

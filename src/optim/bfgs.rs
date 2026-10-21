@@ -12,12 +12,19 @@
 //! [`BfgsConfig::first_step_cap`] in the max norm, so the identity's
 //! unit-free step cannot leave the region the start describes.
 //!
-//! An objective that knows one coordinate's curvature at the start
-//! ([`GradObjective::start_curvature`]) seeds that diagonal entry of `H` with
-//! its inverse instead of 1. The entry keeps that value through Shanno's
-//! rescaling and every restart; the rescaling's `sᵀy/yᵀy` and the first-step
-//! cap read and scale the other coordinates only, since the seeded
-//! coordinate's step is already in its own units.
+//! An objective that knows some coordinates' curvatures at the start
+//! ([`GradObjective::start_curvature`]) seeds those diagonal entries of `H`
+//! with their inverses instead of 1. A seeded entry keeps its value through
+//! Shanno's rescaling and every restart, and the first-step cap reads and
+//! scales the unseeded coordinates only, since a seeded coordinate's step is
+//! already in its own units. Shanno's rescaling gives each contiguous run of
+//! unseeded coordinates its own `sᵀy/yᵀy`, read over that run alone: seeds
+//! that split the point into blocks (the GLMM route's β̃ between θ and ψ)
+//! leave blocks whose curvatures differ by orders of magnitude, and one ratio
+//! over both would set one block's scale from the other's. Without a seed the
+//! one run is every coordinate, the plain Shanno scale. A first step across a
+//! concave stretch of the unseeded coordinates makes no update, so the next
+//! step starts again from the seeded start under the first-step cap.
 //!
 //! Stops:
 //!
@@ -194,18 +201,22 @@ pub(crate) struct BfgsState {
     hy: Vec<f64>,
     xt: Vec<f64>,
     free: Vec<bool>,
+    /// The start's inverse curvature per coordinate, from
+    /// [`GradObjective::start_curvature`]: positive on a seeded coordinate,
+    /// 0 on every other one.
+    seed: Vec<f64>,
 }
 
 impl BfgsState {
     /// The last search's `n×n` inverse-Hessian approximation (row-major), as
-    /// it ended: the start (the identity, or with its seeded entry) until a
+    /// it ended: the start (the identity, with its seeded entries) until a
     /// first update.
     pub(crate) fn inv_hessian(&self) -> &[f64] {
         &self.h
     }
 
     /// Sizes the buffers for `n` coordinates (allocating only when `n`
-    /// changes) and sets `H = I`.
+    /// changes), clears the seeds and sets `H = I`.
     fn reset(&mut self, n: usize) {
         if self.n != n {
             self.n = n;
@@ -218,7 +229,9 @@ impl BfgsState {
             self.hy = vec![0.0; n];
             self.xt = vec![0.0; n];
             self.free = vec![true; n];
+            self.seed = vec![0.0; n];
         }
+        self.seed.fill(0.0);
         self.set_identity(1.0);
     }
 
@@ -230,11 +243,44 @@ impl BfgsState {
         }
     }
 
-    /// `H = scale·I` with the seeded diagonal entry, if any, at its own value.
-    fn set_start(&mut self, scale: f64, seed: Option<(usize, f64)>) {
-        self.set_identity(scale);
-        if let Some((i, v)) = seed {
-            self.h[i * self.n + i] = v;
+    /// `H = I` with each seeded diagonal entry at its own value.
+    fn set_start(&mut self) {
+        self.set_identity(1.0);
+        let n = self.n;
+        for i in (0..n).filter(|&i| self.seed[i] > 0.0) {
+            self.h[i * n + i] = self.seed[i];
+        }
+    }
+
+    /// Shanno's rescaling at the first update: `H` diagonal, each seeded entry
+    /// at its own value, each contiguous run of unseeded coordinates at its
+    /// own `sᵀy/yᵀy` over the run (see the module doc). A run's pair carries
+    /// no positive curvature when its step or gradient change is zero (every
+    /// coordinate of it held on a bound) or the step crossed a concave
+    /// stretch in it; its ratio is then no scale, and it takes `fallback`
+    /// (see the caller).
+    fn set_shanno(&mut self, fallback: f64) {
+        let n = self.n;
+        self.h.fill(0.0);
+        let mut i = 0;
+        while i < n {
+            if self.seed[i] > 0.0 {
+                self.h[i * n + i] = self.seed[i];
+                i += 1;
+                continue;
+            }
+            let end = (i..n).find(|&j| self.seed[j] > 0.0).unwrap_or(n);
+            let sy: f64 = (i..end).map(|j| self.s[j] * self.y[j]).sum();
+            let yy: f64 = (i..end).map(|j| self.y[j] * self.y[j]).sum();
+            let scale = if sy > 0.0 && yy > 0.0 {
+                sy / yy
+            } else {
+                fallback
+            };
+            for j in i..end {
+                self.h[j * n + j] = scale;
+            }
+            i = end;
         }
     }
 
@@ -309,8 +355,8 @@ fn all_finite(v: &[f64]) -> bool {
 /// `h0`, a row-major `n×n` inverse Hessian (a caller's
 /// [`CurvatureHint`](super::CurvatureHint)), replaces the identity start: no
 /// first-step cap and no Shanno rescaling then, since the scale is known.
-/// Without `h0` the objective's [`GradObjective::start_curvature`] seeds one
-/// diagonal entry (see the module doc).
+/// Without `h0` the objective's [`GradObjective::start_curvature`] seeds
+/// diagonal entries (see the module doc).
 #[allow(clippy::needless_range_loop)] // dense small-matrix loops index several arrays
 pub(crate) fn bfgs_minimize(
     obj: &mut impl GradObjective,
@@ -355,14 +401,17 @@ pub(crate) fn bfgs_minimize(
     let pg0 = (0..n)
         .map(|i| ((x[i] - st.g[i]).clamp(lo[i], hi[i]) - x[i]).abs())
         .fold(0.0f64, f64::max);
-    let seed = if hinted {
-        None
-    } else {
-        obj.start_curvature()
-            .filter(|&(i, v)| i < n && v.is_finite() && v > 0.0)
-    };
-    if seed.is_some() {
-        st.set_start(1.0, seed);
+    if !hinted {
+        obj.start_curvature(&mut st.seed);
+        for v in st.seed.iter_mut() {
+            if !(v.is_finite() && *v > 0.0) {
+                *v = 0.0;
+            }
+        }
+    }
+    let any_seeded = st.seed.iter().any(|&v| v > 0.0);
+    if any_seeded {
+        st.set_start();
     }
     if pg0 < cfg.pgrad_tol {
         out.stop = BfgsStop::Pgrad;
@@ -370,7 +419,6 @@ pub(crate) fn bfgs_minimize(
         out.decrement = st.decrement();
         return out;
     }
-    let seeded = |i: usize| seed.is_some_and(|(j, _)| j == i);
     let mut first = !hinted;
     while out.iters < cfg.max_iter {
         out.iters += 1;
@@ -378,7 +426,7 @@ pub(crate) fn bfgs_minimize(
         let mut slope = st.direction();
         if slope >= 0.0 || !slope.is_finite() {
             // Not a descent direction: restart from steepest descent.
-            st.set_start(1.0, seed);
+            st.set_start();
             first = true;
             slope = st.direction();
             if slope >= 0.0 || !slope.is_finite() {
@@ -389,17 +437,19 @@ pub(crate) fn bfgs_minimize(
         }
         if first {
             let dn = (0..n)
-                .filter(|&i| !seeded(i))
+                .filter(|&i| st.seed[i] == 0.0)
                 .fold(0.0f64, |m, i| m.max(st.d[i].abs()));
             if dn > cfg.first_step_cap {
                 let sc = cfg.first_step_cap / dn;
-                if seed.is_none() {
+                if !any_seeded {
                     st.d.iter_mut().for_each(|v| *v *= sc);
                     slope *= sc;
                 } else {
                     // `H` is diagonal after a (re)start, so the partly scaled
                     // step is still a descent direction.
-                    (0..n).filter(|&i| !seeded(i)).for_each(|i| st.d[i] *= sc);
+                    for i in (0..n).filter(|&i| st.seed[i] == 0.0) {
+                        st.d[i] *= sc;
+                    }
                     slope = (0..n).map(|i| st.d[i] * st.g[i]).sum();
                 }
             }
@@ -456,37 +506,41 @@ pub(crate) fn bfgs_minimize(
         let sn = st.s.iter().map(|v| v * v).sum::<f64>().sqrt();
         let yy: f64 = st.y.iter().map(|v| v * v).sum();
         if sy > 1e-12 * sn * yy.sqrt() {
+            let mut update = true;
             if first {
-                // With a seed, Shanno's scale reads the other coordinates
-                // only. Read over all of them, a stiff seeded coordinate (a
-                // Gamma `ψ`, curvature of order n) sets the scale of the rest
-                // too: a Gamma-inverse random-slope fit then ended certified
-                // in a local minimum 0.029 above the optimum
+                // Shanno's scale reads the unseeded coordinates only. Read
+                // over all of them, a stiff seeded coordinate (a Gamma `ψ`,
+                // curvature of order n, or β̃ at about 2·Σw) sets the scale
+                // of the rest too: a Gamma-inverse random-slope fit then
+                // ended certified in a local minimum 0.029 above the optimum
                 // (`gamma_inverse_gradient_route_matches_bobyqa_in_any_units`,
-                // y·2⁻⁵, 2026-10-09).
-                let scale = match seed {
-                    None => sy / yy,
-                    Some((j, _)) => {
-                        let rest = (0..n).filter(|&i| i != j);
-                        let sy_r: f64 = rest.clone().map(|i| st.s[i] * st.y[i]).sum();
-                        let yy_r: f64 = rest.map(|i| st.y[i] * st.y[i]).sum();
-                        // The other coordinates' pair carries no positive
-                        // curvature when their step or gradient change is
-                        // zero (every one held on a bound, or n = 1) or the
-                        // step crossed a concave stretch in them. Their ratio
-                        // is then no scale, and the full `sᵀy/yᵀy`, positive
-                        // by the check above, is the one left.
-                        if sy_r > 0.0 && yy_r > 0.0 {
-                            sy_r / yy_r
-                        } else {
-                            sy / yy
-                        }
-                    }
-                };
-                st.set_start(scale, seed);
-                first = false;
+                // y·2⁻⁵, 2026-10-09). So a run whose own pair carries no
+                // positive curvature takes the ratio over every unseeded
+                // coordinate. When that pair moved but carries no positive
+                // curvature (the step crossed a concave stretch), the full
+                // ratio would be the seeded coordinates' and shrink the rest
+                // to their units, so the update is skipped and the next step
+                // starts again from the start matrix under the first-step
+                // cap: on 144 held-out fits this took a Gamma-inverse random
+                // slope from 67 to 28 evaluations (2026-10-21). Without a seed
+                // the unseeded pair is the full pair, positive by the check
+                // above, so the skip never fires. Only when the unseeded pair
+                // did not move (every unseeded coordinate held on a bound, or
+                // none left) does the full `sᵀy/yᵀy` set the scale.
+                let unseeded = (0..n).filter(|&i| st.seed[i] == 0.0);
+                let sy_u: f64 = unseeded.clone().map(|i| st.s[i] * st.y[i]).sum();
+                let yy_u: f64 = unseeded.map(|i| st.y[i] * st.y[i]).sum();
+                if yy_u > 0.0 && sy_u <= 0.0 {
+                    update = false;
+                } else {
+                    let fallback = if yy_u > 0.0 { sy_u / yy_u } else { sy / yy };
+                    st.set_shanno(fallback);
+                    first = false;
+                }
             }
-            st.update(sy);
+            if update {
+                st.update(sy);
+            }
         }
         let pg = (0..n)
             .map(|i| ((x[i] - st.g[i]).clamp(lo[i], hi[i]) - x[i]).abs())

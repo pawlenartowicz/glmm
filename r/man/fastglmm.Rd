@@ -134,7 +134,9 @@ per warning the call raised: \code{tier}, \code{kind}, \code{title}, \code{messa
 converge) and \code{coef_p} (its p-value), \code{df_method}
 (\code{"satterthwaite"}, \code{"residual"}, \code{"none"}, \code{"disabled"} or \code{"failed"}),
 \code{rss}, \code{r_squared} and \code{adj_r_squared} (OLS fits only, \code{NaN} otherwise),
-\code{offset} (the offset fitted with, \code{NULL} without one), plus
+\code{offset} (the offset fitted with, \code{NULL} without one),
+\code{satterthwaite_record} (what \code{\link[=contrast_test]{contrast_test()}} reads on a fit whose
+\code{df_method} is \code{"satterthwaite"}, \code{NULL} on every other fit), plus
 \link[=anova.fastglmm]{anova()} (the per-term tests, built at fit time, or a
 comparison of two fits), \code{print()}, \link[=summary.fastglmm]{summary()},
 \link[=confint.fastglmm]{confint()} (Wald), \code{nobs()},

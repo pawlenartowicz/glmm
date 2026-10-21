@@ -57,6 +57,10 @@ pub use error::{Error, ParseError};
 // Crate-private: the nesting check of `anova::nesting` and
 // `orchestrate::same_fixed_part` call it.
 pub(crate) use fixed_part::{fixed_part_relation, FixedPartRelation};
+// Crate-private: `orchestrate::run_model_matrix`,
+// `orchestrate::model_matrix_columns` and `orchestrate::term_labels` call them.
+#[cfg(feature = "orchestrate")]
+pub(crate) use materialize::{design_columns, fixed_design, r_terms};
 pub use materialize::{
     label_ranef, lower, materialize, numeric_only_columns, referenced_columns, unresolved_columns,
     Column, FixedTerm, Lowered, RanefBlock, ReGroupInfo, Table,

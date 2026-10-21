@@ -6,7 +6,10 @@
 //! types — so everything here runs under plain `cargo test`, and the two
 //! ports flatten the same fit the same way from one definition instead of
 //! two mirrored copies. [`run_fit`] fits one formula; [`run_compare`] fits
-//! two on the same rows and compares them.
+//! two on the same rows and compares them; [`run_model_matrix`] returns a
+//! formula's fixed-effects design without fitting; [`term_labels`] reads a
+//! formula's fixed-term labels; [`contrast_test`] tests `Lβ = 0` on what a
+//! port stored of one fit.
 //!
 //! Behind the default-off `orchestrate` cargo feature. Like `loop_advanced`
 //! it carries NO semver guarantees: its shape follows the ports' needs.
@@ -14,18 +17,23 @@
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
+use faer::Mat;
+
 use crate::fit::theta_width;
 use crate::formula::anova::{
-    auto_choice, compare, linear_note_line, nesting, term_tests_cached, ChoiceReason, CompareError,
-    CompareOptions, Comparison, Differs, FixedRow, Model, Nesting, RefitCache, SsType, TermTable,
-    TermTest, TermTestOptions, TestChoice,
+    auto_choice, compare, fixed_row, linear_note_line, nesting, term_tests_cached, untested_test,
+    ChoiceReason, CompareError, CompareOptions, Comparison, Differs, FixedRow, Model, Nesting,
+    RefitCache, SsType, TermTable, TermTest, TermTestOptions, TestChoice,
 };
 use crate::formula::{
-    fixed_part_relation, label_ranef, lower, parse, Column, FixedPartRelation, Lowered, Table,
+    design_columns, fixed_design, fixed_part_relation, label_ranef, lower, parse, r_terms, Column,
+    FixedPartRelation, Lowered, ParsedFormula, Table,
 };
-use crate::inference::contrast::{ContrastError, NoDfReason};
+use crate::inference::contrast::{contrast_f_of, ContrastError, NoDfReason};
 use crate::inference::tails::{normal_quantile, t_quantile};
-use crate::inference::{DenDf, LinearKind, Objective, Reference};
+use crate::inference::wald::wald_chisq;
+use crate::inference::{DenDf, LinearKind, LinearNote, LinearTest, Objective, Reference};
+use crate::lmm::satterthwaite::SatterthwaiteState;
 use crate::{fit_warm, Boundary, Family, Fit, Note, OuterStop, StartValues, WaldSe};
 use crate::{BinomialLink, GammaLink, InverseGaussianLink, NegBinomialLink, PoissonLink};
 
@@ -433,6 +441,11 @@ pub struct FitResult {
     /// print t (with a df column on `"satterthwaite"`) on the first two and z
     /// on the rest.
     pub df_method: &'static str,
+    /// The Satterthwaite record [`contrast_test`] reads, on a fit whose
+    /// `df_method` is `"satterthwaite"`; `None` on every other fit, whose
+    /// test reads only `beta`, `vcov`, `aliased`, `nobs` and `dispersion`.
+    /// Coupled sites, as for `y`.
+    pub satterthwaite_record: Option<SatterthwaiteRecord>,
     /// Weighted residual sum of squares `Σwᵢ(yᵢ − μ̂ᵢ)²` of an OLS fit; NaN on
     /// every other fit and on a non-converged one.
     pub rss: f64,
@@ -479,6 +492,28 @@ pub struct FitResult {
     /// `term_table_type2_lrt`. [`choice_tags`] flattens it. Coupled sites, as
     /// for `y`.
     pub term_test_auto: TestChoice,
+}
+
+/// A Gaussian LMM's Satterthwaite record as plain numbers
+/// ([`FitResult::satterthwaite_record`]): a port stores it on its fit and
+/// passes it back to [`contrast_test`]. The `p_r × p_r` matrices are over the
+/// retained columns, `p_r` of them, and every matrix is row-major.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SatterthwaiteRecord {
+    /// `A_eff = 2·blockdiag(H_p⁺, τ̂²/ν)`, `(n_free + 1) × (n_free + 1)`, with
+    /// `n_free` the free θ coordinates.
+    pub a_eff: Vec<f64>,
+    /// `∂C/∂θ̃_k`, one `p_r × p_r` matrix per free θ coordinate.
+    pub jac_theta: Vec<Vec<f64>>,
+    /// `C = Var(β̂)`, `p_r × p_r`.
+    pub c: Vec<f64>,
+    /// τ̂ = σ̂².
+    pub tau: f64,
+    /// The divisor of σ̂²: `N − p_r` on a REML fit, `N` on an ML fit.
+    pub nu: f64,
+    /// The retained columns, 0-based and ascending, on a rank-deficient fit;
+    /// `None` when every column was retained.
+    pub retained: Option<Vec<usize>>,
 }
 
 /// A per-term table as the plain columns a port stores, one entry per row
@@ -570,19 +605,10 @@ pub fn term_columns(table: &TermTable) -> TermColumns {
         kind: rows.iter().map(|r| kind_tag(r.test.kind)).collect(),
         statistic: col(|r| r.test.statistic),
         num_df: col(|r| r.test.num_df),
-        den_df: col(|r| match r.test.reference {
-            Reference::F { den_df, .. } => den_df,
-            _ => f64::NAN,
-        }),
+        den_df: col(|r| den_df_fields(r.test.reference).0),
         den_df_kind: rows
             .iter()
-            .map(|r| match r.test.reference {
-                Reference::F { den_df_kind, .. } => match den_df_kind {
-                    DenDf::Satterthwaite => "satterthwaite",
-                    DenDf::Residual => "residual",
-                },
-                _ => "",
-            })
+            .map(|r| den_df_fields(r.test.reference).1)
             .collect(),
         p_value: col(|r| r.test.p_value),
         sum_sq: col(|r| r.sum_sq.unwrap_or(f64::NAN)),
@@ -598,6 +624,25 @@ pub fn term_columns(table: &TermTable) -> TermColumns {
             })
             .collect(),
         notes: table.notes.clone(),
+    }
+}
+
+/// A row's denominator df and its source, as [`TermColumns::den_df`] and
+/// [`TermColumns::den_df_kind`] name them: NaN and `""` off an F reference.
+fn den_df_fields(reference: Reference) -> (f64, &'static str) {
+    match reference {
+        Reference::F {
+            den_df,
+            den_df_kind,
+            ..
+        } => (
+            den_df,
+            match den_df_kind {
+                DenDf::Satterthwaite => "satterthwaite",
+                DenDf::Residual => "residual",
+            },
+        ),
+        _ => (f64::NAN, ""),
     }
 }
 
@@ -892,6 +937,86 @@ fn same_offset_term(f0: &str, f1: &str) -> bool {
     offset(f0) == offset(f1)
 }
 
+/// `formula` parsed for a fixed-effects design alone ([`model_matrix_columns`],
+/// [`run_model_matrix`]), with whether it has no response. Refused: a formula
+/// with no `~` (the parser would take its default response name for it), a
+/// random-effect term (a fit drops the rows missing a grouping value, which
+/// can remove a factor level and change the design), and an `offset()` term
+/// (it adds no design column).
+///
+/// Both checks on `~` read the string, because the parsed formula cannot tell
+/// `~ x` from `x`, nor `y = x` from `y ~ x`.
+fn design_formula(formula: &str) -> Result<(ParsedFormula, bool), String> {
+    if !formula.contains('~') {
+        return Err(format!(
+            "a design formula needs ~, as in \"~ x + f\" or \"y ~ x + f\"; got {formula:?}"
+        ));
+    }
+    let one_sided = formula.trim_start().starts_with('~');
+    let ast = parse(formula).map_err(|e| e.to_string())?;
+    if !ast.random_effects.is_empty() {
+        return Err(
+            "a design formula takes no random-effect terms; give the fixed part only".to_string(),
+        );
+    }
+    if ast.offset.is_some() {
+        return Err(
+            "a design formula takes no offset() term: an offset adds no design column".to_string(),
+        );
+    }
+    Ok((ast, one_sided))
+}
+
+/// What [`run_model_matrix`] reads from a dataset whose column names are
+/// `available`: `(used, missing, numeric_only)`, as the Python port's
+/// `formula_columns` gives them for a fit. A response (`y ~ x`) is read, so
+/// it must exist, though it is not part of the design; a one-sided formula
+/// (`~ x`) reads none.
+///
+/// # Errors
+///
+/// The refusals of a design formula (no `~`, a random-effect term, an
+/// `offset()` term) and a formula that does not parse.
+#[allow(clippy::type_complexity)]
+pub fn model_matrix_columns(
+    formula: &str,
+    available: &[String],
+) -> Result<(Vec<String>, Vec<String>, Vec<String>), String> {
+    let (ast, one_sided) = design_formula(formula)?;
+    Ok(design_columns(&ast, available, one_sided))
+}
+
+/// The fixed-effects design of `formula` on pre-marshalled columns, as
+/// `(x, n, p, col_names)`: the row-major `n × p` design and the coefficient
+/// names [`run_fit`] gives the same formula, every column kept (an aliased one
+/// too). `n_rows` is the caller's row count, read only when the formula
+/// reads no column (`~ 1`); otherwise the columns give it. The caller drops
+/// no row: a missing value is refused before the call.
+///
+/// # Errors
+///
+/// The refusals of [`model_matrix_columns`], the column errors of
+/// [`run_fit`] (mismatched lengths, a bad factor code), and the design errors
+/// of [`crate::formula::lower`] (an unknown column, a single-level factor, an
+/// empty design, a non-finite value). A panic is returned as `Err`.
+pub fn run_model_matrix(
+    formula: &str,
+    numeric_columns: HashMap<String, Vec<f64>>,
+    factor_columns: HashMap<String, (Vec<String>, Vec<u32>)>,
+    n_rows: usize,
+) -> Result<(Vec<f64>, usize, usize, Vec<String>), String> {
+    let (ast, _) = design_formula(formula)?;
+    let mut table = table_of(numeric_columns, factor_columns)?;
+    // `table_of` takes `n` from the columns, 0 when there are none.
+    if table.columns.is_empty() {
+        table.n = n_rows;
+    }
+    let design = catch_unwind(AssertUnwindSafe(|| fixed_design(&ast, &table)))
+        .map_err(panic_message)?
+        .map_err(|e| e.to_string())?;
+    Ok((design.x, table.n, design.p, design.col_names))
+}
+
 /// The ports' columns as a [`Table`], every column the same length.
 fn table_of(
     numeric_columns: HashMap<String, Vec<f64>>,
@@ -1097,6 +1222,10 @@ fn flatten(prepared: Prepared, fit: Fit, anova_test: TermTest) -> Result<FitResu
     let lowered_notes = std::mem::take(&mut lowered.notes);
 
     let (coef_p, df_method) = t_tests(&fit, &lowered.opts.target_indices);
+    let satterthwaite_record = match (&fit.satterthwaite, df_method) {
+        (Some(st), "satterthwaite") => Some(record_of(st)),
+        _ => None,
+    };
     let (rss, r_squared, adj_r_squared) =
         if lowered.model.re.is_none() && lowered.model.family == Family::Gaussian {
             ols_r_squared(
@@ -1227,6 +1356,7 @@ fn flatten(prepared: Prepared, fit: Fit, anova_test: TermTest) -> Result<FitResu
         coef_df: fit.coef_df,
         coef_p,
         df_method,
+        satterthwaite_record,
         rss,
         r_squared,
         adj_r_squared,
@@ -1367,6 +1497,172 @@ pub fn confint(
 pub fn same_fixed_part(f0: &str, f1: &str) -> Result<bool, String> {
     let parsed = |f: &str| parse(f).map_err(|e| format!("formula {f:?} does not parse: {e}"));
     Ok(fixed_part_relation(&parsed(f0)?, &parsed(f1)?) == FixedPartRelation::Same)
+}
+
+/// The fixed-term labels of `formula` and whether it has an intercept, read
+/// from its parse alone, with no data: R's `attr(terms(f), "term.labels")`.
+/// Each term's variables are joined by `:` in the order they first appear in
+/// the fixed part, as the lowering labels a term (`FixedTerm::label`), and the
+/// terms are sorted by degree, in the written order within a degree.
+/// Random-effect terms and `offset()` are not among them.
+///
+/// # Errors
+///
+/// A formula that does not parse, with the parser's message.
+pub fn term_labels(formula: &str) -> Result<(Vec<String>, bool), String> {
+    let ast = parse(formula).map_err(|e| e.to_string())?;
+    let labels = r_terms(&ast).iter().map(|vars| vars.join(":")).collect();
+    Ok((labels, ast.has_intercept))
+}
+
+/// A row-major copy of `m`.
+fn row_major(m: &Mat<f64>) -> Vec<f64> {
+    (0..m.nrows())
+        .flat_map(|i| (0..m.ncols()).map(move |j| m[(i, j)]))
+        .collect()
+}
+
+/// A Satterthwaite pass's state as the record a port stores.
+fn record_of(st: &SatterthwaiteState) -> SatterthwaiteRecord {
+    SatterthwaiteRecord {
+        a_eff: row_major(&st.a_eff),
+        jac_theta: st.jac_theta.iter().map(row_major).collect(),
+        c: row_major(&st.c),
+        tau: st.tau,
+        nu: st.nu,
+        retained: st.retained.clone(),
+    }
+}
+
+/// The inverse of [`record_of`] on a fit with `p` coefficients, refusing a
+/// record whose sizes do not fit together or with `p`.
+fn record_state(r: SatterthwaiteRecord, p: usize) -> Result<SatterthwaiteState, String> {
+    let malformed = || "the fit's satterthwaite_record is malformed: refit the model".to_string();
+    let k = (r.a_eff.len() as f64).sqrt().round() as usize;
+    if k == 0 || k * k != r.a_eff.len() {
+        return Err(malformed());
+    }
+    let pr = r.retained.as_ref().map_or(p, Vec::len);
+    let square = |v: &[f64]| v.len() == pr * pr;
+    if !square(&r.c) || r.jac_theta.len() != k - 1 || !r.jac_theta.iter().all(|j| square(j)) {
+        return Err(malformed());
+    }
+    if let Some(kept) = &r.retained {
+        if kept.windows(2).any(|w| w[0] >= w[1]) || kept.last().is_some_and(|&j| j >= p) {
+            return Err(malformed());
+        }
+    }
+    let mat = |v: &[f64], n: usize| Mat::from_fn(n, n, |i, j| v[i * n + j]);
+    Ok(SatterthwaiteState::from_record(
+        mat(&r.a_eff, k),
+        r.jac_theta.iter().map(|j| mat(j, pr)).collect(),
+        mat(&r.c, pr),
+        r.tau,
+        r.nu,
+        r.retained,
+    ))
+}
+
+/// One Wald test of `Lβ = 0` on the fields a port stored of one fit, with no
+/// refit: `l` is the `rows × p` matrix `L`, row-major over all `p`
+/// coefficients, aliased ones included. The test follows `df_method`
+/// ([`FitResult::df_method`]):
+///
+/// - `"satterthwaite"` (a Gaussian LMM) and `"residual"` (OLS, a Gamma or
+///   inverse Gaussian GLM with φ estimated): the F of [`Fit::contrast_f`] on
+///   the fit's df record, rebuilt from `record` on the first and, on the
+///   second, as the fit builds it: `C` is `vcov` on the columns not
+///   `aliased`, `ν = nobs` less those columns;
+/// - `"disabled"` and `"failed"` (a Gaussian LMM with no pass): the NaN F row
+///   with the no-df note and its reason, as the per-term table gives it;
+/// - `"none"`: the Wald χ² of the per-term table's Wald rows.
+///
+/// The result is a one-row [`TermTable`] labelled `contrast`, with `Sum Sq`
+/// and `Mean Sq` from `dispersion` on an F row, and `names`, the fit's
+/// coefficient names, as its `coef_names`. A contrast has no SS type, so
+/// `ss_type` (Type III) and `choice.reason` (requested) are placeholders,
+/// which the ports drop.
+///
+/// # Errors
+///
+/// `L` with no row, with a length other than `rows·p` or with a value that is
+/// not finite; an unknown `df_method`; a `"satterthwaite"` fit with no
+/// `record`, or a malformed one. A panic is returned as `Err`.
+#[allow(clippy::too_many_arguments)]
+pub fn contrast_test(
+    df_method: &str,
+    beta: &[f64],
+    vcov: &[Vec<f64>],
+    aliased: &[bool],
+    nobs: usize,
+    dispersion: f64,
+    record: Option<SatterthwaiteRecord>,
+    names: &[String],
+    l: &[f64],
+    rows: usize,
+) -> Result<TermTable, String> {
+    let p = beta.len();
+    if rows == 0 {
+        return Err("L must have at least one row".to_string());
+    }
+    if l.len() != rows * p {
+        return Err(format!(
+            "L must have {p} columns, one per coefficient, aliased ones included; got {} \
+             values in {rows} row(s)",
+            l.len()
+        ));
+    }
+    if let Some(v) = l.iter().find(|v| !v.is_finite()) {
+        return Err(format!("L must be finite numbers, got {v}"));
+    }
+    let test = catch_unwind(AssertUnwindSafe(|| -> Result<LinearTest, String> {
+        Ok(match df_method {
+            "satterthwaite" => {
+                let record = record.ok_or_else(|| {
+                    "a fit whose df_method is \"satterthwaite\" needs its satterthwaite_record"
+                        .to_string()
+                })?;
+                let st = record_state(record, p)?;
+                LinearTest::from_contrast_f(contrast_f_of(beta, &st, l, rows), DenDf::Satterthwaite)
+            }
+            "residual" => {
+                let kept: Vec<usize> = (0..p).filter(|&j| !aliased[j]).collect();
+                let c = Mat::from_fn(kept.len(), kept.len(), |a, b| vcov[kept[a]][kept[b]]);
+                let mut st = SatterthwaiteState::residual(c, nobs as f64 - kept.len() as f64);
+                if kept.len() < p {
+                    st.retained = Some(kept);
+                }
+                LinearTest::from_contrast_f(contrast_f_of(beta, &st, l, rows), DenDf::Residual)
+            }
+            "disabled" => untested_test(
+                true,
+                DenDf::Satterthwaite,
+                vec![LinearNote::NoDf {
+                    reason: NoDfReason::Disabled,
+                }],
+            ),
+            "failed" => untested_test(
+                true,
+                DenDf::Satterthwaite,
+                vec![LinearNote::NoDf {
+                    reason: NoDfReason::Failed,
+                }],
+            ),
+            "none" => wald_chisq(beta, vcov, aliased, l, rows),
+            other => return Err(format!("unknown df_method {other:?}")),
+        })
+    }))
+    .map_err(panic_message)??;
+    Ok(TermTable {
+        ss_type: SsType::Type3,
+        choice: TestChoice {
+            test: test.kind,
+            reason: ChoiceReason::Requested,
+        },
+        fixed: vec![fixed_row("contrast".to_string(), test, dispersion)],
+        notes: Vec::new(),
+        coef_names: names.to_vec(),
+    })
 }
 
 fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
@@ -3273,5 +3569,231 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    #[test]
+    fn term_labels_expand_groups_and_drop_random_terms_and_the_intercept() {
+        let cases: [(&str, &[&str], bool); 7] = [
+            (
+                "y ~ age + sex*_ssd_text + (1 | id)",
+                &["age", "sex", "_ssd_text", "sex:_ssd_text"],
+                true,
+            ),
+            ("y ~ a*(b + c)", &["a", "b", "c", "a:b", "a:c"], true),
+            ("y ~ 0 + a + b", &["a", "b"], false),
+            ("y ~ a + b - 1", &["a", "b"], false),
+            ("y ~ x + offset(o) + (1 + x | g) + (1 | h)", &["x"], true),
+            // Variables are ordered by first appearance, whatever the
+            // interaction's own order; the response is optional.
+            ("~ a + b + b:a", &["a", "b", "a:b"], true),
+            (
+                "y ~ c:b:a + x + a*b",
+                &["x", "a", "b", "b:a", "c:b:a"],
+                true,
+            ),
+        ];
+        for (formula, labels, intercept) in cases {
+            let (got, has_intercept) = term_labels(formula).expect(formula);
+            assert_eq!(got, labels, "{formula}");
+            assert_eq!(has_intercept, intercept, "{formula}");
+        }
+        assert!(term_labels("y ~ x + (1 | g").is_err());
+    }
+
+    /// `contrast_test` on the fields `run_fit` stores gives the kernel's own
+    /// test of the same `L` bit for bit: `Fit::contrast_f` on a Gaussian LMM,
+    /// on OLS (rank-deficient design included) and on a Gamma GLM,
+    /// `wald_chisq` on a binomial GLMM. The stored record carries everything the test reads.
+    #[test]
+    fn contrast_test_on_the_stored_fields_is_the_kernel_test_bitwise() {
+        let binomial = Family::Binomial {
+            link: BinomialLink::Logit,
+        };
+        let (mut numeric, factor) = sim("sim_factorial");
+        let x2: Vec<f64> = numeric["x"].iter().map(|v| 2.0 * v).collect();
+        numeric.insert("x2".to_string(), x2);
+        let with_x2 = (numeric, factor);
+        let cases = [
+            (
+                "y ~ g + h + x + (1 + x | subj)",
+                sim("sim_factorial"),
+                "gaussian",
+                "identity",
+                Family::Gaussian,
+                "satterthwaite",
+            ),
+            (
+                "y ~ g + h + x",
+                sim("sim_factorial"),
+                "gaussian",
+                "identity",
+                Family::Gaussian,
+                "residual",
+            ),
+            (
+                "y ~ g + x + x2 + h",
+                with_x2,
+                "gaussian",
+                "identity",
+                Family::Gaussian,
+                "residual",
+            ),
+            (
+                "y ~ x + grp",
+                sim("glm_gamma"),
+                "gamma",
+                "log",
+                Family::Gamma {
+                    link: GammaLink::Log,
+                },
+                "residual",
+            ),
+            (
+                "y ~ g + h + x + (1 | subj)",
+                sim("sim_factorial_bern"),
+                "binomial",
+                "logit",
+                binomial,
+                "none",
+            ),
+        ];
+        let mut tested = 0;
+        for (formula, data, family, link, fam, df_method) in cases {
+            let r = run(formula, data.clone(), family, link, 1, None, None);
+            let (_, fit) = direct(formula, &data, fam, 1, None, None);
+            assert_eq!(r.df_method, df_method, "{formula}");
+            assert_eq!(
+                r.satterthwaite_record.is_some(),
+                df_method == "satterthwaite"
+            );
+            let p = r.beta.len();
+            let unit = |j: usize| {
+                (0..p)
+                    .map(|k| f64::from(u8::from(k == j)))
+                    .collect::<Vec<_>>()
+            };
+            let mixed: Vec<f64> = (0..p).map(|k| 0.5 * k as f64 - 1.0).collect();
+            // Two rows, the same two plus their sum (rank 2 of 3), one row
+            // touching every column (the aliased `x2` on the third case).
+            let ls: Vec<Vec<f64>> = vec![
+                [unit(1), unit(2)].concat(),
+                [
+                    unit(1),
+                    mixed.clone(),
+                    unit(1).iter().zip(&mixed).map(|(a, b)| a + b).collect(),
+                ]
+                .concat(),
+                mixed.clone(),
+            ];
+            for l in ls {
+                let rows = l.len() / p;
+                let table = contrast_test(
+                    r.df_method,
+                    &r.beta,
+                    &r.vcov,
+                    &r.aliased,
+                    r.nobs,
+                    r.dispersion,
+                    r.satterthwaite_record.clone(),
+                    &r.names,
+                    &l,
+                    rows,
+                )
+                .expect("a test");
+                let got = term_columns(&table);
+                let want = match df_method {
+                    "none" => wald_chisq(&fit.beta, &fit.vcov, fit.aliased(), &l, rows),
+                    _ => LinearTest::from_contrast_f(
+                        fit.contrast_f(&l, rows).expect("a df record"),
+                        if df_method == "satterthwaite" {
+                            DenDf::Satterthwaite
+                        } else {
+                            DenDf::Residual
+                        },
+                    ),
+                };
+                let (den_df, den_df_kind) = den_df_fields(want.reference);
+                assert_eq!(
+                    [
+                        got.statistic[0],
+                        got.num_df[0],
+                        got.den_df[0],
+                        got.p_value[0]
+                    ]
+                    .map(f64::to_bits),
+                    [want.statistic, want.num_df, den_df, want.p_value].map(f64::to_bits),
+                    "{formula}: {l:?}"
+                );
+                assert_eq!(
+                    (got.kind[0], got.den_df_kind[0]),
+                    (kind_tag(want.kind), den_df_kind)
+                );
+                let notes: Vec<String> = want
+                    .notes
+                    .iter()
+                    .map(|n| linear_note_line(*n, &r.names))
+                    .collect();
+                assert_eq!(got.row_notes[0], notes, "{formula}: {l:?}");
+                tested += 1;
+            }
+        }
+        assert_eq!(tested, 15);
+    }
+
+    #[test]
+    fn contrast_test_refuses_a_missing_or_bad_record() {
+        let r = run(
+            "y ~ g + h + x + (1 | subj)",
+            sim("sim_factorial"),
+            "gaussian",
+            "identity",
+            1,
+            None,
+            None,
+        );
+        let e = vec![1.0; r.beta.len()];
+        let test = |df_method: &str, record: Option<SatterthwaiteRecord>| {
+            contrast_test(
+                df_method,
+                &r.beta,
+                &r.vcov,
+                &r.aliased,
+                r.nobs,
+                r.dispersion,
+                record,
+                &r.names,
+                &e,
+                1,
+            )
+        };
+        let rec = r.satterthwaite_record.clone();
+        assert!(test("satterthwaite", rec.clone()).is_ok());
+        let err = |res: Result<TermTable, String>| res.unwrap_err();
+        assert!(err(test("satterthwaite", None)).contains("needs its satterthwaite_record"));
+        let mut short = rec.expect("a record");
+        short.c.pop();
+        assert!(err(test("satterthwaite", Some(short))).contains("is malformed"));
+        assert!(err(test("other", None)).contains("unknown df_method"));
+        // A Gaussian LMM with no pass: the NaN F row with its reason.
+        let row = term_columns(&test("failed", None).expect("a row"));
+        assert_eq!((row.kind[0], row.den_df_kind[0]), ("F", "satterthwaite"));
+        assert!([
+            row.statistic[0],
+            row.num_df[0],
+            row.den_df[0],
+            row.p_value[0],
+            row.sum_sq[0]
+        ]
+        .iter()
+        .all(|v| v.is_nan()));
+        assert_eq!(
+            row.row_notes[0],
+            [linear_note_line(
+                LinearNote::NoDf {
+                    reason: NoDfReason::Failed
+                },
+                &r.names
+            )]
+        );
     }
 }

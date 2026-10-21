@@ -2292,52 +2292,62 @@ fn assemble<T: TailKernel>(
     // `rᵢ'S⁻¹rⱼ` off the forms above: `yi`/`yj` the two rows' core solves,
     // `ti`/`tj` their crossed values on the shared columns `tc` (one row's own
     // crossed entries: both bilinear partners of a row here are that row and a
-    // θ-derivative of it, which share its crossed columns). Only the columns
-    // in `cols` (cluster `f`'s coupling columns, sorted) enter: a column
-    // outside them (a θ-pinned crossed grouping the `f64` pattern dropped and
-    // a dual packer kept) is skipped.
-    let tail_form =
-        |f: usize, cols: &[u32], yi: &[T], yj: &[T], tc: &[u32], ti: &[T], tj: &[T]| -> T {
-            let (hb, nc) = (qc * coup_ptr[f] as usize, cols.len());
-            let gb = f * qc * qc;
-            let mut t_gg = T::ZERO;
-            for l1 in 0..qc {
-                let mut inner = T::ZERO;
-                for l2 in 0..qc {
-                    inner += tail_g[gb + l1 * qc + l2] * yj[l2];
-                }
-                t_gg += yi[l1] * inner;
+    // θ-derivative of it, which share its crossed columns), and `tp` those
+    // columns' positions in `cols` (cluster `f`'s coupling columns, sorted):
+    // the row's `coup_pos` slice.
+    //
+    // Every column of `tc` is in `cols`, at `tp`. `cross_col`/`n_cross` are
+    // written only by `build_packed_m`, and every caller of it on the shared
+    // pattern rebuilds the CSR and `coup_pos` from the arrays it just wrote
+    // whenever the θ-pinning key changes (`structured_laplace_deviance`,
+    // `structured_stream_deviance`). The key is the set of pinned crossed
+    // groupings `build_packed_m` drops: at `T = f64` the groupings at θ = 0,
+    // at a dual `T` none (the dual packer keeps a pinned grouping, and its
+    // CSR is the full pattern). Every assembly reads the pattern its own
+    // value or mode solve left, so a row's columns, the CSR and the positions
+    // always describe one pattern.
+    let tail_form = |f: usize,
+                     cols: &[u32],
+                     yi: &[T],
+                     yj: &[T],
+                     tc: &[u32],
+                     tp: &[u32],
+                     ti: &[T],
+                     tj: &[T]|
+     -> T {
+        let (hb, nc) = (qc * coup_ptr[f] as usize, cols.len());
+        let gb = f * qc * qc;
+        let mut t_gg = T::ZERO;
+        for l1 in 0..qc {
+            let mut inner = T::ZERO;
+            for l2 in 0..qc {
+                inner += tail_g[gb + l1 * qc + l2] * yj[l2];
             }
-            let mut t_cross = T::ZERO;
-            for (z, &b) in tc.iter().enumerate() {
-                let Ok(j) = cols.binary_search(&b) else {
-                    continue;
-                };
-                let mut hi = T::ZERO;
-                let mut hj = T::ZERO;
-                for l in 0..qc {
-                    hi += yi[l] * tail_h[hb + l * nc + j];
-                    hj += yj[l] * tail_h[hb + l * nc + j];
-                }
-                t_cross += hi * tj[z] + hj * ti[z];
+            t_gg += yi[l1] * inner;
+        }
+        let mut t_cross = T::ZERO;
+        for (z, &b) in tc.iter().enumerate() {
+            let j = tp[z] as usize;
+            debug_assert_eq!(cols[j], b, "a row's crossed column sits at its coup_pos");
+            let mut hi = T::ZERO;
+            let mut hj = T::ZERO;
+            for l in 0..qc {
+                hi += yi[l] * tail_h[hb + l * nc + j];
+                hj += yj[l] * tail_h[hb + l * nc + j];
             }
-            let mut t_tt = T::ZERO;
-            for (z1, &b1) in tc.iter().enumerate() {
-                if cols.binary_search(&b1).is_err() {
-                    continue;
-                }
-                let col = &tail_inv[b1 as usize * e..b1 as usize * e + e];
-                let mut inner = T::ZERO;
-                for (z2, &b2) in tc.iter().enumerate() {
-                    if cols.binary_search(&b2).is_err() {
-                        continue;
-                    }
-                    inner += tj[z2] * col[b2 as usize];
-                }
-                t_tt += ti[z1] * inner;
+            t_cross += hi * tj[z] + hj * ti[z];
+        }
+        let mut t_tt = T::ZERO;
+        for (z1, &b1) in tc.iter().enumerate() {
+            let col = &tail_inv[b1 as usize * e..b1 as usize * e + e];
+            let mut inner = T::ZERO;
+            for (z2, &b2) in tc.iter().enumerate() {
+                inner += tj[z2] * col[b2 as usize];
             }
-            t_gg - t_cross + t_tt
-        };
+            t_tt += ti[z1] * inner;
+        }
+        t_gg - t_cross + t_tt
+    };
 
     let canonical = crate::family::is_canonical(family);
     let exact_obj = crate::family::exact_curvature_differs(family);
@@ -2457,8 +2467,9 @@ fn assemble<T: TailKernel>(
                 T::ZERO
             } else {
                 let tc = &cross_col[cbase..cbase + ncz];
+                let tp = &coup_pos[cbase..cbase + ncz];
                 let tv = &cross_theta[..ncz];
-                tail_form(f, cols, &yb[..qc], &yb[..qc], tc, tv, tv)
+                tail_form(f, cols, &yb[..qc], &yb[..qc], tc, tp, tv, tv)
             };
             core_acc + tail_acc
         };
@@ -2574,12 +2585,14 @@ fn assemble<T: TailKernel>(
                     T::ZERO
                 } else {
                     let tc = &cross_col[cbase..cbase + ncz];
+                    let tp = &coup_pos[cbase..cbase + ncz];
                     tail_form(
                         f,
                         cols,
                         &yb[..qc],
                         &ya[..qc],
                         tc,
+                        tp,
                         &cross_theta[..ncz],
                         &cvd[..ncz],
                     )

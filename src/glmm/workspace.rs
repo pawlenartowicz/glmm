@@ -1026,6 +1026,20 @@ pub struct GlmmWorkspace {
     /// Hessian at least once, so `bfgs` holds an estimate a curvature hint can
     /// be taken from. Reset at the top of every `fit_glmm`.
     pub(crate) grad_hint_ready: bool,
+    /// The caller's opt-in to whitening β̃ by the β information on a Laplace
+    /// gradient search (`FitWorkspace::set_beta_info_scaling`). `false` by
+    /// default: the search whitens β̃ by the design (`BetaScale::set`).
+    pub(crate) beta_info_scaling: bool,
+    /// Whether the last gradient search ran on β̃ whitened by the β
+    /// information (`BetaScale::set_info`, a Laplace fit on the opt-in
+    /// without a caller's hint) rather than by the design. Its estimate is
+    /// then mapped into the design's coordinates by `grad_beta_map` before a
+    /// curvature hint is taken from it.
+    pub(crate) grad_beta_info: bool,
+    /// Two row-major `p×p` blocks: `T = L_setᵀ·L_info⁻ᵀ`, the map from the
+    /// information-whitened β̃ to the design-whitened one, then `L_setᵀ`, the
+    /// scratch it is built from. Valid when `grad_beta_info`.
+    pub(crate) grad_beta_map: Vec<f64>,
     /// The response units `c` (the kernel fits `y/c`) of the search whose
     /// state the workspace holds: set by `fit::glmm::fit_glmm_in_units`, put
     /// back with that state when `fit::glmm::gamma_inverse_retry` keeps an
@@ -1513,6 +1527,9 @@ impl GlmmWorkspace {
             grad_scratch: Vec::new(),
             grad_hint_in: None,
             grad_hint_ready: false,
+            beta_info_scaling: false,
+            grad_beta_info: false,
+            grad_beta_map: vec![0.0; 2 * p * p],
             search_units: 1.0,
             pirls: PirlsScratch::for_shape(max_n, k, q, n_primary, nagq).with_profile_rows(
                 if layout == GlmmLayout::Packed {

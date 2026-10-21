@@ -1261,6 +1261,18 @@ pub struct FixedRow {
     pub mean_sq: Option<f64>,
 }
 
+/// A [`FixedRow`] of `test`, with `Sum Sq` and `Mean Sq` from `dispersion` on
+/// an F row.
+pub(crate) fn fixed_row(label: String, test: LinearTest, dispersion: f64) -> FixedRow {
+    let ms = (test.kind == LinearKind::F).then_some(test.statistic * dispersion);
+    FixedRow {
+        label,
+        sum_sq: ms.map(|ms| ms * test.num_df),
+        mean_sq: ms,
+        test,
+    }
+}
+
 /// The per-term tests of one fit ([`term_tests`]).
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq)]
@@ -1528,15 +1540,7 @@ pub(crate) fn term_tests_cached(
     let fixed = hypotheses
         .into_iter()
         .zip(tests)
-        .map(|(h, test)| {
-            let ms = f_rows.then_some(test.statistic * fit.dispersion);
-            FixedRow {
-                label: h.term,
-                sum_sq: ms.map(|ms| ms * test.num_df),
-                mean_sq: ms,
-                test,
-            }
-        })
+        .map(|(h, test)| fixed_row(h.term, test, fit.dispersion))
         .collect();
     Ok(TermTable {
         ss_type: opts.ss_type,
@@ -1914,16 +1918,14 @@ fn dispersion_start(lowered: &Lowered, fit: &Fit) -> Option<f64> {
     (estimated && fit.dispersion.is_finite() && fit.dispersion > 0.0).then_some(fit.dispersion)
 }
 
-/// One term's test: the F of [`Fit::contrast_f`] on an F row, labelled
-/// `den_df_kind`, else the Wald χ², with the NaN rows of [`term_tests`].
-fn term_test(
-    fit: &Fit,
-    h: &TermHypothesis,
-    term: &FixedTerm,
+/// The NaN row of a test that did not run, carrying `notes`: an F row
+/// labelled `den_df_kind` when `f_rows`, else a χ² row.
+pub(crate) fn untested_test(
     f_rows: bool,
     den_df_kind: DenDf,
+    notes: Vec<LinearNote>,
 ) -> LinearTest {
-    let untested = |notes| LinearTest {
+    LinearTest {
         statistic: f64::NAN,
         kind: if f_rows {
             LinearKind::F
@@ -1942,11 +1944,24 @@ fn term_test(
         },
         p_value: f64::NAN,
         notes,
-    };
+    }
+}
+
+/// One term's test: the F of [`Fit::contrast_f`] on an F row, labelled
+/// `den_df_kind`, else the Wald χ², with the NaN rows of [`term_tests`].
+fn term_test(
+    fit: &Fit,
+    h: &TermHypothesis,
+    term: &FixedTerm,
+    f_rows: bool,
+    den_df_kind: DenDf,
+) -> LinearTest {
     let (rows, p) = (h.l.nrows(), h.l.ncols());
     if rows == 0 {
         let aliased = term.columns.clone().filter(|&j| fit.aliased()[j]);
-        return untested(
+        return untested_test(
+            f_rows,
+            den_df_kind,
             aliased
                 .map(|column| LinearNote::AliasedColumn { column })
                 .collect(),
@@ -1956,13 +1971,15 @@ fn term_test(
         .flat_map(|i| (0..p).map(move |j| h.l[(i, j)]))
         .collect();
     if l.iter().any(|v| !v.is_finite()) {
-        return untested(Vec::new());
+        return untested_test(f_rows, den_df_kind, Vec::new());
     }
     if !f_rows {
         return wald_chisq(&fit.beta, &fit.vcov, fit.aliased(), &l, rows);
     }
     match fit.contrast_f(&l, rows) {
         Ok(cf) => LinearTest::from_contrast_f(cf, den_df_kind),
-        Err(ContrastError::NoDf(reason)) => untested(vec![LinearNote::NoDf { reason }]),
+        Err(ContrastError::NoDf(reason)) => {
+            untested_test(f_rows, den_df_kind, vec![LinearNote::NoDf { reason }])
+        }
     }
 }

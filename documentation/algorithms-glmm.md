@@ -496,7 +496,8 @@ minimum, checked with `any_within` exactly as `fit_glmm` does.
 
 **Warm-start guard and `PqlThenJoint` fallback.** A warm fit
 (`theta_start.is_some()`) first evaluates the outer objective — the route's
-own Profile mode when stage 1 runs, `BetaMode::Fixed` otherwise — at both the
+own Profile mode when stage 1 runs, `ProfilePql` on the BFGS route's Laplace
+fits, `BetaMode::Fixed` otherwise — at both the
 caller's θ₀ and the blind cold start `GlmmWorkspace::from_groupings` would have used, and
 begins the search from whichever is lower; a tie or a non-finite warm value
 goes to cold. A start whose θ is the blind θ₀ bit for bit skips the guard on
@@ -511,7 +512,9 @@ radius of a bound (an NB `ln θ_NB` just under its upper bound, a θ₀ above th
 θ box); that first call misses the guard's point and solves its own from
 û = 0, β₀ and a cleared memory, as a cold fit's first call does. So the guard
 costs one extra Laplace-deviance evaluation on a warm fit when the hand-over
-hits, two when it misses and two on the `Joint` route, all outside the
+hits, two when it misses and two on the `Joint` route (one `ProfilePql` solve
+when the BFGS route keeps the warm start and two when it does not, below), all
+outside the
 reported `n_eval`, and a warm fit the guard sends to the blind start runs the
 cold fit's search from the same first state. Measured on the far-warm-start
 scan (x86_64): all 1009 such fits are the cold fit bit for bit.
@@ -578,15 +581,14 @@ starts that fail without the trust region.
 Gamma (log and inverse link) GLMM with at least two θ on the blocked or the
 structured layout searches with projected BFGS instead of the `ExactProfile`
 BOBYQA search. A warm fit (a caller's θ start the start guard keeps or
-compares) does too, except one with no random-slope block whose primary
-grouping averages 50 rows per level or more (`GRAD_WARM_SCALAR_ROWS_MAX`),
-which stays on BOBYQA. An AGQ fit (`nAGQ > 1`) of a binomial (logit or probit
-link) or Poisson GLMM with one scalar random intercept and no other grouping,
-the shapes the exact AGQ gradient covers (`agq_gradient::covers_shape`),
-searches with it instead of the joint BOBYQA search when its grouping averages
-fewer than 50 rows per level (the same `GRAD_WARM_SCALAR_ROWS_MAX`, on cold and
-warm AGQ fits alike); one θ is enough there, because the search it replaces is
-the joint one, not `ExactProfile`. A warm AGQ fit routes only when every
+compares) does too, at any rows per level. An AGQ fit (`nAGQ > 1`) of a
+binomial (logit or probit link) or Poisson GLMM with one scalar random
+intercept and no other grouping, the shapes the exact AGQ gradient covers
+(`agq_gradient::covers_shape`), searches with it instead of the joint BOBYQA
+search when its grouping averages fewer than 50 rows per level
+(`GRAD_WARM_SCALAR_ROWS_MAX`, on cold and warm AGQ fits alike); one θ is
+enough there, because the search it replaces is the joint one, not
+`ExactProfile`. A warm AGQ fit routes only when every
 diagonal θ₀ of its start is at least `GRAD_WARM_AGQ_THETA_MIN = 0.05`: a start
 at or near a zero variance ends near θ = 0, where no endpoint is certified, and
 pays the polish (step 3 below). Measured 2026-10-10 against the joint search
@@ -599,8 +601,8 @@ Laplace fits keep their BOBYQA routes. The rule reads the shape, the start
 kind, the rows per level and, on a warm fit, the start's θ only.
 
 **The objective** is the fixed-β Laplace deviance over `γ̃ = [θ | β̃]`, θ on
-the symmetric box `±THETA_HI`, β whitened as the joint BOBYQA search's
-(`BetaScale`, `β̃ = Lᵀβ`). Every evaluation runs PIRLS at `pirls_tol` from the
+the symmetric box `±THETA_HI`, β whitened (`BetaScale`, `β̃ = Lᵀβ`; see the
+start below for which `L`). Every evaluation runs PIRLS at `pirls_tol` from the
 incumbent's mode. A value whose PIRLS solve runs its iteration cap is a
 failed trial, so an accepted point always rests on a converged mode. On a
 covered AGQ shape the value is the fixed-β AGQ deviance at `nAGQ` nodes, the
@@ -631,21 +633,64 @@ entry costs one O(n) sum. The θ and β entries are the binomial/Poisson ones on
 the weights `wᵢ/φ`. A held φ leaves the search on `[θ | β̃]` at that φ.
 The `ln φ` scale probes of the BOBYQA route (`DISP_SCALE_*`) do not run here.
 
-**Start curvature of `ψ` on the inverse link.** The driver starts from the
-identity, which treats ψ like a θ coordinate, while ψ's curvature at fixed ξ,
-`Gₚ''(ψ) + P_φ`, is of order n. On the inverse link the search seeds ψ's
-diagonal entry of the start inverse Hessian with `1/(Gₚ''(ψ) + P_φ)`
-(`GradSearch::start_curvature`), unless a curvature hint is given. The
-first-step cap and Shanno's first rescaling then read and scale only the
-other coordinates, and ψ's entry keeps its value through every restart.
-Without the seed the first capped step is spent on ψ, the first secant pair
+**β̃ whitening and start curvature on Laplace fits.** The joint BOBYQA
+search's whitening (`BetaScale::set`, the design and the prior weights) leaves
+the deviance's curvature along a β̃ axis at about `2·Σ(working weight)`,
+except along the coefficients the random effects absorb (on four measured
+cells the intercept's was 30 to 77 where `2·Σw` was 5,800 to 81,000), while
+θ's curvatures are tens. So on the loop tier's opt-in
+(`FitWorkspace::set_beta_info_scaling`), on a Laplace fit without a curvature
+hint, cold or warm, one `ProfilePql` solve at the search's start θ and β (from the search's
+own first modes, outside `n_eval`) fills `border.schur` with the β
+information net of what the random effects absorb, and the search whitens β
+by it (`BetaScale::set_info`, as the joint search's second pass does). Every
+β̃ axis then has curvature about `2·Σ(prior weight)`, and the search seeds
+every β̃ diagonal entry of its start inverse Hessian with
+`1/(2·Σ prior weight)` (`GradSearch::start_curvature`). When the start
+guard keeps a warm start, its last solve is this one (`ProfilePql` at the same
+θ and dispersion, from û = 0 and β₀), and the search reads the border it left
+instead of solving again. A start solve that is not finite, or an information `set_info`
+refuses, keeps the design whitening and the identity start; so do a hinted
+fit (its hint is in the design whitening's coordinates) and an AGQ fit.
+Measured 2026-10-20 against the design whitening and the identity start, BFGS
+search time (geometric mean) on generated cells with 30 levels at 5 to 500
+rows each was 0.52 cold and 0.74 from the generating values on Poisson, 0.75
+and 0.89 on binomial, 0.91 and 0.95 on Gamma; on the grid's cells with 2+ θ
+0.84 to 1.02 cold and 0.93 to 0.99 from the generating values. No endpoint
+ended more than 1e-6 above the BOBYQA optimum. It is off by default, so
+`fit_cold`, `fit_warm` and `fit_on` without the opt-in keep the design
+whitening and the identity start: measured 2026-10-21 in evaluations against
+them, it took 21% more on 144 cold fits of generated data built unlike the
+grid (uneven groups, skewed covariates on mixed scales, misspecified random
+effects), and 2% to 6% fewer on warm fits.
+
+**Start curvature of `ψ` on the inverse link.** ψ's curvature at fixed ξ,
+`Gₚ''(ψ) + P_φ`, is of order n, and the identity's entry treats it like a θ
+coordinate. On the inverse link the search seeds ψ's diagonal entry of the
+start inverse Hessian with `1/(Gₚ''(ψ) + P_φ)` (`GradSearch::start_curvature`),
+unless a curvature hint is given. Without the seed the first capped step is spent on ψ, the first secant pair
 is ψ's, and Shanno's scale shrinks θ and β̃ to ψ's units: the q6 and q8
 inverse-link cells then ran out of iterations. Read over all coordinates,
 Shanno's scale also sent a random-slope fit to a local minimum 0.029 above
 the optimum (`gamma_inverse_gradient_route_matches_bobyqa_in_any_units`,
 y·2⁻⁵). On the log link the seed costs warm starts more evaluations than it
-saves cold ones (measured on the grid's routed Gamma/log cells), so the search
-starts from the identity there.
+saves cold ones (measured on the grid's routed Gamma/log cells), so ψ keeps
+the identity's entry there.
+
+**Seeded entries in the driver.** A seeded entry keeps its value through
+Shanno's first rescaling and every restart, and the first-step cap reads and
+scales only the unseeded coordinates. Shanno's rescaling gives each contiguous
+run of unseeded coordinates its own `sᵀy/yᵀy` (θ alone, and an unseeded ψ
+alone, when β̃ is seeded between them). A run whose pair carries no positive
+curvature takes the ratio over every unseeded coordinate, and the full
+`sᵀy/yᵀy` only when that pair carries none either. Rescaled from the first
+pair, β̃ ended fits certified up to 1.8e-4 above the optimum, the decrement
+`½·gᵀHg` too small, so it keeps its seed. When the unseeded coordinates'
+first pair moved but carries no positive curvature (the step crossed a
+concave stretch), the full ratio would be the seeded coordinates' and shrink
+the rest to their units, so the first update is skipped and the next step
+starts again from the start matrix under the first-step cap
+(`bfgs_skips_the_first_update_on_a_concave_unseeded_step`).
 
 **One mode solve per point.** The gradient at an accepted point is assembled
 off the state that point's value evaluation left (`gradient_at_mode`): the
@@ -716,8 +761,12 @@ A warm fit whose θ start has a diagonal above `GRAD_WARM_THETA_MAX = 10` takes
 the BOBYQA route: from such far starts the joint search ended in a worse local
 minimum than `ExactProfile` on 2 of 600 cloglog crossed starts
 (`far_warm_start_scan`). This rule applies to AGQ unchanged. A warm Laplace
-fit keeps the shape's own start guard (on the exact profile) and starts the
-search from the guard's profiled β̂. A warm AGQ fit keeps the AGQ guard, which
+fit's start guard compares the two starts on the PQL profile, not the shape's
+stage-1 mode, solving the blind start first and the caller's last, and the
+search starts from the winner's profiled β̂. The guard keeps no hand-over
+cache here, so a BOBYQA fallback solves its own start. On 3,370 such warm
+fits (2026-10-20) the PQL profile picked the same start as the exact profile
+on all but 4, whose fitted deviances moved by at most 2e-10. A warm AGQ fit keeps the AGQ guard, which
 compares the starts on the fixed-β AGQ objective at β₀ (there is no stage 1 to
 profile on), and starts the search from β₀ at the guard's θ.
 
@@ -729,7 +778,12 @@ on a reused workspace matches a fresh one bit for bit
 **Curvature hint.** `loop_advanced::curvature_hint` after a routed pilot fit
 returns the pilot search's own final BFGS inverse-Hessian estimate over
 `[θ | β̃]` (a covered AGQ fit included), and over `[θ | β̃ | ψ]` on a free Gamma
-dispersion, at no cost. A draw that searches with BOBYQA ignores it.
+dispersion, at no cost. Its β̃ is always the design whitening's, the
+coordinates a hinted fit searches in, which depend on the design alone. After
+an information-whitened search (the opt-in above) the estimate is mapped there: with
+`β̃_set = T·β̃_info`, `T = L_setᵀ·L_info⁻ᵀ` (kept from the fit's start), the β̃
+block becomes `T·H·Tᵀ` and the cross blocks `T·H` and `H·Tᵀ`, θ and ψ
+unchanged, and the positive-definiteness check runs on the mapped matrix. A draw that searches with BOBYQA ignores it.
 `fit_on_hinted` starts each draw's search from it; the fit only reads it, so
 results do not depend on the order of the draws. After a Gamma-inverse retry
 that ran more than the first search (see
@@ -759,6 +813,9 @@ route, 50 give the BOBYQA fit bit for bit, cold and warm; a warm θ₀ = 0.02
 gives the BOBYQA fit bit for bit, 0.06 routes),
 `gradient_route_matches_the_bobyqa_route_at_a_held_gamma_dispersion`,
 `gradient_route_seeds_ln_phi_on_the_inverse_link_only`,
+`gradient_route_whitens_beta_by_its_information`,
+`gradient_route_keeps_the_design_whitening_by_default_and_on_fallback_agq_and_hinted_fits`,
+`gradient_route_curvature_hint_is_in_the_design_coordinates`,
 `gradient_route_hands_over_on_the_iteration_cap`,
 `gradient_route_is_unit_invariant_in_beta` and
 `gradient_route_curvature_hint_is_read_only_and_order_free` (a cold 7-node
@@ -771,7 +828,8 @@ alloc-tier `gradient_route_repeat_fits_allocate_no_more`), all in
 `fit_glmm_binomial_agq_parallel_inner_knob_is_bit_identical` (cbpp's Bernoulli
 rows, about 56 per herd, on BOBYQA; its aggregated rows on BFGS) and
 `joint_search_reaches_the_optimum_when_working_weights_span_decades`
-(`src/fit/glmm_tests.rs`); `bfgs_start_curvature_seeds_one_coordinate` and
+(`src/fit/glmm_tests.rs`); `bfgs_start_curvature_seeds_one_coordinate`,
+`bfgs_start_curvature_rescales_each_unseeded_run_alone` and
 `bfgs_fdelta_floor_is_finer_on_the_glmm_route` (`src/optim/tests.rs`).
 
 ## Laplace approximation

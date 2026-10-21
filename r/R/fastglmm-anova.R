@@ -1,7 +1,8 @@
-# anova() and compare(): the per-term table of one fit, and the comparison of
-# two models. The crate computes every statistic and p-value (the per-term
-# tables at fit time, the comparison in fastglmm_anova_pair and
-# fastglmm_compare); this file only lays them out. Mirrors the Python port's
+# anova(), compare() and contrast_test(): the per-term table of one fit, the
+# comparison of two models, and one joint test of a fit's coefficients. The
+# crate computes every statistic and p-value (the per-term tables at fit time,
+# the comparison in fastglmm_anova_pair and fastglmm_compare, the joint test
+# in fastglmm_contrast_test); this file only lays them out. Mirrors the Python port's
 # glmm/anova.py - change together. The per-term heading and note texts are
 # also copied in validation/tools/anova_ports/anova_ports.rs, which the anova
 # port gate compares with both ports.
@@ -301,6 +302,72 @@ print.fastglmm_comparison <- function(x, ...) {
   invisible(x)
 }
 
+#' Joint Wald test of a linear hypothesis on the fixed effects
+#'
+#' `contrast_test()` tests `L beta = 0` in one test, from what the fit stores:
+#' nothing is refitted. It is the test a lower-order term inside an
+#' interaction needs, whose coefficients a refit without the term cannot
+#' drop.
+#'
+#' On OLS, a Gaussian mixed model and the Gamma and inverse-Gaussian GLMs with
+#' an estimated dispersion (`$df_method` `"residual"` or `"satterthwaite"`)
+#' the row is the F test, on Satterthwaite's denominator df on a mixed model
+#' (lmerTest's `contestMD`) and `n - p` otherwise. A Gaussian mixed model
+#' fitted with `satterthwaite = FALSE`, or whose Satterthwaite pass failed,
+#' gets an `NA` F row with a note saying why. Every other fit gets the Wald
+#' chi-squared test, also a Poisson model with random effects, whose default
+#' [anova()][anova.fastglmm] rows are likelihood-ratio rows. A non-zero entry
+#' on an aliased coefficient gives an `NA` row and a note; an `L` whose rows
+#' span fewer directions than it has rows is tested on those directions,
+#' with a note. There is no likelihood-ratio test here: that is [compare()].
+#'
+#' The name is provisional until 1.0.0.
+#'
+#' @param object a [fastglmm] fit.
+#' @param L a numeric matrix with one column per coefficient, in the order of
+#'   [fixef()] (aliased ones included), one row per tested combination; or a
+#'   numeric vector of that length, for one row.
+#' @return A `c("anova", "data.frame")` with one row named `contrast`, in the
+#'   columns of the [anova()][anova.fastglmm] table of the same test (`Sum Sq`,
+#'   `Mean Sq`, `NumDF`, `DenDF`, `F value`, `Pr(>F)` for an F test; `Chisq`,
+#'   `Df`, `Pr(>Chisq)` for the Wald chi-squared test), and a `heading`
+#'   attribute naming the test, followed by the notes.
+#' @seealso [anova()][anova.fastglmm], [compare()]
+#' @examples
+#' set.seed(1)
+#' g <- factor(rep(1:30, each = 8))
+#' x <- rnorm(240)
+#' f <- factor(sample(c("a", "b", "c"), 240, replace = TRUE))
+#' y <- 1 + 0.5 * x + rnorm(30)[as.integer(g)] + rnorm(240)
+#' m <- fastglmm(y ~ x * f + (1 | g), data.frame(y, x, f, g))
+#' L <- matrix(0, 2, length(fixef(m)))
+#' L[cbind(1:2, match(c("fb", "fc"), names(fixef(m))))] <- 1
+#' contrast_test(m, L)
+#' @export
+contrast_test <- function(object, L) {
+  if (!inherits(object, "fastglmm")) {
+    stop(sprintf("contrast_test() takes a fastglmm fit, not a %s.", class(object)[1L]),
+         call. = FALSE)
+  }
+  .check_fields(object, "df_method")
+  if (identical(object$df_method, "satterthwaite")) {
+    .check_fields(object, "satterthwaite_record")
+  }
+  if (!is.numeric(L) || length(dim(L)) > 2L) {
+    stop(sprintf("L must be a numeric matrix or vector, got %s", .arg_repr(L)), call. = FALSE)
+  }
+  rows <- if (is.matrix(L)) nrow(L) else 1L
+  res <- fastglmm_contrast_test(
+    object$df_method, unname(as.double(object$beta)), as.double(t(object$vcov)),
+    unname(as.logical(object$aliased)), as.double(object$nobs),
+    as.double(object$dispersion), object$satterthwaite_record, names(object$beta),
+    if (is.matrix(L)) as.double(t(L)) else as.double(L), as.integer(rows))
+  # A contrast has no SS type: the crate's table carries a placeholder one.
+  res$ss_type <- NULL
+  # "Wald": the one-line heading of an explicitly asked chi-squared table.
+  .term_anova(object, res, "Wald", identical(res$kind, "F"), FALSE)
+}
+
 # The unnamed elements of `dots`; a named one is an error, as fastglmm()
 # refuses an unknown argument rather than drop it.
 .positional <- function(dots) {
@@ -415,12 +482,20 @@ print.fastglmm_comparison <- function(x, ...) {
     }
     if (!is.null(res$error)) stop(res$error, call. = FALSE)
   }
+  .term_anova(object, res, test, f_rows, lrt)
+}
+
+# The anova data frame of a stored per-term result `res` of `object`, read
+# for test `test`, or of contrast_test()'s row, whose ss_type is NULL, so its
+# heading names no type. `f_rows` says the rows are F tests, `lrt` that `res`
+# is a likelihood-ratio table.
+.term_anova <- function(object, res, test, f_rows, lrt) {
   # Satterthwaite's method is named only when some row has its df: on a fit
   # with the pass switched off or failed, no row does.
   satterthwaite <- if (length(res$label)) {
     any(res$den_df_kind == "satterthwaite" & is.finite(res$den_df))
   } else {
-    dm == "satterthwaite"
+    .df_method(object) == "satterthwaite"
   }
   # The likelihood-ratio heading's second line names the test and why it
   # ran. Mirrors the Python port's heading and
@@ -434,7 +509,7 @@ print.fastglmm_comparison <- function(x, ...) {
     }
     line <- if (lrt) {
       paste0("Likelihood-ratio chi-squared tests (each term's model refitted without it)",
-             if (identical(type, "III")) " on the reduced design")
+             if (identical(res$ss_type, "III")) " on the reduced design")
     } else {
       "Wald chi-squared tests"
     }
@@ -462,7 +537,7 @@ print.fastglmm_comparison <- function(x, ...) {
   row_notes <- unlist(Map(function(label, notes) {
     if (length(notes)) paste0(label, ": ", notes)
   }, res$label, res$row_notes), use.names = FALSE)
-  title[1L] <- paste("Type", res$ss_type, title[1L])
+  if (!is.null(res$ss_type)) title[1L] <- paste("Type", res$ss_type, title[1L])
   structure(tab, heading = c(title,
                             if (!isTRUE(object$converged)) .NOT_CONVERGED, res$notes, row_notes),
             class = c("anova", "data.frame"))

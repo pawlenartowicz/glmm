@@ -216,6 +216,21 @@ fn fit_list(r: orchestrate::FitResult) -> List {
         None => r!(NULL),
     };
     let (objective, objective_nodes) = orchestrate::objective_parts(r.objective);
+    // Its retained columns become 1-based here, as the notes' columns do, and
+    // `record_of` turns them back.
+    let satterthwaite_record: Robj = match r.satterthwaite_record {
+        Some(rec) => r!(list!(
+            a_eff = rec.a_eff,
+            jac_theta = List::from_values(rec.jac_theta.into_iter().map(|j| r!(j))),
+            c = rec.c,
+            tau = rec.tau,
+            nu = rec.nu,
+            retained = rec.retained.map_or(r!(NULL), |kept| {
+                r!(kept.iter().map(|&j| j as i32 + 1).collect::<Vec<i32>>())
+            })
+        )),
+        None => r!(NULL),
+    };
 
     list!(
         beta = r.beta,
@@ -252,6 +267,7 @@ fn fit_list(r: orchestrate::FitResult) -> List {
         coef_df = r.coef_df,
         coef_p = r.coef_p,
         df_method = r.df_method,
+        satterthwaite_record = satterthwaite_record,
         rss = r.rss,
         r_squared = r.r_squared,
         adj_r_squared = r.adj_r_squared,
@@ -641,6 +657,107 @@ fn comparison_list(c: &Comparison) -> Result<List> {
     ))
 }
 
+/// `glmm::orchestrate::contrast_test` for `contrast_test()`: one Wald test of
+/// `L beta = 0` on the fields a fit object stores. `vcov` and `l` cross
+/// flattened row-major, `l` with `rows` rows; `dispersion` crosses as a
+/// vector, so a NaN dispersion (a fit that did not converge) is not refused
+/// by extendr's scalar NA check; `record` is the fit's
+/// `satterthwaite_record`, `NULL` when it has none. Returns the one-row
+/// table as `term_list` gives it.
+///
+/// @usage NULL
+/// @keywords internal
+#[extendr]
+#[allow(clippy::too_many_arguments)]
+fn fastglmm_contrast_test(
+    df_method: &str,
+    beta: &[f64],
+    vcov: &[f64],
+    aliased: &[Rbool],
+    nobs: f64,
+    dispersion: &[f64],
+    record: Robj,
+    names: Vec<String>,
+    l: &[f64],
+    rows: i32,
+) -> Result<List> {
+    let p = beta.len();
+    let dispersion = match dispersion {
+        [v] => *v,
+        _ => return Err(Error::Other("dispersion must be one number".into())),
+    };
+    if vcov.len() != p * p {
+        return Err(Error::Other(format!(
+            "vcov has {} entries for {p} coefficients",
+            vcov.len()
+        )));
+    }
+    let vcov: Vec<Vec<f64>> = vcov.chunks(p.max(1)).map(<[f64]>::to_vec).collect();
+    let aliased: Vec<bool> = aliased.iter().map(|a| a.is_true()).collect();
+    let record = if record.is_null() {
+        None
+    } else {
+        Some(record_of(&List::try_from(&record)?)?)
+    };
+    let table = orchestrate::contrast_test(
+        df_method,
+        beta,
+        &vcov,
+        &aliased,
+        nobs as usize,
+        dispersion,
+        record,
+        &names,
+        l,
+        usize::try_from(rows).unwrap_or(0),
+    )
+    .map_err(Error::Other)?;
+    Ok(term_list(&Ok(table)))
+}
+
+/// A fit object's `satterthwaite_record`, as `fit_list` writes it, read back
+/// into `orchestrate::SatterthwaiteRecord` (its 1-based retained columns
+/// 0-based again).
+fn record_of(rec: &List) -> Result<orchestrate::SatterthwaiteRecord> {
+    let fields: HashMap<&str, Robj> = rec.iter().collect();
+    let bad = |name: &str| {
+        Error::Other(format!(
+            "satterthwaite_record field {name:?} is missing or malformed"
+        ))
+    };
+    let get = |name: &str| fields.get(name).ok_or_else(|| bad(name));
+    let reals = |name: &str| get(name)?.as_real_vector().ok_or_else(|| bad(name));
+    let real = |name: &str| -> Result<f64> {
+        match reals(name)?.as_slice() {
+            [v] => Ok(*v),
+            _ => Err(bad(name)),
+        }
+    };
+    let jac_theta = List::try_from(get("jac_theta")?)
+        .map_err(|_| bad("jac_theta"))?
+        .values()
+        .map(|j| j.as_real_vector().ok_or_else(|| bad("jac_theta")))
+        .collect::<Result<Vec<_>>>()?;
+    let retained = match get("retained")? {
+        r if r.is_null() => None,
+        r => Some(
+            r.as_integer_vector()
+                .ok_or_else(|| bad("retained"))?
+                .into_iter()
+                .map(|j| usize::try_from(j - 1).map_err(|_| bad("retained")))
+                .collect::<Result<Vec<_>>>()?,
+        ),
+    };
+    Ok(orchestrate::SatterthwaiteRecord {
+        a_eff: reals("a_eff")?,
+        jac_theta,
+        c: reals("c")?,
+        tau: real("tau")?,
+        nu: real("nu")?,
+        retained,
+    })
+}
+
 /// The refusal of `anova(m, test = "Wald")` or `test = "LRT"` on a fit
 /// whose per-term rows are F tests, in the crate's words, so both ports say
 /// the same. `satterthwaite` is TRUE when the F rows' denominator df are
@@ -667,6 +784,7 @@ extendr_module! {
     mod glmm_r;
     fn fastglmm_fit;
     fn fastglmm_confint;
+    fn fastglmm_contrast_test;
     fn fastglmm_same_fixed_part;
     fn fastglmm_compare;
     fn fastglmm_anova_pair;

@@ -5,6 +5,7 @@ import dataclasses
 import inspect
 import math
 import pickle
+import re
 import subprocess
 import sys
 import warnings
@@ -680,6 +681,97 @@ def test_nsim_and_seed_are_checked(exact_pair):
         glmm.anova(*exact_pair, nsim=True)
     with pytest.raises(ValueError, match="seed"):
         glmm.anova(*exact_pair, seed=-1)
+
+
+# -- Fit.contrast_test -----------------------------------------------------------
+
+_F_COLUMNS = ["Sum Sq", "Mean Sq", "NumDF", "DenDF", "F value", "Pr(>F)"]
+
+
+def _unit_rows(m, names):
+    L = np.zeros((len(names), len(m.names)))
+    for i, name in enumerate(names):
+        L[i, m.names.index(name)] = 1.0
+    return L
+
+
+def test_the_unit_rows_of_a_term_give_its_anova_row_bit_for_bit(lmm, pois):
+    # No interaction, so the Type III hypothesis of each term is its unit rows:
+    # the row read back from the stored fields is the kernel's own row.
+    ols = quiet_fit("y ~ x + f")
+    for m, heading in (
+        (lmm, "Analysis of Variance Table with Satterthwaite's method"),
+        (ols, "Analysis of Variance Table"),
+        (pois[0], "Analysis of Deviance Table (Wald chi-squared tests)"),
+    ):
+        tab = m.contrast_test(_unit_rows(m, ["fb", "fc"]))
+        term = glmm.anova(m, test="Wald" if m.df_method == "none" else "auto")
+        assert tab.heading == heading
+        assert (tab.row_names, tab.ss_type) == (["contrast"], None)
+        assert tab.columns == term.columns
+        for c in tab.columns:
+            np.testing.assert_array_equal(tab[c], term[c][1:2])
+        # An L given as a vector is a one-row L.
+        x_row = m.contrast_test(_unit_rows(m, ["x"])[0])
+        for c in tab.columns:
+            np.testing.assert_array_equal(x_row[c], term[c][0:1])
+    back = pickle.loads(pickle.dumps(lmm))
+    assert back.contrast_test(_unit_rows(lmm, ["fb", "fc"])).text() == (
+        lmm.contrast_test(_unit_rows(lmm, ["fb", "fc"])).text()
+    )
+
+
+def test_an_lmm_with_no_satterthwaite_pass_gets_the_nan_f_row():
+    m = quiet_fit("y ~ x + f + (1 | g)", satterthwaite=False)
+    tab = m.contrast_test(_unit_rows(m, ["x"]))
+    assert tab.heading == "Analysis of Variance Table"
+    assert all(math.isnan(tab[c][0]) for c in _F_COLUMNS)
+    note = (
+        "contrast: No denominator df (Satterthwaite degrees of freedom were not computed for "
+        "this fit), so the hypothesis was not tested."
+    )
+    assert tab.notes == [note]
+
+
+def test_an_aliased_coefficient_on_a_satterthwaite_lmm():
+    m = quiet_fit("y ~ x + x2 + f + (1 | g)", _data(x2=(2 * _X).tolist()))
+    assert m.df_method == "satterthwaite"
+    assert m.aliased.tolist() == [False, False, True, False, False]
+    assert m.satterthwaite_record["retained"] == [0, 1, 3, 4]
+    tab = m.contrast_test(_unit_rows(m, ["fb", "fc"]))
+    term = glmm.anova(m)
+    for c in tab.columns:
+        np.testing.assert_array_equal(tab[c], term[c][2:3])
+    assert m.contrast_test(_unit_rows(m, ["x", "x2"])).notes == [
+        "contrast: The coefficient x2 is aliased, so the hypothesis was not tested."
+    ]
+
+
+def test_a_fit_stored_by_0_6_1_runs_unless_it_is_a_satterthwaite_lmm(lmm):
+    def stored_by_0_6_1(m):
+        o = object.__new__(glmm.Fit)
+        o.__dict__.update({k: v for k, v in m.__dict__.items() if k != "satterthwaite_record"})
+        return pickle.loads(pickle.dumps(o))
+
+    m = quiet_fit("y ~ x + f")
+    L = _unit_rows(m, ["fb", "fc"])
+    assert stored_by_0_6_1(m).contrast_test(L).text() == m.contrast_test(L).text()
+    with pytest.raises(ValueError, match=r"this fit has no satterthwaite_record.*Refit"):
+        stored_by_0_6_1(lmm).contrast_test(_unit_rows(lmm, ["x"]))
+
+
+def test_contrast_test_refuses_an_l_of_the_wrong_shape_or_not_finite(lmm):
+    p = len(lmm.names)
+    for L, message in (
+        (np.zeros(p + 1), f"L must have {p} columns"),
+        (np.zeros((2, p - 1)), f"L must have {p} columns"),
+        (np.zeros((0, p)), "L must have at least one row"),
+        (np.zeros((1, 1, p)), "L must be a vector or a matrix, got 3 dimensions"),
+        (np.full(p, np.nan), "L must be finite numbers, got NaN"),
+        (np.full(p, np.inf), "L must be finite numbers, got inf"),
+    ):
+        with pytest.raises(ValueError, match=re.escape(message)):
+            lmm.contrast_test(L)
 
 
 # -- pandas ---------------------------------------------------------------------

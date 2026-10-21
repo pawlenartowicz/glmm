@@ -107,6 +107,34 @@ fn bfgs_fdelta_floor_is_finer_on_the_glmm_route() {
     assert!(glmm_f < 0.5 * lmm_f, "GLMM {glmm_f} vs LMM {lmm_f}");
 }
 
+/// A [`Closed`] objective that seeds `seed`'s `(index, inverse curvature)`
+/// entries, counting the asks and recording every value point.
+struct Seeded<F, G> {
+    inner: Closed<F, G>,
+    seed: Vec<(usize, f64)>,
+    asked: std::cell::Cell<usize>,
+    points: Vec<Vec<f64>>,
+}
+
+impl<F: FnMut(&[f64]) -> f64, G: FnMut(&[f64], &mut [f64])> Objective for Seeded<F, G> {
+    fn value(&mut self, x: &[f64], resolution: f64) -> Option<f64> {
+        self.points.push(x.to_vec());
+        self.inner.value(x, resolution)
+    }
+}
+
+impl<F: FnMut(&[f64]) -> f64, G: FnMut(&[f64], &mut [f64])> GradObjective for Seeded<F, G> {
+    fn gradient(&mut self, g: &mut [f64]) -> bool {
+        self.inner.gradient(g)
+    }
+    fn start_curvature(&self, inv_curv: &mut [f64]) {
+        self.asked.set(self.asked.get() + 1);
+        for &(i, v) in &self.seed {
+            inv_curv[i] = v;
+        }
+    }
+}
+
 /// The start-curvature seed, on `f = ½·Σ cᵢ(xᵢ − x*ᵢ)²` with `c = (1, 1,
 /// 1e4)` and the stiff coordinate seeded with its exact `1/c₂`. The first step
 /// takes coordinate 2 to its optimum unscaled while the 0.5 first-step cap
@@ -117,27 +145,6 @@ fn bfgs_fdelta_floor_is_finer_on_the_glmm_route() {
 /// asked, and the first trial is the uncapped `x₀ − h0·g`.
 #[test]
 fn bfgs_start_curvature_seeds_one_coordinate() {
-    struct Seeded<F, G> {
-        inner: Closed<F, G>,
-        seed: Option<(usize, f64)>,
-        asked: std::cell::Cell<usize>,
-        points: Vec<Vec<f64>>,
-    }
-    impl<F: FnMut(&[f64]) -> f64, G: FnMut(&[f64], &mut [f64])> Objective for Seeded<F, G> {
-        fn value(&mut self, x: &[f64], resolution: f64) -> Option<f64> {
-            self.points.push(x.to_vec());
-            self.inner.value(x, resolution)
-        }
-    }
-    impl<F: FnMut(&[f64]) -> f64, G: FnMut(&[f64], &mut [f64])> GradObjective for Seeded<F, G> {
-        fn gradient(&mut self, g: &mut [f64]) -> bool {
-            self.inner.gradient(g)
-        }
-        fn start_curvature(&self) -> Option<(usize, f64)> {
-            self.asked.set(self.asked.get() + 1);
-            self.seed
-        }
-    }
     let (c, xs) = ([1.0, 1.0, 1e4], [3.0, -2.0, 0.5]);
     let run = |h0: Option<&[f64]>| {
         let mut obj = Seeded {
@@ -145,7 +152,7 @@ fn bfgs_start_curvature_seeds_one_coordinate() {
                 |x: &[f64]| (0..3).map(|i| 0.5 * c[i] * (x[i] - xs[i]).powi(2)).sum(),
                 |x: &[f64], g: &mut [f64]| (0..3).for_each(|i| g[i] = c[i] * (x[i] - xs[i])),
             ),
-            seed: Some((2, 1.0 / c[2])),
+            seed: vec![(2, 1.0 / c[2])],
             asked: std::cell::Cell::new(0),
             points: Vec::new(),
         };
@@ -180,6 +187,90 @@ fn bfgs_start_curvature_seeds_one_coordinate() {
     let (_, _, asked, points) = run(Some(&eye));
     assert_eq!(asked, 0, "a hint keeps the seed out");
     assert_eq!(points[1], vec![3.0, -2.0, 5000.0], "hinted first trial");
+}
+
+/// Seeds that split the point into blocks: on `f = ½·Σ cᵢ(xᵢ − x*ᵢ)²` with
+/// `c = (1, 1, 1e4, 100)` and coordinate 2 seeded with its exact `1/c₂`, the
+/// unseeded coordinates form two runs, `{0, 1}` and `{3}`. The first step is
+/// capped over coordinates 0, 1 and 3 (the largest, coordinate 3's 100, down
+/// to 0.5). Shanno's scale, read per run, is each run's own curvature (1 and
+/// 1/100), so the start is the exact inverse Hessian, the update keeps it,
+/// and the second step is the Newton step to `x*`; one ratio over all three
+/// unseeded coordinates (about 1/100) would leave coordinates 0 and 1 a
+/// hundredth of their step.
+#[test]
+fn bfgs_start_curvature_rescales_each_unseeded_run_alone() {
+    let (c, xs) = ([1.0, 1.0, 1e4, 100.0], [3.0, -2.0, 0.5, 1.0]);
+    let mut obj = Seeded {
+        inner: closed(
+            |x: &[f64]| (0..4).map(|i| 0.5 * c[i] * (x[i] - xs[i]).powi(2)).sum(),
+            |x: &[f64], g: &mut [f64]| (0..4).for_each(|i| g[i] = c[i] * (x[i] - xs[i])),
+        ),
+        seed: vec![(2, 1.0 / c[2])],
+        asked: std::cell::Cell::new(0),
+        points: Vec::new(),
+    };
+    let mut x = [0.0; 4];
+    let out = bfgs_minimize(
+        &mut obj,
+        &mut x,
+        &[-1e5; 4],
+        &[1e5; 4],
+        &BfgsConfig::GLMM,
+        &mut BfgsState::default(),
+        None,
+    );
+    let first = &obj.points[1];
+    let want = [0.015, -0.01, 0.5, 0.5];
+    for i in 0..4 {
+        assert!((first[i] - want[i]).abs() < 1e-15, "first trial {first:?}");
+    }
+    let second = &obj.points[2];
+    for i in 0..4 {
+        assert!((second[i] - xs[i]).abs() < 1e-12, "second trial {second:?}");
+    }
+    assert_eq!(out.stop, BfgsStop::Pgrad, "{out:?}");
+}
+
+/// A first step across a concave stretch of the unseeded coordinates: on
+/// `f = x₀⁴/4 − x₀² − x₀ + ½·1e4·(x₁ − 0.5)²`, coordinate 1 seeded with its
+/// exact `1/c`, the first step takes x₁ to its optimum and the capped x₀ from
+/// 0 to 0.5, where `f₀'' < 0`, so x₀'s pair has `s·y < 0`. The full
+/// `sᵀy/yᵀy` (about 1e-4, coordinate 1's) and its update would shrink x₀'s
+/// next step to about 6e-4; with no update the second step is capped at 0.5 again, to
+/// x₀ = 1. The search still ends at the minimum `(1 + √5)/2`.
+#[test]
+fn bfgs_skips_the_first_update_on_a_concave_unseeded_step() {
+    let mut obj = Seeded {
+        inner: closed(
+            |x: &[f64]| x[0].powi(4) / 4.0 - x[0] * x[0] - x[0] + 0.5 * 1e4 * (x[1] - 0.5).powi(2),
+            |x: &[f64], g: &mut [f64]| {
+                g[0] = x[0].powi(3) - 2.0 * x[0] - 1.0;
+                g[1] = 1e4 * (x[1] - 0.5);
+            },
+        ),
+        seed: vec![(1, 1e-4)],
+        asked: std::cell::Cell::new(0),
+        points: Vec::new(),
+    };
+    let mut x = [0.0; 2];
+    let out = bfgs_minimize(
+        &mut obj,
+        &mut x,
+        &[-1e5; 2],
+        &[1e5; 2],
+        &BfgsConfig::GLMM,
+        &mut BfgsState::default(),
+        None,
+    );
+    assert_eq!(obj.points[1], vec![0.5, 0.5], "first trial");
+    assert_eq!(obj.points[2], vec![1.0, 0.5], "second trial");
+    assert_eq!(out.stop, BfgsStop::Pgrad, "{out:?}");
+    let golden = (1.0 + 5f64.sqrt()) / 2.0;
+    assert!(
+        (x[0] - golden).abs() < 1e-6 && (x[1] - 0.5).abs() < 1e-9,
+        "endpoint {x:?}"
+    );
 }
 
 #[test]
@@ -419,4 +510,21 @@ fn curvature_hint_refuses_an_indefinite_hessian() {
         true
     });
     assert!(h.is_none());
+}
+
+#[test]
+fn curvature_hint_from_parts_refuses_bad_parts() {
+    let from = super::CurvatureHint::from_parts;
+    let ok = [2.0, 0.5, 0.5, 1.0];
+    let h = from(2, &ok, 4.0).expect("good parts are accepted");
+    assert_eq!(h.units(), 4.0);
+    assert!(from(3, &ok, 1.0).is_none(), "wrong length");
+    assert!(
+        from(2, &[2.0, f64::NAN, 0.5, 1.0], 1.0).is_none(),
+        "NaN entry"
+    );
+    assert!(from(2, &ok, 0.0).is_none(), "zero units");
+    assert!(from(2, &ok, -1.0).is_none(), "negative units");
+    // Eigenvalues 3 and −1.
+    assert!(from(2, &[1.0, 2.0, 2.0, 1.0], 1.0).is_none(), "indefinite");
 }

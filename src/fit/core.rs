@@ -618,6 +618,23 @@ impl FitWorkspace {
         self.design_rows = None;
     }
 
+    /// Whiten the fixed effects of a GLMM's gradient search by their
+    /// information at the start instead of by the design, which is far off
+    /// for coefficients the random effects absorb (the intercept). It costs
+    /// one PQL mode solve per fit, shared with the start guard's when the
+    /// guard keeps a warm start. Measured in evaluations against the default
+    /// (2026-10-21): about 2% to 6% fewer on warm fits, up to a third fewer on
+    /// crossed and nested shapes, but about 21% more on cold fits of data
+    /// built unlike the accuracy grid. Binomial, Poisson and Gamma Laplace
+    /// fits that search with BFGS and get no curvature hint; no effect on
+    /// other routes. Default `false`. Loop tier only; `fit_cold`/`fit_warm`
+    /// never use it.
+    pub fn set_beta_info_scaling(&mut self, on: bool) {
+        if let FitKind::Glmm { ws } = &mut self.kind {
+            ws.beta_info_scaling = on;
+        }
+    }
+
     /// Debug builds: under the fixed-design promise, panics when this call's
     /// `x`, ids or weights differ from those of the last full setup, compared
     /// by a hash (no copy of the design is kept).

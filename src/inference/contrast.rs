@@ -172,7 +172,7 @@ impl Fit {
                 notes,
             });
         }
-        let inputs = Inputs::new(self, st);
+        let inputs = Inputs::new(&self.beta, st);
         let r = contest_1d(&inputs.contest(), &inputs.restrict(l));
         // A residual-only record has no variance parameters: its df is ν.
         let (df, p_value) = if st.residual_only() {
@@ -211,50 +211,7 @@ impl Fit {
             l.iter().all(|v| v.is_finite()),
             "contrast_f: l must be finite"
         );
-        let st = self.df_state()?;
-        let nan = |notes| ContrastF {
-            f: f64::NAN,
-            num_df: f64::NAN,
-            den_df: f64::NAN,
-            p_value: f64::NAN,
-            notes,
-        };
-        let notes = aliased_notes(st, l, p);
-        if !notes.is_empty() {
-            return Ok(nan(notes));
-        }
-        let inputs = Inputs::new(self, st);
-        let reduced: Vec<Vec<f64>> = l.chunks(p).map(|row| inputs.restrict(row)).collect();
-        let lr = Mat::from_fn(rows, inputs.beta.len(), |i, j| reduced[i][j]);
-        // The eigendecomposition of `L·C·Lᵀ` fails on non-convergence or on a
-        // non-finite `C` (the residual record of an OLS or dispersion GLM fit
-        // that did not converge); the test is then not computed, so `den_df`
-        // is NaN there while `contrast_t`'s df is ν.
-        let Ok(md) = contest_md(&inputs.contest(), lr.as_ref()) else {
-            return Ok(nan(Vec::new()));
-        };
-        // A residual-only record: every direction's df is ν, so the mean
-        // rule gives ν exactly.
-        let (den_df, p_value) = if st.residual_only() {
-            let den = fstat_ddf(&vec![st.nu; md.num_df], 1e-8);
-            (den, f_upper_p(md.f_value, md.num_df as f64, den))
-        } else {
-            (md.den_df, md.p_value)
-        };
-        let mut notes = Vec::new();
-        if md.num_df < rows {
-            notes.push(ContrastNote::RankDeficientL {
-                rank: md.num_df,
-                rows,
-            });
-        }
-        Ok(ContrastF {
-            f: md.f_value,
-            num_df: md.num_df as f64,
-            den_df,
-            p_value,
-            notes,
-        })
+        Ok(contrast_f_of(&self.beta, self.df_state()?, l, rows))
     }
 
     /// The pass's state (or the residual-only record of OLS and the
@@ -271,6 +228,61 @@ impl Fit {
             None => NoDfReason::NotGaussianMixed,
         };
         Err(ContrastError::NoDf(reason))
+    }
+}
+
+/// The test of [`Fit::contrast_f`] on `beta` (all `p` caller columns) and the
+/// df record `st`, the only two things it reads. The caller has checked `l`:
+/// `rows > 0` rows of `p` finite entries.
+pub(crate) fn contrast_f_of(
+    beta: &[f64],
+    st: &SatterthwaiteState,
+    l: &[f64],
+    rows: usize,
+) -> ContrastF {
+    let p = beta.len();
+    let nan = |notes| ContrastF {
+        f: f64::NAN,
+        num_df: f64::NAN,
+        den_df: f64::NAN,
+        p_value: f64::NAN,
+        notes,
+    };
+    let notes = aliased_notes(st, l, p);
+    if !notes.is_empty() {
+        return nan(notes);
+    }
+    let inputs = Inputs::new(beta, st);
+    let reduced: Vec<Vec<f64>> = l.chunks(p).map(|row| inputs.restrict(row)).collect();
+    let lr = Mat::from_fn(rows, inputs.beta.len(), |i, j| reduced[i][j]);
+    // The eigendecomposition of `L·C·Lᵀ` fails on non-convergence or on a
+    // non-finite `C` (the residual record of an OLS or dispersion GLM fit
+    // that did not converge); the test is then not computed, so `den_df`
+    // is NaN there while `contrast_t`'s df is ν.
+    let Ok(md) = contest_md(&inputs.contest(), lr.as_ref()) else {
+        return nan(Vec::new());
+    };
+    // A residual-only record: every direction's df is ν, so the mean
+    // rule gives ν exactly.
+    let (den_df, p_value) = if st.residual_only() {
+        let den = fstat_ddf(&vec![st.nu; md.num_df], 1e-8);
+        (den, f_upper_p(md.f_value, md.num_df as f64, den))
+    } else {
+        (md.den_df, md.p_value)
+    };
+    let mut notes = Vec::new();
+    if md.num_df < rows {
+        notes.push(ContrastNote::RankDeficientL {
+            rank: md.num_df,
+            rows,
+        });
+    }
+    ContrastF {
+        f: md.f_value,
+        num_df: md.num_df as f64,
+        den_df,
+        p_value,
+        notes,
     }
 }
 
@@ -298,10 +310,10 @@ struct Inputs<'a> {
 }
 
 impl<'a> Inputs<'a> {
-    fn new(fit: &Fit, st: &'a SatterthwaiteState) -> Self {
+    fn new(beta: &[f64], st: &'a SatterthwaiteState) -> Self {
         let beta = match st.retained.as_deref() {
-            Some(kept) => kept.iter().map(|&j| fit.beta[j]).collect(),
-            None => fit.beta.clone(),
+            Some(kept) => kept.iter().map(|&j| beta[j]).collect(),
+            None => beta.to_vec(),
         };
         let c = &st.c;
         let mut jac = st.jac_theta.clone();

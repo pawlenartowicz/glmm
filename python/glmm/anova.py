@@ -123,13 +123,15 @@ class TermTable(_Table):
     columns under a two-line `heading` that names the test. The html, latex
     and typst renders add a `Reference` column naming each row's
     distribution, `F(NumDF, DenDF)` or `χ²(Df)`, built from the row's df.
-    Name is provisional until 1.0.0."""
+    `Fit.contrast_test` returns one too: one row named "contrast", in the
+    columns of the table of its test, with `ss_type` None. Name is provisional
+    until 1.0.0."""
 
     _values: dict
     row_names: list
     heading: str
     notes: list
-    ss_type: str  # "III" or "II"
+    ss_type: str | None  # "III" or "II"; None on `Fit.contrast_test`'s row
 
     def _cells(self):
         p_col = "Pr(>F)" if "Pr(>F)" in self._values else "Pr(>Chisq)"
@@ -520,13 +522,15 @@ def _side(m):
 
 def _term_table(m, stored, test):
     """The `TermTable` of a stored per-term result (`Fit.term_table_type3`),
-    read for `glmm.anova(m, test=test)`."""
+    read for `glmm.anova(m, test=test)`, or of `Fit.contrast_test`'s row, whose
+    `ss_type` is None, so its heading names no type."""
     error = stored["error"]
     if error is not None:
         # A panic caught while the table was built is the crate's fault, not
         # the model's: an error, not a refusal.
         raise (RuntimeError if error.startswith("internal error") else ValueError)(error)
     ss = stored["ss_type"]
+    prefix = "" if ss is None else f"Type {ss} "
     labels = list(stored["label"])
     if labels:
         f_rows = stored["kind"][0] == "F"
@@ -540,7 +544,7 @@ def _term_table(m, stored, test):
         f_rows = m.df_method != "none"
         satterthwaite = m.df_method == "satterthwaite"
     if f_rows:
-        heading = f"Type {ss} Analysis of Variance Table" + (
+        heading = f"{prefix}Analysis of Variance Table" + (
             " with Satterthwaite's method" if satterthwaite else ""
         )
         values = {
@@ -566,7 +570,7 @@ def _term_table(m, stored, test):
             )
             heading = f"Type {ss} Analysis of Deviance Table\n{line}; {why}"
         else:
-            heading = f"Type {ss} Analysis of Deviance Table (Wald chi-squared tests)"
+            heading = f"{prefix}Analysis of Deviance Table (Wald chi-squared tests)"
         values = {
             "Chisq": stored["statistic"],
             "Df": stored["num_df"],

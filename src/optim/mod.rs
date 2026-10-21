@@ -57,15 +57,15 @@ pub(crate) trait GradObjective: Objective {
     /// BOBYQA).
     fn gradient(&mut self, g: &mut [f64]) -> bool;
 
-    /// A coordinate whose curvature the objective knows at the start, as
-    /// `(index, inverse curvature)`: the driver seeds that diagonal entry of
-    /// its start inverse Hessian with it (see [`bfgs::bfgs_minimize`]). Asked
+    /// The coordinates whose curvature the objective knows at the start: it
+    /// writes each one's inverse curvature into its entry of `inv_curv`
+    /// (length n, all 0 on entry), and the driver seeds those diagonal entries
+    /// of its start inverse Hessian with them (see [`bfgs::bfgs_minimize`]).
+    /// An entry left at 0, or not finite and positive, is not seeded. Asked
     /// once, right after the start's value and gradient, and only when no
-    /// caller's inverse Hessian is given. `None` (the default) starts from
-    /// the identity.
-    fn start_curvature(&self) -> Option<(usize, f64)> {
-        None
-    }
+    /// caller's inverse Hessian is given. The default seeds nothing: the
+    /// search starts from the identity.
+    fn start_curvature(&self, _inv_curv: &mut [f64]) {}
 }
 
 /// A frozen curvature estimate for the gradient search, taken once from a
@@ -102,21 +102,50 @@ pub struct CurvatureHint {
 }
 
 impl CurvatureHint {
-    /// The θ dimension the hint was taken at.
+    /// The dimension of the search the hint was taken in: n_θ for an LMM;
+    /// n_θ + p for a GLMM, + 1 on a Gamma fit whose dispersion is free.
     pub fn dim(&self) -> usize {
         self.n
     }
 
     /// Row-major `n×n` inverse Hessian.
-    pub(crate) fn inv_hessian(&self) -> &[f64] {
+    pub fn inv_hessian(&self) -> &[f64] {
         &self.inv_hessian
     }
 
+    /// The response units the hint was taken in: 1 everywhere except a Gamma
+    /// inverse-link GLMM.
+    pub fn units(&self) -> f64 {
+        self.units
+    }
+
+    /// A hint rebuilt from its parts, so it can cross a process or WASM
+    /// boundary as plain numbers: `from_parts(h.dim(), h.inv_hessian(),
+    /// h.units())` gives back `h` bit for bit. `inv_hessian` is stored as
+    /// given, not re-symmetrized, since a hint from the LMM finite-difference
+    /// path need not be bit-symmetric. `None` on a length other than `n·n`, a
+    /// value that is not finite, `units` not finite and positive, or a matrix
+    /// that is not positive definite.
+    pub fn from_parts(n: usize, inv_hessian: &[f64], units: f64) -> Option<Self> {
+        if inv_hessian.len() != n * n
+            || inv_hessian.iter().any(|v| !v.is_finite())
+            || !(units.is_finite() && units > 0.0)
+        {
+            return None;
+        }
+        spd_inverse(n, inv_hessian)?;
+        Some(Self {
+            n,
+            inv_hessian: inv_hessian.to_vec(),
+            units,
+        })
+    }
+
     /// A hint from an `n×n` row-major inverse Hessian already in hand (the
-    /// GLMM search's final BFGS estimate, in that search's `units`); `None`
-    /// unless it is symmetric positive definite and finite.
+    /// GLMM search's final BFGS estimate, in that search's `units`),
+    /// symmetrized; `None` unless [`Self::from_parts`] accepts it.
     pub(crate) fn from_inverse(n: usize, inv_hessian: &[f64], units: f64) -> Option<Self> {
-        if inv_hessian.len() != n * n || inv_hessian.iter().any(|v| !v.is_finite()) {
+        if inv_hessian.len() != n * n {
             return None;
         }
         let mut h = inv_hessian.to_vec();
@@ -127,12 +156,7 @@ impl CurvatureHint {
                 h[j * n + i] = a;
             }
         }
-        spd_inverse(n, &h)?;
-        Some(Self {
-            n,
-            inv_hessian: h,
-            units,
-        })
+        Self::from_parts(n, &h, units)
     }
 
     /// The hint at `x` within `[lo, hi]` from `grad` (the gradient at a point,

@@ -195,7 +195,9 @@
 #'   converge) and `coef_p` (its p-value), `df_method`
 #'   (`"satterthwaite"`, `"residual"`, `"none"`, `"disabled"` or `"failed"`),
 #'   `rss`, `r_squared` and `adj_r_squared` (OLS fits only, `NaN` otherwise),
-#'   `offset` (the offset fitted with, `NULL` without one), plus
+#'   `offset` (the offset fitted with, `NULL` without one),
+#'   `satterthwaite_record` (what [contrast_test()] reads on a fit whose
+#'   `df_method` is `"satterthwaite"`, `NULL` on every other fit), plus
 #'   [anova()][anova.fastglmm] (the per-term tests, built at fit time, or a
 #'   comparison of two fits), `print()`, [summary()][summary.fastglmm],
 #'   [confint()][confint.fastglmm] (Wald), `nobs()`,
@@ -498,6 +500,18 @@ fastglmm <- function(formula, data, family = gaussian(),
     coef_df = coef_df,
     coef_p = coef_p,
     df_method = r$df_method,
+    # The Satterthwaite record contrast_test() reads, on a fit whose df_method
+    # is "satterthwaite"; NULL on every other fit, whose test reads only beta,
+    # vcov, aliased, nobs and dispersion. list(a_eff, jac_theta, c, tau, nu,
+    # retained), every matrix a flat row-major double vector over the p_r
+    # retained columns: a_eff ((n_free + 1)^2, 2 blockdiag(H_p^+, tau^2 / nu)
+    # over the n_free free theta coordinates and tau), jac_theta (a list of
+    # p_r^2 vectors, dC/dtheta_k per free coordinate), c (p_r^2, Cov(beta-hat)),
+    # tau (sigma-hat^2), nu (its divisor) and retained (1-based retained
+    # columns, NULL when every column was retained). About p^2 (n_free + 1)
+    # doubles, kept by saveRDS(). Mirrors the Python port's
+    # Fit.satterthwaite_record - change together.
+    satterthwaite_record = r$satterthwaite_record,
     # OLS fits only (NaN otherwise): weighted RSS and summary.lm's R-squared pair.
     rss = r$rss,
     r_squared = r$r_squared,

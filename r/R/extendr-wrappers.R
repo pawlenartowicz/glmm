@@ -34,6 +34,18 @@ fastglmm_fit <- function(formula, numeric, factor_levels, factor_codes, family, 
 #' @keywords internal
 fastglmm_confint <- function(beta, se, coef_df, level) .Call(wrap__fastglmm_confint, beta, se, coef_df, level)
 
+#' `glmm::orchestrate::contrast_test` for `contrast_test()`: one Wald test of
+#' `L beta = 0` on the fields a fit object stores. `vcov` and `l` cross
+#' flattened row-major, `l` with `rows` rows; `dispersion` crosses as a
+#' vector, so a NaN dispersion (a fit that did not converge) is not refused
+#' by extendr's scalar NA check; `record` is the fit's
+#' `satterthwaite_record`, `NULL` when it has none. Returns the one-row
+#' table as `term_list` gives it.
+#'
+#' @usage NULL
+#' @keywords internal
+fastglmm_contrast_test <- function(df_method, beta, vcov, aliased, nobs, dispersion, record, names, l, rows) .Call(wrap__fastglmm_contrast_test, df_method, beta, vcov, aliased, nobs, dispersion, record, names, l, rows)
+
 #' `glmm::orchestrate::same_fixed_part` for `AIC.fastglmm` and
 #' `BIC.fastglmm`: TRUE when the two formula strings have the same fixed
 #' terms (compared as sets of variable names) and the same fixed intercept.

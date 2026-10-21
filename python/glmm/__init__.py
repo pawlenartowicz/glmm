@@ -6,7 +6,7 @@ PyO3 extension), and returns a `Fit`. One option is not yet implemented
 in the kernel and raises a clean `NotImplementedError`: quasi-likelihood
 `dispersion=` on binomial/poisson.
 
-Public surface is `fit`, `Fit`, the tests of `glmm.anova` (`anova`,
+Public surface is `fit`, `Fit`, `model_matrix`, `term_labels`, the tests of `glmm.anova` (`anova`,
 `compare`, `TermTable`, `ComparisonTable`, `Comparison`, in `glmm/anova.py`),
 and the warning categories the diagnostics channel raises (`DiagnosticWarning`, `AgqFallbackWarning`,
 `ArgumentIgnoredWarning`, `ConstantResponseWarning`, `DesignUnsolvableWarning`,
@@ -68,6 +68,8 @@ __all__ = [
     "anova",
     "compare",
     "fit",
+    "model_matrix",
+    "term_labels",
 ]
 
 
@@ -836,6 +838,21 @@ class Fit:
     # effects (the likelihood-ratio tables above), else the test and reason of
     # `term_table_type3`.
     term_test_auto: dict | None = None
+    # The Satterthwaite record `contrast_test` reads, on a fit whose
+    # `df_method` is "satterthwaite"; None on every other fit, whose test reads
+    # only `beta`, `vcov`, `aliased`, `nobs` and `dispersion`. A dict, every
+    # matrix in it a flat row-major float array over the p_r retained columns:
+    #   a_eff      ((n_free + 1)**2,)  2 * blockdiag(H_p^+, tau^2 / nu), over
+    #                                  the n_free free theta coordinates and tau
+    #   jac_theta  list of (p_r**2,)   dC/dtheta_k, one per free coordinate
+    #   c          (p_r**2,)           Cov(beta-hat)
+    #   tau        float               sigma-hat**2
+    #   nu         float               the divisor of sigma-hat**2
+    #   retained   list[int] | None    0-based retained columns, None when every
+    #                                  column was retained
+    # About p**2 * (n_free + 1) floats, kept in a pickle. Mirrors the R port's
+    # `object$satterthwaite_record` - change together.
+    satterthwaite_record: dict | None = None
 
     @property
     def converged(self):
@@ -943,6 +960,67 @@ class Fit:
             ),
             dtype=float,
         ).reshape(len(self.beta), 2)
+
+    def contrast_test(self, L):
+        """One Wald test of the linear hypothesis `L @ beta = 0`, as a `TermTable`
+        with one row named "contrast", laid out as `glmm.anova`'s table of the
+        same test.
+
+        L: a float array of shape (rows, p), or a vector of length p, over all
+            p coefficients in `names` order, aliased ones included.
+
+        On OLS, a Gaussian mixed model and the Gamma and inverse Gaussian GLMs
+        with phi estimated (`df_method` "residual" or "satterthwaite") the row
+        is the F test, on Satterthwaite's denominator df on a mixed model and
+        n - p otherwise. A Gaussian mixed model fitted with
+        `satterthwaite=False`, or whose Satterthwaite pass failed, gets a NaN F
+        row with a note saying why. Every other fit gets the Wald chi-squared
+        test, also a Poisson GLMM, whose default `glmm.anova` rows are
+        likelihood-ratio rows. A non-zero entry on an aliased column gives a
+        NaN row and a note; an `L` whose rows span fewer directions than it
+        has rows is tested on those directions, with a note. Nothing is
+        refitted: there is no likelihood-ratio test here, which is
+        `glmm.compare`.
+
+        Raises `ValueError` on an `L` of the wrong shape, with no rows or with
+        a value that is not finite, and on a fit made by a glmm version that
+        did not store what the test reads. The name is provisional until
+        1.0.0."""
+        from glmm.anova import _check_fields, _term_table
+
+        _check_fields(self, ["df_method"])
+        if self.df_method == "satterthwaite":
+            _check_fields(self, ["satterthwaite_record"])
+        L = np.asarray(L, dtype=float)
+        if L.ndim not in (1, 2):
+            raise ValueError(f"L must be a vector or a matrix, got {L.ndim} dimensions")
+        p = len(self.beta)
+        rec = self.satterthwaite_record
+        if rec is not None:
+            rec = {
+                "a_eff": np.asarray(rec["a_eff"], dtype=float).tolist(),
+                "jac_theta": [np.asarray(j, dtype=float).tolist() for j in rec["jac_theta"]],
+                "c": np.asarray(rec["c"], dtype=float).tolist(),
+                "tau": float(rec["tau"]),
+                "nu": float(rec["nu"]),
+                "retained": rec["retained"],
+            }
+        stored = _native.contrast_test(
+            self.df_method,
+            [float(v) for v in self.beta],
+            np.asarray(self.vcov, dtype=float).reshape(p, p).tolist(),
+            [bool(a) for a in self.aliased],
+            int(self.nobs),
+            float(self.dispersion),
+            rec,
+            list(self.names),
+            L.ravel().tolist(),
+            1 if L.ndim == 1 else L.shape[0],
+        )
+        # A contrast has no SS type: the crate's table carries a placeholder one.
+        stored["ss_type"] = None
+        # "Wald": the one-line heading of an explicitly asked chi-squared table.
+        return _term_table(self, _term_result(stored), "Wald")
 
     def residuals(self, type="response"):
         """Response (`y - fitted`) or Pearson residuals. Deviance and working
@@ -1429,21 +1507,27 @@ def _check_nagq(nagq):
         raise ValueError(f"nagq must be an odd integer in 1..={_MAX_NAGQ}, got {nagq!r}")
 
 
-def _prepare_columns(data, formulas, weights, offset, store, drop_missing_arguments=False):
+def _prepare_columns(
+    data, formulas, weights, offset, store, drop_missing_arguments=False, model_matrix=False
+):
     """The columns of `data` that `formulas` use, as `_native.fit` takes them,
     with `weights=`/`offset=` checked: `(numeric_columns, factor_columns,
     weights, offset)`. A row with a missing value in a column any of the
     formulas uses is dropped once, from every column and from the weights and
     the offset, so two formulas (`compare`) are fitted on the same rows. With
     `drop_missing_arguments` (`compare`), a row whose weight or offset is
-    missing is dropped the same way; otherwise a missing entry is refused."""
+    missing is dropped the same way; otherwise a missing entry is refused.
+    With `model_matrix`, the columns are looked up as `model_matrix` reads
+    them (`_native.model_matrix_columns`), and a row with a missing value
+    raises instead of being dropped."""
     # Only the columns the formula actually uses are read from here on — see
     # `_formula_columns`.
     used_columns = _columns(data)
+    lookup = _native.model_matrix_columns if model_matrix else _formula_columns
     used_names, missing, numeric_only = [], [], []
     for formula in formulas:
         for into, names in zip(
-            (used_names, missing, numeric_only), _formula_columns(formula, used_columns.keys())
+            (used_names, missing, numeric_only), lookup(formula, list(used_columns))
         ):
             into += [name for name in names if name not in into]
     where = "a column the formula uses"
@@ -1508,14 +1592,7 @@ def _prepare_columns(data, formulas, weights, offset, store, drop_missing_argume
 
     # A dict's columns can differ in length, so a ragged dict is refused here,
     # before the per-column masks are combined.
-    # Same message as `run_fit`'s length check in `src/orchestrate.rs` — change
-    # together.
-    lengths = sorted((name, len(keep)) for name, keep in keeps.items())
-    if len({n for _, n in lengths}) > 1:
-        detail = ", ".join(f'"{name}": {n}' for name, n in lengths)
-        raise ValueError(
-            f"columns have mismatched lengths ({detail}); all columns must have the same length"
-        )
+    _check_lengths({name: len(keep) for name, keep in keeps.items()})
     na_mask = np.logical_and.reduce(list(keeps.values())) if keeps else None
 
     # Checked against data's original rows, before the NA row drop below, as
@@ -1537,6 +1614,13 @@ def _prepare_columns(data, formulas, weights, offset, store, drop_missing_argume
     drop = na_mask is not None and not na_mask.all()
     if drop:
         n_kept = int(na_mask.sum())
+        if model_matrix:
+            # No row is dropped: a numpy array has no row names, so the design
+            # would no longer line up with the caller's own arrays.
+            raise ValueError(
+                f"{len(na_mask) - n_kept} of {len(na_mask)} row(s) have a missing value in "
+                f"{where}; drop those rows from data first"
+            )
         if n_kept == 0:
             raise ValueError(f"every row has a missing value in {where}; no rows left to fit")
         _warn(
@@ -1594,6 +1678,17 @@ def _prepare_columns(data, formulas, weights, offset, store, drop_missing_argume
     return numeric_columns, factor_columns, weights, offset
 
 
+def _check_lengths(lengths):
+    """Raise when the `{name: length}` columns of `lengths` differ in length."""
+    # Same message as `table_of`'s length check in `src/orchestrate.rs` — change
+    # together.
+    if len(set(lengths.values())) > 1:
+        detail = ", ".join(f'"{name}": {n}' for name, n in sorted(lengths.items()))
+        raise ValueError(
+            f"columns have mismatched lengths ({detail}); all columns must have the same length"
+        )
+
+
 def _term_result(t):
     """A stored per-term result (`_native.fit`'s dict) with its numeric columns
     as float arrays; see `Fit.term_table_type3`."""
@@ -1601,6 +1696,21 @@ def _term_result(t):
         return {"error": t["error"]}
     numeric = ("statistic", "num_df", "den_df", "p_value", "sum_sq", "mean_sq")
     return {k: np.asarray(v, dtype=float) if k in numeric else v for k, v in t.items()}
+
+
+def _satterthwaite_record(rec):
+    """`_native.fit`'s `satterthwaite_record` with its matrices as float arrays,
+    None when the fit has none; see `Fit.satterthwaite_record`."""
+    if rec is None:
+        return None
+    return {
+        "a_eff": np.asarray(rec["a_eff"], dtype=float),
+        "jac_theta": [np.asarray(j, dtype=float) for j in rec["jac_theta"]],
+        "c": np.asarray(rec["c"], dtype=float),
+        "tau": rec["tau"],
+        "nu": rec["nu"],
+        "retained": rec["retained"],
+    }
 
 
 def _lrt_result(t):
@@ -1735,6 +1845,7 @@ def _fit_from_native(r, formula, family, link, nagq, dispersion, store):
         term_table_type3_lrt=_lrt_result(r["term_table_type3_lrt"]),
         term_table_type2_lrt=_lrt_result(r["term_table_type2_lrt"]),
         term_test_auto=dict(r["term_test_auto"]),
+        satterthwaite_record=_satterthwaite_record(r["satterthwaite_record"]),
     )
     # Singularity is not assessed on a fit that did not converge: the kernel never sets
     # `singular` there (the post-hoc check and the boundary flags are gated on
@@ -1989,6 +2100,68 @@ def fit(
         anova_test,
     )
     return _fit_from_native(r, formula, family, link, nagq, dispersion, store)
+
+
+def model_matrix(data, formula):
+    """The fixed-effects design of `formula` on `data`, as `(X, names)`.
+
+    data: dict[str, array-like]; DataFrame / Arrow Table also accepted, read
+        exactly as `fit` reads them.
+    formula: R-style string with `~`, e.g. "~ age + gender * condition".
+        A response (`"y ~ x"`) is optional; its columns must exist and have
+        no missing value, but they are not part of `X`.
+
+    X: float64 array of shape (rows of data, p), the intercept column first
+        when the formula has one.
+    names: the p column names, the coefficient names `fit` gives the same
+        formula.
+
+    `X` and `names` are the design `fit(data, "y ~ <same right side>")`
+    builds: factors get the same reference level and coding, and an aliased
+    column is kept. A formula with a random-effect or an `offset()` term is
+    refused, and so is a row with a missing value in a column the formula
+    reads: drop such rows first, so `X` stays aligned with `data`.
+    """
+    numeric_columns, factor_columns, _, _ = _prepare_columns(
+        data, [formula], None, None, [], model_matrix=True
+    )
+    if isinstance(data, dict):
+        # The row count is the length of the formula's columns, which
+        # `_prepare_columns` has already checked against each other. `~ 1`
+        # reads no column, so then every column of `data` gives it.
+        names = [*numeric_columns, *factor_columns] or list(data)
+        if not names:
+            raise ValueError("data has no columns, so it has no row count")
+        lengths = {name: len(data[name]) for name in names}
+        _check_lengths(lengths)
+        n_rows = next(iter(lengths.values()))
+    else:
+        n_rows = len(data)
+    x, n, p, names = _native.model_matrix(formula, numeric_columns, factor_columns, n_rows)
+    return _f64(x).reshape(n, p), names
+
+
+def term_labels(formula):
+    """The fixed-term labels of `formula` and whether it has an intercept, as
+    `(labels, has_intercept)`, read from the formula alone, with no data.
+
+    formula: R-style string, e.g. "y ~ age + sex * condition + (1 | id)". The
+        response is optional ("~ x").
+
+    labels: R's `attr(terms(f), "term.labels")`. The variables of a term are
+        joined by ":" in the order they first appear in the formula's fixed
+        part (`~ a + b + b:a` gives "a:b"); terms are sorted by degree and keep
+        their written order within a degree. A parenthesized group is expanded
+        as `fit` expands it (`a*(b + c)` gives "a", "b", "c", "a:b", "a:c").
+        Random-effect terms and `offset()` are not labels. Match the labels as
+        returned rather than building them.
+    has_intercept: False for `0 +` or `- 1`.
+
+    A formula that does not parse raises `ValueError` with the parser's
+    message. The name is provisional until 1.0.0.
+    """
+    labels, has_intercept = _native.term_labels(formula)
+    return list(labels), bool(has_intercept)
 
 
 # Last: `glmm/anova.py` reads `Fit` and the helpers above from this module.

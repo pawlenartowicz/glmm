@@ -239,6 +239,31 @@ impl SatterthwaiteState {
         }
     }
 
+    /// A live record from its numbers, as a port stored them
+    /// (`orchestrate::SatterthwaiteRecord`). The dropped and negative counts
+    /// and the route, which only the fit's curvature note and the tests read,
+    /// are set to their defaults: no contrast reads them.
+    #[cfg(feature = "orchestrate")]
+    pub(crate) fn from_record(
+        a_eff: Mat<f64>,
+        jac_theta: Vec<Mat<f64>>,
+        c: Mat<f64>,
+        tau: f64,
+        nu: f64,
+        retained: Option<Vec<usize>>,
+    ) -> Self {
+        SatterthwaiteState {
+            a_eff,
+            jac_theta,
+            c,
+            tau,
+            nu,
+            retained,
+            status: Status::Live,
+            ..Self::switched_off()
+        }
+    }
+
     /// Whether this is a [`Self::residual`] record: a live state with no
     /// variance parameters (a Gaussian LMM's `a_eff` always has τ's row).
     pub(crate) fn residual_only(&self) -> bool {

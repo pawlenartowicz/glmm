@@ -1,9 +1,10 @@
 # Using `glmm` from Python
 
-One page, four sections. The first walks the single entry point — `glmm.fit` —
+One page, five sections. The first walks the single entry point — `glmm.fit` —
 end to end; the next two go deeper into the knobs and the returned `Fit`; the
-fourth is a short note on warm starts. The Python surface is deliberately
-tiny: `glmm.fit`, `glmm.Fit`, the tests `glmm.anova` and `glmm.compare` with
+fourth is a short note on warm starts, and the fifth shows the design matrix.
+The Python surface is deliberately tiny: `glmm.fit`, `glmm.Fit`,
+`glmm.model_matrix` (§5), the tests `glmm.anova` and `glmm.compare` with
 their result classes (§3), and a family of warning categories, all
 subclasses of `glmm.DiagnosticWarning`, that `fit` can raise. Every warning it
 raises is also appended to `fit.warnings`; see
@@ -375,3 +376,29 @@ a previous fit's state is never threaded forward automatically.
 
 **Batch processing** (many fits with same formula behind one call — bootstrap,
 simulation) is planned.
+
+## 5. The design matrix
+
+`glmm.model_matrix` returns the fixed-effects design of a formula without
+fitting, as R's `model.matrix()` does:
+
+```python
+X, names = glmm.model_matrix(data, "~ x1 + group")
+# X: float64 array, one row per row of data; names: ["(Intercept)", "x1", ...]
+```
+
+`X` and `names` are the design and the coefficient names `glmm.fit` builds for
+the same right side, with the same factor coding. The response is optional;
+when the formula has one (`"y ~ x1"`), its columns must exist but are not part
+of `X`. A formula with a random-effect or an `offset()` term is refused. A row
+with a missing value in a column the formula reads raises rather than being
+dropped, so `X` always has one row per row of `data`: drop such rows first.
+
+One least-squares solve on `X` removes the same covariates from many columns
+at once, where one `glmm.fit` per column would build the design again each
+time:
+
+```python
+X, _ = glmm.model_matrix(data, "~ age + gender")
+residuals = M - X @ np.linalg.lstsq(X, M, rcond=None)[0]   # M: (n, k) array
+```

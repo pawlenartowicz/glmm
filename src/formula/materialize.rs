@@ -296,8 +296,99 @@ pub fn materialize(ast: &ParsedFormula, data: &Table, family: Family) -> Result<
         });
     }
 
-    // 2. Fixed design — intercept first (when the formula has one), then each
-    // term's expanded columns, in R's term order.
+    // 2. Fixed design.
+    let FixedDesign {
+        x,
+        p,
+        col_names,
+        terms,
+        fixed_terms,
+        numeric_main_col,
+        factor_main_cols,
+    } = fixed_design(ast, data)?;
+
+    let rdx = rdx_cross(&terms, ast.has_intercept, data, &x, n, p)?;
+
+    // 3. Random effects → ReStructure + GroupIds (declaration order; first = primary).
+    let (model, ids, re_groups, notes) =
+        lower_random_effects(ast, data, family, n, &numeric_main_col, &factor_main_cols)?;
+
+    // `weights`/`offset` are set here ONLY when the formula itself carries
+    // them (`cbind()` response, `offset()` term). `orchestrate::run_fit` is
+    // the double-specification check site for both — change together.
+    let offset = match &ast.offset {
+        Some(expr) => {
+            let o = numeric_column(expr, data)?;
+            // Refused here, by term, rather than by `fit_warm`'s
+            // `FitOptions.offset` assert, which names a field the formula
+            // user never set.
+            if let Some(row) = o.iter().position(|v| !v.is_finite()) {
+                return Err(Error::TransformNotFinite {
+                    term: format!("offset({expr})"),
+                    row,
+                });
+            }
+            Some(o)
+        }
+        None => None,
+    };
+    let opts = FitOptions {
+        target_indices: (0..p as u32).collect(),
+        offset,
+        weights,
+        ..FitOptions::default()
+    };
+
+    Ok(Lowered {
+        x,
+        y,
+        n,
+        p,
+        col_names,
+        model,
+        ids,
+        re_groups,
+        notes,
+        opts,
+        terms: fixed_terms,
+        has_intercept: ast.has_intercept,
+        rdx,
+        xtx: OnceLock::new(),
+    })
+}
+
+/// The fixed-effects design of a formula on its data ([`fixed_design`]), and
+/// what [`materialize`] reads from it to build the rest of [`Lowered`].
+pub(crate) struct FixedDesign<'a> {
+    /// Row-major `data.n × p` design, as [`Lowered::x`].
+    pub(crate) x: Vec<f64>,
+    /// Design width.
+    pub(crate) p: usize,
+    /// As [`Lowered::col_names`].
+    pub(crate) col_names: Vec<String>,
+    /// The fixed terms of [`r_terms`].
+    terms: Vec<Vec<&'a str>>,
+    /// As [`Lowered::terms`].
+    fixed_terms: Vec<FixedTerm>,
+    /// The random-slope resolution maps, described where [`fixed_design`]
+    /// fills them.
+    numeric_main_col: HashMap<String, ColumnId>,
+    factor_main_cols: HashMap<String, Vec<(String, ColumnId)>>,
+}
+
+/// The fixed-effects design of `ast` on `data`: the intercept first (when the
+/// formula has one), then each term's expanded columns, in R's term order.
+/// The response, the random effects and the offset are not read.
+///
+/// # Errors
+/// [`Error::UnknownColumn`], [`Error::WrongColumnKind`],
+/// [`Error::SingleLevelFactor`], [`Error::EmptyDesign`] and
+/// [`Error::TransformNotFinite`], as [`materialize`] returns them.
+pub(crate) fn fixed_design<'a>(
+    ast: &'a ParsedFormula,
+    data: &Table,
+) -> Result<FixedDesign<'a>, Error> {
+    let n = data.n;
     let mut col_names: Vec<String> = Vec::new();
     let mut cols: Vec<Vec<f64>> = Vec::new();
     if ast.has_intercept {
@@ -393,53 +484,14 @@ pub fn materialize(ast: &ParsedFormula, data: &Table, family: Family) -> Result<
         }
     }
 
-    let rdx = rdx_cross(&terms, ast.has_intercept, data, &x, n, p)?;
-
-    // 3. Random effects → ReStructure + GroupIds (declaration order; first = primary).
-    let (model, ids, re_groups, notes) =
-        lower_random_effects(ast, data, family, n, &numeric_main_col, &factor_main_cols)?;
-
-    // `weights`/`offset` are set here ONLY when the formula itself carries
-    // them (`cbind()` response, `offset()` term). `orchestrate::run_fit` is
-    // the double-specification check site for both — change together.
-    let offset = match &ast.offset {
-        Some(expr) => {
-            let o = numeric_column(expr, data)?;
-            // Refused here, by term, rather than by `fit_warm`'s
-            // `FitOptions.offset` assert, which names a field the formula
-            // user never set.
-            if let Some(row) = o.iter().position(|v| !v.is_finite()) {
-                return Err(Error::TransformNotFinite {
-                    term: format!("offset({expr})"),
-                    row,
-                });
-            }
-            Some(o)
-        }
-        None => None,
-    };
-    let opts = FitOptions {
-        target_indices: (0..p as u32).collect(),
-        offset,
-        weights,
-        ..FitOptions::default()
-    };
-
-    Ok(Lowered {
+    Ok(FixedDesign {
         x,
-        y,
-        n,
         p,
         col_names,
-        model,
-        ids,
-        re_groups,
-        notes,
-        opts,
-        terms: fixed_terms,
-        has_intercept: ast.has_intercept,
-        rdx,
-        xtx: OnceLock::new(),
+        terms,
+        fixed_terms,
+        numeric_main_col,
+        factor_main_cols,
     })
 }
 
@@ -594,7 +646,7 @@ fn numeric_column(name: &str, data: &Table) -> Result<Vec<f64>, Error> {
 /// Terms are then stably sorted by degree: main effects as written, then the
 /// two-way interactions as written, and so on. `y ~ x + c:b:a + a*b*c` thus
 /// becomes `x a b c b:a c:a c:b c:b:a`.
-fn r_terms(ast: &ParsedFormula) -> Vec<Vec<&str>> {
+pub(crate) fn r_terms(ast: &ParsedFormula) -> Vec<Vec<&str>> {
     use super::parse::Term;
     let rank = |v: &str| {
         ast.predictors
@@ -1415,8 +1467,13 @@ fn push_group(out: &mut Vec<String>, group: &str, available: &[String]) {
 /// tries to lower against data that is really missing it. This function never
 /// errors; it is a filter, not a validator.
 pub fn referenced_columns(ast: &ParsedFormula, available: &[String]) -> Vec<String> {
+    resolved_names(ast, available, true)
+}
+
+/// [`referenced_columns`], with the response left out unless `with_response`.
+fn resolved_names(ast: &ParsedFormula, available: &[String], with_response: bool) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for_each_formula_name(ast, |raw, is_group| {
+    for_each_formula_name(ast, with_response, |raw, is_group| {
         if is_group {
             push_group(&mut out, raw, available)
         } else {
@@ -1429,18 +1486,25 @@ pub fn referenced_columns(ast: &ParsedFormula, available: &[String]) -> Vec<Stri
 }
 
 /// Every name the formula spells, in formula order: the response (both
-/// `cbind()` columns), fixed terms, each random effect's grouping (with
-/// `is_group` set) and slope variables, then the `offset()` term. The one walk
-/// behind [`referenced_columns`] and [`unresolved_columns`].
-fn for_each_formula_name(ast: &ParsedFormula, mut visit: impl FnMut(&str, bool)) {
+/// `cbind()` columns; skipped unless `with_response`), fixed terms, each
+/// random effect's grouping (with `is_group` set) and slope variables, then
+/// the `offset()` term. The one walk behind [`referenced_columns`],
+/// [`unresolved_columns`] and [`design_columns`].
+fn for_each_formula_name(
+    ast: &ParsedFormula,
+    with_response: bool,
+    mut visit: impl FnMut(&str, bool),
+) {
     use super::parse::Term;
 
-    match &ast.cbind {
-        Some((s, f)) => {
-            visit(s, false);
-            visit(f, false);
+    if with_response {
+        match &ast.cbind {
+            Some((s, f)) => {
+                visit(s, false);
+                visit(f, false);
+            }
+            None => visit(&ast.dependent, false),
         }
-        None => visit(&ast.dependent, false),
     }
     for term in &ast.terms {
         match term {
@@ -1476,8 +1540,13 @@ fn for_each_formula_name(ast: &ParsedFormula, mut visit: impl FnMut(&str, bool))
 /// calling into Rust, and a formula's genuinely missing column must be
 /// reported ahead of an unrelated length mismatch on those arguments).
 pub fn unresolved_columns(ast: &ParsedFormula, available: &[String]) -> Vec<String> {
+    unresolved_names(ast, available, true)
+}
+
+/// [`unresolved_columns`], with the response left out unless `with_response`.
+fn unresolved_names(ast: &ParsedFormula, available: &[String], with_response: bool) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for_each_formula_name(ast, |raw, is_group| {
+    for_each_formula_name(ast, with_response, |raw, is_group| {
         if is_group {
             push_missing_group(&mut out, raw, available)
         } else {
@@ -1549,6 +1618,29 @@ pub fn numeric_only_columns(ast: &ParsedFormula, available: &[String]) -> Vec<St
         push_resolved(&mut out, expr, available);
     }
     out
+}
+
+/// `(used, missing, numeric_only)` for a design-only lowering
+/// ([`fixed_design`]): [`referenced_columns`], [`unresolved_columns`] and
+/// [`numeric_only_columns`], with the response left out when the formula is
+/// `one_sided`. A one-sided formula's parsed response is the parser's
+/// placeholder name (`explained_variable`), not a column the caller named.
+#[cfg(feature = "orchestrate")]
+pub(crate) fn design_columns(
+    ast: &ParsedFormula,
+    available: &[String],
+    one_sided: bool,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let numeric_only = if one_sided {
+        Vec::new()
+    } else {
+        numeric_only_columns(ast, available)
+    };
+    (
+        resolved_names(ast, available, !one_sided),
+        unresolved_names(ast, available, !one_sided),
+        numeric_only,
+    )
 }
 
 /// A random-effect term's left-hand side as a formula spells it: `"1"`, or
