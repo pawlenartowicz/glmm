@@ -1,9 +1,9 @@
 {
   "engine": "glmm_r",
-  "engine_version": "0.6.1",
+  "engine_version": "0.6.2",
   "machine": "dell-fedora",
   "date": "2026-10-21T22:12:55+02:00",
-  "glmm_crate_version": "0.6.1",
+  "glmm_crate_version": "0.6.2",
   "glmm_git_rev": "462d1df02c141b24fa483fd5cbe0f40470a0b855-dirty",
   "subset": "fast",
   "ml": false,
@@ -20,5 +20,5 @@
   "cells": 116,
   "cell_list": [],
   "completed_from": null,
-  "run_name": "2026-10-21_0.6.1_dell-fedora_2026-10-21"
+  "run_name": "2026-10-21_0.6.2_dell-fedora_2026-10-21"
 }
