@@ -2084,7 +2084,7 @@ mod tests {
         let (x, xr) = (col_major(&xv), col_major(&xrv));
         let offset: Vec<f64> = (0..n).map(|i| 0.1 * ((i % 7) as f64 - 3.0)).collect();
         let w: Vec<f64> = (0..n).map(|i| 0.5 + 0.25 * (i % 5) as f64).collect();
-        // (family, and the relative tolerances on β₂, the deviance and var₂).
+        // (family, and the relative tolerances on β₂, the deviance excess and var₂).
         let arms = [
             (
                 Family::Binomial {
@@ -2168,8 +2168,10 @@ mod tests {
                 pivot < crate::lmm::GRAM_PIVOT_MIN,
                 "{family:?}: pivot {pivot:e}"
             );
+            // One-sided: both fits share one optimum, so a lower deviance is a
+            // closer approach to it; a broken QR step can only land above.
             assert!(
-                (dev - dev_r).abs() <= dev_tol * dev_r,
+                dev - dev_r <= dev_tol * dev_r,
                 "{family:?}: deviance {dev} against {dev_r}"
             );
             let want_var = var_r / (delta * delta);
