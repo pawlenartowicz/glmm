@@ -1,0 +1,85 @@
+{
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0",
+      "emmeans": "2.0.4",
+      "pbkrtest": "0.5.5"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_posthoc.R"
+  },
+  "emmeans": [
+    {
+      "level": "A",
+      "by": null,
+      "estimate": 33.122222222222,
+      "SE": 1.73683341825479,
+      "df": 41.999998311583
+    },
+    {
+      "level": "B",
+      "by": null,
+      "estimate": 31.6444444444444,
+      "SE": 1.7368334182548,
+      "df": 41.999998360063
+    },
+    {
+      "level": "C",
+      "by": null,
+      "estimate": 31.5999999999999,
+      "SE": 1.73683341825479,
+      "df": 41.9999983091684
+    }
+  ],
+  "contrasts": [
+    {
+      "contrast": "A - B",
+      "by": null,
+      "estimate": 1.47777777777764,
+      "SE": 2.45625337567875,
+      "df": 41.9999983310633,
+      "statistic": 0.601638980900852,
+      "statistic_name": "t",
+      "p_none": 0.550648441044505,
+      "p_tukey": 0.819987826169469
+    },
+    {
+      "contrast": "A - C",
+      "by": null,
+      "estimate": 1.52222222222207,
+      "SE": 2.45625337567875,
+      "df": 41.9999983115162,
+      "statistic": 0.619733386341474,
+      "statistic_name": "t",
+      "p_none": 0.538781157597084,
+      "p_tukey": 0.810168852479301
+    },
+    {
+      "contrast": "B - C",
+      "by": null,
+      "estimate": 0.0444444444444251,
+      "SE": 2.45625337567875,
+      "df": 41.999998324183,
+      "statistic": 0.0180944054406209,
+      "statistic_name": "t",
+      "p_none": 0.985649227676399,
+      "p_tukey": 0.999819507977407
+    }
+  ],
+  "name": "posthoc_cake"
+}

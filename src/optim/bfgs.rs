@@ -357,8 +357,33 @@ fn all_finite(v: &[f64]) -> bool {
 /// first-step cap and no Shanno rescaling then, since the scale is known.
 /// Without `h0` the objective's [`GradObjective::start_curvature`] seeds
 /// diagonal entries (see the module doc).
-#[allow(clippy::needless_range_loop)] // dense small-matrix loops index several arrays
+///
+/// `structural` coordinates are held at exactly zero, as in
+/// [`bobyqa_minimize`](super::bobyqa_minimize): the search, `st` and `h0` are
+/// over the others, and on return `x` holds the endpoint with zeros there.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn bfgs_minimize(
+    obj: &mut impl GradObjective,
+    x: &mut [f64],
+    lo: &[f64],
+    hi: &[f64],
+    cfg: &BfgsConfig,
+    st: &mut BfgsState,
+    h0: Option<&[f64]>,
+    structural: &[usize],
+) -> BfgsOutcome {
+    if structural.is_empty() {
+        return bfgs_run(obj, x, lo, hi, cfg, st, h0);
+    }
+    let mut m = super::Masked::new(obj, structural, x.len());
+    let (mut xf, lo, hi) = (m.gather(x), m.gather(lo), m.gather(hi));
+    let out = bfgs_run(&mut m, &mut xf, &lo, &hi, cfg, st, h0);
+    m.scatter(&xf, x);
+    out
+}
+
+#[allow(clippy::needless_range_loop)] // dense small-matrix loops index several arrays
+fn bfgs_run(
     obj: &mut impl GradObjective,
     x: &mut [f64],
     lo: &[f64],

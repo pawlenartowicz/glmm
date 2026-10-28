@@ -1,0 +1,120 @@
+{
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0",
+      "emmeans": "2.0.4",
+      "pbkrtest": "0.5.5"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_posthoc.R"
+  },
+  "emmeans": [
+    {
+      "level": "95",
+      "by": null,
+      "estimate": 0.509175826507186,
+      "SE": 0.186617016302261,
+      "df": null
+    },
+    {
+      "level": "96",
+      "by": null,
+      "estimate": 1.64507850065781,
+      "SE": 0.15742462789031,
+      "df": null
+    },
+    {
+      "level": "97",
+      "by": null,
+      "estimate": -0.491947469667007,
+      "SE": 0.202463060189944,
+      "df": null
+    }
+  ],
+  "contrasts": [
+    {
+      "contrast": "YEAR95 - YEAR96",
+      "by": null,
+      "estimate": -1.13590267415062,
+      "SE": 0.242386545481719,
+      "df": null,
+      "statistic": -4.68632725423406,
+      "statistic_name": "z",
+      "p_none": 2.78151381226304e-06,
+      "p_tukey": 8.30255758144105e-06
+    },
+    {
+      "contrast": "YEAR95 - YEAR97",
+      "by": null,
+      "estimate": 1.00112329617419,
+      "SE": 0.269686777775105,
+      "df": null,
+      "statistic": 3.71217048323015,
+      "statistic_name": "z",
+      "p_none": 0.000205489495341293,
+      "p_tukey": 0.000601955657784092
+    },
+    {
+      "contrast": "YEAR96 - YEAR97",
+      "by": null,
+      "estimate": 2.13702597032482,
+      "SE": 0.253675269101989,
+      "df": null,
+      "statistic": 8.42425821756253,
+      "statistic_name": "z",
+      "p_none": 3.63042844511975e-17,
+      "p_tukey": 3.00870439673417e-14
+    }
+  ],
+  "response": [
+    {
+      "contrast": "YEAR95 / YEAR96",
+      "by": null,
+      "ratio": 0.321132112805318,
+      "SE": 0.0778381034661267,
+      "df": null,
+      "statistic": -4.68632725423406,
+      "statistic_name": "z",
+      "p_none": 2.78151381226304e-06,
+      "p_tukey": 8.30255758144105e-06
+    },
+    {
+      "contrast": "YEAR95 / YEAR97",
+      "by": null,
+      "ratio": 2.7213369796359,
+      "SE": 0.733908601278242,
+      "df": null,
+      "statistic": 3.71217048323015,
+      "statistic_name": "z",
+      "p_none": 0.000205489495341293,
+      "p_tukey": 0.000601955657784092
+    },
+    {
+      "contrast": "YEAR96 / YEAR97",
+      "by": null,
+      "ratio": 8.47419760005651,
+      "SE": 2.14969435661776,
+      "df": null,
+      "statistic": 8.42425821756253,
+      "statistic_name": "z",
+      "p_none": 3.63042844511975e-17,
+      "p_tukey": 3.00870439673417e-14
+    }
+  ],
+  "name": "posthoc_glmm_grouseticks"
+}

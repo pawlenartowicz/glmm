@@ -1,43 +1,95 @@
 //! `glmm`'s model-spec input vocabulary: the structural subset of cluster and
-//! grouping types the fit kernels read (family, RE topology, sizing). Pure
-//! structure — magnitudes are fitted, not spec-carried (see [`ModelSpec`]).
+//! grouping types the fit kernels read (family, RE topology). Pure structure:
+//! level counts come from the [`crate::GroupIds`] of each fit, and magnitudes
+//! are fitted, not spec-carried (see [`ModelSpec`]).
 
 /// Predictor column index — indexes into the `p`-wide design matrix `x`.
 pub type ColumnId = u32;
 
-/// Cluster sizing regime: a fixed cluster count, or a fixed per-cluster size.
+/// One random-effect term on a grouping: the random intercept or not, and a
+/// list of random-slope columns, with an unstructured covariance among the
+/// term's own columns. Two terms on one grouping are independent: the
+/// covariances between their columns are zero. Built by [`ReTerm::intercept`]
+/// or [`ReTerm::no_intercept`], then [`ReTerm::slopes`]; a grouping takes its
+/// terms through [`ReStructure::terms`] or [`Grouping::terms`].
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
-pub enum Sizing {
-    /// Fixed number of clusters; per-cluster size grows with total N.
-    FixedClusters {
-        /// Cluster count, held constant as N scales.
-        n_clusters: u32,
-    },
-    /// Fixed per-cluster size; cluster count grows with total N.
-    FixedSize {
-        /// Rows per cluster, held constant as N scales.
-        cluster_size: u32,
-    },
+pub struct ReTerm {
+    /// Whether the term holds the grouping's random intercept.
+    pub intercept: bool,
+    /// The term's random-slope columns (0-based indices into `x`).
+    pub slopes: Vec<ColumnId>,
 }
 
-impl Sizing {
-    /// Number of clusters when total row count is `n`: the fixed `n_clusters`
-    /// itself under `FixedClusters`, or `n / cluster_size` rounded UP under
-    /// `FixedSize`. Rounding up matches the positional row layout (row `i` in
-    /// cluster `i / cluster_size`): off-grid `n` leaves a partial trailing cluster
-    /// whose rows still carry a real id, and that id must be in range.
-    pub fn n_clusters_at(&self, n: usize) -> usize {
-        match self {
-            Sizing::FixedClusters { n_clusters } => (*n_clusters).max(1) as usize,
-            Sizing::FixedSize { cluster_size } => n.div_ceil((*cluster_size).max(1) as usize),
+impl ReTerm {
+    /// A term holding the random intercept, no slopes yet.
+    pub fn intercept() -> ReTerm {
+        ReTerm {
+            intercept: true,
+            slopes: Vec::new(),
         }
+    }
+
+    /// A term without the random intercept; give it at least one slope.
+    pub fn no_intercept() -> ReTerm {
+        ReTerm {
+            intercept: false,
+            slopes: Vec::new(),
+        }
+    }
+
+    /// Sets the term's random-slope columns (0-based indices into `x`).
+    pub fn slopes(mut self, cols: impl IntoIterator<Item = ColumnId>) -> ReTerm {
+        self.slopes = cols.into_iter().collect();
+        self
+    }
+}
+
+/// The terms and the block's `slopes` for the `terms` builders: the intercept
+/// term moved first (a stable move, the others keep their order), and
+/// `slopes` the terms' columns concatenated in that order.
+fn ordered_terms(terms: impl IntoIterator<Item = ReTerm>) -> (Vec<ReTerm>, Vec<ColumnId>) {
+    let mut terms: Vec<ReTerm> = terms.into_iter().collect();
+    terms.sort_by_key(|t| !t.intercept);
+    let slopes = terms
+        .iter()
+        .flat_map(|t| t.slopes.iter().copied())
+        .collect();
+    (terms, slopes)
+}
+
+/// One term per column of a block whose current terms are `terms` (empty:
+/// one term over the intercept and `slopes`): the intercept term, if the block
+/// has a random intercept, then one term per slope in `slopes` order.
+fn uncorrelated_terms(terms: &[ReTerm], slopes: &[ColumnId]) -> Vec<ReTerm> {
+    let intercept = terms.is_empty() || terms.iter().any(|t| t.intercept);
+    intercept
+        .then(ReTerm::intercept)
+        .into_iter()
+        .chain(slopes.iter().map(|&c| ReTerm::no_intercept().slopes([c])))
+        .collect()
+}
+
+/// Rewrites the terms' columns from `slopes`, which has their total length:
+/// each term takes the next `term.slopes.len()` entries, in order. The step
+/// that rewrites a block's `slopes` (a reduced design) calls it, so `terms`
+/// keeps agreeing with `slopes`. A no-op on empty `terms`.
+pub(crate) fn set_term_slopes(terms: &mut [ReTerm], slopes: &[ColumnId]) {
+    let mut rest = slopes;
+    for t in terms {
+        let (head, tail) = rest.split_at(t.slopes.len());
+        t.slopes.copy_from_slice(head);
+        rest = tail;
     }
 }
 
 /// An extra (crossed or nested) grouping factor beyond the primary grouping.
-/// `slopes` are the random-slope design columns; the RE correlation structure is
-/// always full (parametrized by the fitted θ). Structure-only, like [`ModelSpec`]:
-/// magnitudes and warm starts are not carried here.
+/// `slopes` are the random-slope design columns; with no `terms` the RE
+/// correlation structure is full (parametrized by the fitted θ). Structure-only,
+/// like [`ModelSpec`]: magnitudes and warm starts are not carried here. Built by
+/// [`Grouping::crossed`] or [`Grouping::nested`], then [`Grouping::slopes`] or
+/// [`Grouping::terms`].
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub struct Grouping {
     /// How this grouping's clusters relate to the primary grouping's rows.
@@ -45,38 +97,74 @@ pub struct Grouping {
     /// Random-slope design columns for this grouping (0-based indices into `x`);
     /// empty means random-intercept only.
     pub slopes: Vec<ColumnId>,
+    /// This grouping's random-effect terms, as on [`ReStructure::terms`].
+    pub terms: Vec<ReTerm>,
+}
+
+impl Grouping {
+    /// A crossed extra grouping, intercept only.
+    pub fn crossed() -> Grouping {
+        Grouping {
+            relation: GroupingRelation::Crossed,
+            slopes: Vec::new(),
+            terms: Vec::new(),
+        }
+    }
+
+    /// An extra grouping nested within the primary one, intercept only.
+    pub fn nested() -> Grouping {
+        Grouping {
+            relation: GroupingRelation::NestedWithin,
+            slopes: Vec::new(),
+            terms: Vec::new(),
+        }
+    }
+
+    /// Sets this grouping's random-slope columns (0-based indices into `x`).
+    pub fn slopes(mut self, cols: impl IntoIterator<Item = ColumnId>) -> Grouping {
+        self.slopes = cols.into_iter().collect();
+        self
+    }
+
+    /// Sets this grouping's terms, as [`ReStructure::terms`] does.
+    pub fn terms(mut self, terms: impl IntoIterator<Item = ReTerm>) -> Grouping {
+        (self.terms, self.slopes) = ordered_terms(terms);
+        self
+    }
+
+    /// One term per column, as [`ReStructure::uncorrelated`] does.
+    pub fn uncorrelated(mut self) -> Grouping {
+        self.terms = uncorrelated_terms(&self.terms, &self.slopes);
+        self
+    }
 }
 
 /// How an extra grouping's clusters map onto rows, relative to the primary
-/// grouping.
-#[derive(Debug, Clone, PartialEq)]
+/// grouping. The level counts come from the fit's [`crate::GroupIds`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupingRelation {
-    /// Independent (crossed) with the primary grouping: `n_clusters` clusters,
-    /// each potentially touching any primary cluster (e.g. items crossed with
-    /// subjects).
-    Crossed {
-        /// Cluster count for this crossed factor.
-        n_clusters: u32,
-    },
-    /// Nested within the primary grouping: each primary cluster contains
-    /// `n_per_parent` clusters of this factor, uniquely owned by that parent.
-    NestedWithin {
-        /// Number of this factor's clusters per parent (primary) cluster.
-        n_per_parent: u32,
-    },
+    /// Independent (crossed) with the primary grouping: each level may touch
+    /// any primary cluster (e.g. items crossed with subjects).
+    Crossed,
+    /// Nested within the primary grouping: each level belongs to exactly one
+    /// primary cluster. Its ids are global child levels, dense over all
+    /// parents.
+    NestedWithin,
 }
 
 /// Outcome distribution + link. Selects the fit kernel together with
 /// [`ModelSpec::re`] (`re.is_some()` ⇒ mixed): `Gaussian` → OLS / LMM,
 /// `Binomial{Logit}` → GLM / GLMM. Every variant here has a wired kernel, so no
-/// kernel-less variant is reachable through [`crate::fit_cold`].
+/// kernel-less variant is reachable through [`crate::fit`].
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Family {
     /// Normal response, identity link → OLS (`re: None`) or LMM (`re: Some`).
     Gaussian,
     /// Bernoulli/binomial response → logistic/probit GLM (`re: None`) or GLMM
     /// (`re: Some`). Counts are fit as expanded 0/1 rows (the kernel is
-    /// Bernoulli; see [`crate::fit_cold`]). Variance `V(μ)=μ(1−μ)`,
+    /// Bernoulli; see [`crate::fit`]). Variance `V(μ)=μ(1−μ)`,
     /// dispersion `φ≡1`.
     Binomial {
         /// Link function — [`BinomialLink::Logit`] (canonical) or `Probit`.
@@ -137,6 +225,7 @@ pub enum Family {
 
 /// Binomial link function. `Logit` is canonical (the fused-SIMD kernel);
 /// `Probit` and `Cloglog` both use the general Fisher-scoring branch.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinomialLink {
     /// Canonical logit link `g(μ) = ln(μ/(1−μ))`.
@@ -154,6 +243,7 @@ pub enum BinomialLink {
 }
 
 /// Poisson link function. Only the canonical log link is offered.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PoissonLink {
     /// Canonical log link `g(μ) = ln(μ)`, `μ=exp(η)`.
@@ -162,6 +252,7 @@ pub enum PoissonLink {
 
 /// Gamma link function. `Log` is the safe default; `Inverse` is the classic
 /// Gamma link but can drive `μ≤0` mid-IRLS (domain-clamped).
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GammaLink {
     /// Log link `g(μ) = ln(μ)`, `μ=exp(η)`. Non-canonical for Gamma but stable.
@@ -174,6 +265,7 @@ pub enum GammaLink {
 }
 
 /// Negative-binomial link function. Only the log link is offered.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NegBinomialLink {
     /// Log link `g(μ) = ln(μ)`, `μ=exp(η)`. Non-canonical (the NB canonical link
@@ -184,6 +276,7 @@ pub enum NegBinomialLink {
 /// Inverse-Gaussian link function. `Log` is the safe default; `InverseSquared`
 /// is R's `inverse.gaussian()` default and can drive `μ≤0` mid-IRLS
 /// (domain-clamped).
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InverseGaussianLink {
     /// `g(μ) = 1/μ²`, `μ = η^(−1/2)` (R `inverse.gaussian(link="1/mu^2")`).
@@ -218,16 +311,71 @@ pub enum WaldSe {
 /// effects. Carried in [`ModelSpec::re`] as `Option`, so `None` is a fixed-only
 /// model (OLS/GLM) and `Some` is mixed (LMM/GLMM): an OLS-with-grouping state is
 /// unrepresentable. Holds exactly the RE fields the LMM/GLMM kernels read.
+/// Built by [`ReStructure::intercept`], then [`ReStructure::slopes`] or
+/// [`ReStructure::terms`], and [`ReStructure::extra`].
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReStructure {
-    /// Primary grouping's cluster-count regime.
-    pub sizing: Sizing,
     /// Random-slope design columns for the primary grouping (0-based indices
     /// into `x`); empty means random-intercept only.
     pub slopes: Vec<ColumnId>,
+    /// The primary grouping's random-effect terms. Empty means one
+    /// unstructured term over the intercept and `slopes`. When set, `slopes`
+    /// must be the terms' columns concatenated in term order, at most one
+    /// term holds the intercept and it comes first, no term is empty, and no
+    /// column is in two terms; [`crate::fit`] refuses anything else with
+    /// [`crate::FitError::Shape`]. With no intercept term the grouping has no
+    /// random intercept.
+    pub terms: Vec<ReTerm>,
     /// Additional crossed/nested grouping factors beyond the primary grouping.
     pub extra_groupings: Vec<Grouping>,
 }
+
+impl ReStructure {
+    /// A random intercept on the primary grouping: no slopes, no extra
+    /// groupings.
+    pub fn intercept() -> ReStructure {
+        ReStructure {
+            slopes: Vec::new(),
+            terms: Vec::new(),
+            extra_groupings: Vec::new(),
+        }
+    }
+
+    /// Sets the primary grouping's random-slope columns (0-based indices into
+    /// `x`).
+    pub fn slopes(mut self, cols: impl IntoIterator<Item = ColumnId>) -> ReStructure {
+        self.slopes = cols.into_iter().collect();
+        self
+    }
+
+    /// Sets the primary grouping's terms, and `slopes` to their columns. The
+    /// intercept term, if any, is moved first; the others keep their order.
+    /// `Re::intercept().terms([ReTerm::intercept().slopes([1]),
+    /// ReTerm::no_intercept().slopes([2])])` is lme4's
+    /// `(1 + x1 | g) + (0 + x2 | g)`.
+    pub fn terms(mut self, terms: impl IntoIterator<Item = ReTerm>) -> ReStructure {
+        (self.terms, self.slopes) = ordered_terms(terms);
+        self
+    }
+
+    /// One term per column: the random intercept (when the grouping has one)
+    /// and each slope get independent variances, with zero covariances.
+    /// `Re::intercept().slopes([1]).uncorrelated()` is lme4's `(x || g)`.
+    pub fn uncorrelated(mut self) -> ReStructure {
+        self.terms = uncorrelated_terms(&self.terms, &self.slopes);
+        self
+    }
+
+    /// Appends one extra grouping, after those already declared.
+    pub fn extra(mut self, g: Grouping) -> ReStructure {
+        self.extra_groupings.push(g);
+        self
+    }
+}
+
+/// Short name for [`ReStructure`].
+pub type Re = ReStructure;
 
 /// The kernels' model-spec input. `family` selects the outcome kernel; `re`
 /// selects fixed-only vs mixed (`None` → OLS/GLM, `Some` → LMM/GLMM).
@@ -239,6 +387,31 @@ pub struct ReStructure {
 /// [`crate::FitOptions`]; any warm start is the caller-supplied
 /// [`crate::StartValues`]. This split is why the same spec serves both a cold and
 /// a warm fit unchanged.
+///
+/// # Examples
+///
+/// A logistic GLMM with a random intercept and slope on column 1 for the
+/// primary grouping, plus a crossed random intercept, and a fixed-only OLS:
+///
+/// ```rust
+/// use glmm::{BinomialLink, Family, GroupIds, Grouping, GroupingRelation, ModelSpec, Re};
+///
+/// let (primary, items) = (vec![0, 0, 1, 1], vec![0, 1, 0, 1]);
+/// let spec = ModelSpec::mixed(
+///     Family::Binomial { link: BinomialLink::Logit },
+///     Re::intercept().slopes([1]).extra(Grouping::crossed()),
+/// );
+/// let ids = GroupIds::new(primary).extra(items);
+/// let ols = ModelSpec::fixed(Family::Gaussian);
+///
+/// let re = spec.re.as_ref().unwrap();
+/// assert_eq!(re.slopes, vec![1]);
+/// assert_eq!(re.extra_groupings.len(), 1);
+/// assert_eq!(re.extra_groupings[0].relation, GroupingRelation::Crossed);
+/// assert_eq!(ids.extra.len(), 1);
+/// assert!(ols.re.is_none());
+/// ```
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelSpec {
     /// Outcome distribution + link, selecting the fit kernel.
@@ -246,4 +419,105 @@ pub struct ModelSpec {
     /// Random-effect structure; `None` for a fixed-only model (OLS/GLM),
     /// `Some` for mixed (LMM/GLMM).
     pub re: Option<ReStructure>,
+}
+
+impl ModelSpec {
+    /// A fixed-only model (OLS or GLM).
+    pub fn fixed(family: Family) -> ModelSpec {
+        ModelSpec { family, re: None }
+    }
+
+    /// A mixed model (LMM or GLMM).
+    pub fn mixed(family: Family, re: ReStructure) -> ModelSpec {
+        ModelSpec {
+            family,
+            re: Some(re),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Data, FitError, FitOptions, GroupIds};
+
+    /// A spec whose terms do not describe its blocks returns
+    /// `FitError::Shape` naming the grouping and the reason, on the primary
+    /// and on an extra. Each row breaks one rule, so the reason names the
+    /// guard that refused it.
+    #[test]
+    fn bad_terms_are_a_shape_error() {
+        let n = 12;
+        let x: Vec<f64> = (0..n)
+            .flat_map(|i| [1.0, (i % 5) as f64, (i % 3) as f64])
+            .collect();
+        let y: Vec<f64> = (0..n).map(|i| ((i * 7) % 11) as f64).collect();
+        let ids = GroupIds::new((0..n as u32).map(|i| i % 4).collect())
+            .extra((0..n as u32).map(|i| i % 3).collect());
+        let data = Data::new(&x, &y, n, 3).ids(&ids);
+        let shape_error = |re: Re, grouping: &str, reason: &str| {
+            let spec = ModelSpec::mixed(Family::Gaussian, re);
+            match crate::fit(&data, &spec, &FitOptions::default()) {
+                Err(FitError::Shape(m)) => {
+                    assert!(m.contains(grouping) && m.contains(reason), "{m}")
+                }
+                Err(e) => panic!("{spec:?}: {e:?}"),
+                Ok(_) => panic!("{spec:?}: fitted"),
+            }
+        };
+        let crossed = || Re::intercept().extra(Grouping::crossed());
+        let not_in_order = "not the terms' columns in term order";
+        let empty = "neither the intercept nor a slope";
+
+        // `slopes` changed after the terms were set.
+        shape_error(
+            Re::intercept()
+                .terms([ReTerm::intercept().slopes([1])])
+                .slopes([2]),
+            "primary grouping",
+            not_in_order,
+        );
+        // A slope column in two terms.
+        shape_error(
+            Re::intercept().terms([
+                ReTerm::intercept().slopes([1]),
+                ReTerm::no_intercept().slopes([1]),
+            ]),
+            "primary grouping",
+            "slope column 1 is in two terms",
+        );
+        // The intercept in two terms.
+        shape_error(
+            Re::intercept().terms([ReTerm::intercept(), ReTerm::intercept().slopes([1])]),
+            "primary grouping",
+            "must be in term 0",
+        );
+        // An empty term.
+        shape_error(
+            Re::intercept().terms([ReTerm::intercept(), ReTerm::no_intercept()]),
+            "primary grouping",
+            empty,
+        );
+        // The intercept term not first, which only a field write can do.
+        // `slopes` is swapped too, so it still lists the terms' columns in
+        // term order and only the intercept guard can refuse the spec.
+        let mut re = Re::intercept().terms([
+            ReTerm::intercept().slopes([1]),
+            ReTerm::no_intercept().slopes([2]),
+        ]);
+        re.terms.swap(0, 1);
+        re.slopes.swap(0, 1);
+        shape_error(re, "primary grouping", "must be in term 0");
+        // The same checks reach an extra grouping.
+        shape_error(
+            crossed().extra(Grouping::crossed().terms([ReTerm::no_intercept()])),
+            "extra grouping 1",
+            empty,
+        );
+        let mut re = crossed();
+        re.extra_groupings[0] = Grouping::crossed()
+            .terms([ReTerm::no_intercept().slopes([1])])
+            .slopes([1, 2]);
+        shape_error(re, "extra grouping 0", not_in_order);
+    }
 }

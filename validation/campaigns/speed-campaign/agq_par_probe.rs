@@ -11,7 +11,7 @@
 use std::io::Write;
 use std::time::Instant;
 
-use glmm::fit_cold;
+use glmm::FitOptions;
 use serde_json::Value;
 
 #[path = "../../tools/common.rs"]
@@ -72,7 +72,7 @@ fn main() {
         let q = cell["re_q"][0].as_u64().unwrap_or(0);
 
         // Lowering is outside every timed region — it is CSV marshalling, not fit work.
-        let Ok((mut lo, ..)) =
+        let Ok((lo, ..)) =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lower_grid_cell(cell, DIR)))
         else {
             println!("{case_id:<34} {n_obs:>5} {q:>2}   lowering panicked");
@@ -85,12 +85,13 @@ fn main() {
                 println!("{case_id:<34} {n_obs:>5} {q:>2} {nagq:>5}   skipped (cell over budget)");
                 continue;
             }
-            lo.opts.nagq = nagq;
+            let mut fit_opts = FitOptions::default();
+            fit_opts.nagq = nagq;
 
-            lo.opts.parallel_inner = false;
-            let serial = one_fit(&lo);
-            lo.opts.parallel_inner = true;
-            let par = one_fit(&lo);
+            fit_opts.parallel_inner = false;
+            let serial = one_fit(&lo, &fit_opts);
+            fit_opts.parallel_inner = true;
+            let par = one_fit(&lo, &fit_opts);
             spent += serial.1 + par.1;
 
             match (&serial.0, &par.0) {
@@ -115,10 +116,10 @@ fn main() {
     }
 }
 
-fn one_fit(lo: &glmm::formula::Lowered) -> (Option<glmm::Fit>, f64) {
+fn one_fit(lo: &glmm::formula::Lowered, opts: &FitOptions) -> (Option<glmm::Fit>, f64) {
     let t = Instant::now();
     let f = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts)
+        glmm::fit(&lo.data(), lo.spec(), opts).unwrap()
     }))
     .ok();
     (f, t.elapsed().as_secs_f64())

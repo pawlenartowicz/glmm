@@ -7,15 +7,17 @@ Everything under `validation/` is dev-only and never shipped: the nested
 
 | path | what it is |
 |---|---|
-| `grid/` | the accuracy grid: 923 model cells (794 plus the 129 ML twins of the Gaussian mixed cells), four pinned external oracles, the gates. The main reference system. |
+| `grid/` | the accuracy grid: 947 model cells (816 plus the 131 ML twins of the Gaussian mixed cells), four pinned external oracles, the gates. The main reference system. |
 | `data/empirical/` | committed CSVs from the datasets `lme4` and `nlme` bundle. Read byte-for-byte by every engine and by `cargo test` through `include_str!`. |
 | `data/simulated/` | committed fixed-seed CSVs, regenerable byte-identically by `tools/prep/`. Also read by `include_str!`, including in CI, so the bytes are the fixture. |
 | `manifest.json` | the per-rung model list for the in-crate tiers: one entry per dataset with its formula, family, link, factors and tier. Read by `tests/validation_oracle.rs`, `tools/bit_identity/dump.rs` and `tools/goldens_agq.R`. |
-| `goldens/` | frozen reference results, one JSON per fixture, from lme4, R `glm` / `MASS::glm.nb`, glmmTMB (`*_tmb.json`) and GLMMadaptive. Read at run time by the `oracle-tests` tier. Regenerated only by `tools/goldens_agq.R`. |
-| `goldens/inference/` | frozen inference references (lmerTest df and tests, the exact RLRT, ANOVA tables), one subdirectory per kind (`lmertest/`, `rlrt/`, `anova/`), one JSON per reference. Each is registered in `manifest.json`'s `inference_references` block and written only by its step's generator under `tools/`, through the shared setup `tools/inference_common.R`. |
+| `goldens/` | frozen reference results, one JSON per fixture, from lme4, R `glm` / `MASS::glm.nb`, glmmTMB (`*_tmb.json`) and GLMMadaptive. Read at run time by the `oracle-tests` tier. Regenerated only by `tools/goldens_agq.R`. The lme4 goldens record the lme4 version that wrote them in `engine_version`. 26 were written under lme4 1.1.38 and stay frozen; they are not regenerated when the lme4 pin in `grid/versions.json` moves. A re-run under lme4 2.0-6 (2026-10-27) gives the same numbers on 17 of them, moves numbers on 7 (by 1e-10 to 3e-6 relative, and `sim_gamma_glmm`'s random-effect SD by 32%), and fails on `sim_gamma_inv_glmm` and `sim_sparse_gamma`. |
+| `goldens/inference/` | frozen inference references (lmerTest df and tests, the exact RLRT, ANOVA tables, predictions on new data, pairwise comparisons, effect sizes, extended-precision GLM fits on ill-conditioned designs), one subdirectory per kind (`lmertest/`, `rlrt/`, `anova/`, `predict/`, `posthoc/`, `effectsize/`, `conditioning/`), one JSON per reference. Each is registered in `manifest.json`'s `inference_references` block and written only by its generator under `tools/`: the R generators through the shared setup `tools/inference_common.R`, the `conditioning` one (`tools/goldens_glm_band.py`, mpmath) with its own provenance. |
 | `results/lme4_simulated/` | the frozen `lme4` results for the weights tier, read by the `oracle-tests` tier. |
 | `tools/` | tools and generators, no gates: `bit_identity/` (a "what moved" report: dump the per-rung results before and after a change and diff them; the dumps are machine-local and not committed), `lanewidth/` (SIMD lane-width sensitivity), `memory/` (peak RSS), `goldens_agq.R` (the goldens generator), `prep/` (the fixed-seed generators of `data/`, plus `gamma_agq_reference.R`, a from-scratch Gamma AGQ reference run unweighted at the console and with `--weights` to freeze `gamma_agq_reference_wts.json`), `common.rs` (the shared reader the manifest-shaped examples include). A bare run of `goldens_agq.R` or of a `prep/` script overwrites committed artifacts, so both are deliberate acts, not routine steps. |
 | `tools/prep/gen_inference_data.R` | the fixed-seed generator of the inference references' shared input data: `data/empirical/Dyestuff2.csv` and the simulated designs it writes to `data/simulated/`. Run once; the CSVs are committed, and a re-run must reproduce them byte for byte. |
+| `tools/prep/gen_uncorrelated_data.R` | the data of the uncorrelated and intercept-free random-effect goldens: `data/simulated/sim_uncorr_{rho,boundary}.csv` (fixed seeds), and `data/empirical/sleepstudy_d2.csv` and `Machines_dummy.csv`, which add derived columns to the empirical CSVs. Byte-identical on a re-run. |
+| `data/inference/` | input data that only the inference references read, never the grid: the newdata of the `predict` entries (`tools/prep/gen_predict_data.R`, no draws) and the ill-conditioned GLM designs of the `conditioning` entries (`tools/prep/gen_glm_band_data.R`, fixed seeds). Byte-identical on a re-run. |
 | `campaigns/` | two finished studies, kept rerunnable: `speed-campaign/` (optimizer cost and wall time) and `monte_carlo/` (accuracy against known truth). See `campaigns/README.md`. |
 
 ## Running the grid
@@ -31,7 +33,7 @@ From `grid/`:
   with a random effect with `lmerTest::lmer` and records its per-coefficient
   Satterthwaite df; its run is kept and found like an oracle's.
 - `--fast` restricts the run to the cells tagged `fast` in `manifest.json` (116 of
-  923).
+  947).
 - `--timed[=N]` times every fit: N samples, the first discarded, median of the
   rest. It implies `--fast` and `--jobs 1`, records `no_turbo`, and **refuses to
   start on an unlocked clock** unless `--timed-unlocked` is given, in which case
@@ -49,7 +51,7 @@ From `grid/`:
   none. Records add `term_ddf` (term → F denominator df, null for glmmTMB). The
   flag is recorded as `pipeline` in `run_meta.json`.
 - `--ml` adds the cells tagged `ml` to a `--fast` or `--timed` run, which runs
-  without them otherwise. They are the 129 ML twins of the Gaussian mixed cells
+  without them otherwise. They are the 131 ML twins of the Gaussian mixed cells
   (all but `sim_entangled_pair_lmm`, whose deviance gate reads a frozen REML
   value), each on its parent's data, which `glmm`, `glmm_python` and `glmm_r` fit with
   `reml = Some(false)` / `reml=False` / `REML = FALSE` (every other cell keeps the
@@ -59,7 +61,9 @@ From `grid/`:
   `--fast --ml` run is gated on the fast cells and the twins. A `--fast` run made
   to check accuracy adds `--ml`.
 - `--jobs N` splits the cell list into N chunks and pins worker *i* with
-  `taskset -c i`. The P-cores on this box are 0–5, so N above 6 is refused.
+  `taskset` to the *i*-th core the script inherits, so `taskset -c 2,3 ./run.sh ...`
+  keeps its workers on cores 2 and 3 (a timed run uses core 0). The P-cores on this
+  box are 0–5, so N above 6 is refused, and so is N above the inherited core count.
 - `--label TEXT` is the free-text purpose of the run; it goes into
   `run_meta.json` and into the directory name.
 - `--keep` makes a finished `glmm` / `glmm_python` / `glmm_r` run the engine's kept
@@ -102,8 +106,10 @@ A fresh machine reaches the pinned oracle set with `Rscript install_oracles.R`.
   inference generators' pin), R 4.5.3, Julia 1.12.6. A bump reruns that oracle
   (or `lmertest`) into a new `last/`. The inference reference generators also
   pin `RLRsim` 3.1-9, `car` 3.1-5, `afex` 1.5-1, `numDeriv` 2016.8-1.1,
-  `MASS` 7.3-65 and `jsonlite` 2.0.0; bumping one of these regenerates no
-  frozen reference by itself.
+  `MASS` 7.3-65, `jsonlite` 2.0.0, `emmeans` 2.0.4, `performance` 0.18.2,
+  `effectsize` 1.0.3, `insight` 1.5.4, `pbkrtest` 0.5.5 and `reformulas` 0.4.4,
+  and the Python `conditioning` generator pins `mpmath` 1.4.1; bumping one of
+  these regenerates no frozen reference by itself.
 - **Satterthwaite df** (`compare.R` gate 5): glmm's per-coefficient df against
   `runs/lmertest/last/` on every Gaussian cell with a random effect, at
   `coef_df_rel` in `grid/tol.R`, registry-backed in gate 2's scope with the
@@ -120,7 +126,12 @@ A fresh machine reaches the pinned oracle set with `Rscript install_oracles.R`.
 - **Documented divergences** — `grid/divergences.json`. An over-band difference
   with no entry fails; one that outgrows its entry fails; an entry that stops
   firing fails as stale. A real `glmm` defect is never registered — it stays red
-  and is tracked as a bug.
+  and is tracked as a bug. Most differences never reach the registry, because
+  three rules decide them first: a parameter reference is an oracle at `glmm`'s
+  optimum (deviance at most `dev_eps` above `glmm`'s; gate 5 reads lme4's record of
+  the lmerTest fit), two such fits that both put a random-effect SD below
+  `sd_boundary_abs` agree on it, and an lme4 fit whose only message is the
+  singular-fit note counts as converged (`runs.R`, `reclassify_lme4_on_read`).
 - **Cells with no MLE**: a cell whose manifest entry carries `no_mle` (from
   `NO_MLE` in `gen_manifest.R`, with its reason) has data that admit no
   maximum-likelihood estimate. `compare.R` passes glmm's clean refusal there,

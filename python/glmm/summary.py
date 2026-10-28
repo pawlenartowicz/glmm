@@ -143,25 +143,6 @@ def method_line(fit):
     return "Generalized linear mixed model fit by maximum likelihood (Laplace Approximation) [glmm]"
 
 
-def _unused_level_counts(notes):
-    """Grouping name -> count of declared levels with no rows, read off the
-    kernel's `unused_grouping_levels` notes.
-
-    Mirrors the detail-string split in `glmm.__init__._note_warning`:
-    `"<group>: <level>, <level>"`, partitioned on the first ": " only, since a
-    level label may itself contain one. The level list is then split on ", " —
-    the same separator `orchestrate::note_infos` joins it with (Rust
-    `src/orchestrate.rs`), so a level label containing ", " would overcount;
-    no such label exists in any fixture this port ships with."""
-    counts = {}
-    for note in notes:
-        if note["kind"] != "unused_grouping_levels":
-            continue
-        group, _, levels = note["detail"].partition(": ")
-        counts[group] = len(levels.split(", "))
-    return counts
-
-
 def pearson_residuals(fit):
     mu = np.asarray(fit.fitted, dtype=float)
     y = np.asarray(fit.y, dtype=float)
@@ -305,7 +286,11 @@ class Rendered:
         return "\n".join(out)
 
 
-def build_summary(fit):
+def build_summary(fit, effect_sizes=None, need_refit=False):
+    """The `Summary` of `fit`. `effect_sizes` is the dict of
+    `Fit._effect_sizes(null_refit=False)` (None: no R-squared line), and
+    `need_refit` is True where that call gave None, so the summary points to
+    `r2()` and `icc()` instead."""
     beta = np.asarray(fit.beta, dtype=float)
     se = np.asarray(fit.se, dtype=float)
     aliased = np.asarray(fit.aliased, dtype=bool)
@@ -366,6 +351,7 @@ def build_summary(fit):
             {
                 "group": group,
                 "terms": list(terms),
+                "term_index": list(fit.re_term_index[g]),
                 "variance": sd * sd,
                 "stddev": sd,
                 "corr": corr,
@@ -376,16 +362,7 @@ def build_summary(fit):
 
     groups = []
     if len(fit.ranef_levels) == len(fit.re_groups):
-        # `ranef_levels` is the kernel's slot count, which still includes a
-        # declared level with no rows (a block is sized by the highest
-        # observed code, so a gap level between two used ones still occupies
-        # a slot). lme4 counts groups after `droplevels()`, so those slots
-        # are subtracted back out here.
-        unused = _unused_level_counts(fit.diagnostics["notes"])
-        groups = [
-            (name, int(n) - unused.get(name, 0))
-            for (name, _), n in zip(fit.re_groups, fit.ranef_levels)
-        ]
+        groups = [(name, int(n)) for (name, _), n in zip(fit.re_groups, fit.ranef_levels)]
 
     corr_fixed = None
     if len(beta) >= 2:
@@ -394,6 +371,7 @@ def build_summary(fit):
         with np.errstate(invalid="ignore", divide="ignore"):
             corr_fixed = vc / np.outer(d, d)
 
+    sizes = effect_sizes or {}
     return Summary(
         method=method_line(fit),
         formula=fit.formula,
@@ -417,6 +395,10 @@ def build_summary(fit):
         rss=getattr(fit, "rss", math.nan),
         r_squared=getattr(fit, "r_squared", math.nan),
         adj_r_squared=getattr(fit, "adj_r_squared", math.nan),
+        r2_marginal=sizes.get("marginal"),
+        r2_conditional=sizes.get("conditional"),
+        icc_adjusted=sizes.get("adjusted"),
+        r2_need_refit=need_refit,
         aliased=aliased,
         corr_fixed=corr_fixed,
         dispersion_label=_dispersion_label(fit),
@@ -458,6 +440,14 @@ class Summary(Rendered):
     rss: float
     r_squared: float
     adj_r_squared: float
+    # A mixed model's R-squared pair and adjusted ICC; NaN or None where
+    # there are none.
+    r2_marginal: float | None
+    r2_conditional: float | None
+    icc_adjusted: float | None
+    # True on a Poisson or negative binomial GLMM, whose values need a refit
+    # of the null model: the line then points to r2() and icc().
+    r2_need_refit: bool
     aliased: np.ndarray
     corr_fixed: np.ndarray | None
     dispersion_label: str | None
@@ -515,6 +505,7 @@ class Summary(Rendered):
             )
         else:
             out.append(f"Number of obs: {self.nobs}")
+        out += self._effect_size_lines()
         out.append("")
 
         out.append("Fixed effects:")
@@ -568,6 +559,24 @@ class Summary(Rendered):
         return "\n".join(out)
 
     # -- shared block decomposition ---------------------------------------
+
+    def _effect_size_lines(self):
+        """The line of the R-squared pair and the adjusted ICC, under the
+        number of observations; the pointer to r2() and icc() where they need
+        a refit of the null model; nothing when a value is NaN or absent (a
+        fit without random effects, a family they do not cover, a fit pickled
+        before its training data was kept). Same lines as the R port's
+        print.summary.fastglmm - change together."""
+        if self.r2_need_refit:
+            return ["R2 and ICC need a refit of the null model: call fit.r2() and fit.icc()"]
+        values = (self.r2_marginal, self.r2_conditional, self.icc_adjusted)
+        if any(v is None or not math.isfinite(v) for v in values):
+            return []
+        line = (
+            f"Marginal R2: {values[0]:.3f}, conditional R2: {values[1]:.3f}, "
+            f"adjusted ICC: {values[2]:.3f}"
+        )
+        return [line]
 
     def _lm_lines(self):
         """`summary.lm`'s two footer lines on an OLS fit (it has an R-squared),
@@ -626,8 +635,16 @@ class Summary(Rendered):
         if self.random_effects:
             rows = []
             for re in self.random_effects:
+                term = re["term_index"]
                 for i in range(len(re["stddev"])):
-                    corr = " ".join(f"{re['corr'][i, j]:.2f}" for j in range(i))
+                    # As lme4: a correlation only between two columns of one
+                    # term, whose columns are contiguous; two terms are
+                    # uncorrelated by the model.
+                    corr = " ".join(
+                        f"{re['corr'][i, j]:.2f}"
+                        for j in range(i)
+                        if i >= len(term) or term[j] == term[i]
+                    )
                     rows.append(
                         [
                             re["group"] if i == 0 else "",
@@ -702,7 +719,7 @@ class Summary(Rendered):
             )
         else:
             lines.append(f"Number of obs: {self.nobs}")
-        return lines
+        return lines + self._effect_size_lines()
 
     def _footer_lines(self):
         # "Signif. codes" rides here (not in `_tables`, it is a legend, not a

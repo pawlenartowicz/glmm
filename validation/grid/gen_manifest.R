@@ -15,8 +15,6 @@
 #   ML TWINS a `reml = false` copy of every Gaussian mixed cell above (one
 #            exception, see DEV_REF), on its parent's data.
 #
-# Uncorrelated slopes have no structure code here.
-#
 # THE ENUMERATION ORDER IS COSMETIC: each cell's seed is seed_of(cell$cell), a
 # hash of its own id (an AGQ cell takes its Laplace parent's id, seed and CSV,
 # and an ML twin its parent's seed and CSV),
@@ -367,6 +365,7 @@ DEV_REF <- list(
 )
 
 INFERENCE_DATA_REASON <- "inference reference data (tools/prep/gen_inference_data.R), gated by the inference tier, not a grid cell"
+UNCORRELATED_DATA_REASON <- "data of the uncorrelated random-effect goldens (tools/prep/gen_uncorrelated_data.R), gated by the oracle tier, not a grid cell"
 
 FIXTURE_SKIPPED <- list(
   # data/simulated/ or data/empirical/ CSV stems that become no cell at all,
@@ -374,11 +373,11 @@ FIXTURE_SKIPPED <- list(
   # covers every CSV under both directories, so a fixture cannot vanish
   # quietly.
   #
-  # EXPECTED TO HOLD EXACTLY NINE ENTRIES: InstEval and the eight inference
-  # reference datasets below. Every other simulated fixture -- including
-  # sim_binomial_zerosd and sim_entangled_pair_lmm -- becomes a cell. A further
-  # entry here would mean dropping a committed fixture from the grid; add the
-  # cell instead.
+  # EXPECTED TO HOLD EXACTLY THIRTEEN ENTRIES: InstEval, the eight inference
+  # reference datasets and the four uncorrelated-golden datasets below. Every
+  # other simulated fixture -- including sim_binomial_zerosd and
+  # sim_entangled_pair_lmm -- becomes a cell. A further entry here would mean
+  # dropping a committed fixture from the grid; add the cell instead.
   InstEval = "not one of the eleven empirical datasets the grid covers; 73421 rows x a crossed d/s/dept design would take a large share of the one-night oracle budget",
   Dyestuff2 = INFERENCE_DATA_REASON,
   sim_corr_boundary = INFERENCE_DATA_REASON,
@@ -387,7 +386,11 @@ FIXTURE_SKIPPED <- list(
   sim_factorial_empty = INFERENCE_DATA_REASON,
   sim_near_singular = INFERENCE_DATA_REASON,
   sim_rlrt_few_unbal = INFERENCE_DATA_REASON,
-  sim_rlrt_large_k = INFERENCE_DATA_REASON
+  sim_rlrt_large_k = INFERENCE_DATA_REASON,
+  Machines_dummy = UNCORRELATED_DATA_REASON,
+  sim_uncorr_boundary = UNCORRELATED_DATA_REASON,
+  sim_uncorr_rho = UNCORRELATED_DATA_REASON,
+  sleepstudy_d2 = UNCORRELATED_DATA_REASON
 )
 
 # ---- per-cell oracles --------------------------------------------------------
@@ -926,7 +929,7 @@ FAST_IDS <- unique(c(
 ))
 # (8) the nAGQ = AGQ_K copy of every fast cell adaptive quadrature can fit, so a
 # timed run times each such cell under both Laplace and AGQ. The shape rule
-# mirrors the kernel's nagq > 1 gate (src/fit/common.rs, assert_model_shape):
+# mirrors the kernel's nagq > 1 gate (src/fit/common.rs, check_model_shape):
 # binomial / Poisson / NB / Gamma, one grouping factor, at most 3 random effects
 # per group -- change together. A generated copy is a generated cell of its own
 # id that reads its parent's seed and CSV, built exactly as the section-5 AGQ

@@ -1,18 +1,19 @@
 //! `glmm` — standalone f64 GLMM fit kernels (OLS → GLM → LMM → GLMM).
 //!
-//! The full dispatch — every route from `fit_cold`/`fit_warm` down to its
+//! The full dispatch — every route from [`fit`]/[`fit_with_start`] down to its
 //! solver — is traced in `documentation/algorithms.md`.
 //!
 //! Two public surfaces:
-//! - [`fit_cold`]/[`fit_warm`] + [`ModelSpec`] + [`GroupIds`]: the stable,
-//!   semver-covered friendly API.
+//! - [`fit`]/[`fit_with_start`] + [`Data`] + [`ModelSpec`] + [`GroupIds`]: the
+//!   stable, semver-covered friendly API.
 //! - `loop_advanced` (cargo feature, off by default): the unstable scratch-explicit
 //!   hot-path surface (loop tier) that warm-start consumers like MCPower bind to,
 //!   exposing the kernels and [`StartValues`]. NO semver guarantees.
 //! - [`formula`] (cargo feature, on by default): the R-style formula frontend —
-//!   `formula::lower("y ~ x + (1|g)", &table, family)` builds the kernel's inputs
-//!   from a formula string and a data table instead of by hand. Outside the
-//!   semver promise until the 1.0.0 surface review.
+//!   `formula::fit("y ~ x + (1|g)", &table, family, &opts)` fits a formula
+//!   string against a data table, and `formula::lower` builds the kernel's
+//!   inputs from them instead of by hand. Outside the semver promise until the
+//!   1.0.0 surface review.
 //! - [`inference`]: the hypothesis tests on fitted models. Like
 //!   `loop_advanced`, outside the semver promise until the 1.0 surface review.
 //!
@@ -65,6 +66,7 @@ pub mod simd_transcendental;
 pub mod formula;
 
 mod counters;
+mod data;
 mod family;
 mod fit;
 mod glm;
@@ -73,18 +75,26 @@ mod ids;
 mod lmm;
 mod ols;
 mod optim;
+mod predict;
+mod simulate;
 mod sparse;
 mod spec;
 mod standardize;
 mod start;
 #[cfg(feature = "counters")]
 pub use counters::{EvalCounters, Stage};
-pub use fit::{fit_cold, fit_warm, Boundary, Diagnostics, Fit, FitOptions, Note, OuterStop};
+pub use data::{Data, Design};
+pub use fit::{
+    fit, fit_with_start, Boundary, Diagnostics, Fit, FitError, FitOptions, Note, OuterStop, SeFor,
+};
 pub use ids::GroupIds;
+pub use inference::{Icc, R2};
 /// The blind θ start. Re-exported because a caller that must supply
 /// [`StartValues`] (β and θ are bundled) cannot reach the `None`-θ blind path,
 /// and so has to reproduce that start explicitly.
 pub use lmm::THETA0;
+pub use predict::{predict, PredictOptions, Prediction, Scale};
+pub use simulate::Simulator;
 pub use spec::*;
 
 #[cfg(feature = "loop_advanced")]

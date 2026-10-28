@@ -1,8 +1,17 @@
 TOL <- list(
-  beta_rel        = 1e-3,   # fixed effects: relative. The corpus-wide cross-engine band,
-                            #   not independently measured on this grid.
-  stddev_rel      = 1e-3,   # varcomp std-devs: relative. The corpus-wide cross-engine
-                            #   band, not independently measured on this grid.
+  # beta_rel, stddev_rel, se_rel and se_hessian_rel are the corpus-wide cross-engine
+  # bands, set before this grid. MEASURED (2026-10-27) on the full grid, the kept
+  # 0.7.0 glmm run against the nearest oracle at glmm's optimum (gate 2), Laplace
+  # cells: beta worst 5.81e-04 (binb_q4sx2_g3000p20_bal_base), stddev 6.47e-04
+  # (binb_cross6_g300p5_bal_base), se_rx 1.71e-04 (sim_collinear_lmm_ml),
+  # se_hessian 7.94e-04 (binb_cross4_g3000p20_bal_rare); the correlation, read
+  # against near_zero_abs, 9.17e-04 absolute (binb_q8_g3000p5_bal_base). The house
+  # rule would give 2e-03 for beta, stddev and se_hessian. They stay at 1e-3:
+  # se_rel and beta_rel also set the inference bands below (df_e2e_rel, confint_rel,
+  # wald_rel, sum_sq_rel, eta2_rel, r2_icc_rel), each measured far inside them, and
+  # tests/oracle_support/mod.rs mirrors all four.
+  beta_rel        = 1e-3,   # fixed effects: relative.
+  stddev_rel      = 1e-3,   # varcomp std-devs: relative.
   loglik_abs_lmm  = 2e-6,   # LMM REML criterion: near-exact across engines (~1e-9 typical).
                             #   Measured worst 1.23e-6 on sim_max_q_slope (q=8, 36 theta params,
                             #   the corpus's largest LMM covariance; ~6e-10 relative — MixedModels
@@ -22,7 +31,7 @@ TOL <- list(
                             #   worst + the same margin se_rel carries over ITS measured worst.
 
   # glmm (Rust) vs the glmm Python port -- a ROUND-OFF band, not an agreement band.
-  # The port drives the same kernel through PyO3 (fit_warm(start=NULL) IS fit_cold),
+  # The port drives the same kernel through PyO3 (with no start it is the same `glmm::fit` call),
   # with the same lowering and a deterministic optimizer, so every gated quantity is
   # bit-identical and only the JSON round-trip could perturb it (it does not: Rust
   # and Python both emit shortest-round-trip f64, jsonlite parses back exact). Any
@@ -67,6 +76,19 @@ TOL <- list(
   # touches nothing that carries signal. Exempting a coordinate can only turn a
   # fail into a pass, so raising this is relaxing every band at once.
   near_zero_abs   = 1e-3,
+
+  # sd_boundary_abs  the near-zero floor of a stddev comparison between two fits at
+  # the same optimum (aligned deviances within dev_eps; runs.R::sd_floor): an SD
+  # below it on both sides scores 0. The deviance is flat in a near-zero SD, so
+  # equal deviances with different tiny SDs say the data do not determine them.
+  # near_zero_abs above stays the floor of every other comparison, and of a stddev
+  # comparison whose fits sit at different optima.
+  # Rule: ceil1(2 x the largest such residue). MEASURED (2026-10-27) on the kept
+  # 0.7.0 run, every SD glmm pins to exactly 0 where glmmTMB, at glmm's optimum,
+  # leaves a residue: 3.72e-03 on gami_q2d_g3000p20_bal_base (glmm's deviance
+  # 2.0e-05 the lower), then 2.15e-03 (gami_nest2), 2.03e-03 (gami_nest3) and
+  # 1.06e-03 (gami_cross6), all g3000 Gamma-identity cells; ceil1(7.44e-03) = 8e-03.
+  sd_boundary_abs = 8e-03,
 
   # Vector-RE AGQ rungs vs GLMMadaptive (goldens/sim_*_slope*_agq_k*.json; the
   # in-crate gates in src/fit/glmm_tests.rs use these numbers -- change
@@ -212,10 +234,18 @@ TOL <- list(
   #          1.6e-05. On the seven largest, lmerTest's df evaluated at glmm's own
   #          theta-hat agrees with glmm's to 5.1e-07 or better (Penicillin; the
   #          others at or below 3.2e-07), so the spread is the two theta-hats',
-  #          not the df computation. ceil1(2 x 3.30e-04) = 7e-04. These 19 cells
-  #          are REML; the other 111 REML cells and the 129 ML twins are first
-  #          compared by a full glmm run.
-  coef_df_rel = 7e-04
+  #          not the df computation. ceil1(2 x 3.30e-04) = 7e-04.
+  #          RE-MEASURED (2026-10-27, dell-fedora) on the full grid: the kept 0.7.0
+  #          glmm run against the lmerTest 3.2.1 run (sim_dynrange_lmm and its twin
+  #          refitted after the engines' weights fix), 257 of the 263 Gaussian mixed
+  #          cells (132 REML, 131 ML twins) compared at glmm's optimum; the other six
+  #          are lmerTest failures or lmerTest fits above glmm's optimum, listed as
+  #          no-ref. Worst 7.50e-04 on lmm_q4sx2_g30000p20_bal_base_ml, (Intercept)
+  #          (lme4's deviance 1.05e-05 above glmm's); next 5.92e-04
+  #          lmm_q4sx2_g30000p5_bal_base, 5.73e-04 lmm_q4sx2_g3000p20_bal_nearzero_ml,
+  #          4.98e-04 lmm_nestmix_g3000p20_bal_base. ceil1(2 x 7.50e-04) = 2e-03, and
+  #          ceil1(2 x 5.92e-04) = 2e-03 without the first cell.
+  coef_df_rel = 2e-03
 )
 
 # ── truth-error band, per family ─────────────────────────────────────────────
@@ -224,6 +254,17 @@ TOL <- list(
 # err_glmm(cell) - err_best(cell), both engines on the same data. The pairing is
 # what makes it a band about the glmm-versus-oracle gap rather than about the
 # spread between a 60-row and a 30000-row cell.
+#
+# RE-MEASURED (2026-10-27) on the full grid (compare.R --dev-floor, kept 0.7.0 run),
+# not re-pinned. The largest best-oracle 2*SEM per family, over groups with n >= 2:
+# binomial 1.70e-04 (agq / beta, n = 13), gamma 2.18e-04 (agq / corr, n = 2),
+# gaussian 1.06e-05 (laplace / stddev, n = 214), negativebinomial 1.89e-05
+# (laplace / corr, n = 46), poisson 1.49e-04 (agq / stddev, n = 3). Bands at
+# ceil1 of those fail gate 3 on negativebinomial agq / corr and poisson agq / corr,
+# one vector-AGQ cell each, where no SEM exists and glmm sits 2e-05 and 4.5e-04
+# above GLMMadaptive (the quadrature-grid placement of dev_align.R's ga_rule_dev).
+# A per-family band cannot cover a one-cell group, so the pilot bands below stay
+# until the rule says what such a group is read against.
 #
 # MEASURED ON THE PILOT, 2026-09-22. The gate reads one band per family but
 # fires per (family, arm, quantity) group, so a family's band is the LARGEST
@@ -253,36 +294,10 @@ TOL_TRUTH_BAND <- list(
   inversegaussian = 3e-03
 )
 
-# ── per-cell tolerance overrides ─────────────────────────────────────────────
-# TOL above is grid-wide: one band per quantity, calibrated on the measured
-# worst across every cell. That is the right default (a band nobody can point at
-# a cell for is not calibrated), but it cannot express a cell whose engines agree
-# far better than the grid worst and whose whole reason for existing is that
-# tighter agreement. `se_hessian_rel` is the case: the crate documents <= 2e-5
-# measured glmm-vs-lme4 agreement (src/glmm/se.rs) while the grid-wide band is
-# 1e-3, so a cell added to guard that documented agreement cannot see a 25x
-# violation of it.
-#
-# Keyed by manifest cell id (compare.R's `cell`), then by the TOL key the
-# override replaces. A cell lists ONLY the quantities it tightens; everything
-# else falls through to TOL.
-#
-# Not a place to widen: an override that LOOSENS a band is a tolerance relaxed to
-# make an engine pass, which the grid forbids outright. Overrides tighten, and
-# `validate_tol_per_cell` below enforces that rather than only asking for it.
-#
-# BOTH KEY LEVELS ARE VALIDATED AT LOAD -- see `validate_tol_per_cell`. Do not
-# add an entry expecting `tol_for` to complain about a typo: it cannot, which is
-# exactly why the check is where it is.
-TOL_PER_CELL <- list()
-
-# The band for one quantity on one cell: the cell's own override when it has one,
-# else the grid-wide TOL value. `cell_id` is a manifest cell name; an unknown
-# name is not an error (it simply has no override -- and `validate_tol_per_cell`
-# has already proved every name in the table IS a cell), but an unknown
-# `quantity` is -- a typo there would otherwise gate against NULL and silently
-# pass. An unmeasured band stops for the same reason: NA compares false, so
-# gating against it passes everything.
+# The band for one quantity. `cell_id` names the cell asking, so every call site
+# reads the same way. An unknown `quantity` stops -- a typo would otherwise gate
+# against NULL and silently pass -- and so does an unmeasured band: NA compares
+# false, so gating against it passes everything.
 tol_for <- function(cell_id, quantity) {
   band <- TOL[[quantity]]
   if (is.null(band)) stop(sprintf("tol_for: no such tolerance `%s`", quantity))
@@ -291,132 +306,8 @@ tol_for <- function(cell_id, quantity) {
                         "grid/tol.R names the run that measures it; write the number ",
                         "there with its measurement."),
                  quantity))
-  ov <- TOL_PER_CELL[[cell_id]]
-  if (!is.null(ov) && !is.null(ov[[quantity]])) return(ov[[quantity]])
   band
 }
-
-# Directory this file lives in -- and therefore where manifest.json is, the two
-# being siblings. `source()` records the path it is reading in the sourcing frame's
-# `ofile`, which is the only thing a sourced file can learn its own location from:
-# the working directory is not an anchor (compare.R sources this by an absolute
-# path, other scripts by a relative one) and `--file=` names the SOURCER, not this
-# file. Frames are walked innermost-first so a nested source() still resolves to
-# the file actually being read, and the basename test keeps a nested source() of
-# some other file from answering for this one.
-#
-# CALL THIS DURING LOAD. The `ofile` frames exist only while the source() call is
-# on the stack, which is when its one caller (`validate_tol_per_cell` below) runs.
-# Called later the frame walk finds nothing, and the only remaining anchor is
-# `--file=`. With neither, this STOPS rather than guessing: a guessed directory
-# reads the wrong manifest.json, or none, and validating cell ids against the
-# wrong list is worse than not validating them.
-tol_suite_dir <- function() {
-  for (i in rev(seq_len(sys.nframe()))) {
-    of <- sys.frame(i)$ofile
-    if (is.character(of) && length(of) == 1L && file.exists(of) &&
-        identical(basename(of), "tol.R")) {
-      return(dirname(normalizePath(of)))
-    }
-  }
-  arg <- grep("--file=", commandArgs(FALSE), value = TRUE)
-  if (length(arg) == 1L) return(dirname(normalizePath(sub("--file=", "", arg))))
-  stop("tol_suite_dir: cannot locate tol.R's own directory, so manifest.json ",
-       "cannot be read to validate TOL_PER_CELL. Call this from inside the ",
-       "source() that loads tol.R, not afterwards")
-}
-
-# Every TOL_PER_CELL key, both levels, checked against reality when this file is
-# sourced. Called at the bottom of this block; returns invisibly.
-#
-# WHY LOAD-TIME AND NOT INSIDE `tol_for`. A mistyped key is indistinguishable from
-# "this cell has no override": `tol_for` finds nothing and returns the flat TOL
-# band, so the gate runs LOOSER than intended and the cell goes green having
-# checked nothing. That is the one failure mode a tolerance table must not have,
-# and it is silent at both levels -- an outer typo (`bina_int1_g3000p20_bal_basee`)
-# misses the cell, an inner typo (`se_hessian` for `se_hessian_rel`) misses the
-# quantity, and neither is visible in the output. `tol_for` cannot detect it even
-# in principle, and a check there would only fire for the cells a given run
-# happens to include. So the whole table is validated here, on every source(),
-# regardless of which cells run.
-#
-# NO-OP WHILE THE TABLE IS EMPTY: an empty list has nothing to check, so nothing
-# is read, no manifest is opened and no jsonlite dependency is taken. The manifest
-# read begins the first time an override is added, which is precisely when it is
-# needed.
-validate_tol_per_cell <- function() {
-  if (length(TOL_PER_CELL) == 0L) return(invisible(TRUE))
-
-  cells <- names(TOL_PER_CELL)
-  if (is.null(cells) || any(is.na(cells)) || !all(nzchar(cells))) {
-    stop("validate_tol_per_cell: every TOL_PER_CELL entry must be NAMED with a ",
-         "cell id; found an unnamed or empty-named entry")
-  }
-  dup <- unique(cells[duplicated(cells)])
-  if (length(dup) > 0) {
-    # `[[` returns the FIRST match, so a duplicated name silently discards the
-    # second entry's overrides -- the same silent-loss class as a typo.
-    stop(sprintf("validate_tol_per_cell: duplicated cell id(s) in TOL_PER_CELL: %s",
-                 paste(sprintf("`%s`", dup), collapse = ", ")))
-  }
-
-  if (!requireNamespace("jsonlite", quietly = TRUE)) {
-    stop("validate_tol_per_cell: TOL_PER_CELL is non-empty but jsonlite is not ",
-         "available to read manifest.json and check the cell ids")
-  }
-  manifest_path <- file.path(tol_suite_dir(), "manifest.json")
-  if (!file.exists(manifest_path)) {
-    stop(sprintf("validate_tol_per_cell: manifest.json not found at %s", manifest_path))
-  }
-  man <- jsonlite::fromJSON(manifest_path, simplifyDataFrame = FALSE)
-  known <- vapply(man$cells, `[[`, "", "cell")
-  unknown <- setdiff(cells, known)
-  if (length(unknown) > 0) {
-    stop(sprintf(paste0("validate_tol_per_cell: TOL_PER_CELL names no such cell: ",
-                        "%s -- these would silently fall through to the flat TOL ",
-                        "band (manifest.json knows %d cells)"),
-                 paste(sprintf("`%s`", unknown), collapse = ", "), length(known)))
-  }
-
-  for (cell_id in cells) {
-    ov <- TOL_PER_CELL[[cell_id]]
-    if (!is.list(ov)) {
-      stop(sprintf("validate_tol_per_cell: `%s` must map to a list of overrides, got %s",
-                   cell_id, class(ov)[1]))
-    }
-    quantities <- names(ov)
-    if (length(ov) == 0 || is.null(quantities) || !all(nzchar(quantities))) {
-      stop(sprintf("validate_tol_per_cell: `%s` has an empty or unnamed override list",
-                   cell_id))
-    }
-    for (quantity in quantities) {
-      band <- TOL[[quantity]]
-      if (is.null(band)) {
-        stop(sprintf(paste0("validate_tol_per_cell: `%s` overrides no such ",
-                            "tolerance `%s` -- it would silently fall through to ",
-                            "the flat TOL band"), cell_id, quantity))
-      }
-      value <- ov[[quantity]]
-      if (!is.numeric(value) || length(value) != 1L || !is.finite(value) || value <= 0) {
-        stop(sprintf(paste0("validate_tol_per_cell: `%s`$`%s` must be a single ",
-                            "finite positive number, got %s"),
-                     cell_id, quantity, paste(format(value), collapse = " ")))
-      }
-      # The "overrides tighten" rule, enforced rather than merely documented: a
-      # per-cell band LOOSER than the grid-wide one is a tolerance relaxed for a
-      # single cell, which is the thing the whole grid forbids -- and it is just
-      # as invisible in the output as a typo.
-      if (value > band) {
-        stop(sprintf(paste0("validate_tol_per_cell: `%s`$`%s` = %s is LOOSER than ",
-                            "the grid-wide TOL$%s = %s. Overrides tighten; ",
-                            "widening a band for one cell is not a per-cell band"),
-                     cell_id, quantity, format(value), quantity, format(band)))
-      }
-    }
-  }
-  invisible(TRUE)
-}
-validate_tol_per_cell()
 
 # ── inference (0.6.0) ────────────────────────────────────────────────────────
 # The bands of the inference tests (df, p-values, test statistics), which fall in
@@ -739,15 +630,14 @@ TOL_INFERENCE <- list(
   # weight and takes phi as the mean deviance: -358.999 against glmm's
   # precision-weight maximum -330.523, which R reproduces by optimising
   # sum(dgamma(y, w / phi, scale = mu phi / w, log = TRUE)) over phi).
-  # anova_ml_pair_sleepstudy_fixed is not compared: its smaller model Reaction ~
-  # 1 + (Days | Subject) is refused by the formula frontend (a random slope
-  # whose variable is no fixed term, SlopeVarNotInDesign), and the gate asserts
-  # that refusal. The statistic, absolute: twice DEV_EPS, the sum of the two
-  # sides' gaps the deviance gate admits. MEASURED (2026-10-12, pawel, x86_64)
-  # over the 22 likelihood-ratio rows: worst 1.49e-6
-  # (anova_glmm_pair_grouseticks), every other row at or below 1.5e-7
-  # (anova_glmm_pair_sim_binomial_slope1); anova_glmm_vs_glm_sim_nb 2.43e-2
-  # (glmm's statistic the smaller), the registered objective gap above.
+  # The statistic, absolute: twice DEV_EPS, the sum of the two sides' gaps the
+  # deviance gate admits. MEASURED (2026-10-12, pawel, x86_64) over the 22
+  # likelihood-ratio rows: worst 1.49e-6 (anova_glmm_pair_grouseticks), every
+  # other row at or below 1.5e-7 (anova_glmm_pair_sim_binomial_slope1);
+  # anova_glmm_vs_glm_sim_nb 2.43e-2 (glmm's statistic the smaller), the
+  # registered objective gap above. anova_ml_pair_sleepstudy_fixed, whose
+  # smaller model Reaction ~ 1 + (Days | Subject) has a random slope whose
+  # variable is no fixed term: MEASURED (2026-10-26, pawel, x86_64) 2.472e-8.
   # Also read, hard, by the in-crate check of the per-term likelihood-ratio
   # rows against afex (src/formula/anova_tests.rs::
   # type_iii_lrt_rows_match_afex_on_the_frozen_glmm, which holds a third copy;
@@ -882,7 +772,47 @@ TOL_INFERENCE <- list(
   # se_rel, which df_e2e_rel is; a list cannot read its own entries) plus
   # twice stddev_rel on sigma-hat squared. MEASURED (2026-10-13, pawel, x86_64) over
   # the same 24 rows: worst 7.40e-6 on both (_ml, x).
-  sum_sq_rel = TOL$se_rel + 2 * TOL$stddev_rel
+  sum_sq_rel = TOL$se_rel + 2 * TOL$stddev_rel,
+  # Partial eta-squared of an F per-term row, F * df1 / (F * df1 + df2), as
+  # effectsize::F_to_eta2 computes it, relative: wald_rel on F plus df_e2e_rel
+  # on df2 (each written as se_rel, which both are; a list cannot read its own
+  # entries), the bound of |d ln eta2| = (1 - eta2) |d ln F - d ln df2| with
+  # df1 exact. MEASURED (2026-10-26, pawel, x86_64) on the four rows of
+  # effectsize_ols_sim_factorial (tests/formula_anova.rs::
+  # partial_eta2_matches_the_frozen_ols_reference): worst 5.58e-8 (h, the
+  # zapsmall rounding of term_tests' Type III L noted at wald_rel), the other
+  # rows at or below 3.7e-14. Over the 17 rows of the six effectsize references
+  # with eta2 (tests/inference_oracle.rs::effect_sizes): worst 2.39e-5
+  # (effectsize_glm_glm_gamma, x:grp), the LMM rows at or below 9.95e-6
+  # (effectsize_machines, Machine).
+  eta2_rel = TOL$se_rel + TOL$se_rel,
+  # Marginal and conditional R2 (performance::r2_nakagawa) and the adjusted and
+  # unadjusted ICC (performance::icc), relative. Each is a ratio N / D of sums of
+  # the fixed, random and residual variances v_k, and d ln(N / D) =
+  # sum_k c_k d ln v_k with every |c_k| <= 1, so the error is at most the sum of
+  # the three parts': twice beta_rel on var(X beta-hat), twice stddev_rel on
+  # each of the random and the residual variance. MEASURED (2026-10-26, pawel,
+  # x86_64) over the seven mixed-model effectsize references
+  # (tests/inference_oracle.rs::effect_sizes): R2 worst 3.13e-5
+  # (effectsize_machines, marginal), ICC worst 3.10e-5
+  # (effectsize_glmm_sim_factorial_bern, unadjusted); the other LMMs at or
+  # below 6.93e-6, the other GLMMs at or below 1.64e-5.
+  r2_icc_rel = 2 * TOL$beta_rel + 4 * TOL$stddev_rel,
+  # A Tukey-adjusted pairwise p-value (emmeans' adjust = "tukey"), relative:
+  # the row's p band (satt_p_rel on a t row, wald_p_rel on a z row, both 4e-2,
+  # written as the literal since a list cannot read its own entries) plus R's
+  # ptukey error, 1e-5 relative where it agrees with commonstats'
+  # StudentizedRange (df = Inf, or 30 <= df <= 25000, with both tails at least
+  # 1e-3: the agreement that type's doc comment gives). Outside that region
+  # the Tukey rows are not compared: posthoc_machines (df about 5) and
+  # posthoc_oats (df about 10) whole, and every row whose frozen p or 1 - p is
+  # below 1e-3, where ptukey's upper tail is 1 - ptukey(lower), cancellation
+  # noise. MEASURED (2026-10-27, pawel, x86_64) over the 47 compared rows of
+  # the 14 other posthoc references (tests/inference_oracle.rs::posthoc_rows;
+  # 13 rows left out for their tail): worst 7.55e-4
+  # (posthoc_glmm_sim_factorial_bern_by, a - b within p, a z row); the t rows
+  # at or below 7.46e-6 (posthoc_lmm_sim_factorial_by, b - c within p).
+  tukey_p_rel = 4e-2 + 1e-5
 )
 
 # Max relative difference over two aligned numeric vectors; NA on length mismatch

@@ -12,16 +12,17 @@ and the warning categories the diagnostics channel raises (`DiagnosticWarning`, 
 `ArgumentIgnoredWarning`, `ConstantResponseWarning`, `DesignUnsolvableWarning`,
 `ExactProfileFallbackWarning`, `FewRowsForRandomEffectsWarning`,
 `FitFailedWarning`, `GradientSearchFallbackWarning`, `GlmDivergedWarning`, `HessianSeFallbackWarning`,
-`IllConditionedWarning`, `NbShapeUnsettledWarning`, `NoCoefficientsWarning`,
-`NonIntegerResponseWarning`, `PirlsExhaustedWarning`, `PrecisionLimitedWarning`,
+`IllConditionedWarning`, `NbShapeUnsettledWarning`, `NewGroupingLevelsWarning`,
+`NoCoefficientsWarning`, `NonIntegerResponseWarning`, `PirlsExhaustedWarning`, `PrecisionLimitedWarning`,
 `RowsDroppedWarning`, `SatterthwaiteCurvatureWarning`,
 `SearchLimitWarning`, `SeUnavailableWarning`, `SingleLevelGroupingDroppedWarning`,
 `SingularFitWarning`,
-`TooFewRowsWarning`, `UnusedGroupingLevelsWarning`, `VarianceAtLimitWarning`).
+`TooFewRowsWarning`, `VarianceAtLimitWarning`).
 """
 
 import math
 import os
+import random
 import re
 import sys
 import warnings
@@ -51,8 +52,10 @@ __all__ = [
     "HessianSeFallbackWarning",
     "IllConditionedWarning",
     "NbShapeUnsettledWarning",
+    "NewGroupingLevelsWarning",
     "NoCoefficientsWarning",
     "NonIntegerResponseWarning",
+    "PairwiseTable",
     "PirlsExhaustedWarning",
     "PrecisionLimitedWarning",
     "RowsDroppedWarning",
@@ -63,12 +66,12 @@ __all__ = [
     "SingularFitWarning",
     "TermTable",
     "TooFewRowsWarning",
-    "UnusedGroupingLevelsWarning",
     "VarianceAtLimitWarning",
     "anova",
     "compare",
     "fit",
     "model_matrix",
+    "pairwise",
     "term_labels",
 ]
 
@@ -105,17 +108,13 @@ class PirlsExhaustedWarning(DiagnosticWarning):
     """
 
 
-class UnusedGroupingLevelsWarning(DiagnosticWarning):
-    """A grouping factor declares levels that carry no row but still occupy
-    random-effect columns.
+class NewGroupingLevelsWarning(DiagnosticWarning):
+    """`Fit.predict` met grouping levels the fit did not see.
 
-    An empty cluster between two observed ones contributes nothing to the
-    likelihood and costs model width anyway, because the block is sized by the
-    largest observed code. `ranef` reports such a level with its mode fully
-    shrunk to zero; lme4 has no counterpart row at all. Dropping the level
-    (pandas `.cat.remove_unused_categories()`, R `droplevels`) removes both the
-    row and the wasted width. A level declared *after* the last observed one
-    costs nothing and never warns.
+    Those rows get a random effect of zero for that grouping (the population
+    value), while their other groupings keep theirs. Raised by `predict`, not
+    by `fit`, so it is not in `Fit.warnings`. `allow_new_levels=False` makes
+    such a level an error instead.
     """
 
 
@@ -541,8 +540,9 @@ def _bool_values(col):
 def _sorted_levels_and_codes(labels):
     """A plain string column as (levels, codes), levels lexicographic.
 
-    Mirrors Rust's `Column::factor_from_labels` — the R `factor()` default, and
-    all that can be inferred when the caller declared no order. Doing the sort
+    Mirrors Rust's `Column::factor_from_labels` — the R `factor()` default in
+    the C locale (by code point; R in another locale can order mixed-case labels
+    differently), and all that can be inferred when the caller declared no order. Doing the sort
     here rather than in the parser is what makes it a default the caller can
     override, instead of one imposed on every factor."""
     levels = sorted(set(labels))
@@ -673,8 +673,8 @@ class Fit:
     #                     — observations with no dedicated field, each raised
     #                     as a `DiagnosticWarning` subclass by `fit`. Mostly
     #                     the solver's; the formula lowering contributes
-    #                     "unused_grouping_levels" (grouping and level names
-    #                     ride in `detail`).
+    #                     "single_level_grouping_dropped" and
+    #                     "few_rows_for_random_effects" (names ride in `detail`).
     #                     `columns` are 0-based indices into `names` (the R
     #                     package reports the same thing 1-based, per R's own
     #                     convention). An absent note means "not detected",
@@ -687,6 +687,9 @@ class Fit:
     dispersion: float  # phi (gamma / inverse-gaussian) / theta (negbin) / residual sigma^2 (gaussian) / 1.0 (binomial, poisson)
     names: list  # coefficient names, aligned with beta
     re_groups: list  # per grouping, in varcorr order: (name, [term names])
+    # Per grouping, in re_groups order, the term of each term name: (x || g)
+    # gives [0, 1]. summary() prints a correlation only within one term.
+    re_term_index: list
     n_eval: int  # optimizer objective evaluations (0 on the closed-form/IRLS paths)
     # The gradient (BFGS) theta search, on the models GradientSearchFallbackWarning
     # names; they describe that search even when the derivative-free search
@@ -739,6 +742,16 @@ class Fit:
     #   terms   list[str]  -- column names, "(Intercept)" first
     #   levels  list[str]  -- row labels, one per level
     #   values  ndarray    -- (len(levels), len(terms))
+    #   postvar ndarray    -- (len(levels), len(terms), len(terms)): each
+    #                         level's conditional covariance of its random
+    #                         effects given the data, lme4's
+    #                         `ranef(condVar = TRUE)` "postVar"; None on a fit
+    #                         made with condvar=False and on one whose layout
+    #                         forms none (an extra grouping with a random
+    #                         slope, the sparse route, the packed GLMM)
+    #   condsd  ndarray    -- (len(levels), len(terms)): the conditional
+    #                         standard deviations, the square roots of the
+    #                         diagonal of `postvar`; None where it is
     # Padded slots of a nested grouping are already dropped, so `levels` is
     # exactly the levels that exist. Not a DataFrame: the package's only
     # dependency is numpy, and `fit()` accepts duck-typed data precisely so it
@@ -792,8 +805,7 @@ class Fit:
     # The design summary of a Gaussian fit whose only random term is one random
     # intercept `(1 | g)`, with no prior weights and at least one fixed-effect
     # column; None on every other fit. A dict of three flat float arrays, with
-    # K = the highest observed level code + 1 (a level below it with no rows
-    # counts 0; unused levels after it are not counted) and p retained
+    # K = the number of groups and p retained
     # fixed-effect columns, on the fit's orthogonalized design X~ (it spans the
     # column space of the fixed-effect design):
     #   counts  (K,)    rows per level
@@ -803,8 +815,8 @@ class Fit:
     # (n,) offset the kernel fitted with, None if there is none; read from the
     # kernel like `weights`, so `glmm.anova(m0, m1)` can check that two fits
     # share it. With `y` and `weights` it is everything `glmm.anova(m0, m1)`
-    # reads per row: the fit keeps no data column. Defaulted, like the fields
-    # below, only because a dataclass field with a default comes last.
+    # reads per row. Defaulted, like the fields below, only because a
+    # dataclass field with a default comes last.
     offset: np.ndarray | None = None
     # What the fit maximised, and its quadrature node count: "least_squares"
     # (OLS), "maximum_likelihood" (GLM, or a Gaussian mixed model fitted by
@@ -853,6 +865,15 @@ class Fit:
     # About p**2 * (n_free + 1) floats, kept in a pickle. Mirrors the R port's
     # `object$satterthwaite_record` - change together.
     satterthwaite_record: dict | None = None
+    # What `predict`, `simulate`, `pairwise`, `r2` and `icc` read besides the
+    # public fields, private: the training columns as `_native.fit` took them
+    # ("numeric" and "factor", after the missing-value row drop, and the
+    # "weights" and "offset" arguments, as bytes or None), lowered again on
+    # each call, and the kernel's conditional variances in its own layout
+    # ("condvar", "condvar_x", float64 bytes, and "condvar_cross", a dict or
+    # None). None on a fit pickled before them.
+    # Mirrors the R port's `.kernel_parts` - change together.
+    _kernel_parts: dict | None = field(default=None, repr=False)
 
     @property
     def converged(self):
@@ -935,7 +956,18 @@ class Fit:
         must finish defining `Fit` before `summary.py` is needed."""
         from glmm.summary import build_summary
 
-        return build_summary(self)
+        if self.re_term_index is None:
+            raise ValueError(
+                "this fit was made by a glmm version that did not keep re_term_index, "
+                "which summary reads. Refit the model with this version."
+            )
+        # A fit pickled before `_kernel_parts` cannot lower its rows again, so
+        # its summary has no R-squared line.
+        sizes, need_refit = None, False
+        if self._kernel_parts is not None:
+            sizes = self._effect_sizes(null_refit=False)
+            need_refit = sizes is None
+        return build_summary(self, sizes, need_refit)
 
     def confint(self, level=0.95):
         """Confidence intervals for the fixed effects as a `(p, 2)` array of
@@ -995,16 +1027,6 @@ class Fit:
         if L.ndim not in (1, 2):
             raise ValueError(f"L must be a vector or a matrix, got {L.ndim} dimensions")
         p = len(self.beta)
-        rec = self.satterthwaite_record
-        if rec is not None:
-            rec = {
-                "a_eff": np.asarray(rec["a_eff"], dtype=float).tolist(),
-                "jac_theta": [np.asarray(j, dtype=float).tolist() for j in rec["jac_theta"]],
-                "c": np.asarray(rec["c"], dtype=float).tolist(),
-                "tau": float(rec["tau"]),
-                "nu": float(rec["nu"]),
-                "retained": rec["retained"],
-            }
         stored = _native.contrast_test(
             self.df_method,
             [float(v) for v in self.beta],
@@ -1012,15 +1034,273 @@ class Fit:
             [bool(a) for a in self.aliased],
             int(self.nobs),
             float(self.dispersion),
-            rec,
+            self._record_arg(),
             list(self.names),
             L.ravel().tolist(),
             1 if L.ndim == 1 else L.shape[0],
         )
         # A contrast has no SS type: the crate's table carries a placeholder one.
         stored["ss_type"] = None
+        # A contrast is not a term, so its row has no partial eta-squared.
+        del stored["eta2_partial"]
         # "Wald": the one-line heading of an explicitly asked chi-squared table.
         return _term_table(self, _term_result(stored), "Wald")
+
+    def predict(
+        self,
+        newdata=None,
+        type="link",
+        re_form=None,
+        allow_new_levels=True,
+        se_fit=False,
+        level=0.95,
+        future=False,
+    ):
+        """Predictions on new rows, lme4's `predict(newdata = )`.
+
+        newdata: rows read as `fit` reads `data` (dict, DataFrame, Arrow
+            Table), with the columns the formula reads other than the
+            response; None (the default) predicts the rows the fit used. A
+            factor is coded with the fit's levels by label, so a level the fit
+            did not see is an error. A row with a missing value is refused.
+        type: "link" (the default) for the linear predictor, "response" for
+            the mean.
+        re_form: None (the default) for the prediction given the conditional
+            modes of every grouping, or "NA" for the fixed effects only, which
+            needs no grouping column.
+        allow_new_levels: a grouping level the fit did not see gets a random
+            effect of zero for that grouping, with a
+            `NewGroupingLevelsWarning`; False makes it an error.
+        se_fit: also return the standard error and the interval at `level`.
+            On the response scale the standard error is the delta method's and
+            the interval the inverse link of the link-scale one.
+        level: the coverage of the interval and of the future bounds.
+        future: also return the bounds of a future observation on the response
+            scale (a non-Gaussian mixed model only), the family's quantiles
+            mixed over the uncertainty of the linear predictor.
+
+        Returns the predictions as a float array; with `se_fit` or `future`, a
+        dict of arrays: "fit", then "se_fit", "lower" and "upper" with
+        `se_fit`, and "future_lower" and "future_upper" with `future`.
+
+        The standard error is lme4's (`predict(se.fit = TRUE)`), with the
+        variance parameters held at their estimates; on a GLMM it uses the
+        fit's fixed-effect covariance (`wald_se`), where lme4 uses the RX one.
+        A fit whose random effects route to the sparse solver forms no
+        conditional variances, so a conditional standard error there raises.
+        A model fitted with the `offset=` argument cannot predict new rows:
+        give the offset as an `offset()` term in the formula instead. The name
+        is provisional until 1.0.0."""
+        if re_form is None:
+            population = False
+        elif isinstance(re_form, str) and re_form == "NA":
+            population = True
+        else:
+            raise ValueError(
+                're_form must be None (the random effects included) or "NA" (fixed effects '
+                f"only), got {re_form!r}"
+            )
+        kept = self._kept()
+        if newdata is None:
+            new_numeric = new_factor = None
+            n_rows = 0
+        else:
+            new_numeric, new_factor, _, _ = _prepare_columns(
+                newdata, [self.formula], None, None, [], new_data=True
+            )
+            n_rows = _row_count(newdata, new_numeric, new_factor)
+        r = _native.predict(
+            self.formula,
+            kept["numeric"],
+            kept["factor"],
+            self.family,
+            self.link,
+            kept["weights"],
+            kept["offset"],
+            self._stored_numbers(),
+            new_numeric,
+            new_factor,
+            n_rows,
+            type,
+            population,
+            bool(allow_new_levels),
+            bool(se_fit),
+            float(level),
+            bool(future),
+        )
+        for note in r["notes"]:
+            if note["kind"] == "new_grouping_levels":
+                grouping, rows = note["detail"].split(": ", 1)
+                name = self.re_groups[int(grouping)][0]
+                rows = rows.split(", ")
+                n = len(rows)
+                rows = ", ".join(rows[:10]) + (f", and {n - 10} more" if n > 10 else "")
+                warnings.warn(
+                    f"{_count(n, 'row')} of newdata {'has' if n == 1 else 'have'} a level of "
+                    f"{name} the fit did not see (rows {rows}). Their random effect for "
+                    f"{name} is 0.",
+                    NewGroupingLevelsWarning,
+                    stacklevel=2,
+                )
+        fit = _f64(r["fit"])
+        if not (se_fit or future):
+            return fit
+        out = {"fit": fit}
+        if se_fit:
+            out.update(se_fit=_f64(r["se"]), lower=_f64(r["lower"]), upper=_f64(r["upper"]))
+        if future:
+            out.update(future_lower=_f64(r["future_lower"]), future_upper=_f64(r["future_upper"]))
+        return out
+
+    def simulate(self, nsim=1, seed=None):
+        """`nsim` draws of the response on the rows the fit used, lme4's
+        `simulate()`, as an `(nobs, nsim)` array. Each draw takes new random
+        effects from the fitted covariance and then the family's draw around
+        the conditional mean, with the fitted dispersion; a binomial draw is a
+        proportion of the row's trials.
+
+        seed: a whole number from 0 to 2**64 - 1; the same seed gives the same
+            draws on every platform. None (the default) takes one from Python's
+            `random` module.
+
+        The name is provisional until 1.0.0."""
+        if isinstance(nsim, bool) or not isinstance(nsim, (int, np.integer)) or nsim < 1:
+            raise ValueError(f"nsim must be a whole number of at least 1, got {nsim!r}")
+        if seed is None:
+            seed = random.getrandbits(64)
+        elif isinstance(seed, bool) or not isinstance(seed, (int, np.integer)):
+            raise ValueError(f"seed must be None or a whole number, got {seed!r}")
+        elif not 0 <= seed < 2**64:
+            raise ValueError(f"seed must be from 0 to 2**64 - 1, got {seed}")
+        kept = self._kept()
+        draws = _native.simulate(
+            self.formula,
+            kept["numeric"],
+            kept["factor"],
+            self.family,
+            self.link,
+            kept["weights"],
+            kept["offset"],
+            self._stored_numbers(),
+            int(nsim),
+            int(seed),
+        )
+        return _f64(draws).reshape(int(nsim), self.nobs).T
+
+    def r2(self):
+        """The marginal and conditional R-squared of a mixed model (Nakagawa &
+        Schielzeth 2013), as `{"marginal": .., "conditional": ..}`, the two
+        values of `performance::r2_nakagawa`. On a binomial model with trial
+        counts they are performance's values for a `cbind()` response; a
+        `glmer` fitted with `weights =` gets other values there.
+
+        The marginal R-squared is the fixed-effect variance divided by the
+        fixed-effect, the random-effect and the residual variance; the
+        conditional R-squared also adds the random-effect variance to the
+        numerator. A random slope's variance is averaged over the rows
+        (Johnson 2014). On a GLMM the residual variance is the lognormal
+        approximation of the family's variance on the link scale. A
+        random-effect variance of 0 gives a conditional R-squared equal to
+        the marginal one. A fit without random effects, a Gamma model with a
+        link other than log, an inverse Gaussian model and a fit that did not
+        converge give NaN.
+
+        The values are computed when called. On a Poisson or negative
+        binomial GLMM each call refits the null model once, so keep the
+        result instead of calling again. A fit made by a glmm version that did
+        not keep its training data raises `ValueError`: refit it. The name is
+        provisional until 1.0.0."""
+        e = self._effect_sizes(null_refit=True)
+        return {"marginal": e["marginal"], "conditional": e["conditional"]}
+
+    def icc(self):
+        """The intraclass correlation of a mixed model over all its groupings,
+        as `{"adjusted": .., "unadjusted": ..}`, the two values of
+        `performance::icc` (Nakagawa, Johnson & Schielzeth 2017).
+
+        The adjusted ICC is the random-effect variance divided by the random
+        and the residual variance; the unadjusted ICC also adds the
+        fixed-effect variance to the divisor. The variances are those of
+        `r2()`. A random-effect variance of 0 gives 0. A fit without random
+        effects, a Gamma model with a link other than log, an inverse Gaussian
+        model and a fit that did not converge give NaN.
+
+        The values are computed when called. On a Poisson or negative
+        binomial GLMM each call refits the null model once, so keep the
+        result instead of calling again. A fit made by a glmm version that did
+        not keep its training data raises `ValueError`: refit it. The name is
+        provisional until 1.0.0."""
+        e = self._effect_sizes(null_refit=True)
+        return {"adjusted": e["adjusted"], "unadjusted": e["unadjusted"]}
+
+    def _effect_sizes(self, null_refit):
+        """`_native.effect_sizes` of this fit: the R-squared pair and the two
+        ICCs, or None on a Poisson or negative binomial GLMM when `null_refit`
+        is False (they need a refit of the null model)."""
+        kept = self._kept()
+        return _native.effect_sizes(
+            self.formula,
+            kept["numeric"],
+            kept["factor"],
+            self.family,
+            self.link,
+            kept["weights"],
+            kept["offset"],
+            self._stored_numbers(),
+            [bool(a) for a in self.aliased],
+            bool(self.converged),
+            self.objective,
+            int(self.objective_nodes),
+            null_refit,
+        )
+
+    def _record_arg(self):
+        """`satterthwaite_record` as `_native.contrast_test` and
+        `_native.pairwise` take it (`StoredRecord` in glmm-python/src/lib.rs),
+        None when the fit has none."""
+        rec = self.satterthwaite_record
+        if rec is None:
+            return None
+        return {
+            "a_eff": np.asarray(rec["a_eff"], dtype=float).tolist(),
+            "jac_theta": [np.asarray(j, dtype=float).tolist() for j in rec["jac_theta"]],
+            "c": np.asarray(rec["c"], dtype=float).tolist(),
+            "tau": float(rec["tau"]),
+            "nu": float(rec["nu"]),
+            "retained": rec["retained"],
+        }
+
+    def __setstate__(self, state):
+        # A fit pickled by 0.6.x has no `re_term_index`; it still unpickles and
+        # prints, and `summary_object` refuses it.
+        self.__dict__.update({"re_term_index": None, **state})
+
+    def _kept(self):
+        """`_kernel_parts`, refusing a fit pickled before it."""
+        if self._kernel_parts is None:
+            raise ValueError(
+                "this fit was made by a glmm version that did not keep what predict, "
+                "simulate, pairwise, r2 and icc read. Refit the model with this version."
+            )
+        return self._kernel_parts
+
+    def _stored_numbers(self):
+        """The fit's numbers as `_native.predict`, `_native.simulate` and
+        `_native.effect_sizes` take them (`StoredNumbers` in
+        glmm-python/src/lib.rs)."""
+        kept = self._kept()
+        p = len(self.beta)
+        return {
+            "beta": [float(v) for v in self.beta],
+            "vcov": np.asarray(self.vcov, dtype=float).reshape(p, p).tolist(),
+            "varcorr": [[float(v) for v in b] for b in self.varcorr],
+            "ranef": np.asarray(self.ranef, dtype=np.float64).tobytes(),
+            "ranef_levels": [int(n) for n in self.ranef_levels],
+            "condvar": kept["condvar"],
+            "condvar_x": kept["condvar_x"],
+            "condvar_cross": kept["condvar_cross"],
+            "dispersion": float(self.dispersion),
+        }
 
     def residuals(self, type="response"):
         """Response (`y - fitted`) or Pearson residuals. Deviance and working
@@ -1068,7 +1348,6 @@ _WARNING_KINDS = {
     "few_rows_for_random_effects": ("caution", "Too few rows for the random effects"),
     "variance_at_limit": ("caution", "Variance at its search limit"),
     "argument_ignored": ("note", "Argument ignored"),
-    "unused_grouping_levels": ("note", "Unused grouping levels"),
     "single_level_grouping_dropped": ("note", "Random effect dropped (single level)"),
 }
 # A kernel note this wrapper has no entry for keeps its own kind string.
@@ -1119,6 +1398,12 @@ def _pinned_detail(res):
     return parts
 
 
+def _column_names(columns, names):
+    """The coefficient names of a note's 0-based `columns`, joined by ", "; an
+    index past `names` prints as "column <i>"."""
+    return ", ".join(names[i] if i < len(names) else f"column {i}" for i in columns)
+
+
 def _note_warning(note, names, converged, nobs):
     """One kernel note as (message, warning category), or None to raise nothing.
     `nobs` is the fit's row count.
@@ -1133,27 +1418,14 @@ def _note_warning(note, names, converged, nobs):
         # Only on a non-converged fit, whose one warning (`_nonconvergence`) names it.
         return None
     if kind == "ill_conditioned":
-        named = ", ".join(names[i] if i < len(names) else f"column {i}" for i in note["columns"])
         return (
             (
-                f"{named} is almost a combination of other columns in the model, so its "
+                f"{_column_names(note['columns'], names)} is almost a combination of other columns in the model, so its "
                 "standard error is large. Its estimate is still correct, but imprecise. The "
                 "other columns involved are not named. Consider dropping or combining "
                 "predictors that carry the same information."
             ),
             IllConditionedWarning,
-        )
-    if kind == "unused_grouping_levels":
-        # The kernel packs "<group>: <level>, <level>" (src/orchestrate.rs). Split on
-        # the first ": " only: a level label may contain one.
-        group, _, levels = note["detail"].partition(": ")
-        return (
-            (
-                f"Grouping factor '{group}' has levels with no rows ({levels}). They stay in "
-                "the model with random effects of exactly zero, but they are not counted in "
-                "the number of groups. Remove unused categories before fitting."
-            ),
-            UnusedGroupingLevelsWarning,
         )
     if kind == "pirls_exhausted":
         # Raised only when the final re-evaluation of a converged fit hit the cap. A
@@ -1225,6 +1497,20 @@ def _note_warning(note, names, converged, nobs):
             HessianSeFallbackWarning,
         )
     if kind == "se_unavailable":
+        # `columns` is filled in by `_fit_from_native` from the fit's
+        # ill_conditioned note, when it has one: the two print as this one warning.
+        if note["columns"]:
+            return (
+                (
+                    f"Standard errors could not be computed: "
+                    f"{_column_names(note['columns'], names)} cannot be separated from the "
+                    "other columns in the model. Its estimate is not reported. The other "
+                    "estimates and the deviance can be used; standard errors, p-values and "
+                    "confidence intervals are not reported. Check for predictors that are "
+                    "copies or near-copies of each other."
+                ),
+                SeUnavailableWarning,
+            )
         return (
             (
                 "Standard errors could not be computed at the fit's end point: the fixed "
@@ -1467,15 +1753,10 @@ def _check_call(formula, family, link):
     """The checks `fit` and `compare` make on a formula, the family and the
     link before any data is read; returns the link, the family's default when
     `link` is None."""
-    # Formula-shape checks the shared Rust parser has no dedicated message for
-    # (it would fall through to a generic syntax error): caught here with the
-    # same wording the R port uses (r/R/fastglmm.R's .check_formula) — change
+    # A formula shape the shared Rust parser has no dedicated message for (it
+    # would fall through to a generic syntax error): caught here with the same
+    # wording the R port uses (r/R/fastglmm.R's .check_formula) — change
     # together.
-    if "||" in formula:
-        raise ValueError(
-            "(x || g) double-bar terms are not supported: the glmm kernel always "
-            "fits the full RE correlation structure"
-        )
     if re.search(r"(?<![\w.])\.(?![\w.])", formula):
         raise ValueError("'.' is not supported by the formula parser; list the columns explicitly")
 
@@ -1508,7 +1789,14 @@ def _check_nagq(nagq):
 
 
 def _prepare_columns(
-    data, formulas, weights, offset, store, drop_missing_arguments=False, model_matrix=False
+    data,
+    formulas,
+    weights,
+    offset,
+    store,
+    drop_missing_arguments=False,
+    model_matrix=False,
+    new_data=False,
 ):
     """The columns of `data` that `formulas` use, as `_native.fit` takes them,
     with `weights=`/`offset=` checked: `(numeric_columns, factor_columns,
@@ -1519,11 +1807,23 @@ def _prepare_columns(
     missing is dropped the same way; otherwise a missing entry is refused.
     With `model_matrix`, the columns are looked up as `model_matrix` reads
     them (`_native.model_matrix_columns`), and a row with a missing value
-    raises instead of being dropped."""
+    raises instead of being dropped. With `new_data` (`Fit.predict`), the
+    columns are the ones the formula reads on new rows, the response left
+    out (`_native.predict_columns`), a missing one is left to the kernel to
+    name (a grouping column may be absent), and a row with a missing value
+    raises."""
     # Only the columns the formula actually uses are read from here on — see
     # `_formula_columns`.
     used_columns = _columns(data)
-    lookup = _native.model_matrix_columns if model_matrix else _formula_columns
+    if model_matrix:
+        lookup = _native.model_matrix_columns
+    elif new_data:
+
+        def lookup(formula, names):
+            return _native.predict_columns(formula, names), [], _formula_columns(formula, names)[2]
+
+    else:
+        lookup = _formula_columns
     used_names, missing, numeric_only = [], [], []
     for formula in formulas:
         for into, names in zip(
@@ -1583,6 +1883,18 @@ def _prepare_columns(
                 keeps[name] = codes != -1
                 continue
         entry = _plain_column(col)
+        # float64 holds integers exactly only below 2**53; past that, distinct
+        # ids such as hashed grouping keys would merge without a word.
+        if (
+            entry is not None
+            and getattr(getattr(col, "dtype", None), "kind", None) in ("i", "u")
+            and entry[2].any()
+            and np.abs(entry[1][entry[2]]).max() >= 2**53
+        ):
+            raise ValueError(
+                f"column '{name}' holds integers of 2**53 or more, which a float cannot "
+                "store exactly; pass them as strings (for example df[col].astype(str))"
+            )
         if entry is None:
             values = _values(col)
             keep = np.fromiter((not _is_na(v) for v in values), dtype=bool, count=len(values))
@@ -1614,9 +1926,10 @@ def _prepare_columns(
     drop = na_mask is not None and not na_mask.all()
     if drop:
         n_kept = int(na_mask.sum())
-        if model_matrix:
+        if model_matrix or new_data:
             # No row is dropped: a numpy array has no row names, so the design
-            # would no longer line up with the caller's own arrays.
+            # (or the predictions) would no longer line up with the caller's
+            # own arrays.
             raise ValueError(
                 f"{len(na_mask) - n_kept} of {len(na_mask)} row(s) have a missing value in "
                 f"{where}; drop those rows from data first"
@@ -1694,7 +2007,7 @@ def _term_result(t):
     as float arrays; see `Fit.term_table_type3`."""
     if t["error"] is not None:
         return {"error": t["error"]}
-    numeric = ("statistic", "num_df", "den_df", "p_value", "sum_sq", "mean_sq")
+    numeric = ("statistic", "num_df", "den_df", "p_value", "sum_sq", "mean_sq", "eta2_partial")
     return {k: np.asarray(v, dtype=float) if k in numeric else v for k, v in t.items()}
 
 
@@ -1726,9 +2039,41 @@ def _f64(b):
     return np.frombuffer(b, dtype=np.float64).copy()
 
 
-def _fit_from_native(r, formula, family, link, nagq, dispersion, store):
+def _postvar(block):
+    """A `ranef_blocks` entry's conditional covariances as `(levels, q, q)`,
+    from the row-major per-level vech (column-major lower triangle) the
+    native dict carries; None when the fit formed none."""
+    levels, q = len(block["levels"]), len(block["terms"])
+    if levels == 0 or not block["condvar"]:
+        return None
+    vech = np.asarray(block["condvar"], dtype=float).reshape(levels, q * (q + 1) // 2)
+    # `triu_indices` walks (c, r), c <= r, in the vech's column-major order.
+    c, r = np.triu_indices(q)
+    out = np.empty((levels, q, q))
+    out[:, r, c] = vech
+    out[:, c, r] = vech
+    return out
+
+
+def _ranef_block(b):
+    """One `ranef_blocks` entry of `Fit` from the native dict's; see
+    `Fit.ranef_blocks`."""
+    postvar = _postvar(b)
+    return {
+        "group": b["group"],
+        "terms": b["terms"],
+        "levels": b["levels"],
+        "values": np.asarray(b["values"], dtype=float).reshape(len(b["levels"]), len(b["terms"])),
+        "postvar": postvar,
+        "condsd": None if postvar is None else np.sqrt(np.diagonal(postvar, axis1=1, axis2=2)),
+    }
+
+
+def _fit_from_native(r, formula, family, link, nagq, dispersion, store, kept):
     """The `Fit` of `_native.fit`'s dict `r`, with the fit's warnings raised
-    and appended to `store`; the other arguments are the call's own."""
+    and appended to `store`; `kept` is the training columns and the
+    `weights=`/`offset=` bytes the call sent (`Fit._kernel_parts`), the other
+    arguments the call's own."""
     # nagq's shape eligibility (single grouping factor, binomial/Poisson/NB/Gamma,
     # q <= 3) is only decidable after the Rust-side formula lowering, so the
     # warn-and-strip for it lives in the shared glmm::orchestrate module
@@ -1797,6 +2142,7 @@ def _fit_from_native(r, formula, family, link, nagq, dispersion, store):
         dispersion=r["dispersion"],
         names=r["names"],
         re_groups=r["re_groups"],
+        re_term_index=r["re_term_index"],
         n_eval=r["n_eval"],
         n_grad=r["n_grad"],
         outer_stop=r["outer_stop"],
@@ -1808,17 +2154,7 @@ def _fit_from_native(r, formula, family, link, nagq, dispersion, store):
         fitted=_f64(r["fitted"]),
         ranef=_f64(r["ranef"]),
         ranef_levels=np.frombuffer(r["ranef_levels"], dtype=np.uint64).astype(int),
-        ranef_blocks=[
-            {
-                "group": b["group"],
-                "terms": b["terms"],
-                "levels": b["levels"],
-                "values": np.asarray(b["values"], dtype=float).reshape(
-                    len(b["levels"]), len(b["terms"])
-                ),
-            }
-            for b in r["ranef_blocks"]
-        ],
+        ranef_blocks=[_ranef_block(b) for b in r["ranef_blocks"]],
         formula=formula,
         family=family,
         link=link,
@@ -1846,6 +2182,12 @@ def _fit_from_native(r, formula, family, link, nagq, dispersion, store):
         term_table_type2_lrt=_lrt_result(r["term_table_type2_lrt"]),
         term_test_auto=dict(r["term_test_auto"]),
         satterthwaite_record=_satterthwaite_record(r["satterthwaite_record"]),
+        _kernel_parts={
+            **kept,
+            "condvar": r["condvar"],
+            "condvar_x": r["condvar_x"],
+            "condvar_cross": r["condvar_cross"],
+        },
     )
     # Singularity is not assessed on a fit that did not converge: the kernel never sets
     # `singular` there (the post-hoc check and the boundary flags are gated on
@@ -1861,7 +2203,23 @@ def _fit_from_native(r, formula, family, link, nagq, dispersion, store):
             "affected random effect." + (f" Affected: {', '.join(affected)}." if affected else ""),
             SingularFitWarning,
         )
-    for note in res.diagnostics["notes"]:
+    # A fit with both se_unavailable and ill_conditioned, whose named estimate is
+    # NaN (the GLM's breakdown), prints one warning: the se_unavailable text,
+    # naming the ill_conditioned note's columns. A GLMM keeps that estimate, so it
+    # prints the two notes as they are. The R port's `.fit_object` does the same
+    # (r/R/fastglmm.R) — change together.
+    notes = res.diagnostics["notes"]
+    ill = next((n for n in notes if n["kind"] == "ill_conditioned"), None)
+    paired = (
+        ill is not None
+        and any(n["kind"] == "se_unavailable" for n in notes)
+        and all(i < len(res.beta) and math.isnan(res.beta[i]) for i in ill["columns"])
+    )
+    for note in notes:
+        if paired and note["kind"] == "ill_conditioned":
+            continue
+        if paired and note["kind"] == "se_unavailable":
+            note = dict(note, columns=ill["columns"])
         out = _note_warning(note, res.names, res.converged, res.nobs)
         if out is not None:
             _warn(store, note["kind"], *out)
@@ -1896,6 +2254,7 @@ def fit(
     nagq=1,
     warm_start=None,
     satterthwaite=True,
+    condvar=True,
     reml=None,
     anova_test="auto",
 ):
@@ -1930,6 +2289,12 @@ def fit(
         the summary then tests with z and says "df not computed", and
         `Fit.df_method` is "disabled". OLS and the Gamma and inverse-Gaussian
         GLMs keep their residual df whatever it says.
+    condvar: compute the conditional variances of the random effects (default
+        True), which `postvar` and `condsd` in `Fit.ranef_blocks` and a
+        conditional `predict` with standard errors or future bounds read.
+        False skips them, which saves up to about the time of the fit itself
+        on a crossed model with many levels: `postvar` and `condsd` are then
+        None and such a `predict` raises.
     reml: None, True or False; `Fit.reml` reports the value used.
         Gaussian with random effects (after any single-level grouping is
         dropped): None and True fit by REML, False by ML.
@@ -1957,7 +2322,8 @@ def fit(
     A categorical column's level order is honored: level 0 is the
     treatment-contrast base, so `pd.Categorical(x, categories=[…])` fits against
     the first category you list. A plain string column has no declared order and
-    is sorted lexicographically (R's `factor()` default). A bool column (Python
+    is sorted by code point (R's `factor()` default in the C locale; R in
+    another locale can order mixed-case labels such as `"a"`, `"B"` differently). A bool column (Python
     `bool`, `numpy.bool_`, pandas `bool`/nullable `boolean`, pyarrow `bool_`) is
     treated the same way, with levels `FALSE`/`TRUE` — so a bool `x` gives a
     coefficient `xTRUE`, as in lme4 — except as the response or the `offset()`
@@ -1980,6 +2346,9 @@ def fit(
     if not isinstance(satterthwaite, (bool, np.bool_)):
         raise TypeError(f"satterthwaite must be True or False, got {satterthwaite!r}")
     satterthwaite = bool(satterthwaite)
+    if not isinstance(condvar, (bool, np.bool_)):
+        raise TypeError(f"condvar must be True or False, got {condvar!r}")
+    condvar = bool(condvar)
     if reml is not None and not isinstance(reml, (bool, np.bool_)):
         raise TypeError(f"reml must be None, True or False, got {reml!r}")
     reml = None if reml is None else bool(reml)
@@ -2083,6 +2452,12 @@ def fit(
             None if d is None else float(d),
         )
 
+    kept = {
+        "numeric": numeric_columns,
+        "factor": factor_columns,
+        "weights": weights.tobytes() if weights is not None else None,
+        "offset": offset.tobytes() if offset is not None else None,
+    }
     r = _native.fit(
         formula,
         numeric_columns,
@@ -2092,14 +2467,15 @@ def fit(
         wald_se,
         nagq,
         dispersion,
-        weights.tobytes() if weights is not None else None,
-        offset.tobytes() if offset is not None else None,
+        kept["weights"],
+        kept["offset"],
         warm_start_pair,
         satterthwaite,
+        condvar,
         reml,
         anova_test,
     )
-    return _fit_from_native(r, formula, family, link, nagq, dispersion, store)
+    return _fit_from_native(r, formula, family, link, nagq, dispersion, store, kept)
 
 
 def model_matrix(data, formula):
@@ -2125,6 +2501,14 @@ def model_matrix(data, formula):
     numeric_columns, factor_columns, _, _ = _prepare_columns(
         data, [formula], None, None, [], model_matrix=True
     )
+    n_rows = _row_count(data, numeric_columns, factor_columns)
+    x, n, p, names = _native.model_matrix(formula, numeric_columns, factor_columns, n_rows)
+    return _f64(x).reshape(n, p), names
+
+
+def _row_count(data, numeric_columns, factor_columns):
+    """The row count of `data` whose used columns `_prepare_columns` gave as
+    `numeric_columns` and `factor_columns`."""
     if isinstance(data, dict):
         # The row count is the length of the formula's columns, which
         # `_prepare_columns` has already checked against each other. `~ 1`
@@ -2134,11 +2518,78 @@ def model_matrix(data, formula):
             raise ValueError("data has no columns, so it has no row count")
         lengths = {name: len(data[name]) for name in names}
         _check_lengths(lengths)
-        n_rows = next(iter(lengths.values()))
-    else:
-        n_rows = len(data)
-    x, n, p, names = _native.model_matrix(formula, numeric_columns, factor_columns, n_rows)
-    return _f64(x).reshape(n, p), names
+        return next(iter(lengths.values()))
+    return len(data)
+
+
+def pairwise(m, factor, by=None, at=None, adjust="holm"):
+    """Every pairwise comparison of the levels of one factor of the fixed
+    part, emmeans' `pairs(emmeans(m, ~ factor))`, as a `PairwiseTable`.
+    Nothing is refitted.
+
+    Each comparison is the difference of two levels' estimated means on the
+    link scale. The other factors are averaged with equal weights. Every
+    numeric variable is at its mean over the fit's rows. The test is the t
+    test on Satterthwaite's df on a Gaussian mixed model, the t test on the
+    residual df on OLS and the Gamma and inverse Gaussian GLMs, and the z test
+    on every other fit. On a log or logit link each row also has the ratio of
+    the two means (the odds ratio on a logit link), `exp(estimate)`.
+
+    factor: the name of a factor of the fixed part.
+    by: None, or the name of another variable of the fixed part. The
+        comparisons are made within each level of a factor `by`, or at each
+        value in `at` of a numeric `by`. The p-values are adjusted within each
+        of these groups.
+    at: the values of a numeric `by`, a list of numbers.
+    adjust: "holm" (the default), "bonferroni", "tukey" or "none". The default
+        is Holm, but emmeans' default is Tukey: pass adjust="tukey" to get
+        emmeans' p-values.
+
+    A Gaussian mixed model fitted with `satterthwaite=False` has no df: its
+    rows have NaN df, statistic and p-values, and a note. A comparison that
+    reads an aliased coefficient (an empty cell) is NaN, with a note.
+    `confint()` of the table gives the confidence intervals.
+
+    Raises `ValueError` on a name that is not a variable of the fixed part, a
+    numeric `factor`, `at` without a numeric `by`, an unknown `adjust`, and a
+    fit made by a glmm version that did not keep its training data. The name
+    is provisional until 1.0.0."""
+    from glmm.anova import _pairwise_table
+
+    if not isinstance(m, Fit):
+        raise TypeError(f"glmm.pairwise takes a glmm.Fit, got {type(m).__name__}")
+    if not isinstance(factor, str):
+        raise TypeError(f"factor must be a variable name, got {factor!r}")
+    if by is not None and not isinstance(by, str):
+        raise TypeError(f"by must be None or a variable name, got {by!r}")
+    if at is not None:
+        if by is None:
+            raise ValueError("at gives the values of a numeric by, so it needs by")
+        at = np.asarray(at, dtype=float).ravel()
+        if at.size == 0 or not np.isfinite(at).all():
+            raise ValueError("at must be one or more finite numbers")
+        at = at.tolist()
+    kept = m._kept()
+    p = len(m.beta)
+    stored = _native.pairwise(
+        m.formula,
+        kept["numeric"],
+        kept["factor"],
+        m.family,
+        m.link,
+        m.df_method,
+        [float(v) for v in m.beta],
+        np.asarray(m.vcov, dtype=float).reshape(p, p).tolist(),
+        [bool(a) for a in m.aliased],
+        int(m.nobs),
+        m._record_arg(),
+        list(m.names),
+        factor,
+        by,
+        at,
+        adjust,
+    )
+    return _pairwise_table(stored, m.df_method == "none")
 
 
 def term_labels(formula):
@@ -2165,4 +2616,4 @@ def term_labels(formula):
 
 
 # Last: `glmm/anova.py` reads `Fit` and the helpers above from this module.
-from glmm.anova import Comparison, ComparisonTable, TermTable, anova, compare
+from glmm.anova import Comparison, ComparisonTable, PairwiseTable, TermTable, anova, compare

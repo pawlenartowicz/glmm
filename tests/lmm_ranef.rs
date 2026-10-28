@@ -17,7 +17,7 @@
 //! factor whose levels are deliberately not in sorted order.
 
 use glmm::formula::{label_ranef, lower, Column, Error, RanefBlock, ReGroupInfo, Table};
-use glmm::{fit_cold, Family, Fit, Note};
+use glmm::{Family, Fit, FitOptions};
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
 
@@ -288,7 +288,7 @@ fn assert_fitted(
 /// Lower + fit, returning everything the assertions need.
 fn run(formula: &str, table: &Table) -> (Fit, Vec<RanefBlock>, usize, usize, Vec<f64>) {
     let lo = lower(formula, table, Family::Gaussian).expect("lowers");
-    let fit = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+    let fit = glmm::fit(&lo.data(), lo.spec(), &FitOptions::default()).unwrap();
     assert!(fit.converged(), "{formula}: did not converge");
     let blocks = label_ranef(&fit, &lo.re_groups).expect("labels");
     (fit, blocks, lo.n, lo.p, lo.x)
@@ -439,10 +439,10 @@ fn fitted_adds_the_offset_back() {
     };
     let lo = {
         let mut lo = lower("y ~ x1 + x2 + (1 | g)", &table, Family::Gaussian).unwrap();
-        lo.opts.offset = Some(off.clone());
+        lo.offset = Some(off.clone());
         lo
     };
-    let fit = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+    let fit = glmm::fit(&lo.data(), lo.spec(), &FitOptions::default()).unwrap();
     assert!(fit.converged());
     let groups = vec![((0..48).map(|i| i % 4).collect::<Vec<_>>(), vec![])];
     assert_fitted(&fit, &lo.x, lo.n, lo.p, &groups, Some(&off));
@@ -642,11 +642,10 @@ fn flat_nesting_labels_the_padded_layout_it_silently_routed_to() {
     }
 }
 
-/// A declared grouping level between two observed ones costs random-effect
-/// width, so it is reported — labelled, with its mode fully shrunk to zero —
-/// and the lowering raises a note naming it. lme4 simply has no such row.
+/// A declared grouping level with no row is dropped, as lme4 drops it: no
+/// slot, no `ranef` row, no note, wherever it sits in the level order.
 #[test]
-fn unused_grouping_level_gets_a_zero_row_and_a_note() {
+fn unused_grouping_levels_are_dropped() {
     let lab: Vec<&str> = (0..48).map(|i| ["g1", "g3"][i % 2]).collect();
     let (x1, x2, y, _) = sim(48, 13, &["g1", "g3"]);
     let table = Table {
@@ -654,48 +653,39 @@ fn unused_grouping_level_gets_a_zero_row_and_a_note() {
             ("y".into(), numeric(y)),
             ("x1".into(), numeric(x1)),
             ("x2".into(), numeric(x2)),
-            // g2 is declared BETWEEN two observed levels, so it owns a slot.
-            ("g".into(), factor(&["g1", "g2", "g3"], &lab)),
+            ("g".into(), factor(&["g1", "g2", "g3", "g4"], &lab)),
         ],
         n: 48,
     };
     let lo = lower("y ~ x1 + x2 + (1 | g)", &table, Family::Gaussian).unwrap();
-    match lo.notes.as_slice() {
-        [Note::UnusedGroupingLevels { grouping, levels }] => {
-            assert_eq!(grouping, "g");
-            assert_eq!(levels, &strs(&["g2"]));
-        }
-        other => panic!("expected one unused-levels note, got {other:?}"),
-    }
-    let fit = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+    assert!(lo.notes.is_empty(), "{:?}", lo.notes);
+    let fit = glmm::fit(&lo.data(), lo.spec(), &FitOptions::default()).unwrap();
     assert!(fit.converged());
     let blocks = label_ranef(&fit, &lo.re_groups).unwrap();
-    assert_eq!(blocks[0].levels, strs(&["g1", "g2", "g3"]));
-    assert_eq!(blocks[0].values[1], 0.0, "an empty cluster is fully shrunk");
+    assert_eq!(blocks[0].levels, strs(&["g1", "g3"]));
 }
 
-/// A level declared AFTER the last observed one owns no slot (the block is
-/// `max(code)+1` wide), so it is neither labelled nor noted — and the label
-/// count still has to match the block, which is what `label_ranef` refuses to
-/// guess about.
+/// The nested child ids are built on the parent's own ids, which must match the
+/// primary grouping's: an unused parent level is dropped on both sides alike.
 #[test]
-fn trailing_unused_level_costs_nothing_and_is_not_reported() {
-    let lab: Vec<&str> = (0..48).map(|i| ["g1", "g2"][i % 2]).collect();
-    let (x1, x2, y, _) = sim(48, 17, &["g1", "g2"]);
+fn unused_parent_level_is_dropped_under_nesting() {
+    let parent: Vec<&str> = (0..48).map(|i| ["a1", "a3"][i % 2]).collect();
+    let child: Vec<&str> = (0..48).map(|i| ["b1", "b2", "b3"][(i / 2) % 3]).collect();
+    let (x1, x2, y, _) = sim(48, 19, &["a1", "a3"]);
     let table = Table {
         columns: vec![
             ("y".into(), numeric(y)),
             ("x1".into(), numeric(x1)),
             ("x2".into(), numeric(x2)),
-            ("g".into(), factor(&["g1", "g2", "g3"], &lab)),
+            ("a".into(), factor(&["a1", "a2", "a3"], &parent)),
+            ("b".into(), factor(&["b1", "b2", "b3"], &child)),
         ],
         n: 48,
     };
-    let lo = lower("y ~ x1 + x2 + (1 | g)", &table, Family::Gaussian).unwrap();
-    assert!(lo.notes.is_empty(), "a trailing level costs no width");
-    let fit = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+    let lo = lower("y ~ x1 + x2 + (1 | a/b)", &table, Family::Gaussian).unwrap();
+    let fit = glmm::fit(&lo.data(), lo.spec(), &FitOptions::default()).unwrap();
     let blocks = label_ranef(&fit, &lo.re_groups).unwrap();
-    assert_eq!(blocks[0].levels, strs(&["g1", "g2"]));
+    assert_eq!(blocks[0].levels, strs(&["a1", "a3"]));
 }
 
 /// A fixed-effects-only fit has no conditional modes, and labelling one is an
@@ -712,7 +702,7 @@ fn no_random_effects_labels_to_nothing() {
         n: 30,
     };
     let lo = lower("y ~ x1 + x2", &table, Family::Gaussian).unwrap();
-    let fit = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+    let fit = glmm::fit(&lo.data(), lo.spec(), &FitOptions::default()).unwrap();
     assert!(fit.ranef.is_empty());
     assert!(label_ranef(&fit, &lo.re_groups).unwrap().is_empty());
 }
@@ -733,7 +723,7 @@ fn label_ranef_refuses_a_mismatched_lowering() {
         n: 48,
     };
     let lo = lower("y ~ x1 + x2 + (1 | g)", &table, Family::Gaussian).unwrap();
-    let fit = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+    let fit = glmm::fit(&lo.data(), lo.spec(), &FitOptions::default()).unwrap();
     assert!(!fit.ranef.is_empty(), "the fixture has conditional modes");
     assert!(
         label_ranef(&fit, &lo.re_groups).is_ok(),
@@ -748,6 +738,7 @@ fn label_ranef_refuses_a_mismatched_lowering() {
     let copy = |g: &ReGroupInfo| ReGroupInfo {
         name: g.name.clone(),
         terms: g.terms.clone(),
+        term_index: g.term_index.clone(),
         slot_labels: g.slot_labels.clone(),
     };
     let doubled = [copy(&lo.re_groups[0]), copy(&lo.re_groups[0])];

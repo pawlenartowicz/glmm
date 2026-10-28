@@ -1,0 +1,21 @@
+{
+  "name": "machines_factor_uncorr_lmm",
+  "engine": "lme4::lmer",
+  "engine_version": "2.0.6",
+  "kind": "lmm",
+  "data": "Machines",
+  "family": "gaussian",
+  "link": {},
+  "nagq": 1,
+  "tolPwrss": {},
+  "r_formula": "score ~ 1 + Machine + (1 + Machine || Worker)",
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)", "MachineB", "MachineC"],
+  "estimates": {
+    "beta": [52.3555555555565, 7.96666666667022, 13.9166666666675],
+    "se": [1.68075196914921, 2.42111072697858, 1.54020403377044],
+    "loglik": -104.155609305247,
+    "sigma": 0.961553263053077
+  }
+}

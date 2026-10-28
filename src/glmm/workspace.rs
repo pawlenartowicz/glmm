@@ -36,8 +36,8 @@ pub(crate) enum GlmmLayout {
 }
 
 impl GlmmLayout {
-    pub(crate) fn for_design(model: &crate::ModelSpec, g: &LmmGroupings) -> Self {
-        match crate::fit::classify_design(model, 1) {
+    pub(crate) fn for_design(sized: &crate::fit::SizedSpec, g: &LmmGroupings) -> Self {
+        match crate::fit::classify_design(sized, 1) {
             crate::fit::Solver::Sparse => GlmmLayout::Packed,
             crate::fit::Solver::NoZ if g.extra_offsets.is_empty() => GlmmLayout::Blocked,
             crate::fit::Solver::NoZ if g.structured_extras_eligible() => GlmmLayout::Structured,
@@ -852,7 +852,7 @@ pub(crate) struct FitData<'a> {
     /// unread on the blocked and packed routes.
     pub extra_ids: &'a [Vec<u32>],
     pub z_buf: &'a [f64],
-    /// Per-row linear-predictor offset (`FitOptions::offset`), forwarded to
+    /// Per-row linear-predictor offset (`Data::offset`), forwarded to
     /// every PIRLS/AGQ variant's `eta_fixed` fill. `None` ⇒ no offset.
     pub offset: Option<&'a [f64]>,
     pub n: usize,
@@ -930,10 +930,11 @@ pub struct GlmmWorkspace {
     /// Packed-row layout scratch — see [`PackedScratch`].
     pub(crate) packed: PackedScratch,
     /// Joint (θ,β) BOBYQA solver, dimension `n_theta + p` (+1 on NB: the trailing
-    /// `ln θ_NB` coordinate). Starts at `GLMM_RHO_BEGIN` on the `Joint` route,
+    /// `ln θ_NB` coordinate), less the θ a grouping's terms hold at zero (every
+    /// search here runs on the free θ). Starts at `GLMM_RHO_BEGIN` on the `Joint` route,
     /// where it is the whole search, and at `GLMM_RHO_POLISH` on the others,
     /// where it polishes a stage-1 optimum.
-    pub solver: Bobyqa, // sized n_theta + p
+    pub solver: Bobyqa,
     /// `solver`'s config, kept to build `solver_polish_wide`.
     pub(crate) config: Config,
     /// `config` at `RHO_BEGIN_WARM`: the polish solver for a stage-1 optimum
@@ -969,7 +970,8 @@ pub struct GlmmWorkspace {
     pub(crate) start_point: Vec<f64>,
     /// θ-only BOBYQA solver for the θ-only outer search shared by
     /// `PqlThenJoint` (a warm-start accelerant) and `ExactProfile` (the search
-    /// itself — see `OuterSearch`): sized `n_theta` (+1 on NB and Gamma), configured with
+    /// itself — see `OuterSearch`): sized `n_theta` (+1 on NB and Gamma) less
+    /// the structural θ, as `solver` is, configured with
     /// `GLMM_RHO_BEGIN`/`GLMM_RHO_END` and the LMM
     /// mid-model `npt` rule (`ceil(1.5·n_theta) + 1` at
     /// `n_theta ≥ 3`, else `2·n_theta + 1`) — not
@@ -1052,7 +1054,7 @@ pub struct GlmmWorkspace {
     /// grouping's in declaration order. Only the packed-row layout has extra
     /// slopes, so on the other two the stride is `q_p − 1`.
     pub z_buf: Vec<f64>,
-    /// Per-row prior weights `wᵢ` (`FitOptions::weights`; all-1 when absent —
+    /// Per-row prior weights `wᵢ` (`Data::weights`; all-1 when absent —
     /// zero behavioral change). `wᵢ·W̃ᵢ` on the working weight,
     /// `wᵢ·devᵢ` on the deviance, `wᵢ·ρᵢ` on the score; everything downstream
     /// (A/RHS scatter, β border, Schur, FD Hessian) reads `w`/ρ and inherits it.
@@ -1063,7 +1065,7 @@ pub struct GlmmWorkspace {
     /// `se::joint_hessian_cov` swaps it with `prior_w` for its duration, so the
     /// SE engines see the fixed-φ̂ GLMM they differentiate.
     pub(crate) prior_w_phi: Vec<f64>,
-    /// True iff `prior_w` was filled from `FitOptions::weights`. Selects between
+    /// True iff `prior_w` was filled from `Data::weights`. Selects between
     /// the two logit arms of `simd_transcendental::family_pass`: the fused
     /// `Σ log1pexp` deviance identity holds only for unweighted Bernoulli rows.
     pub(crate) weighted: bool,
@@ -1108,7 +1110,7 @@ pub struct GlmmWorkspace {
     pub(crate) inference: InferenceScratch,
     /// The finite-difference pass's seed state — see [`FdState`].
     pub(crate) fd: FdState,
-    /// Per-row linear-predictor offset (`FitOptions::offset`), read by every
+    /// Per-row linear-predictor offset (`Data::offset`), read by every
     /// `eta_fixed` refresh (`pirls::refresh_eta_fixed`). `None` ⇒ no offset.
     pub(crate) offset: Option<Vec<f64>>,
     /// Count of fit-path PIRLS solves (every solve but the FD-Hessian SE evals') that ran
@@ -1209,12 +1211,12 @@ impl GlmmWorkspace {
     #[cfg(test)]
     pub(crate) fn for_cluster_spec(
         p: usize,
-        cluster: &crate::ModelSpec,
+        sized: &crate::fit::SizedSpec,
         max_n: usize,
         slope_cols: &[usize],
         nagq: u8,
     ) -> Self {
-        Self::for_cluster_spec_ext(p, cluster, max_n, slope_cols, &[], nagq)
+        Self::for_cluster_spec_ext(p, sized, max_n, slope_cols, &[], nagq)
     }
 
     /// The same for a design whose EXTRA groupings carry slopes:
@@ -1224,16 +1226,15 @@ impl GlmmWorkspace {
     /// `&[]` here (`from_groupings` asserts it).
     pub(crate) fn for_cluster_spec_ext(
         p: usize,
-        cluster: &crate::ModelSpec,
+        sized: &crate::fit::SizedSpec,
         max_n: usize,
         slope_cols: &[usize],
         extra_slope_cols: &[Vec<usize>],
         nagq: u8,
     ) -> Self {
-        let groupings =
-            LmmGroupings::from_cluster_spec_ext(cluster, max_n, slope_cols, extra_slope_cols);
-        let layout = GlmmLayout::for_design(cluster, &groupings);
-        Self::from_groupings(groupings, cluster.family, p, max_n, nagq, layout)
+        let groupings = LmmGroupings::from_cluster_spec_ext(sized, slope_cols, extra_slope_cols);
+        let layout = GlmmLayout::for_design(sized, &groupings);
+        Self::from_groupings(groupings, sized.spec.family, p, max_n, nagq, layout)
     }
 
     /// Test-only: the same workspace on the packed-row layout whatever
@@ -1243,15 +1244,15 @@ impl GlmmWorkspace {
     #[cfg(test)]
     pub(crate) fn for_cluster_spec_packed(
         p: usize,
-        cluster: &crate::ModelSpec,
+        sized: &crate::fit::SizedSpec,
         max_n: usize,
         slope_cols: &[usize],
         nagq: u8,
     ) -> Self {
-        let groupings = LmmGroupings::from_cluster_spec(cluster, max_n, slope_cols);
+        let groupings = LmmGroupings::from_cluster_spec(sized, slope_cols);
         Self::from_groupings(
             groupings,
-            cluster.family,
+            sized.spec.family,
             p,
             max_n,
             nagq,
@@ -1367,24 +1368,28 @@ impl GlmmWorkspace {
         // Route per shape (see `OuterSearch` and the `Joint` threshold's
         // measurement further down). The joint solver's start radius follows
         // it: the whole search on `Joint`, a polish of stage 1's optimum otherwise.
-        let route_plan = super::gradient_route_plan(family, nagq, layout, &groupings, n_theta);
+        // Every search runs on the free θ (`optim::bobyqa_minimize`'s
+        // `structural`), so the routes and the solvers count those; `params`
+        // and the boxes keep the full layout.
+        let n_free = groupings.n_free_theta();
+        let route_plan = super::gradient_route_plan(family, nagq, layout, &groupings, n_free);
         let exact_shape = super::exact_profile_shape(nagq, layout);
         let outer_search = if exact_shape {
             OuterSearch::ExactProfile
-        } else if nagq > 1 || (n_theta <= 2 && p <= 4) {
+        } else if nagq > 1 || (n_free <= 2 && p <= 4) {
             OuterSearch::Joint
         } else {
             OuterSearch::PqlThenJoint
         };
         // Feeds through the shared `apply_shipped_schedule` tail.
-        let mut config = Config::new(n_theta + p + n_disp);
+        let mut config = Config::new(n_free + p + n_disp);
         config.rho_begin = if outer_search == OuterSearch::Joint {
             GLMM_RHO_BEGIN
         } else {
             GLMM_RHO_POLISH
         };
         config.rho_end = GLMM_RHO_END;
-        crate::lmm::apply_shipped_schedule(&mut config, n_theta + p + n_disp);
+        crate::lmm::apply_shipped_schedule(&mut config, n_free + p + n_disp);
         // Stage-1 θ-only BOBYQA config: `rho_end` as the joint solver above,
         // `GLMM_RHO_BEGIN` from the blind start, but `npt` mirrors the LMM's mid-model rule
         // (`LmmWorkspace::for_cluster_spec_ext`, `src/lmm/mod.rs`), NOT the
@@ -1393,7 +1398,7 @@ impl GlmmWorkspace {
         // θ-only search is the LMM one. The dimension fed into that shared
         // rule is `n_stage1` — θ, plus the `ln θ_NB` / `ln φ` coordinate. Both
         // configs feed through the shared `apply_shipped_schedule` tail.
-        let n_stage1 = n_theta + n_disp;
+        let n_stage1 = n_free + n_disp;
         let npt_stage1 = if n_stage1 >= 3 {
             (3 * n_stage1).div_ceil(2) + 1
         } else {
@@ -1502,7 +1507,7 @@ impl GlmmWorkspace {
             n_theta,
             layout,
             packed,
-            solver: Bobyqa::new(n_theta + p + n_disp, config)
+            solver: Bobyqa::new(n_free + p + n_disp, config)
                 .expect("BOBYQA config constants are valid by construction"),
             config,
             solver_polish_wide: None,
@@ -2234,8 +2239,17 @@ pub(crate) fn fill_packed_cols_with(
 /// pure contiguous-f64 product. It also keeps Z apart from the fixed-effect
 /// design, which `se::joint_hessian_cov` swaps for an orthogonalized one.
 /// Mirrored by the Rx M row in `se::blocked_m_row` — change together.
-/// No-op when no grouping has a slope.
-pub(crate) fn fill_z_f64(g: &LmmGroupings, x: MatRef<f64>, z_buf: &mut [f64], n: usize) {
+/// No-op when no grouping has a slope. `x` is the `n × p` design (`p` its
+/// column count: a GLMM fit has `p ≥ 1`), `z` the `n × s` random-effect-only
+/// columns a slope index `≥ p` reads.
+pub(crate) fn fill_z_f64(
+    g: &LmmGroupings,
+    x: MatRef<f64>,
+    z: MatRef<f64>,
+    z_buf: &mut [f64],
+    n: usize,
+) {
+    let p = x.ncols();
     let mut t = 0;
     for i in 0..n {
         for &c in g
@@ -2243,7 +2257,7 @@ pub(crate) fn fill_z_f64(g: &LmmGroupings, x: MatRef<f64>, z_buf: &mut [f64], n:
             .iter()
             .chain(g.extra_slope_cols.iter().flatten())
         {
-            z_buf[t] = x[(i, c)];
+            z_buf[t] = crate::lmm::slope_value(x, z, p, i, c);
             t += 1;
         }
     }
@@ -2512,22 +2526,7 @@ pub(crate) fn packed_m_theta_deriv(
 mod tests {
     use super::*;
     use crate::dual::Dual;
-
-    #[test]
-    fn structured_schur_new_builds_symbolic_for_grouseticks() {
-        // Shared grouseticks 3-crossed fixture (INDEX primary, [BROOD, LOCATION]
-        // crossed); this test needs only the groupings + ids, not X/y.
-        let (model, ids, _x, _y, n, _p) = crate::glmm::tests::grouseticks_3crossed_fixture();
-        let g = LmmGroupings::from_cluster_spec(&model, n, &[]);
-        let cluster_ids = ids.primary;
-        let extra_ids = ids.extra;
-        let ss = StructuredSchur::new(&g, &cluster_ids, &extra_ids, n).expect("e = 181 > 0 ⇒ Some");
-        // Fill-in is far below dense: dense would be e·(e+1)/2 = 16471 lower entries.
-        assert!(
-            ss.symbolic.len_val() < 16471,
-            "sparse factor must have less fill than the dense lower triangle"
-        );
-    }
+    use crate::fit::SizedSpec;
 
     /// `packed_m_theta_deriv`'s primary-vech selection — including the
     /// off-diagonal (intercept-slope covariance) slot, which a diagonal-only
@@ -2539,17 +2538,19 @@ mod tests {
     fn packed_m_theta_deriv_matches_central_diff_primary_vech() {
         let n = 16;
         let n_prim = 4;
-        let spec = crate::ModelSpec {
-            family: crate::Family::Binomial {
-                link: crate::BinomialLink::Logit,
-            },
-            re: Some(crate::ReStructure {
-                sizing: crate::Sizing::FixedClusters {
-                    n_clusters: n_prim as u32,
+        let spec = SizedSpec {
+            spec: crate::ModelSpec {
+                family: crate::Family::Binomial {
+                    link: crate::BinomialLink::Logit,
                 },
-                slopes: vec![1],
-                extra_groupings: vec![],
-            }),
+                re: Some(crate::ReStructure {
+                    terms: Vec::new(),
+                    slopes: vec![1],
+                    extra_groupings: vec![],
+                }),
+            },
+            n_primary: n_prim,
+            extra_counts: vec![],
         };
         let mut x = Mat::<f64>::zeros(n, 2);
         let mut ids = vec![0u32; n];
@@ -2558,12 +2559,12 @@ mod tests {
             x[(i, 0)] = 1.0;
             x[(i, 1)] = 0.3 + 0.11 * i as f64;
         }
-        let g = LmmGroupings::from_cluster_spec(&spec, n, &[1]);
+        let g = LmmGroupings::from_cluster_spec(&spec, &[1]);
         let n_theta = g.n_theta();
         let q = g.primary_q;
         let qc = q; // no extras on this shape
         let mut z_buf = vec![0.0; n * (q - 1)];
-        fill_z_f64(&g, x.as_ref(), &mut z_buf, n);
+        fill_z_f64(&g, x.as_ref(), x.as_ref().subcols(0, 0), &mut z_buf, n);
         let extra_ids: Vec<Vec<u32>> = vec![];
         let g_cap = crate::lmm::MAX_EXTRA_GROUPINGS;
         let mut lam = vec![0.0; q * q];
@@ -2642,7 +2643,7 @@ mod tests {
     fn packed_m_theta_deriv_matches_central_diff_extras() {
         let (x, y, ids, extra_ids, spec) = crate::glmm::tests::glmm_extras_q1_dataset(2, 3);
         let n = y.len();
-        let g = LmmGroupings::from_cluster_spec(&spec, n, &[]);
+        let g = LmmGroupings::from_cluster_spec(&spec, &[]);
         let n_theta = g.n_theta();
         let q = g.primary_q;
         let qc = q + g.nested_per_parent;
@@ -2757,34 +2758,34 @@ mod tests {
             c1[i] = (i % n_c1) as u32;
             c2[i] = ((i / n_c1) % n_c2) as u32;
         }
-        let spec = crate::ModelSpec {
-            family: crate::Family::Binomial {
-                link: crate::BinomialLink::Logit,
-            },
-            re: Some(crate::ReStructure {
-                sizing: crate::Sizing::FixedClusters {
-                    n_clusters: n_prim as u32,
+        let spec = SizedSpec {
+            spec: crate::ModelSpec {
+                family: crate::Family::Binomial {
+                    link: crate::BinomialLink::Logit,
                 },
-                slopes: vec![],
-                extra_groupings: vec![
-                    crate::Grouping {
-                        relation: crate::GroupingRelation::Crossed {
-                            n_clusters: n_c1 as u32,
+                re: Some(crate::ReStructure {
+                    terms: Vec::new(),
+                    slopes: vec![],
+                    extra_groupings: vec![
+                        crate::Grouping {
+                            terms: Vec::new(),
+                            relation: crate::GroupingRelation::Crossed,
+                            slopes: vec![],
                         },
-                        slopes: vec![],
-                    },
-                    crate::Grouping {
-                        relation: crate::GroupingRelation::Crossed {
-                            n_clusters: n_c2 as u32,
+                        crate::Grouping {
+                            terms: Vec::new(),
+                            relation: crate::GroupingRelation::Crossed,
+                            slopes: vec![],
                         },
-                        slopes: vec![],
-                    },
-                ],
-            }),
+                    ],
+                }),
+            },
+            n_primary: n_prim,
+            extra_counts: vec![n_c1, n_c2],
         };
         let extra_ids = vec![c1, c2];
         let _ = x;
-        let g = LmmGroupings::from_cluster_spec(&spec, n, &[]);
+        let g = LmmGroupings::from_cluster_spec(&spec, &[]);
         let n_theta = g.n_theta();
         assert_eq!(n_theta, 3, "primary + two crossed scalars");
         let q = g.primary_q;

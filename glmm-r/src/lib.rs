@@ -13,8 +13,8 @@
 use std::collections::HashMap;
 
 use glmm::formula::anova::{
-    compare, CompareError, Comparison, ComparisonTest, Differs, Model, ModelInfo, Side, TermTest,
-    TermTestError,
+    compare_stored, CompareError, Comparison, ComparisonTest, Differs, Model, ModelInfo, Side,
+    TermTest, TermTestError,
 };
 use glmm::inference::{DenDf, Reference};
 use glmm::orchestrate;
@@ -108,6 +108,7 @@ fn fastglmm_fit(
     start_theta: &[f64],
     start_dispersion: &[f64],
     satterthwaite: bool,
+    condvar: bool,
     reml: &[Rbool],
     anova_test: &str,
 ) -> Result<List> {
@@ -142,6 +143,7 @@ fn fastglmm_fit(
         offset,
         warm_start,
         satterthwaite,
+        condvar,
         reml,
         anova_test,
     )
@@ -163,6 +165,12 @@ fn fit_list(r: orchestrate::FitResult) -> List {
     let varcorr = List::from_values(r.varcorr.iter().map(|v| r!(v.clone())));
     let re_group_names: Vec<String> = r.re_groups.iter().map(|(n, _)| n.clone()).collect();
     let re_group_terms = List::from_values(r.re_groups.iter().map(|(_, t)| r!(t.clone())));
+    // 1-based like the notes' columns below.
+    let re_term_index = List::from_values(
+        r.re_term_index
+            .iter()
+            .map(|t| r!(t.iter().map(|&k| k as i32 + 1).collect::<Vec<i32>>())),
+    );
     let agq_warning: Robj = match r.agq_warning {
         Some(msg) => r!(msg),
         None => r!(NULL),
@@ -201,15 +209,53 @@ fn fit_list(r: orchestrate::FitResult) -> List {
     // Labelled conditional modes, one entry per grouping. `ranef.fastglmm`
     // reshapes each into lme4's named data.frame. The flat `ranef` vector is
     // not sent, because only the kernel knows the block layout.
-    let ranef_blocks =
-        List::from_values(r.ranef_blocks.iter().map(|(g, terms, levels, values)| {
+    // `condvar` is each level's vech, row-major over the levels, empty where
+    // the fit formed none; `ranef.fastglmm` builds lme4's `postVar` from it.
+    let ranef_blocks = List::from_values(r.ranef_blocks.iter().map(
+        |(g, terms, levels, values, condvar)| {
             r!(list!(
                 group = g.clone(),
                 terms = terms.clone(),
                 levels = levels.clone(),
-                values = values.clone()
+                values = values.clone(),
+                condvar = condvar.clone()
             ))
-        }));
+        },
+    ));
+    // What `predict.fastglmm` and `simulate.fastglmm` hand back to
+    // `fastglmm_predict` and `fastglmm_simulate` (`parts_of` reads it), kept
+    // private on the fit: the flat modes and their level counts, and the
+    // conditional variances in the kernel's layout.
+    let condvar_cross: Robj = match &r.condvar_cross {
+        Some(c) => r!(list!(
+            family_grouping = c.family_grouping as f64,
+            family = c.family.clone(),
+            tail = c.tail.clone(),
+            coupling_at = c
+                .coupling_at
+                .iter()
+                .map(|&v| v as f64)
+                .collect::<Vec<f64>>(),
+            coupling_cols = c
+                .coupling_cols
+                .iter()
+                .map(|&v| v as f64)
+                .collect::<Vec<f64>>(),
+            coupling = c.coupling.clone()
+        )),
+        None => r!(NULL),
+    };
+    let kernel_parts = list!(
+        ranef = r.ranef.clone(),
+        ranef_levels = r
+            .ranef_levels
+            .iter()
+            .map(|&n| n as f64)
+            .collect::<Vec<f64>>(),
+        condvar = r.condvar.clone(),
+        condvar_x = r.condvar_x.clone(),
+        condvar_cross = condvar_cross
+    );
 
     let offset: Robj = match r.offset {
         Some(o) => r!(o),
@@ -250,6 +296,7 @@ fn fit_list(r: orchestrate::FitResult) -> List {
         names = r.names,
         re_group_names = re_group_names,
         re_group_terms = re_group_terms,
+        re_term_index = re_term_index,
         agq_warning = agq_warning,
         reml_warning = reml_warning,
         loglik = r.loglik,
@@ -257,6 +304,7 @@ fn fit_list(r: orchestrate::FitResult) -> List {
         reml = r.reml,
         fitted = r.fitted,
         ranef_blocks = ranef_blocks,
+        kernel_parts = kernel_parts,
         y = r.y,
         weights = weights,
         design_summary = design_summary,
@@ -310,6 +358,7 @@ fn term_list(result: &std::result::Result<glmm::formula::anova::TermTable, Strin
                 p_value = c.p_value,
                 sum_sq = c.sum_sq,
                 mean_sq = c.mean_sq,
+                eta2_partial = c.eta2_partial,
                 row_notes = List::from_values(c.row_notes.iter().map(|n| r!(n.clone()))),
                 notes = c.notes
             )
@@ -432,7 +481,7 @@ fn fastglmm_compare(
     ))
 }
 
-/// `glmm::formula::anova::compare` for `anova(m0, m1)`: compares two stored
+/// `glmm::formula::anova::compare_stored` for `anova(m0, m1)`: compares two stored
 /// fits as they are, with no refit and no data. `m0` and `m1` are named lists
 /// of the fields a fit object stores (the R wrapper's `.compare_side()`
 /// builds them). Returns `list(comparison, nsim, seed)` as `fastglmm_compare`
@@ -447,7 +496,7 @@ fn fastglmm_compare(
 fn fastglmm_anova_pair(m0: List, m1: List, nsim: &[f64], seed: &[f64]) -> Result<List> {
     let (nsim, seed) = nsim_seed(nsim, seed)?;
     let opts = orchestrate::compare_options(nsim, seed).map_err(Error::Other)?;
-    match compare(&model_of(&m0)?, &model_of(&m1)?, &opts) {
+    match compare_stored(&model_of(&m0)?, &model_of(&m1)?, &opts) {
         Ok(c) => Ok(list!(
             comparison = comparison_list(&c)?,
             nsim = opts.nsim as f64,
@@ -681,24 +730,11 @@ fn fastglmm_contrast_test(
     l: &[f64],
     rows: i32,
 ) -> Result<List> {
-    let p = beta.len();
     let dispersion = match dispersion {
         [v] => *v,
         _ => return Err(Error::Other("dispersion must be one number".into())),
     };
-    if vcov.len() != p * p {
-        return Err(Error::Other(format!(
-            "vcov has {} entries for {p} coefficients",
-            vcov.len()
-        )));
-    }
-    let vcov: Vec<Vec<f64>> = vcov.chunks(p.max(1)).map(<[f64]>::to_vec).collect();
-    let aliased: Vec<bool> = aliased.iter().map(|a| a.is_true()).collect();
-    let record = if record.is_null() {
-        None
-    } else {
-        Some(record_of(&List::try_from(&record)?)?)
-    };
+    let (vcov, aliased, record) = stored_test_fields(beta.len(), vcov, aliased, &record)?;
     let table = orchestrate::contrast_test(
         df_method,
         beta,
@@ -713,6 +749,158 @@ fn fastglmm_contrast_test(
     )
     .map_err(Error::Other)?;
     Ok(term_list(&Ok(table)))
+}
+
+/// What `stored_test_fields` returns.
+type TestFields = (
+    Vec<Vec<f64>>,
+    Vec<bool>,
+    Option<orchestrate::SatterthwaiteRecord>,
+);
+
+/// What `fastglmm_contrast_test` and `fastglmm_pairwise` read of a fit
+/// besides `beta`, for `p` coefficients: `vcov` (row-major) as its rows,
+/// `aliased` as booleans, and `record` (`NULL` when the fit has none) as an
+/// `orchestrate::SatterthwaiteRecord`.
+fn stored_test_fields(
+    p: usize,
+    vcov: &[f64],
+    aliased: &[Rbool],
+    record: &Robj,
+) -> Result<TestFields> {
+    if vcov.len() != p * p {
+        return Err(Error::Other(format!(
+            "vcov has {} entries for {p} coefficients",
+            vcov.len()
+        )));
+    }
+    let vcov: Vec<Vec<f64>> = vcov.chunks(p.max(1)).map(<[f64]>::to_vec).collect();
+    let aliased: Vec<bool> = aliased.iter().map(|a| a.is_true()).collect();
+    let record = if record.is_null() {
+        None
+    } else {
+        Some(record_of(&List::try_from(record)?)?)
+    };
+    Ok((vcov, aliased, record))
+}
+
+/// `glmm::orchestrate::pairwise` for `pairwise()`: the training columns as
+/// `fastglmm_predict` takes them, the fit's fields as `fastglmm_contrast_test`
+/// takes them, then `factor`, `by` (`""` for none), `by_values` (empty for
+/// none) and `adjust`. Returns the table as `orchestrate::pairwise_columns`
+/// flattens it, a list keyed by its fields; `by` and `ratio_kind` are `NULL`
+/// when absent and `levels` crosses as a double.
+///
+/// @usage NULL
+/// @keywords internal
+#[extendr]
+#[allow(clippy::too_many_arguments)]
+fn fastglmm_pairwise(
+    formula: &str,
+    numeric: List,
+    factor_levels: List,
+    factor_codes: List,
+    family: &str,
+    link: &str,
+    df_method: &str,
+    beta: &[f64],
+    vcov: &[f64],
+    aliased: &[Rbool],
+    nobs: f64,
+    record: Robj,
+    names: Vec<String>,
+    factor: &str,
+    by: &str,
+    by_values: &[f64],
+    adjust: &str,
+) -> Result<List> {
+    let (vcov, aliased, record) = stored_test_fields(beta.len(), vcov, aliased, &record)?;
+    let pw = orchestrate::pairwise(
+        formula,
+        numeric_map(numeric)?,
+        factor_map(factor_levels, factor_codes)?,
+        family,
+        link,
+        df_method,
+        beta,
+        &vcov,
+        &aliased,
+        nobs as usize,
+        record,
+        factor,
+        (!by.is_empty()).then_some(by),
+        optional(by_values),
+        adjust,
+    )
+    .map_err(Error::Other)?;
+    let c = orchestrate::pairwise_columns(&pw, &names);
+    let or_null = |v: Option<String>| v.map_or_else(|| r!(NULL), |s| r!(s));
+    Ok(list!(
+        factor = c.factor,
+        by = or_null(c.by),
+        adjust = c.adjust,
+        ratio_kind = or_null(c.ratio_kind.map(str::to_string)),
+        levels = c.levels as f64,
+        contrast = c.contrast,
+        by_level = c.by_level,
+        estimate = c.estimate,
+        se = c.se,
+        df = c.df,
+        statistic = c.statistic,
+        p_value = c.p_value,
+        p_adjusted = c.p_adjusted,
+        ratio = c.ratio,
+        ratio_se = c.ratio_se,
+        row_notes = List::from_values(c.row_notes.iter().map(|n| r!(n.clone())))
+    ))
+}
+
+/// `glmm::orchestrate::pairwise_confint` for `confint()` of a pairwise
+/// table: the columns `fastglmm_pairwise` gave (`estimate`, `se`, `df`, the
+/// unadjusted `p_value`, `adjust`, `levels` as a double, `ratio` the
+/// `ratio_kind`, `""` for none). `level` crosses as a vector, as in
+/// `fastglmm_confint`. Returns `list(adjust, lower, upper, ratio_lower,
+/// ratio_upper)`, `adjust` the adjustment the intervals use.
+///
+/// @usage NULL
+/// @keywords internal
+#[extendr]
+#[allow(clippy::too_many_arguments)]
+fn fastglmm_pairwise_confint(
+    estimate: &[f64],
+    se: &[f64],
+    df: &[f64],
+    p_value: &[f64],
+    adjust: &str,
+    levels: f64,
+    ratio: &str,
+    level: &[f64],
+) -> Result<List> {
+    let level = match level {
+        [v] => *v,
+        _ => f64::NAN,
+    };
+    let ci = orchestrate::pairwise_confint(
+        estimate,
+        se,
+        df,
+        p_value,
+        adjust,
+        whole(levels, "levels")?,
+        (!ratio.is_empty()).then_some(ratio),
+        level,
+    )
+    .map_err(Error::Other)?;
+    let col = |f: fn(&glmm::formula::PairwiseInterval) -> f64| -> Vec<f64> {
+        ci.rows.iter().map(f).collect()
+    };
+    Ok(list!(
+        adjust = orchestrate::adjust_tag(ci.adjust),
+        lower = col(|r| r.lower),
+        upper = col(|r| r.upper),
+        ratio_lower = col(|r| r.ratio_lower),
+        ratio_upper = col(|r| r.ratio_upper)
+    ))
 }
 
 /// A fit object's `satterthwaite_record`, as `fit_list` writes it, read back
@@ -758,6 +946,276 @@ fn record_of(rec: &List) -> Result<orchestrate::SatterthwaiteRecord> {
     })
 }
 
+/// A whole number of at least 0 sent as a double, as `usize`.
+fn whole(v: f64, what: &str) -> Result<usize> {
+    if v >= 0.0 && v.fract() == 0.0 && v <= 9_007_199_254_740_992.0 {
+        Ok(v as usize)
+    } else {
+        Err(Error::Other(format!(
+            "{what} must be a whole number, got {v}"
+        )))
+    }
+}
+
+/// The numbers `predict.fastglmm`, `simulate.fastglmm` and `r2()` / `icc()`
+/// send (the R wrapper's `.stored_numbers()`), read into `orchestrate::StoredParts`:
+/// `beta`, `vcov` flattened row-major, `varcorr`, `dispersion`, and the
+/// fit's `kernel_parts` (`fit_list` writes them) with the counts as doubles.
+fn parts_of(parts: &List) -> Result<orchestrate::StoredParts> {
+    let fields: HashMap<&str, Robj> = parts.iter().collect();
+    let bad = |name: &str| Error::Other(format!("stored field {name:?} is missing or malformed"));
+    let get = |name: &str| fields.get(name).ok_or_else(|| bad(name));
+    let reals = |name: &str| get(name)?.as_real_vector().ok_or_else(|| bad(name));
+    let counts = |v: Vec<f64>, name: &str| -> Result<Vec<usize>> {
+        v.into_iter().map(|c| whole(c, name)).collect()
+    };
+    let beta = reals("beta")?;
+    let p = beta.len();
+    let vcov = reals("vcov")?;
+    if vcov.len() != p * p {
+        return Err(bad("vcov"));
+    }
+    let varcorr = List::try_from(get("varcorr")?)
+        .map_err(|_| bad("varcorr"))?
+        .values()
+        .map(|b| b.as_real_vector().ok_or_else(|| bad("varcorr")))
+        .collect::<Result<Vec<_>>>()?;
+    let dispersion = match reals("dispersion")?.as_slice() {
+        [v] => *v,
+        _ => return Err(bad("dispersion")),
+    };
+    let condvar_cross = match get("condvar_cross")? {
+        c if c.is_null() => None,
+        c => {
+            let c: HashMap<&str, Robj> = List::try_from(c)
+                .map_err(|_| bad("condvar_cross"))?
+                .iter()
+                .collect();
+            let part = |name: &str| {
+                c.get(name)
+                    .and_then(|v| v.as_real_vector())
+                    .ok_or_else(|| bad("condvar_cross"))
+            };
+            let u32s = |name: &str| -> Result<Vec<u32>> {
+                part(name)?
+                    .into_iter()
+                    .map(|v| u32::try_from(whole(v, name)?).map_err(|_| bad(name)))
+                    .collect()
+            };
+            Some(orchestrate::CondvarCrossRecord {
+                family_grouping: match part("family_grouping")?.as_slice() {
+                    [v] => whole(*v, "family_grouping")?,
+                    _ => return Err(bad("condvar_cross")),
+                },
+                family: part("family")?,
+                tail: part("tail")?,
+                coupling_at: u32s("coupling_at")?,
+                coupling_cols: u32s("coupling_cols")?,
+                coupling: part("coupling")?,
+            })
+        }
+    };
+    Ok(orchestrate::StoredParts {
+        beta,
+        vcov: vcov.chunks(p.max(1)).map(<[f64]>::to_vec).collect(),
+        varcorr,
+        ranef: reals("ranef")?,
+        ranef_levels: counts(reals("ranef_levels")?, "ranef_levels")?,
+        condvar: reals("condvar")?,
+        condvar_x: reals("condvar_x")?,
+        condvar_cross,
+        dispersion,
+    })
+}
+
+/// `glmm::orchestrate::predict` for `predict.fastglmm`: the training columns
+/// as `fastglmm_fit` took them (the R wrapper marshals the fit's model frame
+/// again), the stored numbers `parts` (`parts_of`), and the new table's
+/// columns, or none when `has_new` is FALSE (the model frame's rows);
+/// `n_rows` is the new table's row count. `level` crosses as a vector, as
+/// in `fastglmm_confint`. Returns `list(fit, se, lower, upper, future_lower,
+/// future_upper, notes)`, a part not asked for empty; each note is
+/// `list(kind, detail)` with the rows in `detail` 1-based.
+///
+/// @usage NULL
+/// @keywords internal
+#[extendr]
+#[allow(clippy::too_many_arguments)]
+fn fastglmm_predict(
+    formula: &str,
+    numeric: List,
+    factor_levels: List,
+    factor_codes: List,
+    family: &str,
+    link: &str,
+    weights: &[f64],
+    offset: &[f64],
+    parts: List,
+    has_new: bool,
+    new_numeric: List,
+    new_levels: List,
+    new_codes: List,
+    n_rows: f64,
+    scale: &str,
+    population: bool,
+    allow_new_levels: bool,
+    se: bool,
+    level: &[f64],
+    future: bool,
+) -> Result<List> {
+    let level = match level {
+        [v] => *v,
+        _ => f64::NAN,
+    };
+    let new = if has_new {
+        Some((
+            numeric_map(new_numeric)?,
+            factor_map(new_levels, new_codes)?,
+            whole(n_rows, "n_rows")?,
+        ))
+    } else {
+        None
+    };
+    let r = orchestrate::predict(
+        formula,
+        numeric_map(numeric)?,
+        factor_map(factor_levels, factor_codes)?,
+        family,
+        link,
+        optional(weights),
+        optional(offset),
+        &parts_of(&parts)?,
+        new,
+        scale,
+        population,
+        allow_new_levels,
+        se,
+        level,
+        future,
+    )
+    .map_err(Error::Other)?;
+    // The rows of a note become 1-based here, as the fit's columns do.
+    let notes = List::from_values(r.notes.iter().map(|n| {
+        let detail = match n.detail.split_once(": ") {
+            Some((g, rows)) => {
+                let rows: Vec<String> = rows
+                    .split(", ")
+                    .map(|i| {
+                        i.parse::<u64>()
+                            .map_or(i.to_string(), |i| (i + 1).to_string())
+                    })
+                    .collect();
+                format!("{g}: {}", rows.join(", "))
+            }
+            None => n.detail.clone(),
+        };
+        r!(list!(kind = n.kind, detail = detail))
+    }));
+    Ok(list!(
+        fit = r.fit,
+        se = r.se,
+        lower = r.lower,
+        upper = r.upper,
+        future_lower = r.future_lower,
+        future_upper = r.future_upper,
+        notes = notes
+    ))
+}
+
+/// `glmm::orchestrate::simulate` for `simulate.fastglmm`: the columns and
+/// `parts` as `fastglmm_predict` takes them; `nsim` and `seed` whole numbers
+/// sent as doubles (the R wrapper has checked them). The draws draw after
+/// draw, `nobs * nsim` doubles.
+///
+/// @usage NULL
+/// @keywords internal
+#[extendr]
+#[allow(clippy::too_many_arguments)]
+fn fastglmm_simulate(
+    formula: &str,
+    numeric: List,
+    factor_levels: List,
+    factor_codes: List,
+    family: &str,
+    link: &str,
+    weights: &[f64],
+    offset: &[f64],
+    parts: List,
+    nsim: f64,
+    seed: f64,
+) -> Result<Vec<f64>> {
+    orchestrate::simulate(
+        formula,
+        numeric_map(numeric)?,
+        factor_map(factor_levels, factor_codes)?,
+        family,
+        link,
+        optional(weights),
+        optional(offset),
+        &parts_of(&parts)?,
+        whole(nsim, "nsim")?,
+        whole(seed, "seed")? as u64,
+    )
+    .map_err(Error::Other)
+}
+
+/// `glmm::orchestrate::effect_sizes` for `r2()`, `icc()` and
+/// `summary.fastglmm`: the columns and `parts` as `fastglmm_predict` takes
+/// them, and the fit's `aliased`, `converged`, `objective` and
+/// `objective_nodes`. Returns `list(marginal, conditional, adjusted,
+/// unadjusted)`, or `NULL` where the values need the null refit that
+/// `null_refit = FALSE` skips.
+///
+/// @usage NULL
+/// @keywords internal
+#[extendr]
+#[allow(clippy::too_many_arguments)]
+fn fastglmm_effect_sizes(
+    formula: &str,
+    numeric: List,
+    factor_levels: List,
+    factor_codes: List,
+    family: &str,
+    link: &str,
+    weights: &[f64],
+    offset: &[f64],
+    parts: List,
+    aliased: &[Rbool],
+    converged: bool,
+    objective: &str,
+    objective_nodes: i32,
+    null_refit: bool,
+) -> Result<Robj> {
+    let aliased: Vec<bool> = aliased.iter().map(|a| a.is_true()).collect();
+    let nodes = u8::try_from(objective_nodes)
+        .map_err(|_| Error::Other(format!("objective_nodes {objective_nodes} is not 0 to 255")))?;
+    let sizes = orchestrate::effect_sizes(
+        formula,
+        numeric_map(numeric)?,
+        factor_map(factor_levels, factor_codes)?,
+        family,
+        link,
+        optional(weights),
+        optional(offset),
+        &parts_of(&parts)?,
+        &aliased,
+        converged,
+        (objective, nodes),
+        null_refit,
+    )
+    .map_err(Error::Other)?;
+    Ok(match sizes {
+        Some((r2, icc)) => list!(
+            marginal = r2.marginal,
+            conditional = r2.conditional,
+            adjusted = icc.adjusted,
+            unadjusted = icc.unadjusted
+        )
+        .into(),
+        None => r!(NULL),
+    })
+}
+
 /// The refusal of `anova(m, test = "Wald")` or `test = "LRT"` on a fit
 /// whose per-term rows are F tests, in the crate's words, so both ports say
 /// the same. `satterthwaite` is TRUE when the F rows' denominator df are
@@ -785,8 +1243,13 @@ extendr_module! {
     fn fastglmm_fit;
     fn fastglmm_confint;
     fn fastglmm_contrast_test;
+    fn fastglmm_pairwise;
+    fn fastglmm_pairwise_confint;
     fn fastglmm_same_fixed_part;
     fn fastglmm_compare;
     fn fastglmm_anova_pair;
     fn fastglmm_term_test_refusal;
+    fn fastglmm_predict;
+    fn fastglmm_simulate;
+    fn fastglmm_effect_sizes;
 }

@@ -2,10 +2,12 @@
 //! fits must pass before a comparison, the refusals that name the fix, and
 //! the test each pair gets.
 //!
-//! [`compare`] takes two [`Model`]s, plain numbers a port's fit object keeps,
-//! never a [`Fit`] or a [`Lowered`], so a comparison of two stored fits needs
-//! no refit and no data. Its checks run in this order, each a refusal
-//! ([`CompareError`]):
+//! [`compare`] takes two fitted [`formula::Model`](super::Model)s and
+//! [`compare_stored`] two [`Model`]s, the plain numbers a port's fit object
+//! keeps, never a [`Fit`] or a [`Lowered`], so a comparison of two stored
+//! fits needs no refit and no data; [`compare`] reads those numbers off each
+//! fitted model and calls [`compare_stored`]. The checks run in this order,
+//! each a refusal ([`CompareError`]):
 //!
 //! 1. both fits converged, and each side's [`Model::re_groups`] lists one
 //!    grouping per `varcorr` block, each with one term per block dimension;
@@ -76,9 +78,10 @@ use crate::inference::wald::wald_chisq;
 use crate::inference::{
     DenDf, LinearKind, LinearNote, LinearTest, LrNote, LrTest, Objective, Reference,
 };
+use crate::spec::set_term_slopes;
 use crate::{
-    fit_warm, BinomialLink, ColumnId, Family, Fit, GammaLink, InverseGaussianLink, NegBinomialLink,
-    PoissonLink, StartValues, WaldSe,
+    BinomialLink, ColumnId, Data, Design, Family, Fit, FitOptions, GammaLink, InverseGaussianLink,
+    NegBinomialLink, PoissonLink, SeFor, StartValues, WaldSe,
 };
 
 /// One of the two sides of a comparison, as given: `First` is `m0`, the first
@@ -130,14 +133,20 @@ pub enum Nesting {
 ///
 /// One formula is nested in the other when the response is the same, every
 /// fixed term of the smaller one is in the larger one, and every grouping of
-/// the smaller one is in the larger one with the same or more slopes. Terms,
-/// groupings and slopes are compared as sets of variable names, so no order
-/// matters: not the order of the terms, of the variables inside an
-/// interaction (`a:b` is `b:a`), of the groupings, or of the slopes inside a
-/// grouping, and `(1 | a/b)` holds the groupings `a` and `a:b`. The fixed
-/// intercept is a term ([`ParsedFormula::has_intercept`]): `y ~ 0 + x` is
-/// nested in `y ~ x`, and `y ~ 1` against `y ~ 0 + f` is refused although the
-/// column spaces are nested when `f` is a factor. The offset is not read.
+/// the smaller one is in the larger one, each of its random-effect terms
+/// inside one term of the larger one's grouping: the same or more slopes, and
+/// the intercept only where the larger term has it. So `(x || g)` is nested
+/// in `(1 + x | g)`. Terms, groupings and slopes are compared as sets of
+/// variable names, so no order matters: not the order of the terms, of the
+/// variables inside an interaction (`a:b` is `b:a`), of the groupings, or of
+/// the slopes inside a term, and `(1 | a/b)` holds the groupings `a` and
+/// `a:b`. A `zerocorr` term counts as one term per variable, and only a term
+/// of one variable written the same way, or the intercept alone, lies inside
+/// one of those, since the variable may be a factor whose columns `zerocorr`
+/// keeps apart. The fixed intercept is a term
+/// ([`ParsedFormula::has_intercept`]): `y ~ 0 + x` is nested in `y ~ x`, and
+/// `y ~ 1` against `y ~ 0 + f` is refused although the column spaces are
+/// nested when `f` is a factor. The offset is not read.
 ///
 /// # Errors
 /// [`CompareError::Formula`] when a formula does not parse,
@@ -185,37 +194,92 @@ fn vars(name: &str) -> BTreeSet<&str> {
     name.split(':').collect()
 }
 
-/// Each grouping (its variable names) with its slopes (each a set of
-/// variable names). Every grouping carries an intercept.
-fn random_part(f: &ParsedFormula) -> BTreeMap<BTreeSet<&str>, BTreeSet<BTreeSet<&str>>> {
-    f.random_effects
-        .iter()
-        .map(|re| match re {
-            RandomEffect::Intercept { group, .. } => (vars(group), BTreeSet::new()),
-            RandomEffect::Slope {
-                group,
-                vars: slopes,
-            } => (vars(group), slopes.iter().map(|s| vars(s)).collect()),
-        })
-        .collect()
+/// One random-effect term as [`nesting`] compares it: whether it holds the
+/// intercept, its slopes (each a set of variable names), and whether it is one
+/// variable of a `zerocorr` term.
+struct RandomTerm<'a> {
+    intercept: bool,
+    slopes: BTreeSet<BTreeSet<&'a str>>,
+    diagonal: bool,
 }
 
-/// Whether every grouping of `small` is in `large` with the same or more
-/// slopes.
+impl RandomTerm<'_> {
+    /// Whether this term's model lies inside `large`'s: its columns among
+    /// `large`'s, and, against a `zerocorr` variable, nothing but that
+    /// variable spelled the same way or the intercept alone.
+    fn inside(&self, large: &RandomTerm<'_>) -> bool {
+        (!self.intercept || large.intercept)
+            && self.slopes.is_subset(&large.slopes)
+            && (!large.diagonal || self.diagonal || self.slopes.is_empty())
+    }
+}
+
+/// Each grouping (its variable names) with its random-effect terms.
+fn random_part(f: &ParsedFormula) -> BTreeMap<BTreeSet<&str>, Vec<RandomTerm<'_>>> {
+    let mut part: BTreeMap<BTreeSet<&str>, Vec<RandomTerm<'_>>> = BTreeMap::new();
+    fn slopes(vs: &[String]) -> BTreeSet<BTreeSet<&str>> {
+        vs.iter().map(|s| vars(s)).collect()
+    }
+    for re in &f.random_effects {
+        let (group, terms) = match re {
+            RandomEffect::Intercept { group, .. } => (
+                group,
+                vec![RandomTerm {
+                    intercept: true,
+                    slopes: BTreeSet::new(),
+                    diagonal: false,
+                }],
+            ),
+            RandomEffect::Slope { group, vars: vs }
+            | RandomEffect::NoIntercept { group, vars: vs } => (
+                group,
+                vec![RandomTerm {
+                    intercept: matches!(re, RandomEffect::Slope { .. }),
+                    slopes: slopes(vs),
+                    diagonal: false,
+                }],
+            ),
+            RandomEffect::ZeroCorr {
+                group,
+                vars: vs,
+                intercept,
+            } => {
+                let intercept_term = intercept.then(|| RandomTerm {
+                    intercept: true,
+                    slopes: BTreeSet::new(),
+                    diagonal: false,
+                });
+                let per_var = vs.iter().map(|v| RandomTerm {
+                    intercept: false,
+                    slopes: BTreeSet::from([vars(v)]),
+                    diagonal: true,
+                });
+                (group, intercept_term.into_iter().chain(per_var).collect())
+            }
+        };
+        part.entry(vars(group)).or_default().extend(terms);
+    }
+    part
+}
+
+/// Whether every grouping of `small` is in `large`, each of its terms inside
+/// one term of `large`'s grouping.
 fn random_inside(
-    small: &BTreeMap<BTreeSet<&str>, BTreeSet<BTreeSet<&str>>>,
-    large: &BTreeMap<BTreeSet<&str>, BTreeSet<BTreeSet<&str>>>,
+    small: &BTreeMap<BTreeSet<&str>, Vec<RandomTerm<'_>>>,
+    large: &BTreeMap<BTreeSet<&str>, Vec<RandomTerm<'_>>>,
 ) -> bool {
-    small
-        .iter()
-        .all(|(group, slopes)| large.get(group).is_some_and(|l| slopes.is_subset(l)))
+    small.iter().all(|(group, terms)| {
+        large
+            .get(group)
+            .is_some_and(|l| terms.iter().all(|t| l.iter().any(|lt| t.inside(lt))))
+    })
 }
 
 /// What a comparison reads of one fitted model: plain numbers, as a port's fit
 /// object keeps them, so two stored fits are compared with no refit.
 ///
-/// [`Model::from_fit`] builds one from a [`Fit`] and the [`Lowered`] model it
-/// was fitted on; a port builds one from the fields it stored.
+/// [`compare`] reads one off each fitted [`formula::Model`](super::Model); a
+/// port builds one from the fields it stored and calls [`compare_stored`].
 #[derive(Clone, Debug)]
 pub struct Model {
     /// The formula the model was fitted with.
@@ -239,7 +303,7 @@ pub struct Model {
     /// Each `varcorr` block's grouping name and term names, in the same
     /// order ([`Lowered::re_groups`]); empty when there is no random part.
     /// The zero-component rule reads it to match blocks and terms by name.
-    /// [`compare`] refuses a side whose `re_groups` does not list one
+    /// [`compare_stored`] refuses a side whose `re_groups` does not list one
     /// grouping per `varcorr` block, each with one term per block dimension
     /// ([`CompareError::ReGroups`]), so fill it from the fit's `re_groups`.
     pub re_groups: Vec<(String, Vec<String>)>,
@@ -271,13 +335,17 @@ pub struct Model {
 
 impl Model {
     /// The model of `fit`, fitted on `lowered` from `formula` with
-    /// `lowered.opts` (the weights, the offset and the held dispersion are
-    /// read from there).
-    pub fn from_fit(formula: &str, lowered: &Lowered, fit: &Fit) -> Model {
-        let opts = &lowered.opts;
+    /// `fit_opts` (the weights and the offset are read from `lowered`, the
+    /// held dispersion from `fit_opts`).
+    pub(crate) fn from_fit(
+        formula: &str,
+        lowered: &Lowered,
+        fit_opts: &FitOptions,
+        fit: &Fit,
+    ) -> Model {
         let ols = lowered.model.re.is_none() && lowered.model.family == Family::Gaussian;
         let rss = if ols && fit.converged() && fit.fitted.len() == lowered.y.len() {
-            let w = |i: usize| opts.weights.as_ref().map_or(1.0, |w| w[i]);
+            let w = |i: usize| lowered.weights.as_ref().map_or(1.0, |w| w[i]);
             (0..lowered.y.len())
                 .map(|i| w(i) * (lowered.y[i] - fit.fitted[i]).powi(2))
                 .sum()
@@ -300,9 +368,9 @@ impl Model {
                 .map(|g| (g.name.clone(), g.terms.clone()))
                 .collect(),
             y: lowered.y.clone(),
-            weights: opts.weights.clone(),
-            offset: opts.offset.clone(),
-            dispersion_held: opts.dispersion,
+            weights: lowered.weights.clone(),
+            offset: lowered.offset.clone(),
+            dispersion_held: fit_opts.dispersion,
             design_summary: fit
                 .design_summary
                 .as_ref()
@@ -527,9 +595,6 @@ pub(crate) fn linear_note_line(note: LinearNote, names: &[String]) -> String {
         LinearNote::ReducedNotConverged => "A model refitted for this term's likelihood-ratio \
              test did not converge, or its log-likelihood is not finite, so the statistic and its \
              p-value are NaN."
-            .into(),
-        LinearNote::RandomSlopeColumn => "Likelihood-ratio test not available: the term's \
-             column carries a random slope, so the row is the Wald chi-squared test."
             .into(),
         LinearNote::NegativeStatistic => "The model refitted under the term's hypothesis \
              reached a higher log-likelihood than the larger model of this row, by more than \
@@ -795,14 +860,32 @@ fn family_words(family: Family) -> String {
     format!("{name} with {link} link")
 }
 
-/// Compares two fitted models, given in either order: runs the checks, then
+/// Compares two fitted models, given in either order: [`compare_stored`] on
+/// the numbers of each.
+///
+/// # Errors
+/// The first check that fails, as a [`CompareError`].
+pub fn compare(
+    a: &super::Model,
+    b: &super::Model,
+    opts: &CompareOptions,
+) -> Result<Comparison, CompareError> {
+    let stored = |m: &super::Model| Model::from_fit(m.formula(), m.lowered(), &m.opts, m.fit());
+    compare_stored(&stored(a), &stored(b), opts)
+}
+
+/// Compares two stored models, given in either order: runs the checks, then
 /// the test of the pair's case (see the module header for both). The exact
 /// restricted likelihood-ratio test draws `opts.nsim` times from `opts.seed`,
 /// serially, so one call gives the same p-value in every build.
 ///
 /// # Errors
 /// The first check that fails, as a [`CompareError`].
-pub fn compare(a: &Model, b: &Model, opts: &CompareOptions) -> Result<Comparison, CompareError> {
+pub fn compare_stored(
+    a: &Model,
+    b: &Model,
+    opts: &CompareOptions,
+) -> Result<Comparison, CompareError> {
     // 1. Both converged.
     if !(a.converged && b.converged) {
         return Err(CompareError::NotConverged {
@@ -1206,9 +1289,7 @@ pub struct TermTestOptions {
 pub struct TestChoice {
     /// The rows' test: [`LinearKind::F`], the Wald χ²
     /// ([`LinearKind::ChiSquared`]) or the likelihood-ratio χ²
-    /// ([`LinearKind::LikelihoodRatio`]). On a likelihood-ratio table, a row
-    /// whose term carries a random slope is the Wald χ² with
-    /// [`LinearNote::RandomSlopeColumn`].
+    /// ([`LinearKind::LikelihoodRatio`]).
     pub test: LinearKind,
     /// Why the table runs `test`.
     pub reason: ChoiceReason,
@@ -1261,6 +1342,23 @@ pub struct FixedRow {
     pub mean_sq: Option<f64>,
 }
 
+impl FixedRow {
+    /// The row's partial η², `F·df1 / (F·df1 + df2)` from its own F and
+    /// df, as `effectsize::F_to_eta2` computes it from an `anova()` table.
+    /// On a Gaussian LMM `df2` is Satterthwaite's, so the value is
+    /// approximate. NaN on a χ² or likelihood-ratio row and on an F row that
+    /// was not tested (its F and df NaN).
+    pub fn eta2_partial(&self) -> f64 {
+        match self.test.reference {
+            Reference::F { num_df, den_df, .. } => {
+                let f_df1 = self.test.statistic * num_df;
+                f_df1 / (f_df1 + den_df)
+            }
+            _ => f64::NAN,
+        }
+    }
+}
+
 /// A [`FixedRow`] of `test`, with `Sum Sq` and `Mean Sq` from `dispersion` on
 /// an F row.
 pub(crate) fn fixed_row(label: String, test: LinearTest, dispersion: f64) -> FixedRow {
@@ -1310,12 +1408,12 @@ pub enum TermTestError {
         den_df: DenDf,
     },
     /// Likelihood-ratio rows asked of a fit made at another quadrature node
-    /// count than `lowered.opts.nagq`, the count the rows' refits use, so
+    /// count than the options' `nagq`, the count the rows' refits use, so
     /// each row would compare two approximations of the likelihood.
     RefitNodeCount {
         /// The fit's node count (1, the Laplace approximation).
         fit: u8,
-        /// The node count of the refits, `lowered.opts.nagq`.
+        /// The node count of the refits, the options' `nagq`.
         refits: u8,
     },
 }
@@ -1387,15 +1485,14 @@ pub(crate) fn auto_choice(lowered: &Lowered, fit: &Fit) -> TestChoice {
     TestChoice { test, reason }
 }
 
-/// The per-term tests of `fit`, the fit of `lowered` made with
-/// `lowered.opts`: one row per fixed term of [`Lowered::terms`], in that
-/// order (R's), each the test of the term's hypothesis set of
+/// The per-term tests of `model`'s fit: one row per fixed term of
+/// [`Lowered::terms`], in that order (R's), each the test of the term's hypothesis set of
 /// `opts.ss_type`, read off the one fit (a likelihood-ratio row also refits
 /// the model under its hypothesis).
 ///
 /// Which fits get which row is read from the fit (the residual or
-/// Satterthwaite record it keeps for [`Fit::contrast_f`]), never from
-/// `lowered.opts`:
+/// Satterthwaite record it keeps for [`Fit::contrast_f`]), never from the
+/// options:
 ///
 /// - OLS, the Gamma and inverse Gaussian GLMs with φ estimated, and the
 ///   Gaussian LMM (REML or ML) get the F of [`Fit::contrast_f`]: on the
@@ -1413,15 +1510,11 @@ pub(crate) fn auto_choice(lowered: &Lowered, fit: &Fit) -> TestChoice {
 /// [`TermTable::choice`] records the test run and why. A fit with F rows
 /// takes only [`TermTest::Auto`].
 ///
-/// A likelihood-ratio row refits the model under the term's hypothesis with
-/// [`fit_warm`], from the fit's β̂, θ̂ and estimated dispersion, by
-/// `lowered.opts` (node count, weights, offset, held dispersion; a negative
-/// binomial θ is re-estimated). These rows therefore need `fit` made with
-/// `lowered.opts`: a fit made at another node count is refused
-/// ([`TermTestError::RefitNodeCount`]), and weights, an offset or a held
-/// dispersion cannot be read back from a [`Fit`], so a caller that fits with
-/// other ones gets rows that compare two different likelihoods. The Wald and
-/// F rows read the fit alone. Type III fits the reduced design
+/// A likelihood-ratio row refits the model under the term's hypothesis, as
+/// [`crate::fit_with_start`] does, from the fit's β̂, θ̂ and estimated
+/// dispersion, by the options the model was fitted with (node count, held
+/// dispersion; a negative binomial θ is re-estimated) and its lowering's
+/// weights and offset. The Wald and F rows read the fit alone. Type III fits the reduced design
 /// `X·N`, `N` an orthonormal basis of the null space of the term's `L` (the
 /// hypothesis its Wald row tests); Type II, car's `Anova(type = 2,
 /// test.statistic = "LR")`, fits two column subsets of the design, the model
@@ -1429,11 +1522,11 @@ pub(crate) fn auto_choice(lowered: &Lowered, fit: &Fit) -> TestChoice {
 /// distinct subset once. The statistic `2(ℓ₁ − ℓ₀)`, floored at 0, is
 /// referred to χ² on the term's rank; a raw value below zero by more than
 /// round-off takes [`LinearNote::NegativeStatistic`]. A refit that does not
-/// converge gives a NaN row with [`LinearNote::ReducedNotConverged`]; a term
-/// whose reduced design would leave out or mix a column carrying a random
-/// slope gets its Wald row with [`LinearNote::RandomSlopeColumn`]; on a fit
-/// that did not converge every row is NaN, nothing is refitted, and a table
-/// note says why.
+/// converge gives a NaN row with [`LinearNote::ReducedNotConverged`]; on a
+/// fit that did not converge every row is NaN, nothing is refitted, and a
+/// table note says why. The reduced model keeps every random slope: a slope
+/// on a column the reduced design leaves out or mixes reads that column's
+/// values as a random-effect-only column ([`crate::Data::re_columns`]).
 ///
 /// A term with no hypothesis row (its columns aliased) gets a NaN row with
 /// [`LinearNote::AliasedColumn`] for each of its aliased columns, in its
@@ -1448,30 +1541,44 @@ pub(crate) fn auto_choice(lowered: &Lowered, fit: &Fit) -> TestChoice {
 /// [`TermTest::Lrt`] on a fit with F rows, and
 /// [`TermTestError::RefitNodeCount`] when the rows are likelihood-ratio rows
 /// ([`TermTest::Lrt`], or [`TermTest::Auto`] on a Poisson model with random
-/// effects) and the fit's quadrature node count is not `lowered.opts.nagq`.
+/// effects) and the fit's quadrature node count is not that of the options
+/// the model was fitted with.
 pub fn term_tests(
-    lowered: &Lowered,
-    fit: &Fit,
+    model: &super::Model,
     opts: &TermTestOptions,
 ) -> Result<TermTable, TermTestError> {
-    term_tests_cached(lowered, fit, opts, &mut RefitCache::default())
+    term_tests_cached(
+        model.lowered(),
+        &model.opts,
+        model.fit(),
+        opts,
+        &mut RefitCache::default(),
+    )
 }
 
 /// Refits of column subsets of one fit's design, each keyed by its subset
 /// (caller columns of [`Lowered::x`], ascending), so the likelihood-ratio
 /// tables of one fit fit each subset once between them
 /// ([`term_tests_cached`]). A cache belongs to the `(lowered, fit)` pair it
-/// was filled for.
+/// was filled for, with its options.
 #[derive(Default)]
 pub(crate) struct RefitCache(Vec<(Vec<usize>, Fit)>);
 
-/// [`term_tests`], with the likelihood-ratio rows' refits of column subsets
-/// kept in `cache`: a caller that builds both types' likelihood-ratio tables
-/// of one fit passes one cache to both, and a Type III hypothesis that drops
-/// columns reads the Type II design with the same columns, built and fitted
-/// the same way. The rows are those of [`term_tests`] bit for bit.
+/// [`term_tests`] on `fit`, the fit of `lowered` made with `fit_opts`, with
+/// the likelihood-ratio rows' refits of column subsets kept in `cache`. The
+/// likelihood-ratio rows need `fit` made with `fit_opts` on
+/// `lowered.data()`: a fit made at another node count is refused
+/// ([`TermTestError::RefitNodeCount`]), and weights, an offset or a held
+/// dispersion cannot be read back from a [`Fit`], so a caller that fits with
+/// other ones gets rows that compare two different likelihoods.
+///
+/// A caller that builds both types' likelihood-ratio tables of one fit
+/// passes one cache to both, and a Type III hypothesis that drops columns
+/// reads the Type II design with the same columns, built and fitted the same
+/// way. The rows are those of [`term_tests`] bit for bit.
 pub(crate) fn term_tests_cached(
     lowered: &Lowered,
+    fit_opts: &FitOptions,
     fit: &Fit,
     opts: &TermTestOptions,
     cache: &mut RefitCache,
@@ -1503,14 +1610,14 @@ pub(crate) fn term_tests_cached(
             reason: ChoiceReason::Requested,
         },
     };
-    // The likelihood-ratio rows refit by `lowered.opts`: a fit made at another
+    // The likelihood-ratio rows refit by `fit_opts`: a fit made at another
     // node count would be compared with refits of another approximation.
     if choice.test == LinearKind::LikelihoodRatio {
         if let Some(nodes) = quadrature_nodes(fit.objective) {
-            if nodes != lowered.opts.nagq {
+            if nodes != fit_opts.nagq {
                 return Err(TermTestError::RefitNodeCount {
                     fit: nodes,
-                    refits: lowered.opts.nagq,
+                    refits: fit_opts.nagq,
                 });
             }
         }
@@ -1526,8 +1633,15 @@ pub(crate) fn term_tests_cached(
         SsType::Type2 => Vec::new(),
     };
     let tests: Vec<LinearTest> = if choice.test == LinearKind::LikelihoodRatio {
-        let (tests, lrt_notes) =
-            lrt_rows(lowered, fit, &retained, opts.ss_type, &hypotheses, cache);
+        let (tests, lrt_notes) = lrt_rows(
+            lowered,
+            fit_opts,
+            fit,
+            &retained,
+            opts.ss_type,
+            &hypotheses,
+            cache,
+        );
         notes.extend(lrt_notes);
         tests
     } else {
@@ -1564,13 +1678,13 @@ pub(crate) fn term_tests_cached(
 /// itself being `fit`.
 /// A term with no column left to test gets the NaN row of the Wald table with
 /// its aliased-column notes; a Type III hypothesis with a non-finite entry, a
-/// NaN row; a term whose reduced design would leave out or mix a random-slope
-/// column, its Wald row with [`LinearNote::RandomSlopeColumn`]; a basis that
-/// fails its check, a NaN row and the table note [`lrt_no_basis_note`]. A fit
-/// that did not converge gets NaN rows and the table note
-/// [`lrt_not_converged_note`], and nothing is refitted.
+/// NaN row; a basis that fails its check, a NaN row and the table note
+/// [`lrt_no_basis_note`]. Every refit keeps the model's random slopes
+/// ([`remap_all`]). A fit that did not converge gets NaN rows and the table
+/// note [`lrt_not_converged_note`], and nothing is refitted.
 fn lrt_rows(
     lowered: &Lowered,
+    fit_opts: &FitOptions,
     fit: &Fit,
     retained: &[usize],
     ss_type: SsType,
@@ -1585,11 +1699,6 @@ fn lrt_rows(
             false,
             DenDf::Residual,
         )
-    };
-    let slope_wald = |t: usize| {
-        let mut row = wald(t);
-        row.notes.push(LinearNote::RandomSlopeColumn);
-        row
     };
     // A term with no column left to test: the Wald table's NaN row (its
     // hypothesis has no row, so no covariance is read), with its notes.
@@ -1610,13 +1719,10 @@ fn lrt_rows(
             .collect();
         return (rows, vec![lrt_not_converged_note()]);
     }
-    let slopes = slope_lists(lowered);
     match ss_type {
         SsType::Type3 => {
+            let slopes = slope_lists(lowered);
             let exact = type3_unrounded(lowered, retained);
-            // The slope columns as positions in `retained`: an aliased one
-            // stays in no reduced design.
-            let on_retained = remap_all(&slopes, retained);
             let restrict =
                 |m: &Mat<f64>| Mat::from_fn(m.nrows(), retained.len(), |i, a| m[(i, retained[a])]);
             let mut notes = Vec::new();
@@ -1629,42 +1735,32 @@ fn lrt_rows(
                     if h.l.col_iter().any(|c| c.iter().any(|v| !v.is_finite())) {
                         return nan_lrt_row();
                     }
-                    let Some(retained_slopes) = &on_retained else {
-                        return slope_wald(t);
-                    };
-                    let flat: Vec<usize> = retained_slopes
-                        .iter()
-                        .flatten()
-                        .map(|&c| c as usize)
-                        .collect();
                     let l = restrict(&h.l);
-                    let basis =
-                        match type3_null_basis(l.as_ref(), restrict(&exact[t].l).as_ref(), &flat) {
-                            Ok(basis) => basis,
-                            Err(ReducedDesignError::SlopeTouched) => return slope_wald(t),
-                            Err(ReducedDesignError::NoNullBasis) => {
-                                notes.push(lrt_no_basis_note(&h.term));
-                                return nan_lrt_row();
-                            }
-                        };
+                    let basis = match type3_null_basis(l.as_ref(), restrict(&exact[t].l).as_ref()) {
+                        Ok(basis) => basis,
+                        Err(ReducedDesignError::NoNullBasis) => {
+                            notes.push(lrt_no_basis_note(&h.term));
+                            return nan_lrt_row();
+                        }
+                    };
                     let k = basis.ncols();
-                    let kept = untouched_columns(l.as_ref());
+                    // The caller columns of `N`'s leading unit columns.
+                    let kept: Vec<usize> = untouched_columns(l.as_ref())
+                        .iter()
+                        .map(|&a| retained[a])
+                        .collect();
                     if k == kept.len() {
                         // `N` is the unit columns of `kept`: a column drop,
                         // fitted as the Type II subset of the same columns.
-                        let set: Vec<usize> = kept.iter().map(|&a| retained[a]).collect();
-                        let set_slopes = remap_all(&slopes, &set)
-                            .expect("the basis keeps every slope column as a unit column");
-                        fit_subset(lowered, fit, retained, &set, &set_slopes, cache);
+                        fit_subset(lowered, fit_opts, fit, retained, &kept, cache);
                         return lrt_test(
                             fit,
-                            fitted(&set, retained, fit, cache),
+                            fitted(&kept, retained, fit, cache),
                             retained.len() - k,
                         );
                     }
-                    let moved = remap_all(retained_slopes, &kept)
-                        .expect("the basis keeps every slope column as a unit column");
-                    let reduced = refit_on_basis(lowered, fit, retained, &basis, &moved);
+                    let moved = remap_all(&slopes, &kept, k);
+                    let reduced = refit_on_basis(lowered, fit_opts, fit, retained, &basis, &moved);
                     lrt_test(fit, &reduced, retained.len() - k)
                 })
                 .collect();
@@ -1677,14 +1773,8 @@ fn lrt_rows(
                     rows.push(aliased(t));
                     continue;
                 }
-                let (Some(on_full), Some(on_reduced)) =
-                    (remap_all(&slopes, full), remap_all(&slopes, reduced))
-                else {
-                    rows.push(slope_wald(t));
-                    continue;
-                };
-                fit_subset(lowered, fit, retained, full, &on_full, cache);
-                fit_subset(lowered, fit, retained, reduced, &on_reduced, cache);
+                fit_subset(lowered, fit_opts, fit, retained, full, cache);
+                fit_subset(lowered, fit_opts, fit, retained, reduced, cache);
                 rows.push(lrt_test(
                     fitted(full, retained, fit, cache),
                     fitted(reduced, retained, fit, cache),
@@ -1699,14 +1789,13 @@ fn lrt_rows(
 /// Fits the column subset `set` of [`Lowered::x`] (caller columns,
 /// ascending) into `cache`, unless it is there already or is the retained
 /// design, whose fit is `fit`: the design of those columns as they are,
-/// warm-started from their `β̂`, its random slopes on `set_slopes` (positions
-/// in `set`).
+/// warm-started from their `β̂`, its random slopes moved by [`remap_all`].
 fn fit_subset(
     lowered: &Lowered,
+    fit_opts: &FitOptions,
     fit: &Fit,
     retained: &[usize],
     set: &[usize],
-    set_slopes: &[Vec<ColumnId>],
     cache: &mut RefitCache,
 ) {
     if set == retained || cache.0.iter().any(|(s, _)| s == set) {
@@ -1717,7 +1806,8 @@ fn fit_subset(
         .flat_map(|i| set.iter().map(move |&c| lowered.x[i * p + c]))
         .collect();
     let beta = set.iter().map(|&c| fit.beta[c]).collect();
-    let refitted = refit(lowered, fit, &x, set.len(), set_slopes, beta);
+    let moved = remap_all(&slope_lists(lowered), set, set.len());
+    let refitted = refit(lowered, fit_opts, fit, &x, set.len(), &moved, beta);
     cache.0.push((set.to_vec(), refitted));
 }
 
@@ -1777,14 +1867,16 @@ pub(super) fn lrt_test(larger: &Fit, smaller: &Fit, df: usize) -> LinearTest {
 
 /// The refit of a Type III likelihood-ratio row on `X·N`: the columns
 /// `retained` of `lowered`'s design times `basis` (`retained.len() × k`,
-/// [`type3_null_basis`]), its random slopes on `slopes` (positions among the
-/// `k` columns), warm-started from `Nᵀβ̂` ([`refit`]).
+/// [`type3_null_basis`]), its random slopes moved over the `k` columns and
+/// the random-effect-only columns they read ([`remap_all`]), warm-started
+/// from `Nᵀβ̂` ([`refit`]).
 pub(super) fn refit_on_basis(
     lowered: &Lowered,
+    fit_opts: &FitOptions,
     fit: &Fit,
     retained: &[usize],
     basis: &Mat<f64>,
-    slopes: &[Vec<ColumnId>],
+    moved: &MovedSlopes,
 ) -> Fit {
     let (n, p, k) = (lowered.n, lowered.p, basis.ncols());
     let combine = |v: &[f64], j: usize| -> f64 {
@@ -1801,53 +1893,69 @@ pub(super) fn refit_on_basis(
         })
         .collect();
     let beta = (0..k).map(|j| combine(&fit.beta, j)).collect();
-    refit(lowered, fit, &x, k, slopes, beta)
+    refit(lowered, fit_opts, fit, &x, k, moved, beta)
 }
 
 /// A refit of a likelihood-ratio row: `lowered`'s model on the design `x`
-/// (`n × k`, row-major), its random slopes on the columns `slopes`
-/// ([`slope_lists`]'s layout), by `lowered.opts`, the options
-/// [`term_tests`] requires `fit` to be made with (node count, weights,
-/// offset, held dispersion), warm-started from `beta`, the fit's θ̂
+/// (`n × k`, row-major), its random slopes on the columns of `x` and the
+/// random-effect-only columns of `moved` ([`remap_all`]), by `fit_opts`, the
+/// options [`term_tests`] requires `fit` to be made with (node count, held
+/// dispersion), and
+/// `lowered`'s weights and offset, warm-started from `beta`, the fit's θ̂
 /// ([`theta_start`]) and its estimated dispersion ([`dispersion_start`]),
 /// which the refit estimates again. Its standard errors are not computed.
+/// The inputs are the checked fit's with fewer columns, so the refit skips
+/// the entry's input check.
 fn refit(
     lowered: &Lowered,
+    fit_opts: &FitOptions,
     fit: &Fit,
     x: &[f64],
     k: usize,
-    slopes: &[Vec<ColumnId>],
+    (slopes, sources): &MovedSlopes,
     beta: Vec<f64>,
 ) -> Fit {
     let mut model = lowered.model.clone();
     if let Some(re) = &mut model.re {
         let mut lists = slopes.iter().cloned();
         re.slopes = lists.next().expect("one slope list per grouping");
+        set_term_slopes(&mut re.terms, &re.slopes);
         for g in &mut re.extra_groupings {
             g.slopes = lists.next().expect("one slope list per grouping");
+            set_term_slopes(&mut g.terms, &g.slopes);
         }
     }
     // Only the log-likelihood is read: no SE targets and the Rx covariance,
     // so a GLMM refit skips the joint Hessian (the optimum does not depend on
     // the curvature read after it).
-    let mut opts = lowered.opts.clone();
-    opts.target_indices = Vec::new();
+    let mut opts = fit_opts.clone();
+    opts.se_for = SeFor::Only(vec![]);
     opts.wald_se = WaldSe::Rx;
     let start = StartValues {
         beta,
         theta: theta_start(fit),
-        dispersion: dispersion_start(lowered, fit),
+        dispersion: dispersion_start(lowered, fit_opts, fit),
     };
-    fit_warm(
-        x,
-        &lowered.y,
-        lowered.n,
-        k,
-        &model,
-        &lowered.ids,
-        Some(&start),
-        &opts,
-    )
+    let (n, p, re_p) = (lowered.n, lowered.p, lowered.re_p);
+    let z: Vec<f64> = (0..n)
+        .flat_map(|i| {
+            sources.iter().map(move |&c| match c.checked_sub(p) {
+                None => lowered.x[i * p + c],
+                Some(j) => lowered.re_columns[i * re_p + j],
+            })
+        })
+        .collect();
+    let full = lowered.data();
+    let data = Data {
+        design: Design {
+            x,
+            p: k,
+            ..full.design
+        },
+        ..full
+    }
+    .re_columns(&z, sources.len());
+    crate::fit::fit_checked(&data, &model, Some(&start), &opts)
 }
 
 /// Every grouping's random-slope columns in `lowered`'s model: the primary
@@ -1864,10 +1972,21 @@ fn slope_lists(lowered: &Lowered) -> Vec<Vec<ColumnId>> {
         .collect()
 }
 
-/// [`remap_slopes`] on each list of `slopes`: `None` when a slope column is
-/// not in `kept`.
-fn remap_all(slopes: &[Vec<ColumnId>], kept: &[usize]) -> Option<Vec<Vec<ColumnId>>> {
-    slopes.iter().map(|s| remap_slopes(s, kept).ok()).collect()
+/// A refit's random slopes ([`slope_lists`]'s layout) and the
+/// random-effect-only columns they read past the refit's `k` design columns,
+/// each as its column of the full model's `[X | Z_r]` ([`remap_slopes`]).
+type MovedSlopes = (Vec<Vec<ColumnId>>, Vec<usize>);
+
+/// [`remap_slopes`] on each list of `slopes` for a reduced design of `k`
+/// columns led by `kept`, the random-effect-only columns shared between the
+/// lists.
+fn remap_all(slopes: &[Vec<ColumnId>], kept: &[usize], k: usize) -> MovedSlopes {
+    let mut sources = Vec::new();
+    let moved = slopes
+        .iter()
+        .map(|s| remap_slopes(s, kept, k, &mut sources))
+        .collect();
+    (moved, sources)
 }
 
 /// `fit`'s θ̂ as a warm start ([`StartValues::theta`]): each `varcorr` block
@@ -1909,8 +2028,8 @@ pub(super) fn theta_start(fit: &Fit) -> Vec<f64> {
 /// ([`StartValues::dispersion`]): the negative binomial θ, or the Gamma or
 /// inverse Gaussian φ when the fit estimated it. `None`, a cold start, when
 /// the family has none, φ is held, or the value is not finite and positive.
-fn dispersion_start(lowered: &Lowered, fit: &Fit) -> Option<f64> {
-    let estimated = lowered.opts.dispersion.is_none()
+fn dispersion_start(lowered: &Lowered, fit_opts: &FitOptions, fit: &Fit) -> Option<f64> {
+    let estimated = fit_opts.dispersion.is_none()
         && matches!(
             lowered.model.family,
             Family::NegativeBinomial { .. } | Family::Gamma { .. } | Family::InverseGaussian { .. }

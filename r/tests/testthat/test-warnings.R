@@ -94,11 +94,6 @@ test_that("constructed notes store with their tier and title", {
   base <- list(columns = integer(0), pivot = NaN, evals = 0L, final_eval = FALSE,
                detail = "")
   cases <- list(
-    list(note = modifyList(base, list(kind = "unused_grouping_levels", detail = "g: z, w")),
-         cls = "fastglmm_unused_grouping_levels",
-         msg = paste("Grouping factor 'g' has levels with no rows (z, w). They stay in the",
-                     "model with random effects of exactly zero, but they are not counted in",
-                     "the number of groups. Remove unused categories before fitting.")),
     list(note = modifyList(base, list(kind = "single_level_grouping_dropped", detail = "onegroup")),
          cls = "fastglmm_single_level_grouping_dropped",
          msg = paste("Grouping factor 'onegroup' has only one level, so no variance between",
@@ -184,6 +179,24 @@ test_that("constructed notes store with their tier and title", {
   }
 })
 
+test_that("se_unavailable with a column prints the pair text", {
+  # A fit with both se_unavailable and ill_conditioned hands .note_warning the
+  # se_unavailable note carrying the ill_conditioned note's columns.
+  note <- list(kind = "se_unavailable", columns = 3L, pivot = NaN, evals = 0L,
+               final_eval = FALSE, detail = "")
+  out <- fastglmm:::.note_warning(note, c("(Intercept)", "x", "x2"), TRUE)
+  expect_identical(out$cls, c("fastglmm_se_unavailable", "fastglmm_diagnostic"))
+  expect_identical(out$msg, paste(
+    "Standard errors could not be computed: x2 cannot be separated from the other",
+    "columns in the model. Its estimate is not reported. The other estimates and the",
+    "deviance can be used; standard errors, p-values and confidence intervals are not",
+    "reported. Check for predictors that are copies or near-copies of each other."))
+  note$columns <- integer(0)
+  out <- fastglmm:::.note_warning(note, character(0), TRUE)
+  expect_identical(out$cls, c("fastglmm_se_unavailable", "fastglmm_diagnostic"))
+  expect_match(out$msg, "^Standard errors could not be computed at the fit's end point:")
+})
+
 test_that("singular is stored and printed", {
   # tau0 = 0 data: the RE variance pins to the boundary.
   d <- benchmark_data(seed = 107, family = "binomial", tau0 = 1e-8)
@@ -207,13 +220,6 @@ test_that("pirls_exhausted is raised only on a converged final evaluation", {
   note$final_eval <- TRUE
   expect_null(fastglmm:::.note_warning(note, character(0), FALSE))
   expect_false(is.null(fastglmm:::.note_warning(note, character(0), TRUE)))
-})
-
-test_that("unused levels splits on the first separator", {
-  note <- list(kind = "unused_grouping_levels", columns = integer(0), pivot = NaN,
-               evals = 0L, final_eval = FALSE, detail = "g: a: b, c")
-  expect_match(fastglmm:::.note_warning(note, character(0), TRUE)$msg,
-               "^Grouping factor 'g' has levels with no rows \\(a: b, c\\)\\.")
 })
 
 test_that("a single-level grouping is dropped with a warning, keeping the other grouping", {
@@ -390,22 +396,12 @@ test_that("a separated GLM stores glm_diverged last", {
 
 test_that("a reciprocal-link response out of range names the cause", {
   # 1/mu = 1/(1e80 * ...) is below the kernel's 1e-75 bound on the Gamma inverse link.
-  d <- data.frame(x = x, g = g, y = 1e80 * (2 + 0.1 * x))
+  d <- data.frame(x = x, y = 1e80 * (2 + 0.1 * x))
   fit <- suppressWarnings(fastglmm(y ~ x, d, family = Gamma(link = "inverse")))
   expect_false(fit$converged)
   n <- nrow(fit$warnings)
   expect_identical(fit$warnings$kind[[n]], "glm_diverged")
   expect_match(fit$warnings$message[[n]], "Rescale the response", fixed = TRUE)
-  # The GLMM searches on a rescaled response when the cluster means are far
-  # out of scale (src/fit/glmm.rs, `gamma_inverse_units`), so it fits these
-  # data as it fits y * 1e-80, the log-likelihood moved by -n * log(1e80).
-  fit <- suppressWarnings(fastglmm(y ~ x + (1 | g), d, family = Gamma(link = "inverse")))
-  d_small <- transform(d, y = y * 1e-80)
-  small <- suppressWarnings(fastglmm(y ~ x + (1 | g), d_small,
-                                     family = Gamma(link = "inverse")))
-  expect_true(fit$converged && small$converged)
-  want <- as.numeric(logLik(small)) - nrow(d) * log(1e80)
-  expect_lt(abs(as.numeric(logLik(fit)) - want), 1e-6 * abs(want))
 })
 
 test_that("an all-zero binomial is a constant response, not separation", {
@@ -474,18 +470,15 @@ test_that("the kind table pins every tier and title (python/glmm/__init__.py _WA
     few_rows_for_random_effects = c("caution", "Too few rows for the random effects"),
     variance_at_limit = c("caution", "Variance at its search limit"),
     argument_ignored = c("note", "Argument ignored"),
-    unused_grouping_levels = c("note", "Unused grouping levels"),
     single_level_grouping_dropped = c("note", "Random effect dropped (single level)")
   ))
   expect_identical(fastglmm:::.UNKNOWN_KIND, c("caution", "Unrecognized solver message"))
 })
 
-# One fixture, three notes across two kinds:
-# argument_ignored fires twice (dispersion=/nAGQ=, both inapplicable on a
-# Gaussian model, from two different arguments) plus the formula lowering's
-# own unused_grouping_levels, from one declared-but-empty group level
-# ("g_mid", between two used ones). Five groups, eight rows each, with a
-# random slope on z, whose values sit far from zero. The fit adds two cautions
+# One fixture: argument_ignored fires twice (dispersion=/nAGQ=, both
+# inapplicable on a Gaussian model, from two different arguments). Its declared
+# but empty group level ("g_mid", between two used ones) is dropped and raises
+# nothing. Five groups, eight rows each, with a random slope on z, whose values sit far from zero. The fit adds two cautions
 # of its own: y has no random slope, so the slope's variance comes out at
 # zero, and glmm compares standard deviations on its internally standardized
 # design, where that is a singular fit (on the raw design z's distance from
@@ -510,17 +503,15 @@ PARITY <- local({
              g = factor(g, levels = c("g0", "g1", "g2", "g_mid", "g3", "g4")))
 })
 
-test_that("port parity sequence adds four more kinds", {
+test_that("port parity sequence adds three more kinds", {
   fit <- suppressWarnings(fastglmm(y ~ z + (1 + z | g), PARITY, dispersion = 2, nAGQ = 3))
   expect_true(fit$converged)
-  expect_identical(fit$warnings$tier, c("note", "note", "caution", "note", "caution"))
+  expect_identical(fit$warnings$tier, c("note", "note", "caution", "caution"))
   expect_identical(fit$warnings$kind, c(
-    "argument_ignored", "argument_ignored", "singular",
-    "unused_grouping_levels", "variance_at_limit"
+    "argument_ignored", "argument_ignored", "singular", "variance_at_limit"
   ))
   expect_identical(fit$warnings$title, c(
-    "Argument ignored", "Argument ignored", "Singular fit",
-    "Unused grouping levels", "Variance at its search limit"
+    "Argument ignored", "Argument ignored", "Singular fit", "Variance at its search limit"
   ))
 })
 

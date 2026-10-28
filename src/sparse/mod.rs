@@ -16,7 +16,7 @@
 // structured crossed-Schur path (`glmm/pirls/blocked_extras.rs`) and the LMM
 // sparse-tail branch (`SparseTail`); the small-e LMM eval loop stays
 // faer-sparse-free (blocked kernel with the dense tail).
-use crate::lmm::{Criterion, LmmGroupings};
+use crate::lmm::{slope_value, Criterion, LmmGroupings};
 use faer::dyn_stack::{MemBuffer, MemStack};
 use faer::linalg::cholesky::llt::factor::{
     cholesky_in_place, cholesky_in_place_scratch, LltRegularization,
@@ -435,16 +435,18 @@ impl SparseLmmWorkspace {
     /// Accumulate the θ-independent Grams (`Z'Z`, `Z'[X y]`, `[X y]'[X y]`) in
     /// one pass over the rows and size every blocked-kernel buffer — all
     /// allocations happen here; the eval loop allocates nothing.
-    /// `sqrt_w`: `Some(√wᵢ)` per row (prior/precision weights, `FitOptions::weights`
+    /// `sqrt_w`: `Some(√wᵢ)` per row (prior/precision weights, `Data::weights`
     /// square-rooted once by the caller) — threaded into both the z-emission
     /// (`for_each_z_entry`) and pass 2's raw x/y reads below, so every packed
     /// Gram ends up carrying exactly `wᵢ` per row (see `for_each_z_entry`'s
     /// doc). `None` is the unit-weight fast path (no per-row multiply).
     /// `criterion`: the one the deviance evaluates, frozen with the workspace.
-    #[allow(clippy::too_many_arguments)] // marshals (g, x, cluster_ids, extra_ids, y, n, p, sqrt_w, criterion)
+    /// `z`: the `n × s` random-effect-only columns a slope index `≥ p` reads.
+    #[allow(clippy::too_many_arguments)] // marshals (g, x, z, cluster_ids, extra_ids, y, n, p, sqrt_w, criterion)
     pub(crate) fn new(
         g: &LmmGroupings,
         x: MatRef<f64>,
+        z: MatRef<f64>,
         cluster_ids: &[u32],
         extra_ids: &[Vec<u32>],
         y: &[f64],
@@ -697,7 +699,7 @@ impl SparseLmmWorkspace {
             row: Vec::with_capacity(q_p + g.extra_q.iter().sum::<usize>()),
             criterion,
         };
-        ws.fill_values(x, cluster_ids, extra_ids, y, sqrt_w);
+        ws.fill_values(x, z, cluster_ids, extra_ids, y, sqrt_w);
         ws
     }
 
@@ -710,6 +712,7 @@ impl SparseLmmWorkspace {
     pub(crate) fn fill_values(
         &mut self,
         x: MatRef<f64>,
+        z: MatRef<f64>,
         cluster_ids: &[u32],
         extra_ids: &[Vec<u32>],
         y: &[f64],
@@ -777,7 +780,7 @@ impl SparseLmmWorkspace {
             // top-level doc).
             let sw = sqrt_w.map_or(1.0, |w| w[i]);
             row.clear();
-            for_each_z_entry(g, x, cluster_ids, extra_ids, i, sqrt_w, |col, v| {
+            for_each_z_entry(g, x, z, p, cluster_ids, extra_ids, i, sqrt_w, |col, v| {
                 row.push((col, v))
             });
             for (j, xj) in xt.iter_mut().enumerate() {
@@ -1140,11 +1143,16 @@ fn build_sparse_tail(
 /// depends on — its own raw x/y reads carry a matching `√wᵢ` factor (see
 /// `SparseLmmWorkspace::new`), so every product of two z entries, or of a z
 /// entry with an x/y read, ends up carrying exactly `wᵢ` (mirrors
-/// `add_rows_multi`'s `zw`-per-side scheme, `src/lmm/kernel.rs`).
+/// `add_rows_multi`'s `zw`-per-side scheme, `src/lmm/kernel.rs`). A slope
+/// value comes from `x` (`n × p`) or the random-effect-only columns `z`
+/// ([`crate::lmm::slope_value`]).
 #[inline]
+#[allow(clippy::too_many_arguments)] // marshals (g, x, z, p, ids, i, sqrt_w, emit)
 fn for_each_z_entry(
     g: &LmmGroupings,
     x: MatRef<f64>,
+    z: MatRef<f64>,
+    p: usize,
     cluster_ids: &[u32],
     extra_ids: &[Vec<u32>],
     i: usize,
@@ -1156,7 +1164,7 @@ fn for_each_z_entry(
     // Slope-major primary layout — mirrors add_rows_multi's scatter (change together).
     emit(f, sw);
     for (k, &col) in g.primary_slope_cols.iter().enumerate() {
-        emit((k + 1) * g.n_primary + f, sw * x[(i, col)]);
+        emit((k + 1) * g.n_primary + f, sw * slope_value(x, z, p, i, col));
     }
     // Extra groupings: intercept at off, slope c at off+1+c.
     for (e, ids_e) in extra_ids.iter().enumerate() {
@@ -1164,7 +1172,7 @@ fn for_each_z_entry(
         let off = g.extra_offsets[e] + ids_e[i] as usize * q_g;
         emit(off, sw);
         for (c, &col) in g.extra_slope_cols[e].iter().enumerate() {
-            emit(off + 1 + c, sw * x[(i, col)]);
+            emit(off + 1 + c, sw * slope_value(x, z, p, i, col));
         }
     }
 }

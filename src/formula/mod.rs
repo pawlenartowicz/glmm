@@ -1,9 +1,9 @@
 //! R-style formula frontend for the `glmm` kernel.
 //!
 //! Turns `"y ~ x1 * x2 + (1 + x1 | g)"` **plus a data table** into the numeric
-//! inputs [`crate::fit_cold`] consumes — a row-major design matrix, a structure-only
-//! [`crate::ModelSpec`], per-row [`crate::GroupIds`], and a defaulted
-//! [`crate::FitOptions`]. Two stages, cut on whether data is needed:
+//! inputs [`crate::fit`] consumes — a row-major design matrix, a structure-only
+//! [`crate::ModelSpec`], per-row [`crate::GroupIds`], and the weights and offset
+//! the formula carries. Two stages, cut on whether data is needed:
 //!
 //! - [`parse`] is pure and data-free: string → [`ParsedFormula`] (the AST). `*` is
 //!   already desugared into main effects + interactions here, `A/B` into a nesting
@@ -12,7 +12,8 @@
 //!   builds the numeric design, assigns column ids, finalizes the `ModelSpec`, and
 //!   builds `GroupIds`.
 //!
-//! [`lower`] runs both in one call:
+//! [`lower`] runs both in one call, and [`fit()`] lowers and fits in one
+//! call, returning a [`Model`]:
 //! ```
 //! # use glmm::formula::{Column, Table};
 //! # use glmm::Family;
@@ -28,9 +29,9 @@
 //! #     ],
 //! #     n: 8,
 //! # };
-//! let lo = glmm::formula::lower("y ~ x*z + (1|g)", &table, Family::Gaussian)?;
-//! let fit = glmm::fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
-//! # let _ = fit;
+//! let opts = glmm::FitOptions::default();
+//! let model = glmm::formula::fit("y ~ x*z + (1|g)", &table, Family::Gaussian, &opts)?;
+//! assert_eq!(model.fit().beta.len(), model.lowered().p);
 //! # Ok(())
 //! # }
 //! ```
@@ -46,23 +47,33 @@ mod error;
 mod fixed_part;
 pub(crate) mod hypotheses;
 mod materialize;
+pub mod pairwise;
 mod parse;
 
 #[cfg(all(test, feature = "oracle-tests"))]
 mod hypotheses_oracle_tests;
 #[cfg(test)]
 pub(crate) mod hypotheses_tests;
+#[cfg(all(test, feature = "oracle-tests"))]
+mod predict_oracle_tests;
+#[cfg(test)]
+mod predict_tests;
 
 pub use error::{Error, ParseError};
 // Crate-private: the nesting check of `anova::nesting` and
 // `orchestrate::same_fixed_part` call it.
 pub(crate) use fixed_part::{fixed_part_relation, FixedPartRelation};
 // Crate-private: `orchestrate::run_model_matrix`,
-// `orchestrate::model_matrix_columns` and `orchestrate::term_labels` call them.
+// `orchestrate::model_matrix_columns`, `orchestrate::term_labels` and
+// `orchestrate::predict` call them.
 #[cfg(feature = "orchestrate")]
-pub(crate) use materialize::{design_columns, fixed_design, r_terms};
+pub(crate) use materialize::{design_columns, fixed_design, lower_new, r_terms};
 pub use materialize::{
-    label_ranef, lower, materialize, numeric_only_columns, referenced_columns, unresolved_columns,
-    Column, FixedTerm, Lowered, RanefBlock, ReGroupInfo, Table,
+    fit, fit_lowered, label_ranef, lower, materialize, numeric_only_columns, predict,
+    referenced_columns, unresolved_columns, Column, FixedTerm, Lowered, Model, RanefBlock,
+    ReGroupInfo, Table,
+};
+pub use pairwise::{
+    pairwise, Adjust, By, Pairwise, PairwiseInterval, PairwiseIntervals, PairwiseRow, RatioKind,
 };
 pub use parse::{parse, ParsedFormula, RandomEffect, Term};

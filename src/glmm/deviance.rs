@@ -685,7 +685,7 @@ pub(crate) fn glmm_laplace_deviance(
     n: usize,
 ) -> f64 {
     ws.params[..params.len()].copy_from_slice(params);
-    fill_z_f64(&ws.groupings, x, &mut ws.z_buf, n);
+    fill_z_f64(&ws.groupings, x, x.subcols(0, 0), &mut ws.z_buf, n);
     let mut counters = crate::counters::EvalCounters::new();
     laplace_deviance_at(ws, x, y, cluster_ids, extra_ids, n, &mut counters)
 }

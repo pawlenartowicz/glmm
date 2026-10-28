@@ -6,7 +6,7 @@
 use std::io::Write;
 use std::time::Instant;
 
-use glmm::fit_cold;
+use glmm::FitOptions;
 use serde_json::{json, Value};
 
 #[path = "../../tools/common.rs"]
@@ -128,7 +128,7 @@ fn config_tag(lo: &glmm::formula::Lowered, gaussian: bool, user_tag: &str) -> St
                 .extra_groupings
                 .iter()
                 .enumerate()
-                .filter(|(_, g)| matches!(g.relation, glmm::GroupingRelation::Crossed { .. }))
+                .filter(|(_, g)| matches!(g.relation, glmm::GroupingRelation::Crossed))
                 .map(|(g, _)| {
                     lo.ids.extra[g]
                         .iter()
@@ -191,16 +191,15 @@ fn fit_cell(cell: &Value, user_tag: &str, budget: f64) -> Value {
     // Lower first (own catch_unwind: a lowering panic is engine-fail with no
     // site to report), so config_tag can read the lowered relations/ids.
     let t_lower = Instant::now();
-    let mut lowered =
+    let lowered =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lower_grid_cell(cell, DIR)));
     let lower_seconds = t_lower.elapsed().as_secs_f64();
     // Diligent manifests stamp `nagq` on the 33 AGQ-eligible cells (spec Part 6);
     // absent on every other cell (shipped/eval-efficiency manifests included),
     // where this is a no-op leaving `FitOptions::nagq`'s default (1 = Laplace).
-    if let Ok((lo, ..)) = &mut lowered {
-        if let Some(k) = cell["nagq"].as_u64() {
-            lo.opts.nagq = k as u8;
-        }
+    let mut fit_opts = FitOptions::default();
+    if let Some(k) = cell["nagq"].as_u64() {
+        fit_opts.nagq = k as u8;
     }
     let (result, wall_seconds): (Option<glmm::Fit>, f64) = match &lowered {
         Ok((lo, gaussian, _)) => {
@@ -208,7 +207,7 @@ fn fit_cell(cell: &Value, user_tag: &str, budget: f64) -> Value {
             let one_fit = || -> (Option<glmm::Fit>, f64) {
                 let t_fit = Instant::now();
                 let f = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts)
+                    glmm::fit(&lo.data(), lo.spec(), &fit_opts).unwrap()
                 }))
                 .ok();
                 let wall = t_fit.elapsed().as_secs_f64();

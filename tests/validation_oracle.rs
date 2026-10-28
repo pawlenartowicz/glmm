@@ -1,9 +1,9 @@
 //! Tier 2 — the cross-engine tier.
 //!
 //! Asserts the crate against the frozen lme4 / MASS / GLMMadaptive / glmmTMB references
-//! at `validation/grid/tol.R`'s agreement bands: 61 goldens in `validation/goldens/` plus
+//! at `validation/grid/tol.R`'s agreement bands: 83 goldens in `validation/goldens/` plus
 //! the weights tier (rungs 29-43) in `validation/results/lme4_simulated/`. Reads frozen
-//! JSON, so it needs neither R nor Julia at runtime — but it refits all 76, so
+//! JSON, so it needs neither R nor Julia at runtime — but it refits all 98, so
 //! it is off by default:
 //!
 //! ```sh
@@ -28,37 +28,11 @@ use oracle_support::{
 };
 use serde_json::Value;
 
-/// The exactly-six GLMMadaptive vector-RE-AGQ goldens that carry no `loglik` —
-/// the deviance gate's only loud exclusions (`DEV-NA` in
-/// `goldens_agree_with_the_references`). Pinned by name so a golden losing its
-/// `loglik` (or one of these six regaining it) changes this test, not a corpus
-/// count that could silently drift.
-#[test]
-fn dev_align_none_matches_the_six_vector_agq_goldens() {
-    let expect_none = [
-        "sim_binomial_slope1_agq_k7",
-        "sim_binomial_slope1_agq_k11",
-        "sim_binomial_slope2_agq_k7",
-        "sim_binomial_slope2_agq_k11",
-        "sim_poisson_slope1_agq_k7",
-        "sim_poisson_slope1_agq_k11",
-    ];
-    for (g, _) in corpus() {
-        let is_none = oracle_support::dev_align::aligned_dev(&g).is_none();
-        assert_eq!(
-            is_none,
-            expect_none.contains(&g.name.as_str()),
-            "{}: aligned_dev None-ness disagrees with the pinned set of six",
-            g.name
-        );
-    }
-}
-
 /// The goldens whose reference maximises a different objective from glmm's
-/// (`objective_differs`), pinned by name as the six above are, and each with a
-/// twin in the corpus — glmmTMB (`_tmb`) for the lme4 GLMMs, the ML-dispersion
-/// GLM (`_ml`) for the `stats::glm` Gamma GLMs — since the twin is what gates
-/// glmm's deviance on that data and model.
+/// (`objective_differs`), pinned by name, and each with a twin in the corpus —
+/// glmmTMB (`_tmb`) for the lme4 GLMMs, the ML-dispersion GLM (`_ml`) for the
+/// `stats::glm` Gamma GLMs — since the twin is what gates glmm's deviance on
+/// that data and model.
 #[test]
 fn objective_differs_matches_the_pinned_goldens() {
     let expect = [
@@ -110,8 +84,9 @@ fn objective_differs_matches_the_pinned_goldens() {
 /// integrand at the mode, so its logLik is a different function of the
 /// parameters; on Gamma it also plugs in its `pwrss/n` scale instead of
 /// maximising over φ. glmm maximises the Laplace approximation itself, and gates
-/// its deviance against the glmmTMB twin of each such golden. The parameters
-/// are still compared, and their differences are registered divergences.
+/// its deviance and its parameters against the glmmTMB twin of each such golden
+/// (`params_on_twin`): parameters at another objective's optimum say nothing
+/// about glmm's fit.
 ///
 /// `stats::glm`'s Gamma logLik plugs in `D/Σw` for φ; glmm's is maximised at
 /// the ML φ̂, and is gated against the `_ml` twin (same β, ML φ̂ as `dispersion`;
@@ -213,6 +188,8 @@ fn m3_corpus() -> Vec<(Golden, Vec<String>)> {
             let mut golden: Golden =
                 serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{name}: {e}"));
             golden.source = path;
+            golden.reml = s["reml"].as_bool();
+            golden.glmm_formula = s["glmm_formula"].as_str().map(str::to_string);
             (golden, factors_of(s))
         })
         .collect()
@@ -337,6 +314,16 @@ fn asserted_fields(shape: &Shape, g: &Golden) -> Vec<&'static str> {
     if g.estimates.dispersion.is_some() {
         f.push("dispersion");
     }
+    // lme4 fits (1 + Machine || Worker) as (1 | Worker) + (0 + Machine | Worker):
+    // one grouping of width 4, whose intercept variance is not identified because
+    // the intercept lies in the span of the full Machine dummies. glmm fits a
+    // factor `||` as one unstructured (1 + f | g) block, of width 3 here. The
+    // widths differ, so goldens_agq.R writes no varcomp for this row (manifest
+    // `"varcomp": false`) and only the deviance and β are compared. Keyed on the
+    // name, not on absence, so any other golden that loses its varcomp still fails.
+    if g.name == "machines_factor_uncorr_lmm" {
+        f.retain(|k| *k != "varcomp");
+    }
     f.retain(|k| !excused(g, k));
     f
 }
@@ -361,7 +348,34 @@ fn unasserted_fields(g: &Golden) -> Vec<(&'static str, &'static str)> {
              the twin instead, and the exclusion prints as DEV-OBJ.",
         ));
     }
+    if params_on_twin(g) {
+        let e = &g.estimates;
+        for (field, present) in [
+            ("beta", true),
+            ("se_hessian", e.se_hessian.is_some()),
+            ("se_rx", e.se_rx.is_some()),
+            ("theta", e.theta.is_some()),
+            ("varcomp", e.varcomp.is_some()),
+        ] {
+            if present && !out.iter().any(|(f, _)| *f == field) {
+                out.push((
+                    field,
+                    "lme4's estimates sit at the optimum of a different objective \
+                     (objective_differs); glmm's parameters are gated on the glmmTMB \
+                     `_tmb` twin, which maximises glmm's.",
+                ));
+            }
+        }
+    }
     out
+}
+
+/// An lme4 GLMM golden on a different objective (`objective_differs`): its
+/// convergence and singularity flags are still compared, its deviance and its
+/// parameters only on the glmmTMB `_tmb` twin, pinned by
+/// `objective_differs_matches_the_pinned_goldens`.
+fn params_on_twin(g: &Golden) -> bool {
+    g.kind == "glmm" && g.engine.starts_with("lme4::") && objective_differs(g).is_some()
 }
 
 /// The per-convention half of [`unasserted_fields`].
@@ -545,7 +559,7 @@ fn golden_fields_are_all_asserted() {
 /// field, so it localises the same way.
 #[test]
 fn goldens_agree_with_the_references() {
-    // 46 `m3_goldens` + 15 prior-weights rungs. Pinned because a loader that
+    // 83 `m3_goldens` + 15 prior-weights rungs. Pinned because a loader that
     // silently returns fewer — a renamed results directory, a manifest key that
     // moved — would leave this test green while asserting nothing, which is the
     // failure mode the whole tier is built against.
@@ -572,8 +586,10 @@ fn goldens_agree_with_the_references() {
     // directory; the 15 is asserted inside `corpus()` itself. 73 -> 76 on
     // 2026-09-24: the three `_ml` twins of the `stats::glm` Gamma GLM goldens
     // joined when glmm's Gamma GLM moved to the ML dispersion, and the 58 became
-    // 61.
-    assert_eq!(corpus().len(), 76, "the cross-engine corpus changed size");
+    // 61. 76 -> 98 on 2026-10-22: the 22 goldens of uncorrelated and
+    // intercept-free random effects (`||`, `zerocorr`, `(0 + x | g)`, several
+    // terms on one grouping) were frozen, and the 61 became 83.
+    assert_eq!(corpus().len(), 98, "the cross-engine corpus changed size");
     for (g, factors) in corpus() {
         let shape = shape_of(&g);
         let factor_refs: Vec<&str> = factors.iter().map(String::as_str).collect();
@@ -592,6 +608,10 @@ fn goldens_agree_with_the_references() {
             "{name}: singularity flag disagrees with the oracle"
         );
         if !g.converged {
+            continue;
+        }
+        if params_on_twin(&g) {
+            eprintln!("PARAMS-ON-TWIN {name}: parameters and deviance gated on `{name}_tmb`");
             continue;
         }
 
@@ -701,11 +721,11 @@ fn goldens_agree_with_the_references() {
         // much WORSE than the reference glmm may be. A golden with no `loglik` at
         // all (the six GLMMadaptive vector-RE-AGQ rungs, `Shape::VectorAgq`,
         // which never report one) has no deviance to gate — printed loudly
-        // rather than silently skipped, and `dev_align_none_matches_the_six_
-        // vector_agq_goldens` below pins that this set of six can never grow
-        // quietly. A golden whose engine maximises a different objective
-        // (`objective_differs`) is the other loud exclusion, pinned the same way
-        // by `objective_differs_matches_the_pinned_goldens`.
+        // rather than silently skipped, and refused on any other shape, so the
+        // gate cannot empty out through a golden or an `aligned_dev` that loses
+        // its loglik. A golden whose engine maximises a
+        // different objective (`objective_differs`) is the other loud exclusion,
+        // pinned by name in `objective_differs_matches_the_pinned_goldens`.
         match (
             objective_differs(&g),
             oracle_support::dev_align::aligned_dev(&g),
@@ -714,6 +734,10 @@ fn goldens_agree_with_the_references() {
                 eprintln!("DEV-OBJ {name}: {why}")
             }
             (None, None) => {
+                assert!(
+                    shape == Shape::VectorAgq,
+                    "{name}: no aligned deviance outside the vector-RE AGQ goldens"
+                );
                 eprintln!("DEV-NA {name}: golden carries no loglik — parameter sanity only")
             }
             (None, Some(dev_ref)) => {
@@ -751,6 +775,12 @@ fn goldens_agree_with_the_references() {
                 if let Some(want_corr) = &block.corr {
                     for a in 0..sds.len() {
                         for b in (a + 1)..sds.len() {
+                            // A correlation with a member whose stddev is
+                            // exactly 0 is undefined (glmm reports 0/0 = NaN),
+                            // whatever the reference wrote for it.
+                            if sds[a] == 0.0 || sds[b] == 0.0 {
+                                continue;
+                            }
                             assert_abs(
                                 corr[a][b],
                                 want_corr[a][b],

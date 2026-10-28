@@ -1,9 +1,13 @@
 //! The p-value tails and quantile wrappers against R's `pt`, `pf`, `pchisq`,
 //! `qt` and `qnorm`, frozen in `tests/fixtures/tail_values.json` by
 //! `tests/fixtures/gen_tail_values.R`, plus the NaN, `≤ 0`, infinite and
-//! endpoint rules, which the fixture does not cover.
+//! endpoint rules, which the fixture does not cover. The studentized range
+//! is checked against its exact two-mean identity instead.
 
-use super::{chisq_upper_p, f_upper_p, normal_quantile, t_quantile, t_two_sided_p};
+use super::{
+    chisq_upper_p, f_upper_p, normal_quantile, t_quantile, t_two_sided_p, tukey_quantile,
+    tukey_upper_p,
+};
 use serde::Deserialize;
 
 /// Relative band against the frozen R values. The fixture stores 15
@@ -149,4 +153,61 @@ fn quantile_domain_and_endpoints() {
     assert_eq!(t_quantile(1.0, 3.0), f64::INFINITY);
     assert_eq!(normal_quantile(0.0), f64::NEG_INFINITY);
     assert_eq!(normal_quantile(1.0), f64::INFINITY);
+}
+
+/// With two means the studentized range is the two-sided t test,
+/// `P(Q_{2,df} > √2·|t|) = 2·P(T_df > |t|)`, exactly; at df = ∞ the z test
+/// (the χ²₁ tail of `t²`). A NaN argument, `k ≤ 1` or `df ≤ 0` gives NaN.
+#[test]
+fn tukey_upper_p_two_means_is_the_t_test() {
+    for t in [0.5, 2.5, 6.0] {
+        let q = std::f64::consts::SQRT_2 * t;
+        for df in [5.0, 30.0] {
+            let want = t_two_sided_p(t, df);
+            let got = tukey_upper_p(q, 2.0, df);
+            assert!(
+                ((got - want) / want).abs() <= REL,
+                "tukey_upper_p({q}, 2, {df}) = {got:e}, t test {want:e}"
+            );
+        }
+        let want = chisq_upper_p(t * t, 1.0);
+        let got = tukey_upper_p(q, 2.0, f64::INFINITY);
+        assert!(
+            ((got - want) / want).abs() <= REL,
+            "tukey_upper_p({q}, 2, inf) = {got:e}, z test {want:e}"
+        );
+    }
+    for (q, k, df) in [
+        (f64::NAN, 3.0, 10.0),
+        (2.0, f64::NAN, 10.0),
+        (2.0, 3.0, f64::NAN),
+        (2.0, 1.0, 10.0),
+        (2.0, 3.0, 0.0),
+    ] {
+        assert!(
+            tukey_upper_p(q, k, df).is_nan(),
+            "tukey_upper_p({q}, {k}, {df})"
+        );
+    }
+}
+
+/// `tukey_quantile` is the inverse of `tukey_upper_p`'s tail; an `alpha`
+/// outside `[0, 1]` or NaN gives NaN.
+#[test]
+fn tukey_quantile_inverts_tukey_upper_p() {
+    for k in [3.0, 6.0] {
+        for df in [5.0, 30.0, f64::INFINITY] {
+            for alpha in [0.05, 0.01] {
+                let q = tukey_quantile(alpha, k, df);
+                let back = tukey_upper_p(q, k, df);
+                assert!(
+                    ((back - alpha) / alpha).abs() <= 1e-10,
+                    "tukey_quantile({alpha}, {k}, {df}) = {q}: tail {back:e}"
+                );
+            }
+        }
+    }
+    for alpha in [f64::NAN, -0.1, 1.1] {
+        assert!(tukey_quantile(alpha, 3.0, 10.0).is_nan(), "alpha {alpha}");
+    }
 }

@@ -1,47 +1,8 @@
 {
   "//": "Documented divergences from the reference engines, read by validation/grid/compare.R when it compares parameters against an oracle (gate 2) or Satterthwaite df against lmerTest (gate 5, quantity coef_df, in the glmm-vs-oracle scope) and when it scores truth error (gate 3), and by the in-crate goldens tier (tests/oracle_support) for entries scoped to it. Gate 3 judges a group of cells -- one family, estimator arm and quantity -- so there an entry on any cell of the group covers the whole group, and is stale when the group was scored and did not need it. The rules: a difference over band with no entry here FAILS; a difference over band that an entry covers is reported as DOC and passes; a difference that has grown past its entry's max_rel FAILS, so a divergence is never silently absorbed; and an entry whose cell was compared but whose divergence did not fire FAILS as stale, so this file lists only what is still true. `summary` is the standalone short form, so an entry means something without the long form.",
-  "//fields": "id: stable key. cell: which fixture -- a grid cell id for the grid's own consumers, a golden's or an inference reference's name for an 'oracle-tier' entry. comparison: 'glmm-vs-oracle' for a glmm-against-an-oracle difference, 'glmm-vs-truth' for a truth-gate group where glmm's mean error against the generating truth is above the best oracle's by more than the band, 'oracle-vs-oracle' for a difference between two oracles, 'oracle-tier' for the in-crate oracle-tests tiers (the goldens and the inference references); an entry may list several. quantities: the comparison labels each consumer uses. max_rel: the largest relative difference the entry covers (the largest absolute difference for a quantity its consumer compares absolutely, such as the oracle tier's 'lrt'; for 'glmm-vs-truth', the largest amount by which glmm's mean truth error may sit above the best oracle's plus the band) — an observation exceeding it FAILS, so a divergence that grows is not silently absorbed. direction: which way the criterion moved.",
-  "//scope": "Every entry here is an oracle defect, a parameter the data does not determine, or (oracle-tier only) an oracle that maximises a different objective from glmm's; an entry of that third kind is admitted only for a golden whose twin on glmm's own objective (a glmmTMB `_tmb` golden) is gated at the ordinary bands in the same tier. A real glmm defect is never registered — it stays red and is tracked as a bug — because an entry would let it pass.",
+  "//fields": "id: stable key. cell: which fixture -- a grid cell id for the grid's own consumers, a golden's or an inference reference's name for an 'oracle-tier' entry. comparison: 'glmm-vs-oracle' for a glmm-against-an-oracle difference, 'glmm-vs-truth' for a truth-gate group where glmm's mean error against the generating truth is above the best oracle's by more than the band, 'oracle-tier' for the in-crate oracle-tests tiers (the goldens and the inference references); an entry may list several. quantities: the comparison labels each consumer uses. max_rel: the largest relative difference the entry covers (the largest absolute difference for a quantity its consumer compares absolutely, such as the oracle tier's 'lrt'; for 'glmm-vs-truth', the largest amount by which glmm's mean truth error may sit above the best oracle's plus the band) — an observation exceeding it FAILS, so a divergence that grows is not silently absorbed. direction: which way the criterion moved.",
+  "//scope": "Every entry here is an oracle defect, a parameter the data does not determine, or, in the oracle tier only, one of two kinds that need extra support. (a) An oracle that maximises a different objective from glmm's: admitted only where the comparison cannot move to a twin on glmm's own objective, and only when such a twin (a glmmTMB `_tmb` golden, or the population-mode rows of the same reference's glmmTMB block) is gated at the ordinary bands in the same tier. The goldens tier compares the parameters of such an lme4 golden on its twin alone, so it needs no entry. (b) A convention difference, where the oracle reports another named quantity at its fit (another covariance or information matrix): admitted only when the entry names both conventions and either the same tier gates glmm's own computation of the oracle's convention at the ordinary bands (as the `WaldSe::Rx` refit is gated against lme4's `se.fit`), or, where glmm has no switch for it, the entry records a closed-form check that reproduces each side's values to round-off. A real glmm defect is never registered — it stays red and is tracked as a bug — because an entry would let it pass.",
   "entries": [
-    {
-      "id": "grid-pois-q2sx2-se-rx-mixedmodels-worse-optimum",
-      "cell": "pois_q2sx2_g3000p20_bal_base",
-      "comparison": [
-        "glmm-vs-oracle"
-      ],
-      "quantities": [
-        "se_rx"
-      ],
-      "max_rel": 0.421,
-      "direction": "glmm's se_rx is below MixedModels'; glmm holds the lower deviance by 46.554",
-      "summary": "MixedModels is the only oracle reporting se_rx here (glmmTMB reports none, lme4 does not converge) and it is at a much worse point: it converged 46.554 deviance units above glmm and glmmTMB, which agree to 2e-12. Its standard errors are the standard errors of that point. Measured 2026-09-23 on the accuracy grid."
-    },
-    {
-      "id": "grid-pois-q4sx2-se-rx-mixedmodels-worse-optimum",
-      "cell": "pois_q4sx2_g3000p20_bal_base",
-      "comparison": [
-        "glmm-vs-oracle"
-      ],
-      "quantities": [
-        "se_rx"
-      ],
-      "max_rel": 0.217,
-      "direction": "glmm's se_rx is below MixedModels'; glmm holds the lower deviance by 16.615",
-      "summary": "Same as pois_q2sx2_g3000p20_bal_base: MixedModels is the only oracle reporting se_rx and it converged 16.615 deviance units above glmm and glmmTMB. Measured 2026-09-23 on the accuracy grid."
-    },
-    {
-      "id": "grid-binb-cross4-rare-stddev-pinned-to-zero",
-      "cell": "binb_cross4_g3000p20_bal_rare",
-      "comparison": [
-        "glmm-vs-oracle"
-      ],
-      "quantities": [
-        "stddev"
-      ],
-      "max_rel": 1.0,
-      "direction": "glmm pins the first crossed variance component to exactly 0 where the oracles leave a residue, so the relative difference is exactly 1 and cannot be larger",
-      "summary": "The deviance agrees to 5e-08 across all four engines (917.2590650 against 917.2590651) while the first crossed random-effect SD reads 0 from glmm, 2.6e-05 from lme4, 1.2e-03 from MixedModels and 1.9e-03 from glmmTMB. In the rare-event regime that component carries no information, the likelihood is flat in it, and the oracles do not agree with each other either. Nothing distinguishes the points. Measured 2026-09-23 on the accuracy grid."
-    },
     {
       "id": "grid-gami-cross6-stddev-pinned-to-zero",
       "cell": "gami_cross6_g3000p20_bal_base",
@@ -51,90 +12,22 @@
       "quantities": [
         "stddev"
       ],
-      "max_rel": 1.0,
-      "direction": "glmm pins three crossed variance components to exactly 0 where glmmTMB leaves a residue, so the relative difference is exactly 1 and cannot be larger; glmm holds the lower deviance by 7.4e-06",
-      "summary": "glmmTMB is the only converged oracle on glmm's objective here (lme4 fits a different objective on Gamma). The two engines reach the same optimum, glmm's deviance 7.4e-06 lower. At that optimum three of the six crossed random-intercept SDs are 0: glmm reports them as exactly 0, while glmmTMB, which works on log(SD) and cannot reach 0, reports 2.8e-07, 8.2e-06 and 1.1e-03 and cannot invert its Hessian there, so it gives no Hessian standard errors. The likelihood is flat in these three components, and the data do not determine them. The fourth SD differs by 3.9e-03 relative (0.15416 against 0.15477) inside the same deviance gap. Measured 2026-09-26 on the accuracy grid."
-    },
-    {
-      "id": "grid-gami-nest2-stddev-pinned-to-zero",
-      "cell": "gami_nest2_g3000p20_bal_base",
-      "comparison": [
-        "glmm-vs-oracle"
-      ],
-      "quantities": [
-        "stddev"
-      ],
-      "max_rel": 1.0,
-      "direction": "glmm pins the g2 variance component to exactly 0 where glmmTMB leaves a residue, so the relative difference is exactly 1 and cannot be larger; glmm holds the lower deviance by 1.2e-06",
-      "summary": "Same kind as gami_cross6_g3000p20_bal_base. glmmTMB is the only converged oracle on glmm's objective here (lme4 fits a different objective on Gamma). The two engines reach the same optimum, glmm's deviance 1.2e-06 lower. At that optimum the nested g2 SD is 0: glmm reports it as exactly 0, while glmmTMB, which works on log(SD) and cannot reach 0, reports 2.1e-03. The likelihood is flat in this component, and the data do not determine it. The g1 SD agrees to 2.6e-06 relative. Measured 2026-09-27 on the accuracy grid, glmmTMB run of 2026-09-27."
-    },
-    {
-      "id": "grid-gami-nest3-stddev-pinned-to-zero",
-      "cell": "gami_nest3_g3000p20_bal_base",
-      "comparison": [
-        "glmm-vs-oracle"
-      ],
-      "quantities": [
-        "stddev"
-      ],
-      "max_rel": 1.0,
-      "direction": "glmm pins the g1 and g3 variance components to exactly 0 where glmmTMB leaves a residue, so the relative difference is exactly 1 and cannot be larger; glmm holds the lower deviance by 1.8e-06",
-      "summary": "Same kind as gami_cross6_g3000p20_bal_base. glmmTMB is the only converged oracle on glmm's objective here (lme4 fits a different objective on Gamma). The two engines reach the same optimum, glmm's deviance 1.8e-06 lower. At that optimum the g1 and g3 SDs are 0: glmm reports them as exactly 0, while glmmTMB, which works on log(SD) and cannot reach 0, reports 8.4e-04 and 2.0e-03. The likelihood is flat in these components, and the data do not determine them. The g2 SD agrees to 4.0e-08 relative. Measured 2026-09-27 on the accuracy grid, glmmTMB run of 2026-09-27."
-    },
-    {
-      "id": "grid-pois-q2sx2-boundary-stddev-near-zero",
-      "cell": "pois_q2sx2_g3000p20_bal_boundary",
-      "comparison": [
-        "glmm-vs-oracle"
-      ],
-      "quantities": [
-        "stddev"
-      ],
-      "max_rel": 0.1,
-      "direction": "glmm's second g1 SD sits 2.1e-02 to 7.1e-02 relative above MixedModels' depending on platform and build, at the same deviance to 7e-11; glmm holds the lower deviance by 4.2e-07",
-      "summary": "The boundary regime draws both g1 SDs as exactly 0, but the data put a shallow dip in the deviance at small nonzero values: setting the two g1 SDs to 0 costs 4.2e-06 deviance units. glmm, MixedModels (7.73e-04 and 1.925e-03) and lme4 (7.79e-04 and 1.984e-03) all find that dip. Inside it the second SD is not determined to better than about 5%: twelve converged glmm fits of this cell (fedora x86 from 0.4.0 to the 0.5.0 tree, Apple M4 native and WASM) agree on the deviance to 7e-11 and put that SD anywhere from 1.967e-03 to 2.073e-03, 2.1e-02 to 7.1e-02 relative from MixedModels' (fedora 0.5.0 2.82e-02, M4 3.91e-02, WASM 3.69e-02). A ceiling sized on one machine's value flipped the verdict between fedora and the M4 on round-off alone, so max_rel covers the measured spread with margin. The failure this entry must still catch is the 2026-10-02 saddle stop (1.2e-04 and 3.0e-04, 4.0e-06 deviance units above the dip), at 0.84 relative. lme4 is not counted as converged because it reports a singular fit, and glmmTMB does not converge. glmm holds the lowest deviance, 4.2e-07 below MixedModels'. Measured 2026-09-23 on the accuracy grid; re-measured 2026-10-07 across platforms."
-    },
-    {
-      "id": "grid-binb-q8-boundary-varcorr-not-determined",
-      "cell": "binb_q8_g3000p20_bal_boundary",
-      "comparison": [
-        "glmm-vs-oracle"
-      ],
-      "quantities": [
-        "stddev",
-        "corr"
-      ],
       "max_rel": 0.004,
-      "direction": "glmm's varcorr differs from MixedModels'; glmm holds the lower deviance by 2.0e-04",
-      "summary": "An 8-wide covariance block, 36 covariance parameters, in the boundary regime where several of the drawn SDs are 0. glmm and MixedModels agree on the deviance to 5.8e-08 relative and glmm is the lower of the two; the varcorr entries they disagree on are the components sitting at or near zero, where the likelihood is flat. Measured 2026-09-23 on the accuracy grid."
+      "direction": "glmm's fourth crossed SD is 3.9e-03 relative below glmmTMB's (0.15416 against 0.15477) at the same optimum; glmm holds the lower deviance by 7.4e-06",
+      "summary": "glmmTMB is the only converged oracle on glmm's objective here (lme4 fits a different objective on Gamma). The two engines reach the same optimum, glmm's deviance 7.4e-06 lower. Three of the six crossed random-intercept SDs are 0 there (glmm exactly 0, glmmTMB 2.8e-07, 8.2e-06 and 1.1e-03, below sd_boundary_abs), and the fourth differs by 3.9e-03 relative inside the same deviance gap: the likelihood is flat along these components and the data do not determine the fourth to the 1e-03 band. Measured 2026-09-26; 3.92e-03 re-measured 2026-10-27 on the kept 0.7.0 run against the glmmTMB run of 2026-10-27."
     },
     {
-      "id": "grid-binb-q8-single-varcorr-not-determined",
-      "cell": "binb_q8_g3000p20_single_base",
+      "id": "grid-gami-q2d-stddev-pinned-to-zero",
+      "cell": "gami_q2d_g3000p20_bal_base",
       "comparison": [
         "glmm-vs-oracle"
       ],
       "quantities": [
-        "stddev",
-        "corr"
+        "stddev"
       ],
-      "max_rel": 0.0044,
-      "direction": "glmm's varcorr differs from MixedModels'; glmm holds the lower deviance by 1.6e-04",
-      "summary": "One observation per group with an 8-wide covariance block: 3000 rows carrying 24000 random effects. MixedModels is the only oracle that converges (lme4 declines the model, glmmTMB rejects its own Hessian) and it agrees with glmm on the deviance to 4.4e-08 relative, glmm being the lower. A model with eight times as many random effects as rows does not determine its covariance to better than the 4e-03 seen here. Measured 2026-09-23 on the accuracy grid; re-measured 2026-09-27 at 4.33e-03 after the PIRLS careful-mode change, which lowered glmm's deviance on the cell by 6.6e-09."
-    },
-    {
-      "id": "grid-binb-q8-rare-beta-corr-not-determined",
-      "cell": "binb_q8_g3000p20_bal_rare",
-      "comparison": [
-        "glmm-vs-oracle"
-      ],
-      "quantities": [
-        "beta",
-        "corr"
-      ],
-      "max_rel": 0.00211,
-      "direction": "glmm's beta and corr differ from MixedModels'; glmm holds the lower deviance by 9.0e-05",
-      "summary": "An 8-wide covariance block in the rare-event regime. glmm and MixedModels agree on the deviance to 8.0e-08 relative, glmm being the lower, while beta and the correlations differ by about 2e-03: the events are too few to determine them tighter. lme4 stops at its evaluation cap on this cell and is not a converged oracle (compare.R reclassifies cap-reached lme4 fits since 2026-10-07). Measured 2026-09-23 on the accuracy grid."
+      "max_rel": 0.0032,
+      "direction": "glmm's x1 slope SD is 3.1e-03 relative below glmmTMB's (0.29488 against 0.29581) at the same optimum; glmm holds the lower deviance by 2.0e-05",
+      "summary": "Same kind as gami_cross6_g3000p20_bal_base. glmmTMB is the only converged oracle on glmm's objective here (lme4 fits a different objective on Gamma). The two engines reach the same optimum, glmm's deviance 2.0e-05 lower. The g1 intercept SD of the uncorrelated (x1 || g1) term is 0 there (glmm exactly 0, glmmTMB 3.7e-03, below sd_boundary_abs), and the x1 slope SD differs by 3.1e-03 relative inside the same deviance gap: the data do not determine it to the 1e-03 band. Measured 2026-10-27 on the kept 0.7.0 run, 3.15e-03, against the glmmTMB run of 2026-10-27."
     },
     {
       "id": "grid-clla-cross4-beta-intercept-not-determined",
@@ -150,32 +43,6 @@
       "summary": "The estimated intercept is 0.0022 and its standard error is 0.13, sixty times larger, so the data do not determine it to the 1e-03 relative band: that band asks for agreement to 2.2e-06, which is 1.7e-05 standard errors. glmm and glmmTMB differ by 8.2e-06, which is 6.2e-05 standard errors. On a quadratic surface that costs 3.9e-09 deviance units, which matches the measured 5.7e-09 gap and is below what either optimizer resolves. The slope agrees to 3.2e-07. lme4 and MixedModels fit a different objective on this cloglog cell and are not references. Measured 2026-09-26 on the accuracy grid."
     },
     {
-      "id": "grid-binb-int1-boundary-agq7-stddev-glmmadaptive-residue",
-      "cell": "binb_int1_g3000p20_bal_boundary_agq7",
-      "comparison": [
-        "glmm-vs-oracle"
-      ],
-      "quantities": [
-        "stddev"
-      ],
-      "max_rel": 1.0,
-      "direction": "glmm pins the g1 SD to exactly 0 where GLMMadaptive leaves a residue, so the relative difference is exactly 1 and cannot be larger; glmm holds the lower deviance by 1.16e-02",
-      "summary": "The boundary regime draws the g1 SD as exactly 0. glmm reports it as exactly 0. GLMMadaptive works on log(SD), so it cannot reach 0, and it stops at 1.2e-02, 1.16e-02 deviance units above glmm. lme4 reaches glmm's deviance to 3e-12 with an SD of exactly 0, but it is not counted as converged because it reports a singular fit, so GLMMadaptive is the only converged reference on this AGQ cell (glmmTMB fits Laplace only). Measured 2026-10-05 against the 2026-10-05 grid run, GLMMadaptive run of 2026-10-05."
-    },
-    {
-      "id": "grid-sim-binomial-zerosd-agq7-stddev-glmmadaptive-residue",
-      "cell": "sim_binomial_zerosd_agq7",
-      "comparison": [
-        "glmm-vs-oracle"
-      ],
-      "quantities": [
-        "stddev"
-      ],
-      "max_rel": 1.0,
-      "direction": "glmm pins the g SD to exactly 0 where GLMMadaptive leaves a residue, so the relative difference is exactly 1 and cannot be larger; glmm holds the lower deviance by 3.0e-03",
-      "summary": "Same kind as binb_int1_g3000p20_bal_boundary_agq7. The data are drawn with a zero random-effect SD. glmm and lme4 both report the SD as exactly 0 and agree on the deviance to 3e-12. GLMMadaptive, on log(SD), stops at 5.5e-03, 3.0e-03 deviance units above them. lme4 is not counted as converged because it reports a singular fit, so GLMMadaptive is the only converged reference on this AGQ cell (glmmTMB fits Laplace only). Measured 2026-10-03 against the 2026-10-02 grid run, GLMMadaptive run of 2026-09-29."
-    },
-    {
       "id": "grid-binb-q2s-g60p5-agq7-glmmadaptive-short-of-boundary",
       "cell": "binb_q2s_g60p5_bal_base_agq7",
       "comparison": [
@@ -189,470 +56,6 @@
       "max_rel": 0.075,
       "direction": "glmm's correlation is exactly 1 and GLMMadaptive's 0.999995; under GLMMadaptive's own quadrature rule glmm's estimates hold the lower deviance by 1.2e-04",
       "summary": "On this cell glmm puts the two-term g1 block on the boundary, with correlation exactly 1. GLMMadaptive stops at 0.999995 and warns that its Hessian at convergence is not positive definite. Evaluated under GLMMadaptive's own quadrature rule at glmm's estimates, with the correlation taken toward 1, the deviance is 78.59599802: 1.2e-04 below GLMMadaptive's reported optimum (78.59611657) and equal to glmm's own deviance to 4e-12. So GLMMadaptive stops short of its own optimum. The differences are 3.2e-03 on beta, 5.0e-02 on se_hessian and 7.5e-02 on the intercept SD (0.0589 against 0.0545); the slope SD agrees to 8e-04. GLMMadaptive is the only oracle on the AGQ arm for this cell. Measured 2026-10-05 against the 2026-10-05 grid run, GLMMadaptive run of 2026-10-05."
-    },
-    {
-      "id": "grid-lmm-q4sx2-boundary-coef-df-lme4-short-stop",
-      "cell": "lmm_q4sx2_g3000p20_bal_boundary",
-      "comparison": [
-        "glmm-vs-oracle"
-      ],
-      "quantities": [
-        "coef_df"
-      ],
-      "max_rel": 0.3,
-      "direction": "glmm's x1 df is below lmerTest's (990.94 against 1354.92); glmm holds the lower REML criterion by 0.134",
-      "summary": "lmerTest computes its df at lme4's θ̂, and on this cell lme4 stops 0.134 REML units short of its own optimum: lme4's REML criterion is 5760.22414040 at its own θ̂ and 5760.09016793 at glmm's. MixedModels reaches glmm's point (5760.09016829, 3.6e-07 above glmm). The truth puts all four g1 SDs at 0 and the fitted 4x4 g1 block is singular in every engine. lme4's own grid record is not converged because the fit is singular; the lmertest engine keeps singular fits on purpose, so gate 5 compares this cell. The x1 df moves most, 2.69e-01 relative; the other three coefficients differ by 4.3e-02 or less. Evaluated at glmm's θ̂, lmerTest's df agree with glmm's to 1.7e-06 or better, so the gap comes from lme4's point, not from the df computation. max_rel is about 10% above the measured gap, for round-off in glmm's θ̂; measured on one machine only. Measured 2026-10-16 on the accuracy grid (dell-fedora x86), lmerTest run of 2026-10-12."
-    },
-    {
-      "id": "grid-lmm-q8q2x-ml-coef-df-lme4-short-stop",
-      "cell": "lmm_q8q2x_g3000p20_bal_base_ml",
-      "comparison": [
-        "glmm-vs-oracle"
-      ],
-      "quantities": [
-        "coef_df"
-      ],
-      "max_rel": 0.014,
-      "direction": "glmm's (Intercept) df is below lmerTest's (74.40 against 75.37); glmm holds the lower ML deviance by 1.09e-02",
-      "summary": "lmerTest computes its df at lme4's θ̂, and on this cell lme4 stops 1.09e-02 ML deviance units short of its own optimum and still reports converged with no warning: lme4's ML criterion is 9420.95459151 at its own θ̂ and 9420.94373480 at glmm's. glmmTMB (9420.94373489) and MixedModels (9420.94375666) reach glmm's point. The largest gap is on (Intercept), 1.29e-02 relative. Evaluated at glmm's θ̂, lmerTest's df agree with glmm's to 8.9e-06 or better, so the gap comes from lme4's point, not from the df computation. max_rel is about 10% above the measured gap, for round-off in glmm's θ̂; measured on one machine only. Measured 2026-10-16 on the accuracy grid (dell-fedora x86), lmerTest run of 2026-10-12."
-    },
-    {
-      "id": "grid-lmm-q4sx2-g30000-ml-coef-df-lme4-short-stop",
-      "cell": "lmm_q4sx2_g30000p20_bal_base_ml",
-      "comparison": [
-        "glmm-vs-oracle"
-      ],
-      "quantities": [
-        "coef_df"
-      ],
-      "max_rel": 0.00085,
-      "direction": "glmm's (Intercept) df is above lmerTest's (58.954 against 58.909); glmm holds the lower ML deviance by 1.05e-05",
-      "summary": "lmerTest computes its df at lme4's θ̂, and on this 30000-row cell lme4 stops 1.05e-05 ML deviance units above glmm: lme4's ML criterion is 76344.53586217 at its own θ̂ and 76344.53585166 at glmm's; glmmTMB reaches 76344.53585278. This small difference in θ̂ moves the (Intercept) df by 7.50e-04 relative, just above the 7e-04 band; the three slope df agree to 4.5e-05 or better. Evaluated at glmm's θ̂, lmerTest's df agree with glmm's to 4.9e-06 or better, so the gap comes from lme4's point, not from the df computation. max_rel is about 10% above the measured gap, for round-off in glmm's θ̂; measured on one machine only. Measured 2026-10-16 on the accuracy grid (dell-fedora x86), lmerTest run of 2026-10-12."
-    },
-    {
-      "id": "oracle-cbpp-probit-glmm-beta-lme4-objective",
-      "cell": "cbpp_probit_glmm",
-      "comparison": [
-        "oracle-tier"
-      ],
-      "quantities": [
-        "beta"
-      ],
-      "max_rel": 0.0044,
-      "direction": "glmm's deviance is 0.07577 below lme4's reported one, which is not the same function of the parameters; glmm's agrees with glmmTMB's (cbpp_probit_glmm_tmb) to 1.1e-10",
-      "summary": "lme4's glmer builds the Laplace log-determinant from the expected (Fisher) weight, which on the probit link is not the curvature of the integrand at the mode, so it maximises a different objective from the Laplace approximation to the marginal likelihood. The fixed effects therefore differ by up to 0.00434 relative while glmm's fit matches the glmmTMB twin cbpp_probit_glmm_tmb, which this tier gates at the ordinary bands. Measured 2026-09-24."
-    },
-    {
-      "id": "oracle-cbpp-probit-glmm-se-hessian-lme4-objective",
-      "cell": "cbpp_probit_glmm",
-      "comparison": [
-        "oracle-tier"
-      ],
-      "quantities": [
-        "se_hessian"
-      ],
-      "max_rel": 0.0022,
-      "direction": "glmm's deviance is 0.07577 below lme4's reported one, which is not the same function of the parameters; glmm's agrees with glmmTMB's (cbpp_probit_glmm_tmb) to 1.1e-10",
-      "summary": "lme4's glmer builds the Laplace log-determinant from the expected (Fisher) weight, which on the probit link is not the curvature of the integrand at the mode, so it maximises a different objective from the Laplace approximation to the marginal likelihood. The Hessian standard errors therefore differ by up to 0.0022 relative while glmm's fit matches the glmmTMB twin cbpp_probit_glmm_tmb, which this tier gates at the ordinary bands. Measured 2026-09-24."
-    },
-    {
-      "id": "oracle-cbpp-probit-glmm-se-rx-lme4-objective",
-      "cell": "cbpp_probit_glmm",
-      "comparison": [
-        "oracle-tier"
-      ],
-      "quantities": [
-        "se_rx"
-      ],
-      "max_rel": 0.0055,
-      "direction": "glmm's deviance is 0.07577 below lme4's reported one, which is not the same function of the parameters; glmm's agrees with glmmTMB's (cbpp_probit_glmm_tmb) to 1.1e-10",
-      "summary": "lme4's glmer builds the Laplace log-determinant from the expected (Fisher) weight, which on the probit link is not the curvature of the integrand at the mode, so it maximises a different objective from the Laplace approximation to the marginal likelihood. The Rx standard errors therefore differ by up to 0.00543 relative while glmm's fit matches the glmmTMB twin cbpp_probit_glmm_tmb, which this tier gates at the ordinary bands. Measured 2026-09-24."
-    },
-    {
-      "id": "oracle-cbpp-probit-glmm-varcomp-lme4-objective",
-      "cell": "cbpp_probit_glmm",
-      "comparison": [
-        "oracle-tier"
-      ],
-      "quantities": [
-        "herd stddev"
-      ],
-      "max_rel": 0.002,
-      "direction": "glmm's deviance is 0.07577 below lme4's reported one, which is not the same function of the parameters; glmm's agrees with glmmTMB's (cbpp_probit_glmm_tmb) to 1.1e-10",
-      "summary": "lme4's glmer builds the Laplace log-determinant from the expected (Fisher) weight, which on the probit link is not the curvature of the integrand at the mode, so it maximises a different objective from the Laplace approximation to the marginal likelihood. The variance components therefore differ by up to 0.0019 relative while glmm's fit matches the glmmTMB twin cbpp_probit_glmm_tmb, which this tier gates at the ordinary bands. Measured 2026-09-24."
-    },
-    {
-      "id": "oracle-sim-cloglog-glmm-beta-lme4-objective",
-      "cell": "sim_cloglog_glmm",
-      "comparison": [
-        "oracle-tier"
-      ],
-      "quantities": [
-        "beta"
-      ],
-      "max_rel": 0.079,
-      "direction": "glmm's deviance is 0.1289 below lme4's reported one, which is not the same function of the parameters; glmm's agrees with glmmTMB's (sim_cloglog_glmm_tmb) to 7.2e-10",
-      "summary": "lme4's glmer builds the Laplace log-determinant from the expected (Fisher) weight, which on the cloglog link is not the curvature of the integrand at the mode, so it maximises a different objective from the Laplace approximation to the marginal likelihood. The fixed effects therefore differ by up to 0.0782 relative while glmm's fit matches the glmmTMB twin sim_cloglog_glmm_tmb, which this tier gates at the ordinary bands. Measured 2026-09-24."
-    },
-    {
-      "id": "oracle-sim-cloglog-glmm-se-hessian-lme4-objective",
-      "cell": "sim_cloglog_glmm",
-      "comparison": [
-        "oracle-tier"
-      ],
-      "quantities": [
-        "se_hessian"
-      ],
-      "max_rel": 0.0038,
-      "direction": "glmm's deviance is 0.1289 below lme4's reported one, which is not the same function of the parameters; glmm's agrees with glmmTMB's (sim_cloglog_glmm_tmb) to 7.2e-10",
-      "summary": "lme4's glmer builds the Laplace log-determinant from the expected (Fisher) weight, which on the cloglog link is not the curvature of the integrand at the mode, so it maximises a different objective from the Laplace approximation to the marginal likelihood. The Hessian standard errors therefore differ by up to 0.00374 relative while glmm's fit matches the glmmTMB twin sim_cloglog_glmm_tmb, which this tier gates at the ordinary bands. Measured 2026-09-24."
-    },
-    {
-      "id": "oracle-sim-cloglog-glmm-se-rx-lme4-objective",
-      "cell": "sim_cloglog_glmm",
-      "comparison": [
-        "oracle-tier"
-      ],
-      "quantities": [
-        "se_rx"
-      ],
-      "max_rel": 0.011,
-      "direction": "glmm's deviance is 0.1289 below lme4's reported one, which is not the same function of the parameters; glmm's agrees with glmmTMB's (sim_cloglog_glmm_tmb) to 7.2e-10",
-      "summary": "lme4's glmer builds the Laplace log-determinant from the expected (Fisher) weight, which on the cloglog link is not the curvature of the integrand at the mode, so it maximises a different objective from the Laplace approximation to the marginal likelihood. The Rx standard errors therefore differ by up to 0.0108 relative while glmm's fit matches the glmmTMB twin sim_cloglog_glmm_tmb, which this tier gates at the ordinary bands. Measured 2026-09-24."
-    },
-    {
-      "id": "oracle-sim-cloglog-glmm-varcomp-lme4-objective",
-      "cell": "sim_cloglog_glmm",
-      "comparison": [
-        "oracle-tier"
-      ],
-      "quantities": [
-        "g stddev"
-      ],
-      "max_rel": 0.0024,
-      "direction": "glmm's deviance is 0.1289 below lme4's reported one, which is not the same function of the parameters; glmm's agrees with glmmTMB's (sim_cloglog_glmm_tmb) to 7.2e-10",
-      "summary": "lme4's glmer builds the Laplace log-determinant from the expected (Fisher) weight, which on the cloglog link is not the curvature of the integrand at the mode, so it maximises a different objective from the Laplace approximation to the marginal likelihood. The variance components therefore differ by up to 0.00237 relative while glmm's fit matches the glmmTMB twin sim_cloglog_glmm_tmb, which this tier gates at the ordinary bands. Measured 2026-09-24."
-    },
-    {
-      "id": "oracle-sim-gamma-glmm-beta-lme4-objective",
-      "cell": "sim_gamma_glmm",
-      "comparison": [
-        "oracle-tier"
-      ],
-      "quantities": [
-        "beta"
-      ],
-      "max_rel": 0.0721,
-      "direction": "not comparable on the deviance: lme4's reported logLik is 4.341 higher than glmm's, on its plug-in-scale objective; glmm's deviance agrees with glmmTMB's (sim_gamma_glmm_tmb) to 1.2e-09",
-      "summary": "lme4's glmer fixes the Gamma scale at its D/Σw plug-in instead of maximising over it, and on the log link also builds the Laplace log-determinant from the expected (Fisher) weight, which is not the curvature of the integrand at the mode; glmm maximises the Laplace likelihood over phi as well. The fixed effects therefore differ by up to 0.0721 relative (measured 0.0720293 on beta[0]) while glmm's fit matches the glmmTMB twin sim_gamma_glmm_tmb, which this tier gates at the ordinary bands. Measured 2026-09-26."
-    },
-    {
-      "id": "oracle-sim-gamma-glmm-se-hessian-lme4-objective",
-      "cell": "sim_gamma_glmm",
-      "comparison": [
-        "oracle-tier"
-      ],
-      "quantities": [
-        "se_hessian"
-      ],
-      "max_rel": 0.06,
-      "direction": "not comparable on the deviance: lme4's reported logLik is 4.341 higher than glmm's, on its plug-in-scale objective; glmm's deviance agrees with glmmTMB's (sim_gamma_glmm_tmb) to 1.2e-09",
-      "summary": "lme4's glmer fixes the Gamma scale at its D/Σw plug-in instead of maximising over it, and on the log link also builds the Laplace log-determinant from the expected (Fisher) weight, which is not the curvature of the integrand at the mode; glmm maximises the Laplace likelihood over phi as well. The Hessian standard errors therefore differ by up to 0.0591 relative while glmm's fit matches the glmmTMB twin sim_gamma_glmm_tmb, which this tier gates at the ordinary bands. Measured 2026-09-26."
-    },
-    {
-      "id": "oracle-sim-gamma-glmm-se-rx-lme4-objective",
-      "cell": "sim_gamma_glmm",
-      "comparison": [
-        "oracle-tier"
-      ],
-      "quantities": [
-        "se_rx"
-      ],
-      "max_rel": 0.11,
-      "direction": "not comparable on the deviance: lme4's reported logLik is 4.341 higher than glmm's, on its plug-in-scale objective; glmm's deviance agrees with glmmTMB's (sim_gamma_glmm_tmb) to 1.2e-09",
-      "summary": "lme4's glmer fixes the Gamma scale at its D/Σw plug-in instead of maximising over it, and on the log link also builds the Laplace log-determinant from the expected (Fisher) weight, which is not the curvature of the integrand at the mode; glmm maximises the Laplace likelihood over phi as well. The Rx standard errors therefore differ by up to 0.106 relative while glmm's fit matches the glmmTMB twin sim_gamma_glmm_tmb, which this tier gates at the ordinary bands. Measured 2026-09-26."
-    },
-    {
-      "id": "oracle-sim-gamma-glmm-varcomp-lme4-objective",
-      "cell": "sim_gamma_glmm",
-      "comparison": [
-        "oracle-tier"
-      ],
-      "quantities": [
-        "cluster stddev"
-      ],
-      "max_rel": 0.15,
-      "direction": "not comparable on the deviance: lme4's reported logLik is 4.341 higher than glmm's, on its plug-in-scale objective; glmm's deviance agrees with glmmTMB's (sim_gamma_glmm_tmb) to 1.2e-09",
-      "summary": "lme4's glmer fixes the Gamma scale at its D/Σw plug-in instead of maximising over it, and on the log link also builds the Laplace log-determinant from the expected (Fisher) weight, which is not the curvature of the integrand at the mode; glmm maximises the Laplace likelihood over phi as well. The variance components therefore differ by up to 0.146 relative while glmm's fit matches the glmmTMB twin sim_gamma_glmm_tmb, which this tier gates at the ordinary bands. Measured 2026-09-26."
-    },
-    {
-      "id": "oracle-sim-gamma-inv-glmm-beta-lme4-objective",
-      "cell": "sim_gamma_inv_glmm",
-      "comparison": [
-        "oracle-tier"
-      ],
-      "quantities": [
-        "beta"
-      ],
-      "max_rel": 0.041,
-      "direction": "not comparable on the deviance: lme4's reported logLik is 3.063 higher than glmm's, on its plug-in-scale objective; glmm's deviance agrees with glmmTMB's (sim_gamma_inv_glmm_tmb) to 1.9e-10",
-      "summary": "lme4's glmer fixes the Gamma scale at its D/Σw plug-in instead of maximising over it (the inverse link is canonical, so the curvature agrees); glmm maximises the Laplace likelihood over phi as well. The fixed effects therefore differ by up to 0.0404 relative while glmm's fit matches the glmmTMB twin sim_gamma_inv_glmm_tmb, which this tier gates at the ordinary bands. Measured 2026-09-24."
-    },
-    {
-      "id": "oracle-sim-gamma-inv-glmm-se-hessian-lme4-objective",
-      "cell": "sim_gamma_inv_glmm",
-      "comparison": [
-        "oracle-tier"
-      ],
-      "quantities": [
-        "se_hessian"
-      ],
-      "max_rel": 0.097,
-      "direction": "not comparable on the deviance: lme4's reported logLik is 3.063 higher than glmm's, on its plug-in-scale objective; glmm's deviance agrees with glmmTMB's (sim_gamma_inv_glmm_tmb) to 1.9e-10",
-      "summary": "lme4's glmer fixes the Gamma scale at its D/Σw plug-in instead of maximising over it (the inverse link is canonical, so the curvature agrees); glmm maximises the Laplace likelihood over phi as well. The Hessian standard errors therefore differ by up to 0.0963 relative while glmm's fit matches the glmmTMB twin sim_gamma_inv_glmm_tmb, which this tier gates at the ordinary bands. Measured 2026-09-24."
-    },
-    {
-      "id": "oracle-sim-gamma-inv-glmm-se-rx-lme4-objective",
-      "cell": "sim_gamma_inv_glmm",
-      "comparison": [
-        "oracle-tier"
-      ],
-      "quantities": [
-        "se_rx"
-      ],
-      "max_rel": 0.049,
-      "direction": "not comparable on the deviance: lme4's reported logLik is 3.063 higher than glmm's, on its plug-in-scale objective; glmm's deviance agrees with glmmTMB's (sim_gamma_inv_glmm_tmb) to 1.9e-10",
-      "summary": "lme4's glmer fixes the Gamma scale at its D/Σw plug-in instead of maximising over it (the inverse link is canonical, so the curvature agrees); glmm maximises the Laplace likelihood over phi as well. The Rx standard errors therefore differ by up to 0.0481 relative while glmm's fit matches the glmmTMB twin sim_gamma_inv_glmm_tmb, which this tier gates at the ordinary bands. Measured 2026-09-24."
-    },
-    {
-      "id": "oracle-sim-gamma-inv-glmm-varcomp-lme4-objective",
-      "cell": "sim_gamma_inv_glmm",
-      "comparison": [
-        "oracle-tier"
-      ],
-      "quantities": [
-        "cluster stddev"
-      ],
-      "max_rel": 0.08,
-      "direction": "not comparable on the deviance: lme4's reported logLik is 3.063 higher than glmm's, on its plug-in-scale objective; glmm's deviance agrees with glmmTMB's (sim_gamma_inv_glmm_tmb) to 1.9e-10",
-      "summary": "lme4's glmer fixes the Gamma scale at its D/Σw plug-in instead of maximising over it (the inverse link is canonical, so the curvature agrees); glmm maximises the Laplace likelihood over phi as well. The variance components therefore differ by up to 0.0792 relative while glmm's fit matches the glmmTMB twin sim_gamma_inv_glmm_tmb, which this tier gates at the ordinary bands. Measured 2026-09-24."
-    },
-    {
-      "id": "oracle-sim-sparse-gamma-beta-lme4-objective",
-      "cell": "sim_sparse_gamma",
-      "comparison": [
-        "oracle-tier"
-      ],
-      "quantities": [
-        "beta"
-      ],
-      "max_rel": 0.23,
-      "direction": "not comparable on the deviance: lme4's reported logLik is 56.02 higher than glmm's, on its plug-in-scale objective; glmm's deviance agrees with glmmTMB's (sim_sparse_gamma_tmb) to 7.9e-05",
-      "summary": "lme4's glmer fixes the Gamma scale at its D/Σw plug-in instead of maximising over it, and on the log link also builds the Laplace log-determinant from the expected (Fisher) weight, which is not the curvature of the integrand at the mode; glmm maximises the Laplace likelihood over phi as well. The fixed effects therefore differ by up to 0.222 relative while glmm's fit matches the glmmTMB twin sim_sparse_gamma_tmb, which this tier gates at the ordinary bands. Measured 2026-09-24."
-    },
-    {
-      "id": "oracle-sim-sparse-gamma-se-hessian-lme4-objective",
-      "cell": "sim_sparse_gamma",
-      "comparison": [
-        "oracle-tier"
-      ],
-      "quantities": [
-        "se_hessian"
-      ],
-      "max_rel": 0.13,
-      "direction": "not comparable on the deviance: lme4's reported logLik is 56.02 higher than glmm's, on its plug-in-scale objective; glmm's deviance agrees with glmmTMB's (sim_sparse_gamma_tmb) to 7.9e-05",
-      "summary": "lme4's glmer fixes the Gamma scale at its D/Σw plug-in instead of maximising over it, and on the log link also builds the Laplace log-determinant from the expected (Fisher) weight, which is not the curvature of the integrand at the mode; glmm maximises the Laplace likelihood over phi as well. The Hessian standard errors therefore differ by up to 0.127 relative while glmm's fit matches the glmmTMB twin sim_sparse_gamma_tmb, which this tier gates at the ordinary bands. Measured 2026-09-24."
-    },
-    {
-      "id": "oracle-sim-sparse-gamma-se-rx-lme4-objective",
-      "cell": "sim_sparse_gamma",
-      "comparison": [
-        "oracle-tier"
-      ],
-      "quantities": [
-        "se_rx"
-      ],
-      "max_rel": 0.24,
-      "direction": "not comparable on the deviance: lme4's reported logLik is 56.02 higher than glmm's, on its plug-in-scale objective; glmm's deviance agrees with glmmTMB's (sim_sparse_gamma_tmb) to 7.9e-05",
-      "summary": "lme4's glmer fixes the Gamma scale at its D/Σw plug-in instead of maximising over it, and on the log link also builds the Laplace log-determinant from the expected (Fisher) weight, which is not the curvature of the integrand at the mode; glmm maximises the Laplace likelihood over phi as well. The Rx standard errors therefore differ by up to 0.232 relative while glmm's fit matches the glmmTMB twin sim_sparse_gamma_tmb, which this tier gates at the ordinary bands. Measured 2026-09-24."
-    },
-    {
-      "id": "oracle-sim-sparse-gamma-varcomp-lme4-objective",
-      "cell": "sim_sparse_gamma",
-      "comparison": [
-        "oracle-tier"
-      ],
-      "quantities": [
-        "ge corr",
-        "ge stddev",
-        "gp stddev"
-      ],
-      "max_rel": 0.25,
-      "direction": "not comparable on the deviance: lme4's reported logLik is 56.02 higher than glmm's, on its plug-in-scale objective; glmm's deviance agrees with glmmTMB's (sim_sparse_gamma_tmb) to 7.9e-05",
-      "summary": "lme4's glmer fixes the Gamma scale at its D/Σw plug-in instead of maximising over it, and on the log link also builds the Laplace log-determinant from the expected (Fisher) weight, which is not the curvature of the integrand at the mode; glmm maximises the Laplace likelihood over phi as well. The variance components therefore differ by up to 0.241 (relative on SDs, absolute on correlations) while glmm's fit matches the glmmTMB twin sim_sparse_gamma_tmb, which this tier gates at the ordinary bands. Measured 2026-09-24."
-    },
-    {
-      "id": "oracle-sim-nb-glmm-beta-lme4-objective",
-      "cell": "sim_nb_glmm",
-      "comparison": [
-        "oracle-tier"
-      ],
-      "quantities": [
-        "beta"
-      ],
-      "max_rel": 0.74,
-      "direction": "glmm's deviance is 0.0243 above lme4's reported one, which is not the same function of the parameters; glmm's agrees with glmmTMB's (sim_nb_glmm_tmb) to 1.0e-09",
-      "summary": "lme4's glmer.nb builds the Laplace log-determinant from the expected (Fisher) weight, which on the negative-binomial log link is not the curvature of the integrand at the mode, so it maximises a different objective from the Laplace approximation to the marginal likelihood. The fixed effects therefore differ by up to 0.739 relative while glmm's fit matches the glmmTMB twin sim_nb_glmm_tmb, which this tier gates at the ordinary bands. Measured 2026-09-24."
-    },
-    {
-      "id": "oracle-sim-nb-glmm-se-hessian-lme4-objective",
-      "cell": "sim_nb_glmm",
-      "comparison": [
-        "oracle-tier"
-      ],
-      "quantities": [
-        "se_hessian"
-      ],
-      "max_rel": 0.012,
-      "direction": "glmm's deviance is 0.0243 above lme4's reported one, which is not the same function of the parameters; glmm's agrees with glmmTMB's (sim_nb_glmm_tmb) to 1.0e-09",
-      "summary": "lme4's glmer.nb builds the Laplace log-determinant from the expected (Fisher) weight, which on the negative-binomial log link is not the curvature of the integrand at the mode, so it maximises a different objective from the Laplace approximation to the marginal likelihood. lme4's Hessian standard errors also condition on theta_NB, while glmm's joint Hessian carries the ln theta_NB coordinate, as glmmTMB's does. The Hessian standard errors therefore differ by up to 0.0111 relative while glmm's fit matches the glmmTMB twin sim_nb_glmm_tmb, which this tier gates at the ordinary bands. Measured 2026-09-24."
-    },
-    {
-      "id": "oracle-sim-nb-glmm-se-rx-lme4-objective",
-      "cell": "sim_nb_glmm",
-      "comparison": [
-        "oracle-tier"
-      ],
-      "quantities": [
-        "se_rx"
-      ],
-      "max_rel": 0.049,
-      "direction": "glmm's deviance is 0.0243 above lme4's reported one, which is not the same function of the parameters; glmm's agrees with glmmTMB's (sim_nb_glmm_tmb) to 1.0e-09",
-      "summary": "lme4's glmer.nb builds the Laplace log-determinant from the expected (Fisher) weight, which on the negative-binomial log link is not the curvature of the integrand at the mode, so it maximises a different objective from the Laplace approximation to the marginal likelihood. The Rx standard errors therefore differ by up to 0.0487 relative while glmm's fit matches the glmmTMB twin sim_nb_glmm_tmb, which this tier gates at the ordinary bands. Measured 2026-09-24."
-    },
-    {
-      "id": "oracle-sim-nb-glmm-varcomp-lme4-objective",
-      "cell": "sim_nb_glmm",
-      "comparison": [
-        "oracle-tier"
-      ],
-      "quantities": [
-        "cluster stddev"
-      ],
-      "max_rel": 0.0015,
-      "direction": "glmm's deviance is 0.0243 above lme4's reported one, which is not the same function of the parameters; glmm's agrees with glmmTMB's (sim_nb_glmm_tmb) to 1.0e-09",
-      "summary": "lme4's glmer.nb builds the Laplace log-determinant from the expected (Fisher) weight, which on the negative-binomial log link is not the curvature of the integrand at the mode, so it maximises a different objective from the Laplace approximation to the marginal likelihood. The variance components therefore differ by up to 0.00143 relative while glmm's fit matches the glmmTMB twin sim_nb_glmm_tmb, which this tier gates at the ordinary bands. Measured 2026-09-24."
-    },
-    {
-      "id": "oracle-sim-nb-nested-glmm-beta-lme4-objective",
-      "cell": "sim_nb_nested_glmm",
-      "comparison": [
-        "oracle-tier"
-      ],
-      "quantities": [
-        "beta"
-      ],
-      "max_rel": 0.04,
-      "direction": "glmm's deviance is 0.0698 below lme4's reported one, which is not the same function of the parameters; glmm's agrees with glmmTMB's (sim_nb_nested_glmm_tmb) to 1.7e-09",
-      "summary": "lme4's glmer.nb builds the Laplace log-determinant from the expected (Fisher) weight, which on the negative-binomial log link is not the curvature of the integrand at the mode, so it maximises a different objective from the Laplace approximation to the marginal likelihood. The fixed effects therefore differ by up to 0.0398 relative while glmm's fit matches the glmmTMB twin sim_nb_nested_glmm_tmb, which this tier gates at the ordinary bands. Measured 2026-09-24."
-    },
-    {
-      "id": "oracle-sim-nb-nested-glmm-se-hessian-lme4-objective",
-      "cell": "sim_nb_nested_glmm",
-      "comparison": [
-        "oracle-tier"
-      ],
-      "quantities": [
-        "se_hessian"
-      ],
-      "max_rel": 0.0053,
-      "direction": "glmm's deviance is 0.0698 below lme4's reported one, which is not the same function of the parameters; glmm's agrees with glmmTMB's (sim_nb_nested_glmm_tmb) to 1.7e-09",
-      "summary": "lme4's glmer.nb builds the Laplace log-determinant from the expected (Fisher) weight, which on the negative-binomial log link is not the curvature of the integrand at the mode, so it maximises a different objective from the Laplace approximation to the marginal likelihood. lme4's Hessian standard errors also condition on theta_NB, while glmm's joint Hessian carries the ln theta_NB coordinate, as glmmTMB's does. The Hessian standard errors therefore differ by up to 0.00524 relative while glmm's fit matches the glmmTMB twin sim_nb_nested_glmm_tmb, which this tier gates at the ordinary bands. Measured 2026-09-24."
-    },
-    {
-      "id": "oracle-sim-nb-nested-glmm-se-rx-lme4-objective",
-      "cell": "sim_nb_nested_glmm",
-      "comparison": [
-        "oracle-tier"
-      ],
-      "quantities": [
-        "se_rx"
-      ],
-      "max_rel": 0.0063,
-      "direction": "glmm's deviance is 0.0698 below lme4's reported one, which is not the same function of the parameters; glmm's agrees with glmmTMB's (sim_nb_nested_glmm_tmb) to 1.7e-09",
-      "summary": "lme4's glmer.nb builds the Laplace log-determinant from the expected (Fisher) weight, which on the negative-binomial log link is not the curvature of the integrand at the mode, so it maximises a different objective from the Laplace approximation to the marginal likelihood. The Rx standard errors therefore differ by up to 0.00629 relative while glmm's fit matches the glmmTMB twin sim_nb_nested_glmm_tmb, which this tier gates at the ordinary bands. Measured 2026-09-24."
-    },
-    {
-      "id": "oracle-sim-nb-nested-glmm-varcomp-lme4-objective",
-      "cell": "sim_nb_nested_glmm",
-      "comparison": [
-        "oracle-tier"
-      ],
-      "quantities": [
-        "g1 stddev"
-      ],
-      "max_rel": 0.0015,
-      "direction": "glmm's deviance is 0.0698 below lme4's reported one, which is not the same function of the parameters; glmm's agrees with glmmTMB's (sim_nb_nested_glmm_tmb) to 1.7e-09",
-      "summary": "lme4's glmer.nb builds the Laplace log-determinant from the expected (Fisher) weight, which on the negative-binomial log link is not the curvature of the integrand at the mode, so it maximises a different objective from the Laplace approximation to the marginal likelihood. The variance components therefore differ by up to 0.00147 relative while glmm's fit matches the glmmTMB twin sim_nb_nested_glmm_tmb, which this tier gates at the ordinary bands. Measured 2026-09-24."
-    },
-    {
-      "id": "oracle-sim-sparse-nb-beta-lme4-objective",
-      "cell": "sim_sparse_nb",
-      "comparison": [
-        "oracle-tier"
-      ],
-      "quantities": [
-        "beta"
-      ],
-      "max_rel": 0.076,
-      "direction": "glmm's deviance is 0.04883 below lme4's reported one, which is not the same function of the parameters; glmm's agrees with glmmTMB's (sim_sparse_nb_tmb) to 1.9e-06",
-      "summary": "lme4's glmer.nb builds the Laplace log-determinant from the expected (Fisher) weight, which on the negative-binomial log link is not the curvature of the integrand at the mode, so it maximises a different objective from the Laplace approximation to the marginal likelihood. The fixed effects therefore differ by up to 0.0753 relative while glmm's fit matches the glmmTMB twin sim_sparse_nb_tmb, which this tier gates at the ordinary bands. Measured 2026-09-24."
-    },
-    {
-      "id": "oracle-sim-sparse-nb-se-hessian-lme4-objective",
-      "cell": "sim_sparse_nb",
-      "comparison": [
-        "oracle-tier"
-      ],
-      "quantities": [
-        "se_hessian"
-      ],
-      "max_rel": 0.016,
-      "direction": "glmm's deviance is 0.04883 below lme4's reported one, which is not the same function of the parameters; glmm's agrees with glmmTMB's (sim_sparse_nb_tmb) to 1.9e-06",
-      "summary": "lme4's glmer.nb builds the Laplace log-determinant from the expected (Fisher) weight, which on the negative-binomial log link is not the curvature of the integrand at the mode, so it maximises a different objective from the Laplace approximation to the marginal likelihood. lme4's Hessian standard errors also condition on theta_NB, while glmm's joint Hessian carries the ln theta_NB coordinate, as glmmTMB's does. The Hessian standard errors therefore differ by up to 0.0157 relative while glmm's fit matches the glmmTMB twin sim_sparse_nb_tmb, which this tier gates at the ordinary bands. Measured 2026-09-24."
-    },
-    {
-      "id": "oracle-sim-sparse-nb-se-rx-lme4-objective",
-      "cell": "sim_sparse_nb",
-      "comparison": [
-        "oracle-tier"
-      ],
-      "quantities": [
-        "se_rx"
-      ],
-      "max_rel": 0.016,
-      "direction": "glmm's deviance is 0.04883 below lme4's reported one, which is not the same function of the parameters; glmm's agrees with glmmTMB's (sim_sparse_nb_tmb) to 1.9e-06",
-      "summary": "lme4's glmer.nb builds the Laplace log-determinant from the expected (Fisher) weight, which on the negative-binomial log link is not the curvature of the integrand at the mode, so it maximises a different objective from the Laplace approximation to the marginal likelihood. The Rx standard errors therefore differ by up to 0.0152 relative while glmm's fit matches the glmmTMB twin sim_sparse_nb_tmb, which this tier gates at the ordinary bands. Measured 2026-09-24."
-    },
-    {
-      "id": "oracle-sim-sparse-nb-varcomp-lme4-objective",
-      "cell": "sim_sparse_nb",
-      "comparison": [
-        "oracle-tier"
-      ],
-      "quantities": [
-        "c1 stddev",
-        "c2 stddev",
-        "c3 stddev",
-        "c4 stddev",
-        "c5 stddev",
-        "c6 stddev",
-        "c7 stddev",
-        "g1 stddev"
-      ],
-      "max_rel": 0.013,
-      "direction": "glmm's deviance is 0.04883 below lme4's reported one, which is not the same function of the parameters; glmm's agrees with glmmTMB's (sim_sparse_nb_tmb) to 1.9e-06",
-      "summary": "lme4's glmer.nb builds the Laplace log-determinant from the expected (Fisher) weight, which on the negative-binomial log link is not the curvature of the integrand at the mode, so it maximises a different objective from the Laplace approximation to the marginal likelihood. The variance components therefore differ by up to 0.0127 relative while glmm's fit matches the glmmTMB twin sim_sparse_nb_tmb, which this tier gates at the ordinary bands. Measured 2026-09-24."
     },
     {
       "id": "oracle-rlrt-dyestuff2-p-value-rlrsim-round-off-statistic",
@@ -692,6 +95,58 @@
       "max_rel": 0.013,
       "direction": "glmm's deviance is 0.0243 above lme4's reported one, which is not the same function of the parameters; glmm's agrees with glmmTMB's (sim_nb_glmm_tmb) to 1.2e-09",
       "summary": "The larger model of this pair is lme4's glmer.nb fit of y ~ 1 + x + grp + (1 | cluster) on sim_nb, the model of the goldens tier's sim_nb_glmm. lme4's glmer.nb builds the Laplace log-determinant from the expected (Fisher) weight, which on the negative-binomial log link is not the curvature of the integrand at the mode, so its logLik is not the Laplace approximation glmm and glmmTMB maximise. The smaller model (MASS::glm.nb) agrees with glmm to 1.7e-12 in deviance, so the comparison carries the whole gap. The deviance gate reads the glmer.nb side against the frozen glmmTMB fit of the same model instead (sim_nb_glmm_tmb, gap 1.2e-09). The 50:50 mixture p-value (k = 0) moves with the statistic: glmm 8.926e-09 against lme4's 8.815e-09, 0.0126 relative. Measured 2026-10-12."
+    },
+    {
+      "id": "oracle-predict-glmm-sim-factorial-bern-se-fit-lme4-rx-covariance",
+      "cell": "predict_glmm_sim_factorial_bern",
+      "comparison": [
+        "oracle-tier"
+      ],
+      "quantities": [
+        "se_fit"
+      ],
+      "max_rel": 0.049,
+      "direction": "glmm's conditional-mode standard errors are above lme4's on every over-band row (0.805618 against 0.771295 on the worst row); glmm's default fit reads the Hessian covariance of the fixed effects, lme4's se.fit the RX one",
+      "summary": "lme4's predict(se.fit = TRUE) builds the fixed-effect part of the standard error from vcov_full, the RX (expected-information) covariance, even on a fit whose vcov() is the Hessian one; glmm's default fit (WaldSe::Hessian) uses the Hessian covariance of the joint (theta, beta) Laplace deviance. On this binomial GLMM the two differ by up to 0.10 relative on the diagonal (lme4's own vcov(use.hessian = TRUE) against use.hessian = FALSE). glmmTMB's conditional se.fit is a third convention: it adds the uncertainty of the variance parameter on seen levels and the prior variance of the effect on unseen ones, so it is no nearer. 58 conditional-mode lines are over the band (both scales), from 1.13e-03 to 4.45e-02 relative to the nearer reference; the worst rows are the unseen-level rows 5 and 17. Population-mode standard errors pass against glmmTMB. The same driver refits under WaldSe::Rx and gates that fit's se.fit against lme4's at the ordinary band, hard: worst 1.6e-04 relative, so the formula is lme4's and only the covariance differs. Measured 2026-10-26 against the frozen predict_glmm_sim_factorial_bern.json."
+    },
+    {
+      "id": "oracle-predict-glmm-sim-gamma-se-fit-lme4-estimates",
+      "cell": "predict_glmm_sim_gamma",
+      "comparison": [
+        "oracle-tier"
+      ],
+      "quantities": [
+        "se_fit"
+      ],
+      "max_rel": 0.15,
+      "direction": "the worst rows are unseen-level rows, where glmm's standard error is above lme4's (0.32079 against 0.28186 on row 8, response scale); glmm's estimates are maximum likelihood, lme4's are not",
+      "summary": "On a Gamma GLMM lme4's glmer does not maximise the Laplace likelihood over the dispersion: it plugs in its pwrss/n scale, so its estimates are not maximum likelihood (random-intercept variance 0.2354 against glmm's 0.3225, phi 0.5726 against 0.5391; glmmTMB agrees with glmm to six digits). On the four unseen-level rows (2, 5, 8, 11) lme4's conditional se.fit is its population one, x'Vx, at those estimates: evaluated at glmm's estimates the same formula moves from 0.12283 to 0.13571 on row 8, against glmm's 0.13640, the small rest being the RX covariance lme4 reads in place of glmm's Hessian one. glmmTMB adds the prior variance of the new effect there, so it is no nearer (0.58407). In population mode glmm and glmmTMB agree to six digits and pass. The seen-level conditional rows fall under this entry too, because the registry is keyed by reference and quantity: there lme4's conditional variance is the expected-information one (see oracle-predict-glmm-sim-gamma-condvar-lme4-expected-information) and glmmTMB's se.fit adds the uncertainty of the variance parameter, up to 2.13e-02 relative to the nearer reference. 18 lines over the band, from 1.19e-03 to 1.381e-01 relative; the worst is unseen row 8 on the response scale. Measured 2026-10-26 against the frozen predict_glmm_sim_gamma.json."
+    },
+    {
+      "id": "oracle-predict-glmm-sim-gamma-condvar-lme4-expected-information",
+      "cell": "predict_glmm_sim_gamma",
+      "comparison": [
+        "oracle-tier"
+      ],
+      "quantities": [
+        "condvar"
+      ],
+      "max_rel": 0.19,
+      "direction": "glmm's conditional variances spread around lme4's single value (0.03467 to 0.04644 against 0.03967 on every level); glmm uses the observed information of each level's effect, lme4 the expected one",
+      "summary": "lme4's ranef(condVar = TRUE) on a GLMM is the expected-information conditional variance, 1/(1/sigma_b^2 + n_j/phi) on a Gamma log-link random intercept: it reproduces lme4's postVar to 6.9e-18, and it is one value for every level of the same size (all 24 clusters have 12 rows, so lme4 reports 0.03967 on each). glmm's condvar is the inverse of the observed curvature of the Laplace integrand at the mode, which depends on each level's data; it matches the observed-information formula to 4.4e-16. On the canonical-link entries (binomial logit, Poisson log) the two coincide and pass; on Gamma's log link they do not. lme4's estimates are also not maximum likelihood here (see oracle-predict-glmm-sim-gamma-se-fit-lme4-estimates), which adds to the gap. 44 lines over the band (22 postVar entries, 22 condsd), from 4.46e-03 to 1.704e-01 relative; the worst is cluster 10's postVar. Measured 2026-10-26 against the frozen predict_glmm_sim_gamma.json."
+    },
+    {
+      "id": "oracle-predict-pastes-se-fit-lme4-vcov-full-permutation",
+      "cell": "predict_pastes",
+      "comparison": [
+        "oracle-tier"
+      ],
+      "quantities": [
+        "se_fit"
+      ],
+      "max_rel": 0.64,
+      "direction": "lme4's conditional-mode standard errors are wrong in both directions (2.37542 against the exact 0.57250 on row 1, 0.70638 against 1.11555 on row 7); glmm's are the exact joint value",
+      "summary": "On Pastes (strength ~ 1 + (1 | batch/cask)) lme4 2.0-6's predict(se.fit = TRUE) has two defects. vcov_full rebuilds the joint covariance from RZX without the fill-reducing permutation P of the sparse factor, while RZX is permuted, so its covariance is wrong whenever P is not the identity (4.2 off the exact joint inverse here, in the largest entry; on the balanced Penicillin, where vcov_full matches, RZX is the same with or without P). And predict.merMod pairs the columns of the new data's Z with the rows of that covariance by position, not by level, so a row reads another level's variance. glmm's se.fit on the seen rows is 0.5725015 against the exact full-joint value 0.5725018 at lme4's own parameters. glmmTMB adds the uncertainty of the variance parameters, and the prior variance on new levels, so it is up to 2.1e-03 off the exact value on the seen rows and far off on the new-level rows. 10 conditional-mode lines over the band (both scales), from 1.286e-03 to 5.793e-01 relative to the nearer reference; the worst is row 7 (batch A, a new cask). Population mode passes. An oracle defect, recorded in reference_disagreements.md section 2. Measured 2026-10-26 against the frozen predict_pastes.json."
     }
   ]
 }

@@ -119,7 +119,7 @@ impl<'w> OlsSuffStats<'w> {
     /// Panel-GEMM: each ≤PANEL_ROWS slice of the block is repacked densely
     /// (column-major) into `panel_x`/`panel_y` once, then X'X/X'y accumulate through
     /// faer GEMM (`Accum::Add`, `Par::Seq` — per-fit parallelism is the outer
-    /// rayon loop) on x86_64, column dot products elsewhere ([`Self::add_panel`]).
+    /// rayon loop) on x86_64, column dot products elsewhere (`Self::add_panel`).
     /// GEMM's blocked accumulation keeps the FP-add chain off the
     /// critical path, unlike a per-row rank-1 triangle update, which serializes
     /// one add per row (mirrors glm.rs's X'WX conversion). `yty`/`sum_y` stay

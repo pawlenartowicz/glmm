@@ -3,9 +3,8 @@
 
 use super::glm::fit_glm;
 use super::*;
-use crate::{
-    BinomialLink, Family, GroupIds, ModelSpec, NegBinomialLink, Note, ReStructure, Sizing,
-};
+use crate::test_support::{fit_cold, fit_warm_wo};
+use crate::{BinomialLink, Family, GroupIds, ModelSpec, NegBinomialLink, Note, ReStructure};
 
 use super::common_tests::{assert_pinned, lcg, sim_clustered, PIN_REL_OLS};
 
@@ -82,11 +81,21 @@ fn fit_glm_gamma_weighted_matches_r() {
         re: None,
     };
     let opts = FitOptions {
-        target_indices: vec![0, 1],
-        weights: Some(w),
+        se_for: SeFor::Only(vec![0, 1]),
         ..FitOptions::default()
     };
-    let f = fit_cold(&x, &yg, n, 2, &model, &GroupIds::default(), &opts);
+    let f = fit_warm_wo(
+        &x,
+        &yg,
+        n,
+        2,
+        &model,
+        &GroupIds::default(),
+        None,
+        Some(&w),
+        None,
+        &opts,
+    );
     assert!(f.converged());
     for j in 0..2 {
         assert!((f.beta[j] - REF_BETA[j]).abs() < 1e-6, "beta[{j}]");
@@ -150,16 +159,18 @@ fn fit_glm_gamma_weight_scale_invariant() {
     };
     let fit_at = |c: f64| {
         let wc: Vec<f64> = w.iter().map(|&wi| c * wi).collect();
-        fit_cold(
+        fit_warm_wo(
             &x,
             &yg,
             n,
             2,
             &model,
             &GroupIds::default(),
+            None,
+            Some(&wc),
+            None,
             &FitOptions {
-                target_indices: vec![0, 1],
-                weights: Some(wc),
+                se_for: SeFor::Only(vec![0, 1]),
                 ..FitOptions::default()
             },
         )
@@ -280,11 +291,21 @@ fn fit_glm_binomial_weighted_aggregated_matches_r() {
         re: None,
     };
     let opts = FitOptions {
-        target_indices: vec![0, 1],
-        weights: Some(m),
+        se_for: SeFor::Only(vec![0, 1]),
         ..FitOptions::default()
     };
-    let f = fit_cold(&x, &yp, n, 2, &model, &GroupIds::default(), &opts);
+    let f = fit_warm_wo(
+        &x,
+        &yp,
+        n,
+        2,
+        &model,
+        &GroupIds::default(),
+        None,
+        Some(&m),
+        None,
+        &opts,
+    );
     assert!(f.converged());
     for j in 0..2 {
         assert!((f.beta[j] - REF_BETA[j]).abs() < 1e-6, "beta[{j}]");
@@ -333,7 +354,7 @@ fn fit_glm_smoke() {
         &model,
         &GroupIds::default(),
         &FitOptions {
-            target_indices: vec![1],
+            se_for: SeFor::Only(vec![1]),
             ..FitOptions::default()
         },
     );
@@ -406,7 +427,7 @@ fn fit_glm_poisson_matches_r() {
         &model,
         &GroupIds::default(),
         &FitOptions {
-            target_indices: vec![0, 1, 2, 3],
+            se_for: SeFor::Only(vec![0, 1, 2, 3]),
             ..FitOptions::default()
         },
     );
@@ -478,16 +499,18 @@ fn fit_glm_poisson_offset_matches_r() {
         },
         re: None,
     };
-    let f = fit_cold(
+    let f = fit_warm_wo(
         &x,
         &y,
         n,
         p,
         &model,
         &GroupIds::default(),
+        None,
+        None,
+        Some(&o),
         &FitOptions {
-            target_indices: vec![0, 1, 2, 3],
-            offset: Some(o.clone()),
+            se_for: SeFor::Only(vec![0, 1, 2, 3]),
             ..FitOptions::default()
         },
     );
@@ -552,11 +575,21 @@ fn fit_glm_poisson_weighted_matches_r() {
         re: None,
     };
     let opts = FitOptions {
-        target_indices: vec![0, 1],
-        weights: Some(w),
+        se_for: SeFor::Only(vec![0, 1]),
         ..FitOptions::default()
     };
-    let f = fit_cold(&x, &y, n, 2, &model, &GroupIds::default(), &opts);
+    let f = fit_warm_wo(
+        &x,
+        &y,
+        n,
+        2,
+        &model,
+        &GroupIds::default(),
+        None,
+        Some(&w),
+        None,
+        &opts,
+    );
     assert!(f.converged(), "weighted poisson GLM must converge");
     assert!((f.dispersion - 1.0).abs() < 1e-12, "poisson φ≡1");
     for j in 0..2 {
@@ -626,12 +659,21 @@ fn fit_glm_poisson_weighted_offset_matches_r() {
         re: None,
     };
     let opts = FitOptions {
-        target_indices: vec![0, 1],
-        weights: Some(w),
-        offset: Some(o),
+        se_for: SeFor::Only(vec![0, 1]),
         ..FitOptions::default()
     };
-    let f = fit_cold(&x, &y, n, 2, &model, &GroupIds::default(), &opts);
+    let f = fit_warm_wo(
+        &x,
+        &y,
+        n,
+        2,
+        &model,
+        &GroupIds::default(),
+        None,
+        Some(&w),
+        Some(&o),
+        &opts,
+    );
     assert!(f.converged(), "weighted+offset poisson GLM must converge");
     for j in 0..2 {
         let b_rel = (f.beta[j] - REF_BETA[j]).abs() / REF_BETA[j].abs();
@@ -696,7 +738,7 @@ fn fit_glm_poisson_highmean_matches_r() {
         &model,
         &GroupIds::default(),
         &FitOptions {
-            target_indices: vec![0, 1, 2],
+            se_for: SeFor::Only(vec![0, 1, 2]),
             ..FitOptions::default()
         },
     );
@@ -774,7 +816,7 @@ fn fit_glm_probit_matches_r() {
         &model,
         &GroupIds::default(),
         &FitOptions {
-            target_indices: vec![0, 1, 2, 3],
+            se_for: SeFor::Only(vec![0, 1, 2, 3]),
             ..FitOptions::default()
         },
     );
@@ -876,11 +918,21 @@ fn fit_glm_probit_weighted_matches_r() {
         re: None,
     };
     let opts = FitOptions {
-        target_indices: vec![0, 1],
-        weights: Some(m),
+        se_for: SeFor::Only(vec![0, 1]),
         ..FitOptions::default()
     };
-    let f = fit_cold(&x, &yp, n, 2, &model, &GroupIds::default(), &opts);
+    let f = fit_warm_wo(
+        &x,
+        &yp,
+        n,
+        2,
+        &model,
+        &GroupIds::default(),
+        None,
+        Some(&m),
+        None,
+        &opts,
+    );
     assert!(f.converged(), "weighted probit GLM must converge");
     assert!((f.dispersion - 1.0).abs() < 1e-12, "probit φ≡1");
     for j in 0..2 {
@@ -899,65 +951,6 @@ fn fit_glm_probit_weighted_matches_r() {
             REF_SE[j]
         );
     }
-}
-
-/// Cloglog GLM through stable `fit` (re: None): the fitted means must reproduce
-/// the link's own inverse at the converged η, and the log-likelihood (−½ the
-/// binomial `dev_resid` sum for 0/1 y) must be the Bernoulli sum at those means. Non-canonical → general
-/// Fisher-scoring branch. The R-gated version is
-/// `fit_glm_cloglog_matches_r` (validation golden `sim_cloglog_glm`).
-#[test]
-fn fit_glm_cloglog_is_self_consistent() {
-    // Small separable-free design: 200 rows, one continuous predictor.
-    let n = 200usize;
-    let p = 2usize;
-    let mut x = Vec::<f64>::with_capacity(n * p);
-    let mut y = Vec::<f64>::with_capacity(n);
-    for i in 0..n {
-        let xi = -2.0 + 4.0 * (i as f64) / (n as f64);
-        x.push(1.0);
-        x.push(xi);
-        // Deterministic 0/1 pattern with both classes present at every x range.
-        y.push(f64::from(u32::from(i % 3 == 0)));
-    }
-    let model = ModelSpec {
-        family: Family::Binomial {
-            link: BinomialLink::Cloglog,
-        },
-        re: None,
-    };
-    let f = fit_cold(
-        &x,
-        &y,
-        n,
-        p,
-        &model,
-        &GroupIds::default(),
-        &FitOptions {
-            target_indices: vec![0, 1],
-            ..FitOptions::default()
-        },
-    );
-    assert!(f.converged(), "cloglog GLM must converge");
-    assert_eq!(f.dispersion, 1.0, "binomial holds φ≡1");
-    for (i, &mu) in f.fitted.iter().enumerate() {
-        let eta = f.beta[0] + f.beta[1] * x[i * p + 1];
-        let want = crate::family::link_inv(model.family, eta);
-        assert!((mu - want).abs() < 1e-9, "μ[{i}] = {mu} vs {want}");
-        assert!(mu > 0.0 && mu < 1.0);
-    }
-    // y is 0/1, so the saturated log-likelihood is 0 and logLik is the Bernoulli
-    // sum at the fitted means (`Fit.deviance` is NaN on the GLM route).
-    let want_ll: f64 = y
-        .iter()
-        .zip(&f.fitted)
-        .map(|(&yi, &mu)| yi * mu.ln() + (1.0 - yi) * (1.0 - mu).ln())
-        .sum();
-    assert!(
-        (f.loglik - want_ll).abs() <= 1e-9 * want_ll.abs(),
-        "logLik {} vs Bernoulli sum at the fitted means {want_ll}",
-        f.loglik
-    );
 }
 
 /// Cloglog binomial GLM through stable `fit` (re: None), gated against frozen R
@@ -1010,7 +1003,7 @@ fn fit_glm_cloglog_matches_r() {
         &model,
         &GroupIds::default(),
         &FitOptions {
-            target_indices: vec![0, 1, 2, 3, 4],
+            se_for: SeFor::Only(vec![0, 1, 2, 3, 4]),
             ..FitOptions::default()
         },
     );
@@ -1032,6 +1025,24 @@ fn fit_glm_cloglog_matches_r() {
             REF_SE[j]
         );
     }
+    for (i, &mu) in f.fitted.iter().enumerate() {
+        let eta: f64 = (0..p).map(|j| x[i * p + j] * f.beta[j]).sum();
+        let want = crate::family::link_inv(model.family, eta);
+        assert!((mu - want).abs() < 1e-9, "μ[{i}] = {mu} vs {want}");
+        assert!(mu > 0.0 && mu < 1.0);
+    }
+    // y is 0/1, so the saturated log-likelihood is 0 and logLik is the Bernoulli
+    // sum at the fitted means (`Fit.deviance` is NaN on the GLM route).
+    let want_ll: f64 = y
+        .iter()
+        .zip(&f.fitted)
+        .map(|(&yi, &mu)| yi * mu.ln() + (1.0 - yi) * (1.0 - mu).ln())
+        .sum();
+    assert!(
+        (f.loglik - want_ll).abs() <= 1e-9 * want_ll.abs(),
+        "logLik {} vs Bernoulli sum at the fitted means {want_ll}",
+        f.loglik
+    );
 }
 
 /// `y ~ 1 + x + grp` design from the committed `sim_gamma.csv`
@@ -1080,7 +1091,7 @@ fn fit_glm_gamma_log_matches_r() {
         &model,
         &GroupIds::default(),
         &FitOptions {
-            target_indices: vec![0, 1, 2],
+            se_for: SeFor::Only(vec![0, 1, 2]),
             ..FitOptions::default()
         },
     );
@@ -1161,7 +1172,7 @@ fn fit_glm_log_link_converges_in_any_response_units() {
             &ModelSpec { family, re: None },
             &GroupIds::default(),
             &FitOptions {
-                target_indices: vec![0, 1, 2],
+                se_for: SeFor::Only(vec![0, 1, 2]),
                 ..FitOptions::default()
             },
         );
@@ -1220,16 +1231,18 @@ fn fit_glm_dispersion_family_stop_rule_is_scale_free() {
             _ => sim_igauss_xy(),
         };
         let y: Vec<f64> = y.iter().map(|v| v * c).collect();
-        fit_cold(
+        fit_warm_wo(
             &x,
             &y,
             n,
             3,
             &ModelSpec { family, re: None },
             &GroupIds::default(),
+            None,
+            k.map(|k| vec![k; n]).as_deref(),
+            None,
             &FitOptions {
-                target_indices: vec![0, 1, 2],
-                weights: k.map(|k| vec![k; n]),
+                se_for: SeFor::Only(vec![0, 1, 2]),
                 ..FitOptions::default()
             },
         )
@@ -1289,7 +1302,7 @@ fn fit_glm_poisson_small_mean_stop_rule_is_scale_free() {
             },
             &GroupIds::default(),
             &FitOptions {
-                target_indices: vec![0, 1, 2],
+                se_for: SeFor::Only(vec![0, 1, 2]),
                 ..FitOptions::default()
             },
         )
@@ -1326,7 +1339,9 @@ fn fit_glm_poisson_small_mean_stop_rule_is_scale_free() {
 ///   `y·1e-2` (weight μ³/4). Both are exactly equivariant, β scaling by `1/c`
 ///   and `1/c²`, so the references are the frozen R fits of
 ///   `fit_glm_gamma_inverse_matches_r` and
-///   `fit_glm_igauss_inverse_squared_matches_r`.
+///   `fit_glm_igauss_inverse_squared_matches_r`. The inverse-Gaussian fit has
+///   η̂ = 1/μ̂² far above `ETA_DIVERGENCE_CAP` and must still converge; its SEs
+///   (scaling like β) and φ̂ (scaling by `1/c`) are checked as well.
 #[test]
 fn fit_glm_small_unit_weights_converge() {
     const POIS_BETA: [f64; 2] = [1.68065523018842, -0.602386665393579];
@@ -1340,7 +1355,7 @@ fn fit_glm_small_unit_weights_converge() {
     }
     let mut y = vec![0.0f64; 30];
     y.extend_from_slice(&[3.0, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0, 6.0, 5.0, 3.0]);
-    let f = fit_cold(
+    let f = fit_warm_wo(
         &x,
         &y,
         n,
@@ -1352,9 +1367,11 @@ fn fit_glm_small_unit_weights_converge() {
             re: None,
         },
         &GroupIds::default(),
+        None,
+        None,
+        Some(&offset),
         &FitOptions {
-            target_indices: vec![0, 1],
-            offset: Some(offset),
+            se_for: SeFor::Only(vec![0, 1]),
             ..FitOptions::default()
         },
     );
@@ -1376,6 +1393,8 @@ fn fit_glm_small_unit_weights_converge() {
 
     const GAMMA_INV_BETA: [f64; 3] = [0.629151640871097, -0.198980738259224, -0.176508060896549];
     const IG_INV_SQ_BETA: [f64; 3] = [0.459456921305253, -0.0419956854008115, -0.0679438262942649];
+    const IG_INV_SQ_SE: [f64; 3] = [0.0189525417126228, 0.0125108528341764, 0.0251747245203818];
+    const IG_INV_SQ_DISP: f64 = 0.29048859329441;
     let cases = [
         (
             Family::Gamma {
@@ -1384,6 +1403,7 @@ fn fit_glm_small_unit_weights_converge() {
             1e-4,
             1e4,
             GAMMA_INV_BETA,
+            None,
         ),
         (
             Family::InverseGaussian {
@@ -1392,9 +1412,10 @@ fn fit_glm_small_unit_weights_converge() {
             1e-2,
             1e4,
             IG_INV_SQ_BETA,
+            Some((IG_INV_SQ_SE, IG_INV_SQ_DISP / 1e-2)),
         ),
     ];
-    for (family, c, beta_scale, ref_beta) in cases {
+    for (family, c, beta_scale, ref_beta, se_and_disp) in cases {
         let (x, y, n) = match family {
             Family::Gamma { .. } => sim_gamma_xy(),
             _ => sim_igauss_xy(),
@@ -1408,7 +1429,7 @@ fn fit_glm_small_unit_weights_converge() {
             &ModelSpec { family, re: None },
             &GroupIds::default(),
             &FitOptions {
-                target_indices: vec![0, 1, 2],
+                se_for: SeFor::Only(vec![0, 1, 2]),
                 ..FitOptions::default()
             },
         );
@@ -1419,6 +1440,21 @@ fn fit_glm_small_unit_weights_converge() {
                 (b - want).abs() / want.abs() < 1e-3,
                 "{family:?}, y·{c:e}: β[{j}] = {b} vs R {want}"
             );
+        }
+        if let Some((ref_se, ref_disp)) = se_and_disp {
+            let disp_rel = (f.dispersion - ref_disp).abs() / ref_disp;
+            assert!(
+                disp_rel < 5e-3,
+                "{family:?}, y·{c:e}: φ = {} vs R {ref_disp}",
+                f.dispersion
+            );
+            for (j, (&s, &r)) in f.se.iter().zip(&ref_se).enumerate() {
+                let want = r * beta_scale;
+                assert!(
+                    (s - want).abs() / want < SE_REL_DISPERSION,
+                    "{family:?}, y·{c:e}: se[{j}] = {s} vs R {want}"
+                );
+            }
         }
     }
 }
@@ -1457,7 +1493,7 @@ fn fit_glm_log_link_offset_units_do_not_matter() {
     ];
     for (e, ref_beta, ref_se) in pois_cases {
         let offset: Vec<f64> = (0..n).map(|i| if i < 30 { e.ln() } else { 0.0 }).collect();
-        let f = fit_cold(
+        let f = fit_warm_wo(
             &x,
             &y,
             n,
@@ -1469,9 +1505,11 @@ fn fit_glm_log_link_offset_units_do_not_matter() {
                 re: None,
             },
             &GroupIds::default(),
+            None,
+            None,
+            Some(&offset),
             &FitOptions {
-                target_indices: vec![0, 1],
-                offset: Some(offset),
+                se_for: SeFor::Only(vec![0, 1]),
                 ..FitOptions::default()
             },
         );
@@ -1501,7 +1539,7 @@ fn fit_glm_log_link_offset_units_do_not_matter() {
         let y: Vec<f64> = (0..n)
             .map(|i| if i % 2 == 1 { y[i] * e } else { y[i] })
             .collect();
-        let f = fit_cold(
+        let f = fit_warm_wo(
             &x,
             &y,
             n,
@@ -1513,9 +1551,11 @@ fn fit_glm_log_link_offset_units_do_not_matter() {
                 re: None,
             },
             &GroupIds::default(),
+            None,
+            None,
+            Some(&offset),
             &FitOptions {
-                target_indices: vec![0, 1, 2],
-                offset: Some(offset),
+                se_for: SeFor::Only(vec![0, 1, 2]),
                 ..FitOptions::default()
             },
         );
@@ -1558,7 +1598,7 @@ fn fit_glm_gamma_exact_fit_loglik_is_the_maximum() {
             &model,
             &GroupIds::default(),
             &FitOptions {
-                target_indices: vec![0],
+                se_for: SeFor::Only(vec![0]),
                 dispersion,
                 ..FitOptions::default()
             },
@@ -1603,7 +1643,7 @@ fn fit_glm_gamma_inverse_matches_r() {
         &model,
         &GroupIds::default(),
         &FitOptions {
-            target_indices: vec![0, 1, 2],
+            se_for: SeFor::Only(vec![0, 1, 2]),
             ..FitOptions::default()
         },
     );
@@ -1662,16 +1702,18 @@ fn fit_glm_gamma_offset_matches_r() {
         },
         re: None,
     };
-    let f = fit_cold(
+    let f = fit_warm_wo(
         &x,
         &y,
         n,
         p,
         &model,
         &GroupIds::default(),
+        None,
+        None,
+        Some(&o),
         &FitOptions {
-            target_indices: vec![0, 1, 2],
-            offset: Some(o),
+            se_for: SeFor::Only(vec![0, 1, 2]),
             ..FitOptions::default()
         },
     );
@@ -1746,7 +1788,7 @@ fn fit_glm_igauss_matches_r() {
         &model,
         &GroupIds::default(),
         &FitOptions {
-            target_indices: vec![0, 1, 2],
+            se_for: SeFor::Only(vec![0, 1, 2]),
             ..FitOptions::default()
         },
     );
@@ -1802,68 +1844,11 @@ fn fit_glm_igauss_inverse_squared_matches_r() {
         &model,
         &GroupIds::default(),
         &FitOptions {
-            target_indices: vec![0, 1, 2],
+            se_for: SeFor::Only(vec![0, 1, 2]),
             ..FitOptions::default()
         },
     );
     assert!(f.converged(), "igauss-inverse_squared GLM must converge");
-    let disp_rel = (f.dispersion - REF_DISP).abs() / REF_DISP;
-    assert!(disp_rel < 5e-3, "φ = {} vs R {REF_DISP}", f.dispersion);
-    for j in 0..p {
-        assert!(
-            (f.beta[j] - REF_BETA[j]).abs() / REF_BETA[j].abs() < 1e-3,
-            "β[{j}] = {} vs R {}",
-            f.beta[j],
-            REF_BETA[j]
-        );
-        let se_rel = (f.se[j] - REF_SE[j]).abs() / REF_SE[j];
-        assert!(
-            se_rel < SE_REL_DISPERSION,
-            "se[{j}] = {} vs R {}",
-            f.se[j],
-            REF_SE[j]
-        );
-    }
-}
-
-/// Same inverse-Gaussian `1/μ²` fixture with the response scaled by 0.1, which
-/// puts μ̂ in [0.128, 0.203] and so η̂ = 1/μ̂² in [24.2, 60.8] — above
-/// `ETA_DIVERGENCE_CAP`, where the fit is still the honest small-mean one and
-/// must converge. The model is exactly equivariant under `y → c·y` here
-/// (η = 1/μ² scales by `c⁻²` and so does every β), so the reference is the
-/// frozen R β of `fit_glm_igauss_inverse_squared_matches_r` times 100, which R
-/// reproduces to 15 digits on the scaled column; φ̂ scales by `c⁻¹`.
-#[test]
-fn fit_glm_igauss_inverse_squared_converges_at_small_mu() {
-    const REF_BETA: [f64; 3] = [45.9456921305253, -4.19956854008116, -6.79438262942649];
-    const REF_SE: [f64; 3] = [1.89525417126228, 1.25108528341764, 2.51747245203818];
-    const REF_DISP: f64 = 2.9048859329441;
-    let (x, y, n) = sim_igauss_xy();
-    let y: Vec<f64> = y.iter().map(|v| v * 0.1).collect();
-    let p = 3;
-    let model = ModelSpec {
-        family: Family::InverseGaussian {
-            link: crate::InverseGaussianLink::InverseSquared,
-        },
-        re: None,
-    };
-    let f = fit_cold(
-        &x,
-        &y,
-        n,
-        p,
-        &model,
-        &GroupIds::default(),
-        &FitOptions {
-            target_indices: vec![0, 1, 2],
-            ..FitOptions::default()
-        },
-    );
-    assert!(
-        f.converged(),
-        "small-mean igauss-inverse_squared GLM must converge; β = {:?}",
-        f.beta
-    );
     let disp_rel = (f.dispersion - REF_DISP).abs() / REF_DISP;
     assert!(disp_rel < 5e-3, "φ = {} vs R {REF_DISP}", f.dispersion);
     for j in 0..p {
@@ -1932,7 +1917,7 @@ fn fit_glm_igauss_inverse_squared_halves_a_first_step_out_of_the_domain() {
             },
             &GroupIds::default(),
             &FitOptions {
-                target_indices: (0..p as u32).collect(),
+                se_for: SeFor::Only((0..p as u32).collect()),
                 ..FitOptions::default()
             },
         )
@@ -1986,7 +1971,7 @@ fn fit_glm_reciprocal_links_converge_in_tiny_response_units() {
                 &ModelSpec { family, re: None },
                 &GroupIds::default(),
                 &FitOptions {
-                    target_indices: vec![0, 1, 2],
+                    se_for: SeFor::Only(vec![0, 1, 2]),
                     ..FitOptions::default()
                 },
             )
@@ -2052,7 +2037,7 @@ fn fit_glm_igauss_log_halves_a_runaway_step_to_the_maximum() {
         },
         &GroupIds::default(),
         &FitOptions {
-            target_indices: vec![0, 1, 2],
+            se_for: SeFor::Only(vec![0, 1, 2]),
             ..FitOptions::default()
         },
     );
@@ -2147,7 +2132,7 @@ fn fit_glm_reciprocal_links_without_intercept_seed_on_a_positive_column() {
             &ModelSpec { family, re: None },
             &GroupIds::default(),
             &FitOptions {
-                target_indices: vec![0, 1],
+                se_for: SeFor::Only(vec![0, 1]),
                 ..FitOptions::default()
             },
         );
@@ -2212,7 +2197,7 @@ fn fit_glm_igauss_log_slow_fisher_surface_reaches_the_maximum() {
         },
         &GroupIds::default(),
         &FitOptions {
-            target_indices: vec![0, 1, 2],
+            se_for: SeFor::Only(vec![0, 1, 2]),
             ..FitOptions::default()
         },
     );
@@ -2258,16 +2243,18 @@ fn fit_glm_igauss_offset_matches_r() {
         },
         re: None,
     };
-    let f = fit_cold(
+    let f = fit_warm_wo(
         &x,
         &y,
         n,
         p,
         &model,
         &GroupIds::default(),
+        None,
+        None,
+        Some(&o),
         &FitOptions {
-            target_indices: vec![0, 1, 2],
-            offset: Some(o),
+            se_for: SeFor::Only(vec![0, 1, 2]),
             ..FitOptions::default()
         },
     );
@@ -2312,7 +2299,7 @@ fn fit_glm_gamma_fixed_dispersion_scales_se() {
     };
     // φ directive lives in FitOptions, not the Family payload.
     let opts = |phi: f64| FitOptions {
-        target_indices: vec![0, 1, 2],
+        se_for: SeFor::Only(vec![0, 1, 2]),
         dispersion: Some(phi),
         ..FitOptions::default()
     };
@@ -2334,7 +2321,7 @@ fn fit_glm_gamma_fixed_dispersion_scales_se() {
         &model,
         &GroupIds::default(),
         &FitOptions {
-            target_indices: vec![0, 1, 2],
+            se_for: SeFor::Only(vec![0, 1, 2]),
             ..FitOptions::default()
         },
     );
@@ -2383,7 +2370,7 @@ fn fit_glm_igauss_fixed_dispersion_scales_se() {
     };
     // φ directive lives in FitOptions, not the Family payload.
     let opts = |phi: f64| FitOptions {
-        target_indices: vec![0, 1, 2],
+        se_for: SeFor::Only(vec![0, 1, 2]),
         dispersion: Some(phi),
         ..FitOptions::default()
     };
@@ -2491,7 +2478,7 @@ fn fit_glm_nb_matches_mass() {
         &model,
         &GroupIds::default(),
         &FitOptions {
-            target_indices: vec![0, 1, 2],
+            se_for: SeFor::Only(vec![0, 1, 2]),
             ..FitOptions::default()
         },
     );
@@ -2571,11 +2558,21 @@ fn fit_glm_nb_weighted_matches_mass() {
         re: None,
     };
     let opts = FitOptions {
-        target_indices: vec![0, 1],
-        weights: Some(w.to_vec()),
+        se_for: SeFor::Only(vec![0, 1]),
         ..FitOptions::default()
     };
-    let f = fit_cold(&x, &y, n, p, &model, &GroupIds::default(), &opts);
+    let f = fit_warm_wo(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &GroupIds::default(),
+        None,
+        Some(&w),
+        None,
+        &opts,
+    );
     assert!(f.converged(), "weighted NB GLM must converge");
     for j in 0..p {
         assert!(
@@ -2653,13 +2650,13 @@ fn fit_glm_nb_two_cycle_is_damped_to_the_mle() {
         x.extend_from_slice(&[1.0, xi]);
     }
     let opts = FitOptions {
-        target_indices: vec![0, 1],
+        se_for: SeFor::Only(vec![0, 1]),
         ..FitOptions::default()
     };
     let family = Family::NegativeBinomial {
         link: NegBinomialLink::Log,
     };
-    let f = fit_glm(family, 0.5, &x, &y, n, p, &opts);
+    let f = fit_glm(family, 0.5, &x, &y, None, None, n, p, &opts);
     assert!(f.converged(), "damped IRLS must converge");
     // Bands are 2 × the measured gap (β 1.14e-5, loglik 3.3e-12 relative). The
     // halved steps converge linearly, so the relative-deviance stopping rule
@@ -2695,8 +2692,7 @@ fn fit_glm_nb_two_cycle_is_damped_to_the_mle() {
 /// `offset=`), so this pins the offset threaded through the NB outer loop by
 /// its structural invariant instead: a CONSTANT offset `c` on the log link
 /// shifts only the intercept, by `−c`, leaving the slopes and the estimated
-/// dispersion θ̂ untouched (μ̂ = exp(c + β₀ + …) = exp((β₀−c) + …)). The Rust
-/// twin of Python's `test_offset_shifts_poisson_intercept_by_minus_constant`.
+/// dispersion θ̂ untouched (μ̂ = exp(c + β₀ + …) = exp((β₀−c) + …)).
 #[test]
 fn fit_glm_nb_constant_offset_shifts_intercept() {
     let csv = include_str!("../../validation/data/simulated/sim_nb.csv");
@@ -2726,21 +2722,23 @@ fn fit_glm_nb_constant_offset_shifts_intercept() {
         &model,
         &GroupIds::default(),
         &FitOptions {
-            target_indices: vec![0, 1, 2],
+            se_for: SeFor::Only(vec![0, 1, 2]),
             ..FitOptions::default()
         },
     );
     let c = 1.3;
-    let shifted = fit_cold(
+    let shifted = fit_warm_wo(
         &x,
         &y,
         n,
         p,
         &model,
         &GroupIds::default(),
+        None,
+        None,
+        Some(&vec![c; n]),
         &FitOptions {
-            target_indices: vec![0, 1, 2],
-            offset: Some(vec![c; n]),
+            se_for: SeFor::Only(vec![0, 1, 2]),
             ..FitOptions::default()
         },
     );
@@ -2808,7 +2806,7 @@ fn nb_edge_fit(csv: &str, ref_beta: &[f64; 3], ref_se: &[f64; 3]) -> Fit {
         &model,
         &GroupIds::default(),
         &FitOptions {
-            target_indices: vec![0, 1, 2],
+            se_for: SeFor::Only(vec![0, 1, 2]),
             ..FitOptions::default()
         },
     );
@@ -2984,54 +2982,6 @@ fn nb_profile_loglik_on_a_huge_count_is_fast() {
     assert!(elapsed.as_secs_f64() < 0.05, "took {elapsed:?}");
 }
 
-/// A fit whose IRLS actually converges (unlike a single `y = 1e10` outlier,
-/// which trips IRLS's own divergence guards before any θ-profile evaluation
-/// runs) with every count near 2e5, so the θ golden-section search's every
-/// evaluation runs the profile on large counts on every row, not just one
-/// outlier row among many small ones.
-#[test]
-fn fit_glm_nb_with_large_counts_converges_and_is_fast() {
-    let n = 30;
-    let p = 2;
-    let mut st = 11u64;
-    let mut x = Vec::with_capacity(n * p);
-    let mut y = Vec::with_capacity(n);
-    for _ in 0..n {
-        let xi = lcg(&mut st);
-        x.push(1.0);
-        x.push(xi);
-        // An exact log-linear mean, no added noise: mu ranges from about
-        // 148,000 to 270,000, and the
-        // outer θ alternation settles in two rounds (round 1 at the
-        // method-of-moments seed, round 2 at the golden-section optimum),
-        // running the θ search's evaluations on every row each round.
-        let mu = 2.0e5 * (0.3 * xi).exp();
-        y.push(mu.round());
-    }
-    let model = ModelSpec {
-        family: Family::NegativeBinomial {
-            link: crate::NegBinomialLink::Log,
-        },
-        re: None,
-    };
-    let opts = FitOptions {
-        target_indices: vec![0, 1],
-        ..FitOptions::default()
-    };
-    let start = std::time::Instant::now();
-    let f = fit_cold(&x, &y, n, p, &model, &GroupIds::default(), &opts);
-    let elapsed = start.elapsed();
-    assert!(f.converged(), "must converge");
-    assert!(
-        f.dispersion.is_finite(),
-        "θ̂ must be finite, got {}",
-        f.dispersion
-    );
-    // A profile that sums `Σ_{k<y} ln(θ+k)` per row took about 1.7 s on
-    // this fixture's ~50 evaluations; the closed form takes milliseconds.
-    assert!(elapsed.as_secs_f64() < 0.5, "took {elapsed:?}");
-}
-
 /// `NB_MAX_OUTER` cap semantics via the `fit_glm_nb_capped` seam, seeded at
 /// `NB_THETA_LO` (far from θ̂ ≈ 1.01 on sim_nb) so one alternation cannot
 /// meet `NB_THETA_TOL`. Pins that cap exhaustion is reported: the capped fit
@@ -3044,7 +2994,7 @@ fn fit_glm_nb_outer_cap_semantics() {
         sim_clustered(include_str!("../../validation/data/simulated/sim_nb.csv"));
     let (n, p) = (y.len(), 3);
     let opts = FitOptions {
-        target_indices: vec![0, 1, 2],
+        se_for: SeFor::Only(vec![0, 1, 2]),
         ..FitOptions::default()
     };
     let seed = Some(super::glm::NB_THETA_LO);
@@ -3053,6 +3003,8 @@ fn fit_glm_nb_outer_cap_semantics() {
     let f1 = super::glm::fit_glm_nb_capped(
         x_mat.as_ref(),
         &y,
+        None,
+        None,
         n,
         p,
         seed,
@@ -3064,6 +3016,8 @@ fn fit_glm_nb_outer_cap_semantics() {
     let full = super::glm::fit_glm_nb_capped(
         x_mat.as_ref(),
         &y,
+        None,
+        None,
         n,
         p,
         seed,
@@ -3111,7 +3065,7 @@ fn fit_glm_nb_outer_cap_semantics() {
     let family = Family::NegativeBinomial {
         link: NegBinomialLink::Log,
     };
-    let at_theta = super::glm::fit_glm(family, f1.dispersion, &x, &y, n, p, &opts);
+    let at_theta = super::glm::fit_glm(family, f1.dispersion, &x, &y, None, None, n, p, &opts);
     for j in 0..p {
         assert!(
             (f1.beta[j] - at_theta.beta[j]).abs() <= 1e-5 * at_theta.beta[j].abs(),
@@ -3182,7 +3136,7 @@ fn fit_glm_scale_variation_matches_r() {
             &model,
             &GroupIds::default(),
             &FitOptions {
-                target_indices: vec![0, 1],
+                se_for: SeFor::Only(vec![0, 1]),
                 ..FitOptions::default()
             },
         );
@@ -3242,7 +3196,7 @@ fn fit_glm_separated_rejected_like_r() {
         },
         &GroupIds::default(),
         &FitOptions {
-            target_indices: vec![0, 1],
+            se_for: SeFor::Only(vec![0, 1]),
             ..FitOptions::default()
         },
     );
@@ -3257,20 +3211,19 @@ fn fit_glm_separated_rejected_like_r() {
     );
 }
 
-/// Failed Gamma GLM (no random effects), **inverse** link, perfectly
-/// separated: `y ~ x`, `y ∈ {1e-6, 1e6}` split exactly on `x ∈ {0, 1}`. Under
-/// `η = 1/μ` the exact fit needs `η` near `1e6` for one group and near `1e-6`
-/// for the other, so the intercept and slope must grow without settling; R's
-/// own `glm(Gamma(link="inverse"))` does not converge on this data either
-/// (checked in R 4.5.3, `glm.control(maxit=2000, epsilon=1e-12)`: still
-/// `converged=FALSE` at iteration 2000, deviance crawling from 6.3e-07 to
-/// 1.6e-07, coefficients stuck at ±999957.9 — a real non-convergent fit, not
-/// an artifact of one solver's cold start). `dispersion` must be NaN, not the
-/// Gamma exponential special case `φ=1`, which a caller cannot tell from a
-/// real estimate. Also with a caller-held φ (`FitOptions::dispersion =
-/// Some(2.0)`): the held value is neither an estimate off this fit nor honored
-/// when the fit never reached an endpoint, so `2.0` would be as dishonest here
-/// as the unheld case's `1.0`.
+/// Failed Gamma GLM (no random effects), inverse link: `y ~ x` with
+/// `y = 1e80·(2 + 0.1x)` on a binary `x`. The maximum sits at the group means,
+/// `η = 1/μ ≈ 5e-81`, below the kernel's `1e-75` floor on the inverse-link η
+/// (`family::INV_ETA_MIN`). The null-model seed is already below that floor,
+/// so the fit starts from η clamped to it, no step reaches the maximum inside
+/// the range (the last β gives η < 0), and the fit ends not converged. R
+/// 4.5.3's `glm(Gamma("inverse"))` fails on these data too: it stops with
+/// "NA/NaN/Inf in 'x'", because `mu.eta(η)² = 1/η⁴` overflows at that η.
+/// `dispersion` must be NaN, not the Gamma exponential special case
+/// `φ=1`, which a caller cannot tell from a real estimate. Also with a
+/// caller-held φ (`FitOptions::dispersion = Some(2.0)`): the held value is
+/// neither an estimate off this fit nor honored when the fit never reached an
+/// endpoint, so `2.0` would be as dishonest here as the unheld case's `1.0`.
 #[test]
 fn fit_glm_gamma_failed_fit_dispersion_is_nan() {
     let n = 24;
@@ -3278,9 +3231,10 @@ fn fit_glm_gamma_failed_fit_dispersion_is_nan() {
     let mut x = vec![0.0f64; n * p];
     let mut y = vec![0.0f64; n];
     for i in 0..n {
+        let xi = if i < 12 { 0.0 } else { 1.0 };
         x[i * p] = 1.0;
-        x[i * p + 1] = if i < 12 { 0.0 } else { 1.0 };
-        y[i] = if i < 12 { 1e-6 } else { 1e6 };
+        x[i * p + 1] = xi;
+        y[i] = 1e80 * (2.0 + 0.1 * xi);
     }
     for held in [None, Some(2.0)] {
         let f = fit_cold(
@@ -3296,14 +3250,15 @@ fn fit_glm_gamma_failed_fit_dispersion_is_nan() {
             },
             &GroupIds::default(),
             &FitOptions {
-                target_indices: vec![0, 1],
+                se_for: SeFor::Only(vec![0, 1]),
                 dispersion: held,
                 ..FitOptions::default()
             },
         );
         assert!(
             !f.converged(),
-            "perfectly separated Gamma(inverse) GLM must not converge (held φ {held:?})"
+            "Gamma(inverse) GLM whose maximum needs η below the kernel's floor must not \
+             converge (held φ {held:?})"
         );
         assert!(
             f.dispersion.is_nan(),
@@ -3312,6 +3267,64 @@ fn fit_glm_gamma_failed_fit_dispersion_is_nan() {
             f.dispersion
         );
     }
+}
+
+/// Gamma GLM, inverse link, `y ~ x` with `y ∈ {1e-6, 1e6}` split exactly on a
+/// binary `x`: two groups, two coefficients, so the maximum is the exact fit
+/// at the group means, `β = [1/1e-6, 1/1e6 − 1/1e-6] = [1e6, −999999.999999]`,
+/// deviance 0. The Fisher weights `μ²` span 24 decades, so the Gram `X'WX`
+/// has cond ≈ 1e24 and its pivot ratio is far below the floor; the step is
+/// solved from a QR of `√W·X` instead, and the fit converges with an
+/// `IllConditioned` note on column 1. R 4.5.3's `glm` at its defaults does
+/// not converge here (25 iterations, β ≈ ±16.8). Measured here, both
+/// coefficients equal the exact values to the last bit; the bound is one
+/// decade above f64 epsilon.
+#[test]
+fn fit_glm_gamma_two_group_means_converge_on_an_ill_conditioned_gram() {
+    const EXACT: [f64; 2] = [1e6, 1e-6 - 1e6];
+    let n = 24;
+    let p = 2;
+    let mut x = vec![0.0f64; n * p];
+    let mut y = vec![0.0f64; n];
+    for i in 0..n {
+        x[i * p] = 1.0;
+        x[i * p + 1] = if i < 12 { 0.0 } else { 1.0 };
+        y[i] = if i < 12 { 1e-6 } else { 1e6 };
+    }
+    let f = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &ModelSpec {
+            family: Family::Gamma {
+                link: crate::GammaLink::Inverse,
+            },
+            re: None,
+        },
+        &GroupIds::default(),
+        &FitOptions {
+            se_for: SeFor::Only(vec![0, 1]),
+            ..FitOptions::default()
+        },
+    );
+    assert!(f.converged(), "the exact two-group fit must converge");
+    for (j, (&b, &e)) in f.beta.iter().zip(&EXACT).enumerate() {
+        assert!(
+            (b - e).abs() <= 1e-15 * e.abs(),
+            "β[{j}] = {b} vs exact {e}"
+        );
+    }
+    let ill: Vec<_> = f
+        .diagnostics
+        .notes
+        .iter()
+        .filter_map(|n| match n {
+            Note::IllConditioned { columns, .. } => Some(columns.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ill, vec![vec![1u32]], "notes: {:?}", f.diagnostics.notes);
 }
 
 /// Gamma inverse link with a small mean, gated against frozen R
@@ -3347,7 +3360,7 @@ fn fit_glm_gamma_inverse_small_mean_matches_r() {
         },
         &GroupIds::default(),
         &FitOptions {
-            target_indices: vec![0, 1],
+            se_for: SeFor::Only(vec![0, 1]),
             ..FitOptions::default()
         },
     );
@@ -3406,16 +3419,18 @@ fn fit_glm_inverse_gaussian_weight_scale_invariant() {
     };
     let fit_at = |c: f64| {
         let wc: Vec<f64> = w.iter().map(|&wi| c * wi).collect();
-        fit_cold(
+        fit_warm_wo(
             &x,
             &y,
             n,
             p,
             &model,
             &GroupIds::default(),
+            None,
+            Some(&wc),
+            None,
             &FitOptions {
-                target_indices: vec![0, 1],
-                weights: Some(wc),
+                se_for: SeFor::Only(vec![0, 1]),
                 ..FitOptions::default()
             },
         )
@@ -3461,10 +3476,9 @@ fn fit_glm_inverse_gaussian_weight_scale_invariant() {
 }
 
 /// Inverse-Gaussian with random effects is not wired (the profiled
-/// `inverse.gaussian()$aic` objective term is not built) and must fault at the
-/// model-shape gate, before any workspace is allocated.
+/// `inverse.gaussian()$aic` objective term is not built) and is refused at
+/// the model-shape check, before any workspace is allocated.
 #[test]
-#[should_panic(expected = "inverse-Gaussian mixed models are not implemented")]
 fn fit_inverse_gaussian_mixed_faults() {
     let n = 8usize;
     let p = 1usize;
@@ -3479,12 +3493,19 @@ fn fit_inverse_gaussian_mixed_faults() {
             link: crate::InverseGaussianLink::Log,
         },
         re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 2 },
+            terms: Vec::new(),
             slopes: vec![],
             extra_groupings: vec![],
         }),
     };
-    let _ = fit_cold(&x, &y, n, p, &model, &ids, &FitOptions::default());
+    let data = Data::new(&x, &y, n, p).ids(&ids);
+    let Err(e) = crate::fit(&data, &model, &FitOptions::default()) else {
+        panic!("the model must be refused");
+    };
+    assert!(
+        matches!(&e, FitError::Unsupported(m) if m.contains("inverse-Gaussian mixed models")),
+        "{e:?}"
+    );
 }
 
 /// A cloglog fit whose rows mostly sit where μ is 1 to machine precision is an
@@ -3517,7 +3538,7 @@ fn fit_glm_cloglog_with_most_rows_at_mu_one_converges() {
         },
         &GroupIds::default(),
         &FitOptions {
-            target_indices: vec![0, 1],
+            se_for: SeFor::Only(vec![0, 1]),
             ..FitOptions::default()
         },
     );
@@ -3572,7 +3593,7 @@ fn fit_glm_poisson_large_counts_converge_at_the_mle() {
         },
         &GroupIds::default(),
         &FitOptions {
-            target_indices: vec![0, 1],
+            se_for: SeFor::Only(vec![0, 1]),
             ..FitOptions::default()
         },
     );
@@ -3596,7 +3617,7 @@ fn fit_glm_poisson_large_counts_converge_at_the_mle() {
 #[test]
 fn fit_glm_entangled_columns_keep_their_digits() {
     let n = 400;
-    let (x, xr, delta) = super::common_tests::entangled_dyadic_designs(n);
+    let (x, xr, delta) = super::common_tests::entangled_dyadic_designs(n, 20);
     let families = [
         Family::Binomial {
             link: BinomialLink::Logit,
@@ -3630,7 +3651,7 @@ fn fit_glm_entangled_columns_keep_their_digits() {
             .collect();
         let model = ModelSpec { family, re: None };
         let opts = FitOptions {
-            target_indices: vec![0, 1, 2],
+            se_for: SeFor::Only(vec![0, 1, 2]),
             ..FitOptions::default()
         };
         let f = fit_cold(&x, &y, n, 3, &model, &GroupIds::default(), &opts);
@@ -3701,7 +3722,7 @@ fn fit_glm_nb_large_counts_settle_theta() {
         },
         &GroupIds::default(),
         &FitOptions {
-            target_indices: vec![0, 1, 2],
+            se_for: SeFor::Only(vec![0, 1, 2]),
             ..FitOptions::default()
         },
     );
@@ -3754,7 +3775,7 @@ fn gamma_and_inverse_gaussian_glm_estimated_phi_have_t_df() {
         let model = ModelSpec { family, re: None };
         for satterthwaite in [true, false] {
             let opts = FitOptions {
-                target_indices: vec![0, 1, 2],
+                se_for: SeFor::Only(vec![0, 1, 2]),
                 satterthwaite,
                 ..FitOptions::default()
             };
@@ -3781,7 +3802,7 @@ fn held_dispersion_keeps_z() {
     for (family, (x, y, n)) in [(gamma, sim_gamma_xy()), (ig, sim_igauss_xy())] {
         let model = ModelSpec { family, re: None };
         let opts = FitOptions {
-            target_indices: vec![0, 1, 2],
+            se_for: SeFor::Only(vec![0, 1, 2]),
             dispersion: Some(1.5),
             ..FitOptions::default()
         };
@@ -3837,7 +3858,7 @@ fn binomial_poisson_nb_glm_have_no_df() {
     for (family, y) in families {
         let model = ModelSpec { family, re: None };
         let opts = FitOptions {
-            target_indices: vec![0, 1],
+            se_for: SeFor::Only(vec![0, 1]),
             ..FitOptions::default()
         };
         let f = fit_cold(&x, y, n, 2, &model, &GroupIds::default(), &opts);
@@ -3875,11 +3896,21 @@ fn glm_fit_reports_nobs_and_maximum_likelihood() {
     for (family, y, weights) in families {
         let model = ModelSpec { family, re: None };
         let opts = FitOptions {
-            target_indices: vec![0, 1, 2],
-            weights,
+            se_for: SeFor::Only(vec![0, 1, 2]),
             ..FitOptions::default()
         };
-        let f = fit_cold(&x, y, n, 3, &model, &GroupIds::default(), &opts);
+        let f = fit_warm_wo(
+            &x,
+            y,
+            n,
+            3,
+            &model,
+            &GroupIds::default(),
+            None,
+            weights.as_deref(),
+            None,
+            &opts,
+        );
         assert!(f.converged(), "{family:?}");
         assert_eq!(
             (f.nobs, f.objective),

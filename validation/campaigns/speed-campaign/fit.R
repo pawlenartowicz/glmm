@@ -87,17 +87,11 @@ for (cell in cells) {
       # it cannot carry the aggregated-binomial convention -- no weights arg
       # needed here, cbind carries it directly.
       #
-      # KNOWN COVERAGE GAP: glmm's own aggregated-binomial lowering always
-      # routes through `FitOptions.weights` (the prior-weights/trial-count
-      # convention, `common.rs::lower_dataset_generic`'s `prop`
-      # synthesis), and `nagq>1 + weights` is a locked-refused combination on
-      # the glmm side (`FitOptions.weights with nAGQ > 1 is not supported`,
-      # src/fit/mod.rs assert_model_shape). So these 6
-      # `bina_q2s_*` cells fit HERE (a legitimate oracle-side AGQ reference,
-      # confirmed above) but glmm engine-fails on the matching cell -- only
-      # 12/18 q2s cells (and all 15 int1) are glmm-vs-oracle joinable under
-      # AGQ; the 6 bina_q2s_* GLMMadaptive rows are oracle-only until/unless
-      # glmm's weights+AGQ gate is revisited (out of this task's scope).
+      # glmm's aggregated-binomial lowering carries the trial counts in
+      # `Data::weights` (`common.rs::lower_dataset_generic`'s `prop`
+      # synthesis), and glmm fits prior weights with nAGQ > 1, so the 6
+      # `bina_q2s_*` cells are the same model on both sides and all 18 q2s
+      # cells (and all 15 int1) are glmm-vs-oracle joinable under AGQ.
       fam <- switch(cell$family, binomial = binomial(), poisson = poisson())
       m <- mixed_model(fixed = as.formula(cell$ma_fixed),
                        random = as.formula(cell$ma_random),

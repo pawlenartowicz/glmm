@@ -1,0 +1,85 @@
+{
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0",
+      "emmeans": "2.0.4",
+      "pbkrtest": "0.5.5"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_posthoc.R"
+  },
+  "emmeans": [
+    {
+      "level": "Golden Rain",
+      "by": null,
+      "estimate": 104.500000000001,
+      "SE": 7.79754201371131,
+      "df": 8.86900040605767
+    },
+    {
+      "level": "Marvellous",
+      "by": null,
+      "estimate": 109.791666666667,
+      "SE": 7.79754201371131,
+      "df": 8.86900040724452
+    },
+    {
+      "level": "Victory",
+      "by": null,
+      "estimate": 97.6250000000004,
+      "SE": 7.79754201371131,
+      "df": 8.86900040829701
+    }
+  ],
+  "contrasts": [
+    {
+      "contrast": "Golden Rain - Marvellous",
+      "by": null,
+      "estimate": -5.29166666666621,
+      "SE": 7.07891763727815,
+      "df": 9.99994852864466,
+      "statistic": -0.747524824812182,
+      "statistic_name": "t",
+      "p_none": 0.471959032877834,
+      "p_tukey": 0.741873567410174
+    },
+    {
+      "contrast": "Golden Rain - Victory",
+      "by": null,
+      "estimate": 6.87500000000053,
+      "SE": 7.07891763727815,
+      "df": 9.99994853040113,
+      "statistic": 0.971193670031732,
+      "statistic_name": "t",
+      "p_none": 0.354356477412036,
+      "p_tukey": 0.61035494901081
+    },
+    {
+      "contrast": "Marvellous - Victory",
+      "by": null,
+      "estimate": 12.1666666666667,
+      "SE": 7.07891763727816,
+      "df": 9.99994852977505,
+      "statistic": 1.71871849484391,
+      "statistic_name": "t",
+      "p_none": 0.116412491189459,
+      "p_tukey": 0.24583153700514
+    }
+  ],
+  "name": "posthoc_oats"
+}

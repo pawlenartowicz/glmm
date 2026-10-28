@@ -1,0 +1,33 @@
+{
+  "name": "sim_binomial_slope2_uncorr_glmm",
+  "engine": "lme4::glmer",
+  "engine_version": "2.0.6",
+  "kind": "glmm",
+  "data": "sim_binomial_slope2",
+  "family": "binomial",
+  "link": "logit",
+  "nagq": 1,
+  "tolPwrss": 1e-13,
+  "r_formula": "y ~ 1 + x1 + x2 + (1 + x1 + x2 || g)",
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)", "x1", "x2"],
+  "estimates": {
+    "beta": [0.354557627562382, 0.519007006572759, -0.363012659317578],
+    "se_hessian": [0.124182305452678, 0.0983021494772411, 0.0982087150535467],
+    "se_rx": [0.121469928407703, 0.0909028475830945, 0.0934198931421046],
+    "loglik": -747.257183898722,
+    "varcomp": [
+      {
+        "group": "g",
+        "terms": ["(Intercept)", "x1", "x2"],
+        "stddev": [1.00500206038762, 0.545878850142886, 0.557037165453646],
+        "corr": [
+          [1, 0, 0],
+          [0, 1, 0],
+          [0, 0, 1]
+        ]
+      }
+    ]
+  }
+}

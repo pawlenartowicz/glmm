@@ -1,5 +1,5 @@
 //! The Rust front end of the anova port gate: one fixed list of model
-//! comparisons and per-term tables, each table written to stdout as one JSONL
+//! comparisons, per-term tables and post-fit calls, each table written to stdout as one JSONL
 //! row per cell. `anova_ports.py` and `anova_ports.R` make the same calls
 //! through the Python and R ports, and `compare_anova_ports.R` compares the
 //! three files cell by cell at the grid's port band. The three front ends
@@ -24,12 +24,19 @@
 //!   binomial and a Gamma GLMM at `"auto"` (Wald), so that every reason
 //!   `"auto"` gives a chi-squared table is in some heading; and the Type III
 //!   likelihood-ratio table of a binomial GLMM whose random slope is a fixed
-//!   term, whose row keeps its Wald test with the crate's note, so that a
-//!   note is in some heading;
+//!   term, whose refit without that term keeps the random slope;
 //! - one `compare` on `wls_basic` with a missing value in `x2`, which only the
 //!   larger formula uses, with each fit's `nobs` as two more cells;
 //! - one exact restricted likelihood-ratio test on Dyestuff, at the default
-//!   draws and seed, through `compare` and through `anova(m0, m1)`.
+//!   draws and seed, through `compare` and through `anova(m0, m1)`;
+//! - the post-fit calls of [`post_fit_calls`] on the Gaussian LMM and the binomial
+//!   GLMM of [`TERM_MODELS`] on `sim_factorial`: `predict` with standard errors
+//!   on the new rows [`NEW_SUBJ`] ... [`NEW_X`], one of them a `subj` the fit
+//!   did not see, and `simulate` (2 draws, seed 1) of both; `r2`, `icc` and
+//!   `pairwise` of `g` (Holm and Tukey) of the Gaussian one. A predict table
+//!   has R's columns `fit`, `se.fit`, `lower`, `upper`, a simulate table
+//!   `sim_1`, `sim_2`, both with rows named `1`, `2`, ...; a pairwise table has
+//!   emmeans' numeric columns, with each row named after its contrast.
 //!
 //! A cell is `{"call", "row", "col", "row_index", "col_index", "value"}`, the
 //! value a number, or the string `"NaN"`, `"Inf"` or `"-Inf"` where the table
@@ -54,9 +61,9 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use glmm::formula::anova::{compare, Comparison, ComparisonTest, Model, ModelInfo, Side};
+use glmm::formula::anova::{compare_stored, Comparison, ComparisonTest, Model, ModelInfo, Side};
 use glmm::inference::{Objective, Reference};
-use glmm::orchestrate::{self, FitResult};
+use glmm::orchestrate::{self, FitResult, StoredParts};
 use serde_json::{json, Value};
 
 /// `validation/`, so the example runs from any working directory.
@@ -251,6 +258,8 @@ const TERM_CALLS: &[TermCall] = &[
 // compares each port's heading with this one: change together with both.
 const LRT_LINE: &str = "Likelihood-ratio chi-squared tests (each term's model refitted without it)";
 const WALD_LINE: &str = "Wald chi-squared tests";
+const ETA2_LINE: &str =
+    "Partial eta-squared uses the Satterthwaite denominator df, so it is approximate.";
 const NOT_CONVERGED: &str = "The fit did not converge, so its estimates are not at a maximum \
      and these tests are not reliable. Change the model until it converges (a simpler random \
      part often helps), then test again.";
@@ -301,21 +310,27 @@ fn read_data(path: &str, factors: &[&str]) -> Data {
                 data.numeric.insert(name.clone(), v);
             }
             _ => {
-                let levels: Vec<String> = cells
-                    .iter()
-                    .map(|c| c.to_string())
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect();
-                let codes = cells
-                    .iter()
-                    .map(|c| levels.iter().position(|l| l == c).expect("a level") as u32)
-                    .collect();
-                data.factor.insert(name.clone(), (levels, codes));
+                data.factor.insert(name.clone(), factor_of(&cells));
             }
         }
     }
     data
+}
+
+/// A factor column: its distinct labels in byte order as levels, and each
+/// cell's 0-based code.
+fn factor_of(cells: &[&str]) -> (Vec<String>, Vec<u32>) {
+    let levels: Vec<String> = cells
+        .iter()
+        .map(|c| c.to_string())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let codes = cells
+        .iter()
+        .map(|c| levels.iter().position(|l| l == c).expect("a level") as u32)
+        .collect();
+    (levels, codes)
 }
 
 /// `cbind(s, t - s) ~ ...` as `cbind(s, failures) ~ ...` with the column
@@ -488,6 +503,7 @@ fn fit(
         None,
         None,
         true,
+        true,
         m.reml,
         anova_test,
     )
@@ -504,7 +520,7 @@ fn anova_call(call: &str, data: &Data, m: [&Member; 2], weights: Option<Vec<f64>
     };
     let opts = orchestrate::compare_options(None, None).expect("the default options");
     let (a, b) = (model_of(m[0], &fits[0]), model_of(m[1], &fits[1]));
-    match compare(&a, &b, &opts) {
+    match compare_stored(&a, &b, &opts) {
         Ok(c) => comparison_table(call, &c, ["m0", "m1"], [fits[0].rss, fits[1].rss]),
         Err(e) => refused(call, &e.to_string()),
     }
@@ -578,27 +594,33 @@ fn pairs() {
     }
 }
 
+/// The data and the model of a label in [`TERM_MODELS`].
+fn term_model(label: &str) -> (Data, Member) {
+    let t = TERM_MODELS
+        .iter()
+        .find(|t| t.label == label)
+        .expect("a model of TERM_MODELS");
+    let mut data = read_data(t.data, t.factors);
+    let m = Member {
+        formula: aggregated(t.formula, &mut data),
+        family: t.family.to_string(),
+        link: t.link.to_string(),
+        reml: None,
+        nagq: 1,
+    };
+    (data, m)
+}
+
 fn term_calls() {
     for c in TERM_CALLS {
-        let t = TERM_MODELS
-            .iter()
-            .find(|t| t.label == c.model)
-            .expect("a model of TERM_MODELS");
-        let mut data = read_data(t.data, t.factors);
-        let m = Member {
-            formula: aggregated(t.formula, &mut data),
-            family: t.family.to_string(),
-            link: t.link.to_string(),
-            reml: None,
-            nagq: 1,
-        };
+        let (data, m) = term_model(c.model);
         let anova_test = if c.test == "LRT" { "LRT" } else { "auto" };
         let r = fit(&data, &m, None, anova_test);
         for ss in c.types {
             let call = if c.named {
-                format!("terms:{}:{ss}:{}", t.label, c.test)
+                format!("terms:{}:{ss}:{}", c.model, c.test)
             } else {
-                format!("terms:{}:{ss}", t.label)
+                format!("terms:{}:{ss}", c.model)
             };
             match &r {
                 Ok(r) => term_table(&call, r, ss, c.test),
@@ -613,9 +635,9 @@ fn term_calls() {
 /// explicit `"Wald"` or `"LRT"` on F rows; then the likelihood-ratio table
 /// for `"LRT"`, and for `"auto"` where the fit's auto choice is the
 /// likelihood-ratio test; the Wald table otherwise. Laid out as both ports
-/// lay it out (lmerTest's columns on F rows, car's on chi-squared rows, Wald
-/// or likelihood-ratio), then the text cells: the heading and the fit's
-/// `term_test_auto` tags.
+/// lay it out (lmerTest's columns with `Eta2_partial` before `Pr(>F)` on F
+/// rows, car's on chi-squared rows, Wald or likelihood-ratio), then the text
+/// cells: the heading and the fit's `term_test_auto` tags.
 fn term_table(call: &str, r: &FitResult, ss: &str, test: &str) {
     let (wald, lrt) = if ss == "III" {
         (&r.term_table_type3, &r.term_table_type3_lrt)
@@ -650,6 +672,7 @@ fn term_table(call: &str, r: &FitResult, ss: &str, test: &str) {
             ("NumDF", tc.num_df),
             ("DenDF", tc.den_df),
             ("F value", tc.statistic),
+            ("Eta2_partial", tc.eta2_partial),
             ("Pr(>F)", tc.p_value),
         ]
     } else {
@@ -686,8 +709,9 @@ fn f_rows(tc: &orchestrate::TermColumns, df_method: &str) -> bool {
 /// has its df, or on a table with no rows when the fit's `df_method` is
 /// Satterthwaite's; a likelihood-ratio table, or any chi-squared table under
 /// `"auto"`, takes a second line naming the test and why it ran; an explicit
-/// `"Wald"` keeps one line), then the not-converged note, the table's notes
-/// and each row's notes.
+/// `"Wald"` keeps one line), then the not-converged note, the table's notes,
+/// each row's notes, and on a Satterthwaite F table the note on its partial
+/// eta-squared.
 fn heading(
     tc: &orchestrate::TermColumns,
     df_method: &str,
@@ -697,15 +721,15 @@ fn heading(
 ) -> String {
     let ss = tc.ss_type;
     let mut lines = Vec::new();
+    let satterthwaite = if tc.label.is_empty() {
+        df_method == "satterthwaite"
+    } else {
+        tc.den_df_kind
+            .iter()
+            .zip(&tc.den_df)
+            .any(|(kind, d)| *kind == "satterthwaite" && d.is_finite())
+    };
     if f_rows(tc, df_method) {
-        let satterthwaite = if tc.label.is_empty() {
-            df_method == "satterthwaite"
-        } else {
-            tc.den_df_kind
-                .iter()
-                .zip(&tc.den_df)
-                .any(|(kind, d)| *kind == "satterthwaite" && d.is_finite())
-        };
         let method = if satterthwaite {
             " with Satterthwaite's method"
         } else {
@@ -745,6 +769,9 @@ fn heading(
     lines.extend(tc.notes.iter().cloned());
     for (label, notes) in tc.label.iter().zip(&tc.row_notes) {
         lines.extend(notes.iter().map(|n| format!("{label}: {n}")));
+    }
+    if f_rows(tc, df_method) && satterthwaite {
+        lines.push(ETA2_LINE.to_string());
     }
     lines.join("\n")
 }
@@ -798,9 +825,180 @@ fn rlrt_calls() {
     anova_call("anova:rlrt_dyestuff", &data, [&m[0], &m[1]], None);
 }
 
+/// The new rows of the `predict` calls, on the columns of `sim_factorial`:
+/// `s99` is a `subj` the fit did not see. All labels are lowercase, so byte
+/// order and R's locale order agree.
+const NEW_SUBJ: [&str; 4] = ["s01", "s02", "s99", "s18"];
+const NEW_G: [&str; 4] = ["a", "b", "c", "c"];
+const NEW_H: [&str; 4] = ["p", "q", "p", "q"];
+const NEW_X: [f64; 4] = [0.5, -1.0, 0.0, 1.25];
+
+/// The post-fit calls, each named `<kind>:<label>` (`pairwise` with
+/// `:g:<adjust>` appended): `predict` and `simulate` on both models, `r2`,
+/// `icc` and `pairwise` on the Gaussian one, each fitted once.
+fn post_fit_calls() {
+    for (label, gaussian) in [
+        ("lmer_sim_factorial", true),
+        ("glmer_sim_factorial_bern", false),
+    ] {
+        let mut calls = vec!["predict", "simulate"];
+        if gaussian {
+            calls.extend(["r2", "icc", "holm", "tukey"]);
+        }
+        let name = |kind: &str| match kind {
+            "holm" | "tukey" => format!("pairwise:{label}:g:{kind}"),
+            _ => format!("{kind}:{label}"),
+        };
+        let (data, m) = term_model(label);
+        match fit(&data, &m, None, "auto") {
+            Ok(r) => {
+                for kind in calls {
+                    if let Err(e) = post_fit(&name(kind), kind, &data, &m, &r) {
+                        refused(&name(kind), &e);
+                    }
+                }
+            }
+            Err(e) => calls.iter().for_each(|kind| refused(&name(kind), &e)),
+        }
+    }
+}
+
+/// One post-fit call on a stored fit, through the orchestrate functions both
+/// ports call, with the parts both ports store.
+fn post_fit(call: &str, kind: &str, data: &Data, m: &Member, r: &FitResult) -> Result<(), String> {
+    let parts = StoredParts {
+        beta: r.beta.clone(),
+        vcov: r.vcov.clone(),
+        varcorr: r.varcorr.clone(),
+        ranef: r.ranef.clone(),
+        ranef_levels: r.ranef_levels.clone(),
+        condvar: r.condvar.clone(),
+        condvar_x: r.condvar_x.clone(),
+        condvar_cross: r.condvar_cross.clone(),
+        dispersion: r.dispersion,
+    };
+    let (numeric, factor) = (data.numeric.clone(), data.factor.clone());
+    let numbered = |n: usize| (1..=n).map(|i| i.to_string()).collect::<Vec<_>>();
+    match kind {
+        "predict" => {
+            let new_numeric = HashMap::from([("x".to_string(), NEW_X.to_vec())]);
+            let new_factor = HashMap::from([
+                ("subj".to_string(), factor_of(&NEW_SUBJ)),
+                ("g".to_string(), factor_of(&NEW_G)),
+                ("h".to_string(), factor_of(&NEW_H)),
+            ]);
+            let p = orchestrate::predict(
+                &m.formula,
+                numeric,
+                factor,
+                &m.family,
+                &m.link,
+                None,
+                None,
+                &parts,
+                Some((new_numeric, new_factor, NEW_X.len())),
+                "link",
+                false,
+                true,
+                true,
+                0.95,
+                false,
+            )?;
+            let rows = numbered(NEW_X.len());
+            let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+            let cols = [
+                ("fit", p.fit),
+                ("se.fit", p.se),
+                ("lower", p.lower),
+                ("upper", p.upper),
+            ];
+            table(call, &rows, &cols);
+        }
+        "simulate" => {
+            let draws = orchestrate::simulate(
+                &m.formula, numeric, factor, &m.family, &m.link, None, None, &parts, 2, 1,
+            )?;
+            let (first, second) = draws.split_at(r.nobs);
+            let rows = numbered(r.nobs);
+            let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+            table(
+                call,
+                &rows,
+                &[("sim_1", first.to_vec()), ("sim_2", second.to_vec())],
+            );
+        }
+        "r2" | "icc" => {
+            let (r2, icc) = orchestrate::effect_sizes(
+                &m.formula,
+                numeric,
+                factor,
+                &m.family,
+                &m.link,
+                None,
+                None,
+                &parts,
+                &r.aliased,
+                r.converged,
+                orchestrate::objective_parts(r.objective),
+                true,
+            )?
+            .expect("a null refit is allowed");
+            let cols = if kind == "r2" {
+                [
+                    ("marginal", vec![r2.marginal]),
+                    ("conditional", vec![r2.conditional]),
+                ]
+            } else {
+                [
+                    ("adjusted", vec![icc.adjusted]),
+                    ("unadjusted", vec![icc.unadjusted]),
+                ]
+            };
+            table(call, &["fit"], &cols);
+        }
+        adjust => {
+            let pw = orchestrate::pairwise(
+                &m.formula,
+                numeric,
+                factor,
+                &m.family,
+                &m.link,
+                r.df_method,
+                &r.beta,
+                &r.vcov,
+                &r.aliased,
+                r.nobs,
+                r.satterthwaite_record.clone(),
+                "g",
+                None,
+                None,
+                adjust,
+            )?;
+            let pc = orchestrate::pairwise_columns(&pw, &r.names);
+            let rows: Vec<&str> = pc.contrast.iter().map(String::as_str).collect();
+            let statistic = if r.df_method == "none" {
+                "z.ratio"
+            } else {
+                "t.ratio"
+            };
+            // No ratio columns: the Gaussian model's identity link has none.
+            let cols = [
+                ("estimate", pc.estimate),
+                ("SE", pc.se),
+                ("df", pc.df),
+                (statistic, pc.statistic),
+                ("p.value", pc.p_adjusted),
+            ];
+            table(call, &rows, &cols);
+        }
+    }
+    Ok(())
+}
+
 fn main() {
     pairs();
     term_calls();
     missing_value_call();
     rlrt_calls();
+    post_fit_calls();
 }

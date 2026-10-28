@@ -1,8 +1,12 @@
-# anova(), compare() and contrast_test(): the per-term table of one fit, the
-# comparison of two models, and one joint test of a fit's coefficients. The
-# crate computes every statistic and p-value (the per-term tables at fit time,
-# the comparison in fastglmm_anova_pair and fastglmm_compare, the joint test
-# in fastglmm_contrast_test); this file only lays them out. Mirrors the Python port's
+# anova(), compare(), contrast_test(), pairwise(), r2() and icc(): the
+# per-term table of one fit, the comparison of two models, one joint test of a
+# fit's coefficients, the pairwise comparisons of a factor's levels, and the
+# R-squared pair and intraclass correlation. The crate computes every
+# statistic and p-value (the per-term tables at fit time, the comparison in
+# fastglmm_anova_pair and fastglmm_compare, the joint test in
+# fastglmm_contrast_test, the comparisons and their intervals in
+# fastglmm_pairwise and fastglmm_pairwise_confint, R-squared and the ICC in
+# fastglmm_effect_sizes); this file only lays them out. Mirrors the Python port's
 # glmm/anova.py - change together. The per-term heading and note texts are
 # also copied in validation/tools/anova_ports/anova_ports.rs, which the anova
 # port gate compares with both ports.
@@ -22,6 +26,12 @@
 #' test, in the same columns (below). There are no random-effect rows: random
 #' effects are tested by comparing two models.
 #'
+#' An F table also has the partial eta-squared of each term, `Eta2_partial`,
+#' `F * NumDF / (F * NumDF + DenDF)` as `effectsize::F_to_eta2` computes it,
+#' before `Pr(>F)`. On a Gaussian mixed model `DenDF` is Satterthwaite's, not
+#' a count of rows, so the value is approximate, and the table says so in its
+#' last note. The table of [contrast_test()] has no such column.
+#'
 #' On a fit with Wald chi-squared rows, `test = "LRT"` gives likelihood-ratio
 #' chi-squared rows, in the Wald table's columns: each term's row compares the
 #' model with the model refitted under the term's hypothesis (Type III: the
@@ -31,8 +41,8 @@
 #' `Anova(test.statistic = "LR")` on a GLM, applied to GLMMs too). These refits
 #' are made when the model is fitted: when the fit asks for them with
 #' `fastglmm(..., anova_test = "LRT")`, and on a Poisson model with random
-#' effects under the default `anova_test = "auto"`. A term whose columns carry a
-#' random slope keeps its Wald row, with a note.
+#' effects under the default `anova_test = "auto"`. Each refit keeps the
+#' model's random effects, random slopes included.
 #'
 #' The default `test = "auto"` gives the likelihood-ratio rows to a Poisson
 #' model with random effects, whatever its size: in simulation the Wald test
@@ -229,7 +239,7 @@ compare <- function(data, f0, f1, ..., family = gaussian(), weights = NULL,
   })
   f_strs <- vapply(forms, function(f) paste(deparse(f, width.cutoff = 500L), collapse = " "),
                    character(1))
-  for (i in 1:2) .check_formula(forms[[i]], f_strs[[i]])
+  for (f in forms) .check_formula(f)
   fam <- .normalize_family(family)
   if (identical(fam$name, "inversegaussian") && any(grepl("|", f_strs, fixed = TRUE))) {
     stop("family 'inversegaussian' is GLM-only: random-effect terms are not supported",
@@ -328,8 +338,9 @@ print.fastglmm_comparison <- function(x, ...) {
 #'   [fixef()] (aliased ones included), one row per tested combination; or a
 #'   numeric vector of that length, for one row.
 #' @return A `c("anova", "data.frame")` with one row named `contrast`, in the
-#'   columns of the [anova()][anova.fastglmm] table of the same test (`Sum Sq`,
-#'   `Mean Sq`, `NumDF`, `DenDF`, `F value`, `Pr(>F)` for an F test; `Chisq`,
+#'   columns of the [anova()][anova.fastglmm] table of the same test without
+#'   `Eta2_partial` (`Sum Sq`, `Mean Sq`, `NumDF`, `DenDF`, `F value`,
+#'   `Pr(>F)` for an F test; `Chisq`,
 #'   `Df`, `Pr(>Chisq)` for the Wald chi-squared test), and a `heading`
 #'   attribute naming the test, followed by the notes.
 #' @seealso [anova()][anova.fastglmm], [compare()]
@@ -364,8 +375,294 @@ contrast_test <- function(object, L) {
     if (is.matrix(L)) as.double(t(L)) else as.double(L), as.integer(rows))
   # A contrast has no SS type: the crate's table carries a placeholder one.
   res$ss_type <- NULL
+  # A contrast is not a term, so its row has no partial eta-squared.
+  res$eta2_partial <- NULL
   # "Wald": the one-line heading of an explicitly asked chi-squared table.
   .term_anova(object, res, "Wald", identical(res$kind, "F"), FALSE)
+}
+
+#' R-squared of a mixed model
+#'
+#' The marginal and the conditional R-squared of a mixed model (Nakagawa and
+#' Schielzeth 2013), the two values of `performance::r2_nakagawa`. On a
+#' binomial model with trial counts they are performance's values for a
+#' `cbind()` response; a `glmer` fitted with `weights =` gets other values
+#' there. The marginal R-squared is the fixed-effect variance divided by the
+#' fixed-effect, the random-effect and the residual variance; the conditional
+#' R-squared also adds the random-effect variance to the numerator. A random
+#' slope's variance is averaged over the rows (Johnson 2014). On a GLMM the
+#' residual variance is the lognormal approximation of the family's variance
+#' on the link scale.
+#'
+#' The values are computed when `r2()` is called. On a Poisson or negative
+#' binomial GLMM each call refits the null model once, so keep the result
+#' instead of calling again. A random-effect variance of 0 gives a
+#' conditional R-squared equal to the marginal one. A fit without random
+#' effects, a Gamma model with a link other than log, an inverse-Gaussian
+#' model and a fit that did not converge give `NaN`. A fit saved by a
+#' fastglmm version that did not keep its training data is an error: refit
+#' it.
+#'
+#' `r2()` is not a method of `performance::r2`: whichever package is
+#' attached last masks the other's `r2()`. Call `fastglmm::r2()` to be sure.
+#' The name is provisional until 1.0.0.
+#'
+#' @param object a [fastglmm] fit.
+#' @return A named numeric vector with the elements `marginal` and
+#'   `conditional`.
+#' @seealso [icc()]; [summary()][summary.fastglmm], which prints both
+#'   R-squared values with the adjusted ICC.
+#' @examples
+#' set.seed(1)
+#' g <- factor(rep(1:30, each = 8))
+#' x <- rnorm(240)
+#' y <- 1 + 0.5 * x + rnorm(30)[as.integer(g)] + rnorm(240)
+#' r2(fastglmm(y ~ x + (1 | g), data.frame(y, x, g)))
+#' @export
+r2 <- function(object) {
+  if (!inherits(object, "fastglmm")) {
+    stop(sprintf("r2() takes a fastglmm fit, not a %s.", class(object)[1L]), call. = FALSE)
+  }
+  e <- .effect_sizes(object, null_refit = TRUE)
+  c(marginal = e$marginal, conditional = e$conditional)
+}
+
+#' Intraclass correlation of a mixed model
+#'
+#' The adjusted and the unadjusted intraclass correlation of a mixed model
+#' over all its groupings, the two values of `performance::icc` (Nakagawa,
+#' Johnson and Schielzeth 2017). The adjusted ICC is the random-effect
+#' variance divided by the random and the residual variance; the unadjusted
+#' ICC also adds the fixed-effect variance to the divisor. The variances are
+#' those of [r2()].
+#'
+#' The values are computed when `icc()` is called. On a Poisson or negative
+#' binomial GLMM each call refits the null model once, so keep the result
+#' instead of calling again. A random-effect variance of 0 gives 0. A fit
+#' without random effects, a Gamma model with a link other than log, an
+#' inverse-Gaussian model and a fit that did not converge give `NaN`. A fit
+#' saved by a fastglmm version that did not keep its training data is an
+#' error: refit it.
+#'
+#' `icc()` is not a method of `performance::icc`: whichever package is
+#' attached last masks the other's `icc()`. Call `fastglmm::icc()` to be sure.
+#' The name is provisional until 1.0.0.
+#'
+#' @param object a [fastglmm] fit.
+#' @return A named numeric vector with the elements `adjusted` and `unadjusted`.
+#' @seealso [r2()]; [summary()][summary.fastglmm], which prints the adjusted
+#'   ICC with the marginal and conditional R-squared.
+#' @examples
+#' set.seed(1)
+#' g <- factor(rep(1:30, each = 8))
+#' x <- rnorm(240)
+#' y <- 1 + 0.5 * x + rnorm(30)[as.integer(g)] + rnorm(240)
+#' icc(fastglmm(y ~ x + (1 | g), data.frame(y, x, g)))
+#' @export
+icc <- function(object) {
+  if (!inherits(object, "fastglmm")) {
+    stop(sprintf("icc() takes a fastglmm fit, not a %s.", class(object)[1L]), call. = FALSE)
+  }
+  e <- .effect_sizes(object, null_refit = TRUE)
+  c(adjusted = e$adjusted, unadjusted = e$unadjusted)
+}
+
+#' Pairwise comparisons of the levels of a factor
+#'
+#' `pairwise()` compares every pair of levels of one factor of the fixed
+#' part, as `emmeans::emmeans()` followed by `pairs()`. Nothing is refitted.
+#'
+#' Each comparison is the difference of two levels' estimated means on the
+#' link scale. The other factors are averaged with equal weights. Every
+#' numeric variable is at its mean over the fit's rows. The test is the t
+#' test on Satterthwaite's df on a Gaussian mixed model, the t test on the
+#' residual df on OLS and the Gamma and inverse-Gaussian GLMs, and the z test
+#' on every other fit. On a log or logit link each row also has the ratio of
+#' the two means (the odds ratio on a logit link), `exp(estimate)`.
+#'
+#' The default adjustment is Holm. emmeans' default is Tukey: use
+#' `adjust = "tukey"` to get emmeans' p-values.
+#'
+#' A Gaussian mixed model fitted with `satterthwaite = FALSE` has no df: its
+#' rows have `NaN` df, statistic and p-value, and a note. A comparison that
+#' reads an aliased coefficient (an empty cell) is `NaN`, with a note.
+#' [confint()][confint.fastglmm_pairwise] of the table gives the confidence
+#' intervals.
+#'
+#' The name is provisional until 1.0.0.
+#'
+#' @param object a [fastglmm] fit.
+#' @param factor the name of a factor of the fixed part.
+#' @param by `NULL`, or the name of another variable of the fixed part. The
+#'   comparisons are made within each level of a factor `by`, or at each value
+#'   in `at` of a numeric `by`. The p-values are adjusted within each of these
+#'   groups.
+#' @param at the values of a numeric `by`, a numeric vector.
+#' @param adjust `"holm"` (the default), `"bonferroni"`, `"tukey"` or `"none"`.
+#' @return A `c("fastglmm_pairwise", "data.frame")` with emmeans' column
+#'   names: `contrast` (`"a - b"`), the `by` variable when given, `estimate`,
+#'   `SE`, `df` (`Inf` on a z test), `t.ratio` or `z.ratio`, `p.value`
+#'   (adjusted), and on a log or logit link `odds.ratio` or `ratio` and its
+#'   `ratio.SE`. Its `heading` attribute names the comparisons; its `footer`
+#'   attribute names the adjustment and holds the notes.
+#' @seealso [confint()][confint.fastglmm_pairwise], [contrast_test()]
+#' @examples
+#' set.seed(1)
+#' g <- factor(rep(1:30, each = 8))
+#' x <- rnorm(240)
+#' f <- factor(sample(c("a", "b", "c"), 240, replace = TRUE))
+#' y <- 1 + 0.5 * x + 0.4 * (f == "b") + rnorm(30)[as.integer(g)] + rnorm(240)
+#' m <- fastglmm(y ~ x + f + (1 | g), data.frame(y, x, f, g))
+#' pw <- pairwise(m, "f")
+#' pw
+#' confint(pw)
+#' @export
+pairwise <- function(object, factor, by = NULL, at = NULL, adjust = "holm") {
+  if (!inherits(object, "fastglmm")) {
+    stop(sprintf("pairwise() takes a fastglmm fit, not a %s.", class(object)[1L]),
+         call. = FALSE)
+  }
+  one_name <- function(x, what) {
+    if (!(is.character(x) && length(x) == 1L && !is.na(x))) {
+      stop(sprintf("%s must be one variable name, got %s", what, .arg_repr(x)), call. = FALSE)
+    }
+  }
+  one_name(factor, "factor")
+  if (!is.null(by)) one_name(by, "by")
+  if (!is.null(at)) {
+    if (is.null(by)) stop("at gives the values of a numeric by, so it needs by", call. = FALSE)
+    if (!(is.numeric(at) && length(at) && all(is.finite(at)))) {
+      stop("at must be one or more finite numbers", call. = FALSE)
+    }
+  }
+  if (!(is.character(adjust) && length(adjust) == 1L && !is.na(adjust))) {
+    stop(sprintf('adjust must be "holm", "bonferroni", "tukey" or "none", got %s',
+                 .arg_repr(adjust)), call. = FALSE)
+  }
+  train <- .training_columns(object)
+  res <- fastglmm_pairwise(
+    object$formula, train$numeric, train$levels, train$codes, object$family_name,
+    object$link, object$df_method, unname(as.double(object$beta)),
+    as.double(t(object$vcov)), unname(as.logical(object$aliased)), as.double(object$nobs),
+    object$satterthwaite_record, names(object$beta), factor, by %||% "",
+    as.double(at %||% double()), adjust)
+  tab <- data.frame(contrast = res$contrast, check.names = FALSE)
+  if (!is.null(res$by)) tab[[res$by]] <- res$by_level
+  tab$estimate <- res$estimate
+  tab$SE <- res$se
+  tab$df <- res$df
+  tab[[if (identical(object$df_method, "none")) "z.ratio" else "t.ratio"]] <- res$statistic
+  tab$p.value <- res$p_adjusted
+  if (!is.null(res$ratio_kind)) {
+    tab[[.RATIO_NAMES[[res$ratio_kind]]]] <- res$ratio
+    tab$ratio.SE <- res$ratio_se
+  }
+  heading <- paste0("Pairwise comparisons of ", res$factor,
+                    if (!is.null(res$by)) paste0(" by ", res$by))
+  structure(tab, heading = heading,
+            footer = c(.adjust_line(res, res$adjust, FALSE), .pairwise_notes(res)),
+            pairwise = res, class = c("fastglmm_pairwise", "data.frame"))
+}
+
+#' Confidence intervals of pairwise comparisons
+#'
+#' Two-sided confidence intervals of the comparisons of a [pairwise()] table,
+#' from each row's estimate, SE and df, as emmeans' `confint()` of `pairs()`.
+#' The intervals follow the table's adjustment: Bonferroni and Tukey intervals
+#' hold for all rows of a `by` group at once. Holm has no simultaneous
+#' interval, so a Holm table gets Bonferroni intervals, and the footer says
+#' so. A `NaN` row gets a `NaN` interval. Nothing is refitted.
+#'
+#' @param object a table from [pairwise()].
+#' @param parm unused.
+#' @param level the confidence level, a number strictly between 0 and 1.
+#' @param ... unused.
+#' @return A `c("fastglmm_pairwise_ci", "data.frame")` with the columns
+#'   `contrast`, the `by` variable when given, `estimate`, `lower.CL`,
+#'   `upper.CL`, and on a log or logit link `odds.ratio` or `ratio` with
+#'   `ratio.lower.CL` and `ratio.upper.CL`. Its `footer` attribute names the
+#'   level and the adjustment.
+#' @seealso [pairwise()]
+#' @export
+confint.fastglmm_pairwise <- function(object, parm, level = 0.95, ...) {
+  res <- attr(object, "pairwise")
+  ci <- fastglmm_pairwise_confint(res$estimate, res$se, res$df, res$p_value, res$adjust,
+                                  res$levels, res$ratio_kind %||% "", as.double(level))
+  tab <- data.frame(contrast = res$contrast, check.names = FALSE)
+  if (!is.null(res$by)) tab[[res$by]] <- res$by_level
+  tab$estimate <- res$estimate
+  tab$lower.CL <- ci$lower
+  tab$upper.CL <- ci$upper
+  if (!is.null(res$ratio_kind)) {
+    tab[[.RATIO_NAMES[[res$ratio_kind]]]] <- res$ratio
+    tab$ratio.lower.CL <- ci$ratio_lower
+    tab$ratio.upper.CL <- ci$ratio_upper
+  }
+  adjust <- if (identical(res$adjust, "holm")) .HOLM_INTERVALS else
+    .adjust_line(res, ci$adjust, TRUE)
+  structure(tab, heading = attr(object, "heading"),
+            footer = c(paste("Confidence level used:", format(level)), adjust,
+                       .pairwise_notes(res)),
+            class = c("fastglmm_pairwise_ci", "data.frame"))
+}
+
+#' @export
+print.fastglmm_pairwise <- function(x, digits = max(3L, getOption("digits") - 3L), ...) {
+  cat(attr(x, "heading"), sep = "\n")
+  print.data.frame(x, digits = digits, ...)
+  cat(attr(x, "footer"), sep = "\n")
+  invisible(x)
+}
+
+#' @export
+print.fastglmm_pairwise_ci <- function(x, ...) print.fastglmm_pairwise(x, ...)
+
+# The column of a pairwise row's ratio, by its ratio_kind.
+.RATIO_NAMES <- c(odds_ratio = "odds.ratio", ratio = "ratio")
+
+# The footer lines of a pairwise table and of its intervals, emmeans' words.
+# Mirrors the Python port's _HOLM_INTERVALS and _adjust_line - change
+# together.
+.HOLM_INTERVALS <- "Holm has no simultaneous interval; Bonferroni intervals shown."
+
+# The footer line naming `adjust` and its family size, NULL for "none". The
+# family of a Holm or Bonferroni adjustment is the tested rows (a p-value
+# that is not NaN) of each `by` group.
+.adjust_line <- function(res, adjust, intervals) {
+  if (identical(adjust, "none")) return(NULL)
+  lead <- if (intervals) "Conf-level adjustment" else "P value adjustment"
+  if (identical(adjust, "tukey")) {
+    sizes <- .tukey_sizes(res)
+    if (length(sizes) > 1L) return(sprintf("%s: tukey method for varying family sizes", lead))
+    return(sprintf("%s: tukey method for comparing a family of %d estimates", lead, sizes))
+  }
+  size <- res$levels * (res$levels - 1) / 2
+  group <- (seq_along(res$p_value) - 1L) %/% size
+  counts <- sort(unique(vapply(split(res$p_value, group), function(p) sum(!is.nan(p)), 0L)))
+  sprintf("%s: %s method for %s %s", lead, adjust, paste(counts, collapse = " or "),
+          if (intervals) "estimates" else "tests")
+}
+
+# Tukey's family size of each `by` group: the levels in at least one tested
+# comparison (a p-value that is not NaN), as the crate's `tukey_k` counts them.
+# Mirrors the Python port's _tukey_sizes - change together.
+.tukey_sizes <- function(res) {
+  k <- as.integer(res$levels)
+  pairs <- which(upper.tri(diag(k)), arr.ind = TRUE)
+  pairs <- pairs[order(pairs[, "row"], pairs[, "col"]), , drop = FALSE]
+  group <- (seq_along(res$p_value) - 1L) %/% nrow(pairs)
+  sort(unique(vapply(split(res$p_value, group), function(p) {
+    length(unique(as.vector(pairs[!is.nan(p), , drop = FALSE])))
+  }, 0L)))
+}
+
+# Each row's notes, as "a - b: note", or "a - b, h = h1: note" within a `by`
+# level.
+.pairwise_notes <- function(res) {
+  label <- if (is.null(res$by)) res$contrast else
+    paste0(res$contrast, ", ", res$by, " = ", res$by_level)
+  unlist(Map(function(l, notes) if (length(notes)) paste0(l, ": ", notes), label,
+             res$row_notes), use.names = FALSE)
 }
 
 # The unnamed elements of `dots`; a named one is an error, as fastglmm()
@@ -406,6 +703,11 @@ contrast_test <- function(object, L) {
   negative_binomial_mixed = "negative binomial model with random effects",
   other_mixed = "Gamma model with random effects",
   no_random_effects = "model without random effects")
+
+# The last note of a Satterthwaite F table with the Eta2_partial column.
+# Mirrors the Python port's _ETA2_LINE and
+# validation/tools/anova_ports/anova_ports.rs - change together.
+.ETA2_LINE <- "Partial eta-squared uses the Satterthwaite denominator df, so it is approximate."
 
 # The first note of a fit that did not converge. Mirrors the Python port's
 # _NOT_CONVERGED and validation/tools/anova_ports/anova_ports.rs - change
@@ -450,9 +752,8 @@ contrast_test <- function(object, L) {
 # Wald table's rows are all F or all chi-squared; an empty table takes its
 # kind from df_method. `test` "LRT", and "auto" where the fit's
 # term_test_auto is the likelihood-ratio test (a Poisson model with random
-# effects), read the likelihood-ratio table the fit stored (a row whose term
-# carries a random slope is its Wald row, with a note); "Wald" and "LRT" on F
-# rows are the crate's refusal.
+# effects), read the likelihood-ratio table the fit stored; "Wald" and "LRT"
+# on F rows are the crate's refusal.
 .term_table <- function(object, type, test) {
   field <- if (identical(type, "III")) "term_table_type3" else "term_table_type2"
   # Only "auto" reads the fit's auto choice: a fit stored before it still
@@ -524,14 +825,20 @@ contrast_test <- function(object, L) {
   # An untested cell is NA, not NaN, so print.anova leaves it blank, as on
   # lmerTest's and car's tables.
   na <- function(v) replace(v, is.nan(v), NA_real_)
+  # A fit saved before the Eta2_partial column, and a contrast, have none.
+  # It sits before the p-value, which print.anova needs last for its stars.
+  eta2 <- f_rows && !is.null(res$eta2_partial)
   tab <- if (f_rows) {
     data.frame(`Sum Sq` = na(res$sum_sq), `Mean Sq` = na(res$mean_sq),
                NumDF = na(res$num_df), DenDF = na(res$den_df),
-               `F value` = na(res$statistic), `Pr(>F)` = na(res$p_value),
-               check.names = FALSE)
+               `F value` = na(res$statistic), check.names = FALSE)
   } else {
     data.frame(Chisq = na(res$statistic), Df = na(res$num_df),
                `Pr(>Chisq)` = na(res$p_value), check.names = FALSE)
+  }
+  if (f_rows) {
+    if (eta2) tab$Eta2_partial <- na(res$eta2_partial)
+    tab[["Pr(>F)"]] <- na(res$p_value)
   }
   rownames(tab) <- res$label
   row_notes <- unlist(Map(function(label, notes) {
@@ -539,7 +846,8 @@ contrast_test <- function(object, L) {
   }, res$label, res$row_notes), use.names = FALSE)
   if (!is.null(res$ss_type)) title[1L] <- paste("Type", res$ss_type, title[1L])
   structure(tab, heading = c(title,
-                            if (!isTRUE(object$converged)) .NOT_CONVERGED, res$notes, row_notes),
+                            if (!isTRUE(object$converged)) .NOT_CONVERGED, res$notes, row_notes,
+                            if (eta2 && satterthwaite) .ETA2_LINE),
             class = c("anova", "data.frame"))
 }
 

@@ -1,5 +1,5 @@
 #![cfg(feature = "formula")]
-//! End-to-end: drive the validation datasets through `lower` → `fit_cold` and assert
+//! End-to-end: drive the validation datasets through `lower` → `glmm::fit` and assert
 //! the formula frontend lowers to the same design, the same grouping ids, and
 //! therefore the same fit as the hand-built `ModelSpec`/`GroupIds` the in-crate
 //! kernel tests use. Closes the loop formula → design → kernel.
@@ -18,8 +18,7 @@ use glmm::formula::{lower, Column, Table};
 #[cfg(feature = "orchestrate")]
 use glmm::orchestrate::run_fit;
 use glmm::{
-    fit_cold, Family, Fit, FitOptions, GroupIds, Grouping, GroupingRelation, ModelSpec, Note,
-    ReStructure, Sizing,
+    Family, Fit, FitOptions, GroupIds, Grouping, GroupingRelation, ModelSpec, Note, ReStructure,
 };
 #[cfg(feature = "orchestrate")]
 use std::collections::HashMap;
@@ -107,14 +106,6 @@ fn design(n: usize, cols: &[Vec<f64>]) -> Vec<f64> {
     x
 }
 
-/// `target_indices = 0..p`, everything else defaulted — what `lower()` fills
-/// `Lowered::opts` with.
-fn opts_for(p: usize) -> FitOptions {
-    let mut o = FitOptions::default();
-    o.target_indices = (0..p as u32).collect();
-    o
-}
-
 /// `|a-b| <= atol + rtol*|b|`.
 fn close(a: f64, b: f64, rtol: f64, atol: f64) -> bool {
     (a - b).abs() <= atol + rtol * b.abs()
@@ -189,22 +180,14 @@ fn assert_frontend_matches_hand_built(
     assert_eq!(lo.y, hand.y, "{ctx}: response");
     assert_eq!(lo.ids.primary, hand.ids.primary, "{ctx}: primary ids");
     assert_eq!(lo.ids.extra, hand.ids.extra, "{ctx}: extra grouping ids");
-    assert_eq!(
-        lo.opts.target_indices,
-        (0..hand.p as u32).collect::<Vec<_>>(),
-        "{ctx}: target indices"
-    );
 
-    let via_formula = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
-    let by_hand = fit_cold(
-        &hand.x,
-        &hand.y,
-        hand.y.len(),
-        hand.p,
+    let via_formula = glmm::fit(&lo.data(), lo.spec(), &FitOptions::default()).unwrap();
+    let by_hand = glmm::fit(
+        &glmm::Data::new(&hand.x, &hand.y, hand.y.len(), hand.p).ids(&hand.ids),
         &hand.model,
-        &hand.ids,
-        &opts_for(hand.p),
-    );
+        &FitOptions::default(),
+    )
+    .unwrap();
     assert!(
         via_formula.converged(),
         "{ctx}: formula fit did not converge"
@@ -216,18 +199,11 @@ fn assert_frontend_matches_hand_built(
     assert_same_fit(&via_formula, &by_hand, ctx);
 }
 
-/// A random-intercept `ReStructure` over `extras` additional groupings. Cluster
-/// counts in `ModelSpec` are placeholders — `Lowered::model`'s own doc says the
-/// kernel re-derives real level counts from `ids` — so they are written as the
-/// true counts here only to keep the spec readable.
-fn intercept_re(primary_clusters: u32, extras: Vec<Grouping>) -> ReStructure {
-    ReStructure {
-        sizing: Sizing::FixedClusters {
-            n_clusters: primary_clusters,
-        },
-        slopes: vec![],
-        extra_groupings: extras,
-    }
+/// A random-intercept `ReStructure` over `extras` additional groupings.
+fn intercept_re(extras: Vec<Grouping>) -> ReStructure {
+    extras
+        .into_iter()
+        .fold(ReStructure::intercept(), ReStructure::extra)
 }
 
 // ── LMM ──────────────────────────────────────────────────────────────────────
@@ -246,20 +222,9 @@ fn sleepstudy_random_slope_matches_hand_built_spec() {
     let y = nums(&data, 0);
     let days = nums(&data, 1);
     let x = design(data.len(), &[days]);
-    let model = ModelSpec {
-        family: Family::Gaussian,
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters {
-                n_clusters: n_levels(&data, 2),
-            },
-            slopes: vec![1], // random slope on Days, design column 1
-            extra_groupings: vec![],
-        }),
-    };
-    let ids = GroupIds {
-        primary: codes(&data, 2),
-        extra: vec![],
-    };
+    // Random slope on Days, design column 1.
+    let model = ModelSpec::mixed(Family::Gaussian, ReStructure::intercept().slopes([1]));
+    let ids = GroupIds::new(codes(&data, 2));
     let hand = HandBuilt {
         x,
         y,
@@ -323,24 +288,8 @@ fn random_slope_on_a_transform_matches_precomputed_column() {
     assert_eq!(lo_via.x, lo_hand.x);
     assert_eq!(lo_via.model, lo_hand.model);
     assert_eq!(lo_via.re_groups[0].terms, vec!["(Intercept)", "log(Days1)"]);
-    let a = fit_cold(
-        &lo_via.x,
-        &lo_via.y,
-        lo_via.n,
-        lo_via.p,
-        &lo_via.model,
-        &lo_via.ids,
-        &lo_via.opts,
-    );
-    let b = fit_cold(
-        &lo_hand.x,
-        &lo_hand.y,
-        lo_hand.n,
-        lo_hand.p,
-        &lo_hand.model,
-        &lo_hand.ids,
-        &lo_hand.opts,
-    );
+    let a = glmm::fit(&lo_via.data(), lo_via.spec(), &FitOptions::default()).unwrap();
+    let b = glmm::fit(&lo_hand.data(), lo_hand.spec(), &FitOptions::default()).unwrap();
     assert_same_fit(&a, &b, "log slope");
 }
 
@@ -357,22 +306,8 @@ fn penicillin_crossed_matches_hand_built_spec() {
     };
     let y = nums(&data, 0);
     let x = design(data.len(), &[]);
-    let model = ModelSpec {
-        family: Family::Gaussian,
-        re: Some(intercept_re(
-            n_levels(&data, 1),
-            vec![Grouping {
-                relation: GroupingRelation::Crossed {
-                    n_clusters: n_levels(&data, 2),
-                },
-                slopes: vec![],
-            }],
-        )),
-    };
-    let ids = GroupIds {
-        primary: codes(&data, 1),
-        extra: vec![codes(&data, 2)],
-    };
+    let model = ModelSpec::mixed(Family::Gaussian, intercept_re(vec![Grouping::crossed()]));
+    let ids = GroupIds::new(codes(&data, 1)).extra(codes(&data, 2));
     let hand = HandBuilt {
         x,
         y,
@@ -406,24 +341,8 @@ fn pastes_nested_matches_hand_built_spec() {
     // `(1|batch/cask)`'s inner grouping is the batch×cask composite, which the
     // fixture already carries as its globally-unique `sample` column (col 3) —
     // so the hand-built ids read that column rather than re-deriving the pairing.
-    let n_batch = n_levels(&data, 1);
-    let n_sample = n_levels(&data, 3);
-    let model = ModelSpec {
-        family: Family::Gaussian,
-        re: Some(intercept_re(
-            n_batch,
-            vec![Grouping {
-                relation: GroupingRelation::NestedWithin {
-                    n_per_parent: n_sample / n_batch,
-                },
-                slopes: vec![],
-            }],
-        )),
-    };
-    let ids = GroupIds {
-        primary: codes(&data, 1),
-        extra: vec![codes(&data, 3)],
-    };
+    let model = ModelSpec::mixed(Family::Gaussian, intercept_re(vec![Grouping::nested()]));
+    let ids = GroupIds::new(codes(&data, 1)).extra(codes(&data, 3));
     let hand = HandBuilt {
         x,
         y,
@@ -474,30 +393,14 @@ fn pastes_flat_nested_equals_the_explicit_nesting() {
     let lo_flat = lower("strength ~ (1|batch) + (1|sample)", &flat, Family::Gaussian).unwrap();
     let extra = &lo_flat.model.re.as_ref().unwrap().extra_groupings[0];
     assert!(
-        matches!(extra.relation, GroupingRelation::NestedWithin { .. }),
+        matches!(extra.relation, GroupingRelation::NestedWithin),
         "flat (1|batch)+(1|sample) should be detected nested, got {:?}",
         extra.relation
     );
 
     let lo_exp = lower("strength ~ (1|batch/cask)", &explicit, Family::Gaussian).unwrap();
-    let f_flat = fit_cold(
-        &lo_flat.x,
-        &lo_flat.y,
-        lo_flat.n,
-        lo_flat.p,
-        &lo_flat.model,
-        &lo_flat.ids,
-        &lo_flat.opts,
-    );
-    let f_exp = fit_cold(
-        &lo_exp.x,
-        &lo_exp.y,
-        lo_exp.n,
-        lo_exp.p,
-        &lo_exp.model,
-        &lo_exp.ids,
-        &lo_exp.opts,
-    );
+    let f_flat = glmm::fit(&lo_flat.data(), lo_flat.spec(), &FitOptions::default()).unwrap();
+    let f_exp = glmm::fit(&lo_exp.data(), lo_exp.spec(), &FitOptions::default()).unwrap();
     assert!(
         f_flat.converged() && f_exp.converged(),
         "pastes did not converge"
@@ -540,28 +443,148 @@ fn cbind_response_equals_proportion_plus_weights() {
     };
     let lo_c = lower("cbind(inc, fail) ~ period + (1|herd)", &table, fam).unwrap();
     let mut lo_w = lower("prop ~ period + (1|herd)", &table, fam).unwrap();
-    lo_w.opts.weights = Some(size);
+    lo_w.weights = Some(size);
     assert_eq!(lo_c.y, lo_w.y);
-    assert_eq!(lo_c.opts.weights, lo_w.opts.weights);
-    let a = fit_cold(
-        &lo_c.x,
-        &lo_c.y,
-        lo_c.n,
-        lo_c.p,
-        &lo_c.model,
-        &lo_c.ids,
-        &lo_c.opts,
-    );
-    let b = fit_cold(
-        &lo_w.x,
-        &lo_w.y,
-        lo_w.n,
-        lo_w.p,
-        &lo_w.model,
-        &lo_w.ids,
-        &lo_w.opts,
-    );
+    assert_eq!(lo_c.weights, lo_w.weights);
+    let a = glmm::fit(&lo_c.data(), lo_c.spec(), &FitOptions::default()).unwrap();
+    let b = glmm::fit(&lo_w.data(), lo_w.spec(), &FitOptions::default()).unwrap();
     assert_same_fit(&a, &b, "cbind");
+}
+
+/// cbpp with its failure count as a column (`cbind()` takes column names
+/// only): `incidence`, `failures = size - incidence`, `period`, `herd`.
+fn cbpp() -> Table {
+    let data = rows(include_str!("../validation/data/empirical/cbpp.csv"));
+    let inc = nums(&data, 1);
+    let fail: Vec<f64> = inc.iter().zip(nums(&data, 2)).map(|(i, s)| s - i).collect();
+    Table {
+        columns: vec![
+            ("incidence".into(), Column::Numeric(inc)),
+            ("failures".into(), Column::Numeric(fail)),
+            ("period".into(), factor(&data, 3)),
+            ("herd".into(), factor(&data, 0)),
+        ],
+        n: data.len(),
+    }
+}
+
+fn logit() -> Family {
+    Family::Binomial {
+        link: glmm::BinomialLink::Logit,
+    }
+}
+
+/// A default-options fit reports the SEs of every coefficient through the
+/// formula door.
+#[test]
+fn default_options_report_every_se_through_the_formula_door() {
+    let table = cbpp();
+    let f = "cbind(incidence, failures) ~ period + (1 | herd)";
+    let model = glmm::formula::fit(f, &table, logit(), &FitOptions::default()).unwrap();
+    let se = &model.fit().se;
+    assert_eq!(se.len(), 4);
+    assert!(se.iter().all(|s| s.is_finite()), "{se:?}");
+}
+
+/// A nested child id is `parent·W + within`, `W` the widest parent's child
+/// count: ids numbered densely over all parents put a child of one parent in
+/// another's slots, and are refused.
+#[test]
+fn nested_ids_outside_the_parent_block_are_refused() {
+    // Parent 0 has one child, parent 1 three: W = 3.
+    let primary: Vec<u32> = [0u32, 0, 1, 1, 1, 1, 1, 1].to_vec();
+    let padded: Vec<u32> = [0u32, 0, 3, 3, 4, 4, 5, 5].to_vec();
+    let dense: Vec<u32> = [0u32, 0, 1, 1, 2, 2, 3, 3].to_vec();
+    let y = [1.0, 1.2, 2.0, 2.3, 3.1, 2.9, 4.0, 4.4];
+    let x = [1.0; 8];
+    let spec = ModelSpec::mixed(Family::Gaussian, intercept_re(vec![Grouping::nested()]));
+    let fit_with = |child: &[u32]| {
+        let ids = GroupIds::new(primary.clone()).extra(child.to_vec());
+        glmm::fit(
+            &glmm::Data::new(&x, &y, 8, 1).ids(&ids),
+            &spec,
+            &FitOptions::default(),
+        )
+    };
+    assert!(fit_with(&padded).is_ok());
+    match fit_with(&dense) {
+        Err(glmm::FitError::Ids(m)) => assert!(m.contains("parent * 3"), "{m}"),
+        other => panic!("expected FitError::Ids, got {:?}", other.err()),
+    }
+}
+
+/// A level count is `max(id) + 1`, so one huge id would size about 4e9 levels
+/// and abort the process; it is refused as a caller error instead.
+#[test]
+fn a_group_id_not_below_n_is_refused() {
+    let y = [1.0, 1.2, 2.0, 2.3];
+    let x = [1.0; 4];
+    let spec = ModelSpec::mixed(Family::Gaussian, intercept_re(vec![]));
+    let ids = GroupIds::new(vec![0, 0, 1, u32::MAX]);
+    match glmm::fit(
+        &glmm::Data::new(&x, &y, 4, 1).ids(&ids),
+        &spec,
+        &FitOptions::default(),
+    ) {
+        Err(glmm::FitError::Ids(m)) => assert!(m.contains("not below the row count 4"), "{m}"),
+        other => panic!("expected FitError::Ids, got {:?}", other.err()),
+    }
+}
+
+/// A binomial GLMM whose response is all 0 or all 1 has no finite maximum: it
+/// ends not converged and `Separated`, as a Poisson GLMM on all-zero counts
+/// does, never converged at |β₀| ≈ 50.
+#[test]
+fn constant_binomial_response_is_separated_not_converged() {
+    let n = 40;
+    let g: Vec<String> = (0..n).map(|i| format!("g{}", i % 8)).collect();
+    for value in [0.0, 1.0] {
+        let table = Table {
+            columns: vec![
+                ("y".into(), Column::Numeric(vec![value; n])),
+                (
+                    "x".into(),
+                    Column::Numeric((0..n).map(|i| i as f64 / n as f64).collect()),
+                ),
+                ("g".into(), Column::factor_from_labels(&g)),
+            ],
+            n,
+        };
+        let model =
+            glmm::formula::fit("y ~ x + (1 | g)", &table, logit(), &FitOptions::default()).unwrap();
+        let fit = model.fit();
+        assert!(!fit.converged(), "y = {value}");
+        assert!(
+            fit.diagnostics
+                .notes
+                .iter()
+                .any(|n| matches!(n, Note::Separated)),
+            "y = {value}: {:?}",
+            fit.diagnostics.notes
+        );
+    }
+}
+
+/// The formula door returns the kernel's refusal of an input as
+/// `Error::Fit`: quadrature on a GLMM with crossed groupings.
+#[test]
+fn formula_fit_returns_unsupported_for_nagq_on_a_crossed_glmm() {
+    let mut opts = FitOptions::default();
+    opts.nagq = 3;
+    let got = glmm::formula::fit(
+        "cbind(incidence, failures) ~ 1 + (1 | herd) + (1 | period)",
+        &cbpp(),
+        logit(),
+        &opts,
+    );
+    assert!(
+        matches!(
+            got,
+            Err(glmm::formula::Error::Fit(glmm::FitError::Unsupported(_)))
+        ),
+        "{:?}",
+        got.err()
+    );
 }
 
 #[test]
@@ -620,24 +643,8 @@ fn assert_same_lowering(formula: &str, a: &Table, b: &Table, family: Family, ctx
         lo.re_groups.iter().map(|g| g.slot_labels.clone()).collect()
     };
     assert_eq!(labels(&lo_b), labels(&lo_a), "{ctx}: level labels");
-    let fit_a = fit_cold(
-        &lo_a.x,
-        &lo_a.y,
-        lo_a.n,
-        lo_a.p,
-        &lo_a.model,
-        &lo_a.ids,
-        &lo_a.opts,
-    );
-    let fit_b = fit_cold(
-        &lo_b.x,
-        &lo_b.y,
-        lo_b.n,
-        lo_b.p,
-        &lo_b.model,
-        &lo_b.ids,
-        &lo_b.opts,
-    );
+    let fit_a = glmm::fit(&lo_a.data(), lo_a.spec(), &FitOptions::default()).unwrap();
+    let fit_b = glmm::fit(&lo_b.data(), lo_b.spec(), &FitOptions::default()).unwrap();
     assert!(fit_b.converged(), "{ctx}: fit did not converge");
     assert_same_fit(&fit_b, &fit_a, ctx);
 }
@@ -765,16 +772,13 @@ fn grouseticks_poisson_matches_hand_built_spec() {
     let mut cols = dummies(&data, 4);
     cols.push(nums(&data, 6));
     let x = design(data.len(), &cols);
-    let model = ModelSpec {
-        family: Family::Poisson {
+    let model = ModelSpec::mixed(
+        Family::Poisson {
             link: glmm::PoissonLink::Log,
         },
-        re: Some(intercept_re(n_levels(&data, 0), vec![])),
-    };
-    let ids = GroupIds {
-        primary: codes(&data, 0),
-        extra: vec![],
-    };
+        intercept_re(vec![]),
+    );
+    let ids = GroupIds::new(codes(&data, 0));
     let hand = HandBuilt {
         x,
         y,
@@ -852,41 +856,7 @@ fn promoted_factor_re_slope_keeps_treatment_dummies() {
     assert_eq!(plain_names, vec!["fb", "fc"]);
 }
 
-#[test]
-fn log_of_a_nonpositive_value_is_reported_not_finite_at_its_row() {
-    let table = Table {
-        columns: vec![
-            ("y".into(), Column::Numeric(vec![1.0, 2.0, 3.0, 4.0])),
-            ("x".into(), Column::Numeric(vec![1.0, 2.0, -1.0, 4.0])),
-        ],
-        n: 4,
-    };
-    let err = match lower("y ~ log(x)", &table, Family::Gaussian) {
-        Ok(_) => panic!("expected log(x) on a non-positive x to be rejected"),
-        Err(e) => e,
-    };
-    assert!(err.to_string().contains("not finite at row 2"), "{err}");
-}
-
-#[test]
-fn a_non_finite_offset_term_is_reported_at_its_row() {
-    let table = Table {
-        columns: vec![
-            ("y".into(), Column::Numeric(vec![1.0, 2.0, 3.0, 4.0])),
-            (
-                "o".into(),
-                Column::Numeric(vec![0.0, f64::INFINITY, 0.0, 0.0]),
-            ),
-        ],
-        n: 4,
-    };
-    let err = match lower("y ~ 1 + offset(o)", &table, Family::Gaussian) {
-        Ok(_) => panic!("expected an infinite offset() entry to be rejected"),
-        Err(e) => e,
-    };
-    assert_eq!(err.to_string(), "term 'offset(o)' is not finite at row 1");
-}
-
+/// The `log(x)` row has a finite input and a non-finite transform output.
 #[test]
 fn a_non_finite_response_or_predictor_is_reported_at_its_row() {
     let cases = [
@@ -894,6 +864,8 @@ fn a_non_finite_response_or_predictor_is_reported_at_its_row() {
         ("x", f64::NAN, "y ~ x", "x"),
         ("y", f64::NEG_INFINITY, "y ~ x", "y"),
         ("x", 1e200, "y ~ x:z", "x:z"),
+        ("x", -1.0, "y ~ log(x)", "log(x)"),
+        ("z", f64::INFINITY, "y ~ x + offset(z)", "offset(z)"),
     ];
     for (col, bad, formula, term) in cases {
         let mut columns = vec![
@@ -1207,7 +1179,7 @@ fn re_groups_align_with_varcorr_blocks() {
         Family::Gaussian,
     )
     .unwrap();
-    let f = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+    let f = glmm::fit(&lo.data(), lo.spec(), &FitOptions::default()).unwrap();
     assert!(f.converged());
 
     // The shim's invariant: one name per varcorr block, same order.
@@ -1240,11 +1212,10 @@ fn re_groups_align_with_varcorr_blocks() {
     );
 }
 
-/// A factor's level order is the caller's, and level
-/// 0 is the treatment-contrast base. Before this, `factor_levels` sorted every
-/// factor through a `BTreeSet`, so `["low","med","high"]` silently based against
-/// `"high"` — same fit quality, different β, a different question answered, and
-/// nothing in the output to reveal it.
+/// A factor's level order is the caller's, and level 0 is the
+/// treatment-contrast base. A sorted level order would base
+/// `["low","med","high"]` against `"high"`: the same fit quality, a different
+/// β, a different question answered, and nothing in the output to reveal it.
 #[test]
 fn declared_factor_level_order_picks_the_reference_level() {
     let labels = ["low", "high", "med", "low", "high", "med"].map(String::from);
@@ -1283,10 +1254,8 @@ fn declared_factor_level_order_picks_the_reference_level() {
     assert_eq!(lo2.col_names, vec!["(Intercept)", "flow", "fmed"]);
 
     // Not just names: the reference level moved, so the intercept moved with it.
-    let f1 = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
-    let f2 = fit_cold(
-        &lo2.x, &lo2.y, lo2.n, lo2.p, &lo2.model, &lo2.ids, &lo2.opts,
-    );
+    let f1 = glmm::fit(&lo.data(), lo.spec(), &FitOptions::default()).unwrap();
+    let f2 = glmm::fit(&lo2.data(), lo2.spec(), &FitOptions::default()).unwrap();
     assert!(f1.converged() && f2.converged());
     // Intercept = mean of the base level: "low" ≈ 1.05 vs "high" ≈ 3.05.
     assert!(
@@ -1328,26 +1297,18 @@ fn rank_deficient_interaction_drops_the_column_r_drops() {
     };
     let lo = lower("y ~ x:z + xz + (1|g)", &table, Family::Gaussian).unwrap();
     assert_eq!(lo.col_names, vec!["(Intercept)", "xz", "x:z"]);
-    let fit = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+    let fit = glmm::fit(&lo.data(), lo.spec(), &FitOptions::default()).unwrap();
     assert_eq!(fit.aliased(), &[false, false, true]);
     assert!(fit.beta[2].is_nan());
 
     let reduced = lower("y ~ xz + (1|g)", &table, Family::Gaussian).unwrap();
-    let want = fit_cold(
-        &reduced.x,
-        &reduced.y,
-        reduced.n,
-        reduced.p,
-        &reduced.model,
-        &reduced.ids,
-        &reduced.opts,
-    );
+    let want = glmm::fit(&reduced.data(), reduced.spec(), &FitOptions::default()).unwrap();
     assert!(fit.converged() && want.converged());
     assert_vec_close(&fit.beta[..2], &want.beta, "kept coefficients");
 }
 
 /// `offset(log(e))` in the formula must produce the same fit as passing the
-/// same vector through `FitOptions.offset`.
+/// same vector through `Data::offset`.
 #[test]
 fn offset_term_equals_offset_argument() {
     let data = rows(include_str!("../validation/data/empirical/grouseticks.csv"));
@@ -1367,27 +1328,11 @@ fn offset_term_equals_offset_argument() {
     };
     let lo_term = lower("TICKS ~ offset(log(HEIGHT)) + (1|BROOD)", &table, fam).unwrap();
     let mut lo_arg = lower("TICKS ~ (1|BROOD)", &table, fam).unwrap();
-    lo_arg.opts.offset = Some(height.iter().map(|h| h.ln()).collect());
+    lo_arg.offset = Some(height.iter().map(|h| h.ln()).collect());
     assert_eq!(lo_term.col_names, vec!["(Intercept)"]);
-    assert_eq!(lo_term.opts.offset, lo_arg.opts.offset);
-    let a = fit_cold(
-        &lo_term.x,
-        &lo_term.y,
-        lo_term.n,
-        lo_term.p,
-        &lo_term.model,
-        &lo_term.ids,
-        &lo_term.opts,
-    );
-    let b = fit_cold(
-        &lo_arg.x,
-        &lo_arg.y,
-        lo_arg.n,
-        lo_arg.p,
-        &lo_arg.model,
-        &lo_arg.ids,
-        &lo_arg.opts,
-    );
+    assert_eq!(lo_term.offset, lo_arg.offset);
+    let a = glmm::fit(&lo_term.data(), lo_term.spec(), &FitOptions::default()).unwrap();
+    let b = glmm::fit(&lo_arg.data(), lo_arg.spec(), &FitOptions::default()).unwrap();
     assert_same_fit(&a, &b, "offset term");
 }
 
@@ -1421,6 +1366,7 @@ fn run_fit_returns_lowered_response_and_nobs() {
         None,
         None,
         None,
+        true,
         true,
         None,
         "Wald",
@@ -1511,7 +1457,7 @@ mod reml_rule {
         }
         run_fit(
             formula, numeric, factors, family, link, "hessian", 1, None, None, None, None, true,
-            reml, "Wald",
+            true, reml, "Wald",
         )
         .unwrap_or_else(|e| panic!("{formula}, reml {reml:?}: {e}"))
     }
@@ -1524,11 +1470,12 @@ mod reml_rule {
         run(formula, &cbpp(), "binomial", "logit", reml)
     }
 
-    /// `fit_cold` on the lowered formula with `FitOptions::reml` set.
+    /// `glmm::fit` on the lowered formula with `FitOptions::reml` set.
     fn cold(formula: &str, table: &Table, family: Family, reml: Option<bool>) -> Fit {
-        let mut lo = lower(formula, table, family).unwrap();
-        lo.opts.reml = reml;
-        fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts)
+        let lo = lower(formula, table, family).unwrap();
+        let mut fit_opts = FitOptions::default();
+        fit_opts.reml = reml;
+        glmm::fit(&lo.data(), lo.spec(), &fit_opts).unwrap()
     }
 
     fn bits(v: &[f64]) -> Vec<u64> {

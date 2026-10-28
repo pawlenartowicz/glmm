@@ -365,7 +365,7 @@ impl<T: Scalar> AssemblyBufs<T> {
 /// caller's. Returns false when the solve did not converge or the objective is
 /// not finite; the caller restores `ws.pirls.u` either way.
 #[allow(clippy::too_many_arguments)]
-fn mode_solve_f64(
+pub(super) fn mode_solve_f64(
     ws: &mut GlmmWorkspace,
     x: MatRef<f64>,
     y: &[f64],

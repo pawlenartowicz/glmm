@@ -18,7 +18,7 @@ path carries no `unsafe`, no RNG, no global state, no I/O, and compiles
 unmodified to `wasm32`). It tests fixed terms and two nested models
 (`anova`, `compare`), with a reference that respects the boundary when a
 variance component is tested. It deliberately is **not** a general inference
-toolkit: no `predict`, no conditional variances for the random effects, no
+toolkit: no
 profile or bootstrap confidence intervals, no
 Kenward-Roger df and no small-sample correction off Gaussian LMMs, and fewer families than
 glmmTMB/GLMMadaptive — anything the engine cannot compute honestly errors with

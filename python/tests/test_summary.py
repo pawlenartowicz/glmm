@@ -28,6 +28,7 @@ def make_fit(**kw):
         "dispersion": 1.0,
         "names": ["(Intercept)", "x"],
         "re_groups": [],
+        "re_term_index": [],
         "n_eval": 0,
         "n_grad": 0,
         "outer_stop": None,
@@ -90,6 +91,7 @@ def _mixed_fit(**kw):
         "varcorr": [np.array([4.0, 1.0, 1.25])],
         "stddev_se": np.array([0.5, float("nan"), 0.3]),
         "re_groups": [("Subject", ["(Intercept)", "Days"])],
+        "re_term_index": [[0, 0]],
         "ranef_levels": np.array([18]),
         "formula": "y ~ x + (1 + x | Subject)",
         "reml": True,
@@ -120,37 +122,6 @@ def test_summary_object_blocks_lmm():
     # Scaled residuals: (y - fitted) / sqrt(dispersion), quantiles type 7.
     r = (np.array([1.0, 2.0, 3.0, 4.0]) - np.array([1.5, 1.5, 3.5, 3.5])) / math.sqrt(654.94)
     np.testing.assert_allclose(s.scaled_residuals, np.quantile(r, [0, 0.25, 0.5, 0.75, 1]))
-
-
-def test_groups_count_excludes_unused_grouping_levels():
-    # A declared level with no rows still owns a slot in ranef_levels (a
-    # block is sized by the highest observed code), but lme4's count is
-    # after droplevels() — one fewer per unused level, and the number every
-    # renderer prints must agree.
-    f = _mixed_fit(
-        diagnostics={
-            "converged": True,
-            "singular": False,
-            "aliased": np.array([False, False]),
-            "boundary": "interior",
-            "pinned": [],
-            "notes": [
-                {
-                    "kind": "unused_grouping_levels",
-                    "columns": [],
-                    "pivot": math.nan,
-                    "evals": 0,
-                    "final_eval": False,
-                    "detail": "Subject: s9, s10",
-                }
-            ],
-        },
-        ranef_levels=np.array([20]),  # 18 used levels + 2 declared-unused
-    )
-    s = f.summary_object()
-    assert s.groups == [("Subject", 18)]
-    for rendered in (s.text(), s.html(), s.latex(), s.typst()):
-        assert "groups:  Subject, 18" in rendered or "groups: Subject, 18" in rendered
 
 
 def test_summary_object_criterion_row_ml():
@@ -507,6 +478,25 @@ def test_random_effects_block_has_no_se_column():
     assert 'strong("se")' not in s.typst()
     # The data stays on the fit.
     np.testing.assert_array_equal(f.stddev_se, stddev_se)
+
+
+def test_uncorrelated_slope_prints_no_correlation():
+    # As lme4: a correlation is printed only between two columns of one term,
+    # and (x || g) is two terms.
+    rng = np.random.default_rng(3)
+    g = np.repeat(np.arange(20), 10)
+    x = rng.normal(size=200)
+    u0, u1 = rng.normal(size=20), 0.5 * rng.normal(size=20)
+    y = 1 + 0.5 * x + u0[g] + u1[g] * x + rng.normal(size=200)
+    data = {"y": y.tolist(), "x": x.tolist(), "g": [f"g{i}" for i in g]}
+
+    def slope_row(formula):
+        lines = glmm.fit(data, formula).summary_object().text().splitlines()
+        start = lines.index("Random effects:")
+        return next(line.split() for line in lines[start:] if line.split()[:1] == ["x"])
+
+    assert len(slope_row("y ~ x + (x || g)")) == 3  # Name, Variance, Std.Dev.
+    assert len(slope_row("y ~ x + (1 + x | g)")) == 4  # and Corr
 
 
 def test_confint_is_a_p_by_2_array_in_names_order():

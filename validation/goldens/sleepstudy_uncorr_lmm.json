@@ -1,0 +1,32 @@
+{
+  "name": "sleepstudy_uncorr_lmm",
+  "engine": "lme4::lmer",
+  "engine_version": "2.0.6",
+  "kind": "lmm",
+  "data": "sleepstudy",
+  "family": "gaussian",
+  "link": {},
+  "nagq": 1,
+  "tolPwrss": {},
+  "r_formula": "Reaction ~ 1 + Days + (1 + Days || Subject)",
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)", "Days"],
+  "estimates": {
+    "beta": [251.405104848483, 10.467285959596],
+    "se": [6.88538081723721, 1.55956909806857],
+    "loglik": -871.834646790741,
+    "varcomp": [
+      {
+        "group": "Subject",
+        "terms": ["(Intercept)", "Days"],
+        "stddev": [25.0513283247761, 5.98818667372297],
+        "corr": [
+          [1, 0],
+          [0, 1]
+        ]
+      }
+    ],
+    "sigma": 25.5652792015696
+  }
+}

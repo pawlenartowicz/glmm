@@ -23,6 +23,18 @@
 # same change -- Tier 2 fails while the flag and the JSON coexist. This script itself
 # ignores the field: it is a registry annotation, not a fit setting, and it is not
 # copied into the reference JSON.
+#
+# ONE VARCOMP BLOCK PER GROUPING FACTOR. lme4 and glmmTMB return one block per
+# random term, so `(1 + x || g)` or `(1 + x1 | g) + (0 + x2 | g)` comes back as
+# blocks `g`, `g.1`. Both varcomp writers join the blocks of one grouping into one
+# block, in the fit's term order, and write the correlations between terms of
+# different blocks as exact 0: the model fixes them, the fit estimates none of
+# them. No JSON field marks those zeros; the `r_formula` says which they are. The
+# optional manifest field `"varcomp": false` drops `varcomp` from the JSON (the
+# row's `//` gives the reason). The optional field `glmm_formula` is the same model
+# in a spelling glmm's formula door accepts, read by the oracle tier only; this
+# script fits `r_formula` and ignores it. A formula with `||` stops unless reformulas, which
+# expands it for lme4, is at its versions.json pin.
 
 suppressMessages({
   library(lme4)
@@ -40,6 +52,8 @@ suppressMessages({
 
 suite_dir <- normalizePath(file.path(dirname(sub(
   "--file=", "", grep("--file=", commandArgs(FALSE), value = TRUE))), ".."))
+source(file.path(suite_dir, "grid", "engines", "versions.R"))
+pins <- grid_versions(file.path(suite_dir, "grid"))
 
 manifest <- fromJSON(file.path(suite_dir, "manifest.json"), simplifyDataFrame = FALSE)
 out_dir  <- file.path(suite_dir, "goldens")
@@ -55,18 +69,36 @@ fam_obj <- function(family, link) switch(family,
   inversegaussian = inverse.gaussian(link = if (link == "inverse_squared") "1/mu^2" else link),
   stop("fam_obj: unsupported family ", family))
 
-# VarCorr -> per grouping factor: term names, stddevs, correlation matrix. Mirrors
-# the oracle scripts' varcomp writers so the JSON schema matches the curated GLMM references.
-varcomp_of <- function(m) {
-  vc <- VarCorr(m)
-  lapply(names(vc), function(g) {
-    block <- vc[[g]]
-    sd <- attr(block, "stddev")
-    corr <- attr(block, "correlation")
-    list(group = g, terms = I(names(sd)),
-         stddev = I(unname(sd)), corr = unname(corr))
+# VarCorr blocks -> per grouping factor: term names, stddevs, correlation matrix.
+# `groups` is the grouping of each block (the names of the fit's cnms, which
+# VarCorr makes unique as `g`, `g.1`). The key names match the grid engines'
+# varcomp writers; joining the blocks of one grouping into one block is this
+# script's own (the grid engines write one block per random term).
+varcomp_blocks <- function(vc, groups) {
+  stopifnot(length(vc) == length(groups))
+  lapply(unique(groups), function(g) {
+    blocks <- vc[groups == g]
+    terms <- unlist(lapply(blocks, function(b) names(attr(b, "stddev"))), use.names = FALSE)
+    corr <- matrix(0, length(terms), length(terms))
+    at <- 0L
+    for (b in blocks) {
+      idx <- at + seq_along(attr(b, "stddev"))
+      corr[idx, idx] <- attr(b, "correlation")
+      at <- at + length(idx)
+    }
+    list(group = g, terms = I(terms),
+         stddev = I(unlist(lapply(blocks, function(b) attr(b, "stddev")), use.names = FALSE)),
+         corr = corr)
   })
 }
+
+varcomp_of <- function(m) varcomp_blocks(VarCorr(m), names(m@cnms))
+
+# lme4 files its singular-fit note among the convergence messages. `singular`
+# already reports the boundary, so that note alone leaves a fit converged.
+LME4_SINGULAR_MSG <- "boundary (singular) fit: see help('isSingular')"
+lme4_converged <- function(m)
+  length(setdiff(unlist(m@optinfo$conv$lme4$messages), LME4_SINGULAR_MSG)) == 0
 
 # m3_goldens specs carry a bare `data` name (no `source` field like the curated
 # manifest.datasets rungs), so the empirical/simulated split is read off the
@@ -133,10 +165,9 @@ fit_one_glmmadaptive <- function(spec, df) {
     coef_names = I(names(fixef(m))),
     estimates = est
   )
-  out <- file.path(out_dir, paste0(spec$name, ".json"))
-  write(toJSON(res, auto_unbox = TRUE, pretty = TRUE, digits = NA, na = "null"), out)
   cat(sprintf("m3  %-20s  %-4s  %-9s nAGQ=%-2d converged=%s (GLMMadaptive)\n",
               spec$name, spec$kind, spec$family, nagq, res$converged))
+  res
 }
 
 # glmmTMB reference fit (spec oracle="glmmTMB"): the exact Laplace objective by
@@ -151,10 +182,13 @@ fit_one_glmmadaptive <- function(spec, df) {
 # glmm's WaldSe::Hessian), loglik, varcomp, and the dispersion glmm reports on the
 # family (Gamma: sigma()^2 = phi; NB: sigma() = theta). No se_rx (glmmTMB has
 # none). Converged = convergence code 0 AND a positive-definite Hessian, the grid
-# engine's own rule (validation/grid/engines/glmmtmb.R).
+# engine's own rule (validation/grid/engines/glmmtmb.R). A Gaussian row is fitted
+# at the row's `reml` and writes the lmer row's fields (se, sigma), so it reads
+# like the other LMM goldens.
 fit_one_glmmtmb <- function(spec, df) {
   suppressMessages(library(glmmTMB))
   fam <- switch(spec$family,
+    gaussian = stats::gaussian(),
     binomial = stats::binomial(link = spec$link),
     poisson  = stats::poisson(link = spec$link),
     gamma    = stats::Gamma(link = spec$link),
@@ -166,23 +200,19 @@ fit_one_glmmtmb <- function(spec, df) {
   # NaN at starting parameter values". Only then is the fit retried from the
   # fixed-effects GLM's beta, so every golden that converges from the default
   # start is unaffected by this branch.
-  m <- tryCatch(glmmTMB::glmmTMB(fm, data = df, family = fam), error = function(e) {
+  reml <- isTRUE(spec$reml)
+  m <- tryCatch(glmmTMB::glmmTMB(fm, data = df, family = fam, REML = reml), error = function(e) {
     b0 <- coef(glm(lme4::nobars(fm), data = df, family = fam))
-    glmmTMB::glmmTMB(fm, data = df, family = fam, start = list(beta = unname(b0)))
+    glmmTMB::glmmTMB(fm, data = df, family = fam, REML = reml, start = list(beta = unname(b0)))
   })
   cf <- glmmTMB::fixef(m)$cond
   varc <- glmmTMB::VarCorr(m)$cond
-  est <- list(
-    beta = I(unname(cf)),
-    se_hessian = I(unname(sqrt(diag(stats::vcov(m)$cond)))),
-    loglik = as.numeric(stats::logLik(m)),
-    varcomp = lapply(names(varc), function(g) {
-      block <- varc[[g]]
-      list(group = g, terms = I(names(attr(block, "stddev"))),
-           stddev = I(unname(attr(block, "stddev"))),
-           corr = unname(attr(block, "correlation")))
-    })
-  )
+  se <- I(unname(sqrt(diag(stats::vcov(m)$cond))))
+  est <- list(beta = I(unname(cf)))
+  if (spec$family == "gaussian") est$se <- se else est$se_hessian <- se
+  est$loglik <- as.numeric(stats::logLik(m))
+  est$varcomp <- varcomp_blocks(varc, names(m$modelInfo$reTrms$cond$cnms))
+  if (spec$family == "gaussian") est$sigma <- stats::sigma(m)
   if (spec$family == "gamma") est$dispersion <- stats::sigma(m)^2
   if (spec$family == "negbin") est$theta <- stats::sigma(m)
   converged <- isTRUE(m$fit$convergence == 0) && isTRUE(m$sdr$pdHess)
@@ -198,10 +228,9 @@ fit_one_glmmtmb <- function(spec, df) {
     coef_names = I(names(cf)),
     estimates = est
   )
-  out <- file.path(out_dir, paste0(spec$name, ".json"))
-  write(toJSON(res, auto_unbox = TRUE, pretty = TRUE, digits = NA, na = "null"), out)
   cat(sprintf("m3  %-20s  %-4s  %-9s converged=%s singular=%s (glmmTMB)\n",
               spec$name, spec$kind, spec$family, converged, singular))
+  res
 }
 
 # Gamma GLM at the maximum-likelihood dispersion, glmm's Gamma GLM convention:
@@ -237,17 +266,13 @@ fit_one_glm_ml <- function(spec, df) {
     coef_names = I(names(coef(m))),
     estimates = est
   )
-  out <- file.path(out_dir, paste0(spec$name, ".json"))
-  write(toJSON(res, auto_unbox = TRUE, pretty = TRUE, digits = NA, na = "null"), out)
   cat(sprintf("m3  %-20s  %-4s  %-9s converged=%s (ML dispersion)\n",
               spec$name, spec$kind, spec$family, isTRUE(m$converged)))
+  res
 }
 
-fit_one <- function(spec) {
-  df <- read_dataset(spec)
-  if (identical(spec$oracle, "GLMMadaptive")) return(fit_one_glmmadaptive(spec, df))
-  if (identical(spec$oracle, "glmmTMB")) return(fit_one_glmmtmb(spec, df))
-  if (identical(spec$oracle, "glm_ml")) return(fit_one_glm_ml(spec, df))
+# lme4, stats::glm or MASS::glm.nb reference fit: every spec without an `oracle`.
+fit_one_lme4 <- function(spec, df) {
   fm <- as.formula(spec$r_formula)
   nagq <- if (is.null(spec$nagq)) 1L else as.integer(spec$nagq)
 
@@ -283,8 +308,7 @@ fit_one <- function(spec) {
     est$loglik <- as.numeric(logLik(m))
     est$varcomp <- varcomp_of(m)
     est$sigma <- sigma(m)
-    conv_msgs <- m@optinfo$conv$lme4$messages
-    converged <- is.null(conv_msgs) || length(conv_msgs) == 0
+    converged <- lme4_converged(m)
     singular  <- isSingular(m)
   } else {
     # Optional per-spec tolPwrss (manifest `tolPwrss`): the curated oracle's
@@ -312,8 +336,7 @@ fit_one <- function(spec) {
       I(unname(sqrt(diag(as.matrix(vcov(m, use.hessian = FALSE)))))))
     est$loglik <- as.numeric(logLik(m))
     est$varcomp <- varcomp_of(m)
-    conv_msgs <- m@optinfo$conv$lme4$messages
-    converged <- is.null(conv_msgs) || length(conv_msgs) == 0
+    converged <- lme4_converged(m)
     singular  <- isSingular(m)
   }
 
@@ -350,17 +373,31 @@ fit_one <- function(spec) {
     kind = spec$kind, data = spec$data,
     family = spec$family, link = spec$link,
     nagq = nagq,
-    tolPwrss = spec$tolPwrss,  # NULL (dropped) unless the spec sets it
+    tolPwrss = spec$tolPwrss,  # removed below when the spec does not set it
 
     r_formula = spec$r_formula,
     converged = converged, singular = singular,
     coef_names = I(coef_names),
     estimates = est
   )
-  out <- file.path(out_dir, paste0(spec$name, ".json"))
-  write(toJSON(res, auto_unbox = TRUE, pretty = TRUE, digits = NA, na = "null"), out)
+  # jsonlite writes a NULL list member as {}, so drop the key itself.
+  if (is.null(spec$tolPwrss)) res$tolPwrss <- NULL
   cat(sprintf("m3  %-20s  %-4s  %-9s converged=%s singular=%s\n",
               spec$name, spec$kind, spec$family, converged, singular))
+  res
+}
+
+fit_one <- function(spec) {
+  if (grepl("||", spec$r_formula, fixed = TRUE))
+    assert_pkg_version("reformulas", pins[["reformulas"]])
+  df <- read_dataset(spec)
+  res <- if (identical(spec$oracle, "GLMMadaptive")) fit_one_glmmadaptive(spec, df)
+         else if (identical(spec$oracle, "glmmTMB")) fit_one_glmmtmb(spec, df)
+         else if (identical(spec$oracle, "glm_ml")) fit_one_glm_ml(spec, df)
+         else fit_one_lme4(spec, df)
+  if (isFALSE(spec$varcomp)) res$estimates$varcomp <- NULL
+  out <- file.path(out_dir, paste0(spec$name, ".json"))
+  write(toJSON(res, auto_unbox = TRUE, pretty = TRUE, digits = NA, na = "null"), out)
 }
 
 # VALIDATION_ONLY=<name>[,<name>...]: fit only the named goldens —

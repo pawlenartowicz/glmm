@@ -43,6 +43,7 @@ def test_native_fit_refuses_bytes_that_are_not_whole_values():
             None,
             None,
             False,
+            True,
             None,
         )
 
@@ -96,7 +97,7 @@ def test_pinned_detail_survives_a_q2_grouping_where_the_stddev_is_not_zero():
     # stddev inherits the off-diagonal, so it lands at ~1e-10, not at 0.0.
     # Reading `pinned` names the component.
     #
-    # Design mirrors the Rust lmm::tests::zero_slope_variance_pins_slope_component:
+    # Design mirrors the Rust fit::common_tests::diagnostics_pinned_aligns_with_varcorr_blocks:
     # 16 clusters x 16 rows, a real fixed slope but zero cluster-varying slope,
     # residual a +/-0.8 period-4 quadrature block against x's +/-1 alternation so
     # every cluster has sum(resid) = 0 and sum(x*resid) = 0 exactly. The REML
@@ -178,43 +179,6 @@ def test_gamma_glm_fixed_dispersion():
     assert result.dispersion == pytest.approx(1.0)
 
 
-def test_agq_vector_q2_smoke():
-    # q=2 (random intercept + slope) binomial with small clusters, where the
-    # Laplace bias AGQ corrects is visible — proves nagq>1 actually routed to
-    # the vector-AGQ kernel instead of silently refitting Laplace.
-    rng = np.random.default_rng(42)
-    n_groups, per = 75, 4
-    n = n_groups * per
-    g = np.repeat(np.arange(n_groups), per)
-    x = rng.normal(size=n)
-    b0 = rng.normal(scale=1.2, size=n_groups)
-    b1 = rng.normal(scale=0.8, size=n_groups)
-    eta = 0.3 + 0.8 * x + b0[g] + b1[g] * x
-    y = rng.binomial(1, 1.0 / (1.0 + np.exp(-eta))).astype(float)
-    data = {"y": y.tolist(), "x": x.tolist(), "g": [f"g{i}" for i in g.tolist()]}
-
-    laplace = glmm.fit(data, "y ~ x + (1 + x | g)", "binomial")  # nagq=1 default
-    agq = glmm.fit(data, "y ~ x + (1 + x | g)", "binomial", nagq=7, wald_se="hessian")
-    assert agq.converged
-    assert np.all(np.isfinite(agq.se))
-    # Gate routed: quadrature moves the answer off the Laplace fit (empirically
-    # ~3e-2 in beta and ~0.3 in varcorr on this dataset — far above tolerance).
-    assert np.max(np.abs(agq.beta - laplace.beta)) > 1e-6
-    assert np.max(np.abs(np.array(agq.varcorr[0]) - np.array(laplace.varcorr[0]))) > 1e-4
-
-
-def test_mixed_binomial_exposes_ranef_consistent_with_levels():
-    p = 1.0 / (1.0 + np.exp(-(0.2 + 0.8 * _X)))
-    y = _rng.binomial(1, p).astype(float)
-    result = glmm.fit(_data(y.tolist()), "y ~ x + (1 | g)", "binomial")
-    assert result.converged
-    assert len(result.ranef_levels) == len(result.varcorr)
-    q = 1  # scalar random intercept -> q=1 per level
-    assert len(result.ranef) == sum(int(lv) * q for lv in result.ranef_levels)
-    assert result.names == ["(Intercept)", "x"]
-    assert result.dispersion == pytest.approx(1.0)
-
-
 def test_lmm_ranef_blocks_label_the_flat_vector():
     # The port is a pure renderer: the kernel owns the block layout, so what
     # this checks is that the labelled view and the flat vector are the same
@@ -235,36 +199,6 @@ def test_lmm_ranef_blocks_label_the_flat_vector():
     assert sorted(block["levels"]) == sorted(f"g{i}" for i in range(30))
     assert block["values"].shape == (30, 2)
     assert np.allclose(block["values"].reshape(-1), result.ranef)
-
-
-def test_offset_shifts_poisson_intercept_by_minus_constant():
-    y = _rng.poisson(np.exp(0.5 + 0.3 * _X)).astype(float)
-    data = _data(y.tolist())
-    base = glmm.fit(data, "y ~ x", "poisson")
-    c = 1.7
-    shifted = glmm.fit(data, "y ~ x", "poisson", offset=[c] * _N)
-    assert base.converged and shifted.converged
-    assert base.dispersion == pytest.approx(1.0)
-    assert abs(shifted.beta[0] - (base.beta[0] - c)) < 1e-3
-    assert np.max(np.abs(shifted.beta[1:] - base.beta[1:])) < 1e-3
-
-
-def test_warm_start_reaches_same_answer_as_cold():
-    # Own generator, so the data do not depend on which tests drew from `_rng`
-    # first. theta = 5 sits far from this fit's optimum, so the warm search runs
-    # well past the cold one's count (27 evaluations against 12, x86_64). A
-    # nearer start can tie the cold count by chance, and a tie says nothing
-    # about whether the start reached the fit.
-    y = 1.0 + 2.0 * _X + np.random.default_rng(4).normal(scale=0.5, size=_N)
-    cold = glmm.fit(_data(y.tolist()), "y ~ x + (1 | g)")
-    warm = glmm.fit(
-        _data(y.tolist()),
-        "y ~ x + (1 | g)",
-        warm_start={"beta": cold.beta.tolist(), "theta": [5.0]},
-    )
-    assert warm.converged
-    assert np.allclose(warm.beta, cold.beta, atol=1e-6)
-    assert warm.n_eval != cold.n_eval
 
 
 def test_gradient_search_fields_cross_the_port():

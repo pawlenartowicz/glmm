@@ -63,7 +63,11 @@ an estimated covariance matrix, not a profile or bootstrap interval.
 
 For OLS, GLM, and LMM, the covariance comes from the same Cholesky factor the
 fit's normal equations already produce: `Var(β̂_j) = σ̂²·‖L_XX⁻¹e_j‖²`, one
-method throughout.
+method throughout. A GLM's covariance uses the IRLS weights of the last pass
+that solved for β, as R's `glm` does. Those weights belong to the β one step
+before the final one. On well-conditioned test designs this moved the logit
+standard errors by 1e-7 to 3e-7 relative, and the probit and Poisson ones by
+about 1e-10.
 
 For GLMM, two genuinely different Wald covariances are offered, selected by
 `wald_se`/`WaldSe`:
@@ -108,9 +112,9 @@ with z. Both ports compute them with one Rust function, so they give the same
 intervals.
 
 SEs are computed only for the columns the caller asks for: in Rust,
-`FitOptions::target_indices` selects which predictor columns get an SE (every
-other slot is NaN). The formula frontend defaults to all columns, and the
-Python and R surfaces go through it, so the distinction is invisible there.
+`FitOptions::se_for` selects which predictor columns get an SE (every
+other slot is NaN). Its default, `SeFor::All`, is every column, and the
+Python and R surfaces always ask for all of them.
 
 ## Dispersion
 
@@ -128,7 +132,7 @@ overdispersion lives in θ, not φ).
 
 ## Prior weights
 
-What `FitOptions::weights` means depends on the family:
+What `Data::weights` means depends on the family:
 
 - **Gaussian, Gamma, inverse-Gaussian** — every family that carries an
   estimated dispersion φ — treat `weights` as **precision weights**: row `i`
@@ -247,10 +251,6 @@ fit itself, not in `diagnostics`.
     case the ports raise, as `pirls_exhausted`. See
     [`warnings.md`](warnings.md) for what it means for the reported
     estimates.
-  - `UnusedGroupingLevels`: a grouping factor declares levels that own
-    random-effect columns but no row. Raised by the formula frontend, not a
-    solver — the only layer that sees both the declared levels and the
-    per-row codes.
   - `HessianSeFallback`: `wald_se`/`WaldSe::Hessian` was requested, but the
     joint Hessian was not usable: it was not positive definite, or the fit
     took the finite-difference Hessian and a perturbed deviance evaluation was

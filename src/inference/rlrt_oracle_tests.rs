@@ -10,7 +10,8 @@ use super::rlrt::{
 };
 use super::rlrt_refs::{bands, design, entries, load};
 use super::test_refs::{covers, registry_entries, stale_entries, Coverage, DivEntry};
-use crate::{fit_cold, Family, Fit, FitOptions, GroupIds, ModelSpec};
+use crate::test_support::{fit_cold, fit_warm_wo};
+use crate::{Family, Fit, FitOptions, GroupIds, ModelSpec};
 use std::collections::BTreeSet;
 use std::time::Instant;
 
@@ -265,10 +266,20 @@ fn ols_reml(x: &[f64], y: &[f64], n: usize, p: usize, weights: Option<Vec<f64>>)
     };
     let opts = FitOptions {
         reml: Some(true),
-        weights,
         ..FitOptions::default()
     };
-    fit_cold(x, y, n, p, &model, &GroupIds::default(), &opts)
+    fit_warm_wo(
+        x,
+        y,
+        n,
+        p,
+        &model,
+        &GroupIds::default(),
+        None,
+        weights.as_deref(),
+        None,
+        &opts,
+    )
 }
 
 /// Gates 5 and 6, registry-backed, one driver over the quantity labels

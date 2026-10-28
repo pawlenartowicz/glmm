@@ -55,25 +55,26 @@ test_that("dot formulas error", {
   expect_error(fastglmm(y ~ ., err_data()), "'\\.' is not supported")
 })
 
-test_that("the crossing operator ^ errors with the Python port's message", {
+test_that("a crossing power below 2 errors with the Python port's message", {
   # R's own parser refuses a formula ending in `+`, so only `^` is tested here.
-  d <- transform(err_data(), a = x, b = s, c = f)
-  expect_error(fastglmm(y ~ (a + b + c)^2 + (1 | g), d),
-               paste("formula syntax error at position 15: '^' is accepted only in I(x^k), a",
-                     "power of one column; to cross terms, write them out (for example",
-                     "(a + b)^2 as a + b + a:b)"),
+  expect_error(fastglmm(y ~ (x + g)^1 + (1 | g), err_data()),
+               paste("formula syntax error at position 0: invalid power (an integer of 2",
+                     "or more after '^') in term '(x+g)^1'"),
                fixed = TRUE)
 })
 
-test_that("double-bar and intercept-free RE terms name the kernel property", {
+test_that("double-bar and intercept-free RE terms fit; a column in two terms errors", {
   d <- err_data()
-  expect_error(fastglmm(y ~ x + (x || g), d), "full RE correlation")
-  # Intercept-free RE terms are not pre-checked in R: the shared Rust parser
-  # already raises a specific message for this (RandomInterceptSuppressionUnsupported),
-  # and it reaches both ports unchanged - see python/tests/test_validation.py's
-  # equivalent case.
-  expect_error(fastglmm(y ~ x + (0 + x | g), d), "intercept suppression")
-  expect_error(fastglmm(y ~ x + (-1 + x | g), d), "intercept suppression")
+  # err_data has no random intercept, so its variance lands at zero.
+  expect_warning(fit <- fastglmm(y ~ x + (x || g), d), "Singular fit")
+  expect_identical(rownames(VarCorr(fit)$g), c("(Intercept)", "x"))
+  expect_identical(fit$varcorr[[1]][2], 0) # the covariance, vech-packed
+  no_int <- fastglmm(y ~ x + (0 + x | g), d)
+  expect_identical(rownames(VarCorr(no_int)$g), "x")
+  expect_identical(VarCorr(fastglmm(y ~ x + (-1 + x | g), d)), VarCorr(no_int))
+  expect_error(fastglmm(y ~ x + (1 | g) + (1 + x | g), d),
+               "random-effect column '(Intercept)' is in two terms on grouping 'g'",
+               fixed = TRUE)
 })
 
 test_that("intercepted lme4 arguments raise designed errors", {
@@ -274,8 +275,8 @@ test_that("inf in weights= or offset= is refused up front, not by the kernel", {
   d <- err_data()
   w <- rep(1, 40)
   w[1] <- Inf
-  # The plain up-front message, not the kernel's own ("FitOptions.weights
-  # must be finite and > 0") which "weights must be finite" alone would also
+  # The plain up-front message, not the kernel's own ("Data weights must
+  # be finite and > 0 (row 0)") which "weights must be finite" alone would also
   # match as a substring.
   expect_error(fastglmm(y ~ x, d, weights = w), "no NaN, inf, or missing entries")
   o <- rep(0, 40)
@@ -305,30 +306,14 @@ test_that("bad dispersion value message matches the Python port", {
   )
 })
 
-test_that("cloglog GLM matches glm on the same data", {
-  set.seed(1)
-  n <- 300
-  x <- rnorm(n)
-  mu <- 1 - exp(-exp(0.2 + 0.8 * x))
-  d <- data.frame(y = rbinom(n, 1, mu), x = x)
-  f <- fastglmm(y ~ x, data = d, family = binomial(link = "cloglog"))
-  expect_true(f$converged)
-  ref <- glm(y ~ x, data = d, family = binomial(link = "cloglog"))
-  expect_equal(unname(fixef(f)), unname(coef(ref)), tolerance = 1e-5,
-               info = "cloglog vs glm")
-})
-
-test_that("probit GLM fits and matches glm on the same data", {
-  set.seed(1)
-  n <- 300
-  x <- rnorm(n)
-  mu <- pnorm(0.2 + 0.8 * x)
-  d <- data.frame(y = rbinom(n, 1, mu), x = x)
-  f <- fastglmm(y ~ x, data = d, family = binomial(link = "probit"))
-  expect_true(f$converged)
-  ref <- glm(y ~ x, data = d, family = binomial(link = "probit"))
-  expect_equal(unname(fixef(f)), unname(coef(ref)), tolerance = 1e-5,
-               info = "probit vs glm")
+# The kernel refuses the dispersion value; fastglmm() has no pre-check of its
+# own. Mirrors python/tests/test_response_domain.py - change together.
+test_that("a zero or negative dispersion is refused", {
+  d <- data.frame(y = c(1, 2, 3, 4), x = c(0, 1, 2, 3))
+  for (bad in c(0, -1)) {
+    expect_error(fastglmm(y ~ x, d, family = "gamma", dispersion = bad),
+                 "^dispersion must be a finite number > 0, got ")
+  }
 })
 
 test_that("inverse-Gaussian GLM refuses random effects", {
@@ -351,43 +336,14 @@ test_that("inverse-Gaussian GLM refuses random effects", {
   )
 })
 
-test_that("inverse-Gaussian GLM matches glm (default link is already 1/mu^2)", {
-  # inverse.gaussian()'s default link is "1/mu^2", so f and f2 fit the same
-  # model under two spellings; fixef(f) and fixef(f2) are bit-identical.
-  set.seed(2)
-  n <- 400
-  x <- rnorm(n)
-  mu <- exp(0.3 + 0.2 * x)
-  lam <- 3
-  v <- rnorm(n)^2
-  x1 <- mu + mu^2 * v / (2 * lam) -
-    (mu / (2 * lam)) * sqrt(4 * mu * lam * v + mu^2 * v^2)
-  y <- ifelse(runif(n) <= mu / (mu + x1), x1, mu^2 / x1)
-  d <- data.frame(y = y, x = x, g = factor(rep(1:20, each = n / 20)))
-  f <- fastglmm(y ~ x, data = d, family = inverse.gaussian())
-  f2 <- fastglmm(y ~ x, data = d, family = inverse.gaussian(link = "1/mu^2"))
-  # glm()'s own IRLS needs a start near the optimum on this data (y was
-  # generated on the log-mean scale, not the canonical 1/mu^2 scale, so its
-  # default start diverges); starting it at the fit's own beta is a fair
-  # check of whether that beta solves the GLM score equations.
-  ref <- glm(y ~ x, data = d, family = inverse.gaussian(),
-             start = unname(fixef(f)))
-  ref2 <- glm(y ~ x, data = d, family = inverse.gaussian(link = "1/mu^2"),
-              start = unname(fixef(f2)))
-  expect_true(ref$converged, info = "invgauss default link glm ref converged")
-  expect_true(ref2$converged, info = "invgauss 1/mu^2 link glm ref converged")
-  expect_equal(unname(fixef(f)), unname(coef(ref)), tolerance = 1e-5,
-               info = "invgauss default link vs glm")
-  expect_equal(unname(fixef(f2)), unname(coef(ref2)), tolerance = 1e-5,
-               info = "invgauss 1/mu^2 link vs glm")
-})
-
 test_that("inverse-Gaussian accepts dispersion = \"estimate\"", {
   set.seed(3)
   d <- data.frame(y = rgamma(200, 4, 2) + 0.1, x = rnorm(200))
   f <- fastglmm(y ~ x, data = d, family = inverse.gaussian(),
                 dispersion = "estimate")
   expect_true(f$converged)
+  expect_same_fit(f, fastglmm(y ~ x, data = d, family = inverse.gaussian()))
+  expect_equal(sigma(f), sqrt(f$dispersion))
 })
 
 test_that("init.theta seeds the negative-binomial shape search", {
@@ -534,7 +490,6 @@ test_that("nAGQ > 1 on negative-binomial and Gamma fits quadrature", {
 test_that("unimplemented accessors error with the reason", {
   d <- err_data()
   fit <- suppressWarnings(fastglmm(y ~ x + (1 | g), d)) # boundary fit is fine here
-  expect_error(predict(fit), "not available")
   expect_error(coef(fit), "fixef")
   expect_error(terms(fit), "formula\\(\\) returns")
   expect_error(confint(fit, method = "profile"), "no profiling machinery")

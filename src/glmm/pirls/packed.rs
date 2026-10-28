@@ -286,7 +286,7 @@ pub(crate) fn pirls_solve_packed(
     // (rebuilt fresh from this iteration's `w` each Profile step, so no
     // stale-value hazard across PIRLS iterations).
     wx: &mut Mat<f64>,
-    // Per-row linear-predictor offset (`FitOptions::offset`), added into
+    // Per-row linear-predictor offset (`Data::offset`), added into
     // `eta_fixed` by every `refresh_eta_fixed` call. `None` ⇒ no offset.
     offset: Option<&[f64]>,
     pirls_tol_override: Option<f64>,
@@ -744,6 +744,7 @@ pub(crate) fn packed_m_vals_theta_deriv(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fit::SizedSpec;
     use crate::lmm::LmmGroupings;
 
     /// [`packed_m_vals_theta_deriv`] must reproduce a central difference of
@@ -760,27 +761,32 @@ mod tests {
             x[(i, 1)] = 0.7 + 0.31 * i as f64;
             x[(i, 2)] = 2.5 - 0.17 * (i % 7) as f64;
         }
-        let spec = crate::ModelSpec {
-            family: Family::Binomial {
-                link: BinomialLink::Logit,
+        let spec = SizedSpec {
+            spec: crate::ModelSpec {
+                family: Family::Binomial {
+                    link: BinomialLink::Logit,
+                },
+                re: Some(crate::ReStructure {
+                    terms: Vec::new(),
+                    slopes: vec![1],
+                    extra_groupings: vec![crate::Grouping {
+                        terms: Vec::new(),
+                        relation: crate::GroupingRelation::Crossed,
+                        slopes: vec![2],
+                    }],
+                }),
             },
-            re: Some(crate::ReStructure {
-                sizing: crate::Sizing::FixedClusters { n_clusters: 4 },
-                slopes: vec![1],
-                extra_groupings: vec![crate::Grouping {
-                    relation: crate::GroupingRelation::Crossed { n_clusters: 3 },
-                    slopes: vec![2],
-                }],
-            }),
+            n_primary: 4,
+            extra_counts: vec![3],
         };
-        let g = LmmGroupings::from_cluster_spec_ext(&spec, n, &[1], &[vec![2]]);
+        let g = LmmGroupings::from_cluster_spec_ext(&spec, &[1], &[vec![2]]);
         let mut packed = PackedScratch::for_shape(&g, n, g.k_total);
         let width = packed.width;
         let n_theta = g.n_theta();
         let mut theta: Vec<f64> = (0..n_theta).map(|k| 0.4 + 0.11 * k as f64).collect();
         let eps = 1e-6;
         let mut z = vec![0.0; n * 2];
-        crate::glmm::workspace::fill_z_f64(&g, x.as_ref(), &mut z, n);
+        crate::glmm::workspace::fill_z_f64(&g, x.as_ref(), x.as_ref().subcols(0, 0), &mut z, n);
 
         for a in 0..n_theta {
             let base = theta[a];
@@ -818,19 +824,21 @@ mod tests {
     #[test]
     fn evaluate_at_mode_refuses_an_infeasible_eta() {
         let (n, s) = (6usize, 2usize);
-        let spec = crate::ModelSpec {
-            family: Family::Gamma {
-                link: crate::GammaLink::Inverse,
-            },
-            re: Some(crate::ReStructure {
-                sizing: crate::Sizing::FixedClusters {
-                    n_clusters: s as u32,
+        let spec = SizedSpec {
+            spec: crate::ModelSpec {
+                family: Family::Gamma {
+                    link: crate::GammaLink::Inverse,
                 },
-                slopes: vec![],
-                extra_groupings: vec![],
-            }),
+                re: Some(crate::ReStructure {
+                    terms: Vec::new(),
+                    slopes: vec![],
+                    extra_groupings: vec![],
+                }),
+            },
+            n_primary: s,
+            extra_counts: vec![],
         };
-        let g = LmmGroupings::from_cluster_spec_ext(&spec, n, &[], &[]);
+        let g = LmmGroupings::from_cluster_spec_ext(&spec, &[], &[]);
         let k = g.k_total;
         let mut packed = PackedScratch::for_shape(&g, n, k);
         // The test drives `PackedFactor` directly with `sp: None`, so it sizes
@@ -860,7 +868,7 @@ mod tests {
             a_chol: &mut packed.a_chol,
             a_llt_mem: &mut packed.a_llt_mem,
             a_rhs: &mut a_rhs[..],
-            family: spec.family,
+            family: spec.spec.family,
             nb_theta: f64::NAN,
             width,
             k,
@@ -869,7 +877,7 @@ mod tests {
         let mut evaluates = |eta_fixed: &[f64]| {
             evaluate_at_mode(
                 &mut layout,
-                spec.family,
+                spec.spec.family,
                 f64::NAN,
                 &y,
                 &prior_w,

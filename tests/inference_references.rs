@@ -6,12 +6,14 @@
 //! entry whose JSON is missing gates nothing; both fail here. So does an
 //! `oracle-tier` entry of `validation/grid/divergences.json` whose `cell` is
 //! neither a golden nor an inference reference: no driver compares that cell,
-//! so none can find the entry stale. The rules are pure functions over the
-//! manifest entries, the registry and the files on disk, with synthetic
-//! cases beside them, so each rule is shown to fire. No feature gate, so this
-//! runs in CI on the default and `--no-default-features` builds. It reads the
-//! reader by `#[path]`, not through `mod oracle_support`, which imports
-//! `glmm::formula`.
+//! so none can find the entry stale. Every JSON carries the provenance keys its
+//! generator writes: the R keys on every kind but `conditioning`, whose
+//! generator is a Python script with keys of its own. The rules are pure
+//! functions over the manifest entries, the registry and the files on disk,
+//! with synthetic cases beside them, so each rule is shown to fire. No feature
+//! gate, so this runs in CI on the default and `--no-default-features` builds.
+//! It reads the reader by `#[path]`, not through `mod oracle_support`, which
+//! imports `glmm::formula`.
 
 #[allow(dead_code)]
 #[path = "oracle_support/inference.rs"]
@@ -25,7 +27,8 @@ use std::path::{Component, Path};
 /// One kind directory: file stem to parsed JSON. A missing directory is empty.
 type KindDir = BTreeMap<String, Value>;
 
-/// The `provenance` keys `validation/tools/inference_common.R::provenance` writes.
+/// The `provenance` keys `validation/tools/inference_common.R::provenance` writes,
+/// on every kind but `conditioning`.
 const PROVENANCE_KEYS: [&str; 7] = [
     "r_version",
     "packages",
@@ -36,8 +39,13 @@ const PROVENANCE_KEYS: [&str; 7] = [
     "generator",
 ];
 
+/// The `provenance` keys of a `conditioning` reference, which a Python generator
+/// writes. Mirrors `validation/tools/goldens_glm_band.py::provenance`; change
+/// together.
+const PY_PROVENANCE_KEYS: [&str; 4] = ["python_version", "packages", "mp_dps", "generator"];
+
 /// The rules across kinds, over the raw block: each entry parses (so its `kind`
-/// is one of the three), names are unique and none is in `reserved` (the
+/// is one of the seven), names are unique and none is in `reserved` (the
 /// `datasets` and `m3_goldens` names), `data` names a file or is `null` only on
 /// a fit-free entry, `generator` is a bare file name naming a file under
 /// `tools/`, and each `factors` name is a column of the `data` CSV. `exists`
@@ -152,11 +160,15 @@ fn kind_rules(kind: Kind, entries: &[Entry], jsons: &KindDir) -> Vec<String> {
             _ => {}
         }
     }
+    let keys: &[&str] = match kind {
+        Kind::Conditioning => &PY_PROVENANCE_KEYS,
+        _ => &PROVENANCE_KEYS,
+    };
     for (stem, json) in jsons {
         match json.get("provenance").and_then(Value::as_object) {
             None => found.push(format!("{k}/{stem}.json: no `provenance` object")),
             Some(p) => {
-                for key in PROVENANCE_KEYS.iter().filter(|key| !p.contains_key(**key)) {
+                for key in keys.iter().filter(|key| !p.contains_key(**key)) {
                     found.push(format!("{k}/{stem}.json: provenance lacks `{key}`"));
                 }
             }
@@ -321,7 +333,7 @@ fn oracle_tier_entry_on_neither_a_golden_nor_a_reference_is_rejected() {
 /// Each rule on synthetic input: a registered, frozen `lmertest` reference
 /// that passes, perturbed once per test.
 mod rules {
-    use super::{violations, KindDir, PROVENANCE_KEYS};
+    use super::{violations, KindDir, PROVENANCE_KEYS, PY_PROVENANCE_KEYS};
     use serde_json::{json, Value};
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -487,6 +499,38 @@ mod rules {
     }
 
     #[test]
+    fn conditioning_reference_needs_the_python_provenance_keys() {
+        let conditioning = |provenance: Value| {
+            let mut w = World::valid();
+            w.raw[0]["kind"] = json!("conditioning");
+            let mut json = reference("ref_a");
+            json["provenance"] = provenance;
+            w.dirs =
+                BTreeMap::from([("conditioning", KindDir::from([("ref_a".to_string(), json)]))]);
+            w
+        };
+        let python = json!({
+            "python_version": "3.14.2",
+            "packages": { "mpmath": "1.4.1" },
+            "mp_dps": 50,
+            "generator": "goldens_glm_band.py"
+        });
+        assert_eq!(
+            conditioning(python.clone()).violations(),
+            Vec::<String>::new()
+        );
+        for key in PY_PROVENANCE_KEYS {
+            let mut provenance = python.clone();
+            provenance.as_object_mut().unwrap().remove(key);
+            conditioning(provenance).assert_flags(&format!(
+                "conditioning/ref_a.json: provenance lacks `{key}`"
+            ));
+        }
+        let r_keys = reference("ref_a")["provenance"].clone();
+        conditioning(r_keys).assert_flags("conditioning/ref_a.json: provenance lacks `mp_dps`");
+    }
+
+    #[test]
     fn json_name_other_than_its_stem_is_rejected() {
         let mut w = World::valid();
         w.json("lmertest", "ref_a")["name"] = json!("ref_x");
@@ -516,6 +560,13 @@ mod rules {
     }
 
     #[test]
+    fn null_pending_flag_is_not_pending() {
+        let mut w = World::valid();
+        w.raw[0]["pending_reference"] = Value::Null;
+        assert_eq!(w.violations(), Vec::<String>::new());
+    }
+
+    #[test]
     fn generator_naming_no_file_is_rejected() {
         let mut w = World::valid();
         w.raw[0]["generator"] = json!("goldens_missing.R");
@@ -529,6 +580,13 @@ mod rules {
         w.assert_flags("ref_a: factor k is not a column of its data CSV");
         let found = w.violations();
         assert_eq!(found.len(), 1, "{found:?}");
+    }
+
+    #[test]
+    fn factors_that_are_not_an_array_are_rejected() {
+        let mut w = World::valid();
+        w.raw[0]["factors"] = json!("g");
+        w.assert_flags("manifest entry: `factors` is not an array of strings");
     }
 
     #[test]

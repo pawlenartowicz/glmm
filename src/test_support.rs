@@ -9,10 +9,60 @@
 //! `new` / its resets; the cluster count is passed directly.
 
 use crate::ols::PANEL_ROWS;
+use crate::{Data, Fit, FitOptions, GroupIds, ModelSpec, StartValues};
 use faer::Mat;
 
+/// The unit tests' cold fit: no warm start, no weights, no offset. Unit tests
+/// reach the crate's entry point only through this and [`fit_warm_wo`], so a
+/// change of entry point edits these two bodies alone.
+pub(crate) fn fit_cold(
+    x: &[f64],
+    y: &[f64],
+    n: usize,
+    p: usize,
+    model: &ModelSpec,
+    ids: &GroupIds,
+    opts: &FitOptions,
+) -> Fit {
+    fit_warm_wo(x, y, n, p, model, ids, None, None, None, opts)
+}
+
+/// [`fit_cold`] with an optional warm start, prior weights and offset. The
+/// ids reach the fit only when `model` has random effects, so a fixed-only
+/// test may pass whatever ids it built. Panics with the [`crate::FitError`]'s
+/// message on a refused input.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fit_warm_wo(
+    x: &[f64],
+    y: &[f64],
+    n: usize,
+    p: usize,
+    model: &ModelSpec,
+    ids: &GroupIds,
+    start: Option<&StartValues>,
+    weights: Option<&[f64]>,
+    offset: Option<&[f64]>,
+    opts: &FitOptions,
+) -> Fit {
+    let mut data = Data::new(x, y, n, p);
+    if model.re.is_some() {
+        data = data.ids(ids);
+    }
+    if let Some(w) = weights {
+        data = data.weights(w);
+    }
+    if let Some(o) = offset {
+        data = data.offset(o);
+    }
+    let fit = match start {
+        Some(s) => crate::fit_with_start(&data, model, s, opts),
+        None => crate::fit(&data, model, opts),
+    };
+    fit.unwrap_or_else(|e| panic!("{e}"))
+}
+
 /// Near-identity slice comparison shared by the fit-core equivalence tests
-/// (`fit_on`-on-reused-ws vs `fit_cold`). Tolerance is
+/// (`fit_on`-on-reused-ws vs a fresh fit). Tolerance is
 /// `1e-12 + 1e-9·|want|` — tight enough to catch every failure these gates
 /// exist for (stale buffers, `n_max` over-reads, option-reset misses shift
 /// results materially, not by an ULP) without demanding bit-identity across a
@@ -180,49 +230,109 @@ impl TestWs {
     }
 }
 
-/// Intercept-only `ModelSpec` — mirrors `engine_contract::ClusterSpec::intercept_only`.
-pub(crate) fn intercept_only_spec(sizing: crate::Sizing) -> crate::ModelSpec {
-    crate::ModelSpec {
-        family: crate::Family::Gaussian,
-        re: Some(crate::ReStructure {
-            sizing,
-            slopes: vec![],
-            extra_groupings: vec![],
-        }),
+/// Intercept-only Gaussian mixed `ModelSpec` — mirrors
+/// `engine_contract::ClusterSpec::intercept_only`.
+pub(crate) fn intercept_only_spec() -> crate::ModelSpec {
+    crate::ModelSpec::mixed(crate::Family::Gaussian, crate::ReStructure::intercept())
+}
+
+/// Cluster sizing regime of the positional test layout: a fixed cluster
+/// count, or a fixed per-cluster size. The layout helpers below mirror
+/// MCPower's data generation; they build `GroupIds` for tests from counts.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Sizing {
+    /// Fixed number of clusters; per-cluster size grows with total N.
+    FixedClusters {
+        /// Cluster count, held constant as N scales.
+        n_clusters: u32,
+    },
+    /// Fixed per-cluster size; cluster count grows with total N.
+    FixedSize {
+        /// Rows per cluster, held constant as N scales.
+        cluster_size: u32,
+    },
+}
+
+impl Sizing {
+    /// Number of clusters when total row count is `n`: the fixed `n_clusters`
+    /// itself under `FixedClusters`, or `n / cluster_size` rounded UP under
+    /// `FixedSize`. Rounding up matches the positional row layout (row `i` in
+    /// cluster `i / cluster_size`): off-grid `n` leaves a partial trailing cluster
+    /// whose rows still carry a real id, and that id must be in range.
+    pub(crate) fn n_clusters_at(&self, n: usize) -> usize {
+        match self {
+            Sizing::FixedClusters { n_clusters } => (*n_clusters).max(1) as usize,
+            Sizing::FixedSize { cluster_size } => n.div_ceil((*cluster_size).max(1) as usize),
+        }
     }
 }
 
-/// Levels one grouping contributes to an atom block. Delegates to
-/// `ids::block_levels` (the two were a verbatim duplicate) — kept as a
-/// separate binding here since the DGP layout helpers below (`model_atom`,
-/// `extra_level_of_row`) are `ModelSpec`-shaped while `ids`'s is
-/// `ReStructure`-shaped.
-pub(crate) fn block_levels(rel: &crate::GroupingRelation) -> usize {
-    crate::ids::block_levels(rel)
-}
-
-/// Grid atom for the full grouping structure. Verbatim mirror of
-/// `engine_contract::ClusterSpec::atom` (test-only DGP layout).
-pub(crate) fn model_atom(spec: &crate::ModelSpec) -> usize {
-    let re = spec.re.as_ref().expect("model_atom requires re: Some");
-    let base = match &re.sizing {
-        crate::Sizing::FixedClusters { n_clusters } => (*n_clusters).max(1) as usize,
-        crate::Sizing::FixedSize { cluster_size } => (*cluster_size).max(1) as usize,
+/// Grid atom for the full grouping structure: the primary block times every
+/// extra grouping's count. `extra_counts[g]` is the level count of a crossed
+/// grouping and the children per parent of a nested one, declaration order.
+/// Verbatim mirror of `engine_contract::ClusterSpec::atom` (test-only DGP
+/// layout).
+pub(crate) fn model_atom(sizing: &Sizing, extra_counts: &[u32]) -> usize {
+    let base = match sizing {
+        Sizing::FixedClusters { n_clusters } => (*n_clusters).max(1) as usize,
+        Sizing::FixedSize { cluster_size } => (*cluster_size).max(1) as usize,
     };
-    re.extra_groupings
+    extra_counts
         .iter()
-        .fold(base, |a, g| a * block_levels(&g.relation))
+        .fold(base, |a, &c| a * c.max(1) as usize)
 }
 
-/// Level of extra grouping `g` that row `i` belongs to. `ModelSpec`-shaped
-/// wrapper that unwraps `re` and delegates to `ids::extra_level_of_row` (the
-/// `ReStructure`-shaped original) — the two bodies were a verbatim duplicate.
-pub(crate) fn extra_level_of_row(spec: &crate::ModelSpec, g: usize, i: usize) -> usize {
+/// Level of extra grouping `g` that row `i` belongs to under the positional
+/// layout; `extra_counts` as in [`model_atom`]. A nested level is the GLOBAL
+/// child id (`parent · per_parent + within`).
+pub(crate) fn extra_level_of_row(
+    spec: &crate::ModelSpec,
+    sizing: &Sizing,
+    extra_counts: &[u32],
+    g: usize,
+    i: usize,
+) -> usize {
     let re = spec
         .re
         .as_ref()
         .expect("extra_level_of_row requires re: Some");
-    crate::ids::extra_level_of_row(re, g, i) as usize
+    let rel = re.extra_groupings[g].relation;
+    let levels = |h: usize| extra_counts[h].max(1) as usize;
+    match sizing {
+        Sizing::FixedClusters { n_clusters } => {
+            let s = (*n_clusters).max(1) as usize;
+            let stride = (0..g).fold(s, |a, h| a * levels(h));
+            let within = (i / stride) % levels(g);
+            match rel {
+                crate::GroupingRelation::Crossed => within,
+                crate::GroupingRelation::NestedWithin => (i % s) * levels(g) + within,
+            }
+        }
+        Sizing::FixedSize { cluster_size } => {
+            let cs = (*cluster_size).max(1) as usize;
+            (i / cs) * levels(g) + (i % cs) % levels(g)
+        }
+    }
+}
+
+/// Positional `GroupIds` for `n` rows of `spec` under `sizing`, with
+/// `extra_counts` as in [`model_atom`]: the balanced simulator layout, built
+/// from counts up front and then fitted through the same entry as real data.
+pub(crate) fn ids_from_sizing(
+    spec: &crate::ModelSpec,
+    sizing: &Sizing,
+    extra_counts: &[u32],
+    n: usize,
+) -> GroupIds {
+    let primary: Vec<u32> = (0..n).map(|i| cluster_of_row(sizing, i) as u32).collect();
+    let extra: Vec<Vec<u32>> = (0..extra_counts.len())
+        .map(|g| {
+            (0..n)
+                .map(|i| extra_level_of_row(spec, sizing, extra_counts, g, i) as u32)
+                .collect()
+        })
+        .collect();
+    GroupIds { primary, extra }
 }
 
 /// A CSV in the validation corpus's format (`,`-split, quotes trimmed) as a
@@ -275,9 +385,9 @@ pub(crate) fn table_from_rows(
 /// round-robin (`i % n_clusters`) under `FixedClusters`, contiguous blocks
 /// (`i / cluster_size`) under `FixedSize`. Mirrors
 /// `engine_contract::ClusterSizing::cluster_of_row` (test-only DGP layout).
-pub(crate) fn cluster_of_row(sizing: &crate::Sizing, i: usize) -> usize {
+pub(crate) fn cluster_of_row(sizing: &Sizing, i: usize) -> usize {
     match sizing {
-        crate::Sizing::FixedClusters { n_clusters } => i % (*n_clusters).max(1) as usize,
-        crate::Sizing::FixedSize { cluster_size } => i / (*cluster_size).max(1) as usize,
+        Sizing::FixedClusters { n_clusters } => i % (*n_clusters).max(1) as usize,
+        Sizing::FixedSize { cluster_size } => i / (*cluster_size).max(1) as usize,
     }
 }

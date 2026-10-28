@@ -73,9 +73,8 @@ EXPECTED_CALLS <- c(
   # tables of a binomial GLMM, a binomial GLM and a binomial GLMM with trials.
   paste0("terms:", rep(c("glmer_sim_factorial_bern", "glm_sim_factorial_bern", "glmer_cbpp"),
                        each = 2L), c(":III:LRT", ":II:LRT")),
-  # test = "LRT" on a binomial GLMM whose random slope is a fixed term: that
-  # row keeps its Wald test with the crate's note, so the heading cell
-  # compares a note.
+  # test = "LRT" on a binomial GLMM whose random slope is a fixed term: the
+  # refit without that term keeps the random slope.
   "terms:glmer_sim_binomial_slope1:III:LRT",
   # anova(m) at test = "auto" on a Poisson GLMM: the likelihood-ratio table;
   # at an explicit "Wald": the Wald table.
@@ -85,22 +84,25 @@ EXPECTED_CALLS <- c(
   # and the GLM's).
   "terms:glmer_nb_sim_nb:III:auto", "terms:glmer_gamma_sim_gamma:III:auto",
   "compare:missing_x2_wls_basic", "compare:missing_x2_wls_basic:nobs",
-  "compare:rlrt_dyestuff", "anova:rlrt_dyestuff")
-stopifnot(length(EXPECTED_CALLS) == 59L, !anyDuplicated(EXPECTED_CALLS))
+  "compare:rlrt_dyestuff", "anova:rlrt_dyestuff",
+  # The post-fit calls: predict with standard errors on new rows and simulate
+  # (2 draws, seed 1) of a Gaussian LMM and a binomial GLMM; r2, icc and pairwise
+  # (Holm and Tukey) of the Gaussian one.
+  paste0(c("predict:", "simulate:"),
+         rep(c("lmer_sim_factorial", "glmer_sim_factorial_bern"), each = 2L)),
+  "r2:lmer_sim_factorial", "icc:lmer_sim_factorial",
+  "pairwise:lmer_sim_factorial:g:holm", "pairwise:lmer_sim_factorial:g:tukey")
+stopifnot(length(EXPECTED_CALLS) == 67L, !anyDuplicated(EXPECTED_CALLS))
 
 # The non-finite cells (NaN, Inf, -Inf) each front end writes over EXPECTED_CALLS:
-# row 0's test columns of every compare/anova pair table, the Df column of the
-# rlrt_dyestuff tables, and the refusal `error` cells. Pinned so that a finite
-# value turning non-finite in all three front ends fails, as the pairwise
-# comparison alone cannot see it. Changes together with the call list above.
-EXPECTED_NONFINITE <- 120L
+# row 0's test columns of every compare/anova pair table and the Df column of
+# the rlrt_dyestuff tables. Pinned so that a finite value turning non-finite in
+# all three front ends fails, as the pairwise comparison alone cannot see it.
+# Changes together with the call list above.
+EXPECTED_NONFINITE <- 124L
 
-# The calls every front end refuses: the formula frontend does not take
-# `Reaction ~ 1 + (Days | Subject)` (a random slope whose variable is not a
-# fixed term). The same refusal as REFUSED_PAIRS in tests/inference_oracle.rs:
-# change the two lists together.
-EXPECTED_REFUSED <- c("compare:anova_ml_pair_sleepstudy_fixed",
-                      "anova:anova_ml_pair_sleepstudy_fixed")
+# The calls every front end refuses. Empty: every call fits.
+EXPECTED_REFUSED <- character(0)
 
 read_cells <- function(path) {
   lines <- readLines(path, warn = FALSE, encoding = "UTF-8")
@@ -145,8 +147,7 @@ for (name in names(fronts)) {
     fail("%s refused %s, not in EXPECTED_REFUSED (see its stderr for the reason)", name, k)
   }
   for (k in setdiff(EXPECTED_REFUSED, refused)) {
-    fail(paste("%s no longer refuses %s: if it now fits, take it out of EXPECTED_REFUSED",
-               "together with REFUSED_PAIRS in tests/inference_oracle.rs"), name, k)
+    fail("%s no longer refuses %s: if it now fits, take it out of EXPECTED_REFUSED", name, k)
   }
   for (k in setdiff(unique(d$call[startsWith(d$call, "terms:")]), refused)) {
     for (cell in c("heading | text", "term_test_auto | test", "term_test_auto | reason")) {
@@ -246,7 +247,7 @@ for (call in unique(calls)) {
               fmt_d(max(diffs[[3]][at]))))
 }
 cat(sprintf("expected refusals (each front end checked above): %s\n",
-            paste(EXPECTED_REFUSED, collapse = ", ")))
+            if (length(EXPECTED_REFUSED)) paste(EXPECTED_REFUSED, collapse = ", ") else "none"))
 cat(sprintf(paste("compared: %d cells (%d of them text) in %d calls (expected %d);",
                   "cells per front end: Rust %d, Python %d, R %d\n"),
             length(common), sum(is_text), length(unique(calls)), length(EXPECTED_CALLS),

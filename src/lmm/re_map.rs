@@ -379,9 +379,11 @@ impl LmmGroupings {
         mask
     }
 
-    /// Per block, per row: `‖row r of Λₖ‖`, the kernel-space standard
-    /// deviation over σ. `singular`'s negligible-component check compares these
-    /// (commensurate across intercept and slopes, centering included).
+    /// Per block, per reported row: `‖row r of Λₖ‖`, the kernel-space
+    /// standard deviation over σ. `singular`'s negligible-component check
+    /// compares these (commensurate across intercept and slopes, centering
+    /// included). A hidden column 0 is left out: its zero is the model's, not
+    /// a component that went to zero.
     pub(crate) fn kernel_stddevs(&self, theta_kernel: &[f64]) -> Vec<Vec<f64>> {
         let mut out = Vec::with_capacity(self.n_blocks());
         let mut cur = 0usize;
@@ -390,13 +392,35 @@ impl LmmGroupings {
             let mut lam = vec![0.0; q * q];
             primary_lambda(&theta_kernel[cur..], q, &mut lam);
             out.push(
-                (0..q)
+                (usize::from(self.hidden[b])..q)
                     .map(|r| (0..=r).map(|c| lam[r * q + c].powi(2)).sum::<f64>().sqrt())
                     .collect(),
             );
             cur += q * (q + 1) / 2;
         }
         out
+    }
+
+    /// `v`, laid out like θ (each block's column-major vech, primary then each
+    /// extra), without the entries of each hidden block's column 0, which are
+    /// the first `q` of its vech: what is left of the block is the vech of its
+    /// reported columns, the layout of `Fit::varcorr`. In place. An empty `v`
+    /// (nothing of that kind reported) stays empty.
+    pub(crate) fn drop_hidden(&self, v: &mut Vec<f64>) {
+        if v.is_empty() || !self.hidden.contains(&true) {
+            return;
+        }
+        let (mut cur, mut kept) = (0usize, 0usize);
+        for b in 0..self.n_blocks() {
+            let q = self.block_q(b);
+            let skip = if self.hidden[b] { q } else { 0 };
+            for i in cur + skip..cur + q * (q + 1) / 2 {
+                v[kept] = v[i];
+                kept += 1;
+            }
+            cur += q * (q + 1) / 2;
+        }
+        v.truncate(kept);
     }
 }
 

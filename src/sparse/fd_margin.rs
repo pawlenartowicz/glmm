@@ -48,6 +48,7 @@ use faer::linalg::solvers::Solve;
 use faer::Mat;
 use serde_json::Value;
 
+use crate::fit::SizedSpec;
 use crate::formula::{lower, Column, Table};
 use crate::glmm::{
     fd_mixed_diff, fd_second_diff, fill_packed_cols, glmm_laplace_deviance, pirls_tol_fd,
@@ -55,8 +56,7 @@ use crate::glmm::{
 };
 use crate::test_support::table_from_rows;
 use crate::{
-    BinomialLink, Family, FitOptions, GammaLink, GroupIds, ModelSpec, NegBinomialLink, PoissonLink,
-    WaldSe,
+    BinomialLink, Family, GammaLink, GroupIds, ModelSpec, NegBinomialLink, PoissonLink, WaldSe,
 };
 
 const MANIFEST: &str = include_str!("../../validation/manifest.json");
@@ -93,7 +93,8 @@ struct Rung {
     p: usize,
     model: ModelSpec,
     ids: GroupIds,
-    opts: FitOptions,
+    weights: Option<Vec<f64>>,
+    offset: Option<Vec<f64>>,
 }
 
 fn suite_dir() -> String {
@@ -226,18 +227,16 @@ fn glmm_corpus() -> Vec<Rung> {
 
         let mut lo = lower(&formula, &table, family).unwrap_or_else(|e| panic!("{name}: {e}"));
         if let Some(sizes) = agg_sizes {
-            lo.opts.weights = Some(sizes);
+            lo.weights = Some(sizes);
         }
         if let Some(wc) = spec["weights_col"].as_str() {
             let w_idx = header.iter().position(|h| h == wc).unwrap();
-            lo.opts.weights = Some(rows.iter().map(|r| r[w_idx].parse().unwrap()).collect());
+            lo.weights = Some(rows.iter().map(|r| r[w_idx].parse().unwrap()).collect());
         }
         if let Some(oc) = spec["offset"].as_str() {
             let o_idx = header.iter().position(|h| h == oc).unwrap();
-            lo.opts.offset = Some(rows.iter().map(|r| r[o_idx].parse().unwrap()).collect());
+            lo.offset = Some(rows.iter().map(|r| r[o_idx].parse().unwrap()).collect());
         }
-        lo.opts.wald_se = WaldSe::Hessian;
-        lo.opts.nagq = 1;
         out.push(Rung {
             name,
             rung: spec["rung"].as_u64().unwrap(),
@@ -248,7 +247,8 @@ fn glmm_corpus() -> Vec<Rung> {
             p: lo.p,
             model: lo.model,
             ids: lo.ids,
-            opts: lo.opts,
+            weights: lo.weights,
+            offset: lo.offset,
         });
     }
     out
@@ -570,9 +570,9 @@ fn probe(
 /// exactly the point and seed the shipped FD pass differences. Mirrors
 /// `build_glmm`'s workspace construction — the FD grid is only the shipped
 /// one if the design and the built `M` columns come out the same way.
-fn measure_fit(r: &Rung, sized: &ModelSpec, ids: &GroupIds) -> Measured {
+fn measure_fit(r: &Rung, sized: &SizedSpec, ids: &GroupIds) -> Measured {
     let (n, p) = (r.n, r.p);
-    let re = sized.re.as_ref().expect("mixed rung");
+    let re = sized.spec.re.as_ref().expect("mixed rung");
     let slope_cols: Vec<usize> = re.slopes.iter().map(|&c| c as usize).collect();
     let extra_slope_cols: Vec<Vec<usize>> = re
         .extra_groupings
@@ -581,9 +581,9 @@ fn measure_fit(r: &Rung, sized: &ModelSpec, ids: &GroupIds) -> Measured {
         .collect();
     let mut ws =
         GlmmWorkspace::for_cluster_spec_ext(p, sized, n, &slope_cols, &extra_slope_cols, 1);
-    if let Some(w) = &r.opts.weights {
+    if let Some(w) = &r.weights {
         // Mirrors `fit::glmm::prep_glmm_design`: Gamma runs on `ŵ = w/s`.
-        if matches!(sized.family, crate::Family::Gamma { .. }) {
+        if matches!(sized.spec.family, crate::Family::Gamma { .. }) {
             let s = crate::family::weight_scale(Some(w), n);
             for (dst, &wi) in ws.prior_w[..n].iter_mut().zip(w.iter()) {
                 *dst = wi / s;
@@ -593,7 +593,7 @@ fn measure_fit(r: &Rung, sized: &ModelSpec, ids: &GroupIds) -> Measured {
         }
         ws.weighted = true;
     }
-    ws.offset = r.opts.offset.clone();
+    ws.offset = r.offset.clone();
     let x_mat = Mat::<f64>::from_fn(n, p, |i, j| r.x[i * p + j]);
     fill_packed_cols(&mut ws, &ids.primary, &ids.extra, n);
     ws.pattern.structured_schur = if ws.layout == GlmmLayout::Structured {
@@ -602,13 +602,13 @@ fn measure_fit(r: &Rung, sized: &ModelSpec, ids: &GroupIds) -> Measured {
         None
     };
     let (beta_start, _) = crate::fit::glm_warm_start_beta(
-        sized.family,
+        sized.spec.family,
         f64::NAN,
         x_mat.as_ref(),
         &r.y,
         n,
         p,
-        r.opts.offset.as_deref(),
+        r.offset.as_deref(),
     );
     let targets: Vec<u32> = (0..p as u32).collect();
     // Force the FD arm: the probe MEASURES the FD stencil's margin, and the
@@ -620,6 +620,7 @@ fn measure_fit(r: &Rung, sized: &ModelSpec, ids: &GroupIds) -> Measured {
     let fit = crate::glmm::fit_glmm(
         &mut ws,
         x_mat.as_ref(),
+        x_mat.as_ref().subcols(0, 0),
         &r.y,
         &ids.primary,
         &ids.extra,
@@ -643,6 +644,7 @@ fn measure_fit(r: &Rung, sized: &ModelSpec, ids: &GroupIds) -> Measured {
         let status = crate::glmm::joint_hessian_cov(
             &mut ws,
             x_mat.as_ref(),
+            x_mat.as_ref().subcols(0, 0),
             &r.y,
             &ids.primary,
             &ids.extra,
@@ -708,7 +710,7 @@ fn measure_fit(r: &Rung, sized: &ModelSpec, ids: &GroupIds) -> Measured {
 }
 
 /// Which of the four report cells a rung falls in.
-fn cell_of(sized: &ModelSpec, family: Family) -> (&'static str, &'static str) {
+fn cell_of(sized: &SizedSpec, family: Family) -> (&'static str, &'static str) {
     let path = match crate::fit::classify_design(sized, 1) {
         crate::fit::Solver::Sparse => "sparse",
         crate::fit::Solver::NoZ => "dense",
@@ -726,7 +728,7 @@ fn cell_of(sized: &ModelSpec, family: Family) -> (&'static str, &'static str) {
 /// probe is not differencing the shipped stencil and nothing below it means
 /// anything.
 fn measure_rung(r: &Rung) -> (&'static str, &'static str, Measured) {
-    let (sized, sids, _perm) = crate::fit::spec_sized_from_ids_pub(&r.model, &r.ids);
+    let (sized, sids, _perm) = crate::fit::spec_sized_from_ids(&r.model, &r.ids);
     let (path, link) = cell_of(&sized, r.family);
     let meas = measure_fit(r, &sized, &sids);
     if let Some(se) = &meas.se[FULL] {

@@ -6,14 +6,15 @@
 //! those counts, every other (cell, quantity) reported.
 //!
 //! Every quantity comes through the surfaces a user reaches: fits made with
-//! `fit_cold` from `formula::lower` with the lowering's own options (`nagq`
-//! and `reml` set), `formula::anova::{compare, term_tests}`,
+//! `crate::fit` from `formula::lower` with the default options (`nagq` and
+//! `reml` set), `formula::anova::compare_stored` and the body of
+//! `formula::anova::term_tests` (`term_tests_cached`),
 //! `Fit::{contrast_t, contrast_f, coef_df}`, and the tails and quantiles the
 //! ports' `summary()` and `confint` use.
 //!
 //! Aliasing by design. Per dataset the full fixed design (`1`, `time`,
 //! `group`, `time:group`) is tested for aliased columns from its lowered `x`
-//! with the test `fit_cold` applies before any fit: `group` constant, or
+//! with the test `crate::fit` applies before any fit: `group` constant, or
 //! `time:group` aliased because one group's rows share one time. Such a
 //! dataset is left out of every quantity, `f3`'s included, since every fit of
 //! the dataset uses that design or a part of it and a dropped column moves the
@@ -28,11 +29,13 @@ use super::mc_data::bands::{Gate, Side};
 use super::mc_data::{bands, generate, Cell, Response, Truth, CELLS};
 use super::tails::{chisq_upper_p, normal_quantile, t_quantile};
 use crate::formula::anova::{
-    compare, term_tests, CompareOptions, ComparisonTest, Model, SsType, TermTest, TermTestOptions,
+    compare_stored, term_tests_cached, CompareOptions, ComparisonTest, Model, RefitCache, SsType,
+    TermTest, TermTestOptions,
 };
 use crate::formula::{lower, Column, Lowered, Table};
 use crate::inference::{LinearKind, Reference};
-use crate::{fit_cold, BinomialLink, Family, Fit, PoissonLink};
+use crate::test_support::fit_warm_wo;
+use crate::{BinomialLink, Family, Fit, FitOptions, PoissonLink};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -211,7 +214,7 @@ fn lowered(formula: &str, table: &Table, family: Family) -> Lowered {
     lower(formula, table, family).unwrap_or_else(|e| panic!("{formula}: {e}"))
 }
 
-/// The design columns `fit_cold` drops as aliased: its own alias gate
+/// The design columns `crate::fit` drops as aliased: its own alias gate
 /// (`fit::detect_aliased`) on the lowered `x`.
 fn aliased_columns(lo: &Lowered) -> Vec<bool> {
     crate::fit::detect_aliased(&lo.x, lo.n, lo.p)
@@ -238,14 +241,15 @@ fn f3_aliased_columns(table: &Table, family: Family, random: &str) -> usize {
     term.columns.clone().filter(|&j| mask[j]).count()
 }
 
-/// A converged fit with its lowering and formula.
+/// A converged fit with its lowering, options and formula.
 struct Fitted {
     formula: String,
     lo: Lowered,
+    opts: FitOptions,
     fit: Fit,
 }
 
-/// One fit of `formula` on `table`: the lowering's options with `nagq` and
+/// One fit of `formula` on `table`: the default options with `nagq` and
 /// `reml` set, timed under `kind`; `None` when it did not converge.
 fn fit_one(
     acc: &mut CellAcc,
@@ -256,18 +260,26 @@ fn fit_one(
     nagq: u8,
     reml: Option<bool>,
 ) -> Option<Fitted> {
-    let mut lo = lowered(&formula, table, family);
-    lo.opts.nagq = nagq;
-    lo.opts.reml = reml;
+    let lo = lowered(&formula, table, family);
+    let fit_opts = FitOptions {
+        nagq,
+        reml,
+        ..FitOptions::default()
+    };
     let start = Instant::now();
-    let fit = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+    let fit = crate::fit(&lo.data(), &lo.model, &fit_opts).unwrap_or_else(|e| panic!("{e}"));
     let wall = start.elapsed().as_secs_f64();
     let converged = fit.converged();
     let e = acc.fits.entry(kind).or_default();
     e.0 += 1;
     e.1 += u64::from(!converged);
     e.2 += wall;
-    converged.then_some(Fitted { formula, lo, fit })
+    converged.then_some(Fitted {
+        formula,
+        lo,
+        opts: fit_opts,
+        fit,
+    })
 }
 
 /// The design column named `name`.
@@ -301,7 +313,8 @@ fn term_p(f: &Option<Fitted>, ss_type: SsType, label: &str) -> Option<f64> {
         TermTest::Wald
     };
     let opts = TermTestOptions { ss_type, test };
-    let table = term_tests(&f.lo, &f.fit, &opts).ok()?;
+    let table =
+        term_tests_cached(&f.lo, &f.opts, &f.fit, &opts, &mut RefitCache::default()).ok()?;
     // The rows must be the test measured: the F on the Gaussian LMM, the Wald
     // χ² elsewhere. Any other table loses the quantity.
     let kind = match test {
@@ -318,9 +331,9 @@ fn term_p(f: &Option<Fitted>, ss_type: SsType, label: &str) -> Option<f64> {
 /// The likelihood-ratio test of two fits through `compare`.
 fn lrt_p(small: &Option<Fitted>, large: &Option<Fitted>) -> Option<f64> {
     let (a, b) = (small.as_ref()?, large.as_ref()?);
-    let ma = Model::from_fit(&a.formula, &a.lo, &a.fit);
-    let mb = Model::from_fit(&b.formula, &b.lo, &b.fit);
-    match compare(&ma, &mb, &COMPARE).ok()?.test {
+    let ma = Model::from_fit(&a.formula, &a.lo, &a.opts, &a.fit);
+    let mb = Model::from_fit(&b.formula, &b.lo, &b.opts, &b.fit);
+    match compare_stored(&ma, &mb, &COMPARE).ok()?.test {
         ComparisonTest::Lr(t) => Some(t.p_value),
         ComparisonTest::Linear(t) => Some(t.p_value),
     }
@@ -407,9 +420,6 @@ struct Measured {
     /// margin is `≥ 0`); `None` when a fit it needs did not converge or a
     /// bound is not finite.
     covers: BTreeMap<&'static str, Option<[f64; 3]>>,
-    /// The intervals not measured on this design (the `β1` profile on a
-    /// random-slope cell, whose slope variable must stay in the design).
-    skipped: Vec<&'static str>,
 }
 
 /// Measures `table`, a dataset of `cell`; the data measures, the estimates
@@ -505,10 +515,6 @@ fn measure_glmm(cell: &Cell, table: &Table, acc: &mut CellAcc, m: &mut Measured)
     for (j, (wald, profile)) in WALD_CI.into_iter().zip(PROFILE_CI).enumerate() {
         m.covers
             .insert(wald, interval_covers(&full, j, truth.beta[j], false));
-        if cell.slope && j == 1 {
-            m.skipped.push(profile);
-            continue;
-        }
         let held = fit(acc, "glmm_offset", "y_full", OFFSET[j], re, 1);
         let covers = match (&full, &held) {
             (Some(a), Some(b)) => profile_covers(a.fit.loglik, b.fit.loglik),
@@ -615,8 +621,6 @@ struct Counts {
     /// Datasets that lost the quantity: a fit did not converge, or the value
     /// is not finite.
     failed: u64,
-    /// Datasets on which the quantity is not measured by design.
-    skipped: u64,
     /// The datasets kept, `R_kept`.
     used: u64,
     /// Per α the rejections (a test), or per level the intervals covering
@@ -628,7 +632,6 @@ impl Counts {
     fn add(&mut self, o: &Counts) {
         self.aliased += o.aliased;
         self.failed += o.failed;
-        self.skipped += o.skipped;
         self.used += o.used;
         for (h, x) in self.hits.iter_mut().zip(o.hits) {
             *h += x;
@@ -759,8 +762,6 @@ impl CellAcc {
             let c = self.covers.entry(q).or_default();
             if m.aliased {
                 c.aliased += 1;
-            } else if m.skipped.contains(&q) {
-                c.skipped += 1;
             } else {
                 match m
                     .covers
@@ -927,7 +928,6 @@ fn cell_json(cell: &Cell, acc: &CellAcc, r_count: u64) -> Map<String, Value> {
             json!({
                 "aliased": c.aliased,
                 "failed": c.failed,
-                "skipped": c.skipped,
                 "used": c.used,
                 "covered": c.hits,
                 "coverages": c.rates(),
@@ -1071,11 +1071,10 @@ fn print_cell(cell: &Cell, acc: &CellAcc, r_count: u64, wall: f64) {
     for q in covers_of(cell) {
         let c = &acc.covers[q];
         println!(
-            "COVER {name} {q} R_kept={} aliased={} failed={} skipped={} cover(.90 .95 .99)=[{}] z=[{}]",
+            "COVER {name} {q} R_kept={} aliased={} failed={} cover(.90 .95 .99)=[{}] z=[{}]",
             c.used,
             c.aliased,
             c.failed,
-            c.skipped,
             three(c.rates(), 4),
             three(standardized(c, LEVELS), 2),
         );
@@ -1190,7 +1189,7 @@ fn gate_cell(cell: &Cell, acc: &CellAcc) -> (usize, Vec<String>) {
         if gates.is_empty() {
             continue;
         }
-        let datasets = c.aliased + c.failed + c.skipped + c.used;
+        let datasets = c.aliased + c.failed + c.used;
         let aliased = c.aliased as f64 / datasets as f64;
         if aliased > bands::MC_ALIASED_MAX {
             misses.push(format!(
@@ -1410,7 +1409,7 @@ fn profile_duality_matches_the_quantile_check() {
     assert_eq!(profile_covers(f64::NAN, -10.0), None);
 }
 
-/// A dataset whose full design is aliased (as `fit_cold` decides it) is
+/// A dataset whose full design is aliased (as `crate::fit` decides it) is
 /// counted as aliased in every quantity, and fitted no further.
 #[test]
 fn aliased_designs_are_left_out_of_every_quantity() {
@@ -1421,9 +1420,20 @@ fn aliased_designs_are_left_out_of_every_quantity() {
         &table,
         Family::Gaussian,
     );
-    let fit = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+    let fit = fit_warm_wo(
+        &lo.x,
+        &lo.y,
+        lo.n,
+        lo.p,
+        &lo.model,
+        &lo.ids,
+        None,
+        lo.weights.as_deref(),
+        lo.offset.as_deref(),
+        &FitOptions::default(),
+    );
     assert!(fit.converged());
-    assert_eq!(fit.aliased(), aliased_columns(&lo), "fit_cold's own test");
+    assert_eq!(fit.aliased(), aliased_columns(&lo), "the fit's own test");
     let mut acc = CellAcc::default();
     let m = measure(&c, &table, &mut acc);
     acc.record(&c, &m);
@@ -1462,7 +1472,8 @@ fn f3_rows_carry_their_df() {
         ss_type: SsType::Type3,
         test: TermTest::Auto,
     };
-    let rows = term_tests(&f.lo, &f.fit, &opts).unwrap();
+    let rows =
+        term_tests_cached(&f.lo, &f.opts, &f.fit, &opts, &mut RefitCache::default()).unwrap();
     let row = rows.fixed.iter().find(|r| r.label == "f3").unwrap();
     assert_eq!(row.test.num_df, 1.0);
 
@@ -1525,8 +1536,8 @@ enum Hand {
     Profile(Spec, Spec),
 }
 
-/// The hand table of a cell: every quantity of the cell but the skipped
-/// ones, each with its rebuild.
+/// The hand table of a cell: every quantity of the cell, each with its
+/// rebuild.
 fn hand_table(cell: &Cell) -> Vec<(&'static str, Hand)> {
     let re = random_part(cell.slope);
     let alt = random_part(!cell.slope);
@@ -1631,9 +1642,7 @@ fn hand_table(cell: &Cell) -> Vec<(&'static str, Hand)> {
     ];
     for j in 0..4 {
         t.push((WALD_CI[j], Hand::Ci(full("y_full"), j, false, beta[j])));
-        if !(cell.slope && j == 1) {
-            t.push((PROFILE_CI[j], Hand::Profile(full("y_full"), la(offsets[j]))));
-        }
+        t.push((PROFILE_CI[j], Hand::Profile(full("y_full"), la(offsets[j]))));
     }
     if cell.slope {
         return t;
@@ -1662,14 +1671,17 @@ fn hand_table(cell: &Cell) -> Vec<(&'static str, Hand)> {
     t
 }
 
-/// A converged fit of `spec`, made here.
-fn hand_fit(table: &Table, family: Family, spec: &Spec) -> (Lowered, Fit) {
-    let mut lo = lower(&spec.0, table, family).unwrap();
-    lo.opts.nagq = spec.1;
-    lo.opts.reml = spec.2;
-    let fit = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+/// A converged fit of `spec`, made here, with the options it was made with.
+fn hand_fit(table: &Table, family: Family, spec: &Spec) -> (Lowered, FitOptions, Fit) {
+    let lo = lower(&spec.0, table, family).unwrap();
+    let fit_opts = FitOptions {
+        nagq: spec.1,
+        reml: spec.2,
+        ..FitOptions::default()
+    };
+    let fit = crate::fit(&lo.data(), &lo.model, &fit_opts).unwrap_or_else(|e| panic!("{e}"));
     assert!(fit.converged(), "{}", spec.0);
-    (lo, fit)
+    (lo, fit_opts, fit)
 }
 
 /// The rebuilt value: a p-value, or an interval's three margins.
@@ -1682,28 +1694,29 @@ fn rebuild(table: &Table, family: Family, hand: &Hand) -> Rebuilt {
     let column = |lo: &Lowered, name: &str| lo.col_names.iter().position(|c| c == name).unwrap();
     match hand {
         Hand::Z(spec, name) => {
-            let (lo, fit) = hand_fit(table, family, spec);
+            let (lo, _, fit) = hand_fit(table, family, spec);
             let j = column(&lo, name);
             let z = fit.beta[j] / fit.se[j];
             Rebuilt::P(chisq_upper_p(z * z, 1.0))
         }
         Hand::Row(spec, ss_type, test, kind, label) => {
-            let (lo, fit) = hand_fit(table, family, spec);
+            let (lo, fit_opts, fit) = hand_fit(table, family, spec);
             let opts = TermTestOptions {
                 ss_type: *ss_type,
                 test: *test,
             };
-            let rows = term_tests(&lo, &fit, &opts).unwrap();
+            let rows =
+                term_tests_cached(&lo, &fit_opts, &fit, &opts, &mut RefitCache::default()).unwrap();
             assert_eq!(rows.choice.test, *kind, "{}", spec.0);
             let row = rows.fixed.iter().find(|r| r.label == *label).unwrap();
             Rebuilt::P(row.test.p_value)
         }
         Hand::Lr(small, large, reference) => {
             let model = |spec: &Spec| {
-                let (lo, fit) = hand_fit(table, family, spec);
-                Model::from_fit(&spec.0, &lo, &fit)
+                let (lo, fit_opts, fit) = hand_fit(table, family, spec);
+                Model::from_fit(&spec.0, &lo, &fit_opts, &fit)
             };
-            let comparison = compare(&model(small), &model(large), &COMPARE).unwrap();
+            let comparison = compare_stored(&model(small), &model(large), &COMPARE).unwrap();
             let ComparisonTest::Lr(test) = comparison.test else {
                 panic!("{}: not a likelihood-ratio test", large.0)
             };
@@ -1715,20 +1728,20 @@ fn rebuild(table: &Table, family: Family, hand: &Hand) -> Rebuilt {
             Rebuilt::P(test.p_value)
         }
         Hand::T(spec, name) => {
-            let (lo, fit) = hand_fit(table, family, spec);
+            let (lo, _, fit) = hand_fit(table, family, spec);
             let mut l = vec![0.0; lo.p];
             l[column(&lo, name)] = 1.0;
             Rebuilt::P(fit.contrast_t(&l).unwrap().p_value)
         }
         Hand::Joint(spec) => {
-            let (lo, fit) = hand_fit(table, family, spec);
+            let (lo, _, fit) = hand_fit(table, family, spec);
             let mut l = vec![0.0; 2 * lo.p];
             l[column(&lo, "group")] = 1.0;
             l[lo.p + column(&lo, "time:group")] = 1.0;
             Rebuilt::P(fit.contrast_f(&l, 2).unwrap().p_value)
         }
         Hand::Ci(spec, j, t_df, truth) => {
-            let (_, fit) = hand_fit(table, family, spec);
+            let (_, _, fit) = hand_fit(table, family, spec);
             Rebuilt::Margins(LEVELS.map(|level| {
                 let q = if *t_df {
                     t_quantile(0.5 + level / 2.0, fit.coef_df[*j])
@@ -1739,8 +1752,8 @@ fn rebuild(table: &Table, family: Family, hand: &Hand) -> Rebuilt {
             }))
         }
         Hand::Profile(full, held) => {
-            let (_, a) = hand_fit(table, family, full);
-            let (_, b) = hand_fit(table, family, held);
+            let (_, _, a) = hand_fit(table, family, full);
+            let (_, _, b) = hand_fit(table, family, held);
             let p = chisq_upper_p((2.0 * (a.loglik - b.loglik)).max(0.0), 1.0);
             Rebuilt::Margins(LEVELS.map(|level| p - (1.0 - level)))
         }
@@ -1756,12 +1769,7 @@ fn check_against_hand(name: &str) {
     let m = measure(&c, &table, &mut acc);
     acc.record(&c, &m);
     for (q, k) in acc.tests.iter().chain(&acc.covers) {
-        let kept = u64::from(!m.skipped.contains(q));
-        assert_eq!(
-            (k.used, k.failed, k.aliased, k.skipped),
-            (kept, 0, 0, 1 - kept),
-            "{name} {q}"
-        );
+        assert_eq!((k.used, k.failed, k.aliased), (1, 0, 0), "{name} {q}");
     }
     let pairs = if c.response == Response::Gauss {
         0
@@ -1770,11 +1778,7 @@ fn check_against_hand(name: &str) {
     };
     assert_eq!(acc.pairs.len(), pairs, "{name}: Wald/LRT pairs");
     let hand = hand_table(&c);
-    let mut listed: Vec<&str> = hand
-        .iter()
-        .map(|(q, _)| *q)
-        .chain(m.skipped.iter().copied())
-        .collect();
+    let mut listed: Vec<&str> = hand.iter().map(|(q, _)| *q).collect();
     listed.sort_unstable();
     let mut all = [tests_of(&c), covers_of(&c)].concat();
     all.sort_unstable();

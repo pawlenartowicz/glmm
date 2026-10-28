@@ -8,6 +8,9 @@ made. `glmm.anova(m0, m1)` compares two stored fits as they are, with no
 refit and no data. `glmm.compare(data, f0, f1)` fits both formulas on the same
 rows and compares them.
 
+It also holds `PairwiseTable`, the table of `glmm.pairwise` and of its
+intervals.
+
 The module's name is also the function's: `glmm.anova` is the function, and
 this module stays reachable as `sys.modules["glmm.anova"]`.
 """
@@ -30,7 +33,7 @@ from glmm.summary import Rendered, fmt, fmt_df, fmt_p, stars
 _LEGEND = "Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1"
 _RLRT = "exact RLRT null distribution (Crainiceanu & Ruppert 2004)"
 # The per-term heading and note texts (_NOT_CONVERGED, _LRT_LINE,
-# _AUTO_REASONS, _WALD_LINE, and `_term_table`'s heading) are copied in
+# _AUTO_REASONS, _WALD_LINE, _ETA2_LINE, and `_term_table`'s heading) are copied in
 # validation/tools/anova_ports/anova_ports.rs, which the anova port gate
 # compares with both ports - change together.
 _NOT_CONVERGED = (
@@ -51,6 +54,7 @@ _AUTO_REASONS = {
     "no_random_effects": "model without random effects",
 }
 _WALD_LINE = "Wald chi-squared tests"
+_ETA2_LINE = "Partial eta-squared uses the Satterthwaite denominator df, so it is approximate."
 
 
 class _Default(str):
@@ -118,14 +122,17 @@ class _Table(Rendered):
 class TermTable(_Table):
     """The per-term tests of one fit, `glmm.anova(m)`: one row per fixed term,
     in formula order. F tables have lmerTest's columns (`Sum Sq`, `Mean Sq`,
-    `NumDF`, `DenDF`, `F value`, `Pr(>F)`), Wald chi-squared tables car's
-    (`Chisq`, `Df`, `Pr(>Chisq)`), and likelihood-ratio tables the same
-    columns under a two-line `heading` that names the test. The html, latex
-    and typst renders add a `Reference` column naming each row's
-    distribution, `F(NumDF, DenDF)` or `χ²(Df)`, built from the row's df.
+    `NumDF`, `DenDF`, `F value`, `Pr(>F)`) with the partial eta-squared
+    `Eta2_partial`, `F * NumDF / (F * NumDF + DenDF)` (`effectsize::F_to_eta2`),
+    before `Pr(>F)`; on a Satterthwaite table a note says that this value is
+    approximate. Wald chi-squared tables have car's columns (`Chisq`, `Df`,
+    `Pr(>Chisq)`), and likelihood-ratio tables the same columns under a
+    two-line `heading` that names the test. The html, latex and typst renders
+    add a `Reference` column naming each row's distribution,
+    `F(NumDF, DenDF)` or `χ²(Df)`, built from the row's df.
     `Fit.contrast_test` returns one too: one row named "contrast", in the
-    columns of the table of its test, with `ss_type` None. Name is provisional
-    until 1.0.0."""
+    columns of the table of its test without `Eta2_partial`, with `ss_type`
+    None. Name is provisional until 1.0.0."""
 
     _values: dict
     row_names: list
@@ -168,6 +175,196 @@ class TermTable(_Table):
 
     def _footer_lines(self):
         return [_LEGEND, *self.notes]
+
+
+# The footer lines of a pairwise table and of its intervals, emmeans' words.
+# Mirrors the R port's .pairwise_footer - change together.
+_HOLM_INTERVALS = "Holm has no simultaneous interval; Bonferroni intervals shown."
+
+
+def _family_sizes(stored):
+    """The tested rows (a p-value that is not NaN) of each `by` group, the
+    `m` of a Holm or Bonferroni adjustment, as `"3"` or `"2 or 3"`."""
+    k = stored["levels"]
+    size = k * (k - 1) // 2
+    p = stored["p_value"]
+    counts = sorted(
+        {sum(not math.isnan(v) for v in p[i : i + size]) for i in range(0, len(p), size)}
+    )
+    return " or ".join(str(c) for c in counts)
+
+
+def _tukey_sizes(stored):
+    """Tukey's family size of each `by` group: the levels in at least one
+    tested comparison (a p-value that is not NaN), as the crate's `tukey_k`
+    counts them. Mirrors the R port's .tukey_sizes - change together."""
+    k = stored["levels"]
+    pairs = [(i, j) for i in range(k) for j in range(i + 1, k)]
+    p = stored["p_value"]
+    return sorted(
+        {
+            len(
+                {
+                    x
+                    for (i, j), v in zip(pairs, p[g : g + len(pairs)])
+                    if not math.isnan(v)
+                    for x in (i, j)
+                }
+            )
+            for g in range(0, len(p), len(pairs))
+        }
+    )
+
+
+def _adjust_line(stored, adjust, intervals):
+    """The footer line naming `adjust` and its family size, None for "none"."""
+    if adjust == "none":
+        return None
+    lead = "Conf-level adjustment" if intervals else "P value adjustment"
+    if adjust == "tukey":
+        sizes = _tukey_sizes(stored)
+        if len(sizes) > 1:
+            return f"{lead}: tukey method for varying family sizes"
+        return f"{lead}: tukey method for comparing a family of {sizes[0]} estimates"
+    what = "estimates" if intervals else "tests"
+    return f"{lead}: {adjust} method for {_family_sizes(stored)} {what}"
+
+
+@dataclass(repr=False, eq=False)
+class PairwiseTable(_Table):
+    """The pairwise comparisons of `glmm.pairwise`, one row per pair of levels,
+    with emmeans' column names: `contrast` ("a - b"), the `by` variable when
+    given, `estimate`, `SE`, `df` (Inf on a z test), `t.ratio` or `z.ratio`,
+    `p.value` (adjusted), and on a log or logit link `odds.ratio` or `ratio`
+    and its `ratio.SE`. The notes under the table name the adjustment. Its
+    `confint(level=0.95)` is a `PairwiseTable` of the confidence intervals:
+    `contrast`, the `by` variable, `estimate`, `lower.CL`, `upper.CL`, and on a
+    log or logit link the ratio with `ratio.lower.CL` and `ratio.upper.CL`.
+    Name is provisional until 1.0.0."""
+
+    _values: dict
+    row_names: list
+    heading: str
+    notes: list
+    _stored: dict | None  # what confint reads; None on a table of intervals
+
+    def _cells(self):
+        def cell(c, v):
+            if isinstance(v, str):
+                return v
+            if c == "p.value":
+                return fmt_p(v)
+            return fmt_df(v) if c == "df" else fmt(v)
+
+        cells = [[cell(c, self._values[c][i]) for c in self._values] for i in range(len(self))]
+        return list(self._values), cells, [""] * len(self)
+
+    def text(self):
+        header, cells, marks = self._cells()
+        return "\n".join([self.heading, *self._grid(header, cells, marks), *self.notes])
+
+    def _header_lines(self):
+        return [self.heading]
+
+    def _tables(self):
+        header, cells, _ = self._cells()
+        return [("Comparisons", header, cells)]
+
+    def _footer_lines(self):
+        return list(self.notes)
+
+    def confint(self, level=0.95):
+        """Two-sided confidence intervals of the comparisons at `level`, from
+        each row's estimate, SE and df, as emmeans' `confint()` of `pairs()`.
+        The intervals follow the table's adjustment: Bonferroni and Tukey
+        intervals hold for all rows of a `by` group at once. Holm has no
+        simultaneous interval, so a Holm table gets Bonferroni intervals, and
+        the notes say so. A NaN row gets a NaN interval. Nothing is refitted.
+
+        Raises `ValueError` on a `level` that is not strictly between 0 and 1,
+        and on a table of intervals."""
+        st = self._stored
+        if st is None:
+            raise ValueError(
+                "this table holds intervals already; call confint on the pairwise table"
+            )
+        ci = _native.pairwise_confint(
+            st["estimate"],
+            st["se"],
+            st["df"],
+            st["p_value"],
+            st["adjust"],
+            st["levels"],
+            st["ratio_kind"],
+            float(level),
+        )
+        values = {"contrast": list(st["contrast"])}
+        if st["by"] is not None:
+            values[st["by"]] = list(st["by_level"])
+        values.update(
+            {
+                "estimate": np.asarray(st["estimate"], dtype=float),
+                "lower.CL": np.asarray(ci["lower"], dtype=float),
+                "upper.CL": np.asarray(ci["upper"], dtype=float),
+            }
+        )
+        if st["ratio_kind"] is not None:
+            values.update(
+                {
+                    _RATIO_NAMES[st["ratio_kind"]]: np.asarray(st["ratio"], dtype=float),
+                    "ratio.lower.CL": np.asarray(ci["ratio_lower"], dtype=float),
+                    "ratio.upper.CL": np.asarray(ci["ratio_upper"], dtype=float),
+                }
+            )
+        adjust = (
+            _HOLM_INTERVALS
+            if st["adjust"] == "holm"
+            else _adjust_line(st, ci["adjust"], intervals=True)
+        )
+        notes = [f"Confidence level used: {float(level):g}"]
+        notes += [adjust] if adjust is not None else []
+        notes += _pairwise_notes(st)
+        return PairwiseTable(values, list(self.row_names), self.heading, notes, None)
+
+
+_RATIO_NAMES = {"odds_ratio": "odds.ratio", "ratio": "ratio"}
+
+
+def _pairwise_notes(stored):
+    """Each row's notes, as "a - b: note", or "a - b, h = h1: note" within a
+    `by` level."""
+    by = stored["by"]
+    out = []
+    for contrast, level, notes in zip(stored["contrast"], stored["by_level"], stored["row_notes"]):
+        label = contrast if by is None else f"{contrast}, {by} = {level}"
+        out += [f"{label}: {n}" for n in notes]
+    return out
+
+
+def _pairwise_table(stored, z):
+    """The `PairwiseTable` of `_native.pairwise`'s columns; `z` says the rows
+    are z tests (a fit with `df_method` "none")."""
+    factor, by = stored["factor"], stored["by"]
+    values = {"contrast": list(stored["contrast"])}
+    if by is not None:
+        values[by] = list(stored["by_level"])
+    values.update(
+        {
+            "estimate": np.asarray(stored["estimate"], dtype=float),
+            "SE": np.asarray(stored["se"], dtype=float),
+            "df": np.asarray(stored["df"], dtype=float),
+            "z.ratio" if z else "t.ratio": np.asarray(stored["statistic"], dtype=float),
+            "p.value": np.asarray(stored["p_adjusted"], dtype=float),
+        }
+    )
+    if stored["ratio_kind"] is not None:
+        values[_RATIO_NAMES[stored["ratio_kind"]]] = np.asarray(stored["ratio"], dtype=float)
+        values["ratio.SE"] = np.asarray(stored["ratio_se"], dtype=float)
+    heading = f"Pairwise comparisons of {factor}" + ("" if by is None else f" by {by}")
+    adjust = _adjust_line(stored, stored["adjust"], intervals=False)
+    notes = ([adjust] if adjust is not None else []) + _pairwise_notes(stored)
+    rows = [str(i + 1) for i in range(len(stored["contrast"]))]
+    return PairwiseTable(values, rows, heading, notes, stored)
 
 
 @dataclass(repr=False, eq=False)
@@ -280,11 +477,11 @@ def anova(*fits, type=None, test=_AUTO, nsim=None, seed=None):
     are made when the fit is: a fit made with `glmm.fit(..., anova_test="LRT")`
     has these rows, and so does a Poisson model with random effects made with
     the default `anova_test="auto"`; on a fit without them "LRT", and "auto" on
-    a Poisson GLMM, raise `ValueError` naming the fit argument. A term whose
-    column carries a random slope keeps its Wald row, with a note. "Wald" and
-    "LRT" apply to every fit with chi-squared rows: any GLMM, and every GLM but
-    a Gamma or inverse Gaussian one with phi estimated; on a fit with F rows
-    they raise `ValueError` naming the F test. The heading names the test;
+    a Poisson GLMM, raise `ValueError` naming the fit argument. Each refit
+    keeps the model's random effects, random slopes included. "Wald" and "LRT"
+    apply to every fit with chi-squared rows: any GLMM, and every GLM but a
+    Gamma or inverse Gaussian one with phi estimated; on a fit with F rows they
+    raise `ValueError` naming the F test. The heading names the test;
     under "auto" a chi-squared table's heading also names why "auto" chose it
     (the family, or no random effects).
 
@@ -431,6 +628,13 @@ def compare(
     numeric_columns, factor_columns, weights, offset = _prepare_columns(
         data, [f0, f1], weights, offset, store, drop_missing_arguments=True
     )
+    # Both fits keep these shared columns, which hold each formula's own.
+    kept = {
+        "numeric": numeric_columns,
+        "factor": factor_columns,
+        "weights": None if weights is None else weights.tobytes(),
+        "offset": None if offset is None else offset.tobytes(),
+    }
     r = _native.compare(
         f0,
         f1,
@@ -439,13 +643,13 @@ def compare(
         family,
         link,
         nagq,
-        None if weights is None else weights.tobytes(),
-        None if offset is None else offset.tobytes(),
+        kept["weights"],
+        kept["offset"],
         nsim,
         seed,
     )
     fit0, fit1 = (
-        _fit_from_native(r[key], f, family, link, nagq, None, list(store))
+        _fit_from_native(r[key], f, family, link, nagq, None, list(store), kept)
         for key, f in (("fit0", f0), ("fit1", f1))
     )
     return Comparison(_comparison_table(r, ("f0", "f1"), family), fit0, fit1)
@@ -553,8 +757,13 @@ def _term_table(m, stored, test):
             "NumDF": stored["num_df"],
             "DenDF": stored["den_df"],
             "F value": stored["statistic"],
-            "Pr(>F)": stored["p_value"],
         }
+        # A fit stored before the column, and a contrast, have none. It sits
+        # before the p-value, which R's print.anova needs last for its stars.
+        eta2 = "eta2_partial" in stored
+        if eta2:
+            values["Eta2_partial"] = stored["eta2_partial"]
+        values["Pr(>F)"] = stored["p_value"]
     else:
         if stored.get("test") == "lrt" or test == "auto":
             # The second line names the test and why it ran, as the R port's;
@@ -580,6 +789,8 @@ def _term_table(m, stored, test):
         f"{label}: {note}" for label, notes in zip(labels, stored["row_notes"]) for note in notes
     ]
     notes = ([] if m.converged else [_NOT_CONVERGED]) + list(stored["notes"]) + row_notes
+    if f_rows and eta2 and satterthwaite:
+        notes.append(_ETA2_LINE)
     return TermTable(values, labels, heading, notes, ss)
 
 

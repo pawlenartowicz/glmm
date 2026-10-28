@@ -1,34 +1,43 @@
 #![cfg(feature = "formula")]
 //! The two-fit comparison: the formula nesting check, the refusals of
 //! `formula::anova::compare`, and the test each pair gets, each checked on
-//! two `Model` sides.
+//! two fitted `formula::Model` sides.
 //!
 //! The nesting tests read formula strings only: no data, no column names, no
-//! tolerance. The refusal tests build each side from a small fit and then
-//! change the one field a refusal reads, since `compare` reads numbers only.
-//! The case tests fit both sides on one data set; a few then change a
-//! side's numbers (a variance, a log-likelihood) to reach a rule no fit hits
-//! on its own. Reference values frozen from R are not read here.
+//! tolerance. The refusal and case tests fit both sides on one data set. The
+//! checks and rules that only a side changed by hand reaches (a field a
+//! refusal reads, a variance, a log-likelihood) are unit tests of
+//! `compare_stored`, in `src/formula/anova_tests.rs`. The two-fit tests read
+//! no reference value frozen from R.
 //!
 //! The per-term tests of one fit (`term_tests`) are checked at the end, on
 //! the `sim_factorial` designs: the rows, their tests by family, and their
 //! agreement with the fit's own `summary()` statistics and with the two-fit
-//! comparison.
+//! comparison. Two CI guards check the rows' partial η², and a mixed model's
+//! R² and ICC, against values copied from frozen `effectsize` references, and
+//! two more the pairwise intervals and the pairwise rows against frozen
+//! `posthoc` references, within their `oracle_support::tol` bands.
 
 use std::mem::discriminant;
 
+// For `tol` alone; the rest of the module serves the oracle tiers.
+#[allow(dead_code)]
+mod oracle_support;
+
 use glmm::formula::anova::{
     compare, nesting, term_tests, CompareError, CompareOptions, Comparison, ComparisonTest,
-    Differs, Model, Nesting, Side, SsType, TermTable, TermTest, TermTestError, TermTestOptions,
+    Differs, Nesting, Side, SsType, TermTable, TermTest, TermTestError, TermTestOptions,
 };
-use glmm::formula::{lower, Column, Lowered, Table};
+use glmm::formula::{lower, pairwise, Adjust, Column, Lowered, Model, Table};
 use glmm::inference::contrast::NoDfReason;
 use glmm::inference::{
     DenDf, LinearKind, LinearNote, LinearTest, LrNote, LrTest, Objective, Reference,
 };
 use glmm::{
-    fit_cold, BinomialLink, Family, Fit, GammaLink, InverseGaussianLink, Note, PoissonLink, WaldSe,
+    BinomialLink, Family, Fit, FitOptions, GammaLink, InverseGaussianLink, Note, PoissonLink,
+    WaldSe,
 };
+use oracle_support::tol;
 
 // ── The formula nesting check ───────────────────────────────────────────────
 
@@ -226,13 +235,9 @@ fn table() -> Table {
     }
 }
 
-/// A Gaussian fit of `formula` with `reml`, as a `Model`.
+/// A Gaussian fit of `formula` with `reml`.
 fn model(formula: &str, reml: Option<bool>) -> Model {
-    let mut lo = lower(formula, &table(), Family::Gaussian).unwrap();
-    lo.opts.reml = reml;
-    let fit = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
-    assert!(fit.converged(), "{formula} did not converge");
-    Model::from_fit(formula, &lo, &fit)
+    side(formula, &table(), Family::Gaussian, reml)
 }
 
 fn opts() -> CompareOptions {
@@ -279,149 +284,6 @@ fn shape(c: Result<Comparison, CompareError>) -> Result<Nesting, CompareError> {
 
 fn refusal(a: &Model, b: &Model) -> CompareError {
     cmp(a, b).expect_err("refused")
-}
-
-#[test]
-fn a_side_that_did_not_converge_refuses() {
-    let m0 = model("y ~ x + (1 | g)", None);
-    let mut m1 = model("y ~ x + z + (1 | g)", Some(false));
-    let mut m0ml = model("y ~ x + (1 | g)", Some(false));
-    m1.converged = false;
-    let e = refusal(&m0ml, &m1);
-    assert_eq!(
-        e,
-        CompareError::NotConverged {
-            m0: false,
-            m1: true
-        }
-    );
-    assert!(
-        e.to_string()
-            .starts_with("the second model did not converge"),
-        "{e}"
-    );
-    m0ml.converged = false;
-    let e = refusal(&m0ml, &m1);
-    assert!(e.to_string().starts_with("neither model converged"), "{e}");
-    // Checked first: before the estimator check that this pair also fails.
-    let e = refusal(&m0, &m1);
-    assert_eq!(
-        e,
-        CompareError::NotConverged {
-            m0: false,
-            m1: true
-        }
-    );
-}
-
-#[test]
-fn different_row_counts_refuse() {
-    let m0 = model("y ~ x", None);
-    let mut m1 = model("y ~ x + z", None);
-    m1.nobs -= 1;
-    m1.y.pop();
-    let e = refusal(&m0, &m1);
-    assert_eq!(e, CompareError::DifferentRows { m0: 30, m1: 29 });
-    assert_eq!(
-        e.to_string(),
-        "the first model has 30 rows and the second has 29; a comparison needs both fits \
-         on the same rows. Fit both models to the same rows, dropping the rows with a \
-         missing value in any variable of either formula first."
-    );
-}
-
-#[test]
-fn a_response_differing_in_one_entry_refuses() {
-    let m0 = model("y ~ x", None);
-    let mut m1 = model("y ~ x + z", None);
-    m1.y[17] = f64::from_bits(m1.y[17].to_bits() + 1);
-    let e = refusal(&m0, &m1);
-    assert_eq!(e, CompareError::DifferentY);
-    assert_eq!(
-        e.to_string(),
-        "the two models have different responses y (the same row count, different \
-         values); a comparison needs both fits on the same data. Fit both models to the \
-         same data."
-    );
-}
-
-#[test]
-fn different_weights_refuse() {
-    let m0 = model("y ~ x", None);
-    let mut m1 = model("y ~ x + z", None);
-    let mut w = vec![1.0; 30];
-    // All-ones weights are no weights.
-    m1.weights = Some(w.clone());
-    assert!(cmp(&m0, &m1).is_ok());
-    w[4] = 2.0;
-    m1.weights = Some(w);
-    let e = refusal(&m0, &m1);
-    assert_eq!(e, CompareError::DifferentWeights);
-    assert_eq!(
-        e.to_string(),
-        "the two models were fitted with different weights; a comparison needs the same \
-         weights in both. Fit both models with the same weights."
-    );
-}
-
-#[test]
-fn different_offsets_refuse() {
-    let m0 = model("y ~ x", None);
-    let mut m1 = model("y ~ x + z", None);
-    let mut o = vec![0.0; 30];
-    m1.offset = Some(o.clone());
-    assert!(cmp(&m0, &m1).is_ok());
-    o[9] = 0.5;
-    m1.offset = Some(o);
-    let e = refusal(&m0, &m1);
-    assert_eq!(e, CompareError::DifferentOffset);
-    assert_eq!(
-        e.to_string(),
-        "the two models were fitted with different offsets; a comparison needs the same \
-         offset in both. Fit both models with the same offset."
-    );
-}
-
-#[test]
-fn a_different_family_or_link_refuses() {
-    let m0 = model("y ~ x", None);
-    let mut m1 = model("y ~ x + z", None);
-    m1.family = Family::Poisson {
-        link: PoissonLink::Log,
-    };
-    let e = refusal(&m0, &m1);
-    assert!(matches!(e, CompareError::DifferentFamily { .. }), "{e:?}");
-    assert_eq!(
-        e.to_string(),
-        "the first model was fitted as gaussian with identity link and the second as \
-         poisson with log link; a comparison needs the same family and link in both. Fit \
-         both models with the same family and link."
-    );
-}
-
-#[test]
-fn a_different_held_dispersion_refuses() {
-    let m0 = model("y ~ x", None);
-    let mut m1 = model("y ~ x + z", None);
-    m1.dispersion_held = Some(2.0);
-    let e = refusal(&m0, &m1);
-    assert_eq!(
-        e,
-        CompareError::DifferentDispersionHeld {
-            m0: None,
-            m1: Some(2.0)
-        }
-    );
-    assert!(e.to_string().contains("dispersion"), "{e}");
-    let mut m0 = m0;
-    m0.dispersion_held = Some(1.5);
-    let e = refusal(&m0, &m1);
-    assert!(
-        matches!(e, CompareError::DifferentDispersionHeld { .. }),
-        "{e:?}"
-    );
-    m0.dispersion_held = Some(2.0);
-    assert!(cmp(&m0, &m1).is_ok());
 }
 
 #[test]
@@ -481,13 +343,13 @@ fn two_reml_fits_with_different_fixed_parts_refuse() {
 fn the_same_parameter_count_has_nothing_to_test() {
     // With two factors, `a:b` spans the columns of `a * b`.
     let (m0, m1) = (model("y ~ a:b", None), model("y ~ a * b", None));
-    assert_eq!(m0.df, m1.df);
+    assert_eq!(m0.fit().df, m1.fit().df);
     let e = refusal(&m0, &m1);
     assert_eq!(
         e,
         CompareError::NothingToTest {
-            m0: m0.df,
-            m1: m1.df
+            m0: m0.fit().df,
+            m1: m1.fit().df
         }
     );
     assert_eq!(
@@ -496,7 +358,7 @@ fn the_same_parameter_count_has_nothing_to_test() {
             "the two models have the same number of parameters ({}), so there is nothing to \
              test: the larger formula adds no parameter to the smaller one. Compare two models \
              that differ by at least one parameter.",
-            m0.df
+            m0.fit().df
         )
     );
     // With a numeric `x` they are different, nested models.
@@ -507,56 +369,11 @@ fn the_same_parameter_count_has_nothing_to_test() {
 }
 
 #[test]
-fn the_data_checks_come_before_the_nesting_check() {
-    // Not nested, and fitted on different data: the data refusal is reported.
-    let m0 = model("y ~ x", None);
-    let mut m1 = model("y ~ z", None);
-    // The premise: unmodified, the pair is refused as not nested.
-    assert!(
-        matches!(refusal(&m0, &m1), CompareError::NotNested { .. }),
-        "the pair is not nested"
-    );
-    m1.y[17] = f64::from_bits(m1.y[17].to_bits() + 1);
-    assert_eq!(refusal(&m0, &m1), CompareError::DifferentY);
-    m1.nobs -= 1;
-    m1.y.pop();
-    assert_eq!(
-        refusal(&m0, &m1),
-        CompareError::DifferentRows { m0: 30, m1: 29 }
-    );
-}
-
-#[test]
-fn one_formula_on_both_sides_has_the_same_parts_whatever_the_parameter_counts() {
-    // The refusal names the same parts, not the parameter counts: two fits
-    // of one formula have equal counts, and a side built by hand can carry
-    // another count for the same formula.
-    let m0 = model("y ~ x + (1 | g)", Some(false));
-    let mut m1 = m0.clone();
-    for _ in 0..2 {
-        let e = refusal(&m0, &m1);
-        assert_eq!(e, CompareError::SameParts);
-        assert_eq!(
-            e.to_string(),
-            "the two models have the same fixed and random parts, so there is nothing to \
-             test. Compare two models that differ by at least one parameter."
-        );
-        m1.df += 1;
-    }
-    // An OLS pair whose reml settings differ: OLS skips the estimator check,
-    // so the same parts are reported.
-    assert_eq!(
-        refusal(&model("y ~ x", None), &model("y ~ x", Some(true))),
-        CompareError::SameParts
-    );
-}
-
-#[test]
 fn formulas_that_differ_only_by_an_offset_refuse_by_the_offset() {
     // `nesting` does not read the offset, so the two formulas have the same
     // parts; the offset check comes first and names what differs.
     let (m0, m1) = (model("y ~ x + offset(z)", None), model("y ~ x", None));
-    assert_eq!(nesting(&m0.formula, &m1.formula), Ok(Nesting::Same));
+    assert_eq!(nesting(m0.formula(), m1.formula()), Ok(Nesting::Same));
     assert_eq!(refusal(&m0, &m1), CompareError::DifferentOffset);
 }
 
@@ -690,25 +507,18 @@ fn binomial() -> Family {
     }
 }
 
-/// A converged fit of `formula` on `table` with `reml` and `nagq` nodes, and
-/// its `Model`.
-fn fitted(
-    formula: &str,
-    table: &Table,
-    family: Family,
-    reml: Option<bool>,
-    nagq: u8,
-) -> (Model, Fit) {
-    let mut lo = lower(formula, table, family).unwrap();
-    lo.opts.reml = reml;
-    lo.opts.nagq = nagq;
-    let fit = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
-    assert!(fit.converged(), "{formula} did not converge");
-    (Model::from_fit(formula, &lo, &fit), fit)
+/// A converged fit of `formula` on `table` with `reml` and `nagq` nodes.
+fn fitted(formula: &str, table: &Table, family: Family, reml: Option<bool>, nagq: u8) -> Model {
+    let mut fit_opts = FitOptions::default();
+    fit_opts.reml = reml;
+    fit_opts.nagq = nagq;
+    let m = glmm::formula::fit(formula, table, family, &fit_opts).unwrap();
+    assert!(m.fit().converged(), "{formula} did not converge");
+    m
 }
 
 fn side(formula: &str, table: &Table, family: Family, reml: Option<bool>) -> Model {
-    fitted(formula, table, family, reml, 1).0
+    fitted(formula, table, family, reml, 1)
 }
 
 fn lr(c: &Comparison) -> &LrTest {
@@ -812,134 +622,19 @@ fn a_one_grouping_mixture_beside_another_grouping_is_approximate() {
 }
 
 #[test]
-fn a_dropped_component_at_zero_gives_t_zero_and_p_one_on_every_reference() {
-    // Exact reference: Dyestuff2's batch variance is estimated at zero.
-    let d = csv_table(
-        include_str!("../validation/data/empirical/Dyestuff2.csv"),
-        &["Batch"],
-    );
-    let ols = side("Yield ~ 1", &d, Family::Gaussian, Some(true));
-    let full = side("Yield ~ 1 + (1 | Batch)", &d, Family::Gaussian, None);
-    assert_eq!(
-        full.varcorr,
-        vec![vec![0.0]],
-        "Dyestuff2 pins the batch variance"
-    );
-    let c = cmp(&ols, &full).unwrap();
-    let t = lr(&c);
-    assert_eq!(t.statistic.to_bits(), 0.0f64.to_bits());
-    assert_eq!(t.p_value, 1.0);
-    // No draws are made at a zero statistic: the exact test returns `nsim = 0`.
-    assert_eq!(
-        t.reference,
-        Reference::ExactRlrt {
-            nsim: 0,
-            seed: opts().seed
-        }
-    );
-
-    // Mixture reference: the same pair given weights, all equal to 1, keeps
-    // no design summary.
-    let weighted = |f: &str, reml| {
-        let mut lo = lower(f, &d, Family::Gaussian).unwrap();
-        lo.opts.reml = reml;
-        lo.opts.weights = Some(vec![1.0; lo.n]);
-        let fit = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
-        Model::from_fit(f, &lo, &fit)
-    };
-    let (ols_w, full_w) = (
-        weighted("Yield ~ 1", Some(true)),
-        weighted("Yield ~ 1 + (1 | Batch)", None),
-    );
-    assert_eq!(full_w.design_summary, None);
-    let c = cmp(&ols_w, &full_w).unwrap();
-    let t = lr(&c);
-    assert_eq!(t.reference, Reference::ChiBarSquared { df_low: 0 });
-    assert_eq!(t.notes, vec![LrNote::NoDesignSummary, MIXTURE]);
-    assert_eq!((t.statistic, t.p_value), (0.0, 1.0));
-
-    // Mixture and χ² references, from a side whose dropped variances are set
-    // to zero while its log-likelihood stays a round-off above the smaller
-    // one's: the rule, not the round-off, decides.
-    let s = sleepstudy();
-    let int = side(
-        "Reaction ~ Days + (1 | Subject)",
-        &s,
-        Family::Gaussian,
-        None,
-    );
-    let ols = side("Reaction ~ Days", &s, Family::Gaussian, Some(true));
-    let mut slope = side(
-        "Reaction ~ Days + (Days | Subject)",
-        &s,
-        Family::Gaussian,
-        None,
-    );
-    let v = slope.varcorr[0].clone();
-    // The vech block is (intercept, covariance, slope).
-    slope.varcorr = vec![vec![v[0], 0.0, 0.0]];
-    slope.loglik = int.loglik + 1e-9;
-    let t = lr(&cmp(&int, &slope).unwrap()).clone();
-    assert_eq!(t.reference, Reference::ChiBarSquared { df_low: 1 });
-    assert_eq!((t.statistic, t.p_value), (0.0, 1.0));
-    slope.varcorr = vec![vec![0.0, 0.0, 0.0]];
-    slope.loglik = ols.loglik + 1e-9;
-    let t = lr(&cmp(&ols, &slope).unwrap()).clone();
-    assert_eq!(t.reference, Reference::ChiSquared { df: 3 });
-    assert_eq!((t.statistic, t.p_value), (0.0, 1.0));
-    // A zero variance the smaller model keeps does not trigger the rule.
-    slope.varcorr = vec![vec![0.0, 0.0, v[2]]];
-    slope.loglik = int.loglik + 1e-9;
-    let t = lr(&cmp(&int, &slope).unwrap()).clone();
-    assert!(t.statistic > 0.0 && t.p_value < 1.0, "{t:?}");
-}
-
-#[test]
 fn a_fit_at_the_correlation_boundary_is_not_a_zero_component() {
     let d = csv_table(
         include_str!("../validation/data/simulated/sim_corr_boundary.csv"),
         &["g"],
     );
-    let (full, fit) = fitted("y ~ x + (1 + x | g)", &d, Family::Gaussian, None, 1);
+    let full = fitted("y ~ x + (1 + x | g)", &d, Family::Gaussian, None, 1);
+    let fit = full.fit();
     // The trailing θ diagonal is pinned while the slope variance is not zero.
     assert!(fit.diagnostics.pinned.iter().flatten().any(|&p| p));
-    assert!(full.varcorr[0][2] > 0.0, "{:?}", full.varcorr);
+    assert!(fit.varcorr[0][2] > 0.0, "{:?}", fit.varcorr);
     let reduced = side("y ~ x + (1 | g)", &d, Family::Gaussian, None);
     let t = lr(&cmp(&reduced, &full).unwrap()).clone();
     assert!(t.statistic > 0.0, "{t:?}");
-}
-
-#[test]
-fn a_raw_statistic_below_zero_is_floored_with_a_note_naming_the_larger_fit() {
-    let d = sleepstudy();
-    let small = side(
-        "Reaction ~ Days + (1 | Subject)",
-        &d,
-        Family::Gaussian,
-        None,
-    );
-    let mut large = side(
-        "Reaction ~ Days + (Days | Subject)",
-        &d,
-        Family::Gaussian,
-        None,
-    );
-    // Beyond round-off (2·dev_eps = 8e-5 deviance units).
-    large.loglik = small.loglik - 1e-4;
-    let raw = 2.0 * (large.loglik - small.loglik);
-    let c = cmp(&small, &large).unwrap();
-    let t = lr(&c);
-    assert_eq!((t.statistic, t.p_value), (0.0, 1.0));
-    assert_eq!(t.notes, vec![LrNote::NegativeStatistic { raw }, MIXTURE]);
-    let negative = "The larger model did not reach its optimum";
-    assert!(c.note_lines()[0].starts_with(negative));
-    let back = compare(&large, &small, &opts()).unwrap();
-    assert!(back.note_lines()[0].starts_with(negative));
-    // Within round-off: the floor, with no note.
-    large.loglik = small.loglik - 1e-5;
-    let t = lr(&cmp(&small, &large).unwrap()).clone();
-    assert_eq!((t.statistic, t.p_value), (0.0, 1.0));
-    assert_eq!(t.notes, vec![MIXTURE]);
 }
 
 /// Six groups with the same ten rows each, so no grouping varies: a
@@ -974,13 +669,13 @@ fn a_binomial_or_poisson_glmm_at_zero_variance_has_the_glm_log_likelihood() {
     for (y, family) in [("yb", binomial()), ("yc", poisson)] {
         let glm = side(&format!("{y} ~ x"), &d, family, None);
         let glmm = side(&format!("{y} ~ x + (1 | g)"), &d, family, None);
-        assert_eq!(glmm.varcorr, vec![vec![0.0]], "{y}: θ̂ = 0");
-        let gap = (glmm.loglik - glm.loglik).abs();
+        assert_eq!(glmm.fit().varcorr, vec![vec![0.0]], "{y}: θ̂ = 0");
+        let gap = (glmm.fit().loglik - glm.fit().loglik).abs();
         assert!(
-            gap <= 1e-10 * glm.loglik.abs(),
+            gap <= 1e-10 * glm.fit().loglik.abs(),
             "{y}: GLMM {} against GLM {}",
-            glmm.loglik,
-            glm.loglik
+            glmm.fit().loglik,
+            glm.fit().loglik
         );
         let t = lr(&cmp(&glm, &glmm).unwrap()).clone();
         assert_eq!((t.statistic, t.p_value), (0.0, 1.0), "{y}");
@@ -998,44 +693,11 @@ fn a_grouping_lowering_drops_does_not_hide_a_dropped_component_at_zero() {
     let glm = side("yb ~ x", &d, binomial(), None);
     for larger in ["yb ~ x + (1 | g)", "yb ~ x + (1 | g) + (1 | h)"] {
         let glmm = side(larger, &d, binomial(), None);
-        assert_eq!(glmm.varcorr, vec![vec![0.0]], "{larger}");
+        assert_eq!(glmm.fit().varcorr, vec![vec![0.0]], "{larger}");
         let t = lr(&cmp(&glm, &glmm).unwrap()).clone();
         assert_eq!(t.statistic.to_bits(), 0.0f64.to_bits(), "{larger}: {t:?}");
         assert_eq!(t.p_value, 1.0, "{larger}");
     }
-}
-
-#[test]
-fn a_slope_dropped_beside_a_factor_slope_at_zero_gives_t_zero() {
-    let mut d = sleepstudy();
-    let phase: Vec<String> = (0..d.n)
-        .map(|i| ["a", "b", "c"][i % 3].to_string())
-        .collect();
-    d.columns
-        .push(("phase".into(), Column::factor_from_labels(&phase)));
-    let small = side(
-        "Reaction ~ Days + phase + (phase | Subject)",
-        &d,
-        Family::Gaussian,
-        None,
-    );
-    let mut large = side(
-        "Reaction ~ Days + phase + (phase + Days | Subject)",
-        &d,
-        Family::Gaussian,
-        None,
-    );
-    // One block of four dimensions, (Intercept), phaseb, phasec, Days, packed
-    // by rows of its upper triangle: zero Days' variance and covariances.
-    let q = 4;
-    assert_eq!(large.varcorr[0].len(), q * (q + 1) / 2);
-    for i in 0..q {
-        large.varcorr[0][i * q - (i * i - i) / 2 + (q - 1 - i)] = 0.0;
-    }
-    large.loglik = small.loglik + 1e-9;
-    let t = lr(&cmp(&small, &large).unwrap()).clone();
-    assert_eq!(t.statistic.to_bits(), 0.0f64.to_bits(), "{t:?}");
-    assert_eq!(t.p_value, 1.0);
 }
 
 #[test]
@@ -1045,150 +707,12 @@ fn a_fixed_effect_beside_a_grouping_at_zero_is_still_tested() {
     let d = identical_groups();
     let glm = side("yb ~ 1", &d, binomial(), None);
     let glmm = side("yb ~ x + (1 | g)", &d, binomial(), None);
-    assert_eq!(glmm.varcorr, vec![vec![0.0]]);
+    assert_eq!(glmm.fit().varcorr, vec![vec![0.0]]);
     let c = cmp(&glm, &glmm).unwrap();
     assert_eq!(c.differs, Differs::Both);
     let t = lr(&c);
     assert!(t.statistic > 0.0 && t.p_value < 1.0, "{t:?}");
     assert_eq!(t.statistic, floored(&c));
-}
-
-#[test]
-fn a_failed_fit_gives_nan_even_with_the_dropped_variance_at_zero() {
-    // Three pairs whose dropped variances are zero, one per reference: the
-    // mixture, χ² and the exact test.
-    let s = sleepstudy();
-    let int = side(
-        "Reaction ~ Days + (1 | Subject)",
-        &s,
-        Family::Gaussian,
-        None,
-    );
-    let ols = side("Reaction ~ Days", &s, Family::Gaussian, Some(true));
-    let mut slope = side(
-        "Reaction ~ Days + (Days | Subject)",
-        &s,
-        Family::Gaussian,
-        None,
-    );
-    let v = slope.varcorr[0][0];
-    slope.varcorr = vec![vec![v, 0.0, 0.0]];
-    slope.loglik = int.loglik + 1e-9;
-    let mut flat = slope.clone();
-    flat.varcorr = vec![vec![0.0, 0.0, 0.0]];
-    flat.loglik = ols.loglik + 1e-9;
-    let d2 = csv_table(
-        include_str!("../validation/data/empirical/Dyestuff2.csv"),
-        &["Batch"],
-    );
-    let ols2 = side("Yield ~ 1", &d2, Family::Gaussian, Some(true));
-    let full2 = side("Yield ~ 1 + (1 | Batch)", &d2, Family::Gaussian, None);
-    assert_eq!(full2.varcorr, vec![vec![0.0]]);
-    // The p-quality notes each reference carries on a finite pair; a NaN
-    // statistic replaces them with the one note naming its cause.
-    let pairs = [
-        (&int, &slope, vec![MIXTURE]),
-        (&ols, &flat, vec![LrNote::BoundaryIgnored]),
-        (&ols2, &full2, vec![]),
-    ];
-    for (small, large, finite_notes) in pairs {
-        let finite = lr(&compare(small, large, &opts()).unwrap()).clone();
-        assert_eq!((finite.statistic, finite.p_value), (0.0, 1.0), "{finite:?}");
-        assert_eq!(finite.notes, finite_notes, "{}", large.formula);
-        for bad in [f64::NEG_INFINITY, f64::NAN] {
-            for on_larger in [true, false] {
-                let (mut s, mut l) = (small.clone(), large.clone());
-                if on_larger {
-                    l.loglik = bad;
-                } else {
-                    s.loglik = bad;
-                }
-                let c = compare(&s, &l, &opts()).unwrap();
-                let t = lr(&c).clone();
-                let what = format!("{} at {bad}, larger {on_larger}", large.formula);
-                assert!(t.statistic.is_nan(), "{what}: {t:?}");
-                assert!(t.p_value.is_nan(), "{what}: {t:?}");
-                assert_eq!(t.reference, finite.reference, "{what}");
-                assert_eq!(t.notes, vec![LrNote::NonFiniteLoglik], "{what}");
-                let side = if on_larger {
-                    "the larger model"
-                } else {
-                    "the smaller model"
-                };
-                assert_eq!(
-                    c.note_lines(),
-                    vec![format!(
-                        "The log-likelihood of {side} is not finite (a fit that failed or \
-                         collapsed), so the statistic and its p-value are NaN."
-                    )],
-                    "{what}"
-                );
-            }
-        }
-    }
-}
-
-#[test]
-fn a_nan_statistic_keeps_the_notes_on_the_pair() {
-    // The notes that state a fact about the pair stay beside the one naming
-    // the cause; the notes on the p-value ("Conservative ...") go.
-    let d = csv_table(
-        include_str!("../validation/data/empirical/Dyestuff2.csv"),
-        &["Batch"],
-    );
-    let weighted = |f: &str, reml| {
-        let mut lo = lower(f, &d, Family::Gaussian).unwrap();
-        lo.opts.reml = reml;
-        lo.opts.weights = Some(vec![1.0; lo.n]);
-        let fit = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
-        Model::from_fit(f, &lo, &fit)
-    };
-    let small = weighted("Yield ~ 1", Some(true));
-    let mut large = weighted("Yield ~ 1 + (1 | Batch)", None);
-    let s = slope1();
-    let node = |f: &str, nagq| fitted(f, &s, binomial(), None, nagq).0;
-    let (glmm1, mut glmm7) = (node("y ~ 1 + (1 | g)", 1), node("y ~ x + (1 | g)", 7));
-    assert_eq!(
-        lr(&compare(&small, &large, &opts()).unwrap()).notes,
-        vec![LrNote::NoDesignSummary, MIXTURE]
-    );
-    large.loglik = f64::NAN;
-    let c = compare(&small, &large, &opts()).unwrap();
-    assert!(lr(&c).statistic.is_nan());
-    assert_eq!(
-        lr(&c).notes,
-        vec![LrNote::NoDesignSummary, LrNote::NonFiniteLoglik]
-    );
-    let lines = c.note_lines();
-    assert_eq!(lines.len(), 2, "{lines:?}");
-    assert!(
-        lines.iter().all(|l| !l.starts_with("Conservative")),
-        "{lines:?}"
-    );
-    glmm7.loglik = f64::NEG_INFINITY;
-    let c = compare(&glmm1, &glmm7, &opts()).unwrap();
-    assert!(lr(&c).statistic.is_nan());
-    assert_eq!(
-        lr(&c).notes,
-        vec![LrNote::NodeCounts { m0: 1, m1: 7 }, LrNote::NonFiniteLoglik]
-    );
-}
-
-#[test]
-fn an_ml_pair_inside_the_exact_tests_envelope_gets_the_mixture() {
-    // The exact test is a REML test: two ML fits of the same pair, the larger
-    // keeping its design summary, get the mixture.
-    let d = csv_table(
-        include_str!("../validation/data/empirical/Dyestuff.csv"),
-        &["Batch"],
-    );
-    let ols = side("Yield ~ 1", &d, Family::Gaussian, Some(false));
-    let full = side("Yield ~ 1 + (1 | Batch)", &d, Family::Gaussian, Some(false));
-    assert!(full.design_summary.is_some() && !full.reml && !ols.reml);
-    let t = lr(&cmp(&ols, &full).unwrap()).clone();
-    assert_eq!(t.reference, Reference::ChiBarSquared { df_low: 0 });
-    assert_eq!(t.objective, Objective::MaximumLikelihood);
-    assert_eq!(t.notes, vec![MIXTURE]);
 }
 
 /// Sleepstudy with a crossed grouping `blk`, the row index mod 6.
@@ -1202,7 +726,11 @@ fn sleepstudy_blk() -> Table {
 
 /// The position of grouping `name` among a model's `varcorr` blocks.
 fn block(m: &Model, name: &str) -> usize {
-    m.re_groups.iter().position(|(n, _)| n == name).unwrap()
+    m.lowered()
+        .re_groups
+        .iter()
+        .position(|g| g.name == name)
+        .unwrap()
 }
 
 #[test]
@@ -1223,96 +751,12 @@ fn one_dropped_variance_at_zero_beside_a_non_zero_one_keeps_the_statistic() {
         Family::Gaussian,
         None,
     );
-    assert_eq!(large.varcorr[block(&large, "blk")], vec![0.0]);
-    assert!(large.varcorr[block(&large, "Subject")][2] > 1.0);
+    assert_eq!(large.fit().varcorr[block(&large, "blk")], vec![0.0]);
+    assert!(large.fit().varcorr[block(&large, "Subject")][2] > 1.0);
     let c = cmp(&small, &large).unwrap();
     let t = lr(&c);
     assert_eq!(t.statistic, floored(&c));
     assert!(t.statistic > 40.0 && t.p_value < 1e-8, "{t:?}");
-}
-
-#[test]
-fn a_term_kept_in_another_grouping_is_still_dropped_from_its_own() {
-    // Days is dropped from Subject and kept in blk: only Subject's Days
-    // variance decides the rule.
-    let d = sleepstudy_blk();
-    let small = side(
-        "Reaction ~ Days + (1 | Subject) + (Days | blk)",
-        &d,
-        Family::Gaussian,
-        None,
-    );
-    let large = side(
-        "Reaction ~ Days + (Days | Subject) + (Days | blk)",
-        &d,
-        Family::Gaussian,
-        None,
-    );
-    let (s, b) = (block(&large, "Subject"), block(&large, "blk"));
-    for (subject, blk, zero) in [
-        (vec![600.0, 0.0, 0.0], vec![1.0, 0.2, 3.0], true),
-        (vec![600.0, 10.0, 35.0], vec![1.0, 0.0, 0.0], false),
-    ] {
-        let mut l = large.clone();
-        l.varcorr[s] = subject;
-        l.varcorr[b] = blk;
-        l.loglik = small.loglik + 1e-9;
-        let t = lr(&cmp(&small, &l).unwrap()).clone();
-        assert_eq!(t.statistic == 0.0, zero, "{:?}: {t:?}", l.varcorr);
-        assert!(t.statistic < 1e-8, "{t:?}");
-    }
-}
-
-#[test]
-fn groupings_are_matched_as_sets_of_variable_names() {
-    // `(1 | batch/cask)` holds `batch` and `batch:cask`, the smaller fit's
-    // `cask:batch`: dropping `batch` at zero gives T = 0.
-    let d = csv_table(
-        include_str!("../validation/data/empirical/Pastes.csv"),
-        &["batch", "cask", "sample"],
-    );
-    let small = side(
-        "strength ~ 1 + (1 | cask:batch)",
-        &d,
-        Family::Gaussian,
-        None,
-    );
-    let large = side(
-        "strength ~ 1 + (1 | batch/cask)",
-        &d,
-        Family::Gaussian,
-        None,
-    );
-    let b = block(&large, "batch");
-    for (variance, zero) in [(0.0, true), (0.5, false)] {
-        let mut l = large.clone();
-        l.varcorr[b] = vec![variance];
-        l.loglik = small.loglik + 1e-9;
-        let t = lr(&cmp(&small, &l).unwrap()).clone();
-        assert_eq!(t.statistic == 0.0, zero, "batch at {variance}: {t:?}");
-        assert_eq!(t.p_value == 1.0, zero, "batch at {variance}: {t:?}");
-    }
-}
-
-#[test]
-fn a_variance_at_zero_in_the_smaller_fit_makes_the_mixture_approximate() {
-    let s = sleepstudy();
-    let mut int = side(
-        "Reaction ~ Days + (1 | Subject)",
-        &s,
-        Family::Gaussian,
-        None,
-    );
-    let slope = side(
-        "Reaction ~ Days + (Days | Subject)",
-        &s,
-        Family::Gaussian,
-        None,
-    );
-    int.varcorr = vec![vec![0.0]];
-    let t = lr(&cmp(&int, &slope).unwrap()).clone();
-    assert_eq!(t.reference, Reference::ChiBarSquared { df_low: 1 });
-    assert_eq!(t.notes, vec![LrNote::BoundaryMixture { approximate: true }]);
 }
 
 #[test]
@@ -1398,7 +842,7 @@ fn slope1() -> Table {
 #[test]
 fn glm_and_glmm_pairs_are_labelled_with_the_larger_models_objective() {
     let d = slope1();
-    let fit = |f: &str, nagq| fitted(f, &d, binomial(), None, nagq).0;
+    let fit = |f: &str, nagq| fitted(f, &d, binomial(), None, nagq);
     // GLMM pair, the same random part.
     let t = lr(&cmp(&fit("y ~ 1 + (1 | g)", 1), &fit("y ~ x + (1 | g)", 1)).unwrap()).clone();
     assert_eq!(t.reference, Reference::ChiSquared { df: 1 });
@@ -1446,7 +890,7 @@ fn glm_pairs_without_dispersion_keep_the_likelihood_ratio_test() {
 #[test]
 fn two_mixed_fits_with_different_node_counts_carry_a_note_naming_both() {
     let d = slope1();
-    let fit = |f: &str, nagq| fitted(f, &d, binomial(), None, nagq).0;
+    let fit = |f: &str, nagq| fitted(f, &d, binomial(), None, nagq);
     let (small, large) = (fit("y ~ 1 + (1 | g)", 1), fit("y ~ x + (1 | g)", 7));
     let c = compare(&small, &large, &opts()).unwrap();
     let t = lr(&c);
@@ -1503,7 +947,7 @@ fn two_ols_fits_get_the_exact_f_whatever_their_reml() {
     assert!(answers.windows(2).all(|w| w[0] == w[1]), "{answers:?}");
     // The F of the term the larger fit adds, on that fit.
     let lo = lower("y ~ x + z", &d, Family::Gaussian).unwrap();
-    let fit = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+    let fit = glmm::fit(&lo.data(), lo.spec(), &FitOptions::default()).unwrap();
     let c = cmp(&model("y ~ x", None), &model("y ~ x + z", None)).unwrap();
     assert_close(
         linear(&c).statistic,
@@ -1525,7 +969,7 @@ fn two_ols_fits_get_the_exact_f_whatever_their_reml() {
         )
     );
     let lo = lower("y ~ b + x", &d, Family::Gaussian).unwrap();
-    let fit = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+    let fit = glmm::fit(&lo.data(), lo.spec(), &FitOptions::default()).unwrap();
     assert_close(
         t.statistic,
         term_f(&fit, &lo.col_names, &["x"]),
@@ -1564,7 +1008,7 @@ fn two_dispersion_glms_get_the_wald_f_on_the_residual_df() {
         .unwrap();
         let t = linear(&c);
         let lo = lower("y ~ x + grp", &d, family).unwrap();
-        let fit = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+        let fit = glmm::fit(&lo.data(), lo.spec(), &FitOptions::default()).unwrap();
         let grp: Vec<&str> = lo
             .col_names
             .iter()
@@ -1614,7 +1058,7 @@ fn dispersion_glms_whose_names_do_not_nest_fall_back_to_the_asymptotic_lr_test()
     };
     d.columns.push(("x2".into(), Column::Numeric(x)));
     let large = side("y ~ x + x2 + grp", &d, gamma, None);
-    assert!(large.aliased.contains(&true));
+    assert!(large.fit().aliased().contains(&true));
     let t = lr(&cmp(&side("y ~ x2", &d, gamma, None), &large).unwrap()).clone();
     assert_eq!(t.notes, vec![LrNote::NoWaldF]);
 }
@@ -1631,11 +1075,11 @@ fn dispersion_glms_with_a_held_dispersion_get_the_lr_test() {
         &["grp"],
     );
     let held = |f: &str| {
-        let mut lo = lower(f, &d, gamma).unwrap();
-        lo.opts.dispersion = Some(1.0);
-        let fit = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
-        assert!(fit.converged(), "{f} did not converge");
-        Model::from_fit(f, &lo, &fit)
+        let mut fit_opts = FitOptions::default();
+        fit_opts.dispersion = Some(1.0);
+        let m = glmm::formula::fit(f, &d, gamma, &fit_opts).unwrap();
+        assert!(m.fit().converged(), "{f} did not converge");
+        m
     };
     let c = cmp(&held("y ~ x"), &held("y ~ x + grp")).unwrap();
     let t = lr(&c);
@@ -1686,7 +1130,7 @@ fn the_sides_are_kept_as_given_and_the_larger_is_named() {
     assert_eq!(c.larger, Side::First);
     assert_eq!(
         (c.m0.npar, c.m0.nobs, c.m0.loglik),
-        (large.df, large.nobs, large.loglik)
+        (large.fit().df, large.fit().nobs, large.fit().loglik)
     );
 }
 
@@ -1702,8 +1146,8 @@ fn the_same_call_twice_gives_the_same_bytes() {
     let pair = [
         (ols, full),
         (
-            fitted("y ~ x", &s, binomial(), None, 1).0,
-            fitted("y ~ x + (1 | g)", &s, binomial(), None, 1).0,
+            fitted("y ~ x", &s, binomial(), None, 1),
+            fitted("y ~ x + (1 | g)", &s, binomial(), None, 1),
         ),
     ];
     for (a, b) in &pair {
@@ -1762,15 +1206,6 @@ fn gamma() -> Family {
     }
 }
 
-/// A converged fit of `formula` on `table` with `reml`, and its lowering.
-fn lowered_fit(formula: &str, table: &Table, family: Family, reml: Option<bool>) -> (Lowered, Fit) {
-    let mut lo = lower(formula, table, family).unwrap();
-    lo.opts.reml = reml;
-    let fit = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
-    assert!(fit.converged(), "{formula} did not converge");
-    (lo, fit)
-}
-
 /// The options of a `term_tests` call asking for `ss_type`.
 fn options(ss_type: SsType) -> TermTestOptions {
     let mut opts = TermTestOptions::default();
@@ -1782,16 +1217,12 @@ fn options(ss_type: SsType) -> TermTestOptions {
 /// they stay Wald whatever the default test gives; a fit whose rows are F
 /// tests refuses an explicit test, so its table takes the default, which must
 /// be its F table (a χ² fit that refused the Wald test fails here).
-fn term_table(
-    lo: &Lowered,
-    fit: &Fit,
-    mut opts: TermTestOptions,
-) -> Result<TermTable, TermTestError> {
+fn term_table(m: &Model, mut opts: TermTestOptions) -> Result<TermTable, TermTestError> {
     opts.test = TermTest::Wald;
-    match term_tests(lo, fit, &opts) {
+    match term_tests(m, &opts) {
         Err(TermTestError::FTable { .. }) => {
             opts.test = TermTest::Auto;
-            let table = term_tests(lo, fit, &opts);
+            let table = term_tests(m, &opts);
             if let Ok(t) = &table {
                 assert_eq!(
                     t.choice.test,
@@ -1805,8 +1236,8 @@ fn term_table(
     }
 }
 
-fn tables(lo: &Lowered, fit: &Fit) -> [TermTable; 2] {
-    [SsType::Type3, SsType::Type2].map(|ss_type| term_table(lo, fit, options(ss_type)).unwrap())
+fn tables(m: &Model) -> [TermTable; 2] {
+    [SsType::Type3, SsType::Type2].map(|ss_type| term_table(m, options(ss_type)).unwrap())
 }
 
 fn labels(t: &TermTable) -> Vec<&str> {
@@ -1818,7 +1249,7 @@ fn labels(t: &TermTable) -> Vec<&str> {
 /// estimated and with φ held (at 0.5, so a χ² row scaled by the dispersion
 /// shows), and a Gamma GLMM (φ̂ not 1). Each with its name, the kind of its
 /// rows and, on the F rows, the denominator df's kind.
-fn fits() -> Vec<(&'static str, Lowered, Fit, LinearKind, Option<DenDf>)> {
+fn fits() -> Vec<(&'static str, Model, LinearKind, Option<DenDf>)> {
     let (d, b) = (sim_factorial(), sim_factorial_bern());
     let sat = Some(DenDf::Satterthwaite);
     let res = Some(DenDf::Residual);
@@ -1834,32 +1265,37 @@ fn fits() -> Vec<(&'static str, Lowered, Fit, LinearKind, Option<DenDf>)> {
     let mut out: Vec<_> = fits
         .into_iter()
         .map(|(name, formula, table, family, reml, kind, den)| {
-            let (lo, fit) = lowered_fit(formula, table, family, reml);
-            (name, lo, fit, kind, den)
+            (name, side(formula, table, family, reml), kind, den)
         })
         .collect();
-    let (lo, fit) = lowered_fit("y ~ x + grp", &glm_gamma(), gamma(), None);
-    out.push(("Gamma GLM", lo, fit, f, res));
-    let mut lo = lower("y ~ x + grp", &glm_gamma(), gamma()).unwrap();
-    lo.opts.dispersion = Some(0.5);
-    let fit = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
-    assert!(fit.converged());
-    out.push(("Gamma GLM, φ held", lo, fit, chi, None));
-    let (lo, fit) = lowered_fit("y ~ x + grp + (1 | cluster)", &sim_gamma(), gamma(), None);
-    assert!((fit.dispersion - 1.0).abs() > 0.1, "{}", fit.dispersion);
-    out.push(("Gamma GLMM", lo, fit, chi, None));
+    out.push((
+        "Gamma GLM",
+        side("y ~ x + grp", &glm_gamma(), gamma(), None),
+        f,
+        res,
+    ));
+    let mut fit_opts = FitOptions::default();
+    fit_opts.dispersion = Some(0.5);
+    let held = glmm::formula::fit("y ~ x + grp", &glm_gamma(), gamma(), &fit_opts).unwrap();
+    assert!(held.fit().converged());
+    out.push(("Gamma GLM, φ held", held, chi, None));
+    let m = side("y ~ x + grp + (1 | cluster)", &sim_gamma(), gamma(), None);
+    let dispersion = m.fit().dispersion;
+    assert!((dispersion - 1.0).abs() > 0.1, "{dispersion}");
+    out.push(("Gamma GLMM", m, chi, None));
     out
 }
 
 #[test]
 fn each_fit_gets_one_row_per_fixed_term_in_r_order_with_its_familys_test() {
-    for (name, lo, fit, kind, den) in fits() {
+    for (name, m, kind, den) in fits() {
+        let (lo, fit) = (m.lowered(), m.fit());
         if name == "ML LMM" {
             assert!(!fit.reml, "{name}");
         }
         if name == "GLMM" {
             // The GLMM's rows stand on the default Hessian covariance.
-            assert_eq!(lo.opts.wald_se, WaldSe::Hessian);
+            assert_eq!(FitOptions::default().wald_se, WaldSe::Hessian);
             assert!(
                 !fit.diagnostics
                     .notes
@@ -1873,7 +1309,7 @@ fn each_fit_gets_one_row_per_fixed_term_in_r_order_with_its_familys_test() {
         } else {
             LABELS.to_vec()
         };
-        for t in tables(&lo, &fit) {
+        for t in tables(&m) {
             let what = format!("{name}, {:?}", t.ss_type);
             // No intercept row and no random-effect row.
             assert_eq!(labels(&t), want, "{what}");
@@ -1920,9 +1356,10 @@ fn each_fit_gets_one_row_per_fixed_term_in_r_order_with_its_familys_test() {
 fn a_one_df_type_iii_row_of_an_uncontained_term_is_the_summary_statistic_squared() {
     // `x` is in no other term, so its Type III hypothesis is `β_x = 0`: the
     // row is t² on t's df (z² on a Wald χ² row).
-    for (name, lo, fit, kind, _) in fits() {
-        let j = lo.col_names.iter().position(|c| c == "x").unwrap();
-        let t3 = term_table(&lo, &fit, TermTestOptions::default()).unwrap();
+    for (name, m, kind, _) in fits() {
+        let fit = m.fit();
+        let j = m.lowered().col_names.iter().position(|c| c == "x").unwrap();
+        let t3 = term_table(&m, TermTestOptions::default()).unwrap();
         assert_eq!(t3.ss_type, SsType::Type3);
         let row = t3.fixed.iter().find(|r| r.label == "x").unwrap();
         let z = fit.beta[j] / fit.se[j];
@@ -1938,37 +1375,11 @@ fn a_one_df_type_iii_row_of_an_uncontained_term_is_the_summary_statistic_squared
 }
 
 #[test]
-fn the_row_kind_is_read_from_the_fit_not_from_the_options() {
-    // A Gamma GLM with φ estimated, its lowering then given a held φ: the
-    // rows stay the fit's F rows. And the reverse: a fit with φ held keeps
-    // its χ² rows beside options that estimate φ.
-    let (mut lo, fit) = lowered_fit("y ~ x + grp", &glm_gamma(), gamma(), None);
-    let want = tables(&lo, &fit);
-    for t in &want {
-        assert!(t.fixed.iter().all(|r| r.test.kind == LinearKind::F));
-    }
-    lo.opts.dispersion = Some(0.5);
-    assert_eq!(tables(&lo, &fit), want);
-    let mut lo = lower("y ~ x + grp", &glm_gamma(), gamma()).unwrap();
-    lo.opts.dispersion = Some(0.5);
-    let fit = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
-    let want = tables(&lo, &fit);
-    for t in &want {
-        assert!(t
-            .fixed
-            .iter()
-            .all(|r| r.test.kind == LinearKind::ChiSquared));
-    }
-    lo.opts.dispersion = None;
-    assert_eq!(tables(&lo, &fit), want);
-}
-
-#[test]
 fn without_the_satterthwaite_pass_the_lmm_rows_have_no_df_and_say_why() {
-    let mut lo = lower(LMM, &sim_factorial(), Family::Gaussian).unwrap();
-    lo.opts.satterthwaite = false;
-    let fit = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
-    for t in tables(&lo, &fit) {
+    let mut fit_opts = FitOptions::default();
+    fit_opts.satterthwaite = false;
+    let m = glmm::formula::fit(LMM, &sim_factorial(), Family::Gaussian, &fit_opts).unwrap();
+    for t in tables(&m) {
         assert_eq!(labels(&t), LABELS);
         for row in &t.fixed {
             let test = &row.test;
@@ -1994,34 +1405,50 @@ fn an_empty_cell_puts_lmertests_note_on_the_type_iii_table() {
         include_str!("../validation/data/simulated/sim_factorial_empty.csv"),
         &["subj", "g", "h"],
     );
-    let (lo, fit) = lowered_fit(LMM, &empty, Family::Gaussian, None);
-    let [t3, t2] = tables(&lo, &fit);
+    let m = side(LMM, &empty, Family::Gaussian, None);
+    let [t3, t2] = tables(&m);
     assert_eq!(
         t3.notes,
         vec!["Missing cells for: gc:hq. Interpret type III hypotheses with care.".to_string()]
     );
     assert!(t2.notes.is_empty(), "{:?}", t2.notes);
     assert_eq!(labels(&t3), LABELS);
-    let (lo, fit) = lowered_fit(LMM, &sim_factorial(), Family::Gaussian, None);
-    assert!(tables(&lo, &fit).iter().all(|t| t.notes.is_empty()));
+    let m = side(LMM, &sim_factorial(), Family::Gaussian, None);
+    assert!(tables(&m).iter().all(|t| t.notes.is_empty()));
 }
 
 #[test]
 fn an_interaction_without_its_marginal_term_is_refused() {
-    let (lo, fit) = lowered_fit(
+    let m = side(
         "y ~ x + x:g + (1 + x | subj)",
         &sim_factorial(),
         Family::Gaussian,
         None,
     );
     for ss_type in [SsType::Type3, SsType::Type2] {
-        let e = term_table(&lo, &fit, options(ss_type)).unwrap_err();
+        let e = term_table(&m, options(ss_type)).unwrap_err();
         let TermTestError::NotMarginal(message) = &e else {
             panic!("{e:?}")
         };
         assert!(message.contains("`g` (a margin of `x:g`)"), "{message}");
         assert_eq!(e.to_string(), *message);
     }
+    // Only the margin that is missing is named: `g:h` lacks `h`, and `g`,
+    // which the formula has, is not listed.
+    let m = side(
+        "y ~ g + g:h + x + (1 | subj)",
+        &sim_factorial(),
+        Family::Gaussian,
+        None,
+    );
+    let e = term_table(&m, options(SsType::Type3)).unwrap_err();
+    let TermTestError::NotMarginal(message) = &e else {
+        panic!("{e:?}")
+    };
+    assert!(
+        message.contains("`h`") && !message.contains("`g`"),
+        "{message}"
+    );
 }
 
 #[test]
@@ -2041,9 +1468,9 @@ fn a_term_whose_columns_are_all_aliased_gets_an_untested_row() {
         d.columns
             .push(("k".into(), Column::Numeric(vec![2.0; d.n])));
         for (formula, label, column) in [("y ~ x + x2", "x2", 2), ("y ~ k", "k", 1)] {
-            let (lo, fit) = lowered_fit(formula, &d, family, None);
-            assert!(fit.aliased()[column], "{formula}");
-            for t in tables(&lo, &fit) {
+            let m = side(formula, &d, family, None);
+            assert!(m.fit().aliased()[column], "{formula}");
+            for t in tables(&m) {
                 let row = t.fixed.iter().find(|r| r.label == label).unwrap();
                 let what = format!("{formula}, {family:?}, {:?}", t.ss_type);
                 assert!(row.test.statistic.is_nan(), "{what}: {row:?}");
@@ -2061,22 +1488,6 @@ fn a_term_whose_columns_are_all_aliased_gets_an_untested_row() {
 }
 
 #[test]
-fn a_covariance_that_is_not_finite_gives_nan_rows() {
-    // car's Type II reads the covariance; a NaN one gives NaN rows, not a
-    // panic, and so does the Wald χ² of Type III.
-    let (lo, mut fit) = lowered_fit(FIXED, &sim_factorial_bern(), binomial(), None);
-    fit.vcov = vec![vec![f64::NAN; lo.p]; lo.p];
-    for t in tables(&lo, &fit) {
-        assert_eq!(labels(&t), LABELS);
-        assert!(
-            t.fixed.iter().all(|r| r.test.statistic.is_nan()),
-            "{:?}",
-            t.ss_type
-        );
-    }
-}
-
-#[test]
 fn a_pair_differing_by_one_term_gives_that_terms_f_row_on_the_larger_fit() {
     let d = sim_factorial();
     let g = glm_gamma();
@@ -2084,15 +1495,11 @@ fn a_pair_differing_by_one_term_gives_that_terms_f_row_on_the_larger_fit() {
         ("y ~ h + x", "y ~ g + h + x", &d, Family::Gaussian, "g"),
         ("y ~ x", "y ~ x + grp", &g, gamma(), "grp"),
     ] {
-        let (lo0, fit0) = lowered_fit(small, table, family, None);
-        let (lo1, fit1) = lowered_fit(large, table, family, None);
-        let c = cmp(
-            &Model::from_fit(small, &lo0, &fit0),
-            &Model::from_fit(large, &lo1, &fit1),
-        )
-        .unwrap();
+        let m0 = side(small, table, family, None);
+        let m1 = side(large, table, family, None);
+        let c = cmp(&m0, &m1).unwrap();
         let pair = linear(&c);
-        for t in tables(&lo1, &fit1) {
+        for t in tables(&m1) {
             let row = &t.fixed.iter().find(|r| r.label == term).unwrap().test;
             let what = format!("{large}, {:?}", t.ss_type);
             assert_eq!(row.reference, pair.reference, "{what}");
@@ -2142,13 +1549,14 @@ fn type_ii_on_a_glm_or_glmm_is_cars_covariance_metric() {
     let b = sim_factorial_bern();
     let gh = ["gb:hq", "gc:hq"];
     for formula in [FIXED, GLMM] {
-        let (lo, fit) = lowered_fit(formula, &b, binomial(), None);
+        let m = side(formula, &b, binomial(), None);
+        let (lo, fit) = (m.lowered(), m.fit());
         assert!(gh.iter().all(|n| lo.col_names.iter().any(|c| c == n)));
-        let t2 = term_table(&lo, &fit, options(SsType::Type2)).unwrap();
+        let t2 = term_table(&m, options(SsType::Type2)).unwrap();
         for (term, cols) in [("g", vec!["gb", "gc"]), ("h", vec!["hq"])] {
             let row = t2.fixed.iter().find(|r| r.label == term).unwrap();
             let with: Vec<&str> = cols.iter().copied().chain(gh).collect();
-            let want = wald_of(&fit, &lo, &with) - wald_of(&fit, &lo, &gh);
+            let want = wald_of(fit, lo, &with) - wald_of(fit, lo, &gh);
             assert_close(row.test.statistic, want, &format!("{formula} {term}"));
             assert_eq!(row.test.num_df, cols.len() as f64);
         }
@@ -2168,15 +1576,206 @@ fn type_ii_on_weighted_ols_is_cars_covariance_metric() {
         _ => unreachable!("w is numeric"),
     };
     let mut lo = lower("y ~ x * grp", &d, Family::Gaussian).unwrap();
-    lo.opts.weights = Some(w);
-    let fit = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+    lo.weights = Some(w);
+    let m = glmm::formula::fit_lowered("y ~ x * grp", lo, &FitOptions::default()).unwrap();
+    let (lo, fit) = (m.lowered(), m.fit());
     assert!(fit.converged());
     let rel = ["x:grpb"];
     assert!(lo.col_names.iter().any(|c| c == rel[0]));
-    let t2 = term_table(&lo, &fit, options(SsType::Type2)).unwrap();
+    let t2 = term_table(&m, options(SsType::Type2)).unwrap();
     for (term, col) in [("x", "x"), ("grp", "grpb")] {
         let row = t2.fixed.iter().find(|r| r.label == term).unwrap();
-        let want = wald_of(&fit, &lo, &[col, rel[0]]) - wald_of(&fit, &lo, &rel);
+        let want = wald_of(fit, lo, &[col, rel[0]]) - wald_of(fit, lo, &rel);
         assert_close(row.test.statistic * row.test.num_df, want, term);
+    }
+}
+
+/// Partial η² of `y ~ g * h + x` on `sim_factorial`, Type III, against
+/// `effectsize::F_to_eta2` on car's Type III table of the contr.sum refit.
+#[test]
+fn partial_eta2_matches_the_frozen_ols_reference() {
+    // `eta2_partial` of `effectsize_ols_sim_factorial`
+    // (validation/goldens/inference/effectsize/; R 4.5.3, effectsize 1.0.3,
+    // car 3.1.5, goldens_effectsize.R).
+    let want = [
+        ("g", 0.238240434615394),
+        ("h", 0.0287055361778014),
+        ("x", 0.157711191407799),
+        ("g:h", 0.0154200911119474),
+    ];
+    let m = side(FIXED, &sim_factorial(), Family::Gaussian, None);
+    let t = term_table(&m, options(SsType::Type3)).unwrap();
+    assert_eq!(labels(&t), want.map(|(label, _)| label));
+    for (row, (label, eta2)) in t.fixed.iter().zip(want) {
+        let got = row.eta2_partial();
+        let rel = ((got - eta2) / eta2).abs();
+        assert!(
+            rel <= tol::ETA2_REL,
+            "{label}: {got} against {eta2}, rel {rel:e}"
+        );
+    }
+}
+
+/// Marginal and conditional R² and the adjusted and unadjusted ICC of the
+/// REML LMM `angle ~ 1 + recipe*temp + (1 | recipe:replicate)` on `cake`,
+/// against `performance::r2_nakagawa` and `performance::icc` on lme4's fit.
+#[test]
+fn r2_and_icc_match_the_frozen_cake_reference() {
+    // `r2` and `icc` of `effectsize_cake`
+    // (validation/goldens/inference/effectsize/; R 4.5.3, lme4 2.0.6,
+    // performance 0.18.2, insight 1.5.4, goldens_effectsize.R).
+    let want = [
+        ("r2 marginal", 0.110960887225699),
+        ("r2 conditional", 0.70363273147383),
+        ("icc adjusted", 0.666643160837617),
+        ("icc unadjusted", 0.59267184424813),
+    ];
+    let cake = csv_table(
+        include_str!("../validation/data/empirical/cake.csv"),
+        &["recipe", "replicate"],
+    );
+    let m = side(
+        "angle ~ 1 + recipe*temp + (1 | recipe:replicate)",
+        &cake,
+        Family::Gaussian,
+        Some(true),
+    );
+    let (lo, fit) = (m.lowered(), m.fit());
+    let r2 = fit.r2(&lo.data(), lo.spec()).unwrap();
+    let icc = fit.icc(&lo.data(), lo.spec()).unwrap();
+    let got = [r2.marginal, r2.conditional, icc.adjusted, icc.unadjusted];
+    for (got, (what, want)) in got.into_iter().zip(want) {
+        let rel = ((got - want) / want).abs();
+        assert!(
+            rel <= tol::R2_ICC_REL,
+            "{what}: {got} against {want}, rel {rel:e}"
+        );
+    }
+}
+
+/// The Bonferroni and Tukey intervals of the pairwise comparisons of `g` in
+/// `y ~ g * h + x` on `sim_factorial` (OLS, df 113), against emmeans'
+/// `confint(pairs(emmeans(m, ~ g)), adjust = ..)`. Each bound's difference is
+/// measured in units of emmeans' interval width, as gate 1 reads intervals.
+#[test]
+fn pairwise_intervals_match_the_frozen_ols_reference() {
+    // `confint` of `posthoc_ci_ols_sim_factorial`
+    // (validation/goldens/inference/posthoc/; R 4.5.3, emmeans 2.0.4,
+    // goldens_posthoc.R), level 0.95.
+    let want = [
+        (
+            Adjust::Bonferroni,
+            "a - b",
+            -2.18936961541445,
+            -0.387435923720518,
+        ),
+        (
+            Adjust::Bonferroni,
+            "a - c",
+            0.00135825105857923,
+            1.96527607662122,
+        ),
+        (
+            Adjust::Bonferroni,
+            "b - c",
+            1.32854639291325,
+            3.21489347390152,
+        ),
+        (Adjust::Tukey, "a - b", -2.16892322088324, -0.40788231825173),
+        (Adjust::Tukey, "a - c", 0.0236426663361387, 1.94299166134366),
+        (Adjust::Tukey, "b - c", 1.34995061928322, 3.19348924753155),
+    ];
+    let m = side(FIXED, &sim_factorial(), Family::Gaussian, None);
+    for adjust in [Adjust::Bonferroni, Adjust::Tukey] {
+        let pw = pairwise(&m, "g", None, adjust).unwrap();
+        let ci = pw.confint(0.95).unwrap();
+        let rows: Vec<_> = want.iter().filter(|w| w.0 == adjust).collect();
+        assert_eq!(pw.rows.len(), rows.len());
+        for ((row, iv), &&(_, contrast, lower, upper)) in pw.rows.iter().zip(&ci.rows).zip(&rows) {
+            assert_eq!(row.contrast, contrast);
+            let width = upper - lower;
+            for (got, want) in [(iv.lower, lower), (iv.upper, upper)] {
+                let d = ((got - want) / width).abs();
+                assert!(
+                    d <= tol::CONFINT_REL,
+                    "{adjust:?} {contrast}: {got} against {want}, |diff|/width {d:e}"
+                );
+            }
+        }
+    }
+}
+
+/// The pairwise comparisons of `Variety` in the REML LMM
+/// `yield ~ 1 + Variety + nitro + (1 | Block/Variety)` on `Oats`, against
+/// emmeans' `pairs(emmeans(m, ~ Variety, lmer.df = "satterthwaite"),
+/// adjust = "none")`, in the bands of the posthoc gate: the estimate within
+/// `BETA_REL` of its SE, the SE within `SE_REL`, the df within
+/// `DF_E2E_REL`, the t within `BETA_REL + SE_REL` of `max(1, |t|)`, and the
+/// p-value within `SATT_P_REL`.
+#[test]
+fn pairwise_matches_the_frozen_oats_reference() {
+    // `contrasts` of `posthoc_oats` (validation/goldens/inference/posthoc/;
+    // R 4.5.3, lme4 2.0.6, lmerTest 3.2.1, emmeans 2.0.4, goldens_posthoc.R),
+    // as (contrast, estimate, SE, df, t, unadjusted p).
+    let want: [(&str, f64, f64, f64, f64, f64); 3] = [
+        (
+            "Golden Rain - Marvellous",
+            -5.29166666666621,
+            7.07891763727815,
+            9.99994852864466,
+            -0.747524824812182,
+            0.471959032877834,
+        ),
+        (
+            "Golden Rain - Victory",
+            6.87500000000053,
+            7.07891763727815,
+            9.99994853040113,
+            0.971193670031732,
+            0.354356477412036,
+        ),
+        (
+            "Marvellous - Victory",
+            12.1666666666667,
+            7.07891763727816,
+            9.99994852977505,
+            1.71871849484391,
+            0.116412491189459,
+        ),
+    ];
+    let oats = csv_table(
+        include_str!("../validation/data/empirical/Oats.csv"),
+        &["Block", "Variety"],
+    );
+    let m = side(
+        "yield ~ 1 + Variety + nitro + (1 | Block/Variety)",
+        &oats,
+        Family::Gaussian,
+        Some(true),
+    );
+    let pw = pairwise(&m, "Variety", None, Adjust::None).unwrap();
+    assert_eq!(pw.rows.len(), want.len());
+    for (row, (contrast, est, se, df, t, p)) in pw.rows.iter().zip(want) {
+        assert_eq!(row.contrast, contrast);
+        let checks = [
+            ("estimate", row.estimate, est, se, tol::BETA_REL),
+            ("SE", row.se, se, se, tol::SE_REL),
+            ("df", row.df, df, df, tol::DF_E2E_REL),
+            (
+                "t",
+                row.statistic,
+                t,
+                t.abs().max(1.0),
+                tol::BETA_REL + tol::SE_REL,
+            ),
+            ("p", row.p_value, p, p, tol::SATT_P_REL),
+        ];
+        for (what, got, want, scale, band) in checks {
+            let d = ((got - want) / scale).abs();
+            assert!(
+                d <= band,
+                "{contrast} {what}: {got} against {want}, |diff|/{scale} {d:e}"
+            );
+        }
     }
 }

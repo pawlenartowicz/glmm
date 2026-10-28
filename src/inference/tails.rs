@@ -1,11 +1,13 @@
 //! p-values and quantiles of the reference distributions behind the
-//! hypothesis tests: the two-sided Student t p-value, the F and χ² upper
-//! tails, and the t and normal quantiles.
+//! hypothesis tests: the two-sided Student t p-value, the F, χ² and
+//! studentized-range upper tails, and the t, normal and studentized-range
+//! quantiles.
 //!
 //! Every function returns NaN, never an error or a panic, for a NaN argument
-//! or a df that is NaN, infinite or `≤ 0`; the quantile wrappers also for a
-//! probability outside `[0, 1]`. They match R's `pt`, `pf`, `pchisq` (with
-//! `lower.tail = FALSE`), `qt` and `qnorm`.
+//! or a df that is NaN, infinite or `≤ 0` (the studentized range takes an
+//! infinite df); the quantile wrappers also for a probability outside
+//! `[0, 1]`. They match R's `pt`, `pf`, `pchisq`, `ptukey` (with
+//! `lower.tail = FALSE`), `qt`, `qnorm` and `qtukey`.
 //!
 //! Upper tails are evaluated directly (`ContinuousCdf::sf`), never as
 //! `1 − CDF`: the CDF is a number near 1, so `1 − CDF` keeps only its absolute
@@ -13,9 +15,7 @@
 //! 107.2, for example, is about 4e-25, a p-value a likelihood-ratio test can
 //! legitimately report.
 
-#[cfg(any(test, feature = "orchestrate"))]
-use commonstats::dist::Normal;
-use commonstats::dist::{ChiSquared, ContinuousCdf, FisherF, StudentT};
+use commonstats::dist::{ChiSquared, ContinuousCdf, FisherF, Normal, StudentT};
 
 /// A df the distribution constructors accept: finite and `> 0` (NaN fails).
 /// Checked first so a bad df gives NaN rather than a `StatError`.
@@ -53,9 +53,30 @@ pub(crate) fn chisq_upper_p(x: f64, df: f64) -> f64 {
     ChiSquared::new(df).map_or(f64::NAN, |d| d.sf(x))
 }
 
+/// Upper-tail p-value `P(Q_{k,df} > q)` of the studentized range of `k`
+/// means on `df` degrees of freedom (R: `ptukey(q, k, df, lower.tail =
+/// FALSE)`), Tukey's adjustment of a pairwise `t` at `q = √2·|t|`. `df` may
+/// be `f64::INFINITY` (a z test); `k` outside `(1, 1e6]` gives NaN. One call
+/// is a 2-D quadrature, 2–30 ms.
+#[cfg(any(test, feature = "formula"))]
+pub(crate) fn tukey_upper_p(q: f64, k: f64, df: f64) -> f64 {
+    commonstats::dist::StudentizedRange::new(k, df).map_or(f64::NAN, |d| d.sf(q))
+}
+
+/// The upper-tail `alpha` quantile of the studentized range of `k` means on
+/// `df` degrees of freedom (R: `qtukey(1 − alpha, k, df)`), solved on `alpha`
+/// itself. `df` may be `f64::INFINITY`; `k` outside `(1, 1e6]` gives NaN. One
+/// call is 20–80 ms.
+#[cfg(any(test, feature = "formula"))]
+pub(crate) fn tukey_quantile(alpha: f64, k: f64, df: f64) -> f64 {
+    commonstats::dist::StudentizedRange::new(k, df)
+        .and_then(|d| d.isf(alpha))
+        .unwrap_or(f64::NAN)
+}
+
 /// Quantile of Student's t on `df` degrees of freedom (R: `qt(p, df)`);
 /// `df` may be fractional. `p = 0` and `p = 1` give `−∞` and `+∞`.
-#[cfg(any(test, feature = "orchestrate"))]
+#[cfg(any(test, feature = "formula"))]
 pub(crate) fn t_quantile(p: f64, df: f64) -> f64 {
     if !(0.0..=1.0).contains(&p) || !valid_df(df) {
         return f64::NAN;
@@ -67,7 +88,6 @@ pub(crate) fn t_quantile(p: f64, df: f64) -> f64 {
 
 /// Quantile of the standard normal (R: `qnorm(p)`). `p = 0` and `p = 1` give
 /// `−∞` and `+∞`.
-#[cfg(any(test, feature = "orchestrate"))]
 pub(crate) fn normal_quantile(p: f64) -> f64 {
     if !(0.0..=1.0).contains(&p) {
         return f64::NAN;

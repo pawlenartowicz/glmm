@@ -1,0 +1,193 @@
+{
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0",
+      "emmeans": "2.0.4",
+      "pbkrtest": "0.5.5"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_posthoc.R"
+  },
+  "emmeans": [
+    {
+      "level": "1",
+      "by": null,
+      "estimate": -1.39853204368263,
+      "SE": 0.232473254781808,
+      "df": null
+    },
+    {
+      "level": "2",
+      "by": null,
+      "estimate": -2.39084792401158,
+      "SE": 0.310213775104602,
+      "df": null
+    },
+    {
+      "level": "3",
+      "by": null,
+      "estimate": -2.52719619063609,
+      "SE": 0.330275545568724,
+      "df": null
+    },
+    {
+      "level": "4",
+      "by": null,
+      "estimate": -2.97884764158358,
+      "SE": 0.430073337129019,
+      "df": null
+    }
+  ],
+  "contrasts": [
+    {
+      "contrast": "period1 - period2",
+      "by": null,
+      "estimate": 0.992315880328946,
+      "SE": 0.306641326429934,
+      "df": null,
+      "statistic": 3.23608005444656,
+      "statistic_name": "z",
+      "p_none": 0.00121183392740055,
+      "p_tukey": 0.00665040685806018
+    },
+    {
+      "contrast": "period1 - period3",
+      "by": null,
+      "estimate": 1.12866414695346,
+      "SE": 0.326637242566145,
+      "df": null,
+      "statistic": 3.45540556883956,
+      "statistic_name": "z",
+      "p_none": 0.000549465626585566,
+      "p_tukey": 0.00308460160145629
+    },
+    {
+      "contrast": "period1 - period4",
+      "by": null,
+      "estimate": 1.58031559790095,
+      "SE": 0.427437244644503,
+      "df": null,
+      "statistic": 3.69718740634146,
+      "statistic_name": "z",
+      "p_none": 0.000218001408729184,
+      "p_tukey": 0.0012474339877272
+    },
+    {
+      "contrast": "period2 - period3",
+      "by": null,
+      "estimate": 0.13634826662451,
+      "SE": 0.380706857322495,
+      "df": null,
+      "statistic": 0.358145024188546,
+      "statistic_name": "z",
+      "p_none": 0.720234786305213,
+      "p_tukey": 0.984271035605254
+    },
+    {
+      "contrast": "period2 - period4",
+      "by": null,
+      "estimate": 0.587999717572004,
+      "SE": 0.470251777895085,
+      "df": null,
+      "statistic": 1.25039339607386,
+      "statistic_name": "z",
+      "p_none": 0.211155875799027,
+      "p_tukey": 0.594664065069304
+    },
+    {
+      "contrast": "period3 - period4",
+      "by": null,
+      "estimate": 0.451651450947493,
+      "SE": 0.484284461697151,
+      "df": null,
+      "statistic": 0.9326160277055,
+      "statistic_name": "z",
+      "p_none": 0.351018254989798,
+      "p_tukey": 0.787321550058153
+    }
+  ],
+  "response": [
+    {
+      "contrast": "period1 / period2",
+      "by": null,
+      "ratio": 2.69747427184999,
+      "SE": 0.827157088730701,
+      "df": null,
+      "statistic": 3.23608005444656,
+      "statistic_name": "z",
+      "p_none": 0.00121183392740055,
+      "p_tukey": 0.00665040685806018
+    },
+    {
+      "contrast": "period1 / period3",
+      "by": null,
+      "ratio": 3.09152391883317,
+      "SE": 1.00980684817495,
+      "df": null,
+      "statistic": 3.45540556883956,
+      "statistic_name": "z",
+      "p_none": 0.000549465626585566,
+      "p_tukey": 0.00308460160145629
+    },
+    {
+      "contrast": "period1 / period4",
+      "by": null,
+      "ratio": 4.85648826690784,
+      "SE": 2.07584396345545,
+      "df": null,
+      "statistic": 3.69718740634146,
+      "statistic_name": "z",
+      "p_none": 0.000218001408729184,
+      "p_tukey": 0.0012474339877272
+    },
+    {
+      "contrast": "period2 / period3",
+      "by": null,
+      "ratio": 1.14608096584845,
+      "SE": 0.436320882745292,
+      "df": null,
+      "statistic": 0.358145024188546,
+      "statistic_name": "z",
+      "p_none": 0.720234786305213,
+      "p_tukey": 0.984271035605254
+    },
+    {
+      "contrast": "period2 / period4",
+      "by": null,
+      "ratio": 1.80038353566099,
+      "SE": 0.84663355853762,
+      "df": null,
+      "statistic": 1.25039339607386,
+      "statistic_name": "z",
+      "p_none": 0.211155875799027,
+      "p_tukey": 0.594664065069304
+    },
+    {
+      "contrast": "period3 / period4",
+      "by": null,
+      "ratio": 1.57090431593388,
+      "SE": 0.760764551019769,
+      "df": null,
+      "statistic": 0.9326160277055,
+      "statistic_name": "z",
+      "p_none": 0.351018254989798,
+      "p_tukey": 0.787321550058153
+    }
+  ],
+  "name": "posthoc_glmm_cbpp"
+}

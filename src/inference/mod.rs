@@ -1,6 +1,7 @@
-//! Hypothesis tests on fitted models: the arithmetic behind t, F and χ² tests
-//! of fixed effects and variance components, and the numerical helpers they
-//! share.
+//! Hypothesis tests and effect sizes on fitted models: the arithmetic behind
+//! t, F and χ² tests of fixed effects and variance components, the R² and
+//! intraclass correlation of a mixed model ([`R2`], [`Icc`]), and the
+//! numerical helpers they share.
 //!
 //! The public items of this module are outside the crate's semver promise
 //! until the 1.0 surface review: their names and signatures may change in any
@@ -8,6 +9,7 @@
 
 pub(crate) mod contest;
 pub mod contrast;
+pub(crate) mod effect_size;
 pub(crate) mod evd;
 pub(crate) mod lr;
 mod reference;
@@ -15,6 +17,7 @@ pub(crate) mod rlrt;
 pub(crate) mod tails;
 pub(crate) mod wald;
 
+pub use effect_size::{Icc, R2};
 pub use lr::{LrNote, LrTest};
 pub use reference::{DenDf, Objective, Reference};
 pub use wald::{LinearKind, LinearNote, LinearTest};
@@ -32,7 +35,7 @@ mod test_refs_tests;
 // and `design` have readers only in the oracle and Monte Carlo tiers.
 #[cfg(test)]
 #[allow(dead_code)]
-mod rlrt_refs;
+pub(crate) mod rlrt_refs;
 // The exact RLRT's tests: the default matrix, and the gates against RLRsim's
 // frozen references.
 #[cfg(all(test, feature = "oracle-tests", feature = "formula"))]

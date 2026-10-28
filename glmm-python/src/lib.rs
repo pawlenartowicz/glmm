@@ -114,6 +114,7 @@ fn fit_dict<'py>(py: Python<'py>, r: orchestrate::FitResult) -> PyResult<Bound<'
     d.set_item("singular", r.singular)?;
     d.set_item("names", r.names)?;
     d.set_item("re_groups", r.re_groups)?;
+    d.set_item("re_term_index", r.re_term_index)?;
     d.set_item("agq_warning", r.agq_warning)?;
     d.set_item("reml_warning", r.reml_warning)?;
     d.set_item("loglik", r.loglik)?;
@@ -145,15 +146,33 @@ fn fit_dict<'py>(py: Python<'py>, r: orchestrate::FitResult) -> PyResult<Bound<'
     // Python layer reshapes each into `(n_levels, n_terms)` and never has to
     // know a positional order.
     let blocks = PyList::empty(py);
-    for (group, terms, levels, values) in r.ranef_blocks {
+    for (group, terms, levels, values, condvar) in r.ranef_blocks {
         let bd = PyDict::new(py);
         bd.set_item("group", group)?;
         bd.set_item("terms", terms)?;
         bd.set_item("levels", levels)?;
         bd.set_item("values", values)?;
+        bd.set_item("condvar", condvar)?;
         blocks.append(bd)?;
     }
     d.set_item("ranef_blocks", blocks)?;
+    // What `Fit.predict` and `Fit.simulate` hand back to `predict` and
+    // `simulate` below, kept private on the `Fit`.
+    d.set_item("condvar", f64_bytes(py, &r.condvar)?)?;
+    d.set_item("condvar_x", f64_bytes(py, &r.condvar_x)?)?;
+    match r.condvar_cross {
+        Some(c) => {
+            let cd = PyDict::new(py);
+            cd.set_item("family_grouping", c.family_grouping)?;
+            cd.set_item("family", c.family)?;
+            cd.set_item("tail", c.tail)?;
+            cd.set_item("coupling_at", c.coupling_at)?;
+            cd.set_item("coupling_cols", c.coupling_cols)?;
+            cd.set_item("coupling", c.coupling)?;
+            d.set_item("condvar_cross", cd)?;
+        }
+        None => d.set_item("condvar_cross", py.None())?,
+    }
     d.set_item("boundary", r.boundary)?;
     d.set_item("pinned", r.pinned)?;
     // Each note as its own dict, keyed the same way the outer one is: the
@@ -239,6 +258,7 @@ fn term_dict<'py>(
             d.set_item("p_value", c.p_value)?;
             d.set_item("sum_sq", c.sum_sq)?;
             d.set_item("mean_sq", c.mean_sq)?;
+            d.set_item("eta2_partial", c.eta2_partial)?;
             d.set_item("row_notes", c.row_notes)?;
             d.set_item("notes", c.notes)?;
         }
@@ -250,7 +270,7 @@ fn term_dict<'py>(
 #[pyfunction]
 #[pyo3(signature = (
     formula, numeric_columns, factor_columns, family, link, wald_se, nagq,
-    dispersion, weights, offset, warm_start, satterthwaite, reml, anova_test = "auto",
+    dispersion, weights, offset, warm_start, satterthwaite, condvar, reml, anova_test = "auto",
 ))]
 fn fit<'py>(
     py: Python<'py>,
@@ -269,6 +289,7 @@ fn fit<'py>(
     offset: Option<PyBackedBytes>,
     warm_start: Option<(Vec<f64>, Vec<f64>, Option<f64>)>,
     satterthwaite: bool,
+    condvar: bool,
     reml: Option<bool>,
     // "auto", "Wald" or "LRT": "LRT" also stores the likelihood-ratio tables.
     anova_test: &str,
@@ -289,6 +310,7 @@ fn fit<'py>(
         offset,
         warm_start,
         satterthwaite,
+        condvar,
         reml,
         anova_test,
     )
@@ -344,6 +366,19 @@ struct StoredRecord {
     retained: Option<Vec<usize>>,
 }
 
+impl From<StoredRecord> for orchestrate::SatterthwaiteRecord {
+    fn from(r: StoredRecord) -> Self {
+        orchestrate::SatterthwaiteRecord {
+            a_eff: r.a_eff,
+            jac_theta: r.jac_theta,
+            c: r.c,
+            tau: r.tau,
+            nu: r.nu,
+            retained: r.retained,
+        }
+    }
+}
+
 /// `Fit.contrast_test(L)`: `orchestrate::contrast_test` on the fields the fit
 /// stores, `l` the row-major `rows × p` matrix `L`. The one-row table as
 /// `term_dict` gives it.
@@ -362,19 +397,115 @@ fn contrast_test<'py>(
     l: Vec<f64>,
     rows: usize,
 ) -> PyResult<Bound<'py, PyDict>> {
-    let record = record.map(|r| orchestrate::SatterthwaiteRecord {
-        a_eff: r.a_eff,
-        jac_theta: r.jac_theta,
-        c: r.c,
-        tau: r.tau,
-        nu: r.nu,
-        retained: r.retained,
-    });
     let table = orchestrate::contrast_test(
-        df_method, &beta, &vcov, &aliased, nobs, dispersion, record, &names, &l, rows,
+        df_method,
+        &beta,
+        &vcov,
+        &aliased,
+        nobs,
+        dispersion,
+        record.map(Into::into),
+        &names,
+        &l,
+        rows,
     )
     .map_err(PyValueError::new_err)?;
     term_dict(py, &Ok(table))
+}
+
+/// `glmm.pairwise`: `orchestrate::pairwise` on the training columns the fit
+/// keeps and the fields `contrast_test` reads, then the table as
+/// `orchestrate::pairwise_columns` flattens it, a dict keyed by its fields.
+#[allow(clippy::too_many_arguments)]
+#[pyfunction]
+fn pairwise<'py>(
+    py: Python<'py>,
+    formula: &str,
+    numeric_columns: HashMap<String, PyBackedBytes>,
+    factor_columns: HashMap<String, (Vec<String>, PyBackedBytes)>,
+    family: &str,
+    link: &str,
+    df_method: &str,
+    beta: Vec<f64>,
+    vcov: Vec<Vec<f64>>,
+    aliased: Vec<bool>,
+    nobs: usize,
+    record: Option<StoredRecord>,
+    names: Vec<String>,
+    factor: &str,
+    by: Option<&str>,
+    by_values: Option<Vec<f64>>,
+    adjust: &str,
+) -> PyResult<Bound<'py, PyDict>> {
+    let (numeric_columns, factor_columns) = columns(numeric_columns, factor_columns)?;
+    let pw = orchestrate::pairwise(
+        formula,
+        numeric_columns,
+        factor_columns,
+        family,
+        link,
+        df_method,
+        &beta,
+        &vcov,
+        &aliased,
+        nobs,
+        record.map(Into::into),
+        factor,
+        by,
+        by_values,
+        adjust,
+    )
+    .map_err(PyValueError::new_err)?;
+    let c = orchestrate::pairwise_columns(&pw, &names);
+    let d = PyDict::new(py);
+    d.set_item("factor", c.factor)?;
+    d.set_item("by", c.by)?;
+    d.set_item("adjust", c.adjust)?;
+    d.set_item("ratio_kind", c.ratio_kind)?;
+    d.set_item("levels", c.levels)?;
+    d.set_item("contrast", c.contrast)?;
+    d.set_item("by_level", c.by_level)?;
+    d.set_item("estimate", c.estimate)?;
+    d.set_item("se", c.se)?;
+    d.set_item("df", c.df)?;
+    d.set_item("statistic", c.statistic)?;
+    d.set_item("p_value", c.p_value)?;
+    d.set_item("p_adjusted", c.p_adjusted)?;
+    d.set_item("ratio", c.ratio)?;
+    d.set_item("ratio_se", c.ratio_se)?;
+    d.set_item("row_notes", c.row_notes)?;
+    Ok(d)
+}
+
+/// `PairwiseTable.confint`: `orchestrate::pairwise_confint` on the columns
+/// `pairwise` gave, a dict of the bounds and the adjustment the intervals
+/// use.
+#[allow(clippy::too_many_arguments)]
+#[pyfunction]
+fn pairwise_confint<'py>(
+    py: Python<'py>,
+    estimate: Vec<f64>,
+    se: Vec<f64>,
+    df: Vec<f64>,
+    p_value: Vec<f64>,
+    adjust: &str,
+    levels: usize,
+    ratio: Option<&str>,
+    level: f64,
+) -> PyResult<Bound<'py, PyDict>> {
+    let ci =
+        orchestrate::pairwise_confint(&estimate, &se, &df, &p_value, adjust, levels, ratio, level)
+            .map_err(PyValueError::new_err)?;
+    let col = |f: fn(&glmm::formula::PairwiseInterval) -> f64| -> Vec<f64> {
+        ci.rows.iter().map(f).collect()
+    };
+    let d = PyDict::new(py);
+    d.set_item("adjust", orchestrate::adjust_tag(ci.adjust))?;
+    d.set_item("lower", col(|r| r.lower))?;
+    d.set_item("upper", col(|r| r.upper))?;
+    d.set_item("ratio_lower", col(|r| r.ratio_lower))?;
+    d.set_item("ratio_upper", col(|r| r.ratio_upper))?;
+    Ok(d)
 }
 
 /// `glmm.term_labels(formula)`: `orchestrate::term_labels`, the fixed-term
@@ -564,7 +695,7 @@ fn comparison_dict<'py>(
 }
 
 /// `glmm.anova(m0, m1)`: the two stored fits compared as they are, with no
-/// refit (`glmm::formula::anova::compare`). `nsim` and `seed` are the exact
+/// refit (`glmm::formula::anova::compare_stored`). `nsim` and `seed` are the exact
 /// test's, `None` taking `orchestrate::compare_options`' defaults.
 #[pyfunction]
 #[pyo3(signature = (m0, m1, nsim, seed))]
@@ -578,7 +709,7 @@ fn compare_fits<'py>(
     let opts = orchestrate::compare_options(nsim, seed).map_err(PyValueError::new_err)?;
     let rss = [m0.rss, m1.rss];
     let (a, b) = (m0.model()?, m1.model()?);
-    let c = anova::compare(&a, &b, &opts).map_err(|e| PyValueError::new_err(refusal(&e)))?;
+    let c = anova::compare_stored(&a, &b, &opts).map_err(|e| PyValueError::new_err(refusal(&e)))?;
     comparison_dict(py, &c, rss, opts.nsim, opts.seed)
 }
 
@@ -625,6 +756,227 @@ fn compare<'py>(
     d.set_item("fit0", fit_dict(py, r.fit0)?)?;
     d.set_item("fit1", fit_dict(py, r.fit1)?)?;
     Ok(d)
+}
+
+/// A stored `condvar_cross`, keyed as `fit_dict` writes it.
+#[derive(FromPyObject)]
+#[pyo3(from_item_all)]
+struct StoredCross {
+    family_grouping: usize,
+    family: Vec<f64>,
+    tail: Vec<f64>,
+    coupling_at: Vec<u32>,
+    coupling_cols: Vec<u32>,
+    coupling: Vec<f64>,
+}
+
+/// The numbers `Fit.predict`, `Fit.simulate` and `Fit._effect_sizes` send
+/// (`glmm/__init__.py::Fit._stored_numbers`), read into `orchestrate::StoredParts`; the per-level
+/// vectors arrive as float64 bytes.
+#[derive(FromPyObject)]
+#[pyo3(from_item_all)]
+struct StoredNumbers {
+    beta: Vec<f64>,
+    vcov: Vec<Vec<f64>>,
+    varcorr: Vec<Vec<f64>>,
+    ranef: PyBackedBytes,
+    ranef_levels: Vec<usize>,
+    condvar: PyBackedBytes,
+    condvar_x: PyBackedBytes,
+    condvar_cross: Option<StoredCross>,
+    dispersion: f64,
+}
+
+impl StoredNumbers {
+    fn parts(self) -> PyResult<orchestrate::StoredParts> {
+        let f64s = |b: &PyBackedBytes, what| from_bytes(b, what, f64::from_ne_bytes);
+        Ok(orchestrate::StoredParts {
+            ranef: f64s(&self.ranef, "ranef")?,
+            condvar: f64s(&self.condvar, "condvar")?,
+            condvar_x: f64s(&self.condvar_x, "condvar_x")?,
+            beta: self.beta,
+            vcov: self.vcov,
+            varcorr: self.varcorr,
+            ranef_levels: self.ranef_levels,
+            condvar_cross: self.condvar_cross.map(|c| orchestrate::CondvarCrossRecord {
+                family_grouping: c.family_grouping,
+                family: c.family,
+                tail: c.tail,
+                coupling_at: c.coupling_at,
+                coupling_cols: c.coupling_cols,
+                coupling: c.coupling,
+            }),
+            dispersion: self.dispersion,
+        })
+    }
+}
+
+/// `Fit.predict`: `orchestrate::predict` on the training columns the fit
+/// keeps (as `fit` took them), its stored numbers `parts`, and the new
+/// table's columns as `_prepare_columns` sends them, or `None` for the
+/// training rows (`n_rows` is the new table's row count). A dict of
+/// float64 bytes (`fit`, `se`, `lower`, `upper`, `future_lower`,
+/// `future_upper`, empty when not asked for) and the notes as `fit_dict`
+/// writes them.
+#[allow(clippy::too_many_arguments)]
+#[pyfunction]
+#[pyo3(signature = (
+    formula, numeric_columns, factor_columns, family, link, weights, offset, parts,
+    new_numeric, new_factor, n_rows, scale, population, allow_new_levels, se, level, future,
+))]
+fn predict<'py>(
+    py: Python<'py>,
+    formula: &str,
+    numeric_columns: HashMap<String, PyBackedBytes>,
+    factor_columns: HashMap<String, (Vec<String>, PyBackedBytes)>,
+    family: &str,
+    link: &str,
+    weights: Option<PyBackedBytes>,
+    offset: Option<PyBackedBytes>,
+    parts: StoredNumbers,
+    new_numeric: Option<HashMap<String, PyBackedBytes>>,
+    new_factor: Option<HashMap<String, (Vec<String>, PyBackedBytes)>>,
+    n_rows: usize,
+    scale: &str,
+    population: bool,
+    allow_new_levels: bool,
+    se: bool,
+    level: f64,
+    future: bool,
+) -> PyResult<Bound<'py, PyDict>> {
+    let (numeric_columns, factor_columns) = columns(numeric_columns, factor_columns)?;
+    let new = match (new_numeric, new_factor) {
+        (Some(n), Some(f)) => {
+            let (n, f) = columns(n, f)?;
+            Some((n, f, n_rows))
+        }
+        _ => None,
+    };
+    let r = orchestrate::predict(
+        formula,
+        numeric_columns,
+        factor_columns,
+        family,
+        link,
+        opt_f64s(weights, "weights")?,
+        opt_f64s(offset, "offset")?,
+        &parts.parts()?,
+        new,
+        scale,
+        population,
+        allow_new_levels,
+        se,
+        level,
+        future,
+    )
+    .map_err(PyValueError::new_err)?;
+    let d = PyDict::new(py);
+    d.set_item("fit", f64_bytes(py, &r.fit)?)?;
+    d.set_item("se", f64_bytes(py, &r.se)?)?;
+    d.set_item("lower", f64_bytes(py, &r.lower)?)?;
+    d.set_item("upper", f64_bytes(py, &r.upper)?)?;
+    d.set_item("future_lower", f64_bytes(py, &r.future_lower)?)?;
+    d.set_item("future_upper", f64_bytes(py, &r.future_upper)?)?;
+    let notes = PyList::empty(py);
+    for n in r.notes {
+        let nd = PyDict::new(py);
+        nd.set_item("kind", n.kind)?;
+        nd.set_item("detail", n.detail)?;
+        notes.append(nd)?;
+    }
+    d.set_item("notes", notes)?;
+    Ok(d)
+}
+
+/// `Fit.simulate`: `orchestrate::simulate`, the draws as float64 bytes, draw
+/// after draw.
+#[allow(clippy::too_many_arguments)]
+#[pyfunction]
+fn simulate<'py>(
+    py: Python<'py>,
+    formula: &str,
+    numeric_columns: HashMap<String, PyBackedBytes>,
+    factor_columns: HashMap<String, (Vec<String>, PyBackedBytes)>,
+    family: &str,
+    link: &str,
+    weights: Option<PyBackedBytes>,
+    offset: Option<PyBackedBytes>,
+    parts: StoredNumbers,
+    nsim: usize,
+    seed: u64,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let (numeric_columns, factor_columns) = columns(numeric_columns, factor_columns)?;
+    let draws = orchestrate::simulate(
+        formula,
+        numeric_columns,
+        factor_columns,
+        family,
+        link,
+        opt_f64s(weights, "weights")?,
+        opt_f64s(offset, "offset")?,
+        &parts.parts()?,
+        nsim,
+        seed,
+    )
+    .map_err(PyValueError::new_err)?;
+    f64_bytes(py, &draws)
+}
+
+/// `Fit.r2` and `Fit.icc`: `orchestrate::effect_sizes` on the columns and
+/// numbers `simulate` takes, and the fit's `aliased`, `converged`, `objective`
+/// and `objective_nodes`. A dict of `marginal`, `conditional`, `adjusted` and
+/// `unadjusted`, or `None` where the values need the null refit that
+/// `null_refit` is False to skip.
+#[allow(clippy::too_many_arguments)]
+#[pyfunction]
+fn effect_sizes<'py>(
+    py: Python<'py>,
+    formula: &str,
+    numeric_columns: HashMap<String, PyBackedBytes>,
+    factor_columns: HashMap<String, (Vec<String>, PyBackedBytes)>,
+    family: &str,
+    link: &str,
+    weights: Option<PyBackedBytes>,
+    offset: Option<PyBackedBytes>,
+    parts: StoredNumbers,
+    aliased: Vec<bool>,
+    converged: bool,
+    objective: &str,
+    objective_nodes: u8,
+    null_refit: bool,
+) -> PyResult<Option<Bound<'py, PyDict>>> {
+    let (numeric_columns, factor_columns) = columns(numeric_columns, factor_columns)?;
+    let sizes = orchestrate::effect_sizes(
+        formula,
+        numeric_columns,
+        factor_columns,
+        family,
+        link,
+        opt_f64s(weights, "weights")?,
+        opt_f64s(offset, "offset")?,
+        &parts.parts()?,
+        &aliased,
+        converged,
+        (objective, objective_nodes),
+        null_refit,
+    )
+    .map_err(PyValueError::new_err)?;
+    let Some((r2, icc)) = sizes else {
+        return Ok(None);
+    };
+    let d = PyDict::new(py);
+    d.set_item("marginal", r2.marginal)?;
+    d.set_item("conditional", r2.conditional)?;
+    d.set_item("adjusted", icc.adjusted)?;
+    d.set_item("unadjusted", icc.unadjusted)?;
+    Ok(Some(d))
+}
+
+/// `orchestrate::predict_columns` for `Fit.predict`: the names of
+/// `available` the formula reads on new rows, the response left out.
+#[pyfunction]
+fn predict_columns(formula: &str, available: Vec<String>) -> PyResult<Vec<String>> {
+    orchestrate::predict_columns(formula, &available).map_err(PyValueError::new_err)
 }
 
 /// What `formula` reads from a dataset whose column names are `available`, from
@@ -787,9 +1139,15 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(formula_columns, m)?)?;
     m.add_function(wrap_pyfunction!(model_matrix_columns, m)?)?;
     m.add_function(wrap_pyfunction!(model_matrix, m)?)?;
+    m.add_function(wrap_pyfunction!(predict, m)?)?;
+    m.add_function(wrap_pyfunction!(simulate, m)?)?;
+    m.add_function(wrap_pyfunction!(effect_sizes, m)?)?;
+    m.add_function(wrap_pyfunction!(predict_columns, m)?)?;
     m.add_function(wrap_pyfunction!(plain_column, m)?)?;
     m.add_function(wrap_pyfunction!(confint, m)?)?;
     m.add_function(wrap_pyfunction!(contrast_test, m)?)?;
+    m.add_function(wrap_pyfunction!(pairwise, m)?)?;
+    m.add_function(wrap_pyfunction!(pairwise_confint, m)?)?;
     m.add_function(wrap_pyfunction!(term_labels, m)?)?;
     m.add_function(wrap_pyfunction!(f_table_refusal, m)?)?;
     m.add_function(wrap_pyfunction!(compare_fits, m)?)?;

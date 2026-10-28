@@ -1,6 +1,7 @@
 #!/usr/bin/env Rscript
 # The R front end of the anova port gate: the call list of anova_ports.rs,
-# made through the R port (anova.fastglmm, compare), each table written to
+# made through the R port (anova.fastglmm, compare, and the post-fit predict,
+# simulate, r2, icc, pairwise), each table written to
 # stdout as one JSONL row per cell. Mirrors anova_ports.rs and anova_ports.py
 # call for call: change together. The call list and the cell format are
 # documented in anova_ports.rs.
@@ -66,6 +67,12 @@ TERM_CALLS <- list(
   term_call("glmer_gamma_sim_gamma", "III", "auto", TRUE))
 
 MISSING_ROW <- 5L  # 1-based row of wls_basic.csv whose x2 is made missing
+
+# The new rows of the predict calls, as anova_ports.rs's NEW_SUBJ ... NEW_X:
+# s99 is a subj the fit did not see.
+NEWDATA <- data.frame(subj = c("s01", "s02", "s99", "s18"), g = c("a", "b", "c", "c"),
+                      h = c("p", "q", "p", "q"), x = c(0.5, -1.0, 0.0, 1.25),
+                      stringsAsFactors = FALSE)
 
 # Correctly-rounded string to double parse through the C library's strtod, as
 # grid/engines/glmm_r.R parses: R's own as.numeric and read.csv are not
@@ -232,13 +239,21 @@ pairs <- function() {
   }
 }
 
+# The data (a$data) and the model of a label in TERM_MODELS.
+term_model <- function(label) {
+  t <- TERM_MODELS[[label]]
+  a <- aggregated(t$formula, read_data(t$data, t$factors))
+  list(a = a, m = list(formula = a$formula, family = t$family, link = t$link, reml = NULL,
+                       nagq = 1L))
+}
+
 # anova(m, type, test) per TERM_CALLS, each table followed by its text cells:
 # the heading (with the notes), and the fit's term_test_auto.
 term_calls <- function() {
   for (cl in TERM_CALLS) {
-    t <- TERM_MODELS[[cl$model]]
-    a <- aggregated(t$formula, read_data(t$data, t$factors))
-    m <- list(formula = a$formula, family = t$family, link = t$link, reml = NULL, nagq = 1L)
+    tm <- term_model(cl$model)
+    a <- tm$a
+    m <- tm$m
     calls <- sprintf("terms:%s:%s%s", cl$model, cl$types,
                      if (cl$named) paste0(":", cl$test) else "")
     f <- tryCatch(fit(a$data, m, NULL, if (identical(cl$test, "LRT")) "LRT" else "auto"),
@@ -282,7 +297,46 @@ rlrt_calls <- function() {
   anova_call("anova:rlrt_dyestuff", data, m, NULL)
 }
 
+# One post-fit call on the fit `f`, as anova_ports.rs's post_fit.
+post_fit <- function(call, kind, f) {
+  numbered <- function(n) as.character(seq_len(n))
+  if (kind == "predict") {
+    p <- predict(f, NEWDATA, se.fit = TRUE)
+    emit(call, numbered(nrow(NEWDATA)), lapply(p, unname))
+  } else if (kind == "simulate") {
+    emit(call, numbered(f$nobs), as.list(simulate(f, nsim = 2, seed = 1)))
+  } else if (kind %in% c("r2", "icc")) {
+    emit(call, "fit", as.list(if (kind == "r2") r2(f) else icc(f)))
+  } else {
+    tab <- pairwise(f, "g", adjust = kind)
+    emit(call, tab$contrast, as.list(tab[names(tab) != "contrast"]))
+  }
+}
+
+# anova_ports.rs's post_fit_calls: predict and simulate on both models, r2,
+# icc and pairwise on the Gaussian one, each fitted once.
+post_fit_calls <- function() {
+  for (label in c("lmer_sim_factorial", "glmer_sim_factorial_bern")) {
+    kinds <- c("predict", "simulate",
+               if (label == "lmer_sim_factorial") c("r2", "icc", "holm", "tukey"))
+    name <- function(kind) {
+      if (kind %in% c("holm", "tukey")) sprintf("pairwise:%s:g:%s", label, kind) else
+        sprintf("%s:%s", kind, label)
+    }
+    tm <- term_model(label)
+    f <- tryCatch(fit(tm$a$data, tm$m, NULL), error = function(e) e)
+    for (kind in kinds) {
+      if (inherits(f, "error")) {
+        refused(name(kind), f)
+        next
+      }
+      tryCatch(post_fit(name(kind), kind, f), error = function(e) refused(name(kind), e))
+    }
+  }
+}
+
 pairs()
 term_calls()
 missing_value_call()
 rlrt_calls()
+post_fit_calls()

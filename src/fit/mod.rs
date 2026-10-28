@@ -4,23 +4,23 @@
 //! This is the additive stable public surface —
 //! it never touches any kernel; only marshals data and scratch into kernel
 //! calls, then copies results out. The full route table — every path from
-//! `fit_cold`/`fit_warm` to its solver — is in `documentation/algorithms.md`;
+//! [`fit`]/[`fit_with_start`] to its solver — is in `documentation/algorithms.md`;
 //! no route there is feature-gated. This file only tracks its own module
 //! split.
 //!
 //! # Calling convention
 //!
 //! `x` is a design matrix in **row-major f64** layout: element `(i, j)` is at
-//! `x[i * p + j]`. `y` is the response vector of length `n`. The kernels use
-//! faer column-major f64 internally; conversion is done here.
+//! `x[i * p + j]`. `y` is the response vector of length `n`. Both arrive in a
+//! [`Data`]. The kernels use faer column-major f64 internally; conversion is
+//! done here.
 //!
-//! Cluster ids and extra-grouping ids are derived from `ModelSpec` using the
-//! same row-layout rules as MCPower's data-gen layer (mirrors the DGP's
-//! `cluster_of_row` / `extra_level_of_row` helpers).
+//! Cluster ids and extra-grouping ids come from the caller's [`GroupIds`]; every
+//! random-effect level count is derived from them.
 //!
 //! # Module layout
 //!
-//! `fit_warm` dispatches on `(family, re.is_some())` into one estimator
+//! `fit_checked` dispatches on `(family, re.is_some())` into one estimator
 //! module per family — `ols`/`lmm` (Gaussian), `glm` (fixed-effects
 //! binomial/Poisson/Gamma/NB), `glmm` (mixed non-Gaussian, plus GLMM-NB) —
 //! each of which marshals into the matching numerical kernel
@@ -29,7 +29,9 @@
 
 use crate::consts::{MAX_EXTRA_GROUPINGS, MAX_EXTRA_Q, MAX_PRIMARY_Q};
 use crate::inference::Objective;
-use crate::{Family, GroupIds, GroupingRelation, ModelSpec, StartValues, WaldSe};
+use std::borrow::Cow;
+
+use crate::{Data, Design, Family, GroupIds, GroupingRelation, ModelSpec, StartValues, WaldSe};
 
 mod common;
 mod core;
@@ -38,23 +40,39 @@ mod glmm;
 mod lmm;
 mod ols;
 
-use common::{assert_group_ids, assert_model_shape, fit_rank_deficient, spec_sized_from_ids};
+use common::fit_rank_deficient;
+// `pub(crate)` so `Fit::r2` and `Fit::icc` check their data as the fit entry
+// points do.
+pub(crate) use common::validate;
+// `pub(crate)` so `crate::predict` checks new rows as the fit checks its data.
+pub(crate) use common::validate_design;
 // `pub(crate)` so the calibration tier decides a design's aliasing with the
 // alias gate's own test.
 pub(crate) use common::detect_aliased;
 // `pub(crate)` so `orchestrate::run_fit` can check a port's warm-start θ width
-// before the fit, the way `fit_warm` checks it.
+// before the fit, the way `validate` checks it.
+#[cfg(any(test, feature = "orchestrate"))]
 pub(crate) use common::theta_width;
-// The grouping reorder `spec_sized_from_ids` may apply. Always `pub` (it is a
-// `build_workspace` parameter and one of `spec_sized_from_ids_pub`'s returns)
-// but the `fit` module itself is private, so the stable crate surface is
-// unaffected; `crate::loop_advanced` is what actually publishes it.
-pub use common::Perm;
+// The spec with its level counts, which the RE workspace builders in
+// `crate::lmm` and `crate::glmm` read.
+pub(crate) use common::SizedSpec;
+// The random-effect-only column count, which the LMM accumulator sizes its
+// slope buffers by.
+pub(crate) use common::re_only_count;
+// The sizer, for the tests outside `fit` that build kernel workspaces from
+// data-derived ids.
+#[cfg(test)]
+pub(crate) use common::spec_sized_from_ids;
+// The workspace door, for the tests outside `fit` that need a `Fit` only the
+// loop tier can produce (a prestandardized design); `loop_advanced` exports
+// it below.
+#[cfg(all(test, feature = "formula", not(feature = "loop_advanced")))]
+pub(crate) use core::{build_workspace, fit_on};
 
 /// Result of `fit`. Fixed-effect estimates cover all p predictors; SE and
 /// tau2 have the ranges below. Non-target SE slots are NaN.
 ///
-/// `#[non_exhaustive]`: construct one only through [`fit_cold`]/[`fit_warm`],
+/// `#[non_exhaustive]`: construct one only through [`fit`]/[`fit_with_start`],
 /// and match on it with a trailing `..`. Everything the fit reports about
 /// ITSELF — as opposed to about the data — lives on [`Fit::diagnostics`], which
 /// is `#[non_exhaustive]` for the same reason: a seventh diagnostic is then an
@@ -74,13 +92,13 @@ pub struct Fit {
     /// `se[j] == vcov[j][j].sqrt()` wherever both are finite.
     ///
     /// Finite exactly where `se` is — the off-diagonal `vcov[i][j]` is finite
-    /// iff `se[i]` and `se[j]` both are. So a [`FitOptions::target_indices`]
+    /// iff `se[i]` and `se[j]` both are. So a [`SeFor::Only`]
     /// subset leaves everything outside the target block NaN (there is no
     /// covariance to report for a coefficient whose variance was never
     /// computed), and a non-converged fit is all-NaN — except an LMM or GLMM
     /// fit that hit `MaxFunReached`: that budget-exhausted exit reports its
-    /// finite covariance at the capped endpoint here instead. A GLMM fit under
-    /// [`Note::SeUnavailable`] is all-NaN here and in `se` whatever its
+    /// finite covariance at the capped endpoint here instead. A GLM or GLMM fit
+    /// under [`Note::SeUnavailable`] is all-NaN here and in `se` whatever its
     /// `converged`.
     ///
     /// Sources, by path: OLS/GLM/LMM invert the same Cholesky factor `se`'s
@@ -98,6 +116,8 @@ pub struct Fit {
     /// the random-effect variance components only for diagonal/scalar RE
     /// components (q=1 / scalar-extra — the currently reachable case); slope
     /// (q≥2) models are not yet validated through this field. Empty for OLS.
+    /// Laid out like `varcorr`: a block without a random intercept reports
+    /// its slopes only.
     pub tau2: Vec<f64>,
     /// Estimated dispersion: `φ` for Gamma (the Pearson moment on a GLM,
     /// `summary(glm)`'s; the maximum-likelihood estimate on a GLMM) and
@@ -134,9 +154,17 @@ pub struct Fit {
     /// (`validation/goldens/sim_gamma_glmm_tmb.json`). Empty for OLS/GLM
     /// (no random effects). This is the q≥2-valid replacement for `tau2`'s
     /// per-component variances; `tau2` is retained for back-compat.
+    ///
+    /// A block without a random intercept (`(0 + x | g)`,
+    /// [`crate::ReTerm::no_intercept`]) reports its slopes only: the kernel
+    /// keeps an intercept column there at zero variance, and that column is
+    /// dropped from this block and from `tau2`, `stddev_se` and `ranef`. The
+    /// covariance between two terms of one grouping (`(x || g)`) is exactly
+    /// `0.0`.
     pub varcorr: Vec<Vec<f64>>,
     /// SE of each RE standard deviation, laid out like `tau2` (per θ coordinate,
-    /// length `n_theta`; primary block then each extra, in declaration order):
+    /// length `n_theta`, less the slots of a hidden intercept column, see
+    /// `varcorr`; primary block then each extra, in declaration order):
     /// the SE of row k's stddev `√D̂_kk` (the stddev `varcorr` reports) sits at
     /// that row's diagonal slot, and the off-diagonal slots of a q≥2 block are
     /// NaN. Populated ONLY on a converged GLMM `WaldSe::Hessian` fit, from the θ block
@@ -245,8 +273,9 @@ pub struct Fit {
     /// identity does not apply there, even though `loglik` itself is finite.
     pub loglik: f64,
     /// Parameters counted for AIC/BIC: retained fixed effects (`p` minus
-    /// aliased columns, matching lme4's NA-coefficient handling) + `n_theta`
-    /// RE parameters + 1 if the family estimates a dispersion/scale (Gaussian
+    /// aliased columns, matching lme4's NA-coefficient handling) + the RE θ
+    /// entries the fit estimates (not those a grouping's terms hold at zero,
+    /// as in `(x || g)`) + 1 if the family estimates a dispersion/scale (Gaussian
     /// σ², Gamma φ unless held fixed via [`FitOptions::dispersion`], NB θ).
     /// 0 on degenerate NaN-fill paths, and also 0 on a GLMM fit that hits
     /// `MaxFunReached` (gated on `converged`, unlike `loglik`/`deviance`) — the
@@ -288,7 +317,8 @@ pub struct Fit {
     /// lme4's `ranef()` values. One block per grouping in declaration order
     /// (primary, then each extra — same order as `varcorr`), each block
     /// level-major: level `l`'s `q` values (intercept, then slopes in
-    /// declaration order) at `[l·q .. (l+1)·q]`. `η̂ = Xβ̂ + Zb̂` reproduces the
+    /// declaration order; slopes only on a block without a random intercept,
+    /// see `varcorr`) at `[l·q .. (l+1)·q]`. `η̂ = Xβ̂ + Zb̂` reproduces the
     /// linear predictor behind `fitted`. Level counts per grouping are in
     /// [`Fit::ranef_levels`]; `q` per grouping is recoverable from `varcorr`
     /// (vech length). For a nested grouping the block spans
@@ -312,12 +342,48 @@ pub struct Fit {
     /// (primary, then each extra). `ranef.len() = Σ_g levels[g]·q_g`. Empty
     /// exactly when `ranef` is.
     pub ranef_levels: Vec<usize>,
+    /// Conditional covariance of each level's random effects given the data,
+    /// at the fitted parameters: lme4's `ranef(condVar = TRUE)` (`postVar`),
+    /// on the scale of [`Fit::ranef`]. The layout of `ranef` with each level's
+    /// `q` values replaced by the vech of its `q × q` block, in the order of
+    /// `varcorr` (column-major lower triangle), so a grouping's block holds
+    /// `levels[g]·q_g(q_g+1)/2` values; the conditional SDs are the square
+    /// roots of the diagonal entries. A block without a random intercept
+    /// reports its slopes only, as `ranef` does, and a padded nested slot
+    /// holds the prior covariance (it has no rows).
+    ///
+    /// On a Gaussian LMM the block is `σ̂²·Λ̂(Λ̂ᵀZᵀWZΛ̂ + I)⁻¹Λ̂ᵀ` restricted to
+    /// the level (`W` the prior weights); on a GLMM the same with `σ̂² = 1`
+    /// and `W` the observed curvature `−∂²ℓᵢ/∂ηᵢ²` at the conditional modes
+    /// (the Laplace approximation; on a Gamma GLMM it carries `1/φ̂`). Both
+    /// hold β̂ fixed, as lme4's do.
+    ///
+    /// Formed once when the `Fit` is assembled, from the factors at the
+    /// optimum, and only when [`FitOptions::condvar`] asks for it. Empty on a
+    /// fit that did not ask, where `ranef` is, and on the layouts where it is not
+    /// computed: a Gaussian LMM on the sparse route (an extra grouping with a
+    /// random slope, over the dense envelope or more than
+    /// `MAX_CROSSED_LEVELS` crossed levels) and a GLMM on the packed layout,
+    /// which would need a selected inverse of the whole system.
+    pub condvar: Vec<f64>,
+    /// Per level `l`, in the level order of [`Fit::condvar`], the row-major
+    /// `q × p` block `K_l` of `Λ̂(Λ̂ᵀZᵀWZΛ̂ + I)⁻¹Λ̂ᵀZᵀWX` on the caller's columns, the
+    /// same solves as `condvar` (`q` without a hidden intercept, `p` the
+    /// caller's width; an aliased column's entries are NaN). With `V` the
+    /// fixed-effect covariance, `Cov(b̂_l, β̂) = −K_l·V`. Empty exactly when
+    /// `condvar` is.
+    pub(crate) condvar_x: Vec<f64>,
+    /// The conditional covariance between the random effects of different
+    /// groupings, which `condvar`'s per-level blocks leave out, on its scale;
+    /// see [`CondvarCross`]. `None` on a fit with one grouping and wherever
+    /// `condvar` is empty.
+    pub(crate) condvar_cross: Option<CondvarCross>,
     /// Degrees of freedom of each coefficient `β̂_j`, length p: lmerTest's
     /// Satterthwaite df of the contrast `e_j` on a Gaussian LMM, and the
     /// residual df `n − p` (`p` the retained columns) on OLS and on a Gamma or
     /// inverse Gaussian GLM with φ estimated, whatever
     /// [`FitOptions::satterthwaite`] says. Filled on the target columns
-    /// ([`FitOptions::target_indices`]) of a Gaussian mixed fit whose pass ran
+    /// ([`FitOptions::se_for`]) of a Gaussian mixed fit whose pass ran
     /// and of a converged OLS or dispersion GLM fit; NaN on non-target and
     /// aliased columns (as `se`), on an OLS or dispersion GLM fit that did not
     /// converge (as `se`), on every other family (binomial, Poisson, negative
@@ -369,6 +435,53 @@ pub(crate) struct DesignSummary {
     pub(crate) s: Vec<f64>,
     pub(crate) c: Vec<f64>,
 }
+
+/// The conditional covariance between the random effects of different
+/// groupings (all of `Λ̂(Λ̂ᵀZᵀWZΛ̂ + I)⁻¹Λ̂ᵀ` that [`Fit::condvar`] does not
+/// hold), as flat arrays on `condvar`'s scale and reported columns.
+///
+/// One grouping is the family grouping: each of its levels is a family,
+/// together with its children when the model has a nested grouping (`m`
+/// child slots per family, `m = 0` without one). Every other grouping is a
+/// crossed, intercept-only one, and their levels form the tail: the
+/// groupings in declaration order with the nested one skipped, except that
+/// the declared primary stands at the family grouping's place when the two
+/// differ, each grouping's levels in order.
+///
+/// - `family_grouping`: the declaration index of the family grouping; 0
+///   unless the fit made a crossed extra its primary.
+/// - `family`, per family `f`, the vech (column-major lower triangle, as
+///   `varcorr`) of the `w × w` covariance of its `w = q + m` coefficients: the
+///   level's `q` reported coefficients, then the nested grouping's slots
+///   `f·m .. (f+1)·m`.
+/// - `tail`, the vech of the `t × t` covariance of the tail levels.
+/// - `coupling_at` (one entry per family plus one), `coupling_cols` and
+///   `coupling`: family `f`'s entries `e` in `coupling_at[f]..coupling_at[f+1]`
+///   name a tail level `coupling_cols[e]` and hold `w` values
+///   `H_f[e] = coupling[e·w..(e+1)·w]`, one per family coefficient. Tail levels
+///   no entry names have `H_f[e] = 0`. With `T` the `tail` matrix,
+///   `Cov(coefficient a of f, tail level t) = −Σ_e H_f[e][a]·T[cols_e, t]`, and
+///   between coefficients of two different families `f ≠ g`
+///   `Σ_e Σ_e' H_f[e][a]·T[cols_e, cols_e']·H_g[e'][a']`.
+///
+/// Memory: `Σ_f w(w+1)/2 + t(t+1)/2` values plus `w` per entry, the entries
+/// at most one per family and tail level its training rows share, and `t` at
+/// most `MAX_CROSSED_LEVELS`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct CondvarCross {
+    pub(crate) family_grouping: usize,
+    pub(crate) family: Vec<f64>,
+    pub(crate) tail: Vec<f64>,
+    pub(crate) coupling_at: Vec<u32>,
+    pub(crate) coupling_cols: Vec<u32>,
+    pub(crate) coupling: Vec<f64>,
+}
+
+/// What the kernels' factor walks return, in kernel coordinates: the
+/// per-level blocks behind [`Fit::condvar`], the rows behind
+/// [`Fit::condvar_x`], and the pieces `common::assemble_condvar_cross` maps to
+/// [`Fit::condvar_cross`].
+pub(crate) type CondvarBlocks = (Vec<f64>, Vec<f64>, Option<CondvarCross>);
 
 /// Everything a fit reports about itself, reached as `fit.diagnostics`.
 ///
@@ -576,24 +689,6 @@ pub enum Note {
         /// Alternation rounds run (the cap, `NB_MAX_OUTER`, in production).
         rounds: u32,
     },
-    /// A grouping factor declares levels that carry no row but still occupy
-    /// random-effect columns, because the block is `max(code)+1` wide: a level
-    /// between two observed ones is an empty cluster that contributes nothing to
-    /// the likelihood and costs width anyway. Its conditional mode is reported,
-    /// fully shrunk to zero — lme4's `ranef()` has no counterpart row at all, so
-    /// this is a deliberate divergence, and dropping the level (R's
-    /// `droplevels`) removes both the row and the wasted width. A level declared
-    /// AFTER the last observed one costs nothing and is never named here.
-    ///
-    /// Raised by the formula frontend, not by a solver: it is the only layer
-    /// that sees both the declared levels and the per-row codes. Reached through
-    /// [`crate::formula::Lowered::notes`].
-    UnusedGroupingLevels {
-        /// The grouping factor, as the formula spells it.
-        grouping: String,
-        /// The declared level labels with a slot but no row.
-        levels: Vec<String>,
-    },
     /// `FitOptions::wald_se == WaldSe::Hessian` was requested, but the
     /// finite-difference joint Hessian came back non-positive-definite (or a
     /// perturbed deviance evaluation was non-finite), so the SE pass fell back
@@ -630,6 +725,14 @@ pub enum Note {
     /// `Fit::stddev_se` are NaN. Reached on a near-duplicate fixed-effect
     /// column the alias gate keeps, and on fits whose working weights span
     /// many decades.
+    ///
+    /// On a GLM: the fit converged, but the QR of `√W·X` at its last step has
+    /// a zero or non-finite diagonal at a column that is not zero under the
+    /// weights, so that column cannot be separated from the ones before it.
+    /// [`Note::IllConditioned`] comes with it and names the column (`pivot`
+    /// 0); that column's `Fit::beta` is NaN, since the fit held it at its
+    /// start value. The other estimates, the deviance, `loglik`, `fitted` and
+    /// `converged` stand; `Fit::se` and `Fit::vcov` are NaN.
     SeUnavailable,
     /// The response is not within `1e-3` of an integer count — the raw value
     /// for Poisson/negative-binomial, the derived successes `y·wᵢ` for
@@ -654,9 +757,8 @@ pub enum Note {
     /// term is dropped this way, the model fits with `re: None`, the same as a
     /// formula that declared no random effects at all.
     ///
-    /// Raised by the formula frontend, not by a solver, for the same reason
-    /// [`Note::UnusedGroupingLevels`] is: the level count is a property of the
-    /// lowering, not of any fitted model. Reached through
+    /// Raised by the formula frontend, not by a solver: the level count is a
+    /// property of the lowering, not of any fitted model. Reached through
     /// [`crate::formula::Lowered::notes`].
     SingleLevelGroupingDropped {
         /// The grouping factor, as the formula spells it.
@@ -674,7 +776,7 @@ pub enum Note {
     /// the counts are not summed across terms. The fit runs as usual.
     ///
     /// Raised by the formula frontend, not by a solver, for the same reason
-    /// [`Note::UnusedGroupingLevels`] is. A term dropped by
+    /// [`Note::SingleLevelGroupingDropped`] is. A term dropped by
     /// [`Note::SingleLevelGroupingDropped`] is not checked. Reached through
     /// [`crate::formula::Lowered::notes`].
     FewRowsForRandomEffects {
@@ -743,6 +845,22 @@ pub enum Note {
     /// (sets [`Boundary::UpperLimit`] when the boundary would otherwise read
     /// `Interior`); `converged` and `singular` are not changed.
     VarianceAtLimit,
+    /// A prediction on new rows ([`crate::predict`]) met grouping levels the
+    /// fit has no conditional mode for: an id at or past the grouping's
+    /// [`Fit::ranef_levels`] count. Those rows take a zero random effect for
+    /// this grouping, and nothing from it in their standard error, while the
+    /// row's other groupings keep theirs, as lme4's `allow.new.levels = TRUE`
+    /// does. One note per grouping with such rows, in declaration order.
+    /// Raised only when [`crate::PredictOptions::allow_new_levels`] is set (the
+    /// default); without it the same rows are a [`FitError::Ids`]. Never raised
+    /// by a fit.
+    NewGroupingLevels {
+        /// The grouping's declaration index: 0 the primary grouping, `g + 1`
+        /// the extra grouping `g`.
+        grouping: u32,
+        /// The 0-based rows of the new design with an unseen level, ascending.
+        rows: Vec<u32>,
+    },
 }
 
 impl Diagnostics {
@@ -891,7 +1009,7 @@ impl Fit {
 /// including `..` update syntax, does not compile.
 ///
 /// ```compile_fail
-/// let o = glmm::FitOptions { target_indices: vec![0], ..Default::default() };
+/// let o = glmm::FitOptions { se_for: glmm::SeFor::Only(vec![0]), ..Default::default() };
 /// ```
 ///
 /// Start from [`FitOptions::default()`] (or a clone of existing options) and
@@ -899,127 +1017,31 @@ impl Fit {
 ///
 /// ```rust
 /// let mut o = glmm::FitOptions::default();
-/// o.target_indices = vec![0];
+/// o.se_for = glmm::SeFor::Only(vec![0]);
 /// ```
 // Non-exhaustive so a new knob is an additive change, not a break.
 #[non_exhaustive]
 #[derive(Clone)]
 pub struct FitOptions {
-    /// Predictor column indices for which SE is computed.
-    pub target_indices: Vec<u32>,
+    /// Which coefficients get a standard error. Default [`SeFor::All`].
+    pub se_for: SeFor,
     /// Wald-SE denominator (relocated from `ModelSpec`). Default `Hessian`.
     pub wald_se: WaldSe,
     /// Adaptive Gauss–Hermite node count (relocated from `ModelSpec`). Default 1
     /// (= Laplace). Must be odd and in `1..=MAX_NAGQ`; `>1` is honored on a
     /// binomial/Poisson/negative-binomial/Gamma GLMM with a single grouping factor and `q_p ≤ 3` random
     /// effects per group (scalar intercept → `agq::agq_deviance`, vector RE →
-    /// `agq::agq_deviance_vec`, a `k^q_p` product grid). `q_p ≥ 4` is refused by
-    /// `assert_model_shape` (a temporary cost/oracle boundary); other ineligible
-    /// shapes panic there likewise.
+    /// `agq::agq_deviance_vec`, a `k^q_p` product grid). `q_p ≥ 4` is refused
+    /// with [`FitError::Unsupported`] (a temporary cost/oracle boundary), as
+    /// are the other ineligible non-Gaussian mixed shapes. `nagq > 1` is
+    /// ignored on Gaussian models and on models without random effects: the
+    /// fit runs at `nagq = 1` with no note attached, and the ports warn.
     pub nagq: u8,
     /// Gamma/inverse-Gaussian dispersion directive (relocated from
     /// `Family::Gamma`). `None` = estimate φ (the Pearson moment,
     /// `Σwᵢrᵢ²/(n−p)`, on a GLM; maximum likelihood on a GLMM); `Some(v)` =
     /// hold φ fixed at `v`. Ignored by the φ ≡ 1 families.
     pub dispersion: Option<f64>,
-    /// Per-row prior weights `wᵢ` — lme4's `weights=`. `None` = unit weights.
-    /// For an aggregated binomial, `y` is the success PROPORTION and `wᵢ` the
-    /// trial count: this is exactly lme4's `cbind(s, m−s)` objective, whose
-    /// deviance differs from the expanded-Bernoulli one only by a data-only
-    /// saturated constant (same argmin — same β/SE/varcomp).
-    ///
-    /// On every family with an estimated dispersion (Gaussian, Gamma,
-    /// inverse-Gaussian) `wᵢ` is a PRECISION weight: row `i` has variance
-    /// `φ·V(μᵢ)/wᵢ` (`lm`/`glm`'s and lme4's convention, McCullagh & Nelder
-    /// 1989 §2.2), not glmmTMB's `wᵢ` multiplying the log-density. Rescaling
-    /// every weight by one constant `c` changes nothing about the fitted mean
-    /// model or the SEs, and moves `dispersion` by exactly `c` — the fit
-    /// depends on the RELATIVE weights only (the GLM IRLS's own stopping
-    /// tolerance, `glm::DEVIANCE_TOL`, is a relative rule on the deviance, so
-    /// it is scale-free too for `|deviance| ≫ 0.1`). Moment estimates (σ̂²,
-    /// inverse-Gaussian and Gamma-GLM's Pearson φ̂) divide by the raw row count
-    /// `n−p`, never `Σwᵢ−p`. Binomial weights are trial counts (no dispersion
-    /// to divide); Poisson's fit is identical either way (the two conventions
-    /// differ by a weight-only constant); NB's weights keep multiplying the
-    /// log-likelihood (`MASS::glm.nb`'s convention — NB's variance `μ+μ²/θ`
-    /// has no `φ` to divide).
-    ///
-    /// Support matrix: every (family, RE structure, solver) combination,
-    /// including AGQ (`nagq > 1`) on the binomial/Poisson/NB/Gamma shapes it covers — the
-    /// per-row `dev_resid` sums in `glmm/agq.rs` carry `wᵢ`, and PIRLS folds the
-    /// weights into the conditional mode/curvature (aggregated binomial with small
-    /// clusters, e.g. `glmer(cbind(s,m−s) ~ …, nAGQ=k)`, is the canonical case).
-    ///
-    /// - Gaussian fixed-only: WLS via √wᵢ row pre-scaling, `σ̂² = Σwᵢrᵢ²/(n−p)`;
-    ///   matches R `lm(weights=)` (`fit_ols_weighted_matches_r_lm`).
-    /// - GLM fixed-only, any family (Binomial/Poisson/Gamma/NB): weighted IRLS —
-    ///   `wᵢ` multiplies the working weight and deviance; both Gamma's and an
-    ///   inverse-Gaussian's Pearson φ̂ are `Σwᵢrᵢ²/(n−p)`, `summary(glm)`'s value;
-    ///   Gamma's separate maximum-likelihood φ̂ (used only for `loglik`) takes
-    ///   `ŵᵢ = wᵢ/s` in the shape equation (precision weights: this Newton
-    ///   search is not scale-free on raw `w`); the null
-    ///   deviance uses the weighted mean. Matches R
-    ///   `glm(weights=)` (`fit_glm_gamma_weighted_matches_r`,
-    ///   `fit_glm_binomial_weighted_aggregated_matches_r`,
-    ///   `glm_weighted_deviance_null_golden_value`) and `MASS::glm.nb(weights=)`
-    ///   (`fit_glm_nb_weighted_matches_mass`, weighted θ profile).
-    /// - Sparse (`Solver::Sparse`) non-Gaussian GLMM, every family: `wᵢ` weights
-    ///   the sparse PIRLS working weight/deviance/score identically to the
-    ///   dense mixed path below; Gamma's dispersion term
-    ///   (`family::gamma_dispersion_term`) takes `ŵᵢ = wᵢ/s` (`s` the
-    ///   weight-scale normaliser, `family::weight_scale`) in place of a row
-    ///   count, its PIRLS runs on `ŵᵢ/φ`, and NB's marginal-θ profile
-    ///   (`nb_profile_loglik`) takes `opts.weights` raw. Validated against
-    ///   `fit_sparse_gamma_glmm_weighted_matches_glmmtmb` (glmmTMB), the
-    ///   `sparse_weighted_binomial_*` expanded-vs-aggregated tests, and the
-    ///   `sparse_weighted_{poisson,nb}_matches_replicated` weighted-vs-
-    ///   replicated-row equivalence tests.
-    /// - Dense (`Solver::NoZ`) mixed GLMM, every non-Gaussian family
-    ///   (Binomial/Poisson/Gamma/NB): `wᵢ` weights the working weight,
-    ///   deviance, and β-gradient score identically to the sparse binomial path
-    ///   above; Gamma's dispersion term (`family::gamma_dispersion_term`) takes
-    ///   `ŵᵢ = wᵢ/s` in place of a row count. Validated against
-    ///   `fit_glmm_cbpp_aggregated_matches_lme4`,
-    ///   `fit_glmm_poisson_weighted_matches_lme4`, and
-    ///   `fit_glmm_gamma_weighted_matches_glmmtmb` (lme4 `glmer` for the
-    ///   first two, glmmTMB with a dispersion offset for the Gamma one; all dense).
-    /// - Dense (`Solver::NoZ`) mixed Gaussian LMM (weighted REML or ML): every
-    ///   row of `[X y Z]` is conceptually √wᵢ-scaled before hitting the unit-
-    ///   weight suff-stats/deviance kernel (`LmmSuffStats::add_rows_multi`),
-    ///   which folds `wᵢ` straight into the Gram accumulators (`c`, `s`,
-    ///   `counts`: the last now `Σ z²·wᵢ`, not a row count; `ν`, `n − p`
-    ///   under REML and `n` under ML, still comes from the raw row count).
-    ///   `σ̂² = pwrss_w/ν` (raw ν) falls out of the weighted Grams
-    ///   automatically; `tau2 = θ²·σ̂²` and SEs inherit.
-    ///   The reported deviance carries an extra `−Σlog wᵢ` (the weighted
-    ///   Gaussian log-density's `+½Σlog wᵢ` per row, on the −2ℓ scale) atop the
-    ///   usual stripped-constant convention, on both criteria, matching lme4's
-    ///   weighted `lmer(weights=)` REMLcrit (ML: `deviance()`) up to that same
-    ///   stripped constant.
-    ///   Validated against `fit_lmm_weighted_matches_lme4` (lme4 `lmer`, dense,
-    ///   REML), `fit_lmm_weight_scale_invariant_dense_and_sparse` (both
-    ///   criteria), and
-    ///   `fit_lmm_weighted_boundary_matches_wls`.
-    /// - Sparse (`Solver::Sparse`) Gaussian LMM: identical √wᵢ scaling threaded
-    ///   through the sparse-Z accumulator instead — `for_each_z_entry`'s
-    ///   emitted z values and every raw x/y read in `SparseLmmWorkspace::new`'s
-    ///   pass 2 each carry one `√wᵢ` factor, so every Gram product (`ztxy`,
-    ///   `cxy`, the packed `pk_*` raw-Gram streams) ends up carrying exactly
-    ///   `wᵢ`. Deviance/ν stay raw (`n − p` or `n`); the `−Σlog wᵢ` constant is added
-    ///   in `lmm_view_to_fit`, the one site both kernels reach. Validated against
-    ///   `fit_sparse_lmm_weighted_matches_lme4` (lme4 `lmer`, sparse) and
-    ///   `fit_lmm_weight_scale_invariant_dense_and_sparse`.
-    pub weights: Option<Vec<f64>>,
-    /// Per-row additive offset `oᵢ` on the linear-predictor scale — R's
-    /// `offset=`: `η = o + Xβ (+ Zb)`, every family, every solver path. A fixed
-    /// known contribution, NOT a parameter: it adds no column to `X` and never
-    /// appears in `beta`/`se`/`vcov`/`df`. The canonical use is a Poisson
-    /// exposure, `offset = ln(exposure)`. `None` = no offset. Gaussian identity-link paths (OLS/LMM) implement
-    /// it as the exact `y − o` shift before the sufficient-statistics
-    /// accumulation; `Fit::fitted` still reports means on the original `y`
-    /// scale (μ̂ = o + Xβ̂ + Zb̂ through the link). Oracle: `glm(offset=)` /
-    /// `glmer(offset=)`.
-    pub offset: Option<Vec<f64>>,
     /// **Experimental.** Opt into the parallel inner-fit kernels (cluster-outer
     /// AGQ, per-`(i,j)` FD-Hessian grid) — live ONLY when built with the
     /// `parallel` Cargo feature on a non-`wasm32` target. The exclusion is
@@ -1059,6 +1081,16 @@ pub struct FitOptions {
     /// return [`crate::inference::contrast::NoDfReason::Disabled`]. No other
     /// family reads it, and no other field of the fit depends on it.
     pub satterthwaite: bool,
+    /// Form the conditional variances of the random effects ([`Fit::condvar`])
+    /// on a mixed model, which a conditional standard error or future bound
+    /// from [`crate::predict`] reads. Default `false`: they cost a set of
+    /// solves after the fit (on a GLMM, a re-solve of the mode first) that
+    /// grows with the level count, up to as much as the fit itself on a
+    /// crossed model with many levels, and a caller fitting in a loop rarely
+    /// reads them. With `false`, `condvar` is empty and such a prediction
+    /// returns [`FitError::Unsupported`]; no other field of the fit depends on
+    /// it.
+    pub condvar: bool,
     /// The estimator of a Gaussian mixed model: restricted maximum likelihood
     /// (REML) or maximum likelihood (ML). Default `None`, which resolves to
     /// the usual estimator for the model:
@@ -1085,95 +1117,180 @@ pub struct FitOptions {
     pub reml: Option<bool>,
 }
 
+/// Which fixed-effect coefficients a fit computes standard errors for
+/// ([`FitOptions::se_for`]). A coefficient without one has a NaN `se` slot and
+/// a NaN row and column in `vcov`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum SeFor {
+    /// Every coefficient.
+    #[default]
+    All,
+    /// Only these columns of `x` (0-based). `Only(vec![])` computes none,
+    /// which skips the work of the covariance; on a GLMM under
+    /// [`WaldSe::Hessian`] that is the joint Hessian.
+    Only(Vec<u32>),
+}
+
+impl SeFor {
+    /// The column indices this selects on a `p`-column design.
+    pub(crate) fn columns(&self, p: usize) -> Cow<'_, [u32]> {
+        match self {
+            SeFor::All => Cow::Owned((0..p as u32).collect()),
+            SeFor::Only(cols) => Cow::Borrowed(cols),
+        }
+    }
+}
+
 impl Default for FitOptions {
     fn default() -> Self {
         FitOptions {
-            target_indices: vec![],
+            se_for: SeFor::All,
             wald_se: WaldSe::Hessian,
             nagq: 1,
             dispersion: None,
-            weights: None,
-            offset: None,
             parallel_inner: false,
             satterthwaite: true,
+            condvar: false,
             reml: None,
         }
     }
 }
 
-/// Cold single fit — the default real-data entry. Random-effect
-/// level ids are supplied per-row via `ids` ([`GroupIds`]); every level count is
-/// derived from them, so `ModelSpec` stays structure-only. Exactly
-/// `fit_warm(.., None, ..)`.
+/// A caller input the fit refuses, returned by [`fit`] and [`fit_with_start`]
+/// before any fitting. Each variant carries a message naming the field, and
+/// the row (0-based) or the row and column where the check failed; its
+/// [`Display`](std::fmt::Display) is that message alone.
+///
+/// A numerical failure is not a `FitError`: it is reported inside the
+/// [`Fit`] (`converged`, the notes, NaN estimates).
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FitError {
+    /// The data do not have the shape `n` and `p` say (`x` not `n*p` long, `y`
+    /// not `n` long, a non-finite `x`), or a random slope names a column past
+    /// `p`.
+    Shape(String),
+    /// A response outside the family's support: a non-finite `y`, a Poisson
+    /// or negative-binomial `y < 0`, a binomial `y` outside `[0, 1]`, a Gamma
+    /// or inverse-Gaussian `y <= 0`.
+    ResponseOutOfSupport(String),
+    /// Prior weights of the wrong length, or not finite and `> 0`.
+    Weights(String),
+    /// An offset of the wrong length, or not finite.
+    Offset(String),
+    /// Grouping ids that do not match the model: missing on a model with
+    /// random effects, given on a model without them, or of the wrong length
+    /// or count.
+    Ids(String),
+    /// A warm start of the wrong width, with a non-finite entry, or with a
+    /// dispersion that is not finite and `> 0`.
+    Start(String),
+    /// A [`FitOptions`] value no model can use: an even or zero `nagq`, a
+    /// held `dispersion` that is not finite and `> 0`, a [`SeFor::Only`]
+    /// column past `p`.
+    OptionValue(String),
+    /// A model the crate does not fit: a mixed inverse-Gaussian model,
+    /// `nagq > 1` on a non-Gaussian mixed model outside the quadrature shapes
+    /// (one grouping factor, at most 3 random effects per group), or a second
+    /// `NestedWithin` grouping.
+    Unsupported(String),
+    /// A value past a fixed capacity of the kernels: `nagq` above
+    /// [`MAX_NAGQ`](crate::consts::MAX_NAGQ).
+    Envelope(String),
+}
+
+impl std::fmt::Display for FitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (FitError::Shape(m)
+        | FitError::ResponseOutOfSupport(m)
+        | FitError::Weights(m)
+        | FitError::Offset(m)
+        | FitError::Ids(m)
+        | FitError::Start(m)
+        | FitError::OptionValue(m)
+        | FitError::Unsupported(m)
+        | FitError::Envelope(m)) = self;
+        f.write_str(m)
+    }
+}
+
+impl std::error::Error for FitError {}
+
+/// Fit `spec` to `data` — the default real-data entry, with a cold start.
+/// Random-effect level ids are supplied per row through [`Data::ids`]
+/// ([`GroupIds`]); every level count is derived from them, so `ModelSpec`
+/// stays structure-only. Exactly [`fit_with_start`] with an empty
+/// [`StartValues`].
 ///
 /// Dispatches on `(family, re.is_some())` (`Gaussian`→OLS/LMM,
 /// `Binomial`→GLM/GLMM, Poisson/Gamma/NB likewise; `re: None`→fixed-only,
 /// `Some`→mixed). Binomial counts are fit as expanded 0/1 Bernoulli rows (the
 /// kernel is Bernoulli) — except when `y` is an aggregated success PROPORTION
-/// and [`FitOptions::weights`] carries the trial count, which fits directly
+/// and [`Data::weights`] carries the trial count, which fits directly
 /// without the expansion. That aggregated form is supported on every
 /// (family, RE, solver) path, including AGQ (`nagq > 1`) on its binomial/Poisson/NB/Gamma
-/// shapes (see `FitOptions::weights`'s support matrix).
+/// shapes (see [`Data::weights`]'s support matrix).
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics only on engine invariant violations (`x.len() != n*p`, malformed
-/// [`GroupIds`], over-envelope model), plus two input-domain checks run at the
-/// entry: a response outside the family's support (Poisson/NB `y < 0`,
-/// binomial `y` outside `[0, 1]`, Gamma/inverse-Gaussian `y <= 0`), and a
-/// [`FitOptions::dispersion`] value that is not finite and positive. Numerical
-/// failures signal via `Fit { converged: false, .. }` with NaN-filled
-/// estimates — including the degenerate-data cases: a rank-deficient design
-/// has its aliased columns dropped and the reduced model fit (`Fit::aliased`
-/// flags them, their β/se are NaN), and a design whose aliased column is ALSO
-/// an RE slope — unfittable, since the slope has no column left to point at —
-/// returns all-NaN with `converged: false` rather than faulting.
+/// A [`FitError`] when the data, the model or the options are inputs no fit
+/// can take (see its variants), checked before anything is fitted. Numerical
+/// failures are not errors: they signal via `Fit { converged: false, .. }`
+/// with NaN-filled estimates — including the degenerate-data cases: a
+/// rank-deficient design has its aliased columns dropped and the reduced
+/// model fit (`Fit::aliased` flags them, their β/se are NaN), and a design
+/// whose aliased column is ALSO an RE slope — unfittable, since the slope has
+/// no column left to point at — returns all-NaN with `converged: false`
+/// rather than an error.
 ///
 /// # Examples
 ///
 /// Fixed-only OLS (`re: None`): `y = 2x` exactly, so the fitted slope is 2.
 ///
 /// ```rust
-/// use glmm::{fit_cold, Family, FitOptions, GroupIds, ModelSpec};
+/// use glmm::{Data, Family, FitOptions, ModelSpec};
 ///
 /// let x = vec![1.0, 0.0, 1.0, 1.0, 1.0, 2.0]; // n=3, p=2, row-major [intercept, x]
 /// let y = vec![0.0, 2.0, 4.0];
-/// let model = ModelSpec { family: Family::Gaussian, re: None };
-/// let mut opts = FitOptions::default();
-/// opts.target_indices = vec![1];
-/// let fit = fit_cold(&x, &y, 3, 2, &model, &GroupIds::default(), &opts);
+/// let model = ModelSpec::fixed(Family::Gaussian);
+/// let fit = glmm::fit(&Data::new(&x, &y, 3, 2), &model, &FitOptions::default())?;
 /// assert!(fit.converged());
 /// assert!((fit.beta[1] - 2.0).abs() < 1e-9);
+/// # Ok::<(), glmm::FitError>(())
 /// ```
-pub fn fit_cold(
-    x: &[f64],
-    y: &[f64],
-    n: usize,
-    p: usize,
-    model: &ModelSpec,
-    ids: &GroupIds,
-    opts: &FitOptions,
-) -> Fit {
-    fit_warm(x, y, n, p, model, ids, None, opts)
+///
+/// A mistake in the inputs comes back as an error, not a panic:
+///
+/// ```rust
+/// use glmm::{Data, Family, FitError, FitOptions, ModelSpec, PoissonLink};
+///
+/// let x = vec![1.0; 3];
+/// let y = vec![1.0, -1.0, 2.0];
+/// let model = ModelSpec::fixed(Family::Poisson { link: PoissonLink::Log });
+/// let Err(err) = glmm::fit(&Data::new(&x, &y, 3, 1), &model, &FitOptions::default()) else {
+///     panic!("a negative Poisson count is refused");
+/// };
+/// assert!(matches!(err, FitError::ResponseOutOfSupport(_)));
+/// assert_eq!(err.to_string(), "Poisson response must be >= 0 (row 1)");
+/// ```
+pub fn fit(data: &Data<'_>, spec: &ModelSpec, opts: &FitOptions) -> Result<Fit, FitError> {
+    validate(data, spec, None, opts)?;
+    Ok(fit_checked(data, spec, None, opts))
 }
 
-/// Warm single fit — identical to [`fit_cold`] but accepts an optional
-/// [`StartValues`] warm start. `Some` warm-starts the optimizer;
-/// `None` cold-starts (byte-identical to `fit_cold`). One fit, one answer — the
-/// start only shortens the path. The start threads `beta`+`theta` into the
-/// LMM/GLMM kernels, and `dispersion` into the negative-binomial shape search
-/// (GLM and GLMM) and the Gamma GLMM's `ln φ` coordinate; the other fixed-only
-/// (OLS/GLM) fits ignore it (see [`crate::StartValues`]).
+/// [`fit`] from a warm start. One fit, one answer — the start only shortens
+/// the path. The start threads `beta`+`theta` into the LMM/GLMM kernels, and
+/// `dispersion` into the negative-binomial shape search (GLM and GLMM) and the
+/// Gamma GLMM's `ln φ` coordinate; the other fixed-only (OLS/GLM) fits ignore
+/// it (see [`crate::StartValues`]). Either vector may be left empty to
+/// cold-start that component alone, and an all-empty start is [`fit`].
 ///
-/// # Panics
+/// # Errors
 ///
-/// As [`fit_cold`], plus: with `start = Some`, `start.beta.len()` outside
-/// `{0, p}`, `start.theta.len()` outside `{0, n_theta}` (the model's RE θ
-/// width), a non-finite entry in `start.beta` or `start.theta`, or a
-/// `start.dispersion` that is not finite and `> 0` — a malformed
-/// stable input faults at the entry, not deep in a kernel.
-/// Either field may be left empty to cold-start that component alone
-/// (see [`crate::StartValues`]).
+/// As [`fit`], plus [`FitError::Start`]: `start.beta.len()` outside `{0, p}`,
+/// `start.theta.len()` outside `{0, n_theta}` (the model's RE θ width), a
+/// non-finite entry in `start.beta` or `start.theta`, or a `start.dispersion`
+/// that is not finite and `> 0`.
 ///
 /// # Examples
 ///
@@ -1181,122 +1298,47 @@ pub fn fit_cold(
 /// perturbed θ:
 ///
 /// ```rust
-/// use glmm::{fit_warm, Family, FitOptions, GroupIds, ModelSpec, ReStructure, Sizing, StartValues};
+/// use glmm::{Data, Family, FitOptions, GroupIds, ModelSpec, Re, StartValues};
 ///
 /// let x = vec![1.0; 6]; // n=6, p=1 (intercept-only design)
 /// let y = vec![1.0, 2.0, 1.5, 1.2, 2.1, 1.4];
-/// let model = ModelSpec {
-///     family: Family::Gaussian,
-///     re: Some(ReStructure {
-///         sizing: Sizing::FixedClusters { n_clusters: 3 },
-///         slopes: vec![],
-///         extra_groupings: vec![],
-///     }),
-/// };
-/// let ids = GroupIds { primary: vec![0, 1, 2, 0, 1, 2], extra: vec![] };
-/// let start = StartValues { beta: vec![0.0], theta: vec![1.0], dispersion: None };
-/// let fit = fit_warm(&x, &y, 6, 1, &model, &ids, Some(&start), &FitOptions::default());
+/// let model = ModelSpec::mixed(Family::Gaussian, Re::intercept());
+/// let ids = GroupIds::new(vec![0, 1, 2, 0, 1, 2]);
+/// let start = StartValues::new(vec![0.0], vec![1.0]);
+/// let data = Data::new(&x, &y, 6, 1).ids(&ids);
+/// let fit = glmm::fit_with_start(&data, &model, &start, &FitOptions::default())?;
 /// assert_eq!(fit.beta.len(), 1);
+/// # Ok::<(), glmm::FitError>(())
 /// ```
-#[allow(clippy::too_many_arguments)] // marshals (x, y, n, p, spec, ids, start, opts)
-pub fn fit_warm(
-    x: &[f64],
-    y: &[f64],
-    n: usize,
-    p: usize,
-    model: &ModelSpec,
-    ids: &GroupIds,
+pub fn fit_with_start(
+    data: &Data<'_>,
+    spec: &ModelSpec,
+    start: &StartValues,
+    opts: &FitOptions,
+) -> Result<Fit, FitError> {
+    validate(data, spec, Some(start), opts)?;
+    Ok(fit_checked(data, spec, Some(start), opts))
+}
+
+/// The fit of [`fit`] and [`fit_with_start`] on inputs [`validate`] accepted.
+/// `pub(crate)` for the callers that refit a model they already know is
+/// valid (the rank-deficiency salvage, the per-term likelihood-ratio refits),
+/// which skip the check.
+pub(crate) fn fit_checked(
+    data: &Data<'_>,
+    spec: &ModelSpec,
     start: Option<&StartValues>,
     opts: &FitOptions,
 ) -> Fit {
-    assert_eq!(
-        x.len(),
-        n * p,
-        "x must have n*p elements in row-major layout"
-    );
-    assert!(x.iter().all(|&v| v.is_finite()), "x must be finite");
-    assert_eq!(y.len(), n, "y must have n elements");
-    assert!(y.iter().all(|&v| v.is_finite()), "y must be finite");
-    assert_model_shape(model, p, opts.nagq);
-    // An EMPTY field means "cold-start this component" — a caller that knows only
-    // one of the two (an R `start = list(theta = …)`, lme4's shape) cannot compute
-    // the other: the cold β seed is a no-RE GLM fit and the cold θ seed is the
-    // blind THETA0 shape, both of which live inside the kernels. So the widths
-    // accepted are {0, exact}, and each consumption site falls back on empty.
-    if let Some(s) = start {
-        assert!(
-            s.beta.is_empty() || s.beta.len() == p,
-            "StartValues.beta must have p elements, or be empty to cold-start β"
-        );
-        assert!(
-            s.beta.iter().all(|v| v.is_finite()),
-            "StartValues.beta must be finite"
-        );
-        let n_theta = theta_width(model.re.as_ref());
-        assert!(
-            s.theta.is_empty() || s.theta.len() == n_theta,
-            "StartValues.theta must have n_theta elements for this RE structure, \
-             or be empty to cold-start θ"
-        );
-        assert!(
-            s.theta.iter().all(|v| v.is_finite()),
-            "StartValues.theta must be finite"
-        );
-        assert!(
-            s.dispersion.is_none_or(|d| d.is_finite() && d > 0.0),
-            "StartValues.dispersion must be finite and > 0, or None to cold-start it"
-        );
-    }
-    // Prior weights: shape/finiteness check at the boundary, not deep in a kernel.
-    if let Some(w) = &opts.weights {
-        assert_eq!(w.len(), n, "FitOptions.weights must have n elements");
-        assert!(
-            w.iter().all(|&v| v.is_finite() && v > 0.0),
-            "FitOptions.weights must be finite and > 0"
-        );
-    }
-    // Offset: shape/finiteness check at the boundary, like weights above.
-    if let Some(o) = &opts.offset {
-        assert_eq!(o.len(), n, "FitOptions.offset must have n elements");
-        assert!(
-            o.iter().all(|&v| v.is_finite()),
-            "FitOptions.offset must be finite"
-        );
-    }
-    // Response domain: refuse a response outside the family's support before
-    // fitting, rather than let the kernel converge on numbers a valid model
-    // could never have produced (a Poisson y < 0 reaching the kernel gives
-    // `converged = true` with logLik −∞). Binomial's `y` is always the
-    // success PROPORTION (`crate::family`'s aggregated convention: row `i` is
-    // `wᵢ` trials with `wᵢ·yᵢ` successes, unit weights ⇒ Bernoulli), so
-    // `0..=1` covers both the raw 0/1 case and "successes above trials".
-    match model.family {
-        Family::Gaussian => {}
-        Family::Poisson { .. } => {
-            assert!(y.iter().all(|&v| v >= 0.0), "Poisson response must be >= 0");
-        }
-        Family::NegativeBinomial { .. } => {
-            assert!(
-                y.iter().all(|&v| v >= 0.0),
-                "negative-binomial response must be >= 0"
-            );
-        }
-        Family::Binomial { .. } => {
-            assert!(
-                y.iter().all(|&v| (0.0..=1.0).contains(&v)),
-                "binomial response (the success proportion) must be in [0, 1]"
-            );
-        }
-        Family::Gamma { .. } => {
-            assert!(y.iter().all(|&v| v > 0.0), "Gamma response must be > 0");
-        }
-        Family::InverseGaussian { .. } => {
-            assert!(
-                y.iter().all(|&v| v > 0.0),
-                "inverse-Gaussian response must be > 0"
-            );
-        }
-    }
+    let Design {
+        x,
+        n,
+        p,
+        ids,
+        weights,
+        ..
+    } = data.design;
+    let y = data.y;
     // Non-integer counts: still fittable (the deviance and score are
     // continuous in y), but the reported numbers describe a distribution that
     // assumes integer counts, so R's `glm` warns instead of refusing —
@@ -1304,25 +1346,13 @@ pub fn fit_warm(
     // successes `y·wᵢ`, not `y` itself. Computed before dispatch so it applies
     // whether the design later aliases columns or not; attached to the
     // returned `Fit` below (and, on the aliased path, by the recursive
-    // `fit_warm` call inside `fit_rank_deficient`, which sees the same `y`).
-    let non_integer_response_rows =
-        count_non_integer_response(y, model.family, opts.weights.as_deref());
-    // Dispersion: refuse a value no family could ever use (a held φ is a
-    // variance-family scale, so it must be a finite positive number). A
-    // family with no φ to hold (Gaussian, Poisson, binomial, NB) just ignores
-    // the field, as the doc above says — the ports already clear it with an
-    // `argument_ignored` warning before it gets here.
-    if let Some(d) = opts.dispersion {
-        assert!(
-            d.is_finite() && d > 0.0,
-            "FitOptions.dispersion must be finite and > 0"
-        );
-    }
+    // `fit_checked` call inside `fit_rank_deficient`, which sees the same `y`).
+    let non_integer_response_rows = count_non_integer_response(y, spec.family, weights);
     // Rank-deficiency salvage: drop fixed-effect columns aliased on earlier
     // columns and fit the reduced model (lme4 behavior — NA coefficient, still
     // converges). Path-agnostic: preprocesses the fixed design X before the
-    // solver dispatch, so it serves OLS/GLM/LMM/GLMM alike. Runs after the shape
-    // asserts (full p still valid) and short-circuits into a reduced re-entry.
+    // solver dispatch, so it serves OLS/GLM/LMM/GLMM alike. Runs after the
+    // input check (full p still valid) and short-circuits into a reduced re-entry.
     // Tests the UNWEIGHTED X'X at `ALIAS_EPS`, i.e. only genuine redundancy —
     // columns indistinguishable in f64, where there is no separate coefficient
     // to estimate. This is the only place a column is ever dropped. A design
@@ -1331,33 +1361,24 @@ pub fn fit_warm(
     if n > 0 && p > 0 {
         let aliased = detect_aliased(x, n, p);
         if aliased.iter().any(|&a| a) {
-            return fit_rank_deficient(x, y, n, p, model, ids, start, opts, &aliased);
+            return fit_rank_deficient(data, spec, start, opts, &aliased);
         }
     }
-    // Dispatch over the unified fit core: classify + allocate the per-shape
-    // workspace, solve on it, map the lean view to the full `Fit`. Fixed-only is
-    // structure-only; mixed derives level counts from the ids. The ids are
-    // validated HERE, ahead of the core's own re-check, so a bad `GroupIds`
-    // faults against the caller's model with the entry's error message rather
-    // than the core's shape-pin panic.
-    // The sizing step may also reorder the groupings (`Perm`), so `sized`/`ids`/
-    // `perm` travel together from here on: the kernel is fed the reordered ids,
-    // and `into_fit` maps the grouping-indexed results back to the order
-    // `model` declares.
-    let (sized, ids, perm) = match model.re.as_ref() {
-        None => (
-            model.clone(),
-            std::borrow::Cow::Borrowed(ids),
-            Perm::IDENTITY,
-        ),
-        Some(re) => {
-            assert_group_ids(re, ids, n);
-            spec_sized_from_ids(model, ids)
-        }
+    // Dispatch over the unified fit core: size the spec from the ids, classify
+    // and allocate the per-shape workspace, solve on it, map the lean view to
+    // the full `Fit`. The workspace owns the ids, so the data handed to
+    // `fit_on` carries none.
+    let no_ids = GroupIds::default();
+    let mut ws = core::build_workspace(spec, ids.unwrap_or(&no_ids), n, p, opts);
+    let rows = Data {
+        design: Design {
+            ids: None,
+            ..data.design
+        },
+        y,
     };
-    let mut ws = core::build_workspace(&sized, perm, n, p, opts);
-    let view = core::fit_on(&mut ws, x, y, &ids, start, opts);
-    let mut fit = view.into_fit(x, y, &ids, n, p, model, opts);
+    let view = core::fit_on(&mut ws, &rows, start, opts);
+    let mut fit = view.into_fit(&rows, spec, opts);
     // After `into_fit`, which is the last read of the kernel's factor for the
     // fit's own outputs: the pass leaves that factor at its last stencil
     // point (on the shifted response), and nothing reads `ws` after it.
@@ -1407,18 +1428,17 @@ pub(crate) enum Solver {
 /// RE-envelope caps — extra-grouping count, primary width `q_p`, per-extra
 /// width `q_g` — are a scratch ceiling, not a model ceiling: over the caps
 /// routes to `Sparse` instead of failing. Fixed-only and nAGQ legality are
-/// handled by `assert_model_shape` (which still runs first and still panics on
-/// true invariant violations).
+/// handled by `check_model_shape` (which runs first and refuses the shapes
+/// no kernel fits).
 ///
 /// On top of the structural caps, slope-carrying extra groupings always route
 /// `Sparse`, and so does a total `Crossed` level count past
 /// `MAX_CROSSED_LEVELS` — see the comments at the clauses.
 ///
-/// The level-count clause reads `Crossed { n_clusters }`, so callers must pass
-/// a spec with REAL counts (`spec_sized_from_ids`) — the formula frontend's
-/// placeholders (`n_clusters: 1`) would never trip it.
-pub(crate) fn classify_design(model: &ModelSpec, _nagq: u8) -> Solver {
-    let Some(re) = model.re.as_ref() else {
+/// The level-count clause reads the crossed counts of `sized`
+/// ([`SizedSpec::extra_counts`]).
+pub(crate) fn classify_design(sized: &SizedSpec, _nagq: u8) -> Solver {
+    let Some(re) = sized.spec.re.as_ref() else {
         return Solver::NoZ; // no random effects ⇒ nothing to make sparse
     };
     let q_p = 1 + re.slopes.len();
@@ -1444,9 +1464,10 @@ pub(crate) fn classify_design(model: &ModelSpec, _nagq: u8) -> Solver {
     let crossed_levels: usize = re
         .extra_groupings
         .iter()
-        .map(|g| match g.relation {
-            GroupingRelation::Crossed { n_clusters } => n_clusters as usize,
-            GroupingRelation::NestedWithin { .. } => 0,
+        .zip(&sized.extra_counts)
+        .map(|(g, &levels)| match g.relation {
+            GroupingRelation::Crossed => levels,
+            GroupingRelation::NestedWithin => 0,
         })
         .sum();
     if over || slope_extras || crossed_levels > crate::consts::MAX_CROSSED_LEVELS {
@@ -1463,8 +1484,6 @@ pub(crate) fn classify_design(model: &ModelSpec, _nagq: u8) -> Solver {
 // loop tier from here.
 // ---------------------------------------------------------------------------
 
-#[cfg(any(test, feature = "loop_advanced"))]
-pub use common::spec_sized_from_ids_pub;
 // The one diagnostics carrier. Always `pub` (it is `FitView::diagnostics`'s
 // return type), re-exported only for the loop tier — the stable path reads it
 // through `Fit`, never directly.
@@ -1490,22 +1509,26 @@ pub(crate) use glmm::fit_glmm_packed;
 #[cfg(test)]
 pub(crate) use lmm::{fit_mle_noz_pub, fit_mle_sparse_pub};
 
-/// Test-only: [`fit_cold`]'s fit of a full-rank mixed design, returned with the
+/// Test-only: [`fit`]'s fit of a full-rank mixed design, returned with the
 /// workspace it ran on, so a test can read what the fit left there
-/// (`FitWorkspace::lmm_parts`).
+/// (`FitWorkspace::lmm_parts`). `data` carries the ids.
 #[cfg(test)]
 pub(crate) fn fit_cold_keep_workspace(
-    x: &[f64],
-    y: &[f64],
-    n: usize,
-    p: usize,
+    data: &Data<'_>,
     model: &ModelSpec,
-    ids: &GroupIds,
     opts: &FitOptions,
 ) -> (Fit, core::FitWorkspace) {
-    let (sized, ids, perm) = spec_sized_from_ids(model, ids);
-    let mut ws = core::build_workspace(&sized, perm, n, p, opts);
-    let fit = core::fit_on(&mut ws, x, y, &ids, None, opts).into_fit(x, y, &ids, n, p, model, opts);
+    let Design { n, p, ids, .. } = data.design;
+    let ids = ids.expect("a mixed design carries its ids");
+    let mut ws = core::build_workspace(model, ids, n, p, opts);
+    let rows = Data {
+        design: Design {
+            ids: None,
+            ..data.design
+        },
+        y: data.y,
+    };
+    let fit = core::fit_on(&mut ws, &rows, None, opts).into_fit(&rows, model, opts);
     (fit, ws)
 }
 

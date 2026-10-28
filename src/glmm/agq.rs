@@ -232,7 +232,7 @@ pub(crate) fn agq_deviance<T: Scalar>(
     pirls_tol_override: Option<f64>,
     n: usize,
     cluster_rows: Option<&ClusterRowIndex>,
-    // Per-row linear-predictor offset (`FitOptions::offset`), forwarded to the
+    // Per-row linear-predictor offset (`Data::offset`), forwarded to the
     // inner `pirls_solve_blocked` call; the node loop below reads it back off
     // the `eta_fixed` that fill leaves, so nothing else here changes. `None` ⇒
     // no offset.
@@ -661,7 +661,7 @@ pub(crate) fn agq_deviance_vec<T: Scalar>(
     pirls_tol_override: Option<f64>,
     n: usize,
     cluster_rows: Option<&ClusterRowIndex>,
-    // Per-row linear-predictor offset (`FitOptions::offset`), forwarded to the
+    // Per-row linear-predictor offset (`Data::offset`), forwarded to the
     // inner `pirls_solve_blocked` call — the node loop below reads it back off
     // the `eta_fixed` that fill leaves. `None` ⇒ no offset.
     offset: Option<&[f64]>,
@@ -924,7 +924,7 @@ pub(crate) fn glmm_agq_deviance(
     nagq: u8,
 ) -> f64 {
     ws.params[..params.len()].copy_from_slice(params);
-    super::workspace::fill_z_f64(&ws.groupings, x, &mut ws.z_buf, n);
+    super::workspace::fill_z_f64(&ws.groupings, x, x.subcols(0, 0), &mut ws.z_buf, n);
     for v in ws.pirls.u.iter_mut() {
         *v = 0.0; // self-contained PIRLS seed (mode is point-determined; seed only shifts iterates)
     }

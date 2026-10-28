@@ -31,12 +31,13 @@
 use bobyqa::{Bobyqa, Config, RestartConfig, Status};
 use faer::{Mat, MatMut, MatRef};
 
+use crate::fit::{CondvarBlocks, CondvarCross, SizedSpec};
 use crate::scalar::Scalar;
 use crate::standardize::ColumnScaling;
 
 mod kernel;
 pub(crate) mod pg_grad;
-mod re_map;
+pub(crate) mod re_map;
 pub(crate) mod satterthwaite;
 #[cfg(test)]
 mod tests;
@@ -73,7 +74,7 @@ pub const THETA_HI: f64 = 1e3;
 /// cells carry the choice.
 pub const RHO_BEGIN: f64 = 0.5;
 /// Initial trust radius of a θ-only search that starts from a caller's θ₀
-/// (`fit_warm`, the `loop_advanced` truth and carry starts): the LMM search and
+/// (`fit_with_start`, the `loop_advanced` truth and carry starts): the LMM search and
 /// GLMM stage 1 after the start guard kept the caller's θ₀. Such a start sits
 /// near the optimum, where a wide first model only re-explores. On aarch64, on
 /// parametric replicates of the grid cells started at the generating θ or at
@@ -186,19 +187,6 @@ pub const PIN_THETA: f64 = 1e-4;
 /// `FitDiagnostics::ill_conditioned`.
 pub const PIVOT_MIN: f64 = 1e-12;
 
-/// BOBYQA config for an n_theta-dimensional θ-search. `Config::new` supplies
-/// the PRIMA default npt = 2n+1 (3 at n = 1); `apply_shipped_schedule` sets
-/// max_fun = 1000·n. Test-only (reached only via the test-gated
-/// [`LmmWorkspace::with_groupings`]); the live path inlines its own config.
-#[cfg(test)]
-pub fn bobyqa_config(n_theta: usize) -> Config {
-    let mut config = Config::new(n_theta);
-    config.rho_begin = RHO_BEGIN;
-    config.rho_end = RHO_END;
-    apply_shipped_schedule(&mut config, n_theta);
-    config
-}
-
 /// Shared tail for all BOBYQA config sites: the evaluation budget, the RESCUE
 /// factor and the restart schedule.
 ///
@@ -287,8 +275,9 @@ pub struct NestedFactor {
 /// declaration order]` (matching data-gen draw order and the truth-start
 /// vector).
 #[derive(Clone)]
+#[cfg_attr(test, derive(Debug, PartialEq))]
 pub struct LmmGroupings {
-    /// Primary level capacity at the sized max_n.
+    /// Primary level count of the sized spec.
     pub n_primary: usize,
     /// Children per parent; 0 = no nested extra (family width 1).
     pub nested_per_parent: usize,
@@ -305,13 +294,15 @@ pub struct LmmGroupings {
     pub primary_q: usize,
     /// `[X y]` row indices of the slope covariates (their x_full design columns),
     /// one per slope in declaration order, used to recover the per-level `q_p×q_p`
-    /// Gram from `s_raw`. Empty iff `primary_q == 1`.
+    /// Gram from `s_raw`. Empty iff `primary_q == 1`. An index `≥ p` names a
+    /// random-effect-only column (`slope_value`).
     pub primary_slope_cols: Vec<usize>,
     /// θ-indices of the diagonal variance components (pinnable), in
     /// `boundary_rate_per_component` order: the `q_p` primary vech diagonals
     /// (column-major — the diagonal of column d sits at offset `Σ_{j<d}(q_p−j)`)
     /// then the extra-grouping scalars. q_p=1 ⇒ `[0, extras…]`; q_p=2 ⇒
-    /// `[0, 2, extras…]`; off-diagonal vech entries excluded. Computed once per
+    /// `[0, 2, extras…]`; off-diagonal vech entries excluded, and so is a
+    /// diagonal in `structural_theta` (a hidden column 0). Computed once per
     /// workspace by `compute_diagonal_theta` (the vech-diagonal walk lives there,
     /// single-sourced) so the per-fit pin loop borrows instead of reallocating.
     pub diagonal_theta: Vec<usize>,
@@ -324,6 +315,14 @@ pub struct LmmGroupings {
     /// below it. Computed once per workspace by `compute_diagonal_run_len`,
     /// the companion walk to `compute_diagonal_theta`.
     pub diagonal_run_len: Vec<usize>,
+    /// θ-indices held at exactly zero by the spec's terms, ascending: the
+    /// entries between two terms of one block, and the whole column 0 of a
+    /// block with no intercept term. Empty when no grouping has `terms`.
+    pub(crate) structural_theta: Vec<usize>,
+    /// Per block, primary then extras in declaration order: true when the
+    /// block has no intercept term, so its column 0 is an idle RE dimension
+    /// (its θ entries are structural) that no output reports.
+    pub(crate) hidden: Vec<bool>,
     /// Solver-path gate: true iff any extra grouping carries a random slope
     /// (`q_g > 1`). The scalar tail in `reml_deviance` stays byte-identical when
     /// false; the blocked per-factor `Λ_g` tail is taken when true.
@@ -345,14 +344,22 @@ pub struct LmmGroupings {
 /// declaration order) contributes its `q` diagonal entries (column-major: the
 /// diagonal of column d sits at offset `Σ_{j<d}(q−j)` within the factor's vech
 /// block), and the next factor's block starts `q(q+1)/2` θ-slots later. With
-/// every extra `q == 1` this is `[primary diagonals, base+0, base+1, …]`.
-fn compute_diagonal_theta(primary_q: usize, extra_qs: &[usize]) -> Vec<usize> {
+/// every extra `q == 1` this is `[primary diagonals, base+0, base+1, …]`. A
+/// diagonal in `structural` (ascending) is held at zero, not a variance
+/// component, and is left out.
+fn compute_diagonal_theta(
+    primary_q: usize,
+    extra_qs: &[usize],
+    structural: &[usize],
+) -> Vec<usize> {
     let mut idx = Vec::with_capacity(primary_q + extra_qs.len());
     let mut start = 0usize;
     for &q in std::iter::once(&primary_q).chain(extra_qs.iter()) {
         let mut off = start;
         for d in 0..q {
-            idx.push(off);
+            if structural.binary_search(&off).is_err() {
+                idx.push(off);
+            }
             off += q - d; // advance past column d's vech block (length q−d)
         }
         start += q * (q + 1) / 2; // next factor's vech block
@@ -363,33 +370,86 @@ fn compute_diagonal_theta(primary_q: usize, extra_qs: &[usize]) -> Vec<usize> {
 /// Companion walk to `compute_diagonal_theta`, single source of truth for
 /// `LmmGroupings::diagonal_run_len`: for each diagonal, `q − d` where `d` is
 /// its column within its `q`-wide vech block. Must walk the same
-/// `(primary_q, extra_qs)` factor/column loop as `compute_diagonal_theta` —
+/// `(primary_q, extra_qs)` factor/column loop, and leave out the same
+/// structural diagonals, as `compute_diagonal_theta` —
 /// the two are kept as separate loops rather than one returning both, so a
 /// future edit to the walk itself has to be made in two obviously-named
 /// functions instead of silently drifting between a tuple and a caller
 /// working out which half is which.
-fn compute_diagonal_run_len(primary_q: usize, extra_qs: &[usize]) -> Vec<usize> {
+fn compute_diagonal_run_len(
+    primary_q: usize,
+    extra_qs: &[usize],
+    structural: &[usize],
+) -> Vec<usize> {
     let mut run_len = Vec::with_capacity(primary_q + extra_qs.len());
+    let mut start = 0usize;
     for &q in std::iter::once(&primary_q).chain(extra_qs.iter()) {
+        let mut off = start;
         for d in 0..q {
-            run_len.push(q - d);
+            if structural.binary_search(&off).is_err() {
+                run_len.push(q - d);
+            }
+            off += q - d;
         }
+        start += q * (q + 1) / 2;
     }
     run_len
 }
 
+/// Appends to `structural` the θ-indices of one `q`-wide block, its vech at
+/// `start`, that its `terms` hold at zero, and returns whether its column 0
+/// is hidden. Block column 0 belongs to the intercept term, and the slope
+/// columns `1..q` to the terms in order, each taking `term.slopes.len()`
+/// (the spec check makes the terms agree with the block's `slopes`). An entry
+/// `(r, c)` is structural when block columns `r` and `c` belong to different
+/// terms, and every entry of column 0 is when no term holds the intercept.
+/// Empty `terms` is one unstructured term: nothing is appended.
+fn block_mask(
+    q: usize,
+    terms: &[crate::ReTerm],
+    start: usize,
+    structural: &mut Vec<usize>,
+) -> bool {
+    if terms.is_empty() {
+        return false;
+    }
+    let mut owner: Vec<Option<usize>> = vec![None; q];
+    owner[0] = terms.iter().position(|t| t.intercept);
+    let mut col = 1;
+    for (j, t) in terms.iter().enumerate() {
+        for _ in &t.slopes {
+            owner[col] = Some(j);
+            col += 1;
+        }
+    }
+    debug_assert_eq!(col, q, "terms disagree with the block width");
+    let mut off = start;
+    for c in 0..q {
+        for r in c..q {
+            if owner[c].is_none() || owner[r] != owner[c] {
+                structural.push(off);
+            }
+            off += 1;
+        }
+    }
+    block_hidden(terms)
+}
+
+/// Whether a block with these `terms` hides its column 0: some term is
+/// declared and none holds the intercept. Empty `terms` is one unstructured
+/// term with the intercept.
+pub(crate) fn block_hidden(terms: &[crate::ReTerm]) -> bool {
+    !terms.is_empty() && !terms.iter().any(|t| t.intercept)
+}
+
 impl LmmGroupings {
-    /// Structure for a (validated) ClusterSpec at workspace size max_n.
-    /// validate() guarantees ≤ 1 nested entry and crossed ⇒ FixedClusters.
-    /// `slope_cols` are the x_full column indices for the primary slopes
-    /// (`spec.cluster_slope_design_cols` as usize); pass `&[]` for callers without slopes.
-    pub fn from_cluster_spec(
-        cluster: &crate::ModelSpec,
-        max_n: usize,
-        slope_cols: &[usize],
-    ) -> Self {
+    /// Structure for a (validated) sized spec: at most one nested grouping
+    /// (`fit`'s model-shape gate). `slope_cols` are the x_full column indices
+    /// for the primary slopes; pass `&[]` for callers without slopes.
+    #[cfg(test)]
+    pub(crate) fn from_cluster_spec(sized: &SizedSpec, slope_cols: &[usize]) -> Self {
         // Intercept-only extras (or layout-only callers): no extra-slope x-cols.
-        Self::from_cluster_spec_ext(cluster, max_n, slope_cols, &[])
+        Self::from_cluster_spec_ext(sized, slope_cols, &[])
     }
 
     /// As [`Self::from_cluster_spec`], plus the resolved `[X y]` column indices of each
@@ -398,22 +458,19 @@ impl LmmGroupings {
     /// `ModelSpec` (`1 + gs.slopes.len()`); these only supply the x-columns the
     /// suff-stats weight by. `extra_slope_cols` shorter than the extra count, or
     /// an empty inner vec, means that grouping is intercept-only.
-    pub fn from_cluster_spec_ext(
-        cluster: &crate::ModelSpec,
-        max_n: usize,
+    pub(crate) fn from_cluster_spec_ext(
+        sized: &SizedSpec,
         slope_cols: &[usize],
         extra_slope_cols: &[Vec<usize>],
     ) -> Self {
         use crate::GroupingRelation;
         // RE-path constructor: only built for mixed models, so `re` is present.
-        let re = cluster
+        let re = sized
+            .spec
             .re
             .as_ref()
             .expect("LmmGroupings::from_cluster_spec_ext requires re: Some (mixed model)");
-        // Sole cluster-count formula in the crate: it rounds up under `FixedSize`,
-        // which keeps a partial trailing parent's ids in range (production N is an
-        // atom multiple; tests may not be).
-        let n_primary = re.sizing.n_clusters_at(max_n);
+        let n_primary = sized.n_primary.max(1);
         let q_p = 1 + slope_cols.len();
         // Width-general layout: the primary block is `q_p · n_primary` wide
         // ([intercept 0..S | slope_0 S..2S | … | slope_{q-2}]), and the
@@ -451,9 +508,8 @@ impl LmmGroupings {
         let mut nested = None;
         let mut extra_offsets = vec![0usize; n_extras];
         for (g, gs) in re.extra_groupings.iter().enumerate() {
-            if let GroupingRelation::NestedWithin { n_per_parent } = gs.relation {
-                // `.max(1)` clamp mirrored by `fit::core`'s capacity pin — change together.
-                nested_per_parent = (n_per_parent).max(1) as usize;
+            if gs.relation == GroupingRelation::NestedWithin {
+                nested_per_parent = sized.extra_counts[g].max(1);
                 nested = Some(NestedFactor {
                     vech_start: vech_starts[g],
                     q: extra_qs[g],
@@ -465,14 +521,11 @@ impl LmmGroupings {
         // Nested children are q_nested RE columns each (q_nested == 1 ⇒ a
         // single indicator column).
         let q_nested = nested.map(|nf| nf.q).unwrap_or(0);
-        // Nested block width mirrored by `fit::core`'s capacity pin — change together.
         let mut off = prim_width + n_primary * nested_per_parent * q_nested;
         let mut crossed = Vec::new();
         for (g, gs) in re.extra_groupings.iter().enumerate() {
-            if let GroupingRelation::Crossed { n_clusters } = gs.relation {
-                // Crossed level count + `.max(1)` mirrored by `fit::core`'s capacity
-                // pin — change together.
-                let k = (n_clusters).max(1) as usize;
+            if gs.relation == GroupingRelation::Crossed {
+                let k = sized.extra_counts[g].max(1);
                 let q_g = extra_qs[g];
                 crossed.push(CrossedFactor {
                     vech_start: vech_starts[g],
@@ -483,6 +536,18 @@ impl LmmGroupings {
                 extra_offsets[g] = off;
                 off += k * q_g; // q_g RE columns per crossed level
             }
+        }
+        // Walked in θ order, so `structural_theta` comes out ascending.
+        let mut structural_theta = Vec::new();
+        let mut hidden = Vec::with_capacity(1 + n_extras);
+        hidden.push(block_mask(q_p, &re.terms, 0, &mut structural_theta));
+        for (g, gs) in re.extra_groupings.iter().enumerate() {
+            hidden.push(block_mask(
+                extra_qs[g],
+                &gs.terms,
+                vech_starts[g],
+                &mut structural_theta,
+            ));
         }
         let extra_slopes_any = extra_qs.iter().any(|&q| q > 1);
         // Per-grouping slope x-cols, declaration order, padded to the extra count
@@ -504,8 +569,10 @@ impl LmmGroupings {
             k_total: off,
             primary_q: q_p,
             primary_slope_cols: slope_cols.to_vec(),
-            diagonal_theta: compute_diagonal_theta(q_p, &extra_qs),
-            diagonal_run_len: compute_diagonal_run_len(q_p, &extra_qs),
+            diagonal_theta: compute_diagonal_theta(q_p, &extra_qs, &structural_theta),
+            diagonal_run_len: compute_diagonal_run_len(q_p, &extra_qs, &structural_theta),
+            structural_theta,
+            hidden,
             extra_slopes_any,
             extra_q: extra_qs,
             extra_slope_cols,
@@ -550,6 +617,23 @@ impl LmmGroupings {
     /// `diagonal_theta` field doc for the column-major vech layout.
     pub fn diagonal_theta(&self) -> &[usize] {
         &self.diagonal_theta
+    }
+
+    /// The structural θ-indices (see the `structural_theta` field), ascending.
+    pub(crate) fn structural_theta(&self) -> &[usize] {
+        &self.structural_theta
+    }
+
+    /// θ entries the search moves: [`Self::n_theta`] less the structural ones.
+    pub(crate) fn n_free_theta(&self) -> usize {
+        self.n_theta() - self.structural_theta.len()
+    }
+
+    /// Sets every structural entry of a full-layout `theta` to zero.
+    pub(crate) fn zero_structural(&self, theta: &mut [f64]) {
+        for &i in &self.structural_theta {
+            theta[i] = 0.0;
+        }
     }
 
     /// Blind θ₀ and per-component boxes. Diagonal vech entries (the q_p primary
@@ -972,6 +1056,23 @@ impl LmmKernel {
         }
     }
 
+    /// The kernel-coordinate blocks `Fit::condvar`, `Fit::condvar_x` and
+    /// `Fit::condvar_cross` are assembled from, at the θ̂ the last evaluation
+    /// factored ([`condvar_family`]). Allocates its own buffers and leaves the
+    /// kernel's untouched. `None` where they are not computed: the sparse
+    /// kernel, the blocked crossed/nested-slopes path, an empty design, or a
+    /// factor that is not positive definite.
+    pub(crate) fn condvar_blocks(&self, theta: &[f64]) -> Option<CondvarBlocks> {
+        let LmmKernel::Dense { suff, fit } = self else {
+            return None;
+        };
+        let g = &suff.groupings;
+        if g.extra_slopes_any || g.k_total == 0 || suff.n_rows == 0 {
+            return None;
+        }
+        condvar_family(theta, suff, &fit.tail)
+    }
+
     /// Drop any `û` a previous fit on this workspace left, so [`Self::ranef_u`]
     /// reports none for a fit that reached no endpoint.
     pub(crate) fn invalidate_recovery(&mut self) {
@@ -1086,31 +1187,27 @@ pub struct LmmWorkspace {
 }
 
 impl LmmWorkspace {
-    /// Allocates a workspace for a single-intercept grouping at `max_clusters`.
-    /// Test-only since the retirement of the raw `LmmWorkspace` loop surface —
+    /// Dense workspace for a single-intercept grouping at `max_clusters`. Test-only;
     /// the live core path builds through [`Self::for_cluster_spec_ext`].
     #[cfg(test)]
     pub fn new(p: usize, max_clusters: usize) -> Self {
-        let spec = crate::test_support::intercept_only_spec(crate::Sizing::FixedClusters {
-            n_clusters: max_clusters as u32,
-        });
-        Self::with_groupings(p, LmmGroupings::from_cluster_spec(&spec, max_clusters, &[]))
+        let sized = SizedSpec {
+            spec: crate::test_support::intercept_only_spec(),
+            n_primary: max_clusters,
+            extra_counts: vec![],
+        };
+        Self::for_cluster_spec(p, &sized, &[])
     }
 
-    /// Workspace for a validated non-degenerate ClusterSpec at max_n. Carries
+    /// Workspace for a validated non-degenerate sized spec. Carries
     /// the blind θ start and its BOBYQA schedule (`RHO_BEGIN`, `RHO_END`).
     /// `slope_cols` are the x_full column indices for the primary slopes
     /// (`spec.cluster_slope_design_cols` as usize); pass `&[]` for callers without slopes.
     /// Test-only convenience over [`Self::for_cluster_spec_ext`] (the live path);
     /// no production caller constructs a raw `LmmWorkspace` directly.
     #[cfg(test)]
-    pub fn for_cluster_spec(
-        p: usize,
-        cluster: &crate::ModelSpec,
-        max_n: usize,
-        slope_cols: &[usize],
-    ) -> Self {
-        Self::for_cluster_spec_ext(p, cluster, max_n, slope_cols, &[], false)
+    pub(crate) fn for_cluster_spec(p: usize, sized: &SizedSpec, slope_cols: &[usize]) -> Self {
+        Self::for_cluster_spec_ext(p, sized, slope_cols, &[], false)
     }
 
     /// As [`for_cluster_spec`], plus each extra grouping's resolved slope x-columns
@@ -1122,17 +1219,17 @@ impl LmmWorkspace {
     /// Solver::Sparse` on the live path, and the sparse kernel is a superset of
     /// the dense one, so a caller may pass `true` on an in-envelope design to
     /// cross-check the two at the same θ schedule.
-    pub fn for_cluster_spec_ext(
+    pub(crate) fn for_cluster_spec_ext(
         p: usize,
-        cluster: &crate::ModelSpec,
-        max_n: usize,
+        sized: &SizedSpec,
         slope_cols: &[usize],
         extra_slope_cols: &[Vec<usize>],
         sparse: bool,
     ) -> Self {
-        let groupings =
-            LmmGroupings::from_cluster_spec_ext(cluster, max_n, slope_cols, extra_slope_cols);
-        let n_theta = groupings.n_theta();
+        let groupings = LmmGroupings::from_cluster_spec_ext(sized, slope_cols, extra_slope_cols);
+        // The search runs on the free θ (`search_theta`), so its solver is
+        // sized by them; `theta` and the box keep the full layout.
+        let n_theta = groupings.n_free_theta();
         // npt: ⌈1.5n⌉+1 from n_theta = 3 up, Powell's 2n+1 below: the mid model
         // wins on every measured dim ≥ 3
         // (n=3 lmm_slope 1.06x / crossed_nested 1.05x, n=6 multislope 1.10x —
@@ -1182,37 +1279,6 @@ impl LmmWorkspace {
         }
     }
 
-    /// Allocates the suff-stats accumulator, fit scratch, and BOBYQA solver
-    /// state for the given grouping shape, once per problem shape. Test-only;
-    /// production code reaches this only via [`Self::new`].
-    #[cfg(test)]
-    pub fn with_groupings(p: usize, groupings: LmmGroupings) -> Self {
-        let n_theta = groupings.n_theta();
-        let fit = Box::new(LmmFitScratch::with_groupings(p, &groupings));
-        let (theta, lower, upper) = groupings.blind_theta_and_bounds();
-        LmmWorkspace {
-            kernel: LmmKernel::Dense {
-                suff: Box::new(LmmSuffStats::with_groupings(p, groupings)),
-                fit,
-            },
-            recovery: LmmRecovery::new(p),
-            // The constants are valid by construction for the crate's checks
-            // (npt default within bounds; box width 1e3 ≥ 2·RHO_BEGIN), so a
-            // failure here is an engine bug, not a runtime branch.
-            solver: Bobyqa::new(n_theta, bobyqa_config(n_theta))
-                .expect("BOBYQA config constants are valid by construction"),
-            solver_warm: None,
-            bfgs: Default::default(),
-            config: bobyqa_config(n_theta),
-            theta,
-            lower,
-            upper,
-            weight_scale: 1.0,
-            w_scaled: Vec::new(),
-            pass_scratch: None,
-        }
-    }
-
     /// The dense kernel's accumulated sufficient statistics. Panics on a sparse
     /// workspace, which has none.
     #[cfg(test)]
@@ -1231,6 +1297,24 @@ impl LmmWorkspace {
             LmmKernel::Dense { fit, .. } => fit,
             LmmKernel::Sparse { .. } => panic!("sparse LMM workspace has no fit scratch"),
         }
+    }
+}
+
+/// Row `i`'s value of slope index `c`: column `c` of the `n × p` design `x`
+/// when `c < p`, else column `c − p` of the `n × s` random-effect-only
+/// columns `z` (`Data::re_columns`).
+#[inline]
+pub(crate) fn slope_value(
+    x: MatRef<'_, f64>,
+    z: MatRef<'_, f64>,
+    p: usize,
+    i: usize,
+    c: usize,
+) -> f64 {
+    if c < p {
+        x[(i, c)]
+    } else {
+        z[(i, c - p)]
     }
 }
 
@@ -1296,7 +1380,13 @@ pub(crate) fn canonicalize_pinned_blocks(g: &LmmGroupings, theta: &mut [f64]) ->
         // stack scratch below would not hold the block; only the sparse route
         // builds those, so such a block keeps whatever representative the
         // optimizer stopped at.
-        if (2..=MAX_PRIMARY_Q).contains(&q) && canonicalize_block(&mut theta[start..start + len], q)
+        if (2..=MAX_PRIMARY_Q).contains(&q)
+            && canonicalize_block(
+                &mut theta[start..start + len],
+                q,
+                start,
+                &g.structural_theta,
+            )
         {
             changed = true;
         }
@@ -1401,17 +1491,19 @@ pub(crate) fn fix_mode_signs(
 }
 
 /// One block of [`canonicalize_pinned_blocks`]: `vech` is that block's
-/// column-major lower-triangular vech slice and `2 ≤ q ≤ MAX_PRIMARY_Q` its
-/// width. Returns whether any entry moved.
-fn canonicalize_block(vech: &mut [f64], q: usize) -> bool {
+/// column-major lower-triangular vech slice, `2 ≤ q ≤ MAX_PRIMARY_Q` its
+/// width and `start` its θ offset, against which `structural` (the
+/// groupings' structural θ) is read. Returns whether any entry moved.
+fn canonicalize_block(vech: &mut [f64], q: usize, start: usize, structural: &[usize]) -> bool {
     // With no diagonal at the pin threshold Λ is already the unique Cholesky
     // factor of its own Σ and the factorization below would only reproduce it
     // up to round-off. Returning early instead leaves every non-singular fit's
-    // Λ bit-for-bit as the optimizer returned it.
+    // Λ bit-for-bit as the optimizer returned it. A structural diagonal (a
+    // hidden column 0) is zero by the model, not pinned, so it does not count.
     let mut off = 0usize;
     let mut any_pinned = false;
     for d in 0..q {
-        any_pinned |= vech[off] <= PIN_THETA;
+        any_pinned |= vech[off] <= PIN_THETA && structural.binary_search(&(start + off)).is_err();
         off += q - d;
     }
     if !any_pinned {
@@ -1928,6 +2020,260 @@ fn recover_ranef_family(
     true
 }
 
+/// Back-substitution `v ← L⁻ᵀv` against a family's row-major lower `w×w`
+/// factor (`fam_a` after `block_chol`).
+fn fam_back_solve(fam_a: &[f64], w: usize, v: &mut [f64]) {
+    for r in (0..w).rev() {
+        let mut acc = v[r];
+        for i in (r + 1)..w {
+            acc -= fam_a[i * w + r] * v[i];
+        }
+        v[r] = acc / fam_a[r * w + r];
+    }
+}
+
+/// The per-level blocks of `A⁻¹` and `A⁻¹C_X` on the family-blocked path at
+/// `theta`, for `LmmKernel::condvar_blocks`. `A = Λ̃ᵀZ̃ᵀZ̃Λ̃ + I` (the rows
+/// of `Z̃` and `X̃` carry `√ŵ`, as the statistics do) is
+/// `[[F, B], [Bᵀ, T]]` with `F` block-diagonal over the families and `T` the
+/// crossed block, and `C_X = Λ̃ᵀZ̃ᵀX̃`. With `S = T − BᵀF⁻¹B` and
+/// `W_f = F_f⁻¹B_f`, a family's block of `A⁻¹` is `F_f⁻¹ + W_fS⁻¹W_fᵀ` and the
+/// crossed blocks are those of `S⁻¹`; `A⁻¹C_X` is the conditional-mode
+/// back-substitution of [`recover_ranef_family`] with the `p` columns of
+/// `C_X` for the one right-hand side. `F_f` and `B_f` are rebuilt as there;
+/// `tail` (the downdated tail the last evaluation left, unfactored) holds
+/// `S` and the crossed rows of `L⁻¹C_X`. The `C_X` columns are mapped from
+/// `X̃ = X·U⁻¹` to the standardized `X` (`DesignQr::row_times_u`).
+///
+/// Returns the blocks in `Fit::ranef`'s level order (primary `q_p×q_p`, then
+/// each extra's `1×1`), the `p`-wide rows of `A⁻¹C_X` in the same order, and
+/// on a model with extra groupings the pieces `assemble_condvar_cross` takes:
+/// each family's whole block of `A⁻¹`, `S⁻¹`, and `W_f` on the crossed
+/// columns it is not zero on. `None` when a factor is not positive definite.
+fn condvar_family(theta: &[f64], suff: &LmmSuffStats, tail: &[f64]) -> Option<CondvarBlocks> {
+    let g = &suff.groupings;
+    let m = suff.m;
+    let p = m - 1;
+    let k = g.k_total;
+    let kf = g.k_family();
+    let kx = g.k_crossed();
+    let t_dim = kx + m;
+    let np = g.nested_per_parent;
+    let q_p = g.primary_q;
+    let w = q_p + np;
+    let n_prim = g.n_primary;
+    let th_p = theta[0];
+    let th_n = g.nested.map(|nf| theta[nf.vech_start]).unwrap_or(0.0);
+    let slope = q_p > 1;
+    let mut prim_lam = vec![0.0f64; q_p * q_p];
+    let mut prim_gram = vec![0.0f64; q_p * q_p];
+    if slope {
+        primary_lambda(theta, q_p, &mut prim_lam);
+    }
+    let lam_x: Vec<f64> = g
+        .crossed
+        .iter()
+        .flat_map(|cf| std::iter::repeat_n(theta[cf.vech_start], cf.n_levels))
+        .collect();
+
+    // Diagonal of A⁻¹ at each scalar RE column, and `A⁻¹C_X` row-major k×p.
+    let mut diag = vec![0.0f64; k];
+    let mut ainv_cx = vec![0.0f64; k * p];
+    // S's factor L_c, its inverse (column-major, `linv[b·kx + i] = (L_c⁻¹)_ib`)
+    // and the crossed rows of `A⁻¹C_X`, `L_c⁻ᵀ` applied to those of `L⁻¹C_X`.
+    let mut linv = vec![0.0f64; kx * kx];
+    let mut kc = vec![0.0f64; kx * p];
+    let mut cross = (!g.extra_offsets.is_empty()).then(|| CondvarCross {
+        coupling_at: vec![0],
+        ..CondvarCross::default()
+    });
+    if kx > 0 {
+        let tail_ref = faer::MatRef::from_column_major_slice(&tail[..t_dim * t_dim], t_dim, t_dim);
+        let chol = crate::linalg::SeqLlt::new(tail_ref)?;
+        let l = chol.L();
+        for b in 0..kx {
+            let col = &mut linv[b * kx..(b + 1) * kx];
+            col[b] = 1.0 / l[(b, b)];
+            for i in (b + 1)..kx {
+                let acc: f64 = (b..i).map(|j| l[(i, j)] * col[j]).sum();
+                col[i] = -acc / l[(i, i)];
+            }
+            diag[kf + b] = col[b..].iter().map(|v| v * v).sum();
+        }
+        let mut v = vec![0.0f64; kx];
+        for j in 0..p {
+            for (b, vb) in v.iter_mut().enumerate() {
+                *vb = l[(kx + j, b)];
+            }
+            for b in (0..kx).rev() {
+                let mut acc = v[b];
+                for i in (b + 1)..kx {
+                    acc -= l[(i, b)] * v[i];
+                }
+                v[b] = acc / l[(b, b)];
+            }
+            for (b, &vb) in v.iter().enumerate() {
+                kc[b * p + j] = vb;
+            }
+        }
+        ainv_cx[kf * p..].copy_from_slice(&kc);
+        if let Some(c) = cross.as_mut() {
+            // S⁻¹ = L_c⁻ᵀL_c⁻¹, column-major; column `a` of `L_c⁻¹` is zero
+            // above row `a`.
+            c.tail = vec![0.0f64; kx * kx];
+            for b in 0..kx {
+                for a in b..kx {
+                    let v: f64 = (a..kx).map(|i| linv[a * kx + i] * linv[b * kx + i]).sum();
+                    c.tail[b * kx + a] = v;
+                    c.tail[a * kx + b] = v;
+                }
+            }
+        }
+    }
+
+    let mut prim_blocks = vec![0.0f64; n_prim * q_p * q_p];
+    let mut fam_a = vec![0.0f64; w * w];
+    let mut bt = vec![0.0f64; w * t_dim];
+    // Per family: L_f⁻¹ (column-major), W_f (row-major w×kx), Y = L_c⁻¹W_fᵀ
+    // (column-major kx×w), one right-hand side.
+    let mut finv = vec![0.0f64; w * w];
+    let mut wf = vec![0.0f64; w * kx];
+    let mut y = vec![0.0f64; kx * w];
+    let mut v = vec![0.0f64; w];
+    for f in 0..n_prim {
+        assemble_fam_a(
+            &mut fam_a,
+            &mut prim_gram,
+            &prim_lam,
+            suff,
+            f,
+            w,
+            th_p,
+            th_n,
+            slope,
+        );
+        if !crate::linalg::block_chol(&mut fam_a[..w * w], w) {
+            return None;
+        }
+        assemble_fam_b(
+            &mut bt, &lam_x, &prim_lam, suff, f, t_dim, kx, slope, th_p, th_n,
+        );
+        fam_forward_solve(&mut bt, t_dim, w, &fam_a);
+        // `bt` row r: [L_f⁻¹B_f | L_f⁻¹C_X,f | y part], each t_dim long.
+        for c in 0..w {
+            let col = &mut finv[c * w..(c + 1) * w];
+            col.fill(0.0);
+            col[c] = 1.0 / fam_a[c * w + c];
+            for i in (c + 1)..w {
+                let acc: f64 = (c..i).map(|j| fam_a[i * w + j] * col[j]).sum();
+                col[i] = -acc / fam_a[i * w + i];
+            }
+        }
+        for b in 0..kx {
+            for r in 0..w {
+                v[r] = bt[r * t_dim + b];
+            }
+            fam_back_solve(&fam_a, w, &mut v);
+            for r in 0..w {
+                wf[r * kx + b] = v[r];
+            }
+        }
+        // Y[:, r] = L_c⁻¹·W_f[r, :]ᵀ, over the crossed levels W_f touches.
+        y.fill(0.0);
+        for r in 0..w {
+            let yr = &mut y[r * kx..(r + 1) * kx];
+            for b in 0..kx {
+                let wrb = wf[r * kx + b];
+                if wrb == 0.0 {
+                    continue;
+                }
+                for i in b..kx {
+                    yr[i] += linv[b * kx + i] * wrb;
+                }
+            }
+        }
+        let entry = |r: usize, s: usize| -> f64 {
+            let fi: f64 = (r.max(s)..w)
+                .map(|i| finv[r * w + i] * finv[s * w + i])
+                .sum();
+            let gi: f64 = (0..kx).map(|i| y[r * kx + i] * y[s * kx + i]).sum();
+            fi + gi
+        };
+        for r in 0..q_p {
+            for s in 0..q_p {
+                prim_blocks[f * q_p * q_p + r * q_p + s] = entry(r, s);
+            }
+        }
+        for c in 0..np {
+            diag[q_p * n_prim + f * np + c] = entry(q_p + c, q_p + c);
+        }
+        if let Some(c) = cross.as_mut() {
+            for r in 0..w {
+                c.family.extend((0..w).map(|s| entry(r, s)));
+            }
+            for b in 0..kx {
+                if (0..w).any(|r| wf[r * kx + b] != 0.0) {
+                    c.coupling_cols.push(b as u32);
+                    c.coupling.extend((0..w).map(|r| wf[r * kx + b]));
+                }
+            }
+            c.coupling_at.push(c.coupling_cols.len() as u32);
+        }
+        // A⁻¹C_X rows of the family: L_f⁻ᵀ(L_f⁻¹C_X,f − (L_f⁻¹B_f)·A⁻¹C_X,c).
+        for j in 0..p {
+            for r in 0..w {
+                let row = &bt[r * t_dim..(r + 1) * t_dim];
+                let mut acc = row[kx + j];
+                for b in 0..kx {
+                    if row[b] != 0.0 {
+                        acc -= row[b] * kc[b * p + j];
+                    }
+                }
+                v[r] = acc;
+            }
+            fam_back_solve(&fam_a, w, &mut v);
+            for (r, &vr) in v.iter().enumerate() {
+                // RE-column layout of `recover_ranef_family`'s scatter.
+                let col = if r < q_p {
+                    r * n_prim + f
+                } else {
+                    q_p * n_prim + f * np + (r - q_p)
+                };
+                ainv_cx[col * p + j] = vr;
+            }
+        }
+    }
+    for row in ainv_cx.chunks_mut(p.max(1)) {
+        suff.design_qr.row_times_u(row);
+    }
+
+    // `Fit::ranef`'s level order: the primary levels, then each extra's (a
+    // nested grouping over its padded child grid).
+    let levels = |e: usize| match g.nested {
+        Some(nf) if nf.decl == e => n_prim * np,
+        _ => g
+            .crossed
+            .iter()
+            .find(|cf| cf.decl == e)
+            .map_or(0, |cf| cf.n_levels),
+    };
+    let mut blocks = prim_blocks;
+    let mut rows = Vec::with_capacity(k * p);
+    for f in 0..n_prim {
+        for r in 0..q_p {
+            let col = r * n_prim + f;
+            rows.extend_from_slice(&ainv_cx[col * p..(col + 1) * p]);
+        }
+    }
+    for (e, &off) in g.extra_offsets.iter().enumerate() {
+        for l in 0..levels(e) {
+            blocks.push(diag[off + l]);
+            rows.extend_from_slice(&ainv_cx[(off + l) * p..(off + l + 1) * p]);
+        }
+    }
+    Some((blocks, rows, cross))
+}
+
 // ---------------------------------------------------------------------------
 // fit_lmm — BOBYQA θ-search + once-at-θ̂ recovery.
 // ---------------------------------------------------------------------------
@@ -2157,7 +2503,9 @@ pub(crate) fn search_theta(
 ) {
     use crate::optim::bfgs::{bfgs_minimize, BfgsConfig, BfgsStop};
     use crate::optim::{bobyqa_minimize, OuterOptimizer};
-    let n = theta.len();
+    // The search runs on the free θ; the structural entries stay zero.
+    let structural = kernel.groupings().structural_theta().to_vec();
+    let n = kernel.groupings().n_free_theta();
     let route = lmm_outer_optimizer(kernel, n);
     let mut obj = LmmObjective {
         kernel,
@@ -2173,7 +2521,7 @@ pub(crate) fn search_theta(
                 solver
             };
             (
-                bobyqa_minimize(s, &mut obj, theta, lower, upper),
+                bobyqa_minimize(s, &mut obj, theta, lower, upper, &structural),
                 false,
                 false,
                 None,
@@ -2181,7 +2529,16 @@ pub(crate) fn search_theta(
         }
         OuterOptimizer::Bfgs => {
             let h0 = hint.filter(|h| h.dim() == n).map(|h| h.inv_hessian());
-            let bo = bfgs_minimize(&mut obj, theta, lower, upper, &BfgsConfig::LMM, bfgs, h0);
+            let bo = bfgs_minimize(
+                &mut obj,
+                theta,
+                lower,
+                upper,
+                &BfgsConfig::LMM,
+                bfgs,
+                h0,
+                &structural,
+            );
             let report = Some((bo.stop, bo.n_grad, bo.decrement));
             if bo.certified(theta, obj.kernel.groupings().diagonal_theta()) {
                 let out = bobyqa::Outcome {
@@ -2197,7 +2554,7 @@ pub(crate) fn search_theta(
             } else {
                 warm_bobyqa(solver_warm, config, n)
             };
-            let mut out = bobyqa_minimize(s, &mut obj, theta, lower, upper);
+            let mut out = bobyqa_minimize(s, &mut obj, theta, lower, upper, &structural);
             out.n_eval += bo.n_val;
             (out, !polish, false, report)
         }
@@ -2222,9 +2579,11 @@ pub(crate) fn lmm_curvature_hint(ws: &mut LmmWorkspace) -> Option<crate::optim::
         upper,
         ..
     } = ws;
-    if lmm_outer_optimizer(kernel, theta.len()) != crate::optim::OuterOptimizer::Bfgs {
+    let n_free = kernel.groupings().n_free_theta();
+    if lmm_outer_optimizer(kernel, n_free) != crate::optim::OuterOptimizer::Bfgs {
         return None;
     }
+    let structural = kernel.groupings().structural_theta().to_vec();
     let mut counters = crate::counters::EvalCounters::new();
     let mut finite = 0usize;
     let mut obj = LmmObjective {
@@ -2233,7 +2592,7 @@ pub(crate) fn lmm_curvature_hint(ws: &mut LmmWorkspace) -> Option<crate::optim::
         finite_evals: &mut finite,
         last_finite: false,
     };
-    crate::optim::CurvatureHint::from_gradients(theta, lower, upper, |x, g| {
+    crate::optim::CurvatureHint::from_gradients(theta, lower, upper, &structural, |x, g| {
         obj.value(x, 0.0);
         obj.gradient(g)
     })
@@ -2260,8 +2619,9 @@ pub(crate) fn per_group_gradient_armed(kernel: &LmmKernel) -> bool {
 
 /// The outer optimizer a fit's θ search runs: BFGS where the per-group
 /// regression route is armed for this dataset, which admits random slopes on
-/// the primary grouping only (`q_p ≥ 2`, so `n_θ ≥ 3`), and BOBYQA everywhere
-/// else. A function of the shape and the data's level
+/// the primary grouping only (`q_p ≥ 2`, so `n_θ ≥ 3` on an unstructured
+/// block), and BOBYQA everywhere else. `n_theta` counts the free θ, the
+/// search's dimension. A function of the shape and the data's level
 /// Grams, not of the start or the criterion: cold and warm fits, REML and
 /// ML, route alike, and on BFGS the search minimizes the kernel's criterion
 /// with that criterion's gradient.
@@ -2369,6 +2729,8 @@ pub fn fit_lmm(
             }
         }
     }
+    // A start's structural entries are ignored: the search never moves them.
+    kernel.groupings().zero_structural(theta);
     let mut counters = crate::counters::EvalCounters::new();
     // mirrors the stage-1 read in glmm/mod.rs — change together.
     let mut finite_evals = 0usize;
@@ -2416,6 +2778,8 @@ pub fn fit_lmm(
     // non-negative diagonals. Mirror the GLMM pin site — change together.
     if has_endpoint {
         fix_column_signs(kernel.groupings(), theta);
+        // A negated column carries its structural zeros as −0.
+        kernel.groupings().zero_structural(theta);
     }
     let diag = kernel.groupings().diagonal_theta();
     let mut pinned = false;
@@ -2441,6 +2805,8 @@ pub fn fit_lmm(
         // site departs from this on its AGQ route, and undoes a pin that
         // raises the deviance; the reasons are written there.
         if canonicalize_pinned_blocks(kernel.groupings(), theta) {
+            // The refactor's zeros between independent terms can be −0.
+            kernel.groupings().zero_structural(theta);
             pinned = false;
             pinned_components = 0;
             for (k, &ti) in diag.iter().enumerate() {

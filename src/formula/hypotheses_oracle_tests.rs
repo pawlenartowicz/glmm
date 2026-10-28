@@ -17,6 +17,7 @@
 //! part's quantities on a reference compared here fails when it did not fire
 //! or when it also lists a quantity outside that part.
 
+use crate::test_support::fit_warm_wo;
 use faer::Mat;
 use serde_json::Value;
 
@@ -77,8 +78,19 @@ fn nonmarginal_f_matches_anova() {
         .find(|e| e.name == "anova_nonmarginal_sim_factorial")
         .expect("the non-marginal anova entry is registered");
     let json = test_refs::load(Kind::Anova, &e.name);
-    let lo = lowered(&e);
-    let fit = crate::fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+    let (lo, fit_opts) = lowered(&e);
+    let fit = fit_warm_wo(
+        &lo.x,
+        &lo.y,
+        lo.n,
+        lo.p,
+        &lo.model,
+        &lo.ids,
+        None,
+        lo.weights.as_deref(),
+        lo.offset.as_deref(),
+        &fit_opts,
+    );
     assert!(fit.converged(), "the fit converges");
     assert!(fit.aliased().iter().all(|&a| !a), "full rank");
     let all: Vec<usize> = (0..lo.p).collect();
@@ -138,11 +150,11 @@ fn per_term_f_matches_anova() {
             Some(Value::String(twin)) => test_refs::load(Kind::Lmertest, twin),
             _ => json.clone(),
         };
-        let lo = lowered(&e);
+        let (lo, fit_opts) = lowered(&e);
         let beta = numbers(&fit_json["beta"], name);
 
         // At lme4's θ̂, with lme4's β̂ (a function of θ̂ alone).
-        let kept = at_lme4_theta(name, &lo, &fit_json, |kept, ws, map, theta| {
+        let kept = at_lme4_theta(name, &lo, &fit_opts, &fit_json, |kept, ws, map, theta| {
             let routes = routes(ws);
             if routes.contains(&DerivRoute::GradientDiff) {
                 per_group.push(name.to_string());
@@ -208,7 +220,18 @@ fn per_term_f_matches_anova() {
         });
 
         // End to end, at the crate's own θ̂.
-        let fit = crate::fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+        let fit = fit_warm_wo(
+            &lo.x,
+            &lo.y,
+            lo.n,
+            lo.p,
+            &lo.model,
+            &lo.ids,
+            None,
+            lo.weights.as_deref(),
+            lo.offset.as_deref(),
+            &fit_opts,
+        );
         assert!(fit.converged(), "{name}: the fit converges");
         assert_eq!(
             Some(fit.reml),

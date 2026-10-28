@@ -15,8 +15,11 @@
 An object of class \code{"summary.fastglmm"} with \code{coefficients}
 (\code{Estimate}, \verb{Std. Error}, \code{df} on a Gaussian mixed model, then
 \verb{t value} and \verb{Pr(>|t|)}, or \verb{z value} and \verb{Pr(>|z|)}), \code{criterion},
-\code{scaled_residuals} (\code{NULL} when the fit did not converge) and
-\code{corr_fixed} (\code{NULL} when there is one coefficient).
+\code{scaled_residuals} (\code{NULL} when the fit did not converge),
+\code{corr_fixed} (\code{NULL} when there is one coefficient) and \code{effect_sizes}
+(the named values \code{marginal_r2}, \code{conditional_r2} and \code{adjusted_icc} of
+the R-squared line, \code{NULL} when it is left out or points to \code{\link[=r2]{r2()}}) and
+\code{r2_need_refit} (\code{TRUE} when it points to \code{\link[=r2]{r2()}} and \code{\link[=icc]{icc()}}).
 }
 \description{
 lme4's blocks in lme4's order: method line, formula, data, the criterion
@@ -46,4 +49,14 @@ model fit by maximum likelihood", and \code{print()} and \code{summary()} print 
 note on a line of its own directly under the title: "Note: p-values can be
 somewhat anticonservative." It is a printed note, not a warning, and cannot
 be switched off. REML, OLS, GLM and GLMM fits print no note.
+
+A mixed model gets one line under the number of observations with its
+marginal and conditional R-squared and its adjusted intraclass correlation,
+as \code{performance::r2_nakagawa} and \code{performance::icc} compute them, to
+three decimals: \verb{Marginal R2: 0.412, conditional R2: 0.705, adjusted ICC: 0.498}. The values are computed when the summary is made. A Poisson or
+negative binomial GLMM gets instead the line \verb{R2 and ICC need a refit of the null model: call r2(fit) and icc(fit)}, so a summary never refits. The line
+is left out where the values are \code{NaN} (a Gamma model with a link other
+than log, an inverse-Gaussian model, a fit that did not converge) and on a
+fit saved by a version that did not keep its training data. \code{\link[=r2]{r2()}} and
+\code{\link[=icc]{icc()}} give all four values.
 }

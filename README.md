@@ -47,7 +47,7 @@ install.packages("fastglmm", repos = c("https://pawlenartowicz.r-universe.dev", 
 
 ## Validation
 
-glmm is checked on 923 test models before every release. They cover the
+glmm is checked on 947 test models before every release. They cover the
 Gaussian, binomial, Poisson, Gamma and negative binomial families, random
 intercepts, correlated slopes, nested and crossed groupings, and data from 60 to
 30,000 rows. Each model is also fitted by lme4, glmmTMB, MixedModels.jl and
@@ -115,8 +115,9 @@ Each of these choices, and how it differs from lme4 and MixedModels.jl, is in
 | negative binomial | log | yes |
 | inverse Gaussian | log, inverse squared | no, GLM only |
 
-- **Random effects:** random intercepts, correlated random slopes, and several
-  grouping factors, nested or crossed.
+- **Random effects:** random intercepts, correlated or uncorrelated random
+  slopes (`||`), intercept-free blocks, and several grouping factors, nested or
+  crossed.
 - **Linear mixed models:** REML (the default) or maximum likelihood.
 - **Generalized linear mixed models:** the Laplace approximation (the default)
   or adaptive quadrature. Adaptive quadrature works on binomial, Poisson,
@@ -126,6 +127,12 @@ Each of these choices, and how it differs from lme4 and MixedModels.jl, is in
 - **Tests:** tests of the fixed terms, and comparison of two nested models
   (`anova` and `compare` in the Python and R packages), described in
   [`hypothesis-tests.md`](documentation/hypothesis-tests.md).
+- **After a test:** pairwise comparisons between the levels of a factor
+  (`pairwise`, Holm-adjusted by default), partial η², marginal and conditional
+  R², and the ICC.
+- **Prediction and simulation:** predictions on new data, with standard errors
+  and intervals on request, the conditional variances of the random effects,
+  and simulated responses from a fitted model.
 
 Details per family are in
 [`supported_families.md`](documentation/supported_families.md).
@@ -139,7 +146,7 @@ Details per family are in
 | `loop_advanced` | off | Unstable. A low-level API for refitting one model many times, as in a simulation loop. |
 
 For the kernel only, with no formula parser and no `regex`, turn the defaults
-off: `glmm = { version = "0.6", default-features = false }`. Details are in
+off: `glmm = { version = "0.7", default-features = false }`. Details are in
 [`installation.md`](documentation/installation.md).
 
 ## WASM and stability
@@ -150,7 +157,7 @@ wheel of the Python package is attached to each
 model fitted on Linux, on macOS or in WebAssembly gives the same fit: across the
 test models the log-likelihoods differ by at most 3e-7.
 
-glmm is in beta. Semver covers `fit_cold`, `fit_warm`, `ModelSpec` and
+glmm is in beta. Semver covers `fit`, `fit_with_start`, `Data`, `ModelSpec` and
 `GroupIds`. The `formula` frontend stays outside it until 1.0.0, and
 `loop_advanced` has no semver guarantee. The minimum supported Rust version is
 1.85.

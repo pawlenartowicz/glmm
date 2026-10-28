@@ -113,9 +113,9 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "commonstats"
-version = "0.2.2"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c1779773f7b9a8102504c8f81f59fee44dedd28491c6013c9f4811940bb7c6d"
+checksum = "835364f47bd1a84ea69698d93d8dbd5ff5f910d8b109d651d9d7cd4d70424237"
 dependencies = [
  "libm",
  "rand_philox",
@@ -534,7 +534,7 @@ checksum = "e629b9b98ef3dd8afe6ca2bd0f89306cec16d43d907889945bc5d6687f2f13c7"
 
 [[package]]
 name = "glmm"
-version = "0.6.2"
+version = "0.7.0"
 dependencies = [
  "bobyqa",
  "commonstats",
@@ -550,7 +550,7 @@ dependencies = [
 
 [[package]]
 name = "glmm-python"
-version = "0.6.2"
+version = "0.7.0"
 dependencies = [
  "glmm",
  "pyo3",
@@ -558,7 +558,7 @@ dependencies = [
 
 [[package]]
 name = "glmm-r"
-version = "0.6.2"
+version = "0.7.0"
 dependencies = [
  "extendr-api",
  "glmm",
@@ -1491,7 +1491,7 @@ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
 name = "validation"
-version = "0.6.2"
+version = "0.7.0"
 dependencies = [
  "glmm",
  "libc",

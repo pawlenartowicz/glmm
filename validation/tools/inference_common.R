@@ -20,20 +20,26 @@
 #      as tools/goldens_agq.R does, and sources this file from there;
 #   2. calls inference_setup() at top level, before any other work (it may
 #      re-execute the script and exit; see the function);
-#   3. calls assert_inference_versions();
+#   3. calls assert_inference_versions(), then assert_extra_versions(<pkgs>) on
+#      any further package it uses, keeping the names it returns;
 #   4. loops over select_entries(<kind>), one reference per entry, reading an
-#      entry's `data` with read_entry_data(entry) (which applies its `factors`);
-#   5. attaches provenance(<its own file name>) to each result, as `provenance`;
-#   6. writes it with write_reference(obj, file.path(suite_dir, "goldens",
+#      entry's `data` with read_entry_data(entry) (which applies its `factors`)
+#      and fitting an entry's `members` with fit_member (or fit_member_sum, the
+#      same fit with contr.sum on named factors), both built on member_call and
+#      family_call;
+#   5. attaches provenance(<its own file name>, extra = <those names>) to each
+#      result, as `provenance`;
+#   6. stops on a number that is not finite (check_finite) before it writes the
+#      result with write_reference(obj, file.path(suite_dir, "goldens",
 #      "inference", <kind>, paste0(<name>, ".json"))), which sets `name`.
 
 INFERENCE_THREAD_VARS <- c("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS",
                            "MKL_NUM_THREADS", "FLEXIBLAS_NUM_THREADS")
 INFERENCE_PKGS <- c("lmerTest", "RLRsim", "car", "numDeriv", "MASS", "jsonlite")
-INFERENCE_KINDS <- c("lmertest", "rlrt", "anova")
+INFERENCE_KINDS <- c("lmertest", "rlrt", "anova", "predict", "posthoc", "effectsize")
 
 # This file's own directory (validation/tools), recorded while source() runs it,
-# by the same sys.frame(i)$ofile walk as grid/tol.R::tol_suite_dir. The
+# by the same sys.frame(i)$ofile walk as grid/runs.R::runs_script_dir. The
 # functions below locate validation/ from it, never from the working directory
 # or `--file=`, so they also work for a caller outside validation/.
 INFERENCE_COMMON_DIR <- local({
@@ -102,6 +108,35 @@ assert_inference_versions <- function() {
   invisible(NULL)
 }
 
+# The packages `pkgs` a generator uses beyond the ones above, against
+# grid/versions.json; a mismatch stops the run. Returns `pkgs`, the list that
+# generator hands to provenance(extra = ...).
+assert_extra_versions <- function(pkgs) {
+  grid_dir <- file.path(dirname(INFERENCE_COMMON_DIR), "grid")
+  source(file.path(grid_dir, "engines", "versions.R"), local = TRUE)
+  V <- grid_versions(grid_dir)
+  for (pkg in pkgs) assert_pkg_version(pkg, V[[pkg]])
+  pkgs
+}
+
+# Stops unless every number in `x` (a nested list) is finite and no leaf holds
+# an NA, so no Inf, NaN or NA reaches a JSON. `name` and `path` label the leaf.
+check_finite <- function(x, name, path = "") {
+  if (is.list(x)) {
+    keys <- names(x)
+    for (i in seq_along(x)) {
+      key <- if (is.null(keys) || !nzchar(keys[i])) as.character(i) else keys[i]
+      check_finite(x[[i]], name, paste0(path, "/", key))
+    }
+  } else if (anyNA(x) || (is.numeric(x) && !all(is.finite(x)))) {
+    stop(sprintf("%s: %s is not finite", name, path), call. = FALSE)
+  }
+  invisible(x)
+}
+
+# tools/goldens_glm_band.py has a Python copy of provenance, write_reference and
+# select_entries; change it together with these three.
+#
 # What produced a reference, in a fixed key order. No date and no host name, so a
 # re-run on the same machine is byte-identical. `extra` names packages beyond
 # lme4 and the six pins that the generator also uses (e.g. "glmmTMB").
@@ -178,4 +213,59 @@ select_entries <- function(kind) {
     cat(sprintf("skip %s (pending_reference: %s)\n", e$name, e$pending_reference))
   }
   entries[!pending]
+}
+
+# The family call of a member, in the grid's family spelling.
+family_call <- function(family, link) {
+  fun <- switch(family, gaussian = "gaussian", binomial = "binomial", poisson = "poisson",
+                gamma = "Gamma", stop("family_call: unsupported family ", family))
+  str2lang(sprintf('%s(link = "%s")', fun, link))
+}
+
+# The call that fits member `mem` on `data`, and the environment to evaluate it
+# in (holding `data`, so update() inside ranova finds it). Built as a call, not
+# by do.call, so the model's stored call names the weights column.
+member_call <- function(mem, data) {
+  env <- new.env(parent = globalenv())
+  env$data <- data
+  f <- as.formula(mem$formula, env = env)
+  w <- if (is.null(mem$weights)) NULL else as.name(mem$weights)
+  ctrl <- if (is.null(mem$tolPwrss)) NULL else
+    bquote(lme4::glmerControl(tolPwrss = .(mem$tolPwrss)))
+  cl <- switch(mem$fun,
+    "lme4::lmer" = bquote(lme4::lmer(.(f), data = data, REML = .(mem$REML), weights = .(w))),
+    "stats::lm" = bquote(stats::lm(.(f), data = data, weights = .(w))),
+    "stats::glm" = bquote(stats::glm(.(f), family = .(family_call(mem$family, mem$link)),
+                                     data = data, weights = .(w))),
+    "lme4::glmer" = bquote(lme4::glmer(.(f), family = .(family_call(mem$family, mem$link)),
+                                       data = data, weights = .(w), nAGQ = .(mem$nAGQ),
+                                       control = .(ctrl))),
+    "MASS::glm.nb" = {
+      if (!identical(mem$link, "log")) stop("member_call: glm.nb is fitted with its log link")
+      bquote(MASS::glm.nb(.(f), data = data, weights = .(w)))
+    },
+    "lme4::glmer.nb" = {
+      if (!identical(mem$link, "log")) stop("member_call: glmer.nb is fitted with its log link")
+      bquote(lme4::glmer.nb(.(f), data = data, weights = .(w), nAGQ = .(mem$nAGQ),
+                            control = .(ctrl)))
+    },
+    "glmmTMB::glmmTMB" = bquote(glmmTMB::glmmTMB(.(f),
+                                                 family = .(family_call(mem$family, mem$link)),
+                                                 data = data, weights = .(w),
+                                                 REML = .(mem$REML))),
+    stop("member_call: unsupported fun ", mem$fun))
+  list(call = cl, env = env)
+}
+
+fit_member <- function(mem, data) {
+  mc <- member_call(mem, data)
+  eval(mc$call, mc$env)
+}
+
+# Member `mem` refitted with contr.sum on the factor columns `cols`: the call of
+# fit_member plus `contrasts`.
+fit_member_sum <- function(mem, data, cols) {
+  mc <- member_call(mem, data)
+  mc$call$contrasts <- setNames(rep(list("contr.sum"), length(cols)), cols)
+  eval(mc$call, mc$env)
 }

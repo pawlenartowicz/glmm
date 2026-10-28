@@ -22,7 +22,7 @@ More in the [project README](https://github.com/pawlenartowicz/glmm#readme).
 
 ## Validation
 
-The glmm engine is checked on 923 test models before every release. They cover
+The glmm engine is checked on 947 test models before every release. They cover
 the Gaussian, binomial, Poisson, Gamma and negative binomial families, random
 intercepts, correlated slopes, nested and crossed groupings, and data from 60 to
 30,000 rows. Each model is also fitted by lme4, glmmTMB, MixedModels.jl and
@@ -122,6 +122,8 @@ confint(fit)     # Wald intervals on the summary's t or z quantiles
 isSingular(fit)  # boundary-fit flag, lme4's condition
 anova(fit)       # tests of the fixed terms (Type III)
 compare(data, y ~ x1, y ~ x1 + (1 | subject))  # two nested models, fitted and compared
+pairwise(fit, "f")   # pairwise comparisons of the levels of factor f (Holm)
+predict(fit, newdata = new_data)  # predictions on new rows
 ```
 
 `nAGQ = k` (odd, up to 25) turns on adaptive quadrature for binomial, Poisson,

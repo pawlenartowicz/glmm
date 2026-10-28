@@ -1,0 +1,38 @@
+{
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0",
+      "glmmTMB": "1.1.14"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_predict.R"
+  },
+  "coef": {
+    "names": ["(Intercept)", "gb", "gc", "hq", "x", "gb:hq", "gc:hq"],
+    "values": [10.2329742116452, 1.15470015576249, -0.607444700573635, 0.739387038713701, 0.715574223311813, 0.267405227609978, -0.751744926532528]
+  },
+  "predict": {
+    "population": {
+      "link": [12.9727099417734, 11.5506045584009, 10.1914149312948, 11.9659176754497, 10.8112175196872, 10.2037728191136, 15.9021241806422, 14.4800187972698, 13.1208291701636, 14.8953319143186, 13.7406317585561, 13.1331870579824],
+      "response": [12.9727099417734, 11.5506045584009, 10.1914149312948, 11.9659176754497, 10.8112175196872, 10.2037728191136, 15.9021241806422, 14.4800187972698, 13.1208291701636, 14.8953319143186, 13.7406317585561, 13.1331870579824]
+    }
+  },
+  "unseen_rows": [],
+  "default_errors": [],
+  "name": "predict_ols_sim_factorial"
+}

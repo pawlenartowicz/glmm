@@ -5,10 +5,10 @@ use super::{ContrastError, ContrastNote, NoDfReason};
 use crate::fit::common_tests::lcg;
 use crate::fit::fit_cold_keep_workspace;
 use crate::inference::tails::t_two_sided_p;
+use crate::test_support::fit_cold;
 use crate::test_support::intercept_only_spec;
-use crate::{
-    fit_cold, BinomialLink, Family, Fit, FitOptions, GroupIds, ModelSpec, Note, ReStructure, Sizing,
-};
+use crate::SeFor;
+use crate::{BinomialLink, Data, Family, Fit, FitOptions, GroupIds, ModelSpec, Note, ReStructure};
 
 /// `y ~ 1 + x1 + x2 + (1 | g)`: 10 groups of 4 to 9 rows, an interior REML
 /// fit whose df lie well inside `(0, N − p)`. With `dup_at = Some(k)`, a
@@ -40,12 +40,12 @@ fn lmm_data(dup_at: Option<usize>) -> (Vec<f64>, Vec<f64>, GroupIds, usize, usiz
 }
 
 fn lmm_model() -> ModelSpec {
-    intercept_only_spec(Sizing::FixedClusters { n_clusters: 1 })
+    intercept_only_spec()
 }
 
 fn all_targets(p: usize) -> FitOptions {
     FitOptions {
-        target_indices: (0..p as u32).collect(),
+        se_for: SeFor::Only((0..p as u32).collect()),
         ..FitOptions::default()
     }
 }
@@ -161,7 +161,7 @@ fn contrast_on_glmm_is_no_df() {
             link: BinomialLink::Logit,
         },
         re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 1 },
+            terms: Vec::new(),
             slopes: vec![],
             extra_groupings: vec![],
         }),
@@ -216,7 +216,8 @@ fn into_fit_without_pass_is_state_missing() {
             reml,
             ..all_targets(p)
         };
-        let (fit, _) = fit_cold_keep_workspace(&x, &y, n, p, &lmm_model(), &ids, &opts);
+        let (fit, _) =
+            fit_cold_keep_workspace(&Data::new(&x, &y, n, p).ids(&ids), &lmm_model(), &opts);
         assert_eq!(fit.reml, reml.is_none(), "reml {reml:?}");
         assert!(
             fit.satterthwaite.as_ref().is_some_and(|st| st.is_not_run()),
@@ -240,7 +241,7 @@ fn coef_df_nan_outside_targets() {
     let one = lmm_fit(
         None,
         &FitOptions {
-            target_indices: vec![1],
+            se_for: SeFor::Only(vec![1]),
             ..FitOptions::default()
         },
     );
@@ -298,7 +299,7 @@ fn rank_deficient_middle_column_maps_through_retained() {
 }
 
 /// A Gaussian LMM with no finite endpoint records a failed pass without
-/// running one: the `p = 0` refusal through `fit_warm`, and a design whose
+/// running one: the `p = 0` refusal through the fit entry, and a design whose
 /// aliased column is a random slope (`fit_rank_deficient`'s unfittable
 /// return). Both give the note with `nonfinite` and `NoDf(Failed)`; switched
 /// off, the latter gives `Disabled` and no note.

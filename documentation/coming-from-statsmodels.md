@@ -43,8 +43,8 @@ See [`formula.md`](formula.md) for the full accepted/rejected grammar.
 `glmm`'s Python surface is small on purpose: `glmm.fit`, `glmm.Fit` (the
 result type — returned by `fit`, never constructed by the caller), and the
 warning categories the diagnostics channel raises (`DiagnosticWarning` and
-its subclasses, such as `IllConditionedWarning`, `PirlsExhaustedWarning`,
-`UnusedGroupingLevelsWarning` and `HessianSeFallbackWarning`; `glmm.__all__`
+its subclasses, such as `IllConditionedWarning`, `PirlsExhaustedWarning`
+and `HessianSeFallbackWarning`; `glmm.__all__`
 lists them all).
 
 ## `MixedLM` is REML by default too, and both switch to ML the same way
@@ -88,7 +88,7 @@ rather than lumping everything into one "blocked" bucket.
 |---|---|---|
 | `.random_effects` (dict of per-group BLUPs) | `.ranef` / `.ranef_levels` | `fit.random_effects` raises `AttributeError: 'Fit' object has no attribute 'random_effects'` (verified) — the name doesn't exist. The conditional modes themselves do, under `.ranef`/`.ranef_levels`. |
 | `.fittedvalues` | `.fitted` | Same story: `AttributeError` on the statsmodels name (verified); `.fitted` holds the in-sample μ̂ per row. |
-| `.predict(new_data)` | — | `AttributeError: 'Fit' object has no attribute 'predict'` (verified) — no method under this or any other name. This is the one clean, total loss in this table: there is no out-of-sample prediction on any path, converged or not. |
+| `.predict(new_data)` | `.predict(newdata)` | Exists. The default is the link scale (`type="response"` for μ), and `newdata=None` predicts the training rows. A level the fit did not see gets a random effect of 0 and a `NewGroupingLevelsWarning`. |
 | `.bse` | `.se` | Exists, just renamed — the `(p,)` array of Wald standard errors. |
 | `.pvalues` | `.coef_p` (t tests only) | Where `summary()` tests with t (a Gaussian mixed model on its Satterthwaite df, OLS and the gamma and inverse-gaussian GLMs on `n - p`), `fit.coef_p` holds the kernel's two-sided p-values and `fit.coef_df` the df. Where it tests with z, `coef_p` is `NaN` and `summary()` computes Wald z/p on the fly (`z = beta/se`, `p = erfc(\|z\|/sqrt(2))`); recompute that from `.beta`/`.se` if you need the numbers back. |
 | `.aic` | `.aic` (and `.bic`) | Properties, computed on every fit: `-2 * fit.loglik + 2 * fit.df` (`.bic`: `+ fit.df * log(fit.nobs)`). Unlike `MixedLM`, a REML fit gets a number, not `nan`: it is built on the REML criterion, so (per the section above) it compares only fits with the same fixed effects. To compare fixed-effect specifications, fit both models with `reml=False`. |

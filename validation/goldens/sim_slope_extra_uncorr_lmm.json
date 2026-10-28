@@ -1,0 +1,41 @@
+{
+  "name": "sim_slope_extra_uncorr_lmm",
+  "engine": "lme4::lmer",
+  "engine_version": "2.0.6",
+  "kind": "lmm",
+  "data": "sim_slope_extra",
+  "family": "gaussian",
+  "link": {},
+  "nagq": 1,
+  "tolPwrss": {},
+  "r_formula": "y ~ 1 + x + (1 + x | g1) + (1 + x || g2)",
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)", "x"],
+  "estimates": {
+    "beta": [1.13072299148004, 0.500651152867005],
+    "se": [0.286261647225, 0.169338642005892],
+    "loglik": -494.165836983331,
+    "varcomp": [
+      {
+        "group": "g1",
+        "terms": ["(Intercept)", "x"],
+        "stddev": [1.14590545444812, 0.631036926225108],
+        "corr": [
+          [1, 0.193079423881508],
+          [0.193079423881508, 1]
+        ]
+      },
+      {
+        "group": "g2",
+        "terms": ["(Intercept)", "x"],
+        "stddev": [0.640231220079788, 0.399099755381653],
+        "corr": [
+          [1, 0],
+          [0, 1]
+        ]
+      }
+    ],
+    "sigma": 0.70892695526966
+  }
+}

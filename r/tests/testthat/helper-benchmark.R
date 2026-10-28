@@ -1,7 +1,7 @@
 # Data generators shaped like the Li & Signorelli harness: numeric
 # time grid t, Bernoulli(0.4) treatment d, grouping g; random intercept or
-# intercept + t slope. Used by both the unit tests and the gate-5 acceptance
-# test against glmer.
+# intercept + t slope. Used by the unit tests and by
+# r/tools/acceptance-vs-lme4.R, the acceptance test against glmer.
 
 benchmark_data <- function(seed, n_g = 60L, m = 10L,
                            beta = c(-0.5, 0.7, 0.4, 0.2),

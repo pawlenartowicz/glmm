@@ -52,12 +52,11 @@ pub(crate) struct OlsWorkspace {
     panel_x: Vec<f64>,
     panel_y: Vec<f64>,
     // √wᵢ-scaled design / offset-shifted-and-scaled response, n_max-sized.
-    // `scaled_x` is read only on the weighted branch (`:91-99` below); gated
-    // 0×0 when the build is unweighted (`has_weights` is frozen at build, so
-    // the workspace knows at construction whether the buffer can ever be
-    // read). 0×0 rather than `.max(1)`, deliberately: a read on a route that
-    // is supposed to have none must panic on the bounds check, not silently
-    // return a zero.
+    // `scaled_x` is read only on the weighted branch of `fit_ols_prebuilt`,
+    // which sizes it on its first weighted call, so an unweighted loop never
+    // allocates it. 0×0 until then rather than `.max(1)`, deliberately: a read
+    // on a route that is supposed to have none must panic on the bounds check,
+    // not silently return a zero.
     scaled_x: Mat<f64>,
     scaled_y: Vec<f64>,
     /// The fixed-effect factor `U` of an ill-conditioned design
@@ -66,7 +65,7 @@ pub(crate) struct OlsWorkspace {
 }
 
 impl OlsWorkspace {
-    pub(crate) fn new(n_max: usize, p: usize, t: usize, has_weights: bool) -> Self {
+    pub(crate) fn new(n_max: usize, p: usize, t: usize) -> Self {
         let n1 = n_max.max(1);
         let p1 = p.max(1); // guard zero-column degenerate call
         let t1 = t.max(1);
@@ -83,11 +82,7 @@ impl OlsWorkspace {
             // panel buffers: PANEL_ROWS * p1 is always sufficient (see PANEL_ROWS).
             panel_x: vec![0.0f64; PANEL_ROWS * p1],
             panel_y: vec![0.0f64; PANEL_ROWS],
-            scaled_x: if has_weights {
-                Mat::<f64>::zeros(n1, p1)
-            } else {
-                Mat::<f64>::zeros(0, 0)
-            },
+            scaled_x: Mat::<f64>::zeros(0, 0),
             scaled_y: vec![0.0f64; n1],
             design_qr: crate::lmm::DesignQr::identity(p1),
         }
@@ -109,13 +104,16 @@ impl OlsWorkspace {
 /// statistics are accumulated again on `X·U⁻¹` (`lmm::DesignQr`, a QR of
 /// `√W·X`), as the LMM kernels do; a well-conditioned design keeps the direct
 /// path.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn fit_ols_prebuilt<'a>(
     ws: &'a mut OlsWorkspace,
     x_mat: faer::MatRef<'_, f64>,
     y: &[f64],
+    weights: Option<&[f64]>,
+    offset: Option<&[f64]>,
     n: usize,
     p: usize,
-    opts: &FitOptions,
+    targets: &[u32],
     map: &ColumnScaling,
 ) -> OlsFitView<'a> {
     // Reset accumulators — a reused ws must not carry the prior fit's sums.
@@ -129,10 +127,14 @@ pub(crate) fn fit_ols_prebuilt<'a>(
     // only when weighted. Effective x/y point at ws.scaled_* (weighted/offset) or
     // straight at the caller's buffers (unweighted, no offset → bit-identical to
     // passing x_mat/y directly).
-    let weighted = opts.weights.is_some();
-    let offset = opts.offset.is_some();
+    let weighted = weights.is_some();
+    let has_offset = offset.is_some();
     let x_eff = if weighted {
-        let w = opts.weights.as_ref().unwrap();
+        let w = weights.unwrap();
+        if ws.scaled_x.nrows() == 0 {
+            // `scaled_y` is `n_max` long, the row capacity of the workspace.
+            ws.scaled_x = Mat::<f64>::zeros(ws.scaled_y.len(), p.max(1));
+        }
         for i in 0..n {
             let s = w[i].sqrt();
             for j in 0..p {
@@ -143,11 +145,11 @@ pub(crate) fn fit_ols_prebuilt<'a>(
     } else {
         x_mat
     };
-    let y_eff: &[f64] = if weighted || offset {
+    let y_eff: &[f64] = if weighted || has_offset {
         for i in 0..n {
-            let yi = y[i] - opts.offset.as_ref().map_or(0.0, |o| o[i]);
+            let yi = y[i] - offset.map_or(0.0, |o| o[i]);
             ws.scaled_y[i] = if weighted {
-                yi * opts.weights.as_ref().unwrap()[i].sqrt()
+                yi * weights.unwrap()[i].sqrt()
             } else {
                 yi
             };
@@ -224,7 +226,7 @@ pub(crate) fn fit_ols_prebuilt<'a>(
         suff_yty,
         suff_sum_y,
         suff_n_rows,
-        &opts.target_indices,
+        targets,
         ws.suff_xtx_work.as_mut(),
         scratch,
         map,
@@ -249,6 +251,8 @@ pub(crate) fn ols_view_to_fit(
     beta: Vec<f64>,
     x: &[f64],
     y: &[f64],
+    weights: Option<&[f64]>,
+    offset: Option<&[f64]>,
     n: usize,
     p: usize,
     opts: &FitOptions,
@@ -259,11 +263,11 @@ pub(crate) fn ols_view_to_fit(
     let diag = view.diagnostics();
     let converged = diag.converged;
     let mut se = vec![f64::NAN; p];
-    fill_se_compact(view.var_diag, &opts.target_indices, &mut se);
+    fill_se_compact(view.var_diag, &opts.se_for.columns(p), &mut se);
     // `view.factor` is stale-or-zero unless `converged` (its documented
     // contract) — a non-converged fit reports an all-NaN vcov, as `se` does.
     let vcov = if converged {
-        vcov_from_chol(view.factor, p, &opts.target_indices, view.sigma_sq, map)
+        vcov_from_chol(view.factor, p, &opts.se_for.columns(p), view.sigma_sq, map)
     } else {
         nan_vcov(p)
     };
@@ -276,20 +280,17 @@ pub(crate) fn ols_view_to_fit(
     let (fitted, loglik) = if converged && n > 0 {
         let fitted: Vec<f64> = (0..n)
             .map(|i| {
-                let o = opts.offset.as_ref().map_or(0.0, |o| o[i]);
+                let o = offset.map_or(0.0, |o| o[i]);
                 o + (0..p).map(|j| x[i * p + j] * beta[j]).sum::<f64>()
             })
             .collect();
         let rss: f64 = (0..n)
             .map(|i| {
                 let r = y[i] - fitted[i];
-                opts.weights.as_ref().map_or(1.0, |w| w[i]) * r * r
+                weights.map_or(1.0, |w| w[i]) * r * r
             })
             .sum();
-        let sum_log_w = opts
-            .weights
-            .as_ref()
-            .map_or(0.0, |w| w.iter().map(|v| v.ln()).sum());
+        let sum_log_w = weights.map_or(0.0, |w| w.iter().map(|v| v.ln()).sum());
         let ll = if reml {
             // `ln|XᵀWX| + (n − p)·ln(RSS_w/(n − p)) − Σ ln wᵢ` on the caller's
             // X: the deviance a REML Gaussian LMM with this fixed part reports
@@ -329,7 +330,7 @@ pub(crate) fn ols_view_to_fit(
         p,
         view.sigma_sq,
         map,
-        &opts.target_indices,
+        &opts.se_for.columns(p),
         converged,
     );
 
@@ -363,6 +364,9 @@ pub(crate) fn ols_view_to_fit(
         fitted,
         ranef: vec![],
         ranef_levels: vec![],
+        condvar: vec![],
+        condvar_x: vec![],
+        condvar_cross: None,
         coef_df,
         satterthwaite: Some(satterthwaite),
         design_summary: None,

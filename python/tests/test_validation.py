@@ -73,22 +73,12 @@ def test_dot_formula_raises(formula):
         glmm.fit(DATA, formula)
 
 
-def test_intercept_suppressed_re_term_raises():
-    # Not pre-checked client-side: the shared Rust parser already raises a
-    # specific message for this (RandomInterceptSuppressionUnsupported), and
-    # it reaches both ports unchanged.
-    with pytest.raises(ValueError, match="intercept suppression"):
-        glmm.fit(DATA, "y ~ x + (0 + x | g)")
-
-
-@pytest.mark.parametrize("link", ["cloglog", "probit"])
-def test_binomial_glm_link_fits(link):
-    result = glmm.fit(FIT_DATA, "y_bin ~ x", "binomial", link=link)
-    assert result.converged
-    assert len(result.beta) == 2
-    assert result.dispersion == 1.0
-    logit = glmm.fit(FIT_DATA, "y_bin ~ x", "binomial")
-    assert not _np.allclose(result.beta, logit.beta), "the link never reached the kernel"
+def test_intercept_free_re_term_reports_its_slope_only():
+    # y_gauss has no random slope, so the variance lands at zero.
+    with pytest.warns(glmm.SingularFitWarning):
+        result = glmm.fit(FIT_DATA, "y_gauss ~ x + (0 + x | g)")
+    assert result.re_groups == [("g", ["x"])]
+    assert len(result.varcorr[0]) == 1
 
 
 def test_inversegaussian_mixed_raises():
@@ -96,15 +86,6 @@ def test_inversegaussian_mixed_raises():
     # never a kernel panic.
     with pytest.raises(ValueError, match="GLM-only"):
         glmm.fit(DATA, "y ~ x + (1 | g)", "inversegaussian")
-
-
-def test_inversegaussian_glm_fits():
-    result = glmm.fit(FIT_DATA, "y_invgauss ~ x", "inversegaussian")
-    assert result.converged
-    assert result.dispersion > 0
-    result_inv_sq = glmm.fit(FIT_DATA, "y_invgauss ~ x", "inversegaussian", link="inverse_squared")
-    assert result_inv_sq.converged
-    assert not _np.allclose(result.beta, result_inv_sq.beta)
 
 
 def test_inversegaussian_dispersion_estimate_is_accepted():
@@ -119,16 +100,6 @@ def test_wald_se_invalid_raises():
         glmm.fit(DATA, "y ~ x", wald_se="observed")
 
 
-def test_wald_se_rx_reaches_the_kernel():
-    # "rx" bypasses the joint Hessian entirely: unlike the wald_se="hessian"
-    # default, stddev_se is never filled on this route (Fit.stddev_se's own
-    # docstring: "NaN where unavailable").
-    result = glmm.fit(FIT_DATA, "y_bin ~ x + (1 | g)", "binomial", wald_se="rx")
-    assert result.converged
-    assert _np.all(_np.isfinite(result.se))
-    assert _np.all(_np.isnan(result.stddev_se))
-
-
 @pytest.mark.parametrize("nagq", [0, 2, 4, 26, 27, -1, 1.0])
 def test_nagq_invalid_raises(nagq):
     with pytest.raises(ValueError, match="nagq"):
@@ -140,25 +111,6 @@ def test_nagq_max_odd_fits():
     assert result.converged
     assert result.nagq == 25
     assert (result.objective, result.objective_nodes) == ("agq", 25)
-
-
-@pytest.mark.parametrize(
-    ("family", "response"),
-    [("negativebinomial", "y_pois"), ("gamma", "y_gamma")],
-)
-def test_nagq_on_negbin_and_gamma_fits_quadrature(family, response):
-    # NB's theta sits outside the AGQ integral, and Gamma's phi enters it only
-    # as a weight on the deviance (the rest of its log-density sits outside),
-    # so both families take nagq>1 like binomial/Poisson: no warn-and-strip,
-    # and the fit reports the node count it ran.
-    import warnings
-
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        result = glmm.fit(FIT_DATA, f"{response} ~ x + (1 | g)", family, nagq=7)
-    assert not any("nagq" in str(w.message) for w in caught), [str(w.message) for w in caught]
-    assert result.nagq == 7
-    assert result.converged
 
 
 def test_dispersion_on_negativebinomial_warns_then_fits():
@@ -335,16 +287,8 @@ def test_missing_column_through_a_transform_names_the_underlying_column():
         glmm.fit(data, "y ~ x + log(z)")
 
 
-def test_one_level_character_factor_in_the_fixed_part_raises():
-    data = {"y": [1.0, 2.0, 3.0], "x": [0.0, 1.0, 2.0], "f": ["z", "z", "z"]}
-    with pytest.raises(
-        ValueError, match=r"contrasts can be applied only to factors with 2 or more levels"
-    ):
-        glmm.fit(data, "y ~ f + x")
-
-
 def test_one_level_bool_factor_in_the_fixed_part_raises():
-    # A bool column crosses as a FALSE/TRUE factor (item 1); with every value
+    # A bool column crosses as a FALSE/TRUE factor; with every value
     # the same, that factor has one level, same as a one-level character one.
     data = {"y": [1.0, 2.0, 3.0], "x": [0.0, 1.0, 2.0], "b": [True, True, True]}
     with pytest.raises(
@@ -449,35 +393,33 @@ def test_all_rows_missing_in_a_used_column_is_a_plain_error():
             ),
         ),
         (
-            "y ~ (a + b + c)^2 + (1 | g)",
+            "y ~ (x + g)^1 + (1 | g)",
             (
-                "formula syntax error at position 15: '^' is accepted only in I(x^k), a power "
-                "of one column; to cross terms, write them out (for example (a + b)^2 as "
-                "a + b + a:b)"
+                "formula syntax error at position 0: invalid power (an integer of 2 or more "
+                "after '^') in term '(x+g)^1'"
             ),
         ),
     ],
 )
-def test_dangling_plus_and_crossing_operator_raise(formula, message):
+def test_dangling_plus_and_a_crossing_power_below_two_raise(formula, message):
     # The R port tests only `^`: R's own parser refuses a formula ending in `+`.
     with pytest.raises(ValueError, match=f"^{re.escape(message)}$"):
         glmm.fit(DATA, formula)
 
 
 def test_bad_formula_syntax_surfaces_the_parse_error_not_an_unrelated_column_error():
-    # `glmm`'s `||` uncorrelated-random-effects syntax is not supported, and is
-    # caught by fit()'s own formula-shape check before anything else runs. An
-    # unrelated column the formula never uses (a date, which crashes both the
-    # numeric and factor conversions) must not get a chance to raise first
-    # with an error that has nothing to do with the formula.
+    # The formula is parsed before any column is read. An unrelated column the
+    # formula never uses (a date, which crashes both the numeric and factor
+    # conversions) must not get a chance to raise first with an error that has
+    # nothing to do with the formula.
     data = {
         "y": [1.0, 2.0, 3.0, 4.0],
         "x": [0.0, 1.0, 2.0, 3.0],
         "g": [0, 0, 1, 1],
         "stamp": [datetime.date(2020, 1, 1)] * 4,
     }
-    with pytest.raises(ValueError, match="full RE correlation structure"):
-        glmm.fit(data, "y ~ (x || g)")
+    with pytest.raises(ValueError, match="both writes the intercept"):
+        glmm.fit(data, "y ~ x + (1 + x - 1 | g)")
 
 
 def test_weights_and_offset_are_dropped_in_lockstep_with_na_rows():

@@ -19,8 +19,8 @@ cargo add glmm
 ```
 
 ```rust
-use glmm::formula::{lower, Column, Table};
-use glmm::{fit_cold, BinomialLink, Family};
+use glmm::formula::{fit, Column, Table};
+use glmm::{BinomialLink, Family, FitOptions};
 
 let table = Table {
     columns: vec![
@@ -34,23 +34,22 @@ let table = Table {
     n,
 };
 
+let opts = FitOptions::default();
+
 // OLS: fixed effects only
-let lo = lower("y ~ x1 * x2", &table, Family::Gaussian)?;
-let ols = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+let ols = fit("y ~ x1 * x2", &table, Family::Gaussian, &opts)?;
 
 // LMM: correlated random intercept and slope (REML)
-let lo = lower("y ~ x1 + (1 + x1 | subject)", &table, Family::Gaussian)?;
-let lmm = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+let lmm = fit("y ~ x1 + (1 + x1 | subject)", &table, Family::Gaussian, &opts)?;
 
 // GLMM: binomial with a probit link, 7-node adaptive quadrature
 let probit = Family::Binomial { link: BinomialLink::Probit };
-let lo = lower("passed ~ x1 + (1 | school)", &table, probit)?;
-let mut opts = lo.opts.clone();
-opts.nagq = 7;
-let glmm = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &opts);
+let mut agq = FitOptions::default();
+agq.nagq = 7;
+let glmm = fit("passed ~ x1 + (1 | school)", &table, probit, &agq)?;
 
-println!("{:?} {:?}", glmm.beta, glmm.se);           // estimates and standard errors
-println!("{} {}", glmm.converged(), glmm.singular()); // result flags
+println!("{:?} {:?}", glmm.fit().beta, glmm.fit().se);           // estimates and standard errors
+println!("{} {}", glmm.fit().converged(), glmm.fit().singular()); // result flags
 ```
 
 The sections below build the same inputs by hand, add warm starts, and show
@@ -58,13 +57,15 @@ the advanced hot-loop surface.
 
 ## 1. Cold fit — one call, one answer
 
-`fit_cold` is the entry point for a single, one-shot fit: you hand it the
-design, the response, a `ModelSpec` (structure only — family, and random-effect
-topology if any), and `GroupIds` (the per-row grouping level for a mixed
-model). It cold-starts the optimizer internally and returns a `Fit`.
+`glmm::fit` is the entry point for a single, one-shot fit: you hand it a
+`Data` (the design, the response, and for a mixed model the `GroupIds`, the
+per-row grouping level), a `ModelSpec` (structure only — family, and
+random-effect topology if any) and the `FitOptions`. It cold-starts the
+optimizer internally and returns a `Fit`, or a `FitError` when an input is one
+no fit can take.
 
 ```rust
-use glmm::{fit_cold, Family, FitOptions, GroupIds, ModelSpec, ReStructure, Sizing};
+use glmm::{Data, Family, FitOptions, GroupIds, ModelSpec, Re};
 
 // 12 rows, 2 predictors (intercept + x1), 6 groups (2 rows per group).
 let n = 12;
@@ -76,21 +77,15 @@ let y: Vec<f64> = (0..n)
     .map(|i| 1.0 + 0.3 * (i as f64 * 0.1) + (i % 6) as f64 * 0.05 + ((i * 7) % 5) as f64 * 0.02)
     .collect();
 
-// y ~ x1 + (1 | group) — Gaussian, random intercept.
-let model = ModelSpec {
-    family: Family::Gaussian,
-    re: Some(ReStructure {
-        sizing: Sizing::FixedClusters { n_clusters: 6 },
-        slopes: vec![],           // no random slope — intercept-only RE
-        extra_groupings: vec![],  // one grouping factor only
-    }),
-};
-let ids = GroupIds { primary: (0..n as u32).map(|i| i % 6).collect(), extra: vec![] };
+// y ~ x1 + (1 | group) — Gaussian, random intercept: no random slope, one
+// grouping factor only.
+let model = ModelSpec::mixed(Family::Gaussian, Re::intercept());
+let ids = GroupIds::new((0..n as u32).map(|i| i % 6).collect());
+let data = Data::new(&x, &y, n, p).ids(&ids);
 
-let mut opts = FitOptions::default();
-opts.target_indices = vec![0, 1]; // SE for both columns
+let opts = FitOptions::default(); // se_for: SeFor::All, an SE for both columns
 
-let fit = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+let fit = glmm::fit(&data, &model, &opts)?;
 assert!(fit.converged());
 println!("beta = {:?}, se = {:?}", fit.beta, fit.se);
 ```
@@ -106,8 +101,9 @@ Points worth knowing at this layer:
   *additional* grouping factor (crossed or nested) beyond the primary. This is
   how you fit **multiple/crossed/nested grouping factors**: give each grouping
   its own `GroupIds::extra[g]` vector aligned 1:1, declaration order.
-- `FitOptions::target_indices` controls which columns get a standard error —
-  SE computation has a cost, so only ask for the columns you need.
+- `FitOptions::se_for` controls which columns get a standard error (default
+  `SeFor::All`) — SE computation has a cost, so `SeFor::Only` asks for only
+  the columns you need.
 - `fit.converged() == false` signals a numerical failure (not a panic); check
   it before trusting `beta`/`se`. It reads `fit.diagnostics.converged` —
   everything the fit reports about *itself* (convergence, singularity, the
@@ -156,7 +152,7 @@ println!("F({}, {}) = {}, p = {}", f.num_df, f.den_df, f.f, f.p_value);
 // With the pass switched off, the contrasts say why there is no df.
 let mut off = opts.clone();
 off.satterthwaite = false;
-let fit_off = fit_cold(&x, &y, n, p, &model, &ids, &off);
+let fit_off = glmm::fit(&data, &model, &off)?;
 assert!(fit_off.coef_df.iter().all(|d| d.is_nan()));
 assert_eq!(
     fit_off.contrast_t(&[0.0, 1.0]),
@@ -164,7 +160,7 @@ assert_eq!(
 );
 ```
 
-- `coef_df` is NaN on columns outside `target_indices`, on aliased columns,
+- `coef_df` is NaN on columns outside `se_for`, on aliased columns,
   and on every family without a df (binomial, Poisson, negative binomial,
   every GLMM). OLS and the Gamma and inverse-Gaussian GLMs with φ estimated
   carry the residual df `n − p` instead, whatever `satterthwaite` says, and
@@ -180,42 +176,67 @@ assert_eq!(
   ([`warnings.md`](warnings.md) has the cases). The method is in
   [`algorithms-lmm.md`](algorithms-lmm.md#satterthwaite-degrees-of-freedom).
 
+**R² and the ICC.** `fit.r2` gives the marginal and conditional R² of a mixed
+model, and `fit.icc` its adjusted and unadjusted intraclass correlation over
+all groupings, as `performance::r2_nakagawa` and `performance::icc` compute
+them. `Fit` keeps neither the design nor the family, so both take the `Data`
+and the `ModelSpec` the fit was made with:
+
+```rust
+let r2 = fit.r2(&data, &model)?;
+let icc = fit.icc(&data, &model)?;
+println!(
+    "marginal R2 {:.3}, conditional R2 {:.3}, adjusted ICC {:.3}",
+    r2.marginal, r2.conditional, icc.adjusted
+);
+```
+
+- On a GLMM the residual variance is the lognormal approximation of the
+  family's variance on the link scale. On a Poisson or negative binomial GLMM
+  each call refits the null model (the intercept with the same random terms)
+  once.
+- A model without random effects, a Gamma model with the inverse link and an
+  inverse-Gaussian model give `FitError::Unsupported`. A fit that did not
+  converge gives NaN fields. A random-effect variance of 0 gives an ICC of 0
+  and a conditional R² equal to the marginal one.
+
 ## 2. Warm fit — reusing a previous solution
 
-`fit_warm` is `fit_cold` plus one optional argument: a `StartValues` warm
+`glmm::fit_with_start` is `glmm::fit` plus one argument: a `StartValues` warm
 start. This is the natural next step once you're fitting the *same model
 shape* repeatedly with data that changes a little each time (e.g. bootstrap
 resamples, an outer optimization loop, or refitting after adding a few rows) —
 threading in the previous fit's `beta`/`theta` shortens the path to
-convergence. `fit_cold` is exactly `fit_warm(.., None, ..)`, so nothing here
+convergence. `fit` is exactly `fit_with_start` with an empty `StartValues`, so nothing here
 changes the *answer* — a warm start only changes how fast the optimizer gets
 there; the fitted MLE is start-independent.
 
 ```rust
-use glmm::{fit_warm, StartValues};
+use glmm::{Data, StartValues};
 
 // First fit, cold.
-let fit1 = fit_warm(&x, &y, n, p, &model, &ids, None, &opts);
+let fit1 = glmm::fit(&Data::new(&x, &y, n, p).ids(&ids), &model, &opts)?;
 
 // ...data changes slightly (new resample, new batch, refit)...
-let start = StartValues { beta: fit1.beta.clone(), theta: vec![/* n_theta values from the model's RE structure */], dispersion: None };
-let fit2 = fit_warm(&x2, &y2, n, p, &model, &ids, Some(&start), &opts);
+let start = StartValues::new(fit1.beta.clone(), vec![/* n_theta values from the model's RE structure */]);
+let fit2 = glmm::fit_with_start(&Data::new(&x2, &y2, n, p).ids(&ids), &model, &start, &opts)?;
 ```
 
 Notes at this layer:
 
 - `StartValues.beta` must have length `p`; `StartValues.theta` must match the
   model's RE θ width (primary `vech(Λ)` plus one `vech(Λ_g)` block per extra
-  grouping — a mismatch panics at the call boundary, not deep inside a kernel).
+  grouping — a mismatch is a `FitError::Start` at the call boundary, not a
+  failure deep inside a kernel).
 - For a fixed-only model (OLS/GLM) a warm start is a no-op — there's no
-  optimizer state to seed — so just call `fit_cold`/pass `None`.
+  optimizer state to seed — so just call `fit`.
 - The LMM kernel only warm-starts `theta` (β is solved exactly given θ, so a
   β guess doesn't help it); GLMM warm-starts both.
 
 ## 3. Advanced — the `loop_advanced` hot-loop surface
 
 For the tightest inner loop (thousands of near-identical fits — e.g. a Monte
-Carlo power simulation), even `fit_warm`'s per-call allocation is overhead you
+Carlo power simulation), even `fit_with_start`'s per-call allocation is overhead you
 may want to own yourself. The `loop_advanced` cargo feature lets you split the
 fit in two: `build_workspace` classifies the design and allocates the solver's
 per-shape buffers **once**, then `fit_on` solves each draw on that workspace.
@@ -228,21 +249,21 @@ glmm = { version = "...", features = ["loop_advanced"] }
 ```
 
 ```rust
-use glmm::loop_advanced::{build_workspace, fit_on, spec_sized_from_ids_pub};
+use glmm::loop_advanced::{build_workspace, fit_on};
+use glmm::Data;
 
-// The spec you pass to `build_workspace` must carry the REAL random-effect
-// level counts, not the placeholders `fit_cold` accepts. `spec_sized_from_ids_pub`
-// derives them from the ids, as the stable entry does. It may also reorder the
-// groupings: `fit_on` takes the ids it returns, and `perm` records the order.
-let (sized, sized_ids, perm) = spec_sized_from_ids_pub(&model, &ids);
-let mut ws = build_workspace(&sized, perm, n_max, p, &opts);
+// `build_workspace` sizes the spec from the ids, as the stable entry does,
+// and keeps them: every `fit_on` call fits those rows, so the `Data` passed
+// to it carries no ids.
+let mut ws = build_workspace(&model, &ids, n, p, &opts);
 
 for draw in draws {
-    let view = fit_on(&mut ws, &draw.x, &draw.y, &sized_ids, start.as_ref(), &opts);
+    let data = Data::new(&draw.x, &draw.y, n, p);
+    let view = fit_on(&mut ws, &data, start.as_ref(), &opts);
     // Hot-loop reads, straight off the workspace slots — no `Fit` allocated:
     let significant = view.t_sq()[0] > crit && view.converged();
     // Or pay for the full result when you actually need it:
-    // let fit = view.into_fit(&draw.x, &draw.y, &sized_ids, n, p, &model, &opts);
+    // let fit = view.into_fit(&data, &model, &opts);
 }
 ```
 
@@ -255,7 +276,7 @@ need them, after `fit_on` (or `fit_on_hinted`) and with the view dropped:
 use glmm::loop_advanced::satterthwaite;
 
 let mut df_out = vec![0.0; p];
-let view = fit_on(&mut ws, &draw.x, &draw.y, &sized_ids, start.as_ref(), &opts);
+let view = fit_on(&mut ws, &Data::new(&draw.x, &draw.y, n, p), start.as_ref(), &opts);
 let converged = view.converged();
 drop(view);
 if converged {
@@ -272,14 +293,15 @@ pseudo-inverse's blocks. Any other workspace returns
 returns `NoDfReason::Failed` with `df_out` all NaN. On a rank-deficient draw
 the df are as untrustworthy as β̂, so read the diagnostics first, as below.
 
-`fit_on` panics rather than misroutes: the design shape (rows, predictors, RE
-level counts) and the options frozen at build (`nagq`, the criterion `reml`
-resolves to on an LMM, whether weights and offsets are present,
-`parallel_inner`) must match the workspace every call. Row
-counts may vary below the `n_max` you built at.
+`fit_on` panics rather than misroutes: the design shape (rows, predictors) and
+the options frozen at build (`nagq`, the criterion `reml` resolves to on an
+LMM, the number of SE columns, `parallel_inner`) must match the workspace
+every call, and a `Data` with ids panics. On a mixed workspace every draw has
+the row count you built with; on a fixed-only one row counts may vary below
+it. Weights and offsets may change from call to call.
 
-What it does **not** do is validate your data. `fit_warm` checks start-value
-lengths, weight and offset lengths and finiteness, and it drops rank-deficient
+What it does **not** do is validate your data. `fit_with_start` checks start-value
+lengths, weight and offset lengths and finiteness (returning a `FitError`), and it drops rank-deficient
 fixed-effect columns and refits. `fit_on` does none of that — it trusts the
 caller. A `StartValues.beta` or `StartValues.theta` of the wrong width is
 dropped without an error, and that part cold-starts. A weights vector longer
@@ -289,13 +311,13 @@ outside your loop.
 
 This is the **unstable** surface — no semver guarantees, and it changes in any
 release. It exists to serve one class of caller (warm-start simulation loops
-like MCPower's); reach for it only once you've measured that `fit_warm`'s
-per-call cost actually matters for your loop. `fit_cold`/`fit_warm` route
+like MCPower's); reach for it only once you've measured that `fit_with_start`'s
+per-call cost actually matters for your loop. `fit`/`fit_with_start` route
 through this same `build_workspace`/`fit_on` core — they allocate a throwaway
 workspace per call and always assemble the full `Fit`. That shared core is the
 point: the solver cannot drift between the stable entry and the loop tier. The
 answers still can, on one input — a rank-deficient fixed-effect design.
-`fit_warm` runs the alias gate first, drops the redundant column and returns a
+`fit` runs the alias gate first, drops the redundant column and returns a
 reduced fit. `fit_on` skips that gate on purpose — that is part of what you are
 buying — and hands the full design to the solver, so one of two things comes
 back: NaN with `converged: false`, or real numbers with an enormous standard
@@ -305,10 +327,13 @@ given the same kind of duplicated column at two sample sizes, can land on
 opposite sides.
 
 That makes checking your job. Call `FitView::diagnostics()` on **every** draw and
-read `converged` and `ill_conditioned` before you use the numbers — a returned
-number is not evidence of a good fit, and `converged` alone misses every draw
-that fit through badly conditioned. `pivot_col` names the column to look at when
-the flag fires.
+read `converged`, `ill_conditioned` and `se_unavailable` before you use the
+numbers — a returned number is not evidence of a good fit, and `converged` alone
+misses every draw that fit through badly conditioned. `pivot_col` names the
+column to look at when the flag fires. `se_unavailable` (GLM and GLMM) marks a
+converged draw whose estimates and deviance stand but whose standard errors and
+`t_sq` are NaN; on a GLM it comes with `ill_conditioned`, and `pivot_col` names
+the column that could not be separated from the others.
 `loop_advanced` also re-exports the individual OLS/GLM/GLMM/LME kernels and
 their scratch types, a level below this.
 
@@ -321,7 +346,7 @@ by default) does the lowering:
 
 ```rust
 use glmm::formula::{lower, Column, Table};
-use glmm::{fit_cold, Family};
+use glmm::{Family, FitOptions};
 
 let table = Table {
     columns: vec![
@@ -333,12 +358,13 @@ let table = Table {
 };
 
 let lo = lower("y ~ x1 + (1 | group)", &table, Family::Gaussian)?;
-let fit = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+let fit = glmm::fit(&lo.data(), lo.spec(), &FitOptions::default())?;
 ```
 
 `lower` parses the formula (`*` desugars to main effects + interaction, `A/B`
 to nesting), discovers factor levels, builds the design matrix with treatment
-contrasts (R's default), and returns everything `fit_cold` needs — including
+contrasts (R's default), and returns everything `glmm::fit` needs (`lo.data()`,
+`lo.spec()`) — including
 `lo.col_names`, the coefficient name for each design column. Use `parse`/
 `materialize` separately if you need to parse once and materialize against
 several data tables (the parse step is data-free).

@@ -10,7 +10,8 @@
 use super::rlrt::{rlrt_design, rlrt_null, rlrt_statistic, RlrtConfig};
 use super::rlrt_refs::{bands, design};
 use super::tails::chisq_upper_p;
-use crate::{fit_cold, Family, FitOptions, GroupIds, ModelSpec};
+use crate::test_support::fit_cold;
+use crate::{Family, FitOptions, GroupIds, ModelSpec};
 use commonstats::dist::{Normal, Sampler};
 use commonstats::rng::{CommonStatsRng, STREAM_TAG_SIMULATE};
 use std::time::Instant;

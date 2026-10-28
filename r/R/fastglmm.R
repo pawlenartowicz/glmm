@@ -50,9 +50,13 @@
 #' nested calls, and `.` - compute those columns first and pass them by name.
 #' `weights=` together with a `cbind()` formula, and `offset=` together with
 #' an `offset()` formula term, both error naming "use one". Fixed and random
-#' effects support `+`, `:`, `*`, `A/B` nesting, and `(1 + x | g)` random-effect
-#' terms with a **full** correlation structure - `(x || g)` and intercept-free
-#' RE terms are not fittable by the kernel and raise an error. Contrasts are
+#' effects support `+`, `:`, `*`, `A/B` nesting, and `(a + b)^k` crossing.
+#' Random-effect terms may be correlated `(1 + x | g)`, uncorrelated
+#' `(x || g)` or `zerocorr(1 + x | g)`, intercept-free `(0 + x | g)`, or
+#' several terms on one grouping such as `(1 | g) + (0 + x | g)`; a column in
+#' two terms on one grouping is an error. On a factor slope, `(f || g)` keeps
+#' the factor's block correlated, as lme4 does, while `zerocorr(f | g)` makes
+#' every column uncorrelated. Contrasts are
 #' always treatment coding with the **first factor level** as base; to change
 #' the base, `relevel()` the factor (a `contrasts` argument is deliberately
 #' absent). Anything that would silently mean something else - an ordered
@@ -84,7 +88,6 @@
 #' **Diagnostic warnings carry a condition class.** Each solver note is raised
 #' as a warning of class `"fastglmm_diagnostic"` with a per-kind subclass
 #' (`"fastglmm_ill_conditioned"`, `"fastglmm_pirls_exhausted"`,
-#' `"fastglmm_unused_grouping_levels"`,
 #' `"fastglmm_single_level_grouping_dropped"`,
 #' `"fastglmm_few_rows_for_random_effects"`, `"fastglmm_hessian_se_fallback"`,
 #' `"fastglmm_se_unavailable"`, `"fastglmm_exact_profile_fallback"`,
@@ -161,6 +164,13 @@
 #'   then use z and normal quantiles and say "df not computed", and
 #'   `$df_method` is `"disabled"`. OLS and the Gamma and inverse-Gaussian GLMs
 #'   keep their residual df whatever it says.
+#' @param condvar compute the conditional variances of the random effects
+#'   (default `TRUE`), which [ranef()][ranef.fastglmm]'s `postVar` attribute
+#'   and a conditional [predict()][predict.fastglmm] with `se.fit` or `interval`
+#'   read. `FALSE` skips them, which saves up to about the time of the fit
+#'   itself on a crossed model with many levels: `ranef()` then leaves
+#'   `postVar` off, and `ranef(fit, condVar = TRUE)` and such a `predict()` are
+#'   errors.
 #' @param REML `NULL` (the default), `TRUE` or `FALSE`; `$reml` reports the
 #'   value used. A Gaussian mixed model is fitted by REML under `NULL` and
 #'   `TRUE` and by maximum likelihood under `FALSE`. A Gaussian model with no
@@ -196,17 +206,20 @@
 #'   (`"satterthwaite"`, `"residual"`, `"none"`, `"disabled"` or `"failed"`),
 #'   `rss`, `r_squared` and `adj_r_squared` (OLS fits only, `NaN` otherwise),
 #'   `offset` (the offset fitted with, `NULL` without one),
-#'   `satterthwaite_record` (what [contrast_test()] reads on a fit whose
-#'   `df_method` is `"satterthwaite"`, `NULL` on every other fit), plus
-#'   [anova()][anova.fastglmm] (the per-term tests, built at fit time, or a
-#'   comparison of two fits), `print()`, [summary()][summary.fastglmm],
+#'   `satterthwaite_record` (what [contrast_test()] and [pairwise()] read on
+#'   a fit whose `df_method` is `"satterthwaite"`, `NULL` on every other fit),
+#'   plus [anova()][anova.fastglmm] (the per-term tests, built at fit time, or
+#'   a comparison of two fits), [pairwise()] (the pairwise comparisons of a
+#'   factor's levels), [r2()] and [icc()] (a mixed model's R-squared pair and
+#'   intraclass correlation), `print()`, [summary()][summary.fastglmm],
 #'   [confint()][confint.fastglmm] (Wald), `nobs()`,
 #'   [formula()][formula.fastglmm] (returns the model formula as given, so
 #'   `update()` works), `family()`, `model.frame()`, [ranef()][ranef.fastglmm],
-#'   `fitted()`, `residuals()`, [logLik()][logLik.fastglmm], and
+#'   `fitted()`, `residuals()`, [predict()][predict.fastglmm],
+#'   [simulate()][simulate.fastglmm], [logLik()][logLik.fastglmm], and
 #'   [AIC()][AIC.fastglmm] and `BIC()` (which refuse a REML fit beside an ML
 #'   one, and REML fits with different fixed effects). The blocked accessors
-#'   (`predict`, `coef`, `terms`) error with the reason.
+#'   (`coef`, `terms`) error with the reason.
 #'
 #' @examples
 #' set.seed(1)
@@ -231,12 +244,17 @@ fastglmm <- function(formula, data, family = gaussian(),
                      dispersion = NULL,
                      init.theta = NULL,
                      satterthwaite = TRUE,
+                     condvar = TRUE,
                      REML = NULL,
                      anova_test = c("auto", "Wald", "LRT"),
                      ...) {
   .check_dots(...)
   if (!(is.logical(satterthwaite) && length(satterthwaite) == 1L && !is.na(satterthwaite))) {
     stop(sprintf("satterthwaite must be TRUE or FALSE, got %s", .arg_repr(satterthwaite)),
+         call. = FALSE)
+  }
+  if (!(is.logical(condvar) && length(condvar) == 1L && !is.na(condvar))) {
+    stop(sprintf("condvar must be TRUE or FALSE, got %s", .arg_repr(condvar)),
          call. = FALSE)
   }
   .check_reml(REML)
@@ -250,7 +268,7 @@ fastglmm <- function(formula, data, family = gaussian(),
     stop("`formula` must be a formula or a formula string", call. = FALSE)
   }
   f_str <- paste(deparse(formula, width.cutoff = 500L), collapse = " ")
-  .check_formula(formula, f_str)
+  .check_formula(formula)
 
   fam <- .normalize_family(family)
 
@@ -405,6 +423,7 @@ fastglmm <- function(formula, data, family = gaussian(),
     as.double(start$theta %||% double()),
     as.double(start$dispersion %||% double()),
     satterthwaite,
+    condvar,
     if (is.null(REML)) logical() else REML,
     anova_test
   )
@@ -464,7 +483,19 @@ fastglmm <- function(formula, data, family = gaussian(),
       if (length(affected)) paste0(" Affected: ", paste(affected, collapse = ", "), ".")),
       c("fastglmm_singular", "fastglmm_diagnostic"))
   }
+  # A fit with both se_unavailable and ill_conditioned, whose named estimate is
+  # NaN (the GLM's breakdown), prints one warning: the se_unavailable text,
+  # naming the ill_conditioned note's columns. A GLMM keeps that estimate, so it
+  # prints the two notes as they are. The Python port's _fit_from_native does the
+  # same (glmm/__init__.py) - change together.
+  kinds <- vapply(r$notes, function(n) n$kind, character(1))
+  paired <- "ill_conditioned" %in% kinds && "se_unavailable" %in% kinds &&
+    all(is.na(r$beta[r$notes[[match("ill_conditioned", kinds)]]$columns]))
   for (note in r$notes) {
+    if (paired && identical(note$kind, "ill_conditioned")) next
+    if (paired && identical(note$kind, "se_unavailable")) {
+      note$columns <- r$notes[[match("ill_conditioned", kinds)]]$columns
+    }
     out <- .note_warning(note, r$names, r$converged, r$nobs)
     if (!is.null(out)) .warn_keep(store, note$kind, out$msg, out$cls)
   }
@@ -586,10 +617,20 @@ fastglmm <- function(formula, data, family = gaussian(),
     reml = r$reml,
     re_group_names = r$re_group_names,
     re_group_terms = r$re_group_terms,
+    # Per grouping, the 1-based term of each name in `re_group_terms`;
+    # print.VarCorr.fastglmm prints a correlation only within one term.
+    re_term_index = r$re_term_index,
     # Labelled conditional modes straight from the kernel - ranef() reshapes
     # these into lme4's data.frame list. Nothing here slices the flat vector:
     # only the kernel knows which RE block layout the data routed to.
     ranef_blocks = r$ranef_blocks,
+    # What predict() and simulate() read besides the public fields, private:
+    # the flat conditional modes and their level counts, and the conditional
+    # variances in the kernel's layout (`fit_list` in glmm-r/src/lib.rs). The
+    # training columns are `frame`, marshalled again on each call. NULL on a
+    # fit saved before them. Mirrors the Python port's `Fit._kernel_parts` -
+    # change together.
+    .kernel_parts = r$kernel_parts,
     fitted = r$fitted,
     # The response as the kernel fitted it (after lowering: a cbind() LHS is
     # the proportion). residuals() reads this rather than re-resolving the
@@ -602,8 +643,7 @@ fastglmm <- function(formula, data, family = gaussian(),
     # The design summary of a Gaussian fit whose only random term is one
     # random intercept (1 | g), with no prior weights and at least one
     # fixed-effect column; NULL on every other fit. list(counts, s, c), with
-    # K = the highest observed level code + 1 (a level below it with no rows
-    # counts 0; unused levels after it are not counted, so K can be less than
+    # K = the number of groups that have rows (so K can be less than
     # nlevels(g)) and p retained fixed-effect columns, on the fit's
     # orthogonalized design X~ (it spans the column space of the fixed-effect
     # design): counts (K, rows per level), s (p * K, the
@@ -622,12 +662,13 @@ fastglmm <- function(formula, data, family = gaussian(),
     objective_nodes = r$objective_nodes,
     # The per-term tables anova(m) prints, built by the crate at fit time:
     # list(error = NULL, ss_type, test, reason, label, kind, statistic,
-    # num_df, den_df, den_df_kind, p_value, sum_sq, mean_sq, row_notes,
-    # notes), one entry per term in each column, or list(error = <message>)
-    # when the formula gets no table (an interaction without its marginal
-    # terms). The likelihood-ratio tables anova(m, test = "LRT") prints are
-    # the same lists, NULL unless the fit asked with anova_test = "LRT" or is
-    # a Poisson model with random effects fitted with anova_test = "auto".
+    # num_df, den_df, den_df_kind, p_value, sum_sq, mean_sq, eta2_partial,
+    # row_notes, notes), one entry per term in each column, or
+    # list(error = <message>) when the formula gets no table (an interaction
+    # without its marginal terms). The likelihood-ratio tables
+    # anova(m, test = "LRT") prints are the same lists, NULL unless the fit
+    # asked with anova_test = "LRT" or is a Poisson model with random effects
+    # fitted with anova_test = "auto".
     # term_test_auto is list(test, reason): what anova(m)'s default
     # test = "auto" gives ("lrt" on a Poisson model with random effects).
     term_table_type3 = r$term_table_type3,
@@ -811,7 +852,6 @@ fastglmm <- function(formula, data, family = gaussian(),
   few_rows_for_random_effects = c("caution", "Too few rows for the random effects"),
   variance_at_limit = c("caution", "Variance at its search limit"),
   argument_ignored = c("note", "Argument ignored"),
-  unused_grouping_levels = c("note", "Unused grouping levels"),
   single_level_grouping_dropped = c("note", "Random effect dropped (single level)")
 )
 # A kernel note this wrapper has no entry for keeps its own kind string.
@@ -869,6 +909,23 @@ fastglmm <- function(formula, data, family = gaussian(),
   parts
 }
 
+# The coefficient names of a note's `columns`, joined by ", ". `columns`
+# arrives 1-based from the shim, so it indexes `coef_names` directly. Out of
+# range falls back to the index rather than printing NA, mirroring the Python
+# port's guard.
+.column_names <- function(columns, coef_names) {
+  paste(
+    vapply(columns, function(i) {
+      if (i >= 1L && i <= length(coef_names)) {
+        coef_names[[i]]
+      } else {
+        sprintf("column %d", i)
+      }
+    }, character(1)),
+    collapse = ", "
+  )
+}
+
 # One kernel note as list(msg=, cls=), or NULL to raise nothing. The `kind`
 # string, not the English text, is the stable identifier; an unrecognized kind
 # comes from a kernel newer than this wrapper (the Rust `Note` enum is
@@ -877,7 +934,6 @@ fastglmm <- function(formula, data, family = gaussian(),
 # together.
 #
 # Classes: "fastglmm_ill_conditioned", "fastglmm_pirls_exhausted",
-# "fastglmm_unused_grouping_levels",
 # "fastglmm_single_level_grouping_dropped",
 # "fastglmm_few_rows_for_random_effects", "fastglmm_hessian_se_fallback",
 # "fastglmm_se_unavailable", "fastglmm_exact_profile_fallback",
@@ -886,44 +942,19 @@ fastglmm <- function(formula, data, family = gaussian(),
 # "fastglmm_satterthwaite_curvature", "fastglmm_variance_at_limit",
 # "fastglmm_unknown_note" - all inheriting
 # "fastglmm_diagnostic", so one handler catches the whole channel. Not every
-# note comes from the solver: "unused_grouping_levels",
-# "single_level_grouping_dropped" and "few_rows_for_random_effects" are raised
-# by the formula lowering, which is the only layer that sees both the declared
-# levels and the per-row codes. `nobs` is the fit's row count.
+# note comes from the solver: "single_level_grouping_dropped" and
+# "few_rows_for_random_effects" are raised by the formula lowering, which is the
+# only layer that sees the grouping levels. `nobs` is the fit's row count.
 .note_warning <- function(note, coef_names, converged, nobs) {
   # Only on a non-converged fit, whose one warning (.nonconvergence) names it.
   if (identical(note$kind, "separated")) return(NULL)
   if (identical(note$kind, "ill_conditioned")) {
-    # `columns` arrives 1-based from the shim, so it indexes `coef_names`
-    # directly. Out of range falls back to the index rather than printing NA,
-    # mirroring the Python port's guard.
-    named <- paste(
-      vapply(note$columns, function(i) {
-        if (i >= 1L && i <= length(coef_names)) {
-          coef_names[[i]]
-        } else {
-          sprintf("column %d", i)
-        }
-      }, character(1)),
-      collapse = ", "
-    )
-    msg <- paste(named, paste(
+    msg <- paste(.column_names(note$columns, coef_names), paste(
       "is almost a combination of other columns in the model, so its standard error is",
       "large. Its estimate is still correct, but imprecise. The other columns involved",
       "are not named. Consider dropping or combining predictors that carry the same",
       "information."))
     cls <- c("fastglmm_ill_conditioned", "fastglmm_diagnostic")
-  } else if (identical(note$kind, "unused_grouping_levels")) {
-    # The kernel packs "<group>: <level>, <level>" (src/orchestrate.rs). Split on
-    # the first ": " only: a level label may contain one.
-    cut <- regexpr(": ", note$detail, fixed = TRUE)
-    group <- if (cut > 0L) substr(note$detail, 1L, cut - 1L) else note$detail
-    levels <- if (cut > 0L) substring(note$detail, cut + 2L) else ""
-    msg <- sprintf(paste(
-      "Grouping factor '%s' has levels with no rows (%s). They stay in the model with",
-      "random effects of exactly zero, but they are not counted in the number of groups.",
-      "Remove unused categories before fitting."), group, levels)
-    cls <- c("fastglmm_unused_grouping_levels", "fastglmm_diagnostic")
   } else if (identical(note$kind, "pirls_exhausted")) {
     # Raised only when the final re-evaluation of a converged fit hit the cap; see
     # the Python port's _note_warning for the other three cases.
@@ -970,6 +1001,16 @@ fastglmm <- function(formula, data, family = gaussian(),
       "may look more precise than they are. Standard errors for the random-effect",
       "standard deviations are not available.")
     cls <- c("fastglmm_hessian_se_fallback", "fastglmm_diagnostic")
+  } else if (identical(note$kind, "se_unavailable") && length(note$columns)) {
+    # `columns` is filled in by .fit_object from the fit's ill_conditioned note,
+    # when it has one: the two print as this one warning.
+    msg <- paste(
+      "Standard errors could not be computed:", .column_names(note$columns, coef_names),
+      "cannot be separated from the other columns in the model. Its estimate is not",
+      "reported. The other estimates and the deviance can be used; standard errors,",
+      "p-values and confidence intervals are not reported. Check for predictors that",
+      "are copies or near-copies of each other.")
+    cls <- c("fastglmm_se_unavailable", "fastglmm_diagnostic")
   } else if (identical(note$kind, "se_unavailable")) {
     msg <- paste(
       "Standard errors could not be computed at the fit's end point: the fixed",
@@ -1217,22 +1258,12 @@ fastglmm <- function(formula, data, family = gaussian(),
   invisible()
 }
 
-# Pre-checks for formula shapes the shared Rust parser cannot represent,
-# in the order a user hits them (spec section 4 "Parser limits" + engine RE limits).
-# Anything not caught here falls through to the parser, whose own message
-# (e.g. term removal for `y ~ x - 1`) is surfaced verbatim.
-.check_formula <- function(formula, f_str) {
-  # Both checks below catch formula shapes the shared Rust parser has no
-  # dedicated message for (it falls through to a generic syntax error), with
-  # the same wording the Python port uses (python/glmm/__init__.py's `fit`) -
-  # change together. Intercept-free random-effect terms ((0+x|g), (-1+x|g))
-  # are NOT pre-checked here: the parser already raises
-  # RandomInterceptSuppressionUnsupported with a specific message, and that
-  # message reaches both ports unchanged.
-  if (grepl("||", f_str, fixed = TRUE)) {
-    stop("(x || g) double-bar terms are not supported: the glmm kernel always ",
-         "fits the full RE correlation structure", call. = FALSE)
-  }
+# Anything not caught here falls through to the shared Rust parser, whose own
+# message is surfaced verbatim.
+.check_formula <- function(formula) {
+  # Catches a formula shape the parser has no dedicated message for (it falls
+  # through to a generic syntax error), with the same wording the Python port
+  # uses (python/glmm/__init__.py's `_check_call`) - change together.
   if ("." %in% all.vars(formula)) {
     stop("'.' is not supported by the formula parser; list the columns explicitly",
          call. = FALSE)

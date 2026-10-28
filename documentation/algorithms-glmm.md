@@ -1,7 +1,7 @@
 # GLMM — non-Gaussian mixed models
 
 This is the GLMM leaf of the algorithm map: a non-Gaussian `family` with
-`re: Some(..)`. It documents what `fit_cold`/`fit_warm` actually run once the
+`re: Some(..)`. It documents what `fit`/`fit_with_start` actually run once the
 dispatch in [`algorithms.md`](algorithms.md) has selected the GLMM path — the
 penalized-IRLS inner loop, the Laplace/AGQ objective, the dense/sparse solver
 split, the Negative-Binomial outer θ-loop, workspace reuse, and standard errors.
@@ -42,7 +42,7 @@ The recurring symbols on this page, defined once here before first use:
 ## Dispatch within the GLMM path
 
 **Code:** `classify_design` (`src/fit/mod.rs`) and the `(family, Some(_))` arm
-of the dispatch match in `build_workspace` (`src/fit/core.rs`); `assert_model_shape`
+of the dispatch match in `build_workspace` (`src/fit/core.rs`); `check_model_shape`
 (`src/fit/common.rs`); envelope caps in `src/consts.rs` (`MAX_PRIMARY_Q`,
 `MAX_EXTRA_GROUPINGS`, `MAX_EXTRA_Q`, `MAX_CROSSED_LEVELS`).
 
@@ -72,10 +72,10 @@ flowchart TD
 [`algorithms-lmm.md`](algorithms-lmm.md), not here.) Every family that reaches
 this match fits on both solver arms: there is **no reachable `unimplemented!`**
 once dispatch is inside the GLMM path. The hard rejections are the shape
-asserts at the stable boundary (`assert_model_shape`, `src/fit/common.rs`):
+checks at the stable boundary (`check_model_shape`, `src/fit/common.rs`):
 `nAGQ` must be odd in `1..=25`, and `nAGQ>1` is allowed only on a single
 grouping factor (no extras), `q_p ≤ 3` random effects per group,
-binomial/Poisson/negative-binomial/Gamma GLMM. The same assert also checks the engine invariants that
+binomial/Poisson/negative-binomial/Gamma GLMM. The same check also covers the engine invariants that
 hold at `nAGQ = 1`: every primary/extra slope column must index within `p`,
 and at most one `NestedWithin` extra grouping is accepted. It also rejects
 `(Family::InverseGaussian, Some(re))` outright — a family × random-effects
@@ -84,7 +84,7 @@ gate rather than a shape gate — because the GLMM objective needs a profiled
 reaches the `family` diamond above; it faults before `build_workspace`
 allocates anything, and is otherwise a fixed-only GLM family (see
 [`algorithms.md`](algorithms.md#full-dispatch-map)). Prior weights are **not**
-a rejection anywhere on this path — `FitOptions::weights` is honored on every
+a rejection anywhere on this path — `Data::weights` is honored on every
 GLMM shape, AGQ included (see the weights paragraph in the PIRLS section).
 
 **Validation:** the NoZ binomial/Poisson/Gamma path is pinned by cbpp
@@ -251,7 +251,7 @@ one-step exactness it would break. A solve that converges before it fires is
 bit-identical. **Validation:** `nb_pirls_two_cycle_is_damped_and_the_fit_converges`
 (grid cell `nb_cross4_g300p5_bal_base`, whose PIRLS solves two-cycle without the damping).
 
-**Prior weights.** With `FitOptions::weights`, PIRLS folds `wᵢ` into the
+**Prior weights.** With `Data::weights`, PIRLS folds `wᵢ` into the
 working weight (`wᵢ·W̃ᵢ`), the deviance contribution (`wᵢ·devᵢ`), and the
 β-gradient score (`wᵢ·ρᵢ`), so the conditional mode and curvature are those of
 the weighted likelihood. One fork follows inside the shared family kernel: the
@@ -658,7 +658,7 @@ rows each was 0.52 cold and 0.74 from the generating values on Poisson, 0.75
 and 0.89 on binomial, 0.91 and 0.95 on Gamma; on the grid's cells with 2+ θ
 0.84 to 1.02 cold and 0.93 to 0.99 from the generating values. No endpoint
 ended more than 1e-6 above the BOBYQA optimum. It is off by default, so
-`fit_cold`, `fit_warm` and `fit_on` without the opt-in keep the design
+`fit`, `fit_with_start` and `fit_on` without the opt-in keep the design
 whitening and the identity start: measured 2026-10-21 in evaluations against
 them, it took 21% more on 144 cold fits of generated data built unlike the
 grid (uneven groups, skewed covariates on mixed scales, misspecified random
@@ -818,7 +818,7 @@ gives the BOBYQA fit bit for bit, 0.06 routes),
 `gradient_route_curvature_hint_is_in_the_design_coordinates`,
 `gradient_route_hands_over_on_the_iteration_cap`,
 `gradient_route_is_unit_invariant_in_beta` and
-`gradient_route_curvature_hint_is_read_only_and_order_free` (a cold 7-node
+`gradient_route_curvature_hint_is_order_free` (a cold 7-node
 logit AGQ case among its fixtures, as in the refit test above and the
 alloc-tier `gradient_route_repeat_fits_allocate_no_more`), all in
 `src/glmm/tests.rs`;
@@ -924,13 +924,13 @@ combined by log-sum-exp with the Liu–Pierce (1994) reweight `w_j·e^{z_j²}`. 
 `k = 1` the single node sits at the mode with weight √π and the bracket
 collapses to the Laplace term exactly — so `nagq == 1` routes to
 `laplace_deviance` verbatim. `nAGQ` must be **odd** (the GH table stores orders
-`1, 3, …, 25`), enforced by `assert_model_shape`. Prior weights thread through
+`1, 3, …, 25`), enforced by `check_model_shape`. Prior weights thread through
 unchanged — the per-row `dev_resid` sums carry `wᵢ` and PIRLS folds the weights
 into each cluster's mode and curvature, so aggregated binomial with AGQ
 (`glmer(cbind(s, m−s) ~ …, nAGQ=k)`) is supported. AGQ runs on the blocked
 layout only — the packed layout pins `nagq = 1` in `from_groupings` before
 `outer_search` is computed, silently Laplace regardless of the caller's
-`nagq`. `q_p ≥ 4` is refused by `assert_model_shape` as a temporary
+`nagq`. `q_p ≥ 4` is refused by `check_model_shape` as a temporary
 cost/oracle-coverage boundary, not a code limit on the `k^q_p` product grid
 itself (the grid cost is the user's to pay: `k=25` at `q_p=3` is already
 15,625 nodes per cluster per evaluation).
@@ -1327,10 +1327,10 @@ buffers are fixed at construction, and nothing in the crate detects a mismatch
 — a `loop_advanced` caller must construct a fresh workspace whenever the row
 count would exceed `max_n`, `p` changes, or the RE topology changes (any shift
 in `k`, `n_theta`, the groupings, the family, or `nAGQ`). At the stable
-`fit_cold`/`fit_warm` surface this is moot — the workspace is built per call.
+`fit`/`fit_with_start` surface this is moot — the workspace is built per call.
 
 Two seeding mechanisms feed the optimizer. Across fits, a caller-supplied
-`StartValues` threads β and θ into the search (`fit_warm`; `fit_glmm`
+`StartValues` threads β and θ into the search (`fit_with_start`; `fit_glmm`
 warm-starts both, on every layout, unlike the LMM kernel which seeds θ only),
 and on NB and Gamma the dispersion coordinate too (`StartValues::dispersion`,
 in `Fit::dispersion`'s units; a loop-tier caller reads it off
@@ -1565,7 +1565,12 @@ Two genuinely different Wald covariances are offered, selected by `WaldSe`:
   converged point. The factor of 2 arises because the deviance is −2·logL, so
   the observed information is `H_dev/2`. Four rungs produce `H_dev` (1, 2a, 2
   and 3 below), each answering only what the rung above it declines; a
-  decline is a routing answer, not a failure.
+  decline is a routing answer, not a failure. The θ entries a grouping's
+  terms hold at zero (between two terms, as in `(x || g)`, and the intercept
+  column of a block without a random intercept) are not coordinates: the
+  finite-difference rungs never step them, the joint Hessian is restricted to
+  the free θ and β before its Cholesky, and their rows of the θ covariance are
+  exactly zero.
 
   **Rung 1 — the assembled pass** (`assembled::joint_hessian`), the default on
   all three `A`-layouts and at every `m = n_theta + p`. The total derivative of

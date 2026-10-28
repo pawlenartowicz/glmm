@@ -1,7 +1,7 @@
 # Algorithm map — dispatch, knobs, OLS & GLM
 
 This is the entry point of the `glmm` algorithm map. It documents, strictly as
-built, how a call to `fit_cold`/`fit_warm` reaches a terminal solver, indexes
+built, how a call to `fit`/`fit_with_start` reaches a terminal solver, indexes
 every tuning knob, and covers the two fixed-effect-only paths (OLS and GLM). The
 mixed-model leaves get their own pages:
 
@@ -16,29 +16,31 @@ the other engines and the reasoning behind them.
 
 ## Full dispatch map
 
-Every real fit enters through `fit_warm` (`fit_cold` is exactly
-`fit_warm(.., None, ..)`). It shape-checks the inputs (`assert_model_shape`,
-followed by the finiteness/shape asserts on `weights`, `offset`, and any
-`StartValues`), runs the rank-deficiency salvage, sizes the spec from the group
-ids, then hands off to the unified fit core in `src/fit/core.rs`:
-`build_workspace` matches on `(family, re)` — the mixed arm routing through
+Every real fit enters through `fit` or `fit_with_start` (`fit` is exactly
+`fit_with_start` with an empty `StartValues`). Both check the inputs in
+`validate` (`check_model_shape`, followed by the finiteness/shape checks on
+`x`, `y`, the group ids, `weights`, `offset`, any `StartValues` and the
+response domain), which returns a `FitError` on the first failure. Then
+`fit_checked` runs the rank-deficiency salvage and hands off to the unified
+fit core in `src/fit/core.rs`: `build_workspace` sizes the spec from the group
+ids and matches on `(family, re)` — the mixed arm routing through
 `classify_design` to a dense (`NoZ`) or sparse (`Sparse`) solver, and within
 each solver the family selecting the kernel — and `fit_on` solves on the
 workspace it allocated. This is the whole as-built decision tree — one graph, no
 unreachable arms.
 
-The core is the *only* dispatch body. `fit_warm` allocates a throwaway
+The core is the *only* dispatch body. `fit_checked` allocates a throwaway
 workspace per call and always assembles the full `Fit`; a `loop_advanced`
 caller builds once per shape and reads the lean `FitView` per draw. Both walk
 the identical tree, so routing cannot drift between the two tiers. The
 `orchestrate` feature (`src/orchestrate.rs`, off by default, no semver
 guarantee) is a third caller and not a fourth tier: it lowers a formula and a
-data table, calls `fit_warm`, and flattens the result for the Python and R
-packages, so it enters the tree at the same door `fit_warm` does.
+data table, calls `fit` or `fit_with_start`, and flattens the result for the
+Python and R packages, so it enters the tree at the same door they do.
 
 ```mermaid
 flowchart TD
-  E["fit_cold / fit_warm"] --> SH["assert_model_shape"]
+  E["fit / fit_with_start"] --> SH["validate (check_model_shape)"]
   SH --> RD{"detect_aliased: any aliased column?"}
   RD -->|yes| RDF["fit_rank_deficient: drop columns, re-enter reduced"]
   RD -->|no| BW["build_workspace: match family, re"]
@@ -53,11 +55,16 @@ flowchart TD
   CD -->|"Binomial/Poisson/Gamma"| GMM["run_glmm_on (blocked, structured or packed layout)"]
 ```
 
+A random slope reads its values from column `c` of `X` when its slope index
+`c < p`, or from column `c − p` of the random-effect-only columns `Z_r`
+(`Data::re_columns`, row-major `n × s`) when `p ≤ c < p + s`; the route is
+the same either way.
+
 **Rank-deficiency salvage.** Before any solver runs, `detect_aliased` forms the
 lower-triangular Gram `XᵀX` and rank-reveals it (`ols::aliased_columns`, drop
 tolerance `ALIAS_EPS = 1e-14`); if any fixed column is aliased on an earlier one,
 `fit_rank_deficient` drops those columns, fits the reduced full-rank model
-through a recursive `fit_warm`, and scatters β/SE back to full width with the
+through a recursive `fit_checked`, and scatters β/SE back to full width with the
 dropped slots left `NaN` (lme4's `NA`-coefficient behaviour — the fit still
 converges). The rank reveal is deliberately **left-to-right with no pivoting**,
 matching R/lme4's `dqrdc2` convention: of a collinear pair, the *later* column
@@ -91,19 +98,46 @@ have non-obvious reasons:
   scratch per deviance eval), while at 500 levels the cubic term is
   negligible. The other three caps size stack buffers and are hard.
 
-The one hard rejection is a shape assert: `assert_model_shape` still panics on
-true invariant violations (a bad `nagq`, an out-of-range slope column, more
-than one nested grouping) — and, as a family × random-effects gate, on
-`(Family::InverseGaussian, Some(re))`: the GLMM objective needs a profiled
-`inverse.gaussian()$aic` term that is not built, so `fit_warm` faults there
-before `build_workspace` allocates anything (`InverseGaussian` reaches only
-the fixed-only GLM arm above). The level-count clause reads real
-`Crossed { n_clusters }`, so the entry sizes the spec from the row ids
+**Uncorrelated and intercept-free blocks.** A grouping's terms
+(`ReTerm`: in a formula `(x || g)`, `zerocorr(…)`, `(0 + x | g)`, or several
+terms on one grouping) do not change the route. The grouping is one block over
+all its columns, and `classify_design` counts its full width, as for an
+unstructured block. `LmmGroupings` derives a mask from the terms: the θ entries
+between two terms, and on a block without a random intercept the whole θ
+column of its intercept, are held at zero (`structural_theta`). Every outer
+search (`optim::bobyqa_minimize`, `optim::bfgs::bfgs_minimize`) runs on the
+free entries only. It gathers the start and the bounds over them, and a
+private `Masked` objective scatters each point back into the full θ, with the
+held entries at zero, before a kernel reads it. The search sizes, the
+curvature hint and the route gates count free θ; on a block with no held
+entry, which is every unstructured block, the drivers run the unmasked code
+unchanged. The kernels read the full packed θ as before. Held entries in a
+start are zeroed (`zero_structural`), and so again after each floor, guard and
+the sign and pin canonicalization. A block without a random intercept keeps
+its intercept column in the kernel at zero variance, and that column is hidden
+from every output (`drop_hidden`): `varcorr`, `tau2`, `stddev_se` and `ranef`
+report the block's slopes only. `Fit::df`, Satterthwaite and the GLMM joint
+Hessian count and differentiate free θ only. A masked block counts its full
+triangle against the dense envelope and the vector-AGQ limit `q_p ≤ 3`, so a
+block without a random intercept reaches them one slope sooner.
+
+The one hard rejection is a shape check: `check_model_shape` returns a
+`FitError` on inputs no model takes (a bad `nagq`, an out-of-range slope
+column, more than one nested grouping) — and, as a family × random-effects
+gate, on `(Family::InverseGaussian, Some(re))`: the GLMM objective needs a
+profiled `inverse.gaussian()$aic` term that is not built, so the entry refuses
+it before `build_workspace` allocates anything (`InverseGaussian` reaches only
+the fixed-only GLM arm above). The level-count clause reads the real `Crossed`
+level counts, so `build_workspace` sizes the spec from the row ids
 (`spec_sized_from_ids`) before classifying.
 
-**Code:** `fit_warm`/`fit_cold`, `Solver`, `FitOptions` (`src/fit/mod.rs`);
-`detect_aliased`, `fit_rank_deficient`, `assert_model_shape`,
-`spec_sized_from_ids` (`src/fit/common.rs`); `aliased_columns`, `ALIAS_EPS`
+**Code:** `fit`/`fit_with_start`, `fit_checked`, `FitError`, `Solver`,
+`FitOptions` (`src/fit/mod.rs`); `validate`, `detect_aliased`,
+`fit_rank_deficient`, `check_model_shape`,
+`spec_sized_from_ids` (`src/fit/common.rs`); `ReTerm` (`src/spec.rs`);
+`LmmGroupings::{structural_theta, zero_structural}` (`src/lmm/mod.rs`),
+`drop_hidden` (`src/lmm/re_map.rs`); `Masked` (`src/optim/mod.rs`);
+`aliased_columns`, `ALIAS_EPS`
 (`src/ols.rs`); envelope caps in `src/consts.rs`. **Convention:** lme4's
 rank-deficiency handling (drop aliased columns, `NA` coefficient, still
 converge); the `NoZ`/`Sparse` split is a per-shape kernel choice invisible to
@@ -114,6 +148,36 @@ routing boundary and both solver arms are pinned across the mixed corpus — see
 the LMM and GLMM pages for the per-kernel rungs (Dyestuff, sleepstudy,
 Penicillin, Pastes, sim_slope_extra on the Gaussian side; cbpp, grouseticks,
 `sim_sparse_binomial`, `sim_sparse_poisson` on the non-Gaussian side).
+
+**Conditional variances after the optimum.** `Fit::condvar` (lme4's
+`ranef(condVar = TRUE)`) and the pieces `predict` reads for its standard
+errors are formed once, when the `Fit` is assembled, from the factors at the
+optimum, and only when `FitOptions::condvar` asks for them (default `false`;
+the ports pass `true` by default); the search does not change. The matrix is `A = Λ̂ᵀZᵀWZΛ̂ + I`, with
+`W` the prior weights on the LMM (`LmmKernel::condvar_blocks`) and the
+observed curvature at the conditional modes on the GLMM
+(`glmm::condvar_blocks`, in `src/glmm/se.rs`). The GLMM first solves the
+mode again at the optimum, because the standard-error pass can leave its
+factors at another point, and puts the mode back afterwards. `A` is
+`[[F, B], [Bᵀ, T]]`, `F` block-diagonal over the families (a primary level
+with its nested children) and `T` the crossed tail. With the Schur complement
+`S = T − BᵀF⁻¹B` and `W_f = F_f⁻¹B_f`, a family's block of `A⁻¹` is
+`F_f⁻¹ + W_fS⁻¹W_fᵀ` and the tail's is `S⁻¹`. `Fit::condvar` keeps each
+level's own block of `Λ̂A⁻¹Λ̂ᵀ` (times `σ̂²` on the LMM), and the same solves
+give the rows of `Λ̂A⁻¹Λ̂ᵀZᵀWX` (`Fit::condvar_x`, from which the covariance
+between the modes and `β̂` follows). The covariance between levels of
+different groupings is kept in `CondvarCross` (`src/fit/mod.rs`): each
+family's whole block (a level and its nested children), the tail's `S⁻¹`, and
+`W_f`, rescaled to the reported columns, on the tail levels the family's rows
+share (the coupling), so its size
+grows with the families and with `t²` for `t` tail levels, never with `n²`.
+The solves cost far more than one deviance evaluation on a large crossed
+model: on `lmm_cross4_g30000p20_bal_base` (four crossed groupings of 1 500
+levels) about 9 ms against about 90 µs for one evaluation, close to the
+16 ms of the whole fit, which is why they are off by default. The sparse LMM solver, the dense LMM path with a slope
+on an extra grouping (`recover_ranef_blocked`) and the GLMM's packed layout
+form none (`condvar` is empty), since they would need a selected inverse of
+the whole `A`.
 
 ## Internal standardization of the design
 
@@ -147,9 +211,13 @@ column-major `x̃` buffer of the workspace.
 Centering is exact only where an intercept absorbs the constant `−mⱼβⱼ` it
 adds. In `X` that is the intercept column. A random slope is a column of `X`
 too, so its block reads the same `x̃ⱼ`, and there the block's own random
-intercept absorbs the shift: every random-effect block has one, in the same
-unrestricted covariance. `y ~ 0 + x + (1 + x | g)` therefore scales `x` without
-centering it.
+intercept absorbs the shift, but only when the slope is in the same
+unstructured term as that intercept. A slope in any other term (`(x || g)`, or
+a block without a random intercept) is scaled about zero and not centered, as
+a 0/1 slope is, and a column that is such a slope in one grouping is not
+centered in any. `y ~ 0 + x + (1 + x | g)` therefore scales `x` without
+centering it. A slope column of `Z_r` has no coefficient to absorb a shift,
+so it too is scaled about zero and never centered.
 
 The transform is a preconditioner, not a model change. The fit is the same
 model in other coordinates, nothing downstream assumes `x̃` has mean 0 or
@@ -236,12 +304,12 @@ and are not user-facing.
 
 | Knob | Meaning | Owned by |
 |---|---|---|
-| `target_indices` | fixed-effect columns to compute SE for | [OLS](#ordinary-least-squares-ols) / [GLM](#generalised-linear-models-glm) here; LMM SE in [`algorithms-lmm.md`](algorithms-lmm.md#standard-errors); GLMM SE in [`algorithms-glmm.md`](algorithms-glmm.md#standard-errors) |
+| `se_for` | fixed-effect columns to compute SE for: `SeFor::All` (default) or `SeFor::Only(columns)` | [OLS](#ordinary-least-squares-ols) / [GLM](#generalised-linear-models-glm) here; LMM SE in [`algorithms-lmm.md`](algorithms-lmm.md#standard-errors); GLMM SE in [`algorithms-glmm.md`](algorithms-glmm.md#standard-errors) |
 | `wald_se` | `Hessian` (default) vs `Rx` Wald covariance | GLMM only — [`algorithms-glmm.md`](algorithms-glmm.md#standard-errors) (ignored on OLS/GLM/LMM) |
 | `nagq` | AGQ node count, default 1 (Laplace) | GLMM only — [`algorithms-glmm.md`](algorithms-glmm.md#adaptive-gausshermite-quadrature-agq) |
 | `dispersion` | Gamma or inverse-Gaussian φ directive: `None` estimates, `Some(v)` fixes | [GLM Gamma and inverse-Gaussian](#generalised-linear-models-glm) here; Gamma GLMM in [`algorithms-glmm.md`](algorithms-glmm.md#laplace-approximation) |
-| `weights` | per-row prior weights `wᵢ`: precision weights on every family with an estimated dispersion (row `i` has dispersion `φ/wᵢ`) — Gaussian, Gamma, inverse-Gaussian; trial counts on aggregated Binomial; same fit either way on Poisson; multiply the log-likelihood on NB. See [`conventions.md`](conventions.md#prior-weights) | every path — [OLS](#ordinary-least-squares-ols)/[GLM](#generalised-linear-models-glm) here, mixed paths in the LMM/GLMM pages, **including** AGQ (`nagq > 1`) on the binomial/Poisson/NB/Gamma shapes AGQ covers |
-| `offset` | per-row offset `oᵢ` added to the linear predictor | every path — [OLS](#ordinary-least-squares-ols)/[GLM](#generalised-linear-models-glm) here, mixed paths in the LMM/GLMM pages |
+| `Data::weights` (on `Data`, not `FitOptions`) | per-row prior weights `wᵢ`: precision weights on every family with an estimated dispersion (row `i` has dispersion `φ/wᵢ`) — Gaussian, Gamma, inverse-Gaussian; trial counts on aggregated Binomial; same fit either way on Poisson; multiply the log-likelihood on NB. See [`conventions.md`](conventions.md#prior-weights) | every path — [OLS](#ordinary-least-squares-ols)/[GLM](#generalised-linear-models-glm) here, mixed paths in the LMM/GLMM pages, **including** AGQ (`nagq > 1`) on the binomial/Poisson/NB/Gamma shapes AGQ covers |
+| `Data::offset` (on `Data`, not `FitOptions`) | per-row offset `oᵢ` added to the linear predictor | every path — [OLS](#ordinary-least-squares-ols)/[GLM](#generalised-linear-models-glm) here, mixed paths in the LMM/GLMM pages |
 | `parallel_inner` | experimental opt-in to parallel inner kernels | GLMM only — AGQ/FD-Hessian, [`algorithms-glmm.md`](algorithms-glmm.md#standard-errors) (off by default, bit-identical to serial) |
 | `satterthwaite` | run the Satterthwaite pass after a Gaussian LMM fit (`Fit::coef_df`, `Fit::contrast_t`, `Fit::contrast_f`); default `true`, `false` leaves `coef_df` NaN and the contrasts return `NoDfReason::Disabled` | LMM only, [`algorithms-lmm.md`](algorithms-lmm.md#satterthwaite-degrees-of-freedom); OLS and the dispersion GLMs keep their residual df `n − p` whatever it says |
 | `reml` | the Gaussian criterion: `None` (default) and `Some(true)` fit a Gaussian mixed model by REML, `Some(false)` by ML; frozen on the workspace at build, and `Fit::reml` reports the resolved value. On OLS the estimates are the same under every value and `Some(true)` reports the REML log-likelihood. On a GLM or GLMM every value is the ML fit (`Some(true)` is ignored silently; the ports' `orchestrate::run_fit` strips it and sets `FitResult::reml_warning`) | LMM, [`algorithms-lmm.md`](algorithms-lmm.md#profiled-reml-and-ml-objectives); OLS, [OLS](#ordinary-least-squares-ols) here |
@@ -250,7 +318,7 @@ and are not user-facing.
 
 | Knob | Meaning | Owned by |
 |---|---|---|
-| `FitWorkspace::set_prestandardized` | `true` fits the design as given, skipping the per-draw standardization except the random-slope scale; default `false`. `fit_cold`/`fit_warm` always standardize | [internal standardization](#internal-standardization-of-the-design) |
+| `FitWorkspace::set_prestandardized` | `true` fits the design as given, skipping the per-draw standardization except the random-slope scale; default `false`. `fit`/`fit_with_start` always standardize | [internal standardization](#internal-standardization-of-the-design) |
 | `FitWorkspace::set_fixed_design` | `true` promises the same `x`, ids and weights on every following `fit_on` (only `y` and the offset change): the column statistics, the design fill and, on the dense LMM route, the fixed-effect factor and the design part of the sufficient statistics are reused; bit-identical; a debug build checks the promise by a hash; default `false` | [internal standardization](#internal-standardization-of-the-design), [`algorithms-lmm.md`](algorithms-lmm.md#fixed-effect-orthogonalization) |
 | `curvature_hint` / `fit_on_hinted` | a frozen inverse Hessian at a pilot fit's optimum that each later draw's BFGS search starts from (LMMs on the per-group route, over θ; binomial, Poisson and Gamma Laplace GLMMs and binomial logit/probit and Poisson AGQ GLMMs with one scalar random intercept on the gradient route, over `[θ \| β̃]`, and `[θ \| β̃ \| ln φ]` on a free Gamma dispersion, the pilot search's own estimate); read only, so results do not depend on call order; a hint of another search dimension panics | [`algorithms-lmm.md`](algorithms-lmm.md#gradient-search-on-the-per-group-route-bfgs), [`algorithms-glmm.md`](algorithms-glmm.md#gradient-search-bfgs-on-laplace-and-scalar-intercept-agq-fits) |
 | `satterthwaite(&mut ws, &mut df_out)` | the stable path's Satterthwaite df of the last `fit_on` draw, on demand (the loop tier runs no pass otherwise, so a `Fit` from `FitView::into_fit` carries no df); Gaussian LMM workspaces only; reads θ̂ without writing it, so it and `curvature_hint` run in either order; its buffers live on the workspace | [`algorithms-lmm.md`](algorithms-lmm.md#satterthwaite-degrees-of-freedom) (`src/fit/core.rs`) |
@@ -284,6 +352,7 @@ and are not user-facing.
 | `ETA_DIVERGENCE_CAP` | `30` — GLM divergence guard: a fit that ends unsettled (at `MAX_IRLS_ITERS`, on an η its link does not evaluate, or on a failed solve) with some `|η_i − η₀| > 30` and a last step that still moves some η by more than `SEPARATION_STEP` → non-converged and separated; crossing 30 alone stops nothing, `η₀ = oᵢ` on the binomial links and `oᵢ + ln μ₀` (the null-model seed) on the log links; skipped under the Gamma inverse and inverse-Gaussian `1/μ²` links | [GLM](#generalised-linear-models-glm) (`src/glm.rs`) |
 | `PROB_EPS` / `UPPER_TAIL_Q` / `LOG_TAIL_ETA` | `1e-12` / `1e-4` / `230` — tail-row switch: binomial μ within `1e-12` of 0 or `1e-4` of 1, NB/Gamma/IG-log `\|η\| > 230` → deviance, score and weights from their η forms | [GLM](#generalised-linear-models-glm) (`src/family.rs`) |
 | `STEP_ULPS` | `16` — GLM round-off stop: a step that moved no η by more than 16 ULPs of max \|η\| ends the fit as converged | [GLM](#generalised-linear-models-glm) (`src/glm.rs`) |
+| `CANONICAL_RISE` | `1e-3` — GLM step-halving threshold on the canonical links (logit, Poisson/log): a pass whose deviance rises by more than this (relative, with the stop rule's floor) is halved back; the other links halve above `DEVIANCE_TOL` | [GLM](#generalised-linear-models-glm) (`src/glm.rs`) |
 | `SEPARATION_STEP` | `0.01` — GLM separation stop: a deviance stop whose last step still moved some η by more than 0.01 → non-converged; skipped under the Gamma inverse and inverse-Gaussian `1/μ²` links | [GLM](#generalised-linear-models-glm) (`src/glm.rs`) |
 | `MAX_PRIMARY_Q` | `8` — primary width cap (over → Sparse) | [dispatch](#full-dispatch-map) (`src/consts.rs`) |
 | `MAX_EXTRA_Q` | `4` — per-extra-grouping width cap | [dispatch](#full-dispatch-map) (`src/consts.rs`) |
@@ -308,8 +377,8 @@ coordinate
 `OlsSuffStats::add_rows`,
 `fit_suff_stats_t_sq`, `PANEL_ROWS` (`src/ols.rs`). **Convention:** the textbook
 Gaussian OLS normal equations, with R `lm()`'s residual-df and dispersion
-conventions. **Validation:** `fit_ols_recovers_slope`, and for the weighted path
-`fit_ols_weighted_matches_r_lm` (`src/fit/ols_tests.rs`). OLS is the fixed-only
+conventions. **Validation:** `fit_ols_weighted_matches_r_lm`
+(`src/fit/ols_tests.rs`). OLS is the fixed-only
 Gaussian leaf and is not a dedicated mixed-model validation rung; it is exercised
 implicitly as the `q_p = 1` degenerate of the LMM kernels.
 
@@ -345,12 +414,12 @@ variance. `Fit::reml` is `true` then. β̂, the SEs, σ̂² and the RSS do not
 depend on it. The value is read at assembly (`ols_view_to_fit`), so an OLS
 workspace is not frozen on it.
 
-**Offset.** A `FitOptions::offset` is applied as an exact response pre-shift:
+**Offset.** A `Data::offset` is applied as an exact response pre-shift:
 the accumulator sees `y − o`, applied *before* any weight scaling so the two
 compose correctly. (The GLM path below handles its offset differently — inside
 η each iteration.)
 
-**WLS by row scaling.** Prior weights (`FitOptions::weights`) are applied as
+**WLS by row scaling.** Prior weights (`Data::weights`) are applied as
 `√wᵢ` row pre-scaling of both `X` and `y` before the unit-weight accumulator
 runs, so the Grams become `XᵀWX`, `XᵀWy`, `yᵀWy`; then `RSS = yᵀWy − β̂ᵀXᵀWy`
 is the weighted RSS and `σ̂² = RSS/(n − p)` keeps the raw-row df, matching
@@ -364,7 +433,8 @@ scaling; they are deliberately never mapped into `Fit`.
 `fit_glm_nb` (`src/fit/glm.rs`);
 the IRLS kernel `glm_irls_fit` with its constants `MAX_IRLS_ITERS = 50`,
 `DEVIANCE_TOL = 1e-12`, `WEIGHT_CLAMP = 1e-300`, `ETA_DIVERGENCE_CAP = 30`,
-`STEP_ULPS = 16`, `SEPARATION_STEP = 0.01` (`src/glm.rs`); the SIMD
+`STEP_ULPS = 16`, `SEPARATION_STEP = 0.01`, `CANONICAL_RISE = 1e-3`
+(`src/glm.rs`); the SIMD
 transcendental fast paths in `src/simd_transcendental.rs`; per-family link,
 variance and deviance in `src/family.rs`. **Convention:** McCullagh & Nelder
 IRLS with the canonical working response and prior-weight sense; R `glm()`'s
@@ -408,16 +478,41 @@ Two more stops read the step that produced the current β, `max_i |Δηᵢ|`:
   response's units.
 
 **Nearly collinear designs.** Each pass factors `X'WX` by Cholesky, and the
-Gram squares `X`'s condition number. From the first pass whose factor has a
-pivot ratio below `lmm::GRAM_PIVOT_MIN` (1e-3), every later pass solves for
-the step `β_new − β` from the working residual `z − η` instead of for `β_new`
-from `z`: the solve's error is then relative to a step that shrinks to zero,
-and the fixpoint is the one the residual defines. On such a pass the factor
-the SEs read is `Rᵀ` from a QR of `√W·X` at that pass's weights
-(`lmm::DesignQr`), as on the OLS route. On `[1, a, a + δb]` at cond(X) ≈ 2e6 the
-direct solve moved η by about 1e-3 per pass and the fit ran out its budget; now
-β and its SE match the well-conditioned `[1, a, b]` fit to about 1e-10. A
-design that never crosses the bound takes the direct solve, bit for bit.
+Gram squares `X`'s condition number. A pass whose factor has a pivot ratio
+below `lmm::GRAM_PIVOT_MIN` (1e-3), or whose factor fails, solves on
+`X̃ = X·U⁻¹` instead, `U` from a QR of `√W·X` at that pass's weights
+(`lmm::DesignQr`), as the OLS route and the GLMM's Schur do: the Cholesky of
+`X̃'WX̃` is well conditioned, and `β = U⁻¹β̃`. From the first such pass on,
+every pass also solves for the step `β_new − β` from the working residual
+`z − η` instead of for `β_new` from `z`: the solve's error is then relative to
+a step that shrinks to zero, and the fixpoint is the one the residual defines.
+On such a pass the factor the SEs read is `Uᵀ·L̃`, `L̃` the Cholesky factor of
+`X̃'WX̃`. Where the QR has a zero or non-finite diagonal at a column that is
+not zero under the weights, that column has broken down: its row of `U` and
+its row and column of `X̃'WX̃` are set to the unit vector, so the step along it
+is zero and it stays at its start value, and the Newton step is skipped on
+that pass. A fit whose last solve broke down keeps its estimates, deviance and
+`converged`, and withholds its SEs (`GlmFitView::se_unavailable`,
+`Note::SeUnavailable` with `Note::IllConditioned` naming the column, whose
+`Fit::beta` is NaN). A column zero under the weights keeps the Gram's own
+factor, and a failed factor on `X̃` ends the fit not converged. On
+`[1, a, a + δb]` at cond(X) ≈ 2e6 a solve from the Gram moves η by about 1e-3
+per pass and the fit runs out its budget; the solve on `X̃` matches β and its
+SE to the well-conditioned `[1, a, b]` fit to about 1e-10. At `δ = 2⁻²⁷`
+(pivot ratio 5e-17) the Gram is singular to rounding, and the solve on `X̃`
+still lands β within 1e-8 of that fit. The linear predictor then sums terms
+near 1e8 that cancel, so it carries about 1e-8 of rounding, and the deviance
+moves more than the relative stop allows from one pass to the next. From the
+first pass solved on `X̃` on, the round-off stop is therefore measured against
+the size of those terms, `maxᵢ (|oᵢ| + Σⱼ |xᵢⱼβⱼ|)`, instead of `max |η|`, and
+the logit, probit and Poisson fits converge there. Once the round-off bound
+exceeds `SEPARATION_STEP` (0.01), the step can no longer show whether the fit is
+still moving: a stop there is not converged, and separated when some η is past
+`ETA_DIVERGENCE_CAP`. A fit with no finite maximum ends there when a solve on a
+singular `X'WX` throws η out to 1e15 or beyond, after which η absorbs every
+step; the most collinear designs, whose terms pass about 3e12, end not
+converged.
+A design that never crosses the bound takes the direct solve, bit for bit.
 
 When the separation stop fires, or the divergence guard judges the unsettled
 end of a binomial, Poisson or NB fit as running off, the view's `separated`
@@ -537,7 +632,7 @@ where the true objective is flat too. `MU_FLOOR` floors only the Poisson and
 negative-binomial null means (`family::clamp_mu`); Gamma and inverse-Gaussian
 responses are positive and are never floored.
 
-**Offset.** With `FitOptions::offset`, the linear predictor is `η = o + Xβ`
+**Offset.** With `Data::offset`, the linear predictor is `η = o + Xβ`
 throughout; each IRLS iteration solves the weighted normal equations against
 the shifted working response `z − o`, so β never absorbs the offset.
 
@@ -583,11 +678,11 @@ loop, all in `glm_irls_fit`:
   solve would otherwise put every row near η → 0 (μ → ∞), where each row's
   deviance flattens to 1/y and the relative rule stops on that plateau.
 
-**Step-halving** runs on the non-canonical links (probit, cloglog, Gamma,
-NB, inverse-Gaussian), as in R package glm2 (Marschner 2011): when the
-deviance at the β a solve produced rises above the accepted one by more than
-`DEVIANCE_TOL` (relative, with the stop rule's floor), is not finite, or comes
-from an η the link does not evaluate, β moves half way back toward the
+**Step-halving** runs on every link, as in R package glm2 (Marschner 2011):
+when the deviance at the β a solve produced rises above the accepted one by
+more than `DEVIANCE_TOL` (relative, with the stop rule's floor;
+`CANONICAL_RISE = 1e-3` on the canonical links, see below), is not finite, or
+comes from an η the link does not evaluate, β moves half way back toward the
 accepted β and the deviance is re-evaluated, up to `PIRLS_MAX_HALVINGS = 16`
 times per pass. R's `glm.fit` halves only on the last two. Fisher steps raise
 the deviance where the observed curvature is far from the expected one: from
@@ -597,10 +692,18 @@ within the PIRLS band (`pirls_tol`) it is the deviance's own round-off (the
 Fisher step is a descent direction), and the round-off stop ends the fit as
 converged — at large NB counts that round-off sits above `DEVIANCE_TOL`. An
 infeasible or non-finite one ends the fit non-converged. A cold seed's η is not
-`Xβ`, so the first solve is never halved. The canonical links (logit,
-Poisson/log) skip it: their deviance is convex and Fisher scoring is Newton's
-method there, and the unweighted-logit hot path stays one family pass per
-iteration. A fit whose deviance never rises is untouched. (The mixed PIRLS
+`Xβ`, so the first solve is never halved. On the canonical links (logit,
+Poisson/log) the deviance is convex and Fisher scoring is Newton's method, but
+from a far start on a nearly singular `XᵀWX` a Newton step can still overshoot
+and the fit runs off: on an ill-conditioned logit design the first bad pass
+raises the deviance by 18% (relative), and the steps after it grow without
+bound. A canonical link therefore halves only on a rise above `CANONICAL_RISE`.
+A lower threshold would halve on noise: the deviance's own round-off reaches
+about 1e-6 relative at Poisson counts near 2.6e10 (see `STEP_ULPS`), and
+halving at `DEVIANCE_TOL` moved 14 well-conditioned fits. So the
+unweighted-logit hot path stays one family pass per iteration on every pass
+whose deviance does not rise by more than 1e-3. A fit whose deviance never
+rises is untouched. (The mixed PIRLS
 loop halves in the same retrospective form — see
 [`algorithms-glmm.md`](algorithms-glmm.md#pirls-inner-loop).) The other
 relaxation is **period-2 damping**, with the PIRLS constants
@@ -720,7 +823,7 @@ analysis) need to swap family and RE structure without changing API.
 
 | | entry surface | fixed-only models | rank-deficient X |
 |---|---|---|---|
-| `glmm` | `fit_cold`/`fit_warm`, one dispatch over `(family, re)` | built in (OLS, IRLS GLM, NB outer loop) | drop aliased columns, `NaN` coefficients, fit converges (lme4 convention, `dqrdc2` column order) |
+| `glmm` | `fit`/`fit_with_start`, one dispatch over `(family, re)` | built in (OLS, IRLS GLM, NB outer loop) | drop aliased columns, `NaN` coefficients, fit converges (lme4 convention, `dqrdc2` column order) |
 | lme4 | `lmer`/`glmer` | delegated to base R `lm()`/`glm()` (`MASS::glm.nb` for NB) | drop aliased columns, `NA` coefficients |
 | MixedModels.jl | `LinearMixedModel`/`GeneralizedLinearMixedModel` | delegated to the separate GLM.jl package | pivots the fixed-effect matrix to a full-rank subset |
 | GLMMadaptive | `mixed_model()` | none (mixed models only) | not applicable here — see the GLMM page |

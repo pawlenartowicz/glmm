@@ -101,7 +101,7 @@ main <- function() {
   runs <- setNames(lapply(ORACLES, function(o) {
     if (is.null(V)) return(NULL)
     required <- names(Filter(function(cl) o %in% cl[["oracles"]], manifest_cells))
-    safe(reclassify_capped_oracle(newest_oracle_run(GRID, o, V[[o]], required),
+    safe(reclassify_lme4_on_read(newest_oracle_run(GRID, o, V[[o]], required),
                                   o, manifest_cells), o)
   }), ORACLES)
 

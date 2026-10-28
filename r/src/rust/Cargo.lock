@@ -83,9 +83,9 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "commonstats"
-version = "0.2.2"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c1779773f7b9a8102504c8f81f59fee44dedd28491c6013c9f4811940bb7c6d"
+checksum = "835364f47bd1a84ea69698d93d8dbd5ff5f910d8b109d651d9d7cd4d70424237"
 dependencies = [
  "libm",
  "rand_philox",
@@ -324,7 +324,7 @@ dependencies = [
 
 [[package]]
 name = "fastglmm"
-version = "0.6.2"
+version = "0.7.0"
 dependencies = [
  "extendr-api",
  "glmm-r",
@@ -490,18 +490,19 @@ dependencies = [
 
 [[package]]
 name = "glmm"
-version = "0.6.2"
+version = "0.7.0"
 dependencies = [
  "bobyqa",
  "commonstats",
  "faer",
+ "libm",
  "pulp",
  "regex",
 ]
 
 [[package]]
 name = "glmm-r"
-version = "0.6.2"
+version = "0.7.0"
 dependencies = [
  "extendr-api",
  "glmm",

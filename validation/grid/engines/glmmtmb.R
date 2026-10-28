@@ -104,16 +104,19 @@ make_fit <- function(cell, df) {
   wcol <- cell[["weights_col"]]
   fam <- fam_obj(cell[["family"]], cell[["link"]])
   reml <- !is_glm(cell) && isTRUE(cell[["reml"]])
-  wv <- if (is.null(wcol)) NULL else df[[wcol]]
+  # `.wv` and `.w`, not `wv` and `w`: lm/glm/lmer/glmmTMB look `weights` up in `data` first, so a
+  # local named like a data column (sim_dynrange_lmm has a predictor `w`) would
+  # silently fit with that column as the prior weights.
+  .wv <- if (is.null(wcol)) NULL else df[[wcol]]
   disp <- NULL
   if (!is.null(wcol) && cell[["family"]] %in% c("gaussian", "gamma")) {
     scale <- if (cell[["family"]] == "gaussian") "-0.5" else "1"
     disp <- stats::as.formula(sprintf("~ offset(%s * log(%s))", scale, wcol))
   }
-  w <- if (is.null(disp)) wv else NULL
+  .w <- if (is.null(disp)) .wv else NULL
   fit_from <- function(start = NULL) {
     if (is.null(disp))
-      glmmTMB::glmmTMB(fm, data = df, family = fam, weights = w, REML = reml,
+      glmmTMB::glmmTMB(fm, data = df, family = fam, weights = .w, REML = reml,
                        start = start)
     else
       glmmTMB::glmmTMB(fm, data = df, family = fam, dispformula = disp,
@@ -123,7 +126,7 @@ make_fit <- function(cell, df) {
     msg <- conditionMessage(e)
     if (!grepl("NaN at starting parameter values", msg, fixed = TRUE)) stop(e)
     b0 <- stats::coef(stats::glm(reformulas::nobars(fm), data = df, family = fam,
-                                 weights = wv))
+                                 weights = .wv))
     warning("default start failed (", msg, "); refitted from the fixed-effects GLM beta")
     fit_from(list(beta = unname(b0)))
   }))

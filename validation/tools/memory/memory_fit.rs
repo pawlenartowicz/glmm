@@ -17,7 +17,7 @@
 //! else needs to reach stdout.
 
 use glmm::formula::lower;
-use glmm::{fit_cold, BinomialLink, Family, PoissonLink};
+use glmm::{BinomialLink, Family, FitOptions, PoissonLink};
 
 #[path = "../common.rs"]
 mod harness_common;
@@ -67,9 +67,10 @@ fn main() {
 
     let (header, rows) = read_csv_path(csv);
     let table = build_table(&header, &rows, &factors);
-    let mut lo = lower(formula, &table, family).unwrap_or_else(|e| panic!("lower: {e}"));
-    lo.opts.nagq = nagq;
+    let lo = lower(formula, &table, family).unwrap_or_else(|e| panic!("lower: {e}"));
+    let mut fit_opts = FitOptions::default();
+    fit_opts.nagq = nagq;
 
-    let fit = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+    let fit = glmm::fit(&lo.data(), lo.spec(), &fit_opts).unwrap();
     println!("n={} p={} converged={}", lo.n, lo.p, fit.converged());
 }

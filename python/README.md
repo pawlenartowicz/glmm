@@ -33,7 +33,7 @@ the browser under Pyodide: a Pyodide wheel is attached to each
 
 ## Validation
 
-glmm is checked on 923 test models before every release. They cover the
+glmm is checked on 947 test models before every release. They cover the
 Gaussian, binomial, Poisson, Gamma and negative binomial families, random
 intercepts, correlated slopes, nested and crossed groupings, and data from 60 to
 30,000 rows. Each model is also fitted by lme4, glmmTMB, MixedModels.jl and
@@ -115,6 +115,8 @@ fit.coef_df, fit.confint()        # t-test df (Satterthwaite on an LMM), interva
 fit.converged, fit.singular       # result flags
 glmm.anova(fit)                   # tests of the fixed terms (Type III)
 glmm.compare(data, "y ~ x1", "y ~ x1 + (1 | subject)")  # two nested models, fitted and compared
+glmm.pairwise(fit, "f")           # pairwise comparisons of the levels of factor f (Holm)
+fit.predict(new_data)             # predictions on new rows
 ```
 
 ## Documentation

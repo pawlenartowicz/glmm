@@ -16,8 +16,8 @@
 //!
 //! The registry rule: an end-to-end quantity past its band passes only under an
 //! `oracle-tier` entry of `validation/grid/divergences.json` whose `cell` is the
-//! reference's name and whose `quantities` hold `df`, `p_value`, `lrt`, `f` or
-//! `confint` ([`QUANTITIES`]). The in-crate gate at lme4's θ̂ compares the same
+//! reference's name and whose `quantities` hold `df`, `p_value`, `lrt`, `f`,
+//! `confint`, `r2`, `icc`, `eta2` or `posthoc` ([`QUANTITIES`]). The in-crate gate at lme4's θ̂ compares the same
 //! references under its own labels (`df_at_lme4`, `dendf_at_lme4`,
 //! `f_at_lme4`), so each driver reads only the entries under its labels.
 //! [`inference_tier`] then fails on every such entry on a compared reference that
@@ -42,6 +42,22 @@
 //! [`run_fit`] under `anova_test = "LRT"`; their statistic is the quantity
 //! `lrt`.
 //!
+//! The effect sizes (`kind` `effectsize`): [`effect_sizes`] reads R², the ICC
+//! and the partial η² of each term row against performance's and
+//! effectsize's.
+//!
+//! The pairwise comparisons (`kind` `posthoc`): [`posthoc_rows`] reads the
+//! rows of [`pairwise`] (quantity `posthoc`) and their intervals (`confint`)
+//! against emmeans'.
+//!
+//! The extended-precision GLM references on ill-conditioned designs (`kind`
+//! `conditioning`, with `loop_advanced`) gate one fit:
+//! `design_b_logit_halves_back_from_an_overshoot` asserts that design b's
+//! unweighted logit fit at `τ_ref` 3.6e-11 converges at the reference β.
+//! `conditioning_report` fits them all through the loop tier and prints the
+//! accuracy per decade of the reference pivot ratio, asserting only how many
+//! fits it ran.
+//!
 //! Where a gate goes: an integration gate on the public surface joins [`GATES`].
 //! A gate on a `pub(crate)` item cannot be reached from here, so it lives in an
 //! in-crate test file with its own driver, which asserts the same `stale_entries`
@@ -63,21 +79,25 @@
 mod oracle_support;
 
 use glmm::formula::anova::{
-    compare, term_tests, ChoiceReason, CompareOptions, ComparisonTest, Model, SsType, TermTable,
-    TermTest, TermTestError, TermTestOptions,
+    compare, term_tests, ChoiceReason, CompareOptions, ComparisonTest, SsType, TermTable, TermTest,
+    TermTestError, TermTestOptions,
 };
-use glmm::formula::{Column, Lowered};
+use glmm::formula::{fit_lowered, pairwise, Adjust, By, Column, Model, Pairwise};
 use glmm::inference::{LinearKind, LinearTest, LrTest, Reference};
 use glmm::orchestrate::run_fit;
-use glmm::{BinomialLink, Family, Fit, GammaLink, NegBinomialLink, Note, PoissonLink, WaldSe};
+use glmm::{
+    BinomialLink, Family, Fit, FitOptions, GammaLink, NegBinomialLink, Note, PoissonLink, WaldSe,
+};
 use oracle_support::{assert_rel, assert_rel_to, divergence, inference, inference_lowered, tol};
 use serde_json::Value;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::OnceLock;
 
 /// The registry quantities this driver adjudicates; an entry under any other
 /// label belongs to another driver.
-const QUANTITIES: &[&str] = &["df", "p_value", "lrt", "f", "confint"];
+const QUANTITIES: &[&str] = &[
+    "df", "p_value", "lrt", "f", "confint", "r2", "icc", "eta2", "posthoc",
+];
 
 /// One end-to-end gate: it adds the name of every reference it compared.
 type Gate = fn(&mut BTreeSet<String>);
@@ -90,6 +110,8 @@ const GATES: &[(&str, Gate)] = &[
     ("anova_pairs", anova_pairs),
     ("anova_term_rows", anova_term_rows),
     ("anova_lrt_rows", anova_lrt_rows),
+    ("effect_sizes", effect_sizes),
+    ("posthoc_rows", posthoc_rows),
 ];
 
 fn numbers(v: &Value, what: &str) -> Vec<f64> {
@@ -100,13 +122,13 @@ fn numbers(v: &Value, what: &str) -> Vec<f64> {
         .collect()
 }
 
-/// A reference's name, JSON, `fit_cold` fit and the caller column of each of
+/// A reference's name, JSON, `glmm::fit` fit and the caller column of each of
 /// its coefficients.
 type RefFit = (String, Value, Fit, Vec<usize>);
 
 /// The per-coefficient lmerTest references of both criteria (X7: kind
 /// `lmertest` with `proposal_dependent` false; `reml` true or false), each
-/// fitted end to end by `fit_cold` on its lowered formula (the ML ones with
+/// fitted end to end by `glmm::fit` on its lowered formula (the ML ones with
 /// `reml = Some(false)`), with its JSON and the caller column of each of the
 /// reference's coefficients. Fitted once per process, for every gate that
 /// reads them.
@@ -131,8 +153,8 @@ fn fit_lmertest_references() -> Vec<RefFit> {
         .map(|e| {
             assert!(!e.is_pending(), "{}: not frozen", e.name);
             let json = inference::load(inference::Kind::Lmertest, &e.name);
-            let lo = inference_lowered(&e);
-            let fit = glmm::fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+            let (lo, fit_opts) = inference_lowered(&e);
+            let fit = glmm::fit(&lo.data(), lo.spec(), &fit_opts).unwrap();
             assert_eq!(
                 Some(fit.reml),
                 e.raw["reml"].as_bool(),
@@ -272,14 +294,6 @@ const PAIR_CASES: &[&str] = &[
 /// linear hypothesis, read through [`term_tests`].
 const TERM_CASES: &[&str] = &["car_glmm", "car_glm", "car_lm", "linear_hypothesis"];
 
-/// The pairs with a model glmm's formula frontend refuses: a random
-/// slope whose variable is not a fixed term (`Reaction ~ 1 + (Days |
-/// Subject)`, `formula::Error::SlopeVarNotInDesign`, a documented limit).
-/// The gate asserts the refusal and compares nothing, so the name is not
-/// recorded; once the frontend admits the model, the assertion goes red and
-/// the pair joins the gate.
-const REFUSED_PAIRS: &[&str] = &["anova_ml_pair_sleepstudy_fixed"];
-
 /// Pair sides whose frozen `logLik` is lme4's `glmer.nb`, as (pair, side,
 /// golden): `glmer.nb` maximises another objective than the Laplace
 /// approximation glmm and glmmTMB maximise (the goldens tier's registered
@@ -302,14 +316,14 @@ const ENVELOPE_OPTS: CompareOptions = CompareOptions {
     seed: 20261012,
 };
 
-/// One fitted side of a comparison, or the one fit of a per-term table.
+/// One fitted side of a comparison, or the one fit of a per-term table, with
+/// the options it was fitted with.
 struct Side {
-    lo: Lowered,
-    fit: Fit,
+    opts: FitOptions,
     model: Model,
 }
 
-/// A manifest member's family and link.
+/// The family and link of a manifest member, or of a `conditioning` entry.
 fn member_family(m: &Value) -> Family {
     match (
         m["family"].as_str().expect("a member family"),
@@ -318,6 +332,9 @@ fn member_family(m: &Value) -> Family {
         ("gaussian", "identity") => Family::Gaussian,
         ("binomial", "logit") => Family::Binomial {
             link: BinomialLink::Logit,
+        },
+        ("binomial", "probit") => Family::Binomial {
+            link: BinomialLink::Probit,
         },
         ("poisson", "log") => Family::Poisson {
             link: PoissonLink::Log,
@@ -336,15 +353,18 @@ fn member_family(m: &Value) -> Family {
 /// and `nAGQ`, and `FitOptions::reml = reml`.
 fn fit_side(e: &inference::Entry, member: &Value, formula: &str, reml: Option<bool>) -> Side {
     let family = member_family(member);
-    let mut lo = oracle_support::lower_on_entry(e, formula, family, member["weights"].as_str())
+    let lo = oracle_support::lower_on_entry(e, formula, family, member["weights"].as_str())
         .unwrap_or_else(|err| panic!("{} ({formula}): {err}", e.name));
-    lo.opts.reml = reml;
+    let mut fit_opts = FitOptions::default();
+    fit_opts.reml = reml;
     if let Some(k) = member["nAGQ"].as_u64() {
-        lo.opts.nagq = u8::try_from(k).expect("nAGQ fits a u8");
+        fit_opts.nagq = u8::try_from(k).expect("nAGQ fits a u8");
     }
-    let fit = glmm::fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
-    let model = Model::from_fit(&oracle_support::glmm_formula(formula), &lo, &fit);
-    Side { lo, fit, model }
+    let model = fit_lowered(&oracle_support::glmm_formula(formula), lo, &fit_opts).unwrap();
+    Side {
+        opts: fit_opts,
+        model,
+    }
 }
 
 /// A member fitted as its case needs: a Gaussian member on the criterion of
@@ -496,23 +516,6 @@ fn anova_pairs(compared: &mut BTreeSet<String>) {
         let json = inference::load(inference::Kind::Anova, name);
         let members = e.raw["members"].as_array().expect("members");
         let reference = json["reference"].as_str().expect("a reference");
-        if REFUSED_PAIRS.contains(&name) {
-            let refused = members.iter().any(|m| {
-                let formula = m["formula"].as_str().expect("a member formula");
-                let lowered = oracle_support::lower_on_entry(
-                    &e,
-                    formula,
-                    member_family(m),
-                    m["weights"].as_str(),
-                );
-                matches!(lowered, Err(glmm::formula::Error::SlopeVarNotInDesign(_)))
-            });
-            assert!(
-                refused,
-                "{name}: the frontend now admits both models; gate the pair"
-            );
-            continue;
-        }
         if case == "ranova" {
             let member = &members[0];
             let full_formula = json["full"]["formula"].as_str().expect("full formula");
@@ -530,8 +533,8 @@ fn anova_pairs(compared: &mut BTreeSet<String>) {
                 let improved = deviance_gate(
                     &at,
                     [
-                        (&reduced.fit, number(&row["logLik"], &at)),
-                        (&full.fit, full_ll),
+                        (reduced.model.fit(), number(&row["logLik"], &at)),
+                        (full.model.fit(), full_ll),
                     ],
                 );
                 let c = compare(&reduced.model, &full.model, &ENVELOPE_OPTS)
@@ -567,7 +570,10 @@ fn anova_pairs(compared: &mut BTreeSet<String>) {
             let improved = reference != "wald_f"
                 && (deviance_gate(
                     name,
-                    [(&sides[0].fit, logliks[0]), (&sides[1].fit, logliks[1])],
+                    [
+                        (sides[0].model.fit(), logliks[0]),
+                        (sides[1].model.fit(), logliks[1]),
+                    ],
                 ) || other_objective);
             let c = compare(&sides[0].model, &sides[1].model, &ENVELOPE_OPTS)
                 .unwrap_or_else(|err| panic!("{name}: {err}"));
@@ -600,14 +606,14 @@ fn anova_pairs(compared: &mut BTreeSet<String>) {
 /// they stay Wald whatever the default test gives; a fit whose rows are F
 /// tests refuses an explicit test, so its table takes the default, which must
 /// be its F table (a χ² fit that refused the Wald test fails here).
-fn term_table(lo: &Lowered, fit: &Fit, ss_type: SsType) -> Result<TermTable, TermTestError> {
+fn term_table(model: &Model, ss_type: SsType) -> Result<TermTable, TermTestError> {
     let mut opts = TermTestOptions::default();
     opts.ss_type = ss_type;
     opts.test = TermTest::Wald;
-    match term_tests(lo, fit, &opts) {
+    match term_tests(model, &opts) {
         Err(TermTestError::FTable { .. }) => {
             opts.test = TermTest::Auto;
-            let table = term_tests(lo, fit, &opts);
+            let table = term_tests(model, &opts);
             if let Ok(t) = &table {
                 assert_eq!(
                     t.choice.test,
@@ -654,17 +660,16 @@ fn anova_term_rows(compared: &mut BTreeSet<String>) {
         let name = e.name.as_str();
         let json = inference::load(inference::Kind::Anova, name);
         let side = fit_member(&e, &e.raw["members"][0]);
-        let glmm_wald = side.lo.model.re.is_some();
+        let (lo, fit) = (side.model.lowered(), side.model.fit());
+        let glmm_wald = lo.model.re.is_some();
         if glmm_wald {
             assert_eq!(
-                side.lo.opts.wald_se,
+                side.opts.wald_se,
                 WaldSe::Hessian,
                 "{name}: the Wald SEs must be the Hessian ones (car's vcov is lme4's Hessian)"
             );
             assert!(
-                !side
-                    .fit
-                    .diagnostics
+                !fit.diagnostics
                     .notes
                     .iter()
                     .any(|n| matches!(n, Note::HessianSeFallback)),
@@ -677,8 +682,8 @@ fn anova_term_rows(compared: &mut BTreeSet<String>) {
             vec![("type2", SsType::Type2), ("type3_sum", SsType::Type3)]
         };
         for (table, ss_type) in tables {
-            let got = term_table(&side.lo, &side.fit, ss_type)
-                .unwrap_or_else(|err| panic!("{name}: {err}"));
+            let got =
+                term_table(&side.model, ss_type).unwrap_or_else(|err| panic!("{name}: {err}"));
             let rows: Vec<Value> = if table.is_empty() {
                 // The linear hypothesis as the row of the term owning its columns.
                 let tested: Vec<&str> = json["row_names"]
@@ -687,14 +692,13 @@ fn anova_term_rows(compared: &mut BTreeSet<String>) {
                     .iter()
                     .map(|s| s.as_str().expect("a column name"))
                     .collect();
-                let term = side
-                    .lo
+                let term = lo
                     .terms
                     .iter()
                     .find(|t| {
                         t.columns
                             .clone()
-                            .map(|j| side.lo.col_names[j].as_str())
+                            .map(|j| lo.col_names[j].as_str())
                             .eq(tested.iter().copied())
                     })
                     .unwrap_or_else(|| panic!("{name}: no term owns {tested:?}"));
@@ -831,8 +835,9 @@ fn entry_columns(
 /// against the frozen rows: the same terms in the same order, every row a
 /// likelihood-ratio χ² with no note, referred to χ² on the frozen df exactly,
 /// the statistic within `LRT_ABS` (quantity `lrt`) and the p-value within
-/// `LT_LR_P_REL` (quantity `p_value`). No frozen model has a random slope, so no
-/// row may fall back to the Wald χ². The registry may excuse a miss (no
+/// `LT_LR_P_REL` (quantity `p_value`). A term whose columns carry a random
+/// slope is gated the same way: its refit keeps the slope, and its row is a
+/// likelihood-ratio row like any other. The registry may excuse a miss (no
 /// deviance gate can: these entries freeze no `logLik`). [`LRT_SEQUENTIAL`]
 /// is left out; its model's Type II rows are read from
 /// [`LRT_TYPE2_COMPANION`].
@@ -874,6 +879,7 @@ fn anova_lrt_rows(compared: &mut BTreeSet<String>) {
             None,
             None,
             None,
+            true,
             true,
             None,
             "LRT",
@@ -957,6 +963,484 @@ fn anova_lrt_rows(compared: &mut BTreeSet<String>) {
     );
 }
 
+// ── Effect sizes ────────────────────────────────────────────────────────────
+
+/// The effect sizes (`kind` `effectsize`), end to end on glmm's fit of each
+/// entry's one member: `performance::r2_nakagawa`'s marginal and conditional
+/// R² (quantity `r2`) and `performance::icc`'s adjusted and unadjusted ICC
+/// (`icc`) through [`Fit::r2`] and [`Fit::icc`], within `R2_ICC_REL`, on the
+/// mixed models; and `effectsize::F_to_eta2` on each fixed-term row of the
+/// reference's Type III table (`eta2`) against [`FixedRow::eta2_partial`] of
+/// glmm's, within `ETA2_REL`. The frozen tables have no `(Intercept)` row;
+/// on `lm` and `glm` they are car's on the `contr.sum` refit, on the LMMs
+/// lmerTest's Satterthwaite tables, whose DenDF carries lmerTest's
+/// numerical-derivative noise (222.0000014 on `effectsize_cake`'s `temp`,
+/// an integer df), which moves η² far less than the band.
+///
+/// [`FixedRow::eta2_partial`]: glmm::formula::anova::FixedRow::eta2_partial
+fn effect_sizes(compared: &mut BTreeSet<String>) {
+    let mut worst: BTreeMap<&str, f64> = BTreeMap::new();
+    let mut gap = |ctx: &str, quantity: &'static str, got: f64, want: f64, band: f64| {
+        let r = ((got - want) / want).abs();
+        eprintln!("EFFECT {ctx}: glmm {got:.10e} oracle {want:.10e} rel {r:.3e} (band {band:.0e})");
+        let w = worst.entry(quantity).or_insert(0.0);
+        *w = w.max(r);
+        assert_rel(got, want, band, ctx);
+    };
+    let (mut with_r2_icc, mut with_eta2) = (0, 0);
+    let mut names = Vec::new();
+    for e in inference::entries(inference::Kind::Effectsize) {
+        assert!(!e.is_pending(), "{}: not frozen", e.name);
+        let name = e.name.as_str();
+        let json = inference::load(inference::Kind::Effectsize, name);
+        let side = fit_member(&e, &e.raw["members"][0]);
+        let (lo, fit) = (side.model.lowered(), side.model.fit());
+        if !json["r2"].is_null() || !json["icc"].is_null() {
+            let (data, spec) = (lo.data(), lo.spec());
+            let r2 = fit
+                .r2(&data, spec)
+                .unwrap_or_else(|err| panic!("{name}: r2: {err}"));
+            let icc = fit
+                .icc(&data, spec)
+                .unwrap_or_else(|err| panic!("{name}: icc: {err}"));
+            for (q, field, got) in [
+                ("r2", "marginal", r2.marginal),
+                ("r2", "conditional", r2.conditional),
+                ("icc", "adjusted", icc.adjusted),
+                ("icc", "unadjusted", icc.unadjusted),
+            ] {
+                let want = number(&json[q][field], &format!("{name}: {q}.{field}"));
+                gap(
+                    &format!("{name}: {q}[{field}]"),
+                    q,
+                    got,
+                    want,
+                    tol::R2_ICC_REL,
+                );
+            }
+            with_r2_icc += 1;
+        }
+        if let Some(rows) = json["eta2"].as_array() {
+            let table = term_table(&side.model, SsType::Type3)
+                .unwrap_or_else(|err| panic!("{name}: {err}"));
+            assert_eq!(table.fixed.len(), rows.len(), "{name}: every term");
+            for row in rows {
+                let term = row["term"].as_str().expect("a term");
+                let r = table
+                    .fixed
+                    .iter()
+                    .find(|r| r.label == term)
+                    .unwrap_or_else(|| panic!("{name}: no row {term}"));
+                let want = number(&row["eta2_partial"], &format!("{name}: {term}"));
+                let ctx = format!("{name}: eta2[{term}]");
+                gap(&ctx, "eta2", r.eta2_partial(), want, tol::ETA2_REL);
+            }
+            with_eta2 += 1;
+        }
+        compared.insert(e.name.clone());
+        names.push(e.name);
+    }
+    eprintln!("EFFECT compared {}: {names:?}", names.len());
+    eprintln!("EFFECT worst rel per quantity: {worst:?}");
+    assert_eq!(
+        (with_r2_icc, with_eta2),
+        (7, 6),
+        "effect_sizes: entries with R² and ICC, entries with η² rows"
+    );
+}
+
+// ── Pairwise comparisons ────────────────────────────────────────────────────
+
+/// The `posthoc` entries whose Tukey p-values are not compared against
+/// emmeans': their df (about 5 on `posthoc_machines`, about 10 on
+/// `posthoc_oats`) lie outside the df region where R's `ptukey` is known to
+/// agree with the studentized range glmm uses ([`ptukey_df_agrees`]). The
+/// crate's own Tukey tests cover those df (the k = 2 identity with the t
+/// test, and the adjusted p as the studentized-range tail of each row).
+const TUKEY_UNCOMPARED: &[&str] = &["posthoc_machines", "posthoc_oats"];
+
+/// The smallest tail, upper or lower, at which a frozen Tukey p-value is
+/// compared. R's `ptukey(lower.tail = FALSE)` is `1 − ptukey(lower)`: it
+/// integrates the lower tail and subtracts, so an upper tail far below 1
+/// carries the absolute rounding error of the lower one and is cancellation
+/// noise (5.97e-10 frozen where a quadrature of the upper tail itself, with
+/// no subtraction, gives 1.13e-10, at k = 3 and df 94). `commonstats`'
+/// studentized-range doc comment gives its agreement with `ptukey` only
+/// where both tails are at least this; a row outside is not compared.
+const PTUKEY_TAIL_MIN: f64 = 1e-3;
+
+/// The confidence level of the frozen `confint` rows.
+const POSTHOC_LEVEL: f64 = 0.95;
+
+/// The df on which R's `ptukey(q, k, df)` agrees with `commonstats`'
+/// studentized range to 1e-5 relative, as that type's doc comment measured
+/// (with both tails at least [`PTUKEY_TAIL_MIN`]): df infinite, or
+/// 30 ≤ df ≤ 25000.
+fn ptukey_df_agrees(df: f64) -> bool {
+    df == f64::INFINITY || (30.0..=25000.0).contains(&df)
+}
+
+/// Holm's step-down adjustment of `p`: R's `p.adjust(p, "holm")`,
+/// `min(1, cummax((m − i + 1)·p₍ᵢ₎))` in the order of `p`.
+fn holm(p: &[f64]) -> Vec<f64> {
+    let m = p.len();
+    let mut order: Vec<usize> = (0..m).collect();
+    order.sort_by(|&a, &b| p[a].total_cmp(&p[b]));
+    let mut out = vec![0.0; m];
+    let mut run = 0.0_f64;
+    for (rank, &i) in order.iter().enumerate() {
+        run = run.max(((m - rank) as f64 * p[i]).min(1.0));
+        out[i] = run;
+    }
+    out
+}
+
+/// The levels of the factor `factor` of `e`'s data, in their sorted order,
+/// which is glmm's level order.
+fn entry_levels(e: &inference::Entry, factor: &str) -> Vec<String> {
+    let (_, _, columns) = oracle_support::entry_data(e);
+    match columns.into_iter().find(|(n, _)| n == factor) {
+        Some((_, Column::Factor { levels, .. })) => levels,
+        _ => panic!("{}: {factor} is not a factor column", e.name),
+    }
+}
+
+/// The one frozen row of `rows` with emmeans' `label`, `by` level and, on an
+/// interval row, `adjust`.
+fn frozen_row<'a>(
+    rows: &'a [Value],
+    label: &str,
+    by: Option<&str>,
+    adjust: Option<&str>,
+    ctx: &str,
+) -> &'a Value {
+    let hits: Vec<&Value> = rows
+        .iter()
+        .filter(|r| {
+            r["contrast"].as_str() == Some(label)
+                && r["by"].as_str() == by
+                && adjust.is_none_or(|a| r["adjust"].as_str() == Some(a))
+        })
+        .collect();
+    assert_eq!(
+        hits.len(),
+        1,
+        "{ctx}: frozen rows {label} by {by:?} adjust {adjust:?}"
+    );
+    hits[0]
+}
+
+/// The pairwise comparisons (`kind` `posthoc`), end to end on glmm's fit of
+/// each entry's one member through [`pairwise`] (quantity `posthoc`),
+/// against emmeans' `pairs(emmeans(..))` on lme4's, lm's or glm's fit with
+/// `lmer.df = "satterthwaite"`. Per row of the `Adjust::None` result: the
+/// estimate within `BETA_REL` of its SE, the SE within `SE_REL`
+/// (`WALD_GLMM_REL` on a GLMM), a t row's df within `DF_E2E_REL` and a z
+/// row's df infinite (emmeans freezes no df there), the statistic `est/SE`
+/// within `BETA_REL + SE band` of `max(1, |t|)` (its error is at most
+/// `|Δest|/SE + |t|·|ΔSE|/SE`), and the unadjusted p within `SATT_P_REL` (t)
+/// or `WALD_P_REL` (z). Holm is applied to the frozen unadjusted p within
+/// each `by` family here and compared with the `Adjust::Holm` result in the
+/// same p band. The `Adjust::Tukey` p-values against emmeans' within
+/// `TUKEY_P_REL`, except on [`TUKEY_UNCOMPARED`] and on the rows whose
+/// frozen p or its complement is below [`PTUKEY_TAIL_MIN`]. On a log or logit link the
+/// `response` rows: the ratio within `BETA_REL` of the ratio's SE, and the
+/// ratio's SE (`ratio·SE`) within the SE band plus `BETA_REL` times the
+/// link-scale SE (the estimate's error enters through `exp`).
+///
+/// On the entries with `confint_adjust` (quantity `confint`): the intervals
+/// [`Pairwise::confint`] at 0.95 of each listed adjustment's result, and of
+/// the Holm result against the frozen Bonferroni rows (Holm has no
+/// simultaneous interval), each bound within `CONFINT_REL` of emmeans'
+/// interval width, on the link scale and, on a logit link, the odds ratio's.
+///
+/// emmeans labels a comparison of levels that all read as numbers with the
+/// factor's name in front ("period1 - period2"), and a response-scale one
+/// with " / ", so glmm's `"a - b"` is matched under those rules.
+///
+/// [`Pairwise::confint`]: glmm::formula::Pairwise::confint
+fn posthoc_rows(compared: &mut BTreeSet<String>) {
+    let mut worst: BTreeMap<&str, f64> = BTreeMap::new();
+    let mut gap = |ctx: &str, what: &'static str, got: f64, want: f64, scale: f64, band: f64| {
+        let d = (got - want).abs() / scale;
+        eprintln!(
+            "POSTHOC {ctx}: glmm {got:.10e} oracle {want:.10e} diff {d:.3e} (band {band:.1e})"
+        );
+        let w = worst.entry(what).or_insert(0.0);
+        *w = w.max(d);
+        assert_rel_to(got, want, scale, band, ctx);
+    };
+    // Rows compared: contrasts, Holm, Tukey, response, link intervals,
+    // response intervals; then the Tukey rows left out for their tail.
+    let mut counts = [0usize; 7];
+    let mut names = Vec::new();
+    for e in inference::entries(inference::Kind::Posthoc) {
+        assert!(!e.is_pending(), "{}: not frozen", e.name);
+        let name = e.name.as_str();
+        let json = inference::load(inference::Kind::Posthoc, name);
+        let side = fit_member(&e, &e.raw["members"][0]);
+        let model = &side.model;
+        assert!(model.fit().converged(), "{name}: the fit did not converge");
+        let glmm_se = model.lowered().model.re.is_some()
+            && !matches!(model.lowered().spec().family, Family::Gaussian);
+        let se_band = if glmm_se {
+            tol::WALD_GLMM_REL
+        } else {
+            tol::SE_REL
+        };
+        let factor = e.raw["factor"].as_str().expect("a factor");
+        let by = e.raw["by"].as_str();
+        let run = |adjust| {
+            pairwise(model, factor, by.map(By::Levels), adjust)
+                .unwrap_or_else(|err| panic!("{name} {adjust:?}: {err}"))
+        };
+        let [none, holm_pw, bonferroni, tukey] = [
+            Adjust::None,
+            Adjust::Holm,
+            Adjust::Bonferroni,
+            Adjust::Tukey,
+        ]
+        .map(run);
+        let levels = entry_levels(&e, factor);
+        let numeric = levels.iter().all(|l| l.parse::<f64>().is_ok());
+        let tag = |l: &str| {
+            if numeric {
+                format!("{factor}{l}")
+            } else {
+                l.to_string()
+            }
+        };
+        let emmeans_label = |contrast: &str, sep: &str| -> String {
+            let pair = levels
+                .iter()
+                .enumerate()
+                .flat_map(|(i, a)| levels[i + 1..].iter().map(move |b| (a, b)))
+                .find(|(a, b)| format!("{a} - {b}") == contrast)
+                .unwrap_or_else(|| panic!("{name}: no pair of levels gives {contrast}"));
+            format!("{}{sep}{}", tag(pair.0), tag(pair.1))
+        };
+        let frozen = json["contrasts"].as_array().expect("contrasts");
+        assert_eq!(none.rows.len(), frozen.len(), "{name}: every row");
+        for pw in [&holm_pw, &bonferroni, &tukey] {
+            let same = pw
+                .rows
+                .iter()
+                .zip(&none.rows)
+                .all(|(a, b)| a.contrast == b.contrast && a.by_level == b.by_level);
+            assert!(
+                same && pw.rows.len() == none.rows.len(),
+                "{name}: the row order of {:?}",
+                pw.adjust
+            );
+        }
+        let tukey_compared = !TUKEY_UNCOMPARED.contains(&name);
+        let mut families: BTreeMap<Option<&str>, Vec<usize>> = BTreeMap::new();
+        let mut p_frozen = Vec::with_capacity(none.rows.len());
+        for (i, row) in none.rows.iter().enumerate() {
+            let by_level = row.by_level.as_deref();
+            let label = emmeans_label(&row.contrast, " - ");
+            let at = format!("{label} by {by_level:?}");
+            let want = frozen_row(frozen, &label, by_level, None, name);
+            let q = |field: &str| number(&want[field], &format!("{name} {at}: {field}"));
+            let ctx = |what: &str| format!("{name}: posthoc[{what} {at}]");
+            let want_se = q("SE");
+            gap(
+                &ctx("estimate"),
+                "estimate",
+                row.estimate,
+                q("estimate"),
+                want_se,
+                tol::BETA_REL,
+            );
+            gap(&ctx("SE"), "SE", row.se, want_se, want_se, se_band);
+            let z = match want["statistic_name"].as_str() {
+                Some("z") => true,
+                Some("t") => false,
+                other => panic!("{name} {at}: statistic_name {other:?}"),
+            };
+            if z {
+                assert!(want["df"].is_null(), "{name} {at}: a z row with a df");
+                assert_eq!(row.df, f64::INFINITY, "{name} {at}: a z row's df");
+            } else {
+                let want_df = q("df");
+                gap(&ctx("df"), "df", row.df, want_df, want_df, tol::DF_E2E_REL);
+            }
+            let want_t = q("statistic");
+            gap(
+                &ctx("statistic"),
+                "statistic",
+                row.statistic,
+                want_t,
+                want_t.abs().max(1.0),
+                tol::BETA_REL + se_band,
+            );
+            let p_band = if z { tol::WALD_P_REL } else { tol::SATT_P_REL };
+            let want_p = q("p_none");
+            gap(&ctx("p"), "p", row.p_value, want_p, want_p, p_band);
+            families.entry(by_level).or_default().push(i);
+            p_frozen.push((want_p, p_band));
+            counts[0] += 1;
+            if tukey_compared {
+                assert!(
+                    ptukey_df_agrees(row.df),
+                    "{name} {at}: df {} outside ptukey's agreement region",
+                    row.df
+                );
+                let want_p = q("p_tukey");
+                let got = tukey.rows[i].p_adjusted;
+                if want_p.min(1.0 - want_p) < PTUKEY_TAIL_MIN {
+                    eprintln!(
+                        "POSTHOC {name}: p_tukey {at} not compared: frozen {want_p:.4e} \
+                         (glmm {got:.4e}), a tail below {PTUKEY_TAIL_MIN:.0e}"
+                    );
+                    counts[6] += 1;
+                    continue;
+                }
+                gap(
+                    &ctx("p_tukey"),
+                    "p_tukey",
+                    got,
+                    want_p,
+                    want_p,
+                    tol::TUKEY_P_REL,
+                );
+                counts[2] += 1;
+            }
+        }
+        if !tukey_compared {
+            assert!(
+                none.rows.iter().any(|r| !ptukey_df_agrees(r.df)),
+                "{name}: every df is inside ptukey's agreement region; compare its Tukey rows"
+            );
+        }
+        for members in families.values() {
+            let p: Vec<f64> = members.iter().map(|&i| p_frozen[i].0).collect();
+            for (&i, want) in members.iter().zip(holm(&p)) {
+                let row = &holm_pw.rows[i];
+                let at = format!("{} by {:?}", row.contrast, row.by_level);
+                let ctx = format!("{name}: posthoc[p_holm {at}]");
+                gap(&ctx, "p_holm", row.p_adjusted, want, want, p_frozen[i].1);
+                counts[1] += 1;
+            }
+        }
+        if let Some(response) = json["response"].as_array() {
+            assert!(
+                none.ratio.is_some(),
+                "{name}: no ratio on a log or logit link"
+            );
+            assert_eq!(
+                none.rows.len(),
+                response.len(),
+                "{name}: every response row"
+            );
+            for row in &none.rows {
+                let by_level = row.by_level.as_deref();
+                let label = emmeans_label(&row.contrast, " / ");
+                let at = format!("{label} by {by_level:?}");
+                let want = frozen_row(response, &label, by_level, None, name);
+                let link = frozen_row(
+                    frozen,
+                    &emmeans_label(&row.contrast, " - "),
+                    by_level,
+                    None,
+                    name,
+                );
+                let q =
+                    |v: &Value, field: &str| number(&v[field], &format!("{name} {at}: {field}"));
+                let want_ratio_se = q(want, "SE");
+                gap(
+                    &format!("{name}: posthoc[ratio {at}]"),
+                    "ratio",
+                    row.ratio,
+                    q(want, "ratio"),
+                    want_ratio_se,
+                    tol::BETA_REL,
+                );
+                gap(
+                    &format!("{name}: posthoc[ratio_se {at}]"),
+                    "ratio_se",
+                    row.ratio_se,
+                    want_ratio_se,
+                    want_ratio_se,
+                    se_band + tol::BETA_REL * q(link, "SE"),
+                );
+                counts[3] += 1;
+            }
+        } else {
+            assert!(
+                none.ratio.is_none(),
+                "{name}: a ratio with no frozen response rows"
+            );
+        }
+        if let Some(adjusts) = e.raw["confint_adjust"].as_array() {
+            let link = json["confint"].as_array().expect("confint rows");
+            let response = json["confint_response"].as_array();
+            let mut runs: Vec<(&str, &Pairwise, Adjust)> = adjusts
+                .iter()
+                .map(|a| match a.as_str() {
+                    Some("none") => ("none", &none, Adjust::None),
+                    Some("bonferroni") => ("bonferroni", &bonferroni, Adjust::Bonferroni),
+                    Some("tukey") => ("tukey", &tukey, Adjust::Tukey),
+                    other => panic!("{name}: confint_adjust {other:?}"),
+                })
+                .collect();
+            runs.push(("bonferroni", &holm_pw, Adjust::Bonferroni));
+            for (frozen_adjust, pw, want_adjust) in runs {
+                let ci = pw
+                    .confint(POSTHOC_LEVEL)
+                    .unwrap_or_else(|err| panic!("{name} {:?}: {err}", pw.adjust));
+                assert_eq!(
+                    ci.adjust, want_adjust,
+                    "{name} {:?}: the intervals' adjustment",
+                    pw.adjust
+                );
+                for (row, iv) in pw.rows.iter().zip(&ci.rows) {
+                    let by_level = row.by_level.as_deref();
+                    let mut scales = vec![(" - ", link, [iv.lower, iv.upper], "link")];
+                    if pw.ratio.is_some() {
+                        let r = response.unwrap_or_else(|| panic!("{name}: confint_response"));
+                        scales.push((" / ", r, [iv.ratio_lower, iv.ratio_upper], "ratio"));
+                    }
+                    for (sep, rows, got, scale) in scales {
+                        let label = emmeans_label(&row.contrast, sep);
+                        let at = format!("{:?} {scale} {label} by {by_level:?}", pw.adjust);
+                        let want = frozen_row(rows, &label, by_level, Some(frozen_adjust), name);
+                        let bound = |f: &str| number(&want[f], &format!("{name} {at}: {f}"));
+                        let (lower, upper) = (bound("lower"), bound("upper"));
+                        let width = upper - lower;
+                        for (side, g, w) in [("lower", got[0], lower), ("upper", got[1], upper)] {
+                            gap(
+                                &format!("{name}: confint[{side} {at}]"),
+                                "confint",
+                                g,
+                                w,
+                                width,
+                                tol::CONFINT_REL,
+                            );
+                        }
+                        counts[if scale == "link" { 4 } else { 5 }] += 1;
+                    }
+                }
+            }
+        }
+        compared.insert(e.name.clone());
+        names.push(e.name);
+    }
+    eprintln!("POSTHOC compared {}: {names:?}", names.len());
+    eprintln!(
+        "POSTHOC rows (contrasts, holm, tukey, response, intervals, ratio intervals compared; \
+         tukey rows left out for their tail): {counts:?}"
+    );
+    eprintln!("POSTHOC worst per quantity (|diff| / scale): {worst:?}");
+    assert_eq!(names.len(), 16, "posthoc_rows: entries compared");
+    assert_eq!(
+        counts,
+        [66, 66, 47, 33, 48, 24, 13],
+        "posthoc_rows: rows compared (contrasts, holm, tukey, response, intervals, ratio \
+         intervals) and Tukey rows left out for their tail"
+    );
+}
+
 /// The per-term rows of the lmerTest tables through [`term_tests`]: Type III
 /// and Type II on the REML and ML `sim_factorial` fits and on
 /// `sim_factorial_empty`, F and DenDF at the end-to-end band `DF_E2E_REL`,
@@ -979,13 +1463,15 @@ fn lmertest_term_rows_match_anova() {
             .find(|e| e.name == name)
             .unwrap_or_else(|| panic!("{name}: not in the manifest"));
         let json = inference::load(inference::Kind::Lmertest, name);
-        let lo = inference_lowered(e);
-        let fit = glmm::fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+        let (lo, fit_opts) = inference_lowered(e);
+        let formula = e.r_formula.as_deref().expect("the entry has a formula");
+        let model = fit_lowered(formula, lo, &fit_opts).unwrap();
+        let fit = model.fit();
         assert_eq!(Some(fit.reml), json["reml"].as_bool(), "{name}: criterion");
         for (table, ss_type) in [("type3", SsType::Type3), ("type2", SsType::Type2)] {
             let frozen = &json[table];
             let terms = frozen["terms"].as_array().expect("terms");
-            let got = term_table(&lo, &fit, ss_type).unwrap_or_else(|err| panic!("{name}: {err}"));
+            let got = term_table(&model, ss_type).unwrap_or_else(|err| panic!("{name}: {err}"));
             assert_eq!(got.fixed.len(), terms.len(), "{name} {table}: rows");
             for (k, r) in got.fixed.iter().enumerate() {
                 let at = format!("{name} {table} {}", r.label);
@@ -1122,4 +1608,479 @@ fn assert_inference_divergences_all_fired(compared: &BTreeSet<String>) {
         "inference divergence registry is out of date: these entries on a compared \
          reference no longer fire and must be deleted: {stale:?}"
     );
+}
+
+// ── The GLM conditioning band ───────────────────────────────────────────────
+
+/// The GLM conditioning band report and its one gate. Every fit goes through
+/// the loop tier with the default standardization: `glmm::fit` runs the alias
+/// gate, which drops design a's last column once its raw pivot passes
+/// `ALIAS_EPS`, and the loop tier skips that gate.
+#[cfg(feature = "loop_advanced")]
+mod conditioning {
+    use super::{inference, member_family, number, numbers};
+    use glmm::formula::Column;
+    use glmm::loop_advanced::{build_workspace, fit_on, FitDiagnostics, FitWorkspace};
+    use glmm::{
+        BinomialLink, Data, Family, FitOptions, GammaLink, GroupIds, ModelSpec, PoissonLink,
+        ReStructure,
+    };
+    use serde_json::{json, Value};
+    use std::collections::BTreeMap;
+
+    /// The `conditioning` entries per design and family (each family once
+    /// unweighted and once on the prior weights `w`), and their fits in all.
+    /// Written out so an emptied or shrunken kind fails instead of reporting
+    /// on nothing.
+    const ENTRIES: [(&str, &str, usize); 10] = [
+        ("a", "logit", 2),
+        ("a", "probit", 2),
+        ("a", "poisson", 2),
+        ("a", "gamma", 2),
+        ("b", "logit", 2),
+        ("b", "probit", 2),
+        ("b", "poisson", 2),
+        ("c", "logit", 2),
+        ("c", "probit", 2),
+        ("c", "poisson", 2),
+    ];
+    const FITS: usize = 288;
+
+    /// Design d, `y ~ 1 + a + x2` with `x2` an exact copy of `a`: no
+    /// reference, one CSV `glm_band_d_<family>.csv` per family.
+    const DUPLICATE_FAMILIES: [&str; 4] = ["logit", "probit", "poisson", "gamma"];
+
+    /// Rows of the random-intercept grouping of the cross-route refit:
+    /// `g = row mod GROUPS`.
+    const GROUPS: usize = 10;
+
+    /// The short family name the report prints: the link on the binomial,
+    /// the family otherwise.
+    fn short_name(raw: &Value) -> String {
+        let family = raw["family"].as_str().expect("a family");
+        match family {
+            "binomial" => raw["link"].as_str().expect("a link").to_string(),
+            f => f.to_string(),
+        }
+    }
+
+    fn duplicate_family(name: &str) -> Family {
+        match name {
+            "logit" => Family::Binomial {
+                link: BinomialLink::Logit,
+            },
+            "probit" => Family::Binomial {
+                link: BinomialLink::Probit,
+            },
+            "poisson" => Family::Poisson {
+                link: PoissonLink::Log,
+            },
+            "gamma" => Family::Gamma {
+                link: GammaLink::Log,
+            },
+            other => panic!("no design d family {other}"),
+        }
+    }
+
+    /// An entry's CSV columns by name; every column of these files is numeric.
+    fn numeric_columns(e: &inference::Entry) -> BTreeMap<String, Vec<f64>> {
+        let (_, _, columns) = super::oracle_support::entry_data(e);
+        columns
+            .into_iter()
+            .map(|(name, col)| match col {
+                Column::Numeric(v) => (name, v),
+                Column::Factor { .. } => panic!("{}: column {name} is not numeric", e.name),
+            })
+            .collect()
+    }
+
+    fn column<'c>(cols: &'c BTreeMap<String, Vec<f64>>, name: &str) -> &'c [f64] {
+        cols.get(name).unwrap_or_else(|| panic!("no column {name}"))
+    }
+
+    /// One fit's design `[1, c1, c2]`, row-major, and its offset, read off
+    /// `r_formula`: `y ~ 1 + c1 + c2`, optionally `+ offset(o)`, the one shape
+    /// the generator reads.
+    fn band_design<'c>(
+        r_formula: &str,
+        cols: &'c BTreeMap<String, Vec<f64>>,
+    ) -> (Vec<f64>, Option<&'c [f64]>) {
+        let rhs = r_formula
+            .strip_prefix("y ~ 1 + ")
+            .unwrap_or_else(|| panic!("{r_formula}: not y ~ 1 + c1 + c2"));
+        let (mut terms, mut offset) = (Vec::new(), None);
+        for t in rhs.split(" + ") {
+            match t.strip_prefix("offset(").and_then(|o| o.strip_suffix(')')) {
+                Some(o) => offset = Some(column(cols, o)),
+                None => terms.push(column(cols, t)),
+            }
+        }
+        assert_eq!(
+            terms.len(),
+            2,
+            "{r_formula}: two columns beside the intercept"
+        );
+        let x = (0..terms[0].len())
+            .flat_map(|i| [1.0, terms[0][i], terms[1][i]])
+            .collect();
+        (x, offset)
+    }
+
+    /// What one `fit_on` call returned, copied out of the view.
+    struct BandFit {
+        diag: FitDiagnostics,
+        beta: Vec<f64>,
+        var_diag: Vec<f64>,
+        t_sq: Vec<f64>,
+    }
+
+    fn fit_band(ws: &mut FitWorkspace, data: &Data<'_>, opts: &FitOptions) -> BandFit {
+        let v = fit_on(ws, data, None, opts);
+        BandFit {
+            diag: v.diagnostics(),
+            beta: v.betas().to_vec(),
+            var_diag: v.var_diag().to_vec(),
+            t_sq: v.t_sq().to_vec(),
+        }
+    }
+
+    /// The region a fit lands in.
+    fn region(d: &FitDiagnostics) -> &'static str {
+        if d.separated {
+            "separated"
+        } else if !d.converged {
+            "not settled"
+        } else if d.se_unavailable {
+            "SE unavailable"
+        } else if d.ill_conditioned {
+            "flag"
+        } else {
+            "accurate"
+        }
+    }
+
+    /// The largest of `v`, NaN when any is NaN.
+    fn worst(v: impl Iterator<Item = f64>) -> f64 {
+        v.fold(
+            0.0,
+            |m: f64, x| if x.is_nan() { f64::NAN } else { m.max(x) },
+        )
+    }
+
+    /// A converged fit against its reference, over the coefficients: the
+    /// largest β̂ relative error, SE relative error and `|z − z_ref|`, and
+    /// whether some `|β̂ − β_ref|` exceeds the SE. SE is `√var_diag` against
+    /// `√diag(cov_ref)`, z is `β̂/SE` against `β_ref/√diag(cov_ref)`. No
+    /// dispersion enters: the GLM view's `var_diag` is the unscaled
+    /// `(X'WX)⁻¹`, and on the Gamma log link the Fisher weight is the prior
+    /// weight alone. NaN, and no understatement, on a fit that did not
+    /// converge.
+    struct Errors {
+        beta: f64,
+        se: f64,
+        dz: f64,
+        understates: bool,
+    }
+
+    fn errors(f: &BandFit, beta_ref: &[f64], cov_ref: &[Vec<f64>]) -> Errors {
+        if !f.diag.converged {
+            return Errors {
+                beta: f64::NAN,
+                se: f64::NAN,
+                dz: f64::NAN,
+                understates: false,
+            };
+        }
+        let se_ref: Vec<f64> = (0..beta_ref.len()).map(|j| cov_ref[j][j].sqrt()).collect();
+        let se: Vec<f64> = f.var_diag.iter().map(|v| v.sqrt()).collect();
+        let j = 0..beta_ref.len();
+        Errors {
+            beta: worst(
+                j.clone()
+                    .map(|j| ((f.beta[j] - beta_ref[j]) / beta_ref[j]).abs()),
+            ),
+            se: worst(j.clone().map(|j| ((se[j] - se_ref[j]) / se_ref[j]).abs())),
+            dz: worst(
+                j.clone()
+                    .map(|j| (f.beta[j] / se[j] - beta_ref[j] / se_ref[j]).abs()),
+            ),
+            understates: j
+                .into_iter()
+                .any(|j| (f.beta[j] - beta_ref[j]).abs() > se[j]),
+        }
+    }
+
+    /// Counts and worst values over the fits of one decade of `τ_ref` (or of
+    /// design c, which has no reference). The maxima skip NaN: they read the
+    /// converged fits.
+    struct Tally {
+        fits: usize,
+        converged: usize,
+        not_settled: usize,
+        separated: usize,
+        se_unavailable: usize,
+        beta: f64,
+        se: f64,
+        dz: f64,
+        understates: usize,
+        tau_gap: f64,
+    }
+
+    impl Tally {
+        fn new() -> Tally {
+            Tally {
+                fits: 0,
+                converged: 0,
+                not_settled: 0,
+                separated: 0,
+                se_unavailable: 0,
+                beta: f64::NAN,
+                se: f64::NAN,
+                dz: f64::NAN,
+                understates: 0,
+                tau_gap: f64::NAN,
+            }
+        }
+
+        fn add(&mut self, d: &FitDiagnostics, err: Option<&Errors>, tau_gap: f64) {
+            self.fits += 1;
+            self.converged += d.converged as usize;
+            self.not_settled += (!d.converged && !d.separated) as usize;
+            self.separated += d.separated as usize;
+            self.se_unavailable += d.se_unavailable as usize;
+            if let Some(e) = err {
+                self.beta = self.beta.max(e.beta);
+                self.se = self.se.max(e.se);
+                self.dz = self.dz.max(e.dz);
+                self.understates += e.understates as usize;
+            }
+            self.tau_gap = self.tau_gap.max(tau_gap);
+        }
+
+        fn counts(&self) -> String {
+            format!(
+                "fits {:>3} converged {:>3} not settled {:>3} separated {:>3} se_unavailable {:>3}",
+                self.fits, self.converged, self.not_settled, self.separated, self.se_unavailable
+            )
+        }
+    }
+
+    /// The glmm-side measurement of the GLM conditioning band, printed, per
+    /// fit and per decade of `τ_ref`: each `conditioning` reference fitted
+    /// through `fit_on` (`se_for` all), design c with its verdict only;
+    /// designs a and b refitted with a random intercept on `g = row mod 10`,
+    /// the regions of the two routes side by side; design d, an exact
+    /// duplicate column, from its CSVs. τ is `diagnostics().pivot`, on the
+    /// standardized design at the converged weights; `τ_ref` is on the design
+    /// as written. Asserts only how many fits ran, never their accuracy.
+    ///
+    /// ```sh
+    /// cargo test --features oracle-tests,loop_advanced --test inference_oracle conditioning_report -- --nocapture
+    /// ```
+    #[test]
+    fn conditioning_report() {
+        let opts = FitOptions::default();
+        let mut seen: BTreeMap<(String, String), usize> = BTreeMap::new();
+        let mut n_fits = 0;
+        let mut decades: BTreeMap<(String, i32), Tally> = BTreeMap::new();
+        let mut verdicts_c = Tally::new();
+        let mut routes = Vec::new();
+        for e in inference::entries(inference::Kind::Conditioning) {
+            assert!(!e.is_pending(), "{}: not frozen", e.name);
+            let json = inference::load(inference::Kind::Conditioning, &e.name);
+            let design = e.raw["design"].as_str().expect("a design").to_string();
+            let family_name = short_name(&e.raw);
+            *seen
+                .entry((design.clone(), family_name.clone()))
+                .or_default() += 1;
+            let family = member_family(&e.raw);
+            let cols = numeric_columns(&e);
+            let y = column(&cols, "y");
+            let weights = e.raw["weights"].as_str().map(|w| column(&cols, w));
+            let w_label = e.raw["weights"].as_str().unwrap_or("-");
+            let n = y.len();
+            let mut ws =
+                build_workspace(&ModelSpec::fixed(family), &GroupIds::default(), n, 3, &opts);
+            let mut ws_mixed = (design != "c").then(|| {
+                let g = (0..n).map(|i| (i % GROUPS) as u32).collect();
+                build_workspace(
+                    &ModelSpec::mixed(family, ReStructure::intercept()),
+                    &GroupIds::new(g),
+                    n,
+                    3,
+                    &opts,
+                )
+            });
+            for fit in json["fits"].as_array().expect("fits") {
+                n_fits += 1;
+                let label = fit["label"].as_str().expect("a label");
+                let (x, offset) = band_design(fit["r_formula"].as_str().expect("a formula"), &cols);
+                let mut data = Data::new(&x, y, n, 3);
+                if let Some(w) = weights {
+                    data = data.weights(w);
+                }
+                if let Some(o) = offset {
+                    data = data.offset(o);
+                }
+                let f = fit_band(&mut ws, &data, &opts);
+                let d = &f.diag;
+                let at = format!("{design} {family_name:<7} w {w_label} {label:>6}");
+                let Some(ws_mixed) = ws_mixed.as_mut() else {
+                    assert_eq!(fit["finite_mle"].as_bool(), Some(false), "{at}: design c");
+                    eprintln!(
+                        "CONDITIONING {at}: converged {:<5} separated {:<5} se_unavailable {:<5}",
+                        d.converged, d.separated, d.se_unavailable
+                    );
+                    verdicts_c.add(d, None, f64::NAN);
+                    continue;
+                };
+                let beta_ref = numbers(&fit["beta_ref"], &at);
+                let cov_ref: Vec<Vec<f64>> = fit["cov_ref"]
+                    .as_array()
+                    .expect("cov_ref")
+                    .iter()
+                    .map(|r| numbers(r, &at))
+                    .collect();
+                let tau_ref = number(&fit["tau_ref"], &at);
+                let err = errors(&f, &beta_ref, &cov_ref);
+                let tau_gap = (d.pivot / tau_ref).log10().abs();
+                eprintln!(
+                    "CONDITIONING {at}: tau_ref {tau_ref:9.2e} tau {:9.2e} converged {:<5} \
+                     separated {:<5} se_unavailable {:<5} beta_rel {:9.2e} se_rel {:9.2e} \
+                     dz {:9.2e} se<err {}",
+                    d.pivot,
+                    d.converged,
+                    d.separated,
+                    d.se_unavailable,
+                    err.beta,
+                    err.se,
+                    err.dz,
+                    err.understates
+                );
+                let decade = tau_ref.log10().floor() as i32;
+                decades
+                    .entry((design.clone(), -decade))
+                    .or_insert_with(Tally::new)
+                    .add(d, Some(&err), tau_gap);
+                let mixed = fit_band(ws_mixed, &data, &opts);
+                routes.push((at, region(d), region(&mixed.diag)));
+            }
+        }
+        for ((design, neg_decade), t) in &decades {
+            eprintln!(
+                "CONDITIONING-DECADE {design} tau_ref in [1e{:+03}, 1e{:+03}): {} | max beta_rel \
+                 {:9.2e} se_rel {:9.2e} dz {:9.2e} | se<err {} | max |log10(tau/tau_ref)| {:.2}",
+                -neg_decade,
+                1 - neg_decade,
+                t.counts(),
+                t.beta,
+                t.se,
+                t.dz,
+                t.understates,
+                t.tau_gap
+            );
+        }
+        eprintln!(
+            "CONDITIONING-DECADE c (no reference): {}",
+            verdicts_c.counts()
+        );
+        let mut mismatches = Vec::new();
+        for (at, glm, glmm) in &routes {
+            eprintln!("CONDITIONING-ROUTES {at}: glm {glm:<14} glmm (1 | g) {glmm}");
+            if glm != glmm {
+                mismatches.push(format!("{at}: glm {glm}, glmm {glmm}"));
+            }
+        }
+        eprintln!(
+            "CONDITIONING-ROUTES {} of {} fits land in another region with (1 | g):",
+            mismatches.len(),
+            routes.len()
+        );
+        for m in &mismatches {
+            eprintln!("  {m}");
+        }
+        for name in DUPLICATE_FAMILIES {
+            let stem = format!("glm_band_d_{name}");
+            let e = inference::Entry::from_raw(json!({
+                "name": stem,
+                "kind": "conditioning",
+                "data": format!("data/inference/{stem}.csv"),
+                "r_formula": null,
+                "generator": "goldens_glm_band.py",
+            }))
+            .expect("a design d entry");
+            let cols = numeric_columns(&e);
+            let y = column(&cols, "y");
+            let n = y.len();
+            let (x, _) = band_design("y ~ 1 + a + x2", &cols);
+            let mut ws = build_workspace(
+                &ModelSpec::fixed(duplicate_family(name)),
+                &GroupIds::default(),
+                n,
+                3,
+                &opts,
+            );
+            let f = fit_band(&mut ws, &Data::new(&x, y, n, 3), &opts);
+            eprintln!(
+                "CONDITIONING-DUPLICATE {name:<7}: converged {:<5} se_unavailable {:<5} \
+                 t_sq[x2] {:9.2e} pivot {:9.2e} (column {})",
+                f.diag.converged, f.diag.se_unavailable, f.t_sq[2], f.diag.pivot, f.diag.pivot_col
+            );
+        }
+        let want: BTreeMap<(String, String), usize> = ENTRIES
+            .iter()
+            .map(|&(d, f, k)| ((d.to_string(), f.to_string()), k))
+            .collect();
+        assert_eq!(seen, want, "the conditioning entries per design and family");
+        assert_eq!(n_fits, FITS, "the conditioning fits");
+    }
+
+    /// Design b's unweighted logit fit at `τ_ref` 3.6e-11 converges at the
+    /// reference β. From η = 0 its first Newton step raises the deviance by
+    /// 18% (relative), and the steps after it grow until β runs off to 1e299,
+    /// which the divergence guard reports as separated. A finite maximum
+    /// exists (`finite_mle`), so the fit must halve its way back to it.
+    #[test]
+    fn design_b_logit_halves_back_from_an_overshoot() {
+        let opts = FitOptions::default();
+        let e = inference::entries(inference::Kind::Conditioning)
+            .into_iter()
+            .find(|e| e.name == "conditioning_b_logit")
+            .expect("the conditioning_b_logit entry");
+        let json = inference::load(inference::Kind::Conditioning, &e.name);
+        let fit = json["fits"]
+            .as_array()
+            .expect("fits")
+            .iter()
+            .find(|f| f["label"] == "1e-11")
+            .expect("the 1e-11 fit");
+        assert_eq!(fit["finite_mle"].as_bool(), Some(true));
+        let cols = numeric_columns(&e);
+        let y = column(&cols, "y");
+        let n = y.len();
+        let (x, offset) = band_design(fit["r_formula"].as_str().expect("a formula"), &cols);
+        let data = Data::new(&x, y, n, 3).offset(offset.expect("design b has an offset"));
+        let mut ws = build_workspace(
+            &ModelSpec::fixed(member_family(&e.raw)),
+            &GroupIds::default(),
+            n,
+            3,
+            &opts,
+        );
+        let f = fit_band(&mut ws, &data, &opts);
+        assert!(
+            f.diag.converged && !f.diag.separated,
+            "converged {} separated {}",
+            f.diag.converged,
+            f.diag.separated
+        );
+        let beta_ref = numbers(&fit["beta_ref"], "beta_ref");
+        for (j, (b, r)) in f.beta.iter().zip(&beta_ref).enumerate() {
+            let rel = ((b - r) / r).abs();
+            assert!(
+                rel < 1e-4,
+                "beta[{j}] {b} vs reference {r}: relative {rel:.2e}"
+            );
+        }
+    }
 }

@@ -188,7 +188,7 @@ reach.
 
 Every difference above is held to four pinned reference engines: R/lme4,
 R/glmmTMB, Julia/MixedModels.jl and R/GLMMadaptive. Each fits the cells it can on
-a 923-cell accuracy grid (`validation/grid/`), from single-intercept LMMs
+a 947-cell accuracy grid (`validation/grid/`), from single-intercept LMMs
 to crossed/nested/sparse GLMMs. glmmTMB fits every family but
 inverse-Gaussian, and GLMMadaptive fits AGQ on one grouping factor. A converged deviance worse than the best reference on a cell
 fails. Parameter differences are reported; one beyond the agreement band is
@@ -200,7 +200,7 @@ glmmTMB, GLMMadaptive and R's own `glm` references.
 
 ## Limits
 
-The trade is inference machinery and breadth: no `predict`, no
+The trade is inference machinery and breadth: no
 profile/bootstrap CIs, no small-sample df beyond Satterthwaite's for Gaussian
 mixed models (no Kenward-Roger); fewer families than
 glmmTMB/GLMMadaptive; and past a few dozen θ parameters,

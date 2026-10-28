@@ -25,11 +25,29 @@ pub enum Kind {
     Rlrt,
     /// ANOVA tables and model comparisons (`goldens_anova.R`).
     Anova,
+    /// Predictions on new data, their standard errors and the conditional
+    /// variances of the random effects (`goldens_predict.R`).
+    Predict,
+    /// Pairwise comparisons between factor levels (`goldens_posthoc.R`).
+    Posthoc,
+    /// R², ICC and partial η² (`goldens_effectsize.R`).
+    Effectsize,
+    /// Extended-precision GLM references on ill-conditioned designs
+    /// (`goldens_glm_band.py`).
+    Conditioning,
 }
 
 impl Kind {
     /// Every kind, in manifest order.
-    pub const ALL: [Kind; 3] = [Kind::Lmertest, Kind::Rlrt, Kind::Anova];
+    pub const ALL: [Kind; 7] = [
+        Kind::Lmertest,
+        Kind::Rlrt,
+        Kind::Anova,
+        Kind::Predict,
+        Kind::Posthoc,
+        Kind::Effectsize,
+        Kind::Conditioning,
+    ];
 
     /// The manifest `kind` string, which is also the directory name.
     pub fn as_str(self) -> &'static str {
@@ -37,6 +55,10 @@ impl Kind {
             Kind::Lmertest => "lmertest",
             Kind::Rlrt => "rlrt",
             Kind::Anova => "anova",
+            Kind::Predict => "predict",
+            Kind::Posthoc => "posthoc",
+            Kind::Effectsize => "effectsize",
+            Kind::Conditioning => "conditioning",
         }
     }
 
@@ -95,7 +117,7 @@ impl Entry {
         };
         let kind_str = string("kind")?;
         let kind = Kind::parse(&kind_str).ok_or_else(|| {
-            format!("unknown kind \"{kind_str}\" (one of lmertest, rlrt, anova) in {raw}")
+            format!("unknown kind \"{kind_str}\" (one of lmertest, rlrt, anova, predict, posthoc, effectsize, conditioning) in {raw}")
         })?;
         let factors = match raw.get("factors") {
             None => Vec::new(),

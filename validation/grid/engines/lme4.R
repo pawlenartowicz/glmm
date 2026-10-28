@@ -163,28 +163,31 @@ glm_routing <- function(cell) {
 #                                offset(...) term.
 make_fit <- function(cell, df) {
   fm <- stats::as.formula(cell[["r_formula"]])
-  w <- if (is.null(cell[["weights_col"]])) NULL else df[[cell[["weights_col"]]]]
+  # `.w`, not `w`: lm/glm/lmer/glmmTMB look `weights` up in `data` first, so a
+  # local named like a data column (sim_dynrange_lmm has a predictor `w`) would
+  # silently fit with that column as the prior weights.
+  .w <- if (is.null(cell[["weights_col"]])) NULL else df[[cell[["weights_col"]]]]
   nagq <- if (is.null(cell[["nagq"]])) 1L else as.integer(cell[["nagq"]])
   if (is_glm(cell)) {
     return(switch(cell[["family"]],
-      gaussian = function() stats::lm(fm, data = df, weights = w),
-      negativebinomial = function() MASS::glm.nb(fm, data = df, weights = w),
-      function() stats::glm(fm, data = df, weights = w,
+      gaussian = function() stats::lm(fm, data = df, weights = .w),
+      negativebinomial = function() MASS::glm.nb(fm, data = df, weights = .w),
+      function() stats::glm(fm, data = df, weights = .w,
                             family = fam_obj(cell[["family"]], cell[["link"]]))))
   }
   if (cell[["family"]] == "gaussian") {
     # `reml` is meaningful only here; a GLMM has no restricted likelihood.
-    return(function() lme4::lmer(fm, data = df, weights = w,
+    return(function() lme4::lmer(fm, data = df, weights = .w,
                                  REML = isTRUE(cell[["reml"]])))
   }
   if (cell[["family"]] == "negativebinomial") {
     # glmer.nb estimates the shape by profiling around a Poisson glmer start;
     # the named arguments below reach that inner glmer through its `...`.
-    return(function() lme4::glmer.nb(fm, data = df, weights = w, nAGQ = nagq,
+    return(function() lme4::glmer.nb(fm, data = df, weights = .w, nAGQ = nagq,
                                      control = lme4::glmerControl(tolPwrss = TOLPWRSS,
                                                                   calc.derivs = CALC_DERIVS)))
   }
-  function() lme4::glmer(fm, data = df, weights = w, nAGQ = nagq,
+  function() lme4::glmer(fm, data = df, weights = .w, nAGQ = nagq,
                          family = fam_obj(cell[["family"]], cell[["link"]]),
                          control = lme4::glmerControl(tolPwrss = TOLPWRSS,
                                                       calc.derivs = CALC_DERIVS))

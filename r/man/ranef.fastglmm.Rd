@@ -4,10 +4,13 @@
 \alias{ranef.fastglmm}
 \title{Random-effect conditional modes}
 \usage{
-\method{ranef}{fastglmm}(object, ...)
+\method{ranef}{fastglmm}(object, condVar = TRUE, ...)
 }
 \arguments{
 \item{object}{a \link{fastglmm} fit.}
+
+\item{condVar}{\code{TRUE} (the default) to attach the conditional variances as
+a \code{postVar} attribute, \code{FALSE} for the modes alone.}
 
 \item{...}{unused.}
 }
@@ -26,11 +29,14 @@ a grouping factor lands in is a data-dependent speed decision, so only the
 layer that made it can say which level a number belongs to. Padded slots of a
 nested grouping carry no level and are not reported.
 
-Two differences from \code{lme4::ranef} worth knowing. Conditional variances are
-not computed, so \code{condVar} is not supported. And a grouping level that owns
-model width but no rows is reported with its mode shrunk to zero, where lme4
-has no such row at all; the fit warns about that case
-(\code{fastglmm_unused_grouping_levels}).
+With \code{condVar = TRUE} (the default) each data frame carries a \code{postVar}
+attribute, as lme4's does: an array of terms x terms x levels holding each
+level's conditional covariance of its random effects given the data, at the
+fitted parameters. A fit made with \code{condvar = FALSE} has none, and some
+layouts form none: a model with an extra grouping that has a random slope,
+one over the dense size limit (both fitted by the sparse solver), and a GLMM
+on the packed layout. There an explicit \code{condVar = TRUE} is an error, and
+the default leaves the attribute off.
 
 Adds a method to \code{nlme::ranef}, the generic \code{lme4::ranef} also uses (lme4
 adds methods to nlme's generic rather than declaring its own), so a

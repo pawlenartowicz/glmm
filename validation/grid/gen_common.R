@@ -17,14 +17,21 @@ suppressMessages(library(MASS))
 # Each structure: RE terms as a list of q values (q = 1 intercept-only, q >= 2
 # intercept + q-1 slopes on x1..x_{q-1}); `nested` = TRUE chains every later
 # term inside the previous one (unique labels), an integer m chains terms 2..m
-# and leaves the rest crossed. n_theta = sum q(q+1)/2. The ladder targets
-# {1,2,3,5,8,12,18,27,40} are realized via slope/factor counts; neighbors fill
-# the gaps so aggregate curves have support between targets.
+# and leaves the rest crossed. `split` says how each block's columns are split
+# into random-effect terms: absent, one unstructured term; "diag", one term per
+# column, so no correlation is estimated ((x1 || g1)); "noint", the intercept
+# left out ((0 + x1 | g1)), so its true sd is 0. The block keeps q columns in
+# the data either way. n_theta counts the free covariance parameters: q(q+1)/2
+# per unstructured block, q per "diag" block, q(q-1)/2 per "noint" block. The
+# ladder targets {1,2,3,5,8,12,18,27,40} are realized via slope/factor counts;
+# neighbors fill the gaps so aggregate curves have support between targets.
 STRUCTURES <- list(
   int1    = list(q = c(1),                      nested = FALSE, glmm = TRUE),   # nt 1
   int2x   = list(q = c(1, 1),                   nested = FALSE, glmm = TRUE),   # nt 2
   nest2   = list(q = c(1, 1),                   nested = TRUE,  glmm = TRUE),   # nt 2
   q2s     = list(q = c(2),                      nested = FALSE, glmm = TRUE),   # nt 3
+  q1n     = list(q = c(2), split = "noint",     nested = FALSE, glmm = TRUE),   # nt 1 ((0 + x1 | g1))
+  q2d     = list(q = c(2), split = "diag",      nested = FALSE, glmm = TRUE),   # nt 2 ((x1 || g1))
   nest3   = list(q = c(1, 1, 1),                nested = TRUE,  glmm = FALSE),  # nt 3
   nestmix = list(q = c(1, 1, 1),                nested = 2L,    glmm = FALSE),  # nt 3 (g2 in g1, g3 crossed)
   cross4  = list(q = c(1, 1, 1, 1),             nested = FALSE, glmm = TRUE),   # nt 4
@@ -43,7 +50,9 @@ STRUCTURES <- list(
   q8      = list(q = c(8),                      nested = FALSE, glmm = FALSE),  # nt 36 (sim_max_q_slope's class)
   q8q2x   = list(q = c(8, 2, 1),                nested = FALSE, glmm = FALSE)   # nt 40
 )
-n_theta_of <- function(st) sum(vapply(st$q, function(q) q * (q + 1) / 2, 0))
+split_of <- function(st) if (is.null(st$split)) "full" else st$split
+n_theta_of <- function(st) sum(vapply(st$q, function(q) switch(split_of(st),
+  full = q * (q + 1) / 2, diag = q, noint = q * (q - 1) / 2), 0))
 
 # The four structure CLASSES the grid spans. A lone RE term is `scalar` when it
 # is intercept-only and `vector` otherwise; with several terms, a chain inside
@@ -203,6 +212,7 @@ sd_ladder <- function(q, k) 0.9^(seq_len(q) - 1) * c(1.0, 0.8, 0.7, 0.6, 0.6, 0.
 re_sds <- function(cell, k, q) {
   sds <- sd_ladder(q, k)
   if (cell$family != "gaussian") sds <- sds * 0.6   # keep link-scale sane
+  if (identical(split_of(STRUCTURES[[cell$structure]]), "noint")) sds[1] <- 0
   if (identical(cell$regime, "nearzero") && k == 1L) sds[q] <- 0.02
   # `boundary`: the true RE sd is EXACTLY zero on the primary grouping, so the
   # boundary of the parameter space is a class of its own rather than an
@@ -210,7 +220,11 @@ re_sds <- function(cell, k, q) {
   if (identical(cell$regime, "boundary") && k == 1L) sds <- rep(0, q)
   sds
 }
-re_corr <- function(cell) if (identical(cell$regime, "highcorr")) 0.9 else 0.2
+# A split block is drawn with independent columns, the model its formula fits.
+re_corr <- function(cell) {
+  if (!identical(split_of(STRUCTURES[[cell$structure]]), "full")) return(0)
+  if (identical(cell$regime, "highcorr")) 0.9 else 0.2
+}
 
 # Intercept on the linear-predictor scale.
 # gamma/inverse gets eta0 = 20: the inverse link needs eta > 0 for every row, and
@@ -262,7 +276,12 @@ truth_of <- function(cell) {
     q <- st$q[k]
     sds <- re_sds(cell, k, q)
     corr <- matrix(rho, q, q); diag(corr) <- 1
-    list(group = group_names(st)[k], terms = I(term_names(q)),
+    terms <- term_names(q)
+    # The fit reports no intercept for a "noint" block, so neither does the truth.
+    if (identical(split_of(st), "noint")) {
+      terms <- terms[-1]; sds <- sds[-1]; corr <- corr[-1, -1, drop = FALSE]
+    }
+    list(group = group_names(st)[k], terms = I(terms),
          stddev = I(sds), corr = corr)
   })
   list(
@@ -407,6 +426,9 @@ sim_cell <- function(cell) {
     if (any(sds > 0)) {
       Sigma <- diag(sds, q) %*% (matrix(corr_val, q, q) + diag(1 - corr_val, q)) %*% diag(sds, q)
       b <- matrix(mvrnorm(nl, rep(0, q), Sigma), nl, q)
+      # A zero-sd column (the left-out intercept of a "noint" block) is exactly
+      # zero, which mvrnorm's eigen route does not promise.
+      b[, sds == 0] <- 0
     } else {
       # `boundary` zeroes the block; mvrnorm on a singular zero covariance is
       # not guaranteed to return exact zeros, and exact zeros are the point.
@@ -420,36 +442,43 @@ sim_cell <- function(cell) {
 }
 
 # ---- formula emission ---------------------------------------------------------
-# Three dialects. `glmm_formula` differs from `jl_formula` in exactly one way:
-# it never carries an offset(...) term, because glmm and the two ports take the
+# Three dialects. `glmm_formula` differs from `jl_formula` in two ways. It
+# never carries an offset(...) term, because glmm and the two ports take the
 # offset through the fit options while lme4 / glmmTMB / GLMMadaptive /
 # MixedModels.jl read it out of the formula. Building it here rather than
 # stripping the term downstream is what makes "applied exactly once" mechanical.
+# And a "diag" block is written (x1 || g1) in the R and glmm dialects, which
+# lme4 expands to (1 | g1) + (0 + x1 | g1) and glmmTMB to diag(1 + x1 | g1),
+# but zerocorr(1 + x1 | g1) in the Julia one, MixedModels.jl's spelling.
 formulas_of <- function(cell) {
   st <- if (identical(cell$structure, "glm")) NULL else STRUCTURES[[cell$structure]]
-  re <- if (is.null(st)) character(0) else vapply(seq_along(st$q), function(k) {
+  re_of <- function(dialect) if (is.null(st)) character(0) else vapply(seq_along(st$q), function(k) {
     q <- st$q[k]; nm <- group_names(st)[k]
-    if (q == 1) sprintf("(1 | %s)", nm)
-    else sprintf("(1 + %s | %s)", paste(paste0("x", seq_len(q - 1)), collapse = " + "), nm)
+    if (q == 1) return(sprintf("(1 | %s)", nm))
+    xs <- paste(paste0("x", seq_len(q - 1)), collapse = " + ")
+    switch(split_of(st),
+      full  = sprintf("(1 + %s | %s)", xs, nm),
+      noint = sprintf("(0 + %s | %s)", xs, nm),
+      diag  = if (dialect == "jl") sprintf("zerocorr(1 + %s | %s)", xs, nm)
+              else sprintf("(%s || %s)", xs, nm))
   }, "")
   nx <- cell$n_x
   fx <- paste(paste0("x", seq_len(nx)), collapse = " + ")
   off <- if (!is.null(cell$offset_col)) sprintf("offset(%s)", cell$offset_col) else NULL
-  # Two right-hand sides: WITH the offset term and WITHOUT.
-  rhs_off <- paste(c("1", fx, off, re), collapse = " + ")
-  rhs_no  <- paste(c("1", fx, re), collapse = " + ")
+  rhs <- function(dialect, with_offset)
+    paste(c("1", fx, if (with_offset) off, re_of(dialect)), collapse = " + ")
   trials <- identical(cell$form, "trials")
   r_resp <- if (trials)
     sprintf("cbind(%s, %s - %s)", cell$response, cell[["weights"]], cell$response)
     else cell$response
   jl_resp <- if (trials) "prop" else cell$response
   list(
-    r    = sprintf("%s ~ %s", r_resp, rhs_off),
-    jl   = sprintf("@formula(%s ~ %s)", jl_resp, rhs_off),
+    r    = sprintf("%s ~ %s", r_resp, rhs("r", TRUE)),
+    jl   = sprintf("@formula(%s ~ %s)", jl_resp, rhs("jl", TRUE)),
     # The crate's parser treats the intercept as always implicit and has no term
     # for a literal `1`, so the "1 + " is stripped here rather than in four
     # engine scripts. `&` never appears -- formulas_of does not emit it.
-    glmm = strip_glmm_intercept(sprintf("%s ~ %s", jl_resp, rhs_no)))
+    glmm = strip_glmm_intercept(sprintf("%s ~ %s", jl_resp, rhs("glmm", FALSE))))
 }
 
 # The crate's formula dialect, from a Julia-style one: the "@formula(...)"

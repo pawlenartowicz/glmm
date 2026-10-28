@@ -3,10 +3,9 @@
 //! Raw optimizer state, *not* high-level variances: the dominant use is threading
 //! the previous fit's state into the next refit (loop tier / future inference
 //! layer), so it mirrors what the kernels already hold (`ws.params`/`theta`, the β
-//! estimate). The stable `fit_warm` takes this as an optional warm start; `fit_cold`
-//! (≡ `fit_warm(.., None, ..)`) omits it and cold-starts the kernels with
-//! `theta_start = None`. Shared internal primitive: `pub(crate)`
-//! always, and now unconditionally `pub` (a stable input to `fit_warm`).
+//! estimate). The stable `fit_with_start` takes this as its warm start; `fit`
+//! omits it and cold-starts the kernels with `theta_start = None`. A stable
+//! input, so `pub`.
 //!
 //! Carries `beta`, `theta` and an optional `dispersion`: the negative-binomial
 //! shape θ_NB and the Gamma φ, the outer search's trailing coordinate on a
@@ -33,7 +32,9 @@
 /// …)` shape) needs: β then seeds from the no-RE GLM fit and θ from the blind
 /// `THETA0` shape, exactly as `start = None` would. The two cold seeds are
 /// computed inside the kernels, so a caller cannot reproduce them itself.
-/// `StartValues::default()` is the all-cold start.
+/// `StartValues::default()` is the all-cold start; [`StartValues::new`] sets
+/// β and θ, and the dispersion is assigned through its field.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct StartValues {
     /// Warm-start β, length `p`; empty cold-starts β.
@@ -44,4 +45,15 @@ pub struct StartValues {
     /// Warm-start dispersion (NB shape θ, Gamma φ), finite and `> 0`; `None`
     /// cold-starts it.
     pub dispersion: Option<f64>,
+}
+
+impl StartValues {
+    /// A start from β and θ, with the dispersion cold-started (`None`).
+    pub fn new(beta: Vec<f64>, theta: Vec<f64>) -> StartValues {
+        StartValues {
+            beta,
+            theta,
+            dispersion: None,
+        }
+    }
 }

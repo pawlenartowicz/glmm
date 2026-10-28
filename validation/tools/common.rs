@@ -130,11 +130,10 @@ pub fn lower_grid_cell(cell: &Value, manifest_dir: &str) -> (Lowered, bool, usiz
 /// Handles the one genuinely data-shape-dependent branch in the corpus: an
 /// aggregated-binomial rung (manifest `weights` field) synthesizes `prop =
 /// incidence/weights_col` so jl_formula's `prop ~ ...`
-/// response resolves, then passes `Some(sizes)` into `FitOptions::weights`,
-/// one row per aggregate observation — every RE shape now honors prior
-/// weights (`src/fit.rs`'s boundary assert only rejects nAGQ>1 with weights),
-/// so there is no more dense-vs-sparse split or per-trial Bernoulli expansion
-/// to keep the two argmins in agreement.
+/// response resolves, then passes `Some(sizes)` into `Lowered::weights`,
+/// one row per aggregate observation — every RE shape honors prior weights,
+/// AGQ included, so no dense-vs-sparse split or per-trial Bernoulli expansion
+/// is needed to keep the two argmins in agreement.
 ///
 /// Returns the built `Table` alongside the `Lowered`, so a caller that wants to
 /// TIME the lowering (construction-inclusive timing, matching how lme4 /
@@ -171,13 +170,13 @@ pub fn lower_dataset_generic(
     let mut table = build_table(header, rows, factors);
     table.columns.push(("prop".into(), Column::Numeric(prop)));
     let mut lo = lower(formula_str, &table, family).unwrap_or_else(|e| panic!("lower: {e}"));
-    lo.opts.weights = Some(sizes);
+    lo.weights = Some(sizes);
     (lo, table)
 }
 
 /// Load one manifest rung's CSV, build its formula string and `Family` from the manifest
 /// fields, lower it, and apply `weights_col`/`offset` — the block
-/// `bit_identity/dump.rs`'s `rung_record` needs before it can call `fit_cold`.
+/// `bit_identity/dump.rs`'s `rung_record` needs before it can call `glmm::fit`.
 /// `manifest_dir` is the `validation/` crate dir (`CARGO_MANIFEST_DIR`), matching
 /// `lower_grid_cell`'s convention above. Returns the lowered inputs, the pre-typed
 /// `Table` (kept for a caller that re-lowers it for a construction-inclusive timing), the
@@ -287,7 +286,7 @@ pub fn lower_rung(spec: &Value, manifest_dir: &str) -> (Lowered, Table, Family, 
             .iter()
             .position(|h| h == wc)
             .unwrap_or_else(|| panic!("{ds}: weights_col {wc:?} not in CSV header"));
-        lo.opts.weights = Some(rows.iter().map(|r| r[w_idx].parse().unwrap()).collect());
+        lo.weights = Some(rows.iter().map(|r| r[w_idx].parse().unwrap()).collect());
     }
     // `offset` field: per-row known additive term on the linear-predictor scale
     // (R's `offset=`) -- a named CSV column, mirroring `weights_col` above.
@@ -296,7 +295,7 @@ pub fn lower_rung(spec: &Value, manifest_dir: &str) -> (Lowered, Table, Family, 
             .iter()
             .position(|h| h == oc)
             .unwrap_or_else(|| panic!("{ds}: offset {oc:?} not in CSV header"));
-        lo.opts.offset = Some(rows.iter().map(|r| r[o_idx].parse().unwrap()).collect());
+        lo.offset = Some(rows.iter().map(|r| r[o_idx].parse().unwrap()).collect());
     }
 
     (lo, table, family, formula_str)

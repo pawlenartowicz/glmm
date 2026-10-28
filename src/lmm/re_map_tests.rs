@@ -1,18 +1,23 @@
 use super::*;
+use crate::fit::SizedSpec;
 use crate::standardize::ColumnScaling;
-use crate::{Family, ModelSpec, ReStructure, Sizing};
+use crate::{Family, ModelSpec, ReStructure};
 
 /// Groupings for one block (1 + x1 + x2 | g), slope columns 1 and 2 of a p=3 X.
 fn one_block(q_slopes: &[usize]) -> LmmGroupings {
-    let spec = ModelSpec {
-        family: Family::Gaussian,
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 4 },
-            slopes: q_slopes.iter().map(|&c| c as u32).collect(),
-            extra_groupings: vec![],
-        }),
+    let spec = SizedSpec {
+        spec: ModelSpec {
+            family: Family::Gaussian,
+            re: Some(ReStructure {
+                terms: Vec::new(),
+                slopes: q_slopes.iter().map(|&c| c as u32).collect(),
+                extra_groupings: vec![],
+            }),
+        },
+        n_primary: 4,
+        extra_counts: vec![],
     };
-    LmmGroupings::from_cluster_spec_ext(&spec, 16, q_slopes, &[])
+    LmmGroupings::from_cluster_spec_ext(&spec, q_slopes, &[])
 }
 
 /// A scaling with intercept in column 0 and the given (m, s) on columns 1..
@@ -161,7 +166,7 @@ fn stddev_se_matches_finite_differences_of_the_reported_stddevs() {
         }
     });
     let x = [1.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 0.0];
-    let mut cs01 = ColumnScaling::with_re_slopes(3, [1, 2]);
+    let mut cs01 = ColumnScaling::with_re_slopes(3, [1, 2], []);
     cs01.compute(&x, 3, 3, None, true);
     assert!(!g.block_has_shift(0, &cs01));
     for cs in [scaling(&[(12.0, 3.0), (-2.0, 0.5)]), cs01] {
@@ -199,6 +204,67 @@ fn stddev_se_matches_finite_differences_of_the_reported_stddevs() {
             [got[1], got[2], got[4]].iter().all(|v| v.is_nan()),
             "{got:?}"
         );
+    }
+
+    // A masked GLMM, `(1 + grp || cluster)` on `sim_gamma` (Gamma-log; `grp`
+    // is 0/1, so nothing is centered), at the θ̃ and θ̃ covariance its fit
+    // left: the covariance has exact zeros on the structural entry 1, and the
+    // Jacobian is differenced along the free entries 0 and 2.
+    let (x, y, cluster, _) = crate::fit::common_tests::sim_clustered(include_str!(
+        "../../validation/data/simulated/sim_gamma.csv"
+    ));
+    let (n, p) = (y.len(), 3);
+    let model = ModelSpec::mixed(
+        Family::Gamma {
+            link: crate::GammaLink::Log,
+        },
+        ReStructure::intercept().slopes([2]).uncorrelated(),
+    );
+    let ids = crate::GroupIds {
+        primary: cluster,
+        extra: vec![],
+    };
+    let (fit, fws) = crate::fit::fit_cold_keep_workspace(
+        &crate::Data::new(&x, &y, n, p).ids(&ids),
+        &model,
+        &crate::FitOptions::default(),
+    );
+    let (ws, cs) = fws
+        .glmm_parts()
+        .expect("a Gamma mixed fit has a GLMM workspace");
+    assert!(fit.converged());
+    let (g, cov) = (&ws.groupings, &ws.inference.theta_cov);
+    let theta: [f64; 3] = ws.params[..3].try_into().unwrap();
+    assert_eq!(theta[1], 0.0);
+    for a in 0..3 {
+        assert_eq!((cov[(1, a)], cov[(a, 1)]), (0.0, 0.0), "Cov row/column 1");
+    }
+    let mut got = [0.0; 3];
+    g.stddev_se_kernel_to_caller(&theta, cov.as_ref(), &mut got, cs);
+    let mut jac = [[0.0f64; 3]; 2];
+    for a in [0, 2] {
+        let h = 1e-6;
+        let (mut tp, mut tm) = (theta, theta);
+        tp[a] += h;
+        tm[a] -= h;
+        let (fp, fm) = (caller_stddevs(g, &tp, 2, cs), caller_stddevs(g, &tm, 2, cs));
+        for k in 0..2 {
+            jac[k][a] = (fp[k] - fm[k]) / (2.0 * h);
+        }
+    }
+    for (k, slot) in [(0, 0), (1, 2)] {
+        let v: f64 = [0, 2]
+            .into_iter()
+            .flat_map(|a| [0, 2].into_iter().map(move |c| (a, c)))
+            .map(|(a, c)| jac[k][a] * cov[(a, c)] * jac[k][c])
+            .sum();
+        assert!(
+            v > 0.0 && (got[slot] - v.sqrt()).abs() <= 1e-6 * v.sqrt(),
+            "masked GLMM: sd[{k}]: {} vs {}",
+            got[slot],
+            v.sqrt()
+        );
+        assert_eq!(got[slot], fit.stddev_se[slot], "masked GLMM: sd[{k}]");
     }
 }
 

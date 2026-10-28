@@ -1,24 +1,17 @@
-"""Response-domain and dispersion-value validation (GLMM/src/fit/mod.rs, and
-GLMM/src/orchestrate.rs for the dispersion value).
+"""Dispersion-value validation (src/orchestrate.rs).
 
-These checks live in Rust; `fit()` does no pre-check of its own, so every case
+The check lives in Rust; `fit()` does no pre-check of its own, so every case
 here surfaces as a `ValueError` from `_native.fit`.
-Mirrored in r/tests/testthat/test-response-domain.R - change together.
+Mirrored in r/tests/testthat/test-errors.R - change together.
 """
 
 import pytest
 
 import glmm
 
-# Small, deliberately out-of-domain fixtures. Never meant to converge — they
-# only exercise the kernel's entry-level checks.
+# A small fixture that never reaches the kernel: the dispersion check refuses
+# the call before the formula is lowered.
 DATA = {"y": [1.0, 2.0, 3.0, 4.0], "x": [0.0, 1.0, 2.0, 3.0]}
-
-
-def test_poisson_negative_response_raises():
-    data = dict(DATA, y=[1.0, -1.0, 3.0, 4.0])
-    with pytest.raises(ValueError, match="Poisson response"):
-        glmm.fit(data, "y ~ x", "poisson")
 
 
 @pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), float("inf")])

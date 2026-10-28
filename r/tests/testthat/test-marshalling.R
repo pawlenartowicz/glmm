@@ -9,16 +9,7 @@ ols_data <- function() {
   )
 }
 
-test_that("gaussian OLS fits and names coefficients", {
-  fit <- fastglmm(y ~ x, ols_data(), family = gaussian())
-  expect_named(fixef(fit), c("(Intercept)", "x"))
-  expect_equal(unname(fixef(fit)[["x"]]),
-               unname(coef(lm(y ~ x, ols_data()))[["x"]]),
-               tolerance = 1e-8)
-  expect_true(fit$converged)
-})
-
-test_that("a factor's declared level order survives to the base level (gate 3)", {
+test_that("a factor's declared level order survives to the base level", {
   set.seed(11)
   d <- data.frame(
     y = rnorm(60),

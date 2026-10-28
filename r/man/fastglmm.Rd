@@ -18,6 +18,7 @@ fastglmm(
   dispersion = NULL,
   init.theta = NULL,
   satterthwaite = TRUE,
+  condvar = TRUE,
   REML = NULL,
   anova_test = c("auto", "Wald", "LRT"),
   ...
@@ -97,6 +98,14 @@ then use z and normal quantiles and say "df not computed", and
 \verb{$df_method} is \code{"disabled"}. OLS and the Gamma and inverse-Gaussian GLMs
 keep their residual df whatever it says.}
 
+\item{condvar}{compute the conditional variances of the random effects
+(default \code{TRUE}), which \link[=ranef.fastglmm]{ranef()}'s \code{postVar} attribute
+and a conditional \link[=predict.fastglmm]{predict()} with \code{se.fit} or \code{interval}
+read. \code{FALSE} skips them, which saves up to about the time of the fit
+itself on a crossed model with many levels: \code{ranef()} then leaves
+\code{postVar} off, and \code{ranef(fit, condVar = TRUE)} and such a \code{predict()} are
+errors.}
+
 \item{REML}{\code{NULL} (the default), \code{TRUE} or \code{FALSE}; \verb{$reml} reports the
 value used. A Gaussian mixed model is fitted by REML under \code{NULL} and
 \code{TRUE} and by maximum likelihood under \code{FALSE}. A Gaussian model with no
@@ -135,17 +144,20 @@ converge) and \code{coef_p} (its p-value), \code{df_method}
 (\code{"satterthwaite"}, \code{"residual"}, \code{"none"}, \code{"disabled"} or \code{"failed"}),
 \code{rss}, \code{r_squared} and \code{adj_r_squared} (OLS fits only, \code{NaN} otherwise),
 \code{offset} (the offset fitted with, \code{NULL} without one),
-\code{satterthwaite_record} (what \code{\link[=contrast_test]{contrast_test()}} reads on a fit whose
-\code{df_method} is \code{"satterthwaite"}, \code{NULL} on every other fit), plus
-\link[=anova.fastglmm]{anova()} (the per-term tests, built at fit time, or a
-comparison of two fits), \code{print()}, \link[=summary.fastglmm]{summary()},
+\code{satterthwaite_record} (what \code{\link[=contrast_test]{contrast_test()}} and \code{\link[=pairwise]{pairwise()}} read on
+a fit whose \code{df_method} is \code{"satterthwaite"}, \code{NULL} on every other fit),
+plus \link[=anova.fastglmm]{anova()} (the per-term tests, built at fit time, or
+a comparison of two fits), \code{\link[=pairwise]{pairwise()}} (the pairwise comparisons of a
+factor's levels), \code{\link[=r2]{r2()}} and \code{\link[=icc]{icc()}} (a mixed model's R-squared pair and
+intraclass correlation), \code{print()}, \link[=summary.fastglmm]{summary()},
 \link[=confint.fastglmm]{confint()} (Wald), \code{nobs()},
 \link[=formula.fastglmm]{formula()} (returns the model formula as given, so
 \code{update()} works), \code{family()}, \code{model.frame()}, \link[=ranef.fastglmm]{ranef()},
-\code{fitted()}, \code{residuals()}, \link[=logLik.fastglmm]{logLik()}, and
+\code{fitted()}, \code{residuals()}, \link[=predict.fastglmm]{predict()},
+\link[=simulate.fastglmm]{simulate()}, \link[=logLik.fastglmm]{logLik()}, and
 \link[=AIC.fastglmm]{AIC()} and \code{BIC()} (which refuse a REML fit beside an ML
 one, and REML fits with different fixed effects). The blocked accessors
-(\code{predict}, \code{coef}, \code{terms}) error with the reason.
+(\code{coef}, \code{terms}) error with the reason.
 }
 \description{
 One entry point for the whole \code{glmm} engine, dispatching on \code{family} the way
@@ -164,9 +176,13 @@ removal (\code{- 1} / \verb{0 +}). Not accepted: \code{poly()}, arithmetic insid
 nested calls, and \code{.} - compute those columns first and pass them by name.
 \verb{weights=} together with a \code{cbind()} formula, and \verb{offset=} together with
 an \code{offset()} formula term, both error naming "use one". Fixed and random
-effects support \code{+}, \code{:}, \code{*}, \code{A/B} nesting, and \code{(1 + x | g)} random-effect
-terms with a \strong{full} correlation structure - \code{(x || g)} and intercept-free
-RE terms are not fittable by the kernel and raise an error. Contrasts are
+effects support \code{+}, \code{:}, \code{*}, \code{A/B} nesting, and \code{(a + b)^k} crossing.
+Random-effect terms may be correlated \code{(1 + x | g)}, uncorrelated
+\code{(x || g)} or \code{zerocorr(1 + x | g)}, intercept-free \code{(0 + x | g)}, or
+several terms on one grouping such as \code{(1 | g) + (0 + x | g)}; a column in
+two terms on one grouping is an error. On a factor slope, \code{(f || g)} keeps
+the factor's block correlated, as lme4 does, while \code{zerocorr(f | g)} makes
+every column uncorrelated. Contrasts are
 always treatment coding with the \strong{first factor level} as base; to change
 the base, \code{relevel()} the factor (a \code{contrasts} argument is deliberately
 absent). Anything that would silently mean something else - an ordered
@@ -198,7 +214,6 @@ Python port so the two ports agree.
 \strong{Diagnostic warnings carry a condition class.} Each solver note is raised
 as a warning of class \code{"fastglmm_diagnostic"} with a per-kind subclass
 (\code{"fastglmm_ill_conditioned"}, \code{"fastglmm_pirls_exhausted"},
-\code{"fastglmm_unused_grouping_levels"},
 \code{"fastglmm_single_level_grouping_dropped"},
 \code{"fastglmm_few_rows_for_random_effects"}, \code{"fastglmm_hessian_se_fallback"},
 \code{"fastglmm_se_unavailable"}, \code{"fastglmm_exact_profile_fallback"},

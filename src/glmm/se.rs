@@ -5,6 +5,7 @@ use super::deviance::laplace_deviance_at;
 use super::pirls::{schur_from_residuals, structured_ainv_solve};
 use super::workspace::{fill_z_f64, glmm_block_solve, GlmmLayout, GlmmWorkspace};
 use super::{FdHessianStatus, FD_STEP_BASE};
+use crate::fit::{CondvarBlocks, CondvarCross};
 
 /// Evaluate the joint Laplace deviance at `fd_saved + Σ deltaₖ·e_{coordₖ}`,
 /// reusing `ws.fd.fd_saved` (distinct field from `ws.params`, so the disjoint
@@ -312,7 +313,12 @@ fn fd_grid_par(
 ) -> Vec<(usize, usize, f64)> {
     use super::workspace::fd_worker_ws;
     use rayon::prelude::*;
-    let cells: Vec<(usize, usize)> = (0..m).flat_map(|i| (i..m).map(move |j| (i, j))).collect();
+    let structural = ws_ro.groupings.structural_theta();
+    let free = |k: &usize| structural.binary_search(k).is_err();
+    let cells: Vec<(usize, usize)> = (0..m)
+        .filter(free)
+        .flat_map(|i| (i..m).filter(free).map(move |j| (i, j)))
+        .collect();
     let chunk = cells
         .len()
         .div_ceil(rayon::current_num_threads().max(1))
@@ -359,6 +365,9 @@ fn fd_grid_par(
 /// so each grid cell is a pure function of `(γ̂, steps, design)` and the
 /// per-thread workspaces reproduce the serial values bit-for-bit.
 ///
+/// A row or column of a θ entry the grouping's terms hold at zero is not
+/// evaluated: [`joint_hessian_cov`] drops it before the factorization.
+///
 /// Tolerance contract: the CALLER sets `ws.fd.pirls_tol_override` around this
 /// call and resets it on every exit.
 #[allow(clippy::too_many_arguments)]
@@ -395,9 +404,11 @@ fn packed_fd_hessian_cov(
             }
         }
     } else {
-        for i in 0..m {
+        let structural = ws.groupings.structural_theta().to_vec();
+        let free = |k: &usize| structural.binary_search(k).is_err();
+        for i in (0..m).filter(free) {
             let hi = ws.fd.fd_steps[i];
-            for j in i..m {
+            for j in (i..m).filter(free) {
                 let hj = ws.fd.fd_steps[j];
                 let h = fd_hess_entry(ws, i, j, hi, hj, f0, x, y, cluster_ids, extra_ids, n);
                 if !h.is_finite() {
@@ -417,16 +428,18 @@ fn packed_fd_hessian_cov(
 /// coupling}`; the packed one re-factors the dense `ws.packed.a` or solves
 /// through the sparse factor its PIRLS left. `xd` is the fixed-effect
 /// design the Schur is built on, `x` the design the random-effect slopes are
-/// read from; they differ only on [`rx_schur_llt`]'s rebuild.
+/// read from (with `z`, the random-effect-only columns); they differ only on
+/// [`rx_schur_llt`]'s rebuild.
 fn schur_fill(
     ws: &mut GlmmWorkspace,
     x: MatRef<f64>,
+    z: MatRef<f64>,
     xd: MatRef<f64>,
     cluster_ids: &[u32],
     n: usize,
 ) -> bool {
     match ws.layout {
-        GlmmLayout::Blocked => blocked_schur_fill(ws, x, xd, cluster_ids, n),
+        GlmmLayout::Blocked => blocked_schur_fill(ws, x, z, xd, cluster_ids, n),
         GlmmLayout::Structured => structured_schur_fill(ws, xd, cluster_ids, n),
         GlmmLayout::Packed => packed_schur_fill(ws, xd, n),
     }
@@ -454,11 +467,12 @@ fn schur_fill(
 pub(crate) fn rx_schur_llt(
     ws: &mut GlmmWorkspace,
     x: MatRef<f64>,
+    z: MatRef<f64>,
     cluster_ids: &[u32],
     n: usize,
 ) -> Option<(crate::linalg::SeqLlt, Option<crate::lmm::DesignQr>)> {
     let p = ws.p;
-    if !schur_fill(ws, x, x, cluster_ids, n) {
+    if !schur_fill(ws, x, z, x, cluster_ids, n) {
         return None;
     }
     let direct = crate::linalg::SeqLlt::new(ws.border.schur.as_ref());
@@ -490,7 +504,7 @@ pub(crate) fn rx_schur_llt(
             xt[(i, j)] = v;
         }
     }
-    if !schur_fill(ws, x, xt.as_ref(), cluster_ids, n) {
+    if !schur_fill(ws, x, z, xt.as_ref(), cluster_ids, n) {
         return None;
     }
     let chol = crate::linalg::SeqLlt::new(ws.border.schur.as_ref())?;
@@ -510,12 +524,13 @@ pub(crate) fn rx_schur_llt(
 pub(crate) fn rx_cov_into(
     ws: &mut GlmmWorkspace,
     x: MatRef<f64>,
+    z: MatRef<f64>,
     cluster_ids: &[u32],
     p: usize,
     n: usize,
     out_cov: &mut Mat<f64>,
 ) -> bool {
-    let (chol, qr) = match rx_schur_llt(ws, x, cluster_ids, n) {
+    let (chol, qr) = match rx_schur_llt(ws, x, z, cluster_ids, n) {
         Some(f) => f,
         None => return false,
     };
@@ -665,7 +680,10 @@ pub(crate) fn rx_cov_into(
 /// correction RAISES cbpp SEs above RX — as ours does; lme4's default-tol value
 /// lowers them, a sign artifact of the lagged weights.
 ///
-/// `m = n_theta + p`; the β block is rows/cols `n_theta..m`. On NB `ws.params`
+/// `m = n_theta + p`; the β block is rows/cols `n_theta..m`. The θ entries the
+/// grouping's terms hold at zero (`LmmGroupings::structural_theta`) are not
+/// coordinates: no stencil evaluates their rows, the inverse is taken over
+/// the free θ and β alone, and their rows of `theta_cov` are zero. On NB `ws.params`
 /// carries one more trailing entry (`ln θ_NB`), which this (θ, β) FD grid never
 /// perturbs — its row and column are appended separately, by central
 /// differences of the full objective (the `DispRow::Nb` arm below), so the
@@ -677,6 +695,7 @@ pub(crate) fn rx_cov_into(
 pub fn joint_hessian_cov(
     ws: &mut GlmmWorkspace,
     x: MatRef<f64>,
+    z: MatRef<f64>,
     y: &[f64],
     cluster_ids: &[u32],
     extra_ids: &[Vec<u32>],
@@ -694,7 +713,7 @@ pub fn joint_hessian_cov(
     // on `X̃ = XL⁻ᵀ`, whose weighted Gram is the identity), and
     // `Cov(β̂) = L⁻ᵀ·Cov(β̃)·L⁻¹` maps back. The θ block of the inverse does not
     // depend on how β is parametrized. Random-effect slopes are read from the
-    // raw `x` (`z_buf`, the Rx fallback).
+    // raw `x` and the random-effect-only columns `z` (`z_buf`, the Rx fallback).
     let n_theta = ws.n_theta;
     xtwx_fill(ws, x, n);
     let well_conditioned = crate::linalg::SeqLlt::new(ws.border.xtwx.as_ref())
@@ -725,6 +744,7 @@ pub fn joint_hessian_cov(
     let status = joint_hessian_cov_fam(
         ws,
         x,
+        z,
         xd,
         x_search.is_some(),
         y,
@@ -789,6 +809,7 @@ pub fn joint_hessian_cov(
 fn joint_hessian_cov_fam(
     ws: &mut GlmmWorkspace,
     x: MatRef<f64>,
+    z: MatRef<f64>,
     xd: MatRef<f64>,
     beta_scaled: bool,
     y: &[f64],
@@ -827,6 +848,7 @@ fn joint_hessian_cov_fam(
                 joint_hessian_cov_at(
                     ws,
                     x,
+                    z,
                     xd,
                     beta_scaled,
                     y,
@@ -842,6 +864,7 @@ fn joint_hessian_cov_fam(
         crate::spec::Family::NegativeBinomial { .. } => joint_hessian_cov_at(
             ws,
             x,
+            z,
             xd,
             beta_scaled,
             y,
@@ -855,6 +878,7 @@ fn joint_hessian_cov_fam(
         _ => joint_hessian_cov_at(
             ws,
             x,
+            z,
             xd,
             beta_scaled,
             y,
@@ -888,13 +912,15 @@ enum DispRow {
 /// joint Hessian gains before it is inverted: [`DispRow::Gamma`] with the
 /// workspace already holding the fixed-φ̂ GLMM (see the wrapper), or
 /// [`DispRow::Nb`]. `None` on every family whose dispersion is fixed. `xd` is
-/// the fixed-effect design every evaluation reads, `x` the design `z_buf` and
-/// the Rx fallback read, and `beta_scaled` says `xd` is `ws.beta_scale`'s
-/// search design (see [`joint_hessian_cov_fam`]).
+/// the fixed-effect design every evaluation reads, `x` and `z` (the
+/// random-effect-only columns) the design `z_buf` and the Rx fallback read,
+/// and `beta_scaled` says `xd` is `ws.beta_scale`'s search design (see
+/// [`joint_hessian_cov_fam`]).
 #[allow(clippy::too_many_arguments)]
 fn joint_hessian_cov_at(
     ws: &mut GlmmWorkspace,
     x: MatRef<f64>,
+    z: MatRef<f64>,
     xd: MatRef<f64>,
     beta_scaled: bool,
     y: &[f64],
@@ -907,13 +933,15 @@ fn joint_hessian_cov_at(
 ) -> FdHessianStatus {
     let m = ws.n_theta + p;
     let n_theta = ws.n_theta;
+    let structural = ws.groupings.structural_theta().to_vec();
+    let free = |k: &usize| structural.binary_search(k).is_err();
 
     // Snapshot γ̂; fill z_buf once from the raw `x` (every layout, matching
     // `fit_glmm`'s hoist), so the random-effect slopes never come from `xd`.
     // Both live OUTSIDE the exact/FD branch below: `fallback!()` restores
     // `ws.params` from `fd_saved` and `rx_cov_into` reads `z_buf` on both arms.
     ws.fd.fd_saved[..m].copy_from_slice(&ws.params[..m]);
-    fill_z_f64(&ws.groupings, x, &mut ws.z_buf, n);
+    fill_z_f64(&ws.groupings, x, z, &mut ws.z_buf, n);
 
     // Put û(γ̂) back the way it was found. `u_seed` holds the entry mode (see the
     // seeding block below), and every eval here overwrites `ws.pirls.u` with its own
@@ -940,7 +968,7 @@ fn joint_hessian_cov_at(
             // The fallback reports an RX vcov exactly as the production Rx arm
             // does: on Gamma the weights in place here are `prior_wᵢ/φ̂`, so the
             // Schur inverse is already `φ̂·RX⁻¹` and takes no further factor.
-            let ok = rx_cov_into(ws, x, cluster_ids, p, n, out_cov);
+            let ok = rx_cov_into(ws, x, z, cluster_ids, p, n, out_cov);
             // Double failure (joint Hessian AND RX Schur both non-PD; small
             // Gamma-inverse fits with a large random-effect sd reach it):
             // rx_cov_into leaves out_cov UNTOUCHED on `false`, so it would keep
@@ -1194,14 +1222,14 @@ fn joint_hessian_cov_at(
                 }
             }
         } else {
-            for i in 0..m {
+            for i in (0..m).filter(free) {
                 let hi = ws.fd.fd_steps[i];
                 let hii = second_diff(ws, i, hi, f0, xd, y, cluster_ids, extra_ids, n);
                 if !hii.is_finite() {
                     fallback!();
                 }
                 ws.inference.hess_scratch[(i, i)] = hii;
-                for j in (i + 1)..m {
+                for j in ((i + 1)..m).filter(free) {
                     let hj = ws.fd.fd_steps[j];
                     let hij = mixed_diff(ws, i, j, hi, hj, xd, y, cluster_ids, extra_ids, n);
                     if !hij.is_finite() {
@@ -1265,7 +1293,7 @@ fn joint_hessian_cov_at(
             )
             .is_some()
                 && dev_grad.iter().all(|g| g.is_finite());
-            for k in 0..m {
+            for k in (0..m).filter(free) {
                 let g = if exact {
                     dev_grad[k]
                 } else {
@@ -1336,7 +1364,7 @@ fn joint_hessian_cov_at(
                     h[(k, m)] = v;
                 }
             } else {
-                for k in 0..m {
+                for k in (0..m).filter(free) {
                     let hk = NB_DISP_FD_STEP * ws.fd.fd_saved[k].abs().max(1.0);
                     let mut corner = |dk: f64, dt: f64| {
                         nb_full_objective(
@@ -1366,22 +1394,32 @@ fn joint_hessian_cov_at(
     };
 
     // Invert the joint Hessian; non-PD ⇒ RX fallback. cov = 2·(H⁻¹)_ββ.
+    // A θ entry the grouping's terms hold at zero is not a coordinate of the
+    // fit, which is not stationary along it: its row and column, whatever a
+    // rung left there, are dropped before the factorization, and its
+    // covariance is zero. `free_index` maps a coordinate of the full
+    // `[θ | β | disp]` layout to the free one.
     let md = if disp_hess.is_some() { m + 1 } else { m };
-    let chol = match crate::linalg::SeqLlt::new(
-        disp_hess
-            .as_ref()
-            .map_or(ws.inference.hess_scratch.as_ref(), |h| h.as_ref()),
-    ) {
+    let full = disp_hess
+        .as_ref()
+        .map_or(ws.inference.hess_scratch.as_ref(), |h| h.as_ref());
+    let free_hess = (!structural.is_empty()).then(|| {
+        let keep: Vec<usize> = (0..md).filter(free).collect();
+        Mat::from_fn(keep.len(), keep.len(), |a, b| full[(keep[a], keep[b])])
+    });
+    let chol = match crate::linalg::SeqLlt::new(free_hess.as_ref().map_or(full, |h| h.as_ref())) {
         Some(c) => c,
         None => fallback!(),
     };
+    let free_index = |k: usize| structural.binary_search(&k).err().map(|below| k - below);
+    let (nf, md_free) = (n_theta - structural.len(), md - structural.len());
     // Pivot ratio of the β information this covariance comes from. With θ
     // ordered first, rows and columns `n_theta..m` of the factor are the factor
     // of the β block with θ profiled out (any dispersion row comes after them,
     // so it is held fixed). On `ws.beta_scale`'s search design that block is
     // `F` with the fitted design's information `L·FFᵀ·Lᵀ`, so the ratio is read
     // off `L·F` (`BetaScale::map_factor`), on the fitted design's own columns.
-    let beta_factor = chol.L().submatrix(n_theta, n_theta, p, p);
+    let beta_factor = chol.L().submatrix(nf, nf, p, p);
     let (pivot, col) = if beta_scaled {
         let mut l = beta_factor.to_owned();
         ws.beta_scale.map_factor(l.as_mut());
@@ -1390,11 +1428,11 @@ fn joint_hessian_cov_at(
         crate::ols::min_pivot_ratio(beta_factor, p)
     };
     (ws.inference.pivot, ws.inference.pivot_col) = (pivot, col as u32);
-    let mut inv = Mat::<f64>::identity(md, md);
+    let mut inv = Mat::<f64>::identity(md_free, md_free);
     chol.solve_in_place(inv.as_mut());
     for a in 0..p {
         for b in 0..p {
-            out_cov[(a, b)] = 2.0 * inv[(n_theta + a, n_theta + b)];
+            out_cov[(a, b)] = 2.0 * inv[(nf + a, nf + b)];
         }
     }
     // θ block: the same cov = 2·H_dev⁻¹. The β block above discards it; expose
@@ -1404,16 +1442,21 @@ fn joint_hessian_cov_at(
     // `θ = ξ·e^{t/2}` maps it back by the delta method: `dθ = dξ + ½·θ̂·dt`, so
     // `Cov(θₖ, θₗ) = C_kl + ½θₗ·C_km + ½θₖ·C_lm + ¼θₖθₗ·C_mm` with `C = 2·H⁻¹`.
     // The NB row is in absolute coordinates already.
+    let t = md_free - 1;
     for k in 0..n_theta {
         for l in 0..n_theta {
+            let (Some(a), Some(b)) = (free_index(k), free_index(l)) else {
+                ws.inference.theta_cov[(k, l)] = 0.0;
+                continue;
+            };
             ws.inference.theta_cov[(k, l)] = if matches!(disp, Some(DispRow::Gamma { .. })) {
                 let (tk, tl) = (ws.fd.fd_saved[k], ws.fd.fd_saved[l]);
-                2.0 * (inv[(k, l)]
-                    + 0.5 * tl * inv[(k, m)]
-                    + 0.5 * tk * inv[(l, m)]
-                    + 0.25 * tk * tl * inv[(m, m)])
+                2.0 * (inv[(a, b)]
+                    + 0.5 * tl * inv[(a, t)]
+                    + 0.5 * tk * inv[(b, t)]
+                    + 0.25 * tk * tl * inv[(t, t)])
             } else {
-                2.0 * inv[(k, l)]
+                2.0 * inv[(a, b)]
             };
         }
     }
@@ -1610,6 +1653,7 @@ fn packed_schur_fill(ws: &mut GlmmWorkspace, x: MatRef<f64>, n: usize) -> bool {
 fn blocked_schur_fill(
     ws: &mut GlmmWorkspace,
     x: MatRef<f64>,
+    z: MatRef<f64>,
     xd: MatRef<f64>,
     cluster_ids: &[u32],
     n: usize,
@@ -1624,7 +1668,7 @@ fn blocked_schur_fill(
     }
     for i in 0..n {
         let f = cluster_ids[i] as usize;
-        let m_row = blocked_m_row(ws, x, i);
+        let m_row = blocked_m_row(ws, x, z, i);
         let wi = ws.pirls.w[i];
         for r in 0..p {
             let xw = xd[(i, r)] * wi;
@@ -1656,7 +1700,7 @@ fn blocked_schur_fill(
     // q columns only.
     for i in 0..n {
         let f = cluster_ids[i] as usize;
-        let m_row = blocked_m_row(ws, x, i);
+        let m_row = blocked_m_row(ws, x, z, i);
         for col in 0..p {
             let mut r = xd[(i, col)];
             #[allow(clippy::needless_range_loop)]
@@ -1676,7 +1720,12 @@ fn blocked_schur_fill(
 }
 
 /// Row `i` of `M = ZΛ` on the blocked layout: its cluster's `q_p` entries.
-fn blocked_m_row(ws: &GlmmWorkspace, x: MatRef<f64>, i: usize) -> [f64; crate::lmm::MAX_PRIMARY_Q] {
+fn blocked_m_row(
+    ws: &GlmmWorkspace,
+    x: MatRef<f64>,
+    z: MatRef<f64>,
+    i: usize,
+) -> [f64; crate::lmm::MAX_PRIMARY_Q] {
     let q = ws.groupings.primary_q;
     let mut m_row = [0.0_f64; crate::lmm::MAX_PRIMARY_Q];
     #[allow(clippy::needless_range_loop)]
@@ -1689,7 +1738,7 @@ fn blocked_m_row(ws: &GlmmWorkspace, x: MatRef<f64>, i: usize) -> [f64; crate::l
             let zr = if rr == 0 {
                 1.0
             } else {
-                x[(i, ws.groupings.primary_slope_cols[rr - 1])]
+                crate::lmm::slope_value(x, z, ws.p, i, ws.groupings.primary_slope_cols[rr - 1])
             };
             acc += zr * ws.pirls.lam[rr * q + c];
         }
@@ -1829,4 +1878,285 @@ fn structured_schur_fill(
         &mut ws.border.schur,
     );
     true
+}
+
+/// The kernel-coordinate blocks `Fit::condvar`, `Fit::condvar_x` and
+/// `Fit::condvar_cross` are assembled from, on the blocked and structured
+/// layouts: per level, in `Fit::ranef`'s order, the block of `A⁻¹`
+/// (`A = MᵀWM + I`, `W` the observed curvature) and the `p`-wide rows of
+/// `A⁻¹MᵀWx`, `x` the fitted design, and on the structured layout the pieces
+/// across groupings ([`structured_condvar`]). `None` on the packed layout, which has no per-level inverse short of a
+/// selected inverse of the whole `A`, and where a solve or a factor fails.
+///
+/// The f64 factors are not read as the search left them: the standard-error
+/// pass can evaluate the deviance at other points and leave them there (the
+/// finite-difference stencils restore the mode `ws.pirls.u`, not the factors).
+/// So the mode is re-solved at γ̂ first, as the
+/// assembled gradient does (`assembled::mode_solve_f64`, on the fixed-φ̂
+/// weights on a Gamma fit), which leaves `A`'s factor, `W` and `M` at the
+/// mode. `ws.pirls.u` and `ws.pirls.prob` are put back afterwards; every other
+/// slot it writes is scratch the next fit rewrites before reading.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn condvar_blocks(
+    ws: &mut GlmmWorkspace,
+    x: MatRef<f64>,
+    z: MatRef<f64>,
+    y: &[f64],
+    cluster_ids: &[u32],
+    extra_ids: &[Vec<u32>],
+    p: usize,
+    n: usize,
+) -> Option<CondvarBlocks> {
+    if ws.layout == GlmmLayout::Packed || ws.k == 0 {
+        return None;
+    }
+    let kk = ws.k.max(1);
+    let saved_u = ws.pirls.u[..kk].to_vec();
+    let saved_prob = ws.pirls.prob[..n].to_vec();
+    fill_z_f64(&ws.groupings, x, z, &mut ws.z_buf, n);
+    let tol = super::pirls_tol_fd(ws.family);
+    let out = ws.at_fixed_dispersion(n, |ws| {
+        if !super::assembled::mode_solve_f64(ws, x, y, cluster_ids, extra_ids, p, n, tol) {
+            return None;
+        }
+        match ws.layout {
+            GlmmLayout::Blocked => {
+                let (blocks, rows) = blocked_condvar(ws, x, z, cluster_ids, n);
+                Some((blocks, rows, None))
+            }
+            GlmmLayout::Structured => structured_condvar(ws, x, cluster_ids, n),
+            GlmmLayout::Packed => None,
+        }
+    });
+    ws.pirls.u[..kk].copy_from_slice(&saved_u);
+    ws.pirls.prob[..n].copy_from_slice(&saved_prob);
+    out
+}
+
+/// [`condvar_blocks`] on the blocked layout: `A` is block-diagonal over the
+/// clusters, so each level's block is `A_f⁻¹` off the factor in
+/// `ws.pirls.a_blocks`, and its rows of `A⁻¹MᵀWx` are `A_f⁻¹(MᵀWx)_f`, the
+/// per-block solves of [`blocked_schur_fill`].
+fn blocked_condvar(
+    ws: &GlmmWorkspace,
+    x: MatRef<f64>,
+    z: MatRef<f64>,
+    cluster_ids: &[u32],
+    n: usize,
+) -> (Vec<f64>, Vec<f64>) {
+    let (p, q, s) = (ws.p, ws.groupings.primary_q, ws.groupings.n_primary);
+    // (MᵀWx)_f, row-major q×p per cluster.
+    let mut rows = vec![0.0f64; s * q * p];
+    for i in 0..n {
+        let f = cluster_ids[i] as usize;
+        let m_row = blocked_m_row(ws, x, z, i);
+        let wi = ws.pirls.w[i];
+        for (c, &mc) in m_row.iter().enumerate().take(q) {
+            let row = &mut rows[(f * q + c) * p..(f * q + c + 1) * p];
+            for (j, v) in row.iter_mut().enumerate() {
+                *v += wi * mc * x[(i, j)];
+            }
+        }
+    }
+    let mut blocks = vec![0.0f64; s * q * q];
+    let mut rhs = [0.0f64; crate::lmm::MAX_PRIMARY_Q];
+    for f in 0..s {
+        let l = &ws.pirls.a_blocks[f * q * q..(f + 1) * q * q];
+        for c in 0..q {
+            rhs[..q].fill(0.0);
+            rhs[c] = 1.0;
+            glmm_block_solve(l, q, &mut rhs[..q]);
+            for (r, &v) in rhs[..q].iter().enumerate() {
+                blocks[f * q * q + r * q + c] = v;
+            }
+        }
+        for j in 0..p {
+            for (c, v) in rhs[..q].iter_mut().enumerate() {
+                *v = rows[(f * q + c) * p + j];
+            }
+            glmm_block_solve(l, q, &mut rhs[..q]);
+            for (c, &v) in rhs[..q].iter().enumerate() {
+                rows[(f * q + c) * p + j] = v;
+            }
+        }
+    }
+    (blocks, rows)
+}
+
+/// [`condvar_blocks`] on the structured layout, `A = [[F, C], [Cᵀ, E + I]]`
+/// with `F` block-diagonal over the clusters (a core block holds the primary
+/// level and its nested children) and the Schur complement
+/// `S = (E + I) − Σ_f C_fᵀF_f⁻¹C_f`: a core block of `A⁻¹` is
+/// `F_f⁻¹ + W_fS⁻¹W_fᵀ` with `W_f = F_f⁻¹C_f` over the cluster's coupling
+/// columns, a crossed level's is the diagonal of `S⁻¹`. The mode solve of
+/// [`condvar_blocks`] runs off the cached sparse tail factor, so `schur_blk`
+/// holds the dense factor of `S` that `tail_inverse_generic` and
+/// `structured_ainv_solve` (with no sparse factor) read. `A⁻¹MᵀWx` takes one
+/// `structured_ainv_solve` per column of `MᵀWx`, scattered as
+/// [`structured_schur_fill`] scatters it. The pieces `assemble_condvar_cross`
+/// takes are each core block's whole `F_f⁻¹ + W_fS⁻¹W_fᵀ`, `S⁻¹` and `W_f`.
+fn structured_condvar(
+    ws: &GlmmWorkspace,
+    x: MatRef<f64>,
+    cluster_ids: &[u32],
+    n: usize,
+) -> Option<CondvarBlocks> {
+    let p = ws.p;
+    let g = &ws.groupings;
+    let (q, np, s) = (g.primary_q, g.nested_per_parent, g.n_primary);
+    let qc = q + np;
+    let e = g.k_crossed();
+    let prim_width = q * s;
+    let k_family = qc * s;
+    let k = ws.k;
+    let g_cap = crate::lmm::MAX_EXTRA_GROUPINGS;
+    let st = &ws.structured;
+    let pat = &ws.pattern;
+    // Packing `[f·q_core + local | k_family + b]` to the RE-column index.
+    let core_col = |f: usize, local: usize| -> usize {
+        if local < q {
+            f * q + local
+        } else {
+            prim_width + f * np + (local - q)
+        }
+    };
+
+    // S⁻¹ column-major, `sinv[b·e + a] = (S⁻¹)_ab`.
+    let mut sinv = vec![0.0f64; e * e];
+    let mut stage = vec![0.0f64; e];
+    super::pirls::tail_inverse_generic(&st.schur_blk, e, &mut stage, &mut sinv);
+    let mut diag = vec![0.0f64; k];
+    for b in 0..e {
+        diag[k_family + b] = sinv[b * e + b];
+    }
+    let mut cross = CondvarCross {
+        coupling_at: vec![0],
+        ..CondvarCross::default()
+    };
+    let mut prim_blocks = vec![0.0f64; s * q * q];
+    let mut finv = vec![0.0f64; qc * qc];
+    let mut col = [0.0f64; crate::lmm::MAX_PRIMARY_Q];
+    let mut wf: Vec<f64> = Vec::new();
+    let mut ws_f: Vec<f64> = Vec::new();
+    for f in 0..s {
+        let l = &st.core_blocks[f * qc * qc..(f + 1) * qc * qc];
+        for c in 0..qc {
+            col[..qc].fill(0.0);
+            col[c] = 1.0;
+            glmm_block_solve(l, qc, &mut col[..qc]);
+            finv[c * qc..(c + 1) * qc].copy_from_slice(&col[..qc]);
+        }
+        let cols = &pat.coup_cols[pat.coup_ptr[f] as usize..pat.coup_ptr[f + 1] as usize];
+        let nc = cols.len();
+        let coup = qc * pat.coup_ptr[f] as usize;
+        // W_f column-major qc×nc, then (S⁻¹W_fᵀ)ᵀ restricted to the cluster's
+        // columns, `ws_f[j·qc + r] = Σ_j' W_f[r][j']·(S⁻¹)_{cols j', cols j}`.
+        wf.clear();
+        wf.resize(qc * nc, 0.0);
+        for j in 0..nc {
+            for (local, c) in col[..qc].iter_mut().enumerate() {
+                *c = st.coupling[coup + local * nc + j];
+            }
+            glmm_block_solve(l, qc, &mut col[..qc]);
+            wf[j * qc..(j + 1) * qc].copy_from_slice(&col[..qc]);
+        }
+        ws_f.clear();
+        ws_f.resize(qc * nc, 0.0);
+        for (j, &b) in cols.iter().enumerate() {
+            for (jp, &bp) in cols.iter().enumerate() {
+                let sv = sinv[b as usize * e + bp as usize];
+                for r in 0..qc {
+                    ws_f[j * qc + r] += wf[jp * qc + r] * sv;
+                }
+            }
+        }
+        let entry = |r: usize, c: usize| -> f64 {
+            let corr: f64 = (0..nc).map(|j| ws_f[j * qc + r] * wf[j * qc + c]).sum();
+            finv[c * qc + r] + corr
+        };
+        for r in 0..q {
+            for c in 0..q {
+                prim_blocks[f * q * q + r * q + c] = entry(r, c);
+            }
+        }
+        for c in 0..np {
+            diag[core_col(f, q + c)] = entry(q + c, q + c);
+        }
+        for r in 0..qc {
+            cross.family.extend((0..qc).map(|c| entry(r, c)));
+        }
+        cross.coupling_cols.extend_from_slice(cols);
+        cross.coupling.extend_from_slice(&wf);
+        cross.coupling_at.push(cross.coupling_cols.len() as u32);
+    }
+    cross.tail = sinv;
+
+    // MᵀWx in the solve's packing, column-major k×p.
+    let mut mtwx = vec![0.0f64; k * p];
+    for i in 0..n {
+        let f = cluster_ids[i] as usize;
+        let wi = ws.pirls.w[i];
+        let ncz = pat.n_cross[i] as usize;
+        for j in 0..p {
+            let xw = x[(i, j)] * wi;
+            let colj = &mut mtwx[j * k..(j + 1) * k];
+            for local in 0..qc {
+                colj[f * qc + local] += xw * st.m_core_buf[i * qc + local];
+            }
+            for zz in 0..ncz {
+                let b = pat.cross_col[i * g_cap + zz] as usize;
+                colj[k_family + b] += xw * st.cross_theta[zz];
+            }
+        }
+    }
+    let mut ainv_cx = vec![0.0f64; k * p];
+    for j in 0..p {
+        let rhs = &mut mtwx[j * k..(j + 1) * k];
+        structured_ainv_solve(
+            g,
+            &st.core_blocks,
+            &st.coupling,
+            &st.schur_blk,
+            &pat.coup_cols,
+            &pat.coup_ptr,
+            None,
+            rhs,
+        );
+        for f in 0..s {
+            for local in 0..qc {
+                ainv_cx[core_col(f, local) * p + j] = rhs[f * qc + local];
+            }
+        }
+        for b in 0..e {
+            ainv_cx[(k_family + b) * p + j] = rhs[k_family + b];
+        }
+    }
+    if !ainv_cx.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+
+    // `Fit::ranef`'s level order: the primary levels, then each extra's.
+    let mut rows = Vec::with_capacity(k * p);
+    for f in 0..s {
+        for r in 0..q {
+            let c = f * q + r;
+            rows.extend_from_slice(&ainv_cx[c * p..(c + 1) * p]);
+        }
+    }
+    let mut blocks = prim_blocks;
+    for (eg, &off) in g.extra_offsets.iter().enumerate() {
+        let levels = match g.nested {
+            Some(nf) if nf.decl == eg => s * np,
+            _ => g
+                .crossed
+                .iter()
+                .find(|cf| cf.decl == eg)
+                .map_or(0, |cf| cf.n_levels),
+        };
+        for l in off..off + levels {
+            blocks.push(diag[l]);
+            rows.extend_from_slice(&ainv_cx[l * p..(l + 1) * p]);
+        }
+    }
+    Some((blocks, rows, Some(cross)))
 }

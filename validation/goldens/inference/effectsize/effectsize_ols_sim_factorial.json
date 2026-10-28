@@ -1,0 +1,58 @@
+{
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0",
+      "performance": "0.18.2",
+      "effectsize": "1.0.3",
+      "insight": "1.5.4"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_effectsize.R"
+  },
+  "eta2": [
+    {
+      "term": "g",
+      "F": 17.6703846823028,
+      "df1": 2,
+      "df2": 113,
+      "eta2_partial": 0.238240434615394
+    },
+    {
+      "term": "h",
+      "F": 3.33959031880711,
+      "df1": 1,
+      "df2": 113,
+      "eta2_partial": 0.0287055361778014
+    },
+    {
+      "term": "x",
+      "F": 21.1582588386374,
+      "df1": 1,
+      "df2": 113,
+      "eta2_partial": 0.157711191407799
+    },
+    {
+      "term": "g:h",
+      "F": 0.884880079270526,
+      "df1": 2,
+      "df2": 113,
+      "eta2_partial": 0.0154200911119474
+    }
+  ],
+  "name": "effectsize_ols_sim_factorial"
+}

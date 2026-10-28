@@ -1,0 +1,177 @@
+{
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0",
+      "emmeans": "2.0.4",
+      "pbkrtest": "0.5.5"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_posthoc.R"
+  },
+  "emmeans": [
+    {
+      "level": "a",
+      "by": null,
+      "estimate": 10.3703545335504,
+      "SE": 0.342869678848555,
+      "df": 27.8236012749579
+    },
+    {
+      "level": "b",
+      "by": null,
+      "estimate": 11.9286595849042,
+      "SE": 0.329683801519943,
+      "df": 24.1383026006666
+    },
+    {
+      "level": "c",
+      "by": null,
+      "estimate": 9.95405215896796,
+      "SE": 0.349056605409092,
+      "df": 29.8134025000984
+    }
+  ],
+  "contrasts": [
+    {
+      "contrast": "a - b",
+      "by": null,
+      "estimate": -1.5583050513538,
+      "SE": 0.255789337346322,
+      "df": 95.8570116005454,
+      "statistic": -6.09214233681665,
+      "statistic_name": "t",
+      "p_none": 2.31229847056963e-08,
+      "p_tukey": 6.96108848341481e-08
+    },
+    {
+      "contrast": "a - c",
+      "by": null,
+      "estimate": 0.416302374582423,
+      "SE": 0.281984859471617,
+      "df": 97.0161618929214,
+      "statistic": 1.47632881908089,
+      "statistic_name": "t",
+      "p_none": 0.143094185286031,
+      "p_tukey": 0.306733945345964
+    },
+    {
+      "contrast": "b - c",
+      "by": null,
+      "estimate": 1.97460742593623,
+      "SE": 0.263759530514139,
+      "df": 93.9552089359264,
+      "statistic": 7.48639270811251,
+      "statistic_name": "t",
+      "p_none": 3.76857948171929e-11,
+      "p_tukey": 5.97113469780197e-10
+    }
+  ],
+  "confint": [
+    {
+      "adjust": "none",
+      "contrast": "a - b",
+      "by": null,
+      "estimate": -1.5583050513538,
+      "SE": 0.255789337346322,
+      "df": 95.8570116005454,
+      "lower": -2.06605253898163,
+      "upper": -1.05055756372598
+    },
+    {
+      "adjust": "none",
+      "contrast": "a - c",
+      "by": null,
+      "estimate": 0.416302374582423,
+      "SE": 0.281984859471617,
+      "df": 97.0161618929214,
+      "lower": -0.143358336678227,
+      "upper": 0.975963085843073
+    },
+    {
+      "adjust": "none",
+      "contrast": "b - c",
+      "by": null,
+      "estimate": 1.97460742593623,
+      "SE": 0.263759530514139,
+      "df": 93.9552089359264,
+      "lower": 1.45090344023274,
+      "upper": 2.49831141163971
+    },
+    {
+      "adjust": "bonferroni",
+      "contrast": "a - b",
+      "by": null,
+      "estimate": -1.5583050513538,
+      "SE": 0.255789337346322,
+      "df": 95.8570116005454,
+      "lower": -2.18159160739488,
+      "upper": -0.935018495312734
+    },
+    {
+      "adjust": "bonferroni",
+      "contrast": "a - c",
+      "by": null,
+      "estimate": 0.416302374582423,
+      "SE": 0.281984859471617,
+      "df": 97.0161618929214,
+      "lower": -0.270668896881508,
+      "upper": 1.10327364604635
+    },
+    {
+      "adjust": "bonferroni",
+      "contrast": "b - c",
+      "by": null,
+      "estimate": 1.97460742593623,
+      "SE": 0.263759530514139,
+      "df": 93.9552089359264,
+      "lower": 1.33166764934253,
+      "upper": 2.61754720252992
+    },
+    {
+      "adjust": "tukey",
+      "contrast": "a - b",
+      "by": null,
+      "estimate": -1.5583050513538,
+      "SE": 0.255789337346322,
+      "df": 95.8570116005454,
+      "lower": -2.16725308846231,
+      "upper": -0.949357014245296
+    },
+    {
+      "adjust": "tukey",
+      "contrast": "a - c",
+      "by": null,
+      "estimate": 0.416302374582423,
+      "SE": 0.281984859471617,
+      "df": 97.0161618929214,
+      "lower": -0.254882212391011,
+      "upper": 1.08748696155586
+    },
+    {
+      "adjust": "tukey",
+      "contrast": "b - c",
+      "by": null,
+      "estimate": 1.97460742593623,
+      "SE": 0.263759530514139,
+      "df": 93.9552089359264,
+      "lower": 1.34648507541854,
+      "upper": 2.60272977645392
+    }
+  ],
+  "name": "posthoc_ci_lmm_sim_factorial"
+}

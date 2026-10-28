@@ -571,7 +571,8 @@ fn residual_nu(ws: &LmmWorkspace) -> f64 {
 
 /// The θ̃ indices of every Λ column that is not exactly zero in `theta`, in
 /// θ̃ order (each block's `vech` is column-major, so a column is a contiguous
-/// run from its diagonal).
+/// run from its diagonal), less the entries the grouping's terms hold at zero:
+/// the fit never moved those, so they are not parameters of its criterion.
 #[cfg(test)]
 pub(crate) fn free_coordinates(g: &LmmGroupings, theta: &[f64]) -> Vec<usize> {
     let mut free = Vec::new();
@@ -582,10 +583,13 @@ pub(crate) fn free_coordinates(g: &LmmGroupings, theta: &[f64]) -> Vec<usize> {
 /// [`free_coordinates`] into `free`.
 fn free_coordinates_into(g: &LmmGroupings, theta: &[f64], free: &mut Vec<usize>) {
     free.clear();
+    let structural = g.structural_theta();
     for (&start, &len) in g.diagonal_theta().iter().zip(&g.diagonal_run_len) {
         let column = start..start + len;
         if theta[column.clone()].iter().any(|&t| t != 0.0) {
-            free.extend(column);
+            // A free diagonal's run still holds the structural entries below
+            // it (the covariances with a later term).
+            free.extend(column.filter(|k| structural.binary_search(k).is_err()));
         }
     }
 }

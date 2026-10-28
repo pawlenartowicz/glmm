@@ -2,20 +2,19 @@
 
 use super::*;
 use crate::standardize::ColumnScaling;
+use crate::test_support::{fit_cold, fit_warm_wo};
 // The loop-tier entries reached through the module rather than the re-export,
 // which is `loop_advanced`-gated: the pivot the region-2 tests below assert on
 // is recorded on every route, so these must run under default features too.
 use super::core::{build_workspace, fit_on};
 use crate::lmm::LmmWorkspace;
-use crate::{
-    Family, GroupIds, Grouping, GroupingRelation, ModelSpec, ReStructure, Sizing, StartValues,
-};
+use crate::{Family, GroupIds, Grouping, GroupingRelation, ModelSpec, ReStructure, StartValues};
 use faer::Mat;
 
 use super::common_tests::{assert_pinned, dense_str, lcg, PIN_REL_ITER};
 
 use super::lmm::{accumulate_lmm_rows, lmm_run_on, lmm_view_to_fit};
-use crate::test_support::{cluster_of_row, extra_level_of_row, intercept_only_spec};
+use crate::test_support::{cluster_of_row, extra_level_of_row, intercept_only_spec, Sizing};
 
 /// Aliased fixed column on a MIXED design: `y ~ 1 + x1 + x2 + x3 + (1|g)` on
 /// sim_collinear_lmm (x3 ≈ x1 + x2). glmm keeps full width with `NaN` in the
@@ -67,7 +66,7 @@ fn fit_lmm_rank_deficient_drops_the_aliased_column() {
     let model = ModelSpec {
         family: Family::Gaussian,
         re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 1 }, // placeholder — ignored on data path
+            terms: Vec::new(),
             slopes: vec![],
             extra_groupings: vec![],
         }),
@@ -83,7 +82,7 @@ fn fit_lmm_rank_deficient_drops_the_aliased_column() {
             extra: vec![],
         },
         &FitOptions {
-            target_indices: vec![0, 1, 2, 3],
+            se_for: SeFor::Only(vec![0, 1, 2, 3]),
             ..FitOptions::default()
         },
     );
@@ -136,7 +135,7 @@ fn gap_a_stream(k: usize) -> Vec<f64> {
 
 fn intercept_only_lmm() -> ModelSpec {
     // Placeholder sizing — `spec_sized_from_ids` derives the real count.
-    intercept_only_spec(Sizing::FixedClusters { n_clusters: 1 })
+    intercept_only_spec()
 }
 
 /// PURE DYNAMIC RANGE — no collinearity anywhere, and the fit must come out
@@ -202,7 +201,7 @@ fn lmm_pure_dynamic_range_design_fits_in_full() {
         extra: vec![],
     };
     let opts = FitOptions {
-        target_indices: vec![0, 1, 2],
+        se_for: SeFor::Only(vec![0, 1, 2]),
         ..FitOptions::default()
     };
     let f = fit_cold(&x, &y, n, p, &intercept_only_lmm(), &ids, &opts);
@@ -412,7 +411,7 @@ fn lmm_entangled_pair_fits_in_full_with_honest_ses() {
 
     let (x, y, ids, n, p) = build_gap_a_salvage_design(false);
     let opts = FitOptions {
-        target_indices: (0..p as u32).collect(),
+        se_for: SeFor::Only((0..p as u32).collect()),
         ..FitOptions::default()
     };
     let ids = GroupIds {
@@ -480,9 +479,8 @@ fn lmm_entangled_pair_fits_in_full_with_honest_ses() {
         "the pair is distinguishable in f64, so no note may be raised: {:?}",
         f.diagnostics.notes
     );
-    let (sized, ids, perm) = spec_sized_from_ids_pub(&intercept_only_lmm(), &ids);
-    let mut ws = build_workspace(&sized, perm, n, p, &opts);
-    let d = fit_on(&mut ws, &x, &y, &ids, None, &opts).diagnostics();
+    let mut ws = build_workspace(&intercept_only_lmm(), &ids, n, p, &opts);
+    let d = fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts).diagnostics();
     assert!(!d.ill_conditioned, "pivot {} must clear the floor", d.pivot);
     // A 2× band, not a pin. This pivot is a cancelled quantity and the doc's
     // own margins are stated at 100×, so banding it tighter would buy a flaky
@@ -578,7 +576,7 @@ fn lmm_entangled_pair_reml_is_exact_and_invariant() {
         x_w[r * p + 2] = x[r * p + 2] - x[r * p + 1];
     }
     let opts = FitOptions {
-        target_indices: (0..p as u32).collect(),
+        se_for: SeFor::Only((0..p as u32).collect()),
         ..FitOptions::default()
     };
     let ids = GroupIds {
@@ -624,7 +622,7 @@ fn lmm_entangled_pair_reml_is_exact_and_invariant() {
 /// The design above plus `s = 1 + z`, exactly dependent on columns 0 and 3. `s`
 /// is genuinely redundant: there is no separate coefficient for it, so
 /// `detect_aliased` fires at `ALIAS_EPS` before the solver runs, the column is
-/// dropped, and `fit_warm` re-enters on a reduced design whose four columns are
+/// dropped, and `fit_checked` re-enters on a reduced design whose four columns are
 /// bit-identical to the single-level design. Those four are merely entangled,
 /// and the reduced fit keeps every one of them.
 ///
@@ -673,7 +671,7 @@ fn exact_alias_is_dropped_and_the_entangled_pair_is_kept() {
             extra: vec![],
         },
         &FitOptions {
-            target_indices: (0..p as u32).collect(),
+            se_for: SeFor::Only((0..p as u32).collect()),
             ..FitOptions::default()
         },
     );
@@ -745,7 +743,7 @@ fn fit_warm_sleepstudy_slope_matches_cold_optimum() {
     // Parsing mirrors `fit_sleepstudy_slope_varcorr_matches_lme4`.
     let (x, y, n, p, model, ids) = sleepstudy_slope_design();
     let opts = FitOptions {
-        target_indices: vec![0, 1],
+        se_for: SeFor::Only(vec![0, 1]),
         ..FitOptions::default()
     };
     let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
@@ -786,7 +784,7 @@ fn fit_warm_sleepstudy_slope_matches_cold_optimum() {
         ),
     ];
     for (label, start) in &starts {
-        let warm = fit_warm(&x, &y, n, p, &model, &ids, Some(start), &opts);
+        let warm = fit_warm_wo(&x, &y, n, p, &model, &ids, Some(start), None, None, &opts);
         assert!(
             warm.converged(),
             "{label}: warm must not degrade convergence"
@@ -820,7 +818,7 @@ fn fit_warm_sleepstudy_slope_matches_cold_optimum() {
     }
 }
 
-/// Gap #3: sleepstudy `Reaction ~ 1 + Days + (1 + Days | Subject)` — a q=2
+/// Sleepstudy `Reaction ~ 1 + Days + (1 + Days | Subject)` — a q=2
 /// random-slope LMM through `fit_cold`, gated against the frozen lme4 VarCorr
 /// (`validation/goldens/sleepstudy_lmm.json`, REML). Checks the full 2×2 RE
 /// covariance (variances AND the off-diagonal covariance) via `Fit::varcorr`,
@@ -852,7 +850,7 @@ fn fit_sleepstudy_slope_varcorr_matches_lme4() {
         &model,
         &ids,
         &FitOptions {
-            target_indices: vec![0, 1],
+            se_for: SeFor::Only(vec![0, 1]),
             ..FitOptions::default()
         },
     );
@@ -958,16 +956,18 @@ fn fit_lmm_offset_matches_lme4() {
     let (x, y, n, p, model, ids) = sleepstudy_slope_design();
     let o: Vec<f64> = (0..n).map(|i| 5.0 * (i % 4) as f64).collect();
 
-    let f = fit_cold(
+    let f = fit_warm_wo(
         &x,
         &y,
         n,
         p,
         &model,
         &ids,
+        None,
+        None,
+        Some(&o),
         &FitOptions {
-            target_indices: vec![0, 1],
-            offset: Some(o),
+            se_for: SeFor::Only(vec![0, 1]),
             ..FitOptions::default()
         },
     );
@@ -989,7 +989,7 @@ fn fit_lmm_offset_matches_lme4() {
     );
 }
 
-/// Task 5: weighted dense LMM REML — sleepstudy random-slope fit with
+/// Weighted dense LMM REML: sleepstudy random-slope fit with
 /// synthetic weights `w_i = 1 + (i mod 3)` (i = 0-based CSV row order),
 /// gated against a frozen lme4 golden. Pins β, SE, the 2×2 RE covariance
 /// (SDs + correlation), σ̂, and the `−Σlog wᵢ` deviance-constant convention:
@@ -1021,16 +1021,18 @@ fn fit_lmm_weighted_matches_lme4() {
     let (x, y, n, p, model, ids) = sleepstudy_slope_design();
     let w: Vec<f64> = (0..n).map(|i| 1.0 + (i % 3) as f64).collect();
 
-    let f = fit_cold(
+    let f = fit_warm_wo(
         &x,
         &y,
         n,
         p,
         &model,
         &ids,
+        None,
+        Some(&w),
+        None,
         &FitOptions {
-            target_indices: vec![0, 1],
-            weights: Some(w),
+            se_for: SeFor::Only(vec![0, 1]),
             ..FitOptions::default()
         },
     );
@@ -1081,8 +1083,8 @@ fn fit_lmm_weighted_matches_lme4() {
     assert!((corr - REF_CORR).abs() < 4e-3, "corr {corr} vs {REF_CORR}");
 
     // Fit.deviance vs REMLcrit(f) − (n−p)·(1+ln 2π) — pins the −Σlog wᵢ
-    // constant `fit_mle` folds into the reported deviance (see the arm
-    // above fit_mle in this file). 1e-6 abs, as the unweighted analog above.
+    // constant `lmm_view_to_fit` (`src/fit/lmm.rs`) folds into the reported
+    // deviance. 1e-6 abs, as the unweighted analog above.
     let df = (n - p) as f64;
     let expected = REF_REMLCRIT - df * (1.0 + (2.0 * std::f64::consts::PI).ln());
     assert!(
@@ -1151,10 +1153,11 @@ fn fit_lmm_scalar_crossed_varying_weights_noz_matches_sparse() {
     let model = ModelSpec {
         family: Family::Gaussian,
         re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 1 },
+            terms: Vec::new(),
             slopes: vec![1], // random slope on x for g1
             extra_groupings: vec![Grouping {
-                relation: GroupingRelation::Crossed { n_clusters: 1 },
+                terms: Vec::new(),
+                relation: GroupingRelation::Crossed,
                 slopes: vec![], // g2 intercept-only
             }],
         }),
@@ -1164,13 +1167,36 @@ fn fit_lmm_scalar_crossed_varying_weights_noz_matches_sparse() {
         extra: vec![g2],
     };
     let opts = FitOptions {
-        target_indices: vec![0, 1],
-        weights: Some(w),
+        se_for: SeFor::Only(vec![0, 1]),
         ..FitOptions::default()
     };
-    let (sized, ids, _perm) = spec_sized_from_ids(&model, &ids);
-    let noz = fit_mle_noz_pub(&x, &y, n, p, &sized, &ids.primary, &ids.extra, None, &opts);
-    let sp = fit_mle_sparse_pub(&x, &y, n, p, &sized, &ids.primary, &ids.extra, None, &opts);
+    let (sized, ids, _) = spec_sized_from_ids(&model, &ids);
+    let noz = fit_mle_noz_pub(
+        &x,
+        &y,
+        Some(&w),
+        None,
+        n,
+        p,
+        &sized,
+        &ids.primary,
+        &ids.extra,
+        None,
+        &opts,
+    );
+    let sp = fit_mle_sparse_pub(
+        &x,
+        &y,
+        Some(&w),
+        None,
+        n,
+        p,
+        &sized,
+        &ids.primary,
+        &ids.extra,
+        None,
+        &opts,
+    );
     assert!(
         noz.converged() && sp.converged(),
         "both routes must converge"
@@ -1241,29 +1267,53 @@ fn ml_fit_pinned_at_zero_has_the_ols_loglik() {
         family: Family::Gaussian,
         re: None,
     };
-    for weights in [None, Some(w)] {
+    for weights in [None, Some(w.as_slice())] {
         let tag = if weights.is_some() {
             "weighted"
         } else {
             "plain"
         };
         let opts = |reml: Option<bool>| FitOptions {
-            target_indices: vec![0, 1],
-            weights: weights.clone(),
+            se_for: SeFor::Only(vec![0, 1]),
             reml,
             ..FitOptions::default()
         };
-        let ml = fit_cold(
+        let ml = fit_warm_wo(
             &x,
             &y,
             n,
             p,
             &intercept_only_lmm(),
             &ids,
+            None,
+            weights,
+            None,
             &opts(Some(false)),
         );
-        let reml = fit_cold(&x, &y, n, p, &intercept_only_lmm(), &ids, &opts(None));
-        let ols = fit_cold(&x, &y, n, p, &fixed_only, &GroupIds::default(), &opts(None));
+        let reml = fit_warm_wo(
+            &x,
+            &y,
+            n,
+            p,
+            &intercept_only_lmm(),
+            &ids,
+            None,
+            weights,
+            None,
+            &opts(None),
+        );
+        let ols = fit_warm_wo(
+            &x,
+            &y,
+            n,
+            p,
+            &fixed_only,
+            &GroupIds::default(),
+            None,
+            weights,
+            None,
+            &opts(None),
+        );
         assert!(ml.converged() && ols.converged(), "{tag}: both fit");
         assert_eq!(ml.tau2, vec![0.0], "{tag}: the ML fit must pin at θ̂ = 0");
         assert!(
@@ -1326,7 +1376,7 @@ fn ml_deviance_at_ml_theta_is_below_ml_deviance_at_reml_theta() {
         extra: vec![],
     };
     let opts = |reml: Option<bool>| FitOptions {
-        target_indices: (0..p as u32).collect(),
+        se_for: SeFor::Only((0..p as u32).collect()),
         reml,
         ..FitOptions::default()
     };
@@ -1385,10 +1435,11 @@ fn fit_lmm_crossed_slope_extra_varying_weights_noz_matches_sparse() {
     let cluster = ModelSpec {
         family: Family::Gaussian,
         re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 5 },
+            terms: Vec::new(),
             slopes: vec![1],
             extra_groupings: vec![Grouping {
-                relation: GroupingRelation::Crossed { n_clusters: 4 },
+                terms: Vec::new(),
+                relation: GroupingRelation::Crossed,
                 slopes: vec![1],
             }],
         }),
@@ -1406,8 +1457,9 @@ fn fit_lmm_crossed_slope_extra_varying_weights_noz_matches_sparse() {
     let mut eid = vec![0u32; n];
     let mut w = vec![0.0f64; n];
     for i in 0..n {
-        let par = cluster_of_row(&cluster.re.as_ref().unwrap().sizing, i);
-        let item = extra_level_of_row(&cluster, 0, i) as usize;
+        let sizing = Sizing::FixedClusters { n_clusters: 5 };
+        let par = cluster_of_row(&sizing, i);
+        let item = extra_level_of_row(&cluster, &sizing, &[4], 0, i);
         pid[i] = par as u32;
         eid[i] = item as u32;
         let x1 = lcg(&mut st);
@@ -1430,13 +1482,36 @@ fn fit_lmm_crossed_slope_extra_varying_weights_noz_matches_sparse() {
         extra: vec![eid],
     };
     let opts = FitOptions {
-        target_indices: vec![0, 1],
-        weights: Some(w),
+        se_for: SeFor::Only(vec![0, 1]),
         ..FitOptions::default()
     };
-    let (sized, ids, _perm) = spec_sized_from_ids(&cluster, &ids);
-    let noz = fit_mle_noz_pub(&x, &y, n, p, &sized, &ids.primary, &ids.extra, None, &opts);
-    let sp = fit_mle_sparse_pub(&x, &y, n, p, &sized, &ids.primary, &ids.extra, None, &opts);
+    let (sized, ids, _) = spec_sized_from_ids(&cluster, &ids);
+    let noz = fit_mle_noz_pub(
+        &x,
+        &y,
+        Some(&w),
+        None,
+        n,
+        p,
+        &sized,
+        &ids.primary,
+        &ids.extra,
+        None,
+        &opts,
+    );
+    let sp = fit_mle_sparse_pub(
+        &x,
+        &y,
+        Some(&w),
+        None,
+        n,
+        p,
+        &sized,
+        &ids.primary,
+        &ids.extra,
+        None,
+        &opts,
+    );
     assert!(
         noz.converged() && sp.converged(),
         "both routes must converge"
@@ -1508,7 +1583,7 @@ fn fit_lmm_weight_scale_invariant_dense_and_sparse() {
     let cluster = ModelSpec {
         family: Family::Gaussian,
         re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 1 },
+            terms: Vec::new(),
             slopes: vec![],
             extra_groupings: vec![],
         }),
@@ -1517,18 +1592,41 @@ fn fit_lmm_weight_scale_invariant_dense_and_sparse() {
         primary: ids_v,
         extra: vec![],
     };
-    let (sized, ids, _perm) = spec_sized_from_ids(&cluster, &ids);
+    let (sized, ids, _) = spec_sized_from_ids(&cluster, &ids);
 
     let fit_at = |c: f64, reml: Option<bool>| {
         let opts = FitOptions {
-            target_indices: vec![0, 1],
-            weights: Some(w.iter().map(|&wi| wi * c).collect()),
+            se_for: SeFor::Only(vec![0, 1]),
             reml,
             ..FitOptions::default()
         };
-        let dense = fit_mle_noz_pub(&x, &y, n, p, &sized, &ids.primary, &ids.extra, None, &opts);
-        let sparse =
-            fit_mle_sparse_pub(&x, &y, n, p, &sized, &ids.primary, &ids.extra, None, &opts);
+        let wc: Vec<f64> = w.iter().map(|&wi| wi * c).collect();
+        let dense = fit_mle_noz_pub(
+            &x,
+            &y,
+            Some(&wc),
+            None,
+            n,
+            p,
+            &sized,
+            &ids.primary,
+            &ids.extra,
+            None,
+            &opts,
+        );
+        let sparse = fit_mle_sparse_pub(
+            &x,
+            &y,
+            Some(&wc),
+            None,
+            n,
+            p,
+            &sized,
+            &ids.primary,
+            &ids.extra,
+            None,
+            &opts,
+        );
         (dense, sparse)
     };
 
@@ -1605,8 +1703,8 @@ fn fit_lmm_weight_scale_invariant_dense_and_sparse() {
     }
 }
 
-/// The dense-LMM boundary (τ̂ ≈ 0, pinned exactly — mirrors
-/// `lmm::tests::zero_between_cluster_variance_pins_at_exactly_zero`) must
+/// The dense-LMM boundary (τ̂ ≈ 0, pinned exactly; the same design as
+/// `fit::common_tests::diagnostics_boundary_reports_both_ends`) must
 /// reproduce the weighted fixed-only WLS fit on the
 /// same rows: at θ̂=0 the mixed kernel's weighted Grams (`c`/`s`/`counts`,
 /// all Σwᵢ-scaled) collapse to the same weighted
@@ -1635,7 +1733,7 @@ fn fit_lmm_weighted_boundary_matches_wls() {
     let mixed_model = ModelSpec {
         family: Family::Gaussian,
         re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 1 },
+            terms: Vec::new(),
             slopes: vec![],
             extra_groupings: vec![],
         }),
@@ -1644,16 +1742,18 @@ fn fit_lmm_weighted_boundary_matches_wls() {
         primary: ids,
         extra: vec![],
     };
-    let mixed = fit_cold(
+    let mixed = fit_warm_wo(
         &x,
         &y,
         n,
         2,
         &mixed_model,
         &mixed_ids,
+        None,
+        Some(&w),
+        None,
         &FitOptions {
-            target_indices: vec![0, 1],
-            weights: Some(w.clone()),
+            se_for: SeFor::Only(vec![0, 1]),
             ..FitOptions::default()
         },
     );
@@ -1664,16 +1764,18 @@ fn fit_lmm_weighted_boundary_matches_wls() {
         family: Family::Gaussian,
         re: None,
     };
-    let wls = fit_cold(
+    let wls = fit_warm_wo(
         &x,
         &y,
         n,
         2,
         &fixed_only,
         &GroupIds::default(),
+        None,
+        Some(&w),
+        None,
         &FitOptions {
-            target_indices: vec![0, 1],
-            weights: Some(w),
+            se_for: SeFor::Only(vec![0, 1]),
             ..FitOptions::default()
         },
     );
@@ -1755,10 +1857,11 @@ fn fit_sim_slope_varcorr_is_pinned() {
     let model = ModelSpec {
         family: Family::Gaussian,
         re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 1 },
+            terms: Vec::new(),
             slopes: vec![1], // random slope on x for g1
             extra_groupings: vec![Grouping {
-                relation: GroupingRelation::Crossed { n_clusters: 1 },
+                terms: Vec::new(),
+                relation: GroupingRelation::Crossed,
                 slopes: vec![], // g2 intercept-only
             }],
         }),
@@ -1775,7 +1878,7 @@ fn fit_sim_slope_varcorr_is_pinned() {
         &model,
         &ids,
         &FitOptions {
-            target_indices: vec![0, 1],
+            se_for: SeFor::Only(vec![0, 1]),
             ..FitOptions::default()
         },
     );
@@ -1789,12 +1892,11 @@ fn fit_sim_slope_varcorr_is_pinned() {
     assert_pinned(&[f.dispersion], &[REF_SIGMA2], PIN_REL_ITER, "sigma2");
 }
 
-/// Gap #1 crossed: Penicillin `diameter ~ 1 + (1|plate) + (1|sample)` through the
+/// Crossed: Penicillin `diameter ~ 1 + (1|plate) + (1|sample)` through the
 /// data-shaped `fit_cold` with `GroupIds { primary: plate, extra: vec![sample] }`,
 /// gated against the frozen lme4 golden (`validation/goldens/penicillin_lmm.json`,
 /// REML). Two crossed intercept-only groupings, fixed effect = intercept only
-/// (p=1). Placeholder spec counts prove the data path derives level counts from
-/// the ids. The oracle is sacred.
+/// (p=1). The oracle is sacred.
 #[test]
 fn fit_penicillin_crossed_matches_lme4() {
     const REF_BETA: f64 = 22.9722222222;
@@ -1821,10 +1923,11 @@ fn fit_penicillin_crossed_matches_lme4() {
     let model = ModelSpec {
         family: Family::Gaussian,
         re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 1 }, // placeholder — ignored on data path
+            terms: Vec::new(),
             slopes: vec![],
             extra_groupings: vec![Grouping {
-                relation: GroupingRelation::Crossed { n_clusters: 1 }, // placeholder
+                terms: Vec::new(),
+                relation: GroupingRelation::Crossed, // placeholder
                 slopes: vec![],
             }],
         }),
@@ -1841,7 +1944,7 @@ fn fit_penicillin_crossed_matches_lme4() {
         &model,
         &ids,
         &FitOptions {
-            target_indices: vec![0],
+            se_for: SeFor::Only(vec![0]),
             ..FitOptions::default()
         },
     );
@@ -1873,12 +1976,12 @@ fn fit_penicillin_crossed_matches_lme4() {
     );
 }
 
-/// Gap #1 nested: Pastes `strength ~ 1 + (1|batch/cask)` through the data-shaped
+/// Nested: Pastes `strength ~ 1 + (1|batch/cask)` through the data-shaped
 /// `fit_cold` with `GroupIds { primary: batch, extra: vec![cask] }`, where `cask`
 /// is the globally-unique batch:cask level (dense 0..29). Gated against the frozen
 /// lme4 golden (`validation/goldens/pastes_lmm.json`, REML). Exercises the
-/// `NestedWithin` topology tag on the data path; placeholder counts prove level
-/// counts come from the ids. The oracle is sacred.
+/// `NestedWithin` topology tag on the data path, whose level counts come from
+/// the ids. The oracle is sacred.
 #[test]
 fn fit_pastes_nested_matches_lme4() {
     const REF_BETA: f64 = 60.0533333333;
@@ -1906,10 +2009,11 @@ fn fit_pastes_nested_matches_lme4() {
     let model = ModelSpec {
         family: Family::Gaussian,
         re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 1 }, // placeholder
+            terms: Vec::new(),
             slopes: vec![],
             extra_groupings: vec![Grouping {
-                relation: GroupingRelation::NestedWithin { n_per_parent: 1 }, // placeholder
+                terms: Vec::new(),
+                relation: GroupingRelation::NestedWithin, // placeholder
                 slopes: vec![],
             }],
         }),
@@ -1926,7 +2030,7 @@ fn fit_pastes_nested_matches_lme4() {
         &model,
         &ids,
         &FitOptions {
-            target_indices: vec![0],
+            se_for: SeFor::Only(vec![0]),
             ..FitOptions::default()
         },
     );
@@ -2001,21 +2105,21 @@ fn scalar_crossed_lmm_is_grouping_order_insensitive() {
             + small_eff[small[i] as usize]
             + 0.25 * lcg(&mut st);
     }
-    // One extra crossed intercept-only grouping; counts are placeholders, as
-    // the formula frontend emits them.
+    // One extra crossed intercept-only grouping.
     let model = ModelSpec {
         family: Family::Gaussian,
         re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 1 },
+            terms: Vec::new(),
             slopes: vec![],
             extra_groupings: vec![Grouping {
-                relation: GroupingRelation::Crossed { n_clusters: 1 },
+                terms: Vec::new(),
+                relation: GroupingRelation::Crossed,
                 slopes: vec![],
             }],
         }),
     };
     let opts = FitOptions {
-        target_indices: vec![0, 1],
+        se_for: SeFor::Only(vec![0, 1]),
         ..FitOptions::default()
     };
     let fit_of = |primary: &[u32], extra: &[u32]| {
@@ -2115,8 +2219,8 @@ fn sleepstudy_slope_design() -> (Vec<f64>, Vec<f64>, usize, usize, ModelSpec, Gr
     let model = ModelSpec {
         family: Family::Gaussian,
         re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 1 }, // placeholder — data path derives it
-            slopes: vec![1],                                 // random slope on Days (col 1)
+            terms: Vec::new(),
+            slopes: vec![1], // random slope on Days (col 1)
             extra_groupings: vec![],
         }),
     };
@@ -2135,22 +2239,21 @@ fn sleepstudy_slope_design() -> (Vec<f64>, Vec<f64>, usize, usize, ModelSpec, Gr
 /// leaving it untouched by construction.
 ///
 /// Reached through the loop tier (`build_workspace`/`fit_on`) rather than
-/// `fit_warm`, per the loop-tier warm-start contract this crate carries: the
+/// `fit_warm_wo`, per the loop-tier warm-start contract this crate carries: the
 /// same workspace serves both the cold and the warm call.
 #[test]
 fn lmm_warm_start_theta_is_a_fixed_point_of_the_forward_map() {
     let (x, y, n, p, model, ids) = sleepstudy_slope_design();
     let opts = FitOptions {
-        target_indices: vec![0, 1],
+        se_for: SeFor::Only(vec![0, 1]),
         ..FitOptions::default()
     };
-    let (sized, sized_ids, perm) = spec_sized_from_ids_pub(&model, &ids);
-    let mut ws = build_workspace(&sized, perm, n, p, &opts);
+    let mut ws = build_workspace(&model, &ids, n, p, &opts);
 
-    let cold_view = fit_on(&mut ws, &x, &y, &sized_ids, None, &opts);
+    let cold_view = fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts);
     let cold_theta = cold_view.theta().to_vec();
     let cold_n_eval = cold_view.n_eval();
-    let cold_fit = cold_view.into_fit(&x, &y, &sized_ids, n, p, &model, &opts);
+    let cold_fit = cold_view.into_fit(&Data::new(&x, &y, n, p), &model, &opts);
     assert!(
         cold_fit.converged(),
         "cold sleepstudy slope LMM must converge"
@@ -2161,10 +2264,10 @@ fn lmm_warm_start_theta_is_a_fixed_point_of_the_forward_map() {
         theta: cold_theta.clone(),
         dispersion: None,
     };
-    let warm_view = fit_on(&mut ws, &x, &y, &sized_ids, Some(&start), &opts);
+    let warm_view = fit_on(&mut ws, &Data::new(&x, &y, n, p), Some(&start), &opts);
     let warm_theta = warm_view.theta().to_vec();
     let warm_n_eval = warm_view.n_eval();
-    let warm_fit = warm_view.into_fit(&x, &y, &sized_ids, n, p, &model, &opts);
+    let warm_fit = warm_view.into_fit(&Data::new(&x, &y, n, p), &model, &opts);
     assert!(warm_fit.converged(), "warm-started fit must converge");
 
     // The contract: a warm start planted at the cold fit's θ̂ (through the
@@ -2216,7 +2319,7 @@ fn lmm_counters_record_stage_two_and_shrink_evals() {
     use crate::counters::Stage;
     let (x, y, n, p, model, ids) = sleepstudy_slope_design();
     let opts = FitOptions {
-        target_indices: vec![0, 1],
+        se_for: SeFor::Only(vec![0, 1]),
         ..FitOptions::default()
     };
     let f = fit_cold(&x, &y, n, p, &model, &ids, &opts);
@@ -2261,7 +2364,7 @@ fn fit_lmm_p_zero_weighted_reaches_nan_fill() {
     let model = ModelSpec {
         family: Family::Gaussian,
         re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 1 }, // placeholder — data path derives it
+            terms: Vec::new(),
             slopes: vec![],
             extra_groupings: vec![],
         }),
@@ -2271,12 +2374,11 @@ fn fit_lmm_p_zero_weighted_reaches_nan_fill() {
     // "does this branch run to completion", not as a numeric divergence.
     let w: Vec<f64> = (0..n).map(|i| 1.0 + (i % 3) as f64).collect();
     let opts = FitOptions {
-        target_indices: vec![],
-        weights: Some(w),
+        se_for: SeFor::Only(vec![]),
         ..FitOptions::default()
     };
 
-    let f = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    let f = fit_warm_wo(&x, &y, n, p, &model, &ids, None, Some(&w), None, &opts);
 
     assert!(!f.converged(), "p=0 is refused, not fit");
     // The caller's row count, not the accumulator's `n_rows` (0 here).
@@ -2344,7 +2446,7 @@ fn lmm_maxfun_cap_q2_reports_honest_endpoint_and_not_singular() {
     let model = ModelSpec {
         family: Family::Gaussian,
         re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 1 },
+            terms: Vec::new(),
             slopes: vec![1],
             extra_groupings: vec![],
         }),
@@ -2368,12 +2470,12 @@ fn lmm_maxfun_cap_q2_reports_honest_endpoint_and_not_singular() {
         extra: vec![],
     };
     let opts = FitOptions {
-        target_indices: vec![0, 1],
+        se_for: SeFor::Only(vec![0, 1]),
         ..FitOptions::default()
     };
 
-    let (sized, ids, _perm) = spec_sized_from_ids(&model, &ids);
-    let mut ws = LmmWorkspace::for_cluster_spec_ext(p, &sized, n, &[1], &[], false);
+    let (sized, ids, _) = spec_sized_from_ids(&model, &ids);
+    let mut ws = LmmWorkspace::for_cluster_spec_ext(p, &sized, &[1], &[], false);
     let mut x_mat = Mat::<f64>::zeros(n, p);
     for i in 0..n {
         for j in 0..p {
@@ -2381,8 +2483,14 @@ fn lmm_maxfun_cap_q2_reports_honest_endpoint_and_not_singular() {
         }
     }
     ws.suff_mut().reset();
-    ws.suff_mut()
-        .add_rows_multi(x_mat.as_ref(), &y, &ids.primary, &[], None);
+    ws.suff_mut().add_rows_multi(
+        x_mat.as_ref(),
+        x_mat.as_ref().subcols(0, 0),
+        &y,
+        &ids.primary,
+        &[],
+        None,
+    );
 
     let n_theta = ws.theta.len();
     let npt = 2 * n_theta + 1; // PRIMA's minimum npt (n_theta == 3 here)
@@ -2402,12 +2510,12 @@ fn lmm_maxfun_cap_q2_reports_honest_endpoint_and_not_singular() {
     let fit = {
         let v = lmm_run_on(
             &mut ws,
-            &opts.target_indices,
+            &opts.se_for.columns(p),
             None,
             None,
             ColumnScaling::IDENTITY,
         );
-        lmm_view_to_fit(&v, &x, &ids, n, p, &opts)
+        lmm_view_to_fit(&v, &x, &[], 0, None, None, &ids, n, p, &opts)
     };
 
     assert!(!fit.converged(), "a capped fit must not report converged");
@@ -2488,9 +2596,7 @@ fn dense_accumulation_case(n: usize, collinear: bool, weighted: bool) -> DenseCa
     let model = ModelSpec {
         family: Family::Gaussian,
         re: Some(ReStructure {
-            sizing: Sizing::FixedClusters {
-                n_clusters: k as u32,
-            },
+            terms: Vec::new(),
             slopes: vec![],
             extra_groupings: vec![],
         }),
@@ -2499,8 +2605,8 @@ fn dense_accumulation_case(n: usize, collinear: bool, weighted: bool) -> DenseCa
         primary: ids,
         extra: vec![],
     };
-    let (sized, gids, _perm) = spec_sized_from_ids(&model, &gids);
-    let ws = LmmWorkspace::for_cluster_spec_ext(p, &sized, n, &[], &[], false);
+    let (sized, gids, _) = spec_sized_from_ids(&model, &gids);
+    let ws = LmmWorkspace::for_cluster_spec_ext(p, &sized, &[], &[], false);
     (ws, x, y, gids.primary.clone(), w)
 }
 
@@ -2519,6 +2625,7 @@ fn accumulate_lmm_rows_gram_route_matches_the_givens_route() {
         accumulate_lmm_rows(
             &mut ws,
             x.as_ref(),
+            x.as_ref().subcols(0, 0),
             &y,
             n,
             p,
@@ -2531,7 +2638,14 @@ fn accumulate_lmm_rows_gram_route_matches_the_givens_route() {
         let b = givens.suff_mut();
         b.reset();
         b.set_design_qr(x.as_ref(), w.as_deref());
-        b.add_rows_multi(x.as_ref(), &y, &ids, &[], w.as_deref());
+        b.add_rows_multi(
+            x.as_ref(),
+            x.as_ref().subcols(0, 0),
+            &y,
+            &ids,
+            &[],
+            w.as_deref(),
+        );
         let a = ws.suff_mut();
         let m = p + 1;
         if collinear {
@@ -2620,6 +2734,7 @@ fn accumulate_lmm_rows_weighted_reuse_allocates_nothing() {
         accumulate_lmm_rows(
             ws,
             x.as_ref(),
+            x.as_ref().subcols(0, 0),
             &y,
             n,
             p,
@@ -2671,14 +2786,15 @@ fn sparse_accumulation_draw(n: usize, shift: usize, seed: u64) -> SparseDraw {
 }
 
 /// A sparse-kernel workspace for [`sparse_accumulation_draw`]'s design.
-fn sparse_accumulation_workspace(n: usize, ids: &[u32], extra: &[Vec<u32>]) -> LmmWorkspace {
+fn sparse_accumulation_workspace(ids: &[u32], extra: &[Vec<u32>]) -> LmmWorkspace {
     let model = ModelSpec {
         family: Family::Gaussian,
         re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 8 },
+            terms: Vec::new(),
             slopes: vec![],
             extra_groupings: vec![Grouping {
-                relation: GroupingRelation::Crossed { n_clusters: 5 },
+                terms: Vec::new(),
+                relation: GroupingRelation::Crossed,
                 slopes: vec![],
             }],
         }),
@@ -2689,7 +2805,7 @@ fn sparse_accumulation_workspace(n: usize, ids: &[u32], extra: &[Vec<u32>]) -> L
     };
     let (sized, gids, perm) = spec_sized_from_ids(&model, &gids);
     assert!(perm.is_identity() && gids.primary == ids && gids.extra == extra);
-    LmmWorkspace::for_cluster_spec_ext(3, &sized, n, &[], &[], true)
+    LmmWorkspace::for_cluster_spec_ext(3, &sized, &[], &[], true)
 }
 
 /// A sparse-kernel workspace that is refilled in place for a new draw on the
@@ -2705,10 +2821,11 @@ fn accumulate_lmm_rows_sparse_reuse_matches_a_fresh_workspace() {
     for (shift, seed, weighted) in [(3, 1u64, true), (3, 2, true), (3, 3, false), (7, 4, true)] {
         let (x, y, ids, extra, w) = sparse_accumulation_draw(n, shift, seed);
         let w = weighted.then_some(&w[..]);
-        let ws = reused.get_or_insert_with(|| sparse_accumulation_workspace(n, &ids, &extra));
+        let ws = reused.get_or_insert_with(|| sparse_accumulation_workspace(&ids, &extra));
         accumulate_lmm_rows(
             ws,
             x.as_ref(),
+            x.as_ref().subcols(0, 0),
             &y,
             n,
             p,
@@ -2718,10 +2835,11 @@ fn accumulate_lmm_rows_sparse_reuse_matches_a_fresh_workspace() {
             false,
             crate::lmm::Criterion::Reml,
         );
-        let mut fresh = sparse_accumulation_workspace(n, &ids, &extra);
+        let mut fresh = sparse_accumulation_workspace(&ids, &extra);
         accumulate_lmm_rows(
             &mut fresh,
             x.as_ref(),
+            x.as_ref().subcols(0, 0),
             &y,
             n,
             p,
@@ -2755,11 +2873,12 @@ fn accumulate_lmm_rows_sparse_weighted_reuse_allocates_nothing() {
     const N_CALLS: u64 = 10;
     let (n, p) = (240usize, 3usize);
     let (x, y, ids, extra, w) = sparse_accumulation_draw(n, 3, 1);
-    let mut ws = sparse_accumulation_workspace(n, &ids, &extra);
+    let mut ws = sparse_accumulation_workspace(&ids, &extra);
     let run = |ws: &mut LmmWorkspace| {
         accumulate_lmm_rows(
             ws,
             x.as_ref(),
+            x.as_ref().subcols(0, 0),
             &y,
             n,
             p,
@@ -2811,13 +2930,12 @@ fn curvature_hint_results_do_not_depend_on_call_order() {
     use super::core::{curvature_hint, fit_on_hinted};
     let (x, y, n, p, model, ids) = sleepstudy_slope_design();
     let opts = FitOptions {
-        target_indices: vec![0, 1],
+        se_for: SeFor::Only(vec![0, 1]),
         ..FitOptions::default()
     };
-    let (sized, sized_ids, perm) = spec_sized_from_ids_pub(&model, &ids);
-    let build = || build_workspace(&sized, perm, n, p, &opts);
+    let build = || build_workspace(&model, &ids, n, p, &opts);
     let mut pilot_ws = build();
-    let pilot = fit_on(&mut pilot_ws, &x, &y, &sized_ids, None, &opts);
+    let pilot = fit_on(&mut pilot_ws, &Data::new(&x, &y, n, p), None, &opts);
     assert!(pilot.diagnostics().converged);
     let hint = curvature_hint(&mut pilot_ws).expect("sleepstudy takes the gradient route");
     assert_eq!(hint.dim(), 3);
@@ -2827,18 +2945,14 @@ fn curvature_hint_results_do_not_depend_on_call_order() {
     let mut ab = build();
     let a1 = fit_bits(&fit_on_hinted(
         &mut ab,
-        &x,
-        &y1,
-        &sized_ids,
+        &Data::new(&x, &y1, n, p),
         None,
         Some(&hint),
         &opts,
     ));
     let a2 = fit_bits(&fit_on_hinted(
         &mut ab,
-        &x,
-        &y2,
-        &sized_ids,
+        &Data::new(&x, &y2, n, p),
         None,
         Some(&hint),
         &opts,
@@ -2846,27 +2960,21 @@ fn curvature_hint_results_do_not_depend_on_call_order() {
     let mut ba = build();
     let b2 = fit_bits(&fit_on_hinted(
         &mut ba,
-        &x,
-        &y2,
-        &sized_ids,
+        &Data::new(&x, &y2, n, p),
         None,
         Some(&hint),
         &opts,
     ));
     let b1 = fit_bits(&fit_on_hinted(
         &mut ba,
-        &x,
-        &y1,
-        &sized_ids,
+        &Data::new(&x, &y1, n, p),
         None,
         Some(&hint),
         &opts,
     ));
     let f1 = fit_bits(&fit_on_hinted(
         &mut build(),
-        &x,
-        &y1,
-        &sized_ids,
+        &Data::new(&x, &y1, n, p),
         None,
         Some(&hint),
         &opts,
@@ -2888,9 +2996,8 @@ fn curvature_hint_rebuilds_from_its_parts() {
     use super::core::curvature_hint;
     let (x, y, n, p, model, ids) = sleepstudy_slope_design();
     let opts = FitOptions::default();
-    let (sized, sized_ids, perm) = spec_sized_from_ids_pub(&model, &ids);
-    let mut ws = build_workspace(&sized, perm, n, p, &opts);
-    let _ = fit_on(&mut ws, &x, &y, &sized_ids, None, &opts);
+    let mut ws = build_workspace(&model, &ids, n, p, &opts);
+    let _ = fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts);
     let hint = curvature_hint(&mut ws).expect("sleepstudy takes the gradient route");
     let rebuilt =
         crate::optim::CurvatureHint::from_parts(hint.dim(), hint.inv_hessian(), hint.units())
@@ -2909,21 +3016,20 @@ fn curvature_hint_reaches_the_unhinted_optimum() {
     use super::core::{curvature_hint, fit_on_hinted};
     let (x, y, n, p, model, ids) = sleepstudy_slope_design();
     let opts = FitOptions {
-        target_indices: vec![0, 1],
+        se_for: SeFor::Only(vec![0, 1]),
         ..FitOptions::default()
     };
-    let (sized, sized_ids, perm) = spec_sized_from_ids_pub(&model, &ids);
-    let mut ws = build_workspace(&sized, perm, n, p, &opts);
-    let _ = fit_on(&mut ws, &x, &y, &sized_ids, None, &opts);
+    let mut ws = build_workspace(&model, &ids, n, p, &opts);
+    let _ = fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts);
     let hint = curvature_hint(&mut ws).unwrap();
     let y1 = shifted(&y, 0.3);
-    let plain = fit_on(&mut ws, &x, &y1, &sized_ids, None, &opts)
-        .into_fit(&x, &y1, &sized_ids, n, p, &model, &opts)
+    let plain = fit_on(&mut ws, &Data::new(&x, &y1, n, p), None, &opts)
+        .into_fit(&Data::new(&x, &y1, n, p), &model, &opts)
         .deviance;
-    let v = fit_on_hinted(&mut ws, &x, &y1, &sized_ids, None, Some(&hint), &opts);
+    let v = fit_on_hinted(&mut ws, &Data::new(&x, &y1, n, p), None, Some(&hint), &opts);
     assert!(v.diagnostics().converged);
     let hinted = v
-        .into_fit(&x, &y1, &sized_ids, n, p, &model, &opts)
+        .into_fit(&Data::new(&x, &y1, n, p), &model, &opts)
         .deviance;
     assert!(
         hinted <= plain + 1e-9,
@@ -2938,25 +3044,23 @@ fn curvature_hint_of_another_dimension_is_rejected() {
     use super::core::{curvature_hint, fit_on_hinted};
     let (x, y, n, p, model, ids) = sleepstudy_slope_design();
     let opts = FitOptions {
-        target_indices: vec![0, 1],
+        se_for: SeFor::Only(vec![0, 1]),
         ..FitOptions::default()
     };
-    let (sized, sized_ids, perm) = spec_sized_from_ids_pub(&model, &ids);
-    let mut ws = build_workspace(&sized, perm, n, p, &opts);
-    let _ = fit_on(&mut ws, &x, &y, &sized_ids, None, &opts);
+    let mut ws = build_workspace(&model, &ids, n, p, &opts);
+    let _ = fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts);
     let hint = curvature_hint(&mut ws).unwrap();
     // The same data as a random-intercept model: n_θ = 1.
     let intercept = ModelSpec {
         family: Family::Gaussian,
         re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 1 },
+            terms: Vec::new(),
             slopes: vec![],
             extra_groupings: vec![],
         }),
     };
-    let (sized1, ids1, perm1) = spec_sized_from_ids_pub(&intercept, &ids);
-    let mut ws1 = build_workspace(&sized1, perm1, n, p, &opts);
-    let _ = fit_on_hinted(&mut ws1, &x, &y, &ids1, None, Some(&hint), &opts);
+    let mut ws1 = build_workspace(&intercept, &ids, n, p, &opts);
+    let _ = fit_on_hinted(&mut ws1, &Data::new(&x, &y, n, p), None, Some(&hint), &opts);
 }
 
 /// No hint where the fit has no gradient: a random-intercept LMM searches
@@ -2966,20 +3070,19 @@ fn curvature_hint_is_none_off_the_gradient_route() {
     use super::core::curvature_hint;
     let (x, y, n, p, _, ids) = sleepstudy_slope_design();
     let opts = FitOptions {
-        target_indices: vec![0, 1],
+        se_for: SeFor::Only(vec![0, 1]),
         ..FitOptions::default()
     };
     let intercept = ModelSpec {
         family: Family::Gaussian,
         re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 1 },
+            terms: Vec::new(),
             slopes: vec![],
             extra_groupings: vec![],
         }),
     };
-    let (sized, sized_ids, perm) = spec_sized_from_ids_pub(&intercept, &ids);
-    let mut ws = build_workspace(&sized, perm, n, p, &opts);
-    let _ = fit_on(&mut ws, &x, &y, &sized_ids, None, &opts);
+    let mut ws = build_workspace(&intercept, &ids, n, p, &opts);
+    let _ = fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts);
     assert!(curvature_hint(&mut ws).is_none());
 }
 
@@ -3012,13 +3115,12 @@ fn note_on_maxfun_endpoint() {
     use bobyqa::{Bobyqa, Config};
 
     let (x, y, ids, n, p) = satterthwaite_note_data();
-    let model = intercept_only_spec(Sizing::FixedClusters { n_clusters: 1 });
+    let model = intercept_only_spec();
     let opts = FitOptions {
-        target_indices: vec![0, 1],
+        se_for: SeFor::Only(vec![0, 1]),
         ..FitOptions::default()
     };
-    let (sized, ids, perm) = spec_sized_from_ids(&model, &ids);
-    let mut ws = build_workspace(&sized, perm, n, p, &opts);
+    let mut ws = build_workspace(&model, &ids, n, p, &opts);
     {
         let (lmm, _) = ws.lmm_parts().expect("a Gaussian mixed workspace");
         // One θ, so the search is BOBYQA's; five evaluations stop it short.
@@ -3026,8 +3128,11 @@ fn note_on_maxfun_endpoint() {
         config.max_fun = 5;
         lmm.solver = Bobyqa::new(1, config).expect("legal minimal config");
     }
-    let mut fit =
-        fit_on(&mut ws, &x, &y, &ids, None, &opts).into_fit(&x, &y, &ids, n, p, &model, &opts);
+    let mut fit = fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts).into_fit(
+        &Data::new(&x, &y, n, p),
+        &model,
+        &opts,
+    );
     assert_eq!(fit.diagnostics.boundary, Boundary::NoOptimum);
     assert!(fit.deviance.is_finite());
     super::core::attach_satterthwaite(&mut ws, &mut fit, &opts);
@@ -3109,12 +3214,13 @@ fn failed_pass_gives_no_df_failed() {
     use crate::inference::contrast::{ContrastError, NoDfReason};
 
     let (x, y, ids, n, p) = satterthwaite_note_data();
-    let model = intercept_only_spec(Sizing::FixedClusters { n_clusters: 1 });
+    let model = intercept_only_spec();
     let opts = FitOptions {
-        target_indices: vec![0, 1],
+        se_for: SeFor::Only(vec![0, 1]),
         ..FitOptions::default()
     };
-    let (mut fit, mut ws) = fit_cold_keep_workspace(&x, &y, n, p, &model, &ids, &opts);
+    let (mut fit, mut ws) =
+        fit_cold_keep_workspace(&Data::new(&x, &y, n, p).ids(&ids), &model, &opts);
     assert!(fit.converged());
     ws.lmm_parts().expect("a Gaussian mixed workspace").0.theta[0] = f64::NAN;
     super::core::attach_satterthwaite(&mut ws, &mut fit, &opts);
@@ -3231,7 +3337,7 @@ fn check_design_summary(tag: &str, fit: &Fit, x_ref: &[f64], p: usize, ids: &[u3
 /// keep it too.
 #[test]
 fn design_summary_kept_inside_envelope() {
-    let model = intercept_only_spec(Sizing::FixedClusters { n_clusters: 1 });
+    let model = intercept_only_spec();
     let opts = FitOptions::default();
     let x1 = |_: usize, st: &mut u64| vec![1.0, lcg(st)];
     let fit_of = |x: &[f64], y: &[f64], ids: &[u32], p: usize, opts: &FitOptions| {
@@ -3263,11 +3369,22 @@ fn design_summary_kept_inside_envelope() {
 
     let (x, y, ids, p) = summary_design(&[5; 6], x1);
     let offset: Vec<f64> = (0..ids.len()).map(|i| 0.1 * (i % 7) as f64).collect();
-    let with_offset = FitOptions {
-        offset: Some(offset),
-        ..FitOptions::default()
+    let gids = GroupIds {
+        primary: ids.clone(),
+        extra: vec![],
     };
-    let fit = fit_of(&x, &y, &ids, p, &with_offset);
+    let fit = fit_warm_wo(
+        &x,
+        &y,
+        ids.len(),
+        p,
+        &model,
+        &gids,
+        None,
+        None,
+        Some(&offset),
+        &opts,
+    );
     check_design_summary("offset", &fit, &x, p, &ids);
 
     // `x1` twice: the fit drops one copy and keeps the summary of the rest.
@@ -3326,16 +3443,18 @@ fn design_summary_kept_inside_envelope() {
             extra: vec![],
         };
         let n = ids.len();
-        let (sized, gids, perm) = spec_sized_from_ids(&model, &gids);
-        let mut ws = build_workspace(&sized, perm, n, p, &opts);
+        let mut ws = build_workspace(&model, &gids, n, p, &opts);
         {
             let (lmm, _) = ws.lmm_parts().expect("a Gaussian mixed workspace");
             let mut config = Config::new(1);
             config.max_fun = 5;
             lmm.solver = Bobyqa::new(1, config).expect("legal minimal config");
         }
-        let fit = fit_on(&mut ws, &x, &y, &gids, None, &opts)
-            .into_fit(&x, &y, &gids, n, p, &model, &opts);
+        let fit = fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts).into_fit(
+            &Data::new(&x, &y, n, p),
+            &model,
+            &opts,
+        );
         assert!(!fit.converged());
         check_design_summary("max_fun", &fit, &x, p, &ids);
     }
@@ -3345,12 +3464,17 @@ fn design_summary_kept_inside_envelope() {
     // directly): the summary has the six levels seen, not the capacity.
     {
         let n = ids.len();
-        let wide = intercept_only_spec(Sizing::FixedClusters { n_clusters: 9 });
-        let mut ws = LmmWorkspace::for_cluster_spec_ext(p, &wide, n, &[], &[], false);
+        let wide = SizedSpec {
+            spec: intercept_only_spec(),
+            n_primary: 9,
+            extra_counts: vec![],
+        };
+        let mut ws = LmmWorkspace::for_cluster_spec_ext(p, &wide, &[], &[], false);
         let x_mat = Mat::<f64>::from_fn(n, p, |i, j| x[i * p + j]);
         accumulate_lmm_rows(
             &mut ws,
             x_mat.as_ref(),
+            x_mat.as_ref().subcols(0, 0),
             &y,
             n,
             p,
@@ -3368,12 +3492,12 @@ fn design_summary_kept_inside_envelope() {
         let fit = {
             let v = lmm_run_on(
                 &mut ws,
-                &opts.target_indices,
+                &opts.se_for.columns(p),
                 None,
                 None,
                 ColumnScaling::IDENTITY,
             );
-            lmm_view_to_fit(&v, &x, &gids, n, p, &opts)
+            lmm_view_to_fit(&v, &x, &[], 0, None, None, &gids, n, p, &opts)
         };
         check_design_summary("capacity above the levels", &fit, &x, p, &ids);
     }
@@ -3390,10 +3514,10 @@ fn design_summary_absent_outside_envelope() {
         primary: ids.clone(),
         extra: vec![],
     };
-    let intercept = intercept_only_spec(Sizing::FixedClusters { n_clusters: 1 });
+    let intercept = intercept_only_spec();
     let re_with = |slopes: Vec<u32>, extra_groupings: Vec<Grouping>| {
         Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 1 },
+            terms: Vec::new(),
             slopes,
             extra_groupings,
         })
@@ -3425,7 +3549,8 @@ fn design_summary_absent_outside_envelope() {
         re: re_with(
             vec![],
             vec![Grouping {
-                relation: GroupingRelation::Crossed { n_clusters: 1 },
+                terms: Vec::new(),
+                relation: GroupingRelation::Crossed,
                 slopes: vec![],
             }],
         ),
@@ -3435,7 +3560,8 @@ fn design_summary_absent_outside_envelope() {
         re: re_with(
             vec![],
             vec![Grouping {
-                relation: GroupingRelation::NestedWithin { n_per_parent: 1 },
+                terms: Vec::new(),
+                relation: GroupingRelation::NestedWithin,
                 slopes: vec![],
             }],
         ),
@@ -3449,10 +3575,7 @@ fn design_summary_absent_outside_envelope() {
         primary: ids.clone(),
         extra: vec![(0..n).map(|i| (i % 4) as u32).collect()],
     };
-    let weighted = FitOptions {
-        weights: Some((0..n).map(|i| 0.75 + 0.1 * (i % 6) as f64).collect()),
-        ..FitOptions::default()
-    };
+    let w: Vec<f64> = (0..n).map(|i| 0.75 + 0.1 * (i % 6) as f64).collect();
     let none = GroupIds::default();
     for (tag, fit) in [
         ("binomial", fit_cold(&x, &yb, n, p, &binomial, &one, &opts)),
@@ -3468,7 +3591,7 @@ fn design_summary_absent_outside_envelope() {
         ),
         (
             "weighted",
-            fit_cold(&x, &y, n, p, &intercept, &one, &weighted),
+            fit_warm_wo(&x, &y, n, p, &intercept, &one, None, Some(&w), None, &opts),
         ),
         (
             "no fixed effects",
@@ -3484,7 +3607,7 @@ fn design_summary_absent_outside_envelope() {
 #[test]
 fn lmm_fit_reports_nobs_and_its_criterion() {
     let (x, y, n, p) = super::common_tests::lmm_hand_dataset();
-    let model = intercept_only_spec(Sizing::FixedClusters { n_clusters: 6 });
+    let model = intercept_only_spec();
     let ids = GroupIds {
         primary: (0..n).map(|i| (i % 6) as u32).collect(),
         extra: vec![],
@@ -3494,7 +3617,7 @@ fn lmm_fit_reports_nobs_and_its_criterion() {
         (Some(false), Objective::MaximumLikelihood),
     ] {
         let opts = FitOptions {
-            target_indices: vec![1, 2],
+            se_for: SeFor::Only(vec![1, 2]),
             reml,
             ..FitOptions::default()
         };
@@ -3520,13 +3643,13 @@ fn ports_mixed_fit(pairs: bool) -> Fit {
         .map(|i| 0.3 * xs[i] + (((i * 7) % 5) as f64 - 2.0) * 0.4 + off[g[i] as usize])
         .collect();
     let x: Vec<f64> = xs.iter().flat_map(|&v| [1.0, v]).collect();
-    let model = intercept_only_spec(Sizing::FixedClusters { n_clusters: 5 });
+    let model = intercept_only_spec();
     let ids = GroupIds {
         primary: g,
         extra: vec![],
     };
     let opts = FitOptions {
-        target_indices: vec![0, 1],
+        se_for: SeFor::Only(vec![0, 1]),
         ..FitOptions::default()
     };
     fit_cold(&x, &y, n, 2, &model, &ids, &opts)
@@ -3552,4 +3675,122 @@ fn theta_on_its_upper_limit_is_reported_not_interior() {
     assert!(f.converged());
     assert_eq!(f.diagnostics.boundary, Boundary::Interior);
     assert!(!at_limit(&f), "notes: {:?}", f.diagnostics.notes);
+}
+
+/// `(1 + Days || Subject)` on sleepstudy through the matrix door
+/// (`Re::intercept().slopes([1]).uncorrelated()`), REML and ML: the fit
+/// reaches lme4's deviance within `2e-4` (the oracle tier's `DEV_EPS`), and
+/// the covariance between the two terms is exactly zero.
+///
+/// References: `validation/goldens/sleepstudy_uncorr_lmm.json` and
+/// `sleepstudy_uncorr_lmm_ml.json` `.estimates.loglik` (lme4 2.0-6).
+#[test]
+fn uncorrelated_lmm_by_matrix_door() {
+    const DEV_EPS: f64 = 2e-4;
+    let (x, y, n, p, _, ids) = sleepstudy_slope_design();
+    let model = ModelSpec::mixed(
+        Family::Gaussian,
+        ReStructure::intercept().slopes([1]).uncorrelated(),
+    );
+    for (reml, lme4_loglik) in [(true, -871.834646790741), (false, -876.0016275723)] {
+        let f = fit_cold(
+            &x,
+            &y,
+            n,
+            p,
+            &model,
+            &ids,
+            &FitOptions {
+                reml: Some(reml),
+                ..FitOptions::default()
+            },
+        );
+        assert!(f.converged(), "reml {reml}: must converge");
+        let gap = -2.0 * f.loglik - -2.0 * lme4_loglik;
+        assert!(
+            gap.abs() < DEV_EPS,
+            "reml {reml}: −2·loglik {} vs lme4 {} (gap {gap:e})",
+            -2.0 * f.loglik,
+            -2.0 * lme4_loglik
+        );
+        assert_eq!(f.varcorr[0].len(), 3, "reml {reml}: one 2×2 block");
+        assert_eq!(f.varcorr[0][1], 0.0, "reml {reml}: {:?}", f.varcorr[0]);
+    }
+}
+
+/// A rank-deficient design under an uncorrelated block keeps its terms:
+/// `X = [1, a, 2a, x]` with `Re::intercept().slopes([3]).uncorrelated()` drops
+/// column 2, refits the reduced design with the slope moved to column 2
+/// (`set_term_slopes` rewrites the terms with it, or the shape check refuses
+/// the reduced spec), and reports the fit on `[1, a, x]` with
+/// `slopes([2]).uncorrelated()` bit for bit, `beta[2]` NaN.
+#[test]
+fn rank_deficient_uncorrelated_fit_keeps_its_terms() {
+    let (x2, y, n, _, _, ids) = sleepstudy_slope_design();
+    let mut seed = 0x5eed_u64;
+    let a: Vec<f64> = (0..n).map(|_| lcg(&mut seed)).collect();
+    let (mut x_full, mut x_red) = (vec![0.0; n * 4], vec![0.0; n * 3]);
+    for i in 0..n {
+        x_full[i * 4..i * 4 + 4].copy_from_slice(&[1.0, a[i], 2.0 * a[i], x2[i * 2 + 1]]);
+        x_red[i * 3..i * 3 + 3].copy_from_slice(&[1.0, a[i], x2[i * 2 + 1]]);
+    }
+    let spec = |slope| {
+        ModelSpec::mixed(
+            Family::Gaussian,
+            ReStructure::intercept().slopes([slope]).uncorrelated(),
+        )
+    };
+    let opts = FitOptions::default();
+    let full = fit_cold(&x_full, &y, n, 4, &spec(3), &ids, &opts);
+    let red = fit_cold(&x_red, &y, n, 3, &spec(2), &ids, &opts);
+    assert!(full.converged() && red.converged());
+    assert!(full.beta[2].is_nan(), "{:?}", full.beta);
+    assert_eq!(full.deviance.to_bits(), red.deviance.to_bits());
+    for (j, k) in [(0, 0), (1, 1), (3, 2)] {
+        assert_eq!(full.beta[j].to_bits(), red.beta[k].to_bits(), "β[{j}]");
+    }
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    assert_eq!(bits(&full.varcorr[0]), bits(&red.varcorr[0]));
+}
+
+/// `Fit::df` counts the θ entries the fit estimates, not the ones a mask holds
+/// at zero: on sleepstudy (`p = 2`) `(1 + Days || Subject)` has two variance
+/// parameters, `(0 + Days | Subject)` one, each plus σ. A Gamma GLMM through
+/// `model_df` (`sim_gamma`, `p = 3`, `(1 + grp || cluster)`) counts the same
+/// way, plus φ.
+#[test]
+fn masked_df_counts_free_theta() {
+    let (x, y, n, p, _, ids) = sleepstudy_slope_design();
+    let opts = FitOptions::default();
+    let uncorr = ModelSpec::mixed(
+        Family::Gaussian,
+        ReStructure::intercept().slopes([1]).uncorrelated(),
+    );
+    let no_int = ModelSpec::mixed(
+        Family::Gaussian,
+        ReStructure::intercept().terms([crate::ReTerm::no_intercept().slopes([1])]),
+    );
+    for (model, n_free) in [(&uncorr, 2), (&no_int, 1)] {
+        let f = fit_cold(&x, &y, n, p, model, &ids, &opts);
+        assert!(f.converged(), "{n_free} free θ: must converge");
+        assert_eq!(f.df, p + n_free + 1, "{n_free} free θ");
+    }
+
+    let (xg, yg, cluster, _) = super::common_tests::sim_clustered(include_str!(
+        "../../validation/data/simulated/sim_gamma.csv"
+    ));
+    let (ng, pg) = (yg.len(), 3);
+    let gamma = ModelSpec::mixed(
+        Family::Gamma {
+            link: crate::GammaLink::Log,
+        },
+        ReStructure::intercept().slopes([2]).uncorrelated(),
+    );
+    let gids = GroupIds {
+        primary: cluster,
+        extra: vec![],
+    };
+    let f = fit_cold(&xg, &yg, ng, pg, &gamma, &gids, &opts);
+    assert!(f.converged(), "Gamma: must converge");
+    assert_eq!(f.df, pg + 2 + 1, "Gamma");
 }

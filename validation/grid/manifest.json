@@ -1,7 +1,7 @@
 {
   "schema": "glmm-accuracy-grid/1",
   "generated_by": "grid/gen_manifest.R",
-  "generated": "2026-10-12",
+  "generated": "2026-10-23",
   "cells": [
     {
       "cell": "lmm_int1_g3000p20_bal_base",
@@ -168,6 +168,85 @@
             "corr": [
               [1, 0.2],
               [0.2, 1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_q1n_g3000p20_bal_base",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "q1n",
+      "n_theta": 1,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 506298,
+      "data": "data/lmm_q1n_g3000p20_bal_base.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (0 + x1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (0 + x1 | g1))",
+      "glmm_formula": "y ~ x1 + (0 + x1 | g1)",
+      "reml": true,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": [],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["x1"],
+            "stddev": [0.9],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_q2d_g3000p20_bal_base",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "q2d",
+      "n_theta": 2,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 505844,
+      "data": "data/lmm_q2d_g3000p20_bal_base.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (x1 || g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + zerocorr(1 + x1 | g1))",
+      "glmm_formula": "y ~ x1 + (x1 || g1)",
+      "reml": true,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": [],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1"],
+            "stddev": [1, 0.9],
+            "corr": [
+              [1, 0],
+              [0, 1]
             ]
           }
         ],
@@ -1325,6 +1404,87 @@
             "corr": [
               [1, 0.2],
               [0.2, 1]
+            ]
+          }
+        ],
+        "sigma": null,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "binb_q1n_g3000p20_bal_base",
+      "family": "binomial",
+      "link": "logit",
+      "form": "bernoulli",
+      "structure": "q1n",
+      "n_theta": 1,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 565861,
+      "data": "data/binb_q1n_g3000p20_bal_base.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (0 + x1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (0 + x1 | g1))",
+      "glmm_formula": "y ~ x1 + (0 + x1 | g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "tags": [],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.2, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["x1"],
+            "stddev": [0.54],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": null,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "binb_q2d_g3000p20_bal_base",
+      "family": "binomial",
+      "link": "logit",
+      "form": "bernoulli",
+      "structure": "q2d",
+      "n_theta": 2,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 565270,
+      "data": "data/binb_q2d_g3000p20_bal_base.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (x1 || g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + zerocorr(1 + x1 | g1))",
+      "glmm_formula": "y ~ x1 + (x1 || g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "tags": [],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.2, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1"],
+            "stddev": [0.6, 0.54],
+            "corr": [
+              [1, 0],
+              [0, 1]
             ]
           }
         ],
@@ -2503,6 +2663,89 @@
             "corr": [
               [1, 0.2],
               [0.2, 1]
+            ]
+          }
+        ],
+        "sigma": null,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "bina_q1n_g3000p20_bal_base",
+      "family": "binomial",
+      "link": "logit",
+      "form": "trials",
+      "structure": "q1n",
+      "n_theta": 1,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 565845,
+      "data": "data/bina_q1n_g3000p20_bal_base.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "incidence",
+      "r_formula": "cbind(incidence, size - incidence) ~ 1 + x1 + (0 + x1 | g1)",
+      "jl_formula": "@formula(prop ~ 1 + x1 + (0 + x1 | g1))",
+      "glmm_formula": "prop ~ x1 + (0 + x1 | g1)",
+      "weights": "size",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "tags": [],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.2, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["x1"],
+            "stddev": [0.54],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": null,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "bina_q2d_g3000p20_bal_base",
+      "family": "binomial",
+      "link": "logit",
+      "form": "trials",
+      "structure": "q2d",
+      "n_theta": 2,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 565254,
+      "data": "data/bina_q2d_g3000p20_bal_base.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "incidence",
+      "r_formula": "cbind(incidence, size - incidence) ~ 1 + x1 + (x1 || g1)",
+      "jl_formula": "@formula(prop ~ 1 + x1 + zerocorr(1 + x1 | g1))",
+      "glmm_formula": "prop ~ x1 + (x1 || g1)",
+      "weights": "size",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "tags": [],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.2, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1"],
+            "stddev": [0.6, 0.54],
+            "corr": [
+              [1, 0],
+              [0, 1]
             ]
           }
         ],
@@ -3703,6 +3946,87 @@
       }
     },
     {
+      "cell": "prbb_q1n_g3000p20_bal_base",
+      "family": "binomial",
+      "link": "probit",
+      "form": "bernoulli",
+      "structure": "q1n",
+      "n_theta": 1,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 565803,
+      "data": "data/prbb_q1n_g3000p20_bal_base.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (0 + x1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (0 + x1 | g1))",
+      "glmm_formula": "y ~ x1 + (0 + x1 | g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "tags": [],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.2, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["x1"],
+            "stddev": [0.54],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": null,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "prbb_q2d_g3000p20_bal_base",
+      "family": "binomial",
+      "link": "probit",
+      "form": "bernoulli",
+      "structure": "q2d",
+      "n_theta": 2,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 565212,
+      "data": "data/prbb_q2d_g3000p20_bal_base.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (x1 || g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + zerocorr(1 + x1 | g1))",
+      "glmm_formula": "y ~ x1 + (x1 || g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "tags": [],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.2, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1"],
+            "stddev": [0.6, 0.54],
+            "corr": [
+              [1, 0],
+              [0, 1]
+            ]
+          }
+        ],
+        "sigma": null,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
       "cell": "prbb_nest3_g3000p20_bal_base",
       "family": "binomial",
       "link": "probit",
@@ -4872,6 +5196,89 @@
             "corr": [
               [1, 0.2],
               [0.2, 1]
+            ]
+          }
+        ],
+        "sigma": null,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "prba_q1n_g3000p20_bal_base",
+      "family": "binomial",
+      "link": "probit",
+      "form": "trials",
+      "structure": "q1n",
+      "n_theta": 1,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 565787,
+      "data": "data/prba_q1n_g3000p20_bal_base.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "incidence",
+      "r_formula": "cbind(incidence, size - incidence) ~ 1 + x1 + (0 + x1 | g1)",
+      "jl_formula": "@formula(prop ~ 1 + x1 + (0 + x1 | g1))",
+      "glmm_formula": "prop ~ x1 + (0 + x1 | g1)",
+      "weights": "size",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "tags": [],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.2, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["x1"],
+            "stddev": [0.54],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": null,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "prba_q2d_g3000p20_bal_base",
+      "family": "binomial",
+      "link": "probit",
+      "form": "trials",
+      "structure": "q2d",
+      "n_theta": 2,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 565196,
+      "data": "data/prba_q2d_g3000p20_bal_base.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "incidence",
+      "r_formula": "cbind(incidence, size - incidence) ~ 1 + x1 + (x1 || g1)",
+      "jl_formula": "@formula(prop ~ 1 + x1 + zerocorr(1 + x1 | g1))",
+      "glmm_formula": "prop ~ x1 + (x1 || g1)",
+      "weights": "size",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "tags": [],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.2, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1"],
+            "stddev": [0.6, 0.54],
+            "corr": [
+              [1, 0],
+              [0, 1]
             ]
           }
         ],
@@ -6072,6 +6479,87 @@
       }
     },
     {
+      "cell": "cllb_q1n_g3000p20_bal_base",
+      "family": "binomial",
+      "link": "cloglog",
+      "form": "bernoulli",
+      "structure": "q1n",
+      "n_theta": 1,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 565856,
+      "data": "data/cllb_q1n_g3000p20_bal_base.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (0 + x1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (0 + x1 | g1))",
+      "glmm_formula": "y ~ x1 + (0 + x1 | g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB"],
+      "tags": [],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.2, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["x1"],
+            "stddev": [0.54],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": null,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "cllb_q2d_g3000p20_bal_base",
+      "family": "binomial",
+      "link": "cloglog",
+      "form": "bernoulli",
+      "structure": "q2d",
+      "n_theta": 2,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 565265,
+      "data": "data/cllb_q2d_g3000p20_bal_base.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (x1 || g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + zerocorr(1 + x1 | g1))",
+      "glmm_formula": "y ~ x1 + (x1 || g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB"],
+      "tags": [],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.2, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1"],
+            "stddev": [0.6, 0.54],
+            "corr": [
+              [1, 0],
+              [0, 1]
+            ]
+          }
+        ],
+        "sigma": null,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
       "cell": "cllb_nest3_g3000p20_bal_base",
       "family": "binomial",
       "link": "cloglog",
@@ -7241,6 +7729,89 @@
             "corr": [
               [1, 0.2],
               [0.2, 1]
+            ]
+          }
+        ],
+        "sigma": null,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "clla_q1n_g3000p20_bal_base",
+      "family": "binomial",
+      "link": "cloglog",
+      "form": "trials",
+      "structure": "q1n",
+      "n_theta": 1,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 565840,
+      "data": "data/clla_q1n_g3000p20_bal_base.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "incidence",
+      "r_formula": "cbind(incidence, size - incidence) ~ 1 + x1 + (0 + x1 | g1)",
+      "jl_formula": "@formula(prop ~ 1 + x1 + (0 + x1 | g1))",
+      "glmm_formula": "prop ~ x1 + (0 + x1 | g1)",
+      "weights": "size",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB"],
+      "tags": [],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.2, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["x1"],
+            "stddev": [0.54],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": null,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "clla_q2d_g3000p20_bal_base",
+      "family": "binomial",
+      "link": "cloglog",
+      "form": "trials",
+      "structure": "q2d",
+      "n_theta": 2,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 565249,
+      "data": "data/clla_q2d_g3000p20_bal_base.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "incidence",
+      "r_formula": "cbind(incidence, size - incidence) ~ 1 + x1 + (x1 || g1)",
+      "jl_formula": "@formula(prop ~ 1 + x1 + zerocorr(1 + x1 | g1))",
+      "glmm_formula": "prop ~ x1 + (x1 || g1)",
+      "weights": "size",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB"],
+      "tags": [],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.2, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1"],
+            "stddev": [0.6, 0.54],
+            "corr": [
+              [1, 0],
+              [0, 1]
             ]
           }
         ],
@@ -8437,6 +9008,85 @@
       }
     },
     {
+      "cell": "pois_q1n_g3000p20_bal_base",
+      "family": "poisson",
+      "link": "log",
+      "structure": "q1n",
+      "n_theta": 1,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 566126,
+      "data": "data/pois_q1n_g3000p20_bal_base.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (0 + x1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (0 + x1 | g1))",
+      "glmm_formula": "y ~ x1 + (0 + x1 | g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "tags": [],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.4, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["x1"],
+            "stddev": [0.54],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": null,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "pois_q2d_g3000p20_bal_base",
+      "family": "poisson",
+      "link": "log",
+      "structure": "q2d",
+      "n_theta": 2,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 565535,
+      "data": "data/pois_q2d_g3000p20_bal_base.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (x1 || g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + zerocorr(1 + x1 | g1))",
+      "glmm_formula": "y ~ x1 + (x1 || g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels"],
+      "tags": [],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.4, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1"],
+            "stddev": [0.6, 0.54],
+            "corr": [
+              [1, 0],
+              [0, 1]
+            ]
+          }
+        ],
+        "sigma": null,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
       "cell": "pois_nest3_g3000p20_bal_base",
       "family": "poisson",
       "link": "log",
@@ -9581,6 +10231,85 @@
             "corr": [
               [1, 0.2],
               [0.2, 1]
+            ]
+          }
+        ],
+        "sigma": null,
+        "dispersion": 0.5,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "gaml_q1n_g3000p20_bal_base",
+      "family": "gamma",
+      "link": "log",
+      "structure": "q1n",
+      "n_theta": 1,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 565985,
+      "data": "data/gaml_q1n_g3000p20_bal_base.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (0 + x1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (0 + x1 | g1))",
+      "glmm_formula": "y ~ x1 + (0 + x1 | g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB"],
+      "tags": [],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.4, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["x1"],
+            "stddev": [0.54],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": null,
+        "dispersion": 0.5,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "gaml_q2d_g3000p20_bal_base",
+      "family": "gamma",
+      "link": "log",
+      "structure": "q2d",
+      "n_theta": 2,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 565394,
+      "data": "data/gaml_q2d_g3000p20_bal_base.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (x1 || g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + zerocorr(1 + x1 | g1))",
+      "glmm_formula": "y ~ x1 + (x1 || g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB"],
+      "tags": [],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.4, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1"],
+            "stddev": [0.6, 0.54],
+            "corr": [
+              [1, 0],
+              [0, 1]
             ]
           }
         ],
@@ -10743,6 +11472,85 @@
       }
     },
     {
+      "cell": "gami_q1n_g3000p20_bal_base",
+      "family": "gamma",
+      "link": "inverse",
+      "structure": "q1n",
+      "n_theta": 1,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 565937,
+      "data": "data/gami_q1n_g3000p20_bal_base.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (0 + x1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (0 + x1 | g1))",
+      "glmm_formula": "y ~ x1 + (0 + x1 | g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB"],
+      "tags": [],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [20, 0.4],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["x1"],
+            "stddev": [0.54],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": null,
+        "dispersion": 0.5,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "gami_q2d_g3000p20_bal_base",
+      "family": "gamma",
+      "link": "inverse",
+      "structure": "q2d",
+      "n_theta": 2,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 565346,
+      "data": "data/gami_q2d_g3000p20_bal_base.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (x1 || g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + zerocorr(1 + x1 | g1))",
+      "glmm_formula": "y ~ x1 + (x1 || g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB"],
+      "tags": [],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [20, 0.4],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1"],
+            "stddev": [0.6, 0.54],
+            "corr": [
+              [1, 0],
+              [0, 1]
+            ]
+          }
+        ],
+        "sigma": null,
+        "dispersion": 0.5,
+        "nb_theta": null
+      }
+    },
+    {
       "cell": "gami_nest3_g3000p20_bal_base",
       "family": "gamma",
       "link": "inverse",
@@ -11887,6 +12695,85 @@
             "corr": [
               [1, 0.2],
               [0.2, 1]
+            ]
+          }
+        ],
+        "sigma": null,
+        "dispersion": null,
+        "nb_theta": 1.5
+      }
+    },
+    {
+      "cell": "nb_q1n_g3000p20_bal_base",
+      "family": "negativebinomial",
+      "link": "log",
+      "structure": "q1n",
+      "n_theta": 1,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 451011,
+      "data": "data/nb_q1n_g3000p20_bal_base.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (0 + x1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (0 + x1 | g1))",
+      "glmm_formula": "y ~ x1 + (0 + x1 | g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB"],
+      "tags": [],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.4, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["x1"],
+            "stddev": [0.54],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": null,
+        "dispersion": null,
+        "nb_theta": 1.5
+      }
+    },
+    {
+      "cell": "nb_q2d_g3000p20_bal_base",
+      "family": "negativebinomial",
+      "link": "log",
+      "structure": "q2d",
+      "n_theta": 2,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 450676,
+      "data": "data/nb_q2d_g3000p20_bal_base.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (x1 || g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + zerocorr(1 + x1 | g1))",
+      "glmm_formula": "y ~ x1 + (x1 || g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB"],
+      "tags": [],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.4, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1"],
+            "stddev": [0.6, 0.54],
+            "corr": [
+              [1, 0],
+              [0, 1]
             ]
           }
         ],
@@ -40324,6 +41211,85 @@
             "corr": [
               [1, 0.2],
               [0.2, 1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_q1n_g3000p20_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "q1n",
+      "n_theta": 1,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 506298,
+      "data": "data/lmm_q1n_g3000p20_bal_base.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (0 + x1 | g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + (0 + x1 | g1))",
+      "glmm_formula": "y ~ x1 + (0 + x1 | g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["x1"],
+            "stddev": [0.9],
+            "corr": [
+              [1]
+            ]
+          }
+        ],
+        "sigma": 0.6,
+        "dispersion": null,
+        "nb_theta": null
+      }
+    },
+    {
+      "cell": "lmm_q2d_g3000p20_bal_base_ml",
+      "family": "gaussian",
+      "link": "identity",
+      "structure": "q2d",
+      "n_theta": 2,
+      "n_obs": 3000,
+      "per_group": 20,
+      "balance": "bal",
+      "regime": "base",
+      "seed": 505844,
+      "data": "data/lmm_q2d_g3000p20_bal_base.csv",
+      "factors": ["g1"],
+      "n_x": 1,
+      "response": "y",
+      "r_formula": "y ~ 1 + x1 + (x1 || g1)",
+      "jl_formula": "@formula(y ~ 1 + x1 + zerocorr(1 + x1 | g1))",
+      "glmm_formula": "y ~ x1 + (x1 || g1)",
+      "reml": false,
+      "oracles": ["lme4", "glmmTMB", "MixedModels", "lmerTest"],
+      "tags": ["ml"],
+      "truth": {
+        "coef_names": ["(Intercept)", "x1"],
+        "beta": [0.5, 0.8],
+        "varcomp": [
+          {
+            "group": "g1",
+            "terms": ["(Intercept)", "x1"],
+            "stddev": [1, 0.9],
+            "corr": [
+              [1, 0],
+              [0, 1]
             ]
           }
         ],

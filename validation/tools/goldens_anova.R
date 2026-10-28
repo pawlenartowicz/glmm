@@ -82,76 +82,10 @@ suite_dir <- normalizePath(file.path(dirname(sub(
 source(file.path(suite_dir, "tools", "inference_common.R"))
 inference_setup()
 assert_inference_versions()
-local({
-  grid_dir <- file.path(suite_dir, "grid")
-  source(file.path(grid_dir, "engines", "versions.R"), local = TRUE)
-  assert_pkg_version("glmmTMB", grid_versions(grid_dir)[["glmmTMB"]])
-})
+EXTRA_PKGS <- assert_extra_versions("glmmTMB")
 
 GENERATOR <- "goldens_anova.R"
 out_dir <- file.path(suite_dir, "goldens", "inference", "anova")
-
-# Stops unless every number in `x` (a nested list) is finite, so no Inf, NaN
-# or NA reaches a JSON.
-check_finite <- function(x, name, path = "") {
-  if (is.list(x)) {
-    keys <- names(x)
-    for (i in seq_along(x)) {
-      key <- if (is.null(keys) || !nzchar(keys[i])) as.character(i) else keys[i]
-      check_finite(x[[i]], name, paste0(path, "/", key))
-    }
-  } else if (anyNA(x) || (is.numeric(x) && !all(is.finite(x)))) {
-    stop(sprintf("%s: %s is not finite", name, path), call. = FALSE)
-  }
-  invisible(x)
-}
-
-# The family call of a member, in the grid's family spelling.
-family_call <- function(family, link) {
-  fun <- switch(family, gaussian = "gaussian", binomial = "binomial", poisson = "poisson",
-                gamma = "Gamma", stop("family_call: unsupported family ", family))
-  str2lang(sprintf('%s(link = "%s")', fun, link))
-}
-
-# The call that fits member `mem` on `data`, and the environment to evaluate it
-# in (holding `data`, so update() inside ranova finds it). Built as a call, not
-# by do.call, so the model's stored call names the weights column.
-member_call <- function(mem, data) {
-  env <- new.env(parent = globalenv())
-  env$data <- data
-  f <- as.formula(mem$formula, env = env)
-  w <- if (is.null(mem$weights)) NULL else as.name(mem$weights)
-  ctrl <- if (is.null(mem$tolPwrss)) NULL else
-    bquote(lme4::glmerControl(tolPwrss = .(mem$tolPwrss)))
-  cl <- switch(mem$fun,
-    "lme4::lmer" = bquote(lme4::lmer(.(f), data = data, REML = .(mem$REML), weights = .(w))),
-    "stats::lm" = bquote(stats::lm(.(f), data = data, weights = .(w))),
-    "stats::glm" = bquote(stats::glm(.(f), family = .(family_call(mem$family, mem$link)),
-                                     data = data, weights = .(w))),
-    "lme4::glmer" = bquote(lme4::glmer(.(f), family = .(family_call(mem$family, mem$link)),
-                                       data = data, weights = .(w), nAGQ = .(mem$nAGQ),
-                                       control = .(ctrl))),
-    "MASS::glm.nb" = {
-      if (!identical(mem$link, "log")) stop("member_call: glm.nb is fitted with its log link")
-      bquote(MASS::glm.nb(.(f), data = data, weights = .(w)))
-    },
-    "lme4::glmer.nb" = {
-      if (!identical(mem$link, "log")) stop("member_call: glmer.nb is fitted with its log link")
-      bquote(lme4::glmer.nb(.(f), data = data, weights = .(w), nAGQ = .(mem$nAGQ),
-                            control = .(ctrl)))
-    },
-    "glmmTMB::glmmTMB" = bquote(glmmTMB::glmmTMB(.(f),
-                                                 family = .(family_call(mem$family, mem$link)),
-                                                 data = data, weights = .(w),
-                                                 REML = .(mem$REML))),
-    stop("member_call: unsupported fun ", mem$fun))
-  list(call = cl, env = env)
-}
-
-fit_member <- function(mem, data) {
-  mc <- member_call(mem, data)
-  eval(mc$call, mc$env)
-}
 
 member_summary <- function(m, mem) {
   ll <- logLik(m)
@@ -348,14 +282,6 @@ case_mixture_points <- function(entry) {
 
 # Per-term references (the cases car_glmm, car_glm, car_lm, linear_hypothesis,
 # nonmarginal).
-
-# Member `mem` refitted with contr.sum on the factor columns `cols`: the call of
-# fit_member plus `contrasts`.
-fit_member_sum <- function(mem, data, cols) {
-  mc <- member_call(mem, data)
-  mc$call$contrasts <- setNames(rep(list("contr.sum"), length(cols)), cols)
-  eval(mc$call, mc$env)
-}
 
 # The fixed coefficients of a fit (no aliased column allowed), their covariance
 # and names.
@@ -675,7 +601,7 @@ for (entry in select_entries("anova")) {
   cat(sprintf("%s ...\n", entry$name))
   build <- CASES[[entry$case]]
   if (is.null(build)) stop(sprintf("%s: unknown case %s", entry$name, entry$case), call. = FALSE)
-  extra <- if (identical(entry$case, "lrt_terms")) c("glmmTMB", "afex") else "glmmTMB"
+  extra <- if (identical(entry$case, "lrt_terms")) c(EXTRA_PKGS, "afex") else EXTRA_PKGS
   obj <- c(list(provenance = provenance(GENERATOR, extra = extra)),
            check_finite(build(entry), entry$name))
   write_reference(obj, file.path(out_dir, paste0(entry$name, ".json")))

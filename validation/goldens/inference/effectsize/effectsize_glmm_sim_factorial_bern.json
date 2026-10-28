@@ -1,0 +1,36 @@
+{
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0",
+      "performance": "0.18.2",
+      "effectsize": "1.0.3",
+      "insight": "1.5.4"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_effectsize.R"
+  },
+  "r2": {
+    "marginal": 0.137779604305963,
+    "conditional": 0.344845517369023
+  },
+  "icc": {
+    "adjusted": 0.240154273892331,
+    "unadjusted": 0.20706591306306
+  },
+  "name": "effectsize_glmm_sim_factorial_bern"
+}

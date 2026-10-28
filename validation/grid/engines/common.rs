@@ -10,8 +10,8 @@
 
 use glmm::formula::{lower, Column, Lowered, ReGroupInfo, Table};
 use glmm::{
-    fit_cold, BinomialLink, Family, Fit, FitOptions, GammaLink, InverseGaussianLink,
-    NegBinomialLink, PoissonLink, WaldSe,
+    BinomialLink, Family, Fit, FitOptions, GammaLink, InverseGaussianLink, NegBinomialLink,
+    PoissonLink, WaldSe,
 };
 use serde_json::{json, Value};
 use std::time::Instant;
@@ -86,8 +86,9 @@ pub fn nums(xs: &[f64]) -> Value {
 /// the cell's `data` field is a path RELATIVE TO IT, so a generated cell
 /// (`data/<id>.csv`) and a crate fixture (`../data/simulated/<name>.csv`) are
 /// read by the same line and the manifest is the only place that decides which.
-/// Returns the lowered inputs and whether the family is Gaussian.
-pub fn lower_grid_cell(cell: &Value, grid_dir: &str) -> (Lowered, bool) {
+/// Returns the lowered inputs, the fit options the cell sets (its `nagq`), and
+/// whether the family is Gaussian.
+pub fn lower_grid_cell(cell: &Value, grid_dir: &str) -> (Lowered, FitOptions, bool) {
     let path = format!("{grid_dir}/{}", cell["data"].as_str().expect("cell.data"));
     let (header, rows) = read_csv_path(&path);
     let factors: Vec<String> = cell["factors"]
@@ -97,7 +98,7 @@ pub fn lower_grid_cell(cell: &Value, grid_dir: &str) -> (Lowered, bool) {
     // `glmm_formula`, NOT jl_formula: the manifest generator already emitted the
     // crate's dialect -- the "@formula(...)" wrapper and the leading "1 + "
     // removed, and crucially NO offset(...) term, because the offset arrives
-    // through opts.offset below. Lowering jl_formula here instead would apply
+    // through `Lowered::offset` below. Lowering jl_formula here instead would apply
     // the offset twice on every offset cell. No `&`-to-`:` rewrite is needed
     // either: the generated cells never use `&`, and the read-in cells had
     // theirs rewritten when `glmm_formula` was built.
@@ -112,7 +113,7 @@ pub fn lower_grid_cell(cell: &Value, grid_dir: &str) -> (Lowered, bool) {
             .iter()
             .position(|h| h == wc)
             .expect("weights_col in header");
-        lo.opts.weights = Some(rows.iter().map(|r| r[j].parse().unwrap()).collect());
+        lo.weights = Some(rows.iter().map(|r| r[j].parse().unwrap()).collect());
     }
     // The offset, applied HERE and only here for this engine.
     if let Some(oc) = cell["offset_col"].as_str() {
@@ -120,12 +121,13 @@ pub fn lower_grid_cell(cell: &Value, grid_dir: &str) -> (Lowered, bool) {
             .iter()
             .position(|h| h == oc)
             .expect("offset_col in header");
-        lo.opts.offset = Some(rows.iter().map(|r| r[j].parse().unwrap()).collect());
+        lo.offset = Some(rows.iter().map(|r| r[j].parse().unwrap()).collect());
     }
+    let mut fit_opts = FitOptions::default();
     if let Some(k) = cell["nagq"].as_u64() {
-        lo.opts.nagq = k as u8;
+        fit_opts.nagq = k as u8;
     }
-    (lo, matches!(family, Family::Gaussian))
+    (lo, fit_opts, matches!(family, Family::Gaussian))
 }
 
 /// The grid manifest's `family` + `link` pair -> `glmm::Family`. `inversegaussian`
@@ -170,7 +172,7 @@ pub fn family_of(cell: &Value) -> Family {
 /// Build the lowered fit inputs for one cell, handling the one genuinely
 /// data-shape-dependent branch: an aggregated-binomial cell (manifest `weights`)
 /// synthesizes `prop = <response>/<weights column>` so the formula's `prop ~ ...`
-/// response resolves, then passes the trial counts into `FitOptions::weights`,
+/// response resolves, then passes the trial counts into `Data::weights`,
 /// one row per aggregate observation -- exactly lme4's `cbind(s, m-s)`
 /// objective, whose deviance differs from the expanded-Bernoulli one only by a
 /// data-only saturated constant.
@@ -206,7 +208,7 @@ pub fn lower_dataset_generic(
     let mut table = build_table(header, rows, factors);
     table.columns.push(("prop".into(), Column::Numeric(prop)));
     let mut lo = lower(formula_str, &table, family).unwrap_or_else(|e| panic!("lower: {e}"));
-    lo.opts.weights = Some(sizes);
+    lo.weights = Some(sizes);
     (lo, table)
 }
 
@@ -285,7 +287,7 @@ pub fn fit_cell(cell: &Value, grid_dir: &str, timed: Option<usize>, engine_versi
     let cell_id = cell["cell"].as_str().expect("cell.cell");
     let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut rec = base_record(cell_id, "glmm", engine_version);
-        let (mut lo, gaussian) = lower_grid_cell(cell, grid_dir);
+        let (lo, mut fit_opts, gaussian) = lower_grid_cell(cell, grid_dir);
         // A cell tagged `ml` (the ML twin of a Gaussian mixed cell, on its
         // parent's data) is fitted by ML; every other cell keeps the default
         // estimator. The tag decides, not the manifest's `reml` field: that
@@ -294,21 +296,21 @@ pub fn fit_cell(cell: &Value, grid_dir: &str, timed: Option<usize>, engine_versi
         let ml = cell["tags"]
             .as_array()
             .is_some_and(|t| t.iter().any(|v| v == "ml"));
-        lo.opts.reml = if ml { Some(false) } else { None };
+        fit_opts.reml = if ml { Some(false) } else { None };
         let family = family_of(cell);
-        let fit = |o: &FitOptions| fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, o);
+        let fit = |o: &FitOptions| glmm::fit(&lo.data(), lo.spec(), o).unwrap();
 
         // The shipped configuration (`WaldSe::Hessian`) is the primary fit: its
         // estimates are the ones reported, and the timing loop below re-runs it
         // with the Satterthwaite pass switched off. On a gaussian cell `wald_se`
         // is not read at all -- the LMM path has a single profiled SE -- so the
         // same fit serves as the `se_rx` value.
-        let f = fit(&lo.opts);
+        let f = fit(&fit_opts);
         if gaussian {
             rec["se_rx"] = nums(&f.se);
         } else {
             rec["se_hessian"] = nums(&f.se);
-            rec["se_rx"] = nums(&fit(&rx_options(&lo.opts)).se);
+            rec["se_rx"] = nums(&fit(&rx_options(&fit_opts)).se);
         }
 
         // Lowering stays outside the timed region: the reference engines are
@@ -317,7 +319,7 @@ pub fn fit_cell(cell: &Value, grid_dir: &str, timed: Option<usize>, engine_versi
         // `lmer`, so a sample that ran the pass would time more than the fit it
         // is compared with. The pass's cost is measured on its own, not here.
         if let Some(n) = timed {
-            let mut timed_opts = lo.opts.clone();
+            let mut timed_opts = fit_opts.clone();
             timed_opts.satterthwaite = false;
             let mut samples = Vec::with_capacity(n);
             for _ in 0..n {

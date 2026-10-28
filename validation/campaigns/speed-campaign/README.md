@@ -182,9 +182,8 @@ cells.
 ## loop_bench
 
 `loop_bench.rs` measures the loop tier, the build-once / fit-many path a power
-simulation runs: `spec_sized_from_ids_pub` and `build_workspace` once per
-shape, then `fit_on` on D simulated draws of that shape. It is not a gate and
-asserts nothing about speed.
+simulation runs: `build_workspace` once per shape, then `fit_on` on D simulated
+draws of that shape. It is not a gate and asserts nothing about speed.
 
 ```
 cargo build --release --example loop_bench --features "loop_advanced os_counters"           # timing runs

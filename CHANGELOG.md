@@ -6,6 +6,192 @@ All notable changes to the `glmm` crate are recorded here. Format follows
 The Python package (`glmm` on PyPI) is versioned in lockstep with the crate and
 shares these entries; Python-specific notes are called out where they differ.
 
+## [0.7.0] — 2026-10-27
+
+### Added
+
+- **More random-effect forms.** The formula takes `(x || g)` (one uncorrelated
+  term per variable, as lme4), `zerocorr(1 + x | g)`, slopes without a random
+  intercept (`(0 + x | g)`, `(x - 1 | g)` and the like), and several terms on
+  one grouping, such as `(1 + x1 | g) + (0 + x2 | g)`. On a factor slope
+  `(f || g)` keeps the factor's block correlated, as lme4 does;
+  `zerocorr(f | g)` does not. A grouping is still one `varcorr` block, with
+  exact zeros between its terms. `summary()` prints correlations only within
+  a term, read from the new Python `Fit.re_term_index` and R
+  `fit$re_term_index`, so a Python fit pickled by 0.6.x must be refitted
+  before `summary()`. A block without a random intercept counts one effect
+  more against the adaptive-quadrature limit `q ≤ 3`. `Fit::df` and
+  Satterthwaite count only the free variance parameters.
+- **On the matrix door: `ReTerm`, `ReStructure::terms`, `Grouping::terms` and
+  `.uncorrelated()`.** `Re::intercept().slopes([1]).uncorrelated()` is
+  `(x || g)`. Also `formula::ReGroupInfo::term_index`, and
+  `formula::Error::RandomColumnRepeated` when one column is in two terms of
+  one grouping, such as `(1 | g) + (1 + x | g)`. A `match` on
+  `formula::Error` needs an arm for it.
+- **Random slopes on variables that are not fixed terms**, as lme4 fits them:
+  `y ~ 1 + (x | g)`, `y ~ 1 + (f | g)`, `y ~ x:f + (x | g)`. Such a variable
+  gets no coefficient. On the matrix door its columns go in
+  `Design::re_columns(z, s)` or `Data::re_columns(z, s)` (row-major `n × s`; a
+  slope index `c ≥ p` reads column `c − p` of `z`). The formula gives them as
+  `Lowered::re_columns` and `Lowered::re_p`.
+- **The `^` operator in the fixed part**, as in R: `(a + b + c)^2` is every
+  interaction up to order 2. `I(a^2)` stays a power.
+- **`anova()` keeps random slopes in its likelihood-ratio refits**, so a term
+  with a random slope gets a likelihood-ratio row instead of a Wald row with a
+  note. `compare` takes `Reaction ~ 1 + (Days | Subject)` against
+  `Reaction ~ Days + (Days | Subject)`.
+- **R² and ICC: `Fit::r2` and `Fit::icc`** (types `R2` and `Icc`), as
+  `performance::r2_nakagawa` and `performance::icc` compute them (Nakagawa &
+  Schielzeth 2013; random slopes by Johnson 2014; the lognormal approximation
+  on a GLMM). On a Poisson or negative binomial GLMM they refit the null model
+  once. A model without random effects, a Gamma model with the inverse link
+  and an inverse-Gaussian model give `FitError::Unsupported`. Ports: Python
+  `m.r2()` and `m.icc()`, R `r2(fit)` and `icc(fit)`. R's functions mask
+  `performance::r2()` and `performance::icc()`, or are masked by them,
+  depending on which package is attached last. `summary()` of a mixed model
+  prints one line, `Marginal R2: 0.279, conditional R2: 0.799, adjusted ICC:
+  0.722`; on a Poisson or negative binomial GLMM it says to call `r2()` and
+  `icc()` instead.
+- **Partial η²: `FixedRow::eta2_partial`** (`F · df1 / (F · df1 + df2)`), and
+  an `Eta2_partial` column in the F tables of `anova()` in both ports. On a
+  Gaussian mixed model the value is approximate, and the table says so.
+- **`predict`** (`PredictOptions`, `Prediction`, `Scale`), lme4's
+  `predict(newdata = )`, and `formula::predict` for a `Table` of new rows. It
+  predicts on the link or the response scale, with the random effects or
+  without them (`population`, lme4's `re.form = NA`), with SEs and intervals
+  (`se`, `level`), and on a non-Gaussian mixed model with bounds for a future
+  observation (`future`). A grouping level the fit did not see gets a random
+  effect of zero and `Note::NewGroupingLevels`, or `FitError::Ids` with
+  `allow_new_levels = false`. An unseen level of a fixed factor is an error.
+  Ports: Python `Fit.predict(newdata, type, re_form, allow_new_levels, se_fit,
+  level, future)` and R `predict(fit, newdata, re.form, type,
+  allow.new.levels, se.fit, level, future)`, which warn on new levels with
+  `NewGroupingLevelsWarning` and `fastglmm_new_grouping_levels`. R's
+  `predict()` used to stop with an error.
+- **Conditional variances: `Fit::condvar`**, asked for with
+  `FitOptions::condvar` (default `false`), lme4's `ranef(condVar = TRUE)`, and
+  `formula::RanefBlock::condvar` (a pattern that names every field of
+  `RanefBlock` needs `..`). They are not formed for a random slope on a
+  grouping other than the first, over the dense size limits, or on the packed
+  GLMM layout. Conditional SEs and future bounds from `predict` need them. The
+  ports form them by default (the new `condvar` argument): Python
+  `ranef_blocks` entries gain `postvar` and `condsd`, and R `ranef(fit)`
+  attaches `postVar`.
+- **`Simulator`**, lme4's `simulate()`: seeded draws of the response, the same
+  on every platform and thread count. `formula::Lowered::design` gives it the
+  rows of the fit. Ports: Python `Fit.simulate(nsim, seed)` returns an
+  `(nobs, nsim)` array, R `simulate(fit, nsim, seed)` a data frame of columns
+  `sim_1`, .... A seed gives the same draws in both ports when their factor
+  levels sort the same way: Python sorts string labels by code point, R by
+  the session's locale.
+- **Pairwise comparisons: `formula::pairwise`** (`Adjust`, `By`, `Pairwise`,
+  `PairwiseRow`, `RatioKind`) **and `Pairwise::confint`**
+  (`PairwiseIntervals`, `PairwiseInterval`), as emmeans' `pairs(emmeans(..))`
+  and `confint()`. The other factors are averaged with equal weights and
+  numeric variables are at their means (`formula::Lowered::numeric_means`).
+  `By::Levels` and `By::Values` compare within groups. The p-values are
+  adjusted by Holm (the default), Bonferroni, Tukey or none; a Holm table gets
+  Bonferroni intervals. A log or logit link adds the ratio. Ports: Python
+  `glmm.pairwise(m, factor, by=None, at=None, adjust="holm")` returns a
+  `PairwiseTable`, R `pairwise(fit, factor, by = NULL, at = NULL, adjust =
+  "holm")` a data frame of class `fastglmm_pairwise`, both with emmeans'
+  column names, and `confint()` works on either.
+- In both ports, a fit stored by an older version must be refitted before
+  `r2()`, `icc()`, `predict()`, `simulate()` or `pairwise()`.
+
+### Removed
+
+Breaking. Each removed name is listed with what replaces it.
+
+- **`fit_cold` and `fit_warm`.** Use `glmm::fit(&data, &spec, &opts)` and
+  `glmm::fit_with_start(&data, &spec, &start, &opts)`. They take a `Data`
+  (`Data::new(&x, &y, n, p)`, with `.ids(&ids)` on a mixed model) and return
+  `Result<Fit, FitError>`.
+- **`FitOptions::weights` and `FitOptions::offset`.** Use `Data::weights` and
+  `Data::offset`.
+- **`FitOptions::target_indices`.** Use `FitOptions::se_for`: `SeFor::All`
+  (the default) or `SeFor::Only(columns)`. `SeFor::Only(vec![])` computes no
+  SEs.
+- **`Sizing`, `ReStructure::sizing`, and the fields of
+  `GroupingRelation::Crossed { n_clusters }` and
+  `GroupingRelation::NestedWithin { n_per_parent }`.** The level counts come
+  from the `GroupIds`. Use `GroupingRelation::Crossed` and `NestedWithin`, or
+  `Grouping::crossed()` and `Grouping::nested()`.
+- **In `loop_advanced`:** `spec_sized_from_ids_pub` and `Perm`, with no
+  replacement. `build_workspace(spec, ids, n_max, p, opts)` takes the plain
+  `ModelSpec` and the `GroupIds`. `fit_on`, `fit_on_hinted` and
+  `FitView::into_fit` take a `&Data` in place of `x`, `y` and `ids`; the
+  workspace keeps the ids it was built with. `LmmGroupings::from_cluster_spec`
+  and `from_cluster_spec_ext` are no longer public.
+- **`formula::Lowered::opts`.** Use `Lowered::data()` and `Lowered::spec()`,
+  and pass the `FitOptions` apart. A `cbind()` response and an `offset()` term
+  land in `Lowered::weights` and `Lowered::offset`.
+- **`anova::Model::from_fit`.** Use `formula::fit`, or `formula::fit_lowered`
+  after setting weights or an offset; both return a `formula::Model`.
+- **Errors and notes for cases that now fit:**
+  `formula::ParseError::DuplicateGroupingVar` (a repeated column is now
+  `RandomColumnRepeated`), `ParseError::RandomInterceptSuppressionUnsupported`
+  (`(0 | g)` is now `ParseError::EmptySlopeTerm`),
+  `formula::Error::SlopeVarNotInDesign`,
+  `inference::LinearNote::RandomSlopeColumn`, and `Note::UnusedGroupingLevels`
+  with Python's `UnusedGroupingLevelsWarning` and R's
+  `fastglmm_unused_grouping_levels`. The ports' check that refused `(x || g)`
+  is gone too.
+
+### Changed
+
+- **`fit` and `fit_with_start` return a `FitError` on bad input instead of
+  panicking.** The variants are `Shape`, `ResponseOutOfSupport`, `Weights`,
+  `Offset`, `Ids`, `Start`, `OptionValue`, `Unsupported` and `Envelope`, each
+  with a message that names the field and the row. `formula::fit` returns it
+  as `formula::Error::Fit`. Group ids on a model without random effects, and a
+  primary or crossed id not below the row count, are `Ids` errors. A
+  numerical failure is still reported inside the `Fit`, and the loop tier
+  still panics on bad input.
+- **`nagq > 1` on a Gaussian model or a model without random effects is
+  ignored** instead of panicking. The ports warn, as before.
+- **A matrix-door fit computes SEs by default** (`SeFor::All`), so a GLMM fit
+  can now carry `Note::SeUnavailable`.
+- **`ModelSpec`, `ReStructure`, `Grouping`, `GroupingRelation`, `Family`, the
+  link enums, `GroupIds` and `StartValues` are `#[non_exhaustive]`.** Build
+  them with constructors: `ModelSpec::fixed`, `ModelSpec::mixed`,
+  `Re::intercept()`, `Grouping::crossed()`, `GroupIds::new(primary)`,
+  `StartValues::new(beta, theta)` and their builder methods. A `match` on one
+  of the enums needs a `_` arm.
+- **`compare` and `term_tests` take a `formula::Model`.** `compare_stored`
+  compares two stored `anova::Model`s with no refit.
+- **A grouping factor drops its unused levels**, as lme4 does, and `predict`
+  treats them as new levels. `Simulator` draws one random effect per id that
+  occurs, so ids with gaps draw differently from before.
+- **A GLM fit whose QR breaks down at its last step keeps its estimates.** It
+  returns NaN SEs with `Note::SeUnavailable` and `Note::IllConditioned` naming
+  the column. The df, AIC and the Pearson dispersion count only the estimated
+  coefficients. In the loop tier `GlmFitView` gains `se_unavailable`.
+- **`commonstats` moves from 0.2 to 0.3**, for its studentized range. The
+  values glmm reads are unchanged.
+
+### Fixed
+
+- **A GLM fit with a nearly singular `X'WX` now converges.** Each step is
+  solved from a QR of `√W·X`, and the round-off stop is measured against the
+  size of the terms in the linear predictor. Such fits used to stop not
+  converged. Results move only on fits with a pivot ratio below 1e-3 at some
+  step.
+- **Logit and Poisson-log GLMs halve a step whose deviance rises by more than
+  1e-3 relative**, as the other links already did, so a far start no longer
+  runs off and ends `separated`. The GLMM's GLM start does the same.
+- **A random-effect term written right after a name is a syntax error.**
+  `x + zerocor(1 + x | g)` used to parse as a fixed term plus a correlated
+  slope.
+- **Clearer errors** for a random slope on an interaction or nested grouping
+  (`(1 + x | a:b)`, `(x | a/b)`) and for a grouping of three factors
+  (`(1 | a/b/c)`). They used to say "expected identifier".
+- **A random-slope fit that fails, or a GLMM with no more rows than
+  coefficients, reports `tau2` at the reported width** on a block without a
+  random intercept, without the hidden NaN intercept entries.
+- **The loop tier no longer allocates the SE target list on every draw** with
+  the default `se_for`.
+
 ## [0.6.2] — 2026-10-21
 
 ### Added

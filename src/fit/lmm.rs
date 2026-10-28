@@ -1,4 +1,4 @@
-//! LMM (`Family::Gaussian`, `re: Some`) dispatch — marshals `fit_warm`'s
+//! LMM (`Family::Gaussian`, `re: Some`) dispatch — marshals the fit entry's
 //! inputs into the LMM workspace and calls `fit_lmm`. The numerical kernels
 //! live in `src/lmm/mod.rs` and `src/sparse/mod.rs`; this module only builds
 //! the workspace, accumulates the design, and maps `LmmFit` back to `Fit`.
@@ -9,7 +9,7 @@ use crate::standardize::ColumnScaling;
 // Used only by the test-only `fit_mle`/`fit_lmm_into` baselines. The stable core
 // reaches the LMM path via `accumulate_lmm_rows`/`lmm_run_on`, which take neither.
 #[cfg(test)]
-use crate::{ModelSpec, StartValues};
+use crate::StartValues;
 
 use super::common::{
     assemble_varcorr, fill_se_by_predictor, nan_vcov, vcov_from_chol, FitDiagnostics,
@@ -19,6 +19,8 @@ use super::common::{
 // takes a caller-filled `x_mat` directly.
 #[cfg(test)]
 use super::common::{as_given_design, start_to_design, warm_theta};
+#[cfg(test)]
+use super::SizedSpec;
 use super::{DesignSummary, Fit, FitOptions};
 
 // ---------------------------------------------------------------------------
@@ -32,11 +34,13 @@ use super::{DesignSummary, Fit, FitOptions};
 /// view in, instead of allocating a fresh `Mat` every call; the test-only
 /// `fit_mle` baseline builds its own throwaway `Mat` via `as_given_design`.
 /// `criterion` is the workspace's frozen one: a sparse kernel built here
-/// takes it (the dense scratch has carried it since the build).
+/// takes it (the dense scratch has carried it since the build). `z_mat` is
+/// the `n × s` random-effect-only columns, standardized like `x_mat`.
 #[allow(clippy::too_many_arguments)] // marshals the kernel's (x_mat, y, n, p, ids…) surface
 pub(super) fn accumulate_lmm_rows(
     ws: &mut LmmWorkspace,
     x_mat: faer::MatRef<'_, f64>,
+    z_mat: faer::MatRef<'_, f64>,
     y: &[f64],
     n: usize,
     p: usize,
@@ -87,7 +91,7 @@ pub(super) fn accumulate_lmm_rows(
         // Fixed-design opt-in: the design part of the statistics is the last
         // call's (same x, ids, weights), only the response part is rebuilt.
         LmmKernel::Dense { suff, .. } if same_design && n > 0 && p > 0 => {
-            suff.update_response(x_mat, y, cluster_ids, extra_ids, w_for_rows);
+            suff.update_response(x_mat, z_mat, y, cluster_ids, extra_ids, w_for_rows);
         }
         LmmKernel::Dense { suff, .. } => {
             suff.reset();
@@ -99,11 +103,11 @@ pub(super) fn accumulate_lmm_rows(
                 // must run before any row is accumulated, and a second
                 // accumulation through it.
                 // The sparse arm computes its U inside its constructor.
-                suff.add_rows_multi(x_mat, y, cluster_ids, extra_ids, w_for_rows);
+                suff.add_rows_multi(x_mat, z_mat, y, cluster_ids, extra_ids, w_for_rows);
                 if !suff.orthogonalize_from_gram() {
                     suff.reset();
                     suff.set_design_qr(x_mat, w_for_rows);
-                    suff.add_rows_multi(x_mat, y, cluster_ids, extra_ids, w_for_rows);
+                    suff.add_rows_multi(x_mat, z_mat, y, cluster_ids, extra_ids, w_for_rows);
                 }
             }
         }
@@ -125,12 +129,13 @@ pub(super) fn accumulate_lmm_rows(
             // has the same pattern, so it refills the values in place.
             match sparse_ws {
                 Some(sw) if crate::sparse::same_rows(&sw.ids, cluster_ids, extra_ids, n) => {
-                    sw.fill_values(x_mat, cluster_ids, extra_ids, y, sqrt_w);
+                    sw.fill_values(x_mat, z_mat, cluster_ids, extra_ids, y, sqrt_w);
                 }
                 _ => {
                     *sparse_ws = Some(Box::new(crate::sparse::SparseLmmWorkspace::new(
                         g,
                         x_mat,
+                        z_mat,
                         cluster_ids,
                         extra_ids,
                         y,
@@ -176,6 +181,9 @@ pub(crate) struct LmmResultView<'a> {
     /// The dense kernel's accumulated statistics, which `lmm_view_to_fit`
     /// copies the design summary out of; `None` on the sparse kernel.
     suff: Option<&'a LmmSuffStats>,
+    /// The kernel at θ̂, for the conditional variances
+    /// (`LmmKernel::condvar_blocks`).
+    kernel: &'a LmmKernel,
 }
 
 // Loop-tier read accessors (via the `FitView`/`loop_advanced` surface); the
@@ -291,6 +299,7 @@ pub(crate) fn lmm_run_on<'a>(
             LmmKernel::Dense { suff, .. } => Some(&**suff),
             LmmKernel::Sparse { .. } => None,
         },
+        kernel: &ws.kernel,
     }
 }
 
@@ -315,16 +324,22 @@ fn design_summary(suff: &LmmSuffStats) -> DesignSummary {
 /// Maps an [`LmmResultView`] to the full stable `Fit`: SE from `var_diag`, tau2
 /// from θ̂, varcorr, vcov from the augmented factor, the deviance and loglik of
 /// the kernel's criterion (REML or ML), the conditional modes + per-row means,
-/// and, when `opts.weights` is set, the −Σlog wᵢ weighted-deviance correction.
+/// and, when `weights` is set, the −Σlog wᵢ weighted-deviance correction.
 /// On an unweighted fit whose only random term is one random intercept and
 /// which has a fixed-effect column, it also copies the design summary out of
 /// the accumulator.
 ///
-/// `x`/`ids` are here for `fitted` alone (`Xβ̂ + Zb̂` needs the design rows and
-/// the per-row levels), the same way `ols_view_to_fit` already takes `x`/`y`.
+/// `x`/`z`/`offset`/`ids` are here for `fitted` alone (`o + Xβ̂ + Zb̂` needs the
+/// design rows, the row-major `n × s` random-effect-only columns `z` and the
+/// per-row levels), the same way `ols_view_to_fit` already takes `x`/`y`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn lmm_view_to_fit(
     view: &LmmResultView<'_>,
     x: &[f64],
+    z: &[f64],
+    s: usize,
+    weights: Option<&[f64]>,
+    offset: Option<&[f64]>,
     ids: &crate::GroupIds,
     n: usize,
     p: usize,
@@ -338,7 +353,7 @@ pub(crate) fn lmm_view_to_fit(
     let sigma_sq = lmm_fit.sigma_sq;
 
     let mut se = vec![f64::NAN; p];
-    fill_se_by_predictor(view.var_diag, &opts.target_indices, &mut se);
+    fill_se_by_predictor(view.var_diag, &opts.se_for.columns(p), &mut se);
 
     // tau2[k] = theta[k]^2 * sigma_sq — the k-th variance component in original scale.
     // θ̂ holds the fitted Cholesky parameters; diagonal entries satisfy
@@ -353,11 +368,12 @@ pub(crate) fn lmm_view_to_fit(
     let (theta_caller, caller_pins) =
         view.groupings
             .theta_to_caller_vec(view.theta, diag.converged, view.map);
-    let tau2: Vec<f64> = if has_endpoint {
+    let mut tau2: Vec<f64> = if has_endpoint {
         theta_caller.iter().map(|&t| t * t * sigma_sq).collect()
     } else {
         view.theta.iter().map(|_| f64::NAN).collect()
     };
+    view.groupings.drop_hidden(&mut tau2);
 
     // varcorr[g] = vech(σ̂²·Λ̂_gΛ̂_g') per grouping — the q≥2-valid
     // covariance; equals tau2's diagonal only at the (0,0) primary entry.
@@ -374,7 +390,7 @@ pub(crate) fn lmm_view_to_fit(
     // endpoint like `tau2`/`varcorr`: the degenerate return NaN-fills
     // `var_diag` and `sigma_sq` together, so `se` and `vcov` go NaN together.
     let vcov = if has_endpoint {
-        vcov_from_chol(view.factor, p, &opts.target_indices, sigma_sq, view.map)
+        vcov_from_chol(view.factor, p, &opts.se_for.columns(p), sigma_sq, view.map)
     } else {
         nan_vcov(p)
     };
@@ -384,7 +400,8 @@ pub(crate) fn lmm_view_to_fit(
     // (and so never increments `n_rows`) while `n` still reflects the caller's
     // row count.
     let n_rows = view.n_rows;
-    let n_theta = view.theta.len();
+    // The θ entries a grouping's terms hold at zero are not parameters.
+    let n_free = view.groupings.n_free_theta();
 
     // Level counts depend only on the design, so they are reported on every
     // fit; a header line ("Number of obs: …, groups: …") prints on non-converged
@@ -392,7 +409,9 @@ pub(crate) fn lmm_view_to_fit(
     // at a non-converged θ̂ is not a BLUP of anything (the same rule the GLMM
     // paths apply). `ranef_u` is empty when the recovery did not run.
     let ranef_levels = super::common::ranef_level_counts(view.groupings);
-    let (fitted, ranef) = if lmm_fit.converged && !view.ranef_u.is_empty() {
+    let (fitted, ranef, condvar, condvar_x, condvar_cross) = if lmm_fit.converged
+        && !view.ranef_u.is_empty()
+    {
         let ranef = super::common::assemble_ranef_sparse(
             view.theta,
             view.groupings,
@@ -401,6 +420,8 @@ pub(crate) fn lmm_view_to_fit(
         );
         let fitted = super::common::lmm_fitted(
             x,
+            z,
+            s,
             n,
             p,
             view.betas,
@@ -408,11 +429,40 @@ pub(crate) fn lmm_view_to_fit(
             view.groupings,
             &ids.primary,
             &ids.extra,
-            opts.offset.as_deref(),
+            offset,
         );
-        (fitted, ranef)
+        // σ̂² on the kernel's weight scale, as `varcorr` takes it: the factors
+        // carry the compensating `s`.
+        let blocks = if opts.condvar {
+            view.kernel.condvar_blocks(view.theta)
+        } else {
+            None
+        };
+        let (condvar, condvar_x, condvar_cross) = match blocks {
+            Some((blocks, rows, cross)) => (
+                super::common::assemble_condvar(
+                    view.theta,
+                    view.groupings,
+                    &blocks,
+                    sigma_sq,
+                    view.map,
+                ),
+                super::common::assemble_condvar_x(view.theta, view.groupings, &rows, p, view.map),
+                cross.map(|c| {
+                    super::common::assemble_condvar_cross(
+                        view.theta,
+                        view.groupings,
+                        c,
+                        sigma_sq,
+                        view.map,
+                    )
+                }),
+            ),
+            None => (vec![], vec![], None),
+        };
+        (fitted, ranef, condvar, condvar_x, condvar_cross)
     } else {
-        (vec![], vec![])
+        (vec![], vec![], vec![], vec![], None)
     };
 
     // `pinned` in the caller's coordinates, where they differ from the kernel's.
@@ -456,7 +506,7 @@ pub(crate) fn lmm_view_to_fit(
         // deviance; the weighted correction below rewrites both together
         // (using `n`, not `n_rows`: see the note above `n_rows`).
         loglik: super::common::lmm_loglik(deviance, criterion.nu(n_rows, p)),
-        df: if has_endpoint { p + n_theta + 1 } else { 0 },
+        df: if has_endpoint { p + n_free + 1 } else { 0 },
         reml: criterion == Criterion::Reml,
         nobs: n,
         objective: match criterion {
@@ -466,6 +516,9 @@ pub(crate) fn lmm_view_to_fit(
         fitted,
         ranef,
         ranef_levels,
+        condvar,
+        condvar_x,
+        condvar_cross,
         coef_df: vec![f64::NAN; p],
         // No pass has run: the stable path's `attach_satterthwaite` replaces
         // the record; a loop-tier `Fit` keeps it.
@@ -477,7 +530,7 @@ pub(crate) fn lmm_view_to_fit(
         design_summary: match view.suff {
             Some(suff)
                 if suff.m > 1
-                    && opts.weights.is_none()
+                    && weights.is_none()
                     && view.groupings.primary_q == 1
                     && view.groupings.nested.is_none()
                     && view.groupings.crossed.is_empty() =>
@@ -519,7 +572,7 @@ pub(crate) fn lmm_view_to_fit(
     // `LmmResultView::dispersion` (change together) — every other field above
     // (β, se, vcov, tau2, varcorr) is already correct on σ̂²_int, since their
     // formulas cancel the compensating factor of `s`.
-    if let Some(w) = &opts.weights {
+    if let Some(w) = weights {
         let s = view.weight_scale;
         fit.dispersion *= s;
         fit.deviance -= w.iter().map(|v| (v / s).ln()).sum::<f64>();
@@ -540,6 +593,8 @@ pub(crate) fn lmm_view_to_fit(
 fn fit_lmm_into(
     ws: &mut LmmWorkspace,
     x: &[f64],
+    weights: Option<&[f64]>,
+    offset: Option<&[f64]>,
     ids: &crate::GroupIds,
     n: usize,
     p: usize,
@@ -555,16 +610,16 @@ fn fit_lmm_into(
     });
     let view = lmm_run_on(
         ws,
-        &opts.target_indices,
+        &opts.se_for.columns(p),
         warm_theta(start.as_ref()),
         None,
         map,
     );
-    lmm_view_to_fit(&view, x, ids, n, p, opts)
+    lmm_view_to_fit(&view, x, &[], 0, weights, offset, ids, n, p, opts)
 }
 /// LMM dispatch adapter. `cluster_ids`/`extra_ids` are the per-row level ids from
-/// the entry's [`GroupIds`]; `model` is the sizing-corrected spec (counts derived
-/// from those ids). Slope x-columns come from `model.re`. Mirrors `fit_glmm`.
+/// the entry's [`GroupIds`]; `sized` is the spec sized from those ids. Slope
+/// x-columns come from its `re`. Mirrors `fit_glmm`.
 /// `sparse` picks the kernel outright instead of asking `classify_design`, which
 /// is what makes this a forced baseline on either side of the router.
 /// Test-only baseline since the stable path dispatches through the unified core
@@ -574,15 +629,18 @@ fn fit_lmm_into(
 fn fit_mle(
     x: &[f64],
     y: &[f64],
+    weights: Option<&[f64]>,
+    offset: Option<&[f64]>,
     n: usize,
     p: usize,
-    model: &ModelSpec,
+    sized: &SizedSpec,
     cluster_ids: &[u32],
     extra_ids: &[Vec<u32>],
     start: Option<&StartValues>,
     opts: &FitOptions,
     sparse: bool,
 ) -> Fit {
+    let model = &sized.spec;
     let re = model
         .re
         .as_ref()
@@ -602,7 +660,7 @@ fn fit_mle(
         .expect("fit_mle requires a Gaussian mixed model");
     // Build workspace — allocates solver, suff-stats, fit scratch for this model shape
     let mut ws =
-        LmmWorkspace::for_cluster_spec_ext(p, model, n, &slope_cols, &extra_slope_cols, sparse);
+        LmmWorkspace::for_cluster_spec_ext(p, sized, &slope_cols, &extra_slope_cols, sparse);
     // As `fit::core::build_workspace` sets it; the sparse kernel takes it from
     // `accumulate_lmm_rows`.
     if let LmmKernel::Dense { fit, .. } = &mut ws.kernel {
@@ -612,23 +670,24 @@ fn fit_mle(
     // are the only place raw y enters) — the same convention `fit_ols_prebuilt` applies.
     // Mirrored by `fit::core`'s `Lmm` arm; change together.
     let y_shifted: Vec<f64>;
-    let y_eff: &[f64] = match &opts.offset {
+    let y_eff: &[f64] = match offset {
         Some(o) => {
             y_shifted = y.iter().zip(o).map(|(&yi, &oi)| yi - oi).collect();
             &y_shifted
         }
         None => y,
     };
-    let (map, x_mat) = as_given_design(x, n, p, ws.kernel.groupings(), opts.weights.as_deref());
+    let (map, x_mat) = as_given_design(x, n, p, ws.kernel.groupings(), weights);
     accumulate_lmm_rows(
         &mut ws,
         x_mat.as_ref().subrows(0, n),
+        x_mat.as_ref().subrows(0, n).subcols(0, 0),
         y_eff,
         n,
         p,
         cluster_ids,
         extra_ids,
-        opts.weights.as_deref(),
+        weights,
         false,
         criterion,
     );
@@ -637,21 +696,23 @@ fn fit_mle(
         primary: cluster_ids.to_vec(),
         extra: extra_ids.to_vec(),
     };
-    fit_lmm_into(&mut ws, x, &ids, n, p, opts, start, &map)
+    fit_lmm_into(&mut ws, x, weights, offset, &ids, n, p, opts, start, &map)
 }
 /// Test-only forced-NoZ entry: the NoZ↔Sparse cross-checks and timed sweeps
 /// must reach the dense kernel regardless of where `classify_design`'s
-/// performance boundary sits — going through `fit_cold` would compare Sparse
-/// against itself on any cell the router sends to Sparse. Takes the
-/// sizing-corrected spec, like `fit_mle`.
+/// performance boundary sits — going through the fit entry would compare Sparse
+/// against itself on any cell the router sends to Sparse. Takes the sized
+/// spec, like `fit_mle`.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)] // marshals the same surface as fit_mle
 pub(crate) fn fit_mle_noz_pub(
     x: &[f64],
     y: &[f64],
+    weights: Option<&[f64]>,
+    offset: Option<&[f64]>,
     n: usize,
     p: usize,
-    sized: &ModelSpec,
+    sized: &SizedSpec,
     cluster_ids: &[u32],
     extra_ids: &[Vec<u32>],
     start: Option<&StartValues>,
@@ -660,6 +721,8 @@ pub(crate) fn fit_mle_noz_pub(
     fit_mle(
         x,
         y,
+        weights,
+        offset,
         n,
         p,
         sized,
@@ -679,13 +742,28 @@ pub(crate) fn fit_mle_noz_pub(
 pub(crate) fn fit_mle_sparse_pub(
     x: &[f64],
     y: &[f64],
+    weights: Option<&[f64]>,
+    offset: Option<&[f64]>,
     n: usize,
     p: usize,
-    sized: &ModelSpec,
+    sized: &SizedSpec,
     cluster_ids: &[u32],
     extra_ids: &[Vec<u32>],
     start: Option<&StartValues>,
     opts: &FitOptions,
 ) -> Fit {
-    fit_mle(x, y, n, p, sized, cluster_ids, extra_ids, start, opts, true)
+    fit_mle(
+        x,
+        y,
+        weights,
+        offset,
+        n,
+        p,
+        sized,
+        cluster_ids,
+        extra_ids,
+        start,
+        opts,
+        true,
+    )
 }

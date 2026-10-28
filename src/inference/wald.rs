@@ -88,10 +88,6 @@ pub enum LinearNote {
     /// `Lβ = 0`, or on Type II the larger model too) did not converge, or its
     /// log-likelihood is not finite, so the statistic and p-value are NaN.
     ReducedNotConverged,
-    /// `L` touches a column that carries a random slope, which the refit
-    /// under `Lβ = 0` cannot leave out, so the row is the Wald χ² in place
-    /// of the likelihood-ratio test.
-    RandomSlopeColumn,
     /// The likelihood-ratio statistic `2(ℓ₁ − ℓ₀)` came out below zero by
     /// more than round-off: the model under `Lβ = 0` ended above the larger
     /// model's fit, so that fit did not reach its own optimum. The statistic

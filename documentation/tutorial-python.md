@@ -70,7 +70,9 @@ Points worth knowing at this layer:
   grouping factors. Treatment contrasts (R's default) code the factors, based
   on the column's **first level** — a `pandas.Categorical` uses the first
   category you declare; a plain string column declares no order and is sorted
-  lexicographically, as R's `factor()` does.
+  by code point, as R's `factor()` does in the C locale. R in another locale
+  can order labels that differ only in case (`"a"`, `"B"`) differently, so
+  declare the order with a `pandas.Categorical` when the two must match.
 - Misspell a keyword and you get a `TypeError` at the call site — the
   signature is explicit keywords, no options bag, so typos can't become
   silent no-ops.
@@ -208,6 +210,15 @@ them). It is returned by `fit`, never constructed by callers.
 | `term_table_type3`, `term_table_type2`, `term_table_type3_lrt`, `term_table_type2_lrt`, `term_test_auto`, `design_summary` | what `glmm.anova` reads: the per-term tables built when the fit was made (the likelihood-ratio ones `None` unless `anova_test` stored them), what `test="auto"` gives on this fit, and the design summary the exact random-intercept test needs (`None` off its envelope); read them through `glmm.anova` |
 | `dispersion_held` | the number passed as `dispersion=` (gamma / inverse-gaussian only); `None` when φ was estimated or the argument does not apply. When it is set, `summary()` labels the dispersion "fixed" |
 | `diagnostics` | dict with `converged`, `singular`, `aliased`, `boundary`, `pinned`, `notes` — the solver's own report; `converged`/`singular`/`aliased` above are `@property` forwarders over `diagnostics[...]`, kept at the top level for the most-read fields |
+
+**R² and the ICC.** `fit.r2()` gives a mixed model's marginal and conditional
+R² as `{"marginal": .., "conditional": ..}`, and `fit.icc()` its adjusted and
+unadjusted ICC as `{"adjusted": .., "unadjusted": ..}`, as
+`performance::r2_nakagawa` and `performance::icc` compute them. Both compute
+the values when called. On a Poisson or negative binomial GLMM each call
+refits the null model once, so keep the result. `summary()` prints the R² pair
+and the adjusted ICC in one line, or, on a Poisson or negative binomial GLMM,
+a line that points to `fit.r2()` and `fit.icc()`.
 
 **Warnings.** `fit` raises a warning for anything worth knowing about the fit
 (a kernel note such as ill-conditioning, an ignored argument, or a
@@ -352,6 +363,20 @@ conservative. Both calls take `nsim`
 and `seed` for the exact test; the default seed is fixed, so a call gives the
 same p-value every time. The full rules, every reference and every refusal
 are in [`hypothesis-tests.md`](hypothesis-tests.md).
+
+**Pairwise comparisons: `glmm.pairwise`.** On a model with a factor `f` in
+its fixed part, `glmm.pairwise(fit, "f")` compares every pair of its levels,
+as emmeans' `pairs(emmeans(fit, ~ f))`, and returns a `PairwiseTable` with
+emmeans' columns. Nothing is refitted. The default adjustment is Holm;
+emmeans' default is Tukey, so pass `adjust="tukey"` to get emmeans'
+p-values:
+
+```python
+pw = glmm.pairwise(fit, "f")                 # Holm
+glmm.pairwise(fit, "f", adjust="tukey")      # emmeans' default
+glmm.pairwise(fit, "f", by="h")              # within each level of h
+pw.confint(level=0.95)                       # lower.CL, upper.CL
+```
 
 ## 4. Warm starts
 

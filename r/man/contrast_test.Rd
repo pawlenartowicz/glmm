@@ -15,8 +15,9 @@ numeric vector of that length, for one row.}
 }
 \value{
 A \code{c("anova", "data.frame")} with one row named \code{contrast}, in the
-columns of the \link[=anova.fastglmm]{anova()} table of the same test (\verb{Sum Sq},
-\verb{Mean Sq}, \code{NumDF}, \code{DenDF}, \verb{F value}, \verb{Pr(>F)} for an F test; \code{Chisq},
+columns of the \link[=anova.fastglmm]{anova()} table of the same test without
+\code{Eta2_partial} (\verb{Sum Sq}, \verb{Mean Sq}, \code{NumDF}, \code{DenDF}, \verb{F value},
+\verb{Pr(>F)} for an F test; \code{Chisq},
 \code{Df}, \verb{Pr(>Chisq)} for the Wald chi-squared test), and a \code{heading}
 attribute naming the test, followed by the notes.
 }

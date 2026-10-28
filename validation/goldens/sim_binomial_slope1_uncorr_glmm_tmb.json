@@ -1,0 +1,30 @@
+{
+  "name": "sim_binomial_slope1_uncorr_glmm_tmb",
+  "engine": "glmmTMB::glmmTMB",
+  "engine_version": "1.1.14",
+  "kind": "glmm",
+  "data": "sim_binomial_slope1",
+  "family": "binomial",
+  "link": "logit",
+  "nagq": 1,
+  "r_formula": "y ~ 1 + x + (1 + x || g)",
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)", "x"],
+  "estimates": {
+    "beta": [0.407132389602959, 0.400063072784805],
+    "se_hessian": [0.149659447499674, 0.120981326768428],
+    "loglik": -310.491215069586,
+    "varcomp": [
+      {
+        "group": "g",
+        "terms": ["(Intercept)", "x"],
+        "stddev": [0.831016598363583, 0.252001823656519],
+        "corr": [
+          [1, 0],
+          [0, 1]
+        ]
+      }
+    ]
+  }
+}

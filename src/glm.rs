@@ -19,10 +19,13 @@
 //!     `dev_floor`). The other families keep `f = 0.1`.
 //!   - Both stops read the step that produced the current β, `max_i |Δηᵢ|`:
 //!     the fit also stops as converged when that step moved no η by more than
-//!     `STEP_ULPS` ULPs of max |η| (round-off), and a deviance stop whose step
-//!     still moved some η by more than `SEPARATION_STEP` is non-converged
-//!     (separation; skipped under the Gamma inverse and inverse-Gaussian 1/μ²
-//!     links)
+//!     `STEP_ULPS` ULPs of max |η|, or of the size of the terms η sums once
+//!     a pass has solved below the conditioning bound (round-off), and a stop
+//!     whose step still moved some η by more than `SEPARATION_STEP` is
+//!     non-converged (separation; skipped under the Gamma inverse and
+//!     inverse-Gaussian 1/μ² links). A stop whose round-off bound exceeds
+//!     `SEPARATION_STEP` is non-converged too, and separated when some η is
+//!     past `ETA_DIVERGENCE_CAP`: its step cannot show the move.
 //!   - Safety cap: `MAX_IRLS_ITERS = 50`
 //!   - ETA_DIVERGENCE_CAP divergence guard: a fit that ends unsettled (the
 //!     safety cap, an η its link does not evaluate, a failed solve), with
@@ -35,9 +38,10 @@
 //!     data pull it back (`family::eta_infeasible`), or a pass that halving
 //!     cannot bring back, ends the fit non-converged
 //!   - All-0 / all-1 short circuit
-//!   - Step-halving on a deviance increase, a non-finite deviance or an η the
-//!     link does not evaluate (R package glm2's rule; R's `glm.fit` halves only
-//!     on the last two), at most `PIRLS_MAX_HALVINGS` times per pass; on a
+//!   - Step-halving on a deviance increase (above `CANONICAL_RISE` on the
+//!     canonical links), a non-finite deviance or an η the link does not
+//!     evaluate (R package glm2's rule; R's `glm.fit` halves only on the last
+//!     two), at most `PIRLS_MAX_HALVINGS` times per pass; on a
 //!     link whose observed curvature differs from the Fisher weight, steps are
 //!     also halved once β has stepped back and forth three times running
 //!     (period-2 damping, see the accept step)
@@ -132,7 +136,9 @@ pub const ETA_DIVERGENCE_CAP: f64 = 30.0;
 /// Round-off stop, in ULPs of the linear predictor: when the step that
 /// produced the current β moved every η by at most
 /// `STEP_ULPS · ε · max_i |ηᵢ|` (max |η| floored at 1 where the divergence
-/// guard runs, see the step sweep), the fit stops as converged. At large means
+/// guard runs; from the first pass solved below the conditioning bound on,
+/// the size of the terms η sums in place of max |η|, see the step sweep), the
+/// fit stops as converged. At large means
 /// (Poisson or NB at μ ≳ 1e5) the deviance evaluated at float β carries
 /// round-off above `DEVIANCE_TOL`: a row's dᵢ moves by 2|yᵢ − μᵢ|·δηᵢ when its
 /// η rounds differently, and |yᵢ − μᵢ| grows like √μ. Measured spread over
@@ -142,6 +148,15 @@ pub const ETA_DIVERGENCE_CAP: f64 = 30.0;
 /// deviance rule at the same pass: a step this small changes the deviance by
 /// O(step²·information), far below `DEVIANCE_TOL`, unless round-off dominates.
 pub const STEP_ULPS: f64 = 16.0;
+/// Step-halving threshold on the canonical links, relative as in the stop
+/// rule. There Fisher scoring is Newton's method, but from a far start on a
+/// nearly singular X'WX a Newton step can overshoot and the fit runs off (an
+/// ill-conditioned logit design: +18% on the first bad pass, then without
+/// bound). The deviance's own round-off reaches about 1e-6 relative at
+/// Poisson counts near 2.6e10 (see `STEP_ULPS`), and halving at
+/// `DEVIANCE_TOL` moved 14 well-conditioned fits, so a canonical link halves
+/// only above this.
+pub const CANONICAL_RISE: f64 = 1e-3;
 /// Separation stop: a deviance stop whose last step still moved some η by more
 /// than this is non-converged. Without a finite maximum (complete or
 /// quasi-complete separation on a binomial link, a predictor category with
@@ -177,7 +192,9 @@ pub const WEIGHT_CLAMP: f64 = 1e-300;
 pub struct GlmFitView<'a> {
     /// length P — fitted coefficients (NaN-filled on non-converged paths), on
     /// the design `x` held (β̃ when the fit ran through a column map, see
-    /// `glm_irls_fit_mapped`).
+    /// `glm_irls_fit_mapped`). Under `se_unavailable` all finite, the column
+    /// `pivot_col` at its start value (0 from a cold start): it is not an
+    /// estimate.
     pub betas: &'a [f64],
     /// length T — `((X'WX)⁻¹)_jj` for each target, in the caller's units
     /// under a column map: `(B(X̃'WX̃)⁻¹Bᵀ)ₜₜ`.
@@ -186,14 +203,15 @@ pub struct GlmFitView<'a> {
     /// `CritValueTable`.
     pub t_sq: &'a [f64],
     /// Cached lower-triangular Cholesky factor L of the last accepted X'WX.
-    /// Valid only when `converged == true` (stale-or-zero otherwise — same
-    /// staleness contract as `OlsFitView::factor`).
+    /// Valid only when `converged == true` and `se_unavailable == false`
+    /// (stale-or-zero otherwise — same staleness contract as
+    /// `OlsFitView::factor`).
     pub l: MatRef<'a, f64>,
     /// Number of IRLS iterations completed (0 on the short-circuit / non-converged paths).
     pub n_iter: u32,
     /// Whether the deviance fixpoint `|Δdeviance| / (|deviance| + f) < DEVIANCE_TOL`, or the
     /// round-off stop (`STEP_ULPS`), was reached before `MAX_IRLS_ITERS` without the separation
-    /// stop (`SEPARATION_STEP`) firing.
+    /// stop (`SEPARATION_STEP`) firing, with a round-off bound no larger than `SEPARATION_STEP`.
     pub converged: bool,
     /// Whether the fit ended because no finite maximum seems to exist: the separation stop or
     /// the divergence guard (`ETA_DIVERGENCE_CAP`) judged the unsettled end of a binomial,
@@ -226,10 +244,19 @@ pub struct GlmFitView<'a> {
     /// even in principle.
     ///
     /// `NaN` / `0` on every non-converged and short-circuit return — there is no
-    /// converged `X'WX` to measure.
+    /// converged `X'WX` to measure. `0.0` under `se_unavailable`, with
+    /// `pivot_col` the first column that broke down.
     pub pivot: f64,
     /// Column attaining `pivot`. Meaningless when `pivot` is NaN.
     pub pivot_col: u32,
+    /// The fit converged, but the QR of `√W·X` at its last solve had a zero or
+    /// non-finite diagonal at column `pivot_col` (and possibly others after
+    /// it) while `X'WX` there is positive: the column is not separated from
+    /// the ones before it under the converged weights. `betas`, `deviance`
+    /// and `mu` are the fit's; `var_diag` and `t_sq` are NaN, `pivot` is 0.
+    /// The IRLS step along such a column is zero, so it stays at its start
+    /// value. `false` on every other return.
+    pub se_unavailable: bool,
 }
 
 /// Caller-owned scratch borrowed from `SimWorkspace` field-by-field. Built
@@ -291,20 +318,23 @@ pub fn sigmoid_stable(eta: f64) -> f64 {
 // IRLS kernel
 // ---------------------------------------------------------------------------
 
+/// Whether some row's η sits more than `ETA_DIVERGENCE_CAP` from its
+/// null-model location `oᵢ + eta_null`. A NaN η counts as past the cap.
+fn past_cap(eta: &[f64], offset: Option<&[f64]>, eta_null: f64) -> bool {
+    eta.iter().enumerate().any(|(i, &e)| {
+        let d = (e - offset.map_or(0.0, |o| o[i]) - eta_null).abs();
+        d.is_nan() || d > ETA_DIVERGENCE_CAP
+    })
+}
+
 /// The divergence verdict on a fit that ended without settling: some row's
-/// η sits more than `ETA_DIVERGENCE_CAP` from its null-model location
-/// `oᵢ + eta_null` and the last step still moved some η by more than
-/// `SEPARATION_STEP`, so the fit is running off to infinity. A NaN η counts as
-/// past the cap; a NaN step is not a moving step, and neither is the infinite
-/// placeholder of a fit that ended before any step was accepted (a warm start
-/// already past the cap whose first solve failed is not separation).
+/// η is past the cap (`past_cap`) and the last step still moved some η by
+/// more than `SEPARATION_STEP`, so the fit is running off to infinity. A NaN
+/// step is not a moving step, and neither is the infinite placeholder of a fit
+/// that ended before any step was accepted (a warm start already past the cap
+/// whose first solve failed is not separation).
 fn runs_off(eta: &[f64], offset: Option<&[f64]>, eta_null: f64, step_max: f64) -> bool {
-    step_max > SEPARATION_STEP
-        && step_max.is_finite()
-        && eta.iter().enumerate().any(|(i, &e)| {
-            let d = (e - offset.map_or(0.0, |o| o[i]) - eta_null).abs();
-            d.is_nan() || d > ETA_DIVERGENCE_CAP
-        })
+    step_max > SEPARATION_STEP && step_max.is_finite() && past_cap(eta, offset, eta_null)
 }
 
 /// η = o + Xβ as a column sweep (axpy over x's columns), each ηᵢ accumulated
@@ -323,6 +353,27 @@ fn fill_eta(x: MatRef<'_, f64>, beta: &[f64], offset: Option<&[f64]>, eta: &mut 
             *e += oi;
         }
     }
+}
+
+/// The size of the terms `fill_eta` sums, `maxᵢ (|oᵢ| + Σⱼ |xᵢⱼβⱼ|)`, in the
+/// same column sweep; `buf` (length n) is scratch. ηᵢ's round-off scales with
+/// it, not with |ηᵢ|: terms that cancel leave their rounding behind (Higham,
+/// *Accuracy and Stability of Numerical Algorithms*, 2nd ed., §4.2).
+fn term_size(x: MatRef<'_, f64>, beta: &[f64], offset: Option<&[f64]>, buf: &mut [f64]) -> f64 {
+    match offset {
+        Some(o) => {
+            for (t, &oi) in buf.iter_mut().zip(o) {
+                *t = oi.abs();
+            }
+        }
+        None => buf.fill(0.0),
+    }
+    for (j, &b_j) in beta.iter().enumerate() {
+        for (i, t) in buf.iter_mut().enumerate() {
+            *t += (x[(i, j)] * b_j).abs();
+        }
+    }
+    buf.iter().fold(0.0, |m, &t| m.max(t))
 }
 
 /// Fit a GLM via adaptive IRLS. All buffers live in `scratch`; the returned view
@@ -464,6 +515,7 @@ pub(crate) fn glm_irls_fit_mapped<'a>(
             mu: &irls_p[..n],
             pivot: f64::NAN,
             pivot_col: 0,
+            se_unavailable: false,
         };
     }
 
@@ -476,6 +528,7 @@ pub(crate) fn glm_irls_fit_mapped<'a>(
     for &yi in &y[..n] {
         y_sum += yi;
     }
+    // Mirrored by `crate::fit::glmm::glm_warm_start_beta` — change together.
     if matches!(family, Family::Binomial { .. }) && (y_sum <= 0.0 || y_sum >= n as f64) {
         return GlmFitView {
             betas: &irls_betas[..p],
@@ -490,6 +543,7 @@ pub(crate) fn glm_irls_fit_mapped<'a>(
             mu: &irls_p[..n],
             pivot: f64::NAN,
             pivot_col: 0,
+            se_unavailable: false,
         };
     }
 
@@ -748,29 +802,39 @@ pub(crate) fn glm_irls_fit_mapped<'a>(
         irls_u_scratch[..p].fill(0.0);
     }
 
-    // Step-halving runs off the canonical links (logit, Poisson/log): there
-    // the deviance is convex in β and Fisher scoring is Newton's method, and
-    // the unweighted-logit hot path stays one family pass per IRLS pass. At
-    // large Poisson counts the deviance's round-off would also set it off on
-    // noise (see `STEP_ULPS`).
-    let halving_active = !crate::family::is_canonical(family);
+    // On the canonical links (logit, Poisson/log) the deviance is convex in β
+    // and Fisher scoring is Newton's method, so a pass rarely raises the
+    // deviance; a rise there halves only above `CANONICAL_RISE`, where it is
+    // an overshoot rather than round-off. An ordinary pass, and so the
+    // unweighted-logit hot path, stays one family pass per IRLS pass.
+    let canonical = crate::family::is_canonical(family);
 
     // A nearly collinear X'WX: a pivot ratio below `lmm::GRAM_PIVOT_MIN` (whose
-    // comment says why that bound). The Gram squares cond(X), so the solve for
-    // β_new carries an error of about cond(X)²·ε relative to β, and on
-    // `[1, a, a + δb]` at cond(X) ≈ 2e6 that moves η by 1e-3 per pass: the
-    // deviance never settles and the fit runs out its budget. From the first
-    // such factor on, every pass solves for the step instead, β_new − β from
-    // the working residual z − η (= z − o − Xβ), so the solve's relative
-    // error falls on a step that shrinks to zero and the fixpoint is the one
-    // the residual defines. The factor the SEs read comes from a QR of √W·X
-    // at the same weights (`lmm::DesignQr`, as the OLS route takes it): the
-    // Cholesky's own L is off by the same cond(X)²·ε. A design that never
-    // crosses the bound keeps the direct solve and allocates nothing more.
+    // comment says why that bound), or a Cholesky that fails. The Gram squares
+    // cond(X), so a solve on it carries an error of about cond(X)²·ε relative
+    // to β, and on `[1, a, a + δb]` at cond(X) ≈ 2e6 that moves η by 1e-3 per
+    // pass: the deviance never settles and the fit runs out its budget. Such a
+    // pass solves on `X̃ = X·U⁻¹` instead, `U` from a QR of √W·X at that pass's
+    // weights (`lmm::DesignQr`, as the OLS route and the GLMM's Schur take it):
+    // the Cholesky of X̃'WX̃ = U⁻ᵀX'WXU⁻¹ is well conditioned, and β = U⁻¹β̃.
+    // From the first such pass on, every pass also solves for the step,
+    // β_new − β from the working residual z − η (= z − o − Xβ), so the solve's
+    // relative error falls on a step that shrinks to zero and the fixpoint is
+    // the one the residual defines. The factor the SEs read is then Uᵀ·L̃, L̃
+    // the Cholesky factor of X̃'WX̃. Where the QR has a zero or non-finite
+    // diagonal on a column that is not zero under the weights, the column has
+    // broken down: the pass takes a zero step along it, and a fit whose last
+    // solve broke down settles with its SEs withheld (`se_unavailable`).
+    // Where that column is zero under the weights the pass keeps the Gram's
+    // own factor, or fails with it. A design that never crosses the bound
+    // keeps the direct solve and allocates nothing more.
     let mut solve_step = false;
-    let mut design_qr: Option<crate::lmm::DesignQr> = None;
-    // Whether the factor of `last_chol`'s pass is to be read off `design_qr`.
+    // The QR and its mask of broken columns.
+    let mut design_qr: Option<(crate::lmm::DesignQr, Vec<bool>)> = None;
+    // Whether `last_chol` factors X̃'WX̃ on `design_qr`'s `U`.
     let mut l_from_qr = false;
+    // The first broken column of the last solve pass, if any.
+    let mut broken_col: Option<usize> = None;
 
     // IRLS: each pass is a weighted least squares solve
     // β_new = (X'WX)⁻¹ X'Wz on the working response z = η + (y − μ)/W, μ = σ(η).
@@ -819,10 +883,10 @@ pub(crate) fn glm_irls_fit_mapped<'a>(
         // Step-halving (Marschner 2011, R package glm2), in PIRLS's
         // retrospective form: when the deviance at the β the last solve
         // produced rises above the accepted one by more than the stop rule's
-        // band, is not finite, or comes from a raw η the link does not
-        // evaluate, β moves half way back toward the accepted β (held in
-        // `irls_xtwz`, free until this pass's GEMM) and the pass is redone, up
-        // to `PIRLS_MAX_HALVINGS` times. Fisher steps raise the deviance where
+        // band (`CANONICAL_RISE` on the canonical links), is not finite, or
+        // comes from a raw η the link does not evaluate, β moves half way back
+        // toward the accepted β (held in `irls_xtwz`, free until this pass's
+        // GEMM) and the pass is redone, up to `PIRLS_MAX_HALVINGS` times. Fisher steps raise the deviance where
         // the observed curvature is far from the expected one: an
         // inverse-Gaussian/log fit from the null-model start can step from
         // deviance 32 to 37 to 79 to 1575 and run off to β ~ 1e74 while a
@@ -857,8 +921,13 @@ pub(crate) fn glm_irls_fit_mapped<'a>(
                 &mut irls_z[..n],
             );
             let rise = (dev - deviance_accepted) / (dev.abs() + dev_floor);
-            let worse = inf || !dev.is_finite() || rise > DEVIANCE_TOL;
-            if !worse || !halving_active || !deviance_accepted.is_finite() {
+            let rise_tol = if canonical {
+                CANONICAL_RISE
+            } else {
+                DEVIANCE_TOL
+            };
+            let worse = inf || !dev.is_finite() || rise > rise_tol;
+            if !worse || !deviance_accepted.is_finite() {
                 break (dev, inf);
             }
             // A Newton step that raised the deviance gives way to the Fisher
@@ -880,6 +949,10 @@ pub(crate) fn glm_irls_fit_mapped<'a>(
                         s_max = d.abs();
                     }
                     e_max = e_max.max(irls_eta[i].abs());
+                }
+                // `irls_z` is free: the redone pass rewrites it.
+                if solve_step {
+                    e_max = term_size(x, &irls_betas[..p], offset, &mut irls_z[..n]);
                 }
                 if eta_guard_active {
                     e_max = e_max.max(1.0);
@@ -924,8 +997,8 @@ pub(crate) fn glm_irls_fit_mapped<'a>(
         }
         // z − o: the WLS below solves β from X alone, so the offset's fixed
         // contribution must leave the working response. Solving for the step,
-        // the right-hand side is z − η instead: `solve_step` is only set after
-        // a solve, and from the first accept on η = o + Xβ.
+        // the right-hand side is z − η instead: `solve_step` is only set by a
+        // pass's solve, and from the first accept on η = o + Xβ.
         let step_form = solve_step;
         if step_form {
             for i in 0..n {
@@ -946,14 +1019,25 @@ pub(crate) fn glm_irls_fit_mapped<'a>(
         // by more than round-off (`STEP_ULPS`) stops the fit as converged even
         // when the deviance's own round-off keeps the relative rule from
         // firing. A deviance stop with the step still moving some η by more
-        // than `SEPARATION_STEP` is separation, not convergence.
+        // than `SEPARATION_STEP` is separation, not convergence. A round-off
+        // bound above `SEPARATION_STEP` means the step cannot show a move of
+        // that size, so the stop cannot tell the two apart: the fit is not
+        // converged, and separated when some η is past the cap. That is where a
+        // fit without a finite maximum ends once a solve on a nearly singular
+        // X'WX throws η out to 1e15 or beyond: η then absorbs every later step
+        // (o + Xβ rounds to the same η), the step reads 0 and the deviance
+        // repeats exactly, so both stops fire on a fit that is running off.
         if iter > 0 {
             deviance_final = deviance;
             let settled =
                 (deviance - deviance_prev).abs() / (deviance.abs() + dev_floor) < DEVIANCE_TOL;
             if settled || (step_max <= step_tiny && deviance.is_finite()) {
-                diverged = eta_guard_active && step_max > SEPARATION_STEP;
-                converged = !diverged;
+                if eta_guard_active && step_tiny > SEPARATION_STEP {
+                    diverged = past_cap(&irls_eta[..n], offset, eta_null);
+                } else {
+                    diverged = eta_guard_active && step_max > SEPARATION_STEP;
+                    converged = !diverged;
+                }
                 break;
             }
             deviance_prev = deviance;
@@ -1003,14 +1087,98 @@ pub(crate) fn glm_irls_fit_mapped<'a>(
         // Cholesky of X'WX on the lower triangle. `SeqLlt` returns an owned
         // factor (it does not consume irls_xtwx, which is
         // rebuilt from scratch each iter anyway). The factor drives the in-place
-        // β solve below; its L is materialised once after the loop.
-        let chol = match crate::linalg::SeqLlt::new(irls_xtwx.rb()) {
-            Some(c) => c,
-            None => {
-                had_pd_failure = true;
-                break;
+        // β solve below; its L is materialised once after the loop. A factor
+        // that fails or whose pivot ratio is below the bound hands the solve to
+        // `X̃ = X·U⁻¹` (see `solve_step`); the ratio is read before any solve,
+        // so a pass at or above the bound runs the direct solve unchanged.
+        let gram_chol = crate::linalg::SeqLlt::new(irls_xtwx.rb());
+        let below = gram_chol
+            .as_ref()
+            .is_none_or(|c| crate::ols::min_pivot_ratio(c.L(), p).0 < crate::lmm::GRAM_PIVOT_MIN);
+        // `irls_betas_new` is free until the copy below: the Givens and row scratch.
+        // A column whose `R_jj` is zero or not finite while `(X'WX)_jj` is
+        // positive and finite has broken down: the pass solves on `X̃` with a
+        // zero step along it (below). A broken column whose `(X'WX)_jj` is zero
+        // or not finite (a column zero under the weights) keeps the Gram's path.
+        let w = &irls_w[..n];
+        l_from_qr = false;
+        let mut breakdown = None;
+        if below {
+            let (qr, broken) = design_qr
+                .get_or_insert_with(|| (crate::lmm::DesignQr::identity(p), vec![false; p]));
+            if qr.set_from_rows_marking(x, |i| w[i].sqrt(), irls_betas_new, broken) {
+                l_from_qr = true;
+            } else if (0..p).all(|j| {
+                let g = irls_xtwx[(j, j)];
+                !broken[j] || (g.is_finite() && g > 0.0)
+            }) {
+                l_from_qr = true;
+                breakdown = broken.iter().position(|&b| b);
             }
+        }
+        let chol = if let (true, Some((qr, broken))) = (l_from_qr, &design_qr) {
+            // √W·X̃ into `irls_wx` (W∘X is spent once X'WX and X'Wz are
+            // formed), its Gram and X̃'Wz = (√W·X̃)'(√W·z); `irls_z` is dead
+            // after this right-hand side.
+            {
+                let wx = &mut irls_wx[..n * p];
+                let row = &mut irls_betas_new[..p];
+                for i in 0..n {
+                    let sw = w[i].sqrt();
+                    for (j, r) in row.iter_mut().enumerate() {
+                        *r = sw * x[(i, j)];
+                    }
+                    qr.solve_row(row);
+                    for (j, &r) in row.iter().enumerate() {
+                        wx[j * n + i] = r;
+                    }
+                    irls_z[i] *= sw;
+                }
+            }
+            let wxt = MatRef::from_column_major_slice(&irls_wx[..n * p], n, p);
+            triangular::matmul(
+                irls_xtwx.rb_mut(),
+                BlockStructure::TriangularLower,
+                Accum::Replace,
+                wxt.transpose(),
+                BlockStructure::Rectangular,
+                wxt,
+                BlockStructure::Rectangular,
+                1.0,
+                Par::Seq,
+            );
+            matmul(
+                MatMut::from_column_major_slice_mut(&mut irls_xtwz[..p], p, 1),
+                Accum::Replace,
+                wxt.transpose(),
+                MatRef::from_column_major_slice(&irls_z[..n], n, 1),
+                1.0,
+                Par::Seq,
+            );
+            // The zero step along a broken column `j`: row and column `j` of
+            // X̃'WX̃ become `e_j` (the column of X̃ is rounding there), and the
+            // right-hand side is 0 for the step, or β̃_j = β_j (row `j` of `U`
+            // is `e_j`) for β, so the solve leaves β_j where it is.
+            if breakdown.is_some() {
+                for j in (0..p).filter(|&j| broken[j]) {
+                    for k in 0..p {
+                        irls_xtwx[(j, k)] = 0.0;
+                        irls_xtwx[(k, j)] = 0.0;
+                    }
+                    irls_xtwx[(j, j)] = 1.0;
+                    irls_xtwz[j] = if step_form { 0.0 } else { irls_betas[j] };
+                }
+            }
+            crate::linalg::SeqLlt::new(irls_xtwx.rb())
+        } else {
+            gram_chol
         };
+        let Some(chol) = chol else {
+            had_pd_failure = true;
+            break;
+        };
+        solve_step |= below;
+        broken_col = breakdown;
 
         // Solve β_new = L⁻ᵀ L⁻¹ · X'Wz using chol.solve_in_place.
         // First write xtwz into a 1-col view; chol.solve_in_place expects a
@@ -1020,15 +1188,8 @@ pub(crate) fn glm_irls_fit_mapped<'a>(
             let mut rhs = MatMut::from_column_major_slice_mut(irls_xtwz, p, 1usize);
             chol.solve_in_place(rhs.rb_mut());
         }
-        if crate::ols::min_pivot_ratio(chol.L(), p).0 < crate::lmm::GRAM_PIVOT_MIN {
-            solve_step = true;
-            // `irls_betas_new` is free until the copy below: the Givens scratch.
-            let w = &irls_w[..n];
-            l_from_qr = design_qr
-                .get_or_insert_with(|| crate::lmm::DesignQr::identity(p))
-                .set_from_rows(x, |i| w[i].sqrt(), irls_betas_new);
-        } else {
-            l_from_qr = false;
+        if let (true, Some((qr, _))) = (l_from_qr, &design_qr) {
+            qr.map_beta(&mut irls_xtwz[..p]);
         }
         irls_betas_new[..p].copy_from_slice(&irls_xtwz[..p]);
         // Newton step on a link whose exact curvature differs from Fisher:
@@ -1044,8 +1205,9 @@ pub(crate) fn glm_irls_fit_mapped<'a>(
         // z are dead once solved: `irls_w` takes W_obs, `irls_z` the
         // right-hand side's rows. Mirrors the PIRLS Newton step
         // (`glmm::pirls::observed_weights_in_place`).
+        // Not on a pass with a broken column: the raw Gram moves it.
         let mut newton_used = false;
-        if osc_guard_active && deviance_accepted.is_finite() {
+        if osc_guard_active && deviance_accepted.is_finite() && breakdown.is_none() {
             for i in 0..n {
                 let pw = prior_w.map_or(1.0, |w| w[i]);
                 let (e, mu) = (irls_eta[i], irls_p[i]);
@@ -1196,7 +1358,15 @@ pub(crate) fn glm_irls_fit_mapped<'a>(
         // there η is unit-free up to a shift (a probability scale, or ln μ), so
         // |η| ≈ 0 is not small. On the two reciprocal links η carries the
         // response's units, and a floor would turn into a unit-dependent
-        // absolute bound.
+        // absolute bound. On a pass that solves for the step (see
+        // `solve_step`) the bound is relative to the size of the terms η sums
+        // (`term_size`) instead: on `[1, a, a + δb]` at δ = 2⁻²⁷ η sums terms
+        // near 1e8 that cancel to order 1, so η carries about 1e-8 of rounding,
+        // which moves the deviance by more than `DEVIANCE_TOL` from pass to
+        // pass while max |η| puts the bound near 1e-14. A fit that never
+        // crosses the bound keeps max |η| and skips the extra sweep: with a
+        // weighted pivot ratio above 1e-3 its columns are far from collinear,
+        // so its terms cannot cancel by much.
         let (mut s_max, mut e_max) = (0.0f64, 0.0f64);
         for i in 0..n {
             let d = (irls_eta[i] - irls_z[i]).abs();
@@ -1204,6 +1374,10 @@ pub(crate) fn glm_irls_fit_mapped<'a>(
                 s_max = d;
             }
             e_max = e_max.max(irls_eta[i].abs());
+        }
+        // The old η in `irls_z` is spent.
+        if solve_step {
+            e_max = term_size(x, &irls_betas[..p], offset, &mut irls_z[..n]);
         }
         if eta_guard_active {
             e_max = e_max.max(1.0);
@@ -1246,29 +1420,46 @@ pub(crate) fn glm_irls_fit_mapped<'a>(
             mu: &irls_p[..n],
             pivot: f64::NAN,
             pivot_col: 0,
+            se_unavailable: false,
+        };
+    }
+
+    // The last solve broke down: the estimates and the deviance stand, the SEs
+    // are withheld. `l` is not materialised.
+    if let Some(j) = broken_col {
+        irls_var_diag[..t].fill(f64::NAN);
+        irls_t_sq[..t].fill(f64::NAN);
+        return GlmFitView {
+            betas: &irls_betas[..p],
+            var_diag: &irls_var_diag[..t],
+            t_sq: &irls_t_sq[..t],
+            l: irls_l.into_const(),
+            n_iter,
+            converged: true,
+            separated: false,
+            deviance: deviance_final,
+            deviance_null,
+            mu: &irls_p[..n],
+            pivot: 0.0,
+            pivot_col: j as u32,
+            se_unavailable: true,
         };
     }
 
     // Materialise the cached lower-triangular L of the last accepted X'WX —
     // once, now that the fit has converged (deferred from the IRLS loop). On
     // the converged path `last_chol` is always `Some`: `converged` is only set
-    // after a successful factorization stashed it. On a nearly collinear X'WX
-    // L is Rᵀ = Uᵀ·D instead, from the QR of √W·X at that pass's weights (see
-    // `solve_step`).
-    if let (true, Some(qr)) = (l_from_qr, &design_qr) {
-        let d = qr.r_diag();
-        for j in 0..p {
-            for i in 0..p {
-                irls_l[(i, j)] = if i == j { d[j] } else { 0.0 };
-            }
-        }
-        qr.map_factor(irls_l.rb_mut());
-    } else if let Some(chol) = last_chol {
+    // after a successful factorization stashed it. On a pass solved on X̃ the
+    // stashed factor is X̃'WX̃'s, and L = Uᵀ·L̃ (see `solve_step`).
+    if let Some(chol) = last_chol {
         let l = chol.L();
         for j in 0..p {
             for i in 0..p {
                 irls_l[(i, j)] = if i >= j { l[(i, j)] } else { 0.0 };
             }
+        }
+        if let (true, Some((qr, _))) = (l_from_qr, &design_qr) {
+            qr.map_factor(irls_l.rb_mut());
         }
     }
 
@@ -1316,6 +1507,7 @@ pub(crate) fn glm_irls_fit_mapped<'a>(
         mu: &irls_p[..n],
         pivot,
         pivot_col: pivot_col as u32,
+        se_unavailable: false,
     }
 }
 
@@ -1347,41 +1539,6 @@ mod tests {
             irls_l: ws.irls_l.as_mut(),
             irls_wx: &mut ws.irls_wx,
         }
-    }
-
-    #[test]
-    fn glm_rank_deficient_design() {
-        // X with an all-zero column → X'WX has an exactly zero pivot, which the
-        // Cholesky refuses on every rounding.
-        let n = 100;
-        let p = 3;
-        let mut x = Mat::<f64>::zeros(n, p);
-        for i in 0..n {
-            x[(i, 0)] = 1.0;
-            x[(i, 1)] = ((i as f64) / (n as f64)) - 0.5;
-            // Column 2 stays all zeros.
-        }
-        // Build y with mixed 0/1 to avoid the all-0/all-1 short circuit.
-        let y: Vec<f64> = (0..n).map(|i| if i % 2 == 0 { 1.0 } else { 0.0 }).collect();
-        let mut ws = TestWs::new(n, p, 0);
-        let targets: Vec<u32> = vec![1, 2];
-        let fit = glm_irls_fit(
-            crate::Family::Binomial {
-                link: crate::BinomialLink::Logit,
-            },
-            f64::NAN,
-            x.as_ref(),
-            &y,
-            &targets,
-            None,
-            None,
-            None,
-            glm_scratch(&mut ws),
-        );
-        assert!(
-            !fit.converged,
-            "rank-deficient design must report non-converged"
-        );
     }
 
     /// All-0 and all-1 Bernoulli y short-circuit (n_iter 0, not converged)
@@ -1479,6 +1636,64 @@ mod tests {
         );
         // β is left at the last iterate, not NaN-filled.
         assert!(fit.betas.iter().all(|b| b.is_finite()), "{:?}", fit.betas);
+    }
+
+    /// Separation that crosses the bound: `[1, x, x + d]` with `d = ±1` on a
+    /// block of ten rows whose outcomes separate along `d` (`y = 1` where
+    /// `d = 1`), pushed to the edge by an offset of −12, and `d = 0` elsewhere.
+    /// As the block's weights vanish `X'WX` turns singular, the solve on the
+    /// QR factor throws β₁ and β₂ out to ∓3e34, and η then absorbs every later
+    /// step: the step reads 0 and the deviance repeats, so both stops fire on
+    /// a fit that is running off. Their round-off bound is far above
+    /// `SEPARATION_STEP`, so the step cannot show a move and η decides, as on
+    /// a fit that runs out its budget.
+    #[test]
+    fn glm_separation_past_the_round_off_bound_is_not_converged() {
+        let (n, m) = (60, 10);
+        let mut st = 1u64;
+        let mut x = Mat::<f64>::zeros(n, 3);
+        let (mut y, mut offset) = (vec![0.0; n], vec![0.0; n]);
+        for i in 0..n {
+            let x1 = 2.0 * crate::fit::common_tests::lcg(&mut st);
+            let u = 0.5 * (crate::fit::common_tests::lcg(&mut st) + 1.0);
+            let d = match (i < m, i % 2) {
+                (true, 0) => 1.0,
+                (true, _) => -1.0,
+                _ => 0.0,
+            };
+            x[(i, 0)] = 1.0;
+            x[(i, 1)] = x1;
+            x[(i, 2)] = x1 + d;
+            y[i] = if i < m {
+                f64::from(u8::from(d > 0.0))
+            } else {
+                f64::from(u8::from(u < 1.0 / (1.0 + (-0.3 * x1).exp())))
+            };
+            if i < m {
+                offset[i] = -12.0;
+            }
+        }
+        let mut ws = TestWs::new(n, 3, 0);
+        let fit = glm_irls_fit(
+            crate::Family::Binomial {
+                link: crate::BinomialLink::Logit,
+            },
+            f64::NAN,
+            x.as_ref(),
+            &y,
+            &[0, 1, 2],
+            None,
+            None,
+            Some(&offset),
+            glm_scratch(&mut ws),
+        );
+        assert!(
+            !fit.converged && fit.separated,
+            "converged {}, separated {}, β {:?}",
+            fit.converged,
+            fit.separated,
+            fit.betas
+        );
     }
 
     /// Quasi-separation on the cloglog upper tail: one category whose rows are
@@ -1592,8 +1807,6 @@ mod tests {
     /// `beta_start` seeds β and η directly instead of the family's cold-start
     /// rule, so warm-starting at an already-converged optimum should settle
     /// in far fewer IRLS iterations than a cold start and land on the same β.
-    /// Every production call site passes `beta_start: None`, so without this
-    /// test the branch that copies `b0` into `irls_betas`/`irls_eta` never runs.
     #[test]
     fn glm_irls_fit_warm_start_reaches_same_optimum_in_fewer_iterations() {
         let n = 200;
@@ -1845,6 +2058,272 @@ mod tests {
             "poisson slope variance must scale by s²: {rescaled_var} vs {}",
             v1[1]
         );
+    }
+
+    /// A GLM whose `X'WX` factor fails solves its step on `X·U⁻¹`, `U` from the
+    /// QR of `√W·X`, and reaches the maximum. On `entangled_dyadic_designs` at
+    /// `δ = 2⁻²⁷` (pivot ratio about 5e-17) the Gram is singular to rounding,
+    /// and a solve from it ends every arm not converged with β₂ off by 16% to
+    /// 100%. The `[1, a, b]` twin spans the same space, so the entangled
+    /// coefficient is the twin's divided by `δ`, its variance by `δ²`. Arms:
+    /// logit; probit, whose Newton step keeps the raw Gram; Poisson with an
+    /// offset and prior weights, whose right-hand side must stay `z − o` and
+    /// then `z − η`. Logit and Poisson also exercise the round-off stop on the
+    /// size of the terms: η = Xβ sums terms near 1e8 (β₂ ≈ 3e6, |a| ≤ 50) that
+    /// cancel to order 1, so η carries about 1e-8 of rounding and the deviance
+    /// moves by more than the relative rule allows from one pass to the next.
+    /// Measured against the twin (relative): logit deviance 1.5e-10, β₂ 1.0e-9,
+    /// `var_diag₂` 1.0e-9; probit 5.6e-10, 9.3e-6 (6e-5 of its SE, the stop
+    /// rule's slack on a linearly converging link) and 2.1e-6; Poisson 6.4e-11,
+    /// 1.4e-9 and 5.9e-7.
+    #[test]
+    fn glm_steps_through_the_design_qr_when_the_gram_factor_fails() {
+        let n = 400;
+        let (xv, xrv, delta) = crate::fit::common_tests::entangled_dyadic_designs(n, 27);
+        let col_major = |v: &[f64]| Mat::<f64>::from_fn(n, 3, |i, j| v[3 * i + j]);
+        let (x, xr) = (col_major(&xv), col_major(&xrv));
+        let offset: Vec<f64> = (0..n).map(|i| 0.1 * ((i % 7) as f64 - 3.0)).collect();
+        let w: Vec<f64> = (0..n).map(|i| 0.5 + 0.25 * (i % 5) as f64).collect();
+        // (family, and the relative tolerances on β₂, the deviance and var₂).
+        let arms = [
+            (
+                Family::Binomial {
+                    link: BinomialLink::Logit,
+                },
+                1e-8,
+                1e-9,
+                1e-8,
+            ),
+            (
+                Family::Binomial {
+                    link: BinomialLink::Probit,
+                },
+                1e-4,
+                1e-8,
+                1e-5,
+            ),
+            (
+                Family::Poisson {
+                    link: crate::PoissonLink::Log,
+                },
+                1e-8,
+                1e-9,
+                1e-5,
+            ),
+        ];
+        let targets = [0u32, 1, 2];
+        for (family, beta_tol, dev_tol, var_tol) in arms {
+            let poisson = matches!(family, Family::Poisson { .. });
+            let (off, pw) = if poisson {
+                (Some(&offset[..]), Some(&w[..]))
+            } else {
+                (None, None)
+            };
+            let mut st = 7u64;
+            let y: Vec<f64> = (0..n)
+                .map(|i| {
+                    let eta = 0.2 + 0.02 * xrv[3 * i + 1] + 0.02 * xrv[3 * i + 2];
+                    let u = 0.5 * (crate::fit::common_tests::lcg(&mut st) + 1.0);
+                    if poisson {
+                        // Inverse-CDF Poisson draw.
+                        let mu = (eta + offset[i]).exp();
+                        let (mut k, mut pk) = (0.0, (-mu).exp());
+                        let mut cdf = pk;
+                        while u > cdf {
+                            k += 1.0;
+                            pk *= mu / k;
+                            cdf += pk;
+                        }
+                        k
+                    } else {
+                        f64::from(u8::from(u < 1.0 / (1.0 + (-eta).exp())))
+                    }
+                })
+                .collect();
+            let fit = |x: MatRef<'_, f64>| {
+                let mut ws = TestWs::new(n, 3, 0);
+                let v = glm_irls_fit(
+                    family,
+                    f64::NAN,
+                    x,
+                    &y,
+                    &targets,
+                    None,
+                    pw,
+                    off,
+                    glm_scratch(&mut ws),
+                );
+                (v.converged, v.pivot, v.deviance, v.betas[2], v.var_diag[2])
+            };
+            let (conv, pivot, dev, beta, var) = fit(x.as_ref());
+            let (conv_r, _, dev_r, beta_r, var_r) = fit(xr.as_ref());
+            assert!(conv_r, "{family:?}: the twin converges");
+            let want_beta = beta_r / delta;
+            assert!(
+                (beta - want_beta).abs() <= beta_tol * want_beta.abs(),
+                "{family:?}: β₂ {beta} against {want_beta}"
+            );
+            assert!(conv, "{family:?}: converges");
+            assert!(
+                pivot < crate::lmm::GRAM_PIVOT_MIN,
+                "{family:?}: pivot {pivot:e}"
+            );
+            assert!(
+                (dev - dev_r).abs() <= dev_tol * dev_r,
+                "{family:?}: deviance {dev} against {dev_r}"
+            );
+            let want_var = var_r / (delta * delta);
+            assert!(
+                (var - want_var).abs() <= var_tol * want_var,
+                "{family:?}: var₂ {var} against {want_var}"
+            );
+        }
+    }
+
+    /// `[1, x, e, e]` (`n` rows, `e` the indicator of the last row) when
+    /// `dup`, else `[1, x, e]`, with a response for `family`: the Givens pass
+    /// over `√W·X` leaves `R_33` exactly zero, since no rotation reaches the
+    /// duplicate once the first copy has absorbed the last row.
+    fn breakdown_case(family: Family, dup: bool) -> (Mat<f64>, Vec<f64>) {
+        let n = 50;
+        let p = if dup { 4 } else { 3 };
+        let x = Mat::<f64>::from_fn(n, p, |i, j| match j {
+            0 => 1.0,
+            1 => i as f64 / n as f64 - 0.5,
+            _ => f64::from(u8::from(i == n - 1)),
+        });
+        let y = (0..n)
+            .map(|i| match family {
+                Family::Gamma { .. } => 1.0 + 0.25 * ((3 * i) % 7) as f64,
+                _ if i == n - 1 => 3.0,
+                _ => ((7 * i) % 5) as f64,
+            })
+            .collect();
+        (x, y)
+    }
+
+    /// A breakdown at the last solve (`R_33 = 0` on `[1, x, e, e]`) keeps the
+    /// fit: converged, with the deviance of the `[1, x, e]` fit (same column
+    /// space) and the SEs withheld. The duplicate takes a zero step, so from a
+    /// cold start it stays at 0. Gamma/log also takes Newton steps, which skip
+    /// a pass with a broken column (from the raw Gram the duplicate would move
+    /// to −0.17). Measured against `[1, x, e]` (relative deviance): Poisson 0,
+    /// Gamma 2.1e-16.
+    #[test]
+    fn glm_breakdown_keeps_the_deviance_and_withholds_the_ses() {
+        let arms = [
+            Family::Poisson {
+                link: crate::PoissonLink::Log,
+            },
+            Family::Gamma {
+                link: crate::GammaLink::Log,
+            },
+        ];
+        for family in arms {
+            let (x, y) = breakdown_case(family, true);
+            let mut ws = TestWs::new(50, 4, 0);
+            let v = glm_irls_fit(
+                family,
+                f64::NAN,
+                x.as_ref(),
+                &y,
+                &[0, 1, 2, 3],
+                None,
+                None,
+                None,
+                glm_scratch(&mut ws),
+            );
+            let (xr, _) = breakdown_case(family, false);
+            let mut ws_r = TestWs::new(50, 3, 0);
+            let r = glm_irls_fit(
+                family,
+                f64::NAN,
+                xr.as_ref(),
+                &y,
+                &[0, 1, 2],
+                None,
+                None,
+                None,
+                glm_scratch(&mut ws_r),
+            );
+            assert!(r.converged, "{family:?}: the [1, x, e] fit converges");
+            assert!(v.converged && v.se_unavailable, "{family:?}");
+            assert!(!v.separated, "{family:?}");
+            assert_eq!((v.pivot, v.pivot_col), (0.0, 3), "{family:?}");
+            assert!(v.var_diag.iter().all(|d| d.is_nan()), "{family:?}");
+            assert!(v.t_sq.iter().all(|t| t.is_nan()), "{family:?}");
+            assert!(v.betas.iter().all(|b| b.is_finite()), "{family:?}");
+            assert_eq!(v.betas[3], 0.0, "{family:?}");
+            let rel = (v.deviance - r.deviance).abs() / r.deviance;
+            assert!(
+                rel <= 1e-14,
+                "{family:?}: deviance {} against {}",
+                v.deviance,
+                r.deviance
+            );
+        }
+    }
+
+    /// From a warm start the broken-down column stays at its start value: the
+    /// loop tier's call shape, a draw seeded from the truth.
+    #[test]
+    fn glm_breakdown_holds_the_column_at_its_warm_start() {
+        let family = Family::Poisson {
+            link: crate::PoissonLink::Log,
+        };
+        let (x, y) = breakdown_case(family, true);
+        let mut ws = TestWs::new(50, 4, 0);
+        let v = glm_irls_fit(
+            family,
+            f64::NAN,
+            x.as_ref(),
+            &y,
+            &[0, 1, 2, 3],
+            Some(&[0.5, 0.1, 0.3, 0.25]),
+            None,
+            None,
+            glm_scratch(&mut ws),
+        );
+        assert!(v.converged && v.se_unavailable);
+        assert_eq!(v.betas[3], 0.25);
+    }
+
+    /// A column zero under the weights is not a breakdown: the Gram has a zero
+    /// pivot there and the fit ends not converged, with no deviance. The logit
+    /// arm's alternating 0/1 response keeps it off the all-0/all-1 short circuit.
+    #[test]
+    fn glm_zero_weighted_column_stays_not_converged() {
+        let arms = [
+            Family::Poisson {
+                link: crate::PoissonLink::Log,
+            },
+            Family::Binomial {
+                link: crate::BinomialLink::Logit,
+            },
+        ];
+        for family in arms {
+            let (mut x, mut y) = breakdown_case(family, false);
+            for i in 0..50 {
+                x[(i, 2)] = 0.0;
+            }
+            if matches!(family, Family::Binomial { .. }) {
+                y = (0..50).map(|i| f64::from(u8::from(i % 2 == 0))).collect();
+            }
+            let mut ws = TestWs::new(50, 3, 0);
+            let v = glm_irls_fit(
+                family,
+                f64::NAN,
+                x.as_ref(),
+                &y,
+                &[0, 1, 2],
+                None,
+                None,
+                None,
+                glm_scratch(&mut ws),
+            );
+            assert!(!v.converged && !v.se_unavailable, "{family:?}");
+            assert!(v.deviance.is_nan(), "{family:?}");
+        }
     }
 
     // -----------------------------------------------------------------

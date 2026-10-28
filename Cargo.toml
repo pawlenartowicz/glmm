@@ -1,6 +1,6 @@
 [package]
 name = "glmm"
-version = "0.6.2"
+version = "0.7.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -91,12 +91,17 @@ pulp = "0.22.2"
 regex = { version = "1", optional = true }
 # p-value tails (`dist`) and the Philox stream (`rng`, through `rand_philox`):
 # they feed validated p-values and pinned Monte Carlo values. Caret on purpose,
-# floor 0.2.2 (the tails every pinned value was checked on; its `rng` resolves
+# floor 0.3.0 (the studentized range of the Tukey adjustment; its `rng` resolves
 # `rand_philox` 0.2); a release that moves those values gets the values re-pinned
 # (not the crate version), with a provenance line naming both crate versions,
 # never absorbed by widening a band. Unconditional;
 # its MSRV (1.85) matches this crate's floor.
-commonstats = { version = "0.2", default-features = false, features = ["dist", "rng"] }
+commonstats = { version = "0.3", default-features = false, features = ["dist", "rng"] }
+# The draws of `Simulator` (and the Monte Carlo tier's inverse links):
+# `libm::exp` gives the same last bit on every platform, where `f64::exp`
+# follows the platform's libm. Adds no package: `commonstats` already brings
+# `libm` into the lockfile.
+libm = "0.2.16"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 faer = "0.24"
@@ -109,10 +114,6 @@ faer = { version = "0.24", default-features = false, features = ["std", "sparse-
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
 dhat       = "0.3"
-# The Monte Carlo tier's inverse links: `libm::exp` gives the same last bit on
-# every platform, where `f64::exp` follows the platform's libm. Adds no
-# package: `commonstats` already brings `libm` into the lockfile.
-libm       = "0.2.16"
 
 # ───────────────────────── standalone workspace root ─────────────────────────
 # glmm was carved out of the mcpower workspace (Stage 2). It is now its own

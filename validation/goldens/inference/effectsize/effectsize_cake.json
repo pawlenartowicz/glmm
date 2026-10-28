@@ -1,0 +1,59 @@
+{
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0",
+      "performance": "0.18.2",
+      "effectsize": "1.0.3",
+      "insight": "1.5.4"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_effectsize.R"
+  },
+  "r2": {
+    "marginal": 0.110960887225699,
+    "conditional": 0.70363273147383
+  },
+  "icc": {
+    "adjusted": 0.666643160837617,
+    "unadjusted": 0.59267184424813
+  },
+  "eta2": [
+    {
+      "term": "recipe",
+      "F": 0.0956779631310828,
+      "df1": 2,
+      "df2": 254.015760410188,
+      "eta2_partial": 0.000752755977172963
+    },
+    {
+      "term": "temp",
+      "F": 94.1632290652416,
+      "df1": 1,
+      "df2": 222.000001437066,
+      "eta2_partial": 0.297831056810872
+    },
+    {
+      "term": "recipe:temp",
+      "F": 0.0416924445441314,
+      "df1": 2,
+      "df2": 222.000002114707,
+      "eta2_partial": 0.000375466576826108
+    }
+  ],
+  "name": "effectsize_cake"
+}

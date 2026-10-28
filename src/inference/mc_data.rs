@@ -335,7 +335,7 @@ pub(crate) mod bands {
     /// fraction of its datasets lose it to a fit that did not converge or to a
     /// value that is not finite on a converged fit. A dataset whose
     /// fixed-effects design is aliased, decided from the lowered design by
-    /// `fit_cold`'s own aliasing test and never from a NaN row or from the
+    /// the fit entry's own aliasing test and never from a NaN row or from the
     /// fit's aliased mask (`group` constant, or `time:group` aliased because
     /// one group's rows share one time), is left out of the cap and of
     /// `R_kept` for every quantity of that fit, and counted and printed apart:
@@ -426,8 +426,9 @@ pub(crate) mod bands {
         "lrt_2df",
     ];
 
-    /// The gated set, frozen before the measurement and never re-selected on
-    /// it. Every (cell, quantity) not listed is reported: power, bias and RMSE
+    /// The gated set, frozen before the measurement and re-selected once after
+    /// it (two parts moved to reported; documentation/validation.md says which
+    /// and why), frozen since. Every (cell, quantity) not listed is reported: power, bias and RMSE
     /// everywhere, the AGQ arm, the profile-interval coverage, the GLM rows,
     /// every cell outside these regimes, the failed-dataset fractions. Built
     /// from theory, then screened against the pilot: each candidate (cell,

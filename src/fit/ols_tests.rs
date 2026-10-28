@@ -3,40 +3,8 @@
 use super::common_tests::weighted_collinear_ols_fixture;
 use super::ols::{fit_ols_prebuilt, OlsWorkspace};
 use super::*;
+use crate::test_support::{fit_cold, fit_warm_wo};
 use crate::{BinomialLink, Family, GroupIds, ModelSpec};
-
-#[test]
-fn fit_ols_recovers_slope() {
-    // y = 2*x + noise-free → beta[1] ≈ 2
-    let n = 20;
-    let p = 2;
-    let x: Vec<f64> = (0..n).flat_map(|i| [1.0, i as f64]).collect(); // [intercept, x]
-    let y: Vec<f64> = (0..n).map(|i| 2.0 * i as f64).collect();
-    let model = ModelSpec {
-        family: Family::Gaussian,
-        re: None,
-    };
-    let f = fit_cold(
-        &x,
-        &y,
-        n,
-        p,
-        &model,
-        &GroupIds::default(),
-        &FitOptions {
-            target_indices: vec![1],
-            ..FitOptions::default()
-        },
-    );
-    assert!(f.converged());
-    assert!((f.beta[1] - 2.0).abs() < 1e-6);
-    // OLS reports deviance: NaN, singular: false unconditionally (fit/ols.rs).
-    assert!(f.deviance.is_nan());
-    assert!(!f.singular());
-    assert!(f.tau2.is_empty());
-    // y = 2*i is an exact fit (no noise) → RSS/(n-p) ≈ 0, not the GLM φ≡1 convention.
-    assert!(f.dispersion.abs() < 1e-9);
-}
 
 /// WLS through the stable surface, gated against R `lm(weights=)`.
 /// Convention: σ̂² = Σwᵢrᵢ²/(n−p) with raw-row-count df (R's summary.lm).
@@ -67,11 +35,21 @@ fn fit_ols_weighted_matches_r_lm() {
         re: None,
     };
     let opts = FitOptions {
-        target_indices: vec![0, 1],
-        weights: Some(w),
+        se_for: SeFor::Only(vec![0, 1]),
         ..FitOptions::default()
     };
-    let f = fit_cold(&x, &y, n, 2, &model, &GroupIds::default(), &opts);
+    let f = fit_warm_wo(
+        &x,
+        &y,
+        n,
+        2,
+        &model,
+        &GroupIds::default(),
+        None,
+        Some(&w),
+        None,
+        &opts,
+    );
     assert!(f.converged());
     for j in 0..2 {
         assert!((f.beta[j] - REF_BETA[j]).abs() < 1e-9, "beta[{j}]");
@@ -101,6 +79,18 @@ fn fit_ols_weighted_matches_r_lm() {
         let eta = f.beta[0] + f.beta[1] * xi;
         assert!((f.fitted[i] - eta).abs() < 1e-12, "fitted[{i}]");
     }
+    // OLS reports deviance NaN and singular false unconditionally, no τ², and
+    // σ̂² on the RSS/(n−p) convention, not the GLM φ≡1.
+    assert!(f.deviance.is_nan());
+    assert!(!f.singular());
+    assert!(f.tau2.is_empty());
+    let rss: f64 = (0..n).map(|i| w[i] * (y[i] - f.fitted[i]).powi(2)).sum();
+    let want_disp = rss / (n - 2) as f64;
+    assert!(
+        (f.dispersion - want_disp).abs() <= 1e-12 * want_disp,
+        "dispersion {} vs Σwr²/(n−p) {want_disp}",
+        f.dispersion
+    );
 }
 
 /// Weighted OLS with a per-row offset, vs R `lm(weights=, offset=)`.
@@ -131,12 +121,21 @@ fn fit_ols_offset_matches_r_lm() {
         re: None,
     };
     let opts = FitOptions {
-        target_indices: vec![0, 1],
-        weights: Some(w),
-        offset: Some(o.clone()),
+        se_for: SeFor::Only(vec![0, 1]),
         ..FitOptions::default()
     };
-    let f = fit_cold(&x, &y, n, 2, &model, &GroupIds::default(), &opts);
+    let f = fit_warm_wo(
+        &x,
+        &y,
+        n,
+        2,
+        &model,
+        &GroupIds::default(),
+        None,
+        Some(&w),
+        Some(&o),
+        &opts,
+    );
     assert!(f.converged());
     for (j, (&b, &r)) in f.beta.iter().zip(&REF_BETA).enumerate() {
         assert!((b - r).abs() < 1e-9, "beta[{j}] {b} vs R {r}");
@@ -153,29 +152,29 @@ fn fit_ols_offset_matches_r_lm() {
     }
     // A zero offset must be BIT-identical to no offset (the None path is the
     // same code with an all-zeros shift).
-    let f_none = fit_cold(
+    let f_none = fit_warm_wo(
         &x,
         &y,
         n,
         2,
         &model,
         &GroupIds::default(),
-        &FitOptions {
-            offset: None,
-            ..opts.clone()
-        },
+        None,
+        Some(&w),
+        None,
+        &opts,
     );
-    let f_zero = fit_cold(
+    let f_zero = fit_warm_wo(
         &x,
         &y,
         n,
         2,
         &model,
         &GroupIds::default(),
-        &FitOptions {
-            offset: Some(vec![0.0; n]),
-            ..opts
-        },
+        None,
+        Some(&w),
+        Some(&vec![0.0; n]),
+        &opts,
     );
     assert_eq!(f_none.beta, f_zero.beta);
     assert_eq!(f_none.loglik.to_bits(), f_zero.loglik.to_bits());
@@ -206,8 +205,7 @@ fn fit_ols_offset_matches_r_lm() {
 fn fit_ols_weighted_collinear_fits_with_an_honest_se() {
     let (x, y, w, n, p) = weighted_collinear_ols_fixture();
     let opts = FitOptions {
-        target_indices: vec![0, 1, 2],
-        weights: Some(w),
+        se_for: SeFor::Only(vec![0, 1, 2]),
         ..FitOptions::default()
     };
     let model = ModelSpec {
@@ -230,15 +228,17 @@ fn fit_ols_weighted_collinear_fits_with_an_honest_se() {
     // The recorded pivot is on the WEIGHTED Gram and must be in the flagging
     // band; the raw Gram's own pivot is orders above it, which is the whole
     // point of measuring the matrix the fit actually used.
-    let mut ws = OlsWorkspace::new(n, p, opts.target_indices.len(), true);
+    let mut ws = OlsWorkspace::new(n, p, opts.se_for.columns(p).len());
     let x_mat = super::common::to_col_major(&x, n, p);
     let view = fit_ols_prebuilt(
         &mut ws,
         x_mat.as_ref().subrows(0, n),
         &y,
+        Some(&w),
+        None,
         n,
         p,
-        &opts,
+        &opts.se_for.columns(p),
         crate::standardize::ColumnScaling::IDENTITY,
     );
     assert!(
@@ -251,7 +251,7 @@ fn fit_ols_weighted_collinear_fits_with_an_honest_se() {
         view.pivot
     );
 
-    let f = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    let f = fit_warm_wo(&x, &y, n, p, &model, &ids, None, Some(&w), None, &opts);
     assert!(f.converged(), "the fit is computable and must be returned");
     assert_eq!(
         f.aliased(),
@@ -357,7 +357,7 @@ fn fit_fixed_degenerate_width_never_panics() {
 #[test]
 fn fit_ols_entangled_columns_keep_their_digits() {
     let n = 200;
-    let (x, xr, delta) = super::common_tests::entangled_dyadic_designs(n);
+    let (x, xr, delta) = super::common_tests::entangled_dyadic_designs(n, 20);
     let mut st = 5u64;
     let y: Vec<f64> = (0..n)
         .map(|i| {
@@ -369,7 +369,7 @@ fn fit_ols_entangled_columns_keep_their_digits() {
         re: None,
     };
     let opts = FitOptions {
-        target_indices: vec![0, 1, 2],
+        se_for: SeFor::Only(vec![0, 1, 2]),
         ..FitOptions::default()
     };
     let f = fit_cold(&x, &y, n, 3, &model, &GroupIds::default(), &opts);
@@ -419,15 +419,11 @@ fn ols_coef_df_is_n_minus_p() {
         re: None,
     };
     let all = |p: usize| FitOptions {
-        target_indices: (0..p as u32).collect(),
+        se_for: SeFor::Only((0..p as u32).collect()),
         ..FitOptions::default()
     };
     let (x, y, w, n, p) = residual_df_data(false);
     let nu = (n - p) as f64;
-    let weighted = FitOptions {
-        weights: Some(w.clone()),
-        ..all(p)
-    };
     let switched_off = FitOptions {
         satterthwaite: false,
         ..all(p)
@@ -435,14 +431,25 @@ fn ols_coef_df_is_n_minus_p() {
     // ν is the residual df on either criterion: `reml` moves OLS's
     // log-likelihood, never its df.
     let criterion = |reml| FitOptions { reml, ..all(p) };
-    for opts in [
-        all(p),
-        weighted,
-        switched_off,
-        criterion(Some(false)),
-        criterion(Some(true)),
+    for (opts, weights) in [
+        (all(p), None),
+        (all(p), Some(w.as_slice())),
+        (switched_off, None),
+        (criterion(Some(false)), None),
+        (criterion(Some(true)), None),
     ] {
-        let f = fit_cold(&x, &y, n, p, &model, &GroupIds::default(), &opts);
+        let f = fit_warm_wo(
+            &x,
+            &y,
+            n,
+            p,
+            &model,
+            &GroupIds::default(),
+            None,
+            weights,
+            None,
+            &opts,
+        );
         assert!(f.converged());
         assert_eq!(f.coef_df, vec![nu; p]);
         for j in 0..p {
@@ -461,7 +468,7 @@ fn ols_coef_df_is_n_minus_p() {
     // the full C.
     let full = fit_cold(&x, &y, n, p, &model, &GroupIds::default(), &all(p));
     let one = FitOptions {
-        target_indices: vec![1],
+        se_for: SeFor::Only(vec![1]),
         ..FitOptions::default()
     };
     let f = fit_cold(&x, &y, n, p, &model, &GroupIds::default(), &one);
@@ -580,35 +587,38 @@ fn ols_reml_reports_the_closed_form_reml_loglik() {
     let (x, y, w, n, p) = residual_df_data(false);
     let o: Vec<f64> = (0..n).map(|i| 0.3 * (i % 4) as f64).collect();
     let base = FitOptions {
-        target_indices: (0..p as u32).collect(),
+        se_for: SeFor::Only((0..p as u32).collect()),
         ..FitOptions::default()
     };
     let variants = [
-        ("plain", base.clone()),
-        (
-            "weights",
-            FitOptions {
-                weights: Some(w),
-                ..base.clone()
-            },
-        ),
-        (
-            "offset",
-            FitOptions {
-                offset: Some(o),
-                ..base
-            },
-        ),
+        ("plain", None, None),
+        ("weights", Some(w.as_slice()), None),
+        ("offset", None, Some(o.as_slice())),
     ];
-    for (tag, opts) in variants {
-        let ml = fit_cold(&x, &y, n, p, &model, &GroupIds::default(), &opts);
-        let f = fit_cold(
+    for (tag, weights, offset) in variants {
+        let opts = base.clone();
+        let ml = fit_warm_wo(
             &x,
             &y,
             n,
             p,
             &model,
             &GroupIds::default(),
+            None,
+            weights,
+            offset,
+            &opts,
+        );
+        let f = fit_warm_wo(
+            &x,
+            &y,
+            n,
+            p,
+            &model,
+            &GroupIds::default(),
+            None,
+            weights,
+            offset,
             &FitOptions {
                 reml: Some(true),
                 ..opts.clone()
@@ -616,13 +626,16 @@ fn ols_reml_reports_the_closed_form_reml_loglik() {
         );
         assert!(ml.converged() && f.converged(), "{tag}");
         // `Some(false)` is the `None` path: every field bit for bit.
-        let ml_false = fit_cold(
+        let ml_false = fit_warm_wo(
             &x,
             &y,
             n,
             p,
             &model,
             &GroupIds::default(),
+            None,
+            weights,
+            offset,
             &FitOptions {
                 reml: Some(false),
                 ..opts.clone()
@@ -643,14 +656,7 @@ fn ols_reml_reports_the_closed_form_reml_loglik() {
         assert_eq!(f.dispersion.to_bits(), ml.dispersion.to_bits(), "{tag}: σ̂²");
         assert!(f.reml && !ml.reml, "{tag}: reml");
         assert!(f.deviance.is_nan(), "{tag}: deviance");
-        let d = closed_form_reml_deviance(
-            &x,
-            &y,
-            n,
-            p,
-            opts.weights.as_deref(),
-            opts.offset.as_deref(),
-        );
+        let d = closed_form_reml_deviance(&x, &y, n, p, weights, offset);
         let want = reml_loglik(d, n, p);
         assert!(
             (f.loglik - want).abs() <= 1e-10 * want.abs(),
@@ -663,7 +669,7 @@ fn ols_reml_reports_the_closed_form_reml_loglik() {
     // `X = Xr·T` with `det T = δ`, so `ln|XᵀX|` is `ln|XrᵀXr| + 2 ln δ`, the
     // RSS is the same, and the REML log-likelihood moves by exactly `−ln δ`.
     let n = 200;
-    let (x, xr, delta) = super::common_tests::entangled_dyadic_designs(n);
+    let (x, xr, delta) = super::common_tests::entangled_dyadic_designs(n, 20);
     let mut st = 5u64;
     let y: Vec<f64> = (0..n)
         .map(|i| {
@@ -671,7 +677,7 @@ fn ols_reml_reports_the_closed_form_reml_loglik() {
         })
         .collect();
     let opts = FitOptions {
-        target_indices: vec![0, 1, 2],
+        se_for: SeFor::Only(vec![0, 1, 2]),
         reml: Some(true),
         ..FitOptions::default()
     };
@@ -694,7 +700,7 @@ fn ols_reml_survives_an_aliased_column() {
         re: None,
     };
     let opts = |p: usize| FitOptions {
-        target_indices: (0..p as u32).collect(),
+        se_for: SeFor::Only((0..p as u32).collect()),
         reml: Some(true),
         ..FitOptions::default()
     };
@@ -745,7 +751,7 @@ fn ols_reml_loglik_is_on_the_lmm_deviance_scale() {
     let mixed = ModelSpec {
         family: Family::Gaussian,
         re: Some(crate::ReStructure {
-            sizing: crate::Sizing::FixedClusters { n_clusters: 6 },
+            terms: Vec::new(),
             slopes: vec![],
             extra_groupings: vec![],
         }),
@@ -759,41 +765,35 @@ fn ols_reml_loglik_is_on_the_lmm_deviance_scale() {
         extra: vec![],
     };
     let base = FitOptions {
-        target_indices: vec![0],
+        se_for: SeFor::Only(vec![0]),
         ..FitOptions::default()
     };
+    let w: Vec<f64> = k.iter().map(|k| 1.0 + 0.5 * k).collect();
+    let o: Vec<f64> = k.iter().map(|k| 0.4 * (k - 2.0)).collect();
     let variants = [
-        ("plain", base.clone()),
-        (
-            "weights",
-            FitOptions {
-                weights: Some(k.iter().map(|k| 1.0 + 0.5 * k).collect()),
-                ..base.clone()
-            },
-        ),
-        (
-            "offset",
-            FitOptions {
-                offset: Some(k.iter().map(|k| 0.4 * (k - 2.0)).collect()),
-                ..base
-            },
-        ),
+        ("plain", None, None),
+        ("weights", Some(w.as_slice()), None),
+        ("offset", None, Some(o.as_slice())),
     ];
-    for (tag, opts) in variants {
-        let m = fit_cold(&x, &y, n, p, &mixed, &ids, &opts);
+    for (tag, weights, offset) in variants {
+        let opts = base.clone();
+        let m = fit_warm_wo(&x, &y, n, p, &mixed, &ids, None, weights, offset, &opts);
         assert!(m.converged(), "{tag}: the mixed fit converges");
         assert_eq!(
             m.tau2,
             [0.0],
             "{tag}: the mixed fit is pinned at zero variance"
         );
-        let f = fit_cold(
+        let f = fit_warm_wo(
             &x,
             &y,
             n,
             p,
             &ols,
             &GroupIds::default(),
+            None,
+            weights,
+            offset,
             &FitOptions {
                 reml: Some(true),
                 ..opts
@@ -821,14 +821,24 @@ fn ols_fit_reports_nobs_and_least_squares() {
         re: None,
     };
     let (x, y, w, n, p) = residual_df_data(false);
-    for (reml, weights) in [(None, None), (Some(true), Some(w))] {
+    for (reml, weights) in [(None, None), (Some(true), Some(w.as_slice()))] {
         let opts = FitOptions {
-            target_indices: (0..p as u32).collect(),
+            se_for: SeFor::Only((0..p as u32).collect()),
             reml,
-            weights,
             ..FitOptions::default()
         };
-        let f = fit_cold(&x, &y, n, p, &model, &GroupIds::default(), &opts);
+        let f = fit_warm_wo(
+            &x,
+            &y,
+            n,
+            p,
+            &model,
+            &GroupIds::default(),
+            None,
+            weights,
+            None,
+            &opts,
+        );
         assert!(f.converged(), "reml = {reml:?}");
         assert_eq!(
             (f.nobs, f.objective),

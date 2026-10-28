@@ -6,8 +6,9 @@ fourth is a short note on warm starts. The R surface is deliberately small:
 **one function** — `fastglmm()` — plus the `"fastglmm"` object it returns, read
 through lme4-shaped accessors (`summary`, `fixef`, `vcov`, `VarCorr`, `confint`,
 `isSingular`). There is no `lmer`/`glmer` split — `fastglmm()` dispatches on the
-family the way the kernel does. Two more calls test hypotheses: `anova()`, on
-one fit or two, and `compare()`, on one data set and two formulas (§3).
+family the way the kernel does. Three more calls test hypotheses: `anova()`,
+on one fit or two, `compare()`, on one data set and two formulas, and
+`pairwise()`, on the levels of one factor (§3).
 
 Two R conventions differ from the Python port. The **formula comes first**,
 `data` second (as in `lm`/`lme4`), the reverse of `glmm.fit(data, formula)`. And
@@ -83,10 +84,11 @@ Points worth knowing at this layer:
   interaction), `A/B` nesting, `- 1`/`0 +` (drops the intercept),
   `log()`/`sqrt()`/`exp()`/`I(x^k)` on one bare column, `offset()`,
   `cbind(s, f) ~ …` (with `family = binomial()`), and `(1 + x | g)` for a
-  correlated random intercept + slope, with extra `(… | g2)` terms adding
-  crossed/nested groupings. Not accepted — each a clear error with the fix:
-  `poly()` and other general function calls (compute the column first), `.`,
-  and `(x || g)`.
+  correlated random intercept + slope, `(x || g)` or `zerocorr(1 + x | g)`
+  for an uncorrelated one, `(0 + x | g)` for a slope without a random
+  intercept, with extra `(… | g2)` terms adding crossed/nested groupings. Not
+  accepted — each a clear error with the fix: `poly()` and other general
+  function calls (compute the column first), and `.`.
 - Contrasts are always treatment coding based on the **first factor level**; to
   change the base, `relevel()` the factor (there is deliberately no `contrasts=`
   argument).
@@ -218,7 +220,9 @@ shaped like lme4's. These **work**:
 | `isSingular(fit)` | boundary-fit flag — lme4's condition, computed by the kernel. |
 | `sigma(fit)` | residual SD for gaussian fits, `sqrt(phi)` for Gamma/inverse-Gaussian; `1` for binomial/Poisson/negative-binomial (fixed scale, as in lme4). |
 | `nobs`, `formula`, `family`, `model.frame`, `print` | the usual; `formula()` returns the model formula as given, as a formula object, so `update(m, . ~ . + z)` works (the parser is Rust-side, so there is no R `terms` object to hand back). |
-| `ranef(fit)` | conditional modes (BLUPs), one data frame per grouping, lme4-shaped. Conditional variances (`condVar`) are not computed. |
+| `ranef(fit)` | conditional modes (BLUPs), one data frame per grouping, lme4-shaped. With `condVar = TRUE` (the default) each data frame carries lme4's `postVar` attribute, terms × terms × levels; a fit on the sparse route has none. |
+| `predict(fit, newdata)` | predictions on new rows (the training rows without `newdata`), on the link scale by default; `re.form = NA` for the population prediction, `se.fit = TRUE` for standard errors and intervals. A level the fit did not see gets a random effect of 0 and a `fastglmm_new_grouping_levels` warning. See [`coming-from-lme4.md`](coming-from-lme4.md). |
+| `simulate(fit, nsim, seed)` | `nsim` simulated responses on the rows the fit used, one column each; the same `seed` gives the same draws on every platform. |
 | `fitted(fit)` | conditional means per row, including the random-effect contribution and any offset. |
 | `residuals(fit)` | `type = "response"` (default, `y - fitted`) or `type = "pearson"`. Deviance and working residuals are not offered. |
 | `tidy(fit)`, `glance(fit)` | broom-shaped data frames: one row per fixed effect (`term`, `estimate`, `std.error`, `statistic`, then `df` where `summary()` has a df column, then `p.value`; the statistic and p-value are the summary's, t or z), and one row of fit statistics (`nobs`, `logLik`, `AIC`, `BIC`, `deviance`, `df.residual`, `REML`). |
@@ -228,6 +232,8 @@ shaped like lme4's. These **work**:
 | `AIC(fit)`, `BIC(fit)` | `stats`'s values and tables, read from `logLik()`. Two comparisons stop with an error instead: a REML fit beside an ML fit (the error names which is which), and REML fits with different fixed effects, whose REML criteria are not comparable (the error points to `compare()` and to `REML = FALSE`). ML fits compare across fixed effects as in `stats`. See `?AIC.fastglmm` for the uses it cannot check. |
 | `anova(fit)` | the per-term tests, one row per fixed term, built when the model was fitted (no refit when called): Type III by default, `type = "II"` on request; lmerTest's F with Satterthwaite df on a Gaussian mixed model, F on `n - p` on OLS and the Gamma and inverse-Gaussian GLMs with an estimated dispersion, likelihood-ratio chi-squared on a Poisson GLMM, Wald chi-squared elsewhere; `test = "Wald"` or `test = "LRT"` picks the test on a fit with chi-squared rows. See the end of this section. |
 | `anova(m0, m1)` | two fits compared as they are, with no refit; see the end of this section. |
+| `pairwise(fit, "f")` | every pairwise comparison of the levels of a factor of the fixed part, emmeans' `pairs(emmeans(fit, ~ f))` with Holm's adjustment by default (emmeans' default is Tukey); `confint()` of the table gives the intervals. See the end of this section. |
+| `r2(fit)`, `icc(fit)` | a mixed model's marginal and conditional R-squared and its adjusted and unadjusted ICC, as `performance::r2_nakagawa` and `performance::icc` compute them. They are computed when called; on a Poisson or negative binomial GLMM each call refits the null model once. `summary()` prints the R-squared pair and the adjusted ICC in one line, or, on a Poisson or negative binomial GLMM, a line that points to `r2()` and `icc()`. |
 | `fit$offset` | the offset the model was fitted with, `NULL` without one. |
 | `fit$diagnostics` | list with `converged`, `singular`, `aliased`, `boundary`, `pinned`, `notes` — the solver's own report; the top-level `fit$converged`/`fit$singular`/`fit$aliased` are unchanged and mirror the same values. |
 
@@ -265,7 +271,7 @@ suppressWarnings(fastglmm(y ~ x1 + x2 + (1 | group), data), classes = "fastglmm_
 
 These **error, naming the reason** — the package's defining choice, that anything
 the kernel cannot compute honestly is a documented error, never a silently
-different answer: `predict`, `coef`, and `terms`. `coef()` is
+different answer: `coef` and `terms`. `coef()` is
 instructive: lme4's `coef()` means fixed + random effects per group, and
 returning fixed effects only would silently differ from what the same call
 gives an lme4 user, so it errors and points you at `fixef()` and `ranef()`
@@ -329,6 +335,19 @@ which is conservative. Both calls take `nsim` and `seed` for the exact test;
 the default seed is fixed, so a call gives the same p-value every time and
 `set.seed()` does not change it. The full rules, every reference and every
 refusal are in [`hypothesis-tests.md`](hypothesis-tests.md).
+
+**Pairwise comparisons: `pairwise()`.** On a model with a factor `f` in its
+fixed part, `pairwise(fit, "f")` compares every pair of its levels, as
+emmeans' `pairs(emmeans(fit, ~ f))`, and returns a data frame with emmeans'
+columns. Nothing is refitted. The default adjustment is Holm; emmeans'
+default is Tukey, so pass `adjust = "tukey"` to get emmeans' p-values:
+
+```r
+pw <- pairwise(fit, "f")                  # Holm
+pairwise(fit, "f", adjust = "tukey")      # emmeans' default
+pairwise(fit, "f", by = "h")              # within each level of h
+confint(pw, level = 0.95)                 # lower.CL, upper.CL
+```
 
 ## 4. Warm starts
 

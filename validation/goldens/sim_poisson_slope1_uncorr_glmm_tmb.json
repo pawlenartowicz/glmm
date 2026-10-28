@@ -1,0 +1,30 @@
+{
+  "name": "sim_poisson_slope1_uncorr_glmm_tmb",
+  "engine": "glmmTMB::glmmTMB",
+  "engine_version": "1.1.14",
+  "kind": "glmm",
+  "data": "sim_poisson_slope1",
+  "family": "poisson",
+  "link": "log",
+  "nagq": 1,
+  "r_formula": "y ~ 1 + x + (1 + x || g)",
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)", "x"],
+  "estimates": {
+    "beta": [-1.35978402768736, 0.499910444670437],
+    "se_hessian": [0.209124259097293, 0.133895844386515],
+    "loglik": -205.926707454384,
+    "varcomp": [
+      {
+        "group": "g",
+        "terms": ["(Intercept)", "x"],
+        "stddev": [0.991984267961153, 0.372908060087041],
+        "corr": [
+          [1, 0],
+          [0, 1]
+        ]
+      }
+    ]
+  }
+}

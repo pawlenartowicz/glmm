@@ -230,7 +230,7 @@ fn compute_finds_the_statistics_the_module_doc_states() {
     ];
     for c in cases {
         let (x, n, p) = &c.x;
-        let mut cs = ColumnScaling::with_re_slopes(*p, c.re_slopes.iter().copied());
+        let mut cs = ColumnScaling::with_re_slopes(*p, c.re_slopes.iter().copied(), []);
         cs.compute(x, *n, *p, c.weights.as_deref(), c.standardize);
         assert_eq!(cs.intercept(), c.intercept, "{}", c.name);
         assert_eq!(cs.is_identity(), c.identity, "{}", c.name);

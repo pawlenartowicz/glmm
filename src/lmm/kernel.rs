@@ -143,13 +143,32 @@ impl DesignQr {
         // Narrow designs get a fixed `p` (`P`), so the rotations unroll;
         // `P = 0` reads `p` off `u`.
         match self.u.nrows() {
-            2 => self.set_from_rows_impl::<2>(x, row_scale, v),
-            3 => self.set_from_rows_impl::<3>(x, row_scale, v),
-            4 => self.set_from_rows_impl::<4>(x, row_scale, v),
-            5 => self.set_from_rows_impl::<5>(x, row_scale, v),
-            6 => self.set_from_rows_impl::<6>(x, row_scale, v),
-            _ => self.set_from_rows_impl::<0>(x, row_scale, v),
+            2 => self.set_from_rows_impl::<2>(x, row_scale, v, None),
+            3 => self.set_from_rows_impl::<3>(x, row_scale, v, None),
+            4 => self.set_from_rows_impl::<4>(x, row_scale, v, None),
+            5 => self.set_from_rows_impl::<5>(x, row_scale, v, None),
+            6 => self.set_from_rows_impl::<6>(x, row_scale, v, None),
+            _ => self.set_from_rows_impl::<0>(x, row_scale, v, None),
         }
+    }
+
+    /// [`Self::set_from_rows`] that keeps the factor when `R` has a zero or
+    /// non-finite diagonal. True when it has none, with `U` and `D` bit for
+    /// bit those of `set_from_rows` (the fixed widths unroll the same
+    /// rotations in the same order). Otherwise each such column `j` is marked
+    /// in `broken` (length `p`), row `j` of `U` is `e_j` and `D_j = 0`, the
+    /// other rows are as usual, and it returns false. Where `R_jj` is zero
+    /// because no rotation reached column `j`, row `j` of `R` is zero too, and
+    /// column `j` of `x·U⁻¹` is the part of column `j` that the columns before
+    /// it do not explain: zero in exact arithmetic.
+    pub(crate) fn set_from_rows_marking(
+        &mut self,
+        x: MatRef<'_, f64>,
+        row_scale: impl Fn(usize) -> f64,
+        v: &mut [f64],
+        broken: &mut [bool],
+    ) -> bool {
+        self.set_from_rows_impl::<0>(x, row_scale, v, Some(broken))
     }
 
     fn set_from_rows_impl<const P: usize>(
@@ -157,6 +176,7 @@ impl DesignQr {
         x: MatRef<'_, f64>,
         row_scale: impl Fn(usize) -> f64,
         v: &mut [f64],
+        broken: Option<&mut [bool]>,
     ) -> bool {
         let p = if P > 0 { P } else { self.u.nrows() };
         debug_assert_eq!(self.u.nrows(), p);
@@ -210,14 +230,38 @@ impl DesignQr {
                 r[(i, j)] = r_rm[i * p + j];
             }
         }
-        for j in 0..p {
-            let rjj = r[(j, j)];
-            if !(rjj.is_finite() && rjj > 0.0) {
+        let is_broken = |rjj: f64| !(rjj.is_finite() && rjj > 0.0);
+        let Some(broken) = broken else {
+            if (0..p).any(|j| is_broken(r[(j, j)])) {
                 self.set_identity();
                 return false;
             }
+            self.finish_from_r(None);
+            return true;
+        };
+        let mut whole = true;
+        for (j, b) in broken[..p].iter_mut().enumerate() {
+            *b = is_broken(r[(j, j)]);
+            whole &= !*b;
         }
+        self.finish_from_r(Some(&broken[..p]));
+        whole
+    }
+
+    /// `U = D⁻¹R`, `D = diag(R)`, from the `R` held in `u`; a column marked in
+    /// `broken` gets row `e_j` and `D_j = 0`.
+    fn finish_from_r(&mut self, broken: Option<&[bool]>) {
+        let p = self.u.nrows();
+        let r = &mut self.u;
         for i in 0..p {
+            if broken.is_some_and(|b| b[i]) {
+                for j in (i + 1)..p {
+                    r[(i, j)] = 0.0;
+                }
+                r[(i, i)] = 1.0;
+                self.d[i] = 0.0;
+                continue;
+            }
             let rii = r[(i, i)];
             for j in (i + 1)..p {
                 r[(i, j)] /= rii;
@@ -226,7 +270,6 @@ impl DesignQr {
             self.d[i] = rii;
         }
         self.is_identity = false;
-        true
     }
 
     /// `U` and `D` read off the Cholesky factor of a Gram `X'WX` (its leading
@@ -289,6 +332,18 @@ impl DesignQr {
                 acc += self.u[(i, k)] * beta[k];
             }
             beta[i] = acc;
+        }
+    }
+
+    /// `r → r·U` in place, the inverse of [`Self::solve_row`]: a row against
+    /// the columns of `X̃ = X·U⁻¹` to the same row against `X` (entry `j`
+    /// reads only `r_i`, `i ≤ j`, so it runs bottom-up).
+    pub(crate) fn row_times_u(&self, r: &mut [f64]) {
+        let p = self.u.nrows();
+        for j in (0..p).rev() {
+            let uj = &self.u.col_as_slice(j)[..j];
+            let acc: f64 = r[..j].iter().zip(uj).map(|(a, b)| a * b).sum();
+            r[j] += acc;
         }
     }
 
@@ -388,19 +443,26 @@ pub struct LmmSuffStats {
     /// when `primary_q == 1` (no slopes).
     pub zx_slope: Mat<f64>,
     /// The current row's `[x y]` (len m) on the RAW `x`, times `√wᵢ` on a
-    /// weighted fit: every random-slope read and `s_raw` come from here. Filled
+    /// weighted fit: every random-slope read of a design column and the
+    /// design rows of `s_raw` come from here (with `zr_buf`). Filled
     /// only when one of those exists (`need_raw_row` in `add_rows_impl`); `c`
     /// and `s` accumulate from `wt_buf`. The fixed-width instances use a stack
     /// copy instead. Scratch, not a statistic: reset leaves it alone.
     pub w_buf: Vec<f64>,
+    /// The current row's random-effect-only columns (slope indices `p..p + s`,
+    /// `Data::re_columns`), carrying the same `√wᵢ` as `w_buf`: a slope
+    /// index `sc ≥ p` reads `zr_buf[sc − p]` where one below `p` reads
+    /// `w_buf[sc]`. Empty when the design has none. Scratch, like `w_buf`.
+    pub zr_buf: Vec<f64>,
     /// The same row as `w_buf` with its `x` part mapped to `x·U⁻¹`
     /// (`DesignQr`): what `c` and `s` accumulate. Scratch, like `w_buf`.
     pub wt_buf: Vec<f64>,
-    /// `p × k_total` twin of `s`'s `x` rows on the RAW `x`: `s_raw[(j, a)] =
-    /// Σ_{i in RE column a} z_a·x_j`. `s` holds `Z'X̃`, whose rows are no longer
-    /// design columns, so every slope-covariate Gram entry (`Σ z_slope` and
-    /// `Σ z_slope·z_other` over a level) is read from here instead. 0×0 when no
-    /// grouping carries a random slope.
+    /// `(p + s) × k_total` twin of `s`'s `x` rows on the RAW `x`, then the
+    /// random-effect-only columns: `s_raw[(j, a)] = Σ_{i in RE column a}
+    /// z_a·x_j`, row `j` indexed as a slope is. `s` holds `Z'X̃`, whose rows
+    /// are no longer design columns, so every slope-covariate Gram entry
+    /// (`Σ z_slope` and `Σ z_slope·z_other` over a level) is read from here
+    /// instead. 0×0 when no grouping carries a random slope.
     pub s_raw: Mat<f64>,
     /// The fixed-effect factor `U` the `x` part of `c`/`s` is accumulated
     /// through, or that [`Self::orthogonalize_from_gram`] maps the accumulated
@@ -430,6 +492,10 @@ impl LmmSuffStats {
         let m = p + 1;
         let k = groupings.k_total;
         let kx = groupings.k_crossed();
+        let slopes = (groupings.primary_slope_cols.iter())
+            .chain(groupings.extra_slope_cols.iter().flatten())
+            .copied();
+        let s = crate::fit::re_only_count(slopes, p);
         LmmSuffStats {
             m,
             n_rows: 0,
@@ -440,9 +506,10 @@ impl LmmSuffStats {
             zx: Mat::zeros(if kx > 0 { k } else { 0 }, kx),
             zx_slope: Mat::zeros(if kx > 0 { k } else { 0 }, kx),
             w_buf: vec![0.0; m],
+            zr_buf: vec![0.0; s],
             wt_buf: vec![0.0; m],
             s_raw: if groupings.primary_q > 1 || groupings.extra_slopes_any {
-                Mat::zeros(p, k)
+                Mat::zeros(p + s, k)
             } else {
                 Mat::zeros(0, 0)
             },
@@ -541,13 +608,15 @@ impl LmmSuffStats {
     /// and the `y` entry of every `s` column. Everything else (`counts`, `zx`,
     /// `zx_slope`, `s_raw`, the `x` parts, `U`) depends on the design and the
     /// weights only and is kept. The caller guarantees the same `x`, ids and
-    /// weights (the loop tier's fixed-design opt-in). Each entry is rebuilt
+    /// weights (the loop tier's fixed-design opt-in), and the same `z`, the
+    /// `n × s` random-effect-only columns. Each entry is rebuilt
     /// from zero over the rows in ascending order with the products the full
     /// accumulation forms (and `X̃'y` mapped through `U` after the sum when
     /// that is how it was built), so the result is bit-identical to it.
     pub(crate) fn update_response(
         &mut self,
         x: MatRef<'_, f64>,
+        z: MatRef<'_, f64>,
         y: &[f64],
         cluster_ids: &[u32],
         extra_ids: &[Vec<u32>],
@@ -606,16 +675,18 @@ impl LmmSuffStats {
                     *cj += yz * (wj * zw);
                 }
                 cy[p] += yz * yz;
+                // Mirrors `add_rows_impl`'s slope read: change together.
+                let raw_slope = |sc: usize| if sc < p { xr[sc] } else { z[(row, sc - p)] };
                 if g.primary_q > 1 {
                     for (k, &sc) in g.primary_slope_cols.iter().enumerate() {
-                        let z = xr[sc] * zw;
+                        let z = raw_slope(sc) * zw;
                         s.col_as_slice_mut((k + 1) * g.n_primary + gid[0])[p] += z * yz;
                     }
                 }
                 if g.extra_slopes_any {
                     for (e, cols) in g.extra_slope_cols.iter().enumerate() {
                         for (d, &sc) in cols.iter().enumerate() {
-                            let z = xr[sc] * zw;
+                            let z = raw_slope(sc) * zw;
                             s.col_as_slice_mut(gid[1 + e] + 1 + d)[p] += z * yz;
                         }
                     }
@@ -633,7 +704,7 @@ impl LmmSuffStats {
 
     /// Primary-only convenience — the primary-only shape.
     pub fn add_rows(&mut self, x: MatRef<'_, f64>, y: &[f64], cluster_ids: &[u32]) {
-        self.add_rows_multi(x, y, cluster_ids, &[], None);
+        self.add_rows_multi(x, x.subcols(0, 0), y, cluster_ids, &[], None);
     }
 
     /// Accumulate a block of rows for every grouping. `extra_ids[g]` holds
@@ -650,10 +721,12 @@ impl LmmSuffStats {
     /// The `x` part of `c` and `s` is accumulated as `x·U⁻¹` (`DesignQr`, the
     /// identity unless [`Self::set_design_qr`] or
     /// `Self::orthogonalize_from_gram` set it since the last `reset`); slope
-    /// reads and `s_raw` use the raw `x`.
+    /// reads and `s_raw` use the raw `x`, and `z`, the `n × s`
+    /// random-effect-only columns, where a slope index is `≥ p`.
     pub fn add_rows_multi(
         &mut self,
         x: MatRef<'_, f64>,
+        z: MatRef<'_, f64>,
         y: &[f64],
         cluster_ids: &[u32],
         extra_ids: &[Vec<u32>],
@@ -665,19 +738,20 @@ impl LmmSuffStats {
         // The common narrow widths also get a fixed `m` (`M`), so the per-row
         // loops over the row are unrolled; `M = 0` reads `self.m`.
         match (weights, self.m) {
-            (None, 3) => self.add_rows_impl::<false, 3>(x, y, cluster_ids, extra_ids, &[]),
-            (None, 4) => self.add_rows_impl::<false, 4>(x, y, cluster_ids, extra_ids, &[]),
-            (None, 5) => self.add_rows_impl::<false, 5>(x, y, cluster_ids, extra_ids, &[]),
-            (None, 6) => self.add_rows_impl::<false, 6>(x, y, cluster_ids, extra_ids, &[]),
-            (None, 7) => self.add_rows_impl::<false, 7>(x, y, cluster_ids, extra_ids, &[]),
-            (None, _) => self.add_rows_impl::<false, 0>(x, y, cluster_ids, extra_ids, &[]),
-            (Some(w), _) => self.add_rows_impl::<true, 0>(x, y, cluster_ids, extra_ids, w),
+            (None, 3) => self.add_rows_impl::<false, 3>(x, z, y, cluster_ids, extra_ids, &[]),
+            (None, 4) => self.add_rows_impl::<false, 4>(x, z, y, cluster_ids, extra_ids, &[]),
+            (None, 5) => self.add_rows_impl::<false, 5>(x, z, y, cluster_ids, extra_ids, &[]),
+            (None, 6) => self.add_rows_impl::<false, 6>(x, z, y, cluster_ids, extra_ids, &[]),
+            (None, 7) => self.add_rows_impl::<false, 7>(x, z, y, cluster_ids, extra_ids, &[]),
+            (None, _) => self.add_rows_impl::<false, 0>(x, z, y, cluster_ids, extra_ids, &[]),
+            (Some(w), _) => self.add_rows_impl::<true, 0>(x, z, y, cluster_ids, extra_ids, w),
         }
     }
 
     fn add_rows_impl<const WEIGHTED: bool, const M: usize>(
         &mut self,
         x: MatRef<'_, f64>,
+        z: MatRef<'_, f64>,
         y: &[f64],
         cluster_ids: &[u32],
         extra_ids: &[Vec<u32>],
@@ -700,6 +774,7 @@ impl LmmSuffStats {
             zx,
             zx_slope,
             w_buf,
+            zr_buf,
             wt_buf,
             s_raw,
             design_qr,
@@ -815,8 +890,17 @@ impl LmmSuffStats {
                         *wj = if WEIGHTED { xj * zw } else { xj };
                     }
                     w_buf[p] = if WEIGHTED { yr * zw } else { yr };
+                    for (j, zj) in zr_buf.iter_mut().enumerate() {
+                        let v = z[(row, j)];
+                        *zj = if WEIGHTED { v * zw } else { v };
+                    }
                 }
                 let wt = &wt_buf[..m];
+                // Slope index `sc` of the raw row, one `zw` folded in. Mirrored
+                // by `update_response`'s read: change together.
+                let w_buf = &*w_buf;
+                let zr_buf = &zr_buf[..];
+                let raw_slope = |sc: usize| if sc < p { w_buf[sc] } else { zr_buf[sc - p] };
                 for &a in &gid[..n_g] {
                     // Intercept z = 1 becomes `zw`; `wt_buf` already carries one `zw`,
                     // so the product carries `zw² = wᵢ`: total wᵢ·[X̃ y] per row.
@@ -825,8 +909,11 @@ impl LmmSuffStats {
                         *sj += if WEIGHTED { zw * wtj } else { wtj };
                     }
                     if raw {
-                        let rcol = &mut s_raw.col_as_slice_mut(a)[..p];
+                        let (rcol, rcol_z) = s_raw.col_as_slice_mut(a).split_at_mut(p);
                         for (sj, &wj) in rcol.iter_mut().zip(&w_buf[..p]) {
+                            *sj += if WEIGHTED { zw * wj } else { wj };
+                        }
+                        for (sj, &wj) in rcol_z.iter_mut().zip(zr_buf) {
                             *sj += if WEIGHTED { zw * wj } else { wj };
                         }
                     }
@@ -861,7 +948,7 @@ impl LmmSuffStats {
                                 for (d, &sc) in g.primary_slope_cols.iter().enumerate() {
                                     // Slope covariate read as a random-effect column;
                                     // already carries one zw.
-                                    let z = w_buf[sc];
+                                    let z = raw_slope(sc);
                                     // scol mirrors from_cluster_spec's RE-column layout: change together.
                                     let scol = (d + 1) * n_prim + gid[0];
                                     // b's side is the crossed intercept (z=1 → zw);
@@ -894,9 +981,9 @@ impl LmmSuffStats {
                             let z_b = if db == 0 {
                                 zw // intercept z=1 → zw (one weight side)
                             } else if bi == 0 {
-                                w_buf[g.primary_slope_cols[db - 1]]
+                                raw_slope(g.primary_slope_cols[db - 1])
                             } else {
-                                w_buf[g.extra_slope_cols[bi - 1][db - 1]]
+                                raw_slope(g.extra_slope_cols[bi - 1][db - 1])
                             };
                             let b_local = bl + db;
                             for ai in 0..n_g {
@@ -912,9 +999,15 @@ impl LmmSuffStats {
                                     let (a_col, z_a) = if da == 0 {
                                         (gid[ai], zw) // intercept z=1 → zw
                                     } else if ai == 0 {
-                                        (da * n_prim + gid[0], w_buf[g.primary_slope_cols[da - 1]])
+                                        (
+                                            da * n_prim + gid[0],
+                                            raw_slope(g.primary_slope_cols[da - 1]),
+                                        )
                                     } else {
-                                        (gid[ai] + da, w_buf[g.extra_slope_cols[ai - 1][da - 1]])
+                                        (
+                                            gid[ai] + da,
+                                            raw_slope(g.extra_slope_cols[ai - 1][da - 1]),
+                                        )
                                     };
                                     zx[(a_col, b_local)] += z_a * z_b;
                                 }
@@ -929,14 +1022,17 @@ impl LmmSuffStats {
                 // incremented for slope subcols (the Gram reads `s_raw`, not counts).
                 if g.primary_q > 1 {
                     for (k, &sc) in g.primary_slope_cols.iter().enumerate() {
-                        let z = w_buf[sc];
+                        let z = raw_slope(sc);
                         let scol = (k + 1) * n_prim + gid[0];
                         let scol_mut = &mut s.col_as_slice_mut(scol)[..m];
                         for (sj, &wtj) in scol_mut.iter_mut().zip(wt) {
                             *sj += z * wtj;
                         }
-                        let rcol = &mut s_raw.col_as_slice_mut(scol)[..p];
+                        let (rcol, rcol_z) = s_raw.col_as_slice_mut(scol).split_at_mut(p);
                         for (sj, &wj) in rcol.iter_mut().zip(&w_buf[..p]) {
+                            *sj += z * wj;
+                        }
+                        for (sj, &wj) in rcol_z.iter_mut().zip(zr_buf) {
                             *sj += z * wj;
                         }
                     }
@@ -951,14 +1047,17 @@ impl LmmSuffStats {
                     for (e, cols) in g.extra_slope_cols.iter().enumerate() {
                         let gintercept = gid[1 + e];
                         for (d, &sc) in cols.iter().enumerate() {
-                            let z = w_buf[sc];
+                            let z = raw_slope(sc);
                             let scol = gintercept + 1 + d;
                             let scol_mut = &mut s.col_as_slice_mut(scol)[..m];
                             for (sj, &wtj) in scol_mut.iter_mut().zip(wt) {
                                 *sj += z * wtj;
                             }
-                            let rcol = &mut s_raw.col_as_slice_mut(scol)[..p];
+                            let (rcol, rcol_z) = s_raw.col_as_slice_mut(scol).split_at_mut(p);
                             for (sj, &wj) in rcol.iter_mut().zip(&w_buf[..p]) {
+                                *sj += z * wj;
+                            }
+                            for (sj, &wj) in rcol_z.iter_mut().zip(zr_buf) {
                                 *sj += z * wj;
                             }
                         }

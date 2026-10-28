@@ -1,4 +1,4 @@
-//! The crate's error surface. `ParseError`'s six variants and their Display
+//! The crate's error surface. `ParseError`'s four variants and their Display
 //! strings are a fixed contract — the parse test suite matches error
 //! substrings against them, so both change together with `parse.rs`; `Error`
 //! wraps it and adds the materialize-stage (data-dependent) failures. No
@@ -23,18 +23,13 @@ pub enum ParseError {
     },
     /// A `-` term removal outside parentheses (unsupported).
     TermRemovalUnsupported,
-    /// The same grouping factor appears in two random-effect terms.
-    DuplicateGroupingVar {
-        /// The grouping factor name that appears more than once.
-        name: String,
-    },
-    /// A slope term with nothing but `+` signs after its `1+`, e.g. `(1++|g)`.
+    /// A random-effect term with no column: nothing but `+` signs after its
+    /// `1+`, e.g. `(1++|g)`, or the intercept removed with nothing left, e.g.
+    /// `(0|g)`.
     EmptySlopeTerm {
         /// The grouping factor of the empty slope term.
         group: String,
     },
-    /// Intercept suppression `(0+…|g)` / `(-1+…|g)` in a random-effect term.
-    RandomInterceptSuppressionUnsupported,
 }
 
 impl fmt::Display for ParseError {
@@ -47,23 +42,15 @@ impl fmt::Display for ParseError {
             ParseError::TermRemovalUnsupported => {
                 write!(f, "term removal with '-' is not supported")
             }
-            ParseError::DuplicateGroupingVar { name } => {
-                write!(f, "duplicate grouping variable: {name}")
-            }
             ParseError::EmptySlopeTerm { group } => {
                 write!(f, "empty slope term for group {group}")
             }
-            ParseError::RandomInterceptSuppressionUnsupported => write!(
-                f,
-                "a random slope requires a random intercept in this engine version; \
-                 intercept suppression ('0 +' / '-1 +') in a random-effects term is \
-                 not supported — write '(x | g)' or '(1 + x | g)'"
-            ),
         }
     }
 }
 
-/// Everything `parse` or `materialize`/`lower` can reject.
+/// Everything `parse`, `materialize`/`lower` or [`fit`](super::fit()) can
+/// reject.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
     /// A data-free parse failure (see [`ParseError`]).
@@ -78,15 +65,14 @@ pub enum Error {
         name: String,
         /// The kind the column was expected to be, phrased to complete
         /// "column … is not …": `"numeric"` for a column read as numbers
-        /// (a transform argument, an offset, a `cbind()` count), or `"a factor
+        /// (a transform argument, an offset, a `cbind()` count), `"a factor
         /// or a column of whole numbers (grouping variable)"` for a grouping
-        /// column.
+        /// column, `"a factor, as in the fit"` for a new table's column that
+        /// was a factor in the fit ([`super::predict`]), and `"a factor of
+        /// the fixed part"` or `"a numeric variable with chosen values"` for
+        /// the factor or `by` variable of [`super::pairwise()`].
         expected: &'static str,
     },
-    /// A random-slope variable is not present as a (numeric) fixed term, so it
-    /// has no `ColumnId` in the design. A future version may allow
-    /// random-slope variables with no corresponding fixed-effect term.
-    SlopeVarNotInDesign(String),
     /// A factor in the fixed part of the formula (character, or logical with a
     /// single observed value) has fewer than 2 levels, so no treatment
     /// contrast can be built for it. R's `contrasts<-` refuses the same thing;
@@ -95,6 +81,17 @@ pub enum Error {
     SingleLevelFactor {
         /// The factor column name.
         name: String,
+    },
+    /// After factor coding, one random-effect column (the intercept included)
+    /// is in two terms on one grouping, e.g. `(1 | g) + (1 + x | g)`. A
+    /// factor's term holds the intercept in the crate's treatment coding, so
+    /// `(1 + x | g) + (0 + f | g)` is refused too.
+    RandomColumnRepeated {
+        /// The grouping factor.
+        group: String,
+        /// The repeated column: `"(Intercept)"`, a slope column, or a
+        /// factor's dummy column.
+        column: String,
     },
     /// [`super::label_ranef`] was handed a `Fit` and a `re_groups` that do not
     /// describe the same model. The payload says which count disagreed.
@@ -130,6 +127,10 @@ pub enum Error {
         /// 0-based row.
         row: usize,
     },
+    /// The kernel refused the lowered input ([`fit`](super::fit()),
+    /// [`fit_lowered`](super::fit_lowered)), with the [`crate::FitError`]
+    /// [`crate::fit`] returns.
+    Fit(crate::FitError),
 }
 
 impl fmt::Display for Error {
@@ -143,13 +144,15 @@ impl fmt::Display for Error {
             Error::WrongColumnKind { name, expected } => {
                 write!(f, "column '{name}' is not {expected}")
             }
-            Error::SlopeVarNotInDesign(name) => write!(
-                f,
-                "random-slope variable '{name}' is not a numeric fixed term in the design"
-            ),
             Error::SingleLevelFactor { name } => write!(
                 f,
                 "column '{name}': contrasts can be applied only to factors with 2 or more levels"
+            ),
+            Error::RandomColumnRepeated { group, column } => write!(
+                f,
+                "random-effect column '{column}' is in two terms on grouping '{group}'; \
+                 put each column in one term, for example (1 + x + f | g) or \
+                 (x + f || g) instead of (1 + x | g) + (0 + f | g)"
             ),
             Error::RanefShapeMismatch(detail) => write!(
                 f,
@@ -173,6 +176,7 @@ impl fmt::Display for Error {
                 f,
                 "cbind(): successes and failures must be non-negative at every row; row {row} is not"
             ),
+            Error::Fit(e) => write!(f, "{e}"),
         }
     }
 }

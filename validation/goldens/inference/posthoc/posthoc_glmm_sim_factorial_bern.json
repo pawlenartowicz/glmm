@@ -1,0 +1,120 @@
+{
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0",
+      "emmeans": "2.0.4",
+      "pbkrtest": "0.5.5"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_posthoc.R"
+  },
+  "emmeans": [
+    {
+      "level": "a",
+      "by": null,
+      "estimate": -1.30408703790595,
+      "SE": 0.520658778366585,
+      "df": null
+    },
+    {
+      "level": "b",
+      "by": null,
+      "estimate": 0.709729621640368,
+      "SE": 0.441449236341386,
+      "df": null
+    },
+    {
+      "level": "c",
+      "by": null,
+      "estimate": -0.425207841705063,
+      "SE": 0.493293311010486,
+      "df": null
+    }
+  ],
+  "contrasts": [
+    {
+      "contrast": "a - b",
+      "by": null,
+      "estimate": -2.01381665954632,
+      "SE": 0.602064622642693,
+      "df": null,
+      "statistic": -3.34485133955705,
+      "statistic_name": "z",
+      "p_none": 0.000823266845043832,
+      "p_tukey": 0.00237325193488669
+    },
+    {
+      "contrast": "a - c",
+      "by": null,
+      "estimate": -0.87887919620089,
+      "SE": 0.616780786575269,
+      "df": null,
+      "statistic": -1.42494580786303,
+      "statistic_name": "z",
+      "p_none": 0.154172866756734,
+      "p_tukey": 0.327988704039917
+    },
+    {
+      "contrast": "b - c",
+      "by": null,
+      "estimate": 1.13493746334543,
+      "SE": 0.572469808755318,
+      "df": null,
+      "statistic": 1.98252806696138,
+      "statistic_name": "z",
+      "p_none": 0.047420169275248,
+      "p_tukey": 0.116501177487392
+    }
+  ],
+  "response": [
+    {
+      "contrast": "a / b",
+      "by": null,
+      "ratio": 0.133478260173306,
+      "SE": 0.0803625383422445,
+      "df": null,
+      "statistic": -3.34485133955705,
+      "statistic_name": "z",
+      "p_none": 0.000823266845043832,
+      "p_tukey": 0.00237325193488669
+    },
+    {
+      "contrast": "a / c",
+      "by": null,
+      "ratio": 0.415248062567546,
+      "SE": 0.256117026654268,
+      "df": null,
+      "statistic": -1.42494580786303,
+      "statistic_name": "z",
+      "p_none": 0.154172866756734,
+      "p_tukey": 0.327988704039917
+    },
+    {
+      "contrast": "b / c",
+      "by": null,
+      "ratio": 3.11097898660348,
+      "SE": 1.78094154550271,
+      "df": null,
+      "statistic": 1.98252806696138,
+      "statistic_name": "z",
+      "p_none": 0.047420169275248,
+      "p_tukey": 0.116501177487392
+    }
+  ],
+  "name": "posthoc_glmm_sim_factorial_bern"
+}

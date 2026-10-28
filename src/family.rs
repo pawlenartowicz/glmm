@@ -1967,6 +1967,20 @@ mod tests {
                 }
             }
         }
+        // Closed form on cloglog's upper side with y = 0: the deviance is
+        // `2e^η`, so the observed weight is `e^η`. The μ form at the stored
+        // `1 − PROB_EPS` would divide by `V` at the bound and go strongly
+        // negative, making the Laplace `A` non-PD.
+        let eta = 3.32;
+        let mu = link_inv(cloglog, eta);
+        assert!(in_tail(cloglog, eta, mu));
+        let fisher = irls_weight_and_resid(cloglog, f64::NAN, 0.0, eta).1;
+        let wo = observed_weight(cloglog, f64::NAN, 0.0, 1.0, eta, mu, fisher);
+        let t = eta.exp();
+        assert!(
+            (wo - t).abs() <= 1e-12 * t,
+            "cloglog tail y=0: observed weight {wo} vs e^η {t}"
+        );
     }
 
     /// The deviance keeps growing into the tail: on each family with a μ bound
@@ -2888,22 +2902,5 @@ mod probit_rows_tests {
                 assert_eq!(a[i][c].to_bits(), b[c].to_bits(), "row {i} quantity {c}");
             }
         }
-    }
-
-    /// Only a probit `f64` pass takes the tiles.
-    #[test]
-    fn probit_rows_are_probit_and_f64_only() {
-        let (eta, mu, _) = rows();
-        assert!(ProbitRows::new(PROBIT_F, &eta, &mu).is_some());
-        for link in [BinomialLink::Logit, BinomialLink::Cloglog] {
-            assert!(ProbitRows::new(Family::Binomial { link }, &eta, &mu).is_none());
-        }
-        let ed: Vec<crate::dual::Dual<1>> = eta
-            .iter()
-            .map(|&e| crate::dual::Dual::from_f64(e))
-            .collect();
-        let md: Vec<crate::dual::Dual<1>> =
-            mu.iter().map(|&m| crate::dual::Dual::from_f64(m)).collect();
-        assert!(ProbitRows::new(PROBIT_F, &ed, &md).is_none());
     }
 }

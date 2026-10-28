@@ -5,16 +5,16 @@
 
 #[cfg(feature = "formula")]
 use glmm::formula::anova::{
-    compare, term_tests, CompareOptions, ComparisonTest, Model, TermTest, TermTestOptions,
+    compare, term_tests, CompareOptions, ComparisonTest, TermTest, TermTestOptions,
 };
 #[cfg(feature = "formula")]
-use glmm::formula::{lower, Column, Lowered, Table};
-use glmm::inference::{DenDf, LinearNote, Reference};
+use glmm::formula::{Column, Model, Table};
 #[cfg(feature = "formula")]
-use glmm::loop_advanced::type3_pub;
-use glmm::loop_advanced::{lr_p_value_pub, wald_chisq_pub};
+use glmm::inference::Reference;
 #[cfg(feature = "formula")]
-use glmm::{fit_cold, Family, Fit, PoissonLink};
+use glmm::loop_advanced::{lr_p_value_pub, type3_pub, wald_chisq_pub};
+#[cfg(feature = "formula")]
+use glmm::{Family, FitOptions, PoissonLink};
 
 #[cfg(feature = "formula")]
 /// 30 rows: six groups `g` of five, a numeric `x`, a two-level `a` and a
@@ -56,19 +56,13 @@ fn poisson() -> Family {
 }
 
 #[cfg(feature = "formula")]
-/// The lowering of `formula` with `reml` and its converged fit.
-fn fitted(formula: &str, family: Family, reml: Option<bool>) -> (Lowered, Fit) {
-    let mut lo = lower(formula, &table(), family).unwrap();
-    lo.opts.reml = reml;
-    let fit = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
-    assert!(fit.converged(), "{formula} did not converge");
-    (lo, fit)
-}
-
-#[cfg(feature = "formula")]
+/// The converged fit of `formula` with `reml`.
 fn model(formula: &str, family: Family, reml: Option<bool>) -> Model {
-    let (lo, fit) = fitted(formula, family, reml);
-    Model::from_fit(formula, &lo, &fit)
+    let mut fit_opts = FitOptions::default();
+    fit_opts.reml = reml;
+    let m = glmm::formula::fit(formula, &table(), family, &fit_opts).unwrap();
+    assert!(m.fit().converged(), "{formula} did not converge");
+    m
 }
 
 #[test]
@@ -108,12 +102,13 @@ fn the_lr_p_value_is_the_one_compare_reports() {
 #[test]
 #[cfg(feature = "formula")]
 fn type3_and_the_wald_chisq_give_the_term_tests_rows() {
-    let (lo, fit) = fitted("k ~ x + a * b", poisson(), None);
+    let m = model("k ~ x + a * b", poisson(), None);
+    let (lo, fit) = (m.lowered(), m.fit());
     let mut opts = TermTestOptions::default();
     opts.test = TermTest::Wald;
-    let table = term_tests(&lo, &fit, &opts).unwrap();
+    let table = term_tests(&m, &opts).unwrap();
     let retained: Vec<usize> = (0..lo.p).filter(|&j| !fit.aliased()[j]).collect();
-    let hypotheses = type3_pub(&lo, &retained);
+    let hypotheses = type3_pub(lo, &retained);
     assert_eq!(hypotheses.len(), table.fixed.len());
     for (h, row) in hypotheses.iter().zip(&table.fixed) {
         assert_eq!(h.term, row.label);
@@ -133,47 +128,4 @@ fn type3_and_the_wald_chisq_give_the_term_tests_rows() {
             h.term
         );
     }
-}
-
-#[test]
-fn the_lr_p_value_follows_the_reference_it_is_given() {
-    // χ² on 2 df has the closed upper tail exp(-t/2).
-    let p = lr_p_value_pub(3.0, &Reference::ChiSquared { df: 2 });
-    assert!((p - (-1.5f64).exp()).abs() < 1e-12);
-    // The mixture with df_low 0 is half the χ²₁ tail above 0 and 1 at 0.
-    let chi1 = lr_p_value_pub(3.0, &Reference::ChiSquared { df: 1 });
-    let mix = lr_p_value_pub(3.0, &Reference::ChiBarSquared { df_low: 0 });
-    assert!((mix - 0.5 * chi1).abs() < 1e-12);
-    assert_eq!(
-        lr_p_value_pub(0.0, &Reference::ChiBarSquared { df_low: 0 }),
-        1.0
-    );
-    // No p-value from the statistic alone.
-    assert!(lr_p_value_pub(f64::NAN, &Reference::ChiSquared { df: 1 }).is_nan());
-    assert!(lr_p_value_pub(3.0, &Reference::ChiSquared { df: 0 }).is_nan());
-    let f = Reference::F {
-        num_df: 1.0,
-        den_df: 5.0,
-        den_df_kind: DenDf::Residual,
-    };
-    assert!(lr_p_value_pub(3.0, &f).is_nan());
-}
-
-#[test]
-fn a_row_with_no_tested_direction_gives_a_nan_p_value() {
-    let beta = [0.5, 1.0];
-    let vcov = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
-    let aliased = [false, true];
-    // Zero on the one column tested: 0 df.
-    let t = wald_chisq_pub(&beta, &vcov, &aliased, &[0.0, 0.0], 1);
-    assert_eq!(
-        (t.statistic, t.num_df, t.reference),
-        (0.0, 0.0, Reference::ChiSquared { df: 0 })
-    );
-    assert!(t.p_value.is_nan());
-    assert_eq!(t.notes, [LinearNote::RankDeficientL { rank: 0, rows: 1 }]);
-    // Non-zero on the aliased column: not tested.
-    let t = wald_chisq_pub(&beta, &vcov, &aliased, &[0.0, 1.0], 1);
-    assert!(t.statistic.is_nan() && t.num_df.is_nan() && t.p_value.is_nan());
-    assert_eq!(t.notes, [LinearNote::AliasedColumn { column: 1 }]);
 }

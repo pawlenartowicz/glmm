@@ -2,7 +2,7 @@
 
 ## The accuracy grid
 
-`glmm` is validated against a grid of 923 model cells in `validation/grid/`. Each
+`glmm` is validated against a grid of 947 model cells in `validation/grid/`. Each
 cell fixes a family, a link, a random-effect structure, a size, a balance and a
 regime, and — where the data is simulated — records the parameters it was
 generated from. A cell is fitted by `glmm` and by every external engine that can
@@ -13,17 +13,17 @@ Four external engines are the oracles, each pinned to an exact version:
 
 | Oracle | Version | Cells it fits | Estimator |
 |---|---|---|---|
-| R `lme4` | 2.0-6 | every family; negative binomial through `glmer.nb` (911 of 923 cells) | Laplace, scalar AGQ |
-| R `glmmTMB` | 1.1.14 | every family but inverse-Gaussian, no AGQ cells (892 of 923 cells) | Laplace |
-| Julia `MixedModels.jl` | 5.9.0 | gaussian, binomial logit/probit, Poisson (587 of 923 cells) | Laplace |
-| R `GLMMadaptive` | 0.9-7 | non-gaussian, one grouping factor (28 of 923 cells, all AGQ) | AGQ |
+| R `lme4` | 2.0-6 | every family; negative binomial through `glmer.nb` (935 of 947 cells) | Laplace, scalar AGQ |
+| R `glmmTMB` | 1.1.14 | every family but inverse-Gaussian, no AGQ cells (916 of 947 cells) | Laplace |
+| Julia `MixedModels.jl` | 5.9.0 | gaussian, binomial logit/probit, Poisson (601 of 947 cells) | Laplace |
+| R `GLMMadaptive` | 0.9-7 | non-gaussian, one grouping factor (28 of 947 cells, all AGQ) | AGQ |
 
-A fifth engine, R `lmerTest` 3.2-1, fits the 259 Gaussian mixed-model cells
-(the 130 REML cells and their ML twins) for one quantity only, the
+A fifth engine, R `lmerTest` 3.2-1, fits the 263 Gaussian mixed-model cells
+(the 132 REML cells and their ML twins) for one quantity only, the
 per-coefficient Satterthwaite degrees of freedom. Its fit is lme4's, so the
 deviance and parameter checks below never read it.
 
-129 of the cells are ML twins (tag `ml`): each refits one of the REML Gaussian
+131 of the cells are ML twins (tag `ml`): each refits one of the REML Gaussian
 mixed-model cells by maximum likelihood (`reml = false`) on that cell's data,
 and lme4, glmmTMB, MixedModels.jl and lmerTest fit it with their own ML switch.
 Every Gaussian mixed-model cell has a twin except `sim_entangled_pair_lmm`,
@@ -47,24 +47,39 @@ five checks:
    result.
 2. **Parameters against the nearest oracle.** Fixed effects, standard errors by
    matching method, random-effect standard deviations and correlations pass when
-   they are within band of at least one oracle that fitted the cell. Out of band
-   against all of them passes only under an entry in
+   they are within band of at least one oracle at `glmm`'s optimum: a converged
+   oracle whose deviance is no more than the deviance floor above `glmm`'s, or
+   whose deviance cannot be compared with `glmm`'s. An
+   oracle that stopped at a worse point describes a different fit, and check 1 has
+   already scored the cell. Two fits at the same optimum that both put a
+   random-effect standard deviation near zero agree on it, whatever their residues.
+   Out of band against every reference passes only under an entry in
    `validation/grid/divergences.json`: an undocumented difference fails, one that
    outgrows its entry fails, and an entry that stops firing fails as stale.
-3. **Error against the truth, per family (hard).** On the generated cells the
+3. **Error against the truth, per family.** On the generated cells the
    per-cell error against the generating parameters is averaged per family and
    estimator arm, for `glmm` and for every oracle. `glmm` fails the family if it
-   is worse than the best oracle by more than the paired band. This is the check
-   that makes an oracle's own defect visible rather than contagious.
+   is worse than the best oracle by more than the paired band, unless a registry
+   entry covers the group. This is the check that makes an oracle's own defect
+   visible rather than contagious.
 4. **Port gates (hard).** The Python and R packages wrap the same Rust kernel, so
    they are compared against the Rust engine at a round-off band. A miss is a
    wiring bug, never a divergence.
-5. **Satterthwaite df against lmerTest.** On every Gaussian mixed-model cell,
-   `glmm`'s per-coefficient df are compared with lmerTest's. Out of band passes
-   only under a registered entry, as in check 2.
+5. **Satterthwaite df against lmerTest.** On every Gaussian mixed-model cell
+   whose lmerTest fit is at `glmm`'s optimum, `glmm`'s per-coefficient df are
+   compared with lmerTest's. Out of band passes only under a registered entry, as
+   in check 2.
 
-Where two oracles disagree with **each other**, that is recorded as a flag to
-investigate. It is never resolved by picking whichever one sits closer to `glmm`.
+A cell with no usable reference is listed by name, never passed in silence: on the
+0.7.0 run, check 1 had no reference deviance on 33 of the 947 cells (32 where no
+oracle on `glmm`'s objective converged, and one vector-AGQ cell where GLMMadaptive's
+quadrature rule has no value at a singular covariance), and check 2 had no reference for at least one
+quantity on 36. `compare.R` also lists, per oracle, every record that is not a
+converged fit, grouped by message.
+
+Where two oracles disagree with **each other**, the comparison prints the gap (the
+deviance gap of a two-oracle cell, and `compare.R --dev-floor`'s pairwise table).
+It is never resolved by picking whichever one sits closer to `glmm`.
 
 ## What is covered
 
@@ -186,8 +201,9 @@ its datasets lose a fit.
 The cell lists are `mc_data::bands` in `src/inference/mc_data.rs`. Everything else is
 reported only: the GLMM rows of the two-df factor `f3`, the GLM rows, the AGQ arm,
 the profile intervals, power, bias and RMSE, and every cell outside the table. The
-set was fixed from theory and a pilot (on other seeds) before the measurement and
-was not re-selected on its result. It holds 4416 checks, with about 0.014 failures
+set was fixed from theory and a pilot (on other seeds) before the measurement, and
+re-selected once after it: the two parts below moved to reported, for the reasons
+given, and the set has stayed frozen since. It holds 4416 checks, with about 0.014 failures
 expected from Monte Carlo noise, and the measurement passes all of them.
 
 **Moved to reported after the measurement.** Two parts of the set as first fixed

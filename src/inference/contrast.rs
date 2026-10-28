@@ -160,34 +160,7 @@ impl Fit {
             l.iter().all(|v| v.is_finite()),
             "contrast_t: l must be finite"
         );
-        let st = self.df_state()?;
-        let notes = aliased_notes(st, l, p);
-        if !notes.is_empty() {
-            return Ok(ContrastT {
-                estimate: f64::NAN,
-                se: f64::NAN,
-                t: f64::NAN,
-                df: f64::NAN,
-                p_value: f64::NAN,
-                notes,
-            });
-        }
-        let inputs = Inputs::new(&self.beta, st);
-        let r = contest_1d(&inputs.contest(), &inputs.restrict(l));
-        // A residual-only record has no variance parameters: its df is ν.
-        let (df, p_value) = if st.residual_only() {
-            (st.nu, t_two_sided_p(r.t_value, st.nu))
-        } else {
-            (r.df, r.p_value)
-        };
-        Ok(ContrastT {
-            estimate: r.estimate,
-            se: r.std_error,
-            t: r.t_value,
-            df,
-            p_value,
-            notes,
-        })
+        Ok(contrast_t_of(&self.beta, self.df_state()?, l))
     }
 
     /// The F test of `Lβ = 0` with lmerTest's Satterthwaite denominator df
@@ -228,6 +201,40 @@ impl Fit {
             None => NoDfReason::NotGaussianMixed,
         };
         Err(ContrastError::NoDf(reason))
+    }
+}
+
+/// The test of [`Fit::contrast_t`] on `beta` (all `p` caller columns) and the
+/// df record `st`, the only two things it reads. The caller has checked `l`:
+/// `p` finite entries.
+pub(crate) fn contrast_t_of(beta: &[f64], st: &SatterthwaiteState, l: &[f64]) -> ContrastT {
+    let p = beta.len();
+    let notes = aliased_notes(st, l, p);
+    if !notes.is_empty() {
+        return ContrastT {
+            estimate: f64::NAN,
+            se: f64::NAN,
+            t: f64::NAN,
+            df: f64::NAN,
+            p_value: f64::NAN,
+            notes,
+        };
+    }
+    let inputs = Inputs::new(beta, st);
+    let r = contest_1d(&inputs.contest(), &inputs.restrict(l));
+    // A residual-only record has no variance parameters: its df is ν.
+    let (df, p_value) = if st.residual_only() {
+        (st.nu, t_two_sided_p(r.t_value, st.nu))
+    } else {
+        (r.df, r.p_value)
+    };
+    ContrastT {
+        estimate: r.estimate,
+        se: r.std_error,
+        t: r.t_value,
+        df,
+        p_value,
+        notes,
     }
 }
 

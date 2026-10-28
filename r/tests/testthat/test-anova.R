@@ -25,12 +25,15 @@ test_that("anova(m) is the stored Type III table, an anova data frame with no wr
   m <- fastglmm(y ~ x * f + (1 | g), d)
   tab <- anova(m)
   expect_identical(class(tab), c("anova", "data.frame"))
-  expect_identical(names(tab),
-                   c("Sum Sq", "Mean Sq", "NumDF", "DenDF", "F value", "Pr(>F)"))
+  expect_identical(names(tab), c("Sum Sq", "Mean Sq", "NumDF", "DenDF", "F value",
+                                 "Eta2_partial", "Pr(>F)"))
   expect_identical(rownames(tab), c("x", "f", "x:f"))
   expect_identical(attr(tab, "heading")[1L],
                    "Type III Analysis of Variance Table with Satterthwaite's method")
+  expect_identical(attr(tab, "heading")[length(attr(tab, "heading"))],
+                   "Partial eta-squared uses the Satterthwaite denominator df, so it is approximate.")
   stored <- m$term_table_type3
+  expect_identical(tab$Eta2_partial, stored$eta2_partial)
   expect_identical(tab[["F value"]], stored$statistic)
   expect_identical(tab$NumDF, stored$num_df)
   expect_identical(tab$DenDF, stored$den_df)
@@ -697,6 +700,8 @@ test_that("contrast_test() of a term's unit rows is its anova row, bit for bit",
     m <- case[[1L]]
     tab <- contrast_test(m, unit_rows(m, c("fb", "fc")))
     term <- anova(m, test = case[[2L]])
+    # A contrast is not a term: its row has no partial eta-squared.
+    term$Eta2_partial <- NULL
     expect_identical(attr(tab, "heading"), case[[3L]])
     expect_identical(rownames(tab), "contrast")
     expect_identical(names(tab), names(term))
@@ -731,8 +736,8 @@ test_that("contrast_test() on an aliased coefficient of a Satterthwaite LMM", {
   expect_identical(a$df_method, "satterthwaite")
   expect_identical(unname(a$aliased), c(FALSE, FALSE, TRUE, FALSE, FALSE))
   expect_identical(a$satterthwaite_record$retained, c(1L, 2L, 4L, 5L))
-  expect_identical(columns(contrast_test(a, unit_rows(a, c("fb", "fc")))),
-                   columns(anova(a)["f", ]))
+  tab <- contrast_test(a, unit_rows(a, c("fb", "fc")))
+  expect_identical(columns(tab), columns(anova(a)["f", names(tab)]))
   expect_identical(attr(contrast_test(a, unit_rows(a, c("x", "x2"))), "heading")[2L],
                    "contrast: The coefficient x2 is aliased, so the hypothesis was not tested.")
 })
@@ -767,5 +772,193 @@ test_that("contrast_test() refuses an L of the wrong shape or not finite", {
   expect_error(contrast_test(m, rep(NA_real_, p)), "L must be finite numbers", fixed = TRUE)
   expect_error(contrast_test(m, rep(Inf, p)), "L must be finite numbers, got inf", fixed = TRUE)
   expect_error(contrast_test(list(), numeric(p)), "contrast_test() takes a fastglmm fit",
+               fixed = TRUE)
+})
+
+test_that("Eta2_partial is on F tables only, and noted on Satterthwaite tables only", {
+  d <- contrast_data()
+  ols <- anova(fastglmm(y ~ x + f, d))
+  expect_identical(names(ols), c("Sum Sq", "Mean Sq", "NumDF", "DenDF", "F value",
+                                 "Eta2_partial", "Pr(>F)"))
+  expect_false(any(grepl("eta-squared", attr(ols, "heading"))))
+  p <- fastglmm(n ~ x + f + (1 | g), d, family = poisson())
+  for (test in c("auto", "Wald")) {
+    chisq <- anova(p, test = test)
+    expect_false("Eta2_partial" %in% names(chisq))
+    expect_false(any(grepl("eta-squared", attr(chisq, "heading"))))
+  }
+})
+
+# A sleepstudy-shaped LMM: 18 subjects over 10 days, a random intercept and
+# slope.
+sleep_data <- function() {
+  set.seed(20261026)
+  subject <- factor(rep(1:18, each = 10))
+  days <- rep(0:9, 18)
+  reaction <- 250 + 10 * days + rnorm(18, sd = 25)[as.integer(subject)] +
+    rnorm(18, sd = 6)[as.integer(subject)] * days + rnorm(180, sd = 25)
+  data.frame(Reaction = reaction, Days = days, Subject = subject)
+}
+
+r2_line <- function(m) {
+  r <- r2(m)
+  sprintf("Marginal R2: %.3f, conditional R2: %.3f, adjusted ICC: %.3f",
+          r[["marginal"]], r[["conditional"]], icc(m)[["adjusted"]])
+}
+
+test_that("summary() of a mixed model prints R2 and the adjusted ICC under the counts", {
+  m <- fastglmm(Reaction ~ Days + (Days | Subject), sleep_data())
+  r <- r2(m)
+  expect_identical(names(r), c("marginal", "conditional"))
+  expect_identical(names(icc(m)), c("adjusted", "unadjusted"))
+  expect_true(0 < r[["marginal"]] && r[["marginal"]] < r[["conditional"]] &&
+                r[["conditional"]] < 1)
+  out <- capture.output(print(summary(m)))
+  i <- match(r2_line(m), out)
+  expect_false(is.na(i))
+  expect_match(out[i - 1L], "^Number of obs: 180, groups:")
+  expect_identical(summary(m)$effect_sizes,
+                   c(marginal_r2 = r[["marginal"]], conditional_r2 = r[["conditional"]],
+                     adjusted_icc = icc(m)[["adjusted"]]))
+  expect_false(summary(m)$r2_need_refit)
+})
+
+test_that("a fit without random effects has no R2 line and NaN r2() and icc()", {
+  m <- fastglmm(Reaction ~ Days, sleep_data())
+  expect_true(all(is.nan(c(r2(m), icc(m)))))
+  expect_false(any(grepl("Marginal R2", capture.output(print(summary(m))))))
+  expect_null(summary(m)$effect_sizes)
+  expect_error(r2(list()), "r2() takes a fastglmm fit", fixed = TRUE)
+  expect_error(icc(list()), "icc() takes a fastglmm fit", fixed = TRUE)
+})
+
+test_that("summary() of a Poisson GLMM points to r2() and icc() instead of refitting", {
+  d <- anova_data()
+  d$n <- rpois(nrow(d), exp(0.2 + 0.3 * d$x + rnorm(40, sd = 0.5)[as.integer(d$g)]))
+  m <- fastglmm(n ~ x + (1 | g), d, family = poisson())
+  s <- summary(m)
+  expect_true(s$r2_need_refit)
+  expect_null(s$effect_sizes)
+  out <- capture.output(print(s))
+  i <- match("R2 and ICC need a refit of the null model: call r2(fit) and icc(fit)", out)
+  expect_false(is.na(i))
+  expect_match(out[i - 1L], "^Number of obs: 320, groups:")
+  expect_false(any(grepl("Marginal R2", out)))
+  r <- r2(m)
+  expect_true(0 < r[["marginal"]] && r[["marginal"]] < r[["conditional"]] &&
+                r[["conditional"]] < 1)
+  expect_true(all(is.finite(icc(m))))
+})
+
+test_that("a fit stored by 0.6.x prints its summary and anova, and r2() and icc() refuse it", {
+  m <- fastglmm(Reaction ~ Days + (Days | Subject), sleep_data())
+  old <- m
+  old$.kernel_parts <- NULL
+  old$term_table_type3$eta2_partial <- NULL
+  path <- tempfile(fileext = ".rds")
+  saveRDS(old, path)
+  old <- readRDS(path)
+  unlink(path)
+  out <- capture.output(print(summary(m)))
+  expect_identical(capture.output(print(summary(old))), out[out != r2_line(m)])
+  tab <- anova(old)
+  expect_identical(names(tab), c("Sum Sq", "Mean Sq", "NumDF", "DenDF", "F value", "Pr(>F)"))
+  expect_false(any(grepl("eta-squared", attr(tab, "heading"))))
+  for (f in list(r2, icc)) {
+    expect_error(f(old), "pairwise(), r2() and icc() read. Refit", fixed = TRUE)
+  }
+})
+
+# -- pairwise() ----------------------------------------------------------------
+
+test_that("pairwise() columns follow the family", {
+  d <- anova_data()
+  d$n <- rpois(nrow(d), exp(0.2 + 0.3 * d$x))
+  d$b <- as.numeric(d$y > 1.2)
+  cases <- list(
+    list(fastglmm(y ~ x + f + (1 | g), d), c("t.ratio", "p.value")),
+    list(fastglmm(y ~ x + f, d), c("t.ratio", "p.value")),
+    list(fastglmm(n ~ x + f + (1 | g), d, family = poisson()),
+         c("z.ratio", "p.value", "ratio", "ratio.SE")),
+    list(fastglmm(b ~ x + f + (1 | g), d, family = binomial()),
+         c("z.ratio", "p.value", "odds.ratio", "ratio.SE")))
+  for (case in cases) {
+    tab <- pairwise(case[[1L]], "f")
+    expect_identical(class(tab), c("fastglmm_pairwise", "data.frame"))
+    expect_identical(names(tab), c("contrast", "estimate", "SE", "df", case[[2L]]))
+    expect_identical(tab$contrast, c("a - b", "a - c", "b - c"))
+    expect_identical(attr(tab, "heading"), "Pairwise comparisons of f")
+    expect_identical(attr(tab, "footer"), "P value adjustment: holm method for 3 tests")
+    expect_identical(all(is.infinite(tab$df)), identical(case[[1L]]$df_method, "none"))
+  }
+  pois <- pairwise(cases[[3L]][[1L]], "f")
+  expect_equal(pois$ratio, exp(pois$estimate), tolerance = 1e-15)
+  out <- capture.output(print(pois))
+  expect_identical(out[1L], "Pairwise comparisons of f")
+  expect_identical(out[length(out)], "P value adjustment: holm method for 3 tests")
+})
+
+test_that("pairwise() passes adjust, by and at to the crate", {
+  d <- anova_data()
+  m <- fastglmm(y ~ x + f + (1 | g), d)
+  none <- pairwise(m, "f", adjust = "none")
+  expect_length(attr(none, "footer"), 0L)
+  bonf <- pairwise(m, "f", adjust = "bonferroni")
+  expect_identical(bonf$p.value, pmin(1, 3 * none$p.value))
+  expect_identical(attr(bonf, "footer"), "P value adjustment: bonferroni method for 3 tests")
+  tukey <- pairwise(m, "f", adjust = "tukey")
+  expect_identical(attr(tukey, "footer"),
+                   "P value adjustment: tukey method for comparing a family of 3 estimates")
+  expect_true(all(tukey$p.value >= none$p.value))
+  d$h <- factor(rep(c("p", "q"), length.out = nrow(d)))
+  by <- pairwise(fastglmm(y ~ x + f * h + (1 | g), d), "f", by = "h")
+  expect_identical(names(by)[1:2], c("contrast", "h"))
+  expect_identical(by$h, rep(c("p", "q"), each = 3L))
+  expect_identical(attr(by, "heading"), "Pairwise comparisons of f by h")
+  at <- pairwise(fastglmm(y ~ x * f, d), "f", by = "x", at = c(-1, 1))
+  expect_identical(at$x, rep(c("-1", "1"), each = 3L))
+})
+
+test_that("confint() of a pairwise table follows its adjustment", {
+  d <- anova_data()
+  m <- fastglmm(y ~ x + f + (1 | g), d)
+  ci <- confint(pairwise(m, "f"))
+  expect_identical(class(ci), c("fastglmm_pairwise_ci", "data.frame"))
+  expect_identical(names(ci), c("contrast", "estimate", "lower.CL", "upper.CL"))
+  expect_identical(attr(ci, "footer"), c(
+    "Confidence level used: 0.95",
+    "Holm has no simultaneous interval; Bonferroni intervals shown."))
+  bonf <- confint(pairwise(m, "f", adjust = "bonferroni"))
+  expect_identical(ci$lower.CL, bonf$lower.CL)
+  expect_identical(attr(bonf, "footer")[2L],
+                   "Conf-level adjustment: bonferroni method for 3 estimates")
+  none <- confint(pairwise(m, "f", adjust = "none"), level = 0.9)
+  expect_identical(attr(none, "footer"), "Confidence level used: 0.9")
+  expect_true(all(none$upper.CL - none$lower.CL < bonf$upper.CL - bonf$lower.CL))
+  expect_identical(attr(confint(pairwise(m, "f", adjust = "tukey")), "footer")[2L],
+                   "Conf-level adjustment: tukey method for comparing a family of 3 estimates")
+  d$n <- rpois(nrow(d), exp(0.2 + 0.3 * d$x))
+  ratio <- confint(pairwise(fastglmm(n ~ x + f + (1 | g), d, family = poisson()), "f"))
+  expect_identical(names(ratio)[5:7], c("ratio", "ratio.lower.CL", "ratio.upper.CL"))
+  expect_equal(ratio$ratio.lower.CL, exp(ratio$lower.CL), tolerance = 1e-15)
+  expect_error(confint(pairwise(m, "f"), level = 1),
+               "level must be a number strictly between 0 and 1", fixed = TRUE)
+  expect_identical(capture.output(print(ci))[1L], "Pairwise comparisons of f")
+})
+
+test_that("pairwise() refuses bad arguments and an old fit", {
+  d <- anova_data()
+  m <- fastglmm(y ~ x + f + (1 | g), d)
+  expect_error(pairwise(m, "f", adjust = "sidak"),
+               'adjust must be "holm", "bonferroni", "tukey" or "none", got "sidak"',
+               fixed = TRUE)
+  expect_error(pairwise(m, "f", at = 1), "at gives the values of a numeric by", fixed = TRUE)
+  expect_error(pairwise(m, "x"), "column 'x' is not a factor of the fixed part", fixed = TRUE)
+  expect_error(pairwise(m, "nope"), "unknown column: nope", fixed = TRUE)
+  expect_error(pairwise(list(), "f"), "pairwise() takes a fastglmm fit", fixed = TRUE)
+  old <- m
+  old$.kernel_parts <- NULL
+  expect_error(pairwise(old, "f"),
+               "did not keep what predict(), simulate(), pairwise(), r2() and icc() read",
                fixed = TRUE)
 })

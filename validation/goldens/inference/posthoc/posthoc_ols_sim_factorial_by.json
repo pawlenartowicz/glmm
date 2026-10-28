@@ -1,0 +1,139 @@
+{
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0",
+      "emmeans": "2.0.4",
+      "pbkrtest": "0.5.5"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_posthoc.R"
+  },
+  "emmeans": [
+    {
+      "level": "a",
+      "by": "p",
+      "estimate": 10.2644160973418,
+      "SE": 0.291814854372522,
+      "df": 113
+    },
+    {
+      "level": "b",
+      "by": "p",
+      "estimate": 11.4191162531043,
+      "SE": 0.376773716987632,
+      "df": 113
+    },
+    {
+      "level": "c",
+      "by": "p",
+      "estimate": 9.65697139676818,
+      "SE": 0.506060475553274,
+      "df": 113
+    },
+    {
+      "level": "a",
+      "by": "q",
+      "estimate": 11.0038031360555,
+      "SE": 0.463252589175398,
+      "df": 113
+    },
+    {
+      "level": "b",
+      "by": "q",
+      "estimate": 12.425908519428,
+      "SE": 0.326369695078345,
+      "df": 113
+    },
+    {
+      "level": "c",
+      "by": "q",
+      "estimate": 9.64461350894935,
+      "SE": 0.314014377241447,
+      "df": 113
+    }
+  ],
+  "contrasts": [
+    {
+      "contrast": "a - b",
+      "by": "p",
+      "estimate": -1.15470015576249,
+      "SE": 0.47659097497466,
+      "df": 113,
+      "statistic": -2.42283260992068,
+      "statistic_name": "t",
+      "p_none": 0.0169884009649832,
+      "p_tukey": 0.0444595748595139
+    },
+    {
+      "contrast": "a - c",
+      "by": "p",
+      "estimate": 0.607444700573635,
+      "SE": 0.584082724237368,
+      "df": 113,
+      "statistic": 1.03999771841698,
+      "statistic_name": "t",
+      "p_none": 0.30056108739911,
+      "p_tukey": 0.553302585596477
+    },
+    {
+      "contrast": "b - c",
+      "by": "p",
+      "estimate": 1.76214485633613,
+      "SE": 0.631165438737281,
+      "df": 113,
+      "statistic": 2.79189060139526,
+      "statistic_name": "t",
+      "p_none": 0.00615456254928344,
+      "p_tukey": 0.016814393949021
+    },
+    {
+      "contrast": "a - b",
+      "by": "q",
+      "estimate": -1.42210538337247,
+      "SE": 0.567317924162806,
+      "df": 113,
+      "statistic": -2.50671682103307,
+      "statistic_name": "t",
+      "p_none": 0.0136082779850343,
+      "p_tukey": 0.0360104020129762
+    },
+    {
+      "contrast": "a - c",
+      "by": "q",
+      "estimate": 1.35918962710616,
+      "SE": 0.561041197418318,
+      "df": 113,
+      "statistic": 2.42262000252495,
+      "statistic_name": "t",
+      "p_none": 0.0169978414139332,
+      "p_tukey": 0.0444829842133719
+    },
+    {
+      "contrast": "b - c",
+      "by": "q",
+      "estimate": 2.78129501047864,
+      "SE": 0.452539651656977,
+      "df": 113,
+      "statistic": 6.14596975158951,
+      "statistic_name": "t",
+      "p_none": 1.22466262446761e-08,
+      "p_tukey": 3.66644619109735e-08
+    }
+  ],
+  "name": "posthoc_ols_sim_factorial_by"
+}

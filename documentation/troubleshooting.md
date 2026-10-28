@@ -79,6 +79,20 @@ search by itself, with another search method or (a Gamma GLMM with the
 inverse link) on another scale, and it reports honestly if the fit still did
 not converge.
 
+A GLM whose design columns are nearly collinear (to about 1 part in 1e15 once
+the fit's weights are applied) can stop with `glm_diverged` as if the data
+were separated, even though they have a finite maximum; at that point f64
+cannot determine β.
+
+## A converged fit ends a few units above its optimum
+
+A Poisson GLMM fitted with adaptive quadrature (`nagq > 1`) whose fitted means
+span about 14 powers of ten has a deviance near 1e12. At that size the
+deviance is known only to about 0.1 unit. Such a fit can report `converged`
+and still end up to about 10 units above its optimum, a relative error of a
+few times 1e-12. A difference of deviances between two such fits, as in a
+likelihood-ratio test, carries the same error.
+
 ## NotImplementedError: family/link/knob
 
 One combination has an approved design but no kernel support yet, and
@@ -116,13 +130,12 @@ Laplace fit.
 The formula parser accepts bare column names, `- 1`/`0 +`, a small whitelist
 of transforms (`log(x)`, `sqrt(x)`, `exp(x)`, `I(x^2)`), `offset()`, and
 `cbind(s, f)` on the response — but not R's general function-call syntax:
-`poly(x, 2)`, nested calls, arithmetic inside a call, `(x || g)`,
-`(0 + x | g)`, `.`, and `contrasts=` are all clear parse-time errors, never a
-silent reinterpretation. See
+`poly(x, 2)`, nested calls, arithmetic inside a call, `.`, and `contrasts=`
+are all clear parse-time errors, never a silent reinterpretation. See
 [`formula.md#not-accepted-and-the-workaround`](formula.md#not-accepted-and-the-workaround)
 for the full list and the workaround for each.
 
-## predict()/coef() error
+## coef() errors
 
 These aren't missing by oversight — the ports error, naming the reason, on
 anything the kernel can't compute honestly rather than returning a

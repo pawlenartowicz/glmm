@@ -103,7 +103,9 @@ pub struct CurvatureHint {
 
 impl CurvatureHint {
     /// The dimension of the search the hint was taken in: n_θ for an LMM;
-    /// n_θ + p for a GLMM, + 1 on a Gamma fit whose dispersion is free.
+    /// n_θ + p for a GLMM, + 1 on a Gamma fit whose dispersion is free. n_θ
+    /// counts the θ entries the search moves, without those a grouping's
+    /// terms hold at zero.
     pub fn dim(&self) -> usize {
         self.n
     }
@@ -163,7 +165,35 @@ impl CurvatureHint {
     /// `false` when unavailable): `n + 1` gradients, forward steps of
     /// `1e-4·max(1, |x_j|)` (backward at the upper bound). `None` when a
     /// gradient fails or the symmetrized Hessian is not positive definite.
+    /// With `structural` coordinates (as [`bobyqa_minimize`] takes them) the
+    /// hint is over the free ones, the dimension the search runs in: `grad`
+    /// still sees full points, zero at the structural coordinates.
     pub(crate) fn from_gradients(
+        x: &[f64],
+        lo: &[f64],
+        hi: &[f64],
+        structural: &[usize],
+        mut grad: impl FnMut(&[f64], &mut [f64]) -> bool,
+    ) -> Option<Self> {
+        if structural.is_empty() {
+            return Self::from_gradients_free(x, lo, hi, grad);
+        }
+        let free = free_coordinates(structural, x.len());
+        let gather = |v: &[f64]| -> Vec<f64> { free.iter().map(|&i| v[i]).collect() };
+        let (mut full, mut g_full) = (vec![0.0; x.len()], vec![0.0; x.len()]);
+        Self::from_gradients_free(&gather(x), &gather(lo), &gather(hi), |xf, gf| {
+            for (&i, &v) in free.iter().zip(xf) {
+                full[i] = v;
+            }
+            let ok = grad(&full, &mut g_full);
+            for (g, &i) in gf.iter_mut().zip(&free) {
+                *g = g_full[i];
+            }
+            ok
+        })
+    }
+
+    fn from_gradients_free(
         x: &[f64],
         lo: &[f64],
         hi: &[f64],
@@ -300,7 +330,30 @@ impl RoutePlan {
 /// objective reaches BOBYQA as `+∞`, its failed-trial value; a non-finite
 /// value passes through as it is, so an objective that always answers
 /// `Some(d)` gets exactly the search `Bobyqa::minimize` would run on `d`.
+///
+/// `structural` (ascending indices of `x`) are coordinates held at exactly
+/// zero: the search runs on the others ([`Masked`]), so `solver` is sized by
+/// their count, and on return `x` holds the endpoint with zeros there. Empty
+/// runs the search on all of `x`.
 pub(crate) fn bobyqa_minimize(
+    solver: &mut Bobyqa,
+    obj: &mut impl Objective,
+    x: &mut [f64],
+    lower: &[f64],
+    upper: &[f64],
+    structural: &[usize],
+) -> Outcome {
+    if structural.is_empty() {
+        return bobyqa_run(solver, obj, x, lower, upper);
+    }
+    let mut m = Masked::new(obj, structural, x.len());
+    let (mut xf, lo, hi) = (m.gather(x), m.gather(lower), m.gather(upper));
+    let out = bobyqa_run(solver, &mut m, &mut xf, &lo, &hi);
+    m.scatter(&xf, x);
+    out
+}
+
+fn bobyqa_run(
     solver: &mut Bobyqa,
     obj: &mut impl Objective,
     x: &mut [f64],
@@ -313,4 +366,80 @@ pub(crate) fn bobyqa_minimize(
         lower,
         upper,
     )
+}
+
+/// An objective over the free coordinates of a full point whose structural
+/// coordinates are held at exactly zero: each trial is scattered into a full
+/// vector (zeros at the structural ones) before the inner objective sees it,
+/// and the gradient and the start curvature are gathered back. A random-effect
+/// block whose terms make some covariance entries zero is searched so: BOBYQA
+/// cannot take a box with equal bounds, and a gradient search moving those
+/// entries would leave the model.
+struct Masked<'a, O> {
+    inner: &'a mut O,
+    /// The free coordinates of the full point, ascending.
+    free: Vec<usize>,
+    /// The full point of the last trial, zero at every structural coordinate.
+    full: Vec<f64>,
+    /// The inner objective's full-length gradient.
+    grad: Vec<f64>,
+}
+
+impl<'a, O> Masked<'a, O> {
+    fn new(inner: &'a mut O, structural: &[usize], n: usize) -> Self {
+        Self {
+            inner,
+            free: free_coordinates(structural, n),
+            full: vec![0.0; n],
+            grad: vec![0.0; n],
+        }
+    }
+
+    /// The free entries of a full-length `v`.
+    fn gather(&self, v: &[f64]) -> Vec<f64> {
+        self.free.iter().map(|&i| v[i]).collect()
+    }
+
+    /// Writes the free point `xf` into the full `x`, with zeros at the
+    /// structural coordinates.
+    fn scatter(&self, xf: &[f64], x: &mut [f64]) {
+        x.fill(0.0);
+        for (&i, &v) in self.free.iter().zip(xf) {
+            x[i] = v;
+        }
+    }
+}
+
+impl<O: Objective> Objective for Masked<'_, O> {
+    fn value(&mut self, x: &[f64], resolution: f64) -> Option<f64> {
+        for (&i, &v) in self.free.iter().zip(x) {
+            self.full[i] = v;
+        }
+        self.inner.value(&self.full, resolution)
+    }
+}
+
+impl<O: GradObjective> GradObjective for Masked<'_, O> {
+    fn gradient(&mut self, g: &mut [f64]) -> bool {
+        let ok = self.inner.gradient(&mut self.grad);
+        for (gj, &i) in g.iter_mut().zip(&self.free) {
+            *gj = self.grad[i];
+        }
+        ok
+    }
+
+    fn start_curvature(&self, inv_curv: &mut [f64]) {
+        let mut full = vec![0.0; self.full.len()];
+        self.inner.start_curvature(&mut full);
+        for (c, &i) in inv_curv.iter_mut().zip(&self.free) {
+            *c = full[i];
+        }
+    }
+}
+
+/// `0..n` without the ascending `structural` indices.
+fn free_coordinates(structural: &[usize], n: usize) -> Vec<usize> {
+    (0..n)
+        .filter(|i| structural.binary_search(i).is_err())
+        .collect()
 }

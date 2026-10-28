@@ -7,7 +7,8 @@
 //!     the app-spec `formula_suite.rs` harness uses;
 //!   - the random-effects cases (`random_effects_parse.rs`) as direct AST asserts.
 //!
-//! Pure — no data table.
+//! Pure — no data table, except `repeated_random_column_is_refused`, whose
+//! refusal needs the lowering.
 
 use glmm::formula::{parse, ParseError, ParsedFormula, RandomEffect, Term};
 
@@ -38,6 +39,18 @@ fn canonical(p: &ParsedFormula) -> (String, Vec<String>, Vec<String>) {
         .map(|r| match r {
             RandomEffect::Intercept { group, .. } => format!("intercept|{group}"),
             RandomEffect::Slope { group, vars } => format!("slope({})|{group}", vars.join(",")),
+            RandomEffect::NoIntercept { group, vars } => {
+                format!("nointercept({})|{group}", vars.join(","))
+            }
+            RandomEffect::ZeroCorr {
+                group,
+                vars,
+                intercept,
+            } => format!(
+                "zerocorr({}{})|{group}",
+                if *intercept { "1," } else { "0," },
+                vars.join(",")
+            ),
         })
         .collect();
     (p.dependent.clone(), fixed, re)
@@ -188,34 +201,49 @@ const SUCCESS: &[SuccessCase] = &[
 
 /// (id, formula, error substring) — the error cases of the canonical suite.
 const ERRORS: &[(&str, &str, &str)] = &[
+    ("err_empty", "", "formula is empty"),
+    ("err_bad_identifier", "y ~ 1x", "formula syntax error"),
+    ("err_term_removal", "y ~ x1 - x2", "term removal"),
+];
+
+/// The canonical suite's other error cases, which this parser accepts: several
+/// terms on one grouping and an intercept-free term parse, and the lowering
+/// refuses a column in two terms on one grouping
+/// (`repeated_random_column_is_refused`).
+const ERRORS_THAT_PARSE: &[SuccessCase] = &[
     (
         "016_intercept_and_slope_same_group",
         "y ~ x + (1|g) + (1+x|g)",
-        "duplicate grouping variable",
+        "y",
+        &["x"],
+        &["intercept|g", "slope(x)|g"],
     ),
-    ("err_empty", "", "formula is empty"),
-    ("err_bad_identifier", "y ~ 1x", "formula syntax error"),
     (
         "err_duplicate_group",
         "y ~ x + (1|g) + (1|g)",
-        "duplicate grouping variable",
+        "y",
+        &["x"],
+        &["intercept|g", "intercept|g"],
     ),
-    ("err_term_removal", "y ~ x1 - x2", "term removal"),
     (
         "err_intercept_suppression_zero",
         "y ~ x + (0+x|g)",
-        "intercept suppression",
+        "y",
+        &["x"],
+        &["nointercept(x)|g"],
     ),
     (
         "err_intercept_suppression_minus_one",
         "y ~ x + (-1+x|g)",
-        "intercept suppression",
+        "y",
+        &["x"],
+        &["nointercept(x)|g"],
     ),
 ];
 
 #[test]
 fn canonical_suite_matches_mirror() {
-    for &(id, formula, dep, fixed, re) in SUCCESS {
+    for &(id, formula, dep, fixed, re) in SUCCESS.iter().chain(ERRORS_THAT_PARSE) {
         let parsed = parse(formula).unwrap_or_else(|e| panic!("case {id} should parse, got {e}"));
         let (got_dep, got_fixed, got_re) = canonical(&parsed);
         assert_eq!(got_dep, dep, "case {id} dependent");
@@ -250,47 +278,174 @@ fn interaction_grouping_combined_with_plain_intercept() {
     );
 }
 
+/// A column in two terms on one grouping, the intercept included, is refused
+/// by the lowering (the parser cannot see a factor's columns), naming the
+/// grouping and the column.
 #[test]
-fn duplicate_interaction_grouping_var_errors() {
-    let err = parse("y ~ x + (1|recipe:replicate) + (1|recipe:replicate)").unwrap_err();
-    assert!(matches!(
-        err,
-        glmm::formula::ParseError::DuplicateGroupingVar { .. }
-    ));
-}
-
-/// Neither the double-bar decorrelated-slope idiom nor three-level nesting
-/// shorthand is supported grammar: `RE_SLOPE`/`RE_ISLOPE` admit exactly one
-/// `|`, and `RE_NESTED` admits exactly two identifiers around one `/`. Both
-/// chunks fall through every RE regex unmatched and are left in the RHS,
-/// where they fail as a plain syntax error rather than silently mis-parsing.
-#[test]
-fn unsupported_re_syntax_is_a_syntax_error() {
-    for f in ["y ~ x + (1+x||g)", "y ~ x + (1|A/B/C)"] {
+fn repeated_random_column_is_refused() {
+    use glmm::formula::{lower, Column, Error, Table};
+    let labels = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let table = Table {
+        columns: vec![
+            (
+                "y".into(),
+                Column::Numeric(vec![1.0, 2.0, 0.5, 1.5, 2.5, 0.2]),
+            ),
+            (
+                "x".into(),
+                Column::Numeric(vec![0.1, 0.4, 0.2, 0.9, 0.3, 0.7]),
+            ),
+            (
+                "g".into(),
+                Column::factor_from_labels(&labels(&["a", "a", "b", "b", "c", "c"])),
+            ),
+            (
+                "recipe".into(),
+                Column::factor_from_labels(&labels(&["r", "s", "r", "s", "r", "s"])),
+            ),
+            (
+                "replicate".into(),
+                Column::factor_from_labels(&labels(&["1", "1", "2", "2", "3", "3"])),
+            ),
+        ],
+        n: 6,
+    };
+    for (f, group, column) in [
+        ("y ~ x + (1 | g) + (1 | g)", "g", "(Intercept)"),
+        ("y ~ x + (x | g) + (0 + x | g)", "g", "x"),
+        ("y ~ x + (1 | g) + (1 + x | g)", "g", "(Intercept)"),
+        (
+            "y ~ x + (1|recipe:replicate) + (1|recipe:replicate)",
+            "recipe:replicate",
+            "(Intercept)",
+        ),
+    ] {
+        let err = match lower(f, &table, glmm::Family::Gaussian) {
+            Ok(_) => panic!("{f}: expected a refusal"),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err,
+            Error::RandomColumnRepeated {
+                group: group.into(),
+                column: column.into()
+            },
+            "{f}"
+        );
+        let msg = err.to_string();
         assert!(
-            matches!(parse(f), Err(glmm::formula::ParseError::Syntax { .. })),
-            "expected a syntax error for {f}, got {:?}",
-            parse(f)
+            msg.contains("(1 + x + f | g)") && msg.contains("(x + f || g)"),
+            "{f}: {msg}"
         );
     }
 }
 
+/// `(lhs || g)` is one term per variable, the intercept its own term, as
+/// lme4's `expandDoubleVerts` (reformulas 0.4.1) writes `(1 + x + f || g)`:
+/// `(1 | g) + (0 + x | g) + (0 + f | g)`. A factor's term stays one term.
 #[test]
-fn intercept_suppression_rejected() {
-    for f in [
-        "y ~ x + (0+x|g)",
-        "y ~ x + (-1+x|g)",
-        "y ~ x + (0|g)",
-        "y ~ x + (-1|g)",
+fn double_bar_expands_like_lme4() {
+    let int = |g: &str| RandomEffect::Intercept {
+        group: g.into(),
+        parent: None,
+    };
+    let no_int = |g: &str, v: &str| RandomEffect::NoIntercept {
+        group: g.into(),
+        vars: vec![v.into()],
+    };
+    for (f, want) in [
+        (
+            "y ~ x + f + (1 + x + f || g)",
+            vec![int("g"), no_int("g", "x"), no_int("g", "f")],
+        ),
+        ("y ~ x + (x || g)", vec![int("g"), no_int("g", "x")]),
+        (
+            "y ~ x + z + (0 + x + z || g)",
+            vec![no_int("g", "x"), no_int("g", "z")],
+        ),
+        (
+            "y ~ x + (1 | h) + (x || g)",
+            vec![int("h"), int("g"), no_int("g", "x")],
+        ),
+        ("y ~ x + (1 || g)", vec![int("g")]),
     ] {
-        assert!(
-            matches!(
-                parse(f),
-                Err(glmm::formula::ParseError::RandomInterceptSuppressionUnsupported)
-            ),
-            "expected suppression error for {f}, got {:?}",
-            parse(f)
+        assert_eq!(parse(f).unwrap().random_effects, want, "{f}");
+    }
+    assert_eq!(
+        parse("y ~ x + (0 || g)"),
+        Err(ParseError::EmptySlopeTerm { group: "g".into() })
+    );
+}
+
+/// `0 +` and `- 1` drop the random intercept from a term; a term with nothing
+/// else left is an empty slope term.
+#[test]
+fn intercept_suppression_parses() {
+    for f in [
+        "y ~ x + (0 + x | g)",
+        "y ~ x + (-1 + x | g)",
+        "y ~ x + (x - 1 | g)",
+        "y ~ x + (x + 0 | g)",
+    ] {
+        assert_eq!(
+            parse(f).unwrap().random_effects,
+            vec![RandomEffect::NoIntercept {
+                group: "g".into(),
+                vars: vec!["x".into()]
+            }],
+            "{f}"
         );
+    }
+    for f in ["y ~ x + (0 | g)", "y ~ x + (-1 | g)"] {
+        assert_eq!(
+            parse(f),
+            Err(ParseError::EmptySlopeTerm { group: "g".into() }),
+            "{f}"
+        );
+    }
+    let msg = parse("y ~ x + (1 + x - 1 | g)").unwrap_err().to_string();
+    assert!(msg.contains("both writes"), "{msg}");
+}
+
+/// `zerocorr(...)` is one node: only the lowering knows a factor's columns.
+#[test]
+fn zerocorr_parses() {
+    let zc = |vars: &[&str], intercept| RandomEffect::ZeroCorr {
+        group: "g".into(),
+        vars: vars.iter().map(|v| v.to_string()).collect(),
+        intercept,
+    };
+    for (f, want) in [
+        ("y ~ x + zerocorr(1 + x | g)", zc(&["x"], true)),
+        ("y ~ x + zerocorr(x | g)", zc(&["x"], true)),
+        (
+            "y ~ x + z + zerocorr(0 + x + z | g)",
+            zc(&["x", "z"], false),
+        ),
+    ] {
+        let p = parse(f).unwrap_or_else(|e| panic!("{f}: {e}"));
+        assert_eq!(p.random_effects, vec![want], "{f}");
+    }
+    assert_eq!(
+        parse("y ~ x + zerocorr(1 | g)").unwrap().random_effects,
+        vec![RandomEffect::Intercept {
+            group: "g".into(),
+            parent: None
+        }]
+    );
+}
+
+/// `||` and `zerocorr` take one grouping factor, not a nesting.
+#[test]
+fn double_bar_on_nested_is_a_syntax_error() {
+    for f in [
+        "y ~ x + (1 + x || A/B)",
+        "y ~ x + (x || A/B)",
+        "y ~ x + zerocorr(1 + x | A/B)",
+    ] {
+        let err = parse(f).unwrap_err();
+        assert!(matches!(err, ParseError::Syntax { .. }), "{f}: {err:?}");
+        assert!(err.to_string().contains("A/B"), "{f}: {err}");
     }
 }
 
@@ -460,7 +615,7 @@ fn transform_random_slope_parses() {
 
 #[test]
 fn transform_term_beside_a_random_intercept_does_not_confuse_re_extraction() {
-    // Before the slope regexes excluded parens, `(x)+(1|g)` matched as an
+    // The slope regexes exclude parens, so `(x)+(1|g)` is not an
     // implicit-intercept slope term.
     let p = parse("y ~ log(x) + (1|g)").unwrap();
     let (_, fixed, re) = canonical(&p);
@@ -663,8 +818,8 @@ fn non_ascii_names_parse_wherever_a_bare_name_does() {
 
 // ── A dangling `+` and the `^` operator ─────────────────────────────────────
 
-/// `pos` is the character index of the `+` or `^` in the formula string, not
-/// its byte offset (`ł` is two bytes).
+/// `pos` is the character index of the `+` in the formula string, not its
+/// byte offset (`ł` is two bytes).
 fn syntax_error(pos: usize, msg: &str) -> Result<ParsedFormula, ParseError> {
     Err(ParseError::Syntax {
         pos,
@@ -688,20 +843,41 @@ fn a_formula_ending_in_plus_is_a_syntax_error() {
     assert_eq!(parse("y ~ x + + z").unwrap(), parse("y ~ x + z").unwrap());
 }
 
+/// `^` crosses terms as R does: `(a + b + c)^2` is every interaction of the
+/// base's terms up to order 2, `a^2` is `a`, and `I(a^2)` stays a power. The
+/// labels are `attr(terms(f), "term.labels")` from R 4.5.3, the random term
+/// left out as lme4's `nobars` does.
 #[test]
-fn the_crossing_operator_is_a_syntax_error_outside_i() {
-    let msg = "'^' is accepted only in I(x^k), a power of one column; to cross terms, \
-               write them out (for example (a + b)^2 as a + b + a:b)";
-    for (f, pos) in [
-        ("y ~ (a + b + c)^2 + (1 | g)", 15),
-        ("y ~ a^2", 5),
-        ("y ~ (a + b)^2", 11),
-        ("y ~ (ł + b)^2", 11),
+fn crossing_operator_follows_r_terms() {
+    for (f, r_labels) in [
+        (
+            "y ~ (a + b + c)^2",
+            &["a", "b", "c", "a:b", "a:c", "b:c"][..],
+        ),
+        ("y ~ (a + b)^3", &["a", "b", "a:b"]),
+        ("y ~ a^2", &["a"]),
+        ("y ~ (a + b)^2 + (1 | g)", &["a", "b", "a:b"]),
+        (
+            "y ~ x + (a + b + c)^3",
+            &["x", "a", "b", "c", "a:b", "a:c", "b:c", "a:b:c"],
+        ),
+        ("y ~ (a + b)^2:c", &["a:c", "b:c", "a:b:c"]),
+        (
+            "y ~ (a*b + c)^2",
+            &["a", "b", "c", "a:b", "a:c", "b:c", "a:b:c"],
+        ),
+        ("y ~ (ł + b)^2", &["ł", "b", "ł:b"]),
     ] {
-        assert_eq!(parse(f), syntax_error(pos, msg), "{f}");
+        let p = parse(f).unwrap_or_else(|e| panic!("{f}: {e}"));
+        assert_eq!(canonical(&p).1, r_labels, "{f}");
     }
     let (_, fixed, _) = canonical(&parse("y ~ I(a^2)").unwrap());
     assert_eq!(fixed, ["I(a^2)"]);
+    // R refuses a power below 2 ("invalid power in formula").
+    for f in ["y ~ (a + b)^1", "y ~ (a + b)^0", "y ~ (a + b)^x", "y ~ a^"] {
+        let msg = parse(f).expect_err(f).to_string();
+        assert!(msg.contains("power"), "{f}: {msg}");
+    }
 }
 
 // ── Grouping parentheses in the fixed part ──────────────────────────────────
@@ -834,5 +1010,113 @@ fn a_group_refuses_what_the_fixed_part_refuses() {
     ] {
         let msg = parse(f).expect_err(f).to_string();
         assert!(msg.contains(needle), "{f}: {msg}");
+    }
+}
+
+// ── Random-effect terms the grammar refuses ─────────────────────────────────
+
+/// A `( … | g)` written right after a name would otherwise parse as that name
+/// plus the term: `zerocor(1 + x | g)` would become a fixed term `zerocor` and
+/// a correlated slope.
+#[test]
+fn a_random_effect_term_after_a_name_is_a_syntax_error() {
+    let msg = |term: &str| {
+        format!("'{term}': a random-effect term `( … | g)` must stand alone, not after a name")
+    };
+    for (f, term) in [
+        ("y ~ x + foo(1 | g)", "foo(1|g)"),
+        ("y ~ x + foo(x | g)", "foo(x|g)"),
+        ("y ~ x + foo(0 + x | g)", "foo(0+x|g)"),
+        ("y ~ x + foo(1 + x || g)", "foo(1+x||g)"),
+        ("y ~ x + foo(1 | a/b)", "foo(1|a/b)"),
+        ("y ~ x + foo(1 | a:b)", "foo(1|a:b)"),
+        ("y ~ x*foo(1 + x | g)", "foo(1+x|g)"),
+        ("y ~ x + zerocor(1 + x | g)", "zerocor(1+x|g)"),
+        ("y ~ zerocor(1 + x | g)", "zerocor(1+x|g)"),
+    ] {
+        assert_eq!(parse(f), syntax_error(0, &msg(term)), "{f}");
+    }
+    for f in [
+        "y ~ x + zerocorr(1 + x | g)",
+        "y ~ zerocorr(1 + x | g) + x",
+        "y ~ log(x) + (1 | g)",
+        "y ~ (1 | g) - 1",
+    ] {
+        assert!(parse(f).is_ok(), "{f}: {:?}", parse(f));
+    }
+}
+
+/// A piece's term count and nesting depth are bounded: `*` and `^` double the
+/// terms per variable, and each `(` is one level of recursion.
+#[test]
+fn huge_expansions_and_deep_nesting_are_syntax_errors() {
+    let vars: Vec<String> = (0..16).map(|i| format!("x{i}")).collect();
+    for f in [
+        format!("y ~ {}", vars.join("*")),
+        format!("y ~ ({})^16", vars.join("+")),
+        format!("y ~ ({})", vars.join("*")),
+    ] {
+        let msg = parse(&f).expect_err(&f).to_string();
+        assert!(
+            msg.contains("expands to more than 10000 terms"),
+            "{f}: {msg}"
+        );
+    }
+    let deep = format!("y ~ {}x{}", "(".repeat(20_000), ")".repeat(20_000));
+    let msg = parse(&deep).expect_err("deep").to_string();
+    assert!(msg.contains("more than 200 nested parentheses"), "{msg}");
+    let ok = format!("y ~ {}x{}", "(".repeat(100), ")".repeat(100));
+    assert!(parse(&ok).is_ok(), "{:?}", parse(&ok));
+}
+
+/// Nor glued to the term after it: `(1|g)x` would parse as `x + (1|g)`.
+#[test]
+fn a_random_effect_term_before_a_term_without_a_plus_is_a_syntax_error() {
+    for f in [
+        "y ~ (1 | g)x",
+        "y ~ x + (1 | g)(1 | h)",
+        "y ~ x + (1 | g) x",
+    ] {
+        let msg = parse(f).expect_err(f).to_string();
+        assert!(
+            msg.contains("must stand alone, not before another term"),
+            "{f}: {msg}"
+        );
+    }
+}
+
+/// A grouping is one factor, `a:b` or `a/b`; only a random intercept takes
+/// the two-factor ones. The three-factor check runs first, so a slope on
+/// three factors gets the three-factor message.
+#[test]
+fn a_slope_on_two_factors_or_a_grouping_of_three_is_a_syntax_error() {
+    let slope = |term: &str, group: &str| {
+        format!(
+            "'{term}': a random slope on an interaction or nested grouping ('{group}') is not \
+             supported; only a random intercept, `(1 | a:b)` or `(1 | a/b)`"
+        )
+    };
+    for (f, term, group) in [
+        ("y ~ x + (1 + x | a:b)", "(1+x|a:b)", "a:b"),
+        ("y ~ x + (x | a:b)", "(x|a:b)", "a:b"),
+        ("y ~ x + (0 + x | a:b)", "(0+x|a:b)", "a:b"),
+        ("y ~ x + (1 + x | a/b)", "(1+x|a/b)", "a/b"),
+        ("y ~ x + (x | a/b)", "(x|a/b)", "a/b"),
+        ("y ~ x + (1 + log(x) | a:b)", "(1+log(x)|a:b)", "a:b"),
+    ] {
+        assert_eq!(parse(f), syntax_error(0, &slope(term, group)), "{f}");
+    }
+    let three =
+        |term: &str| format!("'{term}': a grouping takes at most two factors (`a:b` or `a/b`)");
+    for (f, term) in [
+        ("y ~ x + (1 | a/b/c)", "(1|a/b/c)"),
+        ("y ~ x + (1 | a:b:c)", "(1|a:b:c)"),
+        ("y ~ x + (1 | a:b/c)", "(1|a:b/c)"),
+        ("y ~ x + (1 + x | a/b/c)", "(1+x|a/b/c)"),
+    ] {
+        assert_eq!(parse(f), syntax_error(0, &three(term)), "{f}");
+    }
+    for f in ["y ~ x + (1 | a/b)", "y ~ x + (1 | a:b)"] {
+        assert!(parse(f).is_ok(), "{f}: {:?}", parse(f));
     }
 }

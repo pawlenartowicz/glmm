@@ -1,0 +1,52 @@
+{
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0",
+      "performance": "0.18.2",
+      "effectsize": "1.0.3",
+      "insight": "1.5.4"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_effectsize.R"
+  },
+  "r2": {
+    "marginal": 0.380490097132828,
+    "conditional": 0.790246398441268
+  },
+  "icc": {
+    "adjusted": 0.661420099036408,
+    "unadjusted": 0.40975630130844
+  },
+  "eta2": [
+    {
+      "term": "Variety",
+      "F": 1.48533459097957,
+      "df1": 2,
+      "df2": 9.99994852960695,
+      "eta2_partial": 0.229030663613665
+    },
+    {
+      "term": "nitro",
+      "F": 118.003089389808,
+      "df1": 1,
+      "df2": 53.0000254243049,
+      "eta2_partial": 0.690063976425705
+    }
+  ],
+  "name": "effectsize_oats"
+}

@@ -1,18 +1,23 @@
 //! The two-fit comparison against its crate-private engines: the exact
 //! restricted likelihood-ratio test called directly on the same numbers, its
 //! refusal reasons, the likelihood-ratio tails, and the refusal texts; the
-//! per-term table's Type II metric on the Gaussian LMM; its test choice; and
-//! its likelihood-ratio rows against `compare` on their formula pairs.
+//! per-term table's Type II metric on the Gaussian LMM; its test choice; its
+//! rows' partial η²; its likelihood-ratio rows against `compare` on their formula pairs; and the
+//! comparison checks and per-term tests that need a side or a fit changed by
+//! hand, which no fitted `formula::Model` carries.
 
+use crate::test_support::fit_warm_wo;
+use crate::FitOptions;
 use std::collections::BTreeSet;
+use std::mem::discriminant;
 
 use faer::Mat;
 
 use super::anova::{
-    compare, linear_note_line, lrt_no_basis_note, lrt_not_converged_note, lrt_test, nesting,
-    refit_on_basis, term_tests, theta_start, ChoiceReason, CompareError, CompareOptions,
-    Comparison, ComparisonTest, Differs, Model, ModelInfo, Side, SsType, TermTest, TermTestError,
-    TermTestOptions,
+    compare_stored, linear_note_line, lrt_no_basis_note, lrt_not_converged_note, lrt_test, nesting,
+    refit_on_basis, term_tests_cached, theta_start, ChoiceReason, CompareError, CompareOptions,
+    Comparison, ComparisonTest, Differs, Model, ModelInfo, RefitCache, Side, SsType, TermTable,
+    TermTest, TermTestError, TermTestOptions,
 };
 use super::hypotheses::{
     check_marginal, missing_cells_note, type2_vcov, type2_xtx, type3, type3_null_basis,
@@ -27,7 +32,7 @@ use crate::inference::{
     DenDf, LinearKind, LinearNote, LinearTest, LrNote, LrTest, Objective, Reference,
 };
 use crate::test_support::csv_table;
-use crate::{fit_cold, BinomialLink, Family, Fit, GammaLink, NegBinomialLink, PoissonLink};
+use crate::{BinomialLink, Family, Fit, GammaLink, NegBinomialLink, PoissonLink};
 
 const OPTS: CompareOptions = CompareOptions {
     nsim: 2000,
@@ -38,11 +43,25 @@ const OPTS: CompareOptions = CompareOptions {
 /// `Model`.
 fn side(formula: &str, table: &Table, reml: Option<bool>, weights: Option<Vec<f64>>) -> Model {
     let mut lo = lower(formula, table, Family::Gaussian).unwrap();
-    lo.opts.reml = reml;
-    lo.opts.weights = weights;
-    let fit = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+    let fit_opts = FitOptions {
+        reml,
+        ..FitOptions::default()
+    };
+    lo.weights = weights;
+    let fit = fit_warm_wo(
+        &lo.x,
+        &lo.y,
+        lo.n,
+        lo.p,
+        &lo.model,
+        &lo.ids,
+        None,
+        lo.weights.as_deref(),
+        lo.offset.as_deref(),
+        &fit_opts,
+    );
     assert!(fit.converged(), "{formula} did not converge");
-    Model::from_fit(formula, &lo, &fit)
+    Model::from_fit(formula, &lo, &fit_opts, &fit)
 }
 
 fn lr(c: &Comparison) -> &LrTest {
@@ -104,7 +123,7 @@ fn lmm_intercept() -> Table {
 #[test]
 fn the_envelope_pair_gets_the_exact_test_as_exact_rlrt_computes_it() {
     let (ols, full) = dyestuff();
-    let c = compare(&ols, &full, &OPTS).unwrap();
+    let c = compare_stored(&ols, &full, &OPTS).unwrap();
     let t = lr(&c);
     let r = direct(&ols, &full);
     assert_eq!(
@@ -124,37 +143,12 @@ fn the_envelope_pair_gets_the_exact_test_as_exact_rlrt_computes_it() {
 }
 
 #[test]
-fn a_weighted_larger_fit_has_no_design_summary_and_gets_the_mixture() {
-    let d = lmm_intercept();
-    let w: Vec<f64> = (0..d.n).map(|i| 1.0 + 0.5 * (i % 3) as f64).collect();
-    let ols = side("y ~ x1", &d, Some(true), Some(w.clone()));
-    let full = side("y ~ x1 + (1 | g)", &d, None, Some(w));
-    assert_eq!(full.design_summary, None);
-    let c = compare(&ols, &full, &OPTS).unwrap();
-    let t = lr(&c);
-    assert_eq!(t.reference, Reference::ChiBarSquared { df_low: 0 });
-    assert_eq!(
-        t.notes,
-        vec![
-            LrNote::NoDesignSummary,
-            LrNote::BoundaryMixture { approximate: false }
-        ]
-    );
-    assert!(t.statistic > 0.0);
-    assert_eq!(
-        t.p_value.to_bits(),
-        lr_p_value(t.statistic, &t.reference).to_bits()
-    );
-    assert!(c.note_lines()[0].contains("unweighted (1 | g)"));
-}
-
-#[test]
 fn groups_the_fixed_part_absorbs_get_the_mixture_with_the_refusal_reason() {
     let d = lmm_intercept();
     let ols = side("y ~ g", &d, Some(true), None);
     let full = side("y ~ g + (1 | g)", &d, None, None);
     assert!(full.design_summary.is_some());
-    let c = compare(&ols, &full, &OPTS).unwrap();
+    let c = compare_stored(&ols, &full, &OPTS).unwrap();
     let t = lr(&c);
     let reason = RlrtRefusal::NoGroupVariation.reason();
     assert_eq!(t.reference, Reference::ChiBarSquared { df_low: 0 });
@@ -210,27 +204,24 @@ const FEW_DRAWS: CompareOptions = CompareOptions {
 fn level_pair(d: &Table) -> (Model, Comparison) {
     let ols = side("y ~ x", d, Some(true), None);
     let full = side("y ~ x + (1 | g)", d, None, None);
-    let c = compare(&ols, &full, &FEW_DRAWS).unwrap();
+    let c = compare_stored(&ols, &full, &FEW_DRAWS).unwrap();
     (full, c)
 }
 
 /// The exact test runs up to 100 levels with rows. A declared level with no
-/// rows does not count: an interior one keeps its slot in the summary as a
-/// 0 count, so 101 slots with one empty are 100 levels with rows.
+/// rows does not count: the frontend drops it, so 101 declared levels with one
+/// empty are 100 levels.
 #[test]
 fn the_exact_test_runs_up_to_100_levels_with_rows() {
     let exact = Reference::ExactRlrt {
         nsim: FEW_DRAWS.nsim,
         seed: FEW_DRAWS.seed,
     };
-    for (d, slots) in [
-        (three_per_level(100, &[]), 100),
-        (three_per_level(101, &[50]), 101),
-    ] {
+    for d in [three_per_level(100, &[]), three_per_level(101, &[50])] {
         let (full, c) = level_pair(&d);
         let (counts, _, _) = full.design_summary.as_ref().expect("inside the envelope");
-        assert_eq!(counts.len(), slots);
-        assert_eq!(counts.iter().filter(|&&n| n > 0.0).count(), 100);
+        assert_eq!(counts.len(), 100);
+        assert!(counts.iter().all(|&n| n > 0.0));
         let t = lr(&c);
         assert_eq!(t.reference, exact);
         assert!(t.statistic > 0.0);
@@ -275,7 +266,7 @@ fn above_100_levels_with_rows_the_mixture_is_used_with_the_reason() {
 #[test]
 fn groupings_that_do_not_match_the_variance_blocks_are_refused() {
     let (ols, full) = dyestuff();
-    let refusal = |a: &Model, b: &Model| compare(a, b, &OPTS).err();
+    let refusal = |a: &Model, b: &Model| compare_stored(a, b, &OPTS).err();
     let mut cleared = full.clone();
     cleared.re_groups.clear();
     assert_eq!(
@@ -369,28 +360,6 @@ fn every_refusal() -> Vec<CompareError> {
     every
 }
 
-/// The refusal texts are port-neutral: each says what is wrong and what to do
-/// in plain words and leaves the call syntax (the comparison function, the
-/// REML argument) to the port that shows it.
-#[test]
-fn no_refusal_text_carries_port_syntax() {
-    let syntax = [
-        "compare(",
-        "REML =",
-        "reml=",
-        "REML=FALSE",
-        "REML=TRUE",
-        "reml = False",
-        "reml = True",
-    ];
-    for e in every_refusal() {
-        let text = e.to_string();
-        for s in syntax {
-            assert!(!text.contains(s), "{e:?}: {text}");
-        }
-    }
-}
-
 /// Every reason a contrast or a per-term row has no denominator df. The
 /// match has no wildcard arm, so a reason added later does not compile until
 /// it is listed here.
@@ -424,7 +393,6 @@ fn every_note_text() -> Vec<String> {
         LinearNote::AliasedColumn { column: 2 },
         LinearNote::RankDeficientL { rank: 1, rows: 2 },
         LinearNote::ReducedNotConverged,
-        LinearNote::RandomSlopeColumn,
         LinearNote::NegativeStatistic,
     ];
     let names = ["(Intercept)", "x", "z"].map(String::from);
@@ -434,11 +402,10 @@ fn every_note_text() -> Vec<String> {
         LinearNote::RankDeficientL { .. } => 1,
         LinearNote::NoDf { .. } => 2,
         LinearNote::ReducedNotConverged => 3,
-        LinearNote::RandomSlopeColumn => 4,
-        LinearNote::NegativeStatistic => 5,
+        LinearNote::NegativeStatistic => 4,
     };
     let kinds: BTreeSet<usize> = linear.iter().map(linear_kind).collect();
-    assert_eq!(kinds, (0..6).collect(), "one row note of each kind");
+    assert_eq!(kinds, (0..5).collect(), "one row note of each kind");
 
     let refusals = [
         RlrtRefusal::NoResidualDf,
@@ -594,18 +561,32 @@ fn rust_syntax(text: &str) -> Option<String> {
 }
 
 /// The note and refusal texts are port-neutral: each port renders them as
-/// given, so none names a Rust path, field or identifier.
+/// given, so none names a Rust path, field or identifier, and none carries a
+/// port's call syntax (the comparison function, the REML argument): each
+/// says what is wrong and what to do in plain words.
 #[test]
 fn no_note_text_carries_rust_syntax() {
     for field in ["(opts.satterthwaite)", "set fit.dispersion first"] {
         assert!(rust_syntax(field).is_some(), "{field}");
     }
     assert_eq!(rust_syntax("e.g. a value, i.e. one of 1.5 or 2."), None);
+    let port_syntax = [
+        "compare(",
+        "REML =",
+        "reml=",
+        "REML=FALSE",
+        "REML=TRUE",
+        "reml = False",
+        "reml = True",
+    ];
     let mut texts = every_note_text();
     texts.extend(every_refusal().iter().map(CompareError::to_string));
     assert!(texts.iter().all(|t| !t.is_empty()));
     for text in texts {
         assert_eq!(rust_syntax(&text), None, "{text}");
+        for s in port_syntax {
+            assert!(!text.contains(s), "{s}: {text}");
+        }
     }
 }
 
@@ -661,16 +642,29 @@ fn type_ii_on_the_gaussian_lmm_is_lmertests_xtx_metric() {
         &["subj", "g", "h"],
     );
     let lo = lower("y ~ g * h + x + (1 + x | subj)", &d, Family::Gaussian).unwrap();
-    let fit = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+    let fit = fit_warm_wo(
+        &lo.x,
+        &lo.y,
+        lo.n,
+        lo.p,
+        &lo.model,
+        &lo.ids,
+        None,
+        lo.weights.as_deref(),
+        lo.offset.as_deref(),
+        &FitOptions::default(),
+    );
     assert!(fit.converged());
     let retained: Vec<usize> = (0..lo.p).filter(|&j| !fit.aliased()[j]).collect();
-    let t2 = term_tests(
+    let t2 = term_tests_cached(
         &lo,
+        &FitOptions::default(),
         &fit,
         &TermTestOptions {
             ss_type: SsType::Type2,
             test: TermTest::Auto,
         },
+        &mut RefitCache::default(),
     )
     .unwrap();
     let xtx = type2_xtx(&lo, &retained);
@@ -798,13 +792,41 @@ fn the_default_test_gives_the_wald_rows_bit_for_bit() {
         ),
     ];
     for (formula, table, family, dispersion, terms, reason) in cases {
-        let mut lo = lower(formula, table, family).unwrap();
-        lo.opts.dispersion = dispersion;
-        let fit = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+        let lo = lower(formula, table, family).unwrap();
+        let fit_opts = FitOptions {
+            dispersion,
+            ..FitOptions::default()
+        };
+        let fit = fit_warm_wo(
+            &lo.x,
+            &lo.y,
+            lo.n,
+            lo.p,
+            &lo.model,
+            &lo.ids,
+            None,
+            lo.weights.as_deref(),
+            lo.offset.as_deref(),
+            &fit_opts,
+        );
         assert!(fit.converged(), "{formula}");
         for ss_type in [SsType::Type3, SsType::Type2] {
-            let auto = term_tests(&lo, &fit, &term_options(ss_type, TermTest::Auto)).unwrap();
-            let wald = term_tests(&lo, &fit, &term_options(ss_type, TermTest::Wald)).unwrap();
+            let auto = term_tests_cached(
+                &lo,
+                &fit_opts,
+                &fit,
+                &term_options(ss_type, TermTest::Auto),
+                &mut RefitCache::default(),
+            )
+            .unwrap();
+            let wald = term_tests_cached(
+                &lo,
+                &fit_opts,
+                &fit,
+                &term_options(ss_type, TermTest::Wald),
+                &mut RefitCache::default(),
+            )
+            .unwrap();
             let at = format!("{formula}, {ss_type:?}");
             assert_eq!(auto.choice.test, LinearKind::ChiSquared, "{at}");
             assert_eq!(auto.choice.reason, reason, "{at}");
@@ -861,13 +883,38 @@ fn the_default_test_gives_a_poisson_glmm_the_likelihood_ratio_rows() {
     ];
     for (formula, table, weights, types) in cases {
         let mut lo = lower(formula, table, poisson).unwrap();
-        lo.opts.weights = weights;
-        let fit = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+        lo.weights = weights;
+        let fit = fit_warm_wo(
+            &lo.x,
+            &lo.y,
+            lo.n,
+            lo.p,
+            &lo.model,
+            &lo.ids,
+            None,
+            lo.weights.as_deref(),
+            lo.offset.as_deref(),
+            &FitOptions::default(),
+        );
         assert!(fit.converged(), "{formula}");
         for &ss_type in types {
             let at = format!("{formula}, {ss_type:?}");
-            let auto = term_tests(&lo, &fit, &term_options(ss_type, TermTest::Auto)).unwrap();
-            let lrt = term_tests(&lo, &fit, &term_options(ss_type, TermTest::Lrt)).unwrap();
+            let auto = term_tests_cached(
+                &lo,
+                &FitOptions::default(),
+                &fit,
+                &term_options(ss_type, TermTest::Auto),
+                &mut RefitCache::default(),
+            )
+            .unwrap();
+            let lrt = term_tests_cached(
+                &lo,
+                &FitOptions::default(),
+                &fit,
+                &term_options(ss_type, TermTest::Lrt),
+                &mut RefitCache::default(),
+            )
+            .unwrap();
             assert_eq!(
                 (auto.choice.test, auto.choice.reason),
                 (LinearKind::LikelihoodRatio, ChoiceReason::PoissonMixed),
@@ -884,8 +931,26 @@ fn the_default_test_gives_a_poisson_glmm_the_likelihood_ratio_rows() {
         }
     }
     let lo = lower("y ~ x", &weighted, poisson).unwrap();
-    let fit = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
-    let t = term_tests(&lo, &fit, &TermTestOptions::default()).unwrap();
+    let fit = fit_warm_wo(
+        &lo.x,
+        &lo.y,
+        lo.n,
+        lo.p,
+        &lo.model,
+        &lo.ids,
+        None,
+        lo.weights.as_deref(),
+        lo.offset.as_deref(),
+        &FitOptions::default(),
+    );
+    let t = term_tests_cached(
+        &lo,
+        &FitOptions::default(),
+        &fit,
+        &TermTestOptions::default(),
+        &mut RefitCache::default(),
+    )
+    .unwrap();
     assert_eq!(
         (t.choice.test, t.choice.reason),
         (LinearKind::ChiSquared, ChoiceReason::NoRandomEffects)
@@ -933,11 +998,29 @@ fn an_explicit_test_on_an_f_table_is_refused() {
     ];
     for (formula, table, family, den_df, df_words) in cases {
         let lo = lower(formula, table, family).unwrap();
-        let fit = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+        let fit = fit_warm_wo(
+            &lo.x,
+            &lo.y,
+            lo.n,
+            lo.p,
+            &lo.model,
+            &lo.ids,
+            None,
+            lo.weights.as_deref(),
+            lo.offset.as_deref(),
+            &FitOptions::default(),
+        );
         assert!(fit.converged(), "{formula}");
         for ss_type in [SsType::Type3, SsType::Type2] {
             let at = format!("{formula}, {ss_type:?}");
-            let t = term_tests(&lo, &fit, &term_options(ss_type, TermTest::Auto)).unwrap();
+            let t = term_tests_cached(
+                &lo,
+                &FitOptions::default(),
+                &fit,
+                &term_options(ss_type, TermTest::Auto),
+                &mut RefitCache::default(),
+            )
+            .unwrap();
             assert_eq!(t.choice.test, LinearKind::F, "{at}");
             assert_eq!(t.choice.reason, ChoiceReason::FTest, "{at}");
             assert!(t.fixed.iter().all(|r| r.test.kind == LinearKind::F), "{at}");
@@ -945,7 +1028,14 @@ fn an_explicit_test_on_an_f_table_is_refused() {
                 (TermTest::Wald, "Wald chi-squared"),
                 (TermTest::Lrt, "likelihood-ratio"),
             ] {
-                let e = term_tests(&lo, &fit, &term_options(ss_type, asked)).unwrap_err();
+                let e = term_tests_cached(
+                    &lo,
+                    &FitOptions::default(),
+                    &fit,
+                    &term_options(ss_type, asked),
+                    &mut RefitCache::default(),
+                )
+                .unwrap_err();
                 assert_eq!(e, TermTestError::FTable { asked, den_df }, "{at}");
                 let text = e.to_string();
                 let f_test = format!("per-term tests on {df_words};");
@@ -956,8 +1046,8 @@ fn an_explicit_test_on_an_f_table_is_refused() {
     }
 }
 
-/// Likelihood-ratio rows refit by the lowering's options, so a fit made at
-/// another quadrature node count is refused, under an explicit
+/// Likelihood-ratio rows refit by the options `term_tests_cached` is given, so a
+/// fit made at another quadrature node count is refused, under an explicit
 /// likelihood-ratio test and under the default on a Poisson model with
 /// random effects, either way round; its Wald rows are unaffected.
 #[test]
@@ -969,24 +1059,60 @@ fn likelihood_ratio_rows_refuse_a_fit_made_at_another_node_count() {
         include_str!("../../validation/data/simulated/glmm_poisson.csv"),
         &["g"],
     );
-    let mut lo = lower("y ~ x + (1 | g)", &table, poisson).unwrap();
+    let lo = lower("y ~ x + (1 | g)", &table, poisson).unwrap();
     let agq = crate::FitOptions {
         nagq: 5,
-        ..lo.opts.clone()
+        ..FitOptions::default()
     };
-    let at5 = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &agq);
-    let at1 = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+    let at5 = fit_warm_wo(
+        &lo.x,
+        &lo.y,
+        lo.n,
+        lo.p,
+        &lo.model,
+        &lo.ids,
+        None,
+        lo.weights.as_deref(),
+        lo.offset.as_deref(),
+        &agq,
+    );
+    let at1 = fit_warm_wo(
+        &lo.x,
+        &lo.y,
+        lo.n,
+        lo.p,
+        &lo.model,
+        &lo.ids,
+        None,
+        lo.weights.as_deref(),
+        lo.offset.as_deref(),
+        &FitOptions::default(),
+    );
     assert!(at5.converged() && at1.converged());
     for ss_type in [SsType::Type3, SsType::Type2] {
         for test in [TermTest::Lrt, TermTest::Auto] {
-            let e = term_tests(&lo, &at5, &term_options(ss_type, test)).unwrap_err();
+            let e = term_tests_cached(
+                &lo,
+                &FitOptions::default(),
+                &at5,
+                &term_options(ss_type, test),
+                &mut RefitCache::default(),
+            )
+            .unwrap_err();
             assert_eq!(
                 e,
                 TermTestError::RefitNodeCount { fit: 5, refits: 1 },
                 "{ss_type:?} {test:?}"
             );
         }
-        let wald = term_tests(&lo, &at5, &term_options(ss_type, TermTest::Wald)).unwrap();
+        let wald = term_tests_cached(
+            &lo,
+            &FitOptions::default(),
+            &at5,
+            &term_options(ss_type, TermTest::Wald),
+            &mut RefitCache::default(),
+        )
+        .unwrap();
         assert!(
             wald.fixed
                 .iter()
@@ -994,9 +1120,101 @@ fn likelihood_ratio_rows_refuse_a_fit_made_at_another_node_count() {
             "{ss_type:?}"
         );
     }
-    lo.opts.nagq = 5;
-    let e = term_tests(&lo, &at1, &term_options(SsType::Type3, TermTest::Lrt)).unwrap_err();
+    let fit_opts = FitOptions {
+        nagq: 5,
+        ..FitOptions::default()
+    };
+    let e = term_tests_cached(
+        &lo,
+        &fit_opts,
+        &at1,
+        &term_options(SsType::Type3, TermTest::Lrt),
+        &mut RefitCache::default(),
+    )
+    .unwrap_err();
     assert_eq!(e, TermTestError::RefitNodeCount { fit: 1, refits: 5 });
+}
+
+/// Partial η² is `effectsize::F_to_eta2` of the row's own F and df,
+/// `F·df1 / (F·df1 + df2)`, bit for bit on every row of an OLS Type III table
+/// and of a Gaussian LMM's Satterthwaite table; NaN on every row of a Wald χ²
+/// table, of a likelihood-ratio table, and of an F table with no df (the
+/// Satterthwaite pass off).
+#[test]
+fn partial_eta2_follows_f_to_eta2() {
+    fn table(
+        formula: &str,
+        t: &Table,
+        family: Family,
+        satterthwaite: bool,
+        test: TermTest,
+    ) -> TermTable {
+        let fit_opts = FitOptions {
+            satterthwaite,
+            ..FitOptions::default()
+        };
+        let m = crate::formula::fit(formula, t, family, &fit_opts).unwrap();
+        assert!(m.fit().converged(), "{formula}");
+        super::anova::term_tests(&m, &term_options(SsType::Type3, test)).unwrap()
+    }
+    let d = csv_table(
+        include_str!("../../validation/data/simulated/sim_factorial.csv"),
+        &["subj", "g", "h"],
+    );
+    let bern = csv_table(
+        include_str!("../../validation/data/simulated/sim_factorial_bern.csv"),
+        &["subj", "g", "h"],
+    );
+    let binomial = Family::Binomial {
+        link: BinomialLink::Logit,
+    };
+    let (ols, lmm) = ("y ~ g * h + x", "y ~ g * h + x + (1 + x | subj)");
+    let gaussian = Family::Gaussian;
+    for (formula, den_kind) in [(ols, DenDf::Residual), (lmm, DenDf::Satterthwaite)] {
+        let t = table(formula, &d, gaussian, true, TermTest::Auto);
+        assert_eq!(t.fixed.len(), 4, "{formula}");
+        for row in &t.fixed {
+            let Reference::F {
+                num_df,
+                den_df,
+                den_df_kind,
+            } = row.test.reference
+            else {
+                panic!("{formula} {}: {:?}", row.label, row.test)
+            };
+            assert_eq!(den_df_kind, den_kind, "{formula} {}", row.label);
+            assert!(den_df.is_finite(), "{formula} {}", row.label);
+            let f_df1 = row.test.statistic * num_df;
+            let want = f_df1 / (f_df1 + den_df);
+            assert_eq!(
+                row.eta2_partial().to_bits(),
+                want.to_bits(),
+                "{formula} {}",
+                row.label
+            );
+        }
+    }
+    let untested = [
+        (
+            table(ols, &bern, binomial, true, TermTest::Wald),
+            LinearKind::ChiSquared,
+        ),
+        (
+            table(ols, &bern, binomial, true, TermTest::Lrt),
+            LinearKind::LikelihoodRatio,
+        ),
+        (
+            table(lmm, &d, gaussian, false, TermTest::Auto),
+            LinearKind::F,
+        ),
+    ];
+    for (t, kind) in untested {
+        assert_eq!(t.fixed.len(), 4, "{kind:?}");
+        for row in &t.fixed {
+            assert_eq!(row.test.kind, kind, "{}", row.label);
+            assert!(row.eta2_partial().is_nan(), "{kind:?} {}", row.label);
+        }
+    }
 }
 
 /// `theta_start` turns each vech-packed covariance block into its lower
@@ -1051,13 +1269,33 @@ struct LrtCase {
 }
 
 impl LrtCase {
+    /// The fit options of every fit of the case: its node count and held
+    /// dispersion.
+    fn options(&self) -> FitOptions {
+        FitOptions {
+            nagq: self.nagq,
+            dispersion: self.dispersion,
+            ..FitOptions::default()
+        }
+    }
+
     /// The cold fit of `formula` with the case's options, converged.
     fn fit(&self, formula: &str) -> (Lowered, Fit) {
         let mut lo = lower(formula, &self.table, self.family).unwrap();
-        lo.opts.nagq = self.nagq;
-        lo.opts.dispersion = self.dispersion;
-        lo.opts.weights = self.weights.map(|w| numeric(&self.table, w));
-        let fit = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+        let fit_opts = self.options();
+        lo.weights = self.weights.map(|w| numeric(&self.table, w));
+        let fit = fit_warm_wo(
+            &lo.x,
+            &lo.y,
+            lo.n,
+            lo.p,
+            &lo.model,
+            &lo.ids,
+            None,
+            lo.weights.as_deref(),
+            lo.offset.as_deref(),
+            &fit_opts,
+        );
         assert!(fit.converged(), "{}: {formula}", self.name);
         (lo, fit)
     }
@@ -1209,13 +1447,13 @@ fn lrt_cases() -> Vec<LrtCase> {
 fn likelihood_ratio_rows_equal_compare_on_their_formula_pairs() {
     for case in lrt_cases() {
         let (lo, fit) = case.fit(&case.formula);
-        let full = Model::from_fit(&case.formula, &lo, &fit);
+        let full = Model::from_fit(&case.formula, &lo, &case.options(), &fit);
         let side = |formula: &str| {
             if formula == case.formula {
                 return full.clone();
             }
             let (lo, fit) = case.fit(formula);
-            Model::from_fit(formula, &lo, &fit)
+            Model::from_fit(formula, &lo, &case.options(), &fit)
         };
         let all: Vec<usize> = (0..lo.p).collect();
         let hyp = type3(&lo, &all);
@@ -1230,13 +1468,20 @@ fn likelihood_ratio_rows_equal_compare_on_their_formula_pairs() {
             })
             .collect();
         for (ss_type, pairs) in [(SsType::Type2, &case.type2), (SsType::Type3, &type3_pairs)] {
-            let t = term_tests(&lo, &fit, &term_options(ss_type, TermTest::Lrt)).unwrap();
+            let t = term_tests_cached(
+                &lo,
+                &case.options(),
+                &fit,
+                &term_options(ss_type, TermTest::Lrt),
+                &mut RefitCache::default(),
+            )
+            .unwrap();
             assert_eq!(t.choice.test, LinearKind::LikelihoodRatio, "{}", case.name);
             assert_eq!(t.choice.reason, ChoiceReason::Requested, "{}", case.name);
             for (term, larger, smaller) in pairs {
                 let at = format!("{}, {ss_type:?} {term}", case.name);
                 let row = &t.fixed.iter().find(|r| r.label == *term).unwrap().test;
-                let c = compare(&side(larger), &side(smaller), &OPTS).unwrap();
+                let c = compare_stored(&side(larger), &side(smaller), &OPTS).unwrap();
                 let want = lr(&c);
                 assert_eq!(row.kind, LinearKind::LikelihoodRatio, "{at}");
                 assert_eq!(
@@ -1273,32 +1518,135 @@ fn likelihood_ratio_rows_equal_compare_on_their_formula_pairs() {
     }
 }
 
-/// A term whose test would leave out or mix a random-slope column (`x`, in
-/// `(1 + x | subj)`) gets its Wald row, bit for bit, with
-/// [`LinearNote::RandomSlopeColumn`], on both types; the table's other rows
-/// are likelihood-ratio rows and the table's test stays the likelihood-ratio
-/// test.
+/// `(x || g)` is nested in `(1 + x | g)`: every term of the smaller random
+/// part lies inside one term of the larger. On sleepstudy the two ML fits are
+/// one parameter apart, the correlation.
 #[test]
-fn a_slope_touching_term_gets_its_wald_row_and_note() {
-    let case = factorial_case("slope", " + (1 + x | subj)", 1, "");
-    let (lo, fit) = case.fit(&case.formula);
-    for ss_type in [SsType::Type3, SsType::Type2] {
-        let lrt = term_tests(&lo, &fit, &term_options(ss_type, TermTest::Lrt)).unwrap();
-        let wald = term_tests(&lo, &fit, &term_options(ss_type, TermTest::Wald)).unwrap();
-        assert_eq!(lrt.choice.test, LinearKind::LikelihoodRatio);
-        for (row, w) in lrt.fixed.iter().zip(&wald.fixed) {
-            let at = format!("{ss_type:?} {}", row.label);
-            if row.label == "x" {
-                let mut want = w.test.clone();
-                want.notes.push(LinearNote::RandomSlopeColumn);
-                assert_eq!(format!("{:?}", row.test), format!("{want:?}"), "{at}");
-            } else {
+fn uncorrelated_is_nested_in_correlated() {
+    assert_eq!(
+        nesting("y ~ x + (x || g)", "y ~ x + (1 + x | g)"),
+        Ok(super::anova::Nesting::Nested {
+            larger: Side::Second,
+            differs: Differs::Random,
+        })
+    );
+    assert_eq!(
+        nesting("y ~ x + (1 | g) + (0 + x | g)", "y ~ x + (x || g)"),
+        Ok(super::anova::Nesting::Same)
+    );
+    assert!(nesting("y ~ x + (0 + x | g)", "y ~ x + (1 | g)").is_err());
+    let d = sleepstudy();
+    let uncorr = side("Reaction ~ Days + (Days || Subject)", &d, Some(false), None);
+    let corr = side("Reaction ~ Days + (Days | Subject)", &d, Some(false), None);
+    let c = cmp(&uncorr, &corr).unwrap();
+    assert_eq!(c.larger, Side::Second);
+    assert_eq!(lr(&c).df, 1);
+}
+
+/// The likelihood-ratio row of `h` in `y ~ h + x + (x || subj)` refits the
+/// model without `h`, which moves the slope from column 2 to column 1; the
+/// refit rewrites the terms with the slopes, so the shape check accepts it and
+/// the row is a likelihood-ratio row with a finite statistic and no note.
+#[test]
+fn lrt_rows_refit_an_uncorrelated_model() {
+    let case = factorial_case("uncorrelated", "", 1, "");
+    let (lo, fit) = case.fit("y ~ h + x + (x || subj)");
+    assert_eq!(lo.model.re.as_ref().unwrap().slopes, vec![2]);
+    let t = term_tests_cached(
+        &lo,
+        &case.options(),
+        &fit,
+        &term_options(SsType::Type2, TermTest::Lrt),
+        &mut RefitCache::default(),
+    )
+    .unwrap();
+    let row = t
+        .fixed
+        .iter()
+        .find(|r| r.label == "h")
+        .expect("a row for h");
+    assert_eq!(row.test.kind, LinearKind::LikelihoodRatio, "{:?}", row.test);
+    assert!(row.test.statistic.is_finite(), "{:?}", row.test);
+    assert!(row.test.notes.is_empty(), "{:?}", row.test);
+}
+
+/// Every row of a likelihood-ratio table is a likelihood-ratio row, with a
+/// finite statistic and no note, when a term's columns carry a random slope:
+/// on `(1 + x | subj)` the rows of `x` drop the slope column, and on
+/// `(1 + g | subj)` the Type III rows of `g` and `h` fit `X·N`, the `N` of
+/// `g` mixing `g`'s slope columns (`h`'s leaves them unit columns). Such a
+/// slope column moves to a
+/// random-effect-only column of the refit, so the reduced model keeps the
+/// random slope. Both types.
+#[test]
+fn a_slope_term_gets_a_likelihood_ratio_row() {
+    for re in [" + (1 + x | subj)", " + (1 + g | subj)"] {
+        let case = factorial_case("slope", re, 1, "");
+        let (lo, fit) = case.fit(&case.formula);
+        if re.contains("g |") {
+            let all: Vec<usize> = (0..lo.p).collect();
+            let g_cols = &lo.terms.iter().find(|t| t.label == "g").unwrap().columns;
+            let exact = type3_unrounded(&lo, &all);
+            for (h, e) in type3(&lo, &all).iter().zip(&exact) {
+                if h.term != "g" && h.term != "h" {
+                    continue;
+                }
+                let kept = untouched_columns(h.l.as_ref());
+                let basis = type3_null_basis(h.l.as_ref(), e.l.as_ref()).unwrap();
+                assert!(basis.ncols() > kept.len(), "{}: N mixes columns", h.term);
+                assert_eq!(
+                    g_cols.clone().any(|c| !kept.contains(&c)),
+                    h.term == "g",
+                    "{}: L touches a slope column",
+                    h.term
+                );
+            }
+        }
+        for ss_type in [SsType::Type3, SsType::Type2] {
+            let lrt = term_tests_cached(
+                &lo,
+                &case.options(),
+                &fit,
+                &term_options(ss_type, TermTest::Lrt),
+                &mut RefitCache::default(),
+            )
+            .unwrap();
+            assert_eq!(lrt.choice.test, LinearKind::LikelihoodRatio);
+            for row in &lrt.fixed {
+                let at = format!("{re} {ss_type:?} {}", row.label);
                 assert_eq!(row.test.kind, LinearKind::LikelihoodRatio, "{at}");
                 assert!(row.test.statistic.is_finite(), "{at}: {:?}", row.test);
                 assert!(row.test.notes.is_empty(), "{at}: {:?}", row.test);
             }
         }
     }
+}
+
+/// A factor slope term: `compare` of `y ~ 1 + (1 + g | subj)` (the slope's
+/// columns random-effect-only) against `y ~ g + (1 + g | subj)`, and the Type
+/// III likelihood-ratio row `g` of the larger fit, whose refit moves `g`'s
+/// slope columns out of the fixed design, give the same statistic and df.
+#[test]
+fn compare_and_the_lrt_row_agree_on_a_factor_slope_term() {
+    let case = factorial_case("factor slope", "", 1, "");
+    let fit = |f: &str| crate::formula::fit(f, &case.table, case.family, &case.options()).unwrap();
+    let (smaller, larger) = (fit("y ~ 1 + (1 + g | subj)"), fit("y ~ g + (1 + g | subj)"));
+    assert!(smaller.fit().converged() && larger.fit().converged());
+    assert_eq!(smaller.lowered().re_p, 2);
+    let c = super::anova::compare(&smaller, &larger, &OPTS).unwrap();
+    let t = lr(&c);
+    let table =
+        super::anova::term_tests(&larger, &term_options(SsType::Type3, TermTest::Lrt)).unwrap();
+    let row = &table.fixed.iter().find(|r| r.label == "g").unwrap().test;
+    assert_eq!(row.kind, LinearKind::LikelihoodRatio);
+    assert!(row.notes.is_empty(), "{row:?}");
+    assert_eq!(row.num_df, t.df as f64);
+    let gap = (row.statistic - t.statistic).abs();
+    eprintln!(
+        "factor slope: lrt row {:e}, compare {:e}",
+        row.statistic, t.statistic
+    );
+    assert!(gap <= LRT_ABS, "{row:?} off compare {t:?} by {gap:e}");
 }
 
 /// A refit that did not converge, the smaller or (a Type II set) the larger,
@@ -1330,7 +1678,14 @@ fn a_fit_or_refit_that_did_not_converge_gives_nan_rows() {
         assert_eq!(t.reference, Reference::ChiSquared { df: 1 });
     }
     for ss_type in [SsType::Type3, SsType::Type2] {
-        let t = term_tests(&lo, &failed_larger, &term_options(ss_type, TermTest::Lrt)).unwrap();
+        let t = term_tests_cached(
+            &lo,
+            &case.options(),
+            &failed_larger,
+            &term_options(ss_type, TermTest::Lrt),
+            &mut RefitCache::default(),
+        )
+        .unwrap();
         assert_eq!(t.fixed.len(), 4);
         for row in &t.fixed {
             let test = &row.test;
@@ -1366,12 +1721,26 @@ fn type_ii_lrt_rows_do_not_read_the_covariance() {
     let case = factorial_case("binomial GLMM", " + (1 | subj)", 1, "");
     let (lo, fit) = case.fit(&case.formula);
     let opts = term_options(SsType::Type2, TermTest::Lrt);
-    let want = term_tests(&lo, &fit, &opts).unwrap();
+    let want = term_tests_cached(
+        &lo,
+        &case.options(),
+        &fit,
+        &opts,
+        &mut RefitCache::default(),
+    )
+    .unwrap();
     let (_, mut blind) = case.fit(&case.formula);
     for row in &mut blind.vcov {
         row.fill(f64::NAN);
     }
-    let got = term_tests(&lo, &blind, &opts).unwrap();
+    let got = term_tests_cached(
+        &lo,
+        &case.options(),
+        &blind,
+        &opts,
+        &mut RefitCache::default(),
+    )
+    .unwrap();
     assert!(want.fixed.iter().all(|r| r.test.statistic.is_finite()));
     assert_eq!(format!("{:?}", got.fixed), format!("{:?}", want.fixed));
 }
@@ -1389,11 +1758,76 @@ fn type_iii_lrt_rows_match_afex_on_the_frozen_glmm() {
     );
     let case = factorial_case("binomial GLMM", " + (1 | subj)", 1, "");
     let (lo, fit) = case.fit(&case.formula);
-    let t = term_tests(&lo, &fit, &term_options(SsType::Type3, TermTest::Lrt)).unwrap();
+    let t = term_tests_cached(
+        &lo,
+        &case.options(),
+        &fit,
+        &term_options(SsType::Type3, TermTest::Lrt),
+        &mut RefitCache::default(),
+    )
+    .unwrap();
     let rows = json["rows"].as_array().expect("frozen rows");
     assert_eq!(rows.len(), t.fixed.len());
     for (row, want) in t.fixed.iter().zip(rows) {
         assert_eq!(row.label, want["term"].as_str().unwrap());
+        assert_eq!(
+            row.test.num_df,
+            want["df"].as_f64().unwrap(),
+            "{}",
+            row.label
+        );
+        let gap = (row.test.statistic - want["statistic"].as_f64().unwrap()).abs();
+        assert!(
+            gap <= LRT_ABS,
+            "{}: {:?} off afex by {gap:e}",
+            row.label,
+            row.test
+        );
+    }
+}
+
+/// The Type III likelihood-ratio row `x` of `y ~ x + (1 + x | g)`, binomial
+/// logit on `sim_binomial_slope1`, whose refit moves the slope on `x` to a
+/// random-effect-only column, against afex's `mixed(type = 3, method =
+/// "LRT")`, frozen in `anova_lrt3_glmm_sim_binomial_slope1`: the statistic
+/// within the registry's `lrt` band, the df exactly.
+#[test]
+fn type_iii_lrt_rows_with_a_random_slope_match_afex() {
+    let json = crate::inference::test_refs::load(
+        crate::inference::test_refs::Kind::Anova,
+        "anova_lrt3_glmm_sim_binomial_slope1",
+    );
+    let case = LrtCase {
+        name: "binomial slope GLMM",
+        table: csv_table(
+            include_str!("../../validation/data/simulated/sim_binomial_slope1.csv"),
+            &["g"],
+        ),
+        formula: "y ~ x + (1 + x | g)".into(),
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        nagq: 1,
+        weights: None,
+        dispersion: None,
+        type2: Vec::new(),
+        type3: Vec::new(),
+    };
+    let (lo, fit) = case.fit(&case.formula);
+    let t = term_tests_cached(
+        &lo,
+        &case.options(),
+        &fit,
+        &term_options(SsType::Type3, TermTest::Lrt),
+        &mut RefitCache::default(),
+    )
+    .unwrap();
+    let rows = json["rows"].as_array().expect("frozen rows");
+    assert_eq!(rows.len(), t.fixed.len());
+    for (row, want) in t.fixed.iter().zip(rows) {
+        assert_eq!(row.label, want["term"].as_str().unwrap());
+        assert_eq!(row.test.kind, LinearKind::LikelihoodRatio, "{}", row.label);
+        assert!(row.test.notes.is_empty(), "{}: {:?}", row.label, row.test);
         assert_eq!(
             row.test.num_df,
             want["df"].as_f64().unwrap(),
@@ -1422,7 +1856,14 @@ fn type_iii_lrt_h_row_refits_on_the_unrounded_null_basis() {
     let case = factorial_case("binomial GLMM", " + (1 | subj)", 1, "");
     let (lo, fit) = case.fit(&case.formula);
     assert!(!fit.aliased().iter().any(|&a| a), "a full-rank design");
-    let table = term_tests(&lo, &fit, &term_options(SsType::Type3, TermTest::Lrt)).unwrap();
+    let table = term_tests_cached(
+        &lo,
+        &case.options(),
+        &fit,
+        &term_options(SsType::Type3, TermTest::Lrt),
+        &mut RefitCache::default(),
+    )
+    .unwrap();
     let h = lo
         .terms
         .iter()
@@ -1433,10 +1874,17 @@ fn type_iii_lrt_h_row_refits_on_the_unrounded_null_basis() {
     let rounded = type3(&lo, &all).swap_remove(h).l;
     let exact = type3_unrounded(&lo, &all).swap_remove(h).l;
     let statistic = |l: &Mat<f64>| {
-        let basis = type3_null_basis(rounded.as_ref(), l.as_ref(), &[]).unwrap();
+        let basis = type3_null_basis(rounded.as_ref(), l.as_ref()).unwrap();
         let kept = untouched_columns(rounded.as_ref()).len();
         assert!(basis.ncols() > kept, "N mixes columns");
-        let reduced = refit_on_basis(&lo, &fit, &all, &basis, &[Vec::new()]);
+        let reduced = refit_on_basis(
+            &lo,
+            &case.options(),
+            &fit,
+            &all,
+            &basis,
+            &(vec![Vec::new()], vec![]),
+        );
         lrt_test(&fit, &reduced, lo.p - basis.ncols()).statistic
     };
     let (g_exact, g_rounded) = (statistic(&exact), statistic(&rounded));
@@ -1455,7 +1903,775 @@ fn type_iii_lrt_h_row_refits_on_the_unrounded_null_basis() {
     );
 }
 
+/// `anova_ml_pair_sleepstudy_fixed`: `Reaction ~ 1 + (Days | Subject)`,
+/// whose slope variable is in no fixed term, against `Reaction ~ Days +
+/// (Days | Subject)`, both ML. The statistic within the registry's `lrt`
+/// band of the one from the frozen logLiks, the df exactly.
+#[test]
+fn the_sleepstudy_ml_pair_matches_its_frozen_reference() {
+    let json = crate::inference::test_refs::load(
+        crate::inference::test_refs::Kind::Anova,
+        "anova_ml_pair_sleepstudy_fixed",
+    );
+    let d = sleepstudy();
+    let fit_opts = FitOptions {
+        reml: Some(false),
+        ..FitOptions::default()
+    };
+    let fit = |f: &str| crate::formula::fit(f, &d, Family::Gaussian, &fit_opts).unwrap();
+    let (smaller, larger) = (
+        fit("Reaction ~ 1 + (Days | Subject)"),
+        fit("Reaction ~ Days + (Days | Subject)"),
+    );
+    let c = super::anova::compare(&smaller, &larger, &OPTS).unwrap();
+    let t = lr(&c);
+    let ll = |i: usize| json["members"][i]["logLik"].as_f64().unwrap();
+    let want = 2.0 * (ll(1) - ll(0));
+    assert_eq!(t.df, 1);
+    let gap = (t.statistic - want).abs();
+    assert!(gap <= LRT_ABS, "{:?} off lme4 by {gap:e}", t);
+}
+
 /// The band of a likelihood-ratio statistic against a frozen reference,
 /// absolute: `TOL_INFERENCE$lrt_abs` in `validation/grid/tol.R` (also
 /// copied in `tests/oracle_support/mod.rs`). Change together.
 const LRT_ABS: f64 = 4e-4;
+
+// The comparison checks and rules below run on sides changed by hand (a
+// variance, a log-likelihood, a field a refusal reads) and the per-term tests
+// on fits paired with other options or a covariance changed by hand: inputs
+// no fitted `formula::Model` carries.
+
+fn opts() -> CompareOptions {
+    CompareOptions {
+        nsim: 1000,
+        seed: 1,
+    }
+}
+
+/// 30 rows: six groups `g` of five, a numeric `x` and `z`, a two-level `a`
+/// and a three-level `b` (every pair of levels present), and a response with
+/// a group effect.
+fn table() -> Table {
+    let n = 30;
+    let (mut y, mut x, mut z) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut g, mut a, mut b) = (Vec::new(), Vec::new(), Vec::new());
+    for i in 0..n {
+        let xi = ((i * 7) % 11) as f64 / 10.0;
+        let zi = ((i * 5) % 13) as f64 / 6.0;
+        let u = [0.9, -0.6, 0.3, -1.1, 0.7, -0.2][i / 5];
+        let e = (((i * 37) % 17) as f64 - 8.0) / 9.0;
+        y.push(2.0 + 0.8 * xi - 0.5 * zi + u + e);
+        x.push(xi);
+        z.push(zi);
+        g.push(format!("g{}", i / 5));
+        a.push(format!("a{}", i % 2));
+        b.push(format!("b{}", i % 3));
+    }
+    Table {
+        columns: vec![
+            ("y".into(), Column::Numeric(y)),
+            ("x".into(), Column::Numeric(x)),
+            ("z".into(), Column::Numeric(z)),
+            ("g".into(), Column::factor_from_labels(&g)),
+            ("a".into(), Column::factor_from_labels(&a)),
+            ("b".into(), Column::factor_from_labels(&b)),
+        ],
+        n,
+    }
+}
+
+/// A Gaussian fit of `formula` on [`table`] with `reml`, as a `Model`.
+fn model(formula: &str, reml: Option<bool>) -> Model {
+    side(formula, &table(), reml, None)
+}
+
+/// The statistic, p-value and reference of a comparison's test.
+fn outcome(c: &Comparison) -> (u64, u64, Reference) {
+    match &c.test {
+        ComparisonTest::Lr(t) => (t.statistic.to_bits(), t.p_value.to_bits(), t.reference),
+        ComparisonTest::Linear(t) => (t.statistic.to_bits(), t.p_value.to_bits(), t.reference),
+    }
+}
+
+/// `compare_stored(a, b)`, after checking that `compare_stored(b, a)` gives
+/// the same answer (the sides mirrored, the same test) or the same refusal.
+fn cmp(a: &Model, b: &Model) -> Result<Comparison, CompareError> {
+    let forward = compare_stored(a, b, &opts());
+    let back = compare_stored(b, a, &opts());
+    match (&forward, &back) {
+        (Ok(f), Ok(b)) => {
+            assert_ne!(f.larger, b.larger, "the larger side follows its model");
+            assert_eq!(f.differs, b.differs);
+            assert_eq!((&f.m0, &f.m1), (&b.m1, &b.m0), "the sides as given");
+            assert_eq!(outcome(f), outcome(b), "the same test either way round");
+        }
+        (Err(f), Err(b)) => assert_eq!(discriminant(f), discriminant(b), "{f} / {b}"),
+        _ => panic!("swapping the sides changed the answer: {forward:?} / {back:?}"),
+    }
+    forward
+}
+
+fn refusal(a: &Model, b: &Model) -> CompareError {
+    cmp(a, b).expect_err("refused")
+}
+
+fn sleepstudy() -> Table {
+    csv_table(
+        include_str!("../../validation/data/empirical/sleepstudy.csv"),
+        &["Subject"],
+    )
+}
+
+fn binomial() -> Family {
+    Family::Binomial {
+        link: BinomialLink::Logit,
+    }
+}
+
+fn gamma() -> Family {
+    Family::Gamma {
+        link: GammaLink::Log,
+    }
+}
+
+const MIXTURE: LrNote = LrNote::BoundaryMixture { approximate: false };
+
+fn slope1() -> Table {
+    csv_table(
+        include_str!("../../validation/data/simulated/sim_binomial_slope1.csv"),
+        &["g"],
+    )
+}
+
+/// Sleepstudy with a crossed grouping `blk`, the row index mod 6.
+fn sleepstudy_blk() -> Table {
+    let mut d = sleepstudy();
+    let blk: Vec<String> = (0..d.n).map(|i| format!("b{}", i % 6)).collect();
+    d.columns
+        .push(("blk".into(), Column::factor_from_labels(&blk)));
+    d
+}
+
+/// The position of grouping `name` among a model's `varcorr` blocks.
+fn block(m: &Model, name: &str) -> usize {
+    m.re_groups.iter().position(|(n, _)| n == name).unwrap()
+}
+
+const FIXED: &str = "y ~ g * h + x";
+/// R's `term.labels` of [`FIXED`].
+const LABELS: [&str; 4] = ["g", "h", "x", "g:h"];
+
+fn sim_factorial_bern() -> Table {
+    csv_table(
+        include_str!("../../validation/data/simulated/sim_factorial_bern.csv"),
+        &["subj", "g", "h"],
+    )
+}
+
+fn glm_gamma() -> Table {
+    csv_table(
+        include_str!("../../validation/data/simulated/glm_gamma.csv"),
+        &["grp"],
+    )
+}
+
+/// A converged fit of `formula` on `table` with `reml`, and its lowering.
+fn lowered_fit(formula: &str, table: &Table, family: Family, reml: Option<bool>) -> (Lowered, Fit) {
+    let lo = lower(formula, table, family).unwrap();
+    let fit_opts = FitOptions {
+        reml,
+        ..FitOptions::default()
+    };
+    let fit = crate::fit(&lo.data(), lo.spec(), &fit_opts).unwrap();
+    assert!(fit.converged(), "{formula} did not converge");
+    (lo, fit)
+}
+
+/// The per-term table of `ss_type`, its χ² rows pinned to the Wald test so
+/// they stay Wald whatever the default test gives; a fit whose rows are F
+/// tests refuses an explicit test, so its table takes the default, which must
+/// be its F table (a χ² fit that refused the Wald test fails here).
+fn term_table(
+    lo: &Lowered,
+    fit_opts: &FitOptions,
+    fit: &Fit,
+    ss_type: SsType,
+) -> Result<TermTable, TermTestError> {
+    let mut opts = term_options(ss_type, TermTest::Wald);
+    match term_tests_cached(lo, fit_opts, fit, &opts, &mut RefitCache::default()) {
+        Err(TermTestError::FTable { .. }) => {
+            opts.test = TermTest::Auto;
+            let table = term_tests_cached(lo, fit_opts, fit, &opts, &mut RefitCache::default());
+            if let Ok(t) = &table {
+                assert_eq!(
+                    t.choice.test,
+                    LinearKind::F,
+                    "a χ² fit refused the Wald test"
+                );
+            }
+            table
+        }
+        other => other,
+    }
+}
+
+/// The Type III and Type II tables of `fit` ([`term_table`]).
+fn tables(lo: &Lowered, fit_opts: &FitOptions, fit: &Fit) -> [TermTable; 2] {
+    [SsType::Type3, SsType::Type2].map(|ss_type| term_table(lo, fit_opts, fit, ss_type).unwrap())
+}
+
+fn labels(t: &TermTable) -> Vec<&str> {
+    t.fixed.iter().map(|r| r.label.as_str()).collect()
+}
+
+#[test]
+fn a_side_that_did_not_converge_refuses() {
+    let m0 = model("y ~ x + (1 | g)", None);
+    let mut m1 = model("y ~ x + z + (1 | g)", Some(false));
+    let mut m0ml = model("y ~ x + (1 | g)", Some(false));
+    m1.converged = false;
+    let e = refusal(&m0ml, &m1);
+    assert_eq!(
+        e,
+        CompareError::NotConverged {
+            m0: false,
+            m1: true
+        }
+    );
+    assert!(
+        e.to_string()
+            .starts_with("the second model did not converge"),
+        "{e}"
+    );
+    m0ml.converged = false;
+    let e = refusal(&m0ml, &m1);
+    assert!(e.to_string().starts_with("neither model converged"), "{e}");
+    // Checked first: before the estimator check that this pair also fails.
+    let e = refusal(&m0, &m1);
+    assert_eq!(
+        e,
+        CompareError::NotConverged {
+            m0: false,
+            m1: true
+        }
+    );
+}
+
+#[test]
+fn different_row_counts_refuse() {
+    let m0 = model("y ~ x", None);
+    let mut m1 = model("y ~ x + z", None);
+    m1.nobs -= 1;
+    m1.y.pop();
+    let e = refusal(&m0, &m1);
+    assert_eq!(e, CompareError::DifferentRows { m0: 30, m1: 29 });
+    assert_eq!(
+        e.to_string(),
+        "the first model has 30 rows and the second has 29; a comparison needs both fits \
+         on the same rows. Fit both models to the same rows, dropping the rows with a \
+         missing value in any variable of either formula first."
+    );
+}
+
+#[test]
+fn a_response_differing_in_one_entry_refuses() {
+    let m0 = model("y ~ x", None);
+    let mut m1 = model("y ~ x + z", None);
+    m1.y[17] = f64::from_bits(m1.y[17].to_bits() + 1);
+    let e = refusal(&m0, &m1);
+    assert_eq!(e, CompareError::DifferentY);
+    assert_eq!(
+        e.to_string(),
+        "the two models have different responses y (the same row count, different \
+         values); a comparison needs both fits on the same data. Fit both models to the \
+         same data."
+    );
+}
+
+#[test]
+fn different_weights_refuse() {
+    let m0 = model("y ~ x", None);
+    let mut m1 = model("y ~ x + z", None);
+    let mut w = vec![1.0; 30];
+    // All-ones weights are no weights.
+    m1.weights = Some(w.clone());
+    assert!(cmp(&m0, &m1).is_ok());
+    w[4] = 2.0;
+    m1.weights = Some(w);
+    let e = refusal(&m0, &m1);
+    assert_eq!(e, CompareError::DifferentWeights);
+    assert_eq!(
+        e.to_string(),
+        "the two models were fitted with different weights; a comparison needs the same \
+         weights in both. Fit both models with the same weights."
+    );
+}
+
+#[test]
+fn different_offsets_refuse() {
+    let m0 = model("y ~ x", None);
+    let mut m1 = model("y ~ x + z", None);
+    let mut o = vec![0.0; 30];
+    m1.offset = Some(o.clone());
+    assert!(cmp(&m0, &m1).is_ok());
+    o[9] = 0.5;
+    m1.offset = Some(o);
+    let e = refusal(&m0, &m1);
+    assert_eq!(e, CompareError::DifferentOffset);
+    assert_eq!(
+        e.to_string(),
+        "the two models were fitted with different offsets; a comparison needs the same \
+         offset in both. Fit both models with the same offset."
+    );
+}
+
+#[test]
+fn a_different_family_or_link_refuses() {
+    let m0 = model("y ~ x", None);
+    let mut m1 = model("y ~ x + z", None);
+    m1.family = Family::Poisson {
+        link: PoissonLink::Log,
+    };
+    let e = refusal(&m0, &m1);
+    assert!(matches!(e, CompareError::DifferentFamily { .. }), "{e:?}");
+    assert_eq!(
+        e.to_string(),
+        "the first model was fitted as gaussian with identity link and the second as \
+         poisson with log link; a comparison needs the same family and link in both. Fit \
+         both models with the same family and link."
+    );
+}
+
+#[test]
+fn a_different_held_dispersion_refuses() {
+    let m0 = model("y ~ x", None);
+    let mut m1 = model("y ~ x + z", None);
+    m1.dispersion_held = Some(2.0);
+    let e = refusal(&m0, &m1);
+    assert_eq!(
+        e,
+        CompareError::DifferentDispersionHeld {
+            m0: None,
+            m1: Some(2.0)
+        }
+    );
+    assert!(e.to_string().contains("dispersion"), "{e}");
+    let mut m0 = m0;
+    m0.dispersion_held = Some(1.5);
+    let e = refusal(&m0, &m1);
+    assert!(
+        matches!(e, CompareError::DifferentDispersionHeld { .. }),
+        "{e:?}"
+    );
+    m0.dispersion_held = Some(2.0);
+    assert!(cmp(&m0, &m1).is_ok());
+}
+
+#[test]
+fn the_data_checks_come_before_the_nesting_check() {
+    // Not nested, and fitted on different data: the data refusal is reported.
+    let m0 = model("y ~ x", None);
+    let mut m1 = model("y ~ z", None);
+    // The premise: unmodified, the pair is refused as not nested.
+    assert!(
+        matches!(refusal(&m0, &m1), CompareError::NotNested { .. }),
+        "the pair is not nested"
+    );
+    m1.y[17] = f64::from_bits(m1.y[17].to_bits() + 1);
+    assert_eq!(refusal(&m0, &m1), CompareError::DifferentY);
+    m1.nobs -= 1;
+    m1.y.pop();
+    assert_eq!(
+        refusal(&m0, &m1),
+        CompareError::DifferentRows { m0: 30, m1: 29 }
+    );
+}
+
+#[test]
+fn one_formula_on_both_sides_has_the_same_parts_whatever_the_parameter_counts() {
+    // The refusal names the same parts, not the parameter counts: two fits
+    // of one formula have equal counts, and a side built by hand can carry
+    // another count for the same formula.
+    let m0 = model("y ~ x + (1 | g)", Some(false));
+    let mut m1 = m0.clone();
+    for _ in 0..2 {
+        let e = refusal(&m0, &m1);
+        assert_eq!(e, CompareError::SameParts);
+        assert_eq!(
+            e.to_string(),
+            "the two models have the same fixed and random parts, so there is nothing to \
+             test. Compare two models that differ by at least one parameter."
+        );
+        m1.df += 1;
+    }
+    // An OLS pair whose reml settings differ: OLS skips the estimator check,
+    // so the same parts are reported.
+    assert_eq!(
+        refusal(&model("y ~ x", None), &model("y ~ x", Some(true))),
+        CompareError::SameParts
+    );
+}
+
+#[test]
+fn a_dropped_component_at_zero_gives_t_zero_and_p_one_on_every_reference() {
+    // Exact reference: Dyestuff2's batch variance is estimated at zero.
+    let d = csv_table(
+        include_str!("../../validation/data/empirical/Dyestuff2.csv"),
+        &["Batch"],
+    );
+    let ols = side("Yield ~ 1", &d, Some(true), None);
+    let full = side("Yield ~ 1 + (1 | Batch)", &d, None, None);
+    assert_eq!(
+        full.varcorr,
+        vec![vec![0.0]],
+        "Dyestuff2 pins the batch variance"
+    );
+    let c = cmp(&ols, &full).unwrap();
+    let t = lr(&c);
+    assert_eq!(t.statistic.to_bits(), 0.0f64.to_bits());
+    assert_eq!(t.p_value, 1.0);
+    // No draws are made at a zero statistic: the exact test returns `nsim = 0`.
+    assert_eq!(
+        t.reference,
+        Reference::ExactRlrt {
+            nsim: 0,
+            seed: opts().seed
+        }
+    );
+
+    // Mixture reference: the same pair given weights, all equal to 1, keeps
+    // no design summary.
+    let weighted = |f: &str, reml| side(f, &d, reml, Some(vec![1.0; d.n]));
+    let (ols_w, full_w) = (
+        weighted("Yield ~ 1", Some(true)),
+        weighted("Yield ~ 1 + (1 | Batch)", None),
+    );
+    assert_eq!(full_w.design_summary, None);
+    let c = cmp(&ols_w, &full_w).unwrap();
+    let t = lr(&c);
+    assert_eq!(t.reference, Reference::ChiBarSquared { df_low: 0 });
+    assert_eq!(t.notes, vec![LrNote::NoDesignSummary, MIXTURE]);
+    assert!(c.note_lines()[0].contains("unweighted (1 | g)"));
+    assert_eq!((t.statistic, t.p_value), (0.0, 1.0));
+
+    // Mixture and χ² references, from a side whose dropped variances are set
+    // to zero while its log-likelihood stays a round-off above the smaller
+    // one's: the rule, not the round-off, decides.
+    let s = sleepstudy();
+    let int = side("Reaction ~ Days + (1 | Subject)", &s, None, None);
+    let ols = side("Reaction ~ Days", &s, Some(true), None);
+    let mut slope = side("Reaction ~ Days + (Days | Subject)", &s, None, None);
+    let v = slope.varcorr[0].clone();
+    // The vech block is (intercept, covariance, slope).
+    slope.varcorr = vec![vec![v[0], 0.0, 0.0]];
+    slope.loglik = int.loglik + 1e-9;
+    let t = lr(&cmp(&int, &slope).unwrap()).clone();
+    assert_eq!(t.reference, Reference::ChiBarSquared { df_low: 1 });
+    assert_eq!((t.statistic, t.p_value), (0.0, 1.0));
+    slope.varcorr = vec![vec![0.0, 0.0, 0.0]];
+    slope.loglik = ols.loglik + 1e-9;
+    let t = lr(&cmp(&ols, &slope).unwrap()).clone();
+    assert_eq!(t.reference, Reference::ChiSquared { df: 3 });
+    assert_eq!((t.statistic, t.p_value), (0.0, 1.0));
+    // A zero variance the smaller model keeps does not trigger the rule.
+    slope.varcorr = vec![vec![0.0, 0.0, v[2]]];
+    slope.loglik = int.loglik + 1e-9;
+    let t = lr(&cmp(&int, &slope).unwrap()).clone();
+    assert!(t.statistic > 0.0 && t.p_value < 1.0, "{t:?}");
+}
+
+#[test]
+fn a_raw_statistic_below_zero_is_floored_with_a_note_naming_the_larger_fit() {
+    let d = sleepstudy();
+    let small = side("Reaction ~ Days + (1 | Subject)", &d, None, None);
+    let mut large = side("Reaction ~ Days + (Days | Subject)", &d, None, None);
+    // Beyond round-off (2·dev_eps = 8e-5 deviance units).
+    large.loglik = small.loglik - 1e-4;
+    let raw = 2.0 * (large.loglik - small.loglik);
+    let c = cmp(&small, &large).unwrap();
+    let t = lr(&c);
+    assert_eq!((t.statistic, t.p_value), (0.0, 1.0));
+    assert_eq!(t.notes, vec![LrNote::NegativeStatistic { raw }, MIXTURE]);
+    let negative = "The larger model did not reach its optimum";
+    assert!(c.note_lines()[0].starts_with(negative));
+    let back = compare_stored(&large, &small, &opts()).unwrap();
+    assert!(back.note_lines()[0].starts_with(negative));
+    // Within round-off: the floor, with no note.
+    large.loglik = small.loglik - 1e-5;
+    let t = lr(&cmp(&small, &large).unwrap()).clone();
+    assert_eq!((t.statistic, t.p_value), (0.0, 1.0));
+    assert_eq!(t.notes, vec![MIXTURE]);
+}
+
+#[test]
+fn a_slope_dropped_beside_a_factor_slope_at_zero_gives_t_zero() {
+    let mut d = sleepstudy();
+    let phase: Vec<String> = (0..d.n)
+        .map(|i| ["a", "b", "c"][i % 3].to_string())
+        .collect();
+    d.columns
+        .push(("phase".into(), Column::factor_from_labels(&phase)));
+    let small = side(
+        "Reaction ~ Days + phase + (phase | Subject)",
+        &d,
+        None,
+        None,
+    );
+    let mut large = side(
+        "Reaction ~ Days + phase + (phase + Days | Subject)",
+        &d,
+        None,
+        None,
+    );
+    // One block of four dimensions, (Intercept), phaseb, phasec, Days, packed
+    // by rows of its upper triangle: zero Days' variance and covariances.
+    let q = 4;
+    assert_eq!(large.varcorr[0].len(), q * (q + 1) / 2);
+    for i in 0..q {
+        large.varcorr[0][i * q - (i * i - i) / 2 + (q - 1 - i)] = 0.0;
+    }
+    large.loglik = small.loglik + 1e-9;
+    let t = lr(&cmp(&small, &large).unwrap()).clone();
+    assert_eq!(t.statistic.to_bits(), 0.0f64.to_bits(), "{t:?}");
+    assert_eq!(t.p_value, 1.0);
+}
+
+#[test]
+fn a_failed_fit_gives_nan_even_with_the_dropped_variance_at_zero() {
+    // Three pairs whose dropped variances are zero, one per reference: the
+    // mixture, χ² and the exact test.
+    let s = sleepstudy();
+    let int = side("Reaction ~ Days + (1 | Subject)", &s, None, None);
+    let ols = side("Reaction ~ Days", &s, Some(true), None);
+    let mut slope = side("Reaction ~ Days + (Days | Subject)", &s, None, None);
+    let v = slope.varcorr[0][0];
+    slope.varcorr = vec![vec![v, 0.0, 0.0]];
+    slope.loglik = int.loglik + 1e-9;
+    let mut flat = slope.clone();
+    flat.varcorr = vec![vec![0.0, 0.0, 0.0]];
+    flat.loglik = ols.loglik + 1e-9;
+    let d2 = csv_table(
+        include_str!("../../validation/data/empirical/Dyestuff2.csv"),
+        &["Batch"],
+    );
+    let ols2 = side("Yield ~ 1", &d2, Some(true), None);
+    let full2 = side("Yield ~ 1 + (1 | Batch)", &d2, None, None);
+    assert_eq!(full2.varcorr, vec![vec![0.0]]);
+    // The p-quality notes each reference carries on a finite pair; a NaN
+    // statistic replaces them with the one note naming its cause.
+    let pairs = [
+        (&int, &slope, vec![MIXTURE]),
+        (&ols, &flat, vec![LrNote::BoundaryIgnored]),
+        (&ols2, &full2, vec![]),
+    ];
+    for (small, large, finite_notes) in pairs {
+        let finite = lr(&compare_stored(small, large, &opts()).unwrap()).clone();
+        assert_eq!((finite.statistic, finite.p_value), (0.0, 1.0), "{finite:?}");
+        assert_eq!(finite.notes, finite_notes, "{}", large.formula);
+        for bad in [f64::NEG_INFINITY, f64::NAN] {
+            for on_larger in [true, false] {
+                let (mut s, mut l) = (small.clone(), large.clone());
+                if on_larger {
+                    l.loglik = bad;
+                } else {
+                    s.loglik = bad;
+                }
+                let c = compare_stored(&s, &l, &opts()).unwrap();
+                let t = lr(&c).clone();
+                let what = format!("{} at {bad}, larger {on_larger}", large.formula);
+                assert!(t.statistic.is_nan(), "{what}: {t:?}");
+                assert!(t.p_value.is_nan(), "{what}: {t:?}");
+                assert_eq!(t.reference, finite.reference, "{what}");
+                assert_eq!(t.notes, vec![LrNote::NonFiniteLoglik], "{what}");
+                let side = if on_larger {
+                    "the larger model"
+                } else {
+                    "the smaller model"
+                };
+                assert_eq!(
+                    c.note_lines(),
+                    vec![format!(
+                        "The log-likelihood of {side} is not finite (a fit that failed or \
+                         collapsed), so the statistic and its p-value are NaN."
+                    )],
+                    "{what}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_nan_statistic_keeps_the_notes_on_the_pair() {
+    // The notes that state a fact about the pair stay beside the one naming
+    // the cause; the notes on the p-value ("Conservative ...") go.
+    let d = csv_table(
+        include_str!("../../validation/data/empirical/Dyestuff2.csv"),
+        &["Batch"],
+    );
+    let weighted = |f: &str, reml| side(f, &d, reml, Some(vec![1.0; d.n]));
+    let small = weighted("Yield ~ 1", Some(true));
+    let mut large = weighted("Yield ~ 1 + (1 | Batch)", None);
+    let s = slope1();
+    let node = |f: &str, nagq| {
+        let lo = lower(f, &s, binomial()).unwrap();
+        let fit_opts = FitOptions {
+            nagq,
+            ..FitOptions::default()
+        };
+        let fit = crate::fit(&lo.data(), lo.spec(), &fit_opts).unwrap();
+        assert!(fit.converged(), "{f} did not converge");
+        Model::from_fit(f, &lo, &fit_opts, &fit)
+    };
+    let (glmm1, mut glmm7) = (node("y ~ 1 + (1 | g)", 1), node("y ~ x + (1 | g)", 7));
+    assert_eq!(
+        lr(&compare_stored(&small, &large, &opts()).unwrap()).notes,
+        vec![LrNote::NoDesignSummary, MIXTURE]
+    );
+    large.loglik = f64::NAN;
+    let c = compare_stored(&small, &large, &opts()).unwrap();
+    assert!(lr(&c).statistic.is_nan());
+    assert_eq!(
+        lr(&c).notes,
+        vec![LrNote::NoDesignSummary, LrNote::NonFiniteLoglik]
+    );
+    let lines = c.note_lines();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(
+        lines.iter().all(|l| !l.starts_with("Conservative")),
+        "{lines:?}"
+    );
+    glmm7.loglik = f64::NEG_INFINITY;
+    let c = compare_stored(&glmm1, &glmm7, &opts()).unwrap();
+    assert!(lr(&c).statistic.is_nan());
+    assert_eq!(
+        lr(&c).notes,
+        vec![LrNote::NodeCounts { m0: 1, m1: 7 }, LrNote::NonFiniteLoglik]
+    );
+}
+
+#[test]
+fn a_term_kept_in_another_grouping_is_still_dropped_from_its_own() {
+    // Days is dropped from Subject and kept in blk: only Subject's Days
+    // variance decides the rule.
+    let d = sleepstudy_blk();
+    let small = side(
+        "Reaction ~ Days + (1 | Subject) + (Days | blk)",
+        &d,
+        None,
+        None,
+    );
+    let large = side(
+        "Reaction ~ Days + (Days | Subject) + (Days | blk)",
+        &d,
+        None,
+        None,
+    );
+    let (s, b) = (block(&large, "Subject"), block(&large, "blk"));
+    for (subject, blk, zero) in [
+        (vec![600.0, 0.0, 0.0], vec![1.0, 0.2, 3.0], true),
+        (vec![600.0, 10.0, 35.0], vec![1.0, 0.0, 0.0], false),
+    ] {
+        let mut l = large.clone();
+        l.varcorr[s] = subject;
+        l.varcorr[b] = blk;
+        l.loglik = small.loglik + 1e-9;
+        let t = lr(&cmp(&small, &l).unwrap()).clone();
+        assert_eq!(t.statistic == 0.0, zero, "{:?}: {t:?}", l.varcorr);
+        assert!(t.statistic < 1e-8, "{t:?}");
+    }
+}
+
+#[test]
+fn groupings_are_matched_as_sets_of_variable_names() {
+    // `(1 | batch/cask)` holds `batch` and `batch:cask`, the smaller fit's
+    // `cask:batch`: dropping `batch` at zero gives T = 0.
+    let d = csv_table(
+        include_str!("../../validation/data/empirical/Pastes.csv"),
+        &["batch", "cask", "sample"],
+    );
+    let small = side("strength ~ 1 + (1 | cask:batch)", &d, None, None);
+    let large = side("strength ~ 1 + (1 | batch/cask)", &d, None, None);
+    let b = block(&large, "batch");
+    for (variance, zero) in [(0.0, true), (0.5, false)] {
+        let mut l = large.clone();
+        l.varcorr[b] = vec![variance];
+        l.loglik = small.loglik + 1e-9;
+        let t = lr(&cmp(&small, &l).unwrap()).clone();
+        assert_eq!(t.statistic == 0.0, zero, "batch at {variance}: {t:?}");
+        assert_eq!(t.p_value == 1.0, zero, "batch at {variance}: {t:?}");
+    }
+}
+
+#[test]
+fn a_variance_at_zero_in_the_smaller_fit_makes_the_mixture_approximate() {
+    let s = sleepstudy();
+    let mut int = side("Reaction ~ Days + (1 | Subject)", &s, None, None);
+    let slope = side("Reaction ~ Days + (Days | Subject)", &s, None, None);
+    int.varcorr = vec![vec![0.0]];
+    let t = lr(&cmp(&int, &slope).unwrap()).clone();
+    assert_eq!(t.reference, Reference::ChiBarSquared { df_low: 1 });
+    assert_eq!(t.notes, vec![LrNote::BoundaryMixture { approximate: true }]);
+}
+
+#[test]
+fn the_row_kind_is_read_from_the_fit_not_from_the_options() {
+    // A Gamma GLM with φ estimated, its lowering then given a held φ: the
+    // rows stay the fit's F rows. And the reverse: a fit with φ held keeps
+    // its χ² rows beside options that estimate φ.
+    let (lo, fit) = lowered_fit("y ~ x + grp", &glm_gamma(), gamma(), None);
+    let want = tables(&lo, &FitOptions::default(), &fit);
+    for t in &want {
+        assert!(t.fixed.iter().all(|r| r.test.kind == LinearKind::F));
+    }
+    let mut fit_opts = FitOptions {
+        dispersion: Some(0.5),
+        ..FitOptions::default()
+    };
+    assert_eq!(tables(&lo, &fit_opts, &fit), want);
+    let lo = lower("y ~ x + grp", &glm_gamma(), gamma()).unwrap();
+    let fit = crate::fit(&lo.data(), lo.spec(), &fit_opts).unwrap();
+    let want = tables(&lo, &fit_opts, &fit);
+    for t in &want {
+        assert!(t
+            .fixed
+            .iter()
+            .all(|r| r.test.kind == LinearKind::ChiSquared));
+    }
+    fit_opts.dispersion = None;
+    assert_eq!(tables(&lo, &fit_opts, &fit), want);
+}
+
+#[test]
+fn a_covariance_that_is_not_finite_gives_nan_rows() {
+    // car's Type II reads the covariance; a NaN one gives NaN rows, not a
+    // panic, and so does the Wald χ² of Type III.
+    let (lo, mut fit) = lowered_fit(FIXED, &sim_factorial_bern(), binomial(), None);
+    fit.vcov = vec![vec![f64::NAN; lo.p]; lo.p];
+    for t in tables(&lo, &FitOptions::default(), &fit) {
+        assert_eq!(labels(&t), LABELS);
+        assert!(
+            t.fixed.iter().all(|r| r.test.statistic.is_nan()),
+            "{:?}",
+            t.ss_type
+        );
+    }
+}
+
+#[test]
+fn an_ml_pair_inside_the_exact_tests_envelope_gets_the_mixture() {
+    // The exact test is a REML test: two ML fits of the same pair, the larger
+    // keeping its design summary, get the mixture.
+    let d = csv_table(
+        include_str!("../../validation/data/empirical/Dyestuff.csv"),
+        &["Batch"],
+    );
+    let ols = side("Yield ~ 1", &d, Some(false), None);
+    let full = side("Yield ~ 1 + (1 | Batch)", &d, Some(false), None);
+    assert!(full.design_summary.is_some() && !full.reml && !ols.reml);
+    let t = lr(&cmp(&ols, &full).unwrap()).clone();
+    assert_eq!(t.reference, Reference::ChiBarSquared { df_low: 0 });
+    assert_eq!(t.objective, Objective::MaximumLikelihood);
+    assert_eq!(t.notes, vec![MIXTURE]);
+}

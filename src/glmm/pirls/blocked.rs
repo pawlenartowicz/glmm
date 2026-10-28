@@ -199,7 +199,7 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
     // (mirrors `pirls_solve_packed`'s `wx`; this variant has no dense M so there is no
     // `wm` twin here — B' = X'WM is filled by cluster-scatter instead).
     wx: &mut Mat<f64>,
-    // Per-row linear-predictor offset (`FitOptions::offset`), added into
+    // Per-row linear-predictor offset (`Data::offset`), added into
     // `eta_fixed` by every `refresh_eta_fixed` call. `None` ⇒ no offset.
     offset: Option<&[f64]>,
     pirls_tol_override: Option<f64>,

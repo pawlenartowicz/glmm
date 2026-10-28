@@ -1066,7 +1066,7 @@ pub(crate) fn pirls_solve_blocked_extras<T: TailKernel>(
     // n × p = W∘X GEMM scratch for the Profile β-Schur border's C = X'WX
     // (mirrors `pirls_solve_packed`'s `wx`).
     wx: &mut Mat<f64>,
-    // Per-row linear-predictor offset (`FitOptions::offset`), added into
+    // Per-row linear-predictor offset (`Data::offset`), added into
     // `eta_fixed` by every `refresh_eta_fixed` call. `None` ⇒ no offset.
     offset: Option<&[f64]>,
     pirls_tol_override: Option<f64>,
@@ -3018,7 +3018,7 @@ mod tests {
             };
 
             let mut spec = spec0.clone();
-            spec.family = family;
+            spec.spec.family = family;
             let mut ws = GlmmWorkspace::for_cluster_spec(p, &spec, n, &[], 1);
 
             let q = ws.groupings.primary_q;

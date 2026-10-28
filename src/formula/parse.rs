@@ -3,9 +3,10 @@
 //! error substrings against them, so both must stay stable across changes to
 //! this file.
 //!
-//! `*` is desugared into main effects + all interactions, a grouped fixed
-//! part (`a*(b + c)`) into the terms it stands for, and `A/B` into a nesting
-//! relation *while parsing* — there is no separate normalize pass.
+//! `*` and `^` are desugared into main effects + interactions, a grouped fixed
+//! part (`a*(b + c)`) into the terms it stands for, `(x || g)` into one term
+//! per variable, and `A/B` into a nesting relation *while parsing* — there is
+//! no separate normalize pass.
 
 use super::error::ParseError;
 use regex::Regex;
@@ -22,13 +23,27 @@ macro_rules! ident {
     };
 }
 
-// Random-effect regex tower — applied in this order so `(0|g)` suppression is
-// caught before `(1|g)`, slopes before plain intercepts, and the `A:B`
-// crossed-interaction grouping (`RE_INTERACTION`) before the plain intercept
-// (`RE_INT`) — RE_INT's group-name class excludes `:` so it can never match an
-// interaction grouping, but the interaction step still runs first for clarity.
-static RE_SUPPRESS: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\((?:0|-1)(?:\+[^|]*)?\|[^)]*\)").unwrap());
+// Random-effect regex tower — applied in this order so `zerocorr(...)` is
+// taken before the `( … | g)` inside it, `||` before the one-bar forms,
+// intercept-free `(0|g)` / `(-1|g)` before `(1|g)`, slopes before plain
+// intercepts, and the `A:B` crossed-interaction grouping (`RE_INTERACTION`)
+// before the plain intercept (`RE_INT`) — RE_INT's group-name class excludes
+// `:` so it can never match an interaction grouping, but the interaction step
+// still runs first for clarity. The `||` and `zerocorr` grouping class takes
+// any name, so a nested `A/B` there gets an error that names it.
+static RE_ZEROCORR: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:^|\+)zerocorr\(((?:[^|()]|\([^|()]*\))+?)\|([^()|]*)\)").unwrap()
+});
+static RE_DOUBLE_BAR: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\(((?:[^|()]|\([^|()]*\))+?)\|\|([^()|]*)\)").unwrap());
+static RE_NO_INTERCEPT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r"\(((?:0|-1)(?:\+(?:[^|()]|\([^|()]*\))*?)?)\|(",
+        ident!(),
+        r")\)"
+    ))
+    .unwrap()
+});
 static RE_NESTED: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(concat!(r"\(1\|(", ident!(), ")/(", ident!(), r")\)")).unwrap());
 // The slope-list class admits one paren level so `(1 + log(x) | g)` matches,
@@ -54,6 +69,10 @@ static RE_INT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(concat!(r"\(1\|(", ident!(), r")\)")).unwrap());
 static RE_INTERACTION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(concat!(r"\(1\|(", ident!(), "):(", ident!(), r")\)")).unwrap());
+// A one-bar term no stage above took: `RE_DOUBLE_BAR`'s pattern with one `|`,
+// so a grouping the tower refuses can be named in the error.
+static RE_LEFTOVER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\(((?:[^|()]|\([^|()]*\))+?)\|([^()|]*)\)").unwrap());
 
 // `cbind(successes, failures)` LHS — a data-free syntax check only; the
 // two names are resolved against `data` in `materialize`.
@@ -108,7 +127,7 @@ pub struct ParsedFormula {
     /// pair always sorts first (parent immediately before child), because the
     /// kernel interprets `NestedWithin` relative to the primary grouping.
     /// Empty when the formula declares none. The first entry's grouping is the
-    /// primary grouping.
+    /// primary grouping; several entries may name one grouping.
     pub random_effects: Vec<RandomEffect>,
     /// `false` when the fixed design carries no intercept (`- 1` / `0 +`).
     /// Random-effect intercepts are unaffected — they are always present.
@@ -144,6 +163,10 @@ pub enum Term {
 /// keyed by two factors' combination — `(1|A:B)` — yields
 /// `Intercept{group:"A:B",parent:None}`: same `"A:B"` group-name shape as the
 /// nested inner, but `parent: None` marks it as crossed, not nested.
+///
+/// Several terms may name one grouping factor; they are independent of each
+/// other. `(1 + x + f || g)` yields `Intercept{g}`, `NoIntercept{g,[x]}` and
+/// `NoIntercept{g,[f]}`, as lme4 expands it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RandomEffect {
     /// Random intercept for `group`.
@@ -160,6 +183,27 @@ pub enum RandomEffect {
         /// Slope variable names (the implicit `1` intercept is dropped from this list).
         vars: Vec<String>,
     },
+    /// Random slope(s) `vars` without the random intercept: `(0 + x | g)`,
+    /// `(-1 + x | g)` or `(x - 1 | g)`.
+    NoIntercept {
+        /// Grouping factor name.
+        group: String,
+        /// Slope variable names.
+        vars: Vec<String>,
+    },
+    /// `zerocorr(1 + x + z | g)`: the intercept (when kept) and each design
+    /// column of `vars` with its own variance and no covariances, the columns
+    /// of a factor included. One node, because only the lowering knows a
+    /// factor's columns.
+    ZeroCorr {
+        /// Grouping factor name.
+        group: String,
+        /// Slope variable names.
+        vars: Vec<String>,
+        /// Whether the term keeps the random intercept (`zerocorr(0 + x | g)`
+        /// does not).
+        intercept: bool,
+    },
 }
 
 /// Parse a formula string into its data-free AST.
@@ -168,19 +212,25 @@ pub enum RandomEffect {
 /// Returns a [`ParseError`] for malformed formulas:
 /// - [`ParseError::EmptyFormula`] if the formula is empty or has no RHS.
 /// - [`ParseError::Syntax`] if a token is not a valid identifier (e.g. contains
-///   invalid characters), the formula ends with `+`, the `^` crossing
-///   operator appears outside an `I(...)` call, a group's parentheses are
-///   unbalanced or empty, or a group holds the intercept (`a*(b + 1)`).
+///   invalid characters), the formula ends with `+`, a `^` power is not an
+///   integer of 2 or more, a group's parentheses are unbalanced or empty, a
+///   group holds the intercept (`a*(b + 1)`), a random-effect term both writes
+///   and removes its intercept, `||` or `zerocorr` names anything but one
+///   grouping factor (`(x || A/B)`), a random-effect term follows a name
+///   (`foo(1 | g)`), a grouping joins three or more factors (`(1 | a/b/c)`,
+///   `(1 | a:b:c)`), or a term puts a slope on a two-factor grouping
+///   (`(1 + x | a:b)`, `(x | a/b)`).
 /// - [`ParseError::TermRemovalUnsupported`] if the formula contains a `-` term
 ///   removal (e.g. `y ~ x - z`).
-/// - [`ParseError::DuplicateGroupingVar`] if the same grouping factor appears
-///   in multiple random-effect terms.
 /// - [`ParseError::EmptySlopeTerm`] if a random-slope term has nothing but
-///   `+` signs after its `1+` (e.g. `(1++|g)`). `(1+|g)` is a
-///   [`ParseError::Syntax`] error instead: whitespace is stripped first, and
-///   the slope pattern needs at least one character before the `|`.
-/// - [`ParseError::RandomInterceptSuppressionUnsupported`] if a random-effect
-///   term suppresses the intercept (e.g. `(0+x|g)` or `(-1+x|g)`).
+///   `+` signs after its `1+` (e.g. `(1++|g)`), or removes the intercept with
+///   nothing left (`(0|g)`, `(-1|g)`). `(1+|g)` is a [`ParseError::Syntax`]
+///   error instead: whitespace is stripped first, and the slope pattern needs
+///   at least one character before the `|`.
+///
+/// A column in two terms on one grouping (`(1|g) + (1+x|g)`) parses; the
+/// lowering refuses it ([`super::Error::RandomColumnRepeated`]), since only it
+/// knows a factor's columns.
 pub fn parse(input: &str) -> Result<ParsedFormula, ParseError> {
     let cleaned: String = input.chars().filter(|c| !c.is_whitespace()).collect();
     if cleaned.is_empty() {
@@ -219,23 +269,13 @@ pub fn parse(input: &str) -> Result<ParsedFormula, ParseError> {
         return Err(ParseError::EmptyFormula);
     }
 
-    // Both checks read the formula as written: the `+` cleaning below would
-    // drop a dangling `+`, and a `^` would fail later with a message that
-    // does not name it. `pos` counts characters, as identifiers may be
-    // non-ASCII.
+    // Read on the formula as written: the `+` cleaning below would drop a
+    // dangling `+`. `pos` counts characters, as identifiers may be non-ASCII.
     let written = input.trim_end();
     if written.ends_with('+') {
         return Err(ParseError::Syntax {
             pos: written.chars().count() - 1,
             msg: "the formula ends with '+': a term is missing after it".into(),
-        });
-    }
-    if let Some(pos) = find_crossing_operator(input) {
-        return Err(ParseError::Syntax {
-            pos,
-            msg: "'^' is accepted only in I(x^k), a power of one column; to cross terms, \
-                  write them out (for example (a + b)^2 as a + b + a:b)"
-                .into(),
         });
     }
 
@@ -330,44 +370,84 @@ pub fn parse(input: &str) -> Result<ParsedFormula, ParseError> {
 }
 
 /// Repeatedly matches `regex` against `work`, hands each match's captures to
-/// `make` to produce zero or more `(seen-key, effect)` pairs, dedup-inserts
-/// each key into `seen` (erroring on a repeat grouping factor), pushes the
-/// effects keyed `(rank, source position)`, and strips the first match out of
-/// `work` — until `regex` no longer matches. This is the skeleton shared by
-/// all five RE-extraction stages in [`extract_random_effects`]; everything
+/// `make` to produce zero or more effects, pushes the effects keyed `(rank,
+/// source position)`, and strips the first match out of `work` — until
+/// `regex` no longer matches. This is the skeleton shared by all the
+/// RE-extraction stages in [`extract_random_effects`]; everything
 /// stage-specific (how many effects one match yields,
 /// `EmptySlopeTerm`/fallback logic) lives in `make`.
 ///
 /// The position is the match text's byte offset in the original `rhs`, so a
 /// final stable sort can restore formula order after the stages run. For
 /// well-formed input the match text is a verbatim substring of `rhs`, and its
-/// first occurrence is the right one: duplicate grouping factors are rejected
-/// (`DuplicateGroupingVar`), so every match text contains a distinct group
-/// name and occurs exactly once. The `unwrap_or` is not decoration: degenerate
-/// input can embed one RE term inside another (e.g. `(1+x+(1|a/b)|g)`), and an
-/// earlier stage's removal then leaves a seam a later stage matches across —
-/// the seam match's text is absent from `rhs` and `find` returns `None`. Such
-/// input parses without error and must not start panicking; `usize::MAX`
-/// parks any seam match at the end, in stage order via the stable sort.
+/// first occurrence that overlaps no earlier match (`taken`) is the right
+/// one: two terms may be spelled alike (`(1|g) + (1|g)`, which the lowering
+/// refuses). The `unwrap_or` is not decoration: degenerate input can embed
+/// one RE term inside another (e.g. `(1+x+(1|a/b)|g)`), and an earlier
+/// stage's removal then leaves a seam a later stage matches across — the seam
+/// match's text is absent from `rhs` and the search finds nothing. Such input
+/// parses without error and must not start panicking; `usize::MAX` parks any
+/// seam match at the end, in stage order via the stable sort.
 fn extract_stage(
     rhs: &str,
     rank: u8,
     work: &mut String,
-    seen: &mut std::collections::BTreeSet<String>,
+    taken: &mut Vec<std::ops::Range<usize>>,
     effects: &mut Vec<((u8, usize), RandomEffect)>,
     regex: &Regex,
-    mut make: impl FnMut(&regex::Captures) -> Result<Vec<(String, RandomEffect)>, ParseError>,
+    mut make: impl FnMut(&regex::Captures) -> Result<Vec<RandomEffect>, ParseError>,
 ) -> Result<(), ParseError> {
     loop {
         let snapshot = work.clone();
         let Some(m) = regex.captures(&snapshot) else {
             break;
         };
-        let pos = rhs.find(m.get(0).unwrap().as_str()).unwrap_or(usize::MAX);
-        for (name, effect) in make(&m)? {
-            if !seen.insert(name.clone()) {
-                return Err(ParseError::DuplicateGroupingVar { name });
+        let text = m.get(0).unwrap().as_str();
+        // The `regex` crate has no look-behind, so the regexes themselves
+        // match a `( … | g)` glued to a name (`foo(1|g)`, which would parse
+        // as a term `foo` plus the RE term). Only matches that start with
+        // `(` are checked: `RE_ZEROCORR`'s starts at `+` or at `zerocorr`.
+        if text.starts_with('(') {
+            let before = &snapshot[..m.get(0).unwrap().start()];
+            let name_start = before
+                .char_indices()
+                .rev()
+                .take_while(|&(_, c)| c == '_' || c.is_alphanumeric())
+                .last()
+                .map_or(before.len(), |(i, _)| i);
+            let name = &before[name_start..];
+            if !name.is_empty() {
+                return Err(ParseError::Syntax {
+                    pos: 0,
+                    msg: format!(
+                        "'{name}{text}': a random-effect term `( … | g)` must stand alone, not \
+                         after a name"
+                    ),
+                });
             }
+        }
+        // Nor glued to what follows: `(1|g)x` would parse as `x + (1|g)`, and
+        // `(1|g)(1|h)` as two terms, where R refuses both.
+        let after = snapshot[m.get(0).unwrap().end()..].trim_start();
+        if !matches!(after.chars().next(), None | Some('+' | '-' | ')')) {
+            return Err(ParseError::Syntax {
+                pos: 0,
+                msg: format!(
+                    "'{text}{after}': a random-effect term `( … | g)` must stand alone, not \
+                     before another term without a `+`"
+                ),
+            });
+        }
+        let free =
+            |&(i, _): &(usize, &str)| !taken.iter().any(|r| i < r.end && r.start < i + text.len());
+        let pos = rhs
+            .match_indices(text)
+            .find(free)
+            .map_or(usize::MAX, |(i, _)| i);
+        if pos != usize::MAX {
+            taken.push(pos..pos + text.len());
+        }
+        for effect in make(&m)? {
             effects.push(((rank, pos), effect));
         }
         *work = regex.replacen(&snapshot, 1, "").into_owned();
@@ -375,156 +455,266 @@ fn extract_stage(
     Ok(())
 }
 
-fn extract_random_effects(rhs: &str) -> Result<(Vec<RandomEffect>, String), ParseError> {
-    use std::collections::BTreeSet;
+/// The left of a random-effect term's `|` (whitespace stripped), read as R
+/// reads it: `0` or `- 1` removes the term's intercept, `1` writes it, and it
+/// is there unless removed. Returns the intercept flag and the slope
+/// variables in written order, repeats dropped.
+///
+/// # Errors
+/// [`ParseError::Syntax`] when the term both writes the intercept and removes
+/// it, which R would resolve by term order.
+fn re_lhs(lhs: &str) -> Result<(bool, Vec<String>), ParseError> {
+    let removed = NO_INTERCEPT_MINUS.is_match(lhs) || NO_INTERCEPT_ZERO.is_match(lhs);
+    let rest = NO_INTERCEPT_MINUS.replace_all(lhs, "$1");
+    let tokens: Vec<&str> = rest.split('+').filter(|t| !t.is_empty()).collect();
+    if removed && tokens.contains(&"1") {
+        return Err(ParseError::Syntax {
+            pos: 0,
+            msg: format!(
+                "the random-effect term '{lhs}' both writes the intercept (`1`) and removes it \
+                 (`- 1` / `0`)"
+            ),
+        });
+    }
+    let vars = tokens
+        .into_iter()
+        .filter(|t| *t != "0" && *t != "1")
+        .map(String::from)
+        .collect();
+    Ok((!removed, distinct(vars)))
+}
 
-    let mut seen: BTreeSet<String> = BTreeSet::new();
+/// One random-effect term of `group`: a random intercept, slopes with or
+/// without it.
+///
+/// # Errors
+/// [`ParseError::EmptySlopeTerm`] when the term removes the intercept and
+/// has no slope.
+fn re_term(group: String, intercept: bool, vars: Vec<String>) -> Result<RandomEffect, ParseError> {
+    match (intercept, vars.is_empty()) {
+        (true, true) => Ok(RandomEffect::Intercept {
+            group,
+            parent: None,
+        }),
+        (false, true) => Err(ParseError::EmptySlopeTerm { group }),
+        (true, false) => Ok(RandomEffect::Slope { group, vars }),
+        (false, false) => Ok(RandomEffect::NoIntercept { group, vars }),
+    }
+}
+
+/// The grouping factor of a `what` term (`||`, `zerocorr`): one column name.
+fn single_grouping(group: &str, what: &str) -> Result<String, ParseError> {
+    if is_identifier(group) {
+        Ok(group.to_string())
+    } else {
+        Err(ParseError::Syntax {
+            pos: 0,
+            msg: format!("{what} takes one grouping factor, got '{group}'"),
+        })
+    }
+}
+
+fn extract_random_effects(rhs: &str) -> Result<(Vec<RandomEffect>, String), ParseError> {
+    let mut taken = Vec::new();
     let mut effects: Vec<((u8, usize), RandomEffect)> = Vec::new();
     let mut work = rhs.to_string();
 
-    // 0. Reject intercept suppression: (0+…|g), (-1+…|g), (0|g), (-1|g).
-    if RE_SUPPRESS.is_match(rhs) {
-        return Err(ParseError::RandomInterceptSuppressionUnsupported);
-    }
-
-    // Stage order below is load-bearing for MATCHING only (suppression before
-    // intercept, interaction before plain intercept, …); the final sort keyed
-    // `(rank, source position)` restores formula order. Rank 0 keeps a nested
-    // pair first regardless of where it was written: `NestedWithin` is
-    // interpreted relative to the PRIMARY grouping (`materialize.rs`), so a
-    // nested term must supply the primary — pure formula order would lower
+    // Stage order below is load-bearing for MATCHING only (zerocorr and `||`
+    // before the one-bar forms, intercept-free before intercept, interaction
+    // before plain intercept, …); the final sort keyed `(rank, source
+    // position)` restores formula order. Rank 0 keeps a nested pair first
+    // regardless of where it was written: `NestedWithin` is interpreted
+    // relative to the PRIMARY grouping (`materialize.rs`), so a nested term
+    // must supply the primary — pure formula order would lower
     // `y ~ (1|c1) + (1|g1/g2)` with `c1` primary and hand the kernel a nested
     // extra whose parent is not the primary. Every other stage gets rank 1.
 
-    // 1. Nested intercept: (1|A/B) → two entries, parent then joined-with-parent.
+    // 1. zerocorr(1+x|g): one node; the lowering splits it by column.
+    extract_stage(
+        rhs,
+        1,
+        &mut work,
+        &mut taken,
+        &mut effects,
+        &RE_ZEROCORR,
+        |m| {
+            let group = single_grouping(m.get(2).unwrap().as_str(), "zerocorr()")?;
+            let (intercept, vars) = re_lhs(m.get(1).unwrap().as_str())?;
+            Ok(vec![if vars.is_empty() {
+                re_term(group, intercept, vars)?
+            } else {
+                RandomEffect::ZeroCorr {
+                    group,
+                    vars,
+                    intercept,
+                }
+            }])
+        },
+    )?;
+
+    // 2. Double bar: (1+x+z||g) → (1|g) + (0+x|g) + (0+z|g), lme4's
+    // `expandDoubleVerts`; a factor's term stays one term.
+    extract_stage(
+        rhs,
+        1,
+        &mut work,
+        &mut taken,
+        &mut effects,
+        &RE_DOUBLE_BAR,
+        |m| {
+            let group = single_grouping(m.get(2).unwrap().as_str(), "'||'")?;
+            let (intercept, vars) = re_lhs(m.get(1).unwrap().as_str())?;
+            if vars.is_empty() {
+                return Ok(vec![re_term(group, intercept, vars)?]);
+            }
+            let mut out: Vec<RandomEffect> = Vec::with_capacity(vars.len() + 1);
+            if intercept {
+                out.push(RandomEffect::Intercept {
+                    group: group.clone(),
+                    parent: None,
+                });
+            }
+            out.extend(vars.into_iter().map(|v| RandomEffect::NoIntercept {
+                group: group.clone(),
+                vars: vec![v],
+            }));
+            Ok(out)
+        },
+    )?;
+
+    // 3. Nested intercept: (1|A/B) → two entries, parent then joined-with-parent.
     extract_stage(
         rhs,
         0,
         &mut work,
-        &mut seen,
+        &mut taken,
         &mut effects,
         &RE_NESTED,
         |m| {
             let parent_name = m.get(1).unwrap().as_str().to_string();
             let child_name = m.get(2).unwrap().as_str().to_string();
-            let joined = format!("{parent_name}:{child_name}");
             Ok(vec![
-                (
-                    parent_name.clone(),
-                    RandomEffect::Intercept {
-                        group: parent_name.clone(),
-                        parent: None,
-                    },
-                ),
-                (
-                    joined.clone(),
-                    RandomEffect::Intercept {
-                        group: joined,
-                        parent: Some(parent_name),
-                    },
-                ),
+                RandomEffect::Intercept {
+                    group: parent_name.clone(),
+                    parent: None,
+                },
+                RandomEffect::Intercept {
+                    group: format!("{parent_name}:{child_name}"),
+                    parent: Some(parent_name),
+                },
             ])
         },
     )?;
 
-    // 2. Random slope: (1+x+y|g) — falls back to a plain Intercept if every
-    // token was "1" (no non-"1" slope vars survive the filter).
-    extract_stage(rhs, 1, &mut work, &mut seen, &mut effects, &RE_SLOPE, |m| {
-        let var_list_raw = m.get(1).unwrap().as_str();
-        let group = m.get(2).unwrap().as_str().to_string();
-        let raw_tokens: Vec<&str> = var_list_raw
-            .split('+')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .collect();
-        if raw_tokens.is_empty() {
-            return Err(ParseError::EmptySlopeTerm { group });
-        }
-        let vars: Vec<String> = distinct(
-            raw_tokens
-                .iter()
-                .filter(|s| **s != "1")
-                .map(|s| String::from(*s))
-                .collect(),
-        );
-        let effect = if vars.is_empty() {
-            RandomEffect::Intercept {
-                group: group.clone(),
-                parent: None,
-            }
-        } else {
-            RandomEffect::Slope {
-                group: group.clone(),
-                vars,
-            }
-        };
-        Ok(vec![(group, effect)])
-    })?;
-
-    // 2.5. Implicit-intercept slope: (x|g), (x+z|g) — equivalent to (1+x|g).
-    // Unlike stage 2, always yields a Slope (never falls back to Intercept):
-    // an empty `vars` here means the term was `(1|g)`, which RE_ISLOPE's
-    // letter-or-`_`-starting group excludes from matching in the first place.
+    // 4. Intercept-free: (0+x|g), (-1+x|g); (0|g) and (-1|g) are empty.
     extract_stage(
         rhs,
         1,
         &mut work,
-        &mut seen,
+        &mut taken,
         &mut effects,
-        &RE_ISLOPE,
+        &RE_NO_INTERCEPT,
+        |m| {
+            let group = m.get(2).unwrap().as_str().to_string();
+            let (intercept, vars) = re_lhs(m.get(1).unwrap().as_str())?;
+            Ok(vec![re_term(group, intercept, vars)?])
+        },
+    )?;
+
+    // 5. Random slope: (1+x+y|g) — falls back to a plain Intercept if every
+    // token was "1" (no non-"1" slope vars survive the filter).
+    extract_stage(
+        rhs,
+        1,
+        &mut work,
+        &mut taken,
+        &mut effects,
+        &RE_SLOPE,
         |m| {
             let var_list_raw = m.get(1).unwrap().as_str();
             let group = m.get(2).unwrap().as_str().to_string();
-            let vars: Vec<String> = distinct(
-                var_list_raw
-                    .split('+')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty() && *s != "1")
-                    .map(String::from)
-                    .collect(),
-            );
-            Ok(vec![(group.clone(), RandomEffect::Slope { group, vars })])
+            if var_list_raw.split('+').all(|s| s.trim().is_empty()) {
+                return Err(ParseError::EmptySlopeTerm { group });
+            }
+            let (intercept, vars) = re_lhs(&format!("1+{var_list_raw}"))?;
+            Ok(vec![re_term(group, intercept, vars)?])
         },
     )?;
 
-    // 2.7. Crossed interaction grouping: (1|A:B) — a random intercept keyed by
-    // the combination of two existing factor columns (NOT nesting: parent stays
-    // None, unlike step 1's `(1|A/B)` inner term).
+    // 5.5. Implicit-intercept slope: (x|g), (x+z|g) — equivalent to (1+x|g);
+    // (x-1|g) drops the intercept. Never an intercept-only term: RE_ISLOPE's
+    // letter-or-`_`-starting body excludes `(1|g)` from matching in the first
+    // place.
     extract_stage(
         rhs,
         1,
         &mut work,
-        &mut seen,
+        &mut taken,
         &mut effects,
-        &RE_INTERACTION,
+        &RE_ISLOPE,
         |m| {
-            let lhs = m.get(1).unwrap().as_str().to_string();
-            let rhs = m.get(2).unwrap().as_str().to_string();
-            let joined = format!("{lhs}:{rhs}");
-            Ok(vec![(
-                joined.clone(),
-                RandomEffect::Intercept {
-                    group: joined,
-                    parent: None,
-                },
-            )])
+            let group = m.get(2).unwrap().as_str().to_string();
+            let (intercept, vars) = re_lhs(m.get(1).unwrap().as_str())?;
+            Ok(vec![re_term(group, intercept, vars)?])
         },
     )?;
 
-    // 3. Random intercept: (1|g)
-    extract_stage(rhs, 1, &mut work, &mut seen, &mut effects, &RE_INT, |m| {
-        let name = m.get(1).unwrap().as_str().to_string();
-        Ok(vec![(
-            name.clone(),
-            RandomEffect::Intercept {
-                group: name,
+    // 5.7. Crossed interaction grouping: (1|A:B) — a random intercept keyed by
+    // the combination of two existing factor columns (NOT nesting: parent stays
+    // None, unlike step 3's `(1|A/B)` inner term).
+    extract_stage(
+        rhs,
+        1,
+        &mut work,
+        &mut taken,
+        &mut effects,
+        &RE_INTERACTION,
+        |m| {
+            let lhs = m.get(1).unwrap().as_str();
+            let rhs = m.get(2).unwrap().as_str();
+            Ok(vec![RandomEffect::Intercept {
+                group: format!("{lhs}:{rhs}"),
                 parent: None,
-            },
-        )])
+            }])
+        },
+    )?;
+
+    // 6. Random intercept: (1|g)
+    extract_stage(rhs, 1, &mut work, &mut taken, &mut effects, &RE_INT, |m| {
+        Ok(vec![RandomEffect::Intercept {
+            group: m.get(1).unwrap().as_str().to_string(),
+            parent: None,
+        }])
     })?;
 
+    // A term left over on a two-factor grouping is a shape the kernel's
+    // grouping model has no place for (a slope on a combined or nested
+    // factor, or a third factor); anything else falls through to
+    // `parse_rhs`'s plain syntax error.
+    for m in RE_LEFTOVER.captures_iter(&work) {
+        let text = m.get(0).unwrap().as_str();
+        let group = m.get(2).unwrap().as_str();
+        let joins = group.chars().filter(|c| matches!(c, ':' | '/')).count();
+        if joins >= 2 {
+            return Err(ParseError::Syntax {
+                pos: 0,
+                msg: format!("'{text}': a grouping takes at most two factors (`a:b` or `a/b`)"),
+            });
+        }
+        if joins == 1 && m.get(1).unwrap().as_str() != "1" {
+            return Err(ParseError::Syntax {
+                pos: 0,
+                msg: format!(
+                    "'{text}': a random slope on an interaction or nested grouping ('{group}') \
+                     is not supported; only a random intercept, `(1 | a:b)` or `(1 | a/b)`"
+                ),
+            });
+        }
+    }
+
     // Restore formula order (stable: a nested pair's parent stays immediately
-    // before its child — both carry one match's position).
+    // before its child, and a `||` term's parts stay in written order — each
+    // set carries one match's position).
     effects.sort_by_key(|(key, _)| *key);
     let effects = effects.into_iter().map(|(_, e)| e).collect();
 
@@ -566,48 +756,6 @@ fn split_at_separator(s: &str) -> (String, String) {
     }
 }
 
-/// The character index in `input` of the first `^` on the right-hand side
-/// that is not inside an `I(...)` call, where `I(x^k)` is a whitelisted
-/// transform. Whitespace is skipped, as `parse` strips it, so `I (x^2)` is
-/// still an `I(...)` call.
-fn find_crossing_operator(input: &str) -> Option<usize> {
-    let rhs_start = input
-        .find('~')
-        .or_else(|| input.find('='))
-        .map_or(0, |sep| sep + 1);
-    let mut depth = 0usize;
-    // The paren depth of the open `I(` call, if inside one.
-    let mut i_call: Option<usize> = None;
-    let mut word = String::new();
-    for (pos, (byte, c)) in input.char_indices().enumerate() {
-        if byte < rhs_start || c.is_whitespace() {
-            continue;
-        }
-        match c {
-            '(' => {
-                depth += 1;
-                if i_call.is_none() && word == "I" {
-                    i_call = Some(depth);
-                }
-            }
-            ')' => {
-                if i_call == Some(depth) {
-                    i_call = None;
-                }
-                depth = depth.saturating_sub(1);
-            }
-            '^' if i_call.is_none() => return Some(pos),
-            _ => {}
-        }
-        if c.is_alphanumeric() || c == '_' {
-            word.push(c);
-        } else {
-            word.clear();
-        }
-    }
-    None
-}
-
 // The only legitimate `-` is the fixed-intercept removal (`- 1`), which the
 // caller strips via `NO_INTERCEPT_MINUS`/`NO_INTERCEPT_ZERO` before this runs
 // — so by the time `find_term_removal` sees a `-`, it is always unsupported,
@@ -634,13 +782,12 @@ fn parse_rhs(rhs: &str) -> Result<(Vec<String>, Vec<Term>), ParseError> {
     let mut terms: Vec<Term> = Vec::new();
     let mut seen_term: BTreeSet<String> = BTreeSet::new();
 
-    // A piece with a group goes through `expand_group`; every other piece is
-    // split on `+` and read term by term, exactly as before grouping existed,
-    // so a formula without a group parses (and fails) as it always has. A
-    // piece with a `|` is a random-effect term no regex took, left to fail
-    // below as a plain syntax error.
+    // A piece with a group or a `^` goes through `expand_group`; every other
+    // piece is split on `+` and read term by term. A piece with a `|` is a
+    // random-effect term no regex took, left to fail below as a plain syntax
+    // error.
     for piece in split_outside_parens(rhs) {
-        if !has_group(piece) || piece.contains('|') {
+        if !(has_group(piece) || has_power(piece)) || piece.contains('|') {
             parse_plain_terms(
                 piece,
                 &mut predictors,
@@ -682,6 +829,10 @@ fn parse_plain_terms(
 
         if term.contains('*') {
             let vars = distinct(parse_identifier_list(term, &['*'])?);
+            // `a*b*…` lists every subset of its variables, `2^k − 1` terms.
+            if vars.len() > MAX_TERMS.ilog2() as usize {
+                return Err(too_many_terms(term));
+            }
             register_vars(&vars, predictors, seen_pred);
             for v in &vars {
                 if seen_term.insert(v.clone()) {
@@ -753,6 +904,26 @@ fn has_group(s: &str) -> bool {
     })
 }
 
+/// Whether `s` has a `^` outside every call's parentheses, where it crosses
+/// terms; inside a call it belongs to the call (`I(x^2)`).
+fn has_power(s: &str) -> bool {
+    // Per open `(`: whether it opens a call.
+    let mut open: Vec<bool> = Vec::new();
+    let mut prev = None;
+    for c in s.chars() {
+        match c {
+            '(' => open.push(prev.is_some_and(is_name_char)),
+            ')' => {
+                open.pop();
+            }
+            '^' if !open.contains(&true) => return true,
+            _ => {}
+        }
+        prev = Some(c);
+    }
+    false
+}
+
 /// Refuses a `1`, `0` or `-1` term directly inside a group. R's term algebra
 /// carries such an intercept through `*` and `:`; this parser has no
 /// intercept term to carry, and the intercept regexes in [`parse`] would read
@@ -792,17 +963,36 @@ fn check_no_intercept_in_groups(s: &str) -> Result<(), ParseError> {
 /// One fixed term as its variable names.
 type TermVars = Vec<String>;
 
-/// A piece with grouping parentheses, desugared by R's term algebra
+/// The most terms one piece may expand to. `*` and `^` double the term list
+/// per variable, so a short formula can ask for millions of terms before any
+/// data is read; no fit has this many.
+const MAX_TERMS: usize = 10_000;
+
+/// The error of a piece past [`MAX_TERMS`].
+fn too_many_terms(piece: &str) -> ParseError {
+    ParseError::Syntax {
+        pos: 0,
+        msg: format!("'{piece}' expands to more than {MAX_TERMS} terms"),
+    }
+}
+
+/// The deepest nesting of parentheses in one piece. The reader recurses once
+/// per level, and a stack overflow would end the process past any error.
+const MAX_DEPTH: usize = 200;
+
+/// A piece with grouping parentheses or a `^`, desugared by R's term algebra
 /// (`EncodeVars` in R's `model.c`): `+` joins two term lists, `l:r` is every
-/// term of `l` with every term of `r`, and `l*r` is `l + r + l:r`, each step
-/// dropping a term already listed. `:` binds tighter than `*`, and `*`
-/// tighter than `+`, as in R. Returns the variables in written order, which
+/// term of `l` with every term of `r`, `l*r` is `l + r + l:r`, and `l^k` is
+/// every interaction of `l`'s terms up to order `k`, each step dropping a
+/// term already listed. `^` binds tighter than `:`, `:` tighter than `*`, and
+/// `*` tighter than `+`, as in R. Returns the variables in written order, which
 /// is how R numbers them, and the terms stably sorted by degree, so that
 /// `(a*b*c)` gives the terms of `a*b*c` in the order its `*` lists them.
 fn expand_group(piece: &str) -> Result<(Vec<String>, Vec<TermVars>), ParseError> {
     let mut p = GroupParser {
         s: piece,
         pos: 0,
+        depth: 0,
         vars: Vec::new(),
     };
     let mut terms = p.sum()?;
@@ -819,6 +1009,8 @@ struct GroupParser<'a> {
     s: &'a str,
     /// Byte offset of the next unread character.
     pos: usize,
+    /// Open parentheses around `pos`, at most [`MAX_DEPTH`].
+    depth: usize,
     /// Every variable name read, in written order, repeats included.
     vars: Vec<String>,
 }
@@ -856,7 +1048,7 @@ impl GroupParser<'_> {
         while self.peek() == Some('*') {
             self.pos += 1;
             let right = self.interaction()?;
-            let both = interact(&out, &right);
+            let both = interact(&out, &right, self.s)?;
             out.extend(right);
             out.extend(both);
             out = drop_repeats(out);
@@ -865,10 +1057,40 @@ impl GroupParser<'_> {
     }
 
     fn interaction(&mut self) -> Result<Vec<TermVars>, ParseError> {
-        let mut out = self.atom()?;
+        let mut out = self.power()?;
         while self.peek() == Some(':') {
             self.pos += 1;
-            out = interact(&out, &self.atom()?);
+            out = interact(&out, &self.power()?, self.s)?;
+        }
+        Ok(out)
+    }
+
+    /// `base^k` as R's `PowerTerms` builds it: `k − 1` times, every term of
+    /// the base with every term of the list so far, base in the outer loop.
+    /// R refuses a power below 2.
+    fn power(&mut self) -> Result<Vec<TermVars>, ParseError> {
+        let base = self.atom()?;
+        if self.peek() != Some('^') {
+            return Ok(base);
+        }
+        self.pos += 1;
+        let start = self.pos;
+        while self.peek().is_some_and(|c| c.is_ascii_digit()) {
+            self.pos += 1;
+        }
+        let k = match self.s[start..self.pos].parse::<u64>() {
+            Ok(k) if k >= 2 => k,
+            _ => return Err(self.syntax("invalid power (an integer of 2 or more after '^')")),
+        };
+        let mut out = base.clone();
+        for _ in 1..k {
+            let next = interact(&base, &out, self.s)?;
+            // A list the step leaves unchanged stays so: stop there rather
+            // than run out a large power.
+            if next == out {
+                break;
+            }
+            out = next;
         }
         Ok(out)
     }
@@ -881,7 +1103,12 @@ impl GroupParser<'_> {
                 if self.peek() == Some(')') {
                     return Err(self.syntax("empty parentheses"));
                 }
+                if self.depth == MAX_DEPTH {
+                    return Err(self.syntax(&format!("more than {MAX_DEPTH} nested parentheses")));
+                }
+                self.depth += 1;
                 let inner = self.sum()?;
+                self.depth -= 1;
                 if self.peek() != Some(')') {
                     return Err(self.unbalanced());
                 }
@@ -906,7 +1133,7 @@ impl GroupParser<'_> {
                 '(' => depth += 1,
                 ')' if depth == 0 => break,
                 ')' => depth -= 1,
-                '+' | '*' | ':' | '-' if depth == 0 => break,
+                '+' | '*' | ':' | '-' | '^' if depth == 0 => break,
                 _ => {}
             }
             self.pos += c.len_utf8();
@@ -922,8 +1149,16 @@ impl GroupParser<'_> {
 }
 
 /// Every term of `left` with every term of `right`, `left` in the outer loop
-/// (R's `InteractTerms`). A variable in both is listed once.
-fn interact(left: &[TermVars], right: &[TermVars]) -> Vec<TermVars> {
+/// (R's `InteractTerms`). A variable in both is listed once. `piece` names
+/// the error past [`MAX_TERMS`], checked before the product is built.
+fn interact(
+    left: &[TermVars],
+    right: &[TermVars],
+    piece: &str,
+) -> Result<Vec<TermVars>, ParseError> {
+    if left.len().saturating_mul(right.len()) > MAX_TERMS {
+        return Err(too_many_terms(piece));
+    }
     let both = left
         .iter()
         .flat_map(|l| {
@@ -932,7 +1167,7 @@ fn interact(left: &[TermVars], right: &[TermVars]) -> Vec<TermVars> {
                 .map(move |r| distinct(l.iter().chain(r).cloned().collect()))
         })
         .collect();
-    drop_repeats(both)
+    Ok(drop_repeats(both))
 }
 
 /// `terms` without the repeat listings of a term, the first kept (R's

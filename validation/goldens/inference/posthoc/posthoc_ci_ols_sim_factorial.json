@@ -1,0 +1,177 @@
+{
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0",
+      "emmeans": "2.0.4",
+      "pbkrtest": "0.5.5"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_posthoc.R"
+  },
+  "emmeans": [
+    {
+      "level": "a",
+      "by": null,
+      "estimate": 10.6341096166987,
+      "SE": 0.273826396587598,
+      "df": 113
+    },
+    {
+      "level": "b",
+      "by": null,
+      "estimate": 11.9225123862661,
+      "SE": 0.24929130853024,
+      "df": 113
+    },
+    {
+      "level": "c",
+      "by": null,
+      "estimate": 9.65079245285876,
+      "SE": 0.297384848192941,
+      "df": 113
+    }
+  ],
+  "contrasts": [
+    {
+      "contrast": "a - b",
+      "by": null,
+      "estimate": -1.28840276956748,
+      "SE": 0.37074659640189,
+      "df": 113,
+      "statistic": -3.47515737722607,
+      "statistic_name": "t",
+      "p_none": 0.000725118209189752,
+      "p_tukey": 0.00207999272961179
+    },
+    {
+      "contrast": "a - c",
+      "by": null,
+      "estimate": 0.983317163839899,
+      "SE": 0.404074718618461,
+      "df": 113,
+      "statistic": 2.43350330652182,
+      "statistic_name": "t",
+      "p_none": 0.0165205367219287,
+      "p_tukey": 0.0432981486737787
+    },
+    {
+      "contrast": "b - c",
+      "by": null,
+      "estimate": 2.27171993340738,
+      "SE": 0.388114592192125,
+      "df": 113,
+      "statistic": 5.8532195879995,
+      "statistic_name": "t",
+      "p_none": 4.80305378169352e-08,
+      "p_tukey": 1.43677321484681e-07
+    }
+  ],
+  "confint": [
+    {
+      "adjust": "none",
+      "contrast": "a - b",
+      "by": null,
+      "estimate": -1.28840276956748,
+      "SE": 0.37074659640189,
+      "df": 113,
+      "lower": -2.02291864467874,
+      "upper": -0.553886894456225
+    },
+    {
+      "adjust": "none",
+      "contrast": "a - c",
+      "by": null,
+      "estimate": 0.983317163839899,
+      "SE": 0.404074718618461,
+      "df": 113,
+      "lower": 0.182772267576999,
+      "upper": 1.7838620601028
+    },
+    {
+      "adjust": "none",
+      "contrast": "b - c",
+      "by": null,
+      "estimate": 2.27171993340738,
+      "SE": 0.388114592192125,
+      "df": 113,
+      "lower": 1.50279492615411,
+      "upper": 3.04064494066065
+    },
+    {
+      "adjust": "bonferroni",
+      "contrast": "a - b",
+      "by": null,
+      "estimate": -1.28840276956748,
+      "SE": 0.37074659640189,
+      "df": 113,
+      "lower": -2.18936961541445,
+      "upper": -0.387435923720518
+    },
+    {
+      "adjust": "bonferroni",
+      "contrast": "a - c",
+      "by": null,
+      "estimate": 0.983317163839899,
+      "SE": 0.404074718618461,
+      "df": 113,
+      "lower": 0.00135825105857923,
+      "upper": 1.96527607662122
+    },
+    {
+      "adjust": "bonferroni",
+      "contrast": "b - c",
+      "by": null,
+      "estimate": 2.27171993340738,
+      "SE": 0.388114592192125,
+      "df": 113,
+      "lower": 1.32854639291325,
+      "upper": 3.21489347390152
+    },
+    {
+      "adjust": "tukey",
+      "contrast": "a - b",
+      "by": null,
+      "estimate": -1.28840276956748,
+      "SE": 0.37074659640189,
+      "df": 113,
+      "lower": -2.16892322088324,
+      "upper": -0.40788231825173
+    },
+    {
+      "adjust": "tukey",
+      "contrast": "a - c",
+      "by": null,
+      "estimate": 0.983317163839899,
+      "SE": 0.404074718618461,
+      "df": 113,
+      "lower": 0.0236426663361387,
+      "upper": 1.94299166134366
+    },
+    {
+      "adjust": "tukey",
+      "contrast": "b - c",
+      "by": null,
+      "estimate": 2.27171993340738,
+      "SE": 0.388114592192125,
+      "df": 113,
+      "lower": 1.34995061928322,
+      "upper": 3.19348924753155
+    }
+  ],
+  "name": "posthoc_ci_ols_sim_factorial"
+}

@@ -1,0 +1,32 @@
+{
+  "name": "sim_uncorr_boundary_lmm",
+  "engine": "lme4::lmer",
+  "engine_version": "2.0.6",
+  "kind": "lmm",
+  "data": "sim_uncorr_boundary",
+  "family": "gaussian",
+  "link": {},
+  "nagq": 1,
+  "tolPwrss": {},
+  "r_formula": "y ~ 1 + x + (1 + x || g)",
+  "converged": true,
+  "singular": true,
+  "coef_names": ["(Intercept)", "x"],
+  "estimates": {
+    "beta": [0.637631325441662, 0.520841977169212],
+    "se": [0.25235387896348, 0.0732568371734321],
+    "loglik": -299.84769159046,
+    "varcomp": [
+      {
+        "group": "g",
+        "terms": ["(Intercept)", "x"],
+        "stddev": [1.08836366093182, 0],
+        "corr": [
+          [1, 0],
+          [0, 1]
+        ]
+      }
+    ],
+    "sigma": 0.943144953980791
+  }
+}

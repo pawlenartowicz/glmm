@@ -46,7 +46,7 @@ The recurring symbols on this page, defined once here before first use:
 
 ## Dispatch within the LMM path
 
-Three real routing decisions sit between `fit_cold`/`fit_warm` and a returned
+Three real routing decisions sit between `fit`/`fit_with_start` and a returned
 `Fit`:
 
 1. **Solver class** — `classify_design` (`src/fit/mod.rs`) returns
@@ -73,7 +73,7 @@ Three real routing decisions sit between `fit_cold`/`fit_warm` and a returned
    is well conditioned; everything else takes the general
    family-by-family elimination. `reml_deviance` also has a
    `reml_deviance_blocked` branch for extra-grouping random slopes, but
-   decision 1 sends every such design to `Sparse`, so from `fit_cold`/`fit_warm`
+   decision 1 sends every such design to `Sparse`, so from `fit`/`fit_with_start`
    that branch is unreachable; only in-crate tests call it.
 
 ```mermaid
@@ -158,7 +158,11 @@ A random slope is a column of the fixed-effect design, and every route fits the
 standardized design
 ([internal standardization](algorithms.md#internal-standardization-of-the-design)),
 so the slope's block reads the same transformed column `x̃` the fixed effects
-do. A continuous slope is centered and scaled. A 0/1 (or constant) slope
+do. A continuous slope is centered and scaled when it is in the same
+unstructured term as its grouping's random intercept. A slope in any other term
+(`(x || g)`, or a block without a random intercept) has no random intercept to
+absorb the shift, so it is scaled about zero and not centered, in every
+grouping that reads it. A 0/1 (or constant) slope
 column, which the standardization would otherwise leave as it is, is scaled
 without being centered, by `s = √(Σ wᵢxᵢ² / Σ wᵢ)`, its prior-weighted
 root-mean-square about zero, so its zeros stay exact zeros. The implicit
@@ -258,7 +262,7 @@ well-conditioned design thus costs no extra pass over the rows, and the step
 costs no copy of `X`. It is always on. When `R` has a zero or non-finite
 diagonal (an all-zero weighted column, fewer rows than columns) `U` stays the
 identity and the kernels see the standardized `X` unorthogonalized. On
-`fit_cold` / `fit_warm` the pre-dispatch alias gate (`detect_aliased`) drops
+`fit` / `fit_with_start` the pre-dispatch alias gate (`detect_aliased`) drops
 exactly redundant columns first. On the loop tier they reach the kernel: their
 pivot ratio is at round-off level, so they take the Givens pass.
 
@@ -314,7 +318,7 @@ on a REML fit `lmm_view_to_fit` adds `2·Σⱼ ln sⱼ` to the deviance and the 
 The ML criterion reads X only through its column space (`r²` and `|V|`), so
 an ML fit needs no such shift.
 
-**Prior weights.** With `FitOptions::weights`, the sufficient-statistics
+**Prior weights.** With `Data::weights`, the sufficient-statistics
 accumulator (`LmmSuffStats::add_rows_multi`, `src/lmm/kernel.rs`) folds `√wᵢ` into
 every accumulated quantity exactly once per side, so every Gram product carries
 `wᵢ` — but the level counts and df stay raw-row (`n − p`). The θ search runs
@@ -331,7 +335,7 @@ the deviance (and recomputes the loglik) *after* optimization rather than paying
 it per evaluation. It sits in the `Fit` assembly, the one site every caller
 reaches, so no caller applies it a second time.
 
-**Offset.** A `FitOptions::offset` is an exact response shift under the
+**Offset.** A `Data::offset` is an exact response shift under the
 identity link: the core's `Lmm` arm accumulates `y − o` and nothing
 downstream needs to know (same convention as the OLS path).
 
@@ -500,7 +504,7 @@ extras), and as the gradient route's polish and fallback, `fit_lmm` minimises
 interpolation set. `Bobyqa::new` is the only allocation site; `minimize` is
 zero-alloc on the warm path.
 
-The schedule set by `LmmWorkspace::for_cluster_spec_ext` (the shipped `fit_cold`
+The schedule set by `LmmWorkspace::for_cluster_spec_ext` (the shipped `fit`
 route) is:
 
 | Parameter | Value | Source |
@@ -526,12 +530,8 @@ The `npt` mid-size (`⌈1.5n⌉+1`, used from `n ≥ 3`) beats Powell's `2n+1` o
 measured dimension ≥ 3; below that it *is* `2n+1`. PRIMA requires
 `n+2 ≤ npt ≤ (n+1)(n+2)/2`, which the formula respects.
 
-One alternate seed exists alongside the shipped schedule: `bobyqa_config`
-(tests only), `RHO_BEGIN` with PRIMA's default `npt = 2n+1`.
-
-**Code**: `fit_lmm`, `LmmWorkspace::for_cluster_spec_ext`,
-`bobyqa_config`, constants `RHO_BEGIN`/`RHO_BEGIN_WARM`/`RHO_END`/`THETA0`
-(`src/lmm/mod.rs`); the external `bobyqa` crate supplies the solver.
+**Code**: `fit_lmm`, `LmmWorkspace::for_cluster_spec_ext`, constants
+`RHO_BEGIN`/`RHO_BEGIN_WARM`/`RHO_END`/`THETA0` (`src/lmm/mod.rs`); the external `bobyqa` crate supplies the solver.
 **Convention**: derivative-free BOBYQA over relative-Cholesky θ, as in lme4's
 default `nloptwrap`/`bobyqa` optimiser for `lmer`. **Validation**: sleepstudy
 (`n_θ = 3`, correlated slope), Penicillin (crossed), Pastes (nested) drive the
@@ -678,7 +678,7 @@ from a forward solve against the fixed-effect Cholesky factor, and the squared
 Wald statistic is `t² = β̂_j² / Var(β̂_j)`. `L_XX` here is the factor already
 mapped back to `X` (`Uᵀ·L̃_XX`, see
 [Fixed-effect orthogonalization](#fixed-effect-orthogonalization)). SEs are computed only for the columns in
-`FitOptions::target_indices`. A joint Wald χ² over the target set is available via
+`FitOptions::se_for`. A joint Wald χ² over the target set is available via
 the shared `joint_wald_chi_sq` helper, `W = ‖R⁻ᵀβ̂_T‖²/σ̂²` from a QR `C_T = Q·R` of
 the same forward-solve columns `C_T = [L_XX⁻¹bₜ]`, so no Gram is formed.
 
@@ -698,7 +698,7 @@ Cornelius 1996; Kuznetsova et al. 2017), computed by one derivative pass at θ̂
 after the fit, with no refit. The pass fills `Fit::coef_df` (the df of each
 unit contrast `e_j`, the `df` column of the summaries) and leaves a private
 state that `Fit::contrast_t` (one contrast) and `Fit::contrast_f` (a contrast
-matrix) read. It runs by default on the stable path (`fit_cold`, `fit_warm`)
+matrix) read. It runs by default on the stable path (`fit`, `fit_with_start`)
 while the fit's workspace still lives; `FitOptions::satterthwaite = false`
 skips it. On the loop tier it runs only when called:
 `loop_advanced::satterthwaite(&mut ws, &mut df_out)` after `fit_on` or
@@ -798,7 +798,11 @@ zero in θ̂ (a pinned component after
 coordinates and every mixed second derivative between them and the rest
 vanish, so the pass drops those coordinates, leaving `gᵀH⁺g` unchanged; their
 own curvature block can be singular, which is the second reason to drop them.
-The test is on the value of the column, not on the pinned bit. The remaining
+The test is on the value of the column, not on the pinned bit. The θ entries
+a grouping's terms hold at zero (between two terms, as in `(x || g)`, and the
+intercept column of a block without a random intercept) are not coordinates
+at all: `free_coordinates_into` leaves them out, so the pass never steps them.
+The remaining
 `H_p` is inverted by an eigendecomposition that keeps only eigenvalues above
 `1e-8·λ_max`, counts those below `−1e-8·λ_max` as negative and the rest as
 dropped, as lmerTest inverts only its positive eigenvalues (lmerTest's own

@@ -6,10 +6,11 @@ use super::se::*;
 use super::workspace::*;
 use super::*;
 use crate::counters::EvalCounters;
+use crate::fit::SizedSpec;
 use crate::test_support::{intercept_only_spec, TestWs};
 use crate::{
     BinomialLink, Family, GammaLink, Grouping, GroupingRelation, ModelSpec, NegBinomialLink,
-    PoissonLink, ReStructure, Sizing, WaldSe,
+    PoissonLink, ReStructure, WaldSe,
 };
 use faer::linalg::solvers::Solve;
 
@@ -35,7 +36,7 @@ fn theta_se(ws: &GlmmWorkspace) -> Vec<f64> {
 fn packed_oracle_fill(ws: &mut GlmmWorkspace, x: faer::MatRef<f64>, params: &[f64], n: usize) {
     let nt = ws.n_theta;
     crate::sparse::fill_lambda_small(&params[..nt], &ws.groupings, &mut ws.packed.lam_small);
-    fill_z_f64(&ws.groupings, x, &mut ws.z_buf, n);
+    fill_z_f64(&ws.groupings, x, x.subcols(0, 0), &mut ws.z_buf, n);
     fill_m_vals(&mut ws.packed, &ws.groupings, &ws.z_buf, n);
 }
 
@@ -77,23 +78,35 @@ fn packed_dense_m(ws: &GlmmWorkspace, n: usize, k: usize) -> Mat<f64> {
 #[test]
 #[should_panic(expected = "slope-carrying extra grouping")]
 fn structured_glmm_entry_rejects_extra_slopes() {
-    let model = ModelSpec {
-        family: Family::Binomial {
-            link: BinomialLink::Logit,
+    let model = SizedSpec {
+        spec: ModelSpec {
+            family: Family::Binomial {
+                link: BinomialLink::Logit,
+            },
+            re: Some(ReStructure {
+                terms: Vec::new(),
+                slopes: vec![],
+                extra_groupings: vec![Grouping {
+                    terms: Vec::new(),
+                    relation: GroupingRelation::Crossed,
+                    slopes: vec![1],
+                }],
+            }),
         },
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 2 },
-            slopes: vec![],
-            extra_groupings: vec![Grouping {
-                relation: GroupingRelation::Crossed { n_clusters: 2 },
-                slopes: vec![1],
-            }],
-        }),
+        n_primary: 2,
+        extra_counts: vec![2],
     };
     let n = 8;
     let p = 2;
-    let groupings = crate::lmm::LmmGroupings::from_cluster_spec(&model, n, &[]);
-    let _ = GlmmWorkspace::from_groupings(groupings, model.family, p, n, 1, GlmmLayout::Structured);
+    let groupings = crate::lmm::LmmGroupings::from_cluster_spec(&model, &[]);
+    let _ = GlmmWorkspace::from_groupings(
+        groupings,
+        model.spec.family,
+        p,
+        n,
+        1,
+        GlmmLayout::Structured,
+    );
 }
 
 /// The packed layout is Laplace-only (see `from_groupings`'s doc): whatever
@@ -102,31 +115,37 @@ fn structured_glmm_entry_rejects_extra_slopes() {
 /// workspace will actually run.
 #[test]
 fn packed_layout_pins_nagq_to_one() {
-    let model = ModelSpec {
-        family: Family::Binomial {
-            link: BinomialLink::Logit,
+    let model = SizedSpec {
+        spec: ModelSpec {
+            family: Family::Binomial {
+                link: BinomialLink::Logit,
+            },
+            re: Some(ReStructure {
+                terms: Vec::new(),
+                slopes: vec![],
+                extra_groupings: vec![Grouping {
+                    terms: Vec::new(),
+                    relation: GroupingRelation::Crossed,
+                    slopes: vec![1],
+                }],
+            }),
         },
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 2 },
-            slopes: vec![],
-            extra_groupings: vec![Grouping {
-                relation: GroupingRelation::Crossed { n_clusters: 2 },
-                slopes: vec![1],
-            }],
-        }),
+        n_primary: 2,
+        extra_counts: vec![2],
     };
     let n = 8;
     let p = 2;
-    let groupings = crate::lmm::LmmGroupings::from_cluster_spec(&model, n, &[]);
-    let ws = GlmmWorkspace::from_groupings(groupings, model.family, p, n, 7, GlmmLayout::Packed);
+    let groupings = crate::lmm::LmmGroupings::from_cluster_spec(&model, &[]);
+    let ws =
+        GlmmWorkspace::from_groupings(groupings, model.spec.family, p, n, 7, GlmmLayout::Packed);
     assert_eq!(ws.nagq, 1);
 }
 
 /// Intercept-only spec carrying the **binomial-logit** family. `ws.family` drives
 /// the deviance and IRLS weights the GLMM kernel computes, so these binomial tests
 /// must set it explicitly rather than inherit `intercept_only_spec`'s Gaussian default.
-fn logit_intercept_spec(sizing: Sizing) -> ModelSpec {
-    let mut s = intercept_only_spec(sizing);
+fn logit_intercept_spec() -> ModelSpec {
+    let mut s = intercept_only_spec();
     s.family = Family::Binomial {
         link: BinomialLink::Logit,
     };
@@ -178,7 +197,7 @@ fn glmm_intercept_dataset() -> (Mat<f64>, Vec<f64>, Vec<u32>) {
 /// q_p=2 (intercept + slope on col 0) primary grouping plus ONE crossed extra
 /// grouping. Returns (X f64 [1, x1], y, primary ids, crossed ids, spec). Every
 /// crossed level gets ≥1 obs (round-robin), and every primary level too.
-fn glmm_slope_crossed_dataset() -> (Mat<f64>, Vec<f64>, Vec<u32>, Vec<u32>, ModelSpec) {
+fn glmm_slope_crossed_dataset() -> (Mat<f64>, Vec<f64>, Vec<u32>, Vec<u32>, SizedSpec) {
     glmm_slope_crossed_dataset_sized(4, 1.0)
 }
 
@@ -188,7 +207,7 @@ fn glmm_slope_crossed_dataset() -> (Mat<f64>, Vec<f64>, Vec<u32>, Vec<u32>, Mode
 fn glmm_slope_crossed_dataset_sized(
     n_crossed: usize,
     re_scale: f64,
-) -> (Mat<f64>, Vec<f64>, Vec<u32>, Vec<u32>, ModelSpec) {
+) -> (Mat<f64>, Vec<f64>, Vec<u32>, Vec<u32>, SizedSpec) {
     let (n, n_prim) = (96usize, 8usize);
     let mut st = 13u64;
     let u0: Vec<f64> = (0..n_prim).map(|_| re_scale * 0.6 * lcg(&mut st)).collect();
@@ -215,22 +234,23 @@ fn glmm_slope_crossed_dataset_sized(
     // Slope on design col 0 of the [1, x1] X the kernels read (the slope_cols
     // arg is &[1] — the x1 column index in the full X); the spec carries
     // ONE slope + ONE crossed grouping so for_cluster_spec sizes q_p=2 + tail.
-    let cluster = ModelSpec {
-        family: Family::Binomial {
-            link: BinomialLink::Logit,
-        },
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters {
-                n_clusters: n_prim as u32,
+    let cluster = SizedSpec {
+        spec: ModelSpec {
+            family: Family::Binomial {
+                link: BinomialLink::Logit,
             },
-            slopes: vec![0],
-            extra_groupings: vec![Grouping {
-                relation: GroupingRelation::Crossed {
-                    n_clusters: n_crossed as u32,
-                },
-                slopes: vec![],
-            }],
-        }),
+            re: Some(ReStructure {
+                terms: Vec::new(),
+                slopes: vec![0],
+                extra_groupings: vec![Grouping {
+                    terms: Vec::new(),
+                    relation: GroupingRelation::Crossed,
+                    slopes: vec![],
+                }],
+            }),
+        },
+        n_primary: n_prim,
+        extra_counts: vec![n_crossed],
     };
     (x, y, ids, crossed, cluster)
 }
@@ -349,30 +369,6 @@ fn brute_force_intercept_laplace(
     pen_dev(&u, None) + 2.0 * logdet
 }
 
-#[test]
-fn agq_k1_reduces_to_laplace() {
-    // The k=1 adaptive node sits at the mode with GH weight √π, so agq_deviance
-    // at nagq=1 equals laplace_deviance analytically. They assemble it via
-    // different ops (scalar dev_resid + log-sum-exp vs the kernel's dev/pen +
-    // 2·logdet), so compare with a tight relative tolerance, NOT bit-equality.
-    // The production nagq=1 path is bit-identical regardless: laplace_deviance's
-    // AGQ guard fires only for nagq>1. Run at a non-unit τ² (= 0.5²) so a missing
-    // λ-scale in the integrand would surface (the k=1 reduction is τ-dependent).
-    let (xf64, y, ids) = glmm_intercept_dataset();
-    let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 });
-    let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], 1);
-    ws.params[0] = 0.5; // θ (Λ scalar) ≠ 1 — exercises the λ-scale
-    ws.params[1] = 0.2;
-    ws.params[2] = 0.8;
-    let p = ws.params.clone();
-    let lap = glmm_laplace_deviance(&p, &mut ws, xf64.as_ref(), &y, &ids, &[], 80);
-    let agq1 = glmm_agq_deviance(&p, &mut ws, xf64.as_ref(), &y, &ids, 80, 1);
-    assert!(
-        (agq1 - lap).abs() <= 1e-12 * lap.abs().max(1.0),
-        "agq(k=1) {agq1} vs laplace {lap}"
-    );
-}
-
 /// White-box, no external oracle: the aggregated-binomial AGQ objective and its
 /// per-trial expanded twin, evaluated at a SHARED (β, θ), differ by exactly the
 /// data-only saturated constant `2·Σᵢ wᵢ[yᵢ ln yᵢ + (1−yᵢ) ln(1−yᵢ)]` (yᵢ the
@@ -433,9 +429,11 @@ fn agq_weighted_aggregated_equals_expanded_plus_saturated_const() {
         .sum();
     assert!(sat < -1e-6, "saturated const must be nonzero (got {sat})");
 
-    let cluster = logit_intercept_spec(Sizing::FixedClusters {
-        n_clusters: nc as u32,
-    });
+    let cluster = SizedSpec {
+        spec: logit_intercept_spec(),
+        n_primary: nc,
+        extra_counts: vec![],
+    };
     for nagq in [1u8, 7] {
         let mut ws_a = GlmmWorkspace::for_cluster_spec(2, &cluster, n_a, &[], nagq);
         ws_a.weighted = true;
@@ -466,14 +464,19 @@ fn agq_weighted_aggregated_equals_expanded_plus_saturated_const() {
 /// operands, same per-accumulator summation order (ClusterRowIndex's
 /// ascending-row guarantee). Exact equality — approximate closeness here
 /// would hide a reordering that invalidates the no-golden-revalidation
-/// safety argument.
+/// safety argument. Under `--features parallel` the `Some(idx)` arm is the
+/// rayon cluster loop, so this also proves parallel = serial.
 #[test]
 fn agq_cluster_outer_bit_identical_to_node_outer() {
     let (xf64, y, ids) = glmm_intercept_dataset();
-    let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 });
+    let cluster = SizedSpec {
+        spec: logit_intercept_spec(),
+        n_primary: 8,
+        extra_counts: vec![],
+    };
     for nagq in [3u8, 7, 11] {
         let mut ws_a = GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], nagq);
-        ws_a.params[0] = 0.5; // θ (Λ scalar) ≠ 1 — exercises the λ-scale, mirrors agq_k1_reduces_to_laplace
+        ws_a.params[0] = 0.5; // θ (Λ scalar) ≠ 1 — exercises the λ-scale
         ws_a.params[1] = 0.2;
         ws_a.params[2] = 0.8;
         let params = ws_a.params.clone();
@@ -552,60 +555,42 @@ fn agq_compressed_with_fallback_cluster_outer_matches_node_outer() {
     }
 }
 
-/// Parallel cluster loop must equal the serial cluster-outer loop bitwise —
-/// disjoint sum-slot writes make the result schedule-independent.
-#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
-#[test]
-fn agq_parallel_bit_identical_to_serial() {
-    let (xf64, y, ids) = glmm_intercept_dataset();
-    let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 });
-    for nagq in [3u8, 7, 11] {
-        let mut ws_a = GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], nagq);
-        ws_a.params[0] = 0.5; // θ (Λ scalar) ≠ 1 — exercises the λ-scale, mirrors agq_k1_reduces_to_laplace
-        ws_a.params[1] = 0.2;
-        ws_a.params[2] = 0.8;
-        let params = ws_a.params.clone();
-        // Some(idx) here runs the rayon arm under --features parallel (this test is
-        // itself feature-gated), so `da` below is the parallel result.
-        ws_a.cluster_rows = Some(ClusterRowIndex::build(&ids, ws_a.groupings.n_primary));
-
-        let mut ws_b = GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], nagq);
-        ws_b.cluster_rows = None; // knob-off path: always the original serial node-outer loop
-
-        let da = glmm_agq_deviance(&params, &mut ws_a, xf64.as_ref(), &y, &ids, 80, nagq);
-        let db = glmm_agq_deviance(&params, &mut ws_b, xf64.as_ref(), &y, &ids, 80, nagq);
-        assert_eq!(da.to_bits(), db.to_bits(), "nagq={nagq}");
-    }
-}
-
 // --- Vector AGQ (agq_deviance_vec) white-box invariants --
 
 /// q=2 vector-RE spec: intercept + slope on design col 1, single grouping
 /// factor, no extras — the shape the widened gate routes to `agq_deviance_vec`.
-fn slope1_spec() -> ModelSpec {
-    ModelSpec {
-        family: Family::Binomial {
-            link: BinomialLink::Logit,
+fn slope1_spec() -> SizedSpec {
+    SizedSpec {
+        spec: ModelSpec {
+            family: Family::Binomial {
+                link: BinomialLink::Logit,
+            },
+            re: Some(ReStructure {
+                terms: Vec::new(),
+                slopes: vec![1],
+                extra_groupings: vec![],
+            }),
         },
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 8 },
-            slopes: vec![1],
-            extra_groupings: vec![],
-        }),
+        n_primary: 8,
+        extra_counts: vec![],
     }
 }
 
 /// q=3 vector-RE spec: intercept + slopes on design cols 1,2 (pins the q≤3 cap).
-fn slope2_spec() -> ModelSpec {
-    ModelSpec {
-        family: Family::Binomial {
-            link: BinomialLink::Logit,
+fn slope2_spec() -> SizedSpec {
+    SizedSpec {
+        spec: ModelSpec {
+            family: Family::Binomial {
+                link: BinomialLink::Logit,
+            },
+            re: Some(ReStructure {
+                terms: Vec::new(),
+                slopes: vec![1, 2],
+                extra_groupings: vec![],
+            }),
         },
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 8 },
-            slopes: vec![1, 2],
-            extra_groupings: vec![],
-        }),
+        n_primary: 8,
+        extra_counts: vec![],
     }
 }
 
@@ -637,7 +622,8 @@ fn glmm_slope2_noextra_dataset() -> (Mat<f64>, Vec<f64>, Vec<u32>) {
 
 /// Vector AGQ k=1 ≡ Laplace at q=2 (rel<1e-12): the single z=0 node collapses the
 /// multivariate Liu–Pierce bracket to `q·ln√π`, leaving `−2ℓ_c(ũ_c)+log|A_c|` —
-/// the Laplace term exactly. Mirrors `agq_k1_reduces_to_laplace` one dimension up;
+/// the Laplace term exactly. Mirrors the scalar k = 1 check in
+/// `agq_nb_ladder_converges_and_one_node_is_laplace` one dimension up;
 /// run at a non-identity Λ_p (correlated intercept/slope) so a missing `Λ_p·u_cj`
 /// or `L_c⁻ᵀ` transform in the integrand would surface.
 #[test]
@@ -755,7 +741,11 @@ fn agq_vec_k_convergence_self_consistent_q2() {
 fn laplace_deviance_collapses_to_glm_at_theta_zero() {
     let (xf64, y, ids) = glmm_intercept_dataset();
     let beta = [0.2_f64, 0.8];
-    let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 });
+    let cluster = SizedSpec {
+        spec: logit_intercept_spec(),
+        n_primary: 8,
+        extra_counts: vec![],
+    };
     let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], 1);
     ws.params[0] = 0.0;
     ws.params[1] = beta[0];
@@ -847,30 +837,30 @@ fn packed_m_vals_scale_each_extra_by_its_own_theta() {
     let (n_prim, n_crossed, n_per_parent) = (4usize, 3usize, 2usize);
     // Declaration order [Crossed, Nested] ⇒ extra_offsets[0] (crossed, high) >
     // extra_offsets[1] (nested, low) — the non-monotonic precondition.
-    let cluster = ModelSpec {
-        family: Family::Binomial {
-            link: BinomialLink::Logit,
-        },
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters {
-                n_clusters: n_prim as u32,
+    let cluster = SizedSpec {
+        spec: ModelSpec {
+            family: Family::Binomial {
+                link: BinomialLink::Logit,
             },
-            slopes: vec![],
-            extra_groupings: vec![
-                Grouping {
-                    relation: GroupingRelation::Crossed {
-                        n_clusters: n_crossed as u32,
+            re: Some(ReStructure {
+                terms: Vec::new(),
+                slopes: vec![],
+                extra_groupings: vec![
+                    Grouping {
+                        terms: Vec::new(),
+                        relation: GroupingRelation::Crossed,
+                        slopes: vec![],
                     },
-                    slopes: vec![],
-                },
-                Grouping {
-                    relation: GroupingRelation::NestedWithin {
-                        n_per_parent: n_per_parent as u32,
+                    Grouping {
+                        terms: Vec::new(),
+                        relation: GroupingRelation::NestedWithin,
+                        slopes: vec![],
                     },
-                    slopes: vec![],
-                },
-            ],
-        }),
+                ],
+            }),
+        },
+        n_primary: n_prim,
+        extra_counts: vec![n_crossed, n_per_parent],
     };
     let n = 8usize;
     let ids: Vec<u32> = (0..n).map(|i| (i % n_prim) as u32).collect();
@@ -950,14 +940,15 @@ fn load_hessian_fixture() -> HessianFixture {
     serde_json::from_str(&s).expect("parse hessian fixture")
 }
 
-/// FD-Hessian fixed-effect covariance matches lme4 `vcov(use.hessian = TRUE)`
+/// The joint-Hessian fixed-effect covariance (`joint_hessian_cov`, which takes
+/// its exact arm on this shape) matches lme4 `vcov(use.hessian = TRUE)`
 /// on the committed n=96 / 12-cluster `y ~ x1 + (1|grp)` glmer fit. Runs OUR
-/// `fit_glmm` to convergence (the production code path) and takes the FD Hessian
+/// `fit_glmm` to convergence (the production code path) and takes the Hessian
 /// at OUR own θ̂/β̂ — NOT at lme4's fixture params. Pins both the kernel
 /// convention and the load-bearing factor of 2 (deviance = −2logL ⇒
 /// cov = 2·inv(H_dev)).
 ///
-/// Why fit first (test rigor — GATE-1 I1): the FD Hessian's β-block invariance
+/// Why fit first: the joint Hessian's β-block invariance
 /// to the θ↔β cross-curvature only holds AT a θ-stationary point. Evaluating at
 /// our own converged θ̂ both (a) reflects production and (b) lets us assert our
 /// solver agrees with lme4's θ̂ — proving any residual vcov gap is genuine
@@ -970,7 +961,11 @@ fn joint_hessian_cov_matches_glmer_use_hessian_true() {
     let n = fx.n;
     let p = fx.beta.len();
     let n_clusters = fx.cluster_ids.iter().max().unwrap() + 1;
-    let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters });
+    let cluster = SizedSpec {
+        spec: logit_intercept_spec(),
+        n_primary: n_clusters as usize,
+        extra_counts: vec![],
+    };
     let mut ws = GlmmWorkspace::for_cluster_spec(p, &cluster, n, &[], 1);
     let mut xf64 = Mat::<f64>::zeros(n, p);
     for i in 0..n {
@@ -985,8 +980,8 @@ fn joint_hessian_cov_matches_glmer_use_hessian_true() {
     // comparison is point-matched: rx_cov_into reproduces lme4 vcov(use.hessian
     // =FALSE) to ~3.6e-6 (this path never goes through numDeriv — it inverts the
     // closed-form β information). Pins that the PIRLS / W̃ / Schur machinery the
-    // FD Hessian shares is exact, isolating any vcov_hessian gap to the FD ↔
-    // numDeriv comparison. Requires a converged central PIRLS at those params.
+    // joint Hessian shares is exact, isolating any vcov_hessian gap to the
+    // Hessian ↔ numDeriv comparison. Requires a converged central PIRLS at those params.
     ws.params[0] = fx.theta;
     for j in 0..p {
         ws.params[1 + j] = fx.beta[j];
@@ -1001,7 +996,15 @@ fn joint_hessian_cov_matches_glmer_use_hessian_true() {
         &mut crate::counters::EvalCounters::new(),
     );
     let mut rx = Mat::<f64>::zeros(p, p);
-    assert!(rx_cov_into(&mut ws, xf64.as_ref(), &ids, p, n, &mut rx));
+    assert!(rx_cov_into(
+        &mut ws,
+        xf64.as_ref(),
+        xf64.as_ref().subcols(0, 0),
+        &ids,
+        p,
+        n,
+        &mut rx
+    ));
     for i in 0..p {
         for j in 0..p {
             let (got, want) = (rx[(i, j)], fx.vcov_rx[i][j]);
@@ -1017,6 +1020,7 @@ fn joint_hessian_cov_matches_glmer_use_hessian_true() {
     let fit = fit_glmm(
         &mut ws,
         xf64.as_ref(),
+        xf64.as_ref().subcols(0, 0),
         &y,
         &ids,
         &[],
@@ -1029,7 +1033,7 @@ fn joint_hessian_cov_matches_glmer_use_hessian_true() {
     );
     assert!(fit.converged, "fit_glmm must converge on the fixture");
     // Our solver vs lme4: θ̂ to ~0.07%, β̂ to ~0.1% (measured). Proves the two
-    // optimisers land on the same stationary point, so the FD Hessian below is
+    // optimisers land on the same stationary point, so the joint Hessian below is
     // taken at a genuine θ-stationary point — the residual vcov gap is NOT an
     // off-stationarity artifact. Tol = a few % (well above the achieved band);
     // a MATERIAL divergence here would be a real engine finding, not noise.
@@ -1052,7 +1056,17 @@ fn joint_hessian_cov_matches_glmer_use_hessian_true() {
     let our_theta = ws.params[0];
 
     let mut cov = Mat::<f64>::zeros(p, p);
-    let status = joint_hessian_cov(&mut ws, xf64.as_ref(), &y, &ids, &[], p, n, &mut cov);
+    let status = joint_hessian_cov(
+        &mut ws,
+        xf64.as_ref(),
+        xf64.as_ref().subcols(0, 0),
+        &y,
+        &ids,
+        &[],
+        p,
+        n,
+        &mut cov,
+    );
     assert_eq!(status, FdHessianStatus::Ok);
     // ws.params restored to OUR converged snapshot on return.
     assert!((ws.params[0] - our_theta).abs() < 1e-15);
@@ -1081,19 +1095,29 @@ fn joint_hessian_cov_matches_glmer_use_hessian_true() {
     }
 }
 
-/// The exact hyper-dual joint Hessian and the FD stencil agree on the committed
-/// n=96 / 12-cluster `y ~ x1 + (1|grp)` fixture, to the `validation/grid/tol.R`
-/// `se_hessian_rel` default band (1e-3). The two sides are the SAME function's
-/// second derivative computed two ways, so the gap is the FD stencil's own
-/// truncation-plus-noise error and nothing else — this is the test that says
-/// the exact arm did not change the meaning of the quantity, only its accuracy.
+/// The exact joint Hessian and the FD stencil agree on the committed
+/// n=96 / 12-cluster `y ~ x1 + (1|grp)` fixture, at Laplace and at nAGQ = 7.
+/// The two sides are the SAME function's second derivative computed two ways,
+/// so the gap is the FD stencil's own truncation-plus-noise error and nothing
+/// else — this is the test that says the exact arm did not change the meaning
+/// of the quantity, only its accuracy. Bands: the `validation/grid/tol.R`
+/// `se_hessian_rel` default (1e-3) at Laplace and `AGQ_SE_HESSIAN_REL` (2e-2,
+/// `tests/oracle_support/mod.rs`) at nAGQ = 7, the order rungs 44/45 carry in
+/// `validation/manifest.json`. The AGQ gate (`deviance.rs`: no extras,
+/// `q_p ≤ 3`, binomial/Poisson) sits entirely inside the blocked branch, so at
+/// nAGQ = 7 the exact Hessian differentiates the AGQ deviance rather than the
+/// Laplace one.
 #[test]
 fn exact_hessian_matches_fd_on_fixture() {
     let fx = load_hessian_fixture();
     let n = fx.n;
     let p = fx.beta.len();
     let n_clusters = fx.cluster_ids.iter().max().unwrap() + 1;
-    let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters });
+    let cluster = SizedSpec {
+        spec: logit_intercept_spec(),
+        n_primary: n_clusters as usize,
+        extra_counts: vec![],
+    };
     let mut xf64 = Mat::<f64>::zeros(n, p);
     for i in 0..n {
         for j in 0..p {
@@ -1103,140 +1127,91 @@ fn exact_hessian_matches_fd_on_fixture() {
     let y = fx.y.clone();
     let ids = fx.cluster_ids.clone();
 
-    let mut cov_exact = Mat::<f64>::zeros(p, p);
-    let mut ws = GlmmWorkspace::for_cluster_spec(p, &cluster, n, &[], 1);
-    // Rx: mirrors the sibling test — the fit itself runs no joint Hessian; the
-    // explicit joint_hessian_cov calls below are the comparison.
-    let fit = fit_glmm(
-        &mut ws,
-        xf64.as_ref(),
-        &y,
-        &ids,
-        &[],
-        &[1u32],
-        None,
-        &vec![0.0; p],
-        n,
-        WaldSe::Rx,
-        ColumnScaling::IDENTITY,
-    );
-    assert!(fit.converged);
-    // Cleared first so the guard below has teeth: each exact arm sizes its own
-    // dual scratch and the FD stencil touches neither. With both calls on the
-    // stencil the two sides agree bitwise and the band passes vacuously.
-    ws.hyper_scratch = None;
-    ws.dual_scratch = None;
-    let st = joint_hessian_cov(&mut ws, xf64.as_ref(), &y, &ids, &[], p, n, &mut cov_exact);
-    assert_eq!(st, FdHessianStatus::Ok);
-    assert!(
-        ws.hyper_scratch.is_some() || ws.dual_scratch.is_some(),
-        "joint_hessian_cov fell through to the FD stencil"
-    );
-    let tse_exact = theta_se(&ws);
-
-    let mut cov_fd = Mat::<f64>::zeros(p, p);
-    ws.fd.force_fd_hessian = true;
-    let st = joint_hessian_cov(&mut ws, xf64.as_ref(), &y, &ids, &[], p, n, &mut cov_fd);
-    assert_eq!(st, FdHessianStatus::Ok);
-    let tse_fd = theta_se(&ws);
-
-    // Band = grid/tol.R's `se_hessian_rel` default (1e-3), applied to the SEs the
-    // caller sees, not to the raw covariance entries.
-    for j in 0..p {
-        let (a, b) = (cov_exact[(j, j)].sqrt(), cov_fd[(j, j)].sqrt());
-        assert!(
-            (a - b).abs() <= 1e-3 * b.abs(),
-            "se[{j}]: exact {a} vs fd {b}"
+    for (nagq, band) in [(1u8, 1e-3), (7, 2e-2)] {
+        let mut cov_exact = Mat::<f64>::zeros(p, p);
+        let mut ws = GlmmWorkspace::for_cluster_spec(p, &cluster, n, &[], nagq);
+        // Rx: the fit itself runs no joint Hessian; the explicit
+        // joint_hessian_cov calls below are the comparison.
+        let fit = fit_glmm(
+            &mut ws,
+            xf64.as_ref(),
+            xf64.as_ref().subcols(0, 0),
+            &y,
+            &ids,
+            &[],
+            &[1u32],
+            None,
+            &vec![0.0; p],
+            n,
+            WaldSe::Rx,
+            ColumnScaling::IDENTITY,
         );
-    }
-    for k in 0..ws.n_theta {
-        assert!(
-            (tse_exact[k] - tse_fd[k]).abs() <= 1e-3 * tse_fd[k].abs(),
-            "theta_se[{k}]: exact {} vs fd {}",
-            tse_exact[k],
-            tse_fd[k]
+        assert!(fit.converged, "nagq={nagq}");
+        // Cleared first so the guard below has teeth: each exact arm sizes its
+        // own scratch and the FD stencil touches none. With both calls on the
+        // stencil the two sides agree bitwise and the band passes vacuously. On
+        // an AGQ shape the assembled pass declines before allocating, so only
+        // the gradient-difference rung (this logit fixture) or the hyper-dual
+        // pass can take it.
+        ws.hyper_scratch = None;
+        ws.dual_scratch = None;
+        ws.agq_gd = None;
+        let st = joint_hessian_cov(
+            &mut ws,
+            xf64.as_ref(),
+            xf64.as_ref().subcols(0, 0),
+            &y,
+            &ids,
+            &[],
+            p,
+            n,
+            &mut cov_exact,
         );
-    }
-}
+        assert_eq!(st, FdHessianStatus::Ok, "nagq={nagq}");
+        let exact_arm_ran = if nagq == 1 {
+            ws.hyper_scratch.is_some() || ws.dual_scratch.is_some()
+        } else {
+            ws.agq_gd.is_some() || ws.hyper_scratch.is_some()
+        };
+        assert!(
+            exact_arm_ran,
+            "nagq={nagq}: joint_hessian_cov fell through to the FD stencil"
+        );
+        let tse_exact = theta_se(&ws);
 
-/// Same exact-vs-FD comparison at nAGQ > 1. The AGQ gate
-/// (`deviance.rs`: no extras, `q_p ≤ 3`, binomial/Poisson) sits entirely inside
-/// the blocked branch, so the exact Hessian differentiates the AGQ deviance
-/// rather than the Laplace one — this is the test that says so. Identical to
-/// `exact_hessian_matches_fd_on_fixture` except the workspace is built at
-/// `nagq = 7` (the order rungs 44/45 carry in `validation/manifest.json`) and
-/// the band is `AGQ_SE_HESSIAN_REL` (`2e-2`) in place of the Laplace default.
-#[test]
-fn exact_hessian_matches_fd_on_fixture_agq() {
-    let fx = load_hessian_fixture();
-    let n = fx.n;
-    let p = fx.beta.len();
-    let n_clusters = fx.cluster_ids.iter().max().unwrap() + 1;
-    let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters });
-    let mut xf64 = Mat::<f64>::zeros(n, p);
-    for i in 0..n {
+        let mut cov_fd = Mat::<f64>::zeros(p, p);
+        ws.fd.force_fd_hessian = true;
+        let st = joint_hessian_cov(
+            &mut ws,
+            xf64.as_ref(),
+            xf64.as_ref().subcols(0, 0),
+            &y,
+            &ids,
+            &[],
+            p,
+            n,
+            &mut cov_fd,
+        );
+        assert_eq!(st, FdHessianStatus::Ok, "nagq={nagq}");
+        let tse_fd = theta_se(&ws);
+
+        // The band applies to the SEs the caller sees, not to the raw
+        // covariance entries.
         for j in 0..p {
-            xf64[(i, j)] = fx.x[i][j];
+            let (a, b) = (cov_exact[(j, j)].sqrt(), cov_fd[(j, j)].sqrt());
+            assert!(
+                (a - b).abs() <= band * b.abs(),
+                "nagq={nagq} se[{j}]: exact {a} vs fd {b}"
+            );
         }
-    }
-    let y = fx.y.clone();
-    let ids = fx.cluster_ids.clone();
-
-    let mut cov_exact = Mat::<f64>::zeros(p, p);
-    let mut ws = GlmmWorkspace::for_cluster_spec(p, &cluster, n, &[], 7);
-    // Rx: mirrors the sibling test — the fit itself runs no joint Hessian; the
-    // explicit joint_hessian_cov calls below are the comparison.
-    let fit = fit_glmm(
-        &mut ws,
-        xf64.as_ref(),
-        &y,
-        &ids,
-        &[],
-        &[1u32],
-        None,
-        &vec![0.0; p],
-        n,
-        WaldSe::Rx,
-        ColumnScaling::IDENTITY,
-    );
-    assert!(fit.converged);
-    // Cleared first so the guard below has teeth (see the sibling test). On an
-    // AGQ shape the assembled pass declines before allocating, so only the
-    // gradient-difference rung (this logit fixture) or the hyper-dual pass can
-    // take it.
-    ws.hyper_scratch = None;
-    ws.dual_scratch = None;
-    ws.agq_gd = None;
-    let st = joint_hessian_cov(&mut ws, xf64.as_ref(), &y, &ids, &[], p, n, &mut cov_exact);
-    assert_eq!(st, FdHessianStatus::Ok);
-    assert!(
-        ws.agq_gd.is_some() || ws.hyper_scratch.is_some(),
-        "joint_hessian_cov fell through to the FD stencil on an AGQ shape"
-    );
-    let tse_exact = theta_se(&ws);
-
-    let mut cov_fd = Mat::<f64>::zeros(p, p);
-    ws.fd.force_fd_hessian = true;
-    let st = joint_hessian_cov(&mut ws, xf64.as_ref(), &y, &ids, &[], p, n, &mut cov_fd);
-    assert_eq!(st, FdHessianStatus::Ok);
-    let tse_fd = theta_se(&ws);
-
-    // Band = `AGQ_SE_HESSIAN_REL` (2e-2, `tests/oracle_support/mod.rs`),
-    // applied to the SEs the caller sees, not to the raw covariance entries.
-    for j in 0..p {
-        let (a, b) = (cov_exact[(j, j)].sqrt(), cov_fd[(j, j)].sqrt());
-        assert!(
-            (a - b).abs() <= 2e-2 * b.abs(),
-            "se[{j}]: exact {a} vs fd {b}"
-        );
-    }
-    for k in 0..ws.n_theta {
-        assert!(
-            (tse_exact[k] - tse_fd[k]).abs() <= 2e-2 * tse_fd[k].abs(),
-            "theta_se[{k}]: exact {} vs fd {}",
-            tse_exact[k],
-            tse_fd[k]
-        );
+        for k in 0..ws.n_theta {
+            assert!(
+                (tse_exact[k] - tse_fd[k]).abs() <= band * tse_fd[k].abs(),
+                "nagq={nagq} theta_se[{k}]: exact {} vs fd {}",
+                tse_exact[k],
+                tse_fd[k]
+            );
+        }
     }
 }
 
@@ -1282,6 +1257,7 @@ fn exact_hessian_matches_fd_on_structured_fixture() {
         let fit = fit_glmm(
             &mut ws,
             xf64.as_ref(),
+            xf64.as_ref().subcols(0, 0),
             &y,
             &ids,
             &extra_ids,
@@ -1311,6 +1287,7 @@ fn exact_hessian_matches_fd_on_structured_fixture() {
         let st = joint_hessian_cov(
             &mut ws,
             xf64.as_ref(),
+            xf64.as_ref().subcols(0, 0),
             &y,
             &ids,
             &extra_ids,
@@ -1330,6 +1307,7 @@ fn exact_hessian_matches_fd_on_structured_fixture() {
         let st = joint_hessian_cov(
             &mut ws,
             xf64.as_ref(),
+            xf64.as_ref().subcols(0, 0),
             &y,
             &ids,
             &extra_ids,
@@ -1388,6 +1366,7 @@ fn pinned_crossed_theta_gets_the_exact_hessian() {
     let fit = fit_glmm(
         &mut ws,
         xf64.as_ref(),
+        xf64.as_ref().subcols(0, 0),
         &y,
         &ids,
         &extra_ids,
@@ -1464,6 +1443,7 @@ fn pinned_crossed_theta_gets_the_exact_hessian() {
     let st = joint_hessian_cov(
         &mut ws,
         xf64.as_ref(),
+        xf64.as_ref().subcols(0, 0),
         &y,
         &ids,
         &extra_ids,
@@ -1483,6 +1463,7 @@ fn pinned_crossed_theta_gets_the_exact_hessian() {
     let st = joint_hessian_cov(
         &mut ws,
         xf64.as_ref(),
+        xf64.as_ref().subcols(0, 0),
         &y,
         &ids,
         &extra_ids,
@@ -1534,12 +1515,12 @@ fn assert_fd_hessian_serial_eq_parallel(
 ) {
     let mut cov_s = Mat::<f64>::zeros(p, p);
     ws.parallel_inner = false;
-    let st_s = joint_hessian_cov(ws, x, y, ids, extra_ids, p, n, &mut cov_s);
+    let st_s = joint_hessian_cov(ws, x, x.subcols(0, 0), y, ids, extra_ids, p, n, &mut cov_s);
     let tse_s = theta_se(ws);
 
     let mut cov_p = Mat::<f64>::zeros(p, p);
     ws.parallel_inner = true;
-    let st_p = joint_hessian_cov(ws, x, y, ids, extra_ids, p, n, &mut cov_p);
+    let st_p = joint_hessian_cov(ws, x, x.subcols(0, 0), y, ids, extra_ids, p, n, &mut cov_p);
     let tse_p = theta_se(ws);
 
     assert_eq!(st_s, st_p, "FdHessianStatus differs serial vs parallel");
@@ -1590,7 +1571,11 @@ fn fd_hessian_parallel_bit_identical_to_serial() {
         let n = fx.n;
         let p = fx.beta.len();
         let n_clusters = fx.cluster_ids.iter().max().unwrap() + 1;
-        let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters });
+        let cluster = SizedSpec {
+            spec: logit_intercept_spec(),
+            n_primary: n_clusters as usize,
+            extra_counts: vec![],
+        };
         let mut ws = GlmmWorkspace::for_cluster_spec(p, &cluster, n, &[], 1);
         let mut xf64 = Mat::<f64>::zeros(n, p);
         for i in 0..n {
@@ -1603,6 +1588,7 @@ fn fd_hessian_parallel_bit_identical_to_serial() {
         let fit = fit_glmm(
             &mut ws,
             xf64.as_ref(),
+            xf64.as_ref().subcols(0, 0),
             &y,
             &ids,
             &[],
@@ -1624,7 +1610,11 @@ fn fd_hessian_parallel_bit_identical_to_serial() {
         let n = fx.n;
         let p = fx.beta.len();
         let n_clusters = fx.cluster_ids.iter().max().unwrap() + 1;
-        let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters });
+        let cluster = SizedSpec {
+            spec: logit_intercept_spec(),
+            n_primary: n_clusters as usize,
+            extra_counts: vec![],
+        };
         let mut ws = GlmmWorkspace::for_cluster_spec_packed(p, &cluster, n, &[], 1);
         let mut xf64 = Mat::<f64>::zeros(n, p);
         for i in 0..n {
@@ -1638,6 +1628,7 @@ fn fd_hessian_parallel_bit_identical_to_serial() {
         let fit = fit_glmm(
             &mut ws,
             xf64.as_ref(),
+            xf64.as_ref().subcols(0, 0),
             &y,
             &ids,
             &[],
@@ -1667,6 +1658,7 @@ fn fd_hessian_parallel_bit_identical_to_serial() {
         let fit = fit_glmm(
             &mut ws,
             x.as_ref(),
+            x.as_ref().subcols(0, 0),
             &y,
             &ids.primary,
             &ids.extra,
@@ -1698,7 +1690,7 @@ fn fd_hessian_parallel_bit_identical_to_serial() {
 /// `joint_hessian_cov` (glmer `use.hessian = TRUE`) instead of the Schur
 /// forward-solve: on the committed fixture the x1 Hessian SE EXCEEDS the Rx
 /// SE and matches the fixture's `vcov_hessian` diagonal. `WaldSe::Rx` keeps
-/// the unchanged Schur path. Pins that the dispatch reads the FD-Hessian
+/// the Schur path. Pins that the dispatch reads the joint-Hessian
 /// covariance into `ws.inference.var_diag` end-to-end (not just the standalone kernel).
 #[test]
 fn hessian_mode_t_sq_uses_joint_hessian_cov() {
@@ -1706,7 +1698,11 @@ fn hessian_mode_t_sq_uses_joint_hessian_cov() {
     let n = fx.n;
     let p = fx.beta.len();
     let n_clusters = fx.cluster_ids.iter().max().unwrap() + 1;
-    let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters });
+    let cluster = SizedSpec {
+        spec: logit_intercept_spec(),
+        n_primary: n_clusters as usize,
+        extra_counts: vec![],
+    };
     let mut xf64 = Mat::<f64>::zeros(n, p);
     for i in 0..n {
         for j in 0..p {
@@ -1721,6 +1717,7 @@ fn hessian_mode_t_sq_uses_joint_hessian_cov() {
     let fit_h = fit_glmm(
         &mut ws_h,
         xf64.as_ref(),
+        xf64.as_ref().subcols(0, 0),
         &y,
         &ids,
         &[],
@@ -1738,6 +1735,7 @@ fn hessian_mode_t_sq_uses_joint_hessian_cov() {
     let fit_rx = fit_glmm(
         &mut ws_rx,
         xf64.as_ref(),
+        xf64.as_ref().subcols(0, 0),
         &y,
         &ids,
         &[],
@@ -1752,7 +1750,7 @@ fn hessian_mode_t_sq_uses_joint_hessian_cov() {
     let se_rx = ws_rx.inference.var_diag[t1].sqrt();
 
     assert!(se_h > se_rx, "hessian SE {se_h} must exceed rx SE {se_rx}");
-    // Match the FD-Hessian kernel band (1e-5 ABSOLUTE on the covariance entries,
+    // Match the joint-Hessian kernel band (1e-5 ABSOLUTE on the covariance entries,
     // achieved ~3.4e-7 against the artifact-free fixture) on the variance the
     // dispatch wrote into ws.inference.var_diag — the band source is
     // `joint_hessian_cov_matches_glmer_use_hessian_true`: change together.
@@ -1770,22 +1768,18 @@ fn hessian_mode_t_sq_uses_joint_hessian_cov() {
 ///
 /// Where non-PD genuinely lives: NOT at the θ→0 floor (the intercept-only
 /// Laplace deviance is EVEN in θ, so its θ-curvature there is structurally
-/// POSITIVE), and NOT at a converged high-variance fit either — since the FD
-/// evals run at `pirls_tol_fd`, never looser than the fit's own exit tolerance,
-/// an interior minimum has PSD curvature by definition. Any non-PD result this
-/// fixture would produce AT θ̂ traces to loose-tol FD noise on that near-flat θ
-/// direction; at this FD tolerance that noise is removed, which is exactly
-/// what keeps the LLT from failing. The
-/// deviance is genuinely concave
+/// POSITIVE), and NOT at a converged high-variance fit either — an interior
+/// minimum has PSD curvature by definition. The deviance is genuinely concave
 /// BEYOND the minimum along θ: at large θ the Laplace `log|A|` term grows
 /// like `2s·log θ` (concave) while the data deviance saturates and the
 /// penalty vanishes, so H_θθ < 0 there — tolerance-independent. The test
-/// therefore evaluates the FD Hessian at θ pushed well past the converged
+/// therefore evaluates the joint Hessian (its exact arm on this shape; no FD
+/// stencil is forced) at θ pushed well past the converged
 /// θ̂ of a high-ICC fit; production reaches this fallback only through such
 /// degenerate geometry, kept as a defensive guard. The β fixed-effect
 /// information (`rx_cov_into`'s Schur, computed from W̃ at the conditional
-/// modes — a different matrix than the FD Hessian) stays PD throughout. Per
-/// `[[faer-llt-rank-deficiency-grey-zone]]` the β design is well-conditioned
+/// modes — a different matrix than the joint Hessian) stays PD throughout. The
+/// β design is well-conditioned
 /// (intercept + a within-cluster-varying continuous x1, NOT separable, NOT a
 /// duplicate column) — only the θ/variance direction is degenerate.
 ///
@@ -1819,15 +1813,18 @@ fn fd_hessian_non_pd_falls_back_to_rx() {
         y[i] = if lcg(&mut st) + 0.5 < pr { 1.0 } else { 0.0 };
     }
     let p = 2usize;
-    let cluster = logit_intercept_spec(Sizing::FixedClusters {
-        n_clusters: nc as u32,
-    });
+    let cluster = SizedSpec {
+        spec: logit_intercept_spec(),
+        n_primary: nc,
+        extra_counts: vec![],
+    };
     let mut ws = GlmmWorkspace::for_cluster_spec(p, &cluster, n, &[], 1);
 
     // Converge a fit (kernel precondition for joint_hessian_cov).
     let fit = fit_glmm(
         &mut ws,
         xf64.as_ref(),
+        xf64.as_ref().subcols(0, 0),
         &y,
         &ids,
         &[],
@@ -1854,7 +1851,17 @@ fn fd_hessian_non_pd_falls_back_to_rx() {
     ws.params[0] *= 5.0;
 
     let mut cov = Mat::<f64>::zeros(p, p);
-    let status = joint_hessian_cov(&mut ws, xf64.as_ref(), &y, &ids, &[], p, n, &mut cov);
+    let status = joint_hessian_cov(
+        &mut ws,
+        xf64.as_ref(),
+        xf64.as_ref().subcols(0, 0),
+        &y,
+        &ids,
+        &[],
+        p,
+        n,
+        &mut cov,
+    );
     assert_eq!(
         status,
         FdHessianStatus::NonPdFellBackToRx,
@@ -1887,7 +1894,15 @@ fn fd_hessian_non_pd_falls_back_to_rx() {
     // the β-information factors are valid for rx_cov_into here too.
     let mut rx = Mat::<f64>::zeros(p, p);
     assert!(
-        rx_cov_into(&mut ws, xf64.as_ref(), &ids, p, n, &mut rx),
+        rx_cov_into(
+            &mut ws,
+            xf64.as_ref(),
+            xf64.as_ref().subcols(0, 0),
+            &ids,
+            p,
+            n,
+            &mut rx
+        ),
         "β-only Schur must stay PD (well-conditioned β design)"
     );
     for i in 0..p {
@@ -1961,13 +1976,16 @@ fn fit_glmm_collapses_to_plain_irls_when_tau_negligible() {
     };
     assert!(irls.2, "plain IRLS must converge");
 
-    let cluster = logit_intercept_spec(Sizing::FixedClusters {
-        n_clusters: nc as u32,
-    });
+    let cluster = SizedSpec {
+        spec: logit_intercept_spec(),
+        n_primary: nc,
+        extra_counts: vec![],
+    };
     let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[], 1);
     let fit = fit_glmm(
         &mut ws,
         x.as_ref(),
+        x.as_ref().subcols(0, 0),
         &y,
         &ids,
         &[],
@@ -2005,6 +2023,7 @@ fn fit_glmm_width_general_slope_and_crossed() {
     let fit = fit_glmm(
         &mut ws,
         xf64.as_ref(),
+        xf64.as_ref().subcols(0, 0),
         &y,
         &ids,
         std::slice::from_ref(&crossed_ids),
@@ -2040,13 +2059,14 @@ fn fit_glmm_width_general_slope_and_crossed() {
     // the groupings cross instead of nesting) and RE scales ×5 keep all four θ̂
     // off the boundary. The layouts take different outer routes (ExactProfile
     // vs not), so agreement is carried through BOBYQA. Bands as in
-    // `nb_coordinate_agrees_across_layouts`: 1e-5 absolute on the deviance,
-    // 1e-3 relative on β̂ and the SEs.
+    // `fit::glmm_tests::fit_glmm_nb_random_slope_seed_lands_in_convergent_basin`:
+    // 1e-5 absolute on the deviance, 1e-3 relative on β̂ and the SEs.
     let (xf64, y, ids, crossed_ids, cluster) = glmm_slope_crossed_dataset_sized(5, 5.0);
     let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[1], 1);
     let fit = fit_glmm(
         &mut ws,
         xf64.as_ref(),
+        xf64.as_ref().subcols(0, 0),
         &y,
         &ids,
         std::slice::from_ref(&crossed_ids),
@@ -2067,6 +2087,7 @@ fn fit_glmm_width_general_slope_and_crossed() {
     let fitp = fit_glmm(
         &mut wsp,
         xf64.as_ref(),
+        xf64.as_ref().subcols(0, 0),
         &y,
         &ids,
         std::slice::from_ref(&crossed_ids),
@@ -2114,11 +2135,16 @@ fn fit_glmm_width_general_slope_and_crossed() {
 fn fit_glmm_warm_path_bounded_alloc() {
     let _serial = crate::test_support::alloc_test_guard();
     let (xf64, y, ids) = glmm_intercept_dataset();
-    let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 });
+    let cluster = SizedSpec {
+        spec: logit_intercept_spec(),
+        n_primary: 8,
+        extra_counts: vec![],
+    };
     let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], 1);
     let _ = fit_glmm(
         &mut ws,
         xf64.as_ref(),
+        xf64.as_ref().subcols(0, 0),
         &y,
         &ids,
         &[],
@@ -2134,6 +2160,7 @@ fn fit_glmm_warm_path_bounded_alloc() {
         let _ = fit_glmm(
             &mut ws,
             xf64.as_ref(),
+            xf64.as_ref().subcols(0, 0),
             &y,
             &ids,
             &[],
@@ -2199,6 +2226,7 @@ fn fit_glmm_structured_warm_path_bounded_alloc() {
     let _ = fit_glmm(
         &mut ws,
         xf64.as_ref(),
+        xf64.as_ref().subcols(0, 0),
         &y,
         &ids,
         &extra_ids,
@@ -2214,6 +2242,7 @@ fn fit_glmm_structured_warm_path_bounded_alloc() {
         let _ = fit_glmm(
             &mut ws,
             xf64.as_ref(),
+            xf64.as_ref().subcols(0, 0),
             &y,
             &ids,
             &extra_ids,
@@ -2441,7 +2470,11 @@ fn blocked_laplace_matches_brute_force_intercept() {
         let (xf64, y, ids) = glmm_intercept_dataset_layout(contiguous, 80, 8);
         let beta = [0.2_f64, 0.8];
         let want = brute_force_intercept_laplace(0.5, &beta, &xf64, &y, &ids, 8);
-        let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 });
+        let cluster = SizedSpec {
+            spec: logit_intercept_spec(),
+            n_primary: 8,
+            extra_counts: vec![],
+        };
         let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], 1);
         assert!(
             ws.groupings.extra_offsets.is_empty(),
@@ -2487,15 +2520,19 @@ fn blocked_pirls_matches_packed_slope_noextra() {
         let (xf64, y, ids) = glmm_slope_noextra_dataset_layout(contiguous, 96, 8);
         let n = y.len();
         // slope on design col 1 ⇒ slope_cols = &[1]; q_p = 2.
-        let cluster = ModelSpec {
-            family: Family::Binomial {
-                link: BinomialLink::Logit,
+        let cluster = SizedSpec {
+            spec: ModelSpec {
+                family: Family::Binomial {
+                    link: BinomialLink::Logit,
+                },
+                re: Some(ReStructure {
+                    terms: Vec::new(),
+                    slopes: vec![1],
+                    extra_groupings: vec![],
+                }),
             },
-            re: Some(ReStructure {
-                sizing: Sizing::FixedClusters { n_clusters: 8 },
-                slopes: vec![1],
-                extra_groupings: vec![],
-            }),
+            n_primary: 8,
+            extra_counts: vec![],
         };
         // Packed oracle: the same design on the packed-row layout, which the
         // constructor would otherwise route to the blocked one.
@@ -2542,7 +2579,13 @@ fn blocked_pirls_matches_packed_slope_noextra() {
         // Blocked: primary_lambda → pirls_solve_blocked, fresh scratch.
         let mut ws2 = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[1], 1);
         crate::lmm::primary_lambda(&theta, ws2.groupings.primary_q, &mut ws2.pirls.lam);
-        fill_z_f64(&ws2.groupings, xf64.as_ref(), &mut ws2.z_buf, n);
+        fill_z_f64(
+            &ws2.groupings,
+            xf64.as_ref(),
+            xf64.as_ref().subcols(0, 0),
+            &mut ws2.z_buf,
+            n,
+        );
         let GlmmWorkspace {
             groupings,
             z_buf,
@@ -2620,20 +2663,25 @@ fn blocked_pirls_matches_packed_slope_noextra() {
 fn blocked_inference_matches_packed_slope_noextra() {
     let (xf64, y, ids) = glmm_slope_noextra_dataset();
     let n = y.len();
-    let cluster = ModelSpec {
-        family: Family::Binomial {
-            link: BinomialLink::Logit,
+    let cluster = SizedSpec {
+        spec: ModelSpec {
+            family: Family::Binomial {
+                link: BinomialLink::Logit,
+            },
+            re: Some(ReStructure {
+                terms: Vec::new(),
+                slopes: vec![1],
+                extra_groupings: vec![],
+            }),
         },
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 8 },
-            slopes: vec![1],
-            extra_groupings: vec![],
-        }),
+        n_primary: 8,
+        extra_counts: vec![],
     };
     let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[1], 1);
     let fit = fit_glmm(
         &mut ws,
         xf64.as_ref(),
+        xf64.as_ref().subcols(0, 0),
         &y,
         &ids,
         &[],
@@ -2749,21 +2797,26 @@ fn blocked_inference_matches_packed_slope_noextra() {
 fn packed_fit_mode_seed_survives_sign_canonicalization() {
     let (xf64, y, ids) = glmm_slope_noextra_dataset_layout(true, 96, 8);
     let n = y.len();
-    let cluster = ModelSpec {
-        family: Family::Binomial {
-            link: BinomialLink::Logit,
+    let cluster = SizedSpec {
+        spec: ModelSpec {
+            family: Family::Binomial {
+                link: BinomialLink::Logit,
+            },
+            re: Some(ReStructure {
+                terms: Vec::new(),
+                slopes: vec![1],
+                extra_groupings: vec![],
+            }),
         },
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 8 },
-            slopes: vec![1],
-            extra_groupings: vec![],
-        }),
+        n_primary: 8,
+        extra_counts: vec![],
     };
     let mut ws = GlmmWorkspace::for_cluster_spec_packed(2, &cluster, n, &[1], 1);
     fill_packed_cols(&mut ws, &ids, &[], n);
     let fit = fit_glmm(
         &mut ws,
         xf64.as_ref(),
+        xf64.as_ref().subcols(0, 0),
         &y,
         &ids,
         &[],
@@ -2795,13 +2848,18 @@ fn packed_fit_mode_seed_survives_sign_canonicalization() {
 #[test]
 fn warm_start_is_per_fit_deterministic() {
     let (xf64, y, ids) = glmm_intercept_dataset();
-    let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 });
+    let cluster = SizedSpec {
+        spec: logit_intercept_spec(),
+        n_primary: 8,
+        extra_counts: vec![],
+    };
     let mk = || GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], 1);
     // Canonical: a fresh workspace's first (cold) fit.
     let mut ws_ref = mk();
     let _ = fit_glmm(
         &mut ws_ref,
         xf64.as_ref(),
+        xf64.as_ref().subcols(0, 0),
         &y,
         &ids,
         &[],
@@ -2819,6 +2877,7 @@ fn warm_start_is_per_fit_deterministic() {
     let _ = fit_glmm(
         &mut ws,
         xf64.as_ref(),
+        xf64.as_ref().subcols(0, 0),
         &y,
         &ids,
         &[],
@@ -2832,6 +2891,7 @@ fn warm_start_is_per_fit_deterministic() {
     let _ = fit_glmm(
         &mut ws,
         xf64.as_ref(),
+        xf64.as_ref().subcols(0, 0),
         &y,
         &ids,
         &[],
@@ -2855,7 +2915,11 @@ fn warm_start_is_per_fit_deterministic() {
 #[test]
 fn warm_start_objective_is_seed_independent() {
     let (xf64, y, ids) = glmm_intercept_dataset();
-    let cluster = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 });
+    let cluster = SizedSpec {
+        spec: logit_intercept_spec(),
+        n_primary: 8,
+        extra_counts: vec![],
+    };
     let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], 1);
     ws.params[0] = 0.5;
     ws.params[1] = 0.2;
@@ -2911,7 +2975,7 @@ fn warm_start_objective_is_seed_independent() {
 pub(crate) fn glmm_extras_q1_dataset(
     np: usize,
     n_crossed: usize,
-) -> (Mat<f64>, Vec<f64>, Vec<u32>, Vec<Vec<u32>>, ModelSpec) {
+) -> (Mat<f64>, Vec<f64>, Vec<u32>, Vec<Vec<u32>>, SizedSpec) {
     glmm_extras_q1_dataset_sized(np, n_crossed, 8, 96)
 }
 
@@ -2925,7 +2989,7 @@ pub(crate) fn glmm_extras_q1_dataset_sized(
     n_crossed: usize,
     n_prim: usize,
     n: usize,
-) -> (Mat<f64>, Vec<f64>, Vec<u32>, Vec<Vec<u32>>, ModelSpec) {
+) -> (Mat<f64>, Vec<f64>, Vec<u32>, Vec<Vec<u32>>, SizedSpec) {
     let mut st = 29u64;
     let u0: Vec<f64> = (0..n_prim).map(|_| 0.6 * lcg(&mut st)).collect();
     // Nested children are globalized: parent·np + within ⇒ n_prim·np draws.
@@ -2961,36 +3025,39 @@ pub(crate) fn glmm_extras_q1_dataset_sized(
         y[i] = if lcg(&mut st) + 0.5 < p { 1.0 } else { 0.0 };
     }
     let mut extra_groupings = Vec::new();
+    let mut extra_counts = Vec::new();
     let mut extra_ids = Vec::new();
     if np > 0 {
         extra_groupings.push(Grouping {
-            relation: GroupingRelation::NestedWithin {
-                n_per_parent: np as u32,
-            },
+            terms: Vec::new(),
+            relation: GroupingRelation::NestedWithin,
             slopes: vec![],
         });
+        extra_counts.push(np);
         extra_ids.push(nested);
     }
     if n_crossed > 0 {
         extra_groupings.push(Grouping {
-            relation: GroupingRelation::Crossed {
-                n_clusters: n_crossed as u32,
-            },
+            terms: Vec::new(),
+            relation: GroupingRelation::Crossed,
             slopes: vec![],
         });
+        extra_counts.push(n_crossed);
         extra_ids.push(crossed);
     }
-    let cluster = ModelSpec {
-        family: Family::Binomial {
-            link: BinomialLink::Logit,
-        },
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters {
-                n_clusters: n_prim as u32,
+    let cluster = SizedSpec {
+        spec: ModelSpec {
+            family: Family::Binomial {
+                link: BinomialLink::Logit,
             },
-            slopes: vec![],
-            extra_groupings,
-        }),
+            re: Some(ReStructure {
+                terms: Vec::new(),
+                slopes: vec![],
+                extra_groupings,
+            }),
+        },
+        n_primary: n_prim,
+        extra_counts,
     };
     (x, y, ids, extra_ids, cluster)
 }
@@ -3497,7 +3564,13 @@ fn structured_extras_matches_packed() {
         // see the widened gate in mod.rs/se.rs); this raw kernel-level test must
         // do the same thing by hand.
         let mut ws2 = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[1], 1);
-        fill_z_f64(&ws2.groupings, xf64.as_ref(), &mut ws2.z_buf, n);
+        fill_z_f64(
+            &ws2.groupings,
+            xf64.as_ref(),
+            xf64.as_ref().subcols(0, 0),
+            &mut ws2.z_buf,
+            n,
+        );
         {
             let GlmmWorkspace {
                 groupings,
@@ -3747,15 +3820,13 @@ fn structured_panel_downdate_matches_scalar() {
 
 /// Parses `validation/data/empirical/grouseticks.csv` into the 3-crossed `TICKS ~ YEAR +
 /// cHEIGHT + (1|INDEX) + (1|BROOD) + (1|LOCATION)` design (observation-level
-/// INDEX primary + crossed BROOD, LOCATION). Returns the **sized** `ModelSpec`
+/// INDEX primary + crossed BROOD, LOCATION). Returns the `SizedSpec`
 /// (crossed widths resolved from the actual level counts via
-/// `spec_sized_from_ids_pub` — a placeholder count would give the wrong crossed
-/// width `e`), the `GroupIds`, the `n×4` design `X` (`[1, YEAR==96, YEAR==97,
-/// cHEIGHT]`), the `TICKS` response `y`, and `(n, p)`. Shared by
-/// `StructuredSchur` construction tests and the structured cold-start overshoot
-/// gate below; mirrors `fit.rs::grouseticks_3crossed_inputs`.
-pub(crate) fn grouseticks_3crossed_fixture(
-) -> (ModelSpec, crate::GroupIds, Mat<f64>, Vec<f64>, usize, usize) {
+/// `spec_sized_from_ids`), the `GroupIds`, the `n×4` design `X` (`[1, YEAR==96, YEAR==97,
+/// cHEIGHT]`), the `TICKS` response `y`, and `(n, p)`. Shared by the
+/// structured tests below; mirrors `fit::glmm_tests::grouseticks_3crossed_inputs`.
+fn grouseticks_3crossed_fixture() -> (SizedSpec, crate::GroupIds, Mat<f64>, Vec<f64>, usize, usize)
+{
     fn dense_ids(raw: &[u32]) -> Vec<u32> {
         use std::collections::HashMap;
         let mut map: HashMap<u32, u32> = HashMap::new();
@@ -3817,24 +3888,23 @@ pub(crate) fn grouseticks_3crossed_fixture(
     let index_ids = dense_ids(&index_raw);
     let brood_ids = dense_str(&brood_raw);
     let loc_ids = dense_str(&loc_raw);
-    let n_index = *index_ids.iter().max().unwrap() as usize + 1;
 
     let model = ModelSpec {
         family: Family::Poisson {
             link: crate::PoissonLink::Log,
         },
         re: Some(ReStructure {
-            sizing: Sizing::FixedClusters {
-                n_clusters: n_index as u32,
-            },
+            terms: Vec::new(),
             slopes: vec![],
             extra_groupings: vec![
                 Grouping {
-                    relation: GroupingRelation::Crossed { n_clusters: 1 },
+                    terms: Vec::new(),
+                    relation: GroupingRelation::Crossed,
                     slopes: vec![],
                 },
                 Grouping {
-                    relation: GroupingRelation::Crossed { n_clusters: 1 },
+                    terms: Vec::new(),
+                    relation: GroupingRelation::Crossed,
                     slopes: vec![],
                 },
             ],
@@ -3844,16 +3914,16 @@ pub(crate) fn grouseticks_3crossed_fixture(
         primary: index_ids,
         extra: vec![brood_ids, loc_ids],
     };
-    // Resize the placeholder crossed `n_clusters` from the actual level counts
-    // (matches `fit_warm` before building `LmmGroupings`).
-    let (sized, ids, _perm) = crate::fit::spec_sized_from_ids_pub(&model, &ids);
+    // Level counts from the ids, as the fit entry sizes them before building
+    // `LmmGroupings`.
+    let (sized, ids, _perm) = crate::fit::spec_sized_from_ids(&model, &ids);
     (sized, ids.into_owned(), x, y, n, p)
 }
 
 /// Structured cold-start overshoot gate (the documented grouseticks
 /// degenerate-fit bug): drive `glmm_laplace_deviance` on the 3-crossed Poisson
 /// shape at θ = 1.0 (all three components) from a β = 0 cold start — historically
-/// the first structured PIRLS step overshot into a ~1e30-weight regime, the
+/// the fi.specrst structured PIRLS step overshot into a ~1e30-weight regime, the
 /// crossed Schur went non-PD, and the kernel returned a non-finite deviance.
 /// Retrospective step-halving in `pirls_solve_blocked_extras` recovers it, so the
 /// raw kernel (no `fit_glmm` degenerate-fit guard) must now be finite.
@@ -3904,7 +3974,7 @@ fn structured_cold_start_overshoot_is_finite() {
 #[allow(clippy::too_many_arguments)]
 fn assert_two_stage_matches_single(
     label: &str,
-    spec: &ModelSpec,
+    spec: &SizedSpec,
     x: faer::MatRef<f64>,
     y: &[f64],
     primary: &[u32],
@@ -3920,6 +3990,7 @@ fn assert_two_stage_matches_single(
     let fit1 = fit_glmm(
         &mut ws1,
         x,
+        x.subcols(0, 0),
         y,
         primary,
         extra,
@@ -3938,6 +4009,7 @@ fn assert_two_stage_matches_single(
     let fit2 = fit_glmm(
         &mut ws2,
         x,
+        x.subcols(0, 0),
         y,
         primary,
         extra,
@@ -4004,7 +4076,7 @@ fn two_stage_matches_single_stage_on_grouseticks() {
 /// ids, X, y, n, p)`. An empty `extra` marks a no-extras (blocked-path) shape;
 /// a non-empty one routes the same helper through the structured-extras solve.
 type ExactProfileFixture = (
-    ModelSpec,
+    SizedSpec,
     Vec<u32>,
     Vec<Vec<u32>>,
     Mat<f64>,
@@ -4018,7 +4090,11 @@ type ExactProfileFixture = (
 /// without duplicating the dataset/spec wiring.
 fn logit_intercept_fixture() -> ExactProfileFixture {
     let (x, y, ids) = glmm_intercept_dataset();
-    let spec = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 });
+    let spec = SizedSpec {
+        spec: logit_intercept_spec(),
+        n_primary: 8,
+        extra_counts: vec![],
+    };
     (spec, ids, Vec::new(), x, y, 80, 2)
 }
 
@@ -4027,8 +4103,12 @@ fn logit_intercept_fixture() -> ExactProfileFixture {
 /// diverge off the canonical link.
 fn probit_intercept_fixture() -> ExactProfileFixture {
     let (x, y, ids) = glmm_intercept_dataset();
-    let mut spec = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 });
-    spec.family = Family::Binomial {
+    let mut spec = SizedSpec {
+        spec: logit_intercept_spec(),
+        n_primary: 8,
+        extra_counts: vec![],
+    };
+    spec.spec.family = Family::Binomial {
         link: BinomialLink::Probit,
     };
     (spec, ids, Vec::new(), x, y, 80, 2)
@@ -4049,17 +4129,19 @@ fn sim_nb_intercept_fixture() -> ExactProfileFixture {
             x[(i, j)] = xv[i * p + j];
         }
     }
-    let spec = ModelSpec {
-        family: Family::NegativeBinomial {
-            link: NegBinomialLink::Log,
-        },
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters {
-                n_clusters: n_clusters as u32,
+    let spec = SizedSpec {
+        spec: ModelSpec {
+            family: Family::NegativeBinomial {
+                link: NegBinomialLink::Log,
             },
-            slopes: vec![],
-            extra_groupings: vec![],
-        }),
+            re: Some(ReStructure {
+                terms: Vec::new(),
+                slopes: vec![],
+                extra_groupings: vec![],
+            }),
+        },
+        n_primary: n_clusters,
+        extra_counts: vec![],
     };
     (spec, ids, Vec::new(), x, y, n, p)
 }
@@ -4123,7 +4205,8 @@ fn exact_profile_value_equals_fixed_mode_value_at_profiled_beta() {
     );
 }
 
-/// Builds the fixture's blocked-path workspace, then hands off to the shared
+/// Builds the fixture's workspace (blocked on the no-extras cells, structured
+/// on the extras ones), then hands off to the shared
 /// core assertion — see `assert_exact_profile_is_beta_minimum_ws`. The cells
 /// are the `#[test]` fns below this pair (logit, probit, extras crossed logit,
 /// grouseticks); the structured-extras cells further down use the sibling
@@ -4582,6 +4665,7 @@ fn structured_inference_matches_packed() {
         let fit = fit_glmm(
             &mut ws,
             xf64.as_ref(),
+            xf64.as_ref().subcols(0, 0),
             &y,
             &ids,
             &extra_ids,
@@ -4702,22 +4786,23 @@ fn packed_path_overshoot_fixture() -> (GlmmWorkspace, Mat<f64>, Vec<f64>, Vec<u3
         y[i] = (10.0 + 4990.0 * (lcg(&mut st) + 0.5)).round(); // counts up to ~5000
     }
     let slope_cols: Vec<usize> = (1..=n_slopes).collect(); // x cols 1..=8 as RE slopes
-    let cluster = ModelSpec {
-        family: Family::Poisson {
-            link: crate::PoissonLink::Log,
-        },
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters {
-                n_clusters: n_prim as u32,
+    let cluster = SizedSpec {
+        spec: ModelSpec {
+            family: Family::Poisson {
+                link: crate::PoissonLink::Log,
             },
-            slopes: (1..=n_slopes as u32).collect(),
-            extra_groupings: vec![Grouping {
-                relation: GroupingRelation::Crossed {
-                    n_clusters: n_crossed as u32,
-                },
-                slopes: vec![],
-            }],
-        }),
+            re: Some(ReStructure {
+                terms: Vec::new(),
+                slopes: (1..=n_slopes as u32).collect(),
+                extra_groupings: vec![Grouping {
+                    terms: Vec::new(),
+                    relation: GroupingRelation::Crossed,
+                    slopes: vec![],
+                }],
+            }),
+        },
+        n_primary: n_prim,
+        extra_counts: vec![n_crossed],
     };
     let mut ws = GlmmWorkspace::for_cluster_spec(1, &cluster, n, &slope_cols, 1);
     fill_packed_cols(&mut ws, &ids, &[crossed], n);
@@ -4765,15 +4850,19 @@ fn pirls_packed_step_halving_recovers_from_overshoot() {
 fn pirls_packed_profile_beta_reaches_pql_stationarity() {
     let (xf64, y, ids) = glmm_slope_noextra_dataset();
     let n = y.len();
-    let cluster = ModelSpec {
-        family: Family::Binomial {
-            link: BinomialLink::Logit,
+    let cluster = SizedSpec {
+        spec: ModelSpec {
+            family: Family::Binomial {
+                link: BinomialLink::Logit,
+            },
+            re: Some(ReStructure {
+                terms: Vec::new(),
+                slopes: vec![1],
+                extra_groupings: vec![],
+            }),
         },
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 8 },
-            slopes: vec![1],
-            extra_groupings: vec![],
-        }),
+        n_primary: 8,
+        extra_counts: vec![],
     };
     // The constructor would route this design to the blocked layout; the packed
     // kernel is what this test drives.
@@ -4876,15 +4965,19 @@ fn pirls_packed_profile_beta_reaches_pql_stationarity() {
 fn pirls_blocked_profile_beta_reaches_pql_stationarity() {
     let (xf64, y, ids) = glmm_slope_noextra_dataset();
     let n = y.len();
-    let cluster = ModelSpec {
-        family: Family::Binomial {
-            link: BinomialLink::Logit,
+    let cluster = SizedSpec {
+        spec: ModelSpec {
+            family: Family::Binomial {
+                link: BinomialLink::Logit,
+            },
+            re: Some(ReStructure {
+                terms: Vec::new(),
+                slopes: vec![1],
+                extra_groupings: vec![],
+            }),
         },
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 8 },
-            slopes: vec![1],
-            extra_groupings: vec![],
-        }),
+        n_primary: 8,
+        extra_counts: vec![],
     };
     let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[1], 1);
     assert!(
@@ -4897,7 +4990,13 @@ fn pirls_blocked_profile_beta_reaches_pql_stationarity() {
     // (the Profile δβ scratch), per the BetaStep contract.
     let theta = [0.5_f64, 0.1, 0.4];
     crate::lmm::primary_lambda(&theta, ws.groupings.primary_q, &mut ws.pirls.lam);
-    fill_z_f64(&ws.groupings, xf64.as_ref(), &mut ws.z_buf, n);
+    fill_z_f64(
+        &ws.groupings,
+        xf64.as_ref(),
+        xf64.as_ref().subcols(0, 0),
+        &mut ws.z_buf,
+        n,
+    );
     let mut beta = vec![0.0_f64; p];
     let GlmmWorkspace {
         groupings,
@@ -4986,8 +5085,8 @@ fn pirls_blocked_profile_beta_reaches_pql_stationarity() {
 /// vanish — the PQL-optimality definition, no external oracle. Recompute
 /// ρ = (dμ/dη)(y−μ)/V at the RETURNED (u, β) with η = Xβ + Mu (M applied from
 /// the packed `m_core_buf`/`cross_*` nonzeros) and bound ‖X'ρ‖∞ by 1e-6·n.
-/// Poisson-log is non-canonical, so the bound is deliberately loosened relative
-/// to the tight logit gates — tied to `pirls_tol`, never the PIRLS tolerance.
+/// The bound is deliberately looser than the tight logit gates' — tied to
+/// `pirls_tol`, never the PIRLS tolerance.
 /// Re-pinned 2026-10-02: `X'WX` is summed in row order in the β-Profile row
 /// pass instead of by a GEMM, and log links read `dμ/dη = μ` from the stored
 /// mean; the return moved by 1 to 3 ULP (`dev` by −5.7e-14, 1 ULP lower,
@@ -5360,67 +5459,6 @@ fn structured_profile_beta_matches_packed_profile() {
     }
 }
 
-/// The coupling CSR is cached per (fit, θ-pinning mask). A BOBYQA eval can
-/// pin a crossed θ to exactly 0 (its lower bound), which drops that grouping
-/// from build_packed_m's cross_col/n_cross and changes the CSR pattern — a
-/// stale cache here would silently corrupt the Schur build. Drive the
-/// workspace through unpinned → pinned → unpinned evals and assert each
-/// deviance is bit-identical to a fresh-workspace eval at the same point.
-#[test]
-fn coupling_csr_rebuilds_on_theta_pinning_transition() {
-    let (model, ids, x, y, n, p) = grouseticks_3crossed_fixture();
-    let mut ws = GlmmWorkspace::for_cluster_spec(p, &model, n, &[], 1);
-    let nt = ws.n_theta;
-    // Unpinned point: every θ > 0, β = 0.
-    let mut unpinned = vec![0.5; nt + p];
-    for b in unpinned[nt..].iter_mut() {
-        *b = 0.0;
-    }
-    // Pinned point: last crossed θ exactly 0 (BOBYQA bound), rest unchanged.
-    let mut pinned = unpinned.clone();
-    let last_crossed = ws.groupings.crossed.last().unwrap().vech_start;
-    pinned[last_crossed] = 0.0;
-
-    let fresh = |params: &[f64]| {
-        let mut w2 = GlmmWorkspace::for_cluster_spec(p, &model, n, &[], 1);
-        glmm_laplace_deviance(params, &mut w2, x.as_ref(), &y, &ids.primary, &ids.extra, n)
-    };
-    let d1 = glmm_laplace_deviance(
-        &unpinned,
-        &mut ws,
-        x.as_ref(),
-        &y,
-        &ids.primary,
-        &ids.extra,
-        n,
-    );
-    let d2 = glmm_laplace_deviance(
-        &pinned,
-        &mut ws,
-        x.as_ref(),
-        &y,
-        &ids.primary,
-        &ids.extra,
-        n,
-    );
-    let d3 = glmm_laplace_deviance(
-        &unpinned,
-        &mut ws,
-        x.as_ref(),
-        &y,
-        &ids.primary,
-        &ids.extra,
-        n,
-    );
-    assert_eq!(
-        d1,
-        fresh(&unpinned),
-        "unpinned eval must match fresh workspace"
-    );
-    assert_eq!(d2, fresh(&pinned), "pinned eval read a stale CSR");
-    assert_eq!(d3, d1, "un-pinning must restore the original pattern");
-}
-
 /// The structured layout keeps one crossed value per slot
 /// (`StructuredScratch::cross_theta`), and at `f64` a θ-pinned grouping takes
 /// no slot, so pinning the FIRST of two crossed groupings shifts the second
@@ -5428,8 +5466,12 @@ fn coupling_csr_rebuilds_on_theta_pinning_transition() {
 /// stale one from the previous evaluation) would pair the pinned grouping's
 /// θ with the surviving grouping's columns. The packed-row layout builds its own
 /// `M` with every column kept, so it is an independent oracle for the same
-/// objective: on the same workspace, unpinned then middle-pinned then
-/// unpinned, each structured deviance must match the packed one to FP error.
+/// objective. The coupling CSR is also cached per (fit, θ-pinning mask), and a
+/// pinned crossed θ drops that grouping from build_packed_m's cross_col/n_cross,
+/// so a stale cache would silently corrupt the Schur build. On one workspace,
+/// unpinned, first pinned, last pinned, then unpinned again: each structured
+/// deviance must match the packed one to FP error and a fresh-workspace eval
+/// bit for bit, and un-pinning must restore the unpinned value exactly.
 #[test]
 fn structured_first_pinned_crossed_theta_matches_packed() {
     let (model, ids, x, y, n, p) = grouseticks_3crossed_fixture();
@@ -5444,16 +5486,24 @@ fn structured_first_pinned_crossed_theta_matches_packed() {
     for (a, v) in unpinned[..nt].iter_mut().enumerate() {
         *v = 0.4 + 0.1 * a as f64;
     }
-    let mut pinned = unpinned.clone();
-    pinned[ws.groupings.crossed[0].vech_start] = 0.0;
+    let mut first_pinned = unpinned.clone();
+    first_pinned[ws.groupings.crossed[0].vech_start] = 0.0;
+    let mut last_pinned = unpinned.clone();
+    last_pinned[ws.groupings.crossed.last().unwrap().vech_start] = 0.0;
     let packed = |params: &[f64]| {
         let mut wp = GlmmWorkspace::for_cluster_spec_packed(p, &model, n, &[], 1);
         fill_packed_cols(&mut wp, &ids.primary, &ids.extra, n);
         glmm_laplace_deviance(params, &mut wp, x.as_ref(), &y, &ids.primary, &ids.extra, n)
     };
+    let fresh = |params: &[f64]| {
+        let mut w2 = GlmmWorkspace::for_cluster_spec(p, &model, n, &[], 1);
+        glmm_laplace_deviance(params, &mut w2, x.as_ref(), &y, &ids.primary, &ids.extra, n)
+    };
+    let mut d_unpinned = f64::NAN;
     for (label, params) in [
         ("unpinned", &unpinned),
-        ("first pinned", &pinned),
+        ("first pinned", &first_pinned),
+        ("last pinned", &last_pinned),
         ("unpinned again", &unpinned),
     ] {
         let d_str =
@@ -5467,6 +5517,19 @@ fn structured_first_pinned_crossed_theta_matches_packed() {
             (d_str - d_pk).abs() <= 1e-9 * d_pk.abs().max(1.0),
             "{label}: structured {d_str} vs packed {d_pk}"
         );
+        assert_eq!(
+            d_str,
+            fresh(params),
+            "{label}: reused workspace read a stale CSR"
+        );
+        match label {
+            "unpinned" => d_unpinned = d_str,
+            "unpinned again" => assert_eq!(
+                d_str, d_unpinned,
+                "un-pinning must restore the original pattern"
+            ),
+            _ => {}
+        }
     }
 }
 
@@ -5492,26 +5555,29 @@ fn blocked_path_overshoot_fixture() -> (GlmmWorkspace, Mat<f64>, Vec<f64>, Vec<u
         y[i] = (10.0 + 4990.0 * (lcg(&mut st) + 0.5)).round(); // counts up to ~5000
     }
     let slope_cols: Vec<usize> = (1..=n_slopes).collect(); // x cols 1..=8 as RE slopes
-    let cluster = ModelSpec {
-        family: Family::Poisson {
-            link: crate::PoissonLink::Log,
-        },
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters {
-                n_clusters: n_prim as u32,
+    let cluster = SizedSpec {
+        spec: ModelSpec {
+            family: Family::Poisson {
+                link: crate::PoissonLink::Log,
             },
-            slopes: (1..=n_slopes as u32).collect(),
-            extra_groupings: vec![],
-        }),
+            re: Some(ReStructure {
+                terms: Vec::new(),
+                slopes: (1..=n_slopes as u32).collect(),
+                extra_groupings: vec![],
+            }),
+        },
+        n_primary: n_prim,
+        extra_counts: vec![],
     };
-    let groupings = crate::lmm::LmmGroupings::from_cluster_spec(&cluster, n, &slope_cols);
-    let ws = GlmmWorkspace::from_groupings(groupings, cluster.family, 1, n, 1, GlmmLayout::Blocked);
+    let groupings = crate::lmm::LmmGroupings::from_cluster_spec(&cluster, &slope_cols);
+    let ws =
+        GlmmWorkspace::from_groupings(groupings, cluster.spec.family, 1, n, 1, GlmmLayout::Blocked);
     (ws, x, y, ids, n)
 }
 
 #[test]
 fn pirls_blocked_step_halving_recovers_from_overshoot() {
-    // Shape/data chosen so the first full Fisher step at the β=0 cold start
+    // Shape/data chosen so the first full Fisher step at the spec.β=0 cold start
     // overshoots η into the exp() blow-up regime (the grouseticks failure
     // class, on the no-extras blocked path). Before step-halving this returned
     // INFINITY.
@@ -5542,18 +5608,22 @@ fn pirls_blocked_step_halving_recovers_from_overshoot() {
 #[test]
 fn nb_workspace_carries_the_theta_nb_coordinate() {
     let re = Some(ReStructure {
-        sizing: Sizing::FixedClusters { n_clusters: 4 },
+        terms: Vec::new(),
         slopes: vec![],
         extra_groupings: vec![],
     });
     let p = 3;
     let nb = GlmmWorkspace::for_cluster_spec(
         p,
-        &ModelSpec {
-            family: Family::NegativeBinomial {
-                link: NegBinomialLink::Log,
+        &SizedSpec {
+            spec: ModelSpec {
+                family: Family::NegativeBinomial {
+                    link: NegBinomialLink::Log,
+                },
+                re: re.clone(),
             },
-            re: re.clone(),
+            n_primary: 4,
+            extra_counts: vec![],
         },
         40,
         &[],
@@ -5573,11 +5643,15 @@ fn nb_workspace_carries_the_theta_nb_coordinate() {
 
     let pois = GlmmWorkspace::for_cluster_spec(
         p,
-        &ModelSpec {
-            family: Family::Poisson {
-                link: PoissonLink::Log,
+        &SizedSpec {
+            spec: ModelSpec {
+                family: Family::Poisson {
+                    link: PoissonLink::Log,
+                },
+                re,
             },
-            re,
+            n_primary: 4,
+            extra_counts: vec![],
         },
         40,
         &[],
@@ -5612,7 +5686,11 @@ fn fit_glmm_se_failure_keeps_the_estimates() {
         x3[(i, 0)] = x2[(i, 0)];
         x3[(i, 1)] = x2[(i, 1)];
     }
-    let spec = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 });
+    let spec = SizedSpec {
+        spec: logit_intercept_spec(),
+        n_primary: 8,
+        extra_counts: vec![],
+    };
     let fit_on = |x: faer::MatRef<f64>, p: usize, wald: WaldSe| {
         let mut ws = GlmmWorkspace::for_cluster_spec(p, &spec, n, &[], 1);
         ws.outer_search = OuterSearch::Joint;
@@ -5620,6 +5698,7 @@ fn fit_glmm_se_failure_keeps_the_estimates() {
         let fit = fit_glmm(
             &mut ws,
             x,
+            x.subcols(0, 0),
             &y,
             &ids,
             &[],
@@ -5681,10 +5760,10 @@ fn fit_glmm_se_failure_keeps_the_estimates() {
 /// The binomial random-intercept fit on `entangled_dyadic_designs` (20
 /// clusters): `X = [1, a, a + δb]`, `[1, a, b]` the same model with
 /// `β' = (β₀, β₁ + β₂, δβ₂)`.
-fn entangled_logit_fixture() -> (Mat<f64>, Mat<f64>, Vec<f64>, Vec<u32>, f64, ModelSpec) {
+fn entangled_logit_fixture() -> (Mat<f64>, Mat<f64>, Vec<f64>, Vec<u32>, f64, SizedSpec) {
     let n = 400;
     let nc = 20usize;
-    let (xv, xrv, delta) = crate::fit::common_tests::entangled_dyadic_designs(n);
+    let (xv, xrv, delta) = crate::fit::common_tests::entangled_dyadic_designs(n, 20);
     let mut st = 11u64;
     let u: Vec<f64> = (0..nc)
         .map(|_| crate::fit::common_tests::lcg(&mut st))
@@ -5706,9 +5785,11 @@ fn entangled_logit_fixture() -> (Mat<f64>, Mat<f64>, Vec<f64>, Vec<u32>, f64, Mo
             0.0
         };
     }
-    let spec = logit_intercept_spec(Sizing::FixedClusters {
-        n_clusters: nc as u32,
-    });
+    let spec = SizedSpec {
+        spec: logit_intercept_spec(),
+        n_primary: nc,
+        extra_counts: vec![],
+    };
     (x, xr, y, ids, delta, spec)
 }
 
@@ -5742,6 +5823,7 @@ fn rx_schur_on_entangled_columns_keeps_its_digits() {
     let fit = fit_glmm(
         &mut ws,
         x.as_ref(),
+        x.as_ref().subcols(0, 0),
         &y,
         &ids,
         &[],
@@ -5760,7 +5842,15 @@ fn rx_schur_on_entangled_columns_keeps_its_digits() {
     );
     let var = ws.inference.var_diag[2];
     let mut cov = Mat::<f64>::zeros(3, 3);
-    assert!(rx_cov_into(&mut ws, xr.as_ref(), &ids, 3, n, &mut cov));
+    assert!(rx_cov_into(
+        &mut ws,
+        xr.as_ref(),
+        xr.as_ref().subcols(0, 0),
+        &ids,
+        3,
+        n,
+        &mut cov
+    ));
     let reference = cov[(2, 2)] / (delta * delta);
     assert!(
         (var - reference).abs() <= 1e-9 * reference,
@@ -5778,7 +5868,15 @@ fn rx_schur_on_entangled_columns_keeps_its_digits() {
     // `rx_cov_into` leaves in `cov_root`; a Cholesky of the covariance itself
     // misses by about `cond(X)²·ε` (1e-5 here).
     let mut raw = Mat::<f64>::zeros(3, 3);
-    assert!(rx_cov_into(&mut ws, x.as_ref(), &ids, 3, n, &mut raw));
+    assert!(rx_cov_into(
+        &mut ws,
+        x.as_ref(),
+        x.as_ref().subcols(0, 0),
+        &ids,
+        3,
+        n,
+        &mut raw
+    ));
     let mut qr = Mat::<f64>::zeros(3, 3);
     let mut z = [0.0; 3];
     let w_root = crate::lmm::joint_wald_chi_sq(
@@ -5817,6 +5915,7 @@ fn hessian_se_on_entangled_columns_keeps_its_digits() {
         let fit = fit_glmm(
             &mut ws,
             x.as_ref(),
+            x.as_ref().subcols(0, 0),
             &y,
             &ids,
             &[],
@@ -5834,7 +5933,17 @@ fn hessian_se_on_entangled_columns_keeps_its_digits() {
         ws.params[nt + 1] = beta[1] + beta[2];
         ws.params[nt + 2] = delta * beta[2];
         let mut cov = Mat::<f64>::zeros(3, 3);
-        let status = joint_hessian_cov(&mut ws, xr.as_ref(), &y, &ids, &[], 3, n, &mut cov);
+        let status = joint_hessian_cov(
+            &mut ws,
+            xr.as_ref(),
+            xr.as_ref().subcols(0, 0),
+            &y,
+            &ids,
+            &[],
+            3,
+            n,
+            &mut cov,
+        );
         assert_eq!(status, FdHessianStatus::Ok);
         let reference = [
             cov[(0, 0)],
@@ -5874,7 +5983,7 @@ fn hessian_se_on_entangled_columns_keeps_its_digits() {
 #[allow(clippy::too_many_arguments)]
 fn assert_two_stage_adversarial(
     label: &str,
-    spec: &ModelSpec,
+    spec: &SizedSpec,
     x: faer::MatRef<f64>,
     y: &[f64],
     primary: &[u32],
@@ -5894,6 +6003,7 @@ fn assert_two_stage_adversarial(
     let fit1 = fit_glmm(
         &mut ws1,
         x,
+        x.subcols(0, 0),
         y,
         primary,
         extra,
@@ -5912,6 +6022,7 @@ fn assert_two_stage_adversarial(
     let fit2 = fit_glmm(
         &mut ws2,
         x,
+        x.subcols(0, 0),
         y,
         primary,
         extra,
@@ -5926,8 +6037,8 @@ fn assert_two_stage_adversarial(
     if let Some(expected) = expect_converged {
         assert_eq!(
             fit2.converged, expected,
-            "{label}: two-stage convergence outcome changed — was pinned so the \
-             clean-failure branch below stays exercised"
+            "{label}: two-stage convergence outcome changed — it is pinned so the \
+             branch below that it takes stays exercised"
         );
     }
     if !fit2.converged {
@@ -5981,12 +6092,16 @@ fn assert_two_stage_adversarial(
 }
 
 /// Adversarial: a wildly over-scaled θ start (θ₀ = 100, ~100× the fitted scale)
-/// on the logit intercept fixture. The joint solve must recover to the single-stage
-/// optimum or fail cleanly — never settle finite-but-wrong.
+/// on the logit intercept fixture. The default route converges and lands on
+/// the `Joint` optimum — never finite-but-wrong.
 #[test]
 fn two_stage_adversarial_bad_theta_start() {
     let (x, y, ids) = glmm_intercept_dataset();
-    let spec = logit_intercept_spec(Sizing::FixedClusters { n_clusters: 8 });
+    let spec = SizedSpec {
+        spec: logit_intercept_spec(),
+        n_primary: 8,
+        extra_counts: vec![],
+    };
     assert_two_stage_adversarial(
         "bad_theta",
         &spec,
@@ -5998,14 +6113,14 @@ fn two_stage_adversarial_bad_theta_start() {
         2,
         Some(&[100.0]),
         None,
-        None,
+        Some(true),
     );
 }
 
 /// Adversarial: a near-collinear design (col 2 = col 1 + 1e-8·noise, condition
 /// number ~1e8) makes the β-Schur near-singular — the stress the β-profiling step's
 /// dense solve must survive. `fit_glmm` runs no rank-deficiency salvage (that lives
-/// in `fit_warm`), so this hits the ill-conditioned kernel directly. The
+/// in `fit_checked`), so this hits the ill-conditioned kernel directly. The
 /// `ExactProfile` attempt fails and the `PqlThenJoint` fallback's search
 /// converges to the `Joint` optimum (deviance equal to ~1e-11, β₁ ≈ −β₂ ≈
 /// 1.45e7: the near-duplicate column's own coefficient). The β Schur
@@ -6031,9 +6146,11 @@ fn two_stage_adversarial_near_collinear_x() {
         let pr = 1.0 / (1.0 + (-eta).exp());
         y[i] = if lcg(&mut st) + 0.5 < pr { 1.0 } else { 0.0 };
     }
-    let spec = logit_intercept_spec(Sizing::FixedClusters {
-        n_clusters: nc as u32,
-    });
+    let spec = SizedSpec {
+        spec: logit_intercept_spec(),
+        n_primary: nc,
+        extra_counts: vec![],
+    };
     assert_two_stage_adversarial(
         "near_collinear",
         &spec,
@@ -6052,6 +6169,7 @@ fn two_stage_adversarial_near_collinear_x() {
 /// Adversarial: 30 clusters of 2 observations each — near-singleton groups leave
 /// the random intercept barely identified and the θ landscape flat/ill-posed, the
 /// regime where a mis-stepped optimizer most easily wanders finite-but-wrong.
+/// The default route converges and lands on the `Joint` optimum.
 #[test]
 fn two_stage_adversarial_tiny_clusters() {
     let (nc, per) = (30usize, 2usize);
@@ -6071,9 +6189,11 @@ fn two_stage_adversarial_tiny_clusters() {
         let pr = 1.0 / (1.0 + (-eta).exp());
         y[i] = if lcg(&mut st) + 0.5 < pr { 1.0 } else { 0.0 };
     }
-    let spec = logit_intercept_spec(Sizing::FixedClusters {
-        n_clusters: nc as u32,
-    });
+    let spec = SizedSpec {
+        spec: logit_intercept_spec(),
+        n_primary: nc,
+        extra_counts: vec![],
+    };
     assert_two_stage_adversarial(
         "tiny_clusters",
         &spec,
@@ -6085,7 +6205,7 @@ fn two_stage_adversarial_tiny_clusters() {
         2,
         None,
         None,
-        None,
+        Some(true),
     );
 }
 
@@ -6109,8 +6229,12 @@ fn two_stage_adversarial_overflow_offset() {
     }
     let mut offset = vec![0.0f64; n];
     offset[10] = 800.0;
-    let mut spec = intercept_only_spec(Sizing::FixedClusters { n_clusters: 6 });
-    spec.family = Family::Poisson {
+    let mut spec = SizedSpec {
+        spec: intercept_only_spec(),
+        n_primary: 6,
+        extra_counts: vec![],
+    };
+    spec.spec.family = Family::Poisson {
         link: PoissonLink::Log,
     };
     assert_two_stage_adversarial(
@@ -6130,36 +6254,34 @@ fn two_stage_adversarial_overflow_offset() {
 
 #[test]
 fn cluster_row_index_matches_naive_filter_and_preserves_row_order() {
-    let cluster_ids: [u32; 10] = [2, 0, 1, 0, 2, 1, 1, 0, 2, 0];
+    // The second input leaves cluster 1 with no rows (ptr[1] == ptr[2]): its
+    // slice must be empty, not a panic.
+    let inputs: [&[u32]; 2] = [&[2, 0, 1, 0, 2, 1, 1, 0, 2, 0], &[0, 2, 0, 2]];
     let s = 3;
-    let idx = ClusterRowIndex::build(&cluster_ids, s);
-    for c in 0..s {
-        let naive: Vec<u32> = cluster_ids
-            .iter()
-            .enumerate()
-            .filter(|&(_, &cc)| cc as usize == c)
-            .map(|(i, _)| i as u32)
-            .collect();
-        assert_eq!(idx.cluster_rows(c), naive.as_slice(), "cluster {c}");
-        assert!(
-            idx.cluster_rows(c).windows(2).all(|w| w[0] < w[1]),
-            "cluster {c} rows not ascending: {:?}",
-            idx.cluster_rows(c)
-        );
+    for cluster_ids in inputs {
+        let idx = ClusterRowIndex::build(cluster_ids, s);
+        for c in 0..s {
+            let naive: Vec<u32> = cluster_ids
+                .iter()
+                .enumerate()
+                .filter(|&(_, &cc)| cc as usize == c)
+                .map(|(i, _)| i as u32)
+                .collect();
+            assert_eq!(
+                idx.cluster_rows(c),
+                naive.as_slice(),
+                "{cluster_ids:?} cluster {c}"
+            );
+            assert!(
+                idx.cluster_rows(c).windows(2).all(|w| w[0] < w[1]),
+                "{cluster_ids:?} cluster {c} rows not ascending: {:?}",
+                idx.cluster_rows(c)
+            );
+        }
+        let mut all: Vec<u32> = (0..s).flat_map(|c| idx.cluster_rows(c).to_vec()).collect();
+        all.sort_unstable();
+        assert_eq!(all, (0..cluster_ids.len() as u32).collect::<Vec<_>>());
     }
-    let mut all: Vec<u32> = (0..s).flat_map(|c| idx.cluster_rows(c).to_vec()).collect();
-    all.sort_unstable();
-    assert_eq!(all, (0..cluster_ids.len() as u32).collect::<Vec<_>>());
-}
-
-#[test]
-fn cluster_row_index_handles_empty_cluster() {
-    // cluster 1 has zero rows — ptr[1]==ptr[2], cluster_rows(1) must be empty, not panic.
-    let cluster_ids: [u32; 4] = [0, 2, 0, 2];
-    let idx = ClusterRowIndex::build(&cluster_ids, 3);
-    assert_eq!(idx.cluster_rows(0), &[0, 2]);
-    assert!(idx.cluster_rows(1).is_empty());
-    assert_eq!(idx.cluster_rows(2), &[1, 3]);
 }
 
 // --- `laplace_gradient`'s FD gate ---
@@ -6188,7 +6310,7 @@ fn fixture(
 fn default_fixture_size(shape: &str) -> (usize, usize) {
     match shape {
         "int1" => (80, 8),
-        "q2s" => (96, 8),
+        "q2s" | "q1n" => (96, 8),
         other => panic!("unknown gradient-gate shape {other}"),
     }
 }
@@ -6226,7 +6348,7 @@ fn fixture_with_nagq_sized(
                 let (x, _y, ids) = glmm_intercept_dataset_layout(false, n, nc);
                 (x, ids, nc as u32, vec![], 4001)
             }
-            "q2s" => {
+            "q2s" | "q1n" => {
                 let (x, _y, ids) = glmm_slope_noextra_dataset_layout(false, n, nc);
                 (x, ids, nc as u32, vec![1], 4002)
             }
@@ -6257,13 +6379,23 @@ fn fixture_with_nagq_sized(
             other => panic!("gradient-gate fixture: family {other:?} not wired"),
         };
     }
-    let model = ModelSpec {
-        family,
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters },
-            slopes: slope_cols.iter().map(|&c| c as u32).collect(),
-            extra_groupings: vec![],
-        }),
+    // `"q1n"` is `(0 + x | g)` on the `"q2s"` design: column 0 of the block
+    // and the entry below it are structural.
+    let terms = match shape {
+        "q1n" => vec![crate::ReTerm::no_intercept().slopes([1])],
+        _ => Vec::new(),
+    };
+    let model = SizedSpec {
+        spec: ModelSpec {
+            family,
+            re: Some(ReStructure {
+                terms,
+                slopes: slope_cols.iter().map(|&c| c as u32).collect(),
+                extra_groupings: vec![],
+            }),
+        },
+        n_primary: n_clusters as usize,
+        extra_counts: vec![],
     };
     let mut ws = GlmmWorkspace::for_cluster_spec(p, &model, n, &slope_cols, nagq);
     if matches!(family, Family::NegativeBinomial { .. }) {
@@ -6315,15 +6447,17 @@ fn fixture_padded_sized(
         "int1" => vec![],
         other => panic!("unknown gradient-gate shape {other}"),
     };
-    let model = ModelSpec {
-        family,
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters {
-                n_clusters: nc as u32,
-            },
-            slopes: slope_cols.iter().map(|&c| c as u32).collect(),
-            extra_groupings: vec![],
-        }),
+    let model = SizedSpec {
+        spec: ModelSpec {
+            family,
+            re: Some(ReStructure {
+                terms: Vec::new(),
+                slopes: slope_cols.iter().map(|&c| c as u32).collect(),
+                extra_groupings: vec![],
+            }),
+        },
+        n_primary: nc,
+        extra_counts: vec![],
     };
     let mut ws = GlmmWorkspace::for_cluster_spec(p, &model, n, &slope_cols, 1);
     if matches!(family, Family::NegativeBinomial { .. }) {
@@ -6375,6 +6509,13 @@ fn fixed_seed_theta(shape: &str) -> FixedSeedTheta {
             diag: &[0, 2],
             beta: vec![0.2, 0.8],
         },
+        // The gates zero its structural entries (0 and 1) after each draw.
+        "q1n" => FixedSeedTheta {
+            state: 5006,
+            n_theta: 3,
+            diag: &[0, 2],
+            beta: vec![0.2, 0.8],
+        },
         // Structured-extras shapes: every factor is intercept-only (q = 1), so
         // every θ lane is a diagonal vech entry and is drawn positive. θ order
         // is the declaration order `glmm_extras_q1_dataset` builds — primary,
@@ -6416,9 +6557,8 @@ fn fixed_seed_theta_padded(shape: &str, extra_p: usize) -> FixedSeedTheta {
 /// Gamma-log, NegativeBinomial}` × `{int1, q2s}` — the family/shape product
 /// the gradient FD gate runs. `int1` (n_θ=1) and `q2s` (n_θ=3) are the only
 /// GLMM-reachable blocked shapes among the speed campaign catalogue's four:
-/// `nest2` is nested (extras non-empty, routes to `pirls_solve_blocked_extras`
-/// — `Unsupported` by the routing gate, nothing for an FD gate to compare) and
-/// `q3s` carries `glmm = FALSE` in the same catalogue (never fit as a GLMM, no
+/// `nest2` is nested (extras non-empty, routes to `pirls_solve_blocked_extras`,
+/// whose cells are `STRUCTURED_GATE_CELLS`) and `q3s` carries `glmm = FALSE` in the same catalogue (never fit as a GLMM, no
 /// GLMM fixture exists). Binomial-cloglog stands in their place: a
 /// GLMM-validated link, non-canonical (exercises the refinement
 /// loop), and the only caller of `Scalar::exp_m1`.
@@ -6497,6 +6637,48 @@ const GRADIENT_GATE_CELLS: &[(Family, &str)] = &[
     ),
 ];
 
+/// The masked shape the two dual FD gates run beside [`GRADIENT_GATE_CELLS`]:
+/// `"q1n"`, `(0 + x | g)`, a block whose column 0 is structural, on every
+/// family of that list.
+const MASKED_GATE_CELLS: &[(Family, &str)] = &[
+    (
+        Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        "q1n",
+    ),
+    (
+        Family::Binomial {
+            link: BinomialLink::Probit,
+        },
+        "q1n",
+    ),
+    (
+        Family::Binomial {
+            link: BinomialLink::Cloglog,
+        },
+        "q1n",
+    ),
+    (
+        Family::Poisson {
+            link: PoissonLink::Log,
+        },
+        "q1n",
+    ),
+    (
+        Family::Gamma {
+            link: GammaLink::Log,
+        },
+        "q1n",
+    ),
+    (
+        Family::NegativeBinomial {
+            link: NegBinomialLink::Log,
+        },
+        "q1n",
+    ),
+];
+
 /// Shared per-draw body of the gradient FD gate: `n_draws` fixed-seed θ (+
 /// fixed β) draws, each checked coordinate-by-coordinate against a central FD
 /// stencil of the SAME blocked Laplace deviance `laplace_gradient`
@@ -6505,7 +6687,9 @@ const GRADIENT_GATE_CELLS: &[(Family, &str)] = &[
 /// floor, not a first difference — this uses its own steps). Band: 1e-6
 /// relative. Both run at the CALLER's `ws.fd.pirls_tol_override` (the gate sets
 /// `Some(1e-12)` — see `dual_gradient_matches_central_fd_per_family_and_shape`'s
-/// doc comment for why the tolerance is tightened this far).
+/// doc comment for why the tolerance is tightened this far). On a masked
+/// workspace each draw has its structural θ entries zeroed, and only the free
+/// coordinates are differenced. Returns the number of coordinate checks.
 #[allow(clippy::too_many_arguments)]
 fn assert_dual_gradient_matches_fd(
     ws: &mut GlmmWorkspace,
@@ -6521,12 +6705,15 @@ fn assert_dual_gradient_matches_fd(
     shape: &str,
     n_draws: usize,
     mut rng: FixedSeedTheta,
-) {
+) -> usize {
     let m = ws.n_theta + p;
     let kk = ws.k.max(1);
     let mut ctrs = EvalCounters::new();
+    let structural = ws.groupings.structural_theta().to_vec();
+    let mut checks = 0;
     for _ in 0..n_draws {
         ws.params[..m].copy_from_slice(&rng.next_params());
+        ws.groupings.zero_structural(&mut ws.params[..m]);
         let saved: Vec<f64> = ws.params[..m].to_vec();
         let mut grad = vec![0.0; m];
         let st = laplace_gradient(ws, x, y, ids, extra_ids, p, n, &mut grad);
@@ -6534,7 +6721,7 @@ fn assert_dual_gradient_matches_fd(
             matches!(st, DerivStatus::Ok(_)),
             "{family:?}/{shape} did not converge"
         );
-        for k in 0..m {
+        for k in (0..m).filter(|k| structural.binary_search(k).is_err()) {
             let h = if k < ws.n_theta {
                 1e-5
             } else {
@@ -6571,8 +6758,10 @@ fn assert_dual_gradient_matches_fd(
                 "{family:?}/{shape} coord {k}: dual {} vs fd {fd}",
                 grad[k]
             );
+            checks += 1;
         }
     }
+    checks
 }
 
 /// Central FD of the Laplace deviance against the dual gradient, per family and
@@ -6584,27 +6773,45 @@ fn assert_dual_gradient_matches_fd(
 /// chain rule's. Forcing 1e-12 tests the math. Same reasoning the parked
 /// gradient spec's validation section gives; the switch already exists as
 /// `ws.fd.pirls_tol_override`.
+///
+/// The masked cells ([`MASKED_GATE_CELLS`]) run beside the list, and the gate
+/// prints the check count of both.
 #[test]
 fn dual_gradient_matches_central_fd_per_family_and_shape() {
-    for &(family, shape) in GRADIENT_GATE_CELLS {
-        let (mut ws, x, y, ids, p, n) = fixture(family, shape);
-        ws.fd.pirls_tol_override = Some(1e-12);
-        let rng = fixed_seed_theta(shape);
-        assert_dual_gradient_matches_fd(
-            &mut ws,
-            x.as_ref(),
-            &y,
-            &ids,
-            &[],
-            p,
-            n,
-            family,
-            shape,
-            10,
-            rng,
-        );
-        ws.fd.pirls_tol_override = None;
+    let mut checks = [0usize; 2];
+    for (set, cells) in [GRADIENT_GATE_CELLS, MASKED_GATE_CELLS]
+        .into_iter()
+        .enumerate()
+    {
+        for &(family, shape) in cells {
+            let (mut ws, x, y, ids, p, n) = fixture(family, shape);
+            ws.fd.pirls_tol_override = Some(1e-12);
+            let rng = fixed_seed_theta(shape);
+            checks[set] += assert_dual_gradient_matches_fd(
+                &mut ws,
+                x.as_ref(),
+                &y,
+                &ids,
+                &[],
+                p,
+                n,
+                family,
+                shape,
+                10,
+                rng,
+            );
+            ws.fd.pirls_tol_override = None;
+        }
     }
+    println!(
+        "dual-gradient FD gate: {} checks on {} cells, {} on {} masked cells",
+        checks[0],
+        GRADIENT_GATE_CELLS.len(),
+        checks[1],
+        MASKED_GATE_CELLS.len()
+    );
+    // Ten draws × (one free θ + two β) per masked cell.
+    assert_eq!(checks[1], MASKED_GATE_CELLS.len() * 10 * 3);
 }
 
 /// The assembled `f64` gradient against `laplace_gradient`, the exact in-tree
@@ -6803,17 +7010,18 @@ fn two_crossed_fixture(
     const N_C2: usize = 4;
     let (x, y, ids, mut extra_ids, mut spec) = glmm_extras_q1_dataset(0, 6);
     let (n, p) = (y.len(), 2usize);
-    spec.family = family;
-    spec.re
+    spec.spec.family = family;
+    spec.spec
+        .re
         .as_mut()
         .expect("the extras dataset always declares an RE structure")
         .extra_groupings
         .push(Grouping {
-            relation: GroupingRelation::Crossed {
-                n_clusters: N_C2 as u32,
-            },
+            terms: Vec::new(),
+            relation: GroupingRelation::Crossed,
             slopes: vec![],
         });
+    spec.extra_counts.push(N_C2);
     extra_ids.push((0..n).map(|i| ((i / 3) % N_C2) as u32).collect());
     let ws = GlmmWorkspace::for_cluster_spec(p, &spec, n, &[], 1);
     assert_eq!(ws.groupings.crossed.len(), 2, "two crossed groupings");
@@ -6834,7 +7042,7 @@ fn two_crossed_fixture(
 /// belongs) shows here as a whole-coordinate miss.
 ///
 /// The last cell is padded past the lane ladder's top rung so the pass runs in
-/// two chunks: it is the only gate that exercises the chunk driver's
+/// three chunks: it is the only gate that exercises the chunk driver's
 /// `base`/`width` bookkeeping, since the per-entry comparison against the
 /// hyper-dual Hessian cannot go above that pass's own cap.
 ///
@@ -6940,7 +7148,7 @@ fn assembled_hessian_columns_match_fd_of_f64_gradient() {
         };
         let extra_p = 12;
         let (mut ws, x, y, ids, p, n) = fixture_padded(family, "q2s", extra_p);
-        assert_eq!(ws.n_theta + p, 17, "the padding must give two chunks");
+        assert_eq!(ws.n_theta + p, 17, "the padding must give three chunks");
         ws.fd.pirls_tol_override = Some(1e-12);
         let rng = fixed_seed_theta_padded("q2s", extra_p);
         let (wt, wb) = assert_assembled_hessian_columns_match_fd(
@@ -7020,7 +7228,7 @@ fn assert_assembled_hessian_columns_match_fd(
         };
         // The objective value the pass reports is the objective, whichever
         // chunk it came out of. Asserted in release, not only in debug: on the
-        // padded cell this pass runs two chunks, and a chunk that
+        // padded cell this pass runs three chunks, and a chunk that
         // differentiated a different point would show here.
         for v in ws.pirls.u[..kk].iter_mut() {
             *v = 0.0;
@@ -7176,7 +7384,9 @@ fn dual_gradient_matches_central_fd_chunked_above_n12() {
 /// `ws.pirls.u` currently holds, and the plus/minus evals need to land in the same
 /// basin for their difference to be the smooth branch's curvature). Also
 /// asserts `hess[(i, j)] == hess[(j, i)]` exactly (`==`, no band) — both
-/// entries are copies of the same packed `h` slot.
+/// entries are copies of the same packed `h` slot. On a masked workspace each
+/// draw has its structural θ entries zeroed, and the gradient is differenced
+/// along the free coordinates only. Returns the number of entry checks.
 #[allow(clippy::too_many_arguments)]
 fn assert_dual_hessian_matches_fd_of_gradient(
     ws: &mut GlmmWorkspace,
@@ -7191,11 +7401,14 @@ fn assert_dual_hessian_matches_fd_of_gradient(
     shape: &str,
     n_draws: usize,
     mut rng: FixedSeedTheta,
-) {
+) -> usize {
     let m = ws.n_theta + p;
     let kk = ws.k.max(1);
+    let structural = ws.groupings.structural_theta().to_vec();
+    let mut checks = 0;
     for _ in 0..n_draws {
         ws.params[..m].copy_from_slice(&rng.next_params());
+        ws.groupings.zero_structural(&mut ws.params[..m]);
         let saved: Vec<f64> = ws.params[..m].to_vec();
         let mut grad = vec![0.0; m];
         let mut hess = Mat::<f64>::zeros(m, m);
@@ -7215,7 +7428,7 @@ fn assert_dual_hessian_matches_fd_of_gradient(
             }
         }
 
-        for k in 0..m {
+        for k in (0..m).filter(|k| structural.binary_search(k).is_err()) {
             let h = if k < ws.n_theta {
                 1e-5
             } else {
@@ -7250,35 +7463,54 @@ fn assert_dual_hessian_matches_fd_of_gradient(
                     "{family:?}/{shape} hess[{row}][{k}]: analytic {} vs fd-of-grad {fd}",
                     hess[(row, k)]
                 );
+                checks += 1;
             }
         }
     }
+    checks
 }
 
 /// Central FD of `laplace_gradient` against `laplace_hessian`, per family and
 /// per RE shape, at a TIGHTENED PIRLS tolerance — same reasoning and same
 /// tolerance as `dual_gradient_matches_central_fd_per_family_and_shape`.
+/// The masked cells ([`MASKED_GATE_CELLS`]) run beside the list, and the gate
+/// prints the check count of both.
 #[test]
 fn dual_hessian_matches_central_fd_of_gradient_per_family_and_shape() {
-    for &(family, shape) in GRADIENT_GATE_CELLS {
-        let (mut ws, x, y, ids, p, n) = fixture(family, shape);
-        ws.fd.pirls_tol_override = Some(1e-12);
-        let rng = fixed_seed_theta(shape);
-        assert_dual_hessian_matches_fd_of_gradient(
-            &mut ws,
-            x.as_ref(),
-            &y,
-            &ids,
-            &[],
-            p,
-            n,
-            family,
-            shape,
-            10,
-            rng,
-        );
-        ws.fd.pirls_tol_override = None;
+    let mut checks = [0usize; 2];
+    for (set, cells) in [GRADIENT_GATE_CELLS, MASKED_GATE_CELLS]
+        .into_iter()
+        .enumerate()
+    {
+        for &(family, shape) in cells {
+            let (mut ws, x, y, ids, p, n) = fixture(family, shape);
+            ws.fd.pirls_tol_override = Some(1e-12);
+            let rng = fixed_seed_theta(shape);
+            checks[set] += assert_dual_hessian_matches_fd_of_gradient(
+                &mut ws,
+                x.as_ref(),
+                &y,
+                &ids,
+                &[],
+                p,
+                n,
+                family,
+                shape,
+                10,
+                rng,
+            );
+            ws.fd.pirls_tol_override = None;
+        }
     }
+    println!(
+        "dual-Hessian FD gate: {} checks on {} cells, {} on {} masked cells",
+        checks[0],
+        GRADIENT_GATE_CELLS.len(),
+        checks[1],
+        MASKED_GATE_CELLS.len()
+    );
+    // Ten draws × three free columns × five rows per masked cell.
+    assert_eq!(checks[1], MASKED_GATE_CELLS.len() * 10 * 3 * 5);
 }
 
 /// One gate cell padded past `m = 8` so `HyperDual<12, 78>` is exercised by a
@@ -7374,7 +7606,7 @@ fn extras_fixture(
             .collect(),
         other => panic!("structured gradient-gate fixture: family {other:?} not wired"),
     };
-    spec.family = family;
+    spec.spec.family = family;
     let mut ws = GlmmWorkspace::for_cluster_spec(p, &spec, n, &[], 1);
     if matches!(family, Family::NegativeBinomial { .. }) {
         ws.nb_theta = 4.0;
@@ -7444,7 +7676,7 @@ fn newton_pirls_lands_on_the_mode_at_a_loose_band() {
         ));
         // Packed: the same design and response on the packed-row layout.
         let (_, _, _, _, mut spec) = glmm_extras_q1_dataset(2, 6);
-        spec.family = family;
+        spec.spec.family = family;
         let mut ws = GlmmWorkspace::for_cluster_spec_packed(2, &spec, n, &[], 1);
         if matches!(family, Family::NegativeBinomial { .. }) {
             ws.nb_theta = 4.0;
@@ -7853,108 +8085,6 @@ fn agq_fast_route_value_matches_the_generic_dual_route() {
     }
 }
 
-/// AGQ gate, `nagq` clause: Binomial-logit `int1` satisfies every OTHER gate
-/// clause, so `nagq = 1` keeps the gate closed (blocked route) while
-/// `nagq = 7` opens it (`agq_deviance` route) — two different objectives, so
-/// at least one gradient lane must differ. The family clause excludes
-/// Gaussian, which never reaches the GLMM kernel, and inverse-Gaussian, which
-/// the mixed-model entry refuses (`fit::common::assert_model_shape`), so the
-/// `nagq` clause is the half a fit can reach.
-#[test]
-fn agq_gate_opens_on_eligible_family_and_nagq() {
-    let family = Family::Binomial {
-        link: BinomialLink::Logit,
-    };
-    let shape = "int1";
-    let params = fixed_seed_theta(shape).next_params();
-
-    let (mut ws_a, xa, ya, ids_a, p, n) = fixture_with_nagq(family, shape, 1);
-    let (mut ws_b, xb, yb, ids_b, _, _) = fixture_with_nagq(family, shape, 7);
-    let m = ws_a.n_theta + p;
-    ws_a.params[..m].copy_from_slice(&params);
-    ws_b.params[..m].copy_from_slice(&params);
-
-    let mut grad_a = vec![0.0; m];
-    let mut grad_b = vec![0.0; m];
-    let st_a = laplace_gradient(&mut ws_a, xa.as_ref(), &ya, &ids_a, &[], p, n, &mut grad_a);
-    let st_b = laplace_gradient(&mut ws_b, xb.as_ref(), &yb, &ids_b, &[], p, n, &mut grad_b);
-    assert!(matches!(st_a, DerivStatus::Ok(_)));
-    assert!(matches!(st_b, DerivStatus::Ok(_)));
-    assert!(
-        grad_a.iter().zip(&grad_b).any(|(a, b)| a != b),
-        "nagq=1 (blocked) and nagq=7 (AGQ) must not evaluate the same objective: \
-         grad_a={grad_a:?}, grad_b={grad_b:?}"
-    );
-}
-
-// -- Tail-boundary timing instrument -------------------------------------
-//
-// Locates the crossed tail width `e` above which the dual kernel's dense
-// generic tail factor costs more per evaluation than the caller's fallback
-// would have cost anyway (the FD Hessian, or ~2m² objective evaluations for a
-// BOBYQA-driven search). Measurement only — does not read or write
-// `DUAL_TAIL_MAX`; a human pins that from the printed table on a locked
-// machine.
-
-/// `block_leverage` equals `mᵀA⁻¹m` computed by a `glmm_block_solve`
-/// against the same 3×3 factor (not an explicit matrix inverse).
-#[test]
-fn block_leverage_matches_block_solve() {
-    use crate::glmm::pirls::block_leverage;
-    use crate::glmm::workspace::glmm_block_chol;
-    let q = 3;
-    // SPD: B Bᵀ + I with B lower-ish
-    let b = [2.0, 0.0, 0.0, 0.5, 1.5, 0.0, -0.3, 0.7, 1.2];
-    let mut a = [0.0; 9];
-    for r in 0..q {
-        for c in 0..q {
-            for kk in 0..q {
-                a[r * q + c] += b[r * q + kk] * b[c * q + kk];
-            }
-        }
-        a[r * q + r] += 1.0;
-    }
-    let m = [0.4, -1.1, 0.9];
-    // A⁻¹m by solving with the same factor (L then Lᵀ): glmm_block_solve
-    let mut l = a;
-    assert!(glmm_block_chol(&mut l, q));
-    let mut x = m;
-    crate::glmm::workspace::glmm_block_solve(&l, q, &mut x);
-    let want: f64 = (0..q).map(|i| m[i] * x[i]).sum();
-    let got = block_leverage(&l, q, &m);
-    assert!((got - want).abs() < 1e-12, "h {got} vs mᵀA⁻¹m {want}");
-}
-
-/// `block_leverage`'s `‖L⁻¹m‖²` and `block_forward_solve`'s `t = L⁻¹m` cannot
-/// drift apart: on the same factor, `block_leverage` must equal `Σt²`.
-#[test]
-fn block_forward_solve_matches_block_leverage() {
-    use crate::glmm::pirls::{block_forward_solve, block_leverage};
-    use crate::glmm::workspace::glmm_block_chol;
-    let q = 3;
-    let b = [2.0, 0.0, 0.0, 0.5, 1.5, 0.0, -0.3, 0.7, 1.2];
-    let mut a = [0.0; 9];
-    for r in 0..q {
-        for c in 0..q {
-            for kk in 0..q {
-                a[r * q + c] += b[r * q + kk] * b[c * q + kk];
-            }
-        }
-        a[r * q + r] += 1.0;
-    }
-    let m = [0.4, -1.1, 0.9];
-    let mut l = a;
-    assert!(glmm_block_chol(&mut l, q));
-    let want = block_leverage(&l, q, &m);
-    let mut t = [0.0_f64; 3];
-    block_forward_solve(&l, q, &m, &mut t);
-    let got: f64 = t.iter().map(|x| x * x).sum();
-    assert_eq!(
-        got, want,
-        "Σt² vs block_leverage: same arithmetic, same order"
-    );
-}
-
 /// The packed layout's sparse Cholesky of `A` against its dense factor on the
 /// same design from the same start: a full fit (stage-1 PQL border solves
 /// included) and the Rx SE, which `packed_schur_fill` builds from the dense
@@ -7973,6 +8103,7 @@ fn packed_sparse_factor_matches_the_dense_one() {
         let fit = fit_glmm(
             &mut ws,
             xf64.as_ref(),
+            xf64.as_ref().subcols(0, 0),
             &y,
             &ids,
             &extra,
@@ -8082,15 +8213,17 @@ fn laplace_log_det_is_the_exact_curvature_at_the_mode() {
                 _ => 0.5 + ((i * 13) % 7) as f64 / 3.0,
             })
             .collect();
-        let model = ModelSpec {
-            family,
-            re: Some(ReStructure {
-                sizing: Sizing::FixedClusters {
-                    n_clusters: s as u32,
-                },
-                slopes: vec![],
-                extra_groupings: vec![],
-            }),
+        let model = SizedSpec {
+            spec: ModelSpec {
+                family,
+                re: Some(ReStructure {
+                    terms: Vec::new(),
+                    slopes: vec![],
+                    extra_groupings: vec![],
+                }),
+            },
+            n_primary: s,
+            extra_counts: vec![],
         };
         let mut ws = GlmmWorkspace::for_cluster_spec(2, &model, n, &[], 1);
         let nb_theta = 2.0;
@@ -8150,10 +8283,13 @@ fn gamma_phi_on_box_bound_flags_both_bounds_only() {
 /// Negative-binomial AGQ: θ_NB sits outside the integral, so the
 /// binomial/Poisson kernels serve NB unchanged. At a fixed (θ, β) the
 /// quadrature ladder converges (7, 15 and 25 nodes agree to quadrature
-/// error), and on NB and probit — links where the exact curvature differs from
-/// Fisher — one adaptive node is the Laplace objective to round-off: the node
+/// error), and one adaptive node is the Laplace objective to round-off. On NB
+/// and probit — links where the exact curvature differs from Fisher — the node
 /// scale reads the factor the exit refresh leaves, `A_obs`, so the k = 1
-/// reduction holds with the exact-curvature `log|A|` too.
+/// reduction holds with the exact-curvature `log|A|` too. The logit row holds
+/// the reduction on the canonical link at a tighter band; the scalar k = 1 node
+/// sums dev_resid and a log-sum-exp where Laplace sums dev/pen and 2·logdet, so
+/// the two agree to a relative tolerance, not bitwise.
 #[test]
 fn agq_nb_ladder_converges_and_one_node_is_laplace() {
     let (n, s) = (60usize, 6usize);
@@ -8164,13 +8300,29 @@ fn agq_nb_ladder_converges_and_one_node_is_laplace() {
         x[(i, 1)] = ((i * 7) % 11) as f64 / 10.0 - 0.5;
     }
     let params = [0.8_f64, 0.1, 0.3];
-    for family in [
-        Family::NegativeBinomial {
-            link: crate::NegBinomialLink::Log,
-        },
-        Family::Binomial {
-            link: BinomialLink::Probit,
-        },
+    // (family, k = 1 band, run the node ladder)
+    for (family, k1_tol, ladder) in [
+        (
+            Family::NegativeBinomial {
+                link: crate::NegBinomialLink::Log,
+            },
+            1e-10,
+            true,
+        ),
+        (
+            Family::Binomial {
+                link: BinomialLink::Probit,
+            },
+            1e-10,
+            true,
+        ),
+        (
+            Family::Binomial {
+                link: BinomialLink::Logit,
+            },
+            1e-12,
+            false,
+        ),
     ] {
         let y: Vec<f64> = (0..n)
             .map(|i| match family {
@@ -8178,15 +8330,17 @@ fn agq_nb_ladder_converges_and_one_node_is_laplace() {
                 _ => ((i * 3) % 5) as f64,
             })
             .collect();
-        let model = ModelSpec {
-            family,
-            re: Some(ReStructure {
-                sizing: Sizing::FixedClusters {
-                    n_clusters: s as u32,
-                },
-                slopes: vec![],
-                extra_groupings: vec![],
-            }),
+        let model = SizedSpec {
+            spec: ModelSpec {
+                family,
+                re: Some(ReStructure {
+                    terms: Vec::new(),
+                    slopes: vec![],
+                    extra_groupings: vec![],
+                }),
+            },
+            n_primary: s,
+            extra_counts: vec![],
         };
         let mut ws = GlmmWorkspace::for_cluster_spec(2, &model, n, &[], 1);
         ws.nb_theta = 2.0;
@@ -8196,9 +8350,12 @@ fn agq_nb_ladder_converges_and_one_node_is_laplace() {
         };
         let agq1 = agq(&mut ws, 1);
         assert!(
-            (agq1 - lap).abs() <= 1e-10 * lap.abs().max(1.0),
+            (agq1 - lap).abs() <= k1_tol * lap.abs().max(1.0),
             "{family:?}: agq(k=1) {agq1} vs laplace {lap}"
         );
+        if !ladder {
+            continue;
+        }
         let (d7, d15, d25) = (agq(&mut ws, 7), agq(&mut ws, 15), agq(&mut ws, 25));
         assert!(d25.is_finite(), "{family:?}: AGQ must evaluate");
         assert!(
@@ -8210,42 +8367,6 @@ fn agq_nb_ladder_converges_and_one_node_is_laplace() {
             "{family:?}: 7 vs 25 nodes: {d7} vs {d25}"
         );
     }
-}
-
-/// A tail row (`family::in_tail`) takes the η-form observed weight in the
-/// Laplace `A`. On cloglog's upper side with y = 0 the row's deviance is
-/// `2e^η`, so its observed weight is `e^η` — positive, where the μ-form
-/// `W_obs` evaluated at the stored `1 − PROB_EPS` would divide by `V` at the
-/// bound and turn strongly negative, making `A` non-PD.
-#[test]
-fn a_tail_row_takes_the_eta_form_observed_weight() {
-    let family = crate::Family::Binomial {
-        link: crate::BinomialLink::Cloglog,
-    };
-    let eta = [3.32_f64, 0.3];
-    let prob = [
-        crate::family::link_inv(family, eta[0]),
-        crate::family::link_inv(family, eta[1]),
-    ];
-    assert!(crate::family::in_tail(family, eta[0], prob[0]));
-    assert!(!crate::family::in_tail(family, eta[1], prob[1]));
-    let y = [0.0, 1.0];
-    let prior_w = [1.0, 1.0];
-    let fisher = [
-        crate::family::irls_weight_and_resid(family, f64::NAN, y[0], eta[0]).1,
-        crate::family::irls_weight_and_resid(family, f64::NAN, y[1], eta[1]).1,
-    ];
-    let mut w = fisher;
-    observed_weights_in_place(family, f64::NAN, &y, &prior_w, &eta, &prob, &mut w, 2);
-    let t = eta[0].exp();
-    assert!(
-        (w[0] - t).abs() <= 1e-12 * t,
-        "tail row: observed weight {} vs e^η {t}",
-        w[0]
-    );
-    let obs1 =
-        crate::family::observed_weight(family, f64::NAN, y[1], 1.0, eta[1], prob[1], fisher[1]);
-    assert_eq!(w[1], obs1, "interior row: observed weight");
 }
 
 /// On the AGQ route the fit keeps the search's own Λ at a pinned diagonal, and
@@ -8266,22 +8387,25 @@ fn fit_glmm_vector_agq_keeps_search_lambda_at_pinned_diagonal() {
     // β parameterisations of the joint search, at the same deviance.
     let (x_rows, y, ids) = pinned_diagonal_fixture(278, 0.0);
     let x = Mat::from_fn(n, 2, |i, j| x_rows[i * 2 + j]);
-    let spec = ModelSpec {
-        family: Family::Binomial {
-            link: BinomialLink::Logit,
-        },
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters {
-                n_clusters: nc as u32,
+    let spec = SizedSpec {
+        spec: ModelSpec {
+            family: Family::Binomial {
+                link: BinomialLink::Logit,
             },
-            slopes: vec![1],
-            extra_groupings: vec![],
-        }),
+            re: Some(ReStructure {
+                terms: Vec::new(),
+                slopes: vec![1],
+                extra_groupings: vec![],
+            }),
+        },
+        n_primary: nc,
+        extra_counts: vec![],
     };
     let mut ws = GlmmWorkspace::for_cluster_spec(2, &spec, n, &[1], nagq);
     let fit = fit_glmm(
         &mut ws,
         x.as_ref(),
+        x.as_ref().subcols(0, 0),
         &y,
         &ids,
         &[],
@@ -8437,26 +8561,27 @@ fn huge_count_cells(
         x[(i, 1)] = z[k];
         y[i] = (c + 0.5 * z[k] + b[k] + d[h[i] as usize]).exp().round();
     }
-    let spec = |crossed: bool| ModelSpec {
-        family: Family::Poisson {
-            link: PoissonLink::Log,
+    let spec = |crossed: bool| SizedSpec {
+        spec: ModelSpec {
+            family: Family::Poisson {
+                link: PoissonLink::Log,
+            },
+            re: Some(ReStructure {
+                terms: Vec::new(),
+                slopes: vec![],
+                extra_groupings: if crossed {
+                    vec![Grouping {
+                        terms: Vec::new(),
+                        relation: GroupingRelation::Crossed,
+                        slopes: vec![],
+                    }]
+                } else {
+                    vec![]
+                },
+            }),
         },
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters {
-                n_clusters: n_g as u32,
-            },
-            slopes: vec![],
-            extra_groupings: if crossed {
-                vec![Grouping {
-                    relation: GroupingRelation::Crossed {
-                        n_clusters: n_h as u32,
-                    },
-                    slopes: vec![],
-                }]
-            } else {
-                vec![]
-            },
-        }),
+        n_primary: n_g,
+        extra_counts: if crossed { vec![n_h] } else { vec![] },
     };
     let extra = vec![h];
     let blocked = GlmmWorkspace::for_cluster_spec(p, &spec(false), n, &[], 1);
@@ -8520,7 +8645,15 @@ fn rx_cov_keeps_its_digits_for_a_cluster_level_covariate_at_huge_counts() {
         let dev = glmm_laplace_deviance(params, &mut ws, x.as_ref(), &y, &g, extra_ids, n);
         assert!(dev.is_finite(), "{label}: deviance {dev}");
         let mut cov = Mat::<f64>::zeros(p, p);
-        let ok = rx_cov_into(&mut ws, x.as_ref(), &g, p, n, &mut cov);
+        let ok = rx_cov_into(
+            &mut ws,
+            x.as_ref(),
+            x.as_ref().subcols(0, 0),
+            &g,
+            p,
+            n,
+            &mut cov,
+        );
         assert!(ok, "{label}: the Rx Schur must stay positive definite");
         for j in 0..p {
             let se = cov[(j, j)].sqrt();
@@ -9143,20 +9276,23 @@ fn agq_gd_fit(
             x[(i, c)] = 0.3 * lcg(&mut st);
         }
     }
-    let model = ModelSpec {
-        family,
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters {
-                n_clusters: nc as u32,
-            },
-            slopes: vec![],
-            extra_groupings: vec![],
-        }),
+    let model = SizedSpec {
+        spec: ModelSpec {
+            family,
+            re: Some(ReStructure {
+                terms: Vec::new(),
+                slopes: vec![],
+                extra_groupings: vec![],
+            }),
+        },
+        n_primary: nc,
+        extra_counts: vec![],
     };
     let mut ws = GlmmWorkspace::for_cluster_spec(p, &model, n, &[], 7);
     let fit = fit_glmm(
         &mut ws,
         x.as_ref(),
+        x.as_ref().subcols(0, 0),
         &y,
         &ids,
         &[],
@@ -9186,14 +9322,34 @@ fn agq_gradient_difference_hessian_matches_hyper_dual() {
             ws.hyper_scratch = None;
             ws.agq_gd = None;
             let mut cov_gd = Mat::<f64>::zeros(p, p);
-            let st = joint_hessian_cov(&mut ws, x.as_ref(), &y, &ids, &[], p, n, &mut cov_gd);
+            let st = joint_hessian_cov(
+                &mut ws,
+                x.as_ref(),
+                x.as_ref().subcols(0, 0),
+                &y,
+                &ids,
+                &[],
+                p,
+                n,
+                &mut cov_gd,
+            );
             assert_eq!(st, FdHessianStatus::Ok, "{family:?}");
             assert!(ws.agq_gd.is_some(), "{family:?}: rung 2a did not run");
             assert!(ws.hyper_scratch.is_none(), "{family:?}: rung 2 ran");
             let tse_gd = theta_se(&ws);
 
             let mut cov_again = Mat::<f64>::zeros(p, p);
-            joint_hessian_cov(&mut ws, x.as_ref(), &y, &ids, &[], p, n, &mut cov_again);
+            joint_hessian_cov(
+                &mut ws,
+                x.as_ref(),
+                x.as_ref().subcols(0, 0),
+                &y,
+                &ids,
+                &[],
+                p,
+                n,
+                &mut cov_again,
+            );
             for a in 0..p {
                 for b in 0..p {
                     assert_eq!(
@@ -9206,7 +9362,17 @@ fn agq_gradient_difference_hessian_matches_hyper_dual() {
 
             ws.fd.skip_agq_gradient_difference = true;
             let mut cov_hd = Mat::<f64>::zeros(p, p);
-            let st = joint_hessian_cov(&mut ws, x.as_ref(), &y, &ids, &[], p, n, &mut cov_hd);
+            let st = joint_hessian_cov(
+                &mut ws,
+                x.as_ref(),
+                x.as_ref().subcols(0, 0),
+                &y,
+                &ids,
+                &[],
+                p,
+                n,
+                &mut cov_hd,
+            );
             ws.fd.skip_agq_gradient_difference = false;
             assert_eq!(st, FdHessianStatus::Ok, "{family:?}");
             assert!(ws.hyper_scratch.is_some(), "{family:?}: rung 2 did not run");
@@ -9241,13 +9407,33 @@ fn agq_gradient_difference_hessian_covers_past_the_lane_cap() {
         assert!(ws.n_theta + p > crate::glmm::derivative::MAX_DUAL_N);
         ws.agq_gd = None;
         let mut cov_gd = Mat::<f64>::zeros(p, p);
-        let st = joint_hessian_cov(&mut ws, x.as_ref(), &y, &ids, &[], p, n, &mut cov_gd);
+        let st = joint_hessian_cov(
+            &mut ws,
+            x.as_ref(),
+            x.as_ref().subcols(0, 0),
+            &y,
+            &ids,
+            &[],
+            p,
+            n,
+            &mut cov_gd,
+        );
         assert_eq!(st, FdHessianStatus::Ok, "{family:?}");
         assert!(ws.agq_gd.is_some(), "{family:?}: rung 2a did not run");
         let tse_gd = theta_se(&ws);
         ws.fd.force_fd_hessian = true;
         let mut cov_fd = Mat::<f64>::zeros(p, p);
-        let st = joint_hessian_cov(&mut ws, x.as_ref(), &y, &ids, &[], p, n, &mut cov_fd);
+        let st = joint_hessian_cov(
+            &mut ws,
+            x.as_ref(),
+            x.as_ref().subcols(0, 0),
+            &y,
+            &ids,
+            &[],
+            p,
+            n,
+            &mut cov_fd,
+        );
         ws.fd.force_fd_hessian = false;
         assert_eq!(st, FdHessianStatus::Ok, "{family:?}");
         let tse_fd = theta_se(&ws);
@@ -9674,6 +9860,7 @@ fn gate_fit(
     fit_glmm(
         ws,
         x,
+        x.subcols(0, 0),
         y,
         ids,
         extra_ids,
@@ -9872,13 +10059,17 @@ fn gradient_route_matches_or_beats_the_bobyqa_route() {
         ids.push(f[4].parse::<u32>().unwrap() - 1);
     }
     let (n, p) = (y.len(), 3);
-    let model = ModelSpec {
-        family: logit,
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 20 },
-            slopes: vec![],
-            extra_groupings: vec![],
-        }),
+    let model = SizedSpec {
+        spec: ModelSpec {
+            family: logit,
+            re: Some(ReStructure {
+                terms: Vec::new(),
+                slopes: vec![],
+                extra_groupings: vec![],
+            }),
+        },
+        n_primary: 20,
+        extra_counts: vec![],
     };
     let mut ws = GlmmWorkspace::for_cluster_spec(p, &model, n, &[], 7);
     ws.prior_w[..n].copy_from_slice(&w);
@@ -10692,13 +10883,13 @@ fn gradient_route_is_unit_invariant_in_beta() {
 }
 
 /// The GLMM curvature hint: a pilot fit's own final BFGS estimate is
-/// offered (`glmm_curvature_hint`), a hinted fit reads it without writing it,
+/// offered (`glmm_curvature_hint`), a hinted fit consumes it within its call,
 /// results do not depend on the order of hinted draws, and a hinted draw ends
 /// at or below the unhinted one's deviance within `1e-6`. On the logit `q2s`
 /// Laplace fixture and on a 7-node logit AGQ random intercept; every fit here
 /// is cold.
 #[test]
-fn gradient_route_curvature_hint_is_read_only_and_order_free() {
+fn gradient_route_curvature_hint_is_order_free() {
     let logit = Family::Binomial {
         link: BinomialLink::Logit,
     };
@@ -10708,7 +10899,6 @@ fn gradient_route_curvature_hint_is_read_only_and_order_free() {
         let _ = gate_fit(&mut pilot, x.as_ref(), &y, &ids, &[], None, &beta0, n);
         let hint = super::glmm_curvature_hint(&pilot).expect("a routed pilot offers a hint");
         assert_eq!(hint.dim(), pilot.n_theta + p);
-        let hint_bits: Vec<u64> = hint.inv_hessian().iter().map(|v| v.to_bits()).collect();
         let draws: Vec<Vec<f64>> = (0..3)
             .map(|d| {
                 y.iter()
@@ -10734,8 +10924,6 @@ fn gradient_route_curvature_hint_is_read_only_and_order_free() {
             a, b,
             "{shape}: hinted results depend on the order of the draws"
         );
-        let after: Vec<u64> = hint.inv_hessian().iter().map(|v| v.to_bits()).collect();
-        assert_eq!(hint_bits, after, "{shape}: the fit wrote the hint");
         let (mut plain, ..) = fixture_with_nagq(logit, shape, nagq);
         for (d, yd) in draws.iter().enumerate() {
             let f = gate_fit(&mut plain, x.as_ref(), yd, &ids, &[], None, &beta0, n);

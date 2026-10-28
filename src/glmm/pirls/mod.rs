@@ -21,7 +21,7 @@ mod packed;
 pub(crate) use blocked::pirls_solve_blocked;
 pub(crate) use blocked_extras::{
     pirls_solve_blocked_extras, stream_fill, structured_ainv_solve, structured_factor,
-    structured_stream_deviance, StreamRows, TailKernel,
+    structured_stream_deviance, tail_inverse_generic, StreamRows, TailKernel,
 };
 pub(crate) use packed::{fill_m_vals, packed_m_vals_theta_deriv, pirls_solve_packed};
 
@@ -1619,7 +1619,7 @@ pub(crate) fn block_forward_solve<T: Scalar>(l: &[T], q: usize, m: &[T], t: &mut
 /// predictor). Called once at entry of each PIRLS solve and, in `BetaStep::Profile`,
 /// after every β update (the accepted δβ step and each β halving) — the trial
 /// evaluation at the top of the loop reads `eta_fixed`, so it must track the
-/// current β. `offset` is `FitOptions::offset` (`None` ⇒ no offset).
+/// current β. `offset` is `Data::offset` (`None` ⇒ no offset).
 fn refresh_eta_fixed<T: crate::scalar::Scalar>(
     x: MatRef<f64>,
     beta: &[T],

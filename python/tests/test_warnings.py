@@ -21,13 +21,11 @@ MIXED = {"x": _X, "g": _G, "y": [y + _OFF[g] for y, g in zip(_Y, _G)]}
 _G_PAIRS = [f"g{(i // 2) % 5}" for i in range(20)]
 MIXED_PAIRS = {"x": _X, "g": _G_PAIRS, "y": [y + _OFF[g] for y, g in zip(_Y, _G_PAIRS)]}
 
-# A single fixture that raises three notes of two kinds from one call: two
-# argument_ignored notes (dispersion=, nagq=, both inapplicable on a Gaussian
-# model) plus the formula lowering's own unused_grouping_levels, from one
-# declared-but-empty group level ("g_mid", between two used ones). Five
-# groups, eight rows each, with a random slope on z, whose values sit far from
-# zero. All three are lowering-time or argument-clearing checks, not solver
-# convergence. The fit adds two cautions of its own: y has no random slope, so
+# A single fixture that raises two argument_ignored notes from one call
+# (dispersion=, nagq=, both inapplicable on a Gaussian model). Its declared but
+# empty group level ("g_mid", between two used ones) is dropped and raises
+# nothing. Five groups, eight rows each, with a random slope on z, whose values
+# sit far from zero. The fit adds two cautions of its own: y has no random slope, so
 # the slope's variance comes out at zero, and glmm compares standard
 # deviations on its internally standardized design, where that is a singular
 # fit (on the raw design z's distance from zero hid it); and y is exact in z
@@ -161,15 +159,6 @@ def test_constructed_notes_store_with_their_tier_and_title():
     }
     cases = [
         (
-            dict(base, kind="unused_grouping_levels", detail="g: z, w"),
-            glmm.UnusedGroupingLevelsWarning,
-            (
-                "Grouping factor 'g' has levels with no rows (z, w). They stay in the model with "
-                "random effects of exactly zero, but they are not counted in the number of "
-                "groups. Remove unused categories before fitting."
-            ),
-        ),
-        (
             dict(base, kind="single_level_grouping_dropped", detail="onegroup"),
             glmm.SingleLevelGroupingDroppedWarning,
             (
@@ -295,6 +284,30 @@ def test_constructed_notes_store_with_their_tier_and_title():
         assert str(caught[0].message) == printed(entry)
 
 
+def test_se_unavailable_with_a_column_prints_the_pair_text():
+    # A fit with both se_unavailable and ill_conditioned hands _note_warning the
+    # se_unavailable note carrying the ill_conditioned note's columns.
+    note = {
+        "kind": "se_unavailable",
+        "columns": [2],
+        "pivot": float("nan"),
+        "evals": 0,
+        "final_eval": False,
+        "detail": "",
+    }
+    msg, cat = glmm._note_warning(note, ["(Intercept)", "x", "x2"], True, 0)
+    assert cat is glmm.SeUnavailableWarning
+    assert msg == (
+        "Standard errors could not be computed: x2 cannot be separated from the other "
+        "columns in the model. Its estimate is not reported. The other estimates and the "
+        "deviance can be used; standard errors, p-values and confidence intervals are not "
+        "reported. Check for predictors that are copies or near-copies of each other."
+    )
+    msg, cat = glmm._note_warning(dict(note, columns=[]), [], True, 0)
+    assert cat is glmm.SeUnavailableWarning
+    assert msg.startswith("Standard errors could not be computed at the fit's end point:")
+
+
 def test_single_level_grouping_dropped_and_other_grouping_still_fits():
     # "onegroup" has one level; "h" has real groups. The random effect for
     # "onegroup" is dropped with a warning, and "h" is promoted to primary
@@ -346,19 +359,6 @@ def test_pirls_exhausted_is_raised_only_on_a_converged_final_eval():
     assert glmm._note_warning(dict(note, final_eval=True), [], True, 0)[1] is (
         glmm.PirlsExhaustedWarning
     )
-
-
-def test_unused_levels_splits_on_the_first_separator():
-    note = {
-        "kind": "unused_grouping_levels",
-        "columns": [],
-        "pivot": float("nan"),
-        "evals": 0,
-        "final_eval": False,
-        "detail": "g: a: b, c",
-    }
-    msg, _ = glmm._note_warning(note, [], True, 0)
-    assert msg.startswith("Grouping factor 'g' has levels with no rows (a: b, c).")
 
 
 def test_ignored_warnings_are_still_stored():
@@ -876,12 +876,10 @@ def test_kind_table_matches_warnings_md():
     assert rows == expected
 
 
-def test_port_parity_sequence_adds_four_more_kinds():
+def test_port_parity_sequence_adds_three_more_kinds():
     # Same PARITY fixture and call in r/tests/testthat/test-warnings.R —
-    # change together. One fixture, three notes across two kinds
-    # (argument_ignored fires twice, from two different arguments;
-    # unused_grouping_levels), plus the fit's own singular and
-    # variance_at_limit cautions.
+    # change together. argument_ignored fires twice, from two different
+    # arguments, plus the fit's own singular and variance_at_limit cautions.
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         m = glmm.fit(PARITY, "y ~ z + (1 + z | g)", dispersion=2.0, nagq=3)
@@ -890,7 +888,6 @@ def test_port_parity_sequence_adds_four_more_kinds():
         ("note", "argument_ignored", "Argument ignored"),
         ("note", "argument_ignored", "Argument ignored"),
         ("caution", "singular", "Singular fit"),
-        ("note", "unused_grouping_levels", "Unused grouping levels"),
         ("caution", "variance_at_limit", "Variance at its search limit"),
     ]
 

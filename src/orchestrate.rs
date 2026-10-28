@@ -1,15 +1,16 @@
 //! String-typed fit orchestration shared by the FFI ports (`glmm-python`,
 //! `glmm-r`): formula + data -> [`crate::formula::lower`] -> option overrides
-//! -> [`crate::fit_warm`], wrapped in `catch_unwind` so the kernel's
-//! `assert!`-based boundary faults become a normal `Err`, never a process
-//! abort across an FFI boundary. Plain-Rust types only — no `pyo3`/`extendr`
+//! -> [`crate::fit`] / [`crate::fit_with_start`], whose [`crate::FitError`]
+//! becomes a normal `Err` with its message; the call is wrapped in
+//! `catch_unwind` so a panic (a crate bug) becomes an `Err` too, never a
+//! process abort across an FFI boundary. Plain-Rust types only — no `pyo3`/`extendr`
 //! types — so everything here runs under plain `cargo test`, and the two
 //! ports flatten the same fit the same way from one definition instead of
 //! two mirrored copies. [`run_fit`] fits one formula; [`run_compare`] fits
 //! two on the same rows and compares them; [`run_model_matrix`] returns a
 //! formula's fixed-effects design without fitting; [`term_labels`] reads a
 //! formula's fixed-term labels; [`contrast_test`] tests `Lβ = 0` on what a
-//! port stored of one fit.
+//! port stored of one fit, and [`pairwise`] compares a factor's levels on it.
 //!
 //! Behind the default-off `orchestrate` cargo feature. Like `loop_advanced`
 //! it carries NO semver guarantees: its shape follows the ports' needs.
@@ -19,23 +20,30 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use faer::Mat;
 
-use crate::fit::theta_width;
+use crate::fit::{theta_width, CondvarCross};
 use crate::formula::anova::{
-    auto_choice, compare, fixed_row, linear_note_line, nesting, term_tests_cached, untested_test,
-    ChoiceReason, CompareError, CompareOptions, Comparison, Differs, FixedRow, Model, Nesting,
-    RefitCache, SsType, TermTable, TermTest, TermTestOptions, TestChoice,
+    auto_choice, compare_stored, fixed_row, linear_note_line, nesting, term_tests_cached,
+    untested_test, ChoiceReason, CompareError, CompareOptions, Comparison, Differs, FixedRow,
+    Model, Nesting, RefitCache, SsType, TermTable, TermTest, TermTestOptions, TestChoice,
 };
+use crate::formula::pairwise::pairwise_of;
 use crate::formula::{
-    design_columns, fixed_design, fixed_part_relation, label_ranef, lower, parse, r_terms, Column,
-    FixedPartRelation, Lowered, ParsedFormula, Table,
+    design_columns, fixed_design, fixed_part_relation, label_ranef, lower, lower_new, parse,
+    r_terms, Adjust, By, Column, FixedPartRelation, Lowered, Pairwise, PairwiseIntervals,
+    PairwiseRow, ParsedFormula, RatioKind, Table,
 };
 use crate::inference::contrast::{contrast_f_of, ContrastError, NoDfReason};
+use crate::inference::effect_size::{variance_parts, VarianceParts};
 use crate::inference::tails::{normal_quantile, t_quantile};
 use crate::inference::wald::wald_chisq;
-use crate::inference::{DenDf, LinearKind, LinearNote, LinearTest, Objective, Reference};
+use crate::inference::{DenDf, Icc, LinearKind, LinearNote, LinearTest, Objective, Reference, R2};
 use crate::lmm::satterthwaite::SatterthwaiteState;
-use crate::{fit_warm, Boundary, Family, Fit, Note, OuterStop, StartValues, WaldSe};
+use crate::predict::{predict_parts, FitParts};
 use crate::{BinomialLink, GammaLink, InverseGaussianLink, NegBinomialLink, PoissonLink};
+use crate::{
+    Boundary, Family, Fit, FitOptions, Note, OuterStop, PredictOptions, Prediction, Scale,
+    Simulator, StartValues, WaldSe,
+};
 
 /// Maps the ports' `family`/`link` strings to [`Family`]. `family` and `link`
 /// are already validated against the full spec table by each port's wrapper
@@ -127,17 +135,20 @@ pub struct NoteInfo {
     /// for every other variant.
     pub final_eval: bool,
     /// Free text a variant needs and the fields above cannot carry (the
-    /// grouping and level names of `UnusedGroupingLevels`, the grouping name
-    /// of `SingleLevelGroupingDropped`, and `FewRowsForRandomEffects`'s term
+    /// grouping name of `SingleLevelGroupingDropped`, `FewRowsForRandomEffects`'s term
     /// as `"<terms> | <grouping>"`, whose row count the ports read from
-    /// `FitResult::nobs`). Empty otherwise; the `kind`, not this string, stays
-    /// the stable identifier.
+    /// `FitResult::nobs`, and `NewGroupingLevels` as `"<grouping index>:
+    /// <rows>"`, 0-based and comma-separated). Empty otherwise; the `kind`, not
+    /// this string, stays the stable identifier.
     pub detail: String,
 }
 
 /// One `crate::formula::RanefBlock` flattened for the ports:
-/// `(grouping name, term names, level labels, row-major values)`.
-pub type RanefBlockTuple = (String, Vec<String>, Vec<String>, Vec<f64>);
+/// `(grouping name, term names, level labels, row-major values, row-major
+/// conditional covariances)`, the last as `RanefBlock::condvar` lays it out
+/// (per level the vech of its `q × q` block) and empty where `Fit::condvar`
+/// is.
+pub type RanefBlockTuple = (String, Vec<String>, Vec<String>, Vec<f64>, Vec<f64>);
 
 /// [`Boundary`] as the string the ports publish. Exhaustive for the same
 /// reason `note_infos` is: a new variant must pick its string here.
@@ -183,14 +194,6 @@ fn note_infos(notes: Vec<Note>) -> Vec<NoteInfo> {
                 evals,
                 final_eval,
                 detail: String::new(),
-            },
-            Note::UnusedGroupingLevels { grouping, levels } => NoteInfo {
-                kind: "unused_grouping_levels",
-                columns: Vec::new(),
-                pivot: f64::NAN,
-                evals: 0,
-                final_eval: false,
-                detail: format!("{grouping}: {}", levels.join(", ")),
             },
             Note::HessianSeFallback => NoteInfo {
                 kind: "hessian_se_fallback",
@@ -285,6 +288,20 @@ fn note_infos(notes: Vec<Note>) -> Vec<NoteInfo> {
                 final_eval: false,
                 detail: String::new(),
             },
+            Note::NewGroupingLevels { grouping, rows } => NoteInfo {
+                kind: "new_grouping_levels",
+                columns: Vec::new(),
+                pivot: f64::NAN,
+                evals: 0,
+                final_eval: false,
+                detail: format!(
+                    "{grouping}: {}",
+                    rows.iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            },
             Note::SatterthwaiteCurvature {
                 dropped,
                 negative,
@@ -353,6 +370,11 @@ pub struct FitResult {
     /// — `ReGroupInfo` flattened for the tuple. Without it a port's `summary()`
     /// has no grouping name to print and falls back to `group 0`.
     pub re_groups: Vec<(String, Vec<String>)>,
+    /// Per grouping, in `re_groups` order, the term of each of its term names
+    /// (`crate::formula::ReGroupInfo::term_index`): `(x || g)` gives `[0, 1]`.
+    /// A port's `summary()` prints a correlation only between two columns of
+    /// one term, as lme4 does.
+    pub re_term_index: Vec<Vec<usize>>,
     /// Warn-and-strip message for an ineligible-shape `nagq>1` (the fit
     /// proceeded with Laplace); surfaced by each port as a Python
     /// `UserWarning` / R `warning()`.
@@ -383,6 +405,19 @@ pub struct FitResult {
     /// in is a data-dependent routing decision inside the kernel, so only the
     /// crate can label it.
     pub ranef_blocks: Vec<RanefBlockTuple>,
+    /// The conditional covariances of the random effects
+    /// (`crate::Fit::condvar`), in the flat layout of `ranef`, padded nested
+    /// slots included; a port stores it, with `condvar_x` and
+    /// `condvar_cross`, for [`predict`]. Coupled sites, as for `y`.
+    pub condvar: Vec<f64>,
+    /// The rows behind the conditional standard error's fixed-effect part
+    /// (the crate-private `Fit::condvar_x`), per level of `condvar` the
+    /// row-major `q × p` block.
+    pub condvar_x: Vec<f64>,
+    /// The conditional covariance across groupings (the crate-private
+    /// `Fit::condvar_cross`) as plain numbers, `None` where the fit has
+    /// none (one grouping, or no `condvar`).
+    pub condvar_cross: Option<CondvarCrossRecord>,
     /// The response as the kernel fitted it (`Lowered::y`): after lowering, so
     /// a `cbind(s, f)` response is the proportion `s/(s+f)` and a formula
     /// transform on the LHS is already applied. Retained so a port can compute
@@ -402,9 +437,8 @@ pub struct FitResult {
     pub offset: Option<Vec<f64>>,
     /// The design summary `(counts, s, c)` of a Gaussian fit whose only random
     /// term is one random intercept, with no prior weights and at least one
-    /// fixed-effect column; `None` on every other fit. With `K` the highest
-    /// observed level code plus one (a level below it with no rows counts 0)
-    /// and `p` retained fixed-effect columns, `counts` has `K` entries, `s` is
+    /// fixed-effect column; `None` on every other fit. With `K` the number of
+    /// groups and `p` retained fixed-effect columns, `counts` has `K` entries, `s` is
     /// the `p × K` matrix `X̃ᵀZ` and `c` the `p × p` matrix `X̃ᵀX̃`, both flat
     /// and column-major, on the fit's orthogonalized design `X̃`
     /// (`crate::fit::DesignSummary` has the detail). Coupled sites, as for
@@ -516,6 +550,53 @@ pub struct SatterthwaiteRecord {
     pub retained: Option<Vec<usize>>,
 }
 
+/// A fit's conditional covariance across groupings
+/// ([`FitResult::condvar_cross`]) as plain numbers: a port stores it on its
+/// fit and passes it back to [`predict`] in [`StoredParts`]. The fields are
+/// those of the crate-private `fit::CondvarCross`, which documents the
+/// layout.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CondvarCrossRecord {
+    /// The declaration index of the grouping whose levels are the families.
+    pub family_grouping: usize,
+    /// Per family the vech of its coefficients' covariance.
+    pub family: Vec<f64>,
+    /// The vech of the tail levels' covariance.
+    pub tail: Vec<f64>,
+    /// Per family plus one, where its coupling entries start.
+    pub coupling_at: Vec<u32>,
+    /// The tail level each coupling entry names.
+    pub coupling_cols: Vec<u32>,
+    /// Per coupling entry, one value per family coefficient.
+    pub coupling: Vec<f64>,
+}
+
+impl From<CondvarCross> for CondvarCrossRecord {
+    fn from(c: CondvarCross) -> Self {
+        CondvarCrossRecord {
+            family_grouping: c.family_grouping,
+            family: c.family,
+            tail: c.tail,
+            coupling_at: c.coupling_at,
+            coupling_cols: c.coupling_cols,
+            coupling: c.coupling,
+        }
+    }
+}
+
+impl From<&CondvarCrossRecord> for CondvarCross {
+    fn from(c: &CondvarCrossRecord) -> Self {
+        CondvarCross {
+            family_grouping: c.family_grouping,
+            family: c.family.clone(),
+            tail: c.tail.clone(),
+            coupling_at: c.coupling_at.clone(),
+            coupling_cols: c.coupling_cols.clone(),
+            coupling: c.coupling.clone(),
+        }
+    }
+}
+
 /// A per-term table as the plain columns a port stores, one entry per row
 /// in each vector, flattened from [`TermTable`] by [`term_columns`].
 #[derive(Clone, Debug, PartialEq)]
@@ -552,11 +633,13 @@ pub struct TermColumns {
     pub sum_sq: Vec<f64>,
     /// lmerTest's `Mean Sq` on an F row; NaN on a χ² row.
     pub mean_sq: Vec<f64>,
+    /// The partial η² of an F row ([`FixedRow::eta2_partial`]); NaN on a χ²
+    /// row and on an untested row.
+    pub eta2_partial: Vec<f64>,
     /// Each row's notes as plain sentences (an aliased column, a rank below
     /// the row count, no denominator df and why; on a likelihood-ratio
-    /// table, a refit that did not converge, a refit above the larger model
-    /// by more than round-off (its statistic set to 0), and a random-slope
-    /// term kept on its Wald row).
+    /// table, a refit that did not converge and a refit above the larger
+    /// model by more than round-off (its statistic set to 0)).
     pub row_notes: Vec<Vec<String>>,
     /// The table's notes as plain sentences (the missing-cell note; on a
     /// likelihood-ratio table, a fit that did not converge, with nothing
@@ -613,6 +696,7 @@ pub fn term_columns(table: &TermTable) -> TermColumns {
         p_value: col(|r| r.test.p_value),
         sum_sq: col(|r| r.sum_sq.unwrap_or(f64::NAN)),
         mean_sq: col(|r| r.mean_sq.unwrap_or(f64::NAN)),
+        eta2_partial: col(FixedRow::eta2_partial),
         row_notes: rows
             .iter()
             .map(|r| {
@@ -688,6 +772,8 @@ pub fn objective_from_parts(label: &str, nodes: u8) -> Result<Objective, String>
 /// one entry point both FFI ports call. `satterthwaite` is
 /// `crate::FitOptions::satterthwaite`: `false` skips the Gaussian LMM's
 /// Satterthwaite pass (its df are then not computed and it is tested with z).
+/// `condvar` is `crate::FitOptions::condvar`: `false` leaves the conditional
+/// variances of the random effects out of the fit.
 ///
 /// `reml` is resolved on the lowered model, after a single-level grouping has
 /// been dropped:
@@ -723,6 +809,7 @@ pub fn run_fit(
     offset: Option<Vec<f64>>,
     warm_start: Option<(Vec<f64>, Vec<f64>, Option<f64>)>,
     satterthwaite: bool,
+    condvar: bool,
     reml: Option<bool>,
     anova_test: &str,
 ) -> Result<FitResult, String> {
@@ -737,7 +824,7 @@ pub fn run_fit(
         }
     };
     let fam = family_from_str(family, link)?;
-    // `fit_warm`'s own checks of `dispersion` and the warm start name kernel
+    // The fit entry's own checks of `dispersion` and the warm start name kernel
     // struct fields (`FitOptions.dispersion`, `StartValues.beta`) a port user
     // never sees, so both are checked here first under the argument's name.
     if let Some(d) = dispersion {
@@ -746,7 +833,7 @@ pub fn run_fit(
         }
     }
     let table = table_of(numeric_columns, factor_columns)?;
-    let prepared = lower_with(
+    let mut prepared = lower_with(
         formula,
         &table,
         fam,
@@ -758,9 +845,10 @@ pub fn run_fit(
         satterthwaite,
         reml,
     )?;
+    prepared.opts.condvar = condvar;
     let lowered = &prepared.lowered;
 
-    // Widths as `fit_warm` checks them: exact, or empty to cold-start that part.
+    // Widths as the fit entry checks them: exact, or empty to cold-start that part.
     if let Some((beta, theta, disp)) = &warm_start {
         if let Some(d) = disp {
             if !(d.is_finite() && *d > 0.0) {
@@ -800,7 +888,7 @@ pub fn run_fit(
         dispersion,
     });
 
-    let fit = fit_lowered(lowered, start.as_ref())?;
+    let fit = fit_lowered(lowered, &prepared.opts, start.as_ref())?;
     flatten(prepared, fit, anova_test)
 }
 
@@ -815,8 +903,8 @@ pub const DEFAULT_SEED: u64 = 20_261_008;
 /// default (Monte Carlo standard error about 2.2e-3 at p = 0.05).
 pub const DEFAULT_NSIM: usize = 10_000;
 
-/// The largest `nsim` [`compare_options`] accepts: 10⁶ draws, a hundred times
-/// the default. The null keeps every draw in memory (16 bytes each), and the
+/// The largest `nsim` [`compare_options`] and [`simulate`] accept: 10⁶ draws,
+/// a hundred times the default. The null keeps every draw in memory (16 bytes each), and the
 /// time grows linearly with the draws and the group count.
 pub const MAX_NSIM: usize = 1_000_000;
 
@@ -857,7 +945,7 @@ pub struct CompareResult {
 }
 
 /// `compare(data, f0, f1)` of the ports: fits two nested formulas on the same
-/// columns and compares the two fits ([`crate::formula::anova::compare`]).
+/// columns and compares the two fits ([`crate::formula::anova::compare_stored`]).
 /// `family`, `link`, `nagq`, `weights` and `offset` are given once and used
 /// for both fits, which are made as [`run_fit`] makes them with
 /// `wald_se = "hessian"`, `satterthwaite = true`, no warm start and
@@ -911,16 +999,20 @@ pub fn run_compare(
     ));
     let table = table_of(numeric_columns, factor_columns)?;
     let side = |formula: &str, weights, offset| -> Result<_, String> {
-        let prepared = lower_with(
+        let mut prepared = lower_with(
             formula, &table, fam, "hessian", nagq, None, weights, offset, true, reml,
         )?;
-        let fit = fit_lowered(&prepared.lowered, None)?;
-        let model = Model::from_fit(formula, &prepared.lowered, &fit);
+        // The ports hand both fits back as fits of their own, with no
+        // `condvar` argument, so they carry the conditional variances a port
+        // fit has by default.
+        prepared.opts.condvar = true;
+        let fit = fit_lowered(&prepared.lowered, &prepared.opts, None)?;
+        let model = Model::from_fit(formula, &prepared.lowered, &prepared.opts, &fit);
         Ok((model, prepared, fit))
     };
     let (m0, prepared0, fit0) = side(f0, weights.clone(), offset.clone())?;
     let (m1, prepared1, fit1) = side(f1, weights, offset)?;
-    let comparison = compare(&m0, &m1, &opts).map_err(|e| e.to_string())?;
+    let comparison = compare_stored(&m0, &m1, &opts).map_err(|e| e.to_string())?;
     Ok(CompareResult {
         comparison,
         fit0: flatten(prepared0, fit0, TermTest::Wald)?,
@@ -1071,19 +1163,21 @@ fn table_of(
     Ok(Table { columns, n })
 }
 
-/// A lowered model with every fit argument applied ([`lower_with`]), and the
-/// two warn-and-strip messages.
+/// A lowered model with every fit argument applied ([`lower_with`]): the
+/// weights and offset on the lowering, the rest in the options it is fitted
+/// with; and the two warn-and-strip messages.
 struct Prepared {
     lowered: Lowered,
+    opts: FitOptions,
     agq_warning: Option<String>,
     reml_warning: Option<String>,
 }
 
-/// `formula` lowered on `table`, with the fit arguments applied to its
-/// options: `wald_se`, `nagq` (warn-and-strip), `reml` (resolved as
+/// `formula` lowered on `table`, with the fit arguments applied: to the fit
+/// options `wald_se`, `nagq` (warn-and-strip), `reml` (resolved as
 /// [`run_fit`] states), `dispersion`, `satterthwaite`, and the
-/// `weights=`/`offset=` arguments (an error when the formula gives the same
-/// thing). [`run_fit`] and [`run_compare`] share it, so a model lowers the
+/// `weights=`/`offset=` arguments to the lowering (an error when the formula
+/// gives the same thing). [`run_fit`] and [`run_compare`] share it, so a model lowers the
 /// same way in both.
 #[allow(clippy::too_many_arguments)]
 fn lower_with(
@@ -1102,18 +1196,18 @@ fn lower_with(
         .map_err(panic_message)?
         .map_err(|e| e.to_string())?;
 
-    lowered.opts.wald_se = match wald_se {
+    let wald_se = match wald_se {
         "hessian" => WaldSe::Hessian,
         "rx" => WaldSe::Rx,
         other => return Err(format!("unsupported wald_se {other:?}")),
     };
     // nagq>1 on an ineligible shape is valid-but-inapplicable — warn-and-strip:
-    // nothing inapplicable may reach the kernel, whose shape check is an
-    // `assert!`, and a Rust panic across an FFI boundary is not an acceptable
-    // user error. The shape is only knowable here, after `lower()`, so this is
-    // the strip site; each port emits the message (Python `UserWarning`, R
-    // `warning()`). Eligibility mirrors
-    // `src/fit/common.rs::assert_model_shape` — change together: nagq>1 needs
+    // the fit entry ignores it on a Gaussian or fixed-only model and refuses it
+    // on the other ineligible shapes, and a port user gets a warning and a
+    // Laplace fit for all of them. The shape is only knowable here, after
+    // `lower()`, so this is the strip site; each port emits the message
+    // (Python `UserWarning`, R `warning()`). Eligibility mirrors
+    // `src/fit/common.rs::check_model_shape` — change together: nagq>1 needs
     // a mixed binomial/Poisson/negative-binomial/Gamma model with a single grouping factor and
     // q_p = 1 + #slopes ≤ 3 (the temporary cost/oracle cap).
     let mut nagq = nagq;
@@ -1128,7 +1222,7 @@ fn lower_with(
         );
         let eligible = match lowered.model.re.as_ref() {
             Some(re) => {
-                let q_p = 1 + re.slopes.len(); // intercept + slopes, as in assert_model_shape
+                let q_p = 1 + re.slopes.len(); // intercept + slopes, as in check_model_shape
                 agq_family && re.extra_groupings.is_empty() && q_p <= 3
             }
             None => false,
@@ -1142,7 +1236,6 @@ fn lower_with(
             nagq = 1;
         }
     }
-    lowered.opts.nagq = nagq;
     // `reml` is resolved here too, on the lowered model, so both ports follow
     // one rule; a single-level grouping the lowering dropped has already made a
     // mixed formula an OLS or GLM fit. A GLM or GLMM has no REML/ML split:
@@ -1150,7 +1243,7 @@ fn lower_with(
     // fit), and `Some(false)` is the `None` fit, silently. Every other value
     // goes to `FitOptions::reml`, which resolves it on a Gaussian model.
     let mut reml_warning: Option<String> = None;
-    lowered.opts.reml = match reml {
+    let reml = match reml {
         Some(true) if lowered.model.family != Family::Gaussian => {
             reml_warning = Some(
                 "reml=true applies only to Gaussian models; it was ignored and the model \
@@ -1161,52 +1254,61 @@ fn lower_with(
         }
         other => other,
     };
-    lowered.opts.dispersion = dispersion;
-    lowered.opts.satterthwaite = satterthwaite;
-    // Mirrors `formula::materialize`'s `opts` construction — change together:
+    let opts = FitOptions {
+        wald_se,
+        nagq,
+        reml,
+        dispersion,
+        satterthwaite,
+        ..FitOptions::default()
+    };
+    // Mirrors `formula::materialize`'s `weights`/`offset` — change together:
     // lowering sets `weights`/`offset` only for a `cbind()` response /
     // `offset()` formula term, so a value here AND the matching argument is
     // the user saying it twice.
-    if weights.is_some() && lowered.opts.weights.is_some() {
+    if weights.is_some() && lowered.weights.is_some() {
         return Err(
             "weights given both as a cbind() response and as the weights= argument; use one"
                 .to_string(),
         );
     }
     if weights.is_some() {
-        lowered.opts.weights = weights;
+        lowered.weights = weights;
     }
-    if offset.is_some() && lowered.opts.offset.is_some() {
+    if offset.is_some() && lowered.offset.is_some() {
         return Err(
             "offset given both as an offset() formula term and as the offset= argument; use one"
                 .to_string(),
         );
     }
     if offset.is_some() {
-        lowered.opts.offset = offset;
+        lowered.offset = offset;
     }
     Ok(Prepared {
         lowered,
+        opts,
         agq_warning,
         reml_warning,
     })
 }
 
-/// The kernel fit of `lowered`, a panic caught and returned as `Err`.
-fn fit_lowered(lowered: &Lowered, start: Option<&StartValues>) -> Result<Fit, String> {
+/// The kernel fit of `lowered` with `opts`, a refused input
+/// ([`crate::FitError`]) returned as `Err` with its message, and a panic (a
+/// crate bug) caught and returned as `Err` too.
+fn fit_lowered(
+    lowered: &Lowered,
+    opts: &FitOptions,
+    start: Option<&StartValues>,
+) -> Result<Fit, String> {
     catch_unwind(AssertUnwindSafe(|| {
-        fit_warm(
-            &lowered.x,
-            &lowered.y,
-            lowered.n,
-            lowered.p,
-            &lowered.model,
-            &lowered.ids,
-            start,
-            &lowered.opts,
-        )
+        let data = lowered.data();
+        match start {
+            Some(s) => crate::fit_with_start(&data, lowered.spec(), s, opts),
+            None => crate::fit(&data, lowered.spec(), opts),
+        }
     }))
-    .map_err(panic_message)
+    .map_err(panic_message)?
+    .map_err(|e| e.to_string())
 }
 
 /// `fit` of `prepared` as a [`FitResult`], with its two per-term tables, and
@@ -1215,13 +1317,14 @@ fn fit_lowered(lowered: &Lowered, start: Option<&StartValues>) -> Result<Fit, St
 fn flatten(prepared: Prepared, fit: Fit, anova_test: TermTest) -> Result<FitResult, String> {
     let Prepared {
         mut lowered,
+        opts: fit_opts,
         agq_warning,
         reml_warning,
     } = prepared;
     // The LOWERING's observations, decided before any solver ran.
     let lowered_notes = std::mem::take(&mut lowered.notes);
 
-    let (coef_p, df_method) = t_tests(&fit, &lowered.opts.target_indices);
+    let (coef_p, df_method) = t_tests(&fit, &fit_opts.se_for.columns(lowered.p));
     let satterthwaite_record = match (&fit.satterthwaite, df_method) {
         (Some(st), "satterthwaite") => Some(record_of(st)),
         _ => None,
@@ -1231,8 +1334,8 @@ fn flatten(prepared: Prepared, fit: Fit, anova_test: TermTest) -> Result<FitResu
             ols_r_squared(
                 &fit,
                 &lowered.y,
-                lowered.opts.weights.as_deref(),
-                lowered.opts.offset.as_deref(),
+                lowered.weights.as_deref(),
+                lowered.offset.as_deref(),
                 lowered.has_intercept,
             )
         } else {
@@ -1248,7 +1351,7 @@ fn flatten(prepared: Prepared, fit: Fit, anova_test: TermTest) -> Result<FitResu
     let mut term_table = |ss_type, test| {
         catch_unwind(AssertUnwindSafe(|| {
             let opts = TermTestOptions { ss_type, test };
-            term_tests_cached(&lowered, &fit, &opts, &mut cache)
+            term_tests_cached(&lowered, &fit_opts, &fit, &opts, &mut cache)
         }))
         .map_err(|payload| {
             format!(
@@ -1286,13 +1389,13 @@ fn flatten(prepared: Prepared, fit: Fit, anova_test: TermTest) -> Result<FitResu
     let ranef_blocks: Vec<RanefBlockTuple> = label_ranef(&fit, &lowered.re_groups)
         .map_err(|e| e.to_string())?
         .into_iter()
-        .map(|b| (b.group, b.terms, b.levels, b.values))
+        .map(|b| (b.group, b.terms, b.levels, b.values, b.condvar))
         .collect();
-    let re_groups: Vec<(String, Vec<String>)> = lowered
+    let (re_groups, re_term_index): (Vec<_>, Vec<_>) = lowered
         .re_groups
         .into_iter()
-        .map(|g| (g.name, g.terms))
-        .collect();
+        .map(|g| ((g.name, g.terms), g.term_index))
+        .unzip();
     // An EMPTY `varcorr` is not a mismatch — it is the crate's numerical-failure
     // convention, "the fit assembled no variance components". Every failure
     // return uses it: the degenerate LMM endpoint (`fit/lmm.rs`, alongside its
@@ -1334,6 +1437,7 @@ fn flatten(prepared: Prepared, fit: Fit, anova_test: TermTest) -> Result<FitResu
         singular: diagnostics.singular,
         names: lowered.col_names,
         re_groups,
+        re_term_index,
         agq_warning,
         reml_warning,
         loglik: fit.loglik,
@@ -1343,14 +1447,17 @@ fn flatten(prepared: Prepared, fit: Fit, anova_test: TermTest) -> Result<FitResu
         ranef: fit.ranef,
         ranef_levels: fit.ranef_levels,
         ranef_blocks,
+        condvar: fit.condvar,
+        condvar_x: fit.condvar_x,
+        condvar_cross: fit.condvar_cross.map(CondvarCrossRecord::from),
         y: lowered.y,
-        weights: lowered.opts.weights,
-        offset: lowered.opts.offset,
+        weights: lowered.weights,
+        offset: lowered.offset,
         design_summary: fit.design_summary.map(|d| (d.counts, d.s, d.c)),
         nobs: lowered.n,
         boundary: boundary_name(diagnostics.boundary),
         pinned: diagnostics.pinned,
-        // The lowering's own observations (unused grouping levels) join the
+        // The lowering's own observations (dropped or thin groupings) join the
         // solver's in one channel: the user does not care which layer noticed.
         notes: note_infos(lowered_notes.into_iter().chain(diagnostics.notes).collect()),
         coef_df: fit.coef_df,
@@ -1563,6 +1670,50 @@ fn record_state(r: SatterthwaiteRecord, p: usize) -> Result<SatterthwaiteState, 
     ))
 }
 
+/// The df record of a fit from what a port stored of it, as `Fit`'s own df
+/// record: `df_method` ([`FitResult::df_method`]) `"satterthwaite"` rebuilds
+/// it from `record`; `"residual"` builds it as the fit does, `C` being `vcov`
+/// on the columns not `aliased` and `ν` being `nobs` less those columns;
+/// `"disabled"`, `"failed"` and `"none"` give the reason there is none
+/// (`"none"` is the families with no df, [`NoDfReason::NotGaussianMixed`]).
+///
+/// # Errors
+///
+/// An unknown `df_method`; a `"satterthwaite"` fit with no `record`, or a
+/// malformed one.
+fn stored_df_state(
+    df_method: &str,
+    beta: &[f64],
+    vcov: &[Vec<f64>],
+    aliased: &[bool],
+    nobs: usize,
+    record: Option<SatterthwaiteRecord>,
+) -> Result<Result<SatterthwaiteState, NoDfReason>, String> {
+    let p = beta.len();
+    Ok(match df_method {
+        "satterthwaite" => {
+            let record = record.ok_or_else(|| {
+                "a fit whose df_method is \"satterthwaite\" needs its satterthwaite_record"
+                    .to_string()
+            })?;
+            Ok(record_state(record, p)?)
+        }
+        "residual" => {
+            let kept: Vec<usize> = (0..p).filter(|&j| !aliased[j]).collect();
+            let c = Mat::from_fn(kept.len(), kept.len(), |a, b| vcov[kept[a]][kept[b]]);
+            let mut st = SatterthwaiteState::residual(c, nobs as f64 - kept.len() as f64);
+            if kept.len() < p {
+                st.retained = Some(kept);
+            }
+            Ok(st)
+        }
+        "disabled" => Err(NoDfReason::Disabled),
+        "failed" => Err(NoDfReason::Failed),
+        "none" => Err(NoDfReason::NotGaussianMixed),
+        other => return Err(format!("unknown df_method {other:?}")),
+    })
+}
+
 /// One Wald test of `Lβ = 0` on the fields a port stored of one fit, with no
 /// refit: `l` is the `rows × p` matrix `L`, row-major over all `p`
 /// coefficients, aliased ones included. The test follows `df_method`
@@ -1616,41 +1767,18 @@ pub fn contrast_test(
         return Err(format!("L must be finite numbers, got {v}"));
     }
     let test = catch_unwind(AssertUnwindSafe(|| -> Result<LinearTest, String> {
-        Ok(match df_method {
-            "satterthwaite" => {
-                let record = record.ok_or_else(|| {
-                    "a fit whose df_method is \"satterthwaite\" needs its satterthwaite_record"
-                        .to_string()
-                })?;
-                let st = record_state(record, p)?;
-                LinearTest::from_contrast_f(contrast_f_of(beta, &st, l, rows), DenDf::Satterthwaite)
-            }
-            "residual" => {
-                let kept: Vec<usize> = (0..p).filter(|&j| !aliased[j]).collect();
-                let c = Mat::from_fn(kept.len(), kept.len(), |a, b| vcov[kept[a]][kept[b]]);
-                let mut st = SatterthwaiteState::residual(c, nobs as f64 - kept.len() as f64);
-                if kept.len() < p {
-                    st.retained = Some(kept);
-                }
-                LinearTest::from_contrast_f(contrast_f_of(beta, &st, l, rows), DenDf::Residual)
-            }
-            "disabled" => untested_test(
-                true,
-                DenDf::Satterthwaite,
-                vec![LinearNote::NoDf {
-                    reason: NoDfReason::Disabled,
-                }],
-            ),
-            "failed" => untested_test(
-                true,
-                DenDf::Satterthwaite,
-                vec![LinearNote::NoDf {
-                    reason: NoDfReason::Failed,
-                }],
-            ),
-            "none" => wald_chisq(beta, vcov, aliased, l, rows),
-            other => return Err(format!("unknown df_method {other:?}")),
-        })
+        let den_df = if df_method == "residual" {
+            DenDf::Residual
+        } else {
+            DenDf::Satterthwaite
+        };
+        Ok(
+            match stored_df_state(df_method, beta, vcov, aliased, nobs, record)? {
+                Ok(st) => LinearTest::from_contrast_f(contrast_f_of(beta, &st, l, rows), den_df),
+                Err(NoDfReason::NotGaussianMixed) => wald_chisq(beta, vcov, aliased, l, rows),
+                Err(reason) => untested_test(true, den_df, vec![LinearNote::NoDf { reason }]),
+            },
+        )
     }))
     .map_err(panic_message)??;
     Ok(TermTable {
@@ -1663,6 +1791,613 @@ pub fn contrast_test(
         notes: Vec::new(),
         coef_names: names.to_vec(),
     })
+}
+
+/// An [`Adjust`] as the ports name it: `"holm"`, `"bonferroni"`, `"tukey"` or
+/// `"none"`.
+pub fn adjust_tag(adjust: Adjust) -> &'static str {
+    match adjust {
+        Adjust::Holm => "holm",
+        Adjust::Bonferroni => "bonferroni",
+        Adjust::Tukey => "tukey",
+        Adjust::None => "none",
+    }
+}
+
+/// The inverse of [`adjust_tag`].
+fn adjust_of(adjust: &str) -> Result<Adjust, String> {
+    Ok(match adjust {
+        "holm" => Adjust::Holm,
+        "bonferroni" => Adjust::Bonferroni,
+        "tukey" => Adjust::Tukey,
+        "none" => Adjust::None,
+        other => {
+            return Err(format!(
+                r#"adjust must be "holm", "bonferroni", "tukey" or "none", got {other:?}"#
+            ))
+        }
+    })
+}
+
+/// A [`RatioKind`] as the ports name it: `"odds_ratio"` or `"ratio"`.
+fn ratio_tag(ratio: RatioKind) -> &'static str {
+    match ratio {
+        RatioKind::OddsRatio => "odds_ratio",
+        RatioKind::Ratio => "ratio",
+    }
+}
+
+/// The ports' `pairwise`: [`crate::formula::pairwise()`] of a stored fit, with
+/// no refit. The training columns, `family` and `link` are what the fit was
+/// made from, as [`run_fit`] took them, and are lowered again for the factor
+/// levels and the numeric means of the reference grid; the `weights=` and
+/// `offset=` arguments are not needed, since a comparison `l'β̂` reads
+/// neither. `df_method`, `beta`, `vcov`, `aliased`, `nobs` and `record` are
+/// the fit's stored fields, read as [`contrast_test`] reads them. `by` names
+/// the variable the comparisons are made within: its levels, or, with
+/// `by_values`, those values of a numeric variable. `adjust` is
+/// [`adjust_tag`]'s name of the adjustment.
+///
+/// # Errors
+///
+/// An unknown `adjust`; `by_values` without `by`; the errors of
+/// [`contrast_test`] on `df_method` and `record`; and every error of
+/// [`crate::formula::pairwise()`]. A panic is returned as `Err`.
+#[allow(clippy::too_many_arguments)]
+pub fn pairwise(
+    formula: &str,
+    numeric_columns: HashMap<String, Vec<f64>>,
+    factor_columns: HashMap<String, (Vec<String>, Vec<u32>)>,
+    family: &str,
+    link: &str,
+    df_method: &str,
+    beta: &[f64],
+    vcov: &[Vec<f64>],
+    aliased: &[bool],
+    nobs: usize,
+    record: Option<SatterthwaiteRecord>,
+    factor: &str,
+    by: Option<&str>,
+    by_values: Option<Vec<f64>>,
+    adjust: &str,
+) -> Result<Pairwise, String> {
+    let adjust = adjust_of(adjust)?;
+    let by = match (by, by_values.as_deref()) {
+        (None, None) => None,
+        (Some(name), None) => Some(By::Levels(name)),
+        (Some(name), Some(values)) => Some(By::Values(name, values)),
+        (None, Some(_)) => {
+            return Err(
+                "the values to compare at need by, the numeric variable they are values of"
+                    .to_string(),
+            )
+        }
+    };
+    let lowered = relower(
+        formula,
+        numeric_columns,
+        factor_columns,
+        family,
+        link,
+        None,
+        None,
+    )?;
+    catch_unwind(AssertUnwindSafe(|| {
+        let df = stored_df_state(df_method, beta, vcov, aliased, nobs, record)?;
+        pairwise_of(
+            formula,
+            &lowered,
+            beta,
+            vcov,
+            aliased,
+            df.as_ref().map_err(|reason| *reason),
+            factor,
+            by,
+            adjust,
+        )
+        .map_err(|e| e.to_string())
+    }))
+    .map_err(panic_message)?
+}
+
+/// A [`Pairwise`] as the plain columns a port stores, one entry per row in
+/// each vector, flattened by [`pairwise_columns`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct PairwiseColumns {
+    /// [`Pairwise::factor`].
+    pub factor: String,
+    /// [`Pairwise::by`].
+    pub by: Option<String>,
+    /// [`Pairwise::adjust`], as [`adjust_tag`] names it.
+    pub adjust: &'static str,
+    /// [`Pairwise::ratio`]: `"odds_ratio"` or `"ratio"`, `None` on a link
+    /// that is neither log nor logit.
+    pub ratio_kind: Option<&'static str>,
+    /// The factor's number of levels, which [`pairwise_confint`] takes back.
+    pub levels: usize,
+    /// [`PairwiseRow::contrast`].
+    pub contrast: Vec<String>,
+    /// [`PairwiseRow::by_level`], `""` without a `by`.
+    pub by_level: Vec<String>,
+    /// [`PairwiseRow::estimate`].
+    pub estimate: Vec<f64>,
+    /// [`PairwiseRow::se`].
+    pub se: Vec<f64>,
+    /// [`PairwiseRow::df`].
+    pub df: Vec<f64>,
+    /// [`PairwiseRow::statistic`].
+    pub statistic: Vec<f64>,
+    /// [`PairwiseRow::p_value`], unadjusted.
+    pub p_value: Vec<f64>,
+    /// [`PairwiseRow::p_adjusted`].
+    pub p_adjusted: Vec<f64>,
+    /// [`PairwiseRow::ratio`].
+    pub ratio: Vec<f64>,
+    /// [`PairwiseRow::ratio_se`].
+    pub ratio_se: Vec<f64>,
+    /// Each row's notes as plain sentences, `names` the fit's coefficient
+    /// names (an aliased column; no df and why).
+    pub row_notes: Vec<Vec<String>>,
+}
+
+/// A [`Pairwise`] as [`PairwiseColumns`], for both FFI ports; `names` are the
+/// fit's coefficient names, which the notes of an aliased column name.
+pub fn pairwise_columns(pw: &Pairwise, names: &[String]) -> PairwiseColumns {
+    let col = |f: fn(&PairwiseRow) -> f64| pw.rows.iter().map(f).collect();
+    PairwiseColumns {
+        factor: pw.factor.clone(),
+        by: pw.by.clone(),
+        adjust: adjust_tag(pw.adjust),
+        ratio_kind: pw.ratio.map(ratio_tag),
+        levels: pw.levels,
+        contrast: pw.rows.iter().map(|r| r.contrast.clone()).collect(),
+        by_level: pw
+            .rows
+            .iter()
+            .map(|r| r.by_level.clone().unwrap_or_default())
+            .collect(),
+        estimate: col(|r| r.estimate),
+        se: col(|r| r.se),
+        df: col(|r| r.df),
+        statistic: col(|r| r.statistic),
+        p_value: col(|r| r.p_value),
+        p_adjusted: col(|r| r.p_adjusted),
+        ratio: col(|r| r.ratio),
+        ratio_se: col(|r| r.ratio_se),
+        row_notes: pw
+            .rows
+            .iter()
+            .map(|r| {
+                r.notes
+                    .iter()
+                    .map(|n| linear_note_line(*n, names))
+                    .collect()
+            })
+            .collect(),
+    }
+}
+
+/// The ports' `confint` of a stored pairwise table: [`Pairwise::confint`] on
+/// the rows rebuilt from what [`pairwise_columns`] gave the port (each row's
+/// `estimate`, `se`, `df` and unadjusted `p_value`, the factor's `levels`,
+/// the table's `adjust` as [`adjust_tag`] names it and its `ratio` kind as
+/// [`PairwiseColumns::ratio_kind`] does). Nothing is refitted and no grid is
+/// built.
+///
+/// # Errors
+///
+/// An unknown `adjust` or `ratio`; columns of different lengths, or a row
+/// count that is not a whole number of families of `levels·(levels − 1)/2`
+/// rows; and the error of [`Pairwise::confint`] on `level`.
+#[allow(clippy::too_many_arguments)]
+pub fn pairwise_confint(
+    estimate: &[f64],
+    se: &[f64],
+    df: &[f64],
+    p_value: &[f64],
+    adjust: &str,
+    levels: usize,
+    ratio: Option<&str>,
+    level: f64,
+) -> Result<PairwiseIntervals, String> {
+    let adjust = adjust_of(adjust)?;
+    let ratio = match ratio {
+        None => None,
+        Some("odds_ratio") => Some(RatioKind::OddsRatio),
+        Some("ratio") => Some(RatioKind::Ratio),
+        Some(other) => {
+            return Err(format!(
+                r#"ratio must be "odds_ratio" or "ratio", got {other:?}"#
+            ))
+        }
+    };
+    let n = estimate.len();
+    let family = levels * levels.saturating_sub(1) / 2;
+    if se.len() != n || df.len() != n || p_value.len() != n || family == 0 || n % family != 0 {
+        return Err(
+            "the stored pairwise table is malformed: make it again with pairwise()".to_string(),
+        );
+    }
+    let rows = (0..n)
+        .map(|i| PairwiseRow {
+            contrast: String::new(),
+            by_level: None,
+            estimate: estimate[i],
+            se: se[i],
+            df: df[i],
+            statistic: f64::NAN,
+            p_value: p_value[i],
+            p_adjusted: f64::NAN,
+            ratio: f64::NAN,
+            ratio_se: f64::NAN,
+            notes: Vec::new(),
+        })
+        .collect();
+    let pw = Pairwise {
+        factor: String::new(),
+        by: None,
+        adjust,
+        ratio,
+        rows,
+        levels,
+    };
+    pw.confint(level).map_err(|e| e.to_string())
+}
+
+/// The numbers of one fit that [`predict`], [`simulate`] and
+/// [`effect_sizes`] read, as a port stored them from its [`FitResult`]:
+/// `beta`, `vcov`, `varcorr`, `ranef`, `ranef_levels`, `condvar`,
+/// `condvar_x`, `condvar_cross` and `dispersion` as that result holds them.
+/// A port may store `beta` with NA in place of an aliased coefficient's NaN;
+/// both are NaN here, and contribute zero.
+#[derive(Clone, Debug)]
+pub struct StoredParts {
+    /// [`FitResult::beta`].
+    pub beta: Vec<f64>,
+    /// [`FitResult::vcov`].
+    pub vcov: Vec<Vec<f64>>,
+    /// [`FitResult::varcorr`].
+    pub varcorr: Vec<Vec<f64>>,
+    /// [`FitResult::ranef`].
+    pub ranef: Vec<f64>,
+    /// [`FitResult::ranef_levels`].
+    pub ranef_levels: Vec<usize>,
+    /// [`FitResult::condvar`].
+    pub condvar: Vec<f64>,
+    /// [`FitResult::condvar_x`].
+    pub condvar_x: Vec<f64>,
+    /// [`FitResult::condvar_cross`].
+    pub condvar_cross: Option<CondvarCrossRecord>,
+    /// [`FitResult::dispersion`].
+    pub dispersion: f64,
+}
+
+impl StoredParts {
+    /// The kernel's view of these numbers for a model of `family`, `cross`
+    /// the kernel form of `condvar_cross`.
+    fn fit_parts<'a>(&'a self, family: Family, cross: Option<&'a CondvarCross>) -> FitParts<'a> {
+        FitParts {
+            family,
+            beta: &self.beta,
+            vcov: &self.vcov,
+            varcorr: &self.varcorr,
+            ranef: &self.ranef,
+            ranef_levels: &self.ranef_levels,
+            condvar: &self.condvar,
+            condvar_x: &self.condvar_x,
+            condvar_cross: cross,
+            dispersion: self.dispersion,
+        }
+    }
+}
+
+/// `formula` lowered on a port's stored training columns as [`run_fit`]
+/// lowered them: [`table_of`], then [`lower_with`] with the `weights=` and
+/// `offset=` arguments the fit was given. The lowering is deterministic, so
+/// this is the fit's own, with its rows, trial counts, factor levels and
+/// grouping labels.
+fn relower(
+    formula: &str,
+    numeric_columns: HashMap<String, Vec<f64>>,
+    factor_columns: HashMap<String, (Vec<String>, Vec<u32>)>,
+    family: &str,
+    link: &str,
+    weights: Option<Vec<f64>>,
+    offset: Option<Vec<f64>>,
+) -> Result<Lowered, String> {
+    let fam = family_from_str(family, link)?;
+    let table = table_of(numeric_columns, factor_columns)?;
+    let prepared = lower_with(
+        formula, &table, fam, "hessian", 1, None, weights, offset, true, None,
+    )?;
+    Ok(prepared.lowered)
+}
+
+/// What [`predict`] reads from a new table whose column names are
+/// `available`: the names the formula reads there, as
+/// [`model_matrix_columns`]' `used` gives them, without the response. A
+/// grouping column is among them when the table has it.
+///
+/// # Errors
+///
+/// A formula that does not parse.
+pub fn predict_columns(formula: &str, available: &[String]) -> Result<Vec<String>, String> {
+    let ast = parse(formula).map_err(|e| e.to_string())?;
+    Ok(design_columns(&ast, available, true).0)
+}
+
+/// What [`predict`] returns: the parts of [`crate::Prediction`], with its
+/// notes flattened as a fit's are. A part that was not asked for is empty.
+#[derive(Debug)]
+pub struct PredictResult {
+    /// The prediction on the requested scale.
+    pub fit: Vec<f64>,
+    /// Its standard error, when asked for.
+    pub se: Vec<f64>,
+    /// The lower end of the interval, when the standard error is asked for.
+    pub lower: Vec<f64>,
+    /// The upper end of the interval.
+    pub upper: Vec<f64>,
+    /// The lower bound of a future observation, when asked for.
+    pub future_lower: Vec<f64>,
+    /// The upper bound of a future observation.
+    pub future_upper: Vec<f64>,
+    /// One `"new_grouping_levels"` note per grouping with levels the fit did
+    /// not see.
+    pub notes: Vec<NoteInfo>,
+}
+
+/// The ports' `predict`: [`crate::predict`] of a stored fit. The training
+/// columns, `family`, `link`, `weights` and `offset` are what the fit was made
+/// from, as [`run_fit`] took them, and are lowered again (`relower`);
+/// `parts` are the numbers the port stored. `new` is the new table's columns
+/// and its row count (read only when it has no column), or `None` to predict
+/// the training rows. `scale` is `"link"` or `"response"`; `population`,
+/// `allow_new_levels`, `se`, `level` and `future` are those of
+/// [`crate::PredictOptions`].
+///
+/// A new table is lowered with the fit's factor levels, column order and
+/// grouping labels; a table with none of the model's grouping columns
+/// predicts in population mode only.
+///
+/// # Errors
+///
+/// An unknown `scale`; a `level` outside `(0, 1)`; `future` on a model that is
+/// not a non-Gaussian mixed model; new rows for a fit made with an `offset=`
+/// argument (its values for the new rows are unknown); conditional mode on a
+/// new table without the grouping columns; the lowering errors of the new
+/// table; and every error of [`crate::predict`]. A panic is returned as `Err`.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub fn predict(
+    formula: &str,
+    numeric_columns: HashMap<String, Vec<f64>>,
+    factor_columns: HashMap<String, (Vec<String>, Vec<u32>)>,
+    family: &str,
+    link: &str,
+    weights: Option<Vec<f64>>,
+    offset: Option<Vec<f64>>,
+    parts: &StoredParts,
+    new: Option<(
+        HashMap<String, Vec<f64>>,
+        HashMap<String, (Vec<String>, Vec<u32>)>,
+        usize,
+    )>,
+    scale: &str,
+    population: bool,
+    allow_new_levels: bool,
+    se: bool,
+    level: f64,
+    future: bool,
+) -> Result<PredictResult, String> {
+    let scale = match scale {
+        "link" => Scale::Link,
+        "response" => Scale::Response,
+        other => {
+            return Err(format!(
+                r#"type must be "link" or "response", got {other:?}"#
+            ))
+        }
+    };
+    if !(level > 0.0 && level < 1.0) {
+        return Err(format!("level must be in (0, 1), got {level}"));
+    }
+    let offset_argument = offset.is_some();
+    let lowered = relower(
+        formula,
+        numeric_columns,
+        factor_columns,
+        family,
+        link,
+        weights,
+        offset,
+    )?;
+    let mixed = lowered.model.re.is_some();
+    if future && !(mixed && lowered.model.family != Family::Gaussian) {
+        return Err("future applies only to a non-Gaussian mixed model".to_string());
+    }
+    let opts = PredictOptions {
+        population,
+        scale,
+        allow_new_levels,
+        se,
+        level,
+        future,
+    };
+    let cross = parts.condvar_cross.as_ref().map(CondvarCross::from);
+    let fp = parts.fit_parts(lowered.model.family, cross.as_ref());
+    let pred = catch_unwind(AssertUnwindSafe(|| -> Result<Prediction, String> {
+        let fitted = |design: &crate::Design<'_>| {
+            predict_parts(&fp, lowered.spec(), design, &opts).map_err(|e| e.to_string())
+        };
+        let Some((numeric, factor, n_rows)) = new else {
+            return fitted(&lowered.design());
+        };
+        if offset_argument {
+            return Err(
+                "this model was fitted with the offset= argument, whose values for new rows \
+                 are unknown; to predict new rows, fit with an offset() term in the formula"
+                    .to_string(),
+            );
+        }
+        let mut table = table_of(numeric, factor)?;
+        if table.columns.is_empty() {
+            table.n = n_rows;
+        }
+        let rows = lower_new(formula, &lowered, &table).map_err(|e| e.to_string())?;
+        if mixed && !population && rows.ids.is_none() {
+            let names: Vec<&str> = lowered.re_groups.iter().map(|g| g.name.as_str()).collect();
+            return Err(format!(
+                "the new data has none of the grouping columns ({}), so it can be predicted \
+                 from the fixed effects only",
+                names.join(", ")
+            ));
+        }
+        fitted(&rows.design())
+    }))
+    .map_err(panic_message)??;
+    Ok(PredictResult {
+        fit: pred.fit,
+        se: pred.se,
+        lower: pred.lower,
+        upper: pred.upper,
+        future_lower: pred.future_lower,
+        future_upper: pred.future_upper,
+        notes: note_infos(pred.notes),
+    })
+}
+
+/// The ports' `simulate`: `nsim` draws of the response of a stored fit on its
+/// training rows ([`crate::Simulator`]), draw `d` the Philox stream `d` of
+/// `seed`. The training columns, `family`, `link`, `weights` and `offset` are
+/// read as [`predict`] reads them, so a binomial draw uses the fit's trial
+/// counts. Returned draw after draw: draw `d` is
+/// `out[d·nobs..(d + 1)·nobs]`.
+///
+/// # Errors
+///
+/// An `nsim` of 0 or above [`MAX_NSIM`], or draws too many to allocate; and
+/// the errors of [`crate::Simulator::new`] (a fit that did not converge has no
+/// dispersion to draw with). A panic is returned as
+/// `Err`.
+#[allow(clippy::too_many_arguments)]
+pub fn simulate(
+    formula: &str,
+    numeric_columns: HashMap<String, Vec<f64>>,
+    factor_columns: HashMap<String, (Vec<String>, Vec<u32>)>,
+    family: &str,
+    link: &str,
+    weights: Option<Vec<f64>>,
+    offset: Option<Vec<f64>>,
+    parts: &StoredParts,
+    nsim: usize,
+    seed: u64,
+) -> Result<Vec<f64>, String> {
+    if !(1..=MAX_NSIM).contains(&nsim) {
+        return Err(format!(
+            "nsim must be a whole number from 1 to {MAX_NSIM}, got {nsim}"
+        ));
+    }
+    let lowered = relower(
+        formula,
+        numeric_columns,
+        factor_columns,
+        family,
+        link,
+        weights,
+        offset,
+    )?;
+    let cross = parts.condvar_cross.as_ref().map(CondvarCross::from);
+    let fp = parts.fit_parts(lowered.model.family, cross.as_ref());
+    catch_unwind(AssertUnwindSafe(|| {
+        let design = lowered.design();
+        let sim = Simulator::from_parts(&fp, lowered.spec(), &design).map_err(|e| e.to_string())?;
+        let n = lowered.n;
+        // An allocation failure aborts the process past `catch_unwind`, so a
+        // draw count too large for memory is refused here instead.
+        let mut out = Vec::new();
+        out.try_reserve_exact(n * nsim)
+            .map_err(|_| format!("nsim = {nsim} draws of {n} rows do not fit in memory"))?;
+        out.resize(n * nsim, 0.0);
+        if n > 0 {
+            for (d, y) in out.chunks_mut(n).enumerate() {
+                sim.simulate_into(seed, d as u64, y)
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(out)
+    }))
+    .map_err(panic_message)?
+}
+
+/// The ports' `r2()` and `icc()`: [`crate::Fit::r2`] and [`crate::Fit::icc`]
+/// of a stored fit, computed when called. The training columns, `family`,
+/// `link`, `weights` and `offset` are read as [`predict`] reads them; `parts`
+/// gives `beta`, `varcorr` and `dispersion`, and `aliased`, `converged` and
+/// `objective` (as [`objective_parts`] gives it) are the fit's stored fields.
+/// A model `Fit::r2` refuses (no random effects, a family and link it does
+/// not cover) gets NaN values, as does a fit that did not converge.
+///
+/// On a converged Poisson or negative binomial model with random effects the
+/// values need a refit of the null model. `null_refit = false` returns
+/// `Ok(None)` there instead of refitting, so a port's `summary()` shows the
+/// values only where they cost no refit.
+///
+/// # Errors
+///
+/// An `objective` [`objective_from_parts`] refuses, and the lowering errors of
+/// the training columns. A panic is returned as `Err`.
+#[allow(clippy::too_many_arguments)]
+pub fn effect_sizes(
+    formula: &str,
+    numeric_columns: HashMap<String, Vec<f64>>,
+    factor_columns: HashMap<String, (Vec<String>, Vec<u32>)>,
+    family: &str,
+    link: &str,
+    weights: Option<Vec<f64>>,
+    offset: Option<Vec<f64>>,
+    parts: &StoredParts,
+    aliased: &[bool],
+    converged: bool,
+    objective: (&str, u8),
+    null_refit: bool,
+) -> Result<Option<(R2, Icc)>, String> {
+    let objective = objective_from_parts(objective.0, objective.1)?;
+    let lowered = relower(
+        formula,
+        numeric_columns,
+        factor_columns,
+        family,
+        link,
+        weights,
+        offset,
+    )?;
+    // The families whose residual variance reads the null model's mean in
+    // `variance_parts` (its `null_mu`) - change together.
+    let refits = converged
+        && lowered.model.re.is_some()
+        && matches!(
+            lowered.model.family,
+            Family::Poisson { .. } | Family::NegativeBinomial { .. }
+        );
+    if refits && !null_refit {
+        return Ok(None);
+    }
+    catch_unwind(AssertUnwindSafe(|| {
+        let parts = variance_parts(
+            lowered.n,
+            &parts.beta,
+            &parts.varcorr,
+            aliased,
+            converged,
+            parts.dispersion,
+            objective,
+            &lowered.data(),
+            lowered.spec(),
+        )
+        .unwrap_or(VarianceParts::NAN);
+        Some((parts.r2(), parts.icc()))
+    }))
+    .map_err(panic_message)
 }
 
 fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
@@ -1678,10 +2413,11 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::formula::anova::{term_tests, ComparisonTest, Side};
+    use crate::formula::anova::{ComparisonTest, Side};
     use crate::inference::tails::t_two_sided_p;
     use crate::inference::LrNote;
     use crate::test_support::csv_table;
+    use crate::test_support::fit_warm_wo;
     use std::collections::HashMap;
 
     #[test]
@@ -1830,7 +2566,7 @@ mod tests {
         let (numeric, factor) = toy_ols();
         let err = run_fit(
             "y ~ z", numeric, factor, "gaussian", "identity", "hessian", 1, None, None, None, None,
-            true, None, "Wald",
+            true, true, None, "Wald",
         )
         .unwrap_err();
         assert_eq!(err, "unknown column: z");
@@ -1852,6 +2588,7 @@ mod tests {
             None,
             Some(vec![0.0; n]),
             None,
+            true,
             true,
             None,
             "Wald",
@@ -1882,6 +2619,7 @@ mod tests {
             Some(vec![1.0; n]),
             None,
             None,
+            true,
             true,
             None,
             "Wald",
@@ -1918,6 +2656,7 @@ mod tests {
             None,
             None,
             None,
+            true,
             true,
             None,
             "Wald",
@@ -1961,6 +2700,7 @@ mod tests {
             None,
             None,
             true,
+            true,
             None,
             "Wald",
         )
@@ -1970,14 +2710,14 @@ mod tests {
     }
 
     #[test]
-    fn kernel_panic_becomes_a_clean_error_not_a_process_abort() {
-        // A panic inside the kernel fit (a negative Poisson count) takes the
-        // catch_unwind around fit_warm.
+    fn refused_fit_input_becomes_a_clean_error() {
+        // A negative Poisson count is refused by the fit entry, and its
+        // `FitError` message comes back as the `Err`.
         let (mut numeric, factor) = toy_ols();
         numeric.get_mut("y").unwrap()[3] = -1.0;
         let err = run_fit(
             "y ~ x", numeric, factor, "poisson", "log", "hessian", 1, None, None, None, None, true,
-            None, "Wald",
+            true, None, "Wald",
         )
         .unwrap_err();
         assert!(err.contains("Poisson response must be >= 0"), "{err}");
@@ -2001,6 +2741,7 @@ mod tests {
             None,
             None,
             true,
+            true,
             None,
             "Wald",
         )
@@ -2013,7 +2754,7 @@ mod tests {
         numeric.insert("junk".to_string(), vec![0.0; 1000]);
         let err = run_fit(
             "y ~ x", numeric, factor, "gaussian", "identity", "hessian", 1, None, None, None, None,
-            true, None, "Wald",
+            true, true, None, "Wald",
         )
         .unwrap_err();
         assert!(err.contains("junk"), "{err}");
@@ -2046,6 +2787,7 @@ mod tests {
             None,
             None,
             true,
+            true,
             None,
             "Wald",
         )
@@ -2068,6 +2810,7 @@ mod tests {
             None,
             None,
             Some((cold.beta.clone(), vec![5.0], None)),
+            true,
             true,
             None,
             "Wald",
@@ -2135,6 +2878,7 @@ mod tests {
             None,
             None,
             satterthwaite,
+            true,
             None,
             "Wald",
         )
@@ -2209,7 +2953,18 @@ mod tests {
         );
         let table = Table { columns, n: 48 };
         let lo = lower(formula, &table, Family::Gaussian).expect("lowers");
-        let fit = fit_warm(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, None, &lo.opts);
+        let fit = fit_warm_wo(
+            &lo.x,
+            &lo.y,
+            lo.n,
+            lo.p,
+            &lo.model,
+            &lo.ids,
+            None,
+            None,
+            None,
+            &FitOptions::default(),
+        );
         let want = fit.design_summary.expect("a (1 | g) fit keeps it");
         let (counts, s, c) = r.design_summary.expect("run_fit carries it");
         assert_eq!(counts, want.counts);
@@ -2232,6 +2987,7 @@ mod tests {
             Some((0..48).map(|i| 0.75 + 0.1 * (i % 6) as f64).collect()),
             None,
             None,
+            true,
             true,
             None,
             "Wald",
@@ -2479,6 +3235,7 @@ mod tests {
             None,
             None,
             true,
+            true,
             None,
             "Wald",
         )
@@ -2498,6 +3255,7 @@ mod tests {
             None,
             None,
             None,
+            true,
             true,
             None,
             "Wald",
@@ -2538,9 +3296,14 @@ mod tests {
             env!("CARGO_MANIFEST_DIR")
         );
         let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        csv_columns(&raw, &["subj", "g", "h"])
+    }
+
+    /// A CSV's columns as the maps `run_fit` takes, the `factors` as factors.
+    fn csv_columns(raw: &str, factors: &[&str]) -> Columns {
         let mut numeric = HashMap::new();
         let mut factor = HashMap::new();
-        for (col, values) in csv_table(&raw, &["subj", "g", "h"]).columns {
+        for (col, values) in csv_table(raw, factors).columns {
             match values {
                 Column::Numeric(v) => {
                     numeric.insert(col, v);
@@ -2568,17 +3331,31 @@ mod tests {
         nagq: u8,
         reml: Option<bool>,
         offset: Option<Vec<f64>>,
-    ) -> (Lowered, Fit) {
+    ) -> (Lowered, FitOptions, Fit) {
         let mut lo = lower(formula, &table(data), family).expect("lowers");
-        lo.opts.wald_se = WaldSe::Hessian;
-        lo.opts.nagq = nagq;
-        lo.opts.reml = reml;
-        lo.opts.satterthwaite = true;
+        let fit_opts = FitOptions {
+            wald_se: WaldSe::Hessian,
+            nagq,
+            reml,
+            satterthwaite: true,
+            ..FitOptions::default()
+        };
         if offset.is_some() {
-            lo.opts.offset = offset;
+            lo.offset = offset;
         }
-        let fit = fit_warm(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, None, &lo.opts);
-        (lo, fit)
+        let fit = fit_warm_wo(
+            &lo.x,
+            &lo.y,
+            lo.n,
+            lo.p,
+            &lo.model,
+            &lo.ids,
+            None,
+            lo.weights.as_deref(),
+            lo.offset.as_deref(),
+            &fit_opts,
+        );
+        (lo, fit_opts, fit)
     }
 
     fn run(
@@ -2592,7 +3369,7 @@ mod tests {
     ) -> FitResult {
         run_fit(
             formula, numeric, factor, family, link, "hessian", nagq, None, None, offset, None,
-            true, reml, "Wald",
+            true, true, reml, "Wald",
         )
         .unwrap_or_else(|e| panic!("{formula}: {e}"))
     }
@@ -2720,11 +3497,11 @@ mod tests {
                 offset.clone(),
                 None,
             );
-            let (lo, fit) = direct(formula, &data, fam, nagq, None, offset);
+            let (lo, _, fit) = direct(formula, &data, fam, nagq, None, offset);
             assert_eq!(kernel_fields(&r), fit_fields(&lo, &fit), "{formula}");
             assert_eq!(r.objective, fit.objective, "{formula}");
             assert_eq!(r.objective, objective, "{formula}");
-            assert_eq!(bits(&r.offset), bits(&lo.opts.offset), "{formula}");
+            assert_eq!(bits(&r.offset), bits(&lo.offset), "{formula}");
             assert_eq!(bits(&r.offset), bits(&want), "{formula}");
         }
     }
@@ -2761,7 +3538,7 @@ mod tests {
                 ("binomial", "logit")
             };
             let r = run(formula, sim(data), family, link, 1, None, None);
-            let (lo, fit) = direct(formula, &sim(data), fam, 1, None, None);
+            let (lo, fit_opts, fit) = direct(formula, &sim(data), fam, 1, None, None);
             for (stored, ss_type) in [
                 (&r.term_table_type3, SsType::Type3),
                 (&r.term_table_type2, SsType::Type2),
@@ -2770,7 +3547,9 @@ mod tests {
                     ss_type,
                     test: TermTest::Auto,
                 };
-                let want = term_tests(&lo, &fit, &opts).map_err(|e| e.to_string());
+                let want =
+                    term_tests_cached(&lo, &fit_opts, &fit, &opts, &mut RefitCache::default())
+                        .map_err(|e| e.to_string());
                 assert_eq!(
                     table_string(stored),
                     table_string(&want),
@@ -2819,6 +3598,101 @@ mod tests {
         assert_eq!(choice_tags(&lmm.term_test_auto), ("F", "f_test"));
     }
 
+    /// `effect_sizes` on what a port stored of a `run_fit` record, the
+    /// training columns lowered again, is `Fit::r2` and `Fit::icc` of the fit
+    /// on its own `Lowered`, bit for bit: an LMM with a random slope, a
+    /// binomial GLMM with a `cbind()` response (trial counts made by the
+    /// lowering) and a Poisson GLMM (values from a null refit). Without the
+    /// null refit the Poisson GLMM gives `None` and the others the same
+    /// values; a fit without random effects gives NaN.
+    #[test]
+    fn effect_sizes_on_stored_parts_are_the_fit_r2_and_icc() {
+        let poisson = Family::Poisson {
+            link: PoissonLink::Log,
+        };
+        let binomial = Family::Binomial {
+            link: BinomialLink::Logit,
+        };
+        let mut cbpp = csv_columns(
+            include_str!("../validation/data/empirical/cbpp.csv"),
+            &["herd", "period"],
+        );
+        let fail: Vec<f64> = cbpp.0["size"]
+            .iter()
+            .zip(&cbpp.0["incidence"])
+            .map(|(n, k)| n - k)
+            .collect();
+        cbpp.0.insert("fail".to_string(), fail);
+        let ours = |formula: &str, cols: &Columns, family, link, r: &FitResult, null_refit| {
+            effect_sizes(
+                formula,
+                cols.0.clone(),
+                cols.1.clone(),
+                family,
+                link,
+                None,
+                None,
+                &stored(r),
+                &r.aliased,
+                r.converged,
+                objective_parts(r.objective),
+                null_refit,
+            )
+            .unwrap_or_else(|e| panic!("{formula}: {e}"))
+        };
+        for (formula, cols, fam, family, link) in [
+            (
+                "y ~ g * h + x + (1 + x | subj)",
+                sim("sim_factorial"),
+                Family::Gaussian,
+                "gaussian",
+                "identity",
+            ),
+            (
+                "cbind(incidence, fail) ~ period + (1 | herd)",
+                cbpp,
+                binomial,
+                "binomial",
+                "logit",
+            ),
+            (
+                "y ~ x + (1 | g)",
+                sim("sim_poisson_bigsd"),
+                poisson,
+                "poisson",
+                "log",
+            ),
+        ] {
+            let r = run(formula, cols.clone(), family, link, 1, None, None);
+            let (lo, _, fit) = direct(formula, &cols, fam, 1, None, None);
+            let want = (
+                fit.r2(&lo.data(), lo.spec()).expect("a mixed model"),
+                fit.icc(&lo.data(), lo.spec()).expect("a mixed model"),
+            );
+            assert!(want.0.marginal.is_finite(), "{formula}");
+            let got = ours(formula, &cols, family, link, &r, true);
+            assert_eq!(format!("{got:?}"), format!("{:?}", Some(want)), "{formula}");
+            let free = ours(formula, &cols, family, link, &r, false);
+            let want_free = (fam != poisson).then_some(want);
+            assert_eq!(format!("{free:?}"), format!("{want_free:?}"), "{formula}");
+        }
+        let cols = sim("sim_factorial");
+        let ols = run(
+            "y ~ g * h + x",
+            cols.clone(),
+            "gaussian",
+            "identity",
+            1,
+            None,
+            None,
+        );
+        let (r2, icc) = ours("y ~ g * h + x", &cols, "gaussian", "identity", &ols, false)
+            .expect("no refit on OLS");
+        assert!([r2.marginal, r2.conditional, icc.adjusted, icc.unadjusted]
+            .iter()
+            .all(|v| v.is_nan()));
+    }
+
     /// `run_fit` as [`run`] makes it at `nagq = 1`, with `anova_test` given.
     fn run_asking(
         formula: &str,
@@ -2829,7 +3703,7 @@ mod tests {
     ) -> FitResult {
         run_fit(
             formula, numeric, factor, family, link, "hessian", 1, None, None, None, None, true,
-            None, anova_test,
+            true, None, anova_test,
         )
         .unwrap_or_else(|e| panic!("{formula}: {e}"))
     }
@@ -2862,7 +3736,7 @@ mod tests {
                 ("binomial", "logit")
             };
             let r = run_asking(formula, sim(data), family, link, "LRT");
-            let (lo, fit) = direct(formula, &sim(data), fam, 1, None, None);
+            let (lo, fit_opts, fit) = direct(formula, &sim(data), fam, 1, None, None);
             for (stored, ss_type) in [
                 (&r.term_table_type3_lrt, SsType::Type3),
                 (&r.term_table_type2_lrt, SsType::Type2),
@@ -2873,7 +3747,9 @@ mod tests {
                     ss_type,
                     test: TermTest::Lrt,
                 };
-                let want = term_tests(&lo, &fit, &opts).map_err(|e| e.to_string());
+                let want =
+                    term_tests_cached(&lo, &fit_opts, &fit, &opts, &mut RefitCache::default())
+                        .map_err(|e| e.to_string());
                 assert_eq!(
                     table_string(stored),
                     table_string(&want),
@@ -2937,7 +3813,7 @@ mod tests {
         let (numeric, factor) = data();
         let err = run_fit(
             formula, numeric, factor, "binomial", "logit", "hessian", 1, None, None, None, None,
-            true, None, "lrt",
+            true, true, None, "lrt",
         )
         .unwrap_err();
         assert_eq!(
@@ -2957,10 +3833,13 @@ mod tests {
         let poisson = Family::Poisson {
             link: PoissonLink::Log,
         };
-        let (lo, fit) = direct(formula, &sim("glmm_poisson"), poisson, 1, None, None);
+        let (lo, fit_opts, fit) = direct(formula, &sim("glmm_poisson"), poisson, 1, None, None);
         let want = |ss_type, test| {
             let opts = TermTestOptions { ss_type, test };
-            table_string(&term_tests(&lo, &fit, &opts).map_err(|e| e.to_string()))
+            table_string(
+                &term_tests_cached(&lo, &fit_opts, &fit, &opts, &mut RefitCache::default())
+                    .map_err(|e| e.to_string()),
+            )
         };
         let values = ["auto", "Wald", "LRT"];
         let fits = values.map(|t| run_asking(formula, sim("glmm_poisson"), "poisson", "log", t));
@@ -3093,11 +3972,11 @@ mod tests {
                     assert!(cols.den_df_kind.iter().all(|k| *k == "satterthwaite"));
                 }
             }
-            let (lo0, fit0) = direct(f0, &sim(data), fam, 1, reml, None);
-            let (lo1, fit1) = direct(f1, &sim(data), fam, 1, reml, None);
-            let want = compare(
-                &Model::from_fit(f0, &lo0, &fit0),
-                &Model::from_fit(f1, &lo1, &fit1),
+            let (lo0, opts0, fit0) = direct(f0, &sim(data), fam, 1, reml, None);
+            let (lo1, opts1, fit1) = direct(f1, &sim(data), fam, 1, reml, None);
+            let want = compare_stored(
+                &Model::from_fit(f0, &lo0, &opts0, &fit0),
+                &Model::from_fit(f1, &lo1, &opts1, &fit1),
                 &compare_options(None, None).unwrap(),
             )
             .expect("comparable");
@@ -3343,12 +4222,13 @@ mod tests {
             } else {
                 sim(data)
             };
-            let (lo, fit) = direct(formula, &columns, fam, 1, None, None);
+            let (lo, fit_opts, fit) = direct(formula, &columns, fam, 1, None, None);
             let opts = TermTestOptions {
                 ss_type,
                 test: TermTest::Auto,
             };
-            let t = term_tests(&lo, &fit, &opts).expect("a table");
+            let t = term_tests_cached(&lo, &fit_opts, &fit, &opts, &mut RefitCache::default())
+                .expect("a table");
             let c = term_columns(&t);
             let reason = if kind == "F" {
                 "f_test"
@@ -3374,9 +4254,10 @@ mod tests {
                 c.p_value.len(),
                 c.sum_sq.len(),
                 c.mean_sq.len(),
+                c.eta2_partial.len(),
                 c.row_notes.len(),
             ];
-            assert_eq!(lens, [n; 10], "{formula} on {data}");
+            assert_eq!(lens, [n; 11], "{formula} on {data}");
             for (i, row) in t.fixed.iter().enumerate() {
                 let at = format!("{formula} on {data}, row {i}");
                 assert_eq!(c.label[i], row.label, "{at}");
@@ -3385,6 +4266,7 @@ mod tests {
                 assert!(same(c.statistic[i], row.test.statistic), "{at}");
                 assert!(same(c.num_df[i], row.test.num_df), "{at}");
                 assert!(same(c.p_value[i], row.test.p_value), "{at}");
+                assert!(same(c.eta2_partial[i], row.eta2_partial()), "{at}");
                 match row.test.reference {
                     Reference::F { den_df, .. } => {
                         assert_eq!(kind, "F", "{at}");
@@ -3551,7 +4433,7 @@ mod tests {
             None,
         )
         .expect("lowers");
-        let mut fit = fit_lowered(&prepared.lowered, None).expect("fits");
+        let mut fit = fit_lowered(&prepared.lowered, &prepared.opts, None).expect("fits");
         // `term_tests` reads `aliased` at each column, past its end now.
         fit.diagnostics.aliased.clear();
         let r = flatten(prepared, fit, TermTest::Lrt).expect("the fit stands");
@@ -3660,7 +4542,7 @@ mod tests {
         let mut tested = 0;
         for (formula, data, family, link, fam, df_method) in cases {
             let r = run(formula, data.clone(), family, link, 1, None, None);
-            let (_, fit) = direct(formula, &data, fam, 1, None, None);
+            let (_, _, fit) = direct(formula, &data, fam, 1, None, None);
             assert_eq!(r.df_method, df_method, "{formula}");
             assert_eq!(
                 r.satterthwaite_record.is_some(),
@@ -3795,5 +4677,556 @@ mod tests {
                 &r.names
             )]
         );
+    }
+
+    // ── predict and simulate on a port's stored numbers ───────────────────
+
+    /// What a port stores of `r` for `predict` and `simulate`.
+    fn stored(r: &FitResult) -> StoredParts {
+        StoredParts {
+            beta: r.beta.clone(),
+            vcov: r.vcov.clone(),
+            varcorr: r.varcorr.clone(),
+            ranef: r.ranef.clone(),
+            ranef_levels: r.ranef_levels.clone(),
+            condvar: r.condvar.clone(),
+            condvar_x: r.condvar_x.clone(),
+            condvar_cross: r.condvar_cross.clone(),
+            dispersion: r.dispersion,
+        }
+    }
+
+    fn bitwise(v: &[f64]) -> Vec<u64> {
+        v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    /// `predict` and `simulate` on the numbers a port stored, the training
+    /// columns lowered again, give the kernel's `predict` and `Simulator` on
+    /// the `Fit` bit for bit: crossed (Penicillin) and nested (Pastes)
+    /// groupings, whose conditional standard error reads the covariance
+    /// across groupings, a correlated slope, a binomial GLMM and a Poisson
+    /// GLMM with an offset term.
+    #[test]
+    fn predict_and_simulate_on_stored_parts_match_the_kernel() {
+        let poisson = Family::Poisson {
+            link: PoissonLink::Log,
+        };
+        let binomial = Family::Binomial {
+            link: BinomialLink::Logit,
+        };
+        // (CSV, factor columns, formula, family, and its port family and link)
+        type Case = (
+            &'static str,
+            &'static [&'static str],
+            &'static str,
+            Family,
+            &'static str,
+            &'static str,
+        );
+        let cases: [Case; 5] = [
+            (
+                include_str!("../validation/data/empirical/Penicillin.csv"),
+                &["plate", "sample"],
+                "diameter ~ 1 + (1 | plate) + (1 | sample)",
+                Family::Gaussian,
+                "gaussian",
+                "identity",
+            ),
+            (
+                include_str!("../validation/data/empirical/Pastes.csv"),
+                &["batch", "cask", "sample"],
+                "strength ~ 1 + (1 | batch/cask)",
+                Family::Gaussian,
+                "gaussian",
+                "identity",
+            ),
+            (
+                include_str!("../validation/data/empirical/sleepstudy.csv"),
+                &["Subject"],
+                "Reaction ~ Days + (1 + Days | Subject)",
+                Family::Gaussian,
+                "gaussian",
+                "identity",
+            ),
+            (
+                include_str!("../validation/data/simulated/sim_factorial_bern.csv"),
+                &["subj", "g", "h"],
+                "y ~ x + g + (1 | subj)",
+                binomial,
+                "binomial",
+                "logit",
+            ),
+            (
+                include_str!("../validation/data/simulated/sim_poisson_offset.csv"),
+                &["cluster"],
+                "y ~ x + offset(log_exposure) + (1 | cluster)",
+                poisson,
+                "poisson",
+                "log",
+            ),
+        ];
+        let mut crossed = 0;
+        for (csv, factors, formula, fam, family, link) in cases {
+            let cols = csv_columns(csv, factors);
+            let r = run(formula, cols.clone(), family, link, 1, None, None);
+            let lo = lower(formula, &table(&cols), fam).expect("lowers");
+            let opts = FitOptions {
+                condvar: true,
+                ..FitOptions::default()
+            };
+            let fit = crate::fit(&lo.data(), lo.spec(), &opts).expect("fits");
+            assert!(fit.converged(), "{formula}");
+            let parts = stored(&r);
+            let future = fam != Family::Gaussian;
+            let ours = |parts: &StoredParts, population: bool| {
+                predict(
+                    formula,
+                    cols.0.clone(),
+                    cols.1.clone(),
+                    family,
+                    link,
+                    None,
+                    None,
+                    parts,
+                    None,
+                    "response",
+                    population,
+                    true,
+                    true,
+                    0.9,
+                    future,
+                )
+                .unwrap_or_else(|e| panic!("{formula}: {e}"))
+            };
+            for population in [false, true] {
+                let opts = PredictOptions {
+                    population,
+                    scale: Scale::Response,
+                    se: true,
+                    level: 0.9,
+                    future,
+                    ..PredictOptions::default()
+                };
+                let want = crate::predict(&fit, lo.spec(), &lo.data().design, &opts).unwrap();
+                let got = ours(&parts, population);
+                for (what, g, w) in [
+                    ("fit", &got.fit, &want.fit),
+                    ("se", &got.se, &want.se),
+                    ("lower", &got.lower, &want.lower),
+                    ("upper", &got.upper, &want.upper),
+                    ("future_lower", &got.future_lower, &want.future_lower),
+                    ("future_upper", &got.future_upper, &want.future_upper),
+                ] {
+                    assert_eq!(bitwise(g), bitwise(w), "{formula} {what} pop={population}");
+                }
+                assert!(got.notes.is_empty(), "{formula}");
+            }
+            // The covariance across groupings moves the conditional SE, so a
+            // port that dropped it would be seen here.
+            if r.condvar_cross.is_some() {
+                crossed += 1;
+                let dropped = StoredParts {
+                    condvar_cross: None,
+                    ..parts.clone()
+                };
+                let (a, b) = (ours(&parts, false).se, ours(&dropped, false).se);
+                assert!(
+                    a.iter().zip(&b).any(|(a, b)| (a - b).abs() > 1e-6 * a),
+                    "{formula}"
+                );
+            }
+            let sim = Simulator::new(&fit, lo.spec(), &lo.design()).unwrap();
+            let draws = simulate(
+                formula,
+                cols.0.clone(),
+                cols.1.clone(),
+                family,
+                link,
+                None,
+                None,
+                &parts,
+                3,
+                7,
+            )
+            .unwrap();
+            assert_eq!(draws.len(), 3 * lo.n, "{formula}");
+            for (d, got) in draws.chunks(lo.n).enumerate() {
+                assert_eq!(
+                    bitwise(got),
+                    bitwise(&sim.simulate(7, d as u64)),
+                    "{formula} draw {d}"
+                );
+            }
+        }
+        assert_eq!(crossed, 2, "Penicillin and Pastes carry a cross record");
+    }
+
+    /// A new table: lowered with the fit's levels and grouping labels, an
+    /// unseen grouping label a note with its rows, the formula door's
+    /// prediction bit for bit; and the refusals the glue adds.
+    #[test]
+    fn predict_lowers_a_new_table_as_the_formula_door_does() {
+        let csv = include_str!("../validation/data/empirical/Penicillin.csv");
+        let formula = "diameter ~ 1 + (1 | plate) + (1 | sample)";
+        let cols = csv_columns(csv, &["plate", "sample"]);
+        let r = run(formula, cols.clone(), "gaussian", "identity", 1, None, None);
+        let parts = stored(&r);
+        // Three rows: a seen pair, an unseen plate, and both unseen, with
+        // levels coded in another order than the fit's.
+        let mut numeric = HashMap::new();
+        numeric.insert("diameter".to_string(), vec![0.0; 3]);
+        let mut factor = HashMap::new();
+        let labels = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        factor.insert("plate".to_string(), (labels(&["zz", "b"]), vec![1, 0, 0]));
+        factor.insert(
+            "sample".to_string(),
+            (labels(&["F", "A", "Q"]), vec![0, 1, 2]),
+        );
+        let new_table = table_of(numeric.clone(), factor.clone()).unwrap();
+        let model = crate::formula::fit(
+            formula,
+            &table(&cols),
+            Family::Gaussian,
+            &FitOptions {
+                condvar: true,
+                ..FitOptions::default()
+            },
+        )
+        .unwrap();
+        let opts = PredictOptions {
+            se: true,
+            ..PredictOptions::default()
+        };
+        let want = crate::formula::predict(&model, &new_table, &opts).unwrap();
+        let ours = |new, population, scale: &str, level| {
+            predict(
+                formula,
+                cols.0.clone(),
+                cols.1.clone(),
+                "gaussian",
+                "identity",
+                None,
+                None,
+                &parts,
+                new,
+                scale,
+                population,
+                true,
+                true,
+                level,
+                false,
+            )
+        };
+        let got = ours(
+            Some((numeric.clone(), factor.clone(), 3)),
+            false,
+            "link",
+            0.95,
+        )
+        .unwrap();
+        assert_eq!(bitwise(&got.fit), bitwise(&want.fit));
+        assert_eq!(bitwise(&got.se), bitwise(&want.se));
+        let notes: Vec<(&str, &str)> = got
+            .notes
+            .iter()
+            .map(|n| (n.kind, n.detail.as_str()))
+            .collect();
+        assert_eq!(
+            notes,
+            [
+                ("new_grouping_levels", "0: 1, 2"),
+                ("new_grouping_levels", "1: 2")
+            ]
+        );
+        // No grouping column: population mode only.
+        let fixed_only = Some((numeric.clone(), HashMap::new(), 3));
+        assert!(ours(fixed_only.clone(), true, "link", 0.95).is_ok());
+        let err = ours(fixed_only, false, "link", 0.95).unwrap_err();
+        assert!(
+            err.contains("none of the grouping columns (plate, sample)"),
+            "{err}"
+        );
+        assert!(ours(None, false, "logit", 0.95)
+            .unwrap_err()
+            .contains("type must be"));
+        assert!(ours(None, false, "link", 1.0)
+            .unwrap_err()
+            .contains("level must be in (0, 1)"));
+        let future = predict(
+            formula,
+            cols.0.clone(),
+            cols.1.clone(),
+            "gaussian",
+            "identity",
+            None,
+            None,
+            &parts,
+            None,
+            "link",
+            false,
+            true,
+            false,
+            0.95,
+            true,
+        );
+        assert!(future
+            .unwrap_err()
+            .contains("future applies only to a non-Gaussian mixed model"));
+        // An `offset=` argument has no values for new rows.
+        let off = Some(vec![0.0; r.nobs]);
+        let r_off = run(
+            formula,
+            cols.clone(),
+            "gaussian",
+            "identity",
+            1,
+            off.clone(),
+            None,
+        );
+        let err = predict(
+            formula,
+            cols.0.clone(),
+            cols.1.clone(),
+            "gaussian",
+            "identity",
+            None,
+            off,
+            &stored(&r_off),
+            Some((numeric, factor, 3)),
+            "link",
+            false,
+            true,
+            false,
+            0.95,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("offset= argument"), "{err}");
+        for nsim in [0, MAX_NSIM + 1] {
+            assert!(simulate(
+                formula,
+                cols.0.clone(),
+                cols.1.clone(),
+                "gaussian",
+                "identity",
+                None,
+                None,
+                &parts,
+                nsim,
+                1
+            )
+            .unwrap_err()
+            .contains("nsim must be a whole number from 1 to"));
+        }
+    }
+
+    // ── pairwise on a port's stored numbers ───────────────────────────────
+
+    /// One `pairwise` case: the formula, its data, the port family and link,
+    /// the kernel family, and the comparison asked for.
+    type PairwiseCase = (
+        &'static str,
+        Columns,
+        &'static str,
+        &'static str,
+        Family,
+        Option<(&'static str, Option<Vec<f64>>)>,
+        Adjust,
+    );
+
+    /// A Satterthwaite LMM within the levels of `h`, OLS at two values of
+    /// `x` and with an empty cell (aliased columns, NaN rows), and a binomial
+    /// GLMM's z rows with odds ratios: every df route and both `by` kinds.
+    fn pairwise_cases() -> [PairwiseCase; 4] {
+        let binomial = Family::Binomial {
+            link: BinomialLink::Logit,
+        };
+        [
+            (
+                "y ~ g * h + x + (1 | subj)",
+                sim("sim_factorial"),
+                "gaussian",
+                "identity",
+                Family::Gaussian,
+                Some(("h", None)),
+                Adjust::Holm,
+            ),
+            (
+                "y ~ g * h + x",
+                sim("sim_factorial"),
+                "gaussian",
+                "identity",
+                Family::Gaussian,
+                Some(("x", Some(vec![-1.0, 0.5]))),
+                Adjust::Tukey,
+            ),
+            (
+                "y ~ g * h + x",
+                sim("sim_factorial_empty"),
+                "gaussian",
+                "identity",
+                Family::Gaussian,
+                Some(("h", None)),
+                Adjust::Bonferroni,
+            ),
+            (
+                "y ~ g * h + x + (1 | subj)",
+                sim("sim_factorial_bern"),
+                "binomial",
+                "logit",
+                binomial,
+                None,
+                Adjust::Holm,
+            ),
+        ]
+    }
+
+    /// `pairwise` on the fields `run_fit` stores and its training columns
+    /// gives `formula::pairwise` on the same model bit for bit (`{:?}` of an
+    /// `f64` round-trips), and `pairwise_columns` carries every row field.
+    #[test]
+    fn stored_pairwise_equals_formula_pairwise() {
+        for (formula, cols, family, link, fam, by, adjust) in pairwise_cases() {
+            let r = run(formula, cols.clone(), family, link, 1, None, None);
+            let model = crate::formula::fit(formula, &table(&cols), fam, &FitOptions::default())
+                .expect("fits");
+            let by_arg = by.as_ref().map(|(name, values)| match values {
+                Some(v) => By::Values(name, v),
+                None => By::Levels(name),
+            });
+            let want = crate::formula::pairwise(&model, "g", by_arg, adjust).expect("pairs");
+            let got = pairwise(
+                formula,
+                cols.0,
+                cols.1,
+                family,
+                link,
+                r.df_method,
+                &r.beta,
+                &r.vcov,
+                &r.aliased,
+                r.nobs,
+                r.satterthwaite_record.clone(),
+                "g",
+                by.as_ref().map(|(name, _)| *name),
+                by.and_then(|(_, values)| values),
+                adjust_tag(adjust),
+            )
+            .unwrap_or_else(|e| panic!("{formula}: {e}"));
+            assert_eq!(format!("{got:?}"), format!("{want:?}"), "{formula}");
+            let c = pairwise_columns(&got, &r.names);
+            assert_eq!(c.adjust, adjust_tag(adjust));
+            assert_eq!(c.levels, 3);
+            for (i, row) in got.rows.iter().enumerate() {
+                assert_eq!(
+                    format!(
+                        "{:?}",
+                        [
+                            c.estimate[i],
+                            c.se[i],
+                            c.df[i],
+                            c.statistic[i],
+                            c.p_value[i],
+                            c.p_adjusted[i],
+                            c.ratio[i],
+                            c.ratio_se[i]
+                        ]
+                    ),
+                    format!(
+                        "{:?}",
+                        [
+                            row.estimate,
+                            row.se,
+                            row.df,
+                            row.statistic,
+                            row.p_value,
+                            row.p_adjusted,
+                            row.ratio,
+                            row.ratio_se
+                        ]
+                    )
+                );
+                assert_eq!(c.contrast[i], row.contrast);
+                assert_eq!(c.by_level[i], row.by_level.clone().unwrap_or_default());
+                assert_eq!(c.row_notes[i].len(), row.notes.len());
+            }
+        }
+    }
+
+    /// `pairwise_confint` on the columns a port stores of a pairwise table
+    /// gives `Pairwise::confint` of the kernel's table bit for bit, under the
+    /// table's own adjustment and under each of the others.
+    #[test]
+    fn stored_confint_equals_pairwise_confint() {
+        let mut nan_rows = 0;
+        for (formula, cols, _, _, fam, by, _) in pairwise_cases() {
+            let model = crate::formula::fit(formula, &table(&cols), fam, &FitOptions::default())
+                .expect("fits");
+            for adjust in [
+                Adjust::Holm,
+                Adjust::Bonferroni,
+                Adjust::Tukey,
+                Adjust::None,
+            ] {
+                let by_arg = by.as_ref().map(|(name, values)| match values {
+                    Some(v) => By::Values(name, v),
+                    None => By::Levels(name),
+                });
+                let pw = crate::formula::pairwise(&model, "g", by_arg, adjust).expect("pairs");
+                let want = pw.confint(0.9).expect("intervals");
+                let c = pairwise_columns(&pw, &[]);
+                let got = pairwise_confint(
+                    &c.estimate,
+                    &c.se,
+                    &c.df,
+                    &c.p_value,
+                    c.adjust,
+                    c.levels,
+                    c.ratio_kind,
+                    0.9,
+                )
+                .expect("intervals");
+                assert_eq!(format!("{got:?}"), format!("{want:?}"), "{formula}");
+                nan_rows += got.rows.iter().filter(|r| r.lower.is_nan()).count();
+            }
+        }
+        // The empty cell's rows, under each of the four adjustments.
+        assert!(nan_rows > 0);
+        let err = |r: Result<PairwiseIntervals, String>| r.unwrap_err();
+        let one = [0.5];
+        assert!(err(pairwise_confint(
+            &one, &one, &one, &one, "sidak", 2, None, 0.95
+        ))
+        .contains("adjust must be"));
+        assert!(err(pairwise_confint(
+            &one,
+            &one,
+            &one,
+            &one,
+            "none",
+            2,
+            Some("rr"),
+            0.95
+        ))
+        .contains("ratio must be"));
+        assert!(err(pairwise_confint(
+            &one, &one, &one, &one, "none", 3, None, 0.95
+        ))
+        .contains("malformed"));
+        assert!(err(pairwise_confint(
+            &one, &one, &one, &one, "none", 2, None, 1.0
+        ))
+        .contains("level must be"));
+    }
+
+    #[test]
+    fn predict_columns_leave_out_the_response() {
+        let available: Vec<String> = ["y", "x", "g", "o", "w"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let used = predict_columns("y ~ x + offset(log(o)) + (1 | g)", &available).unwrap();
+        assert_eq!(used, ["g", "o", "x"]);
+        assert!(predict_columns("y ~ x + (1 | g", &available).is_err());
     }
 }

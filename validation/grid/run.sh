@@ -28,7 +28,9 @@
 #            `ml` in run_meta, where `compare.R --fast` reads it. A full run fits the
 #            twins with no flag and a cell run names them, so --ml is refused there.
 #   --jobs N split the cell list into N chunks and run N workers, worker i pinned
-#            with `taskset -c i`. P-cores on this box are 0-5, so N > 6 is refused.
+#            with `taskset` to the i-th core this script inherits (a timed run: core
+#            0). P-cores on this box are 0-5, so N > 6 is refused, and so is N above
+#            the inherited core count.
 #   --label  free text purpose of the run ("release 0.4.0 baseline"), stored in
 #            run_meta and slugged into the directory name.
 #   --keep   a finished glmm / glmm_wasm / glmm_python / glmm_r run replaces the
@@ -175,8 +177,31 @@ case "$ENGINE" in
   *) echo "unknown engine: $ENGINE" >&2; exit 2 ;;
 esac
 
+# Worker i runs on PIN_LIST[i]. A timed run uses core 0, a P-core, whatever the
+# caller's affinity, since its seconds are compared across runs. An untimed run
+# takes the cores it inherits (`taskset -c 2,3 ./run.sh ...` keeps its workers
+# on 2 and 3), so it shares the machine the way its caller asked.
 PIN_CORES=none
-command -v taskset >/dev/null && PIN_CORES="0-$((JOBS - 1))"
+PIN_LIST=()
+if command -v taskset >/dev/null; then
+  if [[ -n "$TIMED_N" ]]; then
+    PIN_LIST=(0)
+  else
+    IFS=, read -ra spans <<< "$(taskset -cp $$ | sed 's/.*: //')"
+    for s in "${spans[@]}"; do
+      if [[ "$s" == *-* ]]; then
+        for ((c = ${s%-*}; c <= ${s#*-}; c++)); do PIN_LIST+=("$c"); done
+      else
+        PIN_LIST+=("$s")
+      fi
+    done
+    (( JOBS <= ${#PIN_LIST[@]} )) || {
+      echo "--jobs $JOBS exceeds the ${#PIN_LIST[@]} cores this run may use (${PIN_LIST[*]})" >&2
+      exit 2
+    }
+  fi
+  PIN_CORES=$(IFS=,; echo "${PIN_LIST[*]:0:JOBS}")
+fi
 [[ "$PIN_CORES" == none ]] && echo ">> taskset not found -- workers run unpinned" >&2
 
 # ---- cell selection --------------------------------------------------------
@@ -309,7 +334,7 @@ mkdir -p "$RUN_DIR"
 # Every value here is RECORDED, never set -- no_turbo especially: clock locking
 # is the user's bench-l/bench-u, and this script only writes down what it found.
 write_run_meta() {   # $1 = the cell_list JSON array
-  local cell_list="$1" no_turbo loadavg rev crate r_ver jl_ver
+  local cell_list="$1" no_turbo loadavg rev tree crate r_ver jl_ver
   no_turbo="$(cat /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null || echo '?')"
   # The 1/5/15-minute load averages as the run starts: foreign load is invisible
   # to no_turbo and to the pin, and it is what makes two locked runs disagree.
@@ -321,13 +346,25 @@ write_run_meta() {   # $1 = the cell_list JSON array
   # code built the run. Untracked files are not counted.
   rev="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
   [[ "$rev" == unknown ]] || git -C "$ROOT" diff --quiet HEAD -- || rev="$rev-dirty"
+  # What `-dirty` cannot say: WHICH uncommitted code. A hash of the kernel's and the
+  # ports' sources as they differ from HEAD, untracked files included, so two runs
+  # on one dirty tree can be told from runs on two. compare.R's port gate refuses a
+  # port run whose rev or hash differs from the glmm run's.
+  # Cargo.lock is left out: the glmm build after this point may rewrite it, and
+  # Cargo.toml already names the dependencies.
+  local code=(src Cargo.toml glmm-python glmm-r python/glmm r/R r/src
+              validation/grid/engines/common.rs validation/grid/engines/glmm.rs
+              validation/grid/engines/glmm_python.py validation/grid/engines/glmm_r.R)
+  tree="$( { git -C "$ROOT" diff HEAD -- "${code[@]}"
+             git -C "$ROOT" ls-files -z --others --exclude-standard -- "${code[@]}" \
+               | (cd "$ROOT" && xargs -0 cat); } 2>/dev/null | git hash-object --stdin)"
   crate="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$ROOT/Cargo.toml" | head -1)"
   r_ver="$(Rscript -e 'cat(as.character(getRversion()))' 2>/dev/null || echo '?')"
   jl_ver="$(julia --version 2>/dev/null | awk '{print $3}' || echo '?')"
   jq -n \
     --arg engine "$ENGINE" --arg engine_version "$ENGINE_VERSION" \
     --arg machine "$MACHINE" --arg date "$(date -Iseconds)" \
-    --arg crate "$crate" --arg rev "$rev" --arg subset "$SUBSET" \
+    --arg crate "$crate" --arg rev "$rev" --arg tree "$tree" --arg subset "$SUBSET" \
     --arg no_turbo "$no_turbo" --arg pin "$PIN_CORES" \
     --arg loadavg "$loadavg" --arg r "$r_ver" --arg jl "$jl_ver" \
     --arg label "$LABEL" --arg completed_from "${COMPLETED_FROM:-}" \
@@ -338,7 +375,8 @@ write_run_meta() {   # $1 = the cell_list JSON array
     --argjson jobs "$JOBS" --argjson cells "${#SELECTED[@]}" \
     --argjson cell_list "$cell_list" \
     '{engine: $engine, engine_version: $engine_version, machine: $machine, date: $date,
-      glmm_crate_version: $crate, glmm_git_rev: $rev, subset: $subset, ml: $ml,
+      glmm_crate_version: $crate, glmm_git_rev: $rev, glmm_tree_hash: $tree,
+      subset: $subset, ml: $ml,
       timed: $timed, pipeline: $pipeline, timed_unlocked: $unlocked, no_turbo: $no_turbo,
       pin_cores: $pin, jobs: $jobs, loadavg_start: $loadavg,
       r_version: $r, julia_version: $jl, label: $label, cells: $cells,
@@ -426,7 +464,7 @@ run_worker() {   # $1 = part index
   (( ${#cells[@]} )) || return 0
   out="$RUN_DIR/results.part$part.jsonl"
   export GRID_OUT="$out" GRID_CELLS="$(printf '%s\n' "${cells[@]}" | paste -sd, -)"
-  [[ "$PIN_CORES" == none ]] || pin=(taskset -c "$part")
+  [[ "$PIN_CORES" == none ]] || pin=(taskset -c "${PIN_LIST[$part]}")
   touch "$out"
 
   while MISSING=$(next_missing); do

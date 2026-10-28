@@ -15,8 +15,7 @@
 //!      scratch trees shows the actual numeric movement the harness exists
 //!      to measure — see README.md for a worked example.
 use glmm::{
-    Family, FitOptions, GroupIds, Grouping, GroupingRelation, ModelSpec, NegBinomialLink,
-    ReStructure, Sizing, WaldSe,
+    Family, FitOptions, GroupIds, Grouping, ModelSpec, NegBinomialLink, ReStructure, SeFor, WaldSe,
 };
 
 /// Map string factor labels to dense 0-based ids (first-seen order) — same
@@ -59,29 +58,20 @@ fn main() {
         x[i * p] = 1.0;
         x[i * p + 1] = xcol[i];
     }
-    let model = ModelSpec {
-        family: Family::NegativeBinomial {
+    let re = (0..7).fold(ReStructure::intercept(), |re, _| re.extra(Grouping::crossed()));
+    let model = ModelSpec::mixed(
+        Family::NegativeBinomial {
             link: NegBinomialLink::Log,
         },
-        re: Some(ReStructure {
-            sizing: Sizing::FixedClusters { n_clusters: 1 },
-            slopes: vec![],
-            extra_groupings: (0..7)
-                .map(|_| Grouping {
-                    relation: GroupingRelation::Crossed { n_clusters: 1 },
-                    slopes: vec![],
-                })
-                .collect(),
-        }),
-    };
-    let ids = GroupIds {
-        primary: dense_ids(&fac[0]),
-        extra: fac[1..].iter().map(|f| dense_ids(f)).collect(),
-    };
+        re,
+    );
+    let ids = fac[1..]
+        .iter()
+        .fold(GroupIds::new(dense_ids(&fac[0])), |ids, f| ids.extra(dense_ids(f)));
     let mut opts = FitOptions::default();
-    opts.target_indices = vec![0, 1];
+    opts.se_for = SeFor::Only(vec![0, 1]);
     opts.wald_se = WaldSe::Rx;
-    let f = glmm::fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    let f = glmm::fit(&glmm::Data::new(&x, &y, n, p).ids(&ids), &model, &opts).unwrap();
     println!("converged      = {:?}", f.converged());
     println!("beta           = {:?}", f.beta);
     println!("se             = {:?}", f.se);

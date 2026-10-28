@@ -1,0 +1,32 @@
+{
+  "name": "machines_zerocorr_lmm_tmb",
+  "engine": "glmmTMB::glmmTMB",
+  "engine_version": "1.1.14",
+  "kind": "lmm",
+  "data": "Machines_dummy",
+  "family": "gaussian",
+  "link": {},
+  "nagq": 1,
+  "r_formula": "score ~ 1 + Machine + (1 + MachineB + MachineC || Worker)",
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)", "MachineB", "MachineC"],
+  "estimates": {
+    "beta": [52.3555555555556, 7.96666666666667, 13.9166666666667],
+    "se": [1.67869986018413, 2.42561951727318, 1.52307466737242],
+    "loglik": -106.117205869639,
+    "varcomp": [
+      {
+        "group": "Worker",
+        "terms": ["(Intercept)", "MachineB", "MachineC"],
+        "stddev": [4.07425336149978, 5.88935162100707, 3.6470838919264],
+        "corr": [
+          [1, 0, 0],
+          [0, 1, 0],
+          [0, 0, 1]
+        ]
+      }
+    ],
+    "sigma": 0.962276784195111
+  }
+}

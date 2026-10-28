@@ -2,7 +2,7 @@
 % Please edit documentation in R/extendr-wrappers.R
 \name{fastglmm_anova_pair}
 \alias{fastglmm_anova_pair}
-\title{\verb{glmm::formula::anova::compare} for \code{anova(m0, m1)}: compares two stored
+\title{\verb{glmm::formula::anova::compare_stored} for \code{anova(m0, m1)}: compares two stored
 fits as they are, with no refit and no data. \code{m0} and \code{m1} are named lists
 of the fields a fit object stores (the R wrapper's \code{.compare_side()}
 builds them). Returns \code{list(comparison, nsim, seed)} as \code{fastglmm_compare}
@@ -11,7 +11,7 @@ refusal's message and its kind, so the wrapper can point to its own
 \code{compare()} where the kind calls for it (\code{kind} is \code{"other"} for the
 refusals that need no pointer).}
 \description{
-\verb{glmm::formula::anova::compare} for \code{anova(m0, m1)}: compares two stored
+\verb{glmm::formula::anova::compare_stored} for \code{anova(m0, m1)}: compares two stored
 fits as they are, with no refit and no data. \code{m0} and \code{m1} are named lists
 of the fields a fit object stores (the R wrapper's \code{.compare_side()}
 builds them). Returns \code{list(comparison, nsim, seed)} as \code{fastglmm_compare}

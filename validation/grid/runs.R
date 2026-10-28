@@ -138,8 +138,26 @@ newest_oracle_run <- function(grid_dir, oracle, want_version, required_cells) {
 # alone.
 LME4_GLMER_MAXFUN <- 10000L
 
-reclassify_capped_oracle <- function(run, oracle, cells) {
+# The other way round: a record whose only lme4 messages are the singular-fit note
+# (and the 'use.hessian' vcov note that the singular fit causes) is CONVERGED on
+# read. lme4.R files every lme4 message as unconverged, while lmertest.R keeps
+# singular fits, so the same lme4 optimum was a reference for gate 5 and not for
+# gates 1 to 3. lme4's checkConv returns right after the singular note, so no
+# gradient or Hessian check ran on these fits: compare.R takes such a record as a
+# parameter reference only at glmm's optimum (`at_glmm_optimum`), as it takes
+# every other. Applied before the evaluation-cap test, which still fails a
+# singular fit that stopped at the cap.
+LME4_SINGULAR_ONLY <- c(
+  "boundary (singular) fit: see help('isSingular')",
+  paste0("boundary (singular) fit: see help('isSingular'); ",
+         "'use.hessian'=TRUE specified, but Hessian is unavailable"))
+
+reclassify_lme4_on_read <- function(run, oracle, cells) {
   if (is.null(run) || !identical(oracle, "lme4")) return(run)
+  for (cid in names(run$recs)) {
+    if (isTRUE(run$recs[[cid]]$message %in% LME4_SINGULAR_ONLY))
+      run$recs[[cid]]$converged <- TRUE
+  }
   for (cid in names(run$recs)) {
     r <- run$recs[[cid]]
     cl <- cells[[cid]]
@@ -362,6 +380,32 @@ best_oracle_dev <- function(cell, oracle_recs, e_big) {
        why = NA_character_)
 }
 
+# How far oracle `who`'s record `r` sits above glmm's record `g` in deviance on
+# this cell (negative: below), on the scale gate 1 reads: on a ga_rule_cell
+# GLMMadaptive is read against glmm's point under GLMMadaptive's own rule. NA
+# when either side has no usable deviance. Gates 2 and 5 take a parameter
+# reference only at glmm's optimum, and the near-zero SD floor below needs the
+# two fits at the same optimum; both ask this.
+dev_gap <- function(g, r, who, cell) {
+  gd <- if (identical(who, "GLMMadaptive") && ga_rule_cell(cell))
+          suppressWarnings(ga_rule_dev(g, cell)) else aligned_dev(g, cell)
+  rd <- aligned_dev(r, cell)
+  if (length(gd) != 1L || length(rd) != 1L || is.na(gd) || is.na(rd)) return(NA_real_)
+  as.numeric(rd) - as.numeric(gd)
+}
+
+# The near-zero floor of one stddev comparison. With the two fits at the same
+# optimum (deviances within dev_eps), an SD below TOL$sd_boundary_abs on both
+# sides scores 0: the deviance is flat in a near-zero SD, so the data do not
+# determine it, and one engine's exact 0 against another's residue is not a
+# disagreement. Anywhere else the general near_zero_abs.
+sd_floor <- function(g, r, who, cell) {
+  gap <- dev_gap(g, r, who, cell)
+  if (!is.na(gap) && abs(gap) <= tol_for(cell[["cell"]], "dev_eps"))
+    tol_for(cell[["cell"]], "sd_boundary_abs")
+  else tol_for(cell[["cell"]], "near_zero_abs")
+}
+
 # The verdict for one cell. eps and big are read through tol_for(cell[["cell"]], ...)
 # at the call site -- NEVER `TOL$dev_eps` directly. tol_for is where the NA guard
 # lives, and a gate that bypassed it would compare against NA (which is FALSE
@@ -404,7 +448,9 @@ has_quantity <- function(rec, quantity) switch(quantity,
 # the defect visible instead.
 # Returns the SMALLEST difference over the oracles and which oracle gave it;
 # NA_real_ when no oracle offered a comparable vector at all.
-nearest_oracle_diff <- function(g, oracle_recs, cell, quantity) {
+# `sd_boundary = FALSE` keeps every stddev comparison on near_zero_abs: compare.R
+# --dev-floor measures dev_eps, so it cannot read the floor that dev_eps gates.
+nearest_oracle_diff <- function(g, oracle_recs, cell, quantity, sd_boundary = TRUE) {
   best <- NA_real_; who <- NA_character_
   for (o in names(oracle_recs)) {
     r <- oracle_recs[[o]]
@@ -421,7 +467,9 @@ nearest_oracle_diff <- function(g, oracle_recs, cell, quantity) {
       # they do not, the two vectors can still be the same length while meaning
       # different things, and a number computed over them is not a comparison.
       stddev     = if (!identical(varcomp_keys(g), varcomp_keys(r))) NA_real_
-                   else rel_max(stddevs_of(g), stddevs_of(r)),
+                   else rel_max(stddevs_of(g), stddevs_of(r),
+                                atol = if (sd_boundary) sd_floor(g, r, o, cell)
+                                       else tol_for(cell[["cell"]], "near_zero_abs")),
       # ABSOLUTE, and the band doubles as the near-zero floor -- see corr_abs_max.
       corr       = if (!identical(varcomp_keys(g), varcomp_keys(r))) NA_real_
                    else corr_abs_max(corrs_of(g), corrs_of(r), band_for(cell, "corr")),
@@ -553,12 +601,19 @@ truth_extract <- list(
     as.numeric(rec$beta)[perm]
   },
   stddev = function(rec, cell) stddevs_of(rec),
-  corr = function(rec, cell) corrs_of(rec))
+  corr = function(rec, cell) if (uncorrelated_cell(cell)) numeric(0) else corrs_of(rec))
 
 truth_vector <- list(
   beta = function(cell) as.numeric(cell[["truth"]][["beta"]]),
   stddev = function(cell) stddevs_of(list(varcomp = cell[["truth"]][["varcomp"]])),
-  corr = function(cell) corrs_of(list(varcomp = cell[["truth"]][["varcomp"]])))
+  corr = function(cell) if (uncorrelated_cell(cell)) numeric(0)
+                        else corrs_of(list(varcomp = cell[["truth"]][["varcomp"]])))
+
+# A `||` term fixes its correlations at 0, so they are not estimates and gate 3
+# has nothing to score. The engines record them three ways -- glmmTMB as 0, glmm
+# as null, lme4 not at all, because it splits the term into one block per column
+# -- and only dropping them on both sides compares like with like.
+uncorrelated_cell <- function(cell) isTRUE(grepl("||", cell[["r_formula"]], fixed = TRUE))
 
 # Ceil-to-one-significant-figure, the house rule every measured band in tol.R
 # follows.

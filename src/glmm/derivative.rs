@@ -2711,6 +2711,7 @@ pub(crate) fn laplace_hessian(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fit::SizedSpec;
 
     /// A `HyperDual` rung carries no assembly scratch: the assembled pass runs on
     /// the `Dual` rungs alone, and `m·k` second-order numbers would be megabytes
@@ -3023,10 +3024,12 @@ mod tests {
     fn laplace_hessian_m_above_cap_is_unsupported() {
         assert!(NLanes::pick(MAX_DUAL_N + 1, true).is_none());
 
-        let mut model = crate::test_support::intercept_only_spec(crate::Sizing::FixedClusters {
-            n_clusters: 3,
-        });
-        model.family = crate::Family::Binomial {
+        let mut model = SizedSpec {
+            spec: crate::test_support::intercept_only_spec(),
+            n_primary: 3,
+            extra_counts: vec![],
+        };
+        model.spec.family = crate::Family::Binomial {
             link: crate::BinomialLink::Logit,
         };
         let n = 3;

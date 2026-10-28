@@ -28,7 +28,8 @@ pub const MAX_EXTRA_Q: usize = 4;
 
 /// Max θ length: full primary `vech(Λ_p)` plus a `vech(Λ_g)` block per extra
 /// grouping. For `MAX_EXTRA_Q = 1` this collapses to one scalar per extra:
-/// `… + MAX_EXTRA_GROUPINGS`.
+/// `… + MAX_EXTRA_GROUPINGS`. A block whose terms hold entries at zero still
+/// counts its full triangle here, since θ keeps the full layout.
 pub const MAX_THETA: usize = MAX_PRIMARY_Q * (MAX_PRIMARY_Q + 1) / 2
     + MAX_EXTRA_GROUPINGS * (MAX_EXTRA_Q * (MAX_EXTRA_Q + 1) / 2);
 

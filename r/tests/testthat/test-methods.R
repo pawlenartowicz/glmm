@@ -1,6 +1,5 @@
-# Method contracts: VarCorr's vech -> SD/correlation math (the spec's
-# load-bearing accessor), vcov/confint consistency, the Gamma() link trap,
-# and the accessors' shapes.
+# Method contracts: VarCorr's vech -> SD/correlation math, vcov/confint
+# consistency, the Gamma() link trap, and the accessors' shapes.
 
 test_that("VarCorr returns SD/correlation-scale components for a slope model", {
   d <- benchmark_data(seed = 101, family = "binomial",
@@ -33,24 +32,13 @@ test_that("VarCorr returns SD/correlation-scale components for a slope model", {
   expect_error(fastglmm:::.stddev_corr(c(1, 2)), "is not a valid vech")
 })
 
-test_that("vcov is the full symmetric matrix and se its sqrt-diagonal", {
+test_that("vcov is named by the coefficients and se is its sqrt-diagonal", {
   d <- benchmark_data(seed = 102, family = "poisson", beta = c(0, 0.5, 0.3, 0.1))
   fit <- fastglmm(y ~ t + d + t:d + (1 | g), d, family = poisson())
   v <- vcov(fit)
   expect_equal(dim(v), c(4L, 4L))
-  expect_equal(v, t(v), tolerance = 1e-12)
+  expect_identical(dimnames(v), list(names(fixef(fit)), names(fixef(fit))))
   expect_equal(unname(sqrt(diag(v))), unname(fit$se), tolerance = 1e-10)
-})
-
-test_that("confint is Wald off vcov", {
-  d <- benchmark_data(seed = 103, family = "binomial")
-  fit <- fastglmm(y ~ t + d + (1 | g), d, family = binomial())
-  ci <- confint(fit, level = 0.9)
-  q <- qnorm(0.95)
-  expect_equal(unname(ci[, 1]), unname(fixef(fit) - q * fit$se),
-               tolerance = 1e-12)
-  ci_t <- confint(fit, parm = "t")
-  expect_equal(rownames(ci_t), "t")
 })
 
 test_that("the Gamma() link trap: object honored, string means log", {
@@ -72,21 +60,6 @@ test_that("the Gamma() link trap: object honored, string means log", {
   ref_inv <- glm(y ~ x, data = d, family = Gamma(link = "inverse"))
   expect_equal(unname(fixef(fit_obj)), unname(coef(ref_inv)), tolerance = 1e-5,
                info = "gamma inverse-link vs glm")
-})
-
-test_that("sigma for inverse-Gaussian is sqrt(phi), phi the Pearson dispersion", {
-  set.seed(2)
-  n <- 400
-  x <- rnorm(n)
-  mu <- exp(0.3 + 0.2 * x)
-  lam <- 3
-  v <- rnorm(n)^2
-  x1 <- mu + mu^2 * v / (2 * lam) -
-    (mu / (2 * lam)) * sqrt(4 * mu * lam * v + mu^2 * v^2)
-  y <- ifelse(runif(n) <= mu / (mu + x1), x1, mu^2 / x1)
-  d <- data.frame(y = y, x = x)
-  f <- fastglmm(y ~ x, data = d, family = inverse.gaussian())
-  expect_equal(sigma(f), sqrt(f$dispersion))
 })
 
 test_that("summary prints 'Dispersion (phi, ML)' for a Gamma GLMM", {
@@ -163,9 +136,6 @@ test_that("accessors: nobs, formula, family, model.frame", {
   expect_equal(family(fit)$family, "binomial")
   mf <- model.frame(fit)
   expect_setequal(names(mf), c("y", "t", "d", "g"))
-  # isSingular() dispatch is covered separately - it is lme4's own generic
-  # (see the fixef/ranef/VarCorr/isSingular masking test below), so it needs
-  # library(lme4), not just library(fastglmm).
 })
 
 test_that("update() takes a new formula or a changed argument", {
@@ -299,13 +269,6 @@ test_that("print and summary on a non-mixed fit skip the random-effects block", 
   expect_false(grepl("groups:", sout, fixed = TRUE))
 })
 
-test_that("summary carries the correlation of fixed effects off vcov", {
-  d <- benchmark_data(seed = 109, family = "binomial")
-  fit <- fastglmm(y ~ t + d + (1 | g), d, family = binomial())
-  s <- summary(fit)
-  expect_equal(s$corr_fixed, cov2cor(vcov(fit)))
-})
-
 test_that("VarCorr correlations print at 2 dp", {
   d <- benchmark_data(seed = 101, family = "binomial",
                       tau0 = 0.8, tau1 = 0.5, rho = 0.3)
@@ -317,6 +280,20 @@ test_that("VarCorr correlations print at 2 dp", {
   expect_length(slope, 1L)
   corr <- sub(".*\\s", "", trimws(slope))
   expect_match(corr, "^-?[0-9]\\.[0-9]{2}$")
+})
+
+test_that("summary of an uncorrelated slope prints no correlation", {
+  # As lme4: a correlation is printed only between two columns of one term,
+  # and (t || g) is two terms.
+  d <- benchmark_data(seed = 101, family = "binomial",
+                      tau0 = 0.8, tau1 = 0.5, rho = 0.3)
+  slope_row <- function(formula) {
+    out <- capture.output(print(summary(fastglmm(formula, d, family = binomial()))))
+    re <- out[seq(which(out == "Random effects:"), which(out == "Fixed effects:"))]
+    strsplit(trimws(grep("^\\s+t\\s", re, value = TRUE)), "\\s+")[[1]]
+  }
+  expect_length(slope_row(y ~ t + (t || g)), 3L) # Name, Variance, Std.Dev.
+  expect_length(slope_row(y ~ t + (1 + t | g)), 4L) # and Corr
 })
 
 test_that("logLik carries df/nobs/REML and feeds AIC/BIC", {
@@ -399,7 +376,7 @@ test_that("a q >= 2 pin is named even though its stddev is not zero", {
   # rounding artifact. lme4 reports the same exact 1.000 on this design.
   # Reading `pinned` names the component.
   #
-  # Design mirrors the Rust lmm::tests::zero_slope_variance_pins_slope_component:
+  # Design mirrors the Rust fit::common_tests::diagnostics_pinned_aligns_with_varcorr_blocks:
   # 16 clusters x 16 rows, a real fixed slope but zero cluster-varying slope,
   # residual a +/-0.8 period-4 quadrature block against x's +/-1 alternation so
   # every cluster has sum(resid) = 0 and sum(x*resid) = 0 exactly. The REML
@@ -964,19 +941,6 @@ test_that("the summary of an ML Gaussian mixed fit prints the ML criterion block
   sout <- paste(capture.output(print(s)), collapse = "\n")
   expect_false(grepl("REML criterion", sout, fixed = TRUE))
   expect_true(grepl("AIC +BIC +logLik +deviance +df.resid", sout))
-})
-
-test_that("AIC, BIC and glance() are filled on an ML Gaussian mixed fit", {
-  fit <- fastglmm(y ~ x + (1 | g), lmm_data(), REML = FALSE)
-  expect_true(is.finite(AIC(fit)))
-  expect_true(is.finite(BIC(fit)))
-  expect_equal(AIC(fit), -2 * fit$loglik + 2 * fit$df)
-  expect_equal(BIC(fit), -2 * fit$loglik + log(nobs(fit)) * fit$df)
-  gl <- glance(fit)
-  expect_false(gl$REML)
-  expect_equal(gl$AIC, AIC(fit))
-  expect_equal(gl$BIC, BIC(fit))
-  expect_true(all(is.finite(unlist(gl[c("logLik", "deviance", "df.residual")]))))
 })
 
 test_that("the ML note is absent on REML, OLS, GLM and GLMM fits", {

@@ -21,10 +21,17 @@
 //!
 //! Centering is exact only where an intercept absorbs the constant `−mⱼβⱼ` it
 //! adds: in `X` that is the intercept column; in a random-effect block that
-//! uses column `j` as a slope it is the block's own random intercept, which
-//! every block has (`q = 1 + slopes`, one unrestricted covariance). A block
-//! without a random intercept, or with its slope outside the intercept's
-//! covariance, would have to veto centering here.
+//! uses column `j` as a slope it is the block's own random intercept, and only
+//! when the slope is in the same unstructured term as that intercept. A slope
+//! in any other term (`(x || g)`, or a block without a random intercept) is
+//! therefore scaled about zero and not centered, as a 0/1 slope is; a column
+//! that is such a slope in one grouping is not centered in any.
+//!
+//! A random-effect-only column (`Design::re_columns`, slope index `p + j`) is
+//! never centered and always divided by its prior-weighted root mean square
+//! about zero, the rule a slope column of `X` gets on a design fitted as
+//! given. Dividing a column of `Z` is an exact reparametrization of every
+//! block, whatever its terms, and leaves `X` and `β` untouched.
 
 use faer::MatMut;
 
@@ -43,6 +50,12 @@ pub(crate) struct ColumnScaling {
     /// Columns a random-effect block reads as a slope ([`Self::with_re_slopes`]),
     /// fixed at build.
     re_slope: Vec<bool>,
+    /// The slope columns that must not be centered ([`Self::with_re_slopes`]),
+    /// fixed at build.
+    re_uncentered: Vec<bool>,
+    /// `sⱼ` of random-effect-only column `j` (slope index `p + j`),
+    /// [`Self::compute_re_only`]'s; empty when the design has none.
+    re_only_scale: Vec<f64>,
     intercept: Option<usize>,
     identity: bool,
 }
@@ -62,6 +75,8 @@ impl ColumnScaling {
         shift: Vec::new(),
         flags: Vec::new(),
         re_slope: Vec::new(),
+        re_uncentered: Vec::new(),
+        re_only_scale: Vec::new(),
         intercept: None,
         identity: true,
     };
@@ -73,17 +88,30 @@ impl ColumnScaling {
             shift: vec![0.0; p],
             flags: vec![0; p],
             re_slope: vec![false; p],
+            re_uncentered: vec![false; p],
+            re_only_scale: Vec::new(),
             intercept: None,
             identity: true,
         }
     }
 
     /// The identity map of width `p`, with `slopes`, the columns the
-    /// random-effect blocks read as slopes, marked for [`Self::compute`].
-    pub(crate) fn with_re_slopes(p: usize, slopes: impl IntoIterator<Item = usize>) -> Self {
+    /// random-effect blocks read as slopes, and `uncentered`, the slope
+    /// columns that are in no unstructured term with their grouping's random
+    /// intercept, marked for [`Self::compute`]. A column in both lists (a
+    /// slope in two groupings, one of which vetoes) is not centered.
+    pub(crate) fn with_re_slopes(
+        p: usize,
+        slopes: impl IntoIterator<Item = usize>,
+        uncentered: impl IntoIterator<Item = usize>,
+    ) -> Self {
         let mut cs = Self::identity(p);
         for c in slopes {
             cs.re_slope[c] = true;
+        }
+        for c in uncentered {
+            cs.re_slope[c] = true;
+            cs.re_uncentered[c] = true;
         }
         cs
     }
@@ -166,10 +194,12 @@ impl ColumnScaling {
             // Intercept, 0/1 columns and any further all-ones column: as they
             // are. A constant column next to an intercept has no spread to
             // scale; its computed `sⱼ` would be the round-off of `mⱼ` alone.
-            // Either kind read as a random-effect slope is scaled about zero.
+            // Either kind read as a random-effect slope is scaled about zero,
+            // and so is a slope that must not be centered.
             let kept = !standardize
                 || self.flags[j] & FLAG_BINARY != 0
-                || (self.intercept.is_some() && self.flags[j] & FLAG_CONSTANT != 0);
+                || (self.intercept.is_some() && self.flags[j] & FLAG_CONSTANT != 0)
+                || self.re_uncentered[j];
             let scaled = !kept || (self.re_slope[j] && Some(j) != self.intercept);
             self.flags[j] = u8::from(scaled);
             *c = if kept || self.intercept.is_none() {
@@ -214,6 +244,43 @@ impl ColumnScaling {
         }
     }
 
+    /// This draw's statistics of the random-effect-only columns, row-major
+    /// `n×s` `z`, after [`Self::compute`] (which resets the map): each column
+    /// gets `sⱼ = √(Σwᵢzᵢⱼ²/Σwᵢ)` and no center, accumulated in ascending row
+    /// order as `compute` accumulates a column it does not center. A column
+    /// whose `sⱼ` is zero or not finite is left as it is.
+    pub(crate) fn compute_re_only(
+        &mut self,
+        z: &[f64],
+        n: usize,
+        s: usize,
+        weights: Option<&[f64]>,
+    ) {
+        self.re_only_scale.clear();
+        self.re_only_scale.resize(s, 0.0);
+        if s == 0 {
+            return;
+        }
+        let ss = &mut self.re_only_scale;
+        let mut sw = 0.0;
+        for (i, row) in z[..n * s].chunks_exact(s).enumerate() {
+            let wi = weights.map_or(1.0, |w| w[i]);
+            sw += wi;
+            for (a, &v) in ss.iter_mut().zip(row) {
+                *a += if weights.is_some() { wi * v * v } else { v * v };
+            }
+        }
+        for a in ss.iter_mut() {
+            let sj = (*a / sw).sqrt();
+            *a = if sj > 0.0 && sj.is_finite() {
+                self.identity = false;
+                sj
+            } else {
+                1.0
+            };
+        }
+    }
+
     pub(crate) fn is_identity(&self) -> bool {
         self.identity
     }
@@ -228,30 +295,44 @@ impl ColumnScaling {
     pub(crate) fn center(&self, j: usize) -> f64 {
         self.center[j]
     }
-    /// `sⱼ`; 1 on a column left as it is (and on [`Self::IDENTITY`]).
+    /// `sⱼ` of slope index `j` (a column of `X` below `p`, a random-effect-only
+    /// column from `p`); 1 on a column left as it is (and on
+    /// [`Self::IDENTITY`]).
     pub(crate) fn scale(&self, j: usize) -> f64 {
         if self.identity {
             1.0
+        } else if let Some(s) = self.re_only(j) {
+            s
         } else {
             self.scale[j]
         }
     }
-    /// `mⱼ/sⱼ`; 0 on a column left as it is (and on [`Self::IDENTITY`]).
+    /// `mⱼ/sⱼ` of slope index `j`, as [`Self::scale`]; 0 on a column left as
+    /// it is, on a random-effect-only column (and on [`Self::IDENTITY`]).
     pub(crate) fn shift(&self, j: usize) -> f64 {
-        if self.identity {
+        if self.identity || j >= self.scale.len() {
             0.0
         } else {
             self.shift[j]
         }
     }
 
-    /// Column `j` of `x̃` in place, `v ← (v − mⱼ)/sⱼ`; a column left as it is
-    /// is not touched.
+    /// The scale of random-effect-only column `j − p`, `None` below `p`.
+    fn re_only(&self, j: usize) -> Option<f64> {
+        let p = self.scale.len();
+        (j >= p).then(|| self.re_only_scale[j - p])
+    }
+
+    /// Column `j` of `x̃` in place, `v ← (v − mⱼ)/sⱼ`, `j` a slope index as in
+    /// [`Self::scale`]; a column left as it is is not touched.
     pub(crate) fn standardize_column(&self, j: usize, col: &mut [f64]) {
         if self.identity {
             return;
         }
-        let (m, s) = (self.center[j], self.scale[j]);
+        let (m, s) = match self.re_only(j) {
+            Some(s) => (0.0, s),
+            None => (self.center[j], self.scale[j]),
+        };
         if m == 0.0 && s == 1.0 {
             return;
         }
@@ -330,6 +411,21 @@ impl ColumnScaling {
         for (j, b) in beta.iter_mut().enumerate() {
             if Some(j) != self.intercept {
                 *b *= self.scale[j];
+            }
+        }
+    }
+
+    /// `r → r·B⁻¹` in place, `r` a row against the columns of `x̃`: since
+    /// `x̃ = X·B`, the same row against the caller's `X`. `rₜ ← sₜrₜ + mₜr₀`
+    /// off the intercept, which is unchanged.
+    pub(crate) fn row_to_caller(&self, row: &mut [f64]) {
+        if self.identity {
+            return;
+        }
+        let r0 = self.intercept.map_or(0.0, |c| row[c]);
+        for (j, v) in row.iter_mut().enumerate() {
+            if Some(j) != self.intercept {
+                *v = self.scale[j] * *v + self.center[j] * r0;
             }
         }
     }

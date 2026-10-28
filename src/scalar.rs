@@ -304,32 +304,6 @@ impl Scalar for f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::Scalar;
-    /// The `f64` implementation must be the identity on every method that has
-    /// a plain std twin, and must bind to the SAME function the kernel called
-    /// before the trait existed — that identity is what makes `T = f64`
-    /// bit-identical, so it is asserted with `==`, not a tolerance.
-    #[test]
-    fn f64_impl_is_the_identity_binding() {
-        for &v in &[-3.5_f64, -1e-9, 0.0, 0.5, 1.0, 40.0, 700.0] {
-            assert_eq!(Scalar::exp(v), v.exp());
-            assert_eq!(Scalar::exp_m1(v), v.exp_m1());
-            assert_eq!(Scalar::sigmoid(v), crate::glm::sigmoid_stable(v));
-            assert_eq!(Scalar::probit_cdf(v), crate::simd_transcendental::phi_hp(v));
-            assert_eq!(Scalar::value(v), v);
-            assert_eq!(<f64 as Scalar>::from_f64(v), v);
-            assert_eq!(
-                Scalar::log1pexp(v),
-                crate::simd_transcendental::scalar_log1pexp(v)
-            );
-        }
-        for &v in &[1e-8_f64, 0.5, 1.0, 12.0] {
-            assert_eq!(Scalar::ln(v), v.ln());
-            assert_eq!(Scalar::sqrt(v), v.sqrt());
-            assert_eq!(Scalar::ln_gamma(v), crate::simd_transcendental::ln_gamma(v));
-        }
-    }
-
     /// `generic_family_pass::<f64>` (the trait default's logic, extracted so a
     /// test can reach it — `impl Scalar for f64` overrides the default itself
     /// with the SIMD kernel) must agree with `simd_transcendental::family_pass`

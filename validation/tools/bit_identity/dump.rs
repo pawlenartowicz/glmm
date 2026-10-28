@@ -17,7 +17,7 @@
 //! convention: a gaussian rung's single SE lands in `se_hessian` (`se_rx`
 //! null), a fixed-only GLM's lands in `se_rx` (`se_hessian` null, matching
 //! that schema's labeling there), and a GLMM rung gets both, from two
-//! separate `fit_cold` calls (`WaldSe::Hessian` / `WaldSe::Rx`).
+//! separate `glmm::fit` calls (`WaldSe::Hessian` / `WaldSe::Rx`).
 //!
 //! `nagq` is 1 (Laplace) except on the manifest's `agq`-marked rungs, which
 //! fit at the manifest's stated order (`harness_common::rung_agq`), so a move
@@ -44,7 +44,7 @@
 //!                  dropping `formula` breaks the build the harness needs
 //!                  to read the manifest at all.
 
-use glmm::fit_cold;
+use glmm::FitOptions;
 use serde_json::Value;
 
 #[path = "../common.rs"]
@@ -120,22 +120,23 @@ fn rung_record(spec: &Value, config: &str, rung: u64, nagq: Option<u8>) -> Strin
 
     // Data load, formula/family resolution, lowering, and weights_col/offset
     // come from `lower_rung` (common.rs) — one lowering, not a re-derivation.
-    let (mut lo, _table, _family, _formula_str) = lower_rung(spec, DIR);
+    let (lo, _table, _family, _formula_str) = lower_rung(spec, DIR);
+    let mut fit_opts = FitOptions::default();
     // A no-op on a serial build (`FitOptions::parallel_inner` is only live
     // under the `parallel` Cargo feature; see its doc), so this line is safe
     // to run unconditionally in both configs.
-    lo.opts.parallel_inner = config == "parallel";
+    fit_opts.parallel_inner = config == "parallel";
     // The dump applies the manifest's per-rung AGQ order unconditionally, so a
     // move in `src/glmm/agq.rs` shows up in it.
     if let Some(k) = nagq {
-        lo.opts.nagq = k;
+        fit_opts.nagq = k;
     }
 
     let fixed_only = lo.re_groups.is_empty();
     let (deviance, theta, beta, se_hessian, se_rx, n_eval, converged, singular) =
         if gaussian || fixed_only {
             // One fit: Gaussian reports its SE as Hessian-side, fixed-only as Rx-side.
-            let f = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
+            let f = glmm::fit(&lo.data(), lo.spec(), &fit_opts).unwrap();
             (
                 f.deviance,
                 f.tau2.clone(),
@@ -147,9 +148,9 @@ fn rung_record(spec: &Value, config: &str, rung: u64, nagq: Option<u8>) -> Strin
                 f.singular(),
             )
         } else {
-            let o_r = rx_options(&lo.opts);
-            let fh = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &lo.opts);
-            let fr = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &o_r);
+            let o_r = rx_options(&fit_opts);
+            let fh = glmm::fit(&lo.data(), lo.spec(), &fit_opts).unwrap();
+            let fr = glmm::fit(&lo.data(), lo.spec(), &o_r).unwrap();
             (
                 fh.deviance,
                 fh.tau2.clone(),

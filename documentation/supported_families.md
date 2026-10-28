@@ -76,15 +76,15 @@ mixed models go through PIRLS with Laplace/AGQ
   unit weights this is R's `inverse.gaussian()$aic`.
 - Dispersion is fixed at `φ ≡ 1` for Binomial, Poisson, and NB (NB
   overdispersion lives in `θ`, not `φ`).
-- **Prior weights** (`FitOptions::weights`) are honored on every family
+- **Prior weights** (`Data::weights`) are honored on every family
   above, fixed-only and mixed alike, at any `nagq`, including AGQ (`nagq > 1`)
   on the binomial, Poisson, negative-binomial and Gamma shapes it covers.
   They are precision weights on
   Gaussian, Gamma and inverse-Gaussian, trial counts on aggregated Binomial,
   and multiply the log-likelihood on NB — see
   [`conventions.md`](conventions.md#prior-weights) and
-  `FitOptions::weights`'s rustdoc for the exact per-path convention and
+  `Data::weights`'s rustdoc for the exact per-path convention and
   oracle citations.
-- **Offset** (`FitOptions::offset`) is honored on every family above,
-  fixed-only and mixed alike, at any `nagq`. See `FitOptions::offset`'s
+- **Offset** (`Data::offset`) is honored on every family above,
+  fixed-only and mixed alike, at any `nagq`. See `Data::offset`'s
   rustdoc for the exact convention.

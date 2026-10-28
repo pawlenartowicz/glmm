@@ -67,6 +67,7 @@ fn bfgs_solves_a_quadratic_and_certifies() {
         &BfgsConfig::LMM,
         &mut st,
         None,
+        &[],
     );
     // Converged in f to the `Fdelta` floor (1e-9), so x to about
     // √(1e-9 / curvature).
@@ -96,6 +97,7 @@ fn bfgs_fdelta_floor_is_finer_on_the_glmm_route() {
             cfg,
             &mut BfgsState::default(),
             None,
+            &[],
         );
         (out.stop, out.f)
     };
@@ -165,6 +167,7 @@ fn bfgs_start_curvature_seeds_one_coordinate() {
             &BfgsConfig::GLMM,
             &mut BfgsState::default(),
             h0,
+            &[],
         );
         (x, out, obj.asked.get(), obj.points)
     };
@@ -219,6 +222,7 @@ fn bfgs_start_curvature_rescales_each_unseeded_run_alone() {
         &BfgsConfig::GLMM,
         &mut BfgsState::default(),
         None,
+        &[],
     );
     let first = &obj.points[1];
     let want = [0.015, -0.01, 0.5, 0.5];
@@ -262,6 +266,7 @@ fn bfgs_skips_the_first_update_on_a_concave_unseeded_step() {
         &BfgsConfig::GLMM,
         &mut BfgsState::default(),
         None,
+        &[],
     );
     assert_eq!(obj.points[1], vec![0.5, 0.5], "first trial");
     assert_eq!(obj.points[2], vec![1.0, 0.5], "second trial");
@@ -291,6 +296,7 @@ fn bfgs_reaches_the_rosenbrock_minimum() {
         &BfgsConfig::LMM,
         &mut st,
         None,
+        &[],
     );
     assert!(
         (x[0] - 1.0).abs() < 1e-4 && (x[1] - 1.0).abs() < 1e-4,
@@ -319,6 +325,7 @@ fn bfgs_stops_on_an_active_bound() {
         &BfgsConfig::LMM,
         &mut st,
         None,
+        &[],
     );
     assert_eq!(x, [1.0, -1.0], "{out:?}");
     assert_eq!(out.stop, BfgsStop::Pgrad);
@@ -375,6 +382,7 @@ fn bfgs_asks_for_the_gradient_only_at_the_last_finite_value() {
         &BfgsConfig::LMM,
         &mut st,
         None,
+        &[],
     );
     assert!(out.n_grad >= 2, "{out:?}");
     let last_g = obj.calls.iter().rev().find(|c| c.0 == 'g').unwrap();
@@ -407,6 +415,7 @@ fn bfgs_state_reuse_is_bit_identical() {
             &BfgsConfig::LMM,
             st,
             None,
+            &[],
         );
         (x, out.f, out.n_val, out.n_grad)
     };
@@ -430,6 +439,7 @@ fn bfgs_reports_a_non_finite_start() {
         &BfgsConfig::LMM,
         &mut BfgsState::default(),
         None,
+        &[],
     );
     assert_eq!(out.stop, BfgsStop::NonFinite);
     assert!(!out.certified(&x, &[]));
@@ -461,7 +471,7 @@ fn bobyqa_wrapper_matches_minimize_bit_for_bit() {
     };
     let mut x = [1.0, 1.0];
     let mut solver = Bobyqa::new(2, cfg).unwrap();
-    let out = bobyqa_minimize(&mut solver, &mut obj, &mut x, &[-3.0; 2], &[3.0; 2]);
+    let out = bobyqa_minimize(&mut solver, &mut obj, &mut x, &[-3.0; 2], &[3.0; 2], &[]);
     assert_eq!(x.map(f64::to_bits), x_ref.map(f64::to_bits));
     assert_eq!(out.f.to_bits(), ref_out.f.to_bits());
     assert_eq!(out.n_eval, ref_out.n_eval);
@@ -478,11 +488,12 @@ fn bfgs_with_the_exact_inverse_hessian_steps_to_the_optimum() {
         g[0] = 4.0 * (x[0] - 1.0);
         g[1] = x[1] + 3.0;
     };
-    let h = super::CurvatureHint::from_gradients(&[0.0, 0.0], &[-9.0; 2], &[9.0; 2], |x, gg| {
-        g(x, gg);
-        true
-    })
-    .unwrap();
+    let h =
+        super::CurvatureHint::from_gradients(&[0.0, 0.0], &[-9.0; 2], &[9.0; 2], &[], |x, gg| {
+            g(x, gg);
+            true
+        })
+        .unwrap();
     let mut obj = closed(f, g);
     let mut x = [0.0, 0.0];
     let out = bfgs_minimize(
@@ -493,6 +504,7 @@ fn bfgs_with_the_exact_inverse_hessian_steps_to_the_optimum() {
         &BfgsConfig::LMM,
         &mut BfgsState::default(),
         Some(h.inv_hessian()),
+        &[],
     );
     assert!(
         (x[0] - 1.0).abs() < 1e-9 && (x[1] + 3.0).abs() < 1e-9,
@@ -504,11 +516,12 @@ fn bfgs_with_the_exact_inverse_hessian_steps_to_the_optimum() {
 #[test]
 fn curvature_hint_refuses_an_indefinite_hessian() {
     // A saddle: ∂²f = diag(2, −2).
-    let h = super::CurvatureHint::from_gradients(&[0.5, 0.5], &[-9.0; 2], &[9.0; 2], |x, g| {
-        g[0] = 2.0 * x[0];
-        g[1] = -2.0 * x[1];
-        true
-    });
+    let h =
+        super::CurvatureHint::from_gradients(&[0.5, 0.5], &[-9.0; 2], &[9.0; 2], &[], |x, g| {
+            g[0] = 2.0 * x[0];
+            g[1] = -2.0 * x[1];
+            true
+        });
     assert!(h.is_none());
 }
 
@@ -527,4 +540,95 @@ fn curvature_hint_from_parts_refuses_bad_parts() {
     assert!(from(2, &ok, -1.0).is_none(), "negative units");
     // Eigenvalues 3 and −1.
     assert!(from(2, &[1.0, 2.0, 2.0, 1.0], 1.0).is_none(), "indefinite");
+}
+
+/// A search with a structural coordinate is the search of the reduced problem:
+/// on `f = ½ xᵀAx − bᵀx` over three coordinates with coordinate 1 held at
+/// zero, BOBYQA and BFGS end where they end on the two-coordinate quadratic
+/// `f(z₀, 0, z₁)`, bit for bit, and the structural entry comes back exactly
+/// `0.0` from a start that is not zero there.
+#[test]
+fn masked_search_matches_the_reduced_problem() {
+    let a = [4.0, 1.0, 0.5, 1.0, 3.0, 0.5, 0.5, 0.5, 2.0];
+    let b = [1.0, -2.0, 0.5];
+    let f = |x: &[f64]| {
+        let mut v = 0.0;
+        for i in 0..3 {
+            for j in 0..3 {
+                v += 0.5 * x[i] * a[i * 3 + j] * x[j];
+            }
+            v -= b[i] * x[i];
+        }
+        v
+    };
+    let g = |x: &[f64], g: &mut [f64]| {
+        for i in 0..3 {
+            g[i] = (0..3).map(|j| a[i * 3 + j] * x[j]).sum::<f64>() - b[i];
+        }
+    };
+    let full = |z: &[f64]| [z[0], 0.0, z[1]];
+    let f_red = |z: &[f64]| f(&full(z));
+    let g_red = |z: &[f64], gz: &mut [f64]| {
+        let mut gf = [0.0; 3];
+        g(&full(z), &mut gf);
+        gz[0] = gf[0];
+        gz[1] = gf[2];
+    };
+    let (lo, hi) = ([-4.0, -5.0, -6.0], [4.0, 5.0, 6.0]);
+    let (lo_red, hi_red) = ([lo[0], lo[2]], [hi[0], hi[2]]);
+
+    let cfg = Config::new(2);
+    let mut z = [0.3, -0.2];
+    let red = bobyqa_minimize(
+        &mut Bobyqa::new(2, cfg).unwrap(),
+        &mut closed(f_red, g_red),
+        &mut z,
+        &lo_red,
+        &hi_red,
+        &[],
+    );
+    let mut x = [0.3, 0.7, -0.2];
+    let out = bobyqa_minimize(
+        &mut Bobyqa::new(2, cfg).unwrap(),
+        &mut closed(f, g),
+        &mut x,
+        &lo,
+        &hi,
+        &[1],
+    );
+    assert_eq!(x[1].to_bits(), 0.0f64.to_bits(), "BOBYQA: {x:?}");
+    assert_eq!([x[0], x[2]].map(f64::to_bits), z.map(f64::to_bits));
+    assert_eq!(out.f.to_bits(), red.f.to_bits());
+    assert_eq!(out.n_eval, red.n_eval);
+
+    let mut z = [0.3, -0.2];
+    let red = bfgs_minimize(
+        &mut closed(f_red, g_red),
+        &mut z,
+        &lo_red,
+        &hi_red,
+        &BfgsConfig::LMM,
+        &mut BfgsState::default(),
+        None,
+        &[],
+    );
+    let mut x = [0.3, 0.7, -0.2];
+    let out = bfgs_minimize(
+        &mut closed(f, g),
+        &mut x,
+        &lo,
+        &hi,
+        &BfgsConfig::LMM,
+        &mut BfgsState::default(),
+        None,
+        &[1],
+    );
+    assert_eq!(x[1].to_bits(), 0.0f64.to_bits(), "BFGS: {x:?}");
+    assert_eq!([x[0], x[2]].map(f64::to_bits), z.map(f64::to_bits));
+    assert_eq!(out.f.to_bits(), red.f.to_bits());
+    assert_eq!(
+        (out.n_val, out.n_grad, out.stop),
+        (red.n_val, red.n_grad, red.stop)
+    );
+    assert!(out.converged(), "{out:?}");
 }

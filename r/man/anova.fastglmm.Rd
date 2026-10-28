@@ -63,6 +63,12 @@ test, in the same columns (below). There are no random-effect rows: random
 effects are tested by comparing two models.
 }
 \details{
+An F table also has the partial eta-squared of each term, \code{Eta2_partial},
+\code{F * NumDF / (F * NumDF + DenDF)} as \code{effectsize::F_to_eta2} computes it,
+before \verb{Pr(>F)}. On a Gaussian mixed model \code{DenDF} is Satterthwaite's, not
+a count of rows, so the value is approximate, and the table says so in its
+last note. The table of \code{\link[=contrast_test]{contrast_test()}} has no such column.
+
 On a fit with Wald chi-squared rows, \code{test = "LRT"} gives likelihood-ratio
 chi-squared rows, in the Wald table's columns: each term's row compares the
 model with the model refitted under the term's hypothesis (Type III: the
@@ -72,8 +78,8 @@ not contain the term, with and without it, the rule of car's
 \code{Anova(test.statistic = "LR")} on a GLM, applied to GLMMs too). These refits
 are made when the model is fitted: when the fit asks for them with
 \code{fastglmm(..., anova_test = "LRT")}, and on a Poisson model with random
-effects under the default \code{anova_test = "auto"}. A term whose columns carry a
-random slope keeps its Wald row, with a note.
+effects under the default \code{anova_test = "auto"}. Each refit keeps the
+model's random effects, random slopes included.
 
 The default \code{test = "auto"} gives the likelihood-ratio rows to a Poisson
 model with random effects, whatever its size: in simulation the Wald test

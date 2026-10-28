@@ -418,7 +418,8 @@ jobs:
           fi
           Rscript validation/grid/compare.R --ports-only --glmm-run="$run"
       - name: Anova port gate
-        # The model comparisons and per-term tables (anova, compare) on one
+        # The model comparisons and per-term tables (anova, compare) and the
+        # post-fit calls (predict, simulate, r2, icc, pairwise) on one
         # fixed call list through all three front ends, compared cell by cell
         # at the round-off band of the gate above; a call outside the pinned
         # list, an unexpected refusal, a missing cell, or a table whose column

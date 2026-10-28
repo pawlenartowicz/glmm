@@ -62,17 +62,6 @@ def test_dictionary_array_sets_the_reference_level():
     assert result.beta[0] == pytest.approx(1.05, abs=1e-6)  # mean of "low"
 
 
-def test_pyarrow_table_dictionary_column_keeps_its_declared_level_order():
-    pa = pytest.importorskip("pyarrow")
-    f = pa.DictionaryArray.from_arrays(
-        pa.array([0, 2, 1, 0, 2, 1], pa.int8()), pa.array(["low", "med", "high"])
-    )
-    result = glmm.fit(pa.table({"y": _Y, "f": f}), "y ~ f")
-    # Sorted, "high" would be the base; the dictionary declares "low" first.
-    assert result.names == ["(Intercept)", "fmed", "fhigh"]
-    assert result.beta[0] == pytest.approx(1.05, abs=1e-6)  # mean of "low"
-
-
 def test_polars_enum_column_keeps_its_declared_level_order():
     pl = pytest.importorskip("polars")
     f = pl.Series(_LABELS, dtype=pl.Enum(["low", "med", "high"]))

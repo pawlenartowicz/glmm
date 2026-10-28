@@ -85,12 +85,16 @@ def test_anova_of_one_fit_reads_the_stored_type3_table(lmm):
     stored = lmm.term_table_type3
     assert tab.row_names == stored["label"] == ["x", "f"]
     assert tab.columns == [
-        "Sum Sq", "Mean Sq", "NumDF", "DenDF", "F value", "Pr(>F)",
+        "Sum Sq", "Mean Sq", "NumDF", "DenDF", "F value", "Eta2_partial", "Pr(>F)",
     ]  # fmt: skip
     np.testing.assert_array_equal(tab["F value"], stored["statistic"])
     np.testing.assert_array_equal(tab["Pr(>F)"], stored["p_value"])
     np.testing.assert_array_equal(tab["DenDF"], stored["den_df"])
+    np.testing.assert_array_equal(tab["Eta2_partial"], stored["eta2_partial"])
     assert tab.heading == "Type III Analysis of Variance Table with Satterthwaite's method"
+    assert tab.notes[-1] == (
+        "Partial eta-squared uses the Satterthwaite denominator df, so it is approximate."
+    )
     # A one-df term that no other term contains: its F is the square of the
     # summary's t on the same df.
     i = lmm.names.index("x")
@@ -182,6 +186,30 @@ def test_a_fit_from_before_these_tests_is_refused_by_name(exact_pair):
         glmm.anova(old[1])
     with pytest.raises(ValueError, match=r"rss, objective.*Refit"):
         glmm.anova(*old)
+
+
+def test_eta2_partial_is_on_f_tables_only_and_noted_on_satterthwaite_ones(lmm, pois):
+    ols = glmm.anova(quiet_fit("y ~ x + f"))
+    assert ols.columns == [
+        "Sum Sq", "Mean Sq", "NumDF", "DenDF", "F value", "Eta2_partial", "Pr(>F)",
+    ]  # fmt: skip
+    assert not any("eta-squared" in n for n in ols.notes)
+    for test in ("auto", "Wald"):
+        chisq = glmm.anova(pois[0], test=test)
+        assert "Eta2_partial" not in chisq
+        assert not any("eta-squared" in n for n in chisq.notes)
+
+
+def test_a_fit_stored_by_0_6_x_prints_its_anova_without_eta2_partial(lmm):
+    o = object.__new__(glmm.Fit)
+    o.__dict__.update(lmm.__dict__)
+    for field in ("term_table_type3", "term_table_type2"):
+        o.__dict__[field] = {k: v for k, v in lmm.__dict__[field].items() if k != "eta2_partial"}
+    old = pickle.loads(pickle.dumps(o))
+    tab = glmm.anova(old)
+    assert tab.columns == _F_COLUMNS
+    assert not any("eta-squared" in n for n in tab.notes)
+    np.testing.assert_array_equal(tab["F value"], glmm.anova(lmm)["F value"])
 
 
 def test_anova_raises_a_stored_internal_error_as_an_error_not_a_refusal(lmm):
@@ -529,7 +557,7 @@ def test_anova_on_unpickled_fits_gives_the_same_tables(lmm, exact_pair):
     assert glmm.anova(ols, lmm1).text() == glmm.anova(*exact_pair).text()
 
 
-def test_the_fit_stores_its_offset_and_no_data_column():
+def test_the_fit_stores_its_offset_and_no_public_data_column():
     off = 0.1 * _X
     m = quiet_fit("y ~ x + (1 | g)", offset=off)
     np.testing.assert_array_equal(m.offset, off)
@@ -538,6 +566,8 @@ def test_the_fit_stores_its_offset_and_no_data_column():
     for name in ("x", "z"):
         column = np.asarray(D[name])
         for f in dataclasses.fields(m):
+            if f.name.startswith("_"):
+                continue
             value = getattr(m, f.name)
             assert not (
                 isinstance(value, np.ndarray)
@@ -708,7 +738,8 @@ def test_the_unit_rows_of_a_term_give_its_anova_row_bit_for_bit(lmm, pois):
         term = glmm.anova(m, test="Wald" if m.df_method == "none" else "auto")
         assert tab.heading == heading
         assert (tab.row_names, tab.ss_type) == (["contrast"], None)
-        assert tab.columns == term.columns
+        # A contrast is not a term: its row has no partial eta-squared.
+        assert tab.columns == [c for c in term.columns if c != "Eta2_partial"]
         for c in tab.columns:
             np.testing.assert_array_equal(tab[c], term[c][1:2])
         # An L given as a vector is a one-row L.
@@ -772,6 +803,117 @@ def test_contrast_test_refuses_an_l_of_the_wrong_shape_or_not_finite(lmm):
     ):
         with pytest.raises(ValueError, match=re.escape(message)):
             lmm.contrast_test(L)
+
+
+# -- glmm.pairwise ----------------------------------------------------------------
+
+_PAIR_COLUMNS = ["contrast", "estimate", "SE", "df"]
+
+
+def test_pairwise_columns_follow_the_family(lmm, pois):
+    ols = quiet_fit("y ~ x + f")
+    bern = quiet_fit("b ~ x + f + (1 | g)", _data(b=(_Y > 1.2).astype(float).tolist()),
+                     family="binomial")  # fmt: skip
+    for m, rest in (
+        (lmm, ["t.ratio", "p.value"]),
+        (ols, ["t.ratio", "p.value"]),
+        (pois[0], ["z.ratio", "p.value", "ratio", "ratio.SE"]),
+        (bern, ["z.ratio", "p.value", "odds.ratio", "ratio.SE"]),
+    ):
+        tab = glmm.pairwise(m, "f")
+        assert isinstance(tab, glmm.PairwiseTable)
+        assert tab.columns == _PAIR_COLUMNS + rest
+        assert tab["contrast"] == ["a - b", "a - c", "b - c"]
+        assert tab.heading == "Pairwise comparisons of f"
+        assert tab.notes == ["P value adjustment: holm method for 3 tests"]
+        z = m.df_method == "none"
+        assert all(math.isinf(d) for d in tab["df"]) == z
+    # The ratio is exp(estimate), on a log link.
+    tab = glmm.pairwise(pois[0], "f")
+    np.testing.assert_allclose(tab["ratio"], np.exp(tab["estimate"]), rtol=1e-15)
+
+
+def test_pairwise_adjust_reaches_the_crate(lmm):
+    none = glmm.pairwise(lmm, "f", adjust="none")
+    assert none.notes == []
+    bonf = glmm.pairwise(lmm, "f", adjust="bonferroni")
+    np.testing.assert_array_equal(bonf["p.value"], np.minimum(1.0, 3 * none["p.value"]))
+    assert bonf.notes == ["P value adjustment: bonferroni method for 3 tests"]
+    tukey = glmm.pairwise(lmm, "f", adjust="tukey")
+    assert tukey.notes == ["P value adjustment: tukey method for comparing a family of 3 estimates"]
+    assert np.all(tukey["p.value"] >= none["p.value"])
+    np.testing.assert_array_equal(tukey["estimate"], none["estimate"])
+
+
+def test_pairwise_by_a_factor_and_at_values():
+    data = _data(h=np.array(["p", "q"])[np.arange(_N) % 2].tolist())
+    m = quiet_fit("y ~ x + f * h + (1 | g)", data)
+    tab = glmm.pairwise(m, "f", by="h")
+    assert tab.columns[:2] == ["contrast", "h"]
+    assert tab["h"] == ["p"] * 3 + ["q"] * 3
+    assert tab.heading == "Pairwise comparisons of f by h"
+    ols = quiet_fit("y ~ x * f")
+    at = glmm.pairwise(ols, "f", by="x", at=[-1, 1])
+    assert at["x"] == ["-1"] * 3 + ["1"] * 3
+    assert at.row_names == [str(i) for i in range(1, 7)]
+
+
+def test_pairwise_confint_columns_and_footer(lmm, pois):
+    tab = glmm.pairwise(lmm, "f")
+    ci = tab.confint()
+    assert isinstance(ci, glmm.PairwiseTable)
+    assert ci.columns == ["contrast", "estimate", "lower.CL", "upper.CL"]
+    assert ci.notes == [
+        "Confidence level used: 0.95",
+        "Holm has no simultaneous interval; Bonferroni intervals shown.",
+    ]
+    bonf = glmm.pairwise(lmm, "f", adjust="bonferroni").confint()
+    np.testing.assert_array_equal(ci["lower.CL"], bonf["lower.CL"])
+    assert bonf.notes[1] == "Conf-level adjustment: bonferroni method for 3 estimates"
+    none = glmm.pairwise(lmm, "f", adjust="none").confint(level=0.9)
+    assert none.notes == ["Confidence level used: 0.9"]
+    assert np.all(none["upper.CL"] - none["lower.CL"] < bonf["upper.CL"] - bonf["lower.CL"])
+    tukey = glmm.pairwise(lmm, "f", adjust="tukey").confint()
+    assert tukey.notes[1] == (
+        "Conf-level adjustment: tukey method for comparing a family of 3 estimates"
+    )
+    ratio = glmm.pairwise(pois[0], "f").confint()
+    assert ratio.columns[-3:] == ["ratio", "ratio.lower.CL", "ratio.upper.CL"]
+    np.testing.assert_allclose(ratio["ratio.lower.CL"], np.exp(ratio["lower.CL"]), rtol=1e-15)
+    with pytest.raises(ValueError, match="level must be a number strictly between 0 and 1"):
+        tab.confint(level=1.0)
+    with pytest.raises(ValueError, match="holds intervals already"):
+        ci.confint()
+
+
+def test_pairwise_refusals(lmm):
+    with pytest.raises(ValueError, match='adjust must be "holm", "bonferroni"'):
+        glmm.pairwise(lmm, "f", adjust="sidak")
+    with pytest.raises(ValueError, match="at gives the values of a numeric by"):
+        glmm.pairwise(lmm, "f", at=[1.0])
+    with pytest.raises(ValueError, match="column 'x' is not a factor of the fixed part"):
+        glmm.pairwise(lmm, "x")
+    with pytest.raises(ValueError, match="unknown column: nope"):
+        glmm.pairwise(lmm, "nope")
+    with pytest.raises(TypeError, match="glmm.pairwise takes a glmm.Fit"):
+        glmm.pairwise("m", "f")
+    old = object.__new__(glmm.Fit)
+    old.__dict__.update({k: v for k, v in lmm.__dict__.items() if k != "_kernel_parts"})
+    with pytest.raises(ValueError, match="did not keep what predict, simulate, pairwise"):
+        glmm.pairwise(pickle.loads(pickle.dumps(old)), "f")
+
+
+def test_pairwise_renders(lmm):
+    tab = glmm.pairwise(lmm, "f")
+    html = tab.html()
+    assert "<caption>Comparisons</caption>" in html
+    assert "<th>t.ratio</th>" in html
+    assert "P value adjustment: holm method for 3 tests" in html
+    latex = tab.latex()
+    assert "contrast & estimate & SE & df & t.ratio & p.value \\\\" in latex
+    assert "% P value adjustment: holm method for 3 tests" in latex
+    assert tab.typst()
+    assert tab.text().splitlines()[0] == "Pairwise comparisons of f"
 
 
 # -- pandas ---------------------------------------------------------------------

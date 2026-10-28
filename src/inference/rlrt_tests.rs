@@ -15,7 +15,8 @@ use super::rlrt::{
 use super::rlrt_refs::{bands, csv};
 use crate::fit::common_tests::lcg;
 use crate::test_support::intercept_only_spec;
-use crate::{fit_cold, Family, Fit, FitOptions, GroupIds, ModelSpec, Sizing};
+use crate::test_support::{fit_cold, fit_warm_wo};
+use crate::{Family, Fit, FitOptions, GroupIds, ModelSpec};
 use commonstats::dist::{ContinuousCdf, FisherF, Normal, Sampler};
 use commonstats::rng::{CommonStatsRng, STREAM_TAG_RLRT};
 use faer::Mat;
@@ -45,7 +46,7 @@ fn design(
 
 /// The `(1 | g)` fit of a design.
 fn fit_of(x: &[f64], y: &[f64], ids: &[u32], p: usize, opts: &FitOptions) -> Fit {
-    let model = intercept_only_spec(Sizing::FixedClusters { n_clusters: 1 });
+    let model = intercept_only_spec();
     let gids = GroupIds {
         primary: ids.to_vec(),
         extra: vec![],
@@ -158,11 +159,22 @@ fn explicit_z_matches_z_free_route() {
     check_against_dense("group-level covariate", &fit, &x, p, &ids);
 
     let (x, y, ids, p) = design(&[3, 8, 5, 6, 4], 1.0, x1);
-    let with_offset = FitOptions {
-        offset: Some((0..ids.len()).map(|i| 0.1 * (i % 7) as f64).collect()),
-        ..FitOptions::default()
-    };
-    let fit = fit_of(&x, &y, &ids, p, &with_offset);
+    let offset: Vec<f64> = (0..ids.len()).map(|i| 0.1 * (i % 7) as f64).collect();
+    let fit = fit_warm_wo(
+        &x,
+        &y,
+        ids.len(),
+        p,
+        &intercept_only_spec(),
+        &GroupIds {
+            primary: ids.clone(),
+            extra: vec![],
+        },
+        None,
+        None,
+        Some(&offset),
+        &opts,
+    );
     check_against_dense("offset", &fit, &x, p, &ids);
 
     // `x2 = x1 + 1e-4·noise`: a pivot ratio far under `GRAM_PIVOT_MIN`, so

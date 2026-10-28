@@ -245,11 +245,6 @@ fn relatives(lo: &Lowered, t: usize) -> impl Iterator<Item = usize> + '_ {
 /// Why a term has no reduced design for a likelihood-ratio row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReducedDesignError {
-    /// The term's hypothesis touches a column that carries a random slope
-    /// (Type III), or its reduced design drops one (Type II): `Grouping::slopes`
-    /// indexes design columns, so the kernel cannot fit a design that mixes or
-    /// drops such a column.
-    SlopeTouched,
     /// No basis meets `‖E·N‖ ≤ 1e-12·‖E‖` ([`type3_null_basis`]): the
     /// hypothesis has a non-finite entry, the eigensolver failed, the
     /// hypothesis is too ill-conditioned for the bound, or its unrounded and
@@ -315,29 +310,22 @@ pub(crate) fn untouched_columns(l: MatRef<'_, f64>) -> Vec<usize> {
 /// what needs exact zeros: the columns it does not touch come first in `N`,
 /// as unit columns in the order of [`untouched_columns`], so their meaning
 /// and any random slope on them are kept ([`remap_slopes`] with that list);
-/// the slope check; and the rank `r`. The rest of `N` is the null space of
-/// `exact` on the touched columns, `E`: the eigenvectors of `EᵀE`
-/// ([`sym_eigen`]) whose eigenvalue is at most `1e-8` of the largest, as many
-/// as `l` leaves on those columns. The result is checked:
-/// `‖E·N‖_F ≤ 1e-12·‖E‖_F`.
+/// and the rank `r`. The rest of `N` is the null space of `exact` on the
+/// touched columns, `E`: the eigenvectors of `EᵀE` ([`sym_eigen`]) whose
+/// eigenvalue is at most `1e-8` of the largest, as many as `l` leaves on
+/// those columns. The result is checked: `‖E·N‖_F ≤ 1e-12·‖E‖_F`.
 ///
 /// Both are over the columns of the design the reduced fit is built from
-/// (the fit's retained columns), and `slope_cols` lists that design's
-/// random-slope columns. Errors: [`ReducedDesignError::SlopeTouched`] when
-/// `l` touches a slope column, [`ReducedDesignError::NoNullBasis`] when no
-/// decomposition exists, the two ranks differ or the check fails.
+/// (the fit's retained columns). Errors: [`ReducedDesignError::NoNullBasis`]
+/// when no decomposition exists, the two ranks differ or the check fails.
 pub(crate) fn type3_null_basis(
     l: MatRef<'_, f64>,
     exact: MatRef<'_, f64>,
-    slope_cols: &[usize],
 ) -> Result<Mat<f64>, ReducedDesignError> {
     let p = l.ncols();
     assert_eq!(exact.ncols(), p, "l and exact are over the same columns");
     let kept = untouched_columns(l);
     let touched: Vec<usize> = (0..p).filter(|c| !kept.contains(c)).collect();
-    if slope_cols.iter().any(|c| touched.contains(c)) {
-        return Err(ReducedDesignError::SlopeTouched);
-    }
     let on_touched =
         |m: MatRef<'_, f64>| Mat::from_fn(m.nrows(), touched.len(), |i, a| m[(i, touched[a])]);
     let e = on_touched(exact);
@@ -391,23 +379,33 @@ fn null_directions(m: MatRef<'_, f64>) -> Result<Mat<f64>, ReducedDesignError> {
     Ok(Mat::from_fn(k, null.len(), |a, j| vectors[(a, null[j])]))
 }
 
-/// A grouping's random-slope columns (`Grouping::slopes`) on a reduced design
-/// whose column `j` is caller column `kept[j]` (a Type II set of
-/// [`type2_lr_sets`], or the [`untouched_columns`] that lead a Type III `N`):
-/// each slope moves to its column's new position, so it stays on the same
-/// variable. [`ReducedDesignError::SlopeTouched`] when a slope column is not
-/// kept.
+/// A grouping's random-slope columns (`Grouping::slopes`, indices into the
+/// full model's `[X | Z_r]`) on a reduced design of `k` columns whose leading
+/// column `j` is caller column `kept[j]` (a Type II set of
+/// [`type2_lr_sets`], or the [`untouched_columns`] that lead a Type III `N`).
+/// A slope on a kept column moves to its new position, so it stays on the
+/// same variable. Any other slope, on a column the reduced design drops or
+/// mixes or on a full-model `Z_r` column, reads random-effect-only column
+/// `k + j` of the refit, `sources[j]` its column in the full `[X | Z_r]`:
+/// pushed when new, shared by every grouping that names it.
 pub(crate) fn remap_slopes(
     slopes: &[ColumnId],
     kept: &[usize],
-) -> Result<Vec<ColumnId>, ReducedDesignError> {
+    k: usize,
+    sources: &mut Vec<usize>,
+) -> Vec<ColumnId> {
     slopes
         .iter()
         .map(|&s| {
-            kept.iter()
-                .position(|&c| c == s as usize)
-                .map(|j| ColumnId::try_from(j).expect("a design column index fits a ColumnId"))
-                .ok_or(ReducedDesignError::SlopeTouched)
+            let s = s as usize;
+            let j = kept.iter().position(|&c| c == s).unwrap_or_else(|| {
+                let at = sources.iter().position(|&c| c == s).unwrap_or_else(|| {
+                    sources.push(s);
+                    sources.len() - 1
+                });
+                k + at
+            });
+            ColumnId::try_from(j).expect("a design column index fits a ColumnId")
         })
         .collect()
 }

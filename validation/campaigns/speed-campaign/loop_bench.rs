@@ -1317,10 +1317,10 @@ struct Counters {
 
 mod api {
     use super::{Counters, Design, Fam, FullOut, Out, Probe, Start};
-    use glmm::loop_advanced::{build_workspace, fit_on, spec_sized_from_ids_pub, FitWorkspace};
+    use glmm::loop_advanced::{build_workspace, fit_on, FitWorkspace};
     use glmm::{
-        BinomialLink, Family, FitOptions, GammaLink, GroupIds, Grouping, GroupingRelation,
-        ModelSpec, NegBinomialLink, PoissonLink, ReStructure, Sizing, StartValues,
+        BinomialLink, Data, Family, FitOptions, GammaLink, GroupIds, Grouping, ModelSpec,
+        NegBinomialLink, PoissonLink, ReStructure, SeFor, StartValues,
     };
 
     /// The crate's version this module was written against.
@@ -1357,30 +1357,18 @@ mod api {
 
     /// The caller's declaration-order spec of a design.
     fn model(d: &Design) -> ModelSpec {
-        let re = d.groups.first().map(|g0| ReStructure {
-            sizing: Sizing::FixedClusters {
-                n_clusters: g0.levels as u32,
-            },
-            slopes: g0.slopes.iter().map(|&c| c as u32).collect(),
-            extra_groupings: d.groups[1..]
-                .iter()
-                .map(|g| Grouping {
-                    relation: match g.nested_per_parent {
-                        Some(k) => GroupingRelation::NestedWithin {
-                            n_per_parent: k as u32,
-                        },
-                        None => GroupingRelation::Crossed {
-                            n_clusters: g.levels as u32,
-                        },
-                    },
-                    slopes: g.slopes.iter().map(|&c| c as u32).collect(),
-                })
-                .collect(),
+        let Some(g0) = d.groups.first() else {
+            return ModelSpec::fixed(family(d.fam));
+        };
+        let primary = ReStructure::intercept().slopes(g0.slopes.iter().map(|&c| c as u32));
+        let re = d.groups[1..].iter().fold(primary, |re, g| {
+            let grouping = match g.nested_per_parent {
+                Some(_) => Grouping::nested(),
+                None => Grouping::crossed(),
+            };
+            re.extra(grouping.slopes(g.slopes.iter().map(|&c| c as u32)))
         });
-        ModelSpec {
-            family: family(d.fam),
-            re,
-        }
+        ModelSpec::mixed(family(d.fam), re)
     }
 
     /// One shape's built workspace plus everything `fit_on` and `into_fit`
@@ -1388,49 +1376,35 @@ mod api {
     pub struct Bench {
         ws: FitWorkspace,
         model: ModelSpec,
-        ids: GroupIds,
         opts: FitOptions,
         start: StartValues,
         n: usize,
         p: usize,
     }
 
-    /// `spec_sized_from_ids_pub` + `build_workspace`, once per shape. Every
+    /// `build_workspace`, once per shape. Every
     /// non-intercept column is a target (the per-coefficient Wald reads a
     /// power simulation makes).
     pub fn build(d: &Design, prestandardized: bool) -> Bench {
         let model = model(d);
-        let ids = GroupIds {
-            primary: d.ids_primary.clone(),
-            extra: d.ids_extra.clone(),
-        };
+        let ids = d
+            .ids_extra
+            .iter()
+            .fold(GroupIds::new(d.ids_primary.clone()), |ids, e| {
+                ids.extra(e.clone())
+            });
         let mut opts = FitOptions::default();
-        opts.target_indices = (1..d.p as u32).collect();
+        opts.se_for = SeFor::Only((1..d.p as u32).collect());
         opts.nagq = d.nagq;
-        let (sized, sized_ids, perm) = if model.re.is_some() {
-            let (s, i, p) = spec_sized_from_ids_pub(&model, &ids);
-            (s, i.into_owned(), p)
-        } else {
-            (
-                model.clone(),
-                ids.clone(),
-                glmm::loop_advanced::Perm::IDENTITY,
-            )
-        };
-        let mut ws = build_workspace(&sized, perm, d.n, d.p, &opts);
+        let mut ws = build_workspace(&model, &ids, d.n, d.p, &opts);
         if prestandardized {
             ws.set_prestandardized(true);
         }
         Bench {
             ws,
             model,
-            ids: sized_ids,
             opts,
-            start: StartValues {
-                beta: Vec::with_capacity(d.p),
-                theta: Vec::with_capacity(64),
-                dispersion: None,
-            },
+            start: StartValues::new(Vec::with_capacity(d.p), Vec::with_capacity(64)),
             n: d.n,
             p: d.p,
         }
@@ -1450,7 +1424,6 @@ mod api {
         let Bench {
             ws,
             model,
-            ids,
             opts,
             start: sv,
             n,
@@ -1464,7 +1437,7 @@ mod api {
         }
         let sv: Option<&StartValues> = start.map(|_| &*sv);
         probe.begin();
-        let view = fit_on(ws, x, y, ids, sv, opts);
+        let view = fit_on(ws, &Data::new(x, y, *n, *p), sv, opts);
         probe.end();
         let diag = view.diagnostics();
         let mut out = Out {
@@ -1482,7 +1455,7 @@ mod api {
             full: None,
         };
         if full {
-            let fit = view.into_fit(x, y, ids, *n, *p, model, opts);
+            let fit = view.into_fit(&Data::new(x, y, *n, *p), model, opts);
             out.full = Some(FullOut {
                 deviance: fit.deviance,
                 loglik: fit.loglik,

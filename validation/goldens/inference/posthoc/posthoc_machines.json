@@ -1,0 +1,85 @@
+{
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0",
+      "emmeans": "2.0.4",
+      "pbkrtest": "0.5.5"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_posthoc.R"
+  },
+  "emmeans": [
+    {
+      "level": "A",
+      "by": null,
+      "estimate": 52.3555555555544,
+      "SE": 1.68064270133812,
+      "df": 5.0006136239096
+    },
+    {
+      "level": "B",
+      "by": null,
+      "estimate": 60.3222222222195,
+      "SE": 3.52860162519801,
+      "df": 5.000344464102
+    },
+    {
+      "level": "C",
+      "by": null,
+      "estimate": 66.2722222222209,
+      "SE": 1.80593184966242,
+      "df": 5.00289783304533
+    }
+  ],
+  "contrasts": [
+    {
+      "contrast": "A - B",
+      "by": null,
+      "estimate": -7.96666666666508,
+      "SE": 2.42110266012593,
+      "df": 4.99894039798169,
+      "statistic": -3.29051171512517,
+      "statistic_name": "t",
+      "p_none": 0.0217080653523425,
+      "p_tukey": 0.0480963085515023
+    },
+    {
+      "contrast": "A - C",
+      "by": null,
+      "estimate": -13.9166666666665,
+      "SE": 1.54020321577931,
+      "df": 4.99850171009768,
+      "statistic": -9.03560421384065,
+      "statistic_name": "t",
+      "p_none": 0.000277859209652673,
+      "p_tukey": 0.000653672494558499
+    },
+    {
+      "contrast": "B - C",
+      "by": null,
+      "estimate": -5.9500000000014,
+      "SE": 2.44690390357139,
+      "df": 4.99803191198457,
+      "statistic": -2.43164432870333,
+      "statistic_name": "t",
+      "p_none": 0.0592800718155133,
+      "p_tukey": 0.125413595243127
+    }
+  ],
+  "name": "posthoc_machines"
+}

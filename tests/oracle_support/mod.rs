@@ -15,7 +15,7 @@
 
 use glmm::formula::{lower, Column, Lowered, Table};
 use glmm::{
-    fit_cold, BinomialLink, Family, Fit, GammaLink, InverseGaussianLink, NegBinomialLink,
+    BinomialLink, Family, Fit, FitOptions, GammaLink, InverseGaussianLink, NegBinomialLink,
     PoissonLink, WaldSe,
 };
 use serde::Deserialize;
@@ -66,12 +66,12 @@ pub mod tol {
     // stay in `grid/tol.R`, as for every band above.
     /// Gate 1 end to end: the per-coefficient Satterthwaite df at glmm's own
     /// theta-hat against lmerTest's (`df_e2e_rel`).
-    #[allow(dead_code)] // read by tests/inference_oracle.rs only
+    #[allow(dead_code)] // read by tests/inference_oracle.rs and tests/formula_anova.rs only
     pub const DF_E2E_REL: f64 = SE_REL;
     /// Gate 1's interval comparison: the bounds of the Satterthwaite t interval
     /// at glmm's own theta-hat against lmerTest's `contest1D(confint = TRUE)`,
     /// in units of lmerTest's interval width (`confint_rel`).
-    #[allow(dead_code)] // read by tests/inference_oracle.rs only
+    #[allow(dead_code)] // read by tests/inference_oracle.rs and tests/formula_anova.rs only
     pub const CONFINT_REL: f64 = SE_REL;
     /// A two-fit comparison's likelihood-ratio statistic, absolute:
     /// twice this tier's deviance band [`super::DEV_EPS`] (`lrt_abs`).
@@ -100,13 +100,33 @@ pub mod tol {
     pub const WALD_P_REL: f64 = 4e-2;
     /// The p-value of a Satterthwaite per-term row, relative: `DF_E2E_REL`
     /// on F and on DenDF carried through the tail (`satt_p_rel`).
-    #[allow(dead_code)] // read by tests/inference_oracle.rs only
+    #[allow(dead_code)] // read by tests/inference_oracle.rs and tests/formula_anova.rs only
     pub const SATT_P_REL: f64 = 4e-2;
     /// lmerTest's `Sum Sq` and `Mean Sq` on a Satterthwaite per-term row,
     /// relative: `DF_E2E_REL` on F (written as `SE_REL`, as tol.R writes
     /// it) plus twice `STDDEV_REL` on σ̂² (`sum_sq_rel`).
     #[allow(dead_code)] // read by tests/inference_oracle.rs only
     pub const SUM_SQ_REL: f64 = SE_REL + 2.0 * STDDEV_REL;
+    /// Partial η² of an F per-term row, `F·df1 / (F·df1 + df2)`, relative:
+    /// `WALD_REL` on F plus `DF_E2E_REL` on df2, the bound of
+    /// `|d ln η²| = (1 − η²) |d ln F − d ln df2|` (`eta2_rel`).
+    #[allow(dead_code)] // read by tests/inference_oracle.rs and tests/formula_anova.rs only
+    pub const ETA2_REL: f64 = WALD_REL + DF_E2E_REL;
+    /// Marginal and conditional R² and the adjusted and unadjusted ICC,
+    /// relative. Each is a ratio `N/D` of sums of three variances `v_k`, and
+    /// `d ln(N/D) = Σ_k c_k d ln v_k` with every `|c_k| ≤ 1`, so the
+    /// relative error is at most the sum of the three: the fixed variance
+    /// `var(Xβ̂)`, quadratic in β̂ (twice `BETA_REL`), and the random and
+    /// residual variances, each quadratic in a std-dev (twice `STDDEV_REL`
+    /// each) (`r2_icc_rel`).
+    #[allow(dead_code)] // read by tests/inference_oracle.rs and tests/formula_anova.rs only
+    pub const R2_ICC_REL: f64 = 2.0 * BETA_REL + 4.0 * STDDEV_REL;
+    /// A Tukey-adjusted pairwise p-value against emmeans', relative: the
+    /// row's p band (`SATT_P_REL` on a t row, `WALD_P_REL` on a z row, equal)
+    /// plus R's `ptukey` error of 1e-5 relative where it agrees with the
+    /// studentized range (`tukey_p_rel`).
+    #[allow(dead_code)] // read by tests/inference_oracle.rs only
+    pub const TUKEY_P_REL: f64 = SATT_P_REL + 1e-5;
 }
 
 // ── Golden schema ────────────────────────────────────────────────────────────
@@ -143,6 +163,16 @@ pub struct Golden {
     /// does. Only `shape_of` reads it.
     #[serde(skip)]
     pub weights_suite: bool,
+    /// The manifest entry's `reml`: `Some(false)` for an ML fit of a Gaussian
+    /// mixed model, `None` for the default. Not in the frozen result, like
+    /// `weights_col`.
+    #[serde(skip)]
+    pub reml: Option<bool>,
+    /// The manifest entry's `glmm_formula`: the model of `r_formula` in a
+    /// spelling glmm's formula door accepts, where the R spelling is one it
+    /// refuses. `None` on almost every entry: glmm refits `r_formula`.
+    #[serde(skip)]
+    pub glmm_formula: Option<String>,
     pub family: String,
     /// `jsonlite` writes R's `NULL` link (the Gaussian LMM rungs, where `lmer`
     /// takes no family object) as `{}`, not as a string — so this stays a raw
@@ -675,24 +705,25 @@ fn csv_for(g: &Golden) -> String {
 /// `validation/` (the entry's `data`), the entry's `factors` as factor columns
 /// and every other column that parses as numbers numeric (X1, the goldens'
 /// `refit_with` rule), the entry's `weights` column, when it names one, as
-/// the prior weights, and `FitOptions::reml` from the entry's `reml` (`None`
-/// on an entry without one). A Gaussian model; [`lower_on_entry`] takes any.
+/// the prior weights; and the fit options with `FitOptions::reml` from the
+/// entry's `reml` (`None` on an entry without one). A Gaussian model;
+/// [`lower_on_entry`] takes any.
 #[allow(dead_code)] // used by tests/inference_oracle.rs only
-pub fn inference_lowered(e: &inference::Entry) -> Lowered {
+pub fn inference_lowered(e: &inference::Entry) -> (Lowered, FitOptions) {
     let formula = e.r_formula.as_ref().expect("the entry has a formula");
-    let mut lo = lower_on_entry(e, formula, Family::Gaussian, e.raw["weights"].as_str())
+    let lo = lower_on_entry(e, formula, Family::Gaussian, e.raw["weights"].as_str())
         .unwrap_or_else(|err| panic!("{}: {err}", e.name));
-    lo.opts.reml = e.raw["reml"].as_bool();
-    lo
+    let mut fit_opts = FitOptions::default();
+    fit_opts.reml = e.raw["reml"].as_bool();
+    (lo, fit_opts)
 }
 
 /// `formula` of `family` lowered on an inference reference's data, as
 /// [`inference_lowered`] reads it (the entry's `factors` as factor columns),
-/// with the `weights` column, when one is named, as the prior weights. The
-/// other options are the lowering's defaults. R's aggregated-binomial
-/// response `cbind(s, n - s)` is fitted as [`refit_with`] fits it: the
-/// proportion `s / n` as the response of [`glmm_formula`], the trial counts
-/// as the prior weights.
+/// with the `weights` column, when one is named, as the prior weights. R's
+/// aggregated-binomial response `cbind(s, n - s)` is fitted as [`refit_with`]
+/// fits it: the proportion `s / n` as the response of [`glmm_formula`], the
+/// trial counts as the prior weights.
 ///
 /// # Errors
 /// The lowering's refusal of `formula` on this data.
@@ -725,7 +756,7 @@ pub fn lower_on_entry(
         n: rows.len(),
     };
     let mut lo = lower(&glmm_formula(formula), &table, family)?;
-    lo.opts.weights = weights;
+    lo.weights = weights;
     Ok(lo)
 }
 
@@ -852,7 +883,8 @@ fn parse_formula(r_formula: &str) -> Spec {
     }
 }
 
-/// Refit a golden from its own recorded `r_formula` and dataset.
+/// Refit a golden from its own recorded `r_formula` and dataset, or from the
+/// manifest's `glmm_formula` where one is set ([`Golden::glmm_formula`]).
 ///
 /// The oracle records the model it fitted, so Tier 2 drives the crate from that
 /// string rather than a hand-built design — a hand-built design can silently
@@ -872,7 +904,7 @@ pub fn refit_with(
     factors: &[&str],
     wald_se: WaldSe,
 ) -> (Fit, Vec<String>, Vec<String>) {
-    let spec = parse_formula(&g.r_formula);
+    let spec = parse_formula(g.glmm_formula.as_deref().unwrap_or(&g.r_formula));
     let raw = std::fs::read_to_string(csv_for(g)).unwrap_or_else(|e| panic!("{}: {e}", csv_for(g)));
     let mut lines = raw.lines().filter(|l| !l.trim().is_empty());
     let header = split_line(lines.next().expect("CSV has a header"));
@@ -901,7 +933,7 @@ pub fn refit_with(
     };
     // Plain per-row prior weights (the weights tier, rungs 29-43). The manifest
     // makes this mutually exclusive with the aggregated-binomial trial count,
-    // which occupies the same `FitOptions::weights` slot.
+    // which occupies the same `Data::weights` slot.
     let weights = match &g.weights_col {
         None => weights,
         Some(col) => {
@@ -955,13 +987,15 @@ pub fn refit_with(
     // rank deficient the oracle's list is the shorter one (see `align_coefs`).
     // The caller aligns by name, which subsumes the equality check — an
     // unexpected extra or missing column fails there.
-    let lo = lower(&formula, &table, family_of(g)).unwrap_or_else(|e| panic!("{formula}: {e:?}"));
+    let mut lo =
+        lower(&formula, &table, family_of(g)).unwrap_or_else(|e| panic!("{formula}: {e:?}"));
+    lo.weights = weights;
 
-    let mut opts = lo.opts.clone();
+    let mut opts = FitOptions::default();
     opts.nagq = g.nagq;
     opts.wald_se = wald_se;
-    opts.weights = weights;
-    let fit = fit_cold(&lo.x, &lo.y, lo.n, lo.p, &lo.model, &lo.ids, &opts);
+    opts.reml = g.reml;
+    let fit = glmm::fit(&lo.data(), lo.spec(), &opts).unwrap();
     let group_names = lo.re_groups.iter().map(|r| r.name.clone()).collect();
     (fit, lo.col_names, group_names)
 }

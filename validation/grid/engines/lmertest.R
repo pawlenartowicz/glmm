@@ -57,9 +57,12 @@ with_warnings <- function(expr) {
 # offset cell is never Gaussian, so neither case arises here.
 make_fit <- function(cell, df) {
   fm <- stats::as.formula(cell[["r_formula"]])
-  w <- if (is.null(cell[["weights_col"]])) NULL else df[[cell[["weights_col"]]]]
+  # `.w`, not `w`: lm/glm/lmer/glmmTMB look `weights` up in `data` first, so a
+  # local named like a data column (sim_dynrange_lmm has a predictor `w`) would
+  # silently fit with that column as the prior weights.
+  .w <- if (is.null(cell[["weights_col"]])) NULL else df[[cell[["weights_col"]]]]
   reml <- isTRUE(cell[["reml"]])
-  function() with_warnings(lmerTest::lmer(fm, data = df, weights = w, REML = reml))
+  function() with_warnings(lmerTest::lmer(fm, data = df, weights = .w, REML = reml))
 }
 
 # The singular-fit note is the one lme4 convergence message that does not make

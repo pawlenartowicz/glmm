@@ -21,7 +21,7 @@ NULL
 #'
 #' @usage NULL
 #' @keywords internal
-fastglmm_fit <- function(formula, numeric, factor_levels, factor_codes, family, link, wald_se, nagq, dispersion, weights, offset, start_beta, start_theta, start_dispersion, satterthwaite, reml, anova_test) .Call(wrap__fastglmm_fit, formula, numeric, factor_levels, factor_codes, family, link, wald_se, nagq, dispersion, weights, offset, start_beta, start_theta, start_dispersion, satterthwaite, reml, anova_test)
+fastglmm_fit <- function(formula, numeric, factor_levels, factor_codes, family, link, wald_se, nagq, dispersion, weights, offset, start_beta, start_theta, start_dispersion, satterthwaite, condvar, reml, anova_test) .Call(wrap__fastglmm_fit, formula, numeric, factor_levels, factor_codes, family, link, wald_se, nagq, dispersion, weights, offset, start_beta, start_theta, start_dispersion, satterthwaite, condvar, reml, anova_test)
 
 #' `glmm::orchestrate::confint` for `confint.fastglmm`: the lower and upper
 #' bounds per coefficient, the t quantile on a finite df and the normal one
@@ -46,6 +46,28 @@ fastglmm_confint <- function(beta, se, coef_df, level) .Call(wrap__fastglmm_conf
 #' @keywords internal
 fastglmm_contrast_test <- function(df_method, beta, vcov, aliased, nobs, dispersion, record, names, l, rows) .Call(wrap__fastglmm_contrast_test, df_method, beta, vcov, aliased, nobs, dispersion, record, names, l, rows)
 
+#' `glmm::orchestrate::pairwise` for `pairwise()`: the training columns as
+#' `fastglmm_predict` takes them, the fit's fields as `fastglmm_contrast_test`
+#' takes them, then `factor`, `by` (`""` for none), `by_values` (empty for
+#' none) and `adjust`. Returns the table as `orchestrate::pairwise_columns`
+#' flattens it, a list keyed by its fields; `by` and `ratio_kind` are `NULL`
+#' when absent and `levels` crosses as a double.
+#'
+#' @usage NULL
+#' @keywords internal
+fastglmm_pairwise <- function(formula, numeric, factor_levels, factor_codes, family, link, df_method, beta, vcov, aliased, nobs, record, names, factor, by, by_values, adjust) .Call(wrap__fastglmm_pairwise, formula, numeric, factor_levels, factor_codes, family, link, df_method, beta, vcov, aliased, nobs, record, names, factor, by, by_values, adjust)
+
+#' `glmm::orchestrate::pairwise_confint` for `confint()` of a pairwise
+#' table: the columns `fastglmm_pairwise` gave (`estimate`, `se`, `df`, the
+#' unadjusted `p_value`, `adjust`, `levels` as a double, `ratio` the
+#' `ratio_kind`, `""` for none). `level` crosses as a vector, as in
+#' `fastglmm_confint`. Returns `list(adjust, lower, upper, ratio_lower,
+#' ratio_upper)`, `adjust` the adjustment the intervals use.
+#'
+#' @usage NULL
+#' @keywords internal
+fastglmm_pairwise_confint <- function(estimate, se, df, p_value, adjust, levels, ratio, level) .Call(wrap__fastglmm_pairwise_confint, estimate, se, df, p_value, adjust, levels, ratio, level)
+
 #' `glmm::orchestrate::same_fixed_part` for `AIC.fastglmm` and
 #' `BIC.fastglmm`: TRUE when the two formula strings have the same fixed
 #' terms (compared as sets of variable names) and the same fixed intercept.
@@ -68,7 +90,7 @@ fastglmm_same_fixed_part <- function(f0, f1) .Call(wrap__fastglmm_same_fixed_par
 #' @keywords internal
 fastglmm_compare <- function(f0, f1, numeric, factor_levels, factor_codes, family, link, nagq, weights, offset, nsim, seed) .Call(wrap__fastglmm_compare, f0, f1, numeric, factor_levels, factor_codes, family, link, nagq, weights, offset, nsim, seed)
 
-#' `glmm::formula::anova::compare` for `anova(m0, m1)`: compares two stored
+#' `glmm::formula::anova::compare_stored` for `anova(m0, m1)`: compares two stored
 #' fits as they are, with no refit and no data. `m0` and `m1` are named lists
 #' of the fields a fit object stores (the R wrapper's `.compare_side()`
 #' builds them). Returns `list(comparison, nsim, seed)` as `fastglmm_compare`
@@ -89,5 +111,38 @@ fastglmm_anova_pair <- function(m0, m1, nsim, seed) .Call(wrap__fastglmm_anova_p
 #' @usage NULL
 #' @keywords internal
 fastglmm_term_test_refusal <- function(test, satterthwaite) .Call(wrap__fastglmm_term_test_refusal, test, satterthwaite)
+
+#' `glmm::orchestrate::predict` for `predict.fastglmm`: the training columns
+#' as `fastglmm_fit` took them (the R wrapper marshals the fit's model frame
+#' again), the stored numbers `parts` (`parts_of`), and the new table's
+#' columns, or none when `has_new` is FALSE (the model frame's rows);
+#' `n_rows` is the new table's row count. `level` crosses as a vector, as
+#' in `fastglmm_confint`. Returns `list(fit, se, lower, upper, future_lower,
+#' future_upper, notes)`, a part not asked for empty; each note is
+#' `list(kind, detail)` with the rows in `detail` 1-based.
+#'
+#' @usage NULL
+#' @keywords internal
+fastglmm_predict <- function(formula, numeric, factor_levels, factor_codes, family, link, weights, offset, parts, has_new, new_numeric, new_levels, new_codes, n_rows, scale, population, allow_new_levels, se, level, future) .Call(wrap__fastglmm_predict, formula, numeric, factor_levels, factor_codes, family, link, weights, offset, parts, has_new, new_numeric, new_levels, new_codes, n_rows, scale, population, allow_new_levels, se, level, future)
+
+#' `glmm::orchestrate::simulate` for `simulate.fastglmm`: the columns and
+#' `parts` as `fastglmm_predict` takes them; `nsim` and `seed` whole numbers
+#' sent as doubles (the R wrapper has checked them). The draws draw after
+#' draw, `nobs * nsim` doubles.
+#'
+#' @usage NULL
+#' @keywords internal
+fastglmm_simulate <- function(formula, numeric, factor_levels, factor_codes, family, link, weights, offset, parts, nsim, seed) .Call(wrap__fastglmm_simulate, formula, numeric, factor_levels, factor_codes, family, link, weights, offset, parts, nsim, seed)
+
+#' `glmm::orchestrate::effect_sizes` for `r2()`, `icc()` and
+#' `summary.fastglmm`: the columns and `parts` as `fastglmm_predict` takes
+#' them, and the fit's `aliased`, `converged`, `objective` and
+#' `objective_nodes`. Returns `list(marginal, conditional, adjusted,
+#' unadjusted)`, or `NULL` where the values need the null refit that
+#' `null_refit = FALSE` skips.
+#'
+#' @usage NULL
+#' @keywords internal
+fastglmm_effect_sizes <- function(formula, numeric, factor_levels, factor_codes, family, link, weights, offset, parts, aliased, converged, objective, objective_nodes, null_refit) .Call(wrap__fastglmm_effect_sizes, formula, numeric, factor_levels, factor_codes, family, link, weights, offset, parts, aliased, converged, objective, objective_nodes, null_refit)
 
 # nolint end

@@ -1,12 +1,13 @@
-# Hypothesis tests: `anova()` and `compare()`
+# Hypothesis tests: `anova()`, `compare()` and `pairwise()`
 
-Three calls test hypotheses about a fitted model, in both ports:
+Four calls test hypotheses about a fitted model, in both ports:
 
 | Call | R | Python | Takes | Refits? |
 |---|---|---|---|---|
 | per-term tests | `anova(m)` | `glmm.anova(m)` | one fit | no: reads the tables the fit stored when it was made |
 | two fits compared | `anova(m0, m1)` | `glmm.anova(m0, m1)` | two existing fits | no, and reads no data |
 | two formulas compared | `compare(data, f0, f1)` | `glmm.compare(data, f0, f1)` | one data set, two formulas | fits both models itself |
+| pairwise comparisons of a factor's levels | `pairwise(m, "f")` | `glmm.pairwise(m, "f")` | one fit | no: reads the fit's numbers and its rows |
 
 The Rust crate computes every statistic and every p-value; the two ports only
 lay the numbers out, with R's column names, so both give the same tables. A
@@ -37,15 +38,16 @@ glmm.anova(m, type="II")
 
 ```
 Type III Analysis of Variance Table with Satterthwaite's method
-     Sum Sq Mean Sq NumDF DenDF F value    Pr(>F)
-Days  30031   30031     1    17  45.853 3.264e-06 ***
+Partial eta-squared uses the Satterthwaite denominator df, so it is approximate.
+     Sum Sq Mean Sq NumDF DenDF F value Eta2_partial    Pr(>F)
+Days  30031   30031     1    17  45.853      0.72953 3.264e-06 ***
 ```
 
 Which test a row gets depends on the model, as in lmerTest, `lm` and `glm`:
 
 | Model | Row | Columns |
 |---|---|---|
-| Gaussian mixed model (REML or ML) | F on lmerTest's Satterthwaite denominator df (its multi-df construction) | `Sum Sq`, `Mean Sq`, `NumDF`, `DenDF`, `F value`, `Pr(>F)` |
+| Gaussian mixed model (REML or ML) | F on lmerTest's Satterthwaite denominator df (its multi-df construction) | `Sum Sq`, `Mean Sq`, `NumDF`, `DenDF`, `F value`, `Eta2_partial`, `Pr(>F)` |
 | OLS; Gamma and inverse-Gaussian GLMs with φ estimated | F on the residual df `n − p` | the same |
 | binomial, Poisson and negative-binomial GLMs, a Gamma or inverse-Gaussian GLM with φ held, every GLMM but a Poisson one | Wald χ² on the rank of the term's hypothesis | `Chisq`, `Df`, `Pr(>Chisq)` |
 | Poisson GLMM | likelihood-ratio χ² on the rank of the term's hypothesis, from a refit of the model under it | the same |
@@ -72,6 +74,20 @@ indexing and `broom::tidy()` work (on an F table broom keeps `NumDF` and
 does on lmerTest's table); in Python a `TermTable` is indexed by
 column name (`tab["Pr(>F)"]`), and `to_pandas()` returns a DataFrame (pandas
 is imported only then).
+
+**Partial η².** Each F row also has its partial η², the column
+`Eta2_partial`: `F · NumDF / (F · NumDF + DenDF)`, the formula of
+`effectsize::F_to_eta2`. It is the share of variance the term explains, after
+the other terms. It sits before `Pr(>F)`, because R's `print.anova` prints the
+significance stars only when the p-value is the last column. On OLS and on the
+Gamma and inverse-Gaussian GLMs `DenDF` is the residual df `n − p`. On a
+Gaussian mixed model `DenDF` is Satterthwaite's df, which is not a count of
+rows, so the value is only approximate there; the table says so in a note:
+"Partial eta-squared uses the Satterthwaite denominator df, so it is
+approximate." A row with no F (NaN or NA) has no partial η². χ² tables have no
+such column, and neither has the table of `contrast_test()`, which tests a
+contrast, not a term. A fit saved by an older version prints its table
+without the column.
 
 **Type III** (the default) is built the way lmerTest builds it: each term's
 hypothesis starts from the term's full indicator coding, expressed in the
@@ -223,11 +239,9 @@ refit's, referred to χ² on the term's df (the Wald row's `Df`).
 - The table keeps the Wald table's columns, `Chisq`, `Df` and `Pr(>Chisq)`
   (car names its statistic `LR Chisq`), so only the heading tells a
   likelihood-ratio table from a Wald one.
-- A term whose columns carry a random slope keeps its Wald row, with a note:
-  the refit cannot leave out a column the random part uses. A refit that does
-  not converge makes its row NaN, with a note; on a fit that did not converge
-  nothing is refitted and every row is NaN. The notes are listed
-  [below](#the-notes-a-table-can-carry).
+- A refit that does not converge makes its row NaN, with a note; on a fit
+  that did not converge nothing is refitted and every row is NaN. The notes
+  are listed [below](#the-notes-a-table-can-carry).
 
 **When the refits are made: `anova_test`.** The likelihood-ratio rows are
 built when the model is fitted, as the Wald rows are, so `anova(m)` still
@@ -265,6 +279,78 @@ gets likelihood-ratio rows for some models and Wald rows for
 others, under the same column names. To keep one test, name it at fit time
 and in `anova()`: `anova_test = "Wald"` with `test = "Wald"` (no refits, the
 fastest), or `anova_test = "LRT"` with `test = "LRT"`.
+
+## Pairwise comparisons: `pairwise()`
+
+`pairwise()` compares every pair of levels of one factor, as emmeans'
+`pairs(emmeans(m, ~ f))`. Nothing is refitted.
+
+**The default adjustment is Holm. emmeans' default is Tukey.** To get
+emmeans' p-values, pass `adjust = "tukey"`. The choices are `"holm"`,
+`"bonferroni"`, `"tukey"` and `"none"`.
+
+```r
+pw <- pairwise(m, "f")                  # Holm
+pairwise(m, "f", adjust = "tukey")      # emmeans' default
+pairwise(m, "f", by = "h")              # within each level of h
+pairwise(m, "f", by = "x", at = c(1, 2))  # at x = 1 and at x = 2
+confint(pw)
+```
+
+```python
+pw = glmm.pairwise(m, "f")              # a PairwiseTable; prints as text
+glmm.pairwise(m, "f", adjust="tukey")
+glmm.pairwise(m, "f", by="h")
+glmm.pairwise(m, "f", by="x", at=[1, 2])
+pw.confint()
+```
+
+On a Gaussian mixed model with a three-level factor `f`:
+
+```
+Pairwise comparisons of f
+  contrast estimate     SE    df t.ratio p.value
+1    a - b  -0.2114 0.2254 105.8 -0.9377   0.351
+2    a - c   0.3766 0.2233 105.8   1.687   0.189
+3    b - c    0.588 0.2219 105.5    2.65  0.0278
+P value adjustment: holm method for 3 tests
+```
+
+How each row is made:
+
+- The estimate is the difference of two levels' means on the link scale. The
+  other factors of the fixed part are averaged with equal weights. Every
+  numeric variable is at its mean over the fit's rows; a transformed variable
+  is at the transform of its mean (`log(x̄)`, as emmeans).
+- The test is the t test on Satterthwaite's df on a Gaussian mixed model, the
+  t test on the residual df `n − p` on OLS and the Gamma and inverse-Gaussian
+  GLMs, and the z test on every other fit (`df` is `Inf`).
+- On a log or logit link each row also has the ratio of the two means,
+  `exp(estimate)`, with its SE: `odds.ratio` on a logit link, `ratio` on a
+  log link.
+- With `by`, the comparisons are made within each level of another factor,
+  or, with `at`, at each chosen value of a numeric variable. The p-values are
+  adjusted within each of these groups, as emmeans does.
+
+The columns have emmeans' names: `contrast`, the `by` variable, `estimate`,
+`SE`, `df`, `t.ratio` or `z.ratio`, `p.value` (adjusted), and `odds.ratio` or
+`ratio` with `ratio.SE`. The notes under the table name the adjustment and the
+number of tests in a group. In R the table is a data frame of class
+`fastglmm_pairwise`; in Python a `PairwiseTable`, with the `text()`,
+`html()`, `latex()`, `typst()` and `to_pandas()` of the anova tables.
+
+A Gaussian mixed model fitted with `satterthwaite = FALSE` has no df: its rows
+have NaN df, statistic and p-value, and a note. A comparison that reads an
+aliased coefficient (an empty cell) is NaN, with a note, and the adjustment
+counts only the rows that were tested.
+
+**Confidence intervals.** `confint(pw)` (Python `pw.confint()`) gives
+`lower.CL` and `upper.CL` at `level` (0.95 by default), and `ratio.lower.CL`
+and `ratio.upper.CL` on a log or logit link. The intervals follow the
+table's adjustment, as emmeans' `confint()` does: Bonferroni and Tukey
+intervals hold for a whole group at once. Holm has no simultaneous interval,
+so a Holm table gets Bonferroni intervals, and the notes say "Holm has no
+simultaneous interval; Bonferroni intervals shown."
 
 ## Comparing two models
 
@@ -714,9 +800,9 @@ A note about one row is printed after that row's label, for example
 | Missing cells for: …. Interpret type III hypotheses with care. | a Type III table whose design has an empty cell |
 | The coefficient `<name>` is aliased, so the hypothesis was not tested. | a term with an aliased column (NaN row), one note per aliased coefficient, named as in the fit's coefficient names |
 | No denominator df (`<reason>`), so the hypothesis was not tested. | an F row with no df: Satterthwaite switched off or failed |
+| Partial eta-squared uses the Satterthwaite denominator df, so it is approximate. | an F table on Satterthwaite's df (last note) |
 | The `<rows>` tested coefficients span `<rank>` directions of their covariance; the F is on those `<rank>`. | a rank-deficient hypothesis |
 | A model refitted for this term's likelihood-ratio test did not converge, or its log-likelihood is not finite, so the statistic and its p-value are NaN. | a likelihood-ratio row whose refit did not converge, or whose log-likelihood is not finite |
-| Likelihood-ratio test not available: the term's column carries a random slope, so the row is the Wald chi-squared test. | a likelihood-ratio table's row for a term with a random slope |
 | The model refitted under the term's hypothesis reached a higher log-likelihood than the larger model of this row, by more than round-off: the larger model did not reach its optimum. The statistic is set to 0. | a likelihood-ratio row whose statistic came out below zero |
 | No model was refitted, so every likelihood-ratio statistic and p-value is NaN. | a likelihood-ratio table of a fit that did not converge (after the first note) |
 | The model under the hypothesis of `<term>` could not be built (the hypothesis is too ill-conditioned), so its statistic and its p-value are NaN. | a Type III likelihood-ratio row whose reduced design could not be built |
@@ -734,10 +820,11 @@ A note about one row is printed after that row's label, for example
 ## From Rust
 
 The comparison surface lives in `glmm::formula::anova` (feature `formula`):
-`nesting(f0, f1)` (the formula check), `compare(&Model, &Model,
-&CompareOptions)` (two fitted models as plain numbers, `Model::from_fit` builds
-one from a `Fit` and its `Lowered`), and `term_tests(&Lowered, &Fit,
-&TermTestOptions)` (the per-term table). They return `Comparison` (with
+`nesting(f0, f1)` (the formula check), `compare(&formula::Model,
+&formula::Model, &CompareOptions)` (two models from `formula::fit`),
+`compare_stored(&anova::Model, &anova::Model, &CompareOptions)` (two fits kept
+as plain numbers), and `term_tests(&formula::Model, &TermTestOptions)` (the
+per-term table). They return `Comparison` (with
 `ComparisonTest::{Lr(LrTest), Linear(LinearTest)}`) and `TermTable`, whose
 statistics and references are the `glmm::inference` types `LrTest`,
 `LinearTest`, `Reference` and `Objective`. `Fit::nobs` and `Fit::objective`
@@ -749,7 +836,16 @@ tables `run_fit` stores on `FitResult`. `TermTestOptions::test` takes
 which test ran and why (`ChoiceReason`); `run_fit`'s `anova_test` (`"auto"`,
 `"Wald"` or `"LRT"`) decides whether `FitResult::term_table_type3_lrt` and
 `term_table_type2_lrt` are built, and `FitResult::term_test_auto` records
-what `"auto"` gives. None of these is under the semver promise before 1.0.
+what `"auto"` gives. `FixedRow::eta2_partial()` gives a row's partial η²
+(NaN on a row with no F), and `orchestrate::TermColumns::eta2_partial` holds
+it per row. None of these is under the semver promise before 1.0.
+
+The pairwise comparisons are `glmm::formula::pairwise(&model, factor, by,
+adjust)`, with `by` `None`, `Some(By::Levels(name))` or `Some(By::Values(name,
+&values))`, and `adjust` an `Adjust` (`Adjust::default()` is `Holm`). It returns a
+`Pairwise` of `PairwiseRow`s, and `Pairwise::confint(level)` its
+`PairwiseIntervals`. The ports reach it through `orchestrate::pairwise` and
+`orchestrate::pairwise_confint`.
 
 ## References
 

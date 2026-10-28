@@ -2,14 +2,14 @@
 //! every route (one table), the intercept found wherever it sits, a reused
 //! workspace, a carried θ̂, and a pinned block with a centered slope.
 
-use super::common::spec_sized_from_ids_pub;
 use super::common_tests::{lcg, sim_clustered};
 use super::core::{build_workspace, fit_on};
 use super::*;
-use crate::{ReStructure, Sizing};
+use crate::test_support::{fit_cold, fit_warm_wo};
+use crate::ReStructure;
 
-/// One route under test: design, response, spec, ids, options, and which
-/// column the arms act on.
+/// One route under test: design, response, spec, ids, prior weights and
+/// offset, options, and which column the arms act on.
 #[derive(Clone)]
 struct Case {
     name: &'static str,
@@ -19,8 +19,25 @@ struct Case {
     p: usize,
     model: ModelSpec,
     ids: GroupIds,
+    weights: Option<Vec<f64>>,
+    offset: Option<Vec<f64>>,
     opts: FitOptions,
     col: usize,
+}
+
+impl Case {
+    /// The design `x` (the case's own or a transform of it) with the case's
+    /// response, prior weights and offset, and no ids: the loop tier's data.
+    fn data<'a>(&'a self, x: &'a [f64]) -> Data<'a> {
+        let mut data = Data::new(x, &self.y, self.n, self.p);
+        if let Some(w) = &self.weights {
+            data = data.weights(w);
+        }
+        if let Some(o) = &self.offset {
+            data = data.offset(o);
+        }
+        data
+    }
 }
 
 /// `cluster,x,grp,y` fixture with the given family and random structure.
@@ -32,7 +49,7 @@ fn clustered(
     re: bool,
     nagq: u8,
 ) -> Case {
-    let (x, y, cids, nc) = sim_clustered(csv);
+    let (x, y, cids, _) = sim_clustered(csv);
     let n = y.len();
     Case {
         name,
@@ -43,9 +60,7 @@ fn clustered(
         model: ModelSpec {
             family,
             re: re.then(|| ReStructure {
-                sizing: Sizing::FixedClusters {
-                    n_clusters: nc as u32,
-                },
+                terms: Vec::new(),
                 slopes,
                 extra_groupings: vec![],
             }),
@@ -58,8 +73,10 @@ fn clustered(
         } else {
             GroupIds::default()
         },
+        weights: None,
+        offset: None,
         opts: FitOptions {
-            target_indices: vec![0, 1, 2],
+            se_for: SeFor::Only(vec![0, 1, 2]),
             nagq,
             ..FitOptions::default()
         },
@@ -95,9 +112,7 @@ fn yxg(name: &'static str, csv: &str, family: Family, slopes: Vec<u32>, nagq: u8
         model: ModelSpec {
             family,
             re: Some(ReStructure {
-                sizing: Sizing::FixedClusters {
-                    n_clusters: levels.len() as u32,
-                },
+                terms: Vec::new(),
                 slopes,
                 extra_groupings: vec![],
             }),
@@ -106,8 +121,10 @@ fn yxg(name: &'static str, csv: &str, family: Family, slopes: Vec<u32>, nagq: u8
             primary: ids,
             extra: vec![],
         },
+        weights: None,
+        offset: None,
         opts: FitOptions {
-            target_indices: vec![0, 1],
+            se_for: SeFor::Only(vec![0, 1]),
             nagq,
             ..FitOptions::default()
         },
@@ -156,8 +173,10 @@ fn cases() -> Vec<Case> {
             ..model
         },
         ids,
+        weights: None,
+        offset: None,
         opts: FitOptions {
-            target_indices: (0..p as u32).collect(),
+            se_for: SeFor::Only((0..p as u32).collect()),
             ..FitOptions::default()
         },
         col: 1,
@@ -174,7 +193,18 @@ fn with_column(c: &Case, s: f64, a: f64) -> Vec<f64> {
 }
 
 fn fit(c: &Case, x: &[f64]) -> Fit {
-    fit_cold(x, &c.y, c.n, c.p, &c.model, &c.ids, &c.opts)
+    fit_warm_wo(
+        x,
+        &c.y,
+        c.n,
+        c.p,
+        &c.model,
+        &c.ids,
+        None,
+        c.weights.as_deref(),
+        c.offset.as_deref(),
+        &c.opts,
+    )
 }
 
 /// Relative closeness with an absolute floor for values near zero.
@@ -207,9 +237,10 @@ fn invariance_cases() -> Vec<Case> {
         p,
         model,
         ids,
+        weights: Some(w),
+        offset: None,
         opts: FitOptions {
-            target_indices: vec![0, 1],
-            weights: Some(w),
+            se_for: SeFor::Only(vec![0, 1]),
             ..FitOptions::default()
         },
         col: 1,
@@ -223,9 +254,9 @@ fn invariance_cases() -> Vec<Case> {
         c.name = name;
         let mut st = 7u64;
         // `lcg` is U(−1, 1): weights in (0.5, 1.5).
-        c.opts.weights = Some((0..c.n).map(|_| 1.0 + 0.5 * lcg(&mut st)).collect());
+        c.weights = Some((0..c.n).map(|_| 1.0 + 0.5 * lcg(&mut st)).collect());
         if c.model.re.is_some() && !matches!(c.model.family, Family::Gaussian) {
-            c.opts.offset = Some((0..c.n).map(|_| 0.2 * lcg(&mut st)).collect());
+            c.offset = Some((0..c.n).map(|_| 0.2 * lcg(&mut st)).collect());
         }
         v.push(c);
     }
@@ -489,8 +520,7 @@ fn fit_on_reuse_recomputes_statistics_per_draw() {
         .into_iter()
         .filter(|c| matches!(c.name, "ols" | "lmm_dense" | "glmm_laplace"))
     {
-        let (sized, ids, perm) = spec_sized_from_ids_pub(&c.model, &c.ids);
-        let mut ws = build_workspace(&sized, perm, c.n, c.p, &c.opts);
+        let mut ws = build_workspace(&c.model, &c.ids, c.n, c.p, &c.opts);
         let draws = [
             with_column(&c, 1e3, 0.0),
             with_column(&c, 1.0, 1000.0),
@@ -506,9 +536,9 @@ fn fit_on_reuse_recomputes_statistics_per_draw() {
         ];
         let mut joint = vec![];
         for (d, x) in draws.iter().enumerate() {
-            let view = fit_on(&mut ws, x, &c.y, &ids, None, &c.opts);
+            let view = fit_on(&mut ws, &c.data(x), None, &c.opts);
             joint.push(view.joint_t_sq());
-            let got = view.into_fit(x, &c.y, &ids, c.n, c.p, &c.model, &c.opts);
+            let got = view.into_fit(&c.data(x), &c.model, &c.opts);
             let want = fit(&c, x);
             for k in 0..c.p {
                 assert!(
@@ -541,8 +571,7 @@ fn warm_theta_carry_across_draws_matches_cold() {
         .into_iter()
         .filter(|c| matches!(c.name, "lmm_dense" | "glmm_laplace"))
     {
-        let (sized, ids, perm) = spec_sized_from_ids_pub(&c.model, &c.ids);
-        let mut ws = build_workspace(&sized, perm, c.n, c.p, &c.opts);
+        let mut ws = build_workspace(&c.model, &c.ids, c.n, c.p, &c.opts);
         // The evaluation-count check below is a property of the BOBYQA route,
         // whose search length follows its start. The gradient search
         // restarts its curvature from the identity on every fit, so a start
@@ -550,7 +579,7 @@ fn warm_theta_carry_across_draws_matches_cold() {
         // on this fixture, 2026-10-07).
         super::core::force_bobyqa_route(&mut ws);
         let x1 = with_column(&c, 1.0, 1000.0);
-        let theta = fit_on(&mut ws, &c.x, &c.y, &ids, None, &c.opts)
+        let theta = fit_on(&mut ws, &c.data(&c.x), None, &c.opts)
             .theta()
             .to_vec();
         let start = StartValues {
@@ -558,14 +587,16 @@ fn warm_theta_carry_across_draws_matches_cold() {
             theta,
             dispersion: None,
         };
-        let warm = fit_on(&mut ws, &x1, &c.y, &ids, Some(&start), &c.opts)
-            .into_fit(&x1, &c.y, &ids, c.n, c.p, &c.model, &c.opts);
+        let warm = fit_on(&mut ws, &c.data(&x1), Some(&start), &c.opts).into_fit(
+            &c.data(&x1),
+            &c.model,
+            &c.opts,
+        );
         // The cold reference on the same route as the warm fits above.
         let cold = {
-            let mut wc = build_workspace(&sized, perm, c.n, c.p, &c.opts);
+            let mut wc = build_workspace(&c.model, &c.ids, c.n, c.p, &c.opts);
             super::core::force_bobyqa_route(&mut wc);
-            fit_on(&mut wc, &x1, &c.y, &ids, None, &c.opts)
-                .into_fit(&x1, &c.y, &ids, c.n, c.p, &c.model, &c.opts)
+            fit_on(&mut wc, &c.data(&x1), None, &c.opts).into_fit(&c.data(&x1), &c.model, &c.opts)
         };
         assert!(
             close(warm.deviance, cold.deviance, 1e-7),
@@ -578,14 +609,12 @@ fn warm_theta_carry_across_draws_matches_cold() {
         // standardized design it is the optimum the search starts at, where
         // read in the wrong units (the intercept variance at x = 0 taken as the
         // one at the mean) it is far from it.
-        let theta1 = fit_on(&mut ws, &x1, &c.y, &ids, None, &c.opts)
+        let theta1 = fit_on(&mut ws, &c.data(&x1), None, &c.opts)
             .theta()
             .to_vec();
         let again = fit_on(
             &mut ws,
-            &x1,
-            &c.y,
-            &ids,
+            &c.data(&x1),
             Some(&StartValues {
                 beta: vec![],
                 theta: theta1,
@@ -593,7 +622,7 @@ fn warm_theta_carry_across_draws_matches_cold() {
             }),
             &c.opts,
         )
-        .into_fit(&x1, &c.y, &ids, c.n, c.p, &c.model, &c.opts);
+        .into_fit(&c.data(&x1), &c.model, &c.opts);
         assert!(
             close(again.deviance, cold.deviance, 1e-7),
             "{}: carried into the same draw",
@@ -619,12 +648,18 @@ fn warm_theta_carry_across_draws_matches_cold() {
             theta: vec![0.5],
             dispersion: None,
         };
-        let s = fit_on(&mut ws, &x1, &c.y, &ids, Some(&short), &c.opts)
-            .into_fit(&x1, &c.y, &ids, c.n, c.p, &c.model, &c.opts);
-        let mut fresh = build_workspace(&sized, perm, c.n, c.p, &c.opts);
+        let s = fit_on(&mut ws, &c.data(&x1), Some(&short), &c.opts).into_fit(
+            &c.data(&x1),
+            &c.model,
+            &c.opts,
+        );
+        let mut fresh = build_workspace(&c.model, &c.ids, c.n, c.p, &c.opts);
         super::core::force_bobyqa_route(&mut fresh);
-        let f0 = fit_on(&mut fresh, &x1, &c.y, &ids, None, &c.opts)
-            .into_fit(&x1, &c.y, &ids, c.n, c.p, &c.model, &c.opts);
+        let f0 = fit_on(&mut fresh, &c.data(&x1), None, &c.opts).into_fit(
+            &c.data(&x1),
+            &c.model,
+            &c.opts,
+        );
         let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
         assert_eq!(bits(&s.beta), bits(&f0.beta), "{}: short θ start β", c.name);
         assert_eq!(
@@ -644,10 +679,16 @@ fn warm_theta_carry_across_draws_matches_cold() {
             theta: vec![0.5],
             dispersion: None,
         };
-        let s = fit_on(&mut ws, &x1, &c.y, &ids, Some(&short), &c.opts)
-            .into_fit(&x1, &c.y, &ids, c.n, c.p, &c.model, &c.opts);
-        let f0 = fit_on(&mut fresh, &x1, &c.y, &ids, None, &c.opts)
-            .into_fit(&x1, &c.y, &ids, c.n, c.p, &c.model, &c.opts);
+        let s = fit_on(&mut ws, &c.data(&x1), Some(&short), &c.opts).into_fit(
+            &c.data(&x1),
+            &c.model,
+            &c.opts,
+        );
+        let f0 = fit_on(&mut fresh, &c.data(&x1), None, &c.opts).into_fit(
+            &c.data(&x1),
+            &c.model,
+            &c.opts,
+        );
         assert_eq!(bits(&s.beta), bits(&f0.beta), "{}: as given, β", c.name);
         assert_eq!(
             s.deviance.to_bits(),
@@ -664,16 +705,14 @@ fn warm_theta_carry_across_draws_matches_cold() {
 /// far from zero, through `fit_cold`.
 #[test]
 fn pinned_fixture_reports_caller_coordinates() {
-    let (n, nc) = (400usize, 20usize);
+    let n = 400usize;
     let (x, y, primary) = crate::glmm::tests::pinned_diagonal_fixture(278, 1000.0);
     let spec = ModelSpec {
         family: Family::Binomial {
             link: crate::BinomialLink::Logit,
         },
         re: Some(ReStructure {
-            sizing: Sizing::FixedClusters {
-                n_clusters: nc as u32,
-            },
+            terms: Vec::new(),
             slopes: vec![1],
             extra_groupings: vec![],
         }),
@@ -690,7 +729,7 @@ fn pinned_fixture_reports_caller_coordinates() {
         &spec,
         &ids,
         &FitOptions {
-            target_indices: vec![0, 1],
+            se_for: SeFor::Only(vec![0, 1]),
             nagq: 7,
             ..FitOptions::default()
         },
@@ -705,13 +744,12 @@ fn pinned_fixture_reports_caller_coordinates() {
     // The loop tier reports the same exact zero at the slope diagonal of θ̂
     // (column-major vech: entry 2).
     let opts = FitOptions {
-        target_indices: vec![0, 1],
+        se_for: SeFor::Only(vec![0, 1]),
         nagq: 7,
         ..FitOptions::default()
     };
-    let (sized, ids_s, perm) = spec_sized_from_ids_pub(&spec, &ids);
-    let mut ws = build_workspace(&sized, perm, n, 2, &opts);
-    let view = fit_on(&mut ws, &x, &y, &ids_s, None, &opts);
+    let mut ws = build_workspace(&spec, &ids, n, 2, &opts);
+    let view = fit_on(&mut ws, &Data::new(&x, &y, n, 2), None, &opts);
     assert_eq!(view.theta()[2], 0.0, "θ̂ {:?}", view.theta());
     assert_eq!(view.diagnostics().pinned_components, 0b10);
     // varcorr is PSD and finite (no false zero from the map).
@@ -735,11 +773,67 @@ fn glmm_view_dispersion_is_the_caller_intercept_variance() {
         .find(|c| c.name == "glmm_laplace")
         .unwrap();
     let x = with_column(&c, 1.0, 1000.0);
-    let (sized, ids, perm) = spec_sized_from_ids_pub(&c.model, &c.ids);
-    let mut ws = build_workspace(&sized, perm, c.n, c.p, &c.opts);
-    let view = fit_on(&mut ws, &x, &c.y, &ids, None, &c.opts);
+    let mut ws = build_workspace(&c.model, &c.ids, c.n, c.p, &c.opts);
+    let view = fit_on(&mut ws, &c.data(&x), None, &c.opts);
     let d = view.dispersion();
-    let f = view.into_fit(&x, &c.y, &ids, c.n, c.p, &c.model, &c.opts);
+    let f = view.into_fit(&c.data(&x), &c.model, &c.opts);
     let v = f.varcorr[0][0];
     assert!((d - v).abs() <= 1e-14 * v, "{d} vs {v}");
+}
+
+/// A column that is a centered slope in one grouping and an uncorrelated
+/// slope in another is not centered: `x` in `(1 + x | g1) + (1 + x || g2)` on
+/// `sim_slope_extra`. Centering it would move `−m·b_x` onto `g2`'s intercept,
+/// which `||` keeps uncorrelated with its slope, so the centered fit would be
+/// another model. `x` is scaled about zero instead, as with `standardize` off,
+/// and the fit's deviance is that fit's.
+#[test]
+fn uncorrelated_slope_is_not_centered() {
+    let csv = include_str!("../../validation/data/simulated/sim_slope_extra.csv");
+    let (mut x, mut y, mut g1, mut g2) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+        let f: Vec<&str> = line.split(',').map(|s| s.trim_matches('"')).collect();
+        y.push(f[0].parse::<f64>().unwrap());
+        x.extend_from_slice(&[1.0, f[1].parse::<f64>().unwrap()]);
+        g1.push(f[2].parse::<u32>().unwrap());
+        g2.push(f[3].parse::<u32>().unwrap());
+    }
+    let (n, p) = (y.len(), 2);
+    let rms = (x.iter().skip(1).step_by(2).map(|v| v * v).sum::<f64>() / n as f64).sqrt();
+    let mut kept = crate::standardize::ColumnScaling::with_re_slopes(p, [1, 1], [1]);
+    kept.compute(&x, n, p, None, true);
+    assert_eq!(kept.center(1), 0.0);
+    assert!(
+        (kept.scale(1) - rms).abs() <= 1e-12 * rms,
+        "{}",
+        kept.scale(1)
+    );
+    let mut centered = crate::standardize::ColumnScaling::with_re_slopes(p, [1, 1], []);
+    centered.compute(&x, n, p, None, true);
+    assert_ne!(centered.center(1), 0.0);
+
+    let ids = GroupIds {
+        primary: super::common_tests::dense_ids(&g1).0,
+        extra: vec![super::common_tests::dense_ids(&g2).0],
+    };
+    let model = ModelSpec::mixed(
+        Family::Gaussian,
+        ReStructure::intercept()
+            .slopes([1])
+            .extra(crate::Grouping::crossed().slopes([1]).uncorrelated()),
+    );
+    let opts = FitOptions::default();
+    let standardized = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    let data = Data::new(&x, &y, n, p);
+    let mut ws = build_workspace(&model, &ids, n, p, &opts);
+    ws.set_prestandardized(true);
+    let as_given = fit_on(&mut ws, &data, None, &opts).into_fit(&data, &model, &opts);
+    assert!(standardized.converged() && as_given.converged());
+    assert_eq!(
+        standardized.deviance.to_bits(),
+        as_given.deviance.to_bits(),
+        "standardized {} vs as given {}",
+        standardized.deviance,
+        as_given.deviance
+    );
 }

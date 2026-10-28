@@ -1,5 +1,6 @@
 """The Python front end of the anova port gate: the call list of
-`anova_ports.rs`, made through the Python port (`glmm.anova`, `glmm.compare`),
+`anova_ports.rs`, made through the Python port (`glmm.anova`, `glmm.compare`, and the post-fit
+`predict`, `simulate`, `r2`, `icc`, `glmm.pairwise`),
 each table written to stdout as one JSONL row per cell. Mirrors
 `anova_ports.rs` and `anova_ports.R` call for call: change together. The call
 list and the cell format are documented in `anova_ports.rs`.
@@ -123,6 +124,15 @@ TERM_CALLS = [
 ]
 
 MISSING_ROW = 4  # 0-based row of wls_basic.csv whose x2 is made missing
+
+# The new rows of the predict calls, as anova_ports.rs's NEW_SUBJ ... NEW_X:
+# s99 is a subj the fit did not see.
+NEWDATA = {
+    "subj": ["s01", "s02", "s99", "s18"],
+    "g": ["a", "b", "c", "c"],
+    "h": ["p", "q", "p", "q"],
+    "x": [0.5, -1.0, 0.0, 1.25],
+}
 
 
 def read_data(path, factors):
@@ -280,20 +290,25 @@ def pairs():
         anova_call(f"anova:{name}", data, m, weights)
 
 
+def term_model(label):
+    """The data and the model of a label in TERM_MODELS."""
+    path, factors, formula, family, link = {t[0]: t[1:] for t in TERM_MODELS}[label]
+    data = read_data(path, factors)
+    m = {
+        "formula": aggregated(formula, data),
+        "family": family,
+        "link": link,
+        "reml": None,
+        "nagq": 1,
+    }
+    return data, m
+
+
 def term_calls():
     """`glmm.anova(m, type=, test=)` per TERM_CALLS, each table followed by
     its text cells: the heading and notes, and the fit's `term_test_auto`."""
-    models = {t[0]: t[1:] for t in TERM_MODELS}
     for label, types, test, named in TERM_CALLS:
-        path, factors, formula, family, link = models[label]
-        data = read_data(path, factors)
-        m = {
-            "formula": aggregated(formula, data),
-            "family": family,
-            "link": link,
-            "reml": None,
-            "nagq": 1,
-        }
+        data, m = term_model(label)
         calls = [f"terms:{label}:{ss}" + (f":{test}" if named else "") for ss in types]
         try:
             f = fit(data, m, None, anova_test="LRT" if test == "LRT" else "auto")
@@ -334,8 +349,59 @@ def rlrt_calls():
     anova_call("anova:rlrt_dyestuff", data, m, None)
 
 
+def numbered(n):
+    return [str(i + 1) for i in range(n)]
+
+
+def post_fit(call, kind, f):
+    """One post-fit call on the fit `f`, as anova_ports.rs's post_fit."""
+    if kind == "predict":
+        p = f.predict(NEWDATA, se_fit=True)
+        cols = [
+            ("fit", p["fit"]),
+            ("se.fit", p["se_fit"]),
+            ("lower", p["lower"]),
+            ("upper", p["upper"]),
+        ]
+        table(call, numbered(len(NEWDATA["x"])), cols)
+    elif kind == "simulate":
+        draws = f.simulate(nsim=2, seed=1)
+        table(call, numbered(f.nobs), [("sim_1", draws[:, 0]), ("sim_2", draws[:, 1])])
+    elif kind in ("r2", "icc"):
+        e = f.r2() if kind == "r2" else f.icc()
+        table(call, ["fit"], [(k, [v]) for k, v in e.items()])
+    else:
+        tab = glmm.pairwise(f, "g", adjust=kind)
+        cols = [(c, list(tab[c])) for c in tab.columns if c != "contrast"]
+        table(call, list(tab["contrast"]), cols)
+
+
+def post_fit_calls():
+    """anova_ports.rs's post_fit_calls: predict and simulate on both models,
+    r2, icc and pairwise on the Gaussian one, each fitted once."""
+    for label, gaussian in [("lmer_sim_factorial", True), ("glmer_sim_factorial_bern", False)]:
+        kinds = ["predict", "simulate"] + (["r2", "icc", "holm", "tukey"] if gaussian else [])
+
+        def name(kind, label=label):
+            return f"pairwise:{label}:g:{kind}" if kind in ("holm", "tukey") else f"{kind}:{label}"
+
+        data, m = term_model(label)
+        try:
+            f = fit(data, m, None)
+        except ValueError as e:
+            for kind in kinds:
+                refused(name(kind), e)
+            continue
+        for kind in kinds:
+            try:
+                post_fit(name(kind), kind, f)
+            except ValueError as e:
+                refused(name(kind), e)
+
+
 if __name__ == "__main__":
     pairs()
     term_calls()
     missing_value_call()
     rlrt_calls()
+    post_fit_calls()

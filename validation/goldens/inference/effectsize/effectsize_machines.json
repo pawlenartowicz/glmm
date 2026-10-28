@@ -1,0 +1,45 @@
+{
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0",
+      "performance": "0.18.2",
+      "effectsize": "1.0.3",
+      "insight": "1.5.4"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_effectsize.R"
+  },
+  "r2": {
+    "marginal": 0.467714469868753,
+    "conditional": 0.986942253884684
+  },
+  "icc": {
+    "adjusted": 0.97546853074872,
+    "unadjusted": 0.519227784015931
+  },
+  "eta2": [
+    {
+      "term": "Machine",
+      "F": 40.9988868356456,
+      "df1": 2,
+      "df2": 4.99853812773823,
+      "eta2_partial": 0.94254310298481
+    }
+  ],
+  "name": "effectsize_machines"
+}

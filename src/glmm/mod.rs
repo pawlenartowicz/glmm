@@ -405,6 +405,7 @@ pub(crate) use assembled::joint_hessian_columns;
 pub(crate) use derivative::{
     laplace_gradient, laplace_hessian, supports_shape as supports_exact_shape, MAX_DUAL_N,
 };
+pub(crate) use se::condvar_blocks;
 pub use se::joint_hessian_cov;
 // The FD stencils and the packed-row step constant: `se.rs` is their only
 // production reader, the FD-margin measurement their only cross-module one.
@@ -540,12 +541,13 @@ pub(crate) fn glmm_curvature_hint(ws: &GlmmWorkspace) -> Option<crate::optim::Cu
     if !ws.grad_hint_ready {
         return None;
     }
-    let m = grad_search_dim(ws.family, ws.n_theta, ws.p, ws.gamma_phi_held.is_some());
+    // The search ran on the free θ, so its estimate's β̃ block starts there.
+    let (nt, p) = (ws.groupings.n_free_theta(), ws.p);
+    let m = grad_search_dim(ws.family, nt, p, ws.gamma_phi_held.is_some());
     let h = ws.bfgs.inv_hessian();
     if !ws.grad_beta_info {
         return crate::optim::CurvatureHint::from_inverse(m, h, ws.search_units);
     }
-    let (nt, p) = (ws.n_theta, ws.p);
     let t = &ws.grad_beta_map[..p * p];
     // M·H with M = diag(I, T, I): the β̃ rows mix.
     let mut a = h.to_vec();
@@ -565,7 +567,8 @@ pub(crate) fn glmm_curvature_hint(ws: &GlmmWorkspace) -> Option<crate::optim::Cu
 }
 
 /// The gradient search's dimension: `[θ | β̃]`, and `[θ | β̃ | ln φ]` on a
-/// Gamma fit whose dispersion is not held. The curvature hint the search
+/// Gamma fit whose dispersion is not held, with `n_theta` the free θ (the
+/// search holds the structural ones at zero). The curvature hint the search
 /// leaves (`glmm_curvature_hint`) and the one `fit::core::fit_on_hinted`
 /// accepts are this size.
 pub(crate) fn grad_search_dim(
@@ -982,11 +985,14 @@ impl GradSearch<'_, '_> {
 /// columns even for a design fitted as given (`standardize` false), so `map`
 /// is the identity only when no random-effect block has a slope. A direct
 /// caller that passes an unscaled slope column searches θ in that column's
-/// units.
+/// units. `z` is the `n × s` random-effect-only columns a slope index `≥ p`
+/// reads (`ColumnScaling::compute_re_only` scales them), `n × 0` when every
+/// slope is a column of `x`.
 #[allow(clippy::too_many_arguments)]
 pub fn fit_glmm(
     ws: &mut GlmmWorkspace,
     x: MatRef<f64>,
+    z: MatRef<f64>,
     y: &[f64],
     cluster_ids: &[u32],
     extra_ids: &[Vec<u32>],
@@ -1000,7 +1006,7 @@ pub fn fit_glmm(
     // Backstop for a hand-built workspace: the blocked and structured layouts
     // build intercept-only extras (`build_packed_m` carries the per-eval
     // debug_assert). `classify_design` routes any extra-slope shape to Sparse,
-    // so this is unreachable through `fit_on`/`fit_warm` — it catches a caller
+    // so this is unreachable through `fit_on`/`fit` — it catches a caller
     // that constructs `GlmmWorkspace` directly. Mirrors the same debug_assert in
     // `build_packed_m` (`glmm/workspace.rs`) and `assemble_ranef_dense`
     // (`fit/common.rs`) — change together.
@@ -1009,6 +1015,10 @@ pub fn fit_glmm(
         "GLMM entry: extra_slopes_any on a blocked or structured layout"
     );
     let (k, p, n_theta) = (ws.k, ws.p, ws.n_theta);
+    // θ entries a grouping's terms hold at zero: every search below runs on
+    // the others (`optim::bobyqa_minimize`), its solver sized by `n_free`.
+    let structural = ws.groupings.structural_theta().to_vec();
+    let n_free = ws.groupings.n_free_theta();
 
     // γ₀ = [θ₀ | β₀]. `guard_warm` is set only on a warm start (the `Some` arm
     // below) — the start guard further down then decides whether the search
@@ -1033,6 +1043,9 @@ pub fn fit_glmm(
             for &i in ws.groupings.diagonal_theta() {
                 ws.params[i] = ws.params[i].max(THETA_TRUTH_FLOOR);
             }
+            // A start's structural entries are ignored: the search never
+            // moves them.
+            ws.groupings.zero_structural(&mut ws.params[..n_theta]);
             // The start guard further down compares a warm caller's θ₀ with
             // the blind cold θ this data would start from otherwise, and the
             // search begins from whichever the outer objective is lower at.
@@ -1126,7 +1139,7 @@ pub fn fit_glmm(
     // across fits. Carrying it would make a fit's result depend on which fits ran
     // before it in the workspace, breaking both the guarantee that a given (spec,
     // data, seed) fits the same way regardless of call order and the reset-state
-    // assumption `fit_cold` makes about a fresh `GlmmWorkspace`.
+    // assumption the fit entry makes about a fresh `GlmmWorkspace`.
     for v in ws.u_seed[..k].iter_mut() {
         *v = 0.0;
     }
@@ -1298,7 +1311,7 @@ pub fn fit_glmm(
     // `pirls_solve_blocked`'s and `fill_m_vals` do), so every BOBYQA eval's
     // per-solve M fill runs MatRef-free. `se.rs`'s `joint_hessian_cov` mirrors
     // this same hoist for its own FD deviance evals.
-    fill_z_f64(groupings, x, z_buf, n);
+    fill_z_f64(groupings, x, z, z_buf, n);
     // Read-only design view every `laplace_deviance` call below shares — see
     // [`FitData`]. Borrows `groupings`/`z_buf`/`prior_w` only for the lifetime
     // of this destructure's borrow of the workspace; the pinned γ̂ re-evaluation
@@ -1572,6 +1585,7 @@ pub fn fit_glmm(
     let mut grad_spent = 0usize;
     let mut grad_fell_back = false;
     let total_dim = n_theta + p + n_disp;
+    let total_free = n_free + p + n_disp;
     if grad_route {
         use crate::optim::bfgs::{bfgs_minimize, BfgsStop};
         debug_assert!(
@@ -1584,6 +1598,7 @@ pub fn fit_glmm(
         // a hint is given. A held one leaves the search on `[θ | β̃]`.
         let free_phi = is_gamma && held_phi.is_none();
         let m = grad_search_dim(family, n_theta, p, held_phi.is_some());
+        let m_search = grad_search_dim(family, n_free, p, held_phi.is_some());
         debug_assert!((n_disp == 0 || is_gamma) && params.len() == total_dim);
         if guard_beta_kept {
             // A warm fit: the guard profiled β at the θ it picked.
@@ -1738,8 +1753,9 @@ pub fn fit_glmm(
             bfgs,
             grad_hint
                 .as_ref()
-                .filter(|h| h.dim() == m)
+                .filter(|h| h.dim() == m_search)
                 .map(|h| h.inv_hessian()),
+            &structural,
         );
         *grad_hint_ready = bo.n_grad >= 2;
         let mut n_val = bo.n_val;
@@ -1787,7 +1803,7 @@ pub fn fit_glmm(
                 solver_polish_wide.get_or_insert_with(|| {
                     let mut c = *config;
                     c.rho_begin = RHO_BEGIN_WARM;
-                    bobyqa::Bobyqa::new(total_dim, c)
+                    bobyqa::Bobyqa::new(total_free, c)
                         .expect("polish BOBYQA config is valid by construction")
                 })
             } else {
@@ -1810,6 +1826,7 @@ pub fn fit_glmm(
                 &mut params[..total_dim],
                 &lower[..total_dim],
                 &upper[..total_dim],
+                &structural,
             );
             let ok = matches!(out.status, Status::Converged | Status::MaxFunReached)
                 && pol_best.is_finite()
@@ -1885,7 +1902,7 @@ pub fn fit_glmm(
         solver_stage1_warm.get_or_insert_with(|| {
             let mut c = *config_stage1;
             c.rho_begin = RHO_BEGIN_WARM;
-            bobyqa::Bobyqa::new(params_stage1.len(), c)
+            bobyqa::Bobyqa::new(n_free + n_disp, c)
                 .expect("warm BOBYQA config is valid by construction")
         })
     } else {
@@ -2252,6 +2269,7 @@ pub fn fit_glmm(
                         params_stage1,
                         &lo_z,
                         &up_z,
+                        &structural,
                     );
                     params_stage1[j] *= s;
                     // A probe that stayed the incumbent (never beaten by the
@@ -2282,6 +2300,7 @@ pub fn fit_glmm(
                         params_stage1,
                         lower_stage1,
                         upper_stage1,
+                        &structural,
                     )
                 };
                 // Saddle check on the `ExactProfile` endpoint. Σ = ΛΛᵀ is a sum of
@@ -2353,7 +2372,7 @@ pub fn fit_glmm(
                         let polish = solver_stage1_polish.get_or_insert_with(|| {
                             let mut c = *config_stage1;
                             c.rho_begin = GLMM_RHO_POLISH;
-                            bobyqa::Bobyqa::new(params_stage1.len(), c)
+                            bobyqa::Bobyqa::new(n_free + n_disp, c)
                                 .expect("polish BOBYQA config is valid by construction")
                         });
                         let out2 = crate::optim::bobyqa_minimize(
@@ -2375,6 +2394,7 @@ pub fn fit_glmm(
                             params_stage1,
                             lower_stage1,
                             upper_stage1,
+                            &structural,
                         );
                         out1.n_eval += out2.n_eval;
                         out1.status = out2.status;
@@ -2558,7 +2578,7 @@ pub fn fit_glmm(
                             solver_polish_wide.get_or_insert_with(|| {
                                 let mut c = *config;
                                 c.rho_begin = RHO_BEGIN_WARM;
-                                bobyqa::Bobyqa::new(total_dim, c)
+                                bobyqa::Bobyqa::new(total_free, c)
                                     .expect("polish BOBYQA config is valid by construction")
                             })
                         } else {
@@ -2623,6 +2643,7 @@ pub fn fit_glmm(
                             params,
                             lower,
                             upper,
+                            &structural,
                         );
                         // Dispersion bound check. A likelihood can keep rising toward one
                         // bound of the dispersion coordinate: Gamma's lower bound of `ln φ`
@@ -2925,6 +2946,8 @@ pub fn fit_glmm(
             primary_slope_major,
         );
         crate::lmm::fix_column_signs(&ws.groupings, &mut ws.params[..n_theta]);
+        // A negated column carries its structural zeros as −0.
+        ws.groupings.zero_structural(&mut ws.params[..n_theta]);
         // The search's θ, kept so the incumbent check after the pinned
         // re-eval can undo the pin. `start_point` is free once the search
         // loop has ended.
@@ -2968,6 +2991,8 @@ pub fn fit_glmm(
             &mut ws.params[..n_theta]
         };
         if crate::lmm::canonicalize_pinned_blocks(&ws.groupings, theta_c) {
+            // The refactor's zeros between independent terms can be −0.
+            ws.groupings.zero_structural(theta_c);
             pinned = false;
             pinned_components = 0;
             for (kk, &ti) in diag.iter().enumerate() {
@@ -3143,7 +3168,11 @@ pub fn fit_glmm(
                     let mut gain = 0.0f64;
                     start_point[..tp].copy_from_slice(&params[..tp]);
                     for j in 0..n_theta {
-                        if diag.contains(&j) && params[j] == 0.0 {
+                        // A structural coordinate is not a free θ: moving it
+                        // leaves the model.
+                        if (diag.contains(&j) && params[j] == 0.0)
+                            || structural.binary_search(&j).is_ok()
+                        {
                             continue;
                         }
                         let mut f = [f64::NAN; 2];
@@ -3303,6 +3332,7 @@ pub fn fit_glmm(
                 params,
                 lower,
                 upper,
+                &structural,
             );
             n_eval += out.n_eval;
             if best < final_deviance {
@@ -3405,7 +3435,7 @@ pub fn fit_glmm(
             // the fitted objective's own information, φ̂ its ML value. lme4's
             // `pwrss/n` belongs to lme4's φ-free objective and does not apply.
             // Var(β̂)_jj from chol(Schur) forward-solve (mirrors fit_lmm's recovery).
-            let (sc, qr) = match rx_schur_llt(ws, x, cluster_ids, n) {
+            let (sc, qr) = match rx_schur_llt(ws, x, z, cluster_ids, n) {
                 Some(f) => f,
                 None => {
                     se_unavailable = true;
@@ -3483,7 +3513,7 @@ pub fn fit_glmm(
             // pins the Rx warm path). The kernel re-evals PIRLS itself and its
             // RX fallback runs schur_fill internally, so skip the schur_fill above.
             let mut cov = Mat::<f64>::zeros(p, p);
-            let status = joint_hessian_cov(ws, x, y, cluster_ids, extra_ids, p, n, &mut cov);
+            let status = joint_hessian_cov(ws, x, z, y, cluster_ids, extra_ids, p, n, &mut cov);
             // Double-failure sentinel: the kernel NaN-fills `cov` when BOTH the joint
             // Hessian and the RX fallback fail.
             if !cov[(0, 0)].is_finite() {

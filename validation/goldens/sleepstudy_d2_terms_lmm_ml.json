@@ -1,0 +1,33 @@
+{
+  "name": "sleepstudy_d2_terms_lmm_ml",
+  "engine": "lme4::lmer",
+  "engine_version": "2.0.6",
+  "kind": "lmm",
+  "data": "sleepstudy_d2",
+  "family": "gaussian",
+  "link": {},
+  "nagq": 1,
+  "tolPwrss": {},
+  "r_formula": "Reaction ~ 1 + Days + D2 + (1 + Days | Subject) + (0 + D2 | Subject)",
+  "converged": true,
+  "singular": false,
+  "coef_names": ["(Intercept)", "Days", "D2"],
+  "estimates": {
+    "beta": [248.624670647099, 10.4672859595962, 0.337022327441084],
+    "se": [7.28798337131593, 1.50225574810427, 0.37690184843435],
+    "loglik": -870.564216676588,
+    "varcomp": [
+      {
+        "group": "Subject",
+        "terms": ["(Intercept)", "Days", "D2"],
+        "stddev": [26.5498274671275, 5.84840067496017, 1.24665958993578],
+        "corr": [
+          [1, 0.0337630200673259, 0],
+          [0.0337630200673259, 1, 0],
+          [0, 0, 1]
+        ]
+      }
+    ],
+    "sigma": 23.0107410039458
+  }
+}

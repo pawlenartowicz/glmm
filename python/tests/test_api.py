@@ -1,6 +1,7 @@
 import dataclasses
 import inspect
 import math
+import pickle
 import re
 import warnings
 
@@ -11,8 +12,9 @@ import glmm
 
 
 def test_module_surface():
-    # `fit`, `Fit`, `model_matrix`, `term_labels`, the tests of `glmm.anova`
-    # (`anova`, `compare` and their three result classes), and the twenty-six
+    # `fit`, `Fit`, `icc`, `model_matrix`, `term_labels`, the tests of
+    # `glmm.anova` (`anova`, `compare` and their three result classes),
+    # `pairwise` and its `PairwiseTable`, and the twenty-seven
     # warning categories the diagnostics channel raises; a user has to be able
     # to name them to filter on them.
     assert glmm.__all__ == [
@@ -32,8 +34,10 @@ def test_module_surface():
         "HessianSeFallbackWarning",
         "IllConditionedWarning",
         "NbShapeUnsettledWarning",
+        "NewGroupingLevelsWarning",
         "NoCoefficientsWarning",
         "NonIntegerResponseWarning",
+        "PairwiseTable",
         "PirlsExhaustedWarning",
         "PrecisionLimitedWarning",
         "RowsDroppedWarning",
@@ -44,12 +48,12 @@ def test_module_surface():
         "SingularFitWarning",
         "TermTable",
         "TooFewRowsWarning",
-        "UnusedGroupingLevelsWarning",
         "VarianceAtLimitWarning",
         "anova",
         "compare",
         "fit",
         "model_matrix",
+        "pairwise",
         "term_labels",
     ]
     assert issubclass(glmm.IllConditionedWarning, glmm.DiagnosticWarning)
@@ -79,6 +83,7 @@ def test_fit_signature_matches_spec():
         "nagq",
         "warm_start",
         "satterthwaite",
+        "condvar",
         "reml",
         "anova_test",
     ]
@@ -95,6 +100,7 @@ def test_fit_signature_matches_spec():
         "nagq",
         "warm_start",
         "satterthwaite",
+        "condvar",
         "reml",
         "anova_test",
     ]:
@@ -103,6 +109,7 @@ def test_fit_signature_matches_spec():
     assert p["wald_se"].default == "hessian"
     assert p["nagq"].default == 1
     assert p["satterthwaite"].default is True
+    assert p["condvar"].default is True
     assert p["reml"].default is None
     assert p["anova_test"].default == "auto"
 
@@ -221,3 +228,83 @@ def test_aic_and_bic_are_returned_on_every_fit(args, kwargs):
         assert list(criterion) == ["REML criterion at convergence"]
     else:
         assert (criterion["AIC"], criterion["BIC"]) == (aic, bic)
+
+
+# R-squared and the ICC: a sleepstudy-shaped LMM, 18 subjects over 10 days
+# with a random intercept and slope.
+_rs = np.random.default_rng(20261026)
+_subject = np.repeat(np.arange(18), 10)
+_days = np.tile(np.arange(10.0), 18)
+SLEEP = {
+    "Reaction": (
+        250
+        + 10 * _days
+        + _rs.normal(0, 25, 18)[_subject]
+        + _rs.normal(0, 6, 18)[_subject] * _days
+        + _rs.normal(0, 25, _days.size)
+    ).tolist(),
+    "Days": _days.tolist(),
+    "Subject": [f"s{i:02d}" for i in _subject],
+}
+
+
+def _sleep_fit(formula):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return glmm.fit(SLEEP, formula)
+
+
+def _r2_line(m):
+    r2, icc = m.r2(), m.icc()
+    return (
+        f"Marginal R2: {r2['marginal']:.3f}, conditional R2: {r2['conditional']:.3f}, "
+        f"adjusted ICC: {icc['adjusted']:.3f}"
+    )
+
+
+def test_summary_of_a_mixed_model_prints_r2_and_the_adjusted_icc():
+    m = _sleep_fit("Reaction ~ Days + (Days | Subject)")
+    r2, icc = m.r2(), m.icc()
+    assert list(r2) == ["marginal", "conditional"]
+    assert list(icc) == ["adjusted", "unadjusted"]
+    assert 0 < r2["marginal"] < r2["conditional"] < 1
+    lines = m.summary_object().text().splitlines()
+    i = lines.index(_r2_line(m))
+    assert lines[i - 1].startswith("Number of obs: 180, groups:")
+    s = m.summary_object()
+    for render in (s.html(), s.latex(), s.typst()):
+        assert _r2_line(m) in render
+
+
+def test_a_fit_without_random_effects_has_no_r2_line_and_nan_values():
+    m = _sleep_fit("Reaction ~ Days")
+    assert all(math.isnan(v) for v in (*m.r2().values(), *m.icc().values()))
+    assert "Marginal R2" not in m.summary_object().text()
+
+
+_REFIT_LINE = "R2 and ICC need a refit of the null model: call fit.r2() and fit.icc()"
+
+
+def test_summary_of_a_poisson_glmm_points_to_r2_and_icc_instead_of_refitting():
+    m = glmm.fit(REML_DATA, "yc ~ x + (1 | g)", "poisson")
+    s = m.summary_object()
+    lines = s.text().splitlines()
+    i = lines.index(_REFIT_LINE)
+    assert lines[i - 1].startswith("Number of obs: 96, groups:")
+    assert "Marginal R2" not in s.text()
+    for render in (s.html(), s.latex(), s.typst()):
+        assert _REFIT_LINE in render
+    r2 = m.r2()
+    assert 0 < r2["marginal"] < r2["conditional"] < 1
+    assert all(math.isfinite(v) for v in m.icc().values())
+
+
+def test_a_fit_stored_by_0_6_x_prints_its_summary_and_refuses_r2_and_icc():
+    m = _sleep_fit("Reaction ~ Days + (Days | Subject)")
+    o = object.__new__(glmm.Fit)
+    o.__dict__.update({k: v for k, v in m.__dict__.items() if k != "_kernel_parts"})
+    old = pickle.loads(pickle.dumps(o))
+    assert old.summary_object().text() == m.summary_object().text().replace(_r2_line(m) + "\n", "")
+    for method in (old.r2, old.icc):
+        with pytest.raises(ValueError, match=r"pairwise, r2 and icc read\. Refit"):
+            method()
