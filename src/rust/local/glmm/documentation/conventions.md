@@ -1,0 +1,266 @@
+# Conventions
+
+The reporting conventions every `glmm` fit follows, regardless of which surface
+(Rust, Python, R) called it: how estimation works, where standard errors come
+from, how dispersion and variance components are scaled, how factors are
+coded, and what the two boundary/convergence flags on the result mean.
+
+## Estimation
+
+Gaussian mixed models (LMM) are fit by **profiled REML** by default, and by
+**profiled ML** on request (`FitOptions::reml = Some(false)`, Python
+`reml=False`, R `REML = FALSE`), as lme4's `REML` argument does. The fixed
+effects β and the residual scale σ² are profiled out analytically; the
+optimizer searches only the relative covariance parameter θ, with the same
+kernels and routes on both criteria. `Fit::reml` (Python `fit.reml`, R
+`fit$reml`) says which criterion the log-likelihood is. On a REML fit it is
+the REML criterion, which compares only fits with the same fixed effects; to
+compare fixed effects, fit by ML. The summary of an ML fit of a Gaussian mixed
+model carries the printed note "p-values can be somewhat anticonservative." See
+[`algorithms-lmm.md`](algorithms-lmm.md) for the two objectives and the search
+that minimizes them: BOBYQA, or BFGS on the per-group route (random slopes on
+the only grouping factor).
+
+A Gaussian model without random effects (OLS) has the same estimates on both
+criteria. Its log-likelihood is the ML one by default and the REML one, as R's
+`logLik(lm, REML = TRUE)`, under `reml = Some(true)`. Every other family is
+fitted by maximum likelihood; `reml = Some(true)` there is ignored (the Python
+and R surfaces warn).
+
+Non-Gaussian mixed models (GLMM) are fit by **PIRLS + Laplace** by default
+(`nAGQ = 1`): `glmer`'s objective on the canonical links (logit, Poisson log),
+glmmTMB's on probit, cloglog, negative binomial and Gamma. Adaptive
+Gauss–Hermite quadrature is opt-in via `nagq`/`nAGQ` (an odd integer up to
+25), and is honored on binomial, Poisson, negative-binomial and Gamma GLMMs
+with a single grouping factor and up to 3 random effects per group; on any
+other mixed shape the Python and R surfaces warn and fall back to Laplace. See
+[`algorithms-glmm.md`](algorithms-glmm.md) for the PIRLS inner loop and the
+AGQ gate.
+
+Negative binomial fits carry an extra **outer loop for the shape parameter**
+θ (not to be confused with the covariance θ above): the GLM path alternates a
+fixed-θ inner fit with a profile-θ update, and the GLMM path maximizes the same
+marginal log-likelihood over `ln θ` as one more coordinate of its outer search,
+on the dense and the sparse route alike. Either way, θ̂ is reported as the fit's
+`dispersion`.
+
+## Offset
+
+Every family and every solver path accepts a per-row known additive term on
+the linear-predictor scale — R's `offset=`: `η = offset + Xβ (+ Zb)`, with no
+coefficient estimated for it and no column added to the design. The
+canonical use is a rate model against a known exposure, `offset =
+log(exposure)`. `None`/`NULL` (the default) means no offset — byte-identical
+to the pre-offset fit paths. The formula syntax `offset(expr)` is also
+accepted as a term; passing both a formula `offset()` term and the
+`offset=`/`offset` argument is an error asking you to use one (see
+[`formula.md`](formula.md)).
+
+## Standard errors
+
+All reported standard errors are **Wald** — the square root of a diagonal of
+an estimated covariance matrix, not a profile or bootstrap interval.
+
+For OLS, GLM, and LMM, the covariance comes from the same Cholesky factor the
+fit's normal equations already produce: `Var(β̂_j) = σ̂²·‖L_XX⁻¹e_j‖²`, one
+method throughout. A GLM's covariance uses the IRLS weights of the last pass
+that solved for β, as R's `glm` does. Those weights belong to the β one step
+before the final one. On well-conditioned test designs this moved the logit
+standard errors by 1e-7 to 3e-7 relative, and the probit and Poisson ones by
+about 1e-10.
+
+For GLMM, two genuinely different Wald covariances are offered, selected by
+`wald_se`/`WaldSe`:
+
+- **Hessian** (the default, matching `glmer`'s `vcov(use.hessian = TRUE)`):
+  the β-block of `2·H_dev⁻¹`, where `H_dev` is the exact Hessian of the joint
+  `(θ, β)` Laplace deviance at the converged point. It is computed by
+  automatic differentiation of the analytic gradient, with no
+  finite-difference step. A fit the exact pass declines (for example a model
+  over its memory guard) gets a finite-difference Hessian instead; the full
+  list is in `algorithms-glmm.md`, "Standard errors". If the joint Hessian is
+  not positive definite, the fit falls back to the Rx covariance below. The
+  finite-difference Hessian also falls back when a perturbed deviance is
+  non-finite.
+- **Rx** (conditional on θ̂): the Schur complement of the β block (expected
+  information on canonical links, observed curvature on the others),
+  inverted directly from the factors PIRLS already left behind. This is
+  cheaper but assumes β–θ orthogonality — exact for the Gaussian LMM, but
+  anticonservative for a GLMM, where the IRLS weights couple β and θ.
+
+Coefficient tables (the R and Python ports; see `tutorial-r.md` §3) report
+the test lmerTest, `lm` and `glm` report for the same model:
+
+- **Gaussian mixed model:** t on lmerTest's Satterthwaite degrees of freedom,
+  one df per coefficient (`Fit::coef_df`, the `df` column), with a two-sided
+  `Pr(>|t|)`. The df come from one derivative pass after the fit; see
+  [`algorithms-lmm.md`](algorithms-lmm.md#satterthwaite-degrees-of-freedom).
+  Switched off (`satterthwaite = FALSE` / `satterthwaite=False`), or when the
+  pass fails, the table falls back to Wald z.
+- **OLS, and Gamma or inverse-Gaussian GLMs with φ estimated:** t on the
+  residual df `n − p` (`p` the retained columns), as `summary.lm` and
+  `summary.glm` do.
+- **Everything else** (binomial, Poisson, negative binomial, a held
+  dispersion, every GLMM): a Wald z-statistic and a two-sided `Pr(>|z|)`.
+
+Tests of whole terms and of two nested models (`anova`, `compare`) are on
+[`hypothesis-tests.md`](hypothesis-tests.md).
+
+Confidence intervals (`confint`) follow the table row by row: the t quantile
+on the row's df where it tests with t, the normal quantile where it tests
+with z. Both ports compute them with one Rust function, so they give the same
+intervals.
+
+SEs are computed only for the columns the caller asks for: in Rust,
+`FitOptions::se_for` selects which predictor columns get an SE (every
+other slot is NaN). Its default, `SeFor::All`, is every column, and the
+Python and R surfaces always ask for all of them.
+
+## Dispersion
+
+Which families carry an estimated dispersion parameter, and on what scale it
+is reported, is a family-level convention documented in full in
+[`supported_families.md`](supported_families.md). In short: Gamma estimates
+a dispersion φ by maximum likelihood on a mixed fit, unless the caller pins
+it; on a fixed-only fit `Fit::dispersion` is the Pearson moment instead
+(`summary(glm)`'s convention) — the ML value is still computed, to place
+`Fit::loglik` at its maximum, but it is not what `Fit::dispersion` reports
+there. Inverse-Gaussian (fixed-only only) also reports the Pearson moment.
+Negative binomial estimates a shape θ threaded through its own outer loop,
+and dispersion is fixed at `φ ≡ 1` for Binomial, Poisson, and NB (NB's
+overdispersion lives in θ, not φ).
+
+## Prior weights
+
+What `Data::weights` means depends on the family:
+
+- **Gaussian, Gamma, inverse-Gaussian** — every family that carries an
+  estimated dispersion φ — treat `weights` as **precision weights**: row `i`
+  has variance `φ·V(μᵢ)/wᵢ`. This is the convention of `lm`, `summary(glm)`,
+  and lme4. Doubling row `i`'s weight halves its variance.
+- **Binomial** weights are trial counts (`y` is the success proportion,
+  `weights` the number of trials — lme4's `cbind(s, m−s)` model).
+- **Poisson** has no dispersion parameter, so the two conventions below give
+  the same fit — the difference between them is a constant that does not
+  move β, SE, or the point where the likelihood is maximised.
+- **Negative binomial** weights multiply the log-likelihood (`MASS::glm.nb`'s
+  convention): its variance `μ + μ²/θ` has no φ to divide, so precision
+  weights are not defined for it.
+
+On the three families with a dispersion, rescaling every weight by the same
+constant `c` changes nothing about the fit: β, SE, and every reported
+quantity except the dispersion itself stay the same, and the dispersion
+scales by `c`. This differs from glmmTMB's default, which treats `weights`
+as case weights on Gaussian and Gamma — multiplying each row's log-density
+by `wᵢ` — so a glmmTMB fit with `weights = w` does change when every `wᵢ` is
+multiplied by a constant.
+
+Two recipes, depending on what the weight means in your data:
+
+- **True replicate counts** (row `i` really is `wᵢ` identical observations
+  averaged together): repeat the row `wᵢ` times instead of weighting it.
+  Replicated rows and a precision-weighted row are different data, and this
+  recipe is the one that matches `wᵢ` identical observations.
+- **Reproducing glmm's fit in glmmTMB**: fit glmmTMB with no `weights=` and a
+  `dispformula` offset instead — `~ offset(log(w))` for Gamma (glmmTMB's
+  Gamma dispersion predictor is on the log-shape scale) and
+  `~ offset(-0.5 * log(w))` for Gaussian (log σ scale).
+
+## Variance components scale
+
+Random-effect (co)variances are reported on lme4's **SD/correlation** scale —
+standard deviations per random-effect dimension, plus a correlation matrix
+between dimensions within the same grouping — not as raw variances. In R this
+is what `VarCorr(fit)` prints, one block per grouping factor, with a
+`Residual` row (`sigma()`) for a Gaussian mixed fit; the underlying attributes
+(`attr(vc$group, "stddev")`, `attr(vc$group, "correlation")`) are available to
+pull the numbers back out (see `tutorial-r.md` §3).
+
+## Factor coding
+
+Factors are coded with treatment contrasts, base level = the column's first
+level. See [`formula.md#factor-coding`](formula.md#factor-coding) for how the
+base level is determined for string, factor, and categorical columns across
+the three language surfaces.
+
+## Flags on the result
+
+`converged` reports whether the optimizer reached its convergence criterion.
+What `false` means for the rest of the result splits in two, for an LMM or
+GLMM: see the `Fit` doc comment (`src/fit/mod.rs`) for the exact per-field
+detail.
+
+- A search that stopped at its evaluation budget (`MaxFunReached`) still
+  reports coefficients, `se`, `vcov`, `dispersion`, `tau2` and `varcorr` at
+  the best point found (the plateau policy). `stddev_se`, `fitted` and the
+  random-effect modes stay empty regardless. `df` is 0 for a GLMM at that
+  endpoint (the AIC/BIC identity does not apply there); an LMM at the same
+  endpoint reports its usual nonzero `df`.
+- Every other non-converged path (a degenerate configuration, a failed step,
+  a non-finite deviance) NaN-fills or empties every relevant field: there is
+  no endpoint worth reporting.
+
+`warnings.md` documents which severe warning (`search_limit` vs. `fit_failed`
+and the other failure kinds) a caller sees for each case; exactly one is
+raised on every non-converged fit.
+
+`singular` (R's `isSingular(fit)`) reports a boundary fit — the same
+condition lme4 flags: at least one diagonal random-effect variance component
+collapsed to (or landed negligibly close to) zero. It is computed by the
+kernel, not left to the caller to infer from the variance components
+themselves.
+
+**`diagnostics` is the channel these live on.** `converged`, `singular`
+and `aliased` are the three most-read fields and stay at the top level of the
+result (properties over `diagnostics` in Python; unchanged top-level fields in
+R), but they are three of nine: the full report is `diagnostics.converged`,
+`.singular`, `.aliased`, `.boundary`, `.pinned`, `.notes`, `.n_grad`,
+`.outer_stop`, `.outer_decrement`. In Python and R the last three sit on the
+fit itself, not in `diagnostics`.
+
+- `boundary` says where the accepted θ sits: `Interior`, `AtBoundary` (≥ 1
+  variance component pinned at 0), `NoOptimum` (the optimizer capped out at
+  a finite endpoint, reported as a point rather than accepted onto the
+  boundary), or `UpperLimit` (a θ entry ended on the upper limit of the search
+  box, 1000 on the internal scale, on a fit that would otherwise be
+  `Interior`; the `VarianceAtLimit` note comes with it). Every θ-carrying
+  route distinguishes all four: LMM over either kernel, GLMM over every
+  layout, negative binomial included. OLS and GLM
+  (no θ) always report `Interior`, and so does a fit that failed before any
+  search ran (a degenerate guard), which says so through `converged: false`.
+- `pinned` names which variance components were pinned, aligned with the
+  `varcorr` block layout so `pinned[g][i]` pairs with `stddev_corr(g)`'s `i`-th
+  stddev. Empty means "nothing to report" (no components at all, or none
+  pinned), not "checked and none pinned."
+- `n_grad`, `outer_stop` and `outer_decrement` describe the BFGS θ search:
+  its gradient evaluations, why it stopped, and its estimate of the deviance
+  decrease left. They are 0, `None` (R: `NA`) and NaN on a fit that ran no
+  gradient search.
+- `notes` carries solver observations that have no dedicated flag. There are
+  fifteen kinds; [`warnings.md`](warnings.md) gives the warning each one
+  raises. Four of them in more detail:
+  - `IllConditioned`: two or more fixed-effect columns are entangled —
+    near-collinear but not exactly redundant. That design is **fitted, not
+    refused**: the coefficients are real and the standard errors are honest
+    (large, because the data genuinely cannot separate the columns). Contrast
+    `aliased`, which is the genuinely-redundant case — an exactly aliased
+    column is still dropped and reported as `NaN`, matching R.
+  - `PirlsExhausted`: a GLMM's inner PIRLS solve ran its full iteration cap
+    without converging. Observation-only unless it hit the final
+    re-evaluation at the converged fit's variance parameters: that is the one
+    case the ports raise, as `pirls_exhausted`. See
+    [`warnings.md`](warnings.md) for what it means for the reported
+    estimates.
+  - `HessianSeFallback`: `wald_se`/`WaldSe::Hessian` was requested, but the
+    joint Hessian was not usable: it was not positive definite, or the fit
+    took the finite-difference Hessian and a perturbed deviance evaluation was
+    non-finite. The SE pass fell back to the RX/Schur route. `se`/`vcov` are still filled from the fallback;
+    the random-effect stddev SEs (`stddev_se`) stay `NaN`.
+
+  `notes` is empty on a clean fit, and an absent note means "not detected,"
+  never "checked and clean": a fit that formed no factor (most failed fits)
+  records no pivot.
+
+If a fit comes back with `converged == false` or `singular == true`, see
+[`troubleshooting.md`](troubleshooting.md) for what each flag implies and what
+to try next.

@@ -1,0 +1,2710 @@
+//! Unified fit-core tests: the reuse gate (`fit_on`-on-reused-ws vs `fit_cold`,
+//! near-identity), route pinning (build_workspace classification + fit_on shape
+//! panic), and the `FitView` accessor surface. The frozen goldens only ever fit
+//! throwaway workspaces at `n == sized shape`, so they cannot catch stale state,
+//! `n_max` over-reads, or option-reset misses — this suite is that guard.
+
+use super::{build_workspace, fit_on};
+use crate::fit::{
+    common_tests::{lcg, weighted_collinear_ols_fixture},
+    spec_sized_from_ids,
+};
+use crate::test_support::assert_near;
+use crate::test_support::{fit_cold, fit_warm_wo};
+use crate::SeFor;
+use crate::{
+    BinomialLink, Data, Family, FitOptions, GroupIds, Grouping, GroupingRelation, ModelSpec,
+    ReStructure,
+};
+
+// --- case builders (deterministic, no RNG) ---
+
+fn ols_case() -> (
+    Vec<f64>,
+    Vec<f64>,
+    usize,
+    usize,
+    ModelSpec,
+    GroupIds,
+    FitOptions,
+) {
+    let n = 30;
+    let p = 3;
+    let mut x = Vec::with_capacity(n * p);
+    let mut y = Vec::with_capacity(n);
+    for i in 0..n {
+        let a = i as f64;
+        let b = ((i * 5) % 7) as f64 - 3.0;
+        x.extend_from_slice(&[1.0, a, b]);
+        y.push(0.7 + 1.1 * a - 0.5 * b + ((i % 3) as f64 - 1.0));
+    }
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: None,
+    };
+    let opts = FitOptions {
+        se_for: SeFor::Only(vec![1, 2]),
+        ..FitOptions::default()
+    };
+    (x, y, n, p, model, GroupIds::default(), opts)
+}
+
+/// A fixed-effects Poisson(log) dataset (n=30, p=2, `re: None`) — routes to
+/// `FitKind::Glm`. Deterministic, no RNG (the LCG is seeded, not random).
+fn glm_case() -> (
+    Vec<f64>,
+    Vec<f64>,
+    usize,
+    usize,
+    ModelSpec,
+    GroupIds,
+    FitOptions,
+) {
+    let n = 30;
+    let p = 2;
+    let mut st = 7u64;
+    let mut x = Vec::with_capacity(n * p);
+    let mut y = Vec::with_capacity(n);
+    for _ in 0..n {
+        let x1 = 0.4 * lcg(&mut st);
+        x.extend_from_slice(&[1.0, x1]);
+        let eta: f64 = 0.5 + 0.6 * x1;
+        y.push(eta.exp().round());
+    }
+    let model = ModelSpec {
+        family: Family::Poisson {
+            link: crate::PoissonLink::Log,
+        },
+        re: None,
+    };
+    let opts = FitOptions {
+        se_for: SeFor::Only(vec![0, 1]),
+        ..FitOptions::default()
+    };
+    (x, y, n, p, model, GroupIds::default(), opts)
+}
+
+fn lmm_intercept_case() -> (
+    Vec<f64>,
+    Vec<f64>,
+    usize,
+    usize,
+    ModelSpec,
+    GroupIds,
+    FitOptions,
+) {
+    let n_clusters = 6usize;
+    let per = 8usize;
+    let n = n_clusters * per;
+    let p = 2usize;
+    let mut st = 13u64;
+    let mut x = vec![0.0f64; n * p];
+    let mut y = vec![0.0f64; n];
+    let mut ids_v = vec![0u32; n];
+    for i in 0..n {
+        ids_v[i] = (i % n_clusters) as u32;
+        // deterministic pseudo-noise via a tiny LCG
+        st = st
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let x1 = ((st >> 33) as f64 / (1u64 << 31) as f64) - 1.0;
+        x[i * 2] = 1.0;
+        x[i * 2 + 1] = x1;
+        let re = 0.3 * ((ids_v[i] as f64) - (n_clusters as f64) / 2.0);
+        y[i] = 0.5 + 0.4 * x1 + re + 0.1 * ((i % 5) as f64 - 2.0);
+    }
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            terms: Vec::new(),
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: ids_v,
+        extra: vec![],
+    };
+    let opts = FitOptions {
+        se_for: SeFor::Only(vec![0, 1]),
+        ..FitOptions::default()
+    };
+    (x, y, n, p, model, ids, opts)
+}
+
+fn glmm_binomial_intercept_case() -> (
+    Vec<f64>,
+    Vec<f64>,
+    usize,
+    usize,
+    ModelSpec,
+    GroupIds,
+    FitOptions,
+) {
+    let n_clusters = 8usize;
+    let per = 16usize;
+    let n = n_clusters * per;
+    let p = 2usize;
+    let mut x = vec![0.0f64; n * p];
+    let mut y = vec![0.0f64; n];
+    let mut ids_v = vec![0u32; n];
+    for i in 0..n {
+        let c = i / per;
+        ids_v[i] = c as u32;
+        let x1 = ((i % per) as f64) / (per as f64) - 0.5;
+        x[i * 2] = 1.0;
+        x[i * 2 + 1] = x1;
+        // Deterministic 0/1 with cluster shift + slope signal; not separable.
+        let eta = -0.2 + 0.9 * x1 + 0.4 * (c as f64 - 3.5);
+        y[i] = if (eta + ((i * 7 % 11) as f64 - 5.0) * 0.15) > 0.0 {
+            1.0
+        } else {
+            0.0
+        };
+    }
+    let model = ModelSpec {
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        re: Some(ReStructure {
+            terms: Vec::new(),
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: ids_v,
+        extra: vec![],
+    };
+    let opts = FitOptions {
+        se_for: SeFor::Only(vec![1]),
+        ..FitOptions::default()
+    };
+    (x, y, n, p, model, ids, opts)
+}
+
+/// The crossed-extra shape at binomial family: primary random intercept plus one
+/// crossed intercept-only extra grouping, inside the dense GLMM envelope.
+/// Deterministic 0/1 responses, same construction as
+/// [`glmm_binomial_intercept_case`].
+fn crossed_extra_glmm_case() -> (
+    Vec<f64>,
+    Vec<f64>,
+    usize,
+    usize,
+    ModelSpec,
+    GroupIds,
+    FitOptions,
+) {
+    let g1 = 6usize; // primary intercept groups
+    let g2 = 4usize; // crossed extra groups
+    let n = 96usize;
+    let p = 2usize;
+    let mut x = vec![0.0f64; n * p];
+    let mut y = vec![0.0f64; n];
+    let mut pid = vec![0u32; n];
+    let mut eid = vec![0u32; n];
+    for i in 0..n {
+        let c1 = i % g1;
+        let c2 = (i / g1) % g2;
+        pid[i] = c1 as u32;
+        eid[i] = c2 as u32;
+        let x1 = ((i % 8) as f64) / 8.0 - 0.5;
+        x[i * 2] = 1.0;
+        x[i * 2 + 1] = x1;
+        let eta = -0.1 + 0.8 * x1 + 0.3 * (c1 as f64 - 2.5) + 0.25 * (c2 as f64 - 1.5);
+        y[i] = if (eta + ((i * 7 % 11) as f64 - 5.0) * 0.15) > 0.0 {
+            1.0
+        } else {
+            0.0
+        };
+    }
+    let model = ModelSpec {
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        re: Some(ReStructure {
+            terms: Vec::new(),
+            slopes: vec![],
+            extra_groupings: vec![Grouping {
+                terms: Vec::new(),
+                relation: GroupingRelation::Crossed,
+                slopes: vec![],
+            }],
+        }),
+    };
+    let ids = GroupIds {
+        primary: pid,
+        extra: vec![eid],
+    };
+    let opts = FitOptions {
+        se_for: SeFor::Only(vec![1]),
+        ..FitOptions::default()
+    };
+    (x, y, n, p, model, ids, opts)
+}
+
+/// UNBALANCED nesting, Gaussian: 4 parents, parent 0 owning 3 children and the
+/// rest 2, child ids globalized as `3·parent + child`. `spec_sized_from_ids`
+/// takes `n_per_parent` from the widest parent (3), so the build capacity is
+/// `4·3 = 12` while the draw only reaches child id 10 — 11 used levels. That gap
+/// is the under-filled case the capacity pin must accept.
+fn nested_unbalanced_case() -> (
+    Vec<f64>,
+    Vec<f64>,
+    usize,
+    usize,
+    ModelSpec,
+    GroupIds,
+    FitOptions,
+) {
+    let children_per_parent = [3usize, 2, 2, 2];
+    let rows_per_child = 4usize;
+    let p = 2usize;
+    let mut st = 7u64;
+    let mut x = Vec::new();
+    let mut y = Vec::new();
+    let mut pid = Vec::new();
+    let mut eid = Vec::new();
+    for (parent, &kids) in children_per_parent.iter().enumerate() {
+        let u_p = 0.5 * lcg(&mut st);
+        for child in 0..kids {
+            let u_c = 0.3 * lcg(&mut st);
+            for _ in 0..rows_per_child {
+                let x1 = lcg(&mut st);
+                x.extend_from_slice(&[1.0, x1]);
+                y.push(0.4 + 0.6 * x1 + u_p + u_c + 0.2 * lcg(&mut st));
+                pid.push(parent as u32);
+                eid.push((3 * parent + child) as u32);
+            }
+        }
+    }
+    let n = y.len();
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            terms: Vec::new(),
+            slopes: vec![],
+            extra_groupings: vec![Grouping {
+                terms: Vec::new(),
+                relation: GroupingRelation::NestedWithin,
+                slopes: vec![],
+            }],
+        }),
+    };
+    let ids = GroupIds {
+        primary: pid,
+        extra: vec![eid],
+    };
+    let opts = FitOptions {
+        se_for: SeFor::Only(vec![0, 1]),
+        ..FitOptions::default()
+    };
+    (x, y, n, p, model, ids, opts)
+}
+
+// --- FitView accessor surface ---
+
+#[test]
+fn fitview_accessors_match_fit_for_ols() {
+    let (x, y, n, p, model, ids, opts) = ols_case();
+    let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    let mut ws = build_workspace(&model, &ids, n, p, &opts);
+    let v = fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts);
+    assert!(v.converged());
+    assert_eq!(v.converged(), cold.converged());
+    // OLS t_sq is target-compact: slot k is the k-th SE column's (β/se)².
+    assert_eq!(v.t_sq().len(), opts.se_for.columns(p).len());
+    assert_eq!(v.betas().len(), p);
+    assert_near(v.betas(), &cold.beta, "betas vs fit_cold");
+    for (k, &t) in opts.se_for.columns(p).iter().enumerate() {
+        let t = t as usize;
+        let want = (cold.beta[t] / cold.se[t]).powi(2);
+        assert_near(&[v.t_sq()[k]], &[want], &format!("t_sq[{k}] (target {t})"));
+    }
+}
+
+/// The one diagnostics carrier agrees with what `into_fit` materializes into
+/// `Fit`, on all three shapes that reach it differently: OLS (a detection route
+/// with no θ), the LMM's dense kernel, and the LMM's sparse kernel (both of
+/// which report θ boundary state AND a recorded pivot).
+/// Every case here is well-conditioned, so `ill_conditioned` must be false and
+/// every pivot must sit far above its floor — this is the negative control for
+/// the flag, and it is the case the alloc gate below profiles. The sparse
+/// design's measured pivot ratio is 0.998, twelve decades clear of
+/// `lmm::PIVOT_MIN`.
+#[test]
+fn fitview_diagnostics_agree_with_materialized_fit() {
+    let (x, y, n, p, model, ids, opts) = ols_case();
+    let mut ws = build_workspace(&model, &ids, n, p, &opts);
+    let d = fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts).diagnostics();
+    let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    assert_eq!(d.converged, cold.converged());
+    // OLS has no θ, so both sides of the carrier↔`Fit` agreement are pinned at
+    // their absent-state values rather than agreeing about anything: assert the
+    // values, not the equality. `boundary_hit == 1` is what `singular` reads,
+    // and neither can ever become true on this route (see `ols.rs`'s note at
+    // the `diagnostics` field). The LMM case below is where they carry state.
+    assert_eq!(d.boundary_hit, 0, "OLS has no θ to pin");
+    assert!(!cold.singular(), "OLS reports no variance component");
+    assert!(!d.ill_conditioned);
+    assert!(d.pivot > crate::ols::PIVOT_MIN, "pivot {}", d.pivot);
+
+    let (x, y, n, p, model, ids, opts) = lmm_intercept_case();
+    let mut ws = build_workspace(&model, &ids, n, p, &opts);
+    assert!(ws.is_lmm_dense());
+    let d = fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts).diagnostics();
+    let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    assert_eq!(d.converged, cold.converged());
+    assert!(!d.ill_conditioned);
+    assert!(d.pivot > crate::lmm::PIVOT_MIN, "pivot {}", d.pivot);
+    // `Fit::singular` is the carrier's boundary bit ORed with the
+    // negligible-component check, so the carrier can only be the weaker of the
+    // two — never `true` where the fit says `false`.
+    assert!(d.boundary_hit != 1 || cold.singular());
+
+    let (x, y, n, p, model, ids, opts) = crossed_extra_case(vec![1]);
+    let mut ws = build_workspace(&model, &ids, n, p, &opts);
+    assert!(ws.is_lmm_sparse());
+    let d = fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts).diagnostics();
+    let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    assert_eq!(d.converged, cold.converged());
+    assert_eq!(d.boundary_hit == 1, cold.singular());
+    assert!(!d.ill_conditioned);
+    assert!(d.pivot > crate::lmm::PIVOT_MIN, "pivot {}", d.pivot);
+}
+
+/// The positive control the negative one above cannot give: a dense-LMM draw
+/// that comes back FLAGGED. Column 2 is column 1 scaled by 0.1 and nudged by a
+/// relative `D` of alternating sign — a NEAR-duplicate, not an exact one,
+/// because an exact duplicate drives this route's θ-search to a non-finite
+/// deviance and it returns `boundary_hit == 2` with no factor left to measure.
+/// The near-duplicate converges normally and still records a pivot far under
+/// `lmm::PIVOT_MIN`, which is the state this flag exists to report.
+///
+/// It has to go through `fit_on`, not `fit_cold`: the stable entries run the
+/// pre-dispatch alias gate, which finds this pair redundant in the raw Gram and
+/// drops column 2 before any solver sees it — asserted at the end, because that
+/// contrast IS the loop tier's problem. A warm-loop caller bypasses the gate,
+/// gets `converged: true` with a finite β̂ and an enormous SE, and has nothing
+/// to count unless this flag fires.
+#[test]
+fn fitview_diagnostics_flag_a_rank_deficient_lmm_draw() {
+    // Picked against the recorded pivot rather than guessed: 1e-6 puts it at
+    // 9.7e-13, barely inside the band; 1e-7 puts it at 9.0e-15, with room.
+    const D: f64 = 1e-7;
+    let (n, n_clusters, p) = (48usize, 6usize, 3usize);
+    let mut st = 11u64;
+    let mut x = vec![0.0f64; n * p];
+    let mut y = vec![0.0f64; n];
+    let mut ids_v = vec![0u32; n];
+    for i in 0..n {
+        ids_v[i] = (i % n_clusters) as u32;
+        let x1 = lcg(&mut st);
+        x[i * p] = 1.0;
+        x[i * p + 1] = x1;
+        x[i * p + 2] = 0.1 * x1 * (1.0 + D * if i % 2 == 0 { 1.0 } else { -1.0 });
+        y[i] = 0.5 + 0.4 * x1 + 0.8 * lcg(&mut st);
+    }
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            terms: Vec::new(),
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: ids_v,
+        extra: vec![],
+    };
+    let opts = FitOptions {
+        se_for: SeFor::Only(vec![1, 2]),
+        ..FitOptions::default()
+    };
+
+    let mut ws = build_workspace(&model, &ids, n, p, &opts);
+    assert!(ws.is_lmm());
+    let d = fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts).diagnostics();
+    assert!(d.converged, "the near-duplicate design is still computable");
+    assert!(
+        d.ill_conditioned,
+        "a near-duplicate column must raise the flag, pivot was {}",
+        d.pivot
+    );
+    assert!(d.pivot < crate::lmm::PIVOT_MIN, "pivot {}", d.pivot);
+    assert_eq!(
+        d.pivot_col, 2,
+        "the LATER column of the duplicated pair is the one named"
+    );
+
+    // Through the stable entry the alias gate drops column 2 first, so the same
+    // design never reaches the flag — it reaches `aliased` instead. That split
+    // is exactly why the loop tier needs a read of its own.
+    let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    assert_eq!(cold.aliased(), vec![false, false, true]);
+}
+
+/// The OLS twin of the LMM positive control, and the reason there are two: the
+/// two routes compare against two SEPARATE constants that both happen to read
+/// 1e-12, so a swapped comparison is invisible by value. Firing each arm
+/// against its own design is what keeps both wirings under test if either
+/// constant is ever recalibrated.
+///
+/// The design is full-rank raw and near-singular once weighted — the alias gate
+/// tests the raw `x` and passes it, so unlike the LMM case above this one
+/// reaches the flag through `fit_cold` too. The pivot is measured on the
+/// weighted Gram, which is the whole point of recording it.
+#[test]
+fn fitview_diagnostics_flag_a_weighted_collinear_ols_fit() {
+    let (x, y, w, n, p) = weighted_collinear_ols_fixture();
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: None,
+    };
+    let opts = FitOptions {
+        se_for: SeFor::Only(vec![0, 1, 2]),
+        ..FitOptions::default()
+    };
+    let ids = GroupIds::default();
+
+    let mut ws = build_workspace(&model, &ids, n, p, &opts);
+    assert!(ws.is_ols());
+    let d = fit_on(&mut ws, &Data::new(&x, &y, n, p).weights(&w), None, &opts).diagnostics();
+    assert!(d.converged, "the fit is computable and must be returned");
+    assert!(
+        d.ill_conditioned,
+        "the weighted collinearity must raise the flag, pivot was {}",
+        d.pivot
+    );
+    assert!(d.pivot < crate::ols::PIVOT_MIN, "pivot {}", d.pivot);
+    assert_eq!(d.pivot_col, 2);
+    // Nothing is redundant in the RAW design, so the alias gate drops nothing
+    // and the stable entry lands on the same flagged fit.
+    let cold = fit_warm_wo(&x, &y, n, p, &model, &ids, None, Some(&w), None, &opts);
+    assert!(cold.converged() && cold.aliased() == vec![false; p]);
+}
+
+/// [`glmm_nb_intercept_case`] plus a near-duplicate of its slope column (the
+/// construction of `fitview_diagnostics_flag_a_rank_deficient_lmm_draw`).
+fn ill_conditioned_nb_case() -> (
+    Vec<f64>,
+    Vec<f64>,
+    usize,
+    usize,
+    ModelSpec,
+    GroupIds,
+    FitOptions,
+) {
+    const D: f64 = 1e-7;
+    let (x2, y, n, p2, model, ids, opts) = glmm_nb_intercept_case();
+    let p = p2 + 1;
+    let mut x = vec![0.0f64; n * p];
+    for i in 0..n {
+        x[i * p..i * p + p2].copy_from_slice(&x2[i * p2..(i + 1) * p2]);
+        x[i * p + p2] = 0.1 * x2[i * p2 + 1] * (1.0 + D * if i % 2 == 0 { 1.0 } else { -1.0 });
+    }
+    (x, y, n, p, model, ids, opts)
+}
+
+/// The NB routes assemble their `Fit` inside the kernel, so the loop-tier
+/// carrier is read back off it. An ill-conditioned draw must reach the carrier
+/// with the pivot and column the assembled `Fit`'s `Note::IllConditioned`
+/// carries, on both NB routes. `fit_on` skips the alias gate, so the
+/// near-duplicate column of [`ill_conditioned_nb_case`] reaches the solver.
+#[test]
+fn fitview_diagnostics_flag_an_ill_conditioned_nb_draw() {
+    let (x, y, n, p, mixed, ids, opts) = ill_conditioned_nb_case();
+    let glm = ModelSpec {
+        family: mixed.family,
+        re: None,
+    };
+    for model in [glm, mixed] {
+        let mut ws = build_workspace(&model, &ids, n, p, &opts);
+        assert!(ws.is_prebuilt());
+        let view = fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts);
+        let d = view.diagnostics();
+        let fit = view.into_fit(&Data::new(&x, &y, n, p), &model, &opts);
+        let mixed = model.re.is_some();
+        let (columns, pivot) = fit
+            .diagnostics
+            .notes
+            .iter()
+            .find_map(|note| match note {
+                crate::Note::IllConditioned { columns, pivot } => Some((columns.clone(), *pivot)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("mixed={mixed}: no IllConditioned note on the Fit"));
+        assert!(d.ill_conditioned, "mixed={mixed}: carrier misses the note");
+        assert_eq!(d.pivot.to_bits(), pivot.to_bits(), "mixed={mixed}: pivot");
+        assert_eq!(vec![d.pivot_col], columns, "mixed={mixed}: column");
+    }
+}
+
+/// A QR breakdown at the last IRLS step (`[1, x, e, e]`, `e` the indicator of
+/// the last row: the Givens pass leaves `R_33` exactly zero) reaches the
+/// loop-tier carrier on the GLM route and on the NB route, whose alternation
+/// reads the flag back off its assembled `Fit`. The workspace is
+/// prestandardized, so the design reaches IRLS as built.
+#[test]
+fn fit_on_reports_a_breakdown_on_the_glm_and_nb_routes() {
+    let (n, p) = (50usize, 4usize);
+    let mut x = Vec::with_capacity(n * p);
+    for i in 0..n {
+        let e = f64::from(u8::from(i == n - 1));
+        x.extend_from_slice(&[1.0, i as f64 / n as f64 - 0.5, e, e]);
+    }
+    let y: Vec<f64> = (0..n)
+        .map(|i| {
+            if i == n - 1 {
+                3.0
+            } else {
+                ((7 * i) % 5) as f64
+            }
+        })
+        .collect();
+    let opts = FitOptions::default();
+    for family in [
+        Family::Poisson {
+            link: crate::PoissonLink::Log,
+        },
+        Family::NegativeBinomial {
+            link: crate::NegBinomialLink::Log,
+        },
+    ] {
+        let model = ModelSpec { family, re: None };
+        let mut ws = build_workspace(&model, &GroupIds::default(), n, p, &opts);
+        ws.set_prestandardized(true);
+        let data = Data::new(&x, &y, n, p);
+        let view = fit_on(&mut ws, &data, None, &opts);
+        let d = view.diagnostics();
+        assert!(
+            d.converged && d.se_unavailable && d.ill_conditioned,
+            "{family:?}"
+        );
+        assert_eq!((d.pivot, d.pivot_col), (0.0, 3), "{family:?}");
+        assert!(view.t_sq().iter().all(|t| t.is_nan()), "{family:?}");
+        let fit = view.into_fit(&data, &model, &opts);
+        assert!(fit.beta[3].is_nan(), "{family:?}");
+        assert!(fit.beta[..3].iter().all(|b| b.is_finite()), "{family:?}");
+        assert!(fit.se.iter().all(|s| s.is_nan()), "{family:?}");
+        assert!(fit.vcov.iter().flatten().all(|v| v.is_nan()), "{family:?}");
+        assert!(fit.loglik.is_finite(), "{family:?}");
+        // The df counts the estimated coefficients, as a fit with the
+        // duplicate dropped beforehand does.
+        let x3: Vec<f64> = x.chunks_exact(p).flat_map(|r| r[..3].to_vec()).collect();
+        let dropped = crate::fit(&Data::new(&x3, &y, n, 3), &model, &opts).unwrap();
+        assert_eq!(fit.df, dropped.df, "{family:?}: df");
+        let notes = &fit.diagnostics.notes;
+        assert!(
+            notes
+                .iter()
+                .any(|n| matches!(n, crate::Note::SeUnavailable)),
+            "{family:?}: {notes:?}"
+        );
+        assert!(
+            notes.iter().any(|n| matches!(
+                n,
+                crate::Note::IllConditioned { columns, pivot } if columns == &[3] && *pivot == 0.0
+            )),
+            "{family:?}: {notes:?}"
+        );
+    }
+}
+
+/// The carrier must cost the warm loop NOTHING. Not a bound like the kernel
+/// gates elsewhere — an exact zero: `FitDiagnostics` is `Copy` scalars only, so
+/// reading it per draw may not touch the heap on ANY route. The `Prebuilt` arm
+/// is the one that could regress here, since its carrier is read off a `Fit`
+/// that owns several `Vec`s; if a future field starts cloning one of them, this
+/// is what catches it.
+///
+/// Run: `RAYON_NUM_THREADS=1 cargo test -p glmm --features alloc-tests
+/// fitview_diagnostics_zero_alloc -- --ignored --test-threads=1` (`alloc-tests`
+/// installs the dhat allocator; `alloc_test_guard` serializes test bodies, but
+/// libtest's own per-test thread spawn still needs `--test-threads=1`).
+#[cfg(feature = "alloc-tests")]
+#[test]
+#[ignore]
+fn fitview_diagnostics_zero_alloc() {
+    let _serial = crate::test_support::alloc_test_guard();
+    const N_CALLS: usize = 1000;
+
+    let (xo, yo, no, po, mo, ido, oo) = ols_case();
+    let mut ws_ols = build_workspace(&mo, &ido, no, po, &oo);
+    let (xl, yl, nl, pl, ml, idl, ol) = lmm_intercept_case();
+    let mut ws_lmm = build_workspace(&ml, &idl, nl, pl, &ol);
+    let (xs, ys, ns, ps, ms, ids_s, os) = crossed_extra_case(vec![1]);
+    let mut ws_sparse = build_workspace(&ms, &ids_s, ns, ps, &os);
+
+    // Fit each arm ONCE outside the profiler — the fits themselves allocate
+    // (faer internals, and the sparse kernel assembles a whole `Fit`); what is
+    // being measured is only the carrier read off the resulting view.
+    let v_ols = fit_on(&mut ws_ols, &Data::new(&xo, &yo, no, po), None, &oo);
+    let v_lmm = fit_on(&mut ws_lmm, &Data::new(&xl, &yl, nl, pl), None, &ol);
+    let v_sparse = fit_on(&mut ws_sparse, &Data::new(&xs, &ys, ns, ps), None, &os);
+    // An NB GLM draw carrying `Note::IllConditioned`, so the `Prebuilt` arm's
+    // walk over the assembled `Fit`'s notes is exercised.
+    let (xn, yn, nn, pn, mn, idn, on) = ill_conditioned_nb_case();
+    let mn = ModelSpec { re: None, ..mn };
+    let mut ws_nb = build_workspace(&mn, &idn, nn, pn, &on);
+    let v_nb = fit_on(&mut ws_nb, &Data::new(&xn, &yn, nn, pn), None, &on);
+    assert!(v_nb.diagnostics().ill_conditioned);
+
+    let profiler = dhat::Profiler::builder().testing().build();
+    // `diagnostics()` is pure and its input (`v_*`) does not change across
+    // iterations, so black-boxing only the RESULT stops the compiler from
+    // discarding the call as dead code but not from proving the whole loop
+    // body loop-invariant and hoisting it above the loop, which would leave
+    // this measuring one real call plus 999 no-op reads of the cached value
+    // instead of N_CALLS calls. Black-boxing the reference too — an opaque
+    // input each iteration — blocks that hoist, so the assertion below is
+    // actually over N_CALLS × 4 real `diagnostics()` calls.
+    for _ in 0..N_CALLS {
+        std::hint::black_box(std::hint::black_box(&v_ols).diagnostics());
+        std::hint::black_box(std::hint::black_box(&v_lmm).diagnostics());
+        std::hint::black_box(std::hint::black_box(&v_sparse).diagnostics());
+        std::hint::black_box(std::hint::black_box(&v_nb).diagnostics());
+    }
+    let stats = dhat::HeapStats::get();
+    drop(profiler);
+    assert_eq!(
+        stats.total_blocks, 0,
+        "FitView::diagnostics allocated {} blocks across {} reads per arm",
+        stats.total_blocks, N_CALLS
+    );
+}
+
+// --- reuse gate + shape pin ---
+
+#[test]
+fn fit_on_glmm_dense_matches_fit_cold() {
+    let (x, y, n, p, model, ids, opts) = glmm_binomial_intercept_case();
+    let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    assert!(cold.converged());
+    let mut ws = build_workspace(&model, &ids, n, p, &opts);
+    assert!(ws.is_glmm());
+    let f1 = fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts).into_fit(
+        &Data::new(&x, &y, n, p),
+        &model,
+        &opts,
+    );
+    assert_near(&cold.beta, &f1.beta, "beta vs fit_cold");
+    assert_near(&cold.se, &f1.se, "se vs fit_cold");
+
+    // Second draw on the SAME ws — different responses, same shape. Guards stale
+    // Z / PIRLS state that a repeat of draw 1 would agree with anyway.
+    let y2: Vec<f64> = y
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| if i % 5 == 0 { 1.0 - v } else { v })
+        .collect();
+    let cold2 = fit_cold(&x, &y2, n, p, &model, &ids, &opts);
+    assert!(cold2.converged());
+    let f2 = fit_on(&mut ws, &Data::new(&x, &y2, n, p), None, &opts).into_fit(
+        &Data::new(&x, &y2, n, p),
+        &model,
+        &opts,
+    );
+    assert_near(&cold2.beta, &f2.beta, "draw-2 beta vs fit_cold");
+    assert_near(&cold2.se, &f2.se, "draw-2 se vs fit_cold");
+}
+
+/// GLMM-NB random intercept: 8 clusters (`i % 8`, so every prefix of
+/// whole rounds keeps all 8 levels), a log-mean with a slope and a cluster
+/// shift, and a deterministic overdispersed count drawn off [`lcg`].
+fn glmm_nb_intercept_case() -> (
+    Vec<f64>,
+    Vec<f64>,
+    usize,
+    usize,
+    ModelSpec,
+    GroupIds,
+    FitOptions,
+) {
+    let (n_clusters, n, p) = (8usize, 160usize, 2usize);
+    let mut state = 46u64;
+    let mut x = vec![0.0f64; n * p];
+    let mut y = vec![0.0f64; n];
+    let mut ids_v = vec![0u32; n];
+    for i in 0..n {
+        let c = i % n_clusters;
+        ids_v[i] = c as u32;
+        let x1 = lcg(&mut state);
+        x[i * p] = 1.0;
+        x[i * p + 1] = x1;
+        let mu = (1.2 + 0.5 * x1 + 0.6 * (c as f64 - 3.5) / 3.5).exp();
+        // A log-scale spread around μ, then rounded: counts with more spread
+        // than a Poisson's, so θ_NB is finite and inside its box.
+        y[i] = (mu * (1.1 * lcg(&mut state)).exp()).round();
+    }
+    let model = ModelSpec {
+        family: Family::NegativeBinomial {
+            link: crate::NegBinomialLink::Log,
+        },
+        re: Some(ReStructure {
+            terms: Vec::new(),
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: ids_v,
+        extra: vec![],
+    };
+    let opts = FitOptions {
+        se_for: SeFor::Only(vec![1]),
+        ..FitOptions::default()
+    };
+    (x, y, n, p, model, ids, opts)
+}
+
+/// The GLMM-NB route keeps one `GlmmWorkspace` across `fit_on` calls. Each
+/// call must give the fit a fresh workspace gives (`fit_cold`), including a
+/// second draw with other counts.
+#[test]
+fn fit_on_glmm_nb_reused_ws_matches_fit_cold() {
+    let (x, y, n_max, p, model, ids, opts) = glmm_nb_intercept_case();
+    let mut ws = build_workspace(&model, &ids, n_max, p, &opts);
+    assert!(ws.is_prebuilt());
+    let y2: Vec<f64> = y
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| if i % 3 == 0 { v + 2.0 } else { v })
+        .collect();
+    let n = n_max;
+    let mut first_beta = None;
+    for (k, yd) in [&y, &y2].into_iter().enumerate() {
+        let cold = fit_cold(&x, yd, n, p, &model, &ids, &opts);
+        assert!(cold.converged(), "draw {k}: the fixture must converge");
+        let via = fit_on(&mut ws, &Data::new(&x, yd, n, p), None, &opts).into_fit(
+            &Data::new(&x, yd, n, p),
+            &model,
+            &opts,
+        );
+        assert_near(&cold.beta, &via.beta, &format!("draw {k} beta"));
+        assert_near(&cold.se, &via.se, &format!("draw {k} se"));
+        assert_near(&cold.tau2, &via.tau2, &format!("draw {k} tau2"));
+        assert_near(
+            &[cold.dispersion],
+            &[via.dispersion],
+            &format!("draw {k} theta_nb"),
+        );
+        first_beta.get_or_insert(via.beta[1]);
+    }
+    // The draws must differ, or the reuse check above proves nothing.
+    let f2 = fit_cold(&x, &y2, n, p, &model, &ids, &opts);
+    assert!(
+        (f2.beta[1] - first_beta.unwrap()).abs() > 1e-6,
+        "draws are degenerate"
+    );
+}
+
+// --- sparse routing (crossed extra-grouping random slope) ---
+
+/// A crossed Gaussian LMM whose EXTRA grouping carries `extra_slopes` as its
+/// random-slope x-columns. With `vec![1]` this is the shape `classify_design`
+/// routes to `Sparse`, and the shape a dense hot path drops the extra slope from
+/// if it fails to route; with `vec![]` (intercept-only extra) the same design
+/// stays inside the dense NoZ envelope. Returns a converging design either way.
+fn crossed_extra_case(
+    extra_slopes: Vec<u32>,
+) -> (
+    Vec<f64>,
+    Vec<f64>,
+    usize,
+    usize,
+    ModelSpec,
+    GroupIds,
+    FitOptions,
+) {
+    let g1 = 8usize; // primary intercept groups
+    let g2 = 5usize; // extra groups carrying the random slope
+    let n = 80usize;
+    let p = 2usize;
+    let mut st = 99u64;
+    let u1: Vec<f64> = (0..g1).map(|_| 0.5 * lcg(&mut st)).collect();
+    let s2: Vec<f64> = (0..g2).map(|_| 0.4 * lcg(&mut st)).collect();
+    let mut x = vec![0.0f64; n * p];
+    let mut y = vec![0.0f64; n];
+    let mut pid = vec![0u32; n];
+    let mut eid = vec![0u32; n];
+    for i in 0..n {
+        let c1 = i % g1;
+        let c2 = i % g2;
+        pid[i] = c1 as u32;
+        eid[i] = c2 as u32;
+        let x1 = lcg(&mut st);
+        x[i * 2] = 1.0;
+        x[i * 2 + 1] = x1;
+        y[i] = 0.5 + 0.7 * x1 + u1[c1] + s2[c2] * x1 + 0.2 * lcg(&mut st);
+    }
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            terms: Vec::new(),
+            slopes: vec![],
+            extra_groupings: vec![Grouping {
+                terms: Vec::new(),
+                relation: GroupingRelation::Crossed,
+                slopes: extra_slopes,
+            }],
+        }),
+    };
+    let ids = GroupIds {
+        primary: pid,
+        extra: vec![eid],
+    };
+    let opts = FitOptions {
+        se_for: SeFor::Only(vec![0, 1]),
+        ..FitOptions::default()
+    };
+    (x, y, n, p, model, ids, opts)
+}
+
+/// Target count sizes the OLS/GLM result slots at build, so growing it per call
+/// must fault here rather than deep inside the estimator's own bounds check.
+#[test]
+#[should_panic(expected = "target count is frozen at build")]
+fn fit_on_panics_on_grown_target_count() {
+    let (x, y, n, p, model, ids, opts) = ols_case();
+    let mut ws = build_workspace(&model, &ids, n, p, &opts);
+    let wider = FitOptions {
+        se_for: SeFor::Only(vec![0, 1, 2]),
+        ..opts
+    };
+    let _ = fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &wider);
+}
+
+/// One workspace fitted weighted, then unweighted, then with other weight
+/// values (ending on unit weights), then weighted again gives each fit a fresh
+/// workspace gives, bit for bit, on the OLS route (whose √w copy of the design
+/// is sized on the first weighted call) and the dense GLMM route (whose
+/// `prior_w` is refilled on every weighted call and read by the PIRLS
+/// working-weight and deviance folds and the pass-3 effective residual).
+/// Weights are a per-call input, so neither may carry a previous call's
+/// weights into the next one.
+#[test]
+fn fit_on_weights_on_then_off_matches_fresh_workspaces() {
+    let cases = [ols_case(), glmm_binomial_intercept_case()];
+    for (x, y, n, p, model, ids, opts) in cases {
+        let w: Vec<f64> = (0..n).map(|i| 1.0 + (i % 3) as f64).collect();
+        let w2: Vec<f64> = (0..n).map(|i| 1.0 + (i % 4) as f64).collect();
+        let unit = vec![1.0; n];
+        let weighted = Data::new(&x, &y, n, p).weights(&w);
+        let plain = Data::new(&x, &y, n, p);
+        let weighted2 = Data::new(&x, &y, n, p).weights(&w2);
+        let unit_weighted = Data::new(&x, &y, n, p).weights(&unit);
+        let fresh = |data: &Data<'_>| {
+            let mut ws = build_workspace(&model, &ids, n, p, &opts);
+            fit_on(&mut ws, data, None, &opts).into_fit(data, &model, &opts)
+        };
+        let mut ws = build_workspace(&model, &ids, n, p, &opts);
+        for (k, data) in [weighted, plain, weighted2, unit_weighted, weighted]
+            .iter()
+            .enumerate()
+        {
+            let reused = fit_on(&mut ws, data, None, &opts).into_fit(data, &model, &opts);
+            let want = fresh(data);
+            let bits = |v: &[f64]| v.iter().map(|b| b.to_bits()).collect::<Vec<_>>();
+            assert_eq!(
+                bits(&reused.beta),
+                bits(&want.beta),
+                "{:?} call {k}: beta",
+                model.family
+            );
+            assert_eq!(
+                reused.deviance.to_bits(),
+                want.deviance.to_bits(),
+                "{:?} call {k}: deviance",
+                model.family
+            );
+        }
+    }
+}
+
+/// A second `NestedWithin` extra aliases the first's RE-column block
+/// (`from_cluster_spec_ext` is last-wins) and `classify_design` does not count
+/// nestings, so without the build-time shape gate this shape would fit and
+/// return a wrong answer instead of refusing.
+#[test]
+#[should_panic(expected = "at most one NestedWithin")]
+fn build_workspace_rejects_two_nested_groupings() {
+    let (_, _, n, p, model, ids, opts) = nested_unbalanced_case();
+    let mut model = model;
+    let nested = model.re.as_ref().unwrap().extra_groupings[0].clone();
+    model.re.as_mut().unwrap().extra_groupings.push(nested);
+    let _ = build_workspace(&model, &ids, n, p, &opts);
+}
+
+// --- fit_on alloc reduction: stale-row tripwire per touched arm ---
+//
+// `Ols`/`Glm`/`Lmm` each gained a build-once `x_mat` sibling buffer that
+// `fit_on` fills in place instead of allocating fresh every call: workspace
+// `x_mat` reuse across different n must equal fresh single-shot fits. Rows
+// past the CURRENT call's `n` keep the PREVIOUS call's values and are never
+// read — each test below grows n and then shrinks it (shrinking leaves more of
+// the buffer stale), for every arm that gained a buffer (the LMM's is the
+// offset round trip at the end of this block).
+
+#[test]
+fn fit_on_ols_larger_then_smaller_matches_fit_cold() {
+    let (full_x, full_y, n_max, p, model, _ids, opts) = ols_case();
+    let mut ws = build_workspace(&model, &GroupIds::default(), n_max, p, &opts);
+    for &n in &[10usize, 21, n_max, 12] {
+        let x = &full_x[..n * p];
+        let y = &full_y[..n];
+        let ids = GroupIds::default();
+        let cold = fit_cold(x, y, n, p, &model, &ids, &opts);
+        let via = fit_on(&mut ws, &Data::new(x, y, n, p), None, &opts).into_fit(
+            &Data::new(x, y, n, p),
+            &model,
+            &opts,
+        );
+        assert_near(&cold.beta, &via.beta, &format!("n={n} beta"));
+        assert_near(&cold.se, &via.se, &format!("n={n} se"));
+    }
+}
+
+#[test]
+fn fit_on_glm_larger_then_smaller_matches_fit_cold() {
+    let (full_x, full_y, n_max, p, model, _ids, opts) = glm_case();
+    let mut ws = build_workspace(&model, &GroupIds::default(), n_max, p, &opts);
+    assert!(ws.is_glm());
+    for &n in &[12usize, n_max, 12] {
+        let x = &full_x[..n * p];
+        let y = &full_y[..n];
+        let ids = GroupIds::default();
+        let cold = fit_cold(x, y, n, p, &model, &ids, &opts);
+        let via = fit_on(&mut ws, &Data::new(x, y, n, p), None, &opts).into_fit(
+            &Data::new(x, y, n, p),
+            &model,
+            &opts,
+        );
+        assert_near(&cold.beta, &via.beta, &format!("n={n} beta"));
+        assert_near(&cold.se, &via.se, &format!("n={n} se"));
+    }
+}
+
+/// Dense-LMM workspace reuse over changed responses, without and with an
+/// offset. A repeat of one draw would agree even with stale accumulator state;
+/// a different draw will not. The offset path fills the preallocated
+/// `y_shifted` (a build-once sibling buffer) fresh from `y - offset` every
+/// call, so a stale entry from the previous call would show up as a wrong
+/// shift on the next. Each pass builds its own workspace.
+#[test]
+fn fit_on_lmm_dense_reuse_with_and_without_offset_matches_fit_cold() {
+    let (x, full_y, n, p, model, ids, base_opts) = lmm_intercept_case();
+    let offset: Vec<f64> = (0..n).map(|i| 0.05 * ((i % 4) as f64 - 1.5)).collect();
+    let y2: Vec<f64> = full_y
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| v + 0.1 * (i % 5) as f64)
+        .collect();
+    for offset in [None, Some(offset)] {
+        let opts = base_opts.clone();
+        let mut ws = build_workspace(&model, &ids, n, p, &opts);
+        let mut beta0 = Vec::new();
+        for (k, y) in [&full_y, &y2, &full_y].into_iter().enumerate() {
+            let cold = fit_warm_wo(
+                &x,
+                y,
+                n,
+                p,
+                &model,
+                &ids,
+                None,
+                None,
+                offset.as_deref(),
+                &opts,
+            );
+            let mut data = Data::new(&x, y, n, p);
+            if let Some(o) = &offset {
+                data = data.offset(o);
+            }
+            let via = fit_on(&mut ws, &data, None, &opts).into_fit(&data, &model, &opts);
+            let tag = format!("offset={} draw {k}", offset.is_some());
+            assert_near(&cold.beta, &via.beta, &format!("{tag} beta"));
+            assert_near(&cold.se, &via.se, &format!("{tag} se"));
+            assert_near(&cold.tau2, &via.tau2, &format!("{tag} tau2"));
+            assert_near(
+                &[cold.dispersion],
+                &[via.dispersion],
+                &format!("{tag} dispersion"),
+            );
+            beta0.push(via.beta[0]);
+        }
+        // The second draw must actually move the fit, or the reuse check
+        // above proves nothing.
+        assert!(
+            (beta0[0] - beta0[1]).abs() > 1e-6,
+            "offset={}: draws are degenerate",
+            offset.is_some()
+        );
+    }
+}
+
+/// Dense random-slope LMM whose slope column is deliberately far off unit RMS,
+/// so the standardization scales it and the θ̂ read-back in `FitView::new` has
+/// real work to do.
+fn lmm_slope_case() -> (
+    Vec<f64>,
+    Vec<f64>,
+    usize,
+    usize,
+    ModelSpec,
+    GroupIds,
+    FitOptions,
+) {
+    let n_clusters = 6usize;
+    let per = 10usize;
+    let n = n_clusters * per;
+    let p = 2usize;
+    let mut st = 271u64;
+    let mut x = vec![0.0f64; n * p];
+    let mut y = vec![0.0f64; n];
+    let mut ids_v = vec![0u32; n];
+    for i in 0..n {
+        let c = i % n_clusters;
+        ids_v[i] = c as u32;
+        // ×7 puts the column's RMS well away from 1 — the scale the read-back divides by.
+        let x1 = 7.0 * lcg(&mut st);
+        x[i * 2] = 1.0;
+        x[i * 2 + 1] = x1;
+        let u = 0.3 * ((c as f64) - (n_clusters as f64) / 2.0);
+        let s = 0.05 * ((c as f64) - 2.0);
+        y[i] = 0.5 + 0.4 * x1 + u + s * x1 + 0.1 * lcg(&mut st);
+    }
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            terms: Vec::new(),
+            slopes: vec![1],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: ids_v,
+        extra: vec![],
+    };
+    let opts = FitOptions {
+        se_for: SeFor::Only(vec![0, 1]),
+        ..FitOptions::default()
+    };
+    (x, y, n, p, model, ids, opts)
+}
+
+/// `lmm_slope_case`'s per-level slopes move with its intercepts (both linear
+/// in the level), so θ̂ pins Λ's slope column at zero: the pass has two free
+/// θ. This response swaps them for slopes unrelated to the intercepts, which
+/// leave all three free.
+fn slope_free_response(x: &[f64], y: &[f64]) -> Vec<f64> {
+    (0..y.len())
+        .map(|i| {
+            let c = i % 6;
+            let slope = 0.1 * [1.0, -1.0, 0.5, -0.5, 0.0, 0.0][c] - 0.05 * (c as f64 - 2.0);
+            y[i] + slope * x[i * 2 + 1]
+        })
+        .collect()
+}
+
+/// `lmm_slope_case`'s fixed part plus noise from which each level's own
+/// `[1, x]` fit is projected out: the levels agree exactly, so θ̂ pins every Λ
+/// column and the pass has no free θ (its df is ν).
+fn all_pinned_response(x: &[f64]) -> Vec<f64> {
+    let n = x.len() / 2;
+    let mut st = 99u64;
+    let mut e: Vec<f64> = (0..n).map(|_| lcg(&mut st) - 0.5).collect();
+    for c in 0..6 {
+        let rows: Vec<usize> = (0..n).filter(|i| i % 6 == c).collect();
+        let m = rows.len() as f64;
+        let xm = rows.iter().map(|&i| x[i * 2 + 1]).sum::<f64>() / m;
+        let em = rows.iter().map(|&i| e[i]).sum::<f64>() / m;
+        let sxx: f64 = rows.iter().map(|&i| (x[i * 2 + 1] - xm).powi(2)).sum();
+        let sxe: f64 = rows
+            .iter()
+            .map(|&i| (x[i * 2 + 1] - xm) * (e[i] - em))
+            .sum();
+        let b = sxe / sxx;
+        for &i in &rows {
+            e[i] -= em + b * (x[i * 2 + 1] - xm);
+        }
+    }
+    (0..n)
+        .map(|i| 0.5 + 0.4 * x[i * 2 + 1] + 0.1 * e[i])
+        .collect()
+}
+
+/// The free θ the pass sees after the last fit on `ws`.
+fn n_free(ws: &mut super::FitWorkspace) -> usize {
+    let lmm = ws.lmm_parts().expect("an LMM workspace").0;
+    crate::lmm::satterthwaite::free_coordinates(lmm.kernel.groupings(), &lmm.theta).len()
+}
+
+/// Intercept-only crossed design whose EXTRA factor outnumbers the primary, so
+/// `spec_sized_from_ids` swaps the two and the workspace carries a non-identity
+/// `Perm` — the state that makes a warm start arrive in the wrong slot order.
+#[cfg(feature = "alloc-tests")]
+fn reordered_crossed_case() -> (
+    Vec<f64>,
+    Vec<f64>,
+    usize,
+    usize,
+    ModelSpec,
+    GroupIds,
+    FitOptions,
+) {
+    let g1 = 4usize; // primary
+    let g2 = 9usize; // extra — the larger one, which is what triggers the swap
+    let n = 72usize;
+    let p = 2usize;
+    let mut st = 4242u64;
+    let u1: Vec<f64> = (0..g1).map(|_| 0.5 * lcg(&mut st)).collect();
+    let u2: Vec<f64> = (0..g2).map(|_| 0.4 * lcg(&mut st)).collect();
+    let mut x = vec![0.0f64; n * p];
+    let mut y = vec![0.0f64; n];
+    let mut pid = vec![0u32; n];
+    let mut eid = vec![0u32; n];
+    for i in 0..n {
+        let (c1, c2) = (i % g1, i % g2);
+        pid[i] = c1 as u32;
+        eid[i] = c2 as u32;
+        let x1 = lcg(&mut st);
+        x[i * 2] = 1.0;
+        x[i * 2 + 1] = x1;
+        y[i] = 0.5 + 0.7 * x1 + u1[c1] + u2[c2] + 0.2 * lcg(&mut st);
+    }
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            terms: Vec::new(),
+            slopes: vec![],
+            extra_groupings: vec![Grouping {
+                terms: Vec::new(),
+                relation: GroupingRelation::Crossed,
+                slopes: vec![],
+            }],
+        }),
+    };
+    let ids = GroupIds {
+        primary: pid,
+        extra: vec![eid],
+    };
+    let opts = FitOptions {
+        se_for: SeFor::Only(vec![0, 1]),
+        ..FitOptions::default()
+    };
+    (x, y, n, p, model, ids, opts)
+}
+
+/// The two per-draw θ marshalling steps `fit_on` does outside the solver — the
+/// scaled-θ read-back in `FitView::new`, and permuting a warm start into slot
+/// order — must cost the warm loop nothing. Both arms are covered because they
+/// are mutually exclusive by construction: the grouping swap only fires on an
+/// all-intercept design, which is exactly the design that carries no RE column
+/// scale.
+///
+/// `fit_on` as a whole cannot be measured at zero — the post-fit Cholesky
+/// factors and the first warm call's BOBYQA instance allocate — so the gate is
+/// a pin on the TOTAL over a fixed call count. Re-materializing θ̂ or
+/// re-cloning a start costs 2 blocks per draw, so a regression overshoots by
+/// `2 * N_CALLS`, well outside the pin.
+///
+/// Run: `RAYON_NUM_THREADS=1 cargo test -p glmm --features alloc-tests
+/// fit_on_theta_marshalling_bounded_alloc -- --ignored --test-threads=1`
+/// (`alloc-tests` installs the dhat allocator; `alloc_test_guard` serializes
+/// test bodies, but libtest's own per-test thread spawn still needs
+/// `--test-threads=1`).
+#[cfg(feature = "alloc-tests")]
+#[test]
+#[ignore]
+fn fit_on_theta_marshalling_bounded_alloc() {
+    let _serial = crate::test_support::alloc_test_guard();
+    const N_CALLS: usize = 100;
+    // Measured exactly 850 (2026-10-02) under this test's own `RAYON_NUM_THREADS=1` +
+    // `--test-threads=1` protocol, and the same at any `RAYON_NUM_THREADS`:
+    // 350 blocks for the two arms' warm BOBYQA instances (built on the first
+    // warm call, inside the window), then per iteration the `L` of each
+    // `linalg::SeqLlt` — two in each arm's Wald χ², one in the reordered arm's
+    // crossed-tail RE recovery — 5 × 100 = 500. Pinned at the measurement with
+    // no slack: if the count moves, re-measure and update, do not relax.
+    //
+    // dhat counts every thread, so the window must not race a thread that
+    // starts on its own: a faer call that reads the global parallelism
+    // (`Mat::llt`) spawns rayon's pool, and its worker's startup allocations
+    // (4 blocks) land inside or before the window depending on scheduling.
+    //
+    // The blocks this test exists to keep at ZERO are the marshalling ones — 5
+    // per iteration in the code that motivated the gate (scaled arm: scale
+    // vector + θ̂ copy; reordered arm: θ̂ copy + a two-`Vec` start clone). They
+    // are still zero.
+    const BOUND: u64 = 850;
+
+    let (xs, ys, ns, ps, ms, ids_s, os) = lmm_slope_case();
+    let (_, _, perm_s) = spec_sized_from_ids(&ms, &ids_s);
+    assert!(perm_s.is_identity());
+    let mut ws_scaled = build_workspace(&ms, &ids_s, ns, ps, &os);
+    assert!(ws_scaled.is_lmm());
+
+    let (xr, yr, nr, pr, mr, ids_r, or) = reordered_crossed_case();
+    let (_, _, perm_r) = spec_sized_from_ids(&mr, &ids_r);
+    assert!(
+        !perm_r.is_identity(),
+        "the warm-start permutation arm needs a reordering workspace"
+    );
+    let mut ws_reordered = build_workspace(&mr, &ids_r, nr, pr, &or);
+    assert!(ws_reordered.is_lmm());
+
+    // One fit per arm outside the profiler, both to warm the workspace's lazy
+    // buffers and to produce the warm start the profiled loop carries.
+    let start_s = {
+        let v = fit_on(&mut ws_scaled, &Data::new(&xs, &ys, ns, ps), None, &os);
+        assert!(
+            v.theta().iter().all(|t| t.is_finite()) && v.theta().len() == 3,
+            "the scaled arm must carry a q=2 θ"
+        );
+        crate::StartValues {
+            beta: v.betas().to_vec(),
+            theta: v.theta().to_vec(),
+            dispersion: None,
+        }
+    };
+    let start_r = {
+        let v = fit_on(&mut ws_reordered, &Data::new(&xr, &yr, nr, pr), None, &or);
+        crate::StartValues {
+            beta: v.betas().to_vec(),
+            theta: v.theta().to_vec(),
+            dispersion: None,
+        }
+    };
+
+    let profiler = dhat::Profiler::builder().testing().build();
+    for _ in 0..N_CALLS {
+        let v = fit_on(
+            &mut ws_scaled,
+            &Data::new(&xs, &ys, ns, ps),
+            Some(&start_s),
+            &os,
+        );
+        std::hint::black_box(std::hint::black_box(&v).theta());
+        let v = fit_on(
+            &mut ws_reordered,
+            &Data::new(&xr, &yr, nr, pr),
+            Some(&start_r),
+            &or,
+        );
+        std::hint::black_box(std::hint::black_box(&v).theta());
+    }
+    let stats = dhat::HeapStats::get();
+    drop(profiler);
+    assert!(
+        stats.total_blocks <= BOUND,
+        "fit_on allocated {} blocks across {} warm-path calls per arm (BOUND = {})",
+        stats.total_blocks,
+        N_CALLS,
+        BOUND
+    );
+}
+
+/// A warm `fit_on` loop under `SeFor::All` (the default) allocates exactly
+/// what it allocates under `SeFor::Only` over the same columns, on an LMM and
+/// on a GLMM workspace: the `All` column list is written into the workspace's
+/// own buffer, not built on every draw.
+///
+/// Run: `RAYON_NUM_THREADS=1 cargo test -p glmm --features alloc-tests
+/// fit_on_se_for_all_allocates_like_the_explicit_list -- --ignored --test-threads=1`
+#[cfg(feature = "alloc-tests")]
+#[test]
+#[ignore]
+fn fit_on_se_for_all_allocates_like_the_explicit_list() {
+    let _serial = crate::test_support::alloc_test_guard();
+    const N_CALLS: usize = 50;
+    let (xl, yl, nl, pl, ml, ids_l, _) = lmm_slope_case();
+    let (xg, yg, ng, pg, mg, ids_g, _, offset) = glmm_pattern_draw(false, 7, 1);
+    let cases = [
+        ("LMM", Data::new(&xl, &yl, nl, pl), ml, ids_l),
+        (
+            "GLMM",
+            Data::new(&xg, &yg, ng, pg).offset(&offset),
+            mg,
+            ids_g,
+        ),
+    ];
+    for (arm, data, model, ids) in &cases {
+        let (n, p) = (data.design.n, data.design.p);
+        let mut blocks = Vec::new();
+        for opts in [
+            FitOptions::default(),
+            FitOptions {
+                se_for: SeFor::Only((0..p as u32).collect()),
+                ..FitOptions::default()
+            },
+        ] {
+            let mut ws = build_workspace(model, ids, n, p, &opts);
+            let v = fit_on(&mut ws, data, None, &opts);
+            let start = crate::StartValues {
+                beta: v.betas().to_vec(),
+                theta: v.theta().to_vec(),
+                dispersion: None,
+            };
+            // The first warm call builds the warm search's own state.
+            let _ = fit_on(&mut ws, data, Some(&start), &opts);
+            crate::test_support::settle_background_allocs();
+            let profiler = dhat::Profiler::builder().testing().build();
+            for _ in 0..N_CALLS {
+                let v = fit_on(&mut ws, data, Some(&start), &opts);
+                std::hint::black_box(std::hint::black_box(&v).theta());
+            }
+            let stats = dhat::HeapStats::get();
+            drop(profiler);
+            blocks.push(stats.total_blocks);
+        }
+        assert_eq!(
+            blocks[0], blocks[1],
+            "{arm}: {N_CALLS} warm draws allocated {} blocks under SeFor::All and {} under the explicit list",
+            blocks[0], blocks[1]
+        );
+    }
+}
+
+/// A Poisson GLMM with one crossed grouping, on the structured layout
+/// (`packed = false`: 12 × 6 intercept levels, 240 rows) or the packed layout
+/// with the sparse factor of `A` (`packed = true`: a slope on the crossed
+/// grouping, 256 + 4·2 = 264 RE columns, past `PACKED_SPARSE_MIN_K`, 512
+/// rows). Row `i` sits in primary level `i % g1` and crossed level
+/// `(i / shift) % g2`; draws with the same `shift` share their rows' levels.
+/// The response and the offset are drawn from `seed`.
+#[allow(clippy::type_complexity)]
+fn glmm_pattern_draw(
+    packed: bool,
+    shift: usize,
+    seed: u64,
+) -> (
+    Vec<f64>,
+    Vec<f64>,
+    usize,
+    usize,
+    ModelSpec,
+    GroupIds,
+    FitOptions,
+    Vec<f64>,
+) {
+    let (g1, g2, n, p) = if packed {
+        (256usize, 4usize, 512usize, 2usize)
+    } else {
+        (12, 6, 240, 2)
+    };
+    let mut st = seed;
+    let u1: Vec<f64> = (0..g1).map(|_| 0.5 * lcg(&mut st)).collect();
+    let u2: Vec<f64> = (0..g2).map(|_| 0.5 * lcg(&mut st)).collect();
+    let mut x = vec![0.0f64; n * p];
+    let mut y = vec![0.0f64; n];
+    let mut offset = vec![0.0f64; n];
+    let (mut pid, mut eid) = (vec![0u32; n], vec![0u32; n]);
+    for i in 0..n {
+        let (c1, c2) = (i % g1, (i / shift) % g2);
+        pid[i] = c1 as u32;
+        eid[i] = c2 as u32;
+        let x1 = lcg(&mut st);
+        x[i * p] = 1.0;
+        x[i * p + 1] = x1;
+        offset[i] = 0.1 * lcg(&mut st);
+        let eta = 0.5 + 0.3 * x1 + u1[c1] + u2[c2] * (1.0 + 0.5 * x1) + offset[i];
+        // Poisson draw by Knuth's product of uniforms.
+        let (floor, mut count, mut prod) = ((-eta.exp()).exp(), 0.0f64, 1.0f64);
+        loop {
+            prod *= 0.5 * (lcg(&mut st) + 1.0);
+            if prod <= floor {
+                break;
+            }
+            count += 1.0;
+        }
+        y[i] = count;
+    }
+    let model = ModelSpec {
+        family: Family::Poisson {
+            link: crate::PoissonLink::Log,
+        },
+        re: Some(ReStructure {
+            terms: Vec::new(),
+            slopes: vec![],
+            extra_groupings: vec![Grouping {
+                terms: Vec::new(),
+                relation: GroupingRelation::Crossed,
+                slopes: if packed { vec![1] } else { vec![] },
+            }],
+        }),
+    };
+    let ids = GroupIds {
+        primary: pid,
+        extra: vec![eid],
+    };
+    let opts = FitOptions {
+        se_for: SeFor::Only(vec![1]),
+        ..FitOptions::default()
+    };
+    (x, y, n, p, model, ids, opts, offset)
+}
+
+/// The GLMM workspace keeps the packed columns, the sparse factor of `A` and
+/// the crossed-Schur symbolic factor across `fit_on` draws, all on the level
+/// ids it was built with. Each draw must give, bit for bit, the fit a fresh
+/// workspace gives: the draws keep the ids and change the response and
+/// offset.
+#[test]
+fn fit_on_glmm_reused_pattern_matches_a_fresh_workspace() {
+    for packed in [false, true] {
+        let mut reused = None;
+        for (shift, seed) in [(7usize, 1u64), (7, 2), (7, 4)] {
+            let (x, y, n, p, model, ids, opts, offset) = glmm_pattern_draw(packed, shift, seed);
+            let data = Data::new(&x, &y, n, p).offset(&offset);
+            let ws = reused.get_or_insert_with(|| build_workspace(&model, &ids, n, p, &opts));
+            let a = fit_on(ws, &data, None, &opts);
+            let mut fresh = build_workspace(&model, &ids, n, p, &opts);
+            let b = fit_on(&mut fresh, &data, None, &opts);
+            let tag = format!("packed={packed} shift={shift} seed={seed}");
+            assert!(a.converged(), "{tag}: the fixture must converge");
+            let bits = |v: &[f64]| v.iter().map(|t| t.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(a.betas()), bits(b.betas()), "{tag}: β");
+            assert_eq!(bits(a.theta()), bits(b.theta()), "{tag}: θ");
+            assert_eq!(bits(a.var_diag()), bits(b.var_diag()), "{tag}: Var(β)");
+            assert_eq!(a.n_eval(), b.n_eval(), "{tag}: evaluations");
+        }
+        let Some(super::FitWorkspace {
+            kind: super::FitKind::Glmm { ws },
+            ..
+        }) = &reused
+        else {
+            panic!("packed={packed}: the fixture must build a GLMM workspace");
+        };
+        let layout = if packed {
+            crate::glmm::GlmmLayout::Packed
+        } else {
+            crate::glmm::GlmmLayout::Structured
+        };
+        assert_eq!(ws.layout, layout);
+        assert_eq!(ws.packed.sparse.is_some(), packed);
+        assert_eq!(ws.pattern.structured_schur.is_some(), !packed);
+    }
+}
+
+/// [`super::super::glmm::prep_glmm_design`] on the level ids the workspace
+/// was last prepared from allocates nothing, on the structured layout (the
+/// crossed-Schur symbolic factor) and on the packed one (the sparse factor of
+/// `A`): the symbolic structures are kept and the offset is copied into the
+/// workspace's own buffer.
+///
+/// Run: `RAYON_NUM_THREADS=1 cargo test -p glmm --features alloc-tests
+/// prep_glmm_design_on_the_same_ids_allocates_nothing -- --ignored --test-threads=1`
+#[cfg(feature = "alloc-tests")]
+#[test]
+#[ignore]
+fn prep_glmm_design_on_the_same_ids_allocates_nothing() {
+    let _serial = crate::test_support::alloc_test_guard();
+    const N_CALLS: u64 = 10;
+    for packed in [false, true] {
+        let (_x, _y, n, p, model, ids, opts, offset) = glmm_pattern_draw(packed, 7, 1);
+        let mut fws = build_workspace(&model, &ids, n, p, &opts);
+        let super::FitKind::Glmm { ws } = &mut fws.kind else {
+            panic!("packed={packed}: the fixture must build a GLMM workspace");
+        };
+        let prep = |ws: &mut crate::glmm::GlmmWorkspace| {
+            super::super::glmm::prep_glmm_design(
+                ws,
+                &ids.primary,
+                &ids.extra,
+                None,
+                Some(&offset),
+                n,
+                &opts,
+            );
+        };
+        prep(ws);
+        assert_eq!(ws.packed.sparse.is_some(), packed);
+        assert_eq!(ws.pattern.structured_schur.is_some(), !packed);
+        crate::test_support::settle_background_allocs();
+        let profiler = dhat::Profiler::builder().testing().build();
+        for _ in 0..N_CALLS {
+            prep(ws);
+        }
+        let stats = dhat::HeapStats::get();
+        drop(profiler);
+        assert_eq!(
+            stats.total_blocks, 0,
+            "packed={packed}: {N_CALLS} preps on the same ids allocated {} blocks",
+            stats.total_blocks
+        );
+    }
+}
+
+/// Semantics pin for the shrink counter: `evals_after_last_improve` is the
+/// number of evaluations recorded after the last strict improvement of the
+/// per-stage incumbent. A ten-eval stage whose last improvement was eval 7
+/// has three shrink evals.
+#[cfg(feature = "counters")]
+#[test]
+fn eval_counters_count_evals_after_last_improvement() {
+    use crate::counters::{EvalCounters, Stage};
+    let mut c = EvalCounters::new();
+    for obj in [5.0, 4.0, 4.5, 3.0, 3.5, 3.5, 3.5] {
+        c.record_eval(Stage::Two, obj);
+    }
+    assert_eq!(c.stage_evals[Stage::Two as usize], 7);
+    assert_eq!(c.stage_last_improve[Stage::Two as usize], 4);
+    assert_eq!(c.evals_after_last_improve(Stage::Two), 3);
+    assert_eq!(c.evals_after_last_improve(Stage::One), 0);
+}
+
+/// The PIRLS histogram buckets the pending per-eval iteration count and
+/// clears it, so two evals of 3 and 5 iterations land in two different
+/// buckets and nothing carries over into a third eval.
+#[cfg(feature = "counters")]
+#[test]
+fn eval_counters_bucket_pirls_iterations_per_eval() {
+    use crate::counters::EvalCounters;
+    let mut c = EvalCounters::new();
+    c.set_pirls_iters(3);
+    c.commit_pirls_iters();
+    c.set_pirls_iters(5);
+    c.commit_pirls_iters();
+    c.set_pirls_iters(3);
+    c.commit_pirls_iters();
+    assert_eq!(c.pirls_hist[3], 2);
+    assert_eq!(c.pirls_hist[5], 1);
+    assert_eq!(c.pirls_hist.iter().sum::<u32>(), 3);
+}
+
+/// Every route must carry the counters field, and a route with no
+/// derivative-free search must report zeros rather than garbage. Run on the
+/// OLS route, the fixed-θ GLM route (`FitKind::Glm`), and the negative-binomial
+/// route (`FitKind::Prebuilt`), which alternates β and θ without BOBYQA.
+#[cfg(feature = "counters")]
+#[test]
+fn fit_carries_zeroed_counters_on_closed_form_routes() {
+    use crate::counters::Stage;
+    let (x, y, n, p, model, ids, opts) = ols_case();
+    let (gx, gy, gn, gp, glm_model, gids, gopts) = glm_case();
+    let nb_model = ModelSpec {
+        family: Family::NegativeBinomial {
+            link: crate::NegBinomialLink::Log,
+        },
+        re: None,
+    };
+    let cases = [
+        ("OLS", fit_cold(&x, &y, n, p, &model, &ids, &opts)),
+        (
+            "Poisson GLM",
+            fit_cold(&gx, &gy, gn, gp, &glm_model, &gids, &gopts),
+        ),
+        (
+            "NB GLM",
+            fit_cold(&gx, &gy, gn, gp, &nb_model, &gids, &gopts),
+        ),
+    ];
+    for (route, f) in cases {
+        assert_eq!(f.n_eval, 0, "{route} runs no optimizer");
+        assert_eq!(f.counters.stage_evals, [0, 0], "{route}");
+        assert_eq!(
+            f.counters.evals_after_last_improve(Stage::Two),
+            0,
+            "{route}"
+        );
+        assert_eq!(f.counters.agq_evals, 0, "{route}");
+        assert_eq!(f.counters.pirls_hist.iter().sum::<u32>(), 0, "{route}");
+    }
+}
+
+/// The GLMM outer-search route splits which BOBYQA stage runs
+/// (`documentation/algorithms-glmm.md`'s "β profiling — the three outer
+/// routes" section): `ExactProfile` (cbpp, binomial-logit, single intercept
+/// grouping) runs stage 1 only; `Joint` (the Gamma fixture below at `nagq = 7`,
+/// which `exact_profile_shape` excludes as AGQ) runs stage 2 only. The pair
+/// separates the route without reading the in-crate-only
+/// `GlmmWorkspace.outer_search` field.
+#[cfg(feature = "counters")]
+#[test]
+fn counters_show_the_outer_search_stage_split() {
+    let (x, y, cluster_ids, n) = crate::fit::glmm_tests::cbpp_design();
+    let p = 4;
+    let model = crate::fit::glmm_tests::cbpp_model();
+    let f = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &GroupIds {
+            primary: cluster_ids,
+            extra: vec![],
+        },
+        &FitOptions {
+            se_for: SeFor::Only((0..p as u32).collect()),
+            ..FitOptions::default()
+        },
+    );
+    assert!(f.counters.stage_evals[0] > 0, "ExactProfile runs stage 1");
+    assert_eq!(f.counters.stage_evals[1], 0, "ExactProfile skips stage 2");
+
+    let (x, y, cluster_ids, _) = crate::fit::common_tests::sim_clustered(include_str!(
+        "../../validation/data/simulated/sim_gamma.csv"
+    ));
+    let (n, p) = (y.len(), 3);
+    let gamma_model = ModelSpec {
+        family: Family::Gamma {
+            link: crate::GammaLink::Log,
+        },
+        re: Some(ReStructure {
+            slopes: vec![],
+            terms: Vec::new(),
+            extra_groupings: vec![],
+        }),
+    };
+    let g = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &gamma_model,
+        &GroupIds {
+            primary: cluster_ids,
+            extra: vec![],
+        },
+        &FitOptions {
+            se_for: SeFor::Only((0..p as u32).collect()),
+            nagq: 7,
+            ..FitOptions::default()
+        },
+    );
+    assert_eq!(g.counters.stage_evals[0], 0, "Joint skips stage 1");
+    assert!(g.counters.stage_evals[1] > 0, "Joint runs stage 2");
+}
+
+// --- over-envelope θ width -------------------------------------------------
+//
+// `classify_design` accepts a primary block past `MAX_PRIMARY_Q` by routing it
+// to the sparse solver instead of refusing it, so a design's vech can be wider
+// than `MAX_THETA` (96) — `(1 + x1..x13 | g)` is `q_p = 14`, hence
+// `n_theta = 14·15/2 = 105`. Both cases below are that shape, at the smallest
+// data that still routes there — one grouping level, `n == p` — because the
+// search over a 105-wide θ is the whole cost of the fixture and none of its
+// point: what these pin is the θ marshalling around the solver, not the answer.
+
+/// θ width of `over_envelope_design`, past `MAX_THETA` by design.
+#[cfg(test)]
+const OVER_ENVELOPE_N_THETA: usize = 14 * 15 / 2;
+
+/// Gaussian `(1 + x1..x13 | g)` on one grouping level × 14 rows. Column 1 is
+/// pushed far off unit RMS, so the standardization scales it and the θ̂
+/// read-back in `FitView::new` has the divide to do.
+fn over_envelope_design() -> (Vec<f64>, Vec<f64>, usize, usize, ModelSpec, GroupIds) {
+    let q_p = 14usize; // intercept + 13 slopes
+    let n = 14usize;
+    let p = q_p;
+    let mut st = 90125u64;
+    let mut x = vec![0.0f64; n * p];
+    let mut y = vec![0.0f64; n];
+    let ids_v = vec![0u32; n];
+    for i in 0..n {
+        x[i * p] = 1.0;
+        for j in 1..p {
+            let v = lcg(&mut st);
+            x[i * p + j] = if j == 1 { 7.0 * v } else { v };
+        }
+        y[i] = 1.5 + 0.4 * x[i * p + 1] + 0.1 * lcg(&mut st);
+    }
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            terms: Vec::new(),
+            slopes: (1..p as u32).collect(),
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: ids_v,
+        extra: vec![],
+    };
+    (x, y, n, p, model, ids)
+}
+
+/// A vech wider than `MAX_THETA` fits through `fit_cold` instead of panicking.
+///
+/// `FitView::new` maps θ̂ back out of the internal RE column scales in the
+/// workspace's own θ buffer. Sized off the `MAX_THETA` constant that buffer
+/// bounds-checks on this design, so the second half of the test pins the sizing
+/// rule directly — off the built kernel's θ width — and pins that the divide
+/// really ran, which is what puts the wide θ̂ in that buffer in the first place.
+#[test]
+fn over_envelope_vech_fits_through_the_theta_rescale() {
+    let (x, y, n, p, model, ids) = over_envelope_design();
+    let opts = FitOptions {
+        se_for: SeFor::Only(vec![0]),
+        ..FitOptions::default()
+    };
+    assert_eq!(
+        crate::fit::classify_design(&spec_sized_from_ids(&model, &ids).0, 1),
+        crate::fit::Solver::Sparse,
+        "q_p past MAX_PRIMARY_Q must route to the sparse solver, not refuse"
+    );
+    let fit = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    assert_eq!(fit.tau2.len(), OVER_ENVELOPE_N_THETA);
+    assert_eq!(fit.beta.len(), p);
+
+    let mut ws = build_workspace(&model, &ids, n, p, &opts);
+    assert_eq!(
+        ws.theta_declared_buf.len(),
+        OVER_ENVELOPE_N_THETA,
+        "the θ buffer is sized off the built kernel's own θ width, not a constant"
+    );
+    let view = fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts);
+    assert_eq!(view.theta().len(), OVER_ENVELOPE_N_THETA);
+    assert!(
+        !std::ptr::eq(view.theta().as_ptr(), view.kernel_theta().as_ptr()),
+        "a scaled RE column must materialize θ̂ — otherwise this design no \
+         longer exercises the rescale at all"
+    );
+}
+
+/// The same width through `fit_warm_wo`'s θ start on a packed GLMM: `fit_glmm`
+/// maps a caller's θ forward into the internal scale before the floor, and that
+/// map needs the row scales for all 105 entries.
+#[test]
+fn over_envelope_vech_fits_through_a_warm_theta_start() {
+    let (x, _, n, p, mut model, ids) = over_envelope_design();
+    model.family = Family::Poisson {
+        link: crate::PoissonLink::Log,
+    };
+    let y: Vec<f64> = (0..n).map(|i| (i % 4) as f64).collect();
+    let opts = FitOptions {
+        se_for: SeFor::Only(vec![0]),
+        ..FitOptions::default()
+    };
+    // A Cholesky-factor start: unit diagonals, zero off-diagonals.
+    let mut theta = vec![0.0f64; OVER_ENVELOPE_N_THETA];
+    let mut k = 0usize;
+    for c in 0..14 {
+        for r in c..14 {
+            if r == c {
+                theta[k] = 1.0;
+            }
+            k += 1;
+        }
+    }
+    let start = crate::StartValues {
+        beta: vec![],
+        theta,
+        dispersion: None,
+    };
+    let fit = fit_warm_wo(&x, &y, n, p, &model, &ids, Some(&start), None, None, &opts);
+    assert_eq!(fit.tau2.len(), OVER_ENVELOPE_N_THETA);
+    assert_eq!(fit.beta.len(), p);
+}
+
+/// `set_fixed_design(true)` reuses the design-only setup across draws (column
+/// statistics, the standardized `x_mat`, and on the dense LMM route `U` and the
+/// design part of the sufficient statistics). Every draw's fit must be
+/// bit-identical to the same draw on a workspace without the promise:
+/// unweighted, and weighted with an offset (the response-only rebuild reads
+/// both).
+#[test]
+fn fit_on_fixed_design_matches_a_plain_workspace() {
+    let (x, y, n, p, model, ids, opts) = lmm_slope_case();
+    let w: Vec<f64> = (0..n).map(|i| 0.5 + (i % 3) as f64 * 0.5).collect();
+    let off: Vec<f64> = (0..n).map(|i| 0.1 * (i % 5) as f64).collect();
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    for weighted in [false, true] {
+        let o = &opts;
+        let mut fixed = build_workspace(&model, &ids, n, p, o);
+        let mut plain = build_workspace(&model, &ids, n, p, o);
+        fixed.set_fixed_design(true);
+        for draw in 0..3 {
+            let yd: Vec<f64> = y
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| v + 0.2 * draw as f64 * ((i % 7) as f64 - 3.0))
+                .collect();
+            let mut data = Data::new(&x, &yd, n, p);
+            if weighted {
+                data = data.weights(&w).offset(&off);
+            }
+            let a = fit_on(&mut fixed, &data, None, o);
+            let ra = (
+                bits(a.betas()),
+                bits(a.theta()),
+                bits(a.var_diag()),
+                a.n_eval(),
+            );
+            let b = fit_on(&mut plain, &data, None, o);
+            let rb = (
+                bits(b.betas()),
+                bits(b.theta()),
+                bits(b.var_diag()),
+                b.n_eval(),
+            );
+            assert_eq!(ra, rb, "weighted={weighted} draw {draw}");
+        }
+    }
+}
+
+/// The fixed-design promise is checked in debug builds: a changed `x` under
+/// `set_fixed_design(true)` panics instead of fitting the old design.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "set_fixed_design(true) promises")]
+fn fit_on_fixed_design_panics_in_debug_when_x_changes() {
+    let (mut x, y, n, p, model, ids, opts) = lmm_slope_case();
+    let mut ws = build_workspace(&model, &ids, n, p, &opts);
+    ws.set_fixed_design(true);
+    let _ = fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts);
+    x[p + 1] += 1.0;
+    let _ = fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts);
+}
+
+/// The gradient-search diagnostics: a crossed binomial GLMM with two variance
+/// parameters and a random-slope LMM take the BFGS route and report its
+/// gradient count, its stop and its endpoint decrement, on the loop tier and
+/// on the stable `Diagnostics`; a one-θ GLMM searches with BOBYQA and reports
+/// none of them.
+#[test]
+fn fitview_reports_the_gradient_search() {
+    let (x, y, n, p, model, ids, opts) = crossed_extra_glmm_case();
+    let mut ws = build_workspace(&model, &ids, n, p, &opts);
+    let d = fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts).diagnostics();
+    assert!(d.outer_stop.is_some(), "the crossed GLMM did not route");
+    assert!(d.n_grad > 0, "n_grad {}", d.n_grad);
+    assert!(
+        d.outer_decrement.is_finite(),
+        "decrement {}",
+        d.outer_decrement
+    );
+
+    let (x, y, n, p, model, ids, opts) = lmm_slope_case();
+    let mut ws = build_workspace(&model, &ids, n, p, &opts);
+    let d = fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts).diagnostics();
+    assert!(d.outer_stop.is_some(), "the random-slope LMM did not route");
+    assert!(d.n_grad > 0, "n_grad {}", d.n_grad);
+    assert!(
+        d.outer_decrement.is_finite(),
+        "decrement {}",
+        d.outer_decrement
+    );
+    let pd = fit_cold(&x, &y, n, p, &model, &ids, &opts).diagnostics;
+    assert_eq!(pd.n_grad, d.n_grad as usize);
+    assert_eq!(pd.outer_stop, d.outer_stop);
+    assert_eq!(pd.outer_decrement.to_bits(), d.outer_decrement.to_bits());
+
+    let (x, y, n, p, model, ids, opts) = glmm_binomial_intercept_case();
+    let mut ws = build_workspace(&model, &ids, n, p, &opts);
+    let d = fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts).diagnostics();
+    assert_eq!(d.outer_stop, None, "a one-θ GLMM routed");
+    assert_eq!(d.n_grad, 0);
+    assert!(d.outer_decrement.is_nan());
+    let pd = fit_cold(&x, &y, n, p, &model, &ids, &opts).diagnostics;
+    assert_eq!((pd.n_grad, pd.outer_stop), (0, None));
+    assert!(pd.outer_decrement.is_nan());
+}
+
+// --- loop-tier Satterthwaite ---
+
+/// The bits of what a materialized fit reports, for bitwise comparisons.
+fn fit_bits(f: &crate::Fit) -> Vec<u64> {
+    let vcov = f.vcov.iter().flatten();
+    let varcorr = f.varcorr.iter().flatten();
+    f.beta
+        .iter()
+        .chain(&f.se)
+        .chain(vcov)
+        .chain(&f.tau2)
+        .chain(varcorr)
+        .chain([&f.dispersion, &f.deviance])
+        .map(|v| v.to_bits())
+        .collect()
+}
+
+/// `df_out` equal to `want` bit for bit, NaN matching NaN.
+fn assert_df_bits(got: &[f64], want: &[f64], ctx: &str) {
+    assert_eq!(got.len(), want.len(), "{ctx}: length");
+    for (j, (g, w)) in got.iter().zip(want).enumerate() {
+        assert!(
+            g.to_bits() == w.to_bits() || (g.is_nan() && w.is_nan()),
+            "{ctx}[{j}]: {g} vs {w}"
+        );
+    }
+}
+
+#[test]
+fn loop_satterthwaite_matches_stable_coef_df() {
+    let (x, y, n, p, model, ids, mut opts) = lmm_slope_case();
+    // One target of two, so the NaN off the targets is checked too.
+    opts.se_for = SeFor::Only(vec![1]);
+    // Each case also as an ML draw: the loop tier reads ν from the
+    // workspace's criterion as the stable path does.
+    let ml = |(x, y, n, p, model, ids, opts): (_, _, _, _, _, _, FitOptions)| {
+        let opts = FitOptions {
+            reml: Some(false),
+            ..opts
+        };
+        (x, y, n, p, model, ids, opts)
+    };
+    let slope = (x, y, n, p, model, ids, opts);
+    let cases = [
+        ("slope (dense)", slope.clone()),
+        ("intercept (dense)", lmm_intercept_case()),
+        ("crossed slope (sparse)", crossed_extra_case(vec![1])),
+        ("slope (dense), ML", ml(slope)),
+        ("intercept (dense), ML", ml(lmm_intercept_case())),
+        (
+            "crossed slope (sparse), ML",
+            ml(crossed_extra_case(vec![1])),
+        ),
+    ];
+    for (tag, (x, y, n, p, model, ids, opts)) in cases {
+        let cold = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+        assert!(
+            opts.se_for
+                .columns(p)
+                .iter()
+                .all(|&t| cold.coef_df[t as usize].is_finite()),
+            "{tag}: the stable df is not finite on the targets"
+        );
+        let mut ws = build_workspace(&model, &ids, n, p, &opts);
+        drop(fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts));
+        let mut df = vec![0.0; p];
+        assert_eq!(super::satterthwaite(&mut ws, &mut df), Ok(()), "{tag}");
+        assert_df_bits(&df, &cold.coef_df, tag);
+    }
+
+    // One workspace over draws with two, none, three, none and two free θ: the
+    // pass's buffers, reused across the calls, carry nothing from one to the
+    // next (an all-pinned draw parks every pooled buffer and takes none). Then
+    // the derivative route switches: a design one level of which has a constant
+    // slope disarms the per-group gradient (the value route), and the next
+    // draw arms it again, so the per-axis gradients are handed back and forth.
+    let (x, y, n, p, model, ids, opts) = lmm_slope_case();
+    let y_free = slope_free_response(&x, &y);
+    let y_pinned = all_pinned_response(&x);
+    let mut x_disarmed = x.clone();
+    for i in (0..n).step_by(6) {
+        x_disarmed[i * 2 + 1] = x[1];
+    }
+    let mut ws = build_workspace(&model, &ids, n, p, &opts);
+    let mut df = vec![0.0; p];
+    for (tag, x, y, free, armed) in [
+        ("two free", &x, &y, 2, true),
+        ("none free", &x, &y_pinned, 0, true),
+        ("three free", &x, &y_free, 3, true),
+        ("none free again", &x, &y_pinned, 0, true),
+        ("two free again", &x, &y, 2, true),
+        ("value route", &x_disarmed, &y_free, 2, false),
+        ("gradient route again", &x, &y_free, 3, true),
+    ] {
+        drop(fit_on(&mut ws, &Data::new(x, y, n, p), None, &opts));
+        assert_eq!(n_free(&mut ws), free, "{tag}");
+        let lmm = ws.lmm_parts().expect("an LMM workspace").0;
+        assert_eq!(
+            crate::lmm::per_group_gradient_armed(&lmm.kernel),
+            armed,
+            "{tag}"
+        );
+        assert_eq!(super::satterthwaite(&mut ws, &mut df), Ok(()), "{tag}");
+        let cold = fit_cold(x, y, n, p, &model, &ids, &opts);
+        assert_df_bits(&df, &cold.coef_df, tag);
+    }
+}
+
+#[test]
+fn satterthwaite_and_curvature_hint_commute() {
+    let (x, y, n, p, model, ids, opts) = lmm_slope_case();
+    let fresh = || build_workspace(&model, &ids, n, p, &opts);
+    let (mut ws_a, mut ws_b) = (fresh(), fresh());
+    drop(fit_on(&mut ws_a, &Data::new(&x, &y, n, p), None, &opts));
+    drop(fit_on(&mut ws_b, &Data::new(&x, &y, n, p), None, &opts));
+    let (mut df_a, mut df_b) = (vec![0.0; p], vec![0.0; p]);
+
+    super::satterthwaite(&mut ws_a, &mut df_a).unwrap();
+    let hint_a = super::curvature_hint(&mut ws_a).expect("the per-group route gives a hint");
+    let hint_b = super::curvature_hint(&mut ws_b).expect("the per-group route gives a hint");
+    super::satterthwaite(&mut ws_b, &mut df_b).unwrap();
+
+    assert_df_bits(&df_a, &df_b, "df, either order");
+    let bits = |h: &crate::optim::CurvatureHint| -> Vec<u64> {
+        h.inv_hessian().iter().map(|v| v.to_bits()).collect()
+    };
+    assert_eq!(bits(&hint_a), bits(&hint_b), "hint, either order");
+
+    // The next fit on a workspace the pass ran on is a fresh workspace's.
+    let y2: Vec<f64> = y
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| v + 0.2 * ((i % 7) as f64 - 3.0))
+        .collect();
+    let mut ws_c = fresh();
+    for ws in [&mut ws_a, &mut ws_b] {
+        let after = fit_on(ws, &Data::new(&x, &y2, n, p), None, &opts).into_fit(
+            &Data::new(&x, &y2, n, p),
+            &model,
+            &opts,
+        );
+        let clean = fit_on(&mut ws_c, &Data::new(&x, &y2, n, p), None, &opts).into_fit(
+            &Data::new(&x, &y2, n, p),
+            &model,
+            &opts,
+        );
+        assert_eq!(fit_bits(&after), fit_bits(&clean), "the fit after the pass");
+        ws_c = fresh();
+    }
+}
+
+/// A curvature hint taken on a REML pilot only seeds the BFGS search of an ML
+/// fit (`lmm::lmm_curvature_hint`): the hinted fit is by ML and reaches the
+/// unhinted ML fit's optimum.
+#[test]
+fn a_reml_curvature_hint_seeds_an_ml_fit() {
+    let (x, y, n, p, model, ids, opts) = lmm_slope_case();
+    let y = slope_free_response(&x, &y);
+    let mut pilot = build_workspace(&model, &ids, n, p, &opts);
+    let reml = fit_on(&mut pilot, &Data::new(&x, &y, n, p), None, &opts).into_fit(
+        &Data::new(&x, &y, n, p),
+        &model,
+        &opts,
+    );
+    let hint = super::curvature_hint(&mut pilot).expect("the per-group route gives a hint");
+    let ml = FitOptions {
+        reml: Some(false),
+        ..opts.clone()
+    };
+    let fit_ml = |hint: Option<&crate::optim::CurvatureHint>| {
+        let mut ws = build_workspace(&model, &ids, n, p, &ml);
+        super::fit_on_hinted(&mut ws, &Data::new(&x, &y, n, p), None, hint, &ml).into_fit(
+            &Data::new(&x, &y, n, p),
+            &model,
+            &ml,
+        )
+    };
+    let (hinted, plain) = (fit_ml(Some(&hint)), fit_ml(None));
+    assert!(reml.reml && !hinted.reml && !plain.reml);
+    assert!(hinted.converged() && plain.converged());
+    assert!(
+        hinted.deviance <= plain.deviance + 1e-6,
+        "hinted {} vs unhinted {}",
+        hinted.deviance,
+        plain.deviance
+    );
+    // The criterion moved the optimum: a search that read the hint's criterion
+    // would land on the REML θ̂.
+    assert!(
+        (hinted.loglik - reml.loglik).abs() > 1e-3,
+        "{} {}",
+        hinted.loglik,
+        reml.loglik
+    );
+}
+
+#[test]
+fn satterthwaite_on_non_lmm_workspace_is_no_df() {
+    use crate::inference::contrast::{ContrastError, NoDfReason};
+    for (tag, (x, y, n, p, model, ids, opts)) in [("ols", ols_case()), ("glm", glm_case())] {
+        let mut ws = build_workspace(&model, &ids, n, p, &opts);
+        drop(fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts));
+        let mut df = vec![0.0; p];
+        assert_eq!(
+            super::satterthwaite(&mut ws, &mut df),
+            Err(ContrastError::NoDf(NoDfReason::NotGaussianMixed)),
+            "{tag}"
+        );
+        assert!(df.iter().all(|v| v.is_nan()), "{tag}: {df:?}");
+    }
+}
+
+#[test]
+#[should_panic(expected = "satterthwaite: df_out")]
+fn satterthwaite_df_out_shape_checked() {
+    let (x, y, n, p, model, ids, opts) = lmm_intercept_case();
+    let mut ws = build_workspace(&model, &ids, n, p, &opts);
+    drop(fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts));
+    let _ = super::satterthwaite(&mut ws, &mut vec![0.0; p + 1]);
+}
+
+#[test]
+fn satterthwaite_failed_pass_is_no_df_failed() {
+    use crate::inference::contrast::{ContrastError, NoDfReason};
+    let (x, y, n, p, model, ids, opts) = lmm_slope_case();
+    let mut ws = build_workspace(&model, &ids, n, p, &opts);
+    drop(fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts));
+    // A non-finite stencil point: the pass's centre, θ̂'s first coordinate.
+    ws.lmm_parts().expect("an LMM workspace").0.theta[0] = f64::NAN;
+    let mut df = vec![0.0; p];
+    assert_eq!(
+        super::satterthwaite(&mut ws, &mut df),
+        Err(ContrastError::NoDf(NoDfReason::Failed))
+    );
+    assert!(df.iter().all(|v| v.is_nan()), "{df:?}");
+}
+
+#[test]
+fn satterthwaite_no_endpoint_is_no_df_failed() {
+    use crate::inference::contrast::{ContrastError, NoDfReason};
+    let (x, y, n, p, model, ids, opts) = lmm_slope_case();
+    let fresh = || build_workspace(&model, &ids, n, p, &opts);
+    let mut ws = fresh();
+    let mut df = vec![0.0; p];
+    drop(fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts));
+    assert_eq!(super::satterthwaite(&mut ws, &mut df), Ok(()));
+
+    // One NaN response: `fit_lmm` finds no finite endpoint and NaN-fills β̂.
+    let mut y_nan = y.clone();
+    y_nan[3] = f64::NAN;
+    drop(fit_on(&mut ws, &Data::new(&x, &y_nan, n, p), None, &opts));
+    assert_eq!(
+        super::satterthwaite(&mut ws, &mut df),
+        Err(ContrastError::NoDf(NoDfReason::Failed))
+    );
+    assert!(df.iter().all(|v| v.is_nan()), "{df:?}");
+
+    // The next clean draw carries nothing from the failed one.
+    let y2: Vec<f64> = y
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| v + 0.2 * ((i % 7) as f64 - 3.0))
+        .collect();
+    drop(fit_on(&mut ws, &Data::new(&x, &y2, n, p), None, &opts));
+    super::satterthwaite(&mut ws, &mut df).unwrap();
+    let mut clean = fresh();
+    drop(fit_on(&mut clean, &Data::new(&x, &y2, n, p), None, &opts));
+    let mut df_clean = vec![0.0; p];
+    super::satterthwaite(&mut clean, &mut df_clean).unwrap();
+    assert_df_bits(&df, &df_clean, "the draw after the failed one");
+
+    // `y ~ 0 + (1 | g)` on the dense kernel: at p = 0 `fit_lmm` has no
+    // endpoint, and the dense kernel accumulates no rows.
+    let (_, y0, n0, _, _, ids0, _) = lmm_slope_case();
+    let model0 = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            terms: Vec::new(),
+            slopes: vec![],
+            extra_groupings: vec![],
+        }),
+    };
+    let opts0 = FitOptions {
+        se_for: SeFor::Only(vec![]),
+        ..FitOptions::default()
+    };
+    let mut ws0 = build_workspace(&model0, &ids0, n0, 0, &opts0);
+    assert!(!ws0.is_lmm_sparse());
+    drop(fit_on(&mut ws0, &Data::new(&[], &y0, n0, 0), None, &opts0));
+    assert_eq!(
+        super::satterthwaite(&mut ws0, &mut []),
+        Err(ContrastError::NoDf(NoDfReason::Failed))
+    );
+}
+
+#[test]
+fn satterthwaite_nan_beta_is_no_df_failed() {
+    use crate::inference::contrast::{ContrastError, NoDfReason};
+    let (x, y, n, p, model, ids, opts) = lmm_slope_case();
+    let mut ws = build_workspace(&model, &ids, n, p, &opts);
+    drop(fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts));
+    // The no-endpoint mark on otherwise finite statistics: without the β̂ guard
+    // the pass would run at this θ̂ and return finite df.
+    ws.lmm_parts().expect("an LMM workspace").0.recovery.betas[0] = f64::NAN;
+    let mut df = vec![0.0; p];
+    assert_eq!(
+        super::satterthwaite(&mut ws, &mut df),
+        Err(ContrastError::NoDf(NoDfReason::Failed))
+    );
+    assert!(df.iter().all(|v| v.is_nan()), "{df:?}");
+}
+
+/// Repeated loop-tier Satterthwaite calls cost a fixed allocation count, the
+/// same whichever θ the draw pins while one stays free: after a first `fit_on`
+/// plus `satterthwaite` on each of three draws (two free θ with Λ's slope
+/// column pinned, three, and none), the count over `N_CALLS` further warm
+/// `fit_on` plus `satterthwaite` calls on each is pinned at the measurement
+/// with no slack, as
+/// `fit_on_theta_marshalling_bounded_alloc` pins `fit_on`'s.
+///
+/// Run: `RAYON_NUM_THREADS=1 cargo test -p glmm --features alloc-tests
+/// satterthwaite_repeat_calls_bounded_alloc -- --ignored --test-threads=1`
+/// (`alloc-tests` installs the dhat allocator; `alloc_test_guard` serializes
+/// test bodies, but libtest's own per-test thread spawn still needs
+/// `--test-threads=1`).
+#[cfg(feature = "alloc-tests")]
+#[test]
+#[ignore]
+fn satterthwaite_repeat_calls_bounded_alloc() {
+    let _serial = crate::test_support::alloc_test_guard();
+    const N_CALLS: usize = 100;
+    // Measured 5 blocks (2026-10-11, pawel) per `satterthwaite` call under this
+    // test's own `RAYON_NUM_THREADS=1` + `--test-threads=1` protocol, on the two
+    // draws with a free θ: the pseudo-inverse's blocks (its eigendecomposition's
+    // workspace, eigenvalues and their copy, eigenvectors, the inverse); the
+    // pass's other buffers live on the workspace from the first call. Measured
+    // 0 blocks per call on the all-pinned draw (the pseudo-inverse of an
+    // empty `H_p` allocates nothing). None come from the warm `fit_on` calls.
+    // Pinned at the measurement with no slack: if a count moves, re-measure and
+    // update, do not relax.
+    const PER_CALL: u64 = 5;
+    const PER_CALL_NONE_FREE: u64 = 0;
+
+    let (x, y, n, p, model, ids, opts) = lmm_slope_case();
+    let y_free = slope_free_response(&x, &y);
+    let y_pinned = all_pinned_response(&x);
+    let mut ws = build_workspace(&model, &ids, n, p, &opts);
+    let mut df = vec![0.0; p];
+    let mut pilot = |ws: &mut super::FitWorkspace, y: &[f64], free: usize| {
+        let start = {
+            let v = fit_on(ws, &Data::new(&x, y, n, p), None, &opts);
+            crate::StartValues {
+                beta: v.betas().to_vec(),
+                theta: v.theta().to_vec(),
+                dispersion: None,
+            }
+        };
+        assert_eq!(n_free(ws), free, "free θ");
+        super::satterthwaite(ws, &mut df).unwrap();
+        start
+    };
+    let start = pilot(&mut ws, &y, 2);
+    let start_free = pilot(&mut ws, &y_free, 3);
+    let start_pinned = pilot(&mut ws, &y_pinned, 0);
+    crate::test_support::settle_background_allocs();
+
+    let profiler = dhat::Profiler::builder().testing().build();
+    let mut window = |ws: &mut super::FitWorkspace, y: &[f64], start: &crate::StartValues| {
+        for _ in 0..N_CALLS {
+            drop(fit_on(ws, &Data::new(&x, y, n, p), Some(start), &opts));
+            std::hint::black_box(super::satterthwaite(ws, &mut df)).unwrap();
+        }
+        dhat::HeapStats::get().total_blocks
+    };
+    let two_free = window(&mut ws, &y, &start);
+    let three_free = window(&mut ws, &y_free, &start_free) - two_free;
+    let none_free = window(&mut ws, &y_pinned, &start_pinned) - two_free - three_free;
+    drop(profiler);
+    assert!(df.iter().all(|v| v.is_finite()), "{df:?}");
+    let (bound, bound_none) = (
+        N_CALLS as u64 * PER_CALL,
+        N_CALLS as u64 * PER_CALL_NONE_FREE,
+    );
+    assert_eq!(
+        (two_free, three_free, none_free),
+        (bound, bound, bound_none),
+        "{N_CALLS} fit_on plus satterthwaite calls on each draw allocated these blocks"
+    );
+}
+
+// --- the `reml` option and the frozen criterion ---
+
+/// Every field of two fits equal, each `f64` by its bits.
+pub(in crate::fit) fn assert_fits_bitwise_equal(a: &crate::Fit, b: &crate::Fit, ctx: &str) {
+    let bits = |v: &[f64]| v.iter().map(|t| t.to_bits()).collect::<Vec<_>>();
+    assert_eq!(
+        fit_bits(a),
+        fit_bits(b),
+        "{ctx}: β, SE, vcov, τ², varcorr, φ, deviance"
+    );
+    for (name, u, v) in [
+        ("stddev_se", &a.stddev_se, &b.stddev_se),
+        ("fitted", &a.fitted, &b.fitted),
+        ("ranef", &a.ranef, &b.ranef),
+        ("coef_df", &a.coef_df, &b.coef_df),
+    ] {
+        assert_eq!(bits(u), bits(v), "{ctx}: {name}");
+    }
+    assert_eq!(a.loglik.to_bits(), b.loglik.to_bits(), "{ctx}: loglik");
+    assert_eq!(
+        (a.n_eval, a.df, a.reml, a.nobs, a.objective, &a.ranef_levels),
+        (b.n_eval, b.df, b.reml, b.nobs, b.objective, &b.ranef_levels),
+        "{ctx}: n_eval, df, reml, nobs, objective, ranef_levels"
+    );
+    assert_eq!(
+        format!("{:?}", a.diagnostics),
+        format!("{:?}", b.diagnostics),
+        "{ctx}: diagnostics"
+    );
+    #[cfg(feature = "counters")]
+    assert_eq!(
+        format!("{:?}", a.counters),
+        format!("{:?}", b.counters),
+        "{ctx}: counters"
+    );
+    assert_eq!(
+        a.satterthwaite.is_some(),
+        b.satterthwaite.is_some(),
+        "{ctx}: Satterthwaite state"
+    );
+}
+
+/// `reml` is never read on a GLMM: an AGQ binomial fit under `Some(true)`
+/// (ignored) and under `Some(false)` does not panic and is bitwise the
+/// `None` fit.
+#[test]
+fn reml_on_an_agq_glmm_gives_the_none_fit() {
+    let (x, y, primary, n) = crate::fit::glmm_tests::cbpp_design();
+    let p = 4;
+    let model = crate::fit::glmm_tests::cbpp_model();
+    let ids = GroupIds {
+        primary,
+        extra: vec![],
+    };
+    let mut opts = FitOptions {
+        se_for: SeFor::Only((0..p as u32).collect()),
+        nagq: 5,
+        ..FitOptions::default()
+    };
+    let base = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    assert!(base.converged());
+    for reml in [Some(true), Some(false)] {
+        opts.reml = reml;
+        let fit = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+        assert_fits_bitwise_equal(&fit, &base, &format!("reml = {reml:?}"));
+    }
+}
+
+/// The criterion is frozen at build, as `nagq` is: a Gaussian mixed
+/// workspace built under `Some(false)` refuses a call under `None`.
+#[test]
+#[should_panic(expected = "fit_on: reml is frozen at build")]
+fn fit_on_panics_when_the_criterion_moves_off_its_build() {
+    let (x, y, n, p, model, ids, mut opts) = lmm_intercept_case();
+    opts.reml = Some(false);
+    let mut ws = build_workspace(&model, &ids, n, p, &opts);
+    opts.reml = None;
+    let _ = fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts);
+}
+
+/// On a Gaussian mixed spec `reml` resolves to REML for `None` and
+/// `Some(true)` and to ML for `Some(false)`, and the LMM kernel carries it,
+/// dense and sparse.
+#[test]
+fn reml_resolves_to_the_criterion_the_lmm_kernel_carries() {
+    use crate::lmm::Criterion;
+    let cases = [
+        ("dense", lmm_intercept_case()),
+        ("sparse", crossed_extra_case(vec![1])),
+    ];
+    for (tag, (x, y, n, p, model, ids, mut opts)) in cases {
+        for (reml, want) in [
+            (None, Criterion::Reml),
+            (Some(true), Criterion::Reml),
+            (Some(false), Criterion::Ml),
+        ] {
+            opts.reml = reml;
+            let mut ws = build_workspace(&model, &ids, n, p, &opts);
+            assert_eq!(ws.criterion, Some(want), "{tag}, reml = {reml:?}: build");
+            let _ = fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts);
+            assert_eq!(
+                ws.kernel_criterion(),
+                Some(want),
+                "{tag}, reml = {reml:?}: kernel"
+            );
+        }
+    }
+}
+
+/// What is frozen is the resolved criterion, not the raw option: a workspace
+/// built under `None` takes `Some(true)` and `Some(false)` on a GLM and a GLMM,
+/// and `Some(true)` on a Gaussian mixed model, without the frozen-option panic,
+/// and gives the fit of a call under `None`, bit for bit.
+#[test]
+fn reml_values_resolving_alike_pass_the_frozen_check() {
+    let cases = [
+        ("glm", glm_case(), vec![Some(true), Some(false)]),
+        (
+            "glmm",
+            glmm_binomial_intercept_case(),
+            vec![Some(true), Some(false)],
+        ),
+        ("lmm", lmm_intercept_case(), vec![Some(true)]),
+    ];
+    for (tag, (x, y, n, p, model, ids, opts), calls) in cases {
+        let fit = |call: &FitOptions| {
+            let mut ws = build_workspace(&model, &ids, n, p, &opts);
+            fit_on(&mut ws, &Data::new(&x, &y, n, p), None, call).into_fit(
+                &Data::new(&x, &y, n, p),
+                &model,
+                call,
+            )
+        };
+        let base = fit(&opts);
+        for reml in calls {
+            let call = FitOptions {
+                reml,
+                ..opts.clone()
+            };
+            assert_fits_bitwise_equal(&fit(&call), &base, &format!("{tag}, reml = {reml:?}"));
+        }
+    }
+}
+
+/// On OLS `reml` is read when the `Fit` is assembled, from the `opts` handed to
+/// `into_fit`, and nothing is frozen at build: the solve does not depend on it.
+/// A workspace built under one value and called under another gives the fit of
+/// a workspace built under the called value, bit for bit.
+#[test]
+fn ols_workspace_reads_reml_at_assembly() {
+    let (x, y, n, p, model, ids, opts) = ols_case();
+    let fit = |built: Option<bool>, called: Option<bool>| {
+        let mut ws = build_workspace(
+            &model,
+            &ids,
+            n,
+            p,
+            &FitOptions {
+                reml: built,
+                ..opts.clone()
+            },
+        );
+        let call = FitOptions {
+            reml: called,
+            ..opts.clone()
+        };
+        fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &call).into_fit(
+            &Data::new(&x, &y, n, p),
+            &model,
+            &call,
+        )
+    };
+    for (built, called) in [
+        (None, Some(true)),
+        (Some(true), None),
+        (Some(false), Some(true)),
+    ] {
+        let got = fit(built, called);
+        assert_eq!(
+            got.reml,
+            called == Some(true),
+            "built {built:?}, called {called:?}"
+        );
+        assert_fits_bitwise_equal(
+            &got,
+            &fit(called, called),
+            &format!("built {built:?}, called {called:?}"),
+        );
+    }
+}
+
+/// A random slope read from a random-effect-only column (`Data::re_columns`)
+/// fits exactly the model whose slope reads the same values from a column of
+/// `X`. The slope variable `x` is ±1, so its root mean square is exactly 1
+/// with or without weights, and on a prestandardized workspace both specs fit
+/// the same numbers: every output is bit-equal. One shape per slope reader:
+/// the dense LMM accumulator and its response-only rebuild (unweighted and
+/// weighted), the sparse LMM on a crossed extra slope, the GLMM blocked layout
+/// with Rx SEs, the vector AGQ, and the packed layout with Hessian SEs.
+#[test]
+fn re_column_copy_matches_the_fixed_column_slope() {
+    let (g1, g2, n, p) = (8usize, 5usize, 120usize, 3usize);
+    let mut st = 4242u64;
+    let mut x = vec![0.0f64; n * p];
+    let mut xs = vec![0.0f64; n];
+    let (mut pid, mut eid) = (vec![0u32; n], vec![0u32; n]);
+    let u: Vec<f64> = (0..g1).map(|_| 0.5 * lcg(&mut st)).collect();
+    let b: Vec<f64> = (0..g1.max(g2)).map(|_| 0.4 * lcg(&mut st)).collect();
+    let mut eta = vec![0.0f64; n];
+    for i in 0..n {
+        let (c1, c2) = (i % g1, (i / 3) % g2);
+        pid[i] = c1 as u32;
+        eid[i] = c2 as u32;
+        let s = if lcg(&mut st) > 0.0 { 1.0 } else { -1.0 };
+        let w2 = lcg(&mut st);
+        x[i * p..(i + 1) * p].copy_from_slice(&[1.0, s, w2]);
+        xs[i] = s;
+        eta[i] = 0.2 + 0.5 * s - 0.3 * w2 + u[c1] + (b[c1] + b[c2]) * s;
+    }
+    let noise: Vec<f64> = (0..n).map(|_| lcg(&mut st)).collect();
+    let gaussian: Vec<f64> = (0..n).map(|i| eta[i] + 0.3 * noise[i]).collect();
+    let gaussian2: Vec<f64> = (0..n).map(|i| eta[i] - 0.2 * noise[i]).collect();
+    let binary: Vec<f64> = (0..n)
+        .map(|i| f64::from(u8::from(eta[i] + 1.5 * noise[i] > 0.0)))
+        .collect();
+    let counts: Vec<f64> = (0..n)
+        .map(|i| (eta[i].exp() * (1.0 + 0.6 * noise[i])).round())
+        .collect();
+    let w: Vec<f64> = (0..n).map(|i| 0.5 + (i % 3) as f64 * 0.5).collect();
+    let primary = GroupIds::new(pid.clone());
+    let crossed = GroupIds::new(pid).extra(eid);
+    // The slope on the primary grouping, or on a crossed extra grouping.
+    let spec = |family: Family, slope: u32, on_extra: bool| ModelSpec {
+        family,
+        re: Some(ReStructure {
+            terms: Vec::new(),
+            slopes: if on_extra { vec![] } else { vec![slope] },
+            extra_groupings: if on_extra {
+                vec![Grouping {
+                    terms: Vec::new(),
+                    relation: GroupingRelation::Crossed,
+                    slopes: vec![slope],
+                }]
+            } else {
+                vec![]
+            },
+        }),
+    };
+    let binomial = Family::Binomial {
+        link: BinomialLink::Logit,
+    };
+    let poisson = Family::Poisson {
+        link: crate::PoissonLink::Log,
+    };
+    let rx = FitOptions {
+        wald_se: crate::WaldSe::Rx,
+        ..FitOptions::default()
+    };
+    let agq = FitOptions {
+        nagq: 5,
+        ..FitOptions::default()
+    };
+    let default = FitOptions::default();
+    // (name, family, slope on the extra grouping, ids, responses, weights, options)
+    let (ga, gb, bin, cnt) = (
+        gaussian.as_slice(),
+        gaussian2.as_slice(),
+        binary.as_slice(),
+        counts.as_slice(),
+    );
+    let shapes = [
+        (
+            "lmm, response rebuild",
+            Family::Gaussian,
+            false,
+            &primary,
+            vec![ga, gb],
+            None,
+            &default,
+        ),
+        (
+            "lmm, weighted response rebuild",
+            Family::Gaussian,
+            false,
+            &primary,
+            vec![ga, gb],
+            Some(w.as_slice()),
+            &default,
+        ),
+        (
+            "lmm, crossed extra slope",
+            Family::Gaussian,
+            true,
+            &crossed,
+            vec![ga],
+            None,
+            &default,
+        ),
+        (
+            "binomial, blocked Rx",
+            binomial,
+            false,
+            &primary,
+            vec![bin],
+            None,
+            &rx,
+        ),
+        (
+            "binomial, nagq 5",
+            binomial,
+            false,
+            &primary,
+            vec![bin],
+            None,
+            &agq,
+        ),
+        (
+            "poisson, crossed extra slope, Hessian",
+            poisson,
+            true,
+            &crossed,
+            vec![cnt],
+            None,
+            &default,
+        ),
+    ];
+    let mut ran = 0;
+    for (name, family, on_extra, ids, ys, weights, opts) in shapes {
+        let fits = |slope: u32, z: Option<&[f64]>| {
+            let model = spec(family, slope, on_extra);
+            let mut ws = build_workspace(&model, ids, n, p, opts);
+            ws.set_prestandardized(true);
+            ws.set_fixed_design(true);
+            // The crossed extra slope takes the sparse LMM and the packed
+            // GLMM layout; a primary slope the dense LMM and the blocked one.
+            let layout = ws.glmm_parts().map(|(g, _)| g.layout);
+            let want = if on_extra {
+                crate::glmm::GlmmLayout::Packed
+            } else {
+                crate::glmm::GlmmLayout::Blocked
+            };
+            assert!(
+                layout.map_or(ws.is_lmm_sparse() == on_extra, |l| l == want),
+                "{name}: route"
+            );
+            ys.iter()
+                .map(|y| {
+                    let mut data = Data::new(&x, y, n, p);
+                    if let Some(z) = z {
+                        data = data.re_columns(z, 1);
+                    }
+                    if let Some(w) = weights {
+                        data = data.weights(w);
+                    }
+                    fit_on(&mut ws, &data, None, opts).into_fit(&data, &model, opts)
+                })
+                .collect::<Vec<_>>()
+        };
+        let from_x = fits(1, None);
+        let from_z = fits(p as u32, Some(&xs));
+        for (k, (a, b)) in from_x.iter().zip(&from_z).enumerate() {
+            assert!(a.deviance.is_finite(), "{name}, y {k}: no endpoint");
+            assert_fits_bitwise_equal(a, b, &format!("{name}, y {k}"));
+        }
+        ran += 1;
+    }
+    assert_eq!(ran, 6);
+}
+
+/// An aliased fixed column next to a random slope on a random-effect-only
+/// column: the rank-deficiency salvage drops the column and keeps the slope,
+/// so the fit is the fit of the design without the aliased column.
+#[test]
+fn aliased_column_next_to_a_re_only_slope() {
+    let (g, n) = (6usize, 60usize);
+    let mut st = 77u64;
+    let u: Vec<f64> = (0..g).map(|_| 0.5 * lcg(&mut st)).collect();
+    let b: Vec<f64> = (0..g).map(|_| 0.3 * lcg(&mut st)).collect();
+    let (mut x3, mut x2, mut z, mut y, mut ids) = (vec![], vec![], vec![], vec![], vec![]);
+    for i in 0..n {
+        let c = i % g;
+        let (x1, zi) = (lcg(&mut st), lcg(&mut st));
+        x3.extend_from_slice(&[1.0, x1, 2.0 * x1]);
+        x2.extend_from_slice(&[1.0, x1]);
+        z.push(zi);
+        y.push(0.4 + 0.6 * x1 + u[c] + b[c] * zi + 0.2 * lcg(&mut st));
+        ids.push(c as u32);
+    }
+    let ids = GroupIds::new(ids);
+    let model = |slope: u32| ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            terms: Vec::new(),
+            slopes: vec![slope],
+            extra_groupings: vec![],
+        }),
+    };
+    let opts = FitOptions::default();
+    let full = Data::new(&x3, &y, n, 3).ids(&ids).re_columns(&z, 1);
+    let reduced = Data::new(&x2, &y, n, 2).ids(&ids).re_columns(&z, 1);
+    let a = crate::fit(&full, &model(3), &opts).expect("the full design fits");
+    let b = crate::fit(&reduced, &model(2), &opts).expect("the reduced design fits");
+    assert!(a.converged() && b.converged());
+    assert_eq!(a.diagnostics.aliased, vec![false, false, true]);
+    assert!(a.beta[2].is_nan());
+    let bits = |v: &[f64]| v.iter().map(|t| t.to_bits()).collect::<Vec<_>>();
+    assert_eq!(bits(&a.beta[..2]), bits(&b.beta), "β");
+    assert_eq!(a.deviance.to_bits(), b.deviance.to_bits(), "deviance");
+    assert_eq!(
+        bits(&a.varcorr.concat()),
+        bits(&b.varcorr.concat()),
+        "varcorr"
+    );
+}

@@ -1,0 +1,146 @@
+# Troubleshooting
+
+See [`warnings.md`](warnings.md) for every warning and error a fit can raise
+and what to do about it.
+
+## The fit is singular (isSingular is TRUE)
+
+`singular` means a random-effect variance component landed at, or negligibly
+close to, the boundary (zero) — the same condition lme4 flags with
+`isSingular()`. See
+[`conventions.md#flags-on-the-result`](conventions.md#flags-on-the-result)
+for exactly how it's computed. It is not an error: the fit is a valid point
+estimate, just one where the data can't support the random-effect structure
+you asked for. Simplify the RE structure — drop a random slope, drop a
+grouping factor — and refit.
+
+## Warning: Nearly collinear columns
+
+Two or more fixed-effect columns are near-collinear but not exactly
+redundant — the design is computable and the fit is real. The estimates are
+honest and the standard errors are large, because the data genuinely cannot
+separate the entangled columns. This is not a failure: `converged` stays
+`true`, and no column is dropped (contrast an *aliased* column, which is
+exactly redundant and is dropped, with `beta`/`se` reported as `NaN`).
+
+The warning names one column — the one the pivot search happened to reach —
+but its entangled partners are **not** named; the search finds the
+worst-conditioned column, not the full set it is confounded with. To fix it,
+drop or combine the predictors that are actually measuring the same thing.
+The check runs on the design glmm fits internally, whose columns are already
+centered and scaled, so rescaling or centering a column on its own does not
+change it; centering a variable before it enters an interaction or polynomial
+term changes those columns and can. See
+[`conventions.md#flags-on-the-result`](conventions.md#flags-on-the-result) for
+where this sits in the `diagnostics` channel.
+
+## Warning: Simpler standard errors used
+
+`wald_se="hessian"` (Python) / `wald.se = "hessian"` (R) was requested, but
+the joint Hessian this GLMM's SE pass builds was not usable. Either it was
+not positive definite, or the fit took the finite-difference Hessian (the
+fallback of the exact pass) and a perturbed deviance evaluation it needed was
+non-finite. The fit falls back to the RX/Schur
+standard errors instead: `se`/`vcov` are still filled (from the fallback),
+but `stddev_se` (the standard errors of the random-effect standard
+deviations) stays `NaN`, since only the joint-Hessian route can fill it. This
+never fires under `wald_se="rx"`, which never attempts the joint Hessian in
+the first place. If you need `stddev_se`, try simplifying the random-effect
+structure or switching to `wald_se="rx"` to avoid the failed attempt
+entirely.
+
+## converged is false
+
+`converged` reports whether the optimizer reached its convergence criterion.
+What `false` means for the rest of the result depends on how the fit ended:
+see [`conventions.md#flags-on-the-result`](conventions.md#flags-on-the-result)
+for the exact per-field fallback, and `warnings.md` for the severe warning
+that always comes with it (exactly one is raised on every non-converged fit):
+
+- **A budget stop on an LMM or GLMM** (`search_limit`): the search used its
+  evaluation budget before settling. Coefficients, standard errors, the
+  covariance matrix, dispersion, `tau2` and `varcorr` are all reported at the
+  best point the search found. `stddev_se`, `fitted` and the random-effect
+  modes stay empty; a GLMM's `df` is 0 (an LMM's is its usual value, since the
+  budget stop does not change how many parameters it counted). Nothing checks
+  how close that point is to the optimum.
+- **A failed fit** (`fit_failed`, `glm_diverged`, `design_unsolvable`,
+  `constant_response`, `too_few_rows`, `no_coefficients`): the fit stopped on
+  a degenerate configuration and reports no estimates: every relevant field
+  is NaN or empty.
+
+First thing to check: whether the model is too rich for the data, with too
+many random-effect parameters for the number of clusters or groups you have.
+The units of the predictors do not matter: glmm centers and scales the design
+internally before it fits, so rescaling a predictor does not change the
+search. Nearly collinear predictors still do. There is no multistart or retry knob to
+reach for here. `fit` starts from one point. On some models it reruns the
+search by itself, with another search method or (a Gamma GLMM with the
+inverse link) on another scale, and it reports honestly if the fit still did
+not converge.
+
+A GLM whose design columns are nearly collinear (to about 1 part in 1e15 once
+the fit's weights are applied) can stop with `glm_diverged` as if the data
+were separated, even though they have a finite maximum; at that point f64
+cannot determine β.
+
+## A converged fit ends a few units above its optimum
+
+A Poisson GLMM fitted with adaptive quadrature (`nagq > 1`) whose fitted means
+span about 14 powers of ten has a deviance near 1e12. At that size the
+deviance is known only to about 0.1 unit. Such a fit can report `converged`
+and still end up to about 10 units above its optimum, a relative error of a
+few times 1e-12. A difference of deviances between two such fits, as in a
+likelihood-ratio test, carries the same error.
+
+## NotImplementedError: family/link/knob
+
+One combination has an approved design but no kernel support yet, and
+raises a clean `NotImplementedError` rather than silently falling back to
+something close: quasi-likelihood `dispersion=` on binomial/Poisson.
+
+`family="inversegaussian"` (fixed-effect GLM only — mixed models fault with a
+message naming the deferral) and `link="cloglog"` (GLM and GLMM) are both
+implemented.
+
+If you hit this gap, there's nothing to configure around
+it — wait for the knob to land, or restructure the model to avoid it
+(e.g. drop the `dispersion=` request).
+
+## Warning: falling back to Laplace
+
+`nagq`/`nAGQ` only takes effect on one shape: a binomial, Poisson,
+negative-binomial or Gamma GLMM with a single grouping factor and up to 3
+random effects per group, with an odd node count up to 25. Any other mixed
+shape — multiple grouping factors, more REs per group — warns and
+silently falls back to Laplace (`nAGQ = 1`) instead of honoring the
+requested node count. On a Gaussian model or a model without random effects
+there is nothing to approximate, so `nagq` above 1 raises an
+`argument_ignored` note instead.
+
+lme4 errors on these shapes rather than falling back, so a script that
+worked in lme4 with an ineligible `nAGQ` won't fail the same way here — it
+will fit, but on Laplace, and the answer will differ slightly from what an
+actual adaptive-quadrature run would give. Watch for the warning; if you see
+it, either narrow the model to the eligible shape or treat the result as a
+Laplace fit.
+
+## My formula is rejected
+
+The formula parser accepts bare column names, `- 1`/`0 +`, a small whitelist
+of transforms (`log(x)`, `sqrt(x)`, `exp(x)`, `I(x^2)`), `offset()`, and
+`cbind(s, f)` on the response — but not R's general function-call syntax:
+`poly(x, 2)`, nested calls, arithmetic inside a call, `.`, and `contrasts=`
+are all clear parse-time errors, never a silent reinterpretation. See
+[`formula.md#not-accepted-and-the-workaround`](formula.md#not-accepted-and-the-workaround)
+for the full list and the workaround for each.
+
+## coef() errors
+
+These aren't missing by oversight — the ports error, naming the reason, on
+anything the kernel can't compute honestly rather than returning a
+fixed-effects-only or otherwise silently different answer. `ranef()`,
+`fitted()`, `residuals()` and `logLik()`/`AIC()`/`BIC()` are implemented and
+not part of this list. See
+[`coming-from-lme4.md#what-is-deliberately-missing`](coming-from-lme4.md#what-is-deliberately-missing)
+for what's blocked and why.

@@ -1,0 +1,120 @@
+//! `glmm` — standalone f64 GLMM fit kernels (OLS → GLM → LMM → GLMM).
+//!
+//! The full dispatch — every route from [`fit`]/[`fit_with_start`] down to its
+//! solver — is traced in `documentation/algorithms.md`.
+//!
+//! Two public surfaces:
+//! - [`fit`]/[`fit_with_start`] + [`Data`] + [`ModelSpec`] + [`GroupIds`]: the
+//!   stable, semver-covered friendly API.
+//! - `loop_advanced` (cargo feature, off by default): the unstable scratch-explicit
+//!   hot-path surface (loop tier) that warm-start consumers like MCPower bind to,
+//!   exposing the kernels and [`StartValues`]. NO semver guarantees.
+//! - [`formula`] (cargo feature, on by default): the R-style formula frontend —
+//!   `formula::fit("y ~ x + (1|g)", &table, family, &opts)` fits a formula
+//!   string against a data table, and `formula::lower` builds the kernel's
+//!   inputs from them instead of by hand. Outside the semver promise until the
+//!   1.0.0 surface review.
+//! - [`inference`]: the hypothesis tests on fitted models. Like
+//!   `loop_advanced`, outside the semver promise until the 1.0 surface review.
+//!
+//! - `orchestrate` (cargo feature, off by default): the string-typed fit
+//!   orchestration the FFI ports (`glmm-python`, `glmm-r`) share — like
+//!   `loop_advanced`, NO semver guarantees.
+//!
+//! `parallel` (cargo feature, off by default, **experimental**): enables in-fit
+//! parallelism (AGQ cluster loop, FD-Hessian grid) via rayon's global pool; a
+//! no-op on wasm32; gated at runtime by `FitOptions::parallel_inner` (also off
+//! by default — both the feature and the knob are explicit opt-ins).
+//!
+//! - `counters` (cargo feature, off by default, dev-only): adds
+//!   `glmm::EvalCounters` on `Fit` — stage-1/stage-2 evaluation split, evaluations
+//!   after the last incumbent improvement, a PIRLS-iterations-per-evaluation
+//!   histogram, and AGQ evaluations x nodes.
+//! - `alloc-tests` (cargo feature, off by default, dev-only): installs dhat as
+//!   the test binary's global allocator for the bounded-allocation tests.
+//! - `oracle-tests` (cargo feature, off by default, dev-only): the cross-engine
+//!   tier that checks the crate against the frozen lme4 / MixedModels /
+//!   GLMMadaptive goldens.
+//! - `montecarlo-tests` (cargo feature, off by default, dev-only): the Monte
+//!   Carlo tier, level studies checked against seeded bands.
+
+// Every fit route (OLS, GLM, LMM, GLMM) is wired into the stable `fit` module
+// regardless of this feature — see `documentation/algorithms.md` for the full
+// dispatch. What goes dead with the feature OFF is mainly the narrower
+// `loop_advanced` surface: the `FitView` hot-loop accessors and the
+// gradient/Hessian kernels in `src/glmm/derivative.rs`,
+// plus a few other loop-only helpers scattered through `src/lmm/mod.rs`,
+// `src/glmm/assembled.rs`, and `src/ols.rs`. So suppress dead_code only in
+// that build. The `loop_advanced` build uses all of it, so genuinely dead
+// code is still caught there (it's the superset).
+#![cfg_attr(not(feature = "loop_advanced"), allow(dead_code))]
+// Every public statistical item must state its convention and cite its oracle.
+#![warn(missing_docs)]
+
+pub mod consts;
+pub mod dual;
+pub mod inference;
+pub mod linalg;
+pub mod scalar;
+pub mod simd_transcendental;
+
+// R-style formula frontend (`formula` feature, on by default). Off for the
+// formula-free hot path, which then links no `regex`. Module docs live in
+// src/formula/mod.rs — keep them there: a `///` fragment here would resolve the
+// module's intra-doc links in the crate root's scope, breaking them.
+#[cfg(feature = "formula")]
+pub mod formula;
+
+mod counters;
+mod data;
+mod family;
+mod fit;
+mod glm;
+mod glmm;
+mod ids;
+mod lmm;
+mod ols;
+mod optim;
+mod predict;
+mod simulate;
+mod sparse;
+mod spec;
+mod standardize;
+mod start;
+#[cfg(feature = "counters")]
+pub use counters::{EvalCounters, Stage};
+pub use data::{Data, Design};
+pub use fit::{
+    fit, fit_with_start, Boundary, Diagnostics, Fit, FitError, FitOptions, Note, OuterStop, SeFor,
+};
+pub use ids::GroupIds;
+pub use inference::{Icc, R2};
+/// The blind θ start. Re-exported because a caller that must supply
+/// [`StartValues`] (β and θ are bundled) cannot reach the `None`-θ blind path,
+/// and so has to reproduce that start explicitly.
+pub use lmm::THETA0;
+pub use predict::{predict, PredictOptions, Prediction, Scale};
+pub use simulate::Simulator;
+pub use spec::*;
+
+#[cfg(feature = "loop_advanced")]
+pub mod loop_advanced;
+
+// String-typed fit orchestration shared by the FFI ports (`orchestrate`
+// feature, off by default). Like `loop_advanced`: real surface, no semver
+// promise — its shape follows the ports' needs.
+#[cfg(feature = "orchestrate")]
+pub mod orchestrate;
+
+pub use start::StartValues;
+
+#[cfg(test)]
+mod test_support;
+
+// dhat alloc-profiling for the `#[ignore]` warm-path bounded-alloc tests.
+// Gated behind the `alloc-tests` feature (not plain cfg(test)): dhat's
+// allocator takes a global lock on every allocation, which serializes the
+// otherwise-parallel test suite. The library never ships a custom allocator.
+#[cfg(all(test, feature = "alloc-tests"))]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
