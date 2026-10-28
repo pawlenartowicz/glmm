@@ -72,6 +72,16 @@ read_run <- function(dir) {
   list(dir = dir, meta = meta, recs = read_jsonl(file.path(dir, "results.jsonl")))
 }
 
+# run_meta.json's `date` is run.sh's `date -Iseconds`: local time plus its UTC
+# offset, so the strings of a laptop run and a CI run sort by wall clock, not by
+# instant. Every "newest run" order goes through this. R's %z wants "+0100", not
+# "+01:00".
+run_time <- function(date) {
+  t <- as.POSIXct(sub(":(\\d\\d)$", "\\1", date), format = "%Y-%m-%dT%H:%M:%S%z", tz = "UTC")
+  if (anyNA(t)) stop(sprintf("unparseable run date: %s", date[is.na(t)][1]), call. = FALSE)
+  as.numeric(t)
+}
+
 # `required_cells` is every manifest cell whose `oracles` list names this engine.
 # A run qualifies only if its results.jsonl holds a record for all of them, of
 # ANY status: run_meta.json's `subset` records what the invocation was ASKED to
@@ -96,7 +106,7 @@ newest_oracle_run <- function(grid_dir, oracle, want_version, required_cells) {
     ok[[length(ok) + 1L]] <- list(dir = d, date = m$date, version = m$engine_version)
   }
   if (!length(ok)) return(NULL)
-  ok <- ok[order(vapply(ok, `[[`, "", "date"), decreasing = TRUE)]
+  ok <- ok[order(run_time(vapply(ok, `[[`, "", "date")), decreasing = TRUE)]
   for (cand in ok) {
     run <- read_run(cand$dir)
     missing <- setdiff(required_cells, names(run$recs))
@@ -206,7 +216,7 @@ newest_glmm_run <- function(grid_dir, engine = "glmm", override = NULL) {
   dirs <- dirs[keep]; metas <- metas[keep]
   if (!length(dirs)) return(NULL)
   full <- vapply(metas, function(m) identical(m$subset, "full"), TRUE)
-  dates <- vapply(metas, `[[`, "", "date")
+  dates <- run_time(vapply(metas, `[[`, "", "date"))
   # order(): full runs first, then newest date first within each group.
   ord <- order(!full, dates, decreasing = c(FALSE, TRUE), method = "radix")
   if (!any(full)) {

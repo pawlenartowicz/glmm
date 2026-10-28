@@ -71,7 +71,7 @@ merged_timed_runs <- function(grid_dir, dir_name, pipeline = FALSE) {
     ok[[length(ok) + 1L]] <- list(dir = d, date = m$date)
   }
   if (!length(ok)) return(NULL)
-  ok <- ok[order(vapply(ok, `[[`, "", "date"), decreasing = TRUE)]
+  ok <- ok[order(run_time(vapply(ok, `[[`, "", "date")), decreasing = TRUE)]
   recs <- list()
   metas <- list()
   for (o in ok) {
