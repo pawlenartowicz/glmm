@@ -17,7 +17,8 @@ which also serves Rust and R.
   a closed form, and GLMs use IRLS. Mixed models use BFGS where glmm has a cheap
   exact gradient, and BOBYQA, which needs no gradient, elsewhere.
 - **Fast.** glmm is faster than these four packages on every model in the speed
-  tests, and it uses little memory.
+  tests, and it uses little memory. Part of the time saved goes to extra checks
+  during a fit, which catch hard models where a search would stop too early.
 
 More in the [project README](https://github.com/pawlenartowicz/glmm#readme).
 

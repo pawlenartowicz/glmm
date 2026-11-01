@@ -37,6 +37,9 @@ use crate::standardize::ColumnScaling;
 
 mod kernel;
 pub(crate) mod pg_grad;
+pub(crate) mod profile;
+#[cfg(test)]
+pub(crate) mod profile_tests;
 pub(crate) mod re_map;
 pub(crate) mod satterthwaite;
 #[cfg(test)]
@@ -145,6 +148,61 @@ pub const THETA_TRUTH_FLOOR: f64 = 0.01;
 /// badly scaled design can be flagged differently from lme4's `isSingular`,
 /// which applies the same 1e-4 to user-scale θ.
 pub const PIN_THETA: f64 = 1e-4;
+
+/// How far above the search's best objective a pinned fit may land and keep
+/// its pin, in deviance units (`fit_glmm`'s incumbent check). Measured
+/// 2026-10-04: on the 67 pinned GLMM cells of the accuracy grid and on 614
+/// simulated pinned fits (Poisson and binomial; crossed, nested and
+/// random-slope shapes) a pin costs at most 5.2e-8, while a pin that zeroes a
+/// real variance under very precise data costs 1.9 to 48 units. 1e-6 sits
+/// between the two, and below the 4e-5 at which the accuracy grid counts a
+/// deviance as worse than a reference (`validation/grid/tol.R`, `dev_eps`).
+/// After a trough polish the incumbent is the polish's best, so the same
+/// slack judges the re-pin of a polished endpoint.
+pub(crate) const PIN_DEVIANCE_SLACK: f64 = 1e-6;
+
+/// How far below the search's best objective the pinned point must land to
+/// run `fit_glmm`'s trough polish, in deviance units. Measured 2026-10-05 on
+/// 614 simulated pinned Laplace fits (Poisson e² to e¹⁶, binomial up to 1e5
+/// trials; crossed, nested and random-slope shapes): the polish ran on 190
+/// and lowered 184 of them by more than 1e-6, among them 148 of the 167 fits
+/// a polish without this threshold lowers by more than 1e-3; on 240 7-node
+/// AGQ random-slope fits it ran on 71 and lowered 65. On the pinned cells of
+/// the accuracy grid the pin lowers the objective by at most 1.0e-8, so none
+/// of them is polished on the drop. The drop is not the only trigger: the
+/// probe of the pinned corner (`PIN_PROBE_STEP`) sends an endpoint the drop
+/// misses, one that stopped at the trough's bottom, into the same polish,
+/// its predicted gain judged against this threshold. A fit is polished at
+/// most once; the polish's endpoint is pinned again and judged by the
+/// incumbent check, and the fit stops there.
+pub(crate) const PIN_POLISH_DROP: f64 = 1e-7;
+
+/// Step of the stationarity probe at the pinned corner (`fit_glmm`, before
+/// the trough polish), in the search's θ̃ units. The gain the probe predicts
+/// along a free θ coordinate is judged against `PIN_POLISH_DROP`, like the
+/// pin's drop, so the step must resolve gains of that size: the parabola's
+/// error in the gain grows as the fourth power of the step, and at
+/// `GLMM_RHO_POLISH` (0.03) it read 1e-6 on an endpoint the gradient search
+/// had certified, sending it into a polish that found nothing (2026-10-08);
+/// at 1e-3 it is about 1e-11, with the round-off of the two probes (1e-9 on
+/// a deviance of 200) far below `PIN_POLISH_DROP` as well. A starved
+/// endpoint is found by extrapolation, not by the step's reach: on the fit
+/// named above the parabola predicts a gain of about 1 from a point 0.24
+/// off. Well above `GLMM_RHO_END` (3e-6), the resolution of the search's
+/// endpoint. The probe's curvature along each coordinate also scales the
+/// polish's θ, so the probe runs at every kept pin of the search's endpoint,
+/// also when the drop alone sends it into the polish.
+pub(crate) const PIN_PROBE_STEP: f64 = 1e-3;
+
+/// Floor under `PIN_DEVIANCE_SLACK` and `PIN_POLISH_DROP`, in ULPs of the
+/// incumbent (the search's best objective, or after a trough polish the
+/// polish's best). Both thresholds are absolute, but the two
+/// objectives they compare each carry a rounding error that grows with |D|.
+/// The floor takes over past |D| ≈ 7e6 for the drop and 7e7 for the slack, so
+/// the pin check and the trough polish do not act on that noise. Below those
+/// both thresholds keep their measured values.
+pub(crate) const PIN_NOISE_ULPS: f64 = 64.0;
+
 /// Ill-conditioning DETECTION floor for the LMM and GLMM routes, on the
 /// scale-invariant per-column pivot ratio ([`crate::ols::min_pivot_ratio`]) of
 /// X'V⁻¹X at θ̂ on the LMM, and of the β information its SE arm factors on the
@@ -304,7 +362,7 @@ pub struct LmmGroupings {
     /// `[0, 2, extras…]`; off-diagonal vech entries excluded, and so is a
     /// diagonal in `structural_theta` (a hidden column 0). Computed once per
     /// workspace by `compute_diagonal_theta` (the vech-diagonal walk lives there,
-    /// single-sourced) so the per-fit pin loop borrows instead of reallocating.
+    /// single-sourced) so the per-fit pin pass borrows instead of reallocating.
     pub diagonal_theta: Vec<usize>,
     /// Parallel to `diagonal_theta`: for diagonal `k` at column `d` of a
     /// `q`-wide vech block, `q − d` — the diagonal's own vech run, diagonal
@@ -612,7 +670,7 @@ impl LmmGroupings {
         !self.extra_offsets.is_empty() && self.primary_q + self.nested_per_parent <= MAX_PRIMARY_Q
     }
     /// Borrow of the cached diagonal θ-index map (computed once per workspace by
-    /// `compute_diagonal_theta`). Zero-alloc: the per-fit pin loop and the
+    /// `compute_diagonal_theta`). Zero-alloc: the per-fit pin pass and the
     /// rho-schedule fold read this slice without reallocating. See the
     /// `diagonal_theta` field doc for the column-major vech layout.
     pub fn diagonal_theta(&self) -> &[usize] {
@@ -1339,19 +1397,28 @@ pub fn primary_lambda<T: Scalar>(theta: &[T], q: usize, lam: &mut [T]) {
     }
 }
 
-/// Rewrite every pinned RE block's Λ into the canonical Σ-preserving form and
-/// report whether any θ entry moved. Run AFTER a pin loop has snapped diagonals
-/// to exactly 0, and re-run the pin test on the result.
+/// Rewrite every pinned RE block's Λ into its canonical lower factor under
+/// `floor` and report whether any θ entry moved. Run AFTER a pin has snapped
+/// diagonals to exactly 0.
 ///
 /// At a pinned diagonal `Λ_jj = 0` the entries BELOW it in column `j` are not
 /// identified by Σ: rotating that column leaves `Σ = ΛΛ′` unchanged, and with
-/// it the REML and Laplace deviances, β̂, `varcorr` and `ranef` — so BOBYQA can
+/// it the REML and Laplace deviances, β̂, `varcorr` and `ranef`, so BOBYQA can
 /// stop anywhere on that flat circle. Re-factoring Σ with a
 /// semidefinite-tolerant lower Cholesky picks the one representative whose
 /// redundant column is exactly zero: the mass below a pinned diagonal folds
 /// into the trailing diagonals, where it is a variance component the caller
-/// can read. Σ is preserved by construction, so under those objectives this
-/// changes the coordinate, not the fit.
+/// can read.
+///
+/// Under [`PivotFloor::Trace`] Σ is preserved by construction, so under those
+/// objectives this changes the coordinate, not the fit; but a trailing
+/// diagonal the fold leaves small can sit at or below `PIN_THETA` above a
+/// live entry. Under [`PivotFloor::Pin`], the floor of [`pin_endpoint`], the
+/// pin runs inside the factorization: a pivot whose square root is at or
+/// below `PIN_THETA` is skipped like one under the trace floor, so its whole
+/// column is exactly 0 and its mass stays in the trailing Schur complement.
+/// Σ then loses that pivot (at most `PIN_THETA²`) and the column's
+/// conditional covariances with the later components.
 ///
 /// The vector AGQ deviance is NOT a function of Σ alone: its product
 /// Gauss–Hermite grid sits in the `u = Λ⁻¹b` coordinates, so the same Σ under
@@ -1369,7 +1436,11 @@ pub fn primary_lambda<T: Scalar>(theta: &[T], q: usize, lam: &mut [T]) {
 /// this factorization (`S·chol(Σ)` is lower triangular with the same zero
 /// pattern and squares to `SΣS`), so a column's scale does not change what is
 /// folded.
-pub(crate) fn canonicalize_pinned_blocks(g: &LmmGroupings, theta: &mut [f64]) -> bool {
+pub(crate) fn canonicalize_pinned_blocks(
+    g: &LmmGroupings,
+    theta: &mut [f64],
+    floor: PivotFloor,
+) -> bool {
     let mut changed = false;
     let mut start = 0usize;
     // Same factor walk as `compute_diagonal_theta` / `fix_column_signs`
@@ -1386,6 +1457,7 @@ pub(crate) fn canonicalize_pinned_blocks(g: &LmmGroupings, theta: &mut [f64]) ->
                 q,
                 start,
                 &g.structural_theta,
+                floor,
             )
         {
             changed = true;
@@ -1490,11 +1562,100 @@ pub(crate) fn fix_mode_signs(
     }
 }
 
+/// The pin pass at a search endpoint, shared by `fit_lmm` and `fit_glmm`:
+/// sign fix, pin of every diagonal ≤ [`PIN_THETA`], then one canonical fold
+/// with the pin inside the factorization. Returns (any pinned,
+/// `pinned_components`), bit `k` for the `k`-th entry of `diagonal_theta()`
+/// (the first 64 only).
+///
+/// Sign fix first ([`fix_column_signs`]): the box lets a diagonal end
+/// negative, so a block column whose diagonal did is negated whole. Σ and the
+/// deviance are unchanged, and the pin test then sees non-negative diagonals.
+/// The pin collapses every DIAGONAL vech entry ≤ `PIN_THETA` to exactly 0,
+/// FP-stable across platforms. Off-diagonal entries (signed slope
+/// covariances) never pin: a corr → ±1 boundary presents as the *diagonal*
+/// λ_dd → 0 under the Cholesky parameterization, so pinning the diagonal is
+/// the whole policy.
+///
+/// Then the canonical Λ ([`canonicalize_pinned_blocks`] under
+/// [`PivotFloor::Pin`]): the mass below a pinned diagonal folds into the
+/// trailing diagonals, and a trailing pivot the fold leaves at or below
+/// `PIN_THETA` is skipped, so it pins too and its column is exactly 0. One
+/// fold, no loop: a second fold of a canonical Λ need not reproduce it bit
+/// for bit, and it would find nothing left to pin. The flags are the
+/// diagonals the fold leaves exactly 0, so on a block of width ≤
+/// `MAX_PRIMARY_Q` a diagonal is flagged exactly when it is 0, its whole
+/// column is 0, and no diagonal is left in (0, `PIN_THETA`]. Nothing moves
+/// unless a diagonal pinned, so an interior endpoint stays bit-identical.
+///
+/// `flags_on_copy` is the GLMM's AGQ route: θ keeps the search's Λ (sign fix
+/// and first pin only), and the canonical fold runs on the copy, which only
+/// decides the flags. The copy has `theta`'s length.
+pub(crate) fn pin_endpoint(
+    g: &LmmGroupings,
+    theta: &mut [f64],
+    flags_on_copy: Option<&mut [f64]>,
+) -> (bool, u64) {
+    fix_column_signs(g, theta);
+    // A negated column carries its structural zeros as −0.
+    g.zero_structural(theta);
+    for &ti in g.diagonal_theta() {
+        if theta[ti] <= PIN_THETA {
+            theta[ti] = 0.0;
+        }
+    }
+    fold_endpoint(g, theta, flags_on_copy, PivotFloor::Pin)
+}
+
+/// The canonical fold of an endpoint whose sign fix has run, under `floor`,
+/// and its flags: the diagonals the fold leaves exactly 0, bits as in
+/// [`pin_endpoint`]. `fit_glmm` calls it with [`PivotFloor::Trace`] on a
+/// trough polish's endpoint whose pin the incumbent check undid: Σ is kept,
+/// a diagonal the polish held at 0 stays flagged where the fold leaves it 0,
+/// and a new diagonal in (0, `PIN_THETA`] is not pinned (the trace floor
+/// still zeroes a pivot below the round-off of Σ, `q·ε·tr Σ`).
+/// `flags_on_copy` as in [`pin_endpoint`].
+pub(crate) fn fold_endpoint(
+    g: &LmmGroupings,
+    theta: &mut [f64],
+    flags_on_copy: Option<&mut [f64]>,
+    floor: PivotFloor,
+) -> (bool, u64) {
+    let theta_c = match flags_on_copy {
+        Some(copy) => {
+            copy.copy_from_slice(theta);
+            copy
+        }
+        None => theta,
+    };
+    if canonicalize_pinned_blocks(g, theta_c, floor) {
+        // The refactor's zeros between independent terms can be −0.
+        g.zero_structural(theta_c);
+    }
+    let mut pinned = false;
+    let mut components = 0u64;
+    for (k, &ti) in g.diagonal_theta().iter().enumerate() {
+        if theta_c[ti] == 0.0 {
+            pinned = true;
+            if k < u64::BITS as usize {
+                components |= 1u64 << k;
+            }
+        }
+    }
+    (pinned, components)
+}
+
 /// One block of [`canonicalize_pinned_blocks`]: `vech` is that block's
 /// column-major lower-triangular vech slice, `2 ≤ q ≤ MAX_PRIMARY_Q` its
 /// width and `start` its θ offset, against which `structural` (the
 /// groupings' structural θ) is read. Returns whether any entry moved.
-fn canonicalize_block(vech: &mut [f64], q: usize, start: usize, structural: &[usize]) -> bool {
+fn canonicalize_block(
+    vech: &mut [f64],
+    q: usize,
+    start: usize,
+    structural: &[usize],
+    floor: PivotFloor,
+) -> bool {
     // With no diagonal at the pin threshold Λ is already the unique Cholesky
     // factor of its own Σ and the factorization below would only reproduce it
     // up to round-off. Returning early instead leaves every non-singular fit's
@@ -1510,13 +1671,13 @@ fn canonicalize_block(vech: &mut [f64], q: usize, start: usize, structural: &[us
         return false;
     }
 
-    // Semidefinite factor of ΛΛᵀ with the `q·eps·tr Σ` pivot floor: a pinned
-    // column stays exactly zero (`PivotFloor::Trace` carries the floor's
-    // argument).
+    // Semidefinite factor of ΛΛᵀ with the `q·eps·tr Σ` pivot floor (and under
+    // `PivotFloor::Pin` the pin's): a pinned column stays exactly zero
+    // (`PivotFloor` carries the floors' argument).
     let mut lam = [0.0_f64; MAX_PRIMARY_Q * MAX_PRIMARY_Q];
     primary_lambda(vech, q, &mut lam); // Λ lower-tri, row-major
     let mut scratch = [0.0_f64; 2 * MAX_PRIMARY_Q * MAX_PRIMARY_Q];
-    refactor(q, &mut lam, &mut scratch, PivotFloor::Trace);
+    refactor(q, &mut lam, &mut scratch, floor);
     let mut packed = [0.0_f64; MAX_PRIMARY_Q * (MAX_PRIMARY_Q + 1) / 2];
     let packed = &mut packed[..vech.len()];
     pack_vech(&lam, q, packed);
@@ -2762,66 +2923,24 @@ pub fn fit_lmm(
     let converged = matches!(out.status, Status::Converged) && (finite_evals >= 2 || certified);
     let has_endpoint = matches!(out.status, Status::Converged | Status::MaxFunReached);
 
-    // Per-component deterministic pin: every DIAGONAL variance component ≤
-    // PIN_THETA collapses to exactly 0 — FP-stable across platforms. Applied
-    // to any reported endpoint (converged or capped), but `pinned`/
+    // The pin pass (`pin_endpoint`, shared with `fit_glmm`). Applied to any
+    // reported endpoint (converged or capped), but `pinned`/
     // `pinned_components` (⇒ boundary_hit == 1, "accepted boundary") only
     // latch when the fit actually converged — a capped endpoint is reported
-    // as a point, not accepted onto the boundary. Off-diagonal vech entries
-    // (signed slope covariances) are never pinned: a corr → ±1 boundary
-    // presents as the *diagonal* λ_{dd} → 0 under the Cholesky
-    // parameterization, so pinning the diagonal is the whole policy.
-    //
-    // Sign canonicalization first (`fix_column_signs`): the box lets a
-    // diagonal end negative, so a block column whose diagonal did is negated
-    // whole. Σ and the deviance are unchanged, and the pin test then sees
-    // non-negative diagonals. Mirror the GLMM pin site — change together.
-    if has_endpoint {
-        fix_column_signs(kernel.groupings(), theta);
-        // A negated column carries its structural zeros as −0.
-        kernel.groupings().zero_structural(theta);
-    }
-    let diag = kernel.groupings().diagonal_theta();
-    let mut pinned = false;
-    let mut pinned_components = 0u64;
-    if has_endpoint {
-        for (k, &ti) in diag.iter().enumerate() {
-            if theta[ti] <= PIN_THETA {
-                theta[ti] = 0.0;
-                if converged {
-                    pinned = true;
-                    if k < u64::BITS as usize {
-                        pinned_components |= 1u64 << k;
-                    }
-                }
-            }
+    // as a point, not accepted onto the boundary. The pinned re-eval below
+    // runs on the canonicalized θ. The GLMM pin site departs from this on its
+    // AGQ route, and undoes a pin that raises the deviance; the reasons are
+    // written there.
+    let (pinned, pinned_components) = if has_endpoint {
+        let flags = pin_endpoint(kernel.groupings(), theta, None);
+        if converged {
+            flags
+        } else {
+            (false, 0)
         }
-        // Σ-preserving canonical Λ, then the pin test again on the new
-        // diagonals: the fold can retire a component that was pinned only as a
-        // degenerate coordinate, and can expose a trailing diagonal that pins.
-        // The flags are rebuilt from scratch rather than OR'd. Nothing moves
-        // unless a diagonal pinned, so an interior fit stays bit-identical, and
-        // the pinned re-eval below runs on the canonicalized θ. The GLMM pin
-        // site departs from this on its AGQ route, and undoes a pin that
-        // raises the deviance; the reasons are written there.
-        if canonicalize_pinned_blocks(kernel.groupings(), theta) {
-            // The refactor's zeros between independent terms can be −0.
-            kernel.groupings().zero_structural(theta);
-            pinned = false;
-            pinned_components = 0;
-            for (k, &ti) in diag.iter().enumerate() {
-                if theta[ti] <= PIN_THETA {
-                    theta[ti] = 0.0;
-                    if converged {
-                        pinned = true;
-                        if k < u64::BITS as usize {
-                            pinned_components |= 1u64 << k;
-                        }
-                    }
-                }
-            }
-        }
-    }
+    } else {
+        (false, 0)
+    };
 
     // Pin eval at θ̂ — refreshes factor/σ̂² at the accepted-or-capped point
     // (the shipped path's "pin Cholesky at θ̂" step). Armed first: this is the

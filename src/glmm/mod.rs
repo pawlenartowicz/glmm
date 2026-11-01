@@ -54,7 +54,8 @@ use bobyqa::Status;
 use faer::{Mat, MatRef};
 
 use crate::lmm::{
-    GLMM_RHO_POLISH, PIN_THETA, POLISH_NEAR_SINGULAR, RHO_BEGIN_WARM, THETA0, THETA_TRUTH_FLOOR,
+    GLMM_RHO_POLISH, PIN_DEVIANCE_SLACK, PIN_NOISE_ULPS, PIN_POLISH_DROP, PIN_PROBE_STEP,
+    POLISH_NEAR_SINGULAR, RHO_BEGIN_WARM, THETA0, THETA_TRUTH_FLOOR,
 };
 
 use se::rx_schur_llt;
@@ -2925,114 +2926,55 @@ pub fn fit_glmm(
         inc_obj
     };
 
-    // Sign canonicalization first, then the per-component diagonal pin (β never
-    // pins) — mirror `fit_lmm`, `src/lmm/mod.rs`; change together. `diag`
-    // borrows ws.groupings; the loop mutates the disjoint field ws.params, so
-    // no clone is needed. `ok` is true on both a converged fit and a
-    // budget-exhausted one, so the pin below applies to any reported
-    // endpoint; `pinned`/`pinned_components` are still latched here on both,
-    // but only survive into the returned `GlmmFit` on a converged fit — a
-    // budget-exhausted exit zeroes `pinned_components` at assembly.
-    if ok {
-        // The modes flip with their columns (`fix_mode_signs`), before the θ
-        // flip clears the signs that reads: `ws.u_seed` seeds the pinned re-eval.
-        // The packed layout orders the primary block slope-major; blocked and
-        // structured order it level-major.
-        let primary_slope_major = ws.layout == GlmmLayout::Packed;
-        crate::lmm::fix_mode_signs(
-            &ws.groupings,
-            &ws.params[..n_theta],
-            &mut ws.u_seed,
-            primary_slope_major,
-        );
-        crate::lmm::fix_column_signs(&ws.groupings, &mut ws.params[..n_theta]);
-        // A negated column carries its structural zeros as −0.
-        ws.groupings.zero_structural(&mut ws.params[..n_theta]);
-        // The search's θ, kept so the incumbent check after the pinned
-        // re-eval can undo the pin. `start_point` is free once the search
-        // loop has ended.
-        ws.start_point[..n_theta].copy_from_slice(&ws.params[..n_theta]);
-    }
-    let diag = ws.groupings.diagonal_theta();
+    // The post-pin pass, in a fixed order (`crate::lmm::pin_endpoint`, shared
+    // with `fit_lmm`; β never pins): the pin pass at the search's endpoint,
+    // the pinned re-eval, the incumbent check, and at a kept pin the probe of
+    // the free coordinates and at most one trough polish, whose endpoint goes
+    // through the pin pass, the re-eval and the incumbent check once more. No
+    // second polish. `ok` is true on both a converged fit and a
+    // budget-exhausted one, so the pin applies to any reported endpoint;
+    // `pinned`/`pinned_components` are latched on both, but only survive into
+    // the returned `GlmmFit` on a converged fit — a budget-exhausted exit
+    // zeroes `pinned_components` at assembly.
     let mut pinned_components = 0u64;
     let mut pinned = false;
-    if ok {
-        for (kk, &ti) in diag.iter().enumerate() {
-            if ws.params[ti] <= PIN_THETA {
-                ws.params[ti] = 0.0;
-                pinned = true;
-                if kk < u64::BITS as usize {
-                    pinned_components |= 1u64 << kk;
-                }
-            }
-        }
-        // Σ-preserving canonical Λ, then the pin test again on the new
-        // diagonals (mirror `fit_lmm`, `src/lmm/mod.rs` — change together).
-        // The flags are rebuilt from scratch, not OR'd: the fold can retire a
-        // component that pinned only as a degenerate coordinate. Nothing moves
-        // unless a diagonal pinned, so an interior fit stays bit-identical, and
-        // the pinned re-eval below sees the canonicalized θ.
-        //
-        // AGQ is the exception. Its product Gauss–Hermite grid sits in the
-        // u = Λ⁻¹b coordinates (`agq::agq_deviance_vec`), so two Λ with the same
-        // Σ can give different AGQ deviances. Rotating Λ here would report a
-        // point the search did not choose, at a deviance it never saw. On the
-        // AGQ route (the gate `deviance::laplace_deviance` uses) the fold runs
-        // on a copy that only decides the pin flags, and θ, the re-eval below
-        // and the SE pass keep the search's own Λ. The dense AGQ envelope has no
-        // extras and `q_p ≤ 3`, so `MAX_THETA` covers the copy.
-        let agq_route = derivative::agq_eligible(family, nagq, ws.groupings.primary_q)
-            && ws.groupings.extra_offsets.is_empty();
-        let mut canon_copy = [0.0_f64; crate::consts::MAX_THETA];
-        let theta_c: &mut [f64] = if agq_route {
-            canon_copy[..n_theta].copy_from_slice(&ws.params[..n_theta]);
-            &mut canon_copy[..n_theta]
-        } else {
-            &mut ws.params[..n_theta]
-        };
-        if crate::lmm::canonicalize_pinned_blocks(&ws.groupings, theta_c) {
-            // The refactor's zeros between independent terms can be −0.
-            ws.groupings.zero_structural(theta_c);
-            pinned = false;
-            pinned_components = 0;
-            for (kk, &ti) in diag.iter().enumerate() {
-                if theta_c[ti] <= PIN_THETA {
-                    theta_c[ti] = 0.0;
-                    pinned = true;
-                    if kk < u64::BITS as usize {
-                        pinned_components |= 1u64 << kk;
-                    }
-                }
-            }
-        }
-    }
+    // AGQ keeps the search's Λ. Its product Gauss–Hermite grid sits in the
+    // u = Λ⁻¹b coordinates (`agq::agq_deviance_vec`), so two Λ with the same
+    // Σ can give different AGQ deviances. Rotating Λ here would report a
+    // point the search did not choose, at a deviance it never saw. On the
+    // AGQ route (the gate `deviance::laplace_deviance` uses) the canonical
+    // fold runs on a copy that only decides the pin flags, and θ, the
+    // re-eval below and the SE pass keep the search's own Λ. Elsewhere the
+    // pinned re-eval below sees the canonicalized θ. The dense AGQ envelope
+    // has no extras and `q_p ≤ 3`, so `MAX_THETA` covers the copy, which is
+    // sliced on that route only: a sparse fit's θ can be longer.
+    let agq_route = derivative::agq_eligible(family, nagq, ws.groupings.primary_q)
+        && ws.groupings.extra_offsets.is_empty();
+    debug_assert!(!agq_route || n_theta <= crate::consts::MAX_THETA);
 
     // Re-evaluate at the (possibly pinned) γ̂ to refresh M, ũ, W̃. ws.params already
     // holds the pinned γ̂, so call the kernel on it directly — no params copy. The
     // refreshed deviance is the reported marginal deviance (`GlmmFit::deviance`);
     // INFINITY until the re-eval runs.
     let mut final_deviance = f64::INFINITY;
-    // Separate from `ws.pirls_exhausted`: exactly one PIRLS solve happens below,
-    // so this is 0 or 1, folded into the reported bool after the block (the
-    // final re-eval is the case where a truncated solve would feed the
-    // returned estimates directly — see `Note::PirlsExhausted`).
+    // Separate from `ws.pirls_exhausted`: the last re-eval is the one PIRLS
+    // solve this reports, so this is 0 or 1 (reset before each re-eval),
+    // folded into the reported bool after the block (the final re-eval is the
+    // case where a truncated solve would feed the returned estimates directly;
+    // see `Note::PirlsExhausted`).
     let mut final_exhausted_count = 0u32;
     // The pinned re-eval is not a search evaluation: it gets its own throwaway
     // counter for the same reason `final_exhausted_count` is separate above.
     let mut final_counters = crate::counters::EvalCounters::new();
-    // Runs once, or twice when the incumbent check at its end undoes the pin
-    // or the trough polish after it moves the pinned point.
-    let mut reeval = ok;
-    let mut polished = false;
-    // Whether the stationarity probe at the pinned corner has run: it runs
-    // once, and the re-eval that follows it must not run it again.
-    let mut probed = false;
+    let mut inc_obj = inc_obj;
+    let mut budget_exhausted = budget_exhausted;
+    // Trough polishes run: 0 or 1.
+    let mut searches = 0u32;
     let mut n_eval = n_eval;
-    while reeval {
-        reeval = false;
-        // Warm-start the pinned re-eval from the incumbent (its modes are the
-        // inference iterate); u_seed holds the BOBYQA incumbent after minimize.
-        ws.pirls.u[..k].copy_from_slice(&ws.u_seed[..k]);
+    if ok {
+        // The packed layout orders the primary block slope-major; blocked and
+        // structured order it level-major (`fix_mode_signs`).
+        let primary_slope_major = ws.layout == GlmmLayout::Packed;
         let GlmmWorkspace {
             groupings,
             params,
@@ -3062,14 +3004,15 @@ pub fn fit_glmm(
             u_seed,
             pirls_exhausted,
             counters,
+            post_pin,
             ..
         } = ws;
         // Shadow the function-level `offset` borrow (taken before the BOBYQA
         // destructure) with this destructure's own, scoped to the pinned re-eval.
         let offset = offset.as_deref();
         // z_buf still holds this fit's slope copy — x is unchanged since fill_z_f64.
-        // On the structured path this re-eval re-packs m_core_buf/cross_* at γ̂, which
-        // `structured_schur_fill` then reads.
+        // On the structured path each re-eval re-packs m_core_buf/cross_* at γ̂,
+        // which `structured_schur_fill` then reads.
         let data = FitData {
             family,
             groupings,
@@ -3085,228 +3028,150 @@ pub fn fit_glmm(
             n,
             p: *p,
         };
-        final_deviance = laplace_deviance(
-            &data,
-            nb_theta,
-            gamma_phi,
-            nagq,
-            &params[..],
-            beta_rhs,
-            wx,
-            pirls,
-            structured,
-            pattern,
-            packed,
-            border,
-            prior_w_phi,
-            // Pinned-γ̂ re-eval is β-FIXED (reports the fitted β); Profile border
-            // scratch inert. `beta_prof` is the spare distinct buffer.
-            beta_prof,
-            exact_prof,
-            BetaMode::Fixed,
-            // Never the FD-pass tol here — the pinned re-eval stays at `pirls_tol`
-            // (the field is None outside `joint_hessian_cov`).
-            None,
-            cluster_rows.as_ref(),
-            &mut final_exhausted_count,
-            &mut final_counters,
-        );
+        let diag = groupings.diagonal_theta();
+        // The pin pass at an endpoint (the search's, then the polish's). The
+        // modes flip with their columns (`fix_mode_signs`), before the θ flip
+        // clears the signs that reads: `u_seed` seeds the pinned re-eval. The
+        // endpoint's θ is kept in `start_point`, so the incumbent check after
+        // the pinned re-eval can undo the pin, with the sign fix the pin pass
+        // applies to θ (the same fix on the same values).
+        macro_rules! pin_pass {
+            () => {{
+                crate::lmm::fix_mode_signs(
+                    groupings,
+                    &params[..n_theta],
+                    &mut u_seed[..],
+                    primary_slope_major,
+                );
+                start_point[..n_theta].copy_from_slice(&params[..n_theta]);
+                crate::lmm::fix_column_signs(groupings, &mut start_point[..n_theta]);
+                groupings.zero_structural(&mut start_point[..n_theta]);
+                let mut canon_copy = [0.0_f64; crate::consts::MAX_THETA];
+                crate::lmm::pin_endpoint(
+                    groupings,
+                    &mut params[..n_theta],
+                    if agq_route {
+                        Some(&mut canon_copy[..n_theta])
+                    } else {
+                        None
+                    },
+                )
+            }};
+        }
+        // The pinned re-eval at `params`, warm-started from the incumbent's
+        // modes (the inference iterate; `u_seed` holds the BOBYQA incumbent's).
+        // β-FIXED (reports the fitted β); Profile border scratch inert.
+        // `beta_prof` is the spare distinct buffer. Never the FD-pass tol here:
+        // the pinned re-eval stays at `pirls_tol` (the field is None outside
+        // `joint_hessian_cov`).
+        macro_rules! reeval {
+            () => {{
+                pirls.u[..k].copy_from_slice(&u_seed[..k]);
+                final_exhausted_count = 0;
+                laplace_deviance(
+                    &data,
+                    nb_theta,
+                    gamma_phi,
+                    nagq,
+                    &params[..],
+                    beta_rhs,
+                    wx,
+                    pirls,
+                    structured,
+                    pattern,
+                    packed,
+                    border,
+                    prior_w_phi,
+                    beta_prof,
+                    exact_prof,
+                    BetaMode::Fixed,
+                    None,
+                    cluster_rows.as_ref(),
+                    &mut final_exhausted_count,
+                    &mut final_counters,
+                )
+            }};
+        }
         // Incumbent check. `PIN_THETA` is absolute on θ, but what a θ that
         // small is worth depends on the working weights: under very precise
         // data (Poisson counts near e¹⁶, working weights about 9e6) a θ̂ of
         // 7e-5 is a real variance, and zeroing it with β held raises the
         // deviance by tens of units. A pin that leaves the objective
-        // non-finite or more than `PIN_DEVIANCE_SLACK` above the search's own
-        // best is undone: θ goes back to the search's point and the fit is
-        // reported there, converged and not pinned.
-        let pinned_obj = if n_disp == 1 && held_phi.is_none() {
-            final_deviance + nb_dev_term
-        } else {
-            final_deviance
+        // non-finite or more than `PIN_DEVIANCE_SLACK` above the incumbent
+        // (the search's best, or the polish's) is undone. False on a NaN
+        // objective too.
+        let pinned_obj = |dev: f64| {
+            if n_disp == 1 && held_phi.is_none() {
+                dev + nb_dev_term
+            } else {
+                dev
+            }
         };
-        // False on a NaN objective too. A polished point is not checked
-        // again: it is lower than a pinned point that passed.
-        let noise = PIN_NOISE_ULPS * f64::EPSILON * inc_obj.abs();
-        let within = pinned_obj <= inc_obj + PIN_DEVIANCE_SLACK.max(noise);
-        let polish_gain = PIN_POLISH_DROP.max(noise);
-        // Whether the trough polish below runs: the pin lowered the objective
-        // by more than `PIN_POLISH_DROP`, or the probe of the pinned corner
-        // finds the free θ coordinates off their optimum by more than that.
-        // The probe runs only when the drop has not already decided, and
-        // only on a pin that is kept (`within`; the undo branch is first).
-        let wants_polish = pinned
-            && !polished
-            && within
-            && (inc_obj - pinned_obj > polish_gain
-                || (!probed && {
-                    // Stationarity probe at the pinned corner. The trough polish
-                    // was first keyed on the pin's drop alone, but a search
-                    // starved by the trough can also stop at its bottom: on the
-                    // crossed Poisson fit of
-                    // `crossed_zero_variance_reaches_the_single_grouping_optimum`
-                    // the same search ends at θ_h = 5e-7 on x86 (the pin drops
-                    // the objective by 4.5e-5, the polish runs) and at θ_h = -1e-8
-                    // on aarch64 (3e-8, no polish), both with σ_g at 0.77 against
-                    // the `(1 | g)` optimum's 0.53, 2.6 deviance units above it
-                    // (2026-10-08). Where the search ends inside a trough that
-                    // narrow is round-off, so the drop cannot be the trigger.
-                    // Instead each free θ coordinate is probed `PIN_PROBE_STEP`
-                    // either way on the polish's own objective (β held, the
-                    // pinned coordinates 0), and the gain the two probes predict
-                    // along it, the larger of the drop to the lower probe and the
-                    // parabola's `g²/(2c)` through the three points, says whether
-                    // the pinned point is a minimum of the nested model. A
-                    // coordinate on the θ box is probed on its inner side only.
-                    // Each probe is a full-tolerance evaluation counted in
-                    // `n_eval`, from the search's incumbent mode like the
-                    // polish's evaluations. `start_point` holds the search's θ
-                    // for the undo branch, which is ruled out here, so it is the
-                    // probe's scratch.
-                    let pp = *p;
-                    let tp = n_theta + pp;
-                    let diag = groupings.diagonal_theta();
-                    let mut gain = 0.0f64;
-                    start_point[..tp].copy_from_slice(&params[..tp]);
-                    for j in 0..n_theta {
-                        // A structural coordinate is not a free θ: moving it
-                        // leaves the model.
-                        if (diag.contains(&j) && params[j] == 0.0)
-                            || structural.binary_search(&j).is_ok()
-                        {
-                            continue;
-                        }
-                        let mut f = [f64::NAN; 2];
-                        for (side, sgn) in [1.0f64, -1.0].into_iter().enumerate() {
-                            let t = params[j] + sgn * PIN_PROBE_STEP;
-                            if t < lower[j] || t > upper[j] {
-                                continue;
-                            }
-                            start_point[j] = t;
-                            pirls.u[..k].copy_from_slice(&u_seed[..k]);
-                            f[side] = laplace_deviance(
-                                &data,
-                                nb_theta,
-                                gamma_phi,
-                                nagq,
-                                &start_point[..tp],
-                                beta_rhs,
-                                wx,
-                                pirls,
-                                structured,
-                                pattern,
-                                packed,
-                                border,
-                                prior_w_phi,
-                                beta_prof,
-                                exact_prof,
-                                BetaMode::Fixed,
-                                None,
-                                cluster_rows.as_ref(),
-                                pirls_exhausted,
-                                counters,
-                            );
-                            n_eval += 1;
-                        }
-                        start_point[j] = params[j];
-                        // `f64::min` passes over a NaN side.
-                        let lower_probe = f[0].min(f[1]);
-                        if lower_probe.is_finite() {
-                            gain = gain.max(final_deviance - lower_probe);
-                        }
-                        if f[0].is_finite() && f[1].is_finite() {
-                            let h = PIN_PROBE_STEP;
-                            let g = (f[0] - f[1]) / (2.0 * h);
-                            let c = (f[0] + f[1] - 2.0 * final_deviance) / (h * h);
-                            if c > 0.0 {
-                                gain = gain.max(g * g / (2.0 * c));
-                            }
-                        }
-                    }
-                    probed = true;
-                    gain > polish_gain
-                }));
-        if pinned && !polished && !within {
+        let noise = |inc: f64| PIN_NOISE_ULPS * f64::EPSILON * inc.abs();
+        let kept = |dev: f64, inc: f64| pinned_obj(dev) <= inc + PIN_DEVIANCE_SLACK.max(noise(inc));
+
+        (pinned, pinned_components) = pin_pass!();
+        final_deviance = reeval!();
+        if pinned && !kept(final_deviance, inc_obj) {
+            // θ goes back to the search's endpoint and the fit is reported
+            // there, not pinned.
             params[..n_theta].copy_from_slice(&start_point[..n_theta]);
             pinned = false;
             pinned_components = 0;
-            final_exhausted_count = 0;
-            reeval = true;
-        } else if wants_polish {
-            // Trough polish. A variance whose optimum is 0 makes a trough
-            // log(1 + θ²·Σw) in its θ; under very precise data (Σw near 1e7)
-            // it is so narrow that the search's trust radius shrinks to its
-            // end inside it while the other coordinates are still off their
-            // optimum (σ_g up to 0.08 short on crossed Poisson fits near e¹⁴,
-            // 0.24 short on the fit above). Such an endpoint sits on the
-            // trough's wall or at its bottom; the pin lowers the objective
-            // in the first case and the probe above sees the rest. One more
-            // joint search from the pinned point, with the pinned coordinates
-            // held at 0 (the objective reads them as 0, so the trough is
-            // gone), moves the rest; its point is kept only when it is lower.
-            // The dispersion stays at the search's value (its coordinate is
-            // inert here too). Search evaluations: they count in `n_eval`.
-            polished = true;
+            final_deviance = reeval!();
+        } else if pinned {
             let pp = *p;
             let tp = n_theta + pp;
-            let diag = groupings.diagonal_theta();
-            // The pinned point, kept to restore a polish that finds nothing
-            // lower; its zeros also name the held coordinates.
-            params_stage1[..n_theta].copy_from_slice(&params[..n_theta]);
-            guard_beta[..pp].copy_from_slice(&params[n_theta..tp]);
-            let disp = if n_disp == 1 { params[tp] } else { 0.0 };
-            // β̃ is scaled by the β information at the pinned θ, from one PQL
-            // solve there, the metric of the joint search's second pass
-            // (`JOINT_RECHECK_TOL`); the design metric when that solve fails.
-            // Not a search evaluation: own counters, `n_eval` unchanged.
-            let mut info_exhausted = 0u32;
-            let mut info_counters = crate::counters::EvalCounters::new();
-            pirls.u[..k].copy_from_slice(&u_seed[..k]);
-            beta_prof[..pp].copy_from_slice(&params[n_theta..tp]);
-            let info = laplace_deviance(
-                &data,
-                nb_theta,
-                gamma_phi,
-                1,
-                &params[..n_theta],
-                beta_prof,
-                wx,
-                pirls,
-                structured,
-                pattern,
-                packed,
-                border,
-                prior_w_phi,
-                beta_rhs,
-                exact_prof,
-                BetaMode::ProfilePql,
-                None,
-                cluster_rows.as_ref(),
-                &mut info_exhausted,
-                &mut info_counters,
-            );
-            if !(info.is_finite()
-                && beta_scale.set_info(border.schur.as_mut(), prior_w[..n].iter().sum()))
-            {
-                beta_scale.set(x, &prior_w[..n], n);
-            }
-            beta_scale.to_search(&mut params[n_theta..tp]);
-            let mut best = final_deviance;
-            let out = crate::optim::bobyqa_minimize(
-                solver,
-                &mut crate::optim::ValueFn(|gamma: &[f64], _rho: f64| {
-                    start_point[..total_dim].copy_from_slice(gamma);
-                    for &ti in diag {
-                        if params_stage1[ti] == 0.0 {
-                            start_point[ti] = 0.0;
-                        }
-                    }
+            let polish_gain = PIN_POLISH_DROP.max(noise(inc_obj));
+            let drop = inc_obj - pinned_obj(final_deviance);
+            // Stationarity probe at the pinned corner. The trough polish
+            // was first keyed on the pin's drop alone, but a search
+            // starved by the trough can also stop at its bottom: on the
+            // crossed Poisson fit of
+            // `crossed_zero_variance_reaches_the_single_grouping_optimum`
+            // the same search ends at θ_h = 5e-7 on x86 (the pin drops
+            // the objective by 4.5e-5, the polish runs) and at θ_h = -1e-8
+            // on aarch64 (3e-8, no polish), both with σ_g at 0.77 against
+            // the `(1 | g)` optimum's 0.53, 2.6 deviance units above it
+            // (2026-10-08). Where the search ends inside a trough that
+            // narrow is round-off, so the drop cannot be the trigger.
+            // Instead each free θ coordinate is probed `PIN_PROBE_STEP`
+            // either way on the polish's own objective (β held, the
+            // pinned coordinates 0), and the gain the two probes predict
+            // along it, the larger of the drop to the lower probe and the
+            // parabola's `g²/(2c)` through the three points, says whether
+            // the pinned point is a minimum of the nested model. A
+            // coordinate on the θ box is probed on its inner side only.
+            // The parabola's curvature `c` along each coordinate also
+            // scales the polish below, so the probe runs before the
+            // polish also when the drop alone would send the point there.
+            // Each probe is a full-tolerance evaluation counted in
+            // `n_eval`, from the search's incumbent mode like the
+            // polish's evaluations. `start_point` holds the endpoint's θ
+            // for the undo branch, which is ruled out here, so it is the
+            // probe's scratch. A structural coordinate is not a free θ:
+            // moving it leaves the model.
+            let skip = |j: usize| {
+                (diag.contains(&j) && params[j] == 0.0) || structural.binary_search(&j).is_ok()
+            };
+            let theta_curv = &mut post_pin.curv[..];
+            let (gain, evals) = crate::optim::post_pin::stationarity_gain(
+                &params[..tp],
+                &mut start_point[..tp],
+                &skip,
+                &lower[..n_theta],
+                &upper[..n_theta],
+                final_deviance,
+                PIN_PROBE_STEP,
+                theta_curv,
+                &mut |t: &[f64]| {
                     pirls.u[..k].copy_from_slice(&u_seed[..k]);
-                    let dev = laplace_deviance(
+                    laplace_deviance(
                         &data,
                         nb_theta,
                         gamma_phi,
                         nagq,
-                        beta_scale.caller_point(&start_point[..total_dim], n_theta, pp),
+                        t,
                         beta_rhs,
                         wx,
                         pirls,
@@ -3322,52 +3187,222 @@ pub fn fit_glmm(
                         cluster_rows.as_ref(),
                         pirls_exhausted,
                         counters,
-                    );
-                    if dev < best {
-                        best = dev;
-                        u_seed[..k].copy_from_slice(&pirls.u[..k]);
-                    }
-                    dev
-                }),
-                params,
-                lower,
-                upper,
-                &structural,
+                    )
+                },
             );
-            n_eval += out.n_eval;
-            if best < final_deviance {
-                // `params` is the polish's best point, the one `u_seed` holds.
-                for &ti in diag {
-                    if params_stage1[ti] == 0.0 {
-                        params[ti] = 0.0;
+            n_eval += evals as usize;
+            // Whether the trough polish runs: the pin lowered the objective by
+            // more than `PIN_POLISH_DROP`, or the probe finds the free θ
+            // coordinates off their optimum by more than that.
+            if drop > polish_gain || gain > polish_gain {
+                // Trough polish. A variance whose optimum is 0 makes a trough
+                // log(1 + θ²·Σw) in its θ; under very precise data (Σw near 1e7)
+                // it is so narrow that the search's trust radius shrinks to its
+                // end inside it while the other coordinates are still off their
+                // optimum (σ_g up to 0.08 short on crossed Poisson fits near e¹⁴,
+                // 0.24 short on the fit above). Such an endpoint sits on the
+                // trough's wall or at its bottom; the pin lowers the objective
+                // in the first case and the probe above sees the rest. One more
+                // joint search from the pinned point, with the pinned coordinates
+                // held at 0 (the objective reads them as 0, so the trough is
+                // gone), moves the rest. The dispersion stays at the search's
+                // value (its coordinate is inert here too). Search evaluations:
+                // they count in `n_eval`.
+                searches = 1;
+                // The pinned point, kept to restore a polish that finds nothing
+                // lower; its zeros also name the held coordinates.
+                params_stage1[..n_theta].copy_from_slice(&params[..n_theta]);
+                guard_beta[..pp].copy_from_slice(&params[n_theta..tp]);
+                let disp = if n_disp == 1 { params[tp] } else { 0.0 };
+                // β̃ is scaled by the β information at the pinned θ, from one PQL
+                // solve there, the metric of the joint search's second pass
+                // (`JOINT_RECHECK_TOL`); the design metric when that solve fails.
+                // Not a search evaluation: own counters, `n_eval` unchanged.
+                let mut info_exhausted = 0u32;
+                let mut info_counters = crate::counters::EvalCounters::new();
+                pirls.u[..k].copy_from_slice(&u_seed[..k]);
+                beta_prof[..pp].copy_from_slice(&params[n_theta..tp]);
+                let info = laplace_deviance(
+                    &data,
+                    nb_theta,
+                    gamma_phi,
+                    1,
+                    &params[..n_theta],
+                    beta_prof,
+                    wx,
+                    pirls,
+                    structured,
+                    pattern,
+                    packed,
+                    border,
+                    prior_w_phi,
+                    beta_rhs,
+                    exact_prof,
+                    BetaMode::ProfilePql,
+                    None,
+                    cluster_rows.as_ref(),
+                    &mut info_exhausted,
+                    &mut info_counters,
+                );
+                let sum_w: f64 = prior_w[..n].iter().sum();
+                if !(info.is_finite() && beta_scale.set_info(border.schur.as_mut(), sum_w)) {
+                    beta_scale.set(x, &prior_w[..n], n);
+                }
+                beta_scale.to_search(&mut params[n_theta..tp]);
+                // The θ coordinates are scaled too. The β̃ axes have curvature
+                // about 2·Σ(prior weight) (`BetaScale::set_info`); a free θ
+                // coordinate the probe finds stiffer than that is searched as
+                // θⱼ/sⱼ with sⱼ = √(2·Σ(prior weight)/cⱼ), so its curvature
+                // matches theirs; every other θ coordinate keeps sⱼ = 1. Under
+                // very precise data a loading near 0 has curvature ∝ Σw: on the
+                // precise Poisson `(1 + x1 + x2 | g)` fit of
+                // `trough_polish_reaches_the_optimum_on_precise_data` (log-mean e¹⁴) the
+                // profiled Hessian at the optimum has eigenvalues 336 (the
+                // intercept's loading) and 1.4e8 to 4.5e8 (the slopes'
+                // loadings), a condition number of 1.3e6 (2026-10-30).
+                // BOBYQA's one trust radius then shrinks to its end each time
+                // the intercept's loading has moved about 6e-4. Under an
+                // earlier design that chained polishes, every unscaled polish
+                // gained 1e-3 or less after the first three, and twelve
+                // polishes stopped 5e-7 (aarch64 macOS) to 9.2e-4 (x86_64
+                // Linux) above the optimum. Scaled, the polish reaches it.
+                // The box is scaled with the point, and restored after.
+                let theta_scale = &mut post_pin.scale[..];
+                theta_scale.fill(1.0);
+                post_pin.lower.copy_from_slice(&lower[..n_theta]);
+                post_pin.upper.copy_from_slice(&upper[..n_theta]);
+                let c_ref = 2.0 * sum_w;
+                for j in 0..n_theta {
+                    // False on a NaN curvature: a skipped or one-sided coordinate.
+                    if theta_curv[j] > c_ref {
+                        let sj = (c_ref / theta_curv[j]).sqrt();
+                        theta_scale[j] = sj;
+                        params[j] /= sj;
+                        lower[j] /= sj;
+                        upper[j] /= sj;
                     }
                 }
-                beta_scale.to_caller(&mut params[n_theta..tp]);
-                final_exhausted_count = 0;
-                reeval = true;
+                let mut best = final_deviance;
+                let out = crate::optim::bobyqa_minimize(
+                    solver,
+                    &mut crate::optim::ValueFn(|gamma: &[f64], _rho: f64| {
+                        start_point[..total_dim].copy_from_slice(gamma);
+                        for (t, &sj) in start_point[..n_theta].iter_mut().zip(&*theta_scale) {
+                            *t *= sj;
+                        }
+                        for &ti in diag {
+                            if params_stage1[ti] == 0.0 {
+                                start_point[ti] = 0.0;
+                            }
+                        }
+                        pirls.u[..k].copy_from_slice(&u_seed[..k]);
+                        let dev = laplace_deviance(
+                            &data,
+                            nb_theta,
+                            gamma_phi,
+                            nagq,
+                            beta_scale.caller_point(&start_point[..total_dim], n_theta, pp),
+                            beta_rhs,
+                            wx,
+                            pirls,
+                            structured,
+                            pattern,
+                            packed,
+                            border,
+                            prior_w_phi,
+                            beta_prof,
+                            exact_prof,
+                            BetaMode::Fixed,
+                            None,
+                            cluster_rows.as_ref(),
+                            pirls_exhausted,
+                            counters,
+                        );
+                        if dev < best {
+                            best = dev;
+                            u_seed[..k].copy_from_slice(&pirls.u[..k]);
+                        }
+                        dev
+                    }),
+                    params,
+                    lower,
+                    upper,
+                    &structural,
+                );
+                for (t, &sj) in params[..n_theta].iter_mut().zip(&*theta_scale) {
+                    *t *= sj;
+                }
+                lower[..n_theta].copy_from_slice(&post_pin.lower);
+                upper[..n_theta].copy_from_slice(&post_pin.upper);
+                n_eval += out.n_eval;
+                // A polish stopped by its budget reports its best point, not
+                // converged: that point is not a minimum.
+                if out.status == Status::MaxFunReached {
+                    budget_exhausted = true;
+                }
+                if best < final_deviance {
+                    // `params` is the polish's best point, the one `u_seed`
+                    // holds, and the polish's best is the new incumbent.
+                    for &ti in diag {
+                        if params_stage1[ti] == 0.0 {
+                            params[ti] = 0.0;
+                        }
+                    }
+                    beta_scale.to_caller(&mut params[n_theta..tp]);
+                    if n_disp == 1 {
+                        params[tp] = disp;
+                    }
+                    inc_obj = pinned_obj(best);
+                    // The polish's endpoint is pinned from scratch, so a
+                    // coordinate it leaves at or below `PIN_THETA` pins too.
+                    (pinned, pinned_components) = pin_pass!();
+                    final_deviance = reeval!();
+                    if pinned && !kept(final_deviance, inc_obj) {
+                        // θ goes back to the polish's endpoint after the sign
+                        // fix (`start_point`), folded without the pin
+                        // (`PivotFloor::Trace`, Σ kept): the polish moved the
+                        // entries below a diagonal it held at 0 as free
+                        // coordinates, and an entry under an earlier zero
+                        // diagonal folds onto a later one. The flags are the
+                        // diagonals that fold leaves exactly 0; a new diagonal
+                        // in (0, `PIN_THETA`] is not pinned, though the trace
+                        // floor still zeroes one below the round-off of Σ. On
+                        // the AGQ route θ keeps the polish's Λ and the fold
+                        // runs on the copy.
+                        params[..n_theta].copy_from_slice(&start_point[..n_theta]);
+                        let mut canon_copy = [0.0_f64; crate::consts::MAX_THETA];
+                        (pinned, pinned_components) = crate::lmm::fold_endpoint(
+                            groupings,
+                            &mut params[..n_theta],
+                            if agq_route {
+                                Some(&mut canon_copy[..n_theta])
+                            } else {
+                                None
+                            },
+                            crate::lmm::re_map::PivotFloor::Trace,
+                        );
+                        final_deviance = reeval!();
+                    }
+                } else {
+                    // Nothing lower: the pinned point is the fit, re-evaluated
+                    // so ũ, W̃ and `M` are its own and not the polish's last
+                    // point's.
+                    params[..n_theta].copy_from_slice(&params_stage1[..n_theta]);
+                    params[n_theta..tp].copy_from_slice(&guard_beta[..pp]);
+                    if n_disp == 1 {
+                        params[tp] = disp;
+                    }
+                    final_deviance = reeval!();
+                }
             } else {
-                // Nothing lower: the pinned point is the fit, re-evaluated
-                // below so ũ, W̃ and `M` are its own and not the polish's
-                // last point's.
-                params[..n_theta].copy_from_slice(&params_stage1[..n_theta]);
-                params[n_theta..tp].copy_from_slice(&guard_beta[..pp]);
-                final_exhausted_count = 0;
-                reeval = true;
+                // The pinned point stands; the probe left the workspace at
+                // its last point, so it is re-evaluated once more (not a
+                // search evaluation).
+                final_deviance = reeval!();
             }
-            if n_disp == 1 {
-                params[tp] = disp;
-            }
-        } else if probed && !polished {
-            // The probe found the pinned point stationary; its evaluations
-            // left the workspace at the last probe point, so the pinned
-            // point is re-evaluated once more (not a search evaluation).
-            // `polished` marks that re-eval as the last pass: nothing is
-            // checked again at the same point.
-            polished = true;
-            final_exhausted_count = 0;
-            reeval = true;
         }
     }
+    ws.counters.record_post_pin(searches);
     ws.final_pirls_exhausted = final_exhausted_count > 0;
 
     // Degenerate-fit guard. BOBYQA can report `Converged` on a fit that never left
@@ -3443,13 +3478,14 @@ pub fn fit_glmm(
                 }
             };
             let lschur = sc.L();
-            nan_fill_vcov(ws, p);
             // Right-hand side row t of the column map B (eₜ when the design is
             // fitted as given), read as U⁻ᵀbₜ against a factor built on X·U⁻¹:
             // Var(βₜ) = ‖L⁻¹bₜ‖², and the Gram of these columns below is
-            // B·Schur⁻¹·Bᵀ.
-            for &tj in target_indices {
-                let tj = tj as usize;
+            // B·Schur⁻¹·Bᵀ. Every column is solved, so `vcov` holds every pair
+            // (a contrast's columns need not be targets); `var_diag` and `t_sq`
+            // stay on the targets. Each column's solve is independent of the
+            // others, so a target's values do not depend on the target set.
+            for tj in 0..p {
                 for i in 0..p {
                     ws.inference.fwd_solve[i] = map.rhs(tj, i);
                 }
@@ -3465,29 +3501,28 @@ pub fn fit_glmm(
                     }
                     ws.inference.fwd_solve[i] = acc / lschur[(i, i)];
                 }
-                let vd: f64 = ws.inference.fwd_solve[..p]
-                    .iter()
-                    .map(|v| v * v)
-                    .sum::<f64>();
-                ws.inference.var_diag[tj] = vd;
-                ws.inference.t_sq[tj] = if vd.is_finite() && vd > 0.0 {
-                    ws.betas[tj] * ws.betas[tj] / vd
-                } else {
-                    f64::NAN
-                };
-                // Keep this target's column of L⁻¹: Schur⁻¹ = L⁻ᵀL⁻¹, so the
-                // pairwise dots below are `vcov`'s off-diagonals — the same
-                // arithmetic `vd` takes the norm of, not thrown away.
+                if target_indices.contains(&(tj as u32)) {
+                    let vd: f64 = ws.inference.fwd_solve[..p]
+                        .iter()
+                        .map(|v| v * v)
+                        .sum::<f64>();
+                    ws.inference.var_diag[tj] = vd;
+                    ws.inference.t_sq[tj] = if vd.is_finite() && vd > 0.0 {
+                        ws.betas[tj] * ws.betas[tj] / vd
+                    } else {
+                        f64::NAN
+                    };
+                }
+                // Keep this column of L⁻¹: Schur⁻¹ = L⁻ᵀL⁻¹, so the pairwise
+                // dots below are `vcov`'s off-diagonals — the same arithmetic
+                // `vd` takes the norm of, not thrown away.
                 for i in 0..p {
                     ws.inference.vcov_cols[(i, tj)] = ws.inference.fwd_solve[i];
                 }
             }
-            for &ta in target_indices {
-                for &tb in target_indices {
-                    let (a, b) = (ta as usize, tb as usize);
-                    if b > a {
-                        continue; // symmetric — fill both from the lower pair
-                    }
+            // Symmetric: fill both cells from the lower pair.
+            for a in 0..p {
+                for b in 0..=a {
                     let mut acc = 0.0;
                     for i in 0..p {
                         acc += ws.inference.vcov_cols[(i, a)] * ws.inference.vcov_cols[(i, b)];
@@ -3534,10 +3569,11 @@ pub fn fit_glmm(
                     f64::NAN
                 };
             }
-            // `cov` IS Cov(β̂) in full — keep the target block rather than only
-            // the diagonal just read. The RX fallback (`NonPdFellBackToRx`) fills
-            // `cov` through `rx_cov_into`, which forms a complete p×p inverse
-            // too, so it carries a real vcov and is NOT NaN-filled here.
+            // `cov` IS Cov(β̂) in full — keep every pair rather than only the
+            // diagonal just read (a contrast's columns need not be targets).
+            // The RX fallback (`NonPdFellBackToRx`) fills `cov` through
+            // `rx_cov_into`, which forms a complete p×p inverse too, so it
+            // carries a real vcov and is NOT NaN-filled here.
             //
             // Mirror the lower triangle instead of copying both cells: `cov`
             // comes from a solve against an identity, which leaves (a,b) and
@@ -3545,13 +3581,8 @@ pub fn fit_glmm(
             // mathematically, and every other path builds it symmetric by
             // construction, so pick one value per pair rather than hand a
             // consumer an almost-symmetric vcov.
-            nan_fill_vcov(ws, p);
-            for &ta in target_indices {
-                for &tb in target_indices {
-                    let (a, b) = (ta as usize, tb as usize);
-                    if b > a {
-                        continue;
-                    }
+            for a in 0..p {
+                for b in 0..=a {
                     ws.inference.vcov[(a, b)] = cov[(a, b)];
                     ws.inference.vcov[(b, a)] = cov[(a, b)];
                 }
@@ -3619,16 +3650,6 @@ pub fn fit_glmm(
 /// `GLMM_RHO_BEGIN` or `GLMM_RHO_POLISH`.
 const NON_FINITE_RADIUS: f64 = 0.1;
 
-/// How far above the search's best objective a pinned fit may land and keep
-/// its pin, in deviance units (`fit_glmm`'s incumbent check). Measured
-/// 2026-10-04: on the 67 pinned GLMM cells of the accuracy grid and on 614
-/// simulated pinned fits (Poisson and binomial; crossed, nested and
-/// random-slope shapes) a pin costs at most 5.2e-8, while a pin that zeroes a
-/// real variance under very precise data costs 1.9 to 48 units. 1e-6 sits
-/// between the two, and below the 4e-5 at which the accuracy grid counts a
-/// deviance as worse than a reference (`validation/grid/tol.R`, `dev_eps`).
-const PIN_DEVIANCE_SLACK: f64 = 1e-6;
-
 /// Relative deviance drop at which the check after the joint `[θ | β̃]`
 /// search (`fit_glmm`) sends it into a second pass, capped at
 /// [`JOINT_RECHECK_ABS`] deviance units (`joint_recheck_band`). The check re-solves β at
@@ -3670,43 +3691,6 @@ const JOINT_RECHECK_ABS: f64 = 1.0;
 fn joint_recheck_band(f: f64) -> f64 {
     (JOINT_RECHECK_TOL * f.abs().max(1.0)).min(JOINT_RECHECK_ABS)
 }
-
-/// How far below the search's best objective the pinned point must land to
-/// run `fit_glmm`'s trough polish, in deviance units. Measured 2026-10-05 on
-/// 614 simulated pinned Laplace fits (Poisson e² to e¹⁶, binomial up to 1e5
-/// trials; crossed, nested and random-slope shapes): the polish ran on 190
-/// and lowered 184 of them by more than 1e-6, among them 148 of the 167 fits
-/// a polish without this threshold lowers by more than 1e-3; on 240 7-node
-/// AGQ random-slope fits it ran on 71 and lowered 65. On the pinned cells of
-/// the accuracy grid the pin lowers the objective by at most 1.0e-8, so none
-/// of them is polished on the drop. The drop is not the only trigger: the
-/// probe of the pinned corner (`PIN_PROBE_STEP`) sends an endpoint the drop
-/// misses, one that stopped at the trough's bottom, into the same polish,
-/// its predicted gain judged against this threshold.
-const PIN_POLISH_DROP: f64 = 1e-7;
-
-/// Step of the stationarity probe at the pinned corner (`fit_glmm`, before
-/// the trough polish), in the search's θ̃ units. The gain the probe predicts
-/// along a free θ coordinate is judged against `PIN_POLISH_DROP`, like the
-/// pin's drop, so the step must resolve gains of that size: the parabola's
-/// error in the gain grows as the fourth power of the step, and at
-/// `GLMM_RHO_POLISH` (0.03) it read 1e-6 on an endpoint the gradient search
-/// had certified, sending it into a polish that found nothing (2026-10-08);
-/// at 1e-3 it is about 1e-11, with the round-off of the two probes (1e-9 on
-/// a deviance of 200) far below `PIN_POLISH_DROP` as well. A starved
-/// endpoint is found by extrapolation, not by the step's reach: on the fit
-/// named above the parabola predicts a gain of about 1 from a point 0.24
-/// off. Well above `GLMM_RHO_END` (3e-6), the resolution of the search's
-/// endpoint.
-const PIN_PROBE_STEP: f64 = 1e-3;
-
-/// Floor under `PIN_DEVIANCE_SLACK` and `PIN_POLISH_DROP`, in ULPs of the
-/// search's best objective. Both thresholds are absolute, but the two
-/// objectives they compare each carry a rounding error that grows with |D|.
-/// The floor takes over past |D| ≈ 7e6 for the drop and 7e7 for the slack, so
-/// the pin check and the trough polish do not act on that noise. Below those
-/// both thresholds keep their measured values.
-const PIN_NOISE_ULPS: f64 = 64.0;
 
 /// Whether any of `points` (flattened, `x.len()` coordinates each) lies within
 /// Euclidean distance `radius` of `x`.
@@ -3757,9 +3741,10 @@ fn extra_ztwz_trace(ws: &GlmmWorkspace, n: usize) -> f64 {
     }
 }
 
-/// NaN-fill `ws.inference.vcov` — the workspace is reused across fits, so every SE arm
-/// clears it before writing its target block; entries outside that block stay
-/// NaN, keeping `vcov` finite exactly where `var_diag` is.
+/// NaN-fill `ws.inference.vcov` on a fit with no covariance: the
+/// `se_unavailable` tail of [`fit_glmm`] and [`nan_fit`]. The workspace is
+/// reused across fits, so without it such a fit would serve the previous
+/// fit's covariance; on a fit with one, either SE arm writes every pair.
 fn nan_fill_vcov(ws: &mut GlmmWorkspace, p: usize) {
     for a in 0..p {
         for b in 0..p {

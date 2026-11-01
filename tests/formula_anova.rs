@@ -16,7 +16,9 @@
 //! comparison. Two CI guards check the rows' partial η², and a mixed model's
 //! R² and ICC, against values copied from frozen `effectsize` references, and
 //! two more the pairwise intervals and the pairwise rows against frozen
-//! `posthoc` references, within their `oracle_support::tol` bands.
+//! `posthoc` references, and two the profile-likelihood intervals of an LMM
+//! against frozen `profile` references, within their `oracle_support::tol`
+//! bands.
 
 use std::mem::discriminant;
 
@@ -31,11 +33,12 @@ use glmm::formula::anova::{
 use glmm::formula::{lower, pairwise, Adjust, Column, Lowered, Model, Table};
 use glmm::inference::contrast::NoDfReason;
 use glmm::inference::{
-    DenDf, LinearKind, LinearNote, LinearTest, LrNote, LrTest, Objective, Reference,
+    DenDf, LinearKind, LinearNote, LinearTest, LrNote, LrTest, Objective, ProfileInterval,
+    ProfileParam, Reference,
 };
 use glmm::{
-    BinomialLink, Family, Fit, FitOptions, GammaLink, InverseGaussianLink, Note, PoissonLink,
-    WaldSe,
+    BinomialLink, Dispersion, Family, Fit, FitOptions, GammaLink, InverseGaussianLink, Note,
+    PoissonLink, WaldSe,
 };
 use oracle_support::tol;
 
@@ -343,13 +346,13 @@ fn two_reml_fits_with_different_fixed_parts_refuse() {
 fn the_same_parameter_count_has_nothing_to_test() {
     // With two factors, `a:b` spans the columns of `a * b`.
     let (m0, m1) = (model("y ~ a:b", None), model("y ~ a * b", None));
-    assert_eq!(m0.fit().df, m1.fit().df);
+    assert_eq!(m0.fit().df(), m1.fit().df());
     let e = refusal(&m0, &m1);
     assert_eq!(
         e,
         CompareError::NothingToTest {
-            m0: m0.fit().df,
-            m1: m1.fit().df
+            m0: m0.fit().df(),
+            m1: m1.fit().df()
         }
     );
     assert_eq!(
@@ -358,7 +361,7 @@ fn the_same_parameter_count_has_nothing_to_test() {
             "the two models have the same number of parameters ({}), so there is nothing to \
              test: the larger formula adds no parameter to the smaller one. Compare two models \
              that differ by at least one parameter.",
-            m0.fit().df
+            m0.fit().df()
         )
     );
     // With a numeric `x` they are different, nested models.
@@ -630,8 +633,8 @@ fn a_fit_at_the_correlation_boundary_is_not_a_zero_component() {
     let full = fitted("y ~ x + (1 + x | g)", &d, Family::Gaussian, None, 1);
     let fit = full.fit();
     // The trailing θ diagonal is pinned while the slope variance is not zero.
-    assert!(fit.diagnostics.pinned.iter().flatten().any(|&p| p));
-    assert!(fit.varcorr[0][2] > 0.0, "{:?}", fit.varcorr);
+    assert!(fit.diagnostics().pinned.iter().flatten().any(|&p| p));
+    assert!(fit.varcorr(0)[3] > 0.0, "{:?}", fit.varcorr(0));
     let reduced = side("y ~ x + (1 | g)", &d, Family::Gaussian, None);
     let t = lr(&cmp(&reduced, &full).unwrap()).clone();
     assert!(t.statistic > 0.0, "{t:?}");
@@ -660,6 +663,11 @@ fn identical_groups() -> Table {
     }
 }
 
+/// Every grouping's `q × q` covariance, declaration order.
+fn varcorr_blocks(fit: &Fit) -> Vec<Vec<f64>> {
+    (0..fit.n_groupings()).map(|g| fit.varcorr(g)).collect()
+}
+
 #[test]
 fn a_binomial_or_poisson_glmm_at_zero_variance_has_the_glm_log_likelihood() {
     let d = identical_groups();
@@ -669,13 +677,13 @@ fn a_binomial_or_poisson_glmm_at_zero_variance_has_the_glm_log_likelihood() {
     for (y, family) in [("yb", binomial()), ("yc", poisson)] {
         let glm = side(&format!("{y} ~ x"), &d, family, None);
         let glmm = side(&format!("{y} ~ x + (1 | g)"), &d, family, None);
-        assert_eq!(glmm.fit().varcorr, vec![vec![0.0]], "{y}: θ̂ = 0");
-        let gap = (glmm.fit().loglik - glm.fit().loglik).abs();
+        assert_eq!(varcorr_blocks(glmm.fit()), vec![vec![0.0]], "{y}: θ̂ = 0");
+        let gap = (glmm.fit().loglik() - glm.fit().loglik()).abs();
         assert!(
-            gap <= 1e-10 * glm.fit().loglik.abs(),
+            gap <= 1e-10 * glm.fit().loglik().abs(),
             "{y}: GLMM {} against GLM {}",
-            glmm.fit().loglik,
-            glm.fit().loglik
+            glmm.fit().loglik(),
+            glm.fit().loglik()
         );
         let t = lr(&cmp(&glm, &glmm).unwrap()).clone();
         assert_eq!((t.statistic, t.p_value), (0.0, 1.0), "{y}");
@@ -693,7 +701,7 @@ fn a_grouping_lowering_drops_does_not_hide_a_dropped_component_at_zero() {
     let glm = side("yb ~ x", &d, binomial(), None);
     for larger in ["yb ~ x + (1 | g)", "yb ~ x + (1 | g) + (1 | h)"] {
         let glmm = side(larger, &d, binomial(), None);
-        assert_eq!(glmm.fit().varcorr, vec![vec![0.0]], "{larger}");
+        assert_eq!(varcorr_blocks(glmm.fit()), vec![vec![0.0]], "{larger}");
         let t = lr(&cmp(&glm, &glmm).unwrap()).clone();
         assert_eq!(t.statistic.to_bits(), 0.0f64.to_bits(), "{larger}: {t:?}");
         assert_eq!(t.p_value, 1.0, "{larger}");
@@ -707,7 +715,7 @@ fn a_fixed_effect_beside_a_grouping_at_zero_is_still_tested() {
     let d = identical_groups();
     let glm = side("yb ~ 1", &d, binomial(), None);
     let glmm = side("yb ~ x + (1 | g)", &d, binomial(), None);
-    assert_eq!(glmm.fit().varcorr, vec![vec![0.0]]);
+    assert_eq!(varcorr_blocks(glmm.fit()), vec![vec![0.0]]);
     let c = cmp(&glm, &glmm).unwrap();
     assert_eq!(c.differs, Differs::Both);
     let t = lr(&c);
@@ -751,8 +759,8 @@ fn one_dropped_variance_at_zero_beside_a_non_zero_one_keeps_the_statistic() {
         Family::Gaussian,
         None,
     );
-    assert_eq!(large.fit().varcorr[block(&large, "blk")], vec![0.0]);
-    assert!(large.fit().varcorr[block(&large, "Subject")][2] > 1.0);
+    assert_eq!(large.fit().varcorr(block(&large, "blk")), vec![0.0]);
+    assert!(large.fit().varcorr(block(&large, "Subject"))[3] > 1.0);
     let c = cmp(&small, &large).unwrap();
     let t = lr(&c);
     assert_eq!(t.statistic, floored(&c));
@@ -1076,7 +1084,7 @@ fn dispersion_glms_with_a_held_dispersion_get_the_lr_test() {
     );
     let held = |f: &str| {
         let mut fit_opts = FitOptions::default();
-        fit_opts.dispersion = Some(1.0);
+        fit_opts.dispersion = Dispersion::Fixed(1.0);
         let m = glmm::formula::fit(f, &d, gamma, &fit_opts).unwrap();
         assert!(m.fit().converged(), "{f} did not converge");
         m
@@ -1130,7 +1138,7 @@ fn the_sides_are_kept_as_given_and_the_larger_is_named() {
     assert_eq!(c.larger, Side::First);
     assert_eq!(
         (c.m0.npar, c.m0.nobs, c.m0.loglik),
-        (large.fit().df, large.fit().nobs, large.fit().loglik)
+        (large.fit().df(), large.fit().nobs(), large.fit().loglik())
     );
 }
 
@@ -1275,12 +1283,12 @@ fn fits() -> Vec<(&'static str, Model, LinearKind, Option<DenDf>)> {
         res,
     ));
     let mut fit_opts = FitOptions::default();
-    fit_opts.dispersion = Some(0.5);
+    fit_opts.dispersion = Dispersion::Fixed(0.5);
     let held = glmm::formula::fit("y ~ x + grp", &glm_gamma(), gamma(), &fit_opts).unwrap();
     assert!(held.fit().converged());
     out.push(("Gamma GLM, φ held", held, chi, None));
     let m = side("y ~ x + grp + (1 | cluster)", &sim_gamma(), gamma(), None);
-    let dispersion = m.fit().dispersion;
+    let dispersion = m.fit().dispersion();
     assert!((dispersion - 1.0).abs() > 0.1, "{dispersion}");
     out.push(("Gamma GLMM", m, chi, None));
     out
@@ -1291,13 +1299,13 @@ fn each_fit_gets_one_row_per_fixed_term_in_r_order_with_its_familys_test() {
     for (name, m, kind, den) in fits() {
         let (lo, fit) = (m.lowered(), m.fit());
         if name == "ML LMM" {
-            assert!(!fit.reml, "{name}");
+            assert!(!fit.reml(), "{name}");
         }
         if name == "GLMM" {
             // The GLMM's rows stand on the default Hessian covariance.
             assert_eq!(FitOptions::default().wald_se, WaldSe::Hessian);
             assert!(
-                !fit.diagnostics
+                !fit.diagnostics()
                     .notes
                     .iter()
                     .any(|n| matches!(n, Note::HessianSeFallback)),
@@ -1337,7 +1345,7 @@ fn each_fit_gets_one_row_per_fixed_term_in_r_order_with_its_familys_test() {
                         if den == Some(DenDf::Residual) {
                             assert_eq!(den_df, (lo.n - lo.p) as f64, "{what} {}", row.label);
                         }
-                        let ms = test.statistic * fit.dispersion;
+                        let ms = test.statistic * fit.dispersion();
                         assert_eq!(row.mean_sq, Some(ms), "{what} {}", row.label);
                         assert_eq!(row.sum_sq, Some(ms * num_df), "{what} {}", row.label);
                     }
@@ -1362,14 +1370,14 @@ fn a_one_df_type_iii_row_of_an_uncontained_term_is_the_summary_statistic_squared
         let t3 = term_table(&m, TermTestOptions::default()).unwrap();
         assert_eq!(t3.ss_type, SsType::Type3);
         let row = t3.fixed.iter().find(|r| r.label == "x").unwrap();
-        let z = fit.beta[j] / fit.se[j];
+        let z = fit.beta()[j] / fit.se()[j];
         assert_eq!(row.test.num_df, 1.0, "{name}");
         assert_close(row.test.statistic, z * z, name);
         if kind == LinearKind::F {
             let Reference::F { den_df, .. } = row.test.reference else {
                 panic!("{name}: {:?}", row.test.reference)
             };
-            assert_close(den_df, fit.coef_df[j], name);
+            assert_close(den_df, fit.coef_df()[j], name);
         }
     }
 }
@@ -1517,11 +1525,12 @@ fn wald_of(fit: &Fit, lo: &Lowered, names: &[&str]) -> f64 {
         .map(|n| lo.col_names.iter().position(|c| c == n).unwrap())
         .collect();
     let k = s.len();
+    let p = fit.beta().len();
     let mut a: Vec<Vec<f64>> = s
         .iter()
         .map(|&i| {
-            let mut row: Vec<f64> = s.iter().map(|&j| fit.vcov[i][j]).collect();
-            row.push(fit.beta[i]);
+            let mut row: Vec<f64> = s.iter().map(|&j| fit.vcov()[i * p + j]).collect();
+            row.push(fit.beta()[i]);
             row
         })
         .collect();
@@ -1538,7 +1547,7 @@ fn wald_of(fit: &Fit, lo: &Lowered, names: &[&str]) -> f64 {
             }
         }
     }
-    (0..k).map(|i| fit.beta[s[i]] * a[i][k] / a[i][i]).sum()
+    (0..k).map(|i| fit.beta()[s[i]] * a[i][k] / a[i][i]).sum()
 }
 
 #[test]
@@ -1778,4 +1787,125 @@ fn pairwise_matches_the_frozen_oats_reference() {
             );
         }
     }
+}
+
+/// The profile-likelihood intervals of `m` at level 0.95 against `want`, one
+/// `(parameter, lower, upper)` per row in any order: the same parameters
+/// both ways, each bound within `PROFILE_CI_REL` of lme4's interval width,
+/// and a bound lme4 puts at exactly 0 exactly 0 here too.
+fn profile_rows_match(m: &Model, want: &[(ProfileParam, f64, f64)]) -> Vec<ProfileInterval> {
+    let (lo, fit) = (m.lowered(), m.fit());
+    let ci = fit
+        .profile_intervals(&lo.data(), lo.spec(), 0.95, None)
+        .unwrap();
+    assert_eq!(ci.rows.len(), want.len(), "one row per parameter");
+    for &(param, _, _) in want {
+        assert!(ci.rows.iter().any(|r| r.param == param), "no row {param:?}");
+    }
+    for row in &ci.rows {
+        let &(_, lower, upper) = want
+            .iter()
+            .find(|w| w.0 == row.param)
+            .unwrap_or_else(|| panic!("no reference row {:?}", row.param));
+        let width = upper - lower;
+        for (side, got, want) in [("lower", row.lower, lower), ("upper", row.upper, upper)] {
+            if want == 0.0 {
+                assert_eq!(got, 0.0, "{:?} {side}", row.param);
+            }
+            let d = ((got - want) / width).abs();
+            assert!(
+                d <= tol::PROFILE_CI_REL,
+                "{:?} {side}: {got} against {want}, |diff|/width {d:e}",
+                row.param
+            );
+        }
+    }
+    ci.rows
+}
+
+/// The profile-likelihood intervals of the REML LMM
+/// `Reaction ~ 1 + Days + (1 + Days | Subject)` on `sleepstudy` (profiled on
+/// its ML refit), against lme4's `confint(m, method = "profile")`. Each
+/// bound's difference is measured in units of lme4's interval width.
+#[test]
+fn profile_intervals_match_the_frozen_sleepstudy_reference() {
+    // `rows` of `profile_sleepstudy` (validation/goldens/inference/profile/;
+    // R 4.5.3, lme4 2.0.6, goldens_profile.R), as (parameter, lower, upper),
+    // lme4's row name beside each.
+    let want = [
+        // sd_(Intercept)|Subject
+        (
+            ProfileParam::Sd { group: 0, term: 0 },
+            14.3813849768344,
+            37.715831758311,
+        ),
+        // cor_Days.(Intercept)|Subject
+        (
+            ProfileParam::Cor {
+                group: 0,
+                row: 1,
+                col: 0,
+            },
+            -0.481500758489996,
+            0.684986289920817,
+        ),
+        // sd_Days|Subject
+        (
+            ProfileParam::Sd { group: 0, term: 1 },
+            3.80116411638208,
+            8.75338306919496,
+        ),
+        // sigma
+        (ProfileParam::Sigma, 22.8982668890036, 28.8579965181635),
+        // (Intercept)
+        (ProfileParam::Beta(0), 237.680695505234, 265.129514680174),
+        // Days
+        (ProfileParam::Beta(1), 7.35865327511699, 13.5759187517082),
+    ];
+    let m = side(
+        "Reaction ~ 1 + Days + (1 + Days | Subject)",
+        &sleepstudy(),
+        Family::Gaussian,
+        Some(true),
+    );
+    assert_eq!(profile_rows_match(&m, &want).len(), 6);
+}
+
+/// The profile-likelihood intervals of the REML LMM `Yield ~ 1 + (1 | Batch)`
+/// on `Dyestuff2`, whose SD is estimated at 0: its interval is one-sided,
+/// with the lower bound exactly 0, as lme4's.
+#[test]
+fn profile_intervals_match_the_frozen_dyestuff2_reference() {
+    // `rows` of `profile_dyestuff2` (validation/goldens/inference/profile/;
+    // R 4.5.3, lme4 2.0.6, goldens_profile.R), as (parameter, lower, upper),
+    // lme4's row name beside each.
+    let want = [
+        // sd_(Intercept)|Batch
+        (
+            ProfileParam::Sd { group: 0, term: 0 },
+            0.0,
+            2.08404348901022,
+        ),
+        // sigma
+        (ProfileParam::Sigma, 2.8928310201022, 4.81583255245072),
+        // (Intercept)
+        (ProfileParam::Beta(0), 4.31210021673831, 7.01909234683741),
+    ];
+    let dyestuff2 = csv_table(
+        include_str!("../validation/data/empirical/Dyestuff2.csv"),
+        &["Batch"],
+    );
+    let m = side(
+        "Yield ~ 1 + (1 | Batch)",
+        &dyestuff2,
+        Family::Gaussian,
+        Some(true),
+    );
+    let rows = profile_rows_match(&m, &want);
+    assert_eq!(rows.len(), 3);
+    let sd = rows
+        .iter()
+        .find(|r| r.param == ProfileParam::Sd { group: 0, term: 0 })
+        .unwrap();
+    assert_eq!(sd.lower, 0.0);
 }

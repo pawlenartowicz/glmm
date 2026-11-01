@@ -1142,9 +1142,10 @@ also keeps rescaling every weight by a power of two exact. `ln φ_int` is
 boxed to `[ln GAMMA_PHI_LO, ln GAMMA_PHI_HI] = [ln 1e-6, ln 1e6]` and seeded
 from the plug-in dispersion `D/Σŵ` (`ŵᵢ = wᵢ/w̄`) of the no-RE β start — a
 fixed box and a fixed seed regardless of the weights' own scale. A held
-dispersion (`FitOptions::dispersion = Some(v)`) enters the search as `v/w̄`,
-and so does a carried one (`StartValues::dispersion = Some(v)`), which only
-moves the start of the coordinate.
+dispersion (`FitOptions::dispersion = Dispersion::Fixed(v)`) enters the
+search as `v/w̄`, and so does a carried one
+(`StartValues::dispersion = Some(v)`), which only moves the start of the
+coordinate.
 One PIRLS solve per evaluation; there
 is no inner fixed point on φ. `φ_int` is the maximum-likelihood value of the
 Laplace objective on `ŵ`, and `φ̂ = w̄·φ_int` is reported as
@@ -1387,10 +1388,14 @@ the `loop_advanced` MCPower hot-loop surface.
 
 ## Boundary handling and the `singular` flag
 
-**Code:** the pin loop after the outer search converges in `glmm::fit_glmm`
-(`src/glmm/mod.rs`; `PIN_THETA` imported from `src/lmm/mod.rs`); the flag
-assembly and `has_negligible_component`
-(`SINGULAR_REL_TOL = 1e-3`) in `src/fit/mod.rs` and `src/fit/glmm.rs`.
+**Code:** the post-pin pass after the outer search ends (converged or out
+of budget) in `glmm::fit_glmm` (`src/glmm/mod.rs`), which runs the pin pass
+`lmm::pin_endpoint` shared with `fit_lmm`, the stationarity probe
+`optim::post_pin::stationarity_gain` (`src/optim/post_pin.rs`) and
+`lmm::fold_endpoint`; `PIN_THETA`, `PIN_DEVIANCE_SLACK`, `PIN_POLISH_DROP`,
+`PIN_PROBE_STEP` and `PIN_NOISE_ULPS` in `src/lmm/mod.rs`; the flag assembly
+and `has_negligible_component` (`SINGULAR_REL_TOL = 1e-3`) in
+`src/fit/mod.rs` and `src/fit/glmm.rs`.
 
 θ is the vech of the RE-covariance Cholesky factor Λ, searched in the box
 `[−THETA_HI, THETA_HI]` on every entry, diagonals included
@@ -1423,15 +1428,17 @@ with the exact-boundary estimate — a pinned correlation is reported as exactly
 `±1`, not `0.9999…`. Off-diagonals are never pinned (the Cholesky geometry
 above makes the diagonal pin the complete policy).
 
-Between the pin loop and that re-evaluation, each pinned `q ≥ 2` block is
-rewritten into its canonical Σ-preserving Λ by `canonicalize_pinned_blocks`
-(owning description in
-[`algorithms-lmm.md` §Canonical Λ after the pin](algorithms-lmm.md#canonical-λ-after-the-pin)
-— change together): the column below a pinned diagonal is unidentified, so it is
-folded into the trailing diagonals by re-factoring Σ, the pin test runs again,
-and the re-evaluation therefore rebuilds ũ, W̃ and the deviance at the canonical
-θ. Σ is unchanged, so the reported estimates are unchanged; `pinned` becomes
-truthful.
+Between the pin and that re-evaluation, each pinned `q ≥ 2` block is
+rewritten into its canonical Λ by `canonicalize_pinned_blocks` (owning
+description in
+[`algorithms-lmm.md` §Canonical Λ after the pin](algorithms-lmm.md#canonical-λ-after-the-pin);
+change together): the column below a pinned diagonal is unidentified, so it
+is folded into the trailing diagonals by re-factoring Σ, with the pin inside
+the factorization (a trailing pivot at or below `PIN_THETA` is skipped, its
+column zero), and the re-evaluation therefore rebuilds ũ, W̃ and the deviance
+at the canonical θ. Σ̂ loses only a pinned column's conditional variance (at
+most `PIN_THETA²`) and its conditional covariances, and `pinned` flags exactly
+the diagonals the fold leaves 0, each with its whole column 0.
 
 The AGQ route (`nagq > 1`, the `deviance::laplace_deviance` gate) is the
 exception. The vector AGQ product grid sits in the `u = Λ⁻¹b` coordinates, so
@@ -1441,15 +1448,20 @@ pass keep the search's own Λ, so the reported deviance is the value the search
 reached, not a second quadrature of the same Σ.
 
 Unlike the LMM path, the GLMM path then checks the pinned re-evaluation
-against the search's own best objective. `PIN_THETA` is absolute on θ, but
-what a θ that small is worth depends on the working weights: under very
-precise data (Poisson counts near e¹⁶, working weights about 9e6) a θ̂ of 7e-5
-is a real variance, and zeroing it with β held can raise the deviance by tens
-of units. When the pinned deviance (with the dispersion term the search
+against the search's own best objective (after a polish, below, the
+polish's best). `PIN_THETA` is absolute on θ, but what a θ that small is
+worth depends on the working weights: under very precise data (Poisson
+counts near e¹⁶, working weights about 9e6) a θ̂ of 7e-5 is a real
+variance, and zeroing it with β held can raise the deviance by tens of
+units. When the pinned deviance (with the dispersion term the search
 carried) is more than `PIN_DEVIANCE_SLACK = 1e-6` above that best objective,
 the pin is undone: θ goes back to the search's point, the flags are cleared,
 and the fit is re-evaluated and reported there, still `converged`. On the
 grid's pinned cells a pin costs at most 2.6e-8, so no pin there is undone.
+The slack is absolute until the objective's own round-off is larger: both
+it and `PIN_POLISH_DROP` below are floored at `PIN_NOISE_ULPS = 64` ULPs of
+the incumbent, which takes over past |D| ≈ 7e7 for the slack and 7e6 for
+the drop.
 
 A pin that *lowers* the objective by more than `PIN_POLISH_DROP = 1e-7`, or
 whose corner the stationarity probe below finds off the optimum of the free
@@ -1464,30 +1476,78 @@ ended up to 0.08 short of the `(1 | g)` optimum, and on the fit of
 wall is what pinning lowers; one at the trough's bottom it does not, and
 which of the two a search ends at is round-off (that fit ends at θ_h = 5e-7
 on x86, a drop of 4.5e-5, and at θ_h = −1e-8 on aarch64, a drop of 3e-8;
-2026-10-08). So every kept pin is also probed: each free θ coordinate is
-evaluated `PIN_PROBE_STEP = 1e-3` either way on the polish's own objective
-(β held, the pinned coordinates 0), and the larger of the drop to the lower
+2026-10-08). So the kept pin of the search's endpoint is also probed: each
+free θ coordinate is evaluated `PIN_PROBE_STEP = 1e-3` either way on the
+polish's own objective (β held, the pinned coordinates 0), and the larger of
+the drop to the lower
 probe and the parabola's `g²/(2c)` through the three points is the predicted
 gain along it; above `PIN_POLISH_DROP` the polish runs. The step is small
 enough that the parabola's error (fourth power of the step) stays near 1e-11
 on an endpoint the gradient search certified, where `GLMM_RHO_POLISH` read
 1e-6 and polished for nothing; a starved endpoint is found by extrapolation
-(the parabola predicts about 1 from 0.24 off). The probes run once per fit,
-only when the drop has not already decided, and count in `n_eval` (two per
-free θ coordinate). The polish is the joint `[θ | β̃]` search (`ws.solver`)
-from the pinned point, with the pinned coordinates read as 0 and the
-dispersion held, so the trough is gone; its point is kept only when its
-deviance is lower, and then re-evaluated like the pin. A polish that finds
-nothing lower, and a probe that finds the corner stationary, re-evaluate the
-pinned point once more (not a search evaluation), so the reported ũ, W̃ and
-`M` are the pinned point's own and not the last probed point's. β̃ is scaled
-by the β information at the pinned θ, from one PQL solve there, as in the
-second pass above (the design scale when that solve fails). The polish's
+(the parabola predicts about 1 from 0.24 off). The parabola's curvature
+along each coordinate also scales the polish, so the probes run at every
+kept pin of the search's endpoint, also when the drop alone decides; they
+count in `n_eval` (two per free θ coordinate). The polish is the joint
+`[θ | β̃]` search (`ws.solver`) from the pinned point, with the pinned
+coordinates read as 0 and the dispersion held, so the trough is gone. β̃ is
+scaled by the β information at the pinned θ, from one PQL solve there, as in
+the second pass above (the design scale when that solve fails), which gives
+each β̃ axis a curvature of about 2·Σ(prior weight). A free θ coordinate the
+probe finds stiffer than that, curvature `cⱼ > 2·Σ(prior weight)`, is
+searched as `θⱼ/sⱼ` with `sⱼ = √(2·Σ(prior weight)/cⱼ)`; every other θ
+coordinate is searched as it is. Under very precise data a loading near 0
+has a curvature that grows with Σw: on the precise Poisson
+`(1 + x1 + x2 | g)` fit of `trough_polish_reaches_the_optimum_on_precise_data`
+(log-mean e¹⁴, both slope SDs 0) the profiled Hessian at the optimum has
+eigenvalues 336 along the intercept's loading and 1.4e8 to 4.5e8 along the
+slopes' loadings. BOBYQA's single trust radius then shrinks to its end each
+time the intercept's loading has moved about 6e-4. Under an earlier design
+that chained polishes, each unscaled polish on that fit gained 1e-3 or less
+after the first three, and twelve polishes stopped 5e-7 (aarch64 macOS) to
+9.2e-4 (x86_64 Linux) above the optimum that lme4 and a warm restart reach.
+Scaled, the one polish reaches it on every platform. The polish's
 evaluations count in `n_eval`; the PQL solve does not. On 614 simulated
-pinned fits the drop alone ran it on 190, helped 184 of them, and left 5 of
-100 crossed fits more than 1e-3 above the `(1 | g)` optimum against 35
-without it; those 5 were fits the drop did not run it on, which the probe
-is for. No pinned grid cell runs it on the drop.
+pinned fits the drop alone ran it on 190, helped
+184 of them, and left 5 of 100 crossed fits more than 1e-3 above the
+`(1 | g)` optimum against 35 without it; those 5 were fits the drop did not
+run it on, which the probe is for. No pinned grid cell runs it on the drop.
+
+A fit is polished at most once. A polish whose best point is lower than the
+pinned point makes that best value the incumbent, and its point goes through
+the pin pass, the re-evaluation and the incumbent check once more (sign fix,
+pin, canonical fold); then the fit stops, with no second probe and no second
+polish. So a coordinate the polish leaves at or below `PIN_THETA` is pinned
+and flagged like any other, and the coordinates it held at 0 stay pinned.
+When that incumbent check undoes the pin, θ goes back to the polish's
+endpoint after the sign fix, folded by `fold_endpoint` without the pin (the
+trace floor alone, Σ kept), and the flags are the diagonals that fold leaves
+exactly 0: the polish moved the entries below a diagonal it held at 0 as free
+coordinates, and an entry under an earlier zero diagonal folds onto a later
+one (`q = 2`: `[0, a, 0]` folds to `[0, 0, |a|]`), so a held zero usually
+stays 0 but need not. A new diagonal in (0, `PIN_THETA`] is not pinned,
+though the trace floor still zeroes a pivot below the round-off of Σ
+(`q·ε·tr Σ`). On the AGQ route θ keeps the polish's Λ and that fold runs on the copy, which
+gives the flags, as at the first pin. A polish that finds nothing lower, and
+a probe that finds the corner stationary, leave the pinned point as the fit
+and re-evaluate it once more (not a search evaluation), so the reported ũ, W̃
+and `M` are the pinned point's own and not the last probed point's. A polish
+that stops at its evaluation budget (`MaxFunReached`) makes the fit a
+budget-exhausted one, like an outer search that runs out: the fit is
+reported with `converged = false`, `boundary_hit = 2` and no pin flags.
+Under the `counters` feature `EvalCounters::post_pin_searches` counts the
+polishes: 0 or 1.
+
+Together these give the reporting rule. On a converged fit on the Laplace
+and LMM routes, for blocks of width ≤ `MAX_PRIMARY_Q`: a diagonal is flagged
+exactly when its reported value is 0; on the kernel's θ a zero diagonal's
+whole column is 0; and no kernel diagonal lies in (0, `PIN_THETA`] unless the
+incumbent check undid the pin. On AGQ the flags describe Σ̂ (the folded copy,
+or the caller's zeros when a slope is centered, below) and the reported Λ may
+keep a zero diagonal above a live entry, so an exact-zero diagonal of the
+reported θ can be unflagged there. A block past `MAX_PRIMARY_Q` (sparse
+route only) is never folded, and a fit that is not converged reports no
+flags.
 
 `pinned` is reported in the caller's coordinates. The pin acts on the kernel's
 θ̃, on the standardized design; when a slope of the block is centered, the

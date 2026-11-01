@@ -1,4 +1,5 @@
-#![cfg(feature = "formula")]
+// The parser and its AST are public only with `orchestrate`.
+#![cfg(feature = "orchestrate")]
 //! Proves the parser is a superset of MCPower's — the 28 canonical cases parse
 //! identically; everything below the canonical suite is glmm-only grammar.
 //! Two corpora:

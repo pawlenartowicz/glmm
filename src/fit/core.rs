@@ -16,6 +16,7 @@ use faer::Mat;
 
 use crate::glmm::GlmmWorkspace;
 use crate::lmm::{Criterion, LmmGroupings, LmmWorkspace};
+use crate::ols::{contrast_t_sq_of, pair_contrast_norm_sq};
 use crate::standardize::ColumnScaling;
 use crate::{BinomialLink, Data, Design, Family, GroupIds, ModelSpec, Note, StartValues};
 
@@ -238,6 +239,43 @@ impl FitView<'_> {
         }
     }
 
+    /// Wald statistic t² of the pairwise contrast `β_p − β_n`, in the caller's
+    /// units on every route (the draw's column map is read into the
+    /// contrast). The pair need not be among the columns `se_for` selects,
+    /// except on the negative-binomial routes, whose assembled `Fit` holds a
+    /// covariance on those columns only: a pair outside them is NaN there.
+    ///
+    /// The variance is on [`Self::var_diag`]'s scale: σ̂²-scaled on OLS and the
+    /// LMM, the `wald_se` arm's on the GLMM, and φ = 1 on the GLM route, so on
+    /// a Gamma or inverse-Gaussian GLM a caller divides the value by φ̂.
+    ///
+    /// NaN on a fit that did not converge, an index ≥ p, `p_col == n_col` (a
+    /// zero contrast has no test), `scratch` shorter than p, a GLM fit with
+    /// `se_unavailable`, or a variance that is not finite and positive.
+    /// `scratch` is overwritten and not read on output.
+    pub fn contrast_t_sq(&self, p_col: u32, n_col: u32, scratch: &mut [f64]) -> f64 {
+        let betas = self.betas();
+        let p = betas.len();
+        let (pc, nc) = (p_col as usize, n_col as usize);
+        if !self.converged() || pc >= p || nc >= p || pc == nc || scratch.len() < p {
+            return f64::NAN;
+        }
+        let var = match &self.kind {
+            FitViewKind::Ols(v) => {
+                v.sigma_sq * pair_contrast_norm_sq(v.factor, self.map, p, p_col, n_col, scratch)
+            }
+            FitViewKind::Glm(v) if v.se_unavailable => f64::NAN,
+            FitViewKind::Glm(v) => pair_contrast_norm_sq(v.l, self.map, p, p_col, n_col, scratch),
+            FitViewKind::Lmm(v) => v.contrast_var(p_col, n_col, scratch),
+            FitViewKind::Glmm(v) => v.contrast_var(pc, nc),
+            FitViewKind::Prebuilt { fit, .. } => {
+                let c = fit.vcov();
+                c[pc * p + pc] + c[nc * p + nc] - 2.0 * c[pc * p + nc]
+            }
+        };
+        contrast_t_sq_of(betas[pc] - betas[nc], var)
+    }
+
     /// Joint Wald-χ² over the target set (the omnibus significance read). Only
     /// the mixed arms compute it; OLS/GLM (never read here) and the `Prebuilt`
     /// arm (`Fit` carries no joint statistic) report NaN.
@@ -251,7 +289,7 @@ impl FitView<'_> {
     }
 
     /// Objective evaluations the solve spent. OLS is closed-form (0); the
-    /// `Prebuilt` arm forwards the kernel's `Fit.n_eval`. GLM reports 0 by
+    /// `Prebuilt` arm forwards the kernel's `Fit::n_eval()`. GLM reports 0 by
     /// choice, not by omission — it has no objective to evaluate, and its
     /// `GlmFitView::n_iter` counts IRLS steps, which is a different quantity
     /// from the θ-search evaluation count every other arm reports here.
@@ -264,7 +302,7 @@ impl FitView<'_> {
         }
     }
 
-    /// Estimator dispersion: LMM σ̂², GLMM `D̂[0][0]`, `Prebuilt` `Fit.dispersion`.
+    /// Estimator dispersion: LMM σ̂², GLMM `D̂[0][0]`, `Prebuilt` `Fit::dispersion()`.
     /// OLS/GLM (never read here) report NaN.
     ///
     /// The GLMM's `D̂[0][0]` is the primary grouping's random-intercept
@@ -692,6 +730,17 @@ impl FitWorkspace {
     }
 }
 
+impl FitWorkspace {
+    /// The LMM workspace and this draw's column map, as a fit left them (the
+    /// profile intervals search there). `None` on every non-LMM workspace.
+    pub(crate) fn lmm_parts(&mut self) -> Option<(&mut LmmWorkspace, &ColumnScaling)> {
+        match &mut self.kind {
+            FitKind::Lmm { ws, .. } => Some((ws, &self.scaling)),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 impl FitWorkspace {
     pub(crate) fn is_ols(&self) -> bool {
@@ -742,14 +791,6 @@ impl FitWorkspace {
         match &ws.kernel {
             crate::lmm::LmmKernel::Dense { fit, .. } => Some(fit.criterion),
             crate::lmm::LmmKernel::Sparse { ws, .. } => ws.as_ref().map(|s| s.criterion),
-        }
-    }
-    /// The LMM workspace and this draw's column map, for tests that read what
-    /// a fit left there. `None` on every non-LMM workspace.
-    pub(crate) fn lmm_parts(&mut self) -> Option<(&mut LmmWorkspace, &ColumnScaling)> {
-        match &mut self.kind {
-            FitKind::Lmm { ws, .. } => Some((ws, &self.scaling)),
-            _ => None,
         }
     }
     /// The GLMM workspace and this draw's column map, as [`Self::lmm_parts`].
@@ -1052,13 +1093,12 @@ pub fn curvature_hint(ws: &mut FitWorkspace) -> Option<CurvatureHint> {
 /// untrustworthy as β̂ (they can be finite on aliased columns, where the
 /// stable path refits the reduced design and gives NaN): read
 /// `ill_conditioned` off [`FitView::diagnostics`] first, as for [`fit_on`].
+/// [`satterthwaite_with_contrasts`] runs the same pass and also gives the df
+/// of pairwise contrasts.
 ///
 /// # Errors
 ///
-/// `df_out` is then all NaN: [`NoDfReason::NotGaussianMixed`] on any
-/// workspace but a Gaussian LMM's (OLS included); [`NoDfReason::Failed`]
-/// when the pass failed (a stencil deviance, `C` or `σ̂²` not finite) or the
-/// fit had no finite endpoint to run it at.
+/// As [`satterthwaite_with_contrasts`]'s, with `df_out` all NaN.
 ///
 /// # Panics
 ///
@@ -1066,11 +1106,45 @@ pub fn curvature_hint(ws: &mut FitWorkspace) -> Option<CurvatureHint> {
 /// Gaussian LMM's and no `fit_on` has run on it. A dense one no `fit_on` has
 /// filled gives [`NoDfReason::Failed`], as a fit with no endpoint does.
 ///
-/// [`NoDfReason::NotGaussianMixed`]: crate::inference::contrast::NoDfReason::NotGaussianMixed
 /// [`NoDfReason::Failed`]: crate::inference::contrast::NoDfReason::Failed
 pub fn satterthwaite(
     ws: &mut FitWorkspace,
     df_out: &mut [f64],
+) -> Result<(), crate::inference::contrast::ContrastError> {
+    satterthwaite_with_contrasts(ws, df_out, &[], &mut [])
+}
+
+/// [`satterthwaite`]'s pass, also writing the df of each pair's contrast
+/// `e_p − e_n` (`β_p − β_n`, in the caller's units, as
+/// [`FitView::contrast_t_sq`] tests it) into `contrast_df_out`: the stable
+/// path's `Fit::contrast_t` df of that contrast, capped at ν as the
+/// per-target df are. A pair with an index at least the workspace's `p`, or
+/// with its two indices equal, gets NaN. Neither column need be a target, and the pairs add
+/// no deviance evaluation to the pass, so `df_out` is [`satterthwaite`]'s bit
+/// for bit.
+///
+/// # Errors
+///
+/// `df_out` and `contrast_df_out` are then all NaN:
+/// [`NoDfReason::NotGaussianMixed`] on any workspace but a Gaussian LMM's
+/// (OLS included); [`NoDfReason::Failed`] when the pass failed (a stencil
+/// deviance, `C` or `σ̂²` not finite) or the fit had no finite endpoint to
+/// run it at.
+///
+/// # Panics
+///
+/// When `df_out.len()` is not the workspace's `p` or `contrast_df_out.len()`
+/// is not `contrasts.len()`, or when `ws` is a sparse Gaussian LMM's and no
+/// `fit_on` has run on it. A dense one no `fit_on` has filled gives
+/// [`NoDfReason::Failed`], as a fit with no endpoint does.
+///
+/// [`NoDfReason::NotGaussianMixed`]: crate::inference::contrast::NoDfReason::NotGaussianMixed
+/// [`NoDfReason::Failed`]: crate::inference::contrast::NoDfReason::Failed
+pub fn satterthwaite_with_contrasts(
+    ws: &mut FitWorkspace,
+    df_out: &mut [f64],
+    contrasts: &[(u32, u32)],
+    contrast_df_out: &mut [f64],
 ) -> Result<(), crate::inference::contrast::ContrastError> {
     use crate::inference::contrast::{ContrastError, NoDfReason};
     assert_eq!(
@@ -1078,7 +1152,13 @@ pub fn satterthwaite(
         ws.p,
         "satterthwaite: df_out.len() must be the workspace's p"
     );
+    assert_eq!(
+        contrast_df_out.len(),
+        contrasts.len(),
+        "satterthwaite: contrast_df_out.len() must be contrasts.len()"
+    );
     df_out.fill(f64::NAN);
+    contrast_df_out.fill(f64::NAN);
     let FitKind::Lmm { ws: lmm, .. } = &mut ws.kind else {
         return Err(ContrastError::NoDf(NoDfReason::NotGaussianMixed));
     };
@@ -1092,7 +1172,14 @@ pub fn satterthwaite(
     {
         return Err(ContrastError::NoDf(NoDfReason::Failed));
     }
-    if !crate::lmm::satterthwaite::pass_targets(lmm, &ws.scaling, &ws.targets, df_out) {
+    if !crate::lmm::satterthwaite::pass_targets(
+        lmm,
+        &ws.scaling,
+        &ws.targets,
+        df_out,
+        contrasts,
+        contrast_df_out,
+    ) {
         return Err(ContrastError::NoDf(NoDfReason::Failed));
     }
     Ok(())
@@ -1191,7 +1278,12 @@ pub fn fit_on_hinted<'a>(
             // `opts.dispersion`: the workspace's held φ is set later, by the fit.
             FitKind::Glmm { ws } => {
                 let n_free = ws.groupings.n_free_theta();
-                crate::glmm::grad_search_dim(ws.family, n_free, ws.p, opts.dispersion.is_some())
+                crate::glmm::grad_search_dim(
+                    ws.family,
+                    n_free,
+                    ws.p,
+                    opts.dispersion.held().is_some(),
+                )
             }
             _ => panic!("fit_on_hinted: a curvature hint applies to LMM and GLMM workspaces only"),
         };

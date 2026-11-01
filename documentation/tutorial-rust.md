@@ -48,7 +48,7 @@ let mut agq = FitOptions::default();
 agq.nagq = 7;
 let glmm = fit("passed ~ x1 + (1 | school)", &table, probit, &agq)?;
 
-println!("{:?} {:?}", glmm.fit().beta, glmm.fit().se);           // estimates and standard errors
+println!("{:?} {:?}", glmm.fit().beta(), glmm.fit().se());       // estimates and standard errors
 println!("{} {}", glmm.fit().converged(), glmm.fit().singular()); // result flags
 ```
 
@@ -87,7 +87,7 @@ let opts = FitOptions::default(); // se_for: SeFor::All, an SE for both columns
 
 let fit = glmm::fit(&data, &model, &opts)?;
 assert!(fit.converged());
-println!("beta = {:?}, se = {:?}", fit.beta, fit.se);
+println!("beta = {:?}, se = {:?}", fit.beta(), fit.se());
 ```
 
 Points worth knowing at this layer:
@@ -105,11 +105,11 @@ Points worth knowing at this layer:
   `SeFor::All`) — SE computation has a cost, so `SeFor::Only` asks for only
   the columns you need.
 - `fit.converged() == false` signals a numerical failure (not a panic); check
-  it before trusting `beta`/`se`. It reads `fit.diagnostics.converged` —
+  it before trusting `beta`/`se`. It reads `fit.diagnostics().converged` —
   everything the fit reports about *itself* (convergence, singularity, the
   aliased-column mask, the θ boundary state, any solver notes, and how the
   gradient search ended: `n_grad`, `outer_stop`, `outer_decrement`) lives on
-  `fit.diagnostics`, with `converged()`/`singular()`/`aliased()` kept as
+  `fit.diagnostics()`, with `converged()`/`singular()`/`aliased()` kept as
   forwarding accessors for the three most-read ones.
 - **Experimental: in-fit parallelism.** Building with the `parallel` cargo
   feature *and* setting `opts.parallel_inner = true` runs the AGQ
@@ -121,7 +121,7 @@ Points worth knowing at this layer:
   own parallel loop over many fits (the outer loop should own the cores).
 - **The envelope.** The dense ("NoZ") solver has capacity limits:
   `re.slopes.len() + 1 <= 8` (primary width), up to 6 extra groupings, and
-  `slopes.len() + 1 <= 4` per extra grouping (`glmm::consts::{MAX_PRIMARY_Q,
+  `slopes.len() + 1 <= 4` per extra grouping (`glmm::limits::{MAX_PRIMARY_Q,
   MAX_EXTRA_GROUPINGS, MAX_EXTRA_Q}`). Within that envelope, a **Gaussian**
   extra grouping that carries a random slope is routed internally to a sparse
   solver instead (still just works — no API change). Outside the envelope, a
@@ -139,7 +139,7 @@ use glmm::inference::contrast::{ContrastError, NoDfReason};
 
 // Satterthwaite df of each target coefficient: the `df` column of lmerTest's
 // `summary()`.
-println!("df = {:?}", fit.coef_df);
+println!("df = {:?}", fit.coef_df());
 
 // t test of one contrast lᵀβ = 0, `l` over all p columns: here the slope.
 let t = fit.contrast_t(&[0.0, 1.0]).expect("a Gaussian LMM fit carries df");
@@ -153,7 +153,7 @@ println!("F({}, {}) = {}, p = {}", f.num_df, f.den_df, f.f, f.p_value);
 let mut off = opts.clone();
 off.satterthwaite = false;
 let fit_off = glmm::fit(&data, &model, &off)?;
-assert!(fit_off.coef_df.iter().all(|d| d.is_nan()));
+assert!(fit_off.coef_df().iter().all(|d| d.is_nan()));
 assert_eq!(
     fit_off.contrast_t(&[0.0, 1.0]),
     Err(ContrastError::NoDf(NoDfReason::Disabled))
@@ -206,7 +206,7 @@ println!(
 start. This is the natural next step once you're fitting the *same model
 shape* repeatedly with data that changes a little each time (e.g. bootstrap
 resamples, an outer optimization loop, or refitting after adding a few rows) —
-threading in the previous fit's `beta`/`theta` shortens the path to
+threading in the previous fit's β (and a θ the caller tracks itself) shortens the path to
 convergence. `fit` is exactly `fit_with_start` with an empty `StartValues`, so nothing here
 changes the *answer* — a warm start only changes how fast the optimizer gets
 there; the fitted MLE is start-independent.
@@ -218,7 +218,7 @@ use glmm::{Data, StartValues};
 let fit1 = glmm::fit(&Data::new(&x, &y, n, p).ids(&ids), &model, &opts)?;
 
 // ...data changes slightly (new resample, new batch, refit)...
-let start = StartValues::new(fit1.beta.clone(), vec![/* n_theta values from the model's RE structure */]);
+let start = StartValues::new(fit1.beta().to_vec(), Vec::new()); // β only: `Fit` reports no θ
 let fit2 = glmm::fit_with_start(&Data::new(&x2, &y2, n, p).ids(&ids), &model, &start, &opts)?;
 ```
 
@@ -227,7 +227,10 @@ Notes at this layer:
 - `StartValues.beta` must have length `p`; `StartValues.theta` must match the
   model's RE θ width (primary `vech(Λ)` plus one `vech(Λ_g)` block per extra
   grouping — a mismatch is a `FitError::Start` at the call boundary, not a
-  failure deep inside a kernel).
+  failure deep inside a kernel). Either may be left empty, which cold-starts
+  that part as `fit` does: `Fit` reports the variance components
+  (`varcorr(g)`), not θ, so a caller without its own θ passes β only. On an
+  LMM, which warm-starts θ only, a β-only start is a cold start.
 - For a fixed-only model (OLS/GLM) a warm start is a no-op — there's no
   optimizer state to seed — so just call `fit`.
 - The LMM kernel only warm-starts `theta` (β is solved exactly given θ, so a
@@ -292,6 +295,29 @@ pseudo-inverse's blocks. Any other workspace returns
 `Err(ContrastError::NoDf(NoDfReason::NotGaussianMixed))`, and a failed pass
 returns `NoDfReason::Failed` with `df_out` all NaN. On a rank-deficient draw
 the df are as untrustworthy as β̂, so read the diagnostics first, as below.
+
+A pairwise contrast `β_p − β_n` has both reads too: its Wald t² from
+`FitView::contrast_t_sq`, before `drop(view)`, and its df from
+`satterthwaite_with_contrasts`, the same pass with a list of pairs:
+
+```rust
+use glmm::loop_advanced::satterthwaite_with_contrasts;
+
+let (mut scratch, mut contrast_df) = (vec![0.0; p], vec![0.0; 1]);
+let view = fit_on(&mut ws, &Data::new(&draw.x, &draw.y, n, p), start.as_ref(), &opts);
+let t_sq = view.contrast_t_sq(1, 0, &mut scratch); // β_1 − β_0
+let converged = view.converged();
+drop(view);
+if converged {
+    satterthwaite_with_contrasts(&mut ws, &mut df_out, &[(1, 0)], &mut contrast_df)?;
+}
+```
+
+The pair need not be a target, except on a negative binomial fit, where a
+pair outside the `se_for` columns gives NaN. The df match
+`Fit::contrast_t`'s, and `df_out` gets what `satterthwaite` gives. On a GLM
+the t² takes φ = 1, as `var_diag` does: on a Gamma or inverse-Gaussian model
+divide it by φ̂.
 
 `fit_on` panics rather than misroutes: the design shape (rows, predictors) and
 the options frozen at build (`nagq`, the criterion `reml` resolves to on an
@@ -365,10 +391,11 @@ let fit = glmm::fit(&lo.data(), lo.spec(), &FitOptions::default())?;
 to nesting), discovers factor levels, builds the design matrix with treatment
 contrasts (R's default), and returns everything `glmm::fit` needs (`lo.data()`,
 `lo.spec()`) — including
-`lo.col_names`, the coefficient name for each design column. Use `parse`/
-`materialize` separately if you need to parse once and materialize against
-several data tables (the parse step is data-free).
+`lo.col_names`, the coefficient name for each design column. The two stages
+it runs, `parse` (data-free) and `materialize`, are public only with the
+`orchestrate` feature, outside the semver promise; with default features,
+call `lower` once per data table.
 
 If you only need the kernel — the parse-once/fit-many hot path — take
-`glmm = { version = "0.5", default-features = false }`; the formula module
+`glmm = { version = "...", default-features = false }`; the formula module
 disappears and the crate links no `regex`.

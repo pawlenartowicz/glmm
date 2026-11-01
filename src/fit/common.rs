@@ -19,7 +19,9 @@ use crate::{
     ReTerm, StartValues,
 };
 
-use super::{Boundary, CondvarCross, Diagnostics, Fit, FitError, FitOptions, Note, SeFor};
+use super::{
+    Boundary, CondvarCross, Diagnostics, ErrorMessage, Fit, FitError, FitOptions, Note, SeFor,
+};
 
 /// Every diagnostic a fitting arm produces, in one carrier. Each of the five
 /// routes fills it once (`OlsFitView::diagnostics` and its four siblings), the
@@ -384,7 +386,7 @@ pub(super) fn start_to_design(
 /// centered slope can leave no false zero here. Once a slope is centered `M` is
 /// not lower triangular, so the sum runs over every `k`. `map` is the fit's
 /// column standardization, which `N` is read from.
-pub(super) fn varcorr_block(
+pub(crate) fn varcorr_block(
     theta_block: &[f64],
     q: usize,
     scale: f64,
@@ -492,9 +494,9 @@ pub(crate) fn glmm_loglik(
 /// [`Fit::df`] for a converged fit: retained fixed effects + RE θ parameters +
 /// 1 if the family estimates a dispersion/scale. `n_theta` counts the free θ
 /// only ([`crate::lmm::LmmGroupings::n_free_theta`]): an entry the grouping's
-/// terms hold at zero is not estimated. `dispersion_fixed` is
-/// `FitOptions::dispersion.is_some()` (Gamma's hold-φ-fixed directive; every
-/// other family ignores it).
+/// terms hold at zero is not estimated. `dispersion_fixed` is whether
+/// `FitOptions::dispersion` is `Dispersion::Fixed` (the Gamma and
+/// inverse-Gaussian hold-φ-fixed directive; every other family ignores it).
 pub(crate) fn model_df(
     family: Family,
     p_retained: usize,
@@ -1486,7 +1488,7 @@ pub(super) fn fit_rank_deficient(
     let mut vcov = nan_vcov(p);
     for (ri, &oi) in kept.iter().enumerate() {
         for (rj, &oj) in kept.iter().enumerate() {
-            vcov[oi][oj] = fr.vcov[ri][rj];
+            vcov[oi * p + oj] = fr.vcov[ri * kept.len() + rj];
         }
     }
     // `condvar_x` rows are `p` wide: the same scatter, an aliased column NaN.
@@ -1539,18 +1541,18 @@ pub(super) fn fit_rank_deficient(
 pub(super) fn check_group_ids(re: &ReStructure, ids: &GroupIds, n: usize) -> Result<(), FitError> {
     if ids.primary.len() != n {
         return Err(FitError::Ids(
-            "GroupIds.primary must have n elements".to_string(),
+            "GroupIds.primary must have n elements".into(),
         ));
     }
     if ids.extra.len() != re.extra_groupings.len() {
         return Err(FitError::Ids(
-            "GroupIds.extra must align 1:1 with re.extra_groupings (declaration order)".to_string(),
+            "GroupIds.extra must align 1:1 with re.extra_groupings (declaration order)".into(),
         ));
     }
     if let Some(g) = ids.extra.iter().position(|e| e.len() != n) {
-        return Err(FitError::Ids(format!(
-            "GroupIds.extra[{g}] must have n elements"
-        )));
+        return Err(FitError::Ids(
+            format!("GroupIds.extra[{g}] must have n elements").into(),
+        ));
     }
     Ok(())
 }
@@ -1586,10 +1588,14 @@ fn check_nested_ids(re: &ReStructure, ids: &GroupIds) -> Result<(), FitError> {
             .zip(&ids.primary)
             .position(|(&c, &p)| c as usize / w != p as usize);
         if let Some(i) = bad {
-            return Err(FitError::Ids(format!(
-                "GroupIds.extra[{g}] is nested: a child id must be parent * {w} + its \
-                 position within the parent, got {} under parent {} (row {i})",
-                child[i], ids.primary[i]
+            return Err(FitError::Ids(ErrorMessage::at_row(
+                format!(
+                    "GroupIds.extra[{g}] is nested: a child id must be parent * {w} + its \
+                     position within the parent, got {} under parent {} (row ",
+                    child[i], ids.primary[i]
+                ),
+                i,
+                ")",
             )));
         }
     }
@@ -1607,22 +1613,24 @@ fn check_id_bound(re: &ReStructure, ids: &GroupIds, n: usize) -> Result<(), FitE
         .map(|(g, (_, v))| (format!("extra[{g}]"), v));
     for (name, v) in std::iter::once(("primary".to_string(), &ids.primary)).chain(crossed) {
         if let Some(i) = v.iter().position(|&id| id as usize >= n) {
-            return Err(FitError::Ids(format!(
-                "GroupIds.{name}: id {} is not below the row count {n} (row {i}); number \
-                 the levels 0, 1, 2, ... with no gaps",
-                v[i]
+            return Err(FitError::Ids(ErrorMessage::at_row(
+                format!(
+                    "GroupIds.{name}: id {} is not below the row count {n} (row ",
+                    v[i]
+                ),
+                i,
+                "); number the levels 0, 1, 2, ... with no gaps",
             )));
         }
     }
     Ok(())
 }
 
-/// The first row whose value fails `ok`, as the ` (row k)` suffix of a
-/// [`FitError`] message.
-fn bad_row(v: &[f64], ok: impl Fn(f64) -> bool) -> Option<String> {
+/// The message `what (row k)` of the first row `k` whose value fails `ok`.
+fn bad_row(v: &[f64], ok: impl Fn(f64) -> bool, what: &str) -> Option<ErrorMessage> {
     v.iter()
         .position(|&a| !ok(a))
-        .map(|i| format!(" (row {i})"))
+        .map(|i| ErrorMessage::at_row(format!("{what} (row "), i, ")"))
 }
 
 /// The input check [`super::fit`] and [`super::fit_with_start`] share: every
@@ -1644,12 +1652,10 @@ pub(crate) fn validate(
     let Design { n, p, .. } = data.design;
     let y = data.y;
     if y.len() != n {
-        return Err(FitError::Shape("y must have n elements".to_string()));
+        return Err(FitError::Shape("y must have n elements".into()));
     }
-    if let Some(row) = bad_row(y, f64::is_finite) {
-        return Err(FitError::ResponseOutOfSupport(format!(
-            "y must be finite{row}"
-        )));
+    if let Some(m) = bad_row(y, f64::is_finite, "y must be finite") {
+        return Err(FitError::ResponseOutOfSupport(m));
     }
     // An EMPTY field means "cold-start this component" — a caller that knows only
     // one of the two (an R `start = list(theta = …)`, lme4's shape) cannot compute
@@ -1657,7 +1663,7 @@ pub(crate) fn validate(
     // blind THETA0 shape, both of which live inside the kernels. So the widths
     // accepted are {0, exact}, and each consumption site falls back on empty.
     if let Some(s) = start {
-        let start_err = |m: &str| Err(FitError::Start(m.to_string()));
+        let start_err = |m: &str| Err(FitError::Start(m.into()));
         if !(s.beta.is_empty() || s.beta.len() == p) {
             return start_err("StartValues.beta must have p elements, or be empty to cold-start β");
         }
@@ -1687,8 +1693,7 @@ pub(crate) fn validate(
     // success PROPORTION (`crate::family`'s aggregated convention: row `i` is
     // `wᵢ` trials with `wᵢ·yᵢ` successes, unit weights ⇒ Bernoulli), so
     // `0..=1` covers both the raw 0/1 case and "successes above trials".
-    let refused =
-        |ok: fn(f64) -> bool, what: &str| bad_row(y, ok).map(|row| format!("{what}{row}"));
+    let refused = |ok: fn(f64) -> bool, what: &str| bad_row(y, ok, what);
     let out_of_support = match spec.family {
         Family::Gaussian => None,
         Family::Poisson { .. } => refused(|v| v >= 0.0, "Poisson response must be >= 0"),
@@ -1712,18 +1717,18 @@ pub(crate) fn validate(
     // family with no φ to hold (Gaussian, Poisson, binomial, NB) just ignores
     // the field, as its doc says — the ports already clear it with an
     // `argument_ignored` warning before it gets here.
-    if let Some(d) = opts.dispersion {
+    if let Some(d) = opts.dispersion.held() {
         if !(d.is_finite() && d > 0.0) {
             return Err(FitError::OptionValue(
-                "FitOptions.dispersion must be finite and > 0".to_string(),
+                "FitOptions.dispersion must be finite and > 0".into(),
             ));
         }
     }
     if let SeFor::Only(cols) = &opts.se_for {
         if let Some(&c) = cols.iter().find(|&&c| c as usize >= p) {
-            return Err(FitError::OptionValue(format!(
-                "FitOptions.se_for column {c} out of range (p={p})"
-            )));
+            return Err(FitError::OptionValue(
+                format!("FitOptions.se_for column {c} out of range (p={p})").into(),
+            ));
         }
     }
     Ok(())
@@ -1752,27 +1757,27 @@ pub(crate) fn validate_design(
     } = design;
     if x.len() != n * p {
         return Err(FitError::Shape(
-            "x must have n*p elements in row-major layout".to_string(),
+            "x must have n*p elements in row-major layout".into(),
         ));
     }
     if let Some(k) = x.iter().position(|v| !v.is_finite()) {
-        return Err(FitError::Shape(format!(
-            "x must be finite (row {}, column {})",
+        return Err(FitError::Shape(ErrorMessage::at_row(
+            "x must be finite (row ".to_string(),
             k / p,
-            k % p
+            &format!(", column {})", k % p),
         )));
     }
     let z = re.unwrap_or(&[]);
     if z.len() != n * s {
         return Err(FitError::Shape(
-            "re_columns must have n*s elements in row-major layout".to_string(),
+            "re_columns must have n*s elements in row-major layout".into(),
         ));
     }
     if let Some(k) = z.iter().position(|v| !v.is_finite()) {
-        return Err(FitError::Shape(format!(
-            "re_columns must be finite (row {}, column {})",
+        return Err(FitError::Shape(ErrorMessage::at_row(
+            "re_columns must be finite (row ".to_string(),
             k / s,
-            k % s
+            &format!(", column {})", k % s),
         )));
     }
     check_model_shape(spec, nagq)?;
@@ -1783,12 +1788,12 @@ pub(crate) fn validate_design(
         (Some(re), Some(ids)) => check_group_ids(re, ids, n)?,
         (Some(_), None) if ids_required => {
             return Err(FitError::Ids(
-                "a model with random effects needs GroupIds (Data::ids)".to_string(),
+                "a model with random effects needs GroupIds (Data::ids)".into(),
             ))
         }
         (None, Some(ids)) if !(ids.primary.is_empty() && ids.extra.is_empty()) => {
             return Err(FitError::Ids(
-                "GroupIds given for a model without random effects".to_string(),
+                "GroupIds given for a model without random effects".into(),
             ))
         }
         (Some(_), None) | (None, _) => {}
@@ -1796,23 +1801,23 @@ pub(crate) fn validate_design(
     if let Some(w) = weights {
         if w.len() != n {
             return Err(FitError::Weights(
-                "Data weights must have n elements".to_string(),
+                "Data weights must have n elements".into(),
             ));
         }
-        if let Some(row) = bad_row(w, |v| v.is_finite() && v > 0.0) {
-            return Err(FitError::Weights(format!(
-                "Data weights must be finite and > 0{row}"
-            )));
+        if let Some(m) = bad_row(
+            w,
+            |v| v.is_finite() && v > 0.0,
+            "Data weights must be finite and > 0",
+        ) {
+            return Err(FitError::Weights(m));
         }
     }
     if let Some(o) = offset {
         if o.len() != n {
-            return Err(FitError::Offset(
-                "Data offset must have n elements".to_string(),
-            ));
+            return Err(FitError::Offset("Data offset must have n elements".into()));
         }
-        if let Some(row) = bad_row(o, f64::is_finite) {
-            return Err(FitError::Offset(format!("Data offset must be finite{row}")));
+        if let Some(m) = bad_row(o, f64::is_finite, "Data offset must be finite") {
+            return Err(FitError::Offset(m));
         }
     }
     Ok(())
@@ -1864,10 +1869,10 @@ pub(crate) fn check_model_shape(model: &ModelSpec, nagq: u8) -> Result<(), FitEr
         )
     };
     if nagq % 2 == 0 {
-        return Err(FitError::OptionValue(nagq_range()));
+        return Err(FitError::OptionValue(nagq_range().into()));
     }
     if nagq > crate::consts::MAX_NAGQ {
-        return Err(FitError::Envelope(nagq_range()));
+        return Err(FitError::Envelope(nagq_range().into()));
     }
     let Some(re) = model.re.as_ref() else {
         return Ok(());
@@ -1885,12 +1890,12 @@ pub(crate) fn check_model_shape(model: &ModelSpec, nagq: u8) -> Result<(), FitEr
             return Err(FitError::Unsupported(format!(
                 "nagq>1 applies only to binomial, Poisson, negative-binomial and Gamma GLMMs, not {:?}",
                 model.family
-            )));
+            ).into()));
         }
         if !re.extra_groupings.is_empty() {
             return Err(FitError::Unsupported(
                 "nagq>1 needs a single grouping factor (no crossed or nested extra groupings)"
-                    .to_string(),
+                    .into(),
             ));
         }
         // q_p = 1 + #primary slopes. The q_p ≥ 4 refusal is a TEMPORARY cost /
@@ -1900,10 +1905,13 @@ pub(crate) fn check_model_shape(model: &ModelSpec, nagq: u8) -> Result<(), FitEr
         // extends past it, rather than let uncapped q_p through untested.
         let q_p = 1 + re.slopes.len();
         if q_p > 3 {
-            return Err(FitError::Unsupported(format!(
-                "nagq>1 with q_p={q_p} random effects per group exceeds the temporary \
+            return Err(FitError::Unsupported(
+                format!(
+                    "nagq>1 with q_p={q_p} random effects per group exceeds the temporary \
                  q_p≤3 cap (a cost/oracle-coverage boundary, not a code limit)"
-            )));
+                )
+                .into(),
+            ));
         }
     }
     // Inverse-Gaussian mixed models are deliberately not built: the GLMM
@@ -1912,8 +1920,7 @@ pub(crate) fn check_model_shape(model: &ModelSpec, nagq: u8) -> Result<(), FitEr
     // dispatch, so no workspace is allocated for a model that cannot be fit.
     if matches!(model.family, Family::InverseGaussian { .. }) {
         return Err(FitError::Unsupported(
-            "inverse-Gaussian mixed models are not implemented (fixed-effects GLM only)"
-                .to_string(),
+            "inverse-Gaussian mixed models are not implemented (fixed-effects GLM only)".into(),
         ));
     }
     check_terms(&re.slopes, &re.terms, "primary grouping")?;
@@ -1930,9 +1937,9 @@ pub(crate) fn check_model_shape(model: &ModelSpec, nagq: u8) -> Result<(), FitEr
         .filter(|g| matches!(g.relation, GroupingRelation::NestedWithin))
         .count();
     if n_nested > 1 {
-        return Err(FitError::Unsupported(format!(
-            "at most one NestedWithin extra grouping is supported (got {n_nested})"
-        )));
+        return Err(FitError::Unsupported(
+            format!("at most one NestedWithin extra grouping is supported (got {n_nested})").into(),
+        ));
     }
     Ok(())
 }
@@ -1953,9 +1960,9 @@ fn check_slope_columns(model: &ModelSpec, p: usize, s: usize) -> Result<(), FitE
             for &c in slopes {
                 let c = c as usize;
                 if c >= p + s {
-                    return Err(FitError::Shape(format!(
-                        "{what} slope column {c} out of range (p={p}, s={s})"
-                    )));
+                    return Err(FitError::Shape(
+                        format!("{what} slope column {c} out of range (p={p}, s={s})").into(),
+                    ));
                 }
                 if c >= p {
                     read[c - p] = true;
@@ -1964,10 +1971,13 @@ fn check_slope_columns(model: &ModelSpec, p: usize, s: usize) -> Result<(), FitE
         }
     }
     if let Some(j) = read.iter().position(|&r| !r) {
-        return Err(FitError::Shape(format!(
-            "re_columns column {j} (slope index {}) is read by no random slope",
-            p + j
-        )));
+        return Err(FitError::Shape(
+            format!(
+                "re_columns column {j} (slope index {}) is read by no random slope",
+                p + j
+            )
+            .into(),
+        ));
     }
     Ok(())
 }
@@ -1989,7 +1999,7 @@ pub(crate) fn re_only_count(slopes: impl IntoIterator<Item = usize>, p: usize) -
 /// is the order `LmmGroupings` assigns block columns to terms in. Empty
 /// `terms` passes. `grouping` names the block in the error.
 fn check_terms(slopes: &[ColumnId], terms: &[ReTerm], grouping: &str) -> Result<(), FitError> {
-    let refuse = |why: String| Err(FitError::Shape(format!("{grouping}: {why}")));
+    let refuse = |why: String| Err(FitError::Shape(format!("{grouping}: {why}").into()));
     for (j, t) in terms.iter().enumerate() {
         if !t.intercept && t.slopes.is_empty() {
             return refuse(format!("term {j} has neither the intercept nor a slope"));
@@ -2107,8 +2117,8 @@ pub(super) fn fill_se_by_predictor(var_diag: &[f64], target_indices: &[u32], se:
 
 /// An all-NaN `p×p` [`Fit::vcov`] — the shape every path starts from, and the
 /// whole of what a non-converged fit reports (mirroring how `se` NaN-fills).
-pub(crate) fn nan_vcov(p: usize) -> Vec<Vec<f64>> {
-    vec![vec![f64::NAN; p]; p]
+pub(crate) fn nan_vcov(p: usize) -> Vec<f64> {
+    vec![f64::NAN; p * p]
 }
 
 /// The residual df of OLS and of a Gamma or inverse Gaussian GLM with φ
@@ -2144,7 +2154,7 @@ pub(crate) fn residual_df(
             *d = nu;
         }
     }
-    let c = Mat::from_fn(p, p, |i, j| c[i][j]);
+    let c = Mat::from_fn(p, p, |i, j| c[i * p + j]);
     (coef_df, SatterthwaiteState::residual(c, nu))
 }
 
@@ -2156,7 +2166,7 @@ pub(crate) fn residual_df(
 /// of `B`.
 ///
 /// No new numerics — this is the SE forward solve, kept instead of discarded.
-/// `(L L')⁻¹ = L⁻ᵀ L⁻¹`, so `vcov[i][j] = scale · (uᵢ · uⱼ)` where `uⱼ = L⁻¹eⱼ`
+/// `(L L')⁻¹ = L⁻ᵀ L⁻¹`, so entry `(i, j)` is `scale · (uᵢ · uⱼ)` where `uⱼ = L⁻¹eⱼ`
 /// is exactly the vector each `se` target already forward-solves for
 /// (`var_diag_j = scale·‖uⱼ‖²` is this matrix's diagonal — see
 /// `ols::fit_suff_stats_t_sq`). Solving each target's column once and forming
@@ -2173,7 +2183,7 @@ pub(crate) fn vcov_from_chol(
     target_indices: &[u32],
     scale: f64,
     map: &ColumnScaling,
-) -> Vec<Vec<f64>> {
+) -> Vec<f64> {
     let mut vcov = nan_vcov(p);
     // L⁻¹bⱼ for each target j: forward-solve L·u = bⱼ (row j of B, eⱼ when the
     // design is fitted as given), reading L[(i,k)] directly (already
@@ -2198,8 +2208,8 @@ pub(crate) fn vcov_from_chol(
     for (a, (i, ui)) in cols.iter().enumerate() {
         for (j, uj) in cols[a..].iter() {
             let v = scale * ui.iter().zip(uj).map(|(x, y)| x * y).sum::<f64>();
-            vcov[*i][*j] = v;
-            vcov[*j][*i] = v;
+            vcov[*i * p + *j] = v;
+            vcov[*j * p + *i] = v;
         }
     }
     vcov

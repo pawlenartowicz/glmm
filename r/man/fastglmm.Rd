@@ -138,7 +138,17 @@ covariance (\code{vcov()}), variance components on the SD/correlation scale
 \code{diagnostics} list (the solver's own report: \code{boundary}, \code{pinned},
 \code{notes}, plus the three flags above), a \code{warnings} data.frame (one row
 per warning the call raised: \code{tier}, \code{kind}, \code{title}, \code{message}; match on
-\code{kind}), the per-coefficient \code{coef_df} (the t test's degrees of freedom,
+\code{kind}), \code{n_eval} (the optimizer's objective evaluations, 0 on the
+closed-form and IRLS paths), \code{n_grad}, \code{outer_stop} and \code{outer_decrement}
+(the BFGS gradient search's gradient evaluations, not counted in
+\code{n_eval}; why it stopped, \code{"fdelta"}, \code{"pgrad"} or \code{"noise_floor"} when
+it converged, otherwise \code{"line_search"}, \code{"max_iter"},
+\code{"grad_unavailable"} or \code{"non_finite"}; its estimate of the deviance
+decrease left; it runs on the models the
+\code{"fastglmm_gradient_search_fallback"} warning names, and they describe it
+even when the derivative-free search finished the fit; \code{0},
+\code{NA_character_} and \code{NaN} on every fit that ran no gradient search), the
+per-coefficient \code{coef_df} (the t test's degrees of freedom,
 \code{NaN} where the test is z and on an OLS or dispersion-GLM fit that did not
 converge) and \code{coef_p} (its p-value), \code{df_method}
 (\code{"satterthwaite"}, \code{"residual"}, \code{"none"}, \code{"disabled"} or \code{"failed"}),

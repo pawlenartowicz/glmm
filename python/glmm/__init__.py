@@ -7,7 +7,8 @@ in the kernel and raises a clean `NotImplementedError`: quasi-likelihood
 `dispersion=` on binomial/poisson.
 
 Public surface is `fit`, `Fit`, `model_matrix`, `term_labels`, the tests of `glmm.anova` (`anova`,
-`compare`, `TermTable`, `ComparisonTable`, `Comparison`, in `glmm/anova.py`),
+`compare`, `TermTable`, `ComparisonTable`, `Comparison`, in `glmm/anova.py`), `pairwise` and
+`PairwiseTable`, `Fit.profile_confint`'s `ProfileTable`,
 and the warning categories the diagnostics channel raises (`DiagnosticWarning`, `AgqFallbackWarning`,
 `ArgumentIgnoredWarning`, `ConstantResponseWarning`, `DesignUnsolvableWarning`,
 `ExactProfileFallbackWarning`, `FewRowsForRandomEffectsWarning`,
@@ -58,6 +59,7 @@ __all__ = [
     "PairwiseTable",
     "PirlsExhaustedWarning",
     "PrecisionLimitedWarning",
+    "ProfileTable",
     "RowsDroppedWarning",
     "SatterthwaiteCurvatureWarning",
     "SeUnavailableWarning",
@@ -869,7 +871,10 @@ class Fit:
     # public fields, private: the training columns as `_native.fit` took them
     # ("numeric" and "factor", after the missing-value row drop, and the
     # "weights" and "offset" arguments, as bytes or None), lowered again on
-    # each call, and the kernel's conditional variances in its own layout
+    # each call, with "row_index" (each training row's position in the
+    # caller's data, as `_prepare_columns` gives it, so an error names the
+    # caller's row; absent on a fit pickled before it, None when no row was
+    # dropped), and the kernel's conditional variances in its own layout
     # ("condvar", "condvar_x", float64 bytes, and "condvar_cross", a dict or
     # None). None on a fit pickled before them.
     # Mirrors the R port's `.kernel_parts` - change together.
@@ -977,7 +982,8 @@ class Fit:
         Gaussian mixed model fitted with `satterthwaite=False`, whose summary
         says "df not computed"). Aliased coefficients give NaN. The R port's
         `confint()` computes the same intervals through the same kernel
-        function."""
+        function. For profile-likelihood intervals of a Gaussian mixed model,
+        variance parameters included, see `profile_confint`."""
         # A Fit saved before `coef_df` existed has no df: normal intervals,
         # as such a fit's summary tests with z.
         coef_df = getattr(self, "coef_df", None)
@@ -992,6 +998,56 @@ class Fit:
             ),
             dtype=float,
         ).reshape(len(self.beta), 2)
+
+    def profile_confint(self, level=0.95, parm=None):
+        """Profile-likelihood confidence intervals of a Gaussian mixed model,
+        lme4's `confint(method = "profile")`, as a `ProfileTable`: one row per
+        random-effect SD and correlation, the residual SD and coefficient,
+        named as lme4 names them ("sd_(Intercept)|Subject",
+        "cor_Days.(Intercept)|Subject", "sigma", then `names`), with the
+        columns `estimate`, `lower` and `upper`.
+
+        The profiles are of the ML deviance: the model is refitted once by ML
+        from the fit's training rows (a REML fit too, as lme4 does), and the
+        rows report the ML estimates; the notes say so. A bound is where the
+        signed root of the deviance change reaches the normal quantile of
+        `level`. An SD estimated at 0 has 0 as its lower bound, and a
+        correlation whose profile stays inside the cutoff up to -1 or 1 has
+        that limit. An undetermined bound is NaN, and the notes name it.
+
+        level: the confidence level, strictly between 0 and 1.
+        parm: None for every row, or a row name or list of row names; "theta_"
+            stands for the SDs, correlations and "sigma", "beta_" for the
+            coefficients. The rows come in the table's order whatever the
+            order of `parm`.
+
+        Raises `ValueError` on a model without random effects, of a family
+        other than Gaussian, or with an aliased coefficient, on a `level`
+        outside (0, 1), and on a `parm` name the model does not have (the
+        message lists the valid ones); `TypeError` on a `parm` that is not a
+        name or a list of names. Name is provisional until 1.0.0."""
+        from glmm.anova import _profile_table
+
+        if isinstance(parm, str):
+            parm = [parm]
+        elif parm is not None:
+            if not (isinstance(parm, (list, tuple)) and all(isinstance(p, str) for p in parm)):
+                raise TypeError(f"parm must be None, a name or a list of names, got {parm!r}")
+            parm = list(parm)
+        kept = self._kept()
+        r = _native.profile_intervals(
+            self.formula,
+            kept["numeric"],
+            kept["factor"],
+            self.family,
+            self.link,
+            kept["weights"],
+            kept["offset"],
+            bool(self.reml),
+            float(level),
+            parm,
+        )
+        return _profile_table(r, bool(self.reml))
 
     def contrast_test(self, L):
         """One Wald test of the linear hypothesis `L @ beta = 0`, as a `TermTable`
@@ -1105,7 +1161,7 @@ class Fit:
             new_numeric = new_factor = None
             n_rows = 0
         else:
-            new_numeric, new_factor, _, _ = _prepare_columns(
+            new_numeric, new_factor, _, _, _ = _prepare_columns(
                 newdata, [self.formula], None, None, [], new_data=True
             )
             n_rows = _row_count(newdata, new_numeric, new_factor)
@@ -1127,6 +1183,8 @@ class Fit:
             bool(se_fit),
             float(level),
             bool(future),
+            # New rows are the caller's own: `_prepare_columns` drops none.
+            kept.get("row_index") if newdata is None else None,
         )
         for note in r["notes"]:
             if note["kind"] == "new_grouping_levels":
@@ -1184,6 +1242,7 @@ class Fit:
             self._stored_numbers(),
             int(nsim),
             int(seed),
+            kept.get("row_index"),
         )
         return _f64(draws).reshape(int(nsim), self.nobs).T
 
@@ -1280,7 +1339,8 @@ class Fit:
         if self._kernel_parts is None:
             raise ValueError(
                 "this fit was made by a glmm version that did not keep what predict, "
-                "simulate, pairwise, r2 and icc read. Refit the model with this version."
+                "simulate, pairwise, r2, icc and profile_confint read. Refit the model "
+                "with this version."
             )
         return self._kernel_parts
 
@@ -1800,7 +1860,7 @@ def _prepare_columns(
 ):
     """The columns of `data` that `formulas` use, as `_native.fit` takes them,
     with `weights=`/`offset=` checked: `(numeric_columns, factor_columns,
-    weights, offset)`. A row with a missing value in a column any of the
+    weights, offset, row_index)`. A row with a missing value in a column any of the
     formulas uses is dropped once, from every column and from the weights and
     the offset, so two formulas (`compare`) are fitted on the same rows. With
     `drop_missing_arguments` (`compare`), a row whose weight or offset is
@@ -1811,7 +1871,9 @@ def _prepare_columns(
     columns are the ones the formula reads on new rows, the response left
     out (`_native.predict_columns`), a missing one is left to the kernel to
     name (a grouping column may be absent), and a row with a missing value
-    raises."""
+    raises. `row_index` is None when no row was dropped, and otherwise each
+    kept row's 0-based position in `data` as int64 bytes, which the
+    `_native` entry points take so an error names the caller's row."""
     # Only the columns the formula actually uses are read from here on — see
     # `_formula_columns`.
     used_columns = _columns(data)
@@ -1988,7 +2050,8 @@ def _prepare_columns(
                 factor_columns[name] = (levels, np.asarray(codes, dtype=np.uint32).tobytes())
             else:
                 numeric_columns[name] = np.array([float(v) for v in values], dtype=float).tobytes()
-    return numeric_columns, factor_columns, weights, offset
+    row_index = np.flatnonzero(na_mask).astype(np.int64).tobytes() if drop else None
+    return numeric_columns, factor_columns, weights, offset, row_index
 
 
 def _check_lengths(lengths):
@@ -2439,7 +2502,7 @@ def fit(
                 f'warm_start["dispersion"] (or init_theta) must be one finite number > 0, got {d!r}'
             )
 
-    numeric_columns, factor_columns, weights, offset = _prepare_columns(
+    numeric_columns, factor_columns, weights, offset, row_index = _prepare_columns(
         data, [formula], weights, offset, store
     )
 
@@ -2457,6 +2520,7 @@ def fit(
         "factor": factor_columns,
         "weights": weights.tobytes() if weights is not None else None,
         "offset": offset.tobytes() if offset is not None else None,
+        "row_index": row_index,
     }
     r = _native.fit(
         formula,
@@ -2474,6 +2538,7 @@ def fit(
         condvar,
         reml,
         anova_test,
+        row_index,
     )
     return _fit_from_native(r, formula, family, link, nagq, dispersion, store, kept)
 
@@ -2498,7 +2563,7 @@ def model_matrix(data, formula):
     refused, and so is a row with a missing value in a column the formula
     reads: drop such rows first, so `X` stays aligned with `data`.
     """
-    numeric_columns, factor_columns, _, _ = _prepare_columns(
+    numeric_columns, factor_columns, _, _, _ = _prepare_columns(
         data, [formula], None, None, [], model_matrix=True
     )
     n_rows = _row_count(data, numeric_columns, factor_columns)
@@ -2616,4 +2681,12 @@ def term_labels(formula):
 
 
 # Last: `glmm/anova.py` reads `Fit` and the helpers above from this module.
-from glmm.anova import Comparison, ComparisonTable, PairwiseTable, TermTable, anova, compare
+from glmm.anova import (
+    Comparison,
+    ComparisonTable,
+    PairwiseTable,
+    ProfileTable,
+    TermTable,
+    anova,
+    compare,
+)

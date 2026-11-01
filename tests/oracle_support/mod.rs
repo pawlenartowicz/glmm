@@ -43,9 +43,9 @@ pub mod tol {
     /// lme4's lagged-`ldL2` `tolPwrss` artifact, which is what makes 1e-3 tight
     /// enough here.
     pub const SE_HESSIAN_REL: f64 = 1e-3;
-    // No band for lme4's SE-of-RE-stddev: no golden in `validation/goldens/` carries
-    // a `stddev_se` field, and the only frozen copies of that quantity sit in the
-    // weights-tier references under `validation/results/lme4_simulated/`, which no
+    // No band for lme4's SE-of-RE-stddev: no golden at the top of `validation/goldens/`
+    // carries a `stddev_se` field, and the only frozen copies of that quantity sit in
+    // the weights-tier references under `validation/goldens/weights/`, which no
     // assertion here compares. Naming an unused constant would imply a claim Tier 2
     // does not make.
 
@@ -127,6 +127,12 @@ pub mod tol {
     /// studentized range (`tukey_p_rel`).
     #[allow(dead_code)] // read by tests/inference_oracle.rs only
     pub const TUKEY_P_REL: f64 = SATT_P_REL + 1e-5;
+    /// A bound of a profile-likelihood interval against lme4's
+    /// `confint(method = "profile")`, in units of lme4's interval width: the
+    /// std-dev band, since a bound is a point of the deviance surface located
+    /// as the estimate is (`profile_ci_rel`).
+    #[allow(dead_code)] // read by tests/inference_oracle.rs and tests/formula_anova.rs only
+    pub const PROFILE_CI_REL: f64 = STDDEV_REL;
 }
 
 // ── Golden schema ────────────────────────────────────────────────────────────
@@ -158,9 +164,10 @@ pub struct Golden {
     /// estimated, not how the harness fed it.
     #[serde(skip)]
     pub weights_col: Option<String>,
-    /// From the weights tier (rungs 29-43), whose lme4 1.1.38 references write a
-    /// different field set for fixed-only non-Gaussian fits than `goldens_agq.R`
-    /// does. Only `shape_of` reads it.
+    /// From the weights tier (rungs 29-43), whose references
+    /// (`tools/goldens_weights.R`) write a different field set for fixed-only
+    /// non-Gaussian fits than `goldens_agq.R` does. Read by `shape_of` and
+    /// `objective_differs`.
     #[serde(skip)]
     pub weights_suite: bool,
     /// The manifest entry's `reml`: `Some(false)` for an ML fit of a Gaussian

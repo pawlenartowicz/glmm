@@ -57,9 +57,9 @@ fn fit_ols_weighted_matches_r_lm() {
     }
     for (i, j) in [(0, 1), (1, 0)] {
         assert!(
-            (f.vcov[i][j] - REF_VCOV_01).abs() < 1e-12,
+            (f.vcov()[i * 2 + j] - REF_VCOV_01).abs() < 1e-12,
             "vcov[{i}][{j}] = {}, R = {REF_VCOV_01}",
-            f.vcov[i][j]
+            f.vcov()[i * 2 + j]
         );
     }
     // logLik(f) / attr(logLik(f), "df") from the same R run — pins the weighted
@@ -648,11 +648,7 @@ fn ols_reml_reports_the_closed_form_reml_loglik() {
         );
         assert_eq!(bits(&f.beta), bits(&ml.beta), "{tag}: beta");
         assert_eq!(bits(&f.se), bits(&ml.se), "{tag}: se");
-        assert_eq!(
-            bits(&f.vcov.concat()),
-            bits(&ml.vcov.concat()),
-            "{tag}: vcov"
-        );
+        assert_eq!(bits(f.vcov()), bits(ml.vcov()), "{tag}: vcov");
         assert_eq!(f.dispersion.to_bits(), ml.dispersion.to_bits(), "{tag}: σ̂²");
         assert!(f.reml && !ml.reml, "{tag}: reml");
         assert!(f.deviance.is_nan(), "{tag}: deviance");

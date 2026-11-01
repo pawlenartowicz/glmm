@@ -24,7 +24,7 @@ use crate::linalg::SeqLlt;
 use crate::ColumnId;
 
 /// One term's hypothesis matrix, in lmerTest's basis.
-pub struct TermHypothesis {
+pub(crate) struct TermHypothesis {
     /// The term label ([`super::FixedTerm::label`]).
     pub term: String,
     /// `r × p` over all `p` caller columns (zero on aliased ones), one row per
@@ -120,15 +120,6 @@ fn type3_with(lo: &Lowered, retained: &[usize], round: fn(&mut Mat<f64>)) -> Vec
         .collect()
 }
 
-/// [`type3`] for the loop tier (`crate::loop_advanced`, no semver promise):
-/// the matrices depend on the design and `retained` only, so one build serves
-/// every fit of the design that keeps the same columns.
-#[cfg(feature = "loop_advanced")]
-#[doc(hidden)]
-pub fn type3_pub(lo: &Lowered, retained: &[usize]) -> Vec<TermHypothesis> {
-    type3(lo, retained)
-}
-
 /// lmerTest's Type II hypothesis matrices in the `XᵀX` metric
 /// (`get_contrasts_type2_unfolded`), one per term of [`Lowered::terms`] in
 /// that order, on the retained columns as [`type3`]: identity rows for a term
@@ -190,7 +181,8 @@ pub(crate) fn type2_xtx(lo: &Lowered, retained: &[usize]) -> Vec<TermHypothesis>
 /// built in the basis that is the identity on the term's columns,
 /// `[−V_tr·V_rr⁻¹ | I]`, which spans the same rows as car's QR basis; Wald
 /// χ² and F do not depend on the basis. `vcov` is `p × p` over all caller
-/// columns (as [`crate::Fit::vcov`]) and only its retained block is read; a
+/// columns, one row per column ([`crate::Fit::vcov()`] split into rows), and only
+/// its retained block is read; a
 /// relatives block that is not positive definite gives NaN entries.
 pub(crate) fn type2_vcov(
     lo: &Lowered,

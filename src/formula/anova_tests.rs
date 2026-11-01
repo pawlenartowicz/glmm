@@ -32,7 +32,7 @@ use crate::inference::{
     DenDf, LinearKind, LinearNote, LinearTest, LrNote, LrTest, Objective, Reference,
 };
 use crate::test_support::csv_table;
-use crate::{BinomialLink, Family, Fit, GammaLink, NegBinomialLink, PoissonLink};
+use crate::{BinomialLink, Dispersion, Family, Fit, GammaLink, NegBinomialLink, PoissonLink};
 
 const OPTS: CompareOptions = CompareOptions {
     nsim: 2000,
@@ -668,7 +668,7 @@ fn type_ii_on_the_gaussian_lmm_is_lmertests_xtx_metric() {
     )
     .unwrap();
     let xtx = type2_xtx(&lo, &retained);
-    let vcov = type2_vcov(&lo, &retained, &fit.vcov);
+    let vcov = type2_vcov(&lo, &retained, &fit.vcov_rows());
     for ((row, h), car) in t2.fixed.iter().zip(&xtx).zip(&vcov) {
         assert_eq!(row.label, h.term);
         assert_eq!(row.test.statistic, hypothesis_f(&fit, h), "{}", row.label);
@@ -755,12 +755,19 @@ fn the_default_test_gives_the_wald_rows_bit_for_bit() {
         .push(("failures".into(), Column::Numeric(failures)));
     let fixed = ChoiceReason::NoRandomEffects;
     let cases = [
-        ("y ~ g * h + x", &bern, binomial, None, 4, fixed),
+        (
+            "y ~ g * h + x",
+            &bern,
+            binomial,
+            Dispersion::Default,
+            4,
+            fixed,
+        ),
         (
             "y ~ g * h + x + (1 | subj)",
             &bern,
             binomial,
-            None,
+            Dispersion::Default,
             4,
             ChoiceReason::BinomialMixed,
         ),
@@ -768,17 +775,31 @@ fn the_default_test_gives_the_wald_rows_bit_for_bit() {
             "cbind(incidence, failures) ~ period + (1 | herd)",
             &cbpp,
             binomial,
-            None,
+            Dispersion::Default,
             1,
             ChoiceReason::BinomialMixed,
         ),
-        ("y ~ x + grp", &gamma_data, gamma, Some(0.5), 2, fixed),
-        ("y ~ x * grp", &counts, poisson, None, 3, fixed),
+        (
+            "y ~ x + grp",
+            &gamma_data,
+            gamma,
+            Dispersion::Fixed(0.5),
+            2,
+            fixed,
+        ),
+        (
+            "y ~ x * grp",
+            &counts,
+            poisson,
+            Dispersion::Default,
+            3,
+            fixed,
+        ),
         (
             "y ~ x + grp + (1 | cluster)",
             &nb_data,
             nb,
-            None,
+            Dispersion::Default,
             2,
             ChoiceReason::NegativeBinomialMixed,
         ),
@@ -786,7 +807,7 @@ fn the_default_test_gives_the_wald_rows_bit_for_bit() {
             "y ~ x + grp + (1 | cluster)",
             &gamma_clustered,
             gamma,
-            None,
+            Dispersion::Default,
             2,
             ChoiceReason::OtherMixed,
         ),
@@ -1263,7 +1284,7 @@ struct LrtCase {
     family: Family,
     nagq: u8,
     weights: Option<&'static str>,
-    dispersion: Option<f64>,
+    dispersion: Dispersion,
     type2: Vec<(&'static str, String, String)>,
     type3: Vec<(&'static str, String)>,
 }
@@ -1274,7 +1295,7 @@ impl LrtCase {
     fn options(&self) -> FitOptions {
         FitOptions {
             nagq: self.nagq,
-            dispersion: self.dispersion,
+            dispersion: self.dispersion.clone(),
             ..FitOptions::default()
         }
     }
@@ -1326,7 +1347,7 @@ fn factorial_case(name: &'static str, re: &str, nagq: u8, skip: &str) -> LrtCase
         },
         nagq,
         weights: None,
-        dispersion: None,
+        dispersion: Dispersion::Default,
         type2: type2.into_iter().filter(|(t, ..)| *t != skip).collect(),
         type3: type3.into_iter().filter(|(t, _)| *t != skip).collect(),
     }
@@ -1340,7 +1361,7 @@ fn main_effects_case(
     re: &str,
     family: Family,
     weights: Option<&'static str>,
-    dispersion: Option<f64>,
+    dispersion: Dispersion,
 ) -> LrtCase {
     let f = |rhs: &str| format!("y ~ {rhs}{re}");
     LrtCase {
@@ -1379,7 +1400,7 @@ fn lrt_cases() -> Vec<LrtCase> {
             "",
             nb,
             Some("w"),
-            None,
+            Dispersion::Default,
         ),
         main_effects_case(
             "NB GLMM",
@@ -1387,7 +1408,7 @@ fn lrt_cases() -> Vec<LrtCase> {
             " + (1 | cluster)",
             nb,
             None,
-            None,
+            Dispersion::Default,
         ),
         main_effects_case(
             "Gamma GLM, φ held",
@@ -1398,7 +1419,7 @@ fn lrt_cases() -> Vec<LrtCase> {
             "",
             gamma,
             None,
-            Some(0.5),
+            Dispersion::Fixed(0.5),
         ),
         main_effects_case(
             "Gamma GLMM",
@@ -1408,7 +1429,7 @@ fn lrt_cases() -> Vec<LrtCase> {
             " + (1 | cluster)",
             gamma,
             None,
-            None,
+            Dispersion::Default,
         ),
         LrtCase {
             name: "Poisson GLMM with an offset",
@@ -1422,7 +1443,7 @@ fn lrt_cases() -> Vec<LrtCase> {
             },
             nagq: 1,
             weights: None,
-            dispersion: None,
+            dispersion: Dispersion::Default,
             type2: vec![(
                 "x",
                 offset.into(),
@@ -1730,9 +1751,7 @@ fn type_ii_lrt_rows_do_not_read_the_covariance() {
     )
     .unwrap();
     let (_, mut blind) = case.fit(&case.formula);
-    for row in &mut blind.vcov {
-        row.fill(f64::NAN);
-    }
+    blind.vcov.fill(f64::NAN);
     let got = term_tests_cached(
         &lo,
         &case.options(),
@@ -1809,7 +1828,7 @@ fn type_iii_lrt_rows_with_a_random_slope_match_afex() {
         },
         nagq: 1,
         weights: None,
-        dispersion: None,
+        dispersion: Dispersion::Default,
         type2: Vec::new(),
         type3: Vec::new(),
     };
@@ -2626,7 +2645,7 @@ fn the_row_kind_is_read_from_the_fit_not_from_the_options() {
         assert!(t.fixed.iter().all(|r| r.test.kind == LinearKind::F));
     }
     let mut fit_opts = FitOptions {
-        dispersion: Some(0.5),
+        dispersion: Dispersion::Fixed(0.5),
         ..FitOptions::default()
     };
     assert_eq!(tables(&lo, &fit_opts, &fit), want);
@@ -2639,7 +2658,7 @@ fn the_row_kind_is_read_from_the_fit_not_from_the_options() {
             .iter()
             .all(|r| r.test.kind == LinearKind::ChiSquared));
     }
-    fit_opts.dispersion = None;
+    fit_opts.dispersion = Dispersion::Default;
     assert_eq!(tables(&lo, &fit_opts, &fit), want);
 }
 
@@ -2648,7 +2667,7 @@ fn a_covariance_that_is_not_finite_gives_nan_rows() {
     // car's Type II reads the covariance; a NaN one gives NaN rows, not a
     // panic, and so does the Wald χ² of Type III.
     let (lo, mut fit) = lowered_fit(FIXED, &sim_factorial_bern(), binomial(), None);
-    fit.vcov = vec![vec![f64::NAN; lo.p]; lo.p];
+    fit.vcov = vec![f64::NAN; lo.p * lo.p];
     for t in tables(&lo, &FitOptions::default(), &fit) {
         assert_eq!(labels(&t), LABELS);
         assert!(

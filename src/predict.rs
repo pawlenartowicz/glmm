@@ -16,7 +16,8 @@ use crate::fit::CondvarCross;
 use crate::inference::tails::normal_quantile;
 use crate::lmm::slope_value;
 use crate::{
-    Design, Family, Fit, FitError, GroupIds, GroupingRelation, ModelSpec, Note, ReStructure,
+    Design, ErrorMessage, Family, Fit, FitError, GroupIds, GroupingRelation, ModelSpec, Note,
+    ReStructure,
 };
 
 /// The scale [`predict`] reports on, lme4's `type`.
@@ -169,12 +170,13 @@ pub fn predict(
     predict_parts(&FitParts::of(fit, spec), spec, new, opts)
 }
 
-/// The numbers of a fit that [`predict`] and the simulator read, borrowed:
-/// from a [`Fit`] by [`FitParts::of`], or from the numbers a port stored.
+/// The numbers of a fit that [`predict`] and the simulator read, borrowed
+/// (except `vcov`, which a [`Fit`] gives as rows): from a [`Fit`] by
+/// [`FitParts::of`], or from the numbers a port stored.
 pub(crate) struct FitParts<'a> {
     pub(crate) family: Family,
     pub(crate) beta: &'a [f64],
-    pub(crate) vcov: &'a [Vec<f64>],
+    pub(crate) vcov: std::borrow::Cow<'a, [Vec<f64>]>,
     pub(crate) varcorr: &'a [Vec<f64>],
     pub(crate) ranef: &'a [f64],
     pub(crate) ranef_levels: &'a [usize],
@@ -188,9 +190,18 @@ impl<'a> FitParts<'a> {
     /// The parts of `fit`, fitted with `spec`.
     pub(crate) fn of(fit: &'a Fit, spec: &ModelSpec) -> FitParts<'a> {
         FitParts {
+            vcov: std::borrow::Cow::Owned(fit.vcov_rows()),
+            ..FitParts::without_vcov(fit, spec)
+        }
+    }
+
+    /// [`FitParts::of`] with an empty `vcov`, for a reader that never takes a
+    /// standard error (the simulator), so no copy is made.
+    pub(crate) fn without_vcov(fit: &'a Fit, spec: &ModelSpec) -> FitParts<'a> {
+        FitParts {
             family: spec.family,
             beta: &fit.beta,
-            vcov: &fit.vcov,
+            vcov: std::borrow::Cow::Borrowed(&[]),
             varcorr: &fit.varcorr,
             ranef: &fit.ranef,
             ranef_levels: &fit.ranef_levels,
@@ -254,9 +265,9 @@ fn blocks<'a>(
     };
     let p = parts.beta.len();
     let mismatch = |what: &str| {
-        Err(FitError::Shape(format!(
-            "the model does not match the fit: {what}"
-        )))
+        Err(FitError::Shape(
+            format!("the model does not match the fit: {what}").into(),
+        ))
     };
     if parts.ranef_levels.len() != 1 + re.extra_groupings.len()
         || parts.varcorr.len() != parts.ranef_levels.len()
@@ -302,14 +313,13 @@ pub(crate) fn predict_parts(
     let mixed = spec.re.is_some();
     let conditional = mixed && !opts.population;
     if !(opts.level > 0.0 && opts.level < 1.0) {
-        return Err(FitError::OptionValue(format!(
-            "PredictOptions.level must be in (0, 1), got {}",
-            opts.level
-        )));
+        return Err(FitError::OptionValue(
+            format!("PredictOptions.level must be in (0, 1), got {}", opts.level).into(),
+        ));
     }
     if opts.future && !(mixed && spec.family != Family::Gaussian) {
         return Err(FitError::OptionValue(
-            "PredictOptions.future applies only to a non-Gaussian mixed model".to_string(),
+            "PredictOptions.future applies only to a non-Gaussian mixed model".into(),
         ));
     }
     validate_design(new, spec, 1, conditional)?;
@@ -324,10 +334,9 @@ pub(crate) fn predict_parts(
         ..
     } = new;
     if p != parts.beta.len() {
-        return Err(FitError::Shape(format!(
-            "the design has p={p} columns, the fit {}",
-            parts.beta.len()
-        )));
+        return Err(FitError::Shape(
+            format!("the design has p={p} columns, the fit {}", parts.beta.len()).into(),
+        ));
     }
     let need_se = opts.se || opts.future;
     let blocks = if conditional {
@@ -335,7 +344,7 @@ pub(crate) fn predict_parts(
             return Err(FitError::Unsupported(
                 "the fit has no conditional modes (it did not converge); \
                  predict in population mode"
-                    .to_string(),
+                    .into(),
             ));
         }
         blocks(parts, spec, new)?
@@ -347,7 +356,7 @@ pub(crate) fn predict_parts(
             "this fit has no conditional variances (it was fitted with condvar off, or \
              its layout does not form them), so a conditional standard error is not \
              available; refit with condvar on, or predict in population mode"
-                .to_string(),
+                .into(),
         ));
     }
     let cross = match (
@@ -361,8 +370,10 @@ pub(crate) fn predict_parts(
     let family = parts.family;
     if opts.future && matches!(family, Family::Binomial { .. }) {
         if let Some(i) = weights.and_then(|w| w.iter().position(|v| v.fract() != 0.0)) {
-            return Err(FitError::Weights(format!(
-                "binomial future bounds need whole trial counts as weights (row {i})"
+            return Err(FitError::Weights(ErrorMessage::at_row(
+                "binomial future bounds need whole trial counts as weights (row ".to_string(),
+                i,
+                ")",
             )));
         }
     }
@@ -374,11 +385,14 @@ pub(crate) fn predict_parts(
                 continue;
             }
             if !opts.allow_new_levels {
-                return Err(FitError::Ids(format!(
-                    "grouping {g} has a level the fit did not see at row {i} (id {id}, \
-                     the fit has {} levels); set allow_new_levels to predict it with a \
-                     zero random effect",
-                    b.levels
+                return Err(FitError::Ids(ErrorMessage::at_row(
+                    format!("grouping {g} has a level the fit did not see at row "),
+                    i,
+                    &format!(
+                        " (id {id}, the fit has {} levels); set allow_new_levels to predict \
+                         it with a zero random effect",
+                        b.levels
+                    ),
                 )));
             }
             unseen[g].push(i as u32);
@@ -541,7 +555,7 @@ impl<'a> Cross<'a> {
         let mismatch = || {
             Err(FitError::Shape(
                 "the model does not match the fit: the conditional covariance across groupings"
-                    .to_string(),
+                    .into(),
             ))
         };
         let fg = c.family_grouping;

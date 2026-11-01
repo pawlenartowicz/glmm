@@ -567,8 +567,9 @@ It compares the **internal** standard deviations for the same reason the pin
 does: an intercept's standard deviation is in response units and a slope's is in
 response per covariate unit, so their raw ratio moves with the covariate's
 units, while the internal one does not.
-The sparse path applies the identical pin, and the GLMM path mirrors the whole
-policy after its stage-2 BOBYQA
+The sparse path applies the identical pin, and the GLMM path runs the same
+pin pass after its outer search and again at the endpoint of its trough
+polish when that lowers the deviance (a fit polishes at most once)
 ([`algorithms-glmm.md` §Boundary handling](algorithms-glmm.md#boundary-handling-and-the-singular-flag)
 — change together).
 
@@ -577,22 +578,32 @@ policy after its stage-2 BOBYQA
 On a `q ≥ 2` block, a pinned diagonal `λ_jj = 0` leaves the entries *below* it in
 column `j` unidentified: rotating that column changes θ but not `Σ = ΛΛ′`, so it
 changes neither the deviance nor β̂, `varcorr` or `ranef`, and BOBYQA can stop
-anywhere on that flat circle. So the pin loop is followed by
+anywhere on that flat circle. So the pin is followed by
 `canonicalize_pinned_blocks` (`src/lmm/mod.rs`), which rebuilds `Σ` from each
-pinned block's Λ and re-factors it with a semidefinite-tolerant lower Cholesky —
-a pivot at or below `q·ε·tr Σ` zeroes that whole column. The variance that was
-sitting below a pinned diagonal folds into the trailing diagonals, where it is a
-component the caller can read, and the pin test then runs again on the new
-diagonals. Because Σ is preserved, the reported answer does not move; what
-changes is θ itself (and `tau2`, which is per-θ). A block with no pinned diagonal
-is skipped untouched, so a non-singular fit is bit-identical.
+pinned block's Λ and re-factors it with a semidefinite-tolerant lower Cholesky,
+with the pin inside the factorization: a pivot at or below `q·ε·tr Σ`, or one
+whose square root is at or below `PIN_THETA`, is skipped, and its whole column
+is zero. The variance that was sitting below a pinned diagonal folds into the
+trailing diagonals, where it is a component the caller can read, and a trailing
+diagonal the fold would leave at or below `PIN_THETA` pins in the same pass,
+with its column zero too. The flags are the diagonals the fold leaves exactly
+0. One fold, no loop: a second fold of a canonical Λ need not reproduce it bit
+for bit. A pinned pivot's own mass stays in the trailing Schur complement, so
+Σ̂ loses only the pinned column's conditional variance (at most `PIN_THETA²`)
+and its conditional covariances with the later components; the reported
+answer moves by no more than a pin does. Where no pivot pins in the fold (the
+common case, one pinned diagonal with nothing left below it) the result is the
+same, bit for bit, as a Σ-preserving fold followed by a second pin. A block
+with no pinned diagonal is skipped untouched, so a non-singular fit is
+bit-identical.
 
-`Diagnostics::pinned` depends on this canonical form: a zero θ diagonal now has
-an exactly zero column, so it marks a rank-deficient direction of Σ̂ (zero
+`Diagnostics::pinned` depends on this canonical form: a zero θ diagonal has an
+exactly zero column, so it marks a rank-deficient direction of Σ̂ (zero
 variance conditional on the earlier components of the block), which on a
-non-canonical Λ it need not. It is not in general a zero standard deviation: at
-a correlation boundary (`|ρ| = 1`) the trailing diagonal pins while that
-component's own variance, the rest of its Λ row, stays positive. The GLMM
+non-canonical Λ it need not, and a diagonal is flagged exactly when it is
+0. It is not in general a zero standard deviation: at a correlation boundary
+(`|ρ| = 1`) the trailing diagonal pins while that component's own variance,
+the rest of its Λ row, stays positive. The GLMM
 path runs the same step, except on its AGQ route, where only the pin flags use
 the canonical form ([`algorithms-glmm.md`](algorithms-glmm.md) has the reason).
 `canonicalize_pinned_blocks` itself skips a block
@@ -617,11 +628,12 @@ into two cases — the **plateau policy**, pinned by
   carries no rank guard: `fit_lmm` fits a near-singular but
   finite endpoint instead of refusing it.
 
-Both kernels run the same pin loop and plateau policy — it is one copy, in
-`fit_lmm`.
+Both kernels run the same pin pass and plateau policy, one copy in
+`fit_lmm`. The pin pass itself (sign fix, pin, canonical Λ with the pin
+inside the factorization) is `pin_endpoint`, which `fit_glmm` calls too.
 
-**Code**: the pin loop and endpoint recovery in `fit_lmm`, constants
-`PIN_THETA`/`THETA_TRUTH_FLOOR` (`src/lmm/mod.rs`). **Convention**:
+**Code**: the pin pass `pin_endpoint` and the endpoint recovery in `fit_lmm`,
+constants `PIN_THETA`/`THETA_TRUTH_FLOOR` (`src/lmm/mod.rs`). **Convention**:
 lme4 reports such fits as `isSingular`; `glmm` pins to exactly `0` (FP-stable
 across platforms) and still returns the fit. **Validation**: Dyestuff sits near
 the interior; the boundary behaviour is pinned by in-crate τ̂≈0 tests
@@ -654,7 +666,7 @@ sparse kernel can serve as the superset solver without a separate tolerance.
 The sparse kernel's caller is `fit_lmm` through
 `LmmKernel::Sparse`, built by `accumulate_lmm_rows` and refilled in place when
 a call brings the same rows (`same_rows`). The search
-around them is one copy: the seed, the BOBYQA schedule, the pin loop, β̂ and
+around them is one copy: the seed, the BOBYQA schedule, the pin pass, β̂ and
 `Var(β̂)` off the factor, and the joint Wald statistic are `fit_lmm`'s,
 whichever kernel evaluates the objective. The ill-conditioning policy is one
 copy too: `min_pivot_ratio` measured off whichever factor the kernel left is
@@ -672,7 +684,7 @@ by in-crate cross-checks.
 
 The LMM standard error is the profiled SE of the fit's criterion (σ̂² below is
 `r²/(N − P)` on REML and `r²/N` on ML, as lme4's `vcov` on each): one method, not the
-Hessian/Rx split that the GLMM path carries (`Fit.stddev_se` is empty for an LMM,
+Hessian/Rx split that the GLMM path carries (`Fit::stddev_se(g)` is NaN for an LMM,
 and `FitOptions::wald_se` is ignored here). At θ̂, `Var(β̂_j) = σ̂²·‖L_XX⁻¹ e_j‖²`
 from a forward solve against the fixed-effect Cholesky factor, and the squared
 Wald statistic is `t² = β̂_j² / Var(β̂_j)`. `L_XX` here is the factor already
@@ -704,6 +716,10 @@ skips it. On the loop tier it runs only when called:
 `loop_advanced::satterthwaite(&mut ws, &mut df_out)` after `fit_on` or
 `fit_on_hinted`, with the view dropped; its buffers live on the workspace, so
 a call after the first allocates only the pseudo-inverse's blocks.
+`loop_advanced::satterthwaite_with_contrasts` runs the same pass and also
+gives the df of each requested pairwise contrast (`l = e_p − e_n` in the
+identity below), from the stencil the unit contrasts use, with no extra
+deviance evaluation.
 
 **The identity.** lmerTest differentiates the deviance of the fit's criterion
 (the REML deviance, or the ML deviance on a `REML = FALSE` fit) in `(θ, σ)` with
@@ -883,6 +899,130 @@ the accuracy grid the `lmerTest` engine fits every Gaussian mixed cell and its
 ML twin, and `compare.R` gates `coef_df` against it. Every band is in
 `validation/grid/tol.R`.
 
+## Profile-likelihood intervals
+
+`Fit::profile_intervals` gives lme4's `confint(method = "profile")`: for each
+random-effect SD and correlation, the residual SD σ and each coefficient, the
+parameter is held at points on each side of its estimate, the rest are
+re-optimized, and a bound is a root of `ζ(v) = ±z`, with
+`ζ(v) = sign(v − v̂)·√max(0, dev(v) − dev̂)` and `z = Φ⁻¹((1 + level)/2)`.
+The ports call it through `orchestrate::profile_intervals` (R
+`confint(method = "profile")`, Python `Fit.profile_confint`).
+
+**The ML refit.** Every profile is of the ML deviance. The model is refitted by
+ML from a cold start (`fit_cold_keep_workspace`, `src/fit/mod.rs`: the
+`fit` path with `FitOptions { reml: Some(false), satterthwaite: false,
+condvar: false, .. }`), so an ML fit made by `fit` is reproduced exactly and a
+REML fit is replaced by its ML twin, as lme4's profile does (`refitML`). The
+workspace survives the refit: its LMM kernel, factor and warm solver serve
+every held search. Only differences of the deviance enter `ζ`, so every
+θ-independent term the kernel's deviance leaves out (`N(1 + ln 2π)`,
+`−Σ log wᵢ`) cancels, and `dev` below is the kernel's ML deviance
+(`dev(θ) = log|V| + N·ln σ̂²`, [above](#profiled-reml-and-ml-objectives)).
+
+**Variance parameters.** The coordinates are lme4's: per random-effect block,
+in θ order, the column-major `vech` entries that are not structural zeros (an SD
+on the diagonal, a correlation below it), then σ, all in the caller's units. A
+vector `v` maps to the kernel's θ̃ through the relative covariance. With `s` the
+prior-weight scale the kernel runs under
+([prior weights](#profiled-reml-and-ml-objectives)), the kernel's residual
+variance is `σ_int² = σ²/s`. Each block's `Σ = D·R·D` (`D` the SDs, `R` the
+correlations) is divided by `σ_int²` and factored by `semidef_lower_chol` with
+the trace floor; a factor that does not reproduce that matrix to `1e-8·tr`
+means `R` is not positive semidefinite, and the point's deviance is `+∞`. The
+factor, packed as the caller's θ, goes onto the fitted design through
+`LmmGroupings::theta_caller_to_design`, structural entries zeroed. One kernel
+evaluation at that θ̃ gives `dev_p = dev(θ̃)` with σ profiled and
+`σ̂² = r²/N`. The ML deviance at the given σ is
+
+```
+dev(v) = log|V| + N·ln σ_int² + r²/σ_int² − N
+       = dev_p + N·(ln(σ_int²/σ̂²) + σ̂²/σ_int² − 1)
+```
+
+using `r² = N·σ̂²`; at `σ_int = σ̂` it is `dev_p`, the kernel's ML deviance
+without lme4's constant `N(1 + ln 2π)`. Holding coordinate `k` at a value, the other coordinates are
+searched by BOBYQA in scaled units `u = v/c`: `c` is the estimate for a positive
+SD and for σ, `σ̂` for an SD estimated at 0, and 1 for a correlation. The box
+is `[−1, 1]` on a correlation, `[1/THETA_HI, THETA_HI]` on σ, and on an SD
+`[0, THETA_HI·max(1, σ̂_int/(s_c·c))]`, at least the fit's own box for that SD
+(`s_c` the standardization scale of the SD's column, 1 on an intercept), so a
+small SD the fit did not pin can still grow while another parameter is held.
+
+**Coefficients.** At a fixed θ̃ the penalized residual sum of squares is
+`r²(β) = r² + (β − β̂)ᵀA(β − β̂)`, so its minimum over the other coefficients
+with `β_j = b` is `r² + (b − β̂_j)²/(A⁻¹)_jj`. Profiled over σ,
+
+```
+dev_j(θ̃, b) = dev_p + N·ln(1 + (b − β̂_j)²/(N·Var_j)),    Var_j = σ̂²·(A⁻¹)_jj
+```
+
+`β̂_j` and `Var_j` come off the unmapped factor of the evaluation, as the
+Satterthwaite pass reads `C`: row `j` of `M = B·U⁻¹` (`caller_map_into`; `B`
+maps the standardized coefficients back to the caller's, `U` is the
+[orthogonalization](#fixed-effect-orthogonalization)'s) gives
+`β̂_j = M_j·β̃`, with β̃ from the backward solve on `X̃`, and
+`Var_j = σ̂²·‖L̃⁻¹M_jᵀ‖²`. The held minimization runs over θ̃ in the fit's box
+`[−THETA_HI, THETA_HI]`, structural entries held at 0. A coefficient so needs
+no refit with its column dropped and `x_j·b` in the offset, lme4's route,
+which the kernel could not run on an intercept-only model (it refuses `p == 0`).
+
+Both held searches run `bobyqa_minimize` with the workspace's own schedule and
+warm radius (`warm_bobyqa`), on as many coordinates as the fit's free θ (one
+variance coordinate is held, and σ takes its place), so the workspace's warm
+solver serves both. The fit's θ̂ is never written.
+
+**Root search.** A side with a finite limit (0 below an SD, ±1 on a
+correlation) evaluates the limit first: an estimate on the limit, or
+`|ζ(limit)| ≤ z`, gives the limit as the bound, a one-sided interval that keeps
+the two-sided cutoff, as lme4. Otherwise the bound lies between the estimate and
+the limit. A side with no finite limit expands until `|ζ| ≥ z`: a coefficient
+by `β̂_j ± z·se_j·2^k` (`se_j` the ML refit's Wald SE), σ and a positive SD's
+upper side by `ln v = ln v̂ ± (z/√(2m))·2^k` (`m = N` for σ, the grouping's
+level count for an SD), and an SD estimated at 0 by `v = σ̂·2^(k−3)`, at most
+`MAX_EXPAND = 30` steps. Brent's method then finds `|ζ| − z = 0` to
+`ZETA_TOL = 1e-6`, at most `MAX_ROOT_EVALS = 60` evaluations a side. Each held
+search starts from the argmin of the farthest point on that side with
+`|ζ| < z` (the first from the estimate), so an argmin on a boundary past the
+bound never becomes a start. A side that never brackets, a held search that
+does not converge, or a `|ζ|` that falls by more than `ZETA_TOL` from one
+expansion step to the next gives NaN. A held deviance below the fit's by more
+than `BETTER_OPTIMUM_TOL = 1e-6` is `ProfileError::BetterOptimum`, as lme4
+stops on "profiling detected new, lower deviance"; a smaller drop reads as
+`ζ = 0`. A correlation next to an SD estimated at 0 is not identified: its row
+is NaN on both sides, and it stays a free coordinate of the other searches.
+
+**Refusals.** Before any work: `level` outside `(0, 1)` and a `which` naming a
+parameter the model does not have (`FitError::OptionValue`); a model without
+random effects, a family other than Gaussian, or an aliased fixed-effect
+column (`FitError::Unsupported`). An ML refit that does not converge is
+`ProfileError::NotConverged`. The GLMM path has no closed form for β and σ
+at θ and is not profiled.
+
+**Code**: `Fit::profile_intervals`, `profile_on`, `profile_params`, `bound`,
+`root`, `path` (`src/inference/profile.rs`); `ProfileKernel`, `hold_var`,
+`hold_beta`, `var_dev`, `beta_dev`, `theta_into` (`src/lmm/profile.rs`);
+`caller_map_into` (`src/lmm/satterthwaite.rs`); `semidef_lower_chol`,
+`theta_caller_to_design` (`src/lmm/re_map.rs`); `fit_cold_keep_workspace`
+(`src/fit/mod.rs`); `profile_intervals`, `profile_names`
+(`src/orchestrate.rs`). **Convention**: lme4 2.0-6's
+`confint(method = "profile")` with `signames = FALSE` names; its cutoff, its
+ML refit of a REML fit, and its one-sided intervals at a limit; not its ζ
+spline. **Validation**: four frozen lme4 references (sleepstudy, Penicillin,
+Dyestuff2 with an SD estimated at 0, a weighted random-slope model) gate every
+bound to `1e-3` of lme4's interval width, a lme4 bound of exactly 0 to exactly
+0, and the ML refit's deviance hard against lme4's (`tests/inference_oracle.rs`,
+`profile_ci_rel` in `validation/grid/tol.R`). Measured: at most `2.8e-5` of the
+width on sleepstudy, Penicillin and the weighted model; `2.7e-4` on
+Dyestuff2's intercept, lme4's spline error, since direct ML refits agree with
+glmm there to `1.4e-8` of the width and a finer lme4 profile
+(`delta.cutoff = 1/32`) to about `1.6e-6`. On the weighted model
+lme4 2.0-6 mis-profiles the slope, so its coefficient rows are lme4 ML refits
+with the coefficient in the offset. In-crate tests cover the weighted scale
+round trip, an SD held at 0 on a centered-slope block, a correlation at its
+limit, the sparse kernel and a correlation next to an SD at 0
+(`src/lmm/profile_tests.rs`, `src/inference/profile_tests.rs`).
+
 ## Exact RLRT for one random intercept
 
 A Gaussian LMM whose only random term is one random intercept `(1 | g)` can be
@@ -1029,13 +1169,14 @@ grid points.
 **The atom at zero.** At `λ = 0`, `N = 0` and `SL[0] = 0`, so `f(0) = +0.0`
 exactly whenever `D > 0`, and every `T` is at least `+0.0`. A draw whose
 maximum sits at index 0 is an exact zero of the null, and any other draw is
-positive; `rlrt_null` keeps the positive draws sorted (`draws_pos`) and
-counts the rest as the null's mass at zero. `D > 0` always holds: each `χ_s`
+positive; `rlrt_null` keeps the positive draws sorted (`draws_pos`) and the
+draw count `nsim`; the other `nsim − draws_pos.len()` are the null's mass at
+zero. `D > 0` always holds: each `χ_s`
 is a squared normal, and `commonstats`' `Normal` takes the normal quantile at
 `(w + 0.5)/2³²` for a 32-bit word `w`, which is never exactly 1/2, so
 `|z| ≥ 2.9e-10` and `χ_s > 0`; and a design has `k ≥ 1`. A draw whose
 maximum is at the last grid point is an edge hit, where the supremum may lie
-beyond the grid (counted in tests only).
+beyond the grid.
 
 **The p-value** (`RlrtNull::p_value`, after Phipson & Smyth 2010). For an
 observed `t > 0` against `nsim` draws `T_b`,
@@ -1069,9 +1210,7 @@ draws of a longer run are the same values, and the draws run in fixed chunks
 of `NULL_CHUNK = 1024`, each writing its own slice of the output, so
 `parallel_inner` (live only in a `parallel` build on a non-`wasm32` target)
 is bitwise the serial loop. Of the result (`RlrtResult`), a caller reads
-`statistic`, `p_value`, `nsim` (the draws made) and `seed`; the null's
-diagnostics (its mass at zero, the Monte Carlo standard error, `k`, the edge
-hits) exist in tests only.
+`statistic`, `p_value`, `nsim` (the draws made) and `seed`.
 
 **The envelope and the refusals.** `exact_rlrt` checks neither the criterion
 nor convergence, nor that the two fits share their data: its caller passes

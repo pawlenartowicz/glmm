@@ -102,7 +102,6 @@ fn rank_two_psd_satisfies_moore_penrose() {
     });
     let p = psd_pseudo_inverse(a.as_ref(), 1e-8).unwrap();
     assert_eq!((p.rank, p.dropped, p.negative), (2, 2, 0));
-    assert!((p.lambda_max - 3.0).abs() <= 1e-12);
 
     let x = &p.inv;
     let ax = &a * x;
@@ -145,7 +144,6 @@ fn eigenvalue_exactly_at_threshold_is_dropped() {
 fn nonpositive_lambda_max_gives_rank_zero_and_zero_inverse() {
     let p = psd_pseudo_inverse(diag(&[-1.0, -3.0, 0.0]).as_ref(), 1e-8).unwrap();
     assert_eq!((p.rank, p.dropped, p.negative), (0, 1, 2));
-    assert_eq!(p.lambda_max, 0.0);
     assert_eq!((p.inv.nrows(), p.inv.ncols()), (3, 3));
     assert_eq!(max_abs(p.inv.as_ref()), 0.0);
 }
@@ -161,7 +159,6 @@ fn empty_matrix_is_ok_and_empty() {
     let p = psd_pseudo_inverse(a.as_ref(), 1e-8).unwrap();
     assert_eq!((p.inv.nrows(), p.inv.ncols()), (0, 0));
     assert_eq!((p.rank, p.dropped, p.negative), (0, 0, 0));
-    assert_eq!(p.lambda_max, 0.0);
 }
 
 #[test]
@@ -173,7 +170,6 @@ fn one_by_one() {
 
     let p = psd_pseudo_inverse(a.as_ref(), 1e-8).unwrap();
     assert_eq!((p.rank, p.dropped, p.negative), (1, 0, 0));
-    assert_eq!(p.lambda_max, 5.0);
     assert!((p.inv[(0, 0)] - 0.2).abs() <= 1e-15);
 }
 
@@ -227,7 +223,7 @@ fn two_calls_are_bit_identical() {
     let p2 = psd_pseudo_inverse(a.as_ref(), 1e-8).unwrap();
     assert_eq!(bits(p1.inv.as_ref()), bits(p2.inv.as_ref()));
     assert_eq!(
-        (p1.rank, p1.dropped, p1.negative, p1.lambda_max.to_bits()),
-        (p2.rank, p2.dropped, p2.negative, p2.lambda_max.to_bits())
+        (p1.rank, p1.dropped, p1.negative),
+        (p2.rank, p2.dropped, p2.negative)
     );
 }

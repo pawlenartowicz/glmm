@@ -266,7 +266,7 @@ impl Design {
             let q = g.q();
             let mut l = vec![0.0; q * q];
             for i in 0..q {
-                l[i * q + i] = glmm::THETA0;
+                l[i * q + i] = glmm::loop_advanced::THETA0;
             }
             t.extend(vech(&l, q));
         }
@@ -1316,7 +1316,7 @@ struct Counters {
 }
 
 mod api {
-    use super::{Counters, Design, Fam, FullOut, Out, Probe, Start};
+    use super::{vech, Counters, Design, Fam, FullOut, Out, Probe, Start};
     use glmm::loop_advanced::{build_workspace, fit_on, FitWorkspace};
     use glmm::{
         BinomialLink, Data, Family, FitOptions, GammaLink, GroupIds, Grouping, ModelSpec,
@@ -1457,19 +1457,21 @@ mod api {
         if full {
             let fit = view.into_fit(&Data::new(x, y, *n, *p), model, opts);
             out.full = Some(FullOut {
-                deviance: fit.deviance,
-                loglik: fit.loglik,
+                deviance: fit.deviance(),
+                loglik: fit.loglik(),
                 singular: fit.singular(),
-                boundary: match fit.diagnostics.boundary {
+                boundary: match fit.diagnostics().boundary {
                     glmm::Boundary::Interior => "interior",
                     glmm::Boundary::AtBoundary => "at_boundary",
                     glmm::Boundary::NoOptimum => "no_optimum",
                     glmm::Boundary::UpperLimit => "upper_limit",
                     _ => "other",
                 },
-                dispersion: fit.dispersion,
-                n_eval: fit.n_eval,
-                varcorr: fit.varcorr.iter().flatten().copied().collect(),
+                dispersion: fit.dispersion(),
+                n_eval: fit.n_eval(),
+                varcorr: (0..fit.n_groupings())
+                    .flat_map(|g| vech(&fit.varcorr(g), fit.n_re(g)))
+                    .collect(),
                 counters: counters(&fit),
             });
         }
@@ -1479,7 +1481,7 @@ mod api {
     #[cfg(feature = "counters")]
     fn counters(fit: &glmm::Fit) -> Option<Counters> {
         use glmm::Stage;
-        let c = &fit.counters;
+        let c = fit.counters();
         let last = c
             .pirls_hist
             .iter()
@@ -1878,7 +1880,7 @@ fn start_for(
         "theta0" => (
             Start {
                 beta: d.beta.clone(),
-                theta: vec![glmm::THETA0; d.n_theta()],
+                theta: vec![glmm::loop_advanced::THETA0; d.n_theta()],
             },
             "theta0",
         ),

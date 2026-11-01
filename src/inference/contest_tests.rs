@@ -17,7 +17,7 @@ const CONTEST_REL: f64 = 1e-12;
 /// frozen p of exactly 0 is compared exactly. Change together.
 const CONTEST_P_REL: f64 = 8e-12;
 /// `contest_md_rel` in `validation/grid/tol.R` (`TOL_INFERENCE`, fit-free):
-/// `contest_md`'s F, DenDF, p and `ν_m`. Change together.
+/// `contest_md`'s F, DenDF and p. Change together.
 const CONTEST_MD_REL: f64 = 1e-10;
 /// The smallest relative eigen-gap of `L C Lᵀ` a frozen multi-direction case
 /// may have; the band assumes it.
@@ -189,7 +189,7 @@ fn contest_1d_matches_lmertest_summary() {
     }
 }
 
-/// One frozen `contestMD` case: `L`, F, NumDF, DenDF, p and `ν_m`.
+/// One frozen `contestMD` case: `L`, F, NumDF, DenDF and p.
 fn check_md_case(inputs: &Inputs, case: &Value, what: &str) {
     check_md(inputs, &matrix(&case["L"], what), case, what);
 }
@@ -225,11 +225,6 @@ fn check_md(inputs: &Inputs, l: &Mat<f64>, case: &Value, what: &str) {
         CONTEST_MD_REL,
         &format!("{what} p"),
     );
-    let nu = vector(&case["nu_m"], what);
-    assert_eq!(got.nu.len(), nu.len(), "{what}: nu_m length");
-    for (m, (&g, &w)) in got.nu.iter().zip(&nu).enumerate() {
-        assert_rel(g, w, CONTEST_MD_REL, &format!("{what} nu_m[{m}]"));
-    }
 }
 
 #[test]

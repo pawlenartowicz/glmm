@@ -11,7 +11,7 @@
 use crate::spec::{BinomialLink, Family};
 
 /// Sealing supertrait: private, so `Scalar` cannot be implemented outside the
-/// crate and gaining a method is not a semver break.
+/// crate.
 mod sealed {
     pub trait Sealed {}
     impl Sealed for f64 {}
@@ -74,8 +74,6 @@ pub trait Scalar:
     fn sigmoid(self) -> Self;
     /// Standard normal CDF `Φ(x)` — the probit inverse link.
     fn probit_cdf(self) -> Self;
-    /// `lnΓ(x)`, `x > 0`.
-    fn ln_gamma(self) -> Self;
 
     /// The batched per-family η-pass: reads the raw `eta` in place and leaves
     /// it holding `family::clamp_eta`'s projection, fills `prob` with μ and `w`
@@ -268,10 +266,6 @@ impl Scalar for f64 {
     #[inline(always)]
     fn probit_cdf(self) -> f64 {
         crate::simd_transcendental::phi_hp(self)
-    }
-    #[inline(always)]
-    fn ln_gamma(self) -> f64 {
-        crate::simd_transcendental::ln_gamma(self)
     }
 
     #[inline(always)]

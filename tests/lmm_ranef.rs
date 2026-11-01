@@ -16,7 +16,9 @@
 //! through a naming bug — so every labelling assertion here checks names, on a
 //! factor whose levels are deliberately not in sorted order.
 
-use glmm::formula::{label_ranef, lower, Column, Error, RanefBlock, ReGroupInfo, Table};
+#[cfg(feature = "orchestrate")]
+use glmm::formula::{label_ranef, Error, ReGroupInfo};
+use glmm::formula::{lower, Column, Model, RanefBlock, Table};
 use glmm::{Family, Fit, FitOptions};
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -91,16 +93,20 @@ fn brute_ranef(
     // (empty = intercept-only). Declaration order.
     groups: &[(Vec<usize>, Vec<usize>)],
 ) -> Vec<f64> {
-    let sigma_sq = fit.dispersion;
+    let sigma_sq = fit.dispersion();
     // Column count and per-grouping offsets, matching `Fit::ranef`.
     let mut offs = Vec::new();
     let mut k = 0usize;
     for (g, (ids, slopes)) in groups.iter().enumerate() {
         offs.push(k);
-        k += fit.ranef_levels[g] * (1 + slopes.len());
+        k += fit.ranef_levels()[g] * (1 + slopes.len());
         assert_eq!(ids.len(), n);
     }
-    assert_eq!(k, fit.ranef.len(), "oracle and fit disagree on ranef width");
+    assert_eq!(
+        k,
+        modes(fit).len(),
+        "oracle and fit disagree on ranef width"
+    );
 
     // Z (n×k, row-major) in the public layout.
     let mut z = vec![0.0f64; n * k];
@@ -116,21 +122,12 @@ fn brute_ranef(
     }
 
     // Λ (k×k, block-diagonal, one q×q lower factor repeated over the grouping's
-    // levels) from each grouping's vech-packed covariance.
+    // levels) from each grouping's covariance.
     let mut lam = vec![0.0f64; k * k];
     for (g, (_, slopes)) in groups.iter().enumerate() {
         let q = 1 + slopes.len();
-        let vech = &fit.varcorr[g];
-        let idx = |r: usize, c: usize| c * q - (c * c - c) / 2 + (r - c);
         // D_g/σ̂², symmetric q×q, then its Cholesky.
-        let mut d = vec![0.0f64; q * q];
-        for c in 0..q {
-            for r in c..q {
-                let v = vech[idx(r, c)] / sigma_sq;
-                d[r * q + c] = v;
-                d[c * q + r] = v;
-            }
-        }
+        let d: Vec<f64> = fit.varcorr(g).iter().map(|v| v / sigma_sq).collect();
         let mut l = vec![0.0f64; q * q];
         for c in 0..q {
             let mut piv = d[c * q + c];
@@ -150,7 +147,7 @@ fn brute_ranef(
                 l[r * q + c] = v / lc;
             }
         }
-        for lvl in 0..fit.ranef_levels[g] {
+        for lvl in 0..fit.ranef_levels()[g] {
             let base = offs[g] + lvl * q;
             for c in 0..q {
                 for r in c..q {
@@ -162,7 +159,7 @@ fn brute_ranef(
 
     // r = y − Xβ̂; A = Λ′Z′ZΛ + I; rhs = Λ′Z′r.
     let resid: Vec<f64> = (0..n)
-        .map(|i| y[i] - (0..p).map(|j| x[i * p + j] * fit.beta[j]).sum::<f64>())
+        .map(|i| y[i] - (0..p).map(|j| x[i * p + j] * fit.beta()[j]).sum::<f64>())
         .collect();
     let zl: Vec<f64> = {
         let mut out = vec![0.0f64; n * k];
@@ -249,6 +246,13 @@ fn assert_close(got: &[f64], want: &[f64], what: &str) {
     }
 }
 
+/// Every grouping's stored modes, declaration order, concatenated.
+fn modes(fit: &Fit) -> Vec<f64> {
+    (0..fit.n_groupings())
+        .flat_map(|g| fit.ranef(g).iter().copied())
+        .collect()
+}
+
 /// `fitted` recomputed the long way: `Xβ̂ + Zb̂` with `Z` written out.
 fn assert_fitted(
     fit: &Fit,
@@ -258,40 +262,33 @@ fn assert_fitted(
     groups: &[(Vec<usize>, Vec<usize>)],
     offset: Option<&[f64]>,
 ) {
-    let mut offs = Vec::new();
-    let mut k = 0usize;
-    for (g, (_, slopes)) in groups.iter().enumerate() {
-        offs.push(k);
-        k += fit.ranef_levels[g] * (1 + slopes.len());
-    }
     for i in 0..n {
         let mut eta = offset.map_or(0.0, |o| o[i]);
         for j in 0..p {
-            eta += x[i * p + j] * fit.beta[j];
+            eta += x[i * p + j] * fit.beta()[j];
         }
         for (g, (ids, slopes)) in groups.iter().enumerate() {
-            let q = 1 + slopes.len();
-            let base = offs[g] + ids[i] * q;
-            eta += fit.ranef[base];
+            let (modes, base) = (fit.ranef(g), ids[i] * (1 + slopes.len()));
+            eta += modes[base];
             for (d, &sc) in slopes.iter().enumerate() {
-                eta += fit.ranef[base + 1 + d] * x[i * p + sc];
+                eta += modes[base + 1 + d] * x[i * p + sc];
             }
         }
         assert!(
-            (fit.fitted[i] - eta).abs() <= 1e-9 * eta.abs().max(1.0),
+            (fit.fitted()[i] - eta).abs() <= 1e-9 * eta.abs().max(1.0),
             "fitted[{i}]: got {}, want {eta}",
-            fit.fitted[i]
+            fit.fitted()[i]
         );
     }
 }
 
-/// Lower + fit, returning everything the assertions need.
-fn run(formula: &str, table: &Table) -> (Fit, Vec<RanefBlock>, usize, usize, Vec<f64>) {
-    let lo = lower(formula, table, Family::Gaussian).expect("lowers");
-    let fit = glmm::fit(&lo.data(), lo.spec(), &FitOptions::default()).unwrap();
-    assert!(fit.converged(), "{formula}: did not converge");
-    let blocks = label_ranef(&fit, &lo.re_groups).expect("labels");
-    (fit, blocks, lo.n, lo.p, lo.x)
+/// Fit through the formula door, returning the model and its labelled modes.
+fn run(formula: &str, table: &Table) -> (Model, Vec<RanefBlock>) {
+    let model =
+        glmm::formula::fit(formula, table, Family::Gaussian, &FitOptions::default()).expect("fits");
+    assert!(model.fit().converged(), "{formula}: did not converge");
+    let blocks = model.ranef().expect("labels");
+    (model, blocks)
 }
 
 // ── The recovery, against the oracle, on every route ─────────────────────────
@@ -314,11 +311,12 @@ fn balanced_collapse_ranef_matches_brute_force() {
         ],
         n: 48,
     };
-    let (fit, _, n, p, x) = run("y ~ x1 + x2 + (1 | g)", &table);
+    let (model, _) = run("y ~ x1 + x2 + (1 | g)", &table);
+    let (fit, lo) = (model.fit(), model.lowered());
     let groups = vec![(ids, vec![])];
-    let want = brute_ranef(&fit, &x, &y, n, p, &groups);
-    assert_close(&fit.ranef, &want, "collapse ranef");
-    assert_fitted(&fit, &x, n, p, &groups, None);
+    let want = brute_ranef(fit, &lo.x, &y, lo.n, lo.p, &groups);
+    assert_close(&modes(fit), &want, "collapse ranef");
+    assert_fitted(fit, &lo.x, lo.n, lo.p, &groups, None);
 }
 
 /// Unbalanced cluster sizes disarm the collapse, so the general dense path runs
@@ -338,12 +336,13 @@ fn general_dense_slope_ranef_matches_brute_force() {
         ],
         n: 47,
     };
-    let (fit, _, n, p, x) = run("y ~ x1 + x2 + (1 + x1 | g)", &table);
+    let (model, _) = run("y ~ x1 + x2 + (1 + x1 | g)", &table);
+    let (fit, lo) = (model.fit(), model.lowered());
     // x1 is design column 1 (intercept, x1, x2).
     let groups = vec![(ids, vec![1usize])];
-    let want = brute_ranef(&fit, &x, &y, n, p, &groups);
-    assert_close(&fit.ranef, &want, "dense slope ranef");
-    assert_fitted(&fit, &x, n, p, &groups, None);
+    let want = brute_ranef(fit, &lo.x, &y, lo.n, lo.p, &groups);
+    assert_close(&modes(fit), &want, "dense slope ranef");
+    assert_fitted(fit, &lo.x, lo.n, lo.p, &groups, None);
 }
 
 /// A crossed extra grouping puts levels in the dense tail, which the recovery
@@ -372,14 +371,15 @@ fn crossed_extra_ranef_matches_brute_force() {
         ],
         n,
     };
-    let (fit, _, n, p, x) = run("y ~ x1 + (1 | ga) + (1 | gb)", &table);
+    let (model, _) = run("y ~ x1 + (1 | ga) + (1 | gb)", &table);
+    let (fit, lo) = (model.fit(), model.lowered());
     let groups = vec![
         ((0..n).map(|i| i % 5).collect::<Vec<_>>(), vec![]),
         ((0..n).map(|i| i % 4).collect::<Vec<_>>(), vec![]),
     ];
-    let want = brute_ranef(&fit, &x, &y, n, p, &groups);
-    assert_close(&fit.ranef, &want, "crossed ranef");
-    assert_fitted(&fit, &x, n, p, &groups, None);
+    let want = brute_ranef(fit, &lo.x, &y, lo.n, lo.p, &groups);
+    assert_close(&modes(fit), &want, "crossed ranef");
+    assert_fitted(fit, &lo.x, lo.n, lo.p, &groups, None);
 }
 
 /// A random slope on an EXTRA grouping routes the whole fit to the sparse-Z
@@ -409,14 +409,15 @@ fn sparse_route_ranef_matches_brute_force() {
         ],
         n,
     };
-    let (fit, _, n, p, x) = run("y ~ x1 + (1 | ga) + (1 + x1 | gb)", &table);
+    let (model, _) = run("y ~ x1 + (1 | ga) + (1 + x1 | gb)", &table);
+    let (fit, lo) = (model.fit(), model.lowered());
     let groups = vec![
         ((0..n).map(|i| i % 6).collect::<Vec<_>>(), vec![]),
         ((0..n).map(|i| i % 4).collect::<Vec<_>>(), vec![1usize]),
     ];
-    let want = brute_ranef(&fit, &x, &y, n, p, &groups);
-    assert_close(&fit.ranef, &want, "sparse ranef");
-    assert_fitted(&fit, &x, n, p, &groups, None);
+    let want = brute_ranef(fit, &lo.x, &y, lo.n, lo.p, &groups);
+    assert_close(&modes(fit), &want, "sparse ranef");
+    assert_fitted(fit, &lo.x, lo.n, lo.p, &groups, None);
 }
 
 /// The offset is applied to the LMM as an exact `y − o` shift before the
@@ -467,7 +468,7 @@ fn plain_grouping_labels_follow_declared_order() {
         ],
         n: 48,
     };
-    let (_, blocks, _, _, _) = run("y ~ x1 + x2 + (1 | g)", &table);
+    let (_, blocks) = run("y ~ x1 + x2 + (1 | g)", &table);
     assert_eq!(blocks.len(), 1);
     assert_eq!(blocks[0].group, "g");
     assert_eq!(blocks[0].terms, vec!["(Intercept)".to_string()]);
@@ -489,7 +490,7 @@ fn slope_block_is_levels_by_terms() {
         ],
         n: 60,
     };
-    let (_, blocks, _, _, _) = run("y ~ x1 + x2 + (1 + x1 | g)", &table);
+    let (_, blocks) = run("y ~ x1 + x2 + (1 + x1 | g)", &table);
     assert_eq!(blocks[0].terms, strs(&["(Intercept)", "x1"]));
     assert_eq!(blocks[0].levels.len(), 5);
     assert_eq!(blocks[0].values.len(), 10);
@@ -518,7 +519,7 @@ fn crossed_interaction_labels_are_joined_pairs() {
         ],
         n,
     };
-    let (_, blocks, _, _, _) = run("y ~ x1 + (1 | ga:gb)", &table);
+    let (_, blocks) = run("y ~ x1 + (1 | ga:gb)", &table);
     assert_eq!(blocks[0].group, "ga:gb");
     assert_eq!(
         blocks[0].levels,
@@ -563,9 +564,10 @@ fn nested_padding_is_dropped_at_the_hand_computed_slots() {
         ],
         n,
     };
-    let (fit, blocks, _, _, _) = run("y ~ x1 + (1 | ga/gb)", &table);
+    let (model, blocks) = run("y ~ x1 + (1 | ga/gb)", &table);
+    let fit = model.fit();
     // The kernel's own block is the full 3×3 rectangle...
-    assert_eq!(fit.ranef_levels[1], 9, "padded rectangle width");
+    assert_eq!(fit.ranef_levels()[1], 9, "padded rectangle width");
     // ...and the labelled form keeps only the 6 assigned slots, parent-first.
     let inner = &blocks[1];
     assert_eq!(
@@ -577,7 +579,7 @@ fn nested_padding_is_dropped_at_the_hand_computed_slots() {
     // them loses nothing.
     for slot in [1usize, 2, 5] {
         assert_eq!(
-            fit.ranef[fit.ranef_levels[0] + slot],
+            fit.ranef(1)[slot],
             0.0,
             "padded slot {slot} should hold a zero mode"
         );
@@ -621,12 +623,13 @@ fn flat_nesting_labels_the_padded_layout_it_silently_routed_to() {
         ],
         n,
     };
-    let (fit, blocks, _, _, _) = run("y ~ x1 + (1 | ga) + (1 | gb)", &table);
+    let (model, blocks) = run("y ~ x1 + (1 | ga) + (1 | gb)", &table);
+    let fit = model.fit();
     // Parents A/B/C hold 1/2/3 children, so the layout is a 3-wide rectangle
     // per parent: 3 × 3 = 9 slots, inside the padding bound (9 <= 2 · 6), with
     // slots 1, 2 (A's) and 5 (B's) padding. The block is named for the child
     // alone, and the padding is dropped from the labelled form.
-    assert_eq!(fit.ranef_levels[1], 9, "padded rectangle width");
+    assert_eq!(fit.ranef_levels()[1], 9, "padded rectangle width");
     assert_eq!(blocks[1].group, "gb");
     assert_eq!(
         blocks[1].levels,
@@ -635,7 +638,7 @@ fn flat_nesting_labels_the_padded_layout_it_silently_routed_to() {
     assert_eq!(blocks[1].values.len(), 6);
     for slot in [1usize, 2, 5] {
         assert_eq!(
-            fit.ranef[fit.ranef_levels[0] + slot],
+            fit.ranef(1)[slot],
             0.0,
             "padded slot {slot} should hold a zero mode"
         );
@@ -644,6 +647,7 @@ fn flat_nesting_labels_the_padded_layout_it_silently_routed_to() {
 
 /// A declared grouping level with no row is dropped, as lme4 drops it: no
 /// slot, no `ranef` row, no note, wherever it sits in the level order.
+#[cfg(feature = "orchestrate")]
 #[test]
 fn unused_grouping_levels_are_dropped() {
     let lab: Vec<&str> = (0..48).map(|i| ["g1", "g3"][i % 2]).collect();
@@ -667,6 +671,7 @@ fn unused_grouping_levels_are_dropped() {
 
 /// The nested child ids are built on the parent's own ids, which must match the
 /// primary grouping's: an unused parent level is dropped on both sides alike.
+#[cfg(feature = "orchestrate")]
 #[test]
 fn unused_parent_level_is_dropped_under_nesting() {
     let parent: Vec<&str> = (0..48).map(|i| ["a1", "a3"][i % 2]).collect();
@@ -690,6 +695,7 @@ fn unused_parent_level_is_dropped_under_nesting() {
 
 /// A fixed-effects-only fit has no conditional modes, and labelling one is an
 /// empty result rather than an error.
+#[cfg(feature = "orchestrate")]
 #[test]
 fn no_random_effects_labels_to_nothing() {
     let (x1, x2, y, _) = sim(30, 4, &["a"]);
@@ -703,13 +709,15 @@ fn no_random_effects_labels_to_nothing() {
     };
     let lo = lower("y ~ x1 + x2", &table, Family::Gaussian).unwrap();
     let fit = glmm::fit(&lo.data(), lo.spec(), &FitOptions::default()).unwrap();
-    assert!(fit.ranef.is_empty());
+    assert_eq!(fit.n_groupings(), 0);
+    assert!(fit.ranef_levels().is_empty());
     assert!(label_ranef(&fit, &lo.re_groups).unwrap().is_empty());
 }
 
 /// `label_ranef` refuses a `re_groups` that does not describe the fit rather
 /// than returning a partial result — a mislabelled mode reads as a wrong
 /// answer, not a cosmetic slip.
+#[cfg(feature = "orchestrate")]
 #[test]
 fn label_ranef_refuses_a_mismatched_lowering() {
     let (x1, x2, y, lab) = sim(48, 23, &["c1", "c2", "c3"]);
@@ -724,7 +732,10 @@ fn label_ranef_refuses_a_mismatched_lowering() {
     };
     let lo = lower("y ~ x1 + x2 + (1 | g)", &table, Family::Gaussian).unwrap();
     let fit = glmm::fit(&lo.data(), lo.spec(), &FitOptions::default()).unwrap();
-    assert!(!fit.ranef.is_empty(), "the fixture has conditional modes");
+    assert!(
+        !fit.ranef(0).is_empty(),
+        "the fixture has conditional modes"
+    );
     assert!(
         label_ranef(&fit, &lo.re_groups).is_ok(),
         "the lowering describes the fit"

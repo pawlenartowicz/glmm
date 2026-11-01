@@ -593,10 +593,12 @@ fn sigma_vech(theta: &[f64], q: usize) -> Vec<f64> {
     out
 }
 
-/// `canonicalize_pinned_blocks`: a pinned diagonal's column folds into the
-/// trailing diagonals with Σ preserved, a second pass is a no-op, and a block
-/// with no pinned diagonal comes back BIT-identical (that last one is what
-/// keeps every non-singular fit's dump unmoved).
+/// `canonicalize_pinned_blocks` under the trace floor: a pinned diagonal's
+/// column folds into the trailing diagonals with Σ preserved, a second pass
+/// over these two blocks is a no-op (not over every block: a second fold of a
+/// canonical Λ need not reproduce it bit for bit), and a block with no pinned
+/// diagonal comes back BIT-identical (that last one is what keeps every
+/// non-singular fit's dump unmoved).
 #[test]
 fn canonicalize_pinned_blocks_folds_preserves_sigma_and_is_idempotent() {
     let base = SizedSpec {
@@ -613,7 +615,7 @@ fn canonicalize_pinned_blocks_folds_preserves_sigma_and_is_idempotent() {
     let g2 = LmmGroupings::from_cluster_spec(&spec2, &[1]);
     let mut th2 = [0.0, 0.8172902747418043, 0.0];
     let sig2 = sigma_vech(&th2, 2);
-    assert!(canonicalize_pinned_blocks(&g2, &mut th2));
+    assert!(canonicalize_pinned_blocks(&g2, &mut th2, PivotFloor::Trace));
     assert_eq!(th2[0], 0.0);
     assert_eq!(th2[1], 0.0); // column 0 zeroed outright
     assert!((th2[2] - 0.8172902747418043).abs() <= 1e-15); // mass on λ11
@@ -621,7 +623,11 @@ fn canonicalize_pinned_blocks_folds_preserves_sigma_and_is_idempotent() {
         assert!((got - want).abs() <= 1e-15 * want.abs().max(1.0));
     }
     let again = th2;
-    assert!(!canonicalize_pinned_blocks(&g2, &mut th2));
+    assert!(!canonicalize_pinned_blocks(
+        &g2,
+        &mut th2,
+        PivotFloor::Trace
+    ));
     assert_eq!(th2[0].to_bits(), again[0].to_bits());
     assert_eq!(th2[1].to_bits(), again[1].to_bits());
     assert_eq!(th2[2].to_bits(), again[2].to_bits());
@@ -629,7 +635,11 @@ fn canonicalize_pinned_blocks_folds_preserves_sigma_and_is_idempotent() {
     // No pinned diagonal ⇒ strict no-op, bit-for-bit.
     let mut th_live = [1.3, 0.37, 0.9];
     let before = th_live;
-    assert!(!canonicalize_pinned_blocks(&g2, &mut th_live));
+    assert!(!canonicalize_pinned_blocks(
+        &g2,
+        &mut th_live,
+        PivotFloor::Trace
+    ));
     for (a, b) in th_live.iter().zip(&before) {
         assert_eq!(a.to_bits(), b.to_bits());
     }
@@ -642,7 +652,7 @@ fn canonicalize_pinned_blocks_folds_preserves_sigma_and_is_idempotent() {
     let g3 = LmmGroupings::from_cluster_spec(&spec3, &[1, 2]);
     let mut th3 = [0.0, 0.5, 0.25, 0.0, 0.3, 0.4];
     let sig3 = sigma_vech(&th3, 3);
-    assert!(canonicalize_pinned_blocks(&g3, &mut th3));
+    assert!(canonicalize_pinned_blocks(&g3, &mut th3, PivotFloor::Trace));
     assert_eq!(&th3[..3], &[0.0, 0.0, 0.0]); // pinned column 0 gone
     assert!(th3[3] > PIN_THETA); // its variance re-emerges on λ11
     for (got, want) in sigma_vech(&th3, 3).iter().zip(&sig3) {
@@ -654,10 +664,157 @@ fn canonicalize_pinned_blocks_folds_preserves_sigma_and_is_idempotent() {
         );
     }
     let again3 = th3;
-    assert!(!canonicalize_pinned_blocks(&g3, &mut th3));
+    assert!(!canonicalize_pinned_blocks(
+        &g3,
+        &mut th3,
+        PivotFloor::Trace
+    ));
     for (a, b) in th3.iter().zip(&again3) {
         assert_eq!(a.to_bits(), b.to_bits());
     }
+}
+
+/// The q = 3 slope block `(1 + x1 + x2 | g)`, vech
+/// `[λ00, λ10, λ20, λ11, λ21, λ22]`.
+fn q3_groupings() -> LmmGroupings {
+    let mut spec = SizedSpec {
+        spec: intercept_only_spec(),
+        n_primary: 4,
+        extra_counts: vec![],
+    };
+    spec.spec.re.as_mut().unwrap().slopes.extend([1, 2]);
+    LmmGroupings::from_cluster_spec(&spec, &[1, 2])
+}
+
+/// Vech positions of the q = 3 block's diagonals.
+const Q3_DIAG: [usize; 3] = [0, 3, 5];
+
+/// The pin pass with the pin outside the factorization, as `pin_endpoint`
+/// ran it before: pin, the Σ-preserving fold, pin the fold's diagonals again.
+fn pin_fold_pin(g: &LmmGroupings, theta: &mut [f64]) {
+    let pin = |theta: &mut [f64]| {
+        for &ti in g.diagonal_theta() {
+            if theta[ti] <= PIN_THETA {
+                theta[ti] = 0.0;
+            }
+        }
+    };
+    pin(theta);
+    if canonicalize_pinned_blocks(g, theta, PivotFloor::Trace) {
+        pin(theta);
+    }
+}
+
+/// Whether some zero diagonal of the q = 3 block has a nonzero entry below it.
+fn zero_diagonal_above_live_entry(theta: &[f64]) -> bool {
+    [(0usize, 0..3usize), (3, 3..5), (5, 5..6)]
+        .into_iter()
+        .any(|(d, col)| theta[d] == 0.0 && theta[col].iter().any(|&v| v != 0.0))
+}
+
+/// `pin_endpoint` pins inside the factorization: on a block where the first
+/// pin zeroes two or three diagonals, the fold leaves no zero diagonal above a
+/// live entry, no diagonal in (0, `PIN_THETA`], and flags exactly the zero
+/// diagonals. Pinning after a Σ-preserving fold instead (`pin_fold_pin`)
+/// leaves `[0, 0, 0, 0, -6.7e-7, 0]` on the first input (every diagonal
+/// pinned; the fold writes λ₂₁ under a trailing diagonal that the second pin
+/// zeroes) and `[0, 0, 0, 0, 0.3, 0.5385]` on the second (0.3 under a zero
+/// λ₁₁). Σ changes only by what the pins drop: entry (r, c) of a pinned row
+/// or column by at most `PIN_THETA·√max(Σ_rr, Σ_cc)` against Σ after the
+/// first pin, every other entry by round-off.
+#[test]
+fn pin_endpoint_leaves_no_zero_diagonal_above_a_live_entry() {
+    let g = q3_groupings();
+    assert_eq!(g.diagonal_theta(), &Q3_DIAG);
+    let cases: [([f64; 6], u64); 2] = [
+        ([1e-6, 5e-5, -6.7e-7, 1e-6, 3e-5, 1e-6], 0b111),
+        ([1e-6, 1e-6, 0.3, 1e-6, 0.2, 0.5], 0b011),
+    ];
+    let mut ran = 0;
+    for (input, want_flags) in cases {
+        let mut before = input;
+        pin_fold_pin(&g, &mut before);
+        assert!(zero_diagonal_above_live_entry(&before), "{before:?}");
+
+        let mut first_pin = input;
+        for ti in Q3_DIAG {
+            if first_pin[ti] <= PIN_THETA {
+                first_pin[ti] = 0.0;
+            }
+        }
+        let mut th = input;
+        let (pinned, flags) = pin_endpoint(&g, &mut th, None);
+        assert!(pinned);
+        assert_eq!(flags, want_flags, "{th:?}");
+        assert!(!zero_diagonal_above_live_entry(&th), "{th:?}");
+        for (k, ti) in Q3_DIAG.into_iter().enumerate() {
+            assert_eq!(flags & (1 << k) != 0, th[ti] == 0.0, "{th:?}");
+            assert!(th[ti] == 0.0 || th[ti] > PIN_THETA, "{th:?}");
+        }
+        let (sig0, sig1) = (sigma_vech(&first_pin, 3), sigma_vech(&th, 3));
+        let mut at = 0;
+        for c in 0..3 {
+            for r in c..3 {
+                let drop = if flags & (1 << r | 1 << c) != 0 {
+                    PIN_THETA * sig0[Q3_DIAG[r]].max(sig0[Q3_DIAG[c]]).sqrt()
+                } else {
+                    0.0
+                };
+                assert!(
+                    (sig1[at] - sig0[at]).abs() <= drop + 1e-15 * sig0[at].abs().max(1.0),
+                    "Σ({r},{c}) {} vs {}",
+                    sig1[at],
+                    sig0[at]
+                );
+                at += 1;
+            }
+        }
+        ran += 1;
+    }
+    assert_eq!(ran, 2);
+    // On the second input the only mass left is the live last column's:
+    // Σ₂₂ = 0.3² + 0.2² + 0.5².
+    let mut th = cases[1].0;
+    pin_endpoint(&g, &mut th, None);
+    assert_eq!(&th[..5], &[0.0; 5]);
+    assert!((th[5] - 0.38f64.sqrt()).abs() <= 1e-15);
+}
+
+/// On a pinned block the old pass (`pin_fold_pin`) left no zero diagonal above
+/// a live entry on, `pin_endpoint` returns the old result bit for bit: with
+/// nothing below a pinned diagonal, the skipped pivot's column is +0 either
+/// way, and the skip test is the second pin's. One fold, not a fold repeated
+/// until nothing changes: on this block (flags `[T, F, F]`) a second fold of
+/// the canonical Λ moves λ₂₂ in its last bits.
+#[test]
+fn pin_endpoint_matches_the_old_pass_where_it_left_no_residual() {
+    let g = q3_groupings();
+    let input = [
+        2.4335829670786102e-08,
+        -1.8253195353069166e-06,
+        0.010764440989509627,
+        0.34272756824593026,
+        0.8456001670429873,
+        0.8903359168361594,
+    ];
+    let mut before = input;
+    pin_fold_pin(&g, &mut before);
+    assert!(!zero_diagonal_above_live_entry(&before), "{before:?}");
+    let mut refolded = before;
+    assert!(canonicalize_pinned_blocks(
+        &g,
+        &mut refolded,
+        PivotFloor::Trace
+    ));
+    assert_ne!(refolded.map(f64::to_bits), before.map(f64::to_bits));
+
+    let mut th = input;
+    assert_eq!(pin_endpoint(&g, &mut th, None), (true, 0b001));
+    assert_eq!(
+        th.map(f64::to_bits),
+        before.map(f64::to_bits),
+        "{th:?} vs {before:?}"
+    );
 }
 
 /// Suff-stats bookkeeping on a hand-checkable block: counts per RE column,
@@ -2933,7 +3090,11 @@ fn fit_lmm_pin_rebuild_folds_the_raw_endpoint() {
             folded[ti] = 0.0;
         }
     }
-    assert!(canonicalize_pinned_blocks(&suff.groupings, &mut folded));
+    assert!(canonicalize_pinned_blocks(
+        &suff.groupings,
+        &mut folded,
+        PivotFloor::Pin
+    ));
     // Not a round-off rewrite of an already-canonical Λ: θ₁'s mass moves.
     assert!(
         raw[1].abs() > 1e-2 && folded[1] == 0.0,

@@ -193,7 +193,7 @@ impl<'a> Data<'a> {
     ///   `counts`: the last is `Σ z²·wᵢ`, not a row count; `ν`, `n − p`
     ///   under REML and `n` under ML, still comes from the raw row count).
     ///   `σ̂² = pwrss_w/ν` (raw ν) falls out of the weighted Grams
-    ///   automatically; `tau2 = θ²·σ̂²` and SEs inherit.
+    ///   automatically; `varcorr = σ̂²·Λ̂Λ̂ᵀ` and SEs inherit.
     ///   The reported deviance carries an extra `−Σlog wᵢ` (the weighted
     ///   Gaussian log-density's `+½Σlog wᵢ` per row, on the −2ℓ scale) atop the
     ///   usual stripped-constant convention, on both criteria, matching lme4's

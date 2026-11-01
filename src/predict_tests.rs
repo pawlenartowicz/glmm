@@ -319,6 +319,8 @@ fn unseen_ids_contribute_zero_and_raise_one_note_per_grouping() {
         panic!("an unseen level is refused without allow_new_levels");
     };
     assert!(m.contains("grouping 0") && m.contains("row 1"), "{m}");
+    assert_eq!(m.row(), Some(1));
+    assert!(m.text_with_row(6).contains("at row 6 (id "), "{m}");
 }
 
 /// The conditional SE on sleepstudy equals lme4's `vcov_full` form,
@@ -569,7 +571,7 @@ fn conditional_se_matches_a_dense_joint_inverse() {
                     .collect();
                 for j in 0..p {
                     for k in 0..p {
-                        var += d[j] * fit.vcov[j][k] * d[k];
+                        var += d[j] * fit.vcov()[j * p + k] * d[k];
                     }
                 }
                 let want = var.sqrt();

@@ -2234,7 +2234,7 @@ fn fit_glmm_gamma_weighted_held_dispersion_invariant() {
             None,
             &FitOptions {
                 se_for: SeFor::Only(vec![0, 1]),
-                dispersion: Some(v),
+                dispersion: Dispersion::Fixed(v),
                 ..FitOptions::default()
             },
         )
@@ -3873,7 +3873,7 @@ fn fit_glmm_gamma_slope_on_a_shifted_column_costs_no_more_evals() {
     );
 }
 
-/// The `dispersion: Some(v)` directive on the GLMM route: the fit runs at the
+/// The `Dispersion::Fixed(v)` directive on the GLMM route: the fit runs at the
 /// held φ, which is reported instead of the ML estimate, and φ stops costing a
 /// degree of freedom, so `df` drops to 3 β + 1 θ. Same `sim_gamma` design as
 /// `fit_glmm_gamma_sim_matches_grid_reference`, whose estimate-φ `df` is 5.
@@ -3907,7 +3907,7 @@ fn fit_glmm_gamma_fixed_dispersion_is_reported_and_costs_no_df() {
         &ids,
         &FitOptions {
             se_for: SeFor::Only(vec![0, 1, 2]),
-            dispersion: Some(PHI),
+            dispersion: Dispersion::Fixed(PHI),
             ..FitOptions::default()
         },
     );
@@ -3961,7 +3961,7 @@ fn fit_glmm_gamma_fixed_dispersion_is_reported_and_costs_no_df() {
         &ids,
         &FitOptions {
             se_for: SeFor::Only(vec![0, 1, 2]),
-            dispersion: Some(free.dispersion),
+            dispersion: Dispersion::Fixed(free.dispersion),
             ..FitOptions::default()
         },
     );
@@ -6129,6 +6129,34 @@ fn stddev_se_is_the_delta_method_of_the_reported_stddev() {
         }
         assert!(fit.stddev_se[1].is_nan());
     }
+}
+
+/// `stddev_se(g)` reads grouping `g`'s diagonal slots out of the stored
+/// layout, which concatenates the groupings' vechs: on `(1 + x | g) + (1 | b)`
+/// the first grouping's SDs sit at slots 0 and 2 and the second's single one
+/// after the first's three.
+#[test]
+fn stddev_se_reads_each_groupings_diagonal_slots() {
+    let (x, y, n, p, mut model, mut ids) = sim_binomial_slope1_design();
+    model
+        .re
+        .as_mut()
+        .expect("a mixed model")
+        .extra_groupings
+        .push(Grouping::crossed());
+    ids.extra = vec![(0..n).map(|i| (i % 5) as u32).collect()];
+    let opts = FitOptions {
+        wald_se: WaldSe::Hessian,
+        ..FitOptions::default()
+    };
+    let f = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    assert!(f.converged());
+    let s = &f.stddev_se;
+    assert_eq!(s.len(), 4);
+    assert!([s[0], s[2], s[3]].iter().all(|v| v.is_finite()), "{s:?}");
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    assert_eq!(bits(&f.stddev_se(0)), bits(&[s[0], s[2]]));
+    assert_eq!(bits(&f.stddev_se(1)), bits(&[s[3]]));
 }
 
 /// The stage split must add up to the reported eval count, and the shrink
@@ -9437,7 +9465,7 @@ fn glmm_maxfun_cap_reports_honest_endpoint() {
             fit.se[j]
         );
         assert!(
-            fit.vcov[j][j].is_finite(),
+            fit.vcov()[j * fit.beta.len() + j].is_finite(),
             "plateau policy: capped endpoint must not NaN-fill vcov at j={j}"
         );
     }
@@ -11259,7 +11287,7 @@ fn refused_start(start: &StartValues) -> String {
     let (x, y, n, p, model, ids, opts) = sim_gamma_glmm(crate::GammaLink::Log);
     let data = Data::new(&x, &y, n, p).ids(&ids);
     match crate::fit_with_start(&data, &model, start, &opts) {
-        Err(FitError::Start(m)) => m,
+        Err(FitError::Start(m)) => m.into(),
         Err(e) => panic!("not a Start error: {e:?}"),
         Ok(_) => panic!("the start must be refused"),
     }

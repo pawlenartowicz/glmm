@@ -411,14 +411,12 @@ fn unit_invariance_on_every_route() {
             let mut beta = base.beta.clone();
             reparam(&mut beta, c.col, s, a);
             check("β", &f.beta, &beta);
-            let v = congruent(&base.vcov, c.col, s, a);
+            let v = congruent(&base.vcov_rows(), c.col, s, a);
             let se: Vec<f64> = (0..c.p).map(|k| v[k][k].sqrt()).collect();
             check("se", &f.se, &se);
             // vcov relative to √(V_aa·V_bb): an off-diagonal can be near zero.
             let vcov_rel: Vec<f64> = (0..c.p * c.p)
-                .map(|i| {
-                    (f.vcov[i / c.p][i % c.p] - v[i / c.p][i % c.p]) / (se[i / c.p] * se[i % c.p])
-                })
+                .map(|i| (f.vcov()[i] - v[i / c.p][i % c.p]) / (se[i / c.p] * se[i % c.p]))
                 .collect();
             check("vcov", &vcov_rel, &vec![0.0; c.p * c.p]);
             let reml = if f.reml { s.ln() } else { 0.0 };

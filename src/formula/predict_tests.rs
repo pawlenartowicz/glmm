@@ -3,7 +3,7 @@
 //! matrix door on the same rows.
 
 use super::materialize::lower_new;
-use super::{fit, label_ranef, lower, predict, Column, Error, Model, Table};
+use super::{fit, lower, predict, Column, Error, Model, Table};
 use crate::predict::predict_tests::SLEEP;
 use crate::test_support::csv_table;
 use crate::{Family, FitError, FitOptions, GroupIds, Note, PoissonLink, PredictOptions, Scale};
@@ -87,11 +87,18 @@ fn new_table_levels_are_matched_by_label() {
     levels.push("z".to_string());
     codes[5] = levels.len() as u32 - 1;
     match lower_new(formula, &lo, &unseen) {
-        Err(Error::Fit(FitError::Shape(m))) => {
+        Err(e @ Error::Fit(FitError::Shape(_))) => {
+            let Error::Fit(FitError::Shape(m)) = &e else {
+                unreachable!()
+            };
             assert!(
                 m.contains("\"g\"") && m.contains("\"z\"") && m.contains("row 5"),
                 "{m}"
             );
+            // The row crosses `Error::Fit` as a field, and renumbers there.
+            assert_eq!(e.row(), Some(5));
+            assert_eq!(m.row(), Some(5));
+            assert!(e.to_string_with_row(6).contains("at row 6, "), "{e}");
         }
         other => panic!(
             "expected Error::Fit(FitError::Shape(..)), got {:?}",
@@ -134,6 +141,7 @@ fn new_table_levels_are_matched_by_label() {
     match lower_new("y ~ 1 + (1 | A:B)", &lo_ab, &ab) {
         Err(Error::Fit(FitError::Shape(m))) => {
             assert!(m.contains("\"a:b:c\"") && m.contains("row 0"), "{m}");
+            assert_eq!(m.row(), Some(0));
         }
         other => panic!(
             "expected Error::Fit(FitError::Shape(..)), got {:?}",
@@ -163,7 +171,7 @@ fn new_table_levels_are_matched_by_label() {
         n: 4,
     };
     let pred = predict(&m, &new, &PredictOptions::default()).unwrap();
-    let blocks = label_ranef(m.fit(), &m.lowered().re_groups).unwrap();
+    let blocks = m.ranef().unwrap();
     let mode = |g: usize, level: &str| {
         let at = blocks[g].levels.iter().position(|l| l == level).unwrap();
         blocks[g].values[at]
@@ -363,7 +371,7 @@ fn predict_sleepstudy_matches_its_frozen_reference() {
         "Reaction ~ 1 + Days + (1 + Days | Subject)",
         Family::Gaussian,
     );
-    let blocks = label_ranef(m.fit(), &m.lowered().re_groups).unwrap();
+    let blocks = m.ranef().unwrap();
     let mode = |s: &str| {
         let at = blocks[0].levels.iter().position(|l| l == s).unwrap();
         &blocks[0].values[at * 2..at * 2 + 2]

@@ -1,0 +1,62 @@
+{
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_profile.R"
+  },
+  "level": 0.95,
+  "deviance": 162.873036653826,
+  "rows": [
+    {
+      "parameter": "sd_(Intercept)|Batch",
+      "kind": "sd",
+      "group": "Batch",
+      "term": "(Intercept)",
+      "term2": null,
+      "estimate": 0,
+      "lower": 0,
+      "upper": 2.08404348901022,
+      "method": "lme4_profile"
+    },
+    {
+      "parameter": "sigma",
+      "kind": "sigma",
+      "group": null,
+      "term": null,
+      "term2": null,
+      "estimate": 3.65323135137465,
+      "lower": 2.8928310201022,
+      "upper": 4.81583255245072,
+      "method": "lme4_profile"
+    },
+    {
+      "parameter": "(Intercept)",
+      "kind": "beta",
+      "group": null,
+      "term": "(Intercept)",
+      "term2": null,
+      "estimate": 5.6656,
+      "lower": 4.31210021673831,
+      "upper": 7.01909234683741,
+      "method": "lme4_profile"
+    }
+  ],
+  "name": "profile_dyestuff2"
+}

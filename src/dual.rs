@@ -263,11 +263,6 @@ impl<const N: usize> crate::scalar::Scalar for Dual<N> {
         let phi = crate::family::FRAC_1_SQRT_2PI * f64::exp(-0.5 * self.v * self.v);
         chain1(self, value, phi)
     }
-    #[inline]
-    fn ln_gamma(self) -> Self {
-        let value = crate::simd_transcendental::ln_gamma(self.v);
-        chain1(self, value, digamma(self.v))
-    }
 }
 
 // `check` calling `assert_send_sync::<Dual<4>>()` is the compile-time
@@ -598,11 +593,6 @@ impl<const N: usize, const H: usize> crate::scalar::Scalar for HyperDual<N, H> {
         let phi = crate::family::FRAC_1_SQRT_2PI * f64::exp(-0.5 * self.v * self.v);
         chain2(self, value, phi, -self.v * phi)
     }
-    #[inline]
-    fn ln_gamma(self) -> Self {
-        let value = crate::simd_transcendental::ln_gamma(self.v);
-        chain2(self, value, digamma(self.v), trigamma(self.v))
-    }
 }
 
 #[cfg(test)]
@@ -614,8 +604,7 @@ mod tests {
     /// ψ(2) = 1 − γ (A&S 6.3.2–6.3.4); ψ′(1) = π²/6, ψ′(½) = π²/2,
     /// ψ′(2) = π²/6 − 1 (A&S 6.4.3–6.4.5). Every point here goes through the
     /// recurrence to `x ≥ 14`; the `x = 30` point of
-    /// `dual_chain_rules_match_central_fd_of_the_f64_twin` reaches the series
-    /// directly.
+    /// `digamma_is_the_derivative_of_ln_gamma` reaches the series directly.
     #[test]
     fn digamma_trigamma_match_closed_forms() {
         const EULER: f64 = 0.577_215_664_901_532_9;
@@ -641,6 +630,19 @@ mod tests {
                 (trigamma(x) - want).abs() <= 1e-13 * want.abs().max(1.0),
                 "psi'({x})"
             );
+        }
+    }
+
+    /// ψ = (lnΓ)′: `digamma` against a central difference of the crate's
+    /// `ln_gamma`, which shares no code with it. `h = 1e-6·max(x, 1)` puts the
+    /// FD floor near 1e-10; the band is 1e-7. `x = 30` skips the recurrence.
+    #[test]
+    fn digamma_is_the_derivative_of_ln_gamma() {
+        let ln_gamma = crate::simd_transcendental::ln_gamma;
+        for &x in &[0.25_f64, 0.3, 1.0, 3.0, 12.0, 30.0] {
+            let h = 1e-6 * x.max(1.0);
+            let fd = (ln_gamma(x + h) - ln_gamma(x - h)) / (2.0 * h);
+            assert!((digamma(x) - fd).abs() <= 1e-7, "x = {x}");
         }
     }
 
@@ -686,8 +688,8 @@ mod tests {
     /// chain-rule error and not a difference between two implementations of the
     /// same function. h = 1e-6 relative puts the FD truncation and round-off floor
     /// near 1e-10, so the band is 1e-8. No point below 0.25: `h` is absolute
-    /// (1e-6) there, and the central-FD truncation `(h²/6)·f'''` for `ln`, `sqrt`
-    /// and `ln_gamma` at x ≤ 1e-3 exceeds the bands by orders.
+    /// (1e-6) there, and the central-FD truncation `(h²/6)·f'''` for `ln` and
+    /// `sqrt` at x ≤ 1e-3 exceeds the bands by orders.
     // `fd(|t| Scalar::method(t), x)` reads `Scalar::method` as a plain
     // function reference and clippy flags each as a redundant closure, so
     // the lint is silenced here rather than rewriting every closure.
@@ -734,10 +736,8 @@ mod tests {
             let a = Dual::<1> { v: x, d: [1.0] };
             assert!((Scalar::ln(a).d[0] - fd(|t| Scalar::ln(t), x)).abs() <= 1e-8 * (1.0 / x));
             assert!((Scalar::sqrt(a).d[0] - fd(|t| Scalar::sqrt(t), x)).abs() <= 1e-8);
-            assert!((Scalar::ln_gamma(a).d[0] - fd(|t| Scalar::ln_gamma(t), x)).abs() <= 1e-7);
             assert_eq!(Scalar::ln(a).v, Scalar::ln(x));
             assert_eq!(Scalar::sqrt(a).v, Scalar::sqrt(x));
-            assert_eq!(Scalar::ln_gamma(a).v, Scalar::ln_gamma(x));
         }
         // `ln_1p` (the probit tail rows, family.rs) needs x > −1.
         for &x in &[-0.7_f64, 0.0, 0.4, 1.0, 4.0] {
@@ -876,7 +876,6 @@ mod tests {
         for &x in &[0.25_f64, 1.0, 3.0, 12.0] {
             check!(ln, x, 1e-7);
             check!(sqrt, x, 1e-7);
-            check!(ln_gamma, x, 1e-6);
         }
         for &x in &[-0.7_f64, 0.4, 1.0, 4.0] {
             check!(ln_1p, x, 1e-7);

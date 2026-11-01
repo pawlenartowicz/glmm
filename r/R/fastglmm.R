@@ -200,7 +200,17 @@
 #'   `diagnostics` list (the solver's own report: `boundary`, `pinned`,
 #'   `notes`, plus the three flags above), a `warnings` data.frame (one row
 #'   per warning the call raised: `tier`, `kind`, `title`, `message`; match on
-#'   `kind`), the per-coefficient `coef_df` (the t test's degrees of freedom,
+#'   `kind`), `n_eval` (the optimizer's objective evaluations, 0 on the
+#'   closed-form and IRLS paths), `n_grad`, `outer_stop` and `outer_decrement`
+#'   (the BFGS gradient search's gradient evaluations, not counted in
+#'   `n_eval`; why it stopped, `"fdelta"`, `"pgrad"` or `"noise_floor"` when
+#'   it converged, otherwise `"line_search"`, `"max_iter"`,
+#'   `"grad_unavailable"` or `"non_finite"`; its estimate of the deviance
+#'   decrease left; it runs on the models the
+#'   `"fastglmm_gradient_search_fallback"` warning names, and they describe it
+#'   even when the derivative-free search finished the fit; `0`,
+#'   `NA_character_` and `NaN` on every fit that ran no gradient search), the
+#'   per-coefficient `coef_df` (the t test's degrees of freedom,
 #'   `NaN` where the test is z and on an OLS or dispersion-GLM fit that did not
 #'   converge) and `coef_p` (its p-value), `df_method`
 #'   (`"satterthwaite"`, `"residual"`, `"none"`, `"disabled"` or `"failed"`),
@@ -368,6 +378,10 @@ fastglmm <- function(formula, data, family = gaussian(),
   e <- substitute(offset)
   if (!is.null(e)) frame <- .add_offset(frame, eval(e, data, parent.frame()), nrow(data))
 
+  # Each row's 1-based position in `data`, carried through subset= and
+  # na.action as a column, so an error from the engine names the caller's row
+  # (`row_index` of fastglmm_fit) whatever the subset or na.action drops.
+  frame[["(row)"]] <- seq_len(nrow(frame))
   e <- substitute(subset)
   s <- if (is.null(e)) NULL else eval(e, data, parent.frame())
   if (!is.null(s)) frame <- frame[s, , drop = FALSE]
@@ -408,6 +422,8 @@ fastglmm <- function(formula, data, family = gaussian(),
       n_before_na - nrow(frame), n_before_na),
       c("fastglmm_rows_dropped_na", "fastglmm_diagnostic"))
   }
+  row_index <- frame[["(row)"]]
+  frame[["(row)"]] <- NULL
   w <- frame[["(weights)"]]
   o <- frame[["(offset)"]]
 
@@ -425,17 +441,20 @@ fastglmm <- function(formula, data, family = gaussian(),
     satterthwaite,
     condvar,
     if (is.null(REML)) logical() else REML,
-    anova_test
+    anova_test,
+    row_index
   )
 
-  .fit_object(r, store, fam, nAGQ, dispersion, f_str, frame, match.call(), data_name)
+  .fit_object(r, store, fam, nAGQ, dispersion, f_str, frame, row_index, match.call(), data_name)
 }
 
 # The fit object from the kernel's raw list `r`: raises the fit's warnings
 # (into `store`, which already holds the data-prep ones) and builds the
 # "fastglmm" list. fastglmm() and compare() share it, so a fit made by
-# compare() is the object fastglmm() makes.
-.fit_object <- function(r, store, fam, nAGQ, dispersion, f_str, frame, call, data_name) {
+# compare() is the object fastglmm() makes. `row_index` is each frame row's
+# 1-based position in the caller's data.
+.fit_object <- function(r, store, fam, nAGQ, dispersion, f_str, frame, row_index, call,
+                        data_name) {
   ignored <- c("fastglmm_argument_ignored", "fastglmm_diagnostic")
   # Whether the FITTED model actually has random effects - not `mixed`, which
   # only says the formula asked for some: a single-level grouping is dropped
@@ -631,6 +650,11 @@ fastglmm <- function(formula, data, family = gaussian(),
     # fit saved before them. Mirrors the Python port's `Fit._kernel_parts` -
     # change together.
     .kernel_parts = r$kernel_parts,
+    # Each frame row's 1-based position in the caller's data, so an error of
+    # predict() or simulate() on the frame's rows names the caller's row. NULL
+    # when no row was dropped, and on a fit saved before it. Mirrors the
+    # Python port's `Fit._kernel_parts["row_index"]` - change together.
+    .row_index = if (identical(row_index, seq_len(nrow(frame)))) NULL else row_index,
     fitted = r$fitted,
     # The response as the kernel fitted it (after lowering: a cbind() LHS is
     # the proportion). residuals() reads this rather than re-resolving the

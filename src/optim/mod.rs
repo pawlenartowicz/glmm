@@ -33,6 +33,7 @@
 //! pure function of (data, start, hint), in any call order.
 
 pub(crate) mod bfgs;
+pub(crate) mod post_pin;
 #[cfg(test)]
 mod tests;
 

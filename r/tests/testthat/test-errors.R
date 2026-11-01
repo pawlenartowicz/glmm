@@ -276,7 +276,7 @@ test_that("inf in weights= or offset= is refused up front, not by the kernel", {
   w <- rep(1, 40)
   w[1] <- Inf
   # The plain up-front message, not the kernel's own ("Data weights must
-  # be finite and > 0 (row 0)") which "weights must be finite" alone would also
+  # be finite and > 0 (row 1)") which "weights must be finite" alone would also
   # match as a substring.
   expect_error(fastglmm(y ~ x, d, weights = w), "no NaN, inf, or missing entries")
   o <- rep(0, 40)
@@ -450,7 +450,7 @@ test_that("an infinite offset() term names the term, not a kernel struct", {
   d <- err_data()
   d$o <- 0
   d$o[2] <- Inf
-  expect_error(fastglmm(y ~ x + offset(o), d), "term 'offset(o)' is not finite at row 1",
+  expect_error(fastglmm(y ~ x + offset(o), d), "term 'offset(o)' is not finite at row 2",
                fixed = TRUE)
 })
 
@@ -459,8 +459,56 @@ test_that("an infinite response or predictor names the column, not a kernel argu
     d <- err_data()
     d[[col]][2] <- Inf
     expect_error(fastglmm(y ~ x + (1 | g), d),
-                 sprintf("term '%s' is not finite at row 1", col), fixed = TRUE)
+                 sprintf("term '%s' is not finite at row 2", col), fixed = TRUE)
   }
+})
+
+test_that("an engine error names the caller's row, counting from 1", {
+  d <- err_data(); d$k <- rpois(nrow(d), 2); d$k[2] <- -1
+  expect_error(fastglmm(k ~ x, d, family = poisson()), "Poisson response must be >= 0 (row 2)",
+               fixed = TRUE)
+  d <- err_data(); d$x[3] <- Inf
+  expect_error(fastglmm(y ~ x, d), "term 'x' is not finite at row 3", fixed = TRUE)
+})
+
+test_that("an error row counts the caller's rows after na.omit", {
+  d <- err_data(); d$k <- rpois(nrow(d), 2); d$x[1] <- NA; d$k[3] <- -1
+  expect_error(suppressWarnings(fastglmm(k ~ x, d, family = poisson())), "(row 3)", fixed = TRUE)
+  expect_error(suppressWarnings(compare(d, k ~ 1, k ~ x, family = poisson())), "(row 3)",
+               fixed = TRUE)
+})
+
+test_that("an error row counts the caller's rows after subset", {
+  d <- err_data(); d$k <- rpois(nrow(d), 2); d$k[5] <- -1
+  # The kernel sees row 5 as its third row (0-based 2) under either subset.
+  expect_error(fastglmm(k ~ x, d, family = poisson(), subset = -(1:2)), "(row 5)", fixed = TRUE)
+  expect_error(fastglmm(k ~ x, d, family = poisson(), subset = !(seq_len(nrow(d)) %in% c(1, 3))),
+               "(row 5)", fixed = TRUE)
+})
+
+test_that("predict() names a newdata row, and a fit's own row through the rows it kept", {
+  set.seed(5)
+  d <- data.frame(p = sample(1:3, 40, TRUE) / 4, x = rnorm(40), g = factor(rep(1:8, 5)))
+  d$x[1] <- NA
+  w <- rep(4, 40); w[6] <- 4.5
+  m <- suppressWarnings(fastglmm(p ~ x + (1 | g), d, family = binomial(), weights = w))
+  # Row 6 of d is the fit's fifth row (0-based 4).
+  expect_error(predict(m, future = TRUE), "whole trial counts as weights (row 6)", fixed = TRUE)
+  expect_error(simulate(m, seed = 1), "(row 6 has 4.5)", fixed = TRUE)
+  # A newdata row is the caller's own, whatever rows the fit dropped.
+  new <- data.frame(x = c(0, 0.5, 1), g = factor(c("1", "9", "2")))
+  expect_error(predict(m, new, allow.new.levels = FALSE), "did not see at row 2 (id",
+               fixed = TRUE)
+})
+
+test_that("simulate() names the caller's row of the fit's rows", {
+  set.seed(4)
+  d <- data.frame(p = runif(20, 0.2, 0.8), x = rnorm(20))
+  d$x[1] <- NA
+  w <- rep(4, 20); w[4] <- 4.5
+  m <- suppressWarnings(fastglmm(p ~ x, d, family = binomial(), weights = w))
+  expect_error(simulate(m, seed = 1), "whole trial counts as weights (row 4 has 4.5)",
+               fixed = TRUE)
 })
 
 test_that("wald.se must be 'hessian' or 'rx' - mirrors the Python port's wald_se check", {
@@ -492,5 +540,14 @@ test_that("unimplemented accessors error with the reason", {
   fit <- suppressWarnings(fastglmm(y ~ x + (1 | g), d)) # boundary fit is fine here
   expect_error(coef(fit), "fixef")
   expect_error(terms(fit), "formula\\(\\) returns")
-  expect_error(confint(fit, method = "profile"), "no profiling machinery")
+  expect_error(confint(fit, method = "boot"),
+               "confint(method = \"boot\") is not available", fixed = TRUE)
+})
+
+test_that("confint(method = \"profile\") refuses a GLMM with the kernel's reason", {
+  d <- err_data()
+  d$b <- as.numeric(d$y > 0)
+  fit <- suppressWarnings(fastglmm(b ~ x + (1 | g), d, family = binomial()))
+  expect_error(confint(fit, method = "profile"),
+               "profile intervals need a Gaussian model with random effects", fixed = TRUE)
 })

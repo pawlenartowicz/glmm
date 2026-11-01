@@ -1,7 +1,7 @@
 {
   "dataset": "glm_poisson",
-  "engine": "lme4",
-  "engine_version": "1.1.38",
+  "engine": "stats::glm",
+  "engine_version": "R-4.5.3",
   "family": "poisson",
   "reml": null,
   "rung": 31,

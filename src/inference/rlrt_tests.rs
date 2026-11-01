@@ -669,11 +669,12 @@ fn balanced_null_matches_anova_f() {
         let null = rlrt_null(&balanced(k, j), &config(B, seed, true));
         let f = FisherF::new((k - 1) as f64, (n - k) as f64).expect("F(K - 1, n - K)");
         let atom = f.cdf(1.0);
+        let n_zero = B - null.draws_pos.len();
         let (n1, k1) = ((n - 1) as f64, (k - 1) as f64);
         let g = |x: f64| n1 * (((n - k) as f64 + k1 * x) / n1).ln() - k1 * x.ln();
         let ecdf =
-            |x: f64| (null.n_zero + null.draws_pos.partition_point(|&t| t <= x)) as f64 / B as f64;
-        let gap = (null.n_zero as f64 / B as f64 - atom).abs();
+            |x: f64| (n_zero + null.draws_pos.partition_point(|&t| t <= x)) as f64 / B as f64;
+        let gap = (n_zero as f64 / B as f64 - atom).abs();
         eprintln!("(K, J) = ({k}, {j}): atom {atom:.4}, mass at zero off by {gap:.2e}");
         assert!(gap <= band, "({k}, {j}): mass at zero off by {gap:e}");
         worst = worst.max(gap);
@@ -778,8 +779,6 @@ fn zero_tail_df_branch() {
         let (want, at) = max_on_grid(&tables, &chi1, 0.0, d.n_minus_p);
         assert_eq!((t.to_bits(), i), (want.to_bits(), at), "draw {b}");
     }
-    let null = rlrt_null(&d, &cfg);
-    assert_eq!(null.n_zero + null.draws_pos.len(), cfg.nsim);
 }
 
 /// `p = (1 + #{T_b ≥ t})/(B + 1)` for `t > 0` against a brute-force count,
@@ -809,7 +808,7 @@ fn p_value_rules() {
         assert_eq!(null.p_value(t), floor, "t = {t}");
     }
     let empty = rlrt_null(&d, &config(0, 20261031, false));
-    assert_eq!((empty.n_zero, empty.draws_pos.len()), (0, 0));
+    assert!(empty.draws_pos.is_empty());
     assert!(empty.p_value(1.0).is_nan());
     assert_eq!(empty.p_value(0.0), 1.0);
 }
@@ -853,27 +852,21 @@ fn exact_of(full: &Fit, reduced: &Fit, cfg: &RlrtConfig) -> Result<RlrtResult, R
 }
 
 /// Every field to the bit, so two results with a NaN field compare.
-fn result_bits(r: &RlrtResult) -> [u64; 8] {
+fn result_bits(r: &RlrtResult) -> [u64; 4] {
     [
         r.statistic.to_bits(),
         r.p_value.to_bits(),
         r.nsim as u64,
         r.seed,
-        r.mass_at_zero.to_bits(),
-        r.mc_se.to_bits(),
-        r.k_eigen as u64,
-        r.edge_hits as u64,
     ]
 }
 
 /// The result of a zero statistic: `+0.0`, `p = 1`, no draws.
-fn assert_zero_result(tag: &str, r: &RlrtResult, cfg: &RlrtConfig, k_eigen: usize) {
+fn assert_zero_result(tag: &str, r: &RlrtResult, cfg: &RlrtConfig) {
     assert_eq!(r.statistic.to_bits(), 0.0f64.to_bits(), "{tag}: statistic");
     assert_eq!(r.p_value, 1.0, "{tag}: p-value");
-    assert_eq!((r.nsim, r.edge_hits), (0, 0), "{tag}: draws");
-    assert!(r.mass_at_zero.is_nan(), "{tag}: mass at zero");
-    assert_eq!(r.mc_se, 0.0, "{tag}: Monte Carlo SE");
-    assert_eq!((r.seed, r.k_eigen), (cfg.seed, k_eigen), "{tag}: seed, k");
+    assert_eq!(r.nsim, 0, "{tag}: draws");
+    assert_eq!(r.seed, cfg.seed, "{tag}: seed");
 }
 
 /// The floor: a full fit no better than `θ = 0`, not pinned, gives the zero
@@ -885,7 +878,7 @@ fn exact_rlrt_floor() {
     let (counts, s, c) = (vec![5.0; 6], vec![5.0; 6], [30.0]);
     let cfg = config(1000, 20261041, false);
     let zero = exact_rlrt(&counts, &s, &c, -10.0, -10.0, true, &cfg).unwrap();
-    assert_zero_result("pinned", &zero, &cfg, 5);
+    assert_zero_result("pinned", &zero, &cfg);
     for (l1, l0, pinned) in [
         (-12.5, -10.0, false),
         (-10.0, -10.0, false),
@@ -910,16 +903,14 @@ fn exact_rlrt_floor() {
                 r.statistic,
                 r.p_value
             );
-            assert_eq!((r.nsim, r.edge_hits), (0, 0), "{tag}: no draws");
-            assert!(r.mass_at_zero.is_nan() && r.mc_se.is_nan(), "{tag}");
-            assert_eq!((r.seed, r.k_eigen), (cfg.seed, 5), "{tag}");
+            assert_eq!(r.nsim, 0, "{tag}: no draws");
+            assert_eq!(r.seed, cfg.seed, "{tag}");
         }
     }
 }
 
-/// An interior fit: the statistic, the null's p-value, mass at zero and edge
-/// hits as the parts give them, the caller's `nsim` and seed, the design's
-/// `k`, and `mc_se = √(p(1 − p)/nsim)`. `nsim = 0` gives a NaN p-value.
+/// An interior fit: the statistic and the null's p-value as the parts give
+/// them, and the caller's `nsim` and seed. `nsim = 0` gives a NaN p-value.
 #[test]
 fn exact_rlrt_fields() {
     let (x, y, ids, p) = design(&[5, 6, 4, 7, 5, 6], 1.0, |_, st| vec![1.0, lcg(st)]);
@@ -936,17 +927,12 @@ fn exact_rlrt_fields() {
     assert!(t > 0.0, "interior statistic {t}");
     assert_eq!(r.statistic.to_bits(), t.to_bits());
     assert_eq!((r.nsim, r.seed), (cfg.nsim, cfg.seed));
-    assert_eq!(r.k_eigen, d.mu.len());
     assert_eq!(r.p_value.to_bits(), null.p_value(t).to_bits());
-    assert_eq!(r.mass_at_zero, null.n_zero as f64 / cfg.nsim as f64);
-    assert_eq!(r.edge_hits, null.edge_hits);
-    let pv = r.p_value;
-    assert!(pv > 0.0 && pv <= 1.0);
-    assert_eq!(r.mc_se, (pv * (1.0 - pv) / cfg.nsim as f64).sqrt());
+    assert!(r.p_value > 0.0 && r.p_value <= 1.0);
 
     let r = exact_of(&full, &reduced, &config(0, cfg.seed, false)).unwrap();
-    assert!(r.p_value.is_nan() && r.mc_se.is_nan() && r.mass_at_zero.is_nan());
-    assert_eq!((r.nsim, r.edge_hits), (0, 0));
+    assert!(r.p_value.is_nan());
+    assert_eq!(r.nsim, 0);
 }
 
 /// Gate 1, the Dyestuff clause. Dyestuff (`K = 6` batches of `J = 5`) read

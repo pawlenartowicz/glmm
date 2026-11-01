@@ -3,15 +3,15 @@
 //! intraclass correlation of a mixed model ([`R2`], [`Icc`]), and the
 //! numerical helpers they share.
 //!
-//! The public items of this module are outside the crate's semver promise
-//! until the 1.0 surface review: their names and signatures may change in any
-//! release before then.
+//! Its public items are the types the matrix door's and the formula door's
+//! methods return, and they are covered by the crate's semver promise.
 
 pub(crate) mod contest;
 pub mod contrast;
 pub(crate) mod effect_size;
 pub(crate) mod evd;
 pub(crate) mod lr;
+pub mod profile;
 mod reference;
 pub(crate) mod rlrt;
 pub(crate) mod tails;
@@ -19,6 +19,7 @@ pub(crate) mod wald;
 
 pub use effect_size::{Icc, R2};
 pub use lr::{LrNote, LrTest};
+pub use profile::{ProfileError, ProfileInterval, ProfileIntervals, ProfileParam};
 pub use reference::{DenDf, Objective, Reference};
 pub use wald::{LinearKind, LinearNote, LinearTest};
 
@@ -55,5 +56,7 @@ mod mc_data_tests;
 // quantity of the tier, counted, printed and written per cell.
 #[cfg(all(test, feature = "montecarlo-tests"))]
 mod mc_calibration_tests;
+#[cfg(test)]
+mod profile_tests;
 #[cfg(test)]
 mod rlrt_tests;

@@ -4,7 +4,7 @@
 //! throwaway workspaces at `n == sized shape`, so they cannot catch stale state,
 //! `n_max` over-reads, or option-reset misses — this suite is that guard.
 
-use super::{build_workspace, fit_on};
+use super::{build_workspace, fit_on, FitKind};
 use crate::fit::{
     common_tests::{lcg, weighted_collinear_ols_fixture},
     spec_sized_from_ids,
@@ -588,7 +588,7 @@ fn fit_on_reports_a_breakdown_on_the_glm_and_nb_routes() {
         assert!(fit.beta[3].is_nan(), "{family:?}");
         assert!(fit.beta[..3].iter().all(|b| b.is_finite()), "{family:?}");
         assert!(fit.se.iter().all(|s| s.is_nan()), "{family:?}");
-        assert!(fit.vcov.iter().flatten().all(|v| v.is_nan()), "{family:?}");
+        assert!(fit.vcov().iter().all(|v| v.is_nan()), "{family:?}");
         assert!(fit.loglik.is_finite(), "{family:?}");
         // The df counts the estimated coefficients, as a fit with the
         // duplicate dropped beforehand does.
@@ -1908,7 +1908,7 @@ fn fitview_reports_the_gradient_search() {
 
 /// The bits of what a materialized fit reports, for bitwise comparisons.
 fn fit_bits(f: &crate::Fit) -> Vec<u64> {
-    let vcov = f.vcov.iter().flatten();
+    let vcov = f.vcov();
     let varcorr = f.varcorr.iter().flatten();
     f.beta
         .iter()
@@ -2125,6 +2125,96 @@ fn satterthwaite_df_out_shape_checked() {
     let _ = super::satterthwaite(&mut ws, &mut vec![0.0; p + 1]);
 }
 
+/// The df of a pairwise contrast from the loop-tier pass against the stable
+/// path's `Fit::contrast_t` on the same data and model: the loop side asks for
+/// one target (column 2), so `(1, 0)` has neither column a target. The
+/// per-target df stay those of `satterthwaite` bit for bit, and a `p == n`
+/// pair and an out-of-range pair get NaN.
+#[test]
+fn loop_satterthwaite_contrast_df_matches_contrast_t() {
+    let cases = [
+        ("intercept REML", ContrastRe::Intercept, None),
+        ("intercept ML", ContrastRe::Intercept, Some(false)),
+        ("crossed (sparse)", ContrastRe::Crossed, None),
+    ];
+    let mut ran = 0;
+    for (tag, re, reml) in cases {
+        let (x, y, n, p, model, ids) = contrast_case(Family::Gaussian, re);
+        let stable_opts = FitOptions {
+            se_for: SeFor::All,
+            reml,
+            ..FitOptions::default()
+        };
+        let loop_opts = FitOptions {
+            se_for: SeFor::Only(vec![2]),
+            ..stable_opts.clone()
+        };
+        let stable = fit_cold(&x, &y, n, p, &model, &ids, &stable_opts);
+        let data = Data::new(&x, &y, n, p);
+        let mut ws_a = build_workspace(&model, &ids, n, p, &loop_opts);
+        drop(fit_on(&mut ws_a, &data, None, &loop_opts));
+        let mut ws_b = build_workspace(&model, &ids, n, p, &loop_opts);
+        drop(fit_on(&mut ws_b, &data, None, &loop_opts));
+        let (mut df_plain, mut df, mut cdf) = (vec![0.0; p], vec![0.0; p], vec![0.0; 4]);
+        assert_eq!(
+            super::satterthwaite(&mut ws_a, &mut df_plain),
+            Ok(()),
+            "{tag}"
+        );
+        assert_eq!(
+            super::satterthwaite_with_contrasts(
+                &mut ws_b,
+                &mut df,
+                &[(1, 0), (2, 1), (1, 1), (3, 0)],
+                &mut cdf
+            ),
+            Ok(()),
+            "{tag}"
+        );
+        assert_df_bits(&df, &df_plain, tag);
+        let nu = if reml == Some(false) { n } else { n - p } as f64;
+        for (k, (a, b)) in [(1usize, 0usize), (2, 1)].into_iter().enumerate() {
+            let t = stable.contrast_t(&pair_vector(p, a, b)).unwrap();
+            assert!(t.df < nu, "{tag} ({a},{b}): df {} not below ν", t.df);
+            assert!(
+                ((cdf[k] - t.df) / t.df).abs() < 1e-12,
+                "{tag} ({a},{b}): {} vs {}",
+                cdf[k],
+                t.df
+            );
+        }
+        assert!(
+            cdf[2].is_nan() && cdf[3].is_nan(),
+            "{tag}: p == n and out of range: {cdf:?}"
+        );
+        ran += 1;
+    }
+    assert_eq!(ran, 3);
+}
+
+#[test]
+fn satterthwaite_with_contrasts_on_non_lmm_is_no_df() {
+    use crate::inference::contrast::{ContrastError, NoDfReason};
+    let (x, y, n, p, model, ids, opts) = ols_case();
+    let mut ws = build_workspace(&model, &ids, n, p, &opts);
+    drop(fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts));
+    let (mut df, mut cdf) = (vec![0.0; p], vec![0.0; 1]);
+    assert_eq!(
+        super::satterthwaite_with_contrasts(&mut ws, &mut df, &[(1, 0)], &mut cdf),
+        Err(ContrastError::NoDf(NoDfReason::NotGaussianMixed))
+    );
+    assert!(df.iter().chain(&cdf).all(|v| v.is_nan()), "{df:?} {cdf:?}");
+}
+
+#[test]
+#[should_panic(expected = "contrast_df_out")]
+fn satterthwaite_contrast_df_out_shape_checked() {
+    let (x, y, n, p, model, ids, opts) = lmm_intercept_case();
+    let mut ws = build_workspace(&model, &ids, n, p, &opts);
+    drop(fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts));
+    let _ = super::satterthwaite_with_contrasts(&mut ws, &mut vec![0.0; p], &[(1, 0)], &mut []);
+}
+
 #[test]
 fn satterthwaite_failed_pass_is_no_df_failed() {
     use crate::inference::contrast::{ContrastError, NoDfReason};
@@ -2250,8 +2340,11 @@ fn satterthwaite_repeat_calls_bounded_alloc() {
     let (x, y, n, p, model, ids, opts) = lmm_slope_case();
     let y_free = slope_free_response(&x, &y);
     let y_pinned = all_pinned_response(&x);
+    // Two valid pairs: their df come from the pass's own buffers.
+    const PAIRS: [(u32, u32); 2] = [(1, 0), (0, 1)];
     let mut ws = build_workspace(&model, &ids, n, p, &opts);
     let mut df = vec![0.0; p];
+    let mut cdf = vec![0.0; PAIRS.len()];
     let mut pilot = |ws: &mut super::FitWorkspace, y: &[f64], free: usize| {
         let start = {
             let v = fit_on(ws, &Data::new(&x, y, n, p), None, &opts);
@@ -2262,7 +2355,7 @@ fn satterthwaite_repeat_calls_bounded_alloc() {
             }
         };
         assert_eq!(n_free(ws), free, "free θ");
-        super::satterthwaite(ws, &mut df).unwrap();
+        super::satterthwaite_with_contrasts(ws, &mut df, &PAIRS, &mut cdf).unwrap();
         start
     };
     let start = pilot(&mut ws, &y, 2);
@@ -2274,7 +2367,10 @@ fn satterthwaite_repeat_calls_bounded_alloc() {
     let mut window = |ws: &mut super::FitWorkspace, y: &[f64], start: &crate::StartValues| {
         for _ in 0..N_CALLS {
             drop(fit_on(ws, &Data::new(&x, y, n, p), Some(start), &opts));
-            std::hint::black_box(super::satterthwaite(ws, &mut df)).unwrap();
+            std::hint::black_box(super::satterthwaite_with_contrasts(
+                ws, &mut df, &PAIRS, &mut cdf,
+            ))
+            .unwrap();
         }
         dhat::HeapStats::get().total_blocks
     };
@@ -2283,6 +2379,7 @@ fn satterthwaite_repeat_calls_bounded_alloc() {
     let none_free = window(&mut ws, &y_pinned, &start_pinned) - two_free - three_free;
     drop(profiler);
     assert!(df.iter().all(|v| v.is_finite()), "{df:?}");
+    assert!(cdf.iter().all(|v| v.is_finite()), "{cdf:?}");
     let (bound, bound_none) = (
         N_CALLS as u64 * PER_CALL,
         N_CALLS as u64 * PER_CALL_NONE_FREE,
@@ -2707,4 +2804,807 @@ fn aliased_column_next_to_a_re_only_slope() {
         bits(&b.varcorr.concat()),
         "varcorr"
     );
+}
+
+// --- loop-tier pairwise contrasts ---
+
+/// The random-effect structure of a [`contrast_case`].
+#[derive(Clone, Copy)]
+enum ContrastRe {
+    /// Fixed effects only.
+    None,
+    /// A random intercept on 8 levels.
+    Intercept,
+    /// The random intercept plus a crossed 6-level grouping carrying a random
+    /// slope on `x1` (the sparse LMM route, the packed GLMM layout).
+    Crossed,
+}
+
+/// A deterministic n = 96, p = 3 design `[1, x1, x2]` with two continuous
+/// columns (so the draw's column map centres and scales both), 8 primary
+/// levels `i % 8`, and under [`ContrastRe::Crossed`] a crossed grouping
+/// `(i / 8) % 6` with a random slope on `x1`. The response is drawn per family
+/// from `η = 0.3 + 0.5·x1 − 0.4·x2` (plus a level term with random effects)
+/// with the deterministic noise `((i·3) % 7 − 3) / 3`.
+fn contrast_case(
+    family: Family,
+    re: ContrastRe,
+) -> (Vec<f64>, Vec<f64>, usize, usize, ModelSpec, GroupIds) {
+    let (n, p) = (96usize, 3usize);
+    let mut x = Vec::with_capacity(n * p);
+    let mut y = Vec::with_capacity(n);
+    let mixed = !matches!(re, ContrastRe::None);
+    for i in 0..n {
+        let x1 = ((i * 7) % 13) as f64 / 6.0 - 1.0;
+        let x2 = ((i * 5) % 11) as f64 / 5.0 - 1.0;
+        x.extend_from_slice(&[1.0, x1, x2]);
+        let g = (i % 8) as f64;
+        let level = if mixed { 0.4 * (g - 3.5) / 3.5 } else { 0.0 };
+        let eta = 0.3 + 0.5 * x1 - 0.4 * x2 + level;
+        let noise = (((i * 3) % 7) as f64 - 3.0) / 3.0;
+        y.push(match family {
+            Family::Gaussian => eta + 0.3 * noise,
+            Family::Poisson { .. } => eta.exp().round(),
+            Family::Binomial { .. } => f64::from(eta + noise > 0.0),
+            Family::Gamma { .. } | Family::InverseGaussian { .. } => {
+                eta.exp() * (1.0 + 0.3 * noise)
+            }
+            Family::NegativeBinomial { .. } => (eta + 0.5 * noise).exp().round(),
+        });
+    }
+    let primary: Vec<u32> = (0..n).map(|i| (i % 8) as u32).collect();
+    let (re_spec, ids) = match re {
+        ContrastRe::None => (None, GroupIds::default()),
+        ContrastRe::Intercept => (
+            Some(ReStructure {
+                terms: Vec::new(),
+                slopes: vec![],
+                extra_groupings: vec![],
+            }),
+            GroupIds {
+                primary,
+                extra: vec![],
+            },
+        ),
+        ContrastRe::Crossed => (
+            Some(ReStructure {
+                terms: Vec::new(),
+                slopes: vec![],
+                extra_groupings: vec![Grouping {
+                    terms: Vec::new(),
+                    relation: GroupingRelation::Crossed,
+                    slopes: vec![1],
+                }],
+            }),
+            GroupIds {
+                primary,
+                extra: vec![(0..n).map(|i| ((i / 8) % 6) as u32).collect()],
+            },
+        ),
+    };
+    let model = ModelSpec {
+        family,
+        re: re_spec,
+    };
+    (x, y, n, p, model, ids)
+}
+
+/// `e_a − e_b` over `p` columns.
+fn pair_vector(p: usize, a: usize, b: usize) -> Vec<f64> {
+    let mut l = vec![0.0; p];
+    l[a] = 1.0;
+    l[b] = -1.0;
+    l
+}
+
+/// The loop tier's pairwise contrast against the stable path's covariance on
+/// the same data and model: the loop side asks for one target (column 2), so
+/// `(1, 0)` has neither column a target and `(2, 1)` one, and `(1, 0)` takes
+/// in the intercept, whose row of the column map carries the centring shifts.
+/// The Gamma and inverse-Gaussian GLMs report their contrast on the kernel's
+/// φ = 1 scale, so the stable value is multiplied by φ̂. The GLMM Gamma
+/// (inverse) case also fits in search units on both SE arms.
+#[test]
+fn contrast_t_sq_matches_the_stable_vcov() {
+    use crate::{GammaLink, InverseGaussianLink, NegBinomialLink, PoissonLink, WaldSe};
+    let binomial = Family::Binomial {
+        link: BinomialLink::Logit,
+    };
+    let poisson = Family::Poisson {
+        link: PoissonLink::Log,
+    };
+    let gamma_log = Family::Gamma {
+        link: GammaLink::Log,
+    };
+    let gamma_inv = Family::Gamma {
+        link: GammaLink::Inverse,
+    };
+    let inv_gauss = Family::InverseGaussian {
+        link: InverseGaussianLink::InverseSquared,
+    };
+    let rx = WaldSe::Rx;
+    let hess = WaldSe::Hessian;
+    // (tag, family, re, reml, wald_se, also against `Fit::contrast_t`)
+    let cases = [
+        ("OLS", Family::Gaussian, ContrastRe::None, None, hess, true),
+        (
+            "GLM binomial",
+            binomial,
+            ContrastRe::None,
+            None,
+            hess,
+            false,
+        ),
+        ("GLM Poisson", poisson, ContrastRe::None, None, hess, false),
+        (
+            "GLM Gamma log",
+            gamma_log,
+            ContrastRe::None,
+            None,
+            hess,
+            true,
+        ),
+        (
+            "GLM inverse-Gaussian",
+            inv_gauss,
+            ContrastRe::None,
+            None,
+            hess,
+            true,
+        ),
+        (
+            "LMM REML",
+            Family::Gaussian,
+            ContrastRe::Intercept,
+            None,
+            hess,
+            true,
+        ),
+        (
+            "LMM ML",
+            Family::Gaussian,
+            ContrastRe::Intercept,
+            Some(false),
+            hess,
+            true,
+        ),
+        (
+            "LMM crossed",
+            Family::Gaussian,
+            ContrastRe::Crossed,
+            None,
+            hess,
+            true,
+        ),
+        (
+            "GLMM binomial Rx",
+            binomial,
+            ContrastRe::Intercept,
+            None,
+            rx,
+            false,
+        ),
+        (
+            "GLMM binomial Hessian",
+            binomial,
+            ContrastRe::Intercept,
+            None,
+            hess,
+            false,
+        ),
+        (
+            "GLMM Poisson crossed Rx",
+            poisson,
+            ContrastRe::Crossed,
+            None,
+            rx,
+            false,
+        ),
+        (
+            "GLMM Poisson crossed Hessian",
+            poisson,
+            ContrastRe::Crossed,
+            None,
+            hess,
+            false,
+        ),
+        (
+            "GLMM Gamma inverse Rx",
+            gamma_inv,
+            ContrastRe::Intercept,
+            None,
+            rx,
+            false,
+        ),
+        (
+            "GLMM Gamma inverse Hessian",
+            gamma_inv,
+            ContrastRe::Intercept,
+            None,
+            hess,
+            false,
+        ),
+    ];
+    let mut ran = 0;
+    let mut scratch = vec![0.0; 3];
+    for (tag, family, re, reml, wald_se, against_contrast_t) in cases {
+        let (x, mut y, n, p, model, ids) = contrast_case(family, re);
+        if family == gamma_inv {
+            // Cluster η = 1/μ below 1/64, outside the band in which the first
+            // search keeps y's units, so the fit runs on y/c and `vcov` is
+            // mapped back by c² (asserted below).
+            y.iter_mut().for_each(|v| *v *= 256.0);
+        }
+        let stable_opts = FitOptions {
+            se_for: SeFor::All,
+            reml,
+            wald_se,
+            ..FitOptions::default()
+        };
+        let loop_opts = FitOptions {
+            se_for: SeFor::Only(vec![2]),
+            ..stable_opts.clone()
+        };
+        let stable = fit_cold(&x, &y, n, p, &model, &ids, &stable_opts);
+        let mut ws = build_workspace(&model, &ids, n, p, &loop_opts);
+        let view = fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &loop_opts);
+        assert!(stable.converged() && view.converged(), "{tag}");
+        let phi = match (family, re) {
+            (Family::Gamma { .. } | Family::InverseGaussian { .. }, ContrastRe::None) => {
+                stable.dispersion
+            }
+            _ => 1.0,
+        };
+        for (a, b) in [(1usize, 0usize), (2, 1)] {
+            let v = stable.vcov();
+            let var = v[a * p + a] + v[b * p + b] - 2.0 * v[a * p + b];
+            let want = (stable.beta[a] - stable.beta[b]).powi(2) / var * phi;
+            let got = view.contrast_t_sq(a as u32, b as u32, &mut scratch);
+            assert!(
+                ((got - want) / want).abs() < 1e-10,
+                "{tag} ({a},{b}): {got} vs {want}"
+            );
+            if against_contrast_t {
+                let t = stable.contrast_t(&pair_vector(p, a, b)).unwrap();
+                let want = t.t * t.t * phi;
+                assert!(
+                    ((got - want) / want).abs() < 1e-10,
+                    "{tag} ({a},{b}) against contrast_t: {got} vs {want}"
+                );
+            }
+        }
+        drop(view);
+        if family == Family::Gaussian && matches!(re, ContrastRe::Crossed) {
+            assert!(ws.is_lmm_sparse(), "{tag}: the crossed LMM runs sparse");
+        }
+        if family == gamma_inv {
+            let units = ws.glmm_parts().expect("a GLMM workspace").0.search_units;
+            assert_ne!(units, 1.0, "{tag}: the search ran in y's units");
+        }
+        ran += 1;
+    }
+    assert_eq!(ran, 14);
+
+    // The NB GLM returns an assembled `Fit` (the `Prebuilt` arm): its `vcov`
+    // holds the target block only, so a pair outside it has no variance.
+    let nb = Family::NegativeBinomial {
+        link: NegBinomialLink::Log,
+    };
+    let (x, y, n, p, model, ids) = contrast_case(nb, ContrastRe::None);
+    let all = FitOptions {
+        se_for: SeFor::All,
+        ..FitOptions::default()
+    };
+    let stable = fit_cold(&x, &y, n, p, &model, &ids, &all);
+    let mut ws = build_workspace(&model, &ids, n, p, &all);
+    let view = fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &all);
+    assert!(stable.converged() && view.converged(), "NB");
+    let v = stable.vcov();
+    let want =
+        (stable.beta[2] - stable.beta[1]).powi(2) / (v[2 * p + 2] + v[p + 1] - 2.0 * v[2 * p + 1]);
+    let got = view.contrast_t_sq(2, 1, &mut scratch);
+    assert!(((got - want) / want).abs() < 1e-10, "NB: {got} vs {want}");
+    let one = FitOptions {
+        se_for: SeFor::Only(vec![2]),
+        ..FitOptions::default()
+    };
+    let mut ws = build_workspace(&model, &ids, n, p, &one);
+    let view = fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &one);
+    assert!(view.converged(), "NB, one target");
+    assert!(
+        view.contrast_t_sq(2, 1, &mut scratch).is_nan(),
+        "NB, one target"
+    );
+}
+
+/// The contract checks of `FitView::contrast_t_sq`: an index ≥ p on either
+/// side, a zero contrast and a short scratch are NaN on a fit that otherwise
+/// gives a finite value, and so is a draw that did not converge.
+#[test]
+fn contrast_t_sq_nan_contract() {
+    let (x, y, n, p, model, ids) = contrast_case(Family::Gaussian, ContrastRe::None);
+    let opts = FitOptions {
+        se_for: SeFor::Only(vec![2]),
+        ..FitOptions::default()
+    };
+    let mut ws = build_workspace(&model, &ids, n, p, &opts);
+    let view = fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts);
+    let mut checks = 0;
+    for (a, b, len) in [(3u32, 0u32, 3usize), (0, 3, 3), (1, 1, 3), (2, 1, 2)] {
+        assert!(
+            view.contrast_t_sq(a, b, &mut vec![0.0; len]).is_nan(),
+            "({a},{b}) with scratch {len}"
+        );
+        checks += 1;
+    }
+    assert!(view.contrast_t_sq(2, 1, &mut [0.0; 3]).is_finite());
+    checks += 1;
+
+    // Separated: `y = 1` exactly where `x1 > 0`.
+    let binomial = Family::Binomial {
+        link: BinomialLink::Logit,
+    };
+    let (x, _, n, p, model, ids) = contrast_case(binomial, ContrastRe::None);
+    let y: Vec<f64> = (0..n).map(|i| f64::from(x[i * p + 1] > 0.0)).collect();
+    let mut ws = build_workspace(&model, &ids, n, p, &opts);
+    let view = fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts);
+    assert!(!view.converged());
+    assert!(view.contrast_t_sq(2, 1, &mut [0.0; 3]).is_nan());
+    checks += 1;
+    assert_eq!(checks, 6);
+}
+
+// --- fits pinned at a true zero variance ---
+
+/// Gaussian `(1 + x | g)`: ten clusters of eight rows with a real random
+/// intercept and a random slope of exactly 0. On this seed the REML fit pins
+/// the slope column's diagonal.
+fn true_zero_slope_case() -> (Vec<f64>, Vec<f64>, usize, usize, ModelSpec, GroupIds) {
+    let (n_clusters, per, p) = (10usize, 8usize, 2usize);
+    let n = n_clusters * per;
+    let mut st = 1u64;
+    let u: Vec<f64> = (0..n_clusters).map(|_| 0.8 * lcg(&mut st)).collect();
+    let mut x = Vec::with_capacity(n * p);
+    let mut y = Vec::with_capacity(n);
+    let mut ids_v = Vec::with_capacity(n);
+    for i in 0..n {
+        let c = i % n_clusters;
+        let x1 = lcg(&mut st);
+        x.extend_from_slice(&[1.0, x1]);
+        y.push(0.5 + 0.4 * x1 + u[c] + 0.3 * lcg(&mut st));
+        ids_v.push(c as u32);
+    }
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            terms: Vec::new(),
+            slopes: vec![1],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: ids_v,
+        extra: vec![],
+    };
+    (x, y, n, p, model, ids)
+}
+
+/// Poisson log `(1 | g) + (1 | h)`: `g` (8 levels) carries a real effect, the
+/// crossed `h` (6 levels) none at all; two rows per cell. On this seed the
+/// Laplace fit pins `h`.
+fn true_zero_crossed_poisson_case() -> (Vec<f64>, Vec<f64>, usize, usize, ModelSpec, GroupIds) {
+    let (g1, g2, p) = (8usize, 6usize, 2usize);
+    let n = 2 * g1 * g2;
+    let mut st = 3u64;
+    let u: Vec<f64> = (0..g1).map(|_| 0.6 * lcg(&mut st)).collect();
+    let mut x = Vec::with_capacity(n * p);
+    let mut y = Vec::with_capacity(n);
+    let mut pid = Vec::with_capacity(n);
+    let mut eid = Vec::with_capacity(n);
+    for i in 0..n {
+        let (c1, c2) = (i % g1, (i / g1) % g2);
+        let x1 = lcg(&mut st);
+        x.extend_from_slice(&[1.0, x1]);
+        // Knuth's Poisson draw on the LCG's uniforms.
+        let floor = (-(1.0 + 0.3 * x1 + u[c1]).exp()).exp();
+        let mut prod = 1.0f64;
+        let mut count = 0.0f64;
+        loop {
+            prod *= 0.5 * (lcg(&mut st) + 1.0);
+            if prod <= floor {
+                break;
+            }
+            count += 1.0;
+        }
+        y.push(count);
+        pid.push(c1 as u32);
+        eid.push(c2 as u32);
+    }
+    let model = ModelSpec {
+        family: Family::Poisson {
+            link: crate::PoissonLink::Log,
+        },
+        re: Some(ReStructure {
+            terms: Vec::new(),
+            slopes: vec![],
+            extra_groupings: vec![Grouping {
+                terms: Vec::new(),
+                relation: GroupingRelation::Crossed,
+                slopes: vec![],
+            }],
+        }),
+    };
+    let ids = GroupIds {
+        primary: pid,
+        extra: vec![eid],
+    };
+    (x, y, n, p, model, ids)
+}
+
+/// A fit pinned at a variance whose true value is 0 stays pinned: singular,
+/// converged, and the pinned component's `tau2` exactly 0. A trough polish
+/// holds the pinned coordinates at 0, so the exact zero needs no recorded
+/// tolerance. The shapes are the two the other zero-variance guards do not
+/// cover (the Gaussian crossed fit and the binomial intercept fits have
+/// theirs).
+#[test]
+fn true_zero_fits_do_not_move() {
+    let opts = FitOptions {
+        se_for: SeFor::Only(vec![1]),
+        ..FitOptions::default()
+    };
+    // (case, θ index of the true-zero diagonal)
+    let cases = [
+        ("gaussian (1 + x | g)", true_zero_slope_case(), 2usize),
+        (
+            "poisson (1 | g) + (1 | h)",
+            true_zero_crossed_poisson_case(),
+            1,
+        ),
+    ];
+    let mut ran = 0;
+    for (tag, (x, y, n, p, model, ids), zero) in cases {
+        let data = Data::new(&x, &y, n, p);
+        let mut ws = build_workspace(&model, &ids, n, p, &opts);
+        let fit = fit_on(&mut ws, &data, None, &opts).into_fit(&data, &model, &opts);
+        assert!(fit.converged(), "{tag}: not converged");
+        assert!(fit.singular(), "{tag}: not singular");
+        assert_eq!(fit.tau2[zero], 0.0, "{tag}: tau2 {:?}", fit.tau2);
+        ran += 1;
+    }
+    assert_eq!(ran, 2);
+}
+
+// --- the trough polish of a pinned GLMM endpoint ---
+
+/// Poisson log `y ~ x1 + x2 + (1 + x1 + x2 | g)`, 20 clusters of 10 rows,
+/// log-mean about e¹⁴, simulated with a random-intercept SD of 0.5 and both
+/// random-slope SDs exactly 0 (`sim_poisson_precise_two_zero_slopes.csv`,
+/// written by `validation/tools/prep/gen_boundary_pin_data.R`, which records
+/// the seed search that picked it). The search pins both slopes about 1.2 deviance
+/// units above the optimum, and the trough polish takes the fit from there.
+fn precise_two_zero_slopes_fixture() -> (Vec<f64>, Vec<f64>, usize, usize, ModelSpec, GroupIds) {
+    let csv =
+        include_str!("../../validation/data/simulated/sim_poisson_precise_two_zero_slopes.csv");
+    let p = 3usize;
+    let mut x = Vec::new();
+    let mut y = Vec::new();
+    let mut levels: Vec<&str> = Vec::new();
+    let mut ids_v = Vec::new();
+    for line in csv.lines().skip(1).filter(|l| !l.is_empty()) {
+        let f: Vec<&str> = line.split(',').collect();
+        let num = |s: &str| s.parse::<f64>().expect("a numeric cell");
+        y.push(num(f[0]));
+        x.extend_from_slice(&[1.0, num(f[1]), num(f[2])]);
+        let g = levels.iter().position(|&l| l == f[3]).unwrap_or_else(|| {
+            levels.push(f[3]);
+            levels.len() - 1
+        });
+        ids_v.push(g as u32);
+    }
+    let n = y.len();
+    assert_eq!((n, levels.len()), (200, 20));
+    let model = ModelSpec {
+        family: Family::Poisson {
+            link: crate::PoissonLink::Log,
+        },
+        re: Some(ReStructure {
+            terms: Vec::new(),
+            slopes: vec![1, 2],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: ids_v,
+        extra: vec![],
+    };
+    (x, y, n, p, model, ids)
+}
+
+/// Each diagonal of each block, in `Diagnostics::pinned` order: (its pin
+/// flag, its caller-scale θ, `√(tau2 / σ̂²)` with σ̂² the Gaussian residual
+/// variance and 1 on the other families).
+fn diagonal_pins(fit: &crate::Fit, gaussian: bool) -> Vec<(bool, f64)> {
+    let scale = if gaussian { fit.dispersion } else { 1.0 };
+    let mut out = Vec::new();
+    let mut slot = 0usize;
+    for (g, vech) in fit.varcorr.iter().enumerate() {
+        let q = crate::fit::vech_q(vech.len());
+        for c in 0..q {
+            // (c, c) in the column-major lower-triangular vech
+            let at = slot + c * q - c * c.saturating_sub(1) / 2;
+            let flag = fit.diagnostics.pinned.get(g).is_some_and(|b| b[c]);
+            out.push((flag, (fit.tau2[at] / scale).sqrt()));
+        }
+        slot += vech.len();
+    }
+    out
+}
+
+/// The fixture's optimum on glmm's deviance scale, from lme4 2.0-6 (`glmer`,
+/// nAGQ = 1, `tolPwrss = 1e-10`): the last of a chain of tight bobyqa and
+/// Nelder_Mead fits from lme4's own start, as
+/// `validation/tools/prep/boundary_pin_lme4_reference.R` prints it on R 4.5.2
+/// (aarch64 macOS), registered in `validation/manifest.json`
+/// (`in_crate_references`).
+const PRECISE_TWO_ZERO_SLOPES_LME4_DEVIANCE: f64 = 501.9295953724;
+
+/// How far from the optimum the fixture's fit may end: the gap to a warm
+/// start from the reported fit and to `PRECISE_TWO_ZERO_SLOPES_LME4_DEVIANCE`.
+/// Measured 2026-10-30 on aarch64 macOS, x86_64 Linux and wasm32-wasip1
+/// (plain and simd128): the fit ends at 501.92959537, 7e-10 below the lme4
+/// value, and within 2e-11 of the warm start, on every one. With the one
+/// polish searching θ unscaled the fit stops 0.65 above the optimum (aarch64
+/// macOS), so 1e-7 keeps a margin of 140 over the measured gap and still fails
+/// that mutation.
+const PRECISE_TWO_ZERO_SLOPES_GAP: f64 = 1e-7;
+
+/// The trough polish of a pinned endpoint reaches the optimum under very
+/// precise data, where the slopes' loadings are about 1e6 times stiffer than
+/// the intercept's. On the fixture the search pins both slopes, and the fit
+/// ends within `PRECISE_TWO_ZERO_SLOPES_GAP` of the optimum (of a warm start
+/// from the reported fit, and of lme4's), with both slopes pinned and the fit
+/// converged; under `parallel` the `parallel_inner` fit is bit-equal. The fit
+/// is polished once. Without the polish's θ scaling, or with the probe (whose
+/// curvatures give the scaling) skipped when the pin's drop alone triggers the
+/// polish, it stops 0.65 above the optimum on aarch64 macOS. The re-pin of
+/// the polished endpoint is covered by `reported_pins_match_zero_diagonals`.
+#[test]
+fn trough_polish_reaches_the_optimum_on_precise_data() {
+    let (x, y, n, p, model, ids) = precise_two_zero_slopes_fixture();
+    let opts = FitOptions::default();
+    let data = Data::new(&x, &y, n, p);
+    let mut ws = build_workspace(&model, &ids, n, p, &opts);
+    let v = fit_on(&mut ws, &data, None, &opts);
+    let start = crate::StartValues {
+        beta: v.betas().to_vec(),
+        theta: v.theta().to_vec(),
+        dispersion: None,
+    };
+    let fit = v.into_fit(&data, &model, &opts);
+    assert!(fit.converged());
+    assert_eq!(fit.diagnostics.pinned, vec![vec![false, true, true]]);
+    let warm = fit_warm_wo(&x, &y, n, p, &model, &ids, Some(&start), None, None, &opts);
+    assert!(
+        warm.deviance >= fit.deviance - PRECISE_TWO_ZERO_SLOPES_GAP,
+        "warm start found {} below {}",
+        warm.deviance,
+        fit.deviance
+    );
+    assert!(
+        (fit.deviance - PRECISE_TWO_ZERO_SLOPES_LME4_DEVIANCE).abs() <= PRECISE_TWO_ZERO_SLOPES_GAP,
+        "deviance {} not within the bound of lme4's {}",
+        fit.deviance,
+        PRECISE_TWO_ZERO_SLOPES_LME4_DEVIANCE
+    );
+    #[cfg(feature = "parallel")]
+    {
+        let par_opts = FitOptions {
+            parallel_inner: true,
+            ..FitOptions::default()
+        };
+        let par = fit_cold(&x, &y, n, p, &model, &ids, &par_opts);
+        assert_eq!(par.deviance.to_bits(), fit.deviance.to_bits());
+        let bits = |v: &[f64]| v.iter().map(|t| t.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&par.tau2), bits(&fit.tau2));
+        assert_eq!(bits(&par.beta), bits(&fit.beta));
+        assert_eq!(par.diagnostics.pinned, fit.diagnostics.pinned);
+    }
+}
+
+/// Bernoulli logit `y ~ x1 + x2 + (1 + x1 + x2 | g)`: 50 clusters of 10 rows,
+/// a random-intercept SD of 0.5, both random-slope SDs exactly 0, β
+/// (0, 0.5, −0.3), the covariates and the intercepts standard normal by
+/// Box–Muller on the shared `lcg`, the draw's stream seeded by `seed`.
+fn bernoulli_two_zero_slopes_case(
+    seed: u64,
+) -> (Vec<f64>, Vec<f64>, usize, usize, ModelSpec, GroupIds) {
+    let (g, per, p) = (50usize, 10usize, 3usize);
+    let n = g * per;
+    let mut st = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xD1B5_4A32_D192_ED03;
+    let normal = |st: &mut u64| {
+        let u1 = 0.5 * (lcg(st) + 1.0);
+        let u2 = 0.5 * (lcg(st) + 1.0);
+        (-2.0 * u1.max(1e-300).ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+    };
+    let b0: Vec<f64> = (0..g).map(|_| 0.5 * normal(&mut st)).collect();
+    let mut x = Vec::with_capacity(n * p);
+    let mut y = Vec::with_capacity(n);
+    let mut ids_v = Vec::with_capacity(n);
+    for i in 0..n {
+        let c = i / per;
+        let x1 = normal(&mut st);
+        let x2 = normal(&mut st);
+        let pr = 1.0 / (1.0 + (-(0.5 * x1 - 0.3 * x2 + b0[c])).exp());
+        y.push(f64::from(u8::from(0.5 * (lcg(&mut st) + 1.0) < pr)));
+        x.extend_from_slice(&[1.0, x1, x2]);
+        ids_v.push(c as u32);
+    }
+    let model = ModelSpec {
+        family: Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        re: Some(ReStructure {
+            terms: Vec::new(),
+            slopes: vec![1, 2],
+            extra_groupings: vec![],
+        }),
+    };
+    let ids = GroupIds {
+        primary: ids_v,
+        extra: vec![],
+    };
+    (x, y, n, p, model, ids)
+}
+
+/// The pin rule on converged Laplace and LMM fits: on the kernel θ every zero
+/// diagonal's whole column is exactly 0 and no diagonal lies in
+/// (0, `PIN_THETA`]; a diagonal's pin flag is set exactly when its caller θ
+/// (`√(tau2/σ̂²)`) is 0.0; and each block has as many exact-zero caller
+/// diagonals as kernel ones (the rank the map to the caller's coordinates
+/// keeps).
+///
+/// Cases: the two true-zero shapes, the precise two-slope fixture (whose
+/// polished endpoint is pinned again: without that re-pin its kernel θ keeps
+/// a live entry of 5e-10 under a diagonal the polish held at 0), and
+/// Bernoulli `(1 + x1 + x2 | g)`
+/// draws. Seed 120 is the first of 1 to 3,000 on which the pin with a
+/// Σ-preserving fold before the second pin left a zero diagonal above a live
+/// entry (kernel θ `[0, 0, 0, 0, −1.1e-7, 0]`), on aarch64 macOS, x86_64
+/// Linux and wasm32-wasip1 (plain and simd128); seeds 188 and 1559 are the
+/// others. Seed 1942
+/// has a centered slope whose caller θ keeps a diagonal of 1.9e-7, nonzero
+/// and unflagged, above a live entry of 3.1e-4, while the kernel θ pins the
+/// diagonal above it with its column 0: the rank and the flags hold; the
+/// small caller diagonal comes from the map to the caller's coordinates, not
+/// from the pin.
+///
+/// The incumbent check undoes a pin that raises the deviance by more than
+/// `PIN_DEVIANCE_SLACK`, and then a diagonal at or below `PIN_THETA` is
+/// reported as it is, unflagged (on the design of the precise two-slope
+/// fixture, Poisson log-mean e¹⁴, on 121 of 300 datasets). No case here
+/// takes that branch (checked when the test was written), so the undo after
+/// a polish is not covered here. No AGQ case: on AGQ the flags describe Σ̂
+/// and the reported Λ is the search's own.
+#[test]
+fn reported_pins_match_zero_diagonals() {
+    let opts = FitOptions::default();
+    let cases = [
+        ("gaussian (1 + x | g)", true_zero_slope_case(), true),
+        (
+            "poisson (1 | g) + (1 | h)",
+            true_zero_crossed_poisson_case(),
+            false,
+        ),
+        (
+            "poisson (1 + x1 + x2 | g)",
+            precise_two_zero_slopes_fixture(),
+            false,
+        ),
+        (
+            "bernoulli (1 + x1 + x2 | g), seed 120",
+            bernoulli_two_zero_slopes_case(120),
+            false,
+        ),
+        (
+            "bernoulli (1 + x1 + x2 | g), seed 1942",
+            bernoulli_two_zero_slopes_case(1942),
+            false,
+        ),
+    ];
+    let mut fits = 0;
+    let mut pins = 0;
+    for (tag, (x, y, n, p, model, ids), gaussian) in cases {
+        let data = Data::new(&x, &y, n, p);
+        let mut ws = build_workspace(&model, &ids, n, p, &opts);
+        let view = fit_on(&mut ws, &data, None, &opts);
+        let kernel = view.kernel_theta().to_vec();
+        let slots_in_order = view.perm.is_identity();
+        let g = view.kernel_groupings().expect("a mixed model").clone();
+        let fit = view.into_fit(&data, &model, &opts);
+        assert!(fit.converged(), "{tag}: not converged");
+        let caller = diagonal_pins(&fit, gaussian);
+        // The kernel walks its blocks in slot order (primary, then extras) and
+        // `diagonal_pins` walks `varcorr` in declaration order. They pair up
+        // here because every case declares its primary grouping first and has
+        // no slot reorder.
+        assert!(slots_in_order, "{tag}: slots reordered");
+        let (mut start, mut k) = (0usize, 0usize);
+        for q in std::iter::once(g.primary_q).chain(g.extra_q.iter().copied()) {
+            let (mut kernel_zeros, mut caller_zeros) = (0, 0);
+            let mut off = start;
+            for d in 0..q {
+                let t = kernel[off];
+                if t == 0.0 {
+                    kernel_zeros += 1;
+                    assert!(
+                        kernel[off..off + q - d].iter().all(|&v| v == 0.0),
+                        "{tag}: kernel θ {kernel:?}: zero diagonal above a live entry"
+                    );
+                }
+                assert!(
+                    t == 0.0 || t > crate::lmm::PIN_THETA,
+                    "{tag}: kernel θ {kernel:?}: diagonal {k} at or below the pin level"
+                );
+                let (flag, theta) = caller[k];
+                assert_eq!(flag, theta == 0.0, "{tag}: diagonal {k}: caller θ {theta}");
+                caller_zeros += usize::from(theta == 0.0);
+                pins += usize::from(flag);
+                off += q - d;
+                k += 1;
+            }
+            assert_eq!(caller_zeros, kernel_zeros, "{tag}: kernel θ {kernel:?}");
+            start += q * (q + 1) / 2;
+        }
+        assert_eq!(k, caller.len(), "{tag}");
+        fits += 1;
+    }
+    assert_eq!((fits, pins), (5, 8));
+}
+
+/// A polish stopped by its evaluation budget reports its best point as not
+/// converged: that point is not a minimum. On the precise two-slope fixture
+/// the gradient search hands over to the θ-only stage-1 search, which has a
+/// solver of its own, so the joint solver runs only the trough polishes. Its
+/// budget is cut to 90 evaluations, short of what the polish takes (measured:
+/// every budget from 20 to 129 on aarch64 macOS and x86_64 Linux, to 113 on
+/// wasm32-wasip1 and to 112 with simd128, leaves the fit not converged, and
+/// with the polish's budget exit removed each of those fits converges, so no
+/// other search runs out). The budget also scales BOBYQA's restart cycle, so
+/// `n_eval` is not monotone in it. The premise is checked, not assumed: from
+/// budget 89 to 90 `n_eval` grows by exactly one, so exactly one search, the
+/// polish, ran to the budget at both (two would add two; a converged polish,
+/// none). A search whose need equals its budget also stops there, so the
+/// step is taken below the tested budget, not above it.
+#[test]
+fn polish_out_of_budget_is_not_converged() {
+    let (x, y, n, p, model, ids) = precise_two_zero_slopes_fixture();
+    let opts = FitOptions::default();
+    let data = Data::new(&x, &y, n, p);
+    let mut ws = build_workspace(&model, &ids, n, p, &opts);
+    let full = fit_on(&mut ws, &data, None, &opts).into_fit(&data, &model, &opts);
+    assert!(full.converged());
+    assert_eq!(full.diagnostics.pinned, vec![vec![false, true, true]]);
+    let mut fit_at = |budget: usize| {
+        let FitKind::Glmm { ws: g } = &mut ws.kind else {
+            panic!("a Poisson mixed model builds a GLMM workspace")
+        };
+        let mut config = g.config;
+        config.max_fun = budget;
+        g.solver = bobyqa::Bobyqa::new(g.n_theta + p, config).expect("a legal config");
+        fit_on(&mut ws, &data, None, &opts).into_fit(&data, &model, &opts)
+    };
+    let one_less = fit_at(89);
+    let capped = fit_at(90);
+    assert_eq!(
+        capped.n_eval,
+        one_less.n_eval + 1,
+        "not exactly one search ran to the budget"
+    );
+    assert!(
+        !capped.converged(),
+        "a polish out of budget reported converged"
+    );
+    assert!(capped.deviance.is_finite());
+    assert!(capped.diagnostics.pinned.is_empty());
 }

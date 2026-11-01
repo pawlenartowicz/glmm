@@ -1,0 +1,95 @@
+{
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_profile.R"
+  },
+  "level": 0.95,
+  "deviance": 1751.93934446321,
+  "rows": [
+    {
+      "parameter": "sd_(Intercept)|Subject",
+      "kind": "sd",
+      "group": "Subject",
+      "term": "(Intercept)",
+      "term2": null,
+      "estimate": 23.7805585271338,
+      "lower": 14.3813849768344,
+      "upper": 37.715831758311,
+      "method": "lme4_profile"
+    },
+    {
+      "parameter": "sd_Days|Subject",
+      "kind": "sd",
+      "group": "Subject",
+      "term": "Days",
+      "term2": null,
+      "estimate": 5.71683789263024,
+      "lower": 3.80116411638208,
+      "upper": 8.75338306919496,
+      "method": "lme4_profile"
+    },
+    {
+      "parameter": "cor_Days.(Intercept)|Subject",
+      "kind": "cor",
+      "group": "Subject",
+      "term": "(Intercept)",
+      "term2": "Days",
+      "estimate": 0.0813195978647574,
+      "lower": -0.481500758489996,
+      "upper": 0.684986289920817,
+      "method": "lme4_profile"
+    },
+    {
+      "parameter": "sigma",
+      "kind": "sigma",
+      "group": null,
+      "term": null,
+      "term2": null,
+      "estimate": 25.5918151034943,
+      "lower": 22.8982668890036,
+      "upper": 28.8579965181635,
+      "method": "lme4_profile"
+    },
+    {
+      "parameter": "(Intercept)",
+      "kind": "beta",
+      "group": null,
+      "term": "(Intercept)",
+      "term2": null,
+      "estimate": 251.405104848485,
+      "lower": 237.680695505234,
+      "upper": 265.129514680174,
+      "method": "lme4_profile"
+    },
+    {
+      "parameter": "Days",
+      "kind": "beta",
+      "group": null,
+      "term": "Days",
+      "term2": null,
+      "estimate": 10.4672859595956,
+      "lower": 7.35865327511699,
+      "upper": 13.5759187517082,
+      "method": "lme4_profile"
+    }
+  ],
+  "name": "profile_sleepstudy"
+}

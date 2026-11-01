@@ -35,11 +35,13 @@ pub enum Kind {
     /// Extended-precision GLM references on ill-conditioned designs
     /// (`goldens_glm_band.py`).
     Conditioning,
+    /// Profile-likelihood confidence intervals (`goldens_profile.R`).
+    Profile,
 }
 
 impl Kind {
     /// Every kind, in manifest order.
-    pub const ALL: [Kind; 7] = [
+    pub const ALL: [Kind; 8] = [
         Kind::Lmertest,
         Kind::Rlrt,
         Kind::Anova,
@@ -47,6 +49,7 @@ impl Kind {
         Kind::Posthoc,
         Kind::Effectsize,
         Kind::Conditioning,
+        Kind::Profile,
     ];
 
     /// The manifest `kind` string, which is also the directory name.
@@ -59,6 +62,7 @@ impl Kind {
             Kind::Posthoc => "posthoc",
             Kind::Effectsize => "effectsize",
             Kind::Conditioning => "conditioning",
+            Kind::Profile => "profile",
         }
     }
 
@@ -117,7 +121,7 @@ impl Entry {
         };
         let kind_str = string("kind")?;
         let kind = Kind::parse(&kind_str).ok_or_else(|| {
-            format!("unknown kind \"{kind_str}\" (one of lmertest, rlrt, anova, predict, posthoc, effectsize, conditioning) in {raw}")
+            format!("unknown kind \"{kind_str}\" (one of lmertest, rlrt, anova, predict, posthoc, effectsize, conditioning, profile) in {raw}")
         })?;
         let factors = match raw.get("factors") {
             None => Vec::new(),

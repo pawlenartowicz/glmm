@@ -9,7 +9,7 @@ refit and no data. `glmm.compare(data, f0, f1)` fits both formulas on the same
 rows and compares them.
 
 It also holds `PairwiseTable`, the table of `glmm.pairwise` and of its
-intervals.
+intervals, and `ProfileTable`, the table of `Fit.profile_confint`.
 
 The module's name is also the function's: `glmm.anova` is the function, and
 this module stays reachable as `sys.modules["glmm.anova"]`.
@@ -368,6 +368,58 @@ def _pairwise_table(stored, z):
 
 
 @dataclass(repr=False, eq=False)
+class ProfileTable(_Table):
+    """The profile-likelihood confidence intervals of `Fit.profile_confint`,
+    one row per parameter named as lme4's `confint(method = "profile")`
+    names it, with the columns `estimate` (the ML estimate), `lower` and
+    `upper`. An undetermined bound is NaN, and the notes name it. Name is
+    provisional until 1.0.0."""
+
+    _values: dict
+    row_names: list
+    heading: str
+    notes: list
+    level: float
+
+    def _cells(self):
+        cells = [[fmt(self._values[c][i]) for c in self._values] for i in range(len(self))]
+        return list(self._values), cells, [""] * len(self)
+
+    def text(self):
+        header, cells, marks = self._cells()
+        return "\n".join([self.heading, *self._grid(header, cells, marks), *self.notes])
+
+    def _header_lines(self):
+        return [self.heading]
+
+    def _tables(self):
+        header, cells, _ = self._cells()
+        rows = [[name, *row] for name, row in zip(self.row_names, cells)]
+        return [("Intervals", ["", *header], rows)]
+
+    def _footer_lines(self):
+        return list(self.notes)
+
+
+def _profile_table(r, reml):
+    """The `ProfileTable` of `_native.profile_intervals`' dict `r`; `reml`
+    says the fit was made by REML, so the profiles ran on its ML refit."""
+    est, lo, hi = (np.asarray(r[k], dtype=float) for k in ("estimate", "lower", "upper"))
+    level = float(r["level"])
+    note = "Profile intervals on the ML fit"
+    notes = [note + ("; the REML fit was refitted by ML." if reml else ".")]
+    for name, e, a, b in zip(r["names"], est, lo, hi):
+        sides = [s for s, v in (("lower", a), ("upper", b)) if math.isnan(v)]
+        if math.isnan(e):
+            notes.append(f"{name}: not identified next to an SD estimated at 0, so NaN.")
+        elif sides:
+            notes.append(f"{name}: the {' and '.join(sides)} bound is undetermined (NaN).")
+    heading = f"Profile-likelihood confidence intervals, level {level:g}"
+    values = {"estimate": est, "lower": lo, "upper": hi}
+    return ProfileTable(values, list(r["names"]), heading, notes, level)
+
+
+@dataclass(repr=False, eq=False)
 class ComparisonTable(_Table):
     """Two models compared, `glmm.anova(m0, m1)` or `glmm.compare(...).table`:
     one row per model, named after the models as given (`m0` and `m1`, or `f0`
@@ -625,7 +677,7 @@ def compare(
     _check_nagq(nagq)
     _check_draws(nsim, seed)
     store = []
-    numeric_columns, factor_columns, weights, offset = _prepare_columns(
+    numeric_columns, factor_columns, weights, offset, row_index = _prepare_columns(
         data, [f0, f1], weights, offset, store, drop_missing_arguments=True
     )
     # Both fits keep these shared columns, which hold each formula's own.
@@ -634,6 +686,7 @@ def compare(
         "factor": factor_columns,
         "weights": None if weights is None else weights.tobytes(),
         "offset": None if offset is None else offset.tobytes(),
+        "row_index": row_index,
     }
     r = _native.compare(
         f0,
@@ -647,6 +700,7 @@ def compare(
         kept["offset"],
         nsim,
         seed,
+        row_index,
     )
     fit0, fit1 = (
         _fit_from_native(r[key], f, family, link, nagq, None, list(store), kept)

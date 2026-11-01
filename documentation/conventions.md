@@ -238,7 +238,7 @@ fit itself, not in `diagnostics`.
   gradient search.
 - `notes` carries solver observations that have no dedicated flag. There are
   fifteen kinds; [`warnings.md`](warnings.md) gives the warning each one
-  raises. Four of them in more detail:
+  raises. Three of them in more detail:
   - `IllConditioned`: two or more fixed-effect columns are entangled —
     near-collinear but not exactly redundant. That design is **fitted, not
     refused**: the coefficients are real and the standard errors are honest

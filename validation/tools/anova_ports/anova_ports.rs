@@ -507,6 +507,7 @@ fn fit(
         m.reml,
         anova_test,
     )
+    .map_err(String::from)
 }
 
 /// `anova(m0, m1)` on the two members fitted one by one.

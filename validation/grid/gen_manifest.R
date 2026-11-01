@@ -366,6 +366,7 @@ DEV_REF <- list(
 
 INFERENCE_DATA_REASON <- "inference reference data (tools/prep/gen_inference_data.R), gated by the inference tier, not a grid cell"
 UNCORRELATED_DATA_REASON <- "data of the uncorrelated random-effect goldens (tools/prep/gen_uncorrelated_data.R), gated by the oracle tier, not a grid cell"
+BOUNDARY_PIN_DATA_REASON <- "data of the in-crate boundary-pin tests (tools/prep/gen_boundary_pin_data.R, built with the boundary-probe campaign's helpers), gated in-crate, not a grid cell"
 
 FIXTURE_SKIPPED <- list(
   # data/simulated/ or data/empirical/ CSV stems that become no cell at all,
@@ -373,8 +374,10 @@ FIXTURE_SKIPPED <- list(
   # covers every CSV under both directories, so a fixture cannot vanish
   # quietly.
   #
-  # EXPECTED TO HOLD EXACTLY THIRTEEN ENTRIES: InstEval, the eight inference
-  # reference datasets and the four uncorrelated-golden datasets below. Every
+  # EXPECTED TO HOLD EXACTLY FOURTEEN ENTRIES (asserted with the coverage
+  # self-check below): InstEval, the eight inference reference datasets, the
+  # four uncorrelated-golden datasets and the boundary-pin test dataset below.
+  # Every
   # other simulated fixture -- including sim_binomial_zerosd and
   # sim_entangled_pair_lmm -- becomes a cell. A further entry here would mean
   # dropping a committed fixture from the grid; add the cell instead.
@@ -390,7 +393,8 @@ FIXTURE_SKIPPED <- list(
   Machines_dummy = UNCORRELATED_DATA_REASON,
   sim_uncorr_boundary = UNCORRELATED_DATA_REASON,
   sim_uncorr_rho = UNCORRELATED_DATA_REASON,
-  sleepstudy_d2 = UNCORRELATED_DATA_REASON
+  sleepstudy_d2 = UNCORRELATED_DATA_REASON,
+  sim_poisson_precise_two_zero_slopes = BOUNDARY_PIN_DATA_REASON
 )
 
 # ---- per-cell oracles --------------------------------------------------------
@@ -1037,6 +1041,8 @@ stopifnot("NO_MLE names a cell that is not a no-truth fixture" =
 # would otherwise vanish silently the same way.
 stopifnot("DEV_REF names a cell that is not a no-truth fixture" =
   all(names(DEV_REF) %in% intersect(fx_ids, names(FIXTURE_NO_TRUTH))))
+stopifnot("FIXTURE_SKIPPED holds other than fourteen entries" =
+  length(FIXTURE_SKIPPED) == 14L)
 for (sub in c("simulated", "empirical")) {
   stems <- sub("\\.csv$", "", list.files(file.path(here, "..", "data", sub), pattern = "\\.csv$"))
   used  <- unique(sub("\\.csv$", "", basename(vapply(cells, `[[`, "", "data"))))

@@ -159,7 +159,8 @@ warning or an exception:
 - Variance component at zero: pinned to exactly `0.0` (every diagonal
   component ≤ 1e-4), fit still counted converged, reported through
   `Diagnostics::singular`/`Diagnostics::pinned`. On a GLMM the pin is kept only
-  when it leaves the deviance within 1e-6 of the search's best point.
+  when it leaves the deviance within 1e-6 of the best point found (the outer
+  search's, or after a trough polish the polish's).
 - Optimizer cap-out on a flat plateau: the best finite point is returned with
   `converged: false`, not a NaN fill.
 - Genuine numerical failure: NaN-filled, non-converged — never a crash.
@@ -200,8 +201,8 @@ glmmTMB, GLMMadaptive and R's own `glm` references.
 
 ## Limits
 
-The trade is inference machinery and breadth: no
-profile/bootstrap CIs, no small-sample df beyond Satterthwaite's for Gaussian
+The trade is inference machinery and breadth: profile-likelihood CIs only for
+Gaussian mixed models, no bootstrap CIs, no small-sample df beyond Satterthwaite's for Gaussian
 mixed models (no Kenward-Roger); fewer families than
 glmmTMB/GLMMadaptive; and past a few dozen θ parameters,
 gradient-based engines are expected to win. For one interactive model on one

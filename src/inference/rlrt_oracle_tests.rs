@@ -210,6 +210,7 @@ fn ks_null_matches_rlrsim() {
         };
         let null = rlrt_null(&d, &cfg);
         let total = start.elapsed();
+        let n_zero = null.nsim - null.draws_pos.len();
 
         let b_ref = sim.nsim;
         assert_eq!(
@@ -218,21 +219,20 @@ fn ks_null_matches_rlrsim() {
             "{name}: frozen null size"
         );
         let ks = ks_distance(
-            (null.n_zero, &null.draws_pos, B),
+            (n_zero, &null.draws_pos, B),
             (sim.null_n_zero, &sim.null_pos, b_ref),
         );
         let (bf, rf) = (B as f64, b_ref as f64);
         let ks_band = bands::RLRT_KS_COEF * ((bf + rf) / (bf * rf)).sqrt();
-        let (p1, p2) = (null.n_zero as f64 / bf, sim.null_n_zero as f64 / rf);
-        let pooled = (null.n_zero + sim.null_n_zero) as f64 / (bf + rf);
+        let (p1, p2) = (n_zero as f64 / bf, sim.null_n_zero as f64 / rf);
+        let pooled = (n_zero + sim.null_n_zero) as f64 / (bf + rf);
         let se = (pooled * (1.0 - pooled) * (1.0 / bf + 1.0 / rf)).sqrt();
         let z = (p1 - p2).abs() / se;
         eprintln!(
             "{name}: k = {}, seed {}, KS {ks:.4e} (band {ks_band:.4e}), mass at zero {p1:.5} \
-             against {p2:.5} ({z:.2} SE), edge hits {}, fit {:.2} s, total {:.2} s",
+             against {p2:.5} ({z:.2} SE), fit {:.2} s, total {:.2} s",
             d.mu.len(),
             cfg.seed,
-            null.edge_hits,
             fitted.as_secs_f64(),
             total.as_secs_f64()
         );
@@ -370,16 +370,13 @@ fn rlrt_observed_matches_rlrsim() {
         eprintln!(
             "{name}: pinned {pinned}, statistic {:.10e} against RLRsim {:.10e} (|d| {dt:.3e}); \
              p {:.6e} against RLRsim {p_ref:.6e} (|d| {dp:.3e}, band {p_band:.3e}, {:.1}%), \
-             nsim {}, seed {}, mass at zero {:.5}, k {}, edge hits {}",
+             nsim {}, seed {}",
             res.statistic,
             sim.statistic,
             res.p_value,
             100.0 * dp / p_band,
             res.nsim,
-            res.seed,
-            res.mass_at_zero,
-            res.k_eigen,
-            res.edge_hits
+            res.seed
         );
         if name == "rlrt_dyestuff2" {
             assert!(pinned, "{name}: the fit pins its component");

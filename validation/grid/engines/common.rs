@@ -307,10 +307,10 @@ pub fn fit_cell(cell: &Value, grid_dir: &str, timed: Option<usize>, engine_versi
         // same fit serves as the `se_rx` value.
         let f = fit(&fit_opts);
         if gaussian {
-            rec["se_rx"] = nums(&f.se);
+            rec["se_rx"] = nums(f.se());
         } else {
-            rec["se_hessian"] = nums(&f.se);
-            rec["se_rx"] = nums(&fit(&rx_options(&fit_opts)).se);
+            rec["se_hessian"] = nums(f.se());
+            rec["se_rx"] = nums(fit(&rx_options(&fit_opts)).se());
         }
 
         // Lowering stays outside the timed region: the reference engines are
@@ -331,27 +331,27 @@ pub fn fit_cell(cell: &Value, grid_dir: &str, timed: Option<usize>, engine_versi
         }
 
         rec["coef_names"] = json!(lo.col_names);
-        rec["beta"] = nums(&f.beta);
+        rec["beta"] = nums(f.beta());
         // Verbatim, NaN as null per entry: the Satterthwaite df on a Gaussian
         // LMM, `n - p` on OLS and the dispersion GLMs, null where the test is z.
         // A Gaussian LMM whose pass failed records every entry null, which
         // compare.R's gate 5 tells apart from a record with no `coef_df` at all.
-        rec["coef_df"] = nums(&f.coef_df);
+        rec["coef_df"] = nums(f.coef_df());
         // `Fit::dispersion` is σ̂² on gaussian and φ̂ on gamma, while the
         // schema's `sigma` is a standard deviation / scale, so the square root
         // is what makes the two families one convention. It is the estimated
         // shape on negative-binomial, which belongs in `nb_theta` and nowhere
         // else, and a fixed 1.0 on the remaining families, which report null.
         rec["sigma"] = match family {
-            Family::Gaussian | Family::Gamma { .. } => num(f.dispersion.sqrt()),
+            Family::Gaussian | Family::Gamma { .. } => num(f.dispersion().sqrt()),
             _ => Value::Null,
         };
         rec["nb_theta"] = match family {
-            Family::NegativeBinomial { .. } => num(f.dispersion),
+            Family::NegativeBinomial { .. } => num(f.dispersion()),
             _ => Value::Null,
         };
-        set_loglik(&mut rec, f.loglik);
-        rec["n_eval"] = json!(f.n_eval);
+        set_loglik(&mut rec, f.loglik());
+        rec["n_eval"] = json!(f.n_eval());
         rec["converged"] = json!(f.converged());
         rec["singular"] = json!(f.singular());
         // No "maxeval" status: nothing caps evaluations here, so a fit either
@@ -394,7 +394,7 @@ fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
 /// non-convergence diagnosable in a run of ~800 cells, where the alternative is
 /// a record that only says "engine-fail".
 fn not_converged_text(f: &Fit) -> String {
-    let d = &f.diagnostics;
+    let d = f.diagnostics();
     format!(
         "not converged: boundary={:?}, pinned={:?}, notes={:?}",
         d.boundary, d.pinned, d.notes
@@ -410,7 +410,7 @@ fn not_converged_text(f: &Fit) -> String {
 /// calling it per declared grouping would panic and cost the record every other
 /// field.
 fn varcomp(f: &Fit, re_groups: &[ReGroupInfo]) -> Value {
-    if f.varcorr.len() != re_groups.len() {
+    if f.n_groupings() != re_groups.len() {
         return Value::Array(vec![]);
     }
     Value::Array(

@@ -273,6 +273,11 @@ fn nonpositive_weight_is_rejected() {
         matches!(&e, FitError::Weights(m) if m.contains("weights") && m.contains("(row ")),
         "{e:?}"
     );
+    assert_eq!(e.row(), Some(1));
+    assert_eq!(
+        e.message().text_with_row(5),
+        "Data weights must be finite and > 0 (row 5)"
+    );
 }
 
 /// The offset finiteness check is family-independent, so a NaN offset is
@@ -294,6 +299,8 @@ fn nonfinite_offset_on_a_negative_binomial_glm_is_rejected() {
         matches!(&e, FitError::Offset(m) if m.contains("offset") && m.contains("(row ")),
         "{e:?}"
     );
+    assert_eq!(e.row(), Some(1));
+    assert_eq!(e.to_string(), "Data offset must be finite (row 1)");
 }
 
 /// A NaN or an infinite value in `x` is refused at the entry, naming its row
@@ -308,7 +315,44 @@ fn nonfinite_x_is_rejected() {
             matches!(&e, FitError::Shape(m) if m == "x must be finite (row 2, column 0)"),
             "x = {bad}: {e:?}"
         );
+        // The row is a field, and a port can name it in its own numbering.
+        assert_eq!(e.row(), Some(2));
+        assert_eq!(
+            e.message().text_with_row(3),
+            "x must be finite (row 3, column 0)"
+        );
+        assert_eq!(e.message().text_with_row(2), e.to_string());
+        // Equality reads the text, so a built error equals the refusal.
+        assert_eq!(
+            e,
+            FitError::Shape("x must be finite (row 2, column 0)".into())
+        );
+        assert_eq!(
+            format!("{e:?}"),
+            r#"Shape("x must be finite (row 2, column 0)")"#
+        );
     }
+}
+
+/// An `ErrorMessage` compares with the text in either order and with a
+/// `String`, and gives its text back as a `String`, as the `String` payload
+/// it replaced did.
+#[test]
+fn error_message_reads_as_its_text() {
+    let (mut x, y, model) = shape_check_fixture();
+    x[2] = f64::NAN;
+    let FitError::Shape(m) = refusal(&Data::new(&x, &y, 4, 1), &model, &FitOptions::default())
+    else {
+        panic!("expected FitError::Shape");
+    };
+    let text = "x must be finite (row 2, column 0)";
+    let owned = text.to_string();
+    assert!(m == text && m == *text && m == owned);
+    assert!(text == m && *text == m && owned == m);
+    assert!(m != "x must be finite (row 3, column 0)");
+    assert_eq!(m, ErrorMessage::from(owned.clone()));
+    let back: String = m.into();
+    assert_eq!(back, owned);
 }
 
 /// A NaN in `y` is refused at the entry as a response no family supports.
@@ -321,6 +365,7 @@ fn nonfinite_y_nan_is_rejected() {
         matches!(&e, FitError::ResponseOutOfSupport(m) if m == "y must be finite (row 1)"),
         "{e:?}"
     );
+    assert_eq!(e.row(), Some(1));
 }
 
 /// A negative Poisson response is out of the family's domain and is refused
@@ -339,6 +384,11 @@ fn poisson_negative_response_is_rejected() {
         matches!(&e, FitError::ResponseOutOfSupport(m)
             if m.contains("Poisson response must be >= 0 (row 1)")),
         "{e:?}"
+    );
+    assert_eq!(e.row(), Some(1));
+    assert_eq!(
+        e.message().text_with_row(12),
+        "Poisson response must be >= 0 (row 12)"
     );
 }
 
@@ -422,7 +472,7 @@ fn bad_dispersion_is_rejected() {
     };
     for d in [-1.0, f64::NAN, f64::INFINITY] {
         let opts = FitOptions {
-            dispersion: Some(d),
+            dispersion: Dispersion::Fixed(d),
             ..FitOptions::default()
         };
         let e = refusal(&Data::new(&x, &y, 4, 1), &model, &opts);
@@ -436,7 +486,7 @@ fn bad_dispersion_is_rejected() {
 
 /// A held dispersion on a family that has none (Poisson's φ ≡ 1) is ignored,
 /// per the field's own doc — the fit comes out identical to the same call
-/// with `dispersion: None`.
+/// with the default dispersion.
 #[test]
 fn dispersion_on_a_family_without_one_is_ignored() {
     let (x, y, mut model) = shape_check_fixture();
@@ -453,7 +503,7 @@ fn dispersion_on_a_family_without_one_is_ignored() {
         &FitOptions::default(),
     );
     let opts = FitOptions {
-        dispersion: Some(2.0),
+        dispersion: Dispersion::Fixed(2.0),
         ..FitOptions::default()
     };
     let with = fit_cold(&x, &y, 4, 1, &model, &GroupIds::default(), &opts);
@@ -654,10 +704,25 @@ fn fit_rank_deficient_drops_and_matches_reduced() {
     // An aliased column has no covariance either: its whole `vcov` row and
     // column are NaN, while the kept block stays consistent with `se`.
     for i in 0..p {
-        assert!(f.vcov[i][2].is_nan(), "aliased column keeps a NaN vcov col");
-        assert!(f.vcov[2][i].is_nan(), "aliased column keeps a NaN vcov row");
+        assert!(
+            f.vcov()[i * p + 2].is_nan(),
+            "aliased column keeps a NaN vcov col"
+        );
+        assert!(
+            f.vcov()[2 * p + i].is_nan(),
+            "aliased column keeps a NaN vcov row"
+        );
     }
     assert_vcov_agrees_with_se(&f, p, "aliased");
+    // Row-major with both triangles, written by the salvage at flat indices:
+    // symmetric bit for bit (NaN included), and a kept off-diagonal is filled.
+    let v = f.vcov();
+    for i in 0..p {
+        for j in 0..p {
+            assert_eq!(v[i * p + j].to_bits(), v[j * p + i].to_bits(), "({i},{j})");
+        }
+    }
+    assert!(v[1].is_finite() && v[1] != 0.0, "{}", v[1]);
 
     // Direct fit on the 2-column reduced design.
     let mut xr = vec![0.0f64; n * 2];
@@ -752,7 +817,7 @@ fn rank_deficient_random_slope_returns_nonconverged_instead_of_panicking() {
         f.se
     );
     assert!(
-        f.vcov.iter().all(|row| row.iter().all(|v| v.is_nan())),
+        f.vcov().iter().all(|v| v.is_nan()),
         "vcov must be NaN-filled"
     );
     // The mask is the one diagnostic the caller can act on, so it is reported
@@ -1097,6 +1162,14 @@ fn stddev_corr_q3_hand_math() {
     // corr(1,2) = D21/(sd1*sd2) = 3/(3*4) = 0.25
     assert!((corr[1][2] - 0.25).abs() < 1e-12);
     assert!((corr[2][1] - 0.25).abs() < 1e-12);
+
+    // The same block as the full covariance, row-major: the nine hand values.
+    assert_eq!(fit_with_varcorr(vec![9.0]).varcorr(0), vec![9.0]);
+    assert_eq!(f.n_re(0), 3);
+    assert_eq!(
+        f.varcorr(0),
+        vec![4.0, 1.0, 2.0, 1.0, 9.0, 3.0, 2.0, 3.0, 16.0]
+    );
 }
 
 /// assemble_varcorr emits one block per grouping in declaration order:
@@ -1379,6 +1452,75 @@ fn fit_over_envelope_never_panics() {
         );
         assert_eq!(fit.beta.len(), p, "{family:?} over-width returns a Fit");
     }
+}
+
+/// Anti-panic floor past `MAX_THETA`: a Poisson `(1 + x1 + … + x13 | g)`
+/// (θ length 105) routes to the sparse solver, and its search ends with
+/// pinned components, so the pin pass and the probe run on a θ longer than
+/// any stack buffer sized off `MAX_THETA`. The slopes' variances are truly 0;
+/// the intercept's is not. With 20 groups the fit pins 8 diagonals (x86_64
+/// Linux, 2026-10-31); with 7 groups whether it pins at all depends on the
+/// seed and the platform.
+#[test]
+fn fit_glmm_past_max_theta_pins_without_panic() {
+    let (n, p, n_levels) = (300usize, 14usize, 20u32);
+    let mut st = 1u64;
+    let b: Vec<f64> = (0..n_levels).map(|_| 0.8 * lcg(&mut st)).collect();
+    let primary: Vec<u32> = (0..n as u32).map(|i| i % n_levels).collect();
+    let x: Vec<f64> = (0..n)
+        .flat_map(|_| {
+            let mut r = [1.0f64; 14];
+            for v in r[1..].iter_mut() {
+                *v = lcg(&mut st);
+            }
+            r
+        })
+        .collect();
+    // Poisson draws by inversion of the CDF.
+    let y: Vec<f64> = primary
+        .iter()
+        .map(|&g| {
+            let mu = (1.0 + b[g as usize]).exp();
+            let u = 0.5 * (lcg(&mut st) + 1.0);
+            let (mut k, mut pk) = (0.0f64, (-mu).exp());
+            let mut cdf = pk;
+            while u > cdf {
+                k += 1.0;
+                pk *= mu / k;
+                cdf += pk;
+            }
+            k
+        })
+        .collect();
+    let spec = ModelSpec {
+        family: Family::Poisson {
+            link: PoissonLink::Log,
+        },
+        re: Some(ReStructure {
+            terms: Vec::new(),
+            slopes: (1..p as u32).collect(),
+            extra_groupings: vec![],
+        }),
+    };
+    assert!(p * (p + 1) / 2 > crate::consts::MAX_THETA);
+    let ids = GroupIds {
+        primary,
+        extra: vec![],
+    };
+    let fit = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &spec,
+        &ids,
+        &FitOptions {
+            se_for: SeFor::Only(vec![]),
+            ..FitOptions::default()
+        },
+    );
+    assert!(fit.converged(), "the fit converges");
+    assert_eq!(fit.diagnostics().boundary, Boundary::AtBoundary);
 }
 
 /// Degenerate shapes on the mixed non-Gaussian route: `p == 0` (no fixed
@@ -1984,6 +2126,9 @@ fn nagq_even_rejected() {
         matches!(&e, FitError::OptionValue(m) if m.contains("must be odd in 1..=")),
         "{e:?}"
     );
+    // A message without a row: no field, and nothing to renumber.
+    assert_eq!(e.row(), None);
+    assert_eq!(e.message().text_with_row(9), e.to_string());
 }
 
 #[test]
@@ -2150,34 +2295,193 @@ fn fixed_only_fit_runs_zero_bobyqa_evals() {
 // `Fit::vcov` — gating tests for the `targets`-subset carve-out.
 // ---------------------------------------------------------------------------
 
+/// `ranef(g)` slices the stored modes per grouping: the blocks concatenate to
+/// the stored vector bit for bit, on a nested grouping whose padded slots are
+/// part of its block, on a block without a random intercept (whose hidden
+/// intercept `n_re` does not count) and on two groupings of different `q`;
+/// `condvar(g)` does the same with its `q(q+1)/2` values per level, and is
+/// empty on a fit that did not ask for them. On a fit that did not converge
+/// the modes are empty while the level counts are not, and `ranef(g)` does
+/// not panic.
+#[test]
+fn ranef_blocks_partition_the_stored_modes() {
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    let gaussian = |re: ReStructure| ModelSpec {
+        family: Family::Gaussian,
+        re: Some(re),
+    };
+    // (1 | a) + (1 | a:b): four parents, the last with two children where the
+    // others have three, so the child block is padded to 4 · 3 slots.
+    let mut st = 11u64;
+    let (mut x, mut y, mut a, mut b) = (vec![], vec![], vec![], vec![]);
+    let mut child = 0u32;
+    for parent in 0..4u32 {
+        let u = 0.8 * lcg(&mut st);
+        for _ in 0..if parent == 3 { 2 } else { 3 } {
+            let v = 0.5 * lcg(&mut st);
+            for _ in 0..4 {
+                let t = lcg(&mut st);
+                x.extend([1.0, t]);
+                y.push(1.0 + 0.5 * t + u + v + 0.3 * lcg(&mut st));
+                a.push(parent);
+                b.push(child);
+            }
+            child += 1;
+        }
+    }
+    let nested_fit = fit_cold(
+        &x,
+        &y,
+        y.len(),
+        2,
+        &gaussian(ReStructure::intercept().extra(Grouping::nested())),
+        &GroupIds {
+            primary: a,
+            extra: vec![b],
+        },
+        &FitOptions::default(),
+    );
+    assert_eq!(
+        nested_fit.ranef_levels(),
+        &[4, 12],
+        "the child block is padded"
+    );
+    // (0 + x | g): eight groups of six rows, a random slope and no intercept.
+    let (mut x, mut y, mut g) = (vec![], vec![], vec![]);
+    for grp in 0..8u32 {
+        let s = 0.6 * lcg(&mut st);
+        for _ in 0..6 {
+            let t = lcg(&mut st);
+            x.extend([1.0, t]);
+            y.push(0.2 + (0.5 + s) * t + 0.3 * lcg(&mut st));
+            g.push(grp);
+        }
+    }
+    let no_intercept_fit = fit_cold(
+        &x,
+        &y,
+        y.len(),
+        2,
+        &gaussian(ReStructure::intercept().terms([crate::ReTerm::no_intercept().slopes([1])])),
+        &GroupIds {
+            primary: g,
+            extra: vec![],
+        },
+        &FitOptions::default(),
+    );
+    assert_eq!(no_intercept_fit.n_re(0), 1);
+    // (1 + x | a) + (1 | b), crossed: groupings of q = 2 and q = 1, so where a
+    // block starts depends on the other grouping's width. Fitted with the
+    // conditional covariances, and once without them.
+    let w: Vec<f64> = (0..5).map(|_| 0.5 * lcg(&mut st)).collect();
+    let (mut x, mut y, mut a, mut b) = (vec![], vec![], vec![], vec![]);
+    for grp in 0..8u32 {
+        let (u, s) = (0.8 * lcg(&mut st), 0.4 * lcg(&mut st));
+        for k in 0..6u32 {
+            let t = lcg(&mut st);
+            let item = (grp + k) % 5;
+            x.extend([1.0, t]);
+            y.push(1.0 + (0.5 + s) * t + u + w[item as usize] + 0.3 * lcg(&mut st));
+            a.push(grp);
+            b.push(item);
+        }
+    }
+    let mixed_spec = gaussian(
+        ReStructure::intercept()
+            .slopes([1])
+            .extra(Grouping::crossed()),
+    );
+    let mixed_ids = GroupIds {
+        primary: a,
+        extra: vec![b],
+    };
+    let fit_mixed = |condvar: bool| {
+        let opts = FitOptions {
+            condvar,
+            ..FitOptions::default()
+        };
+        fit_cold(&x, &y, y.len(), 2, &mixed_spec, &mixed_ids, &opts)
+    };
+    let mixed_q_fit = fit_mixed(true);
+    assert_eq!((mixed_q_fit.n_re(0), mixed_q_fit.n_re(1)), (2, 1));
+    for f in [&nested_fit, &no_intercept_fit, &mixed_q_fit] {
+        assert!(f.converged() && !f.ranef.is_empty());
+        let joined: Vec<f64> = (0..f.n_groupings())
+            .flat_map(|g| f.ranef(g).to_vec())
+            .collect();
+        assert_eq!(bits(&joined), bits(&f.ranef));
+    }
+    // The padded child slot (parent 3, within-parent 2) holds a zero mode.
+    assert_eq!(nested_fit.ranef(1)[3 * 3 + 2], 0.0);
+    // The conditional covariances partition the same way, `q(q+1)/2` values
+    // per level.
+    assert!(!mixed_q_fit.condvar.is_empty());
+    let joined: Vec<f64> = (0..mixed_q_fit.n_groupings())
+        .flat_map(|g| mixed_q_fit.condvar(g).to_vec())
+        .collect();
+    assert_eq!(bits(&joined), bits(&mixed_q_fit.condvar));
+    // Not asked for: `condvar(g)` is empty where `ranef(g)` is not.
+    let no_condvar_fit = fit_mixed(false);
+    assert_eq!(no_condvar_fit.n_groupings(), 2);
+    for g in 0..2 {
+        assert!(no_condvar_fit.condvar(g).is_empty() && !no_condvar_fit.ranef(g).is_empty());
+    }
+
+    // A max_fun-capped mixed fit: a finite endpoint that did not converge.
+    let (x, y, n, p) = lmm_hand_dataset();
+    let ids = GroupIds {
+        primary: (0..n).map(|i| (i % 6) as u32).collect(),
+        extra: vec![],
+    };
+    let model = gaussian(ReStructure::intercept());
+    let opts = FitOptions::default();
+    let mut ws = super::core::build_workspace(&model, &ids, n, p, &opts);
+    {
+        let (lmm, _) = ws.lmm_parts().expect("a Gaussian mixed workspace");
+        let mut config = bobyqa::Config::new(1);
+        config.max_fun = 5;
+        lmm.solver = bobyqa::Bobyqa::new(1, config).expect("legal minimal config");
+    }
+    let data = Data::new(&x, &y, n, p);
+    let unconverged_fit =
+        super::core::fit_on(&mut ws, &data, None, &opts).into_fit(&data, &model, &opts);
+    assert!(!unconverged_fit.converged());
+    assert!(unconverged_fit.n_groupings() > 0);
+    for g in 0..unconverged_fit.n_groupings() {
+        assert!(unconverged_fit.ranef(g).is_empty());
+        assert!(unconverged_fit.ranef_levels()[g] > 0);
+    }
+}
+
 /// `vcov` must be a symmetric p×p whose diagonal IS `se²`, on every estimator
 /// path — no path may report a finite `se[j]` next to a
-/// NaN `vcov[j][j]`. Covers OLS / GLM / LMM / GLMM (both `WaldSe` arms), since
+/// NaN diagonal entry `(j, j)` of `vcov`. Covers OLS / GLM / LMM / GLMM (both `WaldSe` arms), since
 /// each sources `vcov` from a different matrix.
 fn assert_vcov_agrees_with_se(fit: &Fit, p: usize, ctx: &str) {
-    assert_eq!(fit.vcov.len(), p, "{ctx}: vcov is not p rows");
-    for row in &fit.vcov {
-        assert_eq!(row.len(), p, "{ctx}: vcov is not p×p");
-    }
+    assert_eq!(fit.vcov().len(), p * p, "{ctx}: vcov is not p×p");
     for j in 0..p {
         if fit.se[j].is_finite() {
             assert!(
-                fit.vcov[j][j].is_finite(),
+                fit.vcov()[j * p + j].is_finite(),
                 "{ctx}: finite se[{j}] alongside NaN vcov[{j}][{j}]"
             );
             // se = sqrt(diag) — same quantity, so this is tight, not a tolerance.
             let want = fit.se[j] * fit.se[j];
             assert!(
-                (fit.vcov[j][j] - want).abs() <= 1e-9 * want.abs().max(1e-12),
+                (fit.vcov()[j * p + j] - want).abs() <= 1e-9 * want.abs().max(1e-12),
                 "{ctx}: vcov[{j}][{j}] = {} vs se[{j}]² = {want}",
-                fit.vcov[j][j]
+                fit.vcov()[j * p + j]
             );
         }
     }
     for i in 0..p {
         for j in 0..p {
-            if fit.vcov[i][j].is_finite() || fit.vcov[j][i].is_finite() {
-                assert_eq!(fit.vcov[i][j], fit.vcov[j][i], "{ctx}: vcov not symmetric");
+            if fit.vcov()[i * p + j].is_finite() || fit.vcov()[j * p + i].is_finite() {
+                assert_eq!(
+                    fit.vcov()[i * p + j],
+                    fit.vcov()[j * p + i],
+                    "{ctx}: vcov not symmetric"
+                );
             }
         }
     }
@@ -2296,17 +2600,60 @@ fn vcov_is_nan_outside_the_target_block() {
         },
     );
     assert!(fit.converged());
-    assert!(fit.se[2].is_finite() && fit.vcov[2][2].is_finite());
+    assert!(fit.se[2].is_finite() && fit.vcov()[2 * p + 2].is_finite());
     assert!(fit.se[0].is_nan() && fit.se[1].is_nan());
     for j in [0usize, 1] {
         for i in 0..p {
             assert!(
-                fit.vcov[i][j].is_nan() && fit.vcov[j][i].is_nan(),
+                fit.vcov()[i * p + j].is_nan() && fit.vcov()[j * p + i].is_nan(),
                 "vcov must be NaN outside the target block at ({i},{j})"
             );
         }
     }
     assert_vcov_agrees_with_se(&fit, p, "targets subset");
+
+    // The GLMM's workspace covariance holds every column pair (the loop tier's
+    // contrasts read it); the stable `vcov` still masks it to the targets.
+    let yb: Vec<f64> = y.iter().map(|&v| f64::from(v > 0.5)).collect();
+    let ids = GroupIds {
+        primary: (0..n).map(|i| (i % 6) as u32).collect(),
+        extra: vec![],
+    };
+    for wald_se in [WaldSe::Hessian, WaldSe::Rx] {
+        let glmm = fit_cold(
+            &x,
+            &yb,
+            n,
+            p,
+            &ModelSpec {
+                family: Family::Binomial {
+                    link: BinomialLink::Logit,
+                },
+                re: Some(ReStructure {
+                    terms: Vec::new(),
+                    slopes: vec![],
+                    extra_groupings: vec![],
+                }),
+            },
+            &ids,
+            &FitOptions {
+                se_for: SeFor::Only(vec![2]),
+                wald_se,
+                ..FitOptions::default()
+            },
+        );
+        assert!(glmm.converged(), "glmm {wald_se:?} did not converge");
+        assert!(glmm.vcov()[2 * p + 2].is_finite(), "glmm {wald_se:?}");
+        for j in [0usize, 1] {
+            for i in 0..p {
+                assert!(
+                    glmm.vcov()[i * p + j].is_nan() && glmm.vcov()[j * p + i].is_nan(),
+                    "glmm {wald_se:?}: vcov must be NaN outside the target block at ({i},{j})"
+                );
+            }
+        }
+        assert_vcov_agrees_with_se(&glmm, p, &format!("glmm {wald_se:?} targets subset"));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2979,13 +3326,17 @@ fn condvar_matches_a_dense_inverse() {
             condvar: true,
             ..FitOptions::default()
         };
-        let fit = crate::fit(&lo.data(), lo.spec(), &opts).unwrap();
+        let model = crate::formula::fit_lowered(formula, lo, &opts).unwrap();
+        let (lo, fit) = (model.lowered(), model.fit());
         assert!(fit.converged(), "{formula}: not converged");
         assert!(
             !fit.condvar.is_empty(),
             "{formula}: no conditional variances"
         );
-        let off = crate::fit(&lo.data(), lo.spec(), &FitOptions::default()).unwrap();
+        let off_lowered = fixture_lowered(csv, factors, formula, family);
+        let off_model =
+            crate::formula::fit_lowered(formula, off_lowered, &FitOptions::default()).unwrap();
+        let off = off_model.fit();
         assert!(off.condvar.is_empty() && off.condvar_x.is_empty() && off.condvar_cross.is_none());
         let bits = |v: &[f64]| v.iter().map(|b| b.to_bits()).collect::<Vec<_>>();
         assert_eq!(bits(&off.beta), bits(&fit.beta), "{formula}: beta moved");
@@ -2996,9 +3347,9 @@ fn condvar_matches_a_dense_inverse() {
             fit.deviance.to_bits(),
             "{formula}: deviance moved"
         );
-        let (cv, cx) = dense_condvar(&lo, &fit);
-        // `label_ranef` keeps a labelled level's vech and drops a padded slot's.
-        let blocks = crate::formula::label_ranef(&fit, &lo.re_groups).unwrap();
+        let (cv, cx) = dense_condvar(lo, fit);
+        // The labelling keeps a labelled level's vech and drops a padded slot's.
+        let blocks = model.ranef().unwrap();
         let mut at = 0;
         for (block, info) in blocks.iter().zip(&lo.re_groups) {
             let v = info.terms.len() * (info.terms.len() + 1) / 2;

@@ -5,6 +5,7 @@
 
 use crate::inference::Objective;
 use crate::lmm::{fit_lmm, Criterion, LmmFit, LmmGroupings, LmmKernel, LmmSuffStats, LmmWorkspace};
+use crate::ols::pair_contrast_norm_sq;
 use crate::standardize::ColumnScaling;
 // Used only by the test-only `fit_mle`/`fit_lmm_into` baselines. The stable core
 // reaches the LMM path via `accumulate_lmm_rows`/`lmm_run_on`, which take neither.
@@ -205,6 +206,14 @@ impl LmmResultView<'_> {
     /// fresh workspace or a previous fit's value on a reused one.
     pub(crate) fn var_diag(&self) -> &[f64] {
         self.var_diag
+    }
+    /// Var(β̂_p − β̂_n) on any column pair: σ̂²·‖L_XX⁻¹Bᵀ(e_p − e_n)‖², off the
+    /// same `L_XX` block, σ̂² and column-map right-hand sides `lmm_view_to_fit`
+    /// forms `vcov` from. NaN when an index is ≥ p, the indices are equal, or
+    /// `scratch` is shorter than p.
+    pub(crate) fn contrast_var(&self, p_col: u32, n_col: u32, scratch: &mut [f64]) -> f64 {
+        let p = self.betas.len();
+        self.fit.sigma_sq * pair_contrast_norm_sq(self.factor, self.map, p, p_col, n_col, scratch)
     }
     /// This route's [`FitDiagnostics`] — every field is real here: θ boundary
     /// state, per-component pins and a recorded pivot, on both of its kernels.

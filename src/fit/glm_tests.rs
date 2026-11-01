@@ -1589,7 +1589,7 @@ fn fit_glm_gamma_exact_fit_loglik_is_the_maximum() {
         },
         re: None,
     };
-    let fit = |dispersion: Option<f64>| {
+    let fit = |dispersion: Dispersion| {
         fit_cold(
             &x,
             &y,
@@ -1604,10 +1604,10 @@ fn fit_glm_gamma_exact_fit_loglik_is_the_maximum() {
             },
         )
     };
-    let ml = fit(None);
+    let ml = fit(Dispersion::Default);
     assert!(ml.converged(), "exact Gamma fit must converge");
     for phi in [1e-4, 1e-8, 1e-12] {
-        let held = fit(Some(phi));
+        let held = fit(Dispersion::Fixed(phi));
         assert!(
             ml.loglik >= held.loglik,
             "ML loglik {} below the loglik {} at held φ = {phi:e}",
@@ -2283,8 +2283,8 @@ fn fit_glm_igauss_offset_matches_r() {
     );
 }
 
-/// `dispersion: Some(v)` holds φ=v fixed (skips the ML estimate) and
-/// scales SE by √v. Fitting at Some(1.0) vs Some(2.0) on identical data must
+/// `Dispersion::Fixed(v)` holds φ=v fixed (skips the ML estimate) and
+/// scales SE by √v. Fitting at `Fixed(1.0)` vs `Fixed(2.0)` on identical data must
 /// give the same β and SE in the exact ratio √2, with `dispersion` reported
 /// as the held value.
 #[test]
@@ -2300,7 +2300,7 @@ fn fit_glm_gamma_fixed_dispersion_scales_se() {
     // φ directive lives in FitOptions, not the Family payload.
     let opts = |phi: f64| FitOptions {
         se_for: SeFor::Only(vec![0, 1, 2]),
-        dispersion: Some(phi),
+        dispersion: Dispersion::Fixed(phi),
         ..FitOptions::default()
     };
     let f1 = fit_cold(&x, &y, n, p, &model, &GroupIds::default(), &opts(1.0));
@@ -2354,7 +2354,7 @@ fn fit_glm_gamma_fixed_dispersion_scales_se() {
 }
 
 /// `Family::Gamma { .. } | Family::InverseGaussian { .. }` share one
-/// `dispersion: Some(v)` directive: the Gamma half is covered by
+/// `Dispersion::Fixed(v)` directive: the Gamma half is covered by
 /// `fit_glm_gamma_fixed_dispersion_scales_se` above; this is its
 /// inverse-Gaussian twin, so an IG-specific φ-scaling regression cannot hide
 /// behind the Gamma-only coverage.
@@ -2371,7 +2371,7 @@ fn fit_glm_igauss_fixed_dispersion_scales_se() {
     // φ directive lives in FitOptions, not the Family payload.
     let opts = |phi: f64| FitOptions {
         se_for: SeFor::Only(vec![0, 1, 2]),
-        dispersion: Some(phi),
+        dispersion: Dispersion::Fixed(phi),
         ..FitOptions::default()
     };
     let f1 = fit_cold(&x, &y, n, p, &model, &GroupIds::default(), &opts(1.0));
@@ -3221,7 +3221,7 @@ fn fit_glm_separated_rejected_like_r() {
 /// "NA/NaN/Inf in 'x'", because `mu.eta(η)² = 1/η⁴` overflows at that η.
 /// `dispersion` must be NaN, not the Gamma exponential special case
 /// `φ=1`, which a caller cannot tell from a real estimate. Also with a
-/// caller-held φ (`FitOptions::dispersion = Some(2.0)`): the held value is
+/// caller-held φ (`Dispersion::Fixed(2.0)`): the held value is
 /// neither an estimate off this fit nor honored when the fit never reached an
 /// endpoint, so `2.0` would be as dishonest here as the unheld case's `1.0`.
 #[test]
@@ -3236,7 +3236,7 @@ fn fit_glm_gamma_failed_fit_dispersion_is_nan() {
         x[i * p + 1] = xi;
         y[i] = 1e80 * (2.0 + 0.1 * xi);
     }
-    for held in [None, Some(2.0)] {
+    for held in [Dispersion::Default, Dispersion::Fixed(2.0)] {
         let f = fit_cold(
             &x,
             &y,
@@ -3251,7 +3251,7 @@ fn fit_glm_gamma_failed_fit_dispersion_is_nan() {
             &GroupIds::default(),
             &FitOptions {
                 se_for: SeFor::Only(vec![0, 1]),
-                dispersion: held,
+                dispersion: held.clone(),
                 ..FitOptions::default()
             },
         );
@@ -3803,7 +3803,7 @@ fn held_dispersion_keeps_z() {
         let model = ModelSpec { family, re: None };
         let opts = FitOptions {
             se_for: SeFor::Only(vec![0, 1, 2]),
-            dispersion: Some(1.5),
+            dispersion: Dispersion::Fixed(1.5),
             ..FitOptions::default()
         };
         let f = fit_cold(&x, &y, n, 3, &model, &GroupIds::default(), &opts);

@@ -118,9 +118,7 @@ pub enum LinearNote {
 /// entries, `vcov` does not have `p` rows, `l.len()` is not `rows·p`, or `l`
 /// is not finite.
 // Its callers (the per-term tests and the two-fit comparison) are in the
-// formula frontend, so a build without `formula` compiles it unused, unless
-// `loop_advanced` is on, whose `wald_chisq_pub` calls it (the allow is then
-// merely unneeded).
+// formula frontend, so a build without `formula` compiles it unused.
 #[cfg_attr(not(feature = "formula"), allow(dead_code))]
 pub(crate) fn wald_chisq(
     beta: &[f64],
@@ -204,24 +202,6 @@ pub(crate) fn wald_chisq(
         p_value: chisq_upper_p(statistic, rank as f64),
         notes,
     }
-}
-
-/// [`wald_chisq`] for the loop tier (`crate::loop_advanced`, no semver
-/// promise), with its contract and panics. A hypothesis with no direction
-/// tested has a NaN p-value: a row with a non-zero entry on an aliased column
-/// is not tested ([`LinearNote::AliasedColumn`]), and an `l` zero on every
-/// column tested has 0 df (`num_df` 0, [`LinearNote::RankDeficientL`] with
-/// `rank` 0), whose χ² on 0 df gives no p-value.
-#[cfg(feature = "loop_advanced")]
-#[doc(hidden)]
-pub fn wald_chisq_pub(
-    beta: &[f64],
-    vcov: &[Vec<f64>],
-    aliased: &[bool],
-    l: &[f64],
-    rows: usize,
-) -> LinearTest {
-    wald_chisq(beta, vcov, aliased, l, rows)
 }
 
 impl LinearTest {

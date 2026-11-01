@@ -298,7 +298,10 @@ quantile on the row's `coef_df` where the summary tests with t, the normal
 quantile where it tests with z. It returns a plain `(p, 2)` array (lower,
 upper) in the order of `names`, with no `parm` argument; index the rows you
 want. Aliased coefficients give `NaN` rows. The R port's `confint()` computes
-the same intervals through the same kernel function.
+the same intervals through the same kernel function. `fit.profile_confint()`
+gives lme4's profile-likelihood intervals of a Gaussian mixed model, variance
+parameters included, named as lme4 names them (see
+[`hypothesis-tests.md`](hypothesis-tests.md#profile-likelihood-intervals)).
 
 Aliased columns show `NaN` estimates, as lme4 prints `NA`. A footer carries
 `dispersion`, `converged` and `singular`, and when `varcorr` is non-empty an

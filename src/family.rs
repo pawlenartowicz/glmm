@@ -2232,7 +2232,7 @@ mod tests {
         assert!((variance(f, 2.0, mu) - (mu + mu * mu / 2.0)).abs() < 1e-12);
     }
 
-    /// The identity `Fit.loglik` relies on: `−½·Σwᵢdᵢ + saturated_loglik`
+    /// The identity `Fit::loglik()` relies on: `−½·Σwᵢdᵢ + saturated_loglik`
     /// must equal the exact `Σwᵢ·log f(yᵢ; μᵢ)` at ANY μ (not just the fitted
     /// one), per family — checked against directly-written log-densities.
     #[test]

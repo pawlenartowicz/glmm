@@ -6,6 +6,186 @@ All notable changes to the `glmm` crate are recorded here. Format follows
 The Python package (`glmm` on PyPI) is versioned in lockstep with the crate and
 shares these entries; Python-specific notes are called out where they differ.
 
+## [0.8.0] — 2026-11-01
+
+### Added
+
+- **Pairwise contrasts on the loop tier** (no semver guarantee). A pair
+  `(p, n)` tests `β_p − β_n` in the caller's units, and neither column need
+  be a target.
+  - `FitView::contrast_t_sq(p_col, n_col, scratch)`: its Wald t² on every
+    route. On a negative binomial fit a pair outside the `se_for` columns is
+    NaN. On a GLM the variance has φ = 1, as `var_diag` has: on Gamma and
+    inverse-Gaussian divide the value by φ̂.
+  - `loop_advanced::glm_contrast_t_sq`: the same on a `glm_irls_fit` view,
+    the GLM twin of `ols_contrast_t_sq`, also with φ = 1.
+  - `loop_advanced::satterthwaite_with_contrasts(&mut ws, &mut df_out,
+    contrasts, &mut contrast_df_out)`: the `satterthwaite` pass, also giving
+    each pair's df, which match `Fit::contrast_t` and are capped at ν as the
+    per-target df are. The pairs add no deviance evaluation, and `df_out` is
+    `satterthwaite`'s bit for bit.
+- **Profile-likelihood confidence intervals of a Gaussian mixed model**, as
+  lme4's `confint(method = "profile")` computes them: one interval per
+  random-effect SD and correlation, the residual SD σ and each coefficient.
+  Each parameter is held at points on each side of its estimate while the
+  others are re-optimized, and a bound is where the signed root of the
+  deviance change reaches the normal quantile. The profiles are of the ML
+  deviance: a REML fit is refitted by ML first, as lme4 does. An SD estimated
+  at 0 gets 0 as its lower bound, and a correlation whose profile stays inside
+  the cutoff up to ±1 gets that limit; an undetermined bound is NaN. A GLMM, a
+  model without random effects and a design with an aliased column are
+  refused. Against frozen lme4 2.0-6 references (sleepstudy, Penicillin,
+  Dyestuff2, a weighted random-slope model) every bound is within 1e-3 of
+  lme4's interval width (on the weighted model the coefficient rows are lme4
+  ML refits with the coefficient held in an offset; lme4's own profile is
+  wrong there).
+  - Rust: `Fit::profile_intervals(&data, &spec, level, which)` and
+    `inference::{ProfileParam, ProfileInterval, ProfileIntervals,
+    ProfileError}`.
+  - Python: `Fit.profile_confint(level=0.95, parm=None)`, returning the new
+    `ProfileTable` (columns `estimate`, `lower`, `upper`, rows named as lme4
+    names them).
+  - R: `confint(fit, parm, level = 0.95, method = "profile")`, lme4's bounds
+    matrix with its row names and its `parm` shortcuts `"theta_"` and
+    `"beta_"`. The rows come in glmm's order (each SD followed by its
+    correlations), so match them to lme4 2.0's by name.
+    `confint(method = "boot")` is still refused, with a reworded message.
+- **`counters` (no semver guarantee): `EvalCounters::post_pin_searches`**, the
+  number of trough polishes a GLMM fit ran: 0 or 1.
+- **`Dispersion`**, the type of `FitOptions::dispersion`:
+  `Dispersion::Default` estimates φ on Gamma and inverse-Gaussian,
+  `Dispersion::Fixed(v)` holds it at `v`. A `match` on it needs a `_` arm.
+  The Python `dispersion=` and R `dispersion =` arguments are unchanged.
+- **`Fit::n_groupings()` and `Fit::n_re(g)`**: the number of random-effect
+  groupings, and grouping `g`'s number of random effects (a block without a
+  random intercept counts its slopes only). They size the per-grouping
+  accessors below.
+- **`formula::Model::ranef()`**: the conditional modes of a formula fit,
+  labelled by level and term, one `RanefBlock` per grouping.
+- **`glmm::limits`**: the six `MAX_*` capacity constants. A limit may grow in a
+  minor release; a name does not disappear.
+
+### Removed
+
+Breaking. Each removed name is listed with what replaces it.
+
+- **The public fields of `Fit`.** Read them through the accessors of the
+  same name: `beta()`, `se()`, `coef_df()`, `fitted()`, `loglik()`,
+  `deviance()`, `df()`, `nobs()`, `dispersion()`, `reml()`, `objective()`,
+  `diagnostics()`, `n_eval()`, `ranef_levels()` and, under `counters`,
+  `counters()`. Five accessors differ from their field:
+  - `vcov()` is the `p × p` covariance flat and row-major: entry `(i, j)` is
+    `vcov()[i * p + j]`, where the field held `p` rows.
+  - `varcorr(g)` is grouping `g`'s `q × q` covariance, row-major with both
+    triangles filled (lme4's `VarCorr(m)[[g]]`), where the field held every
+    grouping's packed lower triangle.
+  - `ranef(g)` is grouping `g`'s conditional modes, a levels × `q` block, one
+    row per level, where the field held every grouping's modes end to end.
+    `condvar(g)` is that grouping's conditional covariances, one `q(q+1)/2`
+    vech per level, in `ranef(g)`'s level order.
+  - `stddev_se(g)` is the `q` SEs of grouping `g`'s standard deviations,
+    aligned with `stddev_corr(g)`, where the field held them in the packed
+    layout.
+
+  The Python and R fits keep their fields and shapes.
+- **`Fit::tau2`**, a duplicate of the variance components. Use
+  `Fit::varcorr(g)`. The Python and R fits keep `tau2`.
+- **`FitOptions::dispersion` as an `Option<f64>`.** It is a `Dispersion`:
+  `None` is `Dispersion::Default`, `Some(v)` is `Dispersion::Fixed(v)`.
+- **`glmm::consts`.** Its six `MAX_*` constants are in `glmm::limits`. The
+  Gauss-Hermite tables (`GH_OFFSETS`, `GH_NODES`, `GH_WEIGHTS`) are no longer
+  public.
+- **`glmm::dual` (`Dual`, `HyperDual`), `glmm::scalar` (`Scalar`) and
+  `glmm::linalg`**, with no replacement: they are the kernels' internals.
+- **`glmm::simd_transcendental`** with `sigmoid_fill`, `exp_fill`,
+  `exp_nonpos`, `phi_fill`, `ln_fill` and `ln_owned`, with no replacement:
+  use std's `exp` and `ln`, and `libm::erfc` for the normal CDF.
+- **`glmm::THETA0`.** It is `glmm::loop_advanced::THETA0`. A warm start with
+  no θ of its own leaves `StartValues::theta` empty.
+- **In `loop_advanced`:** `sigmoid_stable` and `primary_lambda`, with no
+  replacement; `lr_p_value_pub`, `wald_chisq_pub`, `type3_pub` and
+  `TermHypothesis`: use `formula::anova::compare` and
+  `formula::anova::term_tests`.
+- **Formula internals, now public only with the `orchestrate` feature**
+  (outside semver):
+  - `formula::{parse, ParsedFormula, Term, RandomEffect, materialize}`: use
+    `formula::lower`, which runs both stages.
+  - `formula::label_ranef`: use `formula::Model::ranef()`.
+  - `formula::{referenced_columns, unresolved_columns,
+    numeric_only_columns}`, with no replacement.
+  - `formula::anova::{Model, compare_stored}`: use `formula::anova::compare`
+    on two `formula::Model`s.
+
+### Changed
+
+- **The semver promise covers the formula frontend and the inference
+  types.** It covers the matrix door (`fit`, `fit_with_start`, `predict` and
+  its types (`PredictOptions`, `Prediction`, `Scale`), `Data`, `Design`,
+  `ModelSpec` and the spec types, `GroupIds`, `FitOptions` and its enums,
+  `StartValues`, `Fit` and its methods (the accessors and the inference
+  methods `contrast_t`, `contrast_f`, `r2`, `icc`, `profile_intervals`),
+  `Diagnostics`, `Note`, `Boundary`, `OuterStop`, `FitError`, `ErrorMessage`,
+  `limits`), the formula door (`formula::{lower, fit, fit_lowered, predict,
+  Table, Column, Lowered, Model}`, `formula::anova::{compare, term_tests,
+  nesting}`, `formula::pairwise`, their types and the error types), the
+  `inference` types the two doors return, and `Simulator`.
+  `loop_advanced`, `orchestrate`, `parallel` and the dev-only features stay
+  outside it, and everything else is private.
+- **The row an error names is a field.** Each `FitError` variant holds an
+  `ErrorMessage` instead of a `String`. It derefs to `str`, compares equal
+  to a `&str` or a `String` in either order, and converts into a `String`.
+  Two messages are equal when their texts are. A `match` on the variants and
+  a check of the text still compile; a constructor needs `.into()`.
+  `FitError::message()` gives the message whatever the variant.
+  `FitError::row()` and
+  `formula::Error::row()` give the 0-based row of the data the check failed
+  at, and `ErrorMessage::text_with_row` and
+  `formula::Error::to_string_with_row` give the text naming another number
+  for it. The Rust text is unchanged, still counting rows from 0. The ports
+  name the caller's own row: R counts from 1, and both ports count the rows
+  of the data they were given, so a row dropped for a missing value, or by
+  R's `subset =`, no longer shifts the number. Before, Python named the row
+  among the rows it kept and R named that row counting from 0.
+- **`loop_advanced::ols_contrast_t_sq` returns NaN for `p_col == n_col`**,
+  where it returned 0: a zero contrast has no test.
+- **On a Laplace or LMM fit, a pinned variance never sits above a live
+  entry, and a diagonal is flagged exactly when it is 0.** A diagonal here is
+  one of the lower Cholesky factor of `varcorr(g)` (of `varcorr(g)/σ̂²` on an
+  LMM). The pin now runs inside the canonical re-factorization of a pinned
+  block: a trailing diagonal the fold leaves at or below the pin level 1e-4
+  is pinned in the same pass, its whole column exactly 0. Before, a block
+  with two or three pinned diagonals could keep a live entry under a zero
+  diagonal (a few Bernoulli `(1 + x1 + x2 | g)` fits in a thousand), and the
+  reported pins then broke their rank. On a converged Laplace or LMM fit a
+  diagonal is now flagged in `pinned` exactly when it is 0. An AGQ fit
+  reports the search's own Λ, and a block wider than 8 (which only the
+  sparse route builds) is not folded. The fold no longer preserves Σ̂
+  exactly: it drops a pinned column's conditional variance, at most 1e-8
+  (the pin level squared), and its conditional covariances. On the 35,106
+  fits of the boundary-probe corpora one fit moves: a Bernoulli
+  `(1 + x1 + x2 | g)` fit whose intercept SD of 8e-11 was reported unflagged
+  now pins all three diagonals, 8.5e-13 lower.
+- **A GLMM whose trough polish leaves a variance at or below the pin level
+  now pins it.** A fit is polished at most once, and the polish's endpoint
+  goes through the pin pass again, as the outer search's endpoint does. When
+  the incumbent check undoes that pin, the fit reports the polish's endpoint
+  with Σ̂ kept, flagging the diagonals that are exactly 0.
+- **A GLMM's trough polish reaches the optimum on very precise data.** The
+  polish now scales the variance parameters as it scales the fixed effects: a
+  θ coordinate the stationarity probe finds stiffer than the fixed-effect axes
+  is rescaled to their curvature. On precise counts a loading near 0 can be a
+  million times stiffer than the others, and the unscaled polish stopped
+  short: on a Poisson `(1 + x1 + x2 | g)` fit with log-mean e¹⁴ and both slope
+  SDs 0, 0.7.0 ended 0.58 to 0.65 deviance units above lme4's optimum
+  (depending on the platform), and the fit now ends at it on every platform.
+  The probe now runs before the polish also when the pin's drop alone
+  triggers it (two evaluations per free θ coordinate). On the boundary-probe
+  corpora the polished fits spend 2.4% fewer evaluations in all, and their
+  deviances move by at most 1.3e-9.
+- **A GLMM whose trough polish runs out of its evaluation budget reports
+  `converged = false`.** The fit is reported as budget-exhausted, with no pin
+  flags, as when the outer search runs out of its budget.
+
 ## [0.7.0] — 2026-10-27
 
 ### Added

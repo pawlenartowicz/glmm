@@ -690,8 +690,9 @@ pub(crate) fn fit_suff_stats_t_sq_mapped<'a>(
 /// t² = (β̂_p − β̂_n)² / var
 /// ```
 ///
-/// Returns `NaN` on any numerical failure (non-converged fit, out-of-range
-/// indices, a variance that is not positive).
+/// Returns `NaN` when the fit did not converge, when an index is ≥ p or the
+/// two are equal (a zero contrast has no test), when `scratch` is shorter
+/// than p, or when the variance is not finite and positive.
 ///
 /// Valid only on a view fitted without a column map (`fit_suff_stats_t_sq`):
 /// it reads `betas` and `factor` as the caller's own coefficients and Gram.
@@ -702,35 +703,60 @@ pub fn ols_contrast_t_sq(fit: &OlsFitView<'_>, p_col: u32, n_col: u32, scratch: 
         return f64::NAN;
     }
     let p = fit.betas.len();
-    let pc = p_col as usize;
-    let nc = n_col as usize;
-    if pc >= p || nc >= p || scratch.len() < p {
+    let var = fit.sigma_sq
+        * pair_contrast_norm_sq(
+            fit.factor,
+            ColumnScaling::IDENTITY,
+            p,
+            p_col,
+            n_col,
+            scratch,
+        );
+    // NaN here also covers the index and scratch checks, before `betas` is read.
+    if var.is_nan() {
         return f64::NAN;
     }
+    contrast_t_sq_of(fit.betas[p_col as usize] - fit.betas[n_col as usize], var)
+}
 
-    // Forward solve L · u = c where c = e_pc − e_nc.
-    let norm_sq = triangular_solve_norm_sq(
-        fit.factor,
-        |i| {
-            if i == pc {
-                1.0
-            } else if i == nc {
-                -1.0
-            } else {
-                0.0
-            }
-        },
+/// ‖L⁻¹·Bᵀ(e_p − e_n)‖² over the leading p × p block of `factor`; NaN when an
+/// index is ≥ p, the indices are equal, or `scratch` is shorter than p.
+///
+/// `factor` is the lower-triangular `L` of the internal information `LLᵀ` and
+/// `B` the column map, so `Var(β_p − β_n) = scale · ‖L⁻¹·Bᵀ(e_p − e_n)‖²` with
+/// `scale` the fit's residual variance (1 on a GLM's φ = 1 scale). The forward
+/// solve's right-hand side is `map.rhs(p_col, i) − map.rhs(n_col, i)`, which
+/// under [`ColumnScaling::IDENTITY`] is exactly 1, −1 and 0.
+pub(crate) fn pair_contrast_norm_sq(
+    factor: MatRef<'_, f64>,
+    map: &ColumnScaling,
+    p: usize,
+    p_col: u32,
+    n_col: u32,
+    scratch: &mut [f64],
+) -> f64 {
+    let pc = p_col as usize;
+    let nc = n_col as usize;
+    if pc >= p || nc >= p || pc == nc || scratch.len() < p {
+        return f64::NAN;
+    }
+    triangular_solve_norm_sq(
+        factor,
+        |i| map.rhs(pc, i) - map.rhs(nc, i),
         scratch,
         p,
         false, // lower-triangular L: row access factor[(i, k)]
-    );
-    let var = fit.sigma_sq * norm_sq;
-    if var <= 0.0 || !var.is_finite() {
-        return f64::NAN;
-    }
+    )
+}
 
-    let beta_diff = fit.betas[pc] - fit.betas[nc];
-    (beta_diff * beta_diff) / var
+/// diff²/var, NaN unless var is finite and positive.
+#[inline]
+pub(crate) fn contrast_t_sq_of(diff: f64, var: f64) -> f64 {
+    if var > 0.0 && var.is_finite() {
+        (diff * diff) / var
+    } else {
+        f64::NAN
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1097,12 +1123,12 @@ mod tests {
         );
     }
 
-    /// `ols_contrast_t_sq`'s bounds guard — `p_col >= p`, `n_col >= p`, or
-    /// `scratch.len() < p` — on a fit that otherwise converges and would
-    /// return a real value, so the guard itself is what is under test, not
-    /// the earlier `!converged` short-circuit. A p=3 factor confirms in-range
-    /// indices still compute normally; the last assertion flips `converged` on
-    /// the same otherwise-valid fit and must get NaN.
+    /// `ols_contrast_t_sq`'s bounds guard — `p_col >= p`, `n_col >= p`,
+    /// `p_col == n_col`, or `scratch.len() < p` — on a fit that otherwise
+    /// converges and would return a real value, so the guard itself is what is
+    /// under test, not the earlier `!converged` short-circuit. A p=3 factor
+    /// confirms in-range indices still compute normally; the last assertion
+    /// flips `converged` on the same otherwise-valid fit and must get NaN.
     #[test]
     fn contrast_t_sq_bounds_checks_return_nan() {
         let p = 3;
@@ -1142,6 +1168,10 @@ mod tests {
         assert!(
             ols_contrast_t_sq(&fit, 1, 2, &mut short_scratch).is_nan(),
             "scratch shorter than p must be refused"
+        );
+        assert!(
+            ols_contrast_t_sq(&fit, 1, 1, &mut scratch).is_nan(),
+            "a zero contrast has no test"
         );
         assert!(
             ols_contrast_t_sq(&fit, 1, 2, &mut scratch).is_finite(),

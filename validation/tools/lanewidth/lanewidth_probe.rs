@@ -73,11 +73,13 @@ fn main() {
     opts.wald_se = WaldSe::Rx;
     let f = glmm::fit(&glmm::Data::new(&x, &y, n, p).ids(&ids), &model, &opts).unwrap();
     println!("converged      = {:?}", f.converged());
-    println!("beta           = {:?}", f.beta);
-    println!("se             = {:?}", f.se);
+    println!("beta           = {:?}", f.beta());
+    println!("se             = {:?}", f.se());
     println!(
         "varcorr[..][0] = {:?}",
-        f.varcorr.iter().map(|b| b[0]).collect::<Vec<_>>()
+        (0..f.n_groupings())
+            .map(|g| f.varcorr(g)[0])
+            .collect::<Vec<_>>()
     );
-    println!("dispersion     = {:?}", f.dispersion);
+    println!("dispersion     = {:?}", f.dispersion());
 }

@@ -778,6 +778,28 @@ test_that("an aliased coefficient gives an NA interval", {
   expect_true(all(is.finite(ci[c("(Intercept)", "x"), ])))
 })
 
+# Profile-likelihood intervals: the crate computes them; this checks the names
+# and shapes the port gives them.
+test_that("confint(method = \"profile\") gives lme4's row names and takes parm and level", {
+  m <- fastglmm(Reaction ~ Days + (Days | Subject), sleep_data())
+  ci <- confint(m, method = "profile")
+  expect_identical(rownames(ci), c("sd_(Intercept)|Subject", "cor_Days.(Intercept)|Subject",
+                                   "sd_Days|Subject", "sigma", "(Intercept)", "Days"))
+  expect_identical(colnames(ci), c("2.5 %", "97.5 %"))
+  expect_true(all(ci[, 1] < ci[, 2]))
+
+  beta <- confint(m, parm = "beta_", method = "profile")
+  expect_identical(rownames(beta), c("(Intercept)", "Days"))
+  expect_equal(beta, ci[5:6, ], tolerance = 1e-10)
+
+  s <- confint(m, parm = "sigma", level = 0.9, method = "profile")
+  expect_identical(dimnames(s), list("sigma", c("5 %", "95 %")))
+  expect_true(ci["sigma", 1] < s[1, 1] && s[1, 2] < ci["sigma", 2])
+
+  expect_error(confint(m, parm = "nope", method = "profile"),
+               "\"nope\".*\"sd_Days\\|Subject\"")
+})
+
 # AIC()/BIC() refuse only the comparisons that are always wrong: a REML fit
 # beside an ML fit, and REML fits with different fixed effects.
 reml_ic_fits <- function() {

@@ -15,7 +15,8 @@ use crate::lmm::re_map::{semidef_lower_chol, PivotFloor};
 use crate::lmm::slope_value;
 use crate::predict::{predict_parts, reported_columns, FitParts, PredictOptions};
 use crate::{
-    BinomialLink, Design, Family, Fit, FitError, GammaLink, InverseGaussianLink, ModelSpec,
+    BinomialLink, Design, ErrorMessage, Family, Fit, FitError, GammaLink, InverseGaussianLink,
+    ModelSpec,
 };
 
 /// `ids` renumbered `0..k` in id order, and `k`. A level's effect is drawn
@@ -148,7 +149,7 @@ impl<'a> Simulator<'a> {
         spec: &ModelSpec,
         design: &Design<'a>,
     ) -> Result<Simulator<'a>, FitError> {
-        Self::from_parts(&FitParts::of(fit, spec), spec, design)
+        Self::from_parts(&FitParts::without_vcov(fit, spec), spec, design)
     }
 
     /// Draw `draw` of the response at `seed`, one value per row of the design.
@@ -166,11 +167,14 @@ impl<'a> Simulator<'a> {
     /// design.
     pub fn simulate_into(&self, seed: u64, draw: u64, y: &mut [f64]) -> Result<(), FitError> {
         if y.len() != self.design.n {
-            return Err(FitError::Shape(format!(
-                "the buffer has {} entries, the design {} rows",
-                y.len(),
-                self.design.n
-            )));
+            return Err(FitError::Shape(
+                format!(
+                    "the buffer has {} entries, the design {} rows",
+                    y.len(),
+                    self.design.n
+                )
+                .into(),
+            ));
         }
         self.fill(seed, draw, y);
         Ok(())
@@ -187,16 +191,16 @@ impl<'a> Simulator<'a> {
             return Err(FitError::Unsupported(
                 "the fit has no dispersion (it did not converge), so there is no \
                  fitted distribution to draw from"
-                    .to_string(),
+                    .into(),
             ));
         }
         validate_design(design, spec, 1, true)?;
         if let (Family::Binomial { .. }, Some(w)) = (parts.family, design.weights) {
             if let Some(i) = w.iter().position(|v| v.fract() != 0.0) {
-                return Err(FitError::Weights(format!(
-                    "a binomial simulation needs whole trial counts as weights \
-                     (row {i} has {})",
-                    w[i]
+                return Err(FitError::Weights(ErrorMessage::at_row(
+                    "a binomial simulation needs whole trial counts as weights (row ".to_string(),
+                    i,
+                    &format!(" has {})", w[i]),
                 )));
             }
         }
@@ -209,9 +213,9 @@ impl<'a> Simulator<'a> {
         if let (Some(re), Some(ids)) = (spec.re.as_ref(), design.ids) {
             let reported = reported_columns(re, ids);
             let mismatch = |what: &str| {
-                Err(FitError::Shape(format!(
-                    "the model does not match the fit: {what}"
-                )))
+                Err(FitError::Shape(
+                    format!("the model does not match the fit: {what}").into(),
+                ))
             };
             if parts.varcorr.len() != reported.len() {
                 return mismatch("the number of groupings");

@@ -95,7 +95,8 @@ const ETA_GRAD: f64 = 3e-6;
 /// The pseudo-inverse threshold on `H_p`, relative to its largest eigenvalue.
 const REL_TOL: f64 = 1e-8;
 
-/// How `H_p` and `∂C/∂θ` were differentiated.
+/// How `H_p` and `∂C/∂θ` were differentiated (a record the tests read).
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DerivRoute {
     /// Central finite differences of the deviance value and of `C_p`.
@@ -130,11 +131,10 @@ pub(crate) struct SatterthwaiteState {
     pub(crate) dropped: usize,
     /// Directions of `H_p` below `−REL_TOL·λ_max`, not inverted.
     pub(crate) negative: usize,
-    /// The derivative route the pass took.
-    // Contract state that only tests read, by design: the pass chooses the
-    // route itself (`stencil`, from the kernel's arming and the gradient's
-    // success) and records it here; no non-test code branches on it.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// The derivative route the pass took, recorded for the tests only: the
+    /// pass chooses the route itself (`stencil`, from the kernel's arming and
+    /// the gradient's success), and no non-test code reads it.
+    #[cfg(test)]
     pub(crate) route: DerivRoute,
     /// Which record this is; one status, so no two of failed, switched off
     /// and not run can hold at once.
@@ -201,6 +201,7 @@ impl SatterthwaiteState {
             nu: f64::NAN,
             dropped: 0,
             negative: 0,
+            #[cfg(test)]
             route: DerivRoute::Value,
             status: Status::SwitchedOff,
             retained: None,
@@ -241,8 +242,8 @@ impl SatterthwaiteState {
 
     /// A live record from its numbers, as a port stored them
     /// (`orchestrate::SatterthwaiteRecord`). The dropped and negative counts
-    /// and the route, which only the fit's curvature note and the tests read,
-    /// are set to their defaults: no contrast reads them.
+    /// (read only by the fit's curvature note and the tests) and the
+    /// test-only route are set to their defaults: no contrast reads them.
     #[cfg(feature = "orchestrate")]
     pub(crate) fn from_record(
         a_eff: Mat<f64>,
@@ -355,13 +356,18 @@ pub(crate) fn pass(ws: &mut LmmWorkspace, map: &ColumnScaling) -> SatterthwaiteS
 /// built on the first call, sized for every θ coordinate free, so each later
 /// call on the workspace allocates only the pseudo-inverse's blocks, whatever
 /// the draw's free coordinates. Writes the df of each `targets` column into
-/// `df_out` and leaves its other entries alone; returns `false`, writing
+/// `df_out` and leaves its other entries alone, and the df of each pair's
+/// contrast `e_p − e_n` into `contrast_df_out` (NaN for a pair with an index
+/// at least the column count, or with its two indices equal, which is no
+/// contrast); returns `false`, writing
 /// nothing, when the pass failed.
 pub(crate) fn pass_targets(
     ws: &mut LmmWorkspace,
     map: &ColumnScaling,
     targets: &[u32],
     df_out: &mut [f64],
+    contrasts: &[(u32, u32)],
+    contrast_df_out: &mut [f64],
 ) -> bool {
     let nu = residual_nu(ws);
     let LmmWorkspace {
@@ -407,6 +413,19 @@ pub(crate) fn pass_targets(
         df_out[t] = s.state.df_into(&s.e, &mut s.g);
         s.e[t] = 0.0;
     }
+    let p = s.e.len();
+    for (&(pc, nc), out) in contrasts.iter().zip(contrast_df_out.iter_mut()) {
+        let (pc, nc) = (pc as usize, nc as usize);
+        if pc >= p || nc >= p || pc == nc {
+            *out = f64::NAN;
+            continue;
+        }
+        s.e[pc] = 1.0;
+        s.e[nc] = -1.0;
+        *out = s.state.df_into(&s.e, &mut s.g);
+        s.e[pc] = 0.0;
+        s.e[nc] = 0.0;
+    }
     true
 }
 
@@ -421,7 +440,8 @@ pub(crate) struct PassScratch {
     hess: Mat<f64>,
     /// The `∂C/∂θ̃_k` matrices `state.jac_theta` does not hold this call.
     spare_jac: Vec<Mat<f64>>,
-    /// `g_p` of [`SatterthwaiteState::df_into`], and the unit vector `e_t`.
+    /// `g_p` of [`SatterthwaiteState::df_into`], and the contrast it takes:
+    /// the unit vector `e_t` or a pair's `e_p − e_n`, all zero between uses.
     g: Vec<f64>,
     e: Vec<f64>,
 }
@@ -651,6 +671,28 @@ fn collect_into(
     restore_response(kernel, &s.saved);
 }
 
+/// `M = B·U⁻¹` into `m` (`p × p`), with `row` a length-`p` scratch: row `t`
+/// maps the kernel's coefficients to the caller's coefficient `t`, so
+/// `β_t = M_t·β̃` and `C = σ̂²·M(L̃L̃ᵀ)⁻¹Mᵀ`, `L̃` the unmapped fixed-effect
+/// factor. `U` is the kernel's [`LmmKernel::design_qr`], fixed by the
+/// accumulation, so `M` does not depend on θ.
+pub(crate) fn caller_map_into(
+    kernel: &LmmKernel,
+    map: &ColumnScaling,
+    row: &mut [f64],
+    m: &mut Mat<f64>,
+) {
+    for t in 0..m.nrows() {
+        for (i, r) in row.iter_mut().enumerate() {
+            *r = map.rhs(t, i);
+        }
+        kernel.design_qr().solve_row(row);
+        for (i, &r) in row.iter().enumerate() {
+            m[(t, i)] = r;
+        }
+    }
+}
+
 /// [`collect_into`]'s evaluations, on whatever response the kernel holds: the
 /// gradient route at `eta_grad` when it is given, the kernel's per-group
 /// gradient is armed and every axis point serves a gradient, the value route
@@ -674,17 +716,7 @@ fn stencil(
         h.clear();
         h.extend(free.iter().map(|&k| eta * theta[k].abs().max(1.0)));
     };
-    // Row t of M = B·U⁻¹, the map from the kernel's columns to the caller's:
-    // C = σ̂²·M(L̃L̃ᵀ)⁻¹Mᵀ, L̃ the unmapped fixed-effect factor.
-    for t in 0..p {
-        for (i, r) in s.row.iter_mut().enumerate() {
-            *r = map.rhs(t, i);
-        }
-        kernel.design_qr().solve_row(&mut s.row);
-        for (i, &r) in s.row.iter().enumerate() {
-            s.m[(t, i)] = r;
-        }
-    }
+    caller_map_into(kernel, map, &mut s.row, &mut s.m);
 
     s.point.clear();
     s.point.extend_from_slice(theta);
@@ -790,7 +822,7 @@ struct SavedResponse {
 }
 
 /// [`shift_response_into`] on fresh buffers.
-#[cfg(test)]
+#[cfg(all(test, feature = "formula"))]
 fn shift_response(kernel: &mut LmmKernel, b: &[f64]) -> SavedResponse {
     let mut saved = SavedResponse::default();
     shift_response_into(kernel, b, &mut saved, &mut Vec::new());
@@ -1022,11 +1054,14 @@ fn assemble_into(
     st.nu = col.nu;
     st.dropped = dropped;
     st.negative = negative;
-    st.route = if col.g_axis.is_some() {
-        DerivRoute::GradientDiff
-    } else {
-        DerivRoute::Value
-    };
+    #[cfg(test)]
+    {
+        st.route = if col.g_axis.is_some() {
+            DerivRoute::GradientDiff
+        } else {
+            DerivRoute::Value
+        };
+    }
     st.status = if failed { Status::Failed } else { Status::Live };
     st.retained = None;
 }

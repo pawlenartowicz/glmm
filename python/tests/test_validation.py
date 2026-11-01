@@ -256,6 +256,58 @@ def test_infinite_response_or_predictor_names_the_column(column, capfd):
     assert "panicked" not in capfd.readouterr().err
 
 
+def test_an_error_row_counts_the_callers_rows_after_a_dropped_row():
+    # Row 0 is dropped for its missing x, so the bad count at row 3 is the
+    # third row passed to the kernel (its row 2), and the message names 3.
+    data = {"k": [1.0, 2.0, 0.0, -1.0, 3.0], "x": [float("nan"), 0.5, 1.0, 1.5, 2.0]}
+    refused = r"^Poisson response must be >= 0 \(row 3\)$"
+    with pytest.warns(glmm.RowsDroppedWarning), pytest.raises(ValueError, match=refused):
+        glmm.fit(data, "k ~ x", family="poisson")
+    with pytest.warns(glmm.RowsDroppedWarning), pytest.raises(ValueError, match=refused):
+        glmm.compare(data, "k ~ 1", "k ~ x", family="poisson")
+
+
+def test_simulate_names_the_callers_row_of_the_fits_rows():
+    # The fit keeps 19 rows; its kernel row 2 is the caller's row 3.
+    rng = _np.random.default_rng(4)
+    x = rng.normal(size=20)
+    x[0] = _np.nan
+    # Whole success counts (p * w), so the only refusal is row 3's weight.
+    p = rng.integers(1, 4, size=20) / 4
+    p[3] = 0.0
+    data = {"p": p.tolist(), "x": x.tolist()}
+    w = _np.full(20, 4.0)
+    w[3] = 4.5
+    with pytest.warns(glmm.RowsDroppedWarning):
+        m = glmm.fit(data, "p ~ x", family="binomial", weights=w)
+    with pytest.raises(ValueError, match=r"whole trial counts as weights \(row 3 has 4\.5\)$"):
+        m.simulate(seed=1)
+
+
+def test_predict_names_a_newdata_row_and_a_fits_own_row():
+    rng = _np.random.default_rng(5)
+    n = 40
+    x = rng.normal(size=n)
+    x[0] = _np.nan
+    p = rng.integers(1, 4, size=n) / 4
+    p[5] = 0.0
+    data = {"p": p.tolist(), "x": x.tolist(), "g": [f"g{i % 8}" for i in range(n)]}
+    w = _np.full(n, 4.0)
+    w[5] = 4.5
+    # The groups carry no effect here, so the fit is singular; that is not under test.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", glmm.SingularFitWarning)
+        with pytest.warns(glmm.RowsDroppedWarning):
+            m = glmm.fit(data, "p ~ x + (1 | g)", family="binomial", weights=w)
+    # Row 5 of data is the fit's row 4.
+    with pytest.raises(ValueError, match=r"whole trial counts as weights \(row 5\)$"):
+        m.predict(future=True)
+    # A newdata row is the caller's own, whatever rows the fit dropped.
+    new = {"x": [0.0, 0.5, 1.0], "g": ["g1", "g9", "g2"]}
+    with pytest.raises(ValueError, match=r"did not see at row 1 \(id"):
+        m.predict(new, allow_new_levels=False)
+
+
 def test_clean_call_emits_no_warnings_and_fits():
     with warnings.catch_warnings():
         warnings.simplefilter("error")  # any warning becomes an error

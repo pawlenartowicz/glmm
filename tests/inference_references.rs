@@ -8,18 +8,26 @@
 //! neither a golden nor an inference reference: no driver compares that cell,
 //! so none can find the entry stale. Every JSON carries the provenance keys its
 //! generator writes: the R keys on every kind but `conditioning`, whose
-//! generator is a Python script with keys of its own. The rules are pure
-//! functions over the manifest entries, the registry and the files on disk,
-//! with synthetic cases beside them, so each rule is shown to fire. No feature
-//! gate, so this runs in CI on the default and `--no-default-features` builds.
-//! It reads the reader by `#[path]`, not through `mod oracle_support`, which
-//! imports `glmm::formula`.
+//! generator is a Python script with keys of its own. Every version that
+//! provenance records (each of `packages`, and `r_version`) is on its pin in
+//! `validation/grid/versions.json`: an off-pin reference fails, and is
+//! regenerated under the pin, never edited; a package with no pin fails until
+//! it is pinned there. The rules are pure functions over the manifest entries,
+//! the registry, the pins and the files on disk, with synthetic cases beside
+//! them, so each rule is shown to fire. No feature gate, so this runs in CI on
+//! the default and `--no-default-features` builds. It reads the reader and the
+//! pins by `#[path]`, not through `mod oracle_support`, which imports
+//! `glmm::formula`.
 
 #[allow(dead_code)]
 #[path = "oracle_support/inference.rs"]
 mod inference_support;
 
+#[path = "oracle_support/pins.rs"]
+mod pin_support;
+
 use inference_support::{DivEntry, Entry, Kind};
+use pin_support::{load_pins, norm_version, Pins};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path};
@@ -45,7 +53,7 @@ const PROVENANCE_KEYS: [&str; 7] = [
 const PY_PROVENANCE_KEYS: [&str; 4] = ["python_version", "packages", "mp_dps", "generator"];
 
 /// The rules across kinds, over the raw block: each entry parses (so its `kind`
-/// is one of the seven), names are unique and none is in `reserved` (the
+/// is one of the eight), names are unique and none is in `reserved` (the
 /// `datasets` and `m3_goldens` names), `data` names a file or is `null` only on
 /// a fit-free entry, `generator` is a bare file name naming a file under
 /// `tools/`, and each `factors` name is a column of the `data` CSV. `exists`
@@ -133,8 +141,47 @@ fn is_bare_name(path: &str) -> bool {
     )
 }
 
-/// The rules of one kind: its entries against the JSONs of its directory.
-fn kind_rules(kind: Kind, entries: &[Entry], jsons: &KindDir) -> Vec<String> {
+/// The findings on one `provenance` object's versions against `pins`
+/// (`validation/grid/versions.json`): every key of `packages` must be pinned and
+/// on its pin, and `r_version`, when present, must be on the `R` pin. Versions
+/// compare with `-` read as `.`. `python_version` is pinned nowhere and is not
+/// read. A missing key is the key rule's finding, not this one's. Each finding
+/// starts with `name`.
+fn provenance_findings(name: &str, provenance: &Value, pins: &Pins) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut check = |what: &str, key: &str, version: &Value| {
+        let Some(version) = version.as_str() else {
+            found.push(format!("{name}: {what} is not a string"));
+            return;
+        };
+        match pins.get(key) {
+            None => found.push(format!(
+                "{name}: {what} {version} has no pin in validation/grid/versions.json; pin `{key}` there"
+            )),
+            Some(pin) if norm_version(version) != norm_version(pin) => found.push(format!(
+                "{name}: {what} {version} does not match the {key} pin {pin} in validation/grid/versions.json"
+            )),
+            Some(_) => {}
+        }
+    };
+    if let Some(r) = provenance.get("r_version") {
+        check("r_version", "R", r);
+    }
+    match provenance.get("packages") {
+        None => {}
+        Some(Value::Object(packages)) => {
+            for (package, version) in packages {
+                check(&format!("package {package}"), package, version);
+            }
+        }
+        Some(_) => found.push(format!("{name}: provenance `packages` is not an object")),
+    }
+    found
+}
+
+/// The rules of one kind: its entries against the JSONs of its directory, each
+/// JSON's provenance versions against `pins`.
+fn kind_rules(kind: Kind, entries: &[Entry], jsons: &KindDir, pins: &Pins) -> Vec<String> {
     let k = kind.as_str();
     let mut found = Vec::new();
     for stem in jsons.keys() {
@@ -165,12 +212,13 @@ fn kind_rules(kind: Kind, entries: &[Entry], jsons: &KindDir) -> Vec<String> {
         _ => &PROVENANCE_KEYS,
     };
     for (stem, json) in jsons {
-        match json.get("provenance").and_then(Value::as_object) {
+        match json.get("provenance").filter(|p| p.is_object()) {
             None => found.push(format!("{k}/{stem}.json: no `provenance` object")),
             Some(p) => {
-                for key in keys.iter().filter(|key| !p.contains_key(**key)) {
+                for key in keys.iter().filter(|key| p.get(**key).is_none()) {
                     found.push(format!("{k}/{stem}.json: provenance lacks `{key}`"));
                 }
+                found.extend(provenance_findings(&format!("{k}/{stem}.json"), p, pins));
             }
         }
         if json.get("name").and_then(Value::as_str) != Some(stem) {
@@ -191,6 +239,7 @@ fn violations(
     reserved: &BTreeSet<String>,
     exists: &dyn Fn(&str) -> bool,
     header: &dyn Fn(&str) -> Vec<String>,
+    pins: &Pins,
 ) -> Vec<String> {
     let (entries, mut found) = manifest_rules(raw, reserved, exists, header);
     let empty = KindDir::new();
@@ -200,6 +249,7 @@ fn violations(
             kind,
             &of_kind,
             dirs.get(kind.as_str()).unwrap_or(&empty),
+            pins,
         ));
     }
     found
@@ -289,7 +339,14 @@ fn inference_references_are_registered() {
             .map(|s| s.trim().trim_matches('"').to_string())
             .collect()
     };
-    let mut found = violations(raw, &dirs, &reserved, &|p| suite.join(p).is_file(), &header);
+    let mut found = violations(
+        raw,
+        &dirs,
+        &reserved,
+        &|p| suite.join(p).is_file(),
+        &header,
+        &load_pins(),
+    );
     let references: BTreeSet<String> = raw
         .iter()
         .filter_map(|r| r["name"].as_str().map(str::to_string))
@@ -304,6 +361,19 @@ fn inference_references_are_registered() {
         "inference references out of registration:\n{}",
         found.join("\n")
     );
+    // Each frozen reference was read and checked: one JSON per entry not
+    // pending, and at least one, both counted from the manifest.
+    let checked: usize = dirs.values().map(KindDir::len).sum();
+    let frozen = raw
+        .iter()
+        .filter(|r| !r["pending_reference"].is_string())
+        .count();
+    assert!(frozen > 0, "no inference reference is frozen");
+    assert_eq!(
+        checked, frozen,
+        "checked {checked} reference JSONs, but {frozen} entries are not pending"
+    );
+    println!("checked {checked} inference references");
 }
 
 #[test]
@@ -333,7 +403,8 @@ fn oracle_tier_entry_on_neither_a_golden_nor_a_reference_is_rejected() {
 /// Each rule on synthetic input: a registered, frozen `lmertest` reference
 /// that passes, perturbed once per test.
 mod rules {
-    use super::{violations, KindDir, PROVENANCE_KEYS, PY_PROVENANCE_KEYS};
+    use super::pin_support::{pins, Pins};
+    use super::{provenance_findings, violations, KindDir, PROVENANCE_KEYS, PY_PROVENANCE_KEYS};
     use serde_json::{json, Value};
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -343,6 +414,8 @@ mod rules {
         reserved: BTreeSet<String>,
         files: BTreeSet<String>,
         headers: BTreeMap<String, Vec<String>>,
+        /// The pins `reference()` is on, not the real ones.
+        pins: Pins,
     }
 
     fn reference(name: &str) -> Value {
@@ -386,6 +459,9 @@ mod rules {
                     "data/simulated/sim_factorial.csv".to_string(),
                     ["subj", "g", "h", "x", "y"].map(String::from).into(),
                 )]),
+                pins: [("R", "4.5.1"), ("lmerTest", "3.1-3"), ("mpmath", "1.4.1")]
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .into(),
             }
         }
 
@@ -403,6 +479,7 @@ mod rules {
                 &self.reserved,
                 &|p| self.files.contains(p),
                 &|p| self.headers.get(p).cloned().unwrap_or_default(),
+                &self.pins,
             )
         }
 
@@ -598,6 +675,37 @@ mod rules {
             w.files.insert(path.to_string());
             w.assert_flags(&format!("ref_a: data {path} is not a plain relative path"));
         }
+    }
+
+    #[test]
+    fn provenance_checks_every_package_and_r() {
+        let ok = json!({"r_version": "4.5.3", "packages": {"lme4": "2.0.6"}});
+        assert!(provenance_findings("r", &ok, &pins()).is_empty());
+        let pkg = json!({"r_version": "4.5.3", "packages": {"lme4": "2.0.5"}});
+        assert_eq!(provenance_findings("r", &pkg, &pins()).len(), 1);
+        let r = json!({"r_version": "4.5.2", "packages": {"lme4": "2.0.6"}});
+        assert_eq!(provenance_findings("r", &r, &pins()).len(), 1);
+        let unpinned = json!({"r_version": "4.5.3", "packages": {"foo": "1.0"}});
+        let f = provenance_findings("r", &unpinned, &pins());
+        assert_eq!(f.len(), 1);
+        assert!(f[0].contains("foo") && f[0].contains("versions.json"));
+    }
+
+    #[test]
+    fn python_provenance_checks_packages_only() {
+        let ok = json!({"python_version": "3.14.2", "packages": {"mpmath": "1.4.1"}});
+        assert!(provenance_findings("c", &ok, &pins()).is_empty());
+        let old = json!({"python_version": "3.14.2", "packages": {"mpmath": "1.3.0"}});
+        assert_eq!(provenance_findings("c", &old, &pins()).len(), 1);
+    }
+
+    #[test]
+    fn reference_off_its_pin_is_rejected() {
+        let mut w = World::valid();
+        w.json("lmertest", "ref_a")["provenance"]["packages"]["lmerTest"] = json!("3.1-2");
+        w.assert_flags("lmertest/ref_a.json: package lmerTest 3.1-2");
+        let found = w.violations();
+        assert_eq!(found.len(), 1, "{found:?}");
     }
 
     #[test]

@@ -18,7 +18,9 @@ use crate::fit::fit_cold_keep_workspace;
 use crate::fit::SizedSpec;
 #[cfg(feature = "formula")]
 use crate::lmm::fit_lmm_unhinted;
-use crate::lmm::{LmmGroupings, LmmKernel, LmmWorkspace};
+#[cfg(feature = "formula")]
+use crate::lmm::LmmKernel;
+use crate::lmm::{LmmGroupings, LmmWorkspace};
 use crate::standardize::ColumnScaling;
 use crate::test_support::intercept_only_spec;
 use crate::SeFor;
@@ -28,6 +30,7 @@ use faer::Mat;
 /// Two routes to the same df that differ only in rounding: `C` read off the
 /// mapped factor against `C` read off the unmapped one through `M = B·U⁻¹`,
 /// amplified by the `1/(2h)` of the central difference (about `1e-15/ETA`).
+#[cfg(feature = "formula")]
 const ROUTE_REL: f64 = 1e-9;
 
 /// `df_fd_rel` in `validation/grid/tol.R` (`TOL_INFERENCE`): the value route's
@@ -194,6 +197,7 @@ fn balanced_one_way_intercept_df_is_k_minus_one() {
 
 /// The deviance and the diagonal of `C` at `θ`, `C` read off the factor mapped
 /// to the caller's columns (the route `Fit::vcov` takes).
+#[cfg(feature = "formula")]
 fn deviance_and_var(
     kernel: &mut LmmKernel,
     theta: &[f64],
@@ -337,8 +341,8 @@ fn state_c_matches_fit_vcov() {
             assert!(rel(st.tau, fit.dispersion) <= 1e-12, "τ̂ {}", st.tau);
             for a in 0..p {
                 for b in 0..p {
-                    let want = fit.vcov[a][b];
-                    let scale = (fit.vcov[a][a] * fit.vcov[b][b]).sqrt();
+                    let want = fit.vcov()[a * p + b];
+                    let scale = (fit.vcov()[a * p + a] * fit.vcov()[b * p + b]).sqrt();
                     assert!(
                         (st.c[(a, b)] - want).abs() <= 1e-12 * scale,
                         "weighted {weighted}: C[{a},{b}] {} against vcov {want}",
@@ -1011,7 +1015,7 @@ mod formula_gates {
             restore_response(&mut ws.kernel, &saved);
             let llt = SeqLlt::new(hess.as_ref()).expect("an interior fit's H is PD");
             for t in 0..p {
-                let v = fit.vcov[t][t];
+                let v = fit.vcov()[t * p + t];
                 let g: Vec<f64> = (0..n)
                     .map(|k| (c_axis[k][0][t] - c_axis[k][1][t]) / (2.0 * h[k]))
                     .collect();
@@ -1132,7 +1136,7 @@ mod formula_gates {
             let c = (f1p - 2.0 * f0 + f1m) / (h[1] * h[1]);
             let b = (fpp + fmm - f0p - f0m - f1p - f1m + 2.0 * f0) / (2.0 * h[0] * h[1]);
             for t in 0..p {
-                let v = fit.vcov[t][t];
+                let v = fit.vcov()[t * p + t];
                 let g0 = (c0p[t] - c0m[t]) / (2.0 * h[0]);
                 let g1 = (c1p[t] - c1m[t]) / (2.0 * h[1]);
                 let ghg = (c * g0 * g0 - 2.0 * b * g0 * g1 + a * g1 * g1) / (a * c - b * b);

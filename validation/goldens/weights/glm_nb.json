@@ -1,7 +1,7 @@
 {
   "dataset": "glm_nb",
-  "engine": "lme4",
-  "engine_version": "1.1.38",
+  "engine": "MASS::glm.nb",
+  "engine_version": "7.3.65",
   "family": "negbin",
   "reml": null,
   "rung": 33,

@@ -174,9 +174,9 @@ impl Pairwise {
     /// 1.
     pub fn confint(&self, level: f64) -> Result<PairwiseIntervals, FitError> {
         if !(level > 0.0 && level < 1.0) {
-            return Err(FitError::OptionValue(format!(
-                "level must be a number strictly between 0 and 1, got {level}"
-            )));
+            return Err(FitError::OptionValue(
+                format!("level must be a number strictly between 0 and 1, got {level}").into(),
+            ));
         }
         let alpha = 1.0 - level;
         let adjust = match self.adjust {
@@ -272,7 +272,7 @@ pub fn pairwise(
         model.formula(),
         model.lowered(),
         &fit.beta,
-        &fit.vcov,
+        &fit.vcov_rows(),
         fit.aliased(),
         df,
         factor,
@@ -418,9 +418,9 @@ pub(crate) fn reference_grid(
         Some(By::Values(name, _)) => return refuse(name, VALUES),
     };
     if by_name == Some(factor) {
-        return Err(Error::Fit(FitError::OptionValue(format!(
-            "by names {factor:?}, the factor compared; it must be another variable"
-        ))));
+        return Err(Error::Fit(FitError::OptionValue(
+            format!("by names {factor:?}, the factor compared; it must be another variable").into(),
+        )));
     }
     let k = factor_levels.len();
     let nb = by_labels.as_ref().map_or(1, Vec::len);

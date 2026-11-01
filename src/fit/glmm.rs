@@ -470,6 +470,14 @@ impl GlmmResultView<'_> {
     pub(crate) fn var_diag(&self) -> &[f64] {
         &self.ws.inference.var_diag
     }
+    /// Var(β̂_p − β̂_n) = V_pp + V_nn − 2·V_pn off the workspace's Cov(β̂),
+    /// which the `wald_se` arm that set `var_diag` fills on every column pair
+    /// of a fit with a covariance (NaN otherwise). The caller checks
+    /// `p_col, n_col < p`.
+    pub(crate) fn contrast_var(&self, p_col: usize, n_col: usize) -> f64 {
+        let v = &self.ws.inference.vcov;
+        v[(p_col, p_col)] + v[(n_col, n_col)] - 2.0 * v[(p_col, n_col)]
+    }
     /// This route's [`FitDiagnostics`]. θ boundary state, per-component pins
     /// and the pivot are all real. The pivot is that of the β information the
     /// SE arm factored at the final PIRLS weights, on the fitted design's
@@ -589,7 +597,7 @@ pub(crate) fn run_glmm_on<'a>(
     // outer search runs on the internal `ŵ = w/s` scale (`prep_glmm_design`),
     // so a held raw-scale `v` enters there as `v/s`.
     ws.gamma_phi_held = match model.family {
-        Family::Gamma { .. } => opts.dispersion.map(|v| v / ws.weight_scale),
+        Family::Gamma { .. } => opts.dispersion.held().map(|v| v / ws.weight_scale),
         _ => None,
     };
     // A carried Gamma φ (`StartValues::dispersion`) seeds the `ln φ`
@@ -1088,7 +1096,7 @@ pub(crate) fn glmm_view_to_fit(
         f64::NAN
     } else {
         match model.family {
-            Family::Gamma { .. } => match opts.dispersion {
+            Family::Gamma { .. } => match opts.dispersion.held() {
                 Some(v) => v,
                 None => ws.weight_scale * ws.gamma_phi,
             },
@@ -1130,11 +1138,23 @@ pub(crate) fn glmm_view_to_fit(
     };
     ws.groupings.drop_hidden(&mut stddev_se);
 
-    // `ws.inference.vcov` is filled at the same target indices as `ws.inference.var_diag` by
-    // whichever SE arm ran, and NaN elsewhere — so `Fit::vcov` is finite exactly
-    // where `Fit::se` is, on both `Hessian` and `Rx`.
-    let vcov: Vec<Vec<f64>> = (0..p)
-        .map(|i| (0..p).map(|j| ws.inference.vcov[(i, j)]).collect())
+    // `ws.inference.vcov` holds every column pair (the loop tier's contrasts
+    // read it), while `ws.inference.var_diag` is written on the targets only.
+    // Masking to the target block keeps `Fit::vcov` finite exactly where
+    // `Fit::se` is, on both `Hessian` and `Rx`.
+    let mut on = vec![false; p];
+    for &t in opts.se_for.columns(p).iter() {
+        on[t as usize] = true;
+    }
+    let vcov: Vec<f64> = (0..p * p)
+        .map(|k| {
+            let (i, j) = (k / p, k % p);
+            if on[i] && on[j] {
+                ws.inference.vcov[(i, j)]
+            } else {
+                f64::NAN
+            }
+        })
         .collect();
 
     let mu_hat = ws.pirls.prob[..n].to_vec();
@@ -1220,7 +1240,7 @@ pub(crate) fn glmm_view_to_fit(
                 model.family,
                 p,
                 ws.groupings.n_free_theta(),
-                opts.dispersion.is_some(),
+                opts.dispersion.held().is_some(),
             )
         } else {
             0

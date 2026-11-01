@@ -16,7 +16,9 @@ has a different package named `glmm`.
   a closed form, and GLMs use IRLS. Mixed models use BFGS where the engine has
   a cheap exact gradient, and BOBYQA, which needs no gradient, elsewhere.
 - **Fast.** The engine is faster than these four packages on every model in the
-  speed tests, and it uses little memory.
+  speed tests, and it uses little memory. Part of the time saved goes to extra
+  checks during a fit, which catch hard models where a search would stop too
+  early.
 
 More in the [project README](https://github.com/pawlenartowicz/glmm#readme).
 

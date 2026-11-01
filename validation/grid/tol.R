@@ -7,9 +7,9 @@ TOL <- list(
   # se_hessian 7.94e-04 (binb_cross4_g3000p20_bal_rare); the correlation, read
   # against near_zero_abs, 9.17e-04 absolute (binb_q8_g3000p5_bal_base). The house
   # rule would give 2e-03 for beta, stddev and se_hessian. They stay at 1e-3:
-  # se_rel and beta_rel also set the inference bands below (df_e2e_rel, confint_rel,
-  # wald_rel, sum_sq_rel, eta2_rel, r2_icc_rel), each measured far inside them, and
-  # tests/oracle_support/mod.rs mirrors all four.
+  # se_rel, beta_rel and stddev_rel also set the inference bands below (df_e2e_rel,
+  # confint_rel, wald_rel, sum_sq_rel, eta2_rel, r2_icc_rel, profile_ci_rel), each
+  # measured inside them, and tests/oracle_support/mod.rs mirrors all four.
   beta_rel        = 1e-3,   # fixed effects: relative.
   stddev_rel      = 1e-3,   # varcomp std-devs: relative.
   loglik_abs_lmm  = 2e-6,   # LMM REML criterion: near-exact across engines (~1e-9 typical).
@@ -454,19 +454,21 @@ TOL_INFERENCE <- list(
   # underflow) are
   # compared exactly, not under this band.
   contest_p_rel = 8e-12,
-  # contestMD's F, DenDF, p and per-direction nu_m on the same inputs and on the
-  # frozen L. The nu_m depend on the eigenvectors of L C L', whose error is about
-  # eps * d1 / gap, so every frozen L has a minimum relative eigen-gap of at
-  # least 1e-4 (about 2e-12 at that gap); rounding the inputs to 15 digits moves
-  # contestMD's DenDF by at most 7.6e-15 relative (MEASURED 2026-10-11, the same
-  # five fixtures). MEASURED (2026-10-11, pawel) by the gate over the 67 frozen
-  # cases (every REML reference with p >= 2, plus lmertest_anova_sim_factorial's
-  # basis pair): F maximum 2.36e-14 (lmertest_sim_wide_crossed, identity L);
-  # DenDF maximum 3.02e-14 (lmertest_anova_sim_factorial, basis pair, lmerTest's
-  # L); nu_m maximum 4.87e-14 (lmertest_sim_factorial, identity L, sixth nu_m);
-  # p maximum 8.14e-13 (lmertest_sim_wide_crossed, identity L). The band is set
-  # a priori, about 50x over the eigenvector error at the smallest admitted gap
-  # (2e-12 at 1e-4) and about 120x over the largest measured (p, 8.14e-13).
+  # contestMD's F, DenDF and p on the same inputs and on the frozen L, DenDF
+  # built from the per-direction nu_m. The nu_m depend on the eigenvectors of
+  # L C L', whose error is about eps * d1 / gap, so every frozen L has a minimum
+  # relative eigen-gap of at least 1e-4 (about 2e-12 at that gap); rounding the
+  # inputs to 15 digits moves contestMD's DenDF by at most 7.6e-15 relative
+  # (MEASURED 2026-10-11, the same five fixtures). MEASURED (2026-10-11, pawel)
+  # by the gate over the 67 frozen cases (every REML reference with p >= 2, plus
+  # lmertest_anova_sim_factorial's basis pair): F maximum 2.36e-14
+  # (lmertest_sim_wide_crossed, identity L); DenDF maximum 3.02e-14
+  # (lmertest_anova_sim_factorial, basis pair, lmerTest's L); p maximum 8.14e-13
+  # (lmertest_sim_wide_crossed, identity L). The nu_m behind DenDF, not compared
+  # on their own, measured at most 4.87e-14 (lmertest_sim_factorial, identity L,
+  # sixth nu_m). The band is set a priori, about 50x over the eigenvector error
+  # at the smallest admitted gap (2e-12 at 1e-4) and about 120x over the largest
+  # measured (p, 8.14e-13).
   contest_md_rel = 1e-10,
   # Gate 1 end to end (end-to-end class, registry quantity `df`, and `f` for the
   # per-term F): glmm's per-coefficient Satterthwaite df at its own theta-hat
@@ -812,7 +814,30 @@ TOL_INFERENCE <- list(
   # 13 rows left out for their tail): worst 7.55e-4
   # (posthoc_glmm_sim_factorial_bern_by, a - b within p, a z row); the t rows
   # at or below 7.46e-6 (posthoc_lmm_sim_factorial_by, b - c within p).
-  tukey_p_rel = 4e-2 + 1e-5
+  tukey_p_rel = 4e-2 + 1e-5,
+  # A bound of a profile-likelihood interval (Fit::profile_intervals) against
+  # lme4's confint(m, method = "profile") on the ML refit, hard (no registry
+  # quantity), in units of lme4's interval width, as confint_rel reads an
+  # interval. A bound is a point of the ML deviance surface, located as the
+  # estimate is, so the band is the std-dev band; lme4's interpolation of its
+  # profile by a spline adds its own error inside it. A bound lme4 puts at
+  # exactly 0 (an SD estimated at 0) must come back exactly 0. Before the
+  # bounds, the ML deviance the profiles start from: glmm's at most lme4's
+  # deviance(refitML(m)) plus DEV_EPS. The coefficient rows of an entry with
+  # beta_method "offset_refit" come from the generator's ML refits with the
+  # coefficient held through an offset and are gated the same
+  # (tests/inference_oracle.rs::profile_intervals, 4 references, 19 rows).
+  # MEASURED (2026-10-29, mac-m4, aarch64): profile_sleepstudy worst 2.80e-5
+  # (cor_Days.(Intercept)|Subject, upper); profile_penicillin 1.72e-5
+  # (sd_(Intercept)|sample, lower); profile_lmm_slope_weighted 1.31e-5
+  # (cor_x.(Intercept)|g, upper) on its lme4-profile rows and 1.15e-8 (x,
+  # lower) on its offset-refit rows; profile_dyestuff2 2.72e-4 ((Intercept),
+  # lower; the SD's lower bound 0 on both sides). That last is lme4's spline:
+  # profile(m, delta.cutoff = 1/32) moves lme4's bounds to 4.312842 and
+  # 7.018358, and the offset refits put the roots at 4.3128375 and 7.0183625,
+  # where glmm's are (4.3128375 and 7.0183625). Every other bound at or below
+  # 2.80e-5; the ML deviance gaps at most 1.8e-10.
+  profile_ci_rel = TOL$stddev_rel
 )
 
 # Max relative difference over two aligned numeric vectors; NA on length mismatch

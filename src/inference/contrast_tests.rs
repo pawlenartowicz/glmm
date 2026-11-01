@@ -386,12 +386,13 @@ fn ols_contrast_f_is_classical_f() {
     assert_eq!(got.den_df, nu);
     assert!(got.notes.is_empty());
     // (Lβ̂)ᵀ(L·C·Lᵀ)⁻¹(Lβ̂)/2 with the 2×2 inverse written out.
-    let c = &fit.vcov;
+    let c = fit.vcov();
+    let at = |i: usize, j: usize| c[i * p + j];
     let lb = [fit.beta[1], fit.beta[2] + fit.beta[3]];
     let (a, b, d) = (
-        c[1][1],
-        c[1][2] + c[1][3],
-        c[2][2] + c[3][3] + 2.0 * c[2][3],
+        at(1, 1),
+        at(1, 2) + at(1, 3),
+        at(2, 2) + at(3, 3) + 2.0 * at(2, 3),
     );
     let det = a * d - b * b;
     let want = (d * lb[0] * lb[0] - 2.0 * b * lb[0] * lb[1] + a * lb[1] * lb[1]) / det / 2.0;

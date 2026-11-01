@@ -3,6 +3,12 @@
 //! in the output are skipped, so the watchdog (run.sh) can kill and
 //! relaunch at will. Per-cell panics are caught and recorded as engine-fail —
 //! grid corners are expected to break engines; a crash is a data point.
+//!
+//! Also drives other campaigns' generated corpora (the boundary-probe
+//! measurement, `campaigns/boundary-probe/`): `GRID_MANIFEST` names their
+//! manifest and `GRID_DATA_DIR` the directory holding their CSVs (default: this
+//! campaign's `data/`). A cell's `corpus`, `nagq` and `reml` fields, where
+//! present, are honored and copied into its record.
 use std::io::Write;
 use std::time::Instant;
 
@@ -22,6 +28,8 @@ fn main() {
         .unwrap_or_else(|_| format!("{DIR}/campaigns/speed-campaign/results/glmm_shipped.jsonl"));
     let tag = std::env::var("GRID_CONFIG_TAG").unwrap_or_default();
     let only = std::env::var("GRID_ONLY").unwrap_or_default();
+    let data_dir = std::env::var("GRID_DATA_DIR")
+        .unwrap_or_else(|_| format!("{DIR}/campaigns/speed-campaign/data"));
     // One cell per process (run.sh sets this for the glmm engine only — the
     // two sites change together): a cell's wall time swung 2-10x on sub-100ms
     // cells depending on the allocator/cache state left behind by whatever
@@ -59,7 +67,7 @@ fn main() {
         if done.contains(case_id) {
             continue;
         }
-        let rec = fit_cell(cell, &tag, budget);
+        let rec = fit_cell(cell, &data_dir, &tag, budget);
         writeln!(out, "{}", serde_json::to_string(&rec).unwrap()).unwrap();
         out.flush().unwrap(); // line-per-fit flush: the watchdog watches mtime
         if one_cell {
@@ -78,7 +86,6 @@ fn main() {
 /// only for scalar (q=1) groupings — see its doc comment); LMM callers pass
 /// `false`.
 fn varcomp(f: &glmm::Fit, re_groups: &[glmm::formula::ReGroupInfo], include_se: bool) -> Value {
-    let mut theta_offset = 0usize;
     Value::Array(
         re_groups
             .iter()
@@ -93,9 +100,8 @@ fn varcomp(f: &glmm::Fit, re_groups: &[glmm::formula::ReGroupInfo], include_se: 
                     "corr": Value::Array(corr.iter().map(|row| nums(row)).collect()),
                 });
                 if include_se && q == 1 {
-                    entry["stddev_se"] = nums(&[f.stddev_se[theta_offset]]);
+                    entry["stddev_se"] = nums(&f.stddev_se(i));
                 }
-                theta_offset += q * (q + 1) / 2;
                 entry
             })
             .collect(),
@@ -137,10 +143,10 @@ fn config_tag(lo: &glmm::formula::Lowered, gaussian: bool, user_tag: &str) -> St
                         .map_or(1, |m| m as usize + 1)
                 })
                 .sum();
-            re.extra_groupings.len() > glmm::consts::MAX_EXTRA_GROUPINGS
-                || 1 + re.slopes.len() > glmm::consts::MAX_PRIMARY_Q
+            re.extra_groupings.len() > glmm::limits::MAX_EXTRA_GROUPINGS
+                || 1 + re.slopes.len() > glmm::limits::MAX_PRIMARY_Q
                 || re.extra_groupings.iter().any(|g| !g.slopes.is_empty())
-                || crossed_levels > glmm::consts::MAX_CROSSED_LEVELS
+                || crossed_levels > glmm::limits::MAX_CROSSED_LEVELS
         }
     };
     let site = match (gaussian, sparse) {
@@ -181,18 +187,27 @@ fn config_tag(lo: &glmm::formula::Lowered, gaussian: bool, user_tag: &str) -> St
 /// records which case applied (`min_of_2`, `single`, `warmup`) and `n_reps`
 /// (0, 1 or 2) the number of *timed* fits that contributed. run.sh owns the
 /// budget number and passes it via `GRID_CELL_BUDGET` — change together.
-fn fit_cell(cell: &Value, user_tag: &str, budget: f64) -> Value {
+fn fit_cell(cell: &Value, data_dir: &str, user_tag: &str, budget: f64) -> Value {
     let case_id = cell["case_id"].as_str().unwrap().to_string();
     let seed = cell["seed"].as_i64().unwrap_or(0);
     let mut rec = json!({
         "case_id": case_id, "seed": seed, "engine": "glmm",
         "optimizer": "bobyqa",
     });
+    // Copied through when the manifest carries them: a multi-corpus manifest
+    // groups its records by `corpus`, and `nagq` tells an AGQ fit from its
+    // Laplace twin on the same site.
+    for key in ["corpus", "nagq"] {
+        if !cell[key].is_null() {
+            rec[key] = cell[key].clone();
+        }
+    }
     // Lower first (own catch_unwind: a lowering panic is engine-fail with no
     // site to report), so config_tag can read the lowered relations/ids.
     let t_lower = Instant::now();
-    let lowered =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lower_grid_cell(cell, DIR)));
+    let lowered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        lower_grid_cell(cell, data_dir)
+    }));
     let lower_seconds = t_lower.elapsed().as_secs_f64();
     // Diligent manifests stamp `nagq` on the 33 AGQ-eligible cells (spec Part 6);
     // absent on every other cell (shipped/eval-efficiency manifests included),
@@ -200,6 +215,11 @@ fn fit_cell(cell: &Value, user_tag: &str, budget: f64) -> Value {
     let mut fit_opts = FitOptions::default();
     if let Some(k) = cell["nagq"].as_u64() {
         fit_opts.nagq = k as u8;
+    }
+    // The estimator of a Gaussian mixed cell: `reml: false` is its ML fit.
+    // `true` is the default's REML, and every other family ignores it.
+    if let Some(r) = cell["reml"].as_bool() {
+        fit_opts.reml = Some(r);
     }
     let (result, wall_seconds): (Option<glmm::Fit>, f64) = match &lowered {
         Ok((lo, gaussian, _)) => {
@@ -241,7 +261,8 @@ fn fit_cell(cell: &Value, user_tag: &str, budget: f64) -> Value {
                         // Determinism QA — identical work per rep is what makes
                         // min-of-2 honest; flag drift rather than silently
                         // taking the min over disagreeing fits.
-                        if fa.deviance.to_bits() != fb.deviance.to_bits() || fa.n_eval != fb.n_eval
+                        if fa.deviance().to_bits() != fb.deviance().to_bits()
+                            || fa.n_eval() != fb.n_eval()
                         {
                             rec["rep_mismatch"] = json!(true);
                         }
@@ -272,15 +293,15 @@ fn fit_cell(cell: &Value, user_tag: &str, budget: f64) -> Value {
     match result {
         Some(f) => {
             let max_fun = lowered.as_ref().map(|(_, _, m)| *m).unwrap_or(0);
-            let maxeval = !f.converged() && f.n_eval >= max_fun;
-            rec["n_eval"] = json!(f.n_eval);
+            let maxeval = !f.converged() && f.n_eval() >= max_fun;
+            rec["n_eval"] = json!(f.n_eval());
             // Optimizer counters. Present only under the `counters`
             // feature; every other pass of this campaign writes no such field,
             // so analyze.R must treat them as optional.
             #[cfg(feature = "counters")]
             {
                 use glmm::Stage;
-                let c = f.counters;
+                let c = f.counters();
                 rec["stage1_evals"] = json!(c.stage_evals[0]);
                 rec["stage2_evals"] = json!(c.stage_evals[1]);
                 rec["stage1_shrink_evals"] = json!(c.evals_after_last_improve(Stage::One));
@@ -290,17 +311,21 @@ fn fit_cell(cell: &Value, user_tag: &str, budget: f64) -> Value {
                 rec["agq_node_evals"] = json!(c.agq_node_evals);
                 rec["nb_nodes"] = json!(c.nb_nodes);
                 rec["nb_evals_total"] = json!(c.nb_evals_total);
+                rec["post_pin_searches"] = json!(c.post_pin_searches);
             }
             rec["converged"] = json!(f.converged());
             rec["singular"] = json!(f.singular());
-            rec["deviance"] = num(f.deviance);
+            // Which variance components were pinned at the boundary, per
+            // grouping and dimension in `varcomp` order; `[]` when none was.
+            rec["pinned"] = json!(f.diagnostics().pinned);
+            rec["deviance"] = num(f.deviance());
             // The NB marginal log-likelihood (saturated term restored at θ̂) and θ̂
             // itself: the deviance alone is not comparable across fits that land
             // on different θ̂_NB.
-            rec["loglik"] = num(f.loglik);
-            rec["dispersion"] = num(f.dispersion);
-            rec["beta"] = nums(&f.beta);
-            rec["se"] = nums(&f.se);
+            rec["loglik"] = num(f.loglik());
+            rec["dispersion"] = num(f.dispersion());
+            rec["beta"] = nums(f.beta());
+            rec["se"] = nums(f.se());
             // theta hat (diligent-run recording, spec Part 6): reduced to
             // stddev+corr per grouping via `Fit::stddev_corr`, mirroring
             // `grid/engines/glmm.rs::varcomp`/R's `varcomp_of` schema so the three
@@ -324,6 +349,7 @@ fn fit_cell(cell: &Value, user_tag: &str, budget: f64) -> Value {
             rec["n_eval"] = json!(0);
             rec["converged"] = json!(false);
             rec["singular"] = json!(false);
+            rec["pinned"] = json!([]);
             rec["deviance"] = Value::Null;
             rec["beta"] = json!([]);
             rec["se"] = json!([]);

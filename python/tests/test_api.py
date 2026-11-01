@@ -14,7 +14,8 @@ import glmm
 def test_module_surface():
     # `fit`, `Fit`, `icc`, `model_matrix`, `term_labels`, the tests of
     # `glmm.anova` (`anova`, `compare` and their three result classes),
-    # `pairwise` and its `PairwiseTable`, and the twenty-seven
+    # `pairwise` and its `PairwiseTable`, `Fit.profile_confint`'s
+    # `ProfileTable`, and the twenty-seven
     # warning categories the diagnostics channel raises; a user has to be able
     # to name them to filter on them.
     assert glmm.__all__ == [
@@ -40,6 +41,7 @@ def test_module_surface():
         "PairwiseTable",
         "PirlsExhaustedWarning",
         "PrecisionLimitedWarning",
+        "ProfileTable",
         "RowsDroppedWarning",
         "SatterthwaiteCurvatureWarning",
         "SeUnavailableWarning",
@@ -305,6 +307,68 @@ def test_a_fit_stored_by_0_6_x_prints_its_summary_and_refuses_r2_and_icc():
     o.__dict__.update({k: v for k, v in m.__dict__.items() if k != "_kernel_parts"})
     old = pickle.loads(pickle.dumps(o))
     assert old.summary_object().text() == m.summary_object().text().replace(_r2_line(m) + "\n", "")
-    for method in (old.r2, old.icc):
-        with pytest.raises(ValueError, match=r"pairwise, r2 and icc read\. Refit"):
+    for method in (old.r2, old.icc, old.profile_confint):
+        with pytest.raises(ValueError, match=r"pairwise, r2, icc and profile_confint read\. Refit"):
             method()
+
+
+# Profile-likelihood intervals: the crate computes them; these tests check
+# the names, shapes and notes the port gives them.
+_PROFILE_ROWS = [
+    "sd_(Intercept)|Subject",
+    "cor_Days.(Intercept)|Subject",
+    "sd_Days|Subject",
+    "sigma",
+    "(Intercept)",
+    "Days",
+]
+_ML_NOTE = "Profile intervals on the ML fit."
+_REML_NOTE = "Profile intervals on the ML fit; the REML fit was refitted by ML."
+
+
+def test_profile_confint_names_lme4s_rows():
+    m = _sleep_fit("Reaction ~ Days + (Days | Subject)")
+    assert m.reml
+    t = m.profile_confint()
+    assert isinstance(t, glmm.ProfileTable)
+    assert t.row_names == _PROFILE_ROWS
+    assert t.columns == ["estimate", "lower", "upper"]
+    assert t.level == 0.95
+    assert np.all(t["lower"] < t["estimate"]) and np.all(t["estimate"] < t["upper"])
+    assert t.notes == [_REML_NOTE]
+    text = t.text()
+    assert all(name in text for name in _PROFILE_ROWS) and _REML_NOTE in text
+    for render in (t.html(), t.latex(), t.typst()):
+        assert "sigma" in render and "estimate" in render
+
+    beta = m.profile_confint(parm="beta_")
+    assert beta.row_names == ["(Intercept)", "Days"]
+    np.testing.assert_allclose(beta["lower"], t["lower"][4:], rtol=1e-10)
+    theta = m.profile_confint(parm=["theta_"])
+    assert theta.row_names == _PROFILE_ROWS[:4]
+
+    s = m.profile_confint(level=0.9, parm="sigma")
+    assert s.row_names == ["sigma"] and s.level == 0.9
+    assert t["lower"][3] < s["lower"][0] < s["upper"][0] < t["upper"][3]
+
+
+def test_profile_confint_of_an_ml_fit_has_no_refit_note():
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        m = glmm.fit(SLEEP, "Reaction ~ Days + (Days | Subject)", reml=False)
+    assert m.profile_confint(parm="sigma").notes == [_ML_NOTE]
+
+
+def test_profile_confint_refuses_what_it_cannot_profile():
+    m = _sleep_fit("Reaction ~ Days + (Days | Subject)")
+    with pytest.raises(ValueError, match=r'"nope".*"sd_Days\|Subject"'):
+        m.profile_confint(parm="nope")
+    with pytest.raises(ValueError, match="level must be a number strictly between 0 and 1"):
+        m.profile_confint(level=1.0)
+    with pytest.raises(TypeError, match="parm must be None, a name or a list of names"):
+        m.profile_confint(parm=3)
+    poisson = glmm.fit(REML_DATA, "yc ~ x + (1 | g)", "poisson")
+    with pytest.raises(
+        ValueError, match="profile intervals need a Gaussian model with random effects"
+    ):
+        poisson.profile_confint()

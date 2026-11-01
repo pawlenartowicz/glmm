@@ -1,6 +1,7 @@
 # Hypothesis tests: `anova()`, `compare()` and `pairwise()`
 
-Four calls test hypotheses about a fitted model, in both ports:
+Five calls test hypotheses about a fitted model, or invert a test into
+intervals, in both ports:
 
 | Call | R | Python | Takes | Refits? |
 |---|---|---|---|---|
@@ -8,6 +9,7 @@ Four calls test hypotheses about a fitted model, in both ports:
 | two fits compared | `anova(m0, m1)` | `glmm.anova(m0, m1)` | two existing fits | no, and reads no data |
 | two formulas compared | `compare(data, f0, f1)` | `glmm.compare(data, f0, f1)` | one data set, two formulas | fits both models itself |
 | pairwise comparisons of a factor's levels | `pairwise(m, "f")` | `glmm.pairwise(m, "f")` | one fit | no: reads the fit's numbers and its rows |
+| profile-likelihood intervals | `confint(m, method = "profile")` | `m.profile_confint()` | one Gaussian mixed fit | yes: one ML fit, then a search per point of each profile |
 
 The Rust crate computes every statistic and every p-value; the two ports only
 lay the numbers out, with R's column names, so both give the same tables. A
@@ -351,6 +353,90 @@ table's adjustment, as emmeans' `confint()` does: Bonferroni and Tukey
 intervals hold for a whole group at once. Holm has no simultaneous interval,
 so a Holm table gets Bonferroni intervals, and the notes say "Holm has no
 simultaneous interval; Bonferroni intervals shown."
+
+## Profile-likelihood intervals
+
+`confint(m, method = "profile")` (Python `m.profile_confint()`) gives lme4's
+`confint(method = "profile")` on a Gaussian mixed model: an interval for each
+random-effect SD and correlation, the residual SD and each coefficient. Each
+parameter is held at points on either side of its estimate while the others are
+re-optimized, and a bound is where the signed square root of the deviance
+change, `ζ`, reaches `±z`, `z = Φ⁻¹((1 + level)/2)`. The interval inverts the
+likelihood-ratio test of the parameter, so unlike a Wald interval it can be
+asymmetric, and it stays inside a variance parameter's range.
+
+```r
+confint(m, method = "profile")                    # every row
+confint(m, parm = "theta_", method = "profile")   # SDs, correlations, sigma
+confint(m, parm = c("sigma", "Days"), level = 0.9, method = "profile")
+```
+
+```python
+m.profile_confint()                     # a ProfileTable; prints as text
+m.profile_confint(parm="beta_")         # the coefficients
+m.profile_confint(level=0.9, parm=["sigma", "Days"])
+```
+
+On sleepstudy, `Reaction ~ Days + (Days | Subject)` fitted by REML:
+
+```
+Profile-likelihood confidence intervals, level 0.95
+                             estimate   lower upper
+sd_(Intercept)|Subject          23.78   14.38 37.72
+cor_Days.(Intercept)|Subject  0.08132 -0.4815 0.685
+sd_Days|Subject                 5.717   3.801 8.753
+sigma                           25.59    22.9 28.86
+(Intercept)                     251.4   237.7 265.1
+Days                            10.47   7.359 13.58
+Profile intervals on the ML fit; the REML fit was refitted by ML.
+```
+
+What the rows are:
+
+- **The ML deviance, always.** A REML fit is refitted by ML first, as lme4
+  does, and every interval is read off the ML deviance; Python's `estimate`
+  column holds the ML estimates, so on a REML fit it differs from `fit.beta`
+  and `fit.varcorr`. R returns the bounds only, as lme4.
+- **lme4's names.** `sd_<term>|<group>`, `cor_<term>.<term>|<group>`, `sigma`,
+  then the coefficient names: lme4's `signames = FALSE` names. `parm` takes
+  these names and lme4's shortcuts `"theta_"` (the SDs, correlations and
+  `sigma`) and `"beta_"` (the coefficients). The variance rows come grouping
+  by grouping, and within a grouping each SD is followed by its correlations
+  with the later columns; lme4 2.0 lists every SD before the correlations, so
+  compare the two by row name.
+- **Limits.** An SD lives in `[0, ∞)` and a correlation in `[−1, 1]`. An SD
+  estimated at 0 has 0 as its lower bound, and a correlation whose profile
+  stays inside the cutoff all the way to −1 or 1 has that limit as its bound.
+  Such a one-sided interval keeps the two-sided cutoff `z`, as lme4 does. A
+  correlation next to an SD estimated at 0 is not identified, and its row is
+  NaN (R: `NA`).
+- **An undetermined bound** is NaN (R: `NA`): a side whose profile never
+  reaches the cutoff, or whose held search does not converge. Python's notes
+  name each one.
+- **Roots, not a spline.** Each bound is found by a root search on the profile
+  itself, to `|ζ| − z` within `1e-6`; lme4 interpolates a spline through a grid
+  of profile points. On the four frozen lme4 references (sleepstudy,
+  Penicillin, Dyestuff2 and a weighted random-slope model) every bound is
+  within 1e-3 of lme4's interval width, at most 2.7e-4, on Dyestuff2's
+  intercept, where the gap is lme4's spline error: direct ML refits agree
+  with glmm there to 1.4e-8 of the width, and a finer lme4 profile
+  (`delta.cutoff = 1/32`) to about 1.6e-6.
+- **Prior weights.** On the weighted reference lme4 2.0-6 profiles the slope
+  wrongly: it warns, and its interval, `[0.823, 0.849]`, is far narrower than
+  the Wald interval `[0.539, 1.111]`. That reference therefore holds each
+  coefficient through ML refits in lme4 with the coefficient moved into the
+  offset (`[0.528, 1.125]` for the slope).
+
+Profiling costs far more than a Wald interval: each bound takes a series of
+held searches, each a minimization over the variance parameters. Pass `parm`
+to profile only the rows you need.
+
+Refused, with the reason: a GLMM, OLS or a GLM ("profile intervals need a
+Gaussian model with random effects"), a fit with an aliased coefficient, and a
+`parm` name the model does not have (the message lists the valid names). A
+held search that finds a deviance below the ML fit's means the fit was not at
+its optimum; that is an error too, as lme4 stops with "profiling detected new,
+lower deviance".
 
 ## Comparing two models
 
@@ -787,6 +873,9 @@ full texts are in [`warnings.md`](warnings.md#test-and-comparison-errors).
 | `test` with two fits | leave it out: a comparison's test follows from the two models |
 | three or more fits or formulas | compare two at a time |
 | a fit object made by a version without these tests | refit the model |
+| profile intervals of a GLMM, OLS or a GLM | none: profile intervals cover Gaussian mixed models; use the Wald intervals of `confint(m)` |
+| profile intervals of a fit with an aliased coefficient | drop the aliased column from the formula and refit |
+| a profile `parm` name the model does not have | pass a name from the message's list, `"theta_"` or `"beta_"` |
 | `nsim` outside 1 to 1,000,000, or `seed` outside its port's range | pass a whole number in range, or leave them at their defaults |
 
 ## The notes a table can carry
@@ -823,8 +912,8 @@ The comparison surface lives in `glmm::formula::anova` (feature `formula`):
 `nesting(f0, f1)` (the formula check), `compare(&formula::Model,
 &formula::Model, &CompareOptions)` (two models from `formula::fit`),
 `compare_stored(&anova::Model, &anova::Model, &CompareOptions)` (two fits kept
-as plain numbers), and `term_tests(&formula::Model, &TermTestOptions)` (the
-per-term table). They return `Comparison` (with
+as plain numbers; with feature `orchestrate`, which the ports build with), and
+`term_tests(&formula::Model, &TermTestOptions)` (the per-term table). They return `Comparison` (with
 `ComparisonTest::{Lr(LrTest), Linear(LinearTest)}`) and `TermTable`, whose
 statistics and references are the `glmm::inference` types `LrTest`,
 `LinearTest`, `Reference` and `Objective`. `Fit::nobs` and `Fit::objective`
@@ -838,7 +927,9 @@ which test ran and why (`ChoiceReason`); `run_fit`'s `anova_test` (`"auto"`,
 `term_table_type2_lrt` are built, and `FitResult::term_test_auto` records
 what `"auto"` gives. `FixedRow::eta2_partial()` gives a row's partial η²
 (NaN on a row with no F), and `orchestrate::TermColumns::eta2_partial` holds
-it per row. None of these is under the semver promise before 1.0.
+it per row. `nesting`, `compare`, `term_tests` and their types are under the
+semver promise; `compare_stored`, `anova::Model` and the `orchestrate` items
+are not.
 
 The pairwise comparisons are `glmm::formula::pairwise(&model, factor, by,
 adjust)`, with `by` `None`, `Some(By::Levels(name))` or `Some(By::Values(name,
@@ -846,6 +937,16 @@ adjust)`, with `by` `None`, `Some(By::Levels(name))` or `Some(By::Values(name,
 `Pairwise` of `PairwiseRow`s, and `Pairwise::confint(level)` its
 `PairwiseIntervals`. The ports reach it through `orchestrate::pairwise` and
 `orchestrate::pairwise_confint`.
+
+The profile-likelihood intervals are `Fit::profile_intervals(&data, &spec,
+level, which)`, on the fit's own data and spec, with `which` `None` for every
+parameter or a slice of `glmm::inference::ProfileParam`
+(`Sd { group, term }`, `Cor { group, row, col }`, `Sigma`, `Beta(j)`). It
+returns `ProfileIntervals { level, deviance, rows }`, one `ProfileInterval {
+param, estimate, lower, upper }` per row, or a `ProfileError`: `Fit` wrapping
+the `FitError` of a refused request, `NotConverged`, or `BetterOptimum`. The
+ports reach it through `orchestrate::profile_intervals`, which names the rows
+with `orchestrate::profile_names`.
 
 ## References
 

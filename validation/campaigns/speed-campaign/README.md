@@ -87,6 +87,7 @@ The lme4 pass only fits the cells named in a file passed through `GRID_TODO`
 ## Environment variables
 
 - `GRID_MANIFEST` — path to the manifest to run. Default: `manifest.json` next to `run.sh`.
+- `GRID_DATA_DIR`: `fit.rs` only. Directory holding the cell CSVs. Default: `data/` next to `run.sh`; another campaign's generated corpus (`../boundary-probe/`) points it at its own data.
 - `GRID_OUT` — path of the output JSONL file. Default (from `run.sh`): `results/<engine>_<tag>.jsonl`; each fit script also has its own fallback path if run outside `run.sh`.
 - `GRID_CONFIG_TAG` — the tag written into each record's `config_tag` field. Default: the pass tag (`run.sh` sets it), or empty string if a fit script is run standalone.
 - `GRID_ONLY` — comma-separated `case_id` list to restrict the run to. Default: empty, meaning every cell in the manifest.
@@ -106,14 +107,19 @@ start time).
 
 Fields `fit.rs` writes per record: `case_id`, `seed`, `engine`, `optimizer`,
 `config_tag`, `n_reps`, `wall_source` (`"warmup"`, `"single"`, or
-`"min_of_2"`), `n_eval`, `converged`, `singular`, `deviance`, `loglik`,
-`dispersion`, `beta`, `se`, `varcomp`, `status`, `lower_seconds`,
-`wall_seconds`, and an optional `rep_mismatch` flag when two timed fits of
-the same cell disagree.
+`"min_of_2"`), `n_eval`, `converged`, `singular`, `pinned` (per grouping and
+dimension, in `varcomp` order; `[]` when nothing was pinned), `deviance`,
+`loglik`, `dispersion`, `beta`, `se`, `varcomp`, `status`, `lower_seconds`,
+`wall_seconds`, an optional `rep_mismatch` flag when two timed fits of the
+same cell disagree, and the cell's `corpus` and `nagq` when the manifest
+carries them. A cell's optional `data` field names its CSV when several cells
+share one (default: the `case_id`), and its `reml` field sets the estimator of
+a Gaussian mixed cell.
 
 Under the `counters` feature (`GRID_COUNTERS`), each record also carries
 `stage1_evals`, `stage2_evals`, `stage1_shrink_evals`, `stage2_shrink_evals`,
-`pirls_hist`, `agq_evals`, `agq_node_evals`, `nb_nodes`, `nb_evals_total`.
+`pirls_hist`, `agq_evals`, `agq_node_evals`, `nb_nodes`, `nb_evals_total`,
+`post_pin_searches`.
 
 A cell that times out or whose launch fails twice with no output gets a
 smaller stub record written by `run.sh` itself: `case_id`, `seed`, `engine`,

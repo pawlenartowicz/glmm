@@ -1,0 +1,96 @@
+{
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_profile.R",
+    "note": "beta rows by ML offset refits, not lme4's profile: lme4 2.0.6's fixed-effect profile on a prior-weighted LMM warns (non-monotonic profile) and comes out about 20x narrower than Wald"
+  },
+  "level": 0.95,
+  "deviance": 746.769280165508,
+  "rows": [
+    {
+      "parameter": "sd_(Intercept)|g",
+      "kind": "sd",
+      "group": "g",
+      "term": "(Intercept)",
+      "term2": null,
+      "estimate": 1.11306272980311,
+      "lower": 0.848690892059127,
+      "upper": 1.5340416492758,
+      "method": "lme4_profile"
+    },
+    {
+      "parameter": "sd_x|g",
+      "kind": "sd",
+      "group": "g",
+      "term": "x",
+      "term2": null,
+      "estimate": 0.670314787945563,
+      "lower": 0.491855439096507,
+      "upper": 0.948234076035366,
+      "method": "lme4_profile"
+    },
+    {
+      "parameter": "cor_x.(Intercept)|g",
+      "kind": "cor",
+      "group": "g",
+      "term": "(Intercept)",
+      "term2": "x",
+      "estimate": 0.34210446282656,
+      "lower": -0.0777636948503317,
+      "upper": 0.659085672679797,
+      "method": "lme4_profile"
+    },
+    {
+      "parameter": "sigma",
+      "kind": "sigma",
+      "group": null,
+      "term": null,
+      "term2": null,
+      "estimate": 0.690071586232906,
+      "lower": 0.632750549043108,
+      "upper": 0.756573850294513,
+      "method": "lme4_profile"
+    },
+    {
+      "parameter": "(Intercept)",
+      "kind": "beta",
+      "group": null,
+      "term": "(Intercept)",
+      "term2": null,
+      "estimate": 1.41519899609109,
+      "lower": 0.943575902636297,
+      "upper": 1.88779903338131,
+      "method": "offset_refit"
+    },
+    {
+      "parameter": "x",
+      "kind": "beta",
+      "group": null,
+      "term": "x",
+      "term2": null,
+      "estimate": 0.824674497914863,
+      "lower": 0.528151298969431,
+      "upper": 1.12517559343601,
+      "method": "offset_refit"
+    }
+  ],
+  "name": "profile_lmm_slope_weighted"
+}

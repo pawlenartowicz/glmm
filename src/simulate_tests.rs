@@ -206,7 +206,11 @@ fn a_non_integer_trial_count_is_refused() {
     w[3] = 2.5;
     let design = lo.design().weights(&w);
     match Simulator::new(&fit, lo.spec(), &design) {
-        Err(FitError::Weights(m)) => assert!(m.contains("row 3"), "{m}"),
+        Err(FitError::Weights(m)) => {
+            assert!(m.contains("row 3"), "{m}");
+            assert_eq!(m.row(), Some(3));
+            assert!(m.text_with_row(8).ends_with("(row 8 has 2.5)"), "{m}");
+        }
         other => panic!("accepted or another error: {:?}", other.err()),
     }
 }

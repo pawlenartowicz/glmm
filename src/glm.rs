@@ -69,7 +69,9 @@ use faer::linalg::matmul::{matmul, triangular};
 use faer::reborrow::{IntoConst, Reborrow, ReborrowMut};
 use faer::{Accum, MatMut, MatRef, Par};
 
-use crate::ols::{nan_fill_ols_scratch, triangular_solve_norm_sq};
+use crate::ols::{
+    contrast_t_sq_of, nan_fill_ols_scratch, pair_contrast_norm_sq, triangular_solve_norm_sq,
+};
 use crate::spec::{BinomialLink, Family};
 use crate::standardize::ColumnScaling;
 
@@ -298,13 +300,13 @@ pub struct GlmScratch<'w> {
 // ---------------------------------------------------------------------------
 
 /// Numerically stable sigmoid: branches on the sign of `eta` so `exp` never
-/// overflows and the ratio avoids cancellation. Production paths now compute `p`
-/// in the vectorized `simd_transcendental`
-/// kernels (fit: `pw_and_log1pexp_sum`; generation: `sigmoid_fill`, ≤2 ULP of this
-/// form); this stays as the libm reference for tests.
-#[cfg_attr(not(test), allow(dead_code))]
+/// overflows and the ratio avoids cancellation. The logit IRLS and PIRLS rows
+/// compute `p` in the vectorized `simd_transcendental` kernels
+/// (`pw_and_log1pexp_sum`, ≤2 ULP of this form); this libm form is the `f64`
+/// and dual-number `sigmoid` of the generic `Scalar` paths and the tests'
+/// reference.
 #[inline]
-pub fn sigmoid_stable(eta: f64) -> f64 {
+pub(crate) fn sigmoid_stable(eta: f64) -> f64 {
     if eta >= 0.0 {
         let z = (-eta).exp();
         1.0 / (1.0 + z)
@@ -450,6 +452,45 @@ pub fn glm_irls_fit<'a>(
         scratch,
         ColumnScaling::IDENTITY,
     )
+}
+
+/// Wald z² of the pairwise contrast `β_p − β_n` on a [`glm_irls_fit`] view,
+/// the GLM twin of `ols_contrast_t_sq`:
+///
+/// ```text
+/// c = e_p − e_n,   L · u = c,   var(β_p − β_n) = ‖u‖²,   z² = (β̂_p − β̂_n)² / var
+/// ```
+///
+/// with `L` the view's factor `l` of `X'WX`. The variance is on the view's own
+/// `var_diag` scale, φ = 1: on Gamma and inverse-Gaussian, whose dispersion
+/// the kernel does not estimate, a caller multiplies the variance by φ̂, that
+/// is, divides the returned value by φ̂.
+///
+/// Returns `NaN` when the fit did not converge, under `se_unavailable`, when
+/// an index is ≥ p or the two are equal, when `scratch` is shorter than p, or
+/// when the variance is not finite and positive.
+///
+/// Valid only on a view fitted without a column map ([`glm_irls_fit`]): it
+/// reads `betas` and `l` as the caller's own coefficients and information.
+///
+/// `scratch` must be length ≥ `p`; it is overwritten and not read on output.
+pub fn glm_contrast_t_sq(fit: &GlmFitView<'_>, p_col: u32, n_col: u32, scratch: &mut [f64]) -> f64 {
+    if !fit.converged || fit.se_unavailable {
+        return f64::NAN;
+    }
+    let var = pair_contrast_norm_sq(
+        fit.l,
+        ColumnScaling::IDENTITY,
+        fit.betas.len(),
+        p_col,
+        n_col,
+        scratch,
+    );
+    // NaN here also covers the index and scratch checks, before `betas` is read.
+    if var.is_nan() {
+        return f64::NAN;
+    }
+    contrast_t_sq_of(fit.betas[p_col as usize] - fit.betas[n_col as usize], var)
 }
 
 /// [`glm_irls_fit`] on a design fitted through a column map `B`
@@ -2458,5 +2499,67 @@ mod tests {
                 fit.deviance
             );
         }
+    }
+
+    /// `glm_contrast_t_sq` on a hand-built view: `l` is the factor of
+    /// `X'WX = [[4, 6], [6, 14]]`, whose inverse is `[[0.7, −0.3], [−0.3, 0.2]]`,
+    /// so c = e₁ − e₀ has `cᵀ(X'WX)⁻¹c = 1.5` and t² = (2.2 − 0.7)²/1.5 = 1.5.
+    /// The swapped pair is exact (the forward solve of −c is the negation of
+    /// that of c); `se_unavailable`, a non-converged fit, a zero contrast, an
+    /// index out of range and a short scratch each give NaN.
+    #[test]
+    fn glm_contrast_t_sq_hand_value() {
+        let mut l = Mat::<f64>::zeros(2, 2);
+        l[(0, 0)] = 2.0;
+        l[(1, 0)] = 3.0;
+        l[(1, 1)] = 5.0_f64.sqrt();
+        let betas = [0.7_f64, 2.2];
+        let var_diag = [0.0_f64; 2];
+        let t_sq = [0.0_f64; 2];
+        let mu = [0.0_f64; 1];
+        let view = GlmFitView {
+            betas: &betas,
+            var_diag: &var_diag,
+            t_sq: &t_sq,
+            l: l.as_ref(),
+            n_iter: 3,
+            converged: true,
+            separated: false,
+            deviance: 0.0,
+            deviance_null: 0.0,
+            mu: &mu,
+            pivot: 1.0,
+            pivot_col: 0,
+            se_unavailable: false,
+        };
+        let mut s = [0.0_f64; 2];
+        assert!((glm_contrast_t_sq(&view, 1, 0, &mut s) - 1.5).abs() < 1e-12);
+        assert_eq!(
+            glm_contrast_t_sq(&view, 1, 0, &mut s).to_bits(),
+            glm_contrast_t_sq(&view, 0, 1, &mut s).to_bits()
+        );
+        assert!(glm_contrast_t_sq(
+            &GlmFitView {
+                se_unavailable: true,
+                ..view
+            },
+            1,
+            0,
+            &mut s
+        )
+        .is_nan());
+        assert!(glm_contrast_t_sq(
+            &GlmFitView {
+                converged: false,
+                ..view
+            },
+            1,
+            0,
+            &mut s
+        )
+        .is_nan());
+        assert!(glm_contrast_t_sq(&view, 1, 1, &mut s).is_nan());
+        assert!(glm_contrast_t_sq(&view, 2, 0, &mut s).is_nan());
+        assert!(glm_contrast_t_sq(&view, 1, 0, &mut [0.0; 1]).is_nan());
     }
 }

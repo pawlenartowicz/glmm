@@ -7,6 +7,8 @@
 
 use std::fmt;
 
+use crate::ErrorMessage;
+
 /// Parse-stage (data-free) failures. Variants and Display strings are a fixed
 /// contract (change together with `parse.rs`, which produces them).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14,7 +16,10 @@ pub enum ParseError {
     /// The formula (or its RHS) is empty.
     EmptyFormula,
     /// A token on the RHS is not a valid identifier, or a term is malformed
-    /// (see [`parse`](super::parse())'s Errors list).
+    /// (for example a trailing `+`, a `^` power that is not an integer of 2
+    /// or more, unbalanced or empty parentheses, a random-effect term that
+    /// both writes and removes its intercept, or a grouping of three or more
+    /// factors).
     Syntax {
         /// 0-based position of the offending token in the formula string.
         pos: usize,
@@ -93,8 +98,9 @@ pub enum Error {
         /// factor's dummy column.
         column: String,
     },
-    /// [`super::label_ranef`] was handed a `Fit` and a `re_groups` that do not
-    /// describe the same model. The payload says which count disagreed.
+    /// The modes of a `Fit` were labelled ([`super::Model::ranef`]) with a
+    /// `re_groups` that does not describe the same model. The payload says
+    /// which count disagreed.
     RanefShapeMismatch(String),
     /// The formula removes the intercept and names no fixed-effect term, so the
     /// design would have zero columns.
@@ -162,21 +168,59 @@ impl fmt::Display for Error {
                 f,
                 "the fixed design has no columns: '- 1' / '0 +' with no fixed-effect term"
             ),
-            Error::TransformNotFinite { term, row } => {
-                write!(f, "term '{term}' is not finite at row {row}")
-            }
+            Error::TransformNotFinite { .. }
+            | Error::ZeroTrials { .. }
+            | Error::NegativeCount { .. } => f.write_str(&self.message()),
             Error::CbindNeedsBinomial => {
                 write!(f, "cbind(successes, failures) needs family = binomial")
             }
-            Error::ZeroTrials { row } => write!(
-                f,
-                "cbind(): successes + failures must be positive and finite at every row; row {row} is not"
-            ),
-            Error::NegativeCount { row } => write!(
-                f,
-                "cbind(): successes and failures must be non-negative at every row; row {row} is not"
-            ),
             Error::Fit(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl Error {
+    /// The 0-based row of the data the error names: the row of
+    /// [`Error::TransformNotFinite`], [`Error::ZeroTrials`] and
+    /// [`Error::NegativeCount`], and [`crate::FitError::row`] of
+    /// [`Error::Fit`]; `None` for the others.
+    pub fn row(&self) -> Option<usize> {
+        match self {
+            Error::TransformNotFinite { row, .. }
+            | Error::ZeroTrials { row }
+            | Error::NegativeCount { row } => Some(*row),
+            Error::Fit(e) => e.row(),
+            _ => None,
+        }
+    }
+
+    /// The [`Display`](fmt::Display) text with `shown` in place of the row's
+    /// number ([`crate::ErrorMessage::text_with_row`]); the text as it is when
+    /// the error names no row.
+    pub fn to_string_with_row(&self, shown: usize) -> String {
+        self.message().text_with_row(shown)
+    }
+
+    /// The text as an [`ErrorMessage`], which knows where its row is.
+    pub(crate) fn message(&self) -> ErrorMessage {
+        match self {
+            Error::TransformNotFinite { term, row } => {
+                ErrorMessage::at_row(format!("term '{term}' is not finite at row "), *row, "")
+            }
+            Error::ZeroTrials { row } => ErrorMessage::at_row(
+                "cbind(): successes + failures must be positive and finite at every row; row "
+                    .to_string(),
+                *row,
+                " is not",
+            ),
+            Error::NegativeCount { row } => ErrorMessage::at_row(
+                "cbind(): successes and failures must be non-negative at every row; row "
+                    .to_string(),
+                *row,
+                " is not",
+            ),
+            Error::Fit(e) => e.message().clone(),
+            other => other.to_string().into(),
         }
     }
 }

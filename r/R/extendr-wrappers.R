@@ -18,10 +18,12 @@ NULL
 #' `reml` (`logical(0)` is `None`, one `TRUE`/`FALSE` is `Some`).
 #' `vcov` crosses flattened row-major with `names` carrying p; the R wrapper
 #' rebuilds the p x p matrix (it is symmetric, so the order is moot).
+#' `row_index` is each passed row's 1-based position in the caller's data,
+#' so an error names the caller's row (`port_error`).
 #'
 #' @usage NULL
 #' @keywords internal
-fastglmm_fit <- function(formula, numeric, factor_levels, factor_codes, family, link, wald_se, nagq, dispersion, weights, offset, start_beta, start_theta, start_dispersion, satterthwaite, condvar, reml, anova_test) .Call(wrap__fastglmm_fit, formula, numeric, factor_levels, factor_codes, family, link, wald_se, nagq, dispersion, weights, offset, start_beta, start_theta, start_dispersion, satterthwaite, condvar, reml, anova_test)
+fastglmm_fit <- function(formula, numeric, factor_levels, factor_codes, family, link, wald_se, nagq, dispersion, weights, offset, start_beta, start_theta, start_dispersion, satterthwaite, condvar, reml, anova_test, row_index) .Call(wrap__fastglmm_fit, formula, numeric, factor_levels, factor_codes, family, link, wald_se, nagq, dispersion, weights, offset, start_beta, start_theta, start_dispersion, satterthwaite, condvar, reml, anova_test, row_index)
 
 #' `glmm::orchestrate::confint` for `confint.fastglmm`: the lower and upper
 #' bounds per coefficient, the t quantile on a finite df and the normal one
@@ -84,11 +86,12 @@ fastglmm_same_fixed_part <- function(f0, f1) .Call(wrap__fastglmm_same_fixed_par
 #' offset) and returns `list(comparison, fit0, fit1, nsim, seed)`: the
 #' comparison as `comparison_list` flattens it, each fit as `fastglmm_fit`
 #' returns one, and the draws requested and the seed of the exact test.
-#' Empty `weights`, `offset`, `nsim` and `seed` are absent.
+#' Empty `weights`, `offset`, `nsim` and `seed` are absent. `row_index` as in
+#' `fastglmm_fit`.
 #'
 #' @usage NULL
 #' @keywords internal
-fastglmm_compare <- function(f0, f1, numeric, factor_levels, factor_codes, family, link, nagq, weights, offset, nsim, seed) .Call(wrap__fastglmm_compare, f0, f1, numeric, factor_levels, factor_codes, family, link, nagq, weights, offset, nsim, seed)
+fastglmm_compare <- function(f0, f1, numeric, factor_levels, factor_codes, family, link, nagq, weights, offset, nsim, seed, row_index) .Call(wrap__fastglmm_compare, f0, f1, numeric, factor_levels, factor_codes, family, link, nagq, weights, offset, nsim, seed, row_index)
 
 #' `glmm::formula::anova::compare_stored` for `anova(m0, m1)`: compares two stored
 #' fits as they are, with no refit and no data. `m0` and `m1` are named lists
@@ -119,20 +122,21 @@ fastglmm_term_test_refusal <- function(test, satterthwaite) .Call(wrap__fastglmm
 #' `n_rows` is the new table's row count. `level` crosses as a vector, as
 #' in `fastglmm_confint`. Returns `list(fit, se, lower, upper, future_lower,
 #' future_upper, notes)`, a part not asked for empty; each note is
-#' `list(kind, detail)` with the rows in `detail` 1-based.
+#' `list(kind, detail)` with the rows in `detail` 1-based. `row_index` as in
+#' `fastglmm_fit`, for the rows predicted.
 #'
 #' @usage NULL
 #' @keywords internal
-fastglmm_predict <- function(formula, numeric, factor_levels, factor_codes, family, link, weights, offset, parts, has_new, new_numeric, new_levels, new_codes, n_rows, scale, population, allow_new_levels, se, level, future) .Call(wrap__fastglmm_predict, formula, numeric, factor_levels, factor_codes, family, link, weights, offset, parts, has_new, new_numeric, new_levels, new_codes, n_rows, scale, population, allow_new_levels, se, level, future)
+fastglmm_predict <- function(formula, numeric, factor_levels, factor_codes, family, link, weights, offset, parts, has_new, new_numeric, new_levels, new_codes, n_rows, scale, population, allow_new_levels, se, level, future, row_index) .Call(wrap__fastglmm_predict, formula, numeric, factor_levels, factor_codes, family, link, weights, offset, parts, has_new, new_numeric, new_levels, new_codes, n_rows, scale, population, allow_new_levels, se, level, future, row_index)
 
 #' `glmm::orchestrate::simulate` for `simulate.fastglmm`: the columns and
 #' `parts` as `fastglmm_predict` takes them; `nsim` and `seed` whole numbers
 #' sent as doubles (the R wrapper has checked them). The draws draw after
-#' draw, `nobs * nsim` doubles.
+#' draw, `nobs * nsim` doubles. `row_index` as in `fastglmm_fit`.
 #'
 #' @usage NULL
 #' @keywords internal
-fastglmm_simulate <- function(formula, numeric, factor_levels, factor_codes, family, link, weights, offset, parts, nsim, seed) .Call(wrap__fastglmm_simulate, formula, numeric, factor_levels, factor_codes, family, link, weights, offset, parts, nsim, seed)
+fastglmm_simulate <- function(formula, numeric, factor_levels, factor_codes, family, link, weights, offset, parts, nsim, seed, row_index) .Call(wrap__fastglmm_simulate, formula, numeric, factor_levels, factor_codes, family, link, weights, offset, parts, nsim, seed, row_index)
 
 #' `glmm::orchestrate::effect_sizes` for `r2()`, `icc()` and
 #' `summary.fastglmm`: the columns and `parts` as `fastglmm_predict` takes
@@ -144,5 +148,15 @@ fastglmm_simulate <- function(formula, numeric, factor_levels, factor_codes, fam
 #' @usage NULL
 #' @keywords internal
 fastglmm_effect_sizes <- function(formula, numeric, factor_levels, factor_codes, family, link, weights, offset, parts, aliased, converged, objective, objective_nodes, null_refit) .Call(wrap__fastglmm_effect_sizes, formula, numeric, factor_levels, factor_codes, family, link, weights, offset, parts, aliased, converged, objective, objective_nodes, null_refit)
+
+#' `glmm::orchestrate::profile_intervals` for `confint(method = "profile")`:
+#' the columns as `fastglmm_effect_sizes` takes them, the fit's `reml`, the
+#' level and `parm` (`NULL` for every row). Returns `list(names, estimate,
+#' lower, upper, level)`; an undetermined bound is `NaN`. `level`
+#' crosses as a vector, as in `fastglmm_confint`.
+#'
+#' @usage NULL
+#' @keywords internal
+fastglmm_profile_intervals <- function(formula, numeric, factor_levels, factor_codes, family, link, weights, offset, reml, level, parm) .Call(wrap__fastglmm_profile_intervals, formula, numeric, factor_levels, factor_codes, family, link, weights, offset, reml, level, parm)
 
 # nolint end

@@ -195,7 +195,7 @@ pub enum Family {
     /// Negative-binomial count response → log-link GLM/GLMM. Variance
     /// `V(μ)=μ+μ²/θ`. On a GLM the shape `θ` is estimated by an alternating
     /// outer loop (`MASS::glm.nb`/`lme4::glmer.nb` style), reported in
-    /// `Fit.dispersion`, and the β SE conditions on `θ̂` (θ-uncertainty out of
+    /// `Fit::dispersion()`, and the β SE conditions on `θ̂` (θ-uncertainty out of
     /// scope). On a GLMM, `ln θ_NB` is instead a coordinate of the outer
     /// search, and the β SE carries its uncertainty through an appended
     /// Hessian row (see `crate::glmm::joint_hessian_cov`). θ̂ is not

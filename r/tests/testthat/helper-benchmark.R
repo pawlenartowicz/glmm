@@ -31,3 +31,14 @@ benchmark_data <- function(seed, n_g = 60L, m = 10L,
   }
   data.frame(y = y, t = t, d = d, g = g)
 }
+
+# A sleepstudy-shaped LMM: 18 subjects over 10 days, a random intercept and
+# slope. Used by test-anova.R and test-methods.R.
+sleep_data <- function() {
+  set.seed(20261026)
+  subject <- factor(rep(1:18, each = 10))
+  days <- rep(0:9, 18)
+  reaction <- 250 + 10 * days + rnorm(18, sd = 25)[as.integer(subject)] +
+    rnorm(18, sd = 6)[as.integer(subject)] * days + rnorm(180, sd = 25)
+  data.frame(Reaction = reaction, Days = days, Subject = subject)
+}

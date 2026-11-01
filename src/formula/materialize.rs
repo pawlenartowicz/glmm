@@ -33,7 +33,7 @@ use std::sync::OnceLock;
 use super::error::Error;
 use super::parse::{parse, parse_transform, ParsedFormula, RandomEffect, Transform};
 use crate::{
-    ColumnId, Data, Design, Family, Fit, FitError, FitOptions, GroupIds, Grouping,
+    ColumnId, Data, Design, ErrorMessage, Family, Fit, FitError, FitOptions, GroupIds, Grouping,
     GroupingRelation, ModelSpec, PredictOptions, Prediction, ReStructure, ReTerm,
 };
 
@@ -90,10 +90,10 @@ impl Table {
     }
 }
 
-/// One grouping factor's random-effect column names, in the order the kernel's
-/// `varcorr`/`tau2` blocks use them — `"(Intercept)"` first, then any slopes —
-/// plus the term each column belongs to and the label of every slot of its
-/// RE block.
+/// One grouping factor's random-effect column names, in the order of the
+/// block of `Fit::varcorr(g)` (`"(Intercept)"` first, then any slopes), plus
+/// the term each column belongs to and the label of every slot of its RE
+/// block.
 pub struct ReGroupInfo {
     /// Grouping factor name (`"Subject"`, or `"A:B"` for a nested inner factor).
     pub name: String,
@@ -111,7 +111,7 @@ pub struct ReGroupInfo {
     /// choice is data-dependent: a flat `(1|A) + (1|B)` routes nested or crossed
     /// depending on how balanced the data is (see `detect_flat_nesting`), so a
     /// consumer that inferred the layout would be wrong on a dataset nobody
-    /// tested. [`label_ranef`] is the only reader.
+    /// tested. The labeller behind [`Model::ranef`] is the only reader.
     pub slot_labels: Vec<Option<String>>,
 }
 
@@ -166,9 +166,9 @@ pub struct Lowered {
     pub model: ModelSpec,
     /// Per-row level ids for every grouping.
     pub ids: GroupIds,
-    /// Per-grouping name + RE term names + slot labels, in `varcorr`/`tau2`
-    /// block order (primary first, then extras in declaration order). Empty when
-    /// the formula declares no random effects.
+    /// Per-grouping name + RE term names + slot labels, in the block order of
+    /// `Fit::varcorr(g)` (primary first, then extras in declaration order).
+    /// Empty when the formula declares no random effects.
     pub re_groups: Vec<ReGroupInfo>,
     /// Observations the LOWERING made about the data, which no solver can make
     /// because no solver sees the labels —
@@ -342,6 +342,20 @@ impl Model {
     pub fn fit(&self) -> &Fit {
         &self.fit
     }
+
+    /// The fit's random-effect conditional modes, labelled: one [`RanefBlock`]
+    /// per grouping in declaration order, rows the grouping's levels as the
+    /// data spells them, columns its terms, padded nested slots dropped. Empty
+    /// when the fit has no conditional modes (no random part, or a fit that did
+    /// not converge).
+    ///
+    /// # Errors
+    /// [`Error::RanefShapeMismatch`] when the lowering's `re_groups` do not
+    /// describe the fit's stored modes, which only a lowering edited after
+    /// [`lower`] can cause.
+    pub fn ranef(&self) -> Result<Vec<RanefBlock>, Error> {
+        label_ranef(&self.fit, &self.lowered.re_groups)
+    }
 }
 
 /// Lowers `formula` against `table` ([`lower`]) and fits it with `opts`
@@ -510,17 +524,19 @@ fn check_table(data: &Table) -> Result<(), Error> {
             Column::Factor { codes, .. } => codes.len(),
         };
         if len != data.n {
-            return Err(Error::Fit(FitError::Shape(format!(
-                "column {name:?} has {len} rows, the table {}",
-                data.n
-            ))));
+            return Err(Error::Fit(FitError::Shape(
+                format!("column {name:?} has {len} rows, the table {}", data.n).into(),
+            )));
         }
         if let Column::Factor { levels, codes } = col {
             if let Some(&bad) = codes.iter().find(|&&c| c as usize >= levels.len()) {
-                return Err(Error::Fit(FitError::Shape(format!(
-                    "factor column {name:?}: code {bad} is out of range for {} levels",
-                    levels.len()
-                ))));
+                return Err(Error::Fit(FitError::Shape(
+                    format!(
+                        "factor column {name:?}: code {bad} is out of range for {} levels",
+                        levels.len()
+                    )
+                    .into(),
+                )));
             }
         }
     }
@@ -720,10 +736,10 @@ pub(crate) fn lower_new(formula: &str, lowered: &Lowered, table: &Table) -> Resu
                 .enumerate()
                 .map(|(row, l)| match slot.get(l.as_str()) {
                     Some(Some(k)) => Ok(*k),
-                    Some(None) => Err(Error::Fit(FitError::Shape(format!(
-                        "grouping {:?} has the label {l:?} at row {row}, which names two of \
-                         the fit's levels; relabel its columns without ':'",
-                        g.name
+                    Some(None) => Err(Error::Fit(FitError::Shape(ErrorMessage::at_row(
+                        format!("grouping {:?} has the label {l:?} at row ", g.name),
+                        row,
+                        ", which names two of the fit's levels; relabel its columns without ':'",
                     )))),
                     None => Ok(unseen),
                 })
@@ -788,9 +804,10 @@ pub(crate) fn new_fixed_design<'a>(
                     .map(|(row, &c)| {
                         let label = &levels[c as usize];
                         index.get(label.as_str()).copied().ok_or_else(|| {
-                            Error::Fit(FitError::Shape(format!(
-                                "column {name:?} has the level {label:?} at row {row}, \
-                                 which the fit did not see"
+                            Error::Fit(FitError::Shape(ErrorMessage::at_row(
+                                format!("column {name:?} has the level {label:?} at row "),
+                                row,
+                                ", which the fit did not see",
                             )))
                         })
                     })
@@ -1787,7 +1804,7 @@ fn block_of(terms: &[LoweredTerm]) -> (Vec<ReTerm>, Vec<ColumnId>) {
 
 /// Build one grouping's `ReGroupInfo` from its [`lower_terms`] —
 /// `"(Intercept)"` first when a term holds it, then the slope columns, in
-/// block order (mirrors `varcorr`/`tau2` block term order). A factor slope's
+/// block order (mirrors the term order of `Fit::varcorr(g)`). A factor slope's
 /// columns are its dummy names (`format!("{var}{lvl}")`, same naming
 /// `factor_dummies` uses on the fixed-effect side), not the bare var name.
 /// `slot_labels` comes from [`grouping_ids`], which is the only place the chosen
@@ -2055,13 +2072,13 @@ pub struct RanefBlock {
     /// Row-major `levels.len() × terms.len()` conditional modes.
     pub values: Vec<f64>,
     /// Row-major `levels.len() × q(q+1)/2`, `q = terms.len()`: each level's
-    /// conditional covariance, the vech of [`crate::Fit::condvar`]'s block
-    /// (column-major lower triangle, `varcorr`'s order). Empty where
-    /// `Fit::condvar` is.
+    /// conditional covariance, the vech of its block in
+    /// [`crate::Fit::condvar()`] (column-major lower triangle, the stored
+    /// `varcorr` order). Empty where `Fit::condvar(g)` is.
     pub condvar: Vec<f64>,
 }
 
-/// Label a fit's random-effect conditional modes: [`crate::Fit::ranef`]'s flat
+/// Label a fit's random-effect conditional modes: the [`crate::Fit::ranef()`]
 /// blocks zipped against the lowering's slot labels, padded slots dropped, one
 /// [`RanefBlock`] per grouping in declaration order.
 ///
@@ -2072,12 +2089,12 @@ pub struct RanefBlock {
 /// the formula.
 ///
 /// A fit with no conditional modes (fixed-only, or non-converged, where
-/// `Fit::ranef` is empty) yields an empty vec — not an error.
+/// every `Fit::ranef(g)` is empty) yields an empty vec — not an error.
 ///
 /// # Errors
 /// [`Error::RanefShapeMismatch`] when `re_groups` does not describe this fit:
 /// a different grouping count, a slot-label count that disagrees with
-/// [`crate::Fit::ranef_levels`], or a total that disagrees with `ranef.len()`
+/// [`crate::Fit::ranef_levels()`], or a total that disagrees with the stored modes' length
 /// (or with a non-empty `condvar`'s length).
 /// Partial results are never returned — a mislabelled mode reads as a wrong
 /// answer, not a cosmetic slip.
@@ -2166,6 +2183,7 @@ pub fn label_ranef(fit: &crate::Fit, re_groups: &[ReGroupInfo]) -> Result<Vec<Ra
 /// a transform, so a caller who already has a column named `"log(x)"` gets
 /// that column, never `"x"`. `available` stands in for `data` here — this
 /// runs before any data column is actually read, in [`referenced_columns`].
+#[cfg(feature = "orchestrate")]
 fn resolve_available<'a>(raw: &'a str, available: &[String]) -> Option<&'a str> {
     if available.iter().any(|a| a == raw) {
         return Some(raw);
@@ -2174,6 +2192,7 @@ fn resolve_available<'a>(raw: &'a str, available: &[String]) -> Option<&'a str> 
     available.iter().any(|a| a == col).then_some(col)
 }
 
+#[cfg(feature = "orchestrate")]
 fn push_resolved(out: &mut Vec<String>, raw: &str, available: &[String]) {
     if let Some(col) = resolve_available(raw, available) {
         out.push(col.to_string());
@@ -2186,6 +2205,7 @@ fn push_resolved(out: &mut Vec<String>, raw: &str, available: &[String]) {
 /// two literal column names joined by `:`; splitting on it recovers them with
 /// no tie-break needed. A plain group with no `:` is that single literal
 /// name, the split's only piece.
+#[cfg(feature = "orchestrate")]
 fn push_group(out: &mut Vec<String>, group: &str, available: &[String]) {
     for part in group.split(':') {
         if available.iter().any(|a| a == part) {
@@ -2206,11 +2226,13 @@ fn push_group(out: &mut Vec<String>, group: &str, available: &[String]) {
 /// from [`materialize`] itself, with its own precise error, once the caller
 /// tries to lower against data that is really missing it. This function never
 /// errors; it is a filter, not a validator.
+#[cfg(feature = "orchestrate")]
 pub fn referenced_columns(ast: &ParsedFormula, available: &[String]) -> Vec<String> {
     resolved_names(ast, available, true)
 }
 
 /// [`referenced_columns`], with the response left out unless `with_response`.
+#[cfg(feature = "orchestrate")]
 fn resolved_names(ast: &ParsedFormula, available: &[String], with_response: bool) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for_each_formula_name(ast, with_response, |raw, is_group| {
@@ -2230,6 +2252,7 @@ fn resolved_names(ast: &ParsedFormula, available: &[String], with_response: bool
 /// random effect's grouping (with `is_group` set) and slope variables, then
 /// the `offset()` term. The one walk behind [`referenced_columns`],
 /// [`unresolved_columns`] and [`design_columns`].
+#[cfg(feature = "orchestrate")]
 fn for_each_formula_name(
     ast: &ParsedFormula,
     with_response: bool,
@@ -2281,11 +2304,13 @@ fn for_each_formula_name(
 /// validates `weights=`/`offset=` against the data's row count before ever
 /// calling into Rust, and a formula's genuinely missing column must be
 /// reported ahead of an unrelated length mismatch on those arguments).
+#[cfg(feature = "orchestrate")]
 pub fn unresolved_columns(ast: &ParsedFormula, available: &[String]) -> Vec<String> {
     unresolved_names(ast, available, true)
 }
 
 /// [`unresolved_columns`], with the response left out unless `with_response`.
+#[cfg(feature = "orchestrate")]
 fn unresolved_names(ast: &ParsedFormula, available: &[String], with_response: bool) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for_each_formula_name(ast, with_response, |raw, is_group| {
@@ -2308,6 +2333,7 @@ fn unresolved_names(ast: &ParsedFormula, available: &[String], with_response: bo
 /// error would name: `raw` itself when it resolves against neither `available`
 /// nor a transform spelling, else the transform's underlying column when THAT
 /// is what is missing. `None` when `raw` resolves.
+#[cfg(feature = "orchestrate")]
 fn missing_name(raw: &str, available: &[String]) -> Option<String> {
     if available.iter().any(|a| a == raw) {
         return None;
@@ -2318,6 +2344,7 @@ fn missing_name(raw: &str, available: &[String]) -> Option<String> {
     }
 }
 
+#[cfg(feature = "orchestrate")]
 fn push_missing(out: &mut Vec<String>, raw: &str, available: &[String]) {
     if let Some(name) = missing_name(raw, available) {
         out.push(name);
@@ -2326,6 +2353,7 @@ fn push_missing(out: &mut Vec<String>, raw: &str, available: &[String]) {
 
 /// [`push_group`]'s miss side: a grouping's literal parts (never a transform
 /// spelling) that are not in `available`.
+#[cfg(feature = "orchestrate")]
 fn push_missing_group(out: &mut Vec<String>, group: &str, available: &[String]) {
     for part in group.split(':') {
         if !available.iter().any(|a| a == part) {
@@ -2347,6 +2375,7 @@ fn push_missing_group(out: &mut Vec<String>, group: &str, available: &[String]) 
 /// every other name, so a transform spelling (`offset(log(exposure))`) names
 /// its underlying column, matching what actually appears in that filtered
 /// list.
+#[cfg(feature = "orchestrate")]
 pub fn numeric_only_columns(ast: &ParsedFormula, available: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     match &ast.cbind {
@@ -2760,6 +2789,7 @@ mod tests {
     /// [`unresolved_columns`] names a bare missing column and a transform's
     /// missing underlying column (`log(z)` reports `z`, not the call text),
     /// and stays empty once everything resolves.
+    #[cfg(feature = "orchestrate")]
     #[test]
     fn unresolved_columns_reports_missing_names_including_transform_targets() {
         let ast = parse("y ~ log(z) + (1 | g) + offset(o)").unwrap();
@@ -3094,8 +3124,53 @@ mod tests {
         assert_eq!(no_intercept.model, lo.model);
     }
 
+    /// A `cbind()` row with a negative count or no trials is named by row,
+    /// as a field a port can renumber; an error without a row has none.
+    #[test]
+    fn cbind_refusals_carry_their_row() {
+        let table = |s: Vec<f64>, f: Vec<f64>| Table {
+            columns: vec![
+                ("s".into(), Column::Numeric(s)),
+                ("f".into(), Column::Numeric(f)),
+                ("x".into(), Column::Numeric(vec![0.0, 1.0, 2.0, 3.0])),
+            ],
+            n: 4,
+        };
+        let binomial = Family::Binomial {
+            link: crate::BinomialLink::Logit,
+        };
+        let refused = |s, f| match lower("cbind(s, f) ~ x", &table(s, f), binomial) {
+            Err(e) => e,
+            Ok(_) => panic!("accepted"),
+        };
+        let negative = refused(vec![1.0, 2.0, -1.0, 0.0], vec![1.0; 4]);
+        assert!(
+            matches!(negative, Error::NegativeCount { row: 2 }),
+            "{negative}"
+        );
+        assert_eq!(negative.row(), Some(2));
+        assert_eq!(
+            negative.to_string_with_row(3),
+            "cbind(): successes and failures must be non-negative at every row; row 3 is not"
+        );
+        let empty = refused(vec![1.0, 0.0, 1.0, 1.0], vec![1.0, 0.0, 1.0, 1.0]);
+        assert!(matches!(empty, Error::ZeroTrials { row: 1 }), "{empty}");
+        assert_eq!(empty.row(), Some(1));
+        assert_eq!(empty.to_string_with_row(1), empty.to_string());
+        let Err(gaussian) = lower(
+            "cbind(s, f) ~ x",
+            &table(vec![1.0; 4], vec![1.0; 4]),
+            Family::Gaussian,
+        ) else {
+            panic!("cbind() on a Gaussian family accepted");
+        };
+        assert_eq!(gaussian.row(), None);
+        assert_eq!(gaussian.to_string_with_row(7), gaussian.to_string());
+    }
+
     /// [`numeric_only_columns`] names the response and the offset column, and
     /// both sides of a `cbind()` response.
+    #[cfg(feature = "orchestrate")]
     #[test]
     fn numeric_only_columns_names_response_and_offset() {
         let ast = parse("y ~ x + (1 | g) + offset(o)").unwrap();

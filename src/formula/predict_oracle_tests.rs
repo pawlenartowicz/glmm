@@ -38,7 +38,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::Value;
 
 use super::materialize::lower_new;
-use super::{fit, label_ranef, predict, Column, Error, Lowered, Model, Table};
+use super::{fit, predict, Column, Error, Lowered, Model, Table};
 use crate::family::mu_eta;
 use crate::inference::rlrt_refs::csv;
 use crate::inference::test_refs::{self, Coverage, DivEntry, Entry, Kind};
@@ -569,7 +569,7 @@ fn predict_references() {
                     }
                 }
             }
-            let blocks = label_ranef(glmm, &lo.re_groups).expect("labelled ranef");
+            let blocks = model.ranef().expect("labelled ranef");
             for c in json["condvar"].as_array().expect("condvar") {
                 let (g, reversed) = grouping_of(lo, c["grouping"].as_str().expect("grouping"));
                 let block = &blocks[g];

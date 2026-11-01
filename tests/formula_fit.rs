@@ -126,28 +126,31 @@ fn assert_vec_close(got: &[f64], want: &[f64], ctx: &str) {
 /// what makes "nowhere" checkable.
 fn assert_same_fit(got: &Fit, want: &Fit, ctx: &str) {
     assert_eq!(got.converged(), want.converged(), "{ctx}: converged");
-    assert_vec_close(&got.beta, &want.beta, &format!("{ctx}: beta"));
-    assert_vec_close(&got.se, &want.se, &format!("{ctx}: se"));
-    assert_vec_close(&got.tau2, &want.tau2, &format!("{ctx}: tau2"));
+    assert_vec_close(got.beta(), want.beta(), &format!("{ctx}: beta"));
+    assert_vec_close(got.se(), want.se(), &format!("{ctx}: se"));
     assert_eq!(
-        got.varcorr.len(),
-        want.varcorr.len(),
+        got.n_groupings(),
+        want.n_groupings(),
         "{ctx}: varcorr block count"
     );
-    for (k, (g, w)) in got.varcorr.iter().zip(&want.varcorr).enumerate() {
-        assert_vec_close(g, w, &format!("{ctx}: varcorr[{k}]"));
+    for k in 0..want.n_groupings() {
+        assert_vec_close(
+            &got.varcorr(k),
+            &want.varcorr(k),
+            &format!("{ctx}: varcorr[{k}]"),
+        );
     }
     assert!(
-        close(got.dispersion, want.dispersion, PIN_REL_ITER, 0.0),
+        close(got.dispersion(), want.dispersion(), PIN_REL_ITER, 0.0),
         "{ctx}: dispersion {} vs hand-built {}",
-        got.dispersion,
-        want.dispersion
+        got.dispersion(),
+        want.dispersion()
     );
     assert!(
-        close(got.loglik, want.loglik, PIN_REL_ITER, 0.0),
+        close(got.loglik(), want.loglik(), PIN_REL_ITER, 0.0),
         "{ctx}: loglik {} vs hand-built {}",
-        got.loglik,
-        want.loglik
+        got.loglik(),
+        want.loglik()
     );
 }
 
@@ -481,7 +484,7 @@ fn default_options_report_every_se_through_the_formula_door() {
     let table = cbpp();
     let f = "cbind(incidence, failures) ~ period + (1 | herd)";
     let model = glmm::formula::fit(f, &table, logit(), &FitOptions::default()).unwrap();
-    let se = &model.fit().se;
+    let se = model.fit().se();
     assert_eq!(se.len(), 4);
     assert!(se.iter().all(|s| s.is_finite()), "{se:?}");
 }
@@ -508,7 +511,12 @@ fn nested_ids_outside_the_parent_block_are_refused() {
     };
     assert!(fit_with(&padded).is_ok());
     match fit_with(&dense) {
-        Err(glmm::FitError::Ids(m)) => assert!(m.contains("parent * 3"), "{m}"),
+        Err(glmm::FitError::Ids(m)) => {
+            assert!(m.contains("parent * 3"), "{m}");
+            // Row 2 is the first child id in another parent's slots.
+            assert_eq!(m.row(), Some(2));
+            assert!(m.ends_with("(row 2)"), "{m}");
+        }
         other => panic!("expected FitError::Ids, got {:?}", other.err()),
     }
 }
@@ -526,7 +534,14 @@ fn a_group_id_not_below_n_is_refused() {
         &spec,
         &FitOptions::default(),
     ) {
-        Err(glmm::FitError::Ids(m)) => assert!(m.contains("not below the row count 4"), "{m}"),
+        Err(glmm::FitError::Ids(m)) => {
+            assert!(m.contains("not below the row count 4"), "{m}");
+            assert_eq!(m.row(), Some(3));
+            assert!(
+                m.text_with_row(4).contains("(row 4); number the levels"),
+                "{m}"
+            );
+        }
         other => panic!("expected FitError::Ids, got {:?}", other.err()),
     }
 }
@@ -555,12 +570,12 @@ fn constant_binomial_response_is_separated_not_converged() {
         let fit = model.fit();
         assert!(!fit.converged(), "y = {value}");
         assert!(
-            fit.diagnostics
+            fit.diagnostics()
                 .notes
                 .iter()
                 .any(|n| matches!(n, Note::Separated)),
             "y = {value}: {:?}",
-            fit.diagnostics.notes
+            fit.diagnostics().notes
         );
     }
 }
@@ -889,6 +904,11 @@ fn a_non_finite_response_or_predictor_is_reported_at_its_row() {
             err.to_string(),
             format!("term '{term}' is not finite at row 1")
         );
+        assert_eq!(err.row(), Some(1));
+        assert_eq!(
+            err.to_string_with_row(2),
+            format!("term '{term}' is not finite at row 2")
+        );
     }
 }
 
@@ -1185,7 +1205,7 @@ fn re_groups_align_with_varcorr_blocks() {
     // The shim's invariant: one name per varcorr block, same order.
     assert_eq!(
         lo.re_groups.len(),
-        f.varcorr.len(),
+        f.n_groupings(),
         "re_groups and varcorr must agree in length"
     );
     let want: [(&str, f64); 2] = [("plate", PLATE_SD), ("sample", SAMPLE_SD)];
@@ -1198,7 +1218,7 @@ fn re_groups_align_with_varcorr_blocks() {
         );
         // The variance actually sitting in block k must be the one belonging to
         // the grouping named at index k — this is what a swap breaks.
-        let got = f.varcorr[k][0].sqrt();
+        let got = f.varcorr(k)[0].sqrt();
         assert!(
             close(got, *sd, PIN_REL_ITER, 0.0),
             "block {k} ({name}) sd {got} vs pinned {sd}"
@@ -1259,14 +1279,14 @@ fn declared_factor_level_order_picks_the_reference_level() {
     assert!(f1.converged() && f2.converged());
     // Intercept = mean of the base level: "low" ≈ 1.05 vs "high" ≈ 3.05.
     assert!(
-        close(f1.beta[0], 1.05, 1e-6, 1e-6),
+        close(f1.beta()[0], 1.05, 1e-6, 1e-6),
         "base low: {}",
-        f1.beta[0]
+        f1.beta()[0]
     );
     assert!(
-        close(f2.beta[0], 3.05, 1e-6, 1e-6),
+        close(f2.beta()[0], 3.05, 1e-6, 1e-6),
         "base high: {}",
-        f2.beta[0]
+        f2.beta()[0]
     );
 }
 
@@ -1299,12 +1319,12 @@ fn rank_deficient_interaction_drops_the_column_r_drops() {
     assert_eq!(lo.col_names, vec!["(Intercept)", "xz", "x:z"]);
     let fit = glmm::fit(&lo.data(), lo.spec(), &FitOptions::default()).unwrap();
     assert_eq!(fit.aliased(), &[false, false, true]);
-    assert!(fit.beta[2].is_nan());
+    assert!(fit.beta()[2].is_nan());
 
     let reduced = lower("y ~ xz + (1|g)", &table, Family::Gaussian).unwrap();
     let want = glmm::fit(&reduced.data(), reduced.spec(), &FitOptions::default()).unwrap();
     assert!(fit.converged() && want.converged());
-    assert_vec_close(&fit.beta[..2], &want.beta, "kept coefficients");
+    assert_vec_close(&fit.beta()[..2], want.beta(), "kept coefficients");
 }
 
 /// `offset(log(e))` in the formula must produce the same fit as passing the
@@ -1559,7 +1579,7 @@ mod reml_rule {
         assert_eq!(bits(&on.se), bits(&none.se));
         assert_eq!(on.dispersion.to_bits(), none.dispersion.to_bits());
         let want = cold(OLS, &sleepstudy(), Family::Gaussian, Some(true));
-        assert_eq!(on.loglik.to_bits(), want.loglik.to_bits());
+        assert_eq!(on.loglik.to_bits(), want.loglik().to_bits());
         assert_ne!(
             on.loglik, none.loglik,
             "the REML and ML log-likelihoods differ"
@@ -1589,7 +1609,7 @@ mod reml_rule {
         }
         assert!(on.reml);
         let want = cold(OLS, &sleepstudy(), Family::Gaussian, Some(true));
-        assert_eq!(on.loglik.to_bits(), want.loglik.to_bits());
+        assert_eq!(on.loglik.to_bits(), want.loglik().to_bits());
         assert_eq!(bits(&on.beta), bits(&none.beta));
         assert_eq!(on.dispersion.to_bits(), none.dispersion.to_bits());
         assert!(!off.reml);
@@ -1616,15 +1636,18 @@ mod reml_rule {
     fn run_fit_reml_false_on_gaussian_mixed_fits_ml() {
         let r = gaussian(LMM, Some(false));
         let want = cold(LMM, &sleepstudy(), Family::Gaussian, Some(false));
-        let d = &want.diagnostics;
-        assert!(!r.reml && !want.reml);
+        let d = want.diagnostics();
+        assert!(!r.reml && !want.reml());
         assert_eq!(r.reml_warning, None);
         assert_eq!(r.converged, d.converged);
         assert_eq!(
             (r.singular, &r.aliased, &r.pinned),
             (d.singular, &d.aliased, &d.pinned)
         );
-        assert_eq!((r.n_eval, r.n_grad, r.df), (want.n_eval, d.n_grad, want.df));
+        assert_eq!(
+            (r.n_eval, r.n_grad, r.df),
+            (want.n_eval(), d.n_grad, want.df())
+        );
         assert_eq!(r.outer_decrement.to_bits(), d.outer_decrement.to_bits());
         assert_eq!(flat(r.boundary), flat(&format!("{:?}", d.boundary)));
         assert_eq!(
@@ -1632,28 +1655,40 @@ mod reml_rule {
             d.outer_stop.map(|s| flat(&format!("{s:?}")))
         );
         assert_eq!(r.notes.len(), d.notes.len());
-        assert_eq!(bits(&r.beta), bits(&want.beta));
-        assert_eq!(bits(&r.se), bits(&want.se));
-        assert_eq!(bits(&r.tau2), bits(&want.tau2));
-        assert_eq!(bits(&r.stddev_se), bits(&want.stddev_se));
-        assert_eq!(bits(&r.fitted), bits(&want.fitted));
-        assert_eq!(bits(&r.ranef), bits(&want.ranef));
-        assert_eq!(bits(&r.coef_df), bits(&want.coef_df));
-        assert_eq!(r.ranef_levels, want.ranef_levels);
+        assert_eq!(bits(&r.beta), bits(want.beta()));
+        assert_eq!(bits(&r.se), bits(want.se()));
+        assert_eq!(bits(&r.fitted), bits(want.fitted()));
+        let ranef: Vec<f64> = (0..want.n_groupings())
+            .flat_map(|g| want.ranef(g).iter().copied())
+            .collect();
+        assert_eq!(bits(&r.ranef), bits(&ranef));
+        assert_eq!(bits(&r.coef_df), bits(want.coef_df()));
+        assert_eq!(r.ranef_levels, want.ranef_levels());
         // Row by row, so a missing or extra row fails rather than zipping away.
         let rows = |m: &[Vec<f64>]| m.iter().map(|v| bits(v)).collect::<Vec<_>>();
-        assert_eq!(rows(&r.vcov), rows(&want.vcov));
-        assert_eq!(rows(&r.varcorr), rows(&want.varcorr));
+        let p = want.beta().len();
+        let want_rows: Vec<Vec<u64>> = want.vcov().chunks(p).map(bits).collect();
+        assert_eq!(rows(&r.vcov), want_rows);
+        // The port keeps each grouping's vech; the kernel gives the q × q.
+        let vech = |g: usize| {
+            let (q, m) = (want.n_re(g), want.varcorr(g));
+            (0..q)
+                .flat_map(|j| (j..q).map(move |i| i * q + j))
+                .map(|k| m[k])
+                .collect::<Vec<f64>>()
+        };
+        let want_varcorr: Vec<Vec<f64>> = (0..want.n_groupings()).map(vech).collect();
+        assert_eq!(rows(&r.varcorr), rows(&want_varcorr));
         assert!(!r.vcov.is_empty() && !r.varcorr.is_empty());
         for (g, w) in [
-            (r.dispersion, want.dispersion),
-            (r.deviance, want.deviance),
-            (r.loglik, want.loglik),
+            (r.dispersion, want.dispersion()),
+            (r.deviance, want.deviance()),
+            (r.loglik, want.loglik()),
         ] {
             assert_eq!(g.to_bits(), w.to_bits());
         }
         // `coef_p` is the t test on each unit vector; `rss` is OLS only.
-        let p = want.beta.len();
+        let p = want.beta().len();
         let coef_p: Vec<f64> = (0..p)
             .map(|j| {
                 let mut e = vec![0.0; p];

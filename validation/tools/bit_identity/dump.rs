@@ -1,6 +1,6 @@
 //! Machine-local "what moved" report: fits all 49 `manifest.json` rungs,
 //! appends two more nAGQ=1 twin records (see `NAGQ1_TWIN_RUNGS` below), and
-//! writes one JSON array, `{rung, config, deviance, theta, beta, se_hessian,
+//! writes one JSON array, `{rung, config, deviance, varcorr, beta, se_hessian,
 //! se_rx, n_eval, converged, singular}` per record (manifest rungs first in
 //! manifest order, then the twins), to `tools/bit_identity/<config>.json`. Dump
 //! before and after a change and diff the two files to see which rungs moved and
@@ -9,10 +9,12 @@
 //! (`.gitignore`) and do not reproduce across CPU microarchitectures, so both
 //! sides of a diff come from the same machine.
 //!
-//! `theta` is `Fit::tau2` (`theta[k]^2 * sigma_sq`, `sigma_sq` ≡ 1 off the
-//! Gaussian path, declaration order), one value per θ coordinate; `Fit` has no
-//! raw-θ accessor. (`Fit::stddev_se` shares that layout but is the SE of the
-//! reported standard deviation, not a θ-scale quantity, and is not dumped.)
+//! `varcorr` holds each grouping's random-effect covariance `D̂ = σ̂²·Λ̂Λ̂'`
+//! (`σ̂²` ≡ 1 off the Gaussian path), one `q × q` matrix per grouping in
+//! declaration order, row-major with both triangles, as `Fit::varcorr(g)`
+//! returns it for `g` below `Fit::n_groupings()`; `[]` for a fit without random
+//! effects and for one that left its covariances unassembled.
+//! (`Fit::stddev_se`, the SE of the reported standard deviations, is not dumped.)
 //! `se_hessian`/`se_rx` follow the cross-engine schema's own
 //! convention: a gaussian rung's single SE lands in `se_hessian` (`se_rx`
 //! null), a fixed-only GLM's lands in `se_rx` (`se_hessian` null, matching
@@ -108,7 +110,7 @@ fn main() {
 
 /// One record for `rung` (a manifest rung id, or a twin's `TWIN_RUNG_OFFSET`-shifted
 /// id), field order fixed by hand (not `serde_json::Map`'s default alphabetical
-/// order) to match the spec's `{rung, config, deviance, theta, beta, se_hessian,
+/// order) to match the spec's `{rung, config, deviance, varcorr, beta, se_hessian,
 /// se_rx, n_eval, converged, singular}`. `nagq` is the caller's choice, not
 /// derived from `spec`, so a twin can reuse its parent's `spec` at a different
 /// AGQ order.
@@ -133,17 +135,17 @@ fn rung_record(spec: &Value, config: &str, rung: u64, nagq: Option<u8>) -> Strin
     }
 
     let fixed_only = lo.re_groups.is_empty();
-    let (deviance, theta, beta, se_hessian, se_rx, n_eval, converged, singular) =
+    let (deviance, varcorr, beta, se_hessian, se_rx, n_eval, converged, singular) =
         if gaussian || fixed_only {
             // One fit: Gaussian reports its SE as Hessian-side, fixed-only as Rx-side.
             let f = glmm::fit(&lo.data(), lo.spec(), &fit_opts).unwrap();
             (
-                f.deviance,
-                f.tau2.clone(),
-                f.beta.clone(),
-                gaussian.then(|| f.se.clone()),
-                (!gaussian).then(|| f.se.clone()),
-                f.n_eval,
+                f.deviance(),
+                varcorr_blocks(&f),
+                f.beta().to_vec(),
+                gaussian.then(|| f.se().to_vec()),
+                (!gaussian).then(|| f.se().to_vec()),
+                f.n_eval(),
                 f.converged(),
                 f.singular(),
             )
@@ -152,12 +154,12 @@ fn rung_record(spec: &Value, config: &str, rung: u64, nagq: Option<u8>) -> Strin
             let fh = glmm::fit(&lo.data(), lo.spec(), &fit_opts).unwrap();
             let fr = glmm::fit(&lo.data(), lo.spec(), &o_r).unwrap();
             (
-                fh.deviance,
-                fh.tau2.clone(),
-                fh.beta.clone(),
-                Some(fh.se.clone()),
-                Some(fr.se.clone()),
-                fh.n_eval + fr.n_eval,
+                fh.deviance(),
+                varcorr_blocks(&fh),
+                fh.beta().to_vec(),
+                Some(fh.se().to_vec()),
+                Some(fr.se().to_vec()),
+                fh.n_eval() + fr.n_eval(),
                 fh.converged() && fr.converged(),
                 fh.singular(),
             )
@@ -166,12 +168,20 @@ fn rung_record(spec: &Value, config: &str, rung: u64, nagq: Option<u8>) -> Strin
     let se_hessian_json = se_hessian.map(|v| nums(&v)).unwrap_or(Value::Null);
     let se_rx_json = se_rx.map(|v| nums(&v)).unwrap_or(Value::Null);
     format!(
-        "  {{\n    \"rung\": {rung},\n    \"config\": {config_json},\n    \"deviance\": {deviance_json},\n    \"theta\": {theta_json},\n    \"beta\": {beta_json},\n    \"se_hessian\": {se_hessian_json},\n    \"se_rx\": {se_rx_json},\n    \"n_eval\": {n_eval},\n    \"converged\": {converged},\n    \"singular\": {singular}\n  }}",
+        "  {{\n    \"rung\": {rung},\n    \"config\": {config_json},\n    \"deviance\": {deviance_json},\n    \"varcorr\": {varcorr_json},\n    \"beta\": {beta_json},\n    \"se_hessian\": {se_hessian_json},\n    \"se_rx\": {se_rx_json},\n    \"n_eval\": {n_eval},\n    \"converged\": {converged},\n    \"singular\": {singular}\n  }}",
         config_json = serde_json::to_string(config).unwrap(),
         deviance_json = serde_json::to_string(&num(deviance)).unwrap(),
-        theta_json = serde_json::to_string(&nums(&theta)).unwrap(),
+        varcorr_json = serde_json::to_string(&Value::Array(
+            varcorr.iter().map(|d| nums(d)).collect()
+        ))
+        .unwrap(),
         beta_json = serde_json::to_string(&nums(&beta)).unwrap(),
         se_hessian_json = serde_json::to_string(&se_hessian_json).unwrap(),
         se_rx_json = serde_json::to_string(&se_rx_json).unwrap(),
     )
+}
+
+/// Every grouping's covariance block, `q × q` row-major, in declaration order.
+fn varcorr_blocks(f: &glmm::Fit) -> Vec<Vec<f64>> {
+    (0..f.n_groupings()).map(|g| f.varcorr(g)).collect()
 }

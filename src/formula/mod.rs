@@ -5,15 +5,18 @@
 //! [`crate::ModelSpec`], per-row [`crate::GroupIds`], and the weights and offset
 //! the formula carries. Two stages, cut on whether data is needed:
 //!
-//! - [`parse`] is pure and data-free: string → [`ParsedFormula`] (the AST). `*` is
+//! - `parse` is pure and data-free: string → `ParsedFormula` (the AST). `*` is
 //!   already desugared into main effects + interactions here, `A/B` into a nesting
 //!   relation.
-//! - [`materialize`] is the only data-dependent stage: it discovers factor levels,
+//! - `materialize` is the only data-dependent stage: it discovers factor levels,
 //!   builds the numeric design, assigns column ids, finalizes the `ModelSpec`, and
 //!   builds `GroupIds`.
 //!
 //! [`lower`] runs both in one call, and [`fit()`] lowers and fits in one
-//! call, returning a [`Model`]:
+//! call, returning a [`Model`]; [`Model::ranef`] labels its conditional modes.
+//! The two stages and the AST are public only with the `orchestrate` feature,
+//! which the language ports build with.
+//!
 //! ```
 //! # use glmm::formula::{Column, Table};
 //! # use glmm::Family;
@@ -31,7 +34,7 @@
 //! # };
 //! let opts = glmm::FitOptions::default();
 //! let model = glmm::formula::fit("y ~ x*z + (1|g)", &table, Family::Gaussian, &opts)?;
-//! assert_eq!(model.fit().beta.len(), model.lowered().p);
+//! assert_eq!(model.fit().beta().len(), model.lowered().p);
 //! # Ok(())
 //! # }
 //! ```
@@ -69,11 +72,18 @@ pub(crate) use fixed_part::{fixed_part_relation, FixedPartRelation};
 #[cfg(feature = "orchestrate")]
 pub(crate) use materialize::{design_columns, fixed_design, lower_new, r_terms};
 pub use materialize::{
-    fit, fit_lowered, label_ranef, lower, materialize, numeric_only_columns, predict,
-    referenced_columns, unresolved_columns, Column, FixedTerm, Lowered, Model, RanefBlock,
-    ReGroupInfo, Table,
+    fit, fit_lowered, lower, predict, Column, FixedTerm, Lowered, Model, RanefBlock, ReGroupInfo,
+    Table,
+};
+// The parser and its AST, the data-dependent half of `lower`, the modes
+// labeller and the column filters the ports build on: public only with
+// `orchestrate`. A formula-door caller has `lower`, `fit` and `Model::ranef`.
+#[cfg(feature = "orchestrate")]
+pub use materialize::{
+    label_ranef, materialize, numeric_only_columns, referenced_columns, unresolved_columns,
 };
 pub use pairwise::{
     pairwise, Adjust, By, Pairwise, PairwiseInterval, PairwiseIntervals, PairwiseRow, RatioKind,
 };
+#[cfg(feature = "orchestrate")]
 pub use parse::{parse, ParsedFormula, RandomEffect, Term};

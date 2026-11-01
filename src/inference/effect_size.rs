@@ -183,7 +183,7 @@ pub(crate) fn variance_parts(
 ) -> Result<VarianceParts, FitError> {
     if spec.re.is_none() {
         return Err(FitError::Unsupported(
-            "R2 and the ICC need a model with random effects".to_string(),
+            "R2 and the ICC need a model with random effects".into(),
         ));
     }
     let supported = match spec.family {
@@ -195,10 +195,13 @@ pub(crate) fn variance_parts(
         Family::InverseGaussian { .. } => false,
     };
     if !supported {
-        return Err(FitError::Unsupported(format!(
-            "R2 and the ICC have no distribution-specific variance for {:?}",
-            spec.family
-        )));
+        return Err(FitError::Unsupported(
+            format!(
+                "R2 and the ICC have no distribution-specific variance for {:?}",
+                spec.family
+            )
+            .into(),
+        ));
     }
     let Design {
         x,
@@ -210,11 +213,14 @@ pub(crate) fn variance_parts(
         ..
     } = data.design;
     if n != nobs || p != beta.len() {
-        return Err(FitError::Shape(format!(
-            "the data have n = {n}, p = {p}; the fit was made on n = {}, p = {}",
-            nobs,
-            beta.len()
-        )));
+        return Err(FitError::Shape(
+            format!(
+                "the data have n = {n}, p = {p}; the fit was made on n = {}, p = {}",
+                nobs,
+                beta.len()
+            )
+            .into(),
+        ));
     }
     let nagq = match objective {
         Objective::Agq { nodes } => nodes,
@@ -236,7 +242,7 @@ pub(crate) fn variance_parts(
     };
     if blocks.len() != varcorr.len() || !blocks.iter().zip(varcorr).all(width_ok) {
         return Err(FitError::Shape(
-            "the spec's random-effect blocks are not the fit's".to_string(),
+            "the spec's random-effect blocks are not the fit's".into(),
         ));
     }
 

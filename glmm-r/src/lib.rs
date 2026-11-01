@@ -87,6 +87,8 @@ fn factor_map(
 /// `reml` (`logical(0)` is `None`, one `TRUE`/`FALSE` is `Some`).
 /// `vcov` crosses flattened row-major with `names` carrying p; the R wrapper
 /// rebuilds the p x p matrix (it is symmetric, so the order is moot).
+/// `row_index` is each passed row's 1-based position in the caller's data,
+/// so an error names the caller's row (`port_error`).
 ///
 /// @usage NULL
 /// @keywords internal
@@ -111,6 +113,7 @@ fn fastglmm_fit(
     condvar: bool,
     reml: &[Rbool],
     anova_test: &str,
+    row_index: &[i32],
 ) -> Result<List> {
     let nagq = u8::try_from(nagq)
         .map_err(|_| Error::Other(format!("nagq {nagq} is out of range for u8")))?;
@@ -147,8 +150,25 @@ fn fastglmm_fit(
         reml,
         anova_test,
     )
-    .map_err(Error::Other)?;
+    .map_err(|e| port_error(e, row_index))?;
     Ok(fit_list(r))
+}
+
+/// `e` as an R error whose message names its row as the caller's data
+/// numbers it: `row_index[row]`, the 1-based position in the caller's data of
+/// the row the R wrapper passed as row `row` (after `subset =` and
+/// `na.action`). An empty `row_index` counts the rows passed from 1.
+fn port_error(e: orchestrate::PortError, row_index: &[i32]) -> Error {
+    Error::Other(match e.row {
+        Some(row) => {
+            let caller = row_index
+                .get(row)
+                .and_then(|&k| usize::try_from(k).ok())
+                .unwrap_or(row + 1);
+            e.message_with_row(caller)
+        }
+        None => e.message,
+    })
 }
 
 /// The empty-means-absent decoding of an optional vector argument.
@@ -435,7 +455,8 @@ fn nsim_seed(nsim: &[f64], seed: &[f64]) -> Result<(Option<usize>, Option<u64>)>
 /// offset) and returns `list(comparison, fit0, fit1, nsim, seed)`: the
 /// comparison as `comparison_list` flattens it, each fit as `fastglmm_fit`
 /// returns one, and the draws requested and the seed of the exact test.
-/// Empty `weights`, `offset`, `nsim` and `seed` are absent.
+/// Empty `weights`, `offset`, `nsim` and `seed` are absent. `row_index` as in
+/// `fastglmm_fit`.
 ///
 /// @usage NULL
 /// @keywords internal
@@ -454,6 +475,7 @@ fn fastglmm_compare(
     offset: &[f64],
     nsim: &[f64],
     seed: &[f64],
+    row_index: &[i32],
 ) -> Result<List> {
     let nagq = u8::try_from(nagq)
         .map_err(|_| Error::Other(format!("nagq {nagq} is out of range for u8")))?;
@@ -471,7 +493,7 @@ fn fastglmm_compare(
         nsim,
         seed,
     )
-    .map_err(Error::Other)?;
+    .map_err(|e| port_error(e, row_index))?;
     Ok(list!(
         comparison = comparison_list(&r.comparison)?,
         fit0 = fit_list(r.fit0),
@@ -1035,7 +1057,8 @@ fn parts_of(parts: &List) -> Result<orchestrate::StoredParts> {
 /// `n_rows` is the new table's row count. `level` crosses as a vector, as
 /// in `fastglmm_confint`. Returns `list(fit, se, lower, upper, future_lower,
 /// future_upper, notes)`, a part not asked for empty; each note is
-/// `list(kind, detail)` with the rows in `detail` 1-based.
+/// `list(kind, detail)` with the rows in `detail` 1-based. `row_index` as in
+/// `fastglmm_fit`, for the rows predicted.
 ///
 /// @usage NULL
 /// @keywords internal
@@ -1062,6 +1085,7 @@ fn fastglmm_predict(
     se: bool,
     level: &[f64],
     future: bool,
+    row_index: &[i32],
 ) -> Result<List> {
     let level = match level {
         [v] => *v,
@@ -1093,7 +1117,7 @@ fn fastglmm_predict(
         level,
         future,
     )
-    .map_err(Error::Other)?;
+    .map_err(|e| port_error(e, row_index))?;
     // The rows of a note become 1-based here, as the fit's columns do.
     let notes = List::from_values(r.notes.iter().map(|n| {
         let detail = match n.detail.split_once(": ") {
@@ -1125,7 +1149,7 @@ fn fastglmm_predict(
 /// `glmm::orchestrate::simulate` for `simulate.fastglmm`: the columns and
 /// `parts` as `fastglmm_predict` takes them; `nsim` and `seed` whole numbers
 /// sent as doubles (the R wrapper has checked them). The draws draw after
-/// draw, `nobs * nsim` doubles.
+/// draw, `nobs * nsim` doubles. `row_index` as in `fastglmm_fit`.
 ///
 /// @usage NULL
 /// @keywords internal
@@ -1143,6 +1167,7 @@ fn fastglmm_simulate(
     parts: List,
     nsim: f64,
     seed: f64,
+    row_index: &[i32],
 ) -> Result<Vec<f64>> {
     orchestrate::simulate(
         formula,
@@ -1156,7 +1181,7 @@ fn fastglmm_simulate(
         whole(nsim, "nsim")?,
         whole(seed, "seed")? as u64,
     )
-    .map_err(Error::Other)
+    .map_err(|e| port_error(e, row_index))
 }
 
 /// `glmm::orchestrate::effect_sizes` for `r2()`, `icc()` and
@@ -1216,6 +1241,59 @@ fn fastglmm_effect_sizes(
     })
 }
 
+/// `glmm::orchestrate::profile_intervals` for `confint(method = "profile")`:
+/// the columns as `fastglmm_effect_sizes` takes them, the fit's `reml`, the
+/// level and `parm` (`NULL` for every row). Returns `list(names, estimate,
+/// lower, upper, level)`; an undetermined bound is `NaN`. `level`
+/// crosses as a vector, as in `fastglmm_confint`.
+///
+/// @usage NULL
+/// @keywords internal
+#[extendr]
+#[allow(clippy::too_many_arguments)]
+fn fastglmm_profile_intervals(
+    formula: &str,
+    numeric: List,
+    factor_levels: List,
+    factor_codes: List,
+    family: &str,
+    link: &str,
+    weights: &[f64],
+    offset: &[f64],
+    reml: bool,
+    level: &[f64],
+    parm: Nullable<Vec<String>>,
+) -> Result<List> {
+    let level = match level {
+        [v] => *v,
+        _ => f64::NAN,
+    };
+    let parm = match parm {
+        Nullable::NotNull(names) => Some(names),
+        Nullable::Null => None,
+    };
+    let r = orchestrate::profile_intervals(
+        formula,
+        numeric_map(numeric)?,
+        factor_map(factor_levels, factor_codes)?,
+        family,
+        link,
+        optional(weights),
+        optional(offset),
+        reml,
+        level,
+        parm,
+    )
+    .map_err(Error::Other)?;
+    Ok(list!(
+        names = r.names,
+        estimate = r.estimate,
+        lower = r.lower,
+        upper = r.upper,
+        level = r.level
+    ))
+}
+
 /// The refusal of `anova(m, test = "Wald")` or `test = "LRT"` on a fit
 /// whose per-term rows are F tests, in the crate's words, so both ports say
 /// the same. `satterthwaite` is TRUE when the F rows' denominator df are
@@ -1252,4 +1330,5 @@ extendr_module! {
     fn fastglmm_predict;
     fn fastglmm_simulate;
     fn fastglmm_effect_sizes;
+    fn fastglmm_profile_intervals;
 }

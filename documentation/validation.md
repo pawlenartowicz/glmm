@@ -93,7 +93,7 @@ has no mixed-model path in the kernel and appears as GLM cells only.
 Two smaller tiers sit alongside the grid and need no external engine: tight pins on
 numbers proven correct before they were recorded, asserted on every push, and a
 cross-engine tier over the frozen single-engine references in
-`validation/goldens/` and `validation/results/lme4_simulated/`, run with
+`validation/goldens/` (the weights tier in its `weights/` subdirectory), run with
 `cargo test --features oracle-tests`. A third tier checks glmm's tests and
 intervals against the generating truth (below).
 
@@ -170,8 +170,11 @@ variance component, the Wald intervals (GLMM) and the Satterthwaite intervals
 (Gaussian); and power, bias and RMSE. Three arms are reported only: the `time:group`
 tests and the Wald intervals of a GLM fitted to a response drawn without random
 effects on the same design, the `time:group` tests of the GLMM fitted with 11
-adaptive quadrature nodes on the `(1 | id)` cells, and the coverage of
-profile-likelihood intervals, which glmm does not compute. Every quantity comes
+adaptive quadrature nodes on the `(1 | id)` cells, and the coverage of the
+coefficients' profile-likelihood intervals on the binomial and Poisson GLMM
+cells, read by duality off the likelihood-ratio test of each true value (a
+refit with the coefficient held by an offset); `confint(method = "profile")`
+itself covers Gaussian mixed models only. Every quantity comes
 through the code a user reaches: the fits, `compare()`, the per-term tables and the
 construction `confint()` uses.
 

@@ -23,7 +23,8 @@ behind the Rust crate, the Python package (`glmm`) and the R package
   a closed form, and GLMs use IRLS. Mixed models use BFGS where glmm has a cheap
   exact gradient, and BOBYQA, which needs no gradient, elsewhere.
 - **Fast.** glmm is faster than these four packages on every model in the speed
-  tests, and it uses little memory.
+  tests, and it uses little memory. Part of the time saved goes to extra checks
+  during a fit, which catch hard models where a search would stop too early.
 
 ## Pick your language
 
@@ -146,7 +147,7 @@ Details per family are in
 | `loop_advanced` | off | Unstable. A low-level API for refitting one model many times, as in a simulation loop. |
 
 For the kernel only, with no formula parser and no `regex`, turn the defaults
-off: `glmm = { version = "0.7", default-features = false }`. Details are in
+off: `glmm = { version = "0.8", default-features = false }`. Details are in
 [`installation.md`](documentation/installation.md).
 
 ## WASM and stability
@@ -157,10 +158,15 @@ wheel of the Python package is attached to each
 model fitted on Linux, on macOS or in WebAssembly gives the same fit: across the
 test models the log-likelihoods differ by at most 3e-7.
 
-glmm is in beta. Semver covers `fit`, `fit_with_start`, `Data`, `ModelSpec` and
-`GroupIds`. The `formula` frontend stays outside it until 1.0.0, and
-`loop_advanced` has no semver guarantee. The minimum supported Rust version is
-1.85.
+glmm is in beta. Semver covers the matrix door (`fit`, `fit_with_start`,
+`predict` and its types, `Data`, `ModelSpec`, `GroupIds`, `FitOptions`, `Fit`
+and its methods, `FitError`, `limits` and the types around them), the
+`formula` frontend (`lower`, `fit`, `fit_lowered`, `predict`,
+`anova::compare`, `anova::term_tests`, `anova::nesting`, `pairwise`, their
+types and the error types), the `inference` types the two doors return, and
+`Simulator`. The crate docs hold the full list. The `loop_advanced`,
+`orchestrate`, `parallel` and `counters` features have no semver guarantee.
+The minimum supported Rust version is 1.85.
 
 ## Documentation
 

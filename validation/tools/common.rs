@@ -80,17 +80,19 @@ pub fn nums(xs: &[f64]) -> Value {
 }
 
 /// Load a grid cell's CSV → lower. Returns the lowered inputs, whether the
-/// family is Gaussian, and the cell's pre-registered eval cap. `manifest_dir`
-/// is the `validation/` crate dir (`CARGO_MANIFEST_DIR`, shared by every bin
-/// target regardless of which campaign subdir the source file sits in); grid
-/// data is campaign-local (`prep.R`'s output), under
-/// `campaigns/speed-campaign/data/`. Used by the grid drivers (`grid_fit`,
-/// `agq_par_probe`) — allow(dead_code) because `bit_identity` includes this file
-/// without calling it.
+/// family is Gaussian, and the cell's pre-registered eval cap. `data_dir` holds
+/// the cell CSVs: the speed campaign's own (`prep.R`'s output,
+/// `campaigns/speed-campaign/data/`) or another campaign's generated corpus.
+/// The CSV is `<data_dir>/<data>.csv`, where `data` is the cell's optional
+/// `data` field (several cells fitting one dataset, e.g. its REML and ML fits,
+/// or its Laplace and AGQ fits) and defaults to `case_id`. Used by the grid
+/// drivers (`grid_fit`, `agq_par_probe`) — allow(dead_code) because
+/// `bit_identity` includes this file without calling it.
 #[allow(dead_code)]
-pub fn lower_grid_cell(cell: &Value, manifest_dir: &str) -> (Lowered, bool, usize) {
+pub fn lower_grid_cell(cell: &Value, data_dir: &str) -> (Lowered, bool, usize) {
     let case_id = cell["case_id"].as_str().unwrap();
-    let path = format!("{manifest_dir}/campaigns/speed-campaign/data/{case_id}.csv");
+    let data_name = cell["data"].as_str().unwrap_or(case_id);
+    let path = format!("{data_dir}/{data_name}.csv");
     let (header, rows) = read_csv_path(&path);
     let factors: Vec<String> = cell["factors"]
         .as_array()
@@ -177,13 +179,13 @@ pub fn lower_dataset_generic(
 /// Load one manifest rung's CSV, build its formula string and `Family` from the manifest
 /// fields, lower it, and apply `weights_col`/`offset` — the block
 /// `bit_identity/dump.rs`'s `rung_record` needs before it can call `glmm::fit`.
-/// `manifest_dir` is the `validation/` crate dir (`CARGO_MANIFEST_DIR`), matching
-/// `lower_grid_cell`'s convention above. Returns the lowered inputs, the pre-typed
-/// `Table` (kept for a caller that re-lowers it for a construction-inclusive timing), the
-/// resolved `Family`, and the formula string lowering used (a re-lower needs the same
-/// string, not just the `Family`). Used by `bit_identity` — allow(dead_code) because
-/// `grid_fit`/`memory_fit`/`agq_par_probe` include this file without calling
-/// it (they lower grid cells or a bare CSV+formula pair instead of a manifest rung).
+/// `manifest_dir` is the `validation/` crate dir (`CARGO_MANIFEST_DIR`). Returns the
+/// lowered inputs, the pre-typed `Table` (kept for a caller that re-lowers it for a
+/// construction-inclusive timing), the resolved `Family`, and the formula string
+/// lowering used (a re-lower needs the same string, not just the `Family`). Used by
+/// `bit_identity` — allow(dead_code) because `grid_fit`/`memory_fit`/`agq_par_probe`
+/// include this file without calling it (they lower grid cells or a bare CSV+formula
+/// pair instead of a manifest rung).
 #[allow(dead_code)]
 pub fn lower_rung(spec: &Value, manifest_dir: &str) -> (Lowered, Table, Family, String) {
     let ds = spec["name"].as_str().expect("manifest entry missing name");
@@ -313,9 +315,9 @@ pub fn rx_options(opts: &FitOptions) -> FitOptions {
     o
 }
 
-/// Manifest's per-rung AGQ order (`spec["agq"]`), present only on the
-/// binomial/Poisson single-grouping-factor (q ≤ 3) rungs glmm's AGQ gate
-/// accepts. `bit_identity/dump.rs` applies it unconditionally so a move in the
+/// Manifest's per-rung AGQ order (`spec["agq"]`), present only on rungs glmm's
+/// AGQ gate accepts: a binomial, Poisson, negative-binomial or Gamma GLMM with a
+/// single grouping factor and at most 3 random effects per group (`q ≤ 3`). `bit_identity/dump.rs` applies it unconditionally so a move in the
 /// AGQ solve path (`src/glmm/agq.rs`) shows up in its report without a
 /// separate env var.
 #[allow(dead_code)]

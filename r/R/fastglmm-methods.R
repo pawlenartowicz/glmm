@@ -477,33 +477,61 @@ family.fastglmm <- function(object, ...) object$family
 #' @export
 model.frame.fastglmm <- function(formula, ...) formula$frame
 
-#' Wald confidence intervals
+#' Confidence intervals: Wald, or profile likelihood
 #'
-#' Intervals off the Wald standard errors that follow [summary()][summary.fastglmm]
-#' coefficient by coefficient: the t quantile on the row's degrees of freedom
-#' where the summary tests with t (Satterthwaite df on a Gaussian mixed model,
-#' `n - p` on OLS and the Gamma and inverse-Gaussian GLMs, as [stats::confint.lm]),
-#' the normal quantile where it tests with z. On a Gaussian mixed model fitted
-#' with `satterthwaite = FALSE` the intervals are normal and a message says the
-#' df were not computed. The Python port's `Fit.confint()` computes the same
-#' intervals through the same kernel function. `method = "profile"` and
-#' `method = "boot"` are not available: the engine has no profiling
-#' machinery, and bootstrap needs refitting infrastructure not built yet.
+#' `method = "Wald"` (the default) gives intervals off the Wald standard errors
+#' that follow [summary()][summary.fastglmm] coefficient by coefficient: the t
+#' quantile on the row's degrees of freedom where the summary tests with t
+#' (Satterthwaite df on a Gaussian mixed model, `n - p` on OLS and the Gamma and
+#' inverse-Gaussian GLMs, as [stats::confint.lm]), the normal quantile where it
+#' tests with z. On a Gaussian mixed model fitted with `satterthwaite = FALSE`
+#' the intervals are normal and a message says the df were not computed. The
+#' Python port's `Fit.confint()` computes the same intervals through the same
+#' kernel function.
+#'
+#' `method = "profile"` gives profile-likelihood intervals of a Gaussian mixed
+#' model, as lme4's `confint(method = "profile")` computes them: one row per
+#' random-effect SD and correlation, the residual SD and coefficient, named as
+#' lme4 names them (`"sd_(Intercept)|Subject"`, `"cor_Days.(Intercept)|Subject"`,
+#' `"sigma"`, then the coefficients). Each parameter is held at points on each
+#' side of its estimate while the others are re-optimized, and a bound is where
+#' the signed root of the deviance change reaches the normal quantile of
+#' `level`. The profiles are of the ML deviance: a REML fit is refitted by ML
+#' first, as lme4 does. An SD estimated at 0 has 0 as its lower bound, and a
+#' correlation whose profile stays inside the cutoff up to -1 or 1 has that
+#' limit. An undetermined bound is `NA`. A GLMM, a model without random
+#' effects, and a design with an aliased column are refused with an error. The
+#' Python port's `Fit.profile_confint()` computes the same intervals.
+#'
+#' `method = "boot"` is not available: bootstrap intervals need refitting
+#' infrastructure not built yet.
 #'
 #' @param object a [fastglmm] fit.
-#' @param parm coefficients to include (names or indices; default all).
+#' @param parm the rows to include (default all). With `method = "Wald"`,
+#'   coefficient names or indices; with `method = "profile"`, row names, or
+#'   lme4's shortcuts `"theta_"` (the SDs, correlations and `"sigma"`) and
+#'   `"beta_"` (the coefficients).
 #' @param level confidence level.
-#' @param method only `"Wald"`.
+#' @param method `"Wald"` or `"profile"`.
 #' @param ... unused.
-#' @return A matrix with one row per coefficient; aliased coefficients are
-#'   `NaN` rows.
+#' @return A matrix of lower and upper bounds. With `method = "Wald"`, one row
+#'   per coefficient, aliased coefficients `NaN` rows; with
+#'   `method = "profile"`, one row per profiled parameter in glmm's order
+#'   (per grouping the SDs and correlations column-major, each SD followed by
+#'   its correlations, then `sigma`, then the coefficients; lme4 2.0 lists a
+#'   block's SDs before its correlations, so match rows to lme4's by name),
+#'   `NA` for an undetermined bound.
 #' @export
 confint.fastglmm <- function(object, parm, level = 0.95,
-                             method = "Wald", ...) {
-  if (!identical(method, "Wald")) {
-    stop("confint(method = \"", method, "\") is not available: the engine ",
-         "has no profiling machinery; only method = \"Wald\" is supported",
+                             method = c("Wald", "profile"), ...) {
+  if (identical(method, c("Wald", "profile"))) method <- "Wald"
+  if (!(is.character(method) && length(method) == 1L && method %in% c("Wald", "profile"))) {
+    stop("confint(method = ", paste(deparse(method), collapse = ""), ") is not available; ",
+         "method = \"Wald\" and method = \"profile\" are supported",
          call. = FALSE)
+  }
+  if (identical(method, "profile")) {
+    return(.profile_confint(object, if (missing(parm)) NULL else as.character(parm), level))
   }
   est <- object$beta
   if (missing(parm)) parm <- names(est)
@@ -514,11 +542,32 @@ confint.fastglmm <- function(object, parm, level = 0.95,
                          as.double(coef_df), as.double(level))
   out <- cbind(stats::setNames(ci$lower, names(est)),
                stats::setNames(ci$upper, names(est)))[parm, , drop = FALSE]
-  a <- (1 - level) / 2
-  colnames(out) <- paste(format(100 * c(a, 1 - a), trim = TRUE, scientific = FALSE,
-                                digits = 3), "%")
+  colnames(out) <- .ci_colnames(level)
   footer <- .df_footer(object)
   if (identical(.df_method(object), "disabled")) message(footer)
+  out
+}
+
+# confint()'s column names, "2.5 %" and "97.5 %" at level 0.95, as stats
+# names them.
+.ci_colnames <- function(level) {
+  a <- (1 - level) / 2
+  paste(format(100 * c(a, 1 - a), trim = TRUE, scientific = FALSE, digits = 3), "%")
+}
+
+# confint(method = "profile"): fastglmm_profile_intervals() on the fit's
+# training columns, as lme4's bounds matrix; NaN (an undetermined bound)
+# becomes NA.
+.profile_confint <- function(object, parm, level) {
+  train <- .training_columns(object)
+  r <- fastglmm_profile_intervals(
+    object$formula, train$numeric, train$levels, train$codes,
+    object$family_name, object$link, .optional(train$weights), .optional(train$offset),
+    isTRUE(object$reml), as.double(level), parm
+  )
+  out <- cbind(r$lower, r$upper)
+  out[is.nan(out)] <- NA_real_
+  dimnames(out) <- list(r$names, .ci_colnames(level))
   out
 }
 
@@ -749,7 +798,9 @@ predict.fastglmm <- function(object, newdata, re.form = NULL, type = c("link", "
     object$family_name, object$link, .optional(train$weights), .optional(train$offset),
     .stored_numbers(object), has_new, new$numeric, new$levels, new$codes,
     as.double(length(rows)), type, population, allow.new.levels, se.fit,
-    as.double(level), future
+    as.double(level), future,
+    # New rows are the caller's own: newdata with a missing value is refused.
+    if (has_new) integer() else .row_index(object)
   )
   for (note in r$notes) {
     if (!identical(note$kind, "new_grouping_levels")) next
@@ -815,7 +866,7 @@ simulate.fastglmm <- function(object, nsim = 1, seed = NULL, ...) {
   draws <- fastglmm_simulate(
     object$formula, train$numeric, train$levels, train$codes,
     object$family_name, object$link, .optional(train$weights), .optional(train$offset),
-    .stored_numbers(object), as.double(nsim), as.double(seed)
+    .stored_numbers(object), as.double(nsim), as.double(seed), .row_index(object)
   )
   out <- as.data.frame(matrix(draws, nrow = object$nobs, ncol = nsim))
   names(out) <- paste0("sim_", seq_len(nsim))
@@ -823,6 +874,10 @@ simulate.fastglmm <- function(object, nsim = 1, seed = NULL, ...) {
   attr(out, "seed") <- seed
   out
 }
+
+# Each model frame row's 1-based position in the caller's data, or integer()
+# (the frame's own rows, counted from 1) on a fit saved before it was kept.
+.row_index <- function(object) as.integer(object$.row_index %||% integer())
 
 # The fit's training columns as fastglmm() marshalled them: the model frame
 # again, with its weights and offset.

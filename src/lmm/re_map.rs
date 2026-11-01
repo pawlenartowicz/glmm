@@ -11,7 +11,7 @@
 
 use faer::MatRef;
 
-use super::{primary_lambda, LmmGroupings};
+use super::{primary_lambda, LmmGroupings, PIN_THETA};
 use crate::standardize::ColumnScaling;
 
 /// Pivot floor of [`semidef_lower_chol`]. A pivot at or below it is a removed
@@ -20,8 +20,17 @@ use crate::standardize::ColumnScaling;
 pub(crate) enum PivotFloor {
     /// `q·eps·tr Σ` on every column: round-off in forming Σ and in the
     /// factorization is `O(q·eps·‖Σ‖₂)` and `‖Σ‖₂ ≤ tr Σ` for PSD Σ. The floor
-    /// that canonicalizes a pinned search endpoint.
+    /// that re-factors a pinned endpoint's Λ without changing Σ.
     Trace,
+    /// The trace floor, and a pivot whose square root is at or below
+    /// `PIN_THETA` is skipped too: the pin applied inside the factorization.
+    /// The skipped column of `L` stays exactly zero, and its pivot (at most
+    /// `PIN_THETA²`) and its conditional covariances with the later columns
+    /// are dropped from Σ, while the rest of its mass stays in the trailing
+    /// Schur complement. The factor that canonicalizes a pinned search
+    /// endpoint: no diagonal is left at or below the threshold, so no zero
+    /// diagonal sits above a live entry.
+    Pin,
     /// `q·eps·Σ_cc` on column `c`, keeping at most `max_rank` pivots: the
     /// coordinate maps' floor. A pivot `Σ_cc − Σₖ L_ck²` is a difference of
     /// numbers no larger than `Σ_cc`, so its rounding is `O(q·eps·Σ_cc)`. The
@@ -43,7 +52,7 @@ pub(crate) enum PivotFloor {
 /// diagonal), under `floor`. A NaN pivot is treated as a removed rank.
 pub(crate) fn semidef_lower_chol(sig: &[f64], q: usize, l: &mut [f64], floor: PivotFloor) {
     let max_rank = match floor {
-        PivotFloor::Trace => q,
+        PivotFloor::Trace | PivotFloor::Pin => q,
         PivotFloor::Column { max_rank } => max_rank,
     };
     let accepted = chol_pass(sig, q, l, floor, 0);
@@ -80,14 +89,14 @@ pub(crate) fn semidef_lower_chol(sig: &[f64], q: usize, l: &mut [f64], floor: Pi
 fn chol_pass(sig: &[f64], q: usize, l: &mut [f64], floor: PivotFloor, forced: u64) -> usize {
     let eps_q = q as f64 * f64::EPSILON;
     let trace_tol = match floor {
-        PivotFloor::Trace => eps_q * (0..q).map(|r| sig[r * q + r]).sum::<f64>(),
+        PivotFloor::Trace | PivotFloor::Pin => eps_q * (0..q).map(|r| sig[r * q + r]).sum::<f64>(),
         PivotFloor::Column { .. } => 0.0,
     };
     l[..q * q].fill(0.0);
     let mut accepted = 0;
     for c in 0..q {
         let tol = match floor {
-            PivotFloor::Trace => trace_tol,
+            PivotFloor::Trace | PivotFloor::Pin => trace_tol,
             PivotFloor::Column { .. } => eps_q * sig[c * q + c],
         };
         let mut d = sig[c * q + c];
@@ -97,8 +106,11 @@ fn chol_pass(sig: &[f64], q: usize, l: &mut [f64], floor: PivotFloor, forced: u6
         if (c < 64 && forced & (1 << c) != 0) || d <= tol || d.is_nan() {
             continue;
         }
-        accepted += 1;
         let lcc = d.sqrt();
+        if matches!(floor, PivotFloor::Pin) && lcc <= PIN_THETA {
+            continue;
+        }
+        accepted += 1;
         l[c * q + c] = lcc;
         for r in (c + 1)..q {
             let mut s = sig[r * q + c];
@@ -142,7 +154,7 @@ impl LmmGroupings {
     /// `(mᵣ/sᵣ, sᵣ)` of row `r` of block `b` (`b == 0` primary) under the fit's
     /// column standardization `cs`, read off the row's design column; row 0,
     /// the intercept, is left as it is.
-    fn block_std(&self, b: usize, r: usize, cs: &ColumnScaling) -> (f64, f64) {
+    pub(crate) fn block_std(&self, b: usize, r: usize, cs: &ColumnScaling) -> (f64, f64) {
         if r == 0 {
             return (0.0, 1.0);
         }

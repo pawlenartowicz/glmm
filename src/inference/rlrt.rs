@@ -363,21 +363,14 @@ pub(crate) struct RlrtConfig {
 
 /// The simulated null distribution of the RLRT on one design, built from the
 /// design alone by [`rlrt_null`], so any number of observed statistics on
-/// that design read their p-value from it ([`RlrtNull::p_value`]). The
-/// fields no caller reads (`n_zero`, `edge_hits`) exist in tests only.
+/// that design read their p-value from it ([`RlrtNull::p_value`]).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RlrtNull {
     /// The positive draws, sorted ascending.
     pub(crate) draws_pos: Vec<f64>,
-    /// Draws exactly zero (the profile's maximum at `λ = 0`).
-    #[cfg(test)]
-    pub(crate) n_zero: usize,
-    /// Draws in all, `n_zero + draws_pos.len()`.
+    /// Draws in all: the positive ones and those exactly zero (the profile's
+    /// maximum at `λ = 0`).
     pub(crate) nsim: usize,
-    /// Draws whose maximum sits on the last grid point, where the supremum
-    /// may lie beyond the grid.
-    #[cfg(test)]
-    pub(crate) edge_hits: usize,
 }
 
 impl RlrtNull {
@@ -460,29 +453,19 @@ pub(crate) fn null_draws(design: &RlrtDesign, cfg: &RlrtConfig) -> Vec<(f64, usi
 }
 
 /// The simulated null of `design` ([`null_draws`]): the positive draws
-/// sorted, the zeros and the grid-edge hits counted, and the `nsim` of `cfg`
-/// carried.
+/// sorted, and the `nsim` of `cfg` carried.
 pub(crate) fn rlrt_null(design: &RlrtDesign, cfg: &RlrtConfig) -> RlrtNull {
     let draws = null_draws(design, cfg);
     // An index-0 maximum is exactly `+0.0` and any other is positive.
     let mut draws_pos: Vec<f64> = draws.iter().map(|d| d.0).filter(|&t| t > 0.0).collect();
     draws_pos.sort_unstable_by(f64::total_cmp);
     RlrtNull {
-        #[cfg(test)]
-        n_zero: cfg.nsim - draws_pos.len(),
         draws_pos,
         nsim: cfg.nsim,
-        #[cfg(test)]
-        edge_hits: draws
-            .iter()
-            .filter(|d| d.1 == LAMBDA_GRID.len() - 1)
-            .count(),
     }
 }
 
-/// The exact RLRT of one fit, as [`exact_rlrt`] returns it. The fields no
-/// caller reads yet (`mass_at_zero`, `mc_se`, `k_eigen`, `edge_hits`) exist
-/// in tests only.
+/// The exact RLRT of one fit, as [`exact_rlrt`] returns it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct RlrtResult {
     /// The observed statistic ([`rlrt_statistic`]).
@@ -495,20 +478,6 @@ pub(crate) struct RlrtResult {
     pub(crate) nsim: usize,
     /// The caller's seed.
     pub(crate) seed: u64,
-    /// The null's share of exact zeros, `n_zero / nsim`; NaN when no draws
-    /// were made.
-    #[cfg(test)]
-    pub(crate) mass_at_zero: f64,
-    /// The Monte Carlo standard error of the p-value, `√(p(1 − p)/nsim)`;
-    /// `0` on a zero statistic, whose p-value is exact.
-    #[cfg(test)]
-    pub(crate) mc_se: f64,
-    /// The design's nonzero eigenvalues, `k`.
-    #[cfg(test)]
-    pub(crate) k_eigen: usize,
-    /// Draws whose maximum sits on the last grid point.
-    #[cfg(test)]
-    pub(crate) edge_hits: usize,
 }
 
 /// The exact RLRT of a `(1 | g)` fit against the OLS fit with the same `X`:
@@ -520,12 +489,11 @@ pub(crate) struct RlrtResult {
 /// positive, the null of `cfg` ([`rlrt_null`]) and its p-value.
 ///
 /// A zero statistic (pinned, or the full fit no better than `θ = 0`) gives
-/// `p = 1` with no draws: `nsim = 0` (and, in tests, `mass_at_zero` NaN and
-/// `mc_se = 0`), so no caller reports a draw count that was never made. A
-/// NaN statistic gives a NaN p-value, also with no draws. `cfg.nsim = 0` on
-/// a positive statistic is a caller error that gives a NaN p-value. A
-/// refusal comes before the statistic is read, so a pinned fit on a design
-/// the test cannot handle is still refused.
+/// `p = 1` with no draws: `nsim = 0`, so no caller reports a draw count that
+/// was never made. A NaN statistic gives a NaN p-value, also with no draws.
+/// `cfg.nsim = 0` on a positive statistic is a caller error that gives a NaN
+/// p-value. A refusal comes before the statistic is read, so a pinned fit on
+/// a design the test cannot handle is still refused.
 pub(crate) fn exact_rlrt(
     counts: &[f64],
     s: &[f64],
@@ -545,14 +513,6 @@ pub(crate) fn exact_rlrt(
             p_value,
             nsim: 0,
             seed: cfg.seed,
-            #[cfg(test)]
-            mass_at_zero: f64::NAN,
-            #[cfg(test)]
-            mc_se: if statistic == 0.0 { 0.0 } else { f64::NAN },
-            #[cfg(test)]
-            k_eigen: design.mu.len(),
-            #[cfg(test)]
-            edge_hits: 0,
         });
     }
     let null = rlrt_null(&design, cfg);
@@ -562,14 +522,6 @@ pub(crate) fn exact_rlrt(
         p_value,
         nsim: cfg.nsim,
         seed: cfg.seed,
-        #[cfg(test)]
-        mass_at_zero: null.n_zero as f64 / cfg.nsim as f64,
-        #[cfg(test)]
-        mc_se: (p_value * (1.0 - p_value) / cfg.nsim as f64).sqrt(),
-        #[cfg(test)]
-        k_eigen: design.mu.len(),
-        #[cfg(test)]
-        edge_hits: null.edge_hits,
     })
 }
 

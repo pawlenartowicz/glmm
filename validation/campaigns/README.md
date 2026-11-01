@@ -48,3 +48,9 @@ where each engine files them — this scoring policy is deliberate, keep it.
 and `plot_comparison.R` → `reports/`. `external/`, `data/`, `results/` are
 gitignored (local, regenerable); `truth/` is committed.
 **Rerun:** `./gen.sh && ./batch.sh`, then the summarize/plot scripts.
+
+## boundary-probe: post-pin mechanisms on boundary fits
+
+A before/after measurement of the mechanisms that act after a variance is
+pinned at zero, on seeded corpora of boundary fits, run through
+`speed-campaign`'s `grid_fit`; see its README.

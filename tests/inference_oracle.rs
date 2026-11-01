@@ -50,6 +50,11 @@
 //! rows of [`pairwise`] (quantity `posthoc`) and their intervals (`confint`)
 //! against emmeans'.
 //!
+//! The profile-likelihood intervals (`kind` `profile`): [`profile_intervals`]
+//! reads each bound of [`Fit::profile_intervals`] against lme4's
+//! `confint(method = "profile")`, after a hard gate on the ML deviance the
+//! profiles start from. It has no registry quantity.
+//!
 //! The extended-precision GLM references on ill-conditioned designs (`kind`
 //! `conditioning`, with `loop_advanced`) gate one fit:
 //! `design_b_logit_halves_back_from_an_overshoot` asserts that design b's
@@ -84,7 +89,7 @@ use glmm::formula::anova::{
 };
 use glmm::formula::{fit_lowered, pairwise, Adjust, By, Column, Model, Pairwise};
 use glmm::inference::{LinearKind, LinearTest, LrTest, Reference};
-use glmm::orchestrate::run_fit;
+use glmm::orchestrate::{profile_names, run_fit};
 use glmm::{
     BinomialLink, Family, Fit, FitOptions, GammaLink, NegBinomialLink, Note, PoissonLink, WaldSe,
 };
@@ -112,6 +117,7 @@ const GATES: &[(&str, Gate)] = &[
     ("anova_lrt_rows", anova_lrt_rows),
     ("effect_sizes", effect_sizes),
     ("posthoc_rows", posthoc_rows),
+    ("profile_intervals", profile_intervals),
 ];
 
 fn numbers(v: &Value, what: &str) -> Vec<f64> {
@@ -156,7 +162,7 @@ fn fit_lmertest_references() -> Vec<RefFit> {
             let (lo, fit_opts) = inference_lowered(&e);
             let fit = glmm::fit(&lo.data(), lo.spec(), &fit_opts).unwrap();
             assert_eq!(
-                Some(fit.reml),
+                Some(fit.reml()),
                 e.raw["reml"].as_bool(),
                 "{}: the fit's criterion",
                 e.name
@@ -205,7 +211,7 @@ fn lmertest_end_to_end(compared: &mut BTreeSet<String>) {
     for (name, json, fit, cols) in lmertest_fits() {
         if is_ml(json) {
             let dev_ref = json["deviance"].as_f64().expect("deviance");
-            let d = -2.0 * fit.loglik - dev_ref;
+            let d = -2.0 * fit.loglik() - dev_ref;
             eprintln!("LMERTEST {name}: ML deviance gap {d:.3e}");
             assert!(
                 d.abs() <= oracle_support::DEV_BIG,
@@ -220,7 +226,7 @@ fn lmertest_end_to_end(compared: &mut BTreeSet<String>) {
         let worst = cols
             .iter()
             .enumerate()
-            .map(|(i, &j)| ((fit.coef_df[j] - want[i]) / want[i]).abs())
+            .map(|(i, &j)| ((fit.coef_df()[j] - want[i]) / want[i]).abs())
             .fold(0.0, f64::max);
         eprintln!(
             "LMERTEST {name}: df max rel {worst:.2e} (band {:.0e})",
@@ -228,7 +234,7 @@ fn lmertest_end_to_end(compared: &mut BTreeSet<String>) {
         );
         for (i, &j) in cols.iter().enumerate() {
             assert_rel(
-                fit.coef_df[j],
+                fit.coef_df()[j],
                 want[i],
                 tol::DF_E2E_REL,
                 &format!("{name}: df[{i}]"),
@@ -250,7 +256,7 @@ fn lmertest_confint(compared: &mut BTreeSet<String>) {
     for (name, json, fit, cols) in lmertest_fits() {
         let level = json["level"].as_f64().expect("level");
         let (lower, upper) = (numbers(&json["lower"], name), numbers(&json["upper"], name));
-        let ci = glmm::orchestrate::confint(&fit.beta, &fit.se, &fit.coef_df, level)
+        let ci = glmm::orchestrate::confint(fit.beta(), fit.se(), fit.coef_df(), level)
             .unwrap_or_else(|err| panic!("{name}: {err}"));
         let worst = cols
             .iter()
@@ -394,7 +400,7 @@ fn number(v: &Value, what: &str) -> f64 {
 fn deviance_gate(ctx: &str, sides: [(&Fit, f64); 2]) -> bool {
     let mut improved = false;
     for (i, (fit, loglik)) in sides.into_iter().enumerate() {
-        let d = -2.0 * fit.loglik + 2.0 * loglik;
+        let d = -2.0 * fit.loglik() + 2.0 * loglik;
         eprintln!("ANOVA {ctx}: side {i} deviance gap {d:.3e}");
         assert!(
             d.abs() <= oracle_support::DEV_BIG,
@@ -669,7 +675,7 @@ fn anova_term_rows(compared: &mut BTreeSet<String>) {
                 "{name}: the Wald SEs must be the Hessian ones (car's vcov is lme4's Hessian)"
             );
             assert!(
-                !fit.diagnostics
+                !fit.diagnostics()
                     .notes
                     .iter()
                     .any(|n| matches!(n, Note::HessianSeFallback)),
@@ -1047,6 +1053,94 @@ fn effect_sizes(compared: &mut BTreeSet<String>) {
         (7, 6),
         "effect_sizes: entries with R² and ICC, entries with η² rows"
     );
+}
+
+// ── Profile-likelihood intervals ────────────────────────────────────────────
+
+/// The profile-likelihood intervals of the `profile` references: each
+/// member fitted as [`fit_member`] fits it, then [`Fit::profile_intervals`]
+/// at the reference's level. First the ML deviance the profiles start from,
+/// hard: glmm's at most lme4's `deviance(refitML(m))` plus `DEV_EPS`, and
+/// within `DEV_BIG` of it. Then every row, matched to the frozen row of the
+/// same name ([`profile_names`]), with the same parameters both ways: each
+/// bound within `PROFILE_CI_REL` of lme4's interval width, and a bound lme4
+/// puts at exactly 0 exactly 0 here too. The frozen rows of an entry with
+/// `beta_method` `offset_refit` carry coefficient bounds from ML refits with
+/// the coefficient held through an offset, gated the same; the worst is
+/// printed per `method`. No registry entry excuses a miss.
+fn profile_intervals(compared: &mut BTreeSet<String>) {
+    let mut worst: BTreeMap<String, (f64, String)> = BTreeMap::new();
+    let (mut entries, mut rows) = (0, 0);
+    for e in inference::entries(inference::Kind::Profile) {
+        assert!(!e.is_pending(), "{}: not frozen", e.name);
+        let name = e.name.as_str();
+        let json = inference::load(inference::Kind::Profile, name);
+        let side = fit_member(&e, &e.raw["members"][0]);
+        let (lo, fit) = (side.model.lowered(), side.model.fit());
+        let level = number(&json["level"], &format!("{name}: level"));
+        let ci = fit
+            .profile_intervals(&lo.data(), lo.spec(), level, None)
+            .unwrap_or_else(|err| panic!("{name}: {err}"));
+        let dev = number(&json["deviance"], &format!("{name}: deviance"));
+        let d = ci.deviance - dev;
+        eprintln!(
+            "PROFILE {name}: deviance glmm {:.10e} lme4 {dev:.10e} gap {d:.3e}",
+            ci.deviance
+        );
+        assert!(
+            d.abs() <= oracle_support::DEV_BIG,
+            "{name}: |Δdev|={d:.3e} > DEV_BIG, suspected convention mismatch"
+        );
+        assert!(
+            d <= oracle_support::DEV_EPS,
+            "{name}: Δdev={d:.3e} > DEV_EPS, worse ML optimum than lme4's"
+        );
+        let params: Vec<_> = ci.rows.iter().map(|r| r.param).collect();
+        let names = profile_names(lo, &params);
+        let frozen = json["rows"].as_array().expect("profile rows");
+        assert_eq!(names.len(), frozen.len(), "{name}: one row per parameter");
+        for f in frozen {
+            let p = f["parameter"].as_str().expect("a parameter name");
+            assert!(names.iter().any(|n| n == p), "{name}: no glmm row {p}");
+        }
+        for (row, pname) in ci.rows.iter().zip(&names) {
+            let f = frozen
+                .iter()
+                .find(|f| f["parameter"].as_str() == Some(pname.as_str()))
+                .unwrap_or_else(|| panic!("{name}: no frozen row {pname}"));
+            let method = f["method"].as_str().expect("a row method");
+            let lower = number(&f["lower"], &format!("{name}: {pname} lower"));
+            let upper = number(&f["upper"], &format!("{name}: {pname} upper"));
+            let width = upper - lower;
+            for (bound, got, want) in [("lower", row.lower, lower), ("upper", row.upper, upper)] {
+                let rel = ((got - want) / width).abs();
+                eprintln!(
+                    "PROFILE {name}: {pname} {bound} glmm {got:.10e} lme4 {want:.10e} \
+                     rel {rel:.3e} ({method})"
+                );
+                if want == 0.0 {
+                    assert_eq!(got, 0.0, "{name}: {pname} {bound} at lme4's 0");
+                }
+                assert!(
+                    rel <= tol::PROFILE_CI_REL,
+                    "{name}: {pname} {bound} glmm={got} lme4={want} \
+                     (|diff|/width {rel:.3e} > {:.0e})",
+                    tol::PROFILE_CI_REL
+                );
+                for key in [name.to_string(), method.to_string()] {
+                    let w = worst.entry(key).or_insert((0.0, String::new()));
+                    if rel > w.0 {
+                        *w = (rel, format!("{name}: {pname} {bound}"));
+                    }
+                }
+            }
+            rows += 1;
+        }
+        entries += 1;
+        compared.insert(e.name.clone());
+    }
+    eprintln!("PROFILE worst |diff|/width per entry and per method: {worst:?}");
+    assert_eq!((entries, rows), (4, 19), "profile_intervals: entries, rows");
 }
 
 // ── Pairwise comparisons ────────────────────────────────────────────────────
@@ -1467,7 +1561,11 @@ fn lmertest_term_rows_match_anova() {
         let formula = e.r_formula.as_deref().expect("the entry has a formula");
         let model = fit_lowered(formula, lo, &fit_opts).unwrap();
         let fit = model.fit();
-        assert_eq!(Some(fit.reml), json["reml"].as_bool(), "{name}: criterion");
+        assert_eq!(
+            Some(fit.reml()),
+            json["reml"].as_bool(),
+            "{name}: criterion"
+        );
         for (table, ss_type) in [("type3", SsType::Type3), ("type2", SsType::Type2)] {
             let frozen = &json[table];
             let terms = frozen["terms"].as_array().expect("terms");

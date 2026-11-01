@@ -4,13 +4,14 @@
 //! vectorize; profiling put them at ~51% of the no-extras GLMM fit).
 //!
 //! Two primitives, on exactly the domains the fit path needs — the stable
-//! sigmoid (`glm::sigmoid_stable`) and `log1pexp` — namely `exp` of a non-positive
-//! argument and `log1p` of `z ∈ (0,1]`:
+//! sigmoid (`glm::sigmoid_stable`) and `log1pexp` — namely `exp` (of a
+//! non-positive argument there, of a signed one in the probit and AGQ tiles) and
+//! `log1p` of `z ∈ (0,1]`:
 //!   - `exp` on `[−700, 700]` (clamped): Cody-Waite reduce `x = k·ln2 + r`,
 //!     degree-11 minimax `exp(r)` on `[-ln2/2, ln2/2]`, scale by `2^k`. The
-//!     reduction is sign-agnostic, so the same kernel serves the fit path's
-//!     non-positive arguments and the generation-side full-domain entries
-//!     (`exp_clamped`/`exp_fill`).
+//!     reduction is sign-agnostic, so the same kernel serves the non-positive
+//!     arguments and the full-domain entries (`exp_clamped`/`exp_fill`, the
+//!     probit `φ(η)` tiles and the AGQ `expm1` tiles).
 //!   - `log1p` on `(0,1]`: fdlibm form `f - (hfsq - s·(hfsq + R))`, `s = f/(2+f)`,
 //!     `R = w·h(w)`, `w = s²`, degree-9 minimax `h`. Keeps the dominant `f - ½f²`
 //!     exact → tail-safe (never forms `1+z`) and ≤1 ULP.
@@ -102,9 +103,8 @@ const EXP_ARG_FLOOR: f64 = -700.0;
 // Upper clamp twin for the full-domain entries (`exp_clamped`/`exp_fill`): the
 // Cody-Waite reduction and the EXP_C polynomial are sign-agnostic (r ∈
 // [−ln2/2, ln2/2] either way) and the FP-magic 2^k build holds for k+1023 ≤ 2046
-// (x ≤ ~709) — 700 keeps symmetric headroom. exp(700) ≈ 1e304, finite; the
-// generation-side caller (hsk lognormal multiplier) saturates astronomically
-// rarely there, where libm would be approaching f64::MAX/inf anyway.
+// (x ≤ ~709) — 700 keeps symmetric headroom. exp(700) ≈ 1e304, finite; where
+// it saturates, libm would be approaching f64::MAX/inf anyway.
 const EXP_ARG_CEIL: f64 = 700.0;
 
 // fma policy: see the module header ("fma policy"). `FUSED` is a const generic
@@ -338,47 +338,6 @@ pub(crate) fn pw_and_log1pexp_sum(eta: &[f64], p: &mut [f64], w: &mut [f64]) -> 
     pulp::Arch::new().dispatch(PwLog1pexpOp::<{ FUSED_DEFAULT }> { eta, p, w })
 }
 
-struct SigmoidInplaceOp<'a, const FUSED: bool> {
-    buf: &'a mut [f64],
-}
-impl<const FUSED: bool> pulp::WithSimd for SigmoidInplaceOp<'_, FUSED> {
-    type Output = ();
-    #[inline(always)]
-    fn with_simd<S: Simd>(self, simd: S) {
-        let one = simd.splat_f64s(1.0);
-        let (head, tail) = S::as_mut_simd_f64s(self.buf);
-        for x in head.iter_mut() {
-            let (z, mask) = simd_z_mask::<S, FUSED>(simd, *x);
-            let opz = simd.add_f64s(one, z);
-            *x = simd.select_f64s(mask, simd.div_f64s(one, opz), simd.div_f64s(z, opz));
-        }
-        for x in tail.iter_mut() {
-            let z = scalar_z::<FUSED>(*x);
-            *x = if *x >= 0.0 {
-                1.0 / (1.0 + z)
-            } else {
-                z / (1.0 + z)
-            };
-        }
-    }
-}
-
-/// In-place `buf[i] = sigmoid(buf[i])` for the generation-side binary-outcome
-/// draw — SIMD head + bit-identical scalar tail, p only (the fit path's fused
-/// (p, w, Σlog1pexp) variant is `pw_and_log1pexp_sum`).
-#[inline]
-pub fn sigmoid_fill(buf: &mut [f64]) {
-    pulp::Arch::new().dispatch(SigmoidInplaceOp::<{ FUSED_DEFAULT }> { buf });
-}
-
-/// Owned scalar `exp` on (−∞, 0], platform-default fma policy, argument clamped
-/// to the kernel's 2^k domain. The generation-side replacement for libm `.exp()`
-/// at non-positive arguments (erfc's `exp(−x²)`); ≤1 ULP of libm.
-#[inline]
-pub fn exp_nonpos(x: f64) -> f64 {
-    scalar_exp_reduced::<{ FUSED_DEFAULT }>(x.max(EXP_ARG_FLOOR))
-}
-
 /// Owned scalar `exp` on the full certified domain `[−700, 700]` (two-sided
 /// clamp); ≤1 ULP of libm. Scalar tail twin of `exp_fill`.
 pub(crate) fn exp_clamped(x: f64) -> f64 {
@@ -404,113 +363,24 @@ impl<const FUSED: bool> pulp::WithSimd for ExpInplaceOp<'_, FUSED> {
     }
 }
 
-/// In-place `buf[i] = exp(buf[i])`, argument clamped to `[−700, 700]` — the
-/// generation-side column pass for the heteroskedasticity lognormal multiplier.
+/// In-place `buf[i] = exp(buf[i])`, argument clamped to `[−700, 700]`: the
+/// probit `φ(η)` tiles (`family`) and the AGQ `expm1` tiles (`glmm::agq_fast`).
 /// SIMD head + bit-identical scalar tail (`exp_clamped`).
 #[inline]
-pub fn exp_fill(buf: &mut [f64]) {
+pub(crate) fn exp_fill(buf: &mut [f64]) {
     pulp::Arch::new().dispatch(ExpInplaceOp::<{ FUSED_DEFAULT }> { buf });
 }
 
-// ln(u) on the censored-Φ domain: bit-trick range reduction reusing LOG1P_H —
-// ln(u) = k·ln2 + log1p(m−1) with the fdlibm √2-normalization m ∈ [√2/2, √2)
-// (k = round(log2 u)): a plain m ∈ [1,2) reduction cancels catastrophically as
-// u → 1 (k=−1 against log1p(2u−1) → ln2, measured ~5000 ULP); √2-normalizing
-// gives k=0 there and feeds log1p the small argument directly. m comes from
-// forcing the exponent field to 1023 (AND mantissa, OR bits(1.0)), then a
-// halving select for the m ≥ √2 half. LOG1P_H stays valid: its w = s² domain
-// only shrinks (|s| ≤ 0.172 → w ≤ 0.0295 ⊂ [0, 1/9]). pulp 0.22 exposes no
-// 64-bit integer shift or u64→f64 convert, so k is recovered with an 11-step
-// compare-ladder kf = −Σ_{j=1..11} [u < √2·2^−j] (exactly consistent with the
-// m ≥ √2 select — the thresholds are exact 2^−j scalings of the same √2). The
-// two-sided clamp makes the ladder total on the skewed-marginal call site:
-// u ≤ 2^−11 → ln(2^−11) = −7.625, past the −EXP_CAP censor either way (the
-// censored-Exp(1) cap ≈ 6.96), so the capped output matches libm's exactly;
-// u = 1.0 (Φ saturates only at |z| ≳ 8.3, outside the generated ±6-SD latent
-// range) → ln(1 − 2^−53) ≈ −1.1e-16 instead of −0.0.
-const LN_U_FLOOR: f64 = 4.8828125e-4; // 2^-11
-const LN_U_CEIL: f64 = f64::from_bits(0x3FEF_FFFF_FFFF_FFFF); // 1 − 2^-53
-const ONE_BITS: u64 = 0x3FF0_0000_0000_0000;
-
-#[inline]
-fn scalar_ln_unit<const FUSED: bool>(u: f64) -> f64 {
-    let u = u.clamp(LN_U_FLOOR, LN_U_CEIL);
-    let mut kf = 0.0f64;
-    let mut th = std::f64::consts::SQRT_2 * 0.5;
-    for _ in 0..11 {
-        if u < th {
-            kf -= 1.0;
-        }
-        th *= 0.5;
-    }
-    let m = f64::from_bits((u.to_bits() & MANT_MASK) | ONE_BITS);
-    let m = if m < std::f64::consts::SQRT_2 {
-        m
-    } else {
-        0.5 * m
-    };
-    let l = scalar_log1p_unit::<FUSED>(m - 1.0);
-    fmadd_scalar::<FUSED>(kf, LN2HI, fmadd_scalar::<FUSED>(kf, LN2LO, l))
-}
-
-struct LnInplaceOp<'a, const FUSED: bool> {
-    buf: &'a mut [f64],
-}
-impl<const FUSED: bool> pulp::WithSimd for LnInplaceOp<'_, FUSED> {
-    type Output = ();
-    #[inline(always)]
-    fn with_simd<S: Simd>(self, simd: S) {
-        let one = simd.splat_f64s(1.0);
-        let (head, tail) = S::as_mut_simd_f64s(self.buf);
-        for v in head.iter_mut() {
-            let u = simd.min_f64s(
-                simd.max_f64s(*v, simd.splat_f64s(LN_U_FLOOR)),
-                simd.splat_f64s(LN_U_CEIL),
-            );
-            let mut kf = simd.splat_f64s(0.0);
-            let mut th = std::f64::consts::SQRT_2 * 0.5;
-            for _ in 0..11 {
-                let mask = simd.less_than_f64s(u, simd.splat_f64s(th));
-                kf = simd.select_f64s(mask, simd.sub_f64s(kf, one), kf);
-                th *= 0.5;
-            }
-            let m = simd.transmute_f64s_u64s(simd.or_u64s(
-                simd.and_u64s(simd.transmute_u64s_f64s(u), simd.splat_u64s(MANT_MASK)),
-                simd.splat_u64s(ONE_BITS),
-            ));
-            let lt = simd.less_than_f64s(m, simd.splat_f64s(std::f64::consts::SQRT_2));
-            let m = simd.select_f64s(lt, m, simd.mul_f64s(simd.splat_f64s(0.5), m));
-            let l = simd_log1p_unit::<S, FUSED>(simd, simd.sub_f64s(m, one));
-            let inner = fmadd::<S, FUSED>(simd, kf, simd.splat_f64s(LN2LO), l);
-            *v = fmadd::<S, FUSED>(simd, kf, simd.splat_f64s(LN2HI), inner);
-        }
-        for v in tail.iter_mut() {
-            *v = scalar_ln_unit::<FUSED>(*v);
-        }
-    }
-}
-
-/// Owned scalar `ln` on the censored-Φ domain (clamped to `[2^−11, 1−2^−53]`) —
-/// the skewed-marginal replacement for libm `.ln()`. Scalar twin of `ln_fill`,
-/// bit-identical per element.
-#[inline]
-pub fn ln_owned(u: f64) -> f64 {
-    scalar_ln_unit::<{ FUSED_DEFAULT }>(u)
-}
-
-/// In-place `buf[i] = ln(buf[i])` on the censored-Φ domain — SIMD head +
-/// bit-identical scalar tail (`ln_owned`).
-#[inline]
-pub fn ln_fill(buf: &mut [f64]) {
-    pulp::Arch::new().dispatch(LnInplaceOp::<{ FUSED_DEFAULT }> { buf });
-}
-
 // ln(x) on the whole positive normal range, for the NB deviance fold
-// (`family_pass`): the same √2-normalized reduction as `scalar_ln_unit`,
-// ln(x) = k·ln2 + log1p(m − 1), m ∈ [√2/2, √2), on the same `LOG1P_H`
-// polynomial, but with k read off the exponent field instead of a compare
-// ladder (whose 11 rungs only cover [2⁻¹¹, 1)). The exponent is moved down
-// by a 32-bit lane shift of the high word (`wrapping_dyn_shr_u32s`; pulp 0.22
+// (`family_pass`) and the AGQ `log1p` tiles: ln(x) = k·ln2 + log1p(m − 1)
+// with the fdlibm √2-normalization m ∈ [√2/2, √2). A plain m ∈ [1, 2) reduction cancels
+// catastrophically as x → 1⁻ (k = −1 against log1p(2x − 1) → ln2); the
+// √2-normalization gives k = 0 there and feeds log1p the small argument
+// directly. `LOG1P_H` stays valid: |s| ≤ 0.172 keeps w = s² ≤ 0.0295, inside
+// the w ∈ [0, 1/9] that `log1p` on z ∈ (0, 1] spans. m comes from forcing the
+// exponent field to 1023 (AND the mantissa, OR `ONE_BITS`), then a halving
+// select for the m ≥ √2 half. k is read off the exponent field, moved down by
+// a 32-bit lane shift of the high word (`wrapping_dyn_shr_u32s`; pulp 0.22
 // has no 64-bit shift or int→float convert) and converted with the
 // 2⁵²-magic: bits `0x4330_0000 | E` in the high word read as `2⁵² + E·2³²`.
 // Arguments below `f64::MIN_POSITIVE` (zero, subnormals) are raised to it:
@@ -520,6 +390,7 @@ pub fn ln_fill(buf: &mut [f64]) {
 // (y+θ)/(μ+θ) ≥ θ/(μ+θ), since θ ≥ `NB_THETA_LO` = 1e-3.
 const LN_POS_FLOOR: f64 = f64::MIN_POSITIVE;
 const EXP_FIELD_MASK: u64 = 0x7FF0_0000_0000_0000;
+const ONE_BITS: u64 = 0x3FF0_0000_0000_0000;
 
 #[inline]
 fn scalar_ln_pos<const FUSED: bool>(x: f64) -> f64 {
@@ -594,8 +465,7 @@ impl<const FUSED: bool> pulp::WithSimd for LnPosInplaceOp<'_, FUSED> {
 
 /// In-place `buf[i] = ln(buf[i])` for finite positive arguments (anything
 /// below `f64::MIN_POSITIVE`, zero included, is read as it): SIMD head +
-/// bit-identical scalar tail, within 2 ULP of libm. Not the censored-Φ
-/// `ln_fill`: this one covers the whole positive range. Outside the domain
+/// bit-identical scalar tail, within 2 ULP of libm. Outside the domain
 /// the output is finite but not a logarithm: `+∞` reads as `2¹⁰²⁴` (exponent
 /// field 2047), and a NaN is floored to `MIN_POSITIVE` on the scalar tail and
 /// on backends whose `max` returns the non-NaN operand (x86), while on those
@@ -607,81 +477,11 @@ pub(crate) fn ln_pos_fill(buf: &mut [f64]) {
     pulp::Arch::new().dispatch(LnPosInplaceOp::<{ FUSED_DEFAULT }> { buf });
 }
 
-// A&S 7.1.26 constants — shared by the SIMD Φ kernel below and its scalar
-// mirror `scalar_phi`; change together.
-const ERF_A1: f64 = 0.254829592;
-const ERF_A2: f64 = -0.284496736;
-const ERF_A3: f64 = 1.421413741;
-const ERF_A4: f64 = -1.453152027;
-const ERF_A5: f64 = 1.061405429;
-const ERF_P: f64 = 0.3275911;
-
-struct PhiInplaceOp<'a, const FUSED: bool> {
-    buf: &'a mut [f64],
-}
-impl<const FUSED: bool> pulp::WithSimd for PhiInplaceOp<'_, FUSED> {
-    type Output = ();
-    #[inline(always)]
-    fn with_simd<S: Simd>(self, simd: S) {
-        let one = simd.splat_f64s(1.0);
-        let half = simd.splat_f64s(0.5);
-        let c = simd.splat_f64s(std::f64::consts::FRAC_1_SQRT_2);
-        let (head, tail) = S::as_mut_simd_f64s(self.buf);
-        for v in head.iter_mut() {
-            let x = simd.mul_f64s(simd.neg_f64s(*v), c); // x = (−z)·(1/√2)
-            let neg = simd.less_than_f64s(x, simd.splat_f64s(0.0));
-            let ax = simd.abs_f64s(x);
-            let t = simd.div_f64s(
-                one,
-                simd.add_f64s(one, simd.mul_f64s(simd.splat_f64s(ERF_P), ax)),
-            );
-            // (((((A5·t + A4)·t) + A3)·t + A2)·t + A1)·t — plain mul/add, as scalar.
-            let mut poly = simd.add_f64s(
-                simd.mul_f64s(simd.splat_f64s(ERF_A5), t),
-                simd.splat_f64s(ERF_A4),
-            );
-            poly = simd.add_f64s(simd.mul_f64s(poly, t), simd.splat_f64s(ERF_A3));
-            poly = simd.add_f64s(simd.mul_f64s(poly, t), simd.splat_f64s(ERF_A2));
-            poly = simd.add_f64s(simd.mul_f64s(poly, t), simd.splat_f64s(ERF_A1));
-            poly = simd.mul_f64s(poly, t);
-            let e = simd_exp_reduced::<S, FUSED>(
-                simd,
-                simd.max_f64s(
-                    simd.mul_f64s(simd.neg_f64s(ax), ax),
-                    simd.splat_f64s(EXP_ARG_FLOOR),
-                ),
-            );
-            let y = simd.sub_f64s(one, simd.mul_f64s(poly, e));
-            let erf = simd.select_f64s(neg, simd.neg_f64s(y), y);
-            *v = simd.mul_f64s(half, simd.sub_f64s(one, erf));
-        }
-        for v in tail.iter_mut() {
-            *v = scalar_phi(*v);
-        }
-    }
-}
-
-/// Scalar mirror of the SIMD Φ head above; bit-identical op-for-op (same A&S
-/// 7.1.26 constants, same owned exp_nonpos) — change together. Kept
-/// self-contained here (not shared through a common dependency) so
-/// `phi_fill`'s tail loop stays a plain function call with no extra crate edge.
-#[inline]
-pub(crate) fn scalar_phi(z: f64) -> f64 {
-    let x = -z * std::f64::consts::FRAC_1_SQRT_2;
-    let sign = if x < 0.0 { -1.0 } else { 1.0 };
-    let ax = x.abs();
-    let t = 1.0 / (1.0 + ERF_P * ax);
-    let poly = (((((ERF_A5 * t + ERF_A4) * t) + ERF_A3) * t + ERF_A2) * t + ERF_A1) * t;
-    let y = 1.0 - poly * exp_nonpos(-ax * ax);
-    0.5 * (1.0 - sign * y)
-}
-
 /// High-precision Φ(z) = ½·erfc(−z/√2), accurate to ~1e-15 (full double).
-/// Used **only** by the probit link in `family.rs`. Deliberately separate from
-/// `scalar_phi`/`phi_fill`: that data-gen path is bit-pinned to
-/// the A&S-7.1.26 form (~7.5e-8) and must not change, but the probit
-/// Hessian SE differentiates Φ twice and amplifies its error, so the fit
-/// needs a Φ good to machine precision. `erfc` is W. J. Cody's rational
+/// Used **only** by the probit link in `family.rs`. Full precision, not a
+/// short form such as A&S 7.1.26 (~7.5e-8): the probit Hessian SE
+/// differentiates Φ twice and amplifies its error, so the fit needs a Φ good
+/// to machine precision. `erfc` is W. J. Cody's rational
 /// Chebyshev approximation (CALERF, Netlib SPECFUN), the same algorithm libm
 /// uses; coefficients verbatim from the reference.
 #[inline]
@@ -883,14 +683,6 @@ pub(crate) fn ln_gamma(x: f64) -> f64 {
         a += c / (x + i as f64);
     }
     LN_SQRT_2PI + (x + 0.5) * t.ln() - t + a.ln()
-}
-
-/// In-place `buf[i] = Φ(buf[i])` — SIMD mirror of `distributions::phi`
-/// (bit-identical per element; the scalar tail calls the self-contained
-/// `scalar_phi` twin above).
-#[inline]
-pub fn phi_fill(buf: &mut [f64]) {
-    pulp::Arch::new().dispatch(PhiInplaceOp::<{ FUSED_DEFAULT }> { buf });
 }
 
 // ---------------------------------------------------------------------------
@@ -2059,22 +1851,6 @@ mod tests {
     }
 
     #[test]
-    fn sigmoid_fill_within_2ulp_of_libm() {
-        // Same grid discipline as the fused kernel test; in-place column op.
-        let n = 20_003usize;
-        let eta: Vec<f64> = (0..n).map(|k| -40.0 + 80.0 * k as f64 / n as f64).collect();
-        let mut buf = eta.clone();
-        sigmoid_fill(&mut buf);
-        let mut pmax = 0i128;
-        for i in 0..n {
-            let (libp, _) = libm_fused(eta[i]);
-            pmax = pmax.max(ulp(buf[i], libp));
-            assert!(buf[i].is_finite() && (0.0..=1.0).contains(&buf[i]));
-        }
-        assert!(pmax <= 2, "sigmoid_fill drifted {pmax} ULP from libm");
-    }
-
-    #[test]
     fn exp_fill_within_1ulp_of_libm_full_domain() {
         // Full certified domain [−700, 700] — positive arguments exercise the
         // same Cody-Waite reduction (sign-agnostic) and the 2^k build up to
@@ -2105,58 +1881,9 @@ mod tests {
     }
 
     #[test]
-    fn ln_fill_within_2ulp_of_libm() {
-        // The skewed-marginal live domain [e^−EXP_CAP, 1) ≈ [9.5e-4, 1) — the
-        // compare-ladder covers k ∈ {−11…−1} and LOG1P_H runs on m−1 ∈ [0,1).
-        // Measured 2026-06-11 over this 20,003-pt grid: scalar and SIMD both
-        // ≤2 ULP of libm ln — pinned at measured.
-        let n = 20_003usize;
-        let lo = 9.5e-4f64;
-        let us: Vec<f64> = (0..n)
-            .map(|k| lo + (1.0 - lo) * k as f64 / n as f64)
-            .collect();
-        let mut smax = 0i128;
-        for &u in &us {
-            smax = smax.max(ulp(ln_owned(u), u.ln()));
-        }
-        assert!(smax <= 2, "ln_owned drifted {smax} ULP from libm");
-        let mut buf = us.clone();
-        ln_fill(&mut buf);
-        let mut vmax = 0i128;
-        for i in 0..n {
-            vmax = vmax.max(ulp(buf[i], us[i].ln()));
-        }
-        assert!(vmax <= 2, "ln_fill drifted {vmax} ULP from libm");
-        // Clamp totality: below-domain input lands past the −EXP_CAP censor;
-        // u = 1.0 maps to ln(1 − 2^−53), not −0.0.
-        assert!(ln_owned(1.0e-9) < -6.96);
-        assert!(ln_owned(0.0) < -6.96);
-        assert!(ln_owned(1.0) < 0.0 && ln_owned(1.0) > -3.0e-16);
-    }
-
-    #[test]
-    fn phi_fill_bit_identical_to_scalar_phi() {
-        // phi_fill mirrors scalar_phi op-for-op (A&S poly in plain
-        // mul/add — fma-policy-neutral — plus the shared owned exp), so head and
-        // tail must agree to the bit, the simd_fused/scalar_fused discipline.
-        let n = 20_003usize;
-        let z: Vec<f64> = (0..n).map(|k| -9.0 + 18.0 * k as f64 / n as f64).collect();
-        let mut buf = z.clone();
-        phi_fill(&mut buf);
-        for i in 0..n {
-            assert_eq!(
-                buf[i].to_bits(),
-                scalar_phi(z[i]).to_bits(),
-                "phi_fill diverged from scalar phi at z={}",
-                z[i]
-            );
-        }
-    }
-
-    #[test]
     fn phi_hp_full_double_precision() {
         // Reference Φ values (R `pnorm`, 16 figs). The probit FD-Hessian SE needs
-        // Φ to ~machine precision — scalar_phi's ~7.5e-8 is far too coarse here.
+        // Φ to ~machine precision — A&S 7.1.26's ~7.5e-8 is far too coarse here.
         let cases = [
             (-6.0, 9.865_876_450_376_968e-10),
             (-3.0, 1.349_898_031_630_095e-3),
@@ -2227,7 +1954,8 @@ mod tests {
             smax = smax.max(ulp(scalar_erfc_blend::<{ FUSED_DEFAULT }>(x), erfc_cody(x)));
         }
         assert!(smax <= 5, "scalar erfc blend drifted {smax} ULP from Cody");
-        // SIMD head vs its scalar twin: bit-identical, the `phi_fill` discipline.
+        // SIMD head vs its scalar twin: bit-identical, the
+        // `simd_fused`/`scalar_fused` discipline.
         let mut buf = xs.clone();
         erfc_fill(&mut buf);
         for i in 0..n {
@@ -2442,37 +2170,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn ln_fill_infinity_saturates_the_domain_clamp() {
-        let mut short = vec![f64::NEG_INFINITY, f64::INFINITY];
-        ln_fill(&mut short);
-        assert_eq!(short[0].to_bits(), ln_owned(LN_U_FLOOR).to_bits());
-        assert_eq!(short[1].to_bits(), ln_owned(LN_U_CEIL).to_bits());
-
-        let mut long = vec![0.5; 16];
-        long[0] = f64::NEG_INFINITY;
-        long[1] = f64::INFINITY;
-        ln_fill(&mut long);
-        assert_eq!(long[0].to_bits(), ln_owned(LN_U_FLOOR).to_bits());
-        assert_eq!(long[1].to_bits(), ln_owned(LN_U_CEIL).to_bits());
-    }
-
-    /// A NaN comes out of `ln_fill` finite, not NaN: the mantissa/exponent bit
-    /// trick turns whatever bits reach it into a plausible-looking ln value.
-    /// The bits depend on where the NaN lands and on the backend's `min`/`max`
-    /// (see `exp_fill_nan_comes_out_nan_or_floored`), so only finiteness is
-    /// pinned.
-    #[test]
-    fn ln_fill_nan_is_laundered_not_propagated() {
-        let mut short = vec![f64::NAN];
-        ln_fill(&mut short);
-        let mut long = vec![0.5; 16];
-        long[0] = f64::NAN;
-        ln_fill(&mut long);
-        assert!(short[0].is_finite(), "{}", short[0]);
-        assert!(long[0].is_finite(), "{}", long[0]);
-    }
-
     /// `ln_pos_fill` against libm over the whole positive normal range
     /// (log-spaced from `f64::MIN_POSITIVE` to `1e300`, plus values next to 1,
     /// the NB deviance's ratio near the mode): within 2 ULP everywhere, and the
@@ -2623,61 +2320,6 @@ mod tests {
             }
         }
         assert_eq!(checked, 21);
-    }
-
-    #[test]
-    fn sigmoid_fill_nonfinite_input() {
-        // +inf saturates to 1.0 (the η ≥ 0 branch). -inf falls through the
-        // same path as a very negative η: `z = exp(-|η|)` clamps to exp(-700)
-        // and `η >= 0.0` is false, selecting the tiny-p branch. NaN takes that
-        // branch too, as tiny p where the clamp's `max` drops the NaN, as NaN
-        // where it propagates it (wasm32 `+simd128` lanes; see
-        // `exp_fill_nan_comes_out_nan_or_floored`).
-        let floor_z = exp_clamped(EXP_ARG_FLOOR);
-        let expect_tiny = floor_z / (1.0 + floor_z);
-
-        let nan_ok = |v: f64| v.is_nan() || v.to_bits() == expect_tiny.to_bits();
-
-        let mut short = vec![f64::NAN, f64::NEG_INFINITY, f64::INFINITY];
-        sigmoid_fill(&mut short);
-        assert!(nan_ok(short[0]), "{}", short[0]);
-        assert_eq!(short[1].to_bits(), expect_tiny.to_bits());
-        assert_eq!(short[2], 1.0);
-
-        let mut long = vec![0.0; 16];
-        long[0] = f64::NAN;
-        long[1] = f64::NEG_INFINITY;
-        long[2] = f64::INFINITY;
-        for (i, x) in long.iter_mut().enumerate().skip(3) {
-            *x = -4.0 + i as f64;
-        }
-        sigmoid_fill(&mut long);
-        assert!(nan_ok(long[0]), "{}", long[0]);
-        assert_eq!(long[1].to_bits(), expect_tiny.to_bits());
-        assert_eq!(long[2], 1.0);
-    }
-
-    #[test]
-    fn phi_fill_nonfinite_input() {
-        // ±inf saturate to the sensible tail limits; plain arithmetic (no
-        // clamp, no bit trick) propagates NaN through instead of laundering it.
-        let mut short = vec![f64::NAN, f64::NEG_INFINITY, f64::INFINITY];
-        phi_fill(&mut short);
-        assert!(short[0].is_nan());
-        assert_eq!(short[1], 0.0);
-        assert_eq!(short[2], 1.0);
-
-        let mut long = vec![0.0; 16];
-        long[0] = f64::NAN;
-        long[1] = f64::NEG_INFINITY;
-        long[2] = f64::INFINITY;
-        for (i, x) in long.iter_mut().enumerate().skip(3) {
-            *x = -4.0 + i as f64;
-        }
-        phi_fill(&mut long);
-        assert!(long[0].is_nan());
-        assert_eq!(long[1], 0.0);
-        assert_eq!(long[2], 1.0);
     }
 
     /// A NaN η makes `Σ log1pexp` NaN wherever it lands: the scalar tail (a

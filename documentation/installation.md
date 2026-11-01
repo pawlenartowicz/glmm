@@ -9,9 +9,14 @@ cargo add glmm
 MSRV is Rust 1.85 — the floor is set by the `bobyqa` dependency. Linear
 algebra runs on [`faer`](https://crates.io/crates/faer) 0.24.
 
-The semver-covered surface is `fit`/`fit_with_start` + `Data` +
-`ModelSpec` + `GroupIds`. The `formula` frontend, on by default, is outside it until the
-1.0.0 surface review.
+The semver-covered surface is the matrix door (`fit`/`fit_with_start`,
+`predict` and its types, `Data`, `ModelSpec`, `GroupIds`, `FitOptions`, `Fit`
+and its methods, `FitError`, `limits` and the types around them), the
+`formula` frontend (on by default: `lower`, `fit`, `fit_lowered`, `predict`,
+`Table`, `Column`, `Lowered`, `Model`, `anova::compare`, `anova::term_tests`,
+`anova::nesting`, `pairwise`, their types and the error types), the
+`inference` types the two doors return, and `Simulator`. The crate docs
+hold the full list.
 
 Default features build the `formula` frontend (R-style formula strings, the
 only thing that pulls in `regex`) — everything else is off by default. The
@@ -21,7 +26,7 @@ semver guarantees. The `orchestrate` feature exposes the string-typed fit
 orchestration the Python and R packages are built on (the family/link string
 vocabulary, the formula-and-data lowering, and the flattened result both
 ports publish), also with no semver guarantees: its shape follows the ports'
-needs. The `parallel` feature (experimental) enables in-fit
+needs. The `parallel` feature (experimental, no semver guarantee) enables in-fit
 parallelism via rayon — the AGQ cluster loop and the FD-Hessian SE grid —
 gated at runtime by `FitOptions::parallel_inner`; both the feature and the
 flag must be on for any thread to spawn, and it's a no-op on wasm32.

@@ -1,14 +1,15 @@
 //! Dev-only optimizer evaluation counters, behind the off-by-default
 //! `counters` feature.
 //!
-//! Four quantities, all observation-only — nothing here is read by any numeric
+//! Five quantities, all observation-only — nothing here is read by any numeric
 //! path, exactly like the `Note::PirlsExhausted` bookkeeping this mirrors:
 //!
 //! 1. the per-stage evaluation split of the two-stage GLMM search;
 //! 2. evaluations recorded after the last strict improvement of a stage's
 //!    incumbent (the trust-radius shrink phase);
 //! 3. PIRLS iterations per outer evaluation, as a histogram;
-//! 4. AGQ evaluations and the node evaluations they cost.
+//! 4. AGQ evaluations and the node evaluations they cost;
+//! 5. the searches the post-pin pass runs at a pinned GLMM endpoint.
 //!
 //! With the feature OFF the struct is zero-sized and every recording method is
 //! an empty `#[inline(always)]` body, so call sites need no `cfg` and the
@@ -65,6 +66,9 @@ pub struct EvalCounters {
     pub nb_nodes: u32,
     /// `n_eval` summed over those inner fits. Always 0, for the same reason.
     pub nb_evals_total: u64,
+    /// Searches run after the pin: the trough polish, 0 or 1 per fit (a
+    /// GLMM polishes a pinned endpoint at most once).
+    pub post_pin_searches: u32,
 }
 
 #[cfg(feature = "counters")]
@@ -80,6 +84,7 @@ impl EvalCounters {
             agq_node_evals: 0,
             nb_nodes: 0,
             nb_evals_total: 0,
+            post_pin_searches: 0,
         }
     }
 
@@ -118,6 +123,11 @@ impl EvalCounters {
         self.agq_node_evals += nodes;
     }
 
+    /// The fit's post-pin searches.
+    pub(crate) fn record_post_pin(&mut self, searches: u32) {
+        self.post_pin_searches += searches;
+    }
+
     /// Evaluations recorded after the stage's last incumbent improvement.
     pub fn evals_after_last_improve(&self, stage: Stage) -> u32 {
         let s = stage as usize;
@@ -147,4 +157,6 @@ impl EvalCounters {
     pub(crate) fn commit_pirls_iters(&mut self) {}
     #[inline(always)]
     pub(crate) fn record_agq_eval(&mut self, _nodes: u64) {}
+    #[inline(always)]
+    pub(crate) fn record_post_pin(&mut self, _searches: u32) {}
 }

@@ -542,6 +542,31 @@ pub(crate) struct BorderScratch {
     pub beta_prev: Vec<f64>,
 }
 
+/// The post-pin pass's θ-length buffers (`fit_glmm`), each `n_theta` long:
+/// sized here, so the probe and the trough polish allocate nothing and hold
+/// no stack buffer a long θ could overrun.
+pub(crate) struct PostPinScratch {
+    /// The probe's curvature along each θ coordinate; NaN on a skipped or
+    /// one-sided coordinate.
+    pub curv: Vec<f64>,
+    /// The polish's θ scale `sⱼ`, 1 on a coordinate searched as it is.
+    pub scale: Vec<f64>,
+    /// The θ box, kept while the polish searches it scaled.
+    pub lower: Vec<f64>,
+    pub upper: Vec<f64>,
+}
+
+impl PostPinScratch {
+    fn new(n_theta: usize) -> Self {
+        PostPinScratch {
+            curv: vec![f64::NAN; n_theta],
+            scale: vec![1.0; n_theta],
+            lower: vec![0.0; n_theta],
+            upper: vec![0.0; n_theta],
+        }
+    }
+}
+
 /// The β coordinates of the joint `[θ | β]` BOBYQA, the fixed-effect twin of
 /// the slope scaling θ̃ is searched on (`crate::standardize`). The search runs
 /// on `β̃ = Lᵀβ`, with `L` the lower Cholesky factor of the prior-weighted Gram
@@ -559,7 +584,7 @@ pub(crate) struct BorderScratch {
 /// orthogonalize by (`lmm::DesignQr`), `Lᵀ = R/√Σw = diag(D/√Σw)·U`.
 /// [`Self::set_info`] builds `L` from a β information instead, for the joint
 /// search's second pass (`glmm::JOINT_RECHECK_TOL`) and the trough polish
-/// (`glmm::PIN_POLISH_DROP`).
+/// (`crate::lmm::PIN_POLISH_DROP`).
 pub(crate) struct BetaScale {
     /// `U` and `D` of this fit's design.
     qr: crate::lmm::DesignQr,
@@ -786,18 +811,22 @@ pub(crate) struct InferenceScratch {
     /// different converged solves, and `Fit::fitted` and `Fit::ranef` (read in
     /// `fit/glmm.rs`) would describe two different points. Length max_n.
     pub(crate) fd_saved_prob: Vec<f64>,
-    /// p×p Cov(β̂) — `var_diag` is its diagonal, and both are filled together at
-    /// the same target indices (NaN elsewhere). Workspace-owned, not returned on
-    /// `GlmmFit`, so filling it costs no per-fit allocation and the `Rx` warm
-    /// path keeps its zero-alloc gate. Sourced from the full matrix each SE arm
-    /// already forms: `Rx` from the Schur forward-solve columns, `Hessian` from
-    /// `joint_hessian_cov`'s β block. Mapped to `Fit::vcov` by `fit/glmm.rs`.
+    /// p×p Cov(β̂) on every column pair, whatever the target set: the loop
+    /// tier's pairwise contrasts read it (`GlmmResultView::contrast_var`), and
+    /// their columns need not be targets. `var_diag` is its diagonal on the
+    /// target indices, where it alone is written. NaN throughout on a fit
+    /// with no covariance (no endpoint, or `se_unavailable`). Workspace-owned,
+    /// not returned on `GlmmFit`, so filling it costs no per-fit allocation
+    /// and the `Rx` warm path keeps its zero-alloc gate. Sourced from the full
+    /// matrix each SE arm already forms: `Rx` from the Schur forward-solve
+    /// columns, `Hessian` from `joint_hessian_cov`'s β block. Mapped to
+    /// `Fit::vcov` by `fit/glmm.rs`, which masks it to the target block.
     pub vcov: Mat<f64>,
-    /// p×p scratch holding, at each target `j`, a column `c_j` with
-    /// `Cov(β̂_a, β̂_b) = c_aᵀc_b`: on `Rx` the per-target forward solves, kept
-    /// so their pairwise dots can fill `vcov`'s off-diagonals instead of only
-    /// `‖·‖²` on its diagonal; on `Hessian` `cov_root·bⱼ`. The joint Wald reads
-    /// them on both arms (`lmm::joint_wald_chi_sq`).
+    /// p×p scratch holding columns `c_j` with `Cov(β̂_a, β̂_b) = c_aᵀc_b`: on
+    /// `Rx` the forward solve of every column, kept so their pairwise dots can
+    /// fill `vcov`'s off-diagonals instead of only `‖·‖²` on its diagonal; on
+    /// `Hessian` `cov_root·bⱼ` at each target `j` only. The joint Wald reads
+    /// the target columns on both arms (`lmm::joint_wald_chi_sq`).
     pub vcov_cols: Mat<f64>,
     /// length p
     pub var_diag: Vec<f64>,
@@ -1106,6 +1135,8 @@ pub struct GlmmWorkspace {
     pub(crate) guard_beta: Vec<f64>,
     /// Exact-profile scratch (`pirls::ExactProfileBufs`), sized once here.
     pub(crate) exact_prof: super::pirls::ExactProfileBufs,
+    /// The post-pin pass's θ-length scratch ([`PostPinScratch`]).
+    pub(crate) post_pin: PostPinScratch,
     /// Post-search inference outputs and their scratch — see [`InferenceScratch`].
     pub(crate) inference: InferenceScratch,
     /// The finite-difference pass's seed state — see [`FdState`].
@@ -1589,6 +1620,7 @@ impl GlmmWorkspace {
             beta_seed: vec![0.0; p],
             guard_u: vec![0.0; k.max(1)],
             guard_beta: vec![0.0; p],
+            post_pin: PostPinScratch::new(n_theta),
             exact_prof: super::pirls::ExactProfileBufs {
                 // `k` is `groupings.k_total`, so these span the structured
                 // path's `k_family + e` as well as the blocked path's `q·s`.

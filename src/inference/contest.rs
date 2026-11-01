@@ -51,13 +51,12 @@ pub(crate) struct ContestMD {
     /// The rank `q` of `L C Lᵀ` under lmerTest's rule; `0` when nothing is
     /// retained (F, DenDF and p are then NaN).
     pub num_df: usize,
-    /// The denominator df, [`fstat_ddf`] of [`ContestMD::nu`].
+    /// The denominator df: [`fstat_ddf`] of the per-direction df `ν_m`, one
+    /// per retained eigen-direction, largest eigenvalue first; on the
+    /// one-direction route the contest1D df.
     pub den_df: f64,
     /// Upper-tail p of `f_value` on `(num_df, den_df)`.
     pub p_value: f64,
-    /// The per-direction df `ν_m`, one per retained eigen-direction, largest
-    /// eigenvalue first; on the one-direction route the contest1D df.
-    pub nu: Vec<f64>,
 }
 
 /// `contest1D`: the t test of `lᵀβ = 0`. `v = lᵀCl`, `g_k = lᵀ Jac_k l`,
@@ -125,7 +124,6 @@ pub(crate) fn contest_md(
             num_df: 0,
             den_df: f64::NAN,
             p_value: f64::NAN,
-            nu: Vec::new(),
         });
     }
     // Row m of PtL is eigenvector kept[m] times L.
@@ -157,7 +155,6 @@ pub(crate) fn contest_md(
         num_df: q,
         den_df,
         p_value: f_upper_p(f_value, q as f64, den_df),
-        nu,
     })
 }
 
@@ -189,7 +186,6 @@ fn from_1d(t: Contest1D) -> ContestMD {
         num_df: 1,
         den_df: t.df,
         p_value: t.p_value,
-        nu: vec![t.df],
     }
 }
 

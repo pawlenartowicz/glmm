@@ -20,7 +20,8 @@ own page.
 | `fixef(fit)` | `fixef(fit)` — named fixed-effect estimates; aliased columns `NA` | `fit.beta` (estimates) with `fit.names` (aligned coefficient names); `fit.aliased` flags rank-deficient columns |
 | `vcov(fit)` | `vcov(fit)` — full `p × p` Wald covariance | `fit.vcov` — `(p, p)` full Cov(β̂) |
 | `VarCorr(fit)` | `VarCorr(fit)` — SD/correlation-scale variance components, lme4-shaped, with a `Residual` row for a Gaussian mixed fit | `fit.varcorr` (vech-packed per grouping) plus `fit.stddev_corr(group_idx)`, which splits a grouping's block into a stddev vector and a correlation matrix |
-| `confint(fit)` | `confint(fit)`: Wald intervals off `vcov()`, on the t quantile where `summary()` tests with t (lmerTest's `contest1D(..., confint = TRUE)` on a Gaussian mixed model) and the normal quantile where it tests with z; `method = "profile"`/`"boot"` are not available and say so | `fit.confint(level=0.95)`: the same intervals as a `(p, 2)` array in `fit.names` order, no `parm` argument |
+| `confint(fit)` | `confint(fit)`: Wald intervals off `vcov()`, on the t quantile where `summary()` tests with t (lmerTest's `contest1D(..., confint = TRUE)` on a Gaussian mixed model) and the normal quantile where it tests with z. lme4's default `confint(fit)` is the profile, not Wald | `fit.confint(level=0.95)`: the same intervals as a `(p, 2)` array in `fit.names` order, no `parm` argument |
+| `confint(fit, method = "profile")` | `confint(fit, method = "profile")`: lme4's profile-likelihood intervals of a Gaussian mixed model, one row per random-effect SD and correlation, `sigma` and coefficient, under lme4's `signames = FALSE` names (`sd_(Intercept)\|Subject`, `cor_Days.(Intercept)\|Subject`, `sigma`), with its `parm` shortcuts `"theta_"` and `"beta_"`. Profiled on the ML deviance; a REML fit is refitted by ML first, as lme4 does. The variance rows come block by block, each SD followed by its correlations, where lme4 2.0 lists every SD first, so match rows by name. A GLMM is refused, and `method = "boot"` is not available | `fit.profile_confint(level=0.95, parm=None)`: the same intervals as a `ProfileTable` with the ML estimates beside them |
 | `isSingular(fit)` | `isSingular(fit)` — boundary-fit flag, lme4's condition, computed by the kernel | `fit.singular` |
 | `ranef(fit)`, `ranef(fit, condVar = TRUE)` | `ranef(fit)` — named list of data frames, one per grouping, rows named by level, with lme4's `postVar` attribute (terms × terms × levels) unless `condVar = FALSE` | `fit.ranef_blocks` — a list of `{group, terms, levels, values, postvar, condsd}`, `values` an `(n_levels, n_terms)` array, `postvar` an `(n_levels, n_terms, n_terms)` array and `condsd` its diagonal's square roots, the two `None` on a fit that forms no conditional variances (not a DataFrame; the package's only dependency is numpy) |
 | `fitted(fit)` | `fitted(fit)` — named numeric vector over the model frame's rows | `fit.fitted` — `(n,)` array |
@@ -36,13 +37,15 @@ own page.
 standard errors, variance components on the SD/correlation scale, the
 conditional modes with their conditional variances and the per-row means they
 imply, predictions on new rows, simulated responses, the pairwise
-comparisons of a factor's levels (`pairwise()`), and the tests of fixed
+comparisons of a factor's levels (`pairwise()`), the tests of fixed
 terms and of two nested models (`anova()`, `compare()`; see
-[`hypothesis-tests.md`](hypothesis-tests.md)). There is no parametric
-bootstrap test and no `ranova()`-style table of every random term at once.
-Anything the engine cannot compute honestly (profiling) is an error naming
-the reason, never a silently different answer. `residuals()` gives response
-and Pearson residuals; deviance and working residuals are not offered.
+[`hypothesis-tests.md`](hypothesis-tests.md)), and the profile-likelihood
+intervals of a Gaussian mixed model (`confint(fit, method = "profile")`).
+There is no parametric bootstrap test and no `ranova()`-style table of every
+random term at once. Anything the engine cannot compute honestly (a GLMM's
+profile intervals, bootstrap intervals) is an error naming the reason, never
+a silently different answer. `residuals()` gives response and Pearson
+residuals; deviance and working residuals are not offered.
 `coef()` errors — lme4's `coef()` means fixed + random effects per group, and
 returning the fixed part alone would silently differ — but you can build it
 yourself from `fixef()` and `ranef()`.
@@ -98,7 +101,8 @@ four oracles (lme4, glmmTMB, MixedModels.jl, GLMMadaptive).
   parent. The values are identical and every row is labelled — only the
   printout's row order and label spelling differ. A crossed interaction
   `(1 | A:B)` matches lme4 exactly, since both sort lexicographically on the
-  joined label.
+  joined label. The profile intervals keep glmm's name for the inner block:
+  `sd_(Intercept)|A:B`, where lme4 writes `sd_(Intercept)|B:A`.
 - An LMM is fitted by REML unless you ask for ML, as in lme4: `REML = FALSE`
   (Python `reml=False`) fits it by maximum likelihood, and that summary prints
   "Note: p-values can be somewhat anticonservative." under its title. On the

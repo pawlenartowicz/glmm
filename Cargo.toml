@@ -1,6 +1,6 @@
 [package]
 name = "glmm"
-version = "0.7.0"
+version = "0.8.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -21,22 +21,24 @@ workspace = true
 # gets the API the Rust tutorial documents. `regex` — the only dep it adds — is
 # pulled in solely by this feature, so `default-features = false` gives the
 # formula-free kernel the parse-once/fit-many hot path wants, linking no regex.
-# CI asserts that (ci.yml "kernel links no regex"). Like `loop_advanced`, it is
-# outside the semver-covered surface (`fit_cold`/`fit_warm`, `ModelSpec`,
-# `GroupIds`) until the 1.0.0 surface review.
+# CI asserts that (ci.yml "kernel links no regex"). Its formula door (`lower`,
+# `fit`, `fit_lowered`, `predict`, `Table`, `Column`, `Lowered`, `Model`,
+# `anova::{compare, term_tests, nesting}`, `pairwise`) is semver-covered, as
+# the matrix door (`fit`/`fit_with_start`, `predict` and its types, `Data`,
+# `ModelSpec`, `GroupIds`, `FitOptions`, `Fit` and its methods) is.
 default = ["formula"]
 formula = ["dep:regex"]
 # Unstable scratch-explicit hot-path surface (the loop tier: scratch-explicit
-# kernels + `StartValues` warm-start). Capability-named, multi-consumer. OFF by
-# default so the semver-covered public API is just `fit_cold`/`fit_warm` +
-# `ModelSpec` + `GroupIds`.
+# kernels and their workspaces). Capability-named, multi-consumer. OFF by
+# default and NOT part of the semver-covered surface.
 loop_advanced = []
 # String-typed fit orchestration shared by the FFI ports (`glmm-python`,
 # `glmm-r`): one definition of the family/link string vocabulary and the
-# result flattening both ports publish, instead of two mirrored copies. OFF by
-# default and — like `loop_advanced` — NOT part of the semver-covered surface:
-# its shape follows the ports' needs. Needs `formula`, which `run_fit` lowers
-# through.
+# result flattening both ports publish, instead of two mirrored copies, plus
+# the formula internals they use (`formula::parse`, `materialize`,
+# `label_ranef`, `anova::compare_stored`). OFF by default and, like
+# `loop_advanced`, NOT part of the semver-covered surface: its shape follows
+# the ports' needs. Needs `formula`, which `run_fit` lowers through.
 orchestrate = ["formula"]
 # Installs dhat as the test binary's #[global_allocator] for the `#[ignore]`
 # bounded-alloc tests. OFF by default: dhat locks a global mutex on every
@@ -49,12 +51,12 @@ orchestrate = ["formula"]
 alloc-tests = []
 # Dev-only optimizer instrumentation (`glmm::EvalCounters` on `Fit`): the
 # stage-1/stage-2 evaluation split, evaluations after the last incumbent
-# improvement, a PIRLS-iterations-per-evaluation histogram, and AGQ
-# evaluations x nodes. OFF by default and — like `loop_advanced` and
-# `orchestrate` — NOT part of the semver-covered surface. Zero cost when off —
-# the contract lives in `src/counters.rs`'s module header; the feature adds no
-# dependency and no I/O, so the wasm and no-default-features builds are
-# unaffected.
+# improvement, a PIRLS-iterations-per-evaluation histogram, AGQ evaluations x
+# nodes, and the searches run after a pin. OFF by default and, like
+# `loop_advanced` and `orchestrate`, NOT part of the semver-covered surface.
+# Zero cost when off: the contract lives in `src/counters.rs`'s module header;
+# the feature adds no dependency and no I/O, so the wasm and
+# no-default-features builds are unaffected.
 counters = []
 # Tier 2, the cross-engine tier: asserts the crate against the frozen lme4 /
 # MixedModels / GLMMadaptive goldens in `validation/goldens/` at `validation/grid/tol.R`'s
@@ -124,7 +126,7 @@ dhat       = "0.3"
 resolver = "2"
 # The `glmm` root package is the kernel plus — behind the default-on `formula`
 # feature — the R-style formula frontend that lowers a formula + data table into
-# the numeric inputs `fit_cold` consumes. `glmm-python` (Python wiring) is the only
+# the numeric inputs `fit` consumes. `glmm-python` (Python wiring) is the only
 # crate that links `pyo3`; `publish = false` — it is a PyO3/maturin extension,
 # never `cargo publish`ed. `glmm-r` is its R-side twin (extendr wiring), re-exported
 # by `r/src/rust` (which stays OUT of this workspace — R drives that staticlib

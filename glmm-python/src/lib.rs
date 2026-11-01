@@ -62,6 +62,24 @@ fn columns(
     Ok((numeric, factor))
 }
 
+/// `e` as a `ValueError` whose message names its row as the caller's data
+/// numbers it, from 0. `row_index` is what `glmm/__init__.py::_prepare_columns`
+/// sends when it dropped rows: the int64 bytes of each passed row's position
+/// in the caller's data (`np.flatnonzero` of its row mask). `None` when it
+/// dropped none, so the row passed is the caller's row.
+fn port_error(e: orchestrate::PortError, row_index: Option<&[u8]>) -> PyErr {
+    let message = match e.row {
+        Some(row) => {
+            let caller = row_index
+                .and_then(|b| b.get(row * 8..row * 8 + 8))
+                .and_then(|c| usize::try_from(i64::from_ne_bytes(c.try_into().ok()?)).ok());
+            e.message_with_row(caller.unwrap_or(row))
+        }
+        None => e.message,
+    };
+    PyValueError::new_err(message)
+}
+
 fn opt_f64s(b: Option<PyBackedBytes>, what: &str) -> PyResult<Option<Vec<f64>>> {
     b.map(|b| from_bytes(&b, what, f64::from_ne_bytes))
         .transpose()
@@ -271,6 +289,7 @@ fn term_dict<'py>(
 #[pyo3(signature = (
     formula, numeric_columns, factor_columns, family, link, wald_se, nagq,
     dispersion, weights, offset, warm_start, satterthwaite, condvar, reml, anova_test = "auto",
+    row_index = None,
 ))]
 fn fit<'py>(
     py: Python<'py>,
@@ -293,6 +312,8 @@ fn fit<'py>(
     reml: Option<bool>,
     // "auto", "Wald" or "LRT": "LRT" also stores the likelihood-ratio tables.
     anova_test: &str,
+    // The caller's row of each row passed, as `port_error` reads it.
+    row_index: Option<PyBackedBytes>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let (numeric_columns, factor_columns) = columns(numeric_columns, factor_columns)?;
     let weights = opt_f64s(weights, "weights")?;
@@ -314,7 +335,7 @@ fn fit<'py>(
         reml,
         anova_test,
     )
-    .map_err(PyValueError::new_err)?;
+    .map_err(|e| port_error(e, row_index.as_deref()))?;
     fit_dict(py, result)
 }
 
@@ -720,6 +741,7 @@ fn compare_fits<'py>(
 #[pyfunction]
 #[pyo3(signature = (
     f0, f1, numeric_columns, factor_columns, family, link, nagq, weights, offset, nsim, seed,
+    row_index = None,
 ))]
 fn compare<'py>(
     py: Python<'py>,
@@ -734,6 +756,7 @@ fn compare<'py>(
     offset: Option<PyBackedBytes>,
     nsim: Option<usize>,
     seed: Option<u64>,
+    row_index: Option<PyBackedBytes>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let (numeric_columns, factor_columns) = columns(numeric_columns, factor_columns)?;
     let weights = opt_f64s(weights, "weights")?;
@@ -751,7 +774,7 @@ fn compare<'py>(
         nsim,
         seed,
     )
-    .map_err(PyValueError::new_err)?;
+    .map_err(|e| port_error(e, row_index.as_deref()))?;
     let d = comparison_dict(py, &r.comparison, [r.fit0.rss, r.fit1.rss], r.nsim, r.seed)?;
     d.set_item("fit0", fit_dict(py, r.fit0)?)?;
     d.set_item("fit1", fit_dict(py, r.fit1)?)?;
@@ -823,6 +846,7 @@ impl StoredNumbers {
 #[pyo3(signature = (
     formula, numeric_columns, factor_columns, family, link, weights, offset, parts,
     new_numeric, new_factor, n_rows, scale, population, allow_new_levels, se, level, future,
+    row_index = None,
 ))]
 fn predict<'py>(
     py: Python<'py>,
@@ -843,6 +867,8 @@ fn predict<'py>(
     se: bool,
     level: f64,
     future: bool,
+    // The caller's row of each row predicted, as `port_error` reads it.
+    row_index: Option<PyBackedBytes>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let (numeric_columns, factor_columns) = columns(numeric_columns, factor_columns)?;
     let new = match (new_numeric, new_factor) {
@@ -869,7 +895,7 @@ fn predict<'py>(
         level,
         future,
     )
-    .map_err(PyValueError::new_err)?;
+    .map_err(|e| port_error(e, row_index.as_deref()))?;
     let d = PyDict::new(py);
     d.set_item("fit", f64_bytes(py, &r.fit)?)?;
     d.set_item("se", f64_bytes(py, &r.se)?)?;
@@ -892,6 +918,10 @@ fn predict<'py>(
 /// after draw.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
+#[pyo3(signature = (
+    formula, numeric_columns, factor_columns, family, link, weights, offset, parts, nsim, seed,
+    row_index = None,
+))]
 fn simulate<'py>(
     py: Python<'py>,
     formula: &str,
@@ -904,6 +934,8 @@ fn simulate<'py>(
     parts: StoredNumbers,
     nsim: usize,
     seed: u64,
+    // The caller's row of each training row, as `port_error` reads it.
+    row_index: Option<PyBackedBytes>,
 ) -> PyResult<Bound<'py, PyBytes>> {
     let (numeric_columns, factor_columns) = columns(numeric_columns, factor_columns)?;
     let draws = orchestrate::simulate(
@@ -918,7 +950,7 @@ fn simulate<'py>(
         nsim,
         seed,
     )
-    .map_err(PyValueError::new_err)?;
+    .map_err(|e| port_error(e, row_index.as_deref()))?;
     f64_bytes(py, &draws)
 }
 
@@ -970,6 +1002,50 @@ fn effect_sizes<'py>(
     d.set_item("adjusted", icc.adjusted)?;
     d.set_item("unadjusted", icc.unadjusted)?;
     Ok(Some(d))
+}
+
+/// `Fit.profile_confint`: `orchestrate::profile_intervals` on the columns
+/// `effect_sizes` takes, the fit's `reml`, `level` and `parm` (None for every
+/// row). A dict of `names`, `estimate`, `lower`, `upper` and `level`.
+#[allow(clippy::too_many_arguments)]
+#[pyfunction]
+#[pyo3(signature = (
+    formula, numeric_columns, factor_columns, family, link, weights, offset, reml, level, parm
+))]
+fn profile_intervals<'py>(
+    py: Python<'py>,
+    formula: &str,
+    numeric_columns: HashMap<String, PyBackedBytes>,
+    factor_columns: HashMap<String, (Vec<String>, PyBackedBytes)>,
+    family: &str,
+    link: &str,
+    weights: Option<PyBackedBytes>,
+    offset: Option<PyBackedBytes>,
+    reml: bool,
+    level: f64,
+    parm: Option<Vec<String>>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let (numeric_columns, factor_columns) = columns(numeric_columns, factor_columns)?;
+    let r = orchestrate::profile_intervals(
+        formula,
+        numeric_columns,
+        factor_columns,
+        family,
+        link,
+        opt_f64s(weights, "weights")?,
+        opt_f64s(offset, "offset")?,
+        reml,
+        level,
+        parm,
+    )
+    .map_err(PyValueError::new_err)?;
+    let d = PyDict::new(py);
+    d.set_item("names", r.names)?;
+    d.set_item("estimate", r.estimate)?;
+    d.set_item("lower", r.lower)?;
+    d.set_item("upper", r.upper)?;
+    d.set_item("level", r.level)?;
+    Ok(d)
 }
 
 /// `orchestrate::predict_columns` for `Fit.predict`: the names of
@@ -1037,7 +1113,7 @@ fn model_matrix<'py>(
     let (numeric_columns, factor_columns) = columns(numeric_columns, factor_columns)?;
     let (x, n, p, names) =
         orchestrate::run_model_matrix(formula, numeric_columns, factor_columns, n_rows)
-            .map_err(PyValueError::new_err)?;
+            .map_err(|e| port_error(e, None))?;
     Ok((f64_bytes(py, &x)?, n, p, names))
 }
 
@@ -1142,6 +1218,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(predict, m)?)?;
     m.add_function(wrap_pyfunction!(simulate, m)?)?;
     m.add_function(wrap_pyfunction!(effect_sizes, m)?)?;
+    m.add_function(wrap_pyfunction!(profile_intervals, m)?)?;
     m.add_function(wrap_pyfunction!(predict_columns, m)?)?;
     m.add_function(wrap_pyfunction!(plain_column, m)?)?;
     m.add_function(wrap_pyfunction!(confint, m)?)?;

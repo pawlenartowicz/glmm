@@ -114,7 +114,13 @@ An error stops the call: nothing is fitted and nothing is returned. Python
 raises the named exception; R raises a plain `stop()` condition (there is no
 per-error R class, unlike the warnings above). Text in `<angle brackets>` is
 filled in from the call. An argument keeps each language's own spelling
-(`nagq` / `nAGQ`); everything else in the message is identical.
+(`nagq` / `nAGQ`), and a row is numbered as each language numbers the
+caller's rows; everything else in the message is identical.
+
+A `<row>` in a message is a row of the data the call was given, counted
+before any row was dropped (a missing value, R's `subset =`): from 0 in
+Python, so "row 3" is `data.iloc[3]`, and from 1 in R, so "row 3" is
+`data[3, ]`. For `predict()` with `newdata` it is a row of `newdata`.
 
 ### Argument and data errors
 
@@ -145,15 +151,21 @@ the Rust kernel: family, link, `inversegaussian` + random effects, `wald_se`
 | `TypeError` | error | `satterthwaite=` is not one `True`/`TRUE` or `False`/`FALSE`. | satterthwaite must be True or False / TRUE or FALSE, got `<value>` | |
 | `TypeError` | error | `reml=` / `REML =` is not `None`/`NULL` or one `True`/`TRUE` or `False`/`FALSE`. | reml must be None, True or False / REML must be NULL, TRUE or FALSE, got `<value>` | Each port names its own absent value (`None` / `NULL`). |
 | `ValueError` | error | `anova_test=` is not `"auto"`, `"Wald"` or `"LRT"`. | anova_test must be 'auto', 'Wald' or 'LRT', got `<value>` | R gives `match.arg()`'s own message. |
-| `ValueError` | error | `Fit.confint(level=)` / `confint(object, level=)` is not a number strictly between 0 and 1. | level must be a number strictly between 0 and 1, got `<value>` | Checked by the Rust function both ports' `confint` call. |
+| `ValueError` | error | `Fit.confint(level=)` / `confint(object, level=)` is not a number strictly between 0 and 1. | level must be a number strictly between 0 and 1, got `<value>` | Checked by the Rust function both ports' `confint` call. `Fit.profile_confint(level=)` / `confint(object, level=, method = "profile")` gives the same message. |
+| `ValueError` | error | `Fit.profile_confint()` / `confint(object, method = "profile")` on a model that is not a Gaussian mixed model: a GLMM, OLS or a GLM. | profile intervals need a Gaussian model with random effects | Profile-likelihood intervals cover Gaussian mixed models only. |
+| `ValueError` | error | `Fit.profile_confint()` / `confint(object, method = "profile")` on a fit with an aliased coefficient. | profile intervals need a fixed-effect design without aliased columns | Drop the aliased column from the formula and refit. |
+| `ValueError` | error | `parm=` of `Fit.profile_confint()` / `confint(object, parm=, method = "profile")` names a row the model does not have. | parm "`<name>`" is not a parameter of this model; the parameters are `<names>`, "theta_" (the random-effect parameters and sigma) and "beta_" (the coefficients) | |
+| `ValueError` | error | The ML refit that `Fit.profile_confint()` / `confint(object, method = "profile")` profiles does not converge. | the maximum-likelihood fit the profiles start from did not converge | |
+| `ValueError` | error | Holding one parameter found a deviance below the ML refit's. | profiling `<parameter>` found a deviance `<drop>` below the maximum-likelihood fit's: the fit is not at its optimum | lme4 stops with "profiling detected new, lower deviance" in the same case. Every bound is measured from the fit's deviance, so none is returned. |
+| `TypeError` | error | `parm=` of `Fit.profile_confint()` is not `None`, a name or a list of names. | parm must be None, a name or a list of names, got `<value>` | Python only. |
 | `ValueError` | error | `Fit.residuals(type=)` / `residuals(object, type=)` is not `"response"` or `"pearson"`. | type must be 'response' or 'pearson', got `<value>` | |
 | `ValueError` | error | `.residuals()` / `residuals()` called on a fit with `converged` false. | residuals are unavailable: the fit did not converge, so no fitted values are available | |
 
 ### Formula errors
 
 Raised by the shared Rust formula parser (`glmm::formula`) and passed
-through unchanged by both bindings, so the text is identical in both ports
-without either one duplicating it. `<value>` placeholders below are filled
+through by both bindings, so the text is identical in both ports, its
+`<row>` numbered as above, without either one duplicating it. `<value>` placeholders below are filled
 in from the formula or the data.
 
 | Python | R | Trigger | Message | Description |
@@ -233,7 +245,8 @@ problem, as the Description says. All raise `ValueError` in Python and an error 
 Raised by `predict()` and `simulate()` (Python `Fit.predict` and
 `Fit.simulate`), and by R's `ranef(condVar = TRUE)`. Where the two ports word
 an argument check differently, both texts are given, Python's first. The
-kernel's messages count groupings and rows from 0 in both ports.
+kernel's messages count groupings from 0 in both ports, and number a row as
+above.
 
 | Python | R | Trigger | Message | Description |
 |---|---|---|---|---|
@@ -286,7 +299,7 @@ R only, all plain `stop()` conditions:
 | `family=` is not a family object, function, or string. | \`family\` must be a family object, family function, or string |
 | `AIC()` or `BIC()` on a REML fit beside an ML fit (another package's fit counts by its estimator). | `<fit>` was fitted by REML and `<fit>` by ML; comparing their AIC / BIC needs both fitted the same way. Refit `<fit>` with REML = FALSE, or use compare(data, f0, f1), which picks the estimator itself. |
 | `AIC()` or `BIC()` on fastglmm REML fits with different fixed effects. | `<fit>` and `<fit>` are REML fits with different fixed effects; the REML likelihood depends on the fixed effects, so comparing their AIC / BIC needs ML fits. Refit both with REML = FALSE, or use compare(data, f0, f1), which fits both models by ML. |
-| `confint(method=)` is not `"Wald"`. | confint(method = "`<method>`") is not available: the engine has no profiling machinery; only method = "Wald" is supported |
+| `confint(method=)` is neither `"Wald"` nor `"profile"`. | confint(method = "`<method>`") is not available; method = "Wald" and method = "profile" are supported |
 | `coef(fit)`. | coef() is not implemented: lme4's coef() means fixed + random effects per group, and returning fixed effects only would silently differ from what an lme4 user expects. Combine fixef() and ranef(), or use fixef() alone. |
 | `terms(fit)`. | terms() is not implemented: the formula machinery is Rust-side (one parser shared with the Python port), and a synthesized R terms object could disagree with how the model was actually built. formula() returns the model formula as given. |
 | `isSingular(x)` on an object that is neither a `fastglmm` fit nor an lme4 `merMod` (with lme4 loaded). | isSingular() does not know how to handle an object of class '`<class>`'. This package's own method handles a fastglmm fit directly; any other class needs its own package loaded first. |

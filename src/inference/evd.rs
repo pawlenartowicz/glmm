@@ -49,10 +49,6 @@ pub(crate) struct PseudoInverse {
     pub dropped: usize,
     /// Directions with `λ < −rel_tol · λ_max` (not kept either).
     pub negative: usize,
-    /// The largest eigenvalue; `0.0` for an empty matrix.
-    // Contract state that only tests read, by design.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub lambda_max: f64,
 }
 
 /// Eigenvalues (ascending) and optionally eigenvectors of the symmetric
@@ -115,7 +111,6 @@ pub(crate) fn psd_pseudo_inverse(
             rank: 0,
             dropped: n - negative,
             negative,
-            lambda_max,
         });
     }
 
@@ -138,7 +133,6 @@ pub(crate) fn psd_pseudo_inverse(
         rank,
         dropped: n - rank - negative,
         negative,
-        lambda_max,
     })
 }
 

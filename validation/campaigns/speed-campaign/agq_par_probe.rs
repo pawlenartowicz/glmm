@@ -31,6 +31,7 @@ const CELL_BUDGET_SECONDS: f64 = 120.0;
 
 fn main() {
     let manifest_path = format!("{DIR}/campaigns/speed-campaign/manifest.json");
+    let data_dir = format!("{DIR}/campaigns/speed-campaign/data");
     let manifest: Value =
         serde_json::from_str(&std::fs::read_to_string(&manifest_path).expect("read grid manifest"))
             .expect("parse grid manifest");
@@ -72,9 +73,9 @@ fn main() {
         let q = cell["re_q"][0].as_u64().unwrap_or(0);
 
         // Lowering is outside every timed region — it is CSV marshalling, not fit work.
-        let Ok((lo, ..)) =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lower_grid_cell(cell, DIR)))
-        else {
+        let Ok((lo, ..)) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            lower_grid_cell(cell, &data_dir)
+        })) else {
             println!("{case_id:<34} {n_obs:>5} {q:>2}   lowering panicked");
             continue;
         };
@@ -96,7 +97,7 @@ fn main() {
 
             match (&serial.0, &par.0) {
                 (Some(a), Some(b)) => {
-                    let bits = if a.deviance.to_bits() == b.deviance.to_bits() {
+                    let bits = if a.deviance().to_bits() == b.deviance().to_bits() {
                         "ok"
                     } else {
                         "DIFFER"
@@ -106,7 +107,7 @@ fn main() {
                         serial.1,
                         par.1,
                         serial.1 / par.1,
-                        a.n_eval,
+                        a.n_eval(),
                     );
                 }
                 _ => println!("{case_id:<34} {n_obs:>5} {q:>2} {nagq:>5}   fit panicked"),

@@ -1,0 +1,73 @@
+{
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_profile.R"
+  },
+  "level": 0.95,
+  "deviance": 332.188348668501,
+  "rows": [
+    {
+      "parameter": "sd_(Intercept)|plate",
+      "kind": "sd",
+      "group": "plate",
+      "term": "(Intercept)",
+      "term2": null,
+      "estimate": 0.845572185009386,
+      "lower": 0.633565966954835,
+      "upper": 1.18210398360299,
+      "method": "lme4_profile"
+    },
+    {
+      "parameter": "sd_(Intercept)|sample",
+      "kind": "sd",
+      "group": "sample",
+      "term": "(Intercept)",
+      "term2": null,
+      "estimate": 1.77064624916623,
+      "lower": 1.09578926046495,
+      "upper": 3.556291664874,
+      "method": "lme4_profile"
+    },
+    {
+      "parameter": "sigma",
+      "kind": "sigma",
+      "group": null,
+      "term": null,
+      "term2": null,
+      "estimate": 0.549932197482389,
+      "lower": 0.485845400185306,
+      "upper": 0.629453478450791,
+      "method": "lme4_profile"
+    },
+    {
+      "parameter": "(Intercept)",
+      "kind": "beta",
+      "group": null,
+      "term": "(Intercept)",
+      "term2": null,
+      "estimate": 22.9722222222164,
+      "lower": 21.2666273836243,
+      "upper": 24.6778176161738,
+      "method": "lme4_profile"
+    }
+  ],
+  "name": "profile_penicillin"
+}

@@ -269,8 +269,8 @@ pub(crate) fn glm_view_to_fit(
     // Dispersion. Binomial/Poisson hold φ≡1 (the kernel's `(XᵀWX)⁻¹` is the full
     // covariance). Gamma and inverse-Gaussian recover φ post-fit — the mean
     // model β is φ-independent, so φ stays out of the IRLS — and scale the SE
-    // by √φ (the kernel folded φ=1, so Var(β̂)=φ·(XᵀWX)⁻¹). `dispersion: Some(v)`
-    // holds φ=v fixed. `None` is the Pearson moment `φ̂=Σ wᵢrᵢ²/(n−p)`,
+    // by √φ (the kernel folded φ=1, so Var(β̂)=φ·(XᵀWX)⁻¹). `Dispersion::Fixed(v)`
+    // holds φ=v fixed. `Dispersion::Default` is the Pearson moment `φ̂=Σ wᵢrᵢ²/(n−p)`,
     // `rᵢ=(yᵢ−μ̂ᵢ)/√V(μ̂ᵢ)`, raw-row df, raw weights — exactly `summary(glm(...,
     // weights=w))$dispersion` on both families (precision weights: row `i` has
     // variance `φ·V(μᵢ)/wᵢ`, so Pearson's `wᵢrᵢ²` is already on that scale).
@@ -281,7 +281,7 @@ pub(crate) fn glm_view_to_fit(
     } else {
         match family {
             Family::Gamma { .. } | Family::InverseGaussian { .. } => {
-                let phi = match opts.dispersion {
+                let phi = match opts.dispersion.held() {
                     Some(v) => v,
                     None => crate::family::pearson_dispersion(
                         y, view.mu, family, nb_theta, n, p_rank, weights,
@@ -301,10 +301,8 @@ pub(crate) fn glm_view_to_fit(
 
     // Var(β̂) = φ·(X'WX)⁻¹ — the same φ the SE loop applied as √φ. A no-op for
     // the φ≡1 families, where `dispersion` is 1.0.
-    for row in vcov.iter_mut() {
-        for v in row.iter_mut() {
-            *v *= dispersion;
-        }
+    for v in vcov.iter_mut() {
+        *v *= dispersion;
     }
 
     // Fitted means μ̂ (the kernel's converged IRLS means) and the family
@@ -318,10 +316,10 @@ pub(crate) fn glm_view_to_fit(
     // start are not scale-free on raw `w` (raw-weight Newton from MASS's
     // start can overshoot to NaN at large `w`; on `ŵ` it does not), so φ̂ is
     // `s` times the internal root and `gamma_dispersion_term` is read at
-    // `ln(φ̂/s)`. A held φ (`opts.dispersion
-    // = Some(v)`) is used as-is for `D/φ`, with `Gₚ` still read on `ŵ` at
+    // `ln(φ̂/s)`. A held φ (`Dispersion::Fixed(v)`)
+    // is used as-is for `D/φ`, with `Gₚ` still read on `ŵ` at
     // `ln(v/s)` — the same internal coordinate the mixed path's held-φ arm
-    // uses (`fit::glmm::run_glmm_on`). Inverse-Gaussian: `opts.dispersion`
+    // uses (`fit::glmm::run_glmm_on`). Inverse-Gaussian: `opts.dispersion.held()`
     // passes straight through to `inv_gaussian_aic`'s own `held_phi` arm —
     // `None` profiles φ at `D/n`, `Some(v)` holds it at `v`.
     let (fitted, loglik) = if converged {
@@ -332,7 +330,7 @@ pub(crate) fn glm_view_to_fit(
                 let hat_w: Option<Vec<f64>> =
                     weights.map(|w| w[..n].iter().map(|&wi| wi / s).collect());
                 let sum_ln_y: f64 = y[..n].iter().map(|v| v.ln()).sum();
-                let phi = match opts.dispersion {
+                let phi = match opts.dispersion.held() {
                     Some(v) => v,
                     None => {
                         // The raw-scale ML equation `Σwᵢgᵢ = D/2` becomes, on
@@ -363,7 +361,7 @@ pub(crate) fn glm_view_to_fit(
                     irls_deviance,
                     n,
                     weights,
-                    opts.dispersion,
+                    opts.dispersion.held(),
                 ) - 2.0)
             }
             _ => {
@@ -379,7 +377,9 @@ pub(crate) fn glm_view_to_fit(
     // `n − p` (`summary.glm`'s `df.residual`), whatever `opts.satterthwaite`
     // says; a held φ, and the families with φ ≡ 1 or an NB shape, keep z.
     let (coef_df, satterthwaite) = match family {
-        Family::Gamma { .. } | Family::InverseGaussian { .. } if opts.dispersion.is_none() => {
+        Family::Gamma { .. } | Family::InverseGaussian { .. }
+            if opts.dispersion.held().is_none() =>
+        {
             let (df, state) = residual_df(
                 view.l,
                 n,
@@ -411,7 +411,7 @@ pub(crate) fn glm_view_to_fit(
         deviance: f64::NAN,
         loglik,
         df: if converged {
-            super::common::model_df(family, p_rank, 0, opts.dispersion.is_some())
+            super::common::model_df(family, p_rank, 0, opts.dispersion.held().is_some())
         } else {
             0
         },

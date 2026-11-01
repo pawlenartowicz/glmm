@@ -279,6 +279,9 @@ compare <- function(data, f0, f1, ..., family = gaussian(), weights = NULL,
       c("fastglmm_rows_dropped_na", "fastglmm_diagnostic"))
     frame <- frame[keep, , drop = FALSE]
   }
+  # Each kept row's 1-based position in `data`, so an error names the
+  # caller's row (`row_index` of fastglmm_compare).
+  row_index <- which(keep)
   w <- frame[["(weights)"]]
   o <- frame[["(offset)"]]
   numeric_only <- unlist(lapply(forms, function(f) c(all.vars(f[[2L]]), .offset_vars(f))))
@@ -286,7 +289,7 @@ compare <- function(data, f0, f1, ..., family = gaussian(), weights = NULL,
 
   res <- fastglmm_compare(f_strs[[1L]], f_strs[[2L]], cols$numeric, cols$levels, cols$codes,
                           fam$name, fam$link, nAGQ, .optional(w), .optional(o),
-                          .optional(nsim), .optional(seed))
+                          .optional(nsim), .optional(seed), row_index)
   call <- match.call()
   # Each fit keeps the columns of its own formula, the weights and the
   # offset, as fastglmm() keeps them; the rows are the shared ones.
@@ -294,7 +297,7 @@ compare <- function(data, f0, f1, ..., family = gaussian(), weights = NULL,
     s <- new.env(parent = emptyenv())
     s$rows <- store$rows
     own <- intersect(c(all.vars(forms[[i]]), "(weights)", "(offset)"), names(frame))
-    .fit_object(r, s, fam, nAGQ, NULL, f_strs[[i]], frame[own], call, data_name)
+    .fit_object(r, s, fam, nAGQ, NULL, f_strs[[i]], frame[own], row_index, call, data_name)
   }
   fit0 <- fit(res$fit0, 1L)
   fit1 <- fit(res$fit1, 2L)

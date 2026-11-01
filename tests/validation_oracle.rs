@@ -2,7 +2,7 @@
 //!
 //! Asserts the crate against the frozen lme4 / MASS / GLMMadaptive / glmmTMB references
 //! at `validation/grid/tol.R`'s agreement bands: 83 goldens in `validation/goldens/` plus
-//! the weights tier (rungs 29-43) in `validation/results/lme4_simulated/`. Reads frozen
+//! the weights tier (rungs 29-43) in `validation/goldens/weights/`. Reads frozen
 //! JSON, so it needs neither R nor Julia at runtime — but it refits all 98, so
 //! it is off by default:
 //!
@@ -195,16 +195,11 @@ fn m3_corpus() -> Vec<(Golden, Vec<String>)> {
         .collect()
 }
 
-/// The weights tier (rungs 29-43 of `validation/manifest.json`), read where it
-/// was generated rather than copied into `validation/goldens/`.
-///
-/// These are promoted into `m3_goldens` coverage: asserted from
-/// `cargo test` instead of only by `grid/compare.R` on a machine with R. Reading them
-/// in place achieves that without a second copy of 15 frozen JSONs. The `goldens/`
-/// and `results/` trees would risk drifting onto different `tolPwrss`
-/// settings if it held a second, separately-maintained copy of these values;
-/// reading `results/` in place keeps them on one footing. A third overlapping
-/// tree would rebuild exactly that hazard.
+/// The weights tier (rungs 29-43 of `validation/manifest.json`), read from
+/// `validation/goldens/weights/`, where `validation/tools/goldens_weights.R` writes
+/// them. A subdirectory keeps them out of the top-level scan of
+/// `all_goldens_are_registered`: they are registered as `datasets` rows, not as
+/// `m3_goldens` entries.
 ///
 /// Its result JSONs use the harness's own field names (`dataset`, no `kind`, no
 /// `r_formula` — the model lives in the manifest, not the result). The three
@@ -221,7 +216,7 @@ fn weights_corpus() -> Vec<(Golden, Vec<String>)> {
         .filter(|s| s["tier"].as_str() == Some("weights"))
         .map(|s| {
             let name = s["name"].as_str().expect("spec has a name");
-            let path = format!("{dir}/results/lme4_simulated/{name}.json");
+            let path = format!("{dir}/goldens/weights/{name}.json");
             let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
             let mut v: Value = serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{name}: {e}"));
             let r_formula = s["r_formula"].clone();
@@ -239,6 +234,112 @@ fn weights_corpus() -> Vec<(Golden, Vec<String>)> {
             (golden, factors_of(s))
         })
         .collect()
+}
+
+/// The `unit_identity` gate of the weights tier: on a row whose manifest `gate`
+/// is `unit_identity` (`all_ones`), every prior weight is exactly 1, and the fit
+/// with those weights is the fit without weights, bit for bit. Bitwise, not a
+/// band, because nothing on the weighted path can round at unit weights: the
+/// weight scale (`family::weight_scale`, the power of two nearest the
+/// geometric mean of w) is exactly 1, the dense LMM accumulator's weighted
+/// instance (`LmmSuffStats::add_rows_multi`) multiplies by `√wᵢ = 1` and adds
+/// `wᵢ = 1`, both exact, and the weighted log-density's `−Σ log wᵢ` added to
+/// the deviance is exactly 0. The unweighted fit runs another instance of
+/// `add_rows_multi` (unit weights, a fixed row width), which performs the same
+/// operations in the same order without the multiplications by 1. The other
+/// `gate` value, `dropped_rows`, is checked by `tools/goldens_weights.R` when it
+/// writes the reference; any other value fails here, so no gate goes unread.
+#[test]
+fn unit_weights_reproduce_the_unweighted_fit() {
+    let manifest: Value =
+        serde_json::from_str(include_str!("../validation/manifest.json")).expect("manifest parses");
+    let mut gated = Vec::new();
+    for s in manifest["datasets"]
+        .as_array()
+        .expect("manifest has datasets")
+        .iter()
+        .filter(|s| s["tier"].as_str() == Some("weights"))
+    {
+        let name = s["name"].as_str().expect("row has a name");
+        match s["gate"].as_str() {
+            None | Some("dropped_rows") => {}
+            Some("unit_identity") => gated.push(name.to_string()),
+            Some(other) => panic!("{name}: unknown weights-tier gate {other}"),
+        }
+    }
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    let mut checked = 0;
+    for (mut g, factors) in weights_corpus() {
+        if !gated.contains(&g.name) {
+            continue;
+        }
+        let name = g.name.clone();
+        let col = g
+            .weights_col
+            .clone()
+            .unwrap_or_else(|| panic!("{name}: a unit_identity row names its weights_col"));
+        let csv = g.csv.clone().expect("a weights-tier golden has its CSV");
+        let raw = std::fs::read_to_string(&csv).unwrap_or_else(|e| panic!("{csv}: {e}"));
+        let mut lines = raw.lines().filter(|l| !l.trim().is_empty());
+        let header: Vec<&str> = lines
+            .next()
+            .expect("CSV has a header")
+            .split(',')
+            .map(|h| h.trim().trim_matches('"'))
+            .collect();
+        let wi = header
+            .iter()
+            .position(|h| *h == col)
+            .unwrap_or_else(|| panic!("{name}: no column {col}"));
+        let n_rows = lines
+            .map(|l| {
+                let w: f64 = l
+                    .split(',')
+                    .nth(wi)
+                    .expect("weight cell")
+                    .trim()
+                    .parse()
+                    .unwrap();
+                assert_eq!(w, 1.0, "{name}: a weight of {w}, not 1");
+            })
+            .count();
+        assert!(n_rows > 0, "{name}: no rows");
+
+        let factor_refs: Vec<&str> = factors.iter().map(String::as_str).collect();
+        let (weighted, ..) = refit(&g, &factor_refs);
+        g.weights_col = None;
+        let (plain, ..) = refit(&g, &factor_refs);
+        let varcorr = |f: &glmm::Fit| {
+            let blocks: Vec<f64> = (0..f.n_groupings()).flat_map(|g| f.varcorr(g)).collect();
+            bits(&blocks)
+        };
+        assert_eq!(bits(weighted.beta()), bits(plain.beta()), "{name}: beta");
+        assert_eq!(bits(weighted.se()), bits(plain.se()), "{name}: se");
+        assert_eq!(bits(weighted.vcov()), bits(plain.vcov()), "{name}: vcov");
+        assert_eq!(varcorr(&weighted), varcorr(&plain), "{name}: varcorr");
+        assert_eq!(
+            weighted.dispersion().to_bits(),
+            plain.dispersion().to_bits(),
+            "{name}: dispersion"
+        );
+        assert_eq!(
+            weighted.deviance().to_bits(),
+            plain.deviance().to_bits(),
+            "{name}: deviance"
+        );
+        assert_eq!(weighted.n_eval(), plain.n_eval(), "{name}: n_eval");
+        assert_eq!(
+            (weighted.converged(), weighted.singular()),
+            (plain.converged(), plain.singular()),
+            "{name}: flags"
+        );
+        checked += 1;
+    }
+    assert_eq!(
+        (checked, gated.len()),
+        (1, 1),
+        "unit_identity rows: {checked} checked of {gated:?}"
+    );
 }
 
 /// The `kind` the weights manifest does not record, on the weights-tier references' own
@@ -625,7 +726,7 @@ fn goldens_agree_with_the_references() {
         };
 
         assert_coefs(
-            &f.beta,
+            f.beta(),
             f.aliased(),
             &align,
             &g.estimates.beta,
@@ -638,7 +739,7 @@ fn goldens_agree_with_the_references() {
         // froze the Schur-complement method too.
         if let Some(se) = g.estimates.se.as_ref().filter(|_| !excused(&g, "se")) {
             assert_coefs(
-                &f.se,
+                f.se(),
                 f.aliased(),
                 &align,
                 se,
@@ -653,7 +754,7 @@ fn goldens_agree_with_the_references() {
                 tol::SE_HESSIAN_REL
             };
             assert_coefs(
-                &f.se,
+                f.se(),
                 f.aliased(),
                 &align,
                 se,
@@ -668,7 +769,7 @@ fn goldens_agree_with_the_references() {
         if let Some(se_rx) = g.estimates.se_rx.as_ref().filter(|_| !excused(&g, "se_rx")) {
             let (fx, _, _) = refit_with(&g, &factor_refs, WaldSe::Rx);
             assert_coefs(
-                &fx.se,
+                fx.se(),
                 fx.aliased(),
                 &align,
                 se_rx,
@@ -682,7 +783,7 @@ fn goldens_agree_with_the_references() {
         // `unasserted_fields`.
         if let (Some(sigma), Shape::Lmm) = (g.estimates.sigma, &shape) {
             assert_rel(
-                f.dispersion.sqrt(),
+                f.dispersion().sqrt(),
                 sigma,
                 tol::STDDEV_REL,
                 &format!("{name}: sigma"),
@@ -690,7 +791,7 @@ fn goldens_agree_with_the_references() {
         }
         if let Some(theta) = g.estimates.theta {
             assert_rel(
-                f.dispersion,
+                f.dispersion(),
                 theta,
                 tol::BETA_REL,
                 &format!("{name}: theta"),
@@ -702,7 +803,7 @@ fn goldens_agree_with_the_references() {
             .filter(|_| !excused(&g, "dispersion"))
         {
             assert_rel(
-                f.dispersion,
+                f.dispersion(),
                 phi,
                 tol::BETA_REL,
                 &format!("{name}: dispersion"),
@@ -741,7 +842,7 @@ fn goldens_agree_with_the_references() {
                 eprintln!("DEV-NA {name}: golden carries no loglik — parameter sanity only")
             }
             (None, Some(dev_ref)) => {
-                let dev_g = -2.0 * f.loglik;
+                let dev_g = -2.0 * f.loglik();
                 let d = dev_g - dev_ref;
                 assert!(
                     d.abs() <= oracle_support::DEV_BIG,

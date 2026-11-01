@@ -789,17 +789,6 @@ test_that("Eta2_partial is on F tables only, and noted on Satterthwaite tables o
   }
 })
 
-# A sleepstudy-shaped LMM: 18 subjects over 10 days, a random intercept and
-# slope.
-sleep_data <- function() {
-  set.seed(20261026)
-  subject <- factor(rep(1:18, each = 10))
-  days <- rep(0:9, 18)
-  reaction <- 250 + 10 * days + rnorm(18, sd = 25)[as.integer(subject)] +
-    rnorm(18, sd = 6)[as.integer(subject)] * days + rnorm(180, sd = 25)
-  data.frame(Reaction = reaction, Days = days, Subject = subject)
-}
-
 r2_line <- function(m) {
   r <- r2(m)
   sprintf("Marginal R2: %.3f, conditional R2: %.3f, adjusted ICC: %.3f",

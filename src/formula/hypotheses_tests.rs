@@ -51,7 +51,7 @@ fn lowered(e: &Entry) -> Lowered {
     lower(formula, &table_of(e), Family::Gaussian).unwrap_or_else(|err| panic!("{}: {err}", e.name))
 }
 
-/// The fit fields (`cols_dropped`, ...): the T1a twin's JSON when the entry
+/// The fit fields (`cols_dropped`, ...): the twin entry's JSON when the entry
 /// names one, the entry's own otherwise.
 fn fit_fields(json: &Value) -> Value {
     match json.get("twin") {

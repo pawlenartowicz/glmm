@@ -2,6 +2,9 @@
 //! size the solver's stack buffers, so they are HARD ceilings. These ceilings
 //! live here in `consts` as the single source, no drift.
 //!
+//! Crate-private. The six `MAX_*` constants reach callers through
+//! `crate::limits`; the Gauss–Hermite tables stay inside the crate.
+//!
 //! The `MAX_*` constants below define the NoZ-scratch envelope (the dense
 //! no-Z-matrix path in `fit::classify_design`), not a model ceiling. Designs
 //! over-envelope route to the sparse-Z path instead.

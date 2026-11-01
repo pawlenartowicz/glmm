@@ -163,17 +163,6 @@ pub(crate) fn chibar_upper_p(t: f64, df_low: usize) -> f64 {
     0.5 * q_low + 0.5 * chisq_upper_p(t, (df_low + 1) as f64)
 }
 
-/// [`lr_p_value`] for the loop tier (`crate::loop_advanced`, no semver
-/// promise): `P(X ≥ statistic)` for `X` drawn from `reference`, NaN for a NaN
-/// statistic, for the exact RLRT and F references, and for
-/// `ChiSquared { df: 0 }` (a χ² on 0 df has no upper tail to evaluate; the
-/// caller builds the `Reference` itself, so equal parameter counts reach it).
-#[cfg(feature = "loop_advanced")]
-#[doc(hidden)]
-pub fn lr_p_value_pub(statistic: f64, reference: &Reference) -> f64 {
-    lr_p_value(statistic, reference)
-}
-
 #[cfg(test)]
 #[path = "lr_tests.rs"]
 mod lr_tests;
