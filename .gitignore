@@ -1,6 +1,6 @@
 /target
 dhat-heap.json
-python/venv/
+python/venv
 __pycache__/
 *.egg-info/
 python/build/
