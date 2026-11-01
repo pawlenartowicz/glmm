@@ -152,9 +152,10 @@ pub const PIN_THETA: f64 = 1e-4;
 /// How far above the search's best objective a pinned fit may land and keep
 /// its pin, in deviance units (`fit_glmm`'s incumbent check). Measured
 /// 2026-10-04: on the 67 pinned GLMM cells of the accuracy grid and on 614
-/// simulated pinned fits (Poisson and binomial; crossed, nested and
-/// random-slope shapes) a pin costs at most 5.2e-8, while a pin that zeroes a
-/// real variance under very precise data costs 1.9 to 48 units. 1e-6 sits
+/// simulated pinned fits whose data was not kept (Poisson and binomial;
+/// crossed, nested and random-slope shapes) a pin costs at most 5.2e-8, while
+/// a pin that zeroes a real variance under very precise data costs 1.9 to 48
+/// units. 1e-6 sits
 /// between the two, and below the 4e-5 at which the accuracy grid counts a
 /// deviance as worse than a reference (`validation/grid/tol.R`, `dev_eps`).
 /// After a trough polish the incumbent is the polish's best, so the same
@@ -163,8 +164,10 @@ pub(crate) const PIN_DEVIANCE_SLACK: f64 = 1e-6;
 
 /// How far below the search's best objective the pinned point must land to
 /// run `fit_glmm`'s trough polish, in deviance units. Measured 2026-10-05 on
-/// 614 simulated pinned Laplace fits (Poisson e² to e¹⁶, binomial up to 1e5
-/// trials; crossed, nested and random-slope shapes): the polish ran on 190
+/// 614 simulated pinned Laplace fits whose data was not kept (Poisson e² to
+/// e¹⁶, binomial up to 1e5 trials; crossed, nested and random-slope shapes;
+/// `validation/campaigns/boundary-probe/` generates other data of these shapes,
+/// and this threshold was not re-measured on it): the polish ran on 190
 /// and lowered 184 of them by more than 1e-6, among them 148 of the 167 fits
 /// a polish without this threshold lowers by more than 1e-3; on 240 7-node
 /// AGQ random-slope fits it ran on 71 and lowered 65. On the pinned cells of
@@ -262,12 +265,14 @@ pub const PIVOT_MIN: f64 = 1e-12;
 /// sets the restart trigger together with `cycle_budget_frac`: the first cycle
 /// restarts after 1/8 of the budget, so 1000·n at 1/8 fires at 750 evaluations
 /// for n = 6 (500·n at 1/8: 375), and the second cycle then runs to `rho_end`.
-/// Measured 2026-09-11 on the boundary-pin corpora (q3 4,500 fits, R1 12,600,
-/// two AGQ cells of 3,000): a fit stopping before the trigger is bit-identical;
+/// Measured 2026-09-11 on simulated boundary fits whose data was not kept, not
+/// the same-sized sets `validation/campaigns/boundary-probe/` generates (q3
+/// 4,500 fits, R1 12,600, two AGQ cells of 3,000): a fit stopping before the
+/// trigger is bit-identical;
 /// on q3, 17 fits improve by more than 1e-6 (largest −3.5e-4), 8 worsen
 /// (largest +6.6e-5), the one fit that hit the 500·n cap converges at 796
 /// evaluations, total evaluations 0.985×, KKT distribution unchanged; R1 and
-/// the AGQ cells move no fit by more than 3e-6. No corpus fit reaches 1000·n.
+/// the AGQ cells move no fit by more than 3e-6. No such fit reaches 1000·n.
 /// A fit that never converges spends twice the evaluations before reporting it.
 ///
 /// The four fields are written out even though they are `RestartConfig::new()`'s

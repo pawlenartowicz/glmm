@@ -544,34 +544,65 @@ fn fitview_diagnostics_flag_an_ill_conditioned_nb_draw() {
 /// A QR breakdown at the last IRLS step (`[1, x, e, e]`, `e` the indicator of
 /// the last row: the Givens pass leaves `R_33` exactly zero) reaches the
 /// loop-tier carrier on the GLM route and on the NB route, whose alternation
-/// reads the flag back off its assembled `Fit`. The workspace is
-/// prestandardized, so the design reaches IRLS as built.
+/// reads the flag back off its assembled `Fit`. With two duplicates
+/// (`[1, x, e, e, e]`) both columns break down, and the fit reports neither as
+/// an estimate. The workspace is prestandardized, so the design reaches IRLS
+/// as built.
 #[test]
 fn fit_on_reports_a_breakdown_on_the_glm_and_nb_routes() {
-    let (n, p) = (50usize, 4usize);
-    let mut x = Vec::with_capacity(n * p);
-    for i in 0..n {
-        let e = f64::from(u8::from(i == n - 1));
-        x.extend_from_slice(&[1.0, i as f64 / n as f64 - 0.5, e, e]);
-    }
-    let y: Vec<f64> = (0..n)
-        .map(|i| {
-            if i == n - 1 {
-                3.0
-            } else {
-                ((7 * i) % 5) as f64
-            }
-        })
-        .collect();
+    let n = 50usize;
     let opts = FitOptions::default();
-    for family in [
-        Family::Poisson {
-            link: crate::PoissonLink::Log,
-        },
-        Family::NegativeBinomial {
-            link: crate::NegBinomialLink::Log,
-        },
-    ] {
+    let cases = [
+        (
+            Family::Poisson {
+                link: crate::PoissonLink::Log,
+            },
+            4usize,
+        ),
+        (
+            Family::Poisson {
+                link: crate::PoissonLink::Log,
+            },
+            5,
+        ),
+        (
+            Family::NegativeBinomial {
+                link: crate::NegBinomialLink::Log,
+            },
+            4,
+        ),
+        (
+            Family::NegativeBinomial {
+                link: crate::NegBinomialLink::Log,
+            },
+            5,
+        ),
+        (
+            Family::Gamma {
+                link: crate::GammaLink::Log,
+            },
+            5,
+        ),
+    ];
+    for (family, p) in cases {
+        let mut x = Vec::with_capacity(n * p);
+        for i in 0..n {
+            let e = f64::from(u8::from(i == n - 1));
+            x.extend_from_slice(&[1.0, i as f64 / n as f64 - 0.5]);
+            x.extend(std::iter::repeat_n(e, p - 2));
+        }
+        // Shifted off zero for Gamma, whose response is positive.
+        let shift = f64::from(u8::from(matches!(family, Family::Gamma { .. })));
+        let y: Vec<f64> = (0..n)
+            .map(|i| {
+                shift
+                    + if i == n - 1 {
+                        3.0
+                    } else {
+                        ((7 * i) % 5) as f64
+                    }
+            })
+            .collect();
         let model = ModelSpec { family, re: None };
         let mut ws = build_workspace(&model, &GroupIds::default(), n, p, &opts);
         ws.set_prestandardized(true);
@@ -585,16 +616,30 @@ fn fit_on_reports_a_breakdown_on_the_glm_and_nb_routes() {
         assert_eq!((d.pivot, d.pivot_col), (0.0, 3), "{family:?}");
         assert!(view.t_sq().iter().all(|t| t.is_nan()), "{family:?}");
         let fit = view.into_fit(&data, &model, &opts);
-        assert!(fit.beta[3].is_nan(), "{family:?}");
+        assert!(fit.beta[3..].iter().all(|b| b.is_nan()), "{family:?} p={p}");
         assert!(fit.beta[..3].iter().all(|b| b.is_finite()), "{family:?}");
         assert!(fit.se.iter().all(|s| s.is_nan()), "{family:?}");
         assert!(fit.vcov().iter().all(|v| v.is_nan()), "{family:?}");
         assert!(fit.loglik.is_finite(), "{family:?}");
-        // The df counts the estimated coefficients, as a fit with the
-        // duplicate dropped beforehand does.
+        // The df and the Pearson divisor count the estimated coefficients, as
+        // a fit with the duplicates dropped beforehand does.
         let x3: Vec<f64> = x.chunks_exact(p).flat_map(|r| r[..3].to_vec()).collect();
         let dropped = crate::fit(&Data::new(&x3, &y, n, 3), &model, &opts).unwrap();
         assert_eq!(fit.df, dropped.df, "{family:?}: df");
+        if matches!(family, Family::Gamma { .. }) {
+            let rel = (fit.dispersion / dropped.dispersion - 1.0).abs();
+            assert!(rel < 1e-8, "dispersion {rel}");
+            let intercept = |k| {
+                let mut c = vec![0.0; k];
+                c[0] = 1.0;
+                c
+            };
+            assert_eq!(
+                fit.contrast_t(&intercept(p)).unwrap().df,
+                dropped.contrast_t(&intercept(3)).unwrap().df,
+                "residual df"
+            );
+        }
         let notes = &fit.diagnostics.notes;
         assert!(
             notes
@@ -2902,7 +2947,7 @@ fn pair_vector(p: usize, a: usize, b: usize) -> Vec<f64> {
 /// `(1, 0)` has neither column a target and `(2, 1)` one, and `(1, 0)` takes
 /// in the intercept, whose row of the column map carries the centring shifts.
 /// The Gamma and inverse-Gaussian GLMs report their contrast on the kernel's
-/// φ = 1 scale, so the stable value is multiplied by φ̂. The GLMM Gamma
+/// φ = 1 scale, so the stable value is multiplied by the view's φ̂. The GLMM Gamma
 /// (inverse) case also fits in search units on both SE arms.
 #[test]
 fn contrast_t_sq_matches_the_stable_vcov() {
@@ -3051,7 +3096,7 @@ fn contrast_t_sq_matches_the_stable_vcov() {
         assert!(stable.converged() && view.converged(), "{tag}");
         let phi = match (family, re) {
             (Family::Gamma { .. } | Family::InverseGaussian { .. }, ContrastRe::None) => {
-                stable.dispersion
+                view.dispersion()
             }
             _ => 1.0,
         };
@@ -3284,8 +3329,14 @@ fn true_zero_fits_do_not_move() {
 /// the seed search that picked it). The search pins both slopes about 1.2 deviance
 /// units above the optimum, and the trough polish takes the fit from there.
 fn precise_two_zero_slopes_fixture() -> (Vec<f64>, Vec<f64>, usize, usize, ModelSpec, GroupIds) {
-    let csv =
-        include_str!("../../validation/data/simulated/sim_poisson_precise_two_zero_slopes.csv");
+    precise_fixture(include_str!(
+        "../../validation/data/simulated/sim_poisson_precise_two_zero_slopes.csv"
+    ))
+}
+
+/// One dataset of the precise `y ~ 1 + x1 + x2 + (1 + x1 + x2 | g)` design,
+/// from its CSV.
+fn precise_fixture(csv: &str) -> (Vec<f64>, Vec<f64>, usize, usize, ModelSpec, GroupIds) {
     let p = 3usize;
     let mut x = Vec::new();
     let mut y = Vec::new();
@@ -3319,6 +3370,66 @@ fn precise_two_zero_slopes_fixture() -> (Vec<f64>, Vec<f64>, usize, usize, Model
         extra: vec![],
     };
     (x, y, n, p, model, ids)
+}
+
+/// A gradient search that hands over and whose BOBYQA route ends with no
+/// result keeps its finite incumbent, reported as a capped endpoint. The model
+/// is the likelihood-ratio refit that drops x1 from the fixed part and keeps
+/// its slope, started as that refit is; it runs out along a ridge, and at a
+/// cap of 200 iterations the profiled deviance fails at every point BOBYQA
+/// tries there, on `ExactProfile` and on the `PqlThenJoint` retry. Which points
+/// those are is round-off, so what follows from BOBYQA ending with no result
+/// is asserted on the platform it was measured on.
+#[test]
+fn a_hand_over_with_no_result_reports_the_gradient_incumbent() {
+    #[cfg(target_arch = "x86_64")]
+    use crate::{Boundary, Note};
+    use crate::{OuterStop, StartValues};
+    let (x, y, n, p, model, ids) = precise_fixture(include_str!(
+        "../../validation/data/simulated/sim_poisson_precise_ridge.csv"
+    ));
+    let opts = FitOptions::default();
+    let data = Data::new(&x, &y, n, p);
+    let mut ws = build_workspace(&model, &ids, n, p, &opts);
+    let view = fit_on(&mut ws, &data, None, &opts);
+    let theta = view.theta().to_vec();
+    let full = view.into_fit(&data, &model, &opts);
+    assert!(full.converged());
+
+    let x_red: Vec<f64> = x.chunks_exact(p).flat_map(|r| [r[0], r[2]]).collect();
+    let z: Vec<f64> = x.chunks_exact(p).map(|r| r[1]).collect();
+    let mut reduced = model.clone();
+    reduced.re.as_mut().expect("a mixed model").slopes = vec![2, 1];
+    let data_red = Data::new(&x_red, &y, n, 2).re_columns(&z, 1);
+    let mut opts_red = opts.clone();
+    opts_red.se_for = SeFor::Only(vec![]);
+    opts_red.wald_se = crate::WaldSe::Rx;
+    let start = StartValues::new(vec![full.beta[0], full.beta[2]], theta);
+    let mut ws_red = build_workspace(&reduced, &ids, n, 2, &opts_red);
+    let FitKind::Glmm { ws: glmm } = &mut ws_red.kind else {
+        panic!("a Poisson mixed model");
+    };
+    glmm.grad_cfg.max_iter = 200;
+    let fit = fit_on(&mut ws_red, &data_red, Some(&start), &opts_red)
+        .into_fit(&data_red, &reduced, &opts_red);
+
+    let d = &fit.diagnostics;
+    assert_eq!(d.outer_stop, Some(OuterStop::MaxIter));
+    assert!(fit.deviance.is_finite(), "deviance {}", fit.deviance);
+    assert!(
+        fit.beta.iter().all(|b| b.is_finite()),
+        "beta {:?}",
+        fit.beta
+    );
+    #[cfg(target_arch = "x86_64")]
+    {
+        assert!(!fit.converged());
+        assert_eq!(d.boundary, Boundary::NoOptimum);
+        assert!(!d
+            .notes
+            .iter()
+            .any(|n| matches!(n, Note::GradientSearchFallback | Note::ExactProfileFallback)));
+    }
 }
 
 /// Each diagonal of each block, in `Diagnostics::pinned` order: (its pin
@@ -3483,9 +3594,10 @@ fn bernoulli_two_zero_slopes_case(
 /// `PIN_DEVIANCE_SLACK`, and then a diagonal at or below `PIN_THETA` is
 /// reported as it is, unflagged (on the design of the precise two-slope
 /// fixture, Poisson log-mean e¹⁴, on 121 of 300 datasets). No case here
-/// takes that branch (checked when the test was written), so the undo after
-/// a polish is not covered here. No AGQ case: on AGQ the flags describe Σ̂
-/// and the reported Λ is the search's own.
+/// takes that branch (checked when the test was written); the undo after a
+/// polish is `undone_pin_of_a_polished_endpoint_keeps_the_polish_and_its_zero`.
+/// No AGQ case: on AGQ the flags describe Σ̂ and the reported Λ is the
+/// search's own.
 #[test]
 fn reported_pins_match_zero_diagonals() {
     let opts = FitOptions::default();
@@ -3562,12 +3674,70 @@ fn reported_pins_match_zero_diagonals() {
     assert_eq!((fits, pins), (5, 8));
 }
 
+/// The incumbent check undoes the pin of the polish's endpoint. The precise
+/// two-slope fixture, its `x1` slope tilted per level by `t·(g − 9.5)/5.77`,
+/// with the iteration cap cut to 200, gives a slope variance whose first
+/// search stops about 0.1 short on σ_g with the `x1` diagonal just above
+/// `PIN_THETA` and the `x2` diagonal at 0, so the first pin is kept and the
+/// polish runs; the polish lowers that diagonal below `PIN_THETA`, where it
+/// is a real variance that pinning would lose. Where the search stops moves
+/// with `t` (7 of these 24 reach the undo on x86_64 Linux, and some end not
+/// converged), so a small grid is walked, and only those fits are read:
+/// no other path leaves a diagonal in (0, `PIN_THETA`] on a fit that is at the
+/// boundary, as the undo of the first pin clears the flags. Such a fit keeps
+/// the polish's diagonal, unflagged, and its held zero, flagged.
+#[test]
+fn undone_pin_of_a_polished_endpoint_keeps_the_polish_and_its_zero() {
+    let opts = FitOptions::default();
+    let (x, base, n, p, model, ids) = precise_two_zero_slopes_fixture();
+    let (mut fits, mut undone) = (0, 0);
+    for step in 0..24 {
+        let t = 8.3e-5 + f64::from(step) * 1e-7;
+        let y: Vec<f64> = base
+            .iter()
+            .zip(&ids.primary)
+            .enumerate()
+            .map(|(i, (&v, &g))| v * (t * (f64::from(g) - 9.5) / 5.77 * x[i * p + 1]).exp())
+            .collect();
+        let data = Data::new(&x, &y, n, p);
+        let mut ws = build_workspace(&model, &ids, n, p, &opts);
+        let FitKind::Glmm { ws: g } = &mut ws.kind else {
+            panic!("a Poisson mixed model builds a GLMM workspace")
+        };
+        g.grad_cfg.max_iter = 200;
+        let view = fit_on(&mut ws, &data, None, &opts);
+        let kernel = view.kernel_theta().to_vec();
+        let fit = view.into_fit(&data, &model, &opts);
+        fits += 1;
+        let (d1, d2) = (kernel[3], kernel[5]);
+        if !fit.converged()
+            || fit.diagnostics.boundary != crate::Boundary::AtBoundary
+            || d1 <= 0.0
+            || d1 > crate::lmm::PIN_THETA
+        {
+            continue;
+        }
+        undone += 1;
+        assert_eq!(d2, 0.0, "t = {t}: kernel θ {kernel:?}");
+        assert_eq!(
+            fit.diagnostics.pinned,
+            vec![vec![false, false, true]],
+            "t = {t}: kernel θ {kernel:?}"
+        );
+        let caller = diagonal_pins(&fit, false);
+        assert!(caller[1].1 > 0.0, "t = {t}: {caller:?}");
+        assert_eq!(caller[2].1, 0.0, "t = {t}: {caller:?}");
+    }
+    assert_eq!(fits, 24);
+    assert!(undone > 0, "no fit reached the undo");
+}
+
 /// A polish stopped by its evaluation budget reports its best point as not
-/// converged: that point is not a minimum. On the precise two-slope fixture
-/// the gradient search hands over to the θ-only stage-1 search, which has a
-/// solver of its own, so the joint solver runs only the trough polishes. Its
-/// budget is cut to 90 evaluations, short of what the polish takes (measured:
-/// every budget from 20 to 129 on aarch64 macOS and x86_64 Linux, to 113 on
+/// converged: that point is not a minimum. On the precise two-slope fixture,
+/// with the iteration cap cut to 200, the gradient search hands over to the
+/// θ-only stage-1 search, which has a solver of its own, so the joint solver
+/// runs only the trough polishes. Its budget is cut to 90 evaluations, short
+/// of what the polish takes (measured: every budget from 20 to 129 on aarch64 macOS and x86_64 Linux, to 113 on
 /// wasm32-wasip1 and to 112 with simd128, leaves the fit not converged, and
 /// with the polish's budget exit removed each of those fits converges, so no
 /// other search runs out). The budget also scales BOBYQA's restart cycle, so
@@ -3592,6 +3762,7 @@ fn polish_out_of_budget_is_not_converged() {
         let mut config = g.config;
         config.max_fun = budget;
         g.solver = bobyqa::Bobyqa::new(g.n_theta + p, config).expect("a legal config");
+        g.grad_cfg.max_iter = 200;
         fit_on(&mut ws, &data, None, &opts).into_fit(&data, &model, &opts)
     };
     let one_less = fit_at(89);

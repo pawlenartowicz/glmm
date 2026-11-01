@@ -179,17 +179,17 @@
 #'   the REML log-likelihood (as `logLik(lm, REML = TRUE)`), `NULL` and `FALSE`
 #'   the ML one. Every other family is fitted by maximum likelihood, and
 #'   `TRUE` there is ignored with a `"fastglmm_argument_ignored"` warning.
-#' @param anova_test which per-term tables the fit stores for
-#'   [anova()][anova.fastglmm]. Every fit stores its Wald chi-squared (or F)
-#'   tables, with no refit. `"auto"` (the default) also stores the
-#'   likelihood-ratio tables of a Poisson model with random effects, which
-#'   `anova(m)` gives by default; `"LRT"` stores them on every fit with
-#'   chi-squared rows (any GLMM, and every GLM but a Gamma or inverse-Gaussian
-#'   one with an estimated dispersion), refitting the model under each term's
-#'   hypothesis after the fit, so that `anova(m, test = "LRT")` can read them;
-#'   `"Wald"` stores none. The fit itself is the same under every value. A
-#'   simulation that must use one test on every model it fits names the test
-#'   here and in `anova()`.
+#' @param anova_test when the likelihood-ratio tables of
+#'   [anova()][anova.fastglmm] are made. Every fit stores its Wald chi-squared
+#'   (or F) tables, with no refit. `"auto"` (the default) makes the
+#'   likelihood-ratio tables the first time `anova()` needs them, which on a
+#'   Poisson model with random effects is `anova(m)` itself; `"LRT"` makes them
+#'   with the fit, on every fit with chi-squared rows (any GLMM, and every GLM
+#'   but a Gamma or inverse-Gaussian one with an estimated dispersion);
+#'   `"Wald"` never makes them, and `anova()` then refuses a test that needs
+#'   them. The tables refit the model under each term's hypothesis, and under
+#'   `"auto"` once more for the fit itself. The fit itself is the same under
+#'   every value.
 #' @param ... intercepted, never silently swallowed. The known lme4 arguments
 #'   (`control`, `verbose`, `contrasts`) raise errors saying why they cannot
 #'   be honored; unknown names error as unused arguments.
@@ -218,8 +218,8 @@
 #'   `offset` (the offset fitted with, `NULL` without one),
 #'   `satterthwaite_record` (what [contrast_test()] and [pairwise()] read on
 #'   a fit whose `df_method` is `"satterthwaite"`, `NULL` on every other fit),
-#'   plus [anova()][anova.fastglmm] (the per-term tests, built at fit time, or
-#'   a comparison of two fits), [pairwise()] (the pairwise comparisons of a
+#'   plus [anova()][anova.fastglmm] (the per-term tests, or a comparison of
+#'   two fits), [pairwise()] (the pairwise comparisons of a
 #'   factor's levels), [r2()] and [icc()] (a mixed model's R-squared pair and
 #'   intraclass correlation), `print()`, [summary()][summary.fastglmm],
 #'   [confint()][confint.fastglmm] (Wald), `nobs()`,
@@ -441,11 +441,20 @@ fastglmm <- function(formula, data, family = gaussian(),
     satterthwaite,
     condvar,
     if (is.null(REML)) logical() else REML,
-    anova_test,
+    if (identical(anova_test, "auto")) "Wald" else anova_test,
     row_index
   )
 
-  .fit_object(r, store, fam, nAGQ, dispersion, f_str, frame, row_index, match.call(), data_name)
+  fit <- .fit_object(r, store, fam, nAGQ, dispersion, f_str, frame, row_index, match.call(),
+                     data_name)
+  if (identical(anova_test, "auto")) {
+    # An environment, so the tables `.lrt_tables` makes stay with every copy
+    # of the fit.
+    fit$.lrt <- list2env(list(call = list(wald.se = wald.se, nAGQ = nAGQ,
+                                          dispersion = dispersion, start = start)),
+                         parent = emptyenv())
+  }
+  fit
 }
 
 # The fit object from the kernel's raw list `r`: raises the fit's warnings
@@ -691,8 +700,8 @@ fastglmm <- function(formula, data, family = gaussian(),
     # list(error = <message>) when the formula gets no table (an interaction
     # without its marginal terms). The likelihood-ratio tables
     # anova(m, test = "LRT") prints are the same lists, NULL unless the fit
-    # asked with anova_test = "LRT" or is a Poisson model with random effects
-    # fitted with anova_test = "auto".
+    # asked with anova_test = "LRT"; under anova_test = "auto" they stay NULL
+    # here and .lrt_tables makes them on the first anova() that needs them.
     # term_test_auto is list(test, reason): what anova(m)'s default
     # test = "auto" gives ("lrt" on a Poisson model with random effects).
     term_table_type3 = r$term_table_type3,

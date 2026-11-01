@@ -226,41 +226,6 @@ pub(crate) enum FamDowndate {
     },
 }
 
-/// Copy the rows' levels into `ids` as one flat run, the `n` primary ids then
-/// each extra grouping's `n` ids, for [`same_rows`]. Reuses `ids`'s capacity.
-pub(crate) fn record_rows(
-    ids: &mut Vec<u32>,
-    cluster_ids: &[u32],
-    extra_ids: &[Vec<u32>],
-    n: usize,
-) {
-    ids.clear();
-    ids.extend_from_slice(&cluster_ids[..n]);
-    for e in extra_ids {
-        ids.extend_from_slice(&e[..n]);
-    }
-}
-
-/// True when `cluster_ids`/`extra_ids` over `n` rows are the levels
-/// [`record_rows`] stored in `ids`. A workspace whose symbolic structures were
-/// built from those levels can keep them for a new draw: the patterns (blocks,
-/// co-occurrence, packed offsets, symbolic factors) depend on the rows' levels
-/// and the groupings only, while x, y and the weights enter the values. The
-/// grouping count is fixed per workspace, so equal lengths mean equal `n`.
-pub(crate) fn same_rows(
-    ids: &[u32],
-    cluster_ids: &[u32],
-    extra_ids: &[Vec<u32>],
-    n: usize,
-) -> bool {
-    n > 0
-        && ids.len() == n * (1 + extra_ids.len())
-        && std::iter::once(cluster_ids)
-            .chain(extra_ids.iter().map(Vec::as_slice))
-            .zip(ids.chunks_exact(n))
-            .all(|(a, b)| a[..n] == *b)
-}
-
 /// Per-fit workspace for the sparse-Z LMM path. Everything θ-independent —
 /// `Z'Z`, `Z'[X y]`, `[X y]'[X y]`, the Λ block map — is built once in `new`;
 /// every per-eval buffer of the blocked kernel (`sparse_schur_factor`) is
@@ -379,8 +344,6 @@ pub(crate) struct SparseLmmWorkspace {
     /// through (`x·U⁻¹`), the same one the dense kernel uses
     /// (`crate::lmm::DesignQr`).
     pub(crate) design_qr: crate::lmm::DesignQr,
-    /// The rows' levels the pattern was built from ([`record_rows`]).
-    pub(crate) ids: Vec<u32>,
     /// Pass-2 offsets, fixed with the pattern: each extra declaration's start
     /// in a row's z-entry list (`seg_off`), each crossed factor's first block
     /// in `lam_blocks` (`cf_base`), each `a21_blk` block's slab in `pk_a21`
@@ -646,8 +609,6 @@ impl SparseLmmWorkspace {
             None
         };
 
-        let mut ids = Vec::with_capacity(n * (1 + n_extras));
-        record_rows(&mut ids, cluster_ids, extra_ids, n);
         let mut ws = Self {
             g: g.clone(),
             ztxy: vec![0.0f64; g.k_total * m],
@@ -690,7 +651,6 @@ impl SparseLmmWorkspace {
             n,
             rec: None,
             design_qr: crate::lmm::DesignQr::identity(p),
-            ids,
             seg_off,
             cf_base,
             a21_slab_off,
@@ -707,8 +667,7 @@ impl SparseLmmWorkspace {
     /// `[X y]'[X y]`, the fixed-effect factor `U` and every packed raw-Gram
     /// block, from the rows. Every value buffer is cleared first and the
     /// per-fit state is reset, so a workspace refilled for a draw on the same
-    /// rows ([`same_rows`]) holds exactly what a new one would, with no
-    /// allocation.
+    /// rows holds exactly what a new one would, with no allocation.
     pub(crate) fn fill_values(
         &mut self,
         x: MatRef<f64>,

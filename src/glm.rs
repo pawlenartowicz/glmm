@@ -194,9 +194,9 @@ pub const WEIGHT_CLAMP: f64 = 1e-300;
 pub struct GlmFitView<'a> {
     /// length P — fitted coefficients (NaN-filled on non-converged paths), on
     /// the design `x` held (β̃ when the fit ran through a column map, see
-    /// `glm_irls_fit_mapped`). Under `se_unavailable` all finite, the column
-    /// `pivot_col` at its start value (0 from a cold start): it is not an
-    /// estimate.
+    /// `glm_irls_fit_mapped`). Under `se_unavailable` all finite, the columns
+    /// of `broken` at their start value (0 from a cold start): those are not
+    /// estimates.
     pub betas: &'a [f64],
     /// length T — `((X'WX)⁻¹)_jj` for each target, in the caller's units
     /// under a column map: `(B(X̃'WX̃)⁻¹Bᵀ)ₜₜ`.
@@ -247,18 +247,20 @@ pub struct GlmFitView<'a> {
     ///
     /// `NaN` / `0` on every non-converged and short-circuit return — there is no
     /// converged `X'WX` to measure. `0.0` under `se_unavailable`, with
-    /// `pivot_col` the first column that broke down.
+    /// `pivot_col` the first of the columns in `broken`.
     pub pivot: f64,
     /// Column attaining `pivot`. Meaningless when `pivot` is NaN.
     pub pivot_col: u32,
     /// The fit converged, but the QR of `√W·X` at its last solve had a zero or
-    /// non-finite diagonal at column `pivot_col` (and possibly others after
-    /// it) while `X'WX` there is positive: the column is not separated from
-    /// the ones before it under the converged weights. `betas`, `deviance`
-    /// and `mu` are the fit's; `var_diag` and `t_sq` are NaN, `pivot` is 0.
-    /// The IRLS step along such a column is zero, so it stays at its start
-    /// value. `false` on every other return.
+    /// non-finite diagonal at the columns of `broken` while `X'WX` there is
+    /// positive: each is not separated from the ones before it under the
+    /// converged weights. `betas`, `deviance` and `mu` are the fit's; `var_diag`
+    /// and `t_sq` are NaN, `pivot` is 0. The IRLS step along such a column is
+    /// zero, so it stays at its start value. `false` on every other return.
     pub se_unavailable: bool,
+    /// Under `se_unavailable`, length P with `true` at each broken column.
+    /// Empty on every other return.
+    pub broken: &'a [bool],
 }
 
 /// Caller-owned scratch borrowed from `SimWorkspace` field-by-field. Built
@@ -293,6 +295,9 @@ pub struct GlmScratch<'w> {
     pub irls_l: MatMut<'w, f64>,
     /// Per-iteration W∘X scratch (column-major, stride n); needs `len ≥ n·p`.
     pub irls_wx: &'w mut [f64],
+    /// Mask of the QR's broken columns, length `p`; read back as
+    /// `GlmFitView::broken`.
+    pub irls_broken: &'w mut [bool],
 }
 
 // ---------------------------------------------------------------------------
@@ -530,6 +535,7 @@ pub(crate) fn glm_irls_fit_mapped<'a>(
         irls_xtwz,
         mut irls_l,
         irls_wx,
+        irls_broken,
     } = scratch;
 
     debug_assert!(p <= irls_betas.len(), "scratch sized for fewer predictors");
@@ -557,6 +563,7 @@ pub(crate) fn glm_irls_fit_mapped<'a>(
             pivot: f64::NAN,
             pivot_col: 0,
             se_unavailable: false,
+            broken: &[],
         };
     }
 
@@ -585,6 +592,7 @@ pub(crate) fn glm_irls_fit_mapped<'a>(
             pivot: f64::NAN,
             pivot_col: 0,
             se_unavailable: false,
+            broken: &[],
         };
     }
 
@@ -870,8 +878,8 @@ pub(crate) fn glm_irls_fit_mapped<'a>(
     // own factor, or fails with it. A design that never crosses the bound
     // keeps the direct solve and allocates nothing more.
     let mut solve_step = false;
-    // The QR and its mask of broken columns.
-    let mut design_qr: Option<(crate::lmm::DesignQr, Vec<bool>)> = None;
+    // The QR; `irls_broken` holds its mask of broken columns.
+    let mut design_qr: Option<crate::lmm::DesignQr> = None;
     // Whether `last_chol` factors X̃'WX̃ on `design_qr`'s `U`.
     let mut l_from_qr = false;
     // The first broken column of the last solve pass, if any.
@@ -1145,8 +1153,8 @@ pub(crate) fn glm_irls_fit_mapped<'a>(
         l_from_qr = false;
         let mut breakdown = None;
         if below {
-            let (qr, broken) = design_qr
-                .get_or_insert_with(|| (crate::lmm::DesignQr::identity(p), vec![false; p]));
+            let broken = &mut irls_broken[..p];
+            let qr = design_qr.get_or_insert_with(|| crate::lmm::DesignQr::identity(p));
             if qr.set_from_rows_marking(x, |i| w[i].sqrt(), irls_betas_new, broken) {
                 l_from_qr = true;
             } else if (0..p).all(|j| {
@@ -1157,7 +1165,7 @@ pub(crate) fn glm_irls_fit_mapped<'a>(
                 breakdown = broken.iter().position(|&b| b);
             }
         }
-        let chol = if let (true, Some((qr, broken))) = (l_from_qr, &design_qr) {
+        let chol = if let (true, Some(qr)) = (l_from_qr, &design_qr) {
             // √W·X̃ into `irls_wx` (W∘X is spent once X'WX and X'Wz are
             // formed), its Gram and X̃'Wz = (√W·X̃)'(√W·z); `irls_z` is dead
             // after this right-hand side.
@@ -1201,7 +1209,7 @@ pub(crate) fn glm_irls_fit_mapped<'a>(
             // right-hand side is 0 for the step, or β̃_j = β_j (row `j` of `U`
             // is `e_j`) for β, so the solve leaves β_j where it is.
             if breakdown.is_some() {
-                for j in (0..p).filter(|&j| broken[j]) {
+                for j in (0..p).filter(|&j| irls_broken[j]) {
                     for k in 0..p {
                         irls_xtwx[(j, k)] = 0.0;
                         irls_xtwx[(k, j)] = 0.0;
@@ -1229,7 +1237,7 @@ pub(crate) fn glm_irls_fit_mapped<'a>(
             let mut rhs = MatMut::from_column_major_slice_mut(irls_xtwz, p, 1usize);
             chol.solve_in_place(rhs.rb_mut());
         }
-        if let (true, Some((qr, _))) = (l_from_qr, &design_qr) {
+        if let (true, Some(qr)) = (l_from_qr, &design_qr) {
             qr.map_beta(&mut irls_xtwz[..p]);
         }
         irls_betas_new[..p].copy_from_slice(&irls_xtwz[..p]);
@@ -1462,6 +1470,7 @@ pub(crate) fn glm_irls_fit_mapped<'a>(
             pivot: f64::NAN,
             pivot_col: 0,
             se_unavailable: false,
+            broken: &[],
         };
     }
 
@@ -1484,6 +1493,7 @@ pub(crate) fn glm_irls_fit_mapped<'a>(
             pivot: 0.0,
             pivot_col: j as u32,
             se_unavailable: true,
+            broken: &irls_broken[..p],
         };
     }
 
@@ -1499,15 +1509,16 @@ pub(crate) fn glm_irls_fit_mapped<'a>(
                 irls_l[(i, j)] = if i >= j { l[(i, j)] } else { 0.0 };
             }
         }
-        if let (true, Some((qr, _))) = (l_from_qr, &design_qr) {
+        if let (true, Some(qr)) = (l_from_qr, &design_qr) {
             qr.map_factor(irls_l.rb_mut());
         }
     }
 
-    // Per-target Var(β̂ₜ) = (B(X̃'WX̃)⁻¹Bᵀ)ₜₜ = ‖L⁻¹bₜ‖², bₜ row t of the column
-    // map B (eₜ on an unmapped design) — see `ols::triangular_solve_norm_sq`
-    // for the forward-solve identity (no σ̂² scaling here: under Bernoulli the
-    // score covariance is (X'WX)⁻¹ directly).
+    // Per-target (B(X̃'WX̃)⁻¹Bᵀ)ₜₜ = ‖L⁻¹bₜ‖², bₜ row t of the column map B (eₜ on
+    // an unmapped design) — see `ols::triangular_solve_norm_sq` for the
+    // forward-solve identity. That is Var(β̂ₜ) at φ = 1, and φ stays out of the
+    // kernel: Var(β̂) = φ·(X'WX)⁻¹ on Gamma and inverse-Gaussian, with φ̂ read
+    // after the fit (`fit::glm::glm_dispersion`).
     for (out_idx, &tj) in target_indices.iter().enumerate() {
         let tj = tj as usize;
         if tj >= p {
@@ -1549,6 +1560,7 @@ pub(crate) fn glm_irls_fit_mapped<'a>(
         pivot,
         pivot_col: pivot_col as u32,
         se_unavailable: false,
+        broken: &[],
     }
 }
 
@@ -1579,6 +1591,7 @@ mod tests {
             irls_xtwz: &mut ws.irls_xtwz,
             irls_l: ws.irls_l.as_mut(),
             irls_wx: &mut ws.irls_wx,
+            irls_broken: &mut ws.irls_broken,
         }
     }
 
@@ -2531,6 +2544,7 @@ mod tests {
             pivot: 1.0,
             pivot_col: 0,
             se_unavailable: false,
+            broken: &[],
         };
         let mut s = [0.0_f64; 2];
         assert!((glm_contrast_t_sq(&view, 1, 0, &mut s) - 1.5).abs() < 1e-12);

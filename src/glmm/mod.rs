@@ -971,9 +971,10 @@ impl GradSearch<'_, '_> {
 /// Errors: no `Result`. An outer search that exhausts its evaluation budget
 /// (`Status::MaxFunReached`) still reports its incumbent through `GlmmFit`:
 /// `converged = false`, `boundary_hit = 2`, `pinned_components` empty, and the
-/// incumbent's β̂, SEs and deviance in the usual fields. Every other
-/// non-convergence (BOBYQA failure, or the degenerate-fit guard tripping on an
-/// all-infeasible BOBYQA simplex) NaN-fills every β̂/SE/deviance field instead
+/// incumbent's β̂, SEs and deviance in the usual fields, and so does a gradient
+/// search whose BOBYQA route ended with no result. Every other non-convergence
+/// (BOBYQA failure, or the degenerate-fit guard tripping on an all-infeasible
+/// BOBYQA simplex) NaN-fills every β̂/SE/deviance field instead
 /// (`f64::NAN` or `f64::INFINITY`; see `nan_fit`). A covariance that cannot be
 /// formed at the endpoint (a non-PD Schur) NaN-fills the SE outputs alone and
 /// sets `GlmmFit::se_unavailable`.
@@ -1159,7 +1160,7 @@ pub fn fit_glmm(
     ws.exact_prof.curv_memory = false;
     ws.non_finite_points.clear();
     ws.counters.reset();
-    ws.pattern.coup_mask = None; // CSR validity is per (fit, pinning mask): ids/z may differ across fits
+    ws.pattern.coup_mask = None; // CSR validity is per (fit, pinning mask)
 
     // Cluster-outer AGQ substrate: built once per fit (cluster_ids is fit-fixed).
     // Scalar AGQ (`q_p = 1`) reads it ONLY in `parallel` builds, where it is
@@ -1173,8 +1174,7 @@ pub fn fit_glmm(
     // parallel pass owns the decision of whether a rows-per-cluster dispatch can
     // unlock the win. Vector AGQ (`q_p ≥ 2`) is cluster-outer on every build and
     // builds a transient index per evaluation when none is handed in, so a
-    // serial build gets it here too, once per fit, rebuilt in place into the
-    // previous fit's buffers.
+    // serial build gets it here too, built once and kept across fits.
     let par_index = cfg!(all(feature = "parallel", not(target_arch = "wasm32")))
         && ws.nagq > 1
         && ws.parallel_inner;
@@ -1184,7 +1184,7 @@ pub fn fit_glmm(
         && ws.groupings.extra_offsets.is_empty();
     ws.cluster_rows = if par_index || serial_vec_index {
         let mut idx = ws.cluster_rows.take().unwrap_or_default();
-        idx.rebuild(cluster_ids, ws.groupings.n_primary);
+        idx.ensure(cluster_ids, ws.groupings.n_primary);
         Some(idx)
     } else {
         None
@@ -1572,7 +1572,8 @@ pub fn fit_glmm(
     //   its unchanged budget: stage 1 at `RHO_BEGIN_WARM` where the route has
     //   one; where it has no stage 1 (AGQ, Laplace `Joint`) the joint search
     //   restarts at `GLMM_RHO_BEGIN`. A failed line search or the cap raise
-    //   `Note::GradientSearchFallback`.
+    //   `Note::GradientSearchFallback`. When that route ends with no result,
+    //   a finite incumbent is the fit's capped endpoint (`grad_incumbent`).
     //
     // On AGQ a fit this route finishes (a certified endpoint or the polish)
     // then goes through the joint search's check and second pass
@@ -1585,6 +1586,15 @@ pub fn fit_glmm(
     let agq_finish = nagq > 1;
     let mut grad_spent = 0usize;
     let mut grad_fell_back = false;
+    // A handed-over incumbent's search dimension m and objective; its
+    // `[θ | β | ψ]` (caller's β) and modes are in the third part of
+    // `ws.grad_scratch`. The BFGS objective holds β at the point, the BOBYQA
+    // route profiles it, and on a ridge the profile can fail at every point the
+    // route tries around a point BFGS evaluated: a reduced fit of
+    // `sim_poisson_precise_ridge` at a BFGS cap of 200 held 710.53 at
+    // θ₀ = 23.8 while all 20 stage-1 evaluations were non-finite, and so were
+    // all those of the `PqlThenJoint` retry.
+    let mut grad_incumbent: Option<(usize, f64)> = None;
     let total_dim = n_theta + p + n_disp;
     let total_free = n_free + p + n_disp;
     if grad_route {
@@ -1608,8 +1618,9 @@ pub fn fit_glmm(
         // The search's start (length m), for a hand-over from the plateau
         // below, and the objective's last `[θ | β]` (length `n_θ + p`):
         // workspace scratch, so a refit allocates nothing here.
-        grad_scratch.resize(m + nb_col, 0.0);
-        let (grad_start, x_last) = grad_scratch.split_at_mut(m);
+        grad_scratch.resize(m + nb_col + m + k, 0.0);
+        let (grad_start, rest) = grad_scratch.split_at_mut(m);
+        let (x_last, incumbent) = rest.split_at_mut(nb_col);
         grad_start.copy_from_slice(&params[..m]);
         x_last.fill(0.0);
         // β̃'s whitening. `BetaScale::set` whitens by the design and the
@@ -1704,14 +1715,13 @@ pub fn fit_glmm(
         }
         beta_scale.to_search(&mut params[n_theta..nb_col]);
         // AGQ: the gradient's row index and buffers, built on the first such
-        // fit and kept for the SE step's gradient-difference Hessian; the index
-        // is rebuilt per fit, since a reused workspace may see new ids.
+        // fit and kept for the SE step's gradient-difference Hessian.
         if nagq > 1 && !agq_gd.as_ref().is_some_and(|g| g.matches_shape(p, nagq)) {
             *agq_gd = Some(Box::new(agq_gradient::AgqGd::for_shape(p, nagq)));
         }
         let mut agq_gd = agq_gd.as_deref_mut().filter(|_| nagq > 1);
         if let Some(gd) = agq_gd.as_deref_mut() {
-            gd.idx.rebuild(&cluster_ids[..n], groupings.n_primary);
+            gd.idx.ensure(&cluster_ids[..n], groupings.n_primary);
         }
         let mut obj = GradSearch {
             data: &data,
@@ -1880,6 +1890,11 @@ pub fn fit_glmm(
             *obj.pirls_exhausted = exhausted;
         }
         beta_scale.to_caller(&mut params[n_theta..nb_col]);
+        if grad_fell_back && best.is_finite() {
+            incumbent[..m].copy_from_slice(&params[..m]);
+            incumbent[m..].copy_from_slice(&u_seed[..k]);
+            grad_incumbent = Some((m, best));
+        }
         if far {
             // From the plateau the BOBYQA route restarts where the search
             // started, the guard's pick, not at the endpoint out on it.
@@ -2880,6 +2895,21 @@ pub fn fit_glmm(
     };
     // A gradient search that handed over spent real evaluations on this fit.
     let n_eval = n_eval + grad_spent;
+    // Reported as a search that ran out: `budget_exhausted` gives `converged =
+    // false` and `boundary_hit = 2` at a finite point, as a capped BOBYQA does.
+    // The estimates are the gradient search's, so neither fallback note, which
+    // say another search made them, is raised.
+    let (ok, budget_exhausted, inc_obj) = match grad_incumbent {
+        Some((m, f)) if !ok => {
+            let (point, modes) = ws.grad_scratch[m + nb_col..].split_at(m);
+            ws.params[..m].copy_from_slice(point);
+            ws.u_seed[..k].copy_from_slice(modes);
+            ws.gradient_search_fallback = false;
+            ws.exact_profile_fallback = false;
+            (true, true, f)
+        }
+        _ => (ok, budget_exhausted, inc_obj),
+    };
 
     // NB / Gamma: the incumbent's dispersion becomes the workspace's fixed θ_NB
     // or φ for everything downstream — the pinned re-eval, the SE path — which

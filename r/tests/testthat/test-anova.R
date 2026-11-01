@@ -462,8 +462,8 @@ test_that("the fit stores the offset, the objective and both per-term results", 
 })
 
 # anova(m, test): "auto" and "Wald" read the stored Wald tables, "LRT" the
-# likelihood-ratio tables a fit stores when fastglmm(..., anova_test = "LRT")
-# asks for them.
+# likelihood-ratio tables, which fastglmm(..., anova_test = "LRT") makes with
+# the fit and the default makes on the first anova() that needs them.
 lrt_fits <- function() {
   d <- benchmark_data(seed = 321, family = "binomial")
   list(wald = fastglmm(y ~ t * d + (1 | g), d, family = binomial()),
@@ -527,8 +527,50 @@ test_that("test comes after type, nsim and seed stay, and test applies to one fi
   expect_error(anova(m0, test = "auto", nsim = 10), "nsim and seed", fixed = TRUE)
 })
 
-test_that("LRT on a fit that stored no likelihood-ratio table names the fit argument", {
-  m <- lrt_fits()$wald
+test_that("a default fit makes the likelihood-ratio tables once, and copies share them", {
+  fits <- lrt_fits()
+  m <- fits$wald
+  copy <- m
+  expect_null(m$.lrt$tables)
+  for (type in c("III", "II")) {
+    expect_identical(anova(m, type = type, test = "LRT"),
+                     anova(fits$lrt, type = type, test = "LRT"))
+  }
+  tables <- m$.lrt$tables
+  expect_false(is.null(tables))
+  expect_identical(anova(copy, test = "LRT"), anova(m, test = "LRT"))
+  expect_identical(m$.lrt$tables, tables)
+})
+
+test_that("the tables of the first anova() are those the fit would have made", {
+  # Each case moves the statistics, so a port that dropped its argument from
+  # the repeated call would fail here.
+  d <- benchmark_data(seed = 323, family = "poisson")
+  d$w <- 1 + seq_len(nrow(d)) %% 3
+  d$off <- (0.1 * seq_len(nrow(d))) %% 1
+  d$p <- exp(0.5 + 0.3 * d$t)
+  f <- y ~ t + d + (1 | g)
+  cases <- list(
+    list(f, d, poisson(), offset = d$off),
+    list(f, d, poisson(), nAGQ = 3L),
+    list(f, d, poisson(), weights = d$w),
+    list(f, d, poisson(), start = list(beta = c(0.5, 0.1, 0.1))),
+    list(y ~ t + d, d, poisson(), weights = d$w),
+    list(p ~ t + d, d, Gamma(link = "log"), dispersion = 2)
+  )
+  for (case in cases) {
+    late <- suppressWarnings(do.call(fastglmm, case))
+    now <- suppressWarnings(do.call(fastglmm, c(case, list(anova_test = "LRT"))))
+    for (type in c("III", "II")) {
+      expect_identical(anova(late, type = type, test = "LRT"),
+                       anova(now, type = type, test = "LRT"))
+    }
+  }
+})
+
+test_that("LRT on a fit made with anova_test = \"Wald\" names the fit argument", {
+  d <- benchmark_data(seed = 321, family = "binomial")
+  m <- fastglmm(y ~ t * d + (1 | g), d, family = binomial(), anova_test = "Wald")
   msg <- paste("this fit stored no likelihood-ratio tables, which are built only when the fit",
                'asks for them: refit with fastglmm(..., anova_test = "LRT").')
   expect_error(anova(m, test = "LRT"), msg, fixed = TRUE)
@@ -594,7 +636,8 @@ test_that("auto gives a Poisson GLMM the likelihood-ratio table, under its own h
   for (m in fits) {
     expect_identical(m$term_test_auto, list(test = "lrt", reason = "poisson_mixed"))
   }
-  expect_identical(fits$auto$term_table_type3_lrt$reason, "poisson_mixed")
+  anova(fits$auto)
+  expect_identical(fits$auto$.lrt$tables$term_table_type3_lrt$reason, "poisson_mixed")
   expect_null(fits$Wald$term_table_type3_lrt)
   for (type in c("III", "II")) {
     design <- if (type == "III") " on the reduced design" else ""

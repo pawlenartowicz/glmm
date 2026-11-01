@@ -317,7 +317,7 @@ The pair need not be a target, except on a negative binomial fit, where a
 pair outside the `se_for` columns gives NaN. The df match
 `Fit::contrast_t`'s, and `df_out` gets what `satterthwaite` gives. On a GLM
 the t² takes φ = 1, as `var_diag` does: on a Gamma or inverse-Gaussian model
-divide it by φ̂.
+divide it by φ̂, which `view.dispersion()` returns.
 
 `fit_on` panics rather than misroutes: the design shape (rows, predictors) and
 the options frozen at build (`nagq`, the criterion `reml` resolves to on an

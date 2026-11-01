@@ -459,7 +459,9 @@ kernel monomorphized over `q = 1..8`. A value plus its gradient costs 1.35 to
 backtracking (`c = 1e-4`, halving, at most 30 trials) on value-only
 evaluations, the gradient once per accepted point; coordinates held on a bound
 the gradient pushes against; Shanno scaling at the first update; the first
-step after a (re)start capped at 0.5 in max norm. Stops: projected gradient
+step after a (re)start capped at 0.5 in max norm and stopped `1e-4` of the step
+short of an exact 0; a failure from an updated `H` restarts once from the start
+matrix. Stops: projected gradient
 below `1e-6`; an accepted decrease below `max(fdelta_abs = 1e-9,
 16·ε·|f|)` after the second iteration (absolute, because the deviance is O(n)
 and a relative stop grows with it); a line search whose every trial's
@@ -664,8 +666,8 @@ Cholesky uniqueness the sparse factor equals the dense path's augmented factor
 — so the two fits agree to machine precision wherever both apply, and the
 sparse kernel can serve as the superset solver without a separate tolerance.
 The sparse kernel's caller is `fit_lmm` through
-`LmmKernel::Sparse`, built by `accumulate_lmm_rows` and refilled in place when
-a call brings the same rows (`same_rows`). The search
+`LmmKernel::Sparse`, built by `accumulate_lmm_rows` on the first call and
+refilled in place on every later one. The search
 around them is one copy: the seed, the BOBYQA schedule, the pin pass, β̂ and
 `Var(β̂)` off the factor, and the joint Wald statistic are `fit_lmm`'s,
 whichever kernel evaluates the objective. The ill-conditioning policy is one

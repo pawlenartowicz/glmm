@@ -106,8 +106,8 @@ pub struct FitDiagnostics {
     /// GLM and GLMM: the fit has an endpoint but no fixed-effect covariance
     /// could be formed there, so its SE outputs are NaN — see
     /// [`crate::Note::SeUnavailable`]. On the GLM it comes with
-    /// `ill_conditioned`, `pivot` 0 and `pivot_col` the column that broke
-    /// down. `false` on OLS and LMM routes.
+    /// `ill_conditioned`, `pivot` 0 and `pivot_col` the first column that
+    /// broke down. `false` on OLS and LMM routes.
     pub se_unavailable: bool,
     /// GLMM-only: the estimated rounding error of the reported deviance is
     /// past what resolves θ̂ — see [`crate::Note::PrecisionLimited`]. `false`
@@ -2121,17 +2121,17 @@ pub(crate) fn nan_vcov(p: usize) -> Vec<f64> {
     vec![f64::NAN; p * p]
 }
 
-/// The residual df of OLS and of a Gamma or inverse Gaussian GLM with φ
-/// estimated (`ν = n − p`, `p` this fit's columns, the retained ones on a
-/// rank-deficient design): `coef_df` is ν on the target columns, NaN
-/// elsewhere, and the record holds the full `C`, [`vcov_from_chol`] over
+/// The residual df `nu` of OLS and of a Gamma or inverse Gaussian GLM with φ
+/// estimated (`n` less the estimated columns: the retained ones on a
+/// rank-deficient design, not those of a QR breakdown), over the `p` columns
+/// of `l`: `coef_df` is ν on the target columns, NaN elsewhere, and the record holds the full `C`, [`vcov_from_chol`] over
 /// every column whatever the targets. A fit that did not converge keeps the
 /// residual record, with ν and an all-NaN `C` (its contrasts are NaN, not
 /// `NoDf`), and `coef_df` stays NaN, as `se` does; the non-convergence is
 /// reported through `converged`, since no pass ran that could fail.
 pub(crate) fn residual_df(
     l: faer::MatRef<'_, f64>,
-    n: usize,
+    nu: f64,
     p: usize,
     scale: f64,
     map: &ColumnScaling,
@@ -2140,7 +2140,6 @@ pub(crate) fn residual_df(
 ) -> (Vec<f64>, crate::lmm::satterthwaite::SatterthwaiteState) {
     use crate::lmm::satterthwaite::SatterthwaiteState;
     let mut coef_df = vec![f64::NAN; p];
-    let nu = n as f64 - p as f64;
     if !converged {
         return (
             coef_df,

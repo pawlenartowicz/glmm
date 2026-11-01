@@ -5,7 +5,7 @@ intervals, in both ports:
 
 | Call | R | Python | Takes | Refits? |
 |---|---|---|---|---|
-| per-term tests | `anova(m)` | `glmm.anova(m)` | one fit | no: reads the tables the fit stored when it was made |
+| per-term tests | `anova(m)` | `glmm.anova(m)` | one fit | no, except the first call that needs likelihood-ratio rows: it runs the fit again, then each reduced model |
 | two fits compared | `anova(m0, m1)` | `glmm.anova(m0, m1)` | two existing fits | no, and reads no data |
 | two formulas compared | `compare(data, f0, f1)` | `glmm.compare(data, f0, f1)` | one data set, two formulas | fits both models itself |
 | pairwise comparisons of a factor's levels | `pairwise(m, "f")` | `glmm.pairwise(m, "f")` | one fit | no: reads the fit's numbers and its rows |
@@ -18,10 +18,10 @@ names of these calls and of their result classes are provisional until 1.0.0.
 
 ## The per-term tests of one fit: `anova(m)`
 
-`anova(m)` gives one row per fixed term. The rows are built when the model is
-fitted and stored on the fit object, so the call computes nothing and refits
-nothing: F and Wald rows come from that fit alone, likelihood-ratio rows from
-refits made with it
+`anova(m)` gives one row per fixed term. F and Wald rows are built when the
+model is fitted and stored on the fit object, so reading them computes nothing
+and refits nothing. Likelihood-ratio rows come from refits, made on the first
+`anova()` that needs them and then kept
 ([below](#wald-or-likelihood-ratio-rows-test-and-anova_test)). There are no
 random-effect rows: a variance component is tested by comparing two models
 (below).
@@ -142,8 +142,8 @@ spelled the same in both ports, choose which:
 
 | Argument | Call | Values | What it chooses |
 |---|---|---|---|
-| `test` | `anova(m, test = )`; Python `glmm.anova(m, test=)` | `"auto"` (default), `"Wald"`, `"LRT"` | which of the stored tables `anova(m)` returns |
-| `anova_test` | `fastglmm(..., anova_test = )`; Python `glmm.fit(..., anova_test=)` | `"auto"` (default), `"Wald"`, `"LRT"` | which tables the fit stores |
+| `test` | `anova(m, test = )`; Python `glmm.anova(m, test=)` | `"auto"` (default), `"Wald"`, `"LRT"` | which table `anova(m)` returns |
+| `anova_test` | `fastglmm(..., anova_test = )`; Python `glmm.fit(..., anova_test=)` | `"auto"` (default), `"Wald"`, `"LRT"` | when the likelihood-ratio tables are made |
 
 ```r
 data(grouseticks, package = "lme4")
@@ -245,26 +245,25 @@ refit's, referred to χ² on the term's df (the Wald row's `Df`).
   that did not converge nothing is refitted and every row is NaN. The notes
   are listed [below](#the-notes-a-table-can-carry).
 
-**When the refits are made: `anova_test`.** The likelihood-ratio rows are
-built when the model is fitted, as the Wald rows are, so `anova(m)` still
-computes nothing. Every fit stores its Wald (or F) tables. `anova_test =
-"auto"` (the default) also stores the likelihood-ratio tables of a Poisson
-GLMM, whose default table they are; `"LRT"` stores them on every fit with χ²
-rows; `"Wald"` stores none. The fit itself (estimates, standard errors,
-log-likelihood) is the same under every value. What changes is the time:
-each reduced model is one more fit, so a default fit of a Poisson GLMM takes
-longer than the same fit with `anova_test = "Wald"`. `compare()` makes its
-two fits with `anova_test = "Wald"`, so they store no likelihood-ratio
-tables: `anova()` of a Poisson GLMM it fitted (`cmp$fit1`, Python
-`cmp.fit1`) needs `test = "Wald"`, and the likelihood-ratio rows come from
-`fastglmm(..., anova_test = "LRT")` (Python
-`glmm.fit(..., anova_test="LRT")`). On a fit with F rows, `anova_test =
+**When the refits are made: `anova_test`.** Every fit stores its Wald (or F)
+tables. `anova_test = "auto"` (the default) makes the likelihood-ratio tables
+the first time `anova()` needs them, which on a Poisson GLMM is `anova(m)`
+itself: that call runs the fit again and then each reduced model, and the fit
+keeps the tables, so the next call computes nothing. `"LRT"` makes them with
+the fit, on every fit with χ² rows, so the fitting call takes the time instead.
+`"Wald"` never makes them. The tables are the same either way, and the fit
+itself (estimates, standard errors, log-likelihood) is the same under every
+value. `compare()` makes its two fits with `anova_test = "Wald"`:
+`anova()` of a Poisson GLMM it fitted (`cmp$fit1`, Python `cmp.fit1`) needs
+`test = "Wald"`, and the likelihood-ratio rows come from
+`fastglmm(..., anova_test = "auto")` (Python
+`glmm.fit(..., anova_test="auto")`). On a fit with F rows, `anova_test =
 "LRT"` leaves the fit as it is, and `anova(m, test = "LRT")` is refused.
 
 **What `test` refuses.** Each refusal names its fix; the texts are in
 [`warnings.md`](warnings.md#test-and-comparison-errors).
 
-- `test = "LRT"` on a fit that stored no likelihood-ratio tables: refit with
+- `test = "LRT"` on a fit made with `anova_test = "Wald"`: refit with
   `anova_test = "LRT"`.
 - `test = "auto"` on a Poisson GLMM fitted with `anova_test = "Wald"`: an
   error, not a silent switch to Wald. Ask for `test = "Wald"`, or refit with
@@ -278,9 +277,9 @@ and whether the model has random effects, so one model gets the same test at
 every sample size. A simulation that fits more than one kind of model (a
 power analysis over Poisson and binomial GLMMs, or a GLMM against its GLM)
 gets likelihood-ratio rows for some models and Wald rows for
-others, under the same column names. To keep one test, name it at fit time
-and in `anova()`: `anova_test = "Wald"` with `test = "Wald"` (no refits, the
-fastest), or `anova_test = "LRT"` with `test = "LRT"`.
+others, under the same column names. To keep one test, name it in `anova()`:
+`test = "Wald"` makes no refits and is the fastest, and `test = "LRT"` refits
+every model.
 
 ## Pairwise comparisons: `pairwise()`
 
@@ -805,10 +804,8 @@ that showed:
 Every χ² table under `test = "auto"` names its test and the reason in its
 heading.
 
-`test = "Wald"` and `test = "LRT"` remain available on every fit with χ² rows;
-on any fit other than a Poisson GLMM fitted with the default
-`anova_test = "auto"`, the likelihood-ratio rows need `anova_test = "LRT"` at
-fit time.
+`test = "Wald"` and `test = "LRT"` remain available on every fit with χ² rows,
+except that a fit made with `anova_test = "Wald"` has no likelihood-ratio rows.
 
 **Sparse binary data with small clusters.** With about two observations per
 cluster and prevalence 0.10, and under a random slope at 0.22, the Laplace fit
@@ -867,7 +864,7 @@ full texts are in [`warnings.md`](warnings.md#test-and-comparison-errors).
 | two REML fits with different fixed parts | `compare()`, which fits both by ML, or refit both with `REML = FALSE` (`reml=False`) |
 | the same model twice, or the same parameter count | compare two models that differ by at least one parameter |
 | an interaction without its marginal terms (`anova(m)`) | add the missing terms |
-| `test = "LRT"` on a fit that stored no likelihood-ratio tables | refit with `anova_test = "LRT"` (Python `anova_test="LRT"`) |
+| `test = "LRT"` on a fit made with `anova_test = "Wald"` | refit with `anova_test = "LRT"` (Python `anova_test="LRT"`) |
 | `test = "auto"` on a Poisson GLMM fitted with `anova_test = "Wald"` | ask for `test = "Wald"`, or refit with the default `anova_test = "auto"` |
 | `test = "Wald"` or `test = "LRT"` on a fit with F rows | leave `test` at its default |
 | `test` with two fits | leave it out: a comparison's test follows from the two models |
@@ -925,7 +922,9 @@ tables `run_fit` stores on `FitResult`. `TermTestOptions::test` takes
 which test ran and why (`ChoiceReason`); `run_fit`'s `anova_test` (`"auto"`,
 `"Wald"` or `"LRT"`) decides whether `FitResult::term_table_type3_lrt` and
 `term_table_type2_lrt` are built, and `FitResult::term_test_auto` records
-what `"auto"` gives. `FixedRow::eta2_partial()` gives a row's partial η²
+what `"auto"` gives. The ports' own `"auto"` sends `run_fit` `"Wald"`, and
+repeats the call with the tables' value when `anova()` needs them.
+`FixedRow::eta2_partial()` gives a row's partial η²
 (NaN on a row with no F), and `orchestrate::TermColumns::eta2_partial` holds
 it per row. `nesting`, `compare`, `term_tests` and their types are under the
 semver promise; `compare_stored`, `anova::Model` and the `orchestrate` items

@@ -44,8 +44,10 @@
 //!   certificate's bound (a warm start at the optimum stops here after one
 //!   value and one gradient);
 //! - `LineSearch`: no accepted trial in [`BfgsConfig::max_backtracks`]
-//!   halvings; `MaxIter`: the iteration cap; `GradUnavailable` and
-//!   `NonFinite`: the objective failed at the start or at an accepted point.
+//!   halvings from the start matrix (a failure from an updated `H` restarts
+//!   from the start matrix first); `MaxIter`: the iteration cap;
+//!   `GradUnavailable` and `NonFinite`: the objective failed at the start or
+//!   at an accepted point.
 //!
 //! [`BfgsOutcome::certified`] is the acceptance test every route applies to
 //! the endpoint; an endpoint that fails it is polished by BOBYQA.
@@ -59,6 +61,14 @@ use super::GradObjective;
 /// Relative floor of the `Fdelta` stop, in units of `ε·|f|`: two deviances
 /// that differ by fewer ulps than this are not a measured decrease.
 pub(crate) const FDELTA_ULPS: f64 = 16.0;
+
+/// How far short of 0 a capped first step stops when it would land on a
+/// nonzero coordinate's exact 0, as a fraction of the step. Near an exact 0 the
+/// deviance is even in a diagonal θ, so its gradient there is exactly 0 and `H`
+/// keeps it out of every later step: the search cannot leave, however far the
+/// optimum is. The GLMM route's blind start lands there on most cold fits (two
+/// capped steps from θ = 1).
+const ZERO_LANDING_SHORT: f64 = 1e-4;
 
 /// The certificate's bound on the BFGS decrement `½·gᵀHg` (free set, deviance
 /// units). Measured endpoint maximum on the LMM route: 1.7e-9 cold.
@@ -104,6 +114,13 @@ impl BfgsConfig {
     /// `ln φ`: the measured prototype's (308 grid and 32 stress cells,
     /// 2026-10-06/07), whose largest iteration count was about 90 (q8 cells).
     ///
+    /// `max_iter` is 2000 for the long valleys of precise counts. Past about
+    /// 1/√Σw a slope's θ has negative curvature, so a step there makes no
+    /// BFGS update and the search crawls until it leaves that stretch: up to
+    /// 1163 iterations on Poisson `(1 + x1 + x2 | g)` at log-mean e¹⁴, and up
+    /// to 1462 on the reduced models of its likelihood-ratio rows, whose
+    /// intercept SD runs out to about 30 (2026-11-01).
+    ///
     /// `fdelta_abs` is 1e-10, not the LMM's 1e-9. Where a variance column
     /// collapses toward zero the deviance is nearly flat along a curved
     /// valley, and the search descends it in waves: the accepted decrease
@@ -114,7 +131,7 @@ impl BfgsConfig {
     /// took 13078 and 9927 evaluations. At 1e-10 both reach the optimum
     /// (2026-10-09, `gami_q6_g3000p20_bal_base`).
     pub(crate) const GLMM: Self = Self {
-        max_iter: 200,
+        max_iter: 2000,
         max_backtracks: 30,
         armijo_c: 1e-4,
         pgrad_tol: 1e-6,
@@ -445,6 +462,7 @@ fn bfgs_run(
         return out;
     }
     let mut first = !hinted;
+    let mut restarted = false;
     while out.iters < cfg.max_iter {
         out.iters += 1;
         st.mark_free(x, lo, hi);
@@ -490,7 +508,11 @@ fn bfgs_run(
                 break;
             }
             for i in 0..n {
-                st.xt[i] = (x[i] + alpha * st.d[i]).clamp(lo[i], hi[i]);
+                let mut t = x[i] + alpha * st.d[i];
+                if first && t == 0.0 && x[i] != 0.0 {
+                    t = x[i] + alpha * st.d[i] * (1.0 - ZERO_LANDING_SHORT);
+                }
+                st.xt[i] = t.clamp(lo[i], hi[i]);
             }
             out.n_val += 1;
             if let Some(ft) = obj.value(&st.xt, 0.0).filter(|v| v.is_finite()) {
@@ -504,13 +526,25 @@ fn bfgs_run(
         }
         let Some(ft) = accepted else {
             st.mark_free(x, lo, hi);
-            out.stop = if alpha * -slope < floor && st.decrement() <= CERT_DECREMENT {
-                BfgsStop::NoiseFloor
-            } else {
-                BfgsStop::LineSearch
-            };
+            // After a restart the decrement is the start matrix's: it says
+            // nothing of the curvature the updated `H` failed on, and a flat
+            // direction with a small gradient would pass as the noise floor.
+            if !restarted && alpha * -slope < floor && st.decrement() <= CERT_DECREMENT {
+                out.stop = BfgsStop::NoiseFloor;
+                break;
+            }
+            // A pair taken across a trough can leave `H` too large by 1e9 or
+            // more along a stiff coordinate, past what the halvings reach.
+            if !first {
+                st.set_start();
+                first = true;
+                restarted = true;
+                continue;
+            }
+            out.stop = BfgsStop::LineSearch;
             break;
         };
+        restarted = false;
         // The accepted trial was the last value call: its gradient is next.
         out.n_grad += 1;
         let grad_ok = obj.gradient(&mut st.g_new) && all_finite(&st.g_new);

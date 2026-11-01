@@ -842,9 +842,10 @@ class Fit:
     term_table_type3: dict | None = None
     term_table_type2: dict | None = None
     # The likelihood-ratio tables `glmm.anova(m, test="LRT")` reads, as the two
-    # above, stored by a fit made with `anova_test="LRT"`, and by a Poisson
-    # model with random effects made with `anova_test="auto"` (None
-    # otherwise); on a fit with F rows each holds the refusal as its "error".
+    # above: made with the fit under `anova_test="LRT"`, by the first
+    # `glmm.anova` that needs them under `anova_test="auto"` (None until then),
+    # and never under "Wald". On a fit with F rows each holds the refusal as
+    # its "error".
     term_table_type3_lrt: dict | None = None
     term_table_type2_lrt: dict | None = None
     # What `glmm.anova(m)`'s default test="auto" gives on this fit:
@@ -874,9 +875,10 @@ class Fit:
     # each call, with "row_index" (each training row's position in the
     # caller's data, as `_prepare_columns` gives it, so an error names the
     # caller's row; absent on a fit pickled before it, None when no row was
-    # dropped), and the kernel's conditional variances in its own layout
+    # dropped), the kernel's conditional variances in its own layout
     # ("condvar", "condvar_x", float64 bytes, and "condvar_cross", a dict or
-    # None). None on a fit pickled before them.
+    # None), and on a fit made with `anova_test="auto"` "lrt_call", the rest of
+    # the call `_lrt_tables` repeats. None on a fit pickled before them.
     # Mirrors the R port's `.kernel_parts` - change together.
     _kernel_parts: dict | None = field(default=None, repr=False)
 
@@ -1312,6 +1314,37 @@ class Fit:
             int(self.objective_nodes),
             null_refit,
         )
+
+    def _lrt_tables(self):
+        """Fill `term_table_type3_lrt` and `term_table_type2_lrt` on a fit made
+        with `anova_test="auto"`, once. Runs the fit's own call again, which
+        is deterministic, so the tables are the ones the fit would have made.
+        Mirrors the R port's `.lrt_tables` - change together."""
+        call = self._kernel_parts.get("lrt_call") if self._kernel_parts else None
+        if call is None or self.term_table_type3_lrt is not None:
+            return
+        wald_se, nagq, dispersion, warm_start = call
+        kept = self._kernel_parts
+        r = _native.fit(
+            self.formula,
+            kept["numeric"],
+            kept["factor"],
+            self.family,
+            self.link,
+            wald_se,
+            nagq,
+            dispersion,
+            kept["weights"],
+            kept["offset"],
+            warm_start,
+            False,  # satterthwaite, condvar, reml: no chi-squared fit reads them
+            False,
+            None,
+            "auto" if self.term_test_auto["test"] == "lrt" else "LRT",
+            kept["row_index"],
+        )
+        self.term_table_type3_lrt = _lrt_result(r["term_table_type3_lrt"])
+        self.term_table_type2_lrt = _lrt_result(r["term_table_type2_lrt"])
 
     def _record_arg(self):
         """`satterthwaite_record` as `_native.contrast_test` and
@@ -2369,18 +2402,17 @@ def fit(
         estimates; True reports the REML log-likelihood (the summary prints
         the REML criterion), None and False the ML one.
         Any other family: ML; True is ignored with an ArgumentIgnoredWarning.
-    anova_test: the per-term tables the fit stores for `glmm.anova(m, test=)`,
-        which reads them and computes nothing. Every fit stores its Wald
-        chi-squared (or F) tables, with no refit. "auto" (default) also
-        stores the likelihood-ratio tables of a Poisson model with random
-        effects, which `glmm.anova(m)` gives by default; "LRT" stores them on
+    anova_test: when the likelihood-ratio tables of `glmm.anova(m, test=)` are
+        made. Every fit stores its Wald chi-squared (or F) tables, with no
+        refit. "auto" (default) makes the likelihood-ratio tables the first
+        time `glmm.anova` needs them, which on a Poisson model with random
+        effects is `glmm.anova(m)` itself; "LRT" makes them with the fit, on
         every fit with chi-squared rows (any GLMM, and every GLM but a Gamma
-        or inverse Gaussian one with phi estimated), refitting the model once
-        per distinct reduced design after the fit, so
-        `glmm.anova(m, test="LRT")` can read them (on a fit with F rows the
-        fit stands and `glmm.anova(m, test="LRT")` raises); "Wald" stores
-        none. A simulation that must use one test on every model it fits
-        names the test here and in `glmm.anova`.
+        or inverse Gaussian one with phi estimated); "Wald" never makes them,
+        and `glmm.anova` then refuses a test that needs them. The tables
+        refit the model once per distinct reduced design, and under "auto"
+        once more for the fit itself. On a fit with F rows the fit stands and
+        `glmm.anova(m, test="LRT")` raises.
 
     A categorical column's level order is honored: level 0 is the
     treatment-contrast base, so `pd.Categorical(x, categories=[…])` fits against
@@ -2522,6 +2554,8 @@ def fit(
         "offset": offset.tobytes() if offset is not None else None,
         "row_index": row_index,
     }
+    if anova_test == "auto":
+        kept["lrt_call"] = (wald_se, nagq, dispersion, warm_start_pair)
     r = _native.fit(
         formula,
         numeric_columns,
@@ -2537,7 +2571,7 @@ def fit(
         satterthwaite,
         condvar,
         reml,
-        anova_test,
+        "Wald" if anova_test == "auto" else anova_test,
         row_index,
     )
     return _fit_from_native(r, formula, family, link, nagq, dispersion, store, kept)

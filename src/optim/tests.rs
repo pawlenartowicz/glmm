@@ -514,6 +514,78 @@ fn bfgs_with_the_exact_inverse_hessian_steps_to_the_optimum() {
 }
 
 #[test]
+fn bfgs_does_not_land_on_an_exact_zero_of_an_even_objective() {
+    // f = 1e4(x² − 0.01)², even in x, with minima at ±0.1. The capped first
+    // step is exactly −0.5, and f'(0) = 0 would hold the search on the maximum
+    // between them. From 0.5 the full step lands on 0; from 0.25 it lands on
+    // −0.25, which is no decrease, and the first halving lands on 0.
+    for start in [0.5, 0.25] {
+        let f = |x: &[f64]| 1e4 * (x[0] * x[0] - 0.01).powi(2);
+        let g = |x: &[f64], g: &mut [f64]| g[0] = 4e4 * x[0] * (x[0] * x[0] - 0.01);
+        let mut obj = closed(f, g);
+        let mut x = [start];
+        let out = bfgs_minimize(
+            &mut obj,
+            &mut x,
+            &[-9.0],
+            &[9.0],
+            &BfgsConfig::GLMM,
+            &mut BfgsState::default(),
+            None,
+            &[],
+        );
+        assert!((x[0].abs() - 0.1).abs() < 1e-6, "{start}: {x:?} {out:?}");
+    }
+}
+
+#[test]
+fn bfgs_restarts_from_the_start_matrix_after_a_failed_line_search() {
+    // A hint 1e12 too large: 30 halvings do not bring its step inside the
+    // quadratic's Armijo range, so only the restart reaches the minimum.
+    let f = |x: &[f64]| 0.5 * (x[0] - 1.0).powi(2);
+    let g = |x: &[f64], g: &mut [f64]| g[0] = x[0] - 1.0;
+    let mut obj = closed(f, g);
+    let mut x = [0.0];
+    let out = bfgs_minimize(
+        &mut obj,
+        &mut x,
+        &[-1e13],
+        &[1e13],
+        &BfgsConfig::GLMM,
+        &mut BfgsState::default(),
+        Some(&[1e12]),
+        &[],
+    );
+    assert_ne!(out.stop, BfgsStop::LineSearch, "{out:?}");
+    assert!((x[0] - 1.0).abs() < 1e-6, "{x:?} {out:?}");
+}
+
+#[test]
+fn bfgs_restart_that_cannot_move_is_not_a_noise_floor_stop() {
+    // A flat x₀ (curvature 1e-6) with g₀ = 5e-6, and a hint that fails on x₁.
+    // The identity's predicted decrease is below the floor, and its decrement
+    // passes the certificate though 1.25e-5 of the deviance is left along x₀.
+    let f = |x: &[f64]| 0.5e-6 * x[0] * x[0] + 0.5 * x[1] * x[1];
+    let g = |x: &[f64], g: &mut [f64]| {
+        g[0] = 1e-6 * x[0];
+        g[1] = x[1];
+    };
+    let mut obj = closed(f, g);
+    let mut x = [5.0, 1e-6];
+    let out = bfgs_minimize(
+        &mut obj,
+        &mut x,
+        &[-9.0; 2],
+        &[9.0; 2],
+        &BfgsConfig::GLMM,
+        &mut BfgsState::default(),
+        Some(&[1.0, 0.0, 0.0, 1e12]),
+        &[],
+    );
+    assert_eq!(out.stop, BfgsStop::LineSearch, "{out:?}");
+}
+
+#[test]
 fn curvature_hint_refuses_an_indefinite_hessian() {
     // A saddle: ∂²f = diag(2, −2).
     let h =

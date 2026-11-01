@@ -14,7 +14,8 @@
 #' Tests of fixed terms, and comparisons of two fits
 #'
 #' With one fit, `anova()` gives one row per fixed term, read from the table the
-#' crate built when the model was fitted: nothing is refitted when it is called.
+#' crate built when the model was fitted; only likelihood-ratio rows can need a
+#' refit (see below).
 #' Type III by default, built the way lmerTest builds it, so it does not depend
 #' on the contrast coding; Type II with `type = "II"`. A Gaussian mixed model
 #' gets lmerTest's F with Satterthwaite's denominator df (columns `Sum Sq`,
@@ -38,10 +39,10 @@
 #' reduced design of the hypothesis its Wald row tests, as afex's
 #' `mixed(method = "LRT")` on a GLMM; Type II: the model of every term that does
 #' not contain the term, with and without it, the rule of car's
-#' `Anova(test.statistic = "LR")` on a GLM, applied to GLMMs too). These refits
-#' are made when the model is fitted: when the fit asks for them with
-#' `fastglmm(..., anova_test = "LRT")`, and on a Poisson model with random
-#' effects under the default `anova_test = "auto"`. Each refit keeps the
+#' `Anova(test.statistic = "LR")` on a GLM, applied to GLMMs too). The first
+#' call that needs these rows refits the model and the fit keeps them, so the
+#' next call computes nothing; a fit made with
+#' `fastglmm(..., anova_test = "LRT")` has them already. Each refit keeps the
 #' model's random effects, random slopes included.
 #'
 #' The default `test = "auto"` gives the likelihood-ratio rows to a Poisson
@@ -97,10 +98,10 @@
 #'   default) gives the likelihood-ratio rows on a Poisson model with random
 #'   effects and the Wald chi-squared (or F) rows on every other fit;
 #'   `"Wald"` the Wald chi-squared rows; `"LRT"` the likelihood-ratio rows.
-#'   The likelihood-ratio rows are those the fit stored: a fit made with
-#'   `fastglmm(..., anova_test = "LRT")` stores them, and so does a Poisson
-#'   model with random effects fitted with the default `anova_test = "auto"`
-#'   (an error otherwise). On a fit whose rows are F tests (a Gaussian model,
+#'   The likelihood-ratio rows are an error on a fit made with
+#'   `anova_test = "Wald"`, and are made on the first call that needs them on
+#'   any other (see `anova_test` in [fastglmm()]). On a fit whose rows are F
+#'   tests (a Gaussian model,
 #'   a Gamma or inverse-Gaussian GLM with an estimated dispersion), `"Wald"`
 #'   and `"LRT"` are errors.
 #' @param nsim for two fits, the number of draws of the exact test's null
@@ -772,7 +773,7 @@ print.fastglmm_pairwise_ci <- function(x, ...) print.fastglmm_pairwise(x, ...)
   lrt <- identical(test, "LRT") ||
     (identical(test, "auto") && identical(object$term_test_auto$test, "lrt"))
   if (lrt) {
-    res <- object[[paste0(field, "_lrt")]]
+    res <- object[[paste0(field, "_lrt")]] %||% .lrt_tables(object)[[paste0(field, "_lrt")]]
     if (is.null(res) && identical(test, "LRT")) {
       stop(paste("this fit stored no likelihood-ratio tables, which are built only when the",
                  'fit asks for them: refit with fastglmm(..., anova_test = "LRT").'),
@@ -787,6 +788,36 @@ print.fastglmm_pairwise_ci <- function(x, ...) print.fastglmm_pairwise(x, ...)
     if (!is.null(res$error)) stop(res$error, call. = FALSE)
   }
   .term_anova(object, res, test, f_rows, lrt)
+}
+
+# The two likelihood-ratio tables of a fit made with anova_test = "auto",
+# made once, or NULL on any other fit. Runs the fit's own call again, which is
+# deterministic, so the tables are the ones the fit would have made. Mirrors
+# the Python port's Fit._lrt_tables - change together.
+.lrt_tables <- function(object) {
+  cache <- object$.lrt
+  if (is.null(cache)) return(NULL)
+  if (is.null(cache$tables)) {
+    a <- cache$call
+    cols <- .training_columns(object)
+    r <- fastglmm_fit(
+      object$formula, cols$numeric, cols$levels, cols$codes,
+      object$family_name, object$link, a$wald.se, a$nAGQ,
+      if (is.null(a$dispersion)) double() else as.double(a$dispersion),
+      if (is.null(cols$weights)) double() else as.double(cols$weights),
+      if (is.null(cols$offset)) double() else as.double(cols$offset),
+      as.double(a$start$beta %||% double()),
+      as.double(a$start$theta %||% double()),
+      as.double(a$start$dispersion %||% double()),
+      FALSE, # satterthwaite, condvar, REML: no chi-squared fit reads them
+      FALSE,
+      logical(),
+      if (identical(object$term_test_auto$test, "lrt")) "auto" else "LRT",
+      object$.row_index %||% seq_len(object$nobs)
+    )
+    cache$tables <- r[c("term_table_type3_lrt", "term_table_type2_lrt")]
+  }
+  cache$tables
 }
 
 # The anova data frame of a stored per-term result `res` of `object`, read

@@ -400,6 +400,42 @@ fn pinned_block_keeps_exact_zeros_at_small_shifts() {
     );
 }
 
+/// A last kernel diagonal the Cholesky of Σ cannot resolve survives the map:
+/// the pivot's square is below the column floor `q·eps·Σ_cc`, so the factor of
+/// Σ alone zeroes it, and the caller's mask would flag a diagonal the kernel
+/// never pinned. Kernel θ of a precise Poisson `(1 + x1 + x2 | g)` fit whose
+/// pin the incumbent check undid, with the last diagonal at the sizes such
+/// fits ended at; the shifts are small made-up ones.
+/// The expected pivot solves on Λ̃ directly, without Σ: the caller's last
+/// pivot is `1/‖Λ̃⁻¹·C⁻¹·e₂‖`, and `C⁻¹·e₂ = e₂ + (m₂/s₂)·e₀`.
+#[test]
+fn full_rank_block_keeps_a_last_pivot_below_the_column_floor() {
+    let g = one_block(&[1, 2]);
+    let (k1, k2) = (0.0432, -0.0179);
+    let cs = scaling(&[(k1, 1.0), (k2, 1.0)]);
+    let mut scratch = vec![0.0; g.re_map_scratch_len()];
+    let mut checks = 0;
+    for l22 in [1e-20, 4.8383e-17, 1.7657e-18, 6.4278e-14, 3.8559e-13] {
+        let (l00, l10, l20) = (0.52562, 4.0974e-5, -7.8678e-5);
+        let (l11, l21) = (5.3513e-5, -4.8601e-5);
+        let theta = [l00, l10, l20, l11, l21, l22];
+        let mut caller = [0.0; 6];
+        g.theta_kernel_to_caller(&theta, &mut caller, &mut scratch, &cs);
+        let u0 = k2 / l00;
+        let u1 = -l10 * u0 / l11;
+        let u2 = (1.0 - l20 * u0 - l21 * u1) / l22;
+        let want = 1.0 / (u0 * u0 + u1 * u1 + u2 * u2).sqrt();
+        assert!(
+            (caller[5] / want - 1.0).abs() <= 1e-10,
+            "λ₂₂ {l22}: caller {} against {want}",
+            caller[5]
+        );
+        assert_eq!(g.pinned_mask(&caller, true), 0, "λ₂₂ {l22}: θ {caller:?}");
+        checks += 1;
+    }
+    assert_eq!(checks, 5);
+}
+
 /// A NaN θ covariance (the `Rx` arm and the Hessian's RX fallback report no θ
 /// block) maps to NaN SEs on every block, centered or not: never to a zero SE.
 #[test]

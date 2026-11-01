@@ -171,6 +171,7 @@ pub(crate) struct TestWs {
     pub irls_xtwz: Vec<f64>,
     pub irls_l: Mat<f64>,
     pub irls_wx: Vec<f64>,
+    pub irls_broken: Vec<bool>,
 }
 
 impl TestWs {
@@ -210,6 +211,7 @@ impl TestWs {
             irls_xtwz: vec![0.0; n_predictors],
             irls_l: Mat::<f64>::zeros(n_predictors, n_predictors),
             irls_wx: vec![0.0; max_n * n_predictors],
+            irls_broken: vec![false; n_predictors],
         }
     }
 

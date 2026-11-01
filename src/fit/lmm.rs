@@ -126,13 +126,11 @@ pub(super) fn accumulate_lmm_rows(
             let sqrt_w = weights.map(|_| ws.w_scaled.as_slice());
             // The Gram scatter IS the constructor on this kernel: one pass over
             // the rows builds `Z'Z`, `Z'[X y]` and `[X y]'[X y]` and sizes every
-            // per-eval buffer. A draw on the rows the workspace was built from
-            // has the same pattern, so it refills the values in place.
+            // per-eval buffer. The workspace owns its ids, so every later draw
+            // has the same pattern and refills the values in place.
             match sparse_ws {
-                Some(sw) if crate::sparse::same_rows(&sw.ids, cluster_ids, extra_ids, n) => {
-                    sw.fill_values(x_mat, z_mat, cluster_ids, extra_ids, y, sqrt_w);
-                }
-                _ => {
+                Some(sw) => sw.fill_values(x_mat, z_mat, cluster_ids, extra_ids, y, sqrt_w),
+                None => {
                     *sparse_ws = Some(Box::new(crate::sparse::SparseLmmWorkspace::new(
                         g,
                         x_mat,

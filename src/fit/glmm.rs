@@ -73,6 +73,7 @@ pub(crate) fn glm_warm_start_beta(
     let mut irls_xtwz = vec![0.0f64; p1];
     let mut irls_l = Mat::<f64>::zeros(p1, p1);
     let mut irls_wx = vec![0.0f64; n1 * p1];
+    let mut irls_broken = vec![false; p];
     // No target SEs are needed for a seed — only β — so target_indices is empty and
     // the var_diag / t_sq slots stay zero-length.
     let mut irls_var_diag: Vec<f64> = vec![];
@@ -100,6 +101,7 @@ pub(crate) fn glm_warm_start_beta(
             irls_xtwz: &mut irls_xtwz,
             irls_l: irls_l.as_mut(),
             irls_wx: &mut irls_wx,
+            irls_broken: &mut irls_broken,
         },
     );
     if (view.converged || view.separated) && view.betas.iter().all(|b| b.is_finite()) {
@@ -301,21 +303,21 @@ pub(super) fn prep_glmm_design(
 
     // The packed M columns with their sparse factor, and the crossed-Schur
     // symbolic factor (read by the structured layout only; None on every other
-    // shape), depend on the rows' level ids alone. A draw on the rows the last
-    // fit was prepared from keeps them; new ids, even at the same `n`, rebuild.
-    if !crate::sparse::same_rows(&ws.design_ids, cluster_ids, extra_ids, n) {
+    // shape), depend on the rows' level ids alone, and a workspace owns its ids:
+    // the first draw builds them and every later one keeps them.
+    if !ws.design_built {
         fill_packed_cols(ws, cluster_ids, extra_ids, n);
         ws.pattern.structured_schur = if ws.layout == GlmmLayout::Structured {
             StructuredSchur::new(&ws.groupings, cluster_ids, extra_ids, n)
         } else {
             None
         };
-        crate::sparse::record_rows(&mut ws.design_ids, cluster_ids, extra_ids, n);
+        ws.design_built = true;
     }
     // `TailKernel::tail_inverse` writes `S⁻¹` one tail component at a time and
     // leaves the entries between components alone, which is right only while
-    // they hold zeros. This design's components can differ from the last
-    // design's on a reused workspace, so clear them once per fit.
+    // they hold zeros. Its fallbacks write the whole matrix, so clear them once
+    // per fit rather than trust what the last fit left.
     ws.exact_prof.tail_inv.fill(0.0);
 }
 
@@ -516,7 +518,7 @@ impl GlmmResultView<'_> {
         self.fit.n_eval
     }
     /// Whether the fit ended on a finite endpoint (the re-eval deviance): a
-    /// converged optimum or a `MaxFunReached` incumbent, not a failed search.
+    /// converged optimum or a capped search's incumbent, not a failed search.
     pub(crate) fn has_endpoint(&self) -> bool {
         self.fit.deviance.is_finite()
     }
@@ -575,12 +577,16 @@ pub(crate) fn run_glmm_on<'a>(
     // the inner PIRLS opens near the mean and does not overshoot. θ still cold-starts
     // at the kernel's THETA0 blind start. An empty field is a per-component cold
     // start (`StartValues`), so it takes the same branch as `start = None`.
-    let (beta_start, separated) = match start {
-        Some(s) if !s.beta.is_empty() => (s.beta.clone(), false),
-        _ => glm_warm_start_beta(model.family, nb_theta, x_mat, y, n, p, offset),
+    let glm_start;
+    let (beta_start, separated): (&[f64], bool) = match start {
+        Some(s) if !s.beta.is_empty() => (&s.beta, false),
+        _ => {
+            glm_start = glm_warm_start_beta(model.family, nb_theta, x_mat, y, n, p, offset);
+            (&glm_start.0, glm_start.1)
+        }
     };
     if separated {
-        let fit = crate::glmm::separated_fit(ws, &beta_start, targets, map);
+        let fit = crate::glmm::separated_fit(ws, beta_start, targets, map);
         let nb_theta = ws.nb_theta;
         return GlmmResultView {
             fit,
@@ -622,7 +628,7 @@ pub(crate) fn run_glmm_on<'a>(
             offset,
             n,
             cluster_ids,
-            &beta_start,
+            beta_start,
         )),
         _ => None,
     };
@@ -642,7 +648,7 @@ pub(crate) fn run_glmm_on<'a>(
             p,
             cluster_ids,
             extra_ids,
-            &beta_start,
+            beta_start,
             start,
             targets,
             opts,
@@ -1048,8 +1054,8 @@ pub(crate) fn glmm_view_to_fit(
     let map = view.map;
     let glmm_fit = &view.fit;
     // Gated on the finite endpoint (the re-eval deviance), not `converged`: the
-    // plateau policy `fit/lmm.rs` applies. A `MaxFunReached` exit reports τ̂², D̂
-    // and the dispersion at its incumbent with `converged == false`; every other
+    // plateau policy `fit/lmm.rs` applies. A capped exit reports τ̂², D̂ and the
+    // dispersion at its incumbent with `converged == false`; every other
     // non-convergence goes through `nan_fit`, whose deviance is +∞.
     let has_endpoint = view.has_endpoint();
     let nb_theta = view.nb_theta;

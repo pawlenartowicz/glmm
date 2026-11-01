@@ -275,6 +275,7 @@ def test_wald_gives_the_stored_wald_table_whatever_the_fit_stored(pois):
 def test_auto_gives_a_poisson_glmm_the_likelihood_ratio_table(pois):
     plain, asked = pois
     assert plain.term_test_auto == {"test": "lrt", "reason": "poisson_mixed"}
+    glmm.anova(plain)
     for ss, design in (("III", " on the reduced design"), ("II", "")):
         lrt_field = "term_table_type3_lrt" if ss == "III" else "term_table_type2_lrt"
         stored = getattr(plain, lrt_field)
@@ -399,14 +400,57 @@ def test_lrt_on_a_fit_that_stored_none_names_the_fit_argument():
         "this fit stored no likelihood-ratio tables, which are built only when the fit "
         "asks for them: refit with glmm.fit(..., anova_test='LRT')."
     )
-    for m in (
-        quiet_fit(_POIS, family="poisson", anova_test="Wald"),
-        quiet_fit("n ~ x + f", family="poisson"),
-    ):
-        for ss in ("III", "II"):
-            with pytest.raises(ValueError) as err:
-                glmm.anova(m, type=ss, test="LRT")
-            assert str(err.value) == message
+    m = quiet_fit(_POIS, family="poisson", anova_test="Wald")
+    for ss in ("III", "II"):
+        with pytest.raises(ValueError) as err:
+            glmm.anova(m, type=ss, test="LRT")
+        assert str(err.value) == message
+
+
+def test_a_default_fit_makes_the_likelihood_ratio_tables_once(monkeypatch):
+    m = quiet_fit(_POIS, family="poisson")
+    assert m.term_table_type3_lrt is None and m.term_table_type2_lrt is None
+    # Before any anova, a pickled fit can still make them.
+    again = pickle.loads(pickle.dumps(m))
+    calls = []
+    real = glmm._native.fit
+    monkeypatch.setattr(glmm._native, "fit", lambda *a: calls.append(a) or real(*a))
+    first = glmm.anova(m)
+    assert m.term_table_type3_lrt is not None and m.term_table_type2_lrt is not None
+    assert len(calls) == 1
+    glmm.anova(m)
+    glmm.anova(m, type="II", test="LRT")
+    assert len(calls) == 1
+    assert glmm.anova(again).text() == first.text()
+    assert len(calls) == 2
+
+
+_W = 1.0 + np.arange(_N) % 3
+
+
+@pytest.mark.parametrize(
+    ("formula", "kw"),
+    [
+        (_POIS, {"family": "poisson", "offset": 0.2 * _Z}),
+        (_POIS, {"family": "poisson", "nagq": 3}),
+        (_POIS, {"family": "poisson", "weights": _W}),
+        (_POIS, {"family": "poisson", "warm_start": {"beta": [0.5, 0.1, 0.1, 0.1]}}),
+        ("n ~ x + f", {"family": "poisson", "weights": _W}),
+        ("p ~ x + f", {"family": "gamma", "dispersion": 2.0}),
+    ],
+    ids=["offset", "nagq", "weights", "warm_start", "glm", "held_dispersion"],
+)
+def test_the_tables_of_the_first_anova_are_those_the_fit_would_have_made(formula, kw):
+    # Each case moves the statistics, so a port that dropped its argument from
+    # the repeated call would fail here.
+    data = _data(p=np.exp(0.5 + 0.3 * _X + 0.1 * _Y).tolist())
+    late = quiet_fit(formula, data, **kw)
+    now = quiet_fit(formula, data, anova_test="LRT", **kw)
+    for ss in ("III", "II"):
+        a, b = glmm.anova(late, type=ss, test="LRT"), glmm.anova(now, type=ss, test="LRT")
+        np.testing.assert_array_equal(a["Chisq"], b["Chisq"])
+        np.testing.assert_array_equal(a["Pr(>Chisq)"], b["Pr(>Chisq)"])
+        assert a.heading == b.heading and a.notes == b.notes
 
 
 def test_a_stored_refusal_comes_before_the_choice_of_table():

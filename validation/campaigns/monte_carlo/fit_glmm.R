@@ -18,8 +18,7 @@ OUT <- Sys.getenv("ACC_OUT", ""); if (!nzchar(OUT)) OUT <- file.path(ACC_DIR, "r
 dir.create(OUT, FALSE, TRUE)
 ACC_SKIP_AGQ <- nzchar(Sys.getenv("ACC_SKIP_AGQ", ""))
 
-# anova_test = "Wald": `secs` times the fit, not the likelihood-ratio refits
-# "auto" stores for a Poisson GLMM.
+# anova_test = "Wald": this campaign reads no likelihood-ratio table.
 fit_rep <- function(cell, nAGQ) function(df, i) {
   est <- NA_EST; good <- FALSE; err <- TRUE; secs <- NA_real_; sing <- NA
   tm <- system.time(fit <- tryCatch(suppressWarnings(

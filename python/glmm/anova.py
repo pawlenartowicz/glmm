@@ -3,8 +3,9 @@ comparison of two models, with their tables.
 
 The crate computes every statistic and every p-value; this module only reads
 them and lays them out, with R's column names, so both ports give the same
-tables. `glmm.anova(m)` reads the per-term table the fit stored when it was
-made. `glmm.anova(m0, m1)` compares two stored fits as they are, with no
+tables. `glmm.anova(m)` reads the fit's per-term table, refitting first only
+when it needs likelihood-ratio rows the fit does not have yet.
+`glmm.anova(m0, m1)` compares two stored fits as they are, with no
 refit and no data. `glmm.compare(data, f0, f1)` fits both formulas on the same
 rows and compares them.
 
@@ -502,8 +503,8 @@ def anova(*fits, type=None, test=_AUTO, nsim=None, seed=None):
     """One fit: its per-term tests, a `TermTable`. Two fits: the two models
     compared as they are, with no refit, a `ComparisonTable`.
 
-    One fit, `glmm.anova(m)`: one row per fixed term, read from the table the
-    fit stored when it was made, so nothing is computed here. `type="III"` (the
+    One fit, `glmm.anova(m)`: one row per fixed term, read from the fit's
+    table; only likelihood-ratio rows can need a refit (below). `type="III"` (the
     default, also taken for None) builds each term's hypothesis the way
     lmerTest does, so it does not depend on the contrast coding; `type="II"` is
     the one alternative. OLS, a Gaussian mixed model and the Gamma and inverse
@@ -525,11 +526,11 @@ def anova(*fits, type=None, test=_AUTO, nsim=None, seed=None):
     hypothesis tested by refitting the model under it (Type II by the rule of
     car's `Anova(test.statistic = "LR")` on a GLM, applied to GLMMs too; Type
     III on the reduced design of the same hypothesis as the Wald row, as afex's
-    `mixed(method = "LRT")` on a GLMM), in the Wald table's columns. The refits
-    are made when the fit is: a fit made with `glmm.fit(..., anova_test="LRT")`
-    has these rows, and so does a Poisson model with random effects made with
-    the default `anova_test="auto"`; on a fit without them "LRT", and "auto" on
-    a Poisson GLMM, raise `ValueError` naming the fit argument. Each refit
+    `mixed(method = "LRT")` on a GLMM), in the Wald table's columns. The first
+    call that needs these rows refits the model and the fit keeps them, so the
+    next call computes nothing; a fit made with `glmm.fit(..., anova_test="LRT")`
+    has them already. On a fit made with `anova_test="Wald"` "LRT", and "auto"
+    on a Poisson GLMM, raise `ValueError` naming the fit argument. Each refit
     keeps the model's random effects, random slopes included. "Wald" and "LRT"
     apply to every fit with chi-squared rows: any GLMM, and every GLM but a
     Gamma or inverse Gaussian one with phi estimated; on a fit with F rows they
@@ -596,6 +597,7 @@ def anova(*fits, type=None, test=_AUTO, nsim=None, seed=None):
             den_df = "residual" if m.df_method == "residual" else "satterthwaite"
             raise ValueError(_native.f_table_refusal(test, den_df))
         if test == "LRT" or (test == "auto" and m.term_test_auto["test"] == "lrt"):
+            m._lrt_tables()
             stored = getattr(m, field + "_lrt", None)
             if stored is None and test == "LRT":
                 raise ValueError(

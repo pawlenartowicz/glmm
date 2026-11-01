@@ -62,6 +62,8 @@ pub struct FitView<'a> {
     /// `pinned` in the caller's coordinates, when a centered slope moved the
     /// zero pattern of Λ away from the kernel's.
     pinned_override: Option<u64>,
+    /// [`Self::dispersion`] on the GLM route, which the kernel does not compute.
+    glm_dispersion: f64,
     /// The fitted design's column map (`β = B·β̃`), for `into_fit`.
     map: &'a ColumnScaling,
 }
@@ -228,7 +230,10 @@ impl FitView<'_> {
         }
     }
 
-    /// Per-coefficient Var(β̂). Same compact/indexed layout split as `t_sq`.
+    /// Per-coefficient Var(β̂). Same compact/indexed layout split as `t_sq`. On
+    /// a Gamma or inverse-Gaussian GLM the kernel holds φ = 1: this is Var(β̂)
+    /// divided by φ̂ ([`Self::dispersion`]), and `t_sq` is the Wald statistic
+    /// times φ̂.
     pub fn var_diag(&self) -> &[f64] {
         match &self.kind {
             FitViewKind::Ols(v) => v.var_diag,
@@ -247,7 +252,8 @@ impl FitView<'_> {
     ///
     /// The variance is on [`Self::var_diag`]'s scale: σ̂²-scaled on OLS and the
     /// LMM, the `wald_se` arm's on the GLMM, and φ = 1 on the GLM route, so on
-    /// a Gamma or inverse-Gaussian GLM a caller divides the value by φ̂.
+    /// a Gamma or inverse-Gaussian GLM a caller divides the value by φ̂
+    /// ([`Self::dispersion`]).
     ///
     /// NaN on a fit that did not converge, an index ≥ p, `p_col == n_col` (a
     /// zero contrast has no test), `scratch` shorter than p, a GLM fit with
@@ -302,8 +308,8 @@ impl FitView<'_> {
         }
     }
 
-    /// Estimator dispersion: LMM σ̂², GLMM `D̂[0][0]`, `Prebuilt` `Fit::dispersion()`.
-    /// OLS/GLM (never read here) report NaN.
+    /// Estimator dispersion: LMM σ̂², GLMM `D̂[0][0]`, `Prebuilt` and GLM
+    /// `Fit::dispersion()` (NaN on a GLM that did not converge). OLS reports NaN.
     ///
     /// The GLMM's `D̂[0][0]` is the primary grouping's random-intercept
     /// variance in the caller's units, `Λ₀₀²` of the caller's lower factor `Λ`
@@ -312,7 +318,8 @@ impl FitView<'_> {
     /// search ended without an endpoint.
     pub fn dispersion(&self) -> f64 {
         match &self.kind {
-            FitViewKind::Ols(_) | FitViewKind::Glm(_) => f64::NAN,
+            FitViewKind::Ols(_) => f64::NAN,
+            FitViewKind::Glm(_) => self.glm_dispersion,
             FitViewKind::Lmm(v) => v.dispersion(),
             FitViewKind::Glmm(v) if v.has_endpoint() => self.theta()[0].powi(2),
             FitViewKind::Glmm(_) => f64::NAN,
@@ -448,6 +455,7 @@ impl<'a> FitView<'a> {
             theta_declared: &[],
             betas_caller: &[],
             pinned_override: None,
+            glm_dispersion: f64::NAN,
             map,
         };
         // OLS / GLM kernels keep β̃ (the NB alternation and the GLMM seed reuse
@@ -1032,7 +1040,8 @@ pub fn build_workspace(
 /// The data, however, is the caller's responsibility — the stable entry
 /// validates and salvages where `fit_on` trusts:
 /// - **Start values.** A `start.beta` or `start.theta` of the wrong width is
-///   dropped: that component cold-starts.
+///   dropped: that component cold-starts. The OLS and GLM routes read neither,
+///   as [`crate::fit_with_start`] says; a warm GLM loop calls `glm_irls_fit`.
 /// - **Weights and offsets.** A weights vector longer than `n` is accepted, but
 ///   `lmm_view_to_fit`'s `−Σ log wᵢ` correction sums the whole vector, so the LMM
 ///   deviance and loglik come out wrong. Non-finite weights or offsets propagate
@@ -1584,7 +1593,13 @@ pub fn fit_on_hinted<'a>(
             ),
         }),
     };
-    FitView::new(
+    let glm_dispersion = match &kind {
+        FitViewKind::Glm(v) => {
+            super::glm::glm_dispersion(v, y, weights, sized.spec.family, n, opts)
+        }
+        _ => f64::NAN,
+    };
+    let mut view = FitView::new(
         kind,
         perm,
         ids,
@@ -1592,7 +1607,9 @@ pub fn fit_on_hinted<'a>(
         beta_caller,
         re_map_scratch,
         scaling,
-    )
+    );
+    view.glm_dispersion = glm_dispersion;
+    view
 }
 
 #[cfg(test)]

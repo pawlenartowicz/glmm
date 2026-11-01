@@ -1207,12 +1207,12 @@ pub(crate) fn saturated_loglik(
 
 /// Pearson-moment dispersion `φ̂ = Σᵢ wᵢrᵢ²/(n−p)`, `rᵢ = (yᵢ−μᵢ)/√V(μᵢ)`, raw
 /// `n−p` degrees of freedom (not `Σwᵢ−p`) — matches R's `summary.glm`'s
-/// (weighted) Pearson dispersion. `prior_w = None` ⇒ unit weights.
+/// (weighted) Pearson dispersion. `prior_w = None` ⇒ unit weights. Gamma and
+/// inverse Gaussian only, the families that estimate φ.
 pub(crate) fn pearson_dispersion(
     y: &[f64],
     mu: &[f64],
     family: Family,
-    nb_theta: f64,
     n: usize,
     p: usize,
     prior_w: Option<&[f64]>,
@@ -1225,7 +1225,7 @@ pub(crate) fn pearson_dispersion(
         let r = match family {
             Family::Gamma { .. } => (y[i] - mu[i]) / mu[i],
             Family::InverseGaussian { .. } => (y[i] - mu[i]) / mu[i] / mu[i].sqrt(),
-            _ => (y[i] - mu[i]) / variance(family, nb_theta, mu[i]).sqrt(),
+            _ => unreachable!("no Pearson φ̂ on {family:?}"),
         };
         let pw = prior_w.map_or(1.0, |w| w[i]);
         s += pw * r * r;

@@ -1958,6 +1958,7 @@ fn fit_glmm_collapses_to_plain_irls_when_tau_negligible() {
             irls_xtwz: &mut sw.irls_xtwz[..2],
             irls_l: sw.irls_l.as_mut().submatrix_mut(0, 0, 2, 2),
             irls_wx: &mut sw.irls_wx[..n * 2],
+            irls_broken: &mut sw.irls_broken[..2],
         };
         let f = glm_irls_fit(
             crate::Family::Binomial {
@@ -8139,34 +8140,6 @@ fn packed_sparse_factor_matches_the_dense_one() {
     }
 }
 
-/// `fill_packed_cols` owns the sparse pattern: a `loop_advanced` caller that
-/// refills a reused workspace with new level ids at the same `n` gets the
-/// pattern of the new ids, identical to a fresh workspace's.
-#[test]
-fn fill_packed_cols_rebuilds_the_sparse_pattern_for_new_ids() {
-    let (_x, y, ids, crossed_a, cluster) = glmm_slope_crossed_dataset();
-    let n = y.len();
-    let crossed_b: Vec<u32> = (0..n as u32).map(|i| (i / 2) % 4).collect();
-    let mut reused = GlmmWorkspace::for_cluster_spec_packed(2, &cluster, n, &[1], 1);
-    fill_packed_cols_with(&mut reused, &ids, &[crossed_a], n, Some(true));
-    fill_packed_cols_with(
-        &mut reused,
-        &ids,
-        std::slice::from_ref(&crossed_b),
-        n,
-        Some(true),
-    );
-    let mut fresh = GlmmWorkspace::for_cluster_spec_packed(2, &cluster, n, &[1], 1);
-    fill_packed_cols_with(&mut fresh, &ids, &[crossed_b], n, Some(true));
-    let (r, f) = (
-        reused.packed.sparse.as_ref().unwrap(),
-        fresh.packed.sparse.as_ref().unwrap(),
-    );
-    assert_eq!(r.axx.symbolic().col_ptr(), f.axx.symbolic().col_ptr());
-    assert_eq!(r.axx.symbolic().row_idx(), f.axx.symbolic().row_idx());
-    assert_eq!(r.row_slots, f.row_slots);
-}
-
 /// The Laplace objective's `log|A|` is the EXACT curvature of the conditional
 /// log-density at the mode on every link, not the Fisher approximation: on a
 /// scalar random intercept, `A` is diagonal with
@@ -9195,7 +9168,7 @@ fn agq_f64_gradient_matches_dual_gradient() {
             let m = ws.n_theta + p;
             let kk = ws.k.max(1);
             let mut gd = super::agq_gradient::AgqGd::for_shape(p, ws.nagq);
-            gd.idx.rebuild(&ids[..n], ws.groupings.n_primary);
+            gd.idx.ensure(&ids[..n], ws.groupings.n_primary);
             let mut rng = fixed_seed_theta("int1");
             let mut ctrs = EvalCounters::new();
             for draw in 0..6 {

@@ -47,7 +47,7 @@ where each engine files them — this scoring policy is deliberate, keep it.
 `batch.sh` drives `fit_{glmm,lme4,glmmadaptive}.R`; `summarize_accuracy_truth.R`
 and `plot_comparison.R` → `reports/`. `external/`, `data/`, `results/` are
 gitignored (local, regenerable); `truth/` is committed.
-**Rerun:** `./gen.sh && ./batch.sh`, then the summarize/plot scripts.
+**Rerun:** `./gen.sh && ./batch.sh 1000`, then the summarize/plot scripts.
 
 ## boundary-probe: post-pin mechanisms on boundary fits
 

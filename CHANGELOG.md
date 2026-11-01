@@ -6,6 +6,22 @@ All notable changes to the `glmm` crate are recorded here. Format follows
 The Python package (`glmm` on PyPI) is versioned in lockstep with the crate and
 shares these entries; Python-specific notes are called out where they differ.
 
+## [Unreleased]
+
+### Fixed
+
+- A Poisson or binomial GLMM on very precise counts no longer ends above the optimum with `converged = true`: the gradient search's iteration cap on the GLMM route is 2000, a failed line search from an updated `H` restarts once from the start matrix, and a capped first step stops just short of an exact 0, where the gradient is exactly 0 and the search could not leave. The same changes remove most non-converged refits and `NaN` rows from the likelihood-ratio tables of such fits. The restart and the zero rule also apply on the LMM's gradient route.
+- The last diagonal of a centered random-slope block, when `Σ` rounds it below its floor, stays small and unflagged in the caller's coordinates, instead of coming back as a pinned zero.
+- A GLM on the loop tier whose QR breaks down at several columns sets all of them to NaN and counts none in df, AIC or the Pearson divisor, as the stable path does.
+- A GLMM whose gradient search hands over to BOBYQA, and whose BOBYQA search ends with no result, reports the point the gradient search reached with `converged = false` and `Boundary::NoOptimum`, instead of NaN.
+
+### Changed
+
+- Python and R: a default fit makes no likelihood-ratio refits. `anova_test = "auto"` now makes the likelihood-ratio tables the first time `anova()` needs them, on any fit with chi-squared rows, and the fit keeps them. The tables are the same. A default fit of a Poisson GLMM no longer pays for the refits, and its first `anova()` does. `"LRT"` still makes them with the fit, and `"Wald"` still never does. `run_fit` is unchanged.
+
+- `loop_advanced` (unstable): `GlmScratch` has a new `irls_broken` slot and `GlmFitView` a new `broken` mask. `FitView::dispersion` returns `Fit::dispersion` on the GLM route, so a Gamma or inverse-Gaussian caller can read φ̂ for `var_diag` and `t_sq`, which stay at φ = 1.
+- A mixed workspace builds its packed columns and crossed-Schur factor once. `fit_on` already refused ids on `Data`, so nothing changes for a caller.
+
 ## [0.8.0] — 2026-11-01
 
 ### Added

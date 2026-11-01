@@ -115,17 +115,17 @@ the REML log-likelihood (as \code{logLik(lm, REML = TRUE)}), \code{NULL} and \co
 the ML one. Every other family is fitted by maximum likelihood, and
 \code{TRUE} there is ignored with a \code{"fastglmm_argument_ignored"} warning.}
 
-\item{anova_test}{which per-term tables the fit stores for
-\link[=anova.fastglmm]{anova()}. Every fit stores its Wald chi-squared (or F)
-tables, with no refit. \code{"auto"} (the default) also stores the
-likelihood-ratio tables of a Poisson model with random effects, which
-\code{anova(m)} gives by default; \code{"LRT"} stores them on every fit with
-chi-squared rows (any GLMM, and every GLM but a Gamma or inverse-Gaussian
-one with an estimated dispersion), refitting the model under each term's
-hypothesis after the fit, so that \code{anova(m, test = "LRT")} can read them;
-\code{"Wald"} stores none. The fit itself is the same under every value. A
-simulation that must use one test on every model it fits names the test
-here and in \code{anova()}.}
+\item{anova_test}{when the likelihood-ratio tables of
+\link[=anova.fastglmm]{anova()} are made. Every fit stores its Wald chi-squared
+(or F) tables, with no refit. \code{"auto"} (the default) makes the
+likelihood-ratio tables the first time \code{anova()} needs them, which on a
+Poisson model with random effects is \code{anova(m)} itself; \code{"LRT"} makes them
+with the fit, on every fit with chi-squared rows (any GLMM, and every GLM
+but a Gamma or inverse-Gaussian one with an estimated dispersion);
+\code{"Wald"} never makes them, and \code{anova()} then refuses a test that needs
+them. The tables refit the model under each term's hypothesis, and under
+\code{"auto"} once more for the fit itself. The fit itself is the same under
+every value.}
 
 \item{...}{intercepted, never silently swallowed. The known lme4 arguments
 (\code{control}, \code{verbose}, \code{contrasts}) raise errors saying why they cannot
@@ -156,8 +156,8 @@ converge) and \code{coef_p} (its p-value), \code{df_method}
 \code{offset} (the offset fitted with, \code{NULL} without one),
 \code{satterthwaite_record} (what \code{\link[=contrast_test]{contrast_test()}} and \code{\link[=pairwise]{pairwise()}} read on
 a fit whose \code{df_method} is \code{"satterthwaite"}, \code{NULL} on every other fit),
-plus \link[=anova.fastglmm]{anova()} (the per-term tests, built at fit time, or
-a comparison of two fits), \code{\link[=pairwise]{pairwise()}} (the pairwise comparisons of a
+plus \link[=anova.fastglmm]{anova()} (the per-term tests, or a comparison of
+two fits), \code{\link[=pairwise]{pairwise()}} (the pairwise comparisons of a
 factor's levels), \code{\link[=r2]{r2()}} and \code{\link[=icc]{icc()}} (a mixed model's R-squared pair and
 intraclass correlation), \code{print()}, \link[=summary.fastglmm]{summary()},
 \link[=confint.fastglmm]{confint()} (Wald), \code{nobs()},

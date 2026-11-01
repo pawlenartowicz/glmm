@@ -503,10 +503,10 @@ pub enum Note {
     /// On a GLM: the fit converged, but the QR of `√W·X` at its last step has
     /// a zero or non-finite diagonal at a column that is not zero under the
     /// weights, so that column cannot be separated from the ones before it.
-    /// [`Note::IllConditioned`] comes with it and names the column (`pivot`
-    /// 0); that column's `Fit::beta` is NaN, since the fit held it at its
-    /// start value. The other estimates, the deviance, `loglik`, `fitted` and
-    /// `converged` stand; `Fit::se` and `Fit::vcov` are NaN.
+    /// [`Note::IllConditioned`] comes with it and names the first such column
+    /// (`pivot` 0); `Fit::beta` is NaN at every such column, since the fit held
+    /// them at their start values. The other estimates, the deviance, `loglik`,
+    /// `fitted` and `converged` stand; `Fit::se` and `Fit::vcov` are NaN.
     SeUnavailable,
     /// The response is not within `1e-3` of an integer count — the raw value
     /// for Poisson/negative-binomial, the derived successes `y·wᵢ` for

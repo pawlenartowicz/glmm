@@ -68,10 +68,15 @@ impl ClusterRowIndex {
         ClusterRowIndex { ptr, rows }
     }
 
-    /// [`ClusterRowIndex::build`] into this index's own buffers, reusing their
-    /// capacity: the same counting sort, so the same `ptr`/`rows`.
-    pub(crate) fn rebuild(&mut self, cluster_ids: &[u32], s: usize) {
+    /// [`ClusterRowIndex::build`] into this index's own buffers, the first time
+    /// it is called on them: a workspace's ids never change, so an index built
+    /// for this `n` and `s` is the one the ids would give. The same counting
+    /// sort, so the same `ptr`/`rows`.
+    pub(crate) fn ensure(&mut self, cluster_ids: &[u32], s: usize) {
         let n = cluster_ids.len();
+        if self.rows.len() == n && self.ptr.len() == s + 1 {
+            return;
+        }
         self.ptr.clear();
         self.ptr.resize(s + 1, 0);
         for &c in cluster_ids {

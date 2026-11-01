@@ -260,8 +260,8 @@ pub(crate) struct StructuredPattern {
     pub coup_mask: Option<u32>,
     /// Cached sparse factor of the crossed Schur `S`. `Some` only on the
     /// structured crossed path with `e > 0`; built by `StructuredSchur::new`
-    /// when a fit's level ids differ from the last fit's. `None` ⇒ the
-    /// packed/blocked/e=0 paths, which never touch it.
+    /// on the workspace's first draw. `None` ⇒ the packed/blocked/e=0 paths,
+    /// which never touch it.
     pub(crate) structured_schur: Option<StructuredSchur>,
     /// Test-only: force the dense `glmm_block_chol` Schur factor instead of the
     /// cached sparse one, so the both-paths cross-check runs both at one θ.
@@ -507,10 +507,7 @@ impl PackedScratch {
     /// Install the factor [`fill_packed_cols`] chose for `A` and size the dense
     /// pair to it: `Some` keeps `A` in the sparse `axx`/`l_values` and leaves
     /// `a`/`a_chol` at `0×0`; `None` sizes both `k.max(1)` square for the dense
-    /// factor, exactly the shape `for_shape` used to allocate unconditionally.
-    /// A refill of a reused workspace (`loop_advanced`, new ids at the same `n`)
-    /// may switch the choice either way, so both directions resize; a refill
-    /// that keeps the choice reallocates nothing.
+    /// factor.
     pub(crate) fn set_factor(&mut self, sparse: Option<Box<PackedSparse>>, k: usize) {
         let side = if sparse.is_some() { 0 } else { k.max(1) };
         if self.a.nrows() != side {
@@ -1045,10 +1042,11 @@ pub struct GlmmWorkspace {
     /// endpoint decrement `½·gᵀHg`, and the rung the route finished on (0 a
     /// certified endpoint, 3 the joint polish, 1 the hand-over to BOBYQA).
     pub(crate) grad_report: Option<(crate::optim::bfgs::BfgsStop, usize, f64, u8)>,
-    /// The gradient search's two buffers: its start, for a hand-over from the
-    /// plateau (`n_θ + p`, + 1 on a free Gamma dispersion), and the
-    /// objective's last `[θ | β]` (`n_θ + p`). Sized on the first routed fit
-    /// so a refit allocates nothing for them.
+    /// The gradient search's three buffers: its start, for a hand-over from the
+    /// plateau (`n_θ + p`, + 1 on a free Gamma dispersion), the objective's
+    /// last `[θ | β]` (`n_θ + p`), and a hand-over's incumbent and modes (the
+    /// start's length, then `k`). Sized on the first routed fit so a refit
+    /// allocates nothing for them.
     pub(crate) grad_scratch: Vec<f64>,
     /// The caller's curvature hint for the next `fit_glmm` (`fit_on_hinted`),
     /// taken (and so cleared) by that fit: a hint never outlives its call.
@@ -1112,10 +1110,9 @@ pub struct GlmmWorkspace {
     pub(crate) structured: StructuredScratch<f64>,
     /// Structured route's θ-independent index pattern — see [`StructuredPattern`].
     pub(crate) pattern: StructuredPattern,
-    /// The rows' levels `fit::glmm::prep_glmm_design` last built the packed
-    /// columns and the crossed-Schur symbolic factor from
-    /// (`sparse::record_rows`); empty until the first fit.
-    pub(crate) design_ids: Vec<u32>,
+    /// Whether `fit::glmm::prep_glmm_design` has built the packed columns and
+    /// the crossed-Schur symbolic factor from the workspace's level ids.
+    pub(crate) design_built: bool,
     /// β-border scratch shared by the Profile-mode PIRLS step and `se.rs` —
     /// see [`BorderScratch`].
     pub(crate) border: BorderScratch,
@@ -1601,7 +1598,7 @@ impl GlmmWorkspace {
                 #[cfg(test)]
                 force_dense_schur: false,
             },
-            design_ids: Vec::new(),
+            design_built: false,
             border: BorderScratch {
                 xtwx: Mat::zeros(p, p),
                 xtwm: Mat::zeros(p, k.max(1)),
@@ -2215,9 +2212,7 @@ pub(crate) const PACKED_SPARSE_MAX_FILL: f64 = 0.5;
 /// explicit: `None` applies the switch (`k ≥ PACKED_SPARSE_MIN_K` and the
 /// symbolic fill `≤ PACKED_SPARSE_MAX_FILL`), `Some(true)`/`Some(false)` force
 /// the sparse or the dense factor. The pattern is a function of the level ids,
-/// so it is (re)built here, where they are read, and never lazily in a solve:
-/// a `loop_advanced` caller that refills a reused workspace with new ids at the
-/// same `n` gets the new pattern.
+/// so it is built here, where they are read, and never lazily in a solve.
 pub(crate) fn fill_packed_cols_with(
     ws: &mut GlmmWorkspace,
     cluster_ids: &[u32],

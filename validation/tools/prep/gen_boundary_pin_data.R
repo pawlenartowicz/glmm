@@ -1,5 +1,5 @@
 #!/usr/bin/env Rscript
-# The simulated dataset of the in-crate boundary-pin tests
+# The simulated datasets of the in-crate boundary-pin tests
 # (src/fit/core_tests.rs) -> ../../data/simulated/<name>.csv, built with the
 # boundary-probe campaign's helpers (campaigns/boundary-probe/gen/gen_common.R):
 #
@@ -15,6 +15,13 @@
 #     both; dataset 229 moved more on x86_64 alone. Its search pins both
 #     slopes about 1.2 deviance units above the optimum, which
 #     boundary_pin_lme4_reference.R computes with lme4.
+#
+#   sim_poisson_precise_ridge  The same design, dataset 8 of the same 300
+#     (dataset seed 485970320), chosen on 2026-11-01: the model without x1 in
+#     its fixed part, slope kept, runs out along a ridge where the profiled
+#     deviance fails around a point the gradient search evaluated. Its CSV is
+#     the Mac arm64 run's, as the other's: R 4.5.3 on x86_64 Linux prints 18 and
+#     20 cells of these two files one unit off in the 15th significant digit.
 #
 # Written with write.csv(..., row.names = FALSE, quote = FALSE). The CSV, not
 # the seed, is the artifact: a re-run must reproduce it byte for byte.
@@ -51,4 +58,17 @@ b0 <- draw_re(20L, 0.5)[lay$gi]
 eta <- 14 + b0 + 0.1 * x1 - 0.1 * x2
 y <- simulate_response(eta, "poisson")
 emit("sim_poisson_precise_two_zero_slopes",
+     data.frame(y = y, x1 = x1, x2 = x2, g = level_labels("g", lay$gi, 3)))
+
+# --- sim_poisson_precise_ridge (dataset 8 of 300) ----------------------------
+seed <- nth_seed(202610314L, 300L, 8L)
+stopifnot(seed == 485970320L)
+set.seed(seed)
+lay <- layout_rows(20L, 10L)
+x1 <- rnorm(lay$n)
+x2 <- rnorm(lay$n)
+b0 <- draw_re(20L, 0.5)[lay$gi]
+eta <- 14 + b0 + 0.1 * x1 - 0.1 * x2
+y <- simulate_response(eta, "poisson")
+emit("sim_poisson_precise_ridge",
      data.frame(y = y, x1 = x1, x2 = x2, g = level_labels("g", lay$gi, 3)))

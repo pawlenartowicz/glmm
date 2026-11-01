@@ -726,14 +726,18 @@ reaches it. Then:
    AGQ has no stage 1, and its joint solver starts at `GLMM_RHO_BEGIN`); the
    polish's status is the fit's;
 4. any other stop (the gradient unavailable at a clamped η row or a non-PD
-   observed factor, the line search, the iteration cap of 200), and an endpoint
-   with a diagonal θ at or above `GRAD_THETA_FAR = 100` (the plateau toward the
+   observed factor, the line search from the start matrix, the iteration cap of
+   2000), and an endpoint with a diagonal θ at or above `GRAD_THETA_FAR = 100` (the plateau toward the
    box), hands over to the shape's BOBYQA route with its unchanged budget: from
    the incumbent, or from the search's start off the plateau. On a Laplace
    shape that route's stage 1 restarts at `RHO_BEGIN_WARM`; on AGQ, which has
    no stage 1, the joint search restarts at `GLMM_RHO_BEGIN`. Only a failed
    line search or the iteration cap raise `Note::GradientSearchFallback`; where
-   the gradient is not defined the BOBYQA route is the designed handler.
+   the gradient is not defined the BOBYQA route is the designed handler. When
+   that route ends with no result, a finite incumbent is the fit's capped
+   endpoint (`converged = false`, `boundary_hit = 2`, no fallback note): BFGS
+   holds β at its point while stage 1 profiles it, and on a ridge the profile
+   can fail around a point BFGS evaluated.
 
 On AGQ a fit that steps 2 or 3 finish then goes through the joint search's
 check and second pass (`JOINT_RECHECK_TOL`, see
@@ -1508,7 +1512,7 @@ after the first three, and twelve polishes stopped 5e-7 (aarch64 macOS) to
 9.2e-4 (x86_64 Linux) above the optimum that lme4 and a warm restart reach.
 Scaled, the one polish reaches it on every platform. The polish's
 evaluations count in `n_eval`; the PQL solve does not. On 614 simulated
-pinned fits the drop alone ran it on 190, helped
+pinned fits (measured 2026-10-05, data not kept) the drop alone ran it on 190, helped
 184 of them, and left 5 of 100 crossed fits more than 1e-3 above the
 `(1 | g)` optimum against 35 without it; those 5 were fits the drop did not
 run it on, which the probe is for. No pinned grid cell runs it on the drop.
@@ -1555,6 +1559,9 @@ caller's Λ is the lower factor of `N·Λ̃Λ̃ᵀ·Nᵀ`, and its exact zeros, 
 `pinned` reads, can sit on another diagonal than the kernel's: an intercept
 diagonal pinned in centered coordinates becomes a zero slope diagonal of the
 caller's factor. With no centered slope the zero pattern is the kernel's. The
+map keeps the kernel's rank: a last pivot that `Σ` rounds below its floor
+(`q·ε·Σ_cc`) is read off `det Λ = det Λ̃` instead, so a last diagonal the
+incumbent check left small stays small and unflagged. The
 same centering makes vector AGQ on a block with a slope integrate in the
 centered `u` coordinates, so its deviance differs from an uncentered fit's by
 the quadrature error ([internal standardization](algorithms.md#internal-standardization-of-the-design)).

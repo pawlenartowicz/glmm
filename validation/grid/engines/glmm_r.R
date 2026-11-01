@@ -125,10 +125,9 @@ do_fit <- function(data, formula, family, wald_se, nagq, reml, satterthwaite = T
   # the arm exists so one would not silently drop the other's column.
   # `reml` is FALSE on a cell tagged `ml` and NULL (the default) otherwise.
   # `satterthwaite` is FALSE only for the timed samples (see the caller).
-  # anova_test = "Wald" by default: the grid times the fit, not the
-  # likelihood-ratio refits "auto" stores for a Poisson GLMM. Pipeline mode
-  # passes "auto", the user's default, which on a Gaussian model stores the same
-  # Wald/F tables and refits nothing.
+  # anova_test = "Wald" by default: the grid reads no likelihood-ratio table.
+  # Pipeline mode passes "auto", the user's default, which makes none either
+  # until anova() asks.
   # suppressWarnings: the expected singular-boundary / nAGQ-fallback notices
   # are captured on the fit object (singular, converged), not needed on
   # stderr for a run of ~800 cells.

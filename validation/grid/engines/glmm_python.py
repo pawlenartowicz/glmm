@@ -280,8 +280,7 @@ def fit_one(cell):
                 rec["wall_seconds"] = statistics.median(samples[1:])
             return call(True)
 
-        # anova_test="Wald": the grid times the fit, not the likelihood-ratio
-        # refits "auto" stores for a Poisson GLMM.
+        # anova_test="Wald": the grid reads no likelihood-ratio table.
         kw["anova_test"] = "Wald"
         fh = timed_fit(
             lambda sat: glmm.fit(

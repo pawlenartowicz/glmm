@@ -6,7 +6,6 @@
   "generator": "external/scripts/00_SetHyperparameters.R + 01_GenerateData.R (set.seed(126))",
   "response_used": "y_full",
   "S": 1000,
-  "lme4_subset_reps": 200,
   "nagq_agq": 11,
   "fit_engine": "fastglmm (r/ port of the glmm Rust kernel)",
   "true_params": {"beta0": 0.1, "beta1": 0.3, "beta2": -0.2, "beta3": 0.1, "tau0": 0.8, "tau1": 0.4, "rho01": 0.2},
@@ -24,9 +23,10 @@
   },
   "arms": {
     "glmm_LA": {"nAGQ": 1, "cells": "all 24"},
-    "glmm_AGQ": {"nAGQ": 11, "cells": "12 RI-only (rdi) cells"},
-    "lme4_LA": {"nAGQ": 1, "cells": "all 24", "reps": 200, "role": "validation gate + timing denominator"},
-    "lme4_AGQ": {"nAGQ": 11, "cells": "12 RI-only cells", "reps": 200, "role": "validation gate"}
+    "glmm_AGQ": {"nAGQ": 11, "cells": "all 24"},
+    "lme4_LA": {"nAGQ": 1, "cells": "all 24", "reps": 50, "role": "validation gate + timing denominator"},
+    "lme4_AGQ": {"nAGQ": 11, "cells": "12 RI-only cells", "reps": 50, "role": "validation gate"},
+    "GLMMadaptive": {"cells": "all 24", "reps": 50, "role": "adaptive timing"}
   },
   "metric": {
     "bias": "grand mean over cells of |mean_reps(theta_hat) - theta_true|",

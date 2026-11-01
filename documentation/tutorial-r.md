@@ -174,13 +174,13 @@ The knobs:
   the ML one. Every other family is fitted by maximum likelihood; `FALSE` there
   changes nothing, and `TRUE` is ignored with an `argument_ignored` warning.
   `fit$reml` says which criterion the fit's log-likelihood is.
-- `anova_test`: which per-term tables the fit stores for `anova()`. Every fit
-  stores its Wald or F tables. `"auto"` (default) also stores the
-  likelihood-ratio tables of a Poisson model with random effects, the rows
-  `anova(fit)` gives it by default; `"LRT"` stores them on every fit with
-  chi-squared rows, so that `anova(fit, test = "LRT")` can read them;
-  `"Wald"` stores none. A likelihood-ratio table costs one refit per reduced
-  model, made after the fit; the fit itself is the same under every value.
+- `anova_test`: when the likelihood-ratio tables of `anova()` are made. Every
+  fit stores its Wald or F tables. `"auto"` (default) makes the
+  likelihood-ratio tables the first time `anova()` needs them, and the fit
+  keeps them; `"LRT"` makes them with the fit, on every fit with chi-squared
+  rows; `"Wald"` never makes them. They cost one refit per reduced model, and
+  under `"auto"` one more for the fit itself; the fit itself is the same under
+  every value.
 - `start` — warm start; see §4.
 - `init.theta` — negative-binomial shape seed, named for
   `MASS::glm.nb(init.theta=)`: the starting value of the shape search, the
@@ -230,7 +230,7 @@ shaped like lme4's. These **work**:
 | `fit$rss`, `fit$r_squared`, `fit$adj_r_squared` | OLS only: the weighted residual sum of squares and `summary.lm`'s multiple and adjusted R-squared (0 on an intercept-only model); `NaN` on every other fit and on a non-converged one. |
 | `logLik(fit)` | log-likelihood on `stats::logLik`'s scale; on a REML fit (a Gaussian mixed model with the default `REML`, or OLS with `REML = TRUE`) this is the REML criterion (`REML = TRUE` attribute), on every other fit the ML log-likelihood (`REML = FALSE`). |
 | `AIC(fit)`, `BIC(fit)` | `stats`'s values and tables, read from `logLik()`. Two comparisons stop with an error instead: a REML fit beside an ML fit (the error names which is which), and REML fits with different fixed effects, whose REML criteria are not comparable (the error points to `compare()` and to `REML = FALSE`). ML fits compare across fixed effects as in `stats`. See `?AIC.fastglmm` for the uses it cannot check. |
-| `anova(fit)` | the per-term tests, one row per fixed term, built when the model was fitted (no refit when called): Type III by default, `type = "II"` on request; lmerTest's F with Satterthwaite df on a Gaussian mixed model, F on `n - p` on OLS and the Gamma and inverse-Gaussian GLMs with an estimated dispersion, likelihood-ratio chi-squared on a Poisson GLMM, Wald chi-squared elsewhere; `test = "Wald"` or `test = "LRT"` picks the test on a fit with chi-squared rows. See the end of this section. |
+| `anova(fit)` | the per-term tests, one row per fixed term, built when the model was fitted (likelihood-ratio rows on the first call that needs them): Type III by default, `type = "II"` on request; lmerTest's F with Satterthwaite df on a Gaussian mixed model, F on `n - p` on OLS and the Gamma and inverse-Gaussian GLMs with an estimated dispersion, likelihood-ratio chi-squared on a Poisson GLMM, Wald chi-squared elsewhere; `test = "Wald"` or `test = "LRT"` picks the test on a fit with chi-squared rows. See the end of this section. |
 | `anova(m0, m1)` | two fits compared as they are, with no refit; see the end of this section. |
 | `pairwise(fit, "f")` | every pairwise comparison of the levels of a factor of the fixed part, emmeans' `pairs(emmeans(fit, ~ f))` with Holm's adjustment by default (emmeans' default is Tukey); `confint()` of the table gives the intervals. See the end of this section. |
 | `r2(fit)`, `icc(fit)` | a mixed model's marginal and conditional R-squared and its adjusted and unadjusted ICC, as `performance::r2_nakagawa` and `performance::icc` compute them. They are computed when called; on a Poisson or negative binomial GLMM each call refits the null model once. `summary()` prints the R-squared pair and the adjusted ICC in one line, or, on a Poisson or negative binomial GLMM, a line that points to `r2()` and `icc()`. |
@@ -292,8 +292,7 @@ attr(vc$group, "correlation")  # their correlation matrix
 ```
 
 **Tests: `anova()` and `compare()`.** `anova(fit)` tests each fixed term of
-one fit, from the table the fit stored when it was made. Two models are
-compared in one of two ways:
+one fit. Two models are compared in one of two ways:
 
 ```r
 # Fixed-term tests of one fit (Type III unless type = "II").
@@ -316,10 +315,8 @@ anova(m0, m1)
 On a fit with chi-squared rows, `anova(fit, test = "Wald")` or
 `anova(fit, test = "LRT")` picks the test of the rows. The default,
 `test = "auto"`, gives a Poisson model with random effects the
-likelihood-ratio rows and every other fit its Wald or F rows. The
-likelihood-ratio rows are refitted when the model is fitted, by default only
-on a Poisson GLMM; on any other fit, ask for them with
-`fastglmm(..., anova_test = "LRT")` first.
+likelihood-ratio rows and every other fit its Wald or F rows. The first call
+that needs likelihood-ratio rows refits the model, and the fit keeps them.
 
 `compare()` has no `REML` argument: on a Gaussian model it fits both models
 by REML when only their random parts differ and by ML when their fixed parts

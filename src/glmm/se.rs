@@ -95,7 +95,7 @@ fn agq_gradient_difference_hessian(
         Some(g) if g.matches_shape(p, nagq) => g,
         _ => Box::new(super::agq_gradient::AgqGd::for_shape(p, nagq)),
     };
-    gd.idx.rebuild(&cluster_ids[..n], ws.groupings.n_primary);
+    gd.idx.ensure(&cluster_ids[..n], ws.groupings.n_primary);
     let saved_tol = ws.fd.pirls_tol_override;
     ws.fd.pirls_tol_override = Some(super::pirls_tol_fd(ws.family));
     let mut gp = vec![0.0; m];

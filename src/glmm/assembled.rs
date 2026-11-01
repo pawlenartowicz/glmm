@@ -1338,8 +1338,7 @@ pub(crate) const SE_ROW_BLOCK: usize = 4096;
 /// list. Lives on the dual scratch (`GlmmDualBufs::row_blocks`), built once by
 /// [`GlmmDualScratch::for_shape_row_blocked`], so a repeat call at the same
 /// shape and cluster sizes allocates nothing. A call whose largest block
-/// outgrows the stored capacity (new cluster ids with larger clusters) grows
-/// it once, in [`RowBlockBufs::ensure`].
+/// outgrows the stored capacity grows it once, in [`RowBlockBufs::ensure`].
 pub(crate) struct RowBlockBufs<T: Scalar> {
     /// `(first, end)` primary-cluster range of each block, rebuilt per call.
     blocks: Vec<(usize, usize)>,
@@ -1898,10 +1897,7 @@ fn blocked_chunks<T: Seed>(
     let lanes = T::LANES;
     let n_chunks = m.div_ceil(lanes.max(1));
 
-    // The index the scratch was built with belongs to the cluster ids of that
-    // build; a reused workspace can be called with new ones, so rebuild it in
-    // place (no allocation at an unchanged `n` and `s`).
-    idx.rebuild(cluster_ids, s);
+    idx.ensure(cluster_ids, s);
     let (max_rows, max_s) = plan_row_blocks(idx, s, block_rows, &mut rb.blocks);
     rb.ensure(max_rows, max_s);
     if offset.is_some() && rb.offset.len() < rb.cap_rows {

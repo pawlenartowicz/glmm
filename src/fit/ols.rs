@@ -326,7 +326,7 @@ pub(crate) fn ols_view_to_fit(
     // t on the residual df `n − p`, whatever `opts.satterthwaite` says.
     let (coef_df, satterthwaite) = residual_df(
         view.factor,
-        n,
+        n as f64 - p as f64,
         p,
         view.sigma_sq,
         map,

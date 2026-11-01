@@ -29,6 +29,13 @@ impl GlmFitView<'_> {
             ..FitDiagnostics::fixed_only(self.converged)
         }
     }
+
+    /// The coefficients the fit estimates: every column but the broken ones.
+    /// The model df, AIC and the Pearson divisor count them as R's `glm` counts
+    /// its `rank`, so this fit and one with those columns dropped agree.
+    fn p_rank(&self) -> usize {
+        self.betas.len() - self.broken.iter().filter(|&&b| b).count()
+    }
 }
 
 /// Builds the standard non-converged NaN `Fit` used to seed
@@ -93,6 +100,7 @@ pub(crate) struct GlmScratchBuf {
     irls_xtwz: Vec<f64>,
     irls_l: Mat<f64>,
     irls_wx: Vec<f64>,
+    irls_broken: Vec<bool>,
 }
 
 impl GlmScratchBuf {
@@ -112,6 +120,7 @@ impl GlmScratchBuf {
             irls_xtwz: vec![0.0f64; p1],
             irls_l: Mat::<f64>::zeros(p1, p1),
             irls_wx: vec![0.0f64; n1 * p1], // column-major W∘X, needs ≥ n·p
+            irls_broken: vec![false; p1],
         }
     }
 
@@ -130,6 +139,7 @@ impl GlmScratchBuf {
             irls_xtwz: &mut self.irls_xtwz,
             irls_l: self.irls_l.as_mut(),
             irls_wx: &mut self.irls_wx,
+            irls_broken: &mut self.irls_broken,
         }
     }
 }
@@ -219,6 +229,37 @@ pub(crate) fn fit_glm_prebuilt<'a>(
     )
 }
 
+/// The `Fit::dispersion` of a GLM view, NaN unless it converged. Binomial and
+/// Poisson hold φ≡1 (the kernel's `(XᵀWX)⁻¹` is the full covariance). Gamma and
+/// inverse-Gaussian recover φ post-fit, because the mean model β is
+/// φ-independent, so φ stays out of the IRLS. `Dispersion::Fixed(v)` holds φ=v
+/// fixed. `Dispersion::Default` is the Pearson moment `φ̂=Σ wᵢrᵢ²/(n−p)`,
+/// `rᵢ=(yᵢ−μ̂ᵢ)/√V(μ̂ᵢ)`, raw-row df, raw weights — exactly `summary(glm(...,
+/// weights=w))$dispersion` on both families (precision weights: row `i` has
+/// variance `φ·V(μᵢ)/wᵢ`, so Pearson's `wᵢrᵢ²` is already on that scale).
+/// Gamma's maximum-likelihood φ̂ is a DIFFERENT estimator, computed in
+/// [`glm_view_to_fit`] for `loglik` alone.
+pub(crate) fn glm_dispersion(
+    view: &GlmFitView<'_>,
+    y: &[f64],
+    weights: Option<&[f64]>,
+    family: Family,
+    n: usize,
+    opts: &FitOptions,
+) -> f64 {
+    if !view.converged {
+        return f64::NAN;
+    }
+    match family {
+        Family::Gamma { .. } | Family::InverseGaussian { .. } => {
+            opts.dispersion.held().unwrap_or_else(|| {
+                crate::family::pearson_dispersion(y, view.mu, family, n, view.p_rank(), weights)
+            })
+        }
+        _ => 1.0,
+    }
+}
+
 /// Maps a [`GlmFitView`] to the full stable `Fit`: SE from `var_diag`, vcov from
 /// the cached Cholesky factor, Gamma dispersion + √φ SE scaling, fitted means μ̂,
 /// and the family log-likelihood. Needs raw `y` (Gamma dispersion + saturated
@@ -245,13 +286,10 @@ pub(crate) fn glm_view_to_fit(
     // A broken-down column (`GlmFitView::se_unavailable`) sits at its start
     // value: not an estimate, so NaN, as an aliased column's is. The other
     // estimates, the deviance and the fitted means stand; no covariance does.
-    if view.se_unavailable {
-        beta[view.pivot_col as usize] = f64::NAN;
+    for j in (0..view.broken.len()).filter(|&j| view.broken[j]) {
+        beta[j] = f64::NAN;
     }
-    // The coefficients the fit estimates: the model df, AIC and the Pearson
-    // divisor count them as R's `glm` counts its `rank`, so this fit and one
-    // with the column dropped beforehand agree.
-    let p_rank = p - usize::from(view.se_unavailable);
+    let p_rank = view.p_rank();
     let has_vcov = converged && !view.se_unavailable;
     // Weighted Σwᵢdᵢ at the accepted iterate (NaN unless converged).
     let irls_deviance = view.deviance;
@@ -266,38 +304,17 @@ pub(crate) fn glm_view_to_fit(
         nan_vcov(p)
     };
 
-    // Dispersion. Binomial/Poisson hold φ≡1 (the kernel's `(XᵀWX)⁻¹` is the full
-    // covariance). Gamma and inverse-Gaussian recover φ post-fit — the mean
-    // model β is φ-independent, so φ stays out of the IRLS — and scale the SE
-    // by √φ (the kernel folded φ=1, so Var(β̂)=φ·(XᵀWX)⁻¹). `Dispersion::Fixed(v)`
-    // holds φ=v fixed. `Dispersion::Default` is the Pearson moment `φ̂=Σ wᵢrᵢ²/(n−p)`,
-    // `rᵢ=(yᵢ−μ̂ᵢ)/√V(μ̂ᵢ)`, raw-row df, raw weights — exactly `summary(glm(...,
-    // weights=w))$dispersion` on both families (precision weights: row `i` has
-    // variance `φ·V(μᵢ)/wᵢ`, so Pearson's `wᵢrᵢ²` is already on that scale).
-    // Gamma's maximum-likelihood φ̂ is a DIFFERENT estimator, computed below for
-    // `loglik` alone — see the Gamma arm.
-    let dispersion = if !converged {
-        f64::NAN
-    } else {
-        match family {
-            Family::Gamma { .. } | Family::InverseGaussian { .. } => {
-                let phi = match opts.dispersion.held() {
-                    Some(v) => v,
-                    None => crate::family::pearson_dispersion(
-                        y, view.mu, family, nb_theta, n, p_rank, weights,
-                    ),
-                };
-                let sqrt_phi = phi.sqrt();
-                for v in se.iter_mut() {
-                    if v.is_finite() {
-                        *v *= sqrt_phi;
-                    }
-                }
-                phi
+    // Gamma and inverse-Gaussian scale the SE by √φ: the kernel folded φ=1, so
+    // Var(β̂)=φ·(XᵀWX)⁻¹. A no-op for the φ≡1 families.
+    let dispersion = glm_dispersion(view, y, weights, family, n, opts);
+    if converged {
+        let sqrt_phi = dispersion.sqrt();
+        for v in se.iter_mut() {
+            if v.is_finite() {
+                *v *= sqrt_phi;
             }
-            _ => 1.0,
         }
-    };
+    }
 
     // Var(β̂) = φ·(X'WX)⁻¹ — the same φ the SE loop applied as √φ. A no-op for
     // the φ≡1 families, where `dispersion` is 1.0.
@@ -374,15 +391,15 @@ pub(crate) fn glm_view_to_fit(
     };
 
     // Gamma and inverse Gaussian with the Pearson φ̂ take t on its divisor
-    // `n − p` (`summary.glm`'s `df.residual`), whatever `opts.satterthwaite`
-    // says; a held φ, and the families with φ ≡ 1 or an NB shape, keep z.
+    // `n − p`, `p` the estimated columns (`summary.glm`'s `df.residual`),
+    // whatever `opts.satterthwaite` says; a held φ, and the families with φ ≡ 1 or an NB shape, keep z.
     let (coef_df, satterthwaite) = match family {
         Family::Gamma { .. } | Family::InverseGaussian { .. }
             if opts.dispersion.held().is_none() =>
         {
             let (df, state) = residual_df(
                 view.l,
-                n,
+                n as f64 - p_rank as f64,
                 p,
                 dispersion,
                 map,

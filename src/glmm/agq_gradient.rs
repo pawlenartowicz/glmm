@@ -141,8 +141,7 @@ fn row_terms(f: RowFamily, y: f64, w: f64, eta: f64) -> (f64, f64, f64, f64) {
 
 /// What the gradient-difference Hessian keeps between SE calls: its own
 /// per-cluster row index (never `ws.cluster_rows`, whose presence switches the
-/// AGQ value kernel's loop order), rebuilt in place on every call because a
-/// reused workspace may see new `cluster_ids`, and [`assemble`]'s buffers.
+/// AGQ value kernel's loop order), built once, and [`assemble`]'s buffers.
 pub(crate) struct AgqGd {
     pub(crate) idx: ClusterRowIndex,
     pub(crate) sc: AgqGradScratch,

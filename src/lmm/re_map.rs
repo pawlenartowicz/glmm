@@ -251,7 +251,8 @@ impl LmmGroupings {
     /// after the factorization (a diagonal scaling commutes with it), so the
     /// column's units stay out of the rank cap's check, and the factor keeps
     /// Λ̃'s rank: as many exact-zero diagonals as Λ̃ has
-    /// ([`PivotFloor::Column`]). A non-finite Λ̃ gives a non-finite Λ.
+    /// ([`PivotFloor::Column`]; a last pivot below that floor is read off the
+    /// determinant). A non-finite Λ̃ gives a non-finite Λ.
     /// `scratch.len() ≥ 2q²`.
     pub(crate) fn lambda_kernel_to_caller(
         &self,
@@ -267,8 +268,18 @@ impl LmmGroupings {
                 return;
             }
             let max_rank = q - (0..q).filter(|&r| lam[r * q + r] == 0.0).count();
+            let det: f64 = (0..q).map(|r| lam[r * q + r].abs()).product();
             self.shift_rows(b, q, q, lam, -1.0, cs);
             refactor(q, lam, scratch, PivotFloor::Column { max_rank });
+            // C has a unit diagonal, so det Λ = det Λ̃: a full-rank Λ̃'s last pivot
+            // is known here to full relative accuracy where Σ, which squares it,
+            // rounds it below the column floor. shortcut: an earlier pivot lost
+            // the same way stays 0, no such fit is known; handling it takes a
+            // factorization of C·Λ̃ that does not form Σ.
+            let head: f64 = (0..q - 1).map(|r| lam[r * q + r]).product();
+            if lam[q * q - 1] == 0.0 && det > 0.0 && head > 0.0 {
+                lam[q * q - 1] = det / head;
+            }
         }
         self.scale_rows(b, q, q, lam, cs);
     }

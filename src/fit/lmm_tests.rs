@@ -2809,16 +2809,16 @@ fn sparse_accumulation_workspace(ids: &[u32], extra: &[Vec<u32>]) -> LmmWorkspac
 }
 
 /// A sparse-kernel workspace that is refilled in place for a new draw on the
-/// rows its pattern was built from, and rebuilt for a draw on other rows,
-/// holds what a workspace built fresh for that draw holds: the deviance at a
-/// fixed θ, which reads every accumulated Gram, agrees bit for bit. The draws
-/// change x, y and the weights, and one is unweighted.
+/// rows its pattern was built from holds what a workspace built fresh for that
+/// draw holds: the deviance at a fixed θ, which reads every accumulated Gram,
+/// agrees bit for bit. The draws change x, y and the weights, and one is
+/// unweighted.
 #[test]
 fn accumulate_lmm_rows_sparse_reuse_matches_a_fresh_workspace() {
     let (n, p) = (240usize, 3usize);
     let theta = [0.7, 0.4];
     let mut reused: Option<LmmWorkspace> = None;
-    for (shift, seed, weighted) in [(3, 1u64, true), (3, 2, true), (3, 3, false), (7, 4, true)] {
+    for (shift, seed, weighted) in [(3, 1u64, true), (3, 2, true), (3, 3, false)] {
         let (x, y, ids, extra, w) = sparse_accumulation_draw(n, shift, seed);
         let w = weighted.then_some(&w[..]);
         let ws = reused.get_or_insert_with(|| sparse_accumulation_workspace(&ids, &extra));

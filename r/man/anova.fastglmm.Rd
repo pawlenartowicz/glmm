@@ -25,10 +25,10 @@ per-term table.}
 default) gives the likelihood-ratio rows on a Poisson model with random
 effects and the Wald chi-squared (or F) rows on every other fit;
 \code{"Wald"} the Wald chi-squared rows; \code{"LRT"} the likelihood-ratio rows.
-The likelihood-ratio rows are those the fit stored: a fit made with
-\code{fastglmm(..., anova_test = "LRT")} stores them, and so does a Poisson
-model with random effects fitted with the default \code{anova_test = "auto"}
-(an error otherwise). On a fit whose rows are F tests (a Gaussian model,
+The likelihood-ratio rows are an error on a fit made with
+\code{anova_test = "Wald"}, and are made on the first call that needs them on
+any other (see \code{anova_test} in \code{\link[=fastglmm]{fastglmm()}}). On a fit whose rows are F
+tests (a Gaussian model,
 a Gamma or inverse-Gaussian GLM with an estimated dispersion), \code{"Wald"}
 and \code{"LRT"} are errors.}
 
@@ -50,7 +50,8 @@ test made no draw.
 }
 \description{
 With one fit, \code{anova()} gives one row per fixed term, read from the table the
-crate built when the model was fitted: nothing is refitted when it is called.
+crate built when the model was fitted; only likelihood-ratio rows can need a
+refit (see below).
 Type III by default, built the way lmerTest builds it, so it does not depend
 on the contrast coding; Type II with \code{type = "II"}. A Gaussian mixed model
 gets lmerTest's F with Satterthwaite's denominator df (columns \verb{Sum Sq},
@@ -75,10 +76,10 @@ model with the model refitted under the term's hypothesis (Type III: the
 reduced design of the hypothesis its Wald row tests, as afex's
 \code{mixed(method = "LRT")} on a GLMM; Type II: the model of every term that does
 not contain the term, with and without it, the rule of car's
-\code{Anova(test.statistic = "LR")} on a GLM, applied to GLMMs too). These refits
-are made when the model is fitted: when the fit asks for them with
-\code{fastglmm(..., anova_test = "LRT")}, and on a Poisson model with random
-effects under the default \code{anova_test = "auto"}. Each refit keeps the
+\code{Anova(test.statistic = "LR")} on a GLM, applied to GLMMs too). The first
+call that needs these rows refits the model and the fit keeps them, so the
+next call computes nothing; a fit made with
+\code{fastglmm(..., anova_test = "LRT")} has them already. Each refit keeps the
 model's random effects, random slopes included.
 
 The default \code{test = "auto"} gives the likelihood-ratio rows to a Poisson
