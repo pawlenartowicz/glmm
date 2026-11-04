@@ -479,6 +479,11 @@ pub(crate) fn linear_note_line(note: LinearNote, names: &[String]) -> String {
              reached a higher log-likelihood than the larger model of this row, by more than \
              round-off: the larger model did not reach its optimum. The statistic is set to 0."
             .into(),
+        LinearNote::LargePoissonCounts => "Counts this large make the likelihood sharp: the \
+             model refitted for this term may have stopped in a local minimum, which overstates \
+             the statistic. To check, refit that model from a large random-intercept standard \
+             deviation."
+            .into(),
     }
 }
 
@@ -1302,6 +1307,22 @@ pub(crate) fn auto_choice(lowered: &Lowered, fit: &Fit) -> TestChoice {
 /// on a column the reduced design leaves out or mixes reads that column's
 /// values as a random-effect-only column ([`crate::Data::re_columns`]).
 ///
+/// On very large Poisson counts such a refit can stop in the wrong one of two
+/// basins. The model has to carry the dropped column's mean on its random
+/// effects, either on that column's own random slope or, with a large
+/// random-intercept standard deviation, on the intercept's random effect, and
+/// both are local minima. A refit that stops in the higher one reports a
+/// converged fit above the reduced model's optimum, and the row's statistic
+/// is too large. On one design, `y ~ 1 + x1 + x2 + (1 + x1 + x2 | g)` with 20
+/// groups of 10 rows and log-link counts at a log mean of 6, 10, 14 and 18,
+/// the reduced refits that converged more than 0.1 deviance units above the
+/// lowest point found from several starts were 2 of 600, 6 of 600, 28 of 600
+/// and 31 of 80. The likelihood-ratio rows of a Poisson mixed model whose
+/// fitted counts average above e⁹ (about 8100) carry
+/// [`LinearNote::LargePoissonCounts`]. That threshold lies between the sets
+/// at log mean 6 and 10 and was not measured: smaller counts are not free of
+/// such refits, only rarer.
+///
 /// A term with no hypothesis row (its columns aliased) gets a NaN row with
 /// [`LinearNote::AliasedColumn`] for each of its aliased columns, in its
 /// place in the term order (lmerTest prints such a row last), and a
@@ -1407,7 +1428,7 @@ pub(crate) fn term_tests_cached(
         SsType::Type2 => Vec::new(),
     };
     let tests: Vec<LinearTest> = if choice.test == LinearKind::LikelihoodRatio {
-        let (tests, lrt_notes) = lrt_rows(
+        let (mut tests, lrt_notes) = lrt_rows(
             lowered,
             fit_opts,
             fit,
@@ -1417,6 +1438,11 @@ pub(crate) fn term_tests_cached(
             cache,
         );
         notes.extend(lrt_notes);
+        if large_poisson_counts(lowered, fit) {
+            for t in tests.iter_mut().filter(|t| t.statistic.is_finite()) {
+                t.notes.push(LinearNote::LargePoissonCounts);
+            }
+        }
         tests
     } else {
         hypotheses
@@ -1437,6 +1463,23 @@ pub(crate) fn term_tests_cached(
         notes,
         coef_names: lowered.col_names.clone(),
     })
+}
+
+/// The log of the mean fitted count above which a Poisson mixed model's
+/// likelihood-ratio rows carry [`LinearNote::LargePoissonCounts`]: e⁹, about
+/// 8100, between log mean 6 (2 of 600 reduced refits in the wrong basin)
+/// and 10 (6 of 600), the rates [`term_tests`] gives. Not itself measured.
+pub(super) const LARGE_POISSON_LOG_MEAN: f64 = 9.0;
+
+/// Whether `fit` is a Poisson mixed model, any link, whose fitted counts
+/// average above `exp(LARGE_POISSON_LOG_MEAN)`. False on a fit with no
+/// fitted values (one that did not converge).
+fn large_poisson_counts(lowered: &Lowered, fit: &Fit) -> bool {
+    let mu = fit.fitted();
+    lowered.model.re.is_some()
+        && matches!(lowered.model.family, Family::Poisson { .. })
+        && !mu.is_empty()
+        && (mu.iter().sum::<f64>() / mu.len() as f64).ln() > LARGE_POISSON_LOG_MEAN
 }
 
 /// The likelihood-ratio rows of [`term_tests`], one per hypothesis of

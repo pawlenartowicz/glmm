@@ -1566,7 +1566,8 @@ pub fn fit_glmm(
     //   polish runs, on a Laplace shape; at `RHO_BEGIN_WARM`
     //   (`solver_polish_wide`) on AGQ (no stage 1; `solver` is the whole
     //   search and starts at `GLMM_RHO_BEGIN`). The polish's status is the
-    //   fit's;
+    //   fit's; a polish that ends with no result leaves the endpoint as the
+    //   fit's capped endpoint (`grad_incumbent`), as a hand-over does;
     // - any other stop (the gradient unavailable, the line search or the
     //   iteration cap) hands the incumbent to this shape's BOBYQA route with
     //   its unchanged budget: stage 1 at `RHO_BEGIN_WARM` where the route has
@@ -1808,6 +1809,13 @@ pub fn fit_glmm(
             // search) `solver` would restart it at `GLMM_RHO_BEGIN`, so the
             // polish takes `solver_polish_wide` there (see the rungs above).
             obj.non_finite_points.clear();
+            // The endpoint and its modes, kept as a hand-over keeps its
+            // incumbent (caller's β): a polish that ends with no result
+            // reports them as the fit's capped endpoint (`grad_incumbent`),
+            // not NaN.
+            incumbent[..m].copy_from_slice(&params[..m]);
+            obj.beta_scale.to_caller(&mut incumbent[n_theta..nb_col]);
+            incumbent[m..].copy_from_slice(&obj.u_inc[..k]);
             let mut finite = 0usize;
             let mut pol_best = best;
             let polish: &mut bobyqa::Bobyqa = if agq_finish {
@@ -1848,6 +1856,9 @@ pub fn fit_glmm(
                         &params[..total_dim],
                         NON_FINITE_RADIUS,
                     ));
+            if !ok && best.is_finite() {
+                grad_incumbent = Some((m, best));
+            }
             grad_done = Some((
                 ok,
                 n_val + out.n_eval,
@@ -2899,8 +2910,13 @@ pub fn fit_glmm(
     // false` and `boundary_hit = 2` at a finite point, as a capped BOBYQA does.
     // The estimates are the gradient search's, so neither fallback note, which
     // say another search made them, is raised.
+    // A handed-over gradient endpoint more than `joint_recheck_band` below
+    // the point the BOBYQA route reports is reported in its place, capped:
+    // from the `far` plateau the route can restart and end higher than the
+    // endpoint it was handed (5 of the 31 capped precise-count refits at
+    // e¹⁴, up to 41 units higher, 2026-11-03).
     let (ok, budget_exhausted, inc_obj) = match grad_incumbent {
-        Some((m, f)) if !ok => {
+        Some((m, f)) if !ok || f < inc_obj - joint_recheck_band(inc_obj) => {
             let (point, modes) = ws.grad_scratch[m + nb_col..].split_at(m);
             ws.params[..m].copy_from_slice(point);
             ws.u_seed[..k].copy_from_slice(modes);
@@ -3149,7 +3165,79 @@ pub fn fit_glmm(
             pinned = false;
             pinned_components = 0;
             final_deviance = reeval!();
-        } else if pinned {
+        }
+        // Plateau probe. Out on the plateau toward the box a search can stop
+        // well above the optimum and still meet its own test: from an
+        // intercept loading of 20 on precise Poisson fits whose optimum is
+        // 0.5, 115 of 300 BOBYQA-route fits ended converged at about 20, 114
+        // to 208 deviance units above it (2026-11-03). There the deviance
+        // changes by ratios of the SD, not by the trust radius, so at a
+        // certified endpoint each diagonal θⱼ at or above
+        // `GRAD_WARM_THETA_MAX` is tried at θⱼ/e and θⱼ·e (β held, counted
+        // in `n_eval`). A lower point refuses the certificate: the fit moves
+        // there and the trough polish below runs from it.
+        let mut log_moved = false;
+        if !budget_exhausted {
+            let mut probed = false;
+            let tp = n_theta + *p;
+            let thr = PIN_POLISH_DROP.max(noise(inc_obj));
+            let mut best = (final_deviance, usize::MAX, 0.0);
+            for &j in diag {
+                let t0 = params[j];
+                if t0 < GRAD_WARM_THETA_MAX || structural.binary_search(&j).is_ok() {
+                    continue;
+                }
+                for f in [(-1.0f64).exp(), 1.0f64.exp()] {
+                    let t = t0 * f;
+                    if t > upper[j] {
+                        continue;
+                    }
+                    start_point[..tp].copy_from_slice(&params[..tp]);
+                    start_point[j] = t;
+                    pirls.u[..k].copy_from_slice(&u_seed[..k]);
+                    let dev = laplace_deviance(
+                        &data,
+                        nb_theta,
+                        gamma_phi,
+                        nagq,
+                        &start_point[..tp],
+                        beta_rhs,
+                        wx,
+                        pirls,
+                        structured,
+                        pattern,
+                        packed,
+                        border,
+                        prior_w_phi,
+                        beta_prof,
+                        exact_prof,
+                        BetaMode::Fixed,
+                        None,
+                        cluster_rows.as_ref(),
+                        pirls_exhausted,
+                        counters,
+                    );
+                    n_eval += 1;
+                    probed = true;
+                    if dev < best.0 - thr {
+                        best = (dev, j, t);
+                    }
+                }
+            }
+            if best.1 != usize::MAX {
+                params[best.1] = best.2;
+                final_deviance = reeval!();
+                u_seed[..k].copy_from_slice(&pirls.u[..k]);
+                inc_obj = pinned_obj(final_deviance);
+                log_moved = true;
+            } else if probed && !pinned {
+                // Nothing lower: the probe left the workspace at its last
+                // point, so the endpoint is re-evaluated (not a search
+                // evaluation).
+                final_deviance = reeval!();
+            }
+        }
+        if pinned || log_moved {
             let pp = *p;
             let tp = n_theta + pp;
             let polish_gain = PIN_POLISH_DROP.max(noise(inc_obj));
@@ -3224,7 +3312,7 @@ pub fn fit_glmm(
             // Whether the trough polish runs: the pin lowered the objective by
             // more than `PIN_POLISH_DROP`, or the probe finds the free θ
             // coordinates off their optimum by more than that.
-            if drop > polish_gain || gain > polish_gain {
+            if drop > polish_gain || gain > polish_gain || log_moved {
                 // Trough polish. A variance whose optimum is 0 makes a trough
                 // log(1 + θ²·Σw) in its θ; under very precise data (Σw near 1e7)
                 // it is so narrow that the search's trust radius shrinks to its

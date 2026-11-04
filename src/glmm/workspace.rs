@@ -978,8 +978,10 @@ pub struct GlmmWorkspace {
     /// on `ExactProfile` the θ-only stage-1 incumbent snapshot is copied in
     /// instead — see `OuterSearch` — and `betas` is copied from this suffix
     /// either way) — so a caller may read it back as the warm start for a
-    /// subsequent fit of related data. On a non-converged fit the content is an
-    /// arbitrary iterate — do not read it. On NB and Gamma the vector has one more
+    /// subsequent fit of related data. On a capped fit (not converged, finite
+    /// deviance) it holds the reported endpoint, which `capped_restart` (in
+    /// `fit::glmm`) restarts from; on any other non-converged fit the content
+    /// is an arbitrary iterate — do not read it. On NB and Gamma the vector has one more
     /// trailing entry, `ln θ_NB` or `ln φ`, whose exponential `fit_glmm` writes back
     /// into `nb_theta` or `gamma_phi` — the `[..n_theta + p]` read-back contract is
     /// unchanged.

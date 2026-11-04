@@ -394,6 +394,7 @@ fn every_note_text() -> Vec<String> {
         LinearNote::RankDeficientL { rank: 1, rows: 2 },
         LinearNote::ReducedNotConverged,
         LinearNote::NegativeStatistic,
+        LinearNote::LargePoissonCounts,
     ];
     let names = ["(Intercept)", "x", "z"].map(String::from);
     linear.extend(reasons.iter().map(|&reason| LinearNote::NoDf { reason }));
@@ -403,9 +404,10 @@ fn every_note_text() -> Vec<String> {
         LinearNote::NoDf { .. } => 2,
         LinearNote::ReducedNotConverged => 3,
         LinearNote::NegativeStatistic => 4,
+        LinearNote::LargePoissonCounts => 5,
     };
     let kinds: BTreeSet<usize> = linear.iter().map(linear_kind).collect();
-    assert_eq!(kinds, (0..5).collect(), "one row note of each kind");
+    assert_eq!(kinds, (0..6).collect(), "one row note of each kind");
 
     let refusals = [
         RlrtRefusal::NoResidualDf,
@@ -859,6 +861,74 @@ fn the_default_test_gives_the_wald_rows_bit_for_bit() {
                 "{at}"
             );
             assert_eq!(rows_of(&auto), rows_of(&wald), "{at}");
+        }
+    }
+}
+
+/// The likelihood-ratio rows of a Poisson mixed model carry the large-counts
+/// note when its fitted counts average above e⁹, and only then: on the
+/// precise ridge fixture (counts about 1e6) every row has it, on grouseticks
+/// (counts about 6) none does, nor does a Poisson GLM of the precise counts.
+#[test]
+fn large_poisson_counts_note_the_likelihood_ratio_rows() {
+    let poisson = Family::Poisson {
+        link: PoissonLink::Log,
+    };
+    let precise = csv_table(
+        include_str!("../../validation/data/simulated/sim_poisson_precise_ridge.csv"),
+        &["g"],
+    );
+    let grouse = csv_table(
+        include_str!("../../validation/data/empirical/grouseticks.csv"),
+        &["YEAR", "BROOD"],
+    );
+    // (formula, data, fitted counts above e⁹, rows noted)
+    let cases = [
+        ("y ~ x1 + x2 + (1 | g)", &precise, true, true),
+        (
+            "TICKS ~ YEAR + cHEIGHT + (1 | BROOD)",
+            &grouse,
+            false,
+            false,
+        ),
+        ("y ~ x1 + x2", &precise, true, false),
+    ];
+    for (formula, table, large, noted) in cases {
+        let lo = lower(formula, table, poisson).unwrap();
+        let fit = fit_warm_wo(
+            &lo.x,
+            &lo.y,
+            lo.n,
+            lo.p,
+            &lo.model,
+            &lo.ids,
+            None,
+            None,
+            None,
+            &FitOptions::default(),
+        );
+        assert!(fit.converged(), "{formula}");
+        let mean = fit.fitted().iter().sum::<f64>() / lo.n as f64;
+        assert_eq!(
+            mean.ln() > super::anova::LARGE_POISSON_LOG_MEAN,
+            large,
+            "{formula}: mean {mean}"
+        );
+        let t = term_tests_cached(
+            &lo,
+            &FitOptions::default(),
+            &fit,
+            &term_options(SsType::Type2, TermTest::Lrt),
+            &mut RefitCache::default(),
+        )
+        .unwrap();
+        for r in &t.fixed {
+            assert!(r.test.statistic.is_finite(), "{formula}");
+            assert_eq!(
+                r.test.notes.contains(&LinearNote::LargePoissonCounts),
+                noted,
+                "{formula}"
+            );
         }
     }
 }

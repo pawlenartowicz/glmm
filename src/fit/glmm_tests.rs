@@ -6851,8 +6851,20 @@ fn fit_glmm_nb_on_poisson_data_reaches_the_theta_bound() {
     );
 }
 
-/// Fit an NB or Gamma GLMM through the shipped build and solve, with both outer BOBYQA
-/// solvers capped at their legal minimum budget, and map it to `Fit`. The
+/// Caps what a fit's restart from a capped endpoint (`capped_restart`) runs
+/// beyond the two swapped-in solvers: the configs the warm and polish solvers
+/// are built from, at their legal minimum budget, and the gradient search,
+/// which no BOBYQA budget bounds, at one iteration. The first search and the
+/// restart then both run out, so a fit capped this way still ends not
+/// converged.
+fn cap_restart(ws: &mut crate::glmm::GlmmWorkspace) {
+    ws.config.max_fun = ws.config.npt + 1;
+    ws.config_stage1.max_fun = ws.config_stage1.npt + 1;
+    ws.grad_cfg.max_iter = 1;
+}
+
+/// Fit an NB or Gamma GLMM through the shipped build and solve, with every
+/// outer search capped ([`cap_restart`]), and map it to `Fit`. The
 /// budget-exhausted exit is a real non-convergence the kernel reports
 /// (`Status::MaxFunReached`), independent of how well PIRLS behaves on the
 /// data, so the budget-stop contracts below do not depend on a PIRLS defect
@@ -6882,6 +6894,7 @@ fn nb_budget_exhausted_fit(
     };
     ws.solver = cap(ws.n_theta + p + 1);
     ws.solver_stage1 = cap(ws.n_theta + 1);
+    cap_restart(&mut ws);
     let layout = ws.layout;
     let mut view = super::glmm::run_glmm_on(
         &mut ws,
@@ -9381,7 +9394,8 @@ fn tail_packed_fit_ships_the_assembled_covariance() {
 ///
 /// The cap is forced by swapping in a joint solver whose `max_fun` is the legal
 /// minimum (`npt + 1`) — one evaluation past the initial interpolation model,
-/// nowhere near cbpp's optimum.
+/// nowhere near cbpp's optimum — and capping the restart from that endpoint
+/// too ([`cap_restart`]).
 #[test]
 fn glmm_maxfun_cap_reports_honest_endpoint() {
     use bobyqa::{Bobyqa, Config};
@@ -9424,6 +9438,7 @@ fn glmm_maxfun_cap_reports_honest_endpoint() {
     };
     ws.solver = cap(ws.n_theta + p);
     ws.solver_stage1 = cap(ws.n_theta);
+    cap_restart(&mut ws);
 
     let mut view = super::glmm::run_glmm_on(
         &mut ws,

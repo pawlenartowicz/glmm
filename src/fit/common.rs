@@ -1157,13 +1157,27 @@ pub(crate) fn spec_sized_from_ids<'a>(
 /// Lower-tri Gram `G = XᵀX` (from row-major X) → `aliased_columns` mask. `p` is
 /// tiny, so the extra `O(N·p²)` reduction for the drop decision is negligible
 /// (the reduced fit recomputes its own suff stats).
+///
+/// Each column enters the Gram divided by the power of two at its largest
+/// `|xᵢⱼ|` (`2^⌊log₂ maxᵢ|xᵢⱼ|⌋`). The test is per column and homogeneous of
+/// degree two in a column's scale on both sides, and a power-of-two factor
+/// is exact, so this changes no verdict on a design whose Gram is finite; it
+/// keeps `Σxᵢⱼ²` finite past `|x| ≈ 1.3e154`, where the raw Gram's
+/// diagonal overflows to `∞` and `∞ ≤ ε·∞` marks the column aliased.
 pub(crate) fn detect_aliased(x: &[f64], n: usize, p: usize) -> Vec<bool> {
+    let mut inv = vec![1.0f64; p];
+    for (a, r) in inv.iter_mut().enumerate() {
+        let m = (0..n).fold(0.0f64, |m, i| m.max(x[i * p + a].abs()));
+        if m > 0.0 && m.is_finite() {
+            *r = 2f64.powi(-(m.log2().floor() as i32).clamp(-1022, 1023));
+        }
+    }
     let mut gram = Mat::<f64>::zeros(p, p);
     for i in 0..n {
         for a in 0..p {
-            let xa = x[i * p + a];
+            let xa = x[i * p + a] * inv[a];
             for b in 0..=a {
-                gram[(a, b)] += xa * x[i * p + b];
+                gram[(a, b)] += xa * (x[i * p + b] * inv[b]);
             }
         }
     }

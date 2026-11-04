@@ -659,6 +659,25 @@ pub(crate) fn run_glmm_on<'a>(
     let mut glmm_fit = fit_in(ws, c0);
     if let Some(u) = units {
         glmm_fit = gamma_inverse_retry(ws, glmm_fit, c0, &u, fit_in);
+    } else {
+        glmm_fit = capped_restart(ws, glmm_fit, |ws, restart| {
+            fit_glmm_in_units(
+                ws,
+                x_mat,
+                z_mat,
+                y,
+                n,
+                p,
+                cluster_ids,
+                extra_ids,
+                &restart.beta,
+                Some(restart),
+                targets,
+                opts,
+                map,
+                1.0,
+            )
+        });
     }
     // θ̂_NB after the search (NaN on every other family, untouched by the kernel).
     let nb_theta = ws.nb_theta;
@@ -671,6 +690,43 @@ pub(crate) fn run_glmm_on<'a>(
         z: z_mat,
         cluster_ids,
         extra_ids,
+    }
+}
+
+/// One more search from the endpoint of a search its budget stopped (`fit`,
+/// not converged at a finite deviance), warm-started there. A search that ran
+/// out walking a long, flat valley (an intercept SD from about 0.7 to 80 on
+/// precise Poisson counts) reaches its optimum from its own endpoint: the
+/// gradient route takes the endpoint, whose free coordinates are already off
+/// the trough that starved the first search. The restart is kept when it
+/// converged or ended lower; otherwise the first search's state is put back.
+/// `n_eval` counts both searches.
+fn capped_restart(
+    ws: &mut GlmmWorkspace,
+    fit: GlmmFit,
+    mut search: impl FnMut(&mut GlmmWorkspace, &StartValues) -> GlmmFit,
+) -> GlmmFit {
+    if fit.converged || !fit.deviance.is_finite() {
+        return fit;
+    }
+    let (n_theta, p) = (ws.n_theta, ws.p);
+    let restart = StartValues::new(
+        ws.params[n_theta..n_theta + p].to_vec(),
+        ws.params[..n_theta].to_vec(),
+    );
+    let (saved, nb_theta) = (SearchState::save(ws), ws.nb_theta);
+    let mut again = search(ws, &restart);
+    let spent = fit.n_eval + again.n_eval;
+    if again.converged || again.deviance < fit.deviance {
+        again.n_eval = spent;
+        return again;
+    }
+    saved.restore(ws);
+    ws.nb_theta = nb_theta;
+    ws.grad_hint_ready = false;
+    GlmmFit {
+        n_eval: spent,
+        ..fit
     }
 }
 

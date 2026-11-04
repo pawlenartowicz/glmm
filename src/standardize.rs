@@ -233,7 +233,16 @@ impl ColumnScaling {
             if self.flags[j] == 0 {
                 continue;
             }
-            let s = (ss / sw).sqrt();
+            let mut s = (ss / sw).sqrt();
+            let mut m = m;
+            // Past |x| ≈ 1.3e154 the sums overflow (or below ≈ 1e-154 the
+            // squares underflow): the two passes again on the column divided
+            // by its largest |xᵢⱼ|, so `mⱼ` and `sⱼ` are those of a column
+            // in [-1, 1], scaled back. A centered column has `mⱼ ≠ 0` unless
+            // its mean is exactly 0, where centering is a no-op either way.
+            if !(s > 0.0 && s.is_finite() && m.is_finite()) {
+                (m, s) = rescaled_spread(x, p, j, weights, sw, m != 0.0);
+            }
             if !(s > 0.0 && s.is_finite() && m.is_finite()) {
                 continue; // degenerate: as it is
             }
@@ -481,6 +490,43 @@ impl ColumnScaling {
         }
         2.0 * self.scale.iter().map(|s| s.ln()).sum::<f64>()
     }
+}
+
+/// Column `j`'s `(mⱼ, sⱼ)` from the column divided by its largest `|xᵢⱼ|`
+/// (`mⱼ = 0` unless `centered`), the fallback of [`ColumnScaling::compute`]
+/// where the direct sums are not finite or the spread underflows. `(NaN, NaN)`
+/// for an all-zero or non-finite column.
+fn rescaled_spread(
+    x: &[f64],
+    p: usize,
+    j: usize,
+    weights: Option<&[f64]>,
+    sw: f64,
+    centered: bool,
+) -> (f64, f64) {
+    let col = || x[j..].iter().step_by(p);
+    let big = col().fold(0.0f64, |m, &v| m.max(v.abs()));
+    if !(big > 0.0 && big.is_finite()) {
+        return (f64::NAN, f64::NAN);
+    }
+    let w = |i: usize| weights.map_or(1.0, |w| w[i]);
+    let mean = if centered {
+        col()
+            .enumerate()
+            .map(|(i, &v)| w(i) * (v / big))
+            .sum::<f64>()
+            / sw
+    } else {
+        0.0
+    };
+    let ss: f64 = col()
+        .enumerate()
+        .map(|(i, &v)| {
+            let d = v / big - mean;
+            w(i) * d * d
+        })
+        .sum();
+    (mean * big, (ss / sw).sqrt() * big)
 }
 
 #[cfg(test)]

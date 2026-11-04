@@ -245,6 +245,22 @@ refit's, referred to χ² on the term's df (the Wald row's `Df`).
   that did not converge nothing is refitted and every row is NaN. The notes
   are listed [below](#the-notes-a-table-can-carry).
 
+**Very large Poisson counts.** A reduced model keeps the random slope of a
+column it drops from the fixed part, so it has to carry that column's mean on
+its random effects: on the column's own random slope, or, with a large
+random-intercept standard deviation, on the intercept's random effect. On
+very large counts both are local minima, and a refit can stop in the higher
+one and report a converged fit above the reduced model's optimum, which makes
+the row's statistic too large. On one design, `y ~ 1 + x1 + x2 + (1 + x1 + x2
+| g)` with 20 groups of 10 rows and log-link counts at a log mean of 6, 10,
+14 and 18, the reduced refits that converged more than 0.1 deviance units
+above the lowest point found from several starts were 2 of 600, 6 of 600, 28
+of 600 and 31 of 80. Every likelihood-ratio row of a Poisson mixed model
+whose fitted counts average above e⁹ (about 8100) carries a note saying so.
+That threshold lies between the sets at log mean 6 and 10 and was not
+measured: smaller counts are not free of such refits, only rarer. To check a row, refit its reduced model from a large
+random-intercept standard deviation and compare the log-likelihoods.
+
 **When the refits are made: `anova_test`.** Every fit stores its Wald (or F)
 tables. `anova_test = "auto"` (the default) makes the likelihood-ratio tables
 the first time `anova()` needs them, which on a Poisson GLMM is `anova(m)`
@@ -890,6 +906,7 @@ A note about one row is printed after that row's label, for example
 | The `<rows>` tested coefficients span `<rank>` directions of their covariance; the F is on those `<rank>`. | a rank-deficient hypothesis |
 | A model refitted for this term's likelihood-ratio test did not converge, or its log-likelihood is not finite, so the statistic and its p-value are NaN. | a likelihood-ratio row whose refit did not converge, or whose log-likelihood is not finite |
 | The model refitted under the term's hypothesis reached a higher log-likelihood than the larger model of this row, by more than round-off: the larger model did not reach its optimum. The statistic is set to 0. | a likelihood-ratio row whose statistic came out below zero |
+| Counts this large make the likelihood sharp: the model refitted for this term may have stopped in a local minimum, which overstates the statistic. To check, refit that model from a large random-intercept standard deviation. | every likelihood-ratio row with a statistic, on a Poisson mixed model whose fitted counts average above e⁹ (about 8100) |
 | No model was refitted, so every likelihood-ratio statistic and p-value is NaN. | a likelihood-ratio table of a fit that did not converge (after the first note) |
 | The model under the hypothesis of `<term>` could not be built (the hypothesis is too ill-conditioned), so its statistic and its p-value are NaN. | a Type III likelihood-ratio row whose reduced design could not be built |
 | Conservative: the true p-value is usually smaller. | every 50:50 mixture reference |

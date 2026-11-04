@@ -98,6 +98,24 @@ test_that("anova(m) stops with the stored refusal, and the fit itself stands", {
   expect_error(anova(m), "internal error while building the per-term table", fixed = TRUE)
 })
 
+test_that("the likelihood-ratio rows of a Poisson GLMM on large counts carry a note", {
+  # Fitted counts averaging above e^9 note every row; small counts note none.
+  set.seed(312)
+  g <- factor(rep(1:12, each = 10))
+  x <- rnorm(120)
+  u <- rnorm(12, sd = 0.5)[as.integer(g)]
+  note <- paste("Counts this large make the likelihood sharp: the model refitted for this term may",
+                "have stopped in a local minimum, which overstates the statistic. To check, refit",
+                "that model from a large random-intercept standard deviation.")
+  big <- data.frame(n = rpois(120, exp(10 + 0.3 * x + u)), x = x, g = g)
+  small <- data.frame(n = rpois(120, exp(0.2 + 0.3 * x + u)), x = x, g = g)
+  expect_true(paste0("x: ", note) %in% attr(anova(fastglmm(n ~ x + (1 | g), big, family = poisson())),
+                                            "heading"))
+  expect_false(any(grepl("Counts this large", attr(anova(fastglmm(n ~ x + (1 | g), small,
+                                                                  family = poisson())), "heading"),
+                         fixed = TRUE)))
+})
+
 test_that("an aliased term's row note names its coefficient, never a column index", {
   # x2 copies x, so its column is aliased and its row is not tested.
   d <- anova_data()

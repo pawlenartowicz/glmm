@@ -93,6 +93,12 @@ pub enum LinearNote {
     /// model's fit, so that fit did not reach its own optimum. The statistic
     /// is set to 0 (p-value 1).
     NegativeStatistic,
+    /// The model is a Poisson mixed model whose fitted counts average above
+    /// e⁹ (about 8100). On counts that large the likelihood is sharp, and the
+    /// model refitted for a likelihood-ratio row can stop in a local minimum
+    /// above its optimum, which overstates the statistic. The row's numbers
+    /// are kept; the per-term tests' documentation gives the measured rates.
+    LargePoissonCounts,
 }
 
 /// The Wald χ² of `Lβ = 0`: `W = (Lβ̂)ᵀ (L V Lᵀ)⁺ (Lβ̂)` on

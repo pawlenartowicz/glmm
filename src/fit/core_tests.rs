@@ -3432,6 +3432,73 @@ fn a_hand_over_with_no_result_reports_the_gradient_incumbent() {
     }
 }
 
+/// The gradient search's endpoint on `sim_poisson_precise_e30`'s refit
+/// without x2, where BFGS stops on its noise floor before the final BOBYQA
+/// polish. Recorded from glmm's own trace on x86_64 Linux, 2026-11-03.
+#[cfg(target_arch = "x86_64")]
+const PRECISE_E30_BFGS_ENDPOINT: f64 = 1351.5310966;
+
+/// A gradient search whose final BOBYQA polish ends with no result keeps its
+/// endpoint as a capped endpoint, not NaN, and the fit is searched once more
+/// from it (`capped_restart`), which converges at or below it. The model is
+/// the likelihood-ratio refit that drops x2 from the fixed part and keeps its
+/// slope, on counts about 1e13 (`sim_poisson_precise_e30.csv`, written by
+/// `validation/tools/prep/gen_precise_e30_data.py`), started as that refit is.
+/// BFGS stops on its noise floor; the polish then stops within the radius of
+/// a point whose deviance was not finite, so its result is refused. Without
+/// the restart the fit ends there, capped; with a NaN endpoint there is
+/// nothing to restart from and the fit stays NaN. That point is round-off,
+/// so what follows from it is asserted on the platform it was measured on.
+#[test]
+fn a_polish_with_no_result_restarts_from_the_gradient_endpoint() {
+    #[cfg(target_arch = "x86_64")]
+    use crate::Boundary;
+    use crate::StartValues;
+    let (x, y, n, p, model, ids) = precise_fixture(include_str!(
+        "../../validation/data/simulated/sim_poisson_precise_e30.csv"
+    ));
+    let opts = FitOptions::default();
+    let data = Data::new(&x, &y, n, p);
+    let mut ws = build_workspace(&model, &ids, n, p, &opts);
+    let view = fit_on(&mut ws, &data, None, &opts);
+    let theta = view.theta().to_vec();
+    let full = view.into_fit(&data, &model, &opts);
+    assert!(full.converged());
+
+    let x_red: Vec<f64> = x.chunks_exact(p).flat_map(|r| [r[0], r[1]]).collect();
+    let z: Vec<f64> = x.chunks_exact(p).map(|r| r[2]).collect();
+    let data_red = Data::new(&x_red, &y, n, 2).re_columns(&z, 1);
+    let mut opts_red = opts.clone();
+    opts_red.se_for = SeFor::Only(vec![]);
+    opts_red.wald_se = crate::WaldSe::Rx;
+    let start = StartValues::new(vec![full.beta[0], full.beta[1]], theta);
+    // x2 leaves the fixed part; its slope reads it as the random-effect-only
+    // column (slope index 2 = p_red + 0), so the slopes stay `[1, 2]`.
+    let mut ws_red = build_workspace(&model, &ids, n, 2, &opts_red);
+    let fit = fit_on(&mut ws_red, &data_red, Some(&start), &opts_red)
+        .into_fit(&data_red, &model, &opts_red);
+
+    assert!(fit.deviance.is_finite(), "deviance {}", fit.deviance);
+    assert!(
+        fit.beta.iter().all(|b| b.is_finite()),
+        "beta {:?}",
+        fit.beta
+    );
+    #[cfg(target_arch = "x86_64")]
+    {
+        assert!(
+            fit.converged(),
+            "the restart from the endpoint did not converge"
+        );
+        assert_ne!(fit.diagnostics.boundary, Boundary::NoOptimum);
+        assert!(
+            fit.deviance <= PRECISE_E30_BFGS_ENDPOINT,
+            "deviance {} above the gradient endpoint",
+            fit.deviance
+        );
+    }
+}
+
 /// Each diagonal of each block, in `Diagnostics::pinned` order: (its pin
 /// flag, its caller-scale θ, `√(tau2 / σ̂²)` with σ̂² the Gaussian residual
 /// variance and 1 on the other families).
@@ -3736,16 +3803,20 @@ fn undone_pin_of_a_polished_endpoint_keeps_the_polish_and_its_zero() {
 /// converged: that point is not a minimum. On the precise two-slope fixture,
 /// with the iteration cap cut to 200, the gradient search hands over to the
 /// θ-only stage-1 search, which has a solver of its own, so the joint solver
-/// runs only the trough polishes. Its budget is cut to 90 evaluations, short
-/// of what the polish takes (measured: every budget from 20 to 129 on aarch64 macOS and x86_64 Linux, to 113 on
-/// wasm32-wasip1 and to 112 with simd128, leaves the fit not converged, and
-/// with the polish's budget exit removed each of those fits converges, so no
-/// other search runs out). The budget also scales BOBYQA's restart cycle, so
-/// `n_eval` is not monotone in it. The premise is checked, not assumed: from
-/// budget 89 to 90 `n_eval` grows by exactly one, so exactly one search, the
-/// polish, ran to the budget at both (two would add two; a converged polish,
-/// none). A search whose need equals its budget also stops there, so the
-/// step is taken below the tested budget, not above it.
+/// runs only the polishes. A fit whose search runs out is searched once more
+/// from its endpoint (`capped_restart`), on the same joint solver, so the
+/// budget is cut to 58 evaluations, short of what the first search's polish
+/// and the restart's polish take (measured on x86_64 Linux, aarch64 macOS and
+/// wasm32-wasip1, plain and with simd128: every budget from 21 to 74 leaves
+/// the fit not converged; from 75 to 83, by platform, the restart's polish
+/// fits in the budget and the fit converges). The budget also scales BOBYQA's
+/// restart cycle, so `n_eval` is not monotone in it. The premise is checked,
+/// not assumed: from budget 57 to 58 `n_eval` grows by exactly two on all
+/// four, so
+/// exactly two searches, the two polishes, ran to the budget at both (one
+/// would add one; a converged restart, which `n_eval` also counts, would not
+/// leave the fit capped). A search whose need equals its budget also stops
+/// there, so the step is taken below the tested budget, not above it.
 #[test]
 fn polish_out_of_budget_is_not_converged() {
     let (x, y, n, p, model, ids) = precise_two_zero_slopes_fixture();
@@ -3765,12 +3836,12 @@ fn polish_out_of_budget_is_not_converged() {
         g.grad_cfg.max_iter = 200;
         fit_on(&mut ws, &data, None, &opts).into_fit(&data, &model, &opts)
     };
-    let one_less = fit_at(89);
-    let capped = fit_at(90);
+    let one_less = fit_at(57);
+    let capped = fit_at(58);
     assert_eq!(
         capped.n_eval,
-        one_less.n_eval + 1,
-        "not exactly one search ran to the budget"
+        one_less.n_eval + 2,
+        "not exactly two searches ran to the budget"
     );
     assert!(
         !capped.converged(),
@@ -3778,4 +3849,112 @@ fn polish_out_of_budget_is_not_converged() {
     );
     assert!(capped.deviance.is_finite());
     assert!(capped.diagnostics.pinned.is_empty());
+}
+
+// --- predictor columns past the f64 square-root range ---
+
+/// A predictor column at values of 1e154 and above, where its sum of squares
+/// overflows, fits as the same column at scale 1: the alias check keeps it,
+/// and the fit gives the scale-1 log-likelihood, flags and notes with its
+/// coefficient divided by the scale. GLM and GLMM `(1 | g)`, on logit,
+/// Poisson, negative binomial and a separated logit, which keeps its
+/// `Separated` note. n = 60, `x = scale·t` with `t` on a fixed irregular grid
+/// in [-0.5, 0.5], six groups.
+#[test]
+fn a_predictor_past_1e154_fits_as_at_scale_1() {
+    use crate::{NegBinomialLink, Note, PoissonLink};
+    let n = 60usize;
+    let t: Vec<f64> = (0..n)
+        .map(|i| (i as f64 * 0.618_033_988_749_895).fract() - 0.5)
+        .collect();
+    let bin: Vec<f64> = (0..n)
+        .map(|i| {
+            let p = 1.0 / (1.0 + (-(0.3 + 1.5 * t[i])).exp());
+            f64::from((i as f64 * 0.754_877_666).fract() < p)
+        })
+        .collect();
+    let sep: Vec<f64> = t.iter().map(|&v| f64::from(v > 0.0)).collect();
+    let cnt: Vec<f64> = (0..n)
+        .map(|i| ((0.3 + 1.5 * t[i]).exp() * 3.0 + (i % 3) as f64).round())
+        .collect();
+    let logit = Family::Binomial {
+        link: BinomialLink::Logit,
+    };
+    let cases = [
+        ("logit", logit, &bin),
+        ("separated logit", logit, &sep),
+        (
+            "poisson",
+            Family::Poisson {
+                link: PoissonLink::Log,
+            },
+            &cnt,
+        ),
+        (
+            "nb",
+            Family::NegativeBinomial {
+                link: NegBinomialLink::Log,
+            },
+            &cnt,
+        ),
+    ];
+    let ids = GroupIds {
+        primary: (0..n).map(|i| (i % 6) as u32).collect(),
+        extra: vec![],
+    };
+    let intercept = ReStructure {
+        terms: Vec::new(),
+        slopes: vec![],
+        extra_groupings: vec![],
+    };
+    let opts = FitOptions::default();
+    // NaN on both sides where the fit has no value (a separated GLM's loglik).
+    let close =
+        |a: f64, b: f64| (a - b).abs() <= 1e-9 * b.abs().max(1.0) || (a.is_nan() && b.is_nan());
+    let mut ran = 0;
+    for (name, family, y) in cases {
+        for re in [None, Some(intercept.clone())] {
+            let tag = format!("{name} {}", if re.is_some() { "GLMM" } else { "GLM" });
+            let model = ModelSpec { family, re };
+            let fit_at = |s: f64| {
+                let x: Vec<f64> = t.iter().flat_map(|&v| [1.0, s * v]).collect();
+                fit_cold(&x, y, n, 2, &model, &ids, &opts)
+            };
+            let base = fit_at(1.0);
+            let separated = |f: &crate::Fit| {
+                f.diagnostics
+                    .notes
+                    .iter()
+                    .any(|m| matches!(m, Note::Separated))
+            };
+            assert_eq!(separated(&base), name == "separated logit", "{tag}");
+            for s in [1e154, 1e200, 1e300] {
+                let f = fit_at(s);
+                let ctx = format!("{tag} at {s:e}");
+                assert_eq!(f.aliased(), [false, false], "{ctx}");
+                assert_eq!(f.converged(), base.converged(), "{ctx}");
+                assert_eq!(separated(&f), separated(&base), "{ctx}");
+                assert!(
+                    close(f.loglik, base.loglik),
+                    "{ctx}: loglik {} vs {}",
+                    f.loglik,
+                    base.loglik
+                );
+                assert!(
+                    close(f.beta[0], base.beta[0]),
+                    "{ctx}: beta {:?} vs {:?}",
+                    f.beta,
+                    base.beta
+                );
+                assert!(
+                    close(f.beta[1] * s, base.beta[1]),
+                    "{ctx}: beta {:?} vs {:?}",
+                    f.beta,
+                    base.beta
+                );
+                ran += 1;
+            }
+        }
+    }
+    assert_eq!(ran, 24);
 }

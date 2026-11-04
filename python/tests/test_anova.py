@@ -272,6 +272,26 @@ def test_wald_gives_the_stored_wald_table_whatever_the_fit_stored(pois):
     np.testing.assert_array_equal(wald.beta, plain.beta)
 
 
+_LARGE_COUNTS = (
+    "Counts this large make the likelihood sharp: the model refitted for this term may have "
+    "stopped in a local minimum, which overstates the statistic. To check, refit that model "
+    "from a large random-intercept standard deviation."
+)
+
+
+def test_large_poisson_counts_note_the_likelihood_ratio_rows(pois):
+    """Fitted counts averaging above e^9 put the note on every likelihood-ratio row; the
+    small counts of `pois` put it on none."""
+    big = np.random.default_rng(33).poisson(np.exp(10.0 + 0.3 * _X + 0.5 * _U[_G]))
+    m = quiet_fit(_POIS, _data(n=big.astype(float).tolist()), family="poisson")
+    for ss in ("III", "II"):
+        tab = glmm.anova(m, type=ss)
+        lines = tab.text().splitlines()
+        for label in tab.row_names:
+            assert f"{label}: {_LARGE_COUNTS}" in lines
+        assert _LARGE_COUNTS not in glmm.anova(pois[0], type=ss).text()
+
+
 def test_auto_gives_a_poisson_glmm_the_likelihood_ratio_table(pois):
     plain, asked = pois
     assert plain.term_test_auto == {"test": "lrt", "reason": "poisson_mixed"}

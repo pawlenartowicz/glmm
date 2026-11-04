@@ -293,7 +293,8 @@ jobs:
   build-pyodide:
     name: Build Pyodide wheel (GitHub release only)
     needs: [verify, version-check]
-    runs-on: ubuntu-latest
+    # Pinned: setup-python has no 3.14.2 build for Ubuntu 26.04 (ubuntu-latest).
+    runs-on: ubuntu-24.04
     permissions:
       contents: write   # softprops/action-gh-release attaches the wheel
     env:
