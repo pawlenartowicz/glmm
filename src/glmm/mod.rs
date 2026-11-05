@@ -2915,8 +2915,29 @@ pub fn fit_glmm(
     // from the `far` plateau the route can restart and end higher than the
     // endpoint it was handed (5 of the 31 capped precise-count refits at
     // e¹⁴, up to 41 units higher, 2026-11-03).
+    // The drop must also clear the deviance's own rounding
+    // (`deviance_rounding`), read at the route's last evaluation, which on a
+    // converged route sits at the incumbent: on a precision-limited fit the two
+    // values differ by rounding alone. Poisson counts near `e³³` with a crossed
+    // factor, deviance 562: the endpoint was 0.016 (native) and 0.042 (wasm
+    // simd128) lower against a rounding estimate of 0.34 and a band of 5.6e-7,
+    // and the hand-over reported a capped fit on one platform only.
     let (ok, budget_exhausted, inc_obj) = match grad_incumbent {
-        Some((m, f)) if !ok || f < inc_obj - joint_recheck_band(inc_obj) => {
+        Some((m, f))
+            if !ok
+                || f < inc_obj
+                    - joint_recheck_band(inc_obj).max(deviance_rounding(
+                        inc_obj,
+                        extra_ztwz_trace(
+                            &pirls.w[..n],
+                            groupings,
+                            *layout,
+                            structured,
+                            pattern,
+                            packed,
+                        ),
+                    )) =>
+        {
             let (point, modes) = ws.grad_scratch[m + nb_col..].split_at(m);
             ws.params[..m].copy_from_slice(point);
             ws.u_seed[..k].copy_from_slice(modes);
@@ -3551,8 +3572,17 @@ pub fn fit_glmm(
     }
     // Read before the SE pass: its evaluations overwrite the final re-eval's
     // weights and `M` rows that `extra_ztwz_trace` reads.
-    let precision_limited =
-        f64::EPSILON * (final_deviance.abs() + extra_ztwz_trace(ws, n)) > DEVIANCE_FLOOR_MAX;
+    let precision_limited = deviance_rounding(
+        final_deviance,
+        extra_ztwz_trace(
+            &ws.pirls.w[..n],
+            &ws.groupings,
+            ws.layout,
+            &ws.structured,
+            &ws.pattern,
+            &ws.packed,
+        ),
+    ) > DEVIANCE_FLOOR_MAX;
 
     for j in 0..p {
         ws.betas[j] = ws.params[n_theta + j];
@@ -3822,24 +3852,40 @@ fn any_within(points: &[f64], x: &[f64], radius: f64) -> bool {
     })
 }
 
+/// Estimated rounding error, in deviance units, of a Laplace deviance `f`
+/// whose extra-factor columns have `M'WM` trace `tr_x` ([`extra_ztwz_trace`]):
+/// `ε·(|f| + tr_x)`. [`DEVIANCE_FLOOR_MAX`] derives both terms and sets the
+/// `Note::PrecisionLimited` threshold on it.
+fn deviance_rounding(f: f64, tr_x: f64) -> f64 {
+    f64::EPSILON * (f.abs() + tr_x)
+}
+
 /// `Σᵢ wᵢ·‖mᵢˣ‖²`, the trace of `M'WM` over the columns of the extra grouping
 /// factors (`mᵢˣ` is row i of `M = ZΛ` without the primary factor's entries),
-/// at the point the last Laplace evaluation solved: the weights in
-/// `ws.pirls.w`, `M` in the layout's packed rows. A pinned factor's entries are
-/// 0 there. 0 on the blocked layout, which has no extra factor. Read by
-/// `fit_glmm` against [`DEVIANCE_FLOOR_MAX`].
-fn extra_ztwz_trace(ws: &GlmmWorkspace, n: usize) -> f64 {
-    let w = &ws.pirls.w[..n];
+/// at the point the last Laplace evaluation solved: the weights `w` (length
+/// n, `GlmmWorkspace::pirls`), `M` in the layout's packed rows. A pinned
+/// factor's entries are 0 there. 0 on the blocked layout, which has no extra
+/// factor. Takes the workspace's fields rather than the workspace, so
+/// `fit_glmm` can read it while its fields are borrowed apart.
+fn extra_ztwz_trace(
+    w: &[f64],
+    groupings: &crate::lmm::LmmGroupings,
+    layout: GlmmLayout,
+    structured: &workspace::StructuredScratch<f64>,
+    pattern: &workspace::StructuredPattern,
+    packed: &workspace::PackedScratch,
+) -> f64 {
+    let n = w.len();
     let sq = |v: &[f64]| v.iter().map(|x| x * x).sum::<f64>();
-    let q_p = ws.groupings.primary_q;
-    match ws.layout {
+    let q_p = groupings.primary_q;
+    match layout {
         GlmmLayout::Blocked => 0.0,
         // `m_core_buf` rows are `[primary | nested]`; row `i`'s `n_cross[i]`
         // crossed entries take the first slots of `cross_theta`
         // (`StructuredScratch`).
         GlmmLayout::Structured => {
-            let qc = q_p + ws.groupings.nested_per_parent;
-            let (st, nc) = (&ws.structured, &ws.pattern.n_cross);
+            let qc = q_p + groupings.nested_per_parent;
+            let (st, nc) = (structured, &pattern.n_cross);
             (0..n)
                 .map(|i| {
                     let nested = &st.m_core_buf[i * qc + q_p..(i + 1) * qc];
@@ -3851,9 +3897,9 @@ fn extra_ztwz_trace(ws: &GlmmWorkspace, n: usize) -> f64 {
         // Each `m_vals` row is the primary's `q_p` entries, then the extras'
         // (`fill_packed_cols`).
         GlmmLayout::Packed => {
-            let width = ws.packed.width;
+            let width = packed.width;
             (0..n)
-                .map(|i| w[i] * sq(&ws.packed.m_vals[i * width + q_p..(i + 1) * width]))
+                .map(|i| w[i] * sq(&packed.m_vals[i * width + q_p..(i + 1) * width]))
                 .sum()
         }
     }
