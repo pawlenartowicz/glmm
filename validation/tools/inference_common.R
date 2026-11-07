@@ -36,7 +36,7 @@
 INFERENCE_THREAD_VARS <- c("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS",
                            "MKL_NUM_THREADS", "FLEXIBLAS_NUM_THREADS")
 INFERENCE_PKGS <- c("lmerTest", "RLRsim", "car", "numDeriv", "MASS", "jsonlite")
-INFERENCE_KINDS <- c("lmertest", "rlrt", "anova", "predict", "posthoc", "effectsize", "profile")
+INFERENCE_KINDS <- c("lmertest", "rlrt", "anova", "predict", "posthoc", "effectsize", "profile", "cr2")
 
 # This file's own directory (validation/tools), recorded while source() runs it,
 # by the same sys.frame(i)$ofile walk as grid/runs.R::runs_script_dir. The

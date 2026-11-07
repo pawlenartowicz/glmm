@@ -1,9 +1,9 @@
 [package]
 name = "validation"
-# Lockstep with the crate: must equal GLMM/Cargo.toml [package] version.
+# Lockstep with the crate: must equal GLMM/glmm-rs/Cargo.toml [package] version.
 # grid/engines/glmm.rs stamps CARGO_PKG_VERSION into each result record's
 # engine_version, and that macro reads THIS manifest, not glmm's.
-version = "0.8.0"
+version = "0.9.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -20,9 +20,9 @@ publish = false
 # `run_compare`). Both are enabled here on the dep rather than per-example
 # `required-features` so every example always builds (and stays under the
 # workspace clippy deny gate) in `cargo clippy --workspace --all-targets`; the
-# workspace members glmm-python and glmm-r turn `orchestrate` on already.
+# workspace members glmm-py and glmm-r/rust turn `orchestrate` on already.
 [dependencies]
-glmm = { path = "..", features = ["formula", "orchestrate"] }
+glmm = { path = "../glmm-rs", features = ["formula", "orchestrate"] }
 
 # Dev-only pass-through of the kernel's optimizer counters, for the speed
 # grid's counter pass. OFF by default: the counters perturb wall time

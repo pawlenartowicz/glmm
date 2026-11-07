@@ -66,7 +66,7 @@ mixed models go through PIRLS with Laplace/AGQ
   [`conventions.md`](conventions.md#prior-weights)). The estimate-vs-fixed
   directive lives in `FitOptions`, not in the family.
 - **NegativeBinomial** dispersion `θ` is estimated by an outer loop
-  (`fit_glm_nb` / `fit_glmm_nb`) and threaded explicitly through the variance
+  (`fit_glm_nb` / `run_glmm_nb_on`) and threaded explicitly through the variance
   function `V(μ) = μ + μ²/θ`.
 - **InverseGaussian** (`V(μ) = μ³`) is GLM-only: mixed models fault at the
   model-shape gate because the profiled `inverse.gaussian()$aic` objective

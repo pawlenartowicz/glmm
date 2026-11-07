@@ -11,7 +11,7 @@
 use glmm::formula::{lower, Column, Lowered, ReGroupInfo, Table};
 use glmm::{
     BinomialLink, Family, Fit, FitOptions, GammaLink, InverseGaussianLink, NegBinomialLink,
-    PoissonLink, WaldSe,
+    PoissonLink, WaldSe, WeightPower,
 };
 use serde_json::{json, Value};
 use std::time::Instant;
@@ -124,6 +124,8 @@ pub fn lower_grid_cell(cell: &Value, grid_dir: &str) -> (Lowered, FitOptions, bo
         lo.offset = Some(rows.iter().map(|r| r[j].parse().unwrap()).collect());
     }
     let mut fit_opts = FitOptions::default();
+    // The weighted cells check the weights as given against the oracles.
+    fit_opts.weight_power = Some(WeightPower::Fixed(1.0));
     if let Some(k) = cell["nagq"].as_u64() {
         fit_opts.nagq = k as u8;
     }

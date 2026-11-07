@@ -185,8 +185,8 @@ fit <- function(data, m, weights, anova_test = "auto") {
     fastglmm(f, data, fam, nAGQ = m$nagq, REML = m$reml, anova_test = anova_test)
   } else {
     data$validation_wts <- weights
-    fastglmm(f, data, fam, weights = validation_wts, nAGQ = m$nagq, REML = m$reml,
-             anova_test = anova_test)
+    fastglmm(f, data, fam, weights = validation_wts, weight_power = 1, nAGQ = m$nagq,
+             REML = m$reml, anova_test = anova_test)
   }
 }
 
@@ -205,7 +205,7 @@ compare_call <- function(call, data, m, weights, nobs = FALSE) {
       compare(data, f0, f1, family = fam, nAGQ = k)
     } else {
       data$validation_wts <- weights
-      compare(data, f0, f1, family = fam, weights = validation_wts, nAGQ = k)
+      compare(data, f0, f1, family = fam, weights = validation_wts, weight_power = 1, nAGQ = k)
     }
   }, error = function(e) e)
   if (inherits(cmp, "error")) return(refused(call, cmp))

@@ -40,12 +40,12 @@ PATCH_FILE="$SELF/pulp-0.22.2-scalar-force.patch"
 PULP_VERSION="0.22.2"
 
 [[ -f "$PATCH_FILE" ]] || { echo "missing patch file: $PATCH_FILE" >&2; exit 2; }
-[[ -f "$CRATE_ROOT/Cargo.toml" ]] || { echo "cannot find crate root from $SELF" >&2; exit 2; }
+[[ -f "$CRATE_ROOT/glmm-rs/Cargo.toml" ]] || { echo "cannot find crate root from $SELF" >&2; exit 2; }
 git -C "$CRATE_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
   || { echo "$CRATE_ROOT is not a git checkout: the tracked grid data cannot be listed" >&2; exit 2; }
 
 # Default test filter: the sparse NB fit tests, the crate's most
-# lane-width-sensitive pin (per its own doc comment in src/sparse/tests.rs).
+# lane-width-sensitive pin (per its own doc comment in glmm-rs/src/sparse/tests.rs).
 # Override with positional args.
 DEFAULT_FILTERS=(fit_sparse_nb_glmm_is_pinned sparse_weighted_nb_matches_replicated)
 if [[ $# -gt 0 ]]; then
@@ -96,8 +96,8 @@ echo "== copying crate source into scratch =="
 # regenerable, and SCRATCH defaults to a tmpfs, so the copies must stay small.
 # The git-tracked files under grid/data (a few MB, among them the CSVs the lib
 # tests embed with include_str!) are copied back in before the duplication.
-RSYNC_EXCLUDES=(--exclude=/target --exclude=/python/venv --exclude=/python/build
-                --exclude=/python/*.egg-info --exclude=/python/.pytest_cache
+RSYNC_EXCLUDES=(--exclude=/target --exclude=/glmm-py/venv --exclude=/glmm-py/build
+                --exclude=/glmm-py/*.egg-info --exclude=/glmm-py/.pytest_cache
                 --exclude=.DS_Store --exclude=/validation/tools/memory/results
                 --exclude=/validation/tools/lanewidth/results
                 --exclude=/validation/grid/data --exclude=/.git)
@@ -135,7 +135,7 @@ grep -q "LANEWIDTH-HARNESS" "$VENDOR_DIR/src/aarch64.rs" "$VENDOR_DIR/src/x86.rs
 # [patch.crates-io] with a path override — not cargo vendor's full
 # source-replacement config — so only pulp is redirected; every other
 # dependency still resolves normally. This table is appended to the scratch
-# copy's Cargo.toml and is NEVER written to the real tree.
+# copy's workspace-root Cargo.toml and is NEVER written to the real tree.
 cat >> "$SCRATCH/scalar/Cargo.toml" <<EOF
 
 [patch.crates-io]
@@ -148,12 +148,12 @@ EOF
 # example into BOTH scratch copies (never into the real tree). It prints
 # pulp::Arch::new()'s Debug repr (the printed-dispatch-marker acceptance
 # evidence) and refits the same sparse NB design as
-# `fit_sparse_nb_glmm_is_pinned` (src/sparse/tests.rs), so a `diff` of the
+# `fit_sparse_nb_glmm_is_pinned` (glmm-rs/src/sparse/tests.rs), so a `diff` of the
 # two probe outputs shows the actual numeric movement this harness exists
 # to measure — see README.md for a worked example.
 for tree in normal scalar; do
-  mkdir -p "$SCRATCH/$tree/examples"
-  cp "$SELF/lanewidth_probe.rs" "$SCRATCH/$tree/examples/lanewidth_probe.rs"
+  mkdir -p "$SCRATCH/$tree/glmm-rs/examples"
+  cp "$SELF/lanewidth_probe.rs" "$SCRATCH/$tree/glmm-rs/examples/lanewidth_probe.rs"
 done
 
 # --release: the crate's own code (not just its dependencies) is only

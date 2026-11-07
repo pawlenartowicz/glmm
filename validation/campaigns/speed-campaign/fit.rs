@@ -12,7 +12,7 @@
 use std::io::Write;
 use std::time::Instant;
 
-use glmm::FitOptions;
+use glmm::{FitOptions, WeightPower};
 use serde_json::{json, Value};
 
 #[path = "../../tools/common.rs"]
@@ -213,6 +213,8 @@ fn fit_cell(cell: &Value, data_dir: &str, user_tag: &str, budget: f64) -> Value 
     // absent on every other cell (shipped/eval-efficiency manifests included),
     // where this is a no-op leaving `FitOptions::nagq`'s default (1 = Laplace).
     let mut fit_opts = FitOptions::default();
+    // The weighted cells time the weights as given, as the oracles fit them.
+    fit_opts.weight_power = Some(WeightPower::Fixed(1.0));
     if let Some(k) = cell["nagq"].as_u64() {
         fit_opts.nagq = k as u8;
     }

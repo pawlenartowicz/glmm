@@ -125,6 +125,7 @@ do_fit <- function(data, formula, family, wald_se, nagq, reml, satterthwaite = T
   # the arm exists so one would not silently drop the other's column.
   # `reml` is FALSE on a cell tagged `ml` and NULL (the default) otherwise.
   # `satterthwaite` is FALSE only for the timed samples (see the caller).
+  # weight_power = 1: the weighted cells check the weights as given.
   # anova_test = "Wald" by default: the grid reads no likelihood-ratio table.
   # Pipeline mode passes "auto", the user's default, which makes none either
   # until anova() asks.
@@ -135,11 +136,11 @@ do_fit <- function(data, formula, family, wald_se, nagq, reml, satterthwaite = T
   has_o <- "validation_off" %in% names(data)
   suppressWarnings(
     if (has_w && has_o)
-      fastglmm(formula, data, family, weights = validation_wts,
+      fastglmm(formula, data, family, weights = validation_wts, weight_power = 1,
                offset = validation_off, wald.se = wald_se, nAGQ = nagq, REML = reml,
                satterthwaite = satterthwaite, anova_test = anova_test)
     else if (has_w)
-      fastglmm(formula, data, family, weights = validation_wts,
+      fastglmm(formula, data, family, weights = validation_wts, weight_power = 1,
                wald.se = wald_se, nAGQ = nagq, REML = reml,
                satterthwaite = satterthwaite, anova_test = anova_test)
     else if (has_o)

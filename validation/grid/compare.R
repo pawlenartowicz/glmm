@@ -323,6 +323,15 @@ port_gate <- function(grid_dir, rust, engine) {
     a <- rust$recs[[name]]; b <- pr$recs[[name]]
     if (is.null(b)) next
     compared <- compared + 1L
+    # A timeout or an engine-fail carries an empty beta: nothing to compare, and
+    # the number columns would stop on it. The cell fails by name, as in gate 2.
+    if (!length(a$beta) || !length(b$beta)) {
+      st <- function(r) if (is.null(r$status)) "-" else r$status
+      cat(sprintf("%-34s  FAIL: no fit (glmm status=%s, %s status=%s)\n",
+                  name, st(a), engine, st(b)))
+      any_fail <<- TRUE
+      next
+    }
     band <- tol_for(name, "port_rel")
     gate <- function(d, absent = FALSE) if (absent) "n/a" else mark(d, band)
 

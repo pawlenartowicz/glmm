@@ -34,13 +34,13 @@ behind the Rust crate, the Python package (`glmm`) and the R package
 cargo add glmm
 ```
 
-**Python** (`glmm`): [Python README](python/README.md)
+**Python** (`glmm`): [Python README](glmm-py/README.md)
 
 ```bash
 pip install glmm
 ```
 
-**R** (`fastglmm`): [R README](r/README.md)
+**R** (`fastglmm`): [R README](glmm-r/README.md)
 
 ```r
 install.packages("fastglmm", repos = c("https://pawlenartowicz.r-universe.dev", getOption("repos")))

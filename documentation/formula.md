@@ -14,6 +14,7 @@ term.
 | Construct | Meaning | Example |
 |---|---|---|
 | Bare column name | A fixed-effect main effect | `x1` |
+| Column names with dots | Names follow R's syntactic-name rule: a letter, `_`, or a `.` not followed by a digit, then letters, digits, `_` or `.` | `age.years`, `(1 \| school.id)` |
 | `+` | Add another term | `x1 + x2` |
 | `:` | Interaction only (no main effects added) | `x1:x2` |
 | `*` | Desugars to main effects + interaction | `x1*x2` → `x1 + x2 + x1:x2` |

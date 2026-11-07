@@ -60,7 +60,7 @@ extra level.) On the non-Gaussian side `classify_design`'s answer selects the
 flowchart TD
   A["family, re: Some"] --> C{family}
   C -->|"Binomial / Poisson / Gamma"| E["glmm::fit_glmm"]
-  C -->|NegativeBinomial| F["fit_glmm_nb"]
+  C -->|NegativeBinomial| F["run_glmm_nb_on"]
   E --> L{"GlmmLayout::for_design"}
   F --> L
   L -->|"NoZ, no extras"| M["blocked"]
@@ -1022,7 +1022,7 @@ No layout materializes a dense `Z`. `GlmmLayout::for_design` reads
 
 The outer search, the NB coordinate search, the SE dispatch and the
 diagnostics are one code path over all three layouts: `fit_glmm` and
-`fit_glmm_nb` never branch on which layout a fit took, only
+`run_glmm_nb_on` never branch on which layout a fit took, only
 `GlmmLayout::for_design` does. The packed layout has no dual kernel — its
 PIRLS is `f64`-only — but its derivatives come from the assembled engine,
 which rebuilds `M`, `η`, `W` and the dense `A` at `Dual<N>` around û's
@@ -1044,7 +1044,7 @@ references in `sim_sparse_gamma_tmb` / `sim_sparse_nb_tmb`).
 
 ## Negative-Binomial outer θ-loop
 
-**Code:** `fit_glmm_nb` (`src/fit/glmm.rs`); the marginal-θ objective term
+**Code:** `run_glmm_nb_on` (`src/fit/glmm.rs`); the marginal-θ objective term
 `nb_profile_loglik` and caps `NB_THETA_LO = 1e-3`, `NB_THETA_HI = 1e4` in
 `src/fit/glm.rs`.
 
@@ -1054,7 +1054,7 @@ far more symmetric in `ln θ` than in θ), `logL_marginal = −½·deviance +
 nb_profile_loglik(y, y, θ)`, where the second term is the NB saturated-reference
 log-likelihood on the same (weighted) scale.
 
-**`fit_glmm_nb`.** `ln θ_NB` is one more trailing coordinate of the outer
+**`run_glmm_nb_on`.** `ln θ_NB` is one more trailing coordinate of the outer
 BOBYQA — `[θ_RE | ln θ_NB]` on the θ-only stage, `[θ_RE | β | ln θ_NB]` on the
 joint one — minimizing `deviance − 2·nb_profile_loglik(y, y, θ_NB, w)`, which is
 `logL_marginal` times −2 and so has the same optimum. β, θ_RE and θ_NB come out

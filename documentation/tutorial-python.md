@@ -128,6 +128,19 @@ fit = glmm.fit(data, "s ~ x1 + (1 | group)", "binomial", link="probit", nagq=7)
   [`conventions.md`](conventions.md#prior-weights)). For an aggregated
   binomial, `y` is the success *proportion* and `weights` the trial count
   (lme4's `cbind(s, m−s)`).
+- `weight_power`: on a Gaussian model, how far the fit trusts `weights`:
+  row `i` has variance `σ²·wᵢ^(−weight_power)`. `1` takes the weights as
+  given, `0` ignores them, `"estimate"` fits the power by REML (by ML with
+  `reml=False`) and refits at it. `None` (default) estimates it on a weighted
+  Gaussian REML fit with one grouping factor or none, at least 20 rows and
+  weights not all equal, and takes the weights as given everywhere else.
+  `m.weight_power` reports the power used and `m.estimated_weight_power` whether it was estimated. See
+  [`conventions.md`](conventions.md#weight-power-and-robust-standard-errors), which lists its limits.
+- `se_type`: `"model"` or `"robust"` (CR2 with Pustejovsky-Tipton df with a
+  grouping factor, HC2 with Bell-McCaffrey df without one), the one standard
+  error the fit reports. `None` (default) is `"robust"` on a fit that
+  estimates the weight power by REML with no random slope, `"model"`
+  everywhere else. `m.se_type` reports it.
 - `offset` — per-row known additive term on the linear-predictor scale, R's
   `offset=`: `eta = offset + X*beta (+ Z*b)`, with no coefficient estimated
   for it and no column added to the design. The canonical use is a Poisson
@@ -182,7 +195,8 @@ them). It is returned by `fit`, never constructed by callers.
 | `se` | `(p,)` standard errors; `NaN` where unavailable |
 | `coef_df` | `(p,)` degrees of freedom of each coefficient's t test: lmerTest's Satterthwaite df on a Gaussian mixed model, `n − p` on OLS and on a gamma or inverse-gaussian GLM with φ estimated; `NaN` where the test is z, on aliased columns, and on an OLS or dispersion-GLM fit that did not converge. Not `df`, which is the AIC parameter count |
 | `coef_p` | `(p,)` two-sided p-value of that t test, computed by the kernel; `NaN` where there is no df |
-| `df_method` | where `coef_df` comes from: `"satterthwaite"`, `"residual"` (OLS and the dispersion GLMs), `"none"` (the families with no df: z), `"disabled"` (a Gaussian mixed model fitted with `satterthwaite=False`: z) or `"failed"` (its Satterthwaite pass failed: z, with a `SatterthwaiteCurvatureWarning`) |
+| `df_method` | where `coef_df` comes from: `"satterthwaite"`, `"residual"` (OLS and the dispersion GLMs), `"none"` (the families with no df: z), `"disabled"` (a Gaussian mixed model fitted with `satterthwaite=False`: z) or `"failed"` (its Satterthwaite pass failed: z, with a `SatterthwaiteCurvatureWarning`); on a robust fit `"pustejovsky_tipton"` (CR2) or `"bell_mccaffrey"` (HC2) |
+| `weight_power`, `estimated_weight_power`, `se_type` | the power used on `weights` (the estimate on a fitted power, 1 on the weights as given, NaN without weights), whether the fit estimated it, and the standard error behind `se`, `vcov` and `coef_df` (`"model"` or `"robust"`); see [`conventions.md`](conventions.md#weight-power-and-robust-standard-errors) |
 | `rss`, `r_squared`, `adj_r_squared` | OLS only: the weighted residual sum of squares and `summary.lm`'s multiple and adjusted R² (0 on an intercept-only model); `NaN` on every other fit and on a non-converged one |
 | `vcov` | `(p, p)` full Cov(β̂) — `se` is the sqrt of its diagonal; use it for contrasts/confidence intervals, where the off-diagonals matter |
 | `names` | coefficient names, aligned with `beta` |

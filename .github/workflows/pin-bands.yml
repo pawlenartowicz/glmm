@@ -4,8 +4,8 @@ name: pin-bands
 #
 # Every pin in the crate reproduces BIT-EXACTLY on the anchor machine across
 # debug/release and all four feature configs (`assert_pinned` in
-# src/fit/common_tests.rs names the anchor and holds the full account). The bands
-# are margin for a different microarchitecture, where `src/simd_transcendental.rs`
+# glmm-rs/src/fit/common_tests.rs names the anchor and holds the full account). The bands
+# are margin for a different microarchitecture, where `glmm-rs/src/simd_transcendental.rs`
 # dispatches on CPU feature detection and the compiler contracts multiply-adds
 # elsewhere in the kernel's long reductions. A second machine
 # (aarch64-apple-darwin) has since been measured by hand and is what currently
@@ -99,18 +99,18 @@ jobs:
         # the band list in `assert_pinned`'s anchor note: add a `const BAND` in a
         # new test file and it must be added here too.
         run: |
-          sed -i 's/^pub(crate) const PIN_REL_OLS: f64 = .*/pub(crate) const PIN_REL_OLS: f64 = 1e-300;/' src/fit/common_tests.rs
-          sed -i 's/^pub(crate) const PIN_REL_ITER: f64 = .*/pub(crate) const PIN_REL_ITER: f64 = 1e-300;/' src/fit/common_tests.rs
-          sed -i 's/^\( *\)const BAND: f64 = .*;$/\1const BAND: f64 = 1e-300;/' src/fit/glmm_tests.rs src/sparse/tests.rs
-          grep -q 'PIN_REL_OLS: f64 = 1e-300;' src/fit/common_tests.rs || { echo "::error::PIN_REL_OLS rewrite missed"; exit 1; }
-          grep -q 'PIN_REL_ITER: f64 = 1e-300;' src/fit/common_tests.rs || { echo "::error::PIN_REL_ITER rewrite missed"; exit 1; }
+          sed -i 's/^pub(crate) const PIN_REL_OLS: f64 = .*/pub(crate) const PIN_REL_OLS: f64 = 1e-300;/' glmm-rs/src/fit/common_tests.rs
+          sed -i 's/^pub(crate) const PIN_REL_ITER: f64 = .*/pub(crate) const PIN_REL_ITER: f64 = 1e-300;/' glmm-rs/src/fit/common_tests.rs
+          sed -i 's/^\( *\)const BAND: f64 = .*;$/\1const BAND: f64 = 1e-300;/' glmm-rs/src/fit/glmm_tests.rs glmm-rs/src/sparse/tests.rs
+          grep -q 'PIN_REL_OLS: f64 = 1e-300;' glmm-rs/src/fit/common_tests.rs || { echo "::error::PIN_REL_OLS rewrite missed"; exit 1; }
+          grep -q 'PIN_REL_ITER: f64 = 1e-300;' glmm-rs/src/fit/common_tests.rs || { echo "::error::PIN_REL_ITER rewrite missed"; exit 1; }
           # Every remaining `const BAND` must now be 1e-300; one that is not means
           # the pattern drifted and that pin is measuring nothing.
-          if grep -rn 'const BAND: f64' src/ | grep -v '1e-300'; then
+          if grep -rn 'const BAND: f64' glmm-rs/src/ | grep -v '1e-300'; then
             echo "::error::a const BAND survived the rewrite (listed above)"; exit 1
           fi
-          grep -n 'PIN_REL_' src/fit/common_tests.rs
-          grep -rn 'const BAND: f64' src/
+          grep -n 'PIN_REL_' glmm-rs/src/fit/common_tests.rs
+          grep -rn 'const BAND: f64' glmm-rs/src/
 
       - name: run the pinned tests and collect every deviation
         # `|| true`: the failures ARE the output. The summary below is what to

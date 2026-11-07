@@ -60,7 +60,11 @@ These are the rows of the default, `test = "auto"`; on a fit with χ² rows,
 
 The heading names the type and the method, for example "Type III Analysis of
 Variance Table with Satterthwaite's method", or "Type III Analysis of
-Variance Table" on an OLS fit or a GLM with φ estimated. A χ² table's heading
+Variance Table" on an OLS fit or a GLM with φ estimated. On a fit with
+`se_type = "robust"` a one-df row is the robust test on its robust df, so the
+heading names Pustejovsky-Tipton's method (one grouping factor) or
+Bell-McCaffrey's (none), and "Pustejovsky-Tipton's and Satterthwaite's
+methods" when the table also has rows of more df, which stay model-based. A χ² table's heading
 is "Type III Analysis of Deviance Table" with a second line naming the test
 and why it ran (below), or the one line "Type III Analysis of Deviance Table
 (Wald chi-squared tests)" when `test = "Wald"` was asked for.
@@ -916,6 +920,7 @@ A note about one row is printed after that row's label, for example
 | The exact restricted likelihood-ratio test was not computed: `<reason>`. The 50:50 mixture is used. | the grouping has more than 100 levels with rows, the design leaves no residual df, or the fixed effects absorb the grouping |
 | The larger model did not reach its optimum: … The statistic is set to 0. | a raw statistic below zero beyond round-off |
 | The two fits use different quadrature node counts, … | two GLMM fits with different `nAGQ` |
+| Both models estimated the power on the weights. When the noise is not a power of the weights, this test rejects a true null somewhat more often than its level: about 6 to 9% at the 5% level in simulations. | `compare()` on two fits that each estimated `weight_power` |
 | The Wald F cannot be formed from the two fits' coefficients: … The likelihood-ratio test is used, with an asymptotic chi-squared reference. | a dispersion-GLM pair whose coefficient names do not nest |
 | The log-likelihood of `<the smaller model \| the larger model \| both models>` is not finite (a fit that failed or collapsed), so the statistic and its p-value are NaN. | a NaN or infinite log-likelihood |
 | Both models were fitted by ML because their fixed parts differ. | `compare()` on a Gaussian pair whose fixed parts differ (not two OLS fits) |

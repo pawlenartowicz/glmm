@@ -108,7 +108,7 @@ build_rust() {
     -p validation --example memory_fit
 }
 
-PY="$(dirname "$ROOT")/python/venv/bin/python"
+PY="$(dirname "$ROOT")/glmm-py/venv/bin/python"
 [[ -x "$PY" ]] || PY="$(command -v python3 || true)"
 
 # n/levels for a manifest CSV: n = data row count, levels = summed distinct-

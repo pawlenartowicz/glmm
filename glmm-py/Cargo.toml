@@ -1,0 +1,19 @@
+[package]
+name = "glmm-python"
+version = "0.9.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "PyO3 binding for the glmm crate — builds the glmm._native extension consumed by GLMM/glmm-py/glmm."
+
+[lib]
+name = "_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.29", features = ["abi3-py310"] }
+glmm-bind = { path = "../glmm-bind" }
+
+[lints]
+workspace = true

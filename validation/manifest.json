@@ -1724,7 +1724,7 @@
     }
   ],
   "//weights_tier": "WEIGHTS validation suite (rungs 29-43). Its references are goldens/weights/<name>.json, written only by tools/goldens_weights.R (lm, glm and MASS::glm.nb for the fixed-only rows, lmer and glmer at nAGQ = 1 for the mixed ones); VALIDATION_ONLY=<name> writes one, and a bare run rewrites all 15, a deliberate act. Each records its fitter as `engine` (stats::lm, stats::glm or MASS::glm.nb on a fixed-only row, lme4 on a mixed one) and that fitter's version as `engine_version` (R's own, as R-<version>, for stats). The 8 fixed-only references are at the R and MASS pins: a rerun of their rows under R 4.5.3 and MASS 7.3-65 reproduces every estimate byte for byte (their `timing` blocks are the original run's). The 7 mixed ones were written under lme4 1.1.38 and stay frozen when the lme4 pin moves: a rerun of tools/goldens_weights.R under lme4 2.0-6 on Mac arm64 (2026-10-29) fits all 15 at the lme4, MASS and numDeriv pins (on R 4.5.2, before the script checked the R pin), reproduces glm_binomial_agg exactly, 7 more within 1e-14 relative and 4 within 6e-11, and moves glmm_poisson by up to 7e-7, glmm_binomial by up to 5e-5 (n_eval 423 to 406) and lmm_crossed by up to 6e-5 (a random-effect correlation). Each of the 7 mixed rows declares that version as `frozen_under`, read by tests/golden_provenance.rs as for an `m3_goldens` entry. Conventions on top of the main manifest: `weights_col` names a plain per-row prior-weight CSV column (mutually exclusive with the aggregated-binomial `weights` field); `jl_formula` is optional: a row without it is lowered from r_formula by tools/common.rs, and grid/gen_manifest.R derives the Julia spelling for its accuracy-grid cell, whose oracles are picked by family and link (oracles_of), not by the field; `gate` marks the two fit-time special gates (dropped_rows, checked by tools/goldens_weights.R before it writes the reference; unit_identity, checked by tests/validation_oracle.rs's unit_weights_reproduce_the_unweighted_fit: the fit with the row's unit weights must equal the fit without weights bit for bit).",
-  "//inference_references": "Inference reference JSONs (lmerTest tests, RLRT, ANOVA tables, predictions, pairwise comparisons, effect sizes, extended-precision GLM fits, profile-likelihood confidence intervals) for the inference layer. One tree, goldens/inference/{lmertest,rlrt,anova,predict,posthoc,effectsize,conditioning,profile}/<name>.json, and this one block; an entry's `kind` (lmertest, rlrt, anova, predict, posthoc, effectsize, conditioning or profile) picks its directory. Entry fields: `name`; `kind`; `data`, the CSV path relative to validation/ (e.g. data/simulated/lmm_intercept.csv, data/empirical/Dyestuff2.csv; a rung dataset is cited by its CSV path, not by its `datasets` name), or null for a fit-free entry, one with no model fit, whose `r_formula` is null too; `r_formula`; optional `factors`, the `data` columns read as factors (as an `m3_goldens` entry's `factors`; each must be a column of the CSV; absent means none); `generator`, the bare file name of the script under tools/ that writes the JSON (e.g. goldens_rlrt.R, not a path; an R generator sources tools/inference_common.R); optional `pending_reference`, a non-empty reason, set while the JSON does not exist yet (generate it with VALIDATION_ONLY=<name> and drop the field in the same change); any further field is kind-specific and owned by the generator that reads it. A predict, posthoc, effectsize or profile entry carries `members`, the fits in the anova member shape (`fun`, `formula`, `family`, `link`, `REML`, `nAGQ`, `weights`, `tolPwrss`), fitted by inference_common.R's fit_member; its `r_formula` is the first member's formula. A profile entry also carries `level`, the confidence level its generator hands to lme4's profile intervals (confint with method = \"profile\"), and an optional `beta_method`: absent or \"lme4_profile\" takes every row from that confint call; \"offset_refit\" takes the variance rows from it and computes each coefficient's interval in the generator from ML refits with the coefficient held through an offset, because lme4 2.0.6's fixed-effect profile on a prior-weighted LMM warns and comes out far narrower than the Wald interval. A conditioning entry's `data` is one CSV per design and family, its `r_formula` is null and its `fits` hold the sweep, one `label` and `r_formula` per fit; its generator is a Python script (goldens_glm_band.py) that writes its own provenance keys (python_version, packages, mp_dps, generator). These are never rows in `datasets` (nor in `m3_goldens`), so the accuracy grid's read-in cells, the bit-identity dump and goldens_agq.R see nothing new. Names are unique across kinds and disjoint from the `datasets` and `m3_goldens` names. Checked by tests/inference_references.rs.",
+  "//inference_references": "Inference reference JSONs (lmerTest tests, RLRT, ANOVA tables, predictions, pairwise comparisons, effect sizes, extended-precision GLM fits, profile-likelihood confidence intervals) for the inference layer. One tree, goldens/inference/{lmertest,rlrt,anova,predict,posthoc,effectsize,conditioning,profile}/<name>.json, and this one block; an entry's `kind` (lmertest, rlrt, anova, predict, posthoc, effectsize, conditioning or profile) picks its directory. Entry fields: `name`; `kind`; `data`, the CSV path relative to validation/ (e.g. data/simulated/lmm_intercept.csv, data/empirical/Dyestuff2.csv; a rung dataset is cited by its CSV path, not by its `datasets` name), or null for a fit-free entry, one with no model fit, whose `r_formula` is null too; `r_formula`; optional `factors`, the `data` columns read as factors (as an `m3_goldens` entry's `factors`; each must be a column of the CSV; absent means none); `generator`, the bare file name of the script under tools/ that writes the JSON (e.g. goldens_rlrt.R, not a path; an R generator sources tools/inference_common.R); optional `pending_reference`, a non-empty reason, set while the JSON does not exist yet (generate it with VALIDATION_ONLY=<name> and drop the field in the same change); any further field is kind-specific and owned by the generator that reads it. A predict, posthoc, effectsize or profile entry carries `members`, the fits in the anova member shape (`fun`, `formula`, `family`, `link`, `REML`, `nAGQ`, `weights`, `tolPwrss`), fitted by inference_common.R's fit_member; its `r_formula` is the first member's formula. A profile entry also carries `level`, the confidence level its generator hands to lme4's profile intervals (confint with method = \"profile\"), and an optional `beta_method`: absent or \"lme4_profile\" takes every row from that confint call; \"offset_refit\" takes the variance rows from it and computes each coefficient's interval in the generator from ML refits with the coefficient held through an offset, because lme4 2.0.6's fixed-effect profile on a prior-weighted LMM warns and comes out far narrower than the Wald interval. A conditioning entry's `data` is one CSV per design and family, its `r_formula` is null and its `fits` hold the sweep, one `label` and `r_formula` per fit; its generator is a Python script (goldens_glm_band.py) that writes its own provenance keys (python_version, packages, mp_dps, generator). These are never rows in `datasets` (nor in `m3_goldens`), so the accuracy grid's read-in cells, the bit-identity dump and goldens_agq.R see nothing new. Names are unique across kinds and disjoint from the `datasets` and `m3_goldens` names. A cr2 entry (CR2 and HC2 references of spec 2-dcr, goldens/inference/cr2/) names one of four R generators: goldens_cr2.R (dense CR2 at the CSV's working model, `oracle` cr2 or cr2_phi of tools/cr2/), goldens_hc2.R (clubSandwich on stats::lm with prior weights `weights`, one cluster per row), goldens_cr2_lme.R (clubSandwich on nlme lme or gls, `weight_power` fixed or estimated) and goldens_cr2_cells.R (the fit-free f1_reps: the first `reps` replications of `cells` from `source`, a file outside the repo, and the `designs` written to data/inference/dcr_cells/). A cr2_hp entry (goldens/inference/cr2_hp/) is written by goldens_cr2_hp.py from make_data(`G`, `nk`, `spread`, `re`, seed 7) at `prec_bits`, with Python provenance keys (python_version, packages, prec_bits, generator). Checked by tests/inference_references.rs.",
   "inference_references": [
     {
       "name": "rlrt_dyestuff",
@@ -6422,6 +6422,312 @@
           "weights": "w"
         }
       ]
+    },
+    {
+      "name": "cr2_dense_ri_s1",
+      "kind": "cr2",
+      "data": "data/inference/cr2_ri_s1.csv",
+      "r_formula": "y ~ 1 + x1 + x2 + (1 | g)",
+      "factors": [
+        "g"
+      ],
+      "generator": "goldens_cr2.R",
+      "oracle": "cr2"
+    },
+    {
+      "name": "cr2_dense_ri_s10",
+      "kind": "cr2",
+      "data": "data/inference/cr2_ri_s10.csv",
+      "r_formula": "y ~ 1 + x1 + x2 + (1 | g)",
+      "factors": [
+        "g"
+      ],
+      "generator": "goldens_cr2.R",
+      "oracle": "cr2"
+    },
+    {
+      "name": "cr2_dense_ri_s100",
+      "kind": "cr2",
+      "data": "data/inference/cr2_ri_s100.csv",
+      "r_formula": "y ~ 1 + x1 + x2 + (1 | g)",
+      "factors": [
+        "g"
+      ],
+      "generator": "goldens_cr2.R",
+      "oracle": "cr2"
+    },
+    {
+      "name": "cr2_dense_rs_s1",
+      "kind": "cr2",
+      "data": "data/inference/cr2_rs_s1.csv",
+      "r_formula": "y ~ 1 + x1 + x2 + (1 + x1 | g)",
+      "factors": [
+        "g"
+      ],
+      "generator": "goldens_cr2.R",
+      "oracle": "cr2_phi"
+    },
+    {
+      "name": "cr2_dense_rs_s10",
+      "kind": "cr2",
+      "data": "data/inference/cr2_rs_s10.csv",
+      "r_formula": "y ~ 1 + x1 + x2 + (1 + x1 | g)",
+      "factors": [
+        "g"
+      ],
+      "generator": "goldens_cr2.R",
+      "oracle": "cr2_phi"
+    },
+    {
+      "name": "cr2_dense_rs_s100",
+      "kind": "cr2",
+      "data": "data/inference/cr2_rs_s100.csv",
+      "r_formula": "y ~ 1 + x1 + x2 + (1 + x1 | g)",
+      "factors": [
+        "g"
+      ],
+      "generator": "goldens_cr2.R",
+      "oracle": "cr2_phi"
+    },
+    {
+      "name": "hc2_n20",
+      "kind": "cr2",
+      "data": "data/inference/hc2_n20.csv",
+      "r_formula": "y ~ 1 + x1 + x2",
+      "generator": "goldens_hc2.R",
+      "weights": "w"
+    },
+    {
+      "name": "hc2_n100",
+      "kind": "cr2",
+      "data": "data/inference/hc2_n100.csv",
+      "r_formula": "y ~ 1 + x1 + x2",
+      "generator": "goldens_hc2.R",
+      "weights": "w"
+    },
+    {
+      "name": "cr2_lme_ri_fixed_s10",
+      "kind": "cr2",
+      "data": "data/inference/cr2_ri_s10.csv",
+      "r_formula": "y ~ 1 + x1 + x2 + (1 | g)",
+      "factors": [
+        "g"
+      ],
+      "generator": "goldens_cr2_lme.R",
+      "weights": "w",
+      "weight_power": "fixed"
+    },
+    {
+      "name": "cr2_lme_ri_estimated_s10",
+      "kind": "cr2",
+      "data": "data/inference/cr2_ri_s10.csv",
+      "r_formula": "y ~ 1 + x1 + x2 + (1 | g)",
+      "factors": [
+        "g"
+      ],
+      "generator": "goldens_cr2_lme.R",
+      "weights": "w",
+      "weight_power": "estimated"
+    },
+    {
+      "name": "cr2_lme_ri_fixed_s100",
+      "kind": "cr2",
+      "data": "data/inference/cr2_ri_s100.csv",
+      "r_formula": "y ~ 1 + x1 + x2 + (1 | g)",
+      "factors": [
+        "g"
+      ],
+      "generator": "goldens_cr2_lme.R",
+      "weights": "w",
+      "weight_power": "fixed"
+    },
+    {
+      "name": "cr2_lme_ri_estimated_s100",
+      "kind": "cr2",
+      "data": "data/inference/cr2_ri_s100.csv",
+      "r_formula": "y ~ 1 + x1 + x2 + (1 | g)",
+      "factors": [
+        "g"
+      ],
+      "generator": "goldens_cr2_lme.R",
+      "weights": "w",
+      "weight_power": "estimated"
+    },
+    {
+      "name": "cr2_lme_gls_fixed_n20",
+      "kind": "cr2",
+      "data": "data/inference/hc2_n20.csv",
+      "r_formula": "y ~ 1 + x1 + x2",
+      "generator": "goldens_cr2_lme.R",
+      "weights": "w",
+      "weight_power": "fixed"
+    },
+    {
+      "name": "cr2_lme_gls_estimated_n20",
+      "kind": "cr2",
+      "data": "data/inference/hc2_n20.csv",
+      "r_formula": "y ~ 1 + x1 + x2",
+      "generator": "goldens_cr2_lme.R",
+      "weights": "w",
+      "weight_power": "estimated"
+    },
+    {
+      "name": "cr2_lme_gls_fixed_n100",
+      "kind": "cr2",
+      "data": "data/inference/hc2_n100.csv",
+      "r_formula": "y ~ 1 + x1 + x2",
+      "generator": "goldens_cr2_lme.R",
+      "weights": "w",
+      "weight_power": "fixed"
+    },
+    {
+      "name": "cr2_lme_gls_estimated_n100",
+      "kind": "cr2",
+      "data": "data/inference/hc2_n100.csv",
+      "r_formula": "y ~ 1 + x1 + x2",
+      "generator": "goldens_cr2_lme.R",
+      "weights": "w",
+      "weight_power": "estimated"
+    },
+    {
+      "name": "f1_reps",
+      "kind": "cr2",
+      "data": null,
+      "r_formula": null,
+      "generator": "goldens_cr2_cells.R",
+      "source": "weights_of_trust/checks/results/formula_search_reps_R1000.csv",
+      "reps": 20,
+      "cells": [
+        "A/10x10/d1/continuous/precision",
+        "A/10x10/d1/junk/junk",
+        "B/10x10/d1/wide/honest",
+        "B/10x10/d1/wide/bump",
+        "D/10x10/d1/wide/step",
+        "A/50x10/d1/continuous/precision",
+        "A/50x10/d1/junk/junk",
+        "B/50x10/d1/wide/honest",
+        "B/50x10/d1/wide/bump",
+        "D/50x10/d1/wide/step"
+      ],
+      "designs": [
+        "A/10x10/d1/continuous/precision",
+        "A/10x10/d1/junk/junk",
+        "B/10x10/d1/wide/honest",
+        "B/10x10/d1/wide/bump",
+        "D/10x10/d1/wide/step",
+        "A/50x10/d1/continuous/precision",
+        "A/50x10/d1/junk/junk",
+        "B/50x10/d1/wide/honest",
+        "B/50x10/d1/wide/bump",
+        "D/50x10/d1/wide/step",
+        "E/10x10/d1/missing_slope/honest",
+        "E/50x10/d1/missing_slope/honest",
+        "B/10x10/d1/wide/floor_mid",
+        "B/50x10/d1/wide/floor_mid",
+        "S/10x10/d1/slope0.25/honest",
+        "S/50x10/d1/slope0.25/honest",
+        "WLS/n20/wide/honest",
+        "WLS/n20/wide/floor_mid",
+        "WLS/n50/wide/honest",
+        "WLS/n50/wide/floor_mid",
+        "WLS/n100/wide/honest",
+        "WLS/n100/wide/floor_mid"
+      ],
+      "design_sources": {
+        "weights_of_trust/checks/formula_search_mc.R": "1d63ee8bfae6724097c3bb34bde2041389429676e50e576441acd5ab3af62170",
+        "weights_of_trust/checks/f2_extensions_mc.R": "a01d901478e13a832c8887d34842ae8d030e64c2f3f14450b1c77fb02447c312",
+        "weights_of_trust/checks/wls_delta_mc.R": "6893e09310d71092c34e7c3108ac1a1b0289bf81227390e10e0a3c2c3a458f3f"
+      }
+    },
+    {
+      "name": "cr2_hp_ri_s100",
+      "kind": "cr2_hp",
+      "data": "data/inference/cr2_ri_s100.csv",
+      "r_formula": "y ~ 1 + x1 + x2 + (1 | g)",
+      "factors": [
+        "g"
+      ],
+      "generator": "goldens_cr2_hp.py",
+      "G": 10,
+      "nk": 20,
+      "spread": 100.0,
+      "re": "ri",
+      "prec_bits": 1024
+    },
+    {
+      "name": "cr2_hp_ri_s1e4",
+      "kind": "cr2_hp",
+      "data": "data/inference/cr2_ri_s1e4.csv",
+      "r_formula": "y ~ 1 + x1 + x2 + (1 | g)",
+      "factors": [
+        "g"
+      ],
+      "generator": "goldens_cr2_hp.py",
+      "G": 10,
+      "nk": 20,
+      "spread": 10000.0,
+      "re": "ri",
+      "prec_bits": 1024
+    },
+    {
+      "name": "cr2_hp_ri_s1e6",
+      "kind": "cr2_hp",
+      "data": "data/inference/cr2_ri_s1e6.csv",
+      "r_formula": "y ~ 1 + x1 + x2 + (1 | g)",
+      "factors": [
+        "g"
+      ],
+      "generator": "goldens_cr2_hp.py",
+      "G": 10,
+      "nk": 20,
+      "spread": 1000000.0,
+      "re": "ri",
+      "prec_bits": 1024
+    },
+    {
+      "name": "cr2_hp_rs_s100",
+      "kind": "cr2_hp",
+      "data": "data/inference/cr2_rs_s100.csv",
+      "r_formula": "y ~ 1 + x1 + x2 + (1 + x1 | g)",
+      "factors": [
+        "g"
+      ],
+      "generator": "goldens_cr2_hp.py",
+      "G": 10,
+      "nk": 20,
+      "spread": 100.0,
+      "re": "rs",
+      "prec_bits": 1024
+    },
+    {
+      "name": "cr2_hp_rs_s1e4",
+      "kind": "cr2_hp",
+      "data": "data/inference/cr2_rs_s1e4.csv",
+      "r_formula": "y ~ 1 + x1 + x2 + (1 + x1 | g)",
+      "factors": [
+        "g"
+      ],
+      "generator": "goldens_cr2_hp.py",
+      "G": 10,
+      "nk": 20,
+      "spread": 10000.0,
+      "re": "rs",
+      "prec_bits": 1024
+    },
+    {
+      "name": "cr2_hp_rs_s1e6",
+      "kind": "cr2_hp",
+      "data": "data/inference/cr2_rs_s1e6.csv",
+      "r_formula": "y ~ 1 + x1 + x2 + (1 + x1 | g)",
+      "factors": [
+        "g"
+      ],
+      "generator": "goldens_cr2_hp.py",
+      "G": 10,
+      "nk": 20,
+      "spread": 1000000.0,
+      "re": "rs",
+      "prec_bits": 1024
     }
   ],
   "//in_crate_references": "In-crate references kept outside goldens/: a fixture file under tests/fixtures/ (or tests/) read by a test, or constants and data a test keeps inline. Each has a committed generator that rebuilds it from its seed or its committed data. Entry fields: `name`; `consumers`, the tests that read it (file::test); `fixture`, the file holding the values relative to the crate root, or null when the test keeps them inline; `data`, where the input data come from; `r_formula`; optional `weights`, the prior-weight scheme on the 0-based row index i; `seed`, the R or Rust seed of simulated data (absent when nothing is drawn); `generator`, the script relative to the crate root (run from the crate root; a generator whose `fixture` is null prints the values instead of writing a file); `engine`, the function that produced the values; `frozen`, the date and the versions recorded when the values were frozen; `reproduced`, the date, the versions and the largest difference of the last generator re-run against the committed values. These are never rows in `datasets`, `m3_goldens` or `inference_references`, so no harness or test reads this block. Names are disjoint from theirs.",
@@ -6435,5 +6741,15 @@
     {"name": "boundary_pin_precise_two_zero_slopes_lme4", "consumers": ["src/fit/core_tests.rs::trough_polish_reaches_the_optimum_on_precise_data"], "fixture": null, "data": "validation/data/simulated/sim_poisson_precise_two_zero_slopes.csv (see boundary_pin_precise_two_zero_slopes)", "r_formula": "y ~ 1 + x1 + x2 + (1 + x1 + x2 | g)", "generator": "validation/tools/prep/boundary_pin_lme4_reference.R", "engine": "lme4::glmer, poisson, nAGQ = 1, tolPwrss = 1e-10: bobyqa (rhoend = 1e-10) from lme4's start, then Nelder_Mead, Nelder_Mead and bobyqa (rhoend = 1e-10), each from the last fit; PRECISE_TWO_ZERO_SLOPES_LME4_DEVIANCE is the last fit's -2 logLik plus twice the saturated Poisson log-likelihood", "frozen": "2026-10-30, R 4.5.2, lme4 2.0-6 (aarch64 macOS)", "reproduced": "2026-10-30, R 4.5.2, lme4 2.0-6: the re-run prints the same output"},
     {"name": "precise_ridge_refit", "consumers": ["src/fit/core_tests.rs::a_hand_over_with_no_result_reports_the_gradient_incumbent"], "fixture": null, "data": "validation/data/simulated/sim_poisson_precise_ridge.csv, dataset 8 of the 300-dataset seed search of boundary_pin_precise_two_zero_slopes (base seed 202610314); seed is the dataset's own", "r_formula": "y ~ 1 + x1 + x2 + (1 + x1 + x2 | g)", "seed": 485970320, "generator": "validation/tools/prep/gen_boundary_pin_data.R", "engine": "glmm itself, Poisson log, Laplace: the reduced model without x1 in its fixed part, whose profiled deviance is non-finite around the gradient search's point at an iteration cap of 200, measured on x86_64 Linux", "frozen": "2026-11-01, data R (Mac arm64), the same run as dataset 143, whose CSV is byte-identical to boundary_pin_precise_two_zero_slopes", "reproduced": "2026-11-01, R 4.5.3 x86_64 Linux: y identical, 20 cells of x1 and x2 one unit off in the 15th significant digit; the test runs on the frozen CSV"},
     {"name": "precise_e30_polish_refit", "consumers": ["src/fit/core_tests.rs::a_polish_with_no_result_restarts_from_the_gradient_endpoint"], "fixture": null, "data": "validation/data/simulated/sim_poisson_precise_e30.csv, dataset 5 of a 40-dataset search at log-mean 30 (seed 30005, Python random.Random)", "r_formula": "y ~ 1 + x1 + x2 + (1 + x1 + x2 | g)", "seed": 30005, "generator": "validation/tools/prep/gen_precise_e30_data.py", "engine": "glmm itself, Poisson log, Laplace: the reduced model without x2 in its fixed part, whose gradient search stops on its noise floor at deviance 1351.5310966 (PRECISE_E30_BFGS_ENDPOINT) and whose final BOBYQA polish then stops within the radius of a non-finite point; the restart from that endpoint converges at or below it; measured on x86_64 Linux", "frozen": "2026-11-03, data Python 3.14.2 (x86_64 Linux)", "reproduced": "2026-11-03, Python 3.14.2 x86_64 Linux: CSV byte-identical"}
+  ],
+  "//copied_tools": "Reference code copied into validation/tools/ from outside the repo, kept as close to its source as the oracle allows. Entry fields: `name`; `path`, relative to validation/; `source`, where it came from (weights_of_trust/ is Maja's weights-of-trust project, docs/ the GLMM-Project docs); `source_sha256` of the file as copied; `copied`, the date; `changes`, every edit made to the copy; `used_by`, the scripts that read it. No harness or test reads this block.",
+  "copied_tools": [
+    {"name": "efficiency_lib.R", "path": "tools/cr2/efficiency_lib.R", "source": "weights_of_trust/checks/efficiency_lib.R", "source_sha256": "047f80b9bda2dedd8ca503fd85587d8ec42760f8aff5bdcac843440c397127c4", "copied": "2026-11-05", "changes": "the scale-free cut of spec 2-dcr §3.2: B^(-1/2) on as many of B's leading eigenvectors as T = D^-T C D^-1 has eigenvalues above 1e-12 (bmh(), replacing mpow()'s absolute cut on B), in cr2(); a two-line header", "used_by": ["tools/goldens_cr2.R", "tools/goldens_hc2.R", "tools/goldens_cr2_lme.R", "tools/goldens_cr2_cells.R"]},
+    {"name": "f2_slope_cr2_mc.R", "path": "tools/cr2/f2_slope_cr2_mc.R", "source": "weights_of_trust/checks/f2_slope_cr2_mc.R", "source_sha256": "bce45b1daab55e0e56dd5a88b2c93e483fd07920c6a42de3b92ae65c64346cc9", "copied": "2026-11-05", "changes": "cr2_phi() calls efficiency_lib.R's bmh(), the same cut; a two-line header. Only cr2_phi() is read (goldens_cr2.R parses it out): the rest sources f2_extensions_mc.R, which is not copied", "used_by": ["tools/goldens_cr2.R"]},
+    {"name": "lib.py", "path": "tools/cr2/lib.py", "source": "docs/0.9.0/cr2-large-clusters/lib.py", "source_sha256": "444dafd11c9d4700877b594e4d73cec3104145ea614c21cc95c57ad9834d7f1e", "copied": "2026-11-05", "changes": "dense_cluster() already applies the §3.2 cut on T; its two scipy.linalg calls (cholesky, solve_triangular) are numpy ones, so no scipy is needed; a two-line header", "used_by": ["tools/prep/gen_cr2_data.py", "tools/goldens_cr2_hp.py", "tools/cr2/hp_ref.py"]},
+    {"name": "centered.py", "path": "tools/cr2/centered.py", "source": "docs/0.9.0/cr2-large-clusters/centered.py", "source_sha256": "0495c96d1302914004d0f213b3fa615fd09cc986784a25c0017daaf74f228511", "copied": "2026-11-05", "changes": "none but a one-line header (no B^(-1/2) by eigendecomposition)", "used_by": ["tools/cr2/rank_check.py"]},
+    {"name": "hp_ref.py", "path": "tools/cr2/hp_ref.py", "source": "docs/0.9.0/cr2-large-clusters/hp_ref.py", "source_sha256": "fcd3d54d795f9731ad62793d24d48c0028ee5ba60edd0a0003539f148a0852b2", "copied": "2026-11-05", "changes": "none but a one-line header (Denman-Beavers, no eigenvalue cut)", "used_by": ["tools/goldens_cr2_hp.py"]},
+    {"name": "rank_check.py", "path": "tools/cr2/rank_check.py", "source": "docs/0.9.0/cr2-large-clusters/rank_check.py", "source_sha256": "814372035d1f601fbef5fa4bd581fe965758b3a3e59ff59fd62424f0f4dea23f", "copied": "2026-11-05", "changes": "reduce_u keeps the directions with ev > eps * max(1, largest ev) instead of ev > eps (the original kept rounding-level directions of a large S and stopped with a singular S on seed 2, case slope constant in cluster); a two-line header. Its dense side is lib.dense_cluster", "used_by": []},
+    {"name": "wls_delta_mc.R", "path": "tools/cr2/wls_delta_mc.R", "source": "weights_of_trust/checks/wls_delta_mc.R", "source_sha256": "6893e09310d71092c34e7c3108ac1a1b0289bf81227390e10e0a3c2c3a458f3f", "copied": "2026-11-05", "changes": "none; only make_design() and curves are read (goldens_cr2_cells.R parses them out): the script runs its simulation at top level", "used_by": ["tools/goldens_cr2_cells.R"]}
   ]
 }

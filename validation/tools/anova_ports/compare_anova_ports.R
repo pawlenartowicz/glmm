@@ -37,7 +37,7 @@
 # each port's messages for `type` (two fits: an R error, a Python
 # `TypeError`; a bad value: R's `match.arg`, a Python `ValueError`). The
 # per-port tests pin them
-# (python/tests/test_anova.py, r/tests/testthat/test-anova.R).
+# (glmm-py/tests/test_anova.py, glmm-r/tests/testthat/test-anova.R).
 #
 # Base R and jsonlite only: the CI port-gate job installs no statistics
 # package.

@@ -50,7 +50,7 @@
 //! `compare_anova_ports.R` pins the call list and the expected refusals.
 //!
 //! The Rust side has no table object, so this file lays each table out the
-//! way both ports do (`python/glmm/anova.py`, `r/R/fastglmm-anova.R`): R's
+//! way both ports do (`glmm-py/glmm/anova.py`, `glmm-r/R/fastglmm-anova.R`): R's
 //! column names, one row per model with the smaller model first, rows named
 //! after the models as given (`m0`/`m1` from `anova`, `f0`/`f1` from
 //! `compare`); and it writes a per-term table's heading as both ports do,
@@ -64,6 +64,7 @@ use std::collections::{BTreeSet, HashMap};
 use glmm::formula::anova::{compare_stored, Comparison, ComparisonTest, Model, ModelInfo, Side};
 use glmm::inference::{Objective, Reference};
 use glmm::orchestrate::{self, FitResult, StoredParts};
+use glmm::WeightPower;
 use serde_json::{json, Value};
 
 /// `validation/`, so the example runs from any working directory.
@@ -254,10 +255,17 @@ const TERM_CALLS: &[TermCall] = &[
 ];
 
 // The per-term headings' texts as both ports write them
-// (`python/glmm/anova.py`, `r/R/fastglmm-anova.R`), copied so that the gate
+// (`glmm-py/glmm/anova.py`, `glmm-r/R/fastglmm-anova.R`), copied so that the gate
 // compares each port's heading with this one: change together with both.
 const LRT_LINE: &str = "Likelihood-ratio chi-squared tests (each term's model refitted without it)";
 const WALD_LINE: &str = "Wald chi-squared tests";
+/// The heading's name of each denominator-df source, in heading order (the
+/// ports' `_DF_METHODS` and `.DF_METHODS`).
+const DF_METHODS: &[(&str, &str)] = &[
+    ("pustejovsky_tipton", "Pustejovsky-Tipton's"),
+    ("bell_mccaffrey", "Bell-McCaffrey's"),
+    ("satterthwaite", "Satterthwaite's"),
+];
 const ETA2_LINE: &str =
     "Partial eta-squared uses the Satterthwaite denominator df, so it is approximate.";
 const NOT_CONVERGED: &str = "The fit did not converge, so its estimates are not at a maximum \
@@ -473,6 +481,8 @@ fn model_of(m: &Member, r: &FitResult) -> Model {
         re_groups: r.re_groups.clone(),
         y: r.y.clone(),
         weights: r.weights.clone(),
+        weight_power: r.weight_power,
+        weight_power_estimated: r.weight_power_estimated,
         offset: r.offset.clone(),
         dispersion_held: None,
         design_summary: r.design_summary.clone(),
@@ -506,6 +516,9 @@ fn fit(
         true,
         m.reml,
         anova_test,
+        // The weighted members check the weights as given.
+        Some(WeightPower::Fixed(1.0)),
+        None,
     )
     .map_err(String::from)
 }
@@ -541,6 +554,8 @@ fn compare_call(call: &str, data: &Data, m: [&Member; 2], weights: Option<Vec<f6
         weights,
         None,
         None,
+        None,
+        Some(WeightPower::Fixed(1.0)),
         None,
     );
     match r {
@@ -706,9 +721,8 @@ fn f_rows(tc: &orchestrate::TermColumns, df_method: &str) -> bool {
 }
 
 /// A per-term table's heading and notes, one line each, as both ports print
-/// them: the title (an F table names Satterthwaite's method when some row
-/// has its df, or on a table with no rows when the fit's `df_method` is
-/// Satterthwaite's; a likelihood-ratio table, or any chi-squared table under
+/// them: the title (an F table names the df method of its rows that have df,
+/// or on a table with no rows the fit's `df_method`, the residual df unnamed; a likelihood-ratio table, or any chi-squared table under
 /// `"auto"`, takes a second line naming the test and why it ran; an explicit
 /// `"Wald"` keeps one line), then the not-converged note, the table's notes,
 /// each row's notes, and on a Satterthwaite F table the note on its partial
@@ -722,19 +736,27 @@ fn heading(
 ) -> String {
     let ss = tc.ss_type;
     let mut lines = Vec::new();
-    let satterthwaite = if tc.label.is_empty() {
-        df_method == "satterthwaite"
+    let kinds: Vec<&str> = if tc.label.is_empty() {
+        vec![df_method]
     } else {
         tc.den_df_kind
             .iter()
             .zip(&tc.den_df)
-            .any(|(kind, d)| *kind == "satterthwaite" && d.is_finite())
+            .filter(|(_, d)| d.is_finite())
+            .map(|(kind, _)| *kind)
+            .collect()
     };
+    let satterthwaite = kinds.contains(&"satterthwaite");
     if f_rows(tc, df_method) {
-        let method = if satterthwaite {
-            " with Satterthwaite's method"
-        } else {
-            ""
+        let names: Vec<&str> = DF_METHODS
+            .iter()
+            .filter(|(kind, _)| kinds.contains(kind))
+            .map(|(_, name)| *name)
+            .collect();
+        let method = match names.len() {
+            0 => String::new(),
+            1 => format!(" with {} method", names[0]),
+            _ => format!(" with {} methods", names.join(" and ")),
         };
         lines.push(format!("Type {ss} Analysis of Variance Table{method}"));
     } else if tc.test == "lrt" || test == "auto" {
@@ -870,6 +892,7 @@ fn post_fit(call: &str, kind: &str, data: &Data, m: &Member, r: &FitResult) -> R
     let parts = StoredParts {
         beta: r.beta.clone(),
         vcov: r.vcov.clone(),
+        model_vcov: r.model_vcov.clone(),
         varcorr: r.varcorr.clone(),
         ranef: r.ranef.clone(),
         ranef_levels: r.ranef_levels.clone(),
@@ -877,6 +900,7 @@ fn post_fit(call: &str, kind: &str, data: &Data, m: &Member, r: &FitResult) -> R
         condvar_x: r.condvar_x.clone(),
         condvar_cross: r.condvar_cross.clone(),
         dispersion: r.dispersion,
+        weight_power: r.weight_power,
     };
     let (numeric, factor) = (data.numeric.clone(), data.factor.clone());
     let numbered = |n: usize| (1..=n).map(|i| i.to_string()).collect::<Vec<_>>();
@@ -967,9 +991,11 @@ fn post_fit(call: &str, kind: &str, data: &Data, m: &Member, r: &FitResult) -> R
                 r.df_method,
                 &r.beta,
                 &r.vcov,
+                &r.model_vcov,
                 &r.aliased,
                 r.nobs,
                 r.satterthwaite_record.clone(),
+                r.robust.clone(),
                 "g",
                 None,
                 None,

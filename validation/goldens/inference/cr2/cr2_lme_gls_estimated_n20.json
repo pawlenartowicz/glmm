@@ -1,0 +1,33 @@
+{
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0",
+      "nlme": "3.1.168",
+      "clubSandwich": "0.7.0"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_cr2_lme.R"
+  },
+  "coefficients": ["(Intercept)", "x1", "x2"],
+  "beta": [0.95851156676207, 0.779809865583429, 0.149968588568159],
+  "se": [0.139763836699815, 0.144000681449282, 0.113189664376204],
+  "df": [3.45806065290752, 2.3842656564934, 4.36246631519782],
+  "delta": 1.25702779580447,
+  "sigma2": 1.10706421694218,
+  "name": "cr2_lme_gls_estimated_n20"
+}

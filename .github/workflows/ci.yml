@@ -40,6 +40,10 @@ jobs:
         # The crate's workspace lints set clippy::all = deny, so a plain clippy
         # run is the correctness gate — no extra `-- -D warnings` needed.
         run: cargo clippy --all-targets
+      - name: glmm-bind (test and clippy)
+        # Not a default member: built with the engine's `formula` on, it would
+        # leak that feature into the no-default-features legs.
+        run: cargo test -p glmm-bind && cargo clippy -p glmm-bind --all-targets
       - name: clippy (loop_bench, with and without its OS counters)
         # The root clippy run above does not build the validation examples, and
         # loop_bench's libc module is compiled only under `os_counters`: build
@@ -148,8 +152,9 @@ jobs:
   # contraction, other `exp`/`ln`, the simd128 kernels), so the lib suite runs
   # there too: plain wasm32 and the simd128 build the grid's glmm_wasm engine
   # uses. wasip1 builds with panic=abort, so libtest reports every should_panic
-  # test as ignored. The runner preopens the crate root twice: as `.` and at
-  # its own path, which the fixtures read through CARGO_MANIFEST_DIR. The grid
+  # test as ignored. The runner preopens the workspace root twice: as `.` and
+  # at its own path, so the fixtures can read `glmm-rs/../validation/` through
+  # CARGO_MANIFEST_DIR. The grid
   # data the lib tests include are the committed `validation/grid/data/fast/`
   # and `_wts` files.
   wasm-test:
@@ -190,11 +195,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo publish --dry-run
+      - run: cargo publish -p glmm --dry-run
 
   # ── r: build the fastglmm source tarball and run R CMD check on it ────────
   # Independent of the Rust/Python jobs above: it builds the tarball
-  # r-universe users get (see r/tools/cran-tarball.sh), not the workspace
+  # r-universe users get (see glmm-r/tools/cran-tarball.sh), not the workspace
   # crate directly.
   r:
     name: r (fastglmm package)
@@ -202,7 +207,7 @@ jobs:
     timeout-minutes: 30
     env:
       # No test calls skip_on_cran(); the live lme4 comparison lives in
-      # r/tools/acceptance-vs-lme4.R and is run by hand. This stays set
+      # glmm-r/tools/acceptance-vs-lme4.R and is run by hand. This stays set
       # so that a skip_on_cran() added later cannot silently skip here; the
       # "fail on any skipped test" step below is what notices.
       NOT_CRAN: "true"
@@ -216,19 +221,19 @@ jobs:
         # The test suite is greped for CALLS; R/ only for a LOAD. Roxygen prose
         # in R/ and man/ mentions lme4:: to say which convention a value
         # follows, and a sentence in a comment is documentation, not a
-        # dependency. r/tools/ is deliberately NOT greped: the live comparison
+        # dependency. glmm-r/tools/ is deliberately NOT greped: the live comparison
         # acceptance-vs-lme4.R lives there, is run by hand, and .Rbuildignore
         # keeps it out of the built tarball.
         run: |
-          if grep -rnE 'lme4::|glmmTMB::|GLMMadaptive::' r/tests/; then
+          if grep -rnE 'lme4::|glmmTMB::|GLMMadaptive::' glmm-r/tests/; then
             echo "::error::an R test calls an external statistics package — CI must check against saved numbers"
             exit 1
           fi
-          if grep -rnE 'library\((lme4|glmmTMB|GLMMadaptive)\)|require(Namespace)?\(.?(lme4|glmmTMB|GLMMadaptive)' r/R/; then
+          if grep -rnE 'library\((lme4|glmmTMB|GLMMadaptive)\)|require(Namespace)?\(.?(lme4|glmmTMB|GLMMadaptive)' glmm-r/R/; then
             echo "::error::the R package's own code loads an external statistics package"
             exit 1
           fi
-          echo "No external statistics engine is called by r/tests/ or loaded by r/R/."
+          echo "No external statistics engine is called by glmm-r/tests/ or loaded by glmm-r/R/."
       - uses: dtolnay/rust-toolchain@stable
       # The real compile happens later, inside the unpacked tarball under
       # $RUNNER_TEMP — a path that does not exist yet and has no stable
@@ -238,19 +243,19 @@ jobs:
       - uses: r-lib/actions/setup-r@v2
       - uses: r-lib/actions/setup-r-dependencies@v2
         with:
-          working-directory: r
+          working-directory: glmm-r
       - name: Build source tarball (self-contained, un-vendored)
         # Runs from a scratch directory so the tarball never lands in the
         # source tree; cran-tarball.sh finds the repo from its own path.
         run: |
           mkdir -p "$RUNNER_TEMP/r-build"
-          (cd "$RUNNER_TEMP/r-build" && "$GITHUB_WORKSPACE/r/tools/cran-tarball.sh")
+          (cd "$RUNNER_TEMP/r-build" && "$GITHUB_WORKSPACE/glmm-r/tools/cran-tarball.sh")
       - name: R CMD check
         # Also run from a scratch directory, for the same reason. Not
         # --as-cran: that mode adds a "Rust compilation" check that reports a
         # WARNING on this un-vendored tarball (it downloads crates), and the
         # step below fails on any WARNING. The vendored CRAN artifact is
-        # checked with --as-cran by hand (r/tools/cran-tarball.sh --vendor).
+        # checked with --as-cran by hand (glmm-r/tools/cran-tarball.sh --vendor).
         # --no-manual: the runner has no TeX, so a PDF manual is not
         # something to check here.
         run: |
@@ -312,11 +317,11 @@ jobs:
       - name: Build wheel (abi3, Linux x86_64)
         uses: PyO3/maturin-action@v1
         with:
-          working-directory: python
+          working-directory: glmm-py
           command: build
           args: --release --out dist
       - name: Install the built wheel (non-editable, catches packaging mistakes)
-        run: pip install --find-links python/dist glmm
+        run: pip install --find-links glmm-py/dist glmm
       - name: Install test + lint deps
         # ruff pinned so a new release's rule/formatter changes can't break CI
         # mid-release (0.16.0 did exactly that); bump deliberately. pandas,
@@ -328,11 +333,11 @@ jobs:
       - name: pytest against the installed wheel, run outside the source tree
         run: |
           cd "$RUNNER_TEMP"
-          python -m pytest "$GITHUB_WORKSPACE/python/tests" -v
+          python -m pytest "$GITHUB_WORKSPACE/glmm-py/tests" -v
       - name: ruff check
-        run: ruff check python/
+        run: ruff check glmm-py/
       - name: ruff format --check
-        run: ruff format --check python/
+        run: ruff format --check glmm-py/
 
   # ── port-gate: the three front ends must agree to round-off ───────────────
   # glmm (Rust), the Python wheel and the fastglmm R package all drive the SAME
@@ -366,15 +371,15 @@ jobs:
       - name: Build the wheel (the same build the python job makes)
         uses: PyO3/maturin-action@v1
         with:
-          working-directory: python
+          working-directory: glmm-py
           command: build
           args: --release --out dist
-      - name: Install the wheel into python/venv
-        # run.sh drives the port through python/venv/bin/python by name, so the
+      - name: Install the wheel into glmm-py/venv
+        # run.sh drives the port through glmm-py/venv/bin/python by name, so the
         # venv is where the wheel has to land.
         run: |
-          python -m venv python/venv
-          python/venv/bin/pip install --find-links python/dist glmm
+          python -m venv glmm-py/venv
+          glmm-py/venv/bin/pip install --find-links glmm-py/dist glmm
       - uses: r-lib/actions/setup-r@v2
         with:
           # Posit's public package manager serves Linux binaries, so jsonlite
@@ -387,11 +392,11 @@ jobs:
         run: Rscript -e 'install.packages(c("jsonlite", "generics", "Rcpp"))'
       - name: Install fastglmm from source
         id: fastglmm
-        # Straight from the checkout: r/configure writes src/Makevars and
-        # r/src/rust's path dependency on ../../../glmm-r resolves here. The
-        # CRAN-shaped tarball (r/tools/cran-tarball.sh) is the r job's business,
+        # Straight from the checkout: glmm-r/configure writes src/Makevars and
+        # glmm-r/src/rust's path dependency on ../../rust resolves here. The
+        # CRAN-shaped tarball (glmm-r/tools/cran-tarball.sh) is the r job's business,
         # not this one's.
-        run: R CMD INSTALL r
+        run: R CMD INSTALL glmm-r
       - name: Build the grid's glmm engine
         # Outside run.sh so a compile error is its own red step rather than a
         # watchdog timeout.
@@ -432,7 +437,7 @@ jobs:
           out="$RUNNER_TEMP/anova_ports"
           mkdir -p "$out"
           cargo run --release -p validation --example anova_ports > "$out/rust.jsonl"
-          python/venv/bin/python validation/tools/anova_ports/anova_ports.py > "$out/python.jsonl"
+          glmm-py/venv/bin/python validation/tools/anova_ports/anova_ports.py > "$out/python.jsonl"
           Rscript validation/tools/anova_ports/anova_ports.R > "$out/r.jsonl"
           Rscript validation/tools/anova_ports/compare_anova_ports.R \
             "$out/rust.jsonl" "$out/python.jsonl" "$out/r.jsonl"

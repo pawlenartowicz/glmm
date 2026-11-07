@@ -27,7 +27,7 @@ The package is not on CRAN yet. Install from a checkout (needs Rust — `cargo`
 and `rustc >= 1.85` on the `PATH`):
 
 ```r
-# in GLMM/r/
+# in GLMM/glmm-r/
 install.packages(".", repos = NULL, type = "source")
 ```
 
@@ -148,6 +148,19 @@ The knobs:
   formula, or pass the success **proportion** as the response and the trial
   count here — the same model, spelled by hand. Weights must be strictly
   positive.
+- `weight_power`: on a Gaussian model, how far the fit trusts `weights`:
+  row `i` has variance `σ²·wᵢ^(−weight_power)`. `1` takes the weights as
+  given, `0` ignores them, `"estimate"` fits the power by REML (by ML with
+  `REML = FALSE`) and refits at it. `NULL` (default) estimates it on a weighted
+  Gaussian REML fit with one grouping factor or none, at least 20 rows and
+  weights not all equal, and takes the weights as given everywhere else.
+  `fit$weight_power` reports the power used and `fit$estimated_weight_power` whether it was estimated. See
+  [`conventions.md`](conventions.md#weight-power-and-robust-standard-errors), which lists its limits.
+- `se_type`: `"model"` or `"robust"` (CR2 with Pustejovsky-Tipton df with a
+  grouping factor, HC2 with Bell-McCaffrey df without one), the one standard
+  error the fit reports. `NULL` (default) is `"robust"` on a fit that
+  estimates the weight power by REML with no random slope, `"model"`
+  everywhere else. `fit$se_type` reports it.
 - `offset` — per-row known additive term on the linear-predictor scale,
   `glm`'s `offset=`: `η = offset + Xβ (+ Zb)`, with no coefficient estimated
   for it and no column added to the design. The canonical use is a Poisson
@@ -226,7 +239,8 @@ shaped like lme4's. These **work**:
 | `fitted(fit)` | conditional means per row, including the random-effect contribution and any offset. |
 | `residuals(fit)` | `type = "response"` (default, `y - fitted`) or `type = "pearson"`. Deviance and working residuals are not offered. |
 | `tidy(fit)`, `glance(fit)` | broom-shaped data frames: one row per fixed effect (`term`, `estimate`, `std.error`, `statistic`, then `df` where `summary()` has a df column, then `p.value`; the statistic and p-value are the summary's, t or z), and one row of fit statistics (`nobs`, `logLik`, `AIC`, `BIC`, `deviance`, `df.residual`, `REML`). |
-| `fit$coef_df`, `fit$coef_p`, `fit$df_method` | per coefficient, the df of its t test (Satterthwaite on a Gaussian mixed model, `n - p` on OLS and the dispersion GLMs, `NaN` where the test is z and on an OLS or dispersion-GLM fit that did not converge) and that test's p-value; `df_method` says which (`"satterthwaite"`, `"residual"`, `"none"`, `"disabled"`, `"failed"`). |
+| `fit$coef_df`, `fit$coef_p`, `fit$df_method` | per coefficient, the df of its t test (Satterthwaite on a Gaussian mixed model, `n - p` on OLS and the dispersion GLMs, `NaN` where the test is z and on an OLS or dispersion-GLM fit that did not converge) and that test's p-value; `df_method` says which (`"satterthwaite"`, `"residual"`, `"none"`, `"disabled"`, `"failed"`, and on a robust fit `"pustejovsky_tipton"` or `"bell_mccaffrey"`). |
+| `fit$weight_power`, `fit$estimated_weight_power`, `fit$se_type` | the power used on `weights` (the estimate on a fitted power, 1 on the weights as given, `NaN` without weights), whether the fit estimated it, and the standard error behind `se`, `vcov` and `coef_df` (`"model"` or `"robust"`); see [`conventions.md`](conventions.md#weight-power-and-robust-standard-errors). |
 | `fit$rss`, `fit$r_squared`, `fit$adj_r_squared` | OLS only: the weighted residual sum of squares and `summary.lm`'s multiple and adjusted R-squared (0 on an intercept-only model); `NaN` on every other fit and on a non-converged one. |
 | `logLik(fit)` | log-likelihood on `stats::logLik`'s scale; on a REML fit (a Gaussian mixed model with the default `REML`, or OLS with `REML = TRUE`) this is the REML criterion (`REML = TRUE` attribute), on every other fit the ML log-likelihood (`REML = FALSE`). |
 | `AIC(fit)`, `BIC(fit)` | `stats`'s values and tables, read from `logLik()`. Two comparisons stop with an error instead: a REML fit beside an ML fit (the error names which is which), and REML fits with different fixed effects, whose REML criteria are not comparable (the error points to `compare()` and to `REML = FALSE`). ML fits compare across fixed effects as in `stats`. See `?AIC.fastglmm` for the uses it cannot check. |

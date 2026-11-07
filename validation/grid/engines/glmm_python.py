@@ -254,7 +254,8 @@ def fit_one(cell):
         # glmm_formula, NOT jl_formula: gen_manifest.R already produced the
         # crate's dialect, so this file does no formula rewriting at all.
         formula = cell["glmm_formula"]
-        kw = {"link": cell["link"], "weights": weights, "offset": offset}
+        # weight_power=1: the weighted cells check the weights as given.
+        kw = {"link": cell["link"], "weights": weights, "offset": offset, "weight_power": 1}
         if cell.get("nagq") is not None:
             kw["nagq"] = int(cell["nagq"])
         # A cell tagged `ml` (an ML twin) is fitted by ML; every other cell

@@ -5,9 +5,9 @@
 # .libPaths() (the user library) and REPLACES whatever version of lme4 / glmmTMB /
 # GLMMadaptive is there, and of the inference reference generators' pins
 # (INFERENCE_PKGS: lmerTest / RLRsim / car / numDeriv / MASS / jsonlite / afex /
-# emmeans / performance / effectsize / insight / pbkrtest / reformulas). MASS
-# ships with R, so the loop skips it when the system library's copy already
-# matches the pin. Nothing else on the machine is consulted about that.
+# emmeans / performance / effectsize / insight / pbkrtest / reformulas / nlme /
+# clubSandwich). MASS and nlme ship with R, so the loop skips them when the system
+# library's copy already matches the pin. Nothing else on the machine is consulted about that.
 #
 # remotes::install_version(pkg, version) is used for every package even where the pin
 # happens to be CRAN's current version: it pins exactly, resolving against the
@@ -16,7 +16,8 @@
 #
 # The R and Julia pins in versions.json are NOT asserted here -- the language
 # runtime is not the estimator; run.sh records them in run_meta.json. Nor is
-# the Python package pin `mpmath`: tools/goldens_glm_band.py asserts it.
+# the Python package pins: tools/goldens_glm_band.py asserts `mpmath`,
+# tools/goldens_cr2_hp.py asserts `python-flint` and `numpy`.
 # The Julia package pin lives in grid/Project.toml + grid/Manifest.toml and is
 # reached with `julia --project=<grid> -e 'using Pkg; Pkg.instantiate()'`.
 
@@ -53,13 +54,13 @@ PKGS <- c("lme4", "glmmTMB", "GLMMadaptive")
 # assert_inference_versions(), but the generators do not attach it, so the
 # INFERENCE_PKGS of tools/inference_common.R leaves it out on purpose: keep the
 # two lists different. The same holds for emmeans, performance, effectsize,
-# insight, pbkrtest and reformulas: each generator that loads one asserts its pin
-# itself. On a fresh machine install_version() pulls any missing afex Import at
+# insight, pbkrtest, reformulas, nlme and clubSandwich: each generator that
+# loads one asserts its pin itself. On a fresh machine install_version() pulls any missing afex Import at
 # CRAN's current version; versions.json records the unpinned ones afex was frozen
 # with.
 INFERENCE_PKGS <- c("lmerTest", "RLRsim", "car", "numDeriv", "MASS", "jsonlite", "afex",
                     "emmeans", "performance", "effectsize", "insight", "pbkrtest",
-                    "reformulas")
+                    "reformulas", "nlme", "clubSandwich")
 for (pkg in c(PKGS, INFERENCE_PKGS)) {
   want <- V[[pkg]]
   have <- tryCatch(as.character(utils::packageVersion(pkg)),

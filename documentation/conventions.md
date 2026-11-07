@@ -166,6 +166,98 @@ Two recipes, depending on what the weight means in your data:
   Gamma dispersion predictor is on the log-shape scale) and
   `~ offset(-0.5 * log(w))` for Gaussian (log σ scale).
 
+## Weight power and robust standard errors
+
+On a Gaussian model, `weight_power` (R `weight_power =`, Python
+`weight_power=`, Rust `FitOptions::weight_power`) says how far the fit trusts
+the weights: row `i` has variance `σ²·wᵢ^(−δ)`. `δ = 1` takes the weights as
+precisions, as in [Prior weights](#prior-weights); `δ = 0` ignores them. A
+number fits on `w^δ` with the model-based standard error. `"estimate"` fits δ
+by maximizing the REML log-likelihood (the ML one with `REML = FALSE` /
+`reml=False`) over a golden-section search and refits at δ̂; δ̂ counts as one
+parameter in the fit's df. The fit reports the power it used
+(`fit$weight_power`, `m.weight_power`, `Fit::weight_power()`; NaN without
+weights) and whether it estimated it (`fit$estimated_weight_power`,
+`m.estimated_weight_power`).
+
+`se_type` chooses the one standard error the fit reports: `"model"`, or
+`"robust"`, which is CR2 with Pustejovsky-Tipton df (clustered by the
+grouping factor) on a model with one grouping factor and HC2 with
+Bell-McCaffrey df on a model without one. `se`, `vcov`, `coef_df`,
+`summary`, `confint`, `contrast_test` with one row and `pairwise` all read
+it, so a coefficient has one p-value everywhere; changing it means fitting
+again. A test of more than one df (`contrast_test` with several rows, the
+multi-df `anova` rows) and `predict` standard errors stay model-based on a
+robust fit, with a warning, because their formulas hold only with the
+model's covariance.
+
+**The default.** A weighted Gaussian REML fit with one grouping factor or
+none, at least 20 rows and weights not all equal estimates δ; its standard
+error is CR2 with a grouping factor and no random slope, HC2 without a
+grouping factor, and the model SE with a random slope. Every other call
+keeps the weights as given. `weight_power = 1` gives the result of glmm
+0.8.0 on any call. `compare(data, f0, f1)` with weights fits δ by ML in both
+models and tests the fixed part by the likelihood-ratio test; `anova(m0, m1)`
+refuses two fits whose powers differ, and two fits that estimated δ and
+differ only in their random part.
+
+**The summary** prints `Weight power: <δ̂> (estimated)`, or the fixed power
+when it is not 1; the line "The estimated weight power is outside [-1, 2],
+the range the simulations behind it covered." when δ̂ left the simulated
+range (a line, not a warning: see Limits); the robust standard error's name
+and df as its footnote; and on a model standard error of a fitted power,
+that the standard errors treat δ̂ as known (on an ML fit, also that the
+simulations estimated it by REML).
+
+The method is built from established parts, not established as a whole: the
+power curve is nlme's `varPower` on the weights, and CR2 with
+Pustejovsky-Tipton df is Pustejovsky and Tipton (2018), both published and in
+software. Using the caller's own weight as the variance covariate is not
+shown to be standard practice. A fixed `weight_power` other than 0 and 1 has
+no simulation evidence: it fits the model the caller names, with the model
+standard error, and nothing here says that model is right.
+
+### Limits
+
+- CR2 repairs the variance, not the mean. It needs independent groups, a
+  correct mean and weights unrelated to the row's error. With 10 groups it
+  runs liberal when real random slopes are left out of the model (Type I
+  about .065).
+- At 10 groups the robust test pays in width through its t quantile, not its
+  standard error (t(6.7)/z about 1.22); `se_type = "robust"` on weights
+  without the δ fit is valid but loses most of the power when the weights
+  are wrong.
+- δ̂ and the robust df treat the working model as known.
+- The δ fit's model SE with Satterthwaite df failed in simulation where a
+  real random slope was left out of the model (worst Type I .252). A fit with
+  one random slope defaults to this SE, so a second row-level predictor whose
+  slope the model leaves out can fail the same way; that case was not
+  simulated.
+- Without groups the default is HC2: it held Type I at .052 to .055 (worst
+  .075) at n of 50 or less and costs power, .40 at n = 20 and .43 at n = 50
+  against .49 for the model SE. With `se_type = "model"` Type I averaged .065
+  to .072 there (worst .095), its df `n − p` do not count δ̂, and on noise
+  off the power curve it stayed near .07 to .08 as n grew.
+- Weights computed from the response: the δ fit is liberal at small n, with
+  HC2 too (.078 to .105), where the weights as given with a robust SE held
+  (.052 to .067). The fit cannot detect this.
+- The out-of-range line says only that δ̂ left [−1, 2], the range the
+  simulations searched. On narrow weights it fires with nothing wrong: at
+  n = 100 δ̂ is outside in about 57% of fits when the largest weight is 1.2
+  times the smallest, 25 to 30% at 1.5 times, about 10% at 2 times and never
+  at 20 times.
+- When the noise variance itself spreads by 1e24 or more across rows, δ̂ can
+  end short of the truth with no note.
+- A predictor constant within groups: use `se_type = "model"`. With 10 groups
+  CR2's df are about 3 (wider intervals, power .29 against .42). The choice
+  applies to every coefficient of the fit.
+- CR2 loses accuracy near leverage 1 (about 1e-16/τ, τ one minus the largest
+  eigenvalue of the leverage); weight spreads above 1e6 inside a group are not
+  tested.
+- `compare()` and `anova(m0, m1)` with fitted powers treat δ as a nuisance
+  parameter estimated by ML in each model; the size of that test has no
+  simulation evidence from the work behind the weight power.
+
 ## Variance components scale
 
 Random-effect (co)variances are reported on lme4's **SD/correlation** scale —

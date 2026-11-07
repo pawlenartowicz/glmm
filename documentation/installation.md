@@ -51,15 +51,15 @@ install.packages("fastglmm", repos = c("https://pawlenartowicz.r-universe.dev", 
 From a checkout — needs Rust (`cargo` and `rustc >= 1.85` on the `PATH`):
 
 ```r
-# in GLMM/r/
+# in GLMM/glmm-r/
 install.packages(".", repos = NULL, type = "source")
 ```
 
-The Rust surface lives in the repo's `glmm-r` crate; `r/src/rust` is a thin
-staticlib re-export the R build drives. Path dependencies resolve only inside
-the repo checkout — a distributable, self-contained source tarball (with the
+The Rust surface lives in the repo's `glmm-r` crate (`glmm-r/rust`);
+`glmm-r/src/rust` is a thin staticlib re-export the R build drives. Path
+dependencies resolve only inside the repo checkout — a distributable, self-contained source tarball (with the
 in-repo crates materialized and, optionally, all cargo dependencies vendored
-for offline/CRAN builds) is produced from `r/` by:
+for offline/CRAN builds) is produced from `glmm-r/` by:
 
 ```sh
 tools/cran-tarball.sh [--vendor]

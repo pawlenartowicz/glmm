@@ -62,7 +62,7 @@ four oracles (lme4, glmmTMB, MixedModels.jl, GLMMadaptive).
   random effects per group (lme4 has no `nAGQ` for `glmer.nb` beyond what
   `glmer` offers, and none for Gamma with φ estimated); any
   other shape warns and falls back to Laplace instead of erroring the way
-  lme4 does — watch for the warning (`r/README.md`). A random slope without
+  lme4 does — watch for the warning (`glmm-r/README.md`). A random slope without
   a random intercept, `(0 + x | g)`, counts one random effect more than lme4
   counts, since the kernel keeps the intercept column at zero variance, so
   the limit of 3 is reached one slope sooner.

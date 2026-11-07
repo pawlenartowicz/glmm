@@ -54,7 +54,7 @@ creates (default: `mktemp -d`, outside this repo); the real tree's
   compiled in, but patching all three means the same one `.patch` covers
   x86_64, aarch64 and wasm32 hosts.
 - `lanewidth_probe.rs` — a small Rust source the script stages as
-  `examples/lanewidth_probe.rs` into each scratch copy (never into the real
+  `glmm-rs/examples/lanewidth_probe.rs` into each scratch copy (never into the real
   tree). It prints `pulp::Arch::new()`'s `Debug` form, then refits the same
   sparse-NB design and data as `fit_sparse_nb_glmm_is_pinned` and prints
   `beta`, `se`, `varcorr` and `dispersion` (theta). This is both the
@@ -101,7 +101,7 @@ cargo's single-`TESTNAME` argument), so you can pass more than one.
 4. Appends a `[patch.crates-io]` table pointing `pulp` at the patched
    vendor path — **only** to `scalar/Cargo.toml`, never to `normal/` and
    never to the real tree.
-5. Stages `lanewidth_probe.rs` as `examples/lanewidth_probe.rs` in both
+5. Stages `lanewidth_probe.rs` as `glmm-rs/examples/lanewidth_probe.rs` in both
    scratch trees and runs it in each (`cargo run --example
    lanewidth_probe`), capturing stdout to `results/<ts>/probe_{normal,
    scalar}.txt`.

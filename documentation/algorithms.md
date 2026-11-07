@@ -51,7 +51,7 @@ flowchart TD
   BW -->|"any family, Some(re)"| CD{"classify_design: NoZ or Sparse"}
 
   CD -->|Gaussian| MLE["lmm_run_on (Dense or Sparse LmmKernel)"]
-  CD -->|NegativeBinomial| GNB["fit_glmm_nb (blocked, structured or packed layout)"]
+  CD -->|NegativeBinomial| GNB["run_glmm_nb_on (blocked, structured or packed layout)"]
   CD -->|"Binomial/Poisson/Gamma"| GMM["run_glmm_on (blocked, structured or packed layout)"]
 ```
 
@@ -278,12 +278,12 @@ design as given and warns on badly scaled predictors (`checkScaleX`).
 
 - **Node** = a named function the dispatch actually calls; the terminal leaves
   (`fit_ols_prebuilt`, `fit_glm_prebuilt`, `fit_glm_nb`, `lmm_run_on`,
-  `run_glmm_on`, `fit_glmm_nb`) are the solvers.
+  `run_glmm_on`, `run_glmm_nb_on`) are the solvers.
   **Diamond** = a real branch in the code (`match`, `classify_design`, a guard).
   **Edge label** = the condition under which that branch is taken.
-- **Code citations** across all three pages use the form `src/path/file.rs` plus
-  the item name (fn/struct/const) — never line numbers, so a citation survives
-  edits to the file. When an item name is unique in the crate the file alone
+- **Code citations** across all three pages use the form `src/path/file.rs` (relative to
+  `glmm-rs/`) plus the item name (fn/struct/const) — never line numbers, so a
+  citation survives edits to the file. When an item name is unique in the crate the file alone
   locates it. (The `fit` and `sparse` modules are directories: the entry and its
   preprocessing live in `src/fit/mod.rs` and `src/fit/common.rs`, the dispatch
   itself in `src/fit/core.rs`, the per-path entry points in

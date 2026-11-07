@@ -39,7 +39,7 @@ fn main() {
     println!("pulp::Arch::new() = {:?}", pulp::Arch::new());
 
     // Same design + data as sparse::tests::fit_sparse_nb_glmm_is_pinned.
-    let csv = include_str!("../validation/data/simulated/sim_sparse_nb.csv");
+    let csv = include_str!("../../validation/data/simulated/sim_sparse_nb.csv");
     let mut y = Vec::<f64>::new();
     let mut xcol = Vec::<f64>::new();
     let mut fac: Vec<Vec<String>> = vec![Vec::new(); 8]; // g1, c1..c7

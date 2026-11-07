@@ -288,7 +288,12 @@ a miss names the cell, the quantity, the rate, the band and its distance in stan
 errors. `calibration_measurement` measures without gating, at `MC_R` datasets per
 cell (default 2000). `cargo test --features montecarlo-tests` runs
 `calibration_gates` together with the level study of the exact restricted
-likelihood-ratio test. Measuring the 216 cells (`calibration_measurement`) took 43
+likelihood-ratio test and the two weighted gates, `dcr_type1_of_x` (the Type I
+of `x` of the default weighted fit on 16 cells) and `dcr_lrt_null` (the null
+Type I of `compare()` with the weight power fitted by ML in both models, on 10
+cells). These two read `MC_R` (gated only at 2000), `MC_THREADS`, and
+`MC_DCR_CELLS`, a comma-separated list of their cell ids, and print one `DCR`
+line per cell with its rejection rate and the estimator the defaults chose. Measuring the 216 cells (`calibration_measurement`) took 43
 minutes with eight threads; `calibration_gates` runs the same measurement and takes
 about as long; the GLMM cells are nearly all of it.
 

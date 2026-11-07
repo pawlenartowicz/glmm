@@ -6,7 +6,7 @@ each table written to stdout as one JSONL row per cell. Mirrors
 list and the cell format are documented in `anova_ports.rs`.
 
 Run from the repository root:
-    python/venv/bin/python validation/tools/anova_ports/anova_ports.py > anova_py.jsonl
+    glmm-py/venv/bin/python validation/tools/anova_ports/anova_ports.py > anova_py.jsonl
 """
 
 import json
@@ -242,6 +242,7 @@ def fit(data, m, weights, anova_test="auto"):
         m["family"],
         link=m["link"],
         weights=weights,
+        weight_power=1,
         nagq=m["nagq"],
         reml=m["reml"],
         anova_test=anova_test,
@@ -265,6 +266,7 @@ def compare_call(call, data, m, weights, nobs=False):
             link=m[0]["link"],
             weights=weights,
             nagq=max(m[0]["nagq"], m[1]["nagq"]),
+            weight_power=1,
         )
     except ValueError as e:
         refused(call, e)

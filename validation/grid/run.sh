@@ -65,7 +65,7 @@
 # run directory from scratch. Nothing is overwritten either way.
 set -euo pipefail
 GRID="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# The crate root: grid/ sits in validation/, which sits in the crate.
+# The repo root: grid/ sits in validation/, which sits beside glmm-rs/.
 ROOT="$(cd "$GRID/../.." && pwd)"
 command -v jq >/dev/null || { echo "run.sh needs jq" >&2; exit 2; }
 
@@ -278,8 +278,8 @@ case "$ENGINE" in
   # record with the version their own build reports, and a suffix added here
   # would put two spellings of one version in one results.jsonl. The build's
   # provenance is run_meta's glmm_git_rev (write_run_meta below).
-  glmm|glmm_wasm) ENGINE_VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$ROOT/Cargo.toml" | head -1)" ;;
-  glmm_python) ENGINE_VERSION="$("$ROOT/python/venv/bin/python" -c 'from importlib.metadata import version; print(version("glmm"))')" ;;
+  glmm|glmm_wasm) ENGINE_VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$ROOT/glmm-rs/Cargo.toml" | head -1)" ;;
+  glmm_python) ENGINE_VERSION="$("$ROOT/glmm-py/venv/bin/python" -c 'from importlib.metadata import version; print(version("glmm"))')" ;;
   glmm_r)      ENGINE_VERSION="$(Rscript -e 'cat(as.character(packageVersion("fastglmm")))')" ;;
 esac
 
@@ -352,13 +352,14 @@ write_run_meta() {   # $1 = the cell_list JSON array
   # port run whose rev or hash differs from the glmm run's.
   # Cargo.lock is left out: the glmm build after this point may rewrite it, and
   # Cargo.toml already names the dependencies.
-  local code=(src Cargo.toml glmm-python glmm-r python/glmm r/R r/src
+  local code=(Cargo.toml glmm-rs/src glmm-rs/Cargo.toml glmm-bind glmm-py/Cargo.toml glmm-py/src glmm-py/glmm
+              glmm-r/rust glmm-r/R glmm-r/src
               validation/grid/engines/common.rs validation/grid/engines/glmm.rs
               validation/grid/engines/glmm_python.py validation/grid/engines/glmm_r.R)
   tree="$( { git -C "$ROOT" diff HEAD -- "${code[@]}"
              git -C "$ROOT" ls-files -z --others --exclude-standard -- "${code[@]}" \
                | (cd "$ROOT" && xargs -0 cat); } 2>/dev/null | git hash-object --stdin)"
-  crate="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$ROOT/Cargo.toml" | head -1)"
+  crate="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$ROOT/glmm-rs/Cargo.toml" | head -1)"
   r_ver="$(Rscript -e 'cat(as.character(getRversion()))' 2>/dev/null || echo '?')"
   jl_ver="$(julia --version 2>/dev/null | awk '{print $3}' || echo '?')"
   jq -n \
@@ -415,7 +416,7 @@ case "$ENGINE" in
   glmm_wasm)    CMD=(wasmtime run --dir /::/ --env GRID_DIR --env GRID_MANIFEST --env GRID_TIMED
                      --env GRID_OUT --env GRID_CELLS --env RAYON_NUM_THREADS
                      "$ROOT/target/wasm32-wasip1/release/examples/grid_glmm.wasm") ;;
-  glmm_python)  CMD=("$ROOT/python/venv/bin/python" "$GRID/engines/glmm_python.py") ;;
+  glmm_python)  CMD=("$ROOT/glmm-py/venv/bin/python" "$GRID/engines/glmm_python.py") ;;
   glmm_r)       CMD=(Rscript "$GRID/engines/glmm_r.R") ;;
   lme4)         CMD=(Rscript "$GRID/engines/lme4.R") ;;
   glmmtmb)      CMD=(Rscript "$GRID/engines/glmmtmb.R") ;;

@@ -1,12 +1,18 @@
 /target
 dhat-heap.json
-python/venv
+glmm-py/venv
 __pycache__/
 *.egg-info/
-python/build/
+glmm-py/build/
 .DS_Store
-python/glmm/_native*.so
-python/glmm/_native*.pyd
+# Compiled outputs anywhere in the tree: the Python extension, the R
+# package's objects and shared library, and R's generated Makevars.
+*.so
+*.pyd
+*.dll
+*.o
+Makevars
+Makevars.win
 
 # validation: campaign raw output is regenerable and ignored; campaign reports/ are
 # committed. All input CSVs under validation/data/ ARE committed (empirical from lme4/nlme
