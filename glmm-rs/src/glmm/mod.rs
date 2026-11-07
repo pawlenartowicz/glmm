@@ -3167,7 +3167,8 @@ pub fn fit_glmm(
         // deviance by tens of units. A pin that leaves the objective
         // non-finite or more than `PIN_DEVIANCE_SLACK` above the incumbent
         // (the search's best, or the polish's) is undone. False on a NaN
-        // objective too.
+        // objective too. `lmm::fit_lmm` applies the same rule — change
+        // together.
         let pinned_obj = |dev: f64| {
             if n_disp == 1 && held_phi.is_none() {
                 dev + nb_dev_term

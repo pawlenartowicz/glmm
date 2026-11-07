@@ -536,6 +536,22 @@ if [[ -n "$COMPLETE_FROM" ]]; then
 fi
 
 PIDS=()
+# A non-interactive bash starts `&` jobs with SIGINT ignored, so Ctrl-C would kill
+# only this shell and leave every worker and engine fitting. Stop them here.
+# Each worker's children are listed before the worker dies, since they are
+# reparented after that and the worker would relaunch an engine killed first.
+stop_workers() {
+  trap - INT TERM
+  echo ">> $ENGINE: interrupted -- stopping workers" >&2
+  local p kids
+  for p in "${PIDS[@]}"; do
+    kids=$(pgrep -P "$p" || true)
+    kill -TERM "$p" $kids 2>/dev/null || true
+  done
+  exit "$1"
+}
+trap 'stop_workers 130' INT
+trap 'stop_workers 143' TERM
 for ((i = 0; i < JOBS; i++)); do
   run_worker "$i" &
   PIDS+=("$!")

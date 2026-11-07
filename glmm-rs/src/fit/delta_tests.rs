@@ -191,6 +191,34 @@ fn reml_search_reaches_the_grid_best() {
     );
 }
 
+/// Spread 1e16 at δ = −1.5: the internal θ̂ (about 7e-5) is below `PIN_THETA`,
+/// but zeroing it costs about 281 log-likelihood units, so the incumbent check
+/// keeps it. A pinned fit would equal the WLS fit, the same model with no
+/// random intercept.
+#[test]
+fn a_pin_that_costs_deviance_is_undone() {
+    let set = dataset(13, 150, 10, 1.0, 1e16, 1.5);
+    let opts = FitOptions {
+        weight_power: Some(WeightPower::Fixed(-1.5)),
+        reml: Some(true),
+        ..FitOptions::default()
+    };
+    let mixed = set.fit(&opts);
+    let wls = crate::fit(
+        &Data::new(&set.x, &set.y, set.n, 2).weights(&set.w),
+        &ModelSpec::fixed(Family::Gaussian),
+        &opts,
+    )
+    .unwrap();
+    assert!(mixed.converged() && mixed.varcorr(0)[0] > 0.0);
+    assert!(
+        mixed.loglik() - wls.loglik() > 200.0,
+        "{} vs {}",
+        mixed.loglik(),
+        wls.loglik()
+    );
+}
+
 /// The LMM's rounding estimate reads the response uncentred: a mean 1e6 times
 /// the residual SD at n = 1000 takes `PrecisionLimited`, a mean 1e2 times it
 /// does not.

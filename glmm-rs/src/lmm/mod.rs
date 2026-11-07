@@ -150,7 +150,8 @@ pub const THETA_TRUTH_FLOOR: f64 = 0.01;
 pub const PIN_THETA: f64 = 1e-4;
 
 /// How far above the search's best objective a pinned fit may land and keep
-/// its pin, in deviance units (`fit_glmm`'s incumbent check). Measured
+/// its pin, in deviance units (the incumbent checks of `fit_glmm` and
+/// `fit_lmm`). Measured
 /// 2026-10-04: on the 67 pinned GLMM cells of the accuracy grid and on 614
 /// simulated pinned fits whose data was not kept (Poisson and binomial;
 /// crossed, nested and random-slope shapes) a pin costs at most 5.2e-8, while
@@ -1243,6 +1244,9 @@ pub struct LmmWorkspace {
     pub(crate) bfgs: crate::optim::bfgs::BfgsState,
     /// θ in/out buffer for `minimize`; holds θ̂ (post-pin) after `fit_lmm`.
     pub theta: Vec<f64>,
+    /// The search's endpoint with its sign fix, `theta`'s length: `fit_lmm`
+    /// returns θ to it when the pin raises the deviance.
+    pub(crate) theta_endpoint: Vec<f64>,
     /// Lower box bound, −THETA_HI on every entry (`blind_theta_and_bounds`).
     pub lower: Vec<f64>,
     /// Upper box bound, THETA_HI on every entry.
@@ -1346,6 +1350,7 @@ impl LmmWorkspace {
             solver_warm: None,
             bfgs: Default::default(),
             config,
+            theta_endpoint: vec![0.0; theta.len()],
             theta,
             lower,
             upper,
@@ -2855,6 +2860,7 @@ pub fn fit_lmm(
         config,
         bfgs,
         theta,
+        theta_endpoint,
         lower,
         upper,
         ..
@@ -2947,29 +2953,42 @@ pub fn fit_lmm(
     // latch when the fit actually converged — a capped endpoint is reported
     // as a point, not accepted onto the boundary. The pinned re-eval below
     // runs on the canonicalized θ. The GLMM pin site departs from this on its
-    // AGQ route, and undoes a pin that raises the deviance; the reasons are
-    // written there.
-    let (pinned, pinned_components) = if has_endpoint {
-        let flags = pin_endpoint(kernel.groupings(), theta, None);
-        if converged {
-            flags
-        } else {
-            (false, 0)
-        }
-    } else {
-        (false, 0)
-    };
+    // AGQ route; the reasons are written there.
+    let mut flags = (false, 0);
+    if has_endpoint {
+        theta_endpoint.copy_from_slice(theta);
+        fix_column_signs(kernel.groupings(), theta_endpoint);
+        kernel.groupings().zero_structural(theta_endpoint);
+        flags = pin_endpoint(kernel.groupings(), theta, None);
+    }
 
     // Pin eval at θ̂ — refreshes factor/σ̂² at the accepted-or-capped point
     // (the shipped path's "pin Cholesky at θ̂" step). Armed first: this is the
     // evaluation the conditional-mode recovery rides on, and arming keeps the
     // per-family factors it needs for this call alone.
-    let dev = if has_endpoint {
+    let mut dev = if has_endpoint {
         kernel.prepare_recovery();
         kernel.deviance(theta)
     } else {
         f64::INFINITY
     };
+    // Incumbent check, the rule of `fit_glmm`'s (mirrors it — change
+    // together). `PIN_THETA` is absolute on the internal θ, but under weights
+    // spanning many orders a θ of 7e-5 is a real variance, and zeroing it
+    // cost 281 log-likelihood units on a weight-power fit. A pin that leaves
+    // the deviance non-finite or more than `PIN_DEVIANCE_SLACK` above the
+    // search's best is undone, and the fit is reported at the search's
+    // endpoint.
+    let slack = PIN_DEVIANCE_SLACK.max(PIN_NOISE_ULPS * f64::EPSILON * out.f.abs());
+    // False on a NaN deviance too.
+    let kept = dev <= out.f + slack;
+    if flags.0 && !kept {
+        theta.copy_from_slice(theta_endpoint);
+        flags = (false, 0);
+        kernel.prepare_recovery();
+        dev = kernel.deviance(theta);
+    }
+    let (pinned, pinned_components) = if converged { flags } else { (false, 0) };
 
     // The kernel factored `[X̃ y]`, X̃ = X·U⁻¹ (`DesignQr`). β̃ comes off that
     // factor first, by the backward solve L̃_XXᵀ β̃ = l_yX̃ (the y row of the

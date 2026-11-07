@@ -126,6 +126,15 @@ test_that("VarCorr omits the Residual row on a non-gaussian mixed fit", {
   expect_false(grepl("Residual", paste(capture.output(print(vc)), collapse = "\n")))
 })
 
+test_that("VarCorr prints a diverged binomial mixed fit, which has no variance rows", {
+  set.seed(1)
+  x <- rnorm(80)
+  d <- data.frame(x = x, y = as.numeric(x > 0), g = factor(rep(1:10, each = 8)))
+  fit <- suppressWarnings(fastglmm(y ~ x + (1 | g), d, family = binomial()))
+  expect_false(fit$converged)
+  expect_identical(capture.output(print(VarCorr(fit))), "No variance estimates.")
+})
+
 test_that("accessors: nobs, formula, family, model.frame", {
   d <- benchmark_data(seed = 105, family = "binomial")
   fit <- fastglmm(y ~ t + d + (1 | g), d, family = binomial())

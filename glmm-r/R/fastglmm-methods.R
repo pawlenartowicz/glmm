@@ -440,6 +440,11 @@ print.VarCorr.fastglmm <- function(x,
     row <- c(row, format(sc, digits = digits), "")
     cells[[length(cells) + 1L]] <- row
   }
+  # A `no_optimum` exit on a family without a residual scale leaves no rows.
+  if (!length(cells)) {
+    cat("No variance estimates.\n")
+    return(invisible(x))
+  }
   rows <- as.data.frame(do.call(rbind, cells), stringsAsFactors = FALSE)
   names(rows) <- cols
   print(rows, row.names = FALSE, right = FALSE)
