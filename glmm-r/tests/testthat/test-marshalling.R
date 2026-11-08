@@ -59,6 +59,13 @@ test_that("every row missing in a used column gives the same message as the Pyth
   )
 })
 
+test_that("empty data gives the same message as the Python port", {
+  # Mirrors glmm-py/tests/test_validation.py's test_empty_data_is_refused.
+  d <- data.frame(y = numeric(), x = numeric(), g = factor())
+  expect_error(fastglmm(y ~ x + (1 | g), d),
+               "^Data has no rows \\(n = 0\\); a fit needs at least one row$")
+})
+
 test_that("weights are honored; zero/short/negative weights are clean errors", {
   d <- ols_data()
   w <- rep(c(2, 1), 5)
@@ -68,6 +75,18 @@ test_that("weights are honored; zero/short/negative weights are clean errors", {
   expect_error(fastglmm(y ~ x, d, weights = c(1, 2)), "one entry")
   expect_error(fastglmm(y ~ x, d, weights = rep(-1, 10)), "positive")
   expect_error(fastglmm(y ~ x, d, weights = c(0, rep(1, 9))), "positive")
+})
+
+test_that("an NA or NaN in weights= or offset= is refused as not finite", {
+  d <- ols_data()
+  for (bad in c(NA, NaN)) {
+    v <- rep(1, nrow(d))
+    v[3] <- bad
+    expect_error(fastglmm(y ~ x, d, weights = v),
+                 "weights must be finite: no NaN, inf, or missing entries", fixed = TRUE)
+    expect_error(fastglmm(y ~ x, d, offset = v),
+                 "offset must be finite: no NaN, inf, or missing entries", fixed = TRUE)
+  }
 })
 
 test_that("offset= is honored as an expression and stays aligned under subset=", {
@@ -209,6 +228,15 @@ test_that("a tibble keeps its class in model.frame(fit)", {
   fit <- fastglmm(y ~ x + (1 | g), tb)
   expect_identical(class(model.frame(fit)), class(tb))
   expect_identical(fit$beta, fastglmm(y ~ x + (1 | g), d)$beta)
+})
+
+test_that("an NA in a logical subset= drops that row without a warning, as lm does", {
+  set.seed(5)
+  d <- data.frame(y = rnorm(29), x = rnorm(29))
+  s <- c(NA, NA, NA, rep(TRUE, 26))
+  expect_no_warning(fit <- fastglmm(y ~ x, d, subset = s))
+  expect_equal(nobs(fit), 26)
+  expect_identical(fit$.row_index, 4:29)
 })
 
 test_that("a data.table keeps its class in model.frame(fit)", {

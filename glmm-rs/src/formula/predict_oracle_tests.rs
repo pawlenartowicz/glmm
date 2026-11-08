@@ -385,7 +385,8 @@ fn predict_references() {
         let lo = model.lowered();
         let spec = lo.spec();
         let glmm = model.fit();
-        let rows = lower_new(formula, lo, &new).unwrap_or_else(|err| panic!("{name}: {err}"));
+        let rows =
+            lower_new(formula, lo, &new, false).unwrap_or_else(|err| panic!("{name}: {err}"));
         let design = rows.design();
         let mixed = spec.re.is_some();
         let beta_ref = lme4_beta(&json, lo);

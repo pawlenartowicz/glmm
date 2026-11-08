@@ -70,7 +70,9 @@ pub(crate) use fixed_part::{fixed_part_relation, FixedPartRelation};
 // `orchestrate::model_matrix_columns`, `orchestrate::term_labels` and
 // `orchestrate::predict` call them.
 #[cfg(feature = "orchestrate")]
-pub(crate) use materialize::{design_columns, fixed_design, lower_new, r_terms};
+pub(crate) use materialize::{
+    design_columns, drop_unused_levels, fixed_design, lower_new, r_terms,
+};
 pub use materialize::{
     fit, fit_lowered, lower, predict, Column, FixedTerm, Lowered, Model, RanefBlock, ReGroupInfo,
     Table,

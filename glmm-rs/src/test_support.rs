@@ -383,6 +383,44 @@ pub(crate) fn table_from_rows(
     }
 }
 
+/// `table` with the label "zzz" inserted into `name`'s levels at `at`, used by
+/// no row (codes at or past `at` shift up by one).
+#[cfg(feature = "formula")]
+pub(crate) fn with_unused(
+    table: &crate::formula::Table,
+    name: &str,
+    at: usize,
+) -> crate::formula::Table {
+    use crate::formula::Column;
+    let columns = table
+        .columns
+        .iter()
+        .map(|(n, col)| {
+            let col = match col {
+                Column::Factor { levels, codes } if n == name => {
+                    let mut levels = levels.clone();
+                    levels.insert(at, "zzz".to_string());
+                    let codes = codes
+                        .iter()
+                        .map(|&c| c + u32::from(c as usize >= at))
+                        .collect();
+                    Column::Factor { levels, codes }
+                }
+                Column::Factor { levels, codes } => Column::Factor {
+                    levels: levels.clone(),
+                    codes: codes.clone(),
+                },
+                Column::Numeric(v) => Column::Numeric(v.clone()),
+            };
+            (n.clone(), col)
+        })
+        .collect();
+    crate::formula::Table {
+        columns,
+        n: table.n,
+    }
+}
+
 /// `sim_factorial` (120 rows, 20 subjects `subj`, factors `g` and `h`, a
 /// numeric `x`) with weights `1 + (i mod 7)/2`, fitted on `formula` with the
 /// weights as given and `se_type`.

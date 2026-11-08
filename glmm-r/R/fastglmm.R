@@ -57,7 +57,8 @@
 #' two terms on one grouping is an error. On a factor slope, `(f || g)` keeps
 #' the factor's block correlated, as lme4 does, while `zerocorr(f | g)` makes
 #' every column uncorrelated. Contrasts are
-#' always treatment coding with the **first factor level** as base; to change
+#' always treatment coding with the **first factor level** with rows as base
+#' (unused levels are dropped, as in `lm` and lme4); to change
 #' the base, `relevel()` the factor (a `contrasts` argument is deliberately
 #' absent). Anything that would silently mean something else - an ordered
 #' factor, a factor with its own `contrasts` attribute, or the unordered slot
@@ -89,7 +90,9 @@
 #' as a warning of class `"fastglmm_diagnostic"` with a per-kind subclass
 #' (`"fastglmm_ill_conditioned"`, `"fastglmm_pirls_exhausted"`,
 #' `"fastglmm_single_level_grouping_dropped"`,
-#' `"fastglmm_few_rows_for_random_effects"`, `"fastglmm_hessian_se_fallback"`,
+#' `"fastglmm_few_rows_for_random_effects"`, `"fastglmm_repeated_grouping"`,
+#' `"fastglmm_slope_constant_within_levels"`, `"fastglmm_separated_by_grouping"`,
+#' `"fastglmm_hessian_se_fallback"`,
 #' `"fastglmm_se_unavailable"`, `"fastglmm_exact_profile_fallback"`,
 #' `"fastglmm_gradient_search_fallback"`,
 #' `"fastglmm_precision_limited"`, `"fastglmm_non_integer_response"`, `"fastglmm_rows_dropped_na"`,
@@ -182,9 +185,14 @@
 #'   value used. A Gaussian mixed model is fitted by REML under `NULL` and
 #'   `TRUE` and by maximum likelihood under `FALSE`. A Gaussian model with no
 #'   random effects (OLS, including a formula whose every grouping was dropped
-#'   as single-level) has the same estimates under every value: `TRUE` reports
-#'   the REML log-likelihood (as `logLik(lm, REML = TRUE)`), `NULL` and `FALSE`
-#'   the ML one. Every other family is fitted by maximum likelihood, and
+#'   as single-level) without weights, or with a fixed `weight_power`, has the
+#'   same estimates under every value: `TRUE` reports the REML log-likelihood
+#'   (as `logLik(lm, REML = TRUE)`), `NULL` and `FALSE` the ML one. Where
+#'   `weight_power = NULL` estimates the weight power, `NULL` and `TRUE`
+#'   estimate it by REML (`$reml` is `TRUE`, the log-likelihood is the REML
+#'   one) and `FALSE` takes the weights as given (power 1), so the estimates
+#'   differ; `weight_power = "estimate"` with `FALSE` estimates the power by
+#'   ML. Every other family is fitted by maximum likelihood, and
 #'   `TRUE` there is ignored with a `"fastglmm_argument_ignored"` warning.
 #' @param anova_test when the likelihood-ratio tables of
 #'   [anova()][anova.fastglmm] are made. Every fit stores its Wald chi-squared
@@ -422,7 +430,12 @@ fastglmm <- function(formula, data, family = gaussian(),
   frame[["(row)"]] <- seq_len(nrow(frame))
   e <- substitute(subset)
   s <- if (is.null(e)) NULL else eval(e, data, parent.frame())
-  if (!is.null(s)) frame <- frame[s, , drop = FALSE]
+  if (!is.null(s)) {
+    # An NA in a logical subset drops that row, as in lm; `[` would make it an
+    # all-NA row that na.action then reports as a missing value.
+    if (is.logical(s)) s <- s & !is.na(s)
+    frame <- frame[s, , drop = FALSE]
+  }
 
   naf <- if (is.character(na.action)) {
     get(na.action, mode = "function")
@@ -442,12 +455,15 @@ fastglmm <- function(formula, data, family = gaussian(),
   if (nrow(frame) == 0L) {
     # Mirrors the Python port's fit(), which raises the same text when its own
     # missing-value row drop empties the data - change together
-    # (glmm-py/glmm/__init__.py, the na_mask block). A subset= or an
-    # already-empty data.frame reaching this point instead (n_before_na == 0)
-    # has no Python counterpart, so it keeps the plain message.
+    # (glmm-py/glmm/__init__.py, the na_mask block). An empty data.frame gets
+    # the kernel's text, as Python passes it through. A subset= that keeps no
+    # row has no Python counterpart, so it keeps the plain message.
     if (n_before_na > 0L) {
       stop("every row has a missing value in a column the formula uses; no rows left to fit",
            call. = FALSE)
+    }
+    if (nrow(data) == 0L) {
+      stop("Data has no rows (n = 0); a fit needs at least one row", call. = FALSE)
     }
     stop("no rows left to fit", call. = FALSE)
   }
@@ -590,7 +606,11 @@ fastglmm <- function(formula, data, family = gaussian(),
     # over the n_free free theta coordinates and tau), jac_theta (a list of
     # p_r^2 vectors, dC/dtheta_k per free coordinate), c (p_r^2, Cov(beta-hat)),
     # tau (sigma-hat^2), nu (its divisor) and retained (1-based retained
-    # columns, NULL when every column was retained). About p^2 (n_free + 1)
+    # columns, NULL when every column was retained). The free theta coordinates
+    # are in the kernel's order, which differs from the order the groupings
+    # were written in when glmm makes the grouping with the most levels the
+    # primary; the df and the contrast tests use them only in sums over all
+    # coordinates, so the order does not change any result. About p^2 (n_free + 1)
     # doubles, kept by saveRDS(). Mirrors the Python port's
     # Fit.satterthwaite_record - change together.
     satterthwaite_record = r$satterthwaite_record,
@@ -847,11 +867,11 @@ fastglmm <- function(formula, data, family = gaussian(),
 # `missing_ok` (compare()), an NA entry is kept for the row mask to drop.
 .add_weights <- function(frame, w, n, missing_ok = FALSE) {
   if (is.null(w)) return(frame)
-  if (!is.numeric(w) || length(w) != n || (!missing_ok && anyNA(w))) {
+  if (!is.numeric(w) || length(w) != n) {
     stop("weights must be a numeric array with one entry per row of data",
          call. = FALSE)
   }
-  if (!all(is.finite(w[!is.na(w)]))) {
+  if (!all(is.finite(if (missing_ok) w[!is.na(w)] else w))) {
     # Mirrors the Python port's wording - change together.
     stop(if (missing_ok) "weights must be finite or missing: no inf entries"
          else "weights must be finite: no NaN, inf, or missing entries", call. = FALSE)
@@ -874,11 +894,11 @@ fastglmm <- function(formula, data, family = gaussian(),
 # against a subset fit with no error anywhere. `missing_ok` as for weights.
 .add_offset <- function(frame, o, n, missing_ok = FALSE) {
   if (is.null(o)) return(frame)
-  if (!is.numeric(o) || length(o) != n || (!missing_ok && anyNA(o))) {
+  if (!is.numeric(o) || length(o) != n) {
     stop("offset must be a numeric array with one entry per row of data",
          call. = FALSE)
   }
-  if (!all(is.finite(o[!is.na(o)]))) {
+  if (!all(is.finite(if (missing_ok) o[!is.na(o)] else o))) {
     # Mirrors the Python port's wording - change together.
     stop(if (missing_ok) "offset must be finite or missing: no inf entries"
          else "offset must be finite: no NaN, inf, or missing entries", call. = FALSE)
@@ -935,6 +955,7 @@ fastglmm <- function(formula, data, family = gaussian(),
   "search_limit", "fit_failed", "glm_diverged", "design_unsolvable", "constant_response",
   "too_few_rows", "no_coefficients", "ill_conditioned", "pirls_exhausted",
   "nb_shape_unsettled", "single_level_grouping_dropped", "few_rows_for_random_effects",
+  "repeated_grouping", "slope_constant_within_levels", "separated_by_grouping",
   "variance_at_limit", "hessian_se_fallback", "se_unavailable", "gradient_search_fallback",
   "exact_profile_fallback", "precision_limited", "non_integer_response",
   "satterthwaite_curvature", "weight_power_at_bound", "weight_power_search_failures",
@@ -1067,6 +1088,12 @@ fastglmm <- function(formula, data, family = gaussian(),
   # uses (glmm-py/glmm/__init__.py's `_check_call`) - change together.
   if ("." %in% all.vars(formula)) {
     stop("'.' is not supported by the formula parser; list the columns explicitly",
+         call. = FALSE)
+  }
+  if (length(formula) != 3L) {
+    # Same text as `materialize`'s no-response error in
+    # glmm-rs/src/formula/materialize.rs - change together.
+    stop("formula syntax error at position 0: the formula has no response; write it as y ~ x",
          call. = FALSE)
   }
   invisible()

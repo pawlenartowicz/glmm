@@ -48,7 +48,8 @@
 # print() has no summary record - change together.
 .method_line <- function(object) {
   fam <- object$family_name
-  mixed <- length(object$varcorr) > 0L
+  # A mixed fit that did not converge has no varcorr but keeps its groupings.
+  mixed <- length(object$re_group_names) > 0L
   if (!mixed) {
     if (fam == "gaussian") "Linear model fit by least squares [fastglmm]"
     else "Generalized linear model fit by IRLS [fastglmm]"
@@ -85,6 +86,8 @@ print.fastglmm <- function(x, digits = max(3L, getOption("digits") - 3L), ...) {
   if (length(x$varcorr)) {
     cat("Random effects:\n")
     print(VarCorr(x), digits = digits)
+  }
+  if (length(x$re_group_names)) {
     sizes <- .group_sizes(x)
     cat("Number of obs: ", x$nobs, ", groups:  ",
         paste0(x$re_group_names, ", ", sizes, collapse = "; "), "\n", sep = "")
@@ -102,7 +105,8 @@ print.fastglmm <- function(x, digits = max(3L, getOption("digits") - 3L), ...) {
 #'
 #' lme4's blocks in lme4's order: method line, formula, data, the criterion
 #' (`REML criterion at convergence` on a REML fit, the `AIC BIC logLik deviance
-#' df.resid` row on an ML fit), scaled residuals, random effects with
+#' df.resid` row on an ML fit, whose `deviance` is `-2 * logLik`, not always
+#' [deviance()][deviance.fastglmm]), scaled residuals, random effects with
 #' variances, the observation/group counts, the coefficient table, the
 #' correlation of fixed effects, and a footer. The Python port's
 #' `Fit.summary()` prints the same blocks - change together.
@@ -181,10 +185,13 @@ summary.fastglmm <- function(object, ...) {
   effect_sizes <- c(marginal_r2 = s$r2_marginal, conditional_r2 = s$r2_conditional,
                     adjusted_icc = s$icc_adjusted)
   if (length(effect_sizes) != 3L || !all(is.finite(effect_sizes))) effect_sizes <- NULL
+  criterion <- unlist(s$criterion)
+  # A fit without estimates has a NaN df.resid; NA, as glance() reports it.
+  criterion[names(criterion) == "df.resid" & is.nan(criterion)] <- NA_real_
   structure(list(
     object = object,
     coefficients = coefficients,
-    criterion = unlist(s$criterion),
+    criterion = criterion,
     scaled_residuals = scaled,
     corr_fixed = corr_fixed,
     effect_sizes = effect_sizes,
@@ -250,6 +257,8 @@ print.summary.fastglmm <- function(x,
   if (length(object$varcorr)) {
     cat("Random effects:\n")
     print(VarCorr(object), digits = digits, variance = TRUE)
+  }
+  if (length(object$re_group_names)) {
     sizes <- .group_sizes(object)
     cat("Number of obs: ", object$nobs, ", groups:  ",
         paste0(object$re_group_names, ", ", sizes, collapse = "; "),
@@ -382,7 +391,9 @@ VarCorr.fastglmm <- function(x, ...) {
     v <- outer(sc$stddev, sc$stddev) * sc$correlation
     dimnames(v) <- list(terms, terms)
     attr(v, "stddev") <- stats::setNames(sc$stddev, terms)
-    attr(v, "correlation") <- sc$correlation
+    corr <- sc$correlation
+    dimnames(corr) <- list(terms, terms)
+    attr(v, "correlation") <- corr
     # The term of each column (1-based); the print method shows a
     # correlation only within one term.
     attr(v, "term_index") <- x$re_term_index[[g]]
@@ -763,7 +774,10 @@ ranef.fastglmm <- function(object, condVar = TRUE, ...) {
 #' only. On a robust fit (`$se_type` `"robust"`) the standard error and
 #' interval are model-based, as on the same fit with `se_type = "model"`,
 #' with a `"fastglmm_predict_se_model_based"` warning: their formula holds
-#' only with the model's covariance.
+#' only with the model's covariance. A fit with no estimates (every
+#' coefficient `NA`: a fit that stopped before estimating anything, such as
+#' too few rows or a degenerate design) predicts `NA`, with an `NA` standard
+#' error and `NA` bounds.
 #'
 #' @param object a [fastglmm] fit.
 #' @param newdata a data frame of new rows with the columns the formula reads
@@ -806,7 +820,7 @@ predict.fastglmm <- function(object, newdata, re.form = NULL, type = c("link", "
   if (missing(newdata) || is.null(newdata)) {
     has_new <- FALSE
     new <- list()
-    rows <- rownames(object$frame)
+    rows <- .row_labels(object)
   } else {
     newdata <- as.data.frame(newdata)
     f <- stats::as.formula(object$formula)
@@ -898,7 +912,7 @@ simulate.fastglmm <- function(object, nsim = 1, seed = NULL, ...) {
     row_index = .row_index(object), row_base = 1L)))
   out <- as.data.frame(matrix(draws, nrow = object$nobs, ncol = nsim))
   names(out) <- paste0("sim_", seq_len(nsim))
-  rownames(out) <- rownames(object$frame)
+  rownames(out) <- .row_labels(object)
   attr(out, "seed") <- seed
   out
 }
@@ -906,6 +920,17 @@ simulate.fastglmm <- function(object, nsim = 1, seed = NULL, ...) {
 # Each model frame row's 1-based position in the caller's data, or integer()
 # (the frame's own rows, counted from 1) on a fit saved before it was kept.
 .row_index <- function(object) as.integer(object$.row_index %||% integer())
+
+# The names of the model frame's rows: its row names, except on a tibble,
+# which drops row names on subsetting, where the 1-based positions in the
+# caller's data stand in (`lm` names a tibble's rows the same way).
+.row_labels <- function(object) {
+  if (inherits(object$frame, "tbl_df") && !is.null(object$.row_index)) {
+    as.character(object$.row_index)
+  } else {
+    rownames(object$frame)
+  }
+}
 
 # The fit's training data as fastglmm() passed it to the native code: the
 # formula, the model frame marshalled again, the family, the weights and the
@@ -956,7 +981,7 @@ simulate.fastglmm <- function(object, nsim = 1, seed = NULL, ...) {
 #' @export
 fitted.fastglmm <- function(object, ...) {
   v <- as.double(object$fitted)
-  if (length(v) == nrow(object$frame)) names(v) <- rownames(object$frame)
+  if (length(v) == nrow(object$frame)) names(v) <- .row_labels(object)
   v
 }
 
@@ -964,9 +989,9 @@ fitted.fastglmm <- function(object, ...) {
 #'
 #' `type = "response"` is `y - fitted(object)`; `type = "pearson"` divides by
 #' `sqrt(phi * V(mu) / w)` with the family's variance function. Deviance and
-#' working residuals are not offered: they need per-family deviance formulas
-#' nothing else in the package carries, and a wrong default would silently
-#' differ from `lme4::residuals(type=)`.
+#' working residuals are not offered: a wrong default would silently differ
+#' from `lme4::residuals(type=)`. Their sum of squares is
+#' [deviance()][deviance.fastglmm].
 #'
 #' @param object a [fastglmm] fit.
 #' @param type `"response"` or `"pearson"`.
@@ -990,7 +1015,7 @@ residuals.fastglmm <- function(object, type = "response", ...) {
   } else {
     as.double(object$y) - mu
   }
-  names(r) <- rownames(object$frame)
+  names(r) <- .row_labels(object)
   r
 }
 
@@ -1034,6 +1059,54 @@ logLik.fastglmm <- function(object, ...) {
   attr(val, "REML") <- object$reml
   class(val) <- "logLik"
   val
+}
+
+#' Deviance of a fastglmm fit
+#'
+#' As `lme4::deviance` (lme4 2.0-6), `lm` and `glm`. A Gaussian mixed model
+#' fitted by ML gives `-2 * logLik`. A Gaussian mixed model fitted by REML
+#' gives the REML criterion (`-2 * logLik` of its REML log-likelihood), with a
+#' warning that it is not the deviance. Every
+#' other fit gives the sum of squared deviance residuals: on OLS the weighted
+#' residual sum of squares (as `deviance.lm`, whatever `REML` the fit was made
+#' with), on a GLM or GLMM the sum over rows of `w * d(y, mu)`, `d` the
+#' family's unit deviance at the conditional mean ([fitted()][fitted.fastglmm],
+#' which includes the random effects). The weights are read at the fit's
+#' `weight_power`. On a GLMM and on OLS this is not `glance()$deviance`, which
+#' is `-2 * logLik`, and never `$deviance`, the optimizer criterion.
+#'
+#' @param object a [fastglmm] fit.
+#' @param REML `NULL` (the default), `TRUE` or `FALSE`; read only on a
+#'   Gaussian mixed model fitted by REML, where `TRUE` and `FALSE` are refused:
+#'   lme4 returns the ML deviance at the REML estimates for either, and that is
+#'   not computed. `-2 * logLik(fit)` gives the REML criterion without the
+#'   warning.
+#' @param ... unused.
+#' @return One number; `NaN` for a fit without estimates.
+#' @export
+deviance.fastglmm <- function(object, REML = NULL, ...) {
+  if (!(is.null(REML) || (is.logical(REML) && length(REML) == 1L && !is.na(REML)))) {
+    stop(sprintf("REML must be NULL, TRUE or FALSE, got %s", .arg_repr(REML)), call. = FALSE)
+  }
+  if (identical(object$family_name, "gaussian") && length(object$re_group_names) > 0L) {
+    if (isTRUE(object$reml) && !is.null(REML)) {
+      stop("deviance(REML = ", REML, ") is not available on a REML fit: the ML deviance at ",
+           "the REML estimates is not computed. Refit with REML = FALSE, or use ",
+           "-2 * logLik(fit) for the REML criterion", call. = FALSE)
+    }
+    if (isTRUE(object$reml) && is.null(REML)) {
+      warning("deviance() of a REML fit returns the REML criterion, not the deviance. ",
+              "Use -2 * logLik(fit) to get it without this warning, or refit ",
+              "with REML = FALSE for the deviance", call. = FALSE)
+    }
+    return(-2 * as.numeric(object$loglik))
+  }
+  mu <- as.double(object$fitted)
+  if (!length(mu)) return(NaN)
+  .glmm_call("deviance_residual_sum", list(
+    family = object$family_name, y = as.double(object$y), fitted = mu,
+    weights = .optional(object$weights), dispersion = as.double(object$dispersion),
+    weight_power = as.double(object$weight_power %||% 1)))
 }
 
 #' AIC and BIC of fastglmm fits
@@ -1193,8 +1266,12 @@ tidy.fastglmm <- function(x, ...) {
 #' One-row model summary
 #'
 #' `nobs`, `logLik`, `AIC`, `BIC`, `deviance` (`-2 * logLik`, the value the
-#' summary's criterion row prints - not `$deviance`, the optimizer criterion),
-#' `df.residual` (`nobs - df`) and `REML`. AIC/BIC are returned on REML fits
+#' summary's criterion row prints - not `$deviance`, the optimizer criterion,
+#' and on a GLMM, a GLM and OLS not [deviance()][deviance.fastglmm], which
+#' follows lme4, `glm` and `lm`),
+#' `df.residual` (`nobs - df`; `NA` when `df` is 0, where the parameters are
+#' not counted: a fit that stopped before estimating anything, such as too few
+#' rows or a degenerate design, and a GLMM that did not converge) and `REML`. AIC/BIC are returned on REML fits
 #' too: computing a number somebody asked for is not printing one they did
 #' not, and the `REML` column says what it is. A REML AIC is comparable only
 #' across models with identical fixed effects.
@@ -1230,7 +1307,8 @@ glance.fastglmm <- function(x, ...) {
     AIC = -2 * ll + 2 * object$df,
     BIC = -2 * ll + log(object$nobs) * object$df,
     deviance = -2 * ll,
-    df.residual = object$nobs - object$df
+    # df is 0 where it is not counted (a fit without estimates).
+    df.residual = if (object$df == 0) NA_real_ else object$nobs - object$df
   )
 }
 

@@ -299,6 +299,18 @@ static REGISTRY: &[FnSpec] = &[
         run: crate::summary::pearson_residuals,
     },
     FnSpec {
+        name: "deviance_residual_sum",
+        params: &[
+            req("family"),
+            req("y"),
+            req("fitted"),
+            opt("weights"),
+            opt("weight_power"),
+            req("dispersion"),
+        ],
+        run: crate::summary::deviance_residual_sum,
+    },
+    FnSpec {
         name: "warning_kind",
         params: &[req("kind")],
         run: crate::notes::warning_kind,

@@ -256,8 +256,9 @@ working weight (`wᵢ·W̃ᵢ`), the deviance contribution (`wᵢ·devᵢ`), and
 β-gradient score (`wᵢ·ρᵢ`), so the conditional mode and curvature are those of
 the weighted likelihood. One fork follows inside the shared family kernel: the
 fused `2·(Σ log1pexp(η) − Σ y·η)` deviance identity holds only for unweighted
-Bernoulli rows, so a *weighted* binomial-logit fit takes the weighted-logit arm
-instead (`ws.weighted` gates it). The
+Bernoulli rows, so a *weighted* binomial-logit fit, and an unweighted one whose
+response has a value other than 0 and 1, takes the weighted-logit arm instead
+(`ws.weighted` gates it; `run_glmm_on` sets it for the fractional response). The
 aggregated-binomial convention (y = success proportion, `wᵢ` = trial count —
 lme4's `cbind(s, m−s)`) rides this mechanism unchanged, on Laplace and AGQ
 alike.
@@ -529,9 +530,12 @@ binary-link warm starts, most failures are a θ₀ where every PIRLS evaluation
 fails, which no border-step change can recover — the guard sidesteps it by not
 starting there when the cold point is better, and the fallback recovers what
 the guard cannot by trying a route whose warm start matters less.
+**Cold fallback.** A fit with a β start that ends (after `capped_restart`) not converged, at a non-finite deviance, or `precision_limited` is searched again from the cold start: the GLM β from `glm_warm_start_beta`, the blind θ, and no carried Gamma φ. The cold search goes through `capped_restart` as a cold fit does. It is kept when its deviance is finite, it converged or the warm fit did not, and it is lower (or the warm deviance is not finite); otherwise the warm result is put back (`SearchState`). `n_eval` counts both. It is skipped on the Gamma inverse link, which has `gamma_inverse_retry`, and when the cold GLM is separated; on a negative-binomial GLMM the shape seed stays the one passed in. Why: the guard compares θ at the caller's β₀, so it cannot catch a far β₀. Measured: a Poisson random-slope fit from β₀ = (−28.5, 0.45) and a Gamma fit on a response on the 1e-12 scale, both of which failed with NaN β, converge at the cold fit; a binomial fit from β₀ = 1e10 to 1e300, which ended at its start (from 1e14, reported converged at a deviance of about 5.8·β₀), ends at the cold deviance; good warm starts are unchanged (12 to 13 evaluations); the fallback does not fire on grid `--fast`, whose fits are cold.
 **Validation:** `far_warm_start_recovers_via_the_cold_guard`,
-`warm_start_the_guard_rejects_is_the_cold_fit` and
-`exact_profile_fallback_reruns_on_pql_then_joint`; the far-warm-start scan
+`warm_start_the_guard_rejects_is_the_cold_fit`,
+`exact_profile_fallback_reruns_on_pql_then_joint`,
+`a_far_warm_start_that_fails_falls_back_to_the_cold_fit` and
+`a_huge_warm_beta_is_not_reported_converged_at_the_start`; the far-warm-start scan
 `far_warm_start_scan` and `far_warm_start_nb_sweep` (`#[ignore]`, run by hand
 in release after a change to the GLMM search; all in `src/fit/glmm_tests.rs`).
 
@@ -1346,8 +1350,9 @@ design, so `fit_on` maps it forward with this draw's column statistics first:
 ([internal standardization](algorithms.md#internal-standardization-of-the-design)).
 A θ̂ a loop-tier caller carries from one draw to the next comes out of
 `FitView::theta` in the caller's units and is mapped forward with the next
-draw's statistics. When the draw's scaling is not the identity, a start of the
-wrong width is dropped to a cold start for that component.
+draw's statistics. A start component of the wrong width or with a non-finite
+entry, or a dispersion that is not finite and > 0, is dropped to a cold start
+for that component.
 A cold start seeds
 β from a full no-RE GLM fit — `glm_warm_start_beta` runs the actual IRLS GLM of
 [`algorithms.md`](algorithms.md#generalised-linear-models-glm) once (with its
@@ -1358,7 +1363,9 @@ zero counts), the GLMM has none either — along the direction the GLM runs off
 in, every row's conditional likelihood is non-decreasing for any random
 effects — so the fit stops there, before any outer search
 (`glmm::separated_fit`): `converged = false`, `n_eval = 0`, β the GLM's last
-iterate, every other estimate NaN. Within a
+iterate, every other estimate NaN. An all-0 or all-1 binomial response takes
+the same stop without running the GLM, with β NaN (`glm_warm_start_beta`
+mirrors the kernel's short circuit for that response). Within a
 fit, `u_seed` holds the conditional-mode warm start incumbent, but it is
 **reset to 0 at the start of every `fit_glmm`** and never carried across fits — a
 cross-fit carry is deliberately rejected (it would break same-seed
@@ -1912,7 +1919,7 @@ its own.
 ## Validation
 
 The GLMM paths are held to the accuracy grid (`validation/grid/`, see
-`validation/README.md`): 923 cells, each fitted on the same CSV by glmm and by
+`validation/README.md`): 947 cells, each fitted on the same CSV by glmm and by
 the pinned oracles that can fit it — lme4, glmmTMB, MixedModels.jl and
 GLMMadaptive. glmm's deviance gates hard against the best converged oracle on
 the cell; a worse deviance fails, with no escape. β, the SEs and the variance

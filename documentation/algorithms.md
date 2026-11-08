@@ -75,6 +75,8 @@ re-enters this branch. An aliased column that is also an RE slope is faulted
 rather than mis-indexed. This preprocessing is path-agnostic: it serves OLS,
 GLM, LMM and GLMM alike.
 
+**Identification notes.** Next to the alias check, `fit_checked` runs `identification_notes` (`src/fit/common.rs`), which reads only the ids, the slope columns and the response, compares values exactly, and adds a note for each random-effect structure the data cannot identify: a single-level grouping, two groupings with the same groups that share a random-effect column, slopes constant within the levels of a block with a random intercept that take too few distinct values for their covariance parameters, and a binomial response constant within every level when some level holds more than one trial. No estimate depends on it. On the aliased path the reduced re-entry runs it on the reduced design, and those notes are the ones reported; the unfittable-random-slope return reports none.
+
 **`classify_design` routing (mixed arm only).** A mixed design routes to
 `Solver::Sparse` when it is over the dense envelope (primary width
 `q_p > MAX_PRIMARY_Q`, more than `MAX_EXTRA_GROUPINGS` extra groupings, or any
@@ -123,7 +125,7 @@ block without a random intercept reaches them one slope sooner.
 
 The one hard rejection is a shape check: `check_model_shape` returns a
 `FitError` on inputs no model takes (a bad `nagq`, an out-of-range slope
-column, more than one nested grouping) — and, as a family × random-effects
+column, a slope column repeated within one grouping, more than one nested grouping) — and, as a family × random-effects
 gate, on `(Family::InverseGaussian, Some(re))`: the GLMM objective needs a
 profiled `inverse.gaussian()$aic` term that is not built, so the entry refuses
 it before `build_workspace` allocates anything (`InverseGaussian` reaches only
@@ -248,7 +250,8 @@ standard deviation 1, and the results map back exactly:
   forward per draw: `β̃ = B⁻¹β`, and `Λ̃` the lower factor of
   `N⁻¹·ΛΛᵀ·N⁻ᵀ`. Its `dispersion` (NB shape, Gamma φ) needs no map: neither
   depends on the design's column scales. On the loop tier a θ̂ carried from one draw is mapped forward
-  with the next draw's statistics. A start component of the wrong width is
+  with the next draw's statistics. A start component of the wrong width or
+  with a non-finite entry, or a dispersion that is not finite and > 0, is
   dropped, a cold start for that component (`fit_on`).
 
 Three diagnostics read the fit's own coordinates. `pinned` is reported in the
@@ -387,8 +390,10 @@ implicitly as the `q_p = 1` degenerate of the LMM kernels.
 and `yᵀy` in a single panel-blocked pass (`OlsSuffStats::add_rows`, repacking
 `PANEL_ROWS = 256`-row panels so the GEMM stays cache-resident), then solves the
 normal equations by a Cholesky of `XᵀX`: `L z = Xᵀy`, `Lᵀ β̂ = z`
-(`fit_suff_stats_t_sq`). The residual sum of squares is the closed form
-`RSS = yᵀy − β̂ᵀXᵀy` — no residual sweep. The dispersion is
+(`fit_suff_stats_t_sq`). The residual sum of squares is summed from the
+residuals of the rows the statistics came from, because the closed form
+`yᵀy − β̂ᵀXᵀy` cancels when y is far from 0; the closed form stays only on the
+loop tier's streaming `fit_suff_stats_t_sq`, which keeps no rows. The dispersion is
 `σ̂² = RSS/(n − p)` with **raw-row** residual df `n − p`, and the SE of a target
 column is `√(σ̂²·‖L⁻¹e_j‖²)` from one forward solve against the Cholesky factor
 (the diagonal of `σ̂²(XᵀX)⁻¹`). The Gram squares `X`'s condition number, so
@@ -422,7 +427,7 @@ compose correctly. (The GLM path below handles its offset differently — inside
 
 **WLS by row scaling.** Prior weights (`Data::weights`) are applied as
 `√wᵢ` row pre-scaling of both `X` and `y` before the unit-weight accumulator
-runs, so the Grams become `XᵀWX`, `XᵀWy`, `yᵀWy`; then `RSS = yᵀWy − β̂ᵀXᵀWy`
+runs, so the Grams become `XᵀWX`, `XᵀWy`, `yᵀWy`; then `RSS = Σ wᵢ(yᵢ − xᵢβ̂)²`
 is the weighted RSS and `σ̂² = RSS/(n − p)` keeps the raw-row df, matching
 R `lm(weights=)`. Constant weights leave the fit invariant. Two of the
 accumulator's by-products (`sum_y`, `sst`) are not weight-consistent under this
@@ -455,9 +460,12 @@ carried into the deviance's units (`dev_floor`): it is multiplied by the
 precision weights' scale (`family::weight_scale`), and on inverse-Gaussian
 divided by the weighted ȳ, since that deviance scales as `1/y`. So on these two
 families the stopping point is the same whatever the units of y or the overall
-scale of the weights. The binomial rule is R's own. On Poisson and NB the floor
-is `0.1·min(1, ȳ)`: R's own rule while ȳ ≥ 1, and scaled with y below that, where
-a non-integer y in tiny units makes the deviance small.
+scale of the weights. On binomial, Poisson and NB R's `0.1` is in units of one
+case: weights of a case or more (trial counts, frequency weights) keep it
+exactly, and weights below one case scale it down with them
+(`min(1, weight_scale)`), as on Gamma. On Poisson and NB the floor is also
+multiplied by `min(1, ȳ)`: R's own rule while ȳ ≥ 1, and scaled with y below
+that, where a non-integer y in tiny units makes the deviance small.
 
 Two more stops read the step that produced the current β, `max_i |Δηᵢ|`:
 
@@ -541,6 +549,9 @@ of the regimes:
   the mean sits far from 1 that IRLS diverges, and a start that ignores the
   offset does the same once the exposures differ by a few decades between
   rows. `r` is not floored; only an all-zero count response takes `ȳ = 0.1`.
+  A log-link fit with an offset that fails from this seed is run once more
+  from R's per-row seed (`μ₀ = y + 0.1` on the counts, `μ₀ = y` on Gamma and
+  inverse-Gaussian, no offset), and reports that run.
 
 The per-iteration row pass — η clamps, inverse link, Fisher weight with its prior
 weight and `WEIGHT_CLAMP` floor, working response `z = η + r`, and the `Σ wᵢdᵢ`
@@ -548,13 +559,15 @@ fold — is one batched call, `simd_transcendental::family_pass`, shared with th
 three GLMM PIRLS variants. It dispatches once on `family` to a vectorised arm
 rather than once per row:
 
-- **Unweighted binomial logit** hands off to the fused kernel
+- **Unweighted binomial logit on a 0/1 response** hands off to the fused kernel
   `pw_and_log1pexp_sum`, which computes the probability `p`, the working weight
   `W`, and the `Σ log1pexp(η)` deviance fold in one vectorised pass, sharing a
   single `exp(−|η|)` evaluation between the probability and the deviance term.
   This is the MCPower hot path and is byte-identical to the standalone fast path
   it grew out of. Its deviance identity `2·(Σ log1pexp(η) − Σ y·η)` holds only
-  for unweighted Bernoulli rows, which is why prior weights route elsewhere.
+  for unweighted Bernoulli rows, which is why prior weights, and a response
+  with a value other than 0 and 1, route elsewhere (`glm_irls_fit`'s
+  `weighted` flag, which also picks the null deviance's form).
 - **Probit** evaluates Φ through a branch-free SIMD `erfc` — Cody's CALERF with
   all three `|x|` regions computed and blended by mask, since one lane vector
   straddles the region seams — and `dμ/dη = φ(η)` through the same owned `exp`.

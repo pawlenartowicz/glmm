@@ -84,16 +84,18 @@ fn slope_pieces_equal_the_kernel_on_the_callers_design() {
     }
 }
 
-/// An exact weighted line (σ̂² ≤ 0, no CR2 pieces) under the default δ fit
+/// An exact weighted fit (σ̂² = 0, no CR2 pieces) under the default δ fit
 /// and under a robust fit at power 1: no panic, and a robust fit's SEs,
-/// `vcov` and df are NaN, never the model's under the robust label.
+/// `vcov` and df are NaN, never the model's under the robust label. An
+/// intercept on a constant y with weights summing to 16: the Cholesky
+/// factor (4), β̂ = 4 and every residual are exact.
 #[test]
 fn an_exact_fit_has_nan_robust_ses() {
-    let n = 20;
-    let x: Vec<f64> = (0..n).flat_map(|i| [1.0, (i + 1) as f64]).collect();
-    let y: Vec<f64> = (0..n).map(|i| 1.0 + 2.0 * (i + 1) as f64).collect();
-    let w: Vec<f64> = (1..=n).map(|i| i as f64).collect();
-    let data = Data::new(&x, &y, n, 2).weights(&w);
+    let n = 4;
+    let x = vec![1.0; n];
+    let y = vec![4.0; n];
+    let w = vec![1.0, 3.0, 4.0, 8.0];
+    let data = Data::new(&x, &y, n, 1).weights(&w);
     let spec = ModelSpec::fixed(Family::Gaussian);
     let robust = FitOptions {
         weight_power: Some(WeightPower::Fixed(1.0)),
@@ -103,6 +105,7 @@ fn an_exact_fit_has_nan_robust_ses() {
     // The δ fit lands on a tiny positive σ̂², so it has pieces.
     let _ = crate::fit(&data, &spec, &FitOptions::default());
     let fit = crate::fit(&data, &spec, &robust).unwrap();
+    assert_eq!(fit.dispersion(), 0.0);
     assert_eq!(fit.se_type, SeType::Robust);
     assert!(fit.robust.is_none());
     assert!(fit.se.iter().all(|v| v.is_nan()), "{:?}", fit.se);

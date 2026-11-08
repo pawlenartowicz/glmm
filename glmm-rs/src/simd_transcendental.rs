@@ -1033,11 +1033,11 @@ fn scalar_sigmoid_owned<const FUSED: bool>(eta: f64) -> f64 {
 /// (`family::eta_infeasible`, or a NaN η on a link that clamps η).
 ///
 /// - `prior_w` empty ⇒ unit prior weights.
-/// - `weighted` selects between the two logit forms: unweighted
+/// - `weighted` (weights given, or a binomial response with a value other
+///   than 0 and 1) selects between the two logit forms: unweighted 0/1
 ///   Bernoulli logit keeps the fused `2·(Σ log1pexp(η) − Σ y·η)` deviance (hence
-///   `yeta`, which the caller's η-pass accumulates), weighted binomial goes
-///   through `family::dev_resid` because that identity does not hold for
-///   aggregated proportions.
+///   `yeta`, which the caller's η-pass accumulates), the rest goes through
+///   `family::dev_resid` because that identity does not hold for proportions.
 #[allow(clippy::too_many_arguments)] // marshals (family, nb_theta, eta, y, prior_w, weighted, yeta, prob, w, z)
 pub(crate) fn family_pass(
     family: Family,

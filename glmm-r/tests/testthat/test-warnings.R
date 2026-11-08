@@ -318,6 +318,79 @@ test_that("port parity few_rows_for_random_effects", {
   expect_identical(conditionMessage(res$cond), printed(row))
 })
 
+# 12 groups of 8 rows; g2 is g under other names, cat is constant within g
+# (two categories), and yb is 0 or 1 within every g. Same fixture and calls in
+# glmm-py/tests/test_warnings.py - change together.
+id_g <- (seq_len(96L) - 1L) %/% 8L
+id_x <- as.numeric(((seq_len(96L) - 1L) * 5L) %% 8L)
+IDENT <- data.frame(
+  x = id_x,
+  g = factor(sprintf("g%02d", id_g)),
+  g2 = factor(sprintf("h%02d", 11L - id_g)),
+  cat = factor(ifelse(id_g < 6L, "A", "B")),
+  y = 0.3 * id_x + 0.5 * ((id_g * 7L) %% 5L) + 0.2 * (((seq_len(96L) - 1L) * 3L) %% 7L),
+  yb = as.numeric(id_g %% 2L == 0L),
+  yv = as.numeric((((seq_len(96L) - 1L) * 5L) %% 3L) == 0L),
+  z = 0
+)
+
+test_that("port parity repeated_grouping", {
+  res <- fit_catching(fastglmm(y ~ x + (1 | g) + (1 | g2), IDENT),
+                      "fastglmm_repeated_grouping")
+  expect_false(is.null(res$cond))
+  expect_s3_class(res$cond, "fastglmm_diagnostic")
+  row <- only(res$fit, "repeated_grouping")
+  expect_identical(c(row$tier, row$title), c("caution", "Same groups under two names"))
+  expect_identical(row$message, paste(
+    "Grouping factors 'g' and 'g2' put the rows into exactly the same groups and share a",
+    "random effect, so the data cannot tell their variances apart. How the variance is",
+    "split between them is arbitrary. Remove one of the two from the model."))
+  expect_identical(conditionMessage(res$cond), printed(row))
+})
+
+test_that("port parity slope_constant_within_levels", {
+  res <- fit_catching(fastglmm(y ~ cat + (1 + cat | g), IDENT),
+                      "fastglmm_slope_constant_within_levels")
+  expect_false(is.null(res$cond))
+  row <- only(res$fit, "slope_constant_within_levels")
+  expect_identical(c(row$tier, row$title), c("caution", "Random slope constant within groups"))
+  expect_identical(row$message, paste(
+    "The random slope on catB does not vary within any group of 'g', so within each group",
+    "it cannot be told apart from the random intercept. Its variance and correlations",
+    "probably cannot be estimated from these data. Consider removing it from the",
+    "random-effects term."))
+  expect_identical(conditionMessage(res$cond), printed(row))
+})
+
+test_that("port parity separated_by_grouping", {
+  res <- fit_catching(fastglmm(yb ~ x + (1 | g), IDENT, family = binomial()),
+                      "fastglmm_separated_by_grouping")
+  expect_false(is.null(res$cond))
+  row <- only(res$fit, "separated_by_grouping")
+  expect_identical(c(row$tier, row$title), c("caution", "Response constant within groups"))
+  expect_identical(row$message, paste(
+    "The response is all 0 or all 1 within every group of 'g', so the likelihood keeps",
+    "rising as this grouping's variance grows, and the variance has no finite estimate.",
+    "Any reported variance is a stopping point, not an estimate, and the fixed effects",
+    "depend on it. Consider dropping this grouping, or a model with a prior on the",
+    "variance."))
+  expect_identical(conditionMessage(res$cond), printed(row))
+})
+
+test_that("a mixed fit with every fixed column aliased", {
+  # Same fixture and call in glmm-py/tests/test_warnings.py - change together. z
+  # is all zero, so it is dropped as aliased and the mixed model has no fixed
+  # effect left to fit.
+  fit <- suppressWarnings(fastglmm(yv ~ 0 + z + (1 | g) + (1 | g2), IDENT,
+                                   family = binomial()))
+  expect_false(fit$converged)
+  expect_identical(fit$warnings$kind, c("repeated_grouping", "no_coefficients"))
+  expect_identical(only(fit, "no_coefficients")$message, paste(
+    "The model has no fixed-effect coefficients: every fixed-effect column is all zero.",
+    "glmm needs at least one fixed effect in a mixed model. Add an intercept or a",
+    "predictor."))
+})
+
 test_that("port parity variance_at_limit", {
   # Same fixture and call in glmm-py/tests/test_warnings.py - change together. On
   # MIXED, y - 0.3x is constant within each group, so the residual variance goes

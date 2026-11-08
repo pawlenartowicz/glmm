@@ -151,7 +151,7 @@ pub(super) fn degenerate_glmm_fit(
         objective: glmm_objective(nagq),
         fitted: vec![],
         ranef: vec![],
-        ranef_levels: vec![],
+        ranef_levels: super::common::ranef_level_counts(groupings),
         condvar: vec![],
         condvar_x: vec![],
         condvar_cross: None,
@@ -581,13 +581,27 @@ pub(crate) fn run_glmm_on<'a>(
     // NB θ₀ (the start of the `ln θ_NB` coordinate) is threaded explicitly; the
     // kernel leaves θ̂_NB in `ws.nb_theta`. NaN for every non-NB family (unread).
     ws.nb_theta = nb_theta;
+    // The fused logit deviance identity holds only for 0/1 rows; `prior_w` is
+    // all 1 here when unweighted (`prep_glmm_design` re-decides the flag per fit).
+    if !ws.weighted
+        && matches!(
+            model.family,
+            crate::Family::Binomial {
+                link: crate::BinomialLink::Logit
+            }
+        )
+        && y[..n].iter().any(|&v| v != 0.0 && v != 1.0)
+    {
+        ws.weighted = true;
+    }
 
     // Warm start threads β + θ into the GLMM kernel. A caller-supplied `start` (the
     // MCPower hot loop) uses its β verbatim; a cold start seeds β from the no-RE GLM
     // fit (lme4/glmer initialization — see `glm_warm_start_beta`) instead of 0, so
     // the inner PIRLS opens near the mean and does not overshoot. θ still cold-starts
     // at the kernel's THETA0 blind start. An empty field is a per-component cold
-    // start (`StartValues`), so it takes the same branch as `start = None`.
+    // start (`StartValues`), so it takes the same branch as `start = None`. A fit
+    // from a β start that fails is searched again from the cold start (below).
     let glm_start;
     let (beta_start, separated): (&[f64], bool) = match start {
         Some(s) if !s.beta.is_empty() => (&s.beta, false),
@@ -667,12 +681,47 @@ pub(crate) fn run_glmm_on<'a>(
             c,
         )
     };
+    let restart_in = |ws: &mut GlmmWorkspace, restart: &StartValues| {
+        fit_glmm_in_units(
+            ws,
+            x_mat,
+            z_mat,
+            y,
+            n,
+            p,
+            cluster_ids,
+            extra_ids,
+            &restart.beta,
+            Some(restart),
+            targets,
+            opts,
+            map,
+            1.0,
+        )
+    };
     let mut glmm_fit = fit_in(ws, c0);
+    let has_units = units.is_some();
     if let Some(u) = units {
         glmm_fit = gamma_inverse_retry(ws, glmm_fit, c0, &u, fit_in);
     } else {
-        glmm_fit = capped_restart(ws, glmm_fit, |ws, restart| {
-            fit_glmm_in_units(
+        glmm_fit = capped_restart(ws, glmm_fit, restart_in);
+    }
+    // A β start the search cannot leave is not caught by the start guard, which
+    // compares θ candidates at the caller's β₀: a fit from one that failed,
+    // stopped short or ended precision-limited is searched again from the cold
+    // start (the GLM β, the blind θ, no carried Gamma φ), as a cold fit is, and
+    // the cold search is kept when it ended lower without losing convergence.
+    if !has_units
+        && start.is_some_and(|s| !s.beta.is_empty())
+        && (!glmm_fit.converged || !glmm_fit.deviance.is_finite() || glmm_fit.precision_limited)
+    {
+        let (cold_beta, sep) = glm_warm_start_beta(model.family, nb_theta, x_mat, y, n, p, offset);
+        if !sep {
+            let (saved, nb_saved, phi_saved) =
+                (SearchState::save(ws), ws.nb_theta, ws.gamma_phi_start);
+            ws.nb_theta = nb_theta;
+            ws.gamma_phi_start = None;
+            let cold = fit_glmm_in_units(
                 ws,
                 x_mat,
                 z_mat,
@@ -681,14 +730,29 @@ pub(crate) fn run_glmm_on<'a>(
                 p,
                 cluster_ids,
                 extra_ids,
-                &restart.beta,
-                Some(restart),
+                &cold_beta,
+                None,
                 targets,
                 opts,
                 map,
                 1.0,
-            )
-        });
+            );
+            let mut cold = capped_restart(ws, cold, restart_in);
+            let spent = glmm_fit.n_eval + cold.n_eval;
+            let keep = cold.deviance.is_finite()
+                && (cold.converged || !glmm_fit.converged)
+                && (!glmm_fit.deviance.is_finite() || cold.deviance < glmm_fit.deviance);
+            if keep {
+                cold.n_eval = spent;
+                glmm_fit = cold;
+            } else {
+                saved.restore(ws);
+                ws.nb_theta = nb_saved;
+                ws.gamma_phi_start = phi_saved;
+                ws.grad_hint_ready = false;
+                glmm_fit.n_eval = spent;
+            }
+        }
     }
     // θ̂_NB after the search (NaN on every other family, untouched by the kernel).
     let nb_theta = ws.nb_theta;
@@ -938,7 +1002,8 @@ fn gamma_inverse_retry(
 
 /// The workspace slots a search writes that are read after `run_glmm_on`
 /// returns (by the [`GlmmResultView`] accessors and [`glmm_view_to_fit`]), so
-/// [`gamma_inverse_retry`] can put back a search that did not run last. Every
+/// [`gamma_inverse_retry`] and the cold fallback of a failed β start in
+/// [`run_glmm_on`] can put back a search that did not run last. Every
 /// other slot a search writes is scratch that `fit_glmm` rewrites before it
 /// reads it. Mirrors those readers — change together.
 struct SearchState {

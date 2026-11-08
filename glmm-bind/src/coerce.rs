@@ -14,9 +14,10 @@ use crate::value::Value;
 /// 2^53: every integer up to here is exactly representable as an `f64`.
 const F64_EXACT_MAX: f64 = 9_007_199_254_740_992.0;
 
-/// A short description of a value for error messages.
+/// A short description of a value for error messages; a one-element vector
+/// is described by its element.
 pub(crate) fn describe(v: &Value) -> String {
-    match v {
+    match &scalar(v) {
         Value::Null => "null".to_owned(),
         Value::Bool(b) => b.to_string(),
         Value::I64(n) => n.to_string(),

@@ -363,7 +363,7 @@ number of tests in a group. In R the table is a data frame of class
 A Gaussian mixed model fitted with `satterthwaite = FALSE` has no df: its rows
 have NaN df, statistic and p-value, and a note. A comparison that reads an
 aliased coefficient (an empty cell) is NaN, with a note, and the adjustment
-counts only the rows that were tested.
+counts only the rows that were tested. A fit that did not converge gets its table with a note saying so.
 
 **Confidence intervals.** `confint(pw)` (Python `pw.confint()`) gives
 `lower.CL` and `upper.CL` at `level` (0.95 by default), and `ratio.lower.CL`
@@ -902,12 +902,13 @@ A note about one row is printed after that row's label, for example
 
 | Note | When |
 |---|---|
-| The fit did not converge, so its estimates are not at a maximum and these tests are not reliable. … | `anova(m)` on a fit that did not converge (first note) |
+| The fit did not converge, so its estimates are not at a maximum and these tests are not reliable. … | `anova(m)` or `pairwise(m, ...)` on a fit that did not converge (first note) |
 | Missing cells for: …. Interpret type III hypotheses with care. | a Type III table whose design has an empty cell |
 | The coefficient `<name>` is aliased, so the hypothesis was not tested. | a term with an aliased column (NaN row), one note per aliased coefficient, named as in the fit's coefficient names |
 | No denominator df (`<reason>`), so the hypothesis was not tested. | an F row with no df: Satterthwaite switched off or failed |
 | Partial eta-squared uses the Satterthwaite denominator df, so it is approximate. | an F table on Satterthwaite's df (last note) |
-| The `<rows>` tested coefficients span `<rank>` directions of their covariance; the F is on those `<rank>`. | a rank-deficient hypothesis |
+| The `<rows>` tested coefficients span `<rank>` directions of their covariance; the test is on those `<rank>`. | a rank-deficient hypothesis |
+| The `<rows>` tested coefficients span no direction of their covariance, so there is nothing to test. | an `L` that is zero on every tested coefficient |
 | A model refitted for this term's likelihood-ratio test did not converge, or its log-likelihood is not finite, so the statistic and its p-value are NaN. | a likelihood-ratio row whose refit did not converge, or whose log-likelihood is not finite |
 | The model refitted under the term's hypothesis reached a higher log-likelihood than the larger model of this row, by more than round-off: the larger model did not reach its optimum. The statistic is set to 0. | a likelihood-ratio row whose statistic came out below zero |
 | Counts this large make the likelihood sharp: the model refitted for this term may have stopped in a local minimum, which overstates the statistic. To check, refit that model from a large random-intercept standard deviation. | every likelihood-ratio row with a statistic, on a Poisson mixed model whose fitted counts average above e⁹ (about 8100) |

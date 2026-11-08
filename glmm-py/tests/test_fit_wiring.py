@@ -352,7 +352,9 @@ def test_a_weight_power_reaches_every_reader_of_the_weights():
 
 def test_weight_power_without_weights_is_ignored_with_a_warning_and_bad_values_raise():
     data = _data((1.0 + _X).tolist())
-    with pytest.warns(glmm.ArgumentIgnoredWarning, match="weight_power=2 has no effect"):
+    with pytest.warns(
+        glmm.ArgumentIgnoredWarning, match=r"weight_power = 2 has no effect without weights\.$"
+    ):
         m = glmm.fit(data, "y ~ x", weight_power=2)
     assert np.isnan(m.weight_power)
     with warnings.catch_warnings():

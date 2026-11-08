@@ -155,6 +155,29 @@ pub(crate) fn pearson_residuals(inp: &mut Inputs) -> Result<Value, BindError> {
     pearson(&family, &y, &fitted, weights.as_deref(), dispersion, power).map(Value::Vec)
 }
 
+/// `deviance_residual_sum`: `Σ w^v · d(y, fitted)`, `d` the family's unit
+/// deviance and `v` the fit's `weight_power` (1 when absent), as the Pearson
+/// residuals read the weights. `dispersion` is read only on negative
+/// binomial, as its shape theta.
+pub(crate) fn deviance_residual_sum(inp: &mut Inputs) -> Result<Value, BindError> {
+    let family = inp.string("family")?;
+    let y = inp.vec("y")?;
+    let fitted = inp.vec("fitted")?;
+    let weights = inp.opt_vec("weights")?;
+    let theta = inp.f64("dispersion")?;
+    let power = inp.opt_f64("weight_power")?.unwrap_or(1.0);
+    let weights = weights.map(|w| {
+        if power == 1.0 {
+            w
+        } else {
+            w.iter().map(|w| w.powf(power)).collect()
+        }
+    });
+    orchestrate::unit_deviance_sum(&family, theta, &y, &fitted, weights.as_deref())
+        .map(Value::F64)
+        .map_err(BindError::invalid_argument)
+}
+
 /// Min, quartiles and max as R's `quantile()` (type 7) gives them; all NaN
 /// when a value is NaN, as numpy's `quantile` gives them.
 fn five_numbers(mut r: Vec<f64>) -> Vec<f64> {
@@ -278,7 +301,9 @@ pub(crate) fn summary(inp: &mut Inputs) -> Result<Value, BindError> {
     let vcov = fit.rows("vcov", p)?;
     let dispersion = fit.f64("dispersion")?;
     let varcorr = fit.opt_vecs("varcorr")?.unwrap_or_default();
-    let mixed = !varcorr.is_empty();
+    // A mixed fit that did not converge has no `varcorr` but keeps its groupings.
+    let re_groups = read_re_groups(&mut fit)?;
+    let mixed = !re_groups.is_empty();
     let df_method = fit
         .opt_string("df_method")?
         .unwrap_or_else(|| "none".to_owned());
@@ -340,7 +365,15 @@ pub(crate) fn summary(inp: &mut Inputs) -> Result<Value, BindError> {
             .with("BIC", Value::F64(bic))
             .with("logLik", Value::F64(loglik))
             .with("deviance", Value::F64(-2.0 * loglik))
-            .with("df.resid", Value::I64(nobs as i64 - df as i64))
+            // `df` is 0 where it is not counted (a fit without estimates).
+            .with(
+                "df.resid",
+                if df == 0 {
+                    Value::F64(f64::NAN)
+                } else {
+                    Value::I64(nobs as i64 - df as i64)
+                },
+            )
     };
 
     let y = fit.vec("y")?;
@@ -361,7 +394,6 @@ pub(crate) fn summary(inp: &mut Inputs) -> Result<Value, BindError> {
         Value::Null
     };
 
-    let re_groups = read_re_groups(&mut fit)?;
     let term_index = match fit.value("re_term_index") {
         Value::Null => Vec::new(),
         Value::List(items) => items

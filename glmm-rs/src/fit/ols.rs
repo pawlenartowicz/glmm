@@ -92,8 +92,9 @@ impl OlsWorkspace {
 /// The accumulate + solve half of an OLS fit over a prebuilt column-major (raw,
 /// unscaled) `x_mat` and reusable scratch. Applies WLS by √wᵢ row scaling and
 /// the identity-link offset y-shift internally (the OLS kernel takes neither),
-/// then accumulates X'WX / X'Wy / y'Wy and runs the sufficient-statistics solve.
-/// `sum_y`/`sst` are NOT weight-consistent under this scaling but are never
+/// then accumulates X'WX / X'Wy / y'Wy and runs the sufficient-statistics solve,
+/// whose RSS is summed from these √wᵢ-scaled, offset-shifted rows.
+/// `sst` is NOT weight-consistent under this scaling but is never
 /// mapped into `Fit` (see [`ols_view_to_fit`]). `map` is the column map `x_mat`
 /// was fitted through: the view's `betas` stay on `x_mat`'s design, its
 /// `var_diag`/`t_sq` are the caller's (`crate::ols::fit_suff_stats_t_sq_mapped`).
@@ -231,6 +232,7 @@ pub(crate) fn fit_ols_prebuilt<'a>(
         scratch,
         map,
         qr,
+        Some((x_eff, y_eff)),
     )
 }
 

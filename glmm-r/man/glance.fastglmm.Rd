@@ -16,8 +16,12 @@ A one-row \code{data.frame}.
 }
 \description{
 \code{nobs}, \code{logLik}, \code{AIC}, \code{BIC}, \code{deviance} (\code{-2 * logLik}, the value the
-summary's criterion row prints - not \verb{$deviance}, the optimizer criterion),
-\code{df.residual} (\code{nobs - df}) and \code{REML}. AIC/BIC are returned on REML fits
+summary's criterion row prints - not \verb{$deviance}, the optimizer criterion,
+and on a GLMM, a GLM and OLS not \link[=deviance.fastglmm]{deviance()}, which
+follows lme4, \code{glm} and \code{lm}),
+\code{df.residual} (\code{nobs - df}; \code{NA} when \code{df} is 0, where the parameters are
+not counted: a fit that stopped before estimating anything, such as too few
+rows or a degenerate design, and a GLMM that did not converge) and \code{REML}. AIC/BIC are returned on REML fits
 too: computing a number somebody asked for is not printing one they did
 not, and the \code{REML} column says what it is. A REML AIC is comparable only
 across models with identical fixed effects.

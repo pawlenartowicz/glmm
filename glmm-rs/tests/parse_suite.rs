@@ -1156,3 +1156,27 @@ fn a_slope_on_two_factors_or_a_grouping_of_three_is_a_syntax_error() {
         assert!(parse(f).is_ok(), "{f}: {:?}", parse(f));
     }
 }
+
+/// An interaction as a random slope, in every random-effect form, is refused
+/// naming the term rather than read as a column called `a:b`.
+#[test]
+fn interaction_random_slope_is_refused() {
+    for (f, token) in [
+        ("y ~ Days + (Days:z | Subject)", "Days:z"),
+        ("y ~ Days + (Days*z | Subject)", "Days*z"),
+        ("y ~ x + (0 + a:b || g)", "a:b"),
+        ("y ~ x + zerocorr(1 + a:b | g)", "a:b"),
+    ] {
+        assert_eq!(
+            parse(f),
+            Err(ParseError::Syntax {
+                pos: 0,
+                msg: format!(
+                    "'{token}': a random slope on an interaction is not supported; compute it \
+                     as a column and use that column as the slope"
+                ),
+            }),
+            "{f}"
+        );
+    }
+}

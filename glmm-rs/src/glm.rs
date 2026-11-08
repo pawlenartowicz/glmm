@@ -16,7 +16,8 @@
 //!     precision weights' scale, and over ȳ on inverse-Gaussian, whose
 //!     deviance scales as 1/y. So their stopping point does not depend on the
 //!     overall scale of the weights or on the response's units (see
-//!     `dev_floor`). The other families keep `f = 0.1`.
+//!     `dev_floor`). On binomial, Poisson and NB `f` is R's 0.1 in units of
+//!     one case: weights below one case scale it down with them.
 //!   - Both stops read the step that produced the current β, `max_i |Δηᵢ|`:
 //!     the fit also stops as converged when that step moved no η by more than
 //!     `STEP_ULPS` ULPs of max |η|, or of the size of the terms η sums once
@@ -53,7 +54,8 @@
 //! (η = 0 for logit; the null-model β, or without an intercept R's
 //! `initialize` μ-start, for the Gamma-inverse and inverse-Gaussian 1/μ²
 //! links; the null model η₀ᵢ = oᵢ + ln(Σwy / Σw·e^o) for the log links — see
-//! the cold-start arm), a
+//! the cold-start arm; a log-link fit with an offset that fails from that
+//! seed is run once more from R's per-row seed, and reports that run), a
 //! fixed reproducible cold
 //! start; `Some(spec.effect_sizes)` — what the shipped hot loop passes — seeds
 //! the spec-derived truth-start (Y is synthetic, so the true β on the logit
@@ -388,8 +390,8 @@ fn term_size(x: MatRef<'_, f64>, beta: &[f64], offset: Option<&[f64]>, buf: &mut
 ///
 /// `family` selects the IRLS math, all of it behind one batched call into
 /// `simd_transcendental::family_pass`. Unweighted `Family::Binomial { link:
-/// Logit }` reaches the fused kernel `pw_and_log1pexp_sum` there, byte-identical
-/// to the MCPower hot loop's own computation; every other
+/// Logit }` on a 0/1 response reaches the fused kernel `pw_and_log1pexp_sum`
+/// there, byte-identical to the MCPower hot loop's own computation; every other
 /// family/link runs a vectorized arm written against `family`'s scalar
 /// formulas. Gamma/NB dispersion is handled by the caller (`fit.rs`),
 /// not here — this kernel folds `φ=1`. `nb_theta` is the NB shape θ̂ the caller's
@@ -397,7 +399,8 @@ fn term_size(x: MatRef<'_, f64>, beta: &[f64], offset: Option<&[f64]>, buf: &mut
 /// `family::variance`/`dev_resid`; pass `f64::NAN` for every other family).
 ///
 /// - `x`: `n × p` design (column-major faer).
-/// - `y`: length `n`; {0.0, 1.0} for binomial, counts for Poisson/NB, positive for Gamma.
+/// - `y`: length `n`; proportions in [0, 1] for binomial (0/1 for Bernoulli
+///   rows), counts for Poisson/NB, positive for Gamma.
 /// - `target_indices`: per-coefficient indices to compute `z²` for.
 /// - `beta_start`: `None` → β = 0 cold start; `Some(β₀)` (length `p`) → spec-derived truth start — seeds β and
 ///   computes η = X·β₀ once. A per-scenario constant, so determinism and
@@ -408,8 +411,9 @@ fn term_size(x: MatRef<'_, f64>, beta: &[f64], offset: Option<&[f64]>, buf: &mut
 ///   per-row deviance contribution; the working response `z = η + r` is
 ///   untouched (prior weights don't scale the working residual). The fused
 ///   `log1pexp` deviance identity holds only for unweighted Bernoulli rows, so
-///   `Some(_)` routes `Family::Binomial { link: Logit }` to the weighted arm
-///   instead (unweighted logit keeps the fused kernel). Matches R
+///   `Some(_)`, or a binomial y with a value other than 0 and 1, routes
+///   `Family::Binomial { link: Logit }` to the weighted arm instead
+///   (unweighted logit on a 0/1 y keeps the fused kernel). Matches R
 ///   `glm(weights=)` (`fit_glm_gamma_weighted_matches_r`,
 ///   `fit_glm_binomial_weighted_aggregated_matches_r`).
 /// - `scratch`: borrowed mutable slots from `SimWorkspace.irls_*`.
@@ -427,7 +431,7 @@ fn term_size(x: MatRef<'_, f64>, beta: &[f64], offset: Option<&[f64]>, buf: &mut
 /// `cbind(successes, failures) ~ ...`, e.g. the `cbpp_logit_glm` validation golden)
 /// also routes through. The one path still without a full β̂ oracle is the
 /// unweighted canonical-logit fast path (`Family::Binomial { link: Logit }`,
-/// `prior_w: None`) — its only external check is the null-deviance golden
+/// `prior_w: None`, a 0/1 y) — its only external check is the null-deviance golden
 /// above, which depends solely on ȳ, not the fitted β.
 #[allow(clippy::too_many_arguments)] // marshals (family, nb_theta, x, y, target_indices, beta_start, prior_w, offset, scratch)
 pub fn glm_irls_fit<'a>(
@@ -515,11 +519,53 @@ pub(crate) fn glm_irls_fit_mapped<'a>(
     scratch: GlmScratch<'a>,
     map: &ColumnScaling,
 ) -> GlmFitView<'a> {
+    glm_irls_fit_seeded(
+        family,
+        nb_theta,
+        x,
+        y,
+        target_indices,
+        beta_start,
+        prior_w,
+        offset,
+        scratch,
+        map,
+        false,
+    )
+}
+
+/// [`glm_irls_fit_mapped`]'s body. `per_row_seed` replaces the log links'
+/// null-model cold seed by R's per-row one (see the cold-start arm); it is set
+/// only on the second attempt of a failed log-link fit with an offset.
+#[allow(clippy::too_many_arguments)]
+fn glm_irls_fit_seeded<'a>(
+    family: Family,
+    nb_theta: f64,
+    x: MatRef<'_, f64>,
+    y: &[f64],
+    target_indices: &[u32],
+    beta_start: Option<&[f64]>,
+    prior_w: Option<&[f64]>,
+    offset: Option<&[f64]>,
+    scratch: GlmScratch<'a>,
+    map: &ColumnScaling,
+    per_row_seed: bool,
+) -> GlmFitView<'a> {
     let n = x.nrows();
     let p = x.ncols();
     let t = target_indices.len();
 
     debug_assert_eq!(n, y.len(), "glm_irls_fit: y length must match X.nrows()");
+    // The fused logit deviance `2·(Σ log1pexp(η) − Σ yη)` and the closed-form
+    // null deviance hold only on 0/1 rows: a fractional binomial y takes the
+    // weighted arm (unit weights) instead.
+    let weighted = prior_w.is_some()
+        || (matches!(
+            family,
+            Family::Binomial {
+                link: BinomialLink::Logit
+            }
+        ) && y[..n].iter().any(|&v| v != 0.0 && v != 1.0));
 
     let GlmScratch {
         irls_eta,
@@ -604,8 +650,9 @@ pub(crate) fn glm_irls_fit_mapped<'a>(
     // prior weights it is the WEIGHTED mean μ̂₀ = Σwᵢyᵢ/Σwᵢ (R's
     // glm(weights=)$null.deviance), so the null deviance is Σ wᵢdᵢ(y, μ̂₀).
     // Logit keeps the closed-form Bernoulli expression verbatim (byte-identity)
-    // only when unweighted — a weighted fit routes through the same general
-    // fold the per-iteration deviance uses (see the `prior_w` guard below), so
+    // only when unweighted on a 0/1 y — a weighted or fractional fit routes
+    // through the same general fold the per-iteration deviance uses (the
+    // `weighted` flag), so
     // `deviance_null` stays on the same weighting convention as `deviance`.
     // (The all-0/all-1 short circuit above keys off raw y, which is equivalent
     // under positive weights: the weighted mean is 0/1 exactly when ȳ is.)
@@ -623,9 +670,7 @@ pub(crate) fn glm_irls_fit_mapped<'a>(
     let deviance_null = match family {
         Family::Binomial {
             link: BinomialLink::Logit,
-        } if prior_w.is_none() => {
-            -2.0 * (y_sum * y_bar.ln() + (n as f64 - y_sum) * (1.0 - y_bar).ln())
-        }
+        } if !weighted => -2.0 * (y_sum * y_bar.ln() + (n as f64 - y_sum) * (1.0 - y_bar).ln()),
         other => {
             let mu0 = crate::family::clamp_mu(other, y_bar);
             let mut d = 0.0;
@@ -687,22 +732,29 @@ pub(crate) fn glm_irls_fit_mapped<'a>(
     // y × 1e3, and a Gamma/log fit with every weight 1e-9 2e-3 short, both
     // reported converged.
     // `weight_scale` is an exact power of two (1 unweighted) and ȳ carries y's
-    // units. The binomial deviance stays on R's 0.1: with φ ≡ 1 it is a
-    // likelihood-ratio statistic of counts, whose weights count cases. Poisson
-    // and NB do too while ȳ ≥ 1, but a non-integer y in tiny units (a rate
-    // without exposure weights) has D ∝ ȳ, and R's 0.1 stopped such a fit
-    // 1.7e-2 short in β at y × 1e-13, reported converged; so below ȳ = 1 the
-    // floor carries ȳ's units. Not a plain 0.1·ȳ: an NB deviance with θ ≪ ȳ
-    // does not grow with ȳ, and at ȳ = 1e6 that floor would ask |ΔD| < 1e-7 of
-    // a linearly converging fit. An all-zero count response (ȳ = 0) keeps 0.1.
-    // Unweighted, off inverse-Gaussian and ȳ < 1 counts, the floor is exactly 0.1.
+    // units. On binomial, Poisson and NB, with φ ≡ 1, the deviance is a
+    // likelihood-ratio statistic of counts, and R's 0.1 is in units of one
+    // case: weights of a case or more (trial counts, frequency weights) keep
+    // it exactly, and weights below one case scale it down with them, as the
+    // Gamma floor does (`case_scale`). With every weight 1e-12 the fixed 0.1
+    // stopped a binomial fit after its first compared pass, read as
+    // separation. Poisson and NB also carry ȳ's units below ȳ = 1: a
+    // non-integer y in tiny units (a rate without exposure weights) has
+    // D ∝ ȳ, and R's 0.1 stopped such a fit 1.7e-2 short in β at y × 1e-13,
+    // reported converged. Not a plain 0.1·ȳ: an NB deviance with θ ≪ ȳ does
+    // not grow with ȳ, and at ȳ = 1e6 that floor would ask |ΔD| < 1e-7 of a
+    // linearly converging fit. An all-zero count response (ȳ = 0) keeps
+    // 0.1·`case_scale`. Unweighted, off inverse-Gaussian and ȳ < 1 counts,
+    // the floor is exactly 0.1.
+    let weight_scale = crate::family::weight_scale(prior_w, n);
+    let case_scale = weight_scale.min(1.0);
     let dev_floor = match family {
-        Family::Gamma { .. } => 0.1 * crate::family::weight_scale(prior_w, n),
-        Family::InverseGaussian { .. } => 0.1 * crate::family::weight_scale(prior_w, n) / y_bar,
+        Family::Gamma { .. } => 0.1 * weight_scale,
+        Family::InverseGaussian { .. } => 0.1 * weight_scale / y_bar,
         Family::Poisson { .. } | Family::NegativeBinomial { .. } if y_bar > 0.0 => {
-            0.1 * y_bar.min(1.0)
+            0.1 * y_bar.min(1.0) * case_scale
         }
-        _ => 0.1,
+        _ => 0.1 * case_scale,
     };
 
     // Seed β and η here; the IRLS loop carries η forward from each
@@ -801,6 +853,23 @@ pub(crate) fn glm_irls_fit_mapped<'a>(
                 // responses of order y·e^{−η}, and IRLS runs off to ~1e306. R
                 // starts both families at μ₀ = y (`Gamma()$initialize`,
                 // `inverse.gaussian()$initialize`).
+                //
+                // The second attempt of a failed log-link fit with an offset
+                // takes R's per-row seed instead, ηᵢ = ln μ₀ᵢ with no offset
+                // (`glm.fit`'s `eta <- linkfun(mustart)`): μ₀ = y + 0.1 on
+                // Poisson and NB (`poisson()$initialize`), μ₀ = y on Gamma and
+                // inverse-Gaussian (y > 0 there). One row with an offset far
+                // above the rest dominates Σw·e^o, and the null-model seed then
+                // puts every other row many log units from its data.
+                _ if per_row_seed => {
+                    let count = matches!(
+                        family,
+                        Family::Poisson { .. } | Family::NegativeBinomial { .. }
+                    );
+                    for i in 0..n {
+                        irls_eta[i] = if count { y[i] + 0.1 } else { y[i] }.ln();
+                    }
+                }
                 _ => {
                     irls_eta[..n].fill(eta_null);
                     if let (true, Some(o)) = (log_link, offset) {
@@ -966,7 +1035,7 @@ pub(crate) fn glm_irls_fit_mapped<'a>(
                 // Sliced to n so the kernel's SIMD head/tail split lines up with
                 // η's; an empty slice is its "unit weights" spelling.
                 prior_w.map_or(&[][..], |w| &w[..n]),
-                prior_w.is_some(),
+                weighted,
                 yeta,
                 &mut irls_p[..n],
                 &mut irls_w[..n],
@@ -1449,6 +1518,39 @@ pub(crate) fn glm_irls_fit_mapped<'a>(
     }
 
     if !converged {
+        // The null-model seed is what keeps exposures decades apart working, so
+        // it stays first; R's per-row seed is only a second try, and its run
+        // is the one reported.
+        if !per_row_seed && beta_start.is_none() && log_link && offset.is_some() {
+            return glm_irls_fit_seeded(
+                family,
+                nb_theta,
+                x,
+                y,
+                target_indices,
+                beta_start,
+                prior_w,
+                offset,
+                GlmScratch {
+                    irls_eta,
+                    irls_p,
+                    irls_w,
+                    irls_z,
+                    irls_betas,
+                    irls_betas_new,
+                    irls_var_diag,
+                    irls_t_sq,
+                    irls_u_scratch,
+                    irls_xtwx,
+                    irls_xtwz,
+                    irls_l,
+                    irls_wx,
+                    irls_broken,
+                },
+                map,
+                true,
+            );
+        }
         // Partial re-NaN: inference outputs only — `betas` are deliberately
         // left at the loop's last fitted value, so the 3-array
         // `nan_fill_ols_scratch` must NOT be used here. A fit whose first solve

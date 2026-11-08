@@ -8,7 +8,7 @@ use crate::formula::{fit, Column, Error, Model, Table};
 use crate::inference::contrast::NoDfReason;
 use crate::inference::tails::{normal_quantile, t_quantile, tukey_quantile, tukey_upper_p};
 use crate::inference::LinearNote;
-use crate::test_support::csv_table;
+use crate::test_support::{csv_table, with_unused};
 use crate::{BinomialLink, Family, FitError, FitOptions};
 
 const FACTORIAL: &str = include_str!("../../../validation/data/simulated/sim_factorial.csv");
@@ -402,4 +402,37 @@ fn rows_of_a_robust_fit_are_its_robust_contrasts() {
             assert_eq!(row.notes, notes);
         }
     }
+}
+
+/// A fit whose factor declares a level no row has compares only the used
+/// levels, as the same rows without it do; with the unused level first too,
+/// and as a `by` factor.
+#[test]
+fn pairwise_ignores_unused_levels() {
+    let plain = csv_table(FACTORIAL, &["subj", "g", "h"]);
+    let unused = with_unused(&plain, "g", 0);
+    let formula = "y ~ x + g * h + (1 | subj)";
+    let m0 = model(&plain, formula, &FitOptions::default());
+    let m1 = model(&unused, formula, &FitOptions::default());
+    let key = |pw: &Pairwise| {
+        pw.rows
+            .iter()
+            .map(|r| {
+                (
+                    r.contrast.clone(),
+                    r.by_level.clone(),
+                    r.estimate,
+                    r.se,
+                    r.p_adjusted,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    for (factor, by) in [("g", None), ("h", Some(By::Levels("g")))] {
+        let a = pairwise(&m0, factor, by, Adjust::Holm).unwrap();
+        let b = pairwise(&m1, factor, by, Adjust::Holm).unwrap();
+        assert_eq!(b.levels, a.levels, "{factor}");
+        assert_eq!(key(&b), key(&a), "{factor}");
+    }
+    assert_eq!(pairwise(&m1, "g", None, Adjust::Holm).unwrap().levels, 3);
 }

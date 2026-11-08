@@ -697,6 +697,49 @@ fn warm_theta_carry_across_draws_matches_cold() {
     }
 }
 
+/// A start with non-finite entries (a failed draw's NaN β, θ, dispersion carried
+/// into the next draw) is dropped to a cold start, standardized or as given.
+#[test]
+fn non_finite_start_is_dropped_to_a_cold_start() {
+    let names = ["lmm_dense", "glmm_laplace", "nb_glmm", "glmm_gamma"];
+    let picked: Vec<Case> = invariance_cases()
+        .into_iter()
+        .filter(|c| names.contains(&c.name))
+        .collect();
+    assert_eq!(picked.len(), names.len());
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    for c in picked {
+        let data = c.data(&c.x);
+        let new_ws = || {
+            let mut ws = build_workspace(&c.model, &c.ids, c.n, c.p, &c.opts);
+            super::core::force_bobyqa_route(&mut ws);
+            ws
+        };
+        let mut ws = new_ws();
+        let mut fresh = new_ws();
+        let n_theta = fit_on(&mut ws, &data, None, &c.opts).theta().len();
+        let nan = StartValues {
+            beta: vec![f64::NAN; c.p],
+            theta: vec![f64::NAN; n_theta],
+            dispersion: Some(f64::NAN),
+        };
+        for as_given in [false, true] {
+            ws.set_prestandardized(as_given);
+            fresh.set_prestandardized(as_given);
+            let s = fit_on(&mut ws, &data, Some(&nan), &c.opts).into_fit(&data, &c.model, &c.opts);
+            let f0 = fit_on(&mut fresh, &data, None, &c.opts).into_fit(&data, &c.model, &c.opts);
+            let at = format!("{} (as given: {as_given})", c.name);
+            assert_eq!(bits(&s.beta), bits(&f0.beta), "{at}: NaN start β");
+            assert_eq!(
+                s.deviance.to_bits(),
+                f0.deviance.to_bits(),
+                "{at}: NaN start deviance"
+            );
+            assert_eq!(s.n_eval, f0.n_eval, "{at}: NaN start evaluations");
+        }
+    }
+}
+
 /// A pinned block with a centered slope: the pinned-diagonal fixture of
 /// `glmm::tests` (the data of
 /// `fit_glmm_vector_agq_keeps_search_lambda_at_pinned_diagonal`), x shifted

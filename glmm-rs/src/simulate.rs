@@ -38,8 +38,21 @@ fn dense_ids(ids: &[u32]) -> (Vec<u32>, usize) {
 /// `μ = g⁻¹(η)` of a draw: [`link_inv`], with `libm`'s `exp`, `expm1` and
 /// `erfc` in place of `f64::exp`, which follows the platform's libm. So a
 /// draw has the same last bit on every target. Mirrors `link_inv`, the clamp
-/// included — change together.
+/// included — change together — except that η ≤ 0 on the two reciprocal
+/// links is NaN: such a mean is outside the family's range.
 fn draw_mean(family: Family, eta: f64) -> f64 {
+    if matches!(
+        family,
+        Family::Gamma {
+            link: GammaLink::Inverse,
+            ..
+        } | Family::InverseGaussian {
+            link: InverseGaussianLink::InverseSquared,
+        }
+    ) && (eta.is_nan() || eta <= 0.0)
+    {
+        return f64::NAN;
+    }
     let eta = clamp_eta(family, eta);
     match family {
         Family::Binomial {
@@ -98,8 +111,10 @@ fn draw_mean(family: Family, eta: f64) -> f64 {
 /// [`Fit::dispersion`]), as `poisson()$simulate` and MASS's are. A
 /// coefficient that is NaN (an aliased column, a GLM column the fit could not
 /// separate) contributes zero, as in [`crate::predict`]. A row whose mean is
-/// outside its family's range (a negative mean through an identity or inverse
-/// link) draws NaN, as R's samplers do.
+/// outside its family's range (η ≤ 0 through the Gamma inverse or
+/// inverse-Gaussian 1/μ² link) draws NaN, as R's samplers do; a NaN row reads
+/// no number from the stream, so the later rows of that draw differ from a
+/// draw without it.
 ///
 /// For a `formula::Lowered` model `m`, `Simulator::new(fit, m.spec(),
 /// &m.design())` draws from the rows and trial counts the fit saw.

@@ -468,8 +468,12 @@ pub(crate) fn linear_note_line(note: LinearNote, names: &[String]) -> String {
             }
             None => "A tested coefficient is aliased, so the hypothesis was not tested.".into(),
         },
+        LinearNote::RankDeficientL { rank: 0, rows } => format!(
+            "The {rows} tested coefficients span no direction of their covariance, so there is \
+             nothing to test."
+        ),
         LinearNote::RankDeficientL { rank, rows } => format!(
-            "The {rows} tested coefficients span {rank} directions of their covariance; the F \
+            "The {rows} tested coefficients span {rank} directions of their covariance; the test \
              is on those {rank}."
         ),
         LinearNote::NoDf { reason } => {

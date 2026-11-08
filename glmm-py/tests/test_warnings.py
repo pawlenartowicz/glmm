@@ -381,6 +381,84 @@ def test_port_parity_few_rows_for_random_effects():
     assert printed(entry) in [str(w.message) for w in caught]
 
 
+# 12 groups of 8 rows; g2 is g under other names, cat is constant within g
+# (two categories), and yb is 0 or 1 within every g. Same fixture and calls
+# in glmm-r/tests/testthat/test-warnings.R - change together.
+_ID_G = [i // 8 for i in range(96)]
+_ID_X = [float((i * 5) % 8) for i in range(96)]
+IDENT = {
+    "x": _ID_X,
+    "g": [f"g{k:02d}" for k in _ID_G],
+    "g2": [f"h{11 - k:02d}" for k in _ID_G],
+    "cat": ["A" if k < 6 else "B" for k in _ID_G],
+    "y": [
+        0.3 * x + 0.5 * ((k * 7) % 5) + 0.2 * ((i * 3) % 7)
+        for i, (x, k) in enumerate(zip(_ID_X, _ID_G))
+    ],
+    "yb": [float(k % 2 == 0) for k in _ID_G],
+    "yv": [float((i * 5) % 3 == 0) for i in range(96)],
+    "z": [0.0] * 96,
+}
+
+
+def test_port_parity_repeated_grouping():
+    with pytest.warns(glmm.RepeatedGroupingWarning) as caught:
+        m = glmm.fit(IDENT, "y ~ x + (1 | g) + (1 | g2)")
+    entry = only(m, "repeated_grouping")
+    assert (entry["tier"], entry["title"]) == ("caution", "Same groups under two names")
+    assert entry["message"] == (
+        "Grouping factors 'g' and 'g2' put the rows into exactly the same groups and share a "
+        "random effect, so the data cannot tell their variances apart. How the variance is "
+        "split between them is arbitrary. Remove one of the two from the model."
+    )
+    assert printed(entry) in [str(w.message) for w in caught]
+
+
+def test_port_parity_slope_constant_within_levels():
+    with pytest.warns(glmm.SlopeConstantWithinLevelsWarning) as caught:
+        m = glmm.fit(IDENT, "y ~ cat + (1 + cat | g)")
+    entry = only(m, "slope_constant_within_levels")
+    assert (entry["tier"], entry["title"]) == ("caution", "Random slope constant within groups")
+    assert entry["message"] == (
+        "The random slope on catB does not vary within any group of 'g', so within each group "
+        "it cannot be told apart from the random intercept. Its variance and correlations "
+        "probably cannot be estimated from these data. Consider removing it from the "
+        "random-effects term."
+    )
+    assert printed(entry) in [str(w.message) for w in caught]
+
+
+def test_port_parity_separated_by_grouping():
+    with pytest.warns(glmm.SeparatedByGroupingWarning) as caught:
+        m = glmm.fit(IDENT, "yb ~ x + (1 | g)", "binomial")
+    entry = only(m, "separated_by_grouping")
+    assert (entry["tier"], entry["title"]) == ("caution", "Response constant within groups")
+    assert entry["message"] == (
+        "The response is all 0 or all 1 within every group of 'g', so the likelihood keeps "
+        "rising as this grouping's variance grows, and the variance has no finite estimate. "
+        "Any reported variance is a stopping point, not an estimate, and the fixed effects "
+        "depend on it. Consider dropping this grouping, or a model with a prior on the "
+        "variance."
+    )
+    assert printed(entry) in [str(w.message) for w in caught]
+
+
+def test_mixed_fit_with_every_fixed_column_aliased():
+    # Same fixture and call in glmm-r/tests/testthat/test-warnings.R - change together.
+    # z is all zero, so it is dropped as aliased and the mixed model has no
+    # fixed effect left to fit.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        m = glmm.fit(IDENT, "yv ~ 0 + z + (1 | g) + (1 | g2)", "binomial")
+    assert not m.converged
+    assert [w["kind"] for w in m.warnings] == ["repeated_grouping", "no_coefficients"]
+    assert only(m, "no_coefficients")["message"] == (
+        "The model has no fixed-effect coefficients: every fixed-effect column is all zero. "
+        "glmm needs at least one fixed effect in a mixed model. Add an intercept or a "
+        "predictor."
+    )
+
+
 def test_port_parity_variance_at_limit():
     # Same fixture and call in glmm-r/tests/testthat/test-warnings.R - change together.
     # On MIXED, y - 0.3x is constant within each group, so the residual variance

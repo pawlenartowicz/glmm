@@ -46,7 +46,8 @@ The default adjustment is Holm. emmeans' default is Tukey: use
 
 A Gaussian mixed model fitted with \code{satterthwaite = FALSE} has no df: its
 rows have \code{NaN} df, statistic and p-value, and a note. A comparison that
-reads an aliased coefficient (an empty cell) is \code{NaN}, with a note.
+reads an aliased coefficient (an empty cell) is \code{NaN}, with a note. A fit
+that did not converge gets its table with a note saying so.
 On a robust fit (\verb{$se_type} \code{"robust"}) each row is the robust t test on
 its robust df, with \code{satterthwaite = FALSE} too; a comparison one group
 alone identifies is \code{NaN} (\code{"fastglmm_robust_se_unidentified"}), and df

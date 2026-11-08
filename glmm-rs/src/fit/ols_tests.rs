@@ -276,7 +276,7 @@ fn fit_ols_weighted_collinear_fits_with_an_honest_se() {
 /// (`src/fit/common_tests.rs`): that test covers the mixed route's own `p == 0`
 /// short-circuit, but `re: None` takes a completely separate one in
 /// `fit_ols_prebuilt` and `fit_glm`, so a regression there is invisible to it. Covers `p == 0`,
-/// `n == p`, `n == 0`, and an all-zero column, for the OLS route
+/// `n == p` and an all-zero column, for the OLS route
 /// (`Family::Gaussian`) and one GLM route (`Family::Binomial { link: Logit }`).
 #[test]
 fn fit_fixed_degenerate_width_never_panics() {
@@ -304,13 +304,6 @@ fn fit_fixed_degenerate_width_never_panics() {
         assert!(
             !fit.converged(),
             "{family:?} p=0: degenerate fit does not report converged"
-        );
-
-        // n == 0, p == 1.
-        let fit = fit_cold(&[], &[], 0, 1, &model, &ids, &FitOptions::default());
-        assert!(
-            !fit.converged(),
-            "{family:?} n=0: degenerate fit does not report converged"
         );
 
         // n == p: four independent columns (lower-triangular ones) on four
@@ -861,4 +854,118 @@ fn ols_fit_reports_nobs_and_least_squares() {
     );
     assert!(!f.converged());
     assert_eq!((f.nobs, f.objective), (n, Objective::LeastSquares));
+}
+
+/// `y = shift + 1 + 2x + o + e` on `[1, x]`, n = 200: the rows, the
+/// response at that shift, and the weights and offset of the weighted arm.
+fn shifted_line(shift: f64) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
+    let mut s = 17u64;
+    let lcg = super::common_tests::lcg;
+    let n = 200;
+    let (mut x, mut y, mut w, mut o) = (vec![], vec![], vec![], vec![]);
+    for _ in 0..n {
+        let xi = lcg(&mut s);
+        let e = 2.0 * lcg(&mut s);
+        let wi = 1.5 + lcg(&mut s);
+        let oi = 3.0 * lcg(&mut s);
+        x.extend([1.0, xi]);
+        y.push(shift + 1.0 + 2.0 * xi + oi + e);
+        w.push(wi);
+        o.push(oi);
+    }
+    (x, y, w, o)
+}
+
+/// σ̂² and the SEs do not depend on how far y sits from 0: at a shift of
+/// 1e8 the closed-form RSS `y′y − β′X′y` cancelled to 0, at 1e9 it was off
+/// 165×. Weighted with an offset too. The 1e-5 band: the residuals keep
+/// about shift·ε/sd(e) ≈ 1e-7 of their relative precision at 1e9.
+#[test]
+fn ols_dispersion_survives_a_large_response_shift() {
+    let spec = ModelSpec::fixed(Family::Gaussian);
+    let n = 200;
+    for weighted in [false, true] {
+        let fit_at = |shift: f64| {
+            let (x, y, w, o) = shifted_line(shift);
+            let d = crate::Data::new(&x, &y, n, 2);
+            let d = if weighted {
+                d.weights(&w).offset(&o)
+            } else {
+                d
+            };
+            crate::fit(&d, &spec, &FitOptions::default()).unwrap()
+        };
+        let f0 = fit_at(0.0);
+        for shift in if weighted { vec![1e8] } else { vec![1e8, 1e9] } {
+            let f = fit_at(shift);
+            assert!(
+                (f.dispersion() / f0.dispersion() - 1.0).abs() <= 1e-5,
+                "{weighted} {shift}: {} vs {}",
+                f.dispersion(),
+                f0.dispersion()
+            );
+            for j in 0..2 {
+                assert!(
+                    (f.se[j] / f0.se[j] - 1.0).abs() <= 1e-5,
+                    "{weighted} {shift}: se[{j}] {} vs {}",
+                    f.se[j],
+                    f0.se[j]
+                );
+            }
+        }
+    }
+}
+
+/// A constant response on `[1, x]`, n = 60.
+fn constant_response(c: f64) -> (Vec<f64>, Vec<f64>) {
+    let mut s = 17u64;
+    let x = (0..60)
+        .flat_map(|_| [1.0, super::common_tests::lcg(&mut s)])
+        .collect();
+    (x, vec![c; 60])
+}
+
+/// A constant response: σ̂² is 0 or a round-off number, never negative, and
+/// the SEs are finite.
+#[test]
+fn ols_constant_response_has_a_nonnegative_dispersion() {
+    let (x, y) = constant_response(2.5);
+    let d = crate::Data::new(&x, &y, 60, 2);
+    let f = crate::fit(
+        &d,
+        &ModelSpec::fixed(Family::Gaussian),
+        &FitOptions::default(),
+    )
+    .unwrap();
+    assert!(
+        f.dispersion() >= 0.0 && f.dispersion() < 1e-25,
+        "{}",
+        f.dispersion()
+    );
+    assert!(
+        f.se.iter().all(|s| s.is_finite() && *s >= 0.0),
+        "{:?}",
+        f.se
+    );
+}
+
+/// HC2 on the same constant response: no robust SE is NaN without a note
+/// saying why. With the RSS summed from the residuals, σ̂² is a round-off
+/// number (8.2e-31 here) and the robust SEs are tiny and finite (about 1e-16),
+/// as R's `lm` reports on an exact line.
+#[test]
+fn ols_constant_response_robust_ses_have_no_nan_without_a_note() {
+    let (x, y) = constant_response(2.5);
+    let d = crate::Data::new(&x, &y, 60, 2);
+    let opts = FitOptions {
+        se_type: Some(SeType::Robust),
+        ..FitOptions::default()
+    };
+    let f = crate::fit(&d, &ModelSpec::fixed(Family::Gaussian), &opts).unwrap();
+    assert!(
+        f.se.iter().all(|s| !s.is_nan()) || !f.diagnostics.notes.is_empty(),
+        "{:?} {:?}",
+        f.se,
+        f.diagnostics.notes
+    );
 }

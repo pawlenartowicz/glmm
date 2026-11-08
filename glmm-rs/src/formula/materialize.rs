@@ -4,10 +4,11 @@
 //! [`GroupIds`], and the weights and offset the formula itself carries.
 //!
 //! Conventions (validated against R `model.matrix` / `lme4`):
-//! - **Treatment contrasts**, base = first level — the caller's [`Column::Factor`]
-//!   level order picks the reference level. [`Column::factor_from_labels`] supplies
-//!   the lexicographic order R's `factor()` defaults to when the caller has none.
-//!   Dummy names follow `paste0(var, level)`, e.g. `period2`. A factor keeps its
+//! - **Treatment contrasts**, base = first level that has rows — the caller's
+//!   [`Column::Factor`] level order picks the reference level, and levels with
+//!   no rows are dropped first, as R's model frame does.
+//!   [`Column::factor_from_labels`] supplies the lexicographic order R's
+//!   `factor()` defaults to when the caller has none. Dummy names follow `paste0(var, level)`, e.g. `period2`. A factor keeps its
 //!   base level (full indicator set) where R's `model.matrix` keeps it — see
 //!   [`full_indicator_flags`].
 //! - **Column order** is R's (`terms.formula`, then `model.matrix`): the
@@ -30,8 +31,10 @@ use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::OnceLock;
 
-use super::error::Error;
-use super::parse::{parse, parse_transform, ParsedFormula, RandomEffect, Transform};
+use super::error::{Error, ParseError};
+use super::parse::{
+    parse, parse_transform, ParsedFormula, RandomEffect, Transform, DEFAULT_RESPONSE,
+};
 use crate::{
     ColumnId, Data, Design, ErrorMessage, Family, Fit, FitError, FitOptions, GroupIds, Grouping,
     GroupingRelation, ModelSpec, PredictOptions, Prediction, ReStructure, ReTerm,
@@ -44,13 +47,14 @@ pub enum Column {
     Numeric(Vec<f64>),
     /// A categorical column, as levels + per-row codes.
     Factor {
-        /// Distinct category levels **in the caller's intended order**. Level 0
-        /// is the treatment-contrast base, so this order picks the reference
-        /// level. Not required to be sorted, and not required to be exhausted
-        /// by `codes`: an unused level yields an all-zero dummy column and thus
-        /// an aliased (NA) coefficient, matching R's `model.matrix` on a factor
-        /// with an unused level. A *grouping* factor drops its unused levels, as
-        /// lme4 does: they get no random-effect slot and no `ranef` row.
+        /// Distinct category levels **in the caller's intended order**; a
+        /// repeated label is refused. Not
+        /// required to be sorted, and not required to be exhausted by `codes`:
+        /// the lowering drops the levels no row has, for every factor the
+        /// formula reads (fixed, random slope and grouping), as R's model frame
+        /// does for `lm`, `glm` and lme4 (`drop.unused.levels = TRUE`). The
+        /// first level that has rows is the treatment-contrast base, so this
+        /// order picks the reference level.
         levels: Vec<String>,
         /// Per-row index into `levels` (length `n`).
         codes: Vec<u32>,
@@ -77,8 +81,13 @@ impl Column {
 /// The crate's minimal columnar input — no Arrow, no pandas. Consumers
 /// (SDOC/Arrow, the Python port/pandas) convert into this at their boundary, once
 /// per model.
+///
+/// # Errors
+/// [`lower`] refuses a table whose column names repeat, whose columns are not
+/// all `n` long, or whose factor has a code past its levels or a level label
+/// given more than once.
 pub struct Table {
-    /// Name → column, each of length `n`, in column order.
+    /// Name → column, each of length `n`, in column order; each name once.
     pub columns: Vec<(String, Column)>,
     /// Row count.
     pub n: usize,
@@ -197,13 +206,9 @@ pub struct Lowered {
     /// tables of one fit, and every fit of the design in a loop, share one.
     pub(crate) xtx: OnceLock<faer::Mat<f64>>,
     /// Each factor the design reads, a fixed term's or a random slope's, with
-    /// its levels in the fit's order. [`lower_new`] codes a new table's labels
+    /// its used levels (those with rows) in the fit's order. [`lower_new`] codes a new table's labels
     /// by them; a grouping factor is matched by its slot labels instead.
     pub(crate) factor_levels: Vec<(String, Vec<String>)>,
-    /// The levels of a [`Self::factor_levels`] factor that no row of the fit
-    /// has, per factor that has one. Their columns are aliased, so
-    /// [`lower_new`] refuses them as levels the fit did not see.
-    pub(crate) unseen_levels: Vec<(String, Vec<String>)>,
     /// Each numeric variable the fixed part reads, the `offset()` term's
     /// included, with its unweighted mean over the rows, in order of first
     /// appearance. A transform's variable is listed raw: `log(x)` gives the
@@ -289,7 +294,10 @@ pub(crate) struct RdxCross {
 /// [`Error::SingleLevelFactor`], [`Error::EmptyDesign`],
 /// [`Error::TransformNotFinite`], [`Error::CbindNeedsBinomial`],
 /// [`Error::ZeroTrials`], [`Error::NegativeCount`]) when `data` doesn't match
-/// what the formula requires.
+/// what the formula requires. [`Error::Fit`] with [`FitError::Shape`] when
+/// `data` is not a valid [`Table`]: a repeated column name, a column that is
+/// not `n` long, a factor code past its levels or a factor level label given
+/// more than once.
 ///
 /// # Examples
 /// ```
@@ -362,7 +370,8 @@ impl Model {
 /// ([`crate::fit`]).
 ///
 /// # Errors
-/// The errors of [`lower`], and [`Error::Fit`] when the kernel refuses the
+/// The errors of [`lower`] (a repeated column name or factor level label in
+/// `table` among them), and [`Error::Fit`] when the kernel refuses the
 /// lowered input.
 pub fn fit(
     formula: &str,
@@ -400,6 +409,8 @@ pub fn fit_lowered(formula: &str, lowered: Lowered, opts: &FitOptions) -> Result
 /// [`Error::ZeroTrials`], and [`Error::NegativeCount`].
 pub fn materialize(ast: &ParsedFormula, data: &Table, family: Family) -> Result<Lowered, Error> {
     check_table(data)?;
+    let owned = drop_unused_levels(data);
+    let data = owned.as_ref().unwrap_or(data);
     let n = data.n;
 
     // 1. Response. `cbind(s, f)` lowers to lme4's own objective: proportion
@@ -428,6 +439,15 @@ pub fn materialize(ast: &ParsedFormula, data: &Table, family: Family) -> Result<
             Some(Column::Numeric(v)) => v.clone(),
             Some(Column::Factor { .. }) => {
                 return Err(Error::ResponseNotNumeric(ast.dependent.clone()))
+            }
+            // A formula literally naming `explained_variable` on data without
+            // that column reads as one with no response.
+            None if ast.dependent == DEFAULT_RESPONSE => {
+                return Err(ParseError::Syntax {
+                    pos: 0,
+                    msg: "the formula has no response; write it as y ~ x".into(),
+                }
+                .into())
             }
             None => return Err(Error::UnknownColumn(ast.dependent.clone())),
         },
@@ -470,25 +490,6 @@ pub fn materialize(ast: &ParsedFormula, data: &Table, family: Family) -> Result<
             _ => None,
         })
         .collect();
-    let unseen_levels = factor_levels
-        .iter()
-        .filter_map(|(v, levels)| {
-            let Some(Column::Factor { codes, .. }) = data.get(v) else {
-                return None;
-            };
-            let mut seen = vec![false; levels.len()];
-            for &c in codes {
-                seen[c as usize] = true;
-            }
-            let unseen: Vec<String> = levels
-                .iter()
-                .zip(seen)
-                .filter(|(_, s)| !s)
-                .map(|(l, _)| l.clone())
-                .collect();
-            (!unseen.is_empty()).then(|| (v.clone(), unseen))
-        })
-        .collect();
     let numeric_means = numeric_means(ast, data);
     Ok(Lowered {
         x,
@@ -509,16 +510,23 @@ pub fn materialize(ast: &ParsedFormula, data: &Table, family: Family) -> Result<
         rdx,
         xtx: OnceLock::new(),
         factor_levels,
-        unseen_levels,
         numeric_means,
     })
 }
 
-/// `data`'s columns checked against it: each `n` long and each factor code a
-/// level. A longer column would index past the design, a shorter one would be
-/// fitted as zeros, and a bad code would index past the levels.
+/// `data`'s columns checked against it: each name once, each `n` long, each
+/// factor code a level and each level label once. A longer column would index
+/// past the design, a shorter one would be fitted as zeros, a bad code would
+/// index past the levels, and a repeated name or label would be read as its
+/// first copy.
 fn check_table(data: &Table) -> Result<(), Error> {
+    let mut names = BTreeSet::new();
     for (name, col) in &data.columns {
+        if !names.insert(name.as_str()) {
+            return Err(Error::Fit(FitError::Shape(
+                format!("duplicate column name {name:?}").into(),
+            )));
+        }
         let len = match col {
             Column::Numeric(v) => v.len(),
             Column::Factor { codes, .. } => codes.len(),
@@ -536,6 +544,12 @@ fn check_table(data: &Table) -> Result<(), Error> {
                         levels.len()
                     )
                     .into(),
+                )));
+            }
+            let mut seen = BTreeSet::new();
+            if let Some(label) = levels.iter().find(|l| !seen.insert(l.as_str())) {
+                return Err(Error::Fit(FitError::Shape(
+                    format!("factor column {name:?} has the level {label:?} more than once").into(),
                 )));
             }
         }
@@ -665,17 +679,25 @@ impl NewRows {
 /// random-effect-only columns ([`re_only_columns`]) then in the fit's order
 /// by construction, the offset evaluated on the new rows, and each grouping
 /// label matched to its slot in [`ReGroupInfo::slot_labels`]. The response
-/// is not read.
+/// is not read. With `population` (a population prediction) no grouping
+/// column and no random-effect-only column is read: `ids` is `None` and
+/// `re_columns` all zero, as for a table with none of the grouping columns.
 ///
 /// # Errors
 /// [`Error::Fit`] with [`FitError::Shape`] for a level of a fixed factor or
 /// a factor slope that the fit did not see, naming column, level and row (lme4
 /// refuses it too); [`Error::WrongColumnKind`] for a variable whose kind is
-/// not the one it had in the fit; the errors of [`fixed_design`],
-/// [`re_only_columns`] and the offset as [`materialize`] returns them; and
-/// [`Error::UnknownColumn`] for a grouping column missing while another is
-/// present.
-pub(crate) fn lower_new(formula: &str, lowered: &Lowered, table: &Table) -> Result<NewRows, Error> {
+/// not the one it had in the fit; the errors of [`fixed_design`] and the
+/// offset as [`materialize`] returns them. In conditional mode only (not
+/// `population`): the errors of [`re_only_columns`], a grouping label that
+/// names two of the fit's levels, and [`Error::UnknownColumn`] for a grouping
+/// column missing while another is present.
+pub(crate) fn lower_new(
+    formula: &str,
+    lowered: &Lowered,
+    table: &Table,
+    population: bool,
+) -> Result<NewRows, Error> {
     let ast = parse(formula)?;
     check_table(table)?;
     let groupings = &lowered.re_groups;
@@ -690,9 +712,10 @@ pub(crate) fn lower_new(formula: &str, lowered: &Lowered, table: &Table) -> Resu
         },
     ) = new_fixed_design(&ast, lowered, table)?;
     let n = table.n;
-    let present = groupings
-        .iter()
-        .any(|g| g.name.split(':').any(|c| table.get(c).is_some()));
+    let present = !population
+        && groupings
+            .iter()
+            .any(|g| g.name.split(':').any(|c| table.get(c).is_some()));
     let (re_columns, re_p, ids) = if present {
         let (re_columns, re_p) = re_only_columns(
             kept_nodes(&ast, groupings),
@@ -787,15 +810,9 @@ pub(crate) fn new_fixed_design<'a>(
     for (name, col) in &table.columns {
         let col = match (col, fit_levels(name)) {
             (Column::Factor { levels, codes }, Some(fit)) => {
-                let unseen = lowered
-                    .unseen_levels
-                    .iter()
-                    .find(|(f, _)| f == name)
-                    .map_or(&[][..], |(_, l)| l);
                 let index: HashMap<&str, u32> = fit
                     .iter()
                     .enumerate()
-                    .filter(|(_, l)| !unseen.contains(l))
                     .map(|(k, l)| (l.as_str(), k as u32))
                     .collect();
                 let codes = codes
@@ -865,7 +882,7 @@ pub(crate) fn new_fixed_design<'a>(
 /// [`Error::WrongColumnKind`], [`Error::TransformNotFinite`]); and
 /// [`Error::Fit`] with the errors of [`crate::predict`].
 pub fn predict(model: &Model, table: &Table, opts: &PredictOptions) -> Result<Prediction, Error> {
-    let rows = lower_new(&model.formula, &model.lowered, table)?;
+    let rows = lower_new(&model.formula, &model.lowered, table, opts.population)?;
     crate::predict(&model.fit, model.lowered.spec(), &rows.design(), opts).map_err(Error::Fit)
 }
 
@@ -1264,10 +1281,72 @@ fn interaction_columns(
 /// built for a whole-number one (see [`grouping_factor`]).
 type LevelsAndCodes<'a> = (Cow<'a, [String]>, Cow<'a, [u32]>);
 
-/// A grouping column's `(levels, codes)`, the levels no row carries dropped (R's
-/// `droplevels`, which lme4 applies to a grouping factor). The codes ARE the
-/// per-row ids, dense in `0..levels.len()` and so each below `n`: a level with no
-/// row would cost a random-effect slot and get a fully shrunk `ranef` row. A
+/// `levels` without the ones no code uses (R's `droplevels`), in their order,
+/// and `codes` renumbered to match; both borrowed when every level is used.
+fn used_levels<'a>(levels: &'a [String], codes: &'a [u32]) -> LevelsAndCodes<'a> {
+    let mut used = vec![false; levels.len()];
+    for &c in codes {
+        used[c as usize] = true;
+    }
+    if used.iter().all(|&u| u) {
+        return (Cow::Borrowed(levels), Cow::Borrowed(codes));
+    }
+    let mut remap = vec![0u32; levels.len()];
+    let mut kept = Vec::new();
+    for (l, _) in used.iter().enumerate().filter(|&(_, &u)| u) {
+        remap[l] = kept.len() as u32;
+        kept.push(levels[l].clone());
+    }
+    let codes = codes.iter().map(|&c| remap[c as usize]).collect();
+    (Cow::Owned(kept), Cow::Owned(codes))
+}
+
+/// `data` with each factor column's unused levels dropped by [`used_levels`],
+/// as R's model frame does (`drop.unused.levels = TRUE`) before `lm`, `glm`
+/// and lme4 code a factor; `None` when every factor uses all its levels. The
+/// codes must be in range ([`check_table`]). A new table for `predict` is not
+/// passed here: it is coded by the fit's levels.
+pub(crate) fn drop_unused_levels(data: &Table) -> Option<Table> {
+    let compact: Vec<Option<(Vec<String>, Vec<u32>)>> = data
+        .columns
+        .iter()
+        .map(|(_, col)| match col {
+            Column::Factor { levels, codes } => match used_levels(levels, codes) {
+                (Cow::Owned(levels), Cow::Owned(codes)) => Some((levels, codes)),
+                _ => None,
+            },
+            Column::Numeric(_) => None,
+        })
+        .collect();
+    if compact.iter().all(Option::is_none) {
+        return None;
+    }
+    // shortcut: copies the whole table when a factor has an unused level;
+    // drop per column on read if that copy shows in a profile.
+    let columns = data
+        .columns
+        .iter()
+        .zip(compact)
+        .map(|((name, col), compact)| {
+            let col = match (col, compact) {
+                (_, Some((levels, codes))) => Column::Factor { levels, codes },
+                (Column::Factor { levels, codes }, None) => Column::Factor {
+                    levels: levels.clone(),
+                    codes: codes.clone(),
+                },
+                (Column::Numeric(v), None) => Column::Numeric(v.clone()),
+            };
+            (name.clone(), col)
+        })
+        .collect();
+    Some(Table { columns, n: data.n })
+}
+
+/// A grouping column's `(levels, codes)`, the levels no row carries dropped by
+/// [`used_levels`] (R's `droplevels`, which lme4 applies to a grouping factor;
+/// [`materialize`] has already dropped them, a new table has not). The codes
+/// ARE the per-row ids, dense in `0..levels.len()` and so each below `n`: a
+/// level with no row would cost a random-effect slot and get a fully shrunk `ranef` row. A
 /// grouping's level order is arbitrary as far as the fit is concerned (its RE
 /// levels are exchangeable), so a factor's own order is kept.
 ///
@@ -1277,23 +1356,7 @@ type LevelsAndCodes<'a> = (Cow<'a, [String]>, Cow<'a, [u32]>);
 /// `factor()` on that column. Any other numeric column is refused.
 fn grouping_factor<'a>(name: &str, data: &'a Table) -> Result<LevelsAndCodes<'a>, Error> {
     match data.get(name) {
-        Some(Column::Factor { levels, codes }) => {
-            let mut used = vec![false; levels.len()];
-            for &c in codes {
-                used[c as usize] = true;
-            }
-            if used.iter().all(|&u| u) {
-                return Ok((Cow::Borrowed(levels), Cow::Borrowed(codes)));
-            }
-            let mut remap = vec![0u32; levels.len()];
-            let mut kept = Vec::new();
-            for (l, _) in used.iter().enumerate().filter(|&(_, &u)| u) {
-                remap[l] = kept.len() as u32;
-                kept.push(levels[l].clone());
-            }
-            let codes = codes.iter().map(|&c| remap[c as usize]).collect();
-            Ok((Cow::Owned(kept), Cow::Owned(codes)))
-        }
+        Some(Column::Factor { levels, codes }) => Ok(used_levels(levels, codes)),
         Some(Column::Numeric(v)) => {
             if !v.iter().all(|x| x.is_finite() && x.fract() == 0.0) {
                 return Err(Error::WrongColumnKind {
@@ -2310,10 +2373,13 @@ pub fn unresolved_columns(ast: &ParsedFormula, available: &[String]) -> Vec<Stri
 }
 
 /// [`unresolved_columns`], with the response left out unless `with_response`.
+/// A formula with no response is left to [`materialize`]'s syntax error, so
+/// the parser's placeholder name is never reported as a missing column.
 #[cfg(feature = "orchestrate")]
 fn unresolved_names(ast: &ParsedFormula, available: &[String], with_response: bool) -> Vec<String> {
+    let no_response = ast.cbind.is_none() && ast.dependent == DEFAULT_RESPONSE;
     let mut out: Vec<String> = Vec::new();
-    for_each_formula_name(ast, with_response, |raw, is_group| {
+    for_each_formula_name(ast, with_response && !no_response, |raw, is_group| {
         if is_group {
             push_missing_group(&mut out, raw, available)
         } else {
@@ -2449,7 +2515,10 @@ fn re_group_name(re: &RandomEffect) -> String {
 mod tests {
     use super::*;
     use crate::formula::parse::RandomEffect;
+    use crate::test_support::{csv_table, with_unused};
     use crate::ReTerm;
+
+    const FACTORIAL: &str = include_str!("../../../validation/data/simulated/sim_factorial.csv");
 
     /// Unbalanced nesting — parents "A","B","C" (lexicographic ids 0,1,2) with
     /// 1, 2, 3 distinct children respectively (child labels reused across
@@ -2714,17 +2783,64 @@ mod tests {
             ],
             n: 3,
         };
-        for formula in ["y ~ f + x", "y ~ f:x"] {
-            assert_eq!(
-                super::lower(formula, &table, Family::Gaussian)
-                    .err()
-                    .unwrap(),
-                Error::SingleLevelFactor {
-                    name: "f".to_string()
-                },
-                "{formula}"
-            );
+        // One level used of three declared: the unused two are dropped first.
+        let declared = Table {
+            columns: vec![
+                ("y".into(), Column::Numeric(vec![1.0, 2.0, 3.0])),
+                ("x".into(), Column::Numeric(vec![0.1, 0.2, 0.3])),
+                (
+                    "f".into(),
+                    Column::Factor {
+                        levels: strs(&["z", "a", "b"]),
+                        codes: vec![0, 0, 0],
+                    },
+                ),
+            ],
+            n: 3,
+        };
+        for table in [&table, &declared] {
+            for formula in ["y ~ f + x", "y ~ f:x"] {
+                assert_eq!(
+                    super::lower(formula, table, Family::Gaussian)
+                        .err()
+                        .unwrap(),
+                    Error::SingleLevelFactor {
+                        name: "f".to_string()
+                    },
+                    "{formula}"
+                );
+            }
         }
+    }
+
+    /// An unused level, first or in the middle, is dropped before coding, as
+    /// R's model frame does (`drop.unused.levels = TRUE`): the lowering equals
+    /// that of the same rows without it, in the fixed part, an interaction and
+    /// a factor slope.
+    #[test]
+    fn unused_levels_are_dropped_before_coding() {
+        let plain = csv_table(FACTORIAL, &["subj", "g", "h"]);
+        let terms = |lo: &Lowered| {
+            lo.re_groups
+                .iter()
+                .map(|g| g.terms.clone())
+                .collect::<Vec<_>>()
+        };
+        for formula in ["y ~ x + g", "y ~ 0 + g", "y ~ x * g + (1 + g | subj)"] {
+            let want = super::lower(formula, &plain, Family::Gaussian).unwrap();
+            for at in [0, 1] {
+                let table = with_unused(&plain, "g", at);
+                let got = super::lower(formula, &table, Family::Gaussian).unwrap();
+                assert_eq!(got.col_names, want.col_names, "{formula} at {at}");
+                assert_eq!(got.x, want.x, "{formula} at {at}");
+                assert_eq!(got.re_columns, want.re_columns, "{formula} at {at}");
+                assert_eq!(terms(&got), terms(&want), "{formula} at {at}");
+                assert_eq!(got.factor_levels, want.factor_levels, "{formula} at {at}");
+            }
+        }
+        // The names a reader checks by eye: base "a", no "gzzz".
+        let lo = super::lower("y ~ x + g", &with_unused(&plain, "g", 0), Family::Gaussian).unwrap();
+        assert_eq!(lo.col_names, ["(Intercept)", "x", "gb", "gc"]);
     }
 
     /// A grouping with a single observed level is dropped with a
@@ -2807,6 +2923,31 @@ mod tests {
             unresolved_columns(&parse("y ~ z + w + z:w").unwrap(), &strs(&["y"])),
             strs(&["z", "w"])
         );
+
+        // A formula with no response leaves the refusal to `materialize`.
+        assert!(unresolved_columns(&parse("~ x").unwrap(), &strs(&["x"])).is_empty());
+    }
+
+    /// A formula with no response (`~ x`, or no separator at all) is a syntax
+    /// error at lowering, not an unknown column named after the parser's
+    /// placeholder.
+    #[test]
+    fn formula_without_response_is_refused() {
+        let table = Table {
+            columns: vec![("x".into(), Column::Numeric(vec![1.0, 2.0, 3.0]))],
+            n: 3,
+        };
+        let want = Error::Parse(ParseError::Syntax {
+            pos: 0,
+            msg: "the formula has no response; write it as y ~ x".into(),
+        });
+        for f in ["~ x", "x"] {
+            assert_eq!(
+                lower(f, &table, Family::Gaussian).err(),
+                Some(want.clone()),
+                "{f}"
+            );
+        }
     }
 
     /// 36 rows: six groups `g` of six, a three-level factor `f` (`a`, `b`,

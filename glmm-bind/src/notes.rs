@@ -25,6 +25,7 @@ const KINDS: &[(&str, &str, &str)] = &[
     ("constant_response", "severe", "Response does not vary"),
     ("too_few_rows", "severe", "Too few rows"),
     ("no_coefficients", "severe", "Nothing to estimate"),
+    ("separated", "severe", "Separation"),
     (
         "pirls_exhausted",
         "caution",
@@ -74,6 +75,21 @@ const KINDS: &[(&str, &str, &str)] = &[
         "few_rows_for_random_effects",
         "caution",
         "Too few rows for the random effects",
+    ),
+    (
+        "repeated_grouping",
+        "caution",
+        "Same groups under two names",
+    ),
+    (
+        "slope_constant_within_levels",
+        "caution",
+        "Random slope constant within groups",
+    ),
+    (
+        "separated_by_grouping",
+        "caution",
+        "Response constant within groups",
     ),
     (
         "variance_at_limit",
@@ -302,6 +318,34 @@ fn note_message(n: &NoteInfo, columns: &[u32], cx: &FitText) -> Option<String> {
             n.evals,
             count(cx.nobs, "row")
         ),
+        // `detail` is "<first>, <second>": two grouping names.
+        "repeated_grouping" => {
+            let (a, b) = n.detail.split_once(", ").unwrap_or((&n.detail, ""));
+            format!(
+                "Grouping factors '{a}' and '{b}' put the rows into exactly the same groups and \
+                 share a random effect, so the data cannot tell their variances apart. How the \
+                 variance is split between them is arbitrary. Remove one of the two from the \
+                 model."
+            )
+        }
+        // `detail` is "<slope labels> | <grouping>".
+        "slope_constant_within_levels" => {
+            let (labels, g) = n.detail.rsplit_once(" | ").unwrap_or((&n.detail, ""));
+            format!(
+                "The random slope on {labels} does not vary within any group of '{g}', so \
+                 within each group it cannot be told apart from the random intercept. Its \
+                 variance and correlations probably cannot be estimated from these data. \
+                 Consider removing it from the random-effects term."
+            )
+        }
+        "separated_by_grouping" => format!(
+            "The response is all 0 or all 1 within every group of '{}', so the likelihood keeps \
+             rising as this grouping's variance grows, and the variance has no finite estimate. \
+             Any reported variance is a stopping point, not an estimate, and the fixed effects \
+             depend on it. Consider dropping this grouping, or a model with a prior on the \
+             variance.",
+            n.detail
+        ),
         "variance_at_limit" => "A random-effect parameter reached the upper limit of the search \
              (1000 on glmm's internal scale). On a Gaussian model this usually means the residual \
              variance is estimated at or near zero; on other families the random-effect variance \
@@ -518,18 +562,21 @@ pub(crate) struct Failed<'a> {
 
 /// The one severe warning of a fit that did not converge, as `(kind,
 /// message)`. The kernel does not say which stopping rule fired, so the cause
-/// is read off what the fit reports, most specific first: no coefficient, too
-/// few rows (a one-row response is trivially constant, so this comes first),
-/// a constant response, then the model. A model with random effects whose
-/// fixed-effects-only GLM stopped on separation (the `separated` note) never
-/// ran its search; its coefficients are that GLM's last step, so it gets the
-/// GLM's message. Otherwise, with random effects, a finite deviance means the
-/// kernel reached an end point (the budget stop, reported at its best point),
-/// and finite estimated coefficients (aliased slots are NaN by contract)
-/// confirm it; anything else failed. The deviance is what decides a model
-/// with no fixed effects. A GLMM inner cap-out during the search is one extra
-/// sentence rather than a second warning. On the reciprocal links a response
-/// outside their range names that cause instead of the general advice.
+/// is read off what the fit reports, most specific first: no coefficient (on
+/// a mixed model, only when columns were dropped as aliased, which means
+/// every fixed-effect column is all zero, since the alias check never drops
+/// the first column that is not), too few rows (a one-row response is
+/// trivially constant, so this comes first), a constant response, then the
+/// model. A model with random effects whose fixed-effects-only GLM stopped on
+/// separation (the `separated` note) never ran its search; its coefficients
+/// are that GLM's last step, so it gets the GLM's message. Otherwise, with
+/// random effects, a finite deviance means the kernel reached an end point
+/// (the budget stop, reported at its best point), and finite estimated
+/// coefficients (aliased slots are NaN by contract) confirm it; anything else
+/// failed. The deviance is what decides a model with no fixed-effect column
+/// at all. A GLMM inner cap-out during the search is one extra sentence
+/// rather than a second warning. On the reciprocal links a response outside
+/// their range names that cause instead of the general advice.
 pub(crate) fn failure(f: &Failed) -> (&'static str, String) {
     let estimated = || {
         f.beta
@@ -544,6 +591,15 @@ pub(crate) fn failure(f: &Failed) -> (&'static str, String) {
             "no_coefficients",
             "The model has no coefficients and no random effects, so there is nothing to \
              estimate. Add an intercept or a predictor."
+                .to_owned(),
+        );
+    }
+    if n_est == 0 && !f.aliased.is_empty() {
+        return (
+            "no_coefficients",
+            "The model has no fixed-effect coefficients: every fixed-effect column is all zero. \
+             glmm needs at least one fixed effect in a mixed model. Add an intercept or a \
+             predictor."
                 .to_owned(),
         );
     }
@@ -697,6 +753,37 @@ mod tests {
     #[test]
     fn constructed_notes_print_their_text() {
         let cases = [
+            (
+                NoteInfo {
+                    detail: "g, g2".into(),
+                    ..note("repeated_grouping")
+                },
+                "Grouping factors 'g' and 'g2' put the rows into exactly the same groups and \
+                 share a random effect, so the data cannot tell their variances apart. How the \
+                 variance is split between them is arbitrary. Remove one of the two from the \
+                 model.",
+            ),
+            (
+                NoteInfo {
+                    detail: "catB | word".into(),
+                    ..note("slope_constant_within_levels")
+                },
+                "The random slope on catB does not vary within any group of 'word', so within \
+                 each group it cannot be told apart from the random intercept. Its variance and \
+                 correlations probably cannot be estimated from these data. Consider removing it \
+                 from the random-effects term.",
+            ),
+            (
+                NoteInfo {
+                    detail: "g".into(),
+                    ..note("separated_by_grouping")
+                },
+                "The response is all 0 or all 1 within every group of 'g', so the likelihood \
+                 keeps rising as this grouping's variance grows, and the variance has no finite \
+                 estimate. Any reported variance is a stopping point, not an estimate, and the \
+                 fixed effects depend on it. Consider dropping this grouping, or a model with a \
+                 prior on the variance.",
+            ),
             (
                 NoteInfo {
                     detail: "onegroup".into(),
@@ -1111,6 +1198,19 @@ mod tests {
             ),
             (
                 Failed {
+                    mixed: true,
+                    beta: &[f64::NAN],
+                    aliased: &[true],
+                    ..base
+                },
+                "no_coefficients",
+                "The model has no fixed-effect coefficients: every fixed-effect column is all \
+                 zero. glmm needs at least one fixed effect in a mixed model. Add an intercept \
+                 or a predictor."
+                    .to_owned(),
+            ),
+            (
+                Failed {
                     beta: &nan,
                     y: &[1.0, 2.0],
                     ..base
@@ -1140,7 +1240,7 @@ mod tests {
                 too_few("1 coefficient", "1 row"),
             ),
         ];
-        assert_eq!(cases.len(), 23);
+        assert_eq!(cases.len(), 24);
         for (f, kind, message) in &cases {
             assert_eq!(failure(f), (*kind, message.clone()), "{kind}");
             assert_eq!(tier_title(kind).0, "severe");

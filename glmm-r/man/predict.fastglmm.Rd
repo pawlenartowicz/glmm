@@ -73,5 +73,8 @@ link of the link-scale one. A fit with no conditional variances (see
 only. On a robust fit (\verb{$se_type} \code{"robust"}) the standard error and
 interval are model-based, as on the same fit with \code{se_type = "model"},
 with a \code{"fastglmm_predict_se_model_based"} warning: their formula holds
-only with the model's covariance.
+only with the model's covariance. A fit with no estimates (every
+coefficient \code{NA}: a fit that stopped before estimating anything, such as
+too few rows or a degenerate design) predicts \code{NA}, with an \code{NA} standard
+error and \code{NA} bounds.
 }

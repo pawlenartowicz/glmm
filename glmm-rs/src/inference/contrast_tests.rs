@@ -359,11 +359,8 @@ fn no_endpoint_lmm_records_failed_pass() {
     );
 }
 
-/// The OLS F test is the classical one: every direction's df is `n − p`, so
-/// the mean rule gives a DenDF of `n − p` exactly, and
-/// `F = (Lβ̂)ᵀ(L·C·Lᵀ)⁻¹(Lβ̂)/r`.
-#[test]
-fn ols_contrast_f_is_classical_f() {
+/// `y ~ 1 + x1 + x2 + x3` by OLS on 40 rows. Returns `(fit, n, p)`.
+fn ols_fit() -> (Fit, usize, usize) {
     let mut s = 31u64;
     let (n, p) = (40, 4);
     let (mut x, mut y) = (vec![], vec![]);
@@ -378,6 +375,15 @@ fn ols_contrast_f_is_classical_f() {
     };
     let fit = fit_cold(&x, &y, n, p, &model, &GroupIds::default(), &all_targets(p));
     assert!(fit.converged());
+    (fit, n, p)
+}
+
+/// The OLS F test is the classical one: every direction's df is `n − p`, so
+/// the mean rule gives a DenDF of `n − p` exactly, and
+/// `F = (Lβ̂)ᵀ(L·C·Lᵀ)⁻¹(Lβ̂)/r`.
+#[test]
+fn ols_contrast_f_is_classical_f() {
+    let (fit, n, p) = ols_fit();
     let nu = (n - p) as f64;
     // L = [e_1; e_2 + e_3].
     let l = [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0];
@@ -401,4 +407,55 @@ fn ols_contrast_f_is_classical_f() {
         got.p_value,
         crate::inference::tails::f_upper_p(got.f, 2.0, nu)
     );
+    assert_zero_l(&fit);
+}
+
+/// Scaling `L` by any nonzero constant leaves the hypothesis, F, df and p
+/// unchanged; `L·C·Lᵀ` must not overflow at 1e160 or underflow at 1e-160.
+/// The one-row t keeps its t and df, and its estimate and se scale with `L`.
+#[test]
+fn contrast_is_invariant_to_scaling_l() {
+    let (fit, _, _) = ols_fit();
+    let l = [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0];
+    let want = fit.contrast_f(&l, 2).unwrap();
+    let want_t = fit.contrast_t(&l[..4]).unwrap();
+    for c in [1e160, 1e-160] {
+        let lc: Vec<f64> = l.iter().map(|v| v * c).collect();
+        let got = fit.contrast_f(&lc, 2).unwrap();
+        assert!(
+            rel(got.f, want.f) < 1e-12,
+            "F at {c}: {got:?} against {want:?}"
+        );
+        assert!(rel(got.p_value, want.p_value) < 1e-10, "p at {c}: {got:?}");
+        assert_eq!((got.num_df, got.den_df), (want.num_df, want.den_df), "{c}");
+        let t = fit.contrast_t(&lc[..4]).unwrap();
+        assert!(
+            rel(t.t, want_t.t) < 1e-12,
+            "t at {c}: {t:?} against {want_t:?}"
+        );
+        assert_eq!(t.df, want_t.df, "{c}");
+        assert!(rel(t.p_value, want_t.p_value) < 1e-10, "{c}");
+        assert!(rel(t.estimate, c * want_t.estimate) < 1e-12, "{c}");
+        assert!(rel(t.se, c * want_t.se) < 1e-12, "{c}");
+    }
+}
+
+/// An all-zero one-row `L` tests nothing: num_df 0 (the rank of `L·C·Lᵀ`),
+/// every other number NaN, and the rank-0 note.
+fn assert_zero_l(fit: &Fit) {
+    let got = fit.contrast_f(&vec![0.0; fit.beta.len()], 1).unwrap();
+    assert_eq!(got.num_df, 0.0);
+    assert!(
+        got.f.is_nan() && got.den_df.is_nan() && got.p_value.is_nan(),
+        "{got:?}"
+    );
+    assert_eq!(
+        got.notes,
+        [ContrastNote::RankDeficientL { rank: 0, rows: 1 }]
+    );
+}
+
+#[test]
+fn contrast_f_zero_l_has_rank_zero() {
+    assert_zero_l(&lmm_fit(None, &all_targets(3)));
 }

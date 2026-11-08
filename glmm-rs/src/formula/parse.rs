@@ -108,6 +108,9 @@ static NO_INTERCEPT_ZERO: LazyLock<Regex> =
 static EXPLICIT_INTERCEPT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?:^|\+)1(\+|$)").unwrap());
 
+/// The response name a formula with no left-hand side parses to.
+pub(crate) const DEFAULT_RESPONSE: &str = "explained_variable";
+
 /// The parsed formula AST. A frozen contract — its shape must stay stable
 /// since the parse test suite depends on it. The suite proves a superset of
 /// MCPower's grammar, not a mirror: fields like `has_intercept` widen the
@@ -264,7 +267,7 @@ pub fn parse(input: &str) -> Result<ParsedFormula, ParseError> {
     if dep.is_empty() {
         // Empty LHS (e.g. `~X` or `=X`) — fall back to the same default name we
         // use when there is no separator at all.
-        dep = "explained_variable".to_string();
+        dep = DEFAULT_RESPONSE.to_string();
     }
     if rhs.is_empty() {
         return Err(ParseError::EmptyFormula);
@@ -462,12 +465,22 @@ fn extract_stage(
 /// variables in written order, repeats dropped.
 ///
 /// # Errors
-/// [`ParseError::Syntax`] when the term both writes the intercept and removes
-/// it, which R would resolve by term order.
+/// [`ParseError::Syntax`] when a slope is an interaction (`x:z`, `x*z`), or
+/// when the term both writes the intercept and removes it, which R would
+/// resolve by term order.
 fn re_lhs(lhs: &str) -> Result<(bool, Vec<String>), ParseError> {
     let removed = NO_INTERCEPT_MINUS.is_match(lhs) || NO_INTERCEPT_ZERO.is_match(lhs);
     let rest = NO_INTERCEPT_MINUS.replace_all(lhs, "$1");
     let tokens: Vec<&str> = rest.split('+').filter(|t| !t.is_empty()).collect();
+    if let Some(token) = tokens.iter().find(|t| t.contains([':', '*'])) {
+        return Err(ParseError::Syntax {
+            pos: 0,
+            msg: format!(
+                "'{token}': a random slope on an interaction is not supported; compute it as a \
+                 column and use that column as the slope"
+            ),
+        });
+    }
     if removed && tokens.contains(&"1") {
         return Err(ParseError::Syntax {
             pos: 0,
@@ -753,7 +766,7 @@ fn split_at_separator(s: &str) -> (String, String) {
     } else if let Some((l, r)) = s.split_once('=') {
         (l.to_string(), r.to_string())
     } else {
-        ("explained_variable".to_string(), s.to_string())
+        (DEFAULT_RESPONSE.to_string(), s.to_string())
     }
 }
 

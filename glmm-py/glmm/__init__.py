@@ -16,10 +16,10 @@ and the warning categories the diagnostics channel raises (`DiagnosticWarning`, 
 `IllConditionedWarning`, `ModelBasedJointTestWarning`, `NbShapeUnsettledWarning`,
 `NewGroupingLevelsWarning`, `NoCoefficientsWarning`, `NonIntegerResponseWarning`,
 `PirlsExhaustedWarning`, `PrecisionLimitedWarning`, `PredictSeModelBasedWarning`,
-`RobustDfSmallWarning`, `RobustSeUnidentifiedWarning`, `RobustWithRandomSlopeWarning`,
+`RepeatedGroupingWarning`, `RobustDfSmallWarning`, `RobustSeUnidentifiedWarning`, `RobustWithRandomSlopeWarning`,
 `RowsDroppedWarning`, `SatterthwaiteCurvatureWarning`,
-`SearchLimitWarning`, `SeUnavailableWarning`, `SingleLevelGroupingDroppedWarning`,
-`SingularFitWarning`,
+`SearchLimitWarning`, `SeUnavailableWarning`, `SeparatedByGroupingWarning`,
+`SingleLevelGroupingDroppedWarning`, `SingularFitWarning`, `SlopeConstantWithinLevelsWarning`,
 `TooFewRowsWarning`, `VarianceAtLimitWarning`, `WeightPowerAtBoundWarning`,
 `WeightPowerImplausibleWarning`, `WeightPowerOutsideUnitWarning`,
 `WeightPowerSearchFailuresWarning`).
@@ -66,6 +66,7 @@ __all__ = [
     "PrecisionLimitedWarning",
     "PredictSeModelBasedWarning",
     "ProfileTable",
+    "RepeatedGroupingWarning",
     "RobustDfSmallWarning",
     "RobustSeUnidentifiedWarning",
     "RobustWithRandomSlopeWarning",
@@ -73,8 +74,10 @@ __all__ = [
     "SatterthwaiteCurvatureWarning",
     "SeUnavailableWarning",
     "SearchLimitWarning",
+    "SeparatedByGroupingWarning",
     "SingleLevelGroupingDroppedWarning",
     "SingularFitWarning",
+    "SlopeConstantWithinLevelsWarning",
     "TermTable",
     "TooFewRowsWarning",
     "VarianceAtLimitWarning",
@@ -157,6 +160,40 @@ class FewRowsForRandomEffectsWarning(DiagnosticWarning):
     """
 
 
+class RepeatedGroupingWarning(DiagnosticWarning):
+    """Two grouping factors put the rows into exactly the same groups and
+    share a random effect, so the data cannot tell their variances apart.
+
+    "Share" means both have a random intercept, or the same slope is in both.
+    The groups are compared exactly, whatever the levels are called. The fit
+    runs as usual; how it splits the variance between the two is arbitrary.
+    """
+
+
+class SlopeConstantWithinLevelsWarning(DiagnosticWarning):
+    """A random slope takes one value within every group of a grouping that
+    also has a random intercept, and too few distinct values across the
+    groups to identify its variance and correlations.
+
+    Raised when the distinct value combinations of such slopes are fewer than
+    the covariance parameters among the intercept and them, as for
+    `(1 + category | word)` with each word in one of two categories. The fit
+    runs as usual.
+    """
+
+
+class SeparatedByGroupingWarning(DiagnosticWarning):
+    """A binomial response is all 0 or all 1 within every group of a grouping
+    with a random intercept, so that grouping's variance has no finite
+    estimate.
+
+    Checked on every group, not most, and only when some group holds more
+    than one trial: a grouping with one 0/1 row per group raises nothing. The
+    fit runs as usual; any reported variance is a stopping point, and the
+    fixed effects depend on it.
+    """
+
+
 class HessianSeFallbackWarning(DiagnosticWarning):
     """`wald_se="hessian"` was requested, but the joint Hessian was not usable
     (not positive definite, or the fit took the finite-difference Hessian and a
@@ -218,8 +255,10 @@ class PrecisionLimitedWarning(DiagnosticWarning):
     misses a large effect) or, with more than one grouping factor, through the
     log-determinant of the random-effect system; on a Gaussian mixed model,
     when the residuals are tiny against the response (a response far from
-    zero next to its residual spread, or weights spanning many orders of
-    magnitude).
+    zero next to its residual spread), with weights spanning many orders of
+    magnitude, or, under REML, when a fixed-effect column lies near the span
+    of a random-effect column with a large variance, so the pivot of X'V⁻¹X
+    cancels (an intercept beside a random intercept).
     """
 
 
@@ -434,24 +473,44 @@ def _columns(data):
 
     Columns are returned UNFLATTENED so `fit` can still see a categorical dtype:
     `list(col)` drops it, and with it the level order the caller declared (see
-    `_levels_and_codes`)."""
+    `_levels_and_codes`).
+
+    Returns `(columns, repeated)`. Only string-named columns are kept: a
+    formula can name no other. `repeated` lists the names that occur more than
+    once, in first-seen order; `_prepare_columns` refuses one the formula uses."""
     if isinstance(data, dict):
-        return dict(data)
+        return {c: v for c, v in data.items() if isinstance(c, str)}, []
     if hasattr(data, "column_names"):  # pyarrow Table
-        return {c: data.column(c) for c in data.column_names}
-    if hasattr(data, "columns"):  # pandas / polars DataFrame
-        return {c: data[c] for c in data.columns}
-    raise TypeError(f"data must be a dict, DataFrame, or pyarrow Table; got {type(data).__name__}")
+        names = list(data.column_names)
+        # By position: lookup by name refuses a repeated name.
+        columns = {c: data.column(i) for i, c in enumerate(names)}
+    elif hasattr(data, "columns"):  # pandas / polars DataFrame
+        names = list(data.columns)
+        columns = {c: data[c] for c in dict.fromkeys(names)}
+    else:
+        raise TypeError(
+            f"data must be a dict, DataFrame, or pyarrow Table; got {type(data).__name__}"
+        )
+    seen, repeated = set(), {}
+    for c in names:
+        if c in seen:
+            repeated[c] = None
+        seen.add(c)
+    return (
+        {c: v for c, v in columns.items() if isinstance(c, str)},
+        [c for c in repeated if isinstance(c, str)],
+    )
 
 
 def _levels_and_codes(col):
     """A factor column as (levels, per-row codes), or None if `col` is not
     categorical.
 
-    A declared level order is the whole point: level 0 is the treatment-contrast
-    base, so `pd.Categorical(x, categories=["low","med","high"])` must fit
-    against `"low"`, not against whichever label happens to sort first. Rust's
-    `Column::Factor` takes the order from us rather than re-deriving it.
+    A declared level order is the whole point: the first level that has rows is
+    the treatment-contrast base, so `pd.Categorical(x, categories=["low","med","high"])`
+    must fit against `"low"`, not against whichever label happens to sort first.
+    Rust's `Column::Factor` takes the order from us rather than re-deriving it,
+    and drops the levels no row has.
 
     Duck-typed on `.categories`/`.codes` — no hard pandas dependency, matching
     `_columns`' `hasattr(data, "column_names")` style. Covers pandas
@@ -702,7 +761,15 @@ def _row_array(values, name, n, missing_ok=False):
     read; the kernel then reports the missing column first. `missing_ok`
     lets a missing entry through as NaN, for a caller that drops its row."""
     try:
-        arr = np.asarray(values, dtype=float)
+        # String, bool and complex entries are refused, as R refuses a
+        # character, logical or complex vector; the float cast would read
+        # "1.5", take True as 1.0 and drop an imaginary part.
+        raw = np.asarray(values)
+        bad = raw.dtype.kind in "USbc" or (
+            raw.dtype.kind == "O"
+            and any(isinstance(v, (str, bytes, bool, np.bool_)) for v in raw.ravel())
+        )
+        arr = None if bad else np.asarray(values, dtype=float)
     except (TypeError, ValueError):
         arr = None
     if arr is None or arr.ndim != 1 or (n is not None and len(arr) != n):
@@ -785,7 +852,10 @@ class Fit:
     #                     `fit`. Mostly
     #                     the solver's; the formula lowering contributes
     #                     "single_level_grouping_dropped" and
-    #                     "few_rows_for_random_effects" (names ride in `detail`).
+    #                     "few_rows_for_random_effects" (names ride in `detail`,
+    #                     as they do on "repeated_grouping",
+    #                     "slope_constant_within_levels" and
+    #                     "separated_by_grouping").
     #                     `columns` are 0-based indices into `names` (the R
     #                     package reports the same thing 1-based, per R's own
     #                     convention). An absent note means "not detected",
@@ -845,7 +915,9 @@ class Fit:
     # grouping lands in is a data-dependent decision inside the kernel.
     ranef: np.ndarray
     # Level count per grouping, for slicing `ranef`: ranef.size == sum(levels *
-    # q_per_group). Empty exactly when `ranef` is.
+    # q_per_group) wherever `ranef` is not empty. Filled on every fit with
+    # random effects, also one that did not converge (where `ranef` is empty);
+    # empty on a fit without random effects.
     ranef_levels: np.ndarray
     # The same conditional modes, labelled: a list of dicts, one per grouping in
     # re_groups order, each with
@@ -978,6 +1050,10 @@ class Fit:
     #   nu         float               the divisor of sigma-hat**2
     #   retained   list[int] | None    0-based retained columns, None when every
     #                                  column was retained
+    # The free theta coordinates are in the kernel's order, which differs from
+    # the order the groupings were written in when glmm makes the grouping with
+    # the most levels the primary; the df and the contrast tests use them only
+    # in sums over all coordinates, so the order does not change any result.
     # About p**2 * (n_free + 1) floats, kept in a pickle. Mirrors the R port's
     # `object$satterthwaite_record` - change together.
     satterthwaite_record: dict | None = None
@@ -1073,8 +1149,17 @@ class Fit:
 
     def stddev_corr(self, group_idx):
         """Split grouping `group_idx`'s vech-packed covariance into
-        (stddevs, correlation matrix) — mirrors Rust `Fit::stddev_corr`
-        (src/fit/mod.rs): column-major lower-triangular vech."""
+        (stddevs, correlation matrix), as Rust `Fit::stddev_corr`
+        (src/fit/mod.rs) does: column-major lower-triangular vech.
+        On a fit with no variance estimates (`varcorr` empty: a fit that
+        stopped before estimating anything, such as too few rows or a
+        degenerate design) this raises `ValueError`."""
+        if not self.varcorr:
+            self.re_groups[group_idx]  # an index past the groupings raises IndexError
+            raise ValueError(
+                "stddev_corr is unavailable: the fit has no variance estimates, "
+                "because it stopped before estimating anything"
+            )
         vech = np.asarray(self.varcorr[group_idx], dtype=float)
         m = len(vech)
         q = (math.isqrt(1 + 8 * m) - 1) // 2
@@ -1211,7 +1296,8 @@ class Fit:
         test, also a Poisson GLMM, whose default `glmm.anova` rows are
         likelihood-ratio rows. A non-zero entry on an aliased column gives a
         NaN row and a note; an `L` whose rows span fewer directions than it
-        has rows is tested on those directions, with a note. Nothing is
+        has rows is tested on those directions, with a note. An `L` that is
+        zero on every coefficient gets df 0 and a note. Nothing is
         refitted: there is no likelihood-ratio test here, which is
         `glmm.compare`.
 
@@ -1306,6 +1392,9 @@ class Fit:
         are model-based, as on the same fit with `se_type="model"`, with a
         `PredictSeModelBasedWarning`: their formula holds only with the
         model's covariance.
+        A fit with no estimates (every coefficient NaN: a fit that stopped
+        before estimating anything, such as too few rows or a degenerate
+        design) predicts NaN, with a NaN standard error and NaN bounds.
         A model fitted with the `offset=` argument cannot predict new rows:
         give the offset as an `offset()` term in the formula instead. The name
         is provisional until 1.0.0."""
@@ -1630,6 +1719,9 @@ _CATEGORIES = {
     "nb_shape_unsettled": NbShapeUnsettledWarning,
     "single_level_grouping_dropped": SingleLevelGroupingDroppedWarning,
     "few_rows_for_random_effects": FewRowsForRandomEffectsWarning,
+    "repeated_grouping": RepeatedGroupingWarning,
+    "slope_constant_within_levels": SlopeConstantWithinLevelsWarning,
+    "separated_by_grouping": SeparatedByGroupingWarning,
     "variance_at_limit": VarianceAtLimitWarning,
     "hessian_se_fallback": HessianSeFallbackWarning,
     "se_unavailable": SeUnavailableWarning,
@@ -1714,8 +1806,9 @@ def _count(n, word):
 
 def _check_call(formula, family, link):
     """The checks `fit` and `compare` make on a formula, the family and the
-    link before any data is read; returns the link, the family's default when
-    `link` is None."""
+    link before any data is read; returns `(family, link)`: the family
+    lowercased (case is ignored, as in the R port), the link the family's
+    default when `link` is None."""
     # A formula shape the shared Rust parser has no dedicated message for (it
     # would fall through to a generic syntax error): caught here with the same
     # wording the R port uses (glmm-r/R/fastglmm.R's .check_formula) — change
@@ -1723,9 +1816,10 @@ def _check_call(formula, family, link):
     if re.search(r"(?<![\w.])\.(?![\w.])", formula):
         raise ValueError("'.' is not supported by the formula parser; list the columns explicitly")
 
-    if family not in _FAMILIES:
+    name = family.lower() if isinstance(family, str) else family
+    if name not in _FAMILIES:
         raise ValueError(f"unknown family {family!r}; expected one of {', '.join(_FAMILIES)}")
-    fam = _FAMILIES[family]
+    fam = _FAMILIES[name]
     if link is None:
         link = fam["default_link"]
     elif link not in fam["links"]:
@@ -1734,14 +1828,17 @@ def _check_call(formula, family, link):
             f"expected one of {', '.join(fam['links'])}"
         )
 
-    if family == "inversegaussian" and "|" in formula:
+    if name == "inversegaussian" and "|" in formula:
         raise ValueError(
             "family 'inversegaussian' is GLM-only: random-effect terms are not supported"
         )
-    return link
+    return name, link
 
 
 def _check_nagq(nagq):
+    """`nagq` as a Python int; a numpy integer is accepted."""
+    if not isinstance(nagq, bool) and isinstance(nagq, (int, np.integer)):
+        nagq = int(nagq)
     if not (
         isinstance(nagq, int)
         and not isinstance(nagq, bool)
@@ -1749,6 +1846,7 @@ def _check_nagq(nagq):
         and nagq % 2 == 1
     ):
         raise ValueError(f"nagq must be an odd integer in 1..={_MAX_NAGQ}, got {nagq!r}")
+    return nagq
 
 
 def _prepare_columns(
@@ -1779,7 +1877,7 @@ def _prepare_columns(
     `_native` entry points take so an error names the caller's row."""
     # Only the columns the formula actually uses are read from here on — see
     # `_formula_columns`.
-    used_columns = _columns(data)
+    used_columns, repeated = _columns(data)
     if model_matrix:
 
         def lookup(formula, names):
@@ -1801,6 +1899,9 @@ def _prepare_columns(
             (used_names, missing, numeric_only), lookup(formula, list(used_columns))
         ):
             into += [name for name in names if name not in into]
+    repeated = [name for name in repeated if name in used_names]
+    if repeated:
+        raise ValueError(f"data has duplicate column name(s): {', '.join(repeated)}")
     where = "a column the formula uses"
     if drop_missing_arguments:
         where = "a column either formula uses, the weights or the offset"
@@ -2246,7 +2347,8 @@ def fit(
 
     data: dict[str, array-like]; DataFrame / Arrow Table also accepted (duck-typed).
     formula: R-style string, e.g. "y ~ x + z + (1 + x | g)".
-    family: gaussian | binomial | poisson | gamma | negativebinomial | inversegaussian.
+    family: gaussian | binomial | poisson | gamma | negativebinomial | inversegaussian;
+        case is ignored ("Gamma" is "gamma").
     nagq: adaptive Gauss-Hermite quadrature nodes per random-effect dimension
         (odd, 1..=25; default 1 = Laplace). k>1 applies to binomial, Poisson,
         negative-binomial and Gamma models with a single grouping factor and
@@ -2286,9 +2388,14 @@ def fit(
         likelihood", prints AIC, BIC, logLik, deviance and df.resid, and
         carries the note "p-values can be somewhat anticonservative" under
         the title; a REML fit prints the REML criterion and no AIC.
-        Gaussian without (OLS, also when every grouping was dropped): same
-        estimates; True reports the REML log-likelihood (the summary prints
-        the REML criterion), None and False the ML one.
+        Gaussian without (OLS, also when every grouping was dropped): without
+        weights, or with a fixed weight_power, the same estimates under every
+        value; True reports the REML log-likelihood (the summary prints the
+        REML criterion), None and False the ML one. Where weight_power=None
+        estimates the weight power, None and True estimate it by REML
+        (`Fit.reml` is True, the log-likelihood is the REML one) and False
+        takes the weights as given (power 1), so the estimates differ;
+        weight_power="estimate" with False estimates the power by ML.
         Any other family: ML; True is ignored with an ArgumentIgnoredWarning.
     anova_test: when the likelihood-ratio tables of `glmm.anova(m, test=)` are
         made. Every fit stores its Wald chi-squared (or F) tables, with no
@@ -2323,9 +2430,10 @@ def fit(
         warns on a random slope (`RobustWithRandomSlopeWarning`).
         `Fit.se_type` reports the value used, and `Fit.df_method` the df.
 
-    A categorical column's level order is honored: level 0 is the
+    A categorical column's level order is honored: the first level is the
     treatment-contrast base, so `pd.Categorical(x, categories=[…])` fits against
-    the first category you list. A plain string column has no declared order and
+    the first category you list that has rows (categories with no rows are
+    dropped, as in R). A plain string column has no declared order and
     is sorted by code point (R's `factor()` default in the C locale; R in
     another locale can order mixed-case labels such as `"a"`, `"B"` differently). A bool column (Python
     `bool`, `numpy.bool_`, pandas `bool`/nullable `boolean`, pyarrow `bool_`) is
@@ -2335,7 +2443,7 @@ def fit(
 
     See the API spec for the remaining knobs.
     """
-    link = _check_call(formula, family, link)
+    family, link = _check_call(formula, family, link)
     # `|` marks a random-effect term, so its presence is the mixed/GLM split
     # — decidable without the (Rust-side) formula parser.
     mixed = "|" in formula
@@ -2345,7 +2453,7 @@ def fit(
     if anova_test not in ("auto", "Wald", "LRT"):
         raise ValueError(f"anova_test must be 'auto', 'Wald' or 'LRT', got {anova_test!r}")
 
-    _check_nagq(nagq)
+    nagq = _check_nagq(nagq)
 
     if not isinstance(satterthwaite, (bool, np.bool_)):
         raise TypeError(f"satterthwaite must be True or False, got {satterthwaite!r}")
@@ -2371,10 +2479,11 @@ def fit(
         )
         dispersion = None
     if dispersion is not None:
-        if not (
-            dispersion == "estimate"
-            or (isinstance(dispersion, (int, float)) and not isinstance(dispersion, bool))
+        if isinstance(dispersion, (int, float, np.integer, np.floating)) and not isinstance(
+            dispersion, bool
         ):
+            dispersion = float(dispersion)
+        elif not (isinstance(dispersion, str) and dispersion == "estimate"):
             raise ValueError(
                 f"dispersion must be None, 'estimate', or a number, got {dispersion!r}"
             )
@@ -2436,12 +2545,13 @@ def fit(
         d = warm_start["dispersion"]
         if (
             isinstance(d, bool)
-            or not isinstance(d, (int, float))
+            or not isinstance(d, (int, float, np.integer, np.floating))
             or not (math.isfinite(d) and d > 0)
         ):
             raise ValueError(
                 f'warm_start["dispersion"] (or init_theta) must be one finite number > 0, got {d!r}'
             )
+        warm_start = dict(warm_start, dispersion=float(d))
 
     numeric_columns, factor_columns, weights, offset, row_index = _prepare_columns(
         data, [formula], weights, offset, store
@@ -2494,7 +2604,7 @@ def fit(
         _warn(
             store,
             "argument_ignored",
-            f"weight_power={weight_power} has no effect without weights.",
+            f"weight_power = {weight_power} has no effect without weights.",
             ArgumentIgnoredWarning,
         )
     return _fit_from_native(r, formula, family, link, nagq, dispersion, store, kept)
@@ -2578,7 +2688,8 @@ def pairwise(m, factor, by=None, at=None, adjust="holm"):
 
     A Gaussian mixed model fitted with `satterthwaite=False` has no df: its
     rows have NaN df, statistic and p-values, and a note. A comparison that
-    reads an aliased coefficient (an empty cell) is NaN, with a note.
+    reads an aliased coefficient (an empty cell) is NaN, with a note. A fit
+    that did not converge gets its table with a note saying so.
     On a robust fit (`se_type` "robust") each row is the robust t test on its
     robust df, with `satterthwaite=False` too; a comparison one group alone
     identifies is NaN (`RobustSeUnidentifiedWarning`), and df below 4 warn
@@ -2624,7 +2735,7 @@ def pairwise(m, factor, by=None, at=None, adjust="holm"):
         },
     )
     _test_warnings(stored)
-    return _pairwise_table(stored, m.df_method == "none")
+    return _pairwise_table(stored, m.df_method == "none", m.converged)
 
 
 def term_labels(formula):

@@ -537,3 +537,90 @@ def test_polars_null_in_a_used_column_drops_its_row():
         result = glmm.fit(df, "y ~ x")
     assert result.converged
     assert result.nobs == 3
+
+
+def test_empty_data_is_refused():
+    empty = {"y": _np.array([]), "x": _np.array([]), "g": _np.array([])}
+    with pytest.raises(
+        ValueError, match=r"^Data has no rows \(n = 0\); a fit needs at least one row$"
+    ):
+        glmm.fit(empty, "y ~ x + (1|g)")
+
+
+def test_one_sided_formula_is_refused():
+    with pytest.raises(
+        ValueError,
+        match=r"^formula syntax error at position 0: the formula has no response; write it as y ~ x$",
+    ):
+        glmm.fit(DATA, "~ x")
+
+
+def _frame_columns():
+    rng = _np.random.default_rng(9)
+    g = _np.repeat(_np.arange(6), 10)
+    x = rng.normal(size=60)
+    y = 1 + x + rng.normal(size=6)[g] + rng.normal(size=60)
+    return y, x, g
+
+
+def test_a_non_string_column_label_is_ignored():
+    pd = pytest.importorskip("pandas")
+    y, x, g = _frame_columns()
+    with_int = glmm.fit(pd.DataFrame({"y": y, "x": x, "g": g, 0: x}), "y ~ x + (1|g)")
+    plain = glmm.fit(pd.DataFrame({"y": y, "x": x, "g": g}), "y ~ x + (1|g)")
+    assert with_int.names == plain.names
+    _np.testing.assert_array_equal(with_int.beta, plain.beta)
+
+
+def test_a_duplicate_column_name_the_formula_uses_is_refused():
+    pd = pytest.importorskip("pandas")
+    y, x, g = _frame_columns()
+    df = pd.DataFrame(_np.column_stack([y, x, -x, g]), columns=["y", "x", "x", "g"])
+    with pytest.raises(ValueError, match=r"^data has duplicate column name\(s\): x$"):
+        glmm.fit(df, "y ~ x + (1|g)")
+    unused = pd.DataFrame(_np.column_stack([y, x, g, x, x]), columns=["y", "x", "g", "z", "z"])
+    assert glmm.fit(unused, "y ~ x + (1|g)").names == ["(Intercept)", "x"]
+
+
+def test_numpy_scalars_are_accepted_for_nagq_dispersion_and_init_theta():
+    f = "y_bin ~ x + (1 | g)"
+    np5 = glmm.fit(FIT_DATA, f, "binomial", nagq=_np.int64(5))
+    _np.testing.assert_array_equal(np5.beta, glmm.fit(FIT_DATA, f, "binomial", nagq=5).beta)
+    with pytest.raises(ValueError, match=r"^nagq must be an odd integer in 1\.\.=25, got 4$"):
+        glmm.fit(FIT_DATA, f, "binomial", nagq=_np.int64(4))
+    c = glmm.compare(FIT_DATA, "y_bin ~ 1 + (1 | g)", f, "binomial", nagq=_np.int64(3))
+    assert c.fit1.nagq == 3
+    nb = glmm.fit(FIT_DATA, "y_pois ~ x", "negativebinomial", init_theta=_np.float32(2.0))
+    nb_plain = glmm.fit(FIT_DATA, "y_pois ~ x", "negativebinomial", init_theta=2.0)
+    _np.testing.assert_array_equal(nb.beta, nb_plain.beta)
+    held = glmm.fit(FIT_DATA, "y_gamma ~ x", "gamma", dispersion=_np.int64(2))
+    _np.testing.assert_array_equal(
+        held.se, glmm.fit(FIT_DATA, "y_gamma ~ x", "gamma", dispersion=2).se
+    )
+
+
+def test_family_case_is_ignored_as_in_the_r_port():
+    upper = glmm.fit(FIT_DATA, "y_gamma ~ x", "Gamma")
+    assert upper.family == "gamma"
+    _np.testing.assert_array_equal(upper.beta, glmm.fit(FIT_DATA, "y_gamma ~ x", "gamma").beta)
+    c = glmm.compare(FIT_DATA, "y_bin ~ 1 + (1 | g)", "y_bin ~ x + (1 | g)", "Binomial")
+    assert c.fit1.family == "binomial"
+    with pytest.raises(ValueError, match=r"^unknown family 'Logistic'; expected one of gaussian, "):
+        glmm.fit(DATA, "y ~ x", "Logistic")
+
+
+@pytest.mark.parametrize(
+    ("arg", "bad"),
+    [
+        ("weights", _np.array(["1.5"] * _N)),
+        ("weights", _np.ones(_N, dtype=bool)),
+        ("weights", _np.array(["1.5"] * _N, dtype=object)),
+        ("weights", _np.array([True] * _N, dtype=object)),
+        ("offset", _np.full(_N, 1 + 2j)),
+    ],
+)
+def test_string_bool_and_complex_weights_or_offset_are_refused(arg, bad):
+    with pytest.raises(
+        ValueError, match=rf"^{arg} must be a numeric array with one entry per row of data$"
+    ):
+        glmm.fit(FIT_DATA, "y_gauss ~ x", **{arg: bad})

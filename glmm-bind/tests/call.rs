@@ -98,6 +98,9 @@ fn fit_through_call_matches_run_fit() {
     assert_eq!(f64s(field(&out, "beta")), direct.beta.as_slice());
     assert_eq!(f64s(field(&out, "se")), direct.se.as_slice());
     assert!(matches!(field(&out, "loglik"), Value::F64(v) if *v == direct.loglik));
+    let sd_se = f64s(field(&out, "stddev_se"));
+    assert_eq!(sd_se.len(), 3, "one vech of q = 2");
+    assert!(sd_se.iter().all(|v| v.is_nan()));
 
     // The caller's level order reaches the engine (the reference level survives).
     let block = match field(&out, "ranef_blocks") {
@@ -120,6 +123,33 @@ fn a_missing_factor_code_is_refused() {
     let e = call("fit", fit_args("y ~ g", numeric, factors, 0)).unwrap_err();
     assert_eq!(e.code, "invalid_argument");
     assert!(e.message.contains("factor column \"g\""), "{}", e.message);
+}
+
+/// R sends a scalar as a length-1 vector; an error names its element, as it
+/// does for Python's plain scalar.
+#[test]
+fn a_length_one_vector_is_described_by_its_element() {
+    let (reaction, days, _) = sleepstudy();
+    let fit = |k: &str, v: Value| {
+        let numeric = rec(vec![
+            ("Reaction", Value::Vec(reaction.clone())),
+            ("Days", Value::Vec(days.clone())),
+        ]);
+        let mut r = fit_args("Reaction ~ Days", numeric, Record::new(), 0);
+        r.push(k, v);
+        call("fit", r).unwrap_err().message
+    };
+    let e = fit("weight_power", Value::StrVec(vec!["est".into()]));
+    assert!(
+        e.starts_with(
+            r#"weight_power must be a finite number or "estimate", got the string "est""#
+        ),
+        "{e}"
+    );
+    let e = fit("weight_power", Value::Vec(vec![f64::NAN]));
+    assert!(e.ends_with("got NaN"), "{e}");
+    let e = fit("weight_power", Value::Vec(vec![1.0, 2.0]));
+    assert!(e.ends_with("got a numeric vector"), "{e}");
 }
 
 /// `weight_power` and `se_type` reach the engine through `fit` and

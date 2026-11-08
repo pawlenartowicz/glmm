@@ -38,20 +38,23 @@ use crate::formula::anova::{
 };
 use crate::formula::pairwise::pairwise_of;
 use crate::formula::{
-    design_columns, fixed_design, fixed_part_relation, label_ranef, lower, lower_new, parse,
-    r_terms, Adjust, By, Column, FixedPartRelation, Lowered, Pairwise, PairwiseIntervals,
-    PairwiseRow, ParsedFormula, RatioKind, Table,
+    design_columns, drop_unused_levels, fixed_design, fixed_part_relation, label_ranef, lower,
+    lower_new, parse, r_terms, Adjust, By, Column, FixedPartRelation, Lowered, Pairwise,
+    PairwiseIntervals, PairwiseRow, ParsedFormula, RatioKind, ReGroupInfo, Table,
 };
 use crate::inference::contrast::{
     contrast_f_of, robust_f_of, ContrastError, DfSource, NoDfReason, RobustInputs,
 };
 use crate::inference::cr2::Cr2Pieces;
 use crate::inference::effect_size::{variance_parts, VarianceParts};
-use crate::inference::profile::{profile_on, profile_params, weight_power_refusal};
+use crate::inference::profile::{
+    better_optimum_message, profile_on, profile_params, weight_power_refusal,
+};
 use crate::inference::tails::{normal_quantile, t_quantile, t_two_sided_p};
 use crate::inference::wald::wald_chisq;
 use crate::inference::{
-    DenDf, Icc, LinearKind, LinearNote, LinearTest, Objective, ProfileParam, Reference, R2,
+    DenDf, Icc, LinearKind, LinearNote, LinearTest, Objective, ProfileError, ProfileParam,
+    Reference, R2,
 };
 use crate::lmm::satterthwaite::SatterthwaiteState;
 use crate::predict::{predict_parts, FitParts};
@@ -223,6 +226,45 @@ pub fn family_from_str(family: &str, link: &str) -> Result<Family, String> {
     }
 }
 
+/// `Σᵢ wᵢ·dᵢ`, `dᵢ` the unit deviance of `family` (a port family name) at
+/// `y[i]` and `mu[i]` and `wᵢ` the row's weight (1 without `weights`): the
+/// deviance of a GLM at `mu`, R's `sum(residuals(fit, "deviance")^2)`, the
+/// weighted residual sum of squares on Gaussian. The link does not enter.
+/// `nb_theta` is the negative-binomial shape; the other families ignore it.
+///
+/// # Errors
+/// An unknown family name, or `y`, `mu` and `weights` of different lengths.
+pub fn unit_deviance_sum(
+    family: &str,
+    nb_theta: f64,
+    y: &[f64],
+    mu: &[f64],
+    weights: Option<&[f64]>,
+) -> Result<f64, String> {
+    // Any link of the family: the unit deviance reads only y and mu.
+    let link = match family {
+        "gaussian" => "identity",
+        "binomial" => "logit",
+        _ => "log",
+    };
+    let fam = family_from_str(family, link)?;
+    if y.len() != mu.len() || weights.is_some_and(|w| w.len() != mu.len()) {
+        return Err(format!(
+            "y, fitted and weights must have the same length, got {}, {} and {}",
+            y.len(),
+            mu.len(),
+            weights.map_or(mu.len(), <[f64]>::len)
+        ));
+    }
+    Ok(y.iter()
+        .zip(mu)
+        .enumerate()
+        .map(|(i, (&y, &mu))| {
+            weights.map_or(1.0, |w| w[i]) * crate::family::dev_resid(fam, nb_theta, y, mu)
+        })
+        .sum())
+}
+
 /// One [`Note`], flattened for the ports. `kind` is the stable identifier each
 /// port keys its warning category (Python) or condition class (R) off; the
 /// English message is built from these fields by the `glmm-bind` crate, not
@@ -259,9 +301,14 @@ pub struct NoteInfo {
     /// Free text a variant needs and the fields above cannot carry (the
     /// grouping name of `SingleLevelGroupingDropped`, `FewRowsForRandomEffects`'s term
     /// as `"<terms> | <grouping>"`, whose row count the ports read from
-    /// `FitResult::nobs`, and `NewGroupingLevels` as `"<grouping index>:
-    /// <rows>"`, 0-based and comma-separated). Empty otherwise; the `kind`, not
-    /// this string, stays the stable identifier.
+    /// `FitResult::nobs`, `NewGroupingLevels` as `"<grouping index>:
+    /// <rows>"`, 0-based and comma-separated, the grouping name of
+    /// `SingleLevelGrouping` and `SeparatedByGrouping`, `RepeatedGrouping` as
+    /// `"<first name>, <second name>"`, and `SlopeConstantWithinLevels` as
+    /// `"<slope label>, <slope label> | <grouping name>"`). A grouping name
+    /// that itself contains `", "` makes the `RepeatedGrouping` split
+    /// ambiguous. Empty otherwise; the `kind`, not this string, stays the
+    /// stable identifier.
     pub detail: String,
     /// The fitted power on `WeightPowerAtBound`, `WeightPowerOutsideUnit`
     /// and `WeightPowerImplausible`. `NaN` for every other variant.
@@ -334,7 +381,12 @@ fn outer_stop_name(stop: OuterStop) -> &'static str {
     }
 }
 
-fn note_infos(notes: Vec<Note>) -> Vec<NoteInfo> {
+/// `notes` flattened for the ports. `re_groups` names the groupings a note
+/// indexes, in declaration order.
+fn note_infos(notes: Vec<Note>, re_groups: &[ReGroupInfo]) -> Vec<NoteInfo> {
+    // A note's grouping index comes from a fit of the model `re_groups` was
+    // lowered with, so it is in range.
+    let name = |g: u32| re_groups[g as usize].name.clone();
     notes
         .into_iter()
         .map(|note| match note {
@@ -378,6 +430,36 @@ fn note_infos(notes: Vec<Note>) -> Vec<NoteInfo> {
                 kind: "few_rows_for_random_effects",
                 evals: random_effects,
                 detail: format!("{terms} | {grouping}"),
+                ..NO_PAYLOAD
+            },
+            Note::SingleLevelGrouping { grouping } => NoteInfo {
+                kind: "single_level_grouping",
+                detail: name(grouping),
+                ..NO_PAYLOAD
+            },
+            Note::RepeatedGrouping { first, second } => NoteInfo {
+                kind: "repeated_grouping",
+                detail: format!("{}, {}", name(first), name(second)),
+                ..NO_PAYLOAD
+            },
+            Note::SlopeConstantWithinLevels { grouping, slopes } => NoteInfo {
+                kind: "slope_constant_within_levels",
+                // The block has a random intercept, so its slope `k` is
+                // term name `1 + k`.
+                detail: format!(
+                    "{} | {}",
+                    slopes
+                        .iter()
+                        .map(|&k| re_groups[grouping as usize].terms[1 + k as usize].as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    name(grouping)
+                ),
+                ..NO_PAYLOAD
+            },
+            Note::SeparatedByGrouping { grouping } => NoteInfo {
+                kind: "separated_by_grouping",
+                detail: name(grouping),
                 ..NO_PAYLOAD
             },
             Note::ExactProfileFallback => NoteInfo {
@@ -726,6 +808,11 @@ pub struct FitResult {
 /// ([`FitResult::satterthwaite_record`]): a port stores it on its fit and
 /// passes it back to [`contrast_test`]. The `p_r × p_r` matrices are over the
 /// retained columns, `p_r` of them, and every matrix is row-major.
+///
+/// The free θ coordinates are in the kernel's order, which differs from the
+/// order the groupings were written in when glmm makes the grouping with the
+/// most levels the primary; the df and the contrast tests use them only in
+/// sums over all coordinates, so the order does not change any result.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SatterthwaiteRecord {
     /// `A_eff = 2·blockdiag(H_p⁺, τ̂²/ν)`, `(n_free + 1) × (n_free + 1)`, with
@@ -1028,8 +1115,12 @@ pub fn objective_from_parts(label: &str, nodes: u8) -> Result<Objective, String>
 /// - a non-Gaussian family (GLM or GLMM): `Some(true)` is ignored, the model is
 ///   fitted by ML exactly as under `None`, and [`FitResult::reml_warning`] is
 ///   set; `Some(false)` gives the `None` fit with no warning;
-/// - Gaussian with no random part (OLS): `Some(true)` gives the same estimates
-///   and reports the REML log-likelihood; `Some(false)` gives the `None` fit;
+/// - Gaussian with no random part (OLS): without weights or with a fixed
+///   weight power, `Some(true)` gives the same estimates and reports the REML
+///   log-likelihood, and `Some(false)` gives the `None` fit. Where the default
+///   weight power is estimated, `None` and `Some(true)` estimate it by REML
+///   and `Some(false)` takes the weights as given (power 1), so the estimates
+///   differ;
 /// - Gaussian mixed model: `None` and `Some(true)` fit by REML, `Some(false)`
 ///   by ML.
 ///
@@ -1387,9 +1478,10 @@ pub fn model_matrix_columns(
 /// The fixed-effects design of `formula` on pre-marshalled columns, as
 /// `(x, n, p, col_names)`: the row-major `n × p` design and the coefficient
 /// names [`run_fit`] gives the same formula, every column kept (an aliased one
-/// too). `n_rows` is the caller's row count, read only when the formula
-/// reads no column (`~ 1`); otherwise the columns give it. The caller drops
-/// no row: a missing value is refused before the call.
+/// too), unused factor levels dropped, as `fit` does. `n_rows` is the
+/// caller's row count, read only when the formula reads no column (`~ 1`);
+/// otherwise the columns give it. The caller drops no row: a missing value is
+/// refused before the call.
 ///
 /// # Errors
 ///
@@ -1409,8 +1501,10 @@ pub fn run_model_matrix(
     if table.columns.is_empty() {
         table.n = n_rows;
     }
+    let owned = drop_unused_levels(&table);
+    let table = owned.as_ref().unwrap_or(&table);
     let design =
-        catch_unwind(AssertUnwindSafe(|| fixed_design(&ast, &table))).map_err(panic_message)??;
+        catch_unwind(AssertUnwindSafe(|| fixed_design(&ast, table))).map_err(panic_message)??;
     Ok((design.x, table.n, design.p, design.col_names))
 }
 
@@ -1698,6 +1792,16 @@ fn flatten(prepared: Prepared, fit: Fit, anova_test: TermTest) -> Result<FitResu
         .into_iter()
         .map(|b| (b.group, b.terms, b.levels, b.values, b.condvar))
         .collect();
+    // The lowering's own observations (dropped or thin groupings) join the
+    // solver's in one channel: the user does not care which layer noticed.
+    // Named before `re_groups` is flattened below.
+    let notes = note_infos(
+        lowered_notes
+            .into_iter()
+            .chain(fit.diagnostics.notes.iter().cloned())
+            .collect(),
+        &lowered.re_groups,
+    );
     let (re_groups, re_term_index): (Vec<_>, Vec<_>) = lowered
         .re_groups
         .into_iter()
@@ -1776,9 +1880,7 @@ fn flatten(prepared: Prepared, fit: Fit, anova_test: TermTest) -> Result<FitResu
         nobs: lowered.n,
         boundary: boundary_name(diagnostics.boundary),
         pinned: diagnostics.pinned,
-        // The lowering's own observations (dropped or thin groupings) join the
-        // solver's in one channel: the user does not care which layer noticed.
-        notes: note_infos(lowered_notes.into_iter().chain(diagnostics.notes).collect()),
+        notes,
         coef_df: fit.coef_df,
         coef_p,
         df_method,
@@ -2499,7 +2601,8 @@ pub fn pairwise_confint(
 /// `condvar`, `condvar_x`, `condvar_cross` and `dispersion` as that result
 /// holds them.
 /// A port may store `beta` with NA in place of an aliased coefficient's NaN;
-/// both are NaN here, and contribute zero.
+/// both are NaN here, and contribute zero, unless every coefficient is NaN
+/// (see [`predict`]).
 #[derive(Clone, Debug)]
 pub struct StoredParts {
     /// [`FitResult::beta`].
@@ -2704,7 +2807,7 @@ pub fn predict(
         if table.columns.is_empty() {
             table.n = n_rows;
         }
-        let rows = lower_new(formula, &lowered, &table)?;
+        let rows = lower_new(formula, &lowered, &table, population)?;
         if mixed && !population && rows.ids.is_none() {
             let names: Vec<&str> = lowered.re_groups.iter().map(|g| g.name.as_str()).collect();
             return Err(format!(
@@ -2724,7 +2827,7 @@ pub fn predict(
         upper: pred.upper,
         future_lower: pred.future_lower,
         future_upper: pred.future_upper,
-        notes: note_infos(pred.notes),
+        notes: note_infos(pred.notes, &lowered.re_groups),
     })
 }
 
@@ -2938,7 +3041,12 @@ pub fn profile_intervals(
         profile_on(&lowered.data(), lowered.spec(), level, which.as_deref())
     }))
     .map_err(panic_message)?
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| match e {
+        ProfileError::BetterOptimum { param, drop } => {
+            better_optimum_message(&profile_names(&lowered, &[param])[0], drop)
+        }
+        e => e.to_string(),
+    })?;
     let params: Vec<ProfileParam> = intervals.rows.iter().map(|r| r.param).collect();
     Ok(ProfileResult {
         names: profile_names(&lowered, &params),
@@ -3025,6 +3133,20 @@ mod tests {
     use crate::test_support::fit_warm_wo;
     use std::collections::HashMap;
 
+    /// `run_model_matrix` gives the design `run_fit` fits: a level no row has
+    /// is dropped, the unused first one included, so the base is "a".
+    #[test]
+    fn model_matrix_drops_unused_levels() {
+        let factors = HashMap::from([(
+            "f".to_string(),
+            (vec!["zzz".into(), "a".into(), "b".into()], vec![1, 2, 1, 2]),
+        )]);
+        let (x, n, p, names) = run_model_matrix("~ f", HashMap::new(), factors, 4).unwrap();
+        assert_eq!(names, ["(Intercept)", "fb"]);
+        assert_eq!((n, p), (4, 2));
+        assert_eq!(x, [1.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0]);
+    }
+
     #[test]
     fn family_and_link_strings_map_to_kernel_families() {
         let ok = [
@@ -3108,24 +3230,62 @@ mod tests {
 
     #[test]
     fn note_payloads_survive_flattening() {
-        let notes = note_infos(vec![
-            Note::SingleLevelGroupingDropped {
-                grouping: "Subject".to_string(),
-            },
-            Note::HessianSeFallback,
-            Note::NbShapeUnsettled { rounds: 25 },
-            Note::ExactProfileFallback,
-            // No known dataset reaches `final_eval == true` end to end, so the
-            // ports' message branch is pinned from constructed notes.
-            Note::PirlsExhausted {
-                evals: 3,
-                final_eval: false,
-            },
-            Note::PirlsExhausted {
-                evals: 0,
-                final_eval: true,
-            },
-        ]);
+        let group = |name: &str, terms: &[&str]| ReGroupInfo {
+            name: name.to_string(),
+            terms: terms.iter().map(|t| t.to_string()).collect(),
+            term_index: vec![0; terms.len()],
+            slot_labels: Vec::new(),
+        };
+        let re_groups = [
+            group("word", &["(Intercept)", "catB", "catC"]),
+            group("g2", &["(Intercept)"]),
+        ];
+        let notes = note_infos(
+            vec![
+                Note::SingleLevelGrouping { grouping: 1 },
+                Note::RepeatedGrouping {
+                    first: 0,
+                    second: 1,
+                },
+                Note::SlopeConstantWithinLevels {
+                    grouping: 0,
+                    slopes: vec![0, 1],
+                },
+                Note::SeparatedByGrouping { grouping: 0 },
+            ],
+            &re_groups,
+        );
+        let flat: Vec<(&str, &str)> = notes.iter().map(|n| (n.kind, n.detail.as_str())).collect();
+        assert_eq!(
+            flat,
+            [
+                ("single_level_grouping", "g2"),
+                ("repeated_grouping", "word, g2"),
+                ("slope_constant_within_levels", "catB, catC | word"),
+                ("separated_by_grouping", "word"),
+            ]
+        );
+        let notes = note_infos(
+            vec![
+                Note::SingleLevelGroupingDropped {
+                    grouping: "Subject".to_string(),
+                },
+                Note::HessianSeFallback,
+                Note::NbShapeUnsettled { rounds: 25 },
+                Note::ExactProfileFallback,
+                // No known dataset reaches `final_eval == true` end to end, so the
+                // ports' message branch is pinned from constructed notes.
+                Note::PirlsExhausted {
+                    evals: 3,
+                    final_eval: false,
+                },
+                Note::PirlsExhausted {
+                    evals: 0,
+                    final_eval: true,
+                },
+            ],
+            &[],
+        );
         assert_eq!(notes[0].kind, "single_level_grouping_dropped");
         assert_eq!(notes[0].detail, "Subject");
         assert_eq!(notes[1].kind, "hessian_se_fallback");

@@ -139,9 +139,9 @@ pub(crate) fn generic_family_pass<T: Scalar>(
 ) -> (T, bool) {
     let n = eta.len();
     let clamp = crate::glm::WEIGHT_CLAMP;
-    // Unweighted Bernoulli logit keeps the fused 2·(Σ log1pexp(η) − Σ y·η)
-    // identity, mirroring the f64 route's fast path (which reaches it through
-    // the SIMD kernel instead).
+    // Unweighted 0/1 Bernoulli logit (`!weighted`) keeps the fused
+    // 2·(Σ log1pexp(η) − Σ y·η) identity, mirroring the f64 route's fast path
+    // (which reaches it through the SIMD kernel instead).
     if matches!(
         family,
         Family::Binomial {

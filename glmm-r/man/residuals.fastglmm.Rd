@@ -16,7 +16,7 @@
 \description{
 \code{type = "response"} is \code{y - fitted(object)}; \code{type = "pearson"} divides by
 \code{sqrt(phi * V(mu) / w)} with the family's variance function. Deviance and
-working residuals are not offered: they need per-family deviance formulas
-nothing else in the package carries, and a wrong default would silently
-differ from \code{lme4::residuals(type=)}.
+working residuals are not offered: a wrong default would silently differ
+from \code{lme4::residuals(type=)}. Their sum of squares is
+\link[=deviance.fastglmm]{deviance()}.
 }

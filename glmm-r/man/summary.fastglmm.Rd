@@ -25,7 +25,8 @@ none).
 }
 \description{
 lme4's blocks in lme4's order: method line, formula, data, the criterion
-(\verb{REML criterion at convergence} on a REML fit, the \verb{AIC BIC logLik deviance df.resid} row on an ML fit), scaled residuals, random effects with
+(\verb{REML criterion at convergence} on a REML fit, the \verb{AIC BIC logLik deviance df.resid} row on an ML fit, whose \code{deviance} is \code{-2 * logLik}, not always
+\link[=deviance.fastglmm]{deviance()}), scaled residuals, random effects with
 variances, the observation/group counts, the coefficient table, the
 correlation of fixed effects, and a footer. The Python port's
 \code{Fit.summary()} prints the same blocks - change together.

@@ -79,6 +79,52 @@ fn an_ml_fit_has_lme4s_criterion_row_and_a_reml_fit_its_criterion() {
     );
 }
 
+/// A mixed fit that did not converge has no variance blocks but keeps its
+/// groupings: it keeps the mixed title and its groups, and its df.resid is
+/// NaN because df is not counted.
+#[test]
+fn a_failed_mixed_fit_keeps_its_title_and_groups_and_has_no_df_resid() {
+    let failed = |family: &str, reml: bool| {
+        summary(fit(vec![
+            ("family", text(family)),
+            ("reml", Value::Bool(reml)),
+            ("converged", Value::Bool(false)),
+            ("df", Value::I64(0)),
+            ("loglik", Value::F64(f64::NAN)),
+            ("beta", Value::Vec(vec![f64::NAN; 2])),
+            ("se", Value::Vec(vec![f64::NAN; 2])),
+            ("vcov", Value::Vec(vec![f64::NAN; 4])),
+            ("dispersion", Value::F64(f64::NAN)),
+            ("fitted", Value::Vec(vec![])),
+            ("varcorr", Value::List(vec![])),
+            (
+                "re_groups",
+                Value::List(vec![Value::List(vec![
+                    text("g"),
+                    Value::StrVec(vec!["(Intercept)".into()]),
+                ])]),
+            ),
+            ("ranef_levels", Value::IntVec(vec![6])),
+        ]))
+    };
+    let b = failed("binomial", false);
+    assert_eq!(
+        s(field(&b, "method")),
+        "Generalized linear mixed model fit by maximum likelihood (Laplace Approximation)"
+    );
+    assert_eq!(
+        field(field(&b, "groups"), "levels"),
+        &Value::IntVec(vec![6])
+    );
+    assert_eq!(field(&b, "random_effects"), &Value::List(vec![]));
+    let Value::Record(c) = field(&b, "criterion") else {
+        panic!("criterion is not a record")
+    };
+    assert!(matches!(c.get("df.resid"), Some(Value::F64(v)) if v.is_nan()));
+    let g = failed("gaussian", true);
+    assert_eq!(s(field(&g, "method")), "Linear mixed model fit by REML");
+}
+
 #[test]
 fn the_test_follows_the_df_method() {
     // No df: Wald z on the normal, z = 2 gives p = 0.0455.
@@ -250,6 +296,42 @@ fn pearson_residuals_stay_finite_at_extreme_means() {
         (got[0] - want).abs() < 1e-15 && (got[1] + want).abs() < 1e-15,
         "{got:?}"
     );
+}
+
+/// `Σ wᵢ^v dᵢ`, `dᵢ` the family's unit deviance, against the hand-worked
+/// Poisson sum `2(0 − (0 − 1)) + 0 + 2(3 ln 3 − 2)` and a Gaussian RSS.
+#[test]
+fn deviance_residual_sum_matches_the_poisson_formula() {
+    let sum = |family: &str, y: Vec<f64>, mu: Vec<f64>, extra: Vec<(&str, Value)>| {
+        let mut r = rec(vec![
+            ("family", text(family)),
+            ("y", Value::Vec(y)),
+            ("fitted", Value::Vec(mu)),
+            ("dispersion", Value::F64(1.0)),
+        ]);
+        for (k, v) in extra {
+            r.push(k, v);
+        }
+        match call("deviance_residual_sum", r).unwrap() {
+            Value::F64(v) => v,
+            other => panic!("{other:?}"),
+        }
+    };
+    let pois = |extra| sum("poisson", vec![0.0, 1.0, 3.0], vec![1.0; 3], extra);
+    let close = |got: f64, want: f64| assert!((got - want).abs() < 1e-12, "{got} vs {want}");
+    close(pois(vec![]), 4.591673732008658);
+    close(
+        pois(vec![("weights", Value::Vec(vec![2.0, 1.0, 1.0]))]),
+        6.591673732008658,
+    );
+    close(
+        pois(vec![
+            ("weights", Value::Vec(vec![4.0, 1.0, 1.0])),
+            ("weight_power", Value::F64(0.5)),
+        ]),
+        6.591673732008658,
+    );
+    close(sum("gaussian", vec![1.0, 2.0], vec![0.0, 0.0], vec![]), 5.0);
 }
 
 /// The Pearson residuals, alone and in the summary's scaled-residual block,

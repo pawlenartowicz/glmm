@@ -9,8 +9,10 @@ use std::fmt;
 
 use crate::ErrorMessage;
 
-/// Parse-stage (data-free) failures. Variants and Display strings are a fixed
-/// contract (change together with `parse.rs`, which produces them).
+/// Parse-stage (data-free) failures, plus the lowering's refusal of a formula
+/// with no response, which needs the data to tell from a response column
+/// named like the parser's placeholder. Variants and Display strings are a
+/// fixed contract (change together with `parse.rs`, which produces them).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseError {
     /// The formula (or its RHS) is empty.
@@ -18,8 +20,9 @@ pub enum ParseError {
     /// A token on the RHS is not a valid identifier, or a term is malformed
     /// (for example a trailing `+`, a `^` power that is not an integer of 2
     /// or more, unbalanced or empty parentheses, a random-effect term that
-    /// both writes and removes its intercept, or a grouping of three or more
-    /// factors).
+    /// both writes and removes its intercept, an interaction as a random
+    /// slope, a grouping of three or more factors, or a formula with no
+    /// response).
     Syntax {
         /// 0-based position of the offending token in the formula string.
         pos: usize,

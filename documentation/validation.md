@@ -230,7 +230,7 @@ measurement; no band was widened.
 **Fits with no more observations than random effects.** Under `(1 + time | id)` with
 mean cluster size 2 (`M = 3`), 52% to 58% of a cell's datasets have no more
 observations than random effects. lme4 refuses such a fit by default
-(`check.nobs.vs.nRE`); glmm fits it and says nothing. The model is weakly identified
+(`check.nobs.vs.nRE`); glmm fits it and raises the `few_rows_for_random_effects` caution (see [`warnings.md`](warnings.md)). The model is weakly identified
 there, not unidentified (a subject seen at three distinct times identifies the
 residual variance). No gated result depends on these fits: the `f3` excess above
 holds on the datasets of `k10_m3_gauss_rdis` with more observations than random

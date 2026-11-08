@@ -1147,7 +1147,8 @@ pub(crate) fn inv_gaussian_aic<T: Scalar>(
 /// the (weighted) `dev_resid` sum. Per family:
 ///
 /// - **Binomial** — the aggregated form: row `i` is `mᵢ = wᵢ` trials with
-///   `sᵢ = wᵢ·yᵢ` successes (unit weights ⇒ Bernoulli, where every term is 0),
+///   `sᵢ = wᵢ·yᵢ` successes (unit weights and 0/1 y ⇒ Bernoulli, where every
+///   term is 0; a fractional y with unit weights keeps its nonzero term),
 ///   so the saturated density at `μ=y` is `ln C(mᵢ,sᵢ) + sᵢ·ln yᵢ +
 ///   (mᵢ−sᵢ)·ln(1−yᵢ)` with the binomial coefficient via `lnΓ` (continuous in
 ///   `wᵢ`; R's `dbinom` rounds — identical on the integer trial counts the

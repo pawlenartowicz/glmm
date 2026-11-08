@@ -272,6 +272,73 @@ fn nan_coefficient_contributes_zero() {
     assert!(got.lower.iter().chain(&got.upper).all(|v| v.is_nan()));
 }
 
+/// A fit that returned no estimates (every coefficient NaN, nothing aliased)
+/// predicts NaN with a NaN standard error, interval and future bounds, on
+/// the link and the response scale.
+#[test]
+fn a_fit_without_estimates_predicts_nan() {
+    // n = p = 2: OLS and the Poisson GLM end not converged with no estimates.
+    let x = [1.0, 0.3, 1.0, -0.4];
+    let poisson = Family::Poisson {
+        link: PoissonLink::Log,
+    };
+    for (family, y) in [(Family::Gaussian, [0.5, 1.5]), (poisson, [1.0, 2.0])] {
+        let spec = ModelSpec::fixed(family);
+        let fit = crate::fit(&Data::new(&x, &y, 2, 2), &spec, &FitOptions::default()).unwrap();
+        assert!(!fit.converged() && fit.beta.iter().all(|b| b.is_nan()));
+        assert!(fit.diagnostics.aliased.iter().all(|a| !a));
+        let new = Design::new(&x, 2, 2);
+        for scale in [Scale::Link, Scale::Response] {
+            let opts = PredictOptions {
+                se: true,
+                scale,
+                ..PredictOptions::default()
+            };
+            let got = predict(&fit, &spec, &new, &opts).unwrap();
+            for v in [&got.fit, &got.se, &got.lower, &got.upper] {
+                assert_eq!(v.len(), 2);
+                assert!(v.iter().all(|e| e.is_nan()), "{family:?} {scale:?}: {v:?}");
+            }
+        }
+    }
+
+    // A Poisson GLMM on the degenerate route (n = p = 3), in population mode
+    // with future bounds.
+    let (n, p) = (3usize, 3usize);
+    let x: Vec<f64> = (0..n * p).map(|k| (k % 5) as f64 + 0.5).collect();
+    let y = vec![1.0, 2.0, 0.0];
+    let ids = GroupIds {
+        primary: vec![0, 1, 1],
+        extra: vec![],
+    };
+    let spec = ModelSpec {
+        family: poisson,
+        re: Some(crate::ReStructure {
+            terms: vec![crate::ReTerm::no_intercept().slopes([1u32])],
+            slopes: vec![1],
+            extra_groupings: vec![],
+        }),
+    };
+    let fit = crate::fit(
+        &Data::new(&x, &y, n, p).ids(&ids),
+        &spec,
+        &FitOptions::default(),
+    )
+    .unwrap();
+    assert!(!fit.converged() && fit.beta.iter().all(|b| b.is_nan()));
+    let opts = PredictOptions {
+        population: true,
+        future: true,
+        se: true,
+        ..PredictOptions::default()
+    };
+    let got = predict(&fit, &spec, &Design::new(&x, n, p), &opts).unwrap();
+    for v in [&got.fit, &got.se, &got.future_lower, &got.future_upper] {
+        assert_eq!(v.len(), n);
+        assert!(v.iter().all(|e| e.is_nan()), "GLMM future: {v:?}");
+    }
+}
+
 /// On Penicillin, ids at or past `Fit::ranef_levels` in one or both groupings
 /// take a zero effect for that grouping only, and raise one note per grouping
 /// with the exact rows; refused when new levels are not allowed.

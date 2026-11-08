@@ -57,10 +57,10 @@ use crate::fit::varcorr_block;
 use crate::optim::{bobyqa_minimize, ValueFn};
 use crate::standardize::ColumnScaling;
 
-/// One lme4-scale variance coordinate. `block` counts the primary grouping
-/// first, then each extra in declaration order; `row` and `col` index the
-/// block's columns in θ's layout (a block without an intercept keeps its idle
-/// column 0); `theta_index` is the entry's slot in θ.
+/// One lme4-scale variance coordinate. `block` is the grouping in kernel slot
+/// order (see `Perm`): the kernel's primary first, then its extras; `row` and
+/// `col` index the block's columns in θ's layout (a block without an intercept
+/// keeps its idle column 0); `theta_index` is the entry's slot in θ.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum VarCoord {
     /// The SD of column `row`.

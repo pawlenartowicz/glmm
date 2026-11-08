@@ -19,9 +19,10 @@
 //! dataset is left out of every quantity, `f3`'s included, since every fit of
 //! the dataset uses that design or a part of it and a dropped column moves the
 //! other coefficients' targets: it is counted as aliased, never as failed, and
-//! no fit is made. A level of `f3` absent keeps its zero column aliased and the
-//! `f3` row is tested at the df it carries (1 instead of 2); with every `f3`
-//! column aliased (a 0-df row) the `f3` quantities count as aliased. A
+//! no fit is made. A level of `f3` absent is dropped at lowering and the `f3`
+//! row is tested at the df it carries (1 instead of 2); with one level left the
+//! lowering refuses `f3`, and the `f3` quantities count as aliased, as they do
+//! with every `f3` column aliased (a 0-df row). A
 //! quantity fails when a fit it needs did not converge, or when its value is
 //! not finite; `R_kept` is the datasets left.
 
@@ -226,11 +227,15 @@ fn design_aliased(table: &Table, family: Family, random: &str) -> bool {
     aliased_columns(&lo).contains(&true)
 }
 
-/// How many `f3` columns of the full design with `f3` are aliased. Mostly an
-/// absent level (1 column, a 1-df row; 2 columns, a 0-df row); rarely an
-/// `f3` level set that equals `group`, where one column of that design drops
-/// (an `f3` column, or `time:group`, which the lowering orders after `f3`).
-fn f3_aliased_columns(table: &Table, family: Family, random: &str) -> usize {
+/// The df of the `f3` row of the full design with `f3`: its columns less the
+/// aliased ones. An absent level is dropped at lowering (2 levels left, 1 df);
+/// with one level left the lowering refuses `f3`, so the df is 0. Rarely an
+/// `f3` level set equals `group`, where one column of that design drops (an
+/// `f3` column, or `time:group`, which the lowering orders after `f3`).
+fn f3_df(table: &Table, family: Family, random: &str) -> usize {
+    if f3_levels(table) < 2 {
+        return 0;
+    }
     let lo = lowered(&formula("y_00", WITH_F3, random), table, family);
     let mask = aliased_columns(&lo);
     let term = lo
@@ -238,7 +243,7 @@ fn f3_aliased_columns(table: &Table, family: Family, random: &str) -> usize {
         .iter()
         .find(|t| t.label == "f3")
         .expect("the f3 term");
-    term.columns.clone().filter(|&j| mask[j]).count()
+    term.columns.clone().filter(|&j| !mask[j]).count()
 }
 
 /// A converged fit with its lowering, options and formula.
@@ -411,7 +416,8 @@ fn numeric<'a>(table: &'a Table, name: &str) -> &'a [f64] {
 struct Measured {
     /// The full fixed design is aliased: nothing is measured.
     aliased: bool,
-    /// Every `f3` column is aliased: the `f3` quantities are not measured.
+    /// The `f3` row has 0 df (one `f3` level left, or every `f3` column
+    /// aliased): the `f3` quantities are not measured.
     f3_aliased: bool,
     /// Per test, its p-value; `None` when a fit it needs did not converge or
     /// `compare` or `term_tests` refused.
@@ -455,16 +461,16 @@ fn measure(cell: &Cell, table: &Table, acc: &mut CellAcc) -> Measured {
             acc.add_measure("glm_minority_per_cluster", minority / k);
         }
     }
-    // The share of datasets whose full design with `f3` drops one column,
-    // mostly an absent `f3` level (a 1-df `f3` row).
-    let f3_dropped = f3_aliased_columns(table, fam, random);
-    acc.add_measure("f3_df1", if f3_dropped == 1 { 1.0 } else { 0.0 });
+    // The share of datasets whose `f3` row has 1 df, mostly an absent `f3`
+    // level.
+    let f3_df = f3_df(table, fam, random);
+    acc.add_measure("f3_df1", if f3_df == 1 { 1.0 } else { 0.0 });
     let mut m = Measured::default();
     if design_aliased(table, fam, random) {
         m.aliased = true;
         return m;
     }
-    m.f3_aliased = f3_dropped >= 2;
+    m.f3_aliased = f3_df == 0;
     if cell.response == Response::Gauss {
         measure_lmm(cell, table, acc, &mut m);
     } else {
@@ -1444,8 +1450,8 @@ fn aliased_designs_are_left_out_of_every_quantity() {
     }
 }
 
-/// An `f3` level absent leaves a 1-df `f3` row that is tested; every `f3`
-/// column aliased leaves the `f3` quantities aliased and the rest kept.
+/// An `f3` level absent is dropped and leaves a 1-df `f3` row that is tested;
+/// one `f3` level left leaves the `f3` quantities aliased and the rest kept.
 #[test]
 fn f3_rows_carry_their_df() {
     let c = cell("k10_m3_gauss_rdi");

@@ -203,6 +203,10 @@ impl FitView<'_> {
                         | Note::NonIntegerResponse { .. }
                         | Note::SingleLevelGroupingDropped { .. }
                         | Note::FewRowsForRandomEffects { .. }
+                        | Note::SingleLevelGrouping { .. }
+                        | Note::RepeatedGrouping { .. }
+                        | Note::SlopeConstantWithinLevels { .. }
+                        | Note::SeparatedByGrouping { .. }
                         | Note::VarianceAtLimit
                         | Note::SatterthwaiteCurvature { .. }
                         | Note::NewGroupingLevels { .. }
@@ -500,7 +504,8 @@ impl<'a> FitView<'a> {
             // intercept-only one, and the map costs the warm loop no heap block.
             let theta = &mut theta_buf[..n_theta];
             view.pinned_override = match view.kernel_groupings() {
-                // The mask is read in slot order, before the reorder below.
+                // The mask is read in slot order; both θ and the mask are
+                // reordered below.
                 Some(g) if mapped => {
                     let converged = view.kernel_diagnostics().converged;
                     g.theta_to_caller(view.kernel_theta(), converged, theta, re_scratch, map)
@@ -512,6 +517,18 @@ impl<'a> FitView<'a> {
             };
             // The maps are in kernel slot order, so they apply before the reorder.
             perm.swap_slots(theta);
+            if !perm.is_identity() {
+                let mut m = view
+                    .pinned_override
+                    .unwrap_or_else(|| view.kernel_diagnostics().pinned_components);
+                let mut out = 0u64;
+                while m != 0 {
+                    let b = m.trailing_zeros() as usize;
+                    out |= 1 << perm.map_index(b);
+                    m &= m - 1;
+                }
+                view.pinned_override = Some(out);
+            }
             view.theta_declared = &theta_buf[..n_theta];
         }
         view
@@ -755,6 +772,11 @@ impl FitWorkspace {
             FitKind::Lmm { ws, .. } => Some((ws, &self.scaling)),
             _ => None,
         }
+    }
+
+    /// The grouping reorder this workspace was built under.
+    pub(crate) fn perm(&self) -> Perm {
+        self.perm
     }
 }
 
@@ -1052,7 +1074,8 @@ pub fn build_workspace(
 ///
 /// The data, however, is the caller's responsibility — the stable entry
 /// validates and salvages where `fit_on` trusts:
-/// - **Start values.** A `start.beta` or `start.theta` of the wrong width is
+/// - **Start values.** A `start.beta` or `start.theta` of the wrong width or
+///   with a non-finite entry, or a dispersion that is not finite and > 0, is
 ///   dropped: that component cold-starts. The OLS and GLM routes read neither,
 ///   as [`crate::fit_with_start`] says; a warm GLM loop calls `glm_irls_fit`.
 /// - **Weights and offsets.** A weights vector longer than `n` is accepted, but
@@ -1443,16 +1466,21 @@ pub fn fit_on_hinted<'a>(
     // Starts arrive in the caller's units and DECLARATION order — the order
     // `FitView::theta` reports θ̂ in, so a warm-start carry round-trips — while
     // the kernels index θ by slot and fit the standardized design. A component
-    // of the wrong width is dropped (a cold start for it), θ is moved to slot
-    // order, and on the θ routes both are mapped onto the standardized design
+    // of the wrong width or with a non-finite entry (a failed draw's NaN carry)
+    // is dropped, a cold start for it, as is a dispersion that is not finite
+    // and > 0; θ is moved to slot order, and on the θ routes both are mapped
+    // onto the standardized design
     // (`start_to_design`). This is
     // the input side of the pair; `unpermute_fit`/`FitView::theta` are the
     // output side.
     let n_theta = theta_width(sized.spec.re.as_ref());
     let maps_start = kind.groupings().filter(|_| !scaling.is_identity());
+    let usable = |v: &[f64], width: usize| v.len() == width && v.iter().all(|x| x.is_finite());
+    let usable_dispersion = |d: &f64| d.is_finite() && *d > 0.0;
     let as_given = |s: &StartValues| {
-        (s.beta.is_empty() || s.beta.len() == p)
-            && (s.theta.is_empty() || (s.theta.len() == n_theta && perm.is_identity()))
+        (s.beta.is_empty() || usable(&s.beta, p))
+            && (s.theta.is_empty() || (usable(&s.theta, n_theta) && perm.is_identity()))
+            && s.dispersion.is_none_or(|d| usable_dispersion(&d))
     };
     let start = match start {
         Some(s) if maps_start.is_some() || !as_given(s) => {
@@ -1460,15 +1488,15 @@ pub fn fit_on_hinted<'a>(
             // standardizing workspace this runs on every draw of a warm loop.
             let dst = start_permuted;
             dst.beta.clear();
-            if s.beta.len() == p {
+            if usable(&s.beta, p) {
                 dst.beta.extend_from_slice(&s.beta);
             }
             dst.theta.clear();
-            if s.theta.len() == n_theta {
+            if usable(&s.theta, n_theta) {
                 dst.theta.extend_from_slice(&s.theta);
                 perm.swap_slots(&mut dst.theta);
             }
-            dst.dispersion = s.dispersion;
+            dst.dispersion = s.dispersion.filter(usable_dispersion);
             if let Some(g) = maps_start {
                 start_to_design(dst, scaling, g, re_map_scratch);
             }

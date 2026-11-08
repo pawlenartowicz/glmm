@@ -70,6 +70,9 @@ pub(crate) use common::re_only_count;
 // One block's covariance off θ̃, which the LMM profile reads its estimates
 // through, as `Fit::varcorr` is assembled.
 pub(crate) use common::varcorr_block;
+// The grouping reorder, which the profile intervals map their kernel
+// coordinates through.
+pub(crate) use common::Perm;
 // The sizer, for the tests outside `fit` that build kernel workspaces from
 // data-derived ids.
 #[cfg(test)]
@@ -587,6 +590,66 @@ pub enum Note {
         /// The rows of the fit.
         rows: u32,
     },
+    /// Every row of a grouping has the same level, so the data hold no
+    /// between-group variance for it. Groupings are numbered in declaration
+    /// order, as on [`Note::NewGroupingLevels`]. The fit runs as usual and no
+    /// estimate changes. Reachable from the matrix door only: the formula
+    /// frontend drops such a grouping first and raises
+    /// [`Note::SingleLevelGroupingDropped`].
+    SingleLevelGrouping {
+        /// The grouping's declaration index: 0 the primary grouping, `g + 1`
+        /// the extra grouping `g`.
+        grouping: u32,
+    },
+    /// Two groupings put the rows into exactly the same groups (the same
+    /// partition of the rows, whatever the ids are called) and their blocks
+    /// share a random-effect column: both have a random intercept, or one
+    /// slope column is in both. The data cannot tell the two variances apart,
+    /// so how the fit splits the variance between them is arbitrary. The fit
+    /// runs as usual and no estimate changes.
+    RepeatedGrouping {
+        /// The earlier grouping's declaration index, as on
+        /// [`Note::NewGroupingLevels`].
+        first: u32,
+        /// The later grouping's declaration index; `first < second`.
+        second: u32,
+    },
+    /// A grouping's block has a random intercept, and some of its slope
+    /// columns take one value within every level of the grouping. With `k`
+    /// such columns, the level effects identify the covariance of the
+    /// intercept and those slopes only through as many equations as there
+    /// are distinct per-level vectors of the products of their values within
+    /// each [`crate::ReTerm`] (the intercept's value is 1); the note is
+    /// raised when that count is below the number of covariance parameters
+    /// among them: `(k + 1)(k + 2)/2` when they share one term, fewer when
+    /// terms split them. So a slope of ±1 per level in a term of its own
+    /// gets the note. Values are compared with `==`. Then
+    /// their variances and correlations cannot be estimated from these data. The fit runs as usual and no estimate
+    /// changes. A block without a random intercept gets no note: there a
+    /// slope constant within levels is a random intercept with a per-level
+    /// scale, which is identified.
+    SlopeConstantWithinLevels {
+        /// The grouping's declaration index, as on [`Note::NewGroupingLevels`].
+        grouping: u32,
+        /// Positions in the grouping's slope list, ascending: position `k` is
+        /// entry `1 + k` of [`Fit::stddev_corr`] for this grouping.
+        slopes: Vec<u32>,
+    },
+    /// A binomial response is 0 or 1 on every row and takes one value within
+    /// every level of a grouping with a random intercept, and some level holds
+    /// more than one trial (two or more rows, or a row whose weight, its trial
+    /// count, is above 1). The likelihood then keeps rising as that grouping's
+    /// variance grows, so the variance has no finite estimate, and the fixed
+    /// effects depend on the reported one. Checked on every level, not most.
+    /// A grouping of one-trial levels (an observation-level random effect on
+    /// a 0/1 response) gets no note: there the variance only moves each row's
+    /// marginal success probability. A response with one value on every row
+    /// gets no note either: that is the constant-response case. The fit runs
+    /// as usual and no estimate changes.
+    SeparatedByGrouping {
+        /// The grouping's declaration index, as on [`Note::NewGroupingLevels`].
+        grouping: u32,
+    },
     /// A GLMM's deviance is too large for `f64` to resolve its optimum: its
     /// estimated rounding error at the endpoint exceeds 1e-2 deviance units,
     /// which moves θ̂ by about a tenth of its standard error, and the search
@@ -600,7 +663,12 @@ pub enum Note {
     /// first source. On a Gaussian mixed model the estimate is
     /// `(k + p + 1)·ε·y′Wy/σ̂²` (`k` random-effect columns, `y′Wy` on the
     /// working weights): the residual sum of squares is a difference of terms
-    /// of the size of `y′Wy`, known to about that times ε. It passes 1e-2 when
+    /// of the size of `y′Wy`, known to about that times ε. Under REML it also
+    /// counts each fixed-effect pivot of X′V⁻¹X, `(k + p + 1)·ε·C_jj/L_jj²`
+    /// (`C_jj` the column's weighted sum of squares, `L_jj²` its pivot): the
+    /// pivot is a difference of two large numbers when a fixed-effect column
+    /// lies near the span of a random-effect column with a large variance (an
+    /// intercept beside a random intercept). The first term passes 1e-2 when
     /// the residuals are tiny against the response: a response far from zero
     /// next to its residual SD (about 1e5 times it at n = 1000), or weights
     /// spanning about 1e11 or more. There θ̂ stops where the search first
@@ -637,7 +705,9 @@ pub enum Note {
     /// negative binomial). `converged` is `false` and `beta` holds the last
     /// step. On a GLM fit that is the fit itself; on a GLMM fit it is the GLM
     /// the search starts from, so the search never ran: the random-effect
-    /// outputs, the SEs and the deviance are NaN.
+    /// outputs, the SEs and the deviance are NaN. A binomial GLMM whose
+    /// response is all 0 or all 1 carries it too, without any IRLS
+    /// iteration, with `beta` NaN.
     Separated,
     /// A random-effect parameter ended on the upper limit of the θ search box
     /// (`crate::lmm::THETA_HI`, 1000 on the search's internal scale, which on
@@ -1476,9 +1546,14 @@ pub struct FitOptions {
     /// | Gaussian, no random part (OLS) | ML log-likelihood | REML log-likelihood | ML log-likelihood |
     /// | any other family | ML | ML | ML |
     ///
-    /// On OLS the value moves only the reported log-likelihood (see
-    /// [`Fit::loglik`]) and [`Fit::reml`]: β̂, the SEs and `σ̂² = RSS/(n − p)`
-    /// are the same under all three. It is read when the `Fit` is assembled,
+    /// On OLS without weights, or with a fixed [`FitOptions::weight_power`],
+    /// the value moves only the reported log-likelihood (see [`Fit::loglik`])
+    /// and [`Fit::reml`]: β̂, the SEs and `σ̂² = RSS/(n − p)` are the same under
+    /// all three. Where the default weight power is estimated (a Gaussian fit
+    /// with weights), `None` and `Some(true)` estimate it by REML, with the
+    /// REML log-likelihood, and `Some(false)` takes the weights as given
+    /// (power 1), so the estimates differ; [`WeightPower::Estimate`] under
+    /// `Some(false)` estimates the power by ML. It is read when the `Fit` is assembled,
     /// from the options handed to `FitView::into_fit`, and is not frozen on an
     /// OLS `FitWorkspace`, since the solve does not depend on it. On a GLM or
     /// GLMM (Laplace or AGQ) the fit is by maximum likelihood whatever the
@@ -1783,8 +1858,8 @@ impl std::fmt::Display for ErrorMessage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FitError {
     /// The data do not have the shape `n` and `p` say (`x` not `n*p` long, `y`
-    /// not `n` long, a non-finite `x`), or a random slope names a column past
-    /// `p`.
+    /// not `n` long, a non-finite `x`) or no rows, or a random slope names a
+    /// column past `p`.
     Shape(ErrorMessage),
     /// A response outside the family's support: a non-finite `y`, a Poisson
     /// or negative-binomial `y < 0`, a binomial `y` outside `[0, 1]`, a Gamma
@@ -2022,6 +2097,10 @@ pub(crate) fn fit_checked(
             return fit;
         }
     }
+    // Random-effect structures the data cannot identify: notes only, on the
+    // same footing as the count above. Past the alias branch, so the reduced
+    // re-entry computes them once, on the reduced design.
+    let identification = common::identification_notes(&data.design, y, spec);
     // A fixed power other than 1 fits on the working weights `w^v`. Applied
     // past the alias branch, so the reduced re-entry applies it once.
     let powered = match (weights, opts.weight_power) {
@@ -2056,6 +2135,7 @@ pub(crate) fn fit_checked(
             rows: non_integer_response_rows,
         });
     }
+    fit.diagnostics.notes.extend(identification);
     fit
 }
 

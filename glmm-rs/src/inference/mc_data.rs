@@ -460,7 +460,7 @@ pub(crate) mod bands {
     /// simulated designs): 2.6%, 1.1% and 0.9% of datasets at `K = 10` and
     /// `M = 3, 9, 17`, 0.04% or less at `K = 20`, none at `K ≥ 30`. A level of
     /// `f3` absent (5.2% of datasets at `K = 10`, 0.09% at `K = 20`) is not
-    /// such a case: its zero column is kept as aliased and the `f3` row has
+    /// such a case: the lowering drops the absent level and the `f3` row has
     /// 1 df. A reported cell prints the failed fraction beside its rate.
     /// Pilot: no Gaussian LMM fit failed to converge (its losses were aliased
     /// designs); GLMM losses (aliased designs and failed fits together) at

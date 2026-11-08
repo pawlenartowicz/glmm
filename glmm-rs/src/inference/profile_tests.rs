@@ -11,7 +11,7 @@ use super::profile::{
     Toward,
 };
 use crate::fit::common_tests::lcg;
-use crate::fit::fit_cold_keep_workspace;
+use crate::fit::{fit_cold_keep_workspace, Perm};
 use crate::lmm::profile::ProfileKernel;
 use crate::lmm::profile_tests::{
     design, levels, ml_opts, num, primary, sleepstudy_ml, slope_model, table, Case,
@@ -49,6 +49,8 @@ fn profile(
 /// `|ζ|` at `value` of `param`: the held minimum from the estimate (θ̂ for a
 /// coefficient), on a fresh ML fit of the case.
 fn zeta_at(case: &Case, param: ProfileParam, value: f64) -> f64 {
+    // No case that calls this is reordered by the size rule (each
+    // multi-grouping case has a slope).
     case.with_ml(|_, ws, map| {
         let hidden = ws.kernel.groupings().hidden.clone();
         let mut k = ProfileKernel::new(ws, map);
@@ -59,7 +61,7 @@ fn zeta_at(case: &Case, param: ProfileParam, value: f64) -> f64 {
                 k.hold_beta(j, value, &mut start)
             }
             _ => {
-                let i = coord_params(k.coords(), &hidden)
+                let i = coord_params(k.coords(), &hidden, Perm::IDENTITY)
                     .iter()
                     .position(|&q| q == param)
                     .expect("a variance parameter of the model");
@@ -574,6 +576,23 @@ fn a_held_minimum_below_the_fit_is_a_better_optimum() {
     assert!(side(5e-7).expect("within the tolerance").is_nan());
 }
 
+/// The message names the parameter in words, not as the Rust enum.
+#[test]
+fn a_better_optimum_message_names_the_parameter() {
+    let msg = |param| ProfileError::BetterOptimum { param, drop: 2e-6 }.to_string();
+    let sd = msg(ProfileParam::Sd { group: 0, term: 1 });
+    assert!(
+        sd.contains("profiling the SD of column 1 of grouping 0 found"),
+        "{sd}"
+    );
+    assert!(!sd.contains("Sd {"), "{sd}");
+    let sigma = msg(ProfileParam::Sigma);
+    assert!(
+        sigma.contains("profiling the residual SD (sigma) found"),
+        "{sigma}"
+    );
+}
+
 /// A side whose `|ζ|` rises but never reaches the quantile is undetermined.
 #[test]
 fn a_side_that_never_brackets_is_nan() {
@@ -649,4 +668,66 @@ fn a_weight_power_other_than_one_is_refused() {
     assert!(fit
         .profile_intervals(&case.data(), &case.model, 0.95, Some(&which))
         .is_ok());
+}
+
+/// Two crossed intercept-only groupings, a (6 levels) declared before b (40):
+/// the size rule makes b the kernel's primary, so the kernel's coordinates
+/// come in the order b, a. Each row must still carry its own grouping's
+/// interval, the same numbers as when b is declared first.
+#[test]
+fn size_rule_reorder_keeps_each_interval_on_its_grouping() {
+    let n = 600;
+    let mut st = 7u64;
+    let ua: Vec<f64> = (0..6).map(|_| 2.0 * lcg(&mut st)).collect();
+    let ub: Vec<f64> = (0..40).map(|_| 0.3 * lcg(&mut st)).collect();
+    let (mut x, mut y, mut a, mut b) = (vec![], vec![], vec![], vec![]);
+    for _ in 0..n {
+        let ia = ((lcg(&mut st) + 1.0) * 0.5 * 6.0) as usize % 6;
+        let ib = ((lcg(&mut st) + 1.0) * 0.5 * 40.0) as usize % 40;
+        let x1 = lcg(&mut st);
+        x.extend([1.0, x1]);
+        y.push(0.3 + 0.5 * x1 + ua[ia] + ub[ib] + lcg(&mut st));
+        a.push(ia as u32);
+        b.push(ib as u32);
+    }
+    let case = |ids: GroupIds| Case {
+        x: x.clone(),
+        y: y.clone(),
+        p: 2,
+        ids,
+        w: None,
+        model: ModelSpec::mixed(
+            Family::Gaussian,
+            ReStructure::intercept().extra(Grouping::crossed()),
+        ),
+    };
+    let ab_case = case(GroupIds::new(a.clone()).extra(b.clone()));
+    let ba_case = case(GroupIds::new(b).extra(a));
+    let reordered = |c: &Case| {
+        !fit_cold_keep_workspace(&c.data(), &c.model, &ml_opts())
+            .1
+            .perm()
+            .is_identity()
+    };
+    assert!(reordered(&ab_case) && !reordered(&ba_case));
+
+    let ab = profile(&ab_case, false, 0.95, None);
+    let ba = profile(&ba_case, false, 0.95, None);
+    let vals = |r: &ProfileInterval| (r.estimate, r.lower, r.upper);
+    assert_eq!(ab.rows[0].param, sd(0, 0));
+    assert_eq!(ab.rows[1].param, sd(1, 0));
+    // The kernel sees the same input both ways, and one row's search does not
+    // depend on the rows before it (see `which_selects_rows`).
+    assert_eq!(vals(&ab.rows[0]), vals(&ba.rows[1]), "a's row");
+    assert_eq!(vals(&ab.rows[1]), vals(&ba.rows[0]), "b's row");
+    assert_eq!(ab.rows[2..], ba.rows[2..]);
+    let sd_a = fit_case(&ab_case, false).varcorr(0)[0].sqrt();
+    assert!(
+        (ab.rows[0].estimate - sd_a).abs() <= 1e-8 * sd_a.abs(),
+        "{} vs {sd_a}",
+        ab.rows[0].estimate
+    );
+    let only_a = profile(&ab_case, false, 0.95, Some(&[sd(0, 0)])).rows;
+    assert_eq!(only_a.len(), 1);
+    assert_eq!(vals(&only_a[0]), vals(&ab.rows[0]), "which picks a's row");
 }

@@ -56,12 +56,14 @@ pub struct ContrastT {
 pub struct ContrastF {
     /// The F statistic.
     pub f: f64,
-    /// The numerator df: the rank of `L·C·Lᵀ` under lmerTest's rule.
+    /// The numerator df: the rank of `L·C·Lᵀ` under lmerTest's rule; 0 for an
+    /// all-zero `L`.
     pub num_df: f64,
     /// The Satterthwaite denominator df (`ν = n − p` on OLS and on a Gamma or
     /// inverse Gaussian GLM with φ estimated). NaN, with every other field, on
     /// such a fit that did not converge, where [`ContrastT::df`] still reports
-    /// ν: the eigendecomposition of its non-finite `L·C·Lᵀ` fails.
+    /// ν: the eigendecomposition of its non-finite `L·C·Lᵀ` fails. NaN for an
+    /// all-zero `L`, which has no direction to take a df on.
     pub den_df: f64,
     /// Upper-tail p of `f` on `(num_df, den_df)`.
     pub p_value: f64,
@@ -79,8 +81,9 @@ pub enum ContrastNote {
         /// The caller column, 0-based.
         column: usize,
     },
-    /// `L·C·Lᵀ` has rank `rank < rows`: the F test is on the `rank`
-    /// directions lmerTest keeps.
+    /// `L·C·Lᵀ` has rank `rank < rows`: the test is on the `rank` directions
+    /// lmerTest keeps. Rank 0 (an all-zero `L`) tests nothing: the statistic,
+    /// denominator df and p-value are NaN on the F test.
     RankDeficientL {
         /// The rank kept (the numerator df).
         rank: usize,
@@ -193,7 +196,9 @@ impl Fit {
     /// OLS and the dispersion GLMs with φ estimated the denominator df is
     /// `n − p`, the classical F. On a robust fit one row is the robust
     /// [`Fit::contrast_t`]'s t² on its df, and more rows the model-based F
-    /// with [`ContrastNote::ModelBasedJointTest`].
+    /// with [`ContrastNote::ModelBasedJointTest`]. An all-zero `L` gets
+    /// `num_df` 0, NaN elsewhere, and [`ContrastNote::RankDeficientL`] with
+    /// rank 0 on every route.
     ///
     /// # Errors
     ///
@@ -251,7 +256,8 @@ impl Fit {
 
 /// The test of [`Fit::contrast_t`] on `beta` (all `p` caller columns) and the
 /// df record `st`, the only two things it reads. The caller has checked `l`:
-/// `p` finite entries.
+/// `p` finite entries. `l` is tested as [`unit_rows`] scales it, so `lᵀCl`
+/// stays in range at any scale of `l`; the estimate and se are scaled back.
 pub(crate) fn contrast_t_of(beta: &[f64], st: &SatterthwaiteState, l: &[f64]) -> ContrastT {
     let p = beta.len();
     let notes = aliased_notes(st, l, p);
@@ -266,7 +272,8 @@ pub(crate) fn contrast_t_of(beta: &[f64], st: &SatterthwaiteState, l: &[f64]) ->
         };
     }
     let inputs = Inputs::new(beta, st);
-    let r = contest_1d(&inputs.contest(), &inputs.restrict(l));
+    let (l, s) = unit_rows(l, p);
+    let r = contest_1d(&inputs.contest(), &inputs.restrict(&l));
     // A residual-only record has no variance parameters: its df is ν.
     let (df, p_value) = if st.residual_only() {
         (st.nu, t_two_sided_p(r.t_value, st.nu))
@@ -274,8 +281,8 @@ pub(crate) fn contrast_t_of(beta: &[f64], st: &SatterthwaiteState, l: &[f64]) ->
         (r.df, r.p_value)
     };
     ContrastT {
-        estimate: r.estimate,
-        se: r.std_error,
+        estimate: r.estimate / s[0],
+        se: r.std_error / s[0],
         t: r.t_value,
         df,
         p_value,
@@ -285,7 +292,9 @@ pub(crate) fn contrast_t_of(beta: &[f64], st: &SatterthwaiteState, l: &[f64]) ->
 
 /// The test of [`Fit::contrast_f`] on `beta` (all `p` caller columns) and the
 /// df record `st`, the only two things it reads. The caller has checked `l`:
-/// `rows > 0` rows of `p` finite entries.
+/// `rows > 0` rows of `p` finite entries. Each row is scaled by
+/// [`unit_rows`] before `L·C·Lᵀ` is formed, which leaves F and its df
+/// unchanged and keeps `L·C·Lᵀ` in range at any scale of a row.
 pub(crate) fn contrast_f_of(
     beta: &[f64],
     st: &SatterthwaiteState,
@@ -304,7 +313,12 @@ pub(crate) fn contrast_f_of(
     if !notes.is_empty() {
         return nan(notes);
     }
+    // lmerTest's one-row shortcut skips the rank rule an all-zero `L` needs.
+    if l.iter().all(|&v| v == 0.0) {
+        return zero_l(rows);
+    }
     let inputs = Inputs::new(beta, st);
+    let (l, _) = unit_rows(l, p);
     let reduced: Vec<Vec<f64>> = l.chunks(p).map(|row| inputs.restrict(row)).collect();
     let lr = Mat::from_fn(rows, inputs.beta.len(), |i, j| reduced[i][j]);
     // The eigendecomposition of `L·C·Lᵀ` fails on non-convergence or on a
@@ -336,6 +350,44 @@ pub(crate) fn contrast_f_of(
         p_value,
         notes,
     }
+}
+
+/// The test of an all-zero `L` of `rows` rows: `L·C·Lᵀ` has rank 0, so there
+/// is nothing to test.
+fn zero_l(rows: usize) -> ContrastF {
+    ContrastF {
+        f: f64::NAN,
+        num_df: 0.0,
+        den_df: f64::NAN,
+        p_value: f64::NAN,
+        notes: vec![ContrastNote::RankDeficientL { rank: 0, rows }],
+    }
+}
+
+/// Each `p`-wide row of `l` times a power of 2 that takes its largest |entry|
+/// into `[1, 2)`, and each row's factor; a zero row stays zero, with factor 1.
+/// The factor is exact, and the F, t and Wald χ² statistics and their df do
+/// not change when a row is scaled, so this only keeps `L·C·Lᵀ` from
+/// overflowing or underflowing when `L` is very large or very small.
+// shortcut: a row whose own entries are ~1e150 apart can still overflow or
+// underflow; scale the columns too if such a contrast is ever needed.
+pub(crate) fn unit_rows(l: &[f64], p: usize) -> (Vec<f64>, Vec<f64>) {
+    let mut l = l.to_vec();
+    let factors = l
+        .chunks_mut(p)
+        .map(|row| {
+            let max = row.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+            if max == 0.0 {
+                return 1.0;
+            }
+            // Clamped so the factor itself stays a normal double.
+            let k = (max.log2().floor() as i32).clamp(-1020, 1020);
+            let f = 2f64.powi(-k);
+            row.iter_mut().for_each(|v| *v *= f);
+            f
+        })
+        .collect();
+    (l, factors)
 }
 
 /// [`ContrastNote::AliasedColumn`] for every column outside the state's
@@ -410,7 +462,9 @@ impl<'a> RobustInputs<'a> {
 }
 
 /// The robust test of [`Fit::contrast_t`] on `beta` and `r`. The caller has
-/// checked `l`: `p` finite entries.
+/// checked `l`: `p` finite entries. The se, df and identification check read
+/// `l` as [`unit_rows`] scales it, so `lᵀVl` stays in range at any scale of
+/// `l`; the se is scaled back.
 pub(crate) fn robust_t_of(beta: &[f64], r: &RobustInputs<'_>, l: &[f64]) -> ContrastT {
     let p = beta.len();
     let untested = |estimate, notes| ContrastT {
@@ -430,7 +484,8 @@ pub(crate) fn robust_t_of(beta: &[f64], r: &RobustInputs<'_>, l: &[f64]) -> Cont
     let Some(pc) = r.pieces else {
         return untested(estimate, Vec::new());
     };
-    if pc.identified_by_one(r.m.as_ref(), l) {
+    let (ls, s) = unit_rows(l, p);
+    if pc.identified_by_one(r.m.as_ref(), &ls) {
         return untested(estimate, vec![ContrastNote::RobustUnidentified]);
     }
     // `vcov` is NaN outside the targets and on a column one cluster alone
@@ -440,11 +495,11 @@ pub(crate) fn robust_t_of(beta: &[f64], r: &RobustInputs<'_>, l: &[f64]) -> Cont
         e[j] = 1.0;
         r.vcov[j * p + j].is_nan() && !pc.identified_by_one(r.m.as_ref(), &e)
     });
-    let se = pc.var(l).sqrt();
+    let se = pc.var(&ls).sqrt() / s[0];
     if outside || se.is_nan() {
         return untested(estimate, Vec::new());
     }
-    let df = pc.df(r.m.as_ref(), l);
+    let df = pc.df(r.m.as_ref(), &ls);
     let t = estimate / se;
     ContrastT {
         estimate,
@@ -472,6 +527,9 @@ pub(crate) fn robust_f_of(
     rows: usize,
 ) -> Result<ContrastF, ContrastError> {
     if rows == 1 {
+        if l.iter().all(|&v| v == 0.0) {
+            return Ok(zero_l(rows));
+        }
         let t = robust_t_of(beta, r, l);
         return Ok(ContrastF {
             f: t.t * t.t,

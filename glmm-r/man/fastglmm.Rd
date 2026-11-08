@@ -112,9 +112,14 @@ errors.}
 value used. A Gaussian mixed model is fitted by REML under \code{NULL} and
 \code{TRUE} and by maximum likelihood under \code{FALSE}. A Gaussian model with no
 random effects (OLS, including a formula whose every grouping was dropped
-as single-level) has the same estimates under every value: \code{TRUE} reports
-the REML log-likelihood (as \code{logLik(lm, REML = TRUE)}), \code{NULL} and \code{FALSE}
-the ML one. Every other family is fitted by maximum likelihood, and
+as single-level) without weights, or with a fixed \code{weight_power}, has the
+same estimates under every value: \code{TRUE} reports the REML log-likelihood
+(as \code{logLik(lm, REML = TRUE)}), \code{NULL} and \code{FALSE} the ML one. Where
+\code{weight_power = NULL} estimates the weight power, \code{NULL} and \code{TRUE}
+estimate it by REML (\verb{$reml} is \code{TRUE}, the log-likelihood is the REML
+one) and \code{FALSE} takes the weights as given (power 1), so the estimates
+differ; \code{weight_power = "estimate"} with \code{FALSE} estimates the power by
+ML. Every other family is fitted by maximum likelihood, and
 \code{TRUE} there is ignored with a \code{"fastglmm_argument_ignored"} warning.}
 
 \item{anova_test}{when the likelihood-ratio tables of
@@ -226,7 +231,8 @@ several terms on one grouping such as \code{(1 | g) + (0 + x | g)}; a column in
 two terms on one grouping is an error. On a factor slope, \code{(f || g)} keeps
 the factor's block correlated, as lme4 does, while \code{zerocorr(f | g)} makes
 every column uncorrelated. Contrasts are
-always treatment coding with the \strong{first factor level} as base; to change
+always treatment coding with the \strong{first factor level} with rows as base
+(unused levels are dropped, as in \code{lm} and lme4); to change
 the base, \code{relevel()} the factor (a \code{contrasts} argument is deliberately
 absent). Anything that would silently mean something else - an ordered
 factor, a factor with its own \code{contrasts} attribute, or the unordered slot
@@ -258,7 +264,9 @@ Python port so the two ports agree.
 as a warning of class \code{"fastglmm_diagnostic"} with a per-kind subclass
 (\code{"fastglmm_ill_conditioned"}, \code{"fastglmm_pirls_exhausted"},
 \code{"fastglmm_single_level_grouping_dropped"},
-\code{"fastglmm_few_rows_for_random_effects"}, \code{"fastglmm_hessian_se_fallback"},
+\code{"fastglmm_few_rows_for_random_effects"}, \code{"fastglmm_repeated_grouping"},
+\code{"fastglmm_slope_constant_within_levels"}, \code{"fastglmm_separated_by_grouping"},
+\code{"fastglmm_hessian_se_fallback"},
 \code{"fastglmm_se_unavailable"}, \code{"fastglmm_exact_profile_fallback"},
 \code{"fastglmm_gradient_search_fallback"},
 \code{"fastglmm_precision_limited"}, \code{"fastglmm_non_integer_response"}, \code{"fastglmm_rows_dropped_na"},

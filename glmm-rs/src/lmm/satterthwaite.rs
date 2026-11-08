@@ -111,6 +111,11 @@ pub(crate) enum DerivRoute {
 /// (all `p` columns unless [`SatterthwaiteState::retained`] says otherwise),
 /// with the column standardization and the fixed-effect orthogonalization
 /// mapped out.
+///
+/// The free θ coordinates are in the kernel's order, which differs from the
+/// order the groupings were written in when glmm makes the grouping with the
+/// most levels the primary; the df and the contrast tests use them only in
+/// sums over all coordinates, so the order does not change any result.
 #[derive(Clone, Debug)]
 pub(crate) struct SatterthwaiteState {
     /// `A_eff = 2·blockdiag(H_p⁺, τ̂²/ν)` over `(θ_free, τ)`, `n_free + 1`

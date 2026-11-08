@@ -124,6 +124,7 @@ wide model to the sparse solver.
 | A column in two terms on one grouping (e.g. `(1 \| g) + (1 + x \| g)`, or `(1 + x \| g) + (0 + f \| g)` with a factor `f`) | Clear error naming the column and the grouping | Put each column in one term: `(1 + x + f \| g)` or `(x + f \|\| g)` |
 | `\|\|` or `zerocorr()` on a nested or crossed grouping (`(x \|\| a/b)`, `(x \|\| a:b)`) | Clear parse error | Not available: a random slope on `a/b` or `a:b` is not supported either; only a random intercept, `(1 \| a/b)` or `(1 \| a:b)` |
 | A random slope on an interaction or nested grouping (`(1 + x \| a:b)`, `(x \| a/b)`) | Clear parse error naming the term | Not available: only a random intercept, `(1 \| a:b)` or `(1 \| a/b)` |
+| An interaction as a random slope (`(x:z \| g)`, `(x*z \| g)`) | Clear parse error naming the term | Compute the product as a column (`xz = x * z`) and use `(xz \| g)` |
 | A grouping of three or more factors (`(1 \| a/b/c)`, `(1 \| a:b:c)`) | Clear parse error naming the term | Not available: a grouping takes at most two factors, `a:b` or `a/b` |
 | A random-effect term written right after a name (`foo(1 \| g)`, or `zerocor(1 + x \| g)` misspelling `zerocorr`) | Clear parse error naming the term | Put a `+` between the name and the term, or fix the spelling |
 | `zerocorr(0 + f \| g)` on a factor `f` | Clear error: the K − 1 coding cannot write it | `zerocorr(1 + f \| g)` |
@@ -138,7 +139,11 @@ reinterpretation of the formula.
 ## Factor coding
 
 Factors are coded with treatment contrasts: the base level is the column's
-**first level**. A plain string column carries no declared order, so it is
+**first level**. A level with no rows is dropped first, as R's model frame does
+for `lm`, `glm` and lme4 (`drop.unused.levels = TRUE`), so the base is the first
+level that has rows. This holds for a fixed factor and a factor slope alike.
+`predict` refuses new data with a dropped level, as a level the fit did not
+see. A plain string column carries no declared order, so it is
 sorted lexicographically — the same rule R's `factor()` uses. A
 `pandas.Categorical` (Python) or an R `factor()` with an explicit level order
 keeps that order, and its first level becomes the base.

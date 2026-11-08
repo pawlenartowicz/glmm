@@ -72,7 +72,10 @@ pub struct OlsFitView<'a> {
     pub df_resid: u32,
     /// `false` on the `n <= p || p == 0` early-return path; all other fields are then unreliable.
     pub converged: bool,
-    /// `‖y − X β̂‖²`. `NaN` on every non-converged / rank-deficient return.
+    /// `‖y − X β̂‖²`, summed from the rows when the kernel was given them
+    /// (the stable route), else the closed form `y′y − β̂′X′y` from the
+    /// running sums (the streaming `fit_suff_stats_t_sq`). `NaN` on every
+    /// non-converged / rank-deficient return.
     pub rss: f64,
     /// `Σ (yᵢ − ȳ)²`. `NaN` on every non-converged / rank-deficient return.
     /// Computed from the `sum_y` / `yty` running sums.
@@ -492,6 +495,7 @@ pub fn fit_suff_stats_t_sq<'a>(
         scratch,
         ColumnScaling::IDENTITY,
         None,
+        None,
     )
 }
 
@@ -504,6 +508,11 @@ pub fn fit_suff_stats_t_sq<'a>(
 /// Gram is well conditioned where `X`'s is not. The factor and β come back
 /// mapped to `X` — `L = Uᵀ·L̃`, `β = U⁻¹·β̃` — so the view reads as if `X`
 /// itself had been factored, with `X`'s digits kept.
+///
+/// `rows`: `(x, y)`, the `n × p` design and length-`n` response the
+/// statistics were accumulated from, before any `U⁻¹` transform. With
+/// `Some`, the RSS is summed from their residuals at β after the `qr`
+/// mapping; with `None` it is the closed form from the running sums.
 #[expect(
     clippy::too_many_arguments,
     reason = "sufficient-statistics kernel; each arg is a distinct precomputed input"
@@ -519,6 +528,7 @@ pub(crate) fn fit_suff_stats_t_sq_mapped<'a>(
     scratch: OlsScratch<'a>,
     map: &ColumnScaling,
     qr: Option<&crate::lmm::DesignQr>,
+    rows: Option<(MatRef<'_, f64>, &[f64])>,
 ) -> OlsFitView<'a> {
     let p = xty.len();
     let t = target_indices.len();
@@ -617,17 +627,23 @@ pub(crate) fn fit_suff_stats_t_sq_mapped<'a>(
         fit_betas[j] = fit_rhs[(j, 0)];
     }
 
-    // RSS = y'y - β̂' · X'y. Closed form — no residual sweep needed.
-    let mut bty = 0.0;
-    for j in 0..p {
-        bty += fit_betas[j] * xty[j];
-    }
-    let rss = yty - bty;
-    // β̃'X̃'y = β'X'y, so the RSS above needs no mapping; β and the factor do.
+    // β̃'X̃'y = β'X'y, so the closed form needs no mapping; β and the factor do.
+    let bty: f64 = (0..p).map(|j| fit_betas[j] * xty[j]).sum();
     if let Some(qr) = qr {
         qr.map_beta(&mut fit_betas[..p]);
         qr.map_factor(fit_factor.rb_mut().submatrix_mut(0, 0, p, p));
     }
+    // RSS = ‖y − Xβ̂‖², summed from the rows when given: the closed form
+    // y'y − β̂'X'y cancels when y is far from 0 next to its residuals.
+    let rss = match rows {
+        Some((x, y)) => (0..n)
+            .map(|i| {
+                let r = y[i] - (0..p).map(|j| x[(i, j)] * fit_betas[j]).sum::<f64>();
+                r * r
+            })
+            .sum(),
+        None => yty - bty,
+    };
     let (pivot, pivot_col) = min_pivot_ratio(fit_factor.rb(), p);
     let df_resid = (n - p) as u32;
     let sigma_sq = rss / df_resid as f64;

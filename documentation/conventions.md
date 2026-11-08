@@ -21,9 +21,14 @@ model carries the printed note "p-values can be somewhat anticonservative." See
 that minimizes them: BOBYQA, or BFGS on the per-group route (random slopes on
 the only grouping factor).
 
-A Gaussian model without random effects (OLS) has the same estimates on both
-criteria. Its log-likelihood is the ML one by default and the REML one, as R's
-`logLik(lm, REML = TRUE)`, under `reml = Some(true)`. Every other family is
+A Gaussian model without random effects (OLS), without weights or with a
+fixed weight power, has the same estimates on both criteria. Its
+log-likelihood is the ML one by default and the REML one, as R's
+`logLik(lm, REML = TRUE)`, under `reml = Some(true)`. Where the default
+weight power is estimated (a Gaussian fit with weights), `None` and
+`Some(true)` estimate it by REML and `Some(false)` takes the weights as given
+(power 1), so the estimates differ; an explicit `WeightPower::Estimate` under
+`Some(false)` estimates the power by ML. Every other family is
 fitted by maximum likelihood; `reml = Some(true)` there is ignored (the Python
 and R surfaces warn).
 
@@ -271,7 +276,7 @@ pull the numbers back out (see `tutorial-r.md` §3).
 ## Factor coding
 
 Factors are coded with treatment contrasts, base level = the column's first
-level. See [`formula.md#factor-coding`](formula.md#factor-coding) for how the
+level that has rows. See [`formula.md#factor-coding`](formula.md#factor-coding) for how the
 base level is determined for string, factor, and categorical columns across
 the three language surfaces.
 
@@ -284,8 +289,9 @@ detail.
 
 - A search that stopped at its evaluation budget (`MaxFunReached`) still
   reports coefficients, `se`, `vcov`, `dispersion`, `tau2` and `varcorr` at
-  the best point found (the plateau policy). `stddev_se`, `fitted` and the
-  random-effect modes stay empty regardless. `df` is 0 for a GLMM at that
+  the best point found (the plateau policy). `stddev_se` is NaN, one entry
+  per vech element, and `fitted` and the random-effect modes stay empty
+  regardless. `df` is 0 for a GLMM at that
   endpoint (the AIC/BIC identity does not apply there); an LMM at the same
   endpoint reports its usual nonzero `df`.
 - Every other non-converged path (a degenerate configuration, a failed step,

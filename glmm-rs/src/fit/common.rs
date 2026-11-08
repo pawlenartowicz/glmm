@@ -59,6 +59,8 @@ pub struct FitDiagnostics {
     /// back-derived from its `Fit::singular`.
     pub boundary_hit: u8,
     /// Bitmask of θ components pinned to the boundary, `diagonal_theta` order.
+    /// `FitView::diagnostics` reports it in the caller's declaration order, as
+    /// `FitView::theta`.
     /// **Meaningless on OLS/GLM and on the GLM-NB route** (no θ): always 0.
     pub pinned_components: u64,
     /// Scale-invariant per-column pivot ratio of the route's own Gram
@@ -955,6 +957,17 @@ impl Perm {
         }
     }
 
+    /// The per-index form of [`Perm::swap_slots`], for a reader that holds one
+    /// grouping index (a profile coordinate's block, a mask bit) instead of a
+    /// vector. The same call converts either way.
+    pub(crate) fn map_index(&self, i: usize) -> usize {
+        match self.swapped_extra {
+            Some(k) if i == 0 => k + 1,
+            Some(k) if i == k + 1 => 0,
+            _ => i,
+        }
+    }
+
     /// Same map for a concatenation of variable-width per-grouping blocks —
     /// [`Fit::ranef`], the one grouping-indexed output whose blocks are wider
     /// than one entry. `widths` must be in the SAME order as `v` currently is;
@@ -964,7 +977,8 @@ impl Perm {
         let Some(k) = self.swapped_extra else {
             return;
         };
-        if widths.is_empty() {
+        // `widths` (the level counts) is filled even when `v` is not.
+        if v.is_empty() {
             return;
         }
         let mut starts = Vec::with_capacity(widths.len());
@@ -1269,10 +1283,17 @@ fn unfittable_random_slope_fit(
     n: usize,
     p: usize,
     model: &ModelSpec,
+    ids: &GroupIds,
     aliased: &[bool],
     opts: &FitOptions,
 ) -> Fit {
     let criterion = resolve_criterion(model, opts);
+    // The level counts the fitted routes report. The size rule never reorders
+    // here: it moves intercept-only models, and this one has a random slope.
+    let (sized, _, _) = spec_sized_from_ids(model, ids);
+    let (slope_cols, extra_slope_cols) = super::glmm::re_slope_cols(model);
+    let groupings =
+        crate::lmm::LmmGroupings::from_cluster_spec_ext(&sized, &slope_cols, &extra_slope_cols);
     // `theta_width` less column 0 of each block without a random intercept:
     // the fitted routes' `LmmGroupings::drop_hidden` width, from the spec
     // alone, as no groupings exist on this return.
@@ -1323,7 +1344,7 @@ fn unfittable_random_slope_fit(
         },
         fitted: vec![],
         ranef: vec![],
-        ranef_levels: vec![],
+        ranef_levels: ranef_level_counts(&groupings),
         condvar: vec![],
         condvar_x: vec![],
         condvar_cross: None,
@@ -1376,7 +1397,7 @@ pub(super) fn fit_rank_deficient(
     opts: &FitOptions,
     aliased: &[bool],
 ) -> Fit {
-    let Design { x, n, p, .. } = data.design;
+    let Design { x, n, p, ids, .. } = data.design;
     let kept: Vec<usize> = (0..p).filter(|&j| !aliased[j]).collect();
     let pk = kept.len();
     debug_assert!(
@@ -1392,7 +1413,8 @@ pub(super) fn fit_rank_deficient(
     // slope makes the model unfittable, and there is no point paying for the
     // O(n·pk) copy to discover that.
     let Some(model_r) = remap_spec_slopes(model, &to_reduced, pk) else {
-        return unfittable_random_slope_fit(n, p, model, aliased, opts);
+        let no_ids = GroupIds::default();
+        return unfittable_random_slope_fit(n, p, model, ids.unwrap_or(&no_ids), aliased, opts);
     };
     // Reduced design (drop aliased columns), row-major.
     let mut xr = vec![0.0f64; n * pk];
@@ -1488,6 +1510,10 @@ pub(super) fn fit_rank_deficient(
             | Note::NonIntegerResponse { .. }
             | Note::SingleLevelGroupingDropped { .. }
             | Note::FewRowsForRandomEffects { .. }
+            | Note::SingleLevelGrouping { .. }
+            | Note::RepeatedGrouping { .. }
+            | Note::SlopeConstantWithinLevels { .. }
+            | Note::SeparatedByGrouping { .. }
             | Note::ExactProfileFallback
             | Note::GradientSearchFallback
             | Note::SeUnavailable
@@ -1683,6 +1709,12 @@ pub(crate) fn validate(
     start: Option<&StartValues>,
     opts: &FitOptions,
 ) -> Result<(WeightPower, SeType), FitError> {
+    // Here and not in `validate_design`: a predict of zero new rows is legal.
+    if data.design.n == 0 {
+        return Err(FitError::Shape(
+            "Data has no rows (n = 0); a fit needs at least one row".into(),
+        ));
+    }
     validate_design(&data.design, spec, opts.nagq, true)?;
     if let (Some(re), Some(ids)) = (spec.re.as_ref(), data.design.ids) {
         // First: `check_nested_ids` sizes a buffer by the largest primary id.
@@ -1797,7 +1829,7 @@ pub(crate) fn validate_design(
         weights,
         offset,
     } = design;
-    if x.len() != n * p {
+    if n.checked_mul(p) != Some(x.len()) {
         return Err(FitError::Shape(
             "x must have n*p elements in row-major layout".into(),
         ));
@@ -1810,7 +1842,7 @@ pub(crate) fn validate_design(
         )));
     }
     let z = re.unwrap_or(&[]);
-    if z.len() != n * s {
+    if n.checked_mul(s) != Some(z.len()) {
         return Err(FitError::Shape(
             "re_columns must have n*s elements in row-major layout".into(),
         ));
@@ -2207,9 +2239,10 @@ pub(crate) fn re_only_count(slopes: impl IntoIterator<Item = usize>, p: usize) -
 
 /// One block's terms against its `slopes` (see [`ReStructure::terms`]): every
 /// term non-empty, the intercept in at most one term and that term first, no
-/// column in two terms, and `slopes` the terms' columns concatenated, which
-/// is the order `LmmGroupings` assigns block columns to terms in. Empty
-/// `terms` passes. `grouping` names the block in the error.
+/// column in two terms, `slopes` the terms' columns concatenated, which
+/// is the order `LmmGroupings` assigns block columns to terms in, and no
+/// column twice in `slopes`. Empty `terms` passes the term checks.
+/// `grouping` names the block in the error.
 fn check_terms(slopes: &[ColumnId], terms: &[ReTerm], grouping: &str) -> Result<(), FitError> {
     let refuse = |why: String| Err(FitError::Shape(format!("{grouping}: {why}").into()));
     for (j, t) in terms.iter().enumerate() {
@@ -2231,7 +2264,160 @@ fn check_terms(slopes: &[ColumnId], terms: &[ReTerm], grouping: &str) -> Result<
             "slopes {slopes:?} are not the terms' columns in term order"
         ));
     }
+    // A repeated column would make a covariance block over two copies of it.
+    if let Some((_, c)) = (slopes.iter().enumerate()).find(|&(j, c)| slopes[..j].contains(c)) {
+        return refuse(format!("slope column {c} is repeated"));
+    }
     Ok(())
+}
+
+/// The random-effect structures these data cannot identify, as notes:
+/// [`Note::SingleLevelGrouping`], [`Note::RepeatedGrouping`],
+/// [`Note::SlopeConstantWithinLevels`] and [`Note::SeparatedByGrouping`]
+/// (their docs give the exact conditions), ordered by grouping index, then in
+/// that kind order. A level is a distinct id of the grouping's id vector; a
+/// nested id already includes its parent. Values are compared with `==`.
+/// Reads only the data and the spec, so no estimate depends on it. Empty on
+/// a fixed-only spec.
+pub(super) fn identification_notes(design: &Design<'_>, y: &[f64], spec: &ModelSpec) -> Vec<Note> {
+    let (Some(re), Some(ids), true) = (spec.re.as_ref(), design.ids, design.n > 0) else {
+        return Vec::new();
+    };
+    let Design { x, n, p, s, .. } = *design;
+    let blocks: Vec<(&[u32], &[ColumnId], &[ReTerm])> =
+        std::iter::once((&ids.primary[..], &re.slopes[..], &re.terms[..]))
+            .chain(
+                (re.extra_groupings.iter().zip(&ids.extra))
+                    .map(|(g, id)| (&id[..], &g.slopes[..], &g.terms[..])),
+            )
+            .collect();
+    // `validate_design` refuses a slope index past `p + s`, so an index at or
+    // past `p` has random-effect-only columns to read.
+    let value = |c: ColumnId, i: usize| match (c as usize).checked_sub(p) {
+        None => x[i * p + c as usize],
+        Some(j) => design.re.expect("a slope index past p reads re_columns")[i * s + j],
+    };
+    let tri = |m: usize| m * (m + 1) / 2;
+    let mut notes = Vec::new();
+    for (g, &(gid, slopes, terms)) in blocks.iter().enumerate() {
+        let grouping = g as u32;
+        if gid.iter().all(|&l| l == gid[0]) {
+            notes.push(Note::SingleLevelGrouping { grouping });
+        }
+        let intercept = !crate::lmm::block_hidden(terms);
+        for (h, &(hid, h_slopes, h_terms)) in blocks.iter().enumerate().skip(g + 1) {
+            let shared = (intercept && !crate::lmm::block_hidden(h_terms))
+                || slopes.iter().any(|c| h_slopes.contains(c));
+            if shared && same_partition(gid, hid) {
+                notes.push(Note::RepeatedGrouping {
+                    first: grouping,
+                    second: h as u32,
+                });
+            }
+        }
+        // Without a random intercept a slope constant within levels is a
+        // random intercept with a per-level scale, which is identified; the
+        // separation argument below needs the intercept too.
+        if !intercept {
+            continue;
+        }
+        let width = gid.iter().max().map_or(0, |&m| m as usize + 1);
+        let mut first_row = vec![usize::MAX; width];
+        for (i, &l) in gid.iter().enumerate() {
+            if first_row[l as usize] == usize::MAX {
+                first_row[l as usize] = i;
+            }
+        }
+        let first = |i: usize| first_row[gid[i] as usize];
+        let constant: Vec<usize> = (0..slopes.len())
+            .filter(|&k| (0..n).all(|i| value(slopes[k], i) == value(slopes[k], first(i))))
+            .collect();
+        if !constant.is_empty() {
+            // The level effects' variance is Σ_t v_t'Σ_t v_t, with v_t the
+            // values of term t's intercept (1) and constant slopes, so each
+            // level gives one equation in the products v_t,a·v_t,b (a ≤ b), and
+            // the covariance entries are not all identified when they
+            // outnumber the distinct product vectors. One unstructured block
+            // is one term; there the products are as distinct as v itself.
+            // Under split terms only the products count: x = ±1 per level in
+            // `(1 + x || g)` gives σ0² + σ1² on every level.
+            let members: Vec<Vec<Option<usize>>> = if terms.is_empty() {
+                vec![std::iter::once(None)
+                    .chain(constant.iter().map(|&k| Some(k)))
+                    .collect()]
+            } else {
+                (terms.iter())
+                    .map(|t| {
+                        (t.intercept.then_some(None).into_iter())
+                            .chain(
+                                (constant.iter())
+                                    .filter(|&&k| t.slopes.contains(&slopes[k]))
+                                    .map(|&k| Some(k)),
+                            )
+                            .collect()
+                    })
+                    .collect()
+            };
+            let at = |m: Option<usize>, r: usize| m.map_or(1.0, |k| value(slopes[k], r));
+            let mut vectors: Vec<Vec<f64>> = (first_row.iter().filter(|&&r| r != usize::MAX))
+                .map(|&r| {
+                    (members.iter())
+                        .flat_map(|m| {
+                            (0..m.len()).flat_map(move |a| {
+                                (a..m.len()).map(move |b| at(m[a], r) * at(m[b], r))
+                            })
+                        })
+                        .collect()
+                })
+                .collect();
+            // `validate_design` refuses a non-finite value, so the order is total.
+            vectors.sort_by(|a, b| a.partial_cmp(b).expect("finite values"));
+            vectors.dedup();
+            let parameters: usize = members.iter().map(|m| tri(m.len())).sum();
+            if vectors.len() < parameters {
+                notes.push(Note::SlopeConstantWithinLevels {
+                    grouping,
+                    slopes: constant.iter().map(|&k| k as u32).collect(),
+                });
+            }
+        }
+        // A level of one Bernoulli trial gains nothing as the variance grows
+        // (its marginal success probability is all that the variance moves),
+        // so separation needs some level with more than one trial: two rows,
+        // or one row of an aggregated response whose weight is its trials.
+        let several_trials = || {
+            let mut trials = vec![0.0; width];
+            for (i, &l) in gid.iter().enumerate() {
+                trials[l as usize] += design.weights.map_or(1.0, |w| w[i]);
+            }
+            trials.iter().any(|&t| t > 1.0)
+        };
+        // A response constant over all rows is `ConstantResponse`'s case, not
+        // separation through this grouping.
+        if matches!(spec.family, Family::Binomial { .. })
+            && y.iter().all(|&v| v == 0.0 || v == 1.0)
+            && y.iter().any(|&v| v != y[0])
+            && (0..n).all(|i| y[i] == y[first(i)])
+            && several_trials()
+        {
+            notes.push(Note::SeparatedByGrouping { grouping });
+        }
+    }
+    notes
+}
+
+/// Whether two id vectors put the rows into the same groups: a one-to-one
+/// map between their ids, consistent over every row.
+fn same_partition(a: &[u32], b: &[u32]) -> bool {
+    let width = |ids: &[u32]| ids.iter().max().map_or(0, |&m| m as usize + 1);
+    let (mut ab, mut ba) = (vec![u32::MAX; width(a)], vec![u32::MAX; width(b)]);
+    a.iter().zip(b).all(|(&u, &v)| {
+        let (u, v) = (u as usize, v as usize);
+        if ab[u] == u32::MAX && ba[v] == u32::MAX {
+            (ab[u], ba[v]) = (v as u32, u as u32);
+        }
+        ab[u] == v as u32 && ba[v] == u as u32
+    })
 }
 
 /// Fills `dst[0..n, 0..p]` from row-major `x` (n·p, unweighted). Factored out

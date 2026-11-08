@@ -38,7 +38,8 @@ chi-squared test, also a Poisson model with random effects, whose default
 \link[=anova.fastglmm]{anova()} rows are likelihood-ratio rows. A non-zero entry
 on an aliased coefficient gives an \code{NA} row and a note; an \code{L} whose rows
 span fewer directions than it has rows is tested on those directions,
-with a note. There is no likelihood-ratio test here: that is \code{\link[=compare]{compare()}}.
+with a note. An \code{L} that is zero on every coefficient gets df 0 and a
+note. There is no likelihood-ratio test here: that is \code{\link[=compare]{compare()}}.
 
 On a robust fit (\verb{$se_type} \code{"robust"}) an \code{L} of one row is the robust
 test, the robust t squared on its df, with \code{satterthwaite = FALSE} too; it

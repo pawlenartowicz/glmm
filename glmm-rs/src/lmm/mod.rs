@@ -1191,6 +1191,27 @@ impl LmmKernel {
         (self.groupings().k_total + m) as f64 * f64::EPSILON * c[(m - 1, m - 1)]
     }
 
+    /// The REML deviance's rounding from the pivots of X̃′V⁻¹X̃, read off the
+    /// X̃ factor (before `map_factor_to_design`): pivot j is a difference of
+    /// Gram terms known to about `(k_total + m)·ε·C_jj` (`C` the accumulated
+    /// `[X̃ y]′Ŵ[X̃ y]`), and `ln L_jj²` enters the REML deviance, so its error
+    /// is that over `L_jj²`. Under ML the pivots enter the deviance only
+    /// through β̂, so 0 there.
+    pub(crate) fn pivot_noise(&self) -> f64 {
+        if self.criterion() != Criterion::Reml {
+            return 0.0;
+        }
+        let c = match self {
+            LmmKernel::Dense { suff, .. } => &suff.c,
+            LmmKernel::Sparse { ws, .. } => &Self::sparse_ws(ws).cxy,
+        };
+        let (m, f) = (c.nrows(), self.factor());
+        let u = (self.groupings().k_total + m) as f64 * f64::EPSILON;
+        (0..m - 1)
+            .map(|j| u * c[(j, j)] / (f[(j, j)] * f[(j, j)]))
+            .sum()
+    }
+
     /// The criterion the deviance evaluates, frozen at the workspace build.
     pub(crate) fn criterion(&self) -> Criterion {
         match self {
@@ -2522,6 +2543,9 @@ pub struct LmmFit {
     /// alone: the driver's stop, its gradient count and the endpoint decrement
     /// `½·gᵀHg`. Kept when BOBYQA finished the fit after it.
     pub(crate) grad_report: Option<(crate::optim::bfgs::BfgsStop, usize, f64)>,
+    /// The REML deviance's rounding from the pivots of X̃′V⁻¹X̃
+    /// ([`LmmKernel::pivot_noise`]) at θ̂; 0 under ML and without an endpoint.
+    pub(crate) pivot_noise: f64,
 }
 
 /// Joint Wald-χ² statistic over the target set `T`,
@@ -2995,6 +3019,7 @@ pub fn fit_lmm(
     // augmented factor is index p): the conditional-mode recovery works on X̃.
     // Then the factor maps to `[X y]`, which is what the pivot, Var(β̂) and the
     // joint Wald below read.
+    let mut pivot_noise = 0.0;
     if dev.is_finite() {
         let factor = kernel.factor();
         for j in (0..p).rev() {
@@ -3004,6 +3029,7 @@ pub fn fit_lmm(
             }
             recovery.beta_tilde[j] = acc / factor[(j, j)];
         }
+        pivot_noise = kernel.pivot_noise();
         kernel.map_factor_to_design();
     }
 
@@ -3053,6 +3079,7 @@ pub fn fit_lmm(
             pivot_col: pivot_col as u32,
             gradient_search_fallback,
             grad_report,
+            pivot_noise: 0.0,
         };
     }
 
@@ -3126,6 +3153,7 @@ pub fn fit_lmm(
         pivot_col: pivot_col as u32,
         gradient_search_fallback,
         grad_report,
+        pivot_noise,
     }
 }
 

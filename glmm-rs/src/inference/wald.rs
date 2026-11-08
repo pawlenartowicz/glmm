@@ -11,7 +11,7 @@
 
 use faer::Mat;
 
-use super::contrast::{ContrastF, ContrastNote, NoDfReason};
+use super::contrast::{unit_rows, ContrastF, ContrastNote, NoDfReason};
 use super::evd::psd_pseudo_inverse;
 use super::reference::{DenDf, Reference};
 use super::tails::chisq_upper_p;
@@ -123,9 +123,11 @@ pub enum LinearNote {
 /// columns tested (a fit that did not converge, or a target subset) gives a
 /// NaN statistic, `num_df` and p-value, `reference` `ChiSquared { df: 0 }`
 /// and no note. Rank 0 (`L V Lᵀ` with no positive eigenvalue, as when `L` is
-/// zero on every column tested) gives statistic `0.0`, `num_df` `0.0`,
+/// zero on every column tested) gives a NaN statistic, `num_df` `0.0`,
 /// `reference` `ChiSquared { df: 0 }`, a NaN p-value and
-/// [`LinearNote::RankDeficientL`] with `rank` 0.
+/// [`LinearNote::RankDeficientL`] with `rank` 0. Each row of `L` is scaled
+/// by `unit_rows` before `L V Lᵀ` is formed, which leaves `W` and its df
+/// unchanged and keeps `L V Lᵀ` in range at any scale of a row.
 ///
 /// # Panics
 ///
@@ -170,6 +172,7 @@ pub(crate) fn wald_chisq(
         return untested(notes);
     }
     let kept: Vec<usize> = (0..p).filter(|&j| !aliased[j]).collect();
+    let (l, _) = unit_rows(l, p);
     let row = |i: usize| &l[i * p..(i + 1) * p];
     let lb: Vec<f64> = (0..rows)
         .map(|i| kept.iter().map(|&j| row(i)[j] * beta[j]).sum())
@@ -210,7 +213,7 @@ pub(crate) fn wald_chisq(
         notes.push(LinearNote::RankDeficientL { rank, rows });
     }
     LinearTest {
-        statistic,
+        statistic: if rank == 0 { f64::NAN } else { statistic },
         kind: LinearKind::ChiSquared,
         num_df: rank as f64,
         reference: Reference::ChiSquared { df: rank },

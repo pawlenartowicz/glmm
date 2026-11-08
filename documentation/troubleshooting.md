@@ -60,8 +60,8 @@ that always comes with it (exactly one is raised on every non-converged fit):
 - **A budget stop on an LMM or GLMM** (`search_limit`): the search used its
   evaluation budget before settling. Coefficients, standard errors, the
   covariance matrix, dispersion, `tau2` and `varcorr` are all reported at the
-  best point the search found. `stddev_se`, `fitted` and the random-effect
-  modes stay empty; a GLMM's `df` is 0 (an LMM's is its usual value, since the
+  best point the search found. `stddev_se` is NaN, one entry per vech
+  element, and `fitted` and the random-effect modes stay empty; a GLMM's `df` is 0 (an LMM's is its usual value, since the
   budget stop does not change how many parameters it counted). Nothing checks
   how close that point is to the optimum.
 - **A failed fit** (`fit_failed`, `glm_diverged`, `design_unsolvable`,

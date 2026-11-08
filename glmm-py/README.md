@@ -84,7 +84,7 @@ memory depends only on the shape of the model. So refitting the same model on
 new data, as in a power simulation or a bootstrap, needs no new memory. Each
 refit can also start from the previous answer.
 
-The search also needs few steps. Its settings were tuned on the 923 test models
+The search also needs few steps. Its settings were tuned on the 947 test models
 and kept only where they cut the number of steps without changing any result.
 With a cheap exact gradient it needs even fewer.
 

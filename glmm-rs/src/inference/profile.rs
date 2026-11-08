@@ -25,7 +25,7 @@
 use std::fmt;
 
 use super::tails::normal_quantile;
-use crate::fit::{detect_aliased, fit_cold_keep_workspace, validate};
+use crate::fit::{detect_aliased, fit_cold_keep_workspace, validate, Perm};
 use crate::lmm::profile::{ProfileKernel, VarCoord};
 use crate::{ColumnId, Data, Design, Family, Fit, FitError, FitOptions, ModelSpec, ReTerm};
 
@@ -129,11 +129,30 @@ impl fmt::Display for ProfileError {
             ProfileError::NotConverged => {
                 f.write_str("the maximum-likelihood fit the profiles start from did not converge")
             }
-            ProfileError::BetterOptimum { param, drop } => write!(
-                f,
-                "profiling {param:?} found a deviance {drop} below the maximum-likelihood fit's: the fit is not at its optimum"
-            ),
+            ProfileError::BetterOptimum { param, drop } => {
+                f.write_str(&better_optimum_message(&describe_param(param), *drop))
+            }
         }
+    }
+}
+
+/// [`ProfileError::BetterOptimum`]'s message, `what` naming the parameter;
+/// the ports name it by its row name instead.
+pub(crate) fn better_optimum_message(what: &str, drop: f64) -> String {
+    format!(
+        "profiling {what} found a deviance {drop} below the maximum-likelihood fit's: the fit is not at its optimum"
+    )
+}
+
+/// A parameter in words, with the 0-based indices of [`ProfileParam`].
+fn describe_param(p: &ProfileParam) -> String {
+    match *p {
+        ProfileParam::Sigma => "the residual SD (sigma)".to_owned(),
+        ProfileParam::Sd { group, term } => format!("the SD of column {term} of grouping {group}"),
+        ProfileParam::Cor { group, row, col } => {
+            format!("the correlation of columns {row} and {col} of grouping {group}")
+        }
+        ProfileParam::Beta(j) => format!("coefficient {j}"),
     }
 }
 
@@ -291,13 +310,14 @@ pub(crate) fn profile_params(spec: &ModelSpec, p: usize) -> Vec<ProfileParam> {
 
 /// The parameter of each of the kernel's coordinates. `hidden[b]` marks a
 /// block without an intercept, whose idle column 0 the kernel keeps and the
-/// reported block drops.
-pub(super) fn coord_params(coords: &[VarCoord], hidden: &[bool]) -> Vec<ProfileParam> {
+/// reported block drops. `group` is the kernel's slot `block` mapped through
+/// `perm` into declaration order; `hidden` stays in slot order.
+pub(super) fn coord_params(coords: &[VarCoord], hidden: &[bool], perm: Perm) -> Vec<ProfileParam> {
     coords
         .iter()
         .map(|&c| match c {
             VarCoord::Sd { block, row, .. } => ProfileParam::Sd {
-                group: block,
+                group: perm.map_index(block),
                 term: row - usize::from(hidden[block]),
             },
             VarCoord::Cor {
@@ -305,7 +325,7 @@ pub(super) fn coord_params(coords: &[VarCoord], hidden: &[bool]) -> Vec<ProfileP
             } => {
                 let h = usize::from(hidden[block]);
                 ProfileParam::Cor {
-                    group: block,
+                    group: perm.map_index(block),
                     row: row - h,
                     col: col - h,
                 }
@@ -371,6 +391,7 @@ pub(crate) fn profile_on(
             l.len() as f64
         })
         .collect();
+    let perm = fws.perm();
     let (ws, map) = fws
         .lmm_parts()
         .expect("a Gaussian mixed fit runs on the LMM workspace");
@@ -378,12 +399,24 @@ pub(crate) fn profile_on(
     let hidden = ws.kernel.groupings().hidden.clone();
     let mut k = ProfileKernel::new(ws, map);
     let coords = k.coords().to_vec();
-    let var_params = coord_params(&coords, &hidden);
-    assert!(
-        params.starts_with(&var_params) && params.len() == var_params.len() + p,
-        "the kernel's coordinates label their rows {var_params:?}, the spec's parameters are \
-         {params:?}"
-    );
+    let var_params = coord_params(&coords, &hidden, perm);
+    let mismatch = || {
+        format!(
+            "the kernel's coordinates label their rows {var_params:?}, the spec's parameters are \
+             {params:?}"
+        )
+    };
+    assert!(params.len() == var_params.len() + p, "{}", mismatch());
+    // The kernel's coordinate index of each row, the rows in declaration order.
+    let order: Vec<usize> = params[..var_params.len()]
+        .iter()
+        .map(|q| {
+            var_params
+                .iter()
+                .position(|v| v == q)
+                .unwrap_or_else(|| panic!("{}", mismatch()))
+        })
+        .collect();
 
     let z = normal_quantile(0.5 * (1.0 + level));
     let est = k.estimate();
@@ -402,7 +435,8 @@ pub(crate) fn profile_on(
     };
 
     let mut rows = Vec::new();
-    for (i, (&coord, &param)) in coords.iter().zip(&var_params).enumerate() {
+    for &i in &order {
+        let (coord, param) = (coords[i], var_params[i]);
         if !wanted(&param) {
             continue;
         }
@@ -412,7 +446,7 @@ pub(crate) fn profile_on(
             VarCoord::Sd { block, .. } => {
                 let lower = side(Toward::Limit(0.0))?;
                 let upper = if e > 0.0 {
-                    let h = z / (2.0 * level_counts[block]).sqrt();
+                    let h = z / (2.0 * level_counts[perm.map_index(block)]).sqrt();
                     side(Toward::Expand(&|t| (e.ln() + h * t).exp()))?
                 } else {
                     side(Toward::Expand(&|t| sigma_hat * t / 8.0))?

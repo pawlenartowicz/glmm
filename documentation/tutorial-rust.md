@@ -329,7 +329,8 @@ it. Weights and offsets may change from call to call.
 What it does **not** do is validate your data. `fit_with_start` checks start-value
 lengths, weight and offset lengths and finiteness (returning a `FitError`), and it drops rank-deficient
 fixed-effect columns and refits. `fit_on` does none of that — it trusts the
-caller. A `StartValues.beta` or `StartValues.theta` of the wrong width is
+caller. A `StartValues.beta` or `StartValues.theta` of the wrong width or with
+a non-finite entry, or a `dispersion` that is not finite and positive, is
 dropped without an error, and that part cold-starts. A weights vector longer
 than `n` is accepted and skews the LMM deviance and log-likelihood; non-finite
 weights or offsets turn the fit into NaN, and the GLMM route panics on a length mismatch instead. Check these once

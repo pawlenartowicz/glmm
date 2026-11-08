@@ -948,6 +948,15 @@ test_that("pairwise() columns follow the family", {
   expect_identical(out[length(out)], "P value adjustment: holm method for 3 tests")
 })
 
+test_that("pairwise on a fit that did not converge carries the note", {
+  set.seed(3)
+  x <- rnorm(60)
+  d <- data.frame(y = as.numeric(x > 0), x = x, f = factor(rep(c("a", "b", "c"), 20)))
+  fit <- suppressWarnings(fastglmm(y ~ f + x, d, family = binomial()))
+  expect_false(fit$converged)
+  expect_identical(attr(pairwise(fit, "f"), "footer")[1], fastglmm:::.NOT_CONVERGED)
+})
+
 test_that("pairwise() passes adjust, by and at to the crate", {
   d <- anova_data()
   m <- fastglmm(y ~ x + f + (1 | g), d)

@@ -181,6 +181,13 @@ pub(crate) fn fit_record(r: FitResult, family: &str, link: &str, row_base: usize
         })
         .collect();
     let lrt = |t: &Option<Result<TermTable, String>>| t.as_ref().map_or(Value::Null, term_record);
+    // The ports promise the `varcorr` vech layout with NaN where the fit
+    // gives no standard error; the kernel leaves it empty on LMM, OLS and GLM.
+    let stddev_se = if r.stddev_se.is_empty() {
+        vec![f64::NAN; r.varcorr.iter().map(Vec::len).sum()]
+    } else {
+        r.stddev_se
+    };
     Value::Record(
         Record::new()
             .with("beta", Value::Vec(r.beta))
@@ -188,7 +195,7 @@ pub(crate) fn fit_record(r: FitResult, family: &str, link: &str, row_base: usize
             .with("vcov", vecs(r.vcov))
             .with("tau2", Value::Vec(r.tau2))
             .with("varcorr", vecs(r.varcorr))
-            .with("stddev_se", Value::Vec(r.stddev_se))
+            .with("stddev_se", Value::Vec(stddev_se))
             .with("aliased", Value::BoolVec(r.aliased))
             .with("dispersion", Value::F64(r.dispersion))
             .with("converged", Value::Bool(r.converged))

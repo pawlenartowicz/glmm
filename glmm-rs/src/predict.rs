@@ -125,7 +125,9 @@ pub struct Prediction {
 /// GLM column the fit could not separate ([`Note::SeUnavailable`]). There
 /// [`Fit::fitted`] keeps that column at its start value instead, so on the
 /// training rows the two differ when that start was not zero, as after
-/// [`crate::fit_with_start`].
+/// [`crate::fit_with_start`]. A fit with no estimates (every coefficient NaN:
+/// a fit that stopped before estimating anything, such as too few rows or a
+/// degenerate design) predicts NaN, with a NaN standard error and NaN bounds.
 ///
 /// The link-scale standard error is lme4 2.0.6's `predict(se.fit = TRUE)`
 /// form, from the joint covariance of `(b̂, β̂)` at the fitted variance
@@ -429,14 +431,20 @@ pub(crate) fn predict_parts(
     let mut d = vec![0.0f64; p];
     let mut z = Vec::new();
     let mut touched = Vec::new();
+    // A fit with no finite coefficient returned no estimates; the zero rule
+    // below is for aliased and broken-down columns of a fit that has some.
+    let no_estimates = parts.beta.iter().all(|b| b.is_nan());
     for i in 0..n {
         let row = &x[i * p..(i + 1) * p];
-        let xb: f64 = row
-            .iter()
-            .zip(parts.beta)
-            .filter(|(_, b)| !b.is_nan())
-            .map(|(v, b)| v * b)
-            .sum();
+        let xb: f64 = if no_estimates {
+            f64::NAN
+        } else {
+            row.iter()
+                .zip(parts.beta)
+                .filter(|(_, b)| !b.is_nan())
+                .map(|(v, b)| v * b)
+                .sum()
+        };
         let mut eta = xb + offset.map_or(0.0, |o| o[i]);
         d.copy_from_slice(row);
         let mut var_b = 0.0f64;
@@ -484,7 +492,7 @@ pub(crate) fn predict_parts(
             var_b += cross.variance(&blocks, &touched, &z);
         }
         let se_link = need_se.then(|| {
-            let mut quad = 0.0f64;
+            let mut quad = if no_estimates { f64::NAN } else { 0.0 };
             for (j, &dj) in d.iter().enumerate() {
                 if parts.beta[j].is_nan() {
                     continue;

@@ -230,6 +230,50 @@ fn a_fit_without_a_dispersion_is_refused() {
     ));
 }
 
+/// A row with η ≤ 0 on the Gamma inverse or inverse-Gaussian 1/μ² link has
+/// no mean in the family's range, so it draws NaN rather than a draw at the
+/// clamped μ (about 1e75 on the Gamma); a row with η > 0 draws as before.
+#[test]
+fn a_reciprocal_link_row_with_eta_at_or_below_zero_draws_nan() {
+    let lcg = crate::fit::common_tests::lcg;
+    for (family, power) in [
+        (
+            Family::Gamma {
+                link: GammaLink::Inverse,
+            },
+            -1.0,
+        ),
+        (
+            Family::InverseGaussian {
+                link: InverseGaussianLink::InverseSquared,
+            },
+            -0.5,
+        ),
+    ] {
+        let mut s = 3u64;
+        let n = 40;
+        let x: Vec<f64> = (0..n).flat_map(|i| [1.0, 0.1 * i as f64]).collect();
+        let y: Vec<f64> = (0..n)
+            .map(|i| (0.5 + 0.01 * i as f64).powf(power) * (1.0 + 0.1 * lcg(&mut s)))
+            .collect();
+        let spec = ModelSpec::fixed(family);
+        let fit = crate::fit(
+            &crate::Data::new(&x, &y, n, 2),
+            &spec,
+            &crate::FitOptions::default(),
+        )
+        .unwrap();
+        let (b0, b1) = (fit.beta[0], fit.beta[1]);
+        assert!(b0 > 0.0 && b1 != 0.0, "{family:?}: {b0} {b1}");
+        let rows = [1.0, 0.0, 1.0, -2.0 * b0 / b1];
+        let d = Simulator::new(&fit, &spec, &Design::new(&rows, 2, 2))
+            .unwrap()
+            .simulate(1, 0);
+        assert!(d[0].is_finite() && d[0] > 0.0, "{family:?}: {}", d[0]);
+        assert!(d[1].is_nan(), "{family:?}: {}", d[1]);
+    }
+}
+
 /// The Monte Carlo check of the draws against the fitted model's moments.
 #[cfg(feature = "montecarlo-tests")]
 mod montecarlo {

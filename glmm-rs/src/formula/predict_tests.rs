@@ -61,7 +61,7 @@ fn new_table_levels_are_matched_by_label() {
     let k = levels.len() as u32;
     levels.reverse();
     codes.iter_mut().for_each(|c| *c = k - 1 - *c);
-    let rows = lower_new(formula, &lo, &reversed).unwrap();
+    let rows = lower_new(formula, &lo, &reversed, false).unwrap();
     assert_eq!(rows.x, lo.x, "reversed levels");
 
     // A subset of the levels: the rows without `g = a`, and the rows with
@@ -71,7 +71,7 @@ fn new_table_levels_are_matched_by_label() {
         let table = csv_rows(FACTORIAL, &factors, |l| {
             subset.contains(&column(l).as_str())
         });
-        let rows = lower_new(formula, &lo, &table).unwrap();
+        let rows = lower_new(formula, &lo, &table, false).unwrap();
         let mut expected = Vec::new();
         for (i, line) in FACTORIAL.lines().skip(1).enumerate() {
             if subset.contains(&column(line).as_str()) {
@@ -87,7 +87,7 @@ fn new_table_levels_are_matched_by_label() {
     let (levels, codes) = factor_mut(&mut unseen, "g");
     levels.push("z".to_string());
     codes[5] = levels.len() as u32 - 1;
-    match lower_new(formula, &lo, &unseen) {
+    match lower_new(formula, &lo, &unseen, false) {
         Err(e @ Error::Fit(FitError::Shape(_))) => {
             let Error::Fit(FitError::Shape(m)) = &e else {
                 unreachable!()
@@ -107,12 +107,20 @@ fn new_table_levels_are_matched_by_label() {
         ),
     }
 
-    // So is a level the fit declared but had no row of: its column is aliased,
-    // and reading it as 0 would predict the base level.
+    // So is a level the fit declared but had no row of: the lowering dropped it.
     let mut declared = csv_table(FACTORIAL, &factors);
     factor_mut(&mut declared, "g").0.push("z".to_string());
     let lo_declared = lower(formula, &declared, Family::Gaussian).unwrap();
-    match lower_new(formula, &lo_declared, &unseen) {
+    // The fit dropped "z", so its lowering is the plain one, and a new table
+    // that declares "z" with no row of it predicts as before.
+    assert_eq!(lo_declared.col_names, lo.col_names);
+    assert_eq!(
+        lower_new(formula, &lo_declared, &declared, false)
+            .unwrap()
+            .x,
+        lo.x
+    );
+    match lower_new(formula, &lo_declared, &unseen, false) {
         Err(Error::Fit(FitError::Shape(m))) => {
             assert!(m.contains("\"z\"") && m.contains("row 5"), "{m}");
         }
@@ -139,7 +147,7 @@ fn new_table_levels_are_matched_by_label() {
         n: 4,
     };
     let lo_ab = lower("y ~ 1 + (1 | A:B)", &ab, Family::Gaussian).unwrap();
-    match lower_new("y ~ 1 + (1 | A:B)", &lo_ab, &ab) {
+    match lower_new("y ~ 1 + (1 | A:B)", &lo_ab, &ab, false) {
         Err(Error::Fit(FitError::Shape(m))) => {
             assert!(m.contains("\"a:b:c\"") && m.contains("row 0"), "{m}");
             assert_eq!(m.row(), Some(0));
@@ -201,6 +209,59 @@ fn new_table_levels_are_matched_by_label() {
         "{:?}",
         pred.notes
     );
+}
+
+/// Population mode reads no grouping column and no column used only in a
+/// random slope: a table with one of two crossed groupings predicts what a
+/// table with neither does, and a slope-only variable may be absent.
+#[test]
+fn population_prediction_reads_no_grouping_column() {
+    const CROSSED: &str = include_str!("../../../validation/data/simulated/lmm_crossed.csv");
+    let pop = PredictOptions {
+        population: true,
+        ..PredictOptions::default()
+    };
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    let m = model(
+        CROSSED,
+        &["g1", "g2"],
+        "y ~ x + (1 | g1) + (1 | g2)",
+        Family::Gaussian,
+    );
+    let x = || ("x".into(), Column::Numeric(vec![0.1, 0.5, 0.9]));
+    let ta = Table {
+        columns: vec![
+            x(),
+            (
+                "g1".into(),
+                Column::factor_from_labels(&labels(&["1", "2", "3"])),
+            ),
+        ],
+        n: 3,
+    };
+    let t0 = Table {
+        columns: vec![x()],
+        n: 3,
+    };
+    let pa = predict(&m, &ta, &pop).unwrap();
+    let p0 = predict(&m, &t0, &pop).unwrap();
+    assert_eq!(bits(&pa.fit), bits(&p0.fit));
+
+    let m = model(
+        SLEEP,
+        &["Subject"],
+        "Reaction ~ 1 + (Days | Subject)",
+        Family::Gaussian,
+    );
+    let subject_only = Table {
+        columns: vec![(
+            "Subject".into(),
+            Column::factor_from_labels(&labels(&["308", "372"])),
+        )],
+        n: 2,
+    };
+    let p = predict(&m, &subject_only, &pop).unwrap();
+    assert_eq!(p.fit, vec![m.fit().beta()[0]; 2]);
 }
 
 #[test]
@@ -281,7 +342,7 @@ fn offset_and_transforms_on_new_data() {
         ],
         n: 3,
     };
-    let rows = lower_new(m.formula(), lo, &new).unwrap();
+    let rows = lower_new(m.formula(), lo, &new, false).unwrap();
     let expected_x: Vec<f64> = x.iter().flat_map(|&v| [1.0, v, v * v]).collect();
     assert_eq!(rows.x, expected_x);
     assert_eq!(rows.offset.as_deref(), Some(&exposure[..]));
@@ -312,7 +373,7 @@ fn formula_predict_equals_the_matrix_door() {
     );
     let lo = m.lowered();
     let table = csv_table(SLEEP, &["Subject"]);
-    let rows = lower_new(m.formula(), lo, &table).unwrap();
+    let rows = lower_new(m.formula(), lo, &table, false).unwrap();
     assert_eq!(rows.x, lo.x);
     assert_eq!(rows.ids.as_ref(), Some(&lo.ids));
     let mut cases = 0;

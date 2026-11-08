@@ -1094,9 +1094,11 @@ pub struct GlmmWorkspace {
     /// `se::joint_hessian_cov` swaps it with `prior_w` for its duration, so the
     /// SE engines see the fixed-φ̂ GLMM they differentiate.
     pub(crate) prior_w_phi: Vec<f64>,
-    /// True iff `prior_w` was filled from `Data::weights`. Selects between
-    /// the two logit arms of `simd_transcendental::family_pass`: the fused
-    /// `Σ log1pexp` deviance identity holds only for unweighted Bernoulli rows.
+    /// True iff weights were given (`prior_w` filled from `Data::weights`),
+    /// or the response is binomial with a value other than 0 and 1 (set by
+    /// `fit::glmm::run_glmm_on`, `prior_w` then all 1). Selects between the
+    /// two logit arms of `simd_transcendental::family_pass`: the fused
+    /// `Σ log1pexp` deviance identity holds only for unweighted 0/1 rows.
     pub(crate) weighted: bool,
     /// `s` of the `ŵ = w/s` a weighted Gamma fit stores in `prior_w`
     /// (`family::weight_scale`, set per fit by `fit::glmm::prep_glmm_design`);

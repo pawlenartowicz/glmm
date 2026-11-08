@@ -25,6 +25,7 @@ own page.
 | `isSingular(fit)` | `isSingular(fit)` — boundary-fit flag, lme4's condition, computed by the kernel | `fit.singular` |
 | `ranef(fit)`, `ranef(fit, condVar = TRUE)` | `ranef(fit)` — named list of data frames, one per grouping, rows named by level, with lme4's `postVar` attribute (terms × terms × levels) unless `condVar = FALSE` | `fit.ranef_blocks` — a list of `{group, terms, levels, values, postvar, condsd}`, `values` an `(n_levels, n_terms)` array, `postvar` an `(n_levels, n_terms, n_terms)` array and `condsd` its diagonal's square roots, the two `None` on a fit that forms no conditional variances (not a DataFrame; the package's only dependency is numpy) |
 | `fitted(fit)` | `fitted(fit)` — named numeric vector over the model frame's rows | `fit.fitted` — `(n,)` array |
+| `deviance(fit)` | `deviance(fit)`: as lme4 2.0-6, `lm` and `glm`: `-2 * logLik` on an ML Gaussian mixed model; on a REML one the REML criterion with a warning (`REML = TRUE` and `REML = FALSE`, which in lme4 give the ML deviance at the REML estimates, are errors; `-2 * logLik(fit)` gives the criterion without a warning); elsewhere the sum of squared deviance residuals at the conditional mean, the weighted residual sum of squares on OLS | no counterpart: `fit.deviance` is the optimizer criterion |
 | `predict(fit, newdata, re.form, type, allow.new.levels, se.fit)` | `predict(fit, newdata, re.form = NULL, type = "link", allow.new.levels = TRUE, se.fit = FALSE, level = 0.95, future = FALSE)`: a named vector, or with `se.fit` or `future` a list of `fit`, `se.fit`, `lower`, `upper`, `future.lower`, `future.upper`; `re.form` takes `NULL` or `NA` only | `fit.predict(newdata, type="link", re_form=None, allow_new_levels=True, se_fit=False, level=0.95, future=False)`: an array, or a dict of arrays; `re_form="NA"` for the fixed effects only |
 | `simulate(fit, nsim, seed)` | `simulate(fit, nsim = 1, seed = NULL)`: a data frame `sim_1`, …, on the model frame's rows | `fit.simulate(nsim=1, seed=None)`: an `(nobs, nsim)` array |
 | `performance::r2_nakagawa(fit)`, `performance::icc(fit)` | `r2(fit)` gives a named vector with `marginal` and `conditional`, `icc(fit)` one with `adjusted` and `unadjusted`; `summary(fit)` prints the marginal and conditional R² and the adjusted ICC in one line. Computed when called, as performance computes them (on a GLMM the lognormal approximation only), for all groupings together, not per grouping. On a Poisson or negative binomial GLMM each `r2()` or `icc()` call refits the null model once, and `summary()` prints a line that points to them instead of the values. `r2()` and `icc()` are plain functions, not methods: when both packages are attached, the one attached last wins, so call `fastglmm::r2()` and `fastglmm::icc()` | `fit.r2()` gives `{"marginal": .., "conditional": ..}`, `fit.icc()` gives `{"adjusted": .., "unadjusted": ..}`; the same line in `fit.summary()` |
@@ -159,7 +160,8 @@ four oracles (lme4, glmmTMB, MixedModels.jl, GLMMadaptive).
 - **A model with no more observations than random effects is fitted.** lme4
   stops on such a fit by default (`check.nobs.vs.nRE = "stop"`; for example a
   random intercept and slope on two observations per subject); glmm fits it
-  and says nothing. The model is weakly identified there; see
+  and raises the `few_rows_for_random_effects` caution (see
+  [`warnings.md`](warnings.md)). The model is weakly identified there; see
   [`validation.md`](validation.md#what-is-gated).
 - All reported standard errors are Wald, not profile or bootstrap — see
   [`conventions.md`](conventions.md#flags-on-the-result) for how the
@@ -217,9 +219,8 @@ four oracles (lme4, glmmTMB, MixedModels.jl, GLMMadaptive).
   two levels, but `predict()` cannot tell them apart and gives both the
   conditional mode of one of them. Avoid `:` in such labels.
 - **A variable used only in a random slope** (`y ~ 1 + (x | g)`) is read from
-  `newdata` whenever `newdata` has a grouping column, also with
-  `re.form = NA`, where it does not change the prediction. Without any of the
-  grouping columns it is not needed.
+  `newdata` in conditional mode only; with `re.form = NA` neither it nor any
+  grouping column is needed.
 - **`future = TRUE` gives bounds for a future observation**, which lme4 does
   not offer: on a non-Gaussian mixed model, the family's quantiles mixed over
   the uncertainty of the linear predictor (`se.fit`), on the response scale.

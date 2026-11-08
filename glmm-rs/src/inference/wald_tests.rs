@@ -218,14 +218,14 @@ fn near_duplicate_rows_split_at_the_rank_threshold() {
 }
 
 /// A non-finite `V` entry among the columns tested: not tested, no note.
-/// `L` zero on every column tested: rank 0, statistic 0 and a NaN p-value.
+/// `L` zero on every column tested: rank 0, a NaN statistic and p-value.
 #[test]
 fn nonfinite_vcov_and_rank_zero_outcomes() {
     let name = "anova_linear_hypothesis_glm_gamma";
     let d = test_refs::load(Kind::Anova, name);
     let (beta, mut vcov) = fit_numbers(&d, name);
     let t = wald_chisq(&beta, &vcov, &[false; 3], &[0.0; 3], 1);
-    assert_eq!(t.statistic, 0.0);
+    assert!(t.statistic.is_nan());
     assert_eq!(t.num_df, 0.0);
     assert_eq!(t.reference, Reference::ChiSquared { df: 0 });
     assert!(t.p_value.is_nan());
@@ -239,6 +239,27 @@ fn nonfinite_vcov_and_rank_zero_outcomes() {
     assert!(t.statistic.is_nan() && t.num_df.is_nan() && t.p_value.is_nan());
     assert_eq!(t.reference, Reference::ChiSquared { df: 0 });
     assert!(t.notes.is_empty(), "{:?}", t.notes);
+}
+
+/// Scaling `L` leaves the statistic and df unchanged; `L V Lᵀ` must not
+/// overflow at 1e160 or underflow at 1e-160.
+#[test]
+fn wald_chisq_is_invariant_to_scaling_l() {
+    let name = "anova_linear_hypothesis_glm_gamma";
+    let d = test_refs::load(Kind::Anova, name);
+    let (beta, vcov) = fit_numbers(&d, name);
+    let l = [0.0, 1.0, 0.0, 0.0, 1.0, 1.0];
+    let want = wald_chisq(&beta, &vcov, &[false; 3], &l, 2);
+    assert!(want.statistic.is_finite() && want.num_df == 2.0, "{want:?}");
+    for c in [1e160, 1e-160] {
+        let lc: Vec<f64> = l.iter().map(|v| v * c).collect();
+        let got = wald_chisq(&beta, &vcov, &[false; 3], &lc, 2);
+        assert!(
+            (got.statistic - want.statistic).abs() <= 1e-12 * want.statistic,
+            "{c}: {got:?} against {want:?}"
+        );
+        assert_eq!(got.num_df, want.num_df, "{c}");
+    }
 }
 
 /// An aliased column's β̂ and vcov entries are NaN on a fit and are never

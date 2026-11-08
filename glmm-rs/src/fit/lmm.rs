@@ -243,8 +243,12 @@ impl LmmResultView<'_> {
             // `ν·ln σ̂²` to about floor/σ̂²: past the GLMM's bound when the
             // residuals are tiny against y′Wy (weights spanning ~1e16, or a
             // near-exact fit), where θ̂ stops wherever the search meets the floor.
+            // REML adds the X̃′V⁻¹X̃ pivots' rounding (`pivot_noise`), a Gram
+            // difference too, which r² alone misses (a random intercept at
+            // large θ, where the intercept's pivot cancels).
             precision_limited: self.fit.sigma_sq.is_finite()
-                && self.kernel.r_sq_floor() > crate::glmm::DEVIANCE_FLOOR_MAX * self.fit.sigma_sq,
+                && self.kernel.r_sq_floor() + self.fit.pivot_noise * self.fit.sigma_sq
+                    > crate::glmm::DEVIANCE_FLOOR_MAX * self.fit.sigma_sq,
             // No IRLS on the Gaussian LMM path.
             separated: false,
             gradient_search_fallback: self.fit.gradient_search_fallback,

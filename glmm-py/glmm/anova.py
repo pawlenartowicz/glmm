@@ -237,7 +237,8 @@ class PairwiseTable(_Table):
     with emmeans' column names: `contrast` ("a - b"), the `by` variable when
     given, `estimate`, `SE`, `df` (Inf on a z test), `t.ratio` or `z.ratio`,
     `p.value` (adjusted), and on a log or logit link `odds.ratio` or `ratio`
-    and its `ratio.SE`. The notes under the table name the adjustment. Its
+    and its `ratio.SE`. The notes under the table name the adjustment, after
+    a note saying so when the fit did not converge. Its
     `confint(level=0.95)` is a `PairwiseTable` of the confidence intervals:
     `contrast`, the `by` variable, `estimate`, `lower.CL`, `upper.CL`, and on a
     log or logit link the ratio with `ratio.lower.CL` and `ratio.upper.CL`.
@@ -345,9 +346,10 @@ def _pairwise_notes(stored):
     return out
 
 
-def _pairwise_table(stored, z):
+def _pairwise_table(stored, z, converged):
     """The `PairwiseTable` of the native `pairwise`'s columns; `z` says the rows
-    are z tests (a fit with `df_method` "none")."""
+    are z tests (a fit with `df_method` "none"), `converged` whether the fit
+    converged."""
     factor, by = stored["factor"], stored["by"]
     values = {"contrast": list(stored["contrast"])}
     if by is not None:
@@ -366,7 +368,11 @@ def _pairwise_table(stored, z):
         values["ratio.SE"] = np.asarray(stored["ratio_se"], dtype=float)
     heading = f"Pairwise comparisons of {factor}" + ("" if by is None else f" by {by}")
     adjust = _adjust_line(stored, stored["adjust"], intervals=False)
-    notes = ([adjust] if adjust is not None else []) + _pairwise_notes(stored)
+    notes = (
+        ([] if converged else [_NOT_CONVERGED])
+        + ([adjust] if adjust is not None else [])
+        + _pairwise_notes(stored)
+    )
     rows = [str(i + 1) for i in range(len(stored["contrast"]))]
     return PairwiseTable(values, rows, heading, notes, stored)
 
@@ -699,10 +705,9 @@ def compare(
     for f in (f0, f1):
         if not isinstance(f, str):
             raise TypeError(f"glmm.compare takes two formula strings, got {_type_name(f)}")
-    resolved = _check_call(f0, family, link)
+    family, link = _check_call(f0, family, link)
     _check_call(f1, family, link)
-    link = resolved
-    _check_nagq(nagq)
+    nagq = _check_nagq(nagq)
     _check_draws(nsim, seed)
     store = []
     numeric_columns, factor_columns, weights, offset, row_index = _prepare_columns(

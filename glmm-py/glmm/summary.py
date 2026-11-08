@@ -530,7 +530,9 @@ class Summary(Rendered):
                     keys,
                     [
                         [
-                            fmt(self.criterion[k], 5) if k != "df.resid" else str(self.criterion[k])
+                            fmt(self.criterion[k], 5)
+                            if k != "df.resid"
+                            else fmt_df(self.criterion[k])
                             for k in keys
                         ]
                     ],

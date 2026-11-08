@@ -68,8 +68,8 @@ Points worth knowing at this layer:
   interaction, `A/B` to nesting, `(1 + x | g)` is a correlated random
   intercept + slope, and additional `(… | g2)` terms add crossed/nested
   grouping factors. Treatment contrasts (R's default) code the factors, based
-  on the column's **first level** — a `pandas.Categorical` uses the first
-  category you declare; a plain string column declares no order and is sorted
+  on the column's **first level** that has rows — a `pandas.Categorical` uses
+  the first category you declare that occurs in the data; a plain string column declares no order and is sorted
   by code point, as R's `factor()` does in the C locale. R in another locale
   can order labels that differ only in case (`"a"`, `"B"`) differently, so
   declare the order with a `pandas.Categorical` when the two must match.
@@ -161,9 +161,14 @@ fit = glmm.fit(data, "s ~ x1 + (1 | group)", "binomial", link="probit", nagq=7)
   prints the `AIC BIC logLik deviance df.resid` row in place of the REML
   criterion, and prints one line under the title: "Note: p-values can be
   somewhat anticonservative." On OLS (also when every grouping was dropped as
-  single-level) the estimates are the same under every value: `True` reports
-  the REML log-likelihood, as R's `logLik(lm, REML = TRUE)`, and `None` and
-  `False` the ML one. Every other family is fitted by maximum likelihood;
+  single-level) without weights, or with a fixed `weight_power`, the
+  estimates are the same under every value: `True` reports the REML
+  log-likelihood, as R's `logLik(lm, REML = TRUE)`, and `None` and `False`
+  the ML one. Where `weight_power=None` estimates the weight power, `None`
+  and `True` estimate it by REML (`fit.reml` is `True`, the log-likelihood is
+  the REML one) and `False` takes the weights as given (power 1), so the
+  estimates differ; `weight_power="estimate"` with `False` estimates the
+  power by ML. Every other family is fitted by maximum likelihood;
   `False` there changes nothing, and `True` is ignored with an
   `ArgumentIgnoredWarning`. `fit.reml` says which criterion `fit.loglik` is.
 - `anova_test`: when the likelihood-ratio tables of `glmm.anova` are made.
@@ -215,7 +220,7 @@ them). It is returned by `fit`, never constructed by callers.
 | `aic`, `bic` | properties, computed on every fit from `loglik`, `df` and `nobs`: `-2·loglik + 2·df` and `-2·loglik + df·ln(nobs)`. On a REML fit they compare only fits with the same fixed effects (see below) |
 | `fitted` | `(n,)` fitted means μ̂ per row; empty on non-converged fits |
 | `ranef` | random-effect conditional modes b̂, one block per grouping in `varcorr`/`re_groups` order, level-major; empty on non-converged fits — prefer `ranef_blocks` for the labelled form, and do not slice this array yourself |
-| `ranef_levels` | level count per grouping, for slicing `ranef`; empty exactly when `ranef` is |
+| `ranef_levels` | level count per grouping, for slicing `ranef`; filled on every fit with random effects, also one that did not converge, where `ranef` is empty |
 | `ranef_blocks` | the same conditional modes, labelled: a list of dicts per grouping (`group`, `terms`, `levels`, `values`); empty exactly when `ranef` is |
 | `converged` | numerical failure signals here (not an exception) — check before trusting `beta`/`se` |
 | `singular` | boundary (singular) fit — `>=1` RE variance component pinned at 0; mirrors lme4's `isSingular` |
@@ -333,6 +338,8 @@ vector and a `(q, q)` correlation matrix:
 ```python
 sd, corr = fit.stddev_corr(0)   # grouping 0: stddevs + correlation matrix
 ```
+
+On a fit that stopped before estimating anything (too few rows, a degenerate design) it raises `ValueError`.
 
 **Tests: `glmm.anova` and `glmm.compare`.** `glmm.anova(fit)` tests each
 fixed term of one fit and returns a `TermTable`. Two models are compared in one of two ways:

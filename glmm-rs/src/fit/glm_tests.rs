@@ -534,6 +534,19 @@ fn fit_glm_poisson_offset_matches_r() {
     }
 }
 
+/// `x1` and `y` of `fit_glm_poisson_weighted_matches_r` (R `set.seed(43)`).
+const POIS_W_X1: [f64; 40] = [
+    -0.0375, -1.5746, -0.486, 0.4652, -0.9041, -0.2774, 0.3864, -0.0604, -0.6862, -1.9061, 1.8038,
+    -0.9669, -0.3531, 1.1069, 0.5663, 2.0643, 1.4693, -1.6515, 0.2026, -0.721, -0.159, 0.7342,
+    -0.3633, -0.0101, 0.5828, -0.2933, -1.3944, -0.0851, -0.6881, -0.7765, 1.7442, 0.4566, -0.1182,
+    1.6754, -1.159, -0.0406, 1.0889, 1.5121, 0.8857, 0.3146,
+];
+const POIS_W_Y: [f64; 40] = [
+    1.0, 0.0, 1.0, 0.0, 1.0, 4.0, 2.0, 1.0, 2.0, 0.0, 1.0, 0.0, 0.0, 1.0, 2.0, 3.0, 1.0, 1.0, 2.0,
+    0.0, 2.0, 1.0, 2.0, 2.0, 2.0, 2.0, 0.0, 3.0, 1.0, 3.0, 7.0, 6.0, 1.0, 5.0, 0.0, 4.0, 2.0, 2.0,
+    3.0, 1.0,
+];
+
 /// Weighted Poisson(log) GLM vs R `glm(weights=)`. Prior weight multiplies the
 /// IRLS working weight and deviance the same way it does in the Gamma/NB arms
 /// (`fit_glm_gamma_weighted_matches_r`); φ stays fixed at 1.
@@ -544,22 +557,13 @@ fn fit_glm_poisson_weighted_matches_r() {
     //   y <- rpois(n, lambda = exp(0.3 + 0.5 * x1))
     //   fp <- glm(y ~ x1, family = poisson, weights = w)
     //   print(coef(summary(fp)), digits = 15); print(logLik(fp), digits = 15)
-    let x1: [f64; 40] = [
-        -0.0375, -1.5746, -0.486, 0.4652, -0.9041, -0.2774, 0.3864, -0.0604, -0.6862, -1.9061,
-        1.8038, -0.9669, -0.3531, 1.1069, 0.5663, 2.0643, 1.4693, -1.6515, 0.2026, -0.721, -0.159,
-        0.7342, -0.3633, -0.0101, 0.5828, -0.2933, -1.3944, -0.0851, -0.6881, -0.7765, 1.7442,
-        0.4566, -0.1182, 1.6754, -1.159, -0.0406, 1.0889, 1.5121, 0.8857, 0.3146,
-    ];
+    let x1 = POIS_W_X1;
     let w: Vec<f64> = vec![
         1.0, 1.0, 2.0, 3.0, 3.0, 1.0, 1.0, 4.0, 2.0, 4.0, 2.0, 1.0, 2.0, 3.0, 3.0, 1.0, 1.0, 1.0,
         3.0, 1.0, 1.0, 2.0, 4.0, 1.0, 1.0, 4.0, 2.0, 1.0, 4.0, 2.0, 4.0, 4.0, 1.0, 4.0, 2.0, 4.0,
         1.0, 3.0, 2.0, 3.0,
     ];
-    let y: Vec<f64> = vec![
-        1.0, 0.0, 1.0, 0.0, 1.0, 4.0, 2.0, 1.0, 2.0, 0.0, 1.0, 0.0, 0.0, 1.0, 2.0, 3.0, 1.0, 1.0,
-        2.0, 0.0, 2.0, 1.0, 2.0, 2.0, 2.0, 2.0, 0.0, 3.0, 1.0, 3.0, 7.0, 6.0, 1.0, 5.0, 0.0, 4.0,
-        2.0, 2.0, 3.0, 1.0,
-    ];
+    let y = POIS_W_Y.to_vec();
     const REF_BETA: [f64; 2] = [0.543560457232364, 0.506189423172992];
     const REF_SE: [f64; 2] = [0.0863317392574266, 0.0761557350301788];
     const REF_LOGLIK: f64 = -151.640748208627;
@@ -1459,6 +1463,73 @@ fn fit_glm_small_unit_weights_converge() {
     }
 }
 
+/// Uniform prior weights only rescale the log-likelihood, so β must not move.
+/// The relative stop's floor was a fixed 0.1 on binomial, Poisson and NB: at
+/// every weight 1e-12 it stopped binomial one pass early as `separated` and
+/// Poisson 2e-5 short; at 1e-100 Poisson and NB ended `separated` too.
+/// Fixture: `POIS_W_X1`/`POIS_W_Y`, binomial on `y ≥ 2`.
+#[test]
+fn fit_glm_tiny_uniform_weights_match_unit_weights() {
+    let n = 40;
+    let mut x = Vec::with_capacity(n * 2);
+    for &xi in &POIS_W_X1 {
+        x.extend_from_slice(&[1.0, xi]);
+    }
+    let y = POIS_W_Y.to_vec();
+    let yb: Vec<f64> = y.iter().map(|&v| f64::from(u8::from(v >= 2.0))).collect();
+    let cases = [
+        (
+            Family::Binomial {
+                link: BinomialLink::Logit,
+            },
+            &yb,
+        ),
+        (
+            Family::Poisson {
+                link: crate::PoissonLink::Log,
+            },
+            &y,
+        ),
+        (
+            Family::NegativeBinomial {
+                link: NegBinomialLink::Log,
+            },
+            &y,
+        ),
+    ];
+    let opts = FitOptions {
+        se_for: SeFor::Only(vec![0, 1]),
+        ..FitOptions::default()
+    };
+    for (family, y) in cases {
+        let model = ModelSpec { family, re: None };
+        let ids = GroupIds::default();
+        let base = fit_warm_wo(&x, y, n, 2, &model, &ids, None, None, None, &opts);
+        assert!(base.converged(), "{family:?} unweighted");
+        for w in [1e-12_f64, 1e-100] {
+            let weights = vec![w; n];
+            let f = fit_warm_wo(&x, y, n, 2, &model, &ids, None, Some(&weights), None, &opts);
+            assert!(f.converged(), "{family:?} w = {w:e}");
+            assert!(
+                !f.diagnostics
+                    .notes
+                    .iter()
+                    .any(|n| matches!(n, Note::Separated)),
+                "{family:?} w = {w:e}: {:?}",
+                f.diagnostics.notes
+            );
+            for j in 0..2 {
+                assert!(
+                    (f.beta[j] - base.beta[j]).abs() / base.beta[j].abs() < 1e-9,
+                    "{family:?} w = {w:e}: β[{j}] {} vs {}",
+                    f.beta[j],
+                    base.beta[j]
+                );
+            }
+        }
+    }
+}
+
 /// Log-link fits whose exposures differ by many decades between rows. The
 /// divergence guard and the cold seed are centred on the null model with the
 /// offset, oᵢ + ln(Σy / Σe^o); centred on ln ȳ alone, rows with exposure
@@ -1570,6 +1641,165 @@ fn fit_glm_log_link_offset_units_do_not_matter() {
             );
         }
     }
+}
+
+/// A Gamma or inverse-Gaussian log-link GLM with one large offset. Both are
+/// scale families, so an offset is the same model as `y·e^−o` without it
+/// (the equivalence `fit_glm_log_link_offset_units_do_not_matter` uses); the
+/// inverse-Gaussian deviance grows by `e^o` under that rescale, so its twin
+/// carries prior weights `e^−o`. One row at offset 10 put the null-model
+/// seed's other rows about 10 log units from their data, and both fits ran
+/// off (Gamma β ≈ 2e32), not converged.
+#[test]
+fn fit_glm_gamma_log_one_large_offset_converges() {
+    let (x, y, n) = sim_gamma_xy();
+    let families = [
+        Family::Gamma {
+            link: crate::GammaLink::Log,
+        },
+        Family::InverseGaussian {
+            link: crate::InverseGaussianLink::Log,
+        },
+    ];
+    let opts = FitOptions {
+        se_for: SeFor::Only(vec![0, 1, 2]),
+        ..FitOptions::default()
+    };
+    let ids = GroupIds::default();
+    for family in families {
+        let model = ModelSpec { family, re: None };
+        for o0 in [10.0_f64, 20.0, 30.0] {
+            let mut offset = vec![0.0; n];
+            offset[0] = o0;
+            let y_twin: Vec<f64> = (0..n).map(|i| y[i] * (-offset[i]).exp()).collect();
+            let w_twin: Vec<f64> = offset.iter().map(|o| (-o).exp()).collect();
+            let w_twin = matches!(family, Family::InverseGaussian { .. }).then_some(&w_twin[..]);
+            let base = fit_warm_wo(&x, &y_twin, n, 3, &model, &ids, None, w_twin, None, &opts);
+            assert!(base.converged(), "{family:?}, o = {o0}: twin");
+            let f = fit_warm_wo(&x, &y, n, 3, &model, &ids, None, None, Some(&offset), &opts);
+            assert!(
+                f.converged(),
+                "{family:?}, o = {o0}: {:?}",
+                f.diagnostics.notes
+            );
+            for j in 0..3 {
+                assert!(
+                    (f.beta[j] - base.beta[j]).abs() / base.beta[j].abs() < 1e-6,
+                    "{family:?}, o = {o0}: β[{j}] {} vs {}",
+                    f.beta[j],
+                    base.beta[j]
+                );
+            }
+        }
+    }
+}
+
+/// The `fit_glm_small_unit_weights_converge` fixture with no exposures and
+/// one large offset. From the null-model seed Poisson and NB ran off and
+/// ended `separated`. The check is the score equations at the reported fit:
+/// Poisson's `Σ xᵢⱼ(yᵢ − μ̂ᵢ)`, NB's `Σ xᵢⱼ(yᵢ − μ̂ᵢ)/(1 + μ̂ᵢ/θ̂)`. R's
+/// converged Poisson β, for orientation (`glm(..., epsilon = 1e-14)`,
+/// R 4.5.x): row 0, o 10: `−7.17743021732178, 8.66331611805285`; row 0, o 15:
+/// `−12.1183768668320, 13.9699224738506`; row 30, o 10:
+/// `−9.61390848702097, 10.9045584489792`.
+#[test]
+fn fit_glm_poisson_one_large_offset_converges() {
+    let n = 40;
+    let mut x = Vec::with_capacity(n * 2);
+    for i in 0..n {
+        x.extend_from_slice(&[1.0, ((i * 7) % 40) as f64 / 39.0]);
+    }
+    let mut y = vec![0.0f64; 30];
+    y.extend_from_slice(&[3.0, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0, 6.0, 5.0, 3.0]);
+    let s: f64 = y.iter().sum();
+    let families = [
+        Family::Poisson {
+            link: crate::PoissonLink::Log,
+        },
+        Family::NegativeBinomial {
+            link: NegBinomialLink::Log,
+        },
+    ];
+    let opts = FitOptions {
+        se_for: SeFor::Only(vec![0, 1]),
+        ..FitOptions::default()
+    };
+    let ids = GroupIds::default();
+    for family in families {
+        let model = ModelSpec { family, re: None };
+        for (row, o0) in [(0, 10.0_f64), (0, 15.0), (30, 10.0)] {
+            let mut offset = vec![0.0; n];
+            offset[row] = o0;
+            let f = fit_warm_wo(&x, &y, n, 2, &model, &ids, None, None, Some(&offset), &opts);
+            assert!(f.converged(), "{family:?}, row {row}, o = {o0}");
+            assert!(
+                !f.diagnostics
+                    .notes
+                    .iter()
+                    .any(|n| matches!(n, Note::Separated)),
+                "{family:?}, row {row}, o = {o0}: {:?}",
+                f.diagnostics.notes
+            );
+            let mu = f.fitted();
+            let shape = match family {
+                Family::NegativeBinomial { .. } => f.dispersion,
+                _ => f64::INFINITY,
+            };
+            for j in 0..2 {
+                let score: f64 = (0..n)
+                    .map(|i| x[i * 2 + j] * (y[i] - mu[i]) / (1.0 + mu[i] / shape))
+                    .sum();
+                assert!(
+                    score.abs() < 1e-8 * s,
+                    "{family:?}, row {row}, o = {o0}: score[{j}] = {score}"
+                );
+            }
+        }
+    }
+}
+
+/// The negative case of `fit_glm_poisson_one_large_offset_converges`: with a
+/// zero-count category (an indicator that is 1 exactly on rows 0..10, where
+/// every y is 0) the maximum is at infinity, so the fit must still end
+/// `separated` after a second start.
+#[test]
+fn fit_glm_poisson_zero_count_category_with_offset_stays_separated() {
+    let n = 40;
+    let mut x = Vec::with_capacity(n * 3);
+    for i in 0..n {
+        let ind = f64::from(u8::from(i < 10));
+        x.extend_from_slice(&[1.0, ((i * 7) % 40) as f64 / 39.0, ind]);
+    }
+    let mut y = vec![0.0f64; 30];
+    y.extend_from_slice(&[3.0, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0, 6.0, 5.0, 3.0]);
+    let mut offset = vec![0.0; n];
+    offset[0] = 10.0;
+    let f = fit_warm_wo(
+        &x,
+        &y,
+        n,
+        3,
+        &ModelSpec {
+            family: Family::Poisson {
+                link: crate::PoissonLink::Log,
+            },
+            re: None,
+        },
+        &GroupIds::default(),
+        None,
+        None,
+        Some(&offset),
+        &FitOptions::default(),
+    );
+    assert!(!f.converged());
+    assert!(
+        f.diagnostics
+            .notes
+            .iter()
+            .any(|n| matches!(n, Note::Separated)),
+        "{:?}",
+        f.diagnostics.notes
+    );
 }
 
 /// A Gamma GLM whose mean model reproduces the data exactly (constant `y`,
@@ -3965,4 +4195,79 @@ fn glm_fit_reports_nobs_and_maximum_likelihood() {
 fn golden_max_finds_the_maximum_inside_its_bracket() {
     let x = super::glm::golden_max(|x| -(x - 0.3).powi(2), -2.0, 2.0, 1e-4);
     assert!((x - 0.3).abs() < 1e-4, "{x}");
+}
+
+/// A fractional binomial response on `[1, x]`: n = 60 in 6 groups of 10,
+/// yᵢ = σ(0.3 + 0.8xᵢ + bₖ) + uᵢ clamped to [0.02, 0.98], with uᵢ uniform on
+/// (−0.05, 0.05) and bₖ uniform on (−1.5, 1.5). Every y is strictly inside
+/// (0, 1). Returns the rows, y and the group ids.
+pub(super) fn fractional_logit_data() -> (Vec<f64>, Vec<f64>, Vec<u32>) {
+    let mut s = 23u64;
+    let (mut x, mut y, mut g) = (vec![], vec![], vec![]);
+    for k in 0..6u32 {
+        let b = 1.5 * lcg(&mut s);
+        for _ in 0..10 {
+            let xi = lcg(&mut s);
+            let mu = 1.0 / (1.0 + (-(0.3 + 0.8 * xi + b)).exp());
+            x.extend([1.0, xi]);
+            y.push((mu + 0.05 * lcg(&mut s)).clamp(0.02, 0.98));
+            g.push(k);
+        }
+    }
+    (x, y, g)
+}
+
+/// The fused logit deviance `2·Σ(log1pexp(η) − yη)` is the deviance only on
+/// 0/1 rows: on a fractional y it lacks −2Σ[y ln y + (1−y) ln(1−y)], so the
+/// fit without weights must take the general arm and match `weights = 1`.
+/// The null deviance takes the same decision.
+#[test]
+fn fractional_logit_glm_matches_its_unit_weight_fit() {
+    use super::glm::{fit_glm_prebuilt, GlmScratchBuf};
+    let (x, y, _) = fractional_logit_data();
+    let (n, p) = (y.len(), 2);
+    let ones = vec![1.0; n];
+    let spec = ModelSpec::fixed(Family::Binomial {
+        link: BinomialLink::Logit,
+    });
+    let opts = FitOptions::default();
+    let a = crate::fit(&crate::Data::new(&x, &y, n, p), &spec, &opts).unwrap();
+    let b = crate::fit(&crate::Data::new(&x, &y, n, p).weights(&ones), &spec, &opts).unwrap();
+    assert!(
+        (a.loglik - b.loglik).abs() <= 1e-9 * b.loglik.abs(),
+        "{} vs {}",
+        a.loglik,
+        b.loglik
+    );
+    for j in 0..p {
+        assert!((a.beta[j] - b.beta[j]).abs() <= 1e-8 * b.beta[j].abs().max(1.0));
+    }
+
+    // `Fit::deviance` is NaN on a GLM: the deviances are read off the view.
+    let x_mat = super::common::to_col_major(&x, n, p);
+    let deviances = |w: Option<&[f64]>| {
+        let mut buf = GlmScratchBuf::new(n, p, p);
+        let view = fit_glm_prebuilt(
+            Family::Binomial {
+                link: BinomialLink::Logit,
+            },
+            f64::NAN,
+            x_mat.as_ref(),
+            &y,
+            w,
+            None,
+            &[0, 1],
+            &mut buf,
+            crate::standardize::ColumnScaling::IDENTITY,
+            None,
+        );
+        [view.deviance, view.deviance_null]
+    };
+    let (va, vb) = (deviances(None), deviances(Some(&ones)));
+    for k in 0..2 {
+        assert!(
+            (va[k] - vb[k]).abs() <= 1e-9 * vb[k].abs(),
+            "{va:?} vs {vb:?}"
+        );
+    }
 }

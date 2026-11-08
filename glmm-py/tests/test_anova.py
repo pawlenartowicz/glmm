@@ -875,6 +875,20 @@ def test_contrast_test_refuses_an_l_of_the_wrong_shape_or_not_finite(lmm):
             lmm.contrast_test(L)
 
 
+def test_contrast_test_zero_l_same_on_every_route(lmm, pois):
+    # The F (LMM, OLS) and Wald chi-squared (GLMM) routes agree on an all-zero L.
+    note = (
+        "contrast: The 1 tested coefficients span no direction of their covariance, so there "
+        "is nothing to test."
+    )
+    for m in (lmm, quiet_fit("y ~ x + f"), pois[0]):
+        tab = m.contrast_test(np.zeros((1, len(m.names))))
+        df, stat = ("NumDF", "F value") if "NumDF" in tab.columns else ("Df", "Chisq")
+        assert tab[df][0] == 0.0, tab.text()
+        assert np.isnan(tab[stat][0]), tab.text()
+        assert tab.notes == [note]
+
+
 # -- glmm.pairwise ----------------------------------------------------------------
 
 _PAIR_COLUMNS = ["contrast", "estimate", "SE", "df"]
@@ -901,6 +915,20 @@ def test_pairwise_columns_follow_the_family(lmm, pois):
     # The ratio is exp(estimate), on a log link.
     tab = glmm.pairwise(pois[0], "f")
     np.testing.assert_allclose(tab["ratio"], np.exp(tab["estimate"]), rtol=1e-15)
+
+
+def test_pairwise_on_a_fit_that_did_not_converge_carries_the_note():
+    rng = np.random.default_rng(3)
+    n = 60
+    f = np.array(["a", "b", "c"])[np.arange(n) % 3]
+    x = rng.normal(size=n)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        m = glmm.fit({"y": (x > 0).astype(float), "x": x, "f": f}, "y ~ f + x", "binomial")
+    assert not m.converged
+    from glmm.anova import _NOT_CONVERGED
+
+    assert glmm.pairwise(m, "f").notes[0] == _NOT_CONVERGED
 
 
 def test_pairwise_adjust_reaches_the_crate(lmm):

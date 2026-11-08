@@ -776,18 +776,23 @@ fn each_f_test_note_renders_its_numbers() {
     t.notes = vec![
         LinearNote::AliasedColumn { column: 2 },
         LinearNote::RankDeficientL { rank: 1, rows: 2 },
+        LinearNote::RankDeficientL { rank: 0, rows: 1 },
     ];
     let lines = c.note_lines();
-    assert_eq!(lines.len(), 2);
+    assert_eq!(lines.len(), 3);
     // Named by the larger fit's coefficient name, never an index.
     assert_eq!(
         lines[0],
         "The coefficient z is aliased, so the hypothesis was not tested."
     );
-    assert!(
-        lines[1].contains("The 2 tested coefficients span 1"),
-        "{}",
-        lines[1]
+    assert_eq!(
+        lines[1],
+        "The 2 tested coefficients span 1 directions of their covariance; the test is on those 1."
+    );
+    assert_eq!(
+        lines[2],
+        "The 1 tested coefficients span no direction of their covariance, so there is nothing to \
+         test."
     );
 }
 

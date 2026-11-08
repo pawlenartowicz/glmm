@@ -13,6 +13,7 @@ test_that("VarCorr returns SD/correlation-scale components for a slope model", {
   # The matrix itself is the covariance its attributes describe.
   sd <- attr(v, "stddev")
   corr <- attr(v, "correlation")
+  expect_identical(dimnames(corr), list(c("(Intercept)", "t"), c("(Intercept)", "t")))
   expect_equal(unname(sd), unname(sqrt(diag(v))), tolerance = 1e-12)
   expect_equal(corr[2, 1], v[2, 1] / (sd[[1]] * sd[[2]]), tolerance = 1e-12)
   # The vech -> SD/correlation math, against hand-computed values. A q = 2
@@ -278,6 +279,24 @@ test_that("print and summary on a non-mixed fit skip the random-effects block", 
   expect_false(grepl("groups:", sout, fixed = TRUE))
 })
 
+test_that("a failed mixed fit keeps the mixed title and the groups line, with no df.residual", {
+  set.seed(1)
+  d <- data.frame(y = 1, x = rnorm(60), g = factor(rep(1:6, each = 10)))
+  fit <- suppressWarnings(fastglmm(y ~ x + (1 | g), d))
+  expect_false(fit$converged)
+  s <- capture.output(summary(fit))
+  expect_identical(s[1], "Linear mixed model fit by REML [fastglmm] ")
+  expect_true(any(s == "Number of obs: 60, groups:  g, 6"))
+  expect_false(any(grepl("Random effects:", s, fixed = TRUE)))
+  p <- capture.output(print(fit))
+  expect_true(any(p == "Number of obs: 60, groups:  g, 6"))
+  expect_true(is.na(glance(fit)$df.residual))
+  # The ML criterion row's df.resid is NA, as in glance() and the Python port.
+  ml <- suppressWarnings(fastglmm(y ~ x + (1 | g), d, REML = FALSE))
+  df_resid <- summary(ml)$criterion[["df.resid"]]
+  expect_true(is.na(df_resid) && !is.nan(df_resid))
+})
+
 test_that("VarCorr correlations print at 2 dp", {
   d <- benchmark_data(seed = 101, family = "binomial",
                       tau0 = 0.8, tau1 = 0.5, rho = 0.3)
@@ -356,6 +375,25 @@ test_that("ranef and fitted return lme4-shaped values on a Gaussian LMM", {
   # better than the fixed part alone does.
   fixed_only <- fit$beta[[1]] + fit$beta[[2]] * t
   expect_lt(sum((y - fv)^2), sum((y - fixed_only)^2))
+})
+
+test_that("names after subset= and an NA drop follow the original rows on a tibble", {
+  skip_if_not_installed("tibble")
+  set.seed(4)
+  n <- 60
+  d <- data.frame(y = rnorm(n), x = rnorm(n), g = sample(paste0("G", 1:6), n, TRUE))
+  d$y[3] <- NA
+  m_df <- suppressWarnings(fastglmm(y ~ x + (1 | g), d, subset = x > 0))
+  m_tb <- suppressWarnings(fastglmm(y ~ x + (1 | g), tibble::as_tibble(d), subset = x > 0))
+  expect_identical(names(fitted(m_tb)), names(fitted(m_df)))
+  expect_identical(names(residuals(m_tb)), names(residuals(m_df)))
+  expect_identical(names(predict(m_tb)), names(predict(m_df)))
+  expect_identical(rownames(simulate(m_tb, seed = 1)), rownames(simulate(m_df, seed = 1)))
+  expect_identical(names(fitted(m_tb))[1], as.character(which(d$x > 0 & !is.na(d$y))[1]))
+  # A data.frame keeps its own row names.
+  rownames(d) <- paste0("r", seq_len(n))
+  m_rn <- suppressWarnings(fastglmm(y ~ x + (1 | g), d, subset = x > 0))
+  expect_identical(names(fitted(m_rn)), rownames(d)[which(d$x > 0 & !is.na(d$y))])
 })
 
 test_that("diagnostics is additive: the top-level names keep working", {
@@ -1005,6 +1043,42 @@ test_that("the summary of an OLS fit made with REML = TRUE prints the REML crite
   expect_false(grepl("AIC", sout, fixed = TRUE))
 })
 
+test_that("deviance() follows lme4, lm and glm", {
+  # GLMM and GLM: the sum of the family's unit deviances at the conditional
+  # mean, base R's dev.resids being the formula.
+  db <- benchmark_data(seed = 111, family = "poisson")
+  w <- rep(c(1, 4), length.out = nrow(db))
+  m <- fastglmm(y ~ t + (1 | g), db, family = poisson(), weights = w)
+  expect_equal(deviance(m), sum(poisson()$dev.resids(db$y, fitted(m), w)), tolerance = 1e-12)
+  expect_false(isTRUE(all.equal(deviance(m), m$deviance)))
+  gl <- fastglmm(y ~ t, db, family = poisson())
+  expect_equal(deviance(gl), sum(poisson()$dev.resids(db$y, fitted(gl), 1)), tolerance = 1e-12)
+  # Gaussian mixed: -2 logLik on ML; on REML the REML criterion, with a warning.
+  # lme4 reads REML = TRUE or FALSE there as the ML deviance at the REML
+  # estimates, which is not computed, so both are refused.
+  d <- lmm_data()
+  ml <- fastglmm(y ~ x + (1 | g), d, REML = FALSE)
+  expect_equal(deviance(ml), -2 * as.numeric(logLik(ml)))
+  reml <- fastglmm(y ~ x + (1 | g), d)
+  expect_warning(dv <- deviance(reml), "the REML criterion, not the deviance", fixed = TRUE)
+  expect_equal(dv, -2 * as.numeric(logLik(reml)))
+  expect_error(deviance(reml, REML = TRUE), "deviance(REML = TRUE) is not available",
+               fixed = TRUE)
+  expect_error(deviance(reml, REML = FALSE), "deviance(REML = FALSE) is not available",
+               fixed = TRUE)
+  # OLS: the weighted residual sum of squares, as deviance.lm, whatever REML
+  # says; the weights read at the fit's weight power.
+  ols <- fastglmm(y ~ x, d)
+  expect_equal(deviance(ols), sum(residuals(ols)^2), tolerance = 1e-12)
+  wd <- rep(c(1, 4), length.out = nrow(d))
+  wols <- fastglmm(y ~ x, d, weights = wd, weight_power = 0.5, REML = TRUE)
+  expect_equal(deviance(wols), sum(sqrt(wd) * residuals(wols)^2), tolerance = 1e-12)
+  # A fit without estimates has no deviance.
+  failed <- structure(list(family_name = "poisson", fitted = numeric(), y = 1:2,
+                           re_group_names = list()), class = "fastglmm")
+  expect_identical(deviance(failed), NaN)
+})
+
 test_that("a weight power reaches every reader of the weights", {
   # weight_power = 0.5 reads the weights raised to 0.5 wherever the claimed fit
   # on w^0.5 reads its own. The weights are squares, so w^0.5 is exact.
@@ -1033,8 +1107,11 @@ test_that("weight_power without weights is ignored with a warning, bad values ar
   expect_true(is.na(m$weight_power))
   expect_no_warning(fastglmm(y ~ x, d, weight_power = 1))
   expect_error(fastglmm(y ~ x, d, weight_power = "Estimate"),
-               'weight_power must be a finite number or "estimate"')
-  expect_error(fastglmm(y ~ x, d, se_type = "CR2"), 'se_type must be "model" or "robust"')
+               'weight_power must be a finite number or "estimate", got the string "Estimate"',
+               fixed = TRUE)
+  expect_error(fastglmm(y ~ x, d, weight_power = NaN), "got NaN$")
+  expect_error(fastglmm(y ~ x, d, se_type = "CR2"),
+               'se_type must be "model" or "robust", got the string "CR2"', fixed = TRUE)
 })
 
 test_that("a fit saved before weight_power and se_type reads power 1 and the model SE", {

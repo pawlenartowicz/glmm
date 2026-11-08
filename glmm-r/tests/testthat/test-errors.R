@@ -55,6 +55,12 @@ test_that("dot formulas error", {
   expect_error(fastglmm(y ~ ., err_data()), "'\\.' is not supported")
 })
 
+test_that("a formula with no response errors with the parser's message", {
+  expect_error(fastglmm(~ x, err_data()),
+               "formula syntax error at position 0: the formula has no response; write it as y ~ x",
+               fixed = TRUE)
+})
+
 test_that("a crossing power below 2 errors with the Python port's message", {
   # R's own parser refuses a formula ending in `+`, so only `^` is tested here.
   expect_error(fastglmm(y ~ (x + g)^1 + (1 | g), err_data()),

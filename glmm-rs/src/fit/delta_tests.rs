@@ -237,6 +237,133 @@ fn a_response_far_from_zero_is_precision_limited() {
     }
 }
 
+/// Spread 1e16 at δ = −2 by REML: from a warm start θ = 10 or 100 the search
+/// stops at θ̂ ≈ 1e9 (caller units). There the intercept's pivot of X′V⁻¹X is
+/// the difference of two numbers near 2.9e16 and comes out as a few units in
+/// their last place, so the deviance is noise (loglik −2450.78 and −2474.29
+/// against −2311.64 at the optimum). r² is fine there, so only the pivot term
+/// of the estimate sees it. The δ = −1.5 cold fit (loglik −1685.894956) is a
+/// near-optimum fit with a small θ and gets no note. Measured 2026-11-08: pivot
+/// terms 20.7 (θ = 10) and 10.4 (θ = 100); before the pivot term neither fit
+/// carried a note.
+#[test]
+fn a_fit_stopped_in_the_pivot_noise_is_precision_limited() {
+    let set = dataset(13, 150, 10, 1.0, 1e16, 1.5);
+    for (delta, start, limited) in [
+        (-2.0, Some(10.0), true),
+        (-2.0, Some(100.0), true),
+        (-1.5, None, false),
+    ] {
+        let opts = FitOptions {
+            weight_power: Some(WeightPower::Fixed(delta)),
+            reml: Some(true),
+            ..FitOptions::default()
+        };
+        let fit = match start {
+            Some(t) => crate::fit_with_start(
+                &set.data(Some(&set.w)),
+                &set.spec(),
+                &StartValues::new(vec![], vec![t]),
+                &opts,
+            )
+            .unwrap(),
+            None => set.fit(&opts),
+        };
+        let notes = &fit.diagnostics.notes;
+        assert_eq!(
+            notes.iter().any(|n| matches!(n, Note::PrecisionLimited)),
+            limited,
+            "δ {delta} start {start:?}: {notes:?}"
+        );
+    }
+}
+
+/// The δ dataset (spread 1e16) with a second, crossed random intercept on
+/// `i % 7`, at δ = −2 by REML. The crossed shape keeps the Gram kernel, so
+/// this note is its only guard. Intercept-only crossed extras route to the
+/// dense kernel (`Solver::NoZ` in `classify_design`). Measured 2026-11-08:
+/// pivot term 3.7, r-term 1.9e-9; the loglik depends on the start (−2204.93
+/// cold, −2349.31 from θ = 10, −2386.48 from θ = 100).
+#[test]
+fn a_crossed_fit_under_wide_weights_is_precision_limited() {
+    let set = dataset(13, 150, 10, 1.0, 1e16, 1.5);
+    let ids = set
+        .ids
+        .clone()
+        .extra((0..150).map(|i| (i % 7) as u32).collect());
+    let spec = ModelSpec::mixed(
+        Family::Gaussian,
+        ReStructure::intercept().extra(Grouping::crossed()),
+    );
+    let opts = FitOptions {
+        weight_power: Some(WeightPower::Fixed(-2.0)),
+        reml: Some(true),
+        ..FitOptions::default()
+    };
+    let data = Data::new(&set.x, &set.y, set.n, 2)
+        .ids(&ids)
+        .weights(&set.w);
+    let fit = crate::fit(&data, &spec, &opts).unwrap();
+    let notes = &fit.diagnostics.notes;
+    assert!(
+        notes.iter().any(|n| matches!(n, Note::PrecisionLimited)),
+        "{notes:?}"
+    );
+}
+
+/// The crossed model of the test above routes to the dense kernel
+/// (`classify_design`), so this one forces the same model through the sparse
+/// kernel (`fit_mle_sparse_pub`), whose `cxy` holds the X̃ Gram the pivot term
+/// reads, and through the dense one (`fit_mle_noz_pub`), on the working
+/// weights `w^−2` by REML. Both fits stop in the pivot noise and both carry
+/// `PrecisionLimited`.
+#[test]
+fn a_sparse_routed_fit_computes_the_pivot_noise() {
+    use super::common::spec_sized_from_ids;
+    use super::{fit_mle_noz_pub, fit_mle_sparse_pub};
+    let set = dataset(13, 150, 10, 1.0, 1e16, 1.5);
+    let ids = set
+        .ids
+        .clone()
+        .extra((0..150).map(|i| (i % 7) as u32).collect());
+    let spec = ModelSpec::mixed(
+        Family::Gaussian,
+        ReStructure::intercept().extra(Grouping::crossed()),
+    );
+    let (sized, ids, _) = spec_sized_from_ids(&spec, &ids);
+    let w: Vec<f64> = set.w.iter().map(|w| w.powf(-2.0)).collect();
+    let opts = FitOptions {
+        reml: Some(true),
+        ..FitOptions::default()
+    };
+    for kernel in ["dense", "sparse"] {
+        let f = if kernel == "sparse" {
+            fit_mle_sparse_pub
+        } else {
+            fit_mle_noz_pub
+        };
+        let fit = f(
+            &set.x,
+            &set.y,
+            Some(&w),
+            None,
+            set.n,
+            2,
+            &sized,
+            &ids.primary,
+            &ids.extra,
+            None,
+            &opts,
+        );
+        let notes = &fit.diagnostics.notes;
+        assert!(
+            notes.iter().any(|n| matches!(n, Note::PrecisionLimited)),
+            "{kernel}: loglik {}, {notes:?}",
+            fit.loglik()
+        );
+    }
+}
+
 /// G1: at δ = 1 and δ = 0 the profile is the REML log-likelihood of the
 /// claimed fit and of the fit without weights.
 #[test]

@@ -258,6 +258,52 @@ fn wrong_x_length_is_a_shape_error() {
     );
 }
 
+/// An `n` whose `n * p` or `n * s` overflows `usize` is a wrong length, not a
+/// panic.
+#[test]
+fn n_times_p_overflow_is_a_shape_error() {
+    let model = ModelSpec::fixed(Family::Gaussian);
+    let opts = FitOptions::default();
+    let e = refusal(&Data::new(&[], &[], usize::MAX / 2 + 1, 2), &model, &opts);
+    assert!(
+        matches!(&e, FitError::Shape(m) if m == "x must have n*p elements in row-major layout"),
+        "{e:?}"
+    );
+    let (x, y, _) = shape_check_fixture();
+    let e = refusal(
+        &Data::new(&x, &y, 4, 1).re_columns(&[], usize::MAX),
+        &model,
+        &opts,
+    );
+    assert!(
+        matches!(&e, FitError::Shape(m) if m == "re_columns must have n*s elements in row-major layout"),
+        "{e:?}"
+    );
+}
+
+/// Zero rows are refused at the fit entry, with or without random effects.
+#[test]
+fn zero_rows_is_a_shape_error() {
+    let opts = FitOptions::default();
+    let fixed = refusal(
+        &Data::new(&[], &[], 0, 1),
+        &ModelSpec::fixed(Family::Gaussian),
+        &opts,
+    );
+    let ids = GroupIds::new(vec![]);
+    let mixed = refusal(
+        &Data::new(&[], &[], 0, 1).ids(&ids),
+        &ModelSpec::mixed(Family::Gaussian, ReStructure::intercept()),
+        &opts,
+    );
+    for e in [fixed, mixed] {
+        assert!(
+            matches!(&e, FitError::Shape(m) if m == "Data has no rows (n = 0); a fit needs at least one row"),
+            "{e:?}"
+        );
+    }
+}
+
 /// A zero weight is not finite-and-positive, so it is refused the same way
 /// as a wrong-length weights vector, naming its row.
 #[test]
@@ -838,6 +884,7 @@ fn rank_deficient_random_slope_returns_nonconverged_instead_of_panicking() {
         "singular is a fitted-boundary flag, not a failure flag"
     );
     assert!(f.varcorr.is_empty() && f.fitted.is_empty() && f.ranef.is_empty());
+    assert_eq!(f.ranef_levels(), [8], "8 clusters");
     // `reml` is the criterion the options resolve to, as on a fitted model.
     assert!(f.reml, "REML by default");
     let ml = fit_cold(
@@ -853,6 +900,27 @@ fn rank_deficient_random_slope_returns_nonconverged_instead_of_panicking() {
         },
     );
     assert!(!ml.converged() && !ml.reml, "ML on request");
+}
+
+/// The unfittable return counts the levels of every grouping, a nested one as
+/// its global child count: 8 parents with 2 children each give 16.
+#[test]
+fn unfittable_random_slope_counts_a_nested_grouping() {
+    let (x, y, n, p, mut ids) = aliased_slope_design();
+    ids.extra = vec![(0..n)
+        .map(|i| 2 * ids.primary[i] + ((i / 8) % 2) as u32)
+        .collect()];
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            terms: Vec::new(),
+            slopes: vec![2],
+            extra_groupings: vec![Grouping::nested()],
+        }),
+    };
+    let f = fit_cold(&x, &y, n, p, &model, &ids, &FitOptions::default());
+    assert!(!f.converged());
+    assert_eq!(f.ranef_levels(), [8, 16]);
 }
 
 /// `y ~ 1 + x1 + x2` over 8 clusters of 12 rows, with `x2 = 1 + x1` exactly,
@@ -931,6 +999,7 @@ fn degenerate_glmm_intercept_free_block_reports_the_slope_width() {
     assert!(!f.converged() && f.beta.iter().all(|b| b.is_nan()));
     assert_eq!(f.tau2.len(), 1, "tau2 {:?}", f.tau2);
     assert!(f.tau2.iter().all(|t| t.is_nan()), "tau2 NaN-filled");
+    assert_eq!(f.ranef_levels(), [2]);
 }
 
 /// Rank-deficiency salvage on a fixed-only design: near-collinear
@@ -1292,10 +1361,8 @@ fn spec_sized_from_ids_nested_unbalanced_first_parent_widest() {
 }
 
 /// A `q_g = 5` (intercept + 4 slopes) extra grouping is over the `MAX_EXTRA_Q = 4`
-/// NoZ-scratch envelope and routes to Sparse. The sparse numeric path
-/// makes this a *supported* design — it routes to Sparse and
-/// `fit_cold` runs the sparse solver (returning a degenerate non-converged `Fit`
-/// on this n=0 input) instead of hitting the removed stub.
+/// NoZ-scratch envelope and routes to Sparse; the over-envelope anti-panic
+/// test below fits that shape.
 #[test]
 fn fit_extra_grouping_q_too_large_routes_sparse() {
     let model = SizedSpec {
@@ -1315,29 +1382,6 @@ fn fit_extra_grouping_q_too_large_routes_sparse() {
         extra_counts: vec![4],
     };
     assert!(matches!(classify_design(&model, 1), Solver::Sparse));
-    // n=0: bypasses rank-deficiency detection (guarded by `if n > 0 && p > 0`)
-    // so routing reaches classify_design → Sparse → the LMM's sparse kernel,
-    // which runs (no PD data at n=0 ⇒ non-converged) rather than panicking.
-    let n = 0;
-    let p = 5; // slopes [1,2,3,4] in-bounds; q_g=5 over the NoZ envelope
-    let fit = fit_cold(
-        &[],
-        &[],
-        n,
-        p,
-        &model.spec,
-        &ids_from_sizing(
-            &model.spec,
-            &Sizing::FixedClusters { n_clusters: 4 },
-            &[4],
-            n,
-        ),
-        &FitOptions {
-            se_for: SeFor::Only(vec![1]),
-            ..FitOptions::default()
-        },
-    );
-    assert!(!fit.converged());
 }
 
 /// Anti-panic floor: an over-envelope mixed model must return a `Fit`, never
@@ -1529,12 +1573,42 @@ fn fit_glmm_past_max_theta_pins_without_panic() {
 }
 
 /// Degenerate shapes on the mixed non-Gaussian route: `p == 0` (no fixed
-/// columns at all), `n == 0` and `n <= p` must return a non-converged `Fit`,
-/// never panic — for the in-envelope (dense) layout, the over-envelope (7
-/// crossed extras, routes `Sparse`/`Packed`) layout, and the `n == 0` shape,
-/// across the wired non-Gaussian families. The all-zero-column case is the
+/// columns at all) and `n <= p` must return a non-converged `Fit`, never
+/// panic — for the in-envelope (dense) and the over-envelope (7 crossed
+/// extras, routes `Sparse`/`Packed`) layout, across the wired non-Gaussian
+/// families. The all-zero-column case is the
 /// width-0 re-entry: the column is aliased, so `fit_rank_deficient` re-enters
 /// the fit with no column kept. The last case is `n == p`.
+/// A degenerate fit has no conditional modes but keeps its level counts, and
+/// the size rule still reorders it when the crossed extra has more levels:
+/// the empty `ranef` is left alone and `ranef_levels` comes back in
+/// declaration order.
+#[test]
+fn degenerate_fit_under_the_size_rule_keeps_declaration_order() {
+    let model = ModelSpec::mixed(
+        Family::Poisson {
+            link: crate::PoissonLink::Log,
+        },
+        crate::Re::intercept().extra(Grouping::crossed()),
+    );
+    let n = 8;
+    let ids = GroupIds {
+        primary: (0..n).map(|i| (i % 2) as u32).collect(),
+        extra: vec![(0..n).map(|i| (i / 2) as u32).collect()],
+    };
+    let fit = fit_cold(
+        &[],
+        &vec![1.0f64; n],
+        n,
+        0,
+        &model,
+        &ids,
+        &FitOptions::default(),
+    );
+    assert!(!fit.converged() && fit.ranef.is_empty());
+    assert_eq!(fit.ranef_levels(), &[2, 4]);
+}
+
 #[test]
 fn fit_glmm_degenerate_width_never_panics() {
     let families = [
@@ -1618,17 +1692,6 @@ fn fit_glmm_degenerate_width_never_panics() {
         assert!(
             !fit.converged(),
             "{family:?} p=0 over-envelope: degenerate fit does not report converged"
-        );
-
-        // n == 0, p == 1.
-        let ids_n0 = GroupIds {
-            primary: vec![],
-            extra: vec![],
-        };
-        let fit = fit_cold(&[], &[], 0, 1, &model, &ids_n0, &FitOptions::default());
-        assert!(
-            !fit.converged(),
-            "{family:?} n=0: degenerate fit does not report converged"
         );
 
         // p == 1 with the one fixed column all zero.
@@ -2217,6 +2280,265 @@ fn nagq_over_the_q_cap_is_rejected() {
     assert!(
         matches!(&e, FitError::Unsupported(m) if m.contains("exceeds the temporary")),
         "{e:?}"
+    );
+}
+
+/// A slope index listed twice in one block, in the default block or inside one
+/// term, and on the primary or an extra grouping, is refused: it would fit a
+/// covariance block over two copies of one column.
+#[test]
+fn repeated_slope_index_is_refused() {
+    let primary = crate::Re::intercept().slopes([1, 1]);
+    let one_term = crate::Re::intercept().terms([crate::ReTerm::intercept().slopes([1, 1])]);
+    let extra = crate::Re::intercept().extra(Grouping::crossed().slopes([2, 2]));
+    for (re, want) in [
+        (primary, "primary grouping: slope column 1 is repeated"),
+        (one_term, "primary grouping: slope column 1 is repeated"),
+        (extra, "extra grouping 0: slope column 2 is repeated"),
+    ] {
+        let e = check_model_shape(&ModelSpec::mixed(Family::Gaussian, re), 1).unwrap_err();
+        assert!(matches!(e, FitError::Shape(_)), "{e:?}");
+        assert_eq!(e.to_string(), want);
+    }
+}
+
+/// The notes of the shared identification check on `f`, in order, as their
+/// `Debug` text (`Note` has no `PartialEq`).
+fn identification_notes_of(f: &Fit) -> Vec<String> {
+    let kinds = f.diagnostics.notes.iter().filter(|n| {
+        matches!(
+            n,
+            Note::SingleLevelGrouping { .. }
+                | Note::RepeatedGrouping { .. }
+                | Note::SlopeConstantWithinLevels { .. }
+                | Note::SeparatedByGrouping { .. }
+        )
+    });
+    kinds.map(|n| format!("{n:?}")).collect()
+}
+
+/// The matrix door notes each random-effect structure these data cannot
+/// identify, and stays silent on the close shapes that are identified: a
+/// slope constant within levels that takes enough distinct values, a block
+/// without a random intercept, and two copies of one grouping that share no
+/// random-effect column.
+#[test]
+fn matrix_door_notes_unidentified_random_effects() {
+    let n = 24;
+    let level = |i: usize| i / 4;
+    let t = |i: usize| (i % 4) as f64;
+    let x: Vec<f64> = (0..n).flat_map(|i| [1.0, t(i)]).collect();
+    let y: Vec<f64> = (0..n)
+        .map(|i| 0.5 * t(i) + 0.3 * ((level(i) * 7) % 5) as f64 + 0.1 * ((i * 3) % 7) as f64)
+        .collect();
+    let yb: Vec<f64> = (0..n).map(|i| f64::from(level(i) < 3)).collect();
+    // Constant within levels: six distinct values, and two.
+    let c: Vec<f64> = (0..n).map(|i| level(i) as f64).collect();
+    let d: Vec<f64> = (0..n).map(|i| (level(i) % 2) as f64).collect();
+    // ±1 per level: two values, but one square.
+    let pm: Vec<f64> = d.iter().map(|v| 2.0 * v - 1.0).collect();
+    let primary: Vec<u32> = (0..n).map(|i| level(i) as u32).collect();
+    let relabelled: Vec<u32> = primary.iter().map(|&g| 5 - g).collect();
+    let gaussian = Family::Gaussian;
+    let binomial = Family::Binomial {
+        link: BinomialLink::Logit,
+    };
+    let crossed = crate::Re::intercept().extra(Grouping::crossed());
+    let no_intercept = || crate::ReTerm::no_intercept();
+    let cases = vec![
+        (
+            "one level",
+            gaussian,
+            crate::Re::intercept(),
+            vec![vec![0; n]],
+            None,
+            vec![Note::SingleLevelGrouping { grouping: 0 }],
+        ),
+        (
+            "one-level extra grouping",
+            gaussian,
+            crossed.clone(),
+            vec![primary.clone(), vec![0; n]],
+            None,
+            vec![Note::SingleLevelGrouping { grouping: 1 }],
+        ),
+        (
+            "relabelled copy",
+            gaussian,
+            crossed.clone(),
+            vec![primary.clone(), relabelled.clone()],
+            None,
+            vec![Note::RepeatedGrouping {
+                first: 0,
+                second: 1,
+            }],
+        ),
+        (
+            "intercept column as a slope",
+            gaussian,
+            crate::Re::intercept().slopes([0]),
+            vec![primary.clone()],
+            None,
+            vec![Note::SlopeConstantWithinLevels {
+                grouping: 0,
+                slopes: vec![0],
+            }],
+        ),
+        (
+            "constant slope with two values",
+            gaussian,
+            crate::Re::intercept().slopes([1, 2]),
+            vec![primary.clone()],
+            Some(&d[..]),
+            vec![Note::SlopeConstantWithinLevels {
+                grouping: 0,
+                slopes: vec![1],
+            }],
+        ),
+        (
+            "response constant within levels",
+            binomial,
+            crate::Re::intercept(),
+            vec![primary.clone()],
+            None,
+            vec![Note::SeparatedByGrouping { grouping: 0 }],
+        ),
+        (
+            "response constant within one-row levels",
+            binomial,
+            crate::Re::intercept(),
+            vec![(0..n as u32).collect()],
+            None,
+            vec![],
+        ),
+        (
+            "constant slope with six values",
+            gaussian,
+            crate::Re::intercept().slopes([1, 2]),
+            vec![primary.clone()],
+            Some(&c[..]),
+            vec![],
+        ),
+        (
+            "varying slope",
+            gaussian,
+            crate::Re::intercept().slopes([1]),
+            vec![primary.clone()],
+            None,
+            vec![],
+        ),
+        (
+            "constant slope without an intercept",
+            gaussian,
+            crate::Re::intercept().terms([no_intercept().slopes([2])]),
+            vec![primary.clone()],
+            Some(&c[..]),
+            vec![],
+        ),
+        (
+            "copy sharing no column",
+            gaussian,
+            crate::Re::intercept().extra(Grouping::crossed().terms([no_intercept().slopes([1])])),
+            vec![primary.clone(), relabelled.clone()],
+            None,
+            vec![],
+        ),
+        (
+            "uncorrelated slope of ±1",
+            gaussian,
+            crate::Re::intercept().slopes([2]).uncorrelated(),
+            vec![primary.clone()],
+            Some(&pm[..]),
+            vec![Note::SlopeConstantWithinLevels {
+                grouping: 0,
+                slopes: vec![0],
+            }],
+        ),
+        (
+            "uncorrelated slope of 0 and 1",
+            gaussian,
+            crate::Re::intercept().slopes([2]).uncorrelated(),
+            vec![primary.clone()],
+            Some(&d[..]),
+            vec![],
+        ),
+    ];
+    assert_eq!(cases.len(), 13);
+    for (what, family, re, groups, z, want) in cases {
+        let ids = GroupIds {
+            primary: groups[0].clone(),
+            extra: groups[1..].to_vec(),
+        };
+        let resp = if family == gaussian { &y } else { &yb };
+        let mut data = Data::new(&x, resp, n, 2).ids(&ids);
+        if let Some(z) = z {
+            data = data.re_columns(z, 1);
+        }
+        let f = crate::fit(&data, &ModelSpec::mixed(family, re), &FitOptions::default())
+            .unwrap_or_else(|e| panic!("{what}: {e}"));
+        let want: Vec<String> = want.iter().map(|n| format!("{n:?}")).collect();
+        assert_eq!(identification_notes_of(&f), want, "{what}");
+    }
+}
+
+/// A binomial response constant over all rows is constant within every level
+/// too, but that is the constant-response case, not separation through the
+/// grouping: no `SeparatedByGrouping`.
+#[test]
+fn a_constant_binomial_response_is_not_separated_by_grouping() {
+    let n = 24;
+    let x: Vec<f64> = (0..n).flat_map(|i| [1.0, (i % 4) as f64]).collect();
+    let ids = GroupIds {
+        primary: (0..n).map(|i| (i / 4) as u32).collect(),
+        extra: vec![],
+    };
+    let binomial = Family::Binomial {
+        link: BinomialLink::Logit,
+    };
+    for value in [0.0, 1.0] {
+        let y = vec![value; n];
+        let data = Data::new(&x, &y, n, 2).ids(&ids);
+        let f = crate::fit(
+            &data,
+            &ModelSpec::mixed(binomial, crate::Re::intercept()),
+            &FitOptions::default(),
+        )
+        .unwrap();
+        assert!(identification_notes_of(&f).is_empty(), "y = {value}");
+    }
+}
+
+/// The note comes from the check on the reduced design: a model whose only
+/// fixed column is all zero drops it, fails at `p = 0`, and still names the
+/// repeated grouping.
+#[test]
+fn identification_note_survives_a_failed_fit() {
+    let n = 24;
+    let x = vec![0.0; n];
+    let y: Vec<f64> = (0..n).map(|i| f64::from((i * 5) % 3 == 0)).collect();
+    let ids = GroupIds {
+        primary: (0..n).map(|i| (i / 4) as u32).collect(),
+        extra: vec![(0..n).map(|i| 5 - (i / 4) as u32).collect()],
+    };
+    let spec = ModelSpec::mixed(
+        Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        crate::Re::intercept().extra(Grouping::crossed()),
+    );
+    let data = Data::new(&x, &y, n, 1).ids(&ids);
+    let f = crate::fit(&data, &spec, &FitOptions::default()).unwrap();
+    assert!(!f.converged());
+    assert!(
+        f.diagnostics.notes.iter().any(|n| matches!(
+            n,
+            Note::RepeatedGrouping {
+                first: 0,
+                second: 1
+            }
+        )),
+        "{:?}",
+        f.diagnostics.notes
     );
 }
 

@@ -4046,3 +4046,47 @@ fn a_predictor_past_1e154_fits_as_at_scale_1() {
     }
     assert_eq!(ran, 24);
 }
+
+/// Two crossed intercept-only groupings, a (4 levels, no variance) declared
+/// before b (40 levels): the size rule makes b the kernel's primary. The view's
+/// pinned mask must follow `theta()` into declaration order, and agree with the
+/// stable `Fit`.
+#[test]
+fn view_pinned_mask_follows_declaration_order_under_the_size_rule() {
+    let (n, p) = (800, 2);
+    let mut st = 99u64;
+    let ua: Vec<f64> = (0..4).map(|_| 0.0 * lcg(&mut st)).collect();
+    let ub: Vec<f64> = (0..40).map(|_| lcg(&mut st)).collect();
+    let (mut x, mut y, mut a, mut b) = (vec![], vec![], vec![], vec![]);
+    for _ in 0..n {
+        let ia = ((lcg(&mut st) + 1.0) * 0.5 * 4.0) as usize % 4;
+        let ib = ((lcg(&mut st) + 1.0) * 0.5 * 40.0) as usize % 40;
+        let x1 = lcg(&mut st);
+        x.extend([1.0, x1]);
+        y.push(0.3 + 0.5 * x1 + ua[ia] + ub[ib] + 0.8 * lcg(&mut st));
+        a.push(ia as u32);
+        b.push(ib as u32);
+    }
+    let model = ModelSpec::mixed(
+        Family::Gaussian,
+        ReStructure::intercept().extra(Grouping::crossed()),
+    );
+    let opts = FitOptions::default();
+    let data = Data::new(&x, &y, n, p);
+
+    let ab = GroupIds::new(a.clone()).extra(b.clone());
+    let mut ws = build_workspace(&model, &ab, n, p, &opts);
+    let view = fit_on(&mut ws, &data, None, &opts);
+    assert!(!view.perm.is_identity());
+    assert!(view.diagnostics().converged);
+    assert_eq!(view.theta()[0], 0.0);
+    assert_eq!(view.diagnostics().pinned_components, 0b01);
+    let fit = view.into_fit(&data, &model, &opts);
+    assert_eq!(fit.diagnostics().pinned, vec![vec![true], vec![false]]);
+
+    let mut ws = build_workspace(&model, &GroupIds::new(b).extra(a), n, p, &opts);
+    let view = fit_on(&mut ws, &data, None, &opts);
+    assert!(view.perm.is_identity());
+    assert_eq!(view.theta()[1], 0.0);
+    assert_eq!(view.diagnostics().pinned_components, 0b10);
+}

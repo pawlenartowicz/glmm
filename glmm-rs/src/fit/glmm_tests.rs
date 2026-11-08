@@ -11756,3 +11756,156 @@ fn uncorrelated_agq_lies_between_its_nested_models() {
     );
     assert_eq!(uncorr.stddev_corr(0).1[0][1], 0.0, "{:?}", uncorr.varcorr);
 }
+
+/// `y ~ x + (1|g)` Laplace on a fractional binomial response: the fit without
+/// weights matches `weights = 1` (the fused logit deviance holds only on 0/1
+/// rows). Then a reused workspace fits a 0/1 response after the fractional
+/// one bit for bit as a fresh workspace does, so the flag is decided again
+/// on every call.
+#[test]
+fn fractional_logit_glmm_matches_its_unit_weight_fit() {
+    let (x, y, g) = super::glm_tests::fractional_logit_data();
+    let (n, p) = (y.len(), 2);
+    let ones = vec![1.0; n];
+    let ids = GroupIds::new(g);
+    let spec = ModelSpec::mixed(
+        Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        ReStructure::intercept(),
+    );
+    let opts = FitOptions::default();
+    let data = Data::new(&x, &y, n, p).ids(&ids);
+    let a = crate::fit(&data, &spec, &opts).unwrap();
+    let b = crate::fit(&data.weights(&ones), &spec, &opts).unwrap();
+    assert!(
+        (a.loglik - b.loglik).abs() <= 1e-9 * b.loglik.abs(),
+        "{} vs {}",
+        a.loglik,
+        b.loglik
+    );
+    assert!(
+        (a.deviance - b.deviance).abs() <= 1e-9 * b.deviance.abs().max(1.0),
+        "{} vs {}",
+        a.deviance,
+        b.deviance
+    );
+    for j in 0..p {
+        assert!((a.beta[j] - b.beta[j]).abs() <= 1e-8 * b.beta[j].abs().max(1.0));
+    }
+    assert!(
+        b.varcorr[0][0] > 0.0,
+        "a singular fit leaves the PIRLS path untested"
+    );
+    assert!(
+        (a.varcorr[0][0] - b.varcorr[0][0]).abs() <= 1e-6 * b.varcorr[0][0],
+        "{} vs {}",
+        a.varcorr[0][0],
+        b.varcorr[0][0]
+    );
+
+    use super::core::{build_workspace, fit_on, FitWorkspace};
+    let y01: Vec<f64> = y.iter().map(|&v| f64::from(u8::from(v > 0.5))).collect();
+    let fit_01 = |ws: &mut FitWorkspace| {
+        let d = Data::new(&x, &y01, n, p);
+        fit_on(ws, &d, None, &opts)
+            .into_fit(&d, &spec, &opts)
+            .loglik
+    };
+    let mut reused = build_workspace(&spec, &ids, n, p, &opts);
+    let _ = fit_on(&mut reused, &Data::new(&x, &y, n, p), None, &opts);
+    let fresh = fit_01(&mut build_workspace(&spec, &ids, n, p, &opts));
+    let again = fit_01(&mut reused);
+    assert_eq!(again.to_bits(), fresh.to_bits(), "{again} vs {fresh}");
+}
+
+/// A β warm start the search cannot leave (far from the optimum in β) fails
+/// where the cold fit converges: Poisson `y ~ x + (1 + x | g)` from β₀ =
+/// (−28.5, 0.45), and Gamma (log) `(1 | g) + (1 | h)` on a response on the
+/// 1e-12 scale, both started at a previous draw's estimates. The fit is then
+/// searched again from the cold start and ends at the cold fit. The expected
+/// values are glmm's own cold fits (loglik −336.877602 and 4386.837322), not an
+/// external reference. Data: `tests/fixtures/gen_warm_start_fixtures.py`.
+#[cfg(feature = "formula")]
+#[test]
+fn a_far_warm_start_that_fails_falls_back_to_the_cold_fit() {
+    let csv = include_str!("../../tests/fixtures/warm_start_far.csv");
+    let cases = [
+        (
+            "y_poisson ~ x + (1 + x | g)",
+            Family::Poisson {
+                link: PoissonLink::Log,
+            },
+            StartValues::new(
+                vec![-28.54277275401354, 0.45232907703888187],
+                vec![0.7339726735264598, 0.04403155767809935, 0.21069636013114532],
+            ),
+        ),
+        (
+            "y_gamma ~ x + (1 | g) + (1 | h)",
+            Family::Gamma {
+                link: crate::GammaLink::Log,
+            },
+            StartValues {
+                beta: vec![0.26211598387550944, 0.5019799333507211],
+                theta: vec![0.7281146516300094, 0.6008399020626377],
+                dispersion: Some(1.0890181012807432),
+            },
+        ),
+    ];
+    let opts = FitOptions::default();
+    for (formula, family, start) in cases {
+        let lo = super::common_tests::fixture_lowered(csv, &["g", "h"], formula, family);
+        let cold = crate::fit(&lo.data(), &lo.model, &opts).unwrap();
+        let warm = crate::fit_with_start(&lo.data(), &lo.model, &start, &opts).unwrap();
+        assert!(cold.converged(), "{formula}: cold fit did not converge");
+        assert!(
+            warm.converged(),
+            "{formula}: warm fit did not converge (β {:?})",
+            warm.beta()
+        );
+        assert!(
+            warm.beta().iter().all(|b| b.is_finite()),
+            "{formula}: β {:?}",
+            warm.beta()
+        );
+        assert!(
+            (warm.loglik() - cold.loglik()).abs() <= 1e-6,
+            "{formula}: loglik warm {} vs cold {}",
+            warm.loglik(),
+            cold.loglik()
+        );
+    }
+}
+
+/// A binomial GLMM warm-started at β₀ = (1e14, 0) or (1e300, 0) ends where it
+/// started, at a deviance of about 5.8·β₀ flagged `precision_limited`, and was
+/// reported converged. The fit is searched again from the cold start and ends at
+/// glmm's own cold fit (deviance 82.7416852514), not an external reference.
+/// Data: `tests/fixtures/gen_warm_start_fixtures.py`.
+#[cfg(feature = "formula")]
+#[test]
+fn a_huge_warm_beta_is_not_reported_converged_at_the_start() {
+    let lo = super::common_tests::fixture_lowered(
+        include_str!("../../tests/fixtures/warm_start_huge_beta.csv"),
+        &["g"],
+        "y ~ x + (1 | g)",
+        Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+    );
+    let opts = FitOptions::default();
+    let cold = crate::fit(&lo.data(), &lo.model, &opts).unwrap();
+    for b0 in [1e14, 1e300] {
+        let start = StartValues::new(vec![b0, 0.0], vec![]);
+        let warm = crate::fit_with_start(&lo.data(), &lo.model, &start, &opts).unwrap();
+        assert!(warm.converged(), "β₀ {b0}: warm fit did not converge");
+        assert!(
+            (warm.deviance() - cold.deviance()).abs() <= 1e-6,
+            "β₀ {b0}: deviance warm {} vs cold {}",
+            warm.deviance(),
+            cold.deviance()
+        );
+        assert_eq!(warm.singular(), cold.singular(), "β₀ {b0}: singular");
+    }
+}

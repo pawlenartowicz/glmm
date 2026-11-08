@@ -586,6 +586,43 @@ fn constant_binomial_response_is_separated_not_converged() {
     }
 }
 
+/// A non-converged GLMM whose second grouping has more levels than the first,
+/// so the size rule swaps them, returns its level counts in declaration order
+/// instead of panicking while it undoes the swap on its empty random effects.
+#[test]
+fn separated_glmm_with_swapped_groupings_returns_declaration_order() {
+    let n = 40;
+    let g: Vec<String> = (0..n).map(|i| format!("g{}", i % 8)).collect();
+    let h: Vec<String> = (0..n).map(|i| format!("h{}", i % 20)).collect();
+    let table = Table {
+        columns: vec![
+            ("y".into(), Column::Numeric(vec![0.0; n])),
+            (
+                "x".into(),
+                Column::Numeric((0..n).map(|i| i as f64 / n as f64).collect()),
+            ),
+            ("g".into(), Column::factor_from_labels(&g)),
+            ("h".into(), Column::factor_from_labels(&h)),
+        ],
+        n,
+    };
+    let model = glmm::formula::fit(
+        "y ~ x + (1 | g) + (1 | h)",
+        &table,
+        logit(),
+        &FitOptions::default(),
+    )
+    .unwrap();
+    let fit = model.fit();
+    assert!(!fit.converged());
+    assert!(fit
+        .diagnostics()
+        .notes
+        .iter()
+        .any(|n| matches!(n, Note::Separated)));
+    assert_eq!(fit.ranef_levels(), &[8, 20]);
+}
+
 /// The formula door returns the kernel's refusal of an input as
 /// `Error::Fit`: quadrature on a GLMM with crossed groupings.
 #[test]
@@ -1176,6 +1213,73 @@ fn a_dropped_single_level_grouping_is_not_checked() {
         "{:?}",
         lo.notes
     );
+}
+
+/// The formula door reaches the same identification check as the matrix door:
+/// `g/one` with one `one` per `g` gives a nested grouping with the same groups
+/// as `g`, and a factor slope constant within `g` with two levels is a slope
+/// the data cannot separate from the intercept. A slope that varies within
+/// groups gets no note.
+#[test]
+fn formula_door_shares_the_identification_check() {
+    let n = 96;
+    let g: Vec<usize> = (0..n).map(|i| i / 8).collect();
+    let table = Table {
+        columns: vec![
+            (
+                "y".into(),
+                Column::Numeric(
+                    (0..n)
+                        .map(|i| {
+                            0.3 * ((i * 5) % 8) as f64
+                                + 0.5 * ((g[i] * 7) % 5) as f64
+                                + 0.2 * ((i * 3) % 7) as f64
+                        })
+                        .collect(),
+                ),
+            ),
+            (
+                "x".into(),
+                Column::Numeric((0..n).map(|i| ((i * 5) % 8) as f64).collect()),
+            ),
+            ("g".into(), coded(&g)),
+            ("one".into(), coded(&[0; 96])),
+            (
+                "cat".into(),
+                coded(&g.iter().map(|&l| usize::from(l >= 6)).collect::<Vec<_>>()),
+            ),
+        ],
+        n,
+    };
+    let notes = |formula: &str| {
+        let model =
+            glmm::formula::fit(formula, &table, Family::Gaussian, &FitOptions::default()).unwrap();
+        let notes = model.fit().diagnostics().notes.clone();
+        notes
+            .into_iter()
+            .filter(|n| {
+                matches!(
+                    n,
+                    Note::SingleLevelGrouping { .. }
+                        | Note::RepeatedGrouping { .. }
+                        | Note::SlopeConstantWithinLevels { .. }
+                        | Note::SeparatedByGrouping { .. }
+                )
+            })
+            .map(|n| format!("{n:?}"))
+            .collect::<Vec<_>>()
+    };
+    let repeated = Note::RepeatedGrouping {
+        first: 0,
+        second: 1,
+    };
+    let constant = Note::SlopeConstantWithinLevels {
+        grouping: 0,
+        slopes: vec![0],
+    };
+    assert_eq!(notes("y ~ x + (1 | g/one)"), [format!("{repeated:?}")]);
+    assert_eq!(notes("y ~ cat + (1 + cat | g)"), [format!("{constant:?}")]);
+    assert!(notes("y ~ x + (1 + x | g)").is_empty());
 }
 
 /// `re_groups` must line up index-for-index with `varcorr`, since `summary()`
@@ -2333,6 +2437,16 @@ mod robust_fits {
             (f.f, f.num_df, f.den_df, f.p_value, &f.notes),
             (t.t * t.t, 1.0, t.df, t.p_value, &t.notes)
         );
+        // `lᵀVl` must not overflow at 1e160 or underflow at 1e-160.
+        for c in [1e160, 1e-160] {
+            let lc: Vec<f64> = l.iter().map(|v| v * c).collect();
+            let tc = fit.contrast_t(&lc).unwrap();
+            assert!(
+                rel(tc.t, t.t) < 1e-12 && rel(tc.se, c * t.se) < 1e-12,
+                "{c}: {tc:?}"
+            );
+            assert!(rel(tc.df, t.df) < 1e-12, "{c}: {tc:?}");
+        }
 
         let two = [unit(p, 1), unit(p, 2)].concat();
         assert_eq!(
@@ -2348,6 +2462,14 @@ mod robust_fits {
         assert!(rel(r.f, mm.f) < 1e-12 && rel(r.den_df, mm.den_df) < 1e-12);
         assert_eq!(r.num_df, 2.0);
         assert_eq!(r.notes, vec![ContrastNote::ModelBasedJointTest]);
+        // An all-zero one-row L takes the model F's rank-0 result.
+        let zero = robust.fit().contrast_f(&vec![0.0; p], 1).unwrap();
+        assert_eq!(zero.num_df, 0.0);
+        assert!(zero.f.is_nan() && zero.den_df.is_nan() && zero.p_value.is_nan());
+        assert_eq!(
+            zero.notes,
+            vec![ContrastNote::RankDeficientL { rank: 0, rows: 1 }]
+        );
     }
 
     /// A contrast one cluster alone identifies gets a NaN SE and df with
@@ -2446,4 +2568,71 @@ mod robust_fits {
         assert!(rel(a.se, b.se) < 1e-12 && rel(a.df, b.df) < 1e-12);
         assert_eq!(a.notes, b.notes);
     }
+}
+
+/// A table with no rows is refused by the fit entry, not fitted to a NaN fit
+/// with its empty grouping dropped as "one level".
+#[test]
+fn zero_row_table_is_refused() {
+    let table = Table {
+        columns: ["y", "x", "g"]
+            .into_iter()
+            .map(|c| (c.into(), Column::Numeric(vec![])))
+            .collect(),
+        n: 0,
+    };
+    let err = glmm::formula::fit(
+        "y ~ x + (1 | g)",
+        &table,
+        Family::Gaussian,
+        &FitOptions::default(),
+    )
+    .err()
+    .expect("zero rows must be refused");
+    assert!(
+        matches!(err, glmm::formula::Error::Fit(glmm::FitError::Shape(_))),
+        "{err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "Data has no rows (n = 0); a fit needs at least one row"
+    );
+}
+
+/// A repeated column name or a repeated level label inside a factor is
+/// refused: `Table` lookups by name, and factor codes by label, would
+/// otherwise read the first copy without a word.
+#[test]
+fn duplicate_column_names_and_factor_levels_are_refused() {
+    let fit_err = |columns: Vec<(&str, Column)>| {
+        let table = Table {
+            columns: columns.into_iter().map(|(n, c)| (n.into(), c)).collect(),
+            n: 4,
+        };
+        glmm::formula::fit("y ~ x", &table, Family::Gaussian, &FitOptions::default())
+            .err()
+            .expect("must be refused")
+            .to_string()
+    };
+    let num = |v: [f64; 4]| Column::Numeric(v.to_vec());
+    let e = fit_err(vec![
+        ("y", num([1.0, 2.0, 3.0, 5.0])),
+        ("x", num([0.0, 1.0, 2.0, 3.0])),
+        ("x", num([3.0, 2.0, 1.0, 0.0])),
+    ]);
+    assert!(e.contains(r#"duplicate column name "x""#), "{e}");
+    let e = fit_err(vec![
+        ("y", num([1.0, 2.0, 3.0, 5.0])),
+        (
+            "x",
+            Column::Factor {
+                levels: vec!["a".into(), "a".into()],
+                codes: vec![0, 1, 0, 1],
+            },
+        ),
+    ]);
+    assert!(
+        e.contains(r#"factor column "x" has the level "a" more than once"#),
+        "{e}"
+    );
 }

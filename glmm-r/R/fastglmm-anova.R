@@ -350,7 +350,8 @@ print.fastglmm_comparison <- function(x, ...) {
 #' [anova()][anova.fastglmm] rows are likelihood-ratio rows. A non-zero entry
 #' on an aliased coefficient gives an `NA` row and a note; an `L` whose rows
 #' span fewer directions than it has rows is tested on those directions,
-#' with a note. There is no likelihood-ratio test here: that is [compare()].
+#' with a note. An `L` that is zero on every coefficient gets df 0 and a
+#' note. There is no likelihood-ratio test here: that is [compare()].
 #'
 #' On a robust fit (`$se_type` `"robust"`) an `L` of one row is the robust
 #' test, the robust t squared on its df, with `satterthwaite = FALSE` too; it
@@ -542,7 +543,8 @@ icc <- function(object) {
 #'
 #' A Gaussian mixed model fitted with `satterthwaite = FALSE` has no df: its
 #' rows have `NaN` df, statistic and p-value, and a note. A comparison that
-#' reads an aliased coefficient (an empty cell) is `NaN`, with a note.
+#' reads an aliased coefficient (an empty cell) is `NaN`, with a note. A fit
+#' that did not converge gets its table with a note saying so.
 #' On a robust fit (`$se_type` `"robust"`) each row is the robust t test on
 #' its robust df, with `satterthwaite = FALSE` too; a comparison one group
 #' alone identifies is `NaN` (`"fastglmm_robust_se_unidentified"`), and df
@@ -622,7 +624,8 @@ pairwise <- function(object, factor, by = NULL, at = NULL, adjust = "holm") {
   heading <- paste0("Pairwise comparisons of ", res$factor,
                     if (!is.null(res$by)) paste0(" by ", res$by))
   structure(tab, heading = heading,
-            footer = c(.adjust_line(res, res$adjust, FALSE), .pairwise_notes(res)),
+            footer = c(if (!isTRUE(object$converged)) .NOT_CONVERGED,
+                       .adjust_line(res, res$adjust, FALSE), .pairwise_notes(res)),
             pairwise = res, class = c("fastglmm_pairwise", "data.frame"))
 }
 

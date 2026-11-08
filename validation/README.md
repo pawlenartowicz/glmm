@@ -27,8 +27,9 @@ From `grid/`:
 ./run.sh <engine> [--fast] [--timed[=N]] [--pipeline] [--ml] [--jobs N] [--label TEXT] [--keep] [cell ...]
 ```
 
-- `engine` is one of `glmm`, `glmm_python`, `glmm_r`, `lme4`, `glmmtmb`,
-  `glmmadaptive`, `mixedmodels`, `lmertest`. `lmertest` fits the Gaussian cells
+- `engine` is one of `glmm`, `glmm_wasm`, `glmm_python`, `glmm_r`, `lme4`, `glmmtmb`,
+  `glmmadaptive`, `mixedmodels`, `lmertest`. `glmm_wasm` is the glmm engine built
+  for wasm32-wasip1 with simd128 and run under wasmtime. `lmertest` fits the Gaussian cells
   with a random effect with `lmerTest::lmer` and records its per-coefficient
   Satterthwaite df; its run is kept and found like an oracle's.
 - `--fast` restricts the run to the cells tagged `fast` in `manifest.json` (116 of
@@ -65,7 +66,7 @@ From `grid/`:
   box are 0–5, so N above 6 is refused, and so is N above the inherited core count.
 - `--label TEXT` is the free-text purpose of the run; it goes into
   `run_meta.json` and into the directory name.
-- `--keep` makes a finished `glmm` / `glmm_python` / `glmm_r` run the engine's kept
+- `--keep` makes a finished `glmm` / `glmm_wasm` / `glmm_python` / `glmm_r` run the engine's kept
   run (see below). Oracle runs are always kept.
 - Trailing cell names restrict the run to those cells, validated against the
   manifest first.

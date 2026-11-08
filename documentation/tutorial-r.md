@@ -182,9 +182,14 @@ The knobs:
   `AIC BIC logLik deviance df.resid` row in place of the REML criterion, and
   prints one line under the title: "Note: p-values can be somewhat
   anticonservative." On OLS (also when every grouping was dropped as
-  single-level) the estimates are the same under every value: `TRUE` reports
-  the REML log-likelihood, as `logLik(lm, REML = TRUE)`, and `NULL` and `FALSE`
-  the ML one. Every other family is fitted by maximum likelihood; `FALSE` there
+  single-level) without weights, or with a fixed `weight_power`, the
+  estimates are the same under every value: `TRUE` reports the REML
+  log-likelihood, as `logLik(lm, REML = TRUE)`, and `NULL` and `FALSE` the ML
+  one. Where `weight_power = NULL` estimates the weight power, `NULL` and
+  `TRUE` estimate it by REML (`fit$reml` is `TRUE`, the log-likelihood is the
+  REML one) and `FALSE` takes the weights as given (power 1), so the
+  estimates differ; `weight_power = "estimate"` with `FALSE` estimates the
+  power by ML. Every other family is fitted by maximum likelihood; `FALSE` there
   changes nothing, and `TRUE` is ignored with an `argument_ignored` warning.
   `fit$reml` says which criterion the fit's log-likelihood is.
 - `anova_test`: when the likelihood-ratio tables of `anova()` are made. Every

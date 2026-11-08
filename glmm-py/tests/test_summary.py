@@ -85,6 +85,14 @@ def test_stddev_corr_invalid_vech_raises():
         f.stddev_corr(0)
 
 
+def test_stddev_corr_without_variance_estimates_raises_a_clear_error():
+    f = make_fit(varcorr=[], re_groups=[("g", ["(Intercept)", "x"])], converged=False)
+    with pytest.raises(ValueError, match="no variance estimates"):
+        f.stddev_corr(0)
+    with pytest.raises(IndexError):
+        f.stddev_corr(1)
+
+
 def _mixed_fit(**kw):
     # Same D as test_stddev_corr_q2_hand_math: sd=[2, 1.1180], rho=0.4472.
     base = {
@@ -180,6 +188,32 @@ def test_summary_non_converged_still_prints_header():
     assert "Number of obs: 4, groups:  Subject, 18" in text
     assert "Scaled residuals" not in text
     assert "converged: False" in text
+
+
+def test_failed_mixed_fit_summary_keeps_title_and_groups_and_prints_df_resid_na():
+    text = _mixed_fit(
+        family="binomial",
+        link="logit",
+        reml=False,
+        converged=False,
+        varcorr=[],
+        stddev_se=np.array([]),
+        fitted=np.array([]),
+        df=0,
+        loglik=math.nan,
+        dispersion=math.nan,
+        coef_df=np.array([math.nan, math.nan]),
+        coef_p=np.array([math.nan, math.nan]),
+        df_method="none",
+    ).summary()
+    lines = text.splitlines()
+    assert lines[0] == (
+        "Generalized linear mixed model fit by maximum likelihood (Laplace Approximation) [glmm]"
+    )
+    assert "Number of obs: 4, groups:  Subject, 18" in text
+    assert "Random effects:" not in text
+    header = next(i for i, ln in enumerate(lines) if "df.resid" in ln)
+    assert lines[header + 1].split() == ["NA", "NA", "NA", "NA", "NA"]
 
 
 def test_summary_no_re_block_when_empty():
