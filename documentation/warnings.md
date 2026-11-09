@@ -138,6 +138,14 @@ and each such row also lists it among the table's notes.
 | `model_based_joint_test` | `ModelBasedJointTestWarning` | `fastglmm_model_based_joint_test`, `fastglmm_diagnostic` | A test of more than one df uses the model-based standard errors, not the robust ones. | `contrast_test` with more than one row. There is no evidence for a robust joint test, so the F is the model-based one, on the model's df; a fit made with `satterthwaite = False` / `FALSE` and a grouping factor has none, and its row is NaN with the no-df note instead of this warning. The `anova` rows of more than one df carry the same note. In Rust it is `ContrastNote::ModelBasedJointTest` (`LinearNote::ModelBasedJointTest`). |
 | `predict_se_model_based` | `PredictSeModelBasedWarning` | `fastglmm_predict_se_model_based`, `fastglmm_diagnostic` | The standard errors and intervals are model-based, not robust: their formula holds only with the model's covariance. | `predict` with `se_fit = True` / `se.fit = TRUE`. The standard error and interval read the model covariance, so they equal those of the same fit with `se_type = "model"`. In Rust it is `Note::PredictSeModelBased` in `Prediction::notes`. |
 
+## The warning of R's `deviance`
+
+`deviance(fit)` on a Gaussian mixed model fitted by REML returns the REML criterion, as lme4 does, and warns. Like the `predict` warning above, it is not a warning of the fit and has no tier or title. The condition has the classes `fastglmm_deviance_reml_criterion` and `fastglmm_diagnostic`.
+
+```
+deviance() of a REML fit returns the REML criterion, not the deviance. Use -2 * logLik(fit) to get it without this warning, or refit with REML = FALSE for the deviance
+```
+
 ## Errors
 
 An error stops the call: nothing is fitted and nothing is returned. Python
@@ -190,7 +198,7 @@ the Rust kernel: family, link, `inversegaussian` + random effects, `wald_se`
 | `ValueError` | error | `se_type="robust"` on a family other than Gaussian. | se_type = "robust" applies only to Gaussian models, not `<family>`; use se_type = "model" | |
 | `ValueError` | error | `se_type="robust"` on a model with crossed or nested groupings. | se_type = "robust" needs at most one grouping factor, not crossed or nested groupings; use se_type = "model" | |
 | `ValueError` | error | `se_type="robust"` on a mixed model fitted by ML, or on a fit that estimates the weight power by ML. | se_type = "robust" needs a REML fit: robust standard errors were checked under REML only; drop reml = false, or use se_type = "model" | |
-| `ValueError` | error | The data has no rows (Python, Rust; R refuses empty data itself with "no rows left to fit"). | Data has no rows (n = 0); a fit needs at least one row | |
+| `ValueError` | error | The data has no rows. | Data has no rows (n = 0); a fit needs at least one row | |
 | `ValueError` | error | A response value outside its family's support. | Poisson response must be >= 0 (row `<row>`); negative-binomial response must be >= 0 (row `<row>`); binomial response (the success proportion) must be in [0, 1] (row `<row>`); Gamma response must be > 0 (row `<row>`); inverse-Gaussian response must be > 0 (row `<row>`) | One message per family; the first such row is named. |
 | `ValueError` | error | `dispersion=` a number that is not finite and > 0. | dispersion must be a finite number > 0, got `<value>` | |
 | `ValueError` | error | A `warm_start` / `start` `beta` or `theta` of the wrong length. | warm-start `<beta \| theta>` has `<k>` entries but the model has `<m>` `<fixed-effect coefficients \| random-effect Cholesky entries>`; give `<m>`, or none to cold-start `<beta \| theta>` | |
@@ -341,7 +349,7 @@ R only, all plain `stop()` conditions:
 | An argument passed to the native code, such as `se_type` or `weight_power`, is a logical, integer or character `NA`. | `<argument>` has a missing value |
 | `na.action` leaves a missing value in a model column (e.g. `na.action = na.pass`). | missing values remain in the model columns after na.action; the kernel cannot fit NA - use na.action = na.omit or complete the data |
 | `na.action=` does not resolve to a function. | invalid na.action |
-| `subset=` or an already-empty `data` leaves no rows, with no missing values involved. | no rows left to fit |
+| `subset=` leaves no rows, with no missing values involved. | no rows left to fit |
 | `control=` passed through `...`. | control= is not supported: the optimizer (BOBYQA) settings are compiled into the glmm kernel; accepting-and-ignoring them is not acceptable |
 | `verbose=` passed through `...`. | verbose= is not supported: the glmm kernel has no progress reporting hook |
 | `contrasts=` passed through `...`. | contrasts= is not supported: the shared formula parser is treatment-coded with base = first level and offers no hook; relevel() the factor to change the base level |

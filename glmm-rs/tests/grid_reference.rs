@@ -19,8 +19,9 @@
 //!   * no `last/` run, or one without `subset: "full"` -- nothing here covers
 //!     the cells this gate reads. A partial run is not a smaller reference, it
 //!     is not one.
-//!   * `engine_version` mismatch -- the crate version moved and nobody recorded
-//!     a new reference run. Record one (see the message the test prints).
+//!   * `engine_version` mismatch on `major.minor` -- the crate moved to a new
+//!     minor and nobody recorded a new reference run. Record one (see the
+//!     message the test prints). A patch version may differ.
 //!   * a `fast` cell with no record, or a record that did not converge -- the
 //!     reference run is not usable as one.
 //!   * a quantity outside the band -- either the kernel changed an answer, or
@@ -262,16 +263,18 @@ fn fast_cells_match_the_committed_glmm_run() {
         meta["subset"], meta["label"], meta["cells"]
     );
 
-    // The reference has to have been fitted by THIS crate version. A version
-    // bump is the moment to record a new run; failing here is how that gets
-    // remembered.
+    // The reference has to have been fitted by this crate's minor line
+    // (`major.minor`). A minor bump is the moment to record a new run; failing
+    // here is how that gets remembered. A patch release reuses its minor's run,
+    // and the bands below still catch any answer it moves.
+    let minor = |v: &str| v.rsplit_once('.').map(|(mm, _)| mm.to_owned());
+    let ref_version = meta["engine_version"].as_str().unwrap_or("");
     assert_eq!(
-        meta["engine_version"].as_str(),
-        Some(env!("CARGO_PKG_VERSION")),
-        "the committed glmm run {run_dir} was fitted by glmm {}, but this \
-         crate is {}. Record a new full run with `validation/grid/run.sh glmm \
-         --keep --label \"<date>\"` and commit it.",
-        meta["engine_version"],
+        minor(ref_version),
+        minor(env!("CARGO_PKG_VERSION")),
+        "the committed glmm run {run_dir} was fitted by glmm {ref_version}, but \
+         this crate is {}. Record a new full run with `validation/grid/run.sh \
+         glmm --keep --label \"<date>\"` and commit it.",
         env!("CARGO_PKG_VERSION")
     );
 

@@ -668,7 +668,8 @@ confint.fastglmm_pairwise <- function(object, parm, level = 0.95, ...) {
   adjust <- if (identical(res$adjust, "holm")) .HOLM_INTERVALS else
     .adjust_line(res, ci$adjust, TRUE)
   structure(tab, heading = attr(object, "heading"),
-            footer = c(paste("Confidence level used:", format(level)), adjust,
+            footer = c(intersect(.NOT_CONVERGED, attr(object, "footer")),
+                       paste("Confidence level used:", format(level)), adjust,
                        .pairwise_notes(res)),
             class = c("fastglmm_pairwise_ci", "data.frame"))
 }

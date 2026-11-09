@@ -954,7 +954,9 @@ test_that("pairwise on a fit that did not converge carries the note", {
   d <- data.frame(y = as.numeric(x > 0), x = x, f = factor(rep(c("a", "b", "c"), 20)))
   fit <- suppressWarnings(fastglmm(y ~ f + x, d, family = binomial()))
   expect_false(fit$converged)
-  expect_identical(attr(pairwise(fit, "f"), "footer")[1], fastglmm:::.NOT_CONVERGED)
+  table <- pairwise(fit, "f")
+  expect_identical(attr(table, "footer")[1], fastglmm:::.NOT_CONVERGED)
+  expect_identical(attr(confint(table), "footer")[1], fastglmm:::.NOT_CONVERGED)
 })
 
 test_that("pairwise() passes adjust, by and at to the crate", {

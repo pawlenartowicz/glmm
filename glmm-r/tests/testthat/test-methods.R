@@ -1060,7 +1060,8 @@ test_that("deviance() follows lme4, lm and glm", {
   ml <- fastglmm(y ~ x + (1 | g), d, REML = FALSE)
   expect_equal(deviance(ml), -2 * as.numeric(logLik(ml)))
   reml <- fastglmm(y ~ x + (1 | g), d)
-  expect_warning(dv <- deviance(reml), "the REML criterion, not the deviance", fixed = TRUE)
+  expect_warning(dv <- deviance(reml), "the REML criterion, not the deviance", fixed = TRUE,
+                 class = "fastglmm_deviance_reml_criterion")
   expect_equal(dv, -2 * as.numeric(logLik(reml)))
   expect_error(deviance(reml, REML = TRUE), "deviance(REML = TRUE) is not available",
                fixed = TRUE)

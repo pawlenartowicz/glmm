@@ -928,7 +928,9 @@ def test_pairwise_on_a_fit_that_did_not_converge_carries_the_note():
     assert not m.converged
     from glmm.anova import _NOT_CONVERGED
 
-    assert glmm.pairwise(m, "f").notes[0] == _NOT_CONVERGED
+    table = glmm.pairwise(m, "f")
+    assert table.notes[0] == _NOT_CONVERGED
+    assert table.confint().notes[0] == _NOT_CONVERGED
 
 
 def test_pairwise_adjust_reaches_the_crate(lmm):

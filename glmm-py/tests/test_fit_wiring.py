@@ -357,6 +357,9 @@ def test_weight_power_without_weights_is_ignored_with_a_warning_and_bad_values_r
     ):
         m = glmm.fit(data, "y ~ x", weight_power=2)
     assert np.isnan(m.weight_power)
+    # Printed as R's format() prints it: 2.0 as "2", 7 significant digits.
+    with pytest.warns(glmm.ArgumentIgnoredWarning, match=r"weight_power = 0\.1234568 has"):
+        glmm.fit(data, "y ~ x", weight_power=0.123456789)
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         glmm.fit(data, "y ~ x", weight_power=1)

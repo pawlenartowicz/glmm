@@ -18,7 +18,8 @@ warning.}
 \item{...}{unused.}
 }
 \value{
-One number; \code{NaN} for a fit without estimates.
+One number; \code{NaN} on a GLM, GLMM or OLS fit that did not converge,
+which has no fitted values.
 }
 \description{
 As \code{lme4::deviance} (lme4 2.0-6), \code{lm} and \code{glm}. A Gaussian mixed model
@@ -30,6 +31,6 @@ residual sum of squares (as \code{deviance.lm}, whatever \code{REML} the fit was
 with), on a GLM or GLMM the sum over rows of \code{w * d(y, mu)}, \code{d} the
 family's unit deviance at the conditional mean (\link[=fitted.fastglmm]{fitted()},
 which includes the random effects). The weights are read at the fit's
-\code{weight_power}. On a GLMM and on OLS this is not \code{glance()$deviance}, which
+\code{weight_power}. On a GLM, a GLMM and OLS this is not \code{glance()$deviance}, which
 is \code{-2 * logLik}, and never \verb{$deviance}, the optimizer criterion.
 }

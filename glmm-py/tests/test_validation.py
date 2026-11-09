@@ -605,6 +605,8 @@ def test_family_case_is_ignored_as_in_the_r_port():
     _np.testing.assert_array_equal(upper.beta, glmm.fit(FIT_DATA, "y_gamma ~ x", "gamma").beta)
     c = glmm.compare(FIT_DATA, "y_bin ~ 1 + (1 | g)", "y_bin ~ x + (1 | g)", "Binomial")
     assert c.fit1.family == "binomial"
+    dotted = glmm.fit(FIT_DATA, "y_gamma ~ x", "inverse.gaussian")
+    assert dotted.family == "inversegaussian"
     with pytest.raises(ValueError, match=r"^unknown family 'Logistic'; expected one of gaussian, "):
         glmm.fit(DATA, "y ~ x", "Logistic")
 

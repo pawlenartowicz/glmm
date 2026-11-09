@@ -1570,7 +1570,7 @@ pub(super) fn fit_rank_deficient(
         stddev_se: fr.stddev_se,
         n_eval: fr.n_eval,
         #[cfg(feature = "counters")]
-        counters: crate::counters::EvalCounters::new(),
+        counters: fr.counters,
         deviance: fr.deviance,
         // Scalars/per-row/RE-shaped fields pass through: loglik and df come
         // from the REDUCED fit (aliased columns carry no parameter — lme4's
@@ -1710,6 +1710,8 @@ pub(crate) fn validate(
     opts: &FitOptions,
 ) -> Result<(WeightPower, SeType), FitError> {
     // Here and not in `validate_design`: a predict of zero new rows is legal.
+    // The R port repeats this text for an empty data.frame (glmm-r/R/fastglmm.R)
+    // - change together.
     if data.design.n == 0 {
         return Err(FitError::Shape(
             "Data has no rows (n = 0); a fit needs at least one row".into(),

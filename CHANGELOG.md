@@ -6,6 +6,44 @@ All notable changes to the `glmm` crate are recorded here. Format follows
 The Python package (`glmm` on PyPI) is versioned in lockstep with the crate and
 shares these entries; Python-specific notes are called out where they differ.
 
+## [0.9.1] — 2026-11-09
+
+### Added
+
+- New notes `RepeatedGrouping` (two grouping factors that put the rows into the same groups), `SlopeConstantWithinLevels` (a random slope that does not vary within any group; under `||` this includes a slope of ±1 per level), `SeparatedByGrouping` (a binomial response all 0 or all 1 within every group, so that grouping's variance has no finite estimate) and `SingleLevelGrouping` (matrix door only). Each reaches Python as a warning class and R as a `fastglmm_*` condition class; see `documentation/warnings.md`.
+
+### Fixed
+
+- A binomial GLMM with separation whose groupings the size rule reorders no longer panics (`range start index … out of range for slice of length 0` in `fit/common.rs`). It reports `glm_diverged`, as the same model with one grouping does ([#1](https://github.com/pawlenartowicz/glmm/issues/1)).
+- Profile intervals on a model whose groupings the size rule reordered gave each grouping's SD interval to the other grouping. They now belong to the right grouping in all three APIs, and `parm=` returns that grouping's row.
+- A far or huge β warm start on a GLMM falls back to the cold fit when the warm fit does not converge, is not finite or is `precision_limited`, and reports the lower converged fit.
+- The stable OLS fit sums the residual sum of squares from the residuals, so σ̂² and SEs are right under a large response shift. The loop tier's streaming OLS kernel is unchanged.
+- Log-link GLMs with a large offset converge. Binomial, Poisson and negative binomial GLMs with tiny uniform weights match their unit-weight fits and no longer report separation.
+- Fractional binomial GLM and GLMM log-likelihoods, and the AIC in their anova tables, count the saturated constant once. Example: −695.785229 becomes −451.972999.
+- A contrast whose rows of `L` differ in scale by more than about 1e4 could be reported rank-deficient. Rows are now scaled to unit size first, and the result is the same at every scale from 1e-20 to 1e160.
+- A contrast with an all-zero `L` gives `NumDF` 0 and a NaN statistic on every route, with a note. The F note no longer appears on χ² rows.
+- `predict` on a fit without estimates gives NaN for `fit`, `se_fit`, `lower` and `upper`, not 0.
+- `simulate()` draws NaN, not 1e75, for rows with η ≤ 0 on a Gamma inverse or inverse-Gaussian 1/μ² link.
+- `PrecisionLimited` also fires when the fixed-effect pivot of a Gaussian mixed REML fit is lost in rounding noise.
+- Reports of failed fits: a mixed model keeps its title and groups line, `df.resid` is NA (Python) or NaN (R), Python `stddev_se` is NaN-filled, a failed Gamma GLMM footer reads `(phi, ML)`, `residual_variance` is NaN, not None, and `ranef_levels` is filled. Python `stddev_corr` on a fit with no variance estimates raises a `ValueError` with a plain reason instead of an `IndexError`.
+- Python `stddev_se` was empty on every LMM; it is now filled.
+- Pairwise tables on a non-converged fit, and their confidence intervals, carry the not-converged note first.
+- `re.form = NA` no longer needs the grouping columns in the new data.
+- A mixed model whose fixed-effect columns are all dropped as aliased gets "Nothing to estimate. The model has no fixed-effect coefficients…" instead of misleading advice.
+- `Data::new` returns a shape error, not a panic, when n·p overflows.
+- Loop tier: `pinned_components` is in declaration order, not slot order. A non-finite start component, or a dispersion that is not finite and > 0, is dropped and the fit starts cold instead of reaching BOBYQA.
+- `BetterOptimum` messages name the parameter instead of printing the Rust `Debug` text.
+- R: `fitted`, `residuals`, `predict` and `simulate` on a tibble keep the original row numbers after a row drop. `subset=` with NA no longer warns about formula columns. NA in weights or offset gives "offset/weights must be finite: no NaN, inf, or missing entries". Coerce errors name the value, for example `got the string "CR2"`. The `VarCorr` correlation matrix has dimnames.
+- Python: numpy integers and floats are accepted for `nagq`, `init_theta` and `dispersion`. Family names are case-insensitive, and R's `"negative.binomial"` and `"inverse.gaussian"` are accepted, as in R. A non-string column label no longer breaks every fit; it is ignored unless the formula uses it. The `weight_power` ignored-argument text reads "weight_power = {v} has no effect…", with the number printed as R prints it.
+- Docs: `warnings.md` lists the remaining errors and notes. The singular-row rule, the weighted-OLS `reml` text, `coming-from-lme4.md` and `validation.md` are corrected. `Note::Separated` on an all-0 or all-1 binomial GLMM is documented as the code behaves, and the order of `jac_theta` in the Satterthwaite record is documented.
+
+### Changed
+
+- Unused factor levels drop out of the coefficients. A level with no rows gives no `NA` coefficient, and the base level is the first level with rows, so `coef`, `col_names` and `model_matrix` have fewer columns. A factor with only one used level now errors: `column 'f': contrasts can be applied only to factors with 2 or more levels`.
+- R `deviance()` follows lme4, `lm` and `glm`. A Gaussian mixed ML fit gives −2 logLik. A mixed REML fit gives the REML criterion with a warning (class `fastglmm_deviance_reml_criterion`), and `deviance(fit, REML = TRUE)` or `REML = FALSE` on it is refused. GLM and GLMM fits give the sum of squared deviance residuals. New help page `?deviance.fastglmm`.
+- New refusals: data with no rows ("Data has no rows (n = 0); a fit needs at least one row"; zero-row `predict` stays legal); a slope column repeated in one grouping; a one-sided formula ("the formula has no response; write it as y ~ x"); a random slope written with `:` or `*`; duplicate column names and duplicate factor level labels in the formula door; Python string, bool and complex weights or offsets.
+- The Python wheel and the R package build with `private-gemm-x86` 0.1.22 (through `faer`) in place of the yanked 0.1.20, which mishandled the block edges of triangular matrix products, and with the other dependencies at their latest versions that build on Rust 1.85. No test or grid result moved.
+
 ## [0.9.0] — 2026-11-07
 
 ### Added

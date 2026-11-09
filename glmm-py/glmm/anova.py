@@ -326,7 +326,8 @@ class PairwiseTable(_Table):
             if st["adjust"] == "holm"
             else _adjust_line(st, ci["adjust"], intervals=True)
         )
-        notes = [f"Confidence level used: {float(level):g}"]
+        notes = [_NOT_CONVERGED] if _NOT_CONVERGED in self.notes else []
+        notes += [f"Confidence level used: {float(level):g}"]
         notes += [adjust] if adjust is not None else []
         notes += _pairwise_notes(st)
         return PairwiseTable(values, list(self.row_names), self.heading, notes, None)

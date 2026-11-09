@@ -1072,7 +1072,7 @@ logLik.fastglmm <- function(object, ...) {
 #' with), on a GLM or GLMM the sum over rows of `w * d(y, mu)`, `d` the
 #' family's unit deviance at the conditional mean ([fitted()][fitted.fastglmm],
 #' which includes the random effects). The weights are read at the fit's
-#' `weight_power`. On a GLMM and on OLS this is not `glance()$deviance`, which
+#' `weight_power`. On a GLM, a GLMM and OLS this is not `glance()$deviance`, which
 #' is `-2 * logLik`, and never `$deviance`, the optimizer criterion.
 #'
 #' @param object a [fastglmm] fit.
@@ -1082,7 +1082,8 @@ logLik.fastglmm <- function(object, ...) {
 #'   not computed. `-2 * logLik(fit)` gives the REML criterion without the
 #'   warning.
 #' @param ... unused.
-#' @return One number; `NaN` for a fit without estimates.
+#' @return One number; `NaN` on a GLM, GLMM or OLS fit that did not converge,
+#'   which has no fitted values.
 #' @export
 deviance.fastglmm <- function(object, REML = NULL, ...) {
   if (!(is.null(REML) || (is.logical(REML) && length(REML) == 1L && !is.na(REML)))) {
@@ -1095,9 +1096,11 @@ deviance.fastglmm <- function(object, REML = NULL, ...) {
            "-2 * logLik(fit) for the REML criterion", call. = FALSE)
     }
     if (isTRUE(object$reml) && is.null(REML)) {
-      warning("deviance() of a REML fit returns the REML criterion, not the deviance. ",
-              "Use -2 * logLik(fit) to get it without this warning, or refit ",
-              "with REML = FALSE for the deviance", call. = FALSE)
+      warning(warningCondition(paste0(
+        "deviance() of a REML fit returns the REML criterion, not the deviance. ",
+        "Use -2 * logLik(fit) to get it without this warning, or refit ",
+        "with REML = FALSE for the deviance"),
+        class = c("fastglmm_deviance_reml_criterion", "fastglmm_diagnostic"), call = NULL))
     }
     return(-2 * as.numeric(object$loglik))
   }

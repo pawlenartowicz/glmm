@@ -1807,8 +1807,9 @@ def _count(n, word):
 def _check_call(formula, family, link):
     """The checks `fit` and `compare` make on a formula, the family and the
     link before any data is read; returns `(family, link)`: the family
-    lowercased (case is ignored, as in the R port), the link the family's
-    default when `link` is None."""
+    lowercased (case is ignored, as in the R port) with R's dotted names
+    mapped to the kernel's, the link the family's default when `link` is
+    None."""
     # A formula shape the shared Rust parser has no dedicated message for (it
     # would fall through to a generic syntax error): caught here with the same
     # wording the R port uses (glmm-r/R/fastglmm.R's .check_formula) — change
@@ -1817,6 +1818,11 @@ def _check_call(formula, family, link):
         raise ValueError("'.' is not supported by the formula parser; list the columns explicitly")
 
     name = family.lower() if isinstance(family, str) else family
+    # R's own names, which the R port's string family also takes
+    # (glmm-r/R/fastglmm.R, the tolower(family) switch) - change together.
+    name = {"negative.binomial": "negativebinomial", "inverse.gaussian": "inversegaussian"}.get(
+        name, name
+    )
     if name not in _FAMILIES:
         raise ValueError(f"unknown family {family!r}; expected one of {', '.join(_FAMILIES)}")
     fam = _FAMILIES[name]
@@ -2348,7 +2354,8 @@ def fit(
     data: dict[str, array-like]; DataFrame / Arrow Table also accepted (duck-typed).
     formula: R-style string, e.g. "y ~ x + z + (1 + x | g)".
     family: gaussian | binomial | poisson | gamma | negativebinomial | inversegaussian;
-        case is ignored ("Gamma" is "gamma").
+        case is ignored ("Gamma" is "gamma"), and R's "negative.binomial" and
+        "inverse.gaussian" are accepted.
     nagq: adaptive Gauss-Hermite quadrature nodes per random-effect dimension
         (odd, 1..=25; default 1 = Laplace). k>1 applies to binomial, Poisson,
         negative-binomial and Gamma models with a single grouping factor and
@@ -2604,7 +2611,8 @@ def fit(
         _warn(
             store,
             "argument_ignored",
-            f"weight_power = {weight_power} has no effect without weights.",
+            # R's format() of the number, 7 significant digits (glmm-r/R/fastglmm.R).
+            f"weight_power = {weight_power:.7g} has no effect without weights.",
             ArgumentIgnoredWarning,
         )
     return _fit_from_native(r, formula, family, link, nagq, dispersion, store, kept)

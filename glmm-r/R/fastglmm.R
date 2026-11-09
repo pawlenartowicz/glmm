@@ -457,7 +457,9 @@ fastglmm <- function(formula, data, family = gaussian(),
     # missing-value row drop empties the data - change together
     # (glmm-py/glmm/__init__.py, the na_mask block). An empty data.frame gets
     # the kernel's text, as Python passes it through. A subset= that keeps no
-    # row has no Python counterpart, so it keeps the plain message.
+    # row has no Python counterpart, so it keeps the plain message. The
+    # empty-data.frame text mirrors the kernel's n == 0 check in
+    # glmm-rs/src/fit/common.rs - change together.
     if (n_before_na > 0L) {
       stop("every row has a missing value in a column the formula uses; no rows left to fit",
            call. = FALSE)
