@@ -508,7 +508,7 @@ fn predict_sleepstudy_matches_its_frozen_reference() {
     }
 }
 
-/// §10.3: on a robust fit `predict` reads the model covariance, so its SEs
+/// On a robust fit `predict` reads the model covariance, so its SEs
 /// equal the same fit's with `se_type = Model` to 1e-12, with
 /// `Note::PredictSeModelBased` when the SE is asked for and not otherwise.
 #[test]

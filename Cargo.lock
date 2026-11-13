@@ -534,7 +534,7 @@ checksum = "e629b9b98ef3dd8afe6ca2bd0f89306cec16d43d907889945bc5d6687f2f13c7"
 
 [[package]]
 name = "glmm"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "bobyqa",
  "commonstats",
@@ -550,7 +550,7 @@ dependencies = [
 
 [[package]]
 name = "glmm-bind"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "glmm",
  "libm",
@@ -558,7 +558,7 @@ dependencies = [
 
 [[package]]
 name = "glmm-python"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "glmm-bind",
  "pyo3",
@@ -566,7 +566,7 @@ dependencies = [
 
 [[package]]
 name = "glmm-r"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "extendr-api",
  "glmm-bind",
@@ -1499,7 +1499,7 @@ checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
 
 [[package]]
 name = "validation"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "glmm",
  "libc",

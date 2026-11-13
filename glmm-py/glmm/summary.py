@@ -28,9 +28,6 @@ from glmm import _native
 # The footer of a Gaussian mixed model's t tests, as the native summary record
 # carries it.
 FOOTNOTE = "t tests use Satterthwaite degrees of freedom (finite-difference θ-Hessian)."
-# The note under the title of a Gaussian mixed model fitted by ML. Same line the
-# R port prints - change together.
-ML_NOTE = "Note: p-values can be somewhat anticonservative."
 # The footer of a Gaussian mixed model fitted with satterthwaite=False; the R port
 # prints "df not computed (satterthwaite = FALSE)", its own argument spelling.
 DF_NOT_COMPUTED = "df not computed (satterthwaite=False)"
@@ -279,6 +276,7 @@ def build_summary(fit, effect_sizes=None, need_refit=False):
                 "re_groups": [(name, list(terms)) for name, terms in fit.re_groups],
                 "re_term_index": [list(t) for t in fit.re_term_index],
                 "ranef_levels": fit.ranef_levels,
+                "re_group_levels": (fit._kernel_parts or {}).get("re_group_levels"),
                 "y": _f64_bytes(fit.y),
                 "fitted": _f64_bytes(fit.fitted),
                 "weights": _f64_bytes(fit.weights),
@@ -314,7 +312,6 @@ def build_summary(fit, effect_sizes=None, need_refit=False):
         # This port prints NA for an infinite z, where the record (as R's
         # 2 * pnorm(-Inf)) has 0.
         r["p_value"][np.isinf(r["statistic"])] = math.nan
-    r["method"] += " [glmm]"
     r["groups"] = list(zip(r["groups"]["names"], r["groups"]["levels"]))
     r["aliased"] = np.asarray(r["aliased"], dtype=bool)
     if df_method == "disabled":
@@ -344,7 +341,9 @@ class Summary(Rendered):
     statistic: np.ndarray
     test: str  # "t" or "z": the statistic's column names
     p_value: np.ndarray
-    residual_df: int | None  # n - p on OLS and the dispersion GLMs, else None
+    residual_df: (
+        int | float | None
+    )  # n - p on OLS and the dispersion GLMs (NaN on a fit with no estimates), else None
     rss: float
     r_squared: float
     adj_r_squared: float
@@ -369,6 +368,9 @@ class Summary(Rendered):
     # The weight power when estimated or other than 1, then (when estimated)
     # the line that it left the simulated range and the model SE's footnote.
     weight_power_lines: list = field(default_factory=list)
+    # The note under the title of a Gaussian mixed model fitted by ML, else
+    # None.
+    ml_note: str | None = None
 
     def __repr__(self):
         return self.text()
@@ -499,8 +501,9 @@ class Summary(Rendered):
         if self.residual_df is None or self.family != "gaussian":
             return []
         sigma = math.sqrt(self.rss / self.residual_df) if self.residual_df > 0 else math.nan
+        df = "NA" if math.isnan(self.residual_df) else self.residual_df
         return [
-            f"Residual standard error: {fmt(sigma)} on {self.residual_df} degrees of freedom",
+            f"Residual standard error: {fmt(sigma)} on {df} degrees of freedom",
             (
                 f"Multiple R-squared:  {fmt(self.r_squared)},\t"
                 f"Adjusted R-squared:  {fmt(self.adj_r_squared)}"
@@ -512,7 +515,8 @@ class Summary(Rendered):
         dispersion GLM with phi estimated."""
         line = f"{self.dispersion_label}: {fmt(self.dispersion, 6)}"
         if self.residual_df is not None:
-            line += f" on {self.residual_df} degrees of freedom"
+            df = "NA" if math.isnan(self.residual_df) else self.residual_df
+            line += f" on {df} degrees of freedom"
         return line
 
     def _tables(self):
@@ -620,9 +624,7 @@ class Summary(Rendered):
     def _notes(self):
         """The notes printed directly under the title: the ML note on an ML fit
         of a Gaussian mixed model, else none. It cannot be switched off."""
-        if self.family == "gaussian" and self.random_effects and not self.reml:
-            return [ML_NOTE]
-        return []
+        return [] if self.ml_note is None else [self.ml_note]
 
     def _header_lines(self):
         lines = [self.method, f"Formula: {self.formula}", f"Family: {self.family} ({self.link})"]

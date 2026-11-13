@@ -6,7 +6,9 @@
 
 use super::{build_workspace, fit_on, FitKind};
 use crate::fit::{
-    common_tests::{lcg, weighted_collinear_ols_fixture},
+    common_tests::{
+        lcg, nested_slope_case, nested_slope_spellings, weighted_collinear_ols_fixture,
+    },
     spec_sized_from_ids,
 };
 use crate::test_support::assert_near;
@@ -926,10 +928,12 @@ fn glmm_nb_view_flags_a_pinned_component() {
 // --- sparse routing (crossed extra-grouping random slope) ---
 
 /// A crossed Gaussian LMM whose EXTRA grouping carries `extra_slopes` as its
-/// random-slope x-columns. With `vec![1]` this is the shape `classify_design`
-/// routes to `Sparse`, and the shape a dense hot path drops the extra slope from
-/// if it fails to route; with `vec![]` (intercept-only extra) the same design
-/// stays inside the dense NoZ envelope. Returns a converging design either way.
+/// random-slope x-columns, and the primary the same ones. With `vec![1]` this is
+/// the shape `classify_design` routes to `Sparse`, and the shape a dense hot path
+/// drops the extra slope from if it fails to route; the primary's slope keeps
+/// the extra's from being the only one, which the fit could put first. With
+/// `vec![]` (intercept-only groupings) the same design stays inside the dense
+/// NoZ envelope. Returns a converging design either way.
 fn crossed_extra_case(
     extra_slopes: Vec<u32>,
 ) -> (
@@ -966,7 +970,7 @@ fn crossed_extra_case(
         family: Family::Gaussian,
         re: Some(ReStructure {
             terms: Vec::new(),
-            slopes: vec![],
+            slopes: extra_slopes.clone(),
             extra_groupings: vec![Grouping {
                 terms: Vec::new(),
                 relation: GroupingRelation::Crossed,
@@ -1111,10 +1115,10 @@ fn fit_on_glm_larger_then_smaller_matches_fit_cold() {
 
 /// Dense-LMM workspace reuse over changed responses, without and with an
 /// offset. A repeat of one draw would agree even with stale accumulator state;
-/// a different draw will not. The offset path fills the preallocated
-/// `y_shifted` (a build-once sibling buffer) fresh from `y - offset` every
-/// call, so a stale entry from the previous call would show up as a wrong
-/// shift on the next. Each pass builds its own workspace.
+/// a different draw will not. Every call refills the internal response
+/// (`standardize::Units`, a build-once buffer) from `y − offset`, so a stale
+/// entry from the previous call would show up as a wrong shift on the next.
+/// Each pass builds its own workspace.
 #[test]
 fn fit_on_lmm_dense_reuse_with_and_without_offset_matches_fit_cold() {
     let (x, full_y, n, p, model, ids, base_opts) = lmm_intercept_case();
@@ -1322,16 +1326,17 @@ fn reordered_crossed_case() -> (
 
 /// The two per-draw θ marshalling steps `fit_on` does outside the solver — the
 /// scaled-θ read-back in `FitView::new`, and permuting a warm start into slot
-/// order — must cost the warm loop nothing. Both arms are covered because they
-/// are mutually exclusive by construction: the grouping swap only fires on an
-/// all-intercept design, which is exactly the design that carries no RE column
-/// scale.
+/// order — must cost the warm loop nothing. Three arms: a slope design with a
+/// column scale and no reorder, an intercept-only design the size rule
+/// reorders, and a lone slope grouping written last, which the rule reorders
+/// with blocks of unequal width and which also carries a column scale.
 ///
 /// `fit_on` as a whole cannot be measured at zero — the post-fit Cholesky
 /// factors and the first warm call's BOBYQA instance allocate — so the gate is
-/// a pin on the TOTAL over a fixed call count. Re-materializing θ̂ or
-/// re-cloning a start costs 2 blocks per draw, so a regression overshoots by
-/// `2 * N_CALLS`, well outside the pin.
+/// a pin on the TOTAL over a fixed call count, one pin for the first two arms
+/// and one for the third. Re-materializing θ̂ or re-cloning a start costs 2
+/// blocks per draw, so a regression overshoots by `2 * N_CALLS`, well outside
+/// the pin.
 ///
 /// Run: `RAYON_NUM_THREADS=1 cargo test -p glmm --features alloc-tests
 /// fit_on_theta_marshalling_bounded_alloc -- --ignored --test-threads=1`
@@ -1427,6 +1432,59 @@ fn fit_on_theta_marshalling_bounded_alloc() {
         N_CALLS,
         BOUND
     );
+
+    // Third arm, its own window: `(1 | h) + (1 + x | g)` with x scaled, so one
+    // draw moves θ blocks of width 1 and 3 and reads back a column scale.
+    // Measured exactly 272 (2026-11-11) under the same protocol: 172 blocks
+    // once, for the warm BOBYQA instance built on the first warm call, then one
+    // block per iteration (222 at 50 calls). Pinned with no slack, as above.
+    const SLOPE_BOUND: u64 = 272;
+    let (mut xl, yl, nl, h, g) = lone_slope_case(0.6);
+    for i in 0..nl {
+        xl[i * 2 + 1] *= 7.0;
+    }
+    let (ml, _) = lone_slope_spellings(Family::Gaussian, vec![1]);
+    let ids_l = GroupIds::new(h).extra(g);
+    let ol = FitOptions {
+        se_for: SeFor::Only(vec![0, 1]),
+        ..FitOptions::default()
+    };
+    let (_, _, perm_l) = spec_sized_from_ids(&ml, &ids_l);
+    assert!(
+        !perm_l.is_identity(),
+        "the slope arm needs a reordering workspace"
+    );
+    let mut ws_slope = build_workspace(&ml, &ids_l, nl, 2, &ol);
+    assert!(ws_slope.is_lmm());
+    let start_l = {
+        let v = fit_on(&mut ws_slope, &Data::new(&xl, &yl, nl, 2), None, &ol);
+        assert_eq!(v.theta().len(), 4);
+        crate::StartValues {
+            beta: v.betas().to_vec(),
+            theta: v.theta().to_vec(),
+            dispersion: None,
+        }
+    };
+    crate::test_support::settle_background_allocs();
+    let profiler = dhat::Profiler::builder().testing().build();
+    for _ in 0..N_CALLS {
+        let v = fit_on(
+            &mut ws_slope,
+            &Data::new(&xl, &yl, nl, 2),
+            Some(&start_l),
+            &ol,
+        );
+        std::hint::black_box(std::hint::black_box(&v).theta());
+    }
+    let stats = dhat::HeapStats::get();
+    drop(profiler);
+    assert!(
+        stats.total_blocks <= SLOPE_BOUND,
+        "fit_on allocated {} blocks across {} warm-path calls of the slope arm (SLOPE_BOUND = {})",
+        stats.total_blocks,
+        N_CALLS,
+        SLOPE_BOUND
+    );
 }
 
 /// A warm `fit_on` loop under `SeFor::All` (the default) allocates exactly
@@ -1492,9 +1550,10 @@ fn fit_on_se_for_all_allocates_like_the_explicit_list() {
 
 /// A Poisson GLMM with one crossed grouping, on the structured layout
 /// (`packed = false`: 12 × 6 intercept levels, 240 rows) or the packed layout
-/// with the sparse factor of `A` (`packed = true`: a slope on the crossed
-/// grouping, 256 + 4·2 = 264 RE columns, past `PACKED_SPARSE_MIN_K`, 512
-/// rows). Row `i` sits in primary level `i % g1` and crossed level
+/// with the sparse factor of `A` (`packed = true`: a slope on both groupings,
+/// 256·2 + 4·2 = 520 RE columns, past `PACKED_SPARSE_MIN_K`, 512 rows; the
+/// primary's slope keeps the crossed one from being the only one, which the
+/// fit could put first). Row `i` sits in primary level `i % g1` and crossed level
 /// `(i / shift) % g2`; draws with the same `shift` share their rows' levels.
 /// The response and the offset are drawn from `seed`.
 #[allow(clippy::type_complexity)]
@@ -1550,7 +1609,7 @@ fn glmm_pattern_draw(
         },
         re: Some(ReStructure {
             terms: Vec::new(),
-            slopes: vec![],
+            slopes: if packed { vec![1] } else { vec![] },
             extra_groupings: vec![Grouping {
                 terms: Vec::new(),
                 relation: GroupingRelation::Crossed,
@@ -2745,12 +2804,14 @@ fn re_column_copy_matches_the_fixed_column_slope() {
     let w: Vec<f64> = (0..n).map(|i| 0.5 + (i % 3) as f64 * 0.5).collect();
     let primary = GroupIds::new(pid.clone());
     let crossed = GroupIds::new(pid).extra(eid);
-    // The slope on the primary grouping, or on a crossed extra grouping.
+    // The slope on the primary grouping, or on both it and a crossed extra
+    // grouping (with the extra's slope the only one, the fit could put the
+    // extra first).
     let spec = |family: Family, slope: u32, on_extra: bool| ModelSpec {
         family,
         re: Some(ReStructure {
             terms: Vec::new(),
-            slopes: if on_extra { vec![] } else { vec![slope] },
+            slopes: vec![slope],
             extra_groupings: if on_extra {
                 vec![Grouping {
                     terms: Vec::new(),
@@ -2938,15 +2999,17 @@ enum ContrastRe {
     None,
     /// A random intercept on 8 levels.
     Intercept,
-    /// The random intercept plus a crossed 6-level grouping carrying a random
-    /// slope on `x1` (the sparse LMM route, the packed GLMM layout).
+    /// A random intercept and slope on `x1` plus a crossed 6-level grouping
+    /// carrying a random slope on `x1` too (the sparse LMM route, the packed
+    /// GLMM layout; with the crossed slope the only one, the fit could put the
+    /// crossed grouping first).
     Crossed,
 }
 
 /// A deterministic n = 96, p = 3 design `[1, x1, x2]` with two continuous
 /// columns (so the draw's column map centres and scales both), 8 primary
-/// levels `i % 8`, and under [`ContrastRe::Crossed`] a crossed grouping
-/// `(i / 8) % 6` with a random slope on `x1`. The response is drawn per family
+/// levels `i % 8`, and under [`ContrastRe::Crossed`] a random slope on `x1` on
+/// them and on a crossed grouping `(i / 8) % 6`. The response is drawn per family
 /// from `η = 0.3 + 0.5·x1 − 0.4·x2` (plus a level term with random effects)
 /// with the deterministic noise `((i·3) % 7 − 3) / 3`.
 fn contrast_case(
@@ -2992,7 +3055,7 @@ fn contrast_case(
         ContrastRe::Crossed => (
             Some(ReStructure {
                 terms: Vec::new(),
-                slopes: vec![],
+                slopes: vec![1],
                 extra_groupings: vec![Grouping {
                     terms: Vec::new(),
                     relation: GroupingRelation::Crossed,
@@ -3936,20 +3999,20 @@ fn polish_out_of_budget_is_not_converged() {
         "a polish out of budget reported converged"
     );
     assert!(capped.deviance.is_finite());
-    assert!(capped.diagnostics.pinned.is_empty());
+    assert!(!capped.diagnostics.pinned.iter().flatten().any(|&b| b));
 }
 
-// --- predictor columns past the f64 square-root range ---
+// --- a predictor column at the top of the data range ---
 
-/// A predictor column at values of 1e154 and above, where its sum of squares
-/// overflows, fits as the same column at scale 1: the alias check keeps it,
-/// and the fit gives the scale-1 log-likelihood, flags and notes with its
+/// A predictor column at the top of the data range (scale `MAX_DATA_ABS`, so
+/// |x| up to 5e99) fits as the same column at scale 1: the alias check keeps
+/// it, and the fit gives the scale-1 log-likelihood, flags and notes with its
 /// coefficient divided by the scale. GLM and GLMM `(1 | g)`, on logit,
 /// Poisson, negative binomial and a separated logit, which keeps its
 /// `Separated` note. n = 60, `x = scale·t` with `t` on a fixed irregular grid
 /// in [-0.5, 0.5], six groups.
 #[test]
-fn a_predictor_past_1e154_fits_as_at_scale_1() {
+fn a_predictor_near_the_data_bound_fits_as_at_scale_1() {
     use crate::{NegBinomialLink, Note, PoissonLink};
     let n = 60usize;
     let t: Vec<f64> = (0..n)
@@ -4016,41 +4079,40 @@ fn a_predictor_past_1e154_fits_as_at_scale_1() {
                     .any(|m| matches!(m, Note::Separated))
             };
             assert_eq!(separated(&base), name == "separated logit", "{tag}");
-            for s in [1e154, 1e200, 1e300] {
-                let f = fit_at(s);
-                let ctx = format!("{tag} at {s:e}");
-                assert_eq!(f.aliased(), [false, false], "{ctx}");
-                assert_eq!(f.converged(), base.converged(), "{ctx}");
-                assert_eq!(separated(&f), separated(&base), "{ctx}");
-                assert!(
-                    close(f.loglik, base.loglik),
-                    "{ctx}: loglik {} vs {}",
-                    f.loglik,
-                    base.loglik
-                );
-                assert!(
-                    close(f.beta[0], base.beta[0]),
-                    "{ctx}: beta {:?} vs {:?}",
-                    f.beta,
-                    base.beta
-                );
-                assert!(
-                    close(f.beta[1] * s, base.beta[1]),
-                    "{ctx}: beta {:?} vs {:?}",
-                    f.beta,
-                    base.beta
-                );
-                ran += 1;
-            }
+            let s = crate::limits::MAX_DATA_ABS;
+            let f = fit_at(s);
+            let ctx = format!("{tag} at {s:e}");
+            assert_eq!(f.aliased(), [false, false], "{ctx}");
+            assert_eq!(f.converged(), base.converged(), "{ctx}");
+            assert_eq!(separated(&f), separated(&base), "{ctx}");
+            assert!(
+                close(f.loglik, base.loglik),
+                "{ctx}: loglik {} vs {}",
+                f.loglik,
+                base.loglik
+            );
+            assert!(
+                close(f.beta[0], base.beta[0]),
+                "{ctx}: beta {:?} vs {:?}",
+                f.beta,
+                base.beta
+            );
+            assert!(
+                close(f.beta[1] * s, base.beta[1]),
+                "{ctx}: beta {:?} vs {:?}",
+                f.beta,
+                base.beta
+            );
+            ran += 1;
         }
     }
-    assert_eq!(ran, 24);
+    assert_eq!(ran, 8);
 }
 
-/// Two crossed intercept-only groupings, a (4 levels, no variance) declared
-/// before b (40 levels): the size rule makes b the kernel's primary. The view's
-/// pinned mask must follow `theta()` into declaration order, and agree with the
-/// stable `Fit`.
+/// Gaussian and binomial: two crossed intercept-only groupings, a (4 levels, no
+/// variance) declared before b (40 levels): the size rule makes b the kernel's
+/// primary. The view's pinned mask must follow `theta()` into declaration
+/// order, and agree with the stable `Fit`.
 #[test]
 fn view_pinned_mask_follows_declaration_order_under_the_size_rule() {
     let (n, p) = (800, 2);
@@ -4089,4 +4151,587 @@ fn view_pinned_mask_follows_declaration_order_under_the_size_rule() {
     assert!(view.perm.is_identity());
     assert_eq!(view.theta()[1], 0.0);
     assert_eq!(view.diagnostics().pinned_components, 0b10);
+
+    // Binomial: a fully crossed with b, one aggregated row per cell, and the
+    // same successes in every a level, so the a margins are equal.
+    let (n, p, trials) = (160, 1, 20.0);
+    let (a, b): (Vec<u32>, Vec<u32>) = (0..n as u32).map(|i| (i / 40, i % 40)).unzip();
+    let y: Vec<f64> = b
+        .iter()
+        .map(|&ib| {
+            let eta = 0.3 + 0.8 * (1.3 * ib as f64 + 0.2).sin();
+            (trials / (1.0 + (-eta).exp())).round() / trials
+        })
+        .collect();
+    let x = vec![1.0; n];
+    let w = vec![trials; n];
+    let model = ModelSpec::mixed(
+        Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        ReStructure::intercept().extra(Grouping::crossed()),
+    );
+    let data = Data::new(&x, &y, n, p).weights(&w);
+
+    let mut ws_ab = build_workspace(
+        &model,
+        &GroupIds::new(a.clone()).extra(b.clone()),
+        n,
+        p,
+        &opts,
+    );
+    let view_ab = fit_on(&mut ws_ab, &data, None, &opts);
+    assert!(!view_ab.perm.is_identity());
+    assert!(view_ab.diagnostics().converged);
+    assert_eq!(view_ab.diagnostics().pinned_components, 0b01);
+
+    let mut ws_ba = build_workspace(&model, &GroupIds::new(b).extra(a), n, p, &opts);
+    let view_ba = fit_on(&mut ws_ba, &data, None, &opts);
+    assert!(view_ba.perm.is_identity());
+    assert_eq!(view_ba.diagnostics().pinned_components, 0b10);
+    let bits = |t: &[f64]| -> Vec<u64> { t.iter().map(|v| v.to_bits()).collect() };
+    assert_eq!(
+        bits(view_ab.theta()),
+        bits(&[view_ba.theta()[1], view_ba.theta()[0]])
+    );
+
+    let fit = view_ab.into_fit(&data, &model, &opts);
+    assert_eq!(fit.diagnostics().pinned, vec![vec![true], vec![false]]);
+}
+
+/// Two crossed intercept-only groupings, a (6 levels) declared before b (40
+/// levels): the size rule makes b the kernel's primary. The stored
+/// Satterthwaite state must list its free θ coordinates in declaration order,
+/// so it is the state of the fit declared b-first with a and b swapped. The
+/// same for a lone slope grouping written last, whose θ block is three wide.
+#[test]
+fn satterthwaite_state_follows_declaration_order_under_the_size_rule() {
+    let (n, p) = (600, 2);
+    let mut st = 7u64;
+    let ua: Vec<f64> = (0..6).map(|_| 2.0 * lcg(&mut st)).collect();
+    let ub: Vec<f64> = (0..40).map(|_| 0.3 * lcg(&mut st)).collect();
+    let (mut x, mut y, mut a, mut b) = (vec![], vec![], vec![], vec![]);
+    for _ in 0..n {
+        let ia = ((lcg(&mut st) + 1.0) * 0.5 * 6.0) as usize % 6;
+        let ib = ((lcg(&mut st) + 1.0) * 0.5 * 40.0) as usize % 40;
+        let x1 = lcg(&mut st);
+        x.extend([1.0, x1]);
+        y.push(0.3 + 0.5 * x1 + ua[ia] + ub[ib] + lcg(&mut st));
+        a.push(ia as u32);
+        b.push(ib as u32);
+    }
+    let model = ModelSpec::mixed(
+        Family::Gaussian,
+        ReStructure::intercept().extra(Grouping::crossed()),
+    );
+    let opts = FitOptions::default();
+    let s = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &model,
+        &GroupIds::new(a.clone()).extra(b.clone()),
+        &opts,
+    );
+    let u = fit_cold(&x, &y, n, p, &model, &GroupIds::new(b).extra(a), &opts);
+    assert!(s.converged() && u.converged());
+    let us = u.satterthwaite.as_ref().unwrap();
+    let bits = |m: &faer::Mat<f64>| -> Vec<u64> {
+        (0..m.ncols())
+            .flat_map(|j| (0..m.nrows()).map(move |i| m[(i, j)].to_bits()))
+            .collect()
+    };
+    assert_eq!(us.jac_theta.len(), 2);
+    assert_ne!(bits(&us.jac_theta[0]), bits(&us.jac_theta[1]));
+
+    assert_satterthwaite_mirror(&s, &u, &[1, 0, 2], "rule 1");
+
+    // `(1 | h) + (1 + x | g)` against `(1 + x | g) + (1 | h)`: the free θ of
+    // the first spelling, h then g's three, sit at 3, 0, 1, 2 in the second.
+    let (x, y, n, h, g) = lone_slope_case(0.6);
+    let (last, first) = lone_slope_spellings(Family::Gaussian, vec![1]);
+    let s = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &last,
+        &GroupIds::new(h.clone()).extra(g.clone()),
+        &opts,
+    );
+    let u = fit_cold(&x, &y, n, p, &first, &GroupIds::new(g).extra(h), &opts);
+    assert!(s.converged() && u.converged());
+    assert_eq!(u.satterthwaite.as_ref().unwrap().jac_theta.len(), 4);
+    assert_satterthwaite_mirror(&s, &u, &[3, 0, 1, 2, 4], "rule 2");
+
+    // The same with h nested in g once g moves first.
+    let (x, y, _, n, h, g) = nested_slope_case(false);
+    let (last, first) = nested_slope_spellings(Family::Gaussian);
+    let s = fit_cold(
+        &x,
+        &y,
+        n,
+        p,
+        &last,
+        &GroupIds::new(h.clone()).extra(g.clone()),
+        &opts,
+    );
+    let u = fit_cold(&x, &y, n, p, &first, &GroupIds::new(g).extra(h), &opts);
+    assert!(s.converged() && u.converged());
+    assert_satterthwaite_mirror(&s, &u, &[3, 0, 1, 2, 4], "rule 2, nested");
+}
+
+/// `s`'s Satterthwaite state is `u`'s with free θ coordinate `k` of `s` at
+/// `pi[k]` of `u` (τ last): bit for bit, and `coef_df` to 1e-12 relative.
+fn assert_satterthwaite_mirror(s: &crate::Fit, u: &crate::Fit, pi: &[usize], ctx: &str) {
+    let (ss, us) = (
+        s.satterthwaite.as_ref().unwrap(),
+        u.satterthwaite.as_ref().unwrap(),
+    );
+    let bits = |m: &faer::Mat<f64>| -> Vec<u64> {
+        (0..m.ncols())
+            .flat_map(|j| (0..m.nrows()).map(move |i| m[(i, j)].to_bits()))
+            .collect()
+    };
+    let m = pi.len();
+    assert_eq!(ss.jac_theta.len(), m - 1, "{ctx}");
+    for (k, &pk) in pi[..m - 1].iter().enumerate() {
+        assert_eq!(
+            bits(&ss.jac_theta[k]),
+            bits(&us.jac_theta[pk]),
+            "{ctx}: jac_theta[{k}]"
+        );
+    }
+    assert_eq!((ss.a_eff.nrows(), ss.a_eff.ncols()), (m, m), "{ctx}");
+    for i in 0..m {
+        for j in 0..m {
+            assert_eq!(
+                ss.a_eff[(i, j)].to_bits(),
+                us.a_eff[(pi[i], pi[j])].to_bits(),
+                "{ctx}: a_eff[({i}, {j})]"
+            );
+        }
+    }
+    assert_eq!(bits(&ss.c), bits(&us.c), "{ctx}");
+    assert_eq!(ss.tau.to_bits(), us.tau.to_bits(), "{ctx}");
+    assert_eq!(ss.nu.to_bits(), us.nu.to_bits(), "{ctx}");
+    for (j, (&sd, &ud)) in s.coef_df.iter().zip(&u.coef_df).enumerate() {
+        assert!(
+            sd.is_finite() && ud.is_finite(),
+            "{ctx}: coef_df[{j}]: {sd} vs {ud}"
+        );
+        assert!(
+            (sd - ud).abs() <= 1e-12 * ud.abs(),
+            "{ctx}: coef_df[{j}]: {sd} vs {ud}"
+        );
+    }
+}
+
+/// `(1 | h) + (1 + x | g)` data: h of 8 levels with intercept SD `h_sd`, g of
+/// 12 levels with a correlated intercept and slope on `x`. Each run of 8 rows
+/// holds every h level once at one g level and one `x`, and the noise sums to
+/// zero within each h level, so at `h_sd = 0` the h-level means of `y` are
+/// equal and h's variance estimate is 0. Returns `(x, y, n, h, g)`, `x`
+/// row-major `n × 2` with an intercept column.
+fn lone_slope_case(h_sd: f64) -> (Vec<f64>, Vec<f64>, usize, Vec<u32>, Vec<u32>) {
+    let n = 480;
+    let mut st = 31u64;
+    let uh: Vec<f64> = (0..8).map(|_| h_sd * lcg(&mut st)).collect();
+    let ug: Vec<(f64, f64)> = (0..12)
+        .map(|_| (0.8 * lcg(&mut st), 0.4 * lcg(&mut st)))
+        .collect();
+    let xb: Vec<f64> = (0..n / 8).map(|_| lcg(&mut st)).collect();
+    let mut e: Vec<f64> = (0..n).map(|_| 0.5 * lcg(&mut st)).collect();
+    for ih in 0..8 {
+        let m = (ih..n).step_by(8).map(|i| e[i]).sum::<f64>() / (n / 8) as f64;
+        (ih..n).step_by(8).for_each(|i| e[i] -= m);
+    }
+    let (mut x, mut y, mut h, mut g) = (vec![], vec![], vec![], vec![]);
+    for i in 0..n {
+        let (ih, ig, x1) = (i % 8, (i / 8) % 12, xb[i / 8]);
+        x.extend([1.0, x1]);
+        y.push(0.3 + 0.5 * x1 + uh[ih] + ug[ig].0 + ug[ig].1 * x1 + e[i]);
+        h.push(ih as u32);
+        g.push(ig as u32);
+    }
+    (x, y, n, h, g)
+}
+
+/// The two spellings of a model with one slope grouping, slope last
+/// `(1 | h) + (1 + x | g)` and slope first `(1 + x | g) + (1 | h)`, with
+/// `slopes` the slope grouping's columns.
+fn lone_slope_spellings(family: Family, slopes: Vec<u32>) -> (ModelSpec, ModelSpec) {
+    (
+        ModelSpec::mixed(
+            family,
+            ReStructure::intercept().extra(Grouping::crossed().slopes(slopes.clone())),
+        ),
+        ModelSpec::mixed(
+            family,
+            ReStructure::intercept()
+                .slopes(slopes)
+                .extra(Grouping::crossed()),
+        ),
+    )
+}
+
+/// `v` cut into one slice per grouping, block g `width(g)` long.
+fn grouping_blocks(v: &[f64], n_groupings: usize, width: impl Fn(usize) -> usize) -> Vec<&[f64]> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    for g in 0..n_groupings {
+        out.push(&v[at..at + width(g)]);
+        at += width(g);
+    }
+    assert_eq!(at, v.len(), "the blocks cover the vector");
+    out
+}
+
+/// `a` (slope last) and `b` (slope first) are bit for bit the same fit, with
+/// each per-grouping field of `a` in the reverse grouping order of `b`'s.
+fn assert_two_grouping_mirror(a: &crate::Fit, b: &crate::Fit, ctx: &str) {
+    let bits = |v: &[f64]| v.iter().map(|t| t.to_bits()).collect::<Vec<_>>();
+    assert_eq!(
+        a.deviance.to_bits(),
+        b.deviance.to_bits(),
+        "{ctx}: deviance"
+    );
+    assert_eq!(bits(&a.beta), bits(&b.beta), "{ctx}: beta");
+    assert_eq!(bits(&a.se), bits(&b.se), "{ctx}: se");
+    assert_eq!(
+        a.ranef_levels,
+        [b.ranef_levels[1], b.ranef_levels[0]],
+        "{ctx}"
+    );
+    assert_eq!(
+        a.diagnostics.pinned,
+        [
+            b.diagnostics.pinned[1].clone(),
+            b.diagnostics.pinned[0].clone()
+        ],
+        "{ctx}: pinned"
+    );
+    let p = a.beta.len();
+    let fields = |f: &crate::Fit| -> Vec<(&str, Vec<Vec<u64>>)> {
+        let lv = &f.ranef_levels;
+        let vc = |g: usize| f.varcorr[g].len();
+        let q = |g: usize| crate::fit::vech_q(vc(g));
+        let split = |v: &[f64], w: &dyn Fn(usize) -> usize| {
+            grouping_blocks(v, 2, w)
+                .into_iter()
+                .map(bits)
+                .collect::<Vec<_>>()
+        };
+        vec![
+            ("varcorr", f.varcorr.iter().map(|b| bits(b)).collect()),
+            ("tau2", split(&f.tau2, &vc)),
+            ("stddev_se", split(&f.stddev_se, &vc)),
+            ("ranef", split(&f.ranef, &|g| lv[g] * q(g))),
+            (
+                "condvar",
+                split(&f.condvar, &|g| lv[g] * q(g) * (q(g) + 1) / 2),
+            ),
+            ("condvar_x", split(&f.condvar_x, &|g| lv[g] * q(g) * p)),
+        ]
+    };
+    for ((name, fa), (_, fb)) in fields(a).into_iter().zip(fields(b)) {
+        assert!(
+            !fa[0].is_empty() && !fa[1].is_empty(),
+            "{ctx}: {name} is filled"
+        );
+        assert_eq!(fa[0], fb[1], "{ctx}: {name} of the slope grouping");
+        assert_eq!(fa[1], fb[0], "{ctx}: {name} of the intercept-only grouping");
+    }
+}
+
+/// A lone slope grouping written after an intercept-only one is fitted as if
+/// written first: the same kernel input both ways, so every reported number
+/// matches bit for bit in declaration order, and the slope-last spelling gets
+/// the conditional variances and conditional standard errors of the dense
+/// route. Gaussian LMM and Gamma log GLMM (the `sim_sparse_gamma` data, its
+/// q = 5 slope grouping written last), and a Gaussian LMM whose slope
+/// grouping has no random intercept, `(1 | h) + (0 + x | g)`.
+#[test]
+fn lone_slope_grouping_written_last_fits_as_if_written_first() {
+    let opts = FitOptions {
+        condvar: true,
+        ..FitOptions::default()
+    };
+    let (xg, yg, ng, h, g) = lone_slope_case(0.6);
+    let (xs, ys, ns, ps, sparse_model, sids) = crate::sparse::tests::sparse_gamma_design();
+    let gamma_slopes = sparse_model.re.as_ref().unwrap().extra_groupings[0]
+        .slopes
+        .clone();
+    let slope_only = [crate::ReTerm::no_intercept().slopes([1])];
+    let cases = [
+        (
+            "gaussian",
+            lone_slope_spellings(Family::Gaussian, vec![1]),
+            (&xg, &yg, ng, 2),
+            (h.clone(), g.clone()),
+        ),
+        (
+            "gamma",
+            lone_slope_spellings(sparse_model.family, gamma_slopes),
+            (&xs, &ys, ns, ps),
+            (sids.primary.clone(), sids.extra[0].clone()),
+        ),
+        (
+            "gaussian, no slope-grouping intercept",
+            (
+                ModelSpec::mixed(
+                    Family::Gaussian,
+                    ReStructure::intercept().extra(Grouping::crossed().terms(slope_only.clone())),
+                ),
+                ModelSpec::mixed(
+                    Family::Gaussian,
+                    ReStructure::intercept()
+                        .terms(slope_only)
+                        .extra(Grouping::crossed()),
+                ),
+            ),
+            (&xg, &yg, ng, 2),
+            (h, g),
+        ),
+    ];
+    for (name, (last, first), (x, y, n, p), (h, g)) in cases {
+        let ids_last = GroupIds::new(h.clone()).extra(g.clone());
+        let ids_first = GroupIds::new(g).extra(h);
+        let a = crate::fit(&Data::new(x, y, n, p).ids(&ids_last), &last, &opts).unwrap();
+        let b = crate::fit(&Data::new(x, y, n, p).ids(&ids_first), &first, &opts).unwrap();
+        assert!(a.converged() && b.converged(), "{name}");
+        assert_two_grouping_mirror(&a, &b, name);
+
+        let popts = crate::PredictOptions {
+            se: true,
+            ..crate::PredictOptions::default()
+        };
+        let pa = crate::predict(
+            &a,
+            &last,
+            &crate::Design::new(x, n, p).ids(&ids_last),
+            &popts,
+        )
+        .unwrap_or_else(|e| panic!("{name}: slope-last predict: {e}"));
+        let pb = crate::predict(
+            &b,
+            &first,
+            &crate::Design::new(x, n, p).ids(&ids_first),
+            &popts,
+        )
+        .unwrap();
+        for (what, va, vb) in [("fit", &pa.fit, &pb.fit), ("se", &pa.se, &pb.se)] {
+            assert_eq!(va.len(), n, "{name}: {what}");
+            for (i, (&u, &v)) in va.iter().zip(vb).enumerate() {
+                assert!(
+                    v.is_finite() && (u - v).abs() <= 1e-12 * v.abs(),
+                    "{name}: {what}[{i}] {u} vs {v}"
+                );
+            }
+        }
+    }
+}
+
+/// `f` with its intercept-only grouping's per-level rows (the second block of
+/// `ranef`, `condvar` and `condvar_x`) gathered from slot `slot_of[l]` into
+/// row `l`, and that grouping's level count set to `slot_of.len()`: a fit of
+/// the nested slope-first spelling in the slope-last spelling's level order.
+fn gather_nested_rows(mut f: crate::Fit, slot_of: &[usize]) -> crate::Fit {
+    let (p, lg) = (f.beta.len(), f.ranef_levels[0]);
+    for (v, head, w) in [
+        (&mut f.ranef, lg * 2, 1),
+        (&mut f.condvar, lg * 3, 1),
+        (&mut f.condvar_x, lg * 2 * p, p),
+    ] {
+        let rows: Vec<f64> = slot_of
+            .iter()
+            .flat_map(|&s| v[head + s * w..head + (s + 1) * w].to_vec())
+            .collect();
+        v.truncate(head);
+        v.extend(rows);
+    }
+    f.ranef_levels[1] = slot_of.len();
+    f
+}
+
+/// A lone slope grouping written after a grouping nested in it is fitted as
+/// the slope-first spelling, which the formula front end nests: the same
+/// kernel input both ways, so every reported number matches bit for bit,
+/// each nested level's rows read off its padded slot. Gaussian LMM and
+/// Poisson GLMM (the structured layout: slope block 2 plus 3 child slots), on
+/// a balanced nesting and on one with padding and declared levels out of slot
+/// order. The loop tier's view maps back the same way.
+#[test]
+fn nested_slope_grouping_written_last_fits_as_if_written_first() {
+    let opts = FitOptions {
+        condvar: true,
+        ..FitOptions::default()
+    };
+    let popts = crate::PredictOptions {
+        se: true,
+        ..crate::PredictOptions::default()
+    };
+    let poisson = Family::Poisson {
+        link: crate::PoissonLink::Log,
+    };
+    for shuffled in [false, true] {
+        let (x, y, counts, n, h, g) = nested_slope_case(shuffled);
+        let p = 2;
+        let padded = crate::fit::common::nested_padded_ids(&g, &h).0;
+        let mut slot_of = vec![0usize; *h.iter().max().unwrap() as usize + 1];
+        for (&l, &s) in h.iter().zip(&padded) {
+            slot_of[l as usize] = s as usize;
+        }
+        let ids_last = GroupIds::new(h.clone()).extra(g.clone());
+        let ids_first = GroupIds::new(g.clone()).extra(padded);
+        for (family, resp) in [(Family::Gaussian, &y), (poisson, &counts)] {
+            let ctx = format!("{family:?}, shuffled {shuffled}");
+            let (last, first) = nested_slope_spellings(family);
+            let a = crate::fit(&Data::new(&x, resp, n, p).ids(&ids_last), &last, &opts).unwrap();
+            let b = crate::fit(&Data::new(&x, resp, n, p).ids(&ids_first), &first, &opts).unwrap();
+            assert!(a.converged() && b.converged(), "{ctx}");
+            assert_eq!(a.ranef_levels, [slot_of.len(), 12], "{ctx}");
+            assert_eq!(b.ranef_levels, [12, 36], "{ctx}");
+            let pa = crate::predict(
+                &a,
+                &last,
+                &crate::Design::new(&x, n, p).ids(&ids_last),
+                &popts,
+            )
+            .unwrap_or_else(|e| panic!("{ctx}: slope-last predict: {e}"));
+            let pb = crate::predict(
+                &b,
+                &first,
+                &crate::Design::new(&x, n, p).ids(&ids_first),
+                &popts,
+            )
+            .unwrap();
+            for (what, va, vb) in [("fit", &pa.fit, &pb.fit), ("se", &pa.se, &pb.se)] {
+                assert_eq!(va.len(), n, "{ctx}: {what}");
+                for (i, (&u, &v)) in va.iter().zip(vb).enumerate() {
+                    assert!(
+                        v.is_finite() && (u - v).abs() <= 1e-12 * v.abs(),
+                        "{ctx}: {what}[{i}] {u} vs {v}"
+                    );
+                }
+            }
+            assert!(
+                !a.condvar_cross.as_ref().unwrap().nested_slots.is_empty(),
+                "{ctx}: the map rides on condvar_cross"
+            );
+            assert_two_grouping_mirror(&a, &gather_nested_rows(b, &slot_of), &ctx);
+
+            if !(shuffled && matches!(family, Family::Gaussian)) {
+                continue;
+            }
+            // The loop tier on the slope-last spelling.
+            let data = Data::new(&x, resp, n, p);
+            let mut ws_first = build_workspace(&first, &ids_first, n, p, &opts);
+            let theta_first = fit_on(&mut ws_first, &data, None, &opts).theta().to_vec();
+            let mut ws = build_workspace(&last, &ids_last, n, p, &opts);
+            let view = fit_on(&mut ws, &data, None, &opts);
+            let bits = |v: &[f64]| v.iter().map(|t| t.to_bits()).collect::<Vec<_>>();
+            let mirrored: Vec<f64> = [&theta_first[3..], &theta_first[..3]].concat();
+            assert_eq!(bits(view.theta()), bits(&mirrored), "{ctx}: view theta");
+            let v = view.into_fit(&data, &last, &opts);
+            assert_eq!(v.ranef_levels, a.ranef_levels, "{ctx}: view ranef_levels");
+            for (what, u, w) in [
+                ("ranef", &v.ranef, &a.ranef),
+                ("condvar", &v.condvar, &a.condvar),
+                ("condvar_x", &v.condvar_x, &a.condvar_x),
+            ] {
+                assert_eq!(bits(u), bits(w), "{ctx}: view {what}");
+            }
+            let cross_bits = |c: &crate::fit::CondvarCross| {
+                (
+                    c.family_grouping,
+                    bits(&c.family),
+                    bits(&c.tail),
+                    c.coupling_at.clone(),
+                    c.coupling_cols.clone(),
+                    bits(&c.coupling),
+                    c.nested_slots.clone(),
+                )
+            };
+            assert_eq!(
+                v.condvar_cross.as_ref().map(cross_bits),
+                a.condvar_cross.as_ref().map(cross_bits),
+                "{ctx}: view condvar_cross"
+            );
+        }
+    }
+}
+
+/// The loop tier under a slope swap: `(1 | h) + (1 + x | g)` with h of zero
+/// variance. The view's θ̂ and pinned mask come back in declaration order (h's
+/// intercept bit first, then g's two diagonal bits, as the stable `Fit`'s
+/// `pinned` says), and a warm start handed back in declaration order lands on
+/// the same fit.
+#[test]
+fn view_and_warm_start_follow_declaration_order_under_a_slope_swap() {
+    let (x, y, n, h, g) = lone_slope_case(0.0);
+    let p = 2;
+    let (last, first) = lone_slope_spellings(Family::Gaussian, vec![1]);
+    let opts = FitOptions::default();
+    let data = Data::new(&x, &y, n, p);
+    let ids_last = GroupIds::new(h.clone()).extra(g.clone());
+    let ids_first = GroupIds::new(g).extra(h);
+
+    let mut ws_first = build_workspace(&first, &ids_first, n, p, &opts);
+    let vf = fit_on(&mut ws_first, &data, None, &opts);
+    assert!(vf.perm.is_identity());
+    let theta_first = vf.theta().to_vec();
+    assert_eq!(vf.diagnostics().pinned_components, 0b100);
+    let start_first = crate::StartValues {
+        beta: vf.betas().to_vec(),
+        theta: theta_first.clone(),
+        dispersion: None,
+    };
+
+    let mut ws = build_workspace(&last, &ids_last, n, p, &opts);
+    let view = fit_on(&mut ws, &data, None, &opts);
+    assert!(!view.perm.is_identity());
+    let bits = |v: &[f64]| v.iter().map(|t| t.to_bits()).collect::<Vec<_>>();
+    let mirrored: Vec<f64> = [&theta_first[3..], &theta_first[..3]].concat();
+    assert_eq!(bits(view.theta()), bits(&mirrored));
+    assert_eq!(view.theta()[0], 0.0);
+    let mask = view.diagnostics().pinned_components;
+    let start = crate::StartValues {
+        beta: view.betas().to_vec(),
+        theta: view.theta().to_vec(),
+        dispersion: None,
+    };
+    let fit = view.into_fit(&data, &last, &opts);
+    // g's block has an intercept, so both of its diagonals carry a bit.
+    let flat: Vec<bool> = fit.diagnostics().pinned.iter().flatten().copied().collect();
+    let from_fit = flat
+        .iter()
+        .enumerate()
+        .fold(0u64, |m, (i, &b)| m | (u64::from(b) << i));
+    assert_eq!(flat.len(), 3);
+    assert_eq!(mask, from_fit);
+    assert_eq!(mask, 0b001);
+
+    let warm = fit_on(&mut ws, &data, Some(&start), &opts).into_fit(&data, &last, &opts);
+    assert!(
+        (warm.deviance() - fit.deviance()).abs() <= 4e-5,
+        "warm {} vs cold {}",
+        warm.deviance(),
+        fit.deviance()
+    );
+    assert_eq!(
+        (
+            warm.converged(),
+            warm.singular(),
+            &warm.diagnostics().pinned
+        ),
+        (fit.converged(), fit.singular(), &fit.diagnostics().pinned)
+    );
+    // The slope-first workspace warm-started from its own θ̂ gets the same
+    // kernel input, so a start moved to the wrong slots shows here.
+    let warm_first =
+        fit_on(&mut ws_first, &data, Some(&start_first), &opts).into_fit(&data, &first, &opts);
+    assert_eq!(warm.deviance().to_bits(), warm_first.deviance().to_bits());
+    assert_eq!(warm.n_eval(), warm_first.n_eval());
 }

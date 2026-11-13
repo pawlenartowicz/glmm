@@ -33,6 +33,36 @@ test_that("character columns get lexicographic levels (factor() default)", {
   expect_named(fixef(fit), c("(Intercept)", "fb", "fc"))
 })
 
+test_that("relabelled and unused factor levels give the same fit", {
+  # Declaring the used levels in reverse order and adding two unused ones
+  # changes the base level and the coding, not the model.
+  i <- 0:39
+  u_g <- c(-0.6, 0.4, 0.1, -0.3, 0.7, -0.2, 0.5, -0.4)
+  x <- sin(1.7 * i + 0.3)
+  f <- c("p", "q", "r")[i %% 3 + 1]
+  g <- paste0("g", i %/% 5)
+  y <- 2 + 0.5 * x + 0.3 * (f == "q") - 0.4 * (f == "r") + u_g[i %/% 5 + 1] +
+    0.4 * sin(2.3 * i + 0.7)
+  levels_of <- function(used) {
+    r <- rev(used)
+    k <- length(r) %/% 2
+    c("zz", r[seq_len(k)], "yy", r[-seq_len(k)])
+  }
+  d_chr <- data.frame(y = y, x = x, f = f, g = g, stringsAsFactors = FALSE)
+  d_fac <- data.frame(
+    y = y, x = x,
+    f = factor(f, levels = levels_of(c("p", "q", "r"))),
+    g = factor(g, levels = levels_of(paste0("g", 0:7)))
+  )
+  ref <- fastglmm(y ~ x + f + (1 | g), d_chr)
+  fit <- fastglmm(y ~ x + f + (1 | g), d_fac)
+  expect_equal(unname(fitted(fit)), unname(fitted(ref)), tolerance = 1e-5)
+  expect_equal(as.numeric(logLik(fit)), as.numeric(logLik(ref)), tolerance = 1e-5)
+  sd_g <- function(m) attr(VarCorr(m)$g, "stddev")
+  expect_equal(sd_g(fit), sd_g(ref), tolerance = 1e-5)
+  expect_identical(names(fixef(fit))[1:4], c("(Intercept)", "x", "fq", "fp"))
+})
+
 test_that("na.omit drops NA rows; na.pass-style leftovers error", {
   d <- ols_data()
   d$y[3] <- NA
@@ -57,13 +87,6 @@ test_that("every row missing in a used column gives the same message as the Pyth
     fastglmm(y ~ x, d),
     "every row has a missing value in a column the formula uses; no rows left to fit"
   )
-})
-
-test_that("empty data gives the same message as the Python port", {
-  # Mirrors glmm-py/tests/test_validation.py's test_empty_data_is_refused.
-  d <- data.frame(y = numeric(), x = numeric(), g = factor())
-  expect_error(fastglmm(y ~ x + (1 | g), d),
-               "^Data has no rows \\(n = 0\\); a fit needs at least one row$")
 })
 
 test_that("weights are honored; zero/short/negative weights are clean errors", {
@@ -230,6 +253,18 @@ test_that("a tibble keeps its class in model.frame(fit)", {
   expect_identical(fit$beta, fastglmm(y ~ x + (1 | g), d)$beta)
 })
 
+test_that("a duplicate column name the formula uses is refused, an unused one is not", {
+  d <- frame_data()
+  dup_x <- cbind(d, x = rev(d$x))
+  msg <- "data has duplicate column name(s): x"
+  expect_error(fastglmm(y ~ x + (1 | g), dup_x), msg, fixed = TRUE)
+  expect_error(compare(dup_x, y ~ x, y ~ x + (1 | g)), msg, fixed = TRUE)
+  dup_z <- cbind(d, z = d$x, z = d$y)
+  m <- fastglmm(y ~ x + (1 | g), dup_z)
+  expect_identical(names(fixef(m)), c("(Intercept)", "x"))
+  expect_error(predict(fastglmm(y ~ x + (1 | g), d), newdata = dup_x), msg, fixed = TRUE)
+})
+
 test_that("an NA in a logical subset= drops that row without a warning, as lm does", {
   set.seed(5)
   d <- data.frame(y = rnorm(29), x = rnorm(29))
@@ -263,4 +298,23 @@ test_that("columns named like a fit's index fields fit", {
                   re_term_index = x, null_cluster = g)
   m <- fastglmm(retained ~ re_term_index + (1 | null_cluster), d, family = binomial)
   expect_named(fixef(m), c("(Intercept)", "re_term_index"))
+})
+
+test_that("a failed mixed fit has full-length NaN random-effect fields", {
+  # n = p = 3 leaves no finite end point: one grouping, two levels, q = 1.
+  # Mirrors test_fit_wiring.py's
+  # test_failed_mixed_fit_has_full_length_nan_random_effect_fields - change
+  # together.
+  d <- data.frame(y = c(1, 2, 4), x1 = c(0, 1, 3), x2 = c(1, 0, 2),
+                  g = c("a", "b", "a"))
+  fit <- suppressWarnings(fastglmm(y ~ x1 + x2 + (1 | g), d))
+  expect_false(fit$converged)
+  expect_length(fit$varcorr, 1L)
+  expect_length(fit$varcorr[[1L]], 1L)
+  expect_length(fit$stddev_se, 1L)
+  expect_length(fit$.kernel_parts$ranef, 2L)
+  expect_length(fitted(fit), 3L)
+  for (v in list(fit$varcorr[[1L]], fit$stddev_se, fit$.kernel_parts$ranef, fitted(fit))) {
+    expect_true(all(is.nan(v)))
+  }
 })

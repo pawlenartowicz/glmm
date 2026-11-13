@@ -19,8 +19,9 @@
 A \code{c("fastglmm_pairwise_ci", "data.frame")} with the columns
 \code{contrast}, the \code{by} variable when given, \code{estimate}, \code{lower.CL},
 \code{upper.CL}, and on a log or logit link \code{odds.ratio} or \code{ratio} with
-\code{ratio.lower.CL} and \code{ratio.upper.CL}. Its \code{footer} attribute names the
-level and the adjustment.
+\code{ratio.lower.CL} and \code{ratio.upper.CL}. Its \code{footer} attribute says when
+the fit did not converge, names the level and the adjustment, and holds
+the notes.
 }
 \description{
 Two-sided confidence intervals of the comparisons of a \code{\link[=pairwise]{pairwise()}} table,

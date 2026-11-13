@@ -180,8 +180,7 @@ pub fn compare_stored(
         });
     }
     // Each side's groupings describe its variance blocks. Checked after
-    // convergence: a fit that did not converge may have no blocks (an empty
-    // `varcorr`) beside its groupings.
+    // convergence: a fit that did not converge has NaN blocks.
     for (side, m) in [(Side::First, a), (Side::Second, b)] {
         let described = m.re_groups.len() == m.varcorr.len()
             && m.re_groups

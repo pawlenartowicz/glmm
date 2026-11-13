@@ -42,8 +42,10 @@ pub struct StartValues {
     /// Warm-start θ (RE Cholesky vech), length `n_theta`; empty cold-starts θ
     /// (and is the only valid value for fixed-only models).
     pub theta: Vec<f64>,
-    /// Warm-start dispersion (NB shape θ, Gamma φ), finite and `> 0`; `None`
-    /// cold-starts it.
+    /// Warm-start dispersion (NB shape θ, Gamma φ), finite and `> 0`; on
+    /// negative binomial within `[NB_THETA_LO, NB_THETA_HI]`
+    /// ([`NB_THETA_LO`](crate::limits::NB_THETA_LO),
+    /// [`NB_THETA_HI`](crate::limits::NB_THETA_HI)). `None` cold-starts it.
     pub dispersion: Option<f64>,
 }
 

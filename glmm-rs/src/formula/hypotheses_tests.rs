@@ -7,11 +7,12 @@ use faer::Mat;
 use serde_json::Value;
 
 use super::hypotheses::{
-    missing_cells_note, remap_slopes, type2_lr_sets, type2_vcov, type2_xtx, type3,
-    type3_null_basis, type3_unrounded, untouched_columns, ReducedDesignError, TermHypothesis,
+    missing_cells_note, type2_lr_sets, type2_vcov, type2_xtx, type3, type3_null_basis,
+    type3_unrounded, untouched_columns, ReducedDesignError, TermHypothesis,
 };
 use super::{lower, Lowered, Table};
 use crate::inference::test_refs::{self, Entry, Kind};
+use crate::spec::remap_slopes;
 use crate::test_support::csv_table;
 use crate::{ColumnId, Family};
 

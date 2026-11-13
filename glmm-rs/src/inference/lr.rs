@@ -93,7 +93,7 @@ pub enum LrNote {
     /// Both fits estimated their power on the weights
     /// ([`crate::WeightPower::Estimate`]). When the noise is not a power of
     /// the weights the test is somewhat liberal: about 6 to 9% at α = .05 in
-    /// spec 2-dcr's G13 cells, against 28% at the weights as given.
+    /// the weighted `compare()` Type I cells, against 28% at the weights as given.
     EstimatedWeightPower,
     /// Two dispersion GLMs whose Wald F cannot be formed (the smaller fit's
     /// coefficient names, aliased columns dropped, are not among the larger

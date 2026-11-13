@@ -6,6 +6,53 @@ All notable changes to the `glmm` crate are recorded here. Format follows
 The Python package (`glmm` on PyPI) is versioned in lockstep with the crate and
 shares these entries; Python-specific notes are called out where they differ.
 
+## [0.9.2] — 2026-11-13
+
+### Changed
+
+- The Satterthwaite record (`satterthwaite_record`) lists its free θ coordinates in the order the groupings were declared, also when glmm makes the grouping with the most levels the primary. On such fits the Satterthwaite df and contrast tests can change in the last digits.
+- On a fit with random effects, `varcorr`, `tau2`, `stddev_se` and `ranef` have their full length on every fit, NaN where the fit has no estimate (a failed fit, or the standard errors of an LMM's standard deviations), and `fitted` has one entry per row, NaN on a fit that did not converge; before, these were empty. `diagnostics.pinned` has one row per grouping, all false when nothing was pinned. A fixed-effects fit with no fixed columns has an empty `beta` (before, one NaN).
+- The texts of errors and ignored-argument warnings now live in one place for both ports. They are the same in Python and R, except that each port spells the argument names its own way (`nagq` / `nAGQ`, `None` / `NULL`). A refused option ends in the value it was given, for example `got the string "x"`.
+- Python checks that raised `TypeError` or `NotImplementedError` (`satterthwaite`, `condvar`, `reml`, `warm_start`, `nsim`, `seed`, pairwise `factor` and `by`, quasi-likelihood `dispersion`) now raise `ValueError`.
+- In `Fit.warnings` and `m$warnings`, the ignored-argument warnings now come after `rows_dropped_na`.
+- `nagq=1.0`, a whole float, is accepted.
+- On a fit with no estimates (every coefficient NaN), the residual degrees of freedom are NaN: in contrast tests, F tests, pairwise tables and the summary footer of both ports. Before, they were `n - p`, for example 0. The df of contrast tests, F tests and pairwise tables on a GLM with φ estimated that did not converge are NaN too.
+- On OLS, R² and adjusted R² are NaN when neither the response nor the fitted values vary beyond round-off (a constant response), where they were a round-off number such as 0.98. R's `summary.lm` prints such a number with an "essentially perfect fit" warning.
+- A formula syntax error whose position is not known no longer says "at position 0": it reads `formula syntax error: …`. The error for a formula that ends with `+` keeps its position. Code that matches "at position" in these messages must change.
+- R's `isSingular(fit, tol = )` now warns that `tol` is not used; the result is still the fit's own singular flag.
+- `confint` of a fit tested with t (residual, Satterthwaite, Bell–McCaffrey or Pustejovsky–Tipton df) gives a NaN interval for a coefficient whose df could not be computed. Before, it fell back to a normal-quantile interval beside a NaN p-value. Binomial, Poisson and negative-binomial GLM intervals and GLMM intervals still use the normal quantile.
+- The robust record (`robust`) has a new entry `t`, so a fit saved by an older build cannot be passed back to the contrast functions.
+- Inputs outside documented ranges are refused before fitting, with the value and the `glmm::limits` constant in the message: |y|, |x| and random-effect-only columns above 1e100 (`MAX_DATA_ABS`), weights outside [1e-100, 1e100], an offset above 700 in magnitude on a log link (`MAX_LOG_OFFSET_ABS`) or 1e100 on another link, binomial trial counts above 2⁵³ (`MAX_TRIALS`), an inverse-Gaussian held dispersion outside [1e-100, 1e100], and a negative-binomial shape seed outside [`NB_THETA_LO`, `NB_THETA_HI`]. The same holds for the new rows of `predict`. `glmm::limits` gains these constants and the two search boxes `GAMMA_PHI_LO`, `GAMMA_PHI_HI`, `NB_THETA_LO`, `NB_THETA_HI`. The texts "x must be finite", "y must be finite", "re_columns must be finite", "Data weights must be finite and > 0" and "Data offset must be finite" changed; code that matches them must change.
+- Every fit now runs on one internal scale of the response, the prior weights and the offset, and maps the results back exactly: a power-of-two response scale on Gaussian, Gamma and inverse-Gaussian fits, the Gaussian response centred on its least-squares fit, the weights divided by a power of two on the families with a dispersion, and the offset centred on log-link fits with an intercept. Results move by round-off, up to a few 1e-7 relative on flat optima. Fits with a response at an extreme scale, or a Gaussian response far from zero, now give the same answer as the same fit on a rescaled response. The divergence message of the reciprocal links no longer advises to rescale the response, because a response rescaled by one number now fits. A Gamma inverse-link GLMM starts its search on a response rescaled so that the largest cluster mean of 1/y lies in [8, 16], at any scale of y; on the grid's Gamma inverse-link cells it takes 0.87 times 0.9.1's evaluations (geometric mean), to the same optimum.
+- `loop_advanced` (unstable): `glm_irls_fit` on Gamma and inverse-Gaussian stops with R's fixed deviance floor 0.1, as it runs on the caller's raw data. Before, the floor scaled with the prior weights (and 1/ȳ on inverse-Gaussian), so a fit with very small weights or a large response may now stop a little short of the optimum, reported converged.
+- A model whose only slope grouping is written after intercept-only crossed groupings, as in `(1 | item) + (1 + x | subject)`, is fitted as if that grouping were written first, when it then fits on the dense route. Such a fit gains conditional variances (so `predict` gives conditional standard errors) and the dense route's speed, and its numbers move by round-off.
+
+### Added
+
+- Errors from the shared code have a code: `invalid_argument`, `fit_error`, `compare_error` or `internal`. In Python it is the `.code` attribute of the exception. In R it is the condition class `fastglmm_error_<code>`.
+- A new warning when a warm-start dispersion is given to a family that does not use it. Only negative binomial fits and Gamma mixed models start from it.
+- A new note `nb_shape_at_limit` (Rust `Note::NbShapeAtLimit`, Python `NbShapeAtLimitWarning`) when a negative binomial shape ends on a limit of its search range [0.001, 10000]: a warning at the lower limit, a stored note without a warning at the upper one. Before, such fits carried no note.
+- A new caution `one_trial_per_level` (Rust `Note::OneTrialPerLevel`, Python `OneTrialPerLevelWarning`, R class `fastglmm_one_trial_per_level`) on a binomial mixed model whose grouping has one trial per level, where that grouping's variance is not identified. Before, such fits were reported converged with no note.
+- A new severe warning `dispersion_at_limit` (Rust `Note::DispersionAtLimit`, Python `DispersionAtLimitWarning`, R class `fastglmm_dispersion_at_limit`) when the free dispersion of a Gamma GLMM ends on an edge of its search range. It names the edge, in place of the generic `fit_failed` text such fits had before.
+
+### Fixed
+
+- A fixed-effect column that is dropped as aliased and is also a random slope no longer makes the fit fail. The random slope keeps its values and the model is fitted, as in lme4: `y ~ x + x2 + (1 + x2 | g)` with `x2 = 2x` gives the fit of `y ~ x + (1 + x2 | g)`, and the coefficient of `x2` is NaN.
+- R: a column name the formula uses that occurs twice in `data` or `newdata` is refused, as in Python; the first column was used before.
+- R's error for a grouping level the fit did not see now names the grouping and uses R's argument name (`allow.new.levels = TRUE`).
+- The interval table of `pairwise` now says its intervals are not reliable when the fit did not converge. Before, it repeated the text about tests.
+- Empty data with a factor column now gets the "Data has no rows" error, not the error about a factor with one level, in both ports and on the Rust formula door (`formula::lower`, `formula::fit`).
+- A Gaussian mixed model with no fixed-effect coefficients no longer raises the Satterthwaite warning beside its "no fixed-effect coefficients" warning.
+- Response-scale predictions of a Gamma inverse-link or inverse-Gaussian `1/mu^2` model are NaN on a row whose linear predictor is at or below 0 (before: a mean of about 1e75), and an interval end at or below 0 is +∞.
+- Robust (HC2 and CR2) degrees of freedom are right on nearly collinear designs. Before, they could be negative, NaN, or change with the order of the predictor columns.
+- A GLMM warm-started through `fit_with_start` (the ports' `start=` / `warm_start=`) on data where the fixed effects separate the response now stops as `separated`, as the cold fit does. Before, it reported convergence at a point with huge standard errors. The `loop_advanced` tier still uses the caller's start as given.
+- `predict` on a rank-deficient fit gives NaN, with a new `rows_not_estimable` warning (Python `RowsNotEstimableWarning`, R class `fastglmm_rows_not_estimable`, Rust `Note::RowsNotEstimable`), for a row outside the row space of the training design; before, such a row got a number with no warning. Rows inside the row space, the training rows among them, do not change. In Rust, `Simulator::new` draws NaN for such a row in the same way.
+- A standard error whose variance underflows to 0 or overflows to infinity (for example a slope on x near 1e99 with y near 1e-150, or on x near 1e-200) is NaN; before, it was reported as 0 or the `vcov` diagonal as infinity.
+- A held Gamma dispersion outside the dispersion search range [`GAMMA_PHI_LO`, `GAMMA_PHI_HI`] (scaled by the weights) is refused; before, a held value near 1e13 to 1e16 gave a converged mixed fit with wrong coefficients, and from about 1e17 a NaN deviance.
+- The Gamma log-likelihood stays finite when a row's shape (its relative weight over the dispersion) is below 1e-8; before, below about 1e-16 it was infinite. Results with every row shape above 1e-8 are unchanged.
+- Profile intervals of a Gaussian mixed model with a random slope no longer depend on the scale of the slope's predictor. Before, a predictor scaled by 1e8 moved the other variances' intervals by about 6%, and one scaled by 1e-8 gave NaN bounds.
+- Simulated responses from a mixed model with a random slope no longer drop a random effect when the slope's predictor has an extreme scale. Before, a predictor scaled by 1e8 lost the slope's random effect and one scaled by 1e-8 lost the intercept's.
+
 ## [0.9.1] — 2026-11-09
 
 ### Added

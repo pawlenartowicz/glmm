@@ -35,6 +35,7 @@ use super::error::{Error, ParseError};
 use super::parse::{
     parse, parse_transform, ParsedFormula, RandomEffect, Transform, DEFAULT_RESPONSE,
 };
+use crate::fit::{detect_flat_nesting, nested_padded_ids};
 use crate::{
     ColumnId, Data, Design, ErrorMessage, Family, Fit, FitError, FitOptions, GroupIds, Grouping,
     GroupingRelation, ModelSpec, PredictOptions, Prediction, ReStructure, ReTerm,
@@ -295,7 +296,7 @@ pub(crate) struct RdxCross {
 /// [`Error::TransformNotFinite`], [`Error::CbindNeedsBinomial`],
 /// [`Error::ZeroTrials`], [`Error::NegativeCount`]) when `data` doesn't match
 /// what the formula requires. [`Error::Fit`] with [`FitError::Shape`] when
-/// `data` is not a valid [`Table`]: a repeated column name, a column that is
+/// `data` has no rows or is not a valid [`Table`]: a repeated column name, a column that is
 /// not `n` long, a factor code past its levels or a factor level label given
 /// more than once.
 ///
@@ -355,7 +356,7 @@ impl Model {
     /// per grouping in declaration order, rows the grouping's levels as the
     /// data spells them, columns its terms, padded nested slots dropped. Empty
     /// when the fit has no conditional modes (no random part, or a fit that did
-    /// not converge).
+    /// not converge, whose [`Fit::ranef`] is NaN).
     ///
     /// # Errors
     /// [`Error::RanefShapeMismatch`] when the lowering's `re_groups` do not
@@ -406,9 +407,20 @@ pub fn fit_lowered(formula: &str, lowered: Lowered, opts: &FitOptions) -> Result
 /// [`Error::RandomColumnRepeated`],
 /// [`Error::SingleLevelFactor`], [`Error::EmptyDesign`],
 /// [`Error::TransformNotFinite`], [`Error::CbindNeedsBinomial`],
-/// [`Error::ZeroTrials`], and [`Error::NegativeCount`].
+/// [`Error::ZeroTrials`], and [`Error::NegativeCount`]. [`Error::Fit`] with
+/// [`FitError::Shape`] when `data` has no rows or is not a valid [`Table`]:
+/// a repeated column name, a column that is not `n` long, a factor code past
+/// its levels or a factor level label given more than once.
 pub fn materialize(ast: &ParsedFormula, data: &Table, family: Family) -> Result<Lowered, Error> {
     check_table(data)?;
+    // Not in `check_table`, which `lower_new` shares: a zero-row predict is
+    // legal. The text is the kernel's (`fit::common::validate`) - change
+    // together.
+    if data.n == 0 {
+        return Err(Error::Fit(FitError::Shape(
+            "Data has no rows (n = 0); a fit needs at least one row".into(),
+        )));
+    }
     let owned = drop_unused_levels(data);
     let data = owned.as_ref().unwrap_or(data);
     let n = data.n;
@@ -1392,121 +1404,6 @@ fn grouping_row_labels(name: &str, data: &Table) -> Result<Vec<String>, Error> {
     Ok(codes.iter().map(|&c| levels[c as usize].clone()).collect())
 }
 
-/// Padded-per-parent child ids: given already-dense `parent_ids` (one per row)
-/// and per-row child `labels`, lay the children out as CONTIGUOUS PER-PARENT
-/// BLOCKS in the same order the parent's own ids use — parent id `p`'s children
-/// occupy `[p·W, p·W + k_p)` where `k_p` is that parent's distinct child count
-/// and `W = max_p k_p` (the true max — every block gets the same width, since
-/// the kernel's `NestedWithin` sizing is a fixed-width rectangle: `src/lmm/kernel.rs`'s
-/// `add_rows_multi` computes a child's RE column as
-/// `extra_offsets[e] + id·extra_q[e]`, which only lands in the right parent's
-/// block under this padded-block layout — a fresh global lexicographic sort of
-/// the joined label does not preserve per-parent contiguity for unbalanced
-/// nesting). Slots `k_p..W` in a shorter parent's block are never assigned to
-/// any row (padding). Assumes each child label occurs under a SINGLE parent —
-/// the caller must have verified nesting (explicit `parent:child` syntax, or
-/// [`detect_flat_nesting`] for the flat idiom).
-///
-/// Returns the ids alongside one label per slot of the padded rectangle
-/// (`n_parents · W`, slot `p·W + k`): the child label at every assigned slot and
-/// `None` at every padded one. The caller joins the parent's own label in when
-/// the formula named a parent (`(1|A/B)`); the flat idiom keeps the child label
-/// bare, because `re_group_info` names that block for the child alone and the
-/// route it takes is data-dependent.
-fn nested_padded_ids(parent_ids: &[u32], labels: &[String]) -> (Vec<u32>, Vec<Option<String>>) {
-    let n_parents = parent_ids
-        .iter()
-        .copied()
-        .max()
-        .map(|m| m as usize + 1)
-        .unwrap_or(1);
-    // Distinct child labels observed under each parent id, lexicographic
-    // (BTreeSet) — the within-parent dense order; the specific order among
-    // children of one parent doesn't matter statistically (an exchangeable RE),
-    // only that it is dense over `0..k_p`.
-    let mut children_per_parent: Vec<BTreeSet<&str>> = vec![BTreeSet::new(); n_parents];
-    for (&p, c) in parent_ids.iter().zip(labels) {
-        children_per_parent[p as usize].insert(c.as_str());
-    }
-    let n_per_parent = children_per_parent
-        .iter()
-        .map(BTreeSet::len)
-        .max()
-        .unwrap_or(1)
-        .max(1);
-    let local_index: Vec<HashMap<&str, u32>> = children_per_parent
-        .iter()
-        .map(|set| {
-            set.iter()
-                .enumerate()
-                .map(|(i, &l)| (l, i as u32))
-                .collect()
-        })
-        .collect();
-    let mut slot_labels: Vec<Option<String>> = vec![None; n_parents * n_per_parent];
-    for (p, set) in children_per_parent.iter().enumerate() {
-        for (k, &child) in set.iter().enumerate() {
-            slot_labels[p * n_per_parent + k] = Some(child.to_string());
-        }
-    }
-    let ids = parent_ids
-        .iter()
-        .zip(labels)
-        .map(|(&p, c)| p * n_per_parent as u32 + local_index[p as usize][c.as_str()])
-        .collect();
-    (ids, slot_labels)
-}
-
-/// Max padding-inflation factor for flat-nesting detection: detect nested only
-/// while `n_parents · max_children ≤ NESTING_INFLATION_BOUND ·
-/// n_distinct_child_levels`. The guard protects the padded rectangle from
-/// inflating the dense RE block — not balance per se: near-balanced nesting
-/// (children-per-parent ∈ {1,2,3}, inflation ~1.6×) pads a few empty slots and
-/// stays far cheaper than routing its tens of thousands of levels crossed
-/// (dense tail is cubic in crossed levels), while an observation-level factor
-/// like grouseticks' INDEX (each row its own level, inflation ≫ 2) still fails
-/// closed to `Crossed` (measured there: nested 44 s vs crossed 0.16 s).
-const NESTING_INFLATION_BOUND: usize = 2;
-
-/// Detect nesting of a flat extra grouping (the lme4 idiom
-/// `(1|parent)+(1|child)`, no explicit `parent:child` syntax) from the observed
-/// id structure, returning its [`nested_padded_ids`] layout iff routing it
-/// nested is both correct AND a win. Two guards, both fail closed to `Crossed`:
-///
-/// 1. **Genuine nesting** — every distinct `child_labels` value must fall under a
-///    single `primary_ids` (parent). A label spanning two parents is genuinely
-///    crossed; routing it nested would corrupt the padded family-block Cholesky.
-/// 2. **Bounded padding inflation** — the padded rectangle
-///    `n_parents · max_children` must not exceed [`NESTING_INFLATION_BOUND`] ×
-///    the distinct child-level count (see the constant's rationale). Explicit
-///    `parent:child` syntax still pads unbounded — there the user asked for the
-///    nested layout outright.
-fn detect_flat_nesting(
-    primary_ids: &[u32],
-    child_labels: &[String],
-) -> Option<(Vec<u32>, Vec<Option<String>>)> {
-    let n_parents = primary_ids
-        .iter()
-        .copied()
-        .max()
-        .map(|m| m as usize + 1)
-        .unwrap_or(1);
-    let mut parent_of: HashMap<&str, u32> = HashMap::new();
-    let mut children_per_parent = vec![0usize; n_parents];
-    for (&p, c) in primary_ids.iter().zip(child_labels) {
-        match parent_of.insert(c.as_str(), p) {
-            Some(prev) if prev != p => return None, // spans two parents → crossed
-            Some(_) => {}                           // repeat obs of a seen child
-            None => children_per_parent[p as usize] += 1, // first sighting
-        }
-    }
-    let w = children_per_parent.iter().copied().max().unwrap_or(0);
-    if n_parents * w > NESTING_INFLATION_BOUND * parent_of.len() {
-        return None; // padded rectangle would inflate the dense RE block
-    }
-    Some(nested_padded_ids(primary_ids, child_labels))
-}
-
 /// One grouping's lowered level layout. `slot_labels` is [`ReGroupInfo`]'s
 /// field.
 struct GroupingLayout {
@@ -2151,8 +2048,8 @@ pub struct RanefBlock {
 /// SPEED decision (see `detect_flat_nesting`) that no consumer can infer from
 /// the formula.
 ///
-/// A fit with no conditional modes (fixed-only, or non-converged, where
-/// every `Fit::ranef(g)` is empty) yields an empty vec — not an error.
+/// A fit with no conditional modes (fixed-only, where `Fit::ranef` is empty,
+/// or non-converged, where it is NaN) yields an empty vec — not an error.
 ///
 /// # Errors
 /// [`Error::RanefShapeMismatch`] when `re_groups` does not describe this fit:
@@ -2162,7 +2059,7 @@ pub struct RanefBlock {
 /// Partial results are never returned — a mislabelled mode reads as a wrong
 /// answer, not a cosmetic slip.
 pub fn label_ranef(fit: &crate::Fit, re_groups: &[ReGroupInfo]) -> Result<Vec<RanefBlock>, Error> {
-    if fit.ranef.is_empty() {
+    if fit.ranef.is_empty() || fit.ranef.iter().any(|v| v.is_nan()) {
         return Ok(Vec::new());
     }
     let mismatch = |what: &str| Error::RanefShapeMismatch(what.to_string());

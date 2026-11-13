@@ -1,47 +1,63 @@
 use glmm::orchestrate;
 
 use crate::error::BindError;
-use crate::fns::Rows;
+use crate::fns::{check_response, check_rows, Rows};
 use crate::inputs::Inputs;
+use crate::options::{self, FitArgs};
 use crate::records::fit_record;
 use crate::value::Value;
 
-/// `orchestrate::run_fit`. `warm_start` is a record of `beta`, `theta` (each
-/// empty or absent to cold-start that part) and `dispersion`.
+/// `orchestrate::run_fit`, the options read first. `warm_start` is a record
+/// of `beta`, `theta` (each empty or absent to cold-start that part) and
+/// `dispersion`.
 pub(crate) fn fit(inp: &mut Inputs) -> Result<Value, BindError> {
     let formula = inp.string("formula")?;
+    check_response(&formula)?;
+    let (family, link) = options::family_link(inp, &[&formula])?;
+    let wald_se = options::wald_se(inp)?;
+    let nagq = options::nagq(inp)?;
+    let (dispersion, warm_start, notes) =
+        options::dispersion_and_start(inp, family, formula.contains('|'))?;
+    let satterthwaite = options::flag(inp, "satterthwaite", "satterthwaite")?;
+    let condvar = options::flag(inp, "condvar", "condvar")?;
+    let reml = options::reml(inp)?;
+    let anova_test = options::choice(inp, "anova_test", "anova_test", &["auto", "Wald", "LRT"])?;
+    let weight_power = inp.opt_weight_power("weight_power")?;
+    let se_type = inp.opt_se_type("se_type")?;
+    let args = FitArgs {
+        family,
+        link,
+        nagq,
+        dispersion,
+        warm_start,
+        weight_power,
+        notes,
+    };
     let numeric = inp.numeric("numeric")?;
     let factors = inp.factors("factors")?;
-    let warm_start = match inp.opt_record("warm_start")? {
-        None => None,
-        Some(mut w) => Some((
-            w.opt_vec("beta")?.unwrap_or_default(),
-            w.opt_vec("theta")?.unwrap_or_default(),
-            w.opt_f64("dispersion")?,
-        )),
-    };
+    let weights = inp.opt_vec("weights")?;
+    let offset = inp.opt_vec("offset")?;
     let rows = Rows::read(inp)?;
-    let family = inp.string("family")?;
-    let link = inp.string("link")?;
+    check_rows(&numeric, &factors)?;
     let r = orchestrate::run_fit(
         &formula,
         numeric,
         factors,
-        &family,
-        &link,
-        &inp.string("wald_se")?,
-        inp.u8("nagq")?,
-        inp.opt_f64("dispersion")?,
-        inp.opt_vec("weights")?,
-        inp.opt_vec("offset")?,
-        warm_start,
-        inp.bool("satterthwaite")?,
-        inp.bool("condvar")?,
-        inp.opt_bool("reml")?,
-        &inp.string("anova_test")?,
-        inp.opt_weight_power("weight_power")?,
-        inp.opt_se_type("se_type")?,
+        family,
+        link,
+        &wald_se,
+        nagq,
+        dispersion,
+        weights,
+        offset,
+        args.warm_start.clone(),
+        satterthwaite,
+        condvar,
+        reml,
+        &anova_test,
+        weight_power,
+        se_type,
     )
     .map_err(|e| rows.error(e))?;
-    Ok(fit_record(r, &family, &link, rows.base()))
+    Ok(fit_record(r, &args, inp.port(), rows.base()))
 }

@@ -16,7 +16,7 @@ links, knobs) is a string or scalar argument, not a type.
 > validation, `Fit`, `summary()` — wired end to end through the PyO3 binding:
 > a valid `fit(...)` call parses the formula, fits, and returns a real `Fit`.
 > One narrow combination is an open gap and raises a clean
-> `NotImplementedError` instead: quasi-likelihood `dispersion=` on
+> `ValueError` instead: quasi-likelihood `dispersion=` on
 > binomial/poisson.
 
 Install from PyPI:
@@ -180,8 +180,8 @@ fit = glmm.fit(data, "s ~ x1 + (1 | group)", "binomial", link="probit", nagq=7)
   every value.
 
 **Error vs. warning.** An *invalid* value — unknown family, a link the family
-doesn't offer, even `nagq` (`ValueError`), a non-dict `warm_start`
-(`TypeError`) — raises. A *valid but inapplicable* option (`dispersion=` on
+doesn't offer, even `nagq`, a non-dict `warm_start` — raises
+`ValueError`, with the error code in `.code`. A *valid but inapplicable* option (`dispersion=` on
 gaussian, `init_theta=` off negative-binomial, quasi-dispersion on a mixed
 binomial/poisson formula, `reml=True` off the Gaussian family) warns
 (`UserWarning`) and is stripped, so it never reaches the kernel: loud enough to catch the mistake, lenient enough for
@@ -202,7 +202,7 @@ them). It is returned by `fit`, never constructed by callers.
 | `coef_p` | `(p,)` two-sided p-value of that t test, computed by the kernel; `NaN` where there is no df |
 | `df_method` | where `coef_df` comes from: `"satterthwaite"`, `"residual"` (OLS and the dispersion GLMs), `"none"` (the families with no df: z), `"disabled"` (a Gaussian mixed model fitted with `satterthwaite=False`: z) or `"failed"` (its Satterthwaite pass failed: z, with a `SatterthwaiteCurvatureWarning`); on a robust fit `"pustejovsky_tipton"` (CR2) or `"bell_mccaffrey"` (HC2) |
 | `weight_power`, `estimated_weight_power`, `se_type` | the power used on `weights` (the estimate on a fitted power, 1 on the weights as given, NaN without weights), whether the fit estimated it, and the standard error behind `se`, `vcov` and `coef_df` (`"model"` or `"robust"`); see [`conventions.md`](conventions.md#weight-power-and-robust-standard-errors) |
-| `rss`, `r_squared`, `adj_r_squared` | OLS only: the weighted residual sum of squares and `summary.lm`'s multiple and adjusted R² (0 on an intercept-only model); `NaN` on every other fit and on a non-converged one |
+| `rss`, `r_squared`, `adj_r_squared` | OLS only: the weighted residual sum of squares and `summary.lm`'s multiple and adjusted R² (0 on an intercept-only model); `NaN` on every other fit, on a non-converged one, and when neither the response nor the fitted values vary beyond round-off |
 | `vcov` | `(p, p)` full Cov(β̂) — `se` is the sqrt of its diagonal; use it for contrasts/confidence intervals, where the off-diagonals matter |
 | `names` | coefficient names, aligned with `beta` |
 | `aliased` | `(p,)` bool — rank-deficient columns dropped (lme4's `NA` coefficients) |
@@ -218,10 +218,10 @@ them). It is returned by `fit`, never constructed by callers.
 | `df` | parameters counted for AIC/BIC: retained fixed effects + RE parameters + 1 if the family estimates a dispersion/scale; `0` on degenerate NaN-fill paths |
 | `reml` | `True` iff `loglik` is a REML criterion rather than an ML log-likelihood: a Gaussian mixed model fitted with `reml=None` or `True`, or OLS fitted with `reml=True`. AIC/LRT comparisons across fits with different fixed effects are invalid when this is set |
 | `aic`, `bic` | properties, computed on every fit from `loglik`, `df` and `nobs`: `-2·loglik + 2·df` and `-2·loglik + df·ln(nobs)`. On a REML fit they compare only fits with the same fixed effects (see below) |
-| `fitted` | `(n,)` fitted means μ̂ per row; empty on non-converged fits |
-| `ranef` | random-effect conditional modes b̂, one block per grouping in `varcorr`/`re_groups` order, level-major; empty on non-converged fits — prefer `ranef_blocks` for the labelled form, and do not slice this array yourself |
-| `ranef_levels` | level count per grouping, for slicing `ranef`; filled on every fit with random effects, also one that did not converge, where `ranef` is empty |
-| `ranef_blocks` | the same conditional modes, labelled: a list of dicts per grouping (`group`, `terms`, `levels`, `values`); empty exactly when `ranef` is |
+| `fitted` | `(n,)` fitted means μ̂ per row; NaN on non-converged fits |
+| `ranef` | random-effect conditional modes b̂, one block per grouping in `varcorr`/`re_groups` order, level-major; NaN on non-converged fits — prefer `ranef_blocks` for the labelled form, and do not slice this array yourself |
+| `ranef_levels` | level count per grouping, for slicing `ranef`; filled on every fit with random effects, also one that did not converge |
+| `ranef_blocks` | the same conditional modes, labelled: a list of dicts per grouping (`group`, `terms`, `levels`, `values`); empty on a fit without random effects, and on one that did not converge (where `ranef` is NaN) |
 | `converged` | numerical failure signals here (not an exception) — check before trusting `beta`/`se` |
 | `singular` | boundary (singular) fit — `>=1` RE variance component pinned at 0; mirrors lme4's `isSingular` |
 | `offset` | `(n,)` the offset the model was fitted with; `None` without one |
@@ -323,7 +323,7 @@ parameters included, named as lme4 names them (see
 [`hypothesis-tests.md`](hypothesis-tests.md#profile-likelihood-intervals)).
 
 Aliased columns show `NaN` estimates, as lme4 prints `NA`. A footer carries
-`dispersion`, `converged` and `singular`, and when `varcorr` is non-empty an
+`dispersion`, `converged` and `singular`, and when `varcorr` holds estimates an
 RE block shows each grouping by name with its per-term variance, stddev and
 correlation (lme4's `VarCorr` layout; the names come from `re_groups`).
 `stddev_se` is not printed; read it off the fit. When the fit raised any
@@ -409,6 +409,8 @@ converges, never the answer:
 fit2 = glmm.fit(data2, "y ~ x1 + (1 | group)",
                 warm_start={"beta": list(fit1.beta), "theta": [...]})
 ```
+
+On data where the fixed effects separate the response, a warm-started fit stops as `separated`, as a cold fit does; only Rust's `loop_advanced` tier skips that check.
 
 The dict takes up to three keys, mirroring the Rust `StartValues`: `"beta"`
 (length p), `"theta"` (Cholesky-scaled RE start; empty for fixed-only

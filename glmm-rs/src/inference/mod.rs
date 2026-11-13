@@ -57,7 +57,7 @@ mod mc_data_tests;
 // quantity of the tier, counted, printed and written per cell.
 #[cfg(all(test, feature = "montecarlo-tests"))]
 mod mc_calibration_tests;
-// Spec 2-dcr's gates G11 and G13 on weighted cells (Monte Carlo tier),
+// Type I checks of the weighted default fit and of `compare()` on weighted cells (Monte Carlo tier),
 // fitted through the ports' calls, which `montecarlo-tests` implies.
 #[cfg(all(test, feature = "montecarlo-tests"))]
 mod dcr_montecarlo_tests;

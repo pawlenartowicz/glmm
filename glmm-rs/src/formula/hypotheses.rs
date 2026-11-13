@@ -21,7 +21,6 @@ use faer::{Mat, MatRef};
 use super::materialize::Lowered;
 use crate::inference::evd::sym_eigen;
 use crate::linalg::SeqLlt;
-use crate::ColumnId;
 
 /// One term's hypothesis matrix, in lmerTest's basis.
 pub(crate) struct TermHypothesis {
@@ -301,8 +300,9 @@ pub(crate) fn untouched_columns(l: MatRef<'_, f64>) -> Vec<usize> {
 /// it, and `exact` the same hypothesis from [`type3_unrounded`]. `l` decides
 /// what needs exact zeros: the columns it does not touch come first in `N`,
 /// as unit columns in the order of [`untouched_columns`], so their meaning
-/// and any random slope on them are kept ([`remap_slopes`] with that list);
-/// and the rank `r`. The rest of `N` is the null space of `exact` on the
+/// and any random slope on them are kept
+/// ([`remap_slopes`](crate::spec::remap_slopes) with that list); and the rank
+/// `r`. The rest of `N` is the null space of `exact` on the
 /// touched columns, `E`: the eigenvectors of `EᵀE` ([`sym_eigen`]) whose
 /// eigenvalue is at most `1e-8` of the largest, as many as `l` leaves on
 /// those columns. The result is checked: `‖E·N‖_F ≤ 1e-12·‖E‖_F`.
@@ -369,37 +369,6 @@ fn null_directions(m: MatRef<'_, f64>) -> Result<Mat<f64>, ReducedDesignError> {
     let cut = NULL_REL_TOL * eig.values[k - 1];
     let null: Vec<usize> = (0..k).filter(|&i| eig.values[i] <= cut).collect();
     Ok(Mat::from_fn(k, null.len(), |a, j| vectors[(a, null[j])]))
-}
-
-/// A grouping's random-slope columns (`Grouping::slopes`, indices into the
-/// full model's `[X | Z_r]`) on a reduced design of `k` columns whose leading
-/// column `j` is caller column `kept[j]` (a Type II set of
-/// [`type2_lr_sets`], or the [`untouched_columns`] that lead a Type III `N`).
-/// A slope on a kept column moves to its new position, so it stays on the
-/// same variable. Any other slope, on a column the reduced design drops or
-/// mixes or on a full-model `Z_r` column, reads random-effect-only column
-/// `k + j` of the refit, `sources[j]` its column in the full `[X | Z_r]`:
-/// pushed when new, shared by every grouping that names it.
-pub(crate) fn remap_slopes(
-    slopes: &[ColumnId],
-    kept: &[usize],
-    k: usize,
-    sources: &mut Vec<usize>,
-) -> Vec<ColumnId> {
-    slopes
-        .iter()
-        .map(|&s| {
-            let s = s as usize;
-            let j = kept.iter().position(|&c| c == s).unwrap_or_else(|| {
-                let at = sources.iter().position(|&c| c == s).unwrap_or_else(|| {
-                    sources.push(s);
-                    sources.len() - 1
-                });
-                k + at
-            });
-            ColumnId::try_from(j).expect("a design column index fits a ColumnId")
-        })
-        .collect()
 }
 
 /// The per-term tests' refusal of a formula whose interaction lacks a

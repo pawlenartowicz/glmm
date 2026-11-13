@@ -33,8 +33,11 @@ With \code{condVar = TRUE} (the default) each data frame carries a \code{postVar
 attribute, as lme4's does: an array of terms x terms x levels holding each
 level's conditional covariance of its random effects given the data, at the
 fitted parameters. A fit made with \code{condvar = FALSE} has none, and some
-layouts form none: a model with an extra grouping that has a random slope,
-one over the dense size limit (both fitted by the sparse solver), and a GLMM
+layouts form none: a model with random slopes on two or more groupings, a
+model with one slope grouping written after other groupings where moving it
+first would leave more than 500 crossed levels or its slope block is wider
+than 8, one over the dense size limit
+(all fitted by the sparse solver), and a GLMM
 on the packed layout. There an explicit \code{condVar = TRUE} is an error, and
 the default leaves the attribute off.
 

@@ -80,6 +80,23 @@ pub(crate) fn clamp_eta<T: Scalar>(family: Family, eta: T) -> T {
     }
 }
 
+/// True when `eta` has no mean in the family's range: η NaN or ≤ 0 on the
+/// Gamma inverse and inverse-Gaussian `InverseSquared` links, whose mean
+/// `1/η` or `η^(−1/2)` must be positive. [`clamp_eta`] would map such η to
+/// a mean near `1/INV_ETA_MIN`, so a caller that reports a mean asks here
+/// first.
+pub(crate) fn mean_out_of_range(family: Family, eta: f64) -> bool {
+    matches!(
+        family,
+        Family::Gamma {
+            link: GammaLink::Inverse,
+            ..
+        } | Family::InverseGaussian {
+            link: InverseGaussianLink::InverseSquared,
+        }
+    ) && (eta.is_nan() || eta <= 0.0)
+}
+
 /// The `(lo, hi)` bounds [`clamp_eta`] holds η inside, per family. Also read
 /// by a caller asking "did the clamp bind on this row?" after the fact:
 /// `glmm::assembled::eta_clamped_rows`.
@@ -835,7 +852,7 @@ impl<'a> ProbitRows<'a> {
 
 /// Whether `μ = e^η` is the link inverse: then `dμ/dη = d²μ/dη² = μ`.
 #[inline]
-fn is_log_link(family: Family) -> bool {
+pub(crate) fn is_log_link(family: Family) -> bool {
     matches!(
         family,
         Family::Poisson { .. }
@@ -881,10 +898,11 @@ pub(crate) fn tail_weight_and_resid<T: Scalar>(
 }
 
 /// The precision-weight normaliser `s`: the power of two closest to the
-/// geometric mean of `w`, `1.0` for unit weights. The Gaussian LMM route
-/// (`fit::lmm::accumulate_lmm_rows`) fits on `ŵ = w/s` too, reporting `σ̂² · s`.
-/// The Gamma precision-weight
-/// path runs on `ŵᵢ = wᵢ/s` internally: row shape `aᵢ = wᵢ/φ = ŵᵢ/(φ/s)`, so
+/// geometric mean of `w`, `1.0` for unit weights. Every route of a family
+/// with a dispersion fits on `ŵ = w/s` (`standardize::Units`) and reports the
+/// dispersion times `s`; the GLM IRLS floor's case scale and the held Gamma
+/// dispersion check in `fit::common::validate` read it too. On Gamma the
+/// row shape is `aᵢ = wᵢ/φ = ŵᵢ/(φ/s)`, so
 /// on `ŵ` the internal dispersion coordinate is `φ/s`, unchanged by rescaling
 /// every `wᵢ` by one constant `c` — exactly so when `c` is a power of two:
 /// `log₂(c·wᵢ) = k + log₂ wᵢ` for `c = 2^k`, so the mean of `log₂ w` shifts
@@ -907,6 +925,19 @@ pub(crate) fn weight_scale(w: Option<&[f64]>, n: usize) -> f64 {
             2.0_f64.powi(mean_log2.round() as i32)
         }
     }
+}
+
+/// Whether the deviance must take its weighted form: prior weights are given,
+/// or a logit binomial response has a value outside {0, 1}, where the fused
+/// Bernoulli deviance does not hold.
+pub(crate) fn weighted_deviance_needed(family: Family, y: &[f64], prior_w: Option<&[f64]>) -> bool {
+    prior_w.is_some()
+        || (matches!(
+            family,
+            Family::Binomial {
+                link: BinomialLink::Logit
+            }
+        ) && y.iter().any(|&v| v != 0.0 && v != 1.0))
 }
 
 /// `2a − 2a·ln a + 2·lnΓ(a)`, that is `2·(lnΓ(a) − a·ln a + a)`, for `a > 0`,
@@ -1148,7 +1179,8 @@ pub(crate) fn inv_gaussian_aic<T: Scalar>(
 ///
 /// - **Binomial** — the aggregated form: row `i` is `mᵢ = wᵢ` trials with
 ///   `sᵢ = wᵢ·yᵢ` successes (unit weights and 0/1 y ⇒ Bernoulli, where every
-///   term is 0; a fractional y with unit weights keeps its nonzero term),
+///   term is 0, the condition [`weighted_deviance_needed`] decides; a
+///   fractional y with unit weights keeps its nonzero term),
 ///   so the saturated density at `μ=y` is `ln C(mᵢ,sᵢ) + sᵢ·ln yᵢ +
 ///   (mᵢ−sᵢ)·ln(1−yᵢ)` with the binomial coefficient via `lnΓ` (continuous in
 ///   `wᵢ`; R's `dbinom` rounds — identical on the integer trial counts the
@@ -1161,7 +1193,7 @@ pub(crate) fn inv_gaussian_aic<T: Scalar>(
 ///   through [`gamma_dispersion_term`] at their φ̂, so there is no saturated
 ///   term to restore; a caller reaching this arm is a bug, surfaced as NaN.
 /// - **InverseGaussian** — NaN for the same reason as Gamma: the objective
-///   substitutes `inv_gaussian_aic` (D1), which already carries the profiled
+///   substitutes `inv_gaussian_aic`, which already carries the profiled
 ///   dispersion, so there is no free-standing saturated constant to restore.
 pub(crate) fn saturated_loglik(
     family: Family,
@@ -1699,7 +1731,7 @@ mod tests {
         }
     }
 
-    /// The ten `(family, link)` cells `weight_eta_deriv` and D4's table cover,
+    /// The ten `(family, link)` cells `weight_eta_deriv` and its table cover,
     /// paired with the η domain each needs (Gamma-inverse and IG-inverse-squared
     /// need `η > 0`).
     fn weight_eta_deriv_cells() -> Vec<(Family, &'static [f64])> {

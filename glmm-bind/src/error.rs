@@ -3,8 +3,8 @@
 use std::fmt;
 
 /// A failed call. Each port maps `code` to its own error class: Python raises
-/// `internal` as `RuntimeError` and every other code as `ValueError`; R raises
-/// an R error for each.
+/// `internal` as `RuntimeError` and every other code as `ValueError`, with the
+/// code as its `.code`; R raises an error of class `fastglmm_error_<code>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BindError {
     /// `invalid_argument` (a bad argument, found by bind or the engine),
@@ -17,20 +17,16 @@ pub struct BindError {
     /// The caller's row the error names, in the caller's numbering
     /// (`row_index`, else the row passed plus `row_base`).
     pub row: Option<usize>,
-    /// On `compare_error`, the refusal's kind (`"different_y"`, ...,
-    /// `"other"`), from which a port adds its pointer to its own `compare`.
-    pub kind: Option<&'static str>,
 }
 
 impl BindError {
-    /// An error with no row and no kind.
+    /// An error with no row.
     #[must_use]
     pub fn new(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into(),
             row: None,
-            kind: None,
         }
     }
 

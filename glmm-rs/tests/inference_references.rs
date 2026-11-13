@@ -7,8 +7,8 @@
 //! `oracle-tier` entry of `validation/grid/divergences.json` whose `cell` is
 //! neither a golden nor an inference reference: no driver compares that cell,
 //! so none can find the entry stale. Every JSON carries the provenance keys its
-//! generator writes: the R keys on every kind but `conditioning` and `cr2_hp`,
-//! whose generators are Python scripts with keys of their own. Every version that
+//! generator writes: the R keys on every kind but `conditioning`, `cr2_hp` and
+//! `cr2_df`, whose generators are Python scripts with keys of their own. Every version that
 //! provenance records (each of `packages`, and `r_version`) is on its pin in
 //! `validation/grid/versions.json`: an off-pin reference fails, and is
 //! regenerated under the pin, never edited; a package with no pin fails until
@@ -36,7 +36,7 @@ use std::path::{Component, Path};
 type KindDir = BTreeMap<String, Value>;
 
 /// The `provenance` keys `validation/tools/inference_common.R::provenance` writes,
-/// on every kind but `conditioning` and `cr2_hp`.
+/// on every kind but `conditioning`, `cr2_hp` and `cr2_df`.
 const PROVENANCE_KEYS: [&str; 7] = [
     "r_version",
     "packages",
@@ -47,9 +47,9 @@ const PROVENANCE_KEYS: [&str; 7] = [
     "generator",
 ];
 
-/// The `provenance` keys of a `conditioning` reference, which a Python generator
-/// writes. Mirrors `validation/tools/goldens_glm_band.py::provenance`; change
-/// together.
+/// The `provenance` keys of a `conditioning` or `cr2_df` reference, which a
+/// Python generator writes. Mirrors `validation/tools/goldens_glm_band.py::provenance`
+/// and `goldens_cr2_df.py::provenance`; change together.
 const PY_PROVENANCE_KEYS: [&str; 4] = ["python_version", "packages", "mp_dps", "generator"];
 
 /// The `provenance` keys of a `cr2_hp` reference. Mirrors
@@ -57,7 +57,7 @@ const PY_PROVENANCE_KEYS: [&str; 4] = ["python_version", "packages", "mp_dps", "
 const HP_PROVENANCE_KEYS: [&str; 4] = ["python_version", "packages", "prec_bits", "generator"];
 
 /// The rules across kinds, over the raw block: each entry parses (so its `kind`
-/// is one of the ten), names are unique and none is in `reserved` (the
+/// is one of the eleven), names are unique and none is in `reserved` (the
 /// `datasets` and `m3_goldens` names), `data` names a file or is `null` only on
 /// a fit-free entry, `generator` is a bare file name naming a file under
 /// `tools/`, and each `factors` name is a column of the `data` CSV. `exists`
@@ -212,7 +212,7 @@ fn kind_rules(kind: Kind, entries: &[Entry], jsons: &KindDir, pins: &Pins) -> Ve
         }
     }
     let keys: &[&str] = match kind {
-        Kind::Conditioning => &PY_PROVENANCE_KEYS,
+        Kind::Conditioning | Kind::Cr2Df => &PY_PROVENANCE_KEYS,
         Kind::Cr2Hp => &HP_PROVENANCE_KEYS,
         _ => &PROVENANCE_KEYS,
     };

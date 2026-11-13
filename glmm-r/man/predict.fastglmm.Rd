@@ -76,5 +76,14 @@ with a \code{"fastglmm_predict_se_model_based"} warning: their formula holds
 only with the model's covariance. A fit with no estimates (every
 coefficient \code{NA}: a fit that stopped before estimating anything, such as
 too few rows or a degenerate design) predicts \code{NA}, with an \code{NA} standard
-error and \code{NA} bounds.
+error and \code{NA} bounds. A row outside the row space of a rank-deficient fit
+(one with aliased columns) is not estimable: its prediction, standard
+error, interval and future bounds are \code{NaN}, with a warning of class
+\code{fastglmm_rows_not_estimable}, as \code{predict.lm(rankdeficient = "NA")} gives
+\code{NA}; rows inside the row space use the kept coefficients as before. On the
+response scale of a Gamma inverse-link or
+inverse-Gaussian \code{1/mu^2} model, a row whose linear predictor is at or
+below 0 has no mean, so its prediction, standard error, interval and
+future bounds are \code{NaN}; on a row with a linear predictor above 0, an
+interval end at or below 0 maps to \code{Inf}.
 }

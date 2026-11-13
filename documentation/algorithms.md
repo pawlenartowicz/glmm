@@ -71,18 +71,21 @@ matching R/lme4's `dqrdc2` convention: of a collinear pair, the *later* column
 is always the one dropped, regardless of magnitude (the per-column pivot test
 `piv ≤ eps·G_dd` is scale-invariant), so the `NaN` slots land exactly where
 lme4 puts its `NA`s. The reduced design is full rank, so the recursion never
-re-enters this branch. An aliased column that is also an RE slope is faulted
-rather than mis-indexed. This preprocessing is path-agnostic: it serves OLS,
-GLM, LMM and GLMM alike.
+re-enters this branch. A random slope on a dropped column keeps reading the
+same values: in the reduced fit it is a random-effect-only column (`Z_r`),
+one per dropped column, shared by every grouping that names it. This
+preprocessing is path-agnostic: it serves OLS, GLM, LMM and GLMM alike.
 
-**Identification notes.** Next to the alias check, `fit_checked` runs `identification_notes` (`src/fit/common.rs`), which reads only the ids, the slope columns and the response, compares values exactly, and adds a note for each random-effect structure the data cannot identify: a single-level grouping, two groupings with the same groups that share a random-effect column, slopes constant within the levels of a block with a random intercept that take too few distinct values for their covariance parameters, and a binomial response constant within every level when some level holds more than one trial. No estimate depends on it. On the aliased path the reduced re-entry runs it on the reduced design, and those notes are the ones reported; the unfittable-random-slope return reports none.
+**Identification notes.** Next to the alias check, `fit_checked` runs `identification_notes` (`src/fit/common.rs`), which reads only the ids, the slope columns and the response, compares values exactly, and adds a note for each random-effect structure the data cannot identify: a single-level grouping, two groupings with the same groups that share a random-effect column, slopes constant within the levels of a block with a random intercept that take too few distinct values for their covariance parameters, and a binomial response constant within every level when some level holds more than one trial. No estimate depends on it. On the aliased path the reduced re-entry runs it on the reduced design, and those notes are the ones reported.
 
 **`classify_design` routing (mixed arm only).** A mixed design routes to
 `Solver::Sparse` when it is over the dense envelope (primary width
 `q_p > MAX_PRIMARY_Q`, more than `MAX_EXTRA_GROUPINGS` extra groupings, or any
 extra grouping width `1 + slopes.len() > MAX_EXTRA_Q`), **or** any extra
 grouping carries a random slope, **or** the total `Crossed` level count exceeds
-`MAX_CROSSED_LEVELS`; otherwise it stays `Solver::NoZ`. The caps are a
+`MAX_CROSSED_LEVELS`; otherwise it stays `Solver::NoZ`.
+Before this check, a lone slope grouping written after intercept-only crossed groupings is moved first when the moved design routes `NoZ` (`spec_sized_from_ids`, `src/fit/common.rs`), and the grouping it displaces takes the nested layout when it is nested in the slope grouping.
+The caps are a
 scratch-capacity boundary, not a model limit — the router redirects rather than
 aborts, so every wired family fits on whichever side it lands and there is **no
 reachable `unimplemented!` / panic** in the mixed dispatch. Two of the clauses
@@ -203,9 +206,8 @@ slope is scaled without being centered, `mⱼ = 0` and `sⱼ` its weighted RMS
 about zero, so its zeros stay exact zeros and the random-effect search sees
 the slope in units of its root mean square
 ([random-effect design column scaling](algorithms-lmm.md#random-effect-design-column-scaling)). The
-response, the offset and the weights are not transformed, except on a Gamma
-GLMM with the inverse link, where the response can be rescaled by a power of two
-([response units](algorithms-glmm.md#response-units-on-the-gamma-inverse-link)). The statistics are
+response, the offset and the weights get their own units step, right after
+this one ([internal units](#internal-units-of-the-response-the-weights-and-the-offset)). The statistics are
 applied inside the column-major fill every route already does, so no extra
 copy of `X` is made: every route, the NB ones included, reads the same
 column-major `x̃` buffer of the workspace.
@@ -276,6 +278,63 @@ random-effect maps (`src/lmm/re_map.rs`); `fit_on`, `FitView::new`
 (`src/fit/core.rs`); `fill_col_major_std`, `vcov_from_chol`, `varcorr_block`
 and the ranef assemblers (`src/fit/common.rs`). **Convention**: lme4 fits the
 design as given and warns on badly scaled predictors (`checkScaleX`).
+
+## Internal units of the response, the weights and the offset
+
+Right after the column statistics, `fit_on` computes one `Units` per draw
+(`src/standardize.rs`), and every route fits on the values it gives:
+
+- **Weights.** On the families with a dispersion (Gaussian, Gamma,
+  inverse Gaussian) the prior weights are precision weights, so dividing
+  them all by one constant only moves the dispersion. Every route fits on
+  `ŵ = w/s`, `s` the power of two nearest the geometric mean of `w`
+  (`family::weight_scale`, exactly 1 when unweighted), and reports the
+  dispersion times `s`. Binomial, Poisson and NB weights are trials or
+  exposure, part of the model, and stay as given.
+- **Response scale.** Gaussian, Gamma and inverse-Gaussian fits run on `y/c`,
+  `c` a power of two: on Gamma and inverse Gaussian the one nearest the
+  `ŵ`-weighted geometric mean of y, on Gaussian the one nearest the weighted
+  root mean square of the shifted response below. A log link without an
+  intercept keeps `c = 1`, since nothing absorbs the shift of η.
+- **Gaussian shift.** The Gaussian response is first replaced by
+  `y − o − x̃β̃₀`, `β̃₀` the weighted least-squares fit of `y − o` on x̃, so
+  the offset is folded in and neither Gaussian route gets one. The OLS
+  residuals and the profiled LMM criterion read y only through the residual,
+  so the shift is exact; it removes the cancellation a response far from zero
+  brings into the Gram.
+- **Offset centre.** On a log link with an intercept and an offset (Poisson,
+  NB, Gamma and inverse-Gaussian log), the offset is centred at its weighted
+  mean `m`, and the intercept takes `m` back.
+
+Every scale is a power of two, so it adds no rounding; the shift and the
+log-link intercept move results by round-off. The map back runs where the
+column map runs (`FitView::new`, the kernels' `var_diag` and `t²`, and
+`into_fit`), so no reader sees internal units. With `β̃ = k·(β̃_int + δ̃)` on
+x̃'s columns:
+
+| | Gaussian | Gamma, IG, log link | Gamma, inverse link | IG, 1/μ² link |
+|---|---|---|---|---|
+| internal offset | none (in y) | `o − m` | `c·o` | `c²·o` |
+| `k`, `δ̃` | `c`, `β̃₀/c` | `1`, `ln c − m` on the intercept | `1/c`, 0 | `1/c²`, 0 |
+| `Var(β̂)` | `·c²` | unchanged | `/c²` | `/c⁴` |
+| τ², varcorr | `·c²` (θ unchanged) | unchanged | `/c²` (θ `/c`) | no mixed model |
+| dispersion | `·s·c²` | Gamma `·s`, IG `·s/c` | `·s` | `·s/c` |
+| fitted μ | from the caller's β | `·c` | `·c` | `·c` |
+| log-likelihood | `− ν·ln c` | `− n·ln c` | `− n·ln c` | `− n·ln c` |
+
+ν is `n` on ML and `n − p` on REML (the REML criterion is the density of
+`n − p` error contrasts); a deviance takes `+2` times the same factor. The
+Wald `t²` and the joint Wald statistic are formed from the caller's β and
+variance. Poisson and NB take only the offset centre; binomial takes nothing.
+The derivations are on `Units`. A GLMM search runs on the same internal values
+(`fit_glmm_in_units`, [GLMM response units](algorithms-glmm.md#response-units)).
+
+The loop-tier `fit_suff_stats_t_sq` and `glm_irls_fit` run on the data as
+given (`Units::IDENTITY`).
+
+**Code**: `Units` (`src/standardize.rs`); `fit_on`, `FitView::new`
+(`src/fit/core.rs`). **Convention**: R's `lm`, `glm` and lme4 fit the data
+as given.
 
 ## Legend
 
@@ -352,7 +411,7 @@ and are not user-facing.
 | `outer_search` route | `ExactProfile` on the `exact_profile_shape` shapes (nAGQ=1 on the blocked or structured layout, not the packed one; canonical or not, Gamma included); else `Joint` when `nAGQ>1 \|\| (n_θ ≤ 2 && p ≤ 4)`; else `PqlThenJoint` | [`algorithms-glmm.md`](algorithms-glmm.md#β-profiling--the-three-outer-routes) (`src/glmm/workspace.rs`, `src/glmm/mod.rs`) |
 | `ExactProfile` stage-1 PIRLS tolerance | `clamp(RHO_TOL_C·ρ², pirls_tol, RHO_TOL_MAX)` with BOBYQA's ρ, `RHO_TOL_C = 1e-2`, `RHO_TOL_MAX = 1e-5`; `pirls_tol` on the first evaluation and once ρ ≤ `RHO_TOL_FULL_FACTOR·GLMM_RHO_END` (3e-5); a loose incumbent re-solved at `pirls_tol` | [`algorithms-glmm.md`](algorithms-glmm.md) (`src/glmm/mod.rs`) |
 | `JOINT_RECHECK_TOL` | `1e-9` relative: after a converged joint `[θ \| β̃]` search (on AGQ, also after a gradient-search finish), a PQL re-solve of β at the incumbent (then, on AGQ, the AGQ objective there) lower by more than this starts a second pass from it, on β̃ scaled by the β information | [`algorithms-glmm.md`](algorithms-glmm.md#β-profiling--the-three-outer-routes) (`src/glmm/mod.rs`) |
-| Gamma-inverse response units | first search on y while the largest cluster η is in `[1/64, 64]`, else on y rescaled to bring it into `[4, 8]`; a search that fails or ends no lower than the GLM point (`UNITS_RETRY_TOL = 1e-6` relative) is retried with the smallest start η in `[1/2, 64]` and the largest cluster η in `[4, 8]` and `[8, 16]` | [`algorithms-glmm.md`](algorithms-glmm.md#response-units-on-the-gamma-inverse-link) (`src/fit/glmm.rs`) |
+| Gamma-inverse response units | first search on the draw's `y/c` while the largest cluster η is in `[1/64, 64]`, else on `y/c` rescaled by a further power of two to bring it into `[4, 8]`; a search that fails or ends no lower than the GLM point (`UNITS_RETRY_TOL = 1e-6` relative) is retried with the smallest start η in `[1/2, 64]` and the largest cluster η in `[4, 8]` and `[8, 16]` | [`algorithms-glmm.md`](algorithms-glmm.md#response-units) (`src/fit/glmm.rs`) |
 | `ETA_DIVERGENCE_CAP` | `30` — GLM divergence guard: a fit that ends unsettled (at `MAX_IRLS_ITERS`, on an η its link does not evaluate, or on a failed solve) with some `|η_i − η₀| > 30` and a last step that still moves some η by more than `SEPARATION_STEP` → non-converged and separated; crossing 30 alone stops nothing, `η₀ = oᵢ` on the binomial links and `oᵢ + ln μ₀` (the null-model seed) on the log links; skipped under the Gamma inverse and inverse-Gaussian `1/μ²` links | [GLM](#generalised-linear-models-glm) (`src/glm.rs`) |
 | `PROB_EPS` / `UPPER_TAIL_Q` / `LOG_TAIL_ETA` | `1e-12` / `1e-4` / `230` — tail-row switch: binomial μ within `1e-12` of 0 or `1e-4` of 1, NB/Gamma/IG-log `\|η\| > 230` → deviance, score and weights from their η forms | [GLM](#generalised-linear-models-glm) (`src/family.rs`) |
 | `STEP_ULPS` | `16` — GLM round-off stop: a step that moved no η by more than 16 ULPs of max \|η\| ends the fit as converged | [GLM](#generalised-linear-models-glm) (`src/glm.rs`) |
@@ -455,15 +514,16 @@ math through the GLMM cold-start GLM fit.
 
 `fit_glm_prebuilt` runs adaptive IRLS cold-started at β = 0, converging on
 R's `glm.fit` rule `|Δ deviance| / (|deviance| + 0.1) < DEVIANCE_TOL` with a
-`MAX_IRLS_ITERS` safety cap. On Gamma and inverse-Gaussian the `0.1` floor is
-carried into the deviance's units (`dev_floor`): it is multiplied by the
-precision weights' scale (`family::weight_scale`), and on inverse-Gaussian
-divided by the weighted ȳ, since that deviance scales as `1/y`. So on these two
-families the stopping point is the same whatever the units of y or the overall
-scale of the weights. On binomial, Poisson and NB R's `0.1` is in units of one
+`MAX_IRLS_ITERS` safety cap. On Gamma and inverse-Gaussian the floor
+(`dev_floor`) is R's plain `0.1`: the core fits these families on `ŵ` and
+`y/c` ([internal units](#internal-units-of-the-response-the-weights-and-the-offset)),
+so their deviance has the same units whatever the units of y or the overall
+scale of the weights, and so has the stopping point. The loop-tier
+`glm_irls_fit` fits the data as given, so there the floor is 0.1 of the
+caller's deviance. On binomial, Poisson and NB R's `0.1` is in units of one
 case: weights of a case or more (trial counts, frequency weights) keep it
 exactly, and weights below one case scale it down with them
-(`min(1, weight_scale)`), as on Gamma. On Poisson and NB the floor is also
+(`min(1, weight_scale)`). On Poisson and NB the floor is also
 multiplied by `min(1, ȳ)`: R's own rule while ȳ ≥ 1, and scaled with y below
 that, where a non-integer y in tiny units makes the deviance small.
 
@@ -773,22 +833,15 @@ On Gamma, `Fit::loglik` uses a different estimator: the maximum-likelihood
 φ̂, the root of `Σᵢ wᵢ·(ln aᵢ − ψ₀(aᵢ)) = D/2`
 (`family::gamma_ml_dispersion`; at unit weights this is
 `MASS::gamma.shape`'s equation). It only places `loglik`; it is not
-reported. Rescaling every weight by a constant `c` scales this φ̂ by the
-same `c` and changes nothing else about the fit, so the ML search itself
-runs on weights normalised by `w̄ = 2^round(mean(log₂ wᵢ))`
-(`family::weight_scale`) — a power of two near the geometric mean of the
-weights, exactly `1` when unweighted (`ŵᵢ = wᵢ/w̄`) — the search box and the
-starting point then stay fixed regardless of the weights' own scale — and
-`φ̂ = w̄·φ̂_int` multiplies the internal root back onto the raw scale. An
-arithmetic mean would let one outlier weight push `φ_int` out of its search
-box; a power of two also keeps rescaling by a power of two exact. Unweighted
-fits skip the division, so they keep their exact arithmetic.
-`Fit::loglik` is `−½·(D/φ + Gₚ)`, with the raw (un-normalised)
-`D` and at `φ = w̄·φ̂_int` (or a held `v`), but `Gₚ` itself — the same
-`family::gamma_dispersion_term` the mixed path uses — is read on the
-normalised `ŵ` at `ln(φ/w̄)` rather than on raw `w` at `ln φ`; the two give
-the same value (`aᵢ = wᵢ/φ = ŵᵢ/(φ/w̄)`), so this is only the solver staying
-on the one numerically stable scale it already searched on. `Fit::loglik` is
+reported. Rescaling every weight by a constant scales this φ̂ by the
+same constant and changes nothing else about the fit. Like the whole fit,
+the ML search runs on the internal `ŵ = w/s` and `y/c`
+([internal units](#internal-units-of-the-response-the-weights-and-the-offset)),
+so its search box and starting point stay fixed whatever the weights' own
+scale. `Fit::loglik` is `−½·(D/φ + Gₚ)` on those internal values, at the
+internal root or a held `v` entered as `v/s`, less `n·ln c` (the density's
+Jacobian for `y/c`). The weight scale needs no term: `aᵢ = wᵢ/φ =
+ŵᵢ/(φ/s)`. `Fit::loglik` is
 thus the maximised log-likelihood of the precision model, so a Gamma GLM and
 a Gamma GLMM report comparable log-likelihoods. On a fit that reproduces the
 data exactly, `D` is rounding noise and the likelihood rises without bound as

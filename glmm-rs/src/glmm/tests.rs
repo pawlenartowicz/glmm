@@ -5634,12 +5634,12 @@ fn nb_workspace_carries_the_theta_nb_coordinate() {
     assert_eq!(nb.params.len(), m + 1);
     assert_eq!(nb.lower.len(), m + 1);
     assert_eq!(nb.upper.len(), m + 1);
-    assert_eq!(nb.lower[m], crate::fit::NB_THETA_LO.ln());
-    assert_eq!(nb.upper[m], crate::fit::NB_THETA_HI.ln());
+    assert_eq!(nb.lower[m], crate::consts::NB_THETA_LO.ln());
+    assert_eq!(nb.upper[m], crate::consts::NB_THETA_HI.ln());
     assert_eq!(nb.params_stage1.len(), nb.n_theta + 1);
     assert_eq!(nb.lower_stage1.len(), nb.n_theta + 1);
-    assert_eq!(nb.lower_stage1[nb.n_theta], crate::fit::NB_THETA_LO.ln());
-    assert_eq!(nb.upper_stage1[nb.n_theta], crate::fit::NB_THETA_HI.ln());
+    assert_eq!(nb.lower_stage1[nb.n_theta], crate::consts::NB_THETA_LO.ln());
+    assert_eq!(nb.upper_stage1[nb.n_theta], crate::consts::NB_THETA_HI.ln());
     assert_eq!(&nb.lower_stage1[..nb.n_theta], &nb.lower[..nb.n_theta]);
 
     let pois = GlmmWorkspace::for_cluster_spec(
@@ -8240,17 +8240,17 @@ fn laplace_log_det_is_the_exact_curvature_at_the_mode() {
     }
 }
 
-/// A fitted `ln φ̂` on either bound of the Gamma coordinate's box is refused;
-/// one just inside the tolerance is not.
+/// A fitted `ln φ̂` on either edge of the Gamma coordinate's box, or within
+/// the tolerance of it, names that edge; one inside the box names none.
 #[test]
-fn gamma_phi_on_box_bound_flags_both_bounds_only() {
+fn gamma_phi_box_edge_names_the_edge_it_sits_on() {
     let (lo, hi) = (GAMMA_PHI_LO.ln(), GAMMA_PHI_HI.ln());
-    assert!(gamma_phi_on_box_bound(lo));
-    assert!(gamma_phi_on_box_bound(hi));
-    assert!(gamma_phi_on_box_bound(lo + 5e-7));
-    assert!(!gamma_phi_on_box_bound(lo + 1e-3));
-    assert!(!gamma_phi_on_box_bound(hi - 1e-3));
-    assert!(!gamma_phi_on_box_bound(0.0));
+    assert_eq!(gamma_phi_box_edge(lo), Some(GAMMA_PHI_LO));
+    assert_eq!(gamma_phi_box_edge(lo + 5e-7), Some(GAMMA_PHI_LO));
+    assert_eq!(gamma_phi_box_edge(hi), Some(GAMMA_PHI_HI));
+    assert_eq!(gamma_phi_box_edge(lo + 1e-3), None);
+    assert_eq!(gamma_phi_box_edge(hi - 1e-3), None);
+    assert_eq!(gamma_phi_box_edge(0.0), None);
 }
 
 /// Negative-binomial AGQ: θ_NB sits outside the integral, so the

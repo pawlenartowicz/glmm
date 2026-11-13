@@ -10,15 +10,15 @@ use faer::Mat;
 
 use crate::glm::{glm_irls_fit, GlmScratch};
 use crate::glmm::{fill_packed_cols, GlmmFit, GlmmLayout, GlmmWorkspace, StructuredSchur};
-use crate::standardize::ColumnScaling;
+use crate::standardize::{ColumnScaling, Units};
 use crate::{Family, ModelSpec, NegBinomialLink, StartValues};
 
 use super::common::{
-    assemble_varcorr, fill_se_by_predictor, glmm_objective, nan_vcov, warm_theta, FitDiagnostics,
+    assemble_varcorr, fill_se_by_predictor, glmm_objective, warm_theta, FitDiagnostics,
 };
 #[cfg(test)]
 use super::SizedSpec;
-use super::{Diagnostics, Fit, FitOptions, SeType};
+use super::{Fit, FitOptions, SeType};
 
 // ---------------------------------------------------------------------------
 // GLMM dispatch (Binomial{Logit}, re: Some)
@@ -33,8 +33,9 @@ use super::{Diagnostics, Fit, FitOptions, SeType};
 /// overshoot into a weight regime (μ = exp(η) ~ 1e30 for Poisson-log) where the
 /// structured crossed-Schur factor loses positive-definiteness and the deviance
 /// aborts to `inf` (the grouseticks 3-crossed degenerate fit). Falls back to β = 0
-/// if the GLM does not converge to finite coefficients. Only the cold path pays this
-/// solve; a warm start (the MCPower hot loop) supplies β and never calls this.
+/// if the GLM does not converge to finite coefficients. The cold path pays this
+/// solve; a stable warm start pays it too, for the separation flag only; a
+/// loop-tier warm start (the MCPower hot loop) supplies β and never calls this.
 ///
 /// The flag is `GlmFitView::separated`: the GLM found no finite maximum, and β is
 /// then its last iterate instead of the fallback, for the caller to report. A
@@ -116,7 +117,7 @@ pub(crate) fn glm_warm_start_beta(
 /// per-call guards of the unified core's `FitKind::Glmm` and
 /// `FitKind::GlmmNb` arms (both build their workspace once per shape, so the check runs per
 /// call), and by the test-only [`build_on_workspace`]. `groupings` and
-/// `nagq` are the workspace's, for the reported `tau2` width and the route's
+/// `nagq` are the workspace's, for the per-grouping layout and the route's
 /// [`Fit::objective`].
 pub(super) fn degenerate_glmm_fit(
     n: usize,
@@ -124,41 +125,9 @@ pub(super) fn degenerate_glmm_fit(
     groupings: &crate::lmm::LmmGroupings,
     nagq: u8,
 ) -> Fit {
-    let mut tau2 = vec![f64::NAN; groupings.n_theta()];
-    groupings.drop_hidden(&mut tau2);
-    Fit {
-        beta: vec![f64::NAN; p],
-        se: vec![f64::NAN; p],
-        vcov: nan_vcov(p),
-        tau2,
-        dispersion: f64::NAN,
-        diagnostics: Diagnostics::from_flags(false, false, p),
-        varcorr: vec![],
-        stddev_se: vec![],
-        n_eval: 0,
-        #[cfg(feature = "counters")]
-        counters: crate::counters::EvalCounters::new(),
-        deviance: f64::NAN,
-        loglik: f64::NAN,
-        df: 0,
-        reml: false,
-        weight_power: f64::NAN,
-        weight_power_estimated: false,
-        se_type: SeType::Model,
-        model_vcov: Vec::new(),
-        robust: None,
-        nobs: n,
-        objective: glmm_objective(nagq),
-        fitted: vec![],
-        ranef: vec![],
-        ranef_levels: super::common::ranef_level_counts(groupings),
-        condvar: vec![],
-        condvar_x: vec![],
-        condvar_cross: None,
-        coef_df: vec![f64::NAN; p],
-        satterthwaite: None,
-        design_summary: None,
-    }
+    let mut fit = Fit::empty(n, p, Some(groupings));
+    fit.objective = glmm_objective(nagq);
+    fit
 }
 
 /// θ-invariant build half: allocates the workspace for this (spec, n) shape
@@ -167,8 +136,9 @@ pub(super) fn degenerate_glmm_fit(
 /// none of which depend on `nb_theta`. On the degenerate n≤p/p=0
 /// short-circuit returns `Err` carrying the same NaN `Fit` triple the public
 /// path returns. Split from [`fit_glmm_prebuilt`] so a caller with its own
-/// workspace policy can build once and solve on it. Test-only: every fit path
-/// builds its workspace in the unified core (`fit::core::build_workspace`).
+/// workspace policy can build once and solve on it. `weights` are the ones the
+/// fit runs on (`Units::weights`). Test-only: every fit path builds its
+/// workspace in the unified core (`fit::core::build_workspace`).
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn build_glmm(
@@ -190,14 +160,17 @@ fn build_glmm(
 }
 
 #[cfg(test)]
-type BuiltGlmm = (GlmmWorkspace, Mat<f64>);
+type BuiltGlmm = (GlmmWorkspace, Mat<f64>, Units);
 
 /// Test-only: [`build_glmm`] on row-major `x`, returning the column-major copy
-/// alongside the workspace.
+/// and the draw's units (`fit::core::draw_units`) alongside the workspace.
+/// [`run_glmm_on`] given those units searches on the units the shipped fit
+/// searches on.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-pub(super) fn fit_glmm_build(
+pub(crate) fn fit_glmm_build(
     x: &[f64],
+    y: &[f64],
     weights: Option<&[f64]>,
     offset: Option<&[f64]>,
     n: usize,
@@ -208,8 +181,33 @@ pub(super) fn fit_glmm_build(
     opts: &FitOptions,
 ) -> Result<BuiltGlmm, Box<(Fit, Vec<f64>, f64)>> {
     let x_mat = super::common::to_col_major(x, n, p);
-    let ws = build_glmm(n, p, sized, cluster_ids, extra_ids, weights, offset, opts)?;
-    Ok((ws, x_mat))
+    let mut units = Units::new(sized.spec.family, n, p);
+    let map = ColumnScaling::IDENTITY;
+    super::core::draw_units(
+        &mut units,
+        None,
+        true,
+        x,
+        x_mat.as_ref(),
+        y,
+        weights,
+        offset,
+        n,
+        p,
+        map,
+    );
+    let fit_weights = units.weights(weights);
+    let ws = build_glmm(
+        n,
+        p,
+        sized,
+        cluster_ids,
+        extra_ids,
+        fit_weights,
+        offset,
+        opts,
+    )?;
+    Ok((ws, x_mat, units))
 }
 
 /// `slope_cols`: x column indices for the primary RE slopes (empty =
@@ -232,7 +230,8 @@ pub(super) fn re_slope_cols(model: &ModelSpec) -> (Vec<usize>, Vec<Vec<usize>>) 
 }
 
 /// The design-dependent tail of [`build_glmm`], on an already-allocated
-/// workspace: [`prep_glmm_design`], after the degenerate guard. Test-only.
+/// workspace: [`prep_glmm_design`], after the degenerate guard. `weights` are
+/// the ones the fit runs on (`Units::weights`). Test-only.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn build_on_workspace(
@@ -262,7 +261,10 @@ fn build_on_workspace(
 /// packed `M` columns and the two crossed-Schur symbolic factors. Shared by
 /// [`build_on_workspace`] (a fresh workspace per call, test-only), the unified
 /// core's `FitKind::Glmm` arm and [`run_glmm_nb_on`] (both reuse one workspace
-/// across draws, hence the `weighted` reset).
+/// across draws, hence the `weighted` reset). `weights` are the ones the fit
+/// runs on (`Units::weights`): `ŵ = w/s` on Gamma, whose outer φ search and
+/// dispersion term are not scale-free on raw `w` (`family::gamma_dispersion_term`),
+/// and the caller's trials or exposure on every other family.
 pub(super) fn prep_glmm_design(
     ws: &mut GlmmWorkspace,
     cluster_ids: &[u32],
@@ -273,20 +275,8 @@ pub(super) fn prep_glmm_design(
     opts: &FitOptions,
 ) {
     ws.parallel_inner = opts.parallel_inner;
-    ws.weight_scale = 1.0;
     if let Some(w) = weights {
-        // Gamma runs its outer φ search and dispersion term on `ŵ = w/s`
-        // (precision weights are not scale-free on raw `w` — see
-        // `family::gamma_dispersion_term`); every other family keeps raw `w`.
-        if matches!(ws.family, crate::Family::Gamma { .. }) {
-            let s = crate::family::weight_scale(Some(w), n);
-            ws.weight_scale = s;
-            for (dst, &wi) in ws.prior_w[..n].iter_mut().zip(w.iter()) {
-                *dst = wi / s;
-            }
-        } else {
-            ws.prior_w[..n].copy_from_slice(w);
-        }
+        ws.prior_w[..n].copy_from_slice(&w[..n]);
         ws.weighted = true;
     } else {
         // Most consumers read `prior_w` without gating on `weighted` (the
@@ -360,18 +350,33 @@ pub(crate) fn fit_glmm_packed(
         super::common::start_to_design(&mut s, &map, &ws.groupings, &mut scratch);
         s
     });
-    let mut ws = match build_on_workspace(ws, n, p, cluster_ids, extra_ids, weights, offset, opts) {
-        Ok(ws) => ws,
-        Err(degenerate) => return *degenerate,
-    };
+    let mut units = Units::new(model.family, n, p);
+    super::core::draw_units(
+        &mut units, None, true, x, x_mat, y, weights, offset, n, p, &map,
+    );
+    let fit_weights = units.weights(weights);
+    let mut ws =
+        match build_on_workspace(ws, n, p, cluster_ids, extra_ids, fit_weights, offset, opts) {
+            Ok(ws) => ws,
+            Err(degenerate) => return *degenerate,
+        };
     // NB seeds its `ln θ_NB` coordinate from the no-RE GLM-NB's own θ̂, exactly
     // as [`run_glmm_nb_on`] does, so the two routes start the same search.
     let nb_theta = match model.family {
         Family::NegativeBinomial { .. } => match start.as_ref().and_then(|s| s.dispersion) {
             Some(d) => d,
             None => {
-                let (prefit, theta) =
-                    super::glm::fit_glm_nb(x_mat, y, weights, offset, n, p, None, opts, &map);
+                let (prefit, theta) = super::glm::fit_glm_nb(
+                    x_mat,
+                    y,
+                    weights,
+                    units.offset(offset),
+                    n,
+                    p,
+                    None,
+                    opts,
+                    &map,
+                );
                 nb_glmm_seed(prefit.converged(), theta)
             }
         },
@@ -392,6 +397,7 @@ pub(crate) fn fit_glmm_packed(
         start.as_ref(),
         opts,
         &map,
+        &units,
     )
 }
 
@@ -405,7 +411,7 @@ pub(crate) fn fit_glmm_packed(
 /// glmmTMB, while θ = 1 reached glmmTMB's optimum in 324 evaluations, and on
 /// `nb_q8_g3000p20_bal_base` a 0.009 start took 38143 evaluations against 1145.
 pub(crate) fn nb_glmm_seed(prefit_converged: bool, prefit_theta: f64) -> f64 {
-    if prefit_converged && prefit_theta >= NB_SEED_FLOOR_FACTOR * super::NB_THETA_LO {
+    if prefit_converged && prefit_theta >= NB_SEED_FLOOR_FACTOR * crate::consts::NB_THETA_LO {
         prefit_theta
     } else {
         NB_SEED_FALLBACK
@@ -432,6 +438,9 @@ pub(crate) struct GlmmResultView<'a> {
     /// The column standardization `x` carried: β̂ and the SEs are already the
     /// caller's, θ̂ is read through it.
     map: &'a ColumnScaling,
+    /// The units the workspace's weights are in: a Gamma φ̂ is `s` times the
+    /// workspace's.
+    units: &'a Units,
     /// The fitted design, its random-effect-only columns and the ids, for
     /// the conditional variances.
     x: faer::MatRef<'a, f64>,
@@ -469,7 +478,7 @@ impl GlmmResultView<'_> {
         match self.ws.family {
             Family::NegativeBinomial { .. } => self.has_endpoint().then_some(self.nb_theta),
             Family::Gamma { .. } => (self.ws.gamma_phi_held.is_none() && self.has_endpoint())
-                .then_some(self.ws.weight_scale * self.ws.gamma_phi),
+                .then_some(self.units.dispersion_scale() * self.ws.gamma_phi),
             _ => None,
         }
     }
@@ -559,7 +568,9 @@ impl GlmmResultView<'_> {
 /// into `structured_schur` is recomputed every eval. [`glmm_view_to_fit`] maps
 /// the returned view to `Fit`. `map` is the column standardization `x_mat`
 /// and `z_mat` (the `n × s` random-effect-only columns) carry; `start` is
-/// already on that design.
+/// already on that design. `y` and `offset` are the caller's, and `units` the
+/// draw's units: those of the weights [`prep_glmm_design`] stored, and the
+/// response scale every search runs on ([`fit_glmm_in_units`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_glmm_on<'a>(
     ws: &'a mut GlmmWorkspace,
@@ -577,23 +588,19 @@ pub(crate) fn run_glmm_on<'a>(
     targets: &[u32],
     opts: &FitOptions,
     map: &'a ColumnScaling,
+    units: &'a Units,
 ) -> GlmmResultView<'a> {
     // NB θ₀ (the start of the `ln θ_NB` coordinate) is threaded explicitly; the
     // kernel leaves θ̂_NB in `ws.nb_theta`. NaN for every non-NB family (unread).
     ws.nb_theta = nb_theta;
-    // The fused logit deviance identity holds only for 0/1 rows; `prior_w` is
-    // all 1 here when unweighted (`prep_glmm_design` re-decides the flag per fit).
-    if !ws.weighted
-        && matches!(
-            model.family,
-            crate::Family::Binomial {
-                link: crate::BinomialLink::Logit
-            }
-        )
-        && y[..n].iter().any(|&v| v != 0.0 && v != 1.0)
-    {
-        ws.weighted = true;
-    }
+    // The fused logit deviance identity holds only for 0/1 rows
+    // (`family::weighted_deviance_needed`); `prior_w` is all 1 here when
+    // unweighted (`prep_glmm_design` re-decides the flag per fit).
+    ws.weighted = crate::family::weighted_deviance_needed(
+        model.family,
+        &y[..n],
+        ws.weighted.then_some(&ws.prior_w[..n]),
+    );
 
     // Warm start threads β + θ into the GLMM kernel. A caller-supplied `start` (the
     // MCPower hot loop) uses its β verbatim; a cold start seeds β from the no-RE GLM
@@ -602,22 +609,47 @@ pub(crate) fn run_glmm_on<'a>(
     // at the kernel's THETA0 blind start. An empty field is a per-component cold
     // start (`StartValues`), so it takes the same branch as `start = None`. A fit
     // from a β start that fails is searched again from the cold start (below).
+    // The stable door checks a β start for separation with the same GLM and
+    // stops as a cold start does when it separates, otherwise keeping the
+    // caller's β; the loop tier trusts the start and skips the GLM.
+    ws.intercept = units.intercept();
+    // The GLM seed runs on the internal response and offset, `y/uc` and
+    // `o − m`, and stays in those units (`beta_units` = `Some(uc)`): a search
+    // at `uc` then starts from it bit for bit, whatever the caller's units. A
+    // caller's β start is in the caller's units (`beta_units` = `None`).
+    let uc = units.c();
+    let glm_seed = || {
+        let (y_int, offset_int) = (units.y(y), units.offset(offset));
+        glm_warm_start_beta(model.family, nb_theta, x_mat, y_int, n, p, offset_int)
+    };
     let glm_start;
-    let (beta_start, separated): (&[f64], bool) = match start {
-        Some(s) if !s.beta.is_empty() => (&s.beta, false),
+    let (beta_start, beta_units, separated): (&[f64], Option<f64>, bool) = match start {
+        Some(s) if !s.beta.is_empty() && ws.check_start_separation => {
+            glm_start = glm_seed();
+            if glm_start.1 {
+                (&glm_start.0, Some(uc), true)
+            } else {
+                (&s.beta, None, false)
+            }
+        }
+        Some(s) if !s.beta.is_empty() => (&s.beta, None, false),
         _ => {
-            glm_start = glm_warm_start_beta(model.family, nb_theta, x_mat, y, n, p, offset);
-            (&glm_start.0, glm_start.1)
+            glm_start = glm_seed();
+            (&glm_start.0, Some(uc), glm_start.1)
         }
     };
     if separated {
-        let fit = crate::glmm::separated_fit(ws, beta_start, targets, map);
+        // The GLM's last iterate, in the caller's units.
+        let mut beta = beta_start.to_vec();
+        units.beta_from_internal(&mut beta);
+        let fit = crate::glmm::separated_fit(ws, &beta, targets, map);
         let nb_theta = ws.nb_theta;
         return GlmmResultView {
             fit,
             nb_theta,
             ws,
             map,
+            units,
             x: x_mat,
             z: z_mat,
             cluster_ids,
@@ -628,7 +660,7 @@ pub(crate) fn run_glmm_on<'a>(
     // outer search runs on the internal `ŵ = w/s` scale (`prep_glmm_design`),
     // so a held raw-scale `v` enters there as `v/s`.
     ws.gamma_phi_held = match model.family {
-        Family::Gamma { .. } => opts.dispersion.held().map(|v| v / ws.weight_scale),
+        Family::Gamma { .. } => opts.dispersion.held().map(|v| units.held_dispersion_in(v)),
         _ => None,
     };
     // A carried Gamma φ (`StartValues::dispersion`) seeds the `ln φ`
@@ -637,13 +669,15 @@ pub(crate) fn run_glmm_on<'a>(
     ws.gamma_phi_start = match model.family {
         Family::Gamma { .. } => start
             .and_then(|s| s.dispersion)
-            .map(|v| v / ws.weight_scale),
+            .map(|v| units.held_dispersion_in(v)),
         _ => None,
     };
-    // Gamma inverse link: the search runs in units read off the data and is
-    // retried in other units when it fails or ends no lower than the GLM
-    // point (`gamma_inverse_units`, `gamma_inverse_retry`).
-    let units = match model.family {
+    // Every search runs on `y/c` with `c` the draw's response scale
+    // (`Units::c`). On the Gamma inverse link `c` takes a further factor read
+    // off the data, and the search is retried at other factors when it fails
+    // or ends no lower than the GLM point (`gamma_inverse_units`,
+    // `gamma_inverse_retry`).
+    let inverse_units = match model.family {
         Family::Gamma {
             link: crate::GammaLink::Inverse,
         } => Some(gamma_inverse_units(
@@ -654,13 +688,20 @@ pub(crate) fn run_glmm_on<'a>(
             n,
             cluster_ids,
             beta_start,
+            beta_units.unwrap_or(1.0),
+            uc,
         )),
         _ => None,
     };
-    let c0 = units.as_ref().map_or(1.0, |u| u.fast);
-    // A curvature hint holds a search's BFGS state in that search's units: a
-    // hint taken in other units than this fit's first search is dropped.
-    if ws.grad_hint_in.as_ref().is_some_and(|h| h.units != c0) {
+    let c0 = inverse_units.as_ref().map_or(uc, |u| u.fast);
+    // A curvature hint holds a search's BFGS state in that search's θ units
+    // (`GlmmWorkspace::search_units`): a hint taken in other units than this
+    // fit's first search is dropped.
+    if ws
+        .grad_hint_in
+        .as_ref()
+        .is_some_and(|h| h.units != theta_units(ws.family, c0))
+    {
         ws.grad_hint_in = None;
     }
     let fit_in = |ws: &mut GlmmWorkspace, c: f64| {
@@ -669,15 +710,18 @@ pub(crate) fn run_glmm_on<'a>(
             x_mat,
             z_mat,
             y,
+            offset,
             n,
             p,
             cluster_ids,
             extra_ids,
             beta_start,
+            beta_units,
             start,
             targets,
             opts,
             map,
+            units,
             c,
         )
     };
@@ -687,21 +731,24 @@ pub(crate) fn run_glmm_on<'a>(
             x_mat,
             z_mat,
             y,
+            offset,
             n,
             p,
             cluster_ids,
             extra_ids,
             &restart.beta,
+            None,
             Some(restart),
             targets,
             opts,
             map,
-            1.0,
+            units,
+            uc,
         )
     };
     let mut glmm_fit = fit_in(ws, c0);
-    let has_units = units.is_some();
-    if let Some(u) = units {
+    let has_units = inverse_units.is_some();
+    if let Some(u) = inverse_units {
         glmm_fit = gamma_inverse_retry(ws, glmm_fit, c0, &u, fit_in);
     } else {
         glmm_fit = capped_restart(ws, glmm_fit, restart_in);
@@ -715,7 +762,7 @@ pub(crate) fn run_glmm_on<'a>(
         && start.is_some_and(|s| !s.beta.is_empty())
         && (!glmm_fit.converged || !glmm_fit.deviance.is_finite() || glmm_fit.precision_limited)
     {
-        let (cold_beta, sep) = glm_warm_start_beta(model.family, nb_theta, x_mat, y, n, p, offset);
+        let (cold_beta, sep) = glm_seed();
         if !sep {
             let (saved, nb_saved, phi_saved) =
                 (SearchState::save(ws), ws.nb_theta, ws.gamma_phi_start);
@@ -726,16 +773,19 @@ pub(crate) fn run_glmm_on<'a>(
                 x_mat,
                 z_mat,
                 y,
+                offset,
                 n,
                 p,
                 cluster_ids,
                 extra_ids,
                 &cold_beta,
+                Some(uc),
                 None,
                 targets,
                 opts,
                 map,
-                1.0,
+                units,
+                uc,
             );
             let mut cold = capped_restart(ws, cold, restart_in);
             let spent = glmm_fit.n_eval + cold.n_eval;
@@ -761,6 +811,7 @@ pub(crate) fn run_glmm_on<'a>(
         nb_theta,
         ws,
         map,
+        units,
         x: x_mat,
         z: z_mat,
         cluster_ids,
@@ -807,11 +858,11 @@ fn capped_restart(
 
 /// What `run_glmm_on` reads off a Gamma-inverse GLMM's data before its first
 /// search ([`gamma_inverse_units`]): response rescales `c` (the kernel fits
-/// `y/c`, where η, β and θ are `c` times larger) and the objective at the GLM
-/// point.
+/// `y/c`, where η, β and θ are `c` times larger), each the draw's
+/// `Units::c` times a factor read off the internal η, and the objective at
+/// the GLM point.
 struct GammaInverseUnits {
-    /// `c` of the first search: 1 while the largest cluster η lies in
-    /// `[1/64, 64]`, [`Self::clusters`] outside.
+    /// `c` of the first search: brings the largest cluster η into `[8, 16]`.
     fast: f64,
     /// Brings the largest cluster η, `Σw/Σwy` over the rows of a
     /// primary-grouping level, into `[4, 8]`.
@@ -852,9 +903,16 @@ fn units_into_band(v: f64, lo: f64, hi: f64) -> f64 {
 /// 15 rows. In y's own units the search reaches an interior optimum with the
 /// largest cluster η from about 2 to 12 and ends converged short of it, with
 /// no sign the retry reads (`gamma_inverse_retry`), mostly where that η is
-/// below 1/64 or above 64; there the first search runs on y rescaled into
-/// `[4, 8]` instead. The σ = 0 optimum, with an η of order 1e-4, is reached
-/// with the smallest start η in `[1/2, 64]`.
+/// below 1/64 or above 64. The first search runs on y rescaled into
+/// `[8, 16]`, inside that band at any scale of y: on the grid's 24
+/// Gamma-inverse cells it took the fewest evaluations there (`[4, 8]` and
+/// `[16, 32]` took more). The σ = 0 optimum, with an η of order 1e-4, is
+/// reached with the smallest start η in `[1/2, 64]`.
+///
+/// Read on `y/uc`, `uc` the draw's `Units::c`, so every `c` returned is
+/// `uc` times its factor. `y` and `offset` are the caller's, `beta_start` in
+/// the units of `y/beta_units`; the GLM point is in the caller's units.
+#[allow(clippy::too_many_arguments)]
 fn gamma_inverse_units(
     ws: &GlmmWorkspace,
     x_mat: faer::MatRef<'_, f64>,
@@ -863,26 +921,37 @@ fn gamma_inverse_units(
     n: usize,
     cluster_ids: &[u32],
     beta_start: &[f64],
+    beta_units: f64,
+    uc: f64,
 ) -> GammaInverseUnits {
     let fam = ws.family;
     let w = &ws.prior_w[..n];
+    // η scales as `c` on this link; powers of two, so these maps are exact.
+    let kb = uc / beta_units;
     let (mut eta_min, mut dev, mut sum_ln_y) = (f64::INFINITY, 0.0, 0.0);
     for i in 0..n {
-        let mut eta = offset.map_or(0.0, |o| o[i]);
+        let mut xb = 0.0;
         for (j, &b) in beta_start.iter().enumerate() {
-            eta += x_mat[(i, j)] * b;
+            xb += x_mat[(i, j)] * b;
         }
+        let eta = offset.map_or(0.0, |o| uc * o[i]) + kb * xb;
+        let yi = y[i] / uc;
         eta_min = eta_min.min(eta);
-        dev += w[i] * crate::family::dev_resid_eta(fam, f64::NAN, y[i], eta);
-        sum_ln_y += y[i].ln();
+        dev += w[i] * crate::family::dev_resid_eta(fam, f64::NAN, yi, eta);
+        sum_ln_y += yi.ln();
     }
     let weights = ws.weighted.then_some(w);
+    // The stable doors refuse a held φ outside the box
+    // (`fit::common::validate`); the clamp bounds the ML estimate, and a held
+    // one from the unvalidated `loop_advanced` tier.
     let phi = ws
         .gamma_phi_held
         .unwrap_or_else(|| crate::family::gamma_ml_dispersion(dev, weights, n))
-        .clamp(crate::glmm::GAMMA_PHI_LO, crate::glmm::GAMMA_PHI_HI);
+        .clamp(crate::consts::GAMMA_PHI_LO, crate::consts::GAMMA_PHI_HI);
     let glm_point = if eta_min > 0.0 {
-        dev / phi + crate::family::gamma_dispersion_term(phi.ln(), weights, n, sum_ln_y)
+        dev / phi
+            + crate::family::gamma_dispersion_term(phi.ln(), weights, n, sum_ln_y)
+            + 2.0 * n as f64 * uc.ln()
     } else {
         f64::INFINITY
     };
@@ -893,7 +962,7 @@ fn gamma_inverse_units(
         .map_or(0, |m| m as usize + 1);
     let (mut wy, mut sw) = (vec![0.0; levels], vec![0.0; levels]);
     for i in 0..n {
-        wy[cluster_ids[i] as usize] += w[i] * y[i];
+        wy[cluster_ids[i] as usize] += w[i] * (y[i] / uc);
         sw[cluster_ids[i] as usize] += w[i];
     }
     let eta_max = (0..levels)
@@ -902,13 +971,9 @@ fn gamma_inverse_units(
         .fold(0.0, f64::max);
     let clusters = units_into_band(eta_max, 4.0, 8.0);
     GammaInverseUnits {
-        fast: if units_into_band(eta_max, 1.0 / 64.0, 64.0) == 1.0 {
-            1.0
-        } else {
-            clusters
-        },
-        clusters,
-        glm: units_into_band(eta_min, 0.5, 64.0),
+        fast: uc * units_into_band(eta_max, 8.0, 16.0),
+        clusters: uc * clusters,
+        glm: uc * units_into_band(eta_min, 0.5, 64.0),
         glm_point,
     }
 }
@@ -1066,26 +1131,51 @@ impl SearchState {
     }
 }
 
-/// One search of [`crate::glmm::fit_glmm`] on `y/c` (η, β and θ times `c`),
-/// mapped back to y's units on the workspace and the returned fit.
+/// The factor θ (and β, η and the offset) of a search on `y/c` take: `c` on
+/// the Gamma inverse link, 1 on every other link, where the intercept absorbs
+/// the rescale ([`fit_glmm_in_units`]).
+fn theta_units(family: Family, c: f64) -> f64 {
+    match family {
+        Family::Gamma {
+            link: crate::GammaLink::Inverse,
+        } => c,
+        _ => 1.0,
+    }
+}
+
+/// One search of [`crate::glmm::fit_glmm`] on `y/c`, mapped back to y's units
+/// on the workspace and the returned fit (`standardize::Units` derives each
+/// map). On the Gamma inverse link η, β, θ and the offset are `c` times the
+/// caller's. On the log link `y/c` moves η by `−ln c` and the centred offset
+/// `o − m` (`Units::m`) by `−m`, which the intercept takes
+/// (`GlmmWorkspace::intercept_shift`; a log-link fit without an intercept has
+/// `c = 1` and `m = 0`), and θ does not move. The deviance takes `+2n·ln c`
+/// and μ̂ the factor `c`. `y` and `offset` are the caller's, `start` is in the
+/// caller's units and `beta_start` in those of a search on `y/beta_units`
+/// (`None`: the caller's).
 #[allow(clippy::too_many_arguments)]
 fn fit_glmm_in_units(
     ws: &mut GlmmWorkspace,
     x_mat: faer::MatRef<'_, f64>,
     z_mat: faer::MatRef<'_, f64>,
     y: &[f64],
+    offset: Option<&[f64]>,
     n: usize,
     p: usize,
     cluster_ids: &[u32],
     extra_ids: &[Vec<u32>],
     beta_start: &[f64],
+    beta_units: Option<f64>,
     start: Option<&StartValues>,
     targets: &[u32],
     opts: &FitOptions,
     map: &ColumnScaling,
+    units: &Units,
     c: f64,
 ) -> GlmmFit {
-    if c == 1.0 {
+    let k = theta_units(ws.family, c);
+    let m = units.m();
+    if c == 1.0 && m == 0.0 && beta_units.is_none_or(|b| b == 1.0) {
         return crate::glmm::fit_glmm(
             ws,
             x_mat,
@@ -1101,44 +1191,101 @@ fn fit_glmm_in_units(
             map,
         );
     }
-    let y_fit: Vec<f64> = y[..n].iter().map(|&v| v / c).collect();
-    let beta_fit: Vec<f64> = beta_start.iter().map(|&b| b * c).collect();
-    let theta_fit: Option<Vec<f64>> = warm_theta(start).map(|t| t.iter().map(|&v| v * c).collect());
-    if let Some(o) = ws.offset.as_mut() {
-        o.iter_mut().for_each(|v| *v *= c);
+    let inverse = matches!(
+        ws.family,
+        Family::Gamma {
+            link: crate::GammaLink::Inverse
+        }
+    );
+    // What the caller's intercept less the internal one is on a search at
+    // `c` (`ln c − m` on the log link), here and in `beta_start`'s units.
+    let log_shift = |c: f64| if inverse { 0.0 } else { c.ln() - m };
+    let shift = log_shift(c);
+    let start_shift = beta_units.map_or(0.0, log_shift);
+    let intercept = ws.intercept.filter(|_| shift != 0.0);
+    debug_assert!(
+        shift == 0.0 || intercept.is_some(),
+        "a log-link search on y/c needs an intercept"
+    );
+    // Taken out of the workspace for the call, which borrows it whole; put
+    // back below, so no draw allocates.
+    let (mut y_fit, mut beta_fit, mut theta_fit) = (
+        std::mem::take(&mut ws.y_units),
+        std::mem::take(&mut ws.beta_units),
+        std::mem::take(&mut ws.theta_units),
+    );
+    for (d, &v) in y_fit[..n].iter_mut().zip(y) {
+        *d = v / c;
     }
+    let kb = k / theta_units(ws.family, beta_units.unwrap_or(1.0));
+    for (d, &b) in beta_fit[..p].iter_mut().zip(beta_start) {
+        *d = b * kb;
+    }
+    if let Some(i) = ws.intercept.filter(|_| start_shift != shift) {
+        beta_fit[i] -= shift - start_shift;
+    }
+    let theta = match warm_theta(start) {
+        Some(t) => {
+            for (d, &v) in theta_fit[..t.len()].iter_mut().zip(t) {
+                *d = v * k;
+            }
+            Some(&theta_fit[..t.len()])
+        }
+        None => None,
+    };
+    if let Some(o) = ws.offset.as_mut().filter(|_| k != 1.0) {
+        o.iter_mut().for_each(|v| *v *= k);
+    }
+    if let (Some(dst), Some(o)) = (
+        ws.offset.as_mut().filter(|_| m != 0.0),
+        units.offset(offset),
+    ) {
+        dst[..n].copy_from_slice(&o[..n]);
+    }
+    ws.intercept_shift = shift;
     let mut fit = crate::glmm::fit_glmm(
         ws,
         x_mat,
         z_mat,
-        &y_fit,
+        &y_fit[..n],
         cluster_ids,
         extra_ids,
         targets,
-        theta_fit.as_deref(),
-        &beta_fit,
+        theta,
+        &beta_fit[..p],
         n,
         opts.wald_se,
         map,
     );
-    if let Some(o) = ws.offset.as_mut() {
-        o.iter_mut().for_each(|v| *v /= c);
+    ws.intercept_shift = 0.0;
+    ws.search_units = k;
+    (ws.y_units, ws.beta_units, ws.theta_units) = (y_fit, beta_fit, theta_fit);
+    if let Some(i) = intercept {
+        ws.params[ws.n_theta + i] += shift;
     }
-    ws.search_units = c;
-    let (n_theta, c2) = (ws.n_theta, c * c);
-    ws.params[..n_theta + p].iter_mut().for_each(|v| *v /= c);
-    ws.betas[..p].iter_mut().for_each(|v| *v /= c);
-    for &t in targets {
-        ws.inference.var_diag[t as usize] /= c2;
+    // Copied back rather than shifted by `+m`, which would round.
+    if let (Some(dst), Some(o)) = (ws.offset.as_mut().filter(|_| m != 0.0), offset) {
+        dst[..n].copy_from_slice(&o[..n]);
     }
-    for j in 0..p {
-        for i in 0..p {
-            ws.inference.vcov[(i, j)] /= c2;
+    if k != 1.0 {
+        if let Some(o) = ws.offset.as_mut() {
+            o.iter_mut().for_each(|v| *v /= k);
         }
-    }
-    for j in 0..n_theta {
-        for i in 0..n_theta {
-            ws.inference.theta_cov[(i, j)] /= c2;
+        let (n_theta, k2) = (ws.n_theta, k * k);
+        ws.params[..n_theta + p].iter_mut().for_each(|v| *v /= k);
+        ws.betas[..p].iter_mut().for_each(|v| *v /= k);
+        for &t in targets {
+            ws.inference.var_diag[t as usize] /= k2;
+        }
+        for j in 0..p {
+            for i in 0..p {
+                ws.inference.vcov[(i, j)] /= k2;
+            }
+        }
+        for j in 0..n_theta {
+            for i in 0..n_theta {
+                ws.inference.theta_cov[(i, j)] /= k2;
+            }
         }
     }
     ws.pirls.prob[..n].iter_mut().for_each(|v| *v *= c);
@@ -1167,18 +1314,44 @@ pub(crate) fn glmm_view_to_fit(
     let diag = view.diagnostics();
     let converged = diag.converged;
     // First, as it re-solves the mode on the workspace (and puts back the
-    // slots read below).
+    // slots read below). In the search's units (`fit_glmm_in_units`): on the
+    // Gamma inverse link the caller's η = 1/μ can lie outside the PIRLS
+    // range. `k` is a power of two, so the scaling there and back is exact;
+    // the blocks of `A⁻¹` do not move with it and its `A⁻¹MᵀWx` rows take `k`.
     let cond = if converged && opts.condvar {
-        crate::glmm::condvar_blocks(
-            view.ws,
+        let ws = &mut *view.ws;
+        let (k, m) = (ws.search_units, ws.n_theta + p);
+        let mut y_fit = std::mem::take(&mut ws.y_units);
+        let rescale = |ws: &mut GlmmWorkspace, f: f64| {
+            ws.params[..m].iter_mut().for_each(|v| *v *= f);
+            if let Some(o) = ws.offset.as_mut() {
+                o.iter_mut().for_each(|v| *v *= f);
+            }
+        };
+        if k != 1.0 {
+            for (d, &v) in y_fit[..n].iter_mut().zip(y) {
+                *d = v / k;
+            }
+            rescale(ws, k);
+        }
+        let out = crate::glmm::condvar_blocks(
+            ws,
             view.x,
             view.z,
-            y,
+            if k != 1.0 { &y_fit[..n] } else { y },
             view.cluster_ids,
             view.extra_ids,
             p,
             n,
-        )
+        );
+        if k != 1.0 {
+            rescale(ws, 1.0 / k);
+        }
+        ws.y_units = y_fit;
+        out.map(|(blocks, mut rows, cross)| {
+            rows.iter_mut().for_each(|v| *v *= k);
+            (blocks, rows, cross)
+        })
     } else {
         None
     };
@@ -1236,7 +1409,7 @@ pub(crate) fn glmm_view_to_fit(
         match model.family {
             Family::Gamma { .. } => match opts.dispersion.held() {
                 Some(v) => v,
-                None => ws.weight_scale * ws.gamma_phi,
+                None => view.units.dispersion_scale() * ws.gamma_phi,
             },
             Family::NegativeBinomial { .. } => nb_theta,
             _ => 1.0,
@@ -1250,7 +1423,7 @@ pub(crate) fn glmm_view_to_fit(
     let varcorr = if has_endpoint {
         assemble_varcorr(&ws.params[..n_theta], &ws.groupings, sigma_sq, map)
     } else {
-        vec![]
+        super::common::nan_varcorr(&ws.groupings)
     };
 
     // SE of the RE stddevs from the joint-Hessian θ block (`WaldSe::Hessian` only;
@@ -1312,7 +1485,7 @@ pub(crate) fn glmm_view_to_fit(
         };
         (mu_hat.clone(), ranef)
     } else {
-        (vec![], vec![])
+        (vec![f64::NAN; n], super::common::nan_ranef(&ws.groupings))
     };
     let (condvar, condvar_x, condvar_cross) = match cond {
         Some((blocks, rows, cross)) => {
@@ -1354,6 +1527,15 @@ pub(crate) fn glmm_view_to_fit(
             &ws.params[..n_theta],
             ws.search_units,
         );
+        if let Family::NegativeBinomial { .. } = model.family {
+            super::common::note_nb_shape_at_limit(&mut diagnostics, nb_theta);
+        }
+    }
+    if let Some(edge) = glmm_fit.phi_at_limit {
+        diagnostics.notes.push(super::Note::DispersionAtLimit {
+            limit: edge * view.units.dispersion_scale(),
+            edge,
+        });
     }
     let mut fit = Fit {
         beta,
@@ -1400,6 +1582,7 @@ pub(crate) fn glmm_view_to_fit(
         coef_df: vec![f64::NAN; p],
         satterthwaite: None,
         design_summary: None,
+        null_basis: Vec::new(),
     };
     // A capped (`MaxFunReached`) endpoint is reported as a point, not an
     // accepted optimum, even though `varcorr` is now finite there — so the
@@ -1434,6 +1617,7 @@ fn fit_glmm_prebuilt(
     start: Option<&StartValues>,
     opts: &FitOptions,
     map: &ColumnScaling,
+    units: &Units,
 ) -> (Fit, Vec<f64>, f64) {
     let mut view = run_glmm_on(
         ws,
@@ -1451,6 +1635,7 @@ fn fit_glmm_prebuilt(
         &opts.se_for.columns(p),
         opts,
         map,
+        units,
     );
     glmm_view_to_fit(&mut view, y, n, p, model, opts)
 }
@@ -1493,7 +1678,9 @@ pub(super) fn run_glmm_nb_on<'a>(
     targets: &[u32],
     opts: &FitOptions,
     cs: &'a ColumnScaling,
+    units: &'a Units,
 ) -> GlmmResultView<'a> {
+    // Exposure weights, which the NB units leave as given.
     prep_glmm_design(ws, cluster_ids, extra_ids, weights, offset, n, opts);
     // The method-of-moments seed (`nb_theta_moment_seed`) charges the random-effect
     // variance to the dispersion: on a GLMM it lands one to two orders of magnitude
@@ -1513,7 +1700,7 @@ pub(super) fn run_glmm_nb_on<'a>(
         Some(d) => d,
         None => {
             let (prefit, prefit_theta) =
-                super::glm::fit_glm_nb(x, y, weights, offset, n, p, None, opts, cs);
+                super::glm::fit_glm_nb(x, y, weights, units.offset(offset), n, p, None, opts, cs);
             nb_glmm_seed(prefit.converged(), prefit_theta)
         }
     };
@@ -1533,6 +1720,7 @@ pub(super) fn run_glmm_nb_on<'a>(
         targets,
         opts,
         cs,
+        units,
     )
 }
 
@@ -1577,8 +1765,8 @@ mod retry_tests {
             glm_point: f64::INFINITY,
         };
         for kept in [u.glm, 2.0 * u.clusters] {
-            let Ok((mut ws, x_mat)) =
-                fit_glmm_build(&x, None, None, n, p, &sized, &sids.primary, &[], &opts)
+            let Ok((mut ws, x_mat, _)) =
+                fit_glmm_build(&x, &y, None, None, n, p, &sized, &sids.primary, &[], &opts)
             else {
                 panic!("the design did not build");
             };
@@ -1589,15 +1777,18 @@ mod retry_tests {
                     x_mat.as_ref(),
                     x_mat.as_ref().subcols(0, 0),
                     &y,
+                    None,
                     n,
                     p,
                     &sids.primary,
                     &[],
                     &beta,
                     None,
+                    None,
                     &opts.se_for.columns(p),
                     &opts,
                     ColumnScaling::IDENTITY,
+                    Units::IDENTITY,
                     c,
                 );
                 assert!(ws.grad_hint_ready, "c = {c}: the search left no hint");

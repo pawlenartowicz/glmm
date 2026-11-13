@@ -9,7 +9,7 @@
 \arguments{
 \item{object}{a \link{fastglmm} fit.}
 
-\item{nsim}{the number of draws, a whole number of at least 1.}
+\item{nsim}{the number of draws, a whole number from 1 to 1000000.}
 
 \item{seed}{a whole number from 0 to 2^53, or \code{NULL} (the default) to take
 one from R's random number generator (so \code{set.seed()} fixes it).}

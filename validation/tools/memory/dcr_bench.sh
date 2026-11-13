@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The weight-power and CR2 benchmark (spec 2-dcr §12): wall time and peak RSS
+# The weight-power and CR2 benchmark: wall time and peak RSS
 # of fit_dcr.R's arms on gen_dcr_bench.py's datasets, one process per run,
 # from /usr/bin/time. A measurement, not a gate. Run it on a locked clock and a
 # quiet machine; the R library in $R_LIBS must hold the fastglmm under test,

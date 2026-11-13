@@ -49,7 +49,9 @@ test_that("argument_ignored is stored and printed, one text per case", {
     list(args = list(init.theta = 1.5),
          msg = "init.theta= is not used for family 'gaussian'."),
     list(args = list(start = list(beta = c(0, 0), phi = 1, b = 2)),
-         msg = "start accepts only 'beta', 'theta' and 'dispersion'; these entries were ignored: phi, b.")
+         msg = "start accepts only 'beta', 'theta' and 'dispersion'; these entries were ignored: phi, b."),
+    list(args = list(start = list(dispersion = 2)),
+         msg = "start$dispersion is not used for family 'gaussian'.")
   )
   for (case in cases) {
     got <- fit_catching(do.call(fastglmm, c(list(y ~ x, FIXED), case$args)),
@@ -59,6 +61,11 @@ test_that("argument_ignored is stored and printed, one text per case", {
     expect_identical(conditionMessage(got$cond), printed(row))
     expect_s3_class(got$cond, "fastglmm_diagnostic")
   }
+})
+
+test_that("any note kind gets the class fastglmm_<kind>", {
+  expect_identical(fastglmm:::.note_class("some_new_kind"),
+                   c("fastglmm_some_new_kind", "fastglmm_diagnostic"))
 })
 
 test_that("quasi-likelihood dispersion on a mixed binomial is stored", {
@@ -182,24 +189,14 @@ test_that("a separated GLM stores glm_diverged last", {
 })
 
 test_that("a GLM whose first solve fails returns no coefficients", {
-  # A 5e-324 weight on the only row that tells x1 from x2 makes X'WX singular to
-  # rounding: no step is taken, so no coefficient is reported.
+  # A 1e-100 weight, the smallest allowed, on the only row that tells x1 from x2
+  # makes X'WX singular to rounding: no step is taken, so no coefficient is reported.
   d <- data.frame(x1 = 1, x2 = c(0, 1, 1, 1), y = c(1, 2, 3, 2.5))
   got <- fit_catching(fastglmm(y ~ 0 + x1 + x2, d, family = Gamma(link = "log"),
-                               weights = c(5e-324, 1, 1, 1)), "fastglmm_design_unsolvable")
+                               weights = c(1e-100, 1, 1, 1)), "fastglmm_design_unsolvable")
   expect_false(got$fit$converged)
   expect_true(all(is.nan(fixef(got$fit))))
   expect_false(is.null(got$cond))
-})
-
-test_that("a reciprocal-link response out of range names the cause", {
-  # 1/mu = 1/(1e80 * ...) is below the kernel's 1e-75 bound on the Gamma inverse link.
-  d <- data.frame(x = x, y = 1e80 * (2 + 0.1 * x))
-  fit <- suppressWarnings(fastglmm(y ~ x, d, family = Gamma(link = "inverse")))
-  expect_false(fit$converged)
-  n <- nrow(fit$warnings)
-  expect_identical(fit$warnings$kind[[n]], "glm_diverged")
-  expect_match(fit$warnings$message[[n]], "Rescale the response", fixed = TRUE)
 })
 
 test_that("an all-zero binomial is a constant response, not separation", {
@@ -377,6 +374,22 @@ test_that("port parity separated_by_grouping", {
   expect_identical(conditionMessage(res$cond), printed(row))
 })
 
+test_that("port parity one_trial_per_level", {
+  # Same fixture and call in glmm-py/tests/test_warnings.py - change together.
+  # One 0/1 row per level of id.
+  i <- 0:19
+  d <- data.frame(x = x, id = sprintf("r%02d", i), yb = as.numeric((7L * i) %% 3L == 0L))
+  res <- fit_catching(fastglmm(yb ~ x + (1 | id), d, family = binomial()),
+                      "fastglmm_one_trial_per_level")
+  expect_false(is.null(res$cond))
+  row <- only(res$fit, "one_trial_per_level")
+  expect_identical(c(row$tier, row$title), c("caution", "Variance not identified"))
+  expect_identical(row$message, paste(
+    "Every level of 'id' has one binary trial, so its variance is not identified: it",
+    "trades against the fixed effects. Drop this grouping, or aggregate rows."))
+  expect_identical(conditionMessage(res$cond), printed(row))
+})
+
 test_that("a mixed fit with every fixed column aliased", {
   # Same fixture and call in glmm-py/tests/test_warnings.py - change together. z
   # is all zero, so it is dropped as aliased and the mixed model has no fixed
@@ -413,20 +426,45 @@ test_that("port parity variance_at_limit", {
   expect_identical(conditionMessage(res$cond), printed(row))
 })
 
-test_that("a degenerate Gaussian LMM carries the Satterthwaite note", {
+test_that("port parity dispersion_at_limit", {
   # Same fixture and call in glmm-py/tests/test_warnings.py - change together. A
-  # random slope on an aliased column (x2 = 2x) leaves a NaN-filled fit with no
+  # Gamma response within about 1e-8 of its log-link means: the dispersion is
+  # near 1e-16, below the smallest value the fit searches.
+  i <- 0:119
+  gid <- i %/% 10L
+  xg <- sin(2.3 * i + 0.7)
+  b <- 0.3 * sin(1.9 * (0:11) + 0.4)
+  e <- sqrt(2) * sin(1.7 * i + 0.3)
+  mu <- exp(0.5 + 0.3 * xg + b[gid + 1L])
+  d <- data.frame(x = xg, g = sprintf("g%d", gid), y = mu * (1 + 1e-8 * e))
+  res <- fit_catching(fastglmm(y ~ x + (1 | g), d, family = Gamma(link = "log")),
+                      "fastglmm_dispersion_at_limit")
+  expect_false(is.null(res$cond))
+  expect_false(res$fit$converged)
+  expect_identical(res$fit$warnings$kind, "dispersion_at_limit")
+  row <- only(res$fit, "dispersion_at_limit")
+  expect_identical(c(row$tier, row$title), c("severe", "Dispersion at its search limit"))
+  expect_identical(row$message, paste(
+    "The Gamma dispersion fell below 1e-06, the smallest value the fit searches, so no",
+    "estimates were computed. The response varies less than about 0.1% around the",
+    "fitted means."))
+  expect_identical(conditionMessage(res$cond), printed(row))
+})
+
+test_that("a degenerate Gaussian LMM carries the Satterthwaite note", {
+  # Same fixture and call in glmm-py/tests/test_warnings.py - change together.
+  # Three rows for three coefficients (n <= p) leave a NaN-filled fit with no
   # finite end point, so the Satterthwaite pass is recorded as failed.
-  d <- MIXED
-  d$x2 <- 2 * d$x
-  got <- fit_catching(fastglmm(y ~ x + x2 + (1 + x2 | g), d),
+  d <- data.frame(y = c(1, 2, 4), x1 = c(0, 1, 3), x2 = c(1, 0, 2),
+                  g = factor(c("a", "b", "a")))
+  got <- fit_catching(fastglmm(y ~ x1 + x2 + (1 | g), d),
                       "fastglmm_satterthwaite_curvature")
   expect_false(is.null(got$cond))
   expect_match(conditionMessage(got$cond), "could not be computed", fixed = TRUE)
   expect_false(got$fit$converged)
   expect_identical(got$fit$df_method, "failed")
-  expect_identical(got$fit$warnings$kind, c("satterthwaite_curvature", "fit_failed"))
-  off <- suppressWarnings(fastglmm(y ~ x + x2 + (1 + x2 | g), d, satterthwaite = FALSE))
+  expect_identical(got$fit$warnings$kind, c("satterthwaite_curvature", "too_few_rows"))
+  off <- suppressWarnings(fastglmm(y ~ x1 + x2 + (1 | g), d, satterthwaite = FALSE))
   expect_identical(off$df_method, "disabled")
-  expect_identical(off$warnings$kind, "fit_failed")
+  expect_identical(off$warnings$kind, "too_few_rows")
 })

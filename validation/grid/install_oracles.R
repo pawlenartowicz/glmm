@@ -16,8 +16,9 @@
 #
 # The R and Julia pins in versions.json are NOT asserted here -- the language
 # runtime is not the estimator; run.sh records them in run_meta.json. Nor is
-# the Python package pins: tools/goldens_glm_band.py asserts `mpmath`,
-# tools/goldens_cr2_hp.py asserts `python-flint` and `numpy`.
+# the Python package pins: tools/goldens_glm_band.py and tools/goldens_cr2_df.py
+# assert `mpmath`, tools/goldens_cr2_hp.py asserts `python-flint` and `numpy`,
+# tools/prep/gen_cr2_df_data.py asserts `numpy`.
 # The Julia package pin lives in grid/Project.toml + grid/Manifest.toml and is
 # reached with `julia --project=<grid> -e 'using Pkg; Pkg.instantiate()'`.
 

@@ -32,8 +32,43 @@
 //! about zero, the rule a slope column of `X` gets on a design fitted as
 //! given. Dividing a column of `Z` is an exact reparametrization of every
 //! block, whatever its terms, and leaves `X` and `β` untouched.
+//!
+//! **The response, the prior weights and the offset** ([`Units`]). On the
+//! families with a dispersion (Gaussian, Gamma, inverse Gaussian) the prior
+//! weights are precision weights: row `i` has variance `φ·V(μᵢ)/wᵢ`, so
+//! `w → w/s` with `φ → φ/s` is an exact reparametrization. Every route fits
+//! on `ŵ = w/s`, `s` the power of two nearest the geometric mean of `w`
+//! (`family::weight_scale`), and the dispersion it reports is `s` times the
+//! internal one; β, the SEs, the covariances, θ, τ² and the log-likelihood
+//! do not take `s`. On binomial, Poisson and negative binomial the weights
+//! are trials or exposure, part of the model, and stay as given.
+//!
+//! The response takes a power-of-two scale `c` on the same three families,
+//! the Gaussian response is first centred on its weighted least-squares fit
+//! `x̃β̃₀`, and on a log link with an intercept the offset is centred at its
+//! weighted mean `m`. Every route fits on the internal values and maps back
+//! once, where the column map is applied. With `β̃ = k·(β̃_int + δ̃)` on x̃'s
+//! columns (the derivations are on [`Units`]):
+//!
+//! | | Gaussian | Gamma, IG, log link | Gamma, inverse link | IG, 1/μ² link |
+//! |---|---|---|---|---|
+//! | internal y | `(y − o − x̃β̃₀)/c` | `y/c` | `y/c` | `y/c` |
+//! | internal offset | none (in y) | `o − m` | `c·o` | `c²·o` |
+//! | `k`, `δ̃` | `c`, `β̃₀/c` | `1`, `ln c − m` on the intercept | `1/c`, 0 | `1/c²`, 0 |
+//! | `Var(β̂)` | `·c²` | unchanged | `/c²` | `/c⁴` |
+//! | τ², varcorr | `·c²` (θ unchanged) | unchanged | `/c²` (θ `/c`) | no mixed model |
+//! | dispersion `φ = d·φ_int` | `d = s·c²` | Gamma `d = s`, IG `d = s/c` | `d = s` | `d = s/c` |
+//! | fitted μ | from the caller's β | `·c` | `·c` | `·c` |
+//! | log-likelihood | `− ν·ln c` | `− n·ln c` | `− n·ln c` | `− n·ln c` |
+//!
+//! ν is `n` on ML and `n − p` on REML; a deviance takes `−2` times the
+//! log-likelihood's shift. Poisson and negative binomial take only `m`
+//! (`δ̃ = −m` on the intercept); binomial takes nothing. A log link without
+//! an intercept gets `c = 1` and `m = 0`.
 
 use faer::MatMut;
+
+use crate::Family;
 
 /// One draw's column statistics and the fixed-effect map `β = Bβ̃` they
 /// define. Every route reads it by reference; [`ColumnScaling::IDENTITY`] is
@@ -489,6 +524,478 @@ impl ColumnScaling {
             return 0.0;
         }
         2.0 * self.scale.iter().map(|s| s.ln()).sum::<f64>()
+    }
+}
+
+/// One draw's units of the response, the prior weights and the offset (the
+/// module doc's last part), and their map back to the caller's units. Built
+/// once per workspace with its buffers at `n_max`, so a draw allocates
+/// nothing; [`Units::IDENTITY`] is the map of a fit run on the data as given.
+///
+/// The response scale `c` on Gamma and inverse Gaussian: the fit runs on
+/// `y/c`, and the caller's β is `k·(β̃_int + δ̃)` on x̃'s columns, its
+/// `Var(β̂)` `k²` times the internal one and its dispersion `d·φ_int`. Each
+/// entry follows from the density:
+/// - Both are scale families: a row's density in `y` is its density in `y/c`
+///   over `c`, so the log-likelihood takes `−n·ln c` and a deviance `+2n·ln c`.
+/// - Gamma's φ does not depend on y's units (`d = s`); the inverse-Gaussian
+///   unit deviance `(y − μ)²/(μ²y)` scales as `1/c`, so `φ_int = φ·c/s`
+///   (`d = s/c`). A held φ goes in as `v/d`.
+/// - Log link: `y/c` moves η by `−ln c`, which the intercept absorbs
+///   (`δ̃ = ln c` on it, `k = 1`). Without an intercept nothing absorbs it,
+///   and `c = 1`.
+/// - Log link with an intercept and an offset, on every family: the offset
+///   is centred at its weighted mean `m` (`ŵ` on Gamma and inverse
+///   Gaussian, the trials or exposure on Poisson and negative binomial). The
+///   fit runs on `o − m`, which moves η by `−m`; the intercept takes it
+///   (`δ̃ = ln c − m`). μ, the deviance and every variance do not move.
+/// - Inverse link: η = 1/μ scales as `c`, and with it β, the random effects,
+///   θ and the offset (`k = 1/c`); on 1/μ², as `c²` (`k = 1/c²`).
+/// - The fitted means take `c`; θ and τ² on the log link, and the Wald `t²`
+///   on every link, do not.
+///
+/// On Gaussian the fit runs on `(y − o − x̃β̃₀)/c`, `β̃₀` the weighted
+/// least-squares fit of `y − o` on x̃ and `c` the power of two nearest the
+/// weighted root mean square of that residual. `y = Xβ + Zb + e` scales as a
+/// whole, so `k = c`, `δ̃ = β̃₀/c` (the shift is exact: the residual, which
+/// the LMM criterion and the OLS fit read, does not depend on it), and with
+/// `β` the random effects, σ² and every variance component (σ²'s `d = s·c²`;
+/// θ, relative to σ, does not move). The log-likelihood takes `−ν·ln c` and
+/// the LMM deviance `+2ν·ln c`, ν = n on ML and n − p on REML, whose
+/// criterion is the density of the n − p error contrasts. The offset is
+/// folded into the response, so no Gaussian route gets one.
+#[derive(Clone, Debug)]
+pub(crate) struct Units {
+    /// Which map applies, from the family and link; fixed at build.
+    kind: UnitsKind,
+    /// Weight scale `s`: `family::weight_scale` of the prior weights on a
+    /// dispersion family, 1 otherwise.
+    s: f64,
+    /// Response scale `c`: a power of two on Gaussian, Gamma and inverse
+    /// Gaussian, 1 otherwise.
+    c: f64,
+    /// Offset centre `m` on a log link with an intercept and an offset, 0
+    /// otherwise.
+    m: f64,
+    /// The first column of the caller's x whose entries are all exactly 1.0
+    /// (the rule `ColumnScaling` uses), found on every family but binomial.
+    intercept: Option<usize>,
+    /// `δ̃` on x̃'s columns (`p` long on every family but binomial, empty
+    /// there): `β̃₀/c` on Gaussian, `ln c − m` on the intercept of a log link,
+    /// zeros otherwise.
+    shift: Vec<f64>,
+    /// `B·δ̃`, the same shift on the caller's columns.
+    shift_caller: Vec<f64>,
+    /// `ŵ = w/s`, the internal response and the offset on the internal
+    /// scale, `n_max` long where the family can change them (empty
+    /// otherwise); their first `n` entries are read only while the matching
+    /// flag is set.
+    w: Vec<f64>,
+    y: Vec<f64>,
+    offset: Vec<f64>,
+    w_changed: bool,
+    y_changed: bool,
+    offset_changed: bool,
+    n: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnitsKind {
+    /// Binomial: weights, response and offset as given.
+    Counts,
+    /// Poisson and negative binomial, on the log link: weights and response
+    /// as given, the offset centred.
+    CountsLog,
+    Gaussian,
+    GammaLog,
+    GammaInverse,
+    InverseGaussianLog,
+    InverseGaussianInverseSquared,
+}
+
+impl Units {
+    /// The map of a fit run on the data as given.
+    pub(crate) const IDENTITY: &'static Units = &Units {
+        kind: UnitsKind::Counts,
+        s: 1.0,
+        c: 1.0,
+        m: 0.0,
+        intercept: None,
+        shift: Vec::new(),
+        shift_caller: Vec::new(),
+        w: Vec::new(),
+        y: Vec::new(),
+        offset: Vec::new(),
+        w_changed: false,
+        y_changed: false,
+        offset_changed: false,
+        n: 0,
+    };
+
+    /// The identity map of a workspace of `family` for up to `n_max` rows
+    /// and `p` columns.
+    pub(crate) fn new(family: Family, n_max: usize, p: usize) -> Units {
+        use crate::{GammaLink, InverseGaussianLink};
+        let kind = match family {
+            Family::Gaussian => UnitsKind::Gaussian,
+            Family::Gamma {
+                link: GammaLink::Log,
+            } => UnitsKind::GammaLog,
+            Family::Gamma {
+                link: GammaLink::Inverse,
+            } => UnitsKind::GammaInverse,
+            Family::InverseGaussian {
+                link: InverseGaussianLink::Log,
+            } => UnitsKind::InverseGaussianLog,
+            Family::InverseGaussian {
+                link: InverseGaussianLink::InverseSquared,
+            } => UnitsKind::InverseGaussianInverseSquared,
+            Family::Poisson { .. } | Family::NegativeBinomial { .. } => UnitsKind::CountsLog,
+            Family::Binomial { .. } => UnitsKind::Counts,
+        };
+        let buf = |on: bool, len: usize| if on { vec![0.0; len] } else { Vec::new() };
+        let dispersion = !matches!(kind, UnitsKind::Counts | UnitsKind::CountsLog);
+        let shifted = kind != UnitsKind::Counts;
+        let offset = !matches!(kind, UnitsKind::Counts | UnitsKind::Gaussian);
+        Units {
+            kind,
+            s: 1.0,
+            c: 1.0,
+            m: 0.0,
+            intercept: None,
+            shift: buf(shifted, p),
+            shift_caller: buf(shifted, p),
+            w: buf(dispersion, n_max),
+            y: buf(dispersion, n_max),
+            offset: buf(offset, n_max),
+            w_changed: false,
+            y_changed: false,
+            offset_changed: false,
+            n: 0,
+        }
+    }
+
+    /// This draw's weight scale from the caller's prior weights (`None`: unit
+    /// weights) on rows `0..n`. `s` is a power of two, so `ŵ` is `w` exactly
+    /// rescaled; at `s = 1` the caller's weights are used as given.
+    pub(crate) fn compute(&mut self, weights: Option<&[f64]>, n: usize) {
+        self.s = 1.0;
+        self.w_changed = false;
+        let counts = matches!(self.kind, UnitsKind::Counts | UnitsKind::CountsLog);
+        let Some(w) = weights.filter(|_| !counts) else {
+            return;
+        };
+        self.s = crate::family::weight_scale(Some(w), n);
+        if self.s != 1.0 {
+            for (dst, &wi) in self.w[..n].iter_mut().zip(w) {
+                *dst = wi / self.s;
+            }
+            self.w_changed = true;
+            self.n = n;
+        }
+    }
+
+    /// This draw's response scale, after [`Self::compute`] on the same rows:
+    /// `c = 2^round(Σŵᵢ·log₂ yᵢ / Σŵᵢ)` on Gamma and inverse Gaussian (`c = 1`
+    /// on a log link without an intercept), the exponent clamped to
+    /// `[−1022, 1023]` so `c` and `1/c` are normal numbers; `c = 1` where the
+    /// mean is not finite. On a log link with an intercept and an offset, the
+    /// offset centre `m = Σwᵢoᵢ / Σwᵢ` (the weights the routes fit on; `m = 0`
+    /// where it is not finite). `x` is the caller's row-major `n×p` design and
+    /// `weights` the caller's. On Gaussian it finds the intercept only;
+    /// [`Self::compute_gaussian`] does the rest.
+    pub(crate) fn compute_response(
+        &mut self,
+        x: &[f64],
+        y: &[f64],
+        weights: Option<&[f64]>,
+        offset: Option<&[f64]>,
+        n: usize,
+        p: usize,
+    ) {
+        self.c = 1.0;
+        self.m = 0.0;
+        self.intercept = None;
+        self.shift.fill(0.0);
+        self.shift_caller.fill(0.0);
+        self.y_changed = false;
+        self.offset_changed = false;
+        if self.kind == UnitsKind::Counts || n == 0 {
+            return;
+        }
+        self.intercept = (0..p).find(|&j| x[j..n * p].iter().step_by(p).all(|&v| v == 1.0));
+        let log = match self.kind {
+            UnitsKind::GammaLog | UnitsKind::InverseGaussianLog | UnitsKind::CountsLog => true,
+            UnitsKind::GammaInverse | UnitsKind::InverseGaussianInverseSquared => false,
+            UnitsKind::Counts | UnitsKind::Gaussian => return,
+        };
+        if log && self.intercept.is_none() {
+            return;
+        }
+        if self.kind != UnitsKind::CountsLog {
+            let (mut swl, mut sw) = (0.0, 0.0);
+            let w = self.weights(weights);
+            for (i, &yi) in y[..n].iter().enumerate() {
+                let wi = w.map_or(1.0, |w| w[i]);
+                swl += wi * yi.log2();
+                sw += wi;
+            }
+            let e = (swl / sw).round();
+            if e.is_finite() && e != 0.0 {
+                self.c = 2.0_f64.powi(e.clamp(-1022.0, 1023.0) as i32);
+                for (dst, &v) in self.y[..n].iter_mut().zip(y) {
+                    *dst = v / self.c;
+                }
+                self.y_changed = true;
+                self.n = n;
+                if let Some(o) = offset.filter(|_| !log) {
+                    let f = if self.kind == UnitsKind::GammaInverse {
+                        self.c
+                    } else {
+                        self.c * self.c
+                    };
+                    for (dst, &v) in self.offset[..n].iter_mut().zip(o) {
+                        *dst = v * f;
+                    }
+                    self.offset_changed = true;
+                }
+            }
+        }
+        let Some(intercept) = self.intercept.filter(|_| log) else {
+            return;
+        };
+        if let Some(o) = offset {
+            let (mut swo, mut sw) = (0.0, 0.0);
+            let w = self.weights(weights);
+            for (i, &oi) in o[..n].iter().enumerate() {
+                let wi = w.map_or(1.0, |w| w[i]);
+                swo += wi * oi;
+                sw += wi;
+            }
+            let m = swo / sw;
+            if m.is_finite() && m != 0.0 {
+                self.m = m;
+                for (dst, &v) in self.offset[..n].iter_mut().zip(o) {
+                    *dst = v - m;
+                }
+                self.offset_changed = true;
+                self.n = n;
+            }
+        }
+        // A column map leaves the intercept as it is (`B·eᵢ = eᵢ`).
+        self.shift[intercept] = self.c.ln() - self.m;
+        self.shift_caller[intercept] = self.shift[intercept];
+    }
+
+    /// The Gaussian response, after [`Self::compute_response`] on the same
+    /// rows: the residual `r = y − o − x̃·β̃₀` (`β̃₀` the weighted
+    /// least-squares fit of `y − o` on x̃ by `shift`'s factor, 0 without one)
+    /// and `c = 2^round(log₂ ‖r‖)`, `‖r‖` its weighted root mean square, the
+    /// exponent clamped as in [`Self::compute_response`] and `c = 1` where
+    /// `‖r‖` is zero or not finite. The internal response is `r/c`. `x_mat` is
+    /// x̃ (column-major, `n` rows) and `map` its column map; `weights` are
+    /// the caller's.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn compute_gaussian(
+        &mut self,
+        x_mat: faer::MatRef<'_, f64>,
+        y: &[f64],
+        weights: Option<&[f64]>,
+        offset: Option<&[f64]>,
+        shift: &mut crate::fit::ShiftBuf,
+        n: usize,
+        map: &ColumnScaling,
+    ) {
+        debug_assert_eq!(self.kind, UnitsKind::Gaussian);
+        let p = self.shift.len();
+        let w = if self.w_changed {
+            Some(&self.w[..n])
+        } else {
+            weights
+        };
+        let r = &mut self.y[..n];
+        let v = |i: usize| y[i] - offset.map_or(0.0, |o| o[i]);
+        // `ŵ(y − o)` for the fit's right-hand side; the residual pass below
+        // starts from `y − o`.
+        match w {
+            Some(w) => r.iter_mut().enumerate().for_each(|(i, d)| *d = w[i] * v(i)),
+            None => r.iter_mut().enumerate().for_each(|(i, d)| *d = v(i)),
+        }
+        let beta0 = shift.solve(x_mat, r);
+        // The intercept's term first: `y − o` and `β̃₀` on the intercept are
+        // near each other on a response far from zero, so their difference is
+        // exact (Sterbenz) and the smaller terms keep their digits. Column by
+        // column on tiles of rows that stay in L1, so each row sees that
+        // order and x̃ is read once.
+        let intercept = self.intercept;
+        let order = intercept
+            .into_iter()
+            .chain((0..p).filter(move |&j| Some(j) != intercept));
+        const TILE: usize = 512;
+        let mut ss = 0.0;
+        for (t, rt) in r.chunks_mut(TILE).enumerate() {
+            let i0 = t * TILE;
+            if w.is_some() {
+                rt.iter_mut().enumerate().for_each(|(i, d)| *d = v(i0 + i));
+            }
+            if let Some(b) = beta0 {
+                for j in order.clone() {
+                    let col = x_mat.col(j).try_as_col_major().expect("x̃ is column-major");
+                    let bj = b[j];
+                    rt.iter_mut()
+                        .zip(&col.as_slice()[i0..])
+                        .for_each(|(d, &x)| *d -= x * bj);
+                }
+            }
+            ss = match w {
+                Some(w) => rt
+                    .iter()
+                    .zip(&w[i0..])
+                    .fold(ss, |a, (&v, &wi)| a + wi * v * v),
+                None => rt.iter().fold(ss, |a, &v| a + v * v),
+            };
+        }
+        self.y_changed = true;
+        self.n = n;
+        let sw = w.map_or(n as f64, |w| w.iter().sum());
+        let mut rms = (ss / sw).sqrt();
+        // Past |r| ≈ 1.3e154 the sum overflows, or below ≈ 1e-154 the squares
+        // underflow: the spread of `r` divided by its largest |rᵢ|, as
+        // [`ColumnScaling::compute`] falls back.
+        if !(rms > 0.0 && rms.is_finite()) {
+            rms = rescaled_spread(r, 1, 0, w, sw, false).1;
+        }
+        let e = rms.log2().round();
+        if e.is_finite() && e != 0.0 {
+            self.c = 2.0_f64.powi(e.clamp(-1022.0, 1023.0) as i32);
+            r.iter_mut().for_each(|v| *v /= self.c);
+        }
+        if let Some(b) = beta0 {
+            for (d, &v) in self.shift.iter_mut().zip(b) {
+                *d = v / self.c;
+            }
+            self.shift_caller.copy_from_slice(&self.shift);
+            map.beta_to_caller(&mut self.shift_caller);
+        }
+    }
+
+    /// The weight scale `s`.
+    pub(crate) fn s(&self) -> f64 {
+        self.s
+    }
+
+    /// The response scale `c`: the routes fit `y/c`.
+    pub(crate) fn c(&self) -> f64 {
+        self.c
+    }
+
+    /// The offset centre `m`.
+    pub(crate) fn m(&self) -> f64 {
+        self.m
+    }
+
+    /// The intercept column [`Self::compute_response`] found (every family
+    /// but binomial).
+    pub(crate) fn intercept(&self) -> Option<usize> {
+        self.intercept
+    }
+
+    /// The weights the routes fit on: `ŵ`, or `raw` (the caller's weights,
+    /// the ones [`Self::compute`] read) where they did not change.
+    pub(crate) fn weights<'a>(&'a self, raw: Option<&'a [f64]>) -> Option<&'a [f64]> {
+        if self.w_changed {
+            Some(&self.w[..self.n])
+        } else {
+            raw
+        }
+    }
+
+    /// The response the routes fit on: `y/c`, `(y − o − x̃β̃₀)/c` on Gaussian,
+    /// or `raw` where it did not change.
+    pub(crate) fn y<'a>(&'a self, raw: &'a [f64]) -> &'a [f64] {
+        if self.y_changed {
+            &self.y[..self.n]
+        } else {
+            raw
+        }
+    }
+
+    /// The offset the routes fit on: `o − m` on a log link, `c·o` on the
+    /// inverse link, `c²·o` on 1/μ², or `raw` where it did not change.
+    pub(crate) fn offset<'a>(&'a self, raw: Option<&'a [f64]>) -> Option<&'a [f64]> {
+        if self.offset_changed {
+            Some(&self.offset[..self.n])
+        } else {
+            raw
+        }
+    }
+
+    /// `k`: the caller's β is `k·(β̃_int + δ̃)`.
+    pub(crate) fn beta_scale(&self) -> f64 {
+        match self.kind {
+            UnitsKind::Gaussian => self.c,
+            UnitsKind::GammaInverse => 1.0 / self.c,
+            UnitsKind::InverseGaussianInverseSquared => (1.0 / self.c) * (1.0 / self.c),
+            _ => 1.0,
+        }
+    }
+
+    /// `k²`: the caller's `Var(β̂)` over the internal one.
+    pub(crate) fn var_scale(&self) -> f64 {
+        self.beta_scale() * self.beta_scale()
+    }
+
+    /// `d`: the caller's dispersion over the internal one.
+    pub(crate) fn dispersion_scale(&self) -> f64 {
+        match self.kind {
+            UnitsKind::Gaussian => self.s * self.var_scale(),
+            UnitsKind::InverseGaussianLog | UnitsKind::InverseGaussianInverseSquared => {
+                self.s / self.c
+            }
+            _ => self.s,
+        }
+    }
+
+    /// A held dispersion `v` (the caller's) on the internal scale.
+    pub(crate) fn held_dispersion_in(&self, v: f64) -> f64 {
+        v / self.dispersion_scale()
+    }
+
+    /// The factor from the GLM kernel's variance at φ = 1 on the internal
+    /// data to the caller's `Var(β̂)/φ̂`: `Var(β̂) = k²·φ_int·(X̃ᵀŴX̃)⁻¹` with
+    /// `φ_int = φ/d`.
+    pub(crate) fn glm_var_scale(&self) -> f64 {
+        self.var_scale() / self.dispersion_scale()
+    }
+
+    /// What the log-likelihood of the internal data takes to be the caller's:
+    /// `−n·ln c`.
+    pub(crate) fn loglik_shift(&self, n: usize) -> f64 {
+        -(n as f64) * self.c.ln()
+    }
+
+    /// `δ̃` on caller column `t` (`B·δ̃`).
+    pub(crate) fn shift_caller(&self, t: usize) -> f64 {
+        self.shift_caller.get(t).copied().unwrap_or(0.0)
+    }
+
+    /// `β̃_int → k·(β̃_int + δ̃)`, on x̃'s columns.
+    pub(crate) fn beta_from_internal(&self, beta: &mut [f64]) {
+        for (b, &d) in beta.iter_mut().zip(&self.shift) {
+            if d != 0.0 {
+                *b += d;
+            }
+        }
+        let k = self.beta_scale();
+        if k != 1.0 {
+            beta.iter_mut().for_each(|b| *b *= k);
+        }
+    }
+
+    /// The caller's β from the internal β̃ (`B·k·(β̃_int + δ̃)`).
+    pub(crate) fn beta_to_caller(&self, map: &ColumnScaling, beta: &mut [f64]) {
+        self.beta_from_internal(beta);
+        map.beta_to_caller(beta);
     }
 }
 

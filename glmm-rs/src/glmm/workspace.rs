@@ -1061,6 +1061,10 @@ pub struct GlmmWorkspace {
     /// gradient search (`FitWorkspace::set_beta_info_scaling`). `false` by
     /// default: the search whitens β̃ by the design (`BetaScale::set`).
     pub(crate) beta_info_scaling: bool,
+    /// Check a caller's β start for separation with the fixed-effects GLM, as
+    /// a cold start does. Set by the stable door; the loop tier leaves it
+    /// false and trusts the start.
+    pub(crate) check_start_separation: bool,
     /// Whether the last gradient search ran on β̃ whitened by the β
     /// information (`BetaScale::set_info`, a Laplace fit on the opt-in
     /// without a caller's hint) rather than by the design. Its estimate is
@@ -1071,11 +1075,25 @@ pub struct GlmmWorkspace {
     /// information-whitened β̃ to the design-whitened one, then `L_setᵀ`, the
     /// scratch it is built from. Valid when `grad_beta_info`.
     pub(crate) grad_beta_map: Vec<f64>,
-    /// The response units `c` (the kernel fits `y/c`) of the search whose
-    /// state the workspace holds: set by `fit::glmm::fit_glmm_in_units`, put
-    /// back with that state when `fit::glmm::gamma_inverse_retry` keeps an
-    /// earlier search; 1 otherwise.
+    /// The factor θ takes in the search whose state the workspace holds: its
+    /// response scale `c` (the kernel fits `y/c`) on the Gamma inverse link,
+    /// 1 on every other link. Set by `fit::glmm::fit_glmm_in_units`, put back
+    /// with that state when `fit::glmm::gamma_inverse_retry` keeps an earlier
+    /// search.
     pub(crate) search_units: f64,
+    /// The intercept column of the fitted design (`standardize::Units`), set
+    /// per fit by `fit::glmm::run_glmm_on`.
+    pub(crate) intercept: Option<usize>,
+    /// Added to `betas[intercept]` once β is on the caller's columns, so the
+    /// SEs' `t²` and the joint Wald read the caller's intercept: `ln c − m`
+    /// while `fit::glmm::fit_glmm_in_units` runs a log-link search on `y/c`
+    /// with the offset centred at `m`, 0 otherwise.
+    pub(crate) intercept_shift: f64,
+    /// The response, β start and θ start of a search on `y/c`
+    /// (`fit::glmm::fit_glmm_in_units`): `max_n`, `p` and `n_theta` long.
+    pub(crate) y_units: Vec<f64>,
+    pub(crate) beta_units: Vec<f64>,
+    pub(crate) theta_units: Vec<f64>,
     /// PIRLS scratch (sized max_n / k) — see [`PirlsScratch`].
     pub(crate) pirls: PirlsScratch<f64>,
     /// Row-major f64 copy of every random-slope column of x, filled once per
@@ -1100,10 +1118,6 @@ pub struct GlmmWorkspace {
     /// two logit arms of `simd_transcendental::family_pass`: the fused
     /// `Σ log1pexp` deviance identity holds only for unweighted 0/1 rows.
     pub(crate) weighted: bool,
-    /// `s` of the `ŵ = w/s` a weighted Gamma fit stores in `prior_w`
-    /// (`family::weight_scale`, set per fit by `fit::glmm::prep_glmm_design`);
-    /// 1 on every other fit. A raw-scale φ is `s` times the internal one.
-    pub(crate) weight_scale: f64,
     /// within-fit û warm-start incumbent; RESET to 0 each fit_glmm — never carried across fits
     pub u_seed: Vec<f64>,
     /// max_n × p = W∘X scratch for the X'WX GEMM (rebuilt per PIRLS iteration,
@@ -1389,11 +1403,11 @@ impl GlmmWorkspace {
             // Gamma seed.
             params.push(0.0);
             if matches!(family, crate::Family::Gamma { .. }) {
-                lower.push(super::GAMMA_PHI_LO.ln());
-                upper.push(super::GAMMA_PHI_HI.ln());
+                lower.push(crate::consts::GAMMA_PHI_LO.ln());
+                upper.push(crate::consts::GAMMA_PHI_HI.ln());
             } else {
-                lower.push(crate::fit::NB_THETA_LO.ln());
-                upper.push(crate::fit::NB_THETA_HI.ln());
+                lower.push(crate::consts::NB_THETA_LO.ln());
+                upper.push(crate::consts::NB_THETA_HI.ln());
             }
         }
 
@@ -1565,9 +1579,15 @@ impl GlmmWorkspace {
             grad_hint_in: None,
             grad_hint_ready: false,
             beta_info_scaling: false,
+            check_start_separation: false,
             grad_beta_info: false,
             grad_beta_map: vec![0.0; 2 * p * p],
             search_units: 1.0,
+            intercept: None,
+            intercept_shift: 0.0,
+            y_units: vec![0.0; max_n],
+            beta_units: vec![0.0; p],
+            theta_units: vec![0.0; n_theta],
             pirls: PirlsScratch::for_shape(max_n, k, q, n_primary, nagq).with_profile_rows(
                 if layout == GlmmLayout::Packed {
                     0
@@ -1581,7 +1601,6 @@ impl GlmmWorkspace {
             prior_w: vec![1.0; max_n],
             prior_w_phi: vec![1.0; max_n],
             weighted: false,
-            weight_scale: 1.0,
             u_seed: vec![0.0; k.max(1)],
             wx: Mat::zeros(max_n, p),
             structured: StructuredScratch::for_shape(

@@ -166,7 +166,6 @@ anova.fastglmm <- function(object, ..., type = c("III", "II"), test = c("auto", 
     stop("test applies to one fit's per-term table, not to a comparison of two fits.",
          call. = FALSE)
   }
-  .check_nsim_seed(nsim, seed)
   for (fit in fits) .check_fields(fit, c("objective", "link", "rss"))
   res <- .glmm_call("compare_fits", list(m0 = .compare_side(fits[[1L]]),
                                           m1 = .compare_side(fits[[2L]]),
@@ -257,13 +256,7 @@ compare <- function(data, f0, f1, ..., family = gaussian(), weights = NULL,
   f_strs <- vapply(forms, function(f) paste(deparse(f, width.cutoff = 500L), collapse = " "),
                    character(1))
   for (f in forms) .check_formula(f)
-  fam <- .normalize_family(family)
-  if (identical(fam$name, "inversegaussian") && any(grepl("|", f_strs, fixed = TRUE))) {
-    stop("family 'inversegaussian' is GLM-only: random-effect terms are not supported",
-         call. = FALSE)
-  }
-  nAGQ <- .check_nagq(nAGQ)
-  .check_nsim_seed(nsim, seed)
+  fam <- .family_arg(family)
 
   # One row mask over the variables of both formulas, the weights and the
   # offset, so both models are fitted to the same rows.
@@ -280,12 +273,10 @@ compare <- function(data, f0, f1, ..., family = gaussian(), weights = NULL,
   keep <- stats::complete.cases(frame)
   # Mirrors the Python port's compare() wording - change together.
   where <- "a column either formula uses, the weights or the offset"
-  if (!any(keep)) {
-    stop(if (nrow(frame)) {
-      sprintf("every row has a missing value in %s; no rows left to fit", where)
-    } else {
-      "no rows left to fit"
-    }, call. = FALSE)
+  # Data with no rows reaches the native code, which says so.
+  if (nrow(frame) && !any(keep)) {
+    stop(sprintf("every row has a missing value in %s; no rows left to fit", where),
+         call. = FALSE)
   }
   store <- new.env(parent = emptyenv())
   store$rows <- list()
@@ -301,7 +292,10 @@ compare <- function(data, f0, f1, ..., family = gaussian(), weights = NULL,
   row_index <- which(keep)
   w <- frame[["(weights)"]]
   o <- frame[["(offset)"]]
-  numeric_only <- unlist(lapply(forms, function(f) c(all.vars(f[[2L]]), .offset_vars(f))))
+  # A one-sided formula has no response; the native code refuses it.
+  numeric_only <- unlist(lapply(forms, function(f) {
+    c(if (length(f) == 3L) all.vars(f[[2L]]), .offset_vars(f))
+  }))
   cols <- .marshal(frame, vars, numeric_only)
 
   res <- .glmm_call("compare", list(
@@ -316,12 +310,12 @@ compare <- function(data, f0, f1, ..., family = gaussian(), weights = NULL,
     s <- new.env(parent = emptyenv())
     s$rows <- store$rows
     own <- intersect(c(all.vars(forms[[i]]), "(weights)", "(offset)"), names(frame))
-    .fit_object(r, s, fam, nAGQ, NULL, f_strs[[i]], frame[own], row_index, call, data_name)
+    .fit_object(r, s, fam$object, f_strs[[i]], frame[own], row_index, call, data_name)
   }
   fit0 <- fit(res$fit0, 1L)
   fit1 <- fit(res$fit1, 2L)
   structure(list(
-    table = .comparison_table(res, c("f0", "f1"), list(fit0, fit1), fam$name),
+    table = .comparison_table(res, c("f0", "f1"), list(fit0, fit1), fit0$family_name),
     fit0 = fit0,
     fit1 = fit1
   ), class = "fastglmm_comparison")
@@ -585,30 +579,13 @@ pairwise <- function(object, factor, by = NULL, at = NULL, adjust = "holm") {
     stop(sprintf("pairwise() takes a fastglmm fit, not a %s.", class(object)[1L]),
          call. = FALSE)
   }
-  one_name <- function(x, what) {
-    if (!(is.character(x) && length(x) == 1L && !is.na(x))) {
-      stop(sprintf("%s must be one variable name, got %s", what, .arg_repr(x)), call. = FALSE)
-    }
-  }
-  one_name(factor, "factor")
-  if (!is.null(by)) one_name(by, "by")
-  if (!is.null(at)) {
-    if (is.null(by)) stop("at gives the values of a numeric by, so it needs by", call. = FALSE)
-    if (!(is.numeric(at) && length(at) && all(is.finite(at)))) {
-      stop("at must be one or more finite numbers", call. = FALSE)
-    }
-  }
-  if (!(is.character(adjust) && length(adjust) == 1L && !is.na(adjust))) {
-    stop(sprintf('adjust must be "holm", "bonferroni", "tukey" or "none", got %s',
-                 .arg_repr(adjust)), call. = FALSE)
-  }
   res <- .glmm_call("pairwise", c(.training_columns(object), list(
     df_method = object$df_method, beta = unname(as.double(object$beta)),
     vcov = as.double(t(object$vcov)), model_vcov = .model_vcov_arg(object),
     aliased = unname(as.logical(object$aliased)),
     nobs = as.double(object$nobs), record = object$satterthwaite_record,
     robust = object$robust, names = names(object$beta), factor = factor, by = by,
-    by_values = .optional(at), adjust = adjust)))
+    at = at, adjust = adjust, converged = isTRUE(object$converged))))
   res <- .test_warnings(res)
   tab <- data.frame(contrast = res$contrast, check.names = FALSE)
   if (!is.null(res$by)) tab[[res$by]] <- res$by_level
@@ -623,9 +600,7 @@ pairwise <- function(object, factor, by = NULL, at = NULL, adjust = "holm") {
   }
   heading <- paste0("Pairwise comparisons of ", res$factor,
                     if (!is.null(res$by)) paste0(" by ", res$by))
-  structure(tab, heading = heading,
-            footer = c(if (!isTRUE(object$converged)) .NOT_CONVERGED,
-                       .adjust_line(res, res$adjust, FALSE), .pairwise_notes(res)),
+  structure(tab, heading = heading, footer = res$notes,
             pairwise = res, class = c("fastglmm_pairwise", "data.frame"))
 }
 
@@ -645,16 +620,14 @@ pairwise <- function(object, factor, by = NULL, at = NULL, adjust = "holm") {
 #' @return A `c("fastglmm_pairwise_ci", "data.frame")` with the columns
 #'   `contrast`, the `by` variable when given, `estimate`, `lower.CL`,
 #'   `upper.CL`, and on a log or logit link `odds.ratio` or `ratio` with
-#'   `ratio.lower.CL` and `ratio.upper.CL`. Its `footer` attribute names the
-#'   level and the adjustment.
+#'   `ratio.lower.CL` and `ratio.upper.CL`. Its `footer` attribute says when
+#'   the fit did not converge, names the level and the adjustment, and holds
+#'   the notes.
 #' @seealso [pairwise()]
 #' @export
 confint.fastglmm_pairwise <- function(object, parm, level = 0.95, ...) {
   res <- attr(object, "pairwise")
-  ci <- .glmm_call("pairwise_confint", list(
-    estimate = res$estimate, se = res$se, df = res$df, p_value = res$p_value,
-    adjust = res$adjust, levels = res$levels, ratio = res$ratio_kind,
-    level = .level(level)))
+  ci <- .glmm_call("pairwise_confint", list(table = res, level = level))
   tab <- data.frame(contrast = res$contrast, check.names = FALSE)
   if (!is.null(res$by)) tab[[res$by]] <- res$by_level
   tab$estimate <- res$estimate
@@ -665,12 +638,7 @@ confint.fastglmm_pairwise <- function(object, parm, level = 0.95, ...) {
     tab$ratio.lower.CL <- ci$ratio_lower
     tab$ratio.upper.CL <- ci$ratio_upper
   }
-  adjust <- if (identical(res$adjust, "holm")) .HOLM_INTERVALS else
-    .adjust_line(res, ci$adjust, TRUE)
-  structure(tab, heading = attr(object, "heading"),
-            footer = c(intersect(.NOT_CONVERGED, attr(object, "footer")),
-                       paste("Confidence level used:", format(level)), adjust,
-                       .pairwise_notes(res)),
+  structure(tab, heading = attr(object, "heading"), footer = ci$notes,
             class = c("fastglmm_pairwise_ci", "data.frame"))
 }
 
@@ -687,51 +655,6 @@ print.fastglmm_pairwise_ci <- function(x, ...) print.fastglmm_pairwise(x, ...)
 
 # The column of a pairwise row's ratio, by its ratio_kind.
 .RATIO_NAMES <- c(odds_ratio = "odds.ratio", ratio = "ratio")
-
-# The footer lines of a pairwise table and of its intervals, emmeans' words.
-# Mirrors the Python port's _HOLM_INTERVALS and _adjust_line - change
-# together.
-.HOLM_INTERVALS <- "Holm has no simultaneous interval; Bonferroni intervals shown."
-
-# The footer line naming `adjust` and its family size, NULL for "none". The
-# family of a Holm or Bonferroni adjustment is the tested rows (a p-value
-# that is not NaN) of each `by` group.
-.adjust_line <- function(res, adjust, intervals) {
-  if (identical(adjust, "none")) return(NULL)
-  lead <- if (intervals) "Conf-level adjustment" else "P value adjustment"
-  if (identical(adjust, "tukey")) {
-    sizes <- .tukey_sizes(res)
-    if (length(sizes) > 1L) return(sprintf("%s: tukey method for varying family sizes", lead))
-    return(sprintf("%s: tukey method for comparing a family of %d estimates", lead, sizes))
-  }
-  size <- res$levels * (res$levels - 1) / 2
-  group <- (seq_along(res$p_value) - 1L) %/% size
-  counts <- sort(unique(vapply(split(res$p_value, group), function(p) sum(!is.nan(p)), 0L)))
-  sprintf("%s: %s method for %s %s", lead, adjust, paste(counts, collapse = " or "),
-          if (intervals) "estimates" else "tests")
-}
-
-# Tukey's family size of each `by` group: the levels in at least one tested
-# comparison (a p-value that is not NaN), as the crate's `tukey_k` counts them.
-# Mirrors the Python port's _tukey_sizes - change together.
-.tukey_sizes <- function(res) {
-  k <- as.integer(res$levels)
-  pairs <- which(upper.tri(diag(k)), arr.ind = TRUE)
-  pairs <- pairs[order(pairs[, "row"], pairs[, "col"]), , drop = FALSE]
-  group <- (seq_along(res$p_value) - 1L) %/% nrow(pairs)
-  sort(unique(vapply(split(res$p_value, group), function(p) {
-    length(unique(as.vector(pairs[!is.nan(p), , drop = FALSE])))
-  }, 0L)))
-}
-
-# Each row's notes, as "a - b: note", or "a - b, h = h1: note" within a `by`
-# level.
-.pairwise_notes <- function(res) {
-  label <- if (is.null(res$by)) res$contrast else
-    paste0(res$contrast, ", ", res$by, " = ", res$by_level)
-  unlist(Map(function(l, notes) if (length(notes)) paste0(l, ": ", notes), label,
-             res$row_notes), use.names = FALSE)
-}
 
 # The unnamed elements of `dots`; a named one is an error, as fastglmm()
 # refuses an unknown argument rather than drop it.
@@ -800,23 +723,17 @@ print.fastglmm_pairwise_ci <- function(x, ...) print.fastglmm_pairwise(x, ...)
 # An optional vector for the native code: NULL when absent or empty.
 .optional <- function(x) if (length(x)) as.double(x)
 
-# A confidence level for the native code: not one number crosses as NaN, so
-# the crate's range check gives its message.
-.level <- function(level) if (length(level) == 1L) as.double(level) else NaN
-
-# nsim and seed: NULL, or one whole number each. The range of nsim is the
-# crate's check (orchestrate::compare_options), with its own message.
-.check_nsim_seed <- function(nsim, seed) {
-  whole <- function(x) is.numeric(x) && length(x) == 1L && is.finite(x) && x == round(x)
-  if (!is.null(nsim) && !whole(nsim)) {
-    stop(sprintf("nsim must be NULL or one whole number, got %s", .arg_repr(nsim)),
-         call. = FALSE)
+# `match.arg`'s idioms for a string option whose signature default lists its
+# `choices`: that default and NULL give the first choice, and a unique
+# partial match is expanded. Any other value passes as given, so the native
+# code refuses it in its own words.
+.choice <- function(x, choices) {
+  if (is.null(x) || identical(x, choices)) return(choices[1L])
+  if (is.character(x) && length(x) == 1L && !is.na(x)) {
+    i <- pmatch(x, choices)
+    if (!is.na(i)) return(choices[i])
   }
-  if (!is.null(seed) && !(whole(seed) && seed >= 0 && seed <= 2^53)) {
-    stop(sprintf("seed must be NULL or one whole number from 0 to 2^53, got %s",
-                 .arg_repr(seed)), call. = FALSE)
-  }
-  invisible()
+  x
 }
 
 # One fit's stored per-term result as lmerTest's (F) or car's (Wald or
@@ -871,8 +788,8 @@ print.fastglmm_pairwise_ci <- function(x, ...) print.fastglmm_pairwise(x, ...)
   if (is.null(cache$tables)) {
     a <- cache$call
     r <- .glmm_call("fit", c(.training_columns(object), list(
-      wald_se = a$wald.se, nagq = a$nAGQ, dispersion = .optional(a$dispersion),
-      warm_start = .warm_start(a$start),
+      wald_se = a$wald.se, nagq = a$nAGQ, dispersion = a$dispersion,
+      warm_start = a$start,
       # satterthwaite, condvar, reml: no chi-squared fit reads them
       satterthwaite = FALSE, condvar = FALSE,
       anova_test = if (identical(object$term_test_auto$test, "lrt")) "auto" else "LRT",
@@ -993,29 +910,6 @@ print.fastglmm_pairwise_ci <- function(x, ...) print.fastglmm_pairwise(x, ...)
     vcov = as.double(t(fit$vcov)),
     aliased = unname(as.logical(fit$aliased))
   )
-}
-
-# The message of a native error; `kind` is NULL except on a refusal of
-# anova(m0, m1). The crate's text says what is wrong in words common to both
-# ports; the refusals compare() avoids gain this port's pointer to it
-# (and to REML = FALSE), in the Python port's words with this port's call.
-.pair_refusal <- function(message, kind) {
-  if (is.null(kind)) return(message)
-  paste(c(message, switch(kind,
-    different_rows = "Or use compare(data, f0, f1), which drops those rows once for both fits.",
-    different_y = "Or use compare(data, f0, f1), which fits both to the same data.",
-    different_weights = "Or use compare(data, f0, f1), which takes the weights once.",
-    different_offset = "Or use compare(data, f0, f1), which takes the offset once.",
-    different_family = "Or use compare(data, f0, f1), which takes the family and link once.",
-    mixed_estimators = "Or use compare(data, f0, f1), which picks the estimator itself.",
-    reml_different_fixed = paste(
-      "Pass REML = FALSE to both fits, or use compare(data, f0, f1), which fits both",
-      "by ML."),
-    reml_different_fixed_estimated = paste(
-      "Pass REML = FALSE and weight_power = \"estimate\" to both fits, or use",
-      "compare(data, f0, f1), which fits both by ML."),
-    weight_power_mismatch = "Or use compare(data, f0, f1), which takes weight_power once.",
-    NULL)), collapse = " ")
 }
 
 # The comparison table from the native compare_fits' or compare's record

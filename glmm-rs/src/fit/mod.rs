@@ -42,6 +42,7 @@ mod glm;
 mod glmm;
 mod lmm;
 mod ols;
+pub(crate) use ols::ShiftBuf;
 mod robust;
 
 use common::fit_rank_deficient;
@@ -53,6 +54,10 @@ pub(crate) use common::validate_design;
 // `pub(crate)` so the calibration tier decides a design's aliasing with the
 // alias gate's own test.
 pub(crate) use common::detect_aliased;
+// `pub(crate)` so `orchestrate::predict` finds the rows a port's stored
+// rank-deficient fit cannot estimate.
+#[cfg(feature = "orchestrate")]
+pub(crate) use common::null_basis;
 // `pub(crate)` so `orchestrate::run_fit` can check a port's warm-start θ width
 // before the fit, the way `validate` checks it.
 #[cfg(any(test, feature = "orchestrate"))]
@@ -70,13 +75,14 @@ pub(crate) use common::re_only_count;
 // One block's covariance off θ̃, which the LMM profile reads its estimates
 // through, as `Fit::varcorr` is assembled.
 pub(crate) use common::varcorr_block;
-// The grouping reorder, which the profile intervals map their kernel
-// coordinates through.
-pub(crate) use common::Perm;
+// The flat-nesting check and its padded layout, which the formula front end
+// runs on the groupings as written.
+#[cfg(feature = "formula")]
+pub(crate) use common::{detect_flat_nesting, nested_padded_ids};
 // The sizer, for the tests outside `fit` that build kernel workspaces from
 // data-derived ids.
 #[cfg(test)]
-pub(crate) use common::spec_sized_from_ids;
+pub(crate) use common::{sized_as_declared, spec_sized_from_ids};
 // The workspace door, for the tests outside `fit` that need a `Fit` only the
 // loop tier can produce (a prestandardized design); `loop_advanced` exports
 // it below.
@@ -85,6 +91,11 @@ pub(crate) use core::{build_workspace, fit_on};
 
 /// Result of `fit`. Fixed-effect estimates cover all p predictors; SE has
 /// the ranges below. Non-target SE slots are NaN.
+///
+/// Every per-grouping and per-θ field has one entry per grouping, or θ
+/// coordinate, on every fit, and `fitted` one entry per row; a value the fit
+/// has no estimate for is NaN. Only `condvar`, `condvar_x` and `condvar_cross`
+/// can be empty (or `None`), as their docs say.
 ///
 /// Construct one only through [`fit`]/[`fit_with_start`]; its fields are
 /// private, so read it through its accessors. Everything the fit reports
@@ -102,7 +113,8 @@ pub struct Fit {
     /// Per-element Cholesky-scaled values `theta[k]^2 * sigma_sq`. These equal
     /// the random-effect variance components only for diagonal/scalar RE
     /// components (q=1 / scalar-extra — the currently reachable case); slope
-    /// (q≥2) models are not yet validated through this field. Empty for OLS.
+    /// (q≥2) models are not yet validated through this field. Empty on a fit
+    /// without random effects, NaN on a fit with no finite endpoint.
     /// Laid out like `varcorr`: a block without a random intercept reports
     /// its slopes only.
     pub(crate) tau2: Vec<f64>,
@@ -113,11 +125,11 @@ pub struct Fit {
     /// Storage behind [`Fit::varcorr()`]: one **vech-packed lower-triangular**
     /// block per grouping, declaration order. Vech order is column-major
     /// lower-triangular (matching the θ vech convention): for a `q×q` block,
-    /// `(0,0),(1,0),…,(q-1,0),(1,1),…,(q-1,q-1)`. Empty for OLS/GLM and on a
-    /// fit that left it unassembled.
+    /// `(0,0),(1,0),…,(q-1,0),(1,1),…,(q-1,q-1)`. Empty on a fit without
+    /// random effects; all NaN on a fit with no finite endpoint.
     pub(crate) varcorr: Vec<Vec<f64>>,
     /// Storage behind [`Fit::stddev_se`]: laid out like `tau2`, one vech per grouping, the SEs
-    /// at the diagonal slots and NaN off them; empty where no route fills it.
+    /// at the diagonal slots and NaN off them and wherever no SE was formed.
     pub(crate) stddev_se: Vec<f64>,
     /// Storage behind [`Fit::n_eval()`].
     pub(crate) n_eval: usize,
@@ -141,11 +153,12 @@ pub struct Fit {
     /// On a robust fit, the model covariance `σ̂²(XᵀV⁻¹X)⁻¹` of every retained
     /// column whatever [`FitOptions::se_for`] says, `p × p` row-major, NaN on
     /// an aliased column's row and column; empty on a model fit, whose `vcov`
-    /// is it. The M of [`Cr2Pieces::df`], and what `predict` and the Type II
-    /// hypotheses read on a robust fit.
+    /// is it. What `predict` and the Type II hypotheses read on a robust fit.
     pub(crate) model_vcov: Vec<f64>,
-    /// The CR2 or HC2 pieces of a robust fit, in the caller's coordinates and
-    /// `p` wide (zero on an aliased column); `None` on a model fit.
+    /// The CR2 or HC2 pieces of a robust fit; `None` on a model fit. Their
+    /// `t` is in the caller's coordinates, `p` rows (zero on an aliased
+    /// column); the rest is in the whitened coordinates of the retained
+    /// columns.
     pub(crate) robust: Option<Cr2Pieces>,
     /// Storage behind [`Fit::nobs()`].
     pub(crate) nobs: usize,
@@ -154,12 +167,14 @@ pub struct Fit {
     /// Storage behind [`Fit::fitted()`].
     pub(crate) fitted: Vec<f64>,
     /// Storage behind [`Fit::ranef()`]: the groupings' blocks concatenated in declaration
-    /// order.
+    /// order; all NaN on a fit that did not converge.
     pub(crate) ranef: Vec<f64>,
-    /// Storage behind [`Fit::ranef_levels()`].
+    /// Storage behind [`Fit::ranef_levels()`]: one level count per grouping on
+    /// every fit with random effects.
     pub(crate) ranef_levels: Vec<usize>,
     /// Storage behind [`Fit::condvar()`]: the groupings' blocks concatenated in declaration
-    /// order.
+    /// order. Empty when [`FitOptions::condvar`] is off, on a layout that forms
+    /// none, and on a fit with no conditional modes (one that did not converge).
     pub(crate) condvar: Vec<f64>,
     /// Per level `l`, in the level order of [`Fit::condvar`], the row-major
     /// `q × p` block `K_l` of `Λ̂(Λ̂ᵀZᵀWZΛ̂ + I)⁻¹Λ̂ᵀZᵀWX` on the caller's columns, the
@@ -170,7 +185,7 @@ pub struct Fit {
     pub(crate) condvar_x: Vec<f64>,
     /// The conditional covariance between the random effects of different
     /// groupings, which `condvar`'s per-level blocks leave out, on its scale;
-    /// see [`CondvarCross`]. `None` on a fit with one grouping and wherever
+    /// see [`CondvarCross`]. `None` on a fit with one grouping and whenever
     /// `condvar` is empty.
     pub(crate) condvar_cross: Option<CondvarCross>,
     /// Storage behind [`Fit::coef_df()`].
@@ -193,6 +208,11 @@ pub struct Fit {
     /// so no fit computes anything extra for it. The arrays and their flat
     /// layout are on [`DesignSummary`].
     pub(crate) design_summary: Option<DesignSummary>,
+    /// Orthonormal basis of the null space of the fixed design `X` the fit
+    /// was given, `k × p` row-major, one row per aliased column; empty on a
+    /// full-rank fit. [`crate::predict`] reads it to find rows that are not
+    /// estimable.
+    pub(crate) null_basis: Vec<f64>,
 }
 
 /// The aggregates a `(1 | g)` fit's dense accumulator holds, as three flat
@@ -229,10 +249,14 @@ pub(crate) struct DesignSummary {
 /// crossed, intercept-only one, and their levels form the tail: the
 /// groupings in declaration order with the nested one skipped, except that
 /// the declared primary stands at the family grouping's place when the two
-/// differ, each grouping's levels in order.
+/// differ, unless it is the nested grouping; each grouping's levels in order.
 ///
 /// - `family_grouping`: the declaration index of the family grouping; 0
 ///   unless the fit made a crossed extra its primary.
+/// - `nested_slots`: when the declared primary is the nested grouping (the
+///   fit moved a slope grouping first and nested the primary in it), per
+///   declared level `l` of it the child slot `f·m + j` it holds; empty
+///   otherwise, and then a nested level's id is its slot.
 /// - `family`, per family `f`, the vech (column-major lower triangle, as
 ///   `varcorr`) of the `w × w` covariance of its `w = q + m` coefficients: the
 ///   level's `q` reported coefficients, then the nested grouping's slots
@@ -258,6 +282,7 @@ pub(crate) struct CondvarCross {
     pub(crate) coupling_at: Vec<u32>,
     pub(crate) coupling_cols: Vec<u32>,
     pub(crate) coupling: Vec<f64>,
+    pub(crate) nested_slots: Vec<u32>,
 }
 
 /// What the kernels' factor walks return, in kernel coordinates: the
@@ -284,8 +309,7 @@ pub(crate) type CondvarBlocks = (Vec<f64>, Vec<f64>, Option<CondvarCross>);
 pub struct Diagnostics {
     /// Whether the optimizer reached its convergence criterion. `false`
     /// usually means `se()`, `vcov()`, `dispersion()` and `varcorr(g)` return
-    /// the NaN-fill (or empty, for `varcorr(g)`) described on each of those
-    /// accessors. The exception is an LMM or GLMM fit that hit
+    /// the NaN-fill described on each of those accessors. The exception is an LMM or GLMM fit that hit
     /// `MaxFunReached`: `se()`, `vcov()`, `dispersion()` and `varcorr(g)` all
     /// report finite values at that budget-exhausted endpoint. `stddev_se`,
     /// `fitted` and `ranef` stay gated on `converged` on both routes; `df`
@@ -295,8 +319,9 @@ pub struct Diagnostics {
     /// `true` iff the fit converged onto the θ boundary (≥ 1 diagonal variance
     /// component pinned at 0 — `boundary == AtBoundary`, OR a converged
     /// diagonal stddev negligible next to its fit's largest — see
-    /// `Fit::has_negligible_component`), the same condition lme4's
-    /// `isSingular` reports. `false` for OLS/GLM and for an LMM or GLMM
+    /// `Fit::has_negligible_component`). This is glmm's own rule: lme4's
+    /// `isSingular` compares its `tol` with the relative covariance factor,
+    /// which is on another scale. `false` for OLS/GLM and for an LMM or GLMM
     /// `MaxFunReached` cap-out — a capped endpoint is reported as a point,
     /// not accepted onto the boundary, so the post-hoc negligible-component
     /// check does not run there even though `varcorr` is finite (both routes
@@ -369,20 +394,15 @@ pub struct Diagnostics {
     /// which only the sparse route ever builds, so on that route a pinned
     /// diagonal can sit above a live off-diagonal after all.
     ///
-    /// **Empty means nothing was pinned** — every route with variance
-    /// components to pin fills this field on every converged fit: each view
-    /// mapper reshapes the fitted mask through
-    /// `common::materialize_diagnostics`, so there is no route left that knows
-    /// a component pinned but declines to say which.
-    /// A fit with no pinned component leaves this empty rather than allocating
-    /// a grid of `false`: the kernels carry the state as a u64 bit mask and
-    /// `pinned_flags` short-circuits to `vec![]` when the mask is zero, so a
-    /// warm loop over draws that never pin pays no heap block per draw for
-    /// saying nothing happened. Any route with no variance components at all
-    /// leaves it empty too (OLS, GLM, and the fixed-effect-only negative
-    /// binomial). The one structural exception: a design past the 64
-    /// components the internal mask holds — outside the crate's currently
-    /// validated envelope — cannot be represented here at all.
+    /// **One row per grouping, aligned with `varcorr`, on every fit with
+    /// random effects; all `false` when nothing was pinned.** Each view mapper
+    /// reshapes the fitted mask through `common::materialize_diagnostics`, so
+    /// there is no route that knows a component pinned but declines to say
+    /// which. Empty on a fit without random effects (OLS, GLM, and the
+    /// fixed-effect-only negative binomial). The one structural exception: a
+    /// design past the 64 components the internal mask holds — outside the
+    /// crate's currently validated envelope — cannot be represented here at
+    /// all.
     pub pinned: Vec<Vec<bool>>,
     /// Solver observations that are not one of the fixed channels above. Empty
     /// on a clean fit, and empty allocates nothing.
@@ -488,6 +508,18 @@ pub enum Note {
     NbShapeUnsettled {
         /// Alternation rounds run (the cap, `NB_MAX_OUTER`, in production).
         rounds: u32,
+    },
+    /// The negative-binomial shape θ̂ ended on a limit of its search range
+    /// [0.001, 10000]: within 1e-6 of it on the log scale. The shape and the
+    /// estimates computed at it are at that limit, not at an optimum. At the
+    /// upper limit the data show no overdispersion the shape can measure (a
+    /// near-Poisson fit); at the lower one they are more overdispersed than
+    /// the range allows. `converged` and every estimate are the search's own.
+    /// Raised by the NB GLM on a converged fit and by the NB GLMM on a fit
+    /// with a finite endpoint.
+    NbShapeAtLimit {
+        /// The limit θ̂ ended on, exactly 0.001 or 10000.
+        limit: f64,
     },
     /// `FitOptions::wald_se == WaldSe::Hessian` was requested, but the
     /// finite-difference joint Hessian came back non-positive-definite (or a
@@ -641,12 +673,23 @@ pub enum Note {
     /// count, is above 1). The likelihood then keeps rising as that grouping's
     /// variance grows, so the variance has no finite estimate, and the fixed
     /// effects depend on the reported one. Checked on every level, not most.
-    /// A grouping of one-trial levels (an observation-level random effect on
-    /// a 0/1 response) gets no note: there the variance only moves each row's
-    /// marginal success probability. A response with one value on every row
+    /// A grouping of one-trial levels gets [`Note::OneTrialPerLevel`]
+    /// instead. A response with one value on every row
     /// gets no note either: that is the constant-response case. The fit runs
     /// as usual and no estimate changes.
     SeparatedByGrouping {
+        /// The grouping's declaration index, as on [`Note::NewGroupingLevels`].
+        grouping: u32,
+    },
+    /// A binomial grouping whose every level holds at most one trial: the sum
+    /// of the level's prior weights (its trials) is at most 1, as with one 0/1
+    /// row per level. The variance of such a grouping only moves each row's
+    /// marginal success probability, which the fixed effects can match
+    /// (exactly under probit, where it is `Φ(η/√(1 + σ²))`), so the variance
+    /// trades against the fixed effects and is not identified. Checked on
+    /// every grouping, with or without a random intercept. The fit runs as
+    /// usual and no estimate changes.
+    OneTrialPerLevel {
         /// The grouping's declaration index, as on [`Note::NewGroupingLevels`].
         grouping: u32,
     },
@@ -685,7 +728,8 @@ pub enum Note {
     /// eigendecomposition of that Hessian failed, or the fit has no finite
     /// endpoint at all. A failed pass fails for the whole fit: every `coef_df`
     /// is NaN and the contrasts return
-    /// [`crate::inference::contrast::NoDfReason::Failed`].
+    /// [`crate::inference::contrast::NoDfReason::Failed`]. Not raised on a fit
+    /// with no fixed-effect coefficients, which has no df to compute.
     SatterthwaiteCurvature {
         /// Directions of the Hessian dropped as flat.
         dropped: u32,
@@ -720,6 +764,22 @@ pub enum Note {
     /// (sets [`Boundary::UpperLimit`] when the boundary would otherwise read
     /// `Interior`); `converged` and `singular` are not changed.
     VarianceAtLimit,
+    /// A Gamma GLMM's free dispersion ended on an edge of its search box
+    /// `[GAMMA_PHI_LO, GAMMA_PHI_HI]`. On a weighted fit the box applies to φ
+    /// divided by a power of two near the geometric mean of the weights. The
+    /// fit is refused: `converged` is false, the boundary is `NoOptimum` and
+    /// every estimate is NaN. A held dispersion is not searched and never gets
+    /// it.
+    DispersionAtLimit {
+        /// The edge φ̂ ended on, on the scale of the dispersion the fit
+        /// reports: `edge` times the power of two the weights were divided
+        /// by, so `edge` itself on an unweighted fit.
+        limit: f64,
+        /// The edge of the box φ̂ ended on, exactly `GAMMA_PHI_LO` or
+        /// `GAMMA_PHI_HI`. A typical row's coefficient of variation there is
+        /// about `√edge`.
+        edge: f64,
+    },
     /// A prediction on new rows ([`crate::predict`]) met grouping levels the
     /// fit has no conditional mode for: an id at or past the grouping's
     /// [`Fit::ranef_levels`] count. Those rows take a zero random effect for
@@ -734,6 +794,16 @@ pub enum Note {
         /// the extra grouping `g`.
         grouping: u32,
         /// The 0-based rows of the new design with an unseen level, ascending.
+        rows: Vec<u32>,
+    },
+    /// A prediction on new rows ([`crate::predict`]) met rows outside the row
+    /// space of a rank-deficient fit's design: `‖N·x‖ > 1e-6·‖x‖`, `N` an
+    /// orthonormal basis of the null space of the training design, R's
+    /// `predict.lm` rule. Their prediction, standard error, interval and
+    /// future bounds are NaN. Only in [`crate::Prediction::notes`].
+    RowsNotEstimable {
+        /// The 0-based rows of the new design outside the row space,
+        /// ascending.
         rows: Vec<u32>,
     },
     /// The fitted weight power ([`WeightPower::Estimate`]) is not a maximum:
@@ -810,22 +880,20 @@ pub enum Note {
     /// In [`crate::Prediction::notes`], when the standard error is asked for
     /// on a fit with [`SeType::Robust`]: the prediction's standard error and
     /// interval are model-based, not robust, since its formula holds only
-    /// with the model's covariance (spec 2-dcr D14).
+    /// with the model's covariance.
     PredictSeModelBased,
 }
 
 impl Diagnostics {
     /// The diagnostics a `Fit` built without a solver carrier can honestly fill:
     /// `boundary` back-derived from `singular`, nothing pinned, no notes, no
-    /// aliased column. Its callers are the NaN-fill returns — the degenerate
-    /// `n`/`p` guards, the NB alternation's seed fit, the unfittable-random-slope
-    /// return — which stand in for a search that never ran and all pass
-    /// `converged: false`. Every fitting route goes through
-    /// `common::materialize_diagnostics` instead, which has a carrier to read.
+    /// aliased column. Its caller is [`Fit::empty`], which stands in for a
+    /// search that never ran and passes `converged: false`. Every fitting route
+    /// goes through `common::materialize_diagnostics` instead, which has a
+    /// carrier to read.
     ///
-    /// `pinned` stays empty here because those callers have no varcorr to align
-    /// a grid against; [`pinned_flags`] is what places the bits when there is
-    /// one.
+    /// `pinned` is empty here; `Fit::empty` sets it from its `varcorr` through
+    /// `common::pinned_flags`, which places one row per block.
     pub(crate) fn from_flags(converged: bool, singular: bool, p: usize) -> Self {
         Diagnostics {
             converged,
@@ -891,6 +959,51 @@ pub fn vech_stddev_corr(vech: &[f64]) -> (Vec<f64>, Vec<Vec<f64>>) {
 const SINGULAR_REL_TOL: f64 = 1e-3;
 
 impl Fit {
+    /// The fit with no estimates, for a search that never ran: every estimate
+    /// NaN at its full length (`fitted` length `n`), `ranef_levels` filled,
+    /// `pinned` all false, `converged` false. `groupings` is `None` on a
+    /// fixed-only fit, which leaves every per-grouping field empty.
+    fn empty(n: usize, p: usize, groupings: Option<&crate::lmm::LmmGroupings>) -> Fit {
+        let varcorr = groupings.map_or_else(Vec::new, common::nan_varcorr);
+        let theta = groupings.map_or_else(Vec::new, common::nan_theta);
+        let mut diagnostics = Diagnostics::from_flags(false, false, p);
+        diagnostics.pinned = common::pinned_flags(0, &varcorr);
+        Fit {
+            beta: vec![f64::NAN; p],
+            se: vec![f64::NAN; p],
+            vcov: common::nan_vcov(p),
+            tau2: theta.clone(),
+            dispersion: f64::NAN,
+            diagnostics,
+            varcorr,
+            stddev_se: theta,
+            n_eval: 0,
+            #[cfg(feature = "counters")]
+            counters: crate::counters::EvalCounters::new(),
+            deviance: f64::NAN,
+            loglik: f64::NAN,
+            df: 0,
+            reml: false,
+            weight_power: f64::NAN,
+            weight_power_estimated: false,
+            se_type: SeType::Model,
+            model_vcov: Vec::new(),
+            robust: None,
+            nobs: n,
+            objective: Objective::MaximumLikelihood,
+            fitted: vec![f64::NAN; n],
+            ranef: groupings.map_or_else(Vec::new, common::nan_ranef),
+            ranef_levels: groupings.map_or_else(Vec::new, common::ranef_level_counts),
+            condvar: vec![],
+            condvar_x: vec![],
+            condvar_cross: None,
+            coef_df: vec![f64::NAN; p],
+            satterthwaite: None,
+            design_summary: None,
+            null_basis: Vec::new(),
+        }
+    }
+
     /// Whether the optimizer reached its convergence criterion — the most-read
     /// field in the API, forwarded so that moving it behind `diagnostics` costs
     /// its callers a `()` and nothing else. See [`Diagnostics::converged`].
@@ -898,7 +1011,7 @@ impl Fit {
         self.diagnostics.converged
     }
 
-    /// Whether the fit is singular (lme4's `isSingular`). Forwarder — see
+    /// Whether the fit is singular, by glmm's own rule. Forwarder — see
     /// [`Diagnostics::singular`].
     pub fn singular(&self) -> bool {
         self.diagnostics.singular
@@ -971,7 +1084,7 @@ impl Fit {
     }
 
     /// The model covariance as `p` rows of `p`: [`Fit::vcov_rows`] on a model
-    /// fit, the private `model_vcov` on a robust one that has it (D14), which
+    /// fit, the private `model_vcov` on a robust one that has it, which
     /// covers every retained column whatever [`FitOptions::se_for`] says.
     pub(crate) fn model_vcov_rows(&self) -> Vec<Vec<f64>> {
         let p = self.beta.len();
@@ -986,9 +1099,7 @@ impl Fit {
 
     /// The number of random-effect groupings the fit reports, declaration
     /// order (primary, then each extra): the valid `g` of every per-grouping
-    /// accessor is below it. 0 on a fixed-effects fit (OLS, GLM) and on a fit
-    /// that left its covariances unassembled (a degenerate or failed fit with
-    /// no finite endpoint).
+    /// accessor is below it. 0 on a fixed-effects fit (OLS, GLM) only.
     pub fn n_groupings(&self) -> usize {
         self.varcorr.len()
     }
@@ -1016,7 +1127,8 @@ impl Fit {
     /// glmmTMB's `VarCorr` reports it (lme4's reports `σ·θ̂` instead). Validated against lme4
     /// `VarCorr` (`validation/goldens/sleepstudy_lmm.json`) and glmmTMB's on Gamma
     /// (`validation/goldens/sim_gamma_glmm_tmb.json`). OLS/GLM fits have no
-    /// groupings (no random effects).
+    /// groupings (no random effects). All NaN on a fit with no finite
+    /// endpoint.
     ///
     /// A block without a random intercept (`(0 + x | g)`,
     /// [`crate::ReTerm::no_intercept`]) reports its slopes only: the kernel
@@ -1073,9 +1185,6 @@ impl Fit {
     /// If `g >= n_groupings()`.
     pub fn stddev_se(&self, g: usize) -> Vec<f64> {
         let q = self.n_re(g);
-        if self.stddev_se.is_empty() {
-            return vec![f64::NAN; q];
-        }
         let start: usize = self.varcorr[..g].iter().map(Vec::len).sum();
         // Diagonal slot `(k, k)` of a column-major vech: `k*q - k*(k-1)/2`.
         (0..q)
@@ -1093,8 +1202,8 @@ impl Fit {
     /// behind [`Fit::fitted()`]. For a nested grouping the block spans
     /// `n_parents·n_per_parent` slots (child id = parent·n_per_parent +
     /// within), padded with zero modes for parents with fewer observed
-    /// children: the padded slots are part of the block. Empty on a fit that
-    /// did not converge, while [`Fit::ranef_levels()`] stays filled there.
+    /// children: the padded slots are part of the block. All NaN on a fit that
+    /// did not converge.
     ///
     /// This is the numbers only. To get them LABELLED — which level each row
     /// belongs to, with the padded slots dropped — fit through the formula
@@ -1114,21 +1223,14 @@ impl Fit {
     /// If `g >= n_groupings()`.
     pub fn ranef(&self, g: usize) -> &[f64] {
         let q = self.n_re(g);
-        if self.ranef.is_empty() {
-            return &[];
-        }
         let start: usize = (0..g).map(|h| self.ranef_levels[h] * self.n_re(h)).sum();
         &self.ranef[start..start + self.ranef_levels[g] * q]
     }
 
     /// Level count per grouping for slicing [`Fit::ranef()`], declaration order
-    /// (primary, then each extra): `ranef(g).len() == ranef_levels()[g] * n_re(g)`
-    /// wherever `ranef(g)` is not empty. Filled on every fit with random
-    /// effects, including one that did not converge, where `ranef(g)` is empty;
-    /// empty on a fit without random effects. The `g` that `ranef(g)` accepts
-    /// is below [`Fit::n_groupings()`], not this slice's length: a Gaussian
-    /// mixed fit with no finite endpoint fills this slice while
-    /// `n_groupings()` is 0.
+    /// (primary, then each extra): `ranef(g).len() == ranef_levels()[g] * n_re(g)`.
+    /// Filled on every fit with random effects, including one that did not
+    /// converge; empty on a fit without random effects.
     pub fn ranef_levels(&self) -> &[usize] {
         &self.ranef_levels
     }
@@ -1153,10 +1255,12 @@ impl Fit {
     ///
     /// Formed once when the `Fit` is assembled, from the factors at the
     /// optimum, and only when [`FitOptions::condvar`] asks for it. Empty on a
-    /// fit that did not ask, where `ranef` is, and on the layouts where it is not
-    /// computed: a Gaussian LMM on the sparse route (an extra grouping with a
-    /// random slope, over the dense envelope or more than
-    /// `MAX_CROSSED_LEVELS` crossed levels) and a GLMM on the packed layout,
+    /// fit that did not ask, on a fit that did not converge (its `ranef` is
+    /// NaN), and on the layouts where it is not computed: a Gaussian LMM on the sparse route (random slopes on two or
+    /// more groupings, a lone slope grouping written after others that leave
+    /// more than `MAX_CROSSED_LEVELS` crossed levels when it is moved first or
+    /// whose slope block is wider than `MAX_PRIMARY_Q`,
+    /// over the dense envelope or more than `MAX_CROSSED_LEVELS` crossed levels) and a GLMM on the packed layout,
     /// which would need a selected inverse of the whole system.
     ///
     /// # Panics
@@ -1197,7 +1301,7 @@ impl Fit {
 
     /// Fitted means μ̂ per row (length `n`): the conditional means through the
     /// inverse link — `g⁻¹(Xβ̂ + Zb̂)` for mixed fits (lme4 `fitted()`),
-    /// `g⁻¹(Xβ̂)` for fixed-only. Empty on non-converged fits. Always on the
+    /// `g⁻¹(Xβ̂)` for fixed-only. NaN on a fit that did not converge. Always on the
     /// original `y` scale, including on the Gaussian LMM paths — see
     /// `fit::common::lmm_fitted` for how the offset is restored there.
     pub fn fitted(&self) -> &[f64] {
@@ -1296,7 +1400,7 @@ impl Fit {
 
     /// The number of rows the fit was given, `n`, on every route and whatever
     /// the outcome: a non-converged or degenerate fit reports it too (where
-    /// `fitted` is empty), and the rank-deficient salvage reports its reduced
+    /// `fitted` is NaN), and the rank-deficient salvage reports its reduced
     /// fit's, which is the same `n`.
     pub fn nobs(&self) -> usize {
         self.nobs
@@ -1414,8 +1518,8 @@ impl Fit {
     /// Post-hoc singular check beyond the optimizer's exact-pin decision
     /// ([`Diagnostics::boundary`], unchanged by this — see
     /// [`SINGULAR_REL_TOL`]).
-    /// Changes no returned estimate. `false` when `varcorr` is empty
-    /// (non-mixed-model fit, or a non-converged fit that left it unassembled).
+    /// Changes no returned estimate. `false` when `varcorr` is empty (a fit
+    /// without random effects).
     ///
     /// The comparison runs on the fit's internal standard deviations
     /// `kernel_sd` (`LmmGroupings::kernel_stddevs`): the row norms of the
@@ -1663,9 +1767,14 @@ pub enum Dispersion {
     /// value.
     #[default]
     Default,
-    /// Hold φ at this value (finite, > 0) on Gamma and inverse-Gaussian.
-    /// Ignored by every other family: binomial and Poisson (φ ≡ 1), Gaussian
-    /// (σ² estimated) and negative binomial (θ estimated).
+    /// Hold φ at this value (finite, > 0) on Gamma and inverse-Gaussian; on
+    /// inverse-Gaussian within `[1/MAX_DATA_ABS, MAX_DATA_ABS]`
+    /// ([`MAX_DATA_ABS`](crate::limits::MAX_DATA_ABS)); on Gamma `v/s` within
+    /// [`GAMMA_PHI_LO`](crate::limits::GAMMA_PHI_LO),
+    /// [`GAMMA_PHI_HI`](crate::limits::GAMMA_PHI_HI), with `s` a power of two
+    /// near the geometric mean of the weights (1 without weights). Ignored by
+    /// every other family: binomial and Poisson (φ ≡ 1), Gaussian (σ²
+    /// estimated) and negative binomial (θ estimated).
     Fixed(f64),
 }
 
@@ -1948,10 +2057,8 @@ impl std::error::Error for FitError {}
 /// failures are not errors: they signal through `fit.converged() == false`
 /// with NaN-filled estimates, including the degenerate-data cases. A
 /// rank-deficient design has its aliased columns dropped and the reduced
-/// model fit (`Fit::aliased` flags them, their β/se are NaN), and a design
-/// whose aliased column is ALSO an RE slope (unfittable, since the slope has
-/// no column left to point at) returns all-NaN with `converged()` false
-/// rather than an error.
+/// model fit (`Fit::aliased` flags them, their β/se are NaN). A dropped
+/// column that is also a random slope keeps its random slope.
 ///
 /// # Examples
 ///
@@ -2043,17 +2150,110 @@ fn fit_resolved(
         se_type: Some(se),
         ..opts.clone()
     };
-    match power {
+    let mut fit = match power {
         WeightPower::Estimate => {
-            delta::fit_delta(data, spec, opts, start, opts.reml != Some(false))
+            delta::fit_delta(data, spec, opts, start, opts.reml != Some(false))?
         }
-        WeightPower::Fixed(_) => Ok(fit_checked(data, spec, start, opts)),
+        WeightPower::Fixed(_) => {
+            let mut fit = fit_checked(data, spec, start, opts);
+            fit.weight_power = power_used(data.design.weights, opts);
+            fit
+        }
+    };
+    // Non-integer counts: still fittable (the deviance and score are
+    // continuous in y), but the reported numbers describe a distribution that
+    // assumes integer counts, so R's `glm` warns instead of refusing —
+    // matched here rather than refused. Binomial's count is the derived
+    // successes `y·wᵢ`, not `y` itself. This and the identification notes
+    // read the data alone, so they are computed once per user fit, on the
+    // caller's design, and the aliased re-entry and the δ search skip them.
+    let rows = count_non_integer_response(data.y, spec.family, data.design.weights);
+    if rows > 0 {
+        fit.diagnostics
+            .notes
+            .push(Note::NonIntegerResponse { rows });
     }
+    (fit.diagnostics.notes).extend(common::identification_notes(&data.design, data.y, spec));
+    #[cfg(debug_assertions)]
+    check_shape(&fit);
+    Ok(fit)
 }
 
-/// The fit of [`fit`] and [`fit_with_start`] on inputs [`validate`] accepted.
-/// `pub(crate)` for the callers that refit a model they already know is
-/// valid (the rank-deficiency salvage, the per-term likelihood-ratio refits),
+/// The layout rule of [`Fit`], asserted on every fit a build with debug
+/// assertions makes. Each grouping's `q` is read off its `varcorr` block, so
+/// a block without a random intercept counts its slopes only. A converged
+/// fit's log-likelihood may be infinite (an exact OLS fit) but never NaN.
+#[cfg(debug_assertions)]
+fn check_shape(fit: &Fit) {
+    assert_eq!(
+        fit.varcorr.len(),
+        fit.ranef_levels.len(),
+        "ranef_levels: one level count per varcorr block"
+    );
+    let qs: Vec<usize> = fit.varcorr.iter().map(|b| vech_q(b.len())).collect();
+    for (g, (block, &q)) in fit.varcorr.iter().zip(&qs).enumerate() {
+        assert_eq!(
+            block.len(),
+            q * (q + 1) / 2,
+            "varcorr[{g}]: not a vech length"
+        );
+    }
+    let n_theta: usize = qs.iter().map(|q| q * (q + 1) / 2).sum();
+    let levels_q = || qs.iter().zip(&fit.ranef_levels);
+    assert_eq!(fit.tau2.len(), n_theta, "tau2: one entry per θ coordinate");
+    assert_eq!(
+        fit.stddev_se.len(),
+        n_theta,
+        "stddev_se: one entry per θ coordinate"
+    );
+    let n_ranef: usize = levels_q().map(|(q, l)| l * q).sum();
+    assert_eq!(fit.ranef.len(), n_ranef, "ranef: levels·q per grouping");
+    let pinned = &fit.diagnostics.pinned;
+    assert_eq!(pinned.len(), qs.len(), "pinned: one row per grouping");
+    for (g, (row, &q)) in pinned.iter().zip(&qs).enumerate() {
+        assert_eq!(row.len(), q, "pinned[{g}]: one flag per standard deviation");
+    }
+    let p = fit.beta.len();
+    assert_eq!(
+        fit.diagnostics.aliased.len(),
+        p,
+        "diagnostics.aliased: one flag per column"
+    );
+    assert_eq!(fit.fitted.len(), fit.nobs, "fitted: one entry per row");
+    let n_aliased = fit.diagnostics.aliased.iter().filter(|&&a| a).count();
+    assert_eq!(
+        fit.null_basis.len(),
+        n_aliased * p,
+        "null_basis: one p-wide row per aliased column"
+    );
+    if fit.condvar.is_empty() {
+        assert!(fit.condvar_x.is_empty(), "condvar_x: empty when condvar is");
+        assert!(
+            fit.condvar_cross.is_none(),
+            "condvar_cross: None when condvar is empty"
+        );
+    } else {
+        let n_condvar: usize = levels_q().map(|(q, l)| l * q * (q + 1) / 2).sum();
+        assert_eq!(fit.condvar.len(), n_condvar, "condvar: one vech per level");
+        let n_condvar_x: usize = levels_q().map(|(q, l)| l * q * p).sum();
+        assert_eq!(
+            fit.condvar_x.len(),
+            n_condvar_x,
+            "condvar_x: one q × p block per level"
+        );
+    }
+    assert!(
+        !(fit.diagnostics.converged && fit.loglik.is_nan()),
+        "loglik: NaN on a converged fit"
+    );
+}
+
+/// The fit of [`fit`] and [`fit_with_start`] on inputs [`validate`] accepted,
+/// without the data notes ([`Note::NonIntegerResponse`] and the
+/// identification notes) and with [`Fit::weight_power`] left at the
+/// mapper's default; `fit_resolved` adds both. `pub(crate)` for the callers
+/// that refit a model they already know is valid (the rank-deficiency
+/// salvage, the per-term likelihood-ratio refits, the weight-power probes),
 /// which skip the check.
 pub(crate) fn fit_checked(
     data: &Data<'_>,
@@ -2070,15 +2270,6 @@ pub(crate) fn fit_checked(
         ..
     } = data.design;
     let y = data.y;
-    // Non-integer counts: still fittable (the deviance and score are
-    // continuous in y), but the reported numbers describe a distribution that
-    // assumes integer counts, so R's `glm` warns instead of refusing —
-    // matched here rather than refused. Binomial's count is the derived
-    // successes `y·wᵢ`, not `y` itself. Computed before dispatch so it applies
-    // whether the design later aliases columns or not; attached to the
-    // returned `Fit` below (and, on the aliased path, by the recursive
-    // `fit_checked` call inside `fit_rank_deficient`, which sees the same `y`).
-    let non_integer_response_rows = count_non_integer_response(y, spec.family, weights);
     // Rank-deficiency salvage: drop fixed-effect columns aliased on earlier
     // columns and fit the reduced model (lme4 behavior — NA coefficient, still
     // converges). Path-agnostic: preprocesses the fixed design X before the
@@ -2093,14 +2284,10 @@ pub(crate) fn fit_checked(
         let aliased = detect_aliased(x, n, p);
         if aliased.iter().any(|&a| a) {
             let mut fit = fit_rank_deficient(data, spec, start, opts, &aliased);
-            fit.weight_power = power_used(weights, opts);
+            fit.null_basis = common::null_basis(x, n, p, &aliased);
             return fit;
         }
     }
-    // Random-effect structures the data cannot identify: notes only, on the
-    // same footing as the count above. Past the alias branch, so the reduced
-    // re-entry computes them once, on the reduced design.
-    let identification = common::identification_notes(&data.design, y, spec);
     // A fixed power other than 1 fits on the working weights `w^v`. Applied
     // past the alias branch, so the reduced re-entry applies it once.
     let powered = match (weights, opts.weight_power) {
@@ -2113,6 +2300,8 @@ pub(crate) fn fit_checked(
     // `fit_on` carries none.
     let no_ids = GroupIds::default();
     let mut ws = core::build_workspace(spec, ids.unwrap_or(&no_ids), n, p, opts);
+    // The stable door checks a β start for separation; the loop tier trusts the caller's.
+    ws.check_start_separation();
     let rows = Data {
         design: Design {
             ids: None,
@@ -2123,19 +2312,12 @@ pub(crate) fn fit_checked(
     };
     let view = core::fit_on(&mut ws, &rows, start, opts);
     let mut fit = view.into_fit(&rows, spec, opts);
-    fit.weight_power = power_used(weights, opts);
     // After `into_fit`, which is the last read of the kernel's factor for the
     // fit's own outputs: the pass leaves that factor at its last stencil
     // point (on the shifted response), and nothing reads `ws` after it.
     core::attach_satterthwaite(&mut ws, &mut fit, opts);
     // After the pass, which writes the model df into `coef_df`.
     robust::apply(&mut fit, &opts.se_for.columns(p), opts.se_type, spec);
-    if non_integer_response_rows > 0 {
-        fit.diagnostics.notes.push(Note::NonIntegerResponse {
-            rows: non_integer_response_rows,
-        });
-    }
-    fit.diagnostics.notes.extend(identification);
     fit
 }
 
@@ -2265,9 +2447,7 @@ pub(crate) fn classify_design(sized: &SizedSpec, _nagq: u8) -> Solver {
 #[cfg(feature = "loop_advanced")]
 pub use common::FitDiagnostics;
 pub use common::OuterStop;
-pub(crate) use glm::{
-    nb_count_groups, nb_profile_loglik, nb_saturated_loglik_grouped, NB_THETA_HI, NB_THETA_LO,
-};
+pub(crate) use glm::{nb_count_groups, nb_profile_loglik, nb_saturated_loglik_grouped};
 // Test-only since the GLMM NB coordinate stopped seeding from it (it seeds from
 // `fit_glm_nb`'s θ̂ instead): `fit_glm_nb_capped` calls it inside `glm.rs`, so the
 // only cross-module readers left are the tests that pin it.
@@ -2281,12 +2461,15 @@ pub(crate) use glmm::glm_warm_start_beta;
 // in-envelope design both ways through it.
 #[cfg(test)]
 pub(crate) use glmm::fit_glmm_packed;
+// The test-only GLMM build and the shipped solve, for `src/sparse/fd_margin.rs`.
+#[cfg(all(test, feature = "formula"))]
+pub(crate) use glmm::{fit_glmm_build, run_glmm_on};
 #[cfg(test)]
 pub(crate) use lmm::{fit_mle_noz_pub, fit_mle_sparse_pub};
 
 /// [`fit`]'s fit of a full-rank mixed design from a cold start, returned with
 /// the workspace it ran on, so the caller can read what the fit left there
-/// (`FitWorkspace::lmm_parts`): the profile intervals search on that
+/// (`FitWorkspace::profile_kernel`): the profile intervals search on that
 /// workspace. `data` carries the ids and passed [`validate`]; no
 /// rank-deficiency salvage and no Satterthwaite pass run here.
 pub(crate) fn fit_cold_keep_workspace(

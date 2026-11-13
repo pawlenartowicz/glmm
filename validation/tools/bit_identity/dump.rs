@@ -124,7 +124,7 @@ fn rung_record(spec: &Value, config: &str, rung: u64, nagq: Option<u8>) -> Strin
     // come from `lower_rung` (common.rs) — one lowering, not a re-derivation.
     let (lo, _table, _family, _formula_str) = lower_rung(spec, DIR);
     let mut fit_opts = FitOptions::default();
-    // The weighted rungs check the weights as given (G10).
+    // The weighted rungs check the weights as given.
     fit_opts.weight_power = Some(WeightPower::Fixed(1.0));
     // A no-op on a serial build (`FitOptions::parallel_inner` is only live
     // under the `parallel` Cargo feature; see its doc), so this line is safe

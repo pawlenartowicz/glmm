@@ -6,12 +6,15 @@ use std::panic::{self, AssertUnwindSafe};
 use crate::error::BindError;
 use crate::fns;
 use crate::inputs::Inputs;
+use crate::port::Port;
 use crate::value::{Record, Value};
 
 /// A parameter's default.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DefaultValue {
-    /// No default: the caller must pass it (non-null).
+    /// No default: the caller must pass it (non-null). An option the caller
+    /// must give is declared [`DefaultValue::Null`] instead, so that its
+    /// reader refuses a null or `NA` value in the option's own words.
     Required,
     /// `None` / `NULL`.
     Null,
@@ -86,18 +89,19 @@ static REGISTRY: &[FnSpec] = &[
             req("formula"),
             req("numeric"),
             req("factors"),
-            req("family"),
-            req("link"),
-            req("wald_se"),
-            req("nagq"),
+            opt("family"),
+            opt("link"),
+            opt("wald_se"),
+            opt("nagq"),
             opt("dispersion"),
+            opt("init_theta"),
             opt("weights"),
             opt("offset"),
             opt("warm_start"),
-            req("satterthwaite"),
-            req("condvar"),
+            opt("satterthwaite"),
+            opt("condvar"),
             opt("reml"),
-            def("anova_test", DefaultValue::Str("auto")),
+            opt("anova_test"),
             opt("weight_power"),
             opt("se_type"),
             opt("row_index"),
@@ -112,9 +116,9 @@ static REGISTRY: &[FnSpec] = &[
             req("f1"),
             req("numeric"),
             req("factors"),
-            req("family"),
-            req("link"),
-            req("nagq"),
+            opt("family"),
+            opt("link"),
+            opt("nagq"),
             opt("weights"),
             opt("offset"),
             opt("nsim"),
@@ -133,7 +137,13 @@ static REGISTRY: &[FnSpec] = &[
     },
     FnSpec {
         name: "confint",
-        params: &[req("beta"), req("se"), req("coef_df"), req("level")],
+        params: &[
+            req("beta"),
+            req("se"),
+            req("coef_df"),
+            req("df_method"),
+            req("level"),
+        ],
         run: fns::inference::confint,
     },
     FnSpec {
@@ -166,25 +176,17 @@ static REGISTRY: &[FnSpec] = &[
             opt("record"),
             opt("robust"),
             req("names"),
-            req("factor"),
+            opt("factor"),
             opt("by"),
-            opt("by_values"),
-            req("adjust"),
+            opt("at"),
+            opt("adjust"),
+            req("converged"),
         ],
         run: fns::inference::pairwise,
     },
     FnSpec {
         name: "pairwise_confint",
-        params: &[
-            req("estimate"),
-            req("se"),
-            req("df"),
-            req("p_value"),
-            req("adjust"),
-            req("levels"),
-            opt("ratio"),
-            req("level"),
-        ],
+        params: &[req("table"), req("level")],
         run: fns::inference::pairwise_confint,
     },
     FnSpec {
@@ -209,12 +211,12 @@ static REGISTRY: &[FnSpec] = &[
             opt("new_numeric"),
             opt("new_factors"),
             req("n_rows"),
-            req("scale"),
-            req("population"),
-            req("allow_new_levels"),
-            req("se"),
+            opt("scale"),
+            opt("re_form"),
+            opt("allow_new_levels"),
+            opt("se"),
             req("level"),
-            req("future"),
+            opt("future"),
             opt("row_index"),
             req("row_base"),
         ],
@@ -229,8 +231,8 @@ static REGISTRY: &[FnSpec] = &[
         name: "simulate",
         params: model_data![
             req("parts"),
-            req("nsim"),
-            req("seed"),
+            opt("nsim"),
+            opt("seed"),
             opt("row_index"),
             req("row_base"),
         ],
@@ -316,6 +318,11 @@ static REGISTRY: &[FnSpec] = &[
         run: crate::notes::warning_kind,
     },
     FnSpec {
+        name: "note_kinds",
+        params: &[],
+        run: crate::notes::note_kinds,
+    },
+    FnSpec {
         name: "summary",
         params: &[
             req("fit"),
@@ -336,15 +343,15 @@ pub fn registry() -> &'static [FnSpec] {
 /// (or null) required argument raise `invalid_argument`, an absent or null
 /// optional argument takes its default, and a panic anywhere below comes
 /// back as an `internal` error.
-pub fn call(name: &str, inputs: Record) -> Result<Value, BindError> {
+pub fn call(port: Port, name: &str, inputs: Record) -> Result<Value, BindError> {
     let spec = REGISTRY
         .iter()
         .find(|s| s.name == name)
         .ok_or_else(|| BindError::invalid_argument(format!("unknown function '{name}'")))?;
-    call_spec(spec, inputs)
+    call_spec(port, spec, inputs)
 }
 
-fn call_spec(spec: &FnSpec, mut inputs: Record) -> Result<Value, BindError> {
+fn call_spec(port: Port, spec: &FnSpec, mut inputs: Record) -> Result<Value, BindError> {
     let keys: Vec<&str> = inputs.keys().collect();
     for (i, key) in keys.iter().enumerate() {
         if !spec.params.iter().any(|p| p.name == *key) {
@@ -372,7 +379,7 @@ fn call_spec(spec: &FnSpec, mut inputs: Record) -> Result<Value, BindError> {
             inputs.set(p.name, p.default.to_value());
         }
     }
-    let mut inp = Inputs::new(inputs);
+    let mut inp = Inputs::new(inputs, port);
     match panic::catch_unwind(AssertUnwindSafe(|| (spec.run)(&mut inp))) {
         Ok(r) => r,
         Err(payload) => Err(BindError::internal(format!(
@@ -408,7 +415,7 @@ mod tests {
             params: &[],
             run: boom,
         };
-        let e = call_spec(&spec, Record::new()).unwrap_err();
+        let e = call_spec(Port::Python, &spec, Record::new()).unwrap_err();
         assert_eq!(e.code, "internal");
         assert!(e.message.contains("kaboom"), "{}", e.message);
     }

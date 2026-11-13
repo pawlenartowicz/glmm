@@ -73,8 +73,8 @@ pub mod inference;
 mod linalg;
 mod scalar;
 
-/// The kernels' capacity constants. A limit may grow in a minor release; a
-/// name does not disappear.
+/// The kernels' capacity constants and the input ranges. A limit may grow in
+/// a minor release; a name does not disappear.
 ///
 /// - `MAX_PRIMARY_Q`, `MAX_EXTRA_GROUPINGS`, `MAX_EXTRA_Q` and
 ///   `MAX_CROSSED_LEVELS` bound the dense (no-Z) solver: the primary
@@ -86,9 +86,22 @@ mod scalar;
 /// - `MAX_NAGQ` is a hard limit: the largest adaptive Gauss–Hermite order a
 ///   fit accepts. A larger `FitOptions::nagq` is refused with
 ///   [`FitError::Envelope`].
+/// - Input ranges. `MAX_DATA_ABS` bounds |y|, every |x| and random-effect-only
+///   column entry, and |offset| on a link other than log; weights and an
+///   inverse-Gaussian held dispersion lie in `[1/MAX_DATA_ABS, MAX_DATA_ABS]`.
+///   `MAX_LOG_OFFSET_ABS` bounds |offset| on a log link, and `MAX_TRIALS`
+///   (2⁵³) a binomial weight. `GAMMA_PHI_LO`, `GAMMA_PHI_HI` are the box of the
+///   Gamma dispersion search and `NB_THETA_LO`, `NB_THETA_HI` that of the
+///   negative-binomial shape; a negative-binomial shape seed outside its box
+///   is refused, and so is a Gamma held dispersion outside the Gamma box or
+///   an inverse-Gaussian one outside `[1/MAX_DATA_ABS, MAX_DATA_ABS]`. [`fit`], [`fit_with_start`] and [`predict()`] refuse an input
+///   outside its range before fitting, with the value and the constant's name
+///   in the message.
 pub mod limits {
     pub use crate::consts::{
-        MAX_CROSSED_LEVELS, MAX_EXTRA_GROUPINGS, MAX_EXTRA_Q, MAX_NAGQ, MAX_PRIMARY_Q, MAX_THETA,
+        GAMMA_PHI_HI, GAMMA_PHI_LO, MAX_CROSSED_LEVELS, MAX_DATA_ABS, MAX_EXTRA_GROUPINGS,
+        MAX_EXTRA_Q, MAX_LOG_OFFSET_ABS, MAX_NAGQ, MAX_PRIMARY_Q, MAX_THETA, MAX_TRIALS,
+        NB_THETA_HI, NB_THETA_LO,
     };
 }
 

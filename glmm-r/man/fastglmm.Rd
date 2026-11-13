@@ -74,7 +74,9 @@ but see the fallback note in Details.}
 \code{list(beta =, theta =)} with \code{theta} the random-effect Cholesky vector,
 plus an optional \verb{dispersion =}: the estimated dispersion as a previous
 fit reports it in \code{fit$dispersion} (the shape for negative binomial, phi
-for Gamma), used as the search's starting value. Any element may be left
+for a Gamma model with random effects), used as the search's starting
+value; on any other family, and on a Gamma model without random effects,
+\code{start$dispersion} is ignored with a warning. Any element may be left
 out to cold-start that part.
 \code{theta} is distinct from \code{init.theta}, which is the negative-binomial
 shape (the same slot as \code{start$dispersion} there).}
@@ -190,7 +192,9 @@ power, 1 on the weights as given, \code{NaN} without weights),
 that \link[=predict.fastglmm]{predict()} and the Type II hypotheses read;
 \code{NULL} otherwise), \code{robust} (on a robust fit, the CR2 or HC2 pieces its
 tests read; \code{NULL} otherwise),
-\code{rss}, \code{r_squared} and \code{adj_r_squared} (OLS fits only, \code{NaN} otherwise),
+\code{rss}, \code{r_squared} and \code{adj_r_squared} (OLS fits only, \code{NaN} otherwise;
+both R-squared also \code{NaN} when neither the response nor the fitted
+values vary beyond round-off),
 \code{offset} (the offset fitted with, \code{NULL} without one),
 \code{satterthwaite_record} (what \code{\link[=contrast_test]{contrast_test()}} and \code{\link[=pairwise]{pairwise()}} read on
 a fit whose \code{df_method} is \code{"satterthwaite"}, \code{NULL} on every other fit),
@@ -261,21 +265,24 @@ get is a Laplace fit, and the warning is the only notice. This mirrors the
 Python port so the two ports agree.
 
 \strong{Diagnostic warnings carry a condition class.} Each solver note is raised
-as a warning of class \code{"fastglmm_diagnostic"} with a per-kind subclass
+as a warning of class \code{"fastglmm_diagnostic"} with the per-kind subclass
+\code{"fastglmm_<kind>"}, \code{kind} as in \verb{$warnings}
 (\code{"fastglmm_ill_conditioned"}, \code{"fastglmm_pirls_exhausted"},
 \code{"fastglmm_single_level_grouping_dropped"},
 \code{"fastglmm_few_rows_for_random_effects"}, \code{"fastglmm_repeated_grouping"},
 \code{"fastglmm_slope_constant_within_levels"}, \code{"fastglmm_separated_by_grouping"},
+\code{"fastglmm_one_trial_per_level"},
 \code{"fastglmm_hessian_se_fallback"},
 \code{"fastglmm_se_unavailable"}, \code{"fastglmm_exact_profile_fallback"},
 \code{"fastglmm_gradient_search_fallback"},
 \code{"fastglmm_precision_limited"}, \code{"fastglmm_non_integer_response"}, \code{"fastglmm_rows_dropped_na"},
 \code{"fastglmm_satterthwaite_curvature"}, \code{"fastglmm_variance_at_limit"},
+\code{"fastglmm_dispersion_at_limit"},
+\code{"fastglmm_nb_shape_at_limit"},
 \code{"fastglmm_weight_power_at_bound"}, \code{"fastglmm_weight_power_search_failures"},
 \code{"fastglmm_weight_power_outside_unit"}, \code{"fastglmm_weight_power_implausible"},
 \code{"fastglmm_robust_with_random_slope"}, \code{"fastglmm_robust_se_unidentified"},
-\code{"fastglmm_robust_df_small"}; a note from
-a newer kernel than this package arrives as \code{"fastglmm_unknown_note"};
+\code{"fastglmm_robust_df_small"}, and so on for every note kind;
 \code{\link[=contrast_test]{contrast_test()}}, \code{\link[=pairwise]{pairwise()}} and \link[=predict.fastglmm]{predict()} on a
 robust fit add \code{"fastglmm_model_based_joint_test"} and
 \code{"fastglmm_predict_se_model_based"}),

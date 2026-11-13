@@ -47,7 +47,7 @@ def _rel(got, want):
 
 
 def test_cr2_matches_club_sandwich_on_an_nlme_fit():
-    # G5 on one cell, for the wiring: clubSandwich on nlme's lme at the
+    # One cell, for the wiring: clubSandwich on nlme's lme at the
     # reference's power, to 1e-7. The kernel's tests cover every cell.
     g = _golden("cr2_lme_ri_estimated_s10")
     m = _fit("cr2_ri_s10", _RI, weight_power=g["delta"], se_type="robust", reml=True)
@@ -57,7 +57,7 @@ def test_cr2_matches_club_sandwich_on_an_nlme_fit():
 
 
 def test_claimed_weights_with_robust_se_are_hc2():
-    # G4 on one cell: HC2 and the Bell-McCaffrey df against clubSandwich on
+    # One cell: HC2 and the Bell-McCaffrey df against clubSandwich on
     # lm, to 1e-10.
     g = _golden("hc2_n20")
     m = _fit("hc2_n20", _WLS, weight_power=1, se_type="robust")
@@ -116,7 +116,7 @@ def test_robust_notes_warn_with_their_class_and_text():
 
 
 def test_contrast_test_and_pairwise_read_the_robust_pieces():
-    # D12: a one-row test is the robust t squared on the robust df (on a unit
+    # A one-row test is the robust t squared on the robust df (on a unit
     # vector the fit's own se and coef_df), with the Satterthwaite pass off too;
     # a comparison is the robust contrast of its L; the same after a pickle. A
     # joint test is the model fit's F, with a warning.
@@ -202,8 +202,7 @@ def test_weight_power_search_notes_warn_with_their_class_and_text():
         glmm.WeightPowerAtBoundWarning, match=r"The fitted weight power, .* is not a maximum"
     ):
         glmm.fit(data, "y ~ x", weights=w)
-    # Weights near 1e200 on noise that follows r**-1: the search range narrows
-    # to keep w**delta within 1e+-250, so no fit in the search fails.
+    # Weights near 1e100, the largest allowed: no fit in the weight-power search fails.
     n = 60
     x = rng.uniform(-1, 1, n)
     r = 1e4 ** rng.uniform(0, 1, n)
@@ -211,7 +210,7 @@ def test_weight_power_search_notes_warn_with_their_class_and_text():
     data = {"x": x.tolist(), "y": (1 + 0.5 * x + rng.normal(size=n) * r**-0.5).tolist()}
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        m = glmm.fit(data, "y ~ x", weights=1e200 * r)
+        m = glmm.fit(data, "y ~ x", weights=1e96 * r)
     assert m.converged and np.all(np.isfinite(m.se))
     assert not [w for w in caught if w.category is glmm.WeightPowerSearchFailuresWarning]
 
@@ -271,7 +270,7 @@ def test_robust_refusals_are_value_errors():
 
 
 def test_a_fit_pickled_before_the_robust_fields_reads_power_1_and_the_model_se():
-    # Review focus 5: a 0.8.0 fit has no weight_power, se_type, model_vcov or
+    # A 0.8.0 fit has no weight_power, se_type, model_vcov or
     # robust; it summarizes and tests as the model fit it is.
     m = _fit("cr2_ri_s10", _RI, weight_power=1)
     o = object.__new__(glmm.Fit)
@@ -322,7 +321,7 @@ _DELTA_PAIRS = [
 
 @pytest.mark.parametrize("name,f0,f1", _DELTA_PAIRS)
 def test_anova_of_two_ml_delta_fits_counts_each_power(name, f0, f1):
-    # §3.1c, D6: the likelihood-ratio test on the fixed columns, each side's
+    # The likelihood-ratio test on the fixed columns, each side's
     # fitted power counted in its npar.
     m0, m1 = (_fit(name, f, weight_power="estimate", reml=False) for f in (f0, f1))
     assert m0.estimated_weight_power and m1.estimated_weight_power
@@ -359,7 +358,7 @@ def test_anova_refuses_two_delta_fits_differing_in_their_random_part():
 
 @pytest.mark.parametrize("name,f0,f1", _DELTA_PAIRS)
 def test_compare_fits_the_weight_power_by_ml_on_both_sides(name, f0, f1):
-    # D16: None resolves to the fitted power under compare's own criterion.
+    # None resolves to the fitted power under compare's own criterion.
     data = _data(name)
     w = np.asarray(data["w"])
     with warnings.catch_warnings():

@@ -61,11 +61,12 @@ that always comes with it (exactly one is raised on every non-converged fit):
   evaluation budget before settling. Coefficients, standard errors, the
   covariance matrix, dispersion, `tau2` and `varcorr` are all reported at the
   best point the search found. `stddev_se` is NaN, one entry per vech
-  element, and `fitted` and the random-effect modes stay empty; a GLMM's `df` is 0 (an LMM's is its usual value, since the
+  element, and `fitted` and the random-effect modes are NaN; a GLMM's `df` is 0 (an LMM's is its usual value, since the
   budget stop does not change how many parameters it counted). Nothing checks
   how close that point is to the optimum.
 - **A failed fit** (`fit_failed`, `glm_diverged`, `design_unsolvable`,
-  `constant_response`, `too_few_rows`, `no_coefficients`): the fit stopped on
+  `constant_response`, `too_few_rows`, `no_coefficients`,
+  `dispersion_at_limit`): the fit stopped on
   a degenerate configuration and reports no estimates: every relevant field
   is NaN or empty.
 
@@ -93,10 +94,10 @@ and still end up to about 10 units above its optimum, a relative error of a
 few times 1e-12. A difference of deviances between two such fits, as in a
 likelihood-ratio test, carries the same error.
 
-## NotImplementedError: family/link/knob
+## Quasi-likelihood dispersion: not implemented
 
 One combination has an approved design but no kernel support yet, and
-raises a clean `NotImplementedError` rather than silently falling back to
+raises a clean error (`ValueError`) rather than silently falling back to
 something close: quasi-likelihood `dispersion=` on binomial/Poisson.
 
 `family="inversegaussian"` (fixed-effect GLM only — mixed models fault with a

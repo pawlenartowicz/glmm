@@ -40,8 +40,7 @@
 # glm(family = inverse.gaussian(link = "1/mu^2"))'s default IRLS start
 # (mustart = y) overshoots into eta <= 0 on some seeds ("no valid set of
 # coefficients... please supply starting values"); the shallower slope keeps
-# that fit converging under R's own default start, which is what Step 2 checks
-# and what goldens_agq.R relies on.
+# that fit converging under R's own default start, which is what goldens_agq.R relies on.
 
 rinvgauss_base <- function(n, mu, lambda) {
   # Michael, Schucany & Haas (1976) transform: y0 = chi-square(1), then the

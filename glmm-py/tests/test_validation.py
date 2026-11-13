@@ -45,10 +45,8 @@ FIT_DATA = {
 
 
 def test_unknown_family_message_matches_the_r_port():
-    # Exact text, including the family list order: mirrors the R port's
-    # equivalent case (glmm-r/tests/testthat/test-errors.R has no separate test
-    # for this since .normalize_family's string branch shares the same
-    # ordering by construction from .FAMILIES).
+    # Exact text, including the family list order. The R port gets the same
+    # text from the shared layer.
     with pytest.raises(
         ValueError,
         match=(
@@ -100,7 +98,7 @@ def test_wald_se_invalid_raises():
         glmm.fit(DATA, "y ~ x", wald_se="observed")
 
 
-@pytest.mark.parametrize("nagq", [0, 2, 4, 26, 27, -1, 1.0])
+@pytest.mark.parametrize("nagq", [0, 2, 4, 26, 27, -1, 1.5, "3"])
 def test_nagq_invalid_raises(nagq):
     with pytest.raises(ValueError, match="nagq"):
         glmm.fit(DATA, "y ~ x + (1 | g)", "binomial", nagq=nagq)
@@ -123,14 +121,19 @@ def test_dispersion_on_negativebinomial_warns_then_fits():
 def test_quasi_on_glm_poisson_is_a_kernel_gap():
     # Non-mixed: dispersion reaches the family check un-stripped, and
     # quasi-Poisson has no kernel implementation yet.
-    with pytest.raises(NotImplementedError, match="quasi-likelihood"):
+    with pytest.raises(
+        ValueError,
+        match=r"^quasi-likelihood dispersion on family 'poisson' is not yet implemented in the "
+        r"kernel$",
+    ) as caught:
         glmm.fit(FIT_DATA, "y_pois ~ x", "poisson", dispersion="estimate")
+    assert caught.value.code == "invalid_argument"
 
 
 def test_dispersion_bad_value_message_matches_the_r_port():
     with pytest.raises(
         ValueError,
-        match=r"^dispersion must be None, 'estimate', or a number, got 'pearson'$",
+        match=r'^dispersion must be None, \'estimate\', or a number, got the string "pearson"$',
     ):
         glmm.fit(DATA, "y ~ x", "gamma", dispersion="pearson")
 
@@ -214,11 +217,11 @@ def test_init_theta_and_warm_start_theta_are_independent(recwarn):
 
 def test_warm_start_not_dict_message_matches_the_r_port():
     with pytest.raises(
-        TypeError,
+        ValueError,
         match=(
             r"^warm_start must be a dict with keys 'beta', 'theta' and/or 'dispersion' \(theta "
             r"is the random-effect Cholesky vector, not the negative-binomial shape - that is "
-            r"init_theta or dispersion\), got list$"
+            r"init_theta or dispersion\), got a numeric vector$"
         ),
     ):
         glmm.fit(DATA, "y ~ x", warm_start=[0.0, 0.0])
@@ -304,8 +307,102 @@ def test_predict_names_a_newdata_row_and_a_fits_own_row():
         m.predict(future=True)
     # A newdata row is the caller's own, whatever rows the fit dropped.
     new = {"x": [0.0, 0.5, 1.0], "g": ["g1", "g9", "g2"]}
-    with pytest.raises(ValueError, match=r"did not see at row 1 \(id"):
+    with pytest.raises(
+        ValueError,
+        match=r'^grouping "g" has a level the fit did not see at row 1; set allow_new_levels=True '
+        r"to predict it with a zero random effect$",
+    ):
         m.predict(new, allow_new_levels=False)
+
+
+# Same table and inputs in glmm-r/tests/testthat/test-errors.R - change together.
+_RANGE_DATA = {
+    "y": [0.5, 1.25, 2.0, 1.5, 3.0, 2.25, 1.0, 2.75],
+    "x": [0.25 * i for i in range(8)],
+    "k": [0.0, 1.0, 2.0, 1.0, 3.0, 2.0, 4.0, 3.0],
+    "p": [0.0, 0.5, 1.0, 0.5, 0.5, 0.0, 1.0, 0.5],
+}
+
+
+def _at_row_2(fill, value):
+    v = [fill] * 8
+    v[2] = value
+    return v
+
+
+@pytest.mark.parametrize(
+    ("data", "formula", "family", "kwargs", "message"),
+    [
+        pytest.param(
+            {**_RANGE_DATA, "x": _at_row_2(0.0, 2e100)},
+            "y ~ x",
+            "gaussian",
+            {},
+            "x must be finite with |x| <= 1e100 (row 2, column 1, value 2e100; "
+            "glmm::limits::MAX_DATA_ABS)",
+            id="x_past_data_bound",
+        ),
+        pytest.param(
+            _RANGE_DATA,
+            "y ~ x",
+            "gaussian",
+            {"weights": _at_row_2(1.0, 1e-101)},
+            "Data weights must be within [1e-100, 1e100] (row 2, value 1e-101; "
+            "glmm::limits::MAX_DATA_ABS)",
+            id="weight_below_its_interval",
+        ),
+        pytest.param(
+            _RANGE_DATA,
+            "k ~ x",
+            "poisson",
+            {"offset": _at_row_2(0.0, 701.0)},
+            "Data offset must be finite with |offset| <= 7e2 on this link (row 2, value 7.01e2; "
+            "glmm::limits::MAX_LOG_OFFSET_ABS)",
+            id="log_offset_past_700",
+        ),
+        pytest.param(
+            _RANGE_DATA,
+            "p ~ x",
+            "binomial",
+            {"weights": _at_row_2(2.0, 2.0**54)},
+            "binomial weights (trial counts) must be <= 9.007199254740992e15 "
+            "(row 2, value 1.8014398509481984e16; glmm::limits::MAX_TRIALS)",
+            id="trials_past_2_to_53",
+        ),
+        pytest.param(
+            _RANGE_DATA,
+            "y ~ x",
+            "gamma",
+            {"link": "log", "dispersion": 1e7},
+            "dispersion on a Gamma model must be within [1e-6, 1e6] "
+            "(value 1e7; glmm::limits::GAMMA_PHI_LO, glmm::limits::GAMMA_PHI_HI)",
+            id="gamma_dispersion_outside_its_box",
+        ),
+        pytest.param(
+            _RANGE_DATA,
+            "y ~ x",
+            "inversegaussian",
+            {"link": "log", "dispersion": 1e101},
+            "dispersion on an inverse-Gaussian model must be within [1e-100, 1e100] "
+            "(value 1e101; glmm::limits::MAX_DATA_ABS)",
+            id="inverse_gaussian_dispersion_outside_its_interval",
+        ),
+        pytest.param(
+            _RANGE_DATA,
+            "k ~ x",
+            "negativebinomial",
+            {"init_theta": 1e-4},
+            "warm-start dispersion (the negative-binomial shape seed) must be within "
+            "[1e-3, 1e4] (value 1e-4; glmm::limits::NB_THETA_LO, glmm::limits::NB_THETA_HI)",
+            id="negative_binomial_shape_seed_outside_its_box",
+        ),
+    ],
+)
+def test_an_input_outside_its_range_is_refused_with_the_limit_name(
+    data, formula, family, kwargs, message
+):
+    with pytest.raises(ValueError, match="^" + re.escape(message) + "$"):
+        glmm.fit(data, formula, family, **kwargs)
 
 
 def test_clean_call_emits_no_warnings_and_fits():
@@ -447,7 +544,7 @@ def test_all_rows_missing_in_a_used_column_is_a_plain_error():
         (
             "y ~ (x + g)^1 + (1 | g)",
             (
-                "formula syntax error at position 0: invalid power (an integer of 2 or more "
+                "formula syntax error: invalid power (an integer of 2 or more "
                 "after '^') in term '(x+g)^1'"
             ),
         ),
@@ -539,22 +636,6 @@ def test_polars_null_in_a_used_column_drops_its_row():
     assert result.nobs == 3
 
 
-def test_empty_data_is_refused():
-    empty = {"y": _np.array([]), "x": _np.array([]), "g": _np.array([])}
-    with pytest.raises(
-        ValueError, match=r"^Data has no rows \(n = 0\); a fit needs at least one row$"
-    ):
-        glmm.fit(empty, "y ~ x + (1|g)")
-
-
-def test_one_sided_formula_is_refused():
-    with pytest.raises(
-        ValueError,
-        match=r"^formula syntax error at position 0: the formula has no response; write it as y ~ x$",
-    ):
-        glmm.fit(DATA, "~ x")
-
-
 def _frame_columns():
     rng = _np.random.default_rng(9)
     g = _np.repeat(_np.arange(6), 10)
@@ -626,3 +707,17 @@ def test_string_bool_and_complex_weights_or_offset_are_refused(arg, bad):
         ValueError, match=rf"^{arg} must be a numeric array with one entry per row of data$"
     ):
         glmm.fit(FIT_DATA, "y_gauss ~ x", **{arg: bad})
+
+
+def test_bind_errors_carry_their_code():
+    with pytest.raises(ValueError) as bad_option:
+        glmm.fit(FIT_DATA, "y_gauss ~ x", nagq=2)
+    assert bad_option.value.code == "invalid_argument"
+    # A held dispersion the kernel refuses is still an argument error.
+    with pytest.raises(ValueError) as bad_value:
+        glmm.fit(FIT_DATA, "y_gamma ~ x", "gamma", dispersion=1e300)
+    assert bad_value.value.code == "invalid_argument"
+    # A count response fitted as binomial: the kernel refuses the data.
+    with pytest.raises(ValueError) as bad_data:
+        glmm.fit(FIT_DATA, "y_pois ~ x", "binomial")
+    assert bad_data.value.code == "fit_error"

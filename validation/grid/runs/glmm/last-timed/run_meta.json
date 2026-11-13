@@ -1,11 +1,11 @@
 {
   "engine": "glmm",
-  "engine_version": "0.9.0",
+  "engine_version": "0.9.2",
   "machine": "dell-fedora",
-  "date": "2026-11-08T17:59:31+01:00",
-  "glmm_crate_version": "0.9.0",
-  "glmm_git_rev": "6b0c78a3a109977aaa8c1cd3a9bb8c72a9fd8ce6-dirty",
-  "glmm_tree_hash": "6f795375b2af309fb6fc513fefa9c64e5e11a71f",
+  "date": "2026-11-13T18:47:40+01:00",
+  "glmm_crate_version": "0.9.2",
+  "glmm_git_rev": "d03b74b1f5126521f08dfe6af5ab2ee9b749469a-dirty",
+  "glmm_tree_hash": "146681115d7ba9685eef09a0611807d7e77357e6",
   "subset": "fast",
   "ml": false,
   "timed": 4,
@@ -14,12 +14,12 @@
   "no_turbo": "1",
   "pin_cores": "0",
   "jobs": 1,
-  "loadavg_start": "1.27 1.54 1.78",
+  "loadavg_start": "1.46 1.04 0.93",
   "r_version": "4.5.3",
   "julia_version": "1.12.6",
-  "label": "2026-11-08",
+  "label": "2026-11-13 release 0.9.2",
   "cells": 116,
   "cell_list": [],
   "completed_from": null,
-  "run_name": "2026-11-08_0.9.0_dell-fedora_2026-11-08_2"
+  "run_name": "2026-11-13_0.9.2_dell-fedora_2026-11-13-release-0-9-2"
 }

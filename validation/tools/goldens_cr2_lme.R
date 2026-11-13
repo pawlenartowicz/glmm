@@ -3,7 +3,7 @@
 # `inference_references` entry with `generator = "goldens_cr2_lme.R"`.
 #
 # THE ORACLE IS SACRED. These JSONs are the independent check of the crate's robust
-# fits (gate G5 of spec 2-dcr). On any glmm disagreement, glmm is presumed wrong:
+# fits. On any glmm disagreement, glmm is presumed wrong:
 # never relax a tolerance or edit a reference.
 #
 # A BARE RUN OVERWRITES EVERY REFERENCE IT OWNS. Use VALIDATION_ONLY for anything
@@ -15,7 +15,7 @@
 # prior weight w = the entry's `weights`. `weight_power = "fixed"` fits delta = 1
 # (varFixed on 1 / w); "estimated" fits varPower(form = ~ w), whose power t gives
 # delta = -2 t, the value a glmm fit takes as `weight_power = Fixed(delta)` (the
-# shared delta of G5). Then clubSandwich's coef_test(vcov = "CR2", test =
+# shared delta). Then clubSandwich's coef_test(vcov = "CR2", test =
 # "Satterthwaite"), clustered by the group, one cluster per row on a gls fit. The
 # JSON carries coefficients, beta, se, df, delta, sigma2 and, on lme, tau2. Before
 # writing, the run checks SE and df against tools/cr2/efficiency_lib.R's cr2() at the

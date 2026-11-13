@@ -3,11 +3,11 @@
 \name{glmm_call}
 \alias{glmm_call}
 \title{Run \code{glmm-bind}'s function \code{name} on the named list \code{inputs}. Returns
-\code{list(value)}, or \code{list(error, code, kind)} for the R helper
+\code{list(value)}, or \code{list(error, code)} for the R helper
 \code{.glmm_call()} to raise, so no R error unwinds through Rust frames.}
 \description{
 Run \code{glmm-bind}'s function \code{name} on the named list \code{inputs}. Returns
-\code{list(value)}, or \code{list(error, code, kind)} for the R helper
+\code{list(value)}, or \code{list(error, code)} for the R helper
 \code{.glmm_call()} to raise, so no R error unwinds through Rust frames.
 }
 \keyword{internal}

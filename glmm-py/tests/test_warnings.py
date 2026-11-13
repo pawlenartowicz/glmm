@@ -271,29 +271,24 @@ def test_separated_glmm_stores_glm_diverged_last():
 
 
 def test_glm_whose_first_solve_fails_returns_no_coefficients():
-    # A 5e-324 weight on the only row that tells x1 from x2 makes X'WX singular to
-    # rounding: no step is taken, so no coefficient is reported.
+    # A 1e-100 weight, the smallest allowed, on the only row that tells x1 from x2
+    # makes X'WX singular to rounding: no step is taken, so no coefficient is reported.
     data = {"x1": [1.0, 1.0, 1.0, 1.0], "x2": [0.0, 1.0, 1.0, 1.0], "y": [1.0, 2.0, 3.0, 2.5]}
     with pytest.warns(glmm.DesignUnsolvableWarning):
         m = glmm.fit(
-            data, "y ~ 0 + x1 + x2", "gamma", link="log", weights=np.array([5e-324, 1, 1, 1])
+            data, "y ~ 0 + x1 + x2", "gamma", link="log", weights=np.array([1e-100, 1, 1, 1])
         )
     assert not m.converged
     assert np.all(np.isnan(m.beta))
     assert m.warnings[-1]["kind"] == "design_unsolvable"
 
 
-def test_reciprocal_link_response_out_of_range_names_the_cause():
-    # 1/mu = 1/(1e80 * ...) is below the kernel's 1e-75 bound on the Gamma inverse link.
+def test_reciprocal_link_glmm_fits_a_response_far_out_of_scale():
+    # 1/mu = 1/(1e80 * ...) is below the kernel's 1e-75 bound on the Gamma inverse
+    # link, but the fit runs on the response divided by a power of two near its
+    # mean, so it fits these data as it fits y * 1e-80, the log-likelihood moved
+    # by -n * ln(1e80).
     y = [1e80 * (2.0 + 0.1 * x) for x in _X]
-    with pytest.warns(glmm.GlmDivergedWarning):
-        m = glmm.fit({"x": _X, "y": y}, "y ~ x", "gamma", link="inverse")
-    assert not m.converged
-    assert m.warnings[-1]["kind"] == "glm_diverged"
-    assert "Rescale the response" in m.warnings[-1]["message"]
-    # The GLMM searches on a rescaled response when the cluster means are far
-    # out of scale (src/fit/glmm.rs, `gamma_inverse_units`), so it fits these
-    # data as it fits y * 1e-80, the log-likelihood moved by -n * ln(1e80).
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         m = glmm.fit({"x": _X, "g": _G, "y": y}, "y ~ x + (1 | g)", "gamma", link="inverse")
@@ -443,6 +438,25 @@ def test_port_parity_separated_by_grouping():
     assert printed(entry) in [str(w.message) for w in caught]
 
 
+def test_port_parity_one_trial_per_level():
+    # Same fixture and call in glmm-r/tests/testthat/test-warnings.R - change together.
+    # One 0/1 row per level of id.
+    data = {
+        "x": _X,
+        "id": [f"r{i:02d}" for i in range(20)],
+        "yb": [float((7 * i) % 3 == 0) for i in range(20)],
+    }
+    with pytest.warns(glmm.OneTrialPerLevelWarning) as caught:
+        m = glmm.fit(data, "yb ~ x + (1 | id)", "binomial")
+    entry = only(m, "one_trial_per_level")
+    assert (entry["tier"], entry["title"]) == ("caution", "Variance not identified")
+    assert entry["message"] == (
+        "Every level of 'id' has one binary trial, so its variance is not identified: it "
+        "trades against the fixed effects. Drop this grouping, or aggregate rows."
+    )
+    assert printed(entry) in [str(w.message) for w in caught]
+
+
 def test_mixed_fit_with_every_fixed_column_aliased():
     # Same fixture and call in glmm-r/tests/testthat/test-warnings.R - change together.
     # z is all zero, so it is dropped as aliased and the mixed model has no
@@ -457,6 +471,17 @@ def test_mixed_fit_with_every_fixed_column_aliased():
         "glmm needs at least one fixed effect in a mixed model. Add an intercept or a "
         "predictor."
     )
+
+
+def test_gaussian_mixed_fit_with_every_fixed_column_aliased():
+    # z is all zero, so the mixed model has no fixed effect left, and no
+    # Satterthwaite df to compute.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        m = glmm.fit(IDENT, "y ~ 0 + z + (1 | g)")
+    assert not m.converged
+    assert [w["kind"] for w in m.warnings] == ["no_coefficients"]
+    assert [w.category for w in caught] == [glmm.NoCoefficientsWarning]
 
 
 def test_port_parity_variance_at_limit():
@@ -481,6 +506,34 @@ def test_port_parity_variance_at_limit():
     assert printed(entry) in [str(w.message) for w in caught]
 
 
+def test_port_parity_dispersion_at_limit():
+    # Same fixture and call in glmm-r/tests/testthat/test-warnings.R - change together.
+    # A Gamma response within about 1e-8 of its log-link means: the dispersion
+    # is near 1e-16, below the smallest value the fit searches.
+    gid = [i // 10 for i in range(120)]
+    x = [math.sin(2.3 * i + 0.7) for i in range(120)]
+    b = [0.3 * math.sin(1.9 * g + 0.4) for g in range(12)]
+    e = [math.sqrt(2.0) * math.sin(1.7 * i + 0.3) for i in range(120)]
+    mu = [math.exp(0.5 + 0.3 * x[i] + b[gid[i]]) for i in range(120)]
+    data = {
+        "x": x,
+        "g": [f"g{v}" for v in gid],
+        "y": [mu[i] * (1.0 + 1e-8 * e[i]) for i in range(120)],
+    }
+    with pytest.warns(glmm.DispersionAtLimitWarning) as caught:
+        m = glmm.fit(data, "y ~ x + (1 | g)", "gamma", link="log")
+    assert not m.converged
+    assert [w["kind"] for w in m.warnings] == ["dispersion_at_limit"]
+    entry = only(m, "dispersion_at_limit")
+    assert (entry["tier"], entry["title"]) == ("severe", "Dispersion at its search limit")
+    assert entry["message"] == (
+        "The Gamma dispersion fell below 1e-06, the smallest value the fit searches, so no "
+        "estimates were computed. The response varies less than about 0.1% around the "
+        "fitted means."
+    )
+    assert printed(entry) in [str(w.message) for w in caught]
+
+
 def test_port_parity_rows_dropped_na():
     # Same fixture and call in glmm-r/tests/testthat/test-warnings.R — change
     # together. One NaN in x drops one of four rows.
@@ -500,19 +553,41 @@ def test_port_parity_rows_dropped_na():
 
 def test_degenerate_gaussian_lmm_carries_the_satterthwaite_note():
     # Same fixture and call in glmm-r/tests/testthat/test-warnings.R - change together.
-    # A random slope on an aliased column (x2 = 2x) leaves a NaN-filled fit with no
+    # Three rows for three coefficients (n <= p) leave a NaN-filled fit with no
     # finite end point, so the Satterthwaite pass is recorded as failed.
-    data = dict(MIXED, x2=[2.0 * v for v in _X])
+    data = {
+        "y": [1.0, 2.0, 4.0],
+        "x1": [0.0, 1.0, 3.0],
+        "x2": [1.0, 0.0, 2.0],
+        "g": ["a", "b", "a"],
+    }
     with (
-        pytest.warns(glmm.FitFailedWarning),
+        pytest.warns(glmm.TooFewRowsWarning),
         pytest.warns(glmm.SatterthwaiteCurvatureWarning, match="could not be computed"),
     ):
-        m = glmm.fit(data, "y ~ x + x2 + (1 + x2 | g)")
+        m = glmm.fit(data, "y ~ x1 + x2 + (1 | g)")
     assert not m.converged
     assert m.df_method == "failed"
-    assert [w["kind"] for w in m.warnings] == ["satterthwaite_curvature", "fit_failed"]
+    assert [w["kind"] for w in m.warnings] == ["satterthwaite_curvature", "too_few_rows"]
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        off = glmm.fit(data, "y ~ x + x2 + (1 + x2 | g)", satterthwaite=False)
+        off = glmm.fit(data, "y ~ x1 + x2 + (1 | g)", satterthwaite=False)
     assert off.df_method == "disabled"
-    assert [w["kind"] for w in off.warnings] == ["fit_failed"]
+    assert [w["kind"] for w in off.warnings] == ["too_few_rows"]
+
+
+def test_warm_start_dispersion_on_gaussian_warns_argument_ignored():
+    with pytest.warns(glmm.ArgumentIgnoredWarning) as caught:
+        m = glmm.fit(FIXED, "y ~ x", warm_start={"dispersion": 2.0})
+    entry = only(m, "argument_ignored")
+    assert entry["message"] == "warm_start[\"dispersion\"] is not used for family 'gaussian'."
+    assert printed(entry) in [str(w.message) for w in caught]
+
+
+def test_warm_start_key_that_is_not_a_string_warns_argument_ignored():
+    with pytest.warns(glmm.ArgumentIgnoredWarning):
+        m = glmm.fit(FIXED, "y ~ x", warm_start={1: 2.0})
+    entry = only(m, "argument_ignored")
+    assert entry["message"] == (
+        "warm_start accepts only 'beta', 'theta' and 'dispersion'; these entries were ignored: 1."
+    )

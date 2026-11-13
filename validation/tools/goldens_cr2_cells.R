@@ -1,5 +1,5 @@
 #!/usr/bin/env Rscript
-# The weights-of-trust cells, regenerated -> validation/goldens/inference/cr2/f1_reps.json
+# The cells of an earlier weighted-fit simulation study, regenerated -> validation/goldens/inference/cr2/f1_reps.json
 # (the `f1_reps` entry of the manifest's `inference_references` block) and
 # validation/data/inference/dcr_cells/<cell>.csv (its `designs`).
 #

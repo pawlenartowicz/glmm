@@ -7,17 +7,19 @@
 //! on the diagonal, a correlation below it (lme4's θ order within a term); then
 //! the residual SD σ. All are in the caller's units. A vector `v` maps to the
 //! kernel's θ̃ through the relative covariance: with `s` the prior-weight scale
-//! the kernel runs under ([`LmmWorkspace::weight_scale`]), the kernel's
-//! residual variance is `σ_int² = σ²/s`, and each block's `Σ = D·R·D` divided
-//! by `σ_int²` is factored by [`semidef_lower_chol`] (trace floor). A factor
-//! that does not reproduce that matrix to `1e-8·tr` means `R` is not positive
-//! semidefinite, and the point is infeasible. The factor, packed as the
-//! caller's θ, goes onto the fitted design through
-//! [`LmmGroupings::theta_caller_to_design`], structural entries zeroed. With
+//! and `c` the response scale the kernel runs under ([`Units`]), the kernel's
+//! residual variance is `σ_int² = σ²/(s·c²)`, its blocks' covariances are the
+//! caller's over `c²`, and each block's `Σ = D·R·D` divided by `σ²/s` is
+//! moved onto the fitted design (`Σ̃ = M⁻¹·Σ·M⁻ᵀ`, `M` the map
+//! `crate::lmm::re_map` documents as `N`) and factored there by
+//! [`semidef_lower_chol`] (trace floor). A factor that does not reproduce
+//! `Σ̃` to `1e-8·tr` means `R` is not positive semidefinite, and the point is
+//! infeasible. The factor, packed, is the kernel's θ̃, structural entries
+//! zeroed. With
 //! `d_p = kernel.deviance(θ̃)` (ML, σ profiled), `σ̂² = kernel.sigma_sq()` and
 //! `N` the kernel's rows, the ML deviance at the given σ is
 //! `d_p + N·(ln(σ_int²/σ̂²) + σ̂²/σ_int² − 1)`, from
-//! `ln|L|² + N·ln σ² + r²/σ²` with `r² = N·σ̂²`.
+//! `ln|L|² + N·ln σ² + r²/σ²` with `r² = N·σ̂²`, on the kernel's scale.
 //!
 //! **Coefficients.** At any θ̃ the penalized residual sum of squares is
 //! `r² + (β − β̂)ᵀA(β − β̂)`, so with `β_j = b` and the other coefficients free
@@ -25,7 +27,9 @@
 //! factor the evaluation leaves, as the Satterthwaite pass reads `C`: row `j`
 //! of `M = B·U⁻¹` ([`caller_map_into`]) gives `β̂_j = M_j·β̃` (β̃ by the
 //! backward solve on `X̃`) and `Var_j = σ̂²·‖L̃⁻¹M_jᵀ‖²`. The ML deviance
-//! profiled over σ and `β_{−j}` is then `d_p + N·ln(1 + (b − β̂_j)²/(N·Var_j))`.
+//! profiled over σ and `β_{−j}` is then `d_p + N·ln(1 + (b − β̂_j)²/(N·Var_j))`,
+//! all three on the kernel's scale: a caller's `b` is held as `b/c − (B·δ̃)_j`
+//! (`Units`, which maps the kernel's β to the caller's as `c·(B·β̃ + B·δ̃)`).
 //! A coefficient needs no refit with its column dropped, which the kernel could
 //! not run on an intercept-only model (it refuses `p == 0`).
 //!
@@ -37,9 +41,9 @@
 //! scaled units `u = v/c`: `c` is the estimate for a positive SD and for σ,
 //! `σ̂` for an SD estimated at 0, and 1 for a correlation. An SD's box is
 //! `u ∈ [0, THETA_HI·max(1, σ̂_int/(s·c))]`: in caller units at least the fit's
-//! own box for that row, `THETA_HI·σ̂_int/s` (`σ̂_int` the kernel's residual SD,
-//! the scale `Fit::varcorr` turns θ̃ into SDs by, `s` the standardization
-//! scale of the row's column, 1 on an intercept), so a small SD the fit did not
+//! own box for that row, `THETA_HI·σ̂_int/s` (`σ̂_int` the scale `Fit::varcorr`
+//! turns θ̃ into SDs by, the kernel's residual SD times the response scale,
+//! `s` the standardization scale of the row's column, 1 on an intercept), so a small SD the fit did not
 //! pin can still grow while another parameter is held, and never narrower than
 //! `[0, THETA_HI]` in `u`, so the estimate is inside it. σ's box is
 //! `[1/THETA_HI, THETA_HI]` in scaled units and a correlation's `[−1, 1]`.
@@ -54,15 +58,16 @@ use super::re_map::{pack_vech, semidef_lower_chol, PivotFloor};
 use super::satterthwaite::caller_map_into;
 use super::{warm_bobyqa, Criterion, LmmGroupings, LmmKernel, LmmWorkspace, THETA_HI};
 use crate::fit::varcorr_block;
+use crate::inference::profile::ProfileParam;
 use crate::optim::{bobyqa_minimize, ValueFn};
-use crate::standardize::ColumnScaling;
+use crate::standardize::{ColumnScaling, Units};
 
-/// One lme4-scale variance coordinate. `block` is the grouping in kernel slot
-/// order (see `Perm`): the kernel's primary first, then its extras; `row` and
-/// `col` index the block's columns in θ's layout (a block without an intercept
-/// keeps its idle column 0); `theta_index` is the entry's slot in θ.
+/// One lme4-scale variance coordinate. `block` is the kernel's slot: its
+/// primary first, then its extras; `row` and `col` index the block's columns
+/// in θ's layout (a block without an intercept keeps its idle column 0);
+/// `theta_index` is the entry's slot in θ.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) enum VarCoord {
+enum VarCoord {
     /// The SD of column `row`.
     Sd {
         block: usize,
@@ -83,12 +88,16 @@ pub(crate) enum VarCoord {
 /// The coordinates and where they sit in θ.
 struct Layout {
     coords: Vec<VarCoord>,
+    /// Each coordinate's label, in declaration order.
+    params: Vec<ProfileParam>,
     /// Per θ entry, its coordinate in `coords`; `None` at a structural entry.
     slot: Vec<Option<usize>>,
     /// Block widths `q`, θ order.
     blocks: Vec<usize>,
-    /// `s` of `σ_int² = σ²/s`.
+    /// `s` of the caller's `σ²/s` the blocks' covariances are divided by.
     weight_scale: f64,
+    /// `d = s·c²` of `σ_int² = σ²/d` (`Units::dispersion_scale`).
+    dispersion_scale: f64,
 }
 
 /// The buffers of one map from `v` to θ̃: a block's matrix and its factor
@@ -96,16 +105,14 @@ struct Layout {
 struct CholScratch {
     sig: Vec<f64>,
     lam: Vec<f64>,
-    remap: Vec<f64>,
 }
 
 impl CholScratch {
-    fn new(lay: &Layout, g: &LmmGroupings) -> Self {
+    fn new(lay: &Layout) -> Self {
         let q = lay.blocks.iter().copied().max().unwrap_or(1);
         CholScratch {
             sig: vec![0.0; q * q],
             lam: vec![0.0; q * q],
-            remap: vec![0.0; g.re_map_scratch_len()],
         }
     }
 }
@@ -119,6 +126,8 @@ fn vech_at(q: usize, r: usize, c: usize) -> usize {
 pub(crate) struct ProfileKernel<'a> {
     ws: &'a mut LmmWorkspace,
     map: &'a ColumnScaling,
+    /// The units the fit's rows were accumulated in, for a held coefficient.
+    units: &'a Units,
     lay: Layout,
     /// The lme4-scale estimate, the units `c` of the scaled search and its box.
     est: Vec<f64>,
@@ -147,9 +156,15 @@ pub(crate) struct ProfileKernel<'a> {
 
 impl<'a> ProfileKernel<'a> {
     /// Over the workspace an ML fit just left at θ̂; `map` is the column
-    /// standardization its rows were accumulated under. Evaluates the deviance
-    /// at θ̂ once.
-    pub(crate) fn new(ws: &'a mut LmmWorkspace, map: &'a ColumnScaling) -> ProfileKernel<'a> {
+    /// standardization its rows were accumulated under, and `group_of_slot[b]`
+    /// the declared grouping of kernel slot `b`. Evaluates the deviance at θ̂
+    /// once.
+    pub(crate) fn new(
+        ws: &'a mut LmmWorkspace,
+        map: &'a ColumnScaling,
+        units: &'a Units,
+        group_of_slot: &[usize],
+    ) -> ProfileKernel<'a> {
         debug_assert_eq!(
             ws.kernel.criterion(),
             Criterion::Ml,
@@ -160,46 +175,65 @@ impl<'a> ProfileKernel<'a> {
             let blocks: Vec<usize> = std::iter::once(g.primary_q)
                 .chain(g.extra_q.iter().copied())
                 .collect();
+            debug_assert_eq!(group_of_slot.len(), blocks.len());
             let structural = g.structural_theta();
             let mut coords = Vec::new();
+            let mut params = Vec::new();
             let mut slot = vec![None; g.n_theta()];
             let mut t = 0usize;
             for (block, &q) in blocks.iter().enumerate() {
+                let (group, h) = (group_of_slot[block], usize::from(g.hidden[block]));
                 for col in 0..q {
                     for row in col..q {
                         if structural.binary_search(&t).is_err() {
                             slot[t] = Some(coords.len());
-                            coords.push(if row == col {
-                                VarCoord::Sd {
+                            // A block without an intercept reports without its
+                            // idle column 0.
+                            if row == col {
+                                coords.push(VarCoord::Sd {
                                     block,
                                     row,
                                     theta_index: t,
-                                }
+                                });
+                                params.push(ProfileParam::Sd {
+                                    group,
+                                    term: row - h,
+                                });
                             } else {
-                                VarCoord::Cor {
+                                coords.push(VarCoord::Cor {
                                     block,
                                     row,
                                     col,
                                     theta_index: t,
-                                }
-                            });
+                                });
+                                params.push(ProfileParam::Cor {
+                                    group,
+                                    row: row - h,
+                                    col: col - h,
+                                });
+                            }
                         }
                         t += 1;
                     }
                 }
             }
             coords.push(VarCoord::Sigma);
+            params.push(ProfileParam::Sigma);
             Layout {
                 coords,
+                params,
                 slot,
                 blocks,
-                weight_scale: ws.weight_scale,
+                weight_scale: units.s(),
+                dispersion_scale: units.dispersion_scale(),
             }
         };
 
         let theta_hat = ws.theta.clone();
         let dev_hat = ws.kernel.deviance(&theta_hat);
         let sigma_int_sq = ws.kernel.sigma_sq();
+        // The kernel's σ̂² as `Fit::varcorr` reads it (times `c²`).
+        let sigma_var = sigma_int_sq * units.var_scale();
         let n = ws.kernel.n_rows() as f64;
         let p = ws.recovery.betas.len();
         let mut m = Mat::zeros(p, p);
@@ -212,7 +246,7 @@ impl<'a> ProfileKernel<'a> {
         let mut cur = 0usize;
         for (b, &q) in lay.blocks.iter().enumerate() {
             let len = q * (q + 1) / 2;
-            let vc = varcorr_block(&theta_hat[cur..cur + len], q, sigma_int_sq, g, b, map);
+            let vc = varcorr_block(&theta_hat[cur..cur + len], q, sigma_var, g, b, map);
             for col in 0..q {
                 for row in col..q {
                     let Some(i) = lay.slot[cur + vech_at(q, row, col)] else {
@@ -231,12 +265,12 @@ impl<'a> ProfileKernel<'a> {
             }
             cur += len;
         }
-        let sigma_hat = (sigma_int_sq * ws.weight_scale).sqrt();
+        let sigma_hat = (sigma_int_sq * units.dispersion_scale()).sqrt();
         est[nc - 1] = sigma_hat;
 
         // The residual scale `Fit::varcorr` turns θ̃ into caller SDs by (the
-        // kernel's σ̂_int, without the weight scale).
-        let sigma_unit = sigma_int_sq.sqrt();
+        // kernel's σ̂_int times `c`, without the weight scale).
+        let sigma_unit = sigma_var.sqrt();
         let (mut unit, mut lower, mut upper) = (vec![1.0; nc], vec![0.0; nc], vec![0.0; nc]);
         for (i, c) in lay.coords.iter().enumerate() {
             (unit[i], lower[i], upper[i]) = match *c {
@@ -254,7 +288,7 @@ impl<'a> ProfileKernel<'a> {
             };
         }
 
-        let chol = CholScratch::new(&lay, g);
+        let chol = CholScratch::new(&lay);
         let structural = g.structural_theta().to_vec();
         ProfileKernel {
             theta_buf: vec![0.0; theta_hat.len()],
@@ -277,13 +311,19 @@ impl<'a> ProfileKernel<'a> {
             lay,
             ws,
             map,
+            units,
         }
     }
 
-    /// lme4-scale coordinates: blocks in θ order, structural entries left out,
-    /// then σ.
-    pub(crate) fn coords(&self) -> &[VarCoord] {
-        &self.lay.coords
+    /// The kernel's coordinates in coordinate order (blocks in θ order,
+    /// structural entries left out, then σ), labelled in declaration order.
+    pub(crate) fn params(&self) -> &[ProfileParam] {
+        &self.lay.params
+    }
+
+    /// The kernel's rows `N`.
+    pub(crate) fn n_rows(&self) -> f64 {
+        self.n
     }
 
     /// The lme4-scale vector (caller units) at the fit's θ̂ and σ̂. A
@@ -296,7 +336,7 @@ impl<'a> ProfileKernel<'a> {
     #[cfg(test)]
     pub(crate) fn theta_of(&self, v: &[f64], theta: &mut [f64]) -> bool {
         let g = self.ws.kernel.groupings();
-        let mut chol = CholScratch::new(&self.lay, g);
+        let mut chol = CholScratch::new(&self.lay);
         theta_into(g, self.map, &self.lay, v, theta, &mut chol)
     }
 
@@ -316,6 +356,7 @@ impl<'a> ProfileKernel<'a> {
     /// [`beta_dev`] on the kernel's parts.
     #[cfg(test)]
     pub(crate) fn beta_deviance(&mut self, theta: &[f64], j: usize, b: f64) -> f64 {
+        let b = self.beta_in(j, b);
         beta_dev(
             &mut self.ws.kernel,
             &self.m,
@@ -326,6 +367,11 @@ impl<'a> ProfileKernel<'a> {
             j,
             b,
         )
+    }
+
+    /// A caller's value `b` of coefficient `j` on the kernel's scale.
+    fn beta_in(&self, j: usize, b: f64) -> f64 {
+        b / self.units.beta_scale() - self.units.shift_caller(j)
     }
 
     /// Minimum of the ML deviance at `v` ([`var_dev`]) with coordinate `k`
@@ -382,6 +428,7 @@ impl<'a> ProfileKernel<'a> {
     /// `start` is a full θ̃ (structural entries ignored); it returns the
     /// argmin. Returns `(deviance, converged)`.
     pub(crate) fn hold_beta(&mut self, j: usize, b: f64, start: &mut [f64]) -> (f64, bool) {
+        let b = self.beta_in(j, b);
         let config = self.ws.config;
         let n_free = self.ws.kernel.groupings().n_free_theta();
         let mut slot = self.ws.solver_warm.take();
@@ -436,9 +483,9 @@ fn theta_into(
     if !(sigma.is_finite() && sigma > 0.0) {
         return false;
     }
-    let sigma_int_sq = sigma * sigma / lay.weight_scale;
+    let sigma_s_sq = sigma * sigma / lay.weight_scale;
     let mut cur = 0usize;
-    for &q in &lay.blocks {
+    for (b, &q) in lay.blocks.iter().enumerate() {
         let read = |r: usize, c: usize| lay.slot[cur + vech_at(q, r, c)].map(|i| v[i]);
         let sd = |r: usize| read(r, r).unwrap_or(0.0);
         let (sig, lam) = (&mut chol.sig[..q * q], &mut chol.lam[..q * q]);
@@ -452,9 +499,40 @@ fn theta_into(
                 if !(-1.0..=1.0).contains(&rho) {
                     return false;
                 }
-                sig[r * q + c] = sd_r * sd(c) * rho / sigma_int_sq;
+                sig[r * q + c] = sd_r * sd(c) * rho / sigma_s_sq;
             }
-            sig[r * q + r] = sd_r * sd_r / sigma_int_sq;
+            sig[r * q + r] = sd_r * sd_r / sigma_s_sq;
+        }
+        // Factored on the fitted design, Σ̃ = N⁻¹·Σ·N⁻ᵀ, where the columns are
+        // commensurate: in the caller's units a slope column's scale (and
+        // its centering shift) can put the intercept's diagonal below the
+        // trace floor `q·eps·tr Σ` and cut a real direction. `N⁻¹·M` is row
+        // r × sᵣ, then row 0 += (mᵣ/sᵣ)·row r, as in
+        // `LmmGroupings::lambda_caller_to_design`; applied, transposed,
+        // applied again and transposed back, it gives both sides.
+        for r in 0..q {
+            for c in r + 1..q {
+                sig[r * q + c] = sig[c * q + r];
+            }
+        }
+        for _ in 0..2 {
+            for r in 1..q {
+                let s = g.block_std(b, r, map).1;
+                for c in 0..q {
+                    sig[r * q + c] *= s;
+                }
+            }
+            for r in 1..q {
+                let sh = g.block_std(b, r, map).0;
+                for c in 0..q {
+                    sig[c] += sh * sig[r * q + c];
+                }
+            }
+            for r in 0..q {
+                for c in r + 1..q {
+                    sig.swap(r * q + c, c * q + r);
+                }
+            }
         }
         semidef_lower_chol(sig, q, lam, PivotFloor::Trace);
         let trace: f64 = (0..q).map(|r| sig[r * q + r]).sum();
@@ -471,7 +549,6 @@ fn theta_into(
         pack_vech(lam, q, &mut theta[cur..cur + len]);
         cur += len;
     }
-    g.theta_caller_to_design(theta, &mut chol.remap, map);
     g.zero_structural(theta);
     true
 }
@@ -492,7 +569,7 @@ fn var_dev(
     let dev = kernel.deviance(theta);
     let sigma = v[lay.coords.len() - 1];
     // `ln(σ_int²/σ̂²) + σ̂²/σ_int² − 1 = x − ln(1 + x)`, `x = σ̂²/σ_int² − 1`.
-    let x = kernel.sigma_sq() * lay.weight_scale / (sigma * sigma) - 1.0;
+    let x = kernel.sigma_sq() * lay.dispersion_scale / (sigma * sigma) - 1.0;
     let d = dev + kernel.n_rows() as f64 * (x - x.ln_1p());
     if d.is_finite() {
         d
@@ -502,7 +579,8 @@ fn var_dev(
 }
 
 /// ML deviance at θ̃ `theta` profiled over σ and every coefficient but
-/// `j`, which is held at `b` (caller units); `+∞` on failure. `beta` and `w`
+/// `j`, which is held at `b` (kernel units, [`ProfileKernel::beta_in`]);
+/// `+∞` on failure. `beta` and `w`
 /// are length-`p` scratch.
 #[allow(clippy::too_many_arguments)] // the kernel, M and the two buffers, split off the profile
 fn beta_dev(

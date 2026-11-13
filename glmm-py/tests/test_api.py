@@ -26,6 +26,7 @@ def test_module_surface():
         "ConstantResponseWarning",
         "DesignUnsolvableWarning",
         "DiagnosticWarning",
+        "DispersionAtLimitWarning",
         "ExactProfileFallbackWarning",
         "FewRowsForRandomEffectsWarning",
         "Fit",
@@ -35,10 +36,12 @@ def test_module_surface():
         "HessianSeFallbackWarning",
         "IllConditionedWarning",
         "ModelBasedJointTestWarning",
+        "NbShapeAtLimitWarning",
         "NbShapeUnsettledWarning",
         "NewGroupingLevelsWarning",
         "NoCoefficientsWarning",
         "NonIntegerResponseWarning",
+        "OneTrialPerLevelWarning",
         "PairwiseTable",
         "PirlsExhaustedWarning",
         "PrecisionLimitedWarning",
@@ -49,6 +52,7 @@ def test_module_surface():
         "RobustSeUnidentifiedWarning",
         "RobustWithRandomSlopeWarning",
         "RowsDroppedWarning",
+        "RowsNotEstimableWarning",
         "SatterthwaiteCurvatureWarning",
         "SeUnavailableWarning",
         "SearchLimitWarning",
@@ -212,10 +216,13 @@ def test_reml_false_on_a_gaussian_mixed_model_fits_by_ml():
     assert np.all(m.coef_df <= m.nobs)
 
 
-@pytest.mark.parametrize("value", [1, 0, 1.0, np.int64(1), "no"])
-def test_reml_must_be_none_or_a_bool(value):
-    msg = re.escape(f"reml must be None, True or False, got {value!r}")
-    with pytest.raises(TypeError, match=msg):
+@pytest.mark.parametrize(
+    ("value", "shown"),
+    [(1, "1"), (0, "0"), (1.0, "1"), (np.int64(1), "1"), ("no", 'the string "no"')],
+)
+def test_reml_must_be_none_or_a_bool(value, shown):
+    msg = re.escape(f"reml must be None, True or False, got {shown}")
+    with pytest.raises(ValueError, match=f"^{msg}$"):
         glmm.fit(REML_DATA, "y ~ x", reml=value)
 
 
@@ -390,3 +397,11 @@ def test_profile_confint_refuses_what_it_cannot_profile():
         ValueError, match="profile intervals need a Gaussian model with random effects"
     ):
         poisson.profile_confint()
+
+
+def test_categories_cover_every_note_kind():
+    # `separated` raises nothing: a fit that did not converge folds it into
+    # its failure warning.
+    kinds = glmm._native.call("note_kinds", {})
+    missing = [k for k in kinds if k != "separated" and k not in glmm._CATEGORIES]
+    assert missing == []

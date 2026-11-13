@@ -356,6 +356,10 @@ jobs:
   # comparisons of a fixed call list through the same three front ends, with
   # the same R dependencies.
   #
+  # A third step, the input port gate, runs one list of inputs through the
+  # Python and R ports' own data conversion and fails on any difference in
+  # what they accept or refuse, their messages and their warnings.
+  #
   # This is the one job that builds the `validation` crate.
   port-gate:
     name: port-gate (Rust vs Python vs R)
@@ -441,3 +445,18 @@ jobs:
           Rscript validation/tools/anova_ports/anova_ports.R > "$out/r.jsonl"
           Rscript validation/tools/anova_ports/compare_anova_ports.R \
             "$out/rust.jsonl" "$out/python.jsonl" "$out/r.jsonl"
+      - name: Input port gate
+        # One fixed list of inputs (validation/tools/input_ports/inputs.json)
+        # through the Python and R ports' own data conversion: numpy scalars
+        # against R integers, a non-string column name, subset= with an NA, an
+        # NA in weights= and offset=, an interaction slope. Each input is
+        # accepted or refused, with its refusal message and its warnings; any
+        # difference between the ports fails, and so does a count of compared
+        # inputs other than the list's. Runs when the steps above fail too.
+        if: ${{ !cancelled() && steps.fastglmm.outcome == 'success' }}
+        run: |
+          out="$RUNNER_TEMP/input_ports"
+          mkdir -p "$out"
+          glmm-py/venv/bin/python validation/tools/input_ports/input_ports.py > "$out/python.jsonl"
+          Rscript validation/tools/input_ports/input_ports.R > "$out/r.jsonl"
+          Rscript validation/tools/input_ports/compare_input_ports.R "$out/python.jsonl" "$out/r.jsonl"

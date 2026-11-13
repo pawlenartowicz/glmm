@@ -6,17 +6,23 @@
 //! because every estimator's dispatch needs at least one of these.
 
 use std::borrow::Cow;
+use std::collections::{BTreeSet, HashMap};
+use std::hash::Hash;
 
 use faer::Mat;
 
+use crate::consts::{
+    GAMMA_PHI_HI, GAMMA_PHI_LO, MAX_DATA_ABS, MAX_LOG_OFFSET_ABS, MAX_TRIALS, NB_THETA_HI,
+    NB_THETA_LO,
+};
 use crate::inference::Objective;
 use crate::lmm::Criterion;
-use crate::spec::set_term_slopes;
+use crate::spec::{remap_slopes, set_term_slopes};
 use crate::standardize::ColumnScaling;
 
 use crate::{
-    ColumnId, Data, Design, Family, GroupIds, Grouping, GroupingRelation, ModelSpec, ReStructure,
-    ReTerm, StartValues,
+    ColumnId, Data, Design, Family, GroupIds, GroupingRelation, ModelSpec, ReStructure, ReTerm,
+    StartValues,
 };
 
 use super::{
@@ -201,8 +207,7 @@ impl FitDiagnostics {
 
 /// Translate a route's carrier into the public [`Diagnostics`]. Cold path only
 /// (the loop tier reads the carrier directly), so the two `Vec`s below are
-/// affordable — but both stay empty on a clean fit, which keeps a `Fit`
-/// materialized from a clean draw cheap.
+/// affordable; `notes` stays empty on a clean fit.
 ///
 /// `varcorr` is the block layout the caller has already assembled — see
 /// [`pinned_flags`] for why it is the only thing that can place the bits.
@@ -293,6 +298,20 @@ pub(super) fn note_theta_at_limit(diagnostics: &mut Diagnostics, theta: &[f64], 
     }
 }
 
+/// Flag a negative-binomial shape on a limit of its search range: θ̂ within
+/// 1e-6 of [`NB_THETA_LO`] or [`NB_THETA_HI`] on the log scale
+/// (the relative tolerance of [`note_theta_at_limit`]) pushes
+/// [`Note::NbShapeAtLimit`] carrying that limit. A NaN θ matches neither.
+/// Called by the NB GLM on a converged fit and by the GLMM view mapper on an
+/// NB fit with a finite endpoint.
+pub(super) fn note_nb_shape_at_limit(diagnostics: &mut Diagnostics, theta: f64) {
+    for limit in [NB_THETA_LO, NB_THETA_HI] {
+        if (theta.ln() - limit.ln()).abs() <= 1e-6 {
+            diagnostics.notes.push(Note::NbShapeAtLimit { limit });
+        }
+    }
+}
+
 /// Reshape a `diagonal_theta`-ordered pin bitmask into [`Diagnostics::pinned`]'s
 /// varcorr-aligned flags. Single source for that placement: every route reaches
 /// it through [`materialize_diagnostics`], which each of the four view mappers
@@ -307,16 +326,10 @@ pub(super) fn note_theta_at_limit(diagnostics: &mut Diagnostics, theta: &[f64], 
 /// same inversion [`Fit::stddev_corr`] uses, so `pinned[g][i]` and
 /// `stddev_corr(g).0[i]` cannot drift apart.
 ///
-/// Mask 0 ⇒ no grid: on every success path this function is fed the fitting
-/// route's real pin mask, carried in from the view mapper through
-/// [`materialize_diagnostics`], so mask 0 here means the fit genuinely pinned
-/// nothing — never a route declining to say. The short-circuit itself is a memory choice, not a
-/// meaning: a warm loop over draws that never pin allocates no grid of
-/// `false` per draw for saying so.
+/// One row per `varcorr` block whatever the mask, all `false` at mask 0, so
+/// the grid has the layout of every other per-grouping field; no blocks (a
+/// fit without random effects) gives no rows.
 pub(crate) fn pinned_flags(mask: u64, varcorr: &[Vec<f64>]) -> Vec<Vec<bool>> {
-    if mask == 0 {
-        return vec![];
-    }
     let mut k = 0usize;
     varcorr
         .iter()
@@ -544,6 +557,37 @@ pub(crate) fn ranef_level_counts(g: &crate::lmm::LmmGroupings) -> Vec<usize> {
     counts
 }
 
+/// Reported `q` per block, in the order of [`ranef_level_counts`]: a hidden
+/// column 0 (a block without a random intercept) is not reported.
+fn reported_q(g: &crate::lmm::LmmGroupings) -> impl Iterator<Item = usize> + '_ {
+    std::iter::once(g.primary_q)
+        .chain(g.extra_q.iter().copied())
+        .zip(&g.hidden)
+        .map(|(q, &hidden)| q - usize::from(hidden))
+}
+
+/// [`Fit::varcorr`] with no estimate: one all-NaN vech per block.
+pub(crate) fn nan_varcorr(g: &crate::lmm::LmmGroupings) -> Vec<Vec<f64>> {
+    reported_q(g)
+        .map(|q| vec![f64::NAN; q * (q + 1) / 2])
+        .collect()
+}
+
+/// `Fit::tau2` or `Fit::stddev_se` with no estimate: `Σ q(q+1)/2` NaN.
+pub(crate) fn nan_theta(g: &crate::lmm::LmmGroupings) -> Vec<f64> {
+    vec![f64::NAN; reported_q(g).map(|q| q * (q + 1) / 2).sum()]
+}
+
+/// [`Fit::ranef`] with no estimate: `Σ levels·q` NaN.
+pub(crate) fn nan_ranef(g: &crate::lmm::LmmGroupings) -> Vec<f64> {
+    let len = ranef_level_counts(g)
+        .iter()
+        .zip(reported_q(g))
+        .map(|(levels, q)| levels * q)
+        .sum();
+    vec![f64::NAN; len]
+}
+
 /// [`Fit::ranef`] from the DENSE GLMM workspace's spherical modes `u`
 /// (blocked/structured layout: primary block level-major `lvl·q_p + c`, then each
 /// extra's scalar indicator columns at its absolute `extra_offsets[e]` — this
@@ -760,6 +804,7 @@ pub(crate) fn assemble_condvar_cross(
         coupling_at: Vec::with_capacity(kernel.coupling_at.len()),
         coupling_cols: Vec::with_capacity(kernel.coupling_cols.len()),
         coupling: Vec::with_capacity(kernel.coupling_cols.len() * wr),
+        nested_slots: Vec::new(),
     };
     // `ma = D_f·(A⁻¹)_ff`, reported rows × kernel columns, then times `D_fᵀ`.
     let mut ma = vec![0.0f64; wr * w];
@@ -913,23 +958,42 @@ pub(crate) fn lmm_fitted(
 /// see, and of every grouping-indexed result they emit.
 ///
 /// `spec_sized_from_ids` is the only producer. Its size rule exchanges the
-/// primary with exactly one extra, and only when every grouping is
-/// intercept-only, so each grouping then owns exactly one θ coordinate, one
-/// `varcorr` block, one `pinned` row and one `ranef` block. Undoing the reorder
-/// is therefore the same exchange applied a second time — a transposition is its
-/// own inverse — which is why this records the one swapped index rather than a
-/// full index map.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// primary with exactly one extra. Undoing the reorder is the same exchange
+/// applied a second time — a transposition is its own inverse — which is why
+/// this records the one swapped index rather than a full index map.
+///
+/// The two groupings it exchanges need not be equally wide, so data holding
+/// one entry per grouping (`varcorr`, `ranef_levels`, `pinned`) moves by
+/// [`Perm::swap_slots`], and data holding a block per grouping moves by
+/// [`Perm::swap_blocks`] with that block's width: `ranef` levels·q, `condvar`
+/// levels·q(q+1)/2, `condvar_x` levels·q·p and `tau2`/`stddev_se` the
+/// `varcorr` block length, each with the reported q (slopes only on a block
+/// without an intercept); θ the kernel's vech of each block, hidden intercept
+/// included; the `pinned_components` mask the block's non-structural
+/// diagonals.
+///
+/// When the swap moved a slope grouping first and the old primary turned out
+/// nested in it, the kernel holds the old primary as a `NestedWithin` extra
+/// on padded `parent·W + position` slots, and `nested_slots` maps each of its
+/// declared levels to its slot. [`unpermute_fit`] then reads that grouping's
+/// per-level rows off the slots in declared level order, and hands the map to
+/// [`CondvarCross::nested_slots`]. θ needs no map: a nested intercept has the
+/// one θ entry a crossed one has.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct Perm {
     /// Extra grouping that traded places with the primary. `None` is the
     /// identity: declaration order reached the kernel untouched.
     swapped_extra: Option<usize>,
+    /// Per declared level of the old primary, its child slot in the kernel;
+    /// empty unless the old primary was nested.
+    nested_slots: Vec<u32>,
 }
 
 impl Perm {
     /// Declaration order reached the kernel untouched.
     pub(crate) const IDENTITY: Perm = Perm {
         swapped_extra: None,
+        nested_slots: Vec::new(),
     };
 
     /// Whether the kernel's slot order IS the caller's declaration order.
@@ -939,27 +1003,16 @@ impl Perm {
 
     /// Map a vector holding one entry per grouping between slot order and
     /// declaration order — `v[0]` the primary's, `v[g+1]` the g-th extra's. The
-    /// same call converts either way (see the type doc). Covers every
-    /// per-grouping and per-θ-coordinate result, the two coinciding because the
-    /// rule only fires on intercept-only groupings.
-    ///
-    /// An EMPTY vector is a documented state for several of the fields this
-    /// runs over — nothing pinned, a non-converged fit carrying no `varcorr`,
-    /// an LMM's absent `stddev_se` — and stays empty. Any other length must
-    /// cover every grouping, so a short one indexes out of bounds here instead
-    /// of quietly reordering the wrong pair.
+    /// same call converts either way (see the type doc).
     pub(crate) fn swap_slots<T>(&self, v: &mut [T]) {
         if let Some(k) = self.swapped_extra {
-            if v.is_empty() {
-                return;
-            }
             v.swap(0, k + 1);
         }
     }
 
     /// The per-index form of [`Perm::swap_slots`], for a reader that holds one
-    /// grouping index (a profile coordinate's block, a mask bit) instead of a
-    /// vector. The same call converts either way.
+    /// grouping index instead of a vector (the profile kernel's slot-to-grouping
+    /// map). The same call converts either way.
     pub(crate) fn map_index(&self, i: usize) -> usize {
         match self.swapped_extra {
             Some(k) if i == 0 => k + 1,
@@ -968,33 +1021,25 @@ impl Perm {
         }
     }
 
-    /// Same map for a concatenation of variable-width per-grouping blocks —
-    /// [`Fit::ranef`], the one grouping-indexed output whose blocks are wider
-    /// than one entry. `widths` must be in the SAME order as `v` currently is;
-    /// map it with [`Perm::swap_slots`] afterwards, not before. Empty is a real
-    /// state here too (a non-converged fit recovers no conditional modes).
-    fn swap_blocks(&self, v: &mut Vec<f64>, widths: &[usize]) {
+    /// Same map for a concatenation of per-grouping blocks of unequal width, in
+    /// place. `widths(i)` is the width of block `i` of `v` in its CURRENT
+    /// order, so the call that undoes a move reads the widths in the moved
+    /// order. An empty `v` (a fit with no `condvar`) is left alone.
+    pub(crate) fn swap_blocks<T>(&self, v: &mut [T], widths: impl Fn(usize) -> usize) {
         let Some(k) = self.swapped_extra else {
             return;
         };
-        // `widths` (the level counts) is filled even when `v` is not.
         if v.is_empty() {
             return;
         }
-        let mut starts = Vec::with_capacity(widths.len());
-        let mut acc = 0usize;
-        for &w in widths {
-            starts.push(acc);
-            acc += w;
-        }
-        debug_assert_eq!(acc, v.len(), "block widths must cover the whole vector");
-        let mut order: Vec<usize> = (0..widths.len()).collect();
-        order.swap(0, k + 1);
-        let mut out = Vec::with_capacity(v.len());
-        for g in order {
-            out.extend_from_slice(&v[starts[g]..starts[g] + widths[g]]);
-        }
-        *v = out;
+        let a = widths(0);
+        let s: usize = (0..=k).map(&widths).sum();
+        let b = widths(k + 1);
+        let e = s + b;
+        debug_assert!(e <= v.len(), "block widths overrun the vector");
+        // [0, 1..=k, k+1] → [1..=k, k+1, 0] → [k+1, 1..=k, 0].
+        v[..e].rotate_left(a);
+        v[..e - a].rotate_right(b);
     }
 }
 
@@ -1004,75 +1049,143 @@ impl Perm {
 /// stable API, so no `Fit` consumer sees slot order. `beta`, `se`, `vcov`,
 /// `fitted`, `deviance` and `loglik` are grouping-order-independent and are not
 /// touched.
-pub(super) fn unpermute_fit(perm: Perm, fit: &mut Fit) {
+pub(super) fn unpermute_fit(perm: &Perm, fit: &mut Fit) {
     if perm.is_identity() {
         return;
     }
-    // `ranef` before `ranef_levels`: the block widths must still describe the
-    // layout `ranef` is currently in.
-    perm.swap_blocks(&mut fit.ranef, &fit.ranef_levels);
-    // The rule moves intercept-only groupings alone, so a level holds one
-    // `condvar` value and one `p`-wide `condvar_x` row.
-    if !fit.condvar.is_empty() {
-        let p = fit.condvar_x.len() / fit.condvar.len();
-        let rows: Vec<usize> = fit.ranef_levels.iter().map(|&l| l * p).collect();
-        perm.swap_blocks(&mut fit.condvar, &fit.ranef_levels);
-        perm.swap_blocks(&mut fit.condvar_x, &rows);
-    }
+    // Every block move before `ranef_levels` and `varcorr` move: their widths
+    // must still describe the slot order the blocks are in.
+    let p = fit.beta.len();
+    let (levels, varcorr) = (&fit.ranef_levels, &fit.varcorr);
+    let q = |g: usize| super::vech_q(varcorr[g].len());
+    perm.swap_blocks(&mut fit.ranef, |g| levels[g] * q(g));
+    perm.swap_blocks(&mut fit.condvar, |g| levels[g] * q(g) * (q(g) + 1) / 2);
+    perm.swap_blocks(&mut fit.condvar_x, |g| levels[g] * q(g) * p);
+    perm.swap_blocks(&mut fit.tau2, |g| varcorr[g].len());
+    perm.swap_blocks(&mut fit.stddev_se, |g| varcorr[g].len());
     // The kernel's primary, the family grouping, is the swapped extra.
     if let (Some(c), Some(k)) = (fit.condvar_cross.as_mut(), perm.swapped_extra) {
         c.family_grouping = k + 1;
     }
     perm.swap_slots(&mut fit.ranef_levels);
-    perm.swap_slots(&mut fit.tau2);
-    perm.swap_slots(&mut fit.stddev_se);
     perm.swap_slots(&mut fit.varcorr);
     perm.swap_slots(&mut fit.diagnostics.pinned);
+    // A nested old primary now leads, `ranef_levels[0]` padded slots wide:
+    // one row per declared level, read off its slot.
+    let slots = &perm.nested_slots;
+    if slots.is_empty() {
+        return;
+    }
+    debug_assert_eq!(fit.varcorr[0].len(), 1, "the old primary is intercept-only");
+    let padded = fit.ranef_levels[0];
+    let gather = |v: &mut Vec<f64>, w: usize| {
+        if v.is_empty() {
+            return;
+        }
+        let rows: Vec<f64> = slots
+            .iter()
+            .flat_map(|&s| v[s as usize * w..(s as usize + 1) * w].to_vec())
+            .collect();
+        v.splice(..padded * w, rows);
+    };
+    gather(&mut fit.ranef, 1);
+    gather(&mut fit.condvar, 1);
+    gather(&mut fit.condvar_x, p);
+    fit.ranef_levels[0] = slots.len();
+    if let Some(c) = fit.condvar_cross.as_mut() {
+        c.nested_slots = slots.clone();
+    }
 }
 
-/// The size rule: **when every grouping is intercept-only and `Crossed`, the
-/// grouping with the most levels becomes the primary; otherwise nothing moves.**
+/// The size rule picks which grouping the kernel holds as its primary. It
+/// fires only when every extra grouping is `Crossed`; otherwise nothing moves.
+/// Then:
 ///
-/// Why it pays. The primary is eliminated as block-diagonal families at cost
-/// linear in its level count, while every extra lands in one Schur tail whose
-/// width is the total crossed level count and whose factorization is cubic in
-/// that width. Which grouping the user happened to write first therefore sets
-/// the tail width. MixedModels.jl sorts its `ReMat`s by decreasing level count
-/// for exactly this reason; Bates, Alday & Kokandakar (2025), arXiv:2505.11674,
-/// measure the effect on InstEval with that sort defeated — ~4.5M vs 775K
-/// nonzeros in the Cholesky factor.
+/// 1. **No grouping has slopes:** the grouping with the most levels becomes the
+///    primary.
+/// 2. **Exactly one grouping has slopes, and it is an extra:** that grouping
+///    becomes the primary, provided the reordered spec still routes `NoZ`
+///    ([`spec_sized_from_ids`] checks this with `classify_design` and undoes
+///    the swap otherwise).
+/// 3. **Otherwise** (two or more slope groupings, or the slope grouping is
+///    already the primary): nothing moves.
 ///
-/// Why it is this narrow. Plain "most levels first" is wrong as soon as a
-/// `NestedWithin` grouping is present: hoisting a child out of its parent turns
-/// a nesting that rides inside the primary's block-diagonal elimination into two
-/// crossed factors sharing one tail, which can be several times WIDER. And it is
-/// wrong as soon as any grouping carries a random slope, because a wide primary
-/// routes the dense kernel whose joint optimizer is known to land above lme4's
-/// optimum on the sparse-Gamma shape. With every grouping scalar and crossed
-/// neither hazard exists — no nesting relation can be invalidated and no slope
-/// block can change hands — and "most levels first" and "smallest crossed tail"
-/// become the same argmax.
+/// Why rule 1 pays. The primary is eliminated as block-diagonal families at
+/// cost linear in its level count, while every extra lands in one Schur tail
+/// whose width is the total crossed level count and whose factorization is
+/// cubic in that width. Which grouping the user happened to write first
+/// therefore sets the tail width. MixedModels.jl sorts its `ReMat`s by
+/// decreasing level count for exactly this reason; Bates, Alday & Kokandakar
+/// (2025), arXiv:2505.11674, measure the effect on InstEval with that sort
+/// defeated — ~4.5M vs 775K nonzeros in the Cholesky factor. Only the choice of
+/// primary matters: the tail's cost does not depend on the order of the extras
+/// inside it, so one transposition is all a reorder needs.
 ///
-/// Ties keep the declared primary (and, among extras, the earliest), so a model
-/// already in the chosen order is handed to the kernel exactly as declared.
+/// Why rule 2 pays. A slope on an extra grouping routes the sparse solver,
+/// which forms no conditional variances; with the slope grouping as primary
+/// the same model gets the per-level elimination, conditional variances and
+/// the dense route's speed. It holds back when the reordered spec would route
+/// `Sparse` anyway (more than `MAX_CROSSED_LEVELS` crossed levels left in the
+/// tail, or a slope block wider than `MAX_PRIMARY_Q`): the order then gives no
+/// conditional variances either way, and the swap would move the old primary,
+/// possibly one with thousands of levels, out of the per-level elimination
+/// into the sparse tail, a move that has not been measured.
+///
+/// Why rule 3 leaves the order alone. `(1 + x | subject) + (1 | item)` stays
+/// as written even when `item` has more levels: moving `item` first would put
+/// the slope on an extra, route the fit sparse and lose the conditional
+/// variances. And with two slope groupings one of them is an extra whichever
+/// goes first.
+///
+/// Why nothing moves with a `NestedWithin` grouping. Hoisting a child out of
+/// its parent turns a nesting that rides inside the primary's block-diagonal
+/// elimination into two crossed factors sharing one tail, which can be several
+/// times WIDER.
+///
+/// Ties under rule 1 keep the declared primary (and, among extras, the
+/// earliest), so a model already in the chosen order is handed to the kernel
+/// exactly as declared.
 fn size_rule_perm(re: &ReStructure, primary_levels: usize, extra_counts: &[usize]) -> Perm {
-    let eligible = re.slopes.is_empty()
-        && re
-            .extra_groupings
-            .iter()
-            .all(|g| g.slopes.is_empty() && g.relation == GroupingRelation::Crossed);
-    if !eligible {
+    if re
+        .extra_groupings
+        .iter()
+        .any(|g| g.relation != GroupingRelation::Crossed)
+    {
         return Perm::IDENTITY;
     }
-    let mut best = primary_levels;
-    let mut swapped_extra = None;
-    for (k, &levels) in extra_counts.iter().enumerate() {
-        if levels > best {
-            best = levels;
-            swapped_extra = Some(k);
+    let mut slope_extras = re
+        .extra_groupings
+        .iter()
+        .enumerate()
+        .filter(|(_, g)| !g.slopes.is_empty());
+    match (
+        re.slopes.is_empty(),
+        slope_extras.next(),
+        slope_extras.next(),
+    ) {
+        // Rule 1.
+        (true, None, _) => {
+            let mut best = primary_levels;
+            let mut swapped_extra = None;
+            for (k, &levels) in extra_counts.iter().enumerate() {
+                if levels > best {
+                    best = levels;
+                    swapped_extra = Some(k);
+                }
+            }
+            Perm {
+                swapped_extra,
+                nested_slots: Vec::new(),
+            }
         }
+        // Rule 2; its routing condition is checked by the caller.
+        (true, Some((k, _)), None) => Perm {
+            swapped_extra: Some(k),
+            nested_slots: Vec::new(),
+        },
+        // Rule 3.
+        _ => Perm::IDENTITY,
     }
-    Perm { swapped_extra }
 }
 
 /// A [`ModelSpec`] with the level counts its kernels size their random-effect
@@ -1102,18 +1215,90 @@ pub(crate) struct SizedSpec {
 /// swap moves two `Vec` handles, two slope lists and two counts — nothing
 /// per-observation — but the ids must be cloned to be swapped, so the clone
 /// happens only on the models the rule actually reorders (`Cow::Borrowed`
-/// otherwise).
+/// otherwise). A slope-grouping swap whose reordered spec would route
+/// `Sparse` is undone before the clone, and the spec, ids and [`Perm`] come
+/// back exactly as declared.
+///
+/// A slope-grouping swap that stays then checks the grouping it displaced for
+/// nesting in the new primary, with the formula front end's two guards
+/// ([`detect_flat_nesting`]). When every one of its declared levels passes,
+/// it becomes a `NestedWithin` extra on padded ids, sized as the slope-first
+/// spelling sizes it, so the kernel gets the input it gets when the user
+/// writes the slope grouping first; [`Perm`] carries the level-to-slot map
+/// back. Otherwise it stays crossed.
 pub(crate) fn spec_sized_from_ids<'a>(
     model: &ModelSpec,
     ids: &'a GroupIds,
 ) -> (SizedSpec, Cow<'a, GroupIds>, Perm) {
+    let mut sized = sized_as_declared(model, ids);
     let Some(re) = model.re.as_ref() else {
-        let sized = SizedSpec {
+        return (sized, Cow::Borrowed(ids), Perm::IDENTITY);
+    };
+    let perm = size_rule_perm(re, sized.n_primary, &sized.extra_counts);
+    let Some(k) = perm.swapped_extra else {
+        return (sized, Cow::Borrowed(ids), perm);
+    };
+    // The spec half of the exchange; applying it twice undoes it.
+    let swap_spec = |sized: &mut SizedSpec| {
+        std::mem::swap(&mut sized.n_primary, &mut sized.extra_counts[k]);
+        let sized_re = sized.spec.re.as_mut().expect("re is Some on this path");
+        std::mem::swap(
+            &mut sized_re.slopes,
+            &mut sized_re.extra_groupings[k].slopes,
+        );
+        std::mem::swap(&mut sized_re.terms, &mut sized_re.extra_groupings[k].terms);
+    };
+    swap_spec(&mut sized);
+    // Rule 2 moved a slope grouping first: keep the swap only when the
+    // reordered spec routes the dense kernel (see `size_rule_perm`).
+    let moved_slopes = sized.spec.re.as_ref().is_some_and(|r| !r.slopes.is_empty());
+    if moved_slopes && super::classify_design(&sized, 1) == super::Solver::Sparse {
+        swap_spec(&mut sized);
+        return (sized, Cow::Borrowed(ids), Perm::IDENTITY);
+    }
+    let mut swapped_ids = ids.clone();
+    std::mem::swap(&mut swapped_ids.primary, &mut swapped_ids.extra[k]);
+    let mut perm = perm;
+    if moved_slopes {
+        // Labelled by declared id, so a child's position inside its parent
+        // is its declared id order.
+        let nested = detect_flat_nesting(&swapped_ids.primary, &ids.primary);
+        // A declared level with no rows (a gap a matrix-door caller may
+        // leave) has no slot to map its results back from.
+        let declared = sized.extra_counts[k];
+        if let Some((padded, labels)) =
+            nested.filter(|(_, l)| l.iter().flatten().count() == declared)
+        {
+            let mut slots = vec![0u32; declared];
+            for (slot, level) in labels.iter().enumerate() {
+                if let Some(level) = level {
+                    slots[*level as usize] = slot as u32;
+                }
+            }
+            let sized_re = sized.spec.re.as_mut().expect("re is Some on this path");
+            sized_re.extra_groupings[k].relation = GroupingRelation::NestedWithin;
+            swapped_ids.extra[k] = padded;
+            sized.extra_counts[k] =
+                nested_width(&swapped_ids.primary, &swapped_ids.extra[k], sized.n_primary);
+            perm.nested_slots = slots;
+            debug_assert!(check_nested_ids(sized_re, &swapped_ids).is_ok());
+            debug_assert!(super::classify_design(&sized, 1) == super::Solver::NoZ);
+        }
+    }
+    (sized, Cow::Owned(swapped_ids), perm)
+}
+
+/// The [`SizedSpec`] of `model` on `ids` in declaration order, with no
+/// grouping reorder: the counts [`spec_sized_from_ids`] starts from. Its
+/// callers outside it are the tests that hand the forced kernel entries a
+/// design exactly as written.
+pub(crate) fn sized_as_declared(model: &ModelSpec, ids: &GroupIds) -> SizedSpec {
+    let Some(re) = model.re.as_ref() else {
+        return SizedSpec {
             spec: model.clone(),
             n_primary: 0,
             extra_counts: Vec::new(),
         };
-        return (sized, Cow::Borrowed(ids), Perm::IDENTITY);
     };
     let level_count = |v: &[u32]| v.iter().copied().max().map(|m| m as usize + 1).unwrap_or(1);
     let n_primary = level_count(&ids.primary);
@@ -1136,31 +1321,14 @@ pub(crate) fn spec_sized_from_ids<'a>(
             }
         })
         .collect();
-    let perm = size_rule_perm(re, n_primary, &extra_counts);
-    let mut sized = SizedSpec {
+    SizedSpec {
         spec: ModelSpec {
             family: model.family,
             re: Some(re.clone()),
         },
         n_primary,
         extra_counts,
-    };
-    let Some(k) = perm.swapped_extra else {
-        return (sized, Cow::Borrowed(ids), perm);
-    };
-    std::mem::swap(&mut sized.n_primary, &mut sized.extra_counts[k]);
-    let sized_re = sized.spec.re.as_mut().expect("just built with re: Some");
-    // Both are empty whenever the rule fires (it requires intercept-only
-    // groupings); swapped anyway so the spec half of the exchange is complete
-    // rather than complete-by-precondition.
-    std::mem::swap(
-        &mut sized_re.slopes,
-        &mut sized_re.extra_groupings[k].slopes,
-    );
-    std::mem::swap(&mut sized_re.terms, &mut sized_re.extra_groupings[k].terms);
-    let mut swapped_ids = ids.clone();
-    std::mem::swap(&mut swapped_ids.primary, &mut swapped_ids.extra[k]);
-    (sized, Cow::Owned(swapped_ids), perm)
+    }
 }
 
 /// Lower-tri Gram `G = XᵀX` (from row-major X) → `aliased_columns` mask. `p` is
@@ -1174,6 +1342,13 @@ pub(crate) fn spec_sized_from_ids<'a>(
 /// keeps `Σxᵢⱼ²` finite past `|x| ≈ 1.3e154`, where the raw Gram's
 /// diagonal overflows to `∞` and `∞ ≤ ε·∞` marks the column aliased.
 pub(crate) fn detect_aliased(x: &[f64], n: usize, p: usize) -> Vec<bool> {
+    let (gram, _) = scaled_gram(x, n, p);
+    crate::ols::aliased_columns(gram.as_ref(), p, crate::ols::ALIAS_EPS)
+}
+
+/// The lower triangle of [`detect_aliased`]'s Gram, with the per-column
+/// factors `inv` it scaled the columns by: Gram column `a` is `x_a·inv[a]`.
+fn scaled_gram(x: &[f64], n: usize, p: usize) -> (Mat<f64>, Vec<f64>) {
     let mut inv = vec![1.0f64; p];
     for (a, r) in inv.iter_mut().enumerate() {
         let m = (0..n).fold(0.0f64, |m, i| m.max(x[i * p + a].abs()));
@@ -1190,71 +1365,66 @@ pub(crate) fn detect_aliased(x: &[f64], n: usize, p: usize) -> Vec<bool> {
             }
         }
     }
-    crate::ols::aliased_columns(gram.as_ref(), p, crate::ols::ALIAS_EPS)
+    (gram, inv)
 }
 
-/// Remap a spec's RE slope x-column indices through the kept-columns map
-/// (`to_reduced[orig]` = reduced index, or `usize::MAX` if that column was
-/// dropped), and each grouping's terms with them, so the reduced spec passes
-/// [`check_model_shape`]. An index past `to_reduced` names a
-/// random-effect-only column, which follows the `p_reduced` kept columns in
-/// the same order (the reduced fit gets the same `Design::re_columns`).
-///
-/// `None` means a dropped column is ALSO used as an RE slope — a rank-deficient
-/// random slope, which the crate does not fit: the reduced design has no column
-/// for that slope to point at, so there is no valid reduced spec to build.
-/// Dropping the random slope alongside the fixed column would be a different
-/// model and needs its own reporting and its own oracle; it is deliberately not
-/// done here. Signalling `None` lets the caller return a non-converged `Fit`
-/// instead of panicking — a library panic would take the caller's process
-/// down, giving an R/Python user an abort instead of an inspectable fit, and
-/// costing a loop caller its whole run over one degenerate draw.
-fn remap_spec_slopes(
-    model: &ModelSpec,
-    to_reduced: &[usize],
-    p_reduced: usize,
-) -> Option<ModelSpec> {
-    let Some(re) = model.re.as_ref() else {
-        return Some(model.clone());
-    };
-    // `collect::<Option<Vec<_>>>` short-circuits on the first dropped column, so
-    // one `None` anywhere in any slope list fails the whole remap.
-    let remap = |cols: &[u32]| -> Option<Vec<u32>> {
-        cols.iter()
-            .map(|&c| {
-                let r = match to_reduced.get(c as usize) {
-                    Some(&r) => r,
-                    None => c as usize - to_reduced.len() + p_reduced,
-                };
-                (r != usize::MAX).then_some(r as u32)
-            })
-            .collect()
-    };
-    let extra_groupings = re
-        .extra_groupings
-        .iter()
-        .map(|g| {
-            let slopes = remap(&g.slopes)?;
-            let mut terms = g.terms.clone();
-            set_term_slopes(&mut terms, &slopes);
-            Some(Grouping {
-                relation: g.relation,
-                slopes,
-                terms,
-            })
-        })
-        .collect::<Option<Vec<_>>>()?;
-    let slopes = remap(&re.slopes)?;
-    let mut terms = re.terms.clone();
-    set_term_slopes(&mut terms, &slopes);
-    Some(ModelSpec {
-        family: model.family,
-        re: Some(ReStructure {
-            slopes,
-            terms,
-            extra_groupings,
-        }),
-    })
+/// An orthonormal basis of the null space of `x` (row-major `n × p`), `k × p`
+/// row-major with one row per column `aliased` marks, in column order; empty
+/// when none is. Read off the factor [`detect_aliased`] decides on, so the
+/// basis and the alias verdicts agree: an aliased column `d` of the scaled
+/// design is, to the alias tolerance, `Σ c_j` times the retained columns
+/// `j ∈ K` before it, with `L_KKᵀc = l_d` (row `d` of the factor over `K`), so
+/// `e_d − Σ c_j e_j` maps the scaled design to zero; multiplying entry `a` by
+/// `inv[a]` makes it a null vector of `x` itself. Modified Gram–Schmidt then
+/// orthonormalizes the vectors in order.
+pub(crate) fn null_basis(x: &[f64], n: usize, p: usize, aliased: &[bool]) -> Vec<f64> {
+    let (gram, inv) = scaled_gram(x, n, p);
+    let (mask, l) = crate::ols::aliased_factor(gram.as_ref(), p, crate::ols::ALIAS_EPS);
+    debug_assert_eq!(mask, aliased, "null_basis: the alias verdicts differ");
+    let mut basis: Vec<f64> = Vec::new();
+    for d in (0..p).filter(|&d| aliased[d]) {
+        let kept: Vec<usize> = (0..d).filter(|&j| !aliased[j]).collect();
+        let mut v = vec![0.0f64; p];
+        v[d] = 1.0;
+        // Back-substitution on the upper triangle `L_KKᵀ`, last kept column first.
+        for (t, &j) in kept.iter().enumerate().rev() {
+            let s: f64 = kept[t + 1..].iter().map(|&k| l[k * p + j] * -v[k]).sum();
+            v[j] = -(l[d * p + j] - s) / l[j * p + j];
+        }
+        for (va, r) in v.iter_mut().zip(&inv) {
+            *va *= r;
+        }
+        for prev in basis.chunks(p) {
+            let dot: f64 = prev.iter().zip(&v).map(|(a, b)| a * b).sum();
+            for (va, pa) in v.iter_mut().zip(prev) {
+                *va -= dot * pa;
+            }
+        }
+        let norm = v.iter().map(|a| a * a).sum::<f64>().sqrt();
+        basis.extend(v.iter().map(|a| a / norm));
+    }
+    basis
+}
+
+/// The spec of the reduced fit on the full columns `kept`: every grouping's
+/// slopes moved by [`remap_slopes`] and its terms with them
+/// ([`set_term_slopes`]), so the reduced spec passes [`check_model_shape`].
+/// The second value lists the full `[X | Z_r]` columns the reduced fit reads
+/// as random-effect-only columns, slope index `kept.len() + j` reading
+/// `sources[j]`: a dropped column that is a random slope, and every existing
+/// `Z_r` column, in the order the slope lists first name them.
+pub(super) fn remap_spec_slopes(model: &ModelSpec, kept: &[usize]) -> (ModelSpec, Vec<usize>) {
+    let mut spec = model.clone();
+    let mut sources = Vec::new();
+    if let Some(re) = &mut spec.re {
+        re.slopes = remap_slopes(&re.slopes, kept, kept.len(), &mut sources);
+        set_term_slopes(&mut re.terms, &re.slopes);
+        for g in &mut re.extra_groupings {
+            g.slopes = remap_slopes(&g.slopes, kept, kept.len(), &mut sources);
+            set_term_slopes(&mut g.terms, &g.slopes);
+        }
+    }
+    (spec, sources)
 }
 
 /// The objective of a GLMM fit at `nagq` quadrature nodes: the Laplace
@@ -1267,116 +1437,17 @@ pub(super) fn glmm_objective(nagq: u8) -> Objective {
     }
 }
 
-/// The "unfittable model" return: an aliased fixed column is also used as an RE
-/// slope, so no reduced spec exists (see [`remap_spec_slopes`]). Carries the
-/// crate's standard numerical-failure convention — NaN β/se/vcov/dispersion,
-/// `converged: false`, no varcorr, `df: 0` — the same shape the solver routes
-/// return on their own failures, so a caller that already handles
-/// `converged == false` needs no new branch. `n_eval: 0` is honest: no optimizer
-/// ran.
-///
-/// `aliased` is reported as-is rather than blanked. `converged == false` with
-/// every β NaN already says "unfittable"; the mask says which columns caused it,
-/// which is the only diagnostic the caller can act on, and it is the same field
-/// `fit_rank_deficient` fills on the successful path.
-fn unfittable_random_slope_fit(
-    n: usize,
-    p: usize,
-    model: &ModelSpec,
-    ids: &GroupIds,
-    aliased: &[bool],
-    opts: &FitOptions,
-) -> Fit {
-    let criterion = resolve_criterion(model, opts);
-    // The level counts the fitted routes report. The size rule never reorders
-    // here: it moves intercept-only models, and this one has a random slope.
-    let (sized, _, _) = spec_sized_from_ids(model, ids);
-    let (slope_cols, extra_slope_cols) = super::glmm::re_slope_cols(model);
-    let groupings =
-        crate::lmm::LmmGroupings::from_cluster_spec_ext(&sized, &slope_cols, &extra_slope_cols);
-    // `theta_width` less column 0 of each block without a random intercept:
-    // the fitted routes' `LmmGroupings::drop_hidden` width, from the spec
-    // alone, as no groupings exist on this return.
-    let block = |q: usize, terms: &[crate::ReTerm]| {
-        q * (q + 1) / 2 - q * usize::from(crate::lmm::block_hidden(terms))
-    };
-    let tau2_width = model.re.as_ref().map_or(0, |re| {
-        block(1 + re.slopes.len(), &re.terms)
-            + re.extra_groupings
-                .iter()
-                .map(|g| block(1 + g.slopes.len(), &g.terms))
-                .sum::<usize>()
-    });
-    let mut fit = Fit {
-        beta: vec![f64::NAN; p],
-        se: vec![f64::NAN; p],
-        vcov: nan_vcov(p),
-        tau2: vec![f64::NAN; tau2_width],
-        dispersion: f64::NAN,
-        diagnostics: Diagnostics {
-            aliased: aliased.to_vec(),
-            ..Diagnostics::from_flags(false, false, p)
-        },
-        varcorr: vec![],
-        stddev_se: vec![],
-        n_eval: 0,
-        #[cfg(feature = "counters")]
-        counters: crate::counters::EvalCounters::new(),
-        deviance: f64::NAN,
-        loglik: f64::NAN,
-        df: 0,
-        // The criterion `opts.reml` resolves to, as a fitted Gaussian mixed
-        // model reports it; every GLMM route reports `reml: false`.
-        reml: criterion == Some(Criterion::Reml),
-        weight_power: f64::NAN,
-        weight_power_estimated: false,
-        se_type: SeType::Model,
-        model_vcov: Vec::new(),
-        robust: None,
-        nobs: n,
-        // The route's objective: the aliased column is a random slope, so
-        // the model is mixed (a criterion on Gaussian, the quadrature on
-        // every other family).
-        objective: match criterion {
-            Some(Criterion::Reml) => Objective::Reml,
-            Some(Criterion::Ml) => Objective::MaximumLikelihood,
-            None => glmm_objective(opts.nagq),
-        },
-        fitted: vec![],
-        ranef: vec![],
-        ranef_levels: ranef_level_counts(&groupings),
-        condvar: vec![],
-        condvar_x: vec![],
-        condvar_cross: None,
-        coef_df: vec![f64::NAN; p],
-        satterthwaite: None,
-        design_summary: None,
-    };
-    // A Gaussian LMM without an endpoint: the Satterthwaite record
-    // `fit_checked`'s step would have stored (it never runs here).
-    if matches!(model.family, Family::Gaussian) {
-        if opts.satterthwaite {
-            super::core::record_failed_pass(&mut fit);
-        } else {
-            fit.satterthwaite = Some(crate::lmm::satterthwaite::SatterthwaiteState::switched_off());
-        }
-    }
-    fit
-}
-
 /// Fit the reduced (aliased-columns-dropped) model and scatter β/se back to full
 /// width: retained slots take the reduced fit, aliased slots are NaN,
 /// `converged` follows the reduced fit, `tau2`/`varcorr`/`dispersion` pass through
-/// (the RE structure is unchanged; only fixed-column indices are remapped).
+/// (the RE structure is unchanged; a slope on a kept column moves to its reduced
+/// index, and a slope on a dropped column reads the same values from a
+/// random-effect-only column of the reduced design, [`remap_spec_slopes`]).
 ///
 /// `Fit::aliased` is the UNION of this level's `aliased` and the reduced fit's own
 /// mask, not just this level's — see the OR in the scatter loop. That keeps the
 /// field's contract (`NaN` in β/se ⇔ the column was dropped) true across a nested
 /// salvage, which the recursion below makes reachable.
-///
-/// Returns an all-NaN, non-converged `Fit` without refitting when a dropped
-/// column is also an RE slope (see [`remap_spec_slopes`]) — that model is
-/// unfittable, not merely rank-deficient.
 ///
 /// **Recursion.** This re-enters `fit_checked`, so termination is a real
 /// obligation. It rests on `kept.len() < p`: every entry hands the recursive
@@ -1397,7 +1468,7 @@ pub(super) fn fit_rank_deficient(
     opts: &FitOptions,
     aliased: &[bool],
 ) -> Fit {
-    let Design { x, n, p, ids, .. } = data.design;
+    let Design { x, n, p, re, s, .. } = data.design;
     let kept: Vec<usize> = (0..p).filter(|&j| !aliased[j]).collect();
     let pk = kept.len();
     debug_assert!(
@@ -1409,13 +1480,6 @@ pub(super) fn fit_rank_deficient(
     for (r, &orig) in kept.iter().enumerate() {
         to_reduced[orig] = r;
     }
-    // Remap before building the reduced design: a dropped column used as an RE
-    // slope makes the model unfittable, and there is no point paying for the
-    // O(n·pk) copy to discover that.
-    let Some(model_r) = remap_spec_slopes(model, &to_reduced, pk) else {
-        let no_ids = GroupIds::default();
-        return unfittable_random_slope_fit(n, p, model, ids.unwrap_or(&no_ids), aliased, opts);
-    };
     // Reduced design (drop aliased columns), row-major.
     let mut xr = vec![0.0f64; n * pk];
     for i in 0..n {
@@ -1449,7 +1513,18 @@ pub(super) fn fit_rank_deficient(
         se_for: SeFor::Only(targets_r),
         ..opts.clone()
     };
-    let reduced = Data {
+    let (model_r, sources) = remap_spec_slopes(model, &kept);
+    // Row-major `n × sources.len()`, indexed with the caller's full `p` and
+    // `s`, as `Design::re_columns` reads them.
+    let zr: Vec<f64> = (0..n)
+        .flat_map(|i| {
+            sources.iter().map(move |&c| match c.checked_sub(p) {
+                None => x[i * p + c],
+                Some(j) => re.expect("a slope past `p` reads `re_columns`")[i * s + j],
+            })
+        })
+        .collect();
+    let mut reduced = Data {
         design: Design {
             x: &xr,
             p: pk,
@@ -1457,6 +1532,9 @@ pub(super) fn fit_rank_deficient(
         },
         ..*data
     };
+    if !sources.is_empty() {
+        reduced = reduced.re_columns(&zr, sources.len());
+    }
     let fr = super::fit_checked(&reduced, &model_r, start_r.as_ref(), &opts_r);
     // Scatter reduced β/se to full width; aliased slots stay NaN.
     //
@@ -1507,6 +1585,7 @@ pub(super) fn fit_rank_deficient(
             Note::PirlsExhausted { .. }
             | Note::HessianSeFallback
             | Note::NbShapeUnsettled { .. }
+            | Note::NbShapeAtLimit { .. }
             | Note::NonIntegerResponse { .. }
             | Note::SingleLevelGroupingDropped { .. }
             | Note::FewRowsForRandomEffects { .. }
@@ -1514,14 +1593,17 @@ pub(super) fn fit_rank_deficient(
             | Note::RepeatedGrouping { .. }
             | Note::SlopeConstantWithinLevels { .. }
             | Note::SeparatedByGrouping { .. }
+            | Note::OneTrialPerLevel { .. }
             | Note::ExactProfileFallback
             | Note::GradientSearchFallback
             | Note::SeUnavailable
             | Note::PrecisionLimited
             | Note::Separated
             | Note::VarianceAtLimit
+            | Note::DispersionAtLimit { .. }
             | Note::SatterthwaiteCurvature { .. }
             | Note::NewGroupingLevels { .. }
+            | Note::RowsNotEstimable { .. }
             | Note::WeightPowerAtBound { .. }
             | Note::WeightPowerSearchFailures { .. }
             | Note::WeightPowerOutsideUnit { .. }
@@ -1548,8 +1630,8 @@ pub(super) fn fit_rank_deficient(
     } else {
         scatter(&fr.model_vcov)
     };
-    // The robust pieces are zero on an aliased column, which has no
-    // coefficient, so a contrast that leaves it out reads them as is.
+    // The robust pieces carry an aliased column, which has no coefficient,
+    // only as a zero row of their `t`.
     let robust = fr.robust.map(|pc| pc.widen(&kept, p));
     // `condvar_x` rows are `p` wide: the same scatter, an aliased column NaN.
     let pr = kept.len();
@@ -1597,6 +1679,8 @@ pub(super) fn fit_rank_deficient(
         satterthwaite,
         // On the reduced design, so its `p` is the retained column count.
         design_summary: fr.design_summary,
+        // Filled by `fit_checked`, the salvage's only caller.
+        null_basis: Vec::new(),
     }
 }
 /// The grouping ids of a mixed model checked against it: the primary id
@@ -1620,6 +1704,127 @@ pub(super) fn check_group_ids(re: &ReStructure, ids: &GroupIds, n: usize) -> Res
         ));
     }
     Ok(())
+}
+
+/// Padded-per-parent child ids: given already-dense `parent_ids` (one per row)
+/// and per-row child `labels`, lay the children out as CONTIGUOUS PER-PARENT
+/// BLOCKS in the same order the parent's own ids use — parent id `p`'s children
+/// occupy `[p·W, p·W + k_p)` where `k_p` is that parent's distinct child count
+/// and `W = max_p k_p` (the true max — every block gets the same width, since
+/// the kernel's `NestedWithin` sizing is a fixed-width rectangle: `src/lmm/kernel.rs`'s
+/// `add_rows_multi` computes a child's RE column as
+/// `extra_offsets[e] + id·extra_q[e]`, which only lands in the right parent's
+/// block under this padded-block layout — a fresh global lexicographic sort of
+/// the joined label does not preserve per-parent contiguity for unbalanced
+/// nesting). Slots `k_p..W` in a shorter parent's block are never assigned to
+/// any row (padding). Assumes each child label occurs under a SINGLE parent —
+/// the caller must have verified nesting (explicit `parent:child` syntax, or
+/// [`detect_flat_nesting`] for the flat idiom).
+///
+/// Returns the ids alongside one label per slot of the padded rectangle
+/// (`n_parents · W`, slot `p·W + k`): the child label at every assigned slot and
+/// `None` at every padded one. The caller joins the parent's own label in when
+/// the formula named a parent (`(1|A/B)`); the flat idiom keeps the child label
+/// bare, because `re_group_info` names that block for the child alone and the
+/// route it takes is data-dependent.
+pub(crate) fn nested_padded_ids<L: Ord + Hash + Clone>(
+    parent_ids: &[u32],
+    labels: &[L],
+) -> (Vec<u32>, Vec<Option<L>>) {
+    let n_parents = parent_ids
+        .iter()
+        .copied()
+        .max()
+        .map(|m| m as usize + 1)
+        .unwrap_or(1);
+    // Distinct child labels observed under each parent id, lexicographic
+    // (BTreeSet) — the within-parent dense order; the specific order among
+    // children of one parent doesn't matter statistically (an exchangeable RE),
+    // only that it is dense over `0..k_p`.
+    let mut children_per_parent: Vec<BTreeSet<&L>> = vec![BTreeSet::new(); n_parents];
+    for (&p, c) in parent_ids.iter().zip(labels) {
+        children_per_parent[p as usize].insert(c);
+    }
+    let n_per_parent = children_per_parent
+        .iter()
+        .map(BTreeSet::len)
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let local_index: Vec<HashMap<&L, u32>> = children_per_parent
+        .iter()
+        .map(|set| {
+            set.iter()
+                .enumerate()
+                .map(|(i, &l)| (l, i as u32))
+                .collect()
+        })
+        .collect();
+    let mut slot_labels: Vec<Option<L>> = vec![None; n_parents * n_per_parent];
+    for (p, set) in children_per_parent.iter().enumerate() {
+        for (k, &child) in set.iter().enumerate() {
+            slot_labels[p * n_per_parent + k] = Some(child.clone());
+        }
+    }
+    let ids = parent_ids
+        .iter()
+        .zip(labels)
+        .map(|(&p, c)| p * n_per_parent as u32 + local_index[p as usize][c])
+        .collect();
+    (ids, slot_labels)
+}
+
+/// Max padding-inflation factor for flat-nesting detection: detect nested only
+/// while `n_parents · max_children ≤ NESTING_INFLATION_BOUND ·
+/// n_distinct_child_levels`. The guard protects the padded rectangle from
+/// inflating the dense RE block — not balance per se: near-balanced nesting
+/// (children-per-parent ∈ {1,2,3}, inflation ~1.6×) pads a few empty slots and
+/// stays far cheaper than routing its tens of thousands of levels crossed
+/// (dense tail is cubic in crossed levels), while an observation-level factor
+/// like grouseticks' INDEX (each row its own level, inflation ≫ 2) still fails
+/// closed to `Crossed` (measured there: nested 44 s vs crossed 0.16 s).
+pub(crate) const NESTING_INFLATION_BOUND: usize = 2;
+
+/// Detect nesting of a flat extra grouping (the lme4 idiom
+/// `(1|parent)+(1|child)`, no explicit `parent:child` syntax) from the observed
+/// id structure, returning its [`nested_padded_ids`] layout iff routing it
+/// nested is both correct AND a win. Two guards, both fail closed to `Crossed`:
+///
+/// 1. **Genuine nesting** — every distinct `child_labels` value must fall under a
+///    single `primary_ids` (parent). A label spanning two parents is genuinely
+///    crossed; routing it nested would corrupt the padded family-block Cholesky.
+/// 2. **Bounded padding inflation** — the padded rectangle
+///    `n_parents · max_children` must not exceed [`NESTING_INFLATION_BOUND`] ×
+///    the distinct child-level count (see the constant's rationale). Explicit
+///    `parent:child` syntax still pads unbounded — there the user asked for the
+///    nested layout outright.
+///
+/// The fit runs the same check on the grouping a slope grouping displaces when
+/// [`spec_sized_from_ids`] moves that slope grouping first.
+pub(crate) fn detect_flat_nesting<L: Ord + Hash + Clone>(
+    primary_ids: &[u32],
+    child_labels: &[L],
+) -> Option<(Vec<u32>, Vec<Option<L>>)> {
+    let n_parents = primary_ids
+        .iter()
+        .copied()
+        .max()
+        .map(|m| m as usize + 1)
+        .unwrap_or(1);
+    let mut parent_of: HashMap<&L, u32> = HashMap::new();
+    let mut children_per_parent = vec![0usize; n_parents];
+    for (&p, c) in primary_ids.iter().zip(child_labels) {
+        match parent_of.insert(c, p) {
+            Some(prev) if prev != p => return None, // spans two parents → crossed
+            Some(_) => {}                           // repeat obs of a seen child
+            None => children_per_parent[p as usize] += 1, // first sighting
+        }
+    }
+    let w = children_per_parent.iter().copied().max().unwrap_or(0);
+    if n_parents * w > NESTING_INFLATION_BOUND * parent_of.len() {
+        return None; // padded rectangle would inflate the dense RE block
+    }
+    Some(nested_padded_ids(primary_ids, child_labels))
 }
 
 /// The widest parent's distinct child count `W` of a nested grouping, the
@@ -1698,6 +1903,26 @@ fn bad_row(v: &[f64], ok: impl Fn(f64) -> bool, what: &str) -> Option<ErrorMessa
         .map(|i| ErrorMessage::at_row(format!("{what} (row "), i, ")"))
 }
 
+/// The message `what (row k, value v; glmm::limits::limit)` of the first row
+/// `k` whose value fails `ok`.
+fn out_of_range(
+    v: &[f64],
+    ok: impl Fn(f64) -> bool,
+    what: &str,
+    limit: &str,
+) -> Option<ErrorMessage> {
+    v.iter().position(|&a| !ok(a)).map(|i| {
+        let after = format!(", value {:e}; glmm::limits::{limit})", v[i]);
+        ErrorMessage::at_row(format!("{what} (row "), i, &after)
+    })
+}
+
+/// Within [`MAX_DATA_ABS`]: false for NaN and ±inf, so one test covers
+/// finiteness and range.
+fn in_data_range(v: f64) -> bool {
+    v.abs() <= MAX_DATA_ABS
+}
+
 /// The input check [`super::fit`] and [`super::fit_with_start`] share: every
 /// caller mistake in `data`, `spec`, `start` and `opts` as a [`FitError`],
 /// before anything is fitted. What passes here reaches the kernels' own
@@ -1710,8 +1935,8 @@ pub(crate) fn validate(
     opts: &FitOptions,
 ) -> Result<(WeightPower, SeType), FitError> {
     // Here and not in `validate_design`: a predict of zero new rows is legal.
-    // The R port repeats this text for an empty data.frame (glmm-r/R/fastglmm.R)
-    // - change together.
+    // Bind's `check_rows` (glmm-bind/src/fns/mod.rs) and `formula::materialize`
+    // repeat this text - change together.
     if data.design.n == 0 {
         return Err(FitError::Shape(
             "Data has no rows (n = 0); a fit needs at least one row".into(),
@@ -1728,7 +1953,12 @@ pub(crate) fn validate(
     if y.len() != n {
         return Err(FitError::Shape("y must have n elements".into()));
     }
-    if let Some(m) = bad_row(y, f64::is_finite, "y must be finite") {
+    if let Some(m) = out_of_range(
+        y,
+        in_data_range,
+        &format!("y must be finite with |y| <= {MAX_DATA_ABS:e}"),
+        "MAX_DATA_ABS",
+    ) {
         return Err(FitError::ResponseOutOfSupport(m));
     }
     // An EMPTY field means "cold-start this component" — a caller that knows only
@@ -1758,6 +1988,15 @@ pub(crate) fn validate(
             return start_err(
                 "StartValues.dispersion must be finite and > 0, or None to cold-start it",
             );
+        }
+        if let (Family::NegativeBinomial { .. }, Some(d)) = (spec.family, s.dispersion) {
+            if !(NB_THETA_LO..=NB_THETA_HI).contains(&d) {
+                return start_err(&format!(
+                    "warm-start dispersion (the negative-binomial shape seed) must be within \
+                     [{NB_THETA_LO:e}, {NB_THETA_HI:e}] (value {d:e}; glmm::limits::NB_THETA_LO, \
+                     glmm::limits::NB_THETA_HI)"
+                ));
+            }
         }
     }
     // Response domain: refuse a response outside the family's support before
@@ -1796,6 +2035,38 @@ pub(crate) fn validate(
             return Err(FitError::OptionValue(
                 "FitOptions.dispersion must be finite and > 0".into(),
             ));
+        }
+        match spec.family {
+            Family::InverseGaussian { .. } => {
+                let lo = 1.0 / MAX_DATA_ABS;
+                if !(lo..=MAX_DATA_ABS).contains(&d) {
+                    return Err(FitError::OptionValue(
+                        format!(
+                            "dispersion on an inverse-Gaussian model must be within \
+                             [{lo:e}, {MAX_DATA_ABS:e}] (value {d:e}; glmm::limits::MAX_DATA_ABS)"
+                        )
+                        .into(),
+                    ));
+                }
+            }
+            Family::Gamma { .. } => {
+                // The GLM and the GLMM both use a held φ as `d / s` on the
+                // internal weight scale, so the box bounds that value; the
+                // message gives the range in the caller's units.
+                let s = crate::family::weight_scale(data.design.weights, n);
+                if !(GAMMA_PHI_LO..=GAMMA_PHI_HI).contains(&(d / s)) {
+                    return Err(FitError::OptionValue(
+                        format!(
+                            "dispersion on a Gamma model must be within [{:e}, {:e}] \
+                             (value {d:e}; glmm::limits::GAMMA_PHI_LO, glmm::limits::GAMMA_PHI_HI)",
+                            GAMMA_PHI_LO * s,
+                            GAMMA_PHI_HI * s
+                        )
+                        .into(),
+                    ));
+                }
+            }
+            _ => {}
         }
     }
     if let SeFor::Only(cols) = &opts.se_for {
@@ -1836,11 +2107,15 @@ pub(crate) fn validate_design(
             "x must have n*p elements in row-major layout".into(),
         ));
     }
-    if let Some(k) = x.iter().position(|v| !v.is_finite()) {
+    if let Some(k) = x.iter().position(|&v| !in_data_range(v)) {
         return Err(FitError::Shape(ErrorMessage::at_row(
-            "x must be finite (row ".to_string(),
+            format!("x must be finite with |x| <= {MAX_DATA_ABS:e} (row "),
             k / p,
-            &format!(", column {})", k % p),
+            &format!(
+                ", column {}, value {:e}; glmm::limits::MAX_DATA_ABS)",
+                k % p,
+                x[k]
+            ),
         )));
     }
     let z = re.unwrap_or(&[]);
@@ -1849,11 +2124,15 @@ pub(crate) fn validate_design(
             "re_columns must have n*s elements in row-major layout".into(),
         ));
     }
-    if let Some(k) = z.iter().position(|v| !v.is_finite()) {
+    if let Some(k) = z.iter().position(|&v| !in_data_range(v)) {
         return Err(FitError::Shape(ErrorMessage::at_row(
-            "re_columns must be finite (row ".to_string(),
+            format!("re_columns must be finite with |re_columns| <= {MAX_DATA_ABS:e} (row "),
             k / s,
-            &format!(", column {})", k % s),
+            &format!(
+                ", column {}, value {:e}; glmm::limits::MAX_DATA_ABS)",
+                k % s,
+                z[k]
+            ),
         )));
     }
     check_model_shape(spec, nagq)?;
@@ -1880,19 +2159,41 @@ pub(crate) fn validate_design(
                 "Data weights must have n elements".into(),
             ));
         }
-        if let Some(m) = bad_row(
+        let lo = 1.0 / MAX_DATA_ABS;
+        if let Some(m) = out_of_range(
             w,
-            |v| v.is_finite() && v > 0.0,
-            "Data weights must be finite and > 0",
+            |v| (lo..=MAX_DATA_ABS).contains(&v),
+            &format!("Data weights must be within [{lo:e}, {MAX_DATA_ABS:e}]"),
+            "MAX_DATA_ABS",
         ) {
             return Err(FitError::Weights(m));
+        }
+        if let Family::Binomial { .. } = spec.family {
+            if let Some(m) = out_of_range(
+                w,
+                |v| v <= MAX_TRIALS,
+                &format!("binomial weights (trial counts) must be <= {MAX_TRIALS:e}"),
+                "MAX_TRIALS",
+            ) {
+                return Err(FitError::Weights(m));
+            }
         }
     }
     if let Some(o) = offset {
         if o.len() != n {
             return Err(FitError::Offset("Data offset must have n elements".into()));
         }
-        if let Some(m) = bad_row(o, f64::is_finite, "Data offset must be finite") {
+        let (limit, name) = if crate::family::is_log_link(spec.family) {
+            (MAX_LOG_OFFSET_ABS, "MAX_LOG_OFFSET_ABS")
+        } else {
+            (MAX_DATA_ABS, "MAX_DATA_ABS")
+        };
+        if let Some(m) = out_of_range(
+            o,
+            |v| v.abs() <= limit,
+            &format!("Data offset must be finite with |offset| <= {limit:e} on this link"),
+            name,
+        ) {
             return Err(FitError::Offset(m));
         }
     }
@@ -2022,7 +2323,7 @@ fn estimate_refusal(spec: &ModelSpec, data: &Data<'_>) -> Option<FitError> {
 
 /// [`FitOptions::se_type`] resolved after the weight power `power`, on a fit
 /// by REML when `reml`, or the refusal of a named value. `None` is `Robust` on
-/// a REML δ fit with no random slope (D22), else `Model`.
+/// a REML δ fit with no random slope, else `Model`.
 pub(crate) fn resolve_se_type(
     spec: &ModelSpec,
     power: WeightPower,
@@ -2275,12 +2576,12 @@ fn check_terms(slopes: &[ColumnId], terms: &[ReTerm], grouping: &str) -> Result<
 
 /// The random-effect structures these data cannot identify, as notes:
 /// [`Note::SingleLevelGrouping`], [`Note::RepeatedGrouping`],
-/// [`Note::SlopeConstantWithinLevels`] and [`Note::SeparatedByGrouping`]
-/// (their docs give the exact conditions), ordered by grouping index, then in
-/// that kind order. A level is a distinct id of the grouping's id vector; a
-/// nested id already includes its parent. Values are compared with `==`.
-/// Reads only the data and the spec, so no estimate depends on it. Empty on
-/// a fixed-only spec.
+/// [`Note::OneTrialPerLevel`], [`Note::SlopeConstantWithinLevels`] and
+/// [`Note::SeparatedByGrouping`] (their docs give the exact conditions),
+/// ordered by grouping index, then in that kind order. A level is a distinct
+/// id of the grouping's id vector; a nested id already includes its parent.
+/// Values are compared with `==`. Reads only the data and the spec, so no
+/// estimate depends on it. Empty on a fixed-only spec.
 pub(super) fn identification_notes(design: &Design<'_>, y: &[f64], spec: &ModelSpec) -> Vec<Note> {
     let (Some(re), Some(ids), true) = (spec.re.as_ref(), design.ids, design.n > 0) else {
         return Vec::new();
@@ -2317,13 +2618,23 @@ pub(super) fn identification_notes(design: &Design<'_>, y: &[f64], spec: &ModelS
                 });
             }
         }
+        let width = gid.iter().max().map_or(0, |&m| m as usize + 1);
+        // Trials per level: the summed prior weights, which are the trial
+        // counts of an aggregated binomial response (1 per row unweighted).
+        let mut trials = vec![0.0; width];
+        for (i, &l) in gid.iter().enumerate() {
+            trials[l as usize] += design.weights.map_or(1.0, |w| w[i]);
+        }
+        let binomial = matches!(spec.family, Family::Binomial { .. });
+        if binomial && trials.iter().all(|&t| t <= 1.0) {
+            notes.push(Note::OneTrialPerLevel { grouping });
+        }
         // Without a random intercept a slope constant within levels is a
         // random intercept with a per-level scale, which is identified; the
         // separation argument below needs the intercept too.
         if !intercept {
             continue;
         }
-        let width = gid.iter().max().map_or(0, |&m| m as usize + 1);
         let mut first_row = vec![usize::MAX; width];
         for (i, &l) in gid.iter().enumerate() {
             if first_row[l as usize] == usize::MAX {
@@ -2387,20 +2698,13 @@ pub(super) fn identification_notes(design: &Design<'_>, y: &[f64], spec: &ModelS
         // (its marginal success probability is all that the variance moves),
         // so separation needs some level with more than one trial: two rows,
         // or one row of an aggregated response whose weight is its trials.
-        let several_trials = || {
-            let mut trials = vec![0.0; width];
-            for (i, &l) in gid.iter().enumerate() {
-                trials[l as usize] += design.weights.map_or(1.0, |w| w[i]);
-            }
-            trials.iter().any(|&t| t > 1.0)
-        };
         // A response constant over all rows is `ConstantResponse`'s case, not
         // separation through this grouping.
-        if matches!(spec.family, Family::Binomial { .. })
+        if binomial
             && y.iter().all(|&v| v == 0.0 || v == 1.0)
             && y.iter().any(|&v| v != y[0])
             && (0..n).all(|i| y[i] == y[first(i)])
-            && several_trials()
+            && trials.iter().any(|&t| t > 1.0)
         {
             notes.push(Note::SeparatedByGrouping { grouping });
         }
@@ -2526,11 +2830,18 @@ pub(crate) fn nan_vcov(p: usize) -> Vec<f64> {
 /// rank-deficient design, not those of a QR breakdown), over the `p` columns
 /// of `l`: `coef_df` is ν on the target columns, NaN elsewhere, and the record holds the full `C`, [`vcov_from_chol`] over
 /// every column whatever the targets. A fit that did not converge keeps the
-/// residual record, with ν and an all-NaN `C` (its contrasts are NaN, not
-/// `NoDf`), and `coef_df` stays NaN, as `se` does; the non-convergence is
-/// reported through `converged`, since no pass ran that could fail.
+/// residual record, with ν (NaN: the callers pass it so) and an all-NaN `C`
+/// (its contrasts are NaN, not `NoDf`), and `coef_df` stays NaN, as `se`
+/// does; a GLM that converged without a `C` keeps `n − p`. The non-convergence is
+/// reported through `converged`, since no pass ran that could fail. On a fit
+/// with no estimates (every entry of `beta` NaN) ν is NaN too
+/// ([`SatterthwaiteState::residual`]).
+///
+/// [`SatterthwaiteState::residual`]: crate::lmm::satterthwaite::SatterthwaiteState::residual
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn residual_df(
     l: faer::MatRef<'_, f64>,
+    beta: &[f64],
     nu: f64,
     p: usize,
     scale: f64,
@@ -2543,7 +2854,7 @@ pub(crate) fn residual_df(
     if !converged {
         return (
             coef_df,
-            SatterthwaiteState::residual(Mat::full(p, p, f64::NAN), nu),
+            SatterthwaiteState::residual(Mat::full(p, p, f64::NAN), nu, beta),
         );
     }
     let every: Vec<u32> = (0..p as u32).collect();
@@ -2554,7 +2865,7 @@ pub(crate) fn residual_df(
         }
     }
     let c = Mat::from_fn(p, p, |i, j| c[i * p + j]);
-    (coef_df, SatterthwaiteState::residual(c, nu))
+    (coef_df, SatterthwaiteState::residual(c, nu, beta))
 }
 
 /// Full `p×p` [`Fit::vcov`] from `l`, the lower-triangular Cholesky factor of a
@@ -2573,7 +2884,9 @@ pub(crate) fn residual_df(
 ///
 /// Only `targets` rows/columns are solved: outside that block there is no `u`
 /// to dot and the result stays NaN, so `vcov` is finite exactly where `se` is
-/// (the `targets`-subset carve-out). `l` must be
+/// (the `targets`-subset carve-out). When `scale` is finite and `> 0`, a
+/// diagonal entry that comes out 0 or not finite, and an off-diagonal entry
+/// that is not finite, is NaN: its variance left f64's range. `l` must be
 /// the converged factor — every caller gates on `converged` first, the same
 /// staleness contract [`crate::ols::OlsFitView::factor`] documents.
 pub(crate) fn vcov_from_chol(
@@ -2604,9 +2917,17 @@ pub(crate) fn vcov_from_chol(
         }
         cols.push((tj, u));
     }
+    let scale_ok = scale > 0.0 && scale.is_finite();
     for (a, (i, ui)) in cols.iter().enumerate() {
         for (j, uj) in cols[a..].iter() {
-            let v = scale * ui.iter().zip(uj).map(|(x, y)| x * y).sum::<f64>();
+            let mut v = scale * ui.iter().zip(uj).map(|(x, y)| x * y).sum::<f64>();
+            // A variance that underflows or overflows is not representable:
+            // NaN, not a false 0 or inf. An off-diagonal 0 stays, because
+            // uncorrelated columns give a true 0. Mirrors the OLS map back in
+            // `ols::fit_suff_stats_t_sq_mapped`.
+            if scale_ok && (!v.is_finite() || (i == j && v == 0.0)) {
+                v = f64::NAN;
+            }
             vcov[*i * p + *j] = v;
             vcov[*j * p + *i] = v;
         }

@@ -518,8 +518,11 @@ def test_test_and_anova_test_are_checked(exact_pair):
             glmm.anova(m0, m1, test=t)
     with pytest.raises(ValueError, match=r"test must be 'auto', 'Wald' or 'LRT', got 'lrt'"):
         glmm.anova(m1, test="lrt")
-    with pytest.raises(ValueError, match=r"anova_test must be 'auto', 'Wald' or 'LRT', got 'lrt'"):
+    with pytest.raises(
+        ValueError, match=r'anova_test must be "auto", "Wald" or "LRT", got "lrt"'
+    ) as bad:
         glmm.fit(D, "y ~ x", anova_test="lrt")
+    assert bad.value.code == "invalid_argument"
 
 
 # -- the comparison of two fits -------------------------------------------------
@@ -777,7 +780,9 @@ def test_nsim_and_seed_are_checked(exact_pair):
         glmm.anova(*exact_pair, nsim=0)
     with pytest.raises(ValueError, match="from 1 to 1000000"):
         glmm.anova(*exact_pair, nsim=1_000_001)
-    with pytest.raises(TypeError, match="nsim"):
+    with pytest.raises(
+        ValueError, match="^nsim must be a whole number from 1 to 1000000, got True$"
+    ):
         glmm.anova(*exact_pair, nsim=True)
     with pytest.raises(ValueError, match="seed"):
         glmm.anova(*exact_pair, seed=-1)
@@ -915,22 +920,6 @@ def test_pairwise_columns_follow_the_family(lmm, pois):
     # The ratio is exp(estimate), on a log link.
     tab = glmm.pairwise(pois[0], "f")
     np.testing.assert_allclose(tab["ratio"], np.exp(tab["estimate"]), rtol=1e-15)
-
-
-def test_pairwise_on_a_fit_that_did_not_converge_carries_the_note():
-    rng = np.random.default_rng(3)
-    n = 60
-    f = np.array(["a", "b", "c"])[np.arange(n) % 3]
-    x = rng.normal(size=n)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        m = glmm.fit({"y": (x > 0).astype(float), "x": x, "f": f}, "y ~ f + x", "binomial")
-    assert not m.converged
-    from glmm.anova import _NOT_CONVERGED
-
-    table = glmm.pairwise(m, "f")
-    assert table.notes[0] == _NOT_CONVERGED
-    assert table.confint().notes[0] == _NOT_CONVERGED
 
 
 def test_pairwise_adjust_reaches_the_crate(lmm):

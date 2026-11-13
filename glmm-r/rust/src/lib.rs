@@ -6,10 +6,10 @@
 //! (`extendr_module! { mod fastglmm; use glmm_r; }`).
 
 use extendr_api::prelude::*;
-use glmm_bind::{BindError, Record, Value};
+use glmm_bind::{BindError, Port, Record, Value};
 
-/// Fields holding positions, counted from 1 in R and from 0 in `glmm-bind`
-/// (D7). Only these are read -1; an `Index` result is written +1 whatever
+/// Fields holding positions, counted from 1 in R and from 0 in `glmm-bind`.
+/// Only these are read -1; an `Index` result is written +1 whatever
 /// its name.
 const INDEX_FIELDS: &[&str] = &["retained", "re_term_index", "null_cluster"];
 
@@ -27,8 +27,9 @@ fn bad(what: &str, why: &str) -> BindError {
 
 /// An R value as a [`Value`]; `what` is its argument or field name. A named
 /// list is a record, any other list a list; a factor keeps its levels in R's
-/// order (codes from 0, `NA` as -1); every vector stays a vector, as
-/// `glmm-bind` reads a one-element vector as a scalar.
+/// order (codes from 0, `NA` as -1); a lone logical, integer or string `NA`
+/// is [`Value::Na`]; every other vector stays a vector, as `glmm-bind` reads
+/// a one-element vector as a scalar.
 fn to_value(x: &Robj, what: &str) -> std::result::Result<Value, BindError> {
     if x.is_null() {
         return Ok(Value::Null);
@@ -83,6 +84,9 @@ fn to_value(x: &Robj, what: &str) -> std::result::Result<Value, BindError> {
         }
         Rtype::Integers => {
             let v = x.as_integer_slice().unwrap_or_default();
+            if v == [i32::MIN] {
+                return Ok(Value::Na);
+            }
             if v.contains(&i32::MIN) {
                 return Err(bad(what, "has a missing value"));
             }
@@ -93,6 +97,12 @@ fn to_value(x: &Robj, what: &str) -> std::result::Result<Value, BindError> {
         }
         Rtype::Logicals => {
             let v = x.as_logical_slice().unwrap_or_default();
+            if let [b] = v {
+                if b.is_na() {
+                    // `NA` given for an option: its reader names it in its refusal.
+                    return Ok(Value::Na);
+                }
+            }
             if v.iter().any(|b| b.is_na()) {
                 return Err(bad(what, "has a missing value"));
             }
@@ -100,6 +110,11 @@ fn to_value(x: &Robj, what: &str) -> std::result::Result<Value, BindError> {
         }
         Rtype::Strings => {
             let v: Vec<&str> = x.as_str_iter().map(Iterator::collect).unwrap_or_default();
+            if let [s] = v[..] {
+                if s.is_na() {
+                    return Ok(Value::Na);
+                }
+            }
             if v.iter().any(|s| s.is_na()) {
                 return Err(bad(what, "has a missing value"));
             }
@@ -145,6 +160,7 @@ fn to_r(v: Value, what: &str) -> Robj {
         Value::StrVec(x) => r!(x),
         Value::BoolVec(x) => r!(x),
         Value::Factor { .. } => unreachable!("glmm-bind returns no factor"),
+        Value::Na => unreachable!("glmm-bind returns no NA"),
         Value::Mat { nrow, ncol, data } => {
             let mut out = r!(data);
             let _ = out.set_attrib("dim", [nrow as i32, ncol as i32]);
@@ -168,7 +184,7 @@ fn to_r(v: Value, what: &str) -> Robj {
 }
 
 /// Run `glmm-bind`'s function `name` on the named list `inputs`. Returns
-/// `list(value)`, or `list(error, code, kind)` for the R helper
+/// `list(value)`, or `list(error, code)` for the R helper
 /// `.glmm_call()` to raise, so no R error unwinds through Rust frames.
 ///
 /// @usage NULL
@@ -176,18 +192,13 @@ fn to_r(v: Value, what: &str) -> Robj {
 #[extendr]
 fn glmm_call(name: &str, inputs: Robj) -> Robj {
     let out = to_value(&inputs, "inputs").and_then(|v| match v {
-        Value::Record(rec) => glmm_bind::call(name, rec),
-        Value::List(items) if items.is_empty() => glmm_bind::call(name, Record::new()),
+        Value::Record(rec) => glmm_bind::call(Port::R, name, rec),
+        Value::List(items) if items.is_empty() => glmm_bind::call(Port::R, name, Record::new()),
         _ => Err(bad("inputs", "must be a named list")),
     });
     match out {
         Ok(v) => list!(value = to_r(v, "")).into(),
-        Err(e) => list!(
-            error = e.message,
-            code = e.code,
-            kind = e.kind.map_or(r!(NULL), |k| r!(k))
-        )
-        .into(),
+        Err(e) => list!(error = e.message, code = e.code).into(),
     }
 }
 

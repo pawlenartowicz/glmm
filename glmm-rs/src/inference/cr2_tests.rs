@@ -1,4 +1,4 @@
-// Gates G2, G3, G4, G6 and G7 of spec 2-dcr at the kernel level: the pieces
+// The robust-fit checks at the kernel level: the pieces
 // against the frozen CR2 / HC2 references, the pole sum against the dense
 // route (a port of `validation/tools/cr2/lib.py::dense_cluster`), and against
 // exact identities.
@@ -28,8 +28,10 @@ fn blocks(cl: &[Cl]) -> Vec<ClusterBlock<'_>> {
         .collect()
 }
 
-/// GLS at the clusters' Φ: fills each `r`, returns M.
-fn gls(cl: &mut [Cl]) -> Mat<f64> {
+/// GLS at the clusters' Φ: fills each `r`, returns M and R = Lᵀ, L the
+/// Cholesky factor of M⁻¹ (a fit's route: M⁻¹ factored, never M inverted
+/// back).
+fn gls(cl: &mut [Cl]) -> (Mat<f64>, Mat<f64>) {
     let p = cl[0].x.ncols();
     let mut info = Mat::<f64>::zeros(p, p);
     let mut g = vec![0.0; p];
@@ -56,7 +58,12 @@ fn gls(cl: &mut [Cl]) -> Mat<f64> {
             .map(|i| c.y[i] - (0..p).map(|j| c.x[(i, j)] * beta[j]).sum::<f64>())
             .collect();
     }
-    m
+    let r = SeqLlt::new(info.as_ref())
+        .unwrap()
+        .L()
+        .transpose()
+        .to_owned();
+    (m, r)
 }
 
 fn unit(p: usize, j: usize) -> Vec<f64> {
@@ -64,11 +71,11 @@ fn unit(p: usize, j: usize) -> Vec<f64> {
 }
 
 /// SE and df of each coefficient.
-fn se_df(pc: &Cr2Pieces, m: &Mat<f64>) -> (Vec<f64>, Vec<f64>) {
-    let p = m.nrows();
+fn se_df(pc: &Cr2Pieces) -> (Vec<f64>, Vec<f64>) {
+    let p = pc.t.nrows();
     let v = pc.vcov();
     let se = (0..p).map(|j| v[(j, j)].sqrt()).collect();
-    let df = (0..p).map(|j| pc.df(m.as_ref(), &unit(p, j))).collect();
+    let df = (0..p).map(|j| pc.df(&unit(p, j))).collect();
     (se, df)
 }
 
@@ -134,14 +141,14 @@ fn golden_gap(kind: Kind, generator: &str, tol: f64) -> f64 {
     for e in list {
         let reference = load(kind, &e.name);
         let mut cl = clusters(e.data.as_deref().unwrap());
-        let m = gls(&mut cl);
-        let pc = cr2_pieces(&blocks(&cl), m.as_ref()).unwrap();
-        let (se, df) = se_df(&pc, &m);
-        // DCR-T7: dense at any size where the conditioning allows it, which
+        let (_, r) = gls(&mut cl);
+        let pc = cr2_pieces(&blocks(&cl), r.as_ref()).unwrap();
+        let (se, df) = se_df(&pc);
+        // Dense at any size where the conditioning allows it, which
         // sends the spread-1e4 and 1e6 clusters to the pole sum, agrees with it.
-        let (se_p, df_p) = se_df(&pole_pieces(&cl, &m), &m);
-        let any_size = cr2_pieces_with(&blocks(&cl), m.as_ref(), (usize::MAX, DENSE.1)).unwrap();
-        let (se_d, df_d) = se_df(&any_size, &m);
+        let (se_p, df_p) = se_df(&pole_pieces(&cl, &r));
+        let any_size = cr2_pieces_with(&blocks(&cl), r.as_ref(), (usize::MAX, DENSE.1)).unwrap();
+        let (se_d, df_d) = se_df(&any_size);
         let routes = max_rel(&se_p, &se_d).max(max_rel(&df_p, &df_d));
         assert!(routes <= 1e-12, "{}: routes differ by {routes:.2e}", e.name);
         let mut gap =
@@ -181,32 +188,91 @@ fn g4_hc2_matches_club_sandwich() {
 #[test]
 fn hc2_record_is_linear_in_n() {
     let mut cl = clusters("data/inference/hc2_n100.csv");
-    let m = gls(&mut cl);
-    let pc = cr2_pieces(&blocks(&cl), m.as_ref()).unwrap();
+    let (_, r) = gls(&mut cl);
+    let pc = cr2_pieces(&blocks(&cl), r.as_ref()).unwrap();
     assert!(pc.whole.is_empty());
+    assert_eq!((pc.t.nrows(), pc.t.ncols()), (3, 3));
     assert_eq!((pc.er.nrows(), pc.er.ncols()), (3, 100));
     assert_eq!((pc.row_e.nrows(), pc.row_e.ncols()), (3, 100));
     assert_eq!((pc.row_x.nrows(), pc.row_x.ncols()), (3, 100));
     assert_eq!(pc.row_phi.len(), 100);
 }
 
+/// The CR2 entry of the `cr2_df` references (12 clusters of 10, Φ_k = I +
+/// τ²11ᵀ, two columns 1e-7 apart) against its 50-digit df. R is the R factor
+/// of a QR of the stacked L_k⁻¹X_k, L_k the Cholesky factor of Φ_k: the route
+/// of a fit's Givens factor on a nearly singular design.
+#[test]
+fn cr2_df_match_50_digits_on_a_nearly_collinear_design() {
+    let list: Vec<_> = entries(Kind::Cr2Df)
+        .into_iter()
+        .filter(|e| e.raw.get("cluster").is_some())
+        .collect();
+    assert_eq!(list.len(), 1, "cr2_df entries with clusters");
+    let e = &list[0];
+    let d = csv_columns(e.data.as_deref().unwrap());
+    let tau = e.raw["tau2"].as_f64().unwrap().sqrt();
+    let mut groups: BTreeMap<i64, Vec<usize>> = BTreeMap::new();
+    for (i, g) in d[e.raw["cluster"].as_str().unwrap()].iter().enumerate() {
+        groups.entry(*g as i64).or_default().push(i);
+    }
+    let cols = ["a", "xi", "xi2"];
+    let cl: Vec<Cl> = groups
+        .values()
+        .map(|rows| Cl {
+            x: Mat::from_fn(rows.len(), 4, |i, j| match j {
+                0 => 1.0,
+                _ => d[cols[j - 1]][rows[i]],
+            }),
+            y: vec![],
+            lam: vec![1.0; rows.len()],
+            u: Mat::from_fn(rows.len(), 1, |_, _| tau),
+            // The df does not read the residuals.
+            r: rows.iter().map(|&i| d["y"][i]).collect(),
+        })
+        .collect();
+    let n: usize = cl.iter().map(|c| c.r.len()).sum();
+    let mut stack = Mat::<f64>::zeros(n, 4);
+    let mut at = 0;
+    for c in &cl {
+        let nk = c.r.len();
+        let phi = Mat::from_fn(nk, nk, |i, j| f64::from(u8::from(i == j)) + tau * tau);
+        let llt = SeqLlt::new(phi.as_ref()).unwrap();
+        let l = llt.L();
+        for j in 0..4 {
+            for i in 0..nk {
+                let acc: f64 = (0..i).map(|k| l[(i, k)] * stack[(at + k, j)]).sum();
+                stack[(at + i, j)] = (c.x[(i, j)] - acc) / l[(i, i)];
+            }
+        }
+        at += nk;
+    }
+    let r = stack.as_ref().qr().thin_R().to_owned();
+    let pc = cr2_pieces(&blocks(&cl), r.as_ref()).unwrap();
+    let df: Vec<f64> = (0..4).map(|j| pc.df(&unit(4, j))).collect();
+    let want = floats(&load(Kind::Cr2Df, &e.name)["df"]);
+    assert_eq!((df.len(), want.len()), (4, 4));
+    let gap = max_rel(&df, &want);
+    assert!(gap <= 1e-8, "df {df:?} against {want:?}: {gap:.2e}");
+}
+
 // ---- the two routes ----
 
 /// The pieces with every multi-row cluster on the pole sum.
-fn pole_pieces(cl: &[Cl], m: &Mat<f64>) -> Cr2Pieces {
-    cr2_pieces_with(&blocks(cl), m.as_ref(), (0, 0.0)).unwrap()
+fn pole_pieces(cl: &[Cl], r: &Mat<f64>) -> Cr2Pieces {
+    cr2_pieces_with(&blocks(cl), r.as_ref(), (0, 0.0)).unwrap()
 }
 
 /// The pieces with every multi-row cluster on the dense route, a port of
 /// `lib.py::dense_cluster`, whatever its conditioning.
-fn dense_pieces(cl: &[Cl], m: &Mat<f64>) -> Cr2Pieces {
-    cr2_pieces_with(&blocks(cl), m.as_ref(), (usize::MAX, f64::INFINITY)).unwrap()
+fn dense_pieces(cl: &[Cl], r: &Mat<f64>) -> Cr2Pieces {
+    cr2_pieces_with(&blocks(cl), r.as_ref(), (usize::MAX, f64::INFINITY)).unwrap()
 }
 
 /// Worst relative gap of SE and df over the unit contrasts, kernel vs dense.
-fn gap_to_dense(cl: &[Cl], m: &Mat<f64>) -> (f64, f64) {
-    let (se_q, df_q) = se_df(&pole_pieces(cl, m), m);
-    let (se_d, df_d) = se_df(&dense_pieces(cl, m), m);
+fn gap_to_dense(cl: &[Cl], r: &Mat<f64>) -> (f64, f64) {
+    let (se_q, df_q) = se_df(&pole_pieces(cl, r));
+    let (se_d, df_d) = se_df(&dense_pieces(cl, r));
     (max_rel(&se_q, &se_d), max_rel(&df_q, &df_d))
 }
 
@@ -315,8 +381,8 @@ fn g7_rank_of_u_matches_dense() {
             for c in cl.iter_mut() {
                 c.u = reduce_u(&c.lam, c.u.as_ref()).unwrap();
             }
-            let m = gls(&mut cl);
-            let (se, df) = gap_to_dense(&cl, &m);
+            let (_, r) = gls(&mut cl);
+            let (se, df) = gap_to_dense(&cl, &r);
             eprintln!("seed {seed} {name:28}: SE {se:.2e} df {df:.2e}");
             worst = worst.max(se).max(df);
         }
@@ -353,13 +419,13 @@ fn leverage_one(two: bool) -> Vec<Cl> {
 
 /// Worst relative gap of the pieces (per piece and cluster, to the dense
 /// piece's largest entry) and of the within contrasts' SE and df.
-fn leverage_gap(cl: &[Cl], m: &Mat<f64>, d: usize) -> f64 {
-    let p = m.nrows();
-    let pc = pole_pieces(cl, m);
+fn leverage_gap(cl: &[Cl], r: &Mat<f64>, d: usize) -> f64 {
+    let p = r.nrows();
+    let pc = pole_pieces(cl, r);
     assert_eq!(pc.null.len(), d);
-    assert_eq!(dense_pieces(cl, m).null.len(), d);
+    assert_eq!(dense_pieces(cl, r).null.len(), d);
     assert!(pc.null.iter().all(|(k, _)| *k == 0));
-    let dn = dense_pieces(cl, m);
+    let dn = dense_pieces(cl, r);
     let mut gap = 0.0f64;
     for ((f, epe), (fd, epd)) in pc.whole.iter().zip(&dn.whole) {
         for (a, b) in [(f, fd), (epe, epd)] {
@@ -380,8 +446,8 @@ fn leverage_gap(cl: &[Cl], m: &Mat<f64>, d: usize) -> f64 {
         }
     }
     // the within contrasts (intercept, x1) keep their CR2 SE and df
-    let (se, df) = se_df(&pc, m);
-    let (sed, dfd) = se_df(&dn, m);
+    let (se, df) = se_df(&pc);
+    let (sed, dfd) = se_df(&dn);
     gap.max(max_rel(&se[..2], &sed[..2]))
         .max(max_rel(&df[..2], &dfd[..2]))
 }
@@ -390,8 +456,8 @@ fn leverage_gap(cl: &[Cl], m: &Mat<f64>, d: usize) -> f64 {
 fn g7_leverage_one_clusters_match_dense() {
     for (two, d) in [(false, 1), (true, 2)] {
         let mut cl = leverage_one(two);
-        let m = gls(&mut cl);
-        let gap = leverage_gap(&cl, &m, d);
+        let (_, r) = gls(&mut cl);
+        let gap = leverage_gap(&cl, &r, d);
         eprintln!("leverage 1, {d} null direction(s): worst gap to dense {gap:.2e}");
         assert!(gap <= 2e-13, "gap {gap:.2e}");
     }
@@ -400,20 +466,20 @@ fn g7_leverage_one_clusters_match_dense() {
 #[test]
 fn g7_one_cluster_contrast_is_flagged_and_a_within_one_is_not() {
     let mut cl = leverage_one(true);
-    let m = gls(&mut cl);
-    let pc = cr2_pieces(&blocks(&cl), m.as_ref()).unwrap();
+    let (_, r) = gls(&mut cl);
+    let pc = cr2_pieces(&blocks(&cl), r.as_ref()).unwrap();
     for j in [2, 3] {
-        assert!(pc.identified_by_one(m.as_ref(), &unit(4, j)), "column {j}");
+        assert!(pc.identified_by_one(&unit(4, j)), "column {j}");
     }
     for j in [0, 1] {
-        assert!(!pc.identified_by_one(m.as_ref(), &unit(4, j)), "column {j}");
+        assert!(!pc.identified_by_one(&unit(4, j)), "column {j}");
     }
-    assert!(pc.identified_by_one(m.as_ref(), &[0.0, 1.0, 0.0, 1.0]));
+    assert!(pc.identified_by_one(&[0.0, 1.0, 0.0, 1.0]));
     let mut ri = clusters("data/inference/cr2_ri_s10.csv");
-    let m = gls(&mut ri);
-    let pc = cr2_pieces(&blocks(&ri), m.as_ref()).unwrap();
+    let (_, r) = gls(&mut ri);
+    let pc = cr2_pieces(&blocks(&ri), r.as_ref()).unwrap();
     assert!(pc.null.is_empty());
-    assert!(!pc.identified_by_one(m.as_ref(), &unit(3, 2)));
+    assert!(!pc.identified_by_one(&unit(3, 2)));
 }
 
 #[test]
@@ -423,10 +489,10 @@ fn g7_trace_q_is_the_gls_variance() {
         "data/inference/hc2_n20.csv",
     ] {
         let mut cl = clusters(path);
-        let m = gls(&mut cl);
-        let pc = cr2_pieces(&blocks(&cl), m.as_ref()).unwrap();
+        let (m, r) = gls(&mut cl);
+        let pc = cr2_pieces(&blocks(&cl), r.as_ref()).unwrap();
         for c in [unit(3, 0), unit(3, 1), unit(3, 2), vec![0.3, -1.2, 0.8]] {
-            let (tr, _) = pc.q_traces(m.as_ref(), &c);
+            let (tr, _) = pc.q_traces(&pc.whiten(&c));
             let cmc: f64 = (0..3)
                 .flat_map(|i| (0..3).map(move |j| (i, j)))
                 .map(|(i, j)| c[i] * m[(i, j)] * c[j])
@@ -439,8 +505,8 @@ fn g7_trace_q_is_the_gls_variance() {
     }
 }
 
-/// SE and df after scaling: r by `sr`, Φ and M by `sv`.
-fn scaled(cl: &[Cl], m: &Mat<f64>, sr: f64, sv: f64) -> (Vec<f64>, Vec<f64>) {
+/// SE and df after scaling: r by `sr`, Φ and M by `sv` (R by 1/√`sv`).
+fn scaled(cl: &[Cl], r: &Mat<f64>, sr: f64, sv: f64) -> (Vec<f64>, Vec<f64>) {
     let cl2: Vec<Cl> = cl
         .iter()
         .map(|c| Cl {
@@ -451,8 +517,8 @@ fn scaled(cl: &[Cl], m: &Mat<f64>, sr: f64, sv: f64) -> (Vec<f64>, Vec<f64>) {
             r: c.r.iter().map(|r| r * sr).collect(),
         })
         .collect();
-    let m2 = Mat::from_fn(m.nrows(), m.ncols(), |i, j| m[(i, j)] * sv);
-    se_df(&cr2_pieces(&blocks(&cl2), m2.as_ref()).unwrap(), &m2)
+    let r2 = Mat::from_fn(r.nrows(), r.ncols(), |i, j| r[(i, j)] / sv.sqrt());
+    se_df(&cr2_pieces(&blocks(&cl2), r2.as_ref()).unwrap())
 }
 
 #[test]
@@ -462,17 +528,17 @@ fn g7_y_and_w_scales_leave_the_df_and_scale_the_se() {
         "data/inference/hc2_n20.csv",
     ] {
         let mut cl = clusters(path);
-        let m = gls(&mut cl);
-        let (se, df) = scaled(&cl, &m, 1.0, 1.0);
+        let (_, r) = gls(&mut cl);
+        let (se, df) = scaled(&cl, &r, 1.0, 1.0);
         // y · 1e-4: r · 1e-4, and σ² (so Φ and M in the caller's units) · 1e-8
-        let (se_y, df_y) = scaled(&cl, &m, 1e-4, 1e-8);
+        let (se_y, df_y) = scaled(&cl, &r, 1e-4, 1e-8);
         let se_y: Vec<f64> = se_y.iter().map(|s| s / 1e-4).collect();
         assert!(
             max_rel(&se_y, &se) <= 1e-12 && max_rel(&df_y, &df) <= 1e-12,
             "{path}: y scale"
         );
         // w · 1e7: Φ and M in the kernel's units (σ² = 1) · 1e-7
-        let (se_w, df_w) = scaled(&cl, &m, 1.0, 1e-7);
+        let (se_w, df_w) = scaled(&cl, &r, 1.0, 1e-7);
         assert!(
             max_rel(&se_w, &se) <= 1e-12 && max_rel(&df_w, &df) <= 1e-12,
             "{path}: w scale"
@@ -480,7 +546,7 @@ fn g7_y_and_w_scales_leave_the_df_and_scale_the_se() {
     }
 }
 
-// ---- G6: the identity A C A z = Φ z on a cluster no dense code can hold ----
+// ---- the identity A C A z = Φ z on a cluster no dense code can hold ----
 
 /// Re[(Φ − i s)⁻¹ Z] through the split Z = Z̃ + U B (Z̃ᵀΛ⁻¹U = 0), with
 /// Ω = (Λ − i s)⁻¹ and K = I + UᵀΩU: (Φ − i s)⁻¹ U = Ω U K⁻¹ and
@@ -603,7 +669,7 @@ fn g6_aca_is_phi_at_100k_rows() {
     let start = std::time::Instant::now();
     let slope = [[1.0, 0.2], [0.2, 0.25]];
     let mut cl = build(&mut Rng(5), &[100_000, 100, 100, 100], slope, 2, 1);
-    let m = gls(&mut cl);
+    let (m, _) = gls(&mut cl);
     let mut hmk = Mat::<f64>::zeros(3, 3);
     for c in &cl[1..] {
         let u = reduce_u(&c.lam, c.u.as_ref()).unwrap();

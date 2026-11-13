@@ -1,8 +1,8 @@
 # fastglmm() - the package's one entry point. The R side does row filtering
-# (subset/na.action), family normalization, argument validation, and column
-# marshalling; the formula is parsed and lowered by the Rust side
-# (glmm::formula - one parser shared with the Python port, spec section 3), so this
-# file deliberately contains no model.matrix / terms machinery.
+# (subset/na.action), R family objects to a name and a link, and column
+# marshalling; the options are checked and the formula is parsed and lowered
+# by the native code (glmm-bind and glmm::formula, shared with the Python
+# port), so this file deliberately contains no model.matrix / terms machinery.
 
 `%||%` <- function(x, y) if (is.null(x)) y else x
 
@@ -13,25 +13,6 @@
 .arg_repr <- function(x) {
   if (is.character(x) && length(x) == 1L) sprintf("'%s'", x) else deparse(x)[1]
 }
-
-# Family/link table - mirrors glmm-py/glmm/__init__.py::_FAMILIES and
-# GLMM/glmm-rs/src/family.rs; change together. Links are the port vocabulary, not R's
-# (R's Gamma "inverse" maps to "inverse", "1/mu^2" to "inverse_squared").
-.FAMILIES <- list(
-  gaussian         = list(default_link = "identity", links = "identity"),
-  binomial         = list(default_link = "logit", links = c("logit", "probit", "cloglog")),
-  poisson          = list(default_link = "log", links = "log"),
-  gamma            = list(default_link = "log", links = c("log", "inverse")),
-  negativebinomial = list(default_link = "log", links = "log"),
-  inversegaussian  = list(default_link = "log", links = c("log", "inverse_squared"))
-)
-
-# Families where dispersion= is meaningful - mirrors
-# glmm-py/glmm/__init__.py::_DISPERSION_FAMILIES; change together.
-.DISPERSION_FAMILIES <- c("binomial", "poisson", "gamma", "inversegaussian")
-
-# Mirrors GLMM/glmm-rs/src/consts.rs::MAX_NAGQ - change together.
-.MAX_NAGQ <- 25L
 
 #' Fit a (generalized) linear or linear mixed model with the glmm Rust kernel
 #'
@@ -87,21 +68,24 @@
 #' Python port so the two ports agree.
 #'
 #' **Diagnostic warnings carry a condition class.** Each solver note is raised
-#' as a warning of class `"fastglmm_diagnostic"` with a per-kind subclass
+#' as a warning of class `"fastglmm_diagnostic"` with the per-kind subclass
+#' `"fastglmm_<kind>"`, `kind` as in `$warnings`
 #' (`"fastglmm_ill_conditioned"`, `"fastglmm_pirls_exhausted"`,
 #' `"fastglmm_single_level_grouping_dropped"`,
 #' `"fastglmm_few_rows_for_random_effects"`, `"fastglmm_repeated_grouping"`,
 #' `"fastglmm_slope_constant_within_levels"`, `"fastglmm_separated_by_grouping"`,
+#' `"fastglmm_one_trial_per_level"`,
 #' `"fastglmm_hessian_se_fallback"`,
 #' `"fastglmm_se_unavailable"`, `"fastglmm_exact_profile_fallback"`,
 #' `"fastglmm_gradient_search_fallback"`,
 #' `"fastglmm_precision_limited"`, `"fastglmm_non_integer_response"`, `"fastglmm_rows_dropped_na"`,
 #' `"fastglmm_satterthwaite_curvature"`, `"fastglmm_variance_at_limit"`,
+#' `"fastglmm_dispersion_at_limit"`,
+#' `"fastglmm_nb_shape_at_limit"`,
 #' `"fastglmm_weight_power_at_bound"`, `"fastglmm_weight_power_search_failures"`,
 #' `"fastglmm_weight_power_outside_unit"`, `"fastglmm_weight_power_implausible"`,
 #' `"fastglmm_robust_with_random_slope"`, `"fastglmm_robust_se_unidentified"`,
-#' `"fastglmm_robust_df_small"`; a note from
-#' a newer kernel than this package arrives as `"fastglmm_unknown_note"`;
+#' `"fastglmm_robust_df_small"`, and so on for every note kind;
 #' [contrast_test()], [pairwise()] and [predict()][predict.fastglmm] on a
 #' robust fit add `"fastglmm_model_based_joint_test"` and
 #' `"fastglmm_predict_se_model_based"`),
@@ -153,7 +137,9 @@
 #'   `list(beta =, theta =)` with `theta` the random-effect Cholesky vector,
 #'   plus an optional `dispersion =`: the estimated dispersion as a previous
 #'   fit reports it in `fit$dispersion` (the shape for negative binomial, phi
-#'   for Gamma), used as the search's starting value. Any element may be left
+#'   for a Gamma model with random effects), used as the search's starting
+#'   value; on any other family, and on a Gamma model without random effects,
+#'   `start$dispersion` is ignored with a warning. Any element may be left
 #'   out to cold-start that part.
 #'   `theta` is distinct from `init.theta`, which is the negative-binomial
 #'   shape (the same slot as `start$dispersion` there).
@@ -258,7 +244,9 @@
 #'   that [predict()][predict.fastglmm] and the Type II hypotheses read;
 #'   `NULL` otherwise), `robust` (on a robust fit, the CR2 or HC2 pieces its
 #'   tests read; `NULL` otherwise),
-#'   `rss`, `r_squared` and `adj_r_squared` (OLS fits only, `NaN` otherwise),
+#'   `rss`, `r_squared` and `adj_r_squared` (OLS fits only, `NaN` otherwise;
+#'   both R-squared also `NaN` when neither the response nor the fitted
+#'   values vary beyond round-off),
 #'   `offset` (the offset fitted with, `NULL` without one),
 #'   `satterthwaite_record` (what [contrast_test()] and [pairwise()] read on
 #'   a fit whose `df_method` is `"satterthwaite"`, `NULL` on every other fit),
@@ -305,16 +293,7 @@ fastglmm <- function(formula, data, family = gaussian(),
                      se_type = NULL,
                      ...) {
   .check_dots(...)
-  if (!(is.logical(satterthwaite) && length(satterthwaite) == 1L && !is.na(satterthwaite))) {
-    stop(sprintf("satterthwaite must be TRUE or FALSE, got %s", .arg_repr(satterthwaite)),
-         call. = FALSE)
-  }
-  if (!(is.logical(condvar) && length(condvar) == 1L && !is.na(condvar))) {
-    stop(sprintf("condvar must be TRUE or FALSE, got %s", .arg_repr(condvar)),
-         call. = FALSE)
-  }
-  .check_reml(REML)
-  anova_test <- match.arg(anova_test)
+  anova_test <- .choice(anova_test, c("auto", "Wald", "LRT"))
   # Captured before `data` is touched: the header's `Data:` line, as lme4
   # deparses it.
   data_name <- paste(deparse(substitute(data), width.cutoff = 500L), collapse = " ")
@@ -326,95 +305,13 @@ fastglmm <- function(formula, data, family = gaussian(),
   f_str <- paste(deparse(formula, width.cutoff = 500L), collapse = " ")
   .check_formula(formula)
 
-  fam <- .normalize_family(family)
-
-  mixed <- grepl("|", f_str, fixed = TRUE)
-  if (identical(fam$name, "inversegaussian") && mixed) {
-    stop("family 'inversegaussian' is GLM-only: random-effect terms are not supported",
-         call. = FALSE)
-  }
-
-  if (!(is.character(wald.se) && length(wald.se) == 1L && wald.se %in% c("hessian", "rx"))) {
-    stop(sprintf("wald.se must be 'hessian' or 'rx', got %s", .arg_repr(wald.se)),
-         call. = FALSE)
-  }
-
-  nAGQ <- .check_nagq(nAGQ)
+  fam <- .family_arg(family)
 
   store <- new.env(parent = emptyenv())
   store$rows <- list()
-  ignored <- c("fastglmm_argument_ignored", "fastglmm_diagnostic")
-
-  # Valid-but-inapplicable options: warn and strip, mirroring the Python port
-  # (nothing inapplicable may reach the kernel - its checks are assert!s).
-  if (!is.null(dispersion) && !(fam$name %in% .DISPERSION_FAMILIES)) {
-    .warn_keep(store, "argument_ignored",
-               sprintf("dispersion= has no effect for family '%s'.", fam$name), ignored)
-    dispersion <- NULL
-  }
-  if (!is.null(dispersion)) {
-    ok <- identical(dispersion, "estimate") ||
-      (is.numeric(dispersion) && length(dispersion) == 1L && is.finite(dispersion))
-    if (!ok) {
-      stop(sprintf("dispersion must be NULL, 'estimate', or a number, got %s",
-                    .arg_repr(dispersion)),
-           call. = FALSE)
-    }
-    if (fam$name %in% c("binomial", "poisson") && mixed) {
-      .warn_keep(store, "argument_ignored", paste(
-        "Quasi-likelihood dispersion= is not supported yet for binomial or Poisson",
-        "models. The default dispersion of 1 was used."), ignored)
-      dispersion <- NULL
-    }
-  }
-  if (identical(dispersion, "estimate") && fam$name %in% c("gamma", "inversegaussian")) {
-    # The phi families' default (NULL) already estimates phi.
-    dispersion <- NULL
-  }
-  if (!is.null(dispersion) && fam$name %in% c("binomial", "poisson")) {
-    # mirrors glmm-py/glmm/__init__.py's NotImplementedError block - change together.
-    stop("quasi-likelihood dispersion on family '", fam$name,
-         "' is not yet implemented in the kernel",
-         call. = FALSE)
-  }
-  if (!is.null(init.theta) && fam$name != "negativebinomial") {
-    .warn_keep(store, "argument_ignored",
-               sprintf("init.theta= is not used for family '%s'.", fam$name), ignored)
-    init.theta <- NULL
-  }
-  if (!is.null(start)) {
-    if (!is.list(start)) {
-      stop(sprintf(paste(
-        "start must be a list with elements 'beta', 'theta' and/or 'dispersion' (theta",
-        "is the random-effect Cholesky vector, not the negative-binomial shape - that is",
-        "init.theta or dispersion), got %s"), class(start)[1L]), call. = FALSE)
-    }
-    unknown <- setdiff(names(start), c("beta", "theta", "dispersion"))
-    if (length(unknown)) {
-      .warn_keep(store, "argument_ignored", paste0(
-        "start accepts only 'beta', 'theta' and 'dispersion'; these entries were ",
-        "ignored: ", paste(unknown, collapse = ", "), "."), ignored)
-      start <- start[intersect(names(start), c("beta", "theta", "dispersion"))]
-    }
-  }
-  # init.theta is the negative-binomial shape seed: the same kernel slot as
-  # start$dispersion, so giving both is ambiguous.
-  if (!is.null(init.theta)) {
-    if (!is.null(start$dispersion)) {
-      stop("give the negative-binomial shape seed once: init.theta= or ",
-           "start$dispersion, not both", call. = FALSE)
-    }
-    start <- c(start, list(dispersion = init.theta))
-  }
-  if (!is.null(start$dispersion) &&
-      !(is.numeric(start$dispersion) && length(start$dispersion) == 1L &&
-        is.finite(start$dispersion) && start$dispersion > 0)) {
-    stop("start$dispersion (or init.theta) must be one finite number > 0",
-         call. = FALSE)
-  }
 
   # --- data prep: row filtering (subset, na.action) happens HERE, on the
-  # data.frame, before marshalling - data prep, not parsing (spec section 3.1). ---
+  # data.frame, before marshalling - data prep, not parsing. ---
   vars <- all.vars(formula)
   data <- .as_data_frame(data, vars)
   frame <- .data_columns(data, vars)
@@ -452,22 +349,13 @@ fastglmm <- function(formula, data, family = gaussian(),
            "the data", call. = FALSE)
     }
   }
-  if (nrow(frame) == 0L) {
+  if (nrow(frame) == 0L && n_before_na > 0L) {
     # Mirrors the Python port's fit(), which raises the same text when its own
     # missing-value row drop empties the data - change together
-    # (glmm-py/glmm/__init__.py, the na_mask block). An empty data.frame gets
-    # the kernel's text, as Python passes it through. A subset= that keeps no
-    # row has no Python counterpart, so it keeps the plain message. The
-    # empty-data.frame text mirrors the kernel's n == 0 check in
-    # glmm-rs/src/fit/common.rs - change together.
-    if (n_before_na > 0L) {
-      stop("every row has a missing value in a column the formula uses; no rows left to fit",
-           call. = FALSE)
-    }
-    if (nrow(data) == 0L) {
-      stop("Data has no rows (n = 0); a fit needs at least one row", call. = FALSE)
-    }
-    stop("no rows left to fit", call. = FALSE)
+    # (glmm-py/glmm/__init__.py, the na_mask block). Data with no rows, or a
+    # subset= that keeps none, reaches the native code, which says so.
+    stop("every row has a missing value in a column the formula uses; no rows left to fit",
+         call. = FALSE)
   }
   if (nrow(frame) < n_before_na) {
     # Mirrors the Python port's fit(), which does its own row-drop bookkeeping
@@ -483,30 +371,28 @@ fastglmm <- function(formula, data, family = gaussian(),
   w <- frame[["(weights)"]]
   o <- frame[["(offset)"]]
 
-  cols <- .marshal(frame, vars, c(all.vars(formula[[2L]]), .offset_vars(formula)))
+  # A one-sided formula has no response; the native code refuses it.
+  response <- if (length(formula) == 3L) all.vars(formula[[2L]])
+  cols <- .marshal(frame, vars, c(response, .offset_vars(formula)))
 
   r <- .glmm_call("fit", list(
     formula = f_str, numeric = cols$numeric, factors = cols$factors,
     family = fam$name, link = fam$link, wald_se = wald.se, nagq = nAGQ,
-    dispersion = .optional(dispersion), weights = .optional(w), offset = .optional(o),
-    warm_start = .warm_start(start), satterthwaite = satterthwaite, condvar = condvar,
-    reml = REML, anova_test = if (identical(anova_test, "auto")) "Wald" else anova_test,
+    dispersion = dispersion, init_theta = init.theta, weights = .optional(w),
+    offset = .optional(o), warm_start = start, satterthwaite = satterthwaite,
+    condvar = condvar, reml = REML,
+    anova_test = if (identical(anova_test, "auto")) "Wald" else anova_test,
     weight_power = weight_power, se_type = se_type,
     row_index = row_index, row_base = 1L
   ))
-  # The native call has refused anything but NULL, "estimate" and a number.
-  if (is.numeric(weight_power) && weight_power != 1 && is.na(r$weight_power)) {
-    .warn_keep(store, "argument_ignored", sprintf(
-      "weight_power = %s has no effect without weights.", format(weight_power)), ignored)
-  }
 
-  fit <- .fit_object(r, store, fam, nAGQ, dispersion, f_str, frame, row_index, match.call(),
-                     data_name)
+  fit <- .fit_object(r, store, fam$object, f_str, frame, row_index, match.call(), data_name)
   if (identical(anova_test, "auto")) {
     # An environment, so the tables `.lrt_tables` makes stay with every copy
     # of the fit.
-    fit$.lrt <- list2env(list(call = list(wald.se = wald.se, nAGQ = nAGQ,
-                                          dispersion = dispersion, start = start)),
+    fit$.lrt <- list2env(list(call = list(wald.se = wald.se, nAGQ = fit$nAGQ,
+                                          dispersion = r$dispersion_held,
+                                          start = r$warm_start)),
                          parent = emptyenv())
   }
   fit
@@ -517,42 +403,10 @@ fastglmm <- function(formula, data, family = gaussian(),
 # "fastglmm" list. fastglmm() and compare() share it, so a fit made by
 # compare() is the object fastglmm() makes. `row_index` is each frame row's
 # 1-based position in the caller's data.
-.fit_object <- function(r, store, fam, nAGQ, dispersion, f_str, frame, row_index, call,
-                        data_name) {
-  ignored <- c("fastglmm_argument_ignored", "fastglmm_diagnostic")
-  # Whether the FITTED model actually has random effects - not `mixed`, which
-  # only says the formula asked for some: a single-level grouping is dropped
-  # after lowering ("single_level_grouping_dropped"), and once every
-  # random-effect term is dropped this way, `r$re_group_names` comes back
-  # empty even though `mixed` (read off the formula text before fitting)
-  # still says TRUE.
-  fitted_mixed <- length(r$re_group_names) > 0L
-  if (!is.null(r$agq_warning) && (identical(fam$name, "gaussian") || !fitted_mixed)) {
-    # nAGQ changes nothing here; see the Python port's fit() for why.
-    reason <- if (identical(fam$name, "gaussian")) {
-      "a Gaussian model"
-    } else {
-      "a model without random effects"
-    }
-    .warn_keep(store, "argument_ignored", sprintf(
-      "nAGQ=%d has no effect for %s, because nothing is approximated.", nAGQ, reason),
-      ignored)
-  } else if (!is.null(r$agq_warning)) {
-    # Built here, not taken from `agq_warning`: that string says nagq=, not nAGQ=.
-    .warn_keep(store, "agq_fallback", sprintf(paste(
-      "nAGQ=%d works only for %s models whose random effects are in one",
-      "grouping factor, with at most 3 random effects in it. This model was fitted",
-      "without adaptive quadrature."), nAGQ, .AGQ_FAMILIES),
-      c("fastglmm_agq_fallback", "fastglmm_diagnostic"))
-  }
-  if (!is.null(r$reml_warning)) {
-    # Decided by the shared rule in run_fit (src/orchestrate.rs), on the model
-    # actually fitted; worded here, as for nAGQ above, in this port's spelling.
-    # Mirrors the Python port's reml_warning block - change together.
-    .warn_keep(store, "argument_ignored", paste(
-      "REML = TRUE applies only to Gaussian models; it was ignored and the model was",
-      "fitted by maximum likelihood."), ignored)
-  }
+.fit_object <- function(r, store, family, f_str, frame, row_index, call, data_name) {
+  # The options the fit did not use, worded by the native code in this port's
+  # spelling, after the data-prep warning and before the fit's own.
+  for (w in r$argument_notes) .warn_entry(store, w, .note_class(w$kind))
   # Singularity is not assessed on a fit that did not converge: the kernel never sets
   # `singular` there (the post-hoc check and the boundary flags are gated on
   # `converged`), so `r$singular` reads FALSE on a non-converged fit. `isTRUE(r$converged)`
@@ -609,10 +463,7 @@ fastglmm <- function(formula, data, family = gaussian(),
     # p_r^2 vectors, dC/dtheta_k per free coordinate), c (p_r^2, Cov(beta-hat)),
     # tau (sigma-hat^2), nu (its divisor) and retained (1-based retained
     # columns, NULL when every column was retained). The free theta coordinates
-    # are in the kernel's order, which differs from the order the groupings
-    # were written in when glmm makes the grouping with the most levels the
-    # primary; the df and the contrast tests use them only in sums over all
-    # coordinates, so the order does not change any result. About p^2 (n_free + 1)
+    # are in the order the groupings were declared. About p^2 (n_free + 1)
     # doubles, kept by saveRDS(). Mirrors the Python port's
     # Fit.satterthwaite_record - change together.
     satterthwaite_record = r$satterthwaite_record,
@@ -621,10 +472,10 @@ fastglmm <- function(formula, data, family = gaussian(),
     r_squared = r$r_squared,
     adj_r_squared = r$adj_r_squared,
     dispersion = r$dispersion,
-    # The numeric dispersion= argument the caller passed (Gamma or
-    # inverse-Gaussian only; NULL when left to estimate). print.summary's
+    # The dispersion the fit held fixed (a number given as dispersion= on
+    # Gamma or inverse-Gaussian; NULL when estimated). print.summary's
     # dispersion label reads this to print "fixed" instead of "ML"/"Pearson".
-    dispersion_held = dispersion,
+    dispersion_held = r$dispersion_held,
     converged = r$converged,
     singular = r$singular,
     # Everything the solver reports about the fit itself, mirroring the Rust
@@ -641,14 +492,11 @@ fastglmm <- function(formula, data, family = gaussian(),
     #             through converged = FALSE.
     #   pinned    one logical vector per grouping, in varcorr order, one entry
     #             per variance component: pinned[[g]][i] pairs with
-    #             .stddev_corr(varcorr[[g]])$stddev[i]. ON A CONVERGED FIT,
-    #             EMPTY MEANS NOTHING WAS PINNED - a model with no variance
-    #             components (OLS, GLM, fixed-effect-only negative binomial)
-    #             reports empty for the same reason: there was nothing to pin.
-    #             fastglmm() does not error on converged = FALSE: pinned is
-    #             empty on every non-converged fit - a failed fit, and a fit
-    #             stopped at its evaluation budget, where nothing is pinned at
-    #             the capped endpoint.
+    #             .stddev_corr(varcorr[[g]])$stddev[i]. One vector per
+    #             grouping on every fit, all FALSE when nothing was pinned
+    #             (also on a fit that did not converge); empty on a model
+    #             without random effects (OLS, GLM, fixed-effect-only negative
+    #             binomial).
     #   notes     list of list(kind=, tier=, title=, message= (NULL raises
     #             nothing), columns=, pivot=, evals=, final_eval=,
     #             detail=, delta=, lower=, upper=, failed=, not_converged=);
@@ -700,12 +548,14 @@ fastglmm <- function(formula, data, family = gaussian(),
     # only the kernel knows which RE block layout the data routed to.
     ranef_blocks = r$ranef_blocks,
     # What predict() and simulate() read besides the public fields, private:
-    # the flat conditional modes and their level counts, and the conditional
-    # variances in the kernel's layout (glmm-bind's fit record). The
+    # the flat conditional modes and their level counts, the conditional
+    # variances in the kernel's layout (glmm-bind's fit record), and each
+    # grouping's observed level count, which summary() prints. The
     # training columns are `frame`, marshalled again on each call. NULL on a
     # fit saved before them. Mirrors the Python port's `Fit._kernel_parts` -
     # change together.
-    .kernel_parts = r[c("ranef", "ranef_levels", "condvar", "condvar_x", "condvar_cross")],
+    .kernel_parts = r[c("ranef", "ranef_levels", "condvar", "condvar_x", "condvar_cross",
+                        "re_group_levels")],
     # Each frame row's 1-based position in the caller's data, so an error of
     # predict() or simulate() on the frame's rows names the caller's row. NULL
     # when no row was dropped, and on a fit saved before it. Mirrors the
@@ -746,16 +596,18 @@ fastglmm <- function(formula, data, family = gaussian(),
              dimnames = list(r$names, r$names))
     },
     # On a robust fit, its CR2 or HC2 pieces, which the tests of a robust fit
-    # read back: list(er, f, epe, row_e, row_x, row_phi, null_cluster, null),
-    # every matrix a flat column-major double vector over the p coefficients
-    # (zero on an aliased one), cluster k the k-th level of the grouping factor
-    # with rows, or row k without one: er (p * G, E_k r_k per cluster), f and
-    # epe (lists of p * p, F_k and E_k Phi_k E_k' per cluster of more than one
-    # row), row_e and row_x (p * n1, e_k and x_k per one-row cluster), row_phi
-    # (n1, its scalar Phi_k), null_cluster (1-based cluster of each null
-    # direction) and null (a list of p-vectors). NULL on a model fit and on a
-    # fit saved before it. Mirrors the Python port's Fit.robust - change
-    # together.
+    # read back: list(t, er, f, epe, row_e, row_x, row_phi, null_cluster,
+    # null), every matrix a flat column-major double vector, cluster k the k-th
+    # level of the grouping factor with rows, or row k without one. t
+    # (p * pz, the map beta = t beta_Z, a zero row on an aliased coefficient)
+    # maps the pz whitened coordinates to the p coefficients; the other
+    # matrices are over the pz whitened coordinates: er (pz * G, E_k r_k per
+    # cluster), f and epe (lists of pz * pz, F_k and E_k Phi_k E_k' per cluster
+    # of more than one row), row_e and row_x (pz * n1, e_k and z_k per one-row
+    # cluster), row_phi (n1, its scalar Phi_k), null_cluster (1-based cluster
+    # of each null direction) and null (a list of pz-vectors). NULL on a
+    # model fit and on a fit saved before it. Mirrors the Python port's
+    # Fit.robust - change together.
     robust = r$robust,
     # The design summary of a Gaussian fit whose only random term is one
     # random intercept (1 | g), with no prior weights and at least one
@@ -795,18 +647,18 @@ fastglmm <- function(formula, data, family = gaussian(),
     term_test_auto = r$term_test_auto,
     call = call,
     formula = f_str,
-    family = fam$object,
+    family = family %||% .family_object(r$family, r$link),
     # Port-vocabulary family name ("gamma", not R's "Gamma") - what the
     # methods dispatch on; `family` above is the R-facing object.
-    family_name = fam$name,
+    family_name = r$family,
     # The port-vocabulary link ("inverse_squared", not R's "1/mu^2").
-    link = fam$link,
+    link = r$link,
     frame = frame,
     nobs = nrow(frame),
     data_name = data_name,
-    # Effective node count: the shim strips ineligible nAGQ>1 to Laplace
-    # (with the warning surfaced above), so record what actually ran.
-    nAGQ = if (is.null(r$agq_warning)) nAGQ else 1L
+    # The nodes that ran: 1 where nAGQ > 1 does not apply (with the warning
+    # raised above).
+    nAGQ = as.integer(r$nagq)
   ), class = "fastglmm")
 }
 
@@ -833,6 +685,12 @@ fastglmm <- function(formula, data, family = gaussian(),
 
 # The columns `vars` of `data`, every one of them present.
 .data_columns <- function(data, vars) {
+  # Mirrors `_prepare_columns` in the Python port: change together. Without
+  # it, .subset() would silently read the first of two same-named columns.
+  dup <- intersect(names(data)[duplicated(names(data))], vars)
+  if (length(dup)) {
+    stop("data has duplicate column name(s): ", paste(dup, collapse = ", "), call. = FALSE)
+  }
   missing_cols <- setdiff(vars, names(data))
   if (length(missing_cols)) {
     stop("column(s) not found in data: ", paste(missing_cols, collapse = ", "),
@@ -940,40 +798,9 @@ fastglmm <- function(formula, data, family = gaussian(),
   list(numeric = numeric_cols, factors = factor_cols)
 }
 
-# fastglmm()'s start= as the native fit's warm_start: NULL when it gives
-# nothing, so the fit starts cold.
-.warm_start <- function(start) {
-  warm <- Filter(length, list(beta = as.double(start$beta), theta = as.double(start$theta),
-                              dispersion = as.double(start$dispersion)))
-  if (length(warm)) warm
-}
-
-# The kinds the fit record's notes and `failure` carry that have a class of
-# their own, "fastglmm_<kind>"; any other kind is "fastglmm_unknown_note".
-# Every class also inherits "fastglmm_diagnostic", so one handler catches the
-# whole channel. Mirrors the Python port's _CATEGORIES (glmm-py/glmm/__init__.py)
-# - change together.
-.NOTE_KINDS <- c(
-  "search_limit", "fit_failed", "glm_diverged", "design_unsolvable", "constant_response",
-  "too_few_rows", "no_coefficients", "ill_conditioned", "pirls_exhausted",
-  "nb_shape_unsettled", "single_level_grouping_dropped", "few_rows_for_random_effects",
-  "repeated_grouping", "slope_constant_within_levels", "separated_by_grouping",
-  "variance_at_limit", "hessian_se_fallback", "se_unavailable", "gradient_search_fallback",
-  "exact_profile_fallback", "precision_limited", "non_integer_response",
-  "satterthwaite_curvature", "weight_power_at_bound", "weight_power_search_failures",
-  "weight_power_outside_unit", "weight_power_implausible", "robust_with_random_slope",
-  "robust_se_unidentified", "robust_df_small"
-)
-
-.note_class <- function(kind) {
-  c(if (kind %in% .NOTE_KINDS) paste0("fastglmm_", kind) else "fastglmm_unknown_note",
-    "fastglmm_diagnostic")
-}
-
-# The families nAGQ > 1 covers, as the fallback message names them. Mirrors the
-# kernel's AGQ eligibility check (src/orchestrate.rs, the `if nagq > 1` block)
-# and the Python port's _AGQ_FAMILIES - change together.
-.AGQ_FAMILIES <- "binomial, Poisson, negative-binomial or Gamma"
+# The classes of a note of `kind`: "fastglmm_<kind>", then
+# "fastglmm_diagnostic", so one handler catches the whole channel.
+.note_class <- function(kind) c(paste0("fastglmm_", kind), "fastglmm_diagnostic")
 
 # Raise one classed warning this port words itself, under the tier and title
 # of `kind`; see .warn_entry.
@@ -1011,9 +838,9 @@ fastglmm <- function(formula, data, family = gaussian(),
 # so a scan for exactly-zero stddevs misses those pins entirely.
 #
 # character(0) means nothing was pinned - including a model with no variance
-# components to pin. `singular` can still be TRUE with `pinned` empty (the
+# components to pin. `singular` can still be TRUE with nothing pinned (the
 # post-hoc negligible-stddev check is independent of the optimizer's own pin
-# decision), so the bare warning text stands regardless - empty `pinned` is
+# decision), so the bare warning text stands regardless - character(0) is
 # never evidence that the fit is not singular.
 # Mirrors glmm-py/glmm/__init__.py::_pinned_detail - change together.
 .pinned_detail <- function(pinned, group_names, group_terms) {
@@ -1032,8 +859,8 @@ fastglmm <- function(formula, data, family = gaussian(),
 .count <- function(n, word) sprintf("%d %s%s", as.integer(n), word, if (n == 1) "" else "s")
 
 # `...` exists only to intercept known lme4 arguments with designed errors
-# (spec section 1/section 4) - an unknown argument must never be silently swallowed
-# (Decision 5: error, never silently differ).
+# - an unknown argument must never be silently swallowed
+# (error, never silently differ).
 .check_dots <- function(...) {
   dots <- list(...)
   if (!length(dots)) return(invisible())
@@ -1058,30 +885,6 @@ fastglmm <- function(formula, data, family = gaussian(),
   invisible()
 }
 
-# nAGQ as an integer, or an error.
-.check_nagq <- function(nAGQ) {
-  if (!(is.numeric(nAGQ) && length(nAGQ) == 1L && !is.na(nAGQ) &&
-        nAGQ == as.integer(nAGQ) && nAGQ >= 1L && nAGQ <= .MAX_NAGQ &&
-        nAGQ %% 2L == 1L)) {
-    stop(sprintf("nAGQ must be an odd integer in 1..=%d, got %s", .MAX_NAGQ, .arg_repr(nAGQ)),
-         call. = FALSE)
-  }
-  as.integer(nAGQ)
-}
-
-# lme4's `REML =`: only the type is checked here. What each value means on
-# the model actually fitted (after lowering, so a formula whose every grouping
-# was dropped counts as OLS) is decided once, by the shared rule in run_fit
-# (src/orchestrate.rs), for both ports.
-.check_reml <- function(reml) {
-  if (is.null(reml)) return(invisible())
-  if (!(is.logical(reml) && length(reml) == 1L && !is.na(reml))) {
-    stop(sprintf("REML must be NULL, TRUE or FALSE, got %s", .arg_repr(reml)),
-         call. = FALSE)
-  }
-  invisible()
-}
-
 # Anything not caught here falls through to the shared Rust parser, whose own
 # message is surfaced verbatim.
 .check_formula <- function(formula) {
@@ -1090,12 +893,6 @@ fastglmm <- function(formula, data, family = gaussian(),
   # uses (glmm-py/glmm/__init__.py's `_check_call`) - change together.
   if ("." %in% all.vars(formula)) {
     stop("'.' is not supported by the formula parser; list the columns explicitly",
-         call. = FALSE)
-  }
-  if (length(formula) != 3L) {
-    # Same text as `materialize`'s no-response error in
-    # glmm-rs/src/formula/materialize.rs - change together.
-    stop("formula syntax error at position 0: the formula has no response; write it as y ~ x",
          call. = FALSE)
   }
   invisible()
@@ -1148,7 +945,7 @@ fastglmm <- function(formula, data, family = gaussian(),
 # variables are out of scope on purpose - only fixed-effects factors are
 # contrast-coded here.
 .check_contrasts <- function(formula, frame) {
-  fixed_rhs <- .strip_bars(formula[[3L]])
+  fixed_rhs <- .strip_bars(formula[[length(formula)]])
   if (is.null(fixed_rhs)) return(invisible())
   has_unordered_factor <- FALSE
   for (nm in all.vars(fixed_rhs)) {
@@ -1179,11 +976,14 @@ fastglmm <- function(formula, data, family = gaussian(),
   invisible()
 }
 
-# family (object | function | string) -> list(name=, link=, object=) in the
-# port vocabulary. A family OBJECT is honored as given - R semantics win -
-# which is the documented Gamma() link trap: Gamma() means link "inverse",
-# the string "gamma" means the glmm default "log".
-.normalize_family <- function(family) {
+# family (object | function | string) -> list(name=, link=, object=), the
+# native fit's family and link arguments and the R family object. A family
+# OBJECT is honored as given - R semantics win - which is the documented
+# Gamma() link trap: Gamma() means link "inverse", the string "gamma" means
+# the glmm default "log". A string passes as given (link NULL, object NULL):
+# the native code checks it, and .family_object() builds the object from the
+# fit's family and link.
+.family_arg <- function(family) {
   if (is.function(family)) family <- family()
   if (inherits(family, "family")) {
     rname <- family$family
@@ -1209,34 +1009,25 @@ fastglmm <- function(formula, data, family = gaussian(),
       stop("unsupported link '", family$link, "' for family '", rname, "'",
            call. = FALSE)
     )
-    object <- family
-  } else if (is.character(family) && length(family) == 1L) {
-    name <- switch(tolower(family),
-      gaussian = "gaussian", binomial = "binomial", poisson = "poisson",
-      gamma = "gamma",
-      negativebinomial = , `negative.binomial` = "negativebinomial",
-      inversegaussian = , `inverse.gaussian` = "inversegaussian",
-      stop("unknown family '", family, "'; expected one of ",
-           paste(names(.FAMILIES), collapse = ", "), call. = FALSE)
-    )
-    link <- .FAMILIES[[name]]$default_link
-    object <- switch(name,
-      gaussian = stats::gaussian(),
-      binomial = stats::binomial(),
-      poisson = stats::poisson(),
-      gamma = stats::Gamma(link = "log"), # glmm's gamma default, NOT R's
-      # No R constructor exists for these; a minimal family-shaped record
-      # keeps family(fit) printable.
-      structure(list(family = name, link = link), class = "family")
-    )
+    list(name = name, link = link, object = family)
+  } else if (is.character(family)) {
+    list(name = family, link = NULL, object = NULL)
   } else {
     stop("`family` must be a family object, family function, or string",
          call. = FALSE)
   }
-  spec <- .FAMILIES[[name]]
-  if (!(link %in% spec$links)) {
-    stop("family '", name, "' does not support link '", link, "'; expected ",
-         "one of ", paste(spec$links, collapse = ", "), call. = FALSE)
-  }
-  list(name = name, link = link, object = object)
+}
+
+# The R family object of a fit made with a family string, from the fit's
+# family and link (both in the port vocabulary).
+.family_object <- function(name, link) {
+  switch(name,
+    gaussian = stats::gaussian(),
+    binomial = stats::binomial(),
+    poisson = stats::poisson(),
+    gamma = stats::Gamma(link = "log"), # glmm's gamma default, NOT R's
+    # No R constructor exists for these; a minimal family-shaped record
+    # keeps family(fit) printable.
+    structure(list(family = name, link = link), class = "family")
+  )
 }

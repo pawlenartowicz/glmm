@@ -21,7 +21,7 @@ use crate::lmm::fit_lmm_unhinted;
 #[cfg(feature = "formula")]
 use crate::lmm::LmmKernel;
 use crate::lmm::{LmmGroupings, LmmWorkspace};
-use crate::standardize::ColumnScaling;
+use crate::standardize::{ColumnScaling, Units};
 use crate::test_support::intercept_only_spec;
 use crate::SeFor;
 use crate::{Data, Family, Fit, FitOptions, GroupIds, ModelSpec, ReStructure};
@@ -71,7 +71,7 @@ fn with_fit<R>(
     n: usize,
     p: usize,
     weights: Option<Vec<f64>>,
-    f: impl FnOnce(&Fit, &mut LmmWorkspace, &ColumnScaling) -> R,
+    f: impl FnOnce(&Fit, &mut LmmWorkspace, &ColumnScaling, &Units) -> R,
 ) -> R {
     let model = intercept_only_spec();
     let ids = GroupIds {
@@ -87,10 +87,10 @@ fn with_fit<R>(
         data = data.weights(w);
     }
     let (fit, mut fws) = fit_cold_keep_workspace(&data, &model, &opts);
-    let (ws, map) = fws
+    let (ws, map, units) = fws
         .lmm_parts()
         .expect("a Gaussian mixed fit has an LMM workspace");
-    f(&fit, ws, map)
+    f(&fit, ws, map, units)
 }
 
 /// `y ~ 1 + x1 + x2 + (1 | g)`: 12 groups of 3 to 8 rows, `x1` far from
@@ -133,10 +133,10 @@ fn n_free_zero_gives_nu() {
     }
     let n = y.len();
     assert_eq!(n, 30);
-    with_fit(&vec![1.0; n], &y, &g, n, 1, None, |fit, ws, map| {
+    with_fit(&vec![1.0; n], &y, &g, n, 1, None, |fit, ws, map, units| {
         assert!(fit.converged());
         assert_eq!(ws.theta, [0.0], "Dyestuff2's θ̂ pins at exactly 0");
-        let st = pass(ws, map);
+        let st = pass(ws, map, units);
         assert!(st.jac_theta.is_empty());
         assert_eq!(coef_df_in_range(&st), [29.0]);
     });
@@ -174,20 +174,20 @@ fn balanced_one_way_intercept_df_is_k_minus_one() {
     assert!(msb > msw, "the fixture needs an interior REML optimum");
     let theta_caller = ((msb - msw) / M as f64 / msw).sqrt();
 
-    with_fit(&vec![1.0; n], &y, &g, n, 1, None, |fit, ws, map| {
+    with_fit(&vec![1.0; n], &y, &g, n, 1, None, |fit, ws, map, units| {
         assert!(fit.converged());
         let mut theta = vec![theta_caller];
         let groupings = ws.kernel.groupings();
         let mut scratch = vec![0.0; groupings.re_map_scratch_len()];
         groupings.theta_caller_to_design(&mut theta, &mut scratch, map);
-        let at_reml = coef_df_in_range(&pass_at(ws, &theta, map))[0];
+        let at_reml = coef_df_in_range(&pass_at(ws, &theta, map, units))[0];
         assert!(
             rel(at_reml, (K - 1) as f64) <= 1e-6,
             "df at the analytic θ̂ {at_reml}"
         );
         // The fitted θ̂ is within RHO_END = 1e-6 of it, which moves df at first
         // order.
-        let at_fit = coef_df_in_range(&pass(ws, map))[0];
+        let at_fit = coef_df_in_range(&pass(ws, map, units))[0];
         assert!(
             rel(at_fit, (K - 1) as f64) <= 1e-5,
             "df at the fitted θ̂ {at_fit}"
@@ -196,17 +196,18 @@ fn balanced_one_way_intercept_df_is_k_minus_one() {
 }
 
 /// The deviance and the diagonal of `C` at `θ`, `C` read off the factor mapped
-/// to the caller's columns (the route `Fit::vcov` takes).
+/// to the caller's columns and units (the route `Fit::vcov` takes).
 #[cfg(feature = "formula")]
 fn deviance_and_var(
     kernel: &mut LmmKernel,
     theta: &[f64],
     map: &ColumnScaling,
+    units: &Units,
     p: usize,
 ) -> (f64, Vec<f64>) {
     let f = kernel.deviance(theta);
     kernel.map_factor_to_design();
-    let (l, s2) = (kernel.factor(), kernel.sigma_sq());
+    let (l, s2) = (kernel.factor(), kernel.sigma_sq() * units.var_scale());
     let var = (0..p)
         .map(|t| {
             let mut u = vec![0.0; p];
@@ -312,11 +313,11 @@ fn satterthwaite_skips_structural_coordinates() {
         ..FitOptions::default()
     };
     let (fit, mut fws) = fit_cold_keep_workspace(&Data::new(&x, &y, n, p).ids(&ids), &model, &opts);
-    let (ws, map) = fws.lmm_parts().expect("an LMM workspace");
+    let (ws, map, units) = fws.lmm_parts().expect("an LMM workspace");
     assert!(fit.converged());
     assert_eq!(ws.theta[1], 0.0);
     assert!(ws.theta[0] != 0.0 && ws.theta[2] != 0.0, "{:?}", ws.theta);
-    let st = pass(ws, map);
+    let st = pass(ws, map, units);
     assert!(!st.is_failed());
     assert_eq!(st.jac_theta.len(), 2);
     coef_df_in_range(&st);
@@ -330,10 +331,10 @@ fn state_c_matches_fit_vcov() {
     let (x, y, g, n, p) = mixed_fixture();
     for w in [None, Some(weights(n))] {
         let weighted = w.is_some();
-        with_fit(&x, &y, &g, n, p, w, |fit, ws, map| {
+        with_fit(&x, &y, &g, n, p, w, |fit, ws, map, units| {
             assert!(fit.converged());
-            assert_eq!(weighted, ws.weight_scale != 1.0);
-            let st = pass(ws, map);
+            assert_eq!(weighted, units.s() != 1.0);
+            let st = pass(ws, map, units);
             assert!(!st.is_failed());
             assert_eq!(st.route, DerivRoute::Value);
             assert_eq!((st.dropped, st.negative), (0, 0), "an interior fit");
@@ -359,10 +360,10 @@ fn state_c_matches_fit_vcov() {
 #[test]
 fn pass_reads_theta_and_never_writes() {
     let (x, y, g, n, p) = mixed_fixture();
-    with_fit(&x, &y, &g, n, p, None, |_, ws, map| {
+    with_fit(&x, &y, &g, n, p, None, |_, ws, map, units| {
         let theta = ws.theta.clone();
         let f_before = ws.kernel.deviance(&theta).to_bits();
-        let st = pass(ws, map);
+        let st = pass(ws, map, units);
         assert!(!st.is_failed());
         let after: Vec<u64> = ws.theta.iter().map(|t| t.to_bits()).collect();
         let before: Vec<u64> = theta.iter().map(|t| t.to_bits()).collect();
@@ -459,7 +460,7 @@ fn assemble_nonfinite_point_gives_nan_df() {
 /// within the search's tolerance). With every coordinate pinned the pass
 /// returns ν exactly. The dense fixture is that test's `lmm_dense` (a `q = 2`
 /// block whose fit is on the correlation boundary), the sparse one its
-/// `lmm_sparse` (a crossed `q = 5` block).
+/// `lmm_sparse` (a crossed `q = 5` block beside a `q = 2` primary).
 #[test]
 fn slope_rescale_keeps_df_and_all_pinned_gives_nu() {
     let (x, y, ids, _) = sim_clustered(include_str!(
@@ -482,7 +483,8 @@ fn slope_rescale_keeps_df_and_all_pinned_gives_nu() {
             extra: vec![],
         },
     );
-    let (x, y, _, p, model, ids) = crate::sparse::tests::sparse_gamma_design();
+    let (x, y, _, p, mut model, ids) = crate::sparse::tests::sparse_gamma_design();
+    model.re.as_mut().unwrap().slopes = vec![1];
     let model = ModelSpec {
         family: Family::Gaussian,
         ..model
@@ -504,11 +506,14 @@ fn slope_rescale_keeps_df_and_all_pinned_gives_nu() {
                 fit_cold_keep_workspace(&Data::new(&x, &y, n, p).ids(&ids), &model, &opts);
             assert!(fit.converged(), "sparse {sparse}, x1·{scale}");
             assert_eq!(fws.is_lmm_sparse(), sparse);
-            let (ws, map) = fws.lmm_parts().expect("an LMM workspace");
-            let df = coef_df_in_range(&pass(ws, map));
+            let (ws, map, units) = fws.lmm_parts().expect("an LMM workspace");
+            let df = coef_df_in_range(&pass(ws, map, units));
             let pinned = vec![0.0; ws.theta.len()];
             let nu = residual_nu(ws);
-            assert_eq!(coef_df_in_range(&pass_at(ws, &pinned, map)), vec![nu; p]);
+            assert_eq!(
+                coef_df_in_range(&pass_at(ws, &pinned, map, units)),
+                vec![nu; p]
+            );
             df
         };
         let (base, scaled) = (df_at(1.0), df_at(1e3));
@@ -548,6 +553,7 @@ mod formula_gates {
         ws: &mut LmmWorkspace,
         theta: &[f64],
         map: &ColumnScaling,
+        units: &Units,
         eta: f64,
         gradient: bool,
     ) -> Collected {
@@ -561,7 +567,7 @@ mod formula_gates {
             &mut ws.kernel,
             theta,
             &ws.recovery.beta_tilde,
-            ws.weight_scale,
+            units,
             map,
             nu,
             value,
@@ -580,14 +586,14 @@ mod formula_gates {
     pub(super) fn with_formula_fit<R>(
         formula: &str,
         table: &Table,
-        f: impl FnOnce(&Fit, &mut LmmWorkspace, &ColumnScaling) -> R,
+        f: impl FnOnce(&Fit, &mut LmmWorkspace, &ColumnScaling, &Units) -> R,
     ) -> R {
         let lo = lower(formula, table, Family::Gaussian).expect("the fixture lowers");
         let (fit, mut fws) = fit_cold_keep_workspace(&lo.data(), &lo.model, &FitOptions::default());
-        let (ws, map) = fws
+        let (ws, map, units) = fws
             .lmm_parts()
             .expect("a Gaussian mixed fit has an LMM workspace");
-        f(&fit, ws, map)
+        f(&fit, ws, map, units)
     }
 
     /// A uniform draw with unit variance.
@@ -796,15 +802,17 @@ mod formula_gates {
         assert_eq!(SWEEP[2], ETA, "ETA is the sweep's third step");
         let bits = |v: &[f64]| v.iter().map(|d| d.to_bits()).collect::<Vec<_>>();
         for (name, table, formula) in sweep_fixtures() {
-            with_formula_fit(&formula, &table, |fit, ws, map| {
+            with_formula_fit(&formula, &table, |fit, ws, map, units| {
                 assert!(fit.converged(), "{name}");
                 let theta = ws.theta.clone();
-                let st = crate::lmm::satterthwaite::pass_value_at(ws, &theta, map);
+                let st = crate::lmm::satterthwaite::pass_value_at(ws, &theta, map, units);
                 assert!(!st.jac_theta.is_empty(), "{name}: no free coordinate");
                 let df: Vec<Vec<f64>> = SWEEP
                     .iter()
                     .map(|&eta| {
-                        coef_df_in_range(&assemble(&collect_eta(ws, &theta, map, eta, false)))
+                        coef_df_in_range(&assemble(&collect_eta(
+                            ws, &theta, map, units, eta, false,
+                        )))
                     })
                     .collect();
                 assert_eq!(bits(&df[2]), bits(&coef_df_in_range(&st)), "{name}");
@@ -927,10 +935,15 @@ mod formula_gates {
                 rel(fs, fd) <= 1e-12,
                 "{name}: deviance {fd} dense, {fs} sparse"
             );
-            let sparse_st = pass_at(&mut sparse, &theta, ColumnScaling::IDENTITY);
+            let sparse_st = pass_at(
+                &mut sparse,
+                &theta,
+                ColumnScaling::IDENTITY,
+                Units::IDENTITY,
+            );
             assert_eq!(sparse_st.route, DerivRoute::Value, "{name}");
             let got = coef_df_in_range(&sparse_st);
-            let routed = pass_at(&mut dense, &theta, ColumnScaling::IDENTITY);
+            let routed = pass_at(&mut dense, &theta, ColumnScaling::IDENTITY, Units::IDENTITY);
             let armed = q == [2];
             let want_route = if armed {
                 DerivRoute::GradientDiff
@@ -944,6 +957,7 @@ mod formula_gates {
                     &mut dense,
                     &theta,
                     ColumnScaling::IDENTITY,
+                    Units::IDENTITY,
                 ));
             }
             for st in dense_states {
@@ -972,11 +986,11 @@ mod formula_gates {
     #[test]
     fn q2_fit_matches_hand_built_stencil() {
         let (table, formula) = speed_shape(&[2], false, false, 811_001);
-        with_formula_fit(&formula, &table, |fit, ws, map| {
+        with_formula_fit(&formula, &table, |fit, ws, map, units| {
             assert!(fit.converged());
             let th = ws.theta.clone();
             let n = th.len();
-            let st = pass_value_at(ws, &th, map);
+            let st = pass_value_at(ws, &th, map, units);
             assert_eq!(st.jac_theta.len(), n, "every coordinate free: θ̂ {th:?}");
             assert_eq!((st.dropped, st.negative), (0, 0));
             let df = coef_df_in_range(&st);
@@ -995,8 +1009,8 @@ mod formula_gates {
             let f0 = ws.kernel.deviance(&th);
             let (mut f_axis, mut c_axis) = (vec![], vec![]);
             for (k, &hk) in h.iter().enumerate().take(n) {
-                let (fp, cp) = deviance_and_var(&mut ws.kernel, &at(&[(k, hk)]), map, p);
-                let (fm, cm) = deviance_and_var(&mut ws.kernel, &at(&[(k, -hk)]), map, p);
+                let (fp, cp) = deviance_and_var(&mut ws.kernel, &at(&[(k, hk)]), map, units, p);
+                let (fm, cm) = deviance_and_var(&mut ws.kernel, &at(&[(k, -hk)]), map, units, p);
                 f_axis.push([fp, fm]);
                 c_axis.push([cp, cm]);
             }
@@ -1067,26 +1081,29 @@ mod formula_gates {
     #[test]
     fn pass_restores_the_response_on_every_route() {
         let (table, formula) = speed_shape(&[1], false, false, 811_001);
-        with_formula_fit(&formula, &table, |fit, ws, map| {
+        with_formula_fit(&formula, &table, |fit, ws, map, units| {
             assert!(fit.converged());
             assert!(
                 matches!(&ws.kernel, LmmKernel::Dense { fit, .. } if fit.collapse_n_active > 0),
                 "int1: the balanced collapse is armed"
             );
             let before = response_bits(ws);
-            assert!(!pass(ws, map).is_failed());
+            assert!(!pass(ws, map, units).is_failed());
             assert_eq!(response_bits(ws), before, "int1");
         });
 
         let (table, formula) = speed_shape(&[2], false, false, 811_001);
-        with_formula_fit(&formula, &table, |fit, ws, map| {
+        with_formula_fit(&formula, &table, |fit, ws, map, units| {
             assert!(fit.converged());
             assert!(per_group_gradient_armed(&ws.kernel), "q2s: per-group route");
             let theta = ws.theta.clone();
             let before = response_bits(ws);
-            assert_eq!(pass(ws, map).route, DerivRoute::GradientDiff);
+            assert_eq!(pass(ws, map, units).route, DerivRoute::GradientDiff);
             assert_eq!(response_bits(ws), before, "q2s, gradient route");
-            assert_eq!(pass_value_at(ws, &theta, map).route, DerivRoute::Value);
+            assert_eq!(
+                pass_value_at(ws, &theta, map, units).route,
+                DerivRoute::Value
+            );
             assert_eq!(response_bits(ws), before, "q2s, value route");
         });
 
@@ -1095,7 +1112,13 @@ mod formula_gates {
         assert!(matches!(sparse.kernel, LmmKernel::Sparse { .. }));
         let theta = sparse.theta.clone();
         let before = response_bits(&mut sparse);
-        assert!(!pass_at(&mut sparse, &theta, ColumnScaling::IDENTITY).is_failed());
+        assert!(!pass_at(
+            &mut sparse,
+            &theta,
+            ColumnScaling::IDENTITY,
+            Units::IDENTITY
+        )
+        .is_failed());
         assert_eq!(response_bits(&mut sparse), before, "cross4, sparse kernel");
     }
 
@@ -1111,11 +1134,11 @@ mod formula_gates {
             include_str!("../../../validation/data/simulated/sim_corr_boundary.csv"),
             &["g"],
         );
-        with_formula_fit("y ~ x + (x | g)", &table, |fit, ws, map| {
+        with_formula_fit("y ~ x + (x | g)", &table, |fit, ws, map, units| {
             assert!(fit.converged());
             let th = ws.theta.clone();
             assert!(th[0] != 0.0 && th[1] != 0.0 && th[2] == 0.0, "θ̂ {th:?}");
-            let st = crate::lmm::satterthwaite::pass_value_at(ws, &th, map);
+            let st = crate::lmm::satterthwaite::pass_value_at(ws, &th, map, units);
             assert_eq!(st.jac_theta.len(), 2);
             assert_eq!((st.dropped, st.negative), (0, 0));
             let df = coef_df_in_range(&st);
@@ -1125,10 +1148,10 @@ mod formula_gates {
             let at = |d0: f64, d1: f64| [th[0] + d0, th[1] + d1, 0.0];
             let saved = shift_response(&mut ws.kernel, &ws.recovery.beta_tilde);
             let f0 = ws.kernel.deviance(&th);
-            let (f0p, c0p) = deviance_and_var(&mut ws.kernel, &at(h[0], 0.0), map, p);
-            let (f0m, c0m) = deviance_and_var(&mut ws.kernel, &at(-h[0], 0.0), map, p);
-            let (f1p, c1p) = deviance_and_var(&mut ws.kernel, &at(0.0, h[1]), map, p);
-            let (f1m, c1m) = deviance_and_var(&mut ws.kernel, &at(0.0, -h[1]), map, p);
+            let (f0p, c0p) = deviance_and_var(&mut ws.kernel, &at(h[0], 0.0), map, units, p);
+            let (f0m, c0m) = deviance_and_var(&mut ws.kernel, &at(-h[0], 0.0), map, units, p);
+            let (f1p, c1p) = deviance_and_var(&mut ws.kernel, &at(0.0, h[1]), map, units, p);
+            let (f1m, c1m) = deviance_and_var(&mut ws.kernel, &at(0.0, -h[1]), map, units, p);
             let fpp = ws.kernel.deviance(&at(h[0], h[1]));
             let fmm = ws.kernel.deviance(&at(-h[0], -h[1]));
             restore_response(&mut ws.kernel, &saved);
@@ -1238,7 +1261,7 @@ mod formula_gates {
         let g: Vec<String> = (0..n).map(|i| (i / PER).to_string()).collect();
 
         let (table, formula) = wide_fixture(&x, &y, &g);
-        let d = with_formula_fit(&formula, &table, |fit, _, _| {
+        let d = with_formula_fit(&formula, &table, |fit, _, _, _| {
             assert!(fit.converged());
             fit.varcorr[0].clone()
         });
@@ -1269,7 +1292,7 @@ mod formula_gates {
             .collect();
 
         let (table, formula) = wide_fixture(&x2, &y, &g);
-        with_formula_fit(&formula, &table, |fit, ws, map| {
+        with_formula_fit(&formula, &table, |fit, ws, map, units| {
             assert!(fit.converged());
             assert!(matches!(ws.kernel, LmmKernel::Sparse { .. }));
             let groupings = ws.kernel.groupings();
@@ -1279,7 +1302,7 @@ mod formula_gates {
             assert!(theta[diag + 1..diag + len].iter().any(|&t| t != 0.0));
             theta[diag] = 0.0;
             assert_eq!(free_coordinates(groupings, &theta).len(), 45);
-            let st = pass_at(ws, &theta, map);
+            let st = pass_at(ws, &theta, map, units);
             assert!(!st.is_failed());
             assert_eq!(st.jac_theta.len(), 45);
             assert!(
@@ -1350,11 +1373,12 @@ pub(crate) mod gate1 {
         ws: &mut LmmWorkspace,
         theta: &[f64],
         map: &ColumnScaling,
+        units: &Units,
         route: DerivRoute,
     ) -> SatterthwaiteState {
         let st = match route {
-            DerivRoute::Value => crate::lmm::satterthwaite::pass_value_at(ws, theta, map),
-            DerivRoute::GradientDiff => pass_at(ws, theta, map),
+            DerivRoute::Value => crate::lmm::satterthwaite::pass_value_at(ws, theta, map, units),
+            DerivRoute::GradientDiff => pass_at(ws, theta, map, units),
         };
         assert_eq!(st.route, route, "the pass took another route");
         st
@@ -1572,7 +1596,7 @@ pub(crate) mod gate1 {
         lo: &Lowered,
         fit_opts: &FitOptions,
         fit_json: &Value,
-        f: impl FnOnce(&[usize], &mut LmmWorkspace, &ColumnScaling, &[f64]) -> R,
+        f: impl FnOnce(&[usize], &mut LmmWorkspace, &ColumnScaling, &Units, &[f64]) -> R,
     ) -> R {
         let dropped = strings(&fit_json["cols_dropped"], name);
         for d in &dropped {
@@ -1603,11 +1627,11 @@ pub(crate) mod gate1 {
             data = data.weights(w);
         }
         let (_, mut fws) = fit_cold_keep_workspace(&data, &lo.model, &opts);
-        let (ws, map) = fws
+        let (ws, map, units) = fws
             .lmm_parts()
             .expect("a Gaussian mixed fit has an LMM workspace");
-        let theta = lme4_theta_to_kernel(name, lo, fit_json, ws, map);
-        f(&kept, ws, map, &theta)
+        let theta = lme4_theta_to_kernel(name, lo, fit_json, ws, map, units);
+        f(&kept, ws, map, units, &theta)
     }
 
     /// lme4's θ̂ (`theta`, blocks in lme4's grouping order) as the kernel's θ̃:
@@ -1623,6 +1647,7 @@ pub(crate) mod gate1 {
         fit_json: &Value,
         ws: &LmmWorkspace,
         map: &ColumnScaling,
+        units: &Units,
     ) -> Vec<f64> {
         let groups = strings(&fit_json["group_names"], name);
         let cnms: Vec<Vec<String>> = fit_json["cnms"]
@@ -1661,7 +1686,7 @@ pub(crate) mod gate1 {
         let groupings = ws.kernel.groupings();
         let mut scratch = vec![0.0; groupings.re_map_scratch_len()];
         groupings.theta_caller_to_design(&mut out, &mut scratch, map);
-        let root_s = ws.weight_scale.sqrt();
+        let root_s = units.s().sqrt();
         out.iter_mut().for_each(|t| *t *= root_s);
         out
     }
@@ -1796,7 +1821,7 @@ pub(crate) mod gate1 {
                     .map(|c| c.as_array().expect("cnms block").len())
                     .max()
                     .unwrap_or(0);
-                at_lme4_theta(name, &lo, &fit_opts, &json, |_, ws, map, theta| {
+                at_lme4_theta(name, &lo, &fit_opts, &json, |_, ws, map, units, theta| {
                     assert_eq!(
                         ws.kernel.criterion() == crate::lmm::Criterion::Reml,
                         reml,
@@ -1808,10 +1833,10 @@ pub(crate) mod gate1 {
                     }
                     let mut value_state = None;
                     for route in routes {
-                        let st = route_pass_at(ws, theta, map, route);
+                        let st = route_pass_at(ws, theta, map, units, route);
                         let df = coef_df_in_range(&st);
                         let theta1 = newton_point(ws, &st, theta);
-                        let moved = route_pass_at(ws, &theta1, map, route).coef_df();
+                        let moved = route_pass_at(ws, &theta1, map, units, route).coef_df();
                         assert_eq!(df.len(), want.len(), "{name}: coefficients");
                         for i in 0..want.len() {
                             let err = (df[i] - want[i]).abs() / want[i];
@@ -1912,7 +1937,7 @@ mod gradient_route {
         table: &Table,
         weights: Option<&str>,
         reml: Option<bool>,
-        f: impl FnOnce(&Fit, &mut LmmWorkspace, &ColumnScaling) -> R,
+        f: impl FnOnce(&Fit, &mut LmmWorkspace, &ColumnScaling, &Units) -> R,
     ) -> R {
         let mut lo = lower(formula, table, Family::Gaussian).expect("the fixture lowers");
         let fit_opts = FitOptions {
@@ -1927,10 +1952,10 @@ mod gradient_route {
             lo.weights = Some(w.expect("a numeric weight column"));
         }
         let (fit, mut fws) = fit_cold_keep_workspace(&lo.data(), &lo.model, &fit_opts);
-        let (ws, map) = fws
+        let (ws, map, units) = fws
             .lmm_parts()
             .expect("a Gaussian mixed fit has an LMM workspace");
-        f(&fit, ws, map)
+        f(&fit, ws, map, units)
     }
 
     /// The per-group fixtures, `(name, table, formula, weight column)`:
@@ -1995,7 +2020,11 @@ mod gradient_route {
     }
 
     /// Both routes' collected values at the fit's θ̂, `(gradient, value)`.
-    fn both_routes(ws: &mut LmmWorkspace, map: &ColumnScaling) -> (Collected, Collected) {
+    fn both_routes(
+        ws: &mut LmmWorkspace,
+        map: &ColumnScaling,
+        units: &Units,
+    ) -> (Collected, Collected) {
         let theta = ws.theta.clone();
         let nu = residual_nu(ws);
         let mut at = |gradient: bool| {
@@ -2003,7 +2032,7 @@ mod gradient_route {
                 &mut ws.kernel,
                 &theta,
                 &ws.recovery.beta_tilde,
-                ws.weight_scale,
+                units,
                 map,
                 nu,
                 ETA,
@@ -2036,7 +2065,7 @@ mod gradient_route {
         {
             let name = format!("{name} (reml {reml:?})");
             let weights = *weights;
-            with_fit_w(formula, table, weights, reml, |fit, ws, map| {
+            with_fit_w(formula, table, weights, reml, |fit, ws, map, units| {
                 assert!(fit.converged(), "{name}");
                 assert_eq!(fit.reml, reml.is_none(), "{name}: criterion");
                 assert!(
@@ -2049,9 +2078,9 @@ mod gradient_route {
                     "{name}: the θ search is not BFGS"
                 );
                 let theta = ws.theta.clone();
-                let st = pass(ws, map);
+                let st = pass(ws, map, units);
                 assert_eq!(st.route, DerivRoute::GradientDiff, "{name}");
-                let value = pass_value_at(ws, &theta, map);
+                let value = pass_value_at(ws, &theta, map, units);
                 assert_eq!(value.route, DerivRoute::Value, "{name}");
                 assert!(!st.is_failed() && !value.is_failed(), "{name}");
                 let (dg, dv) = (coef_df_in_range(&st), coef_df_in_range(&value));
@@ -2061,7 +2090,7 @@ mod gradient_route {
                         "{name}: df[{i}] {g} gradient, {v} value"
                     );
                 }
-                let (cg, cv) = both_routes(ws, map);
+                let (cg, cv) = both_routes(ws, map, units);
                 let (hg, hv) = (hessian(&cg), hessian(&cv));
                 let n = hv.nrows();
                 assert_eq!(n, st.jac_theta.len(), "{name}");
@@ -2131,16 +2160,16 @@ mod gradient_route {
             fixtures.push((name.to_string(), table, formula, None));
         }
         for (name, table, formula, weights) in fixtures {
-            with_fit_w(&formula, &table, weights, None, |fit, ws, map| {
+            with_fit_w(&formula, &table, weights, None, |fit, ws, map, units| {
                 assert!(fit.converged(), "{name}");
                 let theta = ws.theta.clone();
-                let st = pass(ws, map);
+                let st = pass(ws, map, units);
                 assert_eq!(st.route, DerivRoute::GradientDiff, "{name}");
                 assert!(!st.jac_theta.is_empty(), "{name}: no free coordinate");
                 let df: Vec<Vec<f64>> = SWEEP_GRAD[1..3]
                     .iter()
                     .map(|&eta| {
-                        coef_df_in_range(&assemble(&collect_eta(ws, &theta, map, eta, true)))
+                        coef_df_in_range(&assemble(&collect_eta(ws, &theta, map, units, eta, true)))
                     })
                     .collect();
                 assert_eq!(bits(&df[0]), bits(&coef_df_in_range(&st)), "{name}");
@@ -2162,7 +2191,7 @@ mod gradient_route {
     #[test]
     fn failed_gradient_hands_over_to_a_value_route_that_succeeds() {
         let (table, formula) = speed_shape(&[3], false, false, 811_001);
-        with_fit_w(&formula, &table, None, None, |_, ws, map| {
+        with_fit_w(&formula, &table, None, None, |_, ws, map, units| {
             assert!(per_group_gradient_armed(&ws.kernel));
             let theta = ws.theta.clone();
             let nu = residual_nu(ws);
@@ -2170,7 +2199,7 @@ mod gradient_route {
                 &mut ws.kernel,
                 &theta,
                 &ws.recovery.beta_tilde,
-                ws.weight_scale,
+                units,
                 map,
                 nu,
                 ETA,
@@ -2180,7 +2209,7 @@ mod gradient_route {
             let st = assemble(&col);
             assert_eq!(st.route, DerivRoute::Value);
             assert!(!st.is_failed());
-            let value = pass_value_at(ws, &theta, map);
+            let value = pass_value_at(ws, &theta, map, units);
             for (g, v) in st.coef_df().iter().zip(value.coef_df()) {
                 assert_eq!(g.to_bits(), v.to_bits(), "{g} vs {v}");
             }
@@ -2194,9 +2223,9 @@ mod gradient_route {
     #[test]
     fn gradient_route_uses_2n_points() {
         let (table, formula) = speed_shape(&[3], false, false, 811_001);
-        with_fit_w(&formula, &table, None, None, |_, ws, map| {
+        with_fit_w(&formula, &table, None, None, |_, ws, map, units| {
             let theta = ws.theta.clone();
-            let (grad, value) = both_routes(ws, map);
+            let (grad, value) = both_routes(ws, map, units);
             let n = grad.free.len();
             assert_eq!(n, 6);
             let g = grad.g_axis.as_ref().expect("the gradient route");

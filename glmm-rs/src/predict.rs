@@ -10,7 +10,7 @@ use commonstats::dist::{Binomial, ContinuousCdf, DiscreteCdf, Gamma, NegBinomial
 use faer::MatRef;
 
 use crate::consts::{GH_NODES, GH_OFFSETS, GH_WEIGHTS};
-use crate::family::{link_inv, mu_eta};
+use crate::family::{link_inv, mean_out_of_range, mu_eta};
 use crate::fit::validate_design;
 use crate::fit::CondvarCross;
 use crate::inference::tails::normal_quantile;
@@ -87,7 +87,8 @@ pub struct Prediction {
     /// The lower end of the interval at [`PredictOptions::level`], when `se` is
     /// set: `η̂ − z·se` on the link scale, `z` the standard normal quantile of
     /// `(1 + level)/2`, and on the response scale the inverse link of the
-    /// link-scale interval, its ends ordered.
+    /// link-scale interval, its ends ordered, +∞ for an end with no mean
+    /// (see [`predict`]).
     pub lower: Vec<f64>,
     /// The upper end of the same interval.
     pub upper: Vec<f64>,
@@ -100,8 +101,9 @@ pub struct Prediction {
     pub future_upper: Vec<f64>,
     /// One [`Note::NewGroupingLevels`] per grouping with unseen levels, in
     /// declaration order (none in population mode), then
-    /// [`Note::PredictSeModelBased`] when [`PredictOptions::se`] is set on a
-    /// robust fit.
+    /// [`Note::RowsNotEstimable`] when a row is outside the row space of a
+    /// rank-deficient fit, then [`Note::PredictSeModelBased`] when
+    /// [`PredictOptions::se`] is set on a robust fit.
     pub notes: Vec<Note>,
 }
 
@@ -128,6 +130,17 @@ pub struct Prediction {
 /// [`crate::fit_with_start`]. A fit with no estimates (every coefficient NaN:
 /// a fit that stopped before estimating anything, such as too few rows or a
 /// degenerate design) predicts NaN, with a NaN standard error and NaN bounds.
+/// A row outside the row space of a rank-deficient fit (one with aliased
+/// columns) is not estimable: its prediction, standard error, interval and
+/// future bounds are NaN, and the prediction carries a
+/// [`Note::RowsNotEstimable`], as R's `predict.lm(rankdeficient = "NA")` gives
+/// NA; rows inside the row space use the kept coefficients as before.
+///
+/// On the response scale of a Gamma inverse-link or inverse-Gaussian `1/μ²`
+/// model, a row whose η̂ is at or below 0 has no mean, so its prediction,
+/// standard error, interval and future bounds are NaN; on a row with η̂ above
+/// 0, an interval end at or below 0 maps to +∞, and the future bounds are
+/// NaN when their quadrature reaches η ≤ 0.
 ///
 /// The link-scale standard error is lme4 2.0.6's `predict(se.fit = TRUE)`
 /// form, from the joint covariance of `(b̂, β̂)` at the fitted variance
@@ -195,6 +208,8 @@ pub(crate) struct FitParts<'a> {
     /// A robust fit's, whose `vcov` is its model covariance: a standard error
     /// asked for gets [`Note::PredictSeModelBased`].
     pub(crate) robust: bool,
+    /// [`Fit::null_basis`]: `k × p` row-major, empty on a full-rank fit.
+    pub(crate) null_basis: std::borrow::Cow<'a, [f64]>,
 }
 
 impl<'a> FitParts<'a> {
@@ -223,8 +238,29 @@ impl<'a> FitParts<'a> {
             dispersion: fit.dispersion,
             weight_power: fit.weight_power,
             robust: false,
+            null_basis: std::borrow::Cow::Borrowed(&fit.null_basis),
         }
     }
+}
+
+/// The relative tolerance of the estimability test, R's `predict.lm`
+/// `tol = 1e-6`: a row `x` is not estimable when `‖N·x‖ > ESTIMABLE_TOL·‖x‖`,
+/// `N` the fit's null-space basis. R flags `≥`, which also flags an all-zero
+/// row; a zero row predicts 0 under every β, so it is kept.
+const ESTIMABLE_TOL: f64 = 1e-6;
+
+/// Whether `row` lies outside the row space of the design whose null space
+/// `basis` spans (`k × row.len()`, row-major).
+fn not_estimable(basis: &[f64], row: &[f64]) -> bool {
+    if basis.is_empty() {
+        return false;
+    }
+    let off: f64 = basis
+        .chunks(row.len())
+        .map(|nv| nv.iter().zip(row).map(|(a, b)| a * b).sum::<f64>().powi(2))
+        .sum();
+    let norm: f64 = row.iter().map(|v| v * v).sum();
+    off.sqrt() > ESTIMABLE_TOL * norm.sqrt()
 }
 
 /// One grouping as [`Fit::ranef`] lays it out.
@@ -354,7 +390,7 @@ pub(crate) fn predict_parts(
     }
     let need_se = opts.se || opts.future;
     let blocks = if conditional {
-        if parts.ranef.is_empty() {
+        if parts.ranef.iter().any(|v| v.is_nan()) {
             return Err(FitError::Unsupported(
                 "the fit has no conditional modes (it did not converge); \
                  predict in population mode"
@@ -434,8 +470,23 @@ pub(crate) fn predict_parts(
     // A fit with no finite coefficient returned no estimates; the zero rule
     // below is for aliased and broken-down columns of a fit that has some.
     let no_estimates = parts.beta.iter().all(|b| b.is_nan());
+    let mut lost = Vec::new();
     for i in 0..n {
         let row = &x[i * p..(i + 1) * p];
+        if not_estimable(&parts.null_basis, row) {
+            lost.push(i as u32);
+            out.fit.push(f64::NAN);
+            if opts.se {
+                for part in [&mut out.se, &mut out.lower, &mut out.upper] {
+                    part.push(f64::NAN);
+                }
+            }
+            if opts.future {
+                out.future_lower.push(f64::NAN);
+                out.future_upper.push(f64::NAN);
+            }
+            continue;
+        }
         let xb: f64 = if no_estimates {
             f64::NAN
         } else {
@@ -518,10 +569,24 @@ pub(crate) fn predict_parts(
             out.future_lower.push(lo);
             out.future_upper.push(hi);
         }
+        let no_mean = response && mean_out_of_range(family, eta);
         if let (true, Some(se_link)) = (opts.se, se_link) {
             let (a, b) = (eta - zq * se_link, eta + zq * se_link);
-            if response {
-                let (a, b) = (link_inv(family, a), link_inv(family, b));
+            if no_mean {
+                out.se.push(f64::NAN);
+                out.lower.push(f64::NAN);
+                out.upper.push(f64::NAN);
+            } else if response {
+                // An end with no mean is the limit of `1/η` or `η^(−1/2)` as
+                // η falls to 0; a NaN end stays NaN.
+                let end = |e: f64| {
+                    if mean_out_of_range(family, e) && e <= 0.0 {
+                        f64::INFINITY
+                    } else {
+                        link_inv(family, e)
+                    }
+                };
+                let (a, b) = (end(a), end(b));
                 // A decreasing inverse link (Gamma's inverse) swaps the ends.
                 let (a, b) = if a <= b { (a, b) } else { (b, a) };
                 out.se.push(mu_eta(family, eta).abs() * se_link);
@@ -533,8 +598,13 @@ pub(crate) fn predict_parts(
                 out.upper.push(b);
             }
         }
-        out.fit
-            .push(if response { link_inv(family, eta) } else { eta });
+        out.fit.push(if no_mean {
+            f64::NAN
+        } else if response {
+            link_inv(family, eta)
+        } else {
+            eta
+        });
     }
     out.notes = unseen
         .into_iter()
@@ -545,6 +615,9 @@ pub(crate) fn predict_parts(
             rows,
         })
         .collect();
+    if !lost.is_empty() {
+        out.notes.push(Note::RowsNotEstimable { rows: lost });
+    }
     if opts.se && parts.robust {
         out.notes.push(Note::PredictSeModelBased);
     }
@@ -582,7 +655,11 @@ impl<'a> Cross<'a> {
             ))
         };
         let fg = c.family_grouping;
-        if fg >= blocks.len() {
+        // A non-empty map: the declared primary is the nested grouping, its
+        // declared levels mapped to child slots.
+        let slotted = !c.nested_slots.is_empty();
+        if fg >= blocks.len() || (slotted && (fg == 0 || c.nested_slots.len() != blocks[0].levels))
+        {
             return mismatch();
         }
         // The kernel's slot `j` holds grouping `j`, with 0 and `fg` exchanged.
@@ -593,7 +670,9 @@ impl<'a> Cross<'a> {
             if blocks[g].cols.len() != 1 {
                 return mismatch();
             }
-            if g > 0 && re.extra_groupings[g - 1].relation == GroupingRelation::NestedWithin {
+            let nested_extra =
+                g > 0 && re.extra_groupings[g - 1].relation == GroupingRelation::NestedWithin;
+            if nested_extra || (g == 0 && slotted) {
                 places[g] = Place::Nested;
                 nested = Some(g);
             } else {
@@ -602,10 +681,23 @@ impl<'a> Cross<'a> {
             }
         }
         let families = blocks[fg].levels;
-        let m = nested.map_or(0, |g| blocks[g].levels / families.max(1));
         let q = blocks[fg].cols.len();
+        let m = match nested {
+            // The declared levels do not count the padded slots: `m` is what
+            // the family blocks' width leaves after the `q` coefficients.
+            Some(_) if slotted => {
+                let per = c.family.len() / families.max(1);
+                (0..)
+                    .find(|w| w * (w + 1) / 2 >= per)
+                    .unwrap_or(0)
+                    .saturating_sub(q)
+            }
+            Some(g) => blocks[g].levels / families.max(1),
+            None => 0,
+        };
         let w = q + m;
         if (nested.is_some() && m == 0)
+            || c.nested_slots.iter().any(|&s| s as usize >= families * m)
             || c.family.len() != families * w * (w + 1) / 2
             || c.tail.len() != t * (t + 1) / 2
             || c.coupling_at.len() != families + 1
@@ -640,7 +732,10 @@ impl<'a> Cross<'a> {
             let zl = &z[at..at + blocks[g].cols.len()];
             match self.places[g] {
                 Place::Family => fams.push((level, 0, zl)),
-                Place::Nested => fams.push((level / self.m, self.q + level % self.m, zl)),
+                Place::Nested => {
+                    let slot = c.nested_slots.get(level).map_or(level, |&s| s as usize);
+                    fams.push((slot / self.m, self.q + slot % self.m, zl))
+                }
                 Place::Tail(s) => tails.push((s + level, zl[0])),
             }
         }
@@ -722,8 +817,20 @@ fn future_bounds(family: Family, eta: f64, se: f64, w: f64, phi: f64, level: f64
     let nodes: Vec<(f64, f64)> = GH_NODES[block.clone()]
         .iter()
         .zip(&GH_WEIGHTS[block])
-        .map(|(&x, &wk)| (link_inv(family, eta + SQRT_2 * se * x), wk / PI.sqrt()))
+        .map(|(&x, &wk)| {
+            let node = eta + SQRT_2 * se * x;
+            let mu = if mean_out_of_range(family, node) {
+                f64::NAN
+            } else {
+                link_inv(family, node)
+            };
+            (mu, wk / PI.sqrt())
+        })
         .collect();
+    // A node with no mean leaves the mixture undefined.
+    if nodes.iter().any(|&(mu, _)| mu.is_nan()) {
+        return nan;
+    }
     let mu_max = nodes.iter().fold(0.0f64, |m, &(mu, _)| m.max(mu));
     let probs = [(1.0 - level) / 2.0, (1.0 + level) / 2.0];
     let bounds = |q: &dyn Fn(f64) -> f64| (q(probs[0]), q(probs[1]));

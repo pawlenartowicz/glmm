@@ -198,6 +198,19 @@ test_that("isSingular() on a class it cannot handle errors instead of recursing"
   expect_error(isSingular("x"), "does not know how to handle.*character")
 })
 
+test_that("isSingular(tol =) warns that tol is not used", {
+  d <- benchmark_data(seed = 104, family = "binomial")
+  fit <- fastglmm(y ~ t + (1 | g), d, family = binomial())
+  expect_warning(
+    v <- isSingular(fit, tol = 1e-4),
+    paste("tol is not used: isSingular() on a fastglmm fit returns its singular",
+          "flag, which is TRUE when a variance component is at zero or a",
+          "random-effect standard deviation is at most 1e-3 times the fit's largest."),
+    fixed = TRUE, class = "fastglmm_argument_ignored")
+  expect_identical(v, isSingular(fit))
+  expect_no_warning(isSingular(fit))
+})
+
 # The load-order dispatch checks against a real merMod object (both orders,
 # fixef/ranef/VarCorr/isSingular) need lme4 actually installed, which CI
 # deliberately does not have - they live in tools/generic-load-order.R,
@@ -410,7 +423,7 @@ test_that("diagnostics is additive: the top-level names keep working", {
   # This fixture has a real group effect, so nothing pins - assert that, not
   # the set of every value the mapper can emit.
   expect_equal(fit$diagnostics$boundary, "interior")
-  expect_length(fit$diagnostics$pinned, 0L)
+  expect_identical(fit$diagnostics$pinned, list(FALSE))
   expect_length(fit$diagnostics$notes, 0L)
 })
 
@@ -779,8 +792,8 @@ test_that("satterthwaite = FALSE: an LMM tests with z and says so; OLS and Gamma
   dg$y <- rgamma(80, shape = 4, rate = 4 / exp(0.3 + 0.5 * dg$x))
   expect_identical(fastglmm(y ~ x, dg, family = "gamma", satterthwaite = FALSE)$df_method,
                    "residual")
-  expect_error(fastglmm(y ~ x, d, satterthwaite = NA),
-               "satterthwaite must be TRUE or FALSE", fixed = TRUE)
+  expect_error(fastglmm(y ~ x, d, satterthwaite = "no"),
+               "satterthwaite must be TRUE or FALSE, got the string \"no\"", fixed = TRUE)
 })
 
 test_that("after a failed pass the summary tests with z and the intervals are normal", {
@@ -812,8 +825,7 @@ test_that("confint takes the t quantile on each row's df, as confint.lm does", {
   expect_identical(colnames(confint(lmm)), c("2.5 %", "97.5 %"))
   expect_error(confint(lmm, level = 1), "level must be a number strictly between 0 and 1",
                fixed = TRUE)
-  expect_error(confint(lmm, level = NA), "level must be a number strictly between 0 and 1",
-               fixed = TRUE)
+  expect_error(confint(lmm, level = NA), "level must be a number, got NA", fixed = TRUE)
 })
 
 test_that("an aliased coefficient gives an NA interval", {
@@ -1075,7 +1087,7 @@ test_that("deviance() follows lme4, lm and glm", {
   wols <- fastglmm(y ~ x, d, weights = wd, weight_power = 0.5, REML = TRUE)
   expect_equal(deviance(wols), sum(sqrt(wd) * residuals(wols)^2), tolerance = 1e-12)
   # A fit without estimates has no deviance.
-  failed <- structure(list(family_name = "poisson", fitted = numeric(), y = 1:2,
+  failed <- structure(list(family_name = "poisson", fitted = c(NaN, NaN), y = 1:2,
                            re_group_names = list()), class = "fastglmm")
   expect_identical(deviance(failed), NaN)
 })

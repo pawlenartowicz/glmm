@@ -1,0 +1,12 @@
+{
+  "name": "cr2_df_hc2_collinear_e7",
+  "df": [102.03295778123861, 41.49545932705616, 28.272691032990128, 28.272691798400718],
+  "provenance": {
+    "python_version": "3.14.2",
+    "packages": {
+      "mpmath": "1.4.1"
+    },
+    "mp_dps": 50,
+    "generator": "goldens_cr2_df.py"
+  }
+}

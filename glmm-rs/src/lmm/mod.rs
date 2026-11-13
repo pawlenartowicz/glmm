@@ -33,7 +33,7 @@ use faer::{Mat, MatMut, MatRef};
 
 use crate::fit::{CondvarBlocks, CondvarCross, SizedSpec};
 use crate::scalar::Scalar;
-use crate::standardize::ColumnScaling;
+use crate::standardize::{ColumnScaling, Units};
 
 mod kernel;
 pub(crate) mod pg_grad;
@@ -1272,15 +1272,10 @@ pub struct LmmWorkspace {
     pub lower: Vec<f64>,
     /// Upper box bound, THETA_HI on every entry.
     pub upper: Vec<f64>,
-    /// `family::weight_scale` of the rows `fit::lmm::accumulate_lmm_rows` last
-    /// accumulated (`1.0` unweighted): the kernel runs on ŵ = w/s, so its σ̂²
-    /// is the raw-scale σ̂² divided by s.
-    pub(crate) weight_scale: f64,
-    /// The scaled prior weights ŵ = w/s that `fit::lmm::accumulate_lmm_rows`
-    /// hands the kernel (√ŵ once the sparse kernel has taken them). Empty
-    /// until the first weighted draw, then refilled in place, so a weighted
-    /// loop allocates it once.
-    pub(crate) w_scaled: Vec<f64>,
+    /// `√ŵ`, the row scaling `fit::lmm::accumulate_lmm_rows` hands the
+    /// sparse kernel. Empty until the first weighted draw, then refilled in
+    /// place, so a weighted loop allocates it once.
+    pub(crate) w_sqrt: Vec<f64>,
     /// The loop tier's Satterthwaite pass buffers
     /// ([`satterthwaite::pass_targets`]), built on its first call on the
     /// workspace. The stable path's pass builds its own.
@@ -1375,8 +1370,7 @@ impl LmmWorkspace {
             theta,
             lower,
             upper,
-            weight_scale: 1.0,
-            w_scaled: Vec::new(),
+            w_sqrt: Vec::new(),
             pass_scratch: None,
         }
     }
@@ -2862,9 +2856,11 @@ fn lmm_outer_optimizer(kernel: &LmmKernel, n_theta: usize) -> crate::optim::Oute
 /// DGP-derived hint is a deliberate, recorded exception to the
 /// generation↔estimation split.
 ///
-/// `map` is the column standardization the rows were accumulated under:
-/// β̂, `var_diag`, `t_sq` and the joint Wald are reported through it
-/// (`ColumnScaling::IDENTITY` for a design fitted as given).
+/// `map` is the column standardization the rows were accumulated under, and
+/// `units` the units of their response: β̂, `var_diag`, `t_sq` and the joint
+/// Wald are reported through both (`ColumnScaling::IDENTITY` and
+/// `Units::IDENTITY` for data fitted as given); σ̂² and the deviance stay in
+/// the internal units.
 ///
 /// `hint`: a caller's [`crate::optim::CurvatureHint`] for the gradient search
 /// (`loop_advanced::fit_on_hinted`); read only, and ignored on the BOBYQA
@@ -2875,6 +2871,7 @@ pub fn fit_lmm(
     theta_start: Option<&[f64]>,
     hint: Option<&crate::optim::CurvatureHint>,
     map: &ColumnScaling,
+    units: &Units,
 ) -> LmmFit {
     let LmmWorkspace {
         kernel,
@@ -3087,16 +3084,19 @@ pub fn fit_lmm(
     // one against the mapped factor Uᵀ·L̃_XX, which would round the product.
     recovery.betas.copy_from_slice(&recovery.beta_tilde);
     kernel.design_qr().map_beta(&mut recovery.betas);
-    // β̂ on the caller's columns: β = B·β̂(standardized), `map` the column
-    // standardization the rows were accumulated under. `beta_tilde` stays on
-    // the kernel's design for the conditional-mode recovery below.
-    map.beta_to_caller(&mut recovery.betas);
+    // β̂ on the caller's columns and in the caller's units:
+    // β = B·k·(β̂(standardized) + δ̃), `map` the column standardization the
+    // rows were accumulated under and `units` their response's. `beta_tilde`
+    // stays on the kernel's design and in its units for the conditional-mode
+    // recovery below.
+    units.beta_to_caller(map, &mut recovery.betas);
     let factor = kernel.factor();
 
-    // Var(β̂ₜ) = σ̂²·‖L_XX⁻¹bₜ‖² per target, bₜ row t of the column map B (eₜ
-    // when the design is fitted as given); t² = β̂²/Var, via a forward solve on
-    // this factor.
+    // Var(β̂ₜ) = k²·σ̂²·‖L_XX⁻¹bₜ‖² per target, bₜ row t of the column map B
+    // (eₜ when the design is fitted as given); t² = β̂²/Var, via a forward
+    // solve on this factor. `LmmFit::sigma_sq` stays the kernel's.
     let sigma_sq = kernel.sigma_sq();
+    let sigma_var = sigma_sq * units.var_scale();
     for &tj in target_indices {
         let tj = tj as usize;
         for v in recovery.u[..p].iter_mut() {
@@ -3114,7 +3114,7 @@ pub fn fit_lmm(
         for i in 0..p {
             recovery.joint_cols[(i, tj)] = recovery.u[i];
         }
-        let vd = sigma_sq * norm_sq;
+        let vd = sigma_var * norm_sq;
         recovery.var_diag[tj] = vd;
         recovery.t_sq[tj] = if vd.is_finite() && vd > 0.0 {
             (recovery.betas[tj] * recovery.betas[tj]) / vd
@@ -3128,7 +3128,7 @@ pub fn fit_lmm(
     let joint_t_sq = joint_wald_chi_sq(
         recovery.joint_cols.as_ref(),
         &recovery.betas,
-        sigma_sq,
+        sigma_var,
         target_indices,
         recovery.joint_qr.as_mut(),
         &mut recovery.joint_z,
@@ -3165,5 +3165,5 @@ pub(crate) fn fit_lmm_unhinted(
     theta_start: Option<&[f64]>,
     map: &ColumnScaling,
 ) -> LmmFit {
-    fit_lmm(ws, target_indices, theta_start, None, map)
+    fit_lmm(ws, target_indices, theta_start, None, map, Units::IDENTITY)
 }

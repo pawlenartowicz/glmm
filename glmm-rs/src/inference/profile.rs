@@ -25,8 +25,8 @@
 use std::fmt;
 
 use super::tails::normal_quantile;
-use crate::fit::{detect_aliased, fit_cold_keep_workspace, validate, Perm};
-use crate::lmm::profile::{ProfileKernel, VarCoord};
+use crate::fit::{detect_aliased, fit_cold_keep_workspace, validate};
+use crate::lmm::profile::ProfileKernel;
 use crate::{ColumnId, Data, Design, Family, Fit, FitError, FitOptions, ModelSpec, ReTerm};
 
 /// Expansion steps per side; a side that has not bracketed the root after
@@ -308,33 +308,6 @@ pub(crate) fn profile_params(spec: &ModelSpec, p: usize) -> Vec<ProfileParam> {
     out
 }
 
-/// The parameter of each of the kernel's coordinates. `hidden[b]` marks a
-/// block without an intercept, whose idle column 0 the kernel keeps and the
-/// reported block drops. `group` is the kernel's slot `block` mapped through
-/// `perm` into declaration order; `hidden` stays in slot order.
-pub(super) fn coord_params(coords: &[VarCoord], hidden: &[bool], perm: Perm) -> Vec<ProfileParam> {
-    coords
-        .iter()
-        .map(|&c| match c {
-            VarCoord::Sd { block, row, .. } => ProfileParam::Sd {
-                group: perm.map_index(block),
-                term: row - usize::from(hidden[block]),
-            },
-            VarCoord::Cor {
-                block, row, col, ..
-            } => {
-                let h = usize::from(hidden[block]);
-                ProfileParam::Cor {
-                    group: perm.map_index(block),
-                    row: row - h,
-                    col: col - h,
-                }
-            }
-            VarCoord::Sigma => ProfileParam::Sigma,
-        })
-        .collect()
-}
-
 /// The ML fit, its fit-dependent refusals and the profiles;
 /// [`Fit::profile_intervals`] and the ports both call it. Refuses as
 /// [`Fit::profile_intervals`] does, except for the checks against a fit.
@@ -391,15 +364,12 @@ pub(crate) fn profile_on(
             l.len() as f64
         })
         .collect();
-    let perm = fws.perm();
-    let (ws, map) = fws
-        .lmm_parts()
+    let mut k = fws
+        .profile_kernel()
         .expect("a Gaussian mixed fit runs on the LMM workspace");
-    let n_rows = ws.kernel.n_rows() as f64;
-    let hidden = ws.kernel.groupings().hidden.clone();
-    let mut k = ProfileKernel::new(ws, map);
-    let coords = k.coords().to_vec();
-    let var_params = coord_params(&coords, &hidden, perm);
+    let n_rows = k.n_rows();
+    // A copy: the side searches borrow `k` mutably.
+    let var_params = k.params().to_vec();
     let mismatch = || {
         format!(
             "the kernel's coordinates label their rows {var_params:?}, the spec's parameters are \
@@ -423,50 +393,48 @@ pub(crate) fn profile_on(
     let base = k.kernel_deviance_at_hat();
     let sigma_hat = est[est.len() - 1];
     let wanted = |q: &ProfileParam| which.is_none_or(|w| w.contains(q));
-    let sd_at = |b: usize, r: usize| {
-        coords
+    let sd_at = |group: usize, term: usize| {
+        let i = var_params
             .iter()
-            .zip(&est)
-            .find_map(|(c, &e)| match *c {
-                VarCoord::Sd { block, row, .. } if block == b && row == r => Some(e),
-                _ => None,
-            })
-            .expect("each column of a term has its SD")
+            .position(|&q| q == ProfileParam::Sd { group, term })
+            .expect("each column of a term has its SD");
+        est[i]
     };
 
     let mut rows = Vec::new();
     for &i in &order {
-        let (coord, param) = (coords[i], var_params[i]);
+        let param = var_params[i];
         if !wanted(&param) {
             continue;
         }
         let e = est[i];
         let mut side = |toward: Toward<'_>| var_bound(&mut k, i, param, &est, base, z, toward);
-        let (estimate, lower, upper) = match coord {
-            VarCoord::Sd { block, .. } => {
+        let (estimate, lower, upper) = match param {
+            ProfileParam::Sd { group, .. } => {
                 let lower = side(Toward::Limit(0.0))?;
                 let upper = if e > 0.0 {
-                    let h = z / (2.0 * level_counts[perm.map_index(block)]).sqrt();
+                    let h = z / (2.0 * level_counts[group]).sqrt();
                     side(Toward::Expand(&|t| (e.ln() + h * t).exp()))?
                 } else {
                     side(Toward::Expand(&|t| sigma_hat * t / 8.0))?
                 };
                 (e, lower, upper)
             }
-            VarCoord::Cor {
-                block, row, col, ..
-            } => {
-                if sd_at(block, row) == 0.0 || sd_at(block, col) == 0.0 {
+            ProfileParam::Cor { group, row, col } => {
+                if sd_at(group, row) == 0.0 || sd_at(group, col) == 0.0 {
                     (f64::NAN, f64::NAN, f64::NAN)
                 } else {
                     (e, side(Toward::Limit(-1.0))?, side(Toward::Limit(1.0))?)
                 }
             }
-            VarCoord::Sigma => {
+            ProfileParam::Sigma => {
                 let h = z / (2.0 * n_rows).sqrt();
                 let lower = side(Toward::Expand(&|t| (e.ln() - h * t).exp()))?;
                 let upper = side(Toward::Expand(&|t| (e.ln() + h * t).exp()))?;
                 (e, lower, upper)
+            }
+            ProfileParam::Beta(_) => {
+                unreachable!("the kernel's coordinates are variance parameters")
             }
         };
         rows.push(ProfileInterval {

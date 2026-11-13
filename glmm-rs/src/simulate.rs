@@ -9,7 +9,7 @@ use commonstats::dist::{
 use commonstats::rng::{CommonStatsRng, STREAM_TAG_SIMULATE};
 use faer::MatRef;
 
-use crate::family::{clamp_eta, link_inv, PROB_EPS};
+use crate::family::{clamp_eta, link_inv, mean_out_of_range, PROB_EPS};
 use crate::fit::validate_design;
 use crate::lmm::re_map::{semidef_lower_chol, PivotFloor};
 use crate::lmm::slope_value;
@@ -38,19 +38,10 @@ fn dense_ids(ids: &[u32]) -> (Vec<u32>, usize) {
 /// `μ = g⁻¹(η)` of a draw: [`link_inv`], with `libm`'s `exp`, `expm1` and
 /// `erfc` in place of `f64::exp`, which follows the platform's libm. So a
 /// draw has the same last bit on every target. Mirrors `link_inv`, the clamp
-/// included — change together — except that η ≤ 0 on the two reciprocal
-/// links is NaN: such a mean is outside the family's range.
+/// included — change together — except that an η with no mean in the
+/// family's range ([`mean_out_of_range`]) is NaN.
 fn draw_mean(family: Family, eta: f64) -> f64 {
-    if matches!(
-        family,
-        Family::Gamma {
-            link: GammaLink::Inverse,
-            ..
-        } | Family::InverseGaussian {
-            link: InverseGaussianLink::InverseSquared,
-        }
-    ) && (eta.is_nan() || eta <= 0.0)
-    {
+    if mean_out_of_range(family, eta) {
         return f64::NAN;
     }
     let eta = clamp_eta(family, eta);
@@ -110,7 +101,9 @@ fn draw_mean(family: Family, eta: f64) -> f64 {
 /// `w/φ̂`); ignored by the Poisson and the negative binomial (size
 /// [`Fit::dispersion`]), as `poisson()$simulate` and MASS's are. A
 /// coefficient that is NaN (an aliased column, a GLM column the fit could not
-/// separate) contributes zero, as in [`crate::predict`]. A row whose mean is
+/// separate) contributes zero, as in [`crate::predict`], except on a row
+/// outside the row space of a rank-deficient fit (see [`crate::predict`]),
+/// which draws NaN. A row whose mean is
 /// outside its family's range (η ≤ 0 through the Gamma inverse or
 /// inverse-Gaussian 1/μ² link) draws NaN, as R's samplers do; a NaN row reads
 /// no number from the stream, so the later rows of that draw differ from a
@@ -253,8 +246,23 @@ impl<'a> Simulator<'a> {
                         t += 1;
                     }
                 }
+                // Factored as correlations, Σ = D·R·D with L = D·chol(R): on Σ
+                // itself a column's scale can put its diagonal below the trace
+                // floor and drop a real random effect.
+                let sd: Vec<f64> = (0..q).map(|r| sig[r * q + r].sqrt()).collect();
+                for r in 0..q {
+                    for c in 0..=r {
+                        let s = sd[r] * sd[c];
+                        sig[r * q + c] = if s > 0.0 { sig[r * q + c] / s } else { 0.0 };
+                    }
+                }
                 let mut l = vec![0.0; q * q];
                 semidef_lower_chol(&sig, q, &mut l, PivotFloor::Trace);
+                for r in 0..q {
+                    for c in 0..=r {
+                        l[r * q + c] *= sd[r];
+                    }
+                }
                 let (ids, levels) = dense_ids(ids);
                 groupings.push(SimGrouping {
                     ids,
@@ -323,7 +331,12 @@ impl<'a> Simulator<'a> {
                 1.0 => w[i],
                 power => w[i].powf(power),
             });
-            *v = self.draw_row(mu, w, &normal, &mut rng);
+            // A NaN mean reads nothing from the stream, on every family.
+            *v = if mu.is_nan() {
+                f64::NAN
+            } else {
+                self.draw_row(mu, w, &normal, &mut rng)
+            };
         }
     }
 

@@ -12,10 +12,9 @@
 //!     (R's `glm.fit` rule, `src/library/stats/R/glm.R`, where `f = 0.1`).
 //!     The rule is relative while `|deviance| ≫ f`; the floor `f` makes it
 //!     absolute once the deviance itself is tiny (an exact fit). On Gamma and
-//!     inverse-Gaussian `f` is 0.1 in the deviance's own units: times the
-//!     precision weights' scale, and over ȳ on inverse-Gaussian, whose
-//!     deviance scales as 1/y. So their stopping point does not depend on the
-//!     overall scale of the weights or on the response's units (see
+//!     inverse-Gaussian `f` is 0.1 of a deviance whose units the core has
+//!     taken out of the weights and the response (`standardize::Units`), so
+//!     their stopping point does not depend on either's overall scale (see
 //!     `dev_floor`). On binomial, Poisson and NB `f` is R's 0.1 in units of
 //!     one case: weights below one case scale it down with them.
 //!   - Both stops read the step that produced the current β, `max_i |Δηᵢ|`:
@@ -75,7 +74,7 @@ use crate::ols::{
     contrast_t_sq_of, nan_fill_ols_scratch, pair_contrast_norm_sq, triangular_solve_norm_sq,
 };
 use crate::spec::{BinomialLink, Family};
-use crate::standardize::ColumnScaling;
+use crate::standardize::{ColumnScaling, Units};
 
 /// IRLS safety cap.
 pub const MAX_IRLS_ITERS: u32 = 50;
@@ -460,6 +459,7 @@ pub fn glm_irls_fit<'a>(
         offset,
         scratch,
         ColumnScaling::IDENTITY,
+        Units::IDENTITY,
     )
 }
 
@@ -503,9 +503,12 @@ pub fn glm_contrast_t_sq(fit: &GlmFitView<'_>, p_col: u32, n_col: u32, scratch: 
 }
 
 /// [`glm_irls_fit`] on a design fitted through a column map `B`
-/// (`x̃ = X·B`, `β = B·β̃`). The returned `betas` are β̃, on the design `x`
-/// holds; `var_diag` and `t_sq` are the caller's: `Var(βₜ) = ‖L⁻¹bₜ‖²` with
-/// `bₜ` row `t` of `B`, `t² = βₜ²/Var(βₜ)`.
+/// (`x̃ = X·B`, `β = B·β̃`), with `y`, `prior_w` and `offset` those of `units`
+/// (`Units::y`, `Units::weights`, `Units::offset`). The returned `betas` are
+/// β̃ in the internal units, on the design `x` holds; `var_diag` and `t_sq`
+/// are the caller's: `Var(βₜ) = v·‖L⁻¹bₜ‖²` with `bₜ` row `t` of `B` and `v` =
+/// [`Units::glm_var_scale`], `t² = βₜ²/Var(βₜ)` with the caller's `βₜ`
+/// ([`Units::beta_to_caller`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn glm_irls_fit_mapped<'a>(
     family: Family,
@@ -518,6 +521,7 @@ pub(crate) fn glm_irls_fit_mapped<'a>(
     offset: Option<&[f64]>,
     scratch: GlmScratch<'a>,
     map: &ColumnScaling,
+    units: &Units,
 ) -> GlmFitView<'a> {
     glm_irls_fit_seeded(
         family,
@@ -530,6 +534,7 @@ pub(crate) fn glm_irls_fit_mapped<'a>(
         offset,
         scratch,
         map,
+        units,
         false,
     )
 }
@@ -549,6 +554,7 @@ fn glm_irls_fit_seeded<'a>(
     offset: Option<&[f64]>,
     scratch: GlmScratch<'a>,
     map: &ColumnScaling,
+    units: &Units,
     per_row_seed: bool,
 ) -> GlmFitView<'a> {
     let n = x.nrows();
@@ -559,13 +565,7 @@ fn glm_irls_fit_seeded<'a>(
     // The fused logit deviance `2·(Σ log1pexp(η) − Σ yη)` and the closed-form
     // null deviance hold only on 0/1 rows: a fractional binomial y takes the
     // weighted arm (unit weights) instead.
-    let weighted = prior_w.is_some()
-        || (matches!(
-            family,
-            Family::Binomial {
-                link: BinomialLink::Logit
-            }
-        ) && y[..n].iter().any(|&v| v != 0.0 && v != 1.0));
+    let weighted = crate::family::weighted_deviance_needed(family, &y[..n], prior_w);
 
     let GlmScratch {
         irls_eta,
@@ -721,22 +721,22 @@ fn glm_irls_fit_seeded<'a>(
         0.0
     };
 
-    // Floor of the relative deviance rule: R's 0.1, carried into the
-    // deviance's units on the two dispersion families. The floor is an
-    // absolute deviance, so a fixed 0.1 stops a fit early whenever the
-    // deviance is small only because of units. On Gamma and inverse-Gaussian
-    // the prior weights are precision weights with no scale of their own, and
+    // Floor of the relative deviance rule: R's 0.1. The floor is an absolute
+    // deviance, so a fixed 0.1 stops a fit early whenever the deviance is
+    // small only because of units. On Gamma and inverse-Gaussian the prior
+    // weights are precision weights with no scale of their own, and
     // D = Σ wᵢdᵢ scales with them; the inverse-Gaussian unit deviance
-    // (y−μ)²/(yμ²) also scales as 1/y. With R's 0.1, an inverse-Gaussian/log
-    // fit with D = 19 stopped with β 1e-6 (relative) short of the maximum at
-    // y × 1e3, and a Gamma/log fit with every weight 1e-9 2e-3 short, both
-    // reported converged.
-    // `weight_scale` is an exact power of two (1 unweighted) and ȳ carries y's
-    // units. On binomial, Poisson and NB, with φ ≡ 1, the deviance is a
+    // (y−μ)²/(yμ²) also scales as 1/y. The core fits both on internal units
+    // (`standardize::Units`: `ŵ = w/s` and `y/c`, geometric means near 1), so
+    // 0.1 is in those units there. On raw data (the loop tier's
+    // `glm_irls_fit`) it is R's 0.1: an inverse-Gaussian/log fit with D = 19
+    // at y × 1e3 stops with β 1e-6 (relative) short of the maximum, reported
+    // converged. On binomial,
+    // Poisson and NB, with φ ≡ 1, the deviance is a
     // likelihood-ratio statistic of counts, and R's 0.1 is in units of one
     // case: weights of a case or more (trial counts, frequency weights) keep
-    // it exactly, and weights below one case scale it down with them, as the
-    // Gamma floor does (`case_scale`). With every weight 1e-12 the fixed 0.1
+    // it exactly, and weights below one case scale it down with them
+    // (`case_scale`). With every weight 1e-12 the fixed 0.1
     // stopped a binomial fit after its first compared pass, read as
     // separation. Poisson and NB also carry ȳ's units below ȳ = 1: a
     // non-integer y in tiny units (a rate without exposure weights) has
@@ -744,13 +744,11 @@ fn glm_irls_fit_seeded<'a>(
     // reported converged. Not a plain 0.1·ȳ: an NB deviance with θ ≪ ȳ does
     // not grow with ȳ, and at ȳ = 1e6 that floor would ask |ΔD| < 1e-7 of a
     // linearly converging fit. An all-zero count response (ȳ = 0) keeps
-    // 0.1·`case_scale`. Unweighted, off inverse-Gaussian and ȳ < 1 counts,
+    // 0.1·`case_scale`. Unweighted and off ȳ < 1 counts,
     // the floor is exactly 0.1.
-    let weight_scale = crate::family::weight_scale(prior_w, n);
-    let case_scale = weight_scale.min(1.0);
+    let case_scale = crate::family::weight_scale(prior_w, n).min(1.0);
     let dev_floor = match family {
-        Family::Gamma { .. } => 0.1 * weight_scale,
-        Family::InverseGaussian { .. } => 0.1 * weight_scale / y_bar,
+        Family::Gamma { .. } | Family::InverseGaussian { .. } => 0.1,
         Family::Poisson { .. } | Family::NegativeBinomial { .. } if y_bar > 0.0 => {
             0.1 * y_bar.min(1.0) * case_scale
         }
@@ -1548,6 +1546,7 @@ fn glm_irls_fit_seeded<'a>(
                     irls_broken,
                 },
                 map,
+                units,
                 true,
             );
         }
@@ -1629,9 +1628,10 @@ fn glm_irls_fit_seeded<'a>(
 
     // Per-target (B(X̃'WX̃)⁻¹Bᵀ)ₜₜ = ‖L⁻¹bₜ‖², bₜ row t of the column map B (eₜ on
     // an unmapped design) — see `ols::triangular_solve_norm_sq` for the
-    // forward-solve identity. That is Var(β̂ₜ) at φ = 1, and φ stays out of the
-    // kernel: Var(β̂) = φ·(X'WX)⁻¹ on Gamma and inverse-Gaussian, with φ̂ read
-    // after the fit (`fit::glm::glm_dispersion`).
+    // forward-solve identity — in the caller's units (`glm_var_scale`). That
+    // is Var(β̂ₜ) at φ = 1, and φ stays out of the kernel: Var(β̂) = φ·(X'WX)⁻¹
+    // on Gamma and inverse-Gaussian, with φ̂ read after the fit
+    // (`fit::glm::glm_dispersion`). t² reads the caller's βₜ.
     for (out_idx, &tj) in target_indices.iter().enumerate() {
         let tj = tj as usize;
         if tj >= p {
@@ -1643,10 +1643,11 @@ fn glm_irls_fit_seeded<'a>(
             irls_u_scratch,
             p,
             false, // lower-triangular L: row access factor[(i, k)]
-        );
+        ) * units.glm_var_scale();
         irls_var_diag[out_idx] = norm_sq;
         if norm_sq > 0.0 && norm_sq.is_finite() {
-            let beta_j = map.beta_coef(tj, &irls_betas[..p]);
+            let beta_j =
+                units.beta_scale() * (map.beta_coef(tj, &irls_betas[..p]) + units.shift_caller(tj));
             irls_t_sq[out_idx] = (beta_j * beta_j) / norm_sq;
         } else {
             irls_t_sq[out_idx] = f64::NAN;

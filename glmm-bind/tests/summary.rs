@@ -1,7 +1,7 @@
 mod common;
 
 use common::{f64s, field, fit_args, rec, text};
-use glmm_bind::{call, Record, Value};
+use glmm_bind::{call, Port, Record, Value};
 
 /// A stored two-coefficient OLS-shaped fit, as a port passes it: every field,
 /// a z table unless a test sets `df_method`.
@@ -45,7 +45,12 @@ fn fit(extra: Vec<(&str, Value)>) -> Record {
 }
 
 fn summary(fit: Record) -> Value {
-    call("summary", rec(vec![("fit", Value::Record(fit))])).unwrap()
+    call(
+        Port::Python,
+        "summary",
+        rec(vec![("fit", Value::Record(fit))]),
+    )
+    .unwrap()
 }
 
 fn s(v: &Value) -> &str {
@@ -110,7 +115,7 @@ fn a_failed_mixed_fit_keeps_its_title_and_groups_and_has_no_df_resid() {
     let b = failed("binomial", false);
     assert_eq!(
         s(field(&b, "method")),
-        "Generalized linear mixed model fit by maximum likelihood (Laplace Approximation)"
+        "Generalized linear mixed model fit by maximum likelihood (Laplace Approximation) [glmm]"
     );
     assert_eq!(
         field(field(&b, "groups"), "levels"),
@@ -122,7 +127,10 @@ fn a_failed_mixed_fit_keeps_its_title_and_groups_and_has_no_df_resid() {
     };
     assert!(matches!(c.get("df.resid"), Some(Value::F64(v)) if v.is_nan()));
     let g = failed("gaussian", true);
-    assert_eq!(s(field(&g, "method")), "Linear mixed model fit by REML");
+    assert_eq!(
+        s(field(&g, "method")),
+        "Linear mixed model fit by REML [glmm]"
+    );
 }
 
 #[test]
@@ -251,6 +259,7 @@ fn a_mixed_fit_has_its_random_effects_groups_and_effect_sizes() {
         ("unadjusted", Value::F64(0.3)),
     ]);
     let r = call(
+        Port::Python,
         "summary",
         rec(vec![
             ("fit", Value::Record(mixed)),
@@ -258,7 +267,10 @@ fn a_mixed_fit_has_its_random_effects_groups_and_effect_sizes() {
         ]),
     )
     .unwrap();
-    assert_eq!(s(field(&r, "method")), "Linear mixed model fit by REML");
+    assert_eq!(
+        s(field(&r, "method")),
+        "Linear mixed model fit by REML [glmm]"
+    );
     assert_eq!(field(&r, "residual_variance"), &Value::F64(1.0));
     let Value::List(re) = field(&r, "random_effects") else {
         panic!("random_effects is not a list")
@@ -278,9 +290,59 @@ fn a_mixed_fit_has_its_random_effects_groups_and_effect_sizes() {
 }
 
 #[test]
+fn the_title_suffix_and_ml_note_come_by_port() {
+    let mixed = |extra: Vec<(&str, Value)>| {
+        let mut r = fit(vec![
+            ("varcorr", Value::List(vec![Value::Vec(vec![4.0])])),
+            (
+                "re_groups",
+                Value::List(vec![Value::List(vec![
+                    text("g"),
+                    Value::StrVec(vec!["(Intercept)".into()]),
+                ])]),
+            ),
+            ("ranef_levels", Value::IntVec(vec![2])),
+        ]);
+        for (k, v) in extra {
+            r.set(k, v);
+        }
+        r
+    };
+    let note = text("Note: p-values can be somewhat anticonservative.");
+    for (port, title) in [
+        (
+            Port::Python,
+            "Linear mixed model fit by maximum likelihood [glmm]",
+        ),
+        (
+            Port::R,
+            "Linear mixed model fit by maximum likelihood [fastglmm]",
+        ),
+    ] {
+        let r = call(
+            port,
+            "summary",
+            rec(vec![("fit", Value::Record(mixed(vec![])))]),
+        )
+        .unwrap();
+        assert_eq!(s(field(&r, "method")), title);
+        assert_eq!(field(&r, "ml_note"), &note);
+    }
+    let reml = summary(mixed(vec![("reml", Value::Bool(true))]));
+    assert_eq!(field(&reml, "ml_note"), &Value::Null);
+    let failed = summary(mixed(vec![(
+        "varcorr",
+        Value::List(vec![Value::Vec(vec![f64::NAN])]),
+    )]));
+    assert_eq!(field(&failed, "ml_note"), &Value::Null);
+    assert_eq!(field(&summary(fit(vec![])), "ml_note"), &Value::Null);
+}
+
+#[test]
 fn pearson_residuals_stay_finite_at_extreme_means() {
     // V = mu^2 (Gamma) leaves the double range here; sqrt(V) does not.
     let r = call(
+        Port::Python,
         "pearson_residuals",
         rec(vec![
             ("family", text("gamma")),
@@ -312,7 +374,7 @@ fn deviance_residual_sum_matches_the_poisson_formula() {
         for (k, v) in extra {
             r.push(k, v);
         }
-        match call("deviance_residual_sum", r).unwrap() {
+        match call(Port::Python, "deviance_residual_sum", r).unwrap() {
             Value::F64(v) => v,
             other => panic!("{other:?}"),
         }
@@ -352,7 +414,7 @@ fn pearson_residuals_read_the_weight_power() {
         if let Some(v) = power {
             r.push("weight_power", Value::F64(v));
         }
-        f64s(&call("pearson_residuals", r).unwrap()).to_vec()
+        f64s(&call(Port::Python, "pearson_residuals", r).unwrap()).to_vec()
     };
     assert_eq!(pearson(&w, Some(0.5)), pearson(&wv, None));
     assert_ne!(pearson(&w, None), pearson(&wv, None));
@@ -491,7 +553,7 @@ fn narrow_weights_print_the_out_of_range_line_with_the_mild_note() {
         0,
     );
     args.push("weights", Value::Vec(w));
-    let out = call("fit", args).unwrap();
+    let out = call(Port::Python, "fit", args).unwrap();
     let Value::F64(delta) = *field(&out, "weight_power") else {
         panic!("weight_power is not a number")
     };

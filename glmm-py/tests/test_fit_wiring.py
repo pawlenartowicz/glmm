@@ -261,10 +261,9 @@ def test_pinned_detail_is_reported_on_a_sparse_route_fit():
 
 def test_degenerate_mixed_fit_returns_instead_of_panicking():
     # n <= p leaves the LMM with no finite deviance endpoint, so the kernel takes
-    # its degenerate return: NaN beta/se/dispersion and — the crate's
-    # numerical-failure convention — no assembled varcorr. A mixed fit lowers one
-    # grouping regardless, so the two lengths disagree; that must reach the caller
-    # as a returned non-converged result, not a PanicException across the FFI.
+    # its degenerate return: NaN beta/se/dispersion and NaN variance blocks. That
+    # must reach the caller as a returned non-converged result, not a
+    # PanicException across the FFI.
     data = {
         "y": [1.0, 2.0, 3.0],
         "x1": [0.1, 0.7, 0.3],
@@ -275,10 +274,34 @@ def test_degenerate_mixed_fit_returns_instead_of_panicking():
         warnings.simplefilter("ignore")
         result = glmm.fit(data, "y ~ x1 + x2 + (1 | g)")
     assert not result.converged
-    assert result.varcorr == []
     assert result.re_groups == [("g", ["(Intercept)"])]
     # summary() walks varcorr/re_groups together — it must print, not raise.
     assert "Random effects:" not in result.summary()
+
+
+def test_failed_mixed_fit_has_full_length_nan_random_effect_fields():
+    # n = p = 3 leaves no finite end point: one grouping, two levels, q = 1.
+    # Mirrors test-marshalling.R's "a failed mixed fit has full-length NaN
+    # random-effect fields" - change together.
+    data = {
+        "y": [1.0, 2.0, 4.0],
+        "x1": [0.0, 1.0, 3.0],
+        "x2": [1.0, 0.0, 2.0],
+        "g": ["a", "b", "a"],
+    }
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        m = glmm.fit(data, "y ~ x1 + x2 + (1 | g)")
+    assert not m.converged
+    assert len(m.varcorr) == 1 and len(m.varcorr[0]) == 1
+    assert len(m.stddev_se) == 1
+    assert len(m.ranef) == 2
+    assert list(m.ranef_levels) == [2]
+    assert len(m.fitted) == 3
+    for values in (m.varcorr[0], m.stddev_se, m.ranef, m.fitted):
+        assert np.isnan(values).all()
+    with pytest.raises(ValueError, match="no variance estimates"):
+        m.stddev_corr(0)
 
 
 def test_cbind_response_equals_proportion_plus_weights():

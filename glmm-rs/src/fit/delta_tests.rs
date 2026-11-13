@@ -1,4 +1,4 @@
-//! The fitted weight power (§3.1, §3.1c, §3.3 of the δ fit spec): the search
+//! The fitted weight power: the search
 //! against a dense grid of the crate's own profile, its identities, notes and
 //! the `None` resolution.
 
@@ -143,11 +143,11 @@ fn delta_bracket_follows_the_weight_spread() {
     }
 }
 
-/// G1 by REML, through the default call (which resolves to the δ fit on these
+/// By REML, through the default call (which resolves to the δ fit on these
 /// shapes): δ̂'s deviance is within 1e-7 (WLS) or `MIXED_TOL` (random
 /// intercept) of the grid's best; no fit fails at spreads up to 1e16; the fit
 /// reports REML, its log-likelihood is the profile at δ̂, and δ̂ counts in
-/// `df` (D6). Past what `f64` resolves, the search notes its probes.
+/// `df`. Past what `f64` resolves, the search notes its probes.
 #[test]
 fn reml_search_reaches_the_grid_best() {
     for (sets, tol) in [(wls_sets(), 1e-7), (mixed_sets(), MIXED_TOL)] {
@@ -217,24 +217,6 @@ fn a_pin_that_costs_deviance_is_undone() {
         mixed.loglik(),
         wls.loglik()
     );
-}
-
-/// The LMM's rounding estimate reads the response uncentred: a mean 1e6 times
-/// the residual SD at n = 1000 takes `PrecisionLimited`, a mean 1e2 times it
-/// does not.
-#[test]
-fn a_response_far_from_zero_is_precision_limited() {
-    for (shift, limited) in [(1e6, true), (1e2, false)] {
-        let mut set = dataset(21, 1000, 20, 1.0, 1.0, 0.0);
-        set.y.iter_mut().for_each(|y| *y += shift);
-        let fit = crate::fit(&set.data(None), &set.spec(), &FitOptions::default()).unwrap();
-        let notes = &fit.diagnostics.notes;
-        assert_eq!(
-            notes.iter().any(|n| matches!(n, Note::PrecisionLimited)),
-            limited,
-            "shift {shift}: {notes:?}"
-        );
-    }
 }
 
 /// Spread 1e16 at δ = −2 by REML: from a warm start θ = 10 or 100 the search
@@ -364,7 +346,7 @@ fn a_sparse_routed_fit_computes_the_pivot_noise() {
     }
 }
 
-/// G1: at δ = 1 and δ = 0 the profile is the REML log-likelihood of the
+/// At δ = 1 and δ = 0 the profile is the REML log-likelihood of the
 /// claimed fit and of the fit without weights.
 #[test]
 fn profile_at_one_and_zero_is_the_claimed_and_the_unweighted_fit() {
@@ -390,7 +372,7 @@ fn profile_at_one_and_zero_is_the_claimed_and_the_unweighted_fit() {
     }
 }
 
-/// §10.3: `w → 10·w` moves σ² only.
+/// `w → 10·w` moves σ² only.
 #[test]
 fn scaling_the_weights_leaves_delta_and_beta() {
     for set in [
@@ -407,7 +389,7 @@ fn scaling_the_weights_leaves_delta_and_beta() {
     }
 }
 
-/// §3.1c: a named `Estimate` with `reml = Some(false)` maximizes the ML
+/// A named `Estimate` with `reml = Some(false)` maximizes the ML
 /// log-likelihood (the same grid check) and reports ML.
 #[test]
 fn ml_search_reaches_the_ml_grid_best() {
@@ -466,16 +448,21 @@ fn search_notes(fit: &Fit) -> (bool, bool) {
     )
 }
 
-/// Weights near 1e100 on noise steeper than any power keeping `wᵢ^δ` within
-/// 1e±250: the bracket narrows to ±2.4 (the spread alone gives ±7), no probe
+/// Weights in [1e96, 1e100], up to the largest allowed, on noise steeper than
+/// any power keeping `wᵢ^δ` within 1e±250: the bracket narrows to
+/// ±ln(1e250)/ln(1e100) = ±2.5 (the spread alone gives ±7), no probe
 /// fails, and the fit ends at the bound with its note and finite model and
 /// robust SEs (before, XᵀWX overflowed at δ̂ near 3: NaN SEs or a failed refit).
 #[test]
 fn huge_weights_narrow_the_bracket_and_the_fit_ends_at_the_bound() {
     for (seed, delta0) in [(6, 5.0), (13, 4.0), (0, 3.0)] {
-        let set = dataset(seed, 60, 0, 1e100, 1e4, delta0);
+        let set = dataset(seed, 60, 0, 1e96, 1e4, delta0);
         let (lower, upper) = delta_bracket(&set.w);
-        assert!(lower == -upper && upper > 2.0 && upper < 2.5, "{upper}");
+        let narrowed = 1e250_f64.ln() / 1e100_f64.ln();
+        assert!(
+            lower == -upper && (upper - narrowed).abs() < 1e-3,
+            "{upper}"
+        );
         for se_type in [SeType::Model, SeType::Robust] {
             let fit = set.fit(&FitOptions {
                 se_type: Some(se_type),
@@ -514,7 +501,7 @@ fn large_weights_keep_the_bound_probe_finite() {
     assert_eq!(search_notes(&fit), (true, false));
 }
 
-/// §3.3 (G9): `None` resolves to the δ fit only on a Gaussian REML fit with
+/// `None` resolves to the δ fit only on a Gaussian REML fit with
 /// weights not all equal, at most one grouping factor and at least 20 rows.
 #[test]
 fn none_resolves_to_estimate_only_in_scope() {

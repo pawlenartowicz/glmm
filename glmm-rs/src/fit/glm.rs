@@ -5,13 +5,14 @@
 
 use faer::Mat;
 
+use crate::consts::{NB_THETA_HI, NB_THETA_LO};
 use crate::glm::{glm_irls_fit_mapped, GlmFitView, GlmScratch};
 use crate::inference::Objective;
-use crate::standardize::ColumnScaling;
+use crate::standardize::{ColumnScaling, Units};
 use crate::{Family, NegBinomialLink};
 
 use super::common::{fill_se_compact, nan_vcov, residual_df, vcov_from_chol, FitDiagnostics};
-use super::{Diagnostics, Fit, FitOptions, SeType};
+use super::{Fit, FitOptions, SeType};
 
 impl GlmFitView<'_> {
     /// This route's [`FitDiagnostics`]. No θ, so no boundary or pin state. The
@@ -38,47 +39,6 @@ impl GlmFitView<'_> {
     }
 }
 
-/// Builds the standard non-converged NaN `Fit` used to seed
-/// [`fit_glm_nb_capped`]'s θ↔β alternation before the first inner IRLS fit
-/// runs. If `max_outer` were ever `0` this is what the loop returns unmodified,
-/// `dispersion: NaN` included — the loop only overwrites `dispersion` with the
-/// alternation's θ when the final fit converged; in practice `max_outer >= 1`
-/// always, so the first iteration replaces it before it's read.
-fn fit_unsupported_family(n: usize, p: usize) -> Fit {
-    Fit {
-        beta: vec![f64::NAN; p],
-        se: vec![f64::NAN; p],
-        vcov: nan_vcov(p),
-        tau2: vec![],
-        dispersion: f64::NAN,
-        diagnostics: Diagnostics::from_flags(false, false, p),
-        varcorr: vec![],
-        stddev_se: vec![],
-        n_eval: 0,
-        #[cfg(feature = "counters")]
-        counters: crate::counters::EvalCounters::new(),
-        deviance: f64::NAN,
-        loglik: f64::NAN,
-        df: 0,
-        reml: false,
-        weight_power: f64::NAN,
-        weight_power_estimated: false,
-        se_type: SeType::Model,
-        model_vcov: Vec::new(),
-        robust: None,
-        nobs: n,
-        objective: Objective::MaximumLikelihood,
-        fitted: vec![],
-        ranef: vec![],
-        ranef_levels: vec![],
-        condvar: vec![],
-        condvar_x: vec![],
-        condvar_cross: None,
-        coef_df: vec![f64::NAN; p],
-        satterthwaite: None,
-        design_summary: None,
-    }
-}
 // ---------------------------------------------------------------------------
 // GLM dispatch (Binomial{Logit}, re: None)
 // ---------------------------------------------------------------------------
@@ -172,21 +132,30 @@ pub(super) fn fit_glm(
 ) -> Fit {
     let mut buf = GlmScratchBuf::new(n, p, opts.se_for.columns(p).len());
     let x_mat = super::common::to_col_major(x, n, p);
+    let x_mat = x_mat.as_ref().subrows(0, n);
+    let mut units = Units::new(family, n, p);
+    let map = ColumnScaling::IDENTITY;
+    super::core::draw_units(
+        &mut units, None, true, x, x_mat, y, weights, offset, n, p, map,
+    );
     let view = fit_glm_prebuilt(
         family,
         nb_theta,
-        x_mat.as_ref().subrows(0, n),
-        y,
-        weights,
-        offset,
+        x_mat,
+        units.y(y),
+        units.weights(weights),
+        units.offset(offset),
         &opts.se_for.columns(p),
         &mut buf,
         ColumnScaling::IDENTITY,
+        &units,
         None,
     );
+    let mut beta = view.betas.to_vec();
+    units.beta_to_caller(ColumnScaling::IDENTITY, &mut beta);
     glm_view_to_fit(
         &view,
-        view.betas.to_vec(),
+        beta,
         y,
         weights,
         family,
@@ -195,6 +164,7 @@ pub(super) fn fit_glm(
         p,
         opts,
         ColumnScaling::IDENTITY,
+        &units,
     )
 }
 
@@ -203,8 +173,10 @@ pub(super) fn fit_glm(
 /// outer-θ loop ([`fit_glm_nb_capped`]) allocates the scratch ONCE, re-running
 /// IRLS per fixed-θ fit; the unified fit core drives it per draw. [`glm_view_to_fit`] maps the returned view to the full `Fit`.
 ///
-/// `map` is the column map `x_mat` was fitted through: the view's `betas` stay
-/// on `x_mat`'s design, its `var_diag`/`t_sq` are the caller's
+/// `map` is the column map `x_mat` was fitted through and `units` the units of
+/// `y`, `weights` and `offset` (the ones the fit runs on: `Units::y`,
+/// `Units::weights`, `Units::offset`): the view's `betas` stay on `x_mat`'s
+/// design in the internal units, its `var_diag`/`t_sq` are the caller's
 /// (`crate::glm::glm_irls_fit_mapped`). `beta_start` is `glm_irls_fit`'s: `None`
 /// is the cold start, `Some(β)` (on `x_mat`'s design) starts from β.
 #[allow(clippy::too_many_arguments)]
@@ -218,6 +190,7 @@ pub(crate) fn fit_glm_prebuilt<'a>(
     targets: &[u32],
     buf: &'a mut GlmScratchBuf,
     map: &ColumnScaling,
+    units: &Units,
     beta_start: Option<&[f64]>,
 ) -> GlmFitView<'a> {
     glm_irls_fit_mapped(
@@ -231,6 +204,7 @@ pub(crate) fn fit_glm_prebuilt<'a>(
         offset,
         buf.as_scratch(),
         map,
+        units,
     )
 }
 
@@ -244,6 +218,11 @@ pub(crate) fn fit_glm_prebuilt<'a>(
 /// variance `φ·V(μᵢ)/wᵢ`, so Pearson's `wᵢrᵢ²` is already on that scale).
 /// Gamma's maximum-likelihood φ̂ is a DIFFERENT estimator, computed in
 /// [`glm_view_to_fit`] for `loglik` alone.
+///
+/// On the internal scale of `units`: `y` and `weights` are the caller's, the
+/// view was fitted on `y/c` and `ŵ = w/s`, and the value is `φ_int`
+/// (`Units::held_dispersion_in` of a held `v`); the caller's φ̂ is
+/// `units.dispersion_scale()` times it.
 pub(crate) fn glm_dispersion(
     view: &GlmFitView<'_>,
     y: &[f64],
@@ -251,16 +230,23 @@ pub(crate) fn glm_dispersion(
     family: Family,
     n: usize,
     opts: &FitOptions,
+    units: &Units,
 ) -> f64 {
     if !view.converged {
         return f64::NAN;
     }
     match family {
-        Family::Gamma { .. } | Family::InverseGaussian { .. } => {
-            opts.dispersion.held().unwrap_or_else(|| {
-                crate::family::pearson_dispersion(y, view.mu, family, n, view.p_rank(), weights)
-            })
-        }
+        Family::Gamma { .. } | Family::InverseGaussian { .. } => match opts.dispersion.held() {
+            Some(v) => units.held_dispersion_in(v),
+            None => crate::family::pearson_dispersion(
+                units.y(y),
+                view.mu,
+                family,
+                n,
+                view.p_rank(),
+                units.weights(weights),
+            ),
+        },
         _ => 1.0,
     }
 }
@@ -270,7 +256,10 @@ pub(crate) fn glm_dispersion(
 /// and the family log-likelihood. Needs raw `y` (Gamma dispersion + saturated
 /// loglik read it) and `nb_theta` (the NB shape θ̂; only NB/Gamma read it, pass
 /// `f64::NAN` otherwise). `beta` is the caller's β̂, `B·β̃` of the view's, with
-/// `map` the column map the view was fitted through.
+/// `map` the column map the view was fitted through. `weights` are the
+/// caller's and `units` the units the view was fitted in: on Gamma and inverse
+/// Gaussian the kernel ran on `y/c` and `ŵ = w/s`, so its deviance, means,
+/// factor `l` and dispersion `φ_int` are internal, and `Units` maps them.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn glm_view_to_fit(
     view: &GlmFitView<'_>,
@@ -283,6 +272,7 @@ pub(crate) fn glm_view_to_fit(
     p: usize,
     opts: &FitOptions,
     map: &ColumnScaling,
+    units: &Units,
 ) -> Fit {
     // --- map GlmFitView → Fit ---
     // view.var_diag is target-compact [0..t] (like OLS).
@@ -296,22 +286,27 @@ pub(crate) fn glm_view_to_fit(
     }
     let p_rank = view.p_rank();
     let has_vcov = converged && !view.se_unavailable;
-    // Weighted Σwᵢdᵢ at the accepted iterate (NaN unless converged).
+    // Weighted Σŵᵢdᵢ at the accepted iterate (NaN unless converged).
     let irls_deviance = view.deviance;
+    let hat_w = units.weights(weights);
+    let y_int = units.y(y);
     let mut se = vec![f64::NAN; p];
     fill_se_compact(view.var_diag, &opts.se_for.columns(p), &mut se);
-    // Unscaled (X'WX)⁻¹; Gamma's φ multiplies it afterwards, exactly as √φ scales
-    // `se`. `view.l` is stale-or-zero unless `converged` without
-    // `se_unavailable` (its documented contract).
-    let mut vcov = if has_vcov {
-        vcov_from_chol(view.l, p, &opts.se_for.columns(p), 1.0, map)
+    // Gamma and inverse-Gaussian scale the SE by √φ: the kernel folded φ=1, so
+    // Var(β̂)=φ·(XᵀWX)⁻¹, `var_diag` the caller's `(XᵀWX)⁻¹`, and `vcov` the
+    // internal factor's `(X̃ᵀŴX̃)⁻¹`, which takes `k²·φ_int`. A no-op for the
+    // φ≡1 families.
+    let phi_int = glm_dispersion(view, y, weights, family, n, opts, units);
+    let dispersion = units.dispersion_scale() * phi_int;
+    let var_int = phi_int * units.var_scale();
+    // Scaled inside, so a variance that leaves f64's range is NaN. `view.l` is
+    // stale-or-zero unless `converged` without `se_unavailable` (its
+    // documented contract).
+    let vcov = if has_vcov {
+        vcov_from_chol(view.l, p, &opts.se_for.columns(p), var_int, map)
     } else {
         nan_vcov(p)
     };
-
-    // Gamma and inverse-Gaussian scale the SE by √φ: the kernel folded φ=1, so
-    // Var(β̂)=φ·(XᵀWX)⁻¹. A no-op for the φ≡1 families.
-    let dispersion = glm_dispersion(view, y, weights, family, n, opts);
     if converged {
         let sqrt_phi = dispersion.sqrt();
         for v in se.iter_mut() {
@@ -321,70 +316,44 @@ pub(crate) fn glm_view_to_fit(
         }
     }
 
-    // Var(β̂) = φ·(X'WX)⁻¹ — the same φ the SE loop applied as √φ. A no-op for
-    // the φ≡1 families, where `dispersion` is 1.0.
-    for v in vcov.iter_mut() {
-        *v *= dispersion;
-    }
-
     // Fitted means μ̂ (the kernel's converged IRLS means) and the family
     // log-likelihood on R's `logLik.glm`/`MASS::glm.nb` scale.
     // Binomial/Poisson/NB: the IRLS deviance is the weighted `dev_resid` sum,
     // so restoring the saturated constant gives the exact log-likelihood.
     // Gamma: the log-likelihood at the MAXIMISED φ̂ — a different estimator
     // from `dispersion` above (the Pearson moment) — `−½·(D/φ +
-    // gamma_dispersion_term)`, `D` raw-weighted. The ML search and
-    // `gamma_dispersion_term` itself run on `ŵ = w/s`: the seed and solver
-    // start are not scale-free on raw `w` (raw-weight Newton from MASS's
-    // start can overshoot to NaN at large `w`; on `ŵ` it does not), so φ̂ is
-    // `s` times the internal root and `gamma_dispersion_term` is read at
-    // `ln(φ̂/s)`. A held φ (`Dispersion::Fixed(v)`)
-    // is used as-is for `D/φ`, with `Gₚ` still read on `ŵ` at
-    // `ln(v/s)` — the same internal coordinate the mixed path's held-φ arm
-    // uses (`fit::glmm::run_glmm_on`). Inverse-Gaussian: `opts.dispersion.held()`
-    // passes straight through to `inv_gaussian_aic`'s own `held_phi` arm —
-    // `None` profiles φ at `D/n`, `Some(v)` holds it at `v`.
+    // gamma_dispersion_term)`. Both run on the kernel's internal `y/c`, `ŵ`
+    // and deviance, at the internal φ: `D/φ` is that ratio, and the term
+    // reads `ln φ_int` and `ŵ` (the seed and solver start of the ML equation
+    // are not scale-free on raw `w`: raw-weight Newton from MASS's start can
+    // overshoot to NaN at large `w`; on `ŵ` it does not). A held φ
+    // (`Dispersion::Fixed(v)`) enters on the internal scale, as the mixed
+    // path's held-φ arm does (`fit::glmm::run_glmm_on`). Inverse-Gaussian:
+    // `inv_gaussian_aic` on the same internal values (`None` profiles φ at
+    // `D/n`), which `s` leaves unchanged: its `n·ln φ − Σ ln wᵢ` takes
+    // `−n·ln s` from each part. Both then take the Jacobian of `y/c`.
     let (fitted, loglik) = if converged {
-        let mu = view.mu.to_vec();
+        let mu: Vec<f64> = view.mu.iter().map(|m| m * units.c()).collect();
+        let held = opts.dispersion.held().map(|v| units.held_dispersion_in(v));
         let ll = match family {
             Family::Gamma { .. } => {
-                let s = crate::family::weight_scale(weights, n);
-                let hat_w: Option<Vec<f64>> =
-                    weights.map(|w| w[..n].iter().map(|&wi| wi / s).collect());
-                let sum_ln_y: f64 = y[..n].iter().map(|v| v.ln()).sum();
-                let phi = match opts.dispersion.held() {
+                let sum_ln_y: f64 = y_int[..n].iter().map(|v| v.ln()).sum();
+                let phi = match held {
                     Some(v) => v,
-                    None => {
-                        // The raw-scale ML equation `Σwᵢgᵢ = D/2` becomes, on
-                        // `w = s·ŵ`, `Σᵢ ŵᵢ·(ln aᵢ − ψ₀(aᵢ)) = D/(2s)`, so the
-                        // deviance handed to the per-row solver is `D/s`, not
-                        // raw `D` (see `gamma_ml_dispersion`'s own doc comment).
-                        let dev_int = irls_deviance / s;
-                        s * crate::family::gamma_ml_dispersion(dev_int, hat_w.as_deref(), n)
-                    }
+                    None => crate::family::gamma_ml_dispersion(irls_deviance, hat_w, n),
                 };
                 if phi == 0.0 {
                     // An exact fit: the likelihood rises without bound as φ → 0.
                     f64::INFINITY
                 } else {
-                    let psi_int = (phi / s).ln();
                     -0.5 * (irls_deviance / phi
-                        + crate::family::gamma_dispersion_term(
-                            psi_int,
-                            hat_w.as_deref(),
-                            n,
-                            sum_ln_y,
-                        ))
+                        + crate::family::gamma_dispersion_term(phi.ln(), hat_w, n, sum_ln_y))
+                        + units.loglik_shift(n)
                 }
             }
             Family::InverseGaussian { .. } => {
-                -0.5 * (crate::family::inv_gaussian_aic(
-                    y,
-                    irls_deviance,
-                    n,
-                    weights,
-                    opts.dispersion.held(),
-                ) - 2.0)
+                -0.5 * (crate::family::inv_gaussian_aic(y_int, irls_deviance, n, hat_w, held) - 2.0)
+                    + units.loglik_shift(n)
             }
             _ => {
                 -0.5 * irls_deviance + crate::family::saturated_loglik(family, nb_theta, y, weights)
@@ -392,7 +361,7 @@ pub(crate) fn glm_view_to_fit(
         };
         (mu, ll)
     } else {
-        (vec![], f64::NAN)
+        (vec![f64::NAN; n], f64::NAN)
     };
 
     // Gamma and inverse Gaussian with the Pearson φ̂ take t on its divisor
@@ -404,9 +373,14 @@ pub(crate) fn glm_view_to_fit(
         {
             let (df, state) = residual_df(
                 view.l,
-                n as f64 - p_rank as f64,
+                &beta,
+                if converged {
+                    n as f64 - p_rank as f64
+                } else {
+                    f64::NAN
+                },
                 p,
-                dispersion,
+                var_int,
                 map,
                 &opts.se_for.columns(p),
                 has_vcov,
@@ -454,6 +428,7 @@ pub(crate) fn glm_view_to_fit(
         coef_df,
         satterthwaite,
         design_summary: None,
+        null_basis: Vec::new(),
     }
 }
 // ---------------------------------------------------------------------------
@@ -464,12 +439,6 @@ pub(crate) fn glm_view_to_fit(
 /// alternations between the β fit (fixed θ) and the 1-D θ optimisation.
 pub(super) const NB_MAX_OUTER: usize = 25;
 const NB_THETA_TOL: f64 = 1e-6;
-/// θ search bracket (on ln θ): `θ ∈ [1e-3, 1e4]`. NB variance is `μ + μ²/θ`,
-/// so large θ (near `1e4`) drives `μ²/θ` toward zero — near-Poisson, low
-/// overdispersion; small θ (near `1e-3`) is the highly overdispersed end,
-/// implausibly so beyond this bound for the validation datasets.
-pub(crate) const NB_THETA_LO: f64 = 1e-3;
-pub(crate) const NB_THETA_HI: f64 = 1e4;
 
 /// NB saturated log-likelihood of one count, `log f(y; μ = y, θ)`:
 /// `lnΓ(y+θ) − lnΓ(θ) − lnΓ(y+1) + θ·ln(θ/(θ+y)) + y·ln(y/(θ+y))`, 0 at
@@ -736,7 +705,8 @@ pub(super) fn fit_glm_nb_capped(
     // two values (5e-5 apart on a 20-row fit at μ ≈ 1.6e5) and never settles.
     // From the last β the rounds continue one iteration instead.
     let mut beta_start: Vec<f64> = Vec::with_capacity(p);
-    let mut fit_result = fit_unsupported_family(n, p);
+    // Replaced by the first round's fit, as `max_outer >= 1`.
+    let mut fit_result = Fit::empty(n, p, None);
     let mut settled = false;
     let mut rounds: u32 = 0;
     for _ in 0..max_outer {
@@ -744,7 +714,17 @@ pub(super) fn fit_glm_nb_capped(
         // θ is fixed for this β fit and threaded explicitly (the spec is θ-free).
         let start = (!beta_start.is_empty()).then_some(&beta_start[..]);
         let view = fit_glm_prebuilt(
-            family, theta, x, y, weights, offset, &targets, &mut buf, map, start,
+            family,
+            theta,
+            x,
+            y,
+            weights,
+            offset,
+            &targets,
+            &mut buf,
+            map,
+            Units::IDENTITY,
+            start,
         );
         fit_result = glm_view_to_fit(
             &view,
@@ -757,6 +737,7 @@ pub(super) fn fit_glm_nb_capped(
             p,
             opts,
             map,
+            Units::IDENTITY,
         );
         if !fit_result.converged() {
             break;
@@ -789,6 +770,7 @@ pub(super) fn fit_glm_nb_capped(
                 &targets,
                 &mut buf,
                 map,
+                Units::IDENTITY,
                 Some(&beta_start),
             );
             fit_result = glm_view_to_fit(
@@ -802,6 +784,7 @@ pub(super) fn fit_glm_nb_capped(
                 p,
                 opts,
                 map,
+                Units::IDENTITY,
             );
             break;
         }
@@ -819,6 +802,7 @@ pub(super) fn fit_glm_nb_capped(
             &targets,
             &mut buf,
             map,
+            Units::IDENTITY,
             Some(&beta_start),
         );
         fit_result = glm_view_to_fit(
@@ -832,6 +816,7 @@ pub(super) fn fit_glm_nb_capped(
             p,
             opts,
             map,
+            Units::IDENTITY,
         );
         if fit_result.converged() {
             fit_result
@@ -842,6 +827,7 @@ pub(super) fn fit_glm_nb_capped(
     }
     if fit_result.converged() {
         fit_result.dispersion = theta;
+        super::common::note_nb_shape_at_limit(&mut fit_result.diagnostics, theta);
     }
     (fit_result, theta)
 }

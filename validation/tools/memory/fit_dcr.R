@@ -1,5 +1,5 @@
 #!/usr/bin/env Rscript
-# One arm of the weight-power and CR2 benchmark (spec 2-dcr §12) on one dataset
+# One arm of the weight-power and CR2 benchmark on one dataset
 # of gen_dcr_bench.py, in its own process so dcr_bench.sh reads its wall time
 # and peak RSS from /usr/bin/time. Not a validation rung: nothing is compared.
 #

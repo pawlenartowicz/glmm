@@ -1,7 +1,7 @@
 //! The Monte Carlo tier's design: the grid of cells and their seeds, the
 //! generator's determinism and layout (and, at `σ = 0`, its linear predictor
 //! and offsets exactly), the first dataset of six cells pinned, and every
-//! gated cell a cell of the grid; spec 2-dcr's weighted designs read with
+//! gated cell a cell of the grid; the weighted designs read with
 //! their ids' shapes, and the first dataset of four of them pinned.
 
 use super::mc_data::{
@@ -268,7 +268,7 @@ fn gated_cells_are_cells_of_the_grid() {
     }
 }
 
-/// Spec 2-dcr's weighted cells: each frozen design has the groups (or rows,
+/// The weighted cells of the Type I checks: each frozen design has the groups (or rows,
 /// on a WLS cell) its id names, and dataset 0 of four cells is pinned: a WLS
 /// cell, the junk rows, a slope the fit leaves out, a fitted slope.
 #[test]

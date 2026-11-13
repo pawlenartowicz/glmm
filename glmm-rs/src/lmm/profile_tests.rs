@@ -4,10 +4,11 @@
 //! slope maps to a semidefinite θ̃, and a correlation matrix that is not PSD is
 //! infeasible.
 
-use super::profile::{ProfileKernel, VarCoord};
+use super::profile::ProfileKernel;
 use crate::fit::{fit_cold_keep_workspace, varcorr_block};
+use crate::inference::ProfileParam;
 use crate::lmm::LmmWorkspace;
-use crate::standardize::ColumnScaling;
+use crate::standardize::{ColumnScaling, Units};
 use crate::{Data, Family, Fit, FitOptions, GroupIds, ModelSpec, ReStructure};
 
 /// The header and the rows of a quoted CSV, every field unquoted.
@@ -100,13 +101,24 @@ impl Case {
     /// workspace and column map it left.
     pub(crate) fn with_ml<R>(
         &self,
-        f: impl FnOnce(&Fit, &mut LmmWorkspace, &ColumnScaling) -> R,
+        f: impl FnOnce(&Fit, &mut LmmWorkspace, &ColumnScaling, &Units) -> R,
     ) -> R {
         let (fit, mut fws) = fit_cold_keep_workspace(&self.data(), &self.model, &ml_opts());
         assert!(fit.converged(), "the ML fit converges");
-        let (ws, map) = fws.lmm_parts().expect("a Gaussian mixed fit");
-        f(&fit, ws, map)
+        let (ws, map, units) = fws.lmm_parts().expect("a Gaussian mixed fit");
+        f(&fit, ws, map, units)
     }
+}
+
+/// The kernel over a case's workspace, slots in declaration order, since no
+/// case here is reordered by the size rule.
+pub(crate) fn kernel<'a>(
+    ws: &'a mut LmmWorkspace,
+    map: &'a ColumnScaling,
+    units: &'a Units,
+) -> ProfileKernel<'a> {
+    let slots: Vec<usize> = (0..1 + ws.kernel.groupings().extra_q.len()).collect();
+    ProfileKernel::new(ws, map, units, &slots)
 }
 
 pub(crate) fn primary(g: Vec<u32>) -> GroupIds {
@@ -153,34 +165,25 @@ fn lmm_slope_weighted_ml() -> Case {
 fn lme4_scale_round_trips_through_the_kernel_theta() {
     let mut ran = 0;
     for case in [sleepstudy_ml(), lmm_slope_weighted_ml()] {
-        case.with_ml(|fit, ws, map| {
+        case.with_ml(|fit, ws, map, units| {
             if case.w.is_some() {
-                assert_eq!(ws.weight_scale, 8.0, "the weights move the kernel's scale");
+                assert_eq!(units.s(), 8.0, "the weights move the kernel's scale");
             }
             let (sd, corr) = fit.stddev_corr(0);
             let want = [sd[0], corr[1][0], sd[1], fit.dispersion.sqrt()];
-            let mut k = ProfileKernel::new(ws, map);
+            let mut k = kernel(ws, map, units);
             // lme4's θ order within the term: sd, cor, sd, then σ.
             assert_eq!(
-                k.coords(),
+                k.params(),
                 [
-                    VarCoord::Sd {
-                        block: 0,
-                        row: 0,
-                        theta_index: 0
-                    },
-                    VarCoord::Cor {
-                        block: 0,
+                    ProfileParam::Sd { group: 0, term: 0 },
+                    ProfileParam::Cor {
+                        group: 0,
                         row: 1,
-                        col: 0,
-                        theta_index: 1
+                        col: 0
                     },
-                    VarCoord::Sd {
-                        block: 0,
-                        row: 1,
-                        theta_index: 2
-                    },
-                    VarCoord::Sigma,
+                    ProfileParam::Sd { group: 0, term: 1 },
+                    ProfileParam::Sigma,
                 ]
             );
             let v = k.estimate();
@@ -223,8 +226,8 @@ fn a_fixed_coefficient_is_the_dropped_column_fit() {
         model: crate::test_support::intercept_only_spec(),
     };
     let mut points = 0;
-    full.with_ml(|fit, ws, map| {
-        let mut k = ProfileKernel::new(ws, map);
+    full.with_ml(|fit, ws, map, units| {
+        let mut k = kernel(ws, map, units);
         let hat = k.theta_hat().to_vec();
         for j in 0..2 {
             // Column j moves into the offset; the other column stays.
@@ -238,11 +241,14 @@ fn a_fixed_coefficient_is_the_dropped_column_fit() {
                     w: Some(w.clone()),
                     model: crate::test_support::intercept_only_spec(),
                 };
-                dropped.with_ml(|_, ws2, _| {
+                dropped.with_ml(|_, ws2, _, units2| {
+                    // Each kernel's deviance is on its own response scale:
+                    // the caller's is `+2N·ln c` (ML).
+                    let to_caller = |c: f64| 2.0 * n as f64 * c.ln();
                     for f in [1.0, 0.5, 2.0] {
                         let th: Vec<f64> = hat.iter().map(|t| f * t).collect();
-                        let got = k.beta_deviance(&th, j, b);
-                        let want = ws2.kernel.deviance(&th);
+                        let got = k.beta_deviance(&th, j, b) + to_caller(units.c());
+                        let want = ws2.kernel.deviance(&th) + to_caller(units2.c());
                         assert!(
                             (got - want).abs() <= 1e-9 * want.abs(),
                             "j {j} b {b} θ×{f}: {got} {want}"
@@ -258,11 +264,11 @@ fn a_fixed_coefficient_is_the_dropped_column_fit() {
 
 #[test]
 fn an_sd_at_zero_on_a_centered_slope_block() {
-    sleepstudy_ml().with_ml(|_, ws, map| {
-        let s = ws.weight_scale;
+    sleepstudy_ml().with_ml(|_, ws, map, units| {
+        let s = units.s();
         let g = ws.kernel.groupings().clone();
         assert!(g.block_has_shift(0, map), "Days is centered inside");
-        let mut k = ProfileKernel::new(ws, map);
+        let mut k = kernel(ws, map, units);
         let mut v = k.estimate();
         v[2] = 0.0; // sd_Days|Subject
         let mut th = vec![0.0; 3];
@@ -292,8 +298,8 @@ fn a_non_psd_correlation_is_infeasible() {
         w: None,
         model: slope_model(vec![1, 2]),
     };
-    case.with_ml(|_, ws, map| {
-        let mut k = ProfileKernel::new(ws, map);
+    case.with_ml(|_, ws, map, units| {
+        let mut k = kernel(ws, map, units);
         let mut v = k.estimate();
         // sd0, cor10, cor20, sd1, cor21, sd2, σ.
         assert_eq!(v.len(), 7);
@@ -311,8 +317,8 @@ fn a_non_psd_correlation_is_infeasible() {
 
 #[test]
 fn a_parameter_held_at_its_estimate_gives_the_base() {
-    sleepstudy_ml().with_ml(|fit, ws, map| {
-        let mut k = ProfileKernel::new(ws, map);
+    sleepstudy_ml().with_ml(|fit, ws, map, units| {
+        let mut k = kernel(ws, map, units);
         let base = k.kernel_deviance_at_hat();
         let v = k.estimate();
         let mut held = 0;
@@ -373,13 +379,13 @@ fn a_small_sd_is_not_boxed_at_a_multiple_of_its_estimate() {
         w: None,
         model: crate::test_support::intercept_only_spec(),
     };
-    case.with_ml(|_, ws, map| {
+    case.with_ml(|_, ws, map, units| {
         let theta_hat = ws.theta[0];
         assert!(
             theta_hat > crate::lmm::PIN_THETA && theta_hat < 1e-3,
             "θ̂ {theta_hat} is small and unpinned"
         );
-        let mut k = ProfileKernel::new(ws, map);
+        let mut k = kernel(ws, map, units);
         let v = k.estimate();
         let (sd_hat, sigma_hat) = (v[0], v[1]);
         let mut start = v.clone();
@@ -406,8 +412,8 @@ fn a_slope_sd_keeps_the_fits_box_on_a_small_scale_column() {
     for row in case.x.chunks_mut(2) {
         row[1] *= 1e-4;
     }
-    case.with_ml(|_, ws, map| {
-        let mut k = ProfileKernel::new(ws, map);
+    case.with_ml(|_, ws, map, units| {
+        let mut k = kernel(ws, map, units);
         let base = k.kernel_deviance_at_hat();
         let v = k.estimate();
         let (sd_days, sigma_hat) = (v[2], v[3]);

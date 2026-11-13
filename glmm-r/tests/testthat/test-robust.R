@@ -118,13 +118,12 @@ test_that("the weight-power search notes warn with their class and text", {
   expect_warning(fastglmm(y ~ x, d, weights = w),
                  "The fitted weight power, .* is not a maximum",
                  class = "fastglmm_weight_power_at_bound")
-  # Weights near 1e200 on noise that follows r^-1: the search range narrows to
-  # keep w^delta within 1e+-250, so no fit in the search fails.
+  # Weights near 1e100, the largest allowed: no fit in the weight-power search fails.
   n <- 60
   x <- runif(n, -1, 1)
   r <- 1e4^runif(n)
   r[1:2] <- c(1, 1e4)
-  d <- data.frame(x = x, y = 1 + 0.5 * x + rnorm(n) * r^-0.5, w = 1e200 * r)
+  d <- data.frame(x = x, y = 1 + 0.5 * x + rnorm(n) * r^-0.5, w = 1e96 * r)
   failures <- 0
   m <- withCallingHandlers(fastglmm(y ~ x, d, weights = w),
                            fastglmm_weight_power_search_failures = function(w) failures <<- failures + 1,
@@ -178,7 +177,7 @@ test_that("the robust refusals are errors that name the way out", {
   for (case in cases) {
     expect_error(do.call(fastglmm, c(list(case[[1]], d, family = case[[2]], weights = d$w,
                                           se_type = "robust"), case[[3]])),
-                 'use se_type = "model"', fixed = TRUE, class = "simpleError")
+                 'use se_type = "model"', fixed = TRUE, class = "fastglmm_error_fit_error")
   }
 })
 

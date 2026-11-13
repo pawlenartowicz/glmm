@@ -553,7 +553,7 @@ fn profile_matches_hand_values() {
     assert_eq!((t, at), (f[2], 2));
 }
 
-/// Decision 1: the maximum is the global one, never the first decrease. The
+/// The maximum is the global one, never the first decrease. The
 /// hand-values draw on the grid `[0, 1/2, 1/10, 4]` has the profile about
 /// `[0, 0.4622, 0.1314, 0.5676]`: a walk that stops at the first decrease
 /// ends at index 1, the global maximum is index 3.

@@ -7,14 +7,12 @@
 //! or whose `|ζ|` falls is undetermined.
 
 use super::profile::{
-    bound, coord_params, path, ProfileError, ProfileInterval, ProfileIntervals, ProfileParam,
-    Toward,
+    bound, path, ProfileError, ProfileInterval, ProfileIntervals, ProfileParam, Toward,
 };
-use crate::fit::common_tests::lcg;
-use crate::fit::{fit_cold_keep_workspace, Perm};
-use crate::lmm::profile::ProfileKernel;
+use crate::fit::common_tests::{lcg, nested_slope_case, nested_slope_spellings};
+use crate::fit::fit_cold_keep_workspace;
 use crate::lmm::profile_tests::{
-    design, levels, ml_opts, num, primary, sleepstudy_ml, slope_model, table, Case,
+    design, kernel, levels, ml_opts, num, primary, sleepstudy_ml, slope_model, table, Case,
 };
 use crate::{
     BinomialLink, Family, Fit, FitError, FitOptions, GroupIds, Grouping, ModelSpec, ReStructure,
@@ -51,9 +49,8 @@ fn profile(
 fn zeta_at(case: &Case, param: ProfileParam, value: f64) -> f64 {
     // No case that calls this is reordered by the size rule (each
     // multi-grouping case has a slope).
-    case.with_ml(|_, ws, map| {
-        let hidden = ws.kernel.groupings().hidden.clone();
-        let mut k = ProfileKernel::new(ws, map);
+    case.with_ml(|_, ws, map, units| {
+        let mut k = kernel(ws, map, units);
         let base = k.kernel_deviance_at_hat();
         let (d, ok) = match param {
             ProfileParam::Beta(j) => {
@@ -61,7 +58,8 @@ fn zeta_at(case: &Case, param: ProfileParam, value: f64) -> f64 {
                 k.hold_beta(j, value, &mut start)
             }
             _ => {
-                let i = coord_params(k.coords(), &hidden, Perm::IDENTITY)
+                let i = k
+                    .params()
                     .iter()
                     .position(|&q| q == param)
                     .expect("a variance parameter of the model");
@@ -632,7 +630,7 @@ fn a_falling_zeta_makes_the_side_nan() {
     );
 }
 
-/// §6, D17 (G9): profile intervals refit on the weights as given, so a fit
+/// Profile intervals refit on the weights as given, so a fit
 /// that estimated its weight power, or used a fixed power other than 1, is
 /// refused; a power of 1 is the fit the profiles refit.
 #[test]
@@ -673,7 +671,8 @@ fn a_weight_power_other_than_one_is_refused() {
 /// Two crossed intercept-only groupings, a (6 levels) declared before b (40):
 /// the size rule makes b the kernel's primary, so the kernel's coordinates
 /// come in the order b, a. Each row must still carry its own grouping's
-/// interval, the same numbers as when b is declared first.
+/// interval, the same numbers as when b is declared first. The same for a
+/// lone slope grouping written last.
 #[test]
 fn size_rule_reorder_keeps_each_interval_on_its_grouping() {
     let n = 600;
@@ -730,4 +729,98 @@ fn size_rule_reorder_keeps_each_interval_on_its_grouping() {
     let only_a = profile(&ab_case, false, 0.95, Some(&[sd(0, 0)])).rows;
     assert_eq!(only_a.len(), 1);
     assert_eq!(vals(&only_a[0]), vals(&ab.rows[0]), "which picks a's row");
+
+    // A lone slope grouping g written after h, `(1 | h) + (1 + x | g)`, is
+    // moved first, so the kernel's coordinates come in the order g, h. Each row
+    // matches the row of the same grouping and component of `(1 + x | g) +
+    // (1 | h)` bit for bit.
+    let mut st = 17u64;
+    let uh: Vec<f64> = (0..8).map(|_| 0.6 * lcg(&mut st)).collect();
+    let ug: Vec<(f64, f64)> = (0..12)
+        .map(|_| (0.8 * lcg(&mut st), 0.4 * lcg(&mut st)))
+        .collect();
+    let (mut x, mut y, mut h, mut g) = (vec![], vec![], vec![], vec![]);
+    for i in 0..480 {
+        let (ih, ig) = (i % 8, (i / 3) % 12);
+        let x1 = lcg(&mut st);
+        x.extend([1.0, x1]);
+        y.push(0.3 + 0.5 * x1 + uh[ih] + ug[ig].0 + ug[ig].1 * x1 + 0.5 * lcg(&mut st));
+        h.push(ih as u32);
+        g.push(ig as u32);
+    }
+    let case = |ids: GroupIds, re: ReStructure| Case {
+        x: x.clone(),
+        y: y.clone(),
+        p: 2,
+        ids,
+        w: None,
+        model: ModelSpec::mixed(Family::Gaussian, re),
+    };
+    let last = case(
+        GroupIds::new(h.clone()).extra(g.clone()),
+        ReStructure::intercept().extra(Grouping::crossed().slopes([1])),
+    );
+    let first = case(
+        GroupIds::new(g).extra(h),
+        ReStructure::intercept()
+            .slopes([1])
+            .extra(Grouping::crossed()),
+    );
+    assert!(reordered(&last) && !reordered(&first));
+    let (pl, pf) = (
+        profile(&last, false, 0.95, None),
+        profile(&first, false, 0.95, None),
+    );
+    let other = |q: ProfileParam| match q {
+        ProfileParam::Sd { group, term } => ProfileParam::Sd {
+            group: 1 - group,
+            term,
+        },
+        ProfileParam::Cor { group, row, col } => ProfileParam::Cor {
+            group: 1 - group,
+            row,
+            col,
+        },
+        q => q,
+    };
+    let bits = |r: &ProfileInterval| (r.estimate.to_bits(), r.lower.to_bits(), r.upper.to_bits());
+    assert_eq!(pl.rows.len(), pf.rows.len());
+    assert_eq!(pl.rows[0].param, sd(0, 0), "h's row first");
+    for r in &pl.rows {
+        let twin = pf
+            .rows
+            .iter()
+            .find(|t| t.param == other(r.param))
+            .unwrap_or_else(|| panic!("{:?} has no twin", r.param));
+        assert_eq!(bits(r), bits(twin), "{:?}", r.param);
+    }
+
+    // The same with h nested in g once g moves first, against the slope-first
+    // nested spelling (balanced, so h's padded ids are its own).
+    let (x, y, _, _, h, g) = nested_slope_case(false);
+    let (last_model, first_model) = nested_slope_spellings(Family::Gaussian);
+    let nested_case = |ids: GroupIds, model: ModelSpec| Case {
+        x: x.clone(),
+        y: y.clone(),
+        p: 2,
+        ids,
+        w: None,
+        model,
+    };
+    let last = nested_case(GroupIds::new(h.clone()).extra(g.clone()), last_model);
+    let first = nested_case(GroupIds::new(g).extra(h), first_model);
+    assert!(reordered(&last) && !reordered(&first));
+    let (pl, pf) = (
+        profile(&last, false, 0.95, None),
+        profile(&first, false, 0.95, None),
+    );
+    assert_eq!(pl.rows.len(), pf.rows.len());
+    for r in &pl.rows {
+        let twin = pf
+            .rows
+            .iter()
+            .find(|t| t.param == other(r.param))
+            .unwrap_or_else(|| panic!("nested: {:?} has no twin", r.param));
+        assert_eq!(bits(r), bits(twin), "nested: {:?}", r.param);
+    }
 }

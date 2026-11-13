@@ -24,7 +24,7 @@
 //! `b1 = τ1·(ρ·z1 + √(1−ρ²)·z2)`; then per visit the five responses in column
 //! order, one draw each. `f3` enters no linear predictor.
 //!
-//! It also holds the weighted cells of spec 2-dcr's gates G11 and G13
+//! It also holds the weighted cells of the Type I checks of `x` and of `compare()`
 //! ([`DCR_TYPE1_CELLS`], [`DCR_LRT_CELLS`]): frozen designs read from
 //! `validation/data/inference/dcr_cells/`, with only the response drawn here
 //! ([`DcrDesign::null_y`]).
@@ -293,7 +293,7 @@ fn draw(
     }
 }
 
-/// The cells of spec 2-dcr's G11 (§10.6): the Type I of `x` under the
+/// The cells that check the Type I of `x` under the
 /// default weighted fit. The 10 `f2_cells`, the missing-slope cells, the two
 /// cells fitted with a random slope on `x` (`S`), and two WLS cells.
 pub(crate) const DCR_TYPE1_CELLS: [&str; 16] = [
@@ -315,7 +315,7 @@ pub(crate) const DCR_TYPE1_CELLS: [&str; 16] = [
     "WLS/n100/wide/floor_mid",
 ];
 
-/// The cells of spec 2-dcr's G13 (§10.7): the null Type I of `compare()`'s
+/// The cells that check the null Type I of `compare()`'s
 /// likelihood-ratio test of `x`, noise on (`honest`) and off (`floor_mid`)
 /// the power family.
 pub(crate) const DCR_LRT_CELLS: [&str; 10] = [
@@ -333,7 +333,7 @@ pub(crate) const DCR_LRT_CELLS: [&str; 10] = [
 
 /// A weighted cell's frozen design, `validation/data/inference/dcr_cells/`
 /// (written by `validation/tools/goldens_cr2_cells.R` with R's streams, as
-/// the weights-of-trust runs drew it): per row its group, `x`, weight, noise
+/// an earlier simulation study drew it): per row its group, `x`, weight, noise
 /// SD and its group's slope SD. Only `y` is drawn here.
 #[derive(Debug)]
 pub(crate) struct DcrDesign {
@@ -373,8 +373,8 @@ impl DcrDesign {
         }
     }
 
-    /// Dataset `r`'s response under the null of `x`, the weights-of-trust
-    /// truth: `y_i = u_g + s_i·v_g·x_i + σ_i·e_i` with a random intercept
+    /// Dataset `r`'s response under the null of `x`, that
+    /// study's truth: `y_i = u_g + s_i·v_g·x_i + σ_i·e_i` with a random intercept
     /// of SD 1, `s_i` the slope SD and `σ_i` the noise SD of the row, so on
     /// a WLS cell `y_i = σ_i·e_i`. One stream per `(cell, r)`,
     /// `CommonStatsRng::new_tagged(cell_seed(id), r, MC_STREAM_TAG)`,

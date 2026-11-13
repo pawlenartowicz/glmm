@@ -109,6 +109,26 @@ def test_an_unseen_grouping_level_warns_and_gets_the_population_prediction():
         m.predict(new, allow_new_levels=False)
 
 
+def _absent_cell_data():
+    """36 rows over the cells a:B, b:A and b:B of f1 by f2; a:A has no row."""
+    cells = [("a", "B"), ("b", "A"), ("b", "B")]
+    return {
+        "y": [float(1 + (7 * i) % 5 + 2 * (i % 3)) for i in range(36)],
+        "f1": [cells[i % 3][0] for i in range(36)],
+        "f2": [cells[i % 3][1] for i in range(36)],
+        "g": [f"g{(i // 3) % 6}" for i in range(36)],
+    }
+
+
+def test_a_row_the_fit_cannot_estimate_warns_and_predicts_nan():
+    m = quiet_fit("y ~ 0 + f1:f2 + (1 | g)", data=_absent_cell_data())
+    new = {"f1": ["a", "b"], "f2": ["A", "B"]}
+    match = "Row 0 is not estimable from this rank-deficient fit"
+    with pytest.warns(glmm.RowsNotEstimableWarning, match=match):
+        got = m.predict(newdata=new, re_form="NA")
+    assert np.isnan(got[0]) and np.isfinite(got[1])
+
+
 def test_a_fixed_factor_level_the_fit_did_not_see_is_refused():
     m = quiet_fit("y ~ x + h + (1 | g)")
     new = _rows(D, [0, 1])
@@ -119,8 +139,9 @@ def test_a_fixed_factor_level_the_fit_did_not_see_is_refused():
 
 def test_bad_arguments_raise():
     m = quiet_fit("y ~ x + (1 | g)")
-    with pytest.raises(ValueError, match="type must be"):
+    with pytest.raises(ValueError, match="type must be") as bad:
         m.predict(D, type="probability")
+    assert bad.value.code == "invalid_argument"
     with pytest.raises(ValueError, match="re_form must be"):
         m.predict(D, re_form="~ (1 | g)")
     with pytest.raises(ValueError, match="level must be in"):
@@ -157,9 +178,9 @@ def test_ranef_blocks_carry_the_conditional_variances():
 
 
 def test_a_fit_without_conditional_variances_raises_a_clear_error():
-    # An extra grouping with a random slope routes to the sparse solver,
-    # which forms no conditional variances.
-    m = quiet_fit("ys ~ x + (1 | g) + (1 + x | h)")
+    # Two groupings with slopes route to the sparse solver, which forms no
+    # conditional variances.
+    m = quiet_fit("ys ~ x + (1 + x | g) + (1 + x | h)")
     assert all(b["postvar"] is None and b["condsd"] is None for b in m.ranef_blocks)
     assert len(m.predict(D)) == _N
     with pytest.raises(ValueError, match="no conditional variances"):
@@ -183,3 +204,41 @@ def test_a_crossed_fit_round_trips_its_stored_covariances():
     want = m.predict(D, se_fit=True)["se_fit"]
     np.testing.assert_array_equal(back.predict(D, se_fit=True)["se_fit"], want)
     np.testing.assert_array_equal(back.simulate(nsim=2, seed=1), m.simulate(nsim=2, seed=1))
+
+
+def test_a_nested_slope_model_predicts_the_same_in_either_order():
+    # Children `n` nested in `g`, 2 or 3 per parent; the slope-last spelling
+    # is nested by the fit after it moves `g` first, the slope-first one by
+    # the formula front end.
+    rng = np.random.default_rng(20261111)
+    kids = [(g, k) for g in range(12) for k in range(2 if g < 6 else 3)]
+    rows = [(g, k) for g, k in kids for _ in range(10)]
+    x = rng.normal(size=len(rows))
+    u = rng.normal(scale=0.8, size=12)
+    s = rng.normal(scale=0.4, size=12)
+    v = rng.normal(scale=0.5, size=len(kids))
+    kid = {gk: i for i, gk in enumerate(kids)}
+    yn = [
+        1.0 + 0.5 * xi + u[g] + s[g] * xi + v[kid[(g, k)]] + 0.5 * rng.normal()
+        for xi, (g, k) in zip(x, rows)
+    ]
+    d = {
+        "yn": yn,
+        "x": x.tolist(),
+        "g": [f"g{g:02d}" for g, _ in rows],
+        "n": [f"n{g:02d}{k}" for g, k in rows],
+    }
+    last = quiet_fit("yn ~ x + (1 | n) + (1 + x | g)", data=d)
+    first = quiet_fit("yn ~ x + (1 + x | g) + (1 | n)", data=d)
+    assert last.loglik == first.loglik
+    pl, pf = last.predict(d, se_fit=True), first.predict(d, se_fit=True)
+    np.testing.assert_allclose(pl["fit"], pf["fit"], rtol=1e-12)
+    np.testing.assert_allclose(pl["se_fit"], pf["se_fit"], rtol=1e-12)
+    blocks = {b["group"]: b for b in first.ranef_blocks}
+    for b in last.ranef_blocks:
+        twin = blocks[b["group"]]
+        assert b["levels"] == twin["levels"]
+        np.testing.assert_array_equal(b["values"], twin["values"])
+        np.testing.assert_array_equal(b["postvar"], twin["postvar"])
+    back = pickle.loads(pickle.dumps(last))
+    np.testing.assert_array_equal(back.predict(d, se_fit=True)["se_fit"], pl["se_fit"])

@@ -11,9 +11,9 @@
 //! is available the methods return [`ContrastError::NoDf`], never a z test.
 //!
 //! On a robust fit ([`SeType::Robust`]) a one-row test reads the fit's CR2 or
-//! HC2 pieces instead, whatever `satterthwaite` says (spec 2-dcr D12): the
+//! HC2 pieces instead, whatever `satterthwaite` says: the
 //! robust SE `√(lᵀVl)` and the Pustejovsky–Tipton df of `l`. A test of more
-//! rows stays model-based, with [`ContrastNote::ModelBasedJointTest`] (D14).
+//! rows stays model-based, with [`ContrastNote::ModelBasedJointTest`].
 
 use std::fmt;
 
@@ -39,9 +39,9 @@ pub struct ContrastT {
     /// `2v²/(gᵀAg)` (`contest1D`); for a unit vector `e_j` on a target column
     /// it equals [`Fit::coef_df`]`[j]` to rounding (the latter is the pass's
     /// own form, capped at ν). On OLS and on a Gamma or inverse Gaussian GLM
-    /// with φ estimated the residual df `ν = n − p`, also on such a fit that
-    /// did not converge, whose `coef_df` is NaN (as are this test's estimate,
-    /// se, t and p). On a robust fit the Pustejovsky–Tipton df of `l`, which
+    /// with φ estimated the residual df `ν = n − p`; NaN on such a fit that
+    /// did not converge, whose `coef_df` is NaN too (as are this test's
+    /// estimate, se, t and p). On a robust fit the Pustejovsky–Tipton df of `l`, which
     /// for `e_j` is [`Fit::coef_df`]`[j]`.
     pub df: f64,
     /// Two-sided p of `t` on `df`.
@@ -61,8 +61,7 @@ pub struct ContrastF {
     pub num_df: f64,
     /// The Satterthwaite denominator df (`ν = n − p` on OLS and on a Gamma or
     /// inverse Gaussian GLM with φ estimated). NaN, with every other field, on
-    /// such a fit that did not converge, where [`ContrastT::df`] still reports
-    /// ν: the eigendecomposition of its non-finite `L·C·Lᵀ` fails. NaN for an
+    /// such a fit that did not converge, as [`ContrastT::df`] is. NaN for an
     /// all-zero `L`, which has no direction to take a df on.
     pub den_df: f64,
     /// Upper-tail p of `f` on `(num_df, den_df)`.
@@ -227,14 +226,8 @@ impl Fit {
 
     /// What a robust fit's tests read; `None` on a model fit.
     pub(crate) fn robust_inputs(&self) -> Option<RobustInputs<'_>> {
-        (self.se_type == SeType::Robust).then(|| {
-            RobustInputs::new(
-                self.robust.as_ref(),
-                &self.vcov,
-                &self.model_vcov,
-                self.aliased(),
-            )
-        })
+        (self.se_type == SeType::Robust)
+            .then(|| RobustInputs::new(self.robust.as_ref(), &self.vcov, self.aliased()))
     }
 
     /// The pass's state (or the residual-only record of OLS and the
@@ -324,7 +317,7 @@ pub(crate) fn contrast_f_of(
     // The eigendecomposition of `L·C·Lᵀ` fails on non-convergence or on a
     // non-finite `C` (the residual record of an OLS or dispersion GLM fit
     // that did not converge); the test is then not computed, so `den_df`
-    // is NaN there while `contrast_t`'s df is ν.
+    // is NaN there.
     let Ok(md) = contest_md(&inputs.contest(), lr.as_ref()) else {
         return nan(Vec::new());
     };
@@ -418,44 +411,21 @@ pub(crate) enum DfSource<'a> {
     Robust(&'a RobustInputs<'a>),
 }
 
-/// What a robust fit's one-row tests read (D12, D13).
+/// What a robust fit's one-row tests read.
 pub(crate) struct RobustInputs<'a> {
     /// `None` on a fit with no endpoint, whose robust tests are NaN.
     pieces: Option<&'a Cr2Pieces>,
     /// The robust covariance, `p × p` row-major: NaN outside the target
     /// columns and on an unidentified or aliased one.
     vcov: &'a [f64],
-    /// The model covariance M of the df, an aliased column's row and column
-    /// zero, as the pieces are there.
-    m: Mat<f64>,
     aliased: &'a [bool],
 }
 
 impl<'a> RobustInputs<'a> {
-    /// `model_vcov` is `p × p` row-major (`p = aliased.len()`), or empty on a
-    /// fit with no endpoint.
-    pub(crate) fn new(
-        pieces: Option<&'a Cr2Pieces>,
-        vcov: &'a [f64],
-        model_vcov: &[f64],
-        aliased: &'a [bool],
-    ) -> Self {
-        let p = aliased.len();
-        let m = if model_vcov.len() == p * p {
-            Mat::from_fn(p, p, |i, j| {
-                if aliased[i] || aliased[j] {
-                    0.0
-                } else {
-                    model_vcov[i * p + j]
-                }
-            })
-        } else {
-            Mat::zeros(p, p)
-        };
+    pub(crate) fn new(pieces: Option<&'a Cr2Pieces>, vcov: &'a [f64], aliased: &'a [bool]) -> Self {
         RobustInputs {
             pieces,
             vcov,
-            m,
             aliased,
         }
     }
@@ -485,7 +455,7 @@ pub(crate) fn robust_t_of(beta: &[f64], r: &RobustInputs<'_>, l: &[f64]) -> Cont
         return untested(estimate, Vec::new());
     };
     let (ls, s) = unit_rows(l, p);
-    if pc.identified_by_one(r.m.as_ref(), &ls) {
+    if pc.identified_by_one(&ls) {
         return untested(estimate, vec![ContrastNote::RobustUnidentified]);
     }
     // `vcov` is NaN outside the targets and on a column one cluster alone
@@ -493,13 +463,13 @@ pub(crate) fn robust_t_of(beta: &[f64], r: &RobustInputs<'_>, l: &[f64]) -> Cont
     let outside = on.iter().any(|&j| {
         let mut e = vec![0.0; p];
         e[j] = 1.0;
-        r.vcov[j * p + j].is_nan() && !pc.identified_by_one(r.m.as_ref(), &e)
+        r.vcov[j * p + j].is_nan() && !pc.identified_by_one(&e)
     });
     let se = pc.var(&ls).sqrt() / s[0];
     if outside || se.is_nan() {
         return untested(estimate, Vec::new());
     }
-    let df = pc.df(r.m.as_ref(), &ls);
+    let df = pc.df(&ls);
     let t = estimate / se;
     ContrastT {
         estimate,

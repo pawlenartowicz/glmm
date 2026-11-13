@@ -24,7 +24,9 @@ pub enum ParseError {
     /// slope, a grouping of three or more factors, or a formula with no
     /// response).
     Syntax {
-        /// 0-based position of the offending token in the formula string.
+        /// 0-based position of the offending token in the formula string; 0
+        /// means not located (a real position is always above 0, since a
+        /// response comes first).
         pos: usize,
         /// Description of what's wrong with the token.
         msg: String,
@@ -44,6 +46,7 @@ impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ParseError::EmptyFormula => write!(f, "formula is empty"),
+            ParseError::Syntax { pos: 0, msg } => write!(f, "formula syntax error: {msg}"),
             ParseError::Syntax { pos, msg } => {
                 write!(f, "formula syntax error at position {pos}: {msg}")
             }

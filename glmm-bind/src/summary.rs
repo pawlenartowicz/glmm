@@ -1,8 +1,9 @@
 //! The lme4-shaped summary record both ports print (`summary`), and the
 //! Pearson residuals its scaled-residual block reads (`pearson_residuals`).
-//! Each port renders the record; the port's name in the title and the
-//! footer of a fit with Satterthwaite switched off, which spells the port's
-//! own argument, stay with the port.
+//! Each port renders the record. The title with the port's name, the ML
+//! note and the groups line come from here; the footer of a fit with
+//! Satterthwaite switched off, which spells the port's own argument, stays
+//! with the port.
 
 use std::f64::consts::SQRT_2;
 
@@ -12,8 +13,12 @@ use glmm::WEIGHT_POWER_SIMULATED;
 use crate::coerce;
 use crate::error::BindError;
 use crate::inputs::Inputs;
+use crate::port::spell;
 use crate::records::{int, opt_text, read_re_groups, text};
 use crate::value::{Record, Value};
+
+/// The note under the title of a Gaussian mixed model fitted by ML.
+const ML_NOTE: &str = "Note: p-values can be somewhat anticonservative.";
 
 /// The footer of a Gaussian mixed model's t tests.
 const SATTERTHWAITE_FOOTNOTE: &str =
@@ -263,7 +268,9 @@ fn opt_f64(x: Option<f64>) -> Value {
 }
 
 /// `summary`: the record of every block lme4's `print.summary.merMod`
-/// prints, in its order, and the weight power's lines. Fields a fit stored
+/// prints, in its order, and the weight power's lines. `method` is the title
+/// with the port's name, `ml_note` the note printed under it on an ML fit of
+/// a Gaussian mixed model with estimated variances (else `Null`). Fields a fit stored
 /// by an earlier version may lack (`df_method`, `coef_df`, `coef_p`,
 /// `dispersion_held`, `rss`, `r_squared`, `adj_r_squared`, `warnings`,
 /// `weight_power`, `weight_power_estimated`, the groupings) are optional:
@@ -301,7 +308,9 @@ pub(crate) fn summary(inp: &mut Inputs) -> Result<Value, BindError> {
     let vcov = fit.rows("vcov", p)?;
     let dispersion = fit.f64("dispersion")?;
     let varcorr = fit.opt_vecs("varcorr")?.unwrap_or_default();
-    // A mixed fit that did not converge has no `varcorr` but keeps its groupings.
+    // A mixed fit with no variance estimates has NaN `varcorr` blocks and
+    // prints no random-effects block, while its groupings and level counts
+    // still print.
     let re_groups = read_re_groups(&mut fit)?;
     let mixed = !re_groups.is_empty();
     let df_method = fit
@@ -342,14 +351,17 @@ pub(crate) fn summary(inp: &mut Inputs) -> Result<Value, BindError> {
         Value::Null
     };
     let n_aliased = aliased.iter().filter(|&&a| a).count();
-    // n - p, the residual df of OLS and the dispersion GLMs: a non-converged
-    // fit's coef_df is NaN, and its footer still prints n - p. A robust OLS
-    // fit (Bell-McCaffrey) keeps it: its σ̂ is rss / (n - p) as on the model
-    // SE, also at an estimated weight power, which `df` counts instead.
-    let residual_df = if matches!(df_method.as_str(), "residual" | "bell_mccaffrey") {
-        Value::I64(nobs as i64 - (p - n_aliased) as i64)
-    } else {
+    // n - p, the residual df of OLS and the dispersion GLMs. A fit with no
+    // estimates (every β NaN) has no residual df, so its footer prints NaN, as
+    // its contrast df does. A robust OLS fit (Bell-McCaffrey) keeps n - p: its
+    // σ̂ is rss / (n - p) as on the model SE, also at an estimated weight power,
+    // which `df` counts instead.
+    let residual_df = if !matches!(df_method.as_str(), "residual" | "bell_mccaffrey") {
         Value::Null
+    } else if beta.iter().all(|b| b.is_nan()) {
+        Value::F64(f64::NAN)
+    } else {
+        Value::I64(nobs as i64 - (p - n_aliased) as i64)
     };
 
     let criterion = if reml {
@@ -381,7 +393,7 @@ pub(crate) fn summary(inp: &mut Inputs) -> Result<Value, BindError> {
     let weights = fit.opt_vec("weights")?;
     let power = fit.opt_f64("weight_power")?.unwrap_or(1.0);
     let estimated = fit.opt_bool("weight_power_estimated")?.unwrap_or(false);
-    let scaled = if !fitted.is_empty() && fitted.len() == y.len() {
+    let scaled = if fitted.len() == y.len() && !fitted.iter().any(|v| v.is_nan()) {
         Value::Vec(five_numbers(pearson(
             &family,
             &y,
@@ -404,8 +416,13 @@ pub(crate) fn summary(inp: &mut Inputs) -> Result<Value, BindError> {
         other => vec![coerce::to_usizes(other)
             .map_err(|w| BindError::invalid_argument(format!("fit.re_term_index {w}")))?],
     };
-    let mut random_effects = Vec::with_capacity(varcorr.len());
-    for (g, vech) in varcorr.iter().enumerate() {
+    let estimated_blocks: &[Vec<f64>] = if varcorr.iter().flatten().any(|v| v.is_nan()) {
+        &[]
+    } else {
+        &varcorr
+    };
+    let mut random_effects = Vec::with_capacity(estimated_blocks.len());
+    for (g, vech) in estimated_blocks.iter().enumerate() {
         let (sd, corr) = stddev_corr(vech, g)?;
         let (group, terms) = re_groups.get(g).cloned().unwrap_or_default();
         let q = sd.len();
@@ -429,22 +446,21 @@ pub(crate) fn summary(inp: &mut Inputs) -> Result<Value, BindError> {
                 ),
         ));
     }
-    let levels = fit.opt_usizes("ranef_levels")?.unwrap_or_default();
-    let groups = if levels.len() == re_groups.len() {
-        Record::new()
-            .with(
-                "names",
-                Value::StrVec(re_groups.iter().map(|(n, _)| n.clone()).collect()),
-            )
-            .with(
-                "levels",
-                Value::IntVec(levels.iter().map(|&n| n as i64).collect()),
-            )
-    } else {
-        Record::new()
-            .with("names", Value::StrVec(Vec::new()))
-            .with("levels", Value::IntVec(Vec::new()))
+    // A fit stored before `re_group_levels` prints its `ranef_levels`, which
+    // differ only on a nested grouping (padded slots).
+    let levels = match fit.opt_usizes("re_group_levels")? {
+        Some(levels) => levels,
+        None => fit.opt_usizes("ranef_levels")?.unwrap_or_default(),
     };
+    let groups = Record::new()
+        .with(
+            "names",
+            Value::StrVec(re_groups.iter().map(|(n, _)| n.clone()).collect()),
+        )
+        .with(
+            "levels",
+            Value::IntVec(levels.iter().map(|&n| n as i64).collect()),
+        );
 
     let corr_fixed = if p >= 2 {
         let d: Vec<f64> = (0..p).map(|i| vcov[i][i].sqrt()).collect();
@@ -474,12 +490,18 @@ pub(crate) fn summary(inp: &mut Inputs) -> Result<Value, BindError> {
         Value::Null => Value::List(Vec::new()),
         w => w,
     };
+    let ml_note = family == "gaussian" && !reml && !random_effects.is_empty();
     Ok(Value::Record(
         Record::new()
             .with(
                 "method",
-                Value::Str(method_line(&family, mixed, reml, nagq)),
+                Value::Str(format!(
+                    "{} {}",
+                    method_line(&family, mixed, reml, nagq),
+                    spell(inp.port(), "suffix")
+                )),
             )
+            .with("ml_note", opt_text(ml_note.then_some(ML_NOTE)))
             .with("formula", Value::Str(fit.string("formula")?))
             .with("family", text(&family))
             .with("link", Value::Str(fit.string("link")?))

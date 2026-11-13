@@ -1,6 +1,6 @@
 //! A robust fit ([`SeType::Robust`]): the CR2 or HC2 pieces at the final fit,
-//! built in the kernel's coordinates and mapped to the caller's once (spec
-//! 2-dcr §3.2, D13), then the standard errors, df and notes they give.
+//! built in the kernel's coordinates and mapped to the caller's once,
+//! then the standard errors, df and notes they give.
 
 use faer::{Mat, MatRef};
 
@@ -18,7 +18,7 @@ pub(crate) struct Rows<'a> {
     pub(crate) x: &'a [f64],
     pub(crate) y: &'a [f64],
     pub(crate) offset: Option<&'a [f64]>,
-    /// The working weights the fit ran on.
+    /// The caller's prior weights, paired with `sigma2`.
     pub(crate) weights: Option<&'a [f64]>,
     pub(crate) beta: &'a [f64],
     /// The residual variance at weight 1.
@@ -35,16 +35,18 @@ pub(crate) struct Groups<'a> {
 }
 
 /// The pieces of `rows` clustered by `groups` (one row per cluster without),
-/// at `m`, the model covariance σ̂²(X̃ᵀV⁻¹X̃)⁻¹ in the kernel's coordinates
-/// X̃ = X·B, B the column map `map`; mapped to the caller's. `None` where
-/// [`cr2_pieces`] has none (an exact fit, an overflow).
+/// at the fit's factor `factor` of X̃ᵀV⁻¹X̃ and its σ̂², `sigma2`, in the
+/// kernel's coordinates X̃ = X·B, B the column map `map`; their `t` mapped to
+/// the caller's. `factor` is lower triangular, its leading `p × p` block read.
+/// `None` where [`cr2_pieces`] has none (an exact fit, an overflow).
 pub(crate) fn pieces(
     rows: &Rows<'_>,
     groups: Option<&Groups<'_>>,
-    m: MatRef<'_, f64>,
+    factor: MatRef<'_, f64>,
+    sigma2: f64,
     map: &ColumnScaling,
 ) -> Option<Cr2Pieces> {
-    let p = m.nrows();
+    let p = rows.beta.len();
     let n = rows.y.len();
     // Rows in cluster order: a counting sort by level.
     let (order, bounds) = match groups {
@@ -109,31 +111,12 @@ pub(crate) fn pieces(
             }
         })
         .collect();
-    let mut pc = cr2_pieces(&blocks, m)?;
-    // E r, e and n map as β (B·), x as a row (·B⁻¹), F as B F B⁻¹ and
-    // E Φ Eᵀ by congruence.
-    let to_beta = |a: &mut Mat<f64>| {
-        for k in 0..a.ncols() {
-            map.beta_to_caller(a.col_as_slice_mut(k));
-        }
-    };
-    to_beta(&mut pc.er);
-    to_beta(&mut pc.row_e);
-    for k in 0..pc.row_x.ncols() {
-        map.row_to_caller(pc.row_x.col_as_slice_mut(k));
-    }
-    for (f, epe) in &mut pc.whole {
-        let mut row = vec![0.0; p];
-        for i in 0..p {
-            row.iter_mut().enumerate().for_each(|(j, v)| *v = f[(i, j)]);
-            map.row_to_caller(&mut row);
-            row.iter().enumerate().for_each(|(j, &v)| f[(i, j)] = v);
-        }
-        to_beta(f);
-        map.congruence(epe.as_mut());
-    }
-    for (_, nd) in &mut pc.null {
-        map.beta_to_caller(nd);
+    // R = Lᵀ/σ̂, so R M Rᵀ = I for M = σ̂²(L Lᵀ)⁻¹, the fit's model covariance.
+    let sd = sigma2.sqrt();
+    let r = Mat::from_fn(p, p, |i, j| if i <= j { factor[(j, i)] / sd } else { 0.0 });
+    let mut pc = cr2_pieces(&blocks, r.as_ref())?;
+    for k in 0..pc.t.ncols() {
+        map.beta_to_caller(pc.t.col_as_slice_mut(k));
     }
     Some(pc)
 }
@@ -158,7 +141,6 @@ pub(crate) fn apply(fit: &mut Fit, targets: &[u32], se_type: Option<SeType>, spe
     let Some(pc) = &fit.robust else {
         return;
     };
-    let m = MatRef::from_row_major_slice(&fit.model_vcov, p, p);
     let v = pc.vcov();
     let mut unidentified = Vec::new();
     let mut small = (Vec::new(), Vec::new());
@@ -167,11 +149,11 @@ pub(crate) fn apply(fit: &mut Fit, targets: &[u32], se_type: Option<SeType>, spe
         let j = t as usize;
         let mut e = vec![0.0; p];
         e[j] = 1.0;
-        if pc.identified_by_one(m, &e) {
+        if pc.identified_by_one(&e) {
             unidentified.push(t);
             continue;
         }
-        let df = pc.df(m, &e);
+        let df = pc.df(&e);
         fit.coef_df[j] = df;
         if df < DF_SMALL {
             small.0.push(t);

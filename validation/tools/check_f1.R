@@ -1,6 +1,6 @@
 #!/usr/bin/env Rscript
-# G8 of spec 2-dcr (check 4): the R port against F1 (δ fit + CR2) as the
-# weights-of-trust simulation stored it, on the rows of
+# The R port against F1 (δ fit + CR2) as the
+# earlier simulation study stored it, on the rows of
 # validation/goldens/inference/cr2/f1_reps.json (written by goldens_cr2_cells.R:
 # the first 20 replications of the 10 f2_cells, two responses each).
 #
@@ -11,7 +11,7 @@
 #   1. at the stored δ̂ (weight_power = δ̂, se_type = "robust"): estimate, SE and
 #      df within 1e-6 relative of the stored ones;
 #   2. by default (the δ fit): δ̂ within 1e-4 of the stored one (golden section
-#      and the simulation's Brent end up to 3.9e-5 apart, spec §10.4).
+#      and the simulation's Brent end up to 3.9e-5 apart).
 # Run at the gate, after installing the package:
 #   R CMD INSTALL -l $RLIB glmm-r
 #   R_LIBS=$RLIB:$RORACLE Rscript validation/tools/check_f1.R

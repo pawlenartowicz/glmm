@@ -7,6 +7,13 @@
 \description{
 Fits linear models, generalized linear models, and (generalized) linear mixed models with a compiled Rust backend (the 'glmm' crate): linear mixed models by REML or maximum likelihood, and Laplace or adaptive Gauss-Hermite quadrature for binomial, Poisson, negative-binomial, and Gamma mixed models, using 'lme4'-style formulas. Estimates are validated against 'lme4', 'glmmTMB', and 'MixedModels.jl'. Deliberately scoped to fast fitting - fixed effects, Wald standard errors, variance components, conditional modes with their conditional variances, predictions on new data, simulated responses, pairwise comparisons of factor levels, and tests of fixed terms and of two nested models (anova(), compare()), with an exact restricted likelihood-ratio test for one random intercept (Crainiceanu and Ruppert (2004) \doi{10.1111/j.1467-9868.2004.00438.x}), and profile-likelihood confidence intervals of linear mixed models; anything the backend cannot compute honestly is a documented error, never a silently different answer.
 }
+\details{
+An error from the native code has the condition class
+\code{"fastglmm_error_<code>"}, \code{code} one of \code{invalid_argument} (a bad
+argument), \code{fit_error} (the data cannot be fitted), \code{compare_error} (two
+fits cannot be compared) and \code{internal} (a bug in fastglmm), so
+\code{tryCatch()} can select it without matching message text.
+}
 \seealso{
 Useful links:
 \itemize{

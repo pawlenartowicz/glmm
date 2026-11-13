@@ -298,11 +298,10 @@ fn rank_deficient_middle_column_maps_through_retained() {
     assert_eq!(t.notes, [ContrastNote::AliasedColumn { column: 2 }]);
 }
 
-/// A Gaussian LMM with no finite endpoint records a failed pass without
-/// running one: the `p = 0` refusal through the fit entry, and a design whose
-/// aliased column is a random slope (`fit_rank_deficient`'s unfittable
-/// return). Both give the note with `nonfinite` and `NoDf(Failed)`; switched
-/// off, the latter gives `Disabled` and no note.
+/// A Gaussian LMM with no finite endpoint (three rows for three coefficients)
+/// records a failed pass without running one, with the note (`nonfinite`) and
+/// `NoDf(Failed)`; switched off, it gives `Disabled` and no note. A fit with
+/// no fixed coefficients records the failed pass with no note.
 #[test]
 fn no_endpoint_lmm_records_failed_pass() {
     let failed_note = |fit: &Fit| {
@@ -327,13 +326,18 @@ fn no_endpoint_lmm_records_failed_pass() {
     let (_, y, ids, n, _) = lmm_data(None);
     let empty = fit_cold(&[], &y, n, 0, &lmm_model(), &ids, &FitOptions::default());
     assert!(!empty.converged() && empty.deviance.is_nan());
-    assert_eq!(failed_note(&empty), 1);
+    assert_eq!(failed_note(&empty), 0);
     assert_eq!(empty.contrast_t(&[]), Err(failed));
 
-    let (x, y, ids, n, p) = lmm_data(Some(2));
-    let mut slope_on_dup = lmm_model();
-    slope_on_dup.re.as_mut().unwrap().slopes = vec![2];
-    let unfit = fit_cold(&x, &y, n, p, &slope_on_dup, &ids, &all_targets(p));
+    // `y ~ x1 + x2 + (1 | g)` on three rows.
+    let x = [1.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 3.0, 2.0];
+    let y = [1.0, 2.0, 4.0];
+    let ids = GroupIds {
+        primary: vec![0, 1, 0],
+        extra: vec![],
+    };
+    let (n, p) = (3, 3);
+    let unfit = fit_cold(&x, &y, n, p, &lmm_model(), &ids, &all_targets(p));
     assert!(!unfit.converged() && unfit.deviance.is_nan());
     assert_eq!(failed_note(&unfit), 1);
     assert!(unfit.coef_df.iter().all(|d| d.is_nan()));
@@ -345,7 +349,7 @@ fn no_endpoint_lmm_records_failed_pass() {
         &y,
         n,
         p,
-        &slope_on_dup,
+        &lmm_model(),
         &ids,
         &FitOptions {
             satterthwaite: false,

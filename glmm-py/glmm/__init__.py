@@ -2,22 +2,26 @@
 
 `glmm.fit` parses `formula` against `data`'s columns through the Rust
 `glmm::formula` module, fits via the `glmm` kernel (through the `glmm._native`
-PyO3 extension), and returns a `Fit`. One option is not yet implemented
-in the kernel and raises a clean `NotImplementedError`: quasi-likelihood
-`dispersion=` on binomial/poisson.
+PyO3 extension), and returns a `Fit`. The native code checks the arguments:
+a `ValueError` it raises carries `.code`, one of `"invalid_argument"`,
+`"fit_error"` and `"compare_error"`, and a `RuntimeError` (a bug in glmm, not
+a bad argument) has `.code` `"internal"`.
 
 Public surface is `fit`, `Fit`, `model_matrix`, `term_labels`, the tests of `glmm.anova` (`anova`,
 `compare`, `TermTable`, `ComparisonTable`, `Comparison`, in `glmm/anova.py`), `pairwise` and
 `PairwiseTable`, `Fit.profile_confint`'s `ProfileTable`,
 and the warning categories the diagnostics channel raises (`DiagnosticWarning`, `AgqFallbackWarning`,
 `ArgumentIgnoredWarning`, `ConstantResponseWarning`, `DesignUnsolvableWarning`,
+`DispersionAtLimitWarning`,
 `ExactProfileFallbackWarning`, `FewRowsForRandomEffectsWarning`,
 `FitFailedWarning`, `GradientSearchFallbackWarning`, `GlmDivergedWarning`, `HessianSeFallbackWarning`,
-`IllConditionedWarning`, `ModelBasedJointTestWarning`, `NbShapeUnsettledWarning`,
+`IllConditionedWarning`, `ModelBasedJointTestWarning`, `NbShapeAtLimitWarning`,
+`NbShapeUnsettledWarning`,
 `NewGroupingLevelsWarning`, `NoCoefficientsWarning`, `NonIntegerResponseWarning`,
+`OneTrialPerLevelWarning`,
 `PirlsExhaustedWarning`, `PrecisionLimitedWarning`, `PredictSeModelBasedWarning`,
 `RepeatedGroupingWarning`, `RobustDfSmallWarning`, `RobustSeUnidentifiedWarning`, `RobustWithRandomSlopeWarning`,
-`RowsDroppedWarning`, `SatterthwaiteCurvatureWarning`,
+`RowsDroppedWarning`, `RowsNotEstimableWarning`, `SatterthwaiteCurvatureWarning`,
 `SearchLimitWarning`, `SeUnavailableWarning`, `SeparatedByGroupingWarning`,
 `SingleLevelGroupingDroppedWarning`, `SingularFitWarning`, `SlopeConstantWithinLevelsWarning`,
 `TooFewRowsWarning`, `VarianceAtLimitWarning`, `WeightPowerAtBoundWarning`,
@@ -48,6 +52,7 @@ __all__ = [
     "ConstantResponseWarning",
     "DesignUnsolvableWarning",
     "DiagnosticWarning",
+    "DispersionAtLimitWarning",
     "ExactProfileFallbackWarning",
     "FewRowsForRandomEffectsWarning",
     "Fit",
@@ -57,10 +62,12 @@ __all__ = [
     "HessianSeFallbackWarning",
     "IllConditionedWarning",
     "ModelBasedJointTestWarning",
+    "NbShapeAtLimitWarning",
     "NbShapeUnsettledWarning",
     "NewGroupingLevelsWarning",
     "NoCoefficientsWarning",
     "NonIntegerResponseWarning",
+    "OneTrialPerLevelWarning",
     "PairwiseTable",
     "PirlsExhaustedWarning",
     "PrecisionLimitedWarning",
@@ -71,6 +78,7 @@ __all__ = [
     "RobustSeUnidentifiedWarning",
     "RobustWithRandomSlopeWarning",
     "RowsDroppedWarning",
+    "RowsNotEstimableWarning",
     "SatterthwaiteCurvatureWarning",
     "SeUnavailableWarning",
     "SearchLimitWarning",
@@ -136,6 +144,17 @@ class NewGroupingLevelsWarning(DiagnosticWarning):
     """
 
 
+class RowsNotEstimableWarning(DiagnosticWarning):
+    """`Fit.predict` met rows the rank-deficient fit cannot estimate.
+
+    A row outside the row space of the fit's design (a fit with aliased
+    columns) has no prediction from the data, so its prediction, standard
+    error, interval and future bounds are NaN, as R's
+    `predict.lm(rankdeficient = "NA")` gives NA. Raised by `predict`, not by
+    `fit`, so it is not in `Fit.warnings`.
+    """
+
+
 class SingleLevelGroupingDroppedWarning(DiagnosticWarning):
     """A random-effect term's grouping factor has only one observed level, so
     no between-group variance is identifiable from it.
@@ -188,9 +207,19 @@ class SeparatedByGroupingWarning(DiagnosticWarning):
     estimate.
 
     Checked on every group, not most, and only when some group holds more
-    than one trial: a grouping with one 0/1 row per group raises nothing. The
-    fit runs as usual; any reported variance is a stopping point, and the
-    fixed effects depend on it.
+    than one trial: a grouping with one 0/1 row per group raises
+    `OneTrialPerLevelWarning` instead. The fit runs as usual; any reported
+    variance is a stopping point, and the fixed effects depend on it.
+    """
+
+
+class OneTrialPerLevelWarning(DiagnosticWarning):
+    """Every level of a binomial grouping holds one trial, so that grouping's
+    variance only moves each row's marginal success probability and trades
+    against the fixed effects: it is not identified.
+
+    A level's trials are the sum of its rows' weights (1 per row without
+    weights). The estimates are reported as fitted.
     """
 
 
@@ -227,8 +256,8 @@ class ExactProfileFallbackWarning(DiagnosticWarning):
     rerun also failed, they come from whichever of the two attempts reached
     the lower deviance, and `converged` stays `False` either way. Only
     affects mixed models fitted with the default Laplace approximation, and
-    not those with a random slope on a second grouping or too large for the
-    dense layout, which take another route.
+    not those with random slopes on two or more groupings or too large for
+    the dense layout, which take another route.
     """
 
 
@@ -272,6 +301,15 @@ class VarianceAtLimitWarning(DiagnosticWarning):
     finite estimate. `converged` and `singular` are the search's own, and
     `diagnostics["boundary"]` reads "upper_limit" when it would otherwise read
     "interior".
+    """
+
+
+class DispersionAtLimitWarning(DiagnosticWarning):
+    """A Gamma mixed model's dispersion ended on an edge of its search range,
+    so the fit was refused and returned no estimates.
+
+    The message says which edge. A dispersion given with `dispersion=` is not
+    searched and never raises it.
     """
 
 
@@ -421,6 +459,13 @@ class NoCoefficientsWarning(DiagnosticWarning):
     """A model without random effects and without any fixed-effect column."""
 
 
+class NbShapeAtLimitWarning(DiagnosticWarning):
+    """The negative-binomial shape ended on the lower limit of its search (0.001), so
+    the shape and the estimates computed at it are at that limit, not at an optimum. At
+    the upper limit (10000, a fit with no overdispersion the shape can measure) the note
+    is stored in `diagnostics["notes"]` and raises nothing."""
+
+
 class NbShapeUnsettledWarning(DiagnosticWarning):
     """A negative-binomial GLM's shape search stopped at its round limit before it
     settled. The fit is reported at the last shape value, with the coefficients and
@@ -438,33 +483,6 @@ class NonIntegerResponseWarning(DiagnosticWarning):
     inside `poisson()$aic`, at `1e-7 * max(1, abs(y))`), so R warns on e.g.
     `y = 2.0005` where glmm stays silent.
     """
-
-
-# Family table — mirrors the kernel's own table in src/family.rs. `links` is
-# an ordered tuple, not a set: its order is what the "expected one of" error
-# text lists, and it must read the same as the R port's .FAMILIES
-# (glmm-r/R/fastglmm.R) — change together.
-_FAMILIES = {
-    "gaussian": {"default_link": "identity", "links": ("identity",)},
-    "binomial": {"default_link": "logit", "links": ("logit", "probit", "cloglog")},
-    "poisson": {"default_link": "log", "links": ("log",)},
-    "gamma": {"default_link": "log", "links": ("log", "inverse")},
-    "negativebinomial": {"default_link": "log", "links": ("log",)},
-    "inversegaussian": {"default_link": "log", "links": ("log", "inverse_squared")},
-}
-
-# Families where `dispersion=` is meaningful: phi families (gamma,
-# inversegaussian) plus binomial/poisson, where "estimate"/float means
-# quasi-likelihood (GLM only). gaussian and negativebinomial have no phi
-# knob (negbin's parameter is theta).
-_DISPERSION_FAMILIES = {"binomial", "poisson", "gamma", "inversegaussian"}
-
-_MAX_NAGQ = 25  # mirrors GLMM/glmm-rs/src/consts.rs::MAX_NAGQ — change together
-
-# The families nagq > 1 covers, as the fallback message names them. Mirrors the AGQ
-# eligibility check in the kernel (src/orchestrate.rs, the `if nagq > 1` block) and the R
-# port's .AGQ_FAMILIES - change together.
-_AGQ_FAMILIES = "binomial, Poisson, negative-binomial or Gamma"
 
 
 def _columns(data):
@@ -811,7 +829,7 @@ class Fit:
     se: np.ndarray  # (p,) standard errors; NaN where unavailable
     vcov: np.ndarray  # (p, p) full Cov(beta-hat); se is sqrt of its diagonal
     tau2: np.ndarray  # legacy per-element RE variances (q=1 only) — prefer varcorr
-    varcorr: list  # per grouping, in formula order (lme4 sorts by decreasing level count): vech-packed (column-major lower-tri) RE covariance
+    varcorr: list  # per grouping, in formula order (lme4 sorts by decreasing level count): vech-packed (column-major lower-tri) RE covariance; NaN where the fit has no estimate
     stddev_se: np.ndarray  # SE of each RE stddev at its diagonal slot of the theta layout (not beta-aligned); NaN off the diagonal and where unavailable
     # Everything the solver reports about the fit itself, mirroring the Rust
     # `Diagnostics` (src/fit/mod.rs) as a plain dict:
@@ -831,16 +849,11 @@ class Fit:
     #                     search ran (a degenerate guard), reported through
     #                     converged=False.
     #   pinned     list per grouping (varcorr order) of per-component bools:
-    #                     pinned[g][i] pairs with stddev_corr(g)[0][i]. ON A
-    #                     CONVERGED FIT, EMPTY MEANS NOTHING WAS PINNED — a
-    #                     model with no variance components at all (OLS, GLM,
-    #                     fixed-effect-only negative binomial) also reports
-    #                     empty, for the same reason: there was nothing to pin.
-    #                     `fit()` does not raise on `converged: False`:
-    #                     `pinned` is empty on every non-converged fit — a
-    #                     failed fit, and a fit stopped at its evaluation
-    #                     budget, where nothing is pinned at the capped
-    #                     endpoint.
+    #                     pinned[g][i] pairs with stddev_corr(g)[0][i]. One
+    #                     row per grouping on every fit, all False when nothing
+    #                     was pinned (also on a fit that did not converge);
+    #                     empty on a model without random effects (OLS, GLM,
+    #                     fixed-effect-only negative binomial).
     #   notes      list of {"kind": str, "tier": str, "title": str,
     #                     "message": str | None, "columns": [int], "pivot": float,
     #                     "evals": int, "final_eval": bool, "detail": str,
@@ -905,19 +918,19 @@ class Fit:
     # comparisons (AIC/LRT) across fits with different fixed effects are
     # invalid when this is set.
     reml: bool
-    # Fitted means mu-hat per row (n,). Empty on non-converged fits.
+    # Fitted means mu-hat per row (n,). NaN on a fit that did not converge.
     fitted: np.ndarray
     # Random-effect conditional modes b-hat, one block per grouping in
     # varcorr/re_groups order, each block level-major (level l's q values at
-    # [l*q .. (l+1)*q]). Empty on non-converged fits; see `ranef_levels` for
-    # slicing per grouping. This is the raw numbers -- for the labelled form,
+    # [l*q .. (l+1)*q]). NaN on a fit with no conditional modes (one that did
+    # not converge); see `ranef_levels` for slicing per grouping. This is the
+    # raw numbers -- for the labelled form,
     # read `ranef_blocks` instead and do NOT slice this yourself: which layout a
     # grouping lands in is a data-dependent decision inside the kernel.
     ranef: np.ndarray
     # Level count per grouping, for slicing `ranef`: ranef.size == sum(levels *
-    # q_per_group) wherever `ranef` is not empty. Filled on every fit with
-    # random effects, also one that did not converge (where `ranef` is empty);
-    # empty on a fit without random effects.
+    # q_per_group). Filled on every fit with random effects, also one that did
+    # not converge; empty on a fit without random effects.
     ranef_levels: np.ndarray
     # The same conditional modes, labelled: a list of dicts, one per grouping in
     # re_groups order, each with
@@ -930,15 +943,16 @@ class Fit:
     #                         effects given the data, lme4's
     #                         `ranef(condVar = TRUE)` "postVar"; None on a fit
     #                         made with condvar=False and on one whose layout
-    #                         forms none (an extra grouping with a random
-    #                         slope, the sparse route, the packed GLMM)
+    #                         forms none (random slopes on two or more
+    #                         groupings, the sparse route, the packed GLMM)
     #   condsd  ndarray    -- (len(levels), len(terms)): the conditional
     #                         standard deviations, the square roots of the
     #                         diagonal of `postvar`; None where it is
     # Padded slots of a nested grouping are already dropped, so `levels` is
     # exactly the levels that exist. Not a DataFrame: the package's only
     # dependency is numpy, and `fit()` accepts duck-typed data precisely so it
-    # does not require pandas. Empty exactly when `ranef` is.
+    # does not require pandas. Empty on a fit without random effects, and on one
+    # without conditional modes (where `ranef` is NaN).
     ranef_blocks: list
     # Header inputs for `summary()`. `formula`/`family`/`link` are `fit()`'s
     # own arguments, kept so the report can name what was fitted.
@@ -946,8 +960,7 @@ class Fit:
     family: str
     link: str  # resolved link, after the family default is applied
     nagq: int  # quadrature nodes that actually ran (1 after a warn-and-strip)
-    # Row count the kernel fitted. Not `len(fitted)`: `fitted` is empty on a
-    # non-converged fit and the summary header still prints.
+    # Row count the kernel fitted.
     nobs: int
     # The response as the kernel fitted it (`Lowered::y` in Rust): after
     # lowering, so a `cbind(s, f)` response is the proportion s/(s+f). Backs
@@ -975,7 +988,8 @@ class Fit:
     df_method: str
     # OLS fits only (NaN on every other fit and on a non-converged one): the
     # weighted residual sum of squares, and R's `summary.lm` multiple and
-    # adjusted R-squared (0 on an intercept-only model).
+    # adjusted R-squared (0 on an intercept-only model; both R-squared NaN when
+    # neither the response nor the fitted values vary beyond round-off).
     rss: float
     r_squared: float
     adj_r_squared: float
@@ -1050,10 +1064,7 @@ class Fit:
     #   nu         float               the divisor of sigma-hat**2
     #   retained   list[int] | None    0-based retained columns, None when every
     #                                  column was retained
-    # The free theta coordinates are in the kernel's order, which differs from
-    # the order the groupings were written in when glmm makes the grouping with
-    # the most levels the primary; the df and the contrast tests use them only
-    # in sums over all coordinates, so the order does not change any result.
+    # The free theta coordinates are in the order the groupings were declared.
     # About p**2 * (n_free + 1) floats, kept in a pickle. Mirrors the R port's
     # `object$satterthwaite_record` - change together.
     satterthwaite_record: dict | None = None
@@ -1066,8 +1077,9 @@ class Fit:
     # caller's row; absent on a fit pickled before it, None when no row was
     # dropped), the kernel's conditional variances in its own layout
     # ("condvar", "condvar_x", float64 bytes, and "condvar_cross", a dict or
-    # None), and on a fit made with `anova_test="auto"` "lrt_call", the rest of
-    # the call `_lrt_tables` repeats. None on a fit pickled before them.
+    # None), "re_group_levels" (the observed level count per grouping, for the
+    # summary), and on a fit made with `anova_test="auto"` "lrt_call", the rest
+    # of the call `_lrt_tables` repeats. None on a fit pickled before them.
     # Mirrors the R port's `.kernel_parts` - change together.
     _kernel_parts: dict | None = field(default=None, repr=False)
     # The power the fit put on `weights` (row i has variance sigma^2 *
@@ -1088,16 +1100,19 @@ class Fit:
     # before it. Mirrors the R port's `object$model_vcov` - change together.
     model_vcov: np.ndarray | None = None
     # On a robust fit, its CR2 or HC2 pieces, which the tests of a robust fit
-    # read back: a dict of float arrays, every matrix flat and column-major over
-    # the p coefficients (zero on an aliased one), cluster k the k-th level of
-    # the grouping factor with rows, or row k without one:
-    #   er            (p * G,)      E_k r_k, one column per cluster
-    #   f, epe        list of (p*p,) F_k and E_k Phi_k E_k', per cluster of
-    #                               more than one row
-    #   row_e, row_x  (p * n1,)     e_k and x_k of each one-row cluster
-    #   row_phi       (n1,)         its scalar Phi_k
-    #   null_cluster  list[int]     the cluster of each null direction, 0-based
-    #   null          list of (p,)  the null directions
+    # read back: a dict of float arrays, every matrix flat and column-major,
+    # cluster k the k-th level of the grouping factor with rows, or row k
+    # without one. `t` maps the pz whitened coordinates to the p coefficients
+    # (a zero row on an aliased one); the other matrices are over the pz
+    # whitened coordinates:
+    #   t             (p * pz,)       the map beta = t beta_Z
+    #   er            (pz * G,)       E_k r_k, one column per cluster
+    #   f, epe        list of (pz*pz,) F_k and E_k Phi_k E_k', per cluster of
+    #                                 more than one row
+    #   row_e, row_x  (pz * n1,)      e_k and z_k of each one-row cluster
+    #   row_phi       (n1,)           its scalar Phi_k
+    #   null_cluster  list[int]       the cluster of each null direction, 0-based
+    #   null          list of (pz,)   the null directions
     # None on a model fit and on a fit pickled before it. Mirrors the R port's
     # `object$robust` - change together.
     robust: dict | None = None
@@ -1151,16 +1166,15 @@ class Fit:
         """Split grouping `group_idx`'s vech-packed covariance into
         (stddevs, correlation matrix), as Rust `Fit::stddev_corr`
         (src/fit/mod.rs) does: column-major lower-triangular vech.
-        On a fit with no variance estimates (`varcorr` empty: a fit that
+        On a fit with no variance estimates (the block is NaN: a fit that
         stopped before estimating anything, such as too few rows or a
         degenerate design) this raises `ValueError`."""
-        if not self.varcorr:
-            self.re_groups[group_idx]  # an index past the groupings raises IndexError
+        vech = np.asarray(self.varcorr[group_idx], dtype=float)
+        if np.isnan(vech).any():
             raise ValueError(
                 "stddev_corr is unavailable: the fit has no variance estimates, "
                 "because it stopped before estimating anything"
             )
-        vech = np.asarray(self.varcorr[group_idx], dtype=float)
         m = len(vech)
         q = (math.isqrt(1 + 8 * m) - 1) // 2
         if q * (q + 1) // 2 != m:
@@ -1211,7 +1225,8 @@ class Fit:
         `summary()`: the t quantile on the row's `coef_df` where the summary
         tests with t, the normal quantile where it tests with z (including a
         Gaussian mixed model fitted with `satterthwaite=False`, whose summary
-        says "df not computed"). Aliased coefficients give NaN. The R port's
+        says "df not computed"). Aliased coefficients give NaN, and so does a
+        row whose df was lost on a fit that tests with t. The R port's
         `confint()` computes the same intervals through the same kernel
         function. For profile-likelihood intervals of a Gaussian mixed model,
         variance parameters included, see `profile_confint`."""
@@ -1220,12 +1235,16 @@ class Fit:
         coef_df = getattr(self, "coef_df", None)
         if coef_df is None:
             coef_df = np.full(len(self.beta), np.nan)
+            df_method = "none"
+        else:
+            df_method = getattr(self, "df_method", "none")
         ci = _native.call(
             "confint",
             {
                 "beta": [float(v) for v in self.beta],
                 "se": [float(v) for v in self.se],
                 "coef_df": [float(v) for v in coef_df],
+                "df_method": df_method,
                 "level": float(level),
             },
         )
@@ -1395,18 +1414,19 @@ class Fit:
         A fit with no estimates (every coefficient NaN: a fit that stopped
         before estimating anything, such as too few rows or a degenerate
         design) predicts NaN, with a NaN standard error and NaN bounds.
+        A row outside the row space of a rank-deficient fit (one with aliased
+        columns) is not estimable: its prediction, standard error, interval
+        and future bounds are NaN, with a `RowsNotEstimableWarning`, as R's
+        `predict.lm(rankdeficient = "NA")` gives NA; rows inside the row space
+        use the kept coefficients as before.
+        On the response scale of a Gamma inverse-link or inverse-Gaussian
+        `1/mu^2` model, a row whose linear predictor is at or below 0 has no
+        mean, so its prediction, standard error, interval and future bounds
+        are NaN; on a row with a linear predictor above 0, an interval end at
+        or below 0 maps to +inf.
         A model fitted with the `offset=` argument cannot predict new rows:
         give the offset as an `offset()` term in the formula instead. The name
         is provisional until 1.0.0."""
-        if re_form is None:
-            population = False
-        elif isinstance(re_form, str) and re_form == "NA":
-            population = True
-        else:
-            raise ValueError(
-                're_form must be None (the random effects included) or "NA" (fixed effects '
-                f"only), got {re_form!r}"
-            )
         if newdata is None:
             new_numeric = new_factor = None
             n_rows = 0
@@ -1424,11 +1444,11 @@ class Fit:
                 "new_factors": new_factor,
                 "n_rows": n_rows,
                 "scale": type,
-                "population": population,
-                "allow_new_levels": bool(allow_new_levels),
-                "se": bool(se_fit),
-                "level": float(level),
-                "future": bool(future),
+                "re_form": re_form,
+                "allow_new_levels": allow_new_levels,
+                "se": se_fit,
+                "level": level,
+                "future": future,
                 # New rows are the caller's own: `_prepare_columns` drops none.
                 "row_index": self._kept().get("row_index") if newdata is None else None,
                 "row_base": 0,
@@ -1456,6 +1476,20 @@ class Fit:
                     NewGroupingLevelsWarning,
                     stacklevel=2,
                 )
+            if note["kind"] == "rows_not_estimable":
+                # Mirrors the R port's predict wording - change together.
+                rows = note["detail"].split(", ")
+                n = len(rows)
+                rows = ", ".join(rows[:10]) + (f", and {n - 10} more" if n > 10 else "")
+                if n == 1:
+                    rows, verb, result = f"Row {rows}", "is", "its prediction is"
+                else:
+                    rows, verb, result = f"Rows {rows}", "are", "their predictions are"
+                warnings.warn(
+                    f"{rows} {verb} not estimable from this rank-deficient fit, so {result} NaN.",
+                    RowsNotEstimableWarning,
+                    stacklevel=2,
+                )
         fit = _f64(r["fit"])
         if not (se_fit or future):
             return fit
@@ -1478,21 +1512,15 @@ class Fit:
             `random` module.
 
         The name is provisional until 1.0.0."""
-        if isinstance(nsim, bool) or not isinstance(nsim, (int, np.integer)) or nsim < 1:
-            raise ValueError(f"nsim must be a whole number of at least 1, got {nsim!r}")
         if seed is None:
             seed = random.getrandbits(64)
-        elif isinstance(seed, bool) or not isinstance(seed, (int, np.integer)):
-            raise ValueError(f"seed must be None or a whole number, got {seed!r}")
-        elif not 0 <= seed < 2**64:
-            raise ValueError(f"seed must be from 0 to 2**64 - 1, got {seed}")
         draws = _native.call(
             "simulate",
             {
                 **self._model_data(),
                 "parts": self._stored_numbers(),
-                "nsim": int(nsim),
-                "seed": int(seed),
+                "nsim": nsim,
+                "seed": seed,
                 "row_index": self._kept().get("row_index"),
                 "row_base": 0,
             },
@@ -1596,7 +1624,8 @@ class Fit:
     def _robust_args(self):
         """`model_vcov` and `robust` as the native `contrast_test` and `pairwise`
         take them, None when the fit has none (a model fit, or one pickled
-        before them)."""
+        before them). A key missing from a record pickled before it is left
+        out, so the native call names it."""
         rec = self.robust
         return {
             "model_vcov": self._model_vcov_arg(),
@@ -1605,13 +1634,15 @@ class Fit:
             else {
                 **{
                     k: np.asarray(rec[k], dtype=float).tolist()
-                    for k in ("er", "row_e", "row_x", "row_phi")
+                    for k in ("t", "er", "row_e", "row_x", "row_phi")
+                    if k in rec
                 },
                 **{
                     k: [np.asarray(v, dtype=float).tolist() for v in rec[k]]
                     for k in ("f", "epe", "null")
+                    if k in rec
                 },
-                "null_cluster": [int(k) for k in rec["null_cluster"]],
+                **{k: [int(c) for c in rec[k]] for k in ("null_cluster",) if k in rec},
             },
         }
 
@@ -1690,7 +1721,7 @@ class Fit:
         silently differ from lme4's `residuals(type=)`."""
         if type not in ("response", "pearson"):
             raise ValueError(f"type must be 'response' or 'pearson', got {type!r}")
-        if len(self.fitted) != len(self.y) or len(self.fitted) == 0:
+        if np.isnan(self.fitted).any():
             raise ValueError(
                 "residuals are unavailable: the fit did not converge, so no fitted "
                 "values are available"
@@ -1702,10 +1733,10 @@ class Fit:
         return pearson_residuals(self)
 
 
-# The warning category of each kind the fit record's notes and `failure`
-# carry; any other kind raises the base category. The tier, title and message
-# come rendered with the record (glmm-bind/src/notes.rs). Mirrors the R port's
-# .NOTE_KINDS (glmm-r/R/fastglmm.R) - change together.
+# The warning category of each kind the fit record's notes, `argument_notes`
+# and `failure` carry, and of the warnings this port words itself; any other
+# kind raises the base category. The tier, title and message come rendered
+# with the record (glmm-bind/src/notes.rs).
 _CATEGORIES = {
     "search_limit": SearchLimitWarning,
     "fit_failed": FitFailedWarning,
@@ -1722,7 +1753,10 @@ _CATEGORIES = {
     "repeated_grouping": RepeatedGroupingWarning,
     "slope_constant_within_levels": SlopeConstantWithinLevelsWarning,
     "separated_by_grouping": SeparatedByGroupingWarning,
+    "one_trial_per_level": OneTrialPerLevelWarning,
     "variance_at_limit": VarianceAtLimitWarning,
+    "dispersion_at_limit": DispersionAtLimitWarning,
+    "nb_shape_at_limit": NbShapeAtLimitWarning,
     "hessian_se_fallback": HessianSeFallbackWarning,
     "se_unavailable": SeUnavailableWarning,
     "gradient_search_fallback": GradientSearchFallbackWarning,
@@ -1737,6 +1771,10 @@ _CATEGORIES = {
     "robust_with_random_slope": RobustWithRandomSlopeWarning,
     "robust_se_unidentified": RobustSeUnidentifiedWarning,
     "robust_df_small": RobustDfSmallWarning,
+    "argument_ignored": ArgumentIgnoredWarning,
+    "agq_fallback": AgqFallbackWarning,
+    "singular": SingularFitWarning,
+    "rows_dropped_na": RowsDroppedWarning,
 }
 
 
@@ -1779,20 +1817,15 @@ def _pinned_detail(res):
     stddev is sqrt(lambda_offdiag^2 + lambda_diag^2) and so lands at ~1e-9
     rather than at 0 — a scan for exactly-zero stddevs misses those pins.
 
-    Empty means nothing was pinned — including a model with no variance
-    components to pin. `singular` can still be `True` with `pinned` empty (the
-    post-hoc negligible-stddev check is independent of the optimizer's own pin
-    decision), so the bare lme4 text stands regardless; the caller must not
-    read an empty `pinned` as "not singular"."""
-    pinned = res.diagnostics["pinned"]
-    if not pinned:
-        return []
+    An empty result means nothing was pinned — including a model with no
+    variance components to pin. `singular` can still be `True` with nothing
+    pinned (the post-hoc negligible-stddev check is independent of the
+    optimizer's own pin decision), so the bare lme4 text stands regardless;
+    the caller must not read an empty result as "not singular"."""
     parts = []
-    # strict: when the kernel reports pins at all it emits one flag block per
-    # varcorr block, so a length mismatch there is a bug to surface, not
-    # groupings to drop quietly. The empty case is handled above — it is the
-    # documented "nothing was pinned", not a mismatch.
-    for flags, (group, terms) in zip(pinned, res.re_groups, strict=True):
+    # strict: the kernel emits one flag row per varcorr block, so a length
+    # mismatch is a bug to surface, not groupings to drop quietly.
+    for flags, (group, terms) in zip(res.diagnostics["pinned"], res.re_groups, strict=True):
         for i, is_pinned in enumerate(flags):
             if is_pinned:
                 term = terms[i] if i < len(terms) else f"component {i}"
@@ -1804,55 +1837,14 @@ def _count(n, word):
     return f"{n} {word}" if n == 1 else f"{n} {word}s"
 
 
-def _check_call(formula, family, link):
-    """The checks `fit` and `compare` make on a formula, the family and the
-    link before any data is read; returns `(family, link)`: the family
-    lowercased (case is ignored, as in the R port) with R's dotted names
-    mapped to the kernel's, the link the family's default when `link` is
-    None."""
+def _check_call(formula):
+    """Refuse a `'.'` in `formula` before any data is read."""
     # A formula shape the shared Rust parser has no dedicated message for (it
     # would fall through to a generic syntax error): caught here with the same
     # wording the R port uses (glmm-r/R/fastglmm.R's .check_formula) — change
     # together.
     if re.search(r"(?<![\w.])\.(?![\w.])", formula):
         raise ValueError("'.' is not supported by the formula parser; list the columns explicitly")
-
-    name = family.lower() if isinstance(family, str) else family
-    # R's own names, which the R port's string family also takes
-    # (glmm-r/R/fastglmm.R, the tolower(family) switch) - change together.
-    name = {"negative.binomial": "negativebinomial", "inverse.gaussian": "inversegaussian"}.get(
-        name, name
-    )
-    if name not in _FAMILIES:
-        raise ValueError(f"unknown family {family!r}; expected one of {', '.join(_FAMILIES)}")
-    fam = _FAMILIES[name]
-    if link is None:
-        link = fam["default_link"]
-    elif link not in fam["links"]:
-        raise ValueError(
-            f"family {family!r} does not support link {link!r}; "
-            f"expected one of {', '.join(fam['links'])}"
-        )
-
-    if name == "inversegaussian" and "|" in formula:
-        raise ValueError(
-            "family 'inversegaussian' is GLM-only: random-effect terms are not supported"
-        )
-    return name, link
-
-
-def _check_nagq(nagq):
-    """`nagq` as a Python int; a numpy integer is accepted."""
-    if not isinstance(nagq, bool) and isinstance(nagq, (int, np.integer)):
-        nagq = int(nagq)
-    if not (
-        isinstance(nagq, int)
-        and not isinstance(nagq, bool)
-        and 1 <= nagq <= _MAX_NAGQ
-        and nagq % 2 == 1
-    ):
-        raise ValueError(f"nagq must be an odd integer in 1..={_MAX_NAGQ}, got {nagq!r}")
-    return nagq
 
 
 def _prepare_columns(
@@ -2129,6 +2121,7 @@ def _robust_record(rec):
         return None
     flat = ("er", "row_e", "row_x", "row_phi")
     return {
+        "t": np.asarray(rec["t"], dtype=float),
         **{k: _f64(rec[k]) for k in flat},
         "f": [np.asarray(v, dtype=float) for v in rec["f"]],
         "epe": [np.asarray(v, dtype=float) for v in rec["epe"]],
@@ -2180,58 +2173,12 @@ def _ranef_block(b):
     }
 
 
-def _fit_from_native(r, formula, family, link, nagq, dispersion, store, kept):
+def _fit_from_native(r, formula, store, kept):
     """The `Fit` of the native `fit`'s dict `r`, with the fit's warnings raised
     and appended to `store`; `kept` is the training columns and the
-    `weights=`/`offset=` bytes the call sent (`Fit._kernel_parts`), the other
-    arguments the call's own."""
-    # nagq's shape eligibility (single grouping factor, binomial/Poisson/NB/Gamma,
-    # q <= 3) is only decidable after the Rust-side formula lowering, so the
-    # warn-and-strip for it lives in the shared glmm::orchestrate module
-    # (src/orchestrate.rs).
-    # Whether the FITTED model actually has random effects — not `mixed`,
-    # which only says the formula asked for some: a single-level grouping is
-    # dropped after lowering (`single_level_grouping_dropped`), and once every
-    # random-effect term is dropped this way, `r["re_group_names"]` comes back
-    # empty even though `mixed` (read off the formula text before fitting)
-    # still says True.
-    fitted_mixed = bool(r["re_group_names"])
-    if r["agq_warning"] is not None:
-        # Built here, not taken from `agq_warning`: that string spells the R port's
-        # argument differently. A Gaussian model is fitted exactly and a model without
-        # random effects has no integral, so there nagq changes nothing and is an
-        # ignored argument, not a fallback worth a caution.
-        if family == "gaussian" or not fitted_mixed:
-            reason = (
-                "a Gaussian model" if family == "gaussian" else "a model without random effects"
-            )
-            _warn(
-                store,
-                "argument_ignored",
-                f"nagq={nagq} has no effect for {reason}, because nothing is approximated.",
-                ArgumentIgnoredWarning,
-            )
-        else:
-            _warn(
-                store,
-                "agq_fallback",
-                f"nagq={nagq} works only for {_AGQ_FAMILIES} models whose random effects "
-                "are in one grouping factor, with at most 3 random effects in it. This "
-                "model was fitted without adaptive quadrature.",
-                AgqFallbackWarning,
-            )
-    if r["reml_warning"] is not None:
-        # Worded here, as `agq_warning` above: the shared rule in
-        # src/orchestrate.rs decides, each port spells its own argument. The R
-        # port (glmm-r/R/fastglmm.R, `fastglmm`) words the same sentence with
-        # `REML = TRUE`; change together.
-        _warn(
-            store,
-            "argument_ignored",
-            "reml=True applies only to Gaussian models; it was ignored and the model was "
-            "fitted by maximum likelihood.",
-            ArgumentIgnoredWarning,
-        )
+    `weights=`/`offset=` bytes the call sent (`Fit._kernel_parts`). The
+    family, link, nodes and held dispersion are the record's, as the native
+    code parsed them."""
     # Wrap the native dict's plain lists back into the array types Fit's
     # dataclass documents (no numpy Rust dep — the native call returns lists,
     # and the per-row vectors as bytes).
@@ -2267,9 +2214,9 @@ def _fit_from_native(r, formula, family, link, nagq, dispersion, store, kept):
         ranef_levels=np.frombuffer(r["ranef_levels"], dtype=np.uint64).astype(int),
         ranef_blocks=[_ranef_block(b) for b in r["ranef_blocks"]],
         formula=formula,
-        family=family,
-        link=link,
-        nagq=nagq if r["agq_warning"] is None else 1,
+        family=r["family"],
+        link=r["link"],
+        nagq=r["nagq"],
         nobs=int(r["nobs"]),
         y=_f64(r["y"]),
         weights=_f64(r["weights"]) if r["weights"] is not None else None,
@@ -2280,7 +2227,7 @@ def _fit_from_native(r, formula, family, link, nagq, dispersion, store, kept):
         r_squared=r["r_squared"],
         adj_r_squared=r["adj_r_squared"],
         warnings=store,
-        dispersion_held=dispersion,
+        dispersion_held=r["dispersion_held"],
         design_summary=None
         if r["design_summary"] is None
         else {k: np.asarray(v, dtype=float) for k, v in r["design_summary"].items()},
@@ -2303,8 +2250,13 @@ def _fit_from_native(r, formula, family, link, nagq, dispersion, store, kept):
             "condvar": r["condvar"],
             "condvar_x": r["condvar_x"],
             "condvar_cross": r["condvar_cross"],
+            "re_group_levels": r["re_group_levels"],
         },
     )
+    # The warnings of the arguments the fit did not use, worded by the native
+    # code, after the data's own (`rows_dropped_na`).
+    for w in r["argument_notes"]:
+        _raise(store, w, _CATEGORIES.get(w["kind"], DiagnosticWarning))
     # Singularity is not assessed on a fit that did not converge: the kernel never sets
     # `singular` there (the post-hoc check and the boundary flags are gated on
     # `converged`), so `m.singular` reads False on a non-converged fit. `and res.converged`
@@ -2325,7 +2277,7 @@ def _fit_from_native(r, formula, family, link, nagq, dispersion, store, kept):
         if note["message"] is not None:
             _raise(store, note, _CATEGORIES.get(note["kind"], DiagnosticWarning))
     if r["failure"] is not None:
-        _raise(store, r["failure"], _CATEGORIES[r["failure"]["kind"]])
+        _raise(store, r["failure"], _CATEGORIES.get(r["failure"]["kind"], DiagnosticWarning))
     return res
 
 
@@ -2375,7 +2327,9 @@ def fit(
     warm_start: {"beta": …, "theta": …, "dispersion": …} optimizer start; any key
         may be left out to cold-start that part. "dispersion" is the estimated
         dispersion as a previous fit reports it (`Fit.dispersion`): the shape
-        for negative binomial, phi for Gamma. See `init_theta` above for why
+        for negative binomial, phi for a Gamma model with random effects; any
+        other family, and a Gamma model without random effects, ignores it with
+        an ArgumentIgnoredWarning. See `init_theta` above for why
         "theta" here is NOT the negative-binomial shape.
     satterthwaite: compute lmerTest's Satterthwaite degrees of freedom for a
         Gaussian mixed model's t tests (default True). False skips that pass:
@@ -2450,129 +2404,11 @@ def fit(
 
     See the API spec for the remaining knobs.
     """
-    family, link = _check_call(formula, family, link)
-    # `|` marks a random-effect term, so its presence is the mixed/GLM split
-    # — decidable without the (Rust-side) formula parser.
-    mixed = "|" in formula
-
-    if wald_se not in ("hessian", "rx"):
-        raise ValueError(f"wald_se must be 'hessian' or 'rx', got {wald_se!r}")
-    if anova_test not in ("auto", "Wald", "LRT"):
-        raise ValueError(f"anova_test must be 'auto', 'Wald' or 'LRT', got {anova_test!r}")
-
-    nagq = _check_nagq(nagq)
-
-    if not isinstance(satterthwaite, (bool, np.bool_)):
-        raise TypeError(f"satterthwaite must be True or False, got {satterthwaite!r}")
-    satterthwaite = bool(satterthwaite)
-    if not isinstance(condvar, (bool, np.bool_)):
-        raise TypeError(f"condvar must be True or False, got {condvar!r}")
-    condvar = bool(condvar)
-    if reml is not None and not isinstance(reml, (bool, np.bool_)):
-        raise TypeError(f"reml must be None, True or False, got {reml!r}")
-    reml = None if reml is None else bool(reml)
-
+    _check_call(formula)
     store = []
-
-    # Valid-but-inapplicable options: warn and strip. The kernel
-    # boundary-faults on inapplicable options and a Rust panic across the FFI
-    # is not an acceptable user error, so nothing inapplicable may reach it.
-    if dispersion is not None and family not in _DISPERSION_FAMILIES:
-        _warn(
-            store,
-            "argument_ignored",
-            f"dispersion= has no effect for family '{family}'.",
-            ArgumentIgnoredWarning,
-        )
-        dispersion = None
-    if dispersion is not None:
-        if isinstance(dispersion, (int, float, np.integer, np.floating)) and not isinstance(
-            dispersion, bool
-        ):
-            dispersion = float(dispersion)
-        elif not (isinstance(dispersion, str) and dispersion == "estimate"):
-            raise ValueError(
-                f"dispersion must be None, 'estimate', or a number, got {dispersion!r}"
-            )
-        if family in ("binomial", "poisson") and mixed:
-            _warn(
-                store,
-                "argument_ignored",
-                "Quasi-likelihood dispersion= is not supported yet for binomial or Poisson "
-                "models. The default dispersion of 1 was used.",
-                ArgumentIgnoredWarning,
-            )
-            dispersion = None
-    if init_theta is not None and family != "negativebinomial":
-        _warn(
-            store,
-            "argument_ignored",
-            f"init_theta= is not used for family '{family}'.",
-            ArgumentIgnoredWarning,
-        )
-        init_theta = None
-    if warm_start is not None:
-        if not isinstance(warm_start, dict):
-            raise TypeError(
-                "warm_start must be a dict with keys 'beta', 'theta' and/or 'dispersion' (theta "
-                "is the random-effect Cholesky vector, not the negative-binomial shape - that is "
-                f"init_theta or dispersion), got {type(warm_start).__name__}"
-            )
-        allowed = ("beta", "theta", "dispersion")
-        unknown = [k for k in warm_start if k not in allowed]
-        if unknown:
-            _warn(
-                store,
-                "argument_ignored",
-                "warm_start accepts only 'beta', 'theta' and 'dispersion'; these entries were "
-                "ignored: " + ", ".join(map(str, unknown)) + ".",
-                ArgumentIgnoredWarning,
-            )
-            warm_start = {k: v for k, v in warm_start.items() if k in allowed}
-
-    if dispersion == "estimate" and family in ("gamma", "inversegaussian"):
-        # The phi families' default (dispersion=None) already estimates phi
-        # (Pearson on a Gamma GLM, maximum likelihood on a Gamma GLMM, Pearson
-        # on inversegaussian), so "estimate" needs no distinct kernel state.
-        dispersion = None
-    if family in ("binomial", "poisson") and dispersion is not None:
-        raise NotImplementedError(
-            f"quasi-likelihood dispersion on family {family!r} is not yet implemented in the kernel"
-        )
-    # init_theta is the negative-binomial shape seed: the same kernel slot as
-    # warm_start["dispersion"], so giving both is ambiguous.
-    if init_theta is not None:
-        if warm_start is not None and warm_start.get("dispersion") is not None:
-            raise ValueError(
-                "give the negative-binomial shape seed once: init_theta= or "
-                'warm_start["dispersion"], not both'
-            )
-        warm_start = dict(warm_start or {}, dispersion=init_theta)
-    if warm_start is not None and warm_start.get("dispersion") is not None:
-        d = warm_start["dispersion"]
-        if (
-            isinstance(d, bool)
-            or not isinstance(d, (int, float, np.integer, np.floating))
-            or not (math.isfinite(d) and d > 0)
-        ):
-            raise ValueError(
-                f'warm_start["dispersion"] (or init_theta) must be one finite number > 0, got {d!r}'
-            )
-        warm_start = dict(warm_start, dispersion=float(d))
-
     numeric_columns, factor_columns, weights, offset, row_index = _prepare_columns(
         data, [formula], weights, offset, store
     )
-
-    warm_start_record = None
-    if warm_start is not None:
-        d = warm_start.get("dispersion")
-        warm_start_record = {
-            "beta": [float(v) for v in warm_start.get("beta", [])],
-            "theta": [float(v) for v in warm_start.get("theta", [])],
-            "dispersion": None if d is None else float(d),
-        }
-
     kept = {
         "numeric": numeric_columns,
         "factor": factor_columns,
@@ -2580,8 +2416,6 @@ def fit(
         "offset": offset.tobytes() if offset is not None else None,
         "row_index": row_index,
     }
-    if anova_test == "auto":
-        kept["lrt_call"] = (wald_se, nagq, dispersion, warm_start_record)
     r = _native.call(
         "fit",
         {
@@ -2593,9 +2427,15 @@ def fit(
             "wald_se": wald_se,
             "nagq": nagq,
             "dispersion": dispersion,
+            "init_theta": init_theta,
             "weights": kept["weights"],
             "offset": kept["offset"],
-            "warm_start": warm_start_record,
+            # str keys, so a key of another type reaches the unknown-key note.
+            "warm_start": (
+                {str(k): v for k, v in warm_start.items()}
+                if isinstance(warm_start, dict)
+                else warm_start
+            ),
             "satterthwaite": satterthwaite,
             "condvar": condvar,
             "reml": reml,
@@ -2606,16 +2446,9 @@ def fit(
             "row_base": 0,
         },
     )
-    # The native call has refused anything but None, "estimate" and a number.
-    if weight_power not in (None, "estimate", 1) and math.isnan(r["weight_power"]):
-        _warn(
-            store,
-            "argument_ignored",
-            # R's format() of the number, 7 significant digits (glmm-r/R/fastglmm.R).
-            f"weight_power = {weight_power:.7g} has no effect without weights.",
-            ArgumentIgnoredWarning,
-        )
-    return _fit_from_native(r, formula, family, link, nagq, dispersion, store, kept)
+    if anova_test == "auto":
+        kept["lrt_call"] = (wald_se, r["nagq"], r["dispersion_held"], r["warm_start"])
+    return _fit_from_native(r, formula, store, kept)
 
 
 def model_matrix(data, formula):
@@ -2704,25 +2537,15 @@ def pairwise(m, factor, by=None, at=None, adjust="holm"):
     (`RobustDfSmallWarning`).
     `confint()` of the table gives the confidence intervals.
 
-    Raises `ValueError` on a name that is not a variable of the fixed part, a
-    numeric `factor`, `at` without a numeric `by`, an unknown `adjust`, and a
-    fit made by a glmm version that did not keep its training data. The name
-    is provisional until 1.0.0."""
+    Raises `ValueError` on a `factor` or `by` that is not one variable name of
+    the fixed part, a numeric `factor`, `at` without a numeric `by` or with a
+    value that is not a finite number, an unknown `adjust`, and a fit made by
+    a glmm version that did not keep its training data. The name is
+    provisional until 1.0.0."""
     from glmm.anova import _pairwise_table
 
     if not isinstance(m, Fit):
         raise TypeError(f"glmm.pairwise takes a glmm.Fit, got {type(m).__name__}")
-    if not isinstance(factor, str):
-        raise TypeError(f"factor must be a variable name, got {factor!r}")
-    if by is not None and not isinstance(by, str):
-        raise TypeError(f"by must be None or a variable name, got {by!r}")
-    if at is not None:
-        if by is None:
-            raise ValueError("at gives the values of a numeric by, so it needs by")
-        at = np.asarray(at, dtype=float).ravel()
-        if at.size == 0 or not np.isfinite(at).all():
-            raise ValueError("at must be one or more finite numbers")
-        at = at.tolist()
     p = len(m.beta)
     stored = _native.call(
         "pairwise",
@@ -2738,12 +2561,13 @@ def pairwise(m, factor, by=None, at=None, adjust="holm"):
             "names": list(m.names),
             "factor": factor,
             "by": by,
-            "by_values": at,
+            "at": at,
             "adjust": adjust,
+            "converged": bool(m.converged),
         },
     )
     _test_warnings(stored)
-    return _pairwise_table(stored, m.df_method == "none", m.converged)
+    return _pairwise_table(stored, m.df_method == "none")
 
 
 def term_labels(formula):

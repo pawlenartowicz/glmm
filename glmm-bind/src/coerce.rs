@@ -24,6 +24,7 @@ pub(crate) fn describe(v: &Value) -> String {
         Value::U64(n) => n.to_string(),
         Value::F64(x) => x.to_string(),
         Value::Str(s) => format!("the string {s:?}"),
+        Value::Na => "NA".to_owned(),
         other => {
             let kind = other.kind_name();
             let article = if kind.starts_with(['a', 'e', 'i', 'o', 'u']) {
@@ -63,22 +64,13 @@ pub(crate) fn to_usize(v: &Value) -> Result<usize, String> {
     }
 }
 
-/// A seed: any `u64`. A float must be whole and at most 2^53; larger seeds
-/// travel as decimal strings.
+/// A seed: any `u64`. A float must be whole and at most 2^53.
 pub(crate) fn to_seed(v: &Value) -> Result<u64, String> {
-    let bad = || {
-        format!(
-            "must be a whole number in [0, 2^64) (a decimal string above 2^53), got {}",
-            describe(v)
-        )
-    };
+    let bad = || format!("must be a whole number in [0, 2^64), got {}", describe(v));
     match scalar(v) {
         Value::U64(n) => Ok(n),
         Value::I64(n) => u64::try_from(n).map_err(|_| bad()),
         Value::F64(x) if whole_f64(x) => Ok(x as u64),
-        Value::Str(s) if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) => {
-            s.parse::<u64>().map_err(|_| bad())
-        }
         _ => Err(bad()),
     }
 }

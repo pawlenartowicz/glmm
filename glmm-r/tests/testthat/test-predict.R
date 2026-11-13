@@ -34,6 +34,15 @@ test_that("predict on the model frame at the response scale is fitted()", {
                ignore_attr = TRUE)
 })
 
+test_that("type takes a partial name and NULL, as match.arg does", {
+  d <- predict_data()
+  b <- quiet_fit(yb ~ x + (1 | g), d, family = binomial())
+  expect_identical(predict(b, type = "resp"), predict(b, type = "response"))
+  expect_identical(predict(b, type = NULL), predict(b))
+  expect_error(predict(b, type = "probability"),
+               'type must be "link" or "response", got "probability"', fixed = TRUE)
+})
+
 test_that("the default scale is the link", {
   d <- predict_data()
   b <- quiet_fit(yb ~ x + (1 | g), d, family = binomial())
@@ -77,11 +86,36 @@ test_that("an unseen grouping level warns with its class and gets the population
   expect_error(predict(m, new, allow.new.levels = FALSE), "did not see")
 })
 
+test_that("a row the fit cannot estimate warns and predicts NaN", {
+  # 36 rows over the cells a:B, b:A and b:B of f1 by f2; a:A has no row.
+  i <- 0:35
+  d <- data.frame(
+    y = 1 + (7 * i) %% 5 + 2 * (i %% 3),
+    f1 = c("a", "b", "b")[i %% 3 + 1], f2 = c("B", "A", "B")[i %% 3 + 1],
+    g = sprintf("g%d", (i %/% 3) %% 6)
+  )
+  m <- quiet_fit(y ~ 0 + f1:f2 + (1 | g), d)
+  new <- data.frame(f1 = c("a", "b"), f2 = c("A", "B"))
+  expect_warning(
+    got <- predict(m, new, re.form = NA),
+    "Row 1 is not estimable from this rank-deficient fit, so its prediction is NaN.",
+    fixed = TRUE, class = "fastglmm_rows_not_estimable"
+  )
+  expect_true(is.nan(got[[1]]))
+  expect_true(is.finite(got[[2]]))
+})
+
 test_that("bad arguments are refused", {
   d <- predict_data()
   m <- quiet_fit(y ~ x + (1 | g), d)
-  expect_error(predict(m, d, type = "probability"), "should be one of")
-  expect_error(predict(m, d, re.form = ~ (1 | g)), "re.form must be NULL or NA")
+  expect_error(predict(m, d, type = "probability"),
+               'type must be "link" or "response", got "probability"', fixed = TRUE,
+               class = "fastglmm_error_invalid_argument")
+  expect_error(predict(m, d, re.form = ~ (1 | g)), paste(
+    "re.form must be NULL (the random effects of every grouping) or NA (the fixed effects",
+    'only), got the string "~(1 | g)"'), fixed = TRUE)
+  expect_error(predict(m, d, se.fit = "yes"),
+               'se.fit must be TRUE or FALSE, got the string "yes"', fixed = TRUE)
   expect_error(predict(m, d, level = 1.5), "level must be in")
   expect_error(predict(m, d[c("x", "y")]), "grouping columns")
   expect_error(predict(m, d, future = TRUE), "future applies only to a non-Gaussian mixed model")
@@ -102,7 +136,10 @@ test_that("simulate is seeded and has one row per fitted row", {
   b <- simulate(m)
   set.seed(1)
   expect_identical(b, simulate(m))
-  expect_error(simulate(m, nsim = 0), "nsim")
+  expect_error(simulate(m, nsim = 0), "nsim must be a whole number from 1 to 1000000, got 0",
+               fixed = TRUE)
+  expect_error(simulate(m, seed = -1),
+               "seed must be NULL or one whole number from 0 to 2^53, got -1", fixed = TRUE)
 })
 
 test_that("ranef(condVar = TRUE) carries a postVar of terms x terms x levels", {
@@ -118,9 +155,9 @@ test_that("ranef(condVar = TRUE) carries a postVar of terms x terms x levels", {
 
 test_that("a fit without conditional variances raises a clear error", {
   d <- predict_data()
-  # An extra grouping with a random slope routes to the sparse solver, which
-  # forms no conditional variances.
-  m <- quiet_fit(ys ~ x + (1 | g) + (1 + x | h), d)
+  # Two groupings with slopes route to the sparse solver, which forms no
+  # conditional variances.
+  m <- quiet_fit(ys ~ x + (1 + x | g) + (1 + x | h), d)
   expect_error(ranef(m, condVar = TRUE), "no conditional variances")
   expect_null(attr(ranef(m)$g, "postVar"))
   expect_length(predict(m), nrow(d))

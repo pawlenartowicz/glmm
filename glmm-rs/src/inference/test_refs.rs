@@ -42,11 +42,14 @@ pub enum Kind {
     Cr2,
     /// High-precision CR2 references at wide weights (`goldens_cr2_hp.py`).
     Cr2Hp,
+    /// 50-digit CR2 and HC2 df on nearly collinear designs
+    /// (`goldens_cr2_df.py`).
+    Cr2Df,
 }
 
 impl Kind {
     /// Every kind, in manifest order.
-    pub const ALL: [Kind; 10] = [
+    pub const ALL: [Kind; 11] = [
         Kind::Lmertest,
         Kind::Rlrt,
         Kind::Anova,
@@ -57,6 +60,7 @@ impl Kind {
         Kind::Profile,
         Kind::Cr2,
         Kind::Cr2Hp,
+        Kind::Cr2Df,
     ];
 
     /// The manifest `kind` string, which is also the directory name.
@@ -72,6 +76,7 @@ impl Kind {
             Kind::Profile => "profile",
             Kind::Cr2 => "cr2",
             Kind::Cr2Hp => "cr2_hp",
+            Kind::Cr2Df => "cr2_df",
         }
     }
 
@@ -130,7 +135,7 @@ impl Entry {
         };
         let kind_str = string("kind")?;
         let kind = Kind::parse(&kind_str).ok_or_else(|| {
-            format!("unknown kind \"{kind_str}\" (one of lmertest, rlrt, anova, predict, posthoc, effectsize, conditioning, profile, cr2, cr2_hp) in {raw}")
+            format!("unknown kind \"{kind_str}\" (one of lmertest, rlrt, anova, predict, posthoc, effectsize, conditioning, profile, cr2, cr2_hp, cr2_df) in {raw}")
         })?;
         let factors = match raw.get("factors") {
             None => Vec::new(),

@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::formula::Column;
-use crate::predict::predict_tests::{binomial, lowered_fit, BERN, SLEEP};
+use crate::predict::predict_tests::{binomial, doubled_days_fits, lowered_fit, BERN, SLEEP};
 use crate::test_support::csv_table;
 use crate::{FitError, PoissonLink};
 
@@ -125,6 +125,39 @@ fn the_same_seed_and_draw_give_the_same_response() {
     assert_eq!(ran, 3);
 }
 
+/// Rescaling a random slope's predictor, `x → c·x` with the parameters mapped
+/// to match, draws the same response: no scale drops a random effect.
+#[test]
+fn a_rescaled_slope_predictor_draws_the_same_response() {
+    let (lo, fit) = lowered_fit(
+        SLEEP,
+        &["Subject"],
+        "Reaction ~ Days + (1 + Days | Subject)",
+        Family::Gaussian,
+    );
+    let y = Simulator::new(&fit, lo.spec(), &lo.design())
+        .unwrap()
+        .simulate(0, 0);
+    for c in [1e-8, 1e8] {
+        let x: Vec<f64> = lo.x.chunks(2).flat_map(|r| [r[0], c * r[1]]).collect();
+        let beta = [fit.beta[0], fit.beta[1] / c];
+        let v = &fit.varcorr[0];
+        let varcorr = [vec![v[0], v[1] / c, v[2] / (c * c)]];
+        let parts = FitParts {
+            beta: &beta,
+            varcorr: &varcorr,
+            ..FitParts::of(&fit, lo.spec())
+        };
+        let design = Design::new(&x, lo.n, 2).ids(&lo.ids);
+        let yc = Simulator::from_parts(&parts, lo.spec(), &design)
+            .unwrap()
+            .simulate(0, 0);
+        for (a, b) in yc.iter().zip(&y) {
+            assert!((a - b).abs() <= 1e-5 * b.abs(), "c = {c}: {a} vs {b}");
+        }
+    }
+}
+
 #[test]
 fn simulate_into_checks_the_buffer() {
     let (lo, fit) = lowered_fit(
@@ -215,6 +248,23 @@ fn a_non_integer_trial_count_is_refused() {
     }
 }
 
+/// A whole trial count above `MAX_TRIALS` is refused: the binomial draw takes
+/// it as an `i64`, which would saturate.
+#[test]
+fn a_trial_count_past_max_trials_is_refused() {
+    let (lo, fit) = cbpp_fit();
+    let mut w = lo.weights.clone().unwrap();
+    w[3] = 1e30;
+    let design = lo.design().weights(&w);
+    match Simulator::new(&fit, lo.spec(), &design) {
+        Err(FitError::Weights(m)) => {
+            assert!(m.contains("glmm::limits::MAX_TRIALS"), "{m}");
+            assert_eq!(m.row(), Some(3));
+        }
+        other => panic!("accepted or another error: {:?}", other.err()),
+    }
+}
+
 #[test]
 fn a_fit_without_a_dispersion_is_refused() {
     let (lo, mut fit) = lowered_fit(
@@ -271,6 +321,24 @@ fn a_reciprocal_link_row_with_eta_at_or_below_zero_draws_nan() {
             .simulate(1, 0);
         assert!(d[0].is_finite() && d[0] > 0.0, "{family:?}: {}", d[0]);
         assert!(d[1].is_nan(), "{family:?}: {}", d[1]);
+    }
+}
+
+/// A new row outside the row space of a rank-deficient fit draws NaN; a row
+/// inside it (`x2 = 2x`) and an all-zero row draw numbers.
+#[test]
+fn a_row_outside_the_row_space_draws_nan() {
+    let (_, _, _, fit3) = doubled_days_fits();
+    let spec = ModelSpec::mixed(Family::Gaussian, crate::Re::intercept());
+    let rows = [1.0, 1.0, 2.0, 1.0, 1.0, 3.0, 0.0, 0.0, 0.0];
+    let ids = crate::GroupIds::new(vec![0, 1, 2]);
+    let sim = Simulator::new(&fit3, &spec, &Design::new(&rows, 3, 3).ids(&ids)).unwrap();
+    for draw in 0..2 {
+        let y = sim.simulate(0, draw);
+        assert!(
+            y[1].is_nan() && y[0].is_finite() && y[2].is_finite(),
+            "{y:?}"
+        );
     }
 }
 

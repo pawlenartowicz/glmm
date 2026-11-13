@@ -6,7 +6,7 @@
 NULL
 
 #' Run `glmm-bind`'s function `name` on the named list `inputs`. Returns
-#' `list(value)`, or `list(error, code, kind)` for the R helper
+#' `list(value)`, or `list(error, code)` for the R helper
 #' `.glmm_call()` to raise, so no R error unwinds through Rust frames.
 #'
 #' @usage NULL

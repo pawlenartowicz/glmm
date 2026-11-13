@@ -464,9 +464,9 @@ d_ncm <- make_nested_crossed_mix()
 write.csv(d_ncm, file.path(suite_dir, "data", "simulated", "sim_nested_crossed_mix.csv"), row.names = FALSE)
 cat(sprintf("wrote %-12s  %3d rows x %d cols\n", "sim_nested_crossed_mix", nrow(d_ncm), ncol(d_ncm)))
 
-# --- NB theta-bracket-edge GLM datasets (coverage-gaps G2) --------------------
+# --- NB theta-bracket-edge GLM datasets --------------------
 # Two sim_nb siblings whose glm.nb theta-hat sits near an end of glmm's theta
-# search bracket [1e-3, 1e4] (fit.rs NB_THETA_LO/HI). Parameters were chosen by
+# search bracket [1e-3, 1e4] (consts.rs NB_THETA_LO/HI). Parameters were chosen by
 # a pre-freeze glm.nb sweep: at these (theta, n, b0) MASS::glm.nb converges with
 # ZERO warnings (no theta.ml iteration/alternation limit), so the reference is
 # trustworthy -- more extreme settings put theta.ml itself at its limits.
@@ -497,7 +497,7 @@ d_nh <- make_nb_edge(n = 4000, b0 = 2.0, theta = 800)
 write.csv(d_nh, file.path(suite_dir, "data", "simulated", "sim_nb_hightheta.csv"), row.names = FALSE)
 cat(sprintf("wrote %-12s  %3d rows x %d cols\n", "sim_nb_hightheta", nrow(d_nh), ncol(d_nh)))
 
-# --- NB unbalanced-nested GLMM golden dataset (coverage-gaps G2) --------------
+# --- NB unbalanced-nested GLMM golden dataset --------------
 # sim_nb's GLMM sibling on an UNBALANCED NESTED design (per-g1 sizes 8..120 on
 # an exp ladder, the sim_unbalanced_nested precedent; g2 labels reused across
 # parents so (1|g1/g2) disambiguates). theta = 1.5, the sim_nb convention.
@@ -520,7 +520,7 @@ d_nn <- make_nb_nested()
 write.csv(d_nn, file.path(suite_dir, "data", "simulated", "sim_nb_nested.csv"), row.names = FALSE)
 cat(sprintf("wrote %-12s  %3d rows x %d cols\n", "sim_nb_nested", nrow(d_nn), ncol(d_nn)))
 
-# --- Collinear fixed column on a MIXED design (coverage-gaps G5) --------------
+# --- Collinear fixed column on a MIXED design --------------
 # sim_collinear's LMM sibling: x3 = x1 + x2 + jitter sd 1e-13 (same rationale --
 # see the sim_collinear note on drop tolerances) plus a scalar random intercept
 # over 12 clusters. lmer's rankMatrix check drops the LAST dependent column

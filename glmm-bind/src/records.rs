@@ -1,7 +1,7 @@
 //! The engine's result structs as [`Record`]s, and the records a port passes
 //! back (a stored fit's Satterthwaite record, its numbers, one side of a
 //! comparison) as the engine's structs. Field names are those both ports
-//! read today; every index field is a [`Value::Index`] (D7).
+//! read today; every index field is a [`Value::Index`].
 
 use glmm::formula::anova::{
     Comparison, ComparisonTest, Differs, Model, ModelInfo, Side, TermTable,
@@ -16,6 +16,8 @@ use glmm::SeType;
 use crate::error::BindError;
 use crate::inputs::Inputs;
 use crate::notes::{self, Failed, FitText};
+use crate::options::{self, FitArgs};
+use crate::port::Port;
 use crate::value::{Record, Value};
 
 pub(crate) fn text(s: &str) -> Value {
@@ -86,7 +88,8 @@ fn cross_record(c: &CondvarCrossRecord) -> Value {
             .with("tail", Value::Vec(c.tail.clone()))
             .with("coupling_at", ints(c.coupling_at.iter().copied()))
             .with("coupling_cols", ints(c.coupling_cols.iter().copied()))
-            .with("coupling", Value::Vec(c.coupling.clone())),
+            .with("coupling", Value::Vec(c.coupling.clone()))
+            .with("nested_slots", ints(c.nested_slots.iter().copied())),
     )
 }
 
@@ -107,6 +110,7 @@ fn satterthwaite_record(rec: SatterthwaiteRecord) -> Value {
 fn robust_record(rec: RobustRecord) -> Value {
     Value::Record(
         Record::new()
+            .with("t", Value::Vec(rec.t))
             .with("er", Value::Vec(rec.er))
             .with("f", vecs(rec.f))
             .with("epe", vecs(rec.epe))
@@ -120,8 +124,15 @@ fn robust_record(rec: RobustRecord) -> Value {
 
 /// A [`FitResult`] as the fit record, the warning text of its notes and of
 /// its non-convergence (`failure`, `Null` on a converged fit) rendered for
-/// the `family` and `link` the call fitted and the port's `row_base`.
-pub(crate) fn fit_record(r: FitResult, family: &str, link: &str, row_base: usize) -> Value {
+/// the family and link the call fitted and the port's `row_base`. The record
+/// echoes the parsed options: `family`, `link`, `nagq` (the nodes used, 1
+/// when the model fell back from adaptive quadrature), `dispersion_held`
+/// and `warm_start` (`beta`, `theta`, `dispersion`), as `run_fit` took them;
+/// `argument_notes` are the warnings of the options it did not use, worded
+/// for `port`, apart from the kernel's `notes`.
+pub(crate) fn fit_record(r: FitResult, args: &FitArgs, port: Port, row_base: usize) -> Value {
+    let (family, link) = (args.family, args.link);
+    let argument_notes = options::argument_notes(port, args, &r);
     let messages = notes::note_messages(
         &r.notes,
         &r.beta,
@@ -137,7 +148,6 @@ pub(crate) fn fit_record(r: FitResult, family: &str, link: &str, row_base: usize
     } else {
         let (kind, message) = notes::failure(&Failed {
             family,
-            link,
             mixed: !r.re_groups.is_empty(),
             notes: &r.notes,
             beta: &r.beta,
@@ -152,6 +162,12 @@ pub(crate) fn fit_record(r: FitResult, family: &str, link: &str, row_base: usize
     let cross = r.condvar_cross.as_ref().map_or(Value::Null, cross_record);
     let ranef_levels = Value::IntVec(
         r.ranef_levels
+            .iter()
+            .map(|&n| i64::try_from(n).unwrap_or(i64::MAX))
+            .collect(),
+    );
+    let re_group_levels = Value::IntVec(
+        r.re_group_levels
             .iter()
             .map(|&n| i64::try_from(n).unwrap_or(i64::MAX))
             .collect(),
@@ -181,13 +197,6 @@ pub(crate) fn fit_record(r: FitResult, family: &str, link: &str, row_base: usize
         })
         .collect();
     let lrt = |t: &Option<Result<TermTable, String>>| t.as_ref().map_or(Value::Null, term_record);
-    // The ports promise the `varcorr` vech layout with NaN where the fit
-    // gives no standard error; the kernel leaves it empty on LMM, OLS and GLM.
-    let stddev_se = if r.stddev_se.is_empty() {
-        vec![f64::NAN; r.varcorr.iter().map(Vec::len).sum()]
-    } else {
-        r.stddev_se
-    };
     Value::Record(
         Record::new()
             .with("beta", Value::Vec(r.beta))
@@ -195,7 +204,7 @@ pub(crate) fn fit_record(r: FitResult, family: &str, link: &str, row_base: usize
             .with("vcov", vecs(r.vcov))
             .with("tau2", Value::Vec(r.tau2))
             .with("varcorr", vecs(r.varcorr))
-            .with("stddev_se", Value::Vec(stddev_se))
+            .with("stddev_se", Value::Vec(r.stddev_se))
             .with("aliased", Value::BoolVec(r.aliased))
             .with("dispersion", Value::F64(r.dispersion))
             .with("converged", Value::Bool(r.converged))
@@ -212,14 +221,41 @@ pub(crate) fn fit_record(r: FitResult, family: &str, link: &str, row_base: usize
                 "re_term_index",
                 Value::List(r.re_term_index.into_iter().map(Value::Index).collect()),
             )
-            .with("agq_warning", opt_text(r.agq_warning.as_deref()))
-            .with("reml_warning", opt_text(r.reml_warning.as_deref()))
+            .with("family", text(family))
+            .with("link", text(link))
+            .with(
+                "nagq",
+                Value::I64(if r.agq_warning {
+                    1
+                } else {
+                    i64::from(args.nagq)
+                }),
+            )
+            .with(
+                "dispersion_held",
+                args.dispersion.map_or(Value::Null, Value::F64),
+            )
+            .with(
+                "warm_start",
+                args.warm_start
+                    .as_ref()
+                    .map_or(Value::Null, |(beta, theta, dispersion)| {
+                        Value::Record(
+                            Record::new()
+                                .with("beta", Value::Vec(beta.clone()))
+                                .with("theta", Value::Vec(theta.clone()))
+                                .with("dispersion", dispersion.map_or(Value::Null, Value::F64)),
+                        )
+                    }),
+            )
+            .with("argument_notes", Value::List(argument_notes))
             .with("loglik", Value::F64(r.loglik))
             .with("df", int(r.df))
             .with("reml", Value::Bool(r.reml))
             .with("fitted", Value::Vec(r.fitted))
             .with("ranef", Value::Vec(r.ranef))
             .with("ranef_levels", ranef_levels)
+            .with("re_group_levels", re_group_levels)
             .with("y", Value::Vec(r.y))
             .with("weights", opt_vec(r.weights))
             .with("weight_power", Value::F64(r.weight_power))
@@ -453,6 +489,7 @@ pub(crate) fn read_satterthwaite(mut r: Inputs) -> Result<SatterthwaiteRecord, B
 /// A stored fit's `robust`, as [`fit_record`] writes it.
 pub(crate) fn read_robust(mut r: Inputs) -> Result<RobustRecord, BindError> {
     Ok(RobustRecord {
+        t: r.vec("t")?,
         er: r.vec("er")?,
         f: r.vecs("f")?,
         epe: r.vecs("epe")?,
@@ -485,9 +522,8 @@ pub(crate) fn read_parts(mut r: Inputs) -> Result<StoredParts, BindError> {
     let condvar_cross = match r.opt_record("condvar_cross")? {
         None => None,
         Some(mut c) => {
-            let u32s = |c: &mut Inputs, name: &str| -> Result<Vec<u32>, BindError> {
-                c.usizes(name)?
-                    .into_iter()
+            let u32s = |name: &str, v: Vec<usize>| -> Result<Vec<u32>, BindError> {
+                v.into_iter()
                     .map(|v| {
                         u32::try_from(v).map_err(|_| {
                             BindError::invalid_argument(format!(
@@ -501,9 +537,14 @@ pub(crate) fn read_parts(mut r: Inputs) -> Result<StoredParts, BindError> {
                 family_grouping: c.usize("family_grouping")?,
                 family: c.vec("family")?,
                 tail: c.vec("tail")?,
-                coupling_at: u32s(&mut c, "coupling_at")?,
-                coupling_cols: u32s(&mut c, "coupling_cols")?,
+                coupling_at: u32s("coupling_at", c.usizes("coupling_at")?)?,
+                coupling_cols: u32s("coupling_cols", c.usizes("coupling_cols")?)?,
                 coupling: c.vec("coupling")?,
+                // Absent on a fit saved before the field existed.
+                nested_slots: u32s(
+                    "nested_slots",
+                    c.opt_usizes("nested_slots")?.unwrap_or_default(),
+                )?,
             })
         }
     };
@@ -577,7 +618,7 @@ pub(crate) fn read_model(mut m: Inputs) -> Result<Model, BindError> {
     let design_summary = match m.value("design_summary") {
         Value::Null => None,
         Value::Record(r) => {
-            let mut d = Inputs::new(r);
+            let mut d = Inputs::new(r, m.port());
             Some((d.vec("counts")?, d.vec("s")?, d.vec("c")?))
         }
         Value::List(parts) if parts.len() == 3 => {

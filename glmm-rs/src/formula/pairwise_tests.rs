@@ -354,7 +354,7 @@ fn nan_rows_and_level() {
     }
 }
 
-/// On a robust fit each comparison is the robust `contrast_t` of its `L` (D12),
+/// On a robust fit each comparison is the robust `contrast_t` of its `L`,
 /// with the pass off too, and its notes carried over: CR2 on a random
 /// intercept, HC2 on WLS.
 #[test]

@@ -1,5 +1,4 @@
-# Copy of weights_of_trust/checks/efficiency_lib.R with the cut of spec 2-dcr §3.2
-# (bmh() below); see validation/manifest.json `copied_tools`.
+# Uses the scale-free cut in bmh() below; see validation/manifest.json `copied_tools`.
 # Shared helpers for efficiency_mc.R, efficiency_followup_mc.R and
 # formula_search_mc.R: the fastglmm fit, the B^(-1/2) of CR2 with its cut, the CR2 SE
 # with Pustejovsky–Tipton df, the REML profile fit over one weight parameter,

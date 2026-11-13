@@ -1,4 +1,4 @@
-# Copy of docs/0.9.0/cr2-large-clusters/centered.py; computes no B^(-1/2) by eigendecomposition (lib.dense_cluster does).
+# Computes no B^(-1/2) by eigendecomposition (lib.dense_cluster does).
 """Rounding-safe versions of gls() and quad_cluster(). Same maths as lib.py; only the arrangement of the small matrices changes.
 Split each column once: [X, r] = Yt + U B with Yt' Lam^-1 U = 0. Then for Omega = (Lam - i s)^-1, S_s = U' Omega U, K = I + S_s:
     Yt' (Phi-is)^-1 Yt = Yt' Omega Yt - (Yt' Omega U) K^-1 (U' Omega Yt)     (no large cancellation any more)

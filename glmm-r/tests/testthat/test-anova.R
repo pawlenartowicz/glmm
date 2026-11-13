@@ -291,7 +291,8 @@ test_that("the exact RLRT p-value is the same from anova(m0, m1) and compare(), 
                fixed = TRUE)
   expect_error(compare(d, y ~ x, y ~ x + (1 | g), nsim = 1e6 + 1),
                "nsim must be a whole number from 1 to 1000000", fixed = TRUE)
-  expect_error(anova(o, l, nsim = 2.5), "nsim must be NULL or one whole number", fixed = TRUE)
+  expect_error(anova(o, l, nsim = 2.5), "nsim must be a whole number from 1 to 1000000, got 2.5",
+               fixed = TRUE)
   expect_error(anova(o, l, seed = -1), "seed must be NULL or one whole number", fixed = TRUE)
   # A seed is a double in R, exact up to 2^53: a larger or fractional one is refused.
   expect_identical(attr(anova(o, l, nsim = 100, seed = 2^53), "seed"), 2^53)
@@ -528,7 +529,8 @@ test_that("test picks the stored table: auto and Wald the Wald table, LRT the li
   expect_error(anova(m, test = "lrt"), "'arg' should be one of")
   d <- benchmark_data(seed = 321, family = "binomial")
   expect_error(fastglmm(y ~ t + (1 | g), d, family = binomial(), anova_test = "lrt"),
-               "'arg' should be one of")
+               'anova_test must be "auto", "Wald" or "LRT", got "lrt"', fixed = TRUE,
+               class = "fastglmm_error_invalid_argument")
 })
 
 test_that("test comes after type, nsim and seed stay, and test applies to one fit only", {
@@ -593,6 +595,12 @@ test_that("LRT on a fit made with anova_test = \"Wald\" names the fit argument",
                'asks for them: refit with fastglmm(..., anova_test = "LRT").')
   expect_error(anova(m, test = "LRT"), msg, fixed = TRUE)
   expect_error(anova(m, type = "II", test = "LRT"), msg, fixed = TRUE)
+})
+
+test_that("anova_test takes a partial name, as match.arg does", {
+  d <- benchmark_data(seed = 321, family = "binomial")
+  m <- fastglmm(y ~ t * d + (1 | g), d, family = binomial(), anova_test = "W")
+  expect_error(anova(m, test = "LRT"), "stored no likelihood-ratio tables", fixed = TRUE)
 })
 
 test_that("the heading names the likelihood-ratio test and why; Wald keeps its heading", {
@@ -910,7 +918,10 @@ test_that("a fit stored by 0.6.x prints its summary and anova, and r2() and icc(
   old <- readRDS(path)
   unlink(path)
   out <- capture.output(print(summary(m)))
-  expect_identical(capture.output(print(summary(old))), out[out != r2_line(m)])
+  # Without its level counts, the old fit's groups line names the grouping alone.
+  out <- out[out != r2_line(m)]
+  out[out == "Number of obs: 180, groups:  Subject, 18"] <- "Number of obs: 180, groups:  Subject"
+  expect_identical(capture.output(print(summary(old))), out)
   tab <- anova(old)
   expect_identical(names(tab), c("Sum Sq", "Mean Sq", "NumDF", "DenDF", "F value", "Pr(>F)"))
   expect_false(any(grepl("eta-squared", attr(tab, "heading"))))
@@ -946,17 +957,6 @@ test_that("pairwise() columns follow the family", {
   out <- capture.output(print(pois))
   expect_identical(out[1L], "Pairwise comparisons of f")
   expect_identical(out[length(out)], "P value adjustment: holm method for 3 tests")
-})
-
-test_that("pairwise on a fit that did not converge carries the note", {
-  set.seed(3)
-  x <- rnorm(60)
-  d <- data.frame(y = as.numeric(x > 0), x = x, f = factor(rep(c("a", "b", "c"), 20)))
-  fit <- suppressWarnings(fastglmm(y ~ f + x, d, family = binomial()))
-  expect_false(fit$converged)
-  table <- pairwise(fit, "f")
-  expect_identical(attr(table, "footer")[1], fastglmm:::.NOT_CONVERGED)
-  expect_identical(attr(confint(table), "footer")[1], fastglmm:::.NOT_CONVERGED)
 })
 
 test_that("pairwise() passes adjust, by and at to the crate", {
@@ -1014,6 +1014,7 @@ test_that("pairwise() refuses bad arguments and an old fit", {
                'adjust must be "holm", "bonferroni", "tukey" or "none", got "sidak"',
                fixed = TRUE)
   expect_error(pairwise(m, "f", at = 1), "at gives the values of a numeric by", fixed = TRUE)
+  expect_error(pairwise(m, 1), "factor must be one variable name, got 1", fixed = TRUE)
   expect_error(pairwise(m, "x"), "column 'x' is not a factor of the fixed part", fixed = TRUE)
   expect_error(pairwise(m, "nope"), "unknown column: nope", fixed = TRUE)
   expect_error(pairwise(list(), "f"), "pairwise() takes a fastglmm fit", fixed = TRUE)

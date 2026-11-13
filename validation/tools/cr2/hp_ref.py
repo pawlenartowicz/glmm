@@ -1,4 +1,4 @@
-# Copy of docs/0.9.0/cr2-large-clusters/hp_ref.py; computes no B^(-1/2) by eigendecomposition (lib.dense_cluster does).
+# Computes no B^(-1/2) by eigendecomposition (lib.dense_cluster does).
 """High-precision truth for small clusters. Independent of the quadrature: A = Phi (C Phi)^(-1/2) with the
 inverse root from scaled Denman-Beavers at PREC bits (flint arb, midpoints only).
 Leverage-1 case: uses W = C Phi + s0 Pi0, then subtracts s0^(-1/2) Pi0, with Pi0 the spectral projector on the

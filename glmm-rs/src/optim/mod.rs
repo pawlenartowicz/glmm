@@ -96,9 +96,9 @@ pub(crate) trait GradObjective: Objective {
 pub struct CurvatureHint {
     n: usize,
     inv_hessian: Vec<f64>,
-    /// The response units `c` of the GLMM search the hint was taken in (the
-    /// kernel fits `y/c` on Gamma's inverse link,
-    /// `fit::glmm::fit_glmm_in_units`); 1 everywhere else.
+    /// The factor θ took in the GLMM search the hint was taken in
+    /// (`GlmmWorkspace::search_units`): the response scale `c` on Gamma's
+    /// inverse link, 1 everywhere else.
     pub(crate) units: f64,
 }
 

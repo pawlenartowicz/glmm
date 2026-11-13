@@ -1,13 +1,19 @@
-//! Scratch-bounding capacity constants. `glmm` owns these; they
-//! size the solver's stack buffers, so they are HARD ceilings. These ceilings
-//! live here in `consts` as the single source, no drift.
+//! Crate-wide limits, the single source for each.
 //!
-//! Crate-private. The six `MAX_*` constants reach callers through
-//! `crate::limits`; the Gauss–Hermite tables stay inside the crate.
+//! - Capacity. The six scratch constants `MAX_PRIMARY_Q`, `MAX_EXTRA_GROUPINGS`,
+//!   `MAX_EXTRA_Q`, `MAX_THETA`, `MAX_CROSSED_LEVELS` and `MAX_NAGQ` size the
+//!   solver's stack buffers, so they are HARD ceilings. They define the
+//!   NoZ-scratch envelope (the dense no-Z-matrix path in
+//!   `fit::classify_design`), not a model ceiling: designs over-envelope route
+//!   to the sparse-Z path instead.
+//! - Input ranges. `MAX_DATA_ABS`, `MAX_LOG_OFFSET_ABS` and `MAX_TRIALS` bound
+//!   the data, and the search boxes `GAMMA_PHI_LO`/`GAMMA_PHI_HI` and
+//!   `NB_THETA_LO`/`NB_THETA_HI` bound the dispersion coordinates. The stable
+//!   doors (`fit`, `fit_with_start`, `predict`) refuse an input outside them
+//!   with the constant's name in the message (`fit::common::validate`).
 //!
-//! The `MAX_*` constants below define the NoZ-scratch envelope (the dense
-//! no-Z-matrix path in `fit::classify_design`), not a model ceiling. Designs
-//! over-envelope route to the sparse-Z path instead.
+//! Crate-private. Both groups reach callers through `crate::limits`; the
+//! Gauss–Hermite tables stay inside the crate.
 
 /// Max primary RE width `q_p = 1 + #slopes` (≤ 7 random slopes).
 /// See the module header for the NoZ-scratch envelope distinction.
@@ -56,6 +62,43 @@ pub const MAX_CROSSED_LEVELS: usize = 500;
 /// legal but self-punishing; the k^q cost is the user's to pay (the q_p≤3 cap in
 /// `assert_model_shape` bounds the exponent).
 pub const MAX_NAGQ: u8 = 25;
+
+/// The largest |value| of `y`, of an `x` or `re_columns` entry and of an
+/// offset on a link other than log. Weights and the inverse-Gaussian held
+/// dispersion lie in `[1/MAX_DATA_ABS, MAX_DATA_ABS]`. A square stays below
+/// 1e200, so a sum of squares over any real row count stays finite. There is
+/// no lower bound on a non-zero value.
+pub const MAX_DATA_ABS: f64 = 1e100;
+
+/// The largest |offset| on a log link (Poisson, negative binomial, Gamma and
+/// inverse-Gaussian log): `e^709.8` overflows.
+pub const MAX_LOG_OFFSET_ABS: f64 = 700.0;
+
+/// 2⁵³, the largest binomial weight (trial count): above it consecutive
+/// integers are not exact in f64.
+pub const MAX_TRIALS: f64 = 9_007_199_254_740_992.0;
+
+/// Lower edge of the Gamma `ln φ` outer-search coordinate's box (`φ` the
+/// dispersion, shape `1/φ`). Wide on purpose: φ is a free maximum-likelihood
+/// parameter, and the box only keeps a probe away from overflow in `lnΓ(1/φ)`
+/// and from weights `prior_wᵢ/φ` past `f64` range. The lower edge stays at
+/// 1e-6 because a measurement found that φ below it gives wrong estimates on
+/// weighted fits with adaptive quadrature. A held dispersion
+/// (`Dispersion::Fixed`) whose internal value `v/s` is outside the box is
+/// refused, with `s` a power of two near the geometric mean of the weights.
+pub const GAMMA_PHI_LO: f64 = 1e-6;
+/// Upper edge of the Gamma `ln φ` box; see [`GAMMA_PHI_LO`].
+pub const GAMMA_PHI_HI: f64 = 1e6;
+
+/// Lower edge of the negative-binomial shape search (on ln θ): `θ ∈ [1e-3,
+/// 1e4]`. NB variance is `μ + μ²/θ`, so large θ (near `1e4`) drives `μ²/θ`
+/// toward zero — near-Poisson, low overdispersion; small θ (near `1e-3`) is
+/// the highly overdispersed end, implausibly so beyond this bound for the
+/// validation datasets. A shape seed (`StartValues::dispersion`) outside the
+/// box is refused.
+pub const NB_THETA_LO: f64 = 1e-3;
+/// Upper edge of the negative-binomial shape search; see [`NB_THETA_LO`].
+pub const NB_THETA_HI: f64 = 1e4;
 
 // --- Gauss–Hermite quadrature table (physicists', weight e^{-x²}) ------------
 // Flattened nodes/weights for the odd orders 1,3,5,…,25, concatenated in order.

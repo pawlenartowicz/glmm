@@ -3,7 +3,7 @@
 # one per `inference_references` entry with `generator = "goldens_cr2.R"`.
 #
 # THE ORACLE IS SACRED. These JSONs are the frozen reference the crate's CR2 kernel
-# is validated against (gate G2 of spec 2-dcr). On any glmm disagreement, glmm is
+# is validated against. On any glmm disagreement, glmm is
 # presumed wrong: never relax a tolerance or edit a reference.
 #
 # A BARE RUN OVERWRITES EVERY REFERENCE IT OWNS. Use VALIDATION_ONLY for anything
@@ -15,7 +15,7 @@
 # estimate under Phi; the CR2 SE and Pustejovsky-Tipton df of each coefficient come
 # from tools/cr2/efficiency_lib.R's cr2() (`oracle = "cr2"`, random intercept) or
 # tools/cr2/f2_slope_cr2_mc.R's cr2_phi() (`oracle = "cr2_phi"`), both with the
-# §3.2 cut. The JSON carries coefficients, beta, se and df.
+# scale-free eigenvalue cut. The JSON carries coefficients, beta, se and df.
 
 suite_dir <- normalizePath(file.path(dirname(sub(
   "--file=", "", grep("--file=", commandArgs(FALSE), value = TRUE))), ".."))

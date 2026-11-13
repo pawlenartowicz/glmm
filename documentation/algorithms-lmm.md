@@ -57,6 +57,7 @@ Three real routing decisions sit between `fit`/`fit_with_start` and a returned
    caps in `src/consts.rs`), **or** any extra grouping carries a random slope,
    **or** the total `Crossed` level count exceeds `MAX_CROSSED_LEVELS` (500).
    Otherwise `NoZ`.
+   Before this check a lone slope grouping may be moved first ([dispatch map](algorithms.md#full-dispatch-map)).
 2. **Kernel** — every Gaussian design goes to `accumulate_lmm_rows` +
    `lmm_run_on` (`src/fit/lmm.rs`) → `fit_lmm` (`src/lmm/mod.rs`), which
    evaluates the profiled objective of the fit's criterion through the dense
@@ -322,9 +323,11 @@ an ML fit needs no such shift.
 accumulator (`LmmSuffStats::add_rows_multi`, `src/lmm/kernel.rs`) folds `√wᵢ` into
 every accumulated quantity exactly once per side, so every Gram product carries
 `wᵢ` — but the level counts and df stay raw-row (`n − p`). The θ search runs
-on `ŵᵢ = wᵢ/s` (`accumulate_lmm_rows`), where `s = family::weight_scale(w)` is
-the power of two nearest the geometric mean of the weights and exactly `1`
-when unweighted. This keeps θ's internal box (`PIN_THETA`, `THETA_HI`)
+on `ŵᵢ = wᵢ/s`, where `s` is the power of two nearest the geometric mean of
+the weights and exactly `1` when unweighted (`standardize::Units`, the one
+units step every route shares; see
+[internal units](algorithms.md#internal-units-of-the-response-the-weights-and-the-offset)).
+This keeps θ's internal box (`PIN_THETA`, `THETA_HI`)
 meaningful whatever the raw scale of `w`. Only σ̂² moves with that scale, so
 `lmm_view_to_fit` reports `σ̂²·s`; β̂, the SEs, τ² and varcorr need no
 correction, since the factors of `s` in the internal θ̂ and σ̂² cancel. The weighted
@@ -335,9 +338,16 @@ the deviance (and recomputes the loglik) *after* optimization rather than paying
 it per evaluation. It sits in the `Fit` assembly, the one site every caller
 reaches, so no caller applies it a second time.
 
-**Offset.** A `Data::offset` is an exact response shift under the
-identity link: the core's `Lmm` arm accumulates `y − o` and nothing
-downstream needs to know (same convention as the OLS path).
+**Offset and response units.** A `Data::offset` is an exact response shift
+under the identity link. The kernel fits `(y − o − x̃β̃₀)/c`: `β̃₀` the
+weighted least-squares fit of `y − o` on the standardized design and `c` the
+power of two nearest the weighted root mean square of that residual
+(`standardize::Units`, the same step as the OLS path). The profiled criterion
+reads y only through the residual, so the shift is exact and removes the
+cancellation an uncentred response brings into the Gram's `r²`. `fit_lmm`
+maps β back as `c·β̃ + β̃₀` before the column map; σ², τ², varcorr and the
+variances take `c²`, the random effects `c`, and the deviance `+2ν·ln c`
+(`ν = n` on ML, `n − p` on REML). θ, relative to σ, does not move.
 
 The objective returns `f64::INFINITY` on any Cholesky failure or non-positive σ̂²
 (every kernel — dense, blocked and sparse — also on a residual r² ≤ dim·ε·yᵀy,
@@ -868,8 +878,9 @@ Binomial, Poisson, negative binomial and every GLMM have no df.
 **Intervals.** The ports' `confint` (R `confint()`, Python `Fit.confint()`)
 call one Rust function, `orchestrate::confint`: `β̂_j ± q·se_j`, with `q` the
 Student t quantile on `coef_df[j]` where that df is finite and positive and
-the normal quantile otherwise (a z row, a pass switched off or failed),
-taken at `(1 − level)/2` and its complement as `confint.lm` takes them.
+NaN where the df was lost under `residual`, `satterthwaite`,
+`bell_mccaffrey` or `pustejovsky_tipton`, and the normal quantile under
+`none`, `disabled` or `failed`, taken at `(1 − level)/2` and its complement as `confint.lm` takes them.
 
 **Code**: `pass`, `pass_targets`, `stencil`, `assemble`, `ETA`, `ETA_GRAD`
 (`src/lmm/satterthwaite.rs`); `contest_1d`, `contest_md`, `fstat_ddf`
@@ -922,20 +933,7 @@ every held search. Only differences of the deviance enter `ζ`, so every
 `−Σ log wᵢ`) cancels, and `dev` below is the kernel's ML deviance
 (`dev(θ) = log|V| + N·ln σ̂²`, [above](#profiled-reml-and-ml-objectives)).
 
-**Variance parameters.** The coordinates are lme4's: per random-effect block,
-in θ order, the column-major `vech` entries that are not structural zeros (an SD
-on the diagonal, a correlation below it), then σ, all in the caller's units. A
-vector `v` maps to the kernel's θ̃ through the relative covariance. With `s` the
-prior-weight scale the kernel runs under
-([prior weights](#profiled-reml-and-ml-objectives)), the kernel's residual
-variance is `σ_int² = σ²/s`. Each block's `Σ = D·R·D` (`D` the SDs, `R` the
-correlations) is divided by `σ_int²` and factored by `semidef_lower_chol` with
-the trace floor; a factor that does not reproduce that matrix to `1e-8·tr`
-means `R` is not positive semidefinite, and the point's deviance is `+∞`. The
-factor, packed as the caller's θ, goes onto the fitted design through
-`LmmGroupings::theta_caller_to_design`, structural entries zeroed. One kernel
-evaluation at that θ̃ gives `dev_p = dev(θ̃)` with σ profiled and
-`σ̂² = r²/N`. The ML deviance at the given σ is
+**Variance parameters.** The coordinates are lme4's: per random-effect block, in θ order, the column-major `vech` entries that are not structural zeros (an SD on the diagonal, a correlation below it), then σ, all in the caller's units. A vector `v` maps to the kernel's θ̃ through the relative covariance. With `s` the prior-weight scale the kernel runs under ([prior weights](#profiled-reml-and-ml-objectives)), the kernel's residual variance is `σ_int² = σ²/s`. Each block's `Σ = D·R·D` (`D` the SDs, `R` the correlations) is divided by `σ_int²`, moved onto the fitted design (`Σ̃ = M⁻¹·Σ·M⁻ᵀ`, `M` the map `src/lmm/re_map.rs` calls `N`) and factored there by `semidef_lower_chol` with the trace floor. On the fitted design the columns are commensurate; in the caller's units a slope column's scale or centering shift can put a diagonal below the floor and cut a real direction. A factor that does not reproduce `Σ̃` to `1e-8·tr` means `R` is not positive semidefinite, and the point's deviance is `+∞`. The factor, packed, is θ̃, structural entries zeroed. One kernel evaluation at that θ̃ gives `dev_p = dev(θ̃)` with σ profiled and `σ̂² = r²/N`. The ML deviance at the given σ is
 
 ```
 dev(v) = log|V| + N·ln σ_int² + r²/σ_int² − N
@@ -1005,8 +1003,8 @@ at θ and is not profiled.
 `root`, `path` (`src/inference/profile.rs`); `ProfileKernel`, `hold_var`,
 `hold_beta`, `var_dev`, `beta_dev`, `theta_into` (`src/lmm/profile.rs`);
 `caller_map_into` (`src/lmm/satterthwaite.rs`); `semidef_lower_chol`,
-`theta_caller_to_design` (`src/lmm/re_map.rs`); `fit_cold_keep_workspace`
-(`src/fit/mod.rs`); `profile_intervals`, `profile_names`
+`LmmGroupings::block_std` (`src/lmm/re_map.rs`); `fit_cold_keep_workspace`
+(`src/fit/mod.rs`); `FitWorkspace::profile_kernel` (`src/fit/core.rs`); `profile_intervals`, `profile_names`
 (`src/orchestrate.rs`). **Convention**: lme4 2.0-6's
 `confint(method = "profile")` with `signames = FALSE` names; its cutoff, its
 ML refit of a REML fit, and its one-sided intervals at a limit; not its ζ

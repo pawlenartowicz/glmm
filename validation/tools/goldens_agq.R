@@ -102,7 +102,7 @@ lme4_converged <- function(m)
 
 # m3_goldens specs carry a bare `data` name (no `source` field like the curated
 # manifest.datasets rungs), so the empirical/simulated split is read off the
-# `sim_` prefix convention directly (mirrors Step 2's split-by-filename).
+# `sim_` prefix convention directly.
 data_dir_of_name <- function(name)
   file.path(suite_dir, "data", if (startsWith(name, "sim_")) "simulated" else "empirical")
 

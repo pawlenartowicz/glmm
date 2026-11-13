@@ -32,7 +32,8 @@ pub struct Design<'a> {
 
 impl<'a> Design<'a> {
     /// The design `x`, row-major `n × p` (element `(i, j)` is `x[i * p + j]`),
-    /// with no ids, unit weights and no offset.
+    /// with no ids, unit weights and no offset. Every entry finite with
+    /// `|x| ≤` [`MAX_DATA_ABS`](crate::limits::MAX_DATA_ABS).
     pub fn new(x: &'a [f64], n: usize, p: usize) -> Design<'a> {
         Design {
             x,
@@ -47,7 +48,8 @@ impl<'a> Design<'a> {
     }
 
     /// Columns that a random slope reads and that are not fixed-effect
-    /// columns, row-major `n × s` (element `(i, j)` is `z[i * s + j]`), finite:
+    /// columns, row-major `n × s` (element `(i, j)` is `z[i * s + j]`), each
+    /// entry finite with `|z| ≤` [`MAX_DATA_ABS`](crate::limits::MAX_DATA_ABS):
     /// lme4's `y ~ 1 + (x | g)`, where `x` is in no fixed term. A slope index
     /// `c` names design column `c` of `x` when `c < p` and column `c − p` of
     /// `z` when `p ≤ c < p + s`, and every column of `z` must be read by at
@@ -67,15 +69,17 @@ impl<'a> Design<'a> {
         self
     }
 
-    /// Per-row prior weights, length `n`, finite and `> 0`. See
-    /// [`Data::weights`] for what they mean on each family.
+    /// Per-row prior weights, length `n`, within `[1/MAX_DATA_ABS,
+    /// MAX_DATA_ABS]` ([`MAX_DATA_ABS`](crate::limits::MAX_DATA_ABS)); on a binomial model also at most
+    /// [`MAX_TRIALS`](crate::limits::MAX_TRIALS). See [`Data::weights`] for
+    /// what they mean on each family.
     pub fn weights(mut self, w: &'a [f64]) -> Design<'a> {
         self.weights = Some(w);
         self
     }
 
-    /// Per-row offset on the linear-predictor scale, length `n`, finite. See
-    /// [`Data::offset`].
+    /// Per-row offset on the linear-predictor scale, length `n`, with the
+    /// bounds of [`Data::offset`].
     pub fn offset(mut self, o: &'a [f64]) -> Design<'a> {
         self.offset = Some(o);
         self
@@ -103,7 +107,8 @@ pub struct Data<'a> {
 
 impl<'a> Data<'a> {
     /// The design `x`, row-major `n × p`, and the response `y`, length `n`,
-    /// with no ids, unit weights and no offset.
+    /// with no ids, unit weights and no offset. Every entry of `x` and `y`
+    /// finite with magnitude at most [`MAX_DATA_ABS`](crate::limits::MAX_DATA_ABS).
     pub fn new(x: &'a [f64], y: &'a [f64], n: usize, p: usize) -> Data<'a> {
         Data {
             design: Design::new(x, n, p),
@@ -124,8 +129,10 @@ impl<'a> Data<'a> {
         self
     }
 
-    /// Per-row prior weights `wᵢ`, length `n`, finite and `> 0` — lme4's
-    /// `weights=`. Without them every row has unit weight.
+    /// Per-row prior weights `wᵢ`, length `n`, within `[1/MAX_DATA_ABS,
+    /// MAX_DATA_ABS]` ([`MAX_DATA_ABS`](crate::limits::MAX_DATA_ABS)) — lme4's `weights=`. Without them every row has
+    /// unit weight. A binomial weight is also at most
+    /// [`MAX_TRIALS`](crate::limits::MAX_TRIALS) (2⁵³).
     /// For an aggregated binomial, `y` is the success PROPORTION and `wᵢ` the
     /// trial count: this is exactly lme4's `cbind(s, m−s)` objective, whose
     /// deviance differs from the expanded-Bernoulli one only by a data-only
@@ -137,9 +144,10 @@ impl<'a> Data<'a> {
     /// 1989 §2.2), not glmmTMB's `wᵢ` multiplying the log-density. Rescaling
     /// every weight by one constant `c` changes nothing about the fitted mean
     /// model or the SEs, and moves `dispersion` by exactly `c` — the fit
-    /// depends on the RELATIVE weights only (the GLM IRLS's own stopping
-    /// tolerance, `glm::DEVIANCE_TOL`, is a relative rule on the deviance, so
-    /// it is scale-free too for `|deviance| ≫ 0.1`). Moment estimates (σ̂²,
+    /// depends on the RELATIVE weights only. Every route fits on the weights
+    /// divided by the power of two nearest their geometric mean
+    /// (`standardize::Units`), so this holds on every route and solver,
+    /// stopping rules included. Moment estimates (σ̂²,
     /// inverse-Gaussian and Gamma-GLM's Pearson φ̂) divide by the raw row count
     /// `n−p`, never `Σwᵢ−p`. Binomial weights are trial counts (no dispersion
     /// to divide); Poisson's fit is identical either way (the two conventions
@@ -158,9 +166,8 @@ impl<'a> Data<'a> {
     /// - GLM fixed-only, any family (Binomial/Poisson/Gamma/NB): weighted IRLS —
     ///   `wᵢ` multiplies the working weight and deviance; both Gamma's and an
     ///   inverse-Gaussian's Pearson φ̂ are `Σwᵢrᵢ²/(n−p)`, `summary(glm)`'s value;
-    ///   Gamma's separate maximum-likelihood φ̂ (used only for `loglik`) takes
-    ///   `ŵᵢ = wᵢ/s` in the shape equation (precision weights: this Newton
-    ///   search is not scale-free on raw `w`); the null
+    ///   Gamma's separate maximum-likelihood φ̂ (used only for `loglik`)
+    ///   solves the shape equation on the same `ŵᵢ = wᵢ/s`; the null
     ///   deviance uses the weighted mean. Matches R
     ///   `glm(weights=)` (`fit_glm_gamma_weighted_matches_r`,
     ///   `fit_glm_binomial_weighted_aggregated_matches_r`,
@@ -218,7 +225,10 @@ impl<'a> Data<'a> {
     }
 
     /// Per-row additive offset `oᵢ` on the linear-predictor scale, length `n`,
-    /// finite — R's `offset=`: `η = o + Xβ (+ Zb)`, every family, every solver
+    /// with `|oᵢ| ≤` [`MAX_LOG_OFFSET_ABS`](crate::limits::MAX_LOG_OFFSET_ABS)
+    /// on a log link (Poisson, negative binomial, Gamma and inverse-Gaussian
+    /// log) and `|oᵢ| ≤` [`MAX_DATA_ABS`](crate::limits::MAX_DATA_ABS) on
+    /// another link — R's `offset=`: `η = o + Xβ (+ Zb)`, every family, every solver
     /// path. A fixed known contribution, NOT a parameter: it adds no column to
     /// `X` and never appears in `beta`/`se`/`vcov`/`df`. The canonical use is a
     /// Poisson exposure, `offset = ln(exposure)`. Gaussian identity-link paths

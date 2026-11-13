@@ -651,9 +651,11 @@ pub(crate) fn erfc_region3_r<T: crate::scalar::Scalar>(s: T) -> (T, T, T) {
 /// `√π`.
 pub(crate) const SQRT_PI: f64 = 1.772_453_850_905_516;
 
-/// `ln Γ(x)` for `x > 0`, accurate to ~1e-15 (full double). Lanczos
-/// approximation, `g = 7`, 9-coefficient series (Lanczos 1964; coefficients the
-/// widely-used Godfrey/Boost set) — relative error < 2e-16 on `x ∈ (0, ∞)`.
+/// `ln Γ(x)` for `x > 0`. Lanczos approximation, `g = 7`, 9-coefficient
+/// series (Lanczos 1964; coefficients the widely-used Godfrey/Boost set) —
+/// relative error < 2e-16 in exact arithmetic. In f64 the shift `x − 1` keeps
+/// x only to about 1.1e-16 absolute, so below 1 the series loses about
+/// `1.1e-16 / x` absolute; the branch below 1e-8 caps that loss.
 /// Used by the Gamma log-density term (`family::gamma_dispersion_term`, in the
 /// mixed ML objective and the GLM log-likelihood): the dispersion enters
 /// through `lnΓ(1/φ)`, and `ln φ` is a coordinate of the mixed outer search,
@@ -675,7 +677,15 @@ pub(crate) fn ln_gamma(x: f64) -> f64 {
     ];
     const G: f64 = 7.0;
     const LN_SQRT_2PI: f64 = 0.918_938_533_204_672_74; // ½·ln(2π)
-                                                       // Reflection is unnecessary here (callers pass x>0), so use the direct series.
+
+    // Below 1e-8 the shift `x − 1` keeps fewer than half of x's digits, and
+    // below about 1.1e-16 it rounds to −1 and the series divides by zero;
+    // `lnΓ(x) = lnΓ(1 + x) − ln x` has neither problem.
+    const TINY: f64 = 1e-8;
+    if x < TINY {
+        return ln_gamma(1.0 + x) - x.ln();
+    }
+    // Reflection is unnecessary here (callers pass x>0), so use the direct series.
     let x = x - 1.0;
     let mut a = C[0];
     let t = x + G + 0.5;
@@ -1929,6 +1939,18 @@ mod tests {
                 (got - want).abs() <= 1e-13 * want.abs().max(1.0),
                 "ln_gamma({x}) = {got}, want {want}"
             );
+        }
+    }
+
+    /// `lnΓ(x) = −ln x − γx + O(x²)`, so below 1e-12 `lnΓ(x) + ln x` is under
+    /// 1e-12. Without the small-x branch the series divides by zero below
+    /// about 1.1e-16 and returns +inf.
+    #[test]
+    fn ln_gamma_is_finite_for_tiny_x() {
+        for x in [1e-20, 1e-100, 1e-300] {
+            let got = ln_gamma(x);
+            assert!(got.is_finite(), "ln_gamma({x}) = {got}");
+            assert!((got + x.ln()).abs() <= 1e-12, "ln_gamma({x}) = {got}");
         }
     }
 

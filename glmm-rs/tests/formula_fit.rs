@@ -586,43 +586,6 @@ fn constant_binomial_response_is_separated_not_converged() {
     }
 }
 
-/// A non-converged GLMM whose second grouping has more levels than the first,
-/// so the size rule swaps them, returns its level counts in declaration order
-/// instead of panicking while it undoes the swap on its empty random effects.
-#[test]
-fn separated_glmm_with_swapped_groupings_returns_declaration_order() {
-    let n = 40;
-    let g: Vec<String> = (0..n).map(|i| format!("g{}", i % 8)).collect();
-    let h: Vec<String> = (0..n).map(|i| format!("h{}", i % 20)).collect();
-    let table = Table {
-        columns: vec![
-            ("y".into(), Column::Numeric(vec![0.0; n])),
-            (
-                "x".into(),
-                Column::Numeric((0..n).map(|i| i as f64 / n as f64).collect()),
-            ),
-            ("g".into(), Column::factor_from_labels(&g)),
-            ("h".into(), Column::factor_from_labels(&h)),
-        ],
-        n,
-    };
-    let model = glmm::formula::fit(
-        "y ~ x + (1 | g) + (1 | h)",
-        &table,
-        logit(),
-        &FitOptions::default(),
-    )
-    .unwrap();
-    let fit = model.fit();
-    assert!(!fit.converged());
-    assert!(fit
-        .diagnostics()
-        .notes
-        .iter()
-        .any(|n| matches!(n, Note::Separated)));
-    assert_eq!(fit.ranef_levels(), &[8, 20]);
-}
-
 /// The formula door returns the kernel's refusal of an input as
 /// `Error::Fit`: quadrature on a GLMM with crossed groupings.
 #[test]
@@ -984,9 +947,9 @@ fn transform_of_a_factor_column_is_rejected_as_not_numeric() {
 fn intercept_written_first_becomes_primary_over_slope() {
     // Formula order decides the primary grouping: `(1|g)` written before
     // `(1+x|h)` makes `g` primary even though the parser's slope stage runs
-    // before its intercept stage. The slope block then sits on the EXTRA
-    // grouping — which is itself a sparse-routing trigger (algorithms-lmm.md),
-    // the orientation validation rung 24 (`sim_sparse_gamma`) exercises.
+    // before its intercept stage. Lowering keeps the written order, so the
+    // slope block sits on the EXTRA grouping here; the fit then moves the slope
+    // grouping first (the size rule in `fit/common.rs`).
     let table = Table {
         columns: vec![
             ("y".into(), Column::Numeric(vec![1.0, 2.0, 3.0, 4.0])),
@@ -1219,7 +1182,8 @@ fn a_dropped_single_level_grouping_is_not_checked() {
 /// `g/one` with one `one` per `g` gives a nested grouping with the same groups
 /// as `g`, and a factor slope constant within `g` with two levels is a slope
 /// the data cannot separate from the intercept. A slope that varies within
-/// groups gets no note.
+/// groups gets no note. The same grouping spelled as an interaction with a
+/// one-level factor is noted too.
 #[test]
 fn formula_door_shares_the_identification_check() {
     let n = 96;
@@ -1278,6 +1242,10 @@ fn formula_door_shares_the_identification_check() {
         slopes: vec![0],
     };
     assert_eq!(notes("y ~ x + (1 | g/one)"), [format!("{repeated:?}")]);
+    assert_eq!(
+        notes("y ~ x + (1 | g) + (1 | g:one)"),
+        [format!("{repeated:?}")]
+    );
     assert_eq!(notes("y ~ cat + (1 + cat | g)"), [format!("{constant:?}")]);
     assert!(notes("y ~ x + (1 + x | g)").is_empty());
 }
@@ -1296,9 +1264,12 @@ fn re_groups_align_with_varcorr_blocks() {
     // Re-pinned 2026-10-02 with the per-search BOBYQA start radii (LMM blind
     // start 0.5): the search takes another path to the same optimum, plate sd
     // 1.2e-7 and sample sd 1.9e-7 relative, REML criterion 1.5e-12 lower, no
-    // converged, singular or pinned flag changed.
-    const PLATE_SD: f64 = 0.846704534225002;
-    const SAMPLE_SD: f64 = 1.9315579384727732;
+    // converged, singular or pinned flag changed. Moved by round-off when the
+    // response got one units step (shift and scale): plate sd 2.5e-7 and
+    // sample sd 2.3e-7 relative, REML criterion 2.2e-11 higher, no flag
+    // changed.
+    const PLATE_SD: f64 = 0.8467043253286997;
+    const SAMPLE_SD: f64 = 1.9315583874608409;
 
     let data = rows(include_str!(
         "../../validation/data/empirical/Penicillin.csv"
@@ -1668,7 +1639,7 @@ mod reml_rule {
             bits(&result_f64s(want)),
             "{ctx}: f64 bits"
         );
-        got.reml_warning.clone_from(&want.reml_warning);
+        got.reml_warning = want.reml_warning;
         assert_eq!(format!("{got:?}"), format!("{want:?}"), "{ctx}");
     }
 
@@ -1681,7 +1652,7 @@ mod reml_rule {
     #[test]
     fn run_fit_reml_true_ignored_with_warning_on_binomial_glmm() {
         let on = binomial(GLMM, Some(true));
-        assert!(on.reml_warning.is_some(), "Some(true) on a GLMM must warn");
+        assert!(on.reml_warning, "Some(true) on a GLMM must warn");
         assert!(!on.reml);
         assert_same_result(on, &binomial(GLMM, None), "GLMM Some(true) vs None");
     }
@@ -1689,7 +1660,7 @@ mod reml_rule {
     #[test]
     fn run_fit_reml_false_silent_on_binomial_glmm() {
         let off = binomial(GLMM, Some(false));
-        assert_eq!(off.reml_warning, None);
+        assert!(!off.reml_warning);
         assert_same_result(off, &binomial(GLMM, None), "GLMM Some(false) vs None");
     }
 
@@ -1698,7 +1669,7 @@ mod reml_rule {
         let on = gaussian(OLS, Some(true));
         let none = gaussian(OLS, None);
         assert!(on.reml && !none.reml);
-        assert_eq!(on.reml_warning, None);
+        assert!(!on.reml_warning);
         assert_eq!(bits(&on.beta), bits(&none.beta));
         assert_eq!(bits(&on.se), bits(&none.se));
         assert_eq!(on.dispersion.to_bits(), none.dispersion.to_bits());
@@ -1714,7 +1685,7 @@ mod reml_rule {
     fn run_fit_reml_true_accepted_on_gaussian_mixed() {
         let on = gaussian(LMM, Some(true));
         assert!(on.reml);
-        assert_eq!(on.reml_warning, None);
+        assert!(!on.reml_warning);
         assert_same_result(on, &gaussian(LMM, None), "LMM Some(true) vs None");
     }
 
@@ -1729,7 +1700,7 @@ mod reml_rule {
         );
         for r in [&none, &on, &off] {
             assert!(has_dropped_note(r), "{:?}", r.notes);
-            assert_eq!(r.reml_warning, None);
+            assert!(!r.reml_warning);
         }
         assert!(on.reml);
         let want = cold(OLS, &sleepstudy(), Family::Gaussian, Some(true));
@@ -1744,8 +1715,8 @@ mod reml_rule {
         let none = binomial(g, None);
         let (on, off) = (binomial(g, Some(true)), binomial(g, Some(false)));
         assert!(has_dropped_note(&none) && has_dropped_note(&on) && has_dropped_note(&off));
-        assert!(on.reml_warning.is_some(), "Some(true) on a GLM must warn");
-        assert_eq!(off.reml_warning, None);
+        assert!(on.reml_warning, "Some(true) on a GLM must warn");
+        assert!(!off.reml_warning);
         assert_same_result(on, &none, "dropped binomial Some(true) vs None");
         assert_same_result(off, &none, "dropped binomial Some(false) vs None");
     }
@@ -1762,7 +1733,7 @@ mod reml_rule {
         let want = cold(LMM, &sleepstudy(), Family::Gaussian, Some(false));
         let d = want.diagnostics();
         assert!(!r.reml && !want.reml());
-        assert_eq!(r.reml_warning, None);
+        assert!(!r.reml_warning);
         assert_eq!(r.converged, d.converged);
         assert_eq!(
             (r.singular, &r.aliased, &r.pinned),
@@ -1832,7 +1803,7 @@ mod reml_rule {
     }
 }
 
-/// The readers of a fit's weights (§3.1): a fit with `weight_power = 0.5`
+/// The readers of a fit's weights: a fit with `weight_power = 0.5`
 /// reads the weights raised to 0.5 wherever the claimed fit on `w^0.5`
 /// reads its own: `rss`, `r_squared`, `adj_r_squared`, the comparison's F
 /// (its `rss` from `anova::Model::from_fit`), and the simulated draws, by the
@@ -1971,8 +1942,8 @@ mod weight_power_readers {
     }
 }
 
-/// Robust fits (spec 2-dcr §3.2, §3.3): the CR2 and HC2 standard errors and
-/// df through the formula door, against clubSandwich (G5), and the default.
+/// Robust fits: the CR2 and HC2 standard errors and
+/// df through the formula door, against clubSandwich, and the default.
 mod robust_fits {
     use super::*;
     use glmm::{SeType, WeightPower};
@@ -2064,7 +2035,7 @@ mod robust_fits {
         ("cr2_lme_gls_estimated_n100", "hc2_n100", "y ~ 1 + x1 + x2"),
     ];
 
-    /// G5: clubSandwich's CR2 on nlme's `lme` (one grouping factor) and HC2
+    /// clubSandwich's CR2 on nlme's `lme` (one grouping factor) and HC2
     /// on `gls`, REML, at the reference's power (1, or nlme's δ̂ shared),
     /// SE and df to 1e-7. The variance estimates are printed beside them:
     /// nlme settles τ² to about 3e-7 relative, which bounds what the SEs can
@@ -2145,7 +2116,7 @@ mod robust_fits {
         }
     }
 
-    /// The default `se_type` (§3.3, D22, G9): robust on a REML δ fit with one
+    /// The default `se_type`: robust on a REML δ fit with one
     /// grouping factor and no random slope, or with none; the model SE on a
     /// δ fit with a random slope, an ML δ fit, claimed weights and no weights.
     #[test]
@@ -2207,7 +2178,7 @@ mod robust_fits {
         assert_eq!(m.fit().se_type(), SeType::Model);
     }
 
-    /// G4 and G5 end to end: the default call on WLS data is the δ fit with
+    /// End to end: the default call on WLS data is the δ fit with
     /// HC2; with a grouping factor, CR2. Each equals the fit named at its own
     /// δ̂ with `se_type = Robust`, and nlme's δ̂ is printed beside it.
     #[test]
@@ -2237,7 +2208,7 @@ mod robust_fits {
         }
     }
 
-    /// Review focus 3: with `se_for` naming some columns, the robust `se`
+    /// With `se_for` naming some columns, the robust `se`
     /// and `vcov` are NaN outside them and equal the full fit's on them.
     #[test]
     fn se_for_is_honoured_on_a_robust_fit() {
@@ -2259,7 +2230,7 @@ mod robust_fits {
         assert_eq!(s.coef_df()[1], f.coef_df()[1]);
     }
 
-    /// Review focus 4: an aliased column on a robust fit is NaN in `se`,
+    /// An aliased column on a robust fit is NaN in `se`,
     /// `vcov` and `coef_df`, the rest equals the fit without it, a contrast
     /// on it gets `AliasedColumn`, and the robust notes name caller columns.
     #[test]
@@ -2395,7 +2366,7 @@ mod robust_fits {
         (a / b - 1.0).abs()
     }
 
-    /// D12: on a robust fit `contrast_t` reads the pieces, the Satterthwaite
+    /// On a robust fit `contrast_t` reads the pieces, the Satterthwaite
     /// pass off too. A unit vector gives the coefficient's robust SE and df,
     /// another contrast `√(lᵀVl)` on its own df; one-row `contrast_f` is t²
     /// on that df, and a joint test is the model fit's F with
@@ -2510,7 +2481,7 @@ mod robust_fits {
         assert_eq!((t.se, t.df), (fit.se()[1], fit.coef_df()[1]));
     }
 
-    /// Review focus 3 for contrasts: with `se_for` naming x1 only, a robust
+    /// For contrasts, with `se_for` naming x1 only, a robust
     /// contrast on x1 equals the full fit's, and one touching another
     /// column is NaN.
     #[test]
@@ -2531,7 +2502,7 @@ mod robust_fits {
         }
     }
 
-    /// Review focus 4 for contrasts: on a robust fit with an aliased column,
+    /// For contrasts, on a robust fit with an aliased column,
     /// a contrast that leaves it out equals the fit without the column, in
     /// caller indices.
     #[test]
@@ -2571,32 +2542,40 @@ mod robust_fits {
 }
 
 /// A table with no rows is refused by the fit entry, not fitted to a NaN fit
-/// with its empty grouping dropped as "one level".
+/// with its empty grouping dropped as "one level"; also when a fixed effect is
+/// a factor, which would otherwise be refused as a factor with one level.
 #[test]
 fn zero_row_table_is_refused() {
-    let table = Table {
+    let empty = || Table {
         columns: ["y", "x", "g"]
             .into_iter()
             .map(|c| (c.into(), Column::Numeric(vec![])))
             .collect(),
         n: 0,
     };
-    let err = glmm::formula::fit(
-        "y ~ x + (1 | g)",
-        &table,
-        Family::Gaussian,
-        &FitOptions::default(),
-    )
-    .err()
-    .expect("zero rows must be refused");
-    assert!(
-        matches!(err, glmm::formula::Error::Fit(glmm::FitError::Shape(_))),
-        "{err:?}"
-    );
-    assert_eq!(
-        err.to_string(),
-        "Data has no rows (n = 0); a fit needs at least one row"
-    );
+    let numeric = empty();
+    let mut with_factor = empty();
+    with_factor
+        .columns
+        .push(("f".into(), Column::factor_from_labels(&[])));
+    let cases = [
+        ("y ~ x + (1 | g)", &numeric),
+        ("y ~ f + x + (1 | g)", &with_factor),
+    ];
+    for (formula, table) in cases {
+        let err = glmm::formula::fit(formula, table, Family::Gaussian, &FitOptions::default())
+            .err()
+            .expect("zero rows must be refused");
+        assert!(
+            matches!(err, glmm::formula::Error::Fit(glmm::FitError::Shape(_))),
+            "{formula}: {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "Data has no rows (n = 0); a fit needs at least one row",
+            "{formula}"
+        );
+    }
 }
 
 /// A repeated column name or a repeated level label inside a factor is

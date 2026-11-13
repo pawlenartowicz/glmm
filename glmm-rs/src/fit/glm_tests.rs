@@ -1134,10 +1134,11 @@ fn fit_glm_gamma_log_matches_r() {
 /// the Gamma φ̂ stays and the inverse-Gaussian φ̂ scales by `1/c`. So the frozen
 /// R fits of `fit_glm_gamma_log_matches_r` and `fit_glm_igauss_matches_r` are
 /// the reference, and a divergence guard on |η| itself refuses these honest
-/// fits. At y·1e±250 (Gamma) and y·1e-120 (inverse-Gaussian) the variance
-/// μ² or μ³ itself leaves the f64 range, which the Pearson φ̂ must survive. At
-/// y·1e120 the inverse-Gaussian Fisher weight 1/μ puts the factor of X'WX near
-/// 1e-59, which an absolute floor on its diagonal turned into NaN SEs.
+/// fits. At y·1e-250 (Gamma) and y·1e-120 (inverse-Gaussian) the variance
+/// μ² or μ³ itself leaves the f64 range, which the Pearson φ̂ must survive.
+/// At y·1e99, the largest scale whose response stays within `MAX_DATA_ABS`,
+/// the inverse-Gaussian Fisher weight 1/μ puts the factor of X'WX near 1e-49,
+/// which an absolute floor on its diagonal would turn into NaN SEs.
 #[test]
 fn fit_glm_log_link_converges_in_any_response_units() {
     const GAMMA_BETA: [f64; 3] = [0.449945830683142, 0.565796931228723, 0.526238083012209];
@@ -1156,11 +1157,10 @@ fn fit_glm_log_link_converges_in_any_response_units() {
         (gamma, 1e-14, GAMMA_BETA, GAMMA_SE, GAMMA_DISP),
         (gamma, 1e14, GAMMA_BETA, GAMMA_SE, GAMMA_DISP),
         (gamma, 1e-250, GAMMA_BETA, GAMMA_SE, GAMMA_DISP),
-        (gamma, 1e250, GAMMA_BETA, GAMMA_SE, GAMMA_DISP),
         (ig, 1e-14, IG_BETA, IG_SE, IG_DISP),
         (ig, 1e14, IG_BETA, IG_SE, IG_DISP),
         (ig, 1e-120, IG_BETA, IG_SE, IG_DISP),
-        (ig, 1e120, IG_BETA, IG_SE, IG_DISP),
+        (ig, 1e99, IG_BETA, IG_SE, IG_DISP),
     ];
     for (family, c, ref_beta, ref_se, ref_disp) in cases {
         let (x, y, n) = match family {
@@ -1806,7 +1806,8 @@ fn fit_glm_poisson_zero_count_category_with_offset_stays_separated() {
 /// intercept only): the deviance is rounding noise and the maximum-likelihood
 /// φ̂ goes to ~1e-16, where the log-likelihood rises without bound. The
 /// reported `loglik` is the value at that φ̂, so it must be at least the
-/// log-likelihood at any held φ. R's `logLik` is NaN here (its `Gamma()$aic`
+/// log-likelihood at any held φ down to `GAMMA_PHI_LO`, the smallest held
+/// value the door accepts. R's `logLik` is NaN here (its `Gamma()$aic`
 /// at a deviance that rounds below zero).
 #[test]
 fn fit_glm_gamma_exact_fit_loglik_is_the_maximum() {
@@ -1836,7 +1837,7 @@ fn fit_glm_gamma_exact_fit_loglik_is_the_maximum() {
     };
     let ml = fit(Dispersion::Default);
     assert!(ml.converged(), "exact Gamma fit must converge");
-    for phi in [1e-4, 1e-8, 1e-12] {
+    for phi in [1e-4, crate::consts::GAMMA_PHI_LO] {
         let held = fit(Dispersion::Fixed(phi));
         assert!(
             ml.loglik >= held.loglik,
@@ -2378,15 +2379,16 @@ fn fit_glm_reciprocal_links_without_intercept_seed_on_a_positive_column() {
     }
 }
 
-/// A prior weight of 5e-324 on the one row that separates the second column
-/// from the first: X'WX is singular to rounding, so the first solve fails on
+/// A prior weight of 1e-100, the smallest allowed, on the one row that
+/// separates the second column from the first: X'WX is singular to rounding
+/// (`3 + 1e-100` rounds to 3), so the first solve fails on
 /// the Gram and on its QR rebuild. No step was taken, so β is NaN, not the
 /// cold start's 0 (R's pivoted QR reports this column NA instead).
 #[test]
 fn fit_glm_first_solve_failure_reports_no_coefficients() {
     let x = [1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
     let y = [1.0, 2.0, 3.0, 2.5];
-    let w = [5e-324, 1.0, 1.0, 1.0];
+    let w = [1e-100, 1.0, 1.0, 1.0];
     let data = crate::Data::new(&x, &y, 4, 2).weights(&w);
     let spec = ModelSpec::fixed(Family::Gamma {
         link: crate::GammaLink::Log,
@@ -3096,9 +3098,17 @@ fn fit_glm_nb_theta_low_edge_matches_mass() {
     );
     // Sane boundary behavior: inside the bracket, near (but not AT) the low end.
     assert!(
-        f.dispersion > super::glm::NB_THETA_LO && f.dispersion < 1e-2,
+        f.dispersion > crate::consts::NB_THETA_LO && f.dispersion < 1e-2,
         "θ̂ = {} must sit interior near NB_THETA_LO",
         f.dispersion
+    );
+    assert!(
+        !f.diagnostics
+            .notes
+            .iter()
+            .any(|n| matches!(n, Note::NbShapeAtLimit { .. })),
+        "an interior shape carries no limit note, notes {:?}",
+        f.diagnostics.notes
     );
     let th_rel = (f.dispersion - REF_THETA).abs() / REF_THETA;
     assert!(
@@ -3134,15 +3144,85 @@ fn fit_glm_nb_theta_high_edge_matches_mass() {
     );
     // Sane boundary behavior: large but interior (not clamped at NB_THETA_HI).
     assert!(
-        f.dispersion > 1e2 && f.dispersion < super::glm::NB_THETA_HI,
+        f.dispersion > 1e2 && f.dispersion < crate::consts::NB_THETA_HI,
         "θ̂ = {} must sit interior, pushed toward NB_THETA_HI",
         f.dispersion
+    );
+    assert!(
+        !f.diagnostics
+            .notes
+            .iter()
+            .any(|n| matches!(n, Note::NbShapeAtLimit { .. })),
+        "an interior shape carries no limit note, notes {:?}",
+        f.diagnostics.notes
     );
     let th_rel = (f.dispersion - REF_THETA).abs() / REF_THETA;
     assert!(
         th_rel < 1e-2,
         "θ̂ = {} vs MASS {REF_THETA} (rel {th_rel})",
         f.dispersion
+    );
+}
+
+/// An NB(log) GLM through the matrix door with default options, and its
+/// |ln θ̂ − ln `limit`|.
+fn nb_glm_at(x: &[f64], y: &[f64], p: usize, limit: f64) -> (Fit, f64) {
+    let model = ModelSpec {
+        family: Family::NegativeBinomial {
+            link: NegBinomialLink::Log,
+        },
+        re: None,
+    };
+    let f = fit_cold(
+        x,
+        y,
+        y.len(),
+        p,
+        &model,
+        &GroupIds::default(),
+        &FitOptions::default(),
+    );
+    let gap = (f.dispersion.ln() - limit.ln()).abs();
+    (f, gap)
+}
+
+/// Near-Poisson counts (`y = i mod 3 + 1`, variance below the mean): the
+/// profile likelihood rises toward the Poisson limit, so θ̂ ends on
+/// `NB_THETA_HI` and the fit says so.
+#[test]
+fn nb_glm_on_the_upper_shape_limit_carries_the_note() {
+    let n = 40;
+    let y: Vec<f64> = (0..n).map(|i| (i % 3) as f64 + 1.0).collect();
+    let x: Vec<f64> = (0..n).flat_map(|i| [1.0, i as f64 / 40.0]).collect();
+    let (f, gap) = nb_glm_at(&x, &y, 2, crate::consts::NB_THETA_HI);
+    assert!(f.converged(), "the fit converges");
+    assert!(gap <= 1e-6, "θ̂ = {} must end on NB_THETA_HI", f.dispersion);
+    assert!(
+        f.diagnostics.notes.iter().any(
+            |n| matches!(n, Note::NbShapeAtLimit { limit } if *limit == crate::consts::NB_THETA_HI)
+        ),
+        "notes {:?}",
+        f.diagnostics.notes
+    );
+}
+
+/// 99 zeros and one count of 1e6: with μ̂ = ȳ = 1e4 the NB score in θ is about
+/// `100·(ln θ − ln 1e4 + 1) + 1/θ − 100`, zero near θ = 6e-4, so the
+/// likelihood still rises below `NB_THETA_LO` and θ̂ ends on that limit.
+#[test]
+fn nb_glm_on_the_lower_shape_limit_carries_the_note() {
+    let mut y = vec![0.0; 100];
+    y[99] = 1e6;
+    let x = vec![1.0; 100];
+    let (f, gap) = nb_glm_at(&x, &y, 1, crate::consts::NB_THETA_LO);
+    assert!(f.converged(), "the fit converges");
+    assert!(gap <= 1e-6, "θ̂ = {} must end on NB_THETA_LO", f.dispersion);
+    assert!(
+        f.diagnostics.notes.iter().any(
+            |n| matches!(n, Note::NbShapeAtLimit { limit } if *limit == crate::consts::NB_THETA_LO)
+        ),
+        "notes {:?}",
+        f.diagnostics.notes
     );
 }
 
@@ -3246,7 +3326,7 @@ fn fit_glm_nb_outer_cap_semantics() {
         se_for: SeFor::Only(vec![0, 1, 2]),
         ..FitOptions::default()
     };
-    let seed = Some(super::glm::NB_THETA_LO);
+    let seed = Some(crate::consts::NB_THETA_LO);
     let x_mat = super::common::to_col_major(&x, n, p);
 
     let f1 = super::glm::fit_glm_nb_capped(
@@ -3460,14 +3540,9 @@ fn fit_glm_separated_rejected_like_r() {
     );
 }
 
-/// Failed Gamma GLM (no random effects), inverse link: `y ~ x` with
-/// `y = 1e80·(2 + 0.1x)` on a binary `x`. The maximum sits at the group means,
-/// `η = 1/μ ≈ 5e-81`, below the kernel's `1e-75` floor on the inverse-link η
-/// (`family::INV_ETA_MIN`). The null-model seed is already below that floor,
-/// so the fit starts from η clamped to it, no step reaches the maximum inside
-/// the range (the last β gives η < 0), and the fit ends not converged. R
-/// 4.5.3's `glm(Gamma("inverse"))` fails on these data too: it stops with
-/// "NA/NaN/Inf in 'x'", because `mu.eta(η)² = 1/η⁴` overflows at that η.
+/// Failed Gamma GLM (no random effects), inverse link: `y ~ 0 + x` with
+/// `x = ±1` and every y positive. No β is in the link's domain: η = βx needs
+/// η > 0 on rows of both signs of x, so the fit ends not converged.
 /// `dispersion` must be NaN, not the Gamma exponential special case
 /// `φ=1`, which a caller cannot tell from a real estimate. Also with a
 /// caller-held φ (`Dispersion::Fixed(2.0)`): the held value is
@@ -3476,15 +3551,9 @@ fn fit_glm_separated_rejected_like_r() {
 #[test]
 fn fit_glm_gamma_failed_fit_dispersion_is_nan() {
     let n = 24;
-    let p = 2;
-    let mut x = vec![0.0f64; n * p];
-    let mut y = vec![0.0f64; n];
-    for i in 0..n {
-        let xi = if i < 12 { 0.0 } else { 1.0 };
-        x[i * p] = 1.0;
-        x[i * p + 1] = xi;
-        y[i] = 1e80 * (2.0 + 0.1 * xi);
-    }
+    let p = 1;
+    let x: Vec<f64> = (0..n).map(|i| if i < 12 { 1.0 } else { -1.0 }).collect();
+    let y: Vec<f64> = (0..n).map(|i| 2.0 + 0.1 * (i % 3) as f64).collect();
     for held in [Dispersion::Default, Dispersion::Fixed(2.0)] {
         let f = fit_cold(
             &x,
@@ -3499,15 +3568,15 @@ fn fit_glm_gamma_failed_fit_dispersion_is_nan() {
             },
             &GroupIds::default(),
             &FitOptions {
-                se_for: SeFor::Only(vec![0, 1]),
+                se_for: SeFor::Only(vec![0]),
                 dispersion: held.clone(),
                 ..FitOptions::default()
             },
         );
         assert!(
             !f.converged(),
-            "Gamma(inverse) GLM whose maximum needs η below the kernel's floor must not \
-             converge (held φ {held:?})"
+            "Gamma(inverse) GLM with no β in the link's domain must not converge \
+             (held φ {held:?})"
         );
         assert!(
             f.dispersion.is_nan(),
@@ -4259,6 +4328,7 @@ fn fractional_logit_glm_matches_its_unit_weight_fit() {
             &[0, 1],
             &mut buf,
             crate::standardize::ColumnScaling::IDENTITY,
+            crate::standardize::Units::IDENTITY,
             None,
         );
         [view.deviance, view.deviance_null]
@@ -4270,4 +4340,28 @@ fn fractional_logit_glm_matches_its_unit_weight_fit() {
             "{va:?} vs {vb:?}"
         );
     }
+}
+
+/// Gamma/log with x near 8e-155 and φ̂ near 4: (XᵀWX)⁻¹ at the slope is about
+/// 1e308, finite, and φ̂ times it leaves f64's range. The `vcov` diagonal is
+/// NaN, not inf, as on OLS (`an_overflowed_slope_variance_gives_a_nan_vcov_not_inf`).
+#[test]
+fn a_gamma_slope_variance_past_f64_gives_a_nan_vcov_not_inf() {
+    let n = 20;
+    let mut x = Vec::with_capacity(2 * n);
+    let mut y = Vec::with_capacity(n);
+    for i in 0..n {
+        let t = (i as f64 * 0.618_033_988_749_895).fract() - 0.5;
+        x.extend([1.0, 8e-155 * t]);
+        y.push((1.0 + 0.5 * t).exp() * if i % 4 == 3 { 30.0 } else { 0.1 });
+    }
+    let d = crate::Data::new(&x, &y, n, 2);
+    let model = ModelSpec::fixed(Family::Gamma {
+        link: crate::GammaLink::Log,
+    });
+    let f = crate::fit(&d, &model, &FitOptions::default()).unwrap();
+    assert!(f.converged(), "not converged");
+    let v = f.vcov()[2 + 1];
+    assert!(v.is_nan(), "vcov[1,1] = {v}, dispersion {}", f.dispersion);
+    assert!(f.vcov()[0].is_finite(), "vcov[0,0] = {}", f.vcov()[0]);
 }

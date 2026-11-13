@@ -925,6 +925,7 @@ fn post_fit(call: &str, kind: &str, data: &Data, m: &Member, r: &FitResult) -> R
                 "link",
                 false,
                 true,
+                "allow_new_levels=True",
                 true,
                 0.95,
                 false,

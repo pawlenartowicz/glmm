@@ -382,9 +382,9 @@ fn crossed_extra_ranef_matches_brute_force() {
     assert_fitted(fit, &lo.x, lo.n, lo.p, &groups, None);
 }
 
-/// A random slope on an EXTRA grouping routes the whole fit to the sparse-Z
-/// solver (`fit::classify_design`), whose recovery keeps a different set of
-/// factors than the dense one.
+/// Random slopes on two groupings, so one sits on an EXTRA grouping, route the
+/// whole fit to the sparse-Z solver (`fit::classify_design`), whose recovery
+/// keeps a different set of factors than the dense one.
 #[test]
 fn sparse_route_ranef_matches_brute_force() {
     let n = 72;
@@ -409,10 +409,10 @@ fn sparse_route_ranef_matches_brute_force() {
         ],
         n,
     };
-    let (model, _) = run("y ~ x1 + (1 | ga) + (1 + x1 | gb)", &table);
+    let (model, _) = run("y ~ x1 + (1 + x1 | ga) + (1 + x1 | gb)", &table);
     let (fit, lo) = (model.fit(), model.lowered());
     let groups = vec![
-        ((0..n).map(|i| i % 6).collect::<Vec<_>>(), vec![]),
+        ((0..n).map(|i| i % 6).collect::<Vec<_>>(), vec![1usize]),
         ((0..n).map(|i| i % 4).collect::<Vec<_>>(), vec![1usize]),
     ];
     let want = brute_ranef(fit, &lo.x, &y, lo.n, lo.p, &groups);

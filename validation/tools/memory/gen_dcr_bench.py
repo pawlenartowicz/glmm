@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate one dataset of the weight-power and CR2 benchmark (spec 2-dcr §12)
+"""Generate one dataset of the weight-power and CR2 benchmark
 as a CSV. Not a validation rung: nothing is checked against an oracle, only
 wall time and peak RSS are measured (dcr_bench.sh).
 
@@ -21,7 +21,7 @@ HC2_N = (10_000, 100_000, 1_000_000)
 
 
 def _datasets():
-    """(id, row, design) in run order: the small-cluster rows first (§12).
+    """(id, row, design) in run order: the small-cluster rows first.
     A row is the unit a capped run skips the rest of, its sizes ascending."""
     out = []
     for g in SMALL_G:

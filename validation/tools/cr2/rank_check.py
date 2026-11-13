@@ -1,4 +1,4 @@
-# Copy of docs/0.9.0/cr2-large-clusters/rank_check.py; computes no B^(-1/2) by eigendecomposition (lib.dense_cluster does).
+# Computes no B^(-1/2) by eigendecomposition (lib.dense_cluster does).
 # reduce_u's cut is eps * max(1, largest ev) here, not eps, so rounding on a large S drops out.
 """Pole sum against the dense formula when U has less than full column rank in a cluster:
 zero random-effect variance, a zero slope variance, a slope column constant inside a cluster,

@@ -161,7 +161,11 @@ fn cases() -> Vec<Case> {
         clustered("nb_glm", nb, nbf, vec![], false, 1),
         clustered("nb_glmm", nb, nbf, vec![], true, 1),
     ];
-    let (x, y, n, p, model, ids) = crate::sparse::tests::sparse_gamma_design();
+    // The sparse Gamma design's `(1 | gp) + (1 + x1 + x2 + x3 + x4 | ge)` with a
+    // slope on `x1` on `gp` too, so the crossed slope is not the only one and
+    // the fit keeps the sparse route.
+    let (x, y, n, p, mut model, ids) = crate::sparse::tests::sparse_gamma_design();
+    model.re.as_mut().unwrap().slopes = vec![1];
     v.push(Case {
         name: "lmm_sparse",
         x,

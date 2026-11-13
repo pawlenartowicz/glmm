@@ -8,7 +8,7 @@
 \usage{
 isSingular(x, ...)
 
-\method{isSingular}{fastglmm}(x, ...)
+\method{isSingular}{fastglmm}(x, tol, ...)
 
 \method{isSingular}{default}(x, ...)
 }
@@ -16,11 +16,16 @@ isSingular(x, ...)
 \item{x}{a \link{fastglmm} fit.}
 
 \item{...}{unused.}
+
+\item{tol}{not used; giving it raises a \code{"fastglmm_argument_ignored"}
+warning.}
 }
 \description{
-\code{TRUE} iff the fit converged onto the variance-component boundary - the
-same condition \code{lme4::isSingular} reports (the kernel computes it; see
-\verb{glmm::Fit::singular}).
+\code{TRUE} when a variance component is at zero or a random-effect standard
+deviation is at most 1e-3 times the fit's largest (the kernel computes it;
+see \verb{glmm::Fit::singular}). This is fastglmm's own rule: \code{lme4::isSingular}
+compares its \code{tol} with the relative covariance factor, which is on
+another scale, so \code{tol} is not used here.
 }
 \details{
 Two packages, one generic name, and neither one may depend on the other.

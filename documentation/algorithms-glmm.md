@@ -53,7 +53,9 @@ of the dispatch match in `build_workspace` (`src/fit/core.rs`); `check_model_sha
 when the total crossed level count exceeds `MAX_CROSSED_LEVELS`; otherwise it
 stays **NoZ**. (For a slope-carrying extra `Solver::Sparse` is not a speed
 choice: only the packed-row `A`-layout applies a full `q_g×q_g` Λ block per
-extra level.) On the non-Gaussian side `classify_design`'s answer selects the
+extra level.)
+Before this check a lone slope grouping may be moved first ([dispatch map](algorithms.md#full-dispatch-map)).
+On the non-Gaussian side `classify_design`'s answer selects the
 `A`-layout, not a separate driver — every family reaches the same entry point:
 
 ```mermaid
@@ -795,7 +797,7 @@ unchanged, and the positive-definiteness check runs on the mapped matrix. A draw
 `fit_on_hinted` starts each draw's search from it; the fit only reads it, so
 results do not depend on the order of the draws. After a Gamma-inverse retry
 that ran more than the first search (see
-[Response units on the Gamma inverse link](#response-units-on-the-gamma-inverse-link))
+[Response units](#response-units))
 there is no hint: each search's BFGS state is in its own units `c`, and a later
 hinted draw starts in the units of its own first search.
 
@@ -1049,8 +1051,8 @@ references in `sim_sparse_gamma_tmb` / `sim_sparse_nb_tmb`).
 ## Negative-Binomial outer θ-loop
 
 **Code:** `run_glmm_nb_on` (`src/fit/glmm.rs`); the marginal-θ objective term
-`nb_profile_loglik` and caps `NB_THETA_LO = 1e-3`, `NB_THETA_HI = 1e4` in
-`src/fit/glm.rs`.
+`nb_profile_loglik` in `src/fit/glm.rs`, and the caps `NB_THETA_LO = 1e-3`,
+`NB_THETA_HI = 1e4` in `src/consts.rs`.
 
 The NB shape parameter θ is not carried in the spec — the spec is θ-free. The
 route maximizes the **marginal** log-likelihood over `ln θ` (the NB likelihood is
@@ -1144,7 +1146,9 @@ moves φ̂ by the same constant (`aᵢ = wᵢ/φ` is invariant to `w → c·w,
 φ → c·φ`), so `ln φ` — one more trailing coordinate of the outer search, as
 NB's `ln θ` is of the outer BOBYQA — searches on the internal `φ_int = φ/w̄` instead,
 where `w̄ = 2^round(mean(log₂ wᵢ))` is a power of two near the geometric
-mean of the weights, exactly `1` when unweighted. An arithmetic mean would
+mean of the weights, exactly `1` when unweighted: the weight scale `s` that
+every route with a dispersion fits on
+([internal units](algorithms.md#internal-units-of-the-response-the-weights-and-the-offset)). An arithmetic mean would
 let one outlier weight push `φ_int` out of its search box; a power of two
 also keeps rescaling every weight by a power of two exact. `ln φ_int` is
 boxed to `[ln GAMMA_PHI_LO, ln GAMMA_PHI_HI] = [ln 1e-6, ln 1e6]` and seeded
@@ -1238,20 +1242,35 @@ satisfies the stationarity condition on both links),
 a central-difference Hessian of `F` over `[θ | β | ln φ]`), and
 `family::tests::gamma_dispersion_term_*`.
 
-### Response units on the Gamma inverse link
+### Response units
 
-**Code:** `fit::glmm::run_glmm_on`, `gamma_inverse_units`,
-`gamma_inverse_retry` (`src/fit/glmm.rs`).
+**Code:** `fit::glmm::run_glmm_on`, `fit_glmm_in_units`, `gamma_inverse_units`,
+`gamma_inverse_retry` (`src/fit/glmm.rs`); `Units` (`src/standardize.rs`).
 
-On the inverse link `η = 1/μ` is in the reciprocal of y's units, and so are
-β, the random effects and θ, while every θ constant of the search is absolute,
-as on the other links, where η has no units: the blind start `THETA0` = 1, the
-box, the trust radii, `PIN_THETA` and the finite-difference step. A search on
-`y/c` (`c` a power of two) is the same model with η, β, θ and the offset
+Every GLMM search runs on the draw's internal units
+([internal units](algorithms.md#internal-units-of-the-response-the-weights-and-the-offset)):
+Gamma fits on `ŵ = w/s` (`prep_glmm_design`), the count families on their
+weights as given, and `fit_glmm_in_units` runs one search on `y/c` with the
+offset on the internal scale, then maps the workspace back to y's units. On a
+log link `y/c` moves η by `−ln c` and the centred offset `o − m` moves it by
+`−m`; the intercept takes both (`GlmmWorkspace::intercept_shift`, added to
+the intercept before the Wald statistics are formed), and θ does not move.
+The GLM seed runs on the same internal values, so a search starts from it bit
+for bit whatever the caller's units. Every search, including
+`capped_restart`, the cold fallback and the retry below, enters and leaves
+the workspace in the caller's units; the deviance gains `2n·ln c` and μ̂ the
+factor `c`.
+
+On the Gamma inverse link `η = 1/μ` is in the reciprocal of y's units, and so
+are β, the random effects and θ, while every θ constant of the search is
+absolute, as on the other links, where η has no units: the blind start
+`THETA0` = 1, the box, the trust radii, `PIN_THETA` and the finite-difference
+step. A search on `y/c` is the same model with η, β, θ and the offset
 multiplied by `c`; the unit deviance, φ and the weights do not move, and
 `Σ ln y` drops by `n·ln c`. After the search β̂, θ̂ and the covariances are
-divided back (variances by `c²`), μ̂ is multiplied by `c` and the deviance gains
-`2n·ln c`.
+divided back (variances by `c²`). The draw's `c` alone does not put θ near
+the search's constants, so on this link `c` takes a further power-of-two
+factor read off the data, and the search can be retried at other factors.
 
 The likelihood can have two basins whose θ live on scales decades apart:
 σ = 0 near the GLM fit, with its structure on the scale of the smallest start
@@ -1260,8 +1279,9 @@ The likelihood can have two basins whose θ live on scales decades apart:
 cluster η (`Σw/Σwy` over a primary-grouping level). Read off the data and the
 GLM start, before any search:
 
-- **The first search** runs on y as given while the largest cluster η lies in
-  `[1/64, 64]`, and on y rescaled to bring it into `[4, 8]` outside. Measured
+- **The first search** runs on the draw's `y/c` while the largest cluster η
+  (read on `y/c`) lies in `[1/64, 64]`, and on `y/c` rescaled by a further
+  power of two to bring it into `[4, 8]` outside. Measured
   on y·k, k over 2⁻²⁰ to 2²⁰, for a 12-row design whose four cluster means
   span up to nine decades and for 15-row corpus fits: on y as given the
   interior optimum is reached with that η from about 2 to 12, and the search
@@ -1298,7 +1318,10 @@ units above the optimum.
 **Validation:** `gamma_inverse_adversarial_reaches_the_glm_optimum`,
 `gamma_inverse_span_reaches_the_optimum_in_any_units` and
 `gamma_inverse_singular_fit_is_equivariant_in_the_units_of_y`
-(`src/fit/glmm_tests.rs`).
+(`src/fit/glmm_tests.rs`); for every link,
+`response_times_c_maps_back_on_gamma_and_inverse_gaussian`,
+`weights_times_c_leave_the_dispersion_families_unchanged` and
+`a_log_link_offset_is_a_rescaled_response` (`tests/invariance.rs`).
 
 ## Warm starts and workspace reuse
 

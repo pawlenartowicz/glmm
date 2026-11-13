@@ -154,70 +154,78 @@ fn per_term_f_matches_anova() {
         let beta = numbers(&fit_json["beta"], name);
 
         // At lme4's θ̂, with lme4's β̂ (a function of θ̂ alone).
-        let kept = at_lme4_theta(name, &lo, &fit_opts, &fit_json, |kept, ws, map, theta| {
-            let routes = routes(ws);
-            if routes.contains(&DerivRoute::GradientDiff) {
-                per_group.push(name.to_string());
-            }
-            for route in routes {
-                let st0 = route_pass_at(ws, theta, map, route);
-                let theta1 = newton_point(ws, &st0, theta);
-                let st1 = route_pass_at(ws, &theta1, map, route);
-                let (jac0, jac1) = (jac_eff(&st0), jac_eff(&st1));
-                let at = |st: &SatterthwaiteState, jac: &[Mat<f64>], l: &Mat<f64>| {
-                    let inputs = ContestInputs {
-                        beta: &beta,
-                        vcov_beta: st.c.as_ref(),
-                        vcov_varpar: st.a_eff.as_ref(),
-                        jac,
+        let kept = at_lme4_theta(
+            name,
+            &lo,
+            &fit_opts,
+            &fit_json,
+            |kept, ws, map, units, theta| {
+                let routes = routes(ws);
+                if routes.contains(&DerivRoute::GradientDiff) {
+                    per_group.push(name.to_string());
+                }
+                for route in routes {
+                    let st0 = route_pass_at(ws, theta, map, units, route);
+                    let theta1 = newton_point(ws, &st0, theta);
+                    let st1 = route_pass_at(ws, &theta1, map, units, route);
+                    let (jac0, jac1) = (jac_eff(&st0), jac_eff(&st1));
+                    let at = |st: &SatterthwaiteState, jac: &[Mat<f64>], l: &Mat<f64>| {
+                        let inputs = ContestInputs {
+                            beta: &beta,
+                            vcov_beta: st.c.as_ref(),
+                            vcov_varpar: st.a_eff.as_ref(),
+                            jac,
+                        };
+                        contest_md(&inputs, l.as_ref())
+                            .unwrap_or_else(|err| panic!("{name}: {err:?}"))
                     };
-                    contest_md(&inputs, l.as_ref()).unwrap_or_else(|err| panic!("{name}: {err:?}"))
-                };
-                for table in TABLES {
-                    let frozen = &json[table];
-                    let terms = strings(&frozen["terms"], name);
-                    let num_df = numbers(&frozen["NumDF"], name);
-                    let den_df = numbers(&frozen["DenDF"], name);
-                    let f = numbers(&frozen["F"], name);
-                    let second = frozen["DenDF_second"]
-                        .as_array()
-                        .unwrap_or_else(|| panic!("{name} {table}: DenDF_second"));
-                    let hyps = hypotheses(table, &lo, kept);
-                    assert_eq!(hyps.len(), terms.len(), "{name} {table}: terms");
-                    for (k, h) in hyps.iter().enumerate() {
-                        assert_eq!(h.term, terms[k], "{name} {table}: term {k}");
-                        assert!(h.l.nrows() > 0, "{name} {table} {}: no rows", h.term);
-                        let l = restrict(&h.l, kept);
-                        let (md0, md1) = (at(&st0, &jac0, &l), at(&st1, &jac1, &l));
-                        let what = format!("{table} {} at lme4's theta, {route:?} route", h.term);
-                        assert_eq!(md0.num_df as f64, num_df[k], "{name} {what}: NumDF");
-                        let sp = spread(den_df[k], &numbers(&second[k], name));
-                        let nonstat = (md0.den_df - md1.den_df).abs() / den_df[k];
-                        let b = band(route, sp, nonstat);
-                        eprintln!(
+                    for table in TABLES {
+                        let frozen = &json[table];
+                        let terms = strings(&frozen["terms"], name);
+                        let num_df = numbers(&frozen["NumDF"], name);
+                        let den_df = numbers(&frozen["DenDF"], name);
+                        let f = numbers(&frozen["F"], name);
+                        let second = frozen["DenDF_second"]
+                            .as_array()
+                            .unwrap_or_else(|| panic!("{name} {table}: DenDF_second"));
+                        let hyps = hypotheses(table, &lo, kept);
+                        assert_eq!(hyps.len(), terms.len(), "{name} {table}: terms");
+                        for (k, h) in hyps.iter().enumerate() {
+                            assert_eq!(h.term, terms[k], "{name} {table}: term {k}");
+                            assert!(h.l.nrows() > 0, "{name} {table} {}: no rows", h.term);
+                            let l = restrict(&h.l, kept);
+                            let (md0, md1) = (at(&st0, &jac0, &l), at(&st1, &jac1, &l));
+                            let what =
+                                format!("{table} {} at lme4's theta, {route:?} route", h.term);
+                            assert_eq!(md0.num_df as f64, num_df[k], "{name} {what}: NumDF");
+                            let sp = spread(den_df[k], &numbers(&second[k], name));
+                            let nonstat = (md0.den_df - md1.den_df).abs() / den_df[k];
+                            let b = band(route, sp, nonstat);
+                            eprintln!(
                             "PERTERM {name} {what}: DenDF rel {:.2e} F rel {:.2e} spread {sp:.2e} nonstat {nonstat:.2e} band {b:.2e}",
                             (md0.den_df - den_df[k]).abs() / den_df[k],
                             (md0.f_value - f[k]).abs() / f[k]
                         );
-                        at_lme4.check(
-                            name,
-                            "dendf_at_lme4",
-                            &format!("{what} DenDF"),
-                            (md0.den_df, den_df[k]),
-                            b,
-                        );
-                        at_lme4.check(
-                            name,
-                            "f_at_lme4",
-                            &format!("{what} F"),
-                            (md0.f_value, f[k]),
-                            b,
-                        );
+                            at_lme4.check(
+                                name,
+                                "dendf_at_lme4",
+                                &format!("{what} DenDF"),
+                                (md0.den_df, den_df[k]),
+                                b,
+                            );
+                            at_lme4.check(
+                                name,
+                                "f_at_lme4",
+                                &format!("{what} F"),
+                                (md0.f_value, f[k]),
+                                b,
+                            );
+                        }
                     }
                 }
-            }
-            kept.to_vec()
-        });
+                kept.to_vec()
+            },
+        );
 
         // End to end, at the crate's own θ̂.
         let fit = fit_warm_wo(

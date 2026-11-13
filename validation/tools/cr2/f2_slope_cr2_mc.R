@@ -1,5 +1,4 @@
-# Copy of weights_of_trust/checks/f2_slope_cr2_mc.R with the cut of spec 2-dcr §3.2
-# (bmh() of efficiency_lib.R); see validation/manifest.json `copied_tools`.
+# Uses the scale-free cut of efficiency_lib.R's bmh(); see validation/manifest.json `copied_tools`.
 # One more arm for f2_extensions_mc.R, on the same data, 10-group cells only:
 #   F1S slope_cr2  δ profiled on y ~ x + (1 + x | g); CR2 SE and Pustejovsky–Tipton df with
 #                  that fit as the working model. Gap: F1's df come from a working model with

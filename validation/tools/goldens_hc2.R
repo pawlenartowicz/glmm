@@ -3,7 +3,7 @@
 # `inference_references` entry with `generator = "goldens_hc2.R"`.
 #
 # THE ORACLE IS SACRED. These JSONs are the frozen reference the crate's HC2 SE and
-# Bell-McCaffrey df are validated against (gate G4 of spec 2-dcr). On any glmm
+# Bell-McCaffrey df are validated against (the HC2 check). On any glmm
 # disagreement, glmm is presumed wrong: never relax a tolerance or edit a reference.
 #
 # A BARE RUN OVERWRITES EVERY REFERENCE IT OWNS. Use VALIDATION_ONLY for anything

@@ -83,6 +83,36 @@ pub(crate) fn set_term_slopes(terms: &mut [ReTerm], slopes: &[ColumnId]) {
     }
 }
 
+/// A grouping's random-slope columns (indices into a full design's
+/// `[X | Z_r]`) on a reduced design of `k` columns whose leading column `j` is
+/// full column `kept[j]`: an anova refit's kept columns, or the columns the
+/// alias check keeps. A slope on a kept column moves to its new position, so
+/// it stays on the same variable. Any other slope, on a column the reduced
+/// design drops or mixes or on a `Z_r` column, reads random-effect-only column
+/// `k + j` of the reduced fit, `sources[j]` its column in the full `[X | Z_r]`:
+/// pushed when new, shared by every grouping that names it.
+pub(crate) fn remap_slopes(
+    slopes: &[ColumnId],
+    kept: &[usize],
+    k: usize,
+    sources: &mut Vec<usize>,
+) -> Vec<ColumnId> {
+    slopes
+        .iter()
+        .map(|&s| {
+            let s = s as usize;
+            let j = kept.iter().position(|&c| c == s).unwrap_or_else(|| {
+                let at = sources.iter().position(|&c| c == s).unwrap_or_else(|| {
+                    sources.push(s);
+                    sources.len() - 1
+                });
+                k + at
+            });
+            ColumnId::try_from(j).expect("a design column index fits a ColumnId")
+        })
+        .collect()
+}
+
 /// An extra (crossed or nested) grouping factor beyond the primary grouping.
 /// `slopes` are the random-slope design columns; with no `terms` the RE
 /// correlation structure is full (parametrized by the fitted θ). Structure-only,
@@ -95,7 +125,8 @@ pub struct Grouping {
     /// How this grouping's clusters relate to the primary grouping's rows.
     pub relation: GroupingRelation,
     /// Random-slope design columns for this grouping (0-based indices into `x`);
-    /// empty means random-intercept only.
+    /// empty means random-intercept only; a column listed twice is refused with
+    /// [`crate::FitError::Shape`].
     pub slopes: Vec<ColumnId>,
     /// This grouping's random-effect terms, as on [`ReStructure::terms`].
     pub terms: Vec<ReTerm>,
@@ -355,13 +386,14 @@ pub enum WaldSe {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReStructure {
     /// Random-slope design columns for the primary grouping (0-based indices
-    /// into `x`); empty means random-intercept only.
+    /// into `x`); empty means random-intercept only; a column listed twice is
+    /// refused with [`crate::FitError::Shape`].
     pub slopes: Vec<ColumnId>,
     /// The primary grouping's random-effect terms. Empty means one
     /// unstructured term over the intercept and `slopes`. When set, `slopes`
     /// must be the terms' columns concatenated in term order, at most one
     /// term holds the intercept and it comes first, no term is empty, and no
-    /// column is in two terms; [`crate::fit`] refuses anything else with
+    /// column appears twice, in one term or across terms; [`crate::fit`] refuses anything else with
     /// [`crate::FitError::Shape`]. With no intercept term the grouping has no
     /// random intercept.
     pub terms: Vec<ReTerm>,

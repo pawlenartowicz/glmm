@@ -86,7 +86,11 @@ def test_stddev_corr_invalid_vech_raises():
 
 
 def test_stddev_corr_without_variance_estimates_raises_a_clear_error():
-    f = make_fit(varcorr=[], re_groups=[("g", ["(Intercept)", "x"])], converged=False)
+    f = make_fit(
+        varcorr=[np.array([np.nan, np.nan, np.nan])],
+        re_groups=[("g", ["(Intercept)", "x"])],
+        converged=False,
+    )
     with pytest.raises(ValueError, match="no variance estimates"):
         f.stddev_corr(0)
     with pytest.raises(IndexError):
@@ -282,7 +286,7 @@ def test_residuals_response_and_pearson():
     with pytest.raises(ValueError, match="response.*pearson"):
         f.residuals(type="deviance")
     with pytest.raises(ValueError, match="did not converge"):
-        make_fit(fitted=np.array([])).residuals()
+        make_fit(y=np.array([1.0, 2.0]), fitted=np.array([np.nan, np.nan])).residuals()
 
 
 def test_pearson_residuals_stay_finite_at_extreme_means():
@@ -613,7 +617,7 @@ def test_ols_and_glmm_fits_label_their_test():
 
 
 def test_satterthwaite_must_be_a_bool():
-    with pytest.raises(TypeError, match="satterthwaite must be True or False"):
+    with pytest.raises(ValueError, match="satterthwaite must be True or False"):
         glmm.fit(_EMIXED, "y ~ x + (1 | g)", satterthwaite="no")
 
 

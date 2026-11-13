@@ -12,7 +12,9 @@
 \item{...}{unused.}
 }
 \value{
-An object of class \code{"summary.fastglmm"} with \code{coefficients}
+An object of class \code{"summary.fastglmm"} with \code{method} (the
+title), \code{ml_note} (the ML note, \code{NULL} when there is none), \code{groups}
+(the groupings' \code{names} and their \code{levels} counts), \code{coefficients}
 (\code{Estimate}, \verb{Std. Error}, \code{df} on a Gaussian mixed model, then
 \verb{t value} and \verb{Pr(>|t|)}, or \verb{z value} and \verb{Pr(>|z|)}), \code{criterion},
 \code{scaled_residuals} (\code{NULL} when the fit did not converge),

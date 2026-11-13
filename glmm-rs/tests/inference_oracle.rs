@@ -246,8 +246,8 @@ fn lmertest_end_to_end(compared: &mut BTreeSet<String>) {
 }
 
 /// Gate 1's interval comparison: the ports' Satterthwaite t interval
-/// ([`glmm::orchestrate::confint`]: `β̂ ± t_{df}(1 − (1 − level)/2)·SE` on a
-/// finite positive df) of each coefficient, on glmm's `coef_df` at its own θ̂,
+/// ([`glmm::orchestrate::confint`] under `satterthwaite`:
+/// `β̂ ± t_{df}(1 − (1 − level)/2)·SE`) of each coefficient, on glmm's `coef_df` at its own θ̂,
 /// against lmerTest's `contest1D(m, L, confint = TRUE)` bounds at the frozen
 /// `level`. Each bound's difference is measured in units of lmerTest's
 /// interval width, within `CONFINT_REL` (registry quantity `confint`): a bound
@@ -257,8 +257,9 @@ fn lmertest_confint(compared: &mut BTreeSet<String>) {
     for (name, json, fit, cols) in lmertest_fits() {
         let level = json["level"].as_f64().expect("level");
         let (lower, upper) = (numbers(&json["lower"], name), numbers(&json["upper"], name));
-        let ci = glmm::orchestrate::confint(fit.beta(), fit.se(), fit.coef_df(), level)
-            .unwrap_or_else(|err| panic!("{name}: {err}"));
+        let ci =
+            glmm::orchestrate::confint(fit.beta(), fit.se(), fit.coef_df(), "satterthwaite", level)
+                .unwrap_or_else(|err| panic!("{name}: {err}"));
         let worst = cols
             .iter()
             .enumerate()

@@ -3,25 +3,34 @@ use glmm::orchestrate;
 use crate::error::BindError;
 use crate::fns::{ModelData, Rows};
 use crate::inputs::Inputs;
+use crate::options;
+use crate::port::spell;
 use crate::records::read_parts;
 use crate::value::{Record, Value};
 
-/// A note's `detail` with the rows after `": "` counted from `base`
+/// A note's `detail` with its rows counted from `base`: the whole `detail`
+/// of `rows_not_estimable`, the rows after `": "` of every other kind
 /// (`new_grouping_levels` gives `"<grouping index>: <rows>"`, the grouping
 /// index stays 0-based).
-fn detail_rows_from(detail: String, base: usize) -> String {
+fn detail_rows_from(kind: &str, detail: String, base: usize) -> String {
+    let shift = |rows: &str| -> String {
+        rows.split(", ")
+            .map(|i| {
+                i.parse::<usize>()
+                    .map_or(i.to_string(), |i| (i + base).to_string())
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if base == 0 {
+        return detail;
+    }
+    if kind == "rows_not_estimable" {
+        return shift(&detail);
+    }
     match detail.split_once(": ") {
-        Some((g, rows)) if base != 0 => {
-            let rows: Vec<String> = rows
-                .split(", ")
-                .map(|i| {
-                    i.parse::<usize>()
-                        .map_or(i.to_string(), |i| (i + base).to_string())
-                })
-                .collect();
-            format!("{g}: {}", rows.join(", "))
-        }
-        _ => detail,
+        Some((g, rows)) => format!("{g}: {}", shift(rows)),
+        None => detail,
     }
 }
 
@@ -31,6 +40,18 @@ fn detail_rows_from(detail: String, base: usize) -> String {
 /// asked for empty) and `notes`, each `kind` and `detail`, the rows in
 /// `detail` counted from `row_base`.
 pub(crate) fn predict(inp: &mut Inputs) -> Result<Value, BindError> {
+    let port = inp.port();
+    let scale = options::choice(inp, "scale", "type", &["link", "response"])?;
+    let population = options::population(inp)?;
+    let allow_new_levels = options::flag(inp, "allow_new_levels", spell(port, "allow_new_levels"))?;
+    let se = options::flag(inp, "se", spell(port, "se_fit"))?;
+    let level = inp.f64("level")?;
+    if !(level > 0.0 && level < 1.0) {
+        return Err(BindError::invalid_argument(format!(
+            "level must be in (0, 1), got {level}"
+        )));
+    }
+    let future = options::flag(inp, "future", "future")?;
     let d = ModelData::read(inp)?;
     let parts = read_parts(inp.record("parts")?)?;
     let new = if inp.has("new_numeric") || inp.has("new_factors") {
@@ -53,12 +74,13 @@ pub(crate) fn predict(inp: &mut Inputs) -> Result<Value, BindError> {
         d.offset,
         &parts,
         new,
-        &inp.string("scale")?,
-        inp.bool("population")?,
-        inp.bool("allow_new_levels")?,
-        inp.bool("se")?,
-        inp.f64("level")?,
-        inp.bool("future")?,
+        &scale,
+        population,
+        allow_new_levels,
+        spell(port, "allow_new_levels_true"),
+        se,
+        level,
+        future,
     )
     .map_err(|e| rows.error(e))?;
     let notes = r
@@ -70,7 +92,7 @@ pub(crate) fn predict(inp: &mut Inputs) -> Result<Value, BindError> {
                     .with("kind", Value::Str(n.kind.to_owned()))
                     .with(
                         "detail",
-                        Value::Str(detail_rows_from(n.detail, rows.base())),
+                        Value::Str(detail_rows_from(n.kind, n.detail, rows.base())),
                     ),
             )
         })
@@ -89,20 +111,14 @@ pub(crate) fn predict(inp: &mut Inputs) -> Result<Value, BindError> {
 
 /// `orchestrate::simulate`: the draws, draw after draw.
 pub(crate) fn simulate(inp: &mut Inputs) -> Result<Value, BindError> {
+    let nsim = options::nsim(inp)?;
+    let seed = options::seed(inp)?;
     let d = ModelData::read(inp)?;
     let parts = read_parts(inp.record("parts")?)?;
     let rows = Rows::read(inp)?;
     let draws = orchestrate::simulate(
-        &d.formula,
-        d.numeric,
-        d.factors,
-        &d.family,
-        &d.link,
-        d.weights,
-        d.offset,
-        &parts,
-        inp.usize("nsim")?,
-        inp.seed("seed")?,
+        &d.formula, d.numeric, d.factors, &d.family, &d.link, d.weights, d.offset, &parts, nsim,
+        seed,
     )
     .map_err(|e| rows.error(e))?;
     Ok(Value::Vec(draws))
@@ -121,8 +137,13 @@ mod tests {
 
     #[test]
     fn note_rows_count_from_the_base_and_the_grouping_index_does_not() {
-        assert_eq!(detail_rows_from("1: 0, 4".into(), 1), "1: 1, 5");
-        assert_eq!(detail_rows_from("1: 0, 4".into(), 0), "1: 0, 4");
-        assert_eq!(detail_rows_from("no rows".into(), 1), "no rows");
+        let new_levels = "new_grouping_levels";
+        assert_eq!(detail_rows_from(new_levels, "1: 0, 4".into(), 1), "1: 1, 5");
+        assert_eq!(detail_rows_from(new_levels, "1: 0, 4".into(), 0), "1: 0, 4");
+        assert_eq!(detail_rows_from(new_levels, "no rows".into(), 1), "no rows");
+        assert_eq!(
+            detail_rows_from("rows_not_estimable", "0, 4".into(), 1),
+            "1, 5"
+        );
     }
 }

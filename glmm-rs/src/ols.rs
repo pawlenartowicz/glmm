@@ -14,7 +14,7 @@
 use faer::reborrow::{IntoConst, Reborrow, ReborrowMut};
 use faer::{MatMut, MatRef};
 
-use crate::standardize::ColumnScaling;
+use crate::standardize::{ColumnScaling, Units};
 
 /// Rows per widened f64 panel in the suff-stats GEMM accumulate
 /// (`OlsSuffStats::add_rows`). Bounds the f64
@@ -358,6 +358,14 @@ pub(crate) const ALIAS_EPS: f64 = 1e-14;
 /// stays zero, so it contributes nothing to later pivots. Returns a length-`p`
 /// mask (`true` = aliased/drop). `p` tiny ⇒ the `O(p³)` factor is negligible.
 pub(crate) fn aliased_columns(gram: MatRef<'_, f64>, p: usize, eps: f64) -> Vec<bool> {
+    aliased_factor(gram, p, eps).0
+}
+
+/// [`aliased_columns`]' mask with the factor it is decided on: `l` is the
+/// row-major `p × p` lower triangle, with row `d` of an aliased column `d`
+/// holding its entries against the retained columns before it and its own
+/// column left zero.
+pub(crate) fn aliased_factor(gram: MatRef<'_, f64>, p: usize, eps: f64) -> (Vec<bool>, Vec<f64>) {
     let mut l = vec![0.0f64; p * p]; // row-major lower-tri factor of the retained block
     let mut aliased = vec![false; p];
     for d in 0..p {
@@ -384,7 +392,7 @@ pub(crate) fn aliased_columns(gram: MatRef<'_, f64>, p: usize, eps: f64) -> Vec<
             l[i * p + d] = s / ljj;
         }
     }
-    aliased
+    (aliased, l)
 }
 
 /// Ill-conditioning DETECTION floor for the OLS and GLM routes, on the
@@ -494,15 +502,18 @@ pub fn fit_suff_stats_t_sq<'a>(
         xtx_work,
         scratch,
         ColumnScaling::IDENTITY,
+        Units::IDENTITY,
         None,
         None,
     )
 }
 
 /// [`fit_suff_stats_t_sq`] on a design fitted through a column map `B`
-/// (`x̃ = X·B`, `β = B·β̃`). The returned `betas` are β̃, on the design the
-/// statistics were accumulated from; `var_diag` and `t_sq` are the caller's:
-/// `Var(βₜ) = σ̂²·‖L⁻¹bₜ‖²` with `bₜ` row `t` of `B`, `t² = βₜ²/Var(βₜ)`.
+/// (`x̃ = X·B`, `β = B·β̃`) and on a response in `units` (the caller's β is
+/// `B·k·(β̃ + δ̃)`). The returned `betas` are β̃, on the design the
+/// statistics were accumulated from and in the internal units, and so are
+/// `sigma_sq` and `rss`; `var_diag` and `t_sq` are the caller's:
+/// `Var(βₜ) = k²·σ̂²·‖L⁻¹bₜ‖²` with `bₜ` row `t` of `B`, `t² = βₜ²/Var(βₜ)`.
 ///
 /// `qr`: the statistics were accumulated on `X·U⁻¹` (`lmm::DesignQr`), whose
 /// Gram is well conditioned where `X`'s is not. The factor and β come back
@@ -527,6 +538,7 @@ pub(crate) fn fit_suff_stats_t_sq_mapped<'a>(
     mut xtx_work: MatMut<'_, f64>,
     scratch: OlsScratch<'a>,
     map: &ColumnScaling,
+    units: &Units,
     qr: Option<&crate::lmm::DesignQr>,
     rows: Option<(MatRef<'_, f64>, &[f64])>,
 ) -> OlsFitView<'a> {
@@ -665,10 +677,16 @@ pub(crate) fn fit_suff_stats_t_sq_mapped<'a>(
             p,
             false, // lower-triangular L: row access factor[(i, k)]
         );
-        let vd = sigma_sq * norm_sq;
+        let mut vd = units.var_scale() * (sigma_sq * norm_sq);
+        // A variance that underflows or overflows is not representable: NaN,
+        // not a false 0 or inf. Mirrors `fit::common::vcov_from_chol`.
+        if sigma_sq > 0.0 && sigma_sq.is_finite() && !(vd > 0.0 && vd.is_finite()) {
+            vd = f64::NAN;
+        }
         fit_var_diag[out_idx] = vd;
         if vd > 0.0 && vd.is_finite() {
-            let beta_j = map.beta_coef(tj, &fit_betas[..p]);
+            let beta_j =
+                units.beta_scale() * (map.beta_coef(tj, &fit_betas[..p]) + units.shift_caller(tj));
             fit_t_sq[out_idx] = (beta_j * beta_j) / vd;
         } else {
             fit_t_sq[out_idx] = f64::NAN;

@@ -3,7 +3,7 @@
 `kind = "cr2_hp"` entry of the manifest's `inference_references` block.
 
 THE ORACLE IS SACRED. These JSONs are the frozen reference the crate's CR2 kernel is measured
-against at wide weights (gate G3 of spec 2-dcr), where the dense double-precision code is the
+against at wide weights, where the dense double-precision code is the
 less accurate side. On any glmm disagreement, glmm is presumed wrong: never relax a tolerance or
 edit a reference.
 

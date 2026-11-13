@@ -70,7 +70,7 @@ use super::{
     LmmGroupings, LmmKernel, LmmWorkspace,
 };
 use crate::inference::evd::psd_pseudo_inverse;
-use crate::standardize::ColumnScaling;
+use crate::standardize::{ColumnScaling, Units};
 
 /// The finite-difference step factor: `h_k = ETA·max(|θ̃_k|, 1)` on the
 /// kernel's unit-free θ̃. Pinned 2026-10-11 by the step sweep
@@ -112,10 +112,7 @@ pub(crate) enum DerivRoute {
 /// with the column standardization and the fixed-effect orthogonalization
 /// mapped out.
 ///
-/// The free θ coordinates are in the kernel's order, which differs from the
-/// order the groupings were written in when glmm makes the grouping with the
-/// most levels the primary; the df and the contrast tests use them only in
-/// sums over all coordinates, so the order does not change any result.
+/// The free θ coordinates are in the order the groupings were declared.
 #[derive(Clone, Debug)]
 pub(crate) struct SatterthwaiteState {
     /// `A_eff = 2·blockdiag(H_p⁺, τ̂²/ν)` over `(θ_free, τ)`, `n_free + 1`
@@ -235,11 +232,18 @@ impl SatterthwaiteState {
 
     /// The residual-only record of OLS and of a Gamma or inverse Gaussian
     /// GLM with φ estimated: the full `C` and `ν = n − p`, no variance
-    /// parameters (`a_eff` 0 × 0, no `jac_theta`), so every df is ν.
-    pub(crate) fn residual(c: Mat<f64>, nu: f64) -> Self {
+    /// parameters (`a_eff` 0 × 0, no `jac_theta`), so every df is ν. On a
+    /// fit with no estimates (every entry of `beta` NaN, or no column) ν is
+    /// NaN, never the `n − p` of a fit with `n ≤ p` or the `n` of one with no
+    /// columns: there is no estimate to test.
+    pub(crate) fn residual(c: Mat<f64>, nu: f64, beta: &[f64]) -> Self {
         SatterthwaiteState {
             c,
-            nu,
+            nu: if beta.iter().all(|b| b.is_nan()) {
+                f64::NAN
+            } else {
+                nu
+            },
             status: Status::Live,
             ..Self::switched_off()
         }
@@ -333,22 +337,26 @@ impl SatterthwaiteState {
     }
 }
 
-/// The pass at the θ̂ the last fit left in `ws.theta`; `map` is the column
-/// standardization the fit's rows were accumulated under.
-pub(crate) fn pass(ws: &mut LmmWorkspace, map: &ColumnScaling) -> SatterthwaiteState {
+/// The pass at the θ̂ the last fit left in `ws.theta`; `map` and `units` are
+/// the column standardization and the units the fit's rows were accumulated
+/// under.
+pub(crate) fn pass(
+    ws: &mut LmmWorkspace,
+    map: &ColumnScaling,
+    units: &Units,
+) -> SatterthwaiteState {
     let nu = residual_nu(ws);
     let LmmWorkspace {
         kernel,
         recovery,
         theta,
-        weight_scale,
         ..
     } = ws;
     assemble(&collect(
         kernel,
         theta,
         &recovery.beta_tilde,
-        *weight_scale,
+        units,
         map,
         nu,
         ETA,
@@ -369,6 +377,7 @@ pub(crate) fn pass(ws: &mut LmmWorkspace, map: &ColumnScaling) -> SatterthwaiteS
 pub(crate) fn pass_targets(
     ws: &mut LmmWorkspace,
     map: &ColumnScaling,
+    units: &Units,
     targets: &[u32],
     df_out: &mut [f64],
     contrasts: &[(u32, u32)],
@@ -379,7 +388,6 @@ pub(crate) fn pass_targets(
         kernel,
         recovery,
         theta,
-        weight_scale,
         pass_scratch,
         ..
     } = ws;
@@ -400,7 +408,7 @@ pub(crate) fn pass_targets(
         kernel,
         theta,
         &recovery.beta_tilde,
-        *weight_scale,
+        units,
         map,
         nu,
         ETA,
@@ -549,13 +557,14 @@ pub(crate) fn pass_at(
     ws: &mut LmmWorkspace,
     theta: &[f64],
     map: &ColumnScaling,
+    units: &Units,
 ) -> SatterthwaiteState {
     let nu = residual_nu(ws);
     assemble(&collect(
         &mut ws.kernel,
         theta,
         &ws.recovery.beta_tilde,
-        ws.weight_scale,
+        units,
         map,
         nu,
         ETA,
@@ -570,13 +579,14 @@ pub(crate) fn pass_value_at(
     ws: &mut LmmWorkspace,
     theta: &[f64],
     map: &ColumnScaling,
+    units: &Units,
 ) -> SatterthwaiteState {
     let nu = residual_nu(ws);
     assemble(&collect(
         &mut ws.kernel,
         theta,
         &ws.recovery.beta_tilde,
-        ws.weight_scale,
+        units,
         map,
         nu,
         ETA,
@@ -598,7 +608,6 @@ fn residual_nu(ws: &LmmWorkspace) -> f64 {
 /// θ̃ order (each block's `vech` is column-major, so a column is a contiguous
 /// run from its diagonal), less the entries the grouping's terms hold at zero:
 /// the fit never moved those, so they are not parameters of its criterion.
-#[cfg(test)]
 pub(crate) fn free_coordinates(g: &LmmGroupings, theta: &[f64]) -> Vec<usize> {
     let mut free = Vec::new();
     free_coordinates_into(g, theta, &mut free);
@@ -622,9 +631,10 @@ fn free_coordinates_into(g: &LmmGroupings, theta: &[f64], free: &mut Vec<usize>)
 /// Re-evaluate the deviance and `C` at θ̂ and on the stencil around it, on
 /// the response shifted by `X̃·beta_tilde` ([`shift_response_into`]), and put
 /// the kernel's statistics back afterwards. `beta_tilde` is the fit's β̂ on the
-/// kernel's design. `weight_scale` is the workspace's prior-weight scale, which
-/// τ̂ is reported on; `C` needs none (the scale cancels between the kernel's σ̂²
-/// and its `(X̃'V⁻¹X̃)⁻¹`). `eta` is the value route's step factor ([`ETA`] in
+/// kernel's design and in its units. `units` are the rows' units: τ̂ is
+/// reported in the caller's (`Units::dispersion_scale`), and `C` takes `k²`
+/// (`Units::var_scale`; the weight scale cancels between the kernel's σ̂² and
+/// its `(X̃'V⁻¹X̃)⁻¹`). `eta` is the value route's step factor ([`ETA`] in
 /// the pass); `eta_grad`, when given, lets the pass take the gradient route
 /// where it is armed, at that step factor ([`ETA_GRAD`] in the pass). The
 /// gradient reads the same shifted statistics.
@@ -633,7 +643,7 @@ fn collect(
     kernel: &mut LmmKernel,
     theta: &[f64],
     beta_tilde: &[f64],
-    weight_scale: f64,
+    units: &Units,
     map: &ColumnScaling,
     nu: f64,
     eta: f64,
@@ -645,7 +655,7 @@ fn collect(
         kernel,
         theta,
         beta_tilde,
-        weight_scale,
+        units,
         map,
         nu,
         eta,
@@ -663,7 +673,7 @@ fn collect_into(
     kernel: &mut LmmKernel,
     theta: &[f64],
     beta_tilde: &[f64],
-    weight_scale: f64,
+    units: &Units,
     map: &ColumnScaling,
     nu: f64,
     eta: f64,
@@ -672,7 +682,7 @@ fn collect_into(
     s: &mut StencilScratch,
 ) {
     shift_response_into(kernel, beta_tilde, &mut s.saved, &mut s.gram_row);
-    stencil(kernel, theta, weight_scale, map, nu, eta, eta_grad, col, s);
+    stencil(kernel, theta, units, map, nu, eta, eta_grad, col, s);
     restore_response(kernel, &s.saved);
 }
 
@@ -706,7 +716,7 @@ pub(crate) fn caller_map_into(
 fn stencil(
     kernel: &mut LmmKernel,
     theta: &[f64],
-    weight_scale: f64,
+    units: &Units,
     map: &ColumnScaling,
     nu: f64,
     eta: f64,
@@ -715,6 +725,7 @@ fn stencil(
     s: &mut StencilScratch,
 ) {
     let p = s.m.nrows();
+    let k2 = units.var_scale();
     free_coordinates_into(kernel.groupings(), theta, &mut col.free);
     let n = col.free.len();
     let steps = |h: &mut Vec<f64>, free: &[usize], eta: f64| {
@@ -726,8 +737,8 @@ fn stencil(
     s.point.clear();
     s.point.extend_from_slice(theta);
     col.f0 = kernel.deviance(&s.point);
-    c_at_into(kernel, &s.m, &mut s.w, &mut col.c0);
-    col.tau = kernel.sigma_sq() * weight_scale;
+    c_at_into(kernel, &s.m, &mut s.w, &mut col.c0, k2);
+    col.tau = kernel.sigma_sq() * units.dispersion_scale();
     col.nu = nu;
     col.f_mixed.clear();
     if let Some(g) = col.g_axis.take() {
@@ -736,7 +747,7 @@ fn stencil(
 
     if let Some(eta_grad) = eta_grad.filter(|_| per_group_gradient_armed(kernel)) {
         steps(&mut col.h, &col.free, eta_grad);
-        if gradient_axis(kernel, theta, col, s) {
+        if gradient_axis(kernel, theta, col, s, k2) {
             col.g_axis = Some(std::mem::take(&mut s.g_store));
             return;
         }
@@ -753,7 +764,7 @@ fn stencil(
             s.point[k] = theta[k] + step;
             f[side] = kernel.deviance(&s.point);
             s.point[k] = theta[k];
-            c_at_into(kernel, &s.m, &mut s.w, &mut col.c_axis[a][side]);
+            c_at_into(kernel, &s.m, &mut s.w, &mut col.c_axis[a][side], k2);
         }
         col.f_axis.push(f);
     }
@@ -776,14 +787,15 @@ fn stencil(
 
 /// The gradient route's axis points `θ̂ ± h_k e_k`, at `col.h`'s steps: at
 /// each, the deviance (which must be finite), then [`pg_gradient`] on the
-/// state it left, kept on the free coordinates (into `s.g_store`), then `C`.
-/// Fills `col.f_axis` and `col.c_axis`; `false` at the first non-finite
-/// deviance or unavailable gradient.
+/// state it left, kept on the free coordinates (into `s.g_store`), then `C`
+/// (times `k2`, as [`c_at_into`]). Fills `col.f_axis` and `col.c_axis`;
+/// `false` at the first non-finite deviance or unavailable gradient.
 fn gradient_axis(
     kernel: &mut LmmKernel,
     theta: &[f64],
     col: &mut Collected,
     s: &mut StencilScratch,
+    k2: f64,
 ) -> bool {
     let (p, n, n_theta) = (s.m.nrows(), col.free.len(), theta.len());
     col.f_axis.clear();
@@ -808,7 +820,7 @@ fn gradient_axis(
             let g = &mut s.g_store[a][side];
             g.clear();
             g.extend(col.free.iter().map(|&i| s.grad[i]));
-            c_at_into(kernel, &s.m, &mut s.w, &mut col.c_axis[a][side]);
+            c_at_into(kernel, &s.m, &mut s.w, &mut col.c_axis[a][side], k2);
         }
         col.f_axis.push(f);
     }
@@ -943,12 +955,12 @@ fn restore_response(kernel: &mut LmmKernel, saved: &SavedResponse) {
     }
 }
 
-/// `C = σ̂²·WᵀW`, `W = L̃⁻¹Mᵀ` (into `w`), from the factor and σ̂² the
+/// `C = k2·σ̂²·WᵀW`, `W = L̃⁻¹Mᵀ` (into `w`), from the factor and σ̂² the
 /// kernel's last evaluation left, into `c` (`p × p`, as `w`); exactly
-/// symmetric.
-fn c_at_into(kernel: &LmmKernel, m: &Mat<f64>, w: &mut Mat<f64>, c: &mut Mat<f64>) {
+/// symmetric. `k2` is `Units::var_scale`, so `C` is in the caller's units.
+fn c_at_into(kernel: &LmmKernel, m: &Mat<f64>, w: &mut Mat<f64>, c: &mut Mat<f64>, k2: f64) {
     let p = m.nrows();
-    let (l, s2) = (kernel.factor(), kernel.sigma_sq());
+    let (l, s2) = (kernel.factor(), kernel.sigma_sq() * k2);
     for t in 0..p {
         for i in 0..p {
             let mut acc = m[(t, i)];

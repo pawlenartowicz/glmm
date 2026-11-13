@@ -241,6 +241,7 @@ fn fit_ols_weighted_collinear_fits_with_an_honest_se() {
         p,
         &opts.se_for.columns(p),
         crate::standardize::ColumnScaling::IDENTITY,
+        crate::standardize::Units::IDENTITY,
     );
     assert!(
         view.converged,
@@ -494,7 +495,7 @@ fn ols_coef_df_is_n_minus_p() {
     );
 
     // n = p does not converge: no coef_df (as se), but the residual record
-    // stays, so the contrasts are NaN numbers on ν = 0, never `NoDf`.
+    // stays, so the contrasts are NaN numbers, df included, never `NoDf`.
     let x = [1.0, 0.3, -1.2, 1.0, -0.7, 0.4, 1.0, 1.1, 0.9];
     let y = [0.5, -0.2, 1.3];
     let f = fit_cold(&x, &y, 3, 3, &model, &GroupIds::default(), &all(3));
@@ -504,7 +505,7 @@ fn ols_coef_df_is_n_minus_p() {
         .contrast_t(&[0.0, 1.0, 0.0])
         .expect("the residual record, not NoDf");
     assert!(t.estimate.is_nan() && t.se.is_nan() && t.t.is_nan() && t.p_value.is_nan());
-    assert_eq!(t.df, 0.0);
+    assert!(t.df.is_nan());
     let fs = f
         .contrast_f(&[0.0, 1.0, 0.0, 0.0, 0.0, 1.0], 2)
         .expect("the residual record, not NoDf");
@@ -968,4 +969,54 @@ fn ols_constant_response_robust_ses_have_no_nan_without_a_note() {
         f.se,
         f.diagnostics.notes
     );
+}
+
+/// `[1, x]` with `x = x_scale·t` and `y = y_scale·(1 + 0.5·t + e)`, n = 20,
+/// fitted through the stable door with SEs on both columns.
+fn scaled_slope_fit(x_scale: f64, y_scale: f64) -> Fit {
+    let n = 20;
+    let mut x = Vec::with_capacity(2 * n);
+    let mut y = Vec::with_capacity(n);
+    for i in 0..n {
+        let t = (i as f64 * 0.618_033_988_749_895).fract() - 0.5;
+        let e = ((i as f64 * 0.754_877_666).fract() - 0.5) * 0.2;
+        x.extend([1.0, x_scale * t]);
+        y.push(y_scale * (1.0 + 0.5 * t + e));
+    }
+    let d = crate::Data::new(&x, &y, n, 2);
+    let f = crate::fit(
+        &d,
+        &ModelSpec::fixed(Family::Gaussian),
+        &FitOptions::default(),
+    )
+    .unwrap();
+    assert!(f.converged(), "not converged");
+    assert!(
+        !f.aliased().iter().any(|&a| a),
+        "aliased: {:?}",
+        f.aliased()
+    );
+    f
+}
+
+/// y near 1e-150 on x near 1e99: the slope variance is about 1e-500, below
+/// f64's range. Its SE and `vcov` diagonal are NaN, not a false 0; the
+/// intercept's variance (about 1e-302) is representable and stays.
+#[test]
+fn an_underflowed_slope_variance_gives_a_nan_se_not_zero() {
+    let f = scaled_slope_fit(1e99, 1e-150);
+    assert!(f.se[1].is_nan(), "se[1] = {}", f.se[1]);
+    assert!(f.vcov()[2 + 1].is_nan(), "vcov[1,1] = {}", f.vcov()[3]);
+    assert!(f.se[0].is_finite() && f.se[0] > 0.0, "se[0] = {}", f.se[0]);
+}
+
+/// x near 1e-200: the slope variance is about 1e400, above f64's range. The
+/// `vcov` diagonal is NaN, not inf, and the SE is NaN.
+#[test]
+fn an_overflowed_slope_variance_gives_a_nan_vcov_not_inf() {
+    let f = scaled_slope_fit(1e-200, 1.0);
+    assert!(f.se[1].is_nan(), "se[1] = {}", f.se[1]);
+    assert!(f.vcov()[2 + 1].is_nan(), "vcov[1,1] = {}", f.vcov()[3]);
+    assert!(f.beta[1].is_finite(), "beta[1] = {}", f.beta[1]);
+    assert!(f.se[0].is_finite() && f.se[0] > 0.0, "se[0] = {}", f.se[0]);
 }

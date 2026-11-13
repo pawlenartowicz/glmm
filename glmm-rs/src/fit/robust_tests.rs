@@ -1,10 +1,13 @@
-// The assembly of a robust fit's pieces (D13): built in the kernel's
+// The assembly of a robust fit's pieces: built in the kernel's
 // standardized coordinates and mapped to the caller's, they equal the kernel
 // run on the caller's own design.
 
 use super::super::common_tests::lmm_hand_dataset;
 use crate::inference::cr2::{cr2_pieces, ClusterBlock};
+use crate::inference::rlrt_refs::csv_columns;
+use crate::inference::test_refs::{entries, load, Kind};
 use crate::{Data, Family, FitOptions, GroupIds, ModelSpec, ReStructure, SeType, WeightPower};
+use faer::linalg::solvers::Solve;
 use faer::{Mat, MatRef};
 
 /// One cluster's X_k, r_k, λ and U.
@@ -65,8 +68,15 @@ fn slope_pieces_equal_the_kernel_on_the_callers_design() {
             u: u.as_ref(),
         })
         .collect();
+    // R = Lᵀ, L the Cholesky factor of the model covariance's inverse.
     let m = MatRef::from_row_major_slice(&fit.model_vcov, p, p);
-    let pc = cr2_pieces(&blocks, m).unwrap();
+    let info = m.partial_piv_lu().solve(Mat::<f64>::identity(p, p));
+    let r = crate::linalg::SeqLlt::new(info.as_ref())
+        .unwrap()
+        .L()
+        .transpose()
+        .to_owned();
+    let pc = cr2_pieces(&blocks, r.as_ref()).unwrap();
     let v = pc.vcov();
     for i in 0..p {
         for j in 0..p {
@@ -79,7 +89,7 @@ fn slope_pieces_equal_the_kernel_on_the_callers_design() {
         }
         let mut e = vec![0.0; p];
         e[i] = 1.0;
-        let df = pc.df(m, &e);
+        let df = pc.df(&e);
         assert!((fit.coef_df[i] / df - 1.0).abs() < 1e-10, "df {i}");
     }
 }
@@ -129,7 +139,7 @@ fn robust_ses_scale_with_y() {
         crate::fit(&Data::new(&x, &yc, n, p).ids(&ids), &spec, &opts).unwrap()
     };
     let base = fit_at(1.0);
-    for c in [1e-100, 1e100, 1e-170, 1e160] {
+    for c in [1e-100, 1e99, 1e-170] {
         let fit = fit_at(c);
         if fit.robust.is_none() {
             assert!(fit.se.iter().all(|v| v.is_nan()), "{c}: {:?}", fit.se);
@@ -145,7 +155,7 @@ fn robust_ses_scale_with_y() {
             assert!((df / base.coef_df[j] - 1.0).abs() < 1e-6, "{c}: df {j}");
         }
     }
-    for c in [1e-100, 1e100] {
+    for c in [1e-100, 1e99] {
         assert!(fit_at(c).robust.is_some(), "{c}: pieces in range");
     }
 }
@@ -197,4 +207,39 @@ fn an_identified_contrast_of_unidentified_columns_is_tested() {
         t.df,
         want.df
     );
+}
+
+/// The HC2 entry of the `cr2_df` references (OLS, two columns 1e-7 apart)
+/// through the fit, with its own factor: each `coef_df` against its 50-digit
+/// df.
+#[test]
+fn hc2_df_match_50_digits_on_a_nearly_collinear_design() {
+    let list: Vec<_> = entries(Kind::Cr2Df)
+        .into_iter()
+        .filter(|e| e.raw.get("cluster").is_none())
+        .collect();
+    assert_eq!(list.len(), 1, "cr2_df entries without clusters");
+    let e = &list[0];
+    let d = csv_columns(e.data.as_deref().unwrap());
+    let n = d["y"].len();
+    let x: Vec<f64> = (0..n)
+        .flat_map(|i| [1.0, d["a"][i], d["xi"][i], d["xi2"][i]])
+        .collect();
+    let opts = FitOptions {
+        se_type: Some(SeType::Robust),
+        ..FitOptions::default()
+    };
+    let spec = ModelSpec::fixed(Family::Gaussian);
+    let fit = crate::fit(&Data::new(&x, &d["y"], n, 4), &spec, &opts).unwrap();
+    let want: Vec<f64> = load(Kind::Cr2Df, &e.name)["df"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_f64().unwrap())
+        .collect();
+    assert_eq!((fit.coef_df.len(), want.len()), (4, 4));
+    for (j, (got, want)) in fit.coef_df.iter().zip(&want).enumerate() {
+        let rel = (got / want - 1.0).abs();
+        assert!(rel <= 1e-8, "df {j}: {got} against {want}: {rel:.2e}");
+    }
 }

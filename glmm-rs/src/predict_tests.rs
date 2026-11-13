@@ -272,6 +272,143 @@ fn nan_coefficient_contributes_zero() {
     assert!(got.lower.iter().chain(&got.upper).all(|v| v.is_nan()));
 }
 
+/// sleepstudy's `Reaction ~ Days + (1 | Subject)` on `[1, Days]` and on
+/// `[1, Days, 2·Days]`, whose third column is aliased: the lowering, the
+/// three-column design, and the two fits with condvar on.
+pub(crate) fn doubled_days_fits() -> (Lowered, Vec<f64>, Fit, Fit) {
+    let lo = formula::lower(
+        "Reaction ~ Days + (1 | Subject)",
+        &csv_table(SLEEP, &["Subject"]),
+        Family::Gaussian,
+    )
+    .unwrap();
+    let x3: Vec<f64> =
+        lo.x.chunks(2)
+            .flat_map(|r| [r[0], r[1], 2.0 * r[1]])
+            .collect();
+    let spec = ModelSpec::mixed(Family::Gaussian, Re::intercept());
+    let opts = FitOptions {
+        condvar: true,
+        ..FitOptions::default()
+    };
+    let n = lo.n;
+    let fit2 = crate::fit(&Data::new(&lo.x, &lo.y, n, 2).ids(&lo.ids), &spec, &opts).unwrap();
+    let fit3 = crate::fit(&Data::new(&x3, &lo.y, n, 3).ids(&lo.ids), &spec, &opts).unwrap();
+    assert!(fit3.diagnostics.aliased[2]);
+    (lo, x3, fit2, fit3)
+}
+
+/// A rank-deficient fit predicts its own training rows as it fitted them, a
+/// new row inside the row space (`x2 = 2x`) from the kept coefficients, and a
+/// row outside it as NaN with a note; an all-zero row stays estimable.
+#[test]
+fn a_row_outside_the_row_space_of_a_rank_deficient_fit_predicts_nan() {
+    let (lo, x3, fit2, fit3) = doubled_days_fits();
+    let spec = ModelSpec::mixed(Family::Gaussian, Re::intercept());
+    let popts = PredictOptions {
+        se: true,
+        ..PredictOptions::default()
+    };
+    let train = predict(
+        &fit3,
+        &spec,
+        &Design::new(&x3, lo.n, 3).ids(&lo.ids),
+        &popts,
+    )
+    .unwrap();
+    assert!(train.notes.is_empty(), "{:?}", train.notes);
+    for part in [&train.fit, &train.se, &train.lower, &train.upper] {
+        assert!(part.iter().all(|v| v.is_finite()));
+    }
+    for (i, (&got, &want)) in train.fit.iter().zip(&fit3.fitted).enumerate() {
+        assert!(
+            (got - want).abs() <= ROUNDOFF * (1.0 + want.abs()),
+            "row {i}"
+        );
+    }
+
+    let pop = PredictOptions {
+        population: true,
+        ..popts
+    };
+    let rows = [1.0, 1.0, 2.0, 1.0, 1.0, 3.0, 0.0, 0.0, 0.0];
+    let got = predict(&fit3, &spec, &Design::new(&rows, 3, 3), &pop).unwrap();
+    let want = predict(&fit2, &spec, &Design::new(&[1.0, 1.0], 1, 2), &pop).unwrap();
+    for (what, a, b) in [("fit", &got.fit, &want.fit), ("se", &got.se, &want.se)] {
+        assert!(
+            (a[0] - b[0]).abs() <= ROUNDOFF * (1.0 + b[0].abs()),
+            "{what}"
+        );
+    }
+    for part in [&got.fit, &got.se, &got.lower, &got.upper] {
+        assert!(part[1].is_nan() && part[2].is_finite());
+    }
+    assert!(
+        matches!(&got.notes[..], [Note::RowsNotEstimable { rows }] if rows == &[1]),
+        "{:?}",
+        got.notes
+    );
+}
+
+/// 36 rows of counts `y` over the cells a:B, b:A and b:B of `f1` (a, b) by
+/// `f2` (A, B), with six levels of `g` crossed with the cells; the cell a:A
+/// has no row.
+pub(crate) fn absent_cell_csv() -> String {
+    let cells = [("a", "B"), ("b", "A"), ("b", "B")];
+    let mut csv = String::from("y,f1,f2,g\n");
+    for i in 0..36 {
+        let (f1, f2) = cells[i % 3];
+        let y = 1 + (7 * i) % 5 + 2 * (i % 3);
+        csv.push_str(&format!("{y},{f1},{f2},g{}\n", (i / 3) % 6));
+    }
+    csv
+}
+
+/// The cell-means fit `y ~ 0 + f1:f2 + (1 | g)` with an absent cell: the
+/// cell's column is aliased, its row is NaN in every part with a note, and a
+/// cell with data predicts a number.
+#[test]
+fn an_absent_cell_of_a_cell_means_fit_predicts_nan() {
+    let poisson = Family::Poisson {
+        link: PoissonLink::Log,
+    };
+    let (lo, fit) = lowered_fit(
+        &absent_cell_csv(),
+        &["f1", "f2", "g"],
+        "y ~ 0 + f1:f2 + (1 | g)",
+        poisson,
+    );
+    let col = |name: &str| lo.col_names.iter().position(|c| c == name).unwrap();
+    let (aa, bb) = (col("f1a:f2A"), col("f1b:f2B"));
+    assert!(fit.diagnostics.aliased[aa]);
+    let p = lo.p;
+    let mut rows = vec![0.0; 2 * p];
+    rows[aa] = 1.0;
+    rows[p + bb] = 1.0;
+    let opts = PredictOptions {
+        population: true,
+        se: true,
+        future: true,
+        ..PredictOptions::default()
+    };
+    let got = predict(&fit, lo.spec(), &Design::new(&rows, 2, p), &opts).unwrap();
+    for part in [
+        &got.fit,
+        &got.se,
+        &got.lower,
+        &got.upper,
+        &got.future_lower,
+        &got.future_upper,
+    ] {
+        assert!(part[0].is_nan() && part[1].is_finite());
+    }
+    assert!(
+        matches!(&got.notes[..], [Note::RowsNotEstimable { rows }] if rows == &[0]),
+        "{:?}",
+        got.notes
+    );
+}
+
 /// A fit that returned no estimates (every coefficient NaN, nothing aliased)
 /// predicts NaN with a NaN standard error, interval and future bounds, on
 /// the link and the response scale.
@@ -473,6 +610,63 @@ fn se_and_interval_follow_their_formulas() {
     }
 }
 
+/// On the response scale of a Gamma inverse-link fit, a row with η̂ ≤ 0 has no
+/// mean: its fit, SE, interval and future bounds are NaN. A row with η̂ > 0
+/// whose interval reaches η ≤ 0 keeps a finite fit and lower end, and its
+/// upper end is +∞.
+#[test]
+fn a_reciprocal_link_row_with_eta_at_or_below_zero_predicts_nan() {
+    let (lo, fit) = lowered_fit(
+        include_str!("../../validation/data/simulated/sim_gamma.csv"),
+        &["cluster", "grp"],
+        "y ~ x + (1 | cluster)",
+        Family::Gamma {
+            link: GammaLink::Inverse,
+        },
+    );
+    let (b0, b1) = (fit.beta[0], fit.beta[1]);
+    assert!(b0 > 0.0 && b1 != 0.0, "b0 {b0}, b1 {b1}");
+    // On the design [1, x], η̂ = t·b0 at x = (t − 1)·b0/b1.
+    let x_at = |t: f64| (t - 1.0) * b0 / b1;
+    let cands: Vec<f64> = [0.5, 0.2, 0.1, 0.05, 0.02, 0.01, 0.001]
+        .iter()
+        .flat_map(|&t| [1.0, x_at(t)])
+        .collect();
+    let link_opts = PredictOptions {
+        population: true,
+        se: true,
+        ..PredictOptions::default()
+    };
+    let link = predict(&fit, lo.spec(), &Design::new(&cands, 7, 2), &link_opts).unwrap();
+    let k = (0..7)
+        .find(|&k| link.fit[k] - 1.96 * link.se[k] <= 0.0)
+        .expect("a candidate whose interval reaches η ≤ 0");
+    let eta_b = link.fit[k];
+    let rows = [1.0, x_at(-0.5), 1.0, cands[2 * k + 1]];
+    let opts = PredictOptions {
+        population: true,
+        se: true,
+        future: true,
+        scale: Scale::Response,
+        ..PredictOptions::default()
+    };
+    let got = predict(&fit, lo.spec(), &Design::new(&rows, 2, 2), &opts).unwrap();
+    for v in [
+        &got.fit,
+        &got.se,
+        &got.lower,
+        &got.upper,
+        &got.future_lower,
+        &got.future_upper,
+    ] {
+        assert!(v[0].is_nan(), "row with η̂ ≤ 0: {v:?}");
+    }
+    assert!(got.fit[1].is_finite() && got.fit[1] == 1.0 / eta_b);
+    assert!(got.lower[1].is_finite() && got.lower[1] > 0.0, "{got:?}");
+    assert_eq!(got.upper[1], f64::INFINITY);
+    assert!(got.future_lower[1].is_nan() && got.future_upper[1].is_nan());
+}
+
 /// The conditional SE equals `sqrt(zᵀCz + dᵀVd)`, `d = x − Kᵀz`, with `C` and
 /// `K` the dense inverse over the whole random-effect vector
 /// (`common_tests::dense_joint`) and `V` = `Fit::vcov`, so the covariance
@@ -483,7 +677,8 @@ fn se_and_interval_follow_their_formulas() {
 /// per-group fits with a correlated, an uncorrelated block and a
 /// random-effect-only slope, and on the GLMM structured layout a nested family
 /// with a crossed tail (cloglog) and Poisson fits with two and three crossed
-/// groupings in orders the size rule keeps and swaps.
+/// groupings in orders the size rule keeps and swaps, and a slope grouping
+/// written last with the first grouping nested in it.
 #[test]
 fn conditional_se_matches_a_dense_joint_inverse() {
     let mix_f: &[&str] = &["g1", "g2", "c1"];
@@ -492,7 +687,14 @@ fn conditional_se_matches_a_dense_joint_inverse() {
     let poisson = Family::Poisson {
         link: PoissonLink::Log,
     };
-    let shapes: [(&str, &[&str], &str, Family); 10] = [
+    // `nested_slope_case(true)` as CSV, labels zero-padded so the factor order
+    // is the id order.
+    let (x, y, _, n, h, g) = crate::fit::common_tests::nested_slope_case(true);
+    let mut nested_csv = String::from("y,x,h,g\n");
+    for i in 0..n {
+        nested_csv += &format!("{},{},h{:02},g{:02}\n", y[i], x[2 * i + 1], h[i], g[i]);
+    }
+    let shapes: [(&str, &[&str], &str, Family); 11] = [
         (
             include_str!("../../validation/data/empirical/Penicillin.csv"),
             &["plate", "sample"],
@@ -555,6 +757,12 @@ fn conditional_se_matches_a_dense_joint_inverse() {
             "TICKS ~ YEAR + cHEIGHT + (1 | LOCATION) + (1 | BROOD) + (1 | INDEX)",
             poisson,
         ),
+        (
+            &nested_csv,
+            &["h", "g"],
+            "y ~ 1 + x + (1 | h) + (1 + x | g)",
+            Family::Gaussian,
+        ),
     ];
     let opts = PredictOptions {
         se: true,
@@ -563,6 +771,10 @@ fn conditional_se_matches_a_dense_joint_inverse() {
     let mut ran = 0;
     for (csv, factors, formula, family) in shapes {
         let (lo, fit) = lowered_fit(csv, factors, formula, family);
+        if csv == nested_csv {
+            let c = fit.condvar_cross.as_ref().unwrap();
+            assert!(!c.nested_slots.is_empty(), "{formula}: the nested map");
+        }
         let joint = crate::fit::common_tests::dense_joint(&lo, &fit);
         let mut gap = 0.0f64;
         let (n, p) = (lo.n, lo.p);
@@ -654,7 +866,7 @@ fn conditional_se_matches_a_dense_joint_inverse() {
         eprintln!("{formula}: conditional SE {gap:e}");
         ran += 1;
     }
-    assert_eq!(ran, 10);
+    assert_eq!(ran, 11);
 }
 
 /// The inputs `predict` refuses, one per check.
@@ -670,7 +882,7 @@ fn option_errors() {
     let (sparse, sparse_fit) = lowered_fit(
         include_str!("../../validation/data/simulated/sim_slope_extra.csv"),
         &["g1", "g2"],
-        "y ~ 1 + x + (1 | g1) + (1 + x | g2)",
+        "y ~ 1 + x + (1 + x | g1) + (1 + x | g2)",
         Family::Gaussian,
     );
     let wide: Vec<f64> = sleep.x.chunks(2).flat_map(|r| [r[0], r[1], 0.0]).collect();
@@ -758,7 +970,11 @@ fn option_errors() {
             |e| matches!(e, FitError::Unsupported(_)),
         ),
     ];
-    assert!(sparse_fit.condvar.is_empty() && !sparse_fit.ranef.is_empty());
+    assert!(
+        sparse_fit.condvar.is_empty()
+            && !sparse_fit.ranef.is_empty()
+            && sparse_fit.ranef.iter().all(|v| v.is_finite())
+    );
     let mut ran = 0;
     for (what, got, want) in &cases {
         match got {
@@ -782,6 +998,28 @@ fn option_errors() {
     )
     .is_ok());
     assert!(predict(&sparse_fit, sparse.spec(), &sparse.data().design, &pop).is_ok());
+}
+
+/// A new row past the data range is refused like a fit's row, since `predict`
+/// runs the fit's design check.
+#[test]
+fn a_prediction_past_the_data_range_is_refused() {
+    let spec = ModelSpec::fixed(Family::Gaussian);
+    let (x, y) = ([1.0; 4], [1.0, 2.0, 3.0, 4.0]);
+    let fit = crate::fit(&Data::new(&x, &y, 4, 1), &spec, &FitOptions::default())
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    let new = [1.0, 2.0 * crate::limits::MAX_DATA_ABS];
+    let got = predict(
+        &fit,
+        &spec,
+        &Design::new(&new, 2, 1),
+        &PredictOptions::default(),
+    );
+    match got {
+        Err(FitError::Shape(m)) => assert!(m.contains("glmm::limits::MAX_DATA_ABS"), "{m:?}"),
+        Err(e) => panic!("wrong refusal: {e:?}"),
+        Ok(_) => panic!("accepted"),
+    }
 }
 
 /// The Monte Carlo check of the future-observation bounds.

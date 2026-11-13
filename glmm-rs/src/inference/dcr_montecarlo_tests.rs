@@ -1,16 +1,16 @@
-//! Spec 2-dcr's Monte Carlo gates (`montecarlo-tests`) on the weighted cells
+//! Monte Carlo checks (`montecarlo-tests`) on the weighted cells
 //! of [`DCR_TYPE1_CELLS`] and [`DCR_LRT_CELLS`]: every dataset drawn under the
 //! null of `x` ([`DcrDesign::null_y`]) and fitted through the ports' default
 //! calls, [`run_fit`] and [`run_compare`], with no `weight_power` and no
 //! `se_type`.
 //!
-//! - G11 (`dcr_type1_of_x`): the fit `y ~ x` (`+ (1 | g)`, or `+ (1 + x | g)`
+//! - Type I of `x` (`dcr_type1_of_x`): the fit `y ~ x` (`+ (1 | g)`, or `+ (1 + x | g)`
 //!   on the `S` cells) and its p-value of `x` (`coef_p`, on the SE and df the
-//!   defaults resolve to, D22). Its rejection rate at α = .05 within
+//!   defaults resolve to). Its rejection rate at α = .05 within
 //!   `.05 ± (MC_ASYM_REL·.05 + MC_LEVEL_K·SE)` (±.034 at R = 2000) and at most
 //!   .075, per cell.
-//! - G13 (`dcr_lrt_null`): `compare(y ~ 1, y ~ x)` (with `(1 | g)` on the
-//!   grouped cells), whose default fits δ by ML in both models (D16), and its
+//! - Null Type I of `compare()` (`dcr_lrt_null`): `compare(y ~ 1, y ~ x)` (with `(1 | g)` on the
+//!   grouped cells), whose default fits δ by ML in both models, and its
 //!   likelihood-ratio p-value. The rate at α = .05 at most .09 per cell, and
 //!   the mean of the 10 cells' rates at most .07: the test is somewhat
 //!   liberal where the noise is not a power of the weights (the `floor_mid`
@@ -20,8 +20,8 @@
 //! the rates are printed and nothing is gated. `MC_THREADS` splits each
 //! cell's datasets across threads (default the available parallelism; the
 //! counts do not depend on it). `MC_DCR_CELLS` (comma-separated ids) measures
-//! and gates only the cells named; G13's mean is gated only on all 10.
-//! `MC_DCR_LRT_ARM` (`shared` or `claimed`, see [`lrt_null`]) measures G13 on
+//! and gates only the cells named; the LRT mean is gated only on all 10.
+//! `MC_DCR_LRT_ARM` (`shared` or `claimed`, see [`lrt_null`]) measures the LRT check on
 //! another route and gates nothing. A
 //! dataset whose fit errs, does not converge or gives a p-value that is not
 //! finite is failed and left out; a cell that loses more than
@@ -38,10 +38,10 @@ use std::time::Instant;
 
 const ALPHA: f64 = 0.05;
 
-/// G11's per-cell ceiling, Bradley's liberal limit at α = .05.
+/// The per-cell ceiling of the Type I of `x` check, Bradley's liberal limit at α = .05.
 const CEILING: f64 = 0.075;
 
-/// G13's per-cell ceiling and ceiling on the mean of its 10 cells.
+/// The per-cell ceiling of the LRT check and ceiling on the mean of its 10 cells.
 const LRT_CEILING: f64 = 0.09;
 const LRT_MEAN_CEILING: f64 = 0.07;
 
@@ -108,7 +108,7 @@ fn arm(f: &FitResult) -> String {
     format!("{power}/{criterion}/{}", f.df_method)
 }
 
-/// G11 on dataset `r` of `d`.
+/// The Type I of `x` check on dataset `r` of `d`.
 fn type1_of_x(d: &DcrDesign, r: u64) -> Outcome {
     let (numeric, factors) = columns(d, d.null_y(r));
     let formula = format!("y ~ x{}", random_part(d));
@@ -140,7 +140,7 @@ fn type1_of_x(d: &DcrDesign, r: u64) -> Outcome {
     Ok((p < ALPHA, arm(&f)))
 }
 
-/// G13 on dataset `r` of `d`. With `MC_DCR_LRT_ARM=shared` (an experiment,
+/// The LRT check on dataset `r` of `d`. With `MC_DCR_LRT_ARM=shared` (an experiment,
 /// not the product's route): δ̂ by REML on the larger model, then both sides
 /// compared at that fixed power, so a WLS pair takes the F test;
 /// `MC_DCR_LRT_ARM=claimed` compares at the claimed weights (power 1).
@@ -359,8 +359,8 @@ fn cell_misses(gate: &str, m: &Measured, ceiling: f64) -> Vec<String> {
     misses
 }
 
-/// G11, the Type I of `x` of the default weighted fit on the 16 cells of
-/// spec 2-dcr §10.6.
+/// The Type I of `x` of the default weighted fit on the 16 cells of
+/// [`DCR_TYPE1_CELLS`].
 #[test]
 fn dcr_type1_of_x() {
     let (measured, gated, _) = run("G11", &DCR_TYPE1_CELLS, type1_of_x);
@@ -383,8 +383,8 @@ fn dcr_type1_of_x() {
     assert!(misses.is_empty(), "{}", misses.join("\n"));
 }
 
-/// G13, the null Type I of `compare()`'s likelihood-ratio test with δ fitted
-/// by ML in both models, on the 10 cells of spec 2-dcr §10.7.
+/// The null Type I of `compare()`'s likelihood-ratio test with δ fitted
+/// by ML in both models, on the 10 cells of [`DCR_LRT_CELLS`].
 #[test]
 fn dcr_lrt_null() {
     let (measured, gated, all) = run("G13", &DCR_LRT_CELLS, lrt_null);

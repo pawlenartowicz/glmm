@@ -1,4 +1,4 @@
-# Copy of docs/0.9.0/cr2-large-clusters/lib.py; dense_cluster() carries the cut of spec 2-dcr §3.2.
+# dense_cluster() carries the scale-free cut on the eigenvalues of T.
 # Its scipy.linalg calls are numpy ones here, so the validation venv needs no scipy.
 """CR2 on large clusters: shared code. Dense reference, data generator, quadrature method.
 

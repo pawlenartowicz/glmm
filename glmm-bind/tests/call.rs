@@ -3,11 +3,11 @@ mod common;
 use std::collections::HashMap;
 
 use common::{f64s, factor, field, fit_args, rec, sleepstudy, text};
-use glmm_bind::{call, Record, Value};
+use glmm_bind::{call, Port, Record, Value};
 
 #[test]
 fn unknown_function_is_invalid_argument() {
-    let e = call("nope", Record::new()).unwrap_err();
+    let e = call(Port::Python, "nope", Record::new()).unwrap_err();
     assert_eq!(e.code, "invalid_argument");
     assert!(
         e.message.contains("unknown function 'nope'"),
@@ -19,14 +19,14 @@ fn unknown_function_is_invalid_argument() {
 #[test]
 fn unexpected_and_missing_arguments_are_named() {
     let r = rec(vec![("formula", text("y ~ x")), ("bogus", Value::Null)]);
-    let e = call("fit", r).unwrap_err();
+    let e = call(Port::Python, "fit", r).unwrap_err();
     assert_eq!(e.code, "invalid_argument");
     assert!(
         e.message.contains("unexpected argument 'bogus'"),
         "{}",
         e.message
     );
-    let e = call("fit", Record::new()).unwrap_err();
+    let e = call(Port::Python, "fit", Record::new()).unwrap_err();
     assert!(
         e.message.contains("missing required argument"),
         "{}",
@@ -37,7 +37,7 @@ fn unexpected_and_missing_arguments_are_named() {
 #[test]
 fn a_duplicate_argument_is_refused() {
     let r = rec(vec![("formula", text("y ~ x")), ("formula", text("y ~ 1"))]);
-    let e = call("fit", r).unwrap_err();
+    let e = call(Port::Python, "fit", r).unwrap_err();
     assert!(e.message.contains("'formula' twice"), "{}", e.message);
 }
 
@@ -70,7 +70,7 @@ fn fit_through_call_matches_run_fit() {
             codes: codes.iter().map(|&c| c as i32).collect(),
         },
     )]);
-    let out = call("fit", fit_args(formula, numeric, factors, 0)).unwrap();
+    let out = call(Port::Python, "fit", fit_args(formula, numeric, factors, 0)).unwrap();
 
     let direct = glmm::orchestrate::run_fit(
         formula,
@@ -120,7 +120,7 @@ fn a_missing_factor_code_is_refused() {
             codes: vec![0, 1, -1, 0],
         },
     )]);
-    let e = call("fit", fit_args("y ~ g", numeric, factors, 0)).unwrap_err();
+    let e = call(Port::Python, "fit", fit_args("y ~ g", numeric, factors, 0)).unwrap_err();
     assert_eq!(e.code, "invalid_argument");
     assert!(e.message.contains("factor column \"g\""), "{}", e.message);
 }
@@ -137,7 +137,7 @@ fn a_length_one_vector_is_described_by_its_element() {
         ]);
         let mut r = fit_args("Reaction ~ Days", numeric, Record::new(), 0);
         r.push(k, v);
-        call("fit", r).unwrap_err().message
+        call(Port::Python, "fit", r).unwrap_err().message
     };
     let e = fit("weight_power", Value::StrVec(vec!["est".into()]));
     assert!(
@@ -174,7 +174,7 @@ fn weight_power_and_se_type_reach_fit_and_compare() {
         for (k, v) in extra {
             r.push(k, v);
         }
-        call("fit", r)
+        call(Port::Python, "fit", r)
     };
     let e = fit(vec![("weight_power", text("Estimate"))]).unwrap_err();
     assert_eq!(e.code, "invalid_argument");
@@ -215,7 +215,7 @@ fn weight_power_and_se_type_reach_fit_and_compare() {
         ("se_type", text("robust")),
         ("row_base", Value::I64(0)),
     ]);
-    let e = call("compare", compare).unwrap_err();
+    let e = call(Port::Python, "compare", compare).unwrap_err();
     assert_eq!(e.code, "fit_error");
     assert!(e.message.contains("se_type"), "{}", e.message);
 }
@@ -251,7 +251,7 @@ fn a_robust_fit_record_carries_its_pieces() {
         for (k, v) in extra {
             r.push(k, v);
         }
-        call("fit", r).unwrap()
+        call(Port::Python, "fit", r).unwrap()
     };
     let p = 2;
     for (formula, method, extra) in [
@@ -288,9 +288,195 @@ fn a_robust_fit_record_carries_its_pieces() {
             levels.len()
         };
         assert_eq!(er.len(), p * clusters, "{formula}");
+        assert_eq!(f64s(field(robust, "t")).len(), p * p, "{formula}");
     }
     let model = fit("Reaction ~ Days", vec![("weight_power", Value::F64(1.0))]);
     assert_eq!(field(&model, "df_method"), &text("residual"));
     assert_eq!(field(&model, "robust"), &Value::Null);
     assert_eq!(field(&model, "model_vcov"), &Value::List(vec![]));
+}
+
+#[test]
+fn pairwise_and_its_intervals_carry_their_notes() {
+    let numeric = rec(vec![(
+        "y",
+        Value::Vec(vec![1.0, 1.4, 0.8, 2.1, 2.5, 1.9, 3.2, 2.7, 3.6]),
+    )]);
+    let factors = rec(vec![(
+        "f",
+        Value::Factor {
+            levels: vec!["a".into(), "b".into(), "c".into()],
+            codes: vec![0, 0, 0, 1, 1, 1, 2, 2, 2],
+        },
+    )]);
+    let out = call(
+        Port::Python,
+        "fit",
+        fit_args("y ~ f", numeric.clone(), factors.clone(), 0),
+    )
+    .unwrap();
+    let pairwise = |adjust: &str| {
+        let mut r = rec(vec![
+            ("formula", text("y ~ f")),
+            ("numeric", Value::Record(numeric.clone())),
+            ("factors", Value::Record(factors.clone())),
+            ("family", text("gaussian")),
+            ("link", text("identity")),
+            ("factor", text("f")),
+            ("adjust", text(adjust)),
+            ("converged", Value::Bool(false)),
+        ]);
+        for k in ["df_method", "beta", "vcov", "aliased", "nobs", "names"] {
+            r.push(k, field(&out, k).clone());
+        }
+        call(Port::Python, "pairwise", r).unwrap()
+    };
+    let intervals = |table: Value| {
+        call(
+            Port::R,
+            "pairwise_confint",
+            rec(vec![("table", table), ("level", Value::F64(0.9))]),
+        )
+        .unwrap()
+    };
+    let notes = |v: &Value| match field(v, "notes") {
+        Value::StrVec(n) => n.clone(),
+        other => panic!("{other:?}"),
+    };
+    let holm = pairwise("holm");
+    assert_eq!(
+        notes(&holm),
+        [
+            "The fit did not converge, so its estimates are not at a maximum and these tests are \
+             not reliable. Change the model until it converges (a simpler random part often \
+             helps), then test again.",
+            "P value adjustment: holm method for 3 tests",
+        ]
+    );
+    assert_eq!(
+        notes(&intervals(holm)),
+        [
+            "The fit did not converge, so its estimates are not at a maximum and these \
+             intervals are not reliable. Change the model until it converges (a simpler random \
+             part often helps), then compute them again.",
+            "Confidence level used: 0.9",
+            "Holm has no simultaneous interval; Bonferroni intervals shown.",
+        ]
+    );
+    let tukey = notes(&intervals(pairwise("tukey")));
+    assert_eq!(
+        tukey[2],
+        "Conf-level adjustment: tukey method for comparing a family of 3 estimates"
+    );
+}
+
+#[test]
+fn pairwise_notes_count_each_by_groups_family() {
+    // y ~ f * h with the cell f = c, h = v empty: in h = v only a - b is
+    // estimable, so that group has one test where h = u has three.
+    let codes_f = vec![0, 0, 1, 1, 2, 2, 0, 0, 1, 1];
+    let codes_h = vec![0, 0, 0, 0, 0, 0, 1, 1, 1, 1];
+    let numeric = rec(vec![(
+        "y",
+        Value::Vec(vec![1.0, 1.4, 2.1, 2.5, 3.2, 2.7, 1.8, 2.2, 3.1, 2.6]),
+    )]);
+    let factors = rec(vec![
+        (
+            "f",
+            Value::Factor {
+                levels: vec!["a".into(), "b".into(), "c".into()],
+                codes: codes_f,
+            },
+        ),
+        (
+            "h",
+            Value::Factor {
+                levels: vec!["u".into(), "v".into()],
+                codes: codes_h,
+            },
+        ),
+    ]);
+    let out = call(
+        Port::Python,
+        "fit",
+        fit_args("y ~ f * h", numeric.clone(), factors.clone(), 0),
+    )
+    .unwrap();
+    let pairwise = |adjust: &str| {
+        let mut r = rec(vec![
+            ("formula", text("y ~ f * h")),
+            ("numeric", Value::Record(numeric.clone())),
+            ("factors", Value::Record(factors.clone())),
+            ("family", text("gaussian")),
+            ("link", text("identity")),
+            ("factor", text("f")),
+            ("by", text("h")),
+            ("adjust", text(adjust)),
+            ("converged", Value::Bool(true)),
+        ]);
+        for k in ["df_method", "beta", "vcov", "aliased", "nobs", "names"] {
+            r.push(k, field(&out, k).clone());
+        }
+        call(Port::Python, "pairwise", r).unwrap()
+    };
+    let notes = |v: &Value| match field(v, "notes") {
+        Value::StrVec(n) => n.clone(),
+        other => panic!("{other:?}"),
+    };
+    let intervals = |table: Value| {
+        notes(
+            &call(
+                Port::R,
+                "pairwise_confint",
+                rec(vec![("table", table), ("level", Value::F64(0.95))]),
+            )
+            .unwrap(),
+        )
+    };
+    let aliased = [
+        "a - c, h = v: The coefficient fc:hv is aliased, so the hypothesis was not tested.",
+        "b - c, h = v: The coefficient fc:hv is aliased, so the hypothesis was not tested.",
+    ];
+    let holm = pairwise("holm");
+    let p = f64s(field(&holm, "p_value"));
+    assert!(p[..4].iter().all(|v| !v.is_nan()) && p[4..].iter().all(|v| v.is_nan()));
+    assert_eq!(
+        notes(&holm),
+        [
+            &["P value adjustment: holm method for 1 or 3 tests"][..],
+            &aliased
+        ]
+        .concat()
+    );
+    let tukey = pairwise("tukey");
+    assert_eq!(
+        notes(&tukey),
+        [
+            &["P value adjustment: tukey method for varying family sizes"][..],
+            &aliased
+        ]
+        .concat()
+    );
+    assert_eq!(
+        intervals(tukey),
+        [
+            &[
+                "Confidence level used: 0.95",
+                "Conf-level adjustment: tukey method for varying family sizes"
+            ][..],
+            &aliased
+        ]
+        .concat()
+    );
+    assert_eq!(
+        intervals(pairwise("bonferroni")),
+        [
+            &[
+                "Confidence level used: 0.95",
+                "Conf-level adjustment: bonferroni method for 1 or 3 estimates"
+            ][..],
+            &aliased
+        ]
+        .concat()
+    );
 }

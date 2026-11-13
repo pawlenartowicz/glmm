@@ -2169,11 +2169,11 @@ fn scalar_crossed_lmm_is_grouping_order_insensitive() {
         "pinned block count"
     );
     // Not vacuous: this design (seed 1, zero true small-grouping variance)
-    // pins the small grouping's diagonal, so both sides carry a real block —
-    // an empty `pinned` here would mean the fixture stopped pinning and the
-    // swap check below stopped checking anything.
+    // pins the small grouping's diagonal, so both sides carry a `true` —
+    // an all-false `pinned` here would mean the fixture stopped pinning and
+    // the swap check below stopped checking anything.
     assert!(
-        !a.diagnostics.pinned.is_empty(),
+        a.diagnostics.pinned.iter().flatten().any(|&b| b),
         "fixture must pin the small grouping's variance for this check to compare anything"
     );
     for (g, h) in [(0usize, 1usize), (1, 0)] {
@@ -2518,6 +2518,7 @@ fn lmm_maxfun_cap_q2_reports_honest_endpoint_and_not_singular() {
             None,
             None,
             ColumnScaling::IDENTITY,
+            crate::standardize::Units::IDENTITY,
         );
         lmm_view_to_fit(&v, &x, &[], &[], 0, None, None, &ids, n, p, &opts)
     };
@@ -3126,7 +3127,7 @@ fn note_on_maxfun_endpoint() {
     };
     let mut ws = build_workspace(&model, &ids, n, p, &opts);
     {
-        let (lmm, _) = ws.lmm_parts().expect("a Gaussian mixed workspace");
+        let (lmm, _, _) = ws.lmm_parts().expect("a Gaussian mixed workspace");
         // One θ, so the search is BOBYQA's; five evaluations stop it short.
         let mut config = Config::new(1);
         config.max_fun = 5;
@@ -3449,7 +3450,7 @@ fn design_summary_kept_inside_envelope() {
         let n = ids.len();
         let mut ws = build_workspace(&model, &gids, n, p, &opts);
         {
-            let (lmm, _) = ws.lmm_parts().expect("a Gaussian mixed workspace");
+            let (lmm, _, _) = ws.lmm_parts().expect("a Gaussian mixed workspace");
             let mut config = Config::new(1);
             config.max_fun = 5;
             lmm.solver = Bobyqa::new(1, config).expect("legal minimal config");
@@ -3500,6 +3501,7 @@ fn design_summary_kept_inside_envelope() {
                 None,
                 None,
                 ColumnScaling::IDENTITY,
+                crate::standardize::Units::IDENTITY,
             );
             lmm_view_to_fit(&v, &x, &[], &[], 0, None, None, &gids, n, p, &opts)
         };

@@ -2253,7 +2253,10 @@ fn noz_sparse_ranef_agrees() {
         "blocked and sparse must report the same per-grouping level counts"
     );
     assert_eq!(noz.ranef.len(), sp.ranef.len(), "ranef length");
-    assert!(!noz.ranef.is_empty(), "blocked path must recover ranef");
+    assert!(
+        !noz.ranef.is_empty() && noz.ranef.iter().all(|v| v.is_finite()),
+        "blocked path must recover ranef"
+    );
     let mut max_rel = 0f64;
     for (k, (a, b)) in noz.ranef.iter().zip(sp.ranef.iter()).enumerate() {
         let rel = (a - b).abs() / (1.0 + b.abs());
@@ -2504,7 +2507,19 @@ fn fit_wide_slopes_sparse_is_pinned() {
         se_for: SeFor::Only(vec![0, 1, 2, 3, 4]),
         ..crate::FitOptions::default()
     };
-    let f = fit_cold(&x, &y, n, p, &model.spec, &ids, &opts);
+    let f = crate::fit::fit_mle_sparse_pub(
+        &x,
+        &y,
+        None,
+        None,
+        n,
+        p,
+        &crate::fit::sized_as_declared(&model.spec, &ids),
+        &ids.primary,
+        &ids.extra,
+        None,
+        &opts,
+    );
 
     assert!(f.converged(), "sparse over-width fit must converge");
     assert_pinned(&f.beta, &REF_BETA, BAND, "beta");
@@ -2592,15 +2607,17 @@ pub(crate) fn sparse_gamma_design() -> (
     (x, y, n, p, model, ids)
 }
 
-/// A random slope on a column far from zero, sparse route: the
-/// `sim_sparse_gamma` design with `x1` (a slope of the crossed q = 5 block)
-/// shifted by 1000. Before the design was standardized internally that fit
-/// ran out of budget (`converged = false`, 39000 evaluations) 3.67e-4 short of
-/// the optimum. Now both designs reach the search as the same centered column,
-/// so the shifted fit reaches the unshifted optimum. Rx SEs: the case is about
-/// the search, and the FD-Hessian would only add minutes.
-/// Measured on dell-fedora (2026-10-01): converged in 731 evaluations (643
-/// unshifted), logLik 7.1e-9 above the unshifted fit's.
+/// A random slope on a column far from zero: the `sim_sparse_gamma` design
+/// with `x1` (a slope of the crossed q = 5 block) shifted by 1000. The q = 5
+/// grouping is the only one with slopes and is written second, so the size
+/// rule moves it first and the fit takes the dense route, not the sparse one.
+/// Before the design was standardized internally, the same fit on the sparse
+/// route ran out of budget (`converged = false`, 39000 evaluations) 3.67e-4
+/// short of the optimum. Now both designs reach the search as the same
+/// centered column, so the shifted fit reaches the unshifted optimum. Rx SEs:
+/// the case is about the search, and the FD-Hessian would only add time.
+/// Measured on the x86_64 anchor (2026-11-11): converged in 33 evaluations
+/// (33 unshifted), logLik 6.8e-13 apart.
 #[test]
 fn fit_sparse_gamma_shifted_x1_reaches_the_optimum() {
     let (x, y, n, p, model, ids) = sparse_gamma_design();
@@ -2711,7 +2728,7 @@ fn fit_sparse_gamma_hessian_is_pinned() {
     // objective became the ML one (φ a coordinate of the outer search, the
     // joint Hessian gaining its `ln φ` row, observed curvature in the
     // log-determinant), which moves every coordinate.
-    // Re-pinned 2026-10-01, P45 follow-up simplification: `stddev_se` on a
+    // Re-pinned 2026-10-01: `stddev_se` on a
     // q ≥ 2 block became the SE of the reported stddev, so the four slope
     // rows (slots 6, 10, 13, 15) took the new quantity's values and the
     // off-diagonal slots are NaN. Slots 0 and 1 (the scalar and ge's
@@ -2729,15 +2746,29 @@ fn fit_sparse_gamma_hessian_is_pinned() {
     ];
 
     let (x, y, n, p, model, ids) = sparse_gamma_design();
+    let sized = crate::fit::sized_as_declared(&model, &ids);
     assert!(matches!(
-        crate::fit::classify_design(&crate::fit::spec_sized_from_ids(&model, &ids).0, 1),
+        crate::fit::classify_design(&sized, 1),
         crate::fit::Solver::Sparse
     ));
     let opts = crate::FitOptions {
         se_for: SeFor::Only(vec![0, 1, 2, 3, 4]),
         ..crate::FitOptions::default() // default WaldSe::Hessian
     };
-    let f = fit_cold(&x, &y, n, p, &model, &ids, &opts);
+    let (f, _, _) = crate::fit::fit_glmm_packed(
+        &x,
+        &y,
+        None,
+        None,
+        n,
+        p,
+        &sized,
+        &ids.primary,
+        &ids.extra,
+        f64::NAN,
+        None,
+        &opts,
+    );
     assert!(f.converged(), "sparse gamma GLMM (Hessian) must converge");
     // Every PIRLS solve of this fit converges inside PIRLS_MAX_ITERS, so no
     // trial point exhausts it and no PirlsExhausted note is carried.
@@ -3284,15 +3315,17 @@ fn fit_sparse_gamma_glmm_weighted_matches_glmmtmb() {
         se_for: SeFor::Only(vec![0, 1, 2, 3, 4]),
         ..crate::FitOptions::default() // default WaldSe::Hessian
     };
-    let f = fit_warm_wo(
+    let (f, _, _) = crate::fit::fit_glmm_packed(
         &x,
         &y,
+        Some(&weights),
+        None,
         n,
         p,
-        &model,
-        &ids,
-        None,
-        Some(&weights),
+        &crate::fit::sized_as_declared(&model, &ids),
+        &ids.primary,
+        &ids.extra,
+        f64::NAN,
         None,
         &opts,
     );
@@ -4716,7 +4749,20 @@ fn sparse_glmm_over_envelope_converges_gamma() {
         se_for: SeFor::Only(vec![0, 1, 2, 3, 4]),
         ..crate::FitOptions::default()
     };
-    let f = fit_cold(&x, &y, n, p, &model.spec, &ids, &opts);
+    let (f, _, _) = crate::fit::fit_glmm_packed(
+        &x,
+        &y,
+        None,
+        None,
+        n,
+        p,
+        &model,
+        &ids.primary,
+        &ids.extra,
+        f64::NAN,
+        None,
+        &opts,
+    );
     assert!(f.converged(), "over-width gamma converges");
     assert!(f.beta.iter().all(|b| b.is_finite()) && f.se.iter().all(|s| s.is_finite()));
 
@@ -5216,7 +5262,7 @@ fn fit_sparse_lmm_weighted_matches_lme4() {
         primary: g1,
         extra: vec![g2],
     };
-    let (sized, ids, _perm) = crate::fit::spec_sized_from_ids(&model, &ids);
+    let sized = crate::fit::sized_as_declared(&model, &ids);
     assert!(
         matches!(
             crate::fit::classify_design(&sized, 1),
@@ -5229,7 +5275,19 @@ fn fit_sparse_lmm_weighted_matches_lme4() {
         se_for: SeFor::Only(vec![0, 1, 2]),
         ..crate::FitOptions::default()
     };
-    let f = fit_warm_wo(&x, &y, n, p, &model, &ids, None, Some(&w), None, &opts);
+    let f = crate::fit::fit_mle_sparse_pub(
+        &x,
+        &y,
+        Some(&w),
+        None,
+        n,
+        p,
+        &sized,
+        &ids.primary,
+        &ids.extra,
+        None,
+        &opts,
+    );
 
     assert!(f.converged(), "weighted sparse LMM must converge");
     assert!(
@@ -5332,7 +5390,19 @@ fn fit_sparse_lmm_weighted_matches_lme4() {
     // β/se). A run showed
     // ~1e-9 drift on β0 here; 1e-6 keeps headroom without being loose.
     let f_forced = with_forced_sparse_tail(|| {
-        fit_warm_wo(&x, &y, n, p, &model, &ids, None, Some(&w), None, &opts)
+        crate::fit::fit_mle_sparse_pub(
+            &x,
+            &y,
+            Some(&w),
+            None,
+            n,
+            p,
+            &sized,
+            &ids.primary,
+            &ids.extra,
+            None,
+            &opts,
+        )
     });
     assert!(
         f_forced.converged(),
@@ -5435,7 +5505,19 @@ fn sparse_lmm_pinned_names_the_collapsed_component() {
         se_for: SeFor::Only(vec![0, 1]),
         ..crate::FitOptions::default()
     };
-    let f = fit_cold(&x, &y, n, p, &model.spec, &ids, &opts);
+    let f = crate::fit::fit_mle_sparse_pub(
+        &x,
+        &y,
+        None,
+        None,
+        n,
+        p,
+        &model,
+        &ids.primary,
+        &ids.extra,
+        None,
+        &opts,
+    );
 
     assert!(f.converged(), "sparse fit must converge");
     assert!(f.singular(), "gp has no signal, so its component pins");
@@ -5544,7 +5626,19 @@ fn sparse_lmm_pinned_names_the_second_groupings_slope() {
         se_for: SeFor::Only(vec![0, 1]),
         ..crate::FitOptions::default()
     };
-    let f = fit_cold(&x, &y, n, p, &model.spec, &ids, &opts);
+    let f = crate::fit::fit_mle_sparse_pub(
+        &x,
+        &y,
+        None,
+        None,
+        n,
+        p,
+        &model,
+        &ids.primary,
+        &ids.extra,
+        None,
+        &opts,
+    );
 
     assert!(f.converged(), "sparse fit must converge");
     assert!(
@@ -5633,13 +5727,26 @@ fn sparse_glmm_pinned_names_the_collapsed_component() {
         se_for: SeFor::Only(vec![0, 1]),
         ..crate::FitOptions::default()
     };
-    let f = fit_cold(&x, &y, n, p, &model.spec, &ids, &opts);
+    let (f, _, _) = crate::fit::fit_glmm_packed(
+        &x,
+        &y,
+        None,
+        None,
+        n,
+        p,
+        &model,
+        &ids.primary,
+        &ids.extra,
+        f64::NAN,
+        None,
+        &opts,
+    );
 
     assert!(f.converged(), "sparse binomial fit must converge");
     assert!(f.singular(), "gp carries no signal, so its component pins");
     assert!(
-        !f.diagnostics.pinned.is_empty(),
-        "the sparse GLMM route must name its pins, not report an empty grid"
+        f.diagnostics.pinned.iter().flatten().any(|&b| b),
+        "the sparse GLMM route must name its pins, not report an all-false grid"
     );
     // The WHOLE grid, not just `pinned[0][0]`. `ge`'s block is 2 wide, and
     // `pinned_flags` consumes its bits from the same `diagonal_theta`-ordered
@@ -5792,18 +5899,32 @@ fn assert_sparse_sign_trap_escaped(
         "y ~ x1 + (1 | g1) + (1 + x1 | g2)",
         family,
     );
-    let f = fit_warm_wo(
-        &lo.x,
-        &lo.y,
-        lo.n,
-        lo.p,
-        &lo.model,
-        &lo.ids,
-        None,
+    let sized = crate::fit::sized_as_declared(&lo.model, &lo.ids);
+    let (w, o, opts) = (
         lo.weights.as_deref(),
         lo.offset.as_deref(),
-        &crate::FitOptions::default(),
+        crate::FitOptions::default(),
     );
+    let (cl, ex) = (&lo.ids.primary, &lo.ids.extra);
+    let f = if matches!(family, Family::Gaussian) {
+        crate::fit::fit_mle_sparse_pub(&lo.x, &lo.y, w, o, lo.n, lo.p, &sized, cl, ex, None, &opts)
+    } else {
+        crate::fit::fit_glmm_packed(
+            &lo.x,
+            &lo.y,
+            w,
+            o,
+            lo.n,
+            lo.p,
+            &sized,
+            cl,
+            ex,
+            f64::NAN,
+            None,
+            &opts,
+        )
+        .0
+    };
     assert!(
         f.converged(),
         "{what}: must converge ({:?})",

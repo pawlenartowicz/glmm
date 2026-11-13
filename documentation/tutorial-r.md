@@ -246,7 +246,7 @@ shaped like lme4's. These **work**:
 | `tidy(fit)`, `glance(fit)` | broom-shaped data frames: one row per fixed effect (`term`, `estimate`, `std.error`, `statistic`, then `df` where `summary()` has a df column, then `p.value`; the statistic and p-value are the summary's, t or z), and one row of fit statistics (`nobs`, `logLik`, `AIC`, `BIC`, `deviance`, `df.residual`, `REML`). |
 | `fit$coef_df`, `fit$coef_p`, `fit$df_method` | per coefficient, the df of its t test (Satterthwaite on a Gaussian mixed model, `n - p` on OLS and the dispersion GLMs, `NaN` where the test is z and on an OLS or dispersion-GLM fit that did not converge) and that test's p-value; `df_method` says which (`"satterthwaite"`, `"residual"`, `"none"`, `"disabled"`, `"failed"`, and on a robust fit `"pustejovsky_tipton"` or `"bell_mccaffrey"`). |
 | `fit$weight_power`, `fit$estimated_weight_power`, `fit$se_type` | the power used on `weights` (the estimate on a fitted power, 1 on the weights as given, `NaN` without weights), whether the fit estimated it, and the standard error behind `se`, `vcov` and `coef_df` (`"model"` or `"robust"`); see [`conventions.md`](conventions.md#weight-power-and-robust-standard-errors). |
-| `fit$rss`, `fit$r_squared`, `fit$adj_r_squared` | OLS only: the weighted residual sum of squares and `summary.lm`'s multiple and adjusted R-squared (0 on an intercept-only model); `NaN` on every other fit and on a non-converged one. |
+| `fit$rss`, `fit$r_squared`, `fit$adj_r_squared` | OLS only: the weighted residual sum of squares and `summary.lm`'s multiple and adjusted R-squared (0 on an intercept-only model); `NaN` on every other fit, on a non-converged one, and when neither the response nor the fitted values vary beyond round-off. |
 | `logLik(fit)` | log-likelihood on `stats::logLik`'s scale; on a REML fit (a Gaussian mixed model with the default `REML`, or OLS with `REML = TRUE`) this is the REML criterion (`REML = TRUE` attribute), on every other fit the ML log-likelihood (`REML = FALSE`). |
 | `AIC(fit)`, `BIC(fit)` | `stats`'s values and tables, read from `logLik()`. Two comparisons stop with an error instead: a REML fit beside an ML fit (the error names which is which), and REML fits with different fixed effects, whose REML criteria are not comparable (the error points to `compare()` and to `REML = FALSE`). ML fits compare across fixed effects as in `stats`. See `?AIC.fastglmm` for the uses it cannot check. |
 | `anova(fit)` | the per-term tests, one row per fixed term, built when the model was fitted (likelihood-ratio rows on the first call that needs them): Type III by default, `type = "II"` on request; lmerTest's F with Satterthwaite df on a Gaussian mixed model, F on `n - p` on OLS and the Gamma and inverse-Gaussian GLMs with an estimated dispersion, likelihood-ratio chi-squared on a Poisson GLMM, Wald chi-squared elsewhere; `test = "Wald"` or `test = "LRT"` picks the test on a fit with chi-squared rows. See the end of this section. |
@@ -375,6 +375,8 @@ the answer:
 fit2 <- fastglmm(y ~ x1 + (1 | group), data2,
                  start = list(beta = fixef(fit1), theta = theta_prev))
 ```
+
+On data where the fixed effects separate the response, a warm-started fit stops as `separated`, as a cold fit does; only Rust's `loop_advanced` tier skips that check.
 
 `start` takes lme4's name and shape: a list with `beta` (length `p`) and `theta`
 (the random-effect **Cholesky** vector, `lme4::getME(fit, "theta")`'s layout;

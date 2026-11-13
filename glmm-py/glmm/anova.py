@@ -24,7 +24,6 @@ import numpy as np
 from glmm import (
     Fit,
     _check_call,
-    _check_nagq,
     _fit_from_native,
     _native,
     _prepare_columns,
@@ -178,59 +177,6 @@ class TermTable(_Table):
         return [_LEGEND, *self.notes]
 
 
-# The footer lines of a pairwise table and of its intervals, emmeans' words.
-# Mirrors the R port's .pairwise_footer - change together.
-_HOLM_INTERVALS = "Holm has no simultaneous interval; Bonferroni intervals shown."
-
-
-def _family_sizes(stored):
-    """The tested rows (a p-value that is not NaN) of each `by` group, the
-    `m` of a Holm or Bonferroni adjustment, as `"3"` or `"2 or 3"`."""
-    k = stored["levels"]
-    size = k * (k - 1) // 2
-    p = stored["p_value"]
-    counts = sorted(
-        {sum(not math.isnan(v) for v in p[i : i + size]) for i in range(0, len(p), size)}
-    )
-    return " or ".join(str(c) for c in counts)
-
-
-def _tukey_sizes(stored):
-    """Tukey's family size of each `by` group: the levels in at least one
-    tested comparison (a p-value that is not NaN), as the crate's `tukey_k`
-    counts them. Mirrors the R port's .tukey_sizes - change together."""
-    k = stored["levels"]
-    pairs = [(i, j) for i in range(k) for j in range(i + 1, k)]
-    p = stored["p_value"]
-    return sorted(
-        {
-            len(
-                {
-                    x
-                    for (i, j), v in zip(pairs, p[g : g + len(pairs)])
-                    if not math.isnan(v)
-                    for x in (i, j)
-                }
-            )
-            for g in range(0, len(p), len(pairs))
-        }
-    )
-
-
-def _adjust_line(stored, adjust, intervals):
-    """The footer line naming `adjust` and its family size, None for "none"."""
-    if adjust == "none":
-        return None
-    lead = "Conf-level adjustment" if intervals else "P value adjustment"
-    if adjust == "tukey":
-        sizes = _tukey_sizes(stored)
-        if len(sizes) > 1:
-            return f"{lead}: tukey method for varying family sizes"
-        return f"{lead}: tukey method for comparing a family of {sizes[0]} estimates"
-    what = "estimates" if intervals else "tests"
-    return f"{lead}: {adjust} method for {_family_sizes(stored)} {what}"
-
-
 @dataclass(repr=False, eq=False)
 class PairwiseTable(_Table):
     """The pairwise comparisons of `glmm.pairwise`, one row per pair of levels,
@@ -238,7 +184,7 @@ class PairwiseTable(_Table):
     given, `estimate`, `SE`, `df` (Inf on a z test), `t.ratio` or `z.ratio`,
     `p.value` (adjusted), and on a log or logit link `odds.ratio` or `ratio`
     and its `ratio.SE`. The notes under the table name the adjustment, after
-    a note saying so when the fit did not converge. Its
+    a note saying so when the fit did not converge, then each row's notes. Its
     `confint(level=0.95)` is a `PairwiseTable` of the confidence intervals:
     `contrast`, the `by` variable, `estimate`, `lower.CL`, `upper.CL`, and on a
     log or logit link the ratio with `ratio.lower.CL` and `ratio.upper.CL`.
@@ -281,7 +227,8 @@ class PairwiseTable(_Table):
         The intervals follow the table's adjustment: Bonferroni and Tukey
         intervals hold for all rows of a `by` group at once. Holm has no
         simultaneous interval, so a Holm table gets Bonferroni intervals, and
-        the notes say so. A NaN row gets a NaN interval. Nothing is refitted.
+        the notes say so. A NaN row gets a NaN interval. The intervals of a fit
+        that did not converge get a note saying so. Nothing is refitted.
 
         Raises `ValueError` on a `level` that is not strictly between 0 and 1,
         and on a table of intervals."""
@@ -290,19 +237,7 @@ class PairwiseTable(_Table):
             raise ValueError(
                 "this table holds intervals already; call confint on the pairwise table"
             )
-        ci = _native.call(
-            "pairwise_confint",
-            {
-                "estimate": st["estimate"],
-                "se": st["se"],
-                "df": st["df"],
-                "p_value": st["p_value"],
-                "adjust": st["adjust"],
-                "levels": st["levels"],
-                "ratio": st["ratio_kind"],
-                "level": float(level),
-            },
-        )
+        ci = _native.call("pairwise_confint", {"table": st, "level": level})
         values = {"contrast": list(st["contrast"])}
         if st["by"] is not None:
             values[st["by"]] = list(st["by_level"])
@@ -321,36 +256,15 @@ class PairwiseTable(_Table):
                     "ratio.upper.CL": np.asarray(ci["ratio_upper"], dtype=float),
                 }
             )
-        adjust = (
-            _HOLM_INTERVALS
-            if st["adjust"] == "holm"
-            else _adjust_line(st, ci["adjust"], intervals=True)
-        )
-        notes = [_NOT_CONVERGED] if _NOT_CONVERGED in self.notes else []
-        notes += [f"Confidence level used: {float(level):g}"]
-        notes += [adjust] if adjust is not None else []
-        notes += _pairwise_notes(st)
-        return PairwiseTable(values, list(self.row_names), self.heading, notes, None)
+        return PairwiseTable(values, list(self.row_names), self.heading, list(ci["notes"]), None)
 
 
 _RATIO_NAMES = {"odds_ratio": "odds.ratio", "ratio": "ratio"}
 
 
-def _pairwise_notes(stored):
-    """Each row's notes, as "a - b: note", or "a - b, h = h1: note" within a
-    `by` level."""
-    by = stored["by"]
-    out = []
-    for contrast, level, notes in zip(stored["contrast"], stored["by_level"], stored["row_notes"]):
-        label = contrast if by is None else f"{contrast}, {by} = {level}"
-        out += [f"{label}: {n}" for n in notes]
-    return out
-
-
-def _pairwise_table(stored, z, converged):
-    """The `PairwiseTable` of the native `pairwise`'s columns; `z` says the rows
-    are z tests (a fit with `df_method` "none"), `converged` whether the fit
-    converged."""
+def _pairwise_table(stored, z):
+    """The `PairwiseTable` of the native `pairwise`'s columns and notes; `z`
+    says the rows are z tests (a fit with `df_method` "none")."""
     factor, by = stored["factor"], stored["by"]
     values = {"contrast": list(stored["contrast"])}
     if by is not None:
@@ -368,14 +282,8 @@ def _pairwise_table(stored, z, converged):
         values[_RATIO_NAMES[stored["ratio_kind"]]] = np.asarray(stored["ratio"], dtype=float)
         values["ratio.SE"] = np.asarray(stored["ratio_se"], dtype=float)
     heading = f"Pairwise comparisons of {factor}" + ("" if by is None else f" by {by}")
-    adjust = _adjust_line(stored, stored["adjust"], intervals=False)
-    notes = (
-        ([] if converged else [_NOT_CONVERGED])
-        + ([adjust] if adjust is not None else [])
-        + _pairwise_notes(stored)
-    )
     rows = [str(i + 1) for i in range(len(stored["contrast"]))]
-    return PairwiseTable(values, rows, heading, notes, stored)
+    return PairwiseTable(values, rows, heading, list(stored["notes"]), stored)
 
 
 @dataclass(repr=False, eq=False)
@@ -642,7 +550,6 @@ def anova(*fits, type=None, test=_AUTO, nsim=None, seed=None):
             "glmm.anova of two fits takes no test: a comparison's test follows from "
             "the two models; test applies to one fit, glmm.anova(m)"
         )
-    _check_draws(nsim, seed)
     args = {"m0": _side(fits[0]), "m1": _side(fits[1]), "nsim": nsim, "seed": seed}
     r = _native.call("compare_fits", args)
     return _comparison_table(r, ("m0", "m1"), None)
@@ -706,10 +613,8 @@ def compare(
     for f in (f0, f1):
         if not isinstance(f, str):
             raise TypeError(f"glmm.compare takes two formula strings, got {_type_name(f)}")
-    family, link = _check_call(f0, family, link)
-    _check_call(f1, family, link)
-    nagq = _check_nagq(nagq)
-    _check_draws(nsim, seed)
+    _check_call(f0)
+    _check_call(f1)
     store = []
     numeric_columns, factor_columns, weights, offset, row_index = _prepare_columns(
         data, [f0, f1], weights, offset, store, drop_missing_arguments=True
@@ -743,32 +648,13 @@ def compare(
         },
     )
     fit0, fit1 = (
-        _fit_from_native(r[key], f, family, link, nagq, None, list(store), kept)
-        for key, f in (("fit0", f0), ("fit1", f1))
+        _fit_from_native(r[key], f, list(store), kept) for key, f in (("fit0", f0), ("fit1", f1))
     )
-    return Comparison(_comparison_table(r, ("f0", "f1"), family), fit0, fit1)
+    return Comparison(_comparison_table(r, ("f0", "f1"), r["fit0"]["family"]), fit0, fit1)
 
 
 def _type_name(x):
     return type(x).__name__
-
-
-def _check_draws(nsim, seed):
-    """`nsim` and `seed` as `glmm.anova` and `glmm.compare` take them. The
-    crate bounds `nsim` above; a value below 1 cannot cross as an unsigned
-    count, so it is refused here with the crate's message."""
-    if nsim is not None:
-        if isinstance(nsim, bool) or not isinstance(nsim, (int, np.integer)):
-            raise TypeError(f"nsim must be a whole number, got {nsim!r}")
-        if nsim < 1:
-            raise ValueError(
-                f"nsim must be a whole number from 1 to {_native.MAX_NSIM}, got {nsim}"
-            )
-    if seed is not None:
-        if isinstance(seed, bool) or not isinstance(seed, (int, np.integer)):
-            raise TypeError(f"seed must be a whole number, got {seed!r}")
-        if not 0 <= seed < 2**64:
-            raise ValueError(f"seed must be a whole number from 0 to 2**64 - 1, got {seed}")
 
 
 def _check_fields(m, names):

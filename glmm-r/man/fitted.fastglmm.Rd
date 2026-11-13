@@ -12,7 +12,7 @@
 \item{...}{unused.}
 }
 \value{
-A named numeric vector, named by the model frame's row names. Empty
+A named numeric vector, named by the model frame's row names. NaN
 for a fit that did not converge.
 }
 \description{

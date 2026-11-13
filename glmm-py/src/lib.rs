@@ -1,9 +1,11 @@
 //! PyO3 binding: builds the `glmm._native` extension module. `call` converts
 //! a dict of arguments into a `glmm_bind::Record`, runs the registered
 //! function, and converts the result back; argument checks, results and error
-//! codes live in `glmm-bind`.
+//! codes live in `glmm-bind`. An error from `glmm-bind` is raised with the
+//! attribute `code`: `invalid_argument`, `fit_error` or `compare_error` on a
+//! `ValueError`, `internal` on a `RuntimeError`.
 
-use glmm_bind::{BindError, Record, Value};
+use glmm_bind::{BindError, Port, Record, Value};
 
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -234,6 +236,7 @@ fn to_py<'py>(
         Value::StrVec(x) => x.into_pyobject(py)?.into_any(),
         Value::BoolVec(x) => x.into_pyobject(py)?.into_any(),
         Value::Factor { .. } => unreachable!("glmm-bind returns no factor"),
+        Value::Na => unreachable!("glmm-bind returns no NA"),
         Value::Mat { nrow, data, .. } => {
             let rows: Vec<Vec<f64>> = (0..nrow)
                 .map(|i| data.iter().skip(i).step_by(nrow).copied().collect())
@@ -263,47 +266,23 @@ fn to_py<'py>(
     })
 }
 
-/// A refusal of `glmm.anova(m0, m1)` in Python's words: the crate's text says
-/// what is wrong and what to do with no call syntax, and the refusals that
-/// `glmm.compare` avoids gain the pointer to it (and to `reml=False`).
-fn refusal(kind: &str, message: String) -> String {
-    const COMPARE: &str = "glmm.compare(data, f0, f1)";
-    let pointer = match kind {
-        "different_rows" => format!("Or use {COMPARE}, which drops those rows once for both fits."),
-        "different_y" => format!("Or use {COMPARE}, which fits both to the same data."),
-        "different_weights" => format!("Or use {COMPARE}, which takes the weights once."),
-        "different_offset" => format!("Or use {COMPARE}, which takes the offset once."),
-        "different_family" => format!("Or use {COMPARE}, which takes the family and link once."),
-        "mixed_estimators" => format!("Or use {COMPARE}, which picks the estimator itself."),
-        "reml_different_fixed" => {
-            format!("Pass reml=False to both fits, or use {COMPARE}, which fits both by ML.")
-        }
-        "reml_different_fixed_estimated" => format!(
-            "Pass reml=False and weight_power=\"estimate\" to both fits, or use {COMPARE}, \
-             which fits both by ML."
-        ),
-        "weight_power_mismatch" => {
-            format!("Or use {COMPARE}, which takes weight_power once.")
-        }
-        _ => return message,
-    };
-    format!("{message} {pointer}")
-}
-
 /// A `glmm-bind` error as a `ValueError`, or a `RuntimeError` for an
-/// `internal` one (a caught panic: a crate bug, not a bad argument); its
-/// message already names the caller's row.
-fn bind_error(e: BindError) -> PyErr {
-    if e.code == "internal" {
-        return PyRuntimeError::new_err(e.message);
+/// `internal` one (a caught panic: a crate bug, not a bad argument), with the
+/// attribute `code` set to the error's code; its message already names the
+/// caller's row.
+fn bind_error(py: Python<'_>, e: BindError) -> PyErr {
+    let err = if e.code == "internal" {
+        PyRuntimeError::new_err(e.message)
+    } else {
+        PyValueError::new_err(e.message)
+    };
+    if let Err(set) = err.value(py).setattr("code", e.code) {
+        return set;
     }
-    PyValueError::new_err(match e.kind {
-        Some(kind) => refusal(kind, e.message),
-        None => e.message,
-    })
+    err
 }
 
-/// `glmm_bind::call(name, inputs)`: `inputs` a dict of the function's
+/// `glmm_bind::call(Port::Python, name, inputs)`: `inputs` a dict of the function's
 /// arguments, the result as `to_py` gives it.
 #[pyfunction]
 fn call<'py>(
@@ -314,15 +293,12 @@ fn call<'py>(
     let Value::Record(rec) = to_value(inputs.as_any(), "")? else {
         unreachable!("a dict converts to a record")
     };
-    let out = glmm_bind::call(name, rec).map_err(bind_error)?;
+    let out = glmm_bind::call(Port::Python, name, rec).map_err(|e| bind_error(py, e))?;
     to_py(py, out, bytes_fields(name), name == "simulate")
 }
 
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(call, m)?)?;
-    // The bound `compare_options` puts on `nsim`, for the Python-side message
-    // on a value below 1 (which cannot cross as a count).
-    m.add("MAX_NSIM", glmm_bind::MAX_NSIM)?;
     Ok(())
 }

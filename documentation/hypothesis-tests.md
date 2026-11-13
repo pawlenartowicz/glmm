@@ -903,6 +903,7 @@ A note about one row is printed after that row's label, for example
 | Note | When |
 |---|---|
 | The fit did not converge, so its estimates are not at a maximum and these tests are not reliable. … | `anova(m)` or `pairwise(m, ...)` on a fit that did not converge (first note) |
+| The fit did not converge, so its estimates are not at a maximum and these intervals are not reliable. … | the interval table of `pairwise` on a fit that did not converge (first note) |
 | Missing cells for: …. Interpret type III hypotheses with care. | a Type III table whose design has an empty cell |
 | The coefficient `<name>` is aliased, so the hypothesis was not tested. | a term with an aliased column (NaN row), one note per aliased coefficient, named as in the fit's coefficient names |
 | No denominator df (`<reason>`), so the hypothesis was not tested. | an F row with no df: Satterthwaite switched off or failed |

@@ -5,6 +5,8 @@ reference level. A declared order (pandas `Categorical`) must survive to the
 fit; a plain string column has none and is sorted lexicographically.
 """
 
+import math
+
 import numpy as np
 import pytest
 
@@ -114,6 +116,45 @@ def test_declared_level_order_sets_the_reference_level():
     # Base is "low", so the dummies are the other two IN THE DECLARED ORDER.
     assert result.names == ["(Intercept)", "fmed", "fhigh"]
     assert result.beta[0] == pytest.approx(1.05, abs=1e-6)  # mean of "low"
+
+
+def test_relabelled_and_unused_levels_give_the_same_fit():
+    # Declaring the used levels in reverse order and adding two unused ones
+    # changes the base level and the coding, not the model.
+    i = range(40)
+    u_g = [-0.6, 0.4, 0.1, -0.3, 0.7, -0.2, 0.5, -0.4]
+    x = [math.sin(1.7 * j + 0.3) for j in i]
+    f = ["pqr"[j % 3] for j in i]
+    g = [f"g{j // 5}" for j in i]
+    y = [
+        2
+        + 0.5 * x[j]
+        + 0.3 * (f[j] == "q")
+        - 0.4 * (f[j] == "r")
+        + u_g[j // 5]
+        + 0.4 * math.sin(2.3 * j + 0.7)
+        for j in i
+    ]
+    formula = "y ~ x + f + (1 | g)"
+    ref = glmm.fit({"y": y, "x": x, "f": f, "g": g}, formula)
+
+    def factor(values, used):
+        levels = used[::-1]
+        levels.insert(len(levels) // 2, "yy")
+        levels.insert(0, "zz")
+        return _FakeCategorical(levels, [levels.index(v) for v in values])
+
+    g_used = [f"g{k}" for k in range(8)]
+    rev = glmm.fit(
+        {"y": y, "x": x, "f": factor(f, ["p", "q", "r"]), "g": factor(g, g_used)}, formula
+    )
+    np.testing.assert_allclose(rev.fitted, ref.fitted, rtol=1e-5)
+    np.testing.assert_allclose(rev.loglik, ref.loglik, rtol=1e-5)
+    np.testing.assert_allclose(rev.deviance, ref.deviance, rtol=1e-5)
+    for a, b in zip(rev.varcorr, ref.varcorr, strict=True):
+        np.testing.assert_allclose(a, b, rtol=1e-5)
+    assert rev.ranef_levels == ref.ranef_levels
+    assert rev.names[:4] == ["(Intercept)", "x", "fq", "fp"]
 
 
 def test_plain_string_column_still_sorts_lexicographically():

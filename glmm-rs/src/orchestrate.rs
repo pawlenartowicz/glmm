@@ -29,7 +29,7 @@ use faer::Mat;
 /// The SDs and correlations of a vech-packed covariance block, as
 /// [`crate::Fit::stddev_corr`] gives them.
 pub use crate::fit::vech_stddev_corr;
-use crate::fit::{splice_row, theta_width, CondvarCross};
+use crate::fit::{detect_aliased, null_basis, splice_row, theta_width, CondvarCross};
 use crate::formula::anova::{
     auto_choice, compare_stored, fixed_row, linear_note_line, nesting, term_tests_cached,
     untested_test, ChoiceReason, CompareError, CompareOptions, Comparison, Differs, FixedRow,
@@ -80,6 +80,10 @@ pub struct PortError {
     pub row: Option<usize>,
     /// The byte range of the row's digits in `message`.
     digits: Option<(usize, usize)>,
+    /// Whether the error refuses a value the caller gave a fit option or a
+    /// warm start ([`FitError::OptionValue`], [`FitError::Start`]), not the
+    /// model or the data.
+    pub argument: bool,
 }
 
 impl PortError {
@@ -96,6 +100,14 @@ impl PortError {
             _ => self.message.clone(),
         }
     }
+
+    /// A refusal of a value the caller gave an argument.
+    fn argument(message: String) -> Self {
+        PortError {
+            argument: true,
+            ..message.into()
+        }
+    }
 }
 
 impl From<&ErrorMessage> for PortError {
@@ -104,6 +116,7 @@ impl From<&ErrorMessage> for PortError {
             message: m.to_string(),
             row: m.row(),
             digits: m.digits(),
+            argument: false,
         }
     }
 }
@@ -114,13 +127,17 @@ impl From<String> for PortError {
             message,
             row: None,
             digits: None,
+            argument: false,
         }
     }
 }
 
 impl From<FitError> for PortError {
     fn from(e: FitError) -> Self {
-        e.message().into()
+        PortError {
+            argument: matches!(e, FitError::OptionValue(_) | FitError::Start(_)),
+            ..e.message().into()
+        }
     }
 }
 
@@ -168,12 +185,11 @@ impl std::fmt::Display for PortError {
     }
 }
 
-/// Maps the ports' `family`/`link` strings to [`Family`]. `family` and `link`
-/// are already validated against the full spec table by each port's wrapper
-/// layer (`glmm/__init__.py`, `glmm-r/R/fastglmm.R`) before this ever runs — every
-/// family and link in that table now maps to a `Family`/`BinomialLink`
-/// variant, so every `Err` arm below is unreachable via the ports and exists
-/// only for direct callers.
+/// Maps the ports' `family`/`link` strings to [`Family`]. `glmm-bind` has
+/// already checked the ports' strings against its family table and
+/// normalized them before this runs, and every family and link in that table
+/// maps to a variant, so every `Err` arm below is unreachable via the ports
+/// and exists only for direct callers.
 pub fn family_from_str(family: &str, link: &str) -> Result<Family, String> {
     match family {
         "gaussian" => match link {
@@ -302,8 +318,10 @@ pub struct NoteInfo {
     /// grouping name of `SingleLevelGroupingDropped`, `FewRowsForRandomEffects`'s term
     /// as `"<terms> | <grouping>"`, whose row count the ports read from
     /// `FitResult::nobs`, `NewGroupingLevels` as `"<grouping index>:
-    /// <rows>"`, 0-based and comma-separated, the grouping name of
-    /// `SingleLevelGrouping` and `SeparatedByGrouping`, `RepeatedGrouping` as
+    /// <rows>"`, 0-based and comma-separated, `RowsNotEstimable` as its rows,
+    /// 0-based and comma-separated, the grouping name of
+    /// `SingleLevelGrouping`, `SeparatedByGrouping` and `OneTrialPerLevel`,
+    /// `RepeatedGrouping` as
     /// `"<first name>, <second name>"`, and `SlopeConstantWithinLevels` as
     /// `"<slope label>, <slope label> | <grouping name>"`). A grouping name
     /// that itself contains `", "` makes the `RepeatedGrouping` split
@@ -313,10 +331,16 @@ pub struct NoteInfo {
     /// The fitted power on `WeightPowerAtBound`, `WeightPowerOutsideUnit`
     /// and `WeightPowerImplausible`. `NaN` for every other variant.
     pub delta: f64,
-    /// `WeightPowerImplausible` payload: `s^|delta − 1|`. `NaN` for every
-    /// other variant.
+    /// `WeightPowerImplausible` payload: `s^|delta − 1|`. On
+    /// `DispersionAtLimit`, the box edge on the internal weight scale
+    /// (`edge`), which sets the message's percentage. `NaN` for every other
+    /// variant.
     pub factor: f64,
-    /// `WeightPowerAtBound` payload: the search bracket's ends. `NaN` for
+    /// `WeightPowerAtBound` payload: the search bracket's ends. On
+    /// `NbShapeAtLimit` and `DispersionAtLimit` the limit the parameter ended
+    /// on (for `DispersionAtLimit` on the reported dispersion's scale), in
+    /// `lower` when it is the lower limit and in `upper` otherwise, the
+    /// other `NaN`. `NaN` for
     /// every other variant.
     pub lower: f64,
     /// See `lower`.
@@ -411,6 +435,15 @@ fn note_infos(notes: Vec<Note>, re_groups: &[ReGroupInfo]) -> Vec<NoteInfo> {
                 evals: rounds,
                 ..NO_PAYLOAD
             },
+            Note::NbShapeAtLimit { limit } => {
+                let lower_end = limit == crate::consts::NB_THETA_LO;
+                NoteInfo {
+                    kind: "nb_shape_at_limit",
+                    lower: if lower_end { limit } else { f64::NAN },
+                    upper: if lower_end { f64::NAN } else { limit },
+                    ..NO_PAYLOAD
+                }
+            }
             Note::NonIntegerResponse { rows } => NoteInfo {
                 kind: "non_integer_response",
                 evals: rows,
@@ -462,6 +495,11 @@ fn note_infos(notes: Vec<Note>, re_groups: &[ReGroupInfo]) -> Vec<NoteInfo> {
                 detail: name(grouping),
                 ..NO_PAYLOAD
             },
+            Note::OneTrialPerLevel { grouping } => NoteInfo {
+                kind: "one_trial_per_level",
+                detail: name(grouping),
+                ..NO_PAYLOAD
+            },
             Note::ExactProfileFallback => NoteInfo {
                 kind: "exact_profile_fallback",
                 ..NO_PAYLOAD
@@ -486,6 +524,16 @@ fn note_infos(notes: Vec<Note>, re_groups: &[ReGroupInfo]) -> Vec<NoteInfo> {
                 kind: "variance_at_limit",
                 ..NO_PAYLOAD
             },
+            Note::DispersionAtLimit { limit, edge } => {
+                let lower_end = edge == crate::consts::GAMMA_PHI_LO;
+                NoteInfo {
+                    kind: "dispersion_at_limit",
+                    factor: edge,
+                    lower: if lower_end { limit } else { f64::NAN },
+                    upper: if lower_end { f64::NAN } else { limit },
+                    ..NO_PAYLOAD
+                }
+            }
             Note::NewGroupingLevels { grouping, rows } => NoteInfo {
                 kind: "new_grouping_levels",
                 detail: format!(
@@ -495,6 +543,15 @@ fn note_infos(notes: Vec<Note>, re_groups: &[ReGroupInfo]) -> Vec<NoteInfo> {
                         .collect::<Vec<_>>()
                         .join(", ")
                 ),
+                ..NO_PAYLOAD
+            },
+            Note::RowsNotEstimable { rows } => NoteInfo {
+                kind: "rows_not_estimable",
+                detail: rows
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
                 ..NO_PAYLOAD
             },
             Note::WeightPowerAtBound {
@@ -584,7 +641,7 @@ pub struct FitResult {
     pub varcorr: Vec<Vec<f64>>,
     /// Standard errors of the RE standard deviations: one vech per grouping,
     /// laid out like `varcorr`, the SEs at the diagonal slots and NaN off them;
-    /// empty where the fit fills none (a Gaussian LMM). [`crate::Fit::stddev_se()`]
+    /// NaN where the fit has no SE (a Gaussian LMM). [`crate::Fit::stddev_se()`]
     /// gives one grouping's diagonal.
     pub stddev_se: Vec<f64>,
     /// Which fixed-effect columns were dropped as exactly redundant
@@ -623,15 +680,14 @@ pub struct FitResult {
     /// A port's `summary()` prints a correlation only between two columns of
     /// one term, as lme4 does.
     pub re_term_index: Vec<Vec<usize>>,
-    /// Warn-and-strip message for an ineligible-shape `nagq>1` (the fit
-    /// proceeded with Laplace); surfaced by each port as a Python
-    /// `UserWarning` / R `warning()`.
-    pub agq_warning: Option<String>,
+    /// Set when an ineligible-shape `nagq>1` was stripped (the fit proceeded
+    /// with Laplace). Each port raises its own warning when this is set.
+    pub agq_warning: bool,
     /// Set when `reml = Some(true)` was given on a non-Gaussian family (GLM or
     /// GLMM), where the argument has no meaning: it was ignored and the model
     /// fitted by ML, as under `None`. Each port raises its own warning, with
     /// its own spelling of the argument, when this is set.
-    pub reml_warning: Option<String>,
+    pub reml_warning: bool,
     /// Log-likelihood at the fitted parameters (`crate::Fit::loglik`).
     pub loglik: f64,
     /// Parameters counted for AIC/BIC (`crate::Fit::df`).
@@ -646,11 +702,16 @@ pub struct FitResult {
     pub ranef: Vec<f64>,
     /// Level count per grouping, for slicing `ranef` (`crate::Fit::ranef_levels`).
     pub ranef_levels: Vec<usize>,
+    /// Per grouping, in `re_groups` order, the number of its levels the data
+    /// has: a nested grouping's observed combinations, not the padded count
+    /// of `ranef_levels`. What a port's `summary()` prints; filled on a fit
+    /// that failed too.
+    pub re_group_levels: Vec<usize>,
     /// The same conditional modes, LABELLED — `crate::formula::label_ranef`'s
     /// blocks flattened for the ports: per grouping, `(name, term names, level
     /// labels, row-major values)`. Padded nested slots are already dropped, so
-    /// `values.len() == levels.len() * terms.len()`. Empty exactly when `ranef`
-    /// is. A port does NOT slice `ranef` itself: which layout a grouping lands
+    /// `values.len() == levels.len() * terms.len()`. Empty on a fit without
+    /// random effects or without conditional modes. A port does NOT slice `ranef` itself: which layout a grouping lands
     /// in is a data-dependent routing decision inside the kernel, so only the
     /// crate can label it.
     pub ranef_blocks: Vec<RanefBlockTuple>,
@@ -715,16 +776,15 @@ pub struct FitResult {
     /// `y`: `glmm-bind`'s `fit_record` and the R port's returned list flatten it.
     pub design_summary: Option<(Vec<f64>, Vec<f64>, Vec<f64>)>,
     /// Row count the kernel fitted (`Lowered::n`). NOT `fitted.len()`: `fitted`
-    /// is empty on a non-converged fit and the ports' headers print on those.
+    /// is NaN on a non-converged fit and the ports' headers print on those.
     pub nobs: usize,
     /// Where the accepted θ sits, from `crate::Diagnostics::boundary`; see
     /// `boundary_name` for the vocabulary.
     pub boundary: &'static str,
     /// Which variance components the optimizer pinned at 0, aligned with the
-    /// `varcorr` blocks (`crate::Diagnostics::pinned`). **Empty means nothing
-    /// was pinned** — every route with variance components fills this on a
-    /// converged fit, and a model with no variance components at all (OLS,
-    /// GLM, fixed-effect-only negative binomial) leaves it empty too.
+    /// `varcorr` blocks (`crate::Diagnostics::pinned`): one row per grouping,
+    /// all false when nothing was pinned; empty on a model with no variance
+    /// components (OLS, GLM, fixed-effect-only negative binomial).
     pub pinned: Vec<Vec<bool>>,
     /// Solver observations with no dedicated field (`crate::Diagnostics::notes`).
     pub notes: Vec<NoteInfo>,
@@ -760,7 +820,8 @@ pub struct FitResult {
     /// every other fit and on a non-converged one.
     pub rss: f64,
     /// `summary.lm`'s multiple R² of an OLS fit (0 on an intercept-only
-    /// model); NaN on every other fit and on a non-converged one.
+    /// model); NaN on every other fit, on a non-converged one, and when
+    /// neither the response nor the fitted values vary beyond round-off.
     pub r_squared: f64,
     /// `summary.lm`'s adjusted R², with the same NaN and 0 cases as
     /// `r_squared`.
@@ -809,10 +870,7 @@ pub struct FitResult {
 /// passes it back to [`contrast_test`]. The `p_r × p_r` matrices are over the
 /// retained columns, `p_r` of them, and every matrix is row-major.
 ///
-/// The free θ coordinates are in the kernel's order, which differs from the
-/// order the groupings were written in when glmm makes the grouping with the
-/// most levels the primary; the df and the contrast tests use them only in
-/// sums over all coordinates, so the order does not change any result.
+/// The free θ coordinates are in the order the groupings were declared.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SatterthwaiteRecord {
     /// `A_eff = 2·blockdiag(H_p⁺, τ̂²/ν)`, `(n_free + 1) × (n_free + 1)`, with
@@ -831,32 +889,36 @@ pub struct SatterthwaiteRecord {
     pub retained: Option<Vec<usize>>,
 }
 
-/// A robust fit's CR2 or HC2 pieces ([`FitResult::robust`], spec 2-dcr §3.2)
-/// as plain numbers, in the caller's coordinates and `p` wide (zero on an
-/// aliased column): a port stores it on its fit and passes it back to the
-/// readers of a robust fit. Every matrix is flat and column-major; cluster
-/// `k` is the `k`-th level of the grouping factor that has rows, or row `k`
+/// A robust fit's CR2 or HC2 pieces ([`FitResult::robust`])
+/// as plain numbers: a port stores it on its fit and passes it back to the
+/// readers of a robust fit. `t` is in the caller's coordinates, `p` rows
+/// (zero on an aliased column); every other field is in the whitened
+/// coordinates β_Z of the retained columns (β = t β_Z), `p_Z = t.len() / p`
+/// wide (0 when `p` is 0). Every matrix is flat and column-major; cluster `k`
+/// is the `k`-th level of the grouping factor that has rows, or row `k`
 /// without one.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RobustRecord {
-    /// E_k r_k, `p × G`: column `k` for cluster `k`.
+    /// The map β = t β_Z, `p × p_Z`.
+    pub t: Vec<f64>,
+    /// E_k r_k, `p_Z × G`: column `k` for cluster `k`.
     pub er: Vec<f64>,
-    /// F_k = E_k X_k, `p × p`, per cluster of more than one row in cluster
-    /// order.
+    /// F_k = E_k Z_k, `p_Z × p_Z`, per cluster of more than one row in
+    /// cluster order.
     pub f: Vec<Vec<f64>>,
-    /// E_k Φ_k E_kᵀ, `p × p`, per cluster of `f`.
+    /// E_k Φ_k E_kᵀ, `p_Z × p_Z`, per cluster of `f`.
     pub epe: Vec<Vec<f64>>,
-    /// Per one-row cluster in cluster order, a column of `p`: E_k (so
-    /// F_k = e_k x_kᵀ and E_kΦ_kE_kᵀ = φ_k e_k e_kᵀ), `p × n₁`.
+    /// Per one-row cluster in cluster order, a column of `p_Z`: E_k (so
+    /// F_k = e_k z_kᵀ and E_kΦ_kE_kᵀ = φ_k e_k e_kᵀ), `p_Z × n₁`.
     pub row_e: Vec<f64>,
-    /// The design row x_k of each one-row cluster, `p × n₁`.
+    /// The whitened design row z_k of each one-row cluster, `p_Z × n₁`.
     pub row_x: Vec<f64>,
     /// The scalar Φ_k of each one-row cluster.
     pub row_phi: Vec<f64>,
     /// The cluster of each null direction.
     pub null_cluster: Vec<usize>,
-    /// Directions n, `p` each, with H_(−k) n = 0 for their cluster k: a
-    /// contrast with cᵀn ≠ 0 has no information outside cluster k.
+    /// Unit directions n, `p_Z` each, with H_(−k) n = 0 for their cluster k:
+    /// a contrast c with (tᵀc)ᵀn ≠ 0 has no information outside cluster k.
     pub null: Vec<Vec<f64>>,
 }
 
@@ -870,6 +932,7 @@ impl From<Cr2Pieces> for RobustRecord {
         let (f, epe) = pc.whole.iter().map(|(f, e)| (flat(f), flat(e))).unzip();
         let (null_cluster, null) = pc.null.into_iter().unzip();
         RobustRecord {
+            t: flat(&pc.t),
             er: flat(&pc.er),
             f,
             epe,
@@ -901,6 +964,9 @@ pub struct CondvarCrossRecord {
     pub coupling_cols: Vec<u32>,
     /// Per coupling entry, one value per family coefficient.
     pub coupling: Vec<f64>,
+    /// The declared primary's child slots when it is the nested grouping;
+    /// empty otherwise.
+    pub nested_slots: Vec<u32>,
 }
 
 impl From<CondvarCross> for CondvarCrossRecord {
@@ -912,6 +978,7 @@ impl From<CondvarCross> for CondvarCrossRecord {
             coupling_at: c.coupling_at,
             coupling_cols: c.coupling_cols,
             coupling: c.coupling,
+            nested_slots: c.nested_slots,
         }
     }
 }
@@ -925,6 +992,7 @@ impl From<&CondvarCrossRecord> for CondvarCross {
             coupling_at: c.coupling_at.clone(),
             coupling_cols: c.coupling_cols.clone(),
             coupling: c.coupling.clone(),
+            nested_slots: c.nested_slots.clone(),
         }
     }
 }
@@ -1170,7 +1238,9 @@ pub fn run_fit(
     // never sees, so both are checked here first under the argument's name.
     if let Some(d) = dispersion {
         if !(d.is_finite() && d > 0.0) {
-            return Err(format!("dispersion must be a finite number > 0, got {d}").into());
+            return Err(PortError::argument(format!(
+                "dispersion must be a finite number > 0, got {d}"
+            )));
         }
     }
     let table = table_of(numeric_columns, factor_columns)?;
@@ -1195,35 +1265,35 @@ pub fn run_fit(
     if let Some((beta, theta, disp)) = &warm_start {
         if let Some(d) = disp {
             if !(d.is_finite() && *d > 0.0) {
-                return Err(
-                    format!("warm-start dispersion must be a finite number > 0, got {d}").into(),
-                );
+                return Err(PortError::argument(format!(
+                    "warm-start dispersion must be a finite number > 0, got {d}"
+                )));
             }
         }
         if !beta.is_empty() && beta.len() != lowered.p {
-            return Err(format!(
+            return Err(PortError::argument(format!(
                 "warm-start beta has {} entries but the model has {} fixed-effect \
                  coefficients; give {}, or none to cold-start beta",
                 beta.len(),
                 lowered.p,
                 lowered.p
-            )
-            .into());
+            )));
         }
         let n_theta = theta_width(lowered.model.re.as_ref());
         if !theta.is_empty() && theta.len() != n_theta {
-            return Err(format!(
+            return Err(PortError::argument(format!(
                 "warm-start theta has {} entries but the model has {} random-effect \
                  Cholesky entries; give {}, or none to cold-start theta",
                 theta.len(),
                 n_theta,
                 n_theta
-            )
-            .into());
+            )));
         }
         for (name, values) in [("beta", beta), ("theta", theta)] {
             if let Some(v) = values.iter().find(|v| !v.is_finite()) {
-                return Err(format!("warm-start {name} must be finite numbers, got {v}").into());
+                return Err(PortError::argument(format!(
+                    "warm-start {name} must be finite numbers, got {v}"
+                )));
             }
         }
     }
@@ -1362,7 +1432,7 @@ pub fn run_compare(
     };
     let mut prepared0 = lower(f0, weights.clone(), offset.clone())?;
     let mut prepared1 = lower(f1, weights, offset)?;
-    // D16: `None` resolves as a fit's does, with compare's own criterion for
+    // `None` resolves as a fit's does, with compare's own criterion for
     // the fit's `reml`, to one power for both sides: the fitted power where
     // both models take it.
     let power = match weight_power {
@@ -1564,12 +1634,12 @@ fn table_of(
 
 /// A lowered model with every fit argument applied ([`lower_with`]): the
 /// weights and offset on the lowering, the rest in the options it is fitted
-/// with; and the two warn-and-strip messages.
+/// with; and the two warn-and-strip flags.
 struct Prepared {
     lowered: Lowered,
     opts: FitOptions,
-    agq_warning: Option<String>,
-    reml_warning: Option<String>,
+    agq_warning: bool,
+    reml_warning: bool,
 }
 
 /// `formula` lowered on `table`, with the fit arguments applied: to the fit
@@ -1609,7 +1679,7 @@ fn lower_with(
     // a mixed binomial/Poisson/negative-binomial/Gamma model with a single grouping factor and
     // q_p = 1 + #slopes ≤ 3 (the temporary cost/oracle cap).
     let mut nagq = nagq;
-    let mut agq_warning: Option<String> = None;
+    let mut agq_warning = false;
     if nagq > 1 {
         let agq_family = matches!(
             fam,
@@ -1626,11 +1696,7 @@ fn lower_with(
             None => false,
         };
         if !eligible {
-            agq_warning = Some(format!(
-                "nagq={nagq} (adaptive quadrature) applies only to binomial/Poisson/negative-binomial/Gamma \
-                 mixed models with a single grouping factor and at most 3 random \
-                 effects per group; fitting with Laplace (nagq=1)"
-            ));
+            agq_warning = true;
             nagq = 1;
         }
     }
@@ -1640,14 +1706,10 @@ fn lower_with(
     // `Some(true)` there is stripped with a warning (the fit is ML, the `None`
     // fit), and `Some(false)` is the `None` fit, silently. Every other value
     // goes to `FitOptions::reml`, which resolves it on a Gaussian model.
-    let mut reml_warning: Option<String> = None;
+    let mut reml_warning = false;
     let reml = match reml {
         Some(true) if lowered.model.family != Family::Gaussian => {
-            reml_warning = Some(
-                "reml=true applies only to Gaussian models; it was ignored and the model \
-                 fitted by maximum likelihood"
-                    .to_string(),
-            );
+            reml_warning = true;
             None
         }
         other => other,
@@ -1725,7 +1787,7 @@ fn flatten(prepared: Prepared, fit: Fit, anova_test: TermTest) -> Result<FitResu
     let lowered_notes = std::mem::take(&mut lowered.notes);
 
     let (coef_p, df_method) = t_tests(&fit, &fit_opts.se_for.columns(lowered.p));
-    // Also on a robust fit, whose joint tests are model-based (D14).
+    // Also on a robust fit, whose joint tests are model-based.
     let satterthwaite_record = match fit.df_state() {
         Ok(st) if !st.residual_only() => Some(record_of(st)),
         _ => None,
@@ -1802,23 +1864,18 @@ fn flatten(prepared: Prepared, fit: Fit, anova_test: TermTest) -> Result<FitResu
             .collect(),
         &lowered.re_groups,
     );
+    let re_group_levels = lowered
+        .re_groups
+        .iter()
+        .map(|g| g.slot_labels.iter().flatten().count())
+        .collect();
     let (re_groups, re_term_index): (Vec<_>, Vec<_>) = lowered
         .re_groups
         .into_iter()
         .map(|g| ((g.name, g.terms), g.term_index))
         .unzip();
-    // An EMPTY `varcorr` is not a mismatch — it is the crate's numerical-failure
-    // convention, "the fit assembled no variance components". Every failure
-    // return uses it: the degenerate LMM endpoint (`fit/lmm.rs`, alongside its
-    // NaN-filled `tau2`/`vcov`), a FAILED dense GLMM (`fit/glmm.rs`); a capped
-    // dense GLMM now reports its finite endpoint's varcorr, non-empty, under
-    // the plateau policy instead. Also the unfittable-random-slope return and
-    // the sparse NaN return (`fit/common.rs`). `Fit::has_negligible_component` documents
-    // the same reading, and both ports already gate their random-effects block
-    // on `varcorr`'s length, so an empty one prints no RE section rather than
-    // mislabelling one. Only a NON-empty block list of the wrong length is the
-    // kernel bug this check is for. Non-mixed fits leave both empty.
-    if !fit.varcorr.is_empty() && fit.varcorr.len() != re_groups.len() {
+    // A block list of another length than the lowered groupings is a kernel bug.
+    if fit.varcorr.len() != re_groups.len() {
         return Err(format!(
             "re_groups and varcorr must agree in length and order: \
              {} grouping(s) lowered, {} varcorr block(s) returned",
@@ -1856,6 +1913,7 @@ fn flatten(prepared: Prepared, fit: Fit, anova_test: TermTest) -> Result<FitResu
         names: lowered.col_names,
         re_groups,
         re_term_index,
+        re_group_levels,
         agq_warning,
         reml_warning,
         loglik: fit.loglik,
@@ -1947,7 +2005,9 @@ fn t_tests(fit: &Fit, targets: &[u32]) -> (Vec<f64>, &'static str) {
 /// their weighted mean when the formula has an intercept and uncentred
 /// otherwise; `R² = mss/(mss + rss)`, adjusted `1 − (1 − R²)(n − df.int)/(n −
 /// p)` with `p` the retained columns. 0 for both R² when `p` is only the
-/// intercept (or nothing); NaN for all three on a non-converged fit.
+/// intercept (or nothing); NaN for both R² when neither `mss` nor `rss` is
+/// above round-off of the response's sum of squares `Σwᵢ(yᵢ − oᵢ)²`; NaN for
+/// all three on a non-converged fit.
 fn ols_r_squared(
     fit: &Fit,
     y: &[f64],
@@ -1974,30 +2034,50 @@ fn ols_r_squared(
     } else {
         (0..n).map(|i| w(i) * f(i).powi(2)).sum()
     };
+    // The factor 64 leaves a margin of about 250 over a constant response's
+    // round-off; a larger one starts to blank real fits.
+    let tiny = (64.0 * f64::EPSILON).powi(2)
+        * (0..n)
+            .map(|i| w(i) * (y[i] - offset.map_or(0.0, |o| o[i])).powi(2))
+            .sum::<f64>();
+    if mss <= tiny && rss <= tiny {
+        return (rss, f64::NAN, f64::NAN);
+    }
     let r2 = mss / (mss + rss);
     let adj = 1.0 - (1.0 - r2) * ((n - df_int) as f64 / (n - rank) as f64);
     (rss, r2, adj)
 }
 
 /// Confidence intervals for the fixed effects, the one rule both ports'
-/// `confint` call: per coefficient `β̂ ± q·se`, with `q` the Student t
-/// quantile on `coef_df[i]` where that df is finite and positive (the rows
-/// `summary()` tests with t: the Satterthwaite df of a Gaussian LMM, `n − p`
-/// on OLS and the dispersion GLMs) and the standard normal quantile
-/// otherwise (z rows, a pass switched off or failed). The quantiles are taken
-/// at `(1 − level)/2` and `1 − (1 − level)/2`, as `confint.lm` takes them.
-/// An interval is NaN only where `β̂` or `se` is (an aliased column).
+/// `confint` call: per coefficient `β̂ ± q·se`. `df_method` is the fit's, and
+/// says how its `summary()` tests. On a fit that tests with t (`residual`:
+/// `n − p` on OLS and the dispersion GLMs; `satterthwaite`; and the robust
+/// `bell_mccaffrey` and `pustejovsky_tipton`), `q` is the Student t quantile
+/// on `coef_df[i]` where that df is finite and positive, and the interval is
+/// NaN where it is not: a lost df leaves no interval. On a fit that tests
+/// with z (`none`: GLM and GLMM; `disabled` and `failed`: a Gaussian mixed
+/// model whose Satterthwaite pass was switched off or failed), `q` is the
+/// standard normal quantile, or the t quantile on a finite, positive df. The
+/// quantiles are taken at `(1 − level)/2` and `1 − (1 − level)/2`, as
+/// `confint.lm` takes them. An interval is also NaN where `β̂` or `se` is (an
+/// aliased column).
 ///
 /// # Errors
 ///
-/// When `level` is not strictly between 0 and 1, or the three slices differ
-/// in length.
+/// When `level` is not strictly between 0 and 1, the three slices differ in
+/// length, or `df_method` is none of the seven above.
 pub fn confint(
     beta: &[f64],
     se: &[f64],
     coef_df: &[f64],
+    df_method: &str,
     level: f64,
 ) -> Result<Vec<[f64; 2]>, String> {
+    let tests_with_t = match df_method {
+        "residual" | "satterthwaite" | "bell_mccaffrey" | "pustejovsky_tipton" => true,
+        "none" | "disabled" | "failed" => false,
+        other => return Err(format!("unknown df_method {other:?}")),
+    };
     if !(level > 0.0 && level < 1.0) {
         return Err(format!(
             "level must be a number strictly between 0 and 1, got {level}"
@@ -2017,6 +2097,8 @@ pub fn confint(
             let df = coef_df[i];
             let (lo, hi) = if df.is_finite() && df > 0.0 {
                 (t_quantile(a, df), t_quantile(1.0 - a, df))
+            } else if tests_with_t {
+                (f64::NAN, f64::NAN)
             } else {
                 (normal_quantile(a), normal_quantile(1.0 - a))
             };
@@ -2103,11 +2185,10 @@ fn record_state(r: SatterthwaiteRecord, p: usize) -> Result<SatterthwaiteState, 
     ))
 }
 
-/// A robust fit's stored pieces and covariances, flat and row-major.
+/// A robust fit's stored pieces and covariance, flat and row-major.
 struct StoredRobust {
     pieces: Option<Cr2Pieces>,
     vcov: Vec<f64>,
-    model_vcov: Vec<f64>,
 }
 
 impl StoredRobust {
@@ -2136,45 +2217,50 @@ impl StoredRobust {
         Ok(Some(StoredRobust {
             pieces,
             vcov: vcov.concat(),
-            model_vcov: model_vcov.concat(),
         }))
     }
 
     fn inputs<'a>(&'a self, aliased: &'a [bool]) -> RobustInputs<'a> {
-        RobustInputs::new(self.pieces.as_ref(), &self.vcov, &self.model_vcov, aliased)
+        RobustInputs::new(self.pieces.as_ref(), &self.vcov, aliased)
     }
 }
 
 /// The inverse of `RobustRecord::from`, `None` when its sizes do not fit
 /// together or with `p`.
 fn record_pieces(r: RobustRecord, p: usize) -> Option<Cr2Pieces> {
-    let cols = |v: &[f64]| match p {
-        0 => v.is_empty().then_some(0),
-        _ => (v.len() % p == 0).then(|| v.len() / p),
+    let pz = match p {
+        0 => r.t.is_empty().then_some(0)?,
+        _ => (r.t.len() % p == 0).then(|| r.t.len() / p)?,
     };
-    let mat = |v: &[f64], ncols: usize| Mat::from_fn(p, ncols, |i, k| v[k * p + i]);
+    let cols = |v: &[f64]| match pz {
+        0 => v.is_empty().then_some(0),
+        _ => (v.len() % pz == 0).then(|| v.len() / pz),
+    };
+    let mat =
+        |v: &[f64], nrows: usize, ncols: usize| Mat::from_fn(nrows, ncols, |i, k| v[k * nrows + i]);
     let g = cols(&r.er)?;
     let n1 = r.row_phi.len();
     if r.f.len() != r.epe.len()
-        || r.f.iter().chain(&r.epe).any(|m| m.len() != p * p)
-        || cols(&r.row_e) != Some(n1)
+        || r.f.iter().chain(&r.epe).any(|m| m.len() != pz * pz)
+        || r.row_e.len() != pz * n1
         || r.row_x.len() != r.row_e.len()
         || r.null.len() != r.null_cluster.len()
-        || r.null.iter().any(|n| n.len() != p)
+        || r.null.iter().any(|n| n.len() != pz)
         || r.null_cluster.iter().any(|&k| k >= g)
     {
         return None;
     }
     Some(Cr2Pieces {
-        er: mat(&r.er, g),
+        t: mat(&r.t, p, pz),
+        er: mat(&r.er, pz, g),
         whole: r
             .f
             .iter()
             .zip(&r.epe)
-            .map(|(f, e)| (mat(f, p), mat(e, p)))
+            .map(|(f, e)| (mat(f, pz, pz), mat(e, pz, pz)))
             .collect(),
-        row_e: mat(&r.row_e, n1),
-        row_x: mat(&r.row_x, n1),
+        row_e: mat(&r.row_e, pz, n1),
+        row_x: mat(&r.row_x, pz, n1),
         row_phi: r.row_phi,
         null: r.null_cluster.into_iter().zip(r.null).collect(),
     })
@@ -2220,7 +2306,7 @@ fn stored_df_state(
         "residual" | "bell_mccaffrey" => {
             let kept: Vec<usize> = (0..p).filter(|&j| !aliased[j]).collect();
             let c = Mat::from_fn(kept.len(), kept.len(), |a, b| vcov[kept[a]][kept[b]]);
-            let mut st = SatterthwaiteState::residual(c, nobs as f64 - kept.len() as f64);
+            let mut st = SatterthwaiteState::residual(c, nobs as f64 - kept.len() as f64, beta);
             if kept.len() < p {
                 st.retained = Some(kept);
             }
@@ -2652,6 +2738,7 @@ impl StoredParts {
             condvar_cross: cross,
             dispersion: self.dispersion,
             weight_power: self.weight_power,
+            null_basis: std::borrow::Cow::Borrowed(&[]),
         }
     }
 }
@@ -2708,7 +2795,8 @@ pub struct PredictResult {
     /// The upper bound of a future observation.
     pub future_upper: Vec<f64>,
     /// One `"new_grouping_levels"` note per grouping with levels the fit did
-    /// not see.
+    /// not see, then one `"rows_not_estimable"` note when a row is outside the
+    /// row space of a rank-deficient fit.
     pub notes: Vec<NoteInfo>,
 }
 
@@ -2719,7 +2807,8 @@ pub struct PredictResult {
 /// and its row count (read only when it has no column), or `None` to predict
 /// the training rows. `scale` is `"link"` or `"response"`; `population`,
 /// `allow_new_levels`, `se`, `level` and `future` are those of
-/// [`crate::PredictOptions`].
+/// [`crate::PredictOptions`]. `new_levels_arg` is the caller's spelling of
+/// turning `allow_new_levels` on, which the unseen-level refusal names.
 ///
 /// A new table is lowered with the fit's factor levels, column order and
 /// grouping labels; a table with none of the model's grouping columns
@@ -2730,8 +2819,10 @@ pub struct PredictResult {
 /// An unknown `scale`; a `level` outside `(0, 1)`; `future` on a model that is
 /// not a non-Gaussian mixed model; new rows for a fit made with an `offset=`
 /// argument (its values for the new rows are unknown); conditional mode on a
-/// new table without the grouping columns; the lowering errors of the new
-/// table; and every error of [`crate::predict`]. A panic is returned as `Err`.
+/// new table without the grouping columns; a new row with a grouping level
+/// the fit did not see while `allow_new_levels` is off ([`FitError::Ids`],
+/// naming the grouping and the row); the lowering errors of the new table;
+/// and every error of [`crate::predict`]. A panic is returned as `Err`.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn predict(
     formula: &str,
@@ -2750,6 +2841,7 @@ pub fn predict(
     scale: &str,
     population: bool,
     allow_new_levels: bool,
+    new_levels_arg: &str,
     se: bool,
     level: f64,
     future: bool,
@@ -2787,7 +2879,14 @@ pub fn predict(
         future,
     };
     let cross = parts.condvar_cross.as_ref().map(CondvarCross::from);
-    let fp = parts.fit_parts(lowered.model.family, cross.as_ref());
+    let mut fp = parts.fit_parts(lowered.model.family, cross.as_ref());
+    // The fit's null space, from the training design it was fitted on, which
+    // the port does not store.
+    let aliased = detect_aliased(&lowered.x, lowered.n, lowered.p);
+    if aliased.iter().any(|&a| a) {
+        fp.null_basis =
+            std::borrow::Cow::Owned(null_basis(&lowered.x, lowered.n, lowered.p, &aliased));
+    }
     let pred = catch_unwind(AssertUnwindSafe(|| -> Result<Prediction, PortError> {
         let fitted = |design: &crate::Design<'_>| {
             predict_parts(&fp, lowered.spec(), design, &opts).map_err(PortError::from)
@@ -2816,6 +2915,31 @@ pub fn predict(
                 names.join(", ")
             )
             .into());
+        }
+        if let (false, Some(ids)) = (allow_new_levels, &rows.ids) {
+            // The kernel refuses the same rows in the same order, but names
+            // the grouping by its index.
+            let columns: Vec<&[u32]> = std::iter::once(&ids.primary)
+                .chain(&ids.extra)
+                .map(Vec::as_slice)
+                .collect();
+            for i in 0..rows.n {
+                for (g, col) in lowered.re_groups.iter().zip(&columns) {
+                    if col[i] as usize == g.slot_labels.len() {
+                        return Err(FitError::Ids(ErrorMessage::at_row(
+                            format!(
+                                "grouping {:?} has a level the fit did not see at row ",
+                                g.name
+                            ),
+                            i,
+                            &format!(
+                                "; set {new_levels_arg} to predict it with a zero random effect"
+                            ),
+                        ))
+                        .into());
+                    }
+                }
+            }
         }
         fitted(&rows.design())
     }))
@@ -3433,8 +3557,7 @@ mod tests {
             None,
         )
         .expect("ineligible nagq must be stripped, not an error");
-        let msg = result.agq_warning.as_deref().expect("warning expected");
-        assert!(msg.contains("nagq=3"), "{msg}");
+        assert!(result.agq_warning);
 
         // Binomial with q_p = 1 + 3 slopes = 4 > 3: over the random-effect cap.
         let n = 40;
@@ -3478,8 +3601,7 @@ mod tests {
             None,
         )
         .expect("over-cap nagq must be stripped, not an error");
-        let msg = result.agq_warning.as_deref().expect("warning expected");
-        assert!(msg.contains("nagq=3"), "{msg}");
+        assert!(result.agq_warning);
     }
 
     #[test]
@@ -3682,6 +3804,21 @@ mod tests {
         (numeric, factor)
     }
 
+    /// Three rows for three fixed coefficients, two groups.
+    #[allow(clippy::type_complexity)] // test fixture: the numeric+factor column maps run_fit takes
+    fn three_row_lmm() -> (
+        HashMap<String, Vec<f64>>,
+        HashMap<String, (Vec<String>, Vec<u32>)>,
+    ) {
+        let mut numeric = HashMap::new();
+        numeric.insert("y".to_string(), vec![1.0, 2.0, 4.0]);
+        numeric.insert("x1".to_string(), vec![0.0, 1.0, 3.0]);
+        numeric.insert("x2".to_string(), vec![1.0, 0.0, 2.0]);
+        let mut factor = HashMap::new();
+        factor.insert("g".to_string(), factor_col(&["a", "b", "a"]));
+        (numeric, factor)
+    }
+
     #[allow(clippy::type_complexity)] // test fixture: the numeric+factor column maps run_fit takes
     fn fit_with(
         formula: &str,
@@ -3864,18 +4001,13 @@ mod tests {
         assert!(glmm.rss.is_nan() && glmm.r_squared.is_nan());
     }
 
-    /// A Gaussian LMM with no finite endpoint (a random slope on an aliased
-    /// column) carries the failed record and the note; switched off, neither.
+    /// A Gaussian LMM with no finite endpoint (three rows for three
+    /// coefficients) carries the failed record and the note; switched off,
+    /// neither.
     #[test]
     fn degenerate_lmm_is_failed_with_the_curvature_note() {
-        let data = || {
-            let (mut numeric, factor) = toy_lmm();
-            let x2: Vec<f64> = numeric["x"].iter().map(|v| 2.0 * v).collect();
-            numeric.insert("x2".to_string(), x2);
-            (numeric, factor)
-        };
-        let formula = "y ~ x + x2 + (1 + x2 | g)";
-        let r = fit_with(formula, data(), "gaussian", "identity", None, true);
+        let formula = "y ~ x1 + x2 + (1 | g)";
+        let r = fit_with(formula, three_row_lmm(), "gaussian", "identity", None, true);
         assert!(!r.converged);
         assert_eq!(r.df_method, "failed");
         let note = r
@@ -3884,7 +4016,14 @@ mod tests {
             .find(|n| n.kind == "satterthwaite_curvature")
             .expect("the failed pass carries the note");
         assert!(note.detail.ends_with("nonfinite true"), "{}", note.detail);
-        let off = fit_with(formula, data(), "gaussian", "identity", None, false);
+        let off = fit_with(
+            formula,
+            three_row_lmm(),
+            "gaussian",
+            "identity",
+            None,
+            false,
+        );
         assert_eq!(off.df_method, "disabled");
         assert!(!has_curvature_note(&off));
     }
@@ -3949,6 +4088,35 @@ mod tests {
         assert!(unfit.rss.is_nan() && unfit.r_squared.is_nan() && unfit.adj_r_squared.is_nan());
     }
 
+    /// A constant response leaves R² as a ratio of round-off, so both R² are
+    /// NaN; an exactly fitted response that does vary keeps R² = 1.
+    #[test]
+    fn ols_r_squared_is_nan_when_nothing_varies() {
+        let x: Vec<f64> = (0..50).map(|i| i as f64 / 7.0).collect();
+        let data = |y: Vec<f64>| {
+            let mut numeric = HashMap::new();
+            numeric.insert("y".to_string(), y);
+            numeric.insert("x".to_string(), x.clone());
+            (numeric, HashMap::new())
+        };
+
+        let flat = fit_with(
+            "y ~ x",
+            data(vec![3.7; 50]),
+            "gaussian",
+            "identity",
+            None,
+            true,
+        );
+        assert!(flat.converged);
+        assert!(flat.r_squared.is_nan(), "{}", flat.r_squared);
+        assert!(flat.adj_r_squared.is_nan(), "{}", flat.adj_r_squared);
+
+        let line = data(x.iter().map(|v| 2.0 + 3.0 * v).collect());
+        let exact = fit_with("y ~ x", line, "gaussian", "identity", None, true);
+        assert_eq!((exact.r_squared, exact.adj_r_squared), (1.0, 1.0));
+    }
+
     #[test]
     fn same_fixed_part_reads_the_fixed_terms_and_intercept_only() {
         assert_eq!(
@@ -3965,25 +4133,45 @@ mod tests {
     }
 
     #[test]
-    fn confint_takes_t_on_a_finite_df_and_normal_elsewhere() {
+    fn confint_follows_the_df_method() {
         // qt(0.975, 8), qnorm(0.975) and qnorm(0.95) in R.
         let (qt8, qn, qn90) = (2.3060041352041654, 1.9599639845400534, 1.6448536269514715);
         let close = |a: f64, b: f64| (a - b).abs() <= 1e-12 * b.abs().max(1.0);
-        let beta = [1.0, 2.0, f64::NAN, 3.0];
-        let se = [0.5, 0.5, f64::NAN, 0.25];
-        let df = [8.0, f64::NAN, f64::NAN, 0.0];
-        let ci = confint(&beta, &se, &df, 0.95).unwrap();
-        assert!(close(ci[0][0], 1.0 - qt8 * 0.5) && close(ci[0][1], 1.0 + qt8 * 0.5));
-        assert!(close(ci[1][0], 2.0 - qn * 0.5) && close(ci[1][1], 2.0 + qn * 0.5));
-        assert!(ci[2][0].is_nan() && ci[2][1].is_nan());
-        // A df of 0 has no t distribution: normal, never NaN while se is finite.
-        assert!(close(ci[3][0], 3.0 - qn * 0.25) && close(ci[3][1], 3.0 + qn * 0.25));
-        let ci90 = confint(&beta, &se, &df, 0.9).unwrap();
-        assert!(close(ci90[1][1], 2.0 + qn90 * 0.5));
-        for bad in [0.0, 1.0, 1.5, -0.1, f64::NAN] {
-            assert!(confint(&beta, &se, &df, bad).is_err(), "level {bad}");
+        let nan = |ci: [f64; 2]| ci[0].is_nan() && ci[1].is_nan();
+        let beta = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let se = [0.5, 0.5, 0.5, 0.5, 0.5, f64::NAN];
+        let df = [8.0, f64::NAN, 0.0, -1.0, f64::INFINITY, 8.0];
+        for method in [
+            "residual",
+            "satterthwaite",
+            "bell_mccaffrey",
+            "pustejovsky_tipton",
+        ] {
+            let ci = confint(&beta, &se, &df, method, 0.95).unwrap();
+            assert!(close(ci[0][0], 1.0 - qt8 * 0.5) && close(ci[0][1], 1.0 + qt8 * 0.5));
+            // A lost df on a fit that tests with t has no interval.
+            for (i, c) in ci.iter().enumerate().skip(1) {
+                assert!(nan(*c), "{method} row {i}: {c:?}");
+            }
         }
-        assert!(confint(&beta, &se[..2], &df, 0.95).is_err());
+        for method in ["none", "disabled", "failed"] {
+            let ci = confint(&beta, &se, &df, method, 0.95).unwrap();
+            assert!(close(ci[0][0], 1.0 - qt8 * 0.5) && close(ci[0][1], 1.0 + qt8 * 0.5));
+            assert!(close(ci[1][0], 2.0 - qn * 0.5) && close(ci[1][1], 2.0 + qn * 0.5));
+            assert!(close(ci[2][0], 3.0 - qn * 0.5) && close(ci[2][1], 3.0 + qn * 0.5));
+            assert!(nan(ci[5]), "{method}");
+            let ci90 = confint(&beta, &se, &df, method, 0.9).unwrap();
+            assert!(close(ci90[1][1], 2.0 + qn90 * 0.5));
+        }
+        let err = confint(&beta, &se, &df, "other", 0.95).unwrap_err();
+        assert!(err.contains("unknown df_method"), "{err}");
+        for bad in [0.0, 1.0, 1.5, -0.1, f64::NAN] {
+            assert!(
+                confint(&beta, &se, &df, "none", bad).is_err(),
+                "level {bad}"
+            );
+        }
+        assert!(confint(&beta, &se[..2], &df, "none", 0.95).is_err());
     }
 
     /// Deterministic fixed-effects-only Gamma(log) fixture: `y = exp(1 +
@@ -4804,7 +4992,7 @@ mod tests {
             .unwrap_or_else(|e| panic!("{f0} vs {f1}: {e}"));
             for fit in [&got.fit0, &got.fit1] {
                 assert_eq!(fit.reml, fit_reml, "{f0} vs {f1}");
-                assert!(fit.reml_warning.is_none());
+                assert!(!fit.reml_warning);
                 // satterthwaite = true: a Gaussian mixed side's table has its F rows.
                 if fam == gaussian && !fit.varcorr.is_empty() {
                     let cols = term_columns(fit.term_table_type3.as_ref().expect("a table"));
@@ -4875,12 +5063,10 @@ mod tests {
             .to_string()
         );
 
-        let (mut numeric, factor) = toy_lmm();
-        let x2: Vec<f64> = numeric["x"].iter().map(|v| 2.0 * v).collect();
-        numeric.insert("x2".to_string(), x2);
+        let (numeric, factor) = three_row_lmm();
         let err = run_compare(
-            "y ~ x + x2 + (1 | g)",
-            "y ~ x + x2 + (1 + x2 | g)",
+            "y ~ 1 + (1 | g)",
+            "y ~ x1 + x2 + (1 | g)",
             numeric,
             factor,
             "gaussian",
@@ -4924,9 +5110,9 @@ mod tests {
         )
         .expect("compares");
         assert_eq!(got.fit0.objective, Objective::Agq { nodes: 5 });
-        assert!(got.fit0.agq_warning.is_none());
+        assert!(!got.fit0.agq_warning);
         assert_eq!(got.fit1.objective, Objective::Laplace);
-        assert!(got.fit1.agq_warning.as_deref().unwrap().contains("nagq=5"));
+        assert!(got.fit1.agq_warning);
         assert!(got.fit0.weights.is_some());
         let ComparisonTest::Lr(t) = &got.comparison.test else {
             panic!("an LR test")
@@ -5241,7 +5427,7 @@ mod tests {
         )
     }
 
-    /// D16, §3.3: with weights and a shape both models take, `None` fits the
+    /// With weights and a shape both models take, `None` fits the
     /// power by ML on both sides when the fixed parts differ, and the test is
     /// the likelihood-ratio test on the fixed columns; a named power is used
     /// as given; a second grouping factor on one side resolves `None` to the
@@ -5283,7 +5469,7 @@ mod tests {
         }
     }
 
-    /// §6, D24: with the same fixed parts a resolved or named fitted power is
+    /// With the same fixed parts a resolved or named fitted power is
     /// refused before either fit; the weights as given are compared.
     #[test]
     fn run_compare_refuses_fitted_powers_on_a_random_part_alone() {
@@ -5297,7 +5483,7 @@ mod tests {
         assert!(claimed.is_ok());
     }
 
-    /// §6 (G9): `anova_test = "LRT"` on a δ fit stores the refusal of its
+    /// `anova_test = "LRT"` on a δ fit stores the refusal of its
     /// likelihood-ratio tables (a Gaussian fit's rows are F tests), and the
     /// profile intervals refuse a fitted power and a fixed power other than 1.
     #[test]
@@ -5672,8 +5858,98 @@ mod tests {
         );
     }
 
+    /// A stored robust record of a fit with an aliased column (`x2 = 2x`):
+    /// `t` is `p × p_Z`, and `contrast_test` on the record gives the F, df
+    /// and p of the in-memory fit on a contrast over the other coefficients.
+    #[test]
+    fn contrast_test_of_a_stored_robust_fit_with_an_aliased_column() {
+        use crate::test_support::csv_table;
+        let close = |a: f64, b: f64| a == b || (a / b - 1.0).abs() < 1e-12;
+        for (formula, df_method) in [
+            ("y ~ g + x + x2 + (1 | subj)", "pustejovsky_tipton"),
+            ("y ~ g + x + x2", "bell_mccaffrey"),
+        ] {
+            let (mut numeric, factor) = sim("sim_factorial");
+            let n = numeric["y"].len();
+            let x2: Vec<f64> = numeric["x"].iter().map(|v| 2.0 * v).collect();
+            numeric.insert("x2".to_string(), x2.clone());
+            let w: Vec<f64> = (0..n).map(|i| 1.0 + (i % 7) as f64 / 2.0).collect();
+            let r = run_fit(
+                formula,
+                numeric,
+                factor,
+                "gaussian",
+                "identity",
+                "hessian",
+                1,
+                None,
+                Some(w.clone()),
+                None,
+                None,
+                true,
+                true,
+                None,
+                "Wald",
+                Some(WeightPower::Fixed(1.0)),
+                Some(SeType::Robust),
+            )
+            .unwrap();
+            assert_eq!(r.df_method, df_method);
+            let p = r.beta.len();
+            let rec = r.robust.clone().expect("a robust record");
+            assert_eq!(r.aliased.iter().filter(|a| **a).count(), 1);
+            assert_eq!(rec.t.len(), p * (p - 1));
+
+            let csv = include_str!("../../validation/data/simulated/sim_factorial.csv");
+            let mut table = csv_table(csv, &["subj", "g", "h"]);
+            table.columns.push(("x2".to_string(), Column::Numeric(x2)));
+            let mut lo = crate::formula::lower(formula, &table, crate::Family::Gaussian).unwrap();
+            lo.weights = Some(w);
+            let opts = crate::FitOptions {
+                weight_power: Some(WeightPower::Fixed(1.0)),
+                se_type: Some(SeType::Robust),
+                ..crate::FitOptions::default()
+            };
+            let m = crate::formula::fit_lowered(formula, lo, &opts).unwrap();
+            let fit = m.fit();
+            let unit = |j: usize| {
+                (0..p)
+                    .map(|k| f64::from(u8::from(k == j)))
+                    .collect::<Vec<_>>()
+            };
+            let one: Vec<f64> = (0..p).map(|k| [0.0, 1.0, -1.0, 0.5, 0.0][k]).collect();
+            for (l, rows) in [(one, 1), ([unit(1), unit(3)].concat(), 2)] {
+                let table = contrast_test(
+                    r.df_method,
+                    &r.beta,
+                    &r.vcov,
+                    &r.model_vcov,
+                    &r.aliased,
+                    r.nobs,
+                    r.dispersion,
+                    r.satterthwaite_record.clone(),
+                    r.robust.clone(),
+                    &r.names,
+                    &l,
+                    rows,
+                )
+                .unwrap();
+                let got = term_columns(&table);
+                let want = fit.contrast_f(&l, rows).unwrap();
+                for (a, b) in [
+                    (got.statistic[0], want.f),
+                    (got.num_df[0], want.num_df),
+                    (got.den_df[0], want.den_df),
+                    (got.p_value[0], want.p_value),
+                ] {
+                    assert!(close(a, b), "{formula} {rows}: {a} vs {b}");
+                }
+            }
+        }
+    }
+
     /// `contrast_test` and `pairwise` on the fields `run_fit` stores of a
-    /// robust fit give the kernel's tests of that fit (D12): a one-row `L`
+    /// robust fit give the kernel's tests of that fit: a one-row `L`
     /// the robust t² on its df, two rows the model-based F with its note,
     /// each comparison its robust t; CR2 on a random intercept, HC2 on WLS.
     #[test]
@@ -5909,6 +6185,7 @@ mod tests {
                     "response",
                     population,
                     true,
+                    "allow_new_levels=True",
                     true,
                     0.9,
                     future,
@@ -5978,6 +6255,56 @@ mod tests {
         assert_eq!(crossed, 2, "Penicillin and Pastes carry a cross record");
     }
 
+    /// On a cell-means fit with an absent cell, the port path finds the
+    /// fit's null space from the relowered training table: the absent cell's
+    /// row is NaN and named in a note, a cell with data predicts a number.
+    #[test]
+    fn predict_names_the_rows_a_rank_deficient_fit_cannot_estimate() {
+        let formula = "y ~ 0 + f1:f2 + (1 | g)";
+        let cols = csv_columns(
+            &crate::predict::predict_tests::absent_cell_csv(),
+            &["f1", "f2", "g"],
+        );
+        let r = run(formula, cols.clone(), "gaussian", "identity", 1, None, None);
+        let parts = stored(&r);
+        let labels = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let numeric = HashMap::from([("y".to_string(), vec![0.0; 2])]);
+        let factor = HashMap::from([
+            ("f1".to_string(), (labels(&["a", "b"]), vec![0, 1])),
+            ("f2".to_string(), (labels(&["A", "B"]), vec![0, 1])),
+        ]);
+        let got = predict(
+            formula,
+            cols.0,
+            cols.1,
+            "gaussian",
+            "identity",
+            None,
+            None,
+            &parts,
+            Some((numeric, factor, 2)),
+            "link",
+            true,
+            true,
+            "allow_new_levels=True",
+            true,
+            0.95,
+            false,
+        )
+        .unwrap();
+        assert!(
+            got.fit[0].is_nan() && got.fit[1].is_finite(),
+            "{:?}",
+            got.fit
+        );
+        let notes: Vec<(&str, &str)> = got
+            .notes
+            .iter()
+            .map(|n| (n.kind, n.detail.as_str()))
+            .collect();
+        assert_eq!(notes, [("rows_not_estimable", "0")]);
+    }
+
     /// A new table: lowered with the fit's levels and grouping labels, an
     /// unseen grouping label a note with its rows, the formula door's
     /// prediction bit for bit; and the refusals the glue adds.
@@ -6029,6 +6356,7 @@ mod tests {
                 scale,
                 population,
                 true,
+                "allow_new_levels=True",
                 true,
                 level,
                 false,
@@ -6082,6 +6410,7 @@ mod tests {
             "link",
             false,
             true,
+            "allow_new_levels=True",
             false,
             0.95,
             true,
@@ -6113,6 +6442,7 @@ mod tests {
             "link",
             false,
             true,
+            "allow_new_levels=True",
             false,
             0.95,
             false,

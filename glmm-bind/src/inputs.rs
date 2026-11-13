@@ -5,6 +5,7 @@ use std::collections::HashMap;
 
 use crate::coerce;
 use crate::error::BindError;
+use crate::port::Port;
 use crate::value::{Record, Value};
 
 /// The data columns as the engine's orchestration functions take them.
@@ -18,6 +19,8 @@ pub(crate) struct Inputs {
     rec: Record,
     /// `""` for a call's arguments, `"name."` for a nested record.
     ctx: String,
+    /// The calling port; a nested record keeps its parent's.
+    port: Port,
 }
 
 macro_rules! read {
@@ -44,11 +47,16 @@ macro_rules! read {
 }
 
 impl Inputs {
-    pub(crate) fn new(rec: Record) -> Self {
+    pub(crate) fn new(rec: Record, port: Port) -> Self {
         Self {
             rec,
             ctx: String::new(),
+            port,
         }
+    }
+
+    pub(crate) fn port(&self) -> Port {
+        self.port
     }
 
     fn bad(&self, name: &str, why: &str) -> BindError {
@@ -59,7 +67,6 @@ impl Inputs {
     read!(f64, opt_f64, f64, |v: Value| coerce::to_f64(&v));
     read!(usize, opt_usize, usize, |v: Value| coerce::to_usize(&v));
     read!(bool, opt_bool, bool, |v: Value| coerce::to_bool(&v));
-    read!(seed, opt_seed, u64, |v: Value| coerce::to_seed(&v));
     read!(vec, opt_vec, Vec<f64>, coerce::to_vec);
     read!(vecs, opt_vecs, Vec<Vec<f64>>, coerce::to_vecs);
     read!(usizes, opt_usizes, Vec<usize>, coerce::to_usizes);
@@ -99,10 +106,12 @@ impl Inputs {
             Value::List(x) if x.is_empty() => Ok(Some(Inputs {
                 rec: Record::new(),
                 ctx: format!("{}{name}.", self.ctx),
+                port: self.port,
             })),
             Value::Record(rec) => Ok(Some(Inputs {
                 rec,
                 ctx: format!("{}{name}.", self.ctx),
+                port: self.port,
             })),
             other => Err(self.bad(
                 name,

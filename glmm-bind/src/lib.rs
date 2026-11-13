@@ -20,14 +20,14 @@ mod error;
 mod fns;
 mod inputs;
 mod notes;
+mod options;
+mod port;
 mod records;
 mod registry;
 mod summary;
 mod value;
 
 pub use error::BindError;
-/// The bound on `nsim` (`compare`, `compare_fits`), for a port's own message
-/// on a value it cannot pass.
-pub use glmm::orchestrate::MAX_NSIM;
+pub use port::Port;
 pub use registry::{call, registry, DefaultValue, FnSpec, Param};
 pub use value::{Record, Value};

@@ -36,7 +36,8 @@ quantile on the row's degrees of freedom where the summary tests with t
 (Satterthwaite df on a Gaussian mixed model, \code{n - p} on OLS and the Gamma and
 inverse-Gaussian GLMs, as \link[stats:confint]{stats::confint.lm}), the normal quantile where it
 tests with z. On a Gaussian mixed model fitted with \code{satterthwaite = FALSE}
-the intervals are normal and a message says the df were not computed. The
+the intervals are normal and a message says the df were not computed. A row
+whose df was lost on a fit that tests with t gives a \code{NaN} interval. The
 Python port's \code{Fit.confint()} computes the same intervals through the same
 kernel function.
 }

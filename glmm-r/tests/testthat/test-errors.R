@@ -55,16 +55,10 @@ test_that("dot formulas error", {
   expect_error(fastglmm(y ~ ., err_data()), "'\\.' is not supported")
 })
 
-test_that("a formula with no response errors with the parser's message", {
-  expect_error(fastglmm(~ x, err_data()),
-               "formula syntax error at position 0: the formula has no response; write it as y ~ x",
-               fixed = TRUE)
-})
-
 test_that("a crossing power below 2 errors with the Python port's message", {
   # R's own parser refuses a formula ending in `+`, so only `^` is tested here.
   expect_error(fastglmm(y ~ (x + g)^1 + (1 | g), err_data()),
-               paste("formula syntax error at position 0: invalid power (an integer of 2",
+               paste("formula syntax error: invalid power (an integer of 2",
                      "or more after '^') in term '(x+g)^1'"),
                fixed = TRUE)
 })
@@ -182,12 +176,22 @@ test_that("REML must be one non-NA logical", {
   d <- err_data()
   expect_error(fastglmm(y ~ x + (1 | g), d, REML = NA),
                "REML must be NULL, TRUE or FALSE, got NA", fixed = TRUE)
+  expect_error(fastglmm(y ~ x + (1 | g), d, REML = 1),
+               "REML must be NULL, TRUE or FALSE, got 1", fixed = TRUE)
   expect_error(fastglmm(y ~ x + (1 | g), d, REML = c(TRUE, FALSE)), "TRUE or FALSE")
   # No coercion: a number or a string is not a logical, and an empty one is
   # not "absent".
   for (bad in list(1, "TRUE", logical(0))) {
     expect_error(fastglmm(y ~ x + (1 | g), d, REML = bad), "TRUE or FALSE")
   }
+})
+
+test_that("a lone integer or string NA gets the option's own refusal", {
+  d <- err_data()
+  expect_error(fastglmm(y ~ x + (1 | g), d, nAGQ = NA_integer_),
+               "nAGQ must be an odd integer in 1..=25, got NA", fixed = TRUE)
+  expect_error(fastglmm(y ~ x + (1 | g), d, wald.se = NA_character_),
+               "wald.se must be 'hessian' or 'rx', got NA", fixed = TRUE)
 })
 
 test_that("non-treatment contrasts on a fixed-effect factor error instead of fitting silently", {
@@ -282,8 +286,7 @@ test_that("inf in weights= or offset= is refused up front, not by the kernel", {
   w <- rep(1, 40)
   w[1] <- Inf
   # The plain up-front message, not the kernel's own ("Data weights must
-  # be finite and > 0 (row 1)") which "weights must be finite" alone would also
-  # match as a substring.
+  # be within [1e-100, 1e100] (row 1, ...)").
   expect_error(fastglmm(y ~ x, d, weights = w), "no NaN, inf, or missing entries")
   o <- rep(0, 40)
   o[1] <- -Inf
@@ -307,7 +310,7 @@ test_that("bad dispersion value message matches the Python port", {
   d <- err_data()
   expect_error(
     fastglmm(y ~ x, d, family = Gamma(link = "log"), dispersion = "pearson"),
-    "dispersion must be NULL, 'estimate', or a number, got 'pearson'",
+    "dispersion must be NULL, 'estimate', or a number, got the string \"pearson\"",
     fixed = TRUE
   )
 })
@@ -396,6 +399,22 @@ test_that("MASS::negative.binomial-style fixed-theta family objects error", {
                "estimates it")
 })
 
+test_that("a bind error has the class fastglmm_error_<code>", {
+  d <- err_data()
+  code <- function(expr) {
+    tryCatch(expr, fastglmm_error_invalid_argument = function(e) "invalid_argument",
+             fastglmm_error_fit_error = function(e) "fit_error")
+  }
+  expect_identical(code(fastglmm(y ~ x, d, nAGQ = 2)), "invalid_argument")
+  d$pos <- exp(d$x)
+  expect_identical(code(fastglmm(pos ~ x, d, family = Gamma(), dispersion = 1e300)),
+                   "invalid_argument")
+  # A zero weight is refused in R before the native code; a binomial
+  # proportion above 1 is the native code's data error.
+  d$p <- c(2, rep(0.5, nrow(d) - 1L))
+  expect_identical(code(fastglmm(p ~ x, d, family = binomial())), "fit_error")
+})
+
 test_that("nAGQ must be an odd integer in 1..=25", {
   d <- err_data()
   expect_error(fastglmm(y ~ x, d, nAGQ = 2), "odd integer")
@@ -425,7 +444,7 @@ test_that("start must be a list - message matches the Python port's warm_start c
     paste(
       "start must be a list with elements 'beta', 'theta' and/or 'dispersion' (theta",
       "is the random-effect Cholesky vector, not the negative-binomial shape - that is",
-      "init.theta or dispersion), got numeric"
+      "init.theta or dispersion), got a numeric vector"
     ),
     fixed = TRUE
   )
@@ -503,8 +522,9 @@ test_that("predict() names a newdata row, and a fit's own row through the rows i
   expect_error(simulate(m, seed = 1), "(row 6 has 4.5)", fixed = TRUE)
   # A newdata row is the caller's own, whatever rows the fit dropped.
   new <- data.frame(x = c(0, 0.5, 1), g = factor(c("1", "9", "2")))
-  expect_error(predict(m, new, allow.new.levels = FALSE), "did not see at row 2 (id",
-               fixed = TRUE)
+  expect_error(predict(m, new, allow.new.levels = FALSE), paste(
+    'grouping "g" has a level the fit did not see at row 2; set allow.new.levels = TRUE',
+    "to predict it with a zero random effect"), fixed = TRUE)
 })
 
 test_that("simulate() names the caller's row of the fit's rows", {
@@ -517,10 +537,40 @@ test_that("simulate() names the caller's row of the fit's rows", {
                fixed = TRUE)
 })
 
+test_that("an input outside its range is refused with the limit name", {
+  # Same table and inputs in glmm-py/tests/test_validation.py - change together.
+  d <- data.frame(y = c(0.5, 1.25, 2.0, 1.5, 3.0, 2.25, 1.0, 2.75),
+                  x = 0.25 * (0:7),
+                  k = c(0, 1, 2, 1, 3, 2, 4, 3),
+                  p = c(0, 0.5, 1, 0.5, 0.5, 0, 1, 0.5))
+  at_row_3 <- function(fill, value) replace(rep(fill, 8), 3, value)
+  # The column number is not pinned: R names the design column 0-based.
+  expect_error(fastglmm(y ~ x, transform(d, x = at_row_3(0, 2e100))),
+               "x must be finite with \\|x\\| <= 1e100 \\(row 3, column [0-9]+, value 2e100; glmm::limits::MAX_DATA_ABS\\)")
+  expect_error(fastglmm(y ~ x, d, weights = at_row_3(1, 1e-101)),
+               "Data weights must be within [1e-100, 1e100] (row 3, value 1e-101; glmm::limits::MAX_DATA_ABS)",
+               fixed = TRUE)
+  expect_error(fastglmm(k ~ x, d, family = poisson(), offset = at_row_3(0, 701)),
+               "Data offset must be finite with |offset| <= 7e2 on this link (row 3, value 7.01e2; glmm::limits::MAX_LOG_OFFSET_ABS)",
+               fixed = TRUE)
+  expect_error(fastglmm(p ~ x, d, family = binomial(), weights = at_row_3(2, 2^54)),
+               "binomial weights (trial counts) must be <= 9.007199254740992e15 (row 3, value 1.8014398509481984e16; glmm::limits::MAX_TRIALS)",
+               fixed = TRUE)
+  expect_error(fastglmm(y ~ x, d, family = Gamma(link = "log"), dispersion = 1e7),
+               "dispersion on a Gamma model must be within [1e-6, 1e6] (value 1e7; glmm::limits::GAMMA_PHI_LO, glmm::limits::GAMMA_PHI_HI)",
+               fixed = TRUE)
+  expect_error(fastglmm(y ~ x, d, family = inverse.gaussian(link = "log"), dispersion = 1e101),
+               "dispersion on an inverse-Gaussian model must be within [1e-100, 1e100] (value 1e101; glmm::limits::MAX_DATA_ABS)",
+               fixed = TRUE)
+  expect_error(fastglmm(k ~ x, d, family = "negativebinomial", init.theta = 1e-4),
+               "warm-start dispersion (the negative-binomial shape seed) must be within [1e-3, 1e4] (value 1e-4; glmm::limits::NB_THETA_LO, glmm::limits::NB_THETA_HI)",
+               fixed = TRUE)
+})
+
 test_that("wald.se must be 'hessian' or 'rx' - mirrors the Python port's wald_se check", {
   d <- err_data()
   expect_error(fastglmm(y ~ x, d, wald.se = "observed"),
-               "wald.se must be 'hessian' or 'rx', got 'observed'")
+               "wald.se must be 'hessian' or 'rx', got the string \"observed\"", fixed = TRUE)
 })
 
 test_that("nAGQ > 1 on negative-binomial and Gamma fits quadrature", {

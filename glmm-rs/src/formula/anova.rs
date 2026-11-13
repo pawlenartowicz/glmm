@@ -69,7 +69,7 @@ use std::fmt;
 use faer::Mat;
 
 use super::hypotheses::{
-    check_marginal, missing_cells_note, remap_slopes, type2_lr_sets, type2_vcov, type2_xtx, type3,
+    check_marginal, missing_cells_note, type2_lr_sets, type2_vcov, type2_xtx, type3,
     type3_null_basis, type3_unrounded, untouched_columns, ReducedDesignError, TermHypothesis,
 };
 use super::parse::{parse, ParsedFormula, RandomEffect};
@@ -83,7 +83,7 @@ use crate::inference::wald::wald_chisq;
 use crate::inference::{
     DenDf, LinearKind, LinearNote, LinearTest, LrNote, LrTest, Objective, Reference,
 };
-use crate::spec::set_term_slopes;
+use crate::spec::{remap_slopes, set_term_slopes};
 use crate::{ColumnId, Data, Design, Family, Fit, FitOptions, SeFor, StartValues, WaldSe};
 
 mod stored;
@@ -1464,7 +1464,7 @@ pub(crate) fn term_tests_cached(
     let hypotheses = match opts.ss_type {
         SsType::Type3 => type3(lowered, &retained),
         SsType::Type2 if gaussian && mixed => type2_xtx(lowered, &retained),
-        // D14: the model covariance, which on a robust fit is not `vcov`.
+        // The model covariance, which on a robust fit is not `vcov`.
         SsType::Type2 => type2_vcov(lowered, &retained, &fit.model_vcov_rows()),
     };
     let mut notes: Vec<String> = match opts.ss_type {

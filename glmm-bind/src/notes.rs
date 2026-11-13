@@ -1,7 +1,8 @@
 //! The text of every warning a fit raises: each kind's tier and title, the
 //! message of each kernel note, and the one severe warning of a fit that did
 //! not converge. Both ports raise these as given; each keeps only its own
-//! warning class per kind and the warnings that spell its own arguments.
+//! warning class per kind and words only `rows_dropped_na` (its own data
+//! preparation), `singular` and the predict notes.
 //! `documentation/warnings.md` documents the same table and text — change
 //! together.
 
@@ -26,6 +27,11 @@ const KINDS: &[(&str, &str, &str)] = &[
     ("too_few_rows", "severe", "Too few rows"),
     ("no_coefficients", "severe", "Nothing to estimate"),
     ("separated", "severe", "Separation"),
+    (
+        "dispersion_at_limit",
+        "severe",
+        "Dispersion at its search limit",
+    ),
     (
         "pirls_exhausted",
         "caution",
@@ -91,11 +97,13 @@ const KINDS: &[(&str, &str, &str)] = &[
         "caution",
         "Response constant within groups",
     ),
+    ("one_trial_per_level", "caution", "Variance not identified"),
     (
         "variance_at_limit",
         "caution",
         "Variance at its search limit",
     ),
+    ("nb_shape_at_limit", "caution", "Shape at its search limit"),
     (
         "weight_power_at_bound",
         "caution",
@@ -156,6 +164,13 @@ pub(crate) fn warning_record(kind: &str, message: String) -> Value {
             .with("title", text(title))
             .with("message", Value::Str(message)),
     )
+}
+
+/// `note_kinds`: every kind of the table, in its order.
+pub(crate) fn note_kinds(_: &mut Inputs) -> Result<Value, BindError> {
+    Ok(Value::StrVec(
+        KINDS.iter().map(|&(kind, _, _)| kind.to_owned()).collect(),
+    ))
 }
 
 /// `warning_kind`: the `tier` and `title` of `kind`, for a warning the port
@@ -277,6 +292,9 @@ fn note_message(n: &NoteInfo, columns: &[u32], cx: &FitText) -> Option<String> {
     let s = match n.kind {
         // Only on a non-converged fit, whose one warning (`failure`) names it.
         "separated" => return None,
+        // Only on a non-converged fit, whose one warning (`failure`) carries
+        // the message.
+        "dispersion_at_limit" => return None,
         "ill_conditioned" => format!(
             "{} is almost a combination of other columns in the model, so its standard error \
              is large. Its estimate is still correct, but imprecise. The other columns involved \
@@ -346,12 +364,26 @@ fn note_message(n: &NoteInfo, columns: &[u32], cx: &FitText) -> Option<String> {
              variance.",
             n.detail
         ),
+        "one_trial_per_level" => format!(
+            "Every level of '{}' has one binary trial, so its variance is not identified: it \
+             trades against the fixed effects. Drop this grouping, or aggregate rows.",
+            n.detail
+        ),
         "variance_at_limit" => "A random-effect parameter reached the upper limit of the search \
              (1000 on glmm's internal scale). On a Gaussian model this usually means the residual \
              variance is estimated at or near zero; on other families the random-effect variance \
              has no finite estimate. The estimates are at that limit, not at an optimum. Check \
              for a response that the predictors and groups explain exactly."
             .to_owned(),
+        // The upper limit (`lower` NaN) is a near-Poisson fit: stored, no warning.
+        "nb_shape_at_limit" if n.lower.is_nan() => return None,
+        "nb_shape_at_limit" => format!(
+            "The negative binomial shape parameter reached the lower limit of its search, {}. \
+             The data are more overdispersed than this limit allows, so the shape is at that \
+             limit, not at an optimum, and the coefficients and standard errors are computed at \
+             it.",
+            cx.num(n.lower, 4)
+        ),
         "hessian_se_fallback" => "The usual standard errors could not be computed, so a simpler \
              method was used. Its standard errors tend to be too small, so p-values and \
              confidence intervals may look more precise than they are. Standard errors for the \
@@ -524,33 +556,9 @@ const DIVERGED_CONTINUOUS: &str = "The fit did not settle on an answer: the fitt
     reported. Check predictors with extreme values; with a link other than log, the log link is \
     usually more stable.";
 
-// A response far outside the reciprocal links' range: the kernel holds the
-// Gamma 1/mu and inverse-Gaussian 1/mu^2 linear predictor inside
-// [1e-75, 1e75] (`INV_ETA_MIN` / `INV_ETA_MAX` in glmm-rs/src/family.rs —
-// change together), and a fit whose means must sit outside it cannot converge.
-const ETA_RANGE: &str = "Some response values are so large or so small that the linear \
-    predictor of this link (1/mu for gamma, 1/mu^2 for inverse Gaussian) leaves the range the \
-    solver supports, 1e-75 to 1e75. Rescale the response, for example divide it by a power of \
-    ten, or use the log link.";
-
-/// Whether some positive response value puts the reciprocal link's
-/// eta = 1/y (gamma) or 1/y^2 (inverse Gaussian) outside [1e-75, 1e75].
-fn eta_out_of_range(family: &str, link: &str, y: &[f64]) -> bool {
-    let power = match (family, link) {
-        ("gamma", "inverse") => 1,
-        ("inversegaussian", "inverse_squared") => 2,
-        _ => return false,
-    };
-    y.iter().filter(|&&v| v > 0.0).any(|&v| {
-        let eta = 1.0 / v.powi(power);
-        !(1e-75..=1e75).contains(&eta)
-    })
-}
-
 /// What [`failure`] reads off a fit that did not converge.
 pub(crate) struct Failed<'a> {
     pub family: &'a str,
-    pub link: &'a str,
     /// Whether the fitted model kept a random effect.
     pub mixed: bool,
     pub notes: &'a [NoteInfo],
@@ -566,8 +574,9 @@ pub(crate) struct Failed<'a> {
 /// a mixed model, only when columns were dropped as aliased, which means
 /// every fixed-effect column is all zero, since the alias check never drops
 /// the first column that is not), too few rows (a one-row response is
-/// trivially constant, so this comes first), a constant response, then the
-/// model. A model with random effects whose fixed-effects-only GLM stopped on
+/// trivially constant, so this comes first), a constant response, a Gamma
+/// dispersion refused on an edge of its search range (the
+/// `dispersion_at_limit` note, which names the edge), then the model. A model with random effects whose fixed-effects-only GLM stopped on
 /// separation (the `separated` note) never ran its search; its coefficients
 /// are that GLM's last step, so it gets the GLM's message. Otherwise, with
 /// random effects, a finite deviance means the kernel reached an end point
@@ -575,8 +584,7 @@ pub(crate) struct Failed<'a> {
 /// coefficients (aliased slots are NaN by contract) confirm it; anything else
 /// failed. The deviance is what decides a model with no fixed-effect column
 /// at all. A GLMM inner cap-out during the search is one extra sentence
-/// rather than a second warning. On the reciprocal links a response outside
-/// their range names that cause instead of the general advice.
+/// rather than a second warning.
 pub(crate) fn failure(f: &Failed) -> (&'static str, String) {
     let estimated = || {
         f.beta
@@ -626,8 +634,28 @@ pub(crate) fn failure(f: &Failed) -> (&'static str, String) {
             );
         }
     }
+    if let Some(n) = f.notes.iter().find(|n| n.kind == "dispersion_at_limit") {
+        // A Gamma coefficient of variation is about √φ; on a weighted fit a
+        // typical row's is √ of the internal edge (`factor`), not of `lower`.
+        let message = if n.lower.is_nan() {
+            format!(
+                "The Gamma dispersion rose above {}, the largest value the fit searches, so no \
+                 estimates were computed. The response is far more spread out around the \
+                 fitted means than a Gamma model can describe.",
+                fmt_g(n.upper, 4)
+            )
+        } else {
+            format!(
+                "The Gamma dispersion fell below {}, the smallest value the fit searches, so no \
+                 estimates were computed. The response varies less than about {}% around the \
+                 fitted means.",
+                fmt_g(n.lower, 4),
+                fmt_g(100.0 * n.factor.sqrt(), 1)
+            )
+        };
+        return ("dispersion_at_limit", message);
+    }
     let has = |kind: &str| f.notes.iter().any(|n| n.kind == kind);
-    let eta_range = eta_out_of_range(f.family, f.link, f.y);
     if !f.mixed || has("separated") {
         // A GLM whose first solve failed took no step: no coefficient at all.
         if f.family == "gaussian" || (!f.mixed && estimated().all(f64::is_nan)) {
@@ -641,10 +669,6 @@ pub(crate) fn failure(f: &Failed) -> (&'static str, String) {
         let message = match f.family {
             "binomial" => DIVERGED_BINOMIAL.to_owned(),
             "poisson" | "negativebinomial" => DIVERGED_COUNTS.to_owned(),
-            _ if eta_range => format!(
-                "The fit did not converge. The coefficients are from the last step; standard \
-                 errors are not reported. {ETA_RANGE}"
-            ),
             _ => DIVERGED_CONTINUOUS.to_owned(),
         };
         return ("glm_diverged", message);
@@ -665,10 +689,9 @@ pub(crate) fn failure(f: &Failed) -> (&'static str, String) {
             ),
         );
     }
-    let cause = if eta_range { ETA_RANGE } else { advice };
     (
         "fit_failed",
-        format!("The fitting algorithm failed and returned no estimates.{inner} {cause}"),
+        format!("The fitting algorithm failed and returned no estimates.{inner} {advice}"),
     )
 }
 
@@ -960,6 +983,18 @@ mod tests {
             ..note("pirls_exhausted")
         }];
         let separated = [note("separated")];
+        // A weighted fit whose weights were divided by 8: the limit prints on
+        // the reported scale, the percentage from the internal edge.
+        let phi_lower = [NoteInfo {
+            lower: 8e-6,
+            factor: 1e-6,
+            ..note("dispersion_at_limit")
+        }];
+        let phi_upper = [NoteInfo {
+            upper: 1e6,
+            factor: 1e6,
+            ..note("dispersion_at_limit")
+        }];
         let (fin, nan, none) = ([1.5, -2.0], [f64::NAN; 2], [false; 2]);
         let advice =
             "Try a simpler random-effects structure or check for nearly collinear predictors.";
@@ -990,7 +1025,6 @@ mod tests {
         };
         let base = Failed {
             family: "gaussian",
-            link: "identity",
             mixed: false,
             notes: &[],
             beta: &fin,
@@ -1239,12 +1273,122 @@ mod tests {
                 "too_few_rows",
                 too_few("1 coefficient", "1 row"),
             ),
+            // A dispersion on an edge of its search range names the edge.
+            (
+                Failed {
+                    family: "gamma",
+                    mixed: true,
+                    notes: &phi_lower,
+                    beta: &nan,
+                    ..base
+                },
+                "dispersion_at_limit",
+                "The Gamma dispersion fell below 8e-06, the smallest value the fit searches, so \
+                 no estimates were computed. The response varies less than about 0.1% around the \
+                 fitted means."
+                    .to_owned(),
+            ),
+            (
+                Failed {
+                    family: "gamma",
+                    mixed: true,
+                    notes: &phi_upper,
+                    beta: &nan,
+                    ..base
+                },
+                "dispersion_at_limit",
+                "The Gamma dispersion rose above 1e+06, the largest value the fit searches, so no \
+                 estimates were computed. The response is far more spread out around the fitted \
+                 means than a Gamma model can describe."
+                    .to_owned(),
+            ),
         ];
-        assert_eq!(cases.len(), 24);
+        assert_eq!(cases.len(), 26);
         for (f, kind, message) in &cases {
             assert_eq!(failure(f), (*kind, message.clone()), "{kind}");
             assert_eq!(tier_title(kind).0, "severe");
         }
+    }
+
+    #[test]
+    fn dispersion_at_limit_raises_only_through_failure() {
+        let n = NoteInfo {
+            lower: 1e-6,
+            factor: 1e-6,
+            ..note("dispersion_at_limit")
+        };
+        let failed = FitText {
+            converged: false,
+            ..NO_NAMES
+        };
+        assert_eq!(message(&n, &failed), None);
+    }
+
+    #[test]
+    fn note_infos_kinds_have_a_kinds_row_or_a_reason() {
+        // Kinds the ports never raise through this table, with the reason.
+        const SKIP: &[(&str, &str)] = &[
+            ("new_grouping_levels", "a predict note, worded by each port"),
+            ("rows_not_estimable", "a predict note, worded by each port"),
+            (
+                "predict_se_model_based",
+                "a predict note, worded by each port",
+            ),
+            (
+                "single_level_grouping",
+                "matrix door only: the formula door drops the grouping first and raises \
+                 single_level_grouping_dropped",
+            ),
+        ];
+        let src = include_str!("../../glmm-rs/src/orchestrate.rs");
+        let body: Vec<&str> = src
+            .lines()
+            .skip_while(|l| !l.contains("fn note_infos("))
+            .take_while(|&l| l != "}")
+            .collect();
+        let found: Vec<&str> = body
+            .iter()
+            .filter_map(|l| l.split_once("kind: \"").map(|(_, rest)| rest))
+            .filter_map(|rest| rest.split_once('"').map(|(k, _)| k))
+            .filter(|k| !k.is_empty())
+            .collect();
+        assert!(found.len() >= 25, "{found:?}");
+        for kind in &found {
+            assert!(
+                KINDS.iter().any(|k| k.0 == *kind) || SKIP.iter().any(|s| s.0 == *kind),
+                "{kind} has no KINDS row and no skip reason"
+            );
+        }
+        for (kind, _) in SKIP {
+            assert!(found.contains(kind), "stale skip entry {kind}");
+        }
+    }
+
+    #[test]
+    fn note_kinds_lists_every_kinds_row() {
+        let got = crate::registry::call(crate::Port::Python, "note_kinds", Record::new()).unwrap();
+        let want: Vec<String> = KINDS.iter().map(|k| k.0.to_owned()).collect();
+        assert_eq!(got, Value::StrVec(want));
+    }
+
+    #[test]
+    fn nb_shape_at_limit_warns_only_at_the_lower_limit() {
+        let upper = NoteInfo {
+            upper: 1e4,
+            ..note("nb_shape_at_limit")
+        };
+        assert_eq!(message(&upper, &NO_NAMES), None);
+        let lower = NoteInfo {
+            lower: 1e-3,
+            ..note("nb_shape_at_limit")
+        };
+        assert_eq!(
+            message(&lower, &NO_NAMES).unwrap(),
+            "The negative binomial shape parameter reached the lower limit of its search, 0.001. \
+             The data are more overdispersed than this limit allows, so the shape is at that \
+             limit, not at an optimum, and the coefficients and standard errors are computed at \
+             it."
+        );
     }
 
     #[test]

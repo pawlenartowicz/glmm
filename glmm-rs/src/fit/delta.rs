@@ -66,8 +66,7 @@ pub(crate) fn profile(
 /// toward δ = 0 (the search keeps the right part on NaN and on a tie, so a
 /// NaN would steer it silently). The fit at δ̂ runs with `opts`; `start` seeds
 /// it and every probe. A fit at δ̂ whose log-likelihood or β̂ is not finite,
-/// after a probe whose log-likelihood was, is a [`FitError::Weights`] (spec
-/// 2-dcr §3.1).
+/// after a probe whose log-likelihood was, is a [`FitError::Weights`].
 pub(crate) fn fit_delta(
     data: &Data<'_>,
     spec: &ModelSpec,
@@ -132,6 +131,7 @@ pub(crate) fn fit_delta(
     let end = if delta > 0.0 { upper } else { lower };
     let at_bound =
         profile(data, spec, &probe, start, end).0 >= fit.loglik - 1e-9 * fit.loglik.abs().max(1.0);
+    fit.weight_power = delta;
     fit.weight_power_estimated = true;
     if fit.df > 0 {
         fit.df += 1;

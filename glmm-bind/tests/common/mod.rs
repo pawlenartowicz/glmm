@@ -57,6 +57,7 @@ pub fn fit_args(formula: &str, numeric: Record, factors: Record, row_base: i64) 
         ("nagq", Value::I64(1)),
         ("satterthwaite", Value::Bool(true)),
         ("condvar", Value::Bool(true)),
+        ("anova_test", text("auto")),
         ("row_base", Value::I64(row_base)),
     ])
 }

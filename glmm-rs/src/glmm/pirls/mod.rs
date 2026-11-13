@@ -1294,6 +1294,53 @@ pub(crate) fn residual_border(
     }
 }
 
+/// `rhs[..p] = Σᵢ ρᵢ·rᵢ` alone, summed tile by tile exactly as
+/// [`residual_border`] sums it (the two agree to the bit), for a caller that
+/// keeps the border's `S_β` from an earlier call: the Gaussian response
+/// shift, whose Gram belongs to the design.
+pub(crate) fn residual_rhs(rho: &[f64], r: MatRef<f64>, rhs: &mut [f64]) {
+    let (n, p) = (r.nrows(), r.ncols());
+    let mut rc: [&[f64]; BORDER_PMAX] = [&[]; BORDER_PMAX];
+    rhs[..p].fill(0.0);
+    if border_cols(r, &mut rc) {
+        pulp::Arch::new().dispatch(RhsTileOp {
+            cols: &rc[..p],
+            rho: &rho[..n],
+            rhs: &mut rhs[..p],
+        });
+        return;
+    }
+    for (i, &ri) in rho[..n].iter().enumerate() {
+        for (a, s) in rhs[..p].iter_mut().enumerate() {
+            *s += ri * r[(i, a)];
+        }
+    }
+}
+
+/// [`residual_rhs`]'s SIMD body: [`BorderTileOp`]'s `rhs` sums alone, on
+/// the same [`BORDER_TILE`]-row tiles.
+struct RhsTileOp<'a> {
+    cols: &'a [&'a [f64]],
+    rho: &'a [f64],
+    rhs: &'a mut [f64],
+}
+
+impl pulp::WithSimd for RhsTileOp<'_> {
+    type Output = ();
+    #[inline(always)]
+    fn with_simd<S: pulp::Simd>(self, simd: S) {
+        let Self { cols, rho, rhs } = self;
+        let mut i0 = 0;
+        while i0 < rho.len() {
+            let m = (rho.len() - i0).min(BORDER_TILE);
+            for (s, c) in rhs.iter_mut().zip(cols) {
+                *s += simd_dot::<S, false>(simd, &rho[i0..i0 + m], &c[i0..i0 + m]);
+            }
+            i0 += m;
+        }
+    }
+}
+
 /// Row `i`'s score `ρᵢ` on the Profile border's right-hand side: logit's
 /// `wᵢ(yᵢ − μᵢ)`, `row_score` with the prior weight otherwise — the residual
 /// the u-step's right-hand side scatters.

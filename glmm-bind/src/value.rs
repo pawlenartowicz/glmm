@@ -1,5 +1,5 @@
 //! The value tree every port marshals into and out of `glmm-bind`. Values are
-//! owned: a port copies its columns in (D9).
+//! owned: a port copies its columns in.
 
 /// An ordered list of named values: a call's arguments, a result, or a
 /// record passed back (a stored fit's fields).
@@ -99,7 +99,7 @@ pub enum Value {
     /// An integer vector that is not an index (counts, offsets, caller rows).
     IntVec(Vec<i64>),
     /// Positions, 0-based here: the R port writes them +1 and reads them -1,
-    /// the Python port passes them through (D7).
+    /// the Python port passes them through.
     Index(Vec<usize>),
     /// A string vector.
     StrVec(Vec<String>),
@@ -122,6 +122,9 @@ pub enum Value {
         /// The elements.
         data: Vec<f64>,
     },
+    /// R's `NA` given as one value (a length-1 logical `NA`), which a
+    /// refusal names as `NA`.
+    Na,
     /// A named record.
     Record(Record),
     /// An ordered list.
@@ -145,6 +148,7 @@ impl Value {
             Self::BoolVec(_) => "logical vector",
             Self::Factor { .. } => "factor",
             Self::Mat { .. } => "matrix",
+            Self::Na => "missing value",
             Self::Record(_) => "record",
             Self::List(_) => "list",
         }

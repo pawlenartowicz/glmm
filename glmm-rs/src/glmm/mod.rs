@@ -48,6 +48,7 @@
 //! BOBYQA is Powell, M.J.D. (2009), *The BOBYQA algorithm for bound constrained
 //! optimization without derivatives*, Cambridge report DAMTP 2009/NA06.
 
+use crate::consts::{GAMMA_PHI_HI, GAMMA_PHI_LO};
 use crate::standardize::ColumnScaling;
 use crate::WaldSe;
 use bobyqa::Status;
@@ -254,23 +255,23 @@ pub(crate) const RHO_TOL_FULL_FACTOR: f64 = 10.0;
 /// the limit: PIRLS converges past it to the rounding floor, and a band of
 /// 1e-13 moved the same fits as far.
 pub(crate) const DEVIANCE_FLOOR_MAX: f64 = 1e-2;
-/// Box of the Gamma `ln φ` outer-search coordinate (`φ` the dispersion, shape
-/// `1/φ`). Wide on purpose: φ is a free maximum-likelihood parameter, and the
-/// box only keeps a probe away from overflow in `lnΓ(1/φ)` and from weights
-/// `prior_wᵢ/φ` past `f64` range.
-pub(crate) const GAMMA_PHI_LO: f64 = 1e-6;
-pub(crate) const GAMMA_PHI_HI: f64 = 1e6;
 /// Distance in `ln φ` below which a fitted φ̂ counts as on the box bound and the
 /// fit is refused (`fit_glmm`); BOBYQA projects onto the bound, so an incumbent
 /// that reached it sits there to round-off.
 const GAMMA_PHI_BOUND_TOL: f64 = 1e-6;
 
-/// Whether a fitted `ln φ̂` sits on a bound of the Gamma coordinate's box
-/// (within [`GAMMA_PHI_BOUND_TOL`]): an incumbent there describes the box, not
-/// a maximum of the likelihood, and `fit_glmm` refuses the fit.
-pub(crate) fn gamma_phi_on_box_bound(ln_phi: f64) -> bool {
-    ln_phi <= GAMMA_PHI_LO.ln() + GAMMA_PHI_BOUND_TOL
-        || ln_phi >= GAMMA_PHI_HI.ln() - GAMMA_PHI_BOUND_TOL
+/// The edge of the Gamma coordinate's box a fitted `ln φ̂` sits on (within
+/// [`GAMMA_PHI_BOUND_TOL`]), as φ: [`GAMMA_PHI_LO`] or [`GAMMA_PHI_HI`]; `None`
+/// inside the box. An incumbent on an edge describes the box, not a maximum of
+/// the likelihood, and `fit_glmm` refuses the fit.
+pub(crate) fn gamma_phi_box_edge(ln_phi: f64) -> Option<f64> {
+    if ln_phi <= GAMMA_PHI_LO.ln() + GAMMA_PHI_BOUND_TOL {
+        Some(GAMMA_PHI_LO)
+    } else if ln_phi >= GAMMA_PHI_HI.ln() - GAMMA_PHI_BOUND_TOL {
+        Some(GAMMA_PHI_HI)
+    } else {
+        None
+    }
 }
 /// Base FD step for `joint_hessian_cov`'s joint-deviance Hessian. It is applied
 /// ASYMMETRICALLY across the joint (θ, β) vector: `h_θ = FD_STEP_BASE` absolute on
@@ -365,6 +366,11 @@ pub struct GlmmFit {
     /// separation, so the search never ran — see [`crate::Note::Separated`].
     /// β̂ is that GLM's last step; every other output is NaN.
     pub separated: bool,
+    /// Set iff the fit was refused because a free Gamma `ln φ̂` ended on an
+    /// edge of the `[GAMMA_PHI_LO, GAMMA_PHI_HI]` box: that edge, on the
+    /// internal weights `ŵ`. The fit is then `nan_fit`'s. `None` otherwise;
+    /// see [`crate::Note::DispersionAtLimit`].
+    pub phi_at_limit: Option<f64>,
     /// Minimized marginal Laplace deviance at the pinned γ̂ (`d(y,ũ)+‖ũ‖²+log|A|`,
     /// or the AGQ deviance when `nagq>1`), reported as `Fit::deviance`.
     /// `f64::INFINITY` on non-convergence. On an NB fit it carries
@@ -407,6 +413,7 @@ pub(crate) use assembled::joint_hessian_columns;
 pub(crate) use derivative::{
     laplace_gradient, laplace_hessian, supports_shape as supports_exact_shape, MAX_DUAL_N,
 };
+pub(crate) use pirls::{residual_border, residual_rhs};
 pub(crate) use se::condvar_blocks;
 pub use se::joint_hessian_cov;
 // The FD stencils and the packed-row step constant: `se.rs` is their only
@@ -1133,6 +1140,10 @@ pub fn fit_glmm(
         };
         ln_phi_plug = disp.ln().clamp(ws.lower[m], ws.upper[m]);
         let disp = held_phi.or(ws.gamma_phi_start).unwrap_or(disp);
+        // The clamp keeps the start inside the box. It bounds the plug-in and a
+        // carried φ. A held φ is used as given (`disp_at` and the incumbent
+        // write-back below), so for it the clamp only keeps the start of the
+        // inert coordinate inside the box.
         ws.params[m] = disp.ln().clamp(ws.lower[m], ws.upper[m]);
     } else if n_disp == 1 {
         ws.params[m] = ws.nb_theta.ln().clamp(ws.lower[m], ws.upper[m]);
@@ -3562,15 +3573,20 @@ pub fn fit_glmm(
     // report `Converged` off an all-infeasible simplex (PRIMA maps `+inf` to the
     // FUNCMAX ceiling). Do NOT remove it.
     let ok = ok && final_deviance.is_finite();
-    // Gamma: a φ̂ on either bound of the `ln φ` box is not a maximum-likelihood
-    // estimate. The box only keeps probes away from overflow; a search that
-    // runs into it is following a likelihood that keeps rising as φ → 0 (data
-    // the mean model reproduces exactly) or φ → ∞, and the incumbent there
-    // describes the box, not the data.
-    let ok = ok && !(is_gamma && held_phi.is_none() && gamma_phi_on_box_bound(ws.params[nb_col]));
+    // Gamma: a φ̂ on either edge of the `ln φ` box is not a maximum-likelihood
+    // estimate inside the box: the likelihood keeps rising toward that edge, as
+    // on data the mean model reproduces exactly, or its maximum lies past it.
+    // The fit is refused, and `phi_at_limit` names the edge.
+    let phi_at_limit = (ok && is_gamma && held_phi.is_none())
+        .then(|| gamma_phi_box_edge(ws.params[nb_col]))
+        .flatten();
+    let ok = ok && phi_at_limit.is_none();
 
     if !ok {
-        return nan_fit(ws, target_indices, n_eval);
+        return GlmmFit {
+            phi_at_limit,
+            ..nan_fit(ws, target_indices, n_eval)
+        };
     }
     // Read before the SE pass: its evaluations overwrite the final re-eval's
     // weights and `M` rows that `extra_ztwz_trace` reads.
@@ -3592,6 +3608,9 @@ pub fn fit_glmm(
     // β̂ on the caller's columns (β = B·β̂ on the fitted design); every SE arm
     // below reports Var, vcov, t² and the joint Wald in the same units.
     map.beta_to_caller(&mut ws.betas);
+    if let Some(i) = ws.intercept.filter(|_| ws.intercept_shift != 0.0) {
+        ws.betas[i] += ws.intercept_shift;
+    }
 
     // Var(β̂): `Rx` inverts the β-information (Schur) directly — fast, but the
     // Schur complement of the information at the mode assumes β–θ orthogonality (exact for
@@ -3790,6 +3809,7 @@ pub fn fit_glmm(
         se_unavailable,
         precision_limited,
         separated: false,
+        phi_at_limit: None,
         deviance: final_deviance + nb_dev_term,
     }
 }
@@ -3982,6 +4002,7 @@ fn nan_fit(ws: &mut GlmmWorkspace, targets: &[u32], n_eval: usize) -> GlmmFit {
         se_unavailable: false,
         precision_limited: false,
         separated: false,
+        phi_at_limit: None,
         deviance: f64::INFINITY,
     }
 }

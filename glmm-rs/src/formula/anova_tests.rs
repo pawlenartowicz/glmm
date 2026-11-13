@@ -714,7 +714,7 @@ fn flat_l(h: &TermHypothesis) -> (Vec<f64>, usize) {
 /// hypothesis (t², its df and p) and a row of more df the joint test
 /// `contrast_f` gives, model-based with its note: Type III on a random
 /// intercept (CR2), and Type II on WLS (HC2), whose hypotheses are built from
-/// the model covariance (§10.3), equal to the same fit's with
+/// the model covariance, equal to the same fit's with
 /// `se_type = Model` to 1e-12, where the robust covariance gives others. A
 /// one-df row names the robust df's source, a joint row the model's.
 #[test]
@@ -2922,7 +2922,7 @@ const DELTA_PAIRS: [(&str, &str); 2] = [
     ("y ~ x + (1 | subj)", "y ~ x + g + (1 | subj)"),
 ];
 
-/// §3.1c, D6, D24 (G9): two ML δ fits whose fixed parts differ get the
+/// Two ML δ fits whose fixed parts differ get the
 /// likelihood-ratio test on the difference in fixed columns (each side's
 /// δ̂ counted in its npar, so it cancels), not the RSS F of two OLS fits.
 #[test]
@@ -2952,7 +2952,7 @@ fn two_ml_delta_fits_get_the_lrt_on_the_fixed_columns() {
     }
 }
 
-/// §6 (G9): two REML δ fits with different fixed parts refuse as two REML
+/// Two REML δ fits with different fixed parts refuse as two REML
 /// fits do, also without random effects; one δ fit against a fit with the
 /// weights as given, and two different fixed powers, refuse by the weight
 /// power.
@@ -2988,7 +2988,7 @@ fn delta_and_fixed_power_pairs_that_cannot_be_compared_are_refused() {
     }
 }
 
-/// §6, D24 (G9): two δ fits whose fixed parts are the same are refused, by
+/// Two δ fits whose fixed parts are the same are refused, by
 /// REML and by ML, with or without random effects on the smaller side; the
 /// message names `weight_power = 1` only for weights the user trusts.
 #[test]
@@ -3018,7 +3018,7 @@ fn delta_fits_differing_in_their_random_part_alone_are_refused() {
     }
 }
 
-/// §6 (G9): the likelihood-ratio rows of a δ fit are refused, as on every
+/// The likelihood-ratio rows of a δ fit are refused, as on every
 /// Gaussian fit, whose rows are F tests: the refits would each estimate
 /// their own power.
 #[test]

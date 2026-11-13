@@ -7,6 +7,10 @@
 
 use super::common::check_model_shape;
 use super::*;
+use crate::limits::{
+    GAMMA_PHI_HI, GAMMA_PHI_LO, MAX_DATA_ABS, MAX_LOG_OFFSET_ABS, MAX_TRIALS, NB_THETA_HI,
+    NB_THETA_LO,
+};
 use crate::standardize::ColumnScaling;
 use crate::test_support::{fit_cold, fit_warm_wo, ids_from_sizing, Sizing};
 use crate::{
@@ -304,8 +308,8 @@ fn zero_rows_is_a_shape_error() {
     }
 }
 
-/// A zero weight is not finite-and-positive, so it is refused the same way
-/// as a wrong-length weights vector, naming its row.
+/// A zero weight is below the weights' interval, so it is refused the same
+/// way as a wrong-length weights vector, naming its row.
 #[test]
 fn nonpositive_weight_is_rejected() {
     let (x, y, model) = shape_check_fixture();
@@ -322,7 +326,12 @@ fn nonpositive_weight_is_rejected() {
     assert_eq!(e.row(), Some(1));
     assert_eq!(
         e.message().text_with_row(5),
-        "Data weights must be finite and > 0 (row 5)"
+        format!(
+            "Data weights must be within [{:e}, {MAX_DATA_ABS:e}] (row 5, value {:e}; \
+             glmm::limits::MAX_DATA_ABS)",
+            1.0 / MAX_DATA_ABS,
+            0.0
+        )
     );
 }
 
@@ -346,7 +355,13 @@ fn nonfinite_offset_on_a_negative_binomial_glm_is_rejected() {
         "{e:?}"
     );
     assert_eq!(e.row(), Some(1));
-    assert_eq!(e.to_string(), "Data offset must be finite (row 1)");
+    assert_eq!(
+        e.to_string(),
+        format!(
+            "Data offset must be finite with |offset| <= {MAX_LOG_OFFSET_ABS:e} on this link \
+             (row 1, value NaN; glmm::limits::MAX_LOG_OFFSET_ABS)"
+        )
+    );
 }
 
 /// A NaN or an infinite value in `x` is refused at the entry, naming its row
@@ -357,26 +372,23 @@ fn nonfinite_x_is_rejected() {
         let (mut x, y, model) = shape_check_fixture();
         x[2] = bad;
         let e = refusal(&Data::new(&x, &y, 4, 1), &model, &FitOptions::default());
+        let text = |row: usize| {
+            format!(
+                "x must be finite with |x| <= {MAX_DATA_ABS:e} (row {row}, column 0, \
+                 value {bad:e}; glmm::limits::MAX_DATA_ABS)"
+            )
+        };
         assert!(
-            matches!(&e, FitError::Shape(m) if m == "x must be finite (row 2, column 0)"),
+            matches!(&e, FitError::Shape(m) if *m == text(2)),
             "x = {bad}: {e:?}"
         );
         // The row is a field, and a port can name it in its own numbering.
         assert_eq!(e.row(), Some(2));
-        assert_eq!(
-            e.message().text_with_row(3),
-            "x must be finite (row 3, column 0)"
-        );
+        assert_eq!(e.message().text_with_row(3), text(3));
         assert_eq!(e.message().text_with_row(2), e.to_string());
         // Equality reads the text, so a built error equals the refusal.
-        assert_eq!(
-            e,
-            FitError::Shape("x must be finite (row 2, column 0)".into())
-        );
-        assert_eq!(
-            format!("{e:?}"),
-            r#"Shape("x must be finite (row 2, column 0)")"#
-        );
+        assert_eq!(e, FitError::Shape(text(2).into()));
+        assert_eq!(format!("{e:?}"), format!("Shape({:?})", text(2)));
     }
 }
 
@@ -391,11 +403,14 @@ fn error_message_reads_as_its_text() {
     else {
         panic!("expected FitError::Shape");
     };
-    let text = "x must be finite (row 2, column 0)";
-    let owned = text.to_string();
+    let owned = format!(
+        "x must be finite with |x| <= {MAX_DATA_ABS:e} (row 2, column 0, value NaN; \
+         glmm::limits::MAX_DATA_ABS)"
+    );
+    let text = owned.as_str();
     assert!(m == text && m == *text && m == owned);
     assert!(text == m && *text == m && owned == m);
-    assert!(m != "x must be finite (row 3, column 0)");
+    assert!(m != owned.replace("(row 2", "(row 3").as_str());
     assert_eq!(m, ErrorMessage::from(owned.clone()));
     let back: String = m.into();
     assert_eq!(back, owned);
@@ -408,10 +423,446 @@ fn nonfinite_y_nan_is_rejected() {
     y[1] = f64::NAN;
     let e = refusal(&Data::new(&x, &y, 4, 1), &model, &FitOptions::default());
     assert!(
-        matches!(&e, FitError::ResponseOutOfSupport(m) if m == "y must be finite (row 1)"),
+        matches!(&e, FitError::ResponseOutOfSupport(m) if *m == format!(
+            "y must be finite with |y| <= {MAX_DATA_ABS:e} (row 1, value NaN; \
+             glmm::limits::MAX_DATA_ABS)"
+        )),
         "{e:?}"
     );
     assert_eq!(e.row(), Some(1));
+}
+
+/// A value past `MAX_DATA_ABS` in x (either sign), in `re_columns`, in y and
+/// in an identity-link offset is refused with that input's variant, its row,
+/// its value and the limit's name.
+#[test]
+fn values_past_max_data_abs_are_refused() {
+    let big = 2.0 * MAX_DATA_ABS;
+    let opts = FitOptions::default();
+    let (x, y, model) = shape_check_fixture();
+    let lim = "glmm::limits::MAX_DATA_ABS";
+    let check_row = |e: &FitError| {
+        assert_eq!(e.row(), Some(2), "{e:?}");
+        assert!(e.message().text_with_row(3).contains("(row 3,"), "{e:?}");
+    };
+    let mut ran = 0;
+    for v in [big, -big] {
+        let mut x = x.clone();
+        x[2] = v;
+        let e = refusal(&Data::new(&x, &y, 4, 1), &model, &opts);
+        let want = format!(
+            "x must be finite with |x| <= {MAX_DATA_ABS:e} (row 2, column 0, value {v:e}; {lim})"
+        );
+        assert!(matches!(&e, FitError::Shape(m) if *m == want), "{e:?}");
+        check_row(&e);
+        ran += 1;
+    }
+    let z = [-1.0, 1.0, big, -1.0];
+    let ids = GroupIds::new(vec![0, 0, 1, 1]);
+    let slope_on_z = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            terms: Vec::new(),
+            slopes: vec![1],
+            extra_groupings: vec![],
+        }),
+    };
+    let e = refusal(
+        &Data::new(&x, &y, 4, 1).ids(&ids).re_columns(&z, 1),
+        &slope_on_z,
+        &opts,
+    );
+    assert!(
+        matches!(&e, FitError::Shape(m) if m.contains(&format!("value {big:e}; {lim}"))
+            && m.contains("re_columns")),
+        "{e:?}"
+    );
+    check_row(&e);
+    ran += 1;
+    let mut y_big = y.clone();
+    y_big[2] = big;
+    let e = refusal(&Data::new(&x, &y_big, 4, 1), &model, &opts);
+    let want =
+        format!("y must be finite with |y| <= {MAX_DATA_ABS:e} (row 2, value {big:e}; {lim})");
+    assert!(
+        matches!(&e, FitError::ResponseOutOfSupport(m) if *m == want),
+        "{e:?}"
+    );
+    check_row(&e);
+    ran += 1;
+    let o = [0.0, 0.0, big, 0.0];
+    let e = refusal(&Data::new(&x, &y, 4, 1).offset(&o), &model, &opts);
+    assert!(
+        matches!(&e, FitError::Offset(m) if m.contains(&format!("value {big:e}; {lim}"))),
+        "{e:?}"
+    );
+    check_row(&e);
+    ran += 1;
+    assert_eq!(ran, 5);
+}
+
+/// A weight below `1/MAX_DATA_ABS` or above `MAX_DATA_ABS` is refused, naming
+/// its row and value.
+#[test]
+fn weights_outside_their_interval_are_refused() {
+    let (x, y, model) = shape_check_fixture();
+    let mut ran = 0;
+    for v in [0.5 / MAX_DATA_ABS, 2.0 * MAX_DATA_ABS] {
+        let w = [1.0, v, 1.0, 1.0];
+        let e = refusal(
+            &Data::new(&x, &y, 4, 1).weights(&w),
+            &model,
+            &FitOptions::default(),
+        );
+        let want = format!(
+            "Data weights must be within [{:e}, {MAX_DATA_ABS:e}] (row 1, value {v:e}; \
+             glmm::limits::MAX_DATA_ABS)",
+            1.0 / MAX_DATA_ABS
+        );
+        assert!(matches!(&e, FitError::Weights(m) if *m == want), "{e:?}");
+        assert_eq!(e.row(), Some(1));
+        ran += 1;
+    }
+    assert_eq!(ran, 2);
+}
+
+/// On a log link the offset is bounded by `MAX_LOG_OFFSET_ABS`, where `e^η`
+/// would overflow; the same offset on the identity link passes.
+#[test]
+fn an_offset_on_a_log_link_is_bounded_by_700() {
+    let (x, y, gaussian) = shape_check_fixture();
+    let v = MAX_LOG_OFFSET_ABS + 1.0;
+    let o = [0.0, v, 0.0, 0.0];
+    let data = Data::new(&x, &y, 4, 1).offset(&o);
+    let poisson = ModelSpec::fixed(Family::Poisson {
+        link: PoissonLink::Log,
+    });
+    let opts = FitOptions::default();
+    let e = refusal(&data, &poisson, &opts);
+    assert!(
+        matches!(&e, FitError::Offset(m) if m.contains(&format!("value {v:e}; glmm::limits::MAX_LOG_OFFSET_ABS"))),
+        "{e:?}"
+    );
+    assert_eq!(e.row(), Some(1));
+    assert!(super::common::validate(&data, &gaussian, None, &opts).is_ok());
+}
+
+/// A binomial weight (trial count) above 2⁵³ is refused: above it consecutive
+/// integers are not exact in f64.
+#[test]
+fn binomial_trials_past_max_trials_are_refused() {
+    let x = vec![1.0; 4];
+    let y = vec![0.5; 4];
+    let w = [2.0, 2.0, 2.0, 2.0 * MAX_TRIALS];
+    let model = ModelSpec::fixed(Family::Binomial {
+        link: BinomialLink::Logit,
+    });
+    let e = refusal(
+        &Data::new(&x, &y, 4, 1).weights(&w),
+        &model,
+        &FitOptions::default(),
+    );
+    assert!(
+        matches!(&e, FitError::Weights(m) if m.contains(&format!(
+            "value {:e}; glmm::limits::MAX_TRIALS", 2.0 * MAX_TRIALS
+        ))),
+        "{e:?}"
+    );
+    assert_eq!(e.row(), Some(3));
+}
+
+/// An inverse-Gaussian held dispersion outside `[1/MAX_DATA_ABS,
+/// MAX_DATA_ABS]` is refused, named as the ports name the option.
+#[test]
+fn an_inverse_gaussian_held_dispersion_outside_its_interval_is_refused() {
+    let (x, y, _) = shape_check_fixture();
+    let model = ModelSpec::fixed(Family::InverseGaussian {
+        link: InverseGaussianLink::Log,
+    });
+    let mut ran = 0;
+    for v in [0.5 / MAX_DATA_ABS, 2.0 * MAX_DATA_ABS] {
+        let opts = FitOptions {
+            dispersion: Dispersion::Fixed(v),
+            ..FitOptions::default()
+        };
+        let e = refusal(&Data::new(&x, &y, 4, 1), &model, &opts);
+        let want = format!(
+            "dispersion on an inverse-Gaussian model must be within [{:e}, {MAX_DATA_ABS:e}] \
+             (value {v:e}; glmm::limits::MAX_DATA_ABS)",
+            1.0 / MAX_DATA_ABS
+        );
+        assert!(
+            matches!(&e, FitError::OptionValue(m) if *m == want),
+            "{e:?}"
+        );
+        ran += 1;
+    }
+    assert_eq!(ran, 2);
+}
+
+/// A held Gamma dispersion whose internal value `v / weight_scale` is outside
+/// `[GAMMA_PHI_LO, GAMMA_PHI_HI]` is refused, with the range printed in the
+/// caller's units. Weights all 8 put `weight_scale` at 8. The mixed model
+/// checks the GLMM path, which never reads the GLM's held value.
+#[test]
+fn a_held_gamma_dispersion_outside_its_box_is_refused() {
+    let (x, y, _) = shape_check_fixture();
+    let gamma = Family::Gamma {
+        link: GammaLink::Log,
+    };
+    let fixed = ModelSpec::fixed(gamma);
+    let mixed = ModelSpec::mixed(gamma, ReStructure::intercept());
+    let ids = GroupIds::new(vec![0, 0, 1, 1]);
+    let w = [8.0; 4];
+    let plain = Data::new(&x, &y, 4, 1);
+    let cases = [
+        (plain, &fixed, 1e15, 1.0),
+        (plain, &fixed, GAMMA_PHI_LO / 2.0, 1.0),
+        (plain.weights(&w), &fixed, GAMMA_PHI_HI * 16.0, 8.0),
+        (plain.ids(&ids), &mixed, 1e15, 1.0),
+    ];
+    let mut ran = 0;
+    for (data, model, v, s) in cases {
+        let opts = FitOptions {
+            dispersion: Dispersion::Fixed(v),
+            ..FitOptions::default()
+        };
+        let e = refusal(&data, model, &opts);
+        let want = format!(
+            "dispersion on a Gamma model must be within [{:e}, {:e}] (value {v:e}; \
+             glmm::limits::GAMMA_PHI_LO, glmm::limits::GAMMA_PHI_HI)",
+            GAMMA_PHI_LO * s,
+            GAMMA_PHI_HI * s
+        );
+        assert!(
+            matches!(&e, FitError::OptionValue(m) if *m == want),
+            "{v}: {e:?}"
+        );
+        ran += 1;
+    }
+    assert_eq!(ran, 4);
+}
+
+/// A negative-binomial shape seed outside the shape search box is refused,
+/// named as the ports name the warm start.
+#[test]
+fn a_negative_binomial_shape_seed_outside_its_box_is_refused() {
+    let (x, y, _) = shape_check_fixture();
+    let model = ModelSpec::fixed(Family::NegativeBinomial {
+        link: NegBinomialLink::Log,
+    });
+    let mut ran = 0;
+    for v in [NB_THETA_LO / 2.0, NB_THETA_HI * 2.0] {
+        let start = StartValues {
+            dispersion: Some(v),
+            ..StartValues::default()
+        };
+        let e = match crate::fit_with_start(
+            &Data::new(&x, &y, 4, 1),
+            &model,
+            &start,
+            &FitOptions::default(),
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("seed {v} must be refused"),
+        };
+        let want = format!(
+            "warm-start dispersion (the negative-binomial shape seed) must be within \
+             [{NB_THETA_LO:e}, {NB_THETA_HI:e}] (value {v:e}; glmm::limits::NB_THETA_LO, \
+             glmm::limits::NB_THETA_HI)"
+        );
+        assert!(matches!(&e, FitError::Start(m) if *m == want), "{e:?}");
+        ran += 1;
+    }
+    assert_eq!(ran, 2);
+}
+
+/// Every edge of every input range is itself inside it: the entry check (not
+/// a fit, so no edge value has to fit well) accepts each.
+#[test]
+fn every_input_range_edge_is_accepted() {
+    let (x, y, gaussian) = shape_check_fixture();
+    let opts = FitOptions::default();
+    let mut ran = 0;
+    let mut accept =
+        |data: &Data<'_>, model: &ModelSpec, start: Option<&StartValues>, opts: &FitOptions| {
+            let got = super::common::validate(data, model, start, opts);
+            assert!(got.is_ok(), "case {ran}: {:?}", got.err());
+            ran += 1;
+        };
+    for v in [MAX_DATA_ABS, -MAX_DATA_ABS] {
+        let mut x = x.clone();
+        x[2] = v;
+        accept(&Data::new(&x, &y, 4, 1), &gaussian, None, &opts);
+    }
+    let z = [-1.0, 1.0, MAX_DATA_ABS, -1.0];
+    let ids = GroupIds::new(vec![0, 0, 1, 1]);
+    let slope_on_z = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            terms: Vec::new(),
+            slopes: vec![1],
+            extra_groupings: vec![],
+        }),
+    };
+    accept(
+        &Data::new(&x, &y, 4, 1).ids(&ids).re_columns(&z, 1),
+        &slope_on_z,
+        None,
+        &opts,
+    );
+    let y_edge = [1.0, 2.0, MAX_DATA_ABS, 4.0];
+    accept(&Data::new(&x, &y_edge, 4, 1), &gaussian, None, &opts);
+    for v in [1.0 / MAX_DATA_ABS, MAX_DATA_ABS] {
+        let w = [1.0, v, 1.0, 1.0];
+        accept(&Data::new(&x, &y, 4, 1).weights(&w), &gaussian, None, &opts);
+    }
+    let poisson = ModelSpec::fixed(Family::Poisson {
+        link: PoissonLink::Log,
+    });
+    for (model, limit) in [(&poisson, MAX_LOG_OFFSET_ABS), (&gaussian, MAX_DATA_ABS)] {
+        for v in [limit, -limit] {
+            let o = [0.0, v, 0.0, 0.0];
+            accept(&Data::new(&x, &y, 4, 1).offset(&o), model, None, &opts);
+        }
+    }
+    let binomial = ModelSpec::fixed(Family::Binomial {
+        link: BinomialLink::Logit,
+    });
+    let half = [0.5; 4];
+    let trials = [2.0, 2.0, 2.0, MAX_TRIALS];
+    accept(
+        &Data::new(&x, &half, 4, 1).weights(&trials),
+        &binomial,
+        None,
+        &opts,
+    );
+    let ig = ModelSpec::fixed(Family::InverseGaussian {
+        link: InverseGaussianLink::Log,
+    });
+    for v in [1.0 / MAX_DATA_ABS, MAX_DATA_ABS] {
+        let held = FitOptions {
+            dispersion: Dispersion::Fixed(v),
+            ..FitOptions::default()
+        };
+        accept(&Data::new(&x, &y, 4, 1), &ig, None, &held);
+    }
+    let nb = ModelSpec::fixed(Family::NegativeBinomial {
+        link: NegBinomialLink::Log,
+    });
+    for v in [NB_THETA_LO, NB_THETA_HI] {
+        let start = StartValues {
+            dispersion: Some(v),
+            ..StartValues::default()
+        };
+        accept(&Data::new(&x, &y, 4, 1), &nb, Some(&start), &opts);
+    }
+    let gamma = ModelSpec::fixed(Family::Gamma {
+        link: GammaLink::Log,
+    });
+    let w8 = [8.0; 4];
+    for (w, s) in [(None, 1.0), (Some(&w8[..]), 8.0)] {
+        for v in [GAMMA_PHI_LO * s, GAMMA_PHI_HI * s] {
+            let held = FitOptions {
+                dispersion: Dispersion::Fixed(v),
+                ..FitOptions::default()
+            };
+            let data = Data::new(&x, &y, 4, 1);
+            let data = match w {
+                Some(w) => data.weights(w),
+                None => data,
+            };
+            accept(&data, &gamma, None, &held);
+        }
+    }
+    assert_eq!(ran, 19);
+}
+
+/// Eight rows: x an intercept and `tᵢ = i/8 − 0.4`, `yᵢ = 1 + i/8` (all > 0),
+/// two rows per group.
+fn units_fixture() -> (Vec<f64>, Vec<f64>, Vec<f64>, GroupIds) {
+    let n = 8;
+    let t: Vec<f64> = (0..n).map(|i| i as f64 / 8.0 - 0.4).collect();
+    let x = t.iter().flat_map(|&ti| [1.0, ti]).collect();
+    let y = (0..n).map(|i| 1.0 + i as f64 / 8.0).collect();
+    let ids = GroupIds::new((0..n as u32).map(|i| i / 2).collect());
+    (x, t, y, ids)
+}
+
+/// A response rescaled past `MAX_DATA_ABS` (by 1e200 or 2⁸⁰⁰) is refused at
+/// its first row on every family that takes a continuous response, fixed and
+/// with a random intercept, rather than fitted in units no sum of squares can
+/// hold.
+#[test]
+fn y_scaled_past_the_data_range_is_refused_on_every_family() {
+    let (x, _, y, ids) = units_fixture();
+    let gamma = |link| Family::Gamma { link };
+    let ig = |link| Family::InverseGaussian { link };
+    let models = [
+        (Family::Gaussian, false),
+        (Family::Gaussian, true),
+        (gamma(GammaLink::Log), false),
+        (gamma(GammaLink::Log), true),
+        (gamma(GammaLink::Inverse), false),
+        (gamma(GammaLink::Inverse), true),
+        (ig(InverseGaussianLink::Log), false),
+        (ig(InverseGaussianLink::InverseSquared), false),
+    ];
+    let mut refused = 0;
+    for (family, mixed) in models {
+        let model = if mixed {
+            ModelSpec::mixed(family, ReStructure::intercept())
+        } else {
+            ModelSpec::fixed(family)
+        };
+        for c in [1e200, 2f64.powi(800)] {
+            let yc: Vec<f64> = y.iter().map(|v| v * c).collect();
+            let data = Data::new(&x, &yc, 8, 2);
+            let data = if mixed { data.ids(&ids) } else { data };
+            let e = refusal(&data, &model, &FitOptions::default());
+            assert!(
+                matches!(&e, FitError::ResponseOutOfSupport(m)
+                    if m.contains("glmm::limits::MAX_DATA_ABS")),
+                "{family:?} mixed {mixed} c {c:e}: {e:?}"
+            );
+            assert_eq!(e.row(), Some(0));
+            refused += 1;
+        }
+    }
+    assert_eq!(refused, 16);
+}
+
+/// A predictor rescaled or shifted past `MAX_DATA_ABS` is refused at its
+/// first cell, on a Gaussian mixed model and on a binomial GLM.
+#[test]
+fn x_moved_past_the_data_range_is_refused() {
+    let (_, t, y, ids) = units_fixture();
+    let y01: Vec<f64> = (0..8).map(|i| (i % 2) as f64).collect();
+    let lmm = ModelSpec::mixed(Family::Gaussian, ReStructure::intercept());
+    let glm = ModelSpec::fixed(Family::Binomial {
+        link: BinomialLink::Logit,
+    });
+    let mut refused = 0;
+    for moved in [
+        t.iter().map(|ti| ti * 1e200 + 1.0).collect::<Vec<_>>(),
+        t.iter().map(|ti| ti + 1e200).collect(),
+    ] {
+        let x: Vec<f64> = moved.iter().flat_map(|&v| [1.0, v]).collect();
+        for (data, model) in [
+            (Data::new(&x, &y, 8, 2).ids(&ids), &lmm),
+            (Data::new(&x, &y01, 8, 2), &glm),
+        ] {
+            let e = refusal(&data, model, &FitOptions::default());
+            assert!(
+                matches!(&e, FitError::Shape(m)
+                    if m.contains("column 1,") && m.contains("glmm::limits::MAX_DATA_ABS")),
+                "{e:?}"
+            );
+            assert_eq!(e.row(), Some(0));
+            refused += 1;
+        }
+    }
+    assert_eq!(refused, 4);
 }
 
 /// A negative Poisson response is out of the family's domain and is refused
@@ -635,6 +1086,35 @@ fn binomial_non_integer_successes_is_noted() {
     assert!(matches!(notes[0], Note::NonIntegerResponse { rows: 1 }));
 }
 
+/// On a design with an aliased column the fit goes through the reduced
+/// re-entry, and the non-integer count is still attached once, with no weight
+/// power reported for an unweighted fit.
+#[test]
+fn data_notes_attach_once_on_the_aliased_route() {
+    let xs = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0];
+    let x: Vec<f64> = xs.iter().flat_map(|&v| [1.0, v, 2.0 * v]).collect();
+    let y = vec![1.0, 2.0, 2.5, 4.0, 3.0, 6.0];
+    let model = ModelSpec::fixed(Family::Poisson {
+        link: PoissonLink::Log,
+    });
+    let f = fit_cold(
+        &x,
+        &y,
+        6,
+        3,
+        &model,
+        &GroupIds::default(),
+        &FitOptions::default(),
+    );
+    assert_eq!(f.diagnostics.aliased, [false, false, true]);
+    let notes: Vec<_> = (f.diagnostics.notes.iter())
+        .filter(|n| matches!(n, Note::NonIntegerResponse { .. }))
+        .collect();
+    assert_eq!(notes.len(), 1, "notes: {:?}", f.diagnostics.notes);
+    assert!(matches!(notes[0], Note::NonIntegerResponse { rows: 1 }));
+    assert!(f.weight_power.is_nan(), "weight_power {}", f.weight_power);
+}
+
 /// A `StartValues.beta` neither empty nor exactly `p`-wide is refused
 /// through `fit_with_start`, the one entry that takes a start.
 #[test]
@@ -802,27 +1282,11 @@ fn fit_rank_deficient_drops_and_matches_reduced() {
     );
 }
 
-/// An aliased fixed column that is ALSO an RE random slope must report a
-/// non-converged `Fit`, not panic.
-///
-/// `y ~ 1 + x1 + x2 + (0 + x2 | g)` with `x2 = 1 + x1` exactly, so `x2` is
-/// aliased at `ALIAS_EPS` and `fit_checked` routes into `fit_rank_deficient` — which
-/// then has to remap the RE slope index through the kept-columns map and finds
-/// the slope's column gone. Dropping the random slope alongside the fixed column
-/// would be a different model, so the model is genuinely unfittable; the question
-/// is only how that is reported. Panicking here would take the caller's
-/// whole process down — an R/Python user would get an abort instead of an
-/// inspectable fit, and a loop caller would lose the entire run over one
-/// degenerate draw.
-///
-/// Deliberately written with `catch_unwind` rather than `#[should_panic]`: the
-/// assertion under test is that NO panic happens, so a regression must surface as
-/// a test FAILURE with the panic message attached, not as an abort that takes the
-/// rest of the suite's output with it. `AssertUnwindSafe` is sound here because
-/// nothing observed after the call is shared with the closure — the inputs are
-/// read-only and the `Fit` is moved out.
+/// An aliased fixed column that is also a random slope is dropped from the
+/// fixed part, and its slope reads the same values from a random-effect-only
+/// column, so the fit is the fit of `[1, x1]` with `x2` as `re_columns`.
 #[test]
-fn rank_deficient_random_slope_returns_nonconverged_instead_of_panicking() {
+fn aliased_random_slope_fits_on_a_random_effect_only_column() {
     let (x, y, n, p, ids) = aliased_slope_design();
     let model = ModelSpec {
         family: Family::Gaussian,
@@ -836,91 +1300,56 @@ fn rank_deficient_random_slope_returns_nonconverged_instead_of_panicking() {
         se_for: SeFor::Only(vec![0, 1, 2]),
         ..FitOptions::default()
     };
-
-    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        fit_cold(&x, &y, n, p, &model, &ids, &opts)
-    }));
-    let f = match caught {
-        Ok(f) => f,
-        Err(e) => {
-            let msg = e
-                .downcast_ref::<String>()
-                .cloned()
-                .or_else(|| e.downcast_ref::<&str>().map(|s| (*s).to_string()))
-                .unwrap_or_else(|| "<non-string panic payload>".to_string());
-            panic!("fit_cold panicked on a rank-deficient random slope: {msg}");
-        }
+    let f = crate::fit(&Data::new(&x, &y, n, p).ids(&ids), &model, &opts).expect("fits");
+    let xr: Vec<f64> = x.chunks(p).flat_map(|r| r[..2].iter().copied()).collect();
+    let z: Vec<f64> = x.chunks(p).map(|r| r[2]).collect();
+    let twin_opts = FitOptions {
+        se_for: SeFor::Only(vec![0, 1]),
+        ..FitOptions::default()
     };
-
-    assert!(
-        !f.converged(),
-        "an unfittable model must not report converged"
-    );
-    assert!(
-        f.beta.iter().all(|b| b.is_nan()) && f.se.iter().all(|s| s.is_nan()),
-        "β/se must be NaN-filled: beta {:?} se {:?}",
-        f.beta,
-        f.se
-    );
-    assert!(
-        f.vcov().iter().all(|v| v.is_nan()),
-        "vcov must be NaN-filled"
-    );
-    // The mask is the one diagnostic the caller can act on, so it is reported
-    // rather than blanked — the same field the successful salvage fills.
-    assert_eq!(
-        f.aliased(),
-        vec![false, false, true],
-        "the aliased column is still named"
-    );
-    // θ width for q_p = 2 (intercept + one slope) is vech = 3; NaN-filled, not
-    // dropped, because the RE structure was never reduced.
-    assert_eq!(f.tau2.len(), 3, "tau2 keeps the unreduced θ width");
-    assert!(f.tau2.iter().all(|t| t.is_nan()), "tau2 NaN-filled");
-    assert!(f.dispersion.is_nan() && f.deviance.is_nan() && f.loglik.is_nan());
-    assert_eq!(f.df, 0, "no parameters were estimated");
-    assert!(
-        !f.singular(),
-        "singular is a fitted-boundary flag, not a failure flag"
-    );
-    assert!(f.varcorr.is_empty() && f.fitted.is_empty() && f.ranef.is_empty());
-    assert_eq!(f.ranef_levels(), [8], "8 clusters");
-    // `reml` is the criterion the options resolve to, as on a fitted model.
-    assert!(f.reml, "REML by default");
-    let ml = fit_cold(
-        &x,
-        &y,
-        n,
-        p,
+    let twin = crate::fit(
+        &Data::new(&xr, &y, n, 2).ids(&ids).re_columns(&z, 1),
         &model,
-        &ids,
-        &FitOptions {
-            reml: Some(false),
-            ..opts
-        },
+        &twin_opts,
+    )
+    .expect("the twin fits");
+    assert!(f.converged() && twin.converged());
+    assert_eq!(f.aliased(), vec![false, false, true]);
+    assert!(f.beta[2].is_nan() && f.se[2].is_nan());
+    let bits = |v: &[f64]| v.iter().map(|t| t.to_bits()).collect::<Vec<_>>();
+    assert_eq!(bits(&f.beta[..2]), bits(&twin.beta), "β");
+    assert_eq!(bits(&f.se[..2]), bits(&twin.se), "se");
+    assert_eq!(f.deviance.to_bits(), twin.deviance.to_bits(), "deviance");
+    assert_eq!(
+        bits(&f.varcorr.concat()),
+        bits(&twin.varcorr.concat()),
+        "varcorr"
     );
-    assert!(!ml.converged() && !ml.reml, "ML on request");
+    assert_eq!(bits(&f.tau2), bits(&twin.tau2), "tau2");
 }
 
-/// The unfittable return counts the levels of every grouping, a nested one as
-/// its global child count: 8 parents with 2 children each give 16.
+/// The aliased column as a random slope in two crossed groupings: both slope
+/// lists read one shared random-effect-only column, index `k + 0` with
+/// `k = 2` kept columns.
 #[test]
-fn unfittable_random_slope_counts_a_nested_grouping() {
+fn aliased_random_slope_in_two_groupings_reads_one_shared_column() {
     let (x, y, n, p, mut ids) = aliased_slope_design();
-    ids.extra = vec![(0..n)
-        .map(|i| 2 * ids.primary[i] + ((i / 8) % 2) as u32)
-        .collect()];
-    let model = ModelSpec {
-        family: Family::Gaussian,
-        re: Some(ReStructure {
-            terms: Vec::new(),
-            slopes: vec![2],
-            extra_groupings: vec![Grouping::nested()],
-        }),
-    };
+    ids.extra = vec![(0..n).map(|i| ((i / 8) % 4) as u32).collect()];
+    let model = ModelSpec::mixed(
+        Family::Gaussian,
+        ReStructure::intercept()
+            .slopes([2])
+            .extra(Grouping::crossed().slopes([2])),
+    );
+    let (spec_r, sources) = super::common::remap_spec_slopes(&model, &[0, 1]);
+    assert_eq!(sources, vec![2]);
+    let re = spec_r.re.as_ref().expect("mixed");
+    assert_eq!(re.slopes, vec![2]);
+    assert_eq!(re.extra_groupings[0].slopes, vec![2]);
     let f = fit_cold(&x, &y, n, p, &model, &ids, &FitOptions::default());
-    assert!(!f.converged());
-    assert_eq!(f.ranef_levels(), [8, 16]);
+    assert!(f.converged(), "{:?}", f.diagnostics);
+    assert_eq!(f.aliased(), vec![false, false, true]);
+    assert!(f.beta[2].is_nan());
 }
 
 /// `y ~ 1 + x1 + x2` over 8 clusters of 12 rows, with `x2 = 1 + x1` exactly,
@@ -946,31 +1375,6 @@ fn aliased_slope_design() -> (Vec<f64>, Vec<f64>, usize, usize, GroupIds) {
         extra: vec![],
     };
     (x, y, n, p, ids)
-}
-
-/// An intercept-free block reports its slopes only in `tau2` (`Fit::tau2`),
-/// on the unfittable return as on a fitted model: `(0 + x2 | g)` on the
-/// aliased column gives the same all-NaN `tau2` length as `(0 + x1 | g)`
-/// fitted on the column that is not aliased.
-#[test]
-fn unfittable_intercept_free_random_slope_reports_the_slope_width() {
-    let (x, y, n, p, ids) = aliased_slope_design();
-    let model = |col: u32| ModelSpec {
-        family: Family::Gaussian,
-        re: Some(ReStructure {
-            terms: vec![crate::ReTerm::no_intercept().slopes([col])],
-            slopes: vec![col],
-            extra_groupings: vec![],
-        }),
-    };
-    let opts = FitOptions::default();
-    let fitted = fit_cold(&x, &y, n, p, &model(1), &ids, &opts);
-    assert!(fitted.converged(), "the twin on column 1 must fit");
-    assert_eq!(fitted.tau2.len(), 1, "one reported slope variance");
-    let f = fit_cold(&x, &y, n, p, &model(2), &ids, &opts);
-    assert!(!f.converged(), "an aliased slope is unfittable");
-    assert_eq!(f.tau2.len(), fitted.tau2.len(), "tau2 {:?}", f.tau2);
-    assert!(f.tau2.iter().all(|t| t.is_nan()), "tau2 NaN-filled");
 }
 
 /// The degenerate-shape GLMM return (`n <= p`) reports an intercept-free
@@ -1202,7 +1606,15 @@ fn fit_with_varcorr(vech: Vec<f64>) -> Fit {
         coef_df: vec![],
         satterthwaite: None,
         design_summary: None,
+        null_basis: Vec::new(),
     }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "ranef_levels")]
+fn check_shape_refuses_a_grouping_without_its_level_count() {
+    super::check_shape(&fit_with_varcorr(vec![4.0]));
 }
 
 /// q=3 hand-computed, chosen specifically to catch a vech-indexing bug:
@@ -1452,13 +1864,14 @@ fn fit_over_envelope_never_panics() {
         );
         assert_eq!(fit.beta.len(), p, "{family:?} over-count returns a Fit");
 
-        // Over-width: one crossed extra with a width-5 slope block (q_g = 5).
+        // Over-width: one crossed extra with a width-5 slope block (q_g = 5),
+        // beside a primary slope so the extra's is not the only one.
         let model_w = SizedSpec {
             spec: ModelSpec {
                 family,
                 re: Some(ReStructure {
                     terms: Vec::new(),
-                    slopes: vec![],
+                    slopes: vec![1],
                     extra_groupings: vec![Grouping {
                         terms: Vec::new(),
                         relation: GroupingRelation::Crossed,
@@ -1580,9 +1993,9 @@ fn fit_glmm_past_max_theta_pins_without_panic() {
 /// width-0 re-entry: the column is aliased, so `fit_rank_deficient` re-enters
 /// the fit with no column kept. The last case is `n == p`.
 /// A degenerate fit has no conditional modes but keeps its level counts, and
-/// the size rule still reorders it when the crossed extra has more levels:
-/// the empty `ranef` is left alone and `ranef_levels` comes back in
-/// declaration order.
+/// the size rule still reorders it, when the crossed extra has more levels or
+/// is the only grouping with a slope: `ranef` is all NaN at full length and
+/// `ranef_levels` and the `varcorr` blocks come back in declaration order.
 #[test]
 fn degenerate_fit_under_the_size_rule_keeps_declaration_order() {
     let model = ModelSpec::mixed(
@@ -1605,8 +2018,305 @@ fn degenerate_fit_under_the_size_rule_keeps_declaration_order() {
         &ids,
         &FitOptions::default(),
     );
-    assert!(!fit.converged() && fit.ranef.is_empty());
+    assert!(!fit.converged());
+    assert_eq!(fit.ranef.len(), 6);
+    assert!(fit.ranef.iter().all(|v| v.is_nan()));
     assert_eq!(fit.ranef_levels(), &[2, 4]);
+
+    // `(1 | h) + (1 + x | g)` with `n <= p`: the rule moves g first, and h's
+    // one-column block still comes before g's two-column one.
+    let model = ModelSpec::mixed(
+        Family::Poisson {
+            link: crate::PoissonLink::Log,
+        },
+        crate::Re::intercept().extra(Grouping::crossed().slopes([1])),
+    );
+    let (n, p) = (2, 2);
+    let ids = GroupIds {
+        primary: vec![0, 0],
+        extra: vec![vec![0, 1]],
+    };
+    assert!(!super::spec_sized_from_ids(&model, &ids).2.is_identity());
+    let fit = fit_cold(
+        &[1.0, -0.5, 1.0, 0.5],
+        &vec![1.0f64; n],
+        n,
+        p,
+        &model,
+        &ids,
+        &FitOptions::default(),
+    );
+    assert!(!fit.converged());
+    assert_eq!(fit.ranef_levels(), &[1, 2]);
+    assert_eq!((fit.varcorr[0].len(), fit.varcorr[1].len()), (1, 3));
+    assert_eq!(fit.ranef.len(), 1 + 2 * 2);
+    assert!(fit.ranef.iter().all(|v| v.is_nan()));
+
+    // The same with h nested in g once g moves first (`p == 0`, the slope on
+    // a random-effect-only column): h's 30 declared levels, not g's 12 × 3
+    // padded slots.
+    let (x, _, counts, n, h, g) = nested_slope_case(true);
+    let slope: Vec<f64> = x.chunks(2).map(|r| r[1]).collect();
+    let model = ModelSpec::mixed(
+        Family::Poisson {
+            link: crate::PoissonLink::Log,
+        },
+        crate::Re::intercept().extra(Grouping::crossed().slopes([0])),
+    );
+    let ids = GroupIds::new(h).extra(g);
+    let data = Data::new(&[], &counts, n, 0)
+        .re_columns(&slope, 1)
+        .ids(&ids);
+    let fit = crate::fit(&data, &model, &FitOptions::default()).unwrap();
+    assert!(!fit.converged());
+    assert_eq!(fit.ranef_levels(), &[30, 12]);
+    assert_eq!(fit.ranef.len(), 30 + 2 * 12);
+    assert!(fit.ranef.iter().all(|v| v.is_nan()));
+}
+
+/// Where the size rule moves a lone slope grouping first, on the sizing alone
+/// (no fit): only when every extra is crossed, the slope grouping is the only
+/// one and an extra, and the reordered spec routes the dense kernel.
+#[test]
+fn size_rule_moves_a_lone_slope_grouping_first_only_when_it_routes_dense() {
+    let n = 1200;
+    let ids_of = |levels: &[u32]| GroupIds {
+        primary: (0..n).map(|i| i % levels[0]).collect(),
+        extra: levels[1..]
+            .iter()
+            .map(|&l| (0..n).map(|i| (i / 2) % l).collect())
+            .collect(),
+    };
+    let gauss = |re: ReStructure| ModelSpec::mixed(Family::Gaussian, re);
+    let slope_last =
+        |slopes: Vec<u32>| crate::Re::intercept().extra(Grouping::crossed().slopes(slopes));
+
+    // `(1 | h) + (1 + x | g)`, few levels: g moves first, with its slope and
+    // its ids, and the ids are cloned.
+    for h_levels in [3, crate::consts::MAX_CROSSED_LEVELS as u32] {
+        let model = gauss(slope_last(vec![1]));
+        let ids = ids_of(&[h_levels, 4]);
+        let (sized, sids, perm) = super::spec_sized_from_ids(&model, &ids);
+        assert!(!perm.is_identity(), "h with {h_levels} levels");
+        let re = sized.spec.re.as_ref().unwrap();
+        assert_eq!(re.slopes, vec![1]);
+        assert!(re.extra_groupings[0].slopes.is_empty());
+        assert_eq!(
+            (sized.n_primary, sized.extra_counts.clone()),
+            (4, vec![h_levels as usize])
+        );
+        assert!(matches!(sids, std::borrow::Cow::Owned(_)));
+        assert_eq!(
+            (&sids.primary, &sids.extra[0]),
+            (&ids.extra[0], &ids.primary)
+        );
+        assert!(matches!(classify_design(&sized, 1), Solver::NoZ));
+    }
+
+    let stays = |model: ModelSpec, ids: GroupIds, case: &str| {
+        let (sized, sids, perm) = super::spec_sized_from_ids(&model, &ids);
+        assert!(perm.is_identity(), "{case}");
+        assert_eq!(sized, super::sized_as_declared(&model, &ids), "{case}");
+        assert!(matches!(sids, std::borrow::Cow::Borrowed(_)), "{case}");
+    };
+    stays(
+        gauss(
+            crate::Re::intercept()
+                .extra(Grouping::crossed().slopes([1]))
+                .extra(Grouping::crossed().slopes([2])),
+        ),
+        ids_of(&[3, 4, 5]),
+        "two slope groupings",
+    );
+    stays(
+        gauss(slope_last(vec![1]).extra(Grouping::nested())),
+        ids_of(&[3, 4, 5]),
+        "a nested extra",
+    );
+    stays(
+        gauss(slope_last(vec![1])),
+        ids_of(&[crate::consts::MAX_CROSSED_LEVELS as u32 + 1, 4]),
+        "h with 501 levels",
+    );
+    stays(
+        gauss(
+            crate::Re::intercept()
+                .slopes([1])
+                .extra(Grouping::crossed()),
+        ),
+        ids_of(&[3, 40]),
+        "a slope already on the primary",
+    );
+    stays(
+        gauss(slope_last(
+            (1..=crate::consts::MAX_PRIMARY_Q as u32).collect(),
+        )),
+        ids_of(&[3, 4]),
+        "a slope grouping wider than MAX_PRIMARY_Q",
+    );
+}
+
+/// `(1 | h) + (1 + x | g)` data with h nested in g: 12 levels of g with a
+/// random intercept and a slope on `x`, 3 children h per g (2 for g 0 to 5
+/// when `shuffled`), 10 rows per child with `x` varying within it, a child
+/// intercept and noise. `counts` is a count response off the same linear
+/// predictor. Balanced, `h = 3·g + k` and each child's padded slot is its id;
+/// shuffled, the 30 children `j` (in parent order) are declared as
+/// `7·j mod 30`, so a declared level is not its slot. Returns
+/// `(x, y, counts, n, h, g)`, `x` row-major `n × 2` with an intercept column.
+#[allow(clippy::type_complexity)]
+pub(crate) fn nested_slope_case(
+    shuffled: bool,
+) -> (Vec<f64>, Vec<f64>, Vec<f64>, usize, Vec<u32>, Vec<u32>) {
+    let mut st = 53u64;
+    let ug: Vec<(f64, f64)> = (0..12)
+        .map(|_| (0.6 * lcg(&mut st), 0.3 * lcg(&mut st)))
+        .collect();
+    let parents: Vec<u32> = (0..12u32)
+        .flat_map(|gi| std::iter::repeat_n(gi, if shuffled && gi < 6 { 2 } else { 3 }))
+        .collect();
+    let uh: Vec<f64> = parents.iter().map(|_| 0.4 * lcg(&mut st)).collect();
+    let (mut x, mut y, mut counts, mut h, mut g) = (vec![], vec![], vec![], vec![], vec![]);
+    for (j, &gi) in parents.iter().enumerate() {
+        let id = if shuffled { 7 * j % parents.len() } else { j };
+        for _ in 0..10 {
+            let x1 = lcg(&mut st);
+            let (u0, u1) = ug[gi as usize];
+            let eta = 0.3 + 0.5 * x1 + u0 + u1 * x1 + uh[j];
+            x.extend([1.0, x1]);
+            y.push(eta + 0.5 * lcg(&mut st));
+            counts.push(((eta + 0.7).exp() + 0.5 * (lcg(&mut st) + 1.0)).floor());
+            h.push(id as u32);
+            g.push(gi);
+        }
+    }
+    (x, y, counts, h.len(), h, g)
+}
+
+/// The two spellings of [`nested_slope_case`]'s model: slope last
+/// `(1 | h) + (1 + x | g)`, both groupings crossed as written, and slope
+/// first `(1 + x | g)` with h nested in it.
+pub(crate) fn nested_slope_spellings(family: Family) -> (ModelSpec, ModelSpec) {
+    (
+        ModelSpec::mixed(
+            family,
+            ReStructure::intercept().extra(Grouping::crossed().slopes([1])),
+        ),
+        ModelSpec::mixed(
+            family,
+            ReStructure::intercept()
+                .slopes([1])
+                .extra(Grouping::nested()),
+        ),
+    )
+}
+
+/// After moving a lone slope grouping first, the sizing checks the grouping
+/// it displaced for nesting in it with the formula front end's two guards: a
+/// nested one becomes a `NestedWithin` extra on padded ids, so the spec and
+/// ids are those of the slope-first nested spelling. A child level under two
+/// parents, a padded rectangle past the inflation bound and a declared level
+/// with no rows leave it crossed.
+#[test]
+fn a_slope_swap_nests_the_displaced_grouping_under_the_front_end_guards() {
+    let (last, first) = nested_slope_spellings(Family::Gaussian);
+    for shuffled in [false, true] {
+        let (_, _, _, _, h, g) = nested_slope_case(shuffled);
+        let ids = GroupIds::new(h.clone()).extra(g.clone());
+        let (sized, sids, perm) = super::spec_sized_from_ids(&last, &ids);
+        assert!(!perm.is_identity(), "shuffled {shuffled}");
+        let padded = super::common::nested_padded_ids(&g, &h).0;
+        if !shuffled {
+            assert_eq!(padded, h);
+        }
+        let want = GroupIds::new(g.clone()).extra(padded);
+        assert_eq!(
+            sized,
+            super::sized_as_declared(&first, &want),
+            "shuffled {shuffled}"
+        );
+        assert_eq!(*sids, want, "shuffled {shuffled}");
+    }
+
+    // `(1 | h) + (1 | c) + (1 + x | g)`: g moves first, h nests in it and c
+    // stays a crossed extra.
+    let (_, _, _, n, h, g) = nested_slope_case(false);
+    let c: Vec<u32> = (0..n as u32).map(|i| i % 5).collect();
+    let three = ModelSpec::mixed(
+        Family::Gaussian,
+        ReStructure::intercept()
+            .extra(Grouping::crossed())
+            .extra(Grouping::crossed().slopes([1])),
+    );
+    let ids = GroupIds::new(h.clone()).extra(c.clone()).extra(g.clone());
+    let (sized, sids, perm) = super::spec_sized_from_ids(&three, &ids);
+    assert!(!perm.is_identity());
+    let re = sized.spec.re.as_ref().unwrap();
+    assert_eq!(re.extra_groupings[0].relation, GroupingRelation::Crossed);
+    assert_eq!(
+        re.extra_groupings[1].relation,
+        GroupingRelation::NestedWithin
+    );
+    assert_eq!(
+        (&sids.primary, &sids.extra[0], &sids.extra[1]),
+        (&g, &c, &h)
+    );
+
+    let stays_crossed = |h: Vec<u32>, g: Vec<u32>, case: &str| {
+        let ids = GroupIds::new(h.clone()).extra(g.clone());
+        let (sized, sids, perm) = super::spec_sized_from_ids(&last, &ids);
+        assert!(!perm.is_identity(), "{case}");
+        let re = sized.spec.re.as_ref().unwrap();
+        assert_eq!(
+            re.extra_groupings[0].relation,
+            GroupingRelation::Crossed,
+            "{case}"
+        );
+        assert_eq!((&sids.primary, &sids.extra[0]), (&g, &h), "{case}");
+        let declared = *h.iter().max().unwrap() as usize + 1;
+        assert_eq!(sized.extra_counts, vec![declared], "{case}");
+    };
+    let mut two_parents = h.clone();
+    two_parents[0] = 3;
+    stays_crossed(two_parents, g.clone(), "a child level under two parents");
+    // Parent 0 holds children 0 to 4, parents 1 to 11 one child each: a
+    // 12 × 5 rectangle over 16 levels, past 2 · 16.
+    let wide_h: Vec<u32> = (0..32)
+        .map(|i| if i < 10 { i / 2 } else { 5 + (i - 10) / 2 })
+        .collect();
+    let wide_g: Vec<u32> = wide_h.iter().map(|&k| k.saturating_sub(4)).collect();
+    stays_crossed(wide_h, wide_g, "a padded rectangle past the bound");
+    let gap: Vec<u32> = h.iter().map(|&k| k + u32::from(k >= 5)).collect();
+    stays_crossed(gap, g, "a declared level with no rows");
+}
+
+/// The size rule swaps the primary with the second extra here, so one block
+/// sits between the two swapped ones and every block has its own width.
+#[test]
+fn swap_blocks_moves_blocks_of_unequal_width() {
+    let model = ModelSpec::mixed(
+        Family::Gaussian,
+        crate::Re::intercept()
+            .extra(Grouping::crossed())
+            .extra(Grouping::crossed()),
+    );
+    let n = 12;
+    let ids = GroupIds {
+        primary: (0..n).map(|i| (i % 2) as u32).collect(),
+        extra: vec![
+            (0..n).map(|i| (i % 3) as u32).collect(),
+            (0..n).map(|i| (i % 4) as u32).collect(),
+        ],
+    };
+    let (_sized, _ids, perm) = super::spec_sized_from_ids(&model, &ids);
+    let mut v = ["a0", "a1", "m0", "m1", "m2", "b0"];
+    perm.swap_blocks(&mut v, |i| [2, 3, 1][i]);
+    assert_eq!(v, ["b0", "m0", "m1", "m2", "a0", "a1"]);
+    perm.swap_blocks(&mut v, |i| [1, 3, 2][i]);
+    assert_eq!(v, ["a0", "a1", "m0", "m1", "m2", "b0"]);
+    let mut empty: [f64; 0] = [];
+    perm.swap_blocks(&mut empty, |i| [2, 3, 1][i]);
+    assert!(empty.is_empty());
 }
 
 #[test]
@@ -2134,6 +2844,10 @@ fn re_columns_shape_errors() {
     let z2 = vec![-1.0, 2.0, 1.0, 2.0, 1.0, 3.0, -1.0, 3.0];
     let mut z_nan = z1.clone();
     z_nan[2] = f64::NAN;
+    let nan_text = format!(
+        "re_columns must be finite with |re_columns| <= {MAX_DATA_ABS:e} (row 2, column 0, \
+         value NaN; glmm::limits::MAX_DATA_ABS)"
+    );
     let cases: [(&[f64], usize, Vec<u32>, &str); 4] = [
         (
             &z1,
@@ -2153,12 +2867,7 @@ fn re_columns_shape_errors() {
             vec![2],
             "re_columns must have n*s elements in row-major layout",
         ),
-        (
-            &z_nan,
-            1,
-            vec![2],
-            "re_columns must be finite (row 2, column 0)",
-        ),
+        (&z_nan, 1, vec![2], &nan_text),
     ];
     let mut refused = 0;
     for (z, s, slopes, want) in cases {
@@ -2310,6 +3019,7 @@ fn identification_notes_of(f: &Fit) -> Vec<String> {
             n,
             Note::SingleLevelGrouping { .. }
                 | Note::RepeatedGrouping { .. }
+                | Note::OneTrialPerLevel { .. }
                 | Note::SlopeConstantWithinLevels { .. }
                 | Note::SeparatedByGrouping { .. }
         )
@@ -2385,6 +3095,33 @@ fn matrix_door_notes_unidentified_random_effects() {
             }],
         ),
         (
+            "intercept column as a slope, binomial, response constant within levels",
+            binomial,
+            crate::Re::intercept().slopes([0]),
+            vec![primary.clone()],
+            None,
+            vec![
+                Note::SlopeConstantWithinLevels {
+                    grouping: 0,
+                    slopes: vec![0],
+                },
+                Note::SeparatedByGrouping { grouping: 0 },
+            ],
+        ),
+        (
+            "intercept column as a slope, Poisson",
+            Family::Poisson {
+                link: PoissonLink::Log,
+            },
+            crate::Re::intercept().slopes([0]),
+            vec![primary.clone()],
+            None,
+            vec![Note::SlopeConstantWithinLevels {
+                grouping: 0,
+                slopes: vec![0],
+            }],
+        ),
+        (
             "constant slope with two values",
             gaussian,
             crate::Re::intercept().slopes([1, 2]),
@@ -2406,6 +3143,26 @@ fn matrix_door_notes_unidentified_random_effects() {
         (
             "response constant within one-row levels",
             binomial,
+            crate::Re::intercept(),
+            vec![(0..n as u32).collect()],
+            None,
+            vec![Note::OneTrialPerLevel { grouping: 0 }],
+        ),
+        (
+            "binomial with two rows in one level",
+            binomial,
+            crate::Re::intercept(),
+            vec![(0..n as u32)
+                .map(|i| if i <= 11 { i } else { i - 1 })
+                .collect()],
+            None,
+            vec![],
+        ),
+        (
+            "Poisson with one row per level",
+            Family::Poisson {
+                link: PoissonLink::Log,
+            },
             crate::Re::intercept(),
             vec![(0..n as u32).collect()],
             None,
@@ -2463,7 +3220,7 @@ fn matrix_door_notes_unidentified_random_effects() {
             vec![],
         ),
     ];
-    assert_eq!(cases.len(), 13);
+    assert_eq!(cases.len(), 17);
     for (what, family, re, groups, z, want) in cases {
         let ids = GroupIds {
             primary: groups[0].clone(),
@@ -2479,6 +3236,51 @@ fn matrix_door_notes_unidentified_random_effects() {
         let want: Vec<String> = want.iter().map(|n| format!("{n:?}")).collect();
         assert_eq!(identification_notes_of(&f), want, "{what}");
     }
+}
+
+/// `OneTrialPerLevel` counts a level's trials as its summed weights, not its
+/// rows: one row of five trials per level is identified, one 0/1 row of
+/// weight 1 per level is not, and the same holds under adaptive quadrature.
+#[test]
+fn one_trial_per_level_counts_trials_not_rows() {
+    let n = 24;
+    let x: Vec<f64> = (0..n).flat_map(|i| [1.0, (i % 4) as f64]).collect();
+    let ids = GroupIds {
+        primary: (0..n as u32).collect(),
+        extra: vec![],
+    };
+    let spec = ModelSpec::mixed(
+        Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        crate::Re::intercept(),
+    );
+    let fit = |y: &[f64], w: &[f64], opts: &FitOptions| {
+        let data = Data::new(&x, y, n, 2).ids(&ids).weights(w);
+        crate::fit(&data, &spec, opts).unwrap()
+    };
+    let laplace = FitOptions::default();
+    let proportions: Vec<f64> = (0..n).map(|i| (i % 3) as f64 / 5.0).collect();
+    assert_eq!(
+        identification_notes_of(&fit(&proportions, &vec![5.0; n], &laplace)),
+        Vec::<String>::new()
+    );
+    let binary: Vec<f64> = (0..n).map(|i| f64::from(i % 3 == 0)).collect();
+    let one_trial = vec![format!("{:?}", Note::OneTrialPerLevel { grouping: 0 })];
+    assert_eq!(
+        identification_notes_of(&fit(&binary, &vec![1.0; n], &laplace)),
+        one_trial
+    );
+    let agq = fit(
+        &binary,
+        &vec![1.0; n],
+        &FitOptions {
+            nagq: 7,
+            ..FitOptions::default()
+        },
+    );
+    assert_eq!(agq.objective(), Objective::Agq { nodes: 7 });
+    assert_eq!(identification_notes_of(&agq), one_trial);
 }
 
 /// A binomial response constant over all rows is constant within every level
@@ -2538,6 +3340,79 @@ fn identification_note_survives_a_failed_fit() {
             }
         )),
         "{:?}",
+        f.diagnostics.notes
+    );
+}
+
+/// A Gaussian LMM whose ML likelihood keeps rising as the group variance
+/// grows (12 weighted rows, 10 groups of one or two rows) has no finite
+/// maximum, so its fit must not end converged with no note.
+#[test]
+#[ignore = "an LMM whose ML likelihood rises without bound in the group variance stops at an interior point, converged, with no note"]
+fn a_gaussian_lmm_without_a_finite_ml_maximum_is_not_silent() {
+    let y = [
+        5.653009808417115,
+        -0.6536440004991728,
+        1.9879421871004077,
+        -3.9836886561645226,
+        -0.6875399167378251,
+        11.645612063593296,
+        7.1882985336482665,
+        2.848061165203353,
+        3.348582763064386,
+        1.5108602793216335,
+        7.918580314956953,
+        1.9331210316515386,
+    ];
+    let x2 = [
+        -0.4356478163840148,
+        -0.4199319819677705,
+        -1.1127910745219936,
+        -0.11190375416332736,
+        -1.7756632204478608,
+        0.6935337245392426,
+        -1.4036148527186703,
+        1.7575240001334855,
+        1.4802124262699394,
+        -1.9162129934087428,
+        0.6445879145103244,
+        -0.26270439033653414,
+    ];
+    let w = [
+        0.9070619365279919,
+        0.4087594069392292,
+        2.2295003983900763,
+        1.4912237973743012,
+        2.108672032852572,
+        1.9559309203185207,
+        0.3702055456220765,
+        1.6837738960354316,
+        1.0380694391022025,
+        2.144138211382625,
+        1.4868912214648211,
+        2.799029387373056,
+    ];
+    let x: Vec<f64> = (0..12)
+        .flat_map(|i| [1.0, x2[i], f64::from(i == 7 || i == 8)])
+        .collect();
+    let ids = GroupIds {
+        primary: vec![0, 1, 2, 3, 4, 5, 6, 3, 7, 7, 8, 9],
+        extra: vec![],
+    };
+    let f = crate::fit(
+        &Data::new(&x, &y, 12, 3).ids(&ids).weights(&w),
+        &ModelSpec::mixed(Family::Gaussian, crate::Re::intercept()),
+        &FitOptions {
+            reml: Some(false),
+            ..FitOptions::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        !f.converged() || !f.diagnostics.notes.is_empty(),
+        "converged with no note: loglik {}, varcorr {:?}, notes {:?}",
+        f.loglik,
+        f.varcorr,
         f.diagnostics.notes
     );
 }
@@ -2732,7 +3607,7 @@ fn ranef_blocks_partition_the_stored_modes() {
     let mixed_q_fit = fit_mixed(true);
     assert_eq!((mixed_q_fit.n_re(0), mixed_q_fit.n_re(1)), (2, 1));
     for f in [&nested_fit, &no_intercept_fit, &mixed_q_fit] {
-        assert!(f.converged() && !f.ranef.is_empty());
+        assert!(f.converged() && !f.ranef.is_empty() && f.ranef.iter().all(|v| v.is_finite()));
         let joined: Vec<f64> = (0..f.n_groupings())
             .flat_map(|g| f.ranef(g).to_vec())
             .collect();
@@ -2764,7 +3639,7 @@ fn ranef_blocks_partition_the_stored_modes() {
     let opts = FitOptions::default();
     let mut ws = super::core::build_workspace(&model, &ids, n, p, &opts);
     {
-        let (lmm, _) = ws.lmm_parts().expect("a Gaussian mixed workspace");
+        let (lmm, _, _) = ws.lmm_parts().expect("a Gaussian mixed workspace");
         let mut config = bobyqa::Config::new(1);
         config.max_fun = 5;
         lmm.solver = bobyqa::Bobyqa::new(1, config).expect("legal minimal config");
@@ -2775,7 +3650,11 @@ fn ranef_blocks_partition_the_stored_modes() {
     assert!(!unconverged_fit.converged());
     assert!(unconverged_fit.n_groupings() > 0);
     for g in 0..unconverged_fit.n_groupings() {
-        assert!(unconverged_fit.ranef(g).is_empty());
+        assert_eq!(
+            unconverged_fit.ranef(g).len(),
+            unconverged_fit.ranef_levels()[g] * unconverged_fit.n_re(g)
+        );
+        assert!(unconverged_fit.ranef(g).iter().all(|v| v.is_nan()));
         assert!(unconverged_fit.ranef_levels()[g] > 0);
     }
 }
@@ -3071,7 +3950,10 @@ fn diagnostics_boundary_reports_both_ends() {
     );
     assert!(interior.converged());
     assert_eq!(interior.diagnostics.boundary, Boundary::Interior);
-    assert!(interior.diagnostics.pinned.is_empty(), "nothing pinned");
+    assert!(
+        !interior.diagnostics.pinned.iter().flatten().any(|&b| b),
+        "nothing pinned"
+    );
 }
 
 /// `pinned[g][i]` must pair with `stddev_corr(g).0[i]` — the whole point of the
@@ -3313,9 +4195,9 @@ pub(crate) fn fixture_lowered(
 }
 
 /// `fit_rank_deficient` copies `nobs` and `objective` from its reduced fit (an
-/// ML fit here, so the copy is not the REML default), and the unfittable
-/// return carries the route's: the criterion on a Gaussian mixed model, the
-/// quadrature on a GLMM.
+/// ML fit here, so the copy is not the REML default), and a fit whose aliased
+/// column is also a random slope carries its reduced fit's: the criterion on a
+/// Gaussian mixed model, the quadrature on a GLMM.
 #[test]
 fn rank_deficient_fits_carry_nobs_and_the_route_objective() {
     let (n_clusters, per) = (8usize, 12usize);
@@ -3364,7 +4246,7 @@ fn rank_deficient_fits_carry_nobs_and_the_route_objective() {
     assert_eq!(f.aliased(), vec![false, false, true]);
     assert_eq!((f.nobs, f.objective), (n, Objective::MaximumLikelihood));
 
-    // Unfittable: the aliased column is also a random slope.
+    // The aliased column is also a random slope.
     let binomial = Family::Binomial {
         link: BinomialLink::Logit,
     };
@@ -3382,7 +4264,6 @@ fn rank_deficient_fits_carry_nobs_and_the_route_objective() {
     ];
     for (family, y, reml, nagq, want) in cases {
         let f = fit_cold(&x, y, n, p, &spec(family, vec![2]), &ids, &opts(reml, nagq));
-        assert!(!f.converged(), "{family:?}, nagq {nagq}");
         assert_eq!(
             (f.nobs, f.objective),
             (n, want),
@@ -3698,9 +4579,9 @@ fn condvar_matches_a_dense_inverse() {
 }
 
 /// Where the conditional variances are not computed, `condvar` and
-/// `condvar_x` are empty while `ranef` is not: a Gaussian LMM on the sparse
-/// route (a random slope on an extra grouping) and a GLMM on the packed layout
-/// (the same shape, binomial).
+/// `condvar_x` are empty even when asked for, while `ranef` is not: a Gaussian
+/// LMM on the sparse route (random slopes on two groupings) and a GLMM on the
+/// packed layout (the same shape, binomial).
 #[cfg(feature = "formula")]
 #[test]
 fn condvar_is_empty_where_not_covered() {
@@ -3708,13 +4589,13 @@ fn condvar_is_empty_where_not_covered() {
         (
             include_str!("../../../validation/data/simulated/sim_slope_extra.csv"),
             &["g1", "g2"],
-            "y ~ 1 + x + (1 | g1) + (1 + x | g2)",
+            "y ~ 1 + x + (1 + x | g1) + (1 + x | g2)",
             Family::Gaussian,
         ),
         (
             include_str!("../../../validation/data/simulated/sim_factorial_bern.csv"),
             &["subj", "g", "h"],
-            "y ~ x + (1 | subj) + (1 + x | g)",
+            "y ~ x + (1 + x | subj) + (1 + x | g)",
             Family::Binomial {
                 link: BinomialLink::Logit,
             },
@@ -3722,14 +4603,21 @@ fn condvar_is_empty_where_not_covered() {
     ];
     for (csv, factors, formula, family) in shapes {
         let lo = fixture_lowered(csv, factors, formula, family);
-        let fit = crate::fit(&lo.data(), lo.spec(), &FitOptions::default()).unwrap();
-        assert!(!fit.ranef.is_empty(), "{formula}: no ranef");
+        let opts = FitOptions {
+            condvar: true,
+            ..FitOptions::default()
+        };
+        let fit = crate::fit(&lo.data(), lo.spec(), &opts).unwrap();
+        assert!(
+            !fit.ranef.is_empty() && fit.ranef.iter().all(|v| v.is_finite()),
+            "{formula}: no ranef"
+        );
         assert!(fit.condvar.is_empty(), "{formula}: condvar");
         assert!(fit.condvar_x.is_empty(), "{formula}: condvar_x");
     }
 }
 
-// ── weight_power and se_type (DCR-T3) ────────────────────────────────────────
+// ── weight_power and se_type ────────────────────────────────────────
 
 /// `lmm_hand_dataset` (48 rows, 6 clusters of `i % 6`) with weights from 1 to
 /// 4 and its cluster ids.
@@ -3740,7 +4628,7 @@ fn weighted_hand() -> (Vec<f64>, Vec<f64>, Vec<f64>, GroupIds, usize, usize) {
     (x, y, w, ids, n, p)
 }
 
-/// Every refusal of a named `weight_power` or `se_type` (§6, D11), with its
+/// Every refusal of a named `weight_power` or `se_type`, with its
 /// variant and the part of its message that says what to do instead.
 #[test]
 fn weight_power_and_se_type_refusals() {
@@ -3891,7 +4779,7 @@ fn fixed_power_one_fits_every_family_and_no_weights_ignores_it() {
     assert_eq!(a.se_type(), SeType::Model);
 }
 
-/// §10.3: `Fixed(0)` is the unweighted fit, and `Fixed(v)` is the claimed
+/// `Fixed(0)` is the unweighted fit, and `Fixed(v)` is the claimed
 /// fit on the caller's own `w^v`, with the same parameter count; on a mixed
 /// model and on OLS, and on a rank-deficient design (whose reduced re-entry
 /// must raise the weights once).
@@ -3941,7 +4829,7 @@ fn fixed_power_is_the_claimed_fit_on_powered_weights() {
     }
 }
 
-/// D18: the loop tier's workspace door panics on a named power other than 1
+/// The loop tier's workspace door panics on a named power other than 1
 /// or a robust SE (the stable entry refuses or fits them, as above), and
 /// takes `Fixed(1.0)` and `Model` named.
 #[cfg(feature = "loop_advanced")]

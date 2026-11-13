@@ -290,7 +290,7 @@ detail.
 - A search that stopped at its evaluation budget (`MaxFunReached`) still
   reports coefficients, `se`, `vcov`, `dispersion`, `tau2` and `varcorr` at
   the best point found (the plateau policy). `stddev_se` is NaN, one entry
-  per vech element, and `fitted` and the random-effect modes stay empty
+  per vech element, and `fitted` and the random-effect modes are NaN
   regardless. `df` is 0 for a GLMM at that
   endpoint (the AIC/BIC identity does not apply there); an LMM at the same
   endpoint reports its usual nonzero `df`.
@@ -328,15 +328,16 @@ fit itself, not in `diagnostics`.
   search ran (a degenerate guard), which says so through `converged: false`.
 - `pinned` names which variance components were pinned, aligned with the
   `varcorr` block layout so `pinned[g][i]` pairs with `stddev_corr(g)`'s `i`-th
-  stddev. Empty means "nothing to report" (no components at all, or none
-  pinned), not "checked and none pinned."
+  stddev. It has one row per grouping on every fit with random effects, all
+  `false` when nothing was pinned, and is empty on a fit without random
+  effects.
 - `n_grad`, `outer_stop` and `outer_decrement` describe the BFGS θ search:
   its gradient evaluations, why it stopped, and its estimate of the deviance
   decrease left. They are 0, `None` (R: `NA`) and NaN on a fit that ran no
   gradient search.
-- `notes` carries solver observations that have no dedicated flag. There are
-  fifteen kinds; [`warnings.md`](warnings.md) gives the warning each one
-  raises. Three of them in more detail:
+- `notes` carries solver observations that have no dedicated flag;
+  [`warnings.md`](warnings.md) gives the warning each kind raises. Three of
+  them in more detail:
   - `IllConditioned`: two or more fixed-effect columns are entangled —
     near-collinear but not exactly redundant. That design is **fitted, not
     refused**: the coefficients are real and the standard errors are honest

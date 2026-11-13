@@ -1,5 +1,5 @@
 //! CR2 and HC2: the cluster-robust covariance of a Gaussian fit's β̂ and the
-//! Pustejovsky–Tipton df of a contrast (spec 2-dcr §3.2).
+//! Pustejovsky–Tipton df of a contrast.
 //!
 //! Cluster k has the working model Φ_k = diag(λ) + U Uᵀ, H_k = X_kᵀΦ_k⁻¹X_k,
 //! M = (Σ_k H_k)⁻¹ and C_k = Φ_k − X_k M X_kᵀ. A_k solves A C_k A = Φ_k on the
@@ -8,6 +8,15 @@
 //! E_k = M X_kᵀ Φ_k⁻¹ A_k. A cluster stores E_k r_k, F_k = E_k X_k and
 //! E_kΦ_kE_kᵀ = M H_k M + F_k M F_kᵀ; the CR2 variance and the df of any
 //! contrast come from those alone.
+//!
+//! The pieces are formed on the whitened design Z = X R⁻¹, R the upper
+//! triangular factor the fit already has, with R M Rᵀ = I: there M = I, so
+//! every term of the df is of order 1. In β's own coordinates M grows like
+//! κ(X)², and the differences in tr Q and tr Q² cancel on a nearly collinear
+//! design. A contrast c on β is c_Z = tᵀc on β_Z, t = R⁻¹ (β = t β_Z). The
+//! CR2 variance and the Pustejovsky–Tipton df are invariant to this change of
+//! coordinates (E_Z = t⁻¹E, and A_k depends only on X_k M X_kᵀ), so the df on
+//! Z is the df of the caller's contrast.
 //!
 //! Outside the small, well-conditioned clusters of [`DENSE`] no n_k × n_k
 //! matrix is formed. With R_s = Φ + s²Φ⁻¹ and
@@ -38,16 +47,16 @@ use crate::linalg::SeqLlt;
 
 /// The cut on T_k's eigenvalues, which have no units and lie in [0, 1].
 const CUT: f64 = 1e-12;
-/// df below which a robust test has no assurance (spec 2-dcr §6).
+/// df below which a robust test has no assurance.
 pub(crate) const DF_SMALL: f64 = 4.0;
 /// A cluster of at most `DENSE.0` rows whose spectrum bounds have
 /// zmax / zmin ≤ `DENSE.1` takes [`dense_cluster`], any other the pole sum
 /// ([`pole_cluster`]). Dense is 2.4 to 4.8 times as fast up to 12 rows and
 /// 2.8 times as slow at 20; its error grows with zmax / zmin (9e-14 at 2e5,
-/// 6e-11 at 4e8), reaching 1e-12 near 4e6 (DCR-T7, `docs/0.9.0/dcr-timing.md`).
+/// 6e-11 at 4e8), reaching 1e-12 near 4e6 (measured).
 const DENSE: (usize, f64) = (12, 1e6);
 /// Relative tolerance of the rational approximation of z^(−1/2), which sets N.
-// The spec's 1e-10 left G6 at 1.15e-10; 1e-13 meets G6, rank and leverage at their measured 4e-13, at ~28% more poles.
+// 1e-10 left the large-cluster identity check at 1.15e-10; 1e-13 meets it, the rank and the leverage at their measured 4e-13, at ~28% more poles.
 const POLE_TOL: f64 = 1e-13;
 
 /// One cluster at the final fit, in the kernel's coordinates:
@@ -63,34 +72,41 @@ pub(crate) struct ClusterBlock<'a> {
     pub(crate) u: MatRef<'a, f64>,
 }
 
-/// What a fit keeps of CR2: per cluster E_k r_k, F_k and E_kΦ_kE_kᵀ.
+/// What a fit keeps of CR2: per cluster E_k r_k, F_k and E_kΦ_kE_kᵀ, in the
+/// whitened coordinates of Z, `p_Z` wide, and the map `t` back to β.
 pub(crate) struct Cr2Pieces {
-    /// E_k r_k, column k for cluster k (p × G).
+    /// β = t β_Z, `p × p_Z`: R⁻¹ as built, mapped to the caller's coordinates
+    /// by the fit. A column the fit dropped has a zero row.
+    pub(crate) t: Mat<f64>,
+    /// E_k r_k, column k for cluster k (p_Z × G).
     pub(crate) er: Mat<f64>,
-    /// (F_k, E_kΦ_kE_kᵀ) of each cluster of more than one row, in cluster order.
+    /// (F_k, E_kΦ_kE_kᵀ), `p_Z × p_Z`, of each cluster of more than one row, in
+    /// cluster order.
     pub(crate) whole: Vec<(Mat<f64>, Mat<f64>)>,
-    /// One-row clusters in cluster order, a column each: E_k (p × 1), so
-    /// F_k = e_k x_kᵀ and E_kΦ_kE_kᵀ = φ_k e_k e_kᵀ, with x_k in `row_x` and
-    /// the scalar Φ_k in `row_phi`. O(p) per row.
+    /// One-row clusters in cluster order, a column each: E_k (p_Z × 1), so
+    /// F_k = e_k z_kᵀ and E_kΦ_kE_kᵀ = φ_k e_k e_kᵀ, with the row z_k of Z in
+    /// `row_x` and the scalar Φ_k in `row_phi`. O(p_Z) per row.
     pub(crate) row_e: Mat<f64>,
     pub(crate) row_x: Mat<f64>,
     pub(crate) row_phi: Vec<f64>,
-    /// (k, n): H_(−k) n = 0 with nᵀM⁻¹n = 1, so a contrast with cᵀn ≠ 0 has no
-    /// information outside cluster k.
+    /// (k, n), `p_Z` each: H_(−k) n = 0 with |n| = 1, so a contrast with
+    /// c_Zᵀn ≠ 0 has no information outside cluster k.
     pub(crate) null: Vec<(usize, Vec<f64>)>,
 }
 
-/// The CR2 pieces of `blocks` at M = `m` = (Σ_k X_kᵀΦ_k⁻¹X_k)⁻¹, or `None`
-/// when a λ is not finite and > 0 (an exact fit has σ̂² = 0), `m` is not
-/// finite and positive definite, or the spectrum leaves f64's range.
-pub(crate) fn cr2_pieces(blocks: &[ClusterBlock<'_>], m: MatRef<'_, f64>) -> Option<Cr2Pieces> {
-    cr2_pieces_with(blocks, m, DENSE)
+/// The CR2 pieces of `blocks` on Z = X R⁻¹, R = `r` upper triangular with
+/// R M Rᵀ = I, M = (Σ_k X_kᵀΦ_k⁻¹X_k)⁻¹ (only its upper triangle is read), or
+/// `None` when a λ is not finite and > 0 (an exact fit has σ̂² = 0), R has a
+/// non-finite entry or a zero on its diagonal, or the spectrum leaves f64's
+/// range.
+pub(crate) fn cr2_pieces(blocks: &[ClusterBlock<'_>], r: MatRef<'_, f64>) -> Option<Cr2Pieces> {
+    cr2_pieces_with(blocks, r, DENSE)
 }
 
 /// [`cr2_pieces`] with `dense` in place of [`DENSE`].
 pub(crate) fn cr2_pieces_with(
     blocks: &[ClusterBlock<'_>],
-    m: MatRef<'_, f64>,
+    r: MatRef<'_, f64>,
     dense: (usize, f64),
 ) -> Option<Cr2Pieces> {
     let (lo, hi) = blocks
@@ -100,38 +116,69 @@ pub(crate) fn cr2_pieces_with(
     if !(lo > 0.0 && hi.is_finite()) {
         return None;
     }
-    // A_k is the same for Φ_k/s, so the pieces run on Φ_k/s and M/s, s = 4^k
-    // (exact) near the middle of λ's range, and E Φ Eᵀ, φ and n are scaled
-    // back: the pole bounds then do not depend on the scale of y.
-    let r = 2f64.powi(((lo.log2() + hi.log2()) / 4.0).round() as i32);
-    let s = r * r;
+    let p = r.nrows();
+    // No sign is assumed on R's diagonal: a factor from a Givens QR may carry
+    // negative entries there.
+    if !(0..p).all(|j| r[(j, j)] != 0.0 && (0..=j).all(|i| r[(i, j)].is_finite())) {
+        return None;
+    }
+    // Z_k = X_k R⁻¹: Rᵀ z = x per row, a forward solve.
+    let n: usize = blocks.iter().map(|b| b.r.len()).sum();
+    let mut z = Mat::<f64>::zeros(n, p);
+    let mut row = 0;
+    for b in blocks {
+        for i in 0..b.r.len() {
+            for j in 0..p {
+                let acc: f64 = (0..j).map(|k| r[(k, j)] * z[(row, k)]).sum();
+                z[(row, j)] = (b.x[(i, j)] - acc) / r[(j, j)];
+            }
+            row += 1;
+        }
+    }
+    // A_k is the same for Φ_k/s, so the pieces run on Φ_k/s and M/s = I/s,
+    // s = 4^k (exact) near the middle of λ's range, and E Φ Eᵀ, φ and n are
+    // scaled back: the pole bounds then do not depend on the scale of y.
+    let root = 2f64.powi(((lo.log2() + hi.log2()) / 4.0).round() as i32);
+    let s = root * root;
     let lam: Vec<Vec<f64>> = blocks
         .iter()
         .map(|b| b.lambda.iter().map(|l| l / s).collect())
         .collect();
     let u: Vec<Mat<f64>> = blocks
         .iter()
-        .map(|b| Mat::from_fn(b.u.nrows(), b.u.ncols(), |i, j| b.u[(i, j)] / r))
+        .map(|b| Mat::from_fn(b.u.nrows(), b.u.ncols(), |i, j| b.u[(i, j)] / root))
         .collect();
+    let mut at = 0;
     let scaled: Vec<ClusterBlock<'_>> = blocks
         .iter()
         .zip(&lam)
         .zip(&u)
-        .map(|((b, lambda), u)| ClusterBlock {
-            x: b.x,
-            r: b.r,
-            lambda,
-            u: u.as_ref(),
+        .map(|((b, lambda), u)| {
+            let len = b.r.len();
+            at += len;
+            ClusterBlock {
+                x: z.as_ref().subrows(at - len, len),
+                r: b.r,
+                lambda,
+                u: u.as_ref(),
+            }
         })
         .collect();
-    let ms = Mat::from_fn(m.nrows(), m.ncols(), |i, j| m[(i, j)] / s);
+    let ms = Mat::from_fn(p, p, |i, j| if i == j { s.recip() } else { 0.0 });
     let mut pc = scaled_pieces(&scaled, ms.as_ref(), dense)?;
     for (_, epe) in &mut pc.whole {
         *epe *= faer::Scale(s);
     }
     pc.row_phi.iter_mut().for_each(|v| *v *= s);
     for (_, nd) in &mut pc.null {
-        nd.iter_mut().for_each(|v| *v *= r);
+        nd.iter_mut().for_each(|v| *v *= root);
+    }
+    // t = R⁻¹, a back solve on the identity.
+    for j in 0..p {
+        for i in (0..=j).rev() {
+            let acc: f64 = (i + 1..=j).map(|k| r[(i, k)] * pc.t[(k, j)]).sum();
+            pc.t[(i, j)] = (f64::from(u8::from(i == j)) - acc) / r[(i, i)];
+        }
     }
     Some(pc)
 }
@@ -227,6 +274,7 @@ fn scaled_pieces(
     }
     let cols = |v: &[f64]| MatRef::from_column_major_slice(v, p, v.len() / p.max(1)).to_owned();
     Some(Cr2Pieces {
+        t: Mat::zeros(p, p),
         er: cols(&er),
         whole,
         row_e: cols(&row_e),
@@ -237,59 +285,39 @@ fn scaled_pieces(
 }
 
 impl Cr2Pieces {
-    /// The pieces on `p` columns, row and column `kept[j]` taking this record's
-    /// `j` and the rest zero: the record of a fit that dropped the other
-    /// columns. Row `x_k` is a design row, scattered the same way.
-    pub(crate) fn widen(self, kept: &[usize], p: usize) -> Cr2Pieces {
-        let rows = |a: Mat<f64>| {
-            let mut out = Mat::zeros(p, a.ncols());
-            for (r, &o) in kept.iter().enumerate() {
-                for k in 0..a.ncols() {
-                    out[(o, k)] = a[(r, k)];
-                }
+    /// The pieces of a fit on `p` columns that kept only the columns `kept`:
+    /// row `kept[j]` of `t` takes this record's row `j`, and a dropped
+    /// column's row of `t` is zero. The rest is in Z's coordinates, which the
+    /// dropped columns never enter.
+    pub(crate) fn widen(mut self, kept: &[usize], p: usize) -> Cr2Pieces {
+        let mut t = Mat::zeros(p, self.t.ncols());
+        for (r, &o) in kept.iter().enumerate() {
+            for k in 0..t.ncols() {
+                t[(o, k)] = self.t[(r, k)];
             }
-            out
-        };
-        let square = |a: Mat<f64>| {
-            let mut out = Mat::zeros(p, p);
-            for (r, &o) in kept.iter().enumerate() {
-                for (s, &q) in kept.iter().enumerate() {
-                    out[(o, q)] = a[(r, s)];
-                }
-            }
-            out
-        };
-        Cr2Pieces {
-            er: rows(self.er),
-            whole: self
-                .whole
-                .into_iter()
-                .map(|(f, epe)| (square(f), square(epe)))
-                .collect(),
-            row_e: rows(self.row_e),
-            row_x: rows(self.row_x),
-            row_phi: self.row_phi,
-            null: self
-                .null
-                .into_iter()
-                .map(|(k, n)| {
-                    let mut out = vec![0.0; p];
-                    for (r, &o) in kept.iter().enumerate() {
-                        out[o] = n[r];
-                    }
-                    (k, out)
-                })
-                .collect(),
         }
+        self.t = t;
+        self
     }
 
-    /// The CR2 covariance of β̂, Σ_k E_k r_k r_kᵀ E_kᵀ.
+    /// The CR2 covariance of β̂, Σ_k (t E_k r_k)(t E_k r_k)ᵀ.
     pub(crate) fn vcov(&self) -> Mat<f64> {
-        mul(self.er.as_ref(), self.er.transpose())
+        // Summed in [`Self::var`]'s order, so a unit contrast's variance is
+        // this diagonal to the bit.
+        let p = self.t.nrows();
+        let ter = Mat::from_fn(p, self.er.ncols(), |i, k| {
+            (0..self.t.ncols())
+                .map(|l| self.t[(i, l)] * self.er[(l, k)])
+                .sum::<f64>()
+        });
+        Mat::from_fn(p, p, |i, j| {
+            (0..ter.ncols()).map(|k| ter[(i, k)] * ter[(j, k)]).sum()
+        })
     }
 
-    /// cᵀ [`Self::vcov`] c, Σ_k (cᵀE_k r_k)².
+    /// cᵀ [`Self::vcov`] c, Σ_k (c_Zᵀ E_k r_k)².
     pub(crate) fn var(&self, c: &[f64]) -> f64 {
+        let c = self.whiten(c);
         (0..self.er.ncols())
             .map(|k| {
                 let a: f64 = c.iter().enumerate().map(|(i, v)| v * self.er[(i, k)]).sum();
@@ -298,31 +326,39 @@ impl Cr2Pieces {
             .sum()
     }
 
-    /// The Pustejovsky–Tipton df of the contrast `c`, (tr Q)² / tr(Q²), at the
-    /// fit's M = `m`.
-    pub(crate) fn df(&self, m: MatRef<'_, f64>, c: &[f64]) -> f64 {
-        // Q is quadratic in c and the df free of its scale: c taken (exactly,
-        // by a power of 2) to cᵀMc near 1 keeps (tr Q)² in range whatever the
-        // scale of y.
-        let cmc = qform(c, m);
+    /// The Pustejovsky–Tipton df of the contrast `c`, (tr Q)² / tr(Q²).
+    pub(crate) fn df(&self, c: &[f64]) -> f64 {
+        // Q is quadratic in c and the df free of its scale: c_Z taken
+        // (exactly, by a power of 2) to |c_Z|² = cᵀMc near 1 keeps (tr Q)² in
+        // range whatever the scale of y.
+        let c = self.whiten(c);
+        let cmc: f64 = c.iter().map(|v| v * v).sum();
         let k = if cmc > 0.0 && cmc.is_finite() {
             (cmc.log2() / 2.0).round() as i32
         } else {
             0
         };
         let c: Vec<f64> = c.iter().map(|v| v * 2f64.powi(-k)).collect();
-        let (t, t2) = self.q_traces(m, &c);
+        let (t, t2) = self.q_traces(&c);
         t * t / t2
     }
 
-    /// (tr Q, tr Q²) for Q = diag(u_kᵀΦ_k u_k) − U M Uᵀ, U's rows f_kᵀ = cᵀF_k,
-    /// by the low-rank form: tr(U M Uᵀ U M Uᵀ) = tr(M W M W), W = Σ_k f_k f_kᵀ.
-    fn q_traces(&self, m: MatRef<'_, f64>, c: &[f64]) -> (f64, f64) {
+    /// c_Z = tᵀc, the contrast `c` on β_Z.
+    fn whiten(&self, c: &[f64]) -> Vec<f64> {
+        (0..self.t.ncols())
+            .map(|j| c.iter().zip(self.t.col(j).iter()).map(|(a, b)| a * b).sum())
+            .collect()
+    }
+
+    /// (tr Q, tr Q²) for Q = diag(u_kᵀΦ_k u_k) − U Uᵀ at M = I, U's rows
+    /// f_kᵀ = c_Zᵀ F_k, by the low-rank form: tr(U Uᵀ U Uᵀ) = ‖W‖²_F,
+    /// W = Σ_k f_k f_kᵀ.
+    fn q_traces(&self, c: &[f64]) -> (f64, f64) {
         let p = c.len();
         let mut w = Mat::<f64>::zeros(p, p);
         let (mut sq, mut sq2, mut sfmf, mut sqfmf) = (0.0, 0.0, 0.0, 0.0);
         let mut add = |f: &[f64], q: f64| {
-            let fmf = qform(f, m);
+            let fmf: f64 = f.iter().map(|v| v * v).sum();
             sq += q;
             sq2 += q * q;
             sfmf += fmf;
@@ -347,19 +383,19 @@ impl Cr2Pieces {
             }
             add(&f, phi * a * a);
         }
-        let mw = mul(m, w.as_ref());
-        let trmwmw: f64 = (0..p)
+        let trww: f64 = (0..p)
             .flat_map(|i| (0..p).map(move |j| (i, j)))
-            .map(|(i, j)| mw[(i, j)] * mw[(j, i)])
+            .map(|(i, j)| w[(i, j)] * w[(i, j)])
             .sum();
-        (sq - sfmf, sq2 - 2.0 * sqfmf + trmwmw)
+        (sq - sfmf, sq2 - 2.0 * sqfmf + trww)
     }
 
-    /// Whether one cluster alone identifies the contrast `c`: cᵀn ≠ 0 for a
-    /// null direction n, read as (cᵀn)² > [`CUT`] · cᵀMc, the share of cᵀMc
-    /// along n (at most 1 by Cauchy–Schwarz, and free of β's coordinates).
-    pub(crate) fn identified_by_one(&self, m: MatRef<'_, f64>, c: &[f64]) -> bool {
-        let cmc = qform(c, m);
+    /// Whether one cluster alone identifies the contrast `c`: c_Zᵀn ≠ 0 for a
+    /// null direction n, read as (c_Zᵀn)² > [`CUT`] · |c_Z|², the share of
+    /// cᵀMc = |c_Z|² along the unit n (at most 1 by Cauchy–Schwarz).
+    pub(crate) fn identified_by_one(&self, c: &[f64]) -> bool {
+        let c = self.whiten(c);
+        let cmc: f64 = c.iter().map(|v| v * v).sum();
         self.null.iter().any(|(_, n)| {
             let cn: f64 = c.iter().zip(n).map(|(a, b)| a * b).sum();
             cn * cn > CUT * cmc

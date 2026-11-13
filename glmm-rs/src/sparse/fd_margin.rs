@@ -13,23 +13,21 @@
 //! step; `H·δ²` is exactly the raw central-difference NUMERATOR
 //! `f(+δ) − 2·f(0) + f(−δ)`, so no curvature has to be estimated separately.
 //!
-//! **Measured 2026-08-24, M does not predict step-invariance and is not a
-//! criterion.** The second difference annihilates whatever part of the exit
-//! error is constant or linear in γ, so only the error's CURVATURE across the
-//! stencil reaches the Hessian, while `M` divides by an error LEVEL. The two
-//! come apart in both directions on this corpus: on the sparse Gamma-log rung
-//! `M = 6.3` — nominally past the whole budget — while the δ and δ/2 standard
-//! errors agree to 2.0e-5 and show no noise growth at δ/4; on the dense probit
-//! rung `M = 2.8e-11` while those same SEs agree only to 1.4e-4 and the gap
-//! grows 4.7× per halving, the noise signature. Eleven orders of M separate two
-//! rungs whose step-invariance is ordered the other way round, so no threshold
-//! on M rescues it.
+//! **M does not predict step-invariance and is not a criterion.** The second
+//! difference annihilates whatever part of the exit error is constant or
+//! linear in γ, so only the error's CURVATURE across the stencil reaches the
+//! Hessian, while `M` divides by an error LEVEL. On this corpus `M` misses the
+//! noise: on the sparse rungs `sim_binomial_slope_crossed`, `sim_sparse_poisson`
+//! and `glmm_binomial`, `M = 0` while the gap between the δ and δ/2 standard
+//! errors grows 2.0×, 1.6× and 1.1× at the next halving, the noise signature
+//! (a clean O(δ²) stencil shrinks it 4×). No threshold on M rescues that.
 //!
 //! What does track step-invariance is `M*`, the same ratio built from the error
-//! that actually reaches the second difference — the shipped-band numerator
-//! against the reference-band numerator — which this module measures alongside
-//! `M` so the two can be compared. It is reported, not enforced: adopting it is
-//! a separate decision.
+//! that actually reaches the second difference (the shipped-band numerator
+//! against the reference-band numerator), which this module measures alongside
+//! `M` so the two can be compared. On this corpus `M*` is 1.1e-7 to 6.5e-5 on
+//! the five rungs whose gap grows, and at most 4.4e-10 on the others. It is
+//! reported, not enforced: adopting it is a separate decision.
 //!
 //! The reference deviance comes from PIRLS with its exit band shrunk until the
 //! penalized deviance stops changing, never from "the same solve a few decades
@@ -51,13 +49,11 @@ use serde_json::Value;
 use crate::fit::SizedSpec;
 use crate::formula::{lower, Column, Table};
 use crate::glmm::{
-    fd_mixed_diff, fd_second_diff, fill_packed_cols, glmm_laplace_deviance, pirls_tol_fd,
-    GlmmLayout, GlmmWorkspace, StructuredSchur, FD_STEP_BASE, SPARSE_FD_STEP_REL,
+    fd_mixed_diff, fd_second_diff, glmm_laplace_deviance, pirls_tol_fd, GlmmLayout, FD_STEP_BASE,
+    SPARSE_FD_STEP_REL,
 };
 use crate::test_support::table_from_rows;
-use crate::{
-    BinomialLink, Family, GammaLink, GroupIds, ModelSpec, NegBinomialLink, PoissonLink, WaldSe,
-};
+use crate::{BinomialLink, Family, GammaLink, GroupIds, ModelSpec, NegBinomialLink, PoissonLink};
 
 const MANIFEST: &str = include_str!("../../../validation/manifest.json");
 
@@ -66,10 +62,10 @@ const MANIFEST: &str = include_str!("../../../validation/manifest.json");
 /// penalized deviance stops changing at f64 resolution — but PIRLS's overshoot
 /// test shares this band, so at 0.0 a rise of one ULP near the mode counts as an
 /// overshoot and burns a step-halving; on a solve that opens AT the mode that can
-/// exhaust the halving cap and return the honest NaN. Measured 2026-08-24: `0.0`
-/// qualified on no rung of the corpus, 17 landed at 1e-15 or 1e-14, and the
-/// sparse Gamma rung needed 1e-11. The ladder stops at 1e-10 because a reference
-/// looser than two decades under the shipped band measures nothing. Which rung
+/// exhaust the halving cap and return the honest NaN. On the corpus `0.0`
+/// qualifies on no rung; 19 rungs land at 1e-15 and 4 at 1e-14. The ladder
+/// stops at 1e-10 because a reference looser than two decades under the
+/// shipped band measures nothing. Which rung
 /// was used is reported per cell, and the reference is separately checked for
 /// step-freeness before any M is computed from it.
 const REF_TOL_LADDER: [f64; 7] = [0.0, 1e-15, 1e-14, 1e-13, 1e-12, 1e-11, 1e-10];
@@ -566,72 +562,52 @@ fn probe(
     }
 }
 
-/// Fit through the GLMM kernel, then difference its own deviance evaluator at
-/// exactly the point and seed the shipped FD pass differences. Mirrors
-/// `build_glmm`'s workspace construction — the FD grid is only the shipped
-/// one if the design and the built `M` columns come out the same way.
+/// Fit through the shipped GLMM solve (`fit::run_glmm_on` on the test-only
+/// `fit::fit_glmm_build`, so in the units the shipped fit searches on), then
+/// difference its own deviance evaluator at exactly the point and seed the
+/// shipped FD pass differences.
 fn measure_fit(r: &Rung, sized: &SizedSpec, ids: &GroupIds) -> Measured {
     let (n, p) = (r.n, r.p);
-    let re = sized.spec.re.as_ref().expect("mixed rung");
-    let slope_cols: Vec<usize> = re.slopes.iter().map(|&c| c as usize).collect();
-    let extra_slope_cols: Vec<Vec<usize>> = re
-        .extra_groupings
-        .iter()
-        .map(|g| g.slopes.iter().map(|&c| c as usize).collect())
-        .collect();
-    let mut ws =
-        GlmmWorkspace::for_cluster_spec_ext(p, sized, n, &slope_cols, &extra_slope_cols, 1);
-    if let Some(w) = &r.weights {
-        // Mirrors `fit::glmm::prep_glmm_design`: Gamma runs on `ŵ = w/s`.
-        if matches!(sized.spec.family, crate::Family::Gamma { .. }) {
-            let s = crate::family::weight_scale(Some(w), n);
-            for (dst, &wi) in ws.prior_w[..n].iter_mut().zip(w.iter()) {
-                *dst = wi / s;
-            }
-        } else {
-            ws.prior_w[..n].copy_from_slice(w);
-        }
-        ws.weighted = true;
-    }
-    ws.offset = r.offset.clone();
-    let x_mat = Mat::<f64>::from_fn(n, p, |i, j| r.x[i * p + j]);
-    fill_packed_cols(&mut ws, &ids.primary, &ids.extra, n);
-    ws.pattern.structured_schur = if ws.layout == GlmmLayout::Structured {
-        StructuredSchur::new(&ws.groupings, &ids.primary, &ids.extra, n)
-    } else {
-        None
-    };
-    let (beta_start, _) = crate::fit::glm_warm_start_beta(
-        sized.spec.family,
-        f64::NAN,
-        x_mat.as_ref(),
+    let opts = crate::FitOptions::default();
+    let (mut ws, x_mat, units) = crate::fit::fit_glmm_build(
+        &r.x,
         &r.y,
+        r.weights.as_deref(),
+        r.offset.as_deref(),
         n,
         p,
-        r.offset.as_deref(),
-    );
-    let targets: Vec<u32> = (0..p as u32).collect();
+        sized,
+        &ids.primary,
+        &ids.extra,
+        &opts,
+    )
+    .unwrap_or_else(|_| panic!("{}: degenerate design", r.name));
     // Force the FD arm: the probe MEASURES the FD stencil's margin, and the
     // blocked path ships the exact hyper-dual Hessian instead — without
     // the flag the `se_shipped` self-check below would compare the probe's FD
     // numbers against exact ones and fail at the size of the stencil's own
     // error, which is the quantity being measured.
     ws.fd.force_fd_hessian = true;
-    let fit = crate::glmm::fit_glmm(
+    let (converged, _) = crate::fit::run_glmm_on(
         &mut ws,
         x_mat.as_ref(),
         x_mat.as_ref().subcols(0, 0),
         &r.y,
+        r.offset.as_deref(),
+        n,
+        p,
+        &sized.spec,
         &ids.primary,
         &ids.extra,
-        &targets,
+        f64::NAN,
         None,
-        &beta_start,
-        n,
-        WaldSe::Hessian,
+        &opts.se_for.columns(p),
+        &opts,
         crate::standardize::ColumnScaling::IDENTITY,
-    );
-    assert!(fit.converged, "{}: fit must converge", r.name);
+        &units,
+    )
+    .converged_deviance();
+    assert!(converged, "{}: fit must converge", r.name);
     let mut se_shipped: Vec<f64> = (0..p).map(|j| ws.inference.var_diag[j].sqrt()).collect();
     // Mixed Gamma: the shipped β SE inverts the (θ, β) stencil with a trailing
     // `ln φ` row appended (`DispRow::Gamma` in `glmm/se.rs`), which this probe
