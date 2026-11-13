@@ -1,0 +1,122 @@
+[package]
+name = "glmm"
+version = "0.9.2"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = true
+description = "Standalone f64 GLMM fit kernels (OLS, GLM, LMM, GLMM) in pure Rust on faer — the validation-pinned numerics from the MCPower engine."
+keywords = ["statistics", "glmm", "regression", "mixed-models", "mle"]
+categories = ["science", "mathematics"]
+repository = "https://github.com/pawlenartowicz/glmm"
+# The crate lives in glmm-rs/; its README is the repository's.
+readme = "../README.md"
+
+[lib]
+crate-type = ["rlib"]
+
+[lints]
+workspace = true
+
+[features]
+# The R-style formula frontend (`glmm::formula`). ON by default so `cargo add glmm`
+# gets the API the Rust tutorial documents. `regex` — the only dep it adds — is
+# pulled in solely by this feature, so `default-features = false` gives the
+# formula-free kernel the parse-once/fit-many hot path wants, linking no regex.
+# CI asserts that (ci.yml "kernel links no regex"). Its formula door (`lower`,
+# `fit`, `fit_lowered`, `predict`, `Table`, `Column`, `Lowered`, `Model`,
+# `anova::{compare, term_tests, nesting}`, `pairwise`) is semver-covered, as
+# the matrix door (`fit`/`fit_with_start`, `predict` and its types, `Data`,
+# `ModelSpec`, `GroupIds`, `FitOptions`, `Fit` and its methods) is.
+default = ["formula"]
+formula = ["dep:regex"]
+# Unstable scratch-explicit hot-path surface (the loop tier: scratch-explicit
+# kernels and their workspaces). Capability-named, multi-consumer. OFF by
+# default and NOT part of the semver-covered surface.
+loop_advanced = []
+# String-typed fit orchestration shared by the FFI ports (`glmm-python`,
+# `glmm-r`): one definition of the family/link string vocabulary and the
+# result flattening both ports publish, instead of two mirrored copies, plus
+# the formula internals they use (`formula::parse`, `materialize`,
+# `label_ranef`, `anova::compare_stored`). OFF by default and, like
+# `loop_advanced`, NOT part of the semver-covered surface: its shape follows
+# the ports' needs. Needs `formula`, which `run_fit` lowers through.
+orchestrate = ["formula"]
+# Installs dhat as the test binary's #[global_allocator] for the `#[ignore]`
+# bounded-alloc tests. OFF by default: dhat locks a global mutex on every
+# allocation, which serializes the whole parallel test suite when it's always
+# installed. The `#[ignore]` lib tests serialize their own bodies via
+# `test_support::alloc_test_guard` (dhat counts process-wide), but that guard
+# doesn't reach libtest's own per-test thread spawn, so run with
+# `RAYON_NUM_THREADS=1 cargo test --features alloc-tests <name> -- --ignored
+# --test-threads=1` — both flags are needed, or stray blocks land in the count.
+alloc-tests = []
+# Dev-only optimizer instrumentation (`glmm::EvalCounters` on `Fit`): the
+# stage-1/stage-2 evaluation split, evaluations after the last incumbent
+# improvement, a PIRLS-iterations-per-evaluation histogram, AGQ evaluations x
+# nodes, and the searches run after a pin. OFF by default and, like
+# `loop_advanced` and `orchestrate`, NOT part of the semver-covered surface.
+# Zero cost when off: the contract lives in `src/counters.rs`'s module header;
+# the feature adds no dependency and no I/O, so the wasm and
+# no-default-features builds are unaffected.
+counters = []
+# Tier 2, the cross-engine tier: asserts the crate against the frozen lme4 /
+# MixedModels / GLMMadaptive goldens in `validation/goldens/` at `validation/grid/tol.R`'s
+# agreement bands. OFF by default because it is slow — it refits every golden
+# — and because CI runs the validated-answer tier instead. Reads frozen
+# JSON, so it needs neither R nor Julia. Named for the claim, not the cost, and
+# NOT an oracle run of the accuracy grid, which refits the references themselves
+# — a different act. Preferred over `#[ignore]` so the tier is
+# greppable and its absence from a run is visible rather than silent. Implies
+# `orchestrate`: the inference tier (`tests/inference_oracle.rs`) gates the
+# ports' interval function, which lives there.
+oracle-tests = ["orchestrate"]
+# The Monte Carlo tier: level studies checked against seeded bands. OFF by
+# default because it is slow. Compile-time gated rather than `#[ignore]`, so a
+# run without it is visible, never a silent skip. Runs locally at release.
+# Implies `formula`: the level study reads its designs through the formula
+# lowering, so the feature alone always compiles it. Implies `orchestrate`:
+# the weighted-cell checks fit through the ports' `run_fit` and
+# `run_compare`, whose default calls they check.
+montecarlo-tests = ["formula", "orchestrate"]
+# In-fit parallelism (AGQ cluster loop, FD-Hessian grid) via rayon's global pool.
+# OFF by default: a batch/MCPower caller running its own outer rayon loop over
+# many fits should pay nothing for this, not even rayon's per-split overhead.
+# Compile-excluded on wasm32 (`dep:rayon` only pulled in on non-wasm targets
+# below) — a no-op there, not a broken build. Gated at runtime by
+# `FitOptions::parallel_inner` even when the feature is compiled in.
+parallel = ["dep:rayon"]
+
+[dependencies]
+# Validation-stable numerics depend on these crates; `Cargo.lock` holds the
+# validated versions, and moving either in the lockfile re-runs validation.
+bobyqa = "0.3.2"   # `Bobyqa::minimize_with_radius` (the radius-tied stage-1 tolerance), `Config::prima_parity`
+pulp = "0.22.2"
+# Formula-parser only (`src/formula/parse.rs`); optional so the default-off kernel
+# never links it. Its MSRV (1.65) clears this crate's 1.85 floor.
+regex = { version = "1", optional = true }
+# p-value tails (`dist`) and the Philox stream (`rng`, through `rand_philox`):
+# they feed validated p-values and pinned Monte Carlo values. Caret on purpose,
+# floor 0.3.0 (the studentized range of the Tukey adjustment; its `rng` resolves
+# `rand_philox` 0.2); a release that moves those values gets the values re-pinned
+# (not the crate version), with a provenance line naming both crate versions,
+# never absorbed by widening a band. Unconditional;
+# its MSRV (1.85) matches this crate's floor.
+commonstats = { version = "0.3", default-features = false, features = ["dist", "rng"] }
+# The draws of `Simulator` (and the Monte Carlo tier's inverse links):
+# `libm::exp` gives the same last bit on every platform, where `f64::exp`
+# follows the platform's libm. Adds no package: `commonstats` already brings
+# `libm` into the lockfile.
+libm = "0.2.16"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+faer = "0.24"
+rayon = { version = "1", optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+faer = { version = "0.24", default-features = false, features = ["std", "sparse-linalg"] }
+
+[dev-dependencies]
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+dhat       = "0.3"
