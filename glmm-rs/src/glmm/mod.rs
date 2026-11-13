@@ -3655,8 +3655,8 @@ pub fn fit_glmm(
             // stay on the targets. Each column's solve is independent of the
             // others, so a target's values do not depend on the target set.
             for tj in 0..p {
-                for i in 0..p {
-                    ws.inference.fwd_solve[i] = map.rhs(tj, i);
+                for (i, v) in ws.inference.fwd_solve[..p].iter_mut().enumerate() {
+                    *v = map.rhs(tj, i);
                 }
                 if let Some(qr) = &qr {
                     qr.solve_row(&mut ws.inference.fwd_solve[..p]);

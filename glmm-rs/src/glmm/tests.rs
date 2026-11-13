@@ -2642,13 +2642,13 @@ fn blocked_pirls_matches_packed_slope_noextra() {
         // `ws` is the packed layout, `ws2` the blocked one: index the packed `u`
         // through the primary block's component-major order.
         let (qq, ss) = (ws2.groupings.primary_q, ws2.groupings.n_primary);
-        for c in 0..k {
+        for (c, &u2) in ws2.pirls.u[..k].iter().enumerate() {
             let pc = packed_u_index(qq, ss, c);
             assert!(
-                (ws.pirls.u[pc] - ws2.pirls.u[c]).abs() < 1e-7,
+                (ws.pirls.u[pc] - u2).abs() < 1e-7,
                 "{layout} u[{c}]: packed {} blocked {}",
                 ws.pirls.u[pc],
-                ws2.pirls.u[c]
+                u2
             );
         }
     }
@@ -3490,13 +3490,13 @@ fn structured_extras_matches_packed() {
         // `ws` is the packed layout, `ws2` the structured one: index the packed
         // `u` through the primary block's component-major order.
         let (qq, ss) = (ws2.groupings.primary_q, ws2.groupings.n_primary);
-        for c in 0..k {
+        for (c, &u2) in ws2.pirls.u[..k].iter().enumerate() {
             let pc = packed_u_index(qq, ss, c);
             assert!(
-                (ws.pirls.u[pc] - ws2.pirls.u[c]).abs() < 1e-7,
+                (ws.pirls.u[pc] - u2).abs() < 1e-7,
                 "{label} u[{c}]: packed {} structured {}",
                 ws.pirls.u[pc],
-                ws2.pirls.u[c]
+                u2
             );
         }
     }
@@ -3673,13 +3673,13 @@ fn structured_extras_matches_packed() {
         // `ws` is the packed layout, `ws2` the structured one: index the packed
         // `u` through the primary block's component-major order.
         let (qq, ss) = (ws2.groupings.primary_q, ws2.groupings.n_primary);
-        for c in 0..k {
+        for (c, &u2) in ws2.pirls.u[..k].iter().enumerate() {
             let pc = packed_u_index(qq, ss, c);
             assert!(
-                (ws.pirls.u[pc] - ws2.pirls.u[c]).abs() < 1e-7,
+                (ws.pirls.u[pc] - u2).abs() < 1e-7,
                 "{label} u[{c}]: packed {} structured {}",
                 ws.pirls.u[pc],
-                ws2.pirls.u[c]
+                u2
             );
         }
     }
@@ -3938,9 +3938,7 @@ fn structured_cold_start_overshoot_is_finite() {
     );
     // θ = 1.0 for every component (INDEX, BROOD, LOCATION); β = 0 cold start.
     let nt = ws.n_theta;
-    for t in 0..nt {
-        ws.params[t] = 1.0;
-    }
+    ws.params[..nt].fill(1.0);
     for j in 0..p {
         ws.params[nt + j] = 0.0;
     }
@@ -5103,9 +5101,7 @@ fn pirls_structured_profile_beta_reaches_pql_stationarity() {
     );
     let nt = ws.n_theta;
     // Blind θ (one scalar per component: INDEX, BROOD, LOCATION); β seed = 0.
-    for t in 0..nt {
-        ws.params[t] = 0.5;
-    }
+    ws.params[..nt].fill(0.5);
     let mut beta = vec![0.0_f64; p];
     {
         let GlmmWorkspace {

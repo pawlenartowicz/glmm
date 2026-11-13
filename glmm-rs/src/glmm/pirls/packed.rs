@@ -847,8 +847,8 @@ mod tests {
         crate::sparse::fill_lambda_small(&[0.5], &g, &mut packed.lam_small);
         fill_m_vals(&mut packed, &g, &[], n);
         // Intercept-only primary: one nonzero per row, at that row's cluster.
-        for i in 0..n {
-            packed.m_cols[i] = (i % s) as u32;
+        for (i, m) in packed.m_cols[..n].iter_mut().enumerate() {
+            *m = (i % s) as u32;
         }
         let width = packed.width;
         let y = vec![1.0; n];

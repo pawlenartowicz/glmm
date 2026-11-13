@@ -21,7 +21,9 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # ── fmt + clippy + the regex-free-kernel guard, on stable ─────────────────
+  # ── fmt + clippy + the regex-free-kernel guard, on the pinned toolchain ───
+  # Rust is pinned like wasmtime and ruff below, so a new release cannot break
+  # CI mid-release. Move the pin on purpose and fix what the new clippy flags.
   # Split out from the #[test] suite so the four feature-variant test runs can
   # go wide in a matrix (below) instead of recompiling serially behind clippy.
   lint:
@@ -30,7 +32,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.100.0
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
@@ -105,7 +107,7 @@ jobs:
           - { name: orchestrate, flags: "--features orchestrate" }
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.100.0
       - uses: Swatinem/rust-cache@v2
       - name: test (${{ matrix.name }})
         # --no-fail-fast: every target reports, so an integration test is not
@@ -137,7 +139,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.100.0
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
@@ -169,7 +171,7 @@ jobs:
           - { name: simd128, rustflags: "-C target-feature=+simd128" }
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.100.0
         with:
           targets: wasm32-wasip1
       - uses: Swatinem/rust-cache@v2
@@ -193,7 +195,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.100.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo publish -p glmm --dry-run
 
@@ -234,7 +236,7 @@ jobs:
             exit 1
           fi
           echo "No external statistics engine is called by glmm-r/tests/ or loaded by glmm-r/R/."
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.100.0
       # The real compile happens later, inside the unpacked tarball under
       # $RUNNER_TEMP — a path that does not exist yet and has no stable
       # lockfile to key on. Default settings still warm ~/.cargo's registry
@@ -309,7 +311,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.100.0
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
         with:
@@ -367,7 +369,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.100.0
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
         with:

@@ -5422,9 +5422,11 @@ fn fit_sparse_lmm_weighted_matches_lme4() {
             f.se[j]
         );
     }
+    // Both routes reach the same deviance (to 4e-12), but tau2 sits on a flat
+    // optimum: wasm32 with simd128 puts tau2[0] 1.4e-6 apart.
     for k in 0..f.tau2.len() {
         assert!(
-            (f_forced.tau2[k] - f.tau2[k]).abs() < 1e-6,
+            (f_forced.tau2[k] - f.tau2[k]).abs() < 5e-6,
             "forced-sparse-tail tau2[{k}] {} vs unforced {}",
             f_forced.tau2[k],
             f.tau2[k]

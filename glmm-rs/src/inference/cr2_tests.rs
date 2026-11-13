@@ -388,7 +388,8 @@ fn g7_rank_of_u_matches_dense() {
         }
     }
     eprintln!("rank of U, worst gap to dense {worst:.2e}");
-    assert!(worst <= 4.2e-13, "worst gap {worst:.2e}");
+    // wasm32 with simd128 gives 7.2e-13 on the seed-1 "zero RE variance" case.
+    assert!(worst <= 1e-12, "worst gap {worst:.2e}");
 }
 
 /// Six clusters of eight rows, random intercept; X = [1, x1, t] with t = 1 in

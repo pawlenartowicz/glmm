@@ -832,15 +832,9 @@ fn suff_stats_multi_accumulators() {
     suff.add_rows_multi(x.as_ref(), x.as_ref().subcols(0, 0), &y, &pid, &eids, None);
     // One full-factorial block: every primary level has 8 rows, every
     // child 4, every crossed level 12.
-    for f in 0..6 {
-        assert_eq!(suff.counts[f], 8.0);
-    }
-    for c in 6..18 {
-        assert_eq!(suff.counts[c], 4.0);
-    }
-    for b in 18..22 {
-        assert_eq!(suff.counts[b], 12.0);
-    }
+    assert_eq!(suff.counts[0..6], [8.0; 6]);
+    assert_eq!(suff.counts[6..18], [4.0; 12]);
+    assert_eq!(suff.counts[18..22], [12.0; 4]);
     // Crossed co-occurrence: each (primary, crossed) pair shares exactly
     // 2 rows in a full factorial of 6·4·2.
     assert_eq!(suff.zx[(0, 0)], 2.0);
