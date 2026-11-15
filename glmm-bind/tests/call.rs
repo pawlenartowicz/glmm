@@ -480,3 +480,58 @@ fn pairwise_notes_count_each_by_groups_family() {
         .concat()
     );
 }
+
+/// R counts the design column from 1, as it counts rows; `row_index` renames
+/// the row only.
+#[test]
+fn a_design_refusal_counts_its_column_from_row_base() {
+    let data = |x: Vec<f64>, z: Vec<f64>| {
+        let numeric = rec(vec![
+            (
+                "y",
+                Value::Vec(vec![1.0, 2.5, 2.0, 4.0, 5.5, 5.0, 6.5, 8.0]),
+            ),
+            ("x", Value::Vec(x)),
+            ("z", Value::Vec(z)),
+        ]);
+        let factors = rec(vec![(
+            "g",
+            Value::Factor {
+                levels: vec!["a".into(), "b".into(), "c".into(), "d".into()],
+                codes: vec![0, 0, 1, 1, 2, 2, 3, 3],
+            },
+        )]);
+        (numeric, factors)
+    };
+    let plain = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+    let mut wide = plain.clone();
+    wide[3] = 2e100;
+
+    let (numeric, factors) = data(wide.clone(), plain.clone());
+    let e = call(Port::R, "fit", fit_args("y ~ x", numeric, factors, 1)).unwrap_err();
+    assert_eq!(e.code, "fit_error");
+    assert_eq!(e.row, Some(4));
+    assert_eq!(
+        e.message,
+        "x must be finite with |x| <= 1e100 (row 4, column 2, value 2e100; glmm::limits::MAX_DATA_ABS)"
+    );
+
+    let (numeric, factors) = data(plain.clone(), wide.clone());
+    let e = call(
+        Port::R,
+        "fit",
+        fit_args("y ~ x + (0 + z | g)", numeric, factors, 1),
+    )
+    .unwrap_err();
+    assert_eq!(
+        e.message,
+        "re_columns must be finite with |re_columns| <= 1e100 (row 4, column 1, value 2e100; glmm::limits::MAX_DATA_ABS)"
+    );
+
+    let (numeric, factors) = data(wide, plain);
+    let mut args = fit_args("y ~ x", numeric, factors, 1);
+    args.push("row_index", Value::IntVec((100..108).collect()));
+    let e = call(Port::R, "fit", args).unwrap_err();
+    assert_eq!(e.row, Some(103));
+    assert!(e.message.contains("(row 103, column 2,"), "{}", e.message);
+}

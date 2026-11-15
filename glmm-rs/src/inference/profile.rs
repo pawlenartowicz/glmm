@@ -8,9 +8,12 @@
 //!
 //! Every interval is read off the ML deviance: a REML fit is refitted by ML
 //! first, as lme4's profile does, and the intervals report the ML estimates.
-//! The variance parameters are on lme4's scale (SDs and correlations); a
-//! coefficient is held through the Schur complement of the fixed-effect
-//! block, so it needs no refit with its column dropped. Both objectives are
+//! The variance parameters are reported and held on lme4's scale (SDs and
+//! correlations); while one is held, σ and its own block are searched on that
+//! scale and every other block on the fit's own θ̃, which does not depend on
+//! where a predictor's zero is (`crate::lmm::profile`). A coefficient is held
+//! through the Schur complement of the fixed-effect block, so it needs no
+//! refit with its column dropped. Both objectives are
 //! evaluated on the LMM kernel the ML fit leaves behind.
 //!
 //! A bound is a root of `ζ(v) = ±z`, found by Brent's method once the side is
@@ -25,7 +28,7 @@
 use std::fmt;
 
 use super::tails::normal_quantile;
-use crate::fit::{detect_aliased, fit_cold_keep_workspace, validate};
+use crate::fit::{detect_aliased, fit_keep_workspace, validate};
 use crate::lmm::profile::ProfileKernel;
 use crate::{ColumnId, Data, Design, Family, Fit, FitError, FitOptions, ModelSpec, ReTerm};
 
@@ -350,7 +353,7 @@ pub(crate) fn profile_on(
         .into());
     }
 
-    let (fit, mut fws) = fit_cold_keep_workspace(data, spec, &opts);
+    let (fit, mut fws) = fit_keep_workspace(data, spec, None, &opts);
     if !fit.converged() {
         return Err(ProfileError::NotConverged);
     }
@@ -493,7 +496,7 @@ fn var_bound(
     z: f64,
     toward: Toward<'_>,
 ) -> Result<f64, ProfileError> {
-    let zeta = path(z, base, param, est.to_vec(), |v, start| {
+    let zeta = path(z, base, param, k.start(i), |v, start| {
         k.hold_var(i, v, start)
     });
     bound(z, est[i], toward, zeta)
@@ -505,7 +508,11 @@ fn var_bound(
 /// `|ζ| < z`, the first from `start`: the path walks out from the estimate,
 /// and an argmin past the bound (a limit, an overshoot of the root search)
 /// is never a start, since one on a variance's boundary, an SD at 0, can
-/// hold the search there.
+/// hold the search there. Walking out can follow a local minimum of the held
+/// problem away from the global one, so once the path has moved, each point
+/// also runs a held search from `start` and keeps the lower of the two
+/// minima; a search that did not converge never wins. This roughly doubles
+/// the held searches of a side whose path leaves the estimate.
 pub(super) fn path(
     z: f64,
     base: f64,
@@ -514,10 +521,20 @@ pub(super) fn path(
     mut hold: impl FnMut(f64, &mut [f64]) -> (f64, bool),
 ) -> impl FnMut(f64) -> Result<Option<f64>, ProfileError> {
     let mut trial = start.clone();
+    let mut alt = start.clone();
+    let origin = start.clone();
     let mut inner = start;
     move |v| {
         trial.copy_from_slice(&inner);
-        let (d, ok) = hold(v, &mut trial);
+        let (mut d, mut ok) = hold(v, &mut trial);
+        if inner != origin {
+            alt.copy_from_slice(&origin);
+            let (d2, ok2) = hold(v, &mut alt);
+            if ok2 && (!ok || d2 < d) {
+                (d, ok) = (d2, ok2);
+                trial.copy_from_slice(&alt);
+            }
+        }
         let r = zeta_of(d, ok, base, param)?;
         if r.is_some_and(|r| r < z) {
             inner.copy_from_slice(&trial);

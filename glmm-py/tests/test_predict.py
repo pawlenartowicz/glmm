@@ -207,9 +207,8 @@ def test_a_crossed_fit_round_trips_its_stored_covariances():
 
 
 def test_a_nested_slope_model_predicts_the_same_in_either_order():
-    # Children `n` nested in `g`, 2 or 3 per parent; the slope-last spelling
-    # is nested by the fit after it moves `g` first, the slope-first one by
-    # the formula front end.
+    # Children `n` nested in `g`, 2 or 3 per parent; the fit nests both
+    # spellings, moving `g` first in the slope-last one.
     rng = np.random.default_rng(20261111)
     kids = [(g, k) for g in range(12) for k in range(2 if g < 6 else 3)]
     rows = [(g, k) for g, k in kids for _ in range(10)]

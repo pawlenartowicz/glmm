@@ -16,22 +16,29 @@ const MIXED_TOL: f64 = 1e-7;
 /// One seeded dataset: `[1, x]` rows, weights spanning `[scale, scale·spread]`
 /// (both ends attained), noise variance `(w/scale)^(−delta0)`, and with
 /// `groups > 0` a random intercept of SD 0.8 on `i % groups`.
-struct Set {
-    x: Vec<f64>,
-    y: Vec<f64>,
-    w: Vec<f64>,
-    ids: GroupIds,
-    n: usize,
+pub(super) struct Set {
+    pub(super) x: Vec<f64>,
+    pub(super) y: Vec<f64>,
+    pub(super) w: Vec<f64>,
+    pub(super) ids: GroupIds,
+    pub(super) n: usize,
     groups: usize,
 }
 
-fn normal(st: &mut u64) -> f64 {
+pub(super) fn normal(st: &mut u64) -> f64 {
     let u1 = 0.5 * (lcg(st) + 1.0) + 1e-12;
     let u2 = 0.5 * (lcg(st) + 1.0);
     (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
 }
 
-fn dataset(seed: u64, n: usize, groups: usize, scale: f64, spread: f64, delta0: f64) -> Set {
+pub(super) fn dataset(
+    seed: u64,
+    n: usize,
+    groups: usize,
+    scale: f64,
+    spread: f64,
+    delta0: f64,
+) -> Set {
     let mut st = seed;
     let u: Vec<f64> = (0..groups.max(1)).map(|_| 0.8 * normal(&mut st)).collect();
     let mut x = Vec::with_capacity(2 * n);
@@ -61,7 +68,7 @@ fn dataset(seed: u64, n: usize, groups: usize, scale: f64, spread: f64, delta0: 
 }
 
 impl Set {
-    fn spec(&self) -> ModelSpec {
+    pub(super) fn spec(&self) -> ModelSpec {
         if self.groups > 0 {
             ModelSpec::mixed(Family::Gaussian, ReStructure::intercept())
         } else {
@@ -170,23 +177,23 @@ fn reml_search_reaches_the_grid_best() {
         }
     }
     // Spread 1e16 with the profile peaking near δ = 1.5: from δ ≈ 0.6 the
-    // inner fits end on the θ limit or on the exact-fit floor, below the
-    // profile by 0.2 to 1300, so the fit at 1.5 and the fit at δ̂ (0.83) say so.
+    // inner fits need the QR kernel and the rescale retry. δ̂ and its
+    // log-likelihood against the 110-digit REML maximum (δ̂ ≈ 1.502, loglik
+    // 1601.86; `HI_PREC_REF`).
     let rough = dataset(13, 150, 10, 1.0, 1e16, 1.5);
-    let at = rough.fit(&FitOptions {
-        weight_power: Some(WeightPower::Fixed(1.5)),
-        ..FitOptions::default()
-    });
-    let notes = &at.diagnostics.notes;
-    assert!(
-        notes.iter().any(|n| matches!(n, Note::PrecisionLimited)),
-        "{notes:?}"
-    );
     let fit = rough.fit(&FitOptions::default());
-    assert!(fit.converged() && fit.loglik().is_finite());
+    assert!(fit.converged(), "{:?}", fit.diagnostics.notes);
+    assert!(
+        (fit.weight_power() - 1.502).abs() <= 0.01,
+        "δ̂ = {}",
+        fit.weight_power()
+    );
+    assert!((fit.loglik() - 1601.86).abs() <= 0.01, "{}", fit.loglik());
     let notes = &fit.diagnostics.notes;
     assert!(
-        notes.iter().any(|n| matches!(n, Note::PrecisionLimited)),
+        !notes
+            .iter()
+            .any(|n| matches!(n, Note::WeightPowerSearchFailures { .. })),
         "{notes:?}"
     );
 }
@@ -219,53 +226,15 @@ fn a_pin_that_costs_deviance_is_undone() {
     );
 }
 
-/// Spread 1e16 at δ = −2 by REML: from a warm start θ = 10 or 100 the search
-/// stops at θ̂ ≈ 1e9 (caller units). There the intercept's pivot of X′V⁻¹X is
-/// the difference of two numbers near 2.9e16 and comes out as a few units in
-/// their last place, so the deviance is noise (loglik −2450.78 and −2474.29
-/// against −2311.64 at the optimum). r² is fine there, so only the pivot term
-/// of the estimate sees it. The δ = −1.5 cold fit (loglik −1685.894956) is a
-/// near-optimum fit with a small θ and gets no note. Measured 2026-11-08: pivot
-/// terms 20.7 (θ = 10) and 10.4 (θ = 100); before the pivot term neither fit
-/// carried a note.
-#[test]
-fn a_fit_stopped_in_the_pivot_noise_is_precision_limited() {
-    let set = dataset(13, 150, 10, 1.0, 1e16, 1.5);
-    for (delta, start, limited) in [
-        (-2.0, Some(10.0), true),
-        (-2.0, Some(100.0), true),
-        (-1.5, None, false),
-    ] {
-        let opts = FitOptions {
-            weight_power: Some(WeightPower::Fixed(delta)),
-            reml: Some(true),
-            ..FitOptions::default()
-        };
-        let fit = match start {
-            Some(t) => crate::fit_with_start(
-                &set.data(Some(&set.w)),
-                &set.spec(),
-                &StartValues::new(vec![], vec![t]),
-                &opts,
-            )
-            .unwrap(),
-            None => set.fit(&opts),
-        };
-        let notes = &fit.diagnostics.notes;
-        assert_eq!(
-            notes.iter().any(|n| matches!(n, Note::PrecisionLimited)),
-            limited,
-            "δ {delta} start {start:?}: {notes:?}"
-        );
-    }
-}
-
 /// The δ dataset (spread 1e16) with a second, crossed random intercept on
-/// `i % 7`, at δ = −2 by REML. The crossed shape keeps the Gram kernel, so
-/// this note is its only guard. Intercept-only crossed extras route to the
-/// dense kernel (`Solver::NoZ` in `classify_design`). Measured 2026-11-08:
-/// pivot term 3.7, r-term 1.9e-9; the loglik depends on the start (−2204.93
-/// cold, −2349.31 from θ = 10, −2386.48 from θ = 100).
+/// `i % 7`, at δ = −2 by REML, from the warm start θ = (10, 10). The crossed
+/// shape keeps the Gram kernel, so this note is its only guard.
+/// Intercept-only crossed extras route to the dense kernel (`Solver::NoZ` in
+/// `classify_design`). From this start the search stops at θ̂ near the start,
+/// in the pivot noise (loglik −2349.31, pivot term 10.0, measured
+/// 2026-11-15), neither on the box nor at an undone pin, so no retry runs.
+/// From the cold start the rescale retry moves the pin's θ near 1 and the fit
+/// is precise (loglik −2132.51, no note).
 #[test]
 fn a_crossed_fit_under_wide_weights_is_precision_limited() {
     let set = dataset(13, 150, 10, 1.0, 1e16, 1.5);
@@ -285,7 +254,8 @@ fn a_crossed_fit_under_wide_weights_is_precision_limited() {
     let data = Data::new(&set.x, &set.y, set.n, 2)
         .ids(&ids)
         .weights(&set.w);
-    let fit = crate::fit(&data, &spec, &opts).unwrap();
+    let start = StartValues::new(vec![], vec![10.0, 10.0]);
+    let fit = crate::fit_with_start(&data, &spec, &start, &opts).unwrap();
     let notes = &fit.diagnostics.notes;
     assert!(
         notes.iter().any(|n| matches!(n, Note::PrecisionLimited)),
@@ -312,7 +282,7 @@ fn a_sparse_routed_fit_computes_the_pivot_noise() {
         Family::Gaussian,
         ReStructure::intercept().extra(Grouping::crossed()),
     );
-    let (sized, ids, _) = spec_sized_from_ids(&spec, &ids);
+    let (sized, ids, _) = spec_sized_from_ids(&spec, &ids, true);
     let w: Vec<f64> = set.w.iter().map(|w| w.powf(-2.0)).collect();
     let opts = FitOptions {
         reml: Some(true),
@@ -691,4 +661,210 @@ fn the_fit_sets_the_level_its_estimate_reaches() {
         });
         assert!(levels(&fixed.diagnostics.notes).is_empty(), "{power}");
     }
+}
+
+/// The REML maxima of `dataset(13, 150, 10, 1.0, 1e16, 1.5)` at fixed δ, from
+/// an evaluation of the same criterion in 110-digit arithmetic
+/// (`validation/tools/prep/delta_reml_reference.py` on
+/// `validation/data/simulated/delta_weights_seed13.csv`), quoted to two
+/// decimals (so the band is ±0.01 on the log-likelihood). Its free maximum
+/// over δ is at δ̂ ≈ 1.502, loglik 1601.86 (the script's profile at δ = 1.500,
+/// 1.503 and 1.506 gives 1601.8485, 1601.8510 and 1601.7919). Under these weights the inner
+/// fits need the QR kernel (δ ≥ 0.7) or the rescale retry (δ ≤ −1.5, and the
+/// box from δ = 0.6 up).
+const HI_PREC_REF: [(f64, f64); 5] = [
+    (-2.0, -2311.64),
+    (-1.5, -1685.90),
+    (0.7, 867.16),
+    (1.0, 1195.00),
+    (1.5, 1601.85),
+];
+
+/// The data the `HI_PREC_REF` script read are the rows of the test dataset:
+/// x1 and g exactly, y and w within 1e-14 relative (the file was written on
+/// x86_64; `powf` and the normal draws can round differently on another
+/// platform, which moves the references far below their ±0.01 band).
+#[test]
+fn the_reference_data_is_the_test_dataset() {
+    let set = dataset(13, 150, 10, 1.0, 1e16, 1.5);
+    let csv = include_str!("../../../validation/data/simulated/delta_weights_seed13.csv");
+    let mut rows = 0;
+    for (i, line) in csv.lines().skip(1).enumerate() {
+        let f: Vec<f64> = line.split(',').map(|v| v.parse().unwrap()).collect();
+        let near = |a: f64, b: f64| (a - b).abs() <= 1e-14 * b.abs();
+        assert_eq!(f[0].to_bits(), set.x[2 * i + 1].to_bits(), "x1, row {i}");
+        assert!(
+            near(f[1], set.y[i]),
+            "y, row {i}: {} against {}",
+            f[1],
+            set.y[i]
+        );
+        assert!(
+            near(f[2], set.w[i]),
+            "w, row {i}: {} against {}",
+            f[2],
+            set.w[i]
+        );
+        assert_eq!(f[3] as usize, i % 10, "g, row {i}");
+        rows += 1;
+    }
+    assert_eq!(rows, set.n);
+}
+
+fn hi_prec_ref(delta: f64) -> f64 {
+    HI_PREC_REF.iter().find(|r| r.0 == delta).unwrap().1
+}
+
+/// A `Fixed(delta)` REML fit of `set` through the public door, cold or from
+/// the caller-unit θ start `start`.
+fn fixed_power_fit(set: &Set, delta: f64, start: Option<f64>) -> Fit {
+    let opts = FitOptions {
+        weight_power: Some(WeightPower::Fixed(delta)),
+        reml: Some(true),
+        ..FitOptions::default()
+    };
+    match start {
+        Some(t) => crate::fit_with_start(
+            &set.data(Some(&set.w)),
+            &set.spec(),
+            &StartValues::new(vec![], vec![t]),
+            &opts,
+        )
+        .unwrap(),
+        None => set.fit(&opts),
+    }
+}
+
+/// `Fixed(1.5)`: θ̂ is past the box at the plain weight scale and the Gram
+/// deviance is lost in rounding there (r²/y′Wy about 1e-23), so the fit
+/// moves to the QR kernel and rescales. It reaches the reference, and σ̂²
+/// is near the generating residual variance at the weight scale's centre (1).
+#[test]
+fn fixed_power_one_point_five_reaches_the_reference() {
+    let set = dataset(13, 150, 10, 1.0, 1e16, 1.5);
+    let fit = fixed_power_fit(&set, 1.5, None);
+    assert!(fit.converged(), "{:?}", fit.diagnostics.notes);
+    assert!(
+        (fit.loglik() - hi_prec_ref(1.5)).abs() <= 0.01,
+        "{}",
+        fit.loglik()
+    );
+    assert!((fit.dispersion - 1.0).abs() <= 0.1, "σ̂² {}", fit.dispersion);
+}
+
+/// `Fixed(1.0)` and `Fixed(0.7)`: both stop at the Gram precision wall on the
+/// Gram kernel alone; on the QR kernel they reach the reference.
+#[test]
+fn fixed_powers_one_and_point_seven_reach_the_reference() {
+    let set = dataset(13, 150, 10, 1.0, 1e16, 1.5);
+    for delta in [1.0, 0.7] {
+        let fit = fixed_power_fit(&set, delta, None);
+        assert!(fit.converged(), "δ {delta}");
+        assert!(
+            (fit.loglik() - hi_prec_ref(delta)).abs() <= 0.01,
+            "δ {delta}: {}",
+            fit.loglik()
+        );
+    }
+}
+
+/// δ ∈ {0.6, 0.7, 0.8, 0.95}: θ̂ in kernel units is past the box at the plain
+/// weight scale. From the cold start and the warm starts 0.1, 1, 10 and 100
+/// (caller units) no fit ends with `VarianceAtLimit`; at 0.7 every start
+/// reaches the reference, and at 0.8 and 0.95 every start's deviance agrees
+/// with the others within the largest of their precision estimates (glmm's
+/// own output: the fits are compared with each other). δ = 0.6 is fitted cold
+/// only, so it has no start to agree with: from a warm start its search can
+/// stop just inside the box (kernel θ̂ 999.995 against the box test's
+/// 999.999), where no retry starts and no note fires.
+#[test]
+fn upper_powers_leave_the_box_from_every_start() {
+    let set = dataset(13, 150, 10, 1.0, 1e16, 1.5);
+    let opts = FitOptions {
+        reml: Some(true),
+        ..FitOptions::default()
+    };
+    let mut checked = 0;
+    for delta in [0.6, 0.7, 0.8, 0.95] {
+        let w = super::working_weights(&set.w, delta);
+        let data = Data::new(&set.x, &set.y, set.n, 2)
+            .ids(&set.ids)
+            .weights(&w);
+        let starts: &[Option<f64>] = if delta == 0.6 {
+            &[None]
+        } else {
+            &[None, Some(0.1), Some(1.0), Some(10.0), Some(100.0)]
+        };
+        let mut rows = Vec::new();
+        for &start in starts {
+            let sv = start.map(|t| StartValues::new(vec![], vec![t]));
+            let (fit, mut fws) = super::fit_keep_workspace(&data, &set.spec(), sv.as_ref(), &opts);
+            let notes = &fit.diagnostics.notes;
+            assert!(
+                fit.converged() && !notes.iter().any(|n| matches!(n, Note::VarianceAtLimit)),
+                "δ {delta} start {start:?}: {notes:?}"
+            );
+            if delta == 0.7 {
+                assert!(
+                    fit.loglik() >= hi_prec_ref(0.7) - 0.01,
+                    "δ 0.7 start {start:?}: {}",
+                    fit.loglik()
+                );
+            }
+            rows.push((-2.0 * fit.loglik(), fws.lmm_endpoint_precision()));
+            checked += 1;
+        }
+        let e = rows.iter().fold(0.0f64, |m, r| m.max(r.1));
+        for &(d, _) in &rows {
+            assert!(
+                (d - rows[0].0).abs() <= e,
+                "δ {delta}: deviance {d} against {} (E {e:e})",
+                rows[0].0
+            );
+        }
+    }
+    assert_eq!(checked, 16);
+}
+
+/// δ = −2 and −1.5: the kernel θ̂ at the plain weight scale is tiny (about
+/// 8.5e-7 at δ = −2, below the final search radius and the pin threshold),
+/// so on the Gram search alone the endpoint depended on the start and the pin
+/// was undone with no note. The rescale retry brings θ near 1 and every start
+/// reaches the reference: the cold start and the caller-unit starts 1e-3,
+/// 1e-2, 0.1, 1, 10 and 100. From 10 and 100 the Gram search stops in the
+/// noise of the intercept's pivot (`LmmKernel::pivot_noise`), and the QR
+/// kernel takes over first. The δ = −1.5 cold fit carries no
+/// `PrecisionLimited`.
+#[test]
+fn negative_powers_reach_the_reference_from_every_start() {
+    let set = dataset(13, 150, 10, 1.0, 1e16, 1.5);
+    let mut checked = 0;
+    for delta in [-2.0, -1.5] {
+        for start in [
+            None,
+            Some(1e-3),
+            Some(1e-2),
+            Some(0.1),
+            Some(1.0),
+            Some(10.0),
+            Some(100.0),
+        ] {
+            let fit = fixed_power_fit(&set, delta, start);
+            assert!(fit.converged(), "δ {delta} start {start:?}");
+            assert!(
+                (fit.loglik() - hi_prec_ref(delta)).abs() <= 0.01,
+                "δ {delta} start {start:?}: {}",
+                fit.loglik()
+            );
+            if delta == -1.5 && start.is_none() {
+                let notes = &fit.diagnostics.notes;
+                assert!(
+                    !notes.iter().any(|n| matches!(n, Note::PrecisionLimited)),
+                    "{notes:?}"
+                );
+            }
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 14);
 }

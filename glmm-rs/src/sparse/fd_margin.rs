@@ -687,7 +687,7 @@ fn measure_fit(r: &Rung, sized: &SizedSpec, ids: &GroupIds) -> Measured {
 
 /// Which of the four report cells a rung falls in.
 fn cell_of(sized: &SizedSpec, family: Family) -> (&'static str, &'static str) {
-    let path = match crate::fit::classify_design(sized, 1) {
+    let path = match crate::fit::classify_design(sized, false) {
         crate::fit::Solver::Sparse => "sparse",
         crate::fit::Solver::NoZ => "dense",
     };
@@ -704,7 +704,7 @@ fn cell_of(sized: &SizedSpec, family: Family) -> (&'static str, &'static str) {
 /// probe is not differencing the shipped stencil and nothing below it means
 /// anything.
 fn measure_rung(r: &Rung) -> (&'static str, &'static str, Measured) {
-    let (sized, sids, _perm) = crate::fit::spec_sized_from_ids(&r.model, &r.ids);
+    let (sized, sids, _perm) = crate::fit::spec_sized_from_ids(&r.model, &r.ids, false);
     let (path, link) = cell_of(&sized, r.family);
     let meas = measure_fit(r, &sized, &sids);
     if let Some(se) = &meas.se[FULL] {

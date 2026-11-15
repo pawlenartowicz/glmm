@@ -59,7 +59,7 @@ same — only the factorisation route differs.
 it: closed-form collapse (balanced single intercept), block-diagonal PIRLS (no
 extra groupings), a core-plus-Schur factorisation (intercept-only
 crossed/nested extras), and a sparse-Z solver for everything over the dense
-envelope. lme4 and MixedModels.jl run one general solver for all shapes.
+envelope and for large crossed groupings that overlap little. lme4 and MixedModels.jl run one general solver for all shapes.
 
 **Why it is faster.** The common simulation shapes get a
 kernel specialised to their structure instead of paying general-solver

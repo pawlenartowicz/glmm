@@ -574,6 +574,16 @@ _EG = [f"g{i % 5}" for i in range(20)]
 _EOFF = {"g0": -3.0, "g1": -1.5, "g2": 0.0, "g3": 1.5, "g4": 3.0}
 _EY = [0.3 * x + ((i * 7) % 5 - 2) * 0.4 + _EOFF[g] for i, (x, g) in enumerate(zip(_EX, _EG))]
 _EMIXED = {"x": _EX, "g": _EG, "y": _EY}
+# _EMIXED with groups of rows (i // 2) % 5, so y - 0.3x is not constant within a
+# group: θ̂ is interior and σ̂² is not tiny (MIXED_PAIRS of test_warnings.py).
+_EG_PAIRS = [f"g{(i // 2) % 5}" for i in range(20)]
+_EPAIRS = {
+    "x": _EX,
+    "g": _EG_PAIRS,
+    "y": [
+        0.3 * x + ((i * 7) % 5 - 2) * 0.4 + _EOFF[g] for i, (x, g) in enumerate(zip(_EX, _EG_PAIRS))
+    ],
+}
 
 
 def test_lmm_fit_carries_coef_df_and_the_switch_turns_it_off():
@@ -598,7 +608,10 @@ def test_lmm_fit_carries_coef_df_and_the_switch_turns_it_off():
     # _EMIXED rides the theta limit, so a Warnings section follows the footnote.
     footer = off.summary_object().text().split("\n\nWarnings:\n")[0]
     assert footer.splitlines()[-1] == "df not computed (satterthwaite=False)"
-    np.testing.assert_allclose((off.confint()[:, 1] - off.beta) / off.se, 1.9599639845400534)
+    # The normal interval, on a fit with an interior θ̂: on _EMIXED se(x) is below
+    # the spacing of doubles at β̂, so the ratio there is round-off.
+    pairs = glmm.fit(_EPAIRS, "y ~ x + (1 | g)", satterthwaite=False)
+    np.testing.assert_allclose((pairs.confint()[:, 1] - pairs.beta) / pairs.se, 1.9599639845400534)
 
 
 def test_ols_and_glmm_fits_label_their_test():

@@ -52,7 +52,9 @@ the signed root of the deviance change reaches the normal quantile of
 \code{level}. The profiles are of the ML deviance: a REML fit is refitted by ML
 first, as lme4 does. An SD estimated at 0 has 0 as its lower bound, and a
 correlation whose profile stays inside the cutoff up to -1 or 1 has that
-limit. An undetermined bound is \code{NA}. A GLMM, a model without random
+limit. An undetermined bound is \code{NA}. A random-slope column far from zero
+can leave poor or undetermined bounds on the rows of its own random-effect
+block; centering the column avoids this. A GLMM, a model without random
 effects, and a design with an aliased column are refused with an error. The
 Python port's \code{Fit.profile_confint()} computes the same intervals.
 

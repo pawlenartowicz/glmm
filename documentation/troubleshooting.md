@@ -94,6 +94,12 @@ and still end up to about 10 units above its optimum, a relative error of a
 few times 1e-12. A difference of deviances between two such fits, as in a
 likelihood-ratio test, carries the same error.
 
+## A fit with two large crossed groupings is slow
+
+Some data link the levels of two crossed groupings at random, for example people who move between firms, fitted as `y ~ x + (1 | person) + (1 | firm)`. When both groupings have many levels, such a fit slows down sharply as the number of firms grows. Once the people are eliminated, two firms are linked whenever one person worked at both. With movers spread at random over all firms, the sparse Cholesky factor of this firm-by-firm block fills about 18% of a dense triangle, whatever the number of firms. So its memory grows with the square of the number of firms, and its time close to the cube.
+
+We measured this on simulated data with 15 people per firm, factoring the firm-by-firm block with CHOLMOD (R's `Matrix` package). From 2,500 to 20,000 firms the factor filled 17.5% to 18.7% of the dense triangle, and its time grew four to six times with each doubling. At 20,000 firms the factor held 35 million nonzeros and took 13.6 seconds, and a fit repeats this factorization at every step of its search. A different ordering or a different sparse library does not remove this fill-in, and glmm has no setting that avoids it.
+
 ## Quasi-likelihood dispersion: not implemented
 
 One combination has an approved design but no kernel support yet, and

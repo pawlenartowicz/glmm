@@ -4,16 +4,19 @@
 //! the workspace, accumulates the design, and maps `LmmFit` back to `Fit`.
 
 use crate::inference::Objective;
-use crate::lmm::{fit_lmm, Criterion, LmmFit, LmmGroupings, LmmKernel, LmmSuffStats, LmmWorkspace};
+use crate::lmm::{
+    fit_lmm, Criterion, LmmFit, LmmGroupings, LmmKernel, LmmSuffStats, LmmWorkspace, PIN_THETA,
+};
 use crate::ols::pair_contrast_norm_sq;
 use crate::standardize::{ColumnScaling, Units};
 // Used only by the test-only `fit_mle`/`fit_lmm_into` baselines. The stable core
-// reaches the LMM path via `accumulate_lmm_rows`/`lmm_run_on`, which take neither.
+// reaches the LMM path via `lmm_fit_with_retries`/`lmm_view`, which take neither.
 #[cfg(test)]
 use crate::StartValues;
 
 use super::common::{
-    assemble_varcorr, fill_se_by_predictor, nan_vcov, vcov_from_chol, FitDiagnostics,
+    assemble_varcorr, at_theta_limit, fill_se_by_predictor, nan_vcov, vcov_from_chol,
+    FitDiagnostics,
 };
 // Used only by the test-only `fit_mle` baseline, which builds its own throwaway
 // `Mat` — the stable core reaches the LMM path via `accumulate_lmm_rows`, which
@@ -70,10 +73,13 @@ pub(super) fn accumulate_lmm_rows(
     match &mut ws.kernel {
         // Fixed-design opt-in: the design part of the statistics is the last
         // call's (same x, ids, weights), only the response part is rebuilt.
-        LmmKernel::Dense { suff, .. } if same_design && n > 0 && p > 0 => {
+        LmmKernel::Dense { suff, fit } if same_design && n > 0 && p > 0 => {
+            // The QR rows hold the design and the response together: a draw
+            // on the QR kernel always takes the full accumulation.
+            debug_assert!(!fit.qr_on(), "the design shortcut on the QR kernel");
             suff.update_response(x_mat, z_mat, y, cluster_ids, extra_ids, w_for_rows);
         }
-        LmmKernel::Dense { suff, .. } => {
+        LmmKernel::Dense { suff, fit } => {
             suff.reset();
             if n > 0 && p > 0 {
                 // The fixed-effect factor U (`lmm::DesignQr`): on a
@@ -88,6 +94,11 @@ pub(super) fn accumulate_lmm_rows(
                     suff.reset();
                     suff.set_design_qr(x_mat, w_for_rows);
                     suff.add_rows_multi(x_mat, z_mat, y, cluster_ids, extra_ids, w_for_rows);
+                }
+                // The QR kernel, while on, is rebuilt from the same rows
+                // through the `U` just set.
+                if let Some(qr) = fit.qr.as_deref_mut().filter(|q| q.on) {
+                    qr.fill(suff, x_mat, z_mat, y, cluster_ids, extra_ids, w_for_rows);
                 }
             }
         }
@@ -128,7 +139,7 @@ pub(super) fn accumulate_lmm_rows(
     }
 }
 
-/// Borrowed result of [`lmm_run_on`]: the [`LmmFit`] summary plus the workspace
+/// Borrowed result of [`lmm_view`]: the [`LmmFit`] summary plus the workspace
 /// result slots the `Fit` assembly reads (β̂, per-predictor Var/z², the augmented
 /// factor, θ̂, groupings, row count). Lifetime ties back to the [`LmmWorkspace`]
 /// that owns the storage.
@@ -163,6 +174,9 @@ pub(crate) struct LmmResultView<'a> {
     /// The kernel at θ̂, for the conditional variances
     /// (`LmmKernel::condvar_blocks`).
     kernel: &'a LmmKernel,
+    /// `2^rescale_exp`: the kernel θ̂ times this is θ̂ at the plain weight
+    /// scale (`LmmWorkspace::rescale_exp`).
+    theta_scale: f64,
 }
 
 // Loop-tier read accessors (via the `FitView`/`loop_advanced` surface); the
@@ -221,16 +235,8 @@ impl LmmResultView<'_> {
             // The LMM's SEs come off the factor its criterion is evaluated on,
             // so an endpoint always has them.
             se_unavailable: false,
-            // r² is known to about the exact-fit floor, so the deviance's
-            // `ν·ln σ̂²` to about floor/σ̂²: past the GLMM's bound when the
-            // residuals are tiny against y′Wy (weights spanning ~1e16, or a
-            // near-exact fit), where θ̂ stops wherever the search meets the floor.
-            // REML adds the X̃′V⁻¹X̃ pivots' rounding (`pivot_noise`), a Gram
-            // difference too, which r² alone misses (a random intercept at
-            // large θ, where the intercept's pivot cancels).
-            precision_limited: self.fit.sigma_sq.is_finite()
-                && self.kernel.r_sq_floor() + self.fit.pivot_noise * self.fit.sigma_sq
-                    > crate::glmm::DEVIANCE_FLOOR_MAX * self.fit.sigma_sq,
+            // On the kernel and scale the fit ended on.
+            precision_limited: precision_limited(self.kernel, &self.fit),
             // No IRLS on the Gaussian LMM path.
             separated: false,
             gradient_search_fallback: self.fit.gradient_search_fallback,
@@ -259,6 +265,11 @@ impl LmmResultView<'_> {
     pub(crate) fn theta(&self) -> &[f64] {
         self.theta
     }
+    /// The factor that takes [`Self::theta`] to θ̂ at the plain weight scale,
+    /// a power of two (1 unless the rescale retry moved the scale).
+    pub(crate) fn theta_scale(&self) -> f64 {
+        self.theta_scale
+    }
     /// Grouping structure, for the random-effect maps θ̂ is read through.
     pub(crate) fn groupings(&self) -> &LmmGroupings {
         self.groupings
@@ -270,7 +281,9 @@ impl LmmResultView<'_> {
 /// ([`accumulate_lmm_rows`]), on the design `map` standardized. Warm start
 /// threads `theta` only — the LMM β is solved exactly given θ, so a β start is
 /// irrelevant; `None` (cold) uses the kernel's THETA0 blind start. `units` are
-/// the units the rows were accumulated in.
+/// the units the rows were accumulated in. One search, no retry: the test
+/// baselines' route; the fit core runs [`lmm_fit_with_retries`].
+#[cfg(test)]
 pub(crate) fn lmm_run_on<'a>(
     ws: &'a mut LmmWorkspace,
     target_indices: &[u32],
@@ -280,7 +293,16 @@ pub(crate) fn lmm_run_on<'a>(
     units: &'a Units,
 ) -> LmmResultView<'a> {
     let fit = fit_lmm(ws, target_indices, theta_start, hint, map, units);
+    lmm_view(ws, fit, map, units)
+}
 
+/// The view of a finished [`fit_lmm`] (or [`lmm_fit_with_retries`]) on `ws`.
+pub(crate) fn lmm_view<'a>(
+    ws: &'a LmmWorkspace,
+    fit: LmmFit,
+    map: &'a ColumnScaling,
+    units: &'a Units,
+) -> LmmResultView<'a> {
     LmmResultView {
         units,
         criterion: ws.kernel.criterion(),
@@ -299,7 +321,180 @@ pub(crate) fn lmm_run_on<'a>(
             LmmKernel::Sparse { .. } => None,
         },
         kernel: &ws.kernel,
+        theta_scale: 2f64.powi(ws.rescale_exp),
     }
+}
+
+/// Whether the deviance at the fit's endpoint is known only to worse than
+/// `DEVIANCE_FLOOR_MAX`. r² is known to about the kernel's exact-fit floor,
+/// so `ν·ln σ̂²` to about floor/σ̂²: past the bound when the residuals are tiny
+/// against y′Wy (weights spanning ~1e16, or a near-exact fit), where θ̂ stops
+/// wherever the search meets the floor. REML adds the X̃′V⁻¹X̃ pivots'
+/// rounding (`pivot_noise`), a Gram difference too, which r² alone misses (a
+/// random intercept at large θ, where the intercept's pivot cancels). On the
+/// QR kernel the floor is 0 and `pivot_noise` is the whole estimate. Read by
+/// the note and by the QR switch of [`lmm_fit_with_retries`].
+fn precision_limited(kernel: &LmmKernel, fit: &LmmFit) -> bool {
+    fit.sigma_sq.is_finite()
+        && kernel.r_sq_floor() + fit.pivot_noise * fit.sigma_sq
+            > crate::glmm::DEVIANCE_FLOOR_MAX * fit.sigma_sq
+}
+
+/// The diagonal θ̂ (kernel units) that starts a rescale round: the largest
+/// `|θ̂ᵢ|` on the box, or else, when the incumbent check undid a pin, the
+/// smallest nonzero `|θ̂ᵢ|`. A kept pin leaves no diagonal in (0,
+/// `PIN_THETA`] (`lmm::pin_endpoint`), so a diagonal there is a pin that was
+/// tried and undone. `None` when neither holds.
+fn rescale_trigger(g: &LmmGroupings, theta: &[f64]) -> Option<f64> {
+    let diag = || g.diagonal_theta().iter().map(|&i| theta[i].abs());
+    let hi = diag()
+        .filter(|&t| at_theta_limit(t))
+        .fold(f64::NAN, f64::max);
+    if !hi.is_nan() {
+        return Some(hi);
+    }
+    diag()
+        .any(|t| t > 0.0 && t <= PIN_THETA)
+        .then(|| diag().filter(|&t| t > 0.0).fold(f64::INFINITY, f64::min))
+}
+
+/// Rescale rounds at most: one common `s` moves every θ together, so a design
+/// whose components sit decades apart is not settled by more of them.
+const MAX_RESCALES: usize = 4;
+
+/// One Gaussian mixed fit with its two retries, on the rows `x_mat`, `z_mat`,
+/// the caller's `y` and `weights` (the fit reads `units.y(y)` and
+/// `units.weights(weights)`), the start and hint as [`fit_lmm`] takes them.
+///
+/// 1. Accumulate at the plain weight scale on the Gram kernel and search.
+/// 2. QR switch: on a finite endpoint whose deviance is known only to worse
+///    than `DEVIANCE_FLOOR_MAX` (`precision_limited`), on a shape the QR kernel
+///    covers, build the QR kernel from the rows and search again warm from
+///    θ̂. Accepted as it ends: the Gram deviance it would be compared with is
+///    not known to that precision.
+/// 3. Rescale: while a diagonal θ̂ is on the box or a pin was undone
+///    ([`rescale_trigger`], `t`), at most [`MAX_RESCALES`] times, move `s` to
+///    `s·4^−k`, `k = round(log₂ t)`, so ŵ becomes `ŵ·4^k` and θ̂ `θ̂·2^−k`
+///    exactly, re-accumulate and search warm from `θ̂·2^−k`. θ's search
+///    constants are absolute on the kernel θ, whose scale follows `s`; this
+///    brings the triggering θ̂ near 1. Keep-lower: a round whose criterion in
+///    caller units, `deviance + n·ln s`, is worse than the round before it is
+///    undone (that round's `s` restored, re-accumulated and searched warm from
+///    its θ̂), and the loop stops. The restored search pins again, so "never
+///    worse" holds to `PIN_DEVIANCE_SLACK`. After each kept round on the Gram
+///    kernel, step 2 runs again.
+///
+/// `n_eval` is the sum over every search; the `counters` feature reports the
+/// last search's counts. `ws.rescale_exp` and the QR switch are left as the
+/// fit ended, for the view and the next draw (`LmmWorkspace::retried`).
+#[allow(clippy::too_many_arguments)] // the accumulator's surface plus fit_lmm's
+pub(super) fn lmm_fit_with_retries(
+    ws: &mut LmmWorkspace,
+    units: &mut Units,
+    x_mat: faer::MatRef<'_, f64>,
+    z_mat: faer::MatRef<'_, f64>,
+    y: &[f64],
+    weights: Option<&[f64]>,
+    n: usize,
+    p: usize,
+    ids: &crate::GroupIds,
+    same_design: bool,
+    criterion: Criterion,
+    targets: &[u32],
+    theta_start: Option<&[f64]>,
+    hint: Option<&crate::optim::CurvatureHint>,
+    map: &ColumnScaling,
+) -> LmmFit {
+    let accumulate = |ws: &mut LmmWorkspace, units: &Units, same: bool| {
+        accumulate_lmm_rows(
+            ws,
+            x_mat,
+            z_mat,
+            units.y(y),
+            n,
+            p,
+            &ids.primary,
+            &ids.extra,
+            units.weights(weights),
+            same,
+            criterion,
+        );
+    };
+    // The criterion in caller units, up to the constant −Σ ln w.
+    let caller_dev = |fit: &LmmFit, units: &Units| fit.deviance + n as f64 * units.s().ln();
+    // A warm search from `ws.theta_warm`, moved out so `fit_lmm` can borrow
+    // the workspace and put back after, so no round allocates.
+    let search_warm = |ws: &mut LmmWorkspace, units: &Units, spent: &mut usize| {
+        let warm = std::mem::take(&mut ws.theta_warm);
+        let fit = fit_lmm(ws, targets, Some(&warm), None, map, units);
+        ws.theta_warm = warm;
+        *spent += fit.n_eval;
+        fit
+    };
+    let qr_switch = |ws: &mut LmmWorkspace, units: &Units, fit: &mut LmmFit, spent: &mut usize| {
+        if fit.deviance.is_finite()
+            && !ws.kernel.qr_on()
+            && ws.kernel.qr_covers()
+            && precision_limited(&ws.kernel, fit)
+        {
+            ws.kernel.start_qr(
+                x_mat,
+                z_mat,
+                units.y(y),
+                &ids.primary,
+                &ids.extra,
+                units.weights(weights),
+            );
+            ws.theta_warm.copy_from_slice(&ws.theta);
+            *fit = search_warm(ws, units, spent);
+        }
+    };
+
+    ws.kernel.stop_qr();
+    ws.rescale_exp = 0;
+    accumulate(ws, units, same_design);
+    let mut fit = fit_lmm(ws, targets, theta_start, hint, map, units);
+    let mut spent = fit.n_eval;
+    qr_switch(ws, units, &mut fit, &mut spent);
+    for _ in 0..MAX_RESCALES {
+        if !fit.deviance.is_finite() {
+            break;
+        }
+        let Some(t) = rescale_trigger(ws.kernel.groupings(), &ws.theta) else {
+            break;
+        };
+        let k = t.log2().round() as i32;
+        // A step that puts the largest component past the box cannot reach
+        // its optimum, so the round would only be undone.
+        let top = (ws.kernel.groupings().diagonal_theta().iter())
+            .map(|&i| ws.theta[i].abs())
+            .fold(0.0, f64::max);
+        if k == 0 || top * 2f64.powi(-k) > crate::lmm::THETA_HI {
+            break;
+        }
+        let (prev_dev, prev_s, prev_exp) = (caller_dev(&fit, units), units.s(), ws.rescale_exp);
+        ws.theta_prev.copy_from_slice(&ws.theta);
+        units.set_weight_scale(weights, n, prev_s * 4f64.powi(-k));
+        ws.rescale_exp += k;
+        accumulate(ws, units, false);
+        let theta_step = 2f64.powi(-k);
+        for (w, &t) in ws.theta_warm.iter_mut().zip(&ws.theta) {
+            *w = t * theta_step;
+        }
+        fit = search_warm(ws, units, &mut spent);
+        let now = caller_dev(&fit, units);
+        if prev_dev.is_finite() && (now.is_nan() || now > prev_dev) {
+            units.set_weight_scale(weights, n, prev_s);
+            ws.rescale_exp = prev_exp;
+            accumulate(ws, units, false);
+            std::mem::swap(&mut ws.theta_warm, &mut ws.theta_prev);
+            fit = search_warm(ws, units, &mut spent);
+            break;
+        }
+        qr_switch(ws, units, &mut fit, &mut spent);
+    }
+    fit.n_eval = spent;
+    fit
 }
 
 /// The design summary of [`Fit::design_summary`], copied out of the dense
@@ -323,10 +518,10 @@ fn design_summary(suff: &LmmSuffStats) -> DesignSummary {
 /// Maps an [`LmmResultView`] to the full stable `Fit`: SE from `var_diag`, tau2
 /// from θ̂, varcorr, vcov from the augmented factor, the deviance and loglik of
 /// the kernel's criterion (REML or ML), the conditional modes + per-row means,
-/// and, when `weights` is set, the −Σlog wᵢ weighted-deviance correction.
-/// On an unweighted fit whose only random term is one random intercept and
-/// which has a fixed-effect column, it also copies the design summary out of
-/// the accumulator.
+/// and, when the fit ran on weights ŵ, the −Σlog ŵᵢ weighted-deviance
+/// correction. On a fit that ran on no weights, whose only random term is one
+/// random intercept and which has a fixed-effect column, it also copies the
+/// design summary out of the accumulator.
 ///
 /// `x`/`z`/`offset`/`ids` are here for `fitted` (`o + Xβ̂ + Zb̂` needs the
 /// design rows, the row-major `n × s` random-effect-only columns `z` and the
@@ -552,7 +747,7 @@ pub(crate) fn lmm_view_to_fit(
         design_summary: match view.suff {
             Some(suff)
                 if suff.m > 1
-                    && weights.is_none()
+                    && view.units.weights(weights).is_none()
                     && view.groupings.primary_q == 1
                     && view.groupings.nested.is_none()
                     && view.groupings.crossed.is_empty() =>
@@ -594,9 +789,10 @@ pub(crate) fn lmm_view_to_fit(
     // above — every other field (β, se, vcov, tau2, varcorr) is correct on
     // σ̂²_int without it, since their formulas cancel the compensating factor
     // of `s` (the internal θ̂ carries √s: θ̂²·σ̂² = τ², σ̂²·(X'ŴX)⁻¹ = Var(β̂), …).
-    if let Some(w) = weights {
-        let s = view.units.s();
-        fit.deviance -= w.iter().map(|v| (v / s).ln()).sum::<f64>();
+    // ŵ is in use whenever `Units::weights` returns it, which includes an
+    // unweighted fit the rescale retry moved onto the constant ŵ = 1/s.
+    if let Some(w) = view.units.weights(weights) {
+        fit.deviance -= w.iter().map(|v| v.ln()).sum::<f64>();
         fit.loglik = super::common::lmm_loglik(fit.deviance, criterion.nu(n, p));
     }
     if opts.se_type == Some(SeType::Robust) && has_endpoint {
@@ -644,7 +840,8 @@ pub(crate) fn lmm_view_to_fit(
 /// dataset) of the design `map` scaled; `start` is in the caller's units. The
 /// weighted-deviance correction is inside `lmm_view_to_fit`, so callers must
 /// NOT re-apply it. Only the test-gated `fit_mle` baseline composes through
-/// this; the core calls `lmm_run_on`/`lmm_view_to_fit` directly.
+/// this, with no retry; the core calls `lmm_fit_with_retries`, `lmm_view` and
+/// `lmm_view_to_fit`.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)] // marshals the kernel's (ws, x, ids, n, p, opts, start, map) surface
 fn fit_lmm_into(
@@ -682,7 +879,7 @@ fn fit_lmm_into(
 /// `sparse` picks the kernel outright instead of asking `classify_design`, which
 /// is what makes this a forced baseline on either side of the router.
 /// Test-only baseline since the stable path dispatches through the unified core
-/// ([`super::core::fit_on`]) over `accumulate_lmm_rows`/`lmm_run_on`.
+/// ([`super::core::fit_on`]) over `lmm_fit_with_retries`/`lmm_view`.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)] // marshals the kernel's (x, y, n, p, spec, ids…) surface
 fn fit_mle(

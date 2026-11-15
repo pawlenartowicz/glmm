@@ -49,15 +49,7 @@ The recurring symbols on this page, defined once here before first use:
 Three real routing decisions sit between `fit`/`fit_with_start` and a returned
 `Fit`:
 
-1. **Solver class** — `classify_design` (`src/fit/mod.rs`) returns
-   `Solver::NoZ` (dense, bounded stack scratch) or `Solver::Sparse` (heap
-   sparse-Z). A design routes to `Sparse` iff it is over the dense envelope
-   (`extra_groupings.len() > MAX_EXTRA_GROUPINGS`, primary width
-   `q_p > MAX_PRIMARY_Q`, or any extra grouping width `q_g > MAX_EXTRA_Q` — the
-   caps in `src/consts.rs`), **or** any extra grouping carries a random slope,
-   **or** the total `Crossed` level count exceeds `MAX_CROSSED_LEVELS` (500).
-   Otherwise `NoZ`.
-   Before this check a lone slope grouping may be moved first ([dispatch map](algorithms.md#full-dispatch-map)).
+1. **Solver class** — `classify_design` (`src/fit/mod.rs`) returns `Solver::NoZ` (dense, bounded stack scratch) or `Solver::Sparse` (heap sparse-Z). A design routes to `Sparse` iff it is over the dense envelope (`extra_groupings.len() > MAX_EXTRA_GROUPINGS`, primary width `q_p > MAX_PRIMARY_Q`, or any extra grouping width `q_g > MAX_EXTRA_Q` — the caps in `src/consts.rs`), **or** any extra grouping carries a random slope, **or** the crossed tail is past its limit for the fit's `condvar`: with `condvar` on, more than `MAX_CROSSED_LEVELS` (500) `Crossed` levels; with `condvar` off, more than `DENSE_KERNEL_MAX_TAIL` (64) levels at a coupling fill below `DENSE_KERNEL_MIN_FILL` (0.023), or dense tail buffers past `DENSE_TAIL_MAX_BYTES` (1 GiB). Otherwise `NoZ`. Before this check the fit picks the reading and order of the groupings from the ids: nests kept up to 7 children per parent, then the grouping with the most columns first ([dispatch map](algorithms.md#full-dispatch-map)).
 2. **Kernel** — every Gaussian design goes to `accumulate_lmm_rows` +
    `lmm_run_on` (`src/fit/lmm.rs`) → `fit_lmm` (`src/lmm/mod.rs`), which
    evaluates the profiled objective of the fit's criterion through the dense
@@ -81,7 +73,7 @@ Three real routing decisions sit between `fit`/`fit_with_start` and a returned
 flowchart TD
     A["Gaussian, re: Some"] --> B{"classify_design"}
     B --> N["lmm_run_on -> fit_lmm"]
-    N -->|"Solver::Sparse: over envelope / slope on extra / >500 crossed levels"| S["sparse kernel: sparse_reml_deviance"]
+    N -->|"Solver::Sparse: over envelope / slope on extra / crossed tail past its limit"| S["sparse kernel: sparse_reml_deviance"]
     N -->|"Solver::NoZ: in envelope"| C{"reml_deviance sub-path"}
     C -->|"intercept-only primary, balanced"| CO["balanced collapse shortcut"]
     C -->|"slopes on the primary only, every G_g well conditioned"| PG["per-group regressions"]
@@ -350,8 +342,8 @@ variances take `c²`, the random effects `c`, and the deviance `+2ν·ln c`
 (`ν = n` on ML, `n − p` on REML). θ, relative to σ, does not move.
 
 The objective returns `f64::INFINITY` on any Cholesky failure or non-positive σ̂²
-(every kernel — dense, blocked and sparse — also on a residual r² ≤ dim·ε·yᵀy,
-an exact fit whose last pivot is round-off of either sign) — that value is the deviance failure surface BOBYQA is driven over.
+(every Gram kernel — dense, blocked and sparse — also on a residual r² ≤ dim·ε·yᵀy,
+an exact fit whose last pivot is round-off of either sign) — that value is the deviance failure surface BOBYQA is driven over. The QR kernel of [the precision retries](#precision-retries-the-qr-kernel-and-the-rescale) has no such floor test: it computes `r` directly, and fails only on a non-finite or zero pivot or `r = 0`.
 
 **Code**: `reml_deviance`, `reml_deviance_blocked`, `LmmSuffStats::add_rows_multi`
 (`src/lmm/kernel.rs`); `accumulate_lmm_rows`, `lmm_view_to_fit` (`src/fit/lmm.rs`); `sparse_reml_deviance`
@@ -653,6 +645,37 @@ the interior; the boundary behaviour is pinned by in-crate τ̂≈0 tests
 policy by `maxfun_cap_reports_honest_endpoint`, and the singular-fit handling
 by the reference engines flagging the same data.
 
+## Precision retries: the QR kernel and the rescale
+
+The Gram kernels read `r²` and the `X̃'V⁻¹X̃` pivots off differences of accumulated products, so each is known only to about ε times the products it came from. Under prior weights that span many decades two things go wrong (measured on a random-intercept fit, `dataset(13, 150, 10, 1.0, 1e16, 1.5)` in `src/fit/delta_tests.rs`):
+
+- **Rounding.** `r²` falls below the rounding of `y'Wy`, whose large part there is `Σŵb²`, which the response shift does not remove; the search stops at the exact-fit floor. Or a fixed-effect pivot cancels (an intercept beside a random intercept at large θ), the REML deviance jitters by about a unit, and the search stops in that noise. Both raise `precision_limited`.
+- **Scale.** θ's search constants (`THETA_HI`, `RHO_END`, `PIN_THETA`, `THETA0`) are absolute on the kernel θ, whose scale follows the weight scale `s` (`θ_kernel = θ_caller·√s`). θ̂ can then sit past the box, or below the final trust radius and the pin threshold, where the pin is tried and undone and the endpoint depends on the start.
+
+`fit::lmm::lmm_fit_with_retries` runs every fit of the fit core in this order:
+
+1. Accumulate at the plain weight scale on the Gram kernel and search, as above.
+2. **QR switch.** On a finite endpoint that `precision_limited` flags, on a shape the QR kernel covers, build the QR kernel from the rows and search again, warm from θ̂. The covered shapes are the dense family path: a primary grouping of any width up to `MAX_PRIMARY_Q`, with or without nested intercept children, weighted or not, with no crossed factor, no slope on an extra grouping, and at least one fixed-effect column. The switch is accepted as it ends, with no comparison against the Gram value, which by the trigger is not known to 0.01.
+3. **Rescale**, on every shape, sparse and crossed included. While the endpoint is finite and a diagonal θ̂ is on the box (the test of `note_theta_at_limit`, shared as `at_theta_limit`) or a pin was undone (a diagonal in `(0, PIN_THETA]`, which a kept pin never leaves), at most 4 times: with `t` that diagonal (the largest on the box, else the smallest nonzero) and `k = round(log₂ t)`, set `s′ = s·4^−k` in `Units` (`set_weight_scale`). Then `ŵ′ = ŵ·4^k` and `θ′ = θ̂·2^−k` exactly; the rows are accumulated again and the search runs warm from `θ′`. **Keep-lower:** the criterion in caller units, `deviance + n·ln s`, is compared with the round before; a worse round is undone (the previous `s` restored, the rows accumulated again, the search run warm from that round's θ̂) and the loop stops. The restored search pins again, so "never worse" holds to `PIN_DEVIANCE_SLACK`. After each kept round on the Gram kernel, step 2 runs again: a rescale can let the search walk to the precision wall.
+4. The fit reports the last search's endpoint, with `n_eval` the sum over every search (the `counters` feature reports the last search's counts). `variance_at_limit` and `precision_limited` are computed on the final kernel and scale, so they mean "still at the limit after the retries".
+
+A fit that triggers neither retry runs exactly the code it ran before, bit for bit, which covers the loop tier and WASM. One common `s` moves every θ together, so a design whose components sit decades apart is not settled by it; a round that would push the largest component past the box is skipped, the cap stops the loop and the notes report what is left. On a fit with no finite optimum (a residual variance going to zero) a round is usually better than the last, and the fit ends where the last kept search stopped. On the ports' MIXED fixture (`a_theta_without_a_finite_optimum_is_noted_and_an_interior_one_is_not`) each round lowers the criterion by about 194, and the last search stops inside the box, where `r` is so small that the QR deviance is itself lost in rounding: the fit ends with `precision_limited`. An unweighted fit that rescales runs on the constant `ŵ = 1/s′`: the same model, its deviance takes `−Σ ln ŵᵢ` and its σ̂² the factor `s′` as a weighted fit does, and it has no design summary. A search can stop just inside the box (within a few thousandths of `THETA_HI` on the kernel θ, outside the box test's `1e-6` relative band), where no rescale starts and no note fires.
+
+**The QR kernel.** The same criterion, read off orthogonal factorizations of the penalized least-squares system (Bates & DebRoy 2004; Bates et al. 2015, §3)
+
+```
+[ √Ŵ·Z·Λ   √Ŵ·X̃   √Ŵ·y ]
+[   I        0      0   ]
+```
+
+Once per accumulation (every rescale round refills it), each primary level's rows `√ŵᵢ·[z_f,i | x̃ᵢ | yᵢ]` are merged one at a time by Givens rotations into an upper triangle of width `w + m` (`w` the family width, `m = p + 1`); only its first `w` rows are kept per level, `w(w+1)/2 + w·m` numbers, and the rest of each row, which does not depend on θ, goes into one shared `m × m` triangle `R_within`. It uses the `U` the Gram accumulation set, so the two kernels share `X̃`. Per θ each level's `w` rows, times its relative factor `Λ_f`, are merged into the penalty rows `[I_w | 0]`: `2·Σ ln` of the diagonal of the triangle they leave is the level's share of `ln|I + ΛᵀZᵀŴZΛ|` (`ln|L_ZZ|²`), and its `m`-wide remainder is merged into the tail `T`, which starts as `R_within`. Then `log|X̃'V⁻¹X̃| = 2·Σ_{j<p} ln T_jj` and `r = T_pp`, so `r` is known to about `ε·‖√Ŵy‖` rather than `r²` to `ε·y'Wy`, and the pivots are products of rotations, not differences (Golub & Van Loan 2013, §5.1–5.3). Nothing is allocated per evaluation; the buffers are allocated the first time a workspace takes the switch and refilled in place after.
+
+The fit reads the kernel through the same calls as the Gram one. The factor is `Tᵀ` with a positive diagonal, so β̂, the SEs and the Wald statistics read it unchanged; the conditional modes back-substitute per level on the triangle each level leaves at θ̂ (`qr_recover_ranef`). Its precision estimate is `2ε·(ν·√C_pp/r + 1[REML]·Σ_{j<p} √C_jj/T_jj)` (`LmmKernel::pivot_noise`; `C` the accumulated `[X̃ y]'Ŵ[X̃ y]`, so `√C_pp = ‖√Ŵy‖`), one rounding of each norm to first order, and `r_sq_floor` is 0. It has no conditional variances: `Fit::condvar` is empty on a fit that ended on it, even with `condvar = true`. The per-group gradient route is not armed while it is on, so the search runs BOBYQA and the Satterthwaite pass takes the value route; the pass's response shift moves the `y` column of the stored triangles by their `X̃` columns times `b`, exactly as the rows would, and puts it back bit for bit. Profile intervals and the Satterthwaite pass run on the kernel and weight scale the fit ended on; on a rescaled fit with a θ left on the box, the curvature in the other θ coordinates grows by `4^k` while the box coordinate's does not, so the pass can drop that direction as flat and raise `satterthwaite_curvature`.
+
+**Reuse across draws.** Every draw starts at its plain `s` on the Gram kernel. A draw after one that retried accumulates in full, even under `set_fixed_design(true)`, whose shortcut keeps statistics built at the previous draw's scale (`LmmWorkspace::retried`). `FitView::theta` reports θ̂ at the plain scale (`θ̂·2^rescale_exp`), so a carry into the next draw keeps its meaning, and `curvature_hint` returns `None` after a fit that rescaled.
+
+**Code**: `lmm_fit_with_retries`, `precision_limited`, `rescale_trigger` (`src/fit/lmm.rs`); `QrKernel`, `qr_deviance`, `qr_recover_ranef` (`src/lmm/qr.rs`); `LmmKernel::{qr_covers, start_qr, stop_qr, pivot_noise}` and `LmmWorkspace::{rescale_exp, retried}` (`src/lmm/mod.rs`); `Units::set_weight_scale` (`src/standardize.rs`); `at_theta_limit` (`src/fit/common.rs`). **Validation**: on the dataset above, against a 110-digit evaluation of the REML criterion (±0.01 on the log-likelihood): `fixed_power_one_point_five_reaches_the_reference`, `fixed_powers_one_and_point_seven_reach_the_reference`, `negative_powers_reach_the_reference_from_every_start` (δ = −2 and −1.5 from seven starts), the δ fit in `reml_search_reaches_the_grid_best`, and `upper_powers_leave_the_box_from_every_start` (starts agree within their estimates) in `src/fit/delta_tests.rs`. The QR kernel against the Gram one at the Gram optimum (deviance within the Gram's estimate, conditional modes within 1e-8) on Dyestuff, sleepstudy, weighted sleepstudy and Pastes, `qr_deviance_equals_gram_at_the_gram_optimum` and `qr_ranef_equals_gram_at_the_gram_optimum`; a triggered random-slope and nested fit against a dense Householder evaluation of lme4's weighted REML criterion, `a_triggered_fit_on_slopes_and_nesting_matches_a_householder_reference` (`src/fit/lmm_tests.rs`); the reuse rules in `a_draw_after_a_retried_draw_matches_a_fresh_workspace`, `a_retried_view_reports_theta_at_the_plain_scale` and the bounded-allocation `lmm_qr_refill_bounded_alloc` (`src/fit/core_tests.rs`).
+
 ## The sparse kernel: two-level Schur-block Cholesky
 
 `fit_lmm`'s sparse kernel (`src/sparse/mod.rs`) minimises the same objective
@@ -923,7 +946,7 @@ The ports call it through `orchestrate::profile_intervals` (R
 `confint(method = "profile")`, Python `Fit.profile_confint`).
 
 **The ML refit.** Every profile is of the ML deviance. The model is refitted by
-ML from a cold start (`fit_cold_keep_workspace`, `src/fit/mod.rs`: the
+ML from a cold start (`fit_keep_workspace`, `src/fit/mod.rs`: the
 `fit` path with `FitOptions { reml: Some(false), satterthwaite: false,
 condvar: false, .. }`), so an ML fit made by `fit` is reproduced exactly and a
 REML fit is replaced by its ML twin, as lme4's profile does (`refitML`). The
@@ -933,7 +956,7 @@ every held search. Only differences of the deviance enter `ζ`, so every
 `−Σ log wᵢ`) cancels, and `dev` below is the kernel's ML deviance
 (`dev(θ) = log|V| + N·ln σ̂²`, [above](#profiled-reml-and-ml-objectives)).
 
-**Variance parameters.** The coordinates are lme4's: per random-effect block, in θ order, the column-major `vech` entries that are not structural zeros (an SD on the diagonal, a correlation below it), then σ, all in the caller's units. A vector `v` maps to the kernel's θ̃ through the relative covariance. With `s` the prior-weight scale the kernel runs under ([prior weights](#profiled-reml-and-ml-objectives)), the kernel's residual variance is `σ_int² = σ²/s`. Each block's `Σ = D·R·D` (`D` the SDs, `R` the correlations) is divided by `σ_int²`, moved onto the fitted design (`Σ̃ = M⁻¹·Σ·M⁻ᵀ`, `M` the map `src/lmm/re_map.rs` calls `N`) and factored there by `semidef_lower_chol` with the trace floor. On the fitted design the columns are commensurate; in the caller's units a slope column's scale or centering shift can put a diagonal below the floor and cut a real direction. A factor that does not reproduce `Σ̃` to `1e-8·tr` means `R` is not positive semidefinite, and the point's deviance is `+∞`. The factor, packed, is θ̃, structural entries zeroed. One kernel evaluation at that θ̃ gives `dev_p = dev(θ̃)` with σ profiled and `σ̂² = r²/N`. The ML deviance at the given σ is
+**Variance parameters.** The coordinates are lme4's: per random-effect block, in θ order, the column-major `vech` entries that are not structural zeros (an SD on the diagonal, a correlation below it), then σ, all in the caller's units. A vector `v` maps to the kernel's θ̃ through the relative covariance (the held row's own block; the other blocks are copied as θ̃, see the held searches below). With `s` the prior-weight scale ([prior weights](#profiled-reml-and-ml-objectives)) and `c` the response scale the kernel runs under, the kernel's residual variance is `σ_int² = σ²/(s·c²)`. Each block's `Σ = D·R·D` (`D` the SDs, `R` the correlations) is divided by `σ²/s` (the `c²` cancels), moved onto the fitted design (`Σ̃ = M⁻¹·Σ·M⁻ᵀ`, `M` the map `src/lmm/re_map.rs` calls `N`) and factored there by `semidef_lower_chol` with the trace floor. On the fitted design the columns are commensurate; in the caller's units a slope column's scale or centering shift can put a diagonal below the floor and cut a real direction. A factor that does not reproduce `Σ̃` to `1e-8·tr` means `R` is not positive semidefinite, and the point's deviance is `+∞`. The factor, packed, is θ̃, structural entries zeroed. One kernel evaluation at that θ̃ gives `dev_p = dev(θ̃)` with σ profiled and `σ̂² = r²/N`. The ML deviance at the given σ is
 
 ```
 dev(v) = log|V| + N·ln σ_int² + r²/σ_int² − N
@@ -941,8 +964,14 @@ dev(v) = log|V| + N·ln σ_int² + r²/σ_int² − N
 ```
 
 using `r² = N·σ̂²`; at `σ_int = σ̂` it is `dev_p`, the kernel's ML deviance
-without lme4's constant `N(1 + ln 2π)`. Holding coordinate `k` at a value, the other coordinates are
-searched by BOBYQA in scaled units `u = v/c`: `c` is the estimate for a positive
+without lme4's constant `N(1 + ln 2π)`. Holding coordinate `k` at a value, every
+block but `k`'s own is searched as θ̃ in the fit's box, as a coefficient's search
+moves θ̃ (σ's search moves every block so): with σ fixed any θ̃ is a valid
+covariance `σ²Λ̃Λ̃ᵀ`, so the held value constrains only its own block, and on the
+fitted design a slope column far from zero does not push an intercept SD up
+and a correlation towards ±1, as it does on lme4's scale. The rest of `k`'s own
+block and σ, where holding an SD or a correlation is a nonlinear constraint on
+θ̃, are searched by BOBYQA in scaled units `u = v/c`: `c` is the estimate for a positive
 SD and for σ, `σ̂` for an SD estimated at 0, and 1 for a correlation. The box
 is `[−1, 1]` on a correlation, `[1/THETA_HI, THETA_HI]` on σ, and on an SD
 `[0, THETA_HI·max(1, σ̂_int/(s_c·c))]`, at least the fit's own box for that SD
@@ -984,7 +1013,11 @@ level count for an SD), and an SD estimated at 0 by `v = σ̂·2^(k−3)`, at mo
 `ZETA_TOL = 1e-6`, at most `MAX_ROOT_EVALS = 60` evaluations a side. Each held
 search starts from the argmin of the farthest point on that side with
 `|ζ| < z` (the first from the estimate), so an argmin on a boundary past the
-bound never becomes a start. A side that never brackets, a held search that
+bound never becomes a start. Walking out can follow a local minimum of the
+held problem away from the global one, so once the path has moved, each point
+also runs a held search from the estimate and keeps the lower minimum (a
+search that did not converge never wins); this roughly doubles the held
+searches of such a side (`path`, `src/inference/profile.rs`). A side that never brackets, a held search that
 does not converge, or a `|ζ|` that falls by more than `ZETA_TOL` from one
 expansion step to the next gives NaN. A held deviance below the fit's by more
 than `BETTER_OPTIMUM_TOL = 1e-6` is `ProfileError::BetterOptimum`, as lme4
@@ -1003,7 +1036,7 @@ at θ and is not profiled.
 `root`, `path` (`src/inference/profile.rs`); `ProfileKernel`, `hold_var`,
 `hold_beta`, `var_dev`, `beta_dev`, `theta_into` (`src/lmm/profile.rs`);
 `caller_map_into` (`src/lmm/satterthwaite.rs`); `semidef_lower_chol`,
-`LmmGroupings::block_std` (`src/lmm/re_map.rs`); `fit_cold_keep_workspace`
+`LmmGroupings::block_std` (`src/lmm/re_map.rs`); `fit_keep_workspace`
 (`src/fit/mod.rs`); `FitWorkspace::profile_kernel` (`src/fit/core.rs`); `profile_intervals`, `profile_names`
 (`src/orchestrate.rs`). **Convention**: lme4 2.0-6's
 `confint(method = "profile")` with `signames = FALSE` names; its cutoff, its
@@ -1393,6 +1426,9 @@ list of differences from the other engines, with justification, is in
   Mixed-Effects Models Using lme4. *Journal of Statistical Software*, 67(1),
   1–48. — the relative-Cholesky `Λ_θ` parameterization, the profiled REML
   objective, and the singular-fit conventions this page follows.
+- Bates, D. M. & DebRoy, S. (2004). Linear mixed models and penalized least
+  squares. *Journal of Multivariate Analysis*, 91(1), 1–17. — the penalized
+  least-squares system the QR kernel factors.
 - Bates, D. et al. *MixedModels.jl* (Julia package). — the second reference
   engine; same profiled objective, ML default; NEWUOA over unconstrained θ
   since v5.0.0 (BOBYQA retained for scalar RE).
@@ -1412,6 +1448,9 @@ list of differences from the other engines, with justification, is in
   results. *Biometrics*, 41(2), 477–486. The Satterthwaite df of a fixed-effect
   contrast in a mixed model, through the covariance of the variance
   parameters.
+- Golub, G. H. & Van Loan, C. F. (2013). *Matrix Computations*, 4th ed.
+  Johns Hopkins University Press. §5.1–5.3 — Givens rotations and the
+  accuracy of QR least squares behind the QR kernel.
 - Henderson, H. V. & Searle, S. R. (1981). On deriving the inverse of a sum
   of matrices. *SIAM Review*, 23(1), 53–60. — the Woodbury forms behind the
   per-group regression route.

@@ -103,11 +103,10 @@ pub(crate) fn psd_pseudo_inverse(
     let values = decompose(a, Some(v.as_mut()))?;
     let lambda_max = values.last().copied().unwrap_or(0.0);
 
-    let mut inv = Mat::<f64>::zeros(n, n);
     if lambda_max <= 0.0 {
         let negative = values.iter().filter(|&&l| l < 0.0).count();
         return Ok(PseudoInverse {
-            inv,
+            inv: Mat::<f64>::zeros(n, n),
             rank: 0,
             dropped: n - negative,
             negative,
@@ -118,14 +117,14 @@ pub(crate) fn psd_pseudo_inverse(
     let rank = values.iter().filter(|&&l| l > tau).count();
     let negative = values.iter().filter(|&&l| l < -tau).count();
     // Ascending order: the kept eigenvalues are the last `rank`.
-    let kept = n - rank..n;
-    for j in 0..n {
-        for i in 0..n {
-            let mut acc = 0.0;
-            for k in kept.clone() {
-                acc += v[(i, k)] * v[(j, k)] / values[k];
-            }
-            inv[(i, j)] = acc;
+    // inv = V_k diag(1/λ_k) V_kᵀ by faer's `matmul` at `Par::Seq`, the lower
+    // triangle mirrored: a product's two triangles round differently.
+    let vk = v.subcols(n - rank, rank);
+    let vk_scaled = Mat::from_fn(n, rank, |i, m| vk[(i, m)] / values[n - rank + m]);
+    let mut inv = super::cr2::mul(vk_scaled.as_ref(), vk.transpose());
+    for j in 1..n {
+        for i in 0..j {
+            inv[(i, j)] = inv[(j, i)];
         }
     }
     Ok(PseudoInverse {

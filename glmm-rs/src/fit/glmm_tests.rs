@@ -82,7 +82,7 @@ fn profile_row_passes_match_the_matref_passes() {
             extra: if crossed { vec![eid] } else { vec![] },
         };
         let opts = FitOptions::default();
-        let (sized, sized_ids, _) = super::spec_sized_from_ids(&model, &ids);
+        let (sized, sized_ids, _) = super::spec_sized_from_ids(&model, &ids, true);
         let label = format!("crossed={crossed} p={p}");
         let fit = |rows: bool| {
             let (mut ws, x_mat, units) = super::glmm::fit_glmm_build(
@@ -1017,7 +1017,6 @@ const FAR_START_SCAN_ABOVE_COLD: &[(&str, bool, u64, f64, &str)] = &[
     ("cloglog", false, 38, 100.0, "another β branch"),
     ("cloglog", true, 27, 100.0, "another β branch"),
     ("probit", false, 9, 100.0, "another β branch"),
-    ("probit", false, 37, 1000.0, "another β branch"),
     ("probit", true, 14, 20.0, "another β branch"),
     // The start guard hands its winning solve, with the curvature memory
     // that solve left, to the search. From θ₀ = 20 these two searches then
@@ -1391,7 +1390,7 @@ fn pirls_halves_an_overflowing_trial_deviance() {
             let sized = super::common::sized_as_declared(&model, &ids);
             (sized, std::borrow::Cow::Borrowed(&ids))
         } else {
-            let (sized, sids, _) = spec_sized_from_ids(&model, &ids);
+            let (sized, sids, _) = spec_sized_from_ids(&model, &ids, true);
             (sized, sids)
         };
         let (mut ws, xm, _) = super::glmm::fit_glmm_build(
@@ -2873,7 +2872,7 @@ fn fit_glmm_poisson_grouseticks_3crossed_matches_lme4() {
 #[test]
 fn sparse_schur_deviance_equals_dense_grouseticks() {
     let (x, y, n, p, model, ids) = grouseticks_3crossed_inputs();
-    let (model, ids, _) = spec_sized_from_ids(&model, &ids);
+    let (model, ids, _) = spec_sized_from_ids(&model, &ids, true);
     let slope_cols: Vec<usize> = vec![];
     let mut ws = GlmmWorkspace::for_cluster_spec(p, &model, n, &slope_cols, 1);
     // Column-major x + StructuredSchur, as fit_glmm does.
@@ -2953,7 +2952,7 @@ fn sparse_schur_deviance_equals_dense_grouseticks() {
 #[test]
 fn sparse_schur_se_equals_dense_grouseticks() {
     let (x, y, n, p, model, ids) = grouseticks_3crossed_inputs();
-    let (model, ids, _) = spec_sized_from_ids(&model, &ids);
+    let (model, ids, _) = spec_sized_from_ids(&model, &ids, true);
     let slope_cols: Vec<usize> = vec![];
     let mut xm = Mat::<f64>::zeros(n, p);
     for i in 0..n {
@@ -3074,7 +3073,7 @@ fn sparse_schur_small_e_matches_dense() {
             }],
         }),
     };
-    let (model, ids, _) = spec_sized_from_ids(&model, &ids);
+    let (model, ids, _) = spec_sized_from_ids(&model, &ids, true);
     let slope_cols: Vec<usize> = vec![];
     let beta_start = glm_warm_start_beta(
         model.spec.family,
@@ -6083,7 +6082,7 @@ fn masked_joint_hessian_skips_structural_coordinates() {
             family,
             ReStructure::intercept().slopes([slope]).uncorrelated(),
         );
-        let sized = spec_sized_from_ids(&model, ids).0;
+        let sized = spec_sized_from_ids(&model, ids, true).0;
         let opts = FitOptions {
             wald_se: WaldSe::Rx,
             ..FitOptions::default()
@@ -6182,7 +6181,7 @@ fn masked_joint_hessian_skips_structural_coordinates() {
 #[test]
 fn stddev_se_is_the_delta_method_of_the_reported_stddev() {
     let (x, y, n, p, model, ids) = sim_binomial_slope1_design();
-    let sized = spec_sized_from_ids(&model, &ids).0;
+    let sized = spec_sized_from_ids(&model, &ids, true).0;
     let opts = FitOptions {
         se_for: SeFor::Only(vec![0, 1]),
         wald_se: WaldSe::Hessian,
@@ -6312,7 +6311,7 @@ fn dense_glmm_counters_split_stages_and_count_shrink_evals() {
         primary: cluster_ids,
         extra: vec![],
     };
-    let (sized, ids, _) = spec_sized_from_ids(&model, &ids);
+    let (sized, ids, _) = spec_sized_from_ids(&model, &ids, true);
     let mut xm = Mat::<f64>::zeros(n, p);
     for i in 0..n {
         for j in 0..p {
@@ -6669,7 +6668,7 @@ fn fit_glmm_nb_random_slope_seed_lands_in_convergent_basin() {
             );
         }
 
-        let (sized, ids, _) = crate::fit::spec_sized_from_ids(&model, &ids);
+        let (sized, ids, _) = crate::fit::spec_sized_from_ids(&model, &ids, true);
         let packed = crate::fit::fit_glmm_packed(
             &x,
             &y,
@@ -6869,7 +6868,8 @@ fn fit_glmm_gamma_budget_stop_reports_dispersion() {
         primary: cluster_ids,
         extra: vec![],
     };
-    let (f, _) = nb_budget_exhausted_fit(&x, &y, 3, &spec_sized_from_ids(&model, &ids).0, &ids);
+    let (f, _) =
+        nb_budget_exhausted_fit(&x, &y, 3, &spec_sized_from_ids(&model, &ids, true).0, &ids);
     assert!(
         !f.converged(),
         "a budget-exhausted fit must not report converged"
@@ -7101,7 +7101,7 @@ fn fit_glmm_nb_budget_stop_reports_dispersion() {
         extra: vec![],
     };
     let (f, layout) =
-        nb_budget_exhausted_fit(&x, &y, 2, &spec_sized_from_ids(&model, &ids).0, &ids);
+        nb_budget_exhausted_fit(&x, &y, 2, &spec_sized_from_ids(&model, &ids, true).0, &ids);
     assert_ne!(
         layout,
         crate::glmm::GlmmLayout::Packed,
@@ -7119,10 +7119,11 @@ fn fit_glmm_nb_budget_stop_reports_dispersion() {
 }
 
 /// The packed-row twin of [`fit_glmm_nb_budget_stop_reports_dispersion`]: the
-/// same counts with an intercept-only extra grouping declared at 501 levels
-/// (only 6 populated), which routes the design to the packed-row layout through
-/// the crossed-level-count threshold, not through a slope. It lives here, not
-/// in `sparse::tests`, because the build-and-cap seam lives in `fit`.
+/// same counts with a 6-level extra grouping carrying a slope on `x`, which
+/// routes the design to the packed-row layout. (A crossed tail past the
+/// dense-tail byte bound routes there too, but at thousands of declared levels
+/// the packed `k × k` system alone would take hundreds of MB.) It lives here,
+/// not in `sparse::tests`, because the build-and-cap seam lives in `fit`.
 #[test]
 fn packed_glmm_nb_budget_stop_reports_dispersion() {
     let (x, y, cluster_ids, n_clusters) = sim_nb_inf_plateau_dataset();
@@ -7137,7 +7138,7 @@ fn packed_glmm_nb_budget_stop_reports_dispersion() {
             extra_groupings: vec![Grouping {
                 terms: Vec::new(),
                 relation: GroupingRelation::Crossed,
-                slopes: vec![],
+                slopes: vec![1],
             }],
         }),
     };
@@ -7148,7 +7149,8 @@ fn packed_glmm_nb_budget_stop_reports_dispersion() {
     let sized = SizedSpec {
         spec: model,
         n_primary: n_clusters,
-        extra_counts: vec![501],
+        extra_counts: vec![6],
+        tail_fill: 0.0,
     };
     let (f, layout) = nb_budget_exhausted_fit(&x, &y, 2, &sized, &ids);
     assert_eq!(
@@ -7525,8 +7527,8 @@ fn rung_at_gamma_hat(
     // Level counts come from the ids, exactly as the shipped dispatch derives
     // them before it builds a workspace; the lowering leaves placeholders. A
     // rung with a slope on an extra grouping is sized as written, so it keeps
-    // the layout its list names; the size rule moves only intercept-only
-    // groupings on the others, as the dispatch does.
+    // the layout its list names; the others take the fit's own reading and
+    // order of the groupings, as the dispatch does.
     let slope_extra = lo
         .model
         .re
@@ -7536,7 +7538,7 @@ fn rung_at_gamma_hat(
         let sized = super::common::sized_as_declared(&lo.model, &lo.ids);
         (sized, std::borrow::Cow::Borrowed(&lo.ids))
     } else {
-        let (sized, ids, _) = super::spec_sized_from_ids(&lo.model, &lo.ids);
+        let (sized, ids, _) = super::spec_sized_from_ids(&lo.model, &lo.ids, true);
         (sized, ids)
     };
     let (mut ws, x_mat, units) = super::glmm::fit_glmm_build(
@@ -9325,7 +9327,7 @@ fn ws_at_gamma_hat(
         let sized = super::common::sized_as_declared(model, ids);
         (sized, std::borrow::Cow::Borrowed(ids))
     } else {
-        let (sized, ids, _) = super::spec_sized_from_ids(model, ids);
+        let (sized, ids, _) = super::spec_sized_from_ids(model, ids, true);
         (sized, ids)
     };
     let (mut ws, x_mat, units) = super::glmm::fit_glmm_build(
@@ -9600,7 +9602,7 @@ fn glmm_maxfun_cap_reports_honest_endpoint() {
         primary: cluster_ids,
         extra: vec![],
     };
-    let sized = spec_sized_from_ids(&model, &ids).0;
+    let sized = spec_sized_from_ids(&model, &ids, true).0;
     let opts = FitOptions {
         se_for: SeFor::Only(vec![0, 1, 2, 3]),
         ..FitOptions::default()
@@ -9764,6 +9766,7 @@ fn gamma_hessian_se_matches_fd_of_the_full_objective() {
             },
             n_primary: n_clusters,
             extra_counts: vec![],
+            tail_fill: 0.0,
         };
         let (mut ws, x_mat, units) = super::glmm::fit_glmm_build(
             &xr,
@@ -9921,21 +9924,21 @@ fn nb_pirls_two_cycle_is_damped_and_the_fit_converges() {
 }
 
 /// The NB GLMM seed keeps the no-RE GLM-NB prefit's θ̂ when that prefit
-/// converged inside the box, and falls back to θ = 1 when it did not converge
-/// or landed within a factor of 10 of the box floor `NB_THETA_LO`, where
-/// MASS's `glm.nb` fails on the same data and the `ln θ_NB` search started
-/// there converges to a wrong point (grid cell `nb_q2sx2_g3000p5`, 3808 logLik
-/// below glmmTMB from a 0.014 start; 324 evaluations to glmmTMB's optimum from
+/// converged at or above θ = 0.01, a floor independent of the search box, and
+/// falls back to θ = 1 when it did not converge or ended below the floor,
+/// where the `ln θ_NB` search started there barely converges (grid cell
+/// `nb_q8_g3000p20_bal_base`: 38143 evaluations from a 0.009 start, 1145 from
 /// 1.0).
 #[test]
 fn nb_glmm_seed_falls_back_off_a_failed_or_floored_prefit() {
-    let lo = crate::consts::NB_THETA_LO;
-    assert_eq!(super::glmm::nb_glmm_seed(true, 1.7), 1.7);
-    assert_eq!(super::glmm::nb_glmm_seed(true, 10.0 * lo), 10.0 * lo);
-    assert_eq!(super::glmm::nb_glmm_seed(true, 9.0 * lo), 1.0);
-    assert_eq!(super::glmm::nb_glmm_seed(true, lo), 1.0);
-    assert_eq!(super::glmm::nb_glmm_seed(false, 1.7), 1.0);
-    assert_eq!(super::glmm::nb_glmm_seed(true, f64::NAN), 1.0);
+    let seed = super::glmm::nb_glmm_seed;
+    assert_eq!(seed(true, 1.7), 1.7);
+    assert_eq!(seed(true, 1e-2), 1e-2);
+    assert_eq!(seed(true, 9e-3), 1.0);
+    assert_eq!(seed(true, 1e-3), 1.0);
+    assert_eq!(seed(true, crate::consts::NB_THETA_LO), 1.0);
+    assert_eq!(seed(false, 1.7), 1.0);
+    assert_eq!(seed(true, f64::NAN), 1.0);
 }
 
 /// Gamma AGQ: with φ a free coordinate of the outer search, the Gamma
@@ -10138,6 +10141,7 @@ fn rx_se_is_the_penalized_deviance_curvature_in_beta() {
             },
             n_primary: n_clusters,
             extra_counts: vec![],
+            tail_fill: 0.0,
         };
         let opts = FitOptions {
             se_for: SeFor::Only(vec![0, 1, 2]),
@@ -10271,6 +10275,7 @@ fn nb_hessian_se_matches_fd_of_the_full_objective() {
         },
         n_primary: n_clusters,
         extra_counts: vec![],
+        tail_fill: 0.0,
     };
     for nagq in [1u8, 7] {
         let opts = FitOptions {
@@ -10467,7 +10472,7 @@ fn glmm_maxfun_cap_q2_reports_honest_endpoint_and_not_singular() {
         se_for: SeFor::Only(vec![0, 1]),
         ..FitOptions::default()
     };
-    let (sized_model, sized_ids, _) = super::spec_sized_from_ids(&model, &ids);
+    let (sized_model, sized_ids, _) = super::spec_sized_from_ids(&model, &ids, true);
     let (mut ws, x_mat, units) = super::glmm::fit_glmm_build(
         &x,
         &y,
@@ -10615,6 +10620,7 @@ fn fixed_beta_objective_rises_into_the_tail() {
             },
             n_primary: s,
             extra_counts: vec![],
+            tail_fill: 0.0,
         };
         let mut ws = GlmmWorkspace::for_cluster_spec(p, &model, n, &[], 1);
         ws.nb_theta = 1.0;
@@ -11318,7 +11324,7 @@ fn joint_search_reaches_the_optimum_when_working_weights_span_decades() {
             None,
             n,
             2,
-            &spec_sized_from_ids(&model, &ids).0,
+            &spec_sized_from_ids(&model, &ids, true).0,
             &ids.primary,
             &ids.extra,
             f64::NAN,
@@ -12107,7 +12113,9 @@ fn fractional_logit_glmm_matches_its_unit_weight_fit() {
 /// A β warm start the search cannot leave (far from the optimum in β) fails
 /// where the cold fit converges: Poisson `y ~ x + (1 + x | g)` from β₀ =
 /// (−28.5, 0.45), and Gamma (log) `(1 | g) + (1 | h)` on a response on the
-/// 1e-12 scale, both started at a previous draw's estimates. The fit is then
+/// 1e-12 scale, both started at a previous draw's estimates; and the same
+/// Gamma model on the inverse link from 1e10 times its cold β, where the cold
+/// search runs through the inverse link's units and retry. The fit is then
 /// searched again from the cold start and ends at the cold fit. The expected
 /// values are glmm's own cold fits (loglik −336.877602 and 4386.837322), not an
 /// external reference. Data: `tests/fixtures/gen_warm_start_fixtures.py`.
@@ -12136,6 +12144,13 @@ fn a_far_warm_start_that_fails_falls_back_to_the_cold_fit() {
                 theta: vec![0.7281146516300094, 0.6008399020626377],
                 dispersion: Some(1.0890181012807432),
             },
+        ),
+        (
+            "y_gamma ~ x + (1 | g) + (1 | h)",
+            Family::Gamma {
+                link: crate::GammaLink::Inverse,
+            },
+            StartValues::new(vec![6.674854902491283e21, -4.376354201118872e19], vec![]),
         ),
     ];
     let opts = FitOptions::default();

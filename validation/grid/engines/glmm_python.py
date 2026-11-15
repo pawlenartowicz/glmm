@@ -283,6 +283,8 @@ def fit_one(cell):
 
         # anova_test="Wald": the grid reads no likelihood-ratio table.
         kw["anova_test"] = "Wald"
+        # condvar off, as the Rust engine fits with FitOptions::default().
+        kw["condvar"] = False
         fh = timed_fit(
             lambda sat: glmm.fit(
                 data, formula, _FAMILY[cell["family"]], wald_se="hessian", satterthwaite=sat, **kw

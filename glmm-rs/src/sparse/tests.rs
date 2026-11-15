@@ -61,7 +61,7 @@ fn with_forced_sparse_tail<T>(f: impl FnOnce() -> T) -> T {
 /// under a single parent, the nested (padded per-parent ids, `NestedWithin`)
 /// and crossed (flat global ids, `Crossed`) parameterizations are the SAME
 /// statistical model, so REML deviance and β must agree across routes. This
-/// is the correctness lever behind the frontend's inflation-bound detection
+/// is the correctness lever behind the fit's inflation-bound detection
 /// (`detect_flat_nesting`): whichever way a near-balanced factor is routed,
 /// the answer cannot change. Near-balanced shape: children-per-parent
 /// {3,2,3} over 3 parents (8 child levels, padded dim 9). Run for both
@@ -133,10 +133,10 @@ fn run_nested_route_matches_forced_crossed_sparse() {
         primary: cl.clone(),
         extra: vec![flat.clone()],
     };
-    // Ids from the sizing step, not the hand-built pair: the size rule makes the
-    // 8-level child the primary here, and the kernel is fed whatever order the
-    // sized spec describes.
-    let (sized, crossed_ids, _perm) = crate::fit::spec_sized_from_ids(&crossed_model, &crossed_ids);
+    // Sized as declared: the sizing step would find the child nested in the
+    // parent from the ids (3 children per parent, within the nest limit) and
+    // read it nested, which would leave this test no crossed leg.
+    let sized = crate::fit::sized_as_declared(&crossed_model, &crossed_ids);
     let sp = crate::fit::fit_mle_sparse_pub(
         &xflat,
         &y,
@@ -211,10 +211,11 @@ fn sparse_over_32_components_no_overflow() {
         },
         n_primary: 4,
         extra_counts: (0..N_EXTRA).map(|g| 2 + (g % 2)).collect(),
+        tail_fill: 0.0,
     };
     // Over-envelope-by-count ⇒ classify_design routes to Sparse.
     assert!(matches!(
-        crate::fit::classify_design(&model, 1),
+        crate::fit::classify_design(&model, true),
         crate::fit::Solver::Sparse
     ));
 
@@ -538,6 +539,7 @@ fn run_sparse_deviance_equals_dense_crossed() {
         },
         n_primary: 2,
         extra_counts: vec![3],
+        tail_fill: 0.0,
     };
     let g = crate::lmm::LmmGroupings::from_cluster_spec_ext(&model, &[], &[vec![]]);
 
@@ -579,6 +581,81 @@ fn run_sparse_deviance_equals_dense_crossed() {
             );
         }
     }
+}
+
+/// The dense kernel's REML deviance on a nested layout whose widest parent has
+/// 300 children equals the same model's with the child crossed on its own ids.
+/// At θ_nested = 10 each of the 300 pivots of that parent's family is about
+/// √(1 + 4θ²) ≈ 20, so their product passes f64's range; the family loop must
+/// keep it finite. One fixed θ, no search.
+#[test]
+fn wide_nested_family_deviance_matches_its_crossed_spelling() {
+    use crate::GroupIds;
+    // 50 parents: parent 0 has 300 children, the rest 2 each; 4 rows per
+    // child; child ids global, so the crossed spelling uses them as they are.
+    let mut st = 2026u64;
+    let (mut g, mut h, mut y) = (Vec::new(), Vec::new(), Vec::new());
+    let mut cov = Vec::new();
+    let mut child = 0u32;
+    for parent in 0..50u32 {
+        let parent_effect = 2.0 * lcg(&mut st);
+        for _ in 0..if parent == 0 { 300 } else { 2 } {
+            // Uniform on (−10√3, 10√3): child SD 10.
+            let child_effect = 10.0 * 3f64.sqrt() * lcg(&mut st);
+            for _ in 0..4 {
+                let c = lcg(&mut st);
+                g.push(parent);
+                h.push(child);
+                cov.push(c);
+                y.push(1.0 + 0.5 * c + parent_effect + child_effect + lcg(&mut st));
+            }
+            child += 1;
+        }
+    }
+    let n = y.len();
+    let p = 2;
+    let x = Mat::<f64>::from_fn(n, p, |i, j| if j == 0 { 1.0 } else { cov[i] });
+    let padded = crate::fit::nested_padded_ids(&g, &h).0;
+    let spec = |relation| ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            terms: Vec::new(),
+            slopes: vec![],
+            extra_groupings: vec![Grouping {
+                terms: Vec::new(),
+                relation,
+                slopes: vec![],
+            }],
+        }),
+    };
+    let theta = [1.0, 10.0];
+    let deviance = |relation, child_ids: &[u32]| {
+        let ids = GroupIds::new(g.clone()).extra(child_ids.to_vec());
+        let sized = crate::fit::sized_as_declared(&spec(relation), &ids);
+        let groupings = crate::lmm::LmmGroupings::from_cluster_spec_ext(&sized, &[], &[]);
+        let mut suff = crate::lmm::LmmSuffStats::with_groupings(p, groupings.clone());
+        suff.add_rows_multi(
+            x.as_ref(),
+            x.as_ref().subcols(0, 0),
+            &y,
+            &g,
+            &ids.extra,
+            None,
+        );
+        let mut scratch = crate::lmm::LmmFitScratch::with_groupings(p, &groupings);
+        (
+            sized.extra_counts[0],
+            crate::lmm::reml_deviance(&theta, &suff, &mut scratch),
+        )
+    };
+    let (width, nested) = deviance(GroupingRelation::NestedWithin, &padded);
+    let (levels, crossed) = deviance(GroupingRelation::Crossed, &h);
+    assert_eq!((width, levels), (300, 398));
+    assert!(crossed.is_finite(), "crossed deviance {crossed}");
+    assert!(
+        (nested - crossed).abs() <= 1e-10 * crossed.abs(),
+        "nested {nested} vs crossed {crossed}"
+    );
 }
 
 /// Regression guarding the structural-pattern seeding: a PRIMARY RANDOM SLOPE
@@ -623,6 +700,7 @@ fn sparse_deviance_equals_dense_primary_slope_balanced_zero() {
         },
         n_primary: n_clusters as usize,
         extra_counts: vec![],
+        tail_fill: 0.0,
     };
     // Primary slope x-col = 1; no extra groupings.
     let g = crate::lmm::LmmGroupings::from_cluster_spec_ext(&model, &[1], &[]);
@@ -717,6 +795,7 @@ fn sparse_tail_pattern_two_family_cliques_unobserved_level() {
         },
         n_primary: 2,
         extra_counts: vec![5],
+        tail_fill: 0.0,
     };
     let extra_ids = cr_as_extra(&cr);
     let g = crate::lmm::LmmGroupings::from_cluster_spec_ext(&model, &[], &[vec![]]);
@@ -835,6 +914,7 @@ fn sparse_tail_natural_over_cutover_matches_noz() {
         },
         n_primary: 4,
         extra_counts: vec![e_levels as usize],
+        tail_fill: 0.0,
     };
     let ids = crate::GroupIds {
         primary: cl.clone(),
@@ -847,7 +927,8 @@ fn sparse_tail_natural_over_cutover_matches_noz() {
     let noz = fit_cold(&xflat, &y, n, p, &model.spec, &ids, &opts);
     // `model`'s declared counts are already the data's exact counts, so the
     // normalizer is bypassed on the sparse leg deliberately: it would make the
-    // 150-level factor the primary (all-scalar all-crossed size rule) and leave
+    // 150-level factor the primary (the grouping with the most columns goes
+    // first) and leave
     // a 4-level extra, which is the one arrangement that does NOT build the
     // sparse tail this fixture exists to cross. Both legs still report in
     // declaration order, so the varcorr comparison below is like-for-like.
@@ -1313,7 +1394,7 @@ fn fit_wide_crossed_sparse_is_pinned() {
     let (x, y, n, p, model, ids) = wide_crossed_design();
     // 7 extras > MAX_EXTRA_GROUPINGS=6 → over-envelope-by-count ⇒ Sparse.
     assert!(matches!(
-        crate::fit::classify_design(&crate::fit::spec_sized_from_ids(&model, &ids).0, 1),
+        crate::fit::classify_design(&crate::fit::spec_sized_from_ids(&model, &ids, true).0, true),
         crate::fit::Solver::Sparse,
     ));
     let opts = crate::FitOptions {
@@ -1396,12 +1477,13 @@ fn family_downdate_dense_route_matches_scatter_route() {
     let (xflat, y, n, p, model, ids) = wide_crossed_design();
     let x = Mat::<f64>::from_fn(n, p, |i, j| xflat[i * p + j]);
     // Building `LmmGroupings` by hand needs the level counts `fit_cold`
-    // derives from the ids, in declaration order (no size-rule reorder).
+    // derives from the ids, in declaration order (no reorder).
     let lv = |v: &[u32]| v.iter().max().map_or(1, |m| *m as usize + 1);
     let model = SizedSpec {
         spec: model,
         n_primary: lv(&ids.primary),
         extra_counts: ids.extra.iter().map(|e| lv(e)).collect(),
+        tail_fill: 0.0,
     };
     let g1 = crate::lmm::LmmGroupings::from_cluster_spec_ext(&model, &[], &vec![vec![]; 7]);
     assert_eq!(g1.primary_q, 1, "w == 1 arm needs a scalar primary");
@@ -1462,6 +1544,7 @@ fn family_downdate_dense_route_matches_scatter_route() {
         },
         n_primary: 5,
         extra_counts: vec![7],
+        tail_fill: 0.0,
     };
     let extra2 = vec![cr.clone()];
     let g2 = crate::lmm::LmmGroupings::from_cluster_spec_ext(&model2, &[1], &[vec![]]);
@@ -1529,6 +1612,7 @@ fn family_downdate_dense_route_vetoed_above_the_memory_cap() {
             },
             n_primary: 4,
             extra_counts: vec![n_levels as usize],
+            tail_fill: 0.0,
         };
         let x = Mat::<f64>::from_fn(n, p, |i, j| xflat[i * p + j]);
         let g = crate::lmm::LmmGroupings::from_cluster_spec_ext(&model, &[], &[vec![]]);
@@ -1580,7 +1664,7 @@ fn family_downdate_dense_route_vetoed_above_the_memory_cap() {
 fn fit_warm_sparse_wide_crossed_matches_cold_optimum() {
     let (x, y, n, p, model, ids) = wide_crossed_design();
     assert!(matches!(
-        crate::fit::classify_design(&crate::fit::spec_sized_from_ids(&model, &ids).0, 1),
+        crate::fit::classify_design(&crate::fit::spec_sized_from_ids(&model, &ids, true).0, true),
         crate::fit::Solver::Sparse,
     ));
     let opts = crate::FitOptions {
@@ -1698,7 +1782,7 @@ fn run_sparse_vs_noz_cross_check_table(cases: &[&str]) {
     for label in cases {
         let (xflat, y, n, p, model, ids, opts) = build_case(label);
         let noz = fit_cold(&xflat, &y, n, p, &model, &ids, &opts);
-        let (sized, ids, perm) = crate::fit::spec_sized_from_ids(&model, &ids);
+        let (sized, ids, perm) = crate::fit::spec_sized_from_ids(&model, &ids, true);
         let mut sp = crate::fit::fit_mle_sparse_pub(
             &xflat,
             &y,
@@ -2055,7 +2139,7 @@ fn run_grid_agreement(heavy: bool, label: &str, expected_splits: &[usize]) {
         };
         let (xflat, y, n, p, model, ids, opts) = build_grid_case(&cell, 0x5eed_0000 + idx as u64);
         let t0 = std::time::Instant::now();
-        let (sized, ids, _perm) = crate::fit::spec_sized_from_ids(&model, &ids);
+        let (sized, ids, _perm) = crate::fit::spec_sized_from_ids(&model, &ids, true);
         let noz = crate::fit::fit_mle_noz_pub(
             &xflat,
             &y,
@@ -2217,7 +2301,7 @@ fn noz_sparse_ranef_agrees() {
         ..c
     };
     let (xflat, y, n, p, model, ids, opts) = build_grid_case(&cell, 0x5eed_ba1d);
-    let (sized, ids, _perm) = crate::fit::spec_sized_from_ids(&model, &ids);
+    let (sized, ids, _perm) = crate::fit::spec_sized_from_ids(&model, &ids, true);
     let noz = crate::fit::fit_mle_noz_pub(
         &xflat,
         &y,
@@ -2299,7 +2383,7 @@ fn crossover_worst_cell_deviance_parity() {
     let prim_slopes: Vec<usize> = (1..cell.q_p).collect();
     let extra_slopes: Vec<Vec<usize>> =
         (0..cell.n_extra).map(|_| (1..cell.q_g).collect()).collect();
-    let sized = crate::fit::spec_sized_from_ids(&model, &ids).0;
+    let sized = crate::fit::spec_sized_from_ids(&model, &ids, true).0;
     let g = crate::lmm::LmmGroupings::from_cluster_spec_ext(&sized, &prim_slopes, &extra_slopes);
     let mut suff = crate::lmm::LmmSuffStats::with_groupings(p, g.clone());
     suff.add_rows_multi(
@@ -2493,10 +2577,11 @@ fn fit_wide_slopes_sparse_is_pinned() {
         },
         n_primary: 1,
         extra_counts: vec![1],
+        tail_fill: 0.0,
     };
     // q_g=5 over the NoZ envelope WIDTH ⇒ Sparse (over-width, no NoZ twin).
     assert!(matches!(
-        crate::fit::classify_design(&model, 1),
+        crate::fit::classify_design(&model, true),
         crate::fit::Solver::Sparse,
     ));
     let ids = crate::GroupIds {
@@ -2748,7 +2833,7 @@ fn fit_sparse_gamma_hessian_is_pinned() {
     let (x, y, n, p, model, ids) = sparse_gamma_design();
     let sized = crate::fit::sized_as_declared(&model, &ids);
     assert!(matches!(
-        crate::fit::classify_design(&sized, 1),
+        crate::fit::classify_design(&sized, true),
         crate::fit::Solver::Sparse
     ));
     let opts = crate::FitOptions {
@@ -2965,7 +3050,7 @@ fn sparse_binomial_bigsd_design() -> (
 fn fit_warm_sparse_glmm_partial_start_cold_starts_the_missing_component() {
     let (x, y, n, p, model, ids) = sparse_binomial_bigsd_design();
     assert!(matches!(
-        crate::fit::classify_design(&crate::fit::spec_sized_from_ids(&model, &ids).0, 1),
+        crate::fit::classify_design(&crate::fit::spec_sized_from_ids(&model, &ids, true).0, true),
         crate::fit::Solver::Sparse
     ));
     let opts = crate::FitOptions {
@@ -3171,9 +3256,10 @@ fn fit_sparse_nb_glmm_is_pinned() {
         },
         n_primary: 1,
         extra_counts: vec![1],
+        tail_fill: 0.0,
     };
     assert!(matches!(
-        crate::fit::classify_design(&model, 1),
+        crate::fit::classify_design(&model, true),
         crate::fit::Solver::Sparse
     ));
     let ids = crate::GroupIds {
@@ -3507,9 +3593,10 @@ fn fit_sparse_binomial_slope_crossed_is_pinned() {
         },
         n_primary: 1,
         extra_counts: vec![1],
+        tail_fill: 0.0,
     };
     assert!(matches!(
-        crate::fit::classify_design(&model, 1),
+        crate::fit::classify_design(&model, true),
         crate::fit::Solver::Sparse
     ));
     let ids = crate::GroupIds {
@@ -3670,7 +3757,7 @@ fn sparse_glmm_deviance_matches_dense() {
         };
 
         // Blocked/structured workspace, mirroring the construction in `src/fit/glmm.rs`.
-        let sized = crate::fit::spec_sized_from_ids(&model, &ids).0;
+        let sized = crate::fit::spec_sized_from_ids(&model, &ids, true).0;
         let mut dws = crate::glmm::GlmmWorkspace::for_cluster_spec(p, &sized, n, &[], 1);
         dws.pattern.structured_schur = if dws.groupings.structured_extras_eligible() {
             crate::glmm::StructuredSchur::new(&dws.groupings, &ids.primary, &ids.extra, n)
@@ -3779,7 +3866,7 @@ fn sparse_glmm_fit_matches_dense_in_envelope() {
                 ..crate::FitOptions::default()
             };
             let dense = fit_cold(&xflat, &y, n, p, &model, &ids, &opts);
-            let (sized, ids, _perm) = crate::fit::spec_sized_from_ids(&model, &ids);
+            let (sized, ids, _perm) = crate::fit::spec_sized_from_ids(&model, &ids, true);
             let sp = crate::fit::fit_glmm_packed(
                 &xflat,
                 &y,
@@ -3906,7 +3993,7 @@ fn sparse_glmm_gamma_inverse_fit_matches_dense_and_glmmtmb() {
             ..crate::FitOptions::default()
         };
         let dense = fit_cold(&x, &y, n, p, &model, &ids, &opts);
-        let (sized, ids, _perm) = crate::fit::spec_sized_from_ids(&model, &ids);
+        let (sized, ids, _perm) = crate::fit::spec_sized_from_ids(&model, &ids, true);
         let (sp, _mu, _dev) = crate::fit::fit_glmm_packed(
             &x,
             &y,
@@ -4326,7 +4413,7 @@ fn sparse_weighted_binomial_deviance_matches_expanded() {
     use faer::Mat;
     let ((xa, ya, wa, n_a, ids_a), (xe, ye, n_e, ids_e), p, model, sat) =
         build_binomial_weighted_pair();
-    let sized = crate::fit::spec_sized_from_ids(&model, &ids_a).0;
+    let sized = crate::fit::spec_sized_from_ids(&model, &ids_a, true).0;
     let mut ws_a = crate::glmm::GlmmWorkspace::for_cluster_spec(p, &sized, n_a, &[], 1);
     // The fixture is over-envelope, so it picks the packed-row layout on its
     // own; pin that, or a fixture drift would quietly move this onto the
@@ -4498,6 +4585,7 @@ fn sparse_glmm_over_envelope_converges_binomial() {
         },
         n_primary,
         extra_counts: extra_levels.to_vec(),
+        tail_fill: 0.0,
     };
     let ids = crate::GroupIds {
         primary: pid,
@@ -4520,7 +4608,7 @@ fn sparse_glmm_over_envelope_converges_binomial() {
         })
         .collect();
     assert!(matches!(
-        crate::fit::classify_design(&model, 1),
+        crate::fit::classify_design(&model, true),
         crate::fit::Solver::Sparse
     ));
     let f = fit_cold(&x, &yb, n, p, &model.spec, &ids, &opts);
@@ -4608,6 +4696,7 @@ fn sparse_glmm_over_envelope_converges_poisson() {
         },
         n_primary,
         extra_counts: extra_levels.to_vec(),
+        tail_fill: 0.0,
     };
     let ids = crate::GroupIds {
         primary: pid,
@@ -4625,7 +4714,7 @@ fn sparse_glmm_over_envelope_converges_poisson() {
         })
         .collect();
     assert!(matches!(
-        crate::fit::classify_design(&model, 1),
+        crate::fit::classify_design(&model, true),
         crate::fit::Solver::Sparse
     ));
     let f = fit_cold(&x, &yp, n, p, &model.spec, &ids, &opts);
@@ -4736,9 +4825,10 @@ fn sparse_glmm_over_envelope_converges_gamma() {
         },
         n_primary: n_gp,
         extra_counts: vec![n_ge],
+        tail_fill: 0.0,
     };
     assert!(matches!(
-        crate::fit::classify_design(&model, 1),
+        crate::fit::classify_design(&model, true),
         crate::fit::Solver::Sparse
     ));
     let ids = crate::GroupIds {
@@ -5265,7 +5355,7 @@ fn fit_sparse_lmm_weighted_matches_lme4() {
     let sized = crate::fit::sized_as_declared(&model, &ids);
     assert!(
         matches!(
-            crate::fit::classify_design(&sized, 1),
+            crate::fit::classify_design(&sized, true),
             crate::fit::Solver::Sparse
         ),
         "slope-carrying extra grouping must route Sparse"
@@ -5494,9 +5584,10 @@ fn sparse_lmm_pinned_names_the_collapsed_component() {
         },
         n_primary: 12,
         extra_counts: vec![20],
+        tail_fill: 0.0,
     };
     assert!(matches!(
-        crate::fit::classify_design(&model, 1),
+        crate::fit::classify_design(&model, true),
         crate::fit::Solver::Sparse,
     ));
     let ids = crate::GroupIds {
@@ -5615,9 +5706,10 @@ fn sparse_lmm_pinned_names_the_second_groupings_slope() {
         },
         n_primary: 12,
         extra_counts: vec![20],
+        tail_fill: 0.0,
     };
     assert!(matches!(
-        crate::fit::classify_design(&model, 1),
+        crate::fit::classify_design(&model, true),
         crate::fit::Solver::Sparse,
     ));
     let ids = crate::GroupIds {
@@ -5716,9 +5808,10 @@ fn sparse_glmm_pinned_names_the_collapsed_component() {
         },
         n_primary: 12,
         extra_counts: vec![20],
+        tail_fill: 0.0,
     };
     assert!(matches!(
-        crate::fit::classify_design(&model, 1),
+        crate::fit::classify_design(&model, true),
         crate::fit::Solver::Sparse,
     ));
     let ids = crate::GroupIds {
@@ -6110,7 +6203,7 @@ fn packed_and_dense_assembled_hessians_agree() {
             f64::NAN
         };
 
-        let sized = crate::fit::spec_sized_from_ids(&model, &ids).0;
+        let sized = crate::fit::spec_sized_from_ids(&model, &ids, true).0;
         let mut dws = crate::glmm::GlmmWorkspace::for_cluster_spec(p, &sized, n, slope_cols, 1);
         dws.pattern.structured_schur = if dws.groupings.structured_extras_eligible() {
             crate::glmm::StructuredSchur::new(&dws.groupings, &ids.primary, &ids.extra, n)

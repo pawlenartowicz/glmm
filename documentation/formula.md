@@ -14,7 +14,7 @@ term.
 | Construct | Meaning | Example |
 |---|---|---|
 | Bare column name | A fixed-effect main effect | `x1` |
-| Column names with dots | Names follow R's syntactic-name rule: a letter, `_`, or a `.` not followed by a digit, then letters, digits, `_` or `.` | `age.years`, `(1 \| school.id)` |
+| Column names | ASCII names follow R's syntactic-name rule: a letter, `_`, or a `.` not followed by a digit, then letters, digits, `_` or `.`. Any non-ASCII character that is not whitespace or a control character is also a name character, so accented (also NFD), CJK and emoji names work; a name does not start with a digit. In Python, a `.` between two emoji (`😀.😀`), or at the start of a name before an emoji (`.😀`), is refused as the unsupported `.` shorthand. In R, a name R's own parser needs backticks for is refused. | `age.years`, `(1 \| school.id)`, `体重` |
 | `+` | Add another term | `x1 + x2` |
 | `:` | Interaction only (no main effects added) | `x1:x2` |
 | `*` | Desugars to main effects + interaction | `x1*x2` → `x1 + x2 + x1:x2` |

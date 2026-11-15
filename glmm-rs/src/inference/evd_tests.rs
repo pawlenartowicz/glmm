@@ -104,6 +104,15 @@ fn rank_two_psd_satisfies_moore_penrose() {
     assert_eq!((p.rank, p.dropped, p.negative), (2, 2, 0));
 
     let x = &p.inv;
+    for i in 0..4 {
+        for j in 0..4 {
+            assert_eq!(
+                x[(i, j)].to_bits(),
+                x[(j, i)].to_bits(),
+                "inv not exactly symmetric"
+            );
+        }
+    }
     let ax = &a * x;
     let xa = x * &a;
     assert!(max_abs_diff((&ax * &a).as_ref(), a.as_ref()) <= 1e-12);

@@ -35,7 +35,7 @@ use super::error::{Error, ParseError};
 use super::parse::{
     parse, parse_transform, ParsedFormula, RandomEffect, Transform, DEFAULT_RESPONSE,
 };
-use crate::fit::{detect_flat_nesting, nested_padded_ids};
+use crate::fit::nested_padded_ids;
 use crate::{
     ColumnId, Data, Design, ErrorMessage, Family, Fit, FitError, FitOptions, GroupIds, Grouping,
     GroupingRelation, ModelSpec, PredictOptions, Prediction, ReStructure, ReTerm,
@@ -117,11 +117,9 @@ pub struct ReGroupInfo {
     pub term_index: Vec<usize>,
     /// Level label per slot of this grouping's RE block, in kernel block order,
     /// `None` for a padded nested slot that belongs to no level. Emitted by the
-    /// same layer that CHOOSES the layout (`grouping_ids`), because that
-    /// choice is data-dependent: a flat `(1|A) + (1|B)` routes nested or crossed
-    /// depending on how balanced the data is (see `detect_flat_nesting`), so a
-    /// consumer that inferred the layout would be wrong on a dataset nobody
-    /// tested. The labeller behind [`Model::ranef`] is the only reader.
+    /// same layer that builds the layout (`grouping_ids`), because the padding
+    /// of a nested grouping depends on how many children each parent has in
+    /// the data. The labeller behind [`Model::ranef`] is the only reader.
     pub slot_labels: Vec<Option<String>>,
 }
 
@@ -1067,6 +1065,10 @@ fn rdx_cross(
     let mut xt_rdx = faer::Mat::<f64>::zeros(p, cols.len());
     for (c, col) in cols.iter().enumerate() {
         for (i, &r) in col.iter().enumerate() {
+            // x is finite here, so a zero adds only ±0.0.
+            if r == 0.0 {
+                continue;
+            }
             for (j, &v) in x[i * p..(i + 1) * p].iter().enumerate() {
                 xt_rdx[(j, c)] += v * r;
             }
@@ -1908,22 +1910,11 @@ fn lower_random_effects(
         &primary_terms,
         primary_layout.slot_labels,
     )];
-    // The kernel holds ONE nested slot (`LmmGroupings.nested: Option<_>`), so at
-    // most one extra may carry `NestedWithin`. Flat-nesting detection therefore
-    // only fires while no nested extra exists yet — later flat candidates fail
-    // closed to `Crossed` (statistically the same model, see the route-invariance
-    // lever). Explicit `parent:child` syntax is not gated here; a second explicit
-    // nested extra trips the engine's `assert_model_shape` instead.
-    let mut have_nested = false;
     for (name, nodes) in rest {
         let terms = lower_terms(name, nodes, &numeric_cols, &factor_cols)?;
         let (re_terms, slopes) = block_of(&terms);
-        // Explicit `parent:child` syntax → nested. A flat grouping with one
-        // scalar-intercept term and no `:` may STILL nest within the primary
-        // (the lme4 idiom `(1|batch)+(1|sample)`); `detect_flat_nesting`
-        // recognizes that from the id structure and fails closed to Crossed on
-        // any parent conflict. The level counts are the kernel's, derived from
-        // the ids.
+        // Only explicit `parent:child` syntax lowers nested. A flat pair that
+        // happens to nest lowers crossed; the fit finds the nest in the ids.
         let explicit_nested = nodes.iter().find(|re| {
             matches!(
                 re,
@@ -1933,34 +1924,10 @@ fn lower_random_effects(
                 }
             )
         });
-        let (relation, layout) = match (explicit_nested, &nodes[..]) {
-            (Some(&re), _) => (GroupingRelation::NestedWithin, grouping_ids(re, data)?),
-            (
-                None,
-                [re @ RandomEffect::Intercept {
-                    group,
-                    parent: None,
-                }],
-            ) if !group.contains(':') && !have_nested => {
-                match detect_flat_nesting(&primary_ids, &grouping_row_labels(group, data)?) {
-                    // The flat idiom writes no parent, and `re_group_info` names
-                    // this block for the child alone, so the labels stay bare
-                    // child labels: joining the parent in here would make the
-                    // SPELLING move with the dataset, since the same formula
-                    // routes nested or crossed depending on balance.
-                    Some((padded, slot_labels)) => (
-                        GroupingRelation::NestedWithin,
-                        GroupingLayout {
-                            ids: padded,
-                            slot_labels,
-                        },
-                    ),
-                    None => (GroupingRelation::Crossed, grouping_ids(re, data)?),
-                }
-            }
-            (None, _) => (GroupingRelation::Crossed, grouping_ids(nodes[0], data)?),
+        let (relation, layout) = match explicit_nested {
+            Some(&re) => (GroupingRelation::NestedWithin, grouping_ids(re, data)?),
+            None => (GroupingRelation::Crossed, grouping_ids(nodes[0], data)?),
         };
-        have_nested |= matches!(relation, GroupingRelation::NestedWithin);
         extra_groupings.push(Grouping {
             terms: re_terms,
             relation,
@@ -2044,9 +2011,8 @@ pub struct RanefBlock {
 ///
 /// This is the whole of the RE block-layout knowledge, written once. Every
 /// consumer — the Python and R packages, a Rust caller — goes through here
-/// rather than re-deriving the slicing, because the layout is a data-dependent
-/// SPEED decision (see `detect_flat_nesting`) that no consumer can infer from
-/// the formula.
+/// rather than re-deriving the slicing, because a nested grouping's padding
+/// depends on the data and cannot be inferred from the formula.
 ///
 /// A fit with no conditional modes (fixed-only, where `Fit::ranef` is empty,
 /// or non-converged, where it is NaN) yields an empty vec — not an error.
@@ -2505,68 +2471,11 @@ mod tests {
         );
     }
 
-    /// Genuinely crossed with matching cardinality — a child label reused across
-    /// parents (Penicillin's `sample` spans every `plate`). `detect_flat_nesting`
-    /// must fail closed to `Crossed` (`None`), never routing it through the nested padded layout.
+    /// Two flat extras that both nest in the primary lower `Crossed`, each on
+    /// its own lexicographic factor codes with bare labels: only explicit
+    /// `parent:child` syntax lowers nested, and the fit finds the nests itself.
     #[test]
-    fn detect_flat_nesting_shared_child_stays_crossed() {
-        let primary = vec![0, 1, 0, 1];
-        let child = strs(&["x", "x", "y", "y"]);
-        assert_eq!(detect_flat_nesting(&primary, &child), None);
-    }
-
-    /// Genuine nesting but WILDLY uneven (the shape of an observation-level
-    /// factor like grouseticks' `INDEX`): one parent holds most of the children
-    /// — 5/1/1 — so the padded rectangle `n_parents · max_children = 3·5 = 15`
-    /// exceeds `NESTING_INFLATION_BOUND · 7 levels = 14`. Detection fails
-    /// closed to `Crossed` (`None`) even though every child nests cleanly.
-    #[test]
-    fn detect_flat_nesting_high_inflation_stays_crossed() {
-        let primary = vec![0, 0, 0, 0, 0, 1, 2];
-        let child = strs(&["a", "b", "c", "d", "e", "f", "g"]);
-        assert_eq!(detect_flat_nesting(&primary, &child), None);
-    }
-
-    /// The inflation bound at equality: 4/1/1 children, so the padded rectangle
-    /// `3·4 = 12` equals `NESTING_INFLATION_BOUND · 6 levels = 12`, and the
-    /// layout stays nested. Four slots per parent, children in lexicographic
-    /// order within each, the unfilled slots unlabelled (`nested_padded_ids`).
-    #[test]
-    fn detect_flat_nesting_inflation_at_the_bound_stays_nested() {
-        let primary = vec![0, 0, 0, 0, 1, 2];
-        let child = strs(&["a", "b", "c", "d", "e", "f"]);
-        let (ids, labels) = detect_flat_nesting(&primary, &child).unwrap();
-        assert_eq!(ids, vec![0, 1, 2, 3, 4, 8]);
-        let slot = |s: &str| Some(s.to_string());
-        assert_eq!(
-            labels,
-            vec![
-                slot("a"),
-                slot("b"),
-                slot("c"),
-                slot("d"),
-                slot("e"),
-                None,
-                None,
-                None,
-                slot("f"),
-                None,
-                None,
-                None,
-            ]
-        );
-    }
-
-    /// Two flat extras that BOTH nest cleanly in the primary: the kernel holds
-    /// one nested slot, so only the first detects `NestedWithin`; the second
-    /// fails closed to `Crossed` (same statistical model either way). Beyond
-    /// the `matches!` on the relation tag, this pins the actual
-    /// padded ids and slot labels `lower()` built: `g2`'s two children per
-    /// parent land at global ids `[0,1]`/`[2,3]` (bare child labels, hand-traced
-    /// in `nested_padded_ids`), and `g3`'s crossed codes are its own
-    /// lexicographic factor codes, unrelated to `g1`.
-    #[test]
-    fn second_flat_nesting_candidate_stays_crossed() {
+    fn flat_nesting_candidates_lower_crossed() {
         let table = Table {
             columns: vec![
                 (
@@ -2602,12 +2511,11 @@ mod tests {
             .iter()
             .map(|g| g.relation)
             .collect();
-        assert!(matches!(relations[0], GroupingRelation::NestedWithin));
-        assert!(matches!(relations[1], GroupingRelation::Crossed));
+        assert_eq!(relations, [GroupingRelation::Crossed; 2]);
         assert_eq!(
             lo.ids.extra[0],
             vec![0, 0, 1, 1, 2, 2, 3, 3],
-            "g2's two children per g1 parent, padded id per row"
+            "g2's own lexicographic factor codes (a1,a2,b1,b2)"
         );
         assert_eq!(
             lo.re_groups[1].slot_labels,
@@ -2617,7 +2525,7 @@ mod tests {
                 Some("b1".into()),
                 Some("b2".into())
             ],
-            "g2's slot labels stay bare child labels, not parent:child"
+            "g2's slot labels are bare child labels, not parent:child"
         );
         assert_eq!(
             lo.ids.extra[1],
@@ -2879,6 +2787,7 @@ mod tests {
             extra_counts: vec![3; re.extra_groupings.len()],
             spec: ModelSpec::mixed(lo.model.family, re),
             n_primary: 6,
+            tail_fill: 0.0,
         };
         crate::lmm::LmmGroupings::from_cluster_spec_ext(&sized, &primary, &extras)
     }

@@ -3,11 +3,14 @@
 \name{VarCorr.fastglmm}
 \alias{VarCorr.fastglmm}
 \alias{print.VarCorr.fastglmm}
+\alias{as.data.frame.VarCorr.fastglmm}
 \title{Variance components on the SD/correlation scale}
 \usage{
 \method{VarCorr}{fastglmm}(x, ...)
 
 \method{print}{VarCorr.fastglmm}(x, digits = max(3L, getOption("digits") - 3L), variance = FALSE, ...)
+
+\method{as.data.frame}{VarCorr.fastglmm}(x, row.names = NULL, optional = FALSE, order = "cov.last", ...)
 }
 \arguments{
 \item{x}{a \link{fastglmm} fit.}
@@ -19,6 +22,10 @@
 \item{variance}{add a \code{Variance} column before \code{Std.Dev.} (lme4's
 \code{print.summary.merMod} shape; the bare \code{print.fastglmm} header keeps
 \code{Std.Dev.} only, as \code{lme4::print.merMod} does).}
+
+\item{row.names, optional}{unused; part of the \code{as.data.frame} signature.}
+
+\item{order}{only \code{"cov.last"}, lme4's default; \code{"lower.tri"} is refused.}
 }
 \value{
 A list of class \code{"VarCorr.fastglmm"}, one named element per
@@ -42,4 +49,15 @@ Adds a method to \code{nlme::VarCorr}, the generic \code{lme4::VarCorr} also use
 \link{fastglmm} fit and an lme4 \code{merMod} fit dispatch through the same generic
 regardless of load order, and \code{VarCorr(fit)} works without an explicit
 \code{library(nlme)}.
+
+\code{as.data.frame()} returns lme4's long table, in lme4's default
+order (\code{order = "cov.last"}): columns \code{grp}, \code{var1}, \code{var2}, \code{vcov} and
+\code{sdcor}. Per grouping it has one variance row per column (\code{var2} is
+\code{NA}), then one covariance row per correlated pair, in lower-triangle
+column-major order (\code{var1} is the earlier column); a grouping with no
+estimates has no rows. A gaussian fit ends with a \code{Residual} row. lme4
+also adds a \code{Residual} row for a Gamma or inverse-Gaussian fit; fastglmm
+does not. Unlike lme4, which splits \code{(1 | g) + (0 + x | g)} into groups \code{g} and \code{g.1},
+fastglmm keeps one grouping \code{g} with two terms, so both rows have
+\code{grp = "g"} and there is no covariance row between them.
 }

@@ -177,15 +177,23 @@ pub(crate) fn wald_chisq(
     let lb: Vec<f64> = (0..rows)
         .map(|i| kept.iter().map(|&j| row(i)[j] * beta[j]).sum())
         .collect();
-    // `L V Lᵀ` over the kept columns, the lower triangle mirrored so the
-    // matrix is exactly symmetric.
+    // `L V` is an axpy per kept `a`, so the inner loop runs along `vcov[a]`.
+    // Started at −0.0 (the start `Iterator::sum` uses), each entry equals the
+    // dot product over `a` bit for bit.
     let lv: Vec<Vec<f64>> = (0..rows)
         .map(|i| {
-            kept.iter()
-                .map(|&b| kept.iter().map(|&a| row(i)[a] * vcov[a][b]).sum())
-                .collect()
+            let mut acc = vec![-0.0; kept.len()];
+            for &a in &kept {
+                let (s, va) = (row(i)[a], &vcov[a]);
+                for (out, &b) in acc.iter_mut().zip(&kept) {
+                    *out += s * va[b];
+                }
+            }
+            acc
         })
         .collect();
+    // `L V Lᵀ` over the kept columns, the lower triangle mirrored so the
+    // matrix is exactly symmetric.
     let mut m = Mat::<f64>::zeros(rows, rows);
     for i in 0..rows {
         for j in 0..=i {

@@ -9,6 +9,7 @@
 //! `g_k = lᵀ Jac_k l` (Satterthwaite, 1946; Kuznetsova, Brockhoff and
 //! Christensen, 2017).
 
+use super::cr2::mul;
 use super::evd::{sym_eigen, EvdError};
 use super::tails::{f_upper_p, t_two_sided_p};
 use faer::{Mat, MatRef};
@@ -103,12 +104,10 @@ pub(crate) fn contest_md(
         return Ok(from_1d(contest_1d(inp, &row(0))));
     }
 
-    // L C Lᵀ, symmetrized: the two triangles round differently. Plain loops,
-    // not faer's product operator, which reads the global parallelism.
-    let l_rows: Vec<Vec<f64>> = (0..rows).map(row).collect();
-    let lcl = Mat::from_fn(rows, rows, |i, j| {
-        bilinear(&l_rows[i], inp.vcov_beta, &l_rows[j])
-    });
+    // L C Lᵀ by faer's `matmul` at `Par::Seq` (not the product operator,
+    // which reads the global parallelism), symmetrized: the two triangles
+    // round differently.
+    let lcl = mul(l, mul(inp.vcov_beta, l.transpose()).as_ref());
     let vl = Mat::from_fn(rows, rows, |i, j| 0.5 * (lcl[(i, j)] + lcl[(j, i)]));
     let eig = sym_eigen(vl.as_ref(), true)?;
     let vectors = eig.vectors.expect("sym_eigen was asked for vectors");
@@ -126,26 +125,30 @@ pub(crate) fn contest_md(
             p_value: f64::NAN,
         });
     }
-    // Row m of PtL is eigenvector kept[m] times L.
-    let ptl: Vec<Vec<f64>> = kept
-        .iter()
-        .map(|&k| {
-            (0..p)
-                .map(|j| (0..rows).map(|i| vectors[(i, k)] * l[(i, j)]).sum())
-                .collect()
-        })
-        .collect();
+    // Row m of PtL (q × p) is eigenvector kept[m] times L.
+    let pk = Mat::from_fn(rows, q, |i, m| vectors[(i, kept[m])]);
+    let ptl = mul(pk.transpose(), l);
+    let ptl_row = |m: usize| -> Vec<f64> { (0..p).map(|j| ptl[(m, j)]).collect() };
     if q == 1 {
-        return Ok(from_1d(contest_1d(inp, &ptl[0])));
+        return Ok(from_1d(contest_1d(inp, &ptl_row(0))));
     }
 
+    // g_{m,k} = PtL_m Jac_k PtL_mᵀ: row m of PtL·Jac_k dotted with row m of PtL.
+    let ptl_jac: Vec<Mat<f64>> = inp
+        .jac
+        .iter()
+        .map(|j| mul(ptl.as_ref(), j.as_ref()))
+        .collect();
     let mut t2 = 0.0;
     let mut nu = Vec::with_capacity(q);
     for (m, &k) in kept.iter().enumerate() {
         let d = eig.values[k];
-        let est: f64 = ptl[m].iter().zip(inp.beta).map(|(a, b)| a * b).sum();
+        let est: f64 = (0..p).map(|j| ptl[(m, j)] * inp.beta[j]).sum();
         t2 += est * est / d;
-        let grad: Vec<f64> = inp.jac.iter().map(|j| qform(&ptl[m], j.as_ref())).collect();
+        let grad: Vec<f64> = ptl_jac
+            .iter()
+            .map(|pj| (0..p).map(|j| pj[(m, j)] * ptl[(m, j)]).sum())
+            .collect();
         nu.push(2.0 * d * d / qform(&grad, inp.vcov_varpar));
     }
     let f_value = t2 / q as f64;

@@ -386,8 +386,12 @@ pub(crate) fn exp_fill(buf: &mut [f64]) {
 // Arguments below `f64::MIN_POSITIVE` (zero, subnormals) are raised to it:
 // the fold never depends on such a value. It guards `y = 0` itself, and a
 // subnormal y is floored harmlessly because its term is multiplied by y.
-// μ = e^η with |η| ≤ 700 stays normal, and so does the ratio
-// (y+θ)/(μ+θ) ≥ θ/(μ+θ), since θ ≥ `NB_THETA_LO` = 1e-3.
+// μ = e^η with |η| ≤ 700 stays normal. The NB ratio (y+θ)/(μ+θ) need not:
+// at θ = 1e-6 and μ = e^700 it is about 1e-310 and is floored, but the NB
+// fold of `family_pass` keeps `ln u` only where that ratio is at least ½ and
+// takes the difference of two libm logs below it, so the floored log is never
+// kept (`family_pass_nb_tiny_shape_at_eta_max_is_exact`). The AGQ `log1p`
+// tiles keep their argument above ½.
 const LN_POS_FLOOR: f64 = f64::MIN_POSITIVE;
 const EXP_FIELD_MASK: u64 = 0x7FF0_0000_0000_0000;
 const ONE_BITS: u64 = 0x3FF0_0000_0000_0000;
@@ -654,8 +658,10 @@ pub(crate) const SQRT_PI: f64 = 1.772_453_850_905_516;
 /// `ln Γ(x)` for `x > 0`. Lanczos approximation, `g = 7`, 9-coefficient
 /// series (Lanczos 1964; coefficients the widely-used Godfrey/Boost set) —
 /// relative error < 2e-16 in exact arithmetic. In f64 the shift `x − 1` keeps
-/// x only to about 1.1e-16 absolute, so below 1 the series loses about
-/// `1.1e-16 / x` absolute; the branch below 1e-8 caps that loss.
+/// x only to about 1.1e-16 absolute, so below 1 the series would lose about
+/// `1.1e-16 / x` absolute (2e-12 relative at 1e-6); every x below 1 therefore
+/// goes through `lnΓ(1 + x) − ln x`, whose two terms are each accurate to
+/// about 1e-16.
 /// Used by the Gamma log-density term (`family::gamma_dispersion_term`, in the
 /// mixed ML objective and the GLM log-likelihood): the dispersion enters
 /// through `lnΓ(1/φ)`, and `ln φ` is a coordinate of the mixed outer search,
@@ -678,11 +684,10 @@ pub(crate) fn ln_gamma(x: f64) -> f64 {
     const G: f64 = 7.0;
     const LN_SQRT_2PI: f64 = 0.918_938_533_204_672_74; // ½·ln(2π)
 
-    // Below 1e-8 the shift `x − 1` keeps fewer than half of x's digits, and
-    // below about 1.1e-16 it rounds to −1 and the series divides by zero;
-    // `lnΓ(x) = lnΓ(1 + x) − ln x` has neither problem.
-    const TINY: f64 = 1e-8;
-    if x < TINY {
+    // Below 1 the shift `x − 1` loses x's low digits, and below about 1.1e-16
+    // it rounds to −1 and the series divides by zero; `lnΓ(x) = lnΓ(1 + x) −
+    // ln x` evaluates the series on [1, 2), where neither happens.
+    if x < 1.0 {
         return ln_gamma(1.0 + x) - x.ln();
     }
     // Reflection is unnecessary here (callers pass x>0), so use the direct series.
@@ -1954,6 +1959,26 @@ mod tests {
         }
     }
 
+    /// The NB row terms take `lnΓ(θ)` down to the shape's lower search
+    /// limit, 1e-6. References: mpmath `loggamma` at 50 digits, rounded to
+    /// the nearest double (validation/tools/prep/ln_gamma_tiny_reference.py).
+    #[test]
+    fn ln_gamma_is_accurate_at_tiny_shapes() {
+        let cases = [
+            (1e-6, 13.815509980749432),
+            (1e-5, 11.512919692895826),
+            (1e-4, 9.210282658633963),
+        ];
+        let errs: Vec<f64> = cases
+            .iter()
+            .map(|&(x, want)| (ln_gamma(x) - want).abs() / want)
+            .collect();
+        assert!(
+            errs.iter().all(|&e| e <= 1e-14),
+            "relative errors at 1e-6, 1e-5, 1e-4: {errs:?}"
+        );
+    }
+
     #[test]
     fn erfc_blend_accuracy_and_head_tail_identity() {
         // The probit arm's Φ must stay near machine precision (the FD-Hessian SE
@@ -2284,6 +2309,40 @@ mod tests {
                 prob[len - 1]
             );
         }
+    }
+
+    /// At θ = 1e-6 and η = 700 the ratio θ/(μ+θ) is about 1e-310, subnormal,
+    /// and `ln_pos_fill` floors it to `f64::MIN_POSITIVE`; a fold that kept
+    /// that log would be 0.76% off. With y = 0 each row's deviance is
+    /// `2θ·ln((μ+θ)/θ)`. 17 rows put rows on the SIMD head and the scalar
+    /// tail on lane widths 2, 4 and 8.
+    #[test]
+    fn family_pass_nb_tiny_shape_at_eta_max_is_exact() {
+        let fam = Family::NegativeBinomial {
+            link: crate::spec::NegBinomialLink::Log,
+        };
+        let th = 1e-6;
+        let len = 17;
+        let mut eta = vec![crate::family::ETA_MAX; len];
+        let y = vec![0.0; len];
+        let (mut prob, mut w) = (vec![0.0; len], vec![0.0; len]);
+        let (dev, _) = family_pass(
+            fam,
+            th,
+            &mut eta,
+            &y,
+            &[],
+            false,
+            0.0,
+            &mut prob,
+            &mut w,
+            &mut [],
+        );
+        let want = len as f64 * 2.0 * th * ((700f64.exp() + th).ln() - th.ln());
+        assert!(
+            ((dev - want) / want).abs() <= 1e-12,
+            "deviance {dev}, want {want}"
+        );
     }
 
     /// A NaN η on a link that clamps η is flagged as not evaluable, wherever

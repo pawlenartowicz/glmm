@@ -74,11 +74,9 @@ pub(crate) use common::SizedSpec;
 pub(crate) use common::re_only_count;
 // One block's covariance off θ̃, which the LMM profile reads its estimates
 // through, as `Fit::varcorr` is assembled.
+#[cfg(any(feature = "formula", test))]
+pub(crate) use common::nested_padded_ids;
 pub(crate) use common::varcorr_block;
-// The flat-nesting check and its padded layout, which the formula front end
-// runs on the groupings as written.
-#[cfg(feature = "formula")]
-pub(crate) use common::{detect_flat_nesting, nested_padded_ids};
 // The sizer, for the tests outside `fit` that build kernel workspaces from
 // data-derived ids.
 #[cfg(test)]
@@ -253,10 +251,17 @@ pub(crate) struct DesignSummary {
 ///
 /// - `family_grouping`: the declaration index of the family grouping; 0
 ///   unless the fit made a crossed extra its primary.
-/// - `nested_slots`: when the declared primary is the nested grouping (the
-///   fit moved a slope grouping first and nested the primary in it), per
-///   declared level `l` of it the child slot `f·m + j` it holds; empty
-///   otherwise, and then a nested level's id is its slot.
+/// - `nested_grouping`: the declaration index of the grouping `nested_slots`
+///   maps; 0 when that is empty.
+/// - `nested_slots`: when the nested grouping was declared crossed (the fit
+///   found it nested in another grouping from the ids), per declared level
+///   `l` of it the child slot `f·m + j` it holds; empty otherwise, and then a
+///   nested level's id is its slot.
+/// - `pair_slots`: when the fit read the declared `NestedWithin` grouping
+///   crossed (`common::spec_sized_from_ids`), per observed (parent, child)
+///   pair, the grouping's level in the layout above, its declared padded
+///   slot; empty otherwise. A padded slot no pair names had no rows and has
+///   no covariance with any other level.
 /// - `family`, per family `f`, the vech (column-major lower triangle, as
 ///   `varcorr`) of the `w × w` covariance of its `w = q + m` coefficients: the
 ///   level's `q` reported coefficients, then the nested grouping's slots
@@ -273,7 +278,8 @@ pub(crate) struct DesignSummary {
 ///
 /// Memory: `Σ_f w(w+1)/2 + t(t+1)/2` values plus `w` per entry, the entries
 /// at most one per family and tail level its training rows share, and `t` at
-/// most `MAX_CROSSED_LEVELS`.
+/// most `MAX_CROSSED_LEVELS` on a Gaussian model and, on a GLMM, at most the
+/// structured layout's dense-tail bound (`dense_tail_fits`).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct CondvarCross {
     pub(crate) family_grouping: usize,
@@ -282,7 +288,9 @@ pub(crate) struct CondvarCross {
     pub(crate) coupling_at: Vec<u32>,
     pub(crate) coupling_cols: Vec<u32>,
     pub(crate) coupling: Vec<f64>,
+    pub(crate) nested_grouping: usize,
     pub(crate) nested_slots: Vec<u32>,
+    pub(crate) pair_slots: Vec<u32>,
 }
 
 /// What the kernels' factor walks return, in kernel coordinates: the
@@ -510,7 +518,7 @@ pub enum Note {
         rounds: u32,
     },
     /// The negative-binomial shape θ̂ ended on a limit of its search range
-    /// [0.001, 10000]: within 1e-6 of it on the log scale. The shape and the
+    /// [1e-6, 10000]: within 1e-6 of it on the log scale. The shape and the
     /// estimates computed at it are at that limit, not at an optimum. At the
     /// upper limit the data show no overdispersion the shape can measure (a
     /// near-Poisson fit); at the lower one they are more overdispersed than
@@ -518,7 +526,7 @@ pub enum Note {
     /// Raised by the NB GLM on a converged fit and by the NB GLMM on a fit
     /// with a finite endpoint.
     NbShapeAtLimit {
-        /// The limit θ̂ ended on, exactly 0.001 or 10000.
+        /// The limit θ̂ ended on, exactly 1e-6 or 10000.
         limit: f64,
     },
     /// `FitOptions::wald_se == WaldSe::Hessian` was requested, but the
@@ -716,7 +724,14 @@ pub enum Note {
     /// next to its residual SD (about 1e5 times it at n = 1000), or weights
     /// spanning about 1e11 or more. There θ̂ stops where the search first
     /// meets the exact-fit floor, so the log-likelihood can sit far below its
-    /// maximum, and a fitted weight power can stop far from the best one.
+    /// maximum, and a fitted weight power can stop far from the best one. On
+    /// the dense layouts with one grouping factor (nested intercepts allowed,
+    /// no crossed factor or extra-grouping slope) such a fit is searched again
+    /// on the QR form of the same criterion, where the estimate is
+    /// `2ε·(ν·‖√Ŵy‖/r + Σ_{j<p} ‖√Ŵx̃_j‖/T_jj)` (the sum under REML only; `r`
+    /// the residual norm and `T_jj` the fixed-effect pivots, both computed by
+    /// rotations, so it grows only as `r` goes to zero). The note is computed
+    /// on the kernel and weight scale the fit ended on.
     PrecisionLimited,
     /// The Satterthwaite pass of a Gaussian LMM ([`Fit::coef_df`]) met a
     /// curvature it cannot take at face value. Raised when the Hessian of the
@@ -762,7 +777,12 @@ pub enum Note {
     /// deviation relative to the residual one); on other families the random
     /// effect has no finite estimate. Raised on any fit with a finite endpoint
     /// (sets [`Boundary::UpperLimit`] when the boundary would otherwise read
-    /// `Interior`); `converged` and `singular` are not changed.
+    /// `Interior`); `converged` and `singular` are not changed. A Gaussian
+    /// mixed fit first moves its internal weight scale by a power of 4, so θ
+    /// leaves the limit, and searches again, up to 4 times: on it the note
+    /// means θ is still on the limit after those rescales. A Gaussian search
+    /// can also stop just inside the limit (a few thousandths below 1000),
+    /// where no rescale starts and this note is not raised.
     VarianceAtLimit,
     /// A Gamma GLMM's free dispersion ended on an edge of its search box
     /// `[GAMMA_PHI_LO, GAMMA_PHI_HI]`. On a weighted fit the box applies to φ
@@ -1256,12 +1276,13 @@ impl Fit {
     /// Formed once when the `Fit` is assembled, from the factors at the
     /// optimum, and only when [`FitOptions::condvar`] asks for it. Empty on a
     /// fit that did not ask, on a fit that did not converge (its `ranef` is
-    /// NaN), and on the layouts where it is not computed: a Gaussian LMM on the sparse route (random slopes on two or
-    /// more groupings, a lone slope grouping written after others that leave
-    /// more than `MAX_CROSSED_LEVELS` crossed levels when it is moved first or
-    /// whose slope block is wider than `MAX_PRIMARY_Q`,
-    /// over the dense envelope or more than `MAX_CROSSED_LEVELS` crossed levels) and a GLMM on the packed layout,
-    /// which would need a selected inverse of the whole system.
+    /// NaN), and on the layouts where it is not computed: a Gaussian LMM on
+    /// the sparse route (random slopes on two or more groupings, a slope block
+    /// wider than `MAX_PRIMARY_Q`, a model over the dense envelope, or more
+    /// than `MAX_CROSSED_LEVELS` crossed levels in the tail whichever grouping
+    /// goes first), a Gaussian LMM that ended on the QR form of its criterion
+    /// (see [`Note::PrecisionLimited`]), and a GLMM on the packed layout, which
+    /// would need a selected inverse of the whole system.
     ///
     /// # Panics
     ///
@@ -1637,8 +1658,16 @@ pub struct FitOptions {
     /// grows with the level count, up to as much as the fit itself on a
     /// crossed model with many levels, and a caller fitting in a loop rarely
     /// reads them. With `false`, `condvar` is empty and such a prediction
-    /// returns [`FitError::Unsupported`]; no other field of the fit depends on
-    /// it.
+    /// returns [`FitError::Unsupported`].
+    ///
+    /// On a Gaussian mixed model with a crossed grouping it also picks the
+    /// kernel: `true` keeps the dense kernel, the one that forms conditional
+    /// variances, up to [`MAX_CROSSED_LEVELS`](crate::limits::MAX_CROSSED_LEVELS) crossed levels,
+    /// while `false` lets a large crossed tail whose groupings overlap little
+    /// take the sparse kernel, which can be faster. The two kernels reach the
+    /// same optimum, so such a fit's numbers can differ between `true` and
+    /// `false` by round-off. No other model reads it for its fit. On the loop
+    /// tier it is fixed when the workspace is built.
     pub condvar: bool,
     /// The estimator of a Gaussian mixed model: restricted maximum likelihood
     /// (REML) or maximum likelihood (ML). Default `None`, which resolves to
@@ -1819,23 +1848,36 @@ impl Default for FitOptions {
 #[derive(Clone)]
 pub struct ErrorMessage {
     text: String,
-    row: Option<RowAt>,
+    row: Option<NumberAt>,
+    column: Option<NumberAt>,
 }
 
-/// Where a row sits in an [`ErrorMessage`]: the 0-based row and the byte
-/// range of its digits in the text.
+/// Where a number sits in an [`ErrorMessage`]: the 0-based value and the
+/// byte range of its digits in the text.
 #[derive(Clone, Copy)]
-struct RowAt {
-    row: usize,
+struct NumberAt {
+    value: usize,
     start: usize,
     end: usize,
+}
+
+/// Appends `value` to `text` and records where its digits sit.
+fn push_number(text: &mut String, value: usize) -> NumberAt {
+    use std::fmt::Write;
+    let start = text.len();
+    write!(text, "{value}").expect("writing to a String cannot fail");
+    NumberAt {
+        value,
+        start,
+        end: text.len(),
+    }
 }
 
 impl ErrorMessage {
     /// The 0-based row of the data the check failed at, `None` when the
     /// message names no row.
     pub fn row(&self) -> Option<usize> {
-        self.row.map(|at| at.row)
+        self.row.map(|at| at.value)
     }
 
     /// The text with `shown` in place of the row's number; the text as it is
@@ -1849,14 +1891,31 @@ impl ErrorMessage {
 
     /// `before`, the row, then `after`: the one way a row enters a message.
     pub(crate) fn at_row(mut before: String, row: usize, after: &str) -> ErrorMessage {
-        use std::fmt::Write;
-        let start = before.len();
-        write!(before, "{row}").expect("writing to a String cannot fail");
-        let end = before.len();
+        let row = Some(push_number(&mut before, row));
         before.push_str(after);
         ErrorMessage {
             text: before,
-            row: Some(RowAt { row, start, end }),
+            row,
+            column: None,
+        }
+    }
+
+    /// `before`, the row, `between`, the 0-based design column, then `after`.
+    pub(crate) fn at_cell(
+        mut before: String,
+        row: usize,
+        between: &str,
+        column: usize,
+        after: &str,
+    ) -> ErrorMessage {
+        let row = Some(push_number(&mut before, row));
+        before.push_str(between);
+        let column = Some(push_number(&mut before, column));
+        before.push_str(after);
+        ErrorMessage {
+            text: before,
+            row,
+            column,
         }
     }
 
@@ -1864,6 +1923,12 @@ impl ErrorMessage {
     #[cfg(feature = "orchestrate")]
     pub(crate) fn digits(&self) -> Option<(usize, usize)> {
         self.row.map(|at| (at.start, at.end))
+    }
+
+    /// The 0-based design column and the byte range of its digits in the text.
+    #[cfg(feature = "orchestrate")]
+    pub(crate) fn column_at(&self) -> Option<(usize, (usize, usize))> {
+        self.column.map(|at| (at.value, (at.start, at.end)))
     }
 }
 
@@ -1881,7 +1946,11 @@ impl std::ops::Deref for ErrorMessage {
 
 impl From<String> for ErrorMessage {
     fn from(text: String) -> Self {
-        ErrorMessage { text, row: None }
+        ErrorMessage {
+            text,
+            row: None,
+            column: None,
+        }
     }
 }
 
@@ -2370,31 +2439,113 @@ fn count_non_integer_response(y: &[f64], family: Family, weights: Option<&[f64]>
         Family::Gaussian | Family::Gamma { .. } | Family::InverseGaussian { .. } => 0,
     }
 }
-/// Which LMM/GLMM solver a design routes to. `NoZ` is the dense
-/// no-Z fast path with bounded stack scratch (the `MAX_*` envelope), kept
-/// byte-identical. `Sparse` is the heap sparse-Z path that lifts the caps. The
-/// boundary is currently hard-coded at the cap edge; pulling in-envelope-but-large
-/// designs into `Sparse` for speed is future, measured work.
+/// Which LMM/GLMM solver a design routes to. `NoZ` is the dense no-Z path
+/// (the `MAX_*` envelope): the Gaussian dense kernel, and on a GLMM the blocked
+/// or structured layout. `Sparse` is the sparse-Z path: the Gaussian sparse
+/// kernel, and on a GLMM the packed layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Solver {
     NoZ,
     Sparse,
 }
 
-/// Route a design to `NoZ` (in-envelope) or `Sparse` (over-envelope). The
-/// RE-envelope caps — extra-grouping count, primary width `q_p`, per-extra
-/// width `q_g` — are a scratch ceiling, not a model ceiling: over the caps
-/// routes to `Sparse` instead of failing. Fixed-only and nAGQ legality are
-/// handled by `check_model_shape` (which runs first and refuses the shapes
-/// no kernel fits).
+/// Below this coupling fill ([`SizedSpec::tail_fill`]) a Gaussian with
+/// `condvar` off and more than [`DENSE_KERNEL_MAX_TAIL`] crossed levels takes
+/// the sparse kernel. Fitted in November 2026, jointly with
+/// `DENSE_KERNEL_MAX_TAIL`, on the instruction counts of 41 Gaussian models
+/// (the mean slowdown against the faster kernel) and checked on 14 held-out
+/// ones, natively, on WebAssembly and on macOS; one value serves all three
+/// (the fitted value was 0.0232).
+pub(crate) const DENSE_KERNEL_MIN_FILL: f64 = 0.023;
+
+/// Up to this many crossed levels a Gaussian keeps the dense kernel whatever
+/// its fill (fitted with [`DENSE_KERNEL_MIN_FILL`]).
+pub(crate) const DENSE_KERNEL_MAX_TAIL: usize = 64;
+
+/// The largest dense crossed tail a route may hold, in bytes. Not a speed
+/// crossover: it only stops a multi-gigabyte allocation. Lower on wasm32,
+/// where a failed allocation traps and ends the session.
+pub(crate) const DENSE_TAIL_MAX_BYTES: usize = if cfg!(target_arch = "wasm32") {
+    256 << 20
+} else {
+    1 << 30
+};
+
+/// Whether `blocks` dense `e × e` f64 buffers fit in [`DENSE_TAIL_MAX_BYTES`],
+/// `e` the crossed column count. `blocks` is the number of such buffers the
+/// route holds at once:
 ///
-/// On top of the structural caps, slope-carrying extra groupings always route
-/// `Sparse`, and so does a total `Crossed` level count past
-/// `MAX_CROSSED_LEVELS` — see the comments at the clauses.
+/// - the Gaussian dense kernel (`LmmFitScratch`): the tail and its factor
+///   (`tail`, `tail_l`), and on a primary with no slopes also the balanced
+///   collapse's combine scratch `comb` and its `w(w+1)/2` family Grams
+///   `fam_gram`, `w` the family width (1 plus the nested grouping's children
+///   per parent): 2, or `3 + w(w+1)/2`. [`gaussian_dense_fits`] adds its
+///   `n_primary · w · e` couplings `bt` to the same bound. These
+///   buffers are `e + p + 1` wide (the `p` fixed-effect columns and the
+///   response), but the bound counts the crossed columns only, so a design
+///   with many fixed effects can pass it by a factor `((e + p + 1)/e)²`;
+/// - a GLMM on the structured layout: 4, the Schur block `schur_blk` of its
+///   workspace, the exact β-profile's tail inverse `exact_prof.tail_inv`
+///   (allocated at build), the inverse the conditional variances form
+///   (`sinv` in `glmm::se`), and the packed lower triangle of it that
+///   `assemble_condvar_cross` writes while the other three are alive (half a
+///   block, rounded up); counted whether or not `condvar` is on because the
+///   layout is chosen without it. The dual-derivative twins and the
+///   assembled-gradient scratch hold more `e × e` buffers, but only up to
+///   `glmm::derivative::DUAL_TAIL_MAX` (500) crossed levels, far below the
+///   bound.
 ///
-/// The level-count clause reads the crossed counts of `sized`
-/// ([`SizedSpec::extra_counts`]).
-pub(crate) fn classify_design(sized: &SizedSpec, _nagq: u8) -> Solver {
+/// Another `e × e` buffer on either route changes its `blocks`, not the
+/// constant.
+pub(crate) fn dense_tail_fits(e: usize, blocks: usize) -> bool {
+    8 * (e as u128) * (e as u128) * (blocks as u128) <= DENSE_TAIL_MAX_BYTES as u128
+}
+
+/// Whether the Gaussian dense kernel's buffers on `sized` (an in-envelope
+/// spec, so a nested grouping is intercept-only) fit in
+/// [`DENSE_TAIL_MAX_BYTES`], `e` the crossed column count: the `blocks` `e × e`
+/// buffers of [`dense_tail_fits`] plus the stacked family couplings `bt`
+/// (`n_primary · w · e`), `w` the family width. Mirrors
+/// `LmmFitScratch::with_groupings` (change together).
+fn gaussian_dense_fits(sized: &SizedSpec, re: &crate::ReStructure, e: usize) -> bool {
+    // `LmmGroupings` keeps the last nested grouping.
+    let nested = re
+        .extra_groupings
+        .iter()
+        .zip(&sized.extra_counts)
+        .rev()
+        .find(|(g, _)| g.relation == GroupingRelation::NestedWithin)
+        .map_or(0, |(_, &c)| c.max(1));
+    let w = 1 + re.slopes.len() + nested;
+    let blocks = if re.slopes.is_empty() {
+        3 + w * (w + 1) / 2
+    } else {
+        2
+    };
+    let e = e as u128;
+    8 * e * (blocks as u128 * e + sized.n_primary as u128 * w as u128)
+        <= DENSE_TAIL_MAX_BYTES as u128
+}
+
+/// Route a design to `NoZ` (the dense path) or `Sparse`. The RE-envelope caps
+/// (extra-grouping count, primary width `q_p`, per-extra width `q_g`) are a
+/// scratch ceiling, not a model ceiling: over the caps routes to `Sparse`
+/// instead of failing, and so does a slope on an extra grouping. Fixed-only
+/// and nAGQ legality are handled by `check_model_shape` (which runs first and
+/// refuses the shapes no kernel fits).
+///
+/// Inside the envelope the crossed tail decides, `e` its total crossed level
+/// count ([`SizedSpec::extra_counts`]):
+///
+/// - a non-Gaussian family: `NoZ` while its dense tails fit
+///   ([`dense_tail_fits`] with 4 blocks);
+/// - a Gaussian with `condvar` on: `NoZ` up to `MAX_CROSSED_LEVELS`, since
+///   only the dense kernel forms conditional variances;
+/// - a Gaussian with `condvar` off: `NoZ` when `e` is at most
+///   [`DENSE_KERNEL_MAX_TAIL`] or the tail's coupling fill
+///   ([`SizedSpec::tail_fill`]) is at least [`DENSE_KERNEL_MIN_FILL`], and the
+///   dense kernel's buffers fit ([`gaussian_dense_fits`]).
+pub(crate) fn classify_design(sized: &SizedSpec, condvar: bool) -> Solver {
     let Some(re) = sized.spec.re.as_ref() else {
         return Solver::NoZ; // no random effects ⇒ nothing to make sparse
     };
@@ -2413,11 +2564,13 @@ pub(crate) fn classify_design(sized: &SizedSpec, _nagq: u8) -> Solver {
     // (`build_packed_m` carries a debug_assert), so Sparse — whose PIRLS applies
     // full q_g×q_g Λ-blocks per extra level — is the only implemented route.
     let slope_extras = re.extra_groupings.iter().any(|g| !g.slopes.is_empty());
-    // Many-level crossed extras route Sparse: every crossed level lands in the
-    // dense tail (`reml_deviance`'s `t_dim`; the dense GLMM path's Schur
-    // complement likewise), which is cubic in the TOTAL crossed level count —
-    // hence the sum over factors, not a per-factor cap. See MAX_CROSSED_LEVELS
-    // for the measured blowup and the placeholder threshold's rationale.
+    if over || slope_extras {
+        return Solver::Sparse;
+    }
+    // Every crossed level lands in the dense tail (`reml_deviance`'s `t_dim`;
+    // the dense GLMM path's Schur complement likewise), which is cubic in the
+    // TOTAL crossed level count, hence the sum over factors. With slopes on
+    // no extra, this is also the tail's column count.
     let crossed_levels: usize = re
         .extra_groupings
         .iter()
@@ -2427,10 +2580,18 @@ pub(crate) fn classify_design(sized: &SizedSpec, _nagq: u8) -> Solver {
             GroupingRelation::NestedWithin => 0,
         })
         .sum();
-    if over || slope_extras || crossed_levels > crate::consts::MAX_CROSSED_LEVELS {
-        Solver::Sparse
-    } else {
+    let dense = match sized.spec.family {
+        Family::Gaussian if condvar => crossed_levels <= crate::consts::MAX_CROSSED_LEVELS,
+        Family::Gaussian => {
+            (crossed_levels <= DENSE_KERNEL_MAX_TAIL || sized.tail_fill >= DENSE_KERNEL_MIN_FILL)
+                && gaussian_dense_fits(sized, re, crossed_levels)
+        }
+        _ => dense_tail_fits(crossed_levels, 4),
+    };
+    if dense {
         Solver::NoZ
+    } else {
+        Solver::Sparse
     }
 }
 
@@ -2467,14 +2628,15 @@ pub(crate) use glmm::{fit_glmm_build, run_glmm_on};
 #[cfg(test)]
 pub(crate) use lmm::{fit_mle_noz_pub, fit_mle_sparse_pub};
 
-/// [`fit`]'s fit of a full-rank mixed design from a cold start, returned with
-/// the workspace it ran on, so the caller can read what the fit left there
-/// (`FitWorkspace::profile_kernel`): the profile intervals search on that
-/// workspace. `data` carries the ids and passed [`validate`]; no
-/// rank-deficiency salvage and no Satterthwaite pass run here.
-pub(crate) fn fit_cold_keep_workspace(
+/// [`fit`]'s fit of a full-rank mixed design, cold or from `start`, the
+/// weights as given, returned with the workspace it ran on, so the caller can
+/// read what the fit left there (`FitWorkspace::profile_kernel`): the profile
+/// intervals search on that workspace. `data` carries the ids and passed
+/// [`validate`]; no rank-deficiency salvage and no Satterthwaite pass run here.
+pub(crate) fn fit_keep_workspace(
     data: &Data<'_>,
     model: &ModelSpec,
+    start: Option<&StartValues>,
     opts: &FitOptions,
 ) -> (Fit, core::FitWorkspace) {
     let Design { n, p, ids, .. } = data.design;
@@ -2487,7 +2649,7 @@ pub(crate) fn fit_cold_keep_workspace(
         },
         y: data.y,
     };
-    let fit = core::fit_on(&mut ws, &rows, None, opts).into_fit(&rows, model, opts);
+    let fit = core::fit_on(&mut ws, &rows, start, opts).into_fit(&rows, model, opts);
     (fit, ws)
 }
 

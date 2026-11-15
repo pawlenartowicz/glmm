@@ -66,20 +66,24 @@ use crate::{
 
 /// The error of an entry point that lowers or fits a port's data: the
 /// message, and the 0-based row of the data the port passed that it names,
-/// if any. The text counts rows from 0 over the rows passed, as
-/// [`crate::FitError`]'s does; [`PortError::message_with_row`] names the row
-/// as the port numbers it, so the port never parses the text.
+/// if any. The text counts rows and design columns from 0 over the rows
+/// passed, as [`crate::FitError`]'s does; [`PortError::message_shown`] names
+/// the row and the design column in the port's own numbering, so the port
+/// never parses the text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortError {
     /// The message, as [`crate::FitError`] or [`crate::formula::Error`]
-    /// display it. Read it, do not edit it: [`PortError::message_with_row`]
-    /// splices the row at a byte range of this text.
+    /// display it. Read it, do not edit it: [`PortError::message_shown`]
+    /// splices the row and the column at byte ranges of this text.
     pub message: String,
     /// The 0-based row of the data the port passed, `None` when the error
     /// names no row.
     pub row: Option<usize>,
     /// The byte range of the row's digits in `message`.
     digits: Option<(usize, usize)>,
+    /// The 0-based design column `message` names and the byte range of its
+    /// digits.
+    column: Option<(usize, (usize, usize))>,
     /// Whether the error refuses a value the caller gave a fit option or a
     /// warm start ([`FitError::OptionValue`], [`FitError::Start`]), not the
     /// model or the data.
@@ -87,18 +91,24 @@ pub struct PortError {
 }
 
 impl PortError {
-    /// The message with `shown` in place of the row's number: for a port,
-    /// the position in its caller's data of the row it passed as
-    /// [`PortError::row`]. The message as it is when it names no row.
-    pub fn message_with_row(&self, shown: usize) -> String {
-        match self.digits {
-            Some((start, end))
-                if self.message.is_char_boundary(start) && self.message.is_char_boundary(end) =>
-            {
-                splice_row(&self.message, (start, end), shown)
-            }
-            _ => self.message.clone(),
+    /// The message with `row` in place of the row's number and the 0-based
+    /// column plus `column_base` in place of the column's. `row` is, for a
+    /// port, the position in its caller's data of the row it passed as
+    /// [`PortError::row`]. A number the message does not name is skipped.
+    pub fn message_shown(&self, row: usize, column_base: usize) -> String {
+        // The column's digits come after the row's, so the column goes in
+        // first: a row with more digits would move the column's range.
+        let at = |text: &str, (start, end): (usize, usize)| {
+            text.is_char_boundary(start) && text.is_char_boundary(end)
+        };
+        let mut text = self.message.clone();
+        if let Some((column, range)) = self.column.filter(|&(_, r)| at(&text, r)) {
+            text = splice_row(&text, range, column + column_base);
         }
+        if let Some(range) = self.digits.filter(|&r| at(&text, r)) {
+            text = splice_row(&text, range, row);
+        }
+        text
     }
 
     /// A refusal of a value the caller gave an argument.
@@ -116,6 +126,7 @@ impl From<&ErrorMessage> for PortError {
             message: m.to_string(),
             row: m.row(),
             digits: m.digits(),
+            column: m.column_at(),
             argument: false,
         }
     }
@@ -127,6 +138,7 @@ impl From<String> for PortError {
             message,
             row: None,
             digits: None,
+            column: None,
             argument: false,
         }
     }
@@ -964,9 +976,15 @@ pub struct CondvarCrossRecord {
     pub coupling_cols: Vec<u32>,
     /// Per coupling entry, one value per family coefficient.
     pub coupling: Vec<f64>,
-    /// The declared primary's child slots when it is the nested grouping;
+    /// The declaration index of the grouping `nested_slots` maps; 0 when
+    /// that is empty.
+    pub nested_grouping: usize,
+    /// The nested grouping's child slots when it was declared crossed;
     /// empty otherwise.
     pub nested_slots: Vec<u32>,
+    /// The declared nested grouping's padded slot per observed pair when the
+    /// fit read it crossed; empty otherwise.
+    pub pair_slots: Vec<u32>,
 }
 
 impl From<CondvarCross> for CondvarCrossRecord {
@@ -978,7 +996,9 @@ impl From<CondvarCross> for CondvarCrossRecord {
             coupling_at: c.coupling_at,
             coupling_cols: c.coupling_cols,
             coupling: c.coupling,
+            nested_grouping: c.nested_grouping,
             nested_slots: c.nested_slots,
+            pair_slots: c.pair_slots,
         }
     }
 }
@@ -992,7 +1012,9 @@ impl From<&CondvarCrossRecord> for CondvarCross {
             coupling_at: c.coupling_at.clone(),
             coupling_cols: c.coupling_cols.clone(),
             coupling: c.coupling.clone(),
+            nested_grouping: c.nested_grouping,
             nested_slots: c.nested_slots.clone(),
+            pair_slots: c.pair_slots.clone(),
         }
     }
 }
@@ -3620,14 +3642,43 @@ mod tests {
         assert_eq!(err.row, Some(3));
         assert_eq!(err.message, "Poisson response must be >= 0 (row 3)");
         assert_eq!(
-            err.message_with_row(17),
+            err.message_shown(17, 0),
+            "Poisson response must be >= 0 (row 17)"
+        );
+        // A message without a column ignores the column base.
+        assert_eq!(
+            err.message_shown(17, 1),
             "Poisson response must be >= 0 (row 17)"
         );
         // A message without a row is the same whatever the port shows.
         let plain = PortError::from("no row here".to_string());
         assert_eq!(
-            (plain.row, plain.message_with_row(4)),
+            (plain.row, plain.message_shown(4, 0)),
             (None, plain.message.clone())
+        );
+    }
+
+    /// A design refusal names the row as shown and the column from the
+    /// port's base; the shown row gains a digit, so the two splices must not
+    /// shift each other.
+    #[test]
+    fn a_design_refusal_renumbers_its_column() {
+        let (mut numeric, factor) = toy_ols();
+        numeric.get_mut("x").unwrap()[9] = 2e100;
+        let err = run_fit(
+            "y ~ x", numeric, factor, "gaussian", "identity", "hessian", 1, None, None, None, None,
+            true, true, None, "Wald", None, None,
+        )
+        .unwrap_err();
+        assert_eq!(err.row, Some(9));
+        assert_eq!(
+            err.message,
+            "x must be finite with |x| <= 1e100 (row 9, column 1, value 2e100; glmm::limits::MAX_DATA_ABS)"
+        );
+        assert_eq!(err.message_shown(9, 0), err.message);
+        assert_eq!(
+            err.message_shown(10, 1),
+            "x must be finite with |x| <= 1e100 (row 10, column 2, value 2e100; glmm::limits::MAX_DATA_ABS)"
         );
     }
 
@@ -3658,14 +3709,14 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.row, Some(2));
-        assert_eq!(err.message_with_row(3), "term 'x' is not finite at row 3");
+        assert_eq!(err.message_shown(3, 0), "term 'x' is not finite at row 3");
         let err = run_compare(
             "y ~ 1", "y ~ x", numeric, factor, "gaussian", "identity", 1, None, None, None, None,
             None, None,
         )
         .unwrap_err();
         assert_eq!(err.row, Some(2));
-        assert_eq!(err.message_with_row(3), "term 'x' is not finite at row 3");
+        assert_eq!(err.message_shown(3, 0), "term 'x' is not finite at row 3");
     }
 
     #[test]

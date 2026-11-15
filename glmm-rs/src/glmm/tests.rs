@@ -95,6 +95,7 @@ fn structured_glmm_entry_rejects_extra_slopes() {
         },
         n_primary: 2,
         extra_counts: vec![2],
+        tail_fill: 0.0,
     };
     let n = 8;
     let p = 2;
@@ -132,6 +133,7 @@ fn packed_layout_pins_nagq_to_one() {
         },
         n_primary: 2,
         extra_counts: vec![2],
+        tail_fill: 0.0,
     };
     let n = 8;
     let p = 2;
@@ -251,6 +253,7 @@ fn glmm_slope_crossed_dataset_sized(
         },
         n_primary: n_prim,
         extra_counts: vec![n_crossed],
+        tail_fill: 0.0,
     };
     (x, y, ids, crossed, cluster)
 }
@@ -433,6 +436,7 @@ fn agq_weighted_aggregated_equals_expanded_plus_saturated_const() {
         spec: logit_intercept_spec(),
         n_primary: nc,
         extra_counts: vec![],
+        tail_fill: 0.0,
     };
     for nagq in [1u8, 7] {
         let mut ws_a = GlmmWorkspace::for_cluster_spec(2, &cluster, n_a, &[], nagq);
@@ -473,6 +477,7 @@ fn agq_cluster_outer_bit_identical_to_node_outer() {
         spec: logit_intercept_spec(),
         n_primary: 8,
         extra_counts: vec![],
+        tail_fill: 0.0,
     };
     for nagq in [3u8, 7, 11] {
         let mut ws_a = GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], nagq);
@@ -573,6 +578,7 @@ fn slope1_spec() -> SizedSpec {
         },
         n_primary: 8,
         extra_counts: vec![],
+        tail_fill: 0.0,
     }
 }
 
@@ -591,6 +597,7 @@ fn slope2_spec() -> SizedSpec {
         },
         n_primary: 8,
         extra_counts: vec![],
+        tail_fill: 0.0,
     }
 }
 
@@ -745,6 +752,7 @@ fn laplace_deviance_collapses_to_glm_at_theta_zero() {
         spec: logit_intercept_spec(),
         n_primary: 8,
         extra_counts: vec![],
+        tail_fill: 0.0,
     };
     let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], 1);
     ws.params[0] = 0.0;
@@ -861,6 +869,7 @@ fn packed_m_vals_scale_each_extra_by_its_own_theta() {
         },
         n_primary: n_prim,
         extra_counts: vec![n_crossed, n_per_parent],
+        tail_fill: 0.0,
     };
     let n = 8usize;
     let ids: Vec<u32> = (0..n).map(|i| (i % n_prim) as u32).collect();
@@ -965,6 +974,7 @@ fn joint_hessian_cov_matches_glmer_use_hessian_true() {
         spec: logit_intercept_spec(),
         n_primary: n_clusters as usize,
         extra_counts: vec![],
+        tail_fill: 0.0,
     };
     let mut ws = GlmmWorkspace::for_cluster_spec(p, &cluster, n, &[], 1);
     let mut xf64 = Mat::<f64>::zeros(n, p);
@@ -1117,6 +1127,7 @@ fn exact_hessian_matches_fd_on_fixture() {
         spec: logit_intercept_spec(),
         n_primary: n_clusters as usize,
         extra_counts: vec![],
+        tail_fill: 0.0,
     };
     let mut xf64 = Mat::<f64>::zeros(n, p);
     for i in 0..n {
@@ -1575,6 +1586,7 @@ fn fd_hessian_parallel_bit_identical_to_serial() {
             spec: logit_intercept_spec(),
             n_primary: n_clusters as usize,
             extra_counts: vec![],
+            tail_fill: 0.0,
         };
         let mut ws = GlmmWorkspace::for_cluster_spec(p, &cluster, n, &[], 1);
         let mut xf64 = Mat::<f64>::zeros(n, p);
@@ -1614,6 +1626,7 @@ fn fd_hessian_parallel_bit_identical_to_serial() {
             spec: logit_intercept_spec(),
             n_primary: n_clusters as usize,
             extra_counts: vec![],
+            tail_fill: 0.0,
         };
         let mut ws = GlmmWorkspace::for_cluster_spec_packed(p, &cluster, n, &[], 1);
         let mut xf64 = Mat::<f64>::zeros(n, p);
@@ -1702,6 +1715,7 @@ fn hessian_mode_t_sq_uses_joint_hessian_cov() {
         spec: logit_intercept_spec(),
         n_primary: n_clusters as usize,
         extra_counts: vec![],
+        tail_fill: 0.0,
     };
     let mut xf64 = Mat::<f64>::zeros(n, p);
     for i in 0..n {
@@ -1817,6 +1831,7 @@ fn fd_hessian_non_pd_falls_back_to_rx() {
         spec: logit_intercept_spec(),
         n_primary: nc,
         extra_counts: vec![],
+        tail_fill: 0.0,
     };
     let mut ws = GlmmWorkspace::for_cluster_spec(p, &cluster, n, &[], 1);
 
@@ -1981,6 +1996,7 @@ fn fit_glmm_collapses_to_plain_irls_when_tau_negligible() {
         spec: logit_intercept_spec(),
         n_primary: nc,
         extra_counts: vec![],
+        tail_fill: 0.0,
     };
     let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[], 1);
     let fit = fit_glmm(
@@ -2140,6 +2156,7 @@ fn fit_glmm_warm_path_bounded_alloc() {
         spec: logit_intercept_spec(),
         n_primary: 8,
         extra_counts: vec![],
+        tail_fill: 0.0,
     };
     let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], 1);
     let _ = fit_glmm(
@@ -2475,6 +2492,7 @@ fn blocked_laplace_matches_brute_force_intercept() {
             spec: logit_intercept_spec(),
             n_primary: 8,
             extra_counts: vec![],
+            tail_fill: 0.0,
         };
         let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], 1);
         assert!(
@@ -2534,6 +2552,7 @@ fn blocked_pirls_matches_packed_slope_noextra() {
             },
             n_primary: 8,
             extra_counts: vec![],
+            tail_fill: 0.0,
         };
         // Packed oracle: the same design on the packed-row layout, which the
         // constructor would otherwise route to the blocked one.
@@ -2677,6 +2696,7 @@ fn blocked_inference_matches_packed_slope_noextra() {
         },
         n_primary: 8,
         extra_counts: vec![],
+        tail_fill: 0.0,
     };
     let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[1], 1);
     let fit = fit_glmm(
@@ -2811,6 +2831,7 @@ fn packed_fit_mode_seed_survives_sign_canonicalization() {
         },
         n_primary: 8,
         extra_counts: vec![],
+        tail_fill: 0.0,
     };
     let mut ws = GlmmWorkspace::for_cluster_spec_packed(2, &cluster, n, &[1], 1);
     fill_packed_cols(&mut ws, &ids, &[], n);
@@ -2853,6 +2874,7 @@ fn warm_start_is_per_fit_deterministic() {
         spec: logit_intercept_spec(),
         n_primary: 8,
         extra_counts: vec![],
+        tail_fill: 0.0,
     };
     let mk = || GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], 1);
     // Canonical: a fresh workspace's first (cold) fit.
@@ -2920,6 +2942,7 @@ fn warm_start_objective_is_seed_independent() {
         spec: logit_intercept_spec(),
         n_primary: 8,
         extra_counts: vec![],
+        tail_fill: 0.0,
     };
     let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, 80, &[], 1);
     ws.params[0] = 0.5;
@@ -3059,6 +3082,7 @@ pub(crate) fn glmm_extras_q1_dataset_sized(
         },
         n_primary: n_prim,
         extra_counts,
+        tail_fill: 0.0,
     };
     (x, y, ids, extra_ids, cluster)
 }
@@ -3917,7 +3941,7 @@ fn grouseticks_3crossed_fixture() -> (SizedSpec, crate::GroupIds, Mat<f64>, Vec<
     };
     // Level counts from the ids, as the fit entry sizes them before building
     // `LmmGroupings`.
-    let (sized, ids, _perm) = crate::fit::spec_sized_from_ids(&model, &ids);
+    let (sized, ids, _perm) = crate::fit::spec_sized_from_ids(&model, &ids, true);
     (sized, ids.into_owned(), x, y, n, p)
 }
 
@@ -4093,6 +4117,7 @@ fn logit_intercept_fixture() -> ExactProfileFixture {
         spec: logit_intercept_spec(),
         n_primary: 8,
         extra_counts: vec![],
+        tail_fill: 0.0,
     };
     (spec, ids, Vec::new(), x, y, 80, 2)
 }
@@ -4106,6 +4131,7 @@ fn probit_intercept_fixture() -> ExactProfileFixture {
         spec: logit_intercept_spec(),
         n_primary: 8,
         extra_counts: vec![],
+        tail_fill: 0.0,
     };
     spec.spec.family = Family::Binomial {
         link: BinomialLink::Probit,
@@ -4141,6 +4167,7 @@ fn sim_nb_intercept_fixture() -> ExactProfileFixture {
         },
         n_primary: n_clusters,
         extra_counts: vec![],
+        tail_fill: 0.0,
     };
     (spec, ids, Vec::new(), x, y, n, p)
 }
@@ -4802,6 +4829,7 @@ fn packed_path_overshoot_fixture() -> (GlmmWorkspace, Mat<f64>, Vec<f64>, Vec<u3
         },
         n_primary: n_prim,
         extra_counts: vec![n_crossed],
+        tail_fill: 0.0,
     };
     let mut ws = GlmmWorkspace::for_cluster_spec(1, &cluster, n, &slope_cols, 1);
     fill_packed_cols(&mut ws, &ids, &[crossed], n);
@@ -4862,6 +4890,7 @@ fn pirls_packed_profile_beta_reaches_pql_stationarity() {
         },
         n_primary: 8,
         extra_counts: vec![],
+        tail_fill: 0.0,
     };
     // The constructor would route this design to the blocked layout; the packed
     // kernel is what this test drives.
@@ -4977,6 +5006,7 @@ fn pirls_blocked_profile_beta_reaches_pql_stationarity() {
         },
         n_primary: 8,
         extra_counts: vec![],
+        tail_fill: 0.0,
     };
     let mut ws = GlmmWorkspace::for_cluster_spec(2, &cluster, n, &[1], 1);
     assert!(
@@ -5565,6 +5595,7 @@ fn blocked_path_overshoot_fixture() -> (GlmmWorkspace, Mat<f64>, Vec<f64>, Vec<u
         },
         n_primary: n_prim,
         extra_counts: vec![],
+        tail_fill: 0.0,
     };
     let groupings = crate::lmm::LmmGroupings::from_cluster_spec(&cluster, &slope_cols);
     let ws =
@@ -5621,6 +5652,7 @@ fn nb_workspace_carries_the_theta_nb_coordinate() {
             },
             n_primary: 4,
             extra_counts: vec![],
+            tail_fill: 0.0,
         },
         40,
         &[],
@@ -5649,6 +5681,7 @@ fn nb_workspace_carries_the_theta_nb_coordinate() {
             },
             n_primary: 4,
             extra_counts: vec![],
+            tail_fill: 0.0,
         },
         40,
         &[],
@@ -5687,6 +5720,7 @@ fn fit_glmm_se_failure_keeps_the_estimates() {
         spec: logit_intercept_spec(),
         n_primary: 8,
         extra_counts: vec![],
+        tail_fill: 0.0,
     };
     let fit_on = |x: faer::MatRef<f64>, p: usize, wald: WaldSe| {
         let mut ws = GlmmWorkspace::for_cluster_spec(p, &spec, n, &[], 1);
@@ -5786,6 +5820,7 @@ fn entangled_logit_fixture() -> (Mat<f64>, Mat<f64>, Vec<f64>, Vec<u32>, f64, Si
         spec: logit_intercept_spec(),
         n_primary: nc,
         extra_counts: vec![],
+        tail_fill: 0.0,
     };
     (x, xr, y, ids, delta, spec)
 }
@@ -6098,6 +6133,7 @@ fn two_stage_adversarial_bad_theta_start() {
         spec: logit_intercept_spec(),
         n_primary: 8,
         extra_counts: vec![],
+        tail_fill: 0.0,
     };
     assert_two_stage_adversarial(
         "bad_theta",
@@ -6147,6 +6183,7 @@ fn two_stage_adversarial_near_collinear_x() {
         spec: logit_intercept_spec(),
         n_primary: nc,
         extra_counts: vec![],
+        tail_fill: 0.0,
     };
     assert_two_stage_adversarial(
         "near_collinear",
@@ -6190,6 +6227,7 @@ fn two_stage_adversarial_tiny_clusters() {
         spec: logit_intercept_spec(),
         n_primary: nc,
         extra_counts: vec![],
+        tail_fill: 0.0,
     };
     assert_two_stage_adversarial(
         "tiny_clusters",
@@ -6230,6 +6268,7 @@ fn two_stage_adversarial_overflow_offset() {
         spec: intercept_only_spec(),
         n_primary: 6,
         extra_counts: vec![],
+        tail_fill: 0.0,
     };
     spec.spec.family = Family::Poisson {
         link: PoissonLink::Log,
@@ -6393,6 +6432,7 @@ fn fixture_with_nagq_sized(
         },
         n_primary: n_clusters as usize,
         extra_counts: vec![],
+        tail_fill: 0.0,
     };
     let mut ws = GlmmWorkspace::for_cluster_spec(p, &model, n, &slope_cols, nagq);
     if matches!(family, Family::NegativeBinomial { .. }) {
@@ -6455,6 +6495,7 @@ fn fixture_padded_sized(
         },
         n_primary: nc,
         extra_counts: vec![],
+        tail_fill: 0.0,
     };
     let mut ws = GlmmWorkspace::for_cluster_spec(p, &model, n, &slope_cols, 1);
     if matches!(family, Family::NegativeBinomial { .. }) {
@@ -8193,6 +8234,7 @@ fn laplace_log_det_is_the_exact_curvature_at_the_mode() {
             },
             n_primary: s,
             extra_counts: vec![],
+            tail_fill: 0.0,
         };
         let mut ws = GlmmWorkspace::for_cluster_spec(2, &model, n, &[], 1);
         let nb_theta = 2.0;
@@ -8310,6 +8352,7 @@ fn agq_nb_ladder_converges_and_one_node_is_laplace() {
             },
             n_primary: s,
             extra_counts: vec![],
+            tail_fill: 0.0,
         };
         let mut ws = GlmmWorkspace::for_cluster_spec(2, &model, n, &[], 1);
         ws.nb_theta = 2.0;
@@ -8369,6 +8412,7 @@ fn fit_glmm_vector_agq_keeps_search_lambda_at_pinned_diagonal() {
         },
         n_primary: nc,
         extra_counts: vec![],
+        tail_fill: 0.0,
     };
     let mut ws = GlmmWorkspace::for_cluster_spec(2, &spec, n, &[1], nagq);
     let fit = fit_glmm(
@@ -8551,6 +8595,7 @@ fn huge_count_cells(
         },
         n_primary: n_g,
         extra_counts: if crossed { vec![n_h] } else { vec![] },
+        tail_fill: 0.0,
     };
     let extra = vec![h];
     let blocked = GlmmWorkspace::for_cluster_spec(p, &spec(false), n, &[], 1);
@@ -9256,6 +9301,7 @@ fn agq_gd_fit(
         },
         n_primary: nc,
         extra_counts: vec![],
+        tail_fill: 0.0,
     };
     let mut ws = GlmmWorkspace::for_cluster_spec(p, &model, n, &[], 7);
     let fit = fit_glmm(
@@ -10039,6 +10085,7 @@ fn gradient_route_matches_or_beats_the_bobyqa_route() {
         },
         n_primary: 20,
         extra_counts: vec![],
+        tail_fill: 0.0,
     };
     let mut ws = GlmmWorkspace::for_cluster_spec(p, &model, n, &[], 7);
     ws.prior_w[..n].copy_from_slice(&w);

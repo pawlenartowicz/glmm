@@ -337,6 +337,43 @@ test_that("summary of an uncorrelated slope prints no correlation", {
   expect_length(slope_row(y ~ t + (1 + t | g)), 4L) # and Corr
 })
 
+test_that("as.data.frame(VarCorr()) gives lme4's columns and rows", {
+  m <- fastglmm(Reaction ~ Days + (Days | Subject), sleep_data())
+  vc <- VarCorr(m)
+  s <- vc$Subject
+  df <- as.data.frame(vc)
+  expect_identical(names(df), c("grp", "var1", "var2", "vcov", "sdcor"))
+  expect_identical(nrow(df), 4L)
+  expect_identical(df$grp, c("Subject", "Subject", "Subject", "Residual"))
+  expect_identical(df$var1, c("(Intercept)", "Days", "(Intercept)", NA))
+  expect_identical(df$var2, c(NA, NA, "Days", NA))
+  expect_equal(df$vcov, c(s[1, 1], s[2, 2], s[2, 1], attr(vc, "sc")^2))
+  expect_equal(df$sdcor, unname(c(attr(s, "stddev"), attr(s, "correlation")[2, 1],
+                                  attr(vc, "sc"))))
+
+  # q = 4 tells column-major from row-major order; q = 2 and 3 cannot.
+  v <- diag(4)
+  dimnames(v) <- list(letters[1:4], letters[1:4])
+  attr(v, "stddev") <- stats::setNames(rep(1, 4), letters[1:4])
+  attr(v, "correlation") <- diag(4)
+  attr(v, "term_index") <- rep(1L, 4)
+  hand <- as.data.frame(structure(list(g = v), class = "VarCorr.fastglmm",
+                                  sc = NA_real_))
+  expect_identical(hand$var1, c("a", "b", "c", "d", "a", "a", "a", "b", "b", "c"))
+  expect_identical(hand$var2, c(NA, NA, NA, NA, "b", "c", "d", "c", "d", "d"))
+
+  # Two terms of one grouping are uncorrelated: no covariance row.
+  d <- benchmark_data(seed = 101, family = "binomial",
+                      tau0 = 0.8, tau1 = 0.5, rho = 0.3)
+  two <- as.data.frame(VarCorr(fastglmm(y ~ t + (1 | g) + (0 + t | g), d,
+                                        family = binomial())))
+  expect_identical(nrow(two), 2L)
+  expect_identical(two$grp, c("g", "g"))
+  expect_true(all(is.na(two$var2)))
+
+  expect_error(as.data.frame(vc, order = "lower.tri"))
+})
+
 test_that("logLik carries df/nobs/REML and feeds AIC/BIC", {
   d <- benchmark_data(seed = 108, family = "binomial")
   fit <- fastglmm(y ~ t + (1 | g), d, family = binomial())

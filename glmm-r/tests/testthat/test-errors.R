@@ -544,9 +544,9 @@ test_that("an input outside its range is refused with the limit name", {
                   k = c(0, 1, 2, 1, 3, 2, 4, 3),
                   p = c(0, 0.5, 1, 0.5, 0.5, 0, 1, 0.5))
   at_row_3 <- function(fill, value) replace(rep(fill, 8), 3, value)
-  # The column number is not pinned: R names the design column 0-based.
   expect_error(fastglmm(y ~ x, transform(d, x = at_row_3(0, 2e100))),
-               "x must be finite with \\|x\\| <= 1e100 \\(row 3, column [0-9]+, value 2e100; glmm::limits::MAX_DATA_ABS\\)")
+               "x must be finite with |x| <= 1e100 (row 3, column 2, value 2e100; glmm::limits::MAX_DATA_ABS)",
+               fixed = TRUE)
   expect_error(fastglmm(y ~ x, d, weights = at_row_3(1, 1e-101)),
                "Data weights must be within [1e-100, 1e100] (row 3, value 1e-101; glmm::limits::MAX_DATA_ABS)",
                fixed = TRUE)
@@ -562,8 +562,8 @@ test_that("an input outside its range is refused with the limit name", {
   expect_error(fastglmm(y ~ x, d, family = inverse.gaussian(link = "log"), dispersion = 1e101),
                "dispersion on an inverse-Gaussian model must be within [1e-100, 1e100] (value 1e101; glmm::limits::MAX_DATA_ABS)",
                fixed = TRUE)
-  expect_error(fastglmm(k ~ x, d, family = "negativebinomial", init.theta = 1e-4),
-               "warm-start dispersion (the negative-binomial shape seed) must be within [1e-3, 1e4] (value 1e-4; glmm::limits::NB_THETA_LO, glmm::limits::NB_THETA_HI)",
+  expect_error(fastglmm(k ~ x, d, family = "negativebinomial", init.theta = 1e-7),
+               "warm-start dispersion (the negative-binomial shape seed) must be within [1e-6, 1e4] (value 1e-7; glmm::limits::NB_THETA_LO, glmm::limits::NB_THETA_HI)",
                fixed = TRUE)
 })
 

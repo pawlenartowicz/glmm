@@ -677,8 +677,9 @@ fn a_reciprocal_link_row_with_eta_at_or_below_zero_predicts_nan() {
 /// per-group fits with a correlated, an uncorrelated block and a
 /// random-effect-only slope, and on the GLMM structured layout a nested family
 /// with a crossed tail (cloglog) and Poisson fits with two and three crossed
-/// groupings in orders the size rule keeps and swaps, and a slope grouping
-/// written last with the first grouping nested in it.
+/// groupings in orders the fit keeps and swaps, a slope grouping written last
+/// with the first grouping nested in it, and three crossed groupings where
+/// the fit nests the second in the third.
 #[test]
 fn conditional_se_matches_a_dense_joint_inverse() {
     let mix_f: &[&str] = &["g1", "g2", "c1"];
@@ -694,7 +695,30 @@ fn conditional_se_matches_a_dense_joint_inverse() {
     for i in 0..n {
         nested_csv += &format!("{},{},h{:02},g{:02}\n", y[i], x[2 * i + 1], h[i], g[i]);
     }
-    let shapes: [(&str, &[&str], &str, Family); 11] = [
+    let (x, y, _, n, a, h, g) = crate::fit::common_tests::nest_away_case();
+    let mut away_csv = String::from("y,x,a,h,g\n");
+    for i in 0..n {
+        away_csv += &format!(
+            "{},{},a{},h{:02},g{:02}\n",
+            y[i],
+            x[2 * i + 1],
+            a[i],
+            h[i],
+            g[i]
+        );
+    }
+    // A declared nest past K, one parent with 8 children and the rest with
+    // 4, so it is read crossed and its other parents' blocks have empty
+    // slots.
+    let mut children = vec![4usize; 30];
+    children[7] = 8;
+    let (x, y, _, n, g, padded, _) = crate::fit::common_tests::declared_nest_case(&children);
+    let mut wide_csv = String::from("y,x,g,h\n");
+    for i in 0..n {
+        let j = padded[i] - 8 * g[i];
+        wide_csv += &format!("{},{},g{:02},h{}\n", y[i], x[2 * i + 1], g[i], j);
+    }
+    let shapes: [(&str, &[&str], &str, Family); 13] = [
         (
             include_str!("../../validation/data/empirical/Penicillin.csv"),
             &["plate", "sample"],
@@ -763,6 +787,18 @@ fn conditional_se_matches_a_dense_joint_inverse() {
             "y ~ 1 + x + (1 | h) + (1 + x | g)",
             Family::Gaussian,
         ),
+        (
+            &away_csv,
+            &["a", "h", "g"],
+            "y ~ 1 + x + (1 | a) + (1 | h) + (1 | g)",
+            Family::Gaussian,
+        ),
+        (
+            &wide_csv,
+            &["g", "h"],
+            "y ~ 1 + x + (1 | g/h)",
+            Family::Gaussian,
+        ),
     ];
     let opts = PredictOptions {
         se: true,
@@ -771,9 +807,14 @@ fn conditional_se_matches_a_dense_joint_inverse() {
     let mut ran = 0;
     for (csv, factors, formula, family) in shapes {
         let (lo, fit) = lowered_fit(csv, factors, formula, family);
-        if csv == nested_csv {
+        if csv == nested_csv || csv == away_csv {
             let c = fit.condvar_cross.as_ref().unwrap();
             assert!(!c.nested_slots.is_empty(), "{formula}: the nested map");
+        }
+        if csv == wide_csv {
+            let c = fit.condvar_cross.as_ref().unwrap();
+            assert_eq!(fit.ranef_levels, [30, 240], "{formula}: padded slots");
+            assert_eq!(c.pair_slots.len(), 124, "{formula}: the pair map");
         }
         let joint = crate::fit::common_tests::dense_joint(&lo, &fit);
         let mut gap = 0.0f64;
@@ -866,7 +907,7 @@ fn conditional_se_matches_a_dense_joint_inverse() {
         eprintln!("{formula}: conditional SE {gap:e}");
         ran += 1;
     }
-    assert_eq!(ran, 11);
+    assert_eq!(ran, 13);
 }
 
 /// The inputs `predict` refuses, one per check.

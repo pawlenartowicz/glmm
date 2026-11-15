@@ -1680,6 +1680,7 @@ fn assemble_varcorr_one_block_per_grouping() {
             },
             n_primary: 4,
             extra_counts: vec![3],
+            tail_fill: 0.0,
         },
         &[1],
         &[],
@@ -1724,7 +1725,7 @@ fn spec_sized_from_ids_derives_counts() {
         primary: vec![0, 1, 2, 0, 1, 2], // 3 primary levels
         extra: vec![vec![0, 0, 1, 1, 2, 2], vec![0, 1, 2, 3, 4, 5]], // crossed 3, nested 6 children
     };
-    let (sized, _ids, _perm) = super::spec_sized_from_ids(&model, &ids);
+    let (sized, _ids, _perm) = super::spec_sized_from_ids(&model, &ids, true);
     assert_eq!(sized.n_primary, 3);
     // Crossed: 3 levels; nested: 6 children / 3 parents = 2 per parent.
     assert_eq!(sized.extra_counts, vec![3, 2]);
@@ -1766,7 +1767,7 @@ fn spec_sized_from_ids_nested_unbalanced_first_parent_widest() {
             extra: vec![vec![0, 3, 4, 6, 7, 8]],
         },
     ] {
-        let (sized, _ids, _perm) = super::spec_sized_from_ids(&model, &ids);
+        let (sized, _ids, _perm) = super::spec_sized_from_ids(&model, &ids, true);
         assert_eq!(sized.n_primary, 3, "{:?}", ids.primary);
         assert_eq!(sized.extra_counts, vec![3], "{:?}", ids.primary);
     }
@@ -1792,8 +1793,9 @@ fn fit_extra_grouping_q_too_large_routes_sparse() {
         },
         n_primary: 4,
         extra_counts: vec![4],
+        tail_fill: 0.0,
     };
-    assert!(matches!(classify_design(&model, 1), Solver::Sparse));
+    assert!(matches!(classify_design(&model, true), Solver::Sparse));
 }
 
 /// Anti-panic floor: an over-envelope mixed model must return a `Fit`, never
@@ -1841,8 +1843,9 @@ fn fit_over_envelope_never_panics() {
             },
             n_primary: 2,
             extra_counts: vec![2; 7],
+            tail_fill: 0.0,
         };
-        assert!(matches!(classify_design(&model, 1), Solver::Sparse));
+        assert!(matches!(classify_design(&model, true), Solver::Sparse));
         let (n, p) = (8, 1);
         let x = vec![1.0f64; n * p];
         let y = vec![1.0f64; n];
@@ -1881,8 +1884,9 @@ fn fit_over_envelope_never_panics() {
             },
             n_primary: 4,
             extra_counts: vec![4],
+            tail_fill: 0.0,
         };
-        assert!(matches!(classify_design(&model_w, 1), Solver::Sparse));
+        assert!(matches!(classify_design(&model_w, true), Solver::Sparse));
         let (n, p) = (16, 5);
         let mut st = 11u64;
         let x: Vec<f64> = (0..n)
@@ -1993,11 +1997,12 @@ fn fit_glmm_past_max_theta_pins_without_panic() {
 /// width-0 re-entry: the column is aliased, so `fit_rank_deficient` re-enters
 /// the fit with no column kept. The last case is `n == p`.
 /// A degenerate fit has no conditional modes but keeps its level counts, and
-/// the size rule still reorders it, when the crossed extra has more levels or
-/// is the only grouping with a slope: `ranef` is all NaN at full length and
-/// `ranef_levels` and the `varcorr` blocks come back in declaration order.
+/// the fit still reorders it, when the crossed extra has more levels or is the
+/// only grouping with a slope, and still nests a grouping it finds nested:
+/// `ranef` is all NaN at full length and `ranef_levels` and the `varcorr`
+/// blocks come back in declaration order.
 #[test]
-fn degenerate_fit_under_the_size_rule_keeps_declaration_order() {
+fn degenerate_reordered_fit_keeps_declaration_order() {
     let model = ModelSpec::mixed(
         Family::Poisson {
             link: crate::PoissonLink::Log,
@@ -2036,7 +2041,9 @@ fn degenerate_fit_under_the_size_rule_keeps_declaration_order() {
         primary: vec![0, 0],
         extra: vec![vec![0, 1]],
     };
-    assert!(!super::spec_sized_from_ids(&model, &ids).2.is_identity());
+    assert!(!super::spec_sized_from_ids(&model, &ids, true)
+        .2
+        .is_identity());
     let fit = fit_cold(
         &[1.0, -0.5, 1.0, 0.5],
         &vec![1.0f64; n],
@@ -2074,11 +2081,14 @@ fn degenerate_fit_under_the_size_rule_keeps_declaration_order() {
     assert!(fit.ranef.iter().all(|v| v.is_nan()));
 }
 
-/// Where the size rule moves a lone slope grouping first, on the sizing alone
-/// (no fit): only when every extra is crossed, the slope grouping is the only
-/// one and an extra, and the reordered spec routes the dense kernel.
+/// Where a slope grouping goes first, on the sizing alone (no fit), on a
+/// Gaussian model with `condvar` on: when it has the most columns, or when
+/// it is the one reading the dense kernel takes, a declared nested extra
+/// then read crossed on its observed pairs. When no reading takes the dense
+/// kernel, the most columns go first even though both readings route
+/// sparse.
 #[test]
-fn size_rule_moves_a_lone_slope_grouping_first_only_when_it_routes_dense() {
+fn grouping_order_puts_the_most_columns_or_the_dense_reading_first() {
     let n = 1200;
     let ids_of = |levels: &[u32]| GroupIds {
         primary: (0..n).map(|i| i % levels[0]).collect(),
@@ -2096,7 +2106,7 @@ fn size_rule_moves_a_lone_slope_grouping_first_only_when_it_routes_dense() {
     for h_levels in [3, crate::consts::MAX_CROSSED_LEVELS as u32] {
         let model = gauss(slope_last(vec![1]));
         let ids = ids_of(&[h_levels, 4]);
-        let (sized, sids, perm) = super::spec_sized_from_ids(&model, &ids);
+        let (sized, sids, perm) = super::spec_sized_from_ids(&model, &ids, true);
         assert!(!perm.is_identity(), "h with {h_levels} levels");
         let re = sized.spec.re.as_ref().unwrap();
         assert_eq!(re.slopes, vec![1]);
@@ -2110,29 +2120,39 @@ fn size_rule_moves_a_lone_slope_grouping_first_only_when_it_routes_dense() {
             (&sids.primary, &sids.extra[0]),
             (&ids.extra[0], &ids.primary)
         );
-        assert!(matches!(classify_design(&sized, 1), Solver::NoZ));
+        assert!(matches!(classify_design(&sized, true), Solver::NoZ));
     }
 
     let stays = |model: ModelSpec, ids: GroupIds, case: &str| {
-        let (sized, sids, perm) = super::spec_sized_from_ids(&model, &ids);
+        let (sized, sids, perm) = super::spec_sized_from_ids(&model, &ids, true);
         assert!(perm.is_identity(), "{case}");
         assert_eq!(sized, super::sized_as_declared(&model, &ids), "{case}");
         assert!(matches!(sids, std::borrow::Cow::Borrowed(_)), "{case}");
     };
-    stays(
-        gauss(
-            crate::Re::intercept()
-                .extra(Grouping::crossed().slopes([1]))
-                .extra(Grouping::crossed().slopes([2])),
-        ),
-        ids_of(&[3, 4, 5]),
-        "two slope groupings",
+    // `(1 | h) + (1 + x | g)` plus a nest of 2 children in h: its nested
+    // reading keeps the slope on an extra, so g goes first and the nest is
+    // read crossed, its 6 observed pairs numbered in slot order.
+    let mut ids = ids_of(&[3, 4]);
+    let nested_ids: Vec<u32> = (0..n).map(|i| (i % 3) * 2 + (i / 7) % 2).collect();
+    ids.extra.push(nested_ids.clone());
+    let model = gauss(slope_last(vec![1]).extra(Grouping::nested()));
+    let (sized, sids, perm) = super::spec_sized_from_ids(&model, &ids, true);
+    assert!(!perm.is_identity(), "a nested extra");
+    let re = sized.spec.re.as_ref().unwrap();
+    assert_eq!(re.slopes, vec![1], "a nested extra");
+    assert!(re
+        .extra_groupings
+        .iter()
+        .all(|g| g.relation == GroupingRelation::Crossed && g.slopes.is_empty()));
+    assert_eq!(
+        (sized.n_primary, sized.extra_counts.clone()),
+        (4, vec![3, 6])
     );
-    stays(
-        gauss(slope_last(vec![1]).extra(Grouping::nested())),
-        ids_of(&[3, 4, 5]),
-        "a nested extra",
+    assert_eq!(
+        (&sids.primary, &sids.extra[0], &sids.extra[1]),
+        (&ids.extra[0], &ids.primary, &nested_ids)
     );
+    assert!(matches!(classify_design(&sized, true), Solver::NoZ));
     stays(
         gauss(slope_last(vec![1])),
         ids_of(&[crate::consts::MAX_CROSSED_LEVELS as u32 + 1, 4]),
@@ -2147,13 +2167,38 @@ fn size_rule_moves_a_lone_slope_grouping_first_only_when_it_routes_dense() {
         ids_of(&[3, 40]),
         "a slope already on the primary",
     );
-    stays(
-        gauss(slope_last(
-            (1..=crate::consts::MAX_PRIMARY_Q as u32).collect(),
-        )),
-        ids_of(&[3, 4]),
-        "a slope grouping wider than MAX_PRIMARY_Q",
-    );
+
+    // (model, ids, the slot-0 grouping's levels and slopes afterwards).
+    let moves = [
+        (
+            gauss(
+                crate::Re::intercept()
+                    .extra(Grouping::crossed().slopes([1]))
+                    .extra(Grouping::crossed().slopes([2])),
+            ),
+            ids_of(&[3, 4, 5]),
+            (5, vec![2]),
+            "two slope groupings",
+        ),
+        (
+            gauss(slope_last(
+                (1..=crate::consts::MAX_PRIMARY_Q as u32).collect(),
+            )),
+            ids_of(&[3, 4]),
+            (4, (1..=crate::consts::MAX_PRIMARY_Q as u32).collect()),
+            "a slope grouping wider than MAX_PRIMARY_Q",
+        ),
+    ];
+    for (model, ids, (levels, slopes), case) in moves {
+        let (sized, _, perm) = super::spec_sized_from_ids(&model, &ids, true);
+        assert!(!perm.is_identity(), "{case}");
+        assert_eq!(sized.n_primary, levels, "{case}");
+        assert_eq!(sized.spec.re.as_ref().unwrap().slopes, slopes, "{case}");
+        assert!(
+            matches!(classify_design(&sized, true), Solver::Sparse),
+            "{case}"
+        );
+    }
 }
 
 /// `(1 | h) + (1 + x | g)` data with h nested in g: 12 levels of g with a
@@ -2193,6 +2238,86 @@ pub(crate) fn nested_slope_case(
     (x, y, counts, h.len(), h, g)
 }
 
+/// `(1 | a) + (1 | h) + (1 | g)` data with h nested in g and a crossed with
+/// both: 12 levels of g, 3 children h each, 10 rows per child with `x`
+/// varying within it, and a at 5 levels, `(j + r) mod 5` on row r of child j.
+/// The 36 children `j` (in parent order) are declared as `7·j mod 36`, so a
+/// declared level is not its slot. `counts` is a count response off the same
+/// linear predictor. Returns `(x, y, counts, n, a, h, g)`, `x` row-major
+/// `n × 2` with an intercept column.
+#[allow(clippy::type_complexity)]
+pub(crate) fn nest_away_case() -> (
+    Vec<f64>,
+    Vec<f64>,
+    Vec<f64>,
+    usize,
+    Vec<u32>,
+    Vec<u32>,
+    Vec<u32>,
+) {
+    let mut st = 71u64;
+    let ug: Vec<f64> = (0..12).map(|_| 0.6 * lcg(&mut st)).collect();
+    let uh: Vec<f64> = (0..36).map(|_| 0.4 * lcg(&mut st)).collect();
+    let ua: Vec<f64> = (0..5).map(|_| 0.5 * lcg(&mut st)).collect();
+    let (mut x, mut y, mut counts) = (vec![], vec![], vec![]);
+    let (mut a, mut h, mut g) = (vec![], vec![], vec![]);
+    for j in 0..36usize {
+        for r in 0..10 {
+            let x1 = lcg(&mut st);
+            let ai = (j + r) % 5;
+            let eta = 0.3 + 0.5 * x1 + ug[j / 3] + uh[j] + ua[ai];
+            x.extend([1.0, x1]);
+            y.push(eta + 0.5 * lcg(&mut st));
+            counts.push(((eta + 0.7).exp() + 0.5 * (lcg(&mut st) + 1.0)).floor());
+            a.push(ai as u32);
+            h.push((7 * j % 36) as u32);
+            g.push((j / 3) as u32);
+        }
+    }
+    (x, y, counts, h.len(), a, h, g)
+}
+
+/// Parents g, parent `f` with `children[f]` children h, 6 rows each, an
+/// intercept and a slope column: `(x, y, counts, n, g, padded, pairs)`, with
+/// `padded` the child ids `f·W + j` (`W` the widest parent's count) and
+/// `pairs` the observed (parent, child) pairs numbered in that order.
+#[allow(clippy::type_complexity)]
+pub(crate) fn declared_nest_case(
+    children: &[usize],
+) -> (
+    Vec<f64>,
+    Vec<f64>,
+    Vec<f64>,
+    usize,
+    Vec<u32>,
+    Vec<u32>,
+    Vec<u32>,
+) {
+    let w = *children.iter().max().unwrap();
+    let mut st = 97u64;
+    let (mut x, mut y, mut counts) = (vec![], vec![], vec![]);
+    let (mut g, mut padded, mut pairs) = (vec![], vec![], vec![]);
+    let mut pair = 0u32;
+    for (f, &k) in children.iter().enumerate() {
+        let ug = 0.6 * lcg(&mut st);
+        for j in 0..k {
+            let uh = 0.5 * lcg(&mut st);
+            for _ in 0..6 {
+                let x1 = lcg(&mut st);
+                let eta = 0.3 + 0.5 * x1 + ug + uh;
+                x.extend([1.0, x1]);
+                y.push(eta + 0.5 * lcg(&mut st));
+                counts.push(((eta + 0.7).exp() + 0.5 * (lcg(&mut st) + 1.0)).floor());
+                g.push(f as u32);
+                padded.push((f * w + j) as u32);
+                pairs.push(pair);
+            }
+            pair += 1;
+        }
+    }
+    (x, y, counts, g.len(), g, padded, pairs)
+}
+
 /// The two spellings of [`nested_slope_case`]'s model: slope last
 /// `(1 | h) + (1 + x | g)`, both groupings crossed as written, and slope
 /// first `(1 + x | g)` with h nested in it.
@@ -2211,19 +2336,76 @@ pub(crate) fn nested_slope_spellings(family: Family) -> (ModelSpec, ModelSpec) {
     )
 }
 
-/// After moving a lone slope grouping first, the sizing checks the grouping
-/// it displaced for nesting in it with the formula front end's two guards: a
-/// nested one becomes a `NestedWithin` extra on padded ids, so the spec and
-/// ids are those of the slope-first nested spelling. A child level under two
-/// parents, a padded rectangle past the inflation bound and a declared level
-/// with no rows leave it crossed.
+/// Owned string labels, one per row.
+fn labels(l: &[&str]) -> Vec<String> {
+    l.iter().map(|s| s.to_string()).collect()
+}
+
+/// Genuinely crossed with matching cardinality — a child label reused across
+/// parents (Penicillin's `sample` spans every `plate`). `detect_flat_nesting`
+/// must fail closed to `Crossed` (`None`), never routing it through the nested padded layout.
 #[test]
-fn a_slope_swap_nests_the_displaced_grouping_under_the_front_end_guards() {
+fn detect_flat_nesting_shared_child_stays_crossed() {
+    let primary: Vec<u32> = vec![0, 1, 0, 1];
+    let child = labels(&["x", "x", "y", "y"]);
+    assert_eq!(super::common::detect_flat_nesting(&primary, &child), None);
+}
+
+/// Genuine nesting but WILDLY uneven (the shape of an observation-level
+/// factor like grouseticks' `INDEX`): one parent holds most of the children
+/// — 5/1/1 — so the padded rectangle `n_parents · max_children = 3·5 = 15`
+/// exceeds `NESTING_INFLATION_BOUND · 7 levels = 14`. Detection fails
+/// closed to `Crossed` (`None`) even though every child nests cleanly.
+#[test]
+fn detect_flat_nesting_high_inflation_stays_crossed() {
+    let primary: Vec<u32> = vec![0, 0, 0, 0, 0, 1, 2];
+    let child = labels(&["a", "b", "c", "d", "e", "f", "g"]);
+    assert_eq!(super::common::detect_flat_nesting(&primary, &child), None);
+}
+
+/// The inflation bound at equality: 4/1/1 children, so the padded rectangle
+/// `3·4 = 12` equals `NESTING_INFLATION_BOUND · 6 levels = 12`, and the
+/// layout stays nested. Four slots per parent, children in lexicographic
+/// order within each, the unfilled slots unlabelled (`nested_padded_ids`).
+#[test]
+fn detect_flat_nesting_inflation_at_the_bound_stays_nested() {
+    let primary: Vec<u32> = vec![0, 0, 0, 0, 1, 2];
+    let child = labels(&["a", "b", "c", "d", "e", "f"]);
+    let (ids, labels) = super::common::detect_flat_nesting(&primary, &child).unwrap();
+    assert_eq!(ids, vec![0, 1, 2, 3, 4, 8]);
+    let slot = |s: &str| Some(s.to_string());
+    assert_eq!(
+        labels,
+        vec![
+            slot("a"),
+            slot("b"),
+            slot("c"),
+            slot("d"),
+            slot("e"),
+            None,
+            None,
+            None,
+            slot("f"),
+            None,
+            None,
+            None,
+        ]
+    );
+}
+
+/// An intercept-only grouping nested in a slope grouping written after it,
+/// under `detect_flat_nesting`'s two guards, becomes a `NestedWithin` extra
+/// on padded ids with the slope grouping first, so the spec and ids are those
+/// of the slope-first nested spelling. A child level under two parents, a
+/// padded rectangle past the inflation bound and a declared level with no rows
+/// leave it crossed, with the slope grouping still first.
+#[test]
+fn a_slope_swap_nests_the_displaced_grouping_under_the_flat_nesting_guards() {
     let (last, first) = nested_slope_spellings(Family::Gaussian);
     for shuffled in [false, true] {
         let (_, _, _, _, h, g) = nested_slope_case(shuffled);
         let ids = GroupIds::new(h.clone()).extra(g.clone());
-        let (sized, sids, perm) = super::spec_sized_from_ids(&last, &ids);
+        let (sized, sids, perm) = super::spec_sized_from_ids(&last, &ids, true);
         assert!(!perm.is_identity(), "shuffled {shuffled}");
         let padded = super::common::nested_padded_ids(&g, &h).0;
         if !shuffled {
@@ -2249,7 +2431,7 @@ fn a_slope_swap_nests_the_displaced_grouping_under_the_front_end_guards() {
             .extra(Grouping::crossed().slopes([1])),
     );
     let ids = GroupIds::new(h.clone()).extra(c.clone()).extra(g.clone());
-    let (sized, sids, perm) = super::spec_sized_from_ids(&three, &ids);
+    let (sized, sids, perm) = super::spec_sized_from_ids(&three, &ids, true);
     assert!(!perm.is_identity());
     let re = sized.spec.re.as_ref().unwrap();
     assert_eq!(re.extra_groupings[0].relation, GroupingRelation::Crossed);
@@ -2264,7 +2446,7 @@ fn a_slope_swap_nests_the_displaced_grouping_under_the_front_end_guards() {
 
     let stays_crossed = |h: Vec<u32>, g: Vec<u32>, case: &str| {
         let ids = GroupIds::new(h.clone()).extra(g.clone());
-        let (sized, sids, perm) = super::spec_sized_from_ids(&last, &ids);
+        let (sized, sids, perm) = super::spec_sized_from_ids(&last, &ids, true);
         assert!(!perm.is_identity(), "{case}");
         let re = sized.spec.re.as_ref().unwrap();
         assert_eq!(
@@ -2290,8 +2472,220 @@ fn a_slope_swap_nests_the_displaced_grouping_under_the_front_end_guards() {
     stays_crossed(gap, g, "a declared level with no rows");
 }
 
-/// The size rule swaps the primary with the second extra here, so one block
-/// sits between the two swapped ones and every block has its own width.
+/// `(g, h)` ids of a balanced nest: `parents` levels of g with `w` children h
+/// each, child ids global (`h = w·g + k`), `rows` rows per child, the rows of
+/// one child spread through the data.
+pub(crate) fn balanced_nest(parents: u32, w: u32, rows: u32) -> (Vec<u32>, Vec<u32>) {
+    let (mut g, mut h) = (Vec::new(), Vec::new());
+    for _ in 0..rows {
+        for j in 0..parents * w {
+            g.push(j / w);
+            h.push(j);
+        }
+    }
+    (g, h)
+}
+
+/// One nest reaches the kernel as one input however it is spelled: child
+/// first, parent first (both declared crossed) or child declared nested on
+/// padded ids, for a Gaussian and a Poisson model. Child labels local to
+/// their parent span parents, so the same groupings then stay crossed.
+#[test]
+fn every_spelling_of_one_nest_reaches_one_kernel_input() {
+    let (g, h) = balanced_nest(12, 3, 10);
+    let padded_ids = GroupIds::new(g.clone()).extra(super::common::nested_padded_ids(&g, &h).0);
+    let local: Vec<u32> = h.iter().map(|&k| k % 3).collect();
+    for family in [
+        Family::Gaussian,
+        Family::Poisson {
+            link: PoissonLink::Log,
+        },
+    ] {
+        let crossed = ModelSpec::mixed(family, ReStructure::intercept().extra(Grouping::crossed()));
+        let nested = ModelSpec::mixed(family, ReStructure::intercept().extra(Grouping::nested()));
+        let want = super::sized_as_declared(&nested, &padded_ids);
+        for (name, model, ids) in [
+            (
+                "child first",
+                &crossed,
+                GroupIds::new(h.clone()).extra(g.clone()),
+            ),
+            (
+                "parent first",
+                &crossed,
+                GroupIds::new(g.clone()).extra(h.clone()),
+            ),
+            ("declared nested", &nested, padded_ids.clone()),
+        ] {
+            let (sized, sids, _) = super::spec_sized_from_ids(model, &ids, false);
+            assert_eq!(sized, want, "{family:?}, {name}");
+            assert_eq!(*sids, padded_ids, "{family:?}, {name}");
+        }
+        for ids in [
+            GroupIds::new(local.clone()).extra(g.clone()),
+            GroupIds::new(g.clone()).extra(local.clone()),
+        ] {
+            let (sized, _, perm) = super::spec_sized_from_ids(&crossed, &ids, false);
+            let re = sized.spec.re.as_ref().unwrap();
+            assert_eq!(re.extra_groupings[0].relation, GroupingRelation::Crossed);
+            assert_eq!(sized.n_primary, 12, "{family:?}: g has the most levels");
+            assert_eq!(perm.is_identity(), ids.primary == g);
+        }
+    }
+}
+
+/// A nest keeps its nested reading while its widest parent has at most K
+/// children, 7 on a Gaussian model and 5 on a Poisson one; past K it is read
+/// crossed with the child, which has the most levels, first. A Poisson nest
+/// within K whose nested reading would not fit the structured layout (a
+/// 4-column primary plus 5 child slots) keeps the parent first and crossed,
+/// since the child first would put the parent's slopes on an extra.
+#[test]
+fn a_nest_keeps_its_reading_up_to_k_children() {
+    let poisson = Family::Poisson {
+        link: PoissonLink::Log,
+    };
+    let parents = 20;
+    // `(1 | g) + (1 | h)`'s reading on W children per parent: whether h is
+    // nested, and the primary's level count.
+    let reading = |family: Family, slopes: Vec<u32>, w: u32| {
+        let (g, h) = balanced_nest(parents, w, 2);
+        let model = ModelSpec::mixed(
+            family,
+            ReStructure::intercept()
+                .slopes(slopes)
+                .extra(Grouping::crossed()),
+        );
+        let ids = GroupIds::new(g).extra(h);
+        let (sized, _, _) = super::spec_sized_from_ids(&model, &ids, false);
+        let re = sized.spec.re.as_ref().unwrap();
+        (
+            re.extra_groupings[0].relation == GroupingRelation::NestedWithin,
+            sized.n_primary,
+        )
+    };
+    let p = parents as usize;
+    for (w, gaussian_nested, poisson_nested) in
+        [(5, true, true), (6, true, false), (8, false, false)]
+    {
+        for (family, nested) in [
+            (Family::Gaussian, gaussian_nested),
+            (poisson, poisson_nested),
+        ] {
+            let want = if nested {
+                (true, p)
+            } else {
+                (false, p * w as usize)
+            };
+            assert_eq!(reading(family, vec![], w), want, "{family:?}, W {w}");
+        }
+    }
+    assert_eq!(reading(poisson, vec![1, 2, 3], 5), (false, p));
+}
+
+/// The grouping with the most random-effect columns (levels × (1 + slopes))
+/// goes first: crossed a (5 levels), b (40) and s (12, with a slope: 24
+/// columns). A Gaussian with `condvar` off takes b and the sparse kernel; a
+/// Poisson model keeps only the readings on the structured layout, which
+/// takes s; so does a Gaussian with `condvar` on, whose readings must stay on
+/// the dense kernel. Without the slope b goes first for both; with a and b
+/// both at 40 levels the declared primary a stays.
+#[test]
+fn most_columns_go_first() {
+    use super::Solver::{NoZ, Sparse};
+    let poisson = Family::Poisson {
+        link: PoissonLink::Log,
+    };
+    // Row i meets a level `i % a_levels`, b `(i / a_levels) % 40` and s
+    // `i % 12`: no grouping is nested in another.
+    let ids_of = |a_levels: u32| {
+        let n = 40 * a_levels * 12;
+        GroupIds::new((0..n).map(|i| i % a_levels).collect())
+            .extra((0..n).map(|i| (i / a_levels) % 40).collect())
+            .extra((0..n).map(|i| i % 12).collect())
+    };
+    let model = |family: Family, s_slopes: Vec<u32>| {
+        ModelSpec::mixed(
+            family,
+            ReStructure::intercept()
+                .extra(Grouping::crossed())
+                .extra(Grouping::crossed().slopes(s_slopes)),
+        )
+    };
+    let ids = ids_of(5);
+
+    let (sized, _, _) = super::spec_sized_from_ids(&model(Family::Gaussian, vec![1]), &ids, false);
+    assert_eq!(sized.n_primary, 40);
+    assert_eq!(super::classify_design(&sized, false), Sparse);
+
+    for (family, condvar) in [(poisson, false), (Family::Gaussian, true)] {
+        let (sized, _, _) = super::spec_sized_from_ids(&model(family, vec![1]), &ids, condvar);
+        let ctx = format!("{family:?}, condvar {condvar}");
+        assert_eq!(sized.n_primary, 12, "{ctx}");
+        assert_eq!(sized.spec.re.as_ref().unwrap().slopes, vec![1], "{ctx}");
+        assert_eq!(super::classify_design(&sized, condvar), NoZ, "{ctx}");
+        if family == poisson {
+            let g = crate::lmm::LmmGroupings::from_cluster_spec(&sized, &[1]);
+            assert!(g.structured_extras_eligible());
+        }
+    }
+
+    for family in [Family::Gaussian, poisson] {
+        let (sized, _, perm) = super::spec_sized_from_ids(&model(family, vec![]), &ids, false);
+        assert_eq!(sized.n_primary, 40, "{family:?}, no slope");
+        assert!(!perm.is_identity());
+        let ids = ids_of(40);
+        let (_, sids, perm) = super::spec_sized_from_ids(&model(family, vec![]), &ids, false);
+        assert!(perm.is_identity(), "{family:?}, a and b tied");
+        assert!(matches!(sids, std::borrow::Cow::Borrowed(_)));
+    }
+}
+
+/// Three-level ids, school ⊃ class ⊃ student (6 schools, 3 classes each, 4
+/// students per class), all declared crossed: every pair is a nest, and the
+/// two within K (class in school, student in class) compete. The kernel holds
+/// the one whose parent has the most columns, student in class, and reads
+/// school crossed: the input of the spelling that declares class primary,
+/// school crossed and student nested, with one nested grouping as
+/// `check_model_shape` requires.
+#[test]
+fn of_several_nests_the_parent_with_the_most_columns_keeps_its_nest() {
+    let (mut school, mut class, mut student) = (Vec::new(), Vec::new(), Vec::new());
+    for _ in 0..2 {
+        for s in 0..72u32 {
+            school.push(s / 12);
+            class.push(s / 4);
+            student.push(s);
+        }
+    }
+    let three = ModelSpec::mixed(
+        Family::Gaussian,
+        ReStructure::intercept()
+            .extra(Grouping::crossed())
+            .extra(Grouping::crossed()),
+    );
+    let ids = GroupIds::new(school.clone())
+        .extra(class.clone())
+        .extra(student.clone());
+    let (sized, sids, _) = super::spec_sized_from_ids(&three, &ids, false);
+    let declared = ModelSpec::mixed(
+        Family::Gaussian,
+        ReStructure::intercept()
+            .extra(Grouping::crossed())
+            .extra(Grouping::nested()),
+    );
+    let want_ids = GroupIds::new(class.clone())
+        .extra(school)
+        .extra(super::common::nested_padded_ids(&class, &student).0);
+    assert_eq!(sized, super::sized_as_declared(&declared, &want_ids));
+    assert_eq!(*sids, want_ids);
+    assert_eq!(sized.extra_counts, vec![6, 4]);
+    assert_eq!(check_model_shape(&sized.spec, 1), Ok(()));
+}
+
+/// The fit swaps the primary with the second extra here (it has the most
+/// levels), so one block sits between the two swapped ones and every block
+/// has its own width.
 #[test]
 fn swap_blocks_moves_blocks_of_unequal_width() {
     let model = ModelSpec::mixed(
@@ -2305,10 +2699,11 @@ fn swap_blocks_moves_blocks_of_unequal_width() {
         primary: (0..n).map(|i| (i % 2) as u32).collect(),
         extra: vec![
             (0..n).map(|i| (i % 3) as u32).collect(),
-            (0..n).map(|i| (i % 4) as u32).collect(),
+            // Not `i % 4`, which is nested in `i % 2`.
+            (0..n).map(|i| (i / 3) as u32).collect(),
         ],
     };
-    let (_sized, _ids, perm) = super::spec_sized_from_ids(&model, &ids);
+    let (_sized, _ids, perm) = super::spec_sized_from_ids(&model, &ids, true);
     let mut v = ["a0", "a1", "m0", "m1", "m2", "b0"];
     perm.swap_blocks(&mut v, |i| [2, 3, 1][i]);
     assert_eq!(v, ["b0", "m0", "m1", "m2", "a0", "a1"]);
@@ -2383,8 +2778,9 @@ fn fit_glmm_degenerate_width_never_panics() {
             },
             n_primary: 2,
             extra_counts: vec![2; 7],
+            tail_fill: 0.0,
         };
-        assert!(matches!(classify_design(&model_over, 1), Solver::Sparse));
+        assert!(matches!(classify_design(&model_over, true), Solver::Sparse));
         let (n, p) = (8, 0);
         let ids = GroupIds {
             primary: vec![0; n],
@@ -2560,9 +2956,10 @@ fn classify_routes_at_the_cap_edge() {
         },
         n_primary: 10,
         extra_counts: vec![],
+        tail_fill: 0.0,
     };
     assert!(matches!(
-        super::classify_design(&in_env, 1),
+        super::classify_design(&in_env, true),
         super::Solver::NoZ
     ));
 
@@ -2585,9 +2982,10 @@ fn classify_routes_at_the_cap_edge() {
         },
         n_primary: 10,
         extra_counts: vec![4],
+        tail_fill: 0.0,
     };
     assert!(matches!(
-        super::classify_design(&at_cap_count, 1),
+        super::classify_design(&at_cap_count, true),
         super::Solver::NoZ
     ));
     // q_p = MAX_PRIMARY_Q exactly: at the cap ⇒ NoZ.
@@ -2602,9 +3000,10 @@ fn classify_routes_at_the_cap_edge() {
         },
         n_primary: 10,
         extra_counts: vec![],
+        tail_fill: 0.0,
     };
     assert!(matches!(
-        super::classify_design(&at_cap_q, 1),
+        super::classify_design(&at_cap_q, true),
         super::Solver::NoZ
     ));
 
@@ -2626,9 +3025,10 @@ fn classify_routes_at_the_cap_edge() {
         },
         n_primary: 10,
         extra_counts: vec![4],
+        tail_fill: 0.0,
     };
     assert!(matches!(
-        super::classify_design(&over, 1),
+        super::classify_design(&over, true),
         super::Solver::Sparse
     ));
 
@@ -2644,14 +3044,16 @@ fn classify_routes_at_the_cap_edge() {
         },
         n_primary: 10,
         extra_counts: vec![],
+        tail_fill: 0.0,
     };
     assert!(matches!(
-        super::classify_design(&wide, 1),
+        super::classify_design(&wide, true),
         super::Solver::Sparse
     ));
 }
 
-/// Total `Crossed` level count past MAX_CROSSED_LEVELS routes Sparse (the
+/// On a Gaussian with `condvar` on, a total `Crossed` level count past
+/// MAX_CROSSED_LEVELS routes Sparse (the
 /// dense tail is cubic in the SUM of crossed levels, so two half-cap
 /// factors trip it together); at the cap exactly, intercept-only crossed
 /// extras stay NoZ. Nested extras don't count toward the sum (they live in
@@ -2670,6 +3072,7 @@ fn classify_routes_many_crossed_levels_to_sparse() {
         },
         n_primary: 10,
         extra_counts: extras.iter().map(|&(_, k)| k as usize).collect(),
+        tail_fill: 0.0,
     };
     let crossed = |n_clusters: u32| {
         let g = Grouping {
@@ -2682,19 +3085,19 @@ fn classify_routes_many_crossed_levels_to_sparse() {
     // One factor over the cap ⇒ Sparse.
     let over = spec(vec![crossed(cap + 1)]);
     assert!(matches!(
-        super::classify_design(&over, 1),
+        super::classify_design(&over, true),
         super::Solver::Sparse
     ));
     // Sum over factors trips the cap even when each is under it.
     let sum_over = spec(vec![crossed(cap / 2 + 1), crossed(cap / 2 + 1)]);
     assert!(matches!(
-        super::classify_design(&sum_over, 1),
+        super::classify_design(&sum_over, true),
         super::Solver::Sparse
     ));
     // Exactly at the cap ⇒ NoZ unchanged.
     let at_cap = spec(vec![crossed(cap)]);
     assert!(matches!(
-        super::classify_design(&at_cap, 1),
+        super::classify_design(&at_cap, true),
         super::Solver::NoZ
     ));
     // A many-level NESTED extra doesn't count toward the crossed sum.
@@ -2707,9 +3110,205 @@ fn classify_routes_many_crossed_levels_to_sparse() {
         cap + 1,
     )]);
     assert!(matches!(
-        super::classify_design(&nested, 1),
+        super::classify_design(&nested, true),
         super::Solver::NoZ
     ));
+}
+
+/// `(1 | g) + (1 | c)` for `family`, every grouping intercept-only and
+/// crossed.
+fn one_crossed_spec(family: Family) -> ModelSpec {
+    ModelSpec {
+        family,
+        re: Some(ReStructure {
+            terms: Vec::new(),
+            slopes: vec![],
+            extra_groupings: vec![Grouping {
+                terms: Vec::new(),
+                relation: GroupingRelation::Crossed,
+                slopes: vec![],
+            }],
+        }),
+    }
+}
+
+/// Ids of `(1 | g) + (1 | c)` with g at 1000 levels and c at `c_levels`:
+/// g level `f` meets the `m` c levels `f·m .. f·m + m` (mod `c_levels`), with
+/// 2 rows per pair met, so every family touches `m` of the `c_levels` tail
+/// columns and the tail fill is `m(m+1) / (c_levels(c_levels+1))`.
+pub(crate) fn rotating_crossed_ids(c_levels: u32, m: u32) -> GroupIds {
+    let (mut g, mut c) = (Vec::new(), Vec::new());
+    for f in 0..1000u32 {
+        for j in 0..m {
+            for _ in 0..2 {
+                g.push(f);
+                c.push((f * m + j) % c_levels);
+            }
+        }
+    }
+    GroupIds::new(g).extra(c)
+}
+
+/// [`rotating_crossed_ids`]'s design as `(1 | g) + (1 | c)` under `family`.
+pub(crate) fn rotating_crossed_design(
+    family: Family,
+    c_levels: u32,
+    m: u32,
+) -> (ModelSpec, GroupIds) {
+    (one_crossed_spec(family), rotating_crossed_ids(c_levels, m))
+}
+
+/// The tail fill counts, per family, the distinct (grouping, level) tail
+/// columns its rows touch: g at 6 levels and c at 4, g level 0 meeting c
+/// levels 0 and 1 and the others all four, gives `(3 + 5·10) / (6·10)`; a
+/// second crossed grouping d at 2 levels that every g level meets gives
+/// `e = 6`, `e_0 = 4`, `e_f = 6` otherwise.
+#[test]
+fn tail_fill_counts_each_familys_tail_columns() {
+    let (mut g, mut c, mut d) = (Vec::new(), Vec::new(), Vec::new());
+    for f in 0..6u32 {
+        for level in 0..if f == 0 { 2 } else { 4 } {
+            for r in 0..2u32 {
+                g.push(f);
+                c.push(level);
+                d.push(r);
+            }
+        }
+    }
+    let one = one_crossed_spec(Family::Gaussian);
+    let ids = GroupIds::new(g.clone()).extra(c.clone());
+    let (sized, _, perm) = super::spec_sized_from_ids(&one, &ids, false);
+    assert!(perm.is_identity());
+    assert!(
+        (sized.tail_fill - 53.0 / 60.0).abs() <= 1e-15,
+        "{}",
+        sized.tail_fill
+    );
+    assert_eq!(
+        super::sized_as_declared(&one, &ids).tail_fill,
+        sized.tail_fill
+    );
+
+    let mut two = one.clone();
+    let re = two.re.as_mut().unwrap();
+    re.extra_groupings.push(re.extra_groupings[0].clone());
+    let ids = GroupIds::new(g).extra(c).extra(d);
+    let (sized, _, perm) = super::spec_sized_from_ids(&two, &ids, false);
+    assert!(perm.is_identity());
+    let want = (10.0 + 5.0 * 21.0) / (6.0 * 21.0);
+    assert!(
+        (sized.tail_fill - want).abs() <= 1e-15,
+        "{} vs {want}",
+        sized.tail_fill
+    );
+    assert_eq!(
+        super::sized_as_declared(&two, &ids).tail_fill,
+        sized.tail_fill
+    );
+}
+
+/// A Gaussian picks its kernel by `condvar` and the tail: with `condvar` on,
+/// dense up to `MAX_CROSSED_LEVELS`; with it off, dense up to
+/// `DENSE_KERNEL_MAX_TAIL` crossed levels or from `DENSE_KERNEL_MIN_FILL` up,
+/// sparse otherwise. A GLMM reads neither and stays dense.
+#[test]
+fn gaussian_kernel_reads_condvar_and_the_tail_fill() {
+    use super::Solver::{NoZ, Sparse};
+    let binomial = Family::Binomial {
+        link: BinomialLink::Logit,
+    };
+    // (c levels, families' tail columns m, condvar off, condvar on).
+    for (c_levels, m, off, on) in [
+        (65, 1, Sparse, NoZ),
+        (64, 1, NoZ, NoZ),
+        // Fill 465/20100 ≈ 0.0231 and 435/20100 ≈ 0.0216.
+        (200, 30, NoZ, NoZ),
+        (200, 29, Sparse, NoZ),
+    ] {
+        let ctx = format!("c {c_levels}, m {m}");
+        for (family, want_off, want_on) in [(Family::Gaussian, off, on), (binomial, NoZ, NoZ)] {
+            let (model, ids) = rotating_crossed_design(family, c_levels, m);
+            let (sized, _, perm) = super::spec_sized_from_ids(&model, &ids, false);
+            assert!(perm.is_identity(), "{ctx}");
+            assert_eq!(
+                super::classify_design(&sized, false),
+                want_off,
+                "{ctx}, {family:?}"
+            );
+            assert_eq!(
+                super::classify_design(&sized, true),
+                want_on,
+                "{ctx}, {family:?}"
+            );
+        }
+    }
+    // At `m = 1` g would nest in c, 2 children per parent, and fit nested.
+    let (model, ids) = rotating_crossed_design(binomial, 600, 2);
+    let (sized, _, perm) = super::spec_sized_from_ids(&model, &ids, false);
+    assert!(perm.is_identity());
+    assert_eq!(super::classify_design(&sized, false), NoZ);
+    assert_eq!(super::classify_design(&sized, true), NoZ);
+}
+
+/// The dense-tail byte bound, at its edge: 1 GiB natively, 256 MiB on wasm32,
+/// over `blocks` e × e f64 buffers. Through `classify_design`, a Gaussian with
+/// `condvar` off holds 4 blocks with an intercept-only primary and 2 with a
+/// primary slope, plus its `n_primary · w · e` couplings (w = 1 or 2, here
+/// 10 primary levels), a GLMM 4. No data and no fit, so nothing large is
+/// allocated.
+#[test]
+fn dense_tails_stop_at_the_byte_bound() {
+    use super::dense_tail_fits;
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        assert!(dense_tail_fits(11_585, 1) && !dense_tail_fits(11_586, 1));
+        assert!(dense_tail_fits(8_192, 2) && !dense_tail_fits(8_193, 2));
+        assert!(dense_tail_fits(6_688, 3) && !dense_tail_fits(6_689, 3));
+        assert!(dense_tail_fits(5_792, 4) && !dense_tail_fits(5_793, 4));
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        assert!(dense_tail_fits(5_792, 1) && !dense_tail_fits(5_793, 1));
+        assert!(dense_tail_fits(4_096, 2) && !dense_tail_fits(4_097, 2));
+        assert!(dense_tail_fits(3_344, 3) && !dense_tail_fits(3_345, 3));
+        assert!(dense_tail_fits(2_896, 4) && !dense_tail_fits(2_897, 4));
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use super::Solver::{NoZ, Sparse};
+        let sized = |family: Family, slope: bool, levels: usize| {
+            let mut spec = one_crossed_spec(family);
+            if slope {
+                spec.re.as_mut().unwrap().slopes = vec![1];
+            }
+            SizedSpec {
+                spec,
+                n_primary: 10,
+                extra_counts: vec![levels],
+                tail_fill: 1.0,
+            }
+        };
+        let binomial = Family::Binomial {
+            link: BinomialLink::Logit,
+        };
+        for (family, slope, last) in [
+            (Family::Gaussian, false, 5_791),
+            (Family::Gaussian, true, 8_187),
+            (binomial, false, 5_792),
+        ] {
+            let ctx = format!("{family:?}, slope {slope}");
+            assert_eq!(
+                super::classify_design(&sized(family, slope, last), false),
+                NoZ,
+                "{ctx}"
+            );
+            assert_eq!(
+                super::classify_design(&sized(family, slope, last + 1), false),
+                Sparse,
+                "{ctx}"
+            );
+        }
+    }
 }
 
 /// The measured q_g performance boundary for
@@ -2735,17 +3334,18 @@ fn classify_routes_slope_extras_to_sparse_all_families() {
         },
         n_primary: 10,
         extra_counts: vec![5],
+        tail_fill: 0.0,
     };
     // Gaussian, slope-carrying extra (q_g = 2, in-envelope) ⇒ Sparse.
     let g_slope = spec(Family::Gaussian, vec![1]);
     assert!(matches!(
-        super::classify_design(&g_slope, 1),
+        super::classify_design(&g_slope, true),
         super::Solver::Sparse
     ));
     // Gaussian, intercept-only extra ⇒ NoZ.
     let g_int = spec(Family::Gaussian, vec![]);
     assert!(matches!(
-        super::classify_design(&g_int, 1),
+        super::classify_design(&g_int, true),
         super::Solver::NoZ
     ));
     // Non-Gaussian, slope-carrying extra ⇒ Sparse (the only kernel that fits it).
@@ -2756,7 +3356,7 @@ fn classify_routes_slope_extras_to_sparse_all_families() {
         vec![1],
     );
     assert!(matches!(
-        super::classify_design(&p_slope, 1),
+        super::classify_design(&p_slope, true),
         super::Solver::Sparse
     ));
 }
@@ -4466,7 +5066,7 @@ fn condvar_gap(got: &[f64], want: &[f64], what: &str) -> f64 {
 /// per-group, nested and dense crossed LMM routes, the hidden column of an
 /// intercept-free block and an uncorrelated block, a random-effect-only slope,
 /// and the GLMM blocked and structured layouts (the latter with the grouping
-/// order the size rule reverses). The default options form none, and leave
+/// order the grouping order step reverses). The default options form none, and leave
 /// every other estimate bitwise where the `condvar: true` fit has it.
 #[cfg(feature = "formula")]
 #[test]

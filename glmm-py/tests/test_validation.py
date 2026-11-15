@@ -391,9 +391,9 @@ def _at_row_2(fill, value):
             _RANGE_DATA,
             "k ~ x",
             "negativebinomial",
-            {"init_theta": 1e-4},
+            {"init_theta": 1e-7},
             "warm-start dispersion (the negative-binomial shape seed) must be within "
-            "[1e-3, 1e4] (value 1e-4; glmm::limits::NB_THETA_LO, glmm::limits::NB_THETA_HI)",
+            "[1e-6, 1e4] (value 1e-7; glmm::limits::NB_THETA_LO, glmm::limits::NB_THETA_HI)",
             id="negative_binomial_shape_seed_outside_its_box",
         ),
     ],

@@ -14,7 +14,7 @@ use crate::inputs::{FactorColumns, Inputs, NumericColumns};
 
 /// How an error names a row: `row_index`, the caller's number of each row
 /// passed, else the row passed counted from `row_base` (0 from Python, 1
-/// from R).
+/// from R). A design column is always counted from `row_base`.
 pub(crate) struct Rows {
     index: Option<Vec<i64>>,
     base: usize,
@@ -53,7 +53,7 @@ impl Rows {
                 let shown = self.shown(row);
                 BindError {
                     row: Some(shown),
-                    ..BindError::new(code, e.message_with_row(shown))
+                    ..BindError::new(code, e.message_shown(shown, self.base))
                 }
             }
             None => BindError::new(code, e.message),

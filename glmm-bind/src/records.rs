@@ -89,7 +89,9 @@ fn cross_record(c: &CondvarCrossRecord) -> Value {
             .with("coupling_at", ints(c.coupling_at.iter().copied()))
             .with("coupling_cols", ints(c.coupling_cols.iter().copied()))
             .with("coupling", Value::Vec(c.coupling.clone()))
-            .with("nested_slots", ints(c.nested_slots.iter().copied())),
+            .with("nested_grouping", int(c.nested_grouping))
+            .with("nested_slots", ints(c.nested_slots.iter().copied()))
+            .with("pair_slots", ints(c.pair_slots.iter().copied())),
     )
 }
 
@@ -540,11 +542,9 @@ pub(crate) fn read_parts(mut r: Inputs) -> Result<StoredParts, BindError> {
                 coupling_at: u32s("coupling_at", c.usizes("coupling_at")?)?,
                 coupling_cols: u32s("coupling_cols", c.usizes("coupling_cols")?)?,
                 coupling: c.vec("coupling")?,
-                // Absent on a fit saved before the field existed.
-                nested_slots: u32s(
-                    "nested_slots",
-                    c.opt_usizes("nested_slots")?.unwrap_or_default(),
-                )?,
+                nested_grouping: c.usize("nested_grouping")?,
+                nested_slots: u32s("nested_slots", c.usizes("nested_slots")?)?,
+                pair_slots: u32s("pair_slots", c.usizes("pair_slots")?)?,
             })
         }
     };

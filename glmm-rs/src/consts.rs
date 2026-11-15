@@ -1,11 +1,12 @@
 //! Crate-wide limits, the single source for each.
 //!
-//! - Capacity. The six scratch constants `MAX_PRIMARY_Q`, `MAX_EXTRA_GROUPINGS`,
-//!   `MAX_EXTRA_Q`, `MAX_THETA`, `MAX_CROSSED_LEVELS` and `MAX_NAGQ` size the
-//!   solver's stack buffers, so they are HARD ceilings. They define the
-//!   NoZ-scratch envelope (the dense no-Z-matrix path in
-//!   `fit::classify_design`), not a model ceiling: designs over-envelope route
-//!   to the sparse-Z path instead.
+//! - Capacity. The five scratch constants `MAX_PRIMARY_Q`, `MAX_EXTRA_GROUPINGS`,
+//!   `MAX_EXTRA_Q`, `MAX_THETA` and `MAX_NAGQ` size the solver's stack
+//!   buffers, so they are HARD ceilings. They define the NoZ-scratch envelope
+//!   (the dense no-Z-matrix path in `fit::classify_design`), not a model
+//!   ceiling: designs over-envelope route to the sparse-Z path instead.
+//!   `MAX_CROSSED_LEVELS` is a routing boundary of the Gaussian dense kernel
+//!   with `condvar` on, not a buffer size.
 //! - Input ranges. `MAX_DATA_ABS`, `MAX_LOG_OFFSET_ABS` and `MAX_TRIALS` bound
 //!   the data, and the search boxes `GAMMA_PHI_LO`/`GAMMA_PHI_HI` and
 //!   `NB_THETA_LO`/`NB_THETA_HI` bound the dispersion coordinates. The stable
@@ -42,17 +43,19 @@ pub const MAX_EXTRA_Q: usize = 4;
 pub const MAX_THETA: usize = MAX_PRIMARY_Q * (MAX_PRIMARY_Q + 1) / 2
     + MAX_EXTRA_GROUPINGS * (MAX_EXTRA_Q * (MAX_EXTRA_Q + 1) / 2);
 
-/// Max total level count over `Crossed` extra groupings on the dense NoZ path:
-/// designs with `Σ n_clusters` over crossed extras above this route to the
-/// sparse-Z path (`fit::classify_design`). Unlike the `MAX_*` scratch ceilings
-/// this is a PERFORMANCE boundary — the dense tail of `reml_deviance` (and the
-/// dense GLMM path's Schur complement over extras) is cubic in the total
-/// crossed column count, so many-level crossed factors make each deviance eval
-/// take minutes (measured 2026-07-09: 22,714 crossed levels ≈ 10¹³ flops and
-/// ~6 GB scratch per eval). 500 is a placeholder: grouseticks' 403-level
-/// crossed factor ran fine dense (0.16 s), and the cubic term at 500 is ~4×10⁷
-/// flops/eval — negligible. Refine with a dense-vs-sparse crossover sweep
-/// extending the 2026-07-02 sweep's level axis past 30.
+/// Max total level count over `Crossed` extra groupings on the Gaussian dense
+/// kernel when `FitOptions::condvar` is on: above it a Gaussian mixed model
+/// routes to the sparse kernel (`fit::classify_design`), which forms no
+/// conditional variances. With `condvar` off the Gaussian kernel is chosen by
+/// the crossed tail's coupling fill instead, and a GLMM stays on its dense
+/// layouts until their tail buffers would pass a byte bound; neither reads
+/// this constant. Unlike the `MAX_*` scratch ceilings this is a PERFORMANCE
+/// boundary — the dense tail of `reml_deviance` is cubic in the total crossed
+/// column count, so many-level crossed factors make each deviance eval take
+/// minutes (measured 2026-07-09: 22,714 crossed levels ≈ 10¹³ flops and ~6 GB
+/// scratch per eval). 500 is a placeholder: grouseticks' 403-level crossed
+/// factor ran fine dense (0.16 s), and the cubic term at 500 is ~4×10⁷
+/// flops/eval — negligible.
 pub const MAX_CROSSED_LEVELS: usize = 500;
 
 /// Max adaptive Gauss–Hermite node count for `nAGQ>1`. Odd nodes
@@ -90,13 +93,15 @@ pub const GAMMA_PHI_LO: f64 = 1e-6;
 /// Upper edge of the Gamma `ln φ` box; see [`GAMMA_PHI_LO`].
 pub const GAMMA_PHI_HI: f64 = 1e6;
 
-/// Lower edge of the negative-binomial shape search (on ln θ): `θ ∈ [1e-3,
+/// Lower edge of the negative-binomial shape search (on ln θ): `θ ∈ [1e-6,
 /// 1e4]`. NB variance is `μ + μ²/θ`, so large θ (near `1e4`) drives `μ²/θ`
-/// toward zero — near-Poisson, low overdispersion; small θ (near `1e-3`) is
-/// the highly overdispersed end, implausibly so beyond this bound for the
-/// validation datasets. A shape seed (`StartValues::dispersion`) outside the
-/// box is refused.
-pub const NB_THETA_LO: f64 = 1e-3;
+/// toward zero — near-Poisson, low overdispersion; small θ is heavy
+/// overdispersion. The likelihood falls to −∞ as θ → 0 whenever a count is
+/// positive, so its maximum is interior, but it can be arbitrarily small:
+/// 1e-6 is where the search stops, and a fit that ends there carries
+/// `Note::NbShapeAtLimit`. A shape seed (`StartValues::dispersion`) outside
+/// the box is refused.
+pub const NB_THETA_LO: f64 = 1e-6;
 /// Upper edge of the negative-binomial shape search; see [`NB_THETA_LO`].
 pub const NB_THETA_HI: f64 = 1e4;
 

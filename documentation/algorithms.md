@@ -78,13 +78,21 @@ preprocessing is path-agnostic: it serves OLS, GLM, LMM and GLMM alike.
 
 **Identification notes.** Next to the alias check, `fit_checked` runs `identification_notes` (`src/fit/common.rs`), which reads only the ids, the slope columns and the response, compares values exactly, and adds a note for each random-effect structure the data cannot identify: a single-level grouping, two groupings with the same groups that share a random-effect column, slopes constant within the levels of a block with a random intercept that take too few distinct values for their covariance parameters, and a binomial response constant within every level when some level holds more than one trial. No estimate depends on it. On the aliased path the reduced re-entry runs it on the reduced design, and those notes are the ones reported.
 
-**`classify_design` routing (mixed arm only).** A mixed design routes to
-`Solver::Sparse` when it is over the dense envelope (primary width
-`q_p > MAX_PRIMARY_Q`, more than `MAX_EXTRA_GROUPINGS` extra groupings, or any
-extra grouping width `1 + slopes.len() > MAX_EXTRA_Q`), **or** any extra
-grouping carries a random slope, **or** the total `Crossed` level count exceeds
-`MAX_CROSSED_LEVELS`; otherwise it stays `Solver::NoZ`.
-Before this check, a lone slope grouping written after intercept-only crossed groupings is moved first when the moved design routes `NoZ` (`spec_sized_from_ids`, `src/fit/common.rs`), and the grouping it displaces takes the nested layout when it is nested in the slope grouping.
+**`classify_design` routing (mixed arm only).** A mixed design routes to `Solver::Sparse` when it is over the dense envelope (primary width `q_p > MAX_PRIMARY_Q`, more than `MAX_EXTRA_GROUPINGS` extra groupings, or any extra grouping width `1 + slopes.len() > MAX_EXTRA_Q`), **or** any extra grouping carries a random slope. Otherwise the crossed tail decides, with `e` the total `Crossed` level count, and the design stays `Solver::NoZ` when:
+
+- a non-Gaussian family: the structured layout's `e × e` buffers (four, counting the packed conditional-variance triangle as one) fit in `DENSE_TAIL_MAX_BYTES` (1 GiB, 256 MiB on wasm32), which is `e ≤ 5,792`, or 2,896 on wasm32;
+- a Gaussian fitted with `FitOptions::condvar` on: `e ≤ MAX_CROSSED_LEVELS` (500), because only the dense kernel forms conditional variances;
+- a Gaussian with `condvar` off: `e ≤ DENSE_KERNEL_MAX_TAIL` (64) or the tail's coupling fill is at least `DENSE_KERNEL_MIN_FILL` (0.023), and the dense kernel's buffers fit in `DENSE_TAIL_MAX_BYTES` (`gaussian_dense_fits`). The kernel holds 2 `e × e` buffers with a primary slope, 4 on a scalar primary, and `3 + w(w+1)/2` with a nested grouping of family width `w`, plus the `n_primary · w · e` family couplings `bt` (`w` = 1 plus the primary slopes plus the nested children per parent), so the bound is just under 8,192 crossed levels with a primary slope and 5,792 on a scalar primary when the primary has few levels, half that on wasm32, and lower as the primary grows.
+
+The coupling fill (`SizedSpec::tail_fill`, `src/fit/common.rs`) is the mean share of the tail's lower triangle that one primary level's coupling block fills, `Σ_f e_f(e_f+1)/2 ÷ (P · e(e+1)/2)`, with `P` primary levels and `e_f` the crossed columns that primary level `f`'s rows meet. When the crossed groupings overlap little the fill is low, and the sparse kernel is faster there. The fill rule and its 64-level floor were set in November 2026 from instruction counts on 41 Gaussian models and checked on 14 held-out ones, natively, on WebAssembly and on macOS. So `condvar` can change a Gaussian fit's kernel, and its numbers by round-off.
+
+Before classifying, `spec_sized_from_ids` (`src/fit/common.rs`) picks the reading and the order of the groupings the kernel sees from the group ids, so every spelling of one model (the order of the groupings, `g1/g2`, `g1:g2` or two plain groupings, the matrix entry point) reaches one kernel input. It runs three steps:
+
+1. **Nests.** A declared `NestedWithin` grouping, and any two declared-crossed groupings where the child is intercept-only and its ids are nested in the parent's: every child level under one parent, and the padded layout at most `NESTING_INFLATION_BOUND` (2) times the child level count.
+2. **Readings.** A nest keeps its nested reading only while its widest parent has at most K children: `NEST_MAX_CHILDREN_GAUSSIAN` (7, the primary column plus the child slots within `MAX_PRIMARY_Q`) on a Gaussian model, `NEST_MAX_CHILDREN_GLMM` (5) otherwise. A wider nest is read crossed, on its observed (parent, child) pairs. Of several nests the kernel holds the one whose parent has the most columns, and the others are read crossed. A GLMM keeps only the readings that land on the blocked or structured layout, and a Gaussian with `condvar` on only those that land on the dense kernel, when any does.
+3. **Order.** The kept nested reading goes first. Otherwise the grouping with the most random-effect columns (levels × (1 + slopes)) becomes the primary; ties keep the declared order. The primary is eliminated at a cost linear in its level count, while every extra lands in one tail whose factorization is cubic in its width.
+
+`Perm` carries the order back, and `unpermute_fit` reports every result in declaration order; a declared nest read crossed is mapped back to its padded slots.
 The caps are a
 scratch-capacity boundary, not a model limit — the router redirects rather than
 aborts, so every wired family fits on whichever side it lands and there is **no
@@ -97,11 +105,7 @@ have non-obvious reasons:
   implementation: only the packed-row `A`-layout applies a full `q_g×q_g` Λ
   block per extra level, so the blocked and structured layouts stay
   intercept-only on extras.
-- *`MAX_CROSSED_LEVELS` (500) is a performance boundary, not a scratch
-  ceiling*: the dense crossed tail is cubic in the total crossed column count
-  (a measured 22,714-level crossed factor cost ~10¹³ flops and ~6 GB of
-  scratch per deviance eval), while at 500 levels the cubic term is
-  negligible. The other three caps size stack buffers and are hard.
+- *`MAX_CROSSED_LEVELS` (500) is a performance boundary, not a scratch ceiling*, and it applies only to a Gaussian with `condvar` on: the dense crossed tail is cubic in the total crossed column count (a measured 22,714-level crossed factor cost ~10¹³ flops and ~6 GB of scratch per deviance eval), while at 500 levels the cubic term is negligible. `DENSE_TAIL_MAX_BYTES` is not a speed crossover either: it only stops a multi-gigabyte allocation. The other three caps size stack buffers and are hard.
 
 **Uncorrelated and intercept-free blocks.** A grouping's terms
 (`ReTerm`: in a formula `(x || g)`, `zerocorr(…)`, `(0 + x | g)`, or several
@@ -132,8 +136,8 @@ column, a slope column repeated within one grouping, more than one nested groupi
 gate, on `(Family::InverseGaussian, Some(re))`: the GLMM objective needs a
 profiled `inverse.gaussian()$aic` term that is not built, so the entry refuses
 it before `build_workspace` allocates anything (`InverseGaussian` reaches only
-the fixed-only GLM arm above). The level-count clause reads the real `Crossed`
-level counts, so `build_workspace` sizes the spec from the row ids
+the fixed-only GLM arm above). The tail clauses read the real `Crossed`
+level counts and the coupling fill, so `build_workspace` sizes the spec from the row ids
 (`spec_sized_from_ids`) before classifying.
 
 **Code:** `fit`/`fit_with_start`, `fit_checked`, `FitError`, `Solver`,
@@ -421,14 +425,17 @@ and are not user-facing.
 | `MAX_EXTRA_Q` | `4` — per-extra-grouping width cap | [dispatch](#full-dispatch-map) (`src/consts.rs`) |
 | `MAX_EXTRA_GROUPINGS` | `6` — extra-grouping count cap | [dispatch](#full-dispatch-map) (`src/consts.rs`) |
 | `MAX_THETA` | derived θ-length ceiling: `vech(Λ_p)` + one `vech(Λ_g)` block per extra = `8·9/2 + 6·(4·5/2) = 96` | [dispatch](#full-dispatch-map) (`src/consts.rs`) — sizes every θ-length stack buffer |
-| `MAX_CROSSED_LEVELS` | `500` — total crossed-level cap (over → Sparse; a performance boundary, not scratch) | [dispatch](#full-dispatch-map) (`src/consts.rs`) |
+| `MAX_CROSSED_LEVELS` | `500` — total crossed-level cap of a Gaussian with `condvar` on (over → Sparse; a performance boundary, not scratch) | [dispatch](#full-dispatch-map) (`src/consts.rs`) |
+| `DENSE_KERNEL_MIN_FILL` / `DENSE_KERNEL_MAX_TAIL` | `0.023` / `64` — Gaussian with `condvar` off: a crossed tail of more than 64 levels whose coupling fill is below 0.023 → Sparse | [dispatch](#full-dispatch-map) (`src/fit/mod.rs`) |
+| `DENSE_TAIL_MAX_BYTES` | 1 GiB (256 MiB on wasm32) — the dense `e × e` tail buffers a route may hold; over → Sparse (a Gaussian with `condvar` off, a GLMM's structured layout); not a speed crossover | [dispatch](#full-dispatch-map) (`src/fit/mod.rs`) |
+| `NEST_MAX_CHILDREN_GAUSSIAN` / `NEST_MAX_CHILDREN_GLMM` | `7` / `5` — the most children the widest parent of a nest may have for the nest to keep its nested reading; a wider nest is read crossed | [dispatch](#full-dispatch-map) (`src/fit/common.rs`) |
 | `MAX_NAGQ` | `25` — largest odd AGQ order the GH table stores | [`algorithms-glmm.md`](algorithms-glmm.md#adaptive-gausshermite-quadrature-agq) (`src/consts.rs`) |
 | `MAX_DUAL_N` / `MAX_DUAL_H` | `12` / `78` — the top instantiated dual and hyper-dual rung; lanes are instantiated at `N ∈ {4, 5, 6, 8, 12}`. Above `MAX_DUAL_N` the gradient chunks, and so does the joint Hessian, which the assembled pass reads off first-order lanes; the hyper-dual Hessian cannot chunk and refuses above the cap | [`algorithms-glmm.md`](algorithms-glmm.md#standard-errors) (`src/glmm/derivative.rs`) |
 | `AGQ_GD_STEP_REL` / `AGQ_GD_ASYM_MAX` | `1e-5` / `1e-6`: the AGQ gradient-difference Hessian (rung 2a: logit, probit and Poisson-log AGQ on a scalar intercept): each coordinate moves by `1e-5·max(1, |γ̂|)` each way, and a result asymmetric beyond `1e-6·√(|H_rr·H_cc|)` falls back to the hyper-dual rung. No lane cap, so these shapes keep an exact-gradient Hessian above `MAX_DUAL_N` | [`algorithms-glmm.md`](algorithms-glmm.md#standard-errors) (`src/glmm/se.rs`) |
 | `MU_ZERO_REL` / `LAMBDA_GRID` | `1e-10`: a normalized eigenvalue of `ZᵀP₀Z` below it is zero and merges into the tail of the exact RLRT's null; the λ grid is `0` and `exp` of 199 points equally spaced on `[−10, 8]`, in units of `1/μ_max` (RLRsim's) | [`algorithms-lmm.md`](algorithms-lmm.md#exact-rlrt-for-one-random-intercept) (`src/inference/rlrt.rs`) |
 
 The NB GLM outer-loop constants (`NB_MAX_OUTER = 25`, `NB_THETA_TOL = 1e-6`,
-`NB_THETA_LO = 1e-3`, `NB_THETA_HI = 1e4`) are covered in the
+`NB_THETA_LO = 1e-6`, `NB_THETA_HI = 1e4`) are covered in the
 [GLM section](#generalised-linear-models-glm) below; the GLMM NB route, dense and
 sparse alike, reuses the same bounds as the box on its outer BOBYQA's `ln θ`
 coordinate
@@ -856,8 +863,8 @@ held `v`) in closed form (`family::inv_gaussian_aic`).
 
 **Negative-binomial outer θ-loop.** `fit_glm_nb` alternates, `MASS::glm.nb`-style:
 (1) fit the GLM at fixed θ; (2) 1-D maximise the NB profile log-likelihood
-`nb_profile_loglik` over `ln θ` on the bracket `[ln 1e-3, ln 1e4]`
-(`NB_THETA_LO`/`NB_THETA_HI`) by golden-section (`golden_max_ln_theta` /
+`nb_profile_loglik` over `ln θ` on the bracket `[ln 1e-6, ln 1e4]`
+(`NB_THETA_LO`/`NB_THETA_HI`) by golden-section (`golden_max` /
 `optimize_nb_theta`); (3) repeat until `|Δθ|/θ < NB_THETA_TOL = 1e-6`, capped at
 `NB_MAX_OUTER = 25` alternations. Every fit after the first starts from the
 last fit's β, as `MASS::glm.nb` passes `etastart`: from a cold start each

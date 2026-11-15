@@ -10,7 +10,7 @@ use super::profile::{
     bound, path, ProfileError, ProfileInterval, ProfileIntervals, ProfileParam, Toward,
 };
 use crate::fit::common_tests::{lcg, nested_slope_case, nested_slope_spellings};
-use crate::fit::fit_cold_keep_workspace;
+use crate::fit::fit_keep_workspace;
 use crate::lmm::profile_tests::{
     design, kernel, levels, ml_opts, num, primary, sleepstudy_ml, slope_model, table, Case,
 };
@@ -47,7 +47,7 @@ fn profile(
 /// `|ζ|` at `value` of `param`: the held minimum from the estimate (θ̂ for a
 /// coefficient), on a fresh ML fit of the case.
 fn zeta_at(case: &Case, param: ProfileParam, value: f64) -> f64 {
-    // No case that calls this is reordered by the size rule (each
+    // No case that calls this is reordered by the grouping order step (each
     // multi-grouping case has a slope).
     case.with_ml(|_, ws, map, units| {
         let mut k = kernel(ws, map, units);
@@ -63,7 +63,7 @@ fn zeta_at(case: &Case, param: ProfileParam, value: f64) -> f64 {
                     .iter()
                     .position(|&q| q == param)
                     .expect("a variance parameter of the model");
-                let mut start = k.estimate();
+                let mut start = k.start(i);
                 k.hold_var(i, value, &mut start)
             }
         };
@@ -121,6 +121,23 @@ fn assert_two_sided(r: &ProfileInterval) {
             assert!(r.lower > -1.0 && r.upper < 1.0, "{:?}", r.param)
         }
         _ => {}
+    }
+}
+
+/// Asserts `got`'s bounds finite and each within `1e-6` of `want`'s width of
+/// `want`'s: a bound is found to `||ζ| − z| ≤ 1e-6`, which moves it by less.
+fn assert_same_interval(got: &ProfileInterval, want: &ProfileInterval) {
+    let tol = 1e-6 * (want.upper - want.lower);
+    for (g, w) in [(got.lower, want.lower), (got.upper, want.upper)] {
+        assert!(
+            g.is_finite() && w.is_finite() && (g - w).abs() <= tol,
+            "{:?}: [{}, {}] against [{}, {}]",
+            want.param,
+            got.lower,
+            got.upper,
+            want.lower,
+            want.upper
+        );
     }
 }
 
@@ -304,7 +321,7 @@ fn the_sparse_route_profiles_too() {
                 .extra(Grouping::crossed().slopes([1])),
         ),
     };
-    let (_, fws) = fit_cold_keep_workspace(&case.data(), &case.model, &ml_opts());
+    let (_, fws) = fit_keep_workspace(&case.data(), &case.model, None, &ml_opts());
     assert!(
         fws.is_lmm_sparse(),
         "a slope on an extra grouping routes sparse"
@@ -574,6 +591,31 @@ fn a_held_minimum_below_the_fit_is_a_better_optimum() {
     assert!(side(5e-7).expect("within the tolerance").is_nan());
 }
 
+/// Once the path has moved, each point also runs a held search from the
+/// estimate's start and keeps the lower minimum. The synthetic held problem
+/// has a lower minimum (`base + v²`) reached only from the estimate's start
+/// `0.0`, and a higher one (`base + 2v²`) reached from any other start, where
+/// the first point's argmin (`10.0`) leads.
+#[test]
+fn a_second_start_from_the_estimate_keeps_the_lower_minimum() {
+    let base = 100.0;
+    let mut zeta = path(Z95, base, ProfileParam::Sigma, vec![0.0], |v, s| {
+        if s[0] == 0.0 {
+            s[0] = 10.0;
+            (base + v * v, true)
+        } else {
+            s[0] = v;
+            (base + 2.0 * v * v, true)
+        }
+    });
+    assert_eq!(zeta(1.0).expect("no error"), Some(1.0));
+    let r = zeta(2.0).expect("no error").expect("converged");
+    assert!(
+        (r - 2.0).abs() < 1e-12,
+        "|ζ| {r}, not √8 from the path's start"
+    );
+}
+
 /// The message names the parameter in words, not as the Rust enum.
 #[test]
 fn a_better_optimum_message_names_the_parameter() {
@@ -669,12 +711,12 @@ fn a_weight_power_other_than_one_is_refused() {
 }
 
 /// Two crossed intercept-only groupings, a (6 levels) declared before b (40):
-/// the size rule makes b the kernel's primary, so the kernel's coordinates
+/// the grouping order step makes b the kernel's primary, so the kernel's coordinates
 /// come in the order b, a. Each row must still carry its own grouping's
 /// interval, the same numbers as when b is declared first. The same for a
 /// lone slope grouping written last.
 #[test]
-fn size_rule_reorder_keeps_each_interval_on_its_grouping() {
+fn grouping_reorder_keeps_each_interval_on_its_grouping() {
     let n = 600;
     let mut st = 7u64;
     let ua: Vec<f64> = (0..6).map(|_| 2.0 * lcg(&mut st)).collect();
@@ -703,7 +745,7 @@ fn size_rule_reorder_keeps_each_interval_on_its_grouping() {
     let ab_case = case(GroupIds::new(a.clone()).extra(b.clone()));
     let ba_case = case(GroupIds::new(b).extra(a));
     let reordered = |c: &Case| {
-        !fit_cold_keep_workspace(&c.data(), &c.model, &ml_opts())
+        !fit_keep_workspace(&c.data(), &c.model, None, &ml_opts())
             .1
             .perm()
             .is_identity()
@@ -823,4 +865,69 @@ fn size_rule_reorder_keeps_each_interval_on_its_grouping() {
             .unwrap_or_else(|| panic!("nested: {:?} has no twin", r.param));
         assert_eq!(bits(r), bits(twin), "nested: {:?}", r.param);
     }
+}
+
+/// σ does not depend on where a slope's zero is: sleepstudy with `Days + 100`,
+/// where the intercept SD is the SD at day −100 and the correlation sits near
+/// −1, gives plain sleepstudy's interval.
+#[test]
+fn sigma_does_not_depend_on_where_a_slopes_zero_is() {
+    let plain = sleepstudy_ml();
+    let mut shifted = sleepstudy_ml();
+    for row in shifted.x.chunks_mut(2) {
+        row[1] += 100.0;
+    }
+    let which = [ProfileParam::Sigma];
+    let a = profile(&plain, false, 0.95, Some(&which)).rows[0];
+    let b = profile(&shifted, false, 0.95, Some(&which)).rows[0];
+    assert_same_interval(&b, &a);
+}
+
+/// `sig ~ prob + val + aro + (prob | Date) + (prob | image) + (prob | trial)`
+/// with `prob` in [2, 5]: the image slope SD's interval on these columns is
+/// the one on `prob`, `val` and `aro` centered, two scales of one model that
+/// the held searches do not share.
+#[test]
+fn a_slope_sd_interval_does_not_depend_on_centering() {
+    let t = table(include_str!(
+        "../../../validation/data/simulated/profile_crossed_uncentered.csv"
+    ));
+    let case = |center: bool| {
+        let cols: Vec<Vec<f64>> = ["prob", "val", "aro"]
+            .iter()
+            .map(|c| {
+                let v = num(&t, c);
+                let m = if center {
+                    v.iter().sum::<f64>() / v.len() as f64
+                } else {
+                    0.0
+                };
+                v.iter().map(|x| x - m).collect()
+            })
+            .collect();
+        Case {
+            x: design(&[&cols[0], &cols[1], &cols[2]]),
+            y: num(&t, "sig"),
+            p: 4,
+            ids: GroupIds {
+                primary: levels(&t, "Date"),
+                extra: vec![levels(&t, "image"), levels(&t, "trial")],
+            },
+            w: None,
+            model: ModelSpec::mixed(
+                Family::Gaussian,
+                ReStructure::intercept()
+                    .slopes([1])
+                    .extra(Grouping::crossed().slopes([1]))
+                    .extra(Grouping::crossed().slopes([1])),
+            ),
+        }
+    };
+    let which = [sd(1, 1)];
+    let row = |c: &Case| {
+        let out = profile(c, false, 0.95, Some(&which));
+        assert_eq!(out.rows.len(), 1);
+        out.rows[0]
+    };
+    assert_same_interval(&row(&case(false)), &row(&case(true)));
 }

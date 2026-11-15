@@ -40,6 +40,7 @@ pub(crate) mod pg_grad;
 pub(crate) mod profile;
 #[cfg(test)]
 pub(crate) mod profile_tests;
+mod qr;
 pub(crate) mod re_map;
 pub(crate) mod satterthwaite;
 #[cfg(test)]
@@ -886,6 +887,11 @@ pub struct LmmFitScratch {
     /// The criterion the deviance evaluates. `Criterion::Reml` from
     /// [`Self::with_groupings`]; the fit core sets it at build.
     pub(crate) criterion: Criterion,
+    /// The QR form of the deviance (`qr::QrKernel`), built the first time a
+    /// fit starts it and refilled in place after that. While it is on, the
+    /// deviance writes `factor` and `sigma_sq` from it, and the Gram
+    /// statistics stay as they are.
+    pub(crate) qr: Option<Box<qr::QrKernel>>,
 }
 
 impl LmmFitScratch {
@@ -902,7 +908,8 @@ impl LmmFitScratch {
             0
         };
         // Collapse scratch only on the intercept-primary path; slope w would
-        // mis-size it and the path never collapses.
+        // mis-size it and the path never collapses. The t_dim² buffers and
+        // `bt` here are counted by `fit::gaussian_dense_fits` (change together).
         let npairs = if g.primary_q == 1 { w * (w + 1) / 2 } else { 0 };
         // Blocked crossed/nested-slopes scratch only when that path is taken.
         let blocked_kk = if g.extra_slopes_any {
@@ -962,7 +969,13 @@ impl LmmFitScratch {
             blocked_p: vec![0.0; blocked_dim * blocked_dim],
             blocked_l: vec![0.0; blocked_dim * blocked_dim],
             criterion: Criterion::Reml,
+            qr: None,
         }
+    }
+
+    /// Whether the deviance runs on the QR kernel.
+    pub(crate) fn qr_on(&self) -> bool {
+        self.qr.as_ref().is_some_and(|q| q.on)
     }
 }
 
@@ -1036,9 +1049,62 @@ impl LmmKernel {
     /// `f64::INFINITY` is the failure surface.
     pub(crate) fn deviance(&mut self, theta: &[f64]) -> f64 {
         match self {
+            LmmKernel::Dense { suff, fit } if fit.qr_on() => qr::qr_deviance(theta, suff, fit),
             LmmKernel::Dense { suff, fit } => reml_deviance(theta, suff, fit),
             LmmKernel::Sparse { ws, .. } => {
                 crate::sparse::sparse_reml_deviance(theta, Self::sparse_ws_mut(ws))
+            }
+        }
+    }
+
+    /// Whether the QR kernel is on.
+    pub(crate) fn qr_on(&self) -> bool {
+        matches!(self, LmmKernel::Dense { fit, .. } if fit.qr_on())
+    }
+
+    /// Whether the QR kernel covers the accumulated design: the dense
+    /// family path with no crossed factor and no extra-grouping slope, and
+    /// `n > p > 0`.
+    pub(crate) fn qr_covers(&self) -> bool {
+        let LmmKernel::Dense { suff, .. } = self else {
+            return false;
+        };
+        let g = &suff.groupings;
+        let p = suff.m - 1;
+        !g.extra_slopes_any && g.k_crossed() == 0 && suff.n_rows > p && p > 0
+    }
+
+    /// Switch the deviance to the QR kernel, built from the rows the Gram
+    /// statistics were accumulated from (same `x`, `z`, `y`, ids and ŵ, after
+    /// `fit::lmm::accumulate_lmm_rows`); its buffers are allocated on the
+    /// first call and refilled after that. Only on a design [`Self::qr_covers`].
+    #[allow(clippy::too_many_arguments)] // the accumulator's own row surface
+    pub(crate) fn start_qr(
+        &mut self,
+        x: MatRef<'_, f64>,
+        z: MatRef<'_, f64>,
+        y: &[f64],
+        cluster_ids: &[u32],
+        extra_ids: &[Vec<u32>],
+        weights: Option<&[f64]>,
+    ) {
+        debug_assert!(self.qr_covers());
+        let LmmKernel::Dense { suff, fit } = self else {
+            unreachable!("start_qr: only a design qr_covers reaches here");
+        };
+        let p = suff.m - 1;
+        let qr = fit
+            .qr
+            .get_or_insert_with(|| Box::new(qr::QrKernel::new(&suff.groupings, p)));
+        qr.on = true;
+        qr.fill(suff, x, z, y, cluster_ids, extra_ids, weights);
+    }
+
+    /// Switch the deviance back to the Gram kernel; the QR buffers are kept.
+    pub(crate) fn stop_qr(&mut self) {
+        if let LmmKernel::Dense { fit, .. } = self {
+            if let Some(q) = fit.qr.as_deref_mut() {
+                q.on = false;
             }
         }
     }
@@ -1096,6 +1162,10 @@ impl LmmKernel {
     /// left; `betas` must hold β̂. Returns whether the recovery succeeded.
     pub(crate) fn recover_ranef(&mut self, theta: &[f64], betas: &[f64]) -> bool {
         match self {
+            LmmKernel::Dense { suff, fit } if fit.qr_on() => {
+                qr::qr_recover_ranef(theta, suff, fit, betas);
+                fit.ranef_ok
+            }
             LmmKernel::Dense { suff, fit } => {
                 recover_ranef(theta, suff, fit, betas);
                 fit.ranef_ok
@@ -1124,14 +1194,14 @@ impl LmmKernel {
     /// `Fit::condvar_cross` are assembled from, at the θ̂ the last evaluation
     /// factored ([`condvar_family`]). Allocates its own buffers and leaves the
     /// kernel's untouched. `None` where they are not computed: the sparse
-    /// kernel, the blocked crossed/nested-slopes path, an empty design, or a
-    /// factor that is not positive definite.
+    /// kernel, the QR kernel, the blocked crossed/nested-slopes path, an empty
+    /// design, or a factor that is not positive definite.
     pub(crate) fn condvar_blocks(&self, theta: &[f64]) -> Option<CondvarBlocks> {
         let LmmKernel::Dense { suff, fit } = self else {
             return None;
         };
         let g = &suff.groupings;
-        if g.extra_slopes_any || g.k_total == 0 || suff.n_rows == 0 {
+        if fit.qr_on() || g.extra_slopes_any || g.k_total == 0 || suff.n_rows == 0 {
             return None;
         }
         condvar_family(theta, suff, &fit.tail)
@@ -1181,7 +1251,11 @@ impl LmmKernel {
     /// The exact-fit floor `(k_total + p + 1)·ε·y′Wy` of r² that every
     /// kernel's deviance tests against (change together): r² is known only
     /// to about this, so `ν·ln σ̂²` in the deviance to about this over σ̂².
+    /// 0 on the QR kernel, which computes `r` directly.
     pub(crate) fn r_sq_floor(&self) -> f64 {
+        if self.qr_on() {
+            return 0.0;
+        }
         // [X y]′W[X y], `m × m`, its last diagonal entry y′Wy.
         let c = match self {
             LmmKernel::Dense { suff, .. } => &suff.c,
@@ -1197,7 +1271,24 @@ impl LmmKernel {
     /// `[X̃ y]′Ŵ[X̃ y]`), and `ln L_jj²` enters the REML deviance, so its error
     /// is that over `L_jj²`. Under ML the pivots enter the deviance only
     /// through β̂, so 0 there.
+    ///
+    /// On the QR kernel the deviance's whole rounding estimate: `r` is known
+    /// to about `ε·‖√Ŵy‖ = ε·√C_pp` and pivot j to about `ε·√C_jj`, so the
+    /// deviance to about `2ε·(ν·√C_pp/r + 1[REML]·Σ_{j<p} √C_jj/T_jj)`
+    /// (first order, one rounding each; `T` the factor, `r = T_pp`).
     pub(crate) fn pivot_noise(&self) -> f64 {
+        if let LmmKernel::Dense { suff, fit } = self {
+            if fit.qr_on() {
+                let (c, f) = (&suff.c, &fit.factor);
+                let p = suff.m - 1;
+                let nu = fit.criterion.nu(suff.n_rows, p) as f64;
+                let mut e = nu * c[(p, p)].sqrt() / f[(p, p)];
+                if fit.criterion == Criterion::Reml {
+                    e += (0..p).map(|j| c[(j, j)].sqrt() / f[(j, j)]).sum::<f64>();
+                }
+                return 2.0 * f64::EPSILON * e;
+            }
+        }
         if self.criterion() != Criterion::Reml {
             return 0.0;
         }
@@ -1280,6 +1371,14 @@ pub struct LmmWorkspace {
     /// ([`satterthwaite::pass_targets`]), built on its first call on the
     /// workspace. The stable path's pass builds its own.
     pub(crate) pass_scratch: Option<Box<satterthwaite::PassScratch>>,
+    /// The summed exponent `k` of the rescale retry (`fit::lmm`): the fit
+    /// runs at `s·4^−rescale_exp`, so the kernel θ is the plain-scale θ times
+    /// `2^−rescale_exp`. 0 at the start of every draw.
+    pub(crate) rescale_exp: i32,
+    /// The retry's keep-lower θ̂ and warm start, `theta`'s length, so a
+    /// retry round allocates nothing.
+    pub(crate) theta_prev: Vec<f64>,
+    pub(crate) theta_warm: Vec<f64>,
 }
 
 impl LmmWorkspace {
@@ -1291,6 +1390,7 @@ impl LmmWorkspace {
             spec: crate::test_support::intercept_only_spec(),
             n_primary: max_clusters,
             extra_counts: vec![],
+            tail_fill: 0.0,
         };
         Self::for_cluster_spec(p, &sized, &[])
     }
@@ -1367,12 +1467,22 @@ impl LmmWorkspace {
             bfgs: Default::default(),
             config,
             theta_endpoint: vec![0.0; theta.len()],
+            theta_prev: vec![0.0; theta.len()],
+            theta_warm: vec![0.0; theta.len()],
             theta,
             lower,
             upper,
             w_sqrt: Vec::new(),
             pass_scratch: None,
+            rescale_exp: 0,
         }
+    }
+
+    /// Whether the last fit left the plain weight scale or the Gram kernel
+    /// (the rescale retry or the QR kernel, `fit::lmm`): its statistics are
+    /// then not the plain-scale Gram a fixed-design draw could reuse.
+    pub(crate) fn retried(&self) -> bool {
+        self.rescale_exp != 0 || self.kernel.qr_on()
     }
 
     /// The dense kernel's accumulated sufficient statistics. Panics on a sparse
@@ -2772,8 +2882,13 @@ pub(crate) fn search_theta(
 /// criterion is accepted by [`search_theta`] and only seeds the BFGS inverse
 /// Hessian: the search and its gradient are the kernel's criterion's; the
 /// seeded inverse Hessian enters only as a start (and the first decrement).
+/// `None` after a fit the rescale retry moved off the plain weight scale: the
+/// hint would be the curvature in another θ scale than the next draw's.
 pub(crate) fn lmm_curvature_hint(ws: &mut LmmWorkspace) -> Option<crate::optim::CurvatureHint> {
     use crate::optim::{GradObjective, Objective};
+    if ws.rescale_exp != 0 {
+        return None;
+    }
     let LmmWorkspace {
         kernel,
         theta,

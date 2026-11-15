@@ -852,6 +852,39 @@ fn non_ascii_names_parse_wherever_a_bare_name_does() {
     assert_eq!(p.offset.as_deref(), Some("log(ekspozycja_ś)"));
 }
 
+/// Combining marks (an NFD `é`), emoji and their ZWJ / skin-tone sequences are
+/// name characters too, at every site a bare name reaches.
+#[test]
+fn marks_emoji_and_cjk_names_parse_wherever_a_bare_name_does() {
+    for n in ["e\u{301}", "😀", "👩\u{1F3FD}\u{200D}🔬", "体重"] {
+        let fixed_of = |f: String| canonical(&parse(&f).unwrap()).1;
+        let re_of = |f: String| canonical(&parse(&f).unwrap()).2;
+        assert_eq!(fixed_of(format!("y ~ {n}")), [n.to_string()], "{n}");
+        assert_eq!(
+            re_of(format!("y ~ x + (1 + {n} | g)")),
+            [format!("slope({n})|g")]
+        );
+        assert_eq!(
+            re_of(format!("y ~ x + ({n} | g)")),
+            [format!("slope({n})|g")]
+        );
+        assert_eq!(fixed_of(format!("y ~ log({n})")), [format!("log({n})")]);
+        assert_eq!(
+            re_of(format!("y ~ x + (1 | {n})")),
+            [format!("intercept|{n}")]
+        );
+    }
+    let (_, fixed, _) = canonical(&parse("y ~ 😀*z").unwrap());
+    assert_eq!(fixed, ["😀", "z", "😀:z"].map(String::from));
+    // A Unicode minus is not an operator: it joins one name, which the column
+    // lookup then refuses as unknown.
+    let (_, fixed, _) = canonical(&parse("y ~ x\u{2212}z").unwrap());
+    assert_eq!(fixed, ["x\u{2212}z".to_string()]);
+    for f in ["y ~ .5x", "y ~ 5x", "y ~ \u{663}x"] {
+        assert!(parse(f).is_err(), "{f}");
+    }
+}
+
 // ── A dangling `+` and the `^` operator ─────────────────────────────────────
 
 /// `pos` is the character index of the `+` in the formula string, not its
@@ -1069,6 +1102,7 @@ fn a_random_effect_term_after_a_name_is_a_syntax_error() {
         ("y ~ x*foo(1 + x | g)", "foo(1+x|g)"),
         ("y ~ x + zerocor(1 + x | g)", "zerocor(1+x|g)"),
         ("y ~ zerocor(1 + x | g)", "zerocor(1+x|g)"),
+        ("y ~ x + x😀(1 | g)", "x😀(1|g)"),
     ] {
         assert_eq!(parse(f), syntax_error(0, &msg(term)), "{f}");
     }

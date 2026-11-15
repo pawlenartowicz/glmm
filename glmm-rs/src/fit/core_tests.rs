@@ -1327,9 +1327,10 @@ fn reordered_crossed_case() -> (
 /// The two per-draw θ marshalling steps `fit_on` does outside the solver — the
 /// scaled-θ read-back in `FitView::new`, and permuting a warm start into slot
 /// order — must cost the warm loop nothing. Three arms: a slope design with a
-/// column scale and no reorder, an intercept-only design the size rule
-/// reorders, and a lone slope grouping written last, which the rule reorders
-/// with blocks of unequal width and which also carries a column scale.
+/// column scale and no reorder, an intercept-only design the fit reorders
+/// (the grouping with the most columns goes first), and a lone slope grouping
+/// written last, which the fit also reorders, with blocks of unequal width,
+/// and which also carries a column scale.
 ///
 /// `fit_on` as a whole cannot be measured at zero — the post-fit Cholesky
 /// factors and the first warm call's BOBYQA instance allocate — so the gate is
@@ -1369,13 +1370,13 @@ fn fit_on_theta_marshalling_bounded_alloc() {
     const BOUND: u64 = 850;
 
     let (xs, ys, ns, ps, ms, ids_s, os) = lmm_slope_case();
-    let (_, _, perm_s) = spec_sized_from_ids(&ms, &ids_s);
+    let (_, _, perm_s) = spec_sized_from_ids(&ms, &ids_s, true);
     assert!(perm_s.is_identity());
     let mut ws_scaled = build_workspace(&ms, &ids_s, ns, ps, &os);
     assert!(ws_scaled.is_lmm());
 
     let (xr, yr, nr, pr, mr, ids_r, or) = reordered_crossed_case();
-    let (_, _, perm_r) = spec_sized_from_ids(&mr, &ids_r);
+    let (_, _, perm_r) = spec_sized_from_ids(&mr, &ids_r, true);
     assert!(
         !perm_r.is_identity(),
         "the warm-start permutation arm needs a reordering workspace"
@@ -1449,7 +1450,7 @@ fn fit_on_theta_marshalling_bounded_alloc() {
         se_for: SeFor::Only(vec![0, 1]),
         ..FitOptions::default()
     };
-    let (_, _, perm_l) = spec_sized_from_ids(&ml, &ids_l);
+    let (_, _, perm_l) = spec_sized_from_ids(&ml, &ids_l, true);
     assert!(
         !perm_l.is_identity(),
         "the slope arm needs a reordering workspace"
@@ -1924,7 +1925,7 @@ fn over_envelope_vech_fits_through_the_theta_rescale() {
         ..FitOptions::default()
     };
     assert_eq!(
-        crate::fit::classify_design(&spec_sized_from_ids(&model, &ids).0, 1),
+        crate::fit::classify_design(&spec_sized_from_ids(&model, &ids, true).0, true),
         crate::fit::Solver::Sparse,
         "q_p past MAX_PRIMARY_Q must route to the sparse solver, not refuse"
     );
@@ -2507,16 +2508,18 @@ fn satterthwaite_nan_beta_is_no_df_failed() {
 fn satterthwaite_repeat_calls_bounded_alloc() {
     let _serial = crate::test_support::alloc_test_guard();
     const N_CALLS: usize = 100;
-    // Measured 5 blocks (2026-10-11, pawel) per `satterthwaite` call under this
+    // Measured 6 blocks (2026-11-15) per `satterthwaite` call under this
     // test's own `RAYON_NUM_THREADS=1` + `--test-threads=1` protocol, on the two
     // draws with a free θ: the pseudo-inverse's blocks (its eigendecomposition's
-    // workspace, eigenvalues and their copy, eigenvectors, the inverse); the
-    // pass's other buffers live on the workspace from the first call. Measured
+    // workspace, eigenvalues and their copy, eigenvectors, the kept eigenvectors
+    // scaled by 1/λ, the inverse); the pass's other buffers live on the
+    // workspace from the first call. Was 5 until `psd_pseudo_inverse` formed the
+    // inverse as a `matmul` product, which needs the scaled copy. Measured
     // 0 blocks per call on the all-pinned draw (the pseudo-inverse of an
     // empty `H_p` allocates nothing). None come from the warm `fit_on` calls.
     // Pinned at the measurement with no slack: if a count moves, re-measure and
     // update, do not relax.
-    const PER_CALL: u64 = 5;
+    const PER_CALL: u64 = 6;
     const PER_CALL_NONE_FREE: u64 = 0;
 
     let (x, y, n, p, model, ids, opts) = lmm_slope_case();
@@ -2650,6 +2653,36 @@ fn fit_on_panics_when_the_criterion_moves_off_its_build() {
     opts.reml = Some(false);
     let mut ws = build_workspace(&model, &ids, n, p, &opts);
     opts.reml = None;
+    let _ = fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts);
+}
+
+/// `condvar` picks the Gaussian kernel at build: a crossed tail of 65
+/// levels that each family touches once (fill far below
+/// `DENSE_KERNEL_MIN_FILL`) builds the sparse kernel with `condvar` off and
+/// the dense one, which forms conditional variances, with it on.
+#[test]
+fn build_workspace_picks_the_gaussian_kernel_by_condvar() {
+    let (model, ids) = crate::fit::common_tests::rotating_crossed_design(Family::Gaussian, 65, 1);
+    let n = ids.primary.len();
+    for condvar in [false, true] {
+        let opts = FitOptions {
+            condvar,
+            ..FitOptions::default()
+        };
+        let ws = build_workspace(&model, &ids, n, 1, &opts);
+        assert_eq!(ws.is_lmm_dense(), condvar, "condvar {condvar}");
+    }
+}
+
+/// `condvar` is frozen at build, as `nagq` is, since the kernel depends on
+/// it: a workspace built with it off refuses a call with it on.
+#[test]
+#[should_panic(expected = "fit_on: condvar is frozen at build")]
+fn fit_on_refuses_a_changed_condvar() {
+    let (x, y, n, p, model, ids, mut opts) = lmm_intercept_case();
+    opts.condvar = false;
+    let mut ws = build_workspace(&model, &ids, n, p, &opts);
+    opts.condvar = true;
     let _ = fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts);
 }
 
@@ -4110,11 +4143,11 @@ fn a_predictor_near_the_data_bound_fits_as_at_scale_1() {
 }
 
 /// Gaussian and binomial: two crossed intercept-only groupings, a (4 levels, no
-/// variance) declared before b (40 levels): the size rule makes b the kernel's
-/// primary. The view's pinned mask must follow `theta()` into declaration
+/// variance) declared before b (40 levels): the fit makes b, the grouping with
+/// the most columns, the kernel's primary. The view's pinned mask must follow `theta()` into declaration
 /// order, and agree with the stable `Fit`.
 #[test]
-fn view_pinned_mask_follows_declaration_order_under_the_size_rule() {
+fn view_pinned_mask_follows_declaration_order_when_groupings_are_reordered() {
     let (n, p) = (800, 2);
     let mut st = 99u64;
     let ua: Vec<f64> = (0..4).map(|_| 0.0 * lcg(&mut st)).collect();
@@ -4200,12 +4233,13 @@ fn view_pinned_mask_follows_declaration_order_under_the_size_rule() {
 }
 
 /// Two crossed intercept-only groupings, a (6 levels) declared before b (40
-/// levels): the size rule makes b the kernel's primary. The stored
+/// levels): the fit makes b, the grouping with the most columns, the kernel's
+/// primary. The stored
 /// Satterthwaite state must list its free θ coordinates in declaration order,
 /// so it is the state of the fit declared b-first with a and b swapped. The
 /// same for a lone slope grouping written last, whose θ block is three wide.
 #[test]
-fn satterthwaite_state_follows_declaration_order_under_the_size_rule() {
+fn satterthwaite_state_follows_declaration_order_when_groupings_are_reordered() {
     let (n, p) = (600, 2);
     let mut st = 7u64;
     let ua: Vec<f64> = (0..6).map(|_| 2.0 * lcg(&mut st)).collect();
@@ -4556,7 +4590,7 @@ fn gather_nested_rows(mut f: crate::Fit, slot_of: &[usize]) -> crate::Fit {
 }
 
 /// A lone slope grouping written after a grouping nested in it is fitted as
-/// the slope-first spelling, which the formula front end nests: the same
+/// the slope-first spelling, which the fit nests: the same
 /// kernel input both ways, so every reported number matches bit for bit,
 /// each nested level's rows read off its padded slot. Gaussian LMM and
 /// Poisson GLMM (the structured layout: slope block 2 plus 3 child slots), on
@@ -4651,6 +4685,7 @@ fn nested_slope_grouping_written_last_fits_as_if_written_first() {
                     c.coupling_at.clone(),
                     c.coupling_cols.clone(),
                     bits(&c.coupling),
+                    c.nested_grouping,
                     c.nested_slots.clone(),
                 )
             };
@@ -4659,6 +4694,105 @@ fn nested_slope_grouping_written_last_fits_as_if_written_first() {
                 a.condvar_cross.as_ref().map(cross_bits),
                 "{ctx}: view condvar_cross"
             );
+        }
+    }
+}
+
+/// A nest found away from the declared primary maps back:
+/// `(1 | a) + (1 | h) + (1 | g)` with h nested in g reaches the kernel input
+/// of the spelling primary g, h nested on padded ids, a crossed, so every
+/// per-grouping result matches that spelling's bit for bit in this
+/// spelling's declaration order, h's rows read off their slots, and `predict`
+/// agrees to round-off. Gaussian LMM and Poisson GLMM (the structured
+/// layout).
+#[test]
+fn a_nest_away_from_the_primary_maps_back() {
+    let opts = FitOptions {
+        condvar: true,
+        ..FitOptions::default()
+    };
+    let popts = crate::PredictOptions {
+        se: true,
+        ..crate::PredictOptions::default()
+    };
+    let (x, y, counts, n, a, h, g) = crate::fit::common_tests::nest_away_case();
+    let p = 2;
+    let padded = crate::fit::common::nested_padded_ids(&g, &h).0;
+    let mut slot_of = vec![0usize; 36];
+    for (&l, &s) in h.iter().zip(&padded) {
+        slot_of[l as usize] = s as usize;
+    }
+    let ids = GroupIds::new(a.clone()).extra(h.clone()).extra(g.clone());
+    let ids_ref = GroupIds::new(g).extra(padded).extra(a);
+    let bits = |v: &[f64]| v.iter().map(|t| t.to_bits()).collect::<Vec<_>>();
+    let poisson = Family::Poisson {
+        link: crate::PoissonLink::Log,
+    };
+    for (family, resp) in [(Family::Gaussian, &y), (poisson, &counts)] {
+        let ctx = format!("{family:?}");
+        let three = ModelSpec::mixed(
+            family,
+            ReStructure::intercept()
+                .extra(Grouping::crossed())
+                .extra(Grouping::crossed()),
+        );
+        let reference = ModelSpec::mixed(
+            family,
+            ReStructure::intercept()
+                .extra(Grouping::nested())
+                .extra(Grouping::crossed()),
+        );
+        let f = crate::fit(&Data::new(&x, resp, n, p).ids(&ids), &three, &opts).unwrap();
+        let r = crate::fit(&Data::new(&x, resp, n, p).ids(&ids_ref), &reference, &opts).unwrap();
+        assert!(f.converged() && r.converged(), "{ctx}");
+        assert_eq!(f.ranef_levels, [5, 36, 12], "{ctx}");
+        assert_eq!(r.ranef_levels, [12, 36, 5], "{ctx}");
+        assert_eq!(f.deviance.to_bits(), r.deviance.to_bits(), "{ctx}");
+        // Grouping `d` of `f` is grouping `2 − d` of `r`; every block is one
+        // column wide, so a level's row is 1 value (`condvar_x`: p).
+        for d in 0..3 {
+            assert_eq!(
+                bits(&f.varcorr[d]),
+                bits(&r.varcorr[2 - d]),
+                "{ctx}: varcorr {d}"
+            );
+        }
+        for (what, fv, rv, w) in [
+            ("ranef", &f.ranef, &r.ranef, 1),
+            ("condvar", &f.condvar, &r.condvar, 1),
+            ("condvar_x", &f.condvar_x, &r.condvar_x, p),
+        ] {
+            assert_eq!(fv.len(), 53 * w, "{ctx}: {what}");
+            let (fa, fh, fg) = (&fv[..5 * w], &fv[5 * w..41 * w], &fv[41 * w..]);
+            let (rg, rh, ra) = (&rv[..12 * w], &rv[12 * w..48 * w], &rv[48 * w..]);
+            assert_eq!(bits(fa), bits(ra), "{ctx}: {what} of a");
+            assert_eq!(bits(fg), bits(rg), "{ctx}: {what} of g");
+            let rh_declared: Vec<f64> = slot_of
+                .iter()
+                .flat_map(|&s| rh[s * w..(s + 1) * w].to_vec())
+                .collect();
+            assert_eq!(bits(fh), bits(&rh_declared), "{ctx}: {what} of h");
+        }
+        let c = f.condvar_cross.as_ref().unwrap();
+        assert_eq!((c.family_grouping, c.nested_grouping), (2, 1), "{ctx}");
+        assert_eq!(c.nested_slots.len(), 36, "{ctx}");
+        let pf = crate::predict(&f, &three, &crate::Design::new(&x, n, p).ids(&ids), &popts)
+            .unwrap_or_else(|e| panic!("{ctx}: predict: {e}"));
+        let pr = crate::predict(
+            &r,
+            &reference,
+            &crate::Design::new(&x, n, p).ids(&ids_ref),
+            &popts,
+        )
+        .unwrap();
+        for (what, u, v) in [("fit", &pf.fit, &pr.fit), ("se", &pf.se, &pr.se)] {
+            assert_eq!(u.len(), n, "{ctx}: {what}");
+            for (i, (&u, &v)) in u.iter().zip(v).enumerate() {
+                assert!(
+                    v.is_finite() && (u - v).abs() <= 1e-12 * v.abs(),
+                    "{ctx}: {what}[{i}] {u} vs {v}"
+                );
+            }
         }
     }
 }
@@ -4734,4 +4868,422 @@ fn view_and_warm_start_follow_declaration_order_under_a_slope_swap() {
         fit_on(&mut ws_first, &data, Some(&start_first), &opts).into_fit(&data, &first, &opts);
     assert_eq!(warm.deviance().to_bits(), warm_first.deviance().to_bits());
     assert_eq!(warm.n_eval(), warm_first.n_eval());
+}
+
+/// Per observed pair of `pairs`, its slot in `padded` (row-aligned ids).
+fn slot_of_pair(padded: &[u32], pairs: &[u32]) -> Vec<usize> {
+    let mut slot_of = vec![0usize; *pairs.iter().max().unwrap() as usize + 1];
+    for (&s, &l) in padded.iter().zip(pairs) {
+        slot_of[l as usize] = s as usize;
+    }
+    slot_of
+}
+
+/// `a`, a fit with grouping `d` declared nested on padded slots, against `b`,
+/// the same model with `d` crossed on its observed pairs, pair `l` at slot
+/// `slot_of[l]` of `a`: bit for bit the same fit, every other grouping's rows
+/// equal and `d`'s rows scattered to their slots. A slot no pair names holds
+/// a zero mode, `d`'s variance block as its conditional variance and no
+/// covariance with β̂, which is what a nested fit reports for a slot with no
+/// rows.
+fn assert_pairs_scattered(a: &crate::Fit, b: &crate::Fit, d: usize, slot_of: &[usize], ctx: &str) {
+    let bits = |v: &[f64]| v.iter().map(|t| t.to_bits()).collect::<Vec<_>>();
+    let n_groupings = a.ranef_levels.len();
+    assert!(a.converged() && b.converged(), "{ctx}");
+    assert_eq!(
+        a.deviance.to_bits(),
+        b.deviance.to_bits(),
+        "{ctx}: deviance"
+    );
+    assert_eq!(bits(&a.beta), bits(&b.beta), "{ctx}: beta");
+    assert_eq!(bits(&a.se), bits(&b.se), "{ctx}: se");
+    for g in 0..n_groupings {
+        assert_eq!(
+            bits(&a.varcorr[g]),
+            bits(&b.varcorr[g]),
+            "{ctx}: varcorr {g}"
+        );
+        if g != d {
+            assert_eq!(a.ranef_levels[g], b.ranef_levels[g], "{ctx}: levels {g}");
+        }
+    }
+    assert_eq!(b.ranef_levels[d], slot_of.len(), "{ctx}: pairs");
+    let p = a.beta.len();
+    let q = |g: usize| crate::fit::vech_q(a.varcorr[g].len());
+    let qs: Vec<usize> = (0..n_groupings).map(q).collect();
+    // Per field: the per-grouping row width, and an empty slot's row.
+    let fields = [
+        ("ranef", &a.ranef, &b.ranef, qs.clone(), vec![0.0; q(d)]),
+        (
+            "condvar",
+            &a.condvar,
+            &b.condvar,
+            qs.iter().map(|q| q * (q + 1) / 2).collect(),
+            a.varcorr[d].clone(),
+        ),
+        (
+            "condvar_x",
+            &a.condvar_x,
+            &b.condvar_x,
+            qs.iter().map(|q| q * p).collect(),
+            vec![0.0; q(d) * p],
+        ),
+    ];
+    for (name, av, bv, w, empty) in fields {
+        assert_eq!(av.is_empty(), bv.is_empty(), "{ctx}: {name}");
+        if av.is_empty() {
+            continue;
+        }
+        let ab = grouping_blocks(av, n_groupings, |g| a.ranef_levels[g] * w[g]);
+        let bb = grouping_blocks(bv, n_groupings, |g| b.ranef_levels[g] * w[g]);
+        for g in (0..n_groupings).filter(|&g| g != d) {
+            assert_eq!(bits(ab[g]), bits(bb[g]), "{ctx}: {name} of grouping {g}");
+        }
+        let wd = w[d];
+        let mut expected: Vec<f64> = empty.repeat(a.ranef_levels[d]);
+        for (l, &s) in slot_of.iter().enumerate() {
+            expected[s * wd..(s + 1) * wd].copy_from_slice(&bb[d][l * wd..(l + 1) * wd]);
+        }
+        assert_eq!(
+            bits(ab[d]),
+            bits(&expected),
+            "{ctx}: {name} of grouping {d}"
+        );
+    }
+}
+
+/// A declared nest wider than K fits as its crossed spelling on the observed
+/// (parent, child) pairs: both reach one kernel input, so the fit matches bit
+/// for bit with the child's rows on their padded slots, and `predict` agrees
+/// to round-off. Gaussian with 8 children per parent and Poisson with 6 (K + 1
+/// each), and an unbalanced Gaussian nest whose widest parent alone is past
+/// K, so every other parent's block has empty slots.
+#[test]
+fn a_wide_declared_nest_fits_as_its_crossed_spelling() {
+    let opts = FitOptions {
+        condvar: true,
+        ..FitOptions::default()
+    };
+    let popts = crate::PredictOptions {
+        se: true,
+        ..crate::PredictOptions::default()
+    };
+    let poisson = Family::Poisson {
+        link: crate::PoissonLink::Log,
+    };
+    let mut unbalanced = vec![4usize; 30];
+    unbalanced[7] = 8;
+    let cases = [
+        ("gaussian", Family::Gaussian, vec![8usize; 30]),
+        ("poisson", poisson, vec![6usize; 30]),
+        ("unbalanced gaussian", Family::Gaussian, unbalanced),
+    ];
+    for (ctx, family, children) in cases {
+        let (x, y, counts, n, g, padded, pairs) =
+            crate::fit::common_tests::declared_nest_case(&children);
+        let resp = if family == Family::Gaussian {
+            &y
+        } else {
+            &counts
+        };
+        let p = 2;
+        let nested = ModelSpec::mixed(family, ReStructure::intercept().extra(Grouping::nested()));
+        let crossed = ModelSpec::mixed(family, ReStructure::intercept().extra(Grouping::crossed()));
+        let ids_n = GroupIds::new(g.clone()).extra(padded.clone());
+        let ids_c = GroupIds::new(g.clone()).extra(pairs.clone());
+        let a = crate::fit(&Data::new(&x, resp, n, p).ids(&ids_n), &nested, &opts).unwrap();
+        let b = crate::fit(&Data::new(&x, resp, n, p).ids(&ids_c), &crossed, &opts).unwrap();
+        let w = *children.iter().max().unwrap();
+        assert_eq!(a.ranef_levels, [30, 30 * w], "{ctx}");
+        let slot_of = slot_of_pair(&padded, &pairs);
+        assert_pairs_scattered(&a, &b, 1, &slot_of, ctx);
+        let slots: Vec<usize> = (a.condvar_cross.as_ref().unwrap().pair_slots.iter())
+            .map(|&s| s as usize)
+            .collect();
+        assert_eq!(slots, slot_of, "{ctx}: the map rides on condvar_cross");
+        let pa = crate::predict(
+            &a,
+            &nested,
+            &crate::Design::new(&x, n, p).ids(&ids_n),
+            &popts,
+        )
+        .unwrap_or_else(|e| panic!("{ctx}: declared predict: {e}"));
+        let pb = crate::predict(
+            &b,
+            &crossed,
+            &crate::Design::new(&x, n, p).ids(&ids_c),
+            &popts,
+        )
+        .unwrap();
+        for (what, va, vb) in [("fit", &pa.fit, &pb.fit), ("se", &pa.se, &pb.se)] {
+            assert_eq!(va.len(), n, "{ctx}: {what}");
+            for (i, (&u, &v)) in va.iter().zip(vb).enumerate() {
+                assert!(
+                    v.is_finite() && (u - v).abs() <= 1e-12 * v.abs(),
+                    "{ctx}: {what}[{i}] {u} vs {v}"
+                );
+            }
+        }
+    }
+}
+
+/// An unbalanced nest whose widest parent (6 children) is within K is fitted on
+/// its nested reading, so the kernel itself leaves the other parents' last two
+/// slots without rows. Such a slot holds a zero mode, the grouping's variance
+/// as its conditional variance and no covariance with β̂: the values
+/// [`assert_pairs_scattered`] expects of a slot the scatter fills.
+#[test]
+fn an_empty_nested_slot_holds_the_prior() {
+    let opts = FitOptions {
+        condvar: true,
+        ..FitOptions::default()
+    };
+    let mut children = vec![4usize; 30];
+    children[7] = 6;
+    let (x, y, _, n, g, padded, _) = crate::fit::common_tests::declared_nest_case(&children);
+    let p = 2;
+    let spec = ModelSpec::mixed(
+        Family::Gaussian,
+        ReStructure::intercept().extra(Grouping::nested()),
+    );
+    let ids = GroupIds::new(g).extra(padded);
+    let fit = crate::fit(&Data::new(&x, &y, n, p).ids(&ids), &spec, &opts).unwrap();
+    assert!(fit.converged());
+    assert_eq!(fit.ranef_levels, [30, 180]);
+    assert!(fit
+        .condvar_cross
+        .as_ref()
+        .is_none_or(|c| c.pair_slots.is_empty()));
+    // Width-1 blocks: ranef and condvar one value per level, condvar_x `p`.
+    let var = fit.varcorr[1][0];
+    for slot in (0..30)
+        .filter(|&f| f != 7)
+        .flat_map(|f| [6 * f + 4, 6 * f + 5])
+    {
+        let at = 30 + slot;
+        assert_eq!(fit.ranef[at], 0.0, "ranef of slot {slot}");
+        assert_eq!(
+            fit.condvar[at].to_bits(),
+            var.to_bits(),
+            "condvar of slot {slot}"
+        );
+        assert!(
+            fit.condvar_x[at * p..(at + 1) * p]
+                .iter()
+                .all(|&v| v == 0.0),
+            "condvar_x of slot {slot}"
+        );
+    }
+}
+
+/// Through the matrix door (the formula refuses a slope on a nested
+/// grouping): a declared nest with a slope on x, 8 children per parent (past
+/// K), fits as the child crossed with the same slope on its observed pairs,
+/// bit for bit. Gaussian and Poisson log.
+#[test]
+fn a_wide_sloped_nest_fits_as_its_crossed_spelling() {
+    let opts = FitOptions {
+        condvar: true,
+        ..FitOptions::default()
+    };
+    let poisson = Family::Poisson {
+        link: crate::PoissonLink::Log,
+    };
+    let (x, y, counts, n, g, padded, pairs) =
+        crate::fit::common_tests::declared_nest_case(&[8; 30]);
+    let p = 2;
+    let slot_of = slot_of_pair(&padded, &pairs);
+    for (family, resp) in [(Family::Gaussian, &y), (poisson, &counts)] {
+        let ctx = format!("{family:?}");
+        let nested = ModelSpec::mixed(
+            family,
+            ReStructure::intercept().extra(Grouping::nested().slopes([1])),
+        );
+        let crossed = ModelSpec::mixed(
+            family,
+            ReStructure::intercept().extra(Grouping::crossed().slopes([1])),
+        );
+        let ids_n = GroupIds::new(g.clone()).extra(padded.clone());
+        let ids_c = GroupIds::new(g.clone()).extra(pairs.clone());
+        let a = crate::fit(&Data::new(&x, resp, n, p).ids(&ids_n), &nested, &opts).unwrap();
+        let b = crate::fit(&Data::new(&x, resp, n, p).ids(&ids_c), &crossed, &opts).unwrap();
+        assert_eq!(a.ranef_levels, [30, 240], "{ctx}");
+        assert_pairs_scattered(&a, &b, 1, &slot_of, &ctx);
+    }
+}
+
+/// Three-level ids, school, class within school (one school with 2 classes,
+/// the rest with 3) and student within class, every nest within K, declared
+/// `(1 | school)` with class nested and student crossed. The kept nest is the
+/// one whose parent has the most columns, student in class; the declared one
+/// is read crossed, so the fit is the spelling that declares class crossed on
+/// its observed pairs, bit for bit, and the kernel input holds one nest.
+#[test]
+fn a_nest_that_loses_to_another_nest_is_read_crossed() {
+    let opts = FitOptions {
+        condvar: true,
+        ..FitOptions::default()
+    };
+    let mut st = 113u64;
+    let (mut x, mut y) = (vec![], vec![]);
+    let (mut school, mut padded, mut pairs, mut student) = (vec![], vec![], vec![], vec![]);
+    let (mut pair, mut stu) = (0u32, 0u32);
+    for s in 0..6u32 {
+        let us = 0.6 * lcg(&mut st);
+        for c in 0..if s == 2 { 2 } else { 3 } {
+            let uc = 0.5 * lcg(&mut st);
+            for _ in 0..4 {
+                let ut = 0.4 * lcg(&mut st);
+                for _ in 0..3 {
+                    let x1 = lcg(&mut st);
+                    x.extend([1.0, x1]);
+                    y.push(0.3 + 0.5 * x1 + us + uc + ut + 0.5 * lcg(&mut st));
+                    school.push(s);
+                    padded.push(s * 3 + c);
+                    pairs.push(pair);
+                    student.push(stu);
+                }
+                stu += 1;
+            }
+            pair += 1;
+        }
+    }
+    let (n, p) = (y.len(), 2);
+    let declared = ModelSpec::mixed(
+        Family::Gaussian,
+        ReStructure::intercept()
+            .extra(Grouping::nested())
+            .extra(Grouping::crossed()),
+    );
+    let crossed = ModelSpec::mixed(
+        Family::Gaussian,
+        ReStructure::intercept()
+            .extra(Grouping::crossed())
+            .extra(Grouping::crossed()),
+    );
+    let ids_n = GroupIds::new(school.clone())
+        .extra(padded.clone())
+        .extra(student.clone());
+    let ids_c = GroupIds::new(school).extra(pairs.clone()).extra(student);
+    let (sized, kernel_ids, _) = spec_sized_from_ids(&declared, &ids_n, true);
+    let re = sized.spec.re.as_ref().unwrap();
+    let relations: Vec<GroupingRelation> = re.extra_groupings.iter().map(|g| g.relation).collect();
+    assert_eq!(
+        relations,
+        [GroupingRelation::Crossed, GroupingRelation::NestedWithin],
+        "class first, school crossed, student nested"
+    );
+    assert_eq!(
+        kernel_ids.primary, pairs,
+        "class first on its observed pairs"
+    );
+    crate::fit::common::check_model_shape(&sized.spec, 1).unwrap();
+    let (sized_c, kernel_ids_c, _) = spec_sized_from_ids(&crossed, &ids_c, true);
+    assert_eq!((&sized, &*kernel_ids), (&sized_c, &*kernel_ids_c));
+
+    let a = crate::fit(&Data::new(&x, &y, n, p).ids(&ids_n), &declared, &opts).unwrap();
+    let b = crate::fit(&Data::new(&x, &y, n, p).ids(&ids_c), &crossed, &opts).unwrap();
+    assert_eq!(a.ranef_levels, [6, 18, 68]);
+    assert_pairs_scattered(&a, &b, 1, &slot_of_pair(&padded, &pairs), "three levels");
+}
+
+/// A draw after one that took both retries of the Gaussian mixed fit (the QR
+/// kernel and a rescale: the δ dataset at its own weights) gives the same
+/// view, bit for bit, as that draw on a fresh workspace, with and without
+/// the fixed-design promise. The second draw (the same rows, homoscedastic
+/// noise) takes no retry, so it must start at the plain weight scale on the
+/// Gram kernel and, after the retried draw, re-accumulate in full.
+#[test]
+fn a_draw_after_a_retried_draw_matches_a_fresh_workspace() {
+    use crate::fit::delta_tests::dataset;
+    let a = dataset(13, 150, 10, 1.0, 1e16, 1.5);
+    let b = dataset(13, 150, 10, 1.0, 1e16, 0.0);
+    assert!(a.x == b.x && a.w == b.w && a.ids.primary == b.ids.primary);
+    let (model, opts, p) = (a.spec(), FitOptions::default(), 2);
+    let data_a = Data::new(&a.x, &a.y, a.n, p).weights(&a.w);
+    let data_b = Data::new(&b.x, &b.y, b.n, p).weights(&b.w);
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    let draw_b = |ws: &mut super::FitWorkspace| {
+        let v = fit_on(ws, &data_b, None, &opts);
+        let r = (
+            bits(v.betas()),
+            bits(v.theta()),
+            v.dispersion().to_bits(),
+            v.n_eval(),
+        );
+        (r, v.into_fit(&data_b, &model, &opts).loglik.to_bits())
+    };
+    let mut fresh = build_workspace(&model, &a.ids, a.n, p, &opts);
+    let want = draw_b(&mut fresh);
+    assert!(!fresh.lmm_parts().unwrap().0.retried());
+    for fixed in [false, true] {
+        let mut ws = build_workspace(&model, &a.ids, a.n, p, &opts);
+        ws.set_fixed_design(fixed);
+        let _ = fit_on(&mut ws, &data_a, None, &opts);
+        let lmm = ws.lmm_parts().unwrap().0;
+        assert!(lmm.kernel.qr_on() && lmm.rescale_exp != 0, "fixed {fixed}");
+        assert_eq!(draw_b(&mut ws), want, "fixed {fixed}");
+    }
+}
+
+/// `FitView::theta` on a fit the rescale retry moved off the plain weight
+/// scale (MIXED of the ports' warning tests, unweighted, so `s = 1` there and
+/// the kernel θ̂ at the plain scale is the caller's) is the caller's θ̂ of
+/// the assembled fit, `√(τ̂²/σ̂²)`, not the kernel θ̂ at the moved scale.
+#[test]
+fn a_retried_view_reports_theta_at_the_plain_scale() {
+    let (x, y, n, ids) = crate::fit::lmm_tests::ports_mixed_data(false);
+    let model = crate::test_support::intercept_only_spec();
+    let opts = FitOptions::default();
+    let data = Data::new(&x, &y, n, 2);
+    let mut ws = build_workspace(&model, &ids, n, 2, &opts);
+    let v = fit_on(&mut ws, &data, None, &opts);
+    let theta = v.theta()[0];
+    let f = v.into_fit(&data, &model, &opts);
+    assert_ne!(ws.lmm_parts().unwrap().0.rescale_exp, 0);
+    assert_near(
+        &[theta],
+        &[(f.tau2[0] / f.dispersion).sqrt()],
+        "θ̂ at the plain scale",
+    );
+}
+
+/// The Gaussian mixed fit's retries allocate nothing per draw once the
+/// workspace has taken them: the δ dataset at its own weights takes the QR
+/// kernel and a rescale on every draw, and after one warm-up draw (which
+/// builds the QR kernel's buffers and the warm BOBYQA instance) 100 more
+/// draws allocate no block. Measured exactly 0 (2026-11-15) under the run
+/// protocol below: the QR refill, the rescale rounds and their searches add
+/// nothing. Pinned at the measurement with no slack.
+///
+/// Run: `RAYON_NUM_THREADS=1 cargo test -p glmm --features
+/// alloc-tests,loop_advanced lmm_qr_refill_bounded_alloc -- --ignored
+/// --test-threads=1`.
+#[cfg(all(feature = "alloc-tests", feature = "loop_advanced"))]
+#[test]
+#[ignore]
+fn lmm_qr_refill_bounded_alloc() {
+    let _serial = crate::test_support::alloc_test_guard();
+    const N_CALLS: usize = 100;
+    const BOUND: u64 = 0;
+    let a = crate::fit::delta_tests::dataset(13, 150, 10, 1.0, 1e16, 1.5);
+    let (model, opts) = (a.spec(), FitOptions::default());
+    let data = Data::new(&a.x, &a.y, a.n, 2).weights(&a.w);
+    let mut ws = build_workspace(&model, &a.ids, a.n, 2, &opts);
+    std::hint::black_box(fit_on(&mut ws, &data, None, &opts).theta()[0]);
+    let lmm = ws.lmm_parts().unwrap().0;
+    assert!(lmm.kernel.qr_on() && lmm.rescale_exp != 0);
+
+    let profiler = dhat::Profiler::builder().testing().build();
+    for _ in 0..N_CALLS {
+        let v = fit_on(&mut ws, &data, None, &opts);
+        std::hint::black_box(std::hint::black_box(&v).theta());
+    }
+    let stats = dhat::HeapStats::get();
+    drop(profiler);
+    assert_eq!(
+        stats.total_blocks, BOUND,
+        "{} blocks across {N_CALLS} draws",
+        stats.total_blocks
+    );
 }

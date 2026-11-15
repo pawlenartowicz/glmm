@@ -856,7 +856,7 @@ fn add_scaled(acc: &mut Mat<f64>, b: &Mat<f64>, s: f64) {
     }
 }
 
-fn mul<T: ComplexField>(a: MatRef<'_, T>, b: MatRef<'_, T>) -> Mat<T> {
+pub(super) fn mul<T: ComplexField>(a: MatRef<'_, T>, b: MatRef<'_, T>) -> Mat<T> {
     let mut c = Mat::<T>::zeros(a.nrows(), b.ncols());
     matmul(c.as_mut(), Accum::Replace, a, b, one::<T>(), Par::Seq);
     c

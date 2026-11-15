@@ -376,6 +376,9 @@ impl FitView<'_> {
     ///
     /// In the caller's DECLARATION order, matching what [`crate::StartValues`]
     /// is read in, so carrying θ̂ from one fit into the next needs no mapping.
+    /// On a Gaussian mixed fit that moved its internal weight scale (the
+    /// rescale retry of `Note::VarianceAtLimit`), θ̂ is reported at the draw's
+    /// own scale, the one the next draw starts at.
     pub fn theta(&self) -> &[f64] {
         if self.theta_declared.is_empty() {
             self.kernel_theta()
@@ -530,7 +533,14 @@ impl<'a> FitView<'a> {
         let mapped = view
             .kernel_groupings()
             .is_some_and(|g| g.any_column_std(map));
-        if mapped || !perm.is_identity() {
+        // A rescaled Gaussian mixed fit reports θ̂ at the plain weight scale,
+        // so a carry into the next draw (which starts at that scale) keeps
+        // its meaning. The kernel θ the box note reads stays as it is.
+        let theta_scale = match &view.kind {
+            FitViewKind::Lmm(v) => v.theta_scale(),
+            _ => 1.0,
+        };
+        if mapped || !perm.is_identity() || theta_scale != 1.0 {
             let n_theta = view.kernel_theta().len();
             // Sized off this workspace's own θ width, so an over-envelope vech (a
             // primary block past `MAX_PRIMARY_Q`, say) is as bounded as an
@@ -569,6 +579,9 @@ impl<'a> FitView<'a> {
                 });
                 let out = (0..n_bits).fold(0u64, |acc, i| acc | (u64::from(bits[i]) << i));
                 view.pinned_override = Some(out);
+            }
+            if theta_scale != 1.0 {
+                theta.iter_mut().for_each(|t| *t *= theta_scale);
             }
             view.theta_declared = &theta_buf[..n_theta];
         }
@@ -654,6 +667,9 @@ pub struct FitWorkspace {
     /// place (the count is frozen at build): [`satterthwaite`] fills these.
     targets: Vec<u32>,
     parallel_inner: bool,
+    /// `opts.condvar` at build: on a Gaussian crossed design it picked the
+    /// kernel (`classify_design`).
+    condvar: bool,
     /// Storage for [`FitView::theta_declared`], `n_theta` long. Sized once at
     /// build off the built kernel's own θ width, so the widest vech a design can
     /// carry is the widest this holds. Sibling of `kind` for the same borrow
@@ -861,6 +877,63 @@ impl FitWorkspace {
         }
     }
 
+    /// Start the LMM's QR kernel on the rows of the last draw (`data` is that
+    /// draw's), and return whether the design is one it covers; nothing is
+    /// started when it is not.
+    pub(crate) fn lmm_start_qr(&mut self, data: &Data<'_>) -> bool {
+        let FitKind::Lmm { ws } = &mut self.kind else {
+            panic!("lmm_start_qr: not an LMM workspace");
+        };
+        if !ws.kernel.qr_covers() {
+            return false;
+        }
+        let n = data.design.n;
+        ws.kernel.start_qr(
+            self.x_mat.as_ref().subrows(0, n),
+            self.z_mat.as_ref().subrows(0, n),
+            self.units.y(data.y),
+            &self.ids.primary,
+            &self.ids.extra,
+            self.units.weights(data.design.weights),
+        );
+        true
+    }
+
+    /// Re-accumulate the last draw's rows (`data` is that draw's) on the
+    /// weights `w_hat` in place of ŵ, a full accumulation.
+    pub(crate) fn lmm_accumulate(&mut self, data: &Data<'_>, w_hat: Option<&[f64]>) {
+        let FitKind::Lmm { ws } = &mut self.kind else {
+            panic!("lmm_accumulate: not an LMM workspace");
+        };
+        let (n, p) = (data.design.n, self.p);
+        super::lmm::accumulate_lmm_rows(
+            ws,
+            self.x_mat.as_ref().subrows(0, n),
+            self.z_mat.as_ref().subrows(0, n),
+            self.units.y(data.y),
+            n,
+            p,
+            &self.ids.primary,
+            &self.ids.extra,
+            w_hat,
+            false,
+            self.criterion.expect("an LMM workspace has a criterion"),
+        );
+    }
+
+    /// The current kernel's rounding estimate of the deviance at the fit's
+    /// θ̂, in deviance units: `r_sq_floor/σ̂² + pivot_noise`, read right after
+    /// a deviance evaluation there (the `precision_limited` check divided by
+    /// σ̂²).
+    pub(crate) fn lmm_endpoint_precision(&mut self) -> f64 {
+        let FitKind::Lmm { ws } = &mut self.kind else {
+            panic!("lmm_endpoint_precision: not an LMM workspace");
+        };
+        let theta = ws.theta.clone();
+        ws.kernel.deviance(&theta);
+        ws.kernel.r_sq_floor() / ws.kernel.sigma_sq() + ws.kernel.pivot_noise()
+    }
+
     /// The grouping reorder this workspace was built under.
     pub(crate) fn perm(&self) -> &Perm {
         &self.perm
@@ -1011,11 +1084,11 @@ pub fn build_workspace(
             if let Err(e) = check_group_ids(re, ids, n_max) {
                 panic!("{e}");
             }
-            let (sized, ids, perm) = spec_sized_from_ids(spec, ids);
+            let (sized, ids, perm) = spec_sized_from_ids(spec, ids, opts.condvar);
             (sized, ids.into_owned(), perm)
         }
         None => (
-            spec_sized_from_ids(spec, ids).0,
+            spec_sized_from_ids(spec, ids, opts.condvar).0,
             GroupIds::default(),
             Perm::IDENTITY,
         ),
@@ -1044,7 +1117,7 @@ pub fn build_workspace(
         },
         (family, Some(_)) => {
             let (slope_cols, extra_slope_cols) = super::glmm::re_slope_cols(&sized.spec);
-            let solver = classify_design(sized, opts.nagq);
+            let solver = classify_design(sized, opts.condvar);
             match family {
                 // Every mixed design reaches one entry point per family and
                 // picks its kernel behind it: `fit_lmm` over the dense or the
@@ -1115,6 +1188,7 @@ pub fn build_workspace(
         n_targets: t,
         targets,
         parallel_inner: opts.parallel_inner,
+        condvar: opts.condvar,
         theta_declared_buf: vec![0.0; n_theta],
         scaling: ColumnScaling::with_re_slopes(
             p,
@@ -1185,7 +1259,7 @@ pub(super) fn draw_units(
 /// p, the random-effect-only column count `s` the spec's slopes read; on a
 /// mixed workspace `n` must be the build's) or frozen-option (nagq,
 /// the criterion `reml` resolves to, the number of SE columns,
-/// parallel_inner) mismatch, and on a `data` with ids. The solver is the one
+/// parallel_inner, condvar) mismatch, and on a `data` with ids. The solver is the one
 /// the stable entry runs; only the workspace lifecycle differs by caller.
 ///
 /// The data, however, is the caller's responsibility — the stable entry
@@ -1245,7 +1319,7 @@ pub fn curvature_hint(ws: &mut FitWorkspace) -> Option<CurvatureHint> {
 /// The Satterthwaite df of each target coefficient of the last fit on `ws`,
 /// into `df_out` (length `p`, NaN off the columns the last `fit_on` call's
 /// `se_for` selects): the stable path's [`Fit::coef_df`], run on demand (equal
-/// to round-off, not bit for bit, when the size rule reorders the groupings). Call
+/// to round-off, not bit for bit, when the fit reorders the groupings). Call
 /// it after [`fit_on`] or [`fit_on_hinted`], with the view dropped; nothing
 /// runs it otherwise. It reads θ̂ and never writes it, and it leaves the
 /// kernel's factor and `σ̂²` off θ̂, at its last stencil point, as
@@ -1577,6 +1651,10 @@ pub fn fit_on_hinted<'a>(
         opts.parallel_inner, ws.parallel_inner,
         "fit_on: parallel_inner is frozen at build"
     );
+    assert_eq!(
+        opts.condvar, ws.condvar,
+        "fit_on: condvar is frozen at build"
+    );
 
     // A mixed workspace fits the rows of the ids it owns.
     if ws.sized.spec.re.is_some() {
@@ -1617,8 +1695,11 @@ pub fn fit_on_hinted<'a>(
     // Column statistics for this draw, once, before any route reads X: the fit
     // runs on x̃ = (x − m)/s and reports through B and N (`standardize`).
     // Under the fixed-design promise both, and the LMM design statistics
-    // below, are the previous call's.
-    let same_design = *fixed_design && *design_rows == Some(n);
+    // below, are the previous call's, unless the previous LMM fit retried:
+    // its statistics and weight scale are then not the plain ones.
+    let same_design = *fixed_design
+        && *design_rows == Some(n)
+        && !matches!(&*kind, FitKind::Lmm { ws } if ws.retried());
     if !same_design {
         scaling.compute(x, n, p, weights, !*prestandardized);
         scaling.compute_re_only(z, n, s, weights);
@@ -1642,11 +1723,6 @@ pub fn fit_on_hinted<'a>(
         scaling,
     );
     let scaling: &'a ColumnScaling = scaling;
-    let units: &'a Units = units;
-    // The weights, response and offset every route fits on (`Units`; the
-    // Gaussian routes' response holds the offset); the map back reads `units`.
-    let fit_weights = units.weights(weights);
-    let (fit_y, fit_offset) = (units.y(y), units.offset(offset));
 
     // Starts arrive in the caller's units and DECLARATION order — the order
     // `FitView::theta` reports θ̂ in, so a warm-start carry round-trips — while
@@ -1699,6 +1775,34 @@ pub fn fit_on_hinted<'a>(
         unchanged => unchanged,
     };
 
+    // The Gaussian mixed fit runs its retries here, while `units` is still
+    // mutable: the rescale retry moves the weight scale `s` it holds.
+    let mut lmm_fit = match &mut *kind {
+        FitKind::Lmm { ws: lmm_ws } => Some(super::lmm::lmm_fit_with_retries(
+            lmm_ws,
+            units,
+            x_mat,
+            z_mat,
+            y,
+            weights,
+            n,
+            p,
+            ids,
+            same_design,
+            criterion.expect("an LMM workspace has a criterion"),
+            targets,
+            warm_theta(start),
+            hint,
+            scaling,
+        )),
+        _ => None,
+    };
+    let units: &'a Units = units;
+    // The weights, response and offset every route fits on (`Units`; the
+    // Gaussian routes' response holds the offset); the map back reads `units`.
+    let fit_weights = units.weights(weights);
+    let (fit_y, fit_offset) = (units.y(y), units.offset(offset));
+
     let kind = match kind {
         FitKind::Ols { ws: ols_ws } => FitViewKind::Ols(super::ols::fit_ols_prebuilt(
             ols_ws,
@@ -1725,30 +1829,12 @@ pub fn fit_on_hinted<'a>(
             units,
             None,
         )),
-        FitKind::Lmm { ws: lmm_ws } => {
-            // Weights fold into the Gram accumulators.
-            super::lmm::accumulate_lmm_rows(
-                lmm_ws,
-                x_mat,
-                z_mat,
-                fit_y,
-                n,
-                p,
-                &ids.primary,
-                &ids.extra,
-                fit_weights,
-                same_design,
-                criterion.expect("an LMM workspace has a criterion"),
-            );
-            FitViewKind::Lmm(super::lmm::lmm_run_on(
-                lmm_ws,
-                targets,
-                warm_theta(start),
-                hint,
-                scaling,
-                units,
-            ))
-        }
+        FitKind::Lmm { ws: lmm_ws } => FitViewKind::Lmm(super::lmm::lmm_view(
+            lmm_ws,
+            lmm_fit.take().expect("the LMM arm ran its fit above"),
+            scaling,
+            units,
+        )),
         // Degenerate guard, the twin of `build_on_workspace`'s: the PIRLS
         // kernels take no width-0 fixed block, and at `n <= p` the fixed
         // effects are not estimable.

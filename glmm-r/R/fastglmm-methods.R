@@ -407,6 +407,7 @@ print.VarCorr.fastglmm <- function(x,
     for (i in seq_along(sd)) {
       # As lme4: a correlation only between two columns of one term, whose
       # columns are contiguous; two terms are uncorrelated by the model.
+      # as.data.frame.VarCorr.fastglmm uses the same test; change together.
       same <- seq_len(i - 1L)
       if (i <= length(term)) same <- same[term[same] == term[i]]
       corr_cells <- if (length(same)) {
@@ -436,6 +437,55 @@ print.VarCorr.fastglmm <- function(x,
   names(rows) <- cols
   print(rows, row.names = FALSE, right = FALSE)
   invisible(x)
+}
+
+#' @details `as.data.frame()` returns lme4's long table, in lme4's default
+#'   order (`order = "cov.last"`): columns `grp`, `var1`, `var2`, `vcov` and
+#'   `sdcor`. Per grouping it has one variance row per column (`var2` is
+#'   `NA`), then one covariance row per correlated pair, in lower-triangle
+#'   column-major order (`var1` is the earlier column); a grouping with no
+#'   estimates has no rows. A gaussian fit ends with a `Residual` row. lme4
+#'   also adds a `Residual` row for a Gamma or inverse-Gaussian fit; fastglmm
+#'   does not. Unlike lme4, which splits `(1 | g) + (0 + x | g)` into groups `g` and `g.1`,
+#'   fastglmm keeps one grouping `g` with two terms, so both rows have
+#'   `grp = "g"` and there is no covariance row between them.
+#' @param row.names,optional unused; part of the `as.data.frame` signature.
+#' @param order only `"cov.last"`, lme4's default; `"lower.tri"` is refused.
+#' @rdname VarCorr.fastglmm
+#' @export
+as.data.frame.VarCorr.fastglmm <- function(x, row.names = NULL,
+                                           optional = FALSE,
+                                           order = "cov.last", ...) {
+  match.arg(order, "cov.last")
+  grp <- var1 <- var2 <- character()
+  vcov <- sdcor <- numeric()
+  for (g in seq_along(x)) {
+    v <- x[[g]]
+    sd <- attr(v, "stddev")
+    if (anyNA(sd)) next
+    term <- attr(v, "term_index")
+    nm <- names(sd)
+    # which() walks the matrix column-major: j outer, i inner, as lme4.
+    ij <- which(lower.tri(v), arr.ind = TRUE)
+    # print.VarCorr.fastglmm uses the same same-term test; change together.
+    keep <- ij[, 1] > length(term) | term[ij[, 2]] == term[ij[, 1]]
+    ij <- ij[keep, , drop = FALSE]
+    grp <- c(grp, rep(names(x)[g], length(sd) + nrow(ij)))
+    var1 <- c(var1, nm, nm[ij[, 2]])
+    var2 <- c(var2, rep(NA_character_, length(sd)), nm[ij[, 1]])
+    vcov <- c(vcov, diag(v), v[ij])
+    sdcor <- c(sdcor, sd, attr(v, "correlation")[ij])
+  }
+  sc <- attr(x, "sc")
+  if (!is.null(sc) && is.finite(sc)) {
+    grp <- c(grp, "Residual")
+    var1 <- c(var1, NA_character_)
+    var2 <- c(var2, NA_character_)
+    vcov <- c(vcov, sc^2)
+    sdcor <- c(sdcor, sc)
+  }
+  data.frame(grp = grp, var1 = var1, var2 = var2, vcov = unname(vcov),
+             sdcor = unname(sdcor), stringsAsFactors = FALSE)
 }
 
 #' Residual scale
@@ -513,7 +563,9 @@ model.frame.fastglmm <- function(formula, ...) formula$frame
 #' `level`. The profiles are of the ML deviance: a REML fit is refitted by ML
 #' first, as lme4 does. An SD estimated at 0 has 0 as its lower bound, and a
 #' correlation whose profile stays inside the cutoff up to -1 or 1 has that
-#' limit. An undetermined bound is `NA`. A GLMM, a model without random
+#' limit. An undetermined bound is `NA`. A random-slope column far from zero
+#' can leave poor or undetermined bounds on the rows of its own random-effect
+#' block; centering the column avoids this. A GLMM, a model without random
 #' effects, and a design with an aliased column are refused with an error. The
 #' Python port's `Fit.profile_confint()` computes the same intervals.
 #'
@@ -673,11 +725,10 @@ nlme::ranef
 #' level's conditional covariance of its random effects given the data, at the
 #' fitted parameters. A fit made with `condvar = FALSE` has none, and some
 #' layouts form none: a model with random slopes on two or more groupings, a
-#' model with one slope grouping written after other groupings where moving it
-#' first would leave more than 500 crossed levels or its slope block is wider
-#' than 8, one over the dense size limit
-#' (all fitted by the sparse solver), and a GLMM
-#' on the packed layout. There an explicit `condVar = TRUE` is an error, and
+#' Gaussian model where the fit cannot pick a first grouping that leaves at most
+#' 500 levels, and no random slope, in the other crossed groupings, one over
+#' the dense size limit (all fitted by the sparse solver), and a GLMM on the
+#' packed layout. There an explicit `condVar = TRUE` is an error, and
 #' the default leaves the attribute off.
 #'
 #' Adds a method to `nlme::ranef`, the generic `lme4::ranef` also uses (lme4

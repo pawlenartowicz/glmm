@@ -6,6 +6,35 @@ All notable changes to the `glmm` crate are recorded here. Format follows
 The Python package (`glmm` on PyPI) is versioned in lockstep with the crate and
 shares these entries; Python-specific notes are called out where they differ.
 
+## [0.9.3] — 2026-11-16
+
+### Added
+
+- Formula column names may contain any non-ASCII character that is not whitespace or a control character, such as combining accents (NFD names) and emoji, and may start with one that is not a digit. Before, only Unicode letters and digits were accepted.
+- R: `as.data.frame(VarCorr(fit))` returns lme4's long table (`grp`, `var1`, `var2`, `vcov`, `sdcor`, lme4's default order). Two terms of one grouping keep one `grp` name, where lme4 writes `g` and `g.1`.
+
+### Changed
+
+- In R, a refused value in `x` or in a random-effect-only column names its design column counted from 1, as R counts rows and as notes already did; it was counted from 0. Python is unchanged.
+- The negative-binomial shape search now runs from 1e-6 (`glmm::limits::NB_THETA_LO`, was 1e-3) to 1e4, in GLMs and mixed models. A fit whose shape ended on 1e-3 now reaches the maximum below it, and a shape seed (`StartValues::dispersion`, `init_theta=` / `init.theta=`) down to 1e-6 is accepted. Other negative-binomial fits change within the search's tolerance.
+- `lnΓ` of an argument below 1 is computed more precisely; negative-binomial fits with a shape below 1, Gamma fits with a row shape (weight over dispersion) below 1, and Poisson or binomial log-likelihoods with a count below 1 change in the last digits.
+- Every spelling of one mixed model now takes one route: the order of the groupings, `a/b`, `a:b` or two plain groupings, and a `ModelSpec` with group ids all give the same fit. The fit finds nested groupings from the group ids, in any position. A nest is fitted as nested while its widest parent has at most 7 children on a Gaussian model and 5 on a GLMM, and as crossed when it is wider. The grouping with the most random-effect columns (levels × (1 + slopes)) is fitted first. Fits that change route move by round-off.
+- A nest written as two plain groupings, such as `(1 | batch) + (1 | sample)`, now lowers as crossed with the plain child labels, so `ranef` holds one value per observed child rather than a padded layout.
+- A GLMM is no longer sent to the packed layout only because it has more than 500 crossed levels. It stays on its dense layout until the crossed part would need more than 1 GiB of memory (256 MiB on WebAssembly), which is more than 5,792 crossed levels (2,896 on WebAssembly). Such fits can now form conditional variances (with `condvar` on), and their numbers move by round-off.
+- With `condvar` off, a Gaussian mixed model with crossed groupings picks the dense or the sparse solver by how much its crossed groupings overlap, so a large crossed model whose groupings overlap little can fit faster. Turning `condvar` on or off can therefore move such a fit's numbers by round-off.
+- `loop_advanced` (unstable): `condvar` is fixed when the workspace is built. `fit_on` with a different `condvar` panics.
+- Python and R: a fit with crossed groupings that stores conditional variances and was pickled (Python) or saved with `saveRDS` (R) by an earlier release no longer loads. Refit it.
+- Profile intervals (`Fit::profile_intervals`, Python `Fit.profile_confint`, R `confint(method = "profile")`) no longer depend on where a predictor's zero is, except on the rows of that predictor's own random-effect block. For example, σ's interval on sleepstudy with `Days + 100` was undetermined and is now the same as on `Days`. Each held search after the first also starts from the estimate and keeps the lower minimum, so a profile takes about twice as long. On the rows of a predictor's own block this removes one cause of the difference: a bound that stopped in a local minimum of the held fit.
+- Term tests and the collinearity check on a design with a wide factor are faster; F, χ², p-values, DenDF and the Satterthwaite df can move by round-off.
+- A Gaussian mixed model whose deviance is lost in rounding now refits on a QR form of the same criterion, on the dense layouts with one grouping factor (nested intercepts allowed). Any Gaussian mixed model whose variance parameter ends on its search limit, or too small for the search to resolve, refits at a rescaled internal weight scale (up to 4 times). Such fits were noted `precision_limited` or `variance_at_limit`, or reported converged at a value that depended on the start. Under weights spanning 1e16, for example, a random-intercept fit at weight power −2 now reaches the same optimum from every start, a weight power of 1.5 gave a log-likelihood of 444.33 and now gives 1601.85, and the fitted weight power moves from 0.83 to 1.50. The notes are computed after these refits. Fits that need neither are unchanged.
+- An unweighted Gaussian mixed fit that rescales runs internally on constant weights. It is the same model; it has no design summary.
+- A Gaussian mixed fit that ended on the QR form gives no conditional variances, even with `condvar` on.
+- `loop_advanced` (unstable): `FitView::theta` reports θ̂ at the draw's own weight scale after a rescale, and `curvature_hint` returns `None` after a fit that rescaled. The draw after a refitted one does not take the `set_fixed_design(true)` shortcut.
+
+### Fixed
+
+- A Gamma GLMM on the inverse link warm-started from a β its search could not leave, such as 1e10 times the estimate, ended with NaN estimates. It is now searched again from the cold start, as on the other families.
+
 ## [0.9.2] — 2026-11-13
 
 ### Changed

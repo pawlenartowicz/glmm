@@ -138,18 +138,18 @@ do_fit <- function(data, formula, family, wald_se, nagq, reml, satterthwaite = T
     if (has_w && has_o)
       fastglmm(formula, data, family, weights = validation_wts, weight_power = 1,
                offset = validation_off, wald.se = wald_se, nAGQ = nagq, REML = reml,
-               satterthwaite = satterthwaite, anova_test = anova_test)
+               satterthwaite = satterthwaite, anova_test = anova_test, condvar = FALSE)
     else if (has_w)
       fastglmm(formula, data, family, weights = validation_wts, weight_power = 1,
                wald.se = wald_se, nAGQ = nagq, REML = reml,
-               satterthwaite = satterthwaite, anova_test = anova_test)
+               satterthwaite = satterthwaite, anova_test = anova_test, condvar = FALSE)
     else if (has_o)
       fastglmm(formula, data, family, offset = validation_off,
                wald.se = wald_se, nAGQ = nagq, REML = reml,
-               satterthwaite = satterthwaite, anova_test = anova_test)
+               satterthwaite = satterthwaite, anova_test = anova_test, condvar = FALSE)
     else
       fastglmm(formula, data, family, wald.se = wald_se, nAGQ = nagq, REML = reml,
-               satterthwaite = satterthwaite, anova_test = anova_test)
+               satterthwaite = satterthwaite, anova_test = anova_test, condvar = FALSE)
   )
 }
 

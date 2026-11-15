@@ -14,7 +14,7 @@ use super::{
 #[cfg(feature = "formula")]
 use super::{restore_response, shift_response, ETA};
 use crate::fit::common_tests::{lcg, sim_clustered};
-use crate::fit::fit_cold_keep_workspace;
+use crate::fit::fit_keep_workspace;
 use crate::fit::SizedSpec;
 #[cfg(feature = "formula")]
 use crate::lmm::fit_lmm_unhinted;
@@ -86,7 +86,7 @@ fn with_fit<R>(
     if let Some(w) = &weights {
         data = data.weights(w);
     }
-    let (fit, mut fws) = fit_cold_keep_workspace(&data, &model, &opts);
+    let (fit, mut fws) = fit_keep_workspace(&data, &model, None, &opts);
     let (ws, map, units) = fws
         .lmm_parts()
         .expect("a Gaussian mixed fit has an LMM workspace");
@@ -237,6 +237,7 @@ fn free_coordinates_drop_exact_zero_columns() {
         },
         n_primary: 4,
         extra_counts: vec![],
+        tail_fill: 0.0,
     };
     // vech column-major: θ̃ = (Λ₀₀, Λ₁₀, Λ₁₁).
     let g = LmmGroupings::from_cluster_spec(&spec, &[1]);
@@ -264,6 +265,7 @@ fn satterthwaite_skips_structural_coordinates() {
             },
             n_primary: 4,
             extra_counts: vec![],
+            tail_fill: 0.0,
         };
         LmmGroupings::from_cluster_spec(&spec, slope_cols)
     };
@@ -312,7 +314,8 @@ fn satterthwaite_skips_structural_coordinates() {
         se_for: SeFor::Only(vec![0, 1]),
         ..FitOptions::default()
     };
-    let (fit, mut fws) = fit_cold_keep_workspace(&Data::new(&x, &y, n, p).ids(&ids), &model, &opts);
+    let (fit, mut fws) =
+        fit_keep_workspace(&Data::new(&x, &y, n, p).ids(&ids), &model, None, &opts);
     let (ws, map, units) = fws.lmm_parts().expect("an LMM workspace");
     assert!(fit.converged());
     assert_eq!(ws.theta[1], 0.0);
@@ -503,7 +506,7 @@ fn slope_rescale_keeps_df_and_all_pinned_gives_nu() {
                 ..FitOptions::default()
             };
             let (fit, mut fws) =
-                fit_cold_keep_workspace(&Data::new(&x, &y, n, p).ids(&ids), &model, &opts);
+                fit_keep_workspace(&Data::new(&x, &y, n, p).ids(&ids), &model, None, &opts);
             assert!(fit.converged(), "sparse {sparse}, x1·{scale}");
             assert_eq!(fws.is_lmm_sparse(), sparse);
             let (ws, map, units) = fws.lmm_parts().expect("an LMM workspace");
@@ -589,7 +592,24 @@ mod formula_gates {
         f: impl FnOnce(&Fit, &mut LmmWorkspace, &ColumnScaling, &Units) -> R,
     ) -> R {
         let lo = lower(formula, table, Family::Gaussian).expect("the fixture lowers");
-        let (fit, mut fws) = fit_cold_keep_workspace(&lo.data(), &lo.model, &FitOptions::default());
+        let (fit, mut fws) =
+            fit_keep_workspace(&lo.data(), &lo.model, None, &FitOptions::default());
+        let (ws, map, units) = fws
+            .lmm_parts()
+            .expect("a Gaussian mixed fit has an LMM workspace");
+        f(&fit, ws, map, units)
+    }
+
+    /// [`with_formula_fit`] with the QR kernel started on the fit's rows.
+    fn with_formula_fit_qr<R>(
+        formula: &str,
+        table: &Table,
+        f: impl FnOnce(&Fit, &mut LmmWorkspace, &ColumnScaling, &Units) -> R,
+    ) -> R {
+        let lo = lower(formula, table, Family::Gaussian).expect("the fixture lowers");
+        let data = lo.data();
+        let (fit, mut fws) = fit_keep_workspace(&data, &lo.model, None, &FitOptions::default());
+        assert!(fws.lmm_start_qr(&data), "a shape the QR kernel covers");
         let (ws, map, units) = fws
             .lmm_parts()
             .expect("a Gaussian mixed fit has an LMM workspace");
@@ -871,6 +891,7 @@ mod formula_gates {
                 .iter()
                 .map(|ids| levels(ids) as usize)
                 .collect(),
+            tail_fill: 0.0,
         };
         let targets: Vec<u32> = (0..p as u32).collect();
         let fitted = |sparse: bool| {
@@ -1047,15 +1068,22 @@ mod formula_gates {
     }
 
     /// The response statistics' bits (the `y` row of the Gram, the sparse
-    /// kernel's `y` column too, and the `y` entry of each random-effect
-    /// column's `Z'[X̃ y]`) and the deviance's at θ̂.
+    /// kernel's `y` column too, the `y` entry of each random-effect column's
+    /// `Z'[X̃ y]`, and the QR kernel's `y` column while it is on) and the
+    /// deviance's at θ̂.
     fn response_bits(ws: &mut LmmWorkspace) -> Vec<u64> {
-        let mut v: Vec<f64> = match &ws.kernel {
-            LmmKernel::Dense { suff, .. } => {
+        let mut v: Vec<f64> = match &mut ws.kernel {
+            LmmKernel::Dense { suff, fit } => {
                 let p = suff.m - 1;
                 (0..=p)
                     .map(|j| suff.c[(p, j)])
                     .chain((0..suff.s.ncols()).map(|a| suff.s[(p, a)]))
+                    .chain(
+                        fit.qr
+                            .as_deref_mut()
+                            .filter(|q| q.on)
+                            .map_or(vec![], |q| q.y_column()),
+                    )
                     .collect()
             }
             LmmKernel::Sparse { ws: sp, .. } => {
@@ -1075,9 +1103,9 @@ mod formula_gates {
 
     /// The pass puts the response back bit for bit on each kernel route it
     /// meets: the balanced collapse (`int1`, five rows in each of 60 groups),
-    /// the per-group regressions (`q2s`, on both of its routes) and the sparse
-    /// kernel (`cross4`). The deviance at θ̂ reads the re-armed precomputes, so
-    /// a stale one shows there.
+    /// the QR kernel (`int1` again), the per-group regressions (`q2s`, on both
+    /// of its routes) and the sparse kernel (`cross4`). The deviance at θ̂
+    /// reads the re-armed precomputes, so a stale one shows there.
     #[test]
     fn pass_restores_the_response_on_every_route() {
         let (table, formula) = speed_shape(&[1], false, false, 811_001);
@@ -1090,6 +1118,13 @@ mod formula_gates {
             let before = response_bits(ws);
             assert!(!pass(ws, map, units).is_failed());
             assert_eq!(response_bits(ws), before, "int1");
+        });
+        with_formula_fit_qr(&formula, &table, |fit, ws, map, units| {
+            assert!(fit.converged());
+            assert!(ws.kernel.qr_on(), "int1: the QR kernel is on");
+            let before = response_bits(ws);
+            assert!(!pass(ws, map, units).is_failed());
+            assert_eq!(response_bits(ws), before, "int1, QR kernel");
         });
 
         let (table, formula) = speed_shape(&[2], false, false, 811_001);
@@ -1120,6 +1155,34 @@ mod formula_gates {
         )
         .is_failed());
         assert_eq!(response_bits(&mut sparse), before, "cross4, sparse kernel");
+    }
+
+    /// The pass on the QR kernel gives the Gram kernel's df at the same θ̂,
+    /// both on the value route, within its band [`DF_FD_REL`] (`q2s`, random
+    /// slopes on the primary).
+    #[test]
+    fn qr_pass_df_match_the_gram_pass() {
+        let (table, formula) = speed_shape(&[2], false, false, 811_001);
+        let lo = lower(&formula, &table, Family::Gaussian).expect("the fixture lowers");
+        let data = lo.data();
+        let (fit, mut fws) = fit_keep_workspace(&data, &lo.model, None, &FitOptions::default());
+        assert!(fit.converged());
+        let (ws, map, units) = fws.lmm_parts().unwrap();
+        let theta = ws.theta.clone();
+        let gram = pass_value_at(ws, &theta, map, units).coef_df();
+        assert!(fws.lmm_start_qr(&data), "q2s: a covered shape");
+        let (ws, map, units) = fws.lmm_parts().unwrap();
+        let st = pass_value_at(ws, &theta, map, units);
+        assert_eq!(st.route, DerivRoute::Value);
+        let qr = st.coef_df();
+        assert_eq!(qr.len(), lo.p);
+        assert_eq!(gram.len(), qr.len());
+        for (t, (&q, &g)) in qr.iter().zip(&gram).enumerate() {
+            assert!(
+                rel(q, g) <= DF_FD_REL,
+                "coefficient {t}: QR df {q} against Gram {g}"
+            );
+        }
     }
 
     /// The canonical correlation boundary (`sim_corr_boundary`, `y ~ x + (x | g)`):
@@ -1626,7 +1689,7 @@ pub(crate) mod gate1 {
         if let Some(w) = &lo.weights {
             data = data.weights(w);
         }
-        let (_, mut fws) = fit_cold_keep_workspace(&data, &lo.model, &opts);
+        let (_, mut fws) = fit_keep_workspace(&data, &lo.model, None, &opts);
         let (ws, map, units) = fws
             .lmm_parts()
             .expect("a Gaussian mixed fit has an LMM workspace");
@@ -1680,7 +1743,7 @@ pub(crate) mod gate1 {
                 theta[start[g]..start[g + 1]].to_vec()
             })
             .collect();
-        let (_, _, perm) = spec_sized_from_ids(&lo.model, &lo.ids);
+        let (_, _, perm) = spec_sized_from_ids(&lo.model, &lo.ids, true);
         perm.swap_slots(&mut blocks);
         let mut out: Vec<f64> = blocks.concat();
         let groupings = ws.kernel.groupings();
@@ -1951,7 +2014,7 @@ mod gradient_route {
             });
             lo.weights = Some(w.expect("a numeric weight column"));
         }
-        let (fit, mut fws) = fit_cold_keep_workspace(&lo.data(), &lo.model, &fit_opts);
+        let (fit, mut fws) = fit_keep_workspace(&lo.data(), &lo.model, None, &fit_opts);
         let (ws, map, units) = fws
             .lmm_parts()
             .expect("a Gaussian mixed fit has an LMM workspace");

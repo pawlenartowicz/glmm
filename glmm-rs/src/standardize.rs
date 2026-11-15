@@ -685,14 +685,29 @@ impl Units {
         let Some(w) = weights.filter(|_| !counts) else {
             return;
         };
-        self.s = crate::family::weight_scale(Some(w), n);
-        if self.s != 1.0 {
-            for (dst, &wi) in self.w[..n].iter_mut().zip(w) {
-                *dst = wi / self.s;
-            }
-            self.w_changed = true;
-            self.n = n;
+        self.set_weight_scale(Some(w), n, crate::family::weight_scale(Some(w), n));
+    }
+
+    /// Set the weight scale to `s` on rows `0..n` of the caller's prior
+    /// weights (`None`: unit weights) and refill `ŵ = w/s` (`1/s` without
+    /// weights); at `s = 1` the caller's weights are used as given. A
+    /// dispersion family only: the Gaussian mixed fit's rescale retry moves
+    /// `s` by a power of 4 after [`Self::compute`].
+    pub(crate) fn set_weight_scale(&mut self, weights: Option<&[f64]>, n: usize, s: f64) {
+        self.s = s;
+        self.w_changed = s != 1.0;
+        if !self.w_changed {
+            return;
         }
+        match weights {
+            Some(w) => {
+                for (dst, &wi) in self.w[..n].iter_mut().zip(w) {
+                    *dst = wi / s;
+                }
+            }
+            None => self.w[..n].fill(1.0 / s),
+        }
+        self.n = n;
     }
 
     /// This draw's response scale, after [`Self::compute`] on the same rows:

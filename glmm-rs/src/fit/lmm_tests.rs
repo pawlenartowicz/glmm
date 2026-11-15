@@ -1171,7 +1171,7 @@ fn fit_lmm_scalar_crossed_varying_weights_noz_matches_sparse() {
         se_for: SeFor::Only(vec![0, 1]),
         ..FitOptions::default()
     };
-    let (sized, ids, _) = spec_sized_from_ids(&model, &ids);
+    let (sized, ids, _) = spec_sized_from_ids(&model, &ids, true);
     let noz = fit_mle_noz_pub(
         &x,
         &y,
@@ -1487,7 +1487,7 @@ fn fit_lmm_crossed_slope_extra_varying_weights_noz_matches_sparse() {
         se_for: SeFor::Only(vec![0, 1]),
         ..FitOptions::default()
     };
-    let (sized, ids, _) = spec_sized_from_ids(&cluster, &ids);
+    let (sized, ids, _) = spec_sized_from_ids(&cluster, &ids, true);
     let noz = fit_mle_noz_pub(
         &x,
         &y,
@@ -1594,7 +1594,7 @@ fn fit_lmm_weight_scale_invariant_dense_and_sparse() {
         primary: ids_v,
         extra: vec![],
     };
-    let (sized, ids, _) = spec_sized_from_ids(&cluster, &ids);
+    let (sized, ids, _) = spec_sized_from_ids(&cluster, &ids, true);
 
     let fit_at = |c: f64, reml: Option<bool>| {
         let opts = FitOptions {
@@ -1993,39 +1993,7 @@ fn fit_pastes_nested_matches_lme4() {
     const REF_BATCH_SD: f64 = 1.287366;
     const REF_CASK_SD: f64 = 2.904077;
 
-    let csv = include_str!("../../../validation/data/empirical/Pastes.csv");
-    // cols: strength,batch,cask,sample  (sample = "batch:cask" global label)
-    let mut y = Vec::<f64>::new();
-    let mut batch_raw = Vec::<String>::new();
-    let mut cask_raw = Vec::<String>::new();
-    for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
-        let f: Vec<&str> = line.split(',').map(|s| s.trim_matches('"')).collect();
-        y.push(f[0].parse().unwrap()); // strength
-        batch_raw.push(f[1].to_string()); // batch
-        cask_raw.push(f[3].to_string()); // sample = batch:cask global label
-    }
-    let n = y.len();
-    let p = 1;
-    let x = vec![1.0f64; n];
-    let (batch, _n_batch) = dense_str(&batch_raw);
-    let (cask, _n_cask) = dense_str(&cask_raw);
-
-    let model = ModelSpec {
-        family: Family::Gaussian,
-        re: Some(ReStructure {
-            terms: Vec::new(),
-            slopes: vec![],
-            extra_groupings: vec![Grouping {
-                terms: Vec::new(),
-                relation: GroupingRelation::NestedWithin, // placeholder
-                slopes: vec![],
-            }],
-        }),
-    };
-    let ids = GroupIds {
-        primary: batch,
-        extra: vec![cask],
-    };
+    let (x, y, n, p, model, ids) = pastes_nested_design();
     let f = fit_cold(
         &x,
         &y,
@@ -2069,7 +2037,8 @@ fn fit_pastes_nested_matches_lme4() {
 /// Grouping order must not change the answer. Both declarations of the same
 /// two-factor scalar-crossed design — `(1|big) + (1|small)` and
 /// `(1|small) + (1|big)` — reach the kernel as the identical design, because
-/// the size rule makes the many-level factor the primary either way. So the
+/// the fit puts the grouping with the most columns, here the many-level
+/// factor, first either way. So the
 /// fits are BIT-identical wherever the quantity is grouping-blind (deviance, β,
 /// SE, the optimizer's evaluation count), and every grouping-indexed field
 /// comes back in the order that caller declared, which is the reverse of the
@@ -2478,7 +2447,7 @@ fn lmm_maxfun_cap_q2_reports_honest_endpoint_and_not_singular() {
         ..FitOptions::default()
     };
 
-    let (sized, ids, _) = spec_sized_from_ids(&model, &ids);
+    let (sized, ids, _) = spec_sized_from_ids(&model, &ids, true);
     let mut ws = LmmWorkspace::for_cluster_spec_ext(p, &sized, &[1], &[], false);
     let mut x_mat = Mat::<f64>::zeros(n, p);
     for i in 0..n {
@@ -2610,7 +2579,7 @@ fn dense_accumulation_case(n: usize, collinear: bool, weighted: bool) -> DenseCa
         primary: ids,
         extra: vec![],
     };
-    let (sized, gids, _) = spec_sized_from_ids(&model, &gids);
+    let (sized, gids, _) = spec_sized_from_ids(&model, &gids, true);
     let ws = LmmWorkspace::for_cluster_spec_ext(p, &sized, &[], &[], false);
     (ws, x, y, gids.primary.clone(), w)
 }
@@ -2808,7 +2777,7 @@ fn sparse_accumulation_workspace(ids: &[u32], extra: &[Vec<u32>]) -> LmmWorkspac
         primary: ids.to_vec(),
         extra: extra.to_vec(),
     };
-    let (sized, gids, perm) = spec_sized_from_ids(&model, &gids);
+    let (sized, gids, perm) = spec_sized_from_ids(&model, &gids, true);
     assert!(perm.is_identity() && gids.primary == ids && gids.extra == extra);
     LmmWorkspace::for_cluster_spec_ext(3, &sized, &[], &[], true)
 }
@@ -3225,7 +3194,7 @@ fn failed_pass_gives_no_df_failed() {
         ..FitOptions::default()
     };
     let (mut fit, mut ws) =
-        fit_cold_keep_workspace(&Data::new(&x, &y, n, p).ids(&ids), &model, &opts);
+        fit_keep_workspace(&Data::new(&x, &y, n, p).ids(&ids), &model, None, &opts);
     assert!(fit.converged());
     ws.lmm_parts().expect("a Gaussian mixed workspace").0.theta[0] = f64::NAN;
     super::core::attach_satterthwaite(&mut ws, &mut fit, &opts);
@@ -3473,6 +3442,7 @@ fn design_summary_kept_inside_envelope() {
             spec: intercept_only_spec(),
             n_primary: 9,
             extra_counts: vec![],
+            tail_fill: 0.0,
         };
         let mut ws = LmmWorkspace::for_cluster_spec_ext(p, &wide, &[], &[], false);
         let x_mat = Mat::<f64>::from_fn(n, p, |i, j| x[i * p + j]);
@@ -3639,6 +3609,17 @@ fn lmm_fit_reports_nobs_and_its_criterion() {
 /// upper limit of its search box; MIXED_PAIRS (groups `(i / 2) % 5`) breaks
 /// that and its θ̂ is interior.
 fn ports_mixed_fit(pairs: bool) -> Fit {
+    let (x, y, n, ids) = ports_mixed_data(pairs);
+    let model = intercept_only_spec();
+    let opts = FitOptions {
+        se_for: SeFor::Only(vec![0, 1]),
+        ..FitOptions::default()
+    };
+    fit_cold(&x, &y, n, 2, &model, &ids, &opts)
+}
+
+/// The rows of [`ports_mixed_fit`]: `x = [1, x]` (`p = 2`), `y`, `n`, ids.
+pub(super) fn ports_mixed_data(pairs: bool) -> (Vec<f64>, Vec<f64>, usize, GroupIds) {
     let xs: Vec<f64> = (-10..=10).filter(|&v| v != 0).map(f64::from).collect();
     let n = xs.len();
     let off = [-3.0, -1.5, 0.0, 1.5, 3.0];
@@ -3649,22 +3630,22 @@ fn ports_mixed_fit(pairs: bool) -> Fit {
         .map(|i| 0.3 * xs[i] + (((i * 7) % 5) as f64 - 2.0) * 0.4 + off[g[i] as usize])
         .collect();
     let x: Vec<f64> = xs.iter().flat_map(|&v| [1.0, v]).collect();
-    let model = intercept_only_spec();
     let ids = GroupIds {
         primary: g,
         extra: vec![],
     };
-    let opts = FitOptions {
-        se_for: SeFor::Only(vec![0, 1]),
-        ..FitOptions::default()
-    };
-    fit_cold(&x, &y, n, 2, &model, &ids, &opts)
+    (x, y, n, ids)
 }
 
-/// A θ on its upper search limit is reported as such, with a note, and the
-/// rest of the fit is left as the search ended it.
+/// A θ on its upper search limit is reported with a note, and the rest of the
+/// fit is left as the search ended it. The first fixture (y − 0.3x constant
+/// within groups) has no finite optimum: the residual variance goes to zero,
+/// every rescale round of the retry lowers the criterion (by about 194), so
+/// keep-lower keeps each one, and the fit ends where its QR deviance is lost
+/// in rounding, inside the box, with the note that says so. The second
+/// fixture is interior.
 #[test]
-fn theta_on_its_upper_limit_is_reported_not_interior() {
+fn a_theta_without_a_finite_optimum_is_noted_and_an_interior_one_is_not() {
     let at_limit = |f: &Fit| {
         f.diagnostics
             .notes
@@ -3674,8 +3655,16 @@ fn theta_on_its_upper_limit_is_reported_not_interior() {
     let f = ports_mixed_fit(false);
     assert!(f.converged());
     assert!(!f.singular());
-    assert_eq!(f.diagnostics.boundary, Boundary::UpperLimit);
-    assert!(at_limit(&f), "notes: {:?}", f.diagnostics.notes);
+    // Was UpperLimit, VarianceAtLimit, loglik 58.97; moved by the rescale retry (loglik 447.07).
+    assert_eq!(f.diagnostics.boundary, Boundary::Interior);
+    assert!(
+        f.diagnostics
+            .notes
+            .iter()
+            .any(|n| matches!(n, Note::PrecisionLimited)),
+        "notes: {:?}",
+        f.diagnostics.notes
+    );
 
     let f = ports_mixed_fit(true);
     assert!(f.converged());
@@ -3799,4 +3788,575 @@ fn masked_df_counts_free_theta() {
     let f = fit_cold(&xg, &yg, ng, pg, &gamma, &gids, &opts);
     assert!(f.converged(), "Gamma: must converge");
     assert_eq!(f.df, pg + 2 + 1, "Gamma");
+}
+
+/// Pastes, `strength ~ 1 + (1 | batch/cask)`: 60 rows, 10 batches of 3
+/// casks.
+fn pastes_nested_design() -> (Vec<f64>, Vec<f64>, usize, usize, ModelSpec, GroupIds) {
+    let csv = include_str!("../../../validation/data/empirical/Pastes.csv");
+    // cols: strength,batch,cask,sample  (sample = "batch:cask" global label)
+    let mut y = Vec::<f64>::new();
+    let mut batch_raw = Vec::<String>::new();
+    let mut cask_raw = Vec::<String>::new();
+    for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+        let f: Vec<&str> = line.split(',').map(|s| s.trim_matches('"')).collect();
+        y.push(f[0].parse().unwrap()); // strength
+        batch_raw.push(f[1].to_string()); // batch
+        cask_raw.push(f[3].to_string()); // sample = batch:cask global label
+    }
+    let n = y.len();
+    let p = 1;
+    let x = vec![1.0f64; n];
+    let (batch, _n_batch) = dense_str(&batch_raw);
+    let (cask, _n_cask) = dense_str(&cask_raw);
+
+    let model = ModelSpec {
+        family: Family::Gaussian,
+        re: Some(ReStructure {
+            terms: Vec::new(),
+            slopes: vec![],
+            extra_groupings: vec![Grouping {
+                terms: Vec::new(),
+                relation: GroupingRelation::NestedWithin, // placeholder
+                slopes: vec![],
+            }],
+        }),
+    };
+    let ids = GroupIds {
+        primary: batch,
+        extra: vec![cask],
+    };
+    (x, y, n, p, model, ids)
+}
+
+/// Dyestuff, `Yield ~ 1 + (1 | Batch)`: 30 rows, 6 batches of 5.
+fn dyestuff_design() -> (Vec<f64>, Vec<f64>, usize, usize, ModelSpec, GroupIds) {
+    let csv = include_str!("../../../validation/data/empirical/Dyestuff.csv");
+    let mut y = Vec::<f64>::new();
+    let mut batch_raw = Vec::<String>::new();
+    for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+        let f: Vec<&str> = line.split(',').map(|s| s.trim_matches('"')).collect();
+        batch_raw.push(f[0].to_string()); // Batch
+        y.push(f[1].parse().unwrap()); // Yield
+    }
+    let n = y.len();
+    let (batch, _) = dense_str(&batch_raw);
+    let model = ModelSpec::mixed(Family::Gaussian, ReStructure::intercept());
+    (vec![1.0; n], y, n, 1, model, GroupIds::new(batch))
+}
+
+/// A fit the QR kernel is checked on against the Gram kernel.
+struct QrCase {
+    name: &'static str,
+    x: Vec<f64>,
+    y: Vec<f64>,
+    n: usize,
+    p: usize,
+    model: ModelSpec,
+    ids: GroupIds,
+    w: Option<Vec<f64>>,
+    reml: bool,
+}
+
+impl QrCase {
+    fn data(&self) -> Data<'_> {
+        let d = Data::new(&self.x, &self.y, self.n, self.p).ids(&self.ids);
+        match &self.w {
+            Some(w) => d.weights(w),
+            None => d,
+        }
+    }
+
+    /// The cold Gram fit's workspace, the weights as given.
+    fn gram_fit(&self) -> super::core::FitWorkspace {
+        let opts = FitOptions {
+            reml: Some(self.reml),
+            ..FitOptions::default()
+        };
+        let (fit, mut fws) = super::fit_keep_workspace(&self.data(), &self.model, None, &opts);
+        assert!(fit.converged(), "{}: the Gram fit converges", self.name);
+        // A retried fit would end on the QR kernel or another scale, and the
+        // tests would compare QR with QR.
+        assert!(
+            !fws.lmm_parts().unwrap().0.retried(),
+            "{}: the fit takes no retry",
+            self.name
+        );
+        fws
+    }
+}
+
+/// Every covered shape of the QR kernel on real data: Dyestuff (`q_p = 1`)
+/// by REML and ML; sleepstudy `(1 + Days | Subject)` (`q_p = 2`) by REML and
+/// ML, and by REML on the weights `1 + i mod 3` of
+/// `fit_lmm_weighted_matches_lme4`; Pastes `(1 | batch/cask)` (nested
+/// children) by REML; and the δ dataset of `delta_tests` on the working
+/// weights `w^0.5` (`q_p = 1`, weights over eight decades, still
+/// Gram-precise).
+fn qr_cases() -> Vec<QrCase> {
+    let mut cases = Vec::new();
+    for reml in [true, false] {
+        let (x, y, n, p, model, ids) = dyestuff_design();
+        cases.push(QrCase {
+            name: if reml { "Dyestuff REML" } else { "Dyestuff ML" },
+            x,
+            y,
+            n,
+            p,
+            model,
+            ids,
+            w: None,
+            reml,
+        });
+    }
+    for (name, reml, weighted) in [
+        ("sleepstudy REML", true, false),
+        ("sleepstudy ML", false, false),
+        ("sleepstudy weighted REML", true, true),
+    ] {
+        let (x, y, n, p, model, ids) = sleepstudy_slope_design();
+        cases.push(QrCase {
+            name,
+            w: weighted.then(|| (0..n).map(|i| 1.0 + (i % 3) as f64).collect()),
+            x,
+            y,
+            n,
+            p,
+            model,
+            ids,
+            reml,
+        });
+    }
+    let (x, y, n, p, model, ids) = pastes_nested_design();
+    cases.push(QrCase {
+        name: "Pastes REML",
+        x,
+        y,
+        n,
+        p,
+        model,
+        ids,
+        w: None,
+        reml: true,
+    });
+    let set = super::delta_tests::dataset(13, 150, 10, 1.0, 1e16, 1.5);
+    cases.push(QrCase {
+        name: "delta dataset, w^0.5, REML",
+        w: Some(super::working_weights(&set.w, 0.5)),
+        model: set.spec(),
+        x: set.x,
+        y: set.y,
+        n: set.n,
+        p: 2,
+        ids: set.ids,
+        reml: true,
+    });
+    cases
+}
+
+/// At the Gram fit's θ̂, the QR kernel's deviance equals the Gram kernel's
+/// within the Gram's own rounding estimate there (`r_sq_floor/σ̂² +
+/// pivot_noise`). The two share the accumulated `U` and nothing else.
+#[test]
+fn qr_deviance_equals_gram_at_the_gram_optimum() {
+    let mut checked = 0;
+    for case in qr_cases() {
+        let data = case.data();
+        let mut fws = case.gram_fit();
+        let e = fws.lmm_endpoint_precision();
+        let (ws, _, _) = fws.lmm_parts().unwrap();
+        let theta = ws.theta.clone();
+        let d_g = ws.kernel.deviance(&theta);
+        assert!(fws.lmm_start_qr(&data), "{}: a covered shape", case.name);
+        let (ws, _, _) = fws.lmm_parts().unwrap();
+        assert!(ws.kernel.qr_on(), "{}", case.name);
+        let d_q = ws.kernel.deviance(&theta);
+        assert!(
+            (d_q - d_g).abs() <= e,
+            "{}: QR {d_q} against Gram {d_g}, |diff| {:e} > E {e:e}",
+            case.name,
+            (d_q - d_g).abs()
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, 7);
+}
+
+/// At the Gram fit's θ̂ and β̃, the conditional modes off the QR kernel equal
+/// the Gram kernel's entry by entry, within `1e-8` of the block's scale (the
+/// band `tests/lmm_ranef.rs` holds the Gram recovery to against a direct BLUP
+/// solve).
+#[test]
+fn qr_ranef_equals_gram_at_the_gram_optimum() {
+    let mut checked = 0;
+    for case in qr_cases() {
+        let data = case.data();
+        let mut fws = case.gram_fit();
+        let (ws, _, _) = fws.lmm_parts().unwrap();
+        let (theta, beta) = (ws.theta.clone(), ws.recovery.beta_tilde.clone());
+        ws.kernel.deviance(&theta);
+        assert!(ws.kernel.recover_ranef(&theta, &beta), "{}", case.name);
+        let gram = ws.kernel.ranef_u().to_vec();
+        assert!(fws.lmm_start_qr(&data), "{}", case.name);
+        let (ws, _, _) = fws.lmm_parts().unwrap();
+        ws.kernel.deviance(&theta);
+        assert!(ws.kernel.recover_ranef(&theta, &beta), "{}", case.name);
+        let qr = ws.kernel.ranef_u();
+        assert_eq!(qr.len(), gram.len(), "{}", case.name);
+        let scale = gram.iter().fold(1.0f64, |m, v| m.max(v.abs()));
+        for (i, (&q, &g)) in qr.iter().zip(&gram).enumerate() {
+            assert!(
+                (q - g).abs() <= 1e-8 * scale,
+                "{}: û[{i}] QR {q} against Gram {g}",
+                case.name
+            );
+        }
+        checked += 1;
+    }
+    assert_eq!(checked, 7);
+}
+
+/// The QR kernel refilled at another weight scale keeps the criterion in
+/// caller units: with ŵ·4^k accumulated and θ̂·2^−k, the deviance moves by
+/// exactly `n·k·ln 4` (`deviance + n·ln s` does not depend on s), within the
+/// QR kernel's rounding estimate at θ̂.
+#[test]
+fn qr_refill_at_a_new_weight_scale_keeps_the_caller_deviance() {
+    const K: i32 = 3;
+    let mut checked = 0;
+    for case in qr_cases()
+        .into_iter()
+        .filter(|c| matches!(c.name, "Dyestuff REML" | "delta dataset, w^0.5, REML"))
+    {
+        let data = case.data();
+        let mut fws = case.gram_fit();
+        assert!(fws.lmm_start_qr(&data), "{}", case.name);
+        let e = fws.lmm_endpoint_precision();
+        let (ws, _, units) = fws.lmm_parts().unwrap();
+        let theta = ws.theta.clone();
+        let d0 = ws.kernel.deviance(&theta);
+        let c = 4f64.powi(K);
+        let w_hat: Vec<f64> = match units.weights(case.w.as_deref()) {
+            Some(w) => w.iter().map(|v| v * c).collect(),
+            None => vec![c; case.n],
+        };
+        fws.lmm_accumulate(&data, Some(&w_hat));
+        let (ws, _, _) = fws.lmm_parts().unwrap();
+        assert!(ws.kernel.qr_on(), "{}", case.name);
+        let scaled: Vec<f64> = theta.iter().map(|t| t * 2f64.powi(-K)).collect();
+        let d1 = ws.kernel.deviance(&scaled);
+        let want = d0 + case.n as f64 * K as f64 * 4f64.ln();
+        assert!(
+            (d1 - want).abs() <= e,
+            "{}: {d1} against {want}, E {e:e}",
+            case.name
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, 2);
+}
+
+/// The unweighted MIXED fixture rescales (θ̂ on the box), so it runs on the
+/// constant ŵ = 1/s like a fit with unit weights, which takes the same
+/// rounds. The two reports are equal bit for bit: the deviance takes the same
+/// −Σ ln ŵᵢ, σ̂² the same `s`, and the design summary, built on the Gram of ŵ,
+/// is left out of the rescaled unweighted fit (an unrescaled one, MIXED_PAIRS,
+/// keeps it).
+#[test]
+fn a_rescaled_unweighted_fit_matches_unit_weights() {
+    let model = intercept_only_spec();
+    let opts = FitOptions::default();
+    let (x, y, n, ids) = ports_mixed_data(false);
+    let ones = vec![1.0; n];
+    let data = Data::new(&x, &y, n, 2).ids(&ids);
+    let (plain, mut ws_plain) = super::fit_keep_workspace(&data, &model, None, &opts);
+    let (unit, mut ws_unit) = super::fit_keep_workspace(&data.weights(&ones), &model, None, &opts);
+    for fws in [&mut ws_plain, &mut ws_unit] {
+        assert_ne!(fws.lmm_parts().unwrap().0.rescale_exp, 0);
+    }
+    let bits = |f: &Fit| {
+        let mut v = vec![f.deviance, f.loglik, f.dispersion];
+        v.extend(&f.beta);
+        v.extend(f.varcorr.iter().flatten());
+        v.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+    };
+    assert_eq!(bits(&plain), bits(&unit));
+    assert!(plain.design_summary.is_none());
+    let (x, y, n, ids) = ports_mixed_data(true);
+    let (pairs, _) =
+        super::fit_keep_workspace(&Data::new(&x, &y, n, 2).ids(&ids), &model, None, &opts);
+    assert!(pairs.design_summary.is_some());
+}
+
+/// lme4's weighted REML criterion `REMLcrit` at given estimates, from faer's
+/// Householder QR of the whole stacked penalized least-squares system
+/// (Bates et al. 2015, §3)
+///
+/// ```text
+///   [ √W·Z·Λ̂   √W·X   √W·y ]
+///   [   I        0      0   ]
+/// ```
+///
+/// whose `R` has blocks `R_ZZ`, `R_XX` and the last pivot `r`:
+/// `2·ln|det R_ZZ| + 2·ln|det R_XX| + ν·(1 + ln(2π·r²/ν)) − Σ ln wᵢ`, `ν = n − p`.
+/// `zl` is `Z·Λ̂` (`n × q`, caller units), `x` row-major `n × p`. It shares no
+/// code with the kernels.
+///
+/// The rows go in by decreasing norm: Householder QR without that order is
+/// not row-wise stable when the row norms span many decades, and its `r`
+/// then moves with the row order (Cox & Higham 1998). Measured on the
+/// sleepstudy fixture of the test below: 2e-4 in the criterion between the
+/// given and the reversed order, 1e-8 from the QR kernel once sorted.
+///
+/// Bates, D., Mächler, M., Bolker, B. & Walker, S. (2015). Fitting linear
+/// mixed-effects models using lme4. *Journal of Statistical Software* 67(1).
+/// Cox, A. J. & Higham, N. J. (1998). Stability of Householder QR
+/// factorization for weighted least squares problems. In *Numerical Analysis
+/// 1997*, 57–73. Addison Wesley Longman.
+fn householder_remlcrit(zl: &Mat<f64>, x: &[f64], y: &[f64], w: &[f64], p: usize) -> f64 {
+    let (n, q) = (zl.nrows(), zl.ncols());
+    let d = q + p + 1;
+    let mut m = Mat::<f64>::zeros(n + q, d);
+    for i in 0..n {
+        let sw = w[i].sqrt();
+        for j in 0..q {
+            m[(i, j)] = sw * zl[(i, j)];
+        }
+        for j in 0..p {
+            m[(i, q + j)] = sw * x[i * p + j];
+        }
+        m[(i, q + p)] = sw * y[i];
+    }
+    for j in 0..q {
+        m[(n + j, j)] = 1.0;
+    }
+    let norm = |i: usize| (0..d).map(|j| m[(i, j)] * m[(i, j)]).sum::<f64>();
+    let mut order: Vec<usize> = (0..n + q).collect();
+    order.sort_by(|&a, &b| norm(b).total_cmp(&norm(a)));
+    let m = Mat::<f64>::from_fn(n + q, d, |i, j| m[(order[i], j)]);
+    let r = m.as_ref().qr().thin_R().to_owned();
+    let ln_abs = |j: usize| r[(j, j)].abs().ln();
+    let nu = (n - p) as f64;
+    let rr = r[(q + p, q + p)] * r[(q + p, q + p)];
+    2.0 * (0..q).map(ln_abs).sum::<f64>()
+        + 2.0 * (q..q + p).map(ln_abs).sum::<f64>()
+        + nu * (1.0 + (2.0 * std::f64::consts::PI * rr / nu).ln())
+        - w.iter().map(|v| v.ln()).sum::<f64>()
+}
+
+/// `Z·Λ̂` of sleepstudy's `(1 + Days | Subject)`, `Λ̂` the lower Cholesky
+/// factor of the fit's `varcorr/σ̂²`.
+fn sleepstudy_zl(f: &Fit, x: &[f64], ids: &GroupIds) -> Mat<f64> {
+    let n = ids.primary.len();
+    let k = ids.primary.iter().max().unwrap() + 1;
+    let vc = &f.varcorr[0];
+    let s2 = f.dispersion;
+    let l00 = (vc[0] / s2).sqrt();
+    let l10 = vc[1] / s2 / l00;
+    let l11 = (vc[2] / s2 - l10 * l10).sqrt();
+    let mut zl = Mat::<f64>::zeros(n, 2 * k as usize);
+    for i in 0..n {
+        let (c, days) = (2 * ids.primary[i] as usize, x[2 * i + 1]);
+        zl[(i, c)] = l00 + days * l10;
+        zl[(i, c + 1)] = days * l11;
+    }
+    zl
+}
+
+/// `Z·Λ̂` of Pastes' `(1 | batch/cask)`: a batch and a cask column per row,
+/// each times `√(varcorr/σ̂²)` of its grouping.
+fn pastes_zl(f: &Fit, ids: &GroupIds) -> Mat<f64> {
+    let n = ids.primary.len();
+    let kb = *ids.primary.iter().max().unwrap() as usize + 1;
+    let kc = *ids.extra[0].iter().max().unwrap() as usize + 1;
+    let (lb, lc) = (
+        (f.varcorr[0][0] / f.dispersion).sqrt(),
+        (f.varcorr[1][0] / f.dispersion).sqrt(),
+    );
+    let mut zl = Mat::<f64>::zeros(n, kb + kc);
+    for i in 0..n {
+        zl[(i, ids.primary[i] as usize)] = lb;
+        zl[(i, kb + ids.extra[0][i] as usize)] = lc;
+    }
+    zl
+}
+
+/// Weights `r` log-uniform on `[1, 1e16]` (rows 0 and 1 at the two ends) and
+/// residual noise `r^(−0.75)·N(0, 1)`, the recipe of `delta_tests::dataset`.
+fn wide_weights_and_noise(n: usize, st: &mut u64) -> (Vec<f64>, Vec<f64>) {
+    let normal = super::delta_tests::normal;
+    (0..n)
+        .map(|i| {
+            let r = match i {
+                0 => 1.0,
+                1 => 1e16,
+                _ => 1e16f64.powf(0.5 * (lcg(st) + 1.0)),
+            };
+            (r, r.powf(-0.75) * normal(st))
+        })
+        .unzip()
+}
+
+/// The QR kernel's general per-level step (a random slope, `q_p = 2`; nested
+/// children) on fits that need it: sleepstudy's `(1 + Days | Subject)` and
+/// Pastes' `(1 | batch/cask)` layouts, the response regenerated from lme4's
+/// estimates on the real data (`fit_sleepstudy_slope_varcorr_matches_lme4`,
+/// `fit_pastes_nested_matches_lme4`) under weights spanning 1e16
+/// ([`wide_weights_and_noise`]), fitted by REML on those weights. The large
+/// y′Wy is Σŵb², which the response shift does not remove, so the Gram
+/// kernel loses the residual. Each fit, cold and from the warm diagonal
+/// starts 0.1, 1 and 10 (caller units, off-diagonals 0):
+///
+/// - ends on the QR kernel;
+/// - has `−2·loglik` equal to an independent dense Householder evaluation of
+///   lme4's weighted REML criterion at its own estimates
+///   ([`householder_remlcrit`]) within its precision estimate;
+/// - agrees with the other starts within the largest of their precision
+///   estimates (glmm's own output: the fits are compared with each other).
+///
+/// The reference helper is first checked against lme4's `REMLcrit` on the
+/// fit of `fit_lmm_weighted_matches_lme4`.
+#[test]
+fn a_triggered_fit_on_slopes_and_nesting_matches_a_householder_reference() {
+    let normal = super::delta_tests::normal;
+    {
+        const REF_REMLCRIT: f64 = 1778.29146275691;
+        let (x, y, n, p, model, ids) = sleepstudy_slope_design();
+        let w: Vec<f64> = (0..n).map(|i| 1.0 + (i % 3) as f64).collect();
+        let opts = FitOptions {
+            weight_power: Some(WeightPower::Fixed(1.0)),
+            ..FitOptions::default()
+        };
+        let f = fit_warm_wo(&x, &y, n, p, &model, &ids, None, Some(&w), None, &opts);
+        let crit = householder_remlcrit(&sleepstudy_zl(&f, &x, &ids), &x, &y, &w, p);
+        assert!(
+            (crit - REF_REMLCRIT).abs() < 1e-6,
+            "helper {crit} against lme4 {REF_REMLCRIT}"
+        );
+    }
+
+    let mut checked = 0;
+    for name in ["sleepstudy", "Pastes"] {
+        let mut st: u64 = if name == "sleepstudy" { 21 } else { 22 };
+        let (x, mut y, n, p, model, ids) = if name == "sleepstudy" {
+            sleepstudy_slope_design()
+        } else {
+            pastes_nested_design()
+        };
+        let (w, noise) = wide_weights_and_noise(n, &mut st);
+        if name == "sleepstudy" {
+            let (sd0, sd1, corr) = (24.7406579949841, 5.92213765889808, 0.0655512382381282);
+            let b: Vec<[f64; 2]> = (0..18)
+                .map(|_| {
+                    let (z1, z2) = (normal(&mut st), normal(&mut st));
+                    [
+                        sd0 * z1,
+                        sd1 * (corr * z1 + (1.0 - corr * corr).sqrt() * z2),
+                    ]
+                })
+                .collect();
+            for i in 0..n {
+                let (days, bs) = (x[2 * i + 1], b[ids.primary[i] as usize]);
+                y[i] = 251.405104848485 + 10.467285959596 * days + bs[0] + bs[1] * days + noise[i];
+            }
+        } else {
+            let bb: Vec<f64> = (0..10).map(|_| 1.287366 * normal(&mut st)).collect();
+            let bc: Vec<f64> = (0..30).map(|_| 2.904077 * normal(&mut st)).collect();
+            for i in 0..n {
+                y[i] = 60.0533333333
+                    + bb[ids.primary[i] as usize]
+                    + bc[ids.extra[0][i] as usize]
+                    + noise[i];
+            }
+        }
+        let data = Data::new(&x, &y, n, p).ids(&ids).weights(&w);
+        let opts = FitOptions {
+            reml: Some(true),
+            ..FitOptions::default()
+        };
+        let mut rows = Vec::new();
+        for start in [None, Some(0.1), Some(1.0), Some(10.0)] {
+            let sv = start.map(|t| {
+                let theta = if name == "sleepstudy" {
+                    vec![t, 0.0, t]
+                } else {
+                    vec![t, t]
+                };
+                StartValues::new(vec![], theta)
+            });
+            let (f, mut fws) = super::fit_keep_workspace(&data, &model, sv.as_ref(), &opts);
+            assert!(f.converged(), "{name} {start:?}: {:?}", f.diagnostics.notes);
+            let e = fws.lmm_endpoint_precision();
+            let zl = if name == "sleepstudy" {
+                sleepstudy_zl(&f, &x, &ids)
+            } else {
+                pastes_zl(&f, &ids)
+            };
+            let crit = householder_remlcrit(&zl, &x, &y, &w, p);
+            let dev = -2.0 * f.loglik;
+            assert!(
+                (dev - crit).abs() <= e,
+                "{name} {start:?}: −2·loglik {dev} against Householder {crit}, E {e:e}"
+            );
+            assert!(
+                fws.lmm_parts().unwrap().0.kernel.qr_on(),
+                "{name} {start:?}: ends on the QR kernel"
+            );
+            rows.push((dev, e));
+            checked += 1;
+        }
+        let e = rows.iter().fold(0.0f64, |m, r| m.max(r.1));
+        for &(d, _) in &rows {
+            assert!(
+                (d - rows[0].0).abs() <= e,
+                "{name}: −2·loglik {d} against {} (E {e:e})",
+                rows[0].0
+            );
+        }
+    }
+    assert_eq!(checked, 8);
+}
+
+/// Keep-lower undoes a worse rescale round. On the ports' PARITY fixture
+/// (`y ~ z + (1 + z | g)`, z near 1e4, y exact in z and g, so no finite
+/// optimum) the first rescale round (k = 10) is kept and moves the fit to
+/// the QR kernel; the second (k = 10 again, the intercept's θ̂ still on the
+/// box) ends worse in caller units, so it is undone and the fit ends at the
+/// first round's scale. The test repeats that second round by hand at the
+/// fit's endpoint and checks it is worse than where the fit ended.
+#[test]
+fn a_worse_rescale_round_is_undone() {
+    let n = 40;
+    let (mut x, mut y, mut g) = (Vec::new(), Vec::new(), Vec::new());
+    for gi in 0..5u32 {
+        for j in 0..8 {
+            let z = 1.0e4 + (j as f64 - 3.5);
+            x.extend_from_slice(&[1.0, z]);
+            y.push(1.0 + 0.1 * z / 1.0e4 + 0.05 * gi as f64);
+            g.push(gi);
+        }
+    }
+    let ids = GroupIds::new(g);
+    let model = ModelSpec::mixed(Family::Gaussian, ReStructure::intercept().slopes([1]));
+    let data = Data::new(&x, &y, n, 2).ids(&ids);
+    let (fit, mut fws) = super::fit_keep_workspace(&data, &model, None, &FitOptions::default());
+    assert!(fit.converged());
+    let (ws, _, units) = fws.lmm_parts().unwrap();
+    assert!(ws.kernel.qr_on());
+    assert_eq!(ws.rescale_exp, 10, "the fit ends at the kept round's scale");
+    let theta = ws.theta.clone();
+    let s = units.s();
+    let kept = ws.kernel.deviance(&theta) + n as f64 * s.ln();
+    let w_next = vec![4f64.powi(10) / s; n];
+
+    // The undone round: s·4^−10, warm from θ̂·2^−10.
+    fws.lmm_accumulate(&data, Some(&w_next));
+    let (ws, map, _) = fws.lmm_parts().unwrap();
+    let warm: Vec<f64> = theta.iter().map(|t| t * 2f64.powi(-10)).collect();
+    let next = crate::lmm::fit_lmm_unhinted(ws, &[], Some(&warm), map);
+    let undone = next.deviance + n as f64 * (s * 4f64.powi(-10)).ln();
+    assert!(
+        kept < undone,
+        "kept {kept} against the undone round's {undone}"
+    );
 }

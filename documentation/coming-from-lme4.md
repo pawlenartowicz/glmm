@@ -199,9 +199,9 @@ four oracles (lme4, glmmTMB, MixedModels.jl, GLMMadaptive).
 - **Some fits have no conditional variances**: a fit made with
   `condvar = FALSE` (Python `condvar=False`), which skips them to save time
   (up to about the time of the fit on a large crossed model), a model with
-  random slopes on two or more groupings, a model with one slope grouping written after other groupings where moving it first would leave more than 500 crossed levels or its slope block is wider than 8, a model over the
-  dense size limits (more than 500 crossed levels, for example), and the
-  larger GLMMs that use the packed layout. There `ranef(fit)` has no `postVar`
+  random slopes on two or more groupings, a Gaussian model where glmm cannot pick a first grouping that leaves at most 500 levels, and no random slope, in the other crossed groupings, a model over the
+  dense size limits (a random-effect block wider than 8, for example), and the
+  larger GLMMs that use the packed layout (more than 5,792 crossed levels, for example). There `ranef(fit)` has no `postVar`
   attribute (an explicit `condVar = TRUE` is an error), Python's `postvar` and
   `condsd` are `None`, and `predict()` gives a standard error, or a future
   bound, with `re.form = NA` only. The predictions themselves work on every

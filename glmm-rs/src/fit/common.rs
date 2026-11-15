@@ -279,6 +279,14 @@ pub(super) fn materialize_diagnostics(
     }
 }
 
+/// Whether a kernel θ entry `t` is on the upper limit of its search box:
+/// `|t| ≥ THETA_HI·(1 − 1e-6)`. Shared by [`note_theta_at_limit`] and the
+/// Gaussian mixed fit's rescale retry (`fit::lmm`), so the note and the retry
+/// read one box.
+pub(super) fn at_theta_limit(t: f64) -> bool {
+    t.abs() >= crate::lmm::THETA_HI * (1.0 - 1e-6)
+}
+
 /// Flag a θ on the upper limit of its search box: some coordinate with
 /// `|units·θ| ≥ THETA_HI·(1 − 1e-6)` (`crate::lmm::THETA_HI`, the box both
 /// mixed kernels search in) pushes [`Note::VarianceAtLimit`] and turns an
@@ -289,8 +297,7 @@ pub(super) fn materialize_diagnostics(
 /// view mappers call this on a fit with a finite endpoint, after
 /// [`materialize_diagnostics`].
 pub(super) fn note_theta_at_limit(diagnostics: &mut Diagnostics, theta: &[f64], units: f64) {
-    let edge = crate::lmm::THETA_HI * (1.0 - 1e-6);
-    if theta.iter().any(|t| (units * t).abs() >= edge) {
+    if theta.iter().any(|t| at_theta_limit(units * t)) {
         diagnostics.notes.push(Note::VarianceAtLimit);
         if diagnostics.boundary == Boundary::Interior {
             diagnostics.boundary = Boundary::UpperLimit;
@@ -804,7 +811,9 @@ pub(crate) fn assemble_condvar_cross(
         coupling_at: Vec::with_capacity(kernel.coupling_at.len()),
         coupling_cols: Vec::with_capacity(kernel.coupling_cols.len()),
         coupling: Vec::with_capacity(kernel.coupling_cols.len() * wr),
+        nested_grouping: 0,
         nested_slots: Vec::new(),
+        pair_slots: Vec::new(),
     };
     // `ma = D_f·(A⁻¹)_ff`, reported rows × kernel columns, then times `D_fᵀ`.
     let mut ma = vec![0.0f64; wr * w];
@@ -957,10 +966,10 @@ pub(crate) fn lmm_fitted(
 /// extra — the layout of both the `ModelSpec` and the `GroupIds` the kernels
 /// see, and of every grouping-indexed result they emit.
 ///
-/// `spec_sized_from_ids` is the only producer. Its size rule exchanges the
-/// primary with exactly one extra. Undoing the reorder is the same exchange
-/// applied a second time — a transposition is its own inverse — which is why
-/// this records the one swapped index rather than a full index map.
+/// `spec_sized_from_ids` is the only producer. It exchanges the primary with
+/// at most one extra. Undoing the reorder is the same exchange applied a
+/// second time — a transposition is its own inverse — which is why this
+/// records the one swapped index rather than a full index map.
 ///
 /// The two groupings it exchanges need not be equally wide, so data holding
 /// one entry per grouping (`varcorr`, `ranef_levels`, `pinned`) moves by
@@ -972,33 +981,48 @@ pub(crate) fn lmm_fitted(
 /// included; the `pinned_components` mask the block's non-structural
 /// diagonals.
 ///
-/// When the swap moved a slope grouping first and the old primary turned out
-/// nested in it, the kernel holds the old primary as a `NestedWithin` extra
-/// on padded `parent·W + position` slots, and `nested_slots` maps each of its
-/// declared levels to its slot. [`unpermute_fit`] then reads that grouping's
-/// per-level rows off the slots in declared level order, and hands the map to
-/// [`CondvarCross::nested_slots`]. θ needs no map: a nested intercept has the
-/// one θ entry a crossed one has.
+/// When the caller declared every grouping crossed and one turned out nested
+/// in another, the kernel holds it as a `NestedWithin` extra on padded
+/// `parent·W + position` slots, and `nested` names it by declaration index
+/// with each of its declared levels' slot. [`unpermute_fit`] then reads that
+/// grouping's per-level rows off the slots in declared level order, wherever
+/// its block sits, and hands the map to [`CondvarCross::nested_slots`]. θ
+/// needs no map: a nested intercept has the one θ entry a crossed one has.
+///
+/// When the caller declared a grouping `NestedWithin` and the fit reads it
+/// crossed, the kernel holds it on its observed (parent, child) pairs, and
+/// `pairs` names it with its padded slot count and each pair's slot.
+/// [`unpermute_fit`] then scatters its rows back to the padded slots (after
+/// the gather above, so a pair grouping the kernel holds nested in another
+/// grouping takes both maps) and hands the map to
+/// [`CondvarCross::pair_slots`]. θ needs no map: the same block is fitted on
+/// either layout.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct Perm {
-    /// Extra grouping that traded places with the primary. `None` is the
-    /// identity: declaration order reached the kernel untouched.
+    /// Extra grouping that traded places with the primary. `None`: no
+    /// grouping moved.
     swapped_extra: Option<usize>,
-    /// Per declared level of the old primary, its child slot in the kernel;
-    /// empty unless the old primary was nested.
-    nested_slots: Vec<u32>,
+    /// The declaration index of the declared-crossed grouping the kernel
+    /// holds nested, and per declared level of it its child slot.
+    nested: Option<(usize, Vec<u32>)>,
+    /// The declaration index of the declared-nested grouping the kernel
+    /// holds crossed, its padded slot count, and per observed pair (the
+    /// kernel's level) its padded slot.
+    pairs: Option<(usize, usize, Vec<u32>)>,
 }
 
 impl Perm {
     /// Declaration order reached the kernel untouched.
     pub(crate) const IDENTITY: Perm = Perm {
         swapped_extra: None,
-        nested_slots: Vec::new(),
+        nested: None,
+        pairs: None,
     };
 
-    /// Whether the kernel's slot order IS the caller's declaration order.
+    /// Whether the kernel's input IS the caller's declaration: no grouping
+    /// moved, none was nested and no declared nest was read crossed.
     pub(crate) fn is_identity(&self) -> bool {
-        self.swapped_extra.is_none()
+        self.swapped_extra.is_none() && self.nested.is_none() && self.pairs.is_none()
     }
 
     /// Map a vector holding one entry per grouping between slot order and
@@ -1044,10 +1068,10 @@ impl Perm {
 }
 
 /// Report a fit's grouping-indexed results in the caller's declaration order.
-/// The kernels emit them in slot order, which [`spec_sized_from_ids`]'s size
-/// rule may have reordered; this is the single site that undoes it for the
-/// stable API, so no `Fit` consumer sees slot order. `beta`, `se`, `vcov`,
-/// `fitted`, `deviance` and `loglik` are grouping-order-independent and are not
+/// The kernels emit them in slot order, which [`spec_sized_from_ids`] may have
+/// reordered; this is the single site that undoes it for the stable API, so
+/// no `Fit` consumer sees slot order. `beta`, `se`, `vcov`, `fitted`,
+/// `deviance` and `loglik` are grouping-order-independent and are not
 /// touched.
 pub(super) fn unpermute_fit(perm: &Perm, fit: &mut Fit) {
     if perm.is_identity() {
@@ -1070,121 +1094,72 @@ pub(super) fn unpermute_fit(perm: &Perm, fit: &mut Fit) {
     perm.swap_slots(&mut fit.ranef_levels);
     perm.swap_slots(&mut fit.varcorr);
     perm.swap_slots(&mut fit.diagnostics.pinned);
-    // A nested old primary now leads, `ranef_levels[0]` padded slots wide:
-    // one row per declared level, read off its slot.
-    let slots = &perm.nested_slots;
-    if slots.is_empty() {
-        return;
-    }
-    debug_assert_eq!(fit.varcorr[0].len(), 1, "the old primary is intercept-only");
-    let padded = fit.ranef_levels[0];
-    let gather = |v: &mut Vec<f64>, w: usize| {
-        if v.is_empty() {
-            return;
-        }
-        let rows: Vec<f64> = slots
-            .iter()
-            .flat_map(|&s| v[s as usize * w..(s as usize + 1) * w].to_vec())
-            .collect();
-        v.splice(..padded * w, rows);
-    };
-    gather(&mut fit.ranef, 1);
-    gather(&mut fit.condvar, 1);
-    gather(&mut fit.condvar_x, p);
-    fit.ranef_levels[0] = slots.len();
-    if let Some(c) = fit.condvar_cross.as_mut() {
-        c.nested_slots = slots.clone();
-    }
-}
-
-/// The size rule picks which grouping the kernel holds as its primary. It
-/// fires only when every extra grouping is `Crossed`; otherwise nothing moves.
-/// Then:
-///
-/// 1. **No grouping has slopes:** the grouping with the most levels becomes the
-///    primary.
-/// 2. **Exactly one grouping has slopes, and it is an extra:** that grouping
-///    becomes the primary, provided the reordered spec still routes `NoZ`
-///    ([`spec_sized_from_ids`] checks this with `classify_design` and undoes
-///    the swap otherwise).
-/// 3. **Otherwise** (two or more slope groupings, or the slope grouping is
-///    already the primary): nothing moves.
-///
-/// Why rule 1 pays. The primary is eliminated as block-diagonal families at
-/// cost linear in its level count, while every extra lands in one Schur tail
-/// whose width is the total crossed level count and whose factorization is
-/// cubic in that width. Which grouping the user happened to write first
-/// therefore sets the tail width. MixedModels.jl sorts its `ReMat`s by
-/// decreasing level count for exactly this reason; Bates, Alday & Kokandakar
-/// (2025), arXiv:2505.11674, measure the effect on InstEval with that sort
-/// defeated — ~4.5M vs 775K nonzeros in the Cholesky factor. Only the choice of
-/// primary matters: the tail's cost does not depend on the order of the extras
-/// inside it, so one transposition is all a reorder needs.
-///
-/// Why rule 2 pays. A slope on an extra grouping routes the sparse solver,
-/// which forms no conditional variances; with the slope grouping as primary
-/// the same model gets the per-level elimination, conditional variances and
-/// the dense route's speed. It holds back when the reordered spec would route
-/// `Sparse` anyway (more than `MAX_CROSSED_LEVELS` crossed levels left in the
-/// tail, or a slope block wider than `MAX_PRIMARY_Q`): the order then gives no
-/// conditional variances either way, and the swap would move the old primary,
-/// possibly one with thousands of levels, out of the per-level elimination
-/// into the sparse tail, a move that has not been measured.
-///
-/// Why rule 3 leaves the order alone. `(1 + x | subject) + (1 | item)` stays
-/// as written even when `item` has more levels: moving `item` first would put
-/// the slope on an extra, route the fit sparse and lose the conditional
-/// variances. And with two slope groupings one of them is an extra whichever
-/// goes first.
-///
-/// Why nothing moves with a `NestedWithin` grouping. Hoisting a child out of
-/// its parent turns a nesting that rides inside the primary's block-diagonal
-/// elimination into two crossed factors sharing one tail, which can be several
-/// times WIDER.
-///
-/// Ties under rule 1 keep the declared primary (and, among extras, the
-/// earliest), so a model already in the chosen order is handed to the kernel
-/// exactly as declared.
-fn size_rule_perm(re: &ReStructure, primary_levels: usize, extra_counts: &[usize]) -> Perm {
-    if re
-        .extra_groupings
-        .iter()
-        .any(|g| g.relation != GroupingRelation::Crossed)
-    {
-        return Perm::IDENTITY;
-    }
-    let mut slope_extras = re
-        .extra_groupings
-        .iter()
-        .enumerate()
-        .filter(|(_, g)| !g.slopes.is_empty());
-    match (
-        re.slopes.is_empty(),
-        slope_extras.next(),
-        slope_extras.next(),
-    ) {
-        // Rule 1.
-        (true, None, _) => {
-            let mut best = primary_levels;
-            let mut swapped_extra = None;
-            for (k, &levels) in extra_counts.iter().enumerate() {
-                if levels > best {
-                    best = levels;
-                    swapped_extra = Some(k);
-                }
+    // A grouping held nested is `ranef_levels[d]` padded slots wide: one row
+    // per declared level, read off its slot.
+    if let Some((d, slots)) = &perm.nested {
+        let d = *d;
+        debug_assert_eq!(
+            fit.varcorr[d].len(),
+            1,
+            "a nested grouping is intercept-only"
+        );
+        let levels = fit.ranef_levels.clone();
+        let qs: Vec<usize> = fit.varcorr.iter().map(|b| super::vech_q(b.len())).collect();
+        let gather = |v: &mut Vec<f64>, width: &dyn Fn(usize) -> usize| {
+            if v.is_empty() {
+                return;
             }
-            Perm {
-                swapped_extra,
-                nested_slots: Vec::new(),
-            }
+            let at: usize = (0..d).map(|g| levels[g] * width(g)).sum();
+            let w = width(d);
+            let rows: Vec<f64> = slots
+                .iter()
+                .flat_map(|&s| v[at + s as usize * w..at + (s as usize + 1) * w].to_vec())
+                .collect();
+            v.splice(at..at + levels[d] * w, rows);
+        };
+        gather(&mut fit.ranef, &|g| qs[g]);
+        gather(&mut fit.condvar, &|g| qs[g] * (qs[g] + 1) / 2);
+        gather(&mut fit.condvar_x, &|g| qs[g] * p);
+        fit.ranef_levels[d] = slots.len();
+        if let Some(c) = fit.condvar_cross.as_mut() {
+            c.nested_grouping = d;
+            c.nested_slots = slots.clone();
         }
-        // Rule 2; its routing condition is checked by the caller.
-        (true, Some((k, _)), None) => Perm {
-            swapped_extra: Some(k),
-            nested_slots: Vec::new(),
-        },
-        // Rule 3.
-        _ => Perm::IDENTITY,
+    }
+    // A declared nest read crossed goes back to its padded slots, pair `l`'s
+    // rows to slot `pair_slots[l]`. A slot no row reached gets what the
+    // nested reading gives it: a zero mode (NaN on a fit whose modes are), the
+    // grouping's own covariance block as its conditional variance, and no
+    // covariance with β̂.
+    if let Some((d, n_slots, pair_slots)) = &perm.pairs {
+        let (d, n_slots) = (*d, *n_slots);
+        let levels = fit.ranef_levels.clone();
+        let qs: Vec<usize> = fit.varcorr.iter().map(|b| super::vech_q(b.len())).collect();
+        let scatter = |v: &mut Vec<f64>, width: &dyn Fn(usize) -> usize, empty: &[f64]| {
+            if v.is_empty() {
+                return;
+            }
+            let at: usize = (0..d).map(|g| levels[g] * width(g)).sum();
+            let w = width(d);
+            let mut rows = empty.repeat(n_slots);
+            for (l, &s) in pair_slots.iter().enumerate() {
+                let s = s as usize;
+                rows[s * w..(s + 1) * w].copy_from_slice(&v[at + l * w..at + (l + 1) * w]);
+            }
+            v.splice(at..at + levels[d] * w, rows);
+        };
+        let empty_mode = if fit.converged() { 0.0 } else { f64::NAN };
+        scatter(&mut fit.ranef, &|g| qs[g], &vec![empty_mode; qs[d]]);
+        scatter(
+            &mut fit.condvar,
+            &|g| qs[g] * (qs[g] + 1) / 2,
+            &fit.varcorr[d],
+        );
+        scatter(&mut fit.condvar_x, &|g| qs[g] * p, &vec![0.0; qs[d] * p]);
+        fit.ranef_levels[d] = n_slots;
+        if let Some(c) = fit.condvar_cross.as_mut() {
+            c.pair_slots = pair_slots.clone();
+        }
     }
 }
 
@@ -1201,6 +1176,10 @@ pub(crate) struct SizedSpec {
     /// Per extra grouping, slot order: the level count of a crossed grouping,
     /// the children per parent (the widest parent's count) of a nested one.
     pub(crate) extra_counts: Vec<usize>,
+    /// The coupling fill of the crossed tail in slot order ([`tail_fill`]):
+    /// the share of the tail's lower triangle the primary's families touch.
+    /// `classify_design` reads it to pick the Gaussian kernel.
+    pub(crate) tail_fill: f64,
 }
 
 /// The [`SizedSpec`] of `model` on `ids` (`n_primary = max(primary)+1`; per
@@ -1208,84 +1187,285 @@ pub(crate) struct SizedSpec {
 /// distinct child count). Topology tags, family and slope columns are kept.
 /// `re: None` gives the spec as-is with no counts.
 ///
-/// It is also where [`size_rule_perm`]'s grouping reorder is applied, which is
-/// why the ids come back with the spec rather than being left to the caller:
-/// a sized spec and the ids that match it can only be obtained together, so no
-/// path can size a spec and then hand the kernel ids in a different order. The
-/// swap moves two `Vec` handles, two slope lists and two counts — nothing
-/// per-observation — but the ids must be cloned to be swapped, so the clone
-/// happens only on the models the rule actually reorders (`Cow::Borrowed`
-/// otherwise). A slope-grouping swap whose reordered spec would route
-/// `Sparse` is undone before the clone, and the spec, ids and [`Perm`] come
-/// back exactly as declared.
+/// It is also where the fit picks the reading and the order of the
+/// groupings the kernel sees, which is why the ids come back with the spec
+/// rather than being left to the caller: a sized spec and the ids that match
+/// it can only be obtained together, so no path can size a spec and then hand
+/// the kernel ids in a different order. One model gets one kernel input
+/// whatever its spelling, in three steps:
 ///
-/// A slope-grouping swap that stays then checks the grouping it displaced for
-/// nesting in the new primary, with the formula front end's two guards
-/// ([`detect_flat_nesting`]). When every one of its declared levels passes,
-/// it becomes a `NestedWithin` extra on padded ids, sized as the slope-first
-/// spelling sizes it, so the kernel gets the input it gets when the user
-/// writes the slope grouping first; [`Perm`] carries the level-to-slot map
-/// back. Otherwise it stays crossed.
+/// 1. **Nests.** A declared `NestedWithin` extra under the primary, and any
+///    two other groupings, in either order, where the child is intercept-only
+///    and its ids pass [`detect_flat_nesting`]'s two guards under the
+///    parent's, with no declared child level left without rows (a gap a
+///    matrix-door caller may leave has no slot to map back from). The
+///    declared one takes part as a crossed grouping on its observed
+///    (parent, child) pairs, the ids of its crossed spelling; it comes back
+///    as declared when its nested reading wins, and on those pair ids
+///    otherwise.
+/// 2. **Readings.** A nest keeps its nested reading only while its widest
+///    parent has at most K children: [`NEST_MAX_CHILDREN_GAUSSIAN`] on a
+///    Gaussian model, [`NEST_MAX_CHILDREN_GLMM`] otherwise. Of several such
+///    nests the kernel holds the one whose parent has the most columns
+///    (levels × (1 + slopes)), ties in declaration order; the others are read
+///    crossed. The candidate readings are each grouping as the primary with
+///    every other one crossed, plus the kept nest's nested reading (parent
+///    primary, child `NestedWithin` on padded ids). A GLMM keeps the
+///    candidates that land on the blocked or structured layout (dense, with
+///    the primary block plus the child slots within `MAX_PRIMARY_Q`), a
+///    Gaussian with `condvar` on those `classify_design` sends to the dense
+///    kernel; when none lands, all are kept. A Gaussian with `condvar` off
+///    keeps all.
+/// 3. **Order.** The nested reading wins when it survived; otherwise the
+///    candidate whose primary has the most columns. Ties keep the declared
+///    primary, then the earliest extra, so a model already in the chosen
+///    order is handed to the kernel exactly as declared.
+///
+/// Why the most columns go first. The primary is eliminated as
+/// block-diagonal families at cost linear in its level count, while every
+/// extra lands in one Schur tail whose factorization is cubic in its width.
+/// Which grouping the user happened to write first would otherwise set the
+/// tail width. MixedModels.jl sorts its `ReMat`s by decreasing level count
+/// for this reason; Bates, Alday & Kokandakar (2025), arXiv:2505.11674,
+/// measure the effect on InstEval with that sort defeated — ~4.5M vs 775K
+/// nonzeros in the Cholesky factor. Only the choice of primary matters: the
+/// tail's cost does not depend on the order of the extras inside it, so one
+/// transposition is all a reorder needs. Why the filters: a slope on an extra
+/// grouping routes the sparse solver (the packed layout on a GLMM), which on
+/// a GLMM has no gradient search and on a Gaussian forms no conditional
+/// variances. Why K: a nest rides inside the primary's families, which widen
+/// with the widest parent, and K is where the measured fits stop favouring
+/// the nested reading (see the two constants).
+///
+/// The swap moves two `Vec` handles, two slope lists and two counts — nothing
+/// per-observation — but the ids must be cloned to be moved, so the clone
+/// happens only on the models whose input changes (`Cow::Borrowed`
+/// otherwise). [`Perm`] carries the transposition, the nested grouping's
+/// level-to-slot map and a declared nest's pair-to-slot map back.
+///
+/// `condvar` is the fit's `FitOptions::condvar`, which the readings hand to
+/// `classify_design`; [`SizedSpec::tail_fill`] is filled for the order the
+/// spec comes back in.
 pub(crate) fn spec_sized_from_ids<'a>(
     model: &ModelSpec,
     ids: &'a GroupIds,
+    condvar: bool,
 ) -> (SizedSpec, Cow<'a, GroupIds>, Perm) {
-    let mut sized = sized_as_declared(model, ids);
+    let declared = sized_as_declared(model, ids);
     let Some(re) = model.re.as_ref() else {
-        return (sized, Cow::Borrowed(ids), Perm::IDENTITY);
+        return (declared, Cow::Borrowed(ids), Perm::IDENTITY);
     };
-    let perm = size_rule_perm(re, sized.n_primary, &sized.extra_counts);
-    let Some(k) = perm.swapped_extra else {
-        return (sized, Cow::Borrowed(ids), perm);
+    // A declared nest (at most one, `check_model_shape`) takes part in the
+    // steps below as a crossed grouping on its observed (parent, child) pairs,
+    // numbered in padded slot order, so a reading that drops it holds it on
+    // the same ids as the crossed spelling of the same model.
+    let declared_nest = re
+        .extra_groupings
+        .iter()
+        .position(|g| g.relation == GroupingRelation::NestedWithin);
+    let (work_model, work, pair_slots) = match declared_nest {
+        None => (Cow::Borrowed(model), Cow::Borrowed(ids), Vec::new()),
+        Some(k) => {
+            let n_slots = declared.n_primary * declared.extra_counts[k];
+            let mut seen = vec![false; n_slots];
+            for &s in &ids.extra[k] {
+                seen[s as usize] = true;
+            }
+            let mut pair_of = vec![0u32; n_slots];
+            let mut pair_slots = Vec::new();
+            for (s, _) in seen.iter().enumerate().filter(|(_, &b)| b) {
+                pair_of[s] = pair_slots.len() as u32;
+                pair_slots.push(s as u32);
+            }
+            let mut work = ids.clone();
+            for c in &mut work.extra[k] {
+                *c = pair_of[*c as usize];
+            }
+            let mut m = model.clone();
+            m.re.as_mut()
+                .expect("re is Some on this path")
+                .extra_groupings[k]
+                .relation = GroupingRelation::Crossed;
+            (Cow::Owned(m), Cow::Owned(work), pair_slots)
+        }
     };
-    // The spec half of the exchange; applying it twice undoes it.
-    let swap_spec = |sized: &mut SizedSpec| {
-        std::mem::swap(&mut sized.n_primary, &mut sized.extra_counts[k]);
-        let sized_re = sized.spec.re.as_mut().expect("re is Some on this path");
-        std::mem::swap(
-            &mut sized_re.slopes,
-            &mut sized_re.extra_groupings[k].slopes,
-        );
-        std::mem::swap(&mut sized_re.terms, &mut sized_re.extra_groupings[k].terms);
+    let declared_child = declared_nest.map(|k| k + 1);
+    let base = match declared_nest {
+        None => Cow::Borrowed(&declared),
+        Some(_) => Cow::Owned(sized_as_declared(&work_model, &work)),
     };
-    swap_spec(&mut sized);
-    // Rule 2 moved a slope grouping first: keep the swap only when the
-    // reordered spec routes the dense kernel (see `size_rule_perm`).
-    let moved_slopes = sized.spec.re.as_ref().is_some_and(|r| !r.slopes.is_empty());
-    if moved_slopes && super::classify_design(&sized, 1) == super::Solver::Sparse {
-        swap_spec(&mut sized);
-        return (sized, Cow::Borrowed(ids), Perm::IDENTITY);
+    // Grouping `i` in declaration order: 0 the primary, `g+1` the g-th extra.
+    let n_groupings = 1 + re.extra_groupings.len();
+    let ids_of = |i: usize| match i {
+        0 => &work.primary[..],
+        _ => &work.extra[i - 1][..],
+    };
+    let slopes_of = |i: usize| match i {
+        0 => re.slopes.len(),
+        _ => re.extra_groupings[i - 1].slopes.len(),
+    };
+    let levels = |i: usize| match i {
+        0 => base.n_primary,
+        _ => base.extra_counts[i - 1],
+    };
+    let columns = |i: usize| levels(i) * (1 + slopes_of(i));
+    let k_max = match model.family {
+        Family::Gaussian => NEST_MAX_CHILDREN_GAUSSIAN,
+        _ => NEST_MAX_CHILDREN_GLMM,
+    };
+
+    struct Nest {
+        parent: usize,
+        child: usize,
+        width: usize,
+        padded: Vec<u32>,
+        slots: Vec<u32>,
     }
-    let mut swapped_ids = ids.clone();
-    std::mem::swap(&mut swapped_ids.primary, &mut swapped_ids.extra[k]);
-    let mut perm = perm;
-    if moved_slopes {
-        // Labelled by declared id, so a child's position inside its parent
-        // is its declared id order.
-        let nested = detect_flat_nesting(&swapped_ids.primary, &ids.primary);
-        // A declared level with no rows (a gap a matrix-door caller may
-        // leave) has no slot to map its results back from.
-        let declared = sized.extra_counts[k];
-        if let Some((padded, labels)) =
-            nested.filter(|(_, l)| l.iter().flatten().count() == declared)
+    let mut nest: Option<Nest> = None;
+    for parent in 0..n_groupings {
+        if nest
+            .as_ref()
+            .is_some_and(|n| columns(parent) <= columns(n.parent))
         {
-            let mut slots = vec![0u32; declared];
+            continue;
+        }
+        for child in 0..n_groupings {
+            // Each observed child level sits under one parent, so more than
+            // K children per parent on average puts the widest past K.
+            if child == parent || levels(child) > k_max * levels(parent) {
+                continue;
+            }
+            // The declared nest is one whatever the guards say (its caller
+            // asked for the nested layout outright), slopes included. Kept,
+            // it comes back as declared, so it carries no padded ids or map.
+            if parent == 0 && Some(child) == declared_child {
+                let width = declared.extra_counts[child - 1];
+                if width > k_max {
+                    continue;
+                }
+                nest = Some(Nest {
+                    parent,
+                    child,
+                    width,
+                    padded: Vec::new(),
+                    slots: Vec::new(),
+                });
+                break;
+            }
+            if slopes_of(child) > 0 {
+                continue;
+            }
+            // Labelled by declared id, so a child's position inside its
+            // parent is its declared id order.
+            let Some((padded, labels)) = detect_flat_nesting(ids_of(parent), ids_of(child)) else {
+                continue;
+            };
+            let width = labels.len() / levels(parent);
+            if width > k_max || labels.iter().flatten().count() != levels(child) {
+                continue;
+            }
+            let mut slots = vec![0u32; levels(child)];
             for (slot, level) in labels.iter().enumerate() {
                 if let Some(level) = level {
                     slots[*level as usize] = slot as u32;
                 }
             }
-            let sized_re = sized.spec.re.as_mut().expect("re is Some on this path");
-            sized_re.extra_groupings[k].relation = GroupingRelation::NestedWithin;
-            swapped_ids.extra[k] = padded;
-            sized.extra_counts[k] =
-                nested_width(&swapped_ids.primary, &swapped_ids.extra[k], sized.n_primary);
-            perm.nested_slots = slots;
-            debug_assert!(check_nested_ids(sized_re, &swapped_ids).is_ok());
-            debug_assert!(super::classify_design(&sized, 1) == super::Solver::NoZ);
+            nest = Some(Nest {
+                parent,
+                child,
+                width,
+                padded,
+                slots,
+            });
+            break;
         }
     }
-    (sized, Cow::Owned(swapped_ids), perm)
+
+    // The slot the nested child sits in under the transposition 0 ↔ parent.
+    let child_slot = |n: &Nest| if n.child == 0 { n.parent } else { n.child };
+    // A reading's spec and counts, with no tail fill: `primary` exchanged
+    // with slot 0, and the kept nest's child nested when `nested`.
+    let reading = |primary: usize, nested: bool| -> SizedSpec {
+        let mut s = base.as_ref().clone();
+        s.tail_fill = 0.0;
+        let s_re = s.spec.re.as_mut().expect("re is Some on this path");
+        if primary > 0 {
+            let k = primary - 1;
+            std::mem::swap(&mut s.n_primary, &mut s.extra_counts[k]);
+            std::mem::swap(&mut s_re.slopes, &mut s_re.extra_groupings[k].slopes);
+            std::mem::swap(&mut s_re.terms, &mut s_re.extra_groupings[k].terms);
+        }
+        if let Some(n) = nest.as_ref().filter(|_| nested) {
+            let k = child_slot(n) - 1;
+            s_re.extra_groupings[k].relation = GroupingRelation::NestedWithin;
+            s.extra_counts[k] = n.width;
+        }
+        s
+    };
+    let lands = |s: &SizedSpec| match model.family {
+        Family::Gaussian => !condvar || super::classify_design(s, true) == super::Solver::NoZ,
+        _ => {
+            let s_re = s.spec.re.as_ref().expect("re is Some on this path");
+            let child_slots: usize = (s_re.extra_groupings.iter().zip(&s.extra_counts))
+                .filter(|(g, _)| g.relation == GroupingRelation::NestedWithin)
+                .map(|(_, &w)| w)
+                .sum();
+            super::classify_design(s, false) == super::Solver::NoZ
+                && 1 + s_re.slopes.len() + child_slots <= crate::consts::MAX_PRIMARY_Q
+        }
+    };
+    let mut readings: Vec<(usize, bool)> = (0..n_groupings).map(|i| (i, false)).collect();
+    if let Some(n) = &nest {
+        readings.push((n.parent, true));
+    }
+    let landing: Vec<(usize, bool)> = readings
+        .iter()
+        .copied()
+        .filter(|&(primary, nested)| lands(&reading(primary, nested)))
+        .collect();
+    let pool = if landing.is_empty() {
+        readings
+    } else {
+        landing
+    };
+    let (primary, nested) = match pool.iter().find(|r| r.1) {
+        Some(&r) => r,
+        None => pool[1..].iter().fold(pool[0], |best, &r| {
+            if columns(r.0) > columns(best.0) {
+                r
+            } else {
+                best
+            }
+        }),
+    };
+    let kept_declared =
+        nested && (nest.as_ref()).is_some_and(|n| n.parent == 0 && Some(n.child) == declared_child);
+    if kept_declared || (primary == 0 && !nested && declared_nest.is_none()) {
+        return (declared, Cow::Borrowed(ids), Perm::IDENTITY);
+    }
+
+    let mut sized = reading(primary, nested);
+    let mut out = work.into_owned();
+    if primary > 0 {
+        std::mem::swap(&mut out.primary, &mut out.extra[primary - 1]);
+    }
+    let mut perm = Perm {
+        swapped_extra: primary.checked_sub(1),
+        nested: None,
+        pairs: declared_nest.map(|k| {
+            let n_slots = declared.n_primary * declared.extra_counts[k];
+            (k + 1, n_slots, pair_slots)
+        }),
+    };
+    if let Some(n) = nest.filter(|_| nested) {
+        let slot = child_slot(&n);
+        out.extra[slot - 1] = n.padded;
+        perm.nested = Some((n.child, n.slots));
+        debug_assert!(check_nested_ids(sized.spec.re.as_ref().unwrap(), &out).is_ok());
+    }
+    let extra: Vec<&[u32]> = out.extra.iter().map(Vec::as_slice).collect();
+    sized.tail_fill = tail_fill(&sized, &out.primary, &extra);
+    (sized, Cow::Owned(out), perm)
 }
 
 /// The [`SizedSpec`] of `model` on `ids` in declaration order, with no
@@ -1298,6 +1478,7 @@ pub(crate) fn sized_as_declared(model: &ModelSpec, ids: &GroupIds) -> SizedSpec 
             spec: model.clone(),
             n_primary: 0,
             extra_counts: Vec::new(),
+            tail_fill: 0.0,
         };
     };
     let level_count = |v: &[u32]| v.iter().copied().max().map(|m| m as usize + 1).unwrap_or(1);
@@ -1321,14 +1502,76 @@ pub(crate) fn sized_as_declared(model: &ModelSpec, ids: &GroupIds) -> SizedSpec 
             }
         })
         .collect();
-    SizedSpec {
+    let mut sized = SizedSpec {
         spec: ModelSpec {
             family: model.family,
             re: Some(re.clone()),
         },
         n_primary,
         extra_counts,
+        tail_fill: 0.0,
+    };
+    let extra: Vec<&[u32]> = ids.extra.iter().map(Vec::as_slice).collect();
+    sized.tail_fill = tail_fill(&sized, &ids.primary, &extra);
+    sized
+}
+
+/// The coupling fill of `sized`'s crossed tail on the ids `primary` and
+/// `extra` (slot order, as `sized` describes them). With `P` primary levels,
+/// `e = Σ q·levels` over the `Crossed` extras, and `e_f = Σ q` over the
+/// distinct (crossed grouping, level) pairs among primary level `f`'s rows, it
+/// is `Σ_f e_f(e_f+1)/2 ÷ (P · e(e+1)/2)`: the mean share of the tail's lower
+/// triangle one family's coupling block fills. `0.0` with no crossed extra.
+pub(crate) fn tail_fill(sized: &SizedSpec, primary: &[u32], extra: &[&[u32]]) -> f64 {
+    let Some(re) = sized.spec.re.as_ref() else {
+        return 0.0;
+    };
+    // Per crossed extra: its ids, q and first tail column.
+    let mut crossed = Vec::new();
+    let mut e = 0usize;
+    for ((g, &levels), ids) in re
+        .extra_groupings
+        .iter()
+        .zip(&sized.extra_counts)
+        .zip(extra)
+    {
+        if g.relation == GroupingRelation::Crossed {
+            let q = 1 + g.slopes.len();
+            crossed.push((*ids, q, e));
+            e += q * levels;
+        }
     }
+    if e == 0 || sized.n_primary == 0 {
+        return 0.0;
+    }
+    // Rows grouped by primary level; `seen[c]` is the last family (plus one)
+    // that touched tail column `c`.
+    let mut rows: Vec<u32> = (0..primary.len() as u32).collect();
+    rows.sort_unstable_by_key(|&i| primary[i as usize]);
+    let mut seen = vec![0u32; e];
+    let mut sum = 0.0;
+    let mut start = 0;
+    while start < rows.len() {
+        let f = primary[rows[start] as usize];
+        let mut e_f = 0usize;
+        let mut end = start;
+        while end < rows.len() && primary[rows[end] as usize] == f {
+            let i = rows[end] as usize;
+            for &(ids, q, offset) in &crossed {
+                let c = offset + q * ids[i] as usize;
+                if seen[c] != f + 1 {
+                    seen[c] = f + 1;
+                    e_f += q;
+                }
+            }
+            end += 1;
+        }
+        let e_f = e_f as f64;
+        sum += e_f * (e_f + 1.0) / 2.0;
+        start = end;
+    }
+    let e = e as f64;
+    sum / (sized.n_primary as f64 * e * (e + 1.0) / 2.0)
 }
 
 /// Lower-tri Gram `G = XᵀX` (from row-major X) → `aliased_columns` mask. `p` is
@@ -1359,6 +1602,10 @@ fn scaled_gram(x: &[f64], n: usize, p: usize) -> (Mat<f64>, Vec<f64>) {
     let mut gram = Mat::<f64>::zeros(p, p);
     for i in 0..n {
         for a in 0..p {
+            // x is finite here, so a zero adds only ±0.0.
+            if x[i * p + a] == 0.0 {
+                continue;
+            }
             let xa = x[i * p + a] * inv[a];
             for b in 0..=a {
                 gram[(a, b)] += xa * (x[i * p + b] * inv[b]);
@@ -1719,14 +1966,12 @@ pub(super) fn check_group_ids(re: &ReStructure, ids: &GroupIds, n: usize) -> Res
 /// nesting). Slots `k_p..W` in a shorter parent's block are never assigned to
 /// any row (padding). Assumes each child label occurs under a SINGLE parent —
 /// the caller must have verified nesting (explicit `parent:child` syntax, or
-/// [`detect_flat_nesting`] for the flat idiom).
+/// [`detect_flat_nesting`]).
 ///
 /// Returns the ids alongside one label per slot of the padded rectangle
 /// (`n_parents · W`, slot `p·W + k`): the child label at every assigned slot and
-/// `None` at every padded one. The caller joins the parent's own label in when
-/// the formula named a parent (`(1|A/B)`); the flat idiom keeps the child label
-/// bare, because `re_group_info` names that block for the child alone and the
-/// route it takes is data-dependent.
+/// `None` at every padded one. The formula front end joins the parent's own
+/// label in (`(1|A/B)`).
 pub(crate) fn nested_padded_ids<L: Ord + Hash + Clone>(
     parent_ids: &[u32],
     labels: &[L],
@@ -1785,6 +2030,21 @@ pub(crate) fn nested_padded_ids<L: Ord + Hash + Clone>(
 /// closed to `Crossed` (measured there: nested 44 s vs crossed 0.16 s).
 pub(crate) const NESTING_INFLATION_BOUND: usize = 2;
 
+/// The most children the widest parent of a nest may have for the nest to
+/// keep its nested reading on a Gaussian model ([`spec_sized_from_ids`]): the
+/// structured limit, one primary column plus the child slots within
+/// `MAX_PRIMARY_Q`. Wider nests are read crossed. Set from instruction counts
+/// over 74 models and 28 held-out ones (native, WASM and Mac) and locked wall
+/// times on 34 (native), 2026-11-14.
+pub(crate) const NEST_MAX_CHILDREN_GAUSSIAN: usize = crate::consts::MAX_PRIMARY_Q - 1;
+
+/// [`NEST_MAX_CHILDREN_GAUSSIAN`] for every other family, from the same
+/// measurements: at 3, a nest of 400 parents with 4 children each fitted
+/// 4.3× slower under the ports' defaults, from the post-fit work on its
+/// crossed tail; at 7, `grouseticks` (7 broods in the widest location)
+/// fitted 4.25× slower nested than crossed.
+pub(crate) const NEST_MAX_CHILDREN_GLMM: usize = 5;
+
 /// Detect nesting of a flat extra grouping (the lme4 idiom
 /// `(1|parent)+(1|child)`, no explicit `parent:child` syntax) from the observed
 /// id structure, returning its [`nested_padded_ids`] layout iff routing it
@@ -1799,8 +2059,8 @@ pub(crate) const NESTING_INFLATION_BOUND: usize = 2;
 ///    `parent:child` syntax still pads unbounded — there the user asked for the
 ///    nested layout outright.
 ///
-/// The fit runs the same check on the grouping a slope grouping displaces when
-/// [`spec_sized_from_ids`] moves that slope grouping first.
+/// The fit runs it on every pair of declared-crossed groupings
+/// ([`spec_sized_from_ids`]).
 pub(crate) fn detect_flat_nesting<L: Ord + Hash + Clone>(
     primary_ids: &[u32],
     child_labels: &[L],
@@ -2108,14 +2368,12 @@ pub(crate) fn validate_design(
         ));
     }
     if let Some(k) = x.iter().position(|&v| !in_data_range(v)) {
-        return Err(FitError::Shape(ErrorMessage::at_row(
+        return Err(FitError::Shape(ErrorMessage::at_cell(
             format!("x must be finite with |x| <= {MAX_DATA_ABS:e} (row "),
             k / p,
-            &format!(
-                ", column {}, value {:e}; glmm::limits::MAX_DATA_ABS)",
-                k % p,
-                x[k]
-            ),
+            ", column ",
+            k % p,
+            &format!(", value {:e}; glmm::limits::MAX_DATA_ABS)", x[k]),
         )));
     }
     let z = re.unwrap_or(&[]);
@@ -2125,14 +2383,12 @@ pub(crate) fn validate_design(
         ));
     }
     if let Some(k) = z.iter().position(|&v| !in_data_range(v)) {
-        return Err(FitError::Shape(ErrorMessage::at_row(
+        return Err(FitError::Shape(ErrorMessage::at_cell(
             format!("re_columns must be finite with |re_columns| <= {MAX_DATA_ABS:e} (row "),
             k / s,
-            &format!(
-                ", column {}, value {:e}; glmm::limits::MAX_DATA_ABS)",
-                k % s,
-                z[k]
-            ),
+            ", column ",
+            k % s,
+            &format!(", value {:e}; glmm::limits::MAX_DATA_ABS)", z[k]),
         )));
     }
     check_model_shape(spec, nagq)?;

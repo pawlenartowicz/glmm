@@ -1155,7 +1155,7 @@ fn joint_hessian_cov_at(
             fallback!();
         }
     } else if !used_exact {
-        // Rung 3 on the blocked and structured layouts. Two entry conditions
+        // Rung 3 on the blocked and structured layouts. Three entry conditions
         // reach it, and they are the whole list:
         //
         //   (a) `ws.fd.force_fd_hessian`, which skips the exact branch
@@ -1165,15 +1165,12 @@ fn joint_hessian_cov_at(
         //       clamped mode state, a non-positive-definite observed factor
         //       or an AGQ-routed shape, and the hyper-dual pass on
         //       `m > MAX_DUAL_N`.
-        //
-        // A third — a layout with no exact engine at all — is empty as the
-        // dispatch stands. The only layout `derivative::supports_shape`
-        // refuses is the packed-row one, which has the assembled engine and,
-        // under it, its own stencil above; and `supports_shape`'s other
-        // clause, a structured crossed tail wider than `DUAL_TAIL_MAX`,
-        // cannot fire, that cap being the crossed-level limit
-        // `fit::classify_design` already routes past into the packed-row
-        // layout.
+        //   (c) a structured crossed tail wider than `DUAL_TAIL_MAX`, which
+        //       neither exact rung takes: `derivative::supports_shape`
+        //       refuses it, and `assembled::assembly_routes` reads
+        //       `supports_shape` off the packed-row layout. (The packed-row
+        //       layout itself, which `supports_shape` also refuses, has the
+        //       assembled engine and, under it, its own stencil above.)
         //
         // Every deviance eval below (f0, the f± stencil, and the fallback's central
         // re-eval) converges PIRLS at the FD-pass tol — see the doc comment.

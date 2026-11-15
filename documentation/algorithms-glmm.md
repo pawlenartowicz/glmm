@@ -44,17 +44,10 @@ The recurring symbols on this page, defined once here before first use:
 **Code:** `classify_design` (`src/fit/mod.rs`) and the `(family, Some(_))` arm
 of the dispatch match in `build_workspace` (`src/fit/core.rs`); `check_model_shape`
 (`src/fit/common.rs`); envelope caps in `src/consts.rs` (`MAX_PRIMARY_Q`,
-`MAX_EXTRA_GROUPINGS`, `MAX_EXTRA_Q`, `MAX_CROSSED_LEVELS`).
+`MAX_EXTRA_GROUPINGS`, `MAX_EXTRA_Q`); the dense-tail bound `DENSE_TAIL_MAX_BYTES` (`src/fit/mod.rs`).
 
-`classify_design` returns `Solver::NoZ` (the dense clustered kernel) or
-`Solver::Sparse`. A design routes **Sparse** when it is over the dense envelope
-(`q_p > 8`, more than 6 extra groupings, or any extra grouping with
-`1 + slopes.len() > 4`), when *any* extra grouping carries a random slope, or
-when the total crossed level count exceeds `MAX_CROSSED_LEVELS`; otherwise it
-stays **NoZ**. (For a slope-carrying extra `Solver::Sparse` is not a speed
-choice: only the packed-row `A`-layout applies a full `q_g×q_g` Λ block per
-extra level.)
-Before this check a lone slope grouping may be moved first ([dispatch map](algorithms.md#full-dispatch-map)).
+`classify_design` returns `Solver::NoZ` (the dense clustered kernel) or `Solver::Sparse`. A design routes **Sparse** when it is over the dense envelope (`q_p > 8`, more than 6 extra groupings, or any extra grouping with `1 + slopes.len() > 4`), when *any* extra grouping carries a random slope, or when the structured layout's `e × e` crossed-tail buffers (`schur_blk`, the exact β-profile's `tail_inv`, the conditional variances' `sinv` and its packed lower triangle, counted as four) would pass `DENSE_TAIL_MAX_BYTES` (1 GiB, 256 MiB on wasm32: more than 5,792 crossed levels, 2,896 on wasm32); otherwise it stays **NoZ**. A GLMM has no crossed-level cap below that bound, and `condvar` does not change its layout. (For a slope-carrying extra `Solver::Sparse` is not a speed choice: only the packed-row `A`-layout applies a full `q_g×q_g` Λ block per extra level.)
+Before this check the fit picks the reading and order of the groupings from the ids: a nest keeps its nested reading up to 5 children per parent, only the readings that land on the blocked or structured layout are kept when any does, and the grouping with the most columns goes first ([dispatch map](algorithms.md#full-dispatch-map)).
 On the non-Gaussian side `classify_design`'s answer selects the
 `A`-layout, not a separate driver — every family reaches the same entry point:
 
@@ -137,7 +130,7 @@ structure:
   `S = (E + I) − Σ_f C_fᵀA_f⁻¹C_f` (`schur_blk`). The determinant splits by
   the Schur identity, `log|A| = Σ_f log|A_f| + log|S|`.
 - **Packed** (everything else — a slope-carrying extra, over the envelope
-  caps, too many crossed levels, or an extras core too wide for the
+  caps, a crossed tail past the dense-tail byte bound, or an extras core too wide for the
   structured route): `M = ZΛ` in fixed-width rows and a `k×k` `A`, factored
   whole — densely, or through a sparse Cholesky on `A`'s fixed pattern (the
   union of each row's `width` RE columns plus the diagonal, AMD-ordered, one
@@ -532,7 +525,7 @@ binary-link warm starts, most failures are a θ₀ where every PIRLS evaluation
 fails, which no border-step change can recover — the guard sidesteps it by not
 starting there when the cold point is better, and the fallback recovers what
 the guard cannot by trying a route whose warm start matters less.
-**Cold fallback.** A fit with a β start that ends (after `capped_restart`) not converged, at a non-finite deviance, or `precision_limited` is searched again from the cold start: the GLM β from `glm_warm_start_beta`, the blind θ, and no carried Gamma φ. The cold search goes through `capped_restart` as a cold fit does. It is kept when its deviance is finite, it converged or the warm fit did not, and it is lower (or the warm deviance is not finite); otherwise the warm result is put back (`SearchState`). `n_eval` counts both. It is skipped on the Gamma inverse link, which has `gamma_inverse_retry`, and when the cold GLM is separated; on a negative-binomial GLMM the shape seed stays the one passed in. Why: the guard compares θ at the caller's β₀, so it cannot catch a far β₀. Measured: a Poisson random-slope fit from β₀ = (−28.5, 0.45) and a Gamma fit on a response on the 1e-12 scale, both of which failed with NaN β, converge at the cold fit; a binomial fit from β₀ = 1e10 to 1e300, which ended at its start (from 1e14, reported converged at a deviance of about 5.8·β₀), ends at the cold deviance; good warm starts are unchanged (12 to 13 evaluations); the fallback does not fire on grid `--fast`, whose fits are cold.
+**Cold fallback.** A fit with a β start that ends (after `capped_restart`, or `gamma_inverse_retry` on the Gamma inverse link) not converged, at a non-finite deviance, or `precision_limited` is searched again from the cold start: the GLM β from `glm_warm_start_beta`, the blind θ, and no carried Gamma φ. The cold search goes through `capped_restart` as a cold fit does (on the Gamma inverse link, `gamma_inverse_units` and `gamma_inverse_retry`). It is kept when its deviance is finite, it converged or the warm fit did not, and it is lower (or the warm deviance is not finite); otherwise the warm result is put back (`SearchState`). `n_eval` counts both. It is skipped when the cold GLM is separated; on a negative-binomial GLMM the shape seed stays the one passed in. Why: the guard compares θ at the caller's β₀, so it cannot catch a far β₀. Measured: a Poisson random-slope fit from β₀ = (−28.5, 0.45) a Gamma fit on a response on the 1e-12 scale, and a Gamma inverse-link fit from 1e10 times its cold β, all of which failed with NaN β, converge at the cold fit; a binomial fit from β₀ = 1e10 to 1e300, which ended at its start (from 1e14, reported converged at a deviance of about 5.8·β₀), ends at the cold deviance; good warm starts are unchanged (12 to 13 evaluations); the fallback does not fire on grid `--fast`, whose fits are cold.
 **Validation:** `far_warm_start_recovers_via_the_cold_guard`,
 `warm_start_the_guard_rejects_is_the_cold_fit`,
 `exact_profile_fallback_reruns_on_pql_then_joint`,
@@ -1023,7 +1016,7 @@ No layout materializes a dense `Z`. `GlmmLayout::for_design` reads
 | layout | `A` | kernel | dual kernel | exact profile | route |
 |---|---|---|---|---|---|
 | blocked | block-diagonal, `q ≤ MAX_PRIMARY_Q` | `pirls_solve_blocked<T>` | yes | yes | no extras |
-| structured | `[[A_cc, C], [C', S]]` | `pirls_solve_blocked_extras<T: TailKernel>` | yes | yes | extras, `q_core ≤ MAX_PRIMARY_Q`, crossed levels ≤ 500 |
+| structured | `[[A_cc, C], [C', S]]` | `pirls_solve_blocked_extras<T: TailKernel>` | yes | yes | extras, `q_core ≤ MAX_PRIMARY_Q`, crossed tail within `DENSE_TAIL_MAX_BYTES` (≤ 5,792 levels; 2,896 on wasm32) |
 | packed | one `k×k`, dense (`a`/`a_chol`) or sparse-factored (`PackedSparse`), never both | `pirls_solve_packed` (`f64`) | no | no | everything `classify_design` sends to `Solver::Sparse`, plus an extras design whose core is too wide for the structured route |
 
 The outer search, the NB coordinate search, the SE dispatch and the
@@ -1051,7 +1044,7 @@ references in `sim_sparse_gamma_tmb` / `sim_sparse_nb_tmb`).
 ## Negative-Binomial outer θ-loop
 
 **Code:** `run_glmm_nb_on` (`src/fit/glmm.rs`); the marginal-θ objective term
-`nb_profile_loglik` in `src/fit/glm.rs`, and the caps `NB_THETA_LO = 1e-3`,
+`nb_profile_loglik` in `src/fit/glm.rs`, and the caps `NB_THETA_LO = 1e-6`,
 `NB_THETA_HI = 1e4` in `src/consts.rs`.
 
 The NB shape parameter θ is not carried in the spec — the spec is θ-free. The
@@ -1065,15 +1058,15 @@ BOBYQA — `[θ_RE | ln θ_NB]` on the θ-only stage, `[θ_RE | β | ln θ_NB]` 
 joint one — minimizing `deviance − 2·nb_profile_loglik(y, y, θ_NB, w)`, which is
 `logL_marginal` times −2 and so has the same optimum. β, θ_RE and θ_NB come out
 of one fit: there is no bracketing search and no re-fit at θ̂, the incumbent IS
-the answer. The same `[ln 1e-3, ln 1e4]` bounds serve as the coordinate's box.
+the answer. The same `[ln 1e-6, ln 1e4]` bounds serve as the coordinate's box.
 A carried shape (`StartValues::dispersion`) starts the coordinate directly and
 the prefit is skipped. Otherwise it cold-starts from the no-RE GLM-NB's own θ̂
 (one extra fixed-effects-only `fit_glm_nb`); the method-of-moments seed charges the RE variance to the
 dispersion and lands one to two orders of magnitude low, where PIRLS does not
-converge on random-slope shapes. When that prefit fails, or lands within a
-factor of 10 of the box floor, the coordinate starts from θ = 1 instead
-(`fit::glmm::nb_glmm_seed`): measured on grid cell `nb_q2sx2_g3000p5_bal_base`, a
-floor-side start converged 3808 logLik below glmmTMB.
+converge on random-slope shapes. When that prefit fails, or lands below
+θ = 0.01 (`NB_SEED_FLOOR`), the coordinate starts from θ = 1 instead
+(`fit::glmm::nb_glmm_seed`): measured on grid cell `nb_q8_g3000p20_bal_base`, a
+0.009 start took 38143 evaluations against 1145 from θ = 1.
 
 The reported `Fit::deviance` on an NB GLMM is the search's own objective,
 `deviance + (−2·saturated_loglik(θ̂))` at the fitted θ̂ — equal to `−2·logLik`
@@ -1809,8 +1802,9 @@ Two genuinely different Wald covariances are offered, selected by `WaldSe`:
   AGQ), and it is the
   per-cell fallback for what rung 1 declines on a layout that has a dual twin
   of its PIRLS kernel (`derivative::supports_shape`: blocked and structured,
-  never packed; its `k_crossed ≤ DUAL_TAIL_MAX` clause is unreachable while
-  `DUAL_TAIL_MAX` equals `MAX_CROSSED_LEVELS`). It refuses
+  never packed; its `k_crossed ≤ DUAL_TAIL_MAX` (500) clause refuses a
+  structured layout with a wider crossed tail, which searches with BOBYQA and
+  takes the FD Hessian). It refuses
   `m > MAX_DUAL_N` (12), because a second-order pass cannot be chunked: a
   cross-chunk second-derivative block needs both coordinates' first-order lanes
   live in the same pass. The dual PIRLS steps with the exact `½h_uu` — the

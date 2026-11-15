@@ -76,13 +76,15 @@ mod scalar;
 /// The kernels' capacity constants and the input ranges. A limit may grow in
 /// a minor release; a name does not disappear.
 ///
-/// - `MAX_PRIMARY_Q`, `MAX_EXTRA_GROUPINGS`, `MAX_EXTRA_Q` and
-///   `MAX_CROSSED_LEVELS` bound the dense (no-Z) solver: the primary
-///   grouping's random-effect width, the number of extra groupings, the width
-///   of each extra grouping, and the total level count over crossed extra
-///   groupings. A design past any of them is not refused: it routes to the
-///   sparse solver and still fits. `MAX_THETA` is the θ length those four
-///   bounds imply on the dense path.
+/// - `MAX_PRIMARY_Q`, `MAX_EXTRA_GROUPINGS` and `MAX_EXTRA_Q` bound the dense
+///   (no-Z) solver: the primary grouping's random-effect width, the number of
+///   extra groupings, and the width of each extra grouping. A design past any
+///   of them is not refused: it routes to the sparse solver and still fits.
+///   `MAX_THETA` is the θ length those three bounds imply on the dense path.
+/// - `MAX_CROSSED_LEVELS` bounds the total level count over crossed extra
+///   groupings on the dense solver of a Gaussian model fitted with
+///   `FitOptions::condvar` on; past it the model routes to the sparse solver,
+///   which forms no conditional variances.
 /// - `MAX_NAGQ` is a hard limit: the largest adaptive Gauss–Hermite order a
 ///   fit accepts. A larger `FitOptions::nagq` is refused with
 ///   [`FitError::Envelope`].

@@ -829,13 +829,15 @@ fn gradient_axis(
 
 /// The kernel's statistics that hold the response, as they were before
 /// [`shift_response_into`]: the `y` row of the `[X̃ y]` Gram (and its `y`
-/// column, which the sparse kernel stores too), and the `y` entry of each
-/// random-effect column's `Z'[X̃ y]`.
+/// column, which the sparse kernel stores too), the `y` entry of each
+/// random-effect column's `Z'[X̃ y]`, and the `y` column of the QR kernel's
+/// triangles while it is on.
 #[derive(Default)]
 struct SavedResponse {
     xy: Vec<f64>,
     yx: Vec<f64>,
     zy: Vec<f64>,
+    qr_y: Vec<f64>,
 }
 
 /// [`shift_response_into`] on fresh buffers.
@@ -873,6 +875,7 @@ fn shift_response_into(
     xy.clear();
     yx.clear();
     zy.clear();
+    saved.qr_y.clear();
     match kernel {
         LmmKernel::Dense { suff, fit } => {
             debug_assert_eq!(p, suff.m - 1, "b has the kernel's p entries");
@@ -887,6 +890,9 @@ fn shift_response_into(
             for a in 0..suff.s.ncols() {
                 let shift: f64 = (0..p).map(|j| b[j] * suff.s[(j, a)]).sum();
                 suff.s[(p, a)] -= shift;
+            }
+            if let Some(qr) = fit.qr.as_deref_mut().filter(|q| q.on) {
+                qr.shift_response(b, &mut saved.qr_y);
             }
             precompute_balanced_collapse(suff, fit);
             precompute_group_regressions(suff, fit);
@@ -935,6 +941,9 @@ fn restore_response(kernel: &mut LmmKernel, saved: &SavedResponse) {
             }
             for (a, &v) in saved.zy.iter().enumerate() {
                 suff.s[(p, a)] = v;
+            }
+            if let Some(qr) = fit.qr.as_deref_mut().filter(|q| q.on) {
+                qr.restore_response(&saved.qr_y);
             }
             precompute_balanced_collapse(suff, fit);
             precompute_group_regressions(suff, fit);

@@ -20,21 +20,22 @@
 //!   (`GlmmLayout::Packed`), the one kernel with no dual twin.
 //!   `GlmmLayout::for_design` sends two families of design there: every design
 //!   `classify_design` answers `Solver::Sparse` for (past the dense envelope,
-//!   slopes on an extra grouping, more than `MAX_CROSSED_LEVELS` crossed
-//!   levels), and an in-envelope extras design whose core block is too wide for
-//!   the structured route (`!structured_extras_eligible()`). `supports_shape`
-//!   also refuses a STRUCTURED design whose crossed tail is wider than
-//!   [`DUAL_TAIL_MAX`], but that clause never fires: `DUAL_TAIL_MAX` is pinned
-//!   at `MAX_CROSSED_LEVELS`, so such a design is `Packed` already and is
-//!   refused on the layout first. Every blocked and every structured shape IS
-//!   differentiated here — the structured ones through
-//!   `structured_laplace_deviance` over the same `pirls_solve_blocked_extras`
-//!   the `f64` fit path runs. Checked first in both entry points' routing gate,
-//!   before `m` is even computed. Caller fallback: on the SE path
-//!   `se::joint_hessian_cov` asks `assembled::joint_hessian` first, and that
-//!   engine DOES take the packed-row layout, so the stencil
+//!   slopes on an extra grouping, a crossed tail past the dense-tail byte
+//!   bound), and an in-envelope extras design whose core block is too wide for
+//!   the structured route (`!structured_extras_eligible()`). Caller fallback:
+//!   on the SE path `se::joint_hessian_cov` asks `assembled::joint_hessian`
+//!   first, and that engine DOES take the packed-row layout, so the stencil
 //!   (`se::packed_fd_hessian_cov`) is reached only where the assembled pass
 //!   declines as well; the optimizer runs BOBYQA on the objective.
+//!   `supports_shape` also refuses a STRUCTURED design whose crossed tail is
+//!   wider than [`DUAL_TAIL_MAX`]: such a design (a GLMM with more than 500
+//!   crossed levels whose dense tail fits) searches with BOBYQA, and since the
+//!   assembled engine reads `supports_shape` off the packed-row layout, its SE
+//!   takes the FD Hessian of the blocked and structured layouts. Every other
+//!   blocked and structured shape IS differentiated here — the structured ones
+//!   through `structured_laplace_deviance` over the same
+//!   `pirls_solve_blocked_extras` the `f64` fit path runs. Checked first in
+//!   both entry points' routing gate, before `m` is even computed.
 //! - **(b) `m = n_theta + p > MAX_DUAL_N` (12)** — for the **Hessian only**
 //!   (`NLanes::pick`). The gradient is not refused there: it runs in
 //!   `⌈m / 12⌉` passes of at most 12 seeded coordinates on the top rung, each
@@ -483,14 +484,15 @@ pub(crate) const MAX_DUAL_REFINEMENTS: usize = 12;
 /// crossover in `(0, 500]` — dual Hessian 17–27× one objective (rising to a
 /// plateau near 25× from `e = 192`), gradient 3–6×, against the
 /// `2m² = 32` FD equivalent; VerbAgg/grouseticks 161×/97× vs 162×/98×. It
-/// therefore sits at the crossed-level cap — `classify_design` already
-/// routes anything wider to Sparse, so no structured shape is refused for
-/// its tail.
+/// therefore sits at the end of the measured range. `classify_design` keeps a
+/// GLMM on the structured layout past it while the dense tail fits, so the
+/// `Structured` clause of [`supports_shape`] fires: such a design searches
+/// with BOBYQA and takes the FD Hessian.
 ///
 /// NOT the same boundary as `sparse::TAIL_SPARSE_MIN` — that one chooses
 /// between two f64 factorizations of the LMM tail and has its own
 /// measurement.
-pub(crate) const DUAL_TAIL_MAX: usize = crate::consts::MAX_CROSSED_LEVELS;
+pub(crate) const DUAL_TAIL_MAX: usize = 500;
 
 /// Shapes the dual kernel can differentiate: the blocked layout, or the
 /// structured layout with a crossed tail the dense generic factor can carry.
@@ -2993,21 +2995,18 @@ mod tests {
         assert!(ws.dual_scratch.is_none());
     }
 
-    /// A crossed tail one level past `DUAL_TAIL_MAX` is `Unsupported` — and it
-    /// gets there through the LAYOUT, not through `supports_shape`'s
-    /// `Structured` tail clause. `DUAL_TAIL_MAX` is pinned at
-    /// `MAX_CROSSED_LEVELS`, the routing cap, so a tail past it is `Packed`
-    /// before the tail is ever looked at. That coupling is what this pins: if
-    /// `DUAL_TAIL_MAX` is ever raised above the routing cap, the layout assert
-    /// fails and the tail clause becomes reachable for the first time. Built
-    /// RELATIVE to the constant, so re-pinning it moves this fixture with it
-    /// rather than turning the test into a silent pass.
+    /// A crossed tail one level past `DUAL_TAIL_MAX` is `Unsupported`, and the
+    /// clause that refuses it is `supports_shape`'s `Structured` tail clause:
+    /// the design stays on the structured layout (its dense tail fits), so
+    /// the layout alone does not refuse it. Built RELATIVE to the constant, so
+    /// re-pinning it moves this fixture with it rather than turning the test
+    /// into a silent pass.
     #[test]
     fn laplace_gradient_tail_past_boundary_is_unsupported() {
         let (mut ws, x, y, ids, extra_ids, p, n) = extras_routing_fixture(0, DUAL_TAIL_MAX + 1);
         assert_eq!(ws.groupings.k_crossed(), DUAL_TAIL_MAX + 1);
         assert!(ws.groupings.structured_extras_eligible());
-        assert_eq!(ws.layout, GlmmLayout::Packed);
+        assert_eq!(ws.layout, GlmmLayout::Structured);
         assert!(!supports_shape(ws.layout, &ws.groupings));
         let mut grad = vec![0.0f64; ws.n_theta + p];
         let status = laplace_gradient(&mut ws, x.as_ref(), &y, &ids, &extra_ids, p, n, &mut grad);
@@ -3028,6 +3027,7 @@ mod tests {
             spec: crate::test_support::intercept_only_spec(),
             n_primary: 3,
             extra_counts: vec![],
+            tail_fill: 0.0,
         };
         model.spec.family = crate::Family::Binomial {
             link: crate::BinomialLink::Logit,

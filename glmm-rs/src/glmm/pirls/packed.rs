@@ -778,6 +778,7 @@ mod tests {
             },
             n_primary: 4,
             extra_counts: vec![3],
+            tail_fill: 0.0,
         };
         let g = LmmGroupings::from_cluster_spec_ext(&spec, &[1], &[vec![2]]);
         let mut packed = PackedScratch::for_shape(&g, n, g.k_total);
@@ -837,6 +838,7 @@ mod tests {
             },
             n_primary: s,
             extra_counts: vec![],
+            tail_fill: 0.0,
         };
         let g = LmmGroupings::from_cluster_spec_ext(&spec, &[], &[]);
         let k = g.k_total;

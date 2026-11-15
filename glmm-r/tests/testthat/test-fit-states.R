@@ -287,6 +287,9 @@ fs_calls <- list(
   `print(VarCorr())` = list(estimate = FALSE, run = function(ctx) {
     capture.output(print(VarCorr(ctx$fit)))
   }),
+  `as.data.frame(VarCorr())` = list(estimate = TRUE, run = function(ctx) {
+    fs_columns(as.data.frame(VarCorr(ctx$fit)), c("vcov", "sdcor"))
+  }),
   # Only this fit's own numbers and the test: the reduced fit is another fit,
   # which can have estimates where this one has none.
   `anova(fit0, fit)` = list(estimate = TRUE, run = function(ctx) {

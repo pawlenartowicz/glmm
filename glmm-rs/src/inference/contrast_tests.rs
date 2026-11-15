@@ -3,7 +3,7 @@
 
 use super::{ContrastError, ContrastNote, NoDfReason};
 use crate::fit::common_tests::lcg;
-use crate::fit::fit_cold_keep_workspace;
+use crate::fit::fit_keep_workspace;
 use crate::inference::tails::t_two_sided_p;
 use crate::test_support::fit_cold;
 use crate::test_support::intercept_only_spec;
@@ -216,8 +216,12 @@ fn into_fit_without_pass_is_state_missing() {
             reml,
             ..all_targets(p)
         };
-        let (fit, _) =
-            fit_cold_keep_workspace(&Data::new(&x, &y, n, p).ids(&ids), &lmm_model(), &opts);
+        let (fit, _) = fit_keep_workspace(
+            &Data::new(&x, &y, n, p).ids(&ids),
+            &lmm_model(),
+            None,
+            &opts,
+        );
         assert_eq!(fit.reml, reml.is_none(), "reml {reml:?}");
         assert!(
             fit.satterthwaite.as_ref().is_some_and(|st| st.is_not_run()),

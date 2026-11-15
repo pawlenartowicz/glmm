@@ -352,6 +352,21 @@ def test_dotted_column_names_fit():
     assert "age.years" in m.names
 
 
+@pytest.mark.parametrize("name", ["e\u0301", "x\U0001f600"])
+def test_mark_and_emoji_column_names_fit(name):
+    y = 1.0 + 2.0 * _X + np.sin(_GROUPS) + _rng.normal(scale=0.5, size=_N)
+    data = {
+        name: _X.tolist(),
+        "g": [f"g{i}" for i in _GROUPS.tolist()],
+        "y": y.tolist(),
+    }
+    m = glmm.fit(data, f"y ~ {name} + (1 | g)")
+    assert name in m.names
+    if name == "e\u0301":
+        # The name comes back as given, not NFC-normalized.
+        assert "\u00e9" not in m.names
+
+
 def test_a_weight_power_reaches_every_reader_of_the_weights():
     # weight_power=0.5 reads the weights raised to 0.5 wherever the claimed
     # fit on w**0.5 reads its own. The weights are squares, so w**0.5 is

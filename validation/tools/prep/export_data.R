@@ -465,8 +465,9 @@ write.csv(d_ncm, file.path(suite_dir, "data", "simulated", "sim_nested_crossed_m
 cat(sprintf("wrote %-12s  %3d rows x %d cols\n", "sim_nested_crossed_mix", nrow(d_ncm), ncol(d_ncm)))
 
 # --- NB theta-bracket-edge GLM datasets --------------------
-# Two sim_nb siblings whose glm.nb theta-hat sits near an end of glmm's theta
-# search bracket [1e-3, 1e4] (consts.rs NB_THETA_LO/HI). Parameters were chosen by
+# Two sim_nb siblings with extreme glm.nb theta-hat: a heavily overdispersed one
+# and a near-Poisson one near glmm's upper search limit NB_THETA_HI = 1e4
+# (consts.rs). Parameters were chosen by
 # a pre-freeze glm.nb sweep: at these (theta, n, b0) MASS::glm.nb converges with
 # ZERO warnings (no theta.ml iteration/alternation limit), so the reference is
 # trustworthy -- more extreme settings put theta.ml itself at its limits.

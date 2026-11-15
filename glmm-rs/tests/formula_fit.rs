@@ -369,10 +369,12 @@ fn pastes_nested_matches_hand_built_spec() {
     );
 }
 
-/// Same Pastes fit as `pastes_nested_matches_hand_built_spec`, but via the FLAT
-/// lme4 idiom `(1|batch)+(1|sample)`: `sample` is the globally-unique
-/// `batch:cask` column, so it genuinely nests in `batch` and must be classified
-/// `NestedWithin` — not `Crossed` — yet produce the identical fit.
+/// Same Pastes fit as `pastes_nested_matches_hand_built_spec`, but via the flat
+/// lme4 idiom `(1|batch) + (1|sample)`, where `sample` is the globally unique
+/// `batch:cask` column. The front end lowers it `Crossed` with the bare sample
+/// labels; the fit finds the nest in the ids and hands the kernel the same input
+/// as the explicit `(1|batch/cask)`, so every conditional mode agrees bit for
+/// bit with its batch-and-cask twin.
 ///
 /// The equality is against the explicit `(1|batch/cask)` lowering rather than
 /// against an oracle: "the two idioms name the same model" is a claim about this
@@ -380,7 +382,7 @@ fn pastes_nested_matches_hand_built_spec() {
 /// is looking for. lme4 agreement for the underlying fit is the `pastes_lmm`
 /// cell in `tests/validation_oracle.rs`.
 #[test]
-fn pastes_flat_nested_equals_the_explicit_nesting() {
+fn flat_nested_spelling_keeps_plain_labels() {
     let data = rows(include_str!("../../validation/data/empirical/Pastes.csv"));
     let flat = Table {
         columns: vec![
@@ -398,31 +400,59 @@ fn pastes_flat_nested_equals_the_explicit_nesting() {
         ],
         n: data.len(),
     };
-
-    let lo_flat = lower("strength ~ (1|batch) + (1|sample)", &flat, Family::Gaussian).unwrap();
+    let opts = FitOptions::default();
+    let m_flat = glmm::formula::fit(
+        "strength ~ 1 + (1 | batch) + (1 | sample)",
+        &flat,
+        Family::Gaussian,
+        &opts,
+    )
+    .unwrap();
+    let m_exp = glmm::formula::fit(
+        "strength ~ (1 | batch/cask)",
+        &explicit,
+        Family::Gaussian,
+        &opts,
+    )
+    .unwrap();
+    let lo_flat = m_flat.lowered();
     let extra = &lo_flat.model.re.as_ref().unwrap().extra_groupings[0];
+    assert_eq!(extra.relation, GroupingRelation::Crossed);
     assert!(
-        matches!(extra.relation, GroupingRelation::NestedWithin),
-        "flat (1|batch)+(1|sample) should be detected nested, got {:?}",
-        extra.relation
-    );
-
-    let lo_exp = lower("strength ~ (1|batch/cask)", &explicit, Family::Gaussian).unwrap();
-    let f_flat = glmm::fit(&lo_flat.data(), lo_flat.spec(), &FitOptions::default()).unwrap();
-    let f_exp = glmm::fit(&lo_exp.data(), lo_exp.spec(), &FitOptions::default()).unwrap();
-    assert!(
-        f_flat.converged() && f_exp.converged(),
+        m_flat.fit().converged() && m_exp.fit().converged(),
         "pastes did not converge"
     );
-    assert_same_fit(&f_flat, &f_exp, "pastes flat vs explicit");
+    assert_same_fit(m_flat.fit(), m_exp.fit(), "pastes flat vs explicit");
 
     // The two idioms disagree on what to CALL the inner grouping — the flat form
     // takes the user's column name, the explicit form composes outer:inner — so
     // the names are checked separately from the fit rather than folded into it.
     assert_eq!(lo_flat.re_groups[0].name, "batch");
     assert_eq!(lo_flat.re_groups[1].name, "sample");
-    assert_eq!(lo_exp.re_groups[0].name, "batch");
-    assert_eq!(lo_exp.re_groups[1].name, "batch:cask");
+    assert_eq!(m_exp.lowered().re_groups[1].name, "batch:cask");
+
+    let flat_blocks = m_flat.ranef().unwrap();
+    let exp_blocks = m_exp.ranef().unwrap();
+    let mut declared: Vec<String> = data.iter().map(|r| r[3].clone()).collect();
+    declared.sort();
+    declared.dedup();
+    assert_eq!(
+        flat_blocks[1].levels, declared,
+        "bare sample labels, declared order"
+    );
+    for (g, (f, e)) in flat_blocks.iter().zip(&exp_blocks).enumerate() {
+        // Pastes' sample labels are spelled `batch:cask`, the explicit form's
+        // joined label, so the two blocks pair up by label.
+        for (level, value) in f.levels.iter().zip(&f.values) {
+            let k = e.levels.iter().position(|l| l == level).unwrap();
+            assert_eq!(
+                value.to_bits(),
+                e.values[k].to_bits(),
+                "grouping {g}, level {level}"
+            );
+        }
+        assert_eq!(f.levels.len(), e.levels.len(), "grouping {g}");
+    }
 }
 
 // ── GLMM ─────────────────────────────────────────────────────────────────────
@@ -949,7 +979,7 @@ fn intercept_written_first_becomes_primary_over_slope() {
     // `(1+x|h)` makes `g` primary even though the parser's slope stage runs
     // before its intercept stage. Lowering keeps the written order, so the
     // slope block sits on the EXTRA grouping here; the fit then moves the slope
-    // grouping first (the size rule in `fit/common.rs`).
+    // grouping first (the grouping order step of `spec_sized_from_ids`).
     let table = Table {
         columns: vec![
             ("y".into(), Column::Numeric(vec![1.0, 2.0, 3.0, 4.0])),

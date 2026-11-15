@@ -5,11 +5,11 @@
 //! infeasible.
 
 use super::profile::ProfileKernel;
-use crate::fit::{fit_cold_keep_workspace, varcorr_block};
+use crate::fit::{fit_keep_workspace, varcorr_block};
 use crate::inference::ProfileParam;
 use crate::lmm::LmmWorkspace;
 use crate::standardize::{ColumnScaling, Units};
-use crate::{Data, Family, Fit, FitOptions, GroupIds, ModelSpec, ReStructure};
+use crate::{Data, Family, Fit, FitOptions, GroupIds, Grouping, ModelSpec, ReStructure};
 
 /// The header and the rows of a quoted CSV, every field unquoted.
 pub(crate) fn table(csv: &str) -> (Vec<String>, Vec<Vec<String>>) {
@@ -103,7 +103,7 @@ impl Case {
         &self,
         f: impl FnOnce(&Fit, &mut LmmWorkspace, &ColumnScaling, &Units) -> R,
     ) -> R {
-        let (fit, mut fws) = fit_cold_keep_workspace(&self.data(), &self.model, &ml_opts());
+        let (fit, mut fws) = fit_keep_workspace(&self.data(), &self.model, None, &ml_opts());
         assert!(fit.converged(), "the ML fit converges");
         let (ws, map, units) = fws.lmm_parts().expect("a Gaussian mixed fit");
         f(&fit, ws, map, units)
@@ -111,7 +111,7 @@ impl Case {
 }
 
 /// The kernel over a case's workspace, slots in declaration order, since no
-/// case here is reordered by the size rule.
+/// case here is reordered by the grouping order step.
 pub(crate) fn kernel<'a>(
     ws: &'a mut LmmWorkspace,
     map: &'a ColumnScaling,
@@ -192,7 +192,7 @@ fn lme4_scale_round_trips_through_the_kernel_theta() {
                 assert!(((g - w) / w).abs() <= 1e-13, "{g} {w}");
             }
             let mut th = vec![0.0; v.len() - 1];
-            assert!(k.theta_of(&v, &mut th));
+            assert!(k.theta_of(Some(0), &v, &mut th));
             assert!(
                 th.iter()
                     .zip(k.theta_hat())
@@ -201,12 +201,54 @@ fn lme4_scale_round_trips_through_the_kernel_theta() {
                 k.theta_hat()
             );
             let base = k.kernel_deviance_at_hat();
-            let got = k.var_deviance(&v);
+            let got = k.var_deviance(Some(0), &v);
             assert!((got - base).abs() <= 1e-9 * base.abs(), "{got} {base}");
+            // Each row's start, other blocks copied as θ̂ rather than mapped.
+            for i in 0..v.len() {
+                let own = (i + 1 < v.len()).then_some(0);
+                let got = k.var_deviance(own, &k.start(i));
+                assert!(
+                    (got - base).abs() <= 1e-9 * base.abs(),
+                    "row {i}: {got} {base}"
+                );
+            }
         });
         ran += 1;
     }
-    assert_eq!(ran, 2);
+    // Penicillin, `diameter ~ 1 + (1 | plate) + (1 | sample)`: two blocks, so
+    // each SD row copies the other block's θ̂ and σ's row copies both.
+    let t = table(include_str!(
+        "../../../validation/data/empirical/Penicillin.csv"
+    ));
+    let y = num(&t, "diameter");
+    let case = Case {
+        x: vec![1.0; y.len()],
+        y,
+        p: 1,
+        ids: GroupIds {
+            primary: levels(&t, "plate"),
+            extra: vec![levels(&t, "sample")],
+        },
+        w: None,
+        model: ModelSpec::mixed(
+            Family::Gaussian,
+            ReStructure::intercept().extra(Grouping::crossed()),
+        ),
+    };
+    case.with_ml(|_, ws, map, units| {
+        let mut k = kernel(ws, map, units);
+        let base = k.kernel_deviance_at_hat();
+        assert_eq!(k.estimate().len(), 3);
+        for (i, own) in [Some(0), Some(1), None].into_iter().enumerate() {
+            let got = k.var_deviance(own, &k.start(i));
+            assert!(
+                (got - base).abs() <= 1e-9 * base.abs(),
+                "row {i}: {got} {base}"
+            );
+        }
+    });
+    ran += 1;
+    assert_eq!(ran, 3);
 }
 
 #[test]
@@ -272,7 +314,7 @@ fn an_sd_at_zero_on_a_centered_slope_block() {
         let mut v = k.estimate();
         v[2] = 0.0; // sd_Days|Subject
         let mut th = vec![0.0; 3];
-        assert!(k.theta_of(&v, &mut th));
+        assert!(k.theta_of(Some(0), &v, &mut th));
         let sigma_int_sq = v[3] * v[3] / s;
         let vc = varcorr_block(&th, 2, sigma_int_sq, &g, 0, map);
         let trace = vc[0] + vc[2];
@@ -280,7 +322,7 @@ fn an_sd_at_zero_on_a_centered_slope_block() {
         let want = v[0] * v[0];
         assert!(((vc[0] - want) / want).abs() <= 1e-12, "{} {want}", vc[0]);
         let base = k.kernel_deviance_at_hat();
-        let d = k.var_deviance(&v);
+        let d = k.var_deviance(Some(0), &v);
         assert!(d.is_finite() && d > base, "{d} {base}");
     });
 }
@@ -310,8 +352,8 @@ fn a_non_psd_correlation_is_infeasible() {
         v[2] = 0.95;
         v[4] = -0.95;
         let mut th = vec![0.0; 6];
-        assert!(!k.theta_of(&v, &mut th));
-        assert_eq!(k.var_deviance(&v), f64::INFINITY);
+        assert!(!k.theta_of(Some(0), &v, &mut th));
+        assert_eq!(k.var_deviance(Some(0), &v), f64::INFINITY);
     });
 }
 
@@ -323,7 +365,7 @@ fn a_parameter_held_at_its_estimate_gives_the_base() {
         let v = k.estimate();
         let mut held = 0;
         for i in 0..v.len() {
-            let mut start = v.clone();
+            let mut start = k.start(i);
             let (d, ok) = k.hold_var(i, v[i], &mut start);
             assert!(ok && (d - base).abs() <= 1e-6, "coordinate {i}: {d} {base}");
             assert_eq!(start[i], v[i]);
@@ -388,13 +430,13 @@ fn a_small_sd_is_not_boxed_at_a_multiple_of_its_estimate() {
         let mut k = kernel(ws, map, units);
         let v = k.estimate();
         let (sd_hat, sigma_hat) = (v[0], v[1]);
-        let mut start = v.clone();
+        let mut start = k.start(1);
         let (_, ok) = k.hold_var(1, sigma_hat / 10.0, &mut start);
         assert!(ok);
+        let sd = k.caller_of(1, &start)[0];
         assert!(
-            start[0] > 1.5 * 1000.0 * sd_hat,
-            "sd {} against 1000·ŝd {}",
-            start[0],
+            sd > 1.5 * 1000.0 * sd_hat,
+            "sd {sd} against 1000·ŝd {}",
             1000.0 * sd_hat
         );
     });
@@ -422,14 +464,14 @@ fn a_slope_sd_keeps_the_fits_box_on_a_small_scale_column() {
             "{sd_days} {sigma_hat}"
         );
         let mut held = 0;
-        for i in 0..v.len() {
-            let mut start = v.clone();
-            let (d, ok) = k.hold_var(i, v[i], &mut start);
+        for (i, &vi) in v.iter().enumerate() {
+            let mut start = k.start(i);
+            let (d, ok) = k.hold_var(i, vi, &mut start);
             assert!(ok && (d - base).abs() <= 1e-6, "coordinate {i}: {d} {base}");
+            let sd_days = k.caller_of(i, &start)[2];
             assert!(
-                start[2] > crate::lmm::THETA_HI * sigma_hat,
-                "coordinate {i}: sd_Days {} capped",
-                start[2]
+                sd_days > crate::lmm::THETA_HI * sigma_hat,
+                "coordinate {i}: sd_Days {sd_days} capped"
             );
             held += 1;
         }

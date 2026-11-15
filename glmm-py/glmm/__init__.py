@@ -460,7 +460,7 @@ class NoCoefficientsWarning(DiagnosticWarning):
 
 
 class NbShapeAtLimitWarning(DiagnosticWarning):
-    """The negative-binomial shape ended on the lower limit of its search (0.001), so
+    """The negative-binomial shape ended on the lower limit of its search (1e-6), so
     the shape and the estimates computed at it are at that limit, not at an optimum. At
     the upper limit (10000, a fit with no overdispersion the shape can measure) the note
     is stored in `diagnostics["notes"]` and raises nothing."""
@@ -1264,7 +1264,10 @@ class Fit:
         signed root of the deviance change reaches the normal quantile of
         `level`. An SD estimated at 0 has 0 as its lower bound, and a
         correlation whose profile stays inside the cutoff up to -1 or 1 has
-        that limit. An undetermined bound is NaN, and the notes name it.
+        that limit. An undetermined bound is NaN, and the notes name it. A
+        random-slope column far from zero can leave poor or undetermined
+        bounds on the rows of its own random-effect block; centering the
+        column avoids this.
 
         level: the confidence level, strictly between 0 and 1.
         parm: None for every row, or a row name or list of row names; "theta_"
@@ -2341,7 +2344,8 @@ def fit(
         conditional `predict` with standard errors or future bounds read.
         False skips them, which saves up to about the time of the fit itself
         on a crossed model with many levels: `postvar` and `condsd` are then
-        None and such a `predict` raises.
+        None and such a `predict` raises. `False` also lets a Gaussian model
+        with a large crossed grouping use the sparse solver, which can be faster.
     reml: None, True or False; `Fit.reml` reports the value used.
         Gaussian with random effects (after any single-level grouping is
         dropped): None and True fit by REML, False by ML.

@@ -12,15 +12,27 @@ use super::error::ParseError;
 use regex::Regex;
 use std::sync::LazyLock;
 
-// A column name inside a regex, the same class `is_identifier` accepts: a
-// letter, `_`, or a `.` not followed by a digit, then letters, digits, `_` or
-// `.` (R's syntactic names, such as `age.years`), Unicode-aware on both sides.
-// `\p{Alphabetic}` is `char::is_alphabetic`, and `\p{Alphabetic}` plus `\p{N}`
-// is `char::is_alphanumeric`, so a name that parses as a bare term also
-// parses inside a grouping term, a transform, or `cbind()`.
+// A column name inside a regex, the same class `is_identifier` accepts. ASCII
+// follows R's syntactic names (such as `age.years`): a letter, `_`, or a `.`
+// not followed by a digit, then letters, digits, `_` or `.`. Any non-ASCII
+// character that is not whitespace or a control character is a name character
+// too (combining marks, emoji and their ZWJ sequences, CJK), and starts a name
+// unless it is numeric: every operator and delimiter of the grammar is ASCII,
+// so this cannot split a term differently. In Unicode mode `\s` is
+// `char::is_whitespace`, `\p{Cc}` is `char::is_control` and `\p{N}` is
+// `char::is_numeric`, so the first class of `ident_start!` is `is_name_start`
+// and the trailing class of `ident!` is `is_name_char`, and a name that parses
+// as a bare term also parses inside a grouping term, a transform, or
+// `cbind()`. `is_name_char`, `is_name_start`, `ident_start!` (also used by
+// `RE_ISLOPE`) and `ident!` change together.
+macro_rules! ident_start {
+    () => {
+        r"(?:[_A-Za-z[^\x00-\x7F\s\p{Cc}\p{N}]]|\.[_.A-Za-z[^\x00-\x7F\s\p{Cc}\p{N}]])"
+    };
+}
 macro_rules! ident {
     () => {
-        r"(?:[_\p{Alphabetic}]|\.[_.\p{Alphabetic}])[_.\p{Alphabetic}\p{N}]*"
+        concat!(ident_start!(), r"[_.A-Za-z0-9[^\x00-\x7F\s\p{Cc}]]*")
     };
 }
 
@@ -60,7 +72,9 @@ static RE_SLOPE: LazyLock<Regex> = LazyLock::new(|| {
 });
 static RE_ISLOPE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(concat!(
-        r"\(((?:[_\p{Alphabetic}]|\.[_.\p{Alphabetic}])(?:[^|()]|\([^|()]*\))*?)\|(",
+        r"\((",
+        ident_start!(),
+        r"(?:[^|()]|\([^|()]*\))*?)\|(",
         ident!(),
         r")\)"
     ))
@@ -903,8 +917,17 @@ fn split_outside_parens(s: &str) -> Vec<&str> {
     pieces
 }
 
+// Change together with `ident!`.
 fn is_name_char(c: char) -> bool {
-    c.is_alphanumeric() || c == '_' || c == '.'
+    c.is_ascii_alphanumeric()
+        || c == '_'
+        || c == '.'
+        || (!c.is_ascii() && !c.is_whitespace() && !c.is_control())
+}
+
+// Change together with `ident_start!`.
+fn is_name_start(c: char) -> bool {
+    c == '_' || c.is_ascii_alphabetic() || (!c.is_ascii() && is_name_char(c) && !c.is_numeric())
 }
 
 /// Whether `s` has a grouping `(`: one not directly after a name, where it
@@ -1284,15 +1307,13 @@ fn parse_identifier_list(s: &str, seps: &[char]) -> Result<Vec<String>, ParseErr
         .collect()
 }
 
+// The same class as `ident!`; change together.
 fn is_identifier(s: &str) -> bool {
     let mut chars = s.chars().peekable();
     match chars.next() {
-        Some(c) if c.is_alphabetic() || c == '_' => {}
+        Some(c) if is_name_start(c) => {}
         // `.x` and `..x` are names; `.` alone (R's "all other columns") and `.5` are not.
-        Some('.')
-            if chars
-                .peek()
-                .is_some_and(|&c| c.is_alphabetic() || c == '_' || c == '.') => {}
+        Some('.') if chars.peek().is_some_and(|&c| c == '.' || is_name_start(c)) => {}
         _ => return false,
     }
     chars.all(is_name_char)

@@ -12,7 +12,7 @@ pub struct BindError {
     /// `compare_error` (two stored fits cannot be compared) or `internal`
     /// (a panic, or a function not implemented yet).
     pub code: &'static str,
-    /// The message, the caller's row already in it.
+    /// The message, the caller's row and design column already in it.
     pub message: String,
     /// The caller's row the error names, in the caller's numbering
     /// (`row_index`, else the row passed plus `row_base`).

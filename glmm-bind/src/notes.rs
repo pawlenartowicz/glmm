@@ -1379,12 +1379,12 @@ mod tests {
         };
         assert_eq!(message(&upper, &NO_NAMES), None);
         let lower = NoteInfo {
-            lower: 1e-3,
+            lower: 1e-6,
             ..note("nb_shape_at_limit")
         };
         assert_eq!(
             message(&lower, &NO_NAMES).unwrap(),
-            "The negative binomial shape parameter reached the lower limit of its search, 0.001. \
+            "The negative binomial shape parameter reached the lower limit of its search, 1e-06. \
              The data are more overdispersed than this limit allows, so the shape is at that \
              limit, not at an optimum, and the coefficients and standard errors are computed at \
              it."

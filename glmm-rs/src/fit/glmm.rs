@@ -402,16 +402,13 @@ pub(crate) fn fit_glmm_packed(
 }
 
 /// The NB GLMM's `ln θ_NB` start from the no-RE GLM-NB prefit: its θ̂ when the
-/// prefit converged at least a factor [`NB_SEED_FLOOR_FACTOR`] above the box
-/// floor `NB_THETA_LO`, and [`NB_SEED_FALLBACK`] otherwise. A prefit that fails,
-/// or that runs to the floor (MASS's `glm.nb` fails on the same data there),
-/// starts the outer search in a region where PIRLS barely converges and the
-/// search can settle at a wrong point: measured on grid cell
-/// `nb_q2sx2_g3000p5_bal_base`, a 0.014 start converged 3808 logLik below
-/// glmmTMB, while θ = 1 reached glmmTMB's optimum in 324 evaluations, and on
-/// `nb_q8_g3000p20_bal_base` a 0.009 start took 38143 evaluations against 1145.
+/// prefit converged at or above [`NB_SEED_FLOOR`] (θ = 0.01, independent of the
+/// search box), and [`NB_SEED_FALLBACK`] otherwise. A prefit that fails, or
+/// that ends below the floor, starts the outer search in a region where PIRLS
+/// barely converges: measured on grid cell `nb_q8_g3000p20_bal_base`, a 0.009
+/// start took 38143 evaluations against 1145 from θ = 1.
 pub(crate) fn nb_glmm_seed(prefit_converged: bool, prefit_theta: f64) -> f64 {
-    if prefit_converged && prefit_theta >= NB_SEED_FLOOR_FACTOR * crate::consts::NB_THETA_LO {
+    if prefit_converged && prefit_theta >= NB_SEED_FLOOR {
         prefit_theta
     } else {
         NB_SEED_FALLBACK
@@ -419,9 +416,9 @@ pub(crate) fn nb_glmm_seed(prefit_converged: bool, prefit_theta: f64) -> f64 {
 }
 
 /// See [`nb_glmm_seed`].
-const NB_SEED_FLOOR_FACTOR: f64 = 10.0;
-/// See [`nb_glmm_seed`]: the measured start that reaches the optimum on both
-/// cells the floor guard exists for.
+const NB_SEED_FLOOR: f64 = 1e-2;
+/// See [`nb_glmm_seed`]: the measured start that reaches the optimum on the
+/// cell the floor guard exists for.
 const NB_SEED_FALLBACK: f64 = 1.0;
 
 /// Borrowed result of [`run_glmm_on`]: the [`GlmmFit`] summary, the θ̂ it was fit
@@ -758,8 +755,11 @@ pub(crate) fn run_glmm_on<'a>(
     // stopped short or ended precision-limited is searched again from the cold
     // start (the GLM β, the blind θ, no carried Gamma φ), as a cold fit is, and
     // the cold search is kept when it ended lower without losing convergence.
-    if !has_units
-        && start.is_some_and(|s| !s.beta.is_empty())
+    // On the Gamma inverse link the cold search reads its units off the cold β
+    // and is retried as a cold fit's is (`gamma_inverse_units`,
+    // `gamma_inverse_retry`); on every other family it goes through
+    // `capped_restart`.
+    if start.is_some_and(|s| !s.beta.is_empty())
         && (!glmm_fit.converged || !glmm_fit.deviance.is_finite() || glmm_fit.precision_limited)
     {
         let (cold_beta, sep) = glm_seed();
@@ -768,26 +768,36 @@ pub(crate) fn run_glmm_on<'a>(
                 (SearchState::save(ws), ws.nb_theta, ws.gamma_phi_start);
             ws.nb_theta = nb_theta;
             ws.gamma_phi_start = None;
-            let cold = fit_glmm_in_units(
-                ws,
-                x_mat,
-                z_mat,
-                y,
-                offset,
-                n,
-                p,
-                cluster_ids,
-                extra_ids,
-                &cold_beta,
-                Some(uc),
-                None,
-                targets,
-                opts,
-                map,
-                units,
-                uc,
-            );
-            let mut cold = capped_restart(ws, cold, restart_in);
+            let cold_in = |ws: &mut GlmmWorkspace, c: f64| {
+                fit_glmm_in_units(
+                    ws,
+                    x_mat,
+                    z_mat,
+                    y,
+                    offset,
+                    n,
+                    p,
+                    cluster_ids,
+                    extra_ids,
+                    &cold_beta,
+                    Some(uc),
+                    None,
+                    targets,
+                    opts,
+                    map,
+                    units,
+                    c,
+                )
+            };
+            let mut cold = if has_units {
+                let u =
+                    gamma_inverse_units(ws, x_mat, y, offset, n, cluster_ids, &cold_beta, uc, uc);
+                let first = cold_in(ws, u.fast);
+                gamma_inverse_retry(ws, first, u.fast, &u, cold_in)
+            } else {
+                let first = cold_in(ws, uc);
+                capped_restart(ws, first, restart_in)
+            };
             let spent = glmm_fit.n_eval + cold.n_eval;
             let keep = cold.deviance.is_finite()
                 && (cold.converged || !glmm_fit.converged)
@@ -1688,8 +1698,8 @@ pub(super) fn run_glmm_nb_on<'a>(
     // handing the outer BOBYQA a `+∞` plateau it can't escape. The no-RE GLM-NB's own
     // θ̂ is a start, not an estimate (the fixed effects alone under-explain the mean,
     // so it still moves under the outer search), but it starts inside the basin PIRLS
-    // can actually converge in, except where the prefit itself fails or runs to
-    // the box floor — see [`nb_glmm_seed`]. `fit_glm_nb` hands back its θ as its
+    // can actually converge in, except where the prefit itself fails or ends
+    // below θ = 0.01 — see [`nb_glmm_seed`]. `fit_glm_nb` hands back its θ as its
     // second return value — the last θ its alternation stood on, the moment seed
     // if the first inner IRLS failed, the θ reached so far if a later one did —
     // because the `Fit`'s own `dispersion` field is NaN unless the prefit
@@ -1756,7 +1766,8 @@ mod retry_tests {
             se_for: SeFor::Only(vec![0, 1]),
             ..FitOptions::default()
         };
-        let (sized, sids, _) = super::super::common::spec_sized_from_ids(&model, &ids);
+        let (sized, sids, _) =
+            super::super::common::spec_sized_from_ids(&model, &ids, opts.condvar);
         let beta = [0.8, -0.3];
         let u = GammaInverseUnits {
             fast: 1.0,

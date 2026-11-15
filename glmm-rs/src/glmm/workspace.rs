@@ -26,8 +26,8 @@ pub enum OuterSearch {
 
 /// Which `A`-layout a design takes. `Packed` is every design `fit::classify_design`
 /// sends to `Solver::Sparse` (over the dense envelope, slopes on an extra grouping,
-/// more than `MAX_CROSSED_LEVELS` crossed levels) plus every extras design whose
-/// core block is too wide for the structured route.
+/// a crossed tail whose dense buffers would pass `fit::DENSE_TAIL_MAX_BYTES`) plus
+/// every extras design whose core block is too wide for the structured route.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum GlmmLayout {
     Blocked,
@@ -37,7 +37,8 @@ pub(crate) enum GlmmLayout {
 
 impl GlmmLayout {
     pub(crate) fn for_design(sized: &crate::fit::SizedSpec, g: &LmmGroupings) -> Self {
-        match crate::fit::classify_design(sized, 1) {
+        // `condvar` picks only the Gaussian kernel; a GLMM's layout does not read it.
+        match crate::fit::classify_design(sized, false) {
             crate::fit::Solver::Sparse => GlmmLayout::Packed,
             crate::fit::Solver::NoZ if g.extra_offsets.is_empty() => GlmmLayout::Blocked,
             crate::fit::Solver::NoZ if g.structured_extras_eligible() => GlmmLayout::Structured,
@@ -2601,6 +2602,7 @@ mod tests {
             },
             n_primary: n_prim,
             extra_counts: vec![],
+            tail_fill: 0.0,
         };
         let mut x = Mat::<f64>::zeros(n, 2);
         let mut ids = vec![0u32; n];
@@ -2832,6 +2834,7 @@ mod tests {
             },
             n_primary: n_prim,
             extra_counts: vec![n_c1, n_c2],
+            tail_fill: 0.0,
         };
         let extra_ids = vec![c1, c2];
         let _ = x;

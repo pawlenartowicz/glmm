@@ -23,8 +23,8 @@ const SE_REL_PHI1: f64 = 3e-5;
 /// estimated dispersion on top of the same IRLS stopping-tolerance gap
 /// `SE_REL_PHI1` already carries, so it needs its own, looser floor. `7e-5` =
 /// ceil-to-one-significant-figure(2 × 3.2793e-5), the worst measured relative
-/// gap (`fit_glm_nb_theta_low_edge_matches_mass`, the heavily-overdispersed
-/// θ-bracket edge).
+/// gap (`fit_glm_nb_theta_low_edge_matches_mass`, a heavily overdispersed
+/// fit).
 const SE_REL_DISPERSION: f64 = 7e-5;
 
 /// Weighted Gamma(log) GLM vs R glm(weights=). Precision weights: row `i` has
@@ -1464,12 +1464,16 @@ fn fit_glm_small_unit_weights_converge() {
 }
 
 /// Uniform prior weights only rescale the log-likelihood, so β must not move.
-/// The relative stop's floor was a fixed 0.1 on binomial, Poisson and NB: at
-/// every weight 1e-12 it stopped binomial one pass early as `separated` and
-/// Poisson 2e-5 short; at 1e-100 Poisson and NB ended `separated` too.
+/// With a fixed floor of 0.1 on its relative stop, IRLS stopped binomial one
+/// pass early as `separated` at every weight 1e-12 and Poisson 2e-5 short, and
+/// at 1e-100 Poisson and NB ended `separated` too. On NB the full fit also
+/// searches θ, whose stop (`NB_THETA_TOL`, 1e-6 relative) moves β by more
+/// than this test's 1e-9, so NB's β is compared at θ held at the unweighted
+/// θ̂, on the fixed-θ IRLS the full fit runs each round.
 /// Fixture: `POIS_W_X1`/`POIS_W_Y`, binomial on `y ≥ 2`.
 #[test]
 fn fit_glm_tiny_uniform_weights_match_unit_weights() {
+    use super::glm::{fit_glm_prebuilt, GlmScratchBuf};
     let n = 40;
     let mut x = Vec::with_capacity(n * 2);
     for &xi in &POIS_W_X1 {
@@ -1518,12 +1522,36 @@ fn fit_glm_tiny_uniform_weights_match_unit_weights() {
                 "{family:?} w = {w:e}: {:?}",
                 f.diagnostics.notes
             );
+            let (got, want) = if matches!(family, Family::NegativeBinomial { .. }) {
+                let x_mat = super::common::to_col_major(&x, n, 2);
+                let held = |wts: Option<&[f64]>| {
+                    let mut buf = GlmScratchBuf::new(n, 2, 2);
+                    let view = fit_glm_prebuilt(
+                        family,
+                        base.dispersion,
+                        x_mat.as_ref(),
+                        y,
+                        wts,
+                        None,
+                        &[0, 1],
+                        &mut buf,
+                        crate::standardize::ColumnScaling::IDENTITY,
+                        crate::standardize::Units::IDENTITY,
+                        None,
+                    );
+                    assert!(view.converged && !view.separated, "NB θ held, w = {w:e}");
+                    view.betas.to_vec()
+                };
+                (held(Some(&weights[..])), held(None))
+            } else {
+                (f.beta.clone(), base.beta.clone())
+            };
             for j in 0..2 {
                 assert!(
-                    (f.beta[j] - base.beta[j]).abs() / base.beta[j].abs() < 1e-9,
+                    (got[j] - want[j]).abs() / want[j].abs() < 1e-9,
                     "{family:?} w = {w:e}: β[{j}] {} vs {}",
-                    f.beta[j],
-                    base.beta[j]
+                    got[j],
+                    want[j]
                 );
             }
         }
@@ -3079,13 +3107,12 @@ fn nb_edge_fit(csv: &str, ref_beta: &[f64; 3], ref_se: &[f64; 3]) -> Fit {
     f
 }
 
-/// θ-bracket LOW edge: heavily overdispersed NB GLM (θ̂ ≈ 4.1e-3, half an
-/// order above `NB_THETA_LO` = 1e-3), gated against frozen `MASS::glm.nb`
-/// (`validation/goldens/sim_nb_lowtheta_glm.json`; glm.nb converged with zero
-/// warnings on the committed CSV — the reference is trustworthy this close
-/// to the edge, not past it). Pins that the golden-section θ search stays
-/// interior and matches MASS near its lower bracket end. The oracle is
-/// sacred.
+/// Heavily overdispersed NB GLM (θ̂ ≈ 4.1e-3, interior, three decades above
+/// the lower search limit `NB_THETA_LO`), gated against frozen
+/// `MASS::glm.nb` (`validation/goldens/sim_nb_lowtheta_glm.json`; glm.nb
+/// converged with zero warnings on the committed CSV). Pins that the
+/// golden-section θ search stays interior and matches MASS at a heavily
+/// overdispersed shape. The oracle is sacred.
 #[test]
 fn fit_glm_nb_theta_low_edge_matches_mass() {
     const REF_BETA: [f64; 3] = [0.392948589321679, -1.19642377752834, 0.820910978622294];
@@ -3096,10 +3123,9 @@ fn fit_glm_nb_theta_low_edge_matches_mass() {
         &REF_BETA,
         &REF_SE,
     );
-    // Sane boundary behavior: inside the bracket, near (but not AT) the low end.
     assert!(
         f.dispersion > crate::consts::NB_THETA_LO && f.dispersion < 1e-2,
-        "θ̂ = {} must sit interior near NB_THETA_LO",
+        "θ̂ = {} must be interior and heavily overdispersed",
         f.dispersion
     );
     assert!(
@@ -3206,14 +3232,62 @@ fn nb_glm_on_the_upper_shape_limit_carries_the_note() {
     );
 }
 
-/// 99 zeros and one count of 1e6: with μ̂ = ȳ = 1e4 the NB score in θ is about
-/// `100·(ln θ − ln 1e4 + 1) + 1/θ − 100`, zero near θ = 6e-4, so the
-/// likelihood still rises below `NB_THETA_LO` and θ̂ ends on that limit.
+/// One positive count in 400 rows, drawn at θ = 2e-4
+/// (`validation/data/simulated/sim_nb_tinytheta.csv`), `y ~ x`: the shape
+/// maximum lies between 1e-6 and 1e-3, and the search reaches it. Reference:
+/// the base-R profile maximum printed by
+/// `validation/tools/prep/nb_tiny_shape_profile_reference.R` (manifest entry
+/// `nb_tiny_shape_profile`). Bands: θ̂ within 1e-6 relative (`NB_THETA_TOL`,
+/// the limit `optimize_nb_theta` states on θ̂'s distance from the joint
+/// maximum); loglik within 1e-9 absolute, since a 1e-6 relative error in θ̂
+/// and the IRLS stop move the loglik at second order only.
+#[test]
+fn nb_glm_tiny_shape_matches_the_base_r_profile() {
+    const TINY_REF_THETA: f64 = 0.0005052793757600073;
+    const TINY_REF_LOGLIK: f64 = -15.94606048286881;
+    let csv = include_str!("../../../validation/data/simulated/sim_nb_tinytheta.csv");
+    let (mut x, mut y) = (Vec::new(), Vec::new());
+    for line in csv.lines().skip(1) {
+        let v: Vec<f64> = line.split(',').map(|t| t.parse().unwrap()).collect();
+        y.push(v[0]);
+        x.extend([1.0, v[1]]);
+    }
+    assert_eq!(y.len(), 400);
+    let (f, _) = nb_glm_at(&x, &y, 2, crate::consts::NB_THETA_LO);
+    assert!(f.converged(), "the fit converges");
+    let th_rel = (f.dispersion / TINY_REF_THETA - 1.0).abs();
+    assert!(
+        th_rel <= 1e-6,
+        "θ̂ = {} vs base R {TINY_REF_THETA} (rel {th_rel:e})",
+        f.dispersion
+    );
+    assert!(
+        (f.loglik - TINY_REF_LOGLIK).abs() <= 1e-9,
+        "loglik {} vs base R {TINY_REF_LOGLIK}",
+        f.loglik
+    );
+    assert!(
+        !f.diagnostics
+            .notes
+            .iter()
+            .any(|n| matches!(n, Note::NbShapeAtLimit { .. })),
+        "an interior shape carries no limit note, notes {:?}",
+        f.diagnostics.notes
+    );
+}
+
+/// 99999 zeros and one count `Y = 1e9`, intercept only: μ̂ = ȳ = 1e4 at every
+/// θ, and the NB score in θ is zero where `1/θ = n·ln(μ̂/θ) − ψ(Y) − γ`
+/// (n = 1e5), at θ ≈ 4.18e-7: the base-R profile maximum is
+/// 4.1846611879490883e-7 (`validation/tools/prep/nb_tiny_shape_profile_reference.R`,
+/// manifest entry `nb_tiny_shape_profile`). The likelihood still rises below
+/// `NB_THETA_LO`, so θ̂ ends on that limit.
 #[test]
 fn nb_glm_on_the_lower_shape_limit_carries_the_note() {
-    let mut y = vec![0.0; 100];
-    y[99] = 1e6;
-    let x = vec![1.0; 100];
+    let n = 100_000;
+    let mut y = vec![0.0; n];
+    y[n - 1] = 1e9;
+    let x = vec![1.0; n];
     let (f, gap) = nb_glm_at(&x, &y, 1, crate::consts::NB_THETA_LO);
     assert!(f.converged(), "the fit converges");
     assert!(gap <= 1e-6, "θ̂ = {} must end on NB_THETA_LO", f.dispersion);
@@ -3239,11 +3313,13 @@ fn nb_saturated_loglik_is_accurate_at_any_count() {
         link: crate::NegBinomialLink::Log,
     };
     let refs = [
+        (1.0, 1e-6, -13.815_525_373_475_332),
         (1.0, 1e-3, -6.915_663_534_094_536),
         (7.0, 1.3, -2.883_695_866_047_211_4),
         (1e3, 50.0, -5.896_748_004_258_026),
         (1e5, 1e4, -7.874_357_311_179_878),
         (1e10, 50.0, -21.990_444_607_378_04),
+        (1e10, 1e-6, -36.841_375_726_200_45),
         (1e10, 1e-3, -29.940_937_570_603_343),
         (1e15, 1e4, -30.852_553_075_465_597),
     ];
@@ -3311,7 +3387,7 @@ fn nb_profile_loglik_on_a_huge_count_is_fast() {
 }
 
 /// `NB_MAX_OUTER` cap semantics via the `fit_glm_nb_capped` seam, seeded at
-/// `NB_THETA_LO` (far from θ̂ ≈ 1.01 on sim_nb) so one alternation cannot
+/// θ = 1e-3 (far from θ̂ ≈ 1.01 on sim_nb) so one alternation cannot
 /// meet `NB_THETA_TOL`. Pins that cap exhaustion is reported: the capped fit
 /// keeps `converged = true` (the last inner IRLS fit converged), carries a
 /// `NbShapeUnsettled` note, and β/SE are refit at the θ in `dispersion`.
@@ -3326,7 +3402,7 @@ fn fit_glm_nb_outer_cap_semantics() {
         se_for: SeFor::Only(vec![0, 1, 2]),
         ..FitOptions::default()
     };
-    let seed = Some(crate::consts::NB_THETA_LO);
+    let seed = Some(1e-3);
     let x_mat = super::common::to_col_major(&x, n, p);
 
     let f1 = super::glm::fit_glm_nb_capped(
@@ -3389,7 +3465,7 @@ fn fit_glm_nb_outer_cap_semantics() {
     // fixed-θ GLM at `f1.dispersion` (the test-only `fit_glm`, cold IRLS at
     // β = 0) reproduces them. The refit starts from the last round's β, so the
     // two stop at different iterates of the same fit: 5e-7 apart here, against
-    // a fit left at the stale θ = `NB_THETA_LO`, whose β is far off.
+    // a fit left at the stale θ = 1e-3, whose β is far off.
     assert!(f1.dispersion.is_finite());
     let family = Family::NegativeBinomial {
         link: NegBinomialLink::Log,

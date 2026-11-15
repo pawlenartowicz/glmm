@@ -698,8 +698,9 @@ fn make_design(
             vec![grp("subject", g_glmm, vec![slope_col], vec![ri, slope_sd])],
         ),
         "glmm_crossed" => {
-            // Declared items first, subjects second, so the crate's size rule
-            // swaps them (more subjects than items): this shape exercises the
+            // Declared items first, subjects second, so the crate swaps them
+            // (more subjects than items, and the grouping with the most
+            // columns goes first): this shape exercises the
             // grouping reorder of starts and θ̂ on the base scheme.
             let (s, i) = if raw {
                 (pick(30, 50), pick(20, 40))

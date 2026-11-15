@@ -268,16 +268,25 @@ PARITY <- local({
              g = factor(g, levels = c("g0", "g1", "g2", "g_mid", "g3", "g4")))
 })
 
-test_that("port parity sequence adds three more kinds", {
+test_that("port parity sequence adds four more kinds", {
   fit <- suppressWarnings(fastglmm(y ~ z + (1 + z | g), PARITY, dispersion = 2, nAGQ = 3))
   expect_true(fit$converged)
-  expect_identical(fit$warnings$tier, c("note", "note", "caution", "caution"))
+  # satterthwaite_curvature added by the rescale retry (loglik 311.47 to 547.14).
+  expect_identical(fit$warnings$tier, c("note", "note", "caution", "caution", "caution"))
   expect_identical(fit$warnings$kind, c(
-    "argument_ignored", "argument_ignored", "singular", "variance_at_limit"
+    "argument_ignored", "argument_ignored", "singular", "variance_at_limit",
+    "satterthwaite_curvature"
   ))
   expect_identical(fit$warnings$title, c(
-    "Argument ignored", "Argument ignored", "Singular fit", "Variance at its search limit"
+    "Argument ignored", "Argument ignored", "Singular fit", "Variance at its search limit",
+    "Satterthwaite df uncertain"
   ))
+  expect_identical(only(fit, "variance_at_limit")$message, paste(
+    "A random-effect parameter reached the upper limit of the search (1000 on glmm's",
+    "internal scale). On a Gaussian model this usually means the residual variance is",
+    "estimated at or near zero; on other families the random-effect variance has no",
+    "finite estimate. The estimates are at that limit, not at an optimum. Check for a",
+    "response that the predictors and groups explain exactly."))
 })
 
 test_that("port parity non_integer_response", {
@@ -404,25 +413,30 @@ test_that("a mixed fit with every fixed column aliased", {
     "predictor."))
 })
 
-test_that("port parity variance_at_limit", {
+test_that("port parity precision_limited", {
   # Same fixture and call in glmm-py/tests/test_warnings.py - change together. On
-  # MIXED, y - 0.3x is constant within each group, so the residual variance goes
-  # to zero and theta ends on the upper limit of its search.
-  res <- fit_catching(fastglmm(y ~ x + (1 | g), MIXED), "fastglmm_variance_at_limit")
+  # MIXED, y - 0.3x is constant within each group, so the model has no finite
+  # optimum: the residual variance goes to zero. Every rescale of the internal
+  # weight scale lowers the criterion, so all of them are kept, and the fit ends
+  # where the residual is too small for its deviance to be known.
+  res <- fit_catching(fastglmm(y ~ x + (1 | g), MIXED), "fastglmm_precision_limited")
   expect_false(is.null(res$cond))
   expect_s3_class(res$cond, "fastglmm_diagnostic")
   expect_true(res$fit$converged)
   expect_false(res$fit$singular)
-  expect_identical(res$fit$diagnostics$boundary, "upper_limit")
-  expect_identical(res$fit$warnings$kind, "variance_at_limit")
-  row <- only(res$fit, "variance_at_limit")
-  expect_identical(c(row$tier, row$title), c("caution", "Variance at its search limit"))
+  # Was upper_limit, variance_at_limit, loglik 58.97; moved by the rescale retry (loglik 447.07).
+  expect_identical(res$fit$diagnostics$boundary, "interior")
+  expect_identical(res$fit$warnings$kind, "precision_limited")
+  row <- only(res$fit, "precision_limited")
+  expect_identical(c(row$tier, row$title), c("caution", "Numbers too large for full precision"))
   expect_identical(row$message, paste(
-    "A random-effect parameter reached the upper limit of the search (1000 on glmm's",
-    "internal scale). On a Gaussian model this usually means the residual variance is",
-    "estimated at or near zero; on other families the random-effect variance has no",
-    "finite estimate. The estimates are at that limit, not at an optimum. Check for a",
-    "response that the predictors and groups explain exactly."))
+    "The numbers in this fit are so large that rounding in the computer's arithmetic",
+    "hides small changes in its deviance. The random-effect estimates, and the fixed",
+    "effects that depend on them, may be off by a tenth of a standard error or more.",
+    "This happens with counts in the billions or more, or when a model misses a large",
+    "effect in such data; on a Gaussian model, with a response far from zero next to its",
+    "residual spread (subtract a constant from it), or with weights spanning many orders",
+    "of magnitude."))
   expect_identical(conditionMessage(res$cond), printed(row))
 })
 

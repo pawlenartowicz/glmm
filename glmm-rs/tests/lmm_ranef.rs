@@ -586,15 +586,11 @@ fn nested_padding_is_dropped_at_the_hand_computed_slots() {
     }
 }
 
-/// **The case `label_ranef` exists for.** A FLAT pair `(1|A) + (1|B)` with no
-/// `:` anywhere in the formula reaches the same padded nested layout as
-/// `(1|A/B)` above, purely because the data happens to nest and stay inside the
-/// padding bound. A consumer that inferred the layout from the formula would
-/// mislabel every row here; the labels must still come out one per observed
-/// child, spelled for the child alone (the block is named for the child, so
-/// joining the parent in would make the spelling move with the dataset).
+/// A flat pair `(1|A) + (1|B)` whose data nest unevenly: the fit holds the
+/// child on a padded nested layout, yet the fit reports it as written, one
+/// slot and one bare label per observed child, in declared order.
 #[test]
-fn flat_nesting_labels_the_padded_layout_it_silently_routed_to() {
+fn flat_nesting_reports_one_slot_per_child() {
     let cells: [(&str, &str); 6] = [
         ("A", "s1"),
         ("B", "s2"),
@@ -625,24 +621,15 @@ fn flat_nesting_labels_the_padded_layout_it_silently_routed_to() {
     };
     let (model, blocks) = run("y ~ x1 + (1 | ga) + (1 | gb)", &table);
     let fit = model.fit();
-    // Parents A/B/C hold 1/2/3 children, so the layout is a 3-wide rectangle
-    // per parent: 3 × 3 = 9 slots, inside the padding bound (9 <= 2 · 6), with
-    // slots 1, 2 (A's) and 5 (B's) padding. The block is named for the child
-    // alone, and the padding is dropped from the labelled form.
-    assert_eq!(fit.ranef_levels()[1], 9, "padded rectangle width");
+    // Parents A/B/C hold 1/2/3 children, inside the padding bound
+    // (3 × 3 = 9 <= 2 · 6).
+    assert_eq!(fit.ranef_levels()[1], 6);
     assert_eq!(blocks[1].group, "gb");
     assert_eq!(
         blocks[1].levels,
         strs(&["s1", "s2", "s3", "s4", "s5", "s6"])
     );
-    assert_eq!(blocks[1].values.len(), 6);
-    for slot in [1usize, 2, 5] {
-        assert_eq!(
-            fit.ranef(1)[slot],
-            0.0,
-            "padded slot {slot} should hold a zero mode"
-        );
-    }
+    assert_eq!(blocks[1].values, fit.ranef(1));
 }
 
 /// A declared grouping level with no row is dropped, as lme4 drops it: no

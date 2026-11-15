@@ -637,6 +637,10 @@ enum Place {
 struct Cross<'a> {
     c: &'a CondvarCross,
     places: Vec<Place>,
+    /// The declared nested grouping read crossed (`usize::MAX` when none),
+    /// and per padded slot of it its pair, `None` on a slot with no rows.
+    pg: usize,
+    pair_of: Vec<Option<usize>>,
     /// The family grouping's reported coefficients, child slots per family,
     /// coefficients per family and tail levels.
     q: usize,
@@ -654,11 +658,41 @@ impl<'a> Cross<'a> {
                     .into(),
             ))
         };
-        let fg = c.family_grouping;
-        // A non-empty map: the declared primary is the nested grouping, its
-        // declared levels mapped to child slots.
+        let (fg, ng) = (c.family_grouping, c.nested_grouping);
+        // A non-empty `pair_slots`: the declared nested grouping was read
+        // crossed on its observed pairs, which are its levels below.
+        let mut pg = usize::MAX;
+        let mut pair_of = Vec::new();
+        if !c.pair_slots.is_empty() {
+            match re
+                .extra_groupings
+                .iter()
+                .position(|g| g.relation == GroupingRelation::NestedWithin)
+            {
+                Some(k) if k + 1 < blocks.len() => pg = k + 1,
+                _ => return mismatch(),
+            }
+            pair_of = vec![None; blocks[pg].levels];
+            for (l, &s) in c.pair_slots.iter().enumerate() {
+                let s = s as usize;
+                if s >= pair_of.len() || pair_of[s].is_some() {
+                    return mismatch();
+                }
+                pair_of[s] = Some(l);
+            }
+        }
+        let levels = |g: usize| {
+            if g == pg {
+                c.pair_slots.len()
+            } else {
+                blocks[g].levels
+            }
+        };
+        // A non-empty map: grouping `ng` was declared crossed and is the
+        // nested grouping, its declared levels mapped to child slots.
         let slotted = !c.nested_slots.is_empty();
-        if fg >= blocks.len() || (slotted && (fg == 0 || c.nested_slots.len() != blocks[0].levels))
+        if fg >= blocks.len()
+            || (slotted && (ng >= blocks.len() || ng == fg || c.nested_slots.len() != levels(ng)))
         {
             return mismatch();
         }
@@ -670,17 +704,18 @@ impl<'a> Cross<'a> {
             if blocks[g].cols.len() != 1 {
                 return mismatch();
             }
-            let nested_extra =
-                g > 0 && re.extra_groupings[g - 1].relation == GroupingRelation::NestedWithin;
-            if nested_extra || (g == 0 && slotted) {
+            let nested_extra = g > 0
+                && g != pg
+                && re.extra_groupings[g - 1].relation == GroupingRelation::NestedWithin;
+            if nested_extra || (slotted && g == ng) {
                 places[g] = Place::Nested;
                 nested = Some(g);
             } else {
                 places[g] = Place::Tail(t);
-                t += blocks[g].levels;
+                t += levels(g);
             }
         }
-        let families = blocks[fg].levels;
+        let families = levels(fg);
         let q = blocks[fg].cols.len();
         let m = match nested {
             // The declared levels do not count the padded slots: `m` is what
@@ -710,6 +745,8 @@ impl<'a> Cross<'a> {
         Ok(Cross {
             c,
             places,
+            pg,
+            pair_of,
             q,
             m,
             w,
@@ -729,6 +766,14 @@ impl<'a> Cross<'a> {
         let mut fams: Vec<(usize, usize, &[f64])> = Vec::new();
         let mut tails: Vec<(usize, f64)> = Vec::new();
         for &(g, level, at) in touched {
+            // A padded slot with no rows has no cross covariance.
+            let level = if g != self.pg {
+                level
+            } else if let Some(l) = self.pair_of[level] {
+                l
+            } else {
+                continue;
+            };
             let zl = &z[at..at + blocks[g].cols.len()];
             match self.places[g] {
                 Place::Family => fams.push((level, 0, zl)),

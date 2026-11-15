@@ -16,6 +16,7 @@ fn one_block(q_slopes: &[usize]) -> LmmGroupings {
         },
         n_primary: 4,
         extra_counts: vec![],
+        tail_fill: 0.0,
     };
     LmmGroupings::from_cluster_spec_ext(&spec, q_slopes, &[])
 }
@@ -224,9 +225,10 @@ fn stddev_se_matches_finite_differences_of_the_reported_stddevs() {
         primary: cluster,
         extra: vec![],
     };
-    let (fit, fws) = crate::fit::fit_cold_keep_workspace(
+    let (fit, fws) = crate::fit::fit_keep_workspace(
         &crate::Data::new(&x, &y, n, p).ids(&ids),
         &model,
+        None,
         &crate::FitOptions::default(),
     );
     let (ws, cs) = fws

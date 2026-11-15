@@ -975,7 +975,7 @@ fn binomial_logit() -> Family {
 /// Swapping the declaration order of two crossed groupings is the same model:
 /// every per-grouping output trades places (grouping `d` of one spelling is
 /// `1 − d` of the other) and every other output stays. Each pair's second
-/// spelling is one the size rule reorders inside the kernel (`h`, the
+/// spelling is one the grouping order step reorders inside the kernel (`h`, the
 /// smaller grouping, written first; the lone slope grouping written last), so
 /// the pair compares the reordered path with the one that is not. On the
 /// Gaussian pairs the profile intervals trade places too.
@@ -1396,15 +1396,23 @@ fn predictor_location_and_scale_map_the_fit() {
 /// random slope's SD take `1/c` (`c > 0`, so no bound swaps). Under `x + a`
 /// the slope, σ, the random intercept SD of `g` and the random slope's SD
 /// stay; the intercept, the random intercept SD of `h` and the correlation
-/// have no closed-form map of their bounds and are not compared.
-fn profile_case(t: &mut Tally, name: &str, spec: &ModelSpec, ids: &GroupIds, tr: &Transform) {
+/// have no closed-form map of their bounds and are not compared. `which`
+/// selects the rows profiled, as in `Fit::profile_intervals`.
+fn profile_case(
+    t: &mut Tally,
+    name: &str,
+    spec: &ModelSpec,
+    ids: &GroupIds,
+    tr: &Transform,
+    which: Option<&[ProfileParam]>,
+) {
     let y = gaussian_y();
     let mut opts = FitOptions::default();
     opts.reml = Some(false);
     let profile = |x: &[f64]| {
         let d = data(x, &y, None, Some(ids));
         let f = fit(&d, spec, &opts).unwrap_or_else(|e| panic!("{name}: {e}"));
-        let p = f.profile_intervals(&d, spec, 0.95, None);
+        let p = f.profile_intervals(&d, spec, 0.95, which);
         (f, p)
     };
     let (base, pb) = profile(&tr.x_base);
@@ -1465,28 +1473,49 @@ fn predictor_location_and_scale_map_the_profile_intervals() {
     let slope = gaussian_crossed_slope();
     let mut t = Tally::default();
     for tr in &predictor_transforms() {
-        profile_case(&mut t, "gaussian (1 | g)", &intercept, &gids, tr);
+        profile_case(&mut t, "gaussian (1 | g)", &intercept, &gids, tr, None);
         if tr.t[0][1] == 0.0 {
-            profile_case(&mut t, "gaussian (1 | g) + (1 + x | h)", &slope, &ghids, tr);
+            profile_case(
+                &mut t,
+                "gaussian (1 | g) + (1 + x | h)",
+                &slope,
+                &ghids,
+                tr,
+                None,
+            );
         }
     }
     t.assert_clean();
     assert_eq!((t.cases, t.compared, t.outside, t.flagged), (10, 150, 0, 0));
 }
 
-/// [`profile_case`] on `(1 | g) + (1 + x | h)` under `x + a`.
+/// [`profile_case`] on `(1 | g) + (1 + x | h)` under `x + a`, on the rows
+/// held outside h's block: g's SD, σ and x's coefficient. Shifting `x` drives h's correlation
+/// towards −1, and h's own rows are searched in the caller's
+/// coordinates, where that cannot be resolved.
 #[test]
-#[ignore = "the profile search of a correlated random slope runs in the caller's coordinates, where shifting the slope's predictor drives the correlation towards -1 and the search cannot resolve the bounds"]
 fn predictor_location_maps_the_profile_intervals_of_a_crossed_random_slope() {
     let (g, h) = ids();
     let ghids = GroupIds::new(g).extra(h);
     let slope = gaussian_crossed_slope();
+    let which = [
+        ProfileParam::Sd { group: 0, term: 0 },
+        ProfileParam::Sigma,
+        ProfileParam::Beta(1),
+    ];
     let mut t = Tally::default();
     for tr in predictor_transforms().iter().filter(|tr| tr.t[0][1] != 0.0) {
-        profile_case(&mut t, "gaussian (1 | g) + (1 + x | h)", &slope, &ghids, tr);
+        profile_case(
+            &mut t,
+            "gaussian (1 | g) + (1 + x | h)",
+            &slope,
+            &ghids,
+            tr,
+            Some(&which),
+        );
     }
     t.assert_clean();
-    assert_eq!((t.cases, t.compared, t.outside, t.flagged), (2, 24, 0, 0));
+    assert_eq!((t.cases, t.compared, t.outside, t.flagged), (2, 18, 0, 0));
 }
 
 /// Every prior weight × `k` on a binomial and a Poisson GLM: the weights

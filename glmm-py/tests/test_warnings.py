@@ -321,10 +321,11 @@ def test_too_few_rows_end_to_end():
     )
 
 
-def test_port_parity_sequence_adds_three_more_kinds():
+def test_port_parity_sequence_adds_four_more_kinds():
     # Same PARITY fixture and call in glmm-r/tests/testthat/test-warnings.R —
     # change together. argument_ignored fires twice, from two different
-    # arguments, plus the fit's own singular and variance_at_limit cautions.
+    # arguments, plus the fit's own singular, variance_at_limit and
+    # satterthwaite_curvature cautions.
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         m = glmm.fit(PARITY, "y ~ z + (1 + z | g)", dispersion=2.0, nagq=3)
@@ -334,7 +335,16 @@ def test_port_parity_sequence_adds_three_more_kinds():
         ("note", "argument_ignored", "Argument ignored"),
         ("caution", "singular", "Singular fit"),
         ("caution", "variance_at_limit", "Variance at its search limit"),
+        # Added by the rescale retry (loglik 311.47 to 547.14): a Hessian direction drops as flat.
+        ("caution", "satterthwaite_curvature", "Satterthwaite df uncertain"),
     ]
+    assert only(m, "variance_at_limit")["message"] == (
+        "A random-effect parameter reached the upper limit of the search (1000 on glmm's "
+        "internal scale). On a Gaussian model this usually means the residual variance is "
+        "estimated at or near zero; on other families the random-effect variance has no "
+        "finite estimate. The estimates are at that limit, not at an optimum. Check for a "
+        "response that the predictors and groups explain exactly."
+    )
 
 
 def test_port_parity_non_integer_response():
@@ -484,24 +494,29 @@ def test_gaussian_mixed_fit_with_every_fixed_column_aliased():
     assert [w.category for w in caught] == [glmm.NoCoefficientsWarning]
 
 
-def test_port_parity_variance_at_limit():
+def test_port_parity_precision_limited():
     # Same fixture and call in glmm-r/tests/testthat/test-warnings.R - change together.
-    # On MIXED, y - 0.3x is constant within each group, so the residual variance
-    # goes to zero and theta ends on the upper limit of its search.
-    with pytest.warns(glmm.VarianceAtLimitWarning) as caught:
+    # On MIXED, y - 0.3x is constant within each group, so the model has no finite
+    # optimum: the residual variance goes to zero. Every rescale of the internal
+    # weight scale lowers the criterion, so all of them are kept, and the fit ends
+    # where the residual is too small for its deviance to be known.
+    with pytest.warns(glmm.PrecisionLimitedWarning) as caught:
         m = glmm.fit(MIXED, "y ~ x + (1 | g)")
     assert m.converged
     assert not m.singular
-    assert m.diagnostics["boundary"] == "upper_limit"
-    assert [w["kind"] for w in m.warnings] == ["variance_at_limit"]
-    entry = only(m, "variance_at_limit")
-    assert (entry["tier"], entry["title"]) == ("caution", "Variance at its search limit")
+    # Was upper_limit, variance_at_limit, loglik 58.97; moved by the rescale retry (loglik 447.07).
+    assert m.diagnostics["boundary"] == "interior"
+    assert [w["kind"] for w in m.warnings] == ["precision_limited"]
+    entry = only(m, "precision_limited")
+    assert (entry["tier"], entry["title"]) == ("caution", "Numbers too large for full precision")
     assert entry["message"] == (
-        "A random-effect parameter reached the upper limit of the search (1000 on glmm's "
-        "internal scale). On a Gaussian model this usually means the residual variance is "
-        "estimated at or near zero; on other families the random-effect variance has no "
-        "finite estimate. The estimates are at that limit, not at an optimum. Check for a "
-        "response that the predictors and groups explain exactly."
+        "The numbers in this fit are so large that rounding in the computer's arithmetic "
+        "hides small changes in its deviance. The random-effect estimates, and the fixed "
+        "effects that depend on them, may be off by a tenth of a standard error or more. "
+        "This happens with counts in the billions or more, or when a model misses a large "
+        "effect in such data; on a Gaussian model, with a response far from zero next to its "
+        "residual spread (subtract a constant from it), or with weights spanning many orders "
+        "of magnitude."
     )
     assert printed(entry) in [str(w.message) for w in caught]
 

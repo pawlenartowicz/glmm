@@ -166,7 +166,8 @@
 #'   read. `FALSE` skips them, which saves up to about the time of the fit
 #'   itself on a crossed model with many levels: `ranef()` then leaves
 #'   `postVar` off, and `ranef(fit, condVar = TRUE)` and such a `predict()` are
-#'   errors.
+#'   errors. `FALSE` also lets a Gaussian model with a large crossed grouping
+#'   use the sparse solver, which can be faster.
 #' @param REML `NULL` (the default), `TRUE` or `FALSE`; `$reml` reports the
 #'   value used. A Gaussian mixed model is fitted by REML under `NULL` and
 #'   `TRUE` and by maximum likelihood under `FALSE`. A Gaussian model with no

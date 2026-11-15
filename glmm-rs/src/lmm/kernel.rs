@@ -1219,7 +1219,8 @@ const WITHIN_RESIDUAL_MIN: f64 = 1e-11;
 pub(crate) fn precompute_group_regressions(suff: &LmmSuffStats, fit: &mut LmmFitScratch) -> bool {
     fit.pg_n_active = 0;
     let g = &suff.groupings;
-    if fit.pg_b.is_empty() || suff.n_rows == 0 || !group_regression_shape(g) {
+    // The QR kernel searches with BOBYQA: no route is armed while it is on.
+    if fit.pg_b.is_empty() || suff.n_rows == 0 || !group_regression_shape(g) || fit.qr_on() {
         return false;
     }
     let q = g.primary_q;
@@ -1973,21 +1974,25 @@ pub fn reml_deviance(theta: &[f64], suff: &LmmSuffStats, fit: &mut LmmFitScratch
             // via the shared kernel in `crate::linalg::block_chol` (zero-alloc;
             // false on a non-positive pivot, mapped to +INFINITY here — the
             // module's failure surface). Chains are ≤ w links — not chain-sick.
-            // Pivots are multiplied into a per-family product (≤ w ≈ 9 terms,
-            // each ≥ 1 since A_f's diagonal is 1.0 + θ²·n) and logged once
-            // after the loop instead of once per pivot — log(∏l) = Σln(l),
-            // same value, ~w× fewer .ln() calls. Must NOT accumulate this
-            // product across the outer `f` loop: with ~60 families and θ up
-            // to THETA_HI (1e3) during BOBYQA exploration, a global product
-            // over ~480 terms can overflow f64 to +Infinity where the
-            // per-family scoping (bounded product, reset each family) stays
-            // finite.
+            // Pivots are multiplied into a per-family product (each ≥ 1 since
+            // A_f's diagonal is 1.0 + θ²·n) and logged once after the loop
+            // instead of once per pivot — log(∏l) = Σln(l), same value, ~w×
+            // fewer .ln() calls. The product is logged and restarted whenever
+            // it passes 1e150, so it stays finite for any family width (a
+            // padded nested family is as wide as its widest parent, and θ runs
+            // up to THETA_HI (1e3) during BOBYQA exploration); a family whose
+            // product never passes 1e150 takes exactly one .ln(). For the same
+            // reason the product is never carried across the outer `f` loop.
             if !crate::linalg::block_chol(&mut fit.fam_a[..w * w], w) {
                 return f64::INFINITY;
             }
             let mut fam_prod = 1.0;
             for j in 0..w {
                 fam_prod *= fit.fam_a[j * w + j];
+                if fam_prod > 1e150 {
+                    log_lzz_half += fam_prod.ln();
+                    fam_prod = 1.0;
+                }
             }
             log_lzz_half += fam_prod.ln();
             // B_f (rows = Bt columns f·w..f·w+w, each contiguous): cols [crossed | X y],

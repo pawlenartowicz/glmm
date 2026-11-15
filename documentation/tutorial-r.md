@@ -308,6 +308,7 @@ text, pull the attributes `VarCorr()` hangs on each block:
 vc <- VarCorr(fit)
 attr(vc$group, "stddev")       # per-term random-effect standard deviations
 attr(vc$group, "correlation")  # their correlation matrix
+as.data.frame(vc)              # lme4's long table: grp, var1, var2, vcov, sdcor
 ```
 
 **Tests: `anova()` and `compare()`.** `anova(fit)` tests each fixed term of

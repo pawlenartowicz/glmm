@@ -123,8 +123,8 @@ Points worth knowing at this layer:
   `re.slopes.len() + 1 <= 8` (primary width), up to 6 extra groupings, and
   `slopes.len() + 1 <= 4` per extra grouping (`glmm::limits::{MAX_PRIMARY_Q,
   MAX_EXTRA_GROUPINGS, MAX_EXTRA_Q}`).
-  Within that envelope, a **Gaussian** extra grouping that carries a random slope is routed internally to a sparse solver instead (still just works — no API change), unless it is the only grouping with a random slope and moving it first leaves at most 500 crossed levels: then it is fitted as if written first, on the dense solver.
-  Outside the envelope, a mixed model with an extra grouping carrying a random slope, or a design with too many crossed levels, is likewise routed to the sparse solver automatically, unless moving its only slope grouping first (as above) brings it inside: a slope block up to 8 wide fits as a primary grouping. Every family fits either way, with no reachable panic.
+  Within that envelope, a **Gaussian** extra grouping that carries a random slope is routed internally to a sparse solver instead (still just works — no API change). Which grouping comes first is the fit's choice, not the order you write them in: the grouping with the most random-effect columns (levels × (1 + slopes)) goes first, and a GLMM, or a Gaussian model fitted with `condvar` on, puts first a grouping that keeps the model on the dense solver when one does. So a lone slope grouping often goes first and fits on the dense solver.
+  Outside the envelope, a mixed model with an extra grouping carrying a random slope, or a design with too many crossed levels, is likewise routed to the sparse solver automatically. Every family fits either way, with no reachable panic.
 
 **Degrees of freedom and contrasts.** A Gaussian mixed fit also carries
 lmerTest's Satterthwaite degrees of freedom: one derivative pass after the

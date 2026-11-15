@@ -108,7 +108,8 @@ and a conditional \link[=predict.fastglmm]{predict()} with \code{se.fit} or \cod
 read. \code{FALSE} skips them, which saves up to about the time of the fit
 itself on a crossed model with many levels: \code{ranef()} then leaves
 \code{postVar} off, and \code{ranef(fit, condVar = TRUE)} and such a \code{predict()} are
-errors.}
+errors. \code{FALSE} also lets a Gaussian model with a large crossed grouping
+use the sparse solver, which can be faster.}
 
 \item{REML}{\code{NULL} (the default), \code{TRUE} or \code{FALSE}; \verb{$reml} reports the
 value used. A Gaussian mixed model is fitted by REML under \code{NULL} and
