@@ -74,8 +74,11 @@ pub const MAX_NAGQ: u8 = 25;
 pub const MAX_DATA_ABS: f64 = 1e100;
 
 /// The largest |offset| on a log link (Poisson, negative binomial, Gamma and
-/// inverse-Gaussian log): `e^709.8` overflows.
-pub const MAX_LOG_OFFSET_ABS: f64 = 700.0;
+/// inverse-Gaussian log). An offset is the log of an exposure, and
+/// `e^230 ≈ 7.7e99` keeps that exposure inside [`MAX_DATA_ABS`]. It leaves 470
+/// below the log links' clamp on η (700, under the overflow at `e^709.8`) for
+/// `Xβ + Zb`, so a valid offset does not put its row past the clamp.
+pub const MAX_LOG_OFFSET_ABS: f64 = 230.0;
 
 /// 2⁵³, the largest binomial weight (trial count): above it consecutive
 /// integers are not exact in f64.

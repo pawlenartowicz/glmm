@@ -526,10 +526,10 @@ fn weights_outside_their_interval_are_refused() {
     assert_eq!(ran, 2);
 }
 
-/// On a log link the offset is bounded by `MAX_LOG_OFFSET_ABS`, where `e^η`
-/// would overflow; the same offset on the identity link passes.
+/// On a log link the offset is bounded by `MAX_LOG_OFFSET_ABS`; the same
+/// offset on the identity link passes.
 #[test]
-fn an_offset_on_a_log_link_is_bounded_by_700() {
+fn an_offset_on_a_log_link_is_bounded() {
     let (x, y, gaussian) = shape_check_fixture();
     let v = MAX_LOG_OFFSET_ABS + 1.0;
     let o = [0.0, v, 0.0, 0.0];

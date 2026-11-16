@@ -464,12 +464,7 @@ pub(super) fn lmm_fit_with_retries(
             break;
         };
         let k = t.log2().round() as i32;
-        // A step that puts the largest component past the box cannot reach
-        // its optimum, so the round would only be undone.
-        let top = (ws.kernel.groupings().diagonal_theta().iter())
-            .map(|&i| ws.theta[i].abs())
-            .fold(0.0, f64::max);
-        if k == 0 || top * 2f64.powi(-k) > crate::lmm::THETA_HI {
+        if k == 0 {
             break;
         }
         let (prev_dev, prev_s, prev_exp) = (caller_dev(&fit, units), units.s(), ws.rescale_exp);

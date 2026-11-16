@@ -550,8 +550,8 @@ test_that("an input outside its range is refused with the limit name", {
   expect_error(fastglmm(y ~ x, d, weights = at_row_3(1, 1e-101)),
                "Data weights must be within [1e-100, 1e100] (row 3, value 1e-101; glmm::limits::MAX_DATA_ABS)",
                fixed = TRUE)
-  expect_error(fastglmm(k ~ x, d, family = poisson(), offset = at_row_3(0, 701)),
-               "Data offset must be finite with |offset| <= 7e2 on this link (row 3, value 7.01e2; glmm::limits::MAX_LOG_OFFSET_ABS)",
+  expect_error(fastglmm(k ~ x, d, family = poisson(), offset = at_row_3(0, 231)),
+               "Data offset must be finite with |offset| <= 2.3e2 on this link (row 3, value 2.31e2; glmm::limits::MAX_LOG_OFFSET_ABS)",
                fixed = TRUE)
   expect_error(fastglmm(p ~ x, d, family = binomial(), weights = at_row_3(2, 2^54)),
                "binomial weights (trial counts) must be <= 9.007199254740992e15 (row 3, value 1.8014398509481984e16; glmm::limits::MAX_TRIALS)",

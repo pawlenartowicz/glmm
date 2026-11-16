@@ -355,10 +355,10 @@ def _at_row_2(fill, value):
             _RANGE_DATA,
             "k ~ x",
             "poisson",
-            {"offset": _at_row_2(0.0, 701.0)},
-            "Data offset must be finite with |offset| <= 7e2 on this link (row 2, value 7.01e2; "
+            {"offset": _at_row_2(0.0, 231.0)},
+            "Data offset must be finite with |offset| <= 2.3e2 on this link (row 2, value 2.31e2; "
             "glmm::limits::MAX_LOG_OFFSET_ABS)",
-            id="log_offset_past_700",
+            id="log_offset_past_230",
         ),
         pytest.param(
             _RANGE_DATA,
