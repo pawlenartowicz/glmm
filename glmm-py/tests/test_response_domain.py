@@ -1,4 +1,4 @@
-"""Dispersion-value validation (src/orchestrate.rs).
+"""Dispersion-value validation (glmm-rs/src/orchestrate.rs).
 
 The check lives in Rust; `fit()` does no pre-check of its own, so every case
 here surfaces as a `ValueError` from `_native.call("fit", ...)`.

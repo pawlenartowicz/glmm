@@ -19,6 +19,7 @@ use std::cmp::Reverse;
 use faer::{Mat, MatRef};
 
 use super::materialize::Lowered;
+use crate::inference::cr2::mul;
 use crate::inference::evd::sym_eigen;
 use crate::linalg::SeqLlt;
 
@@ -333,7 +334,9 @@ pub(crate) fn type3_null_basis(
             .sum::<f64>()
             .sqrt()
     };
-    let resid = frobenius((&e * &null).as_ref());
+    // `mul` runs at `Par::Seq`; the product operator reads faer's global
+    // parallelism, which starts rayon's global pool on a native build.
+    let resid = frobenius(mul(e.as_ref(), null.as_ref()).as_ref());
     if !resid.is_finite() || resid > NULL_CHECK_REL * frobenius(e.as_ref()) {
         return Err(ReducedDesignError::NoNullBasis);
     }

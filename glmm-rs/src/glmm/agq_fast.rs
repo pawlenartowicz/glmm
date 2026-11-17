@@ -824,7 +824,9 @@ pub(crate) fn probit_sums(
 /// table (z-vector, then the summed Liu–Pierce reweight). Row constants are
 /// laid out in the CSR order of `idx`, so a cluster's rows are contiguous;
 /// its node shifts are evaluated a tile at a time (several nodes per tile on
-/// a small cluster).
+/// a small cluster). With `parallel` set the clusters split over rayon under
+/// the `parallel` feature; otherwise, and in any other build, they run serially.
+/// Each cluster writes only its own slot, so both loops give the same bits.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn vector_sums(
     kind: Kind,
@@ -846,6 +848,7 @@ pub(crate) fn vector_sums(
     rows_buf: &mut Vec<f64>,
     sum: &mut [f64],
     idx: &ClusterRowIndex,
+    parallel: bool,
 ) {
     let s = sum.len();
     let qz = q - 1;
@@ -1017,14 +1020,16 @@ pub(crate) fn vector_sums(
         *sum_c = acc_sum;
     };
     #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
-    {
+    if parallel {
         use rayon::prelude::*;
         sum[..s]
             .par_iter_mut()
             .enumerate()
             .for_each(|(c, sc)| per_cluster(c, sc));
+        return;
     }
     #[cfg(not(all(feature = "parallel", not(target_arch = "wasm32"))))]
+    let _ = parallel;
     for (c, sc) in sum[..s].iter_mut().enumerate() {
         per_cluster(c, sc);
     }

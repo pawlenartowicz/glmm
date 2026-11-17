@@ -4317,15 +4317,21 @@ fn a_triggered_fit_on_slopes_and_nesting_matches_a_householder_reference() {
     assert_eq!(checked, 8);
 }
 
-/// Keep-lower undoes a worse rescale round. On the ports' PARITY fixture
-/// (`y ~ z + (1 + z | g)`, z near 1e4, y exact in z and g, so no finite
-/// optimum) the first rescale round (k = 10) is kept and moves the fit to
-/// the QR kernel; the second (k = 10 again, the intercept's θ̂ still on the
-/// box) ends worse in caller units, so it is undone and the fit ends at the
-/// first round's scale. The test repeats that second round by hand at the
-/// fit's endpoint and checks it is worse than where the fit ended.
+/// A rescale round searches from exactly the last round's θ̂·2^−k, so it
+/// starts at the last round's criterion. On the ports' PARITY fixture
+/// (`y ~ z + (1 + z | g)`, z near 1e4, y linear in z and g up to the
+/// rounding of its stored values) the intercept's θ̂ is on the box after the
+/// first round (k = 10), and the second round (k = 10 again) reaches the
+/// optimum that rounding leaves, inside the box, 6.63 lower in caller units
+/// natively and under WebAssembly with and without simd128 (measured
+/// 2026-11-16). Raising the pinned slope diagonal to `THETA_TRUTH_FLOOR` at a
+/// round's start would end the second round a few units above or below the
+/// first with the platform's round-off, and the fit's notes would change with it.
+/// The test refits at the first round's scale by hand, warm from θ̂·2^10
+/// (past the box, so on it), and checks that the fit ended lower than that
+/// by more than both rounding estimates.
 #[test]
-fn a_worse_rescale_round_is_undone() {
+fn a_rescale_round_starts_at_the_last_endpoint() {
     let n = 40;
     let (mut x, mut y, mut g) = (Vec::new(), Vec::new(), Vec::new());
     for gi in 0..5u32 {
@@ -4340,23 +4346,33 @@ fn a_worse_rescale_round_is_undone() {
     let model = ModelSpec::mixed(Family::Gaussian, ReStructure::intercept().slopes([1]));
     let data = Data::new(&x, &y, n, 2).ids(&ids);
     let (fit, mut fws) = super::fit_keep_workspace(&data, &model, None, &FitOptions::default());
-    assert!(fit.converged());
+    assert!(fit.converged() && fit.singular());
+    assert!(
+        !fit.diagnostics
+            .notes
+            .iter()
+            .any(|n| matches!(n, Note::VarianceAtLimit)),
+        "notes: {:?}",
+        fit.diagnostics.notes
+    );
+    let e = fws.lmm_endpoint_precision();
     let (ws, _, units) = fws.lmm_parts().unwrap();
     assert!(ws.kernel.qr_on());
-    assert_eq!(ws.rescale_exp, 10, "the fit ends at the kept round's scale");
+    assert_eq!(ws.rescale_exp, 20, "the second round is kept");
     let theta = ws.theta.clone();
     let s = units.s();
     let kept = ws.kernel.deviance(&theta) + n as f64 * s.ln();
-    let w_next = vec![4f64.powi(10) / s; n];
+    let w_back = vec![4f64.powi(-10) / s; n];
 
-    // The undone round: s·4^−10, warm from θ̂·2^−10.
-    fws.lmm_accumulate(&data, Some(&w_next));
+    // The first round's scale: s·4^10, warm from θ̂·2^10.
+    fws.lmm_accumulate(&data, Some(&w_back));
     let (ws, map, _) = fws.lmm_parts().unwrap();
-    let warm: Vec<f64> = theta.iter().map(|t| t * 2f64.powi(-10)).collect();
-    let next = crate::lmm::fit_lmm_unhinted(ws, &[], Some(&warm), map);
-    let undone = next.deviance + n as f64 * (s * 4f64.powi(-10)).ln();
+    let warm: Vec<f64> = theta.iter().map(|t| t * 2f64.powi(10)).collect();
+    let back = crate::lmm::fit_lmm_unhinted(ws, &[], Some(&warm), map);
+    let e_back = ws.kernel.r_sq_floor() / back.sigma_sq + back.pivot_noise;
+    let at_back = back.deviance + n as f64 * (s * 4f64.powi(10)).ln();
     assert!(
-        kept < undone,
-        "kept {kept} against the undone round's {undone}"
+        kept < at_back - (e + e_back),
+        "kept {kept} against {at_back} at the first round's scale (E {e:e}, {e_back:e})"
     );
 }

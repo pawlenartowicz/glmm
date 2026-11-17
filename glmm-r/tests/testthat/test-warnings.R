@@ -268,31 +268,49 @@ PARITY <- local({
              g = factor(g, levels = c("g0", "g1", "g2", "g_mid", "g3", "g4")))
 })
 
-test_that("port parity sequence adds four more kinds", {
+test_that("port parity sequence adds three more kinds", {
   fit <- suppressWarnings(fastglmm(y ~ z + (1 + z | g), PARITY, dispersion = 2, nAGQ = 3))
   expect_true(fit$converged)
-  # satterthwaite_curvature added by the rescale retry (loglik 311.47 to 547.14).
-  expect_identical(fit$warnings$tier, c("note", "note", "caution", "caution", "caution"))
+  # satterthwaite_curvature added by the rescale retry (loglik 311.47 to 550.45).
+  expect_identical(fit$warnings$tier, c("note", "note", "caution", "caution"))
   expect_identical(fit$warnings$kind, c(
-    "argument_ignored", "argument_ignored", "singular", "variance_at_limit",
-    "satterthwaite_curvature"
+    "argument_ignored", "argument_ignored", "singular", "satterthwaite_curvature"
   ))
   expect_identical(fit$warnings$title, c(
-    "Argument ignored", "Argument ignored", "Singular fit", "Variance at its search limit",
-    "Satterthwaite df uncertain"
+    "Argument ignored", "Argument ignored", "Singular fit", "Satterthwaite df uncertain"
   ))
-  expect_identical(only(fit, "variance_at_limit")$message, paste(
+})
+
+test_that("port parity variance_at_limit", {
+  # Same fixture and call in glmm-py/tests/test_warnings.py - change together.
+  # Mirrors the Rust unit test glmm_theta_on_its_upper_limit_is_reported_not_interior
+  # (glmm-rs/src/fit/glmm_tests.rs): y is 0, 1, 0, 1 in each of 4 groups with group offsets
+  # of +1500 and -1500, which the random effects cancel at an SD near 1500, past the
+  # search limit.
+  i <- 0:15
+  d <- data.frame(y = as.numeric(i %% 2), g = factor(sprintf("g%d", i %/% 4L)),
+                  o = ifelse((i %/% 4L) %% 2L == 0L, 1500, -1500))
+  res <- fit_catching(fastglmm(y ~ 1 + (1 | g), d, family = "binomial", offset = o),
+                      "fastglmm_variance_at_limit")
+  expect_false(is.null(res$cond))
+  expect_true(res$fit$converged)
+  expect_identical(res$fit$diagnostics$boundary, "upper_limit")
+  expect_identical(res$fit$warnings$kind, "variance_at_limit")
+  row <- only(res$fit, "variance_at_limit")
+  expect_identical(c(row$tier, row$title), c("caution", "Variance at its search limit"))
+  expect_identical(row$message, paste(
     "A random-effect parameter reached the upper limit of the search (1000 on glmm's",
     "internal scale). On a Gaussian model this usually means the residual variance is",
     "estimated at or near zero; on other families the random-effect variance has no",
     "finite estimate. The estimates are at that limit, not at an optimum. Check for a",
     "response that the predictors and groups explain exactly."))
+  expect_identical(conditionMessage(res$cond), printed(row))
 })
 
 test_that("port parity non_integer_response", {
   # Same fixture and call in glmm-py/tests/test_warnings.py - change together.
   # Intercept-only Poisson, mirrors the Rust unit test
-  # poisson_non_integer_response_is_noted (src/fit/common_tests.rs).
+  # poisson_non_integer_response_is_noted (glmm-rs/src/fit/common_tests.rs).
   d <- data.frame(y = c(1, 2.5, 3, 4))
   expect_warning(fit <- fastglmm(y ~ 1, d, family = "poisson"), "not a whole number")
   expect_true(fit$converged)

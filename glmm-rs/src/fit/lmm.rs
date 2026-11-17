@@ -292,7 +292,7 @@ pub(crate) fn lmm_run_on<'a>(
     map: &'a ColumnScaling,
     units: &'a Units,
 ) -> LmmResultView<'a> {
-    let fit = fit_lmm(ws, target_indices, theta_start, hint, map, units);
+    let fit = fit_lmm(ws, target_indices, theta_start, false, hint, map, units);
     lmm_view(ws, fit, map, units)
 }
 
@@ -375,14 +375,17 @@ const MAX_RESCALES: usize = 4;
 /// 3. Rescale: while a diagonal θ̂ is on the box or a pin was undone
 ///    ([`rescale_trigger`], `t`), at most [`MAX_RESCALES`] times, move `s` to
 ///    `s·4^−k`, `k = round(log₂ t)`, so ŵ becomes `ŵ·4^k` and θ̂ `θ̂·2^−k`
-///    exactly, re-accumulate and search warm from `θ̂·2^−k`. θ's search
-///    constants are absolute on the kernel θ, whose scale follows `s`; this
-///    brings the triggering θ̂ near 1. Keep-lower: a round whose criterion in
-///    caller units, `deviance + n·ln s`, is worse than the round before it is
-///    undone (that round's `s` restored, re-accumulated and searched warm from
-///    its θ̂), and the loop stops. The restored search pins again, so "never
-///    worse" holds to `PIN_DEVIANCE_SLACK`. After each kept round on the Gram
-///    kernel, step 2 runs again.
+///    exactly, re-accumulate and search warm from exactly `θ̂·2^−k`, with no
+///    `THETA_TRUTH_FLOOR`, so the round starts at the last round's criterion.
+///    θ's search constants are absolute on the kernel θ, whose scale follows
+///    `s`; this brings the triggering θ̂ near 1. Keep-lower: a round whose
+///    criterion in caller units, `deviance + n·ln s`, is above the round
+///    before it by more than both endpoints' rounding estimates
+///    (`r_sq_floor/σ̂² + pivot_noise` each), or is not finite, is undone (that
+///    round's `s` restored, re-accumulated and searched again from exactly its
+///    θ̂), and the loop stops. The restored search starts at that θ̂ and pins
+///    again, so "never worse" holds to `PIN_DEVIANCE_SLACK`. After each kept
+///    round on the Gram kernel, step 2 runs again.
 ///
 /// `n_eval` is the sum over every search; the `counters` feature reports the
 /// last search's counts. `ws.rescale_exp` and the QR switch are left as the
@@ -422,11 +425,15 @@ pub(super) fn lmm_fit_with_retries(
     };
     // The criterion in caller units, up to the constant −Σ ln w.
     let caller_dev = |fit: &LmmFit, units: &Units| fit.deviance + n as f64 * units.s().ln();
+    // The deviance's rounding at the fit's endpoint (`precision_limited` over σ̂²).
+    let rounding =
+        |ws: &LmmWorkspace, fit: &LmmFit| ws.kernel.r_sq_floor() / fit.sigma_sq + fit.pivot_noise;
     // A warm search from `ws.theta_warm`, moved out so `fit_lmm` can borrow
-    // the workspace and put back after, so no round allocates.
-    let search_warm = |ws: &mut LmmWorkspace, units: &Units, spent: &mut usize| {
+    // the workspace and put back after, so no round allocates; `exact` as
+    // `fit_lmm` takes it.
+    let search_warm = |ws: &mut LmmWorkspace, units: &Units, spent: &mut usize, exact: bool| {
         let warm = std::mem::take(&mut ws.theta_warm);
-        let fit = fit_lmm(ws, targets, Some(&warm), None, map, units);
+        let fit = fit_lmm(ws, targets, Some(&warm), exact, None, map, units);
         ws.theta_warm = warm;
         *spent += fit.n_eval;
         fit
@@ -446,14 +453,14 @@ pub(super) fn lmm_fit_with_retries(
                 units.weights(weights),
             );
             ws.theta_warm.copy_from_slice(&ws.theta);
-            *fit = search_warm(ws, units, spent);
+            *fit = search_warm(ws, units, spent, false);
         }
     };
 
     ws.kernel.stop_qr();
     ws.rescale_exp = 0;
     accumulate(ws, units, same_design);
-    let mut fit = fit_lmm(ws, targets, theta_start, hint, map, units);
+    let mut fit = fit_lmm(ws, targets, theta_start, false, hint, map, units);
     let mut spent = fit.n_eval;
     qr_switch(ws, units, &mut fit, &mut spent);
     for _ in 0..MAX_RESCALES {
@@ -464,10 +471,17 @@ pub(super) fn lmm_fit_with_retries(
             break;
         };
         let k = t.log2().round() as i32;
-        if k == 0 {
+        // A step that puts the largest component past the box searches only
+        // a corner of it that excludes θ̂; such a round moves the deviance by
+        // round-off at most.
+        let top = (ws.kernel.groupings().diagonal_theta().iter())
+            .map(|&i| ws.theta[i].abs())
+            .fold(0.0, f64::max);
+        if k == 0 || top * 2f64.powi(-k) > crate::lmm::THETA_HI {
             break;
         }
         let (prev_dev, prev_s, prev_exp) = (caller_dev(&fit, units), units.s(), ws.rescale_exp);
+        let prev_e = rounding(ws, &fit);
         ws.theta_prev.copy_from_slice(&ws.theta);
         units.set_weight_scale(weights, n, prev_s * 4f64.powi(-k));
         ws.rescale_exp += k;
@@ -476,14 +490,17 @@ pub(super) fn lmm_fit_with_retries(
         for (w, &t) in ws.theta_warm.iter_mut().zip(&ws.theta) {
             *w = t * theta_step;
         }
-        fit = search_warm(ws, units, &mut spent);
+        fit = search_warm(ws, units, &mut spent, true);
         let now = caller_dev(&fit, units);
-        if prev_dev.is_finite() && (now.is_nan() || now > prev_dev) {
+        // The round starts at the last criterion, so a difference inside the
+        // rounding is round-off and must not decide it. False on a NaN `now`.
+        let no_worse = now <= prev_dev + prev_e + rounding(ws, &fit);
+        if !no_worse {
             units.set_weight_scale(weights, n, prev_s);
             ws.rescale_exp = prev_exp;
             accumulate(ws, units, false);
             std::mem::swap(&mut ws.theta_warm, &mut ws.theta_prev);
-            fit = search_warm(ws, units, &mut spent);
+            fit = search_warm(ws, units, &mut spent, true);
             break;
         }
         qr_switch(ws, units, &mut fit, &mut spent);

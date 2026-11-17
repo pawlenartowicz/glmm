@@ -35,6 +35,8 @@ shares these entries; Python-specific notes are called out where they differ.
 ### Fixed
 
 - A Gamma GLMM on the inverse link warm-started from a β its search could not leave, such as 1e10 times the estimate, ended with NaN estimates. It is now searched again from the cold start, as on the other families.
+- A mixed-model warm start with a variance parameter past its search limit is moved onto the limit before the gradient search starts, as the derivative-free search already did. Before, the gradient search started outside the limit and could end there.
+- Likelihood-ratio term tables no longer start rayon's global thread pool, so the Python and R packages run them on one thread. In a `parallel` build with `FitOptions::parallel_inner = false`, a vector AGQ fit's deviance evaluations no longer run on rayon; its default `WaldSe::Hessian` standard errors still do. Results are unchanged.
 
 ## [0.9.2] — 2026-11-13
 

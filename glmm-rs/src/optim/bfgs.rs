@@ -367,7 +367,8 @@ fn all_finite(v: &[f64]) -> bool {
     v.iter().all(|x| x.is_finite())
 }
 
-/// Projected BFGS from `x` within `[lo, hi]`; on return `x` holds the
+/// Projected BFGS from `x` within `[lo, hi]`, a start outside the box first
+/// projected onto it, as BOBYQA projects its own; on return `x` holds the
 /// incumbent. Evaluates at full tolerance (`resolution` 0) throughout.
 /// `h0`, a row-major `n×n` inverse Hessian (a caller's
 /// [`CurvatureHint`](super::CurvatureHint)), replaces the identity start: no
@@ -427,6 +428,9 @@ fn bfgs_run(
         stop: BfgsStop::MaxIter,
         decrement: f64::INFINITY,
     };
+    for i in 0..n {
+        x[i] = x[i].clamp(lo[i], hi[i]);
+    }
     let mut fk = match obj.value(x, 0.0) {
         Some(v) if v.is_finite() => v,
         _ => {

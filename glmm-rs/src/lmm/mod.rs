@@ -2969,7 +2969,9 @@ fn lmm_outer_optimizer(kernel: &LmmKernel, n_theta: usize) -> crate::optim::Oute
 /// THETA_TRUTH_FLOOR and off-diagonals passed through verbatim. A
 /// per-scenario constant — determinism and chunk merging are unaffected. The
 /// DGP-derived hint is a deliberate, recorded exception to the
-/// generation↔estimation split.
+/// generation↔estimation split. `exact` skips that floor: the start is a
+/// previous endpoint (the rescale rounds of `fit::lmm::lmm_fit_with_retries`),
+/// so the search starts at that endpoint's deviance.
 ///
 /// `map` is the column standardization the rows were accumulated under, and
 /// `units` the units of their response: β̂, `var_diag`, `t_sq` and the joint
@@ -2984,6 +2986,7 @@ pub fn fit_lmm(
     ws: &mut LmmWorkspace,
     target_indices: &[u32],
     theta_start: Option<&[f64]>,
+    exact: bool,
     hint: Option<&crate::optim::CurvatureHint>,
     map: &ColumnScaling,
     units: &Units,
@@ -3016,9 +3019,9 @@ pub fn fit_lmm(
     }
 
     // A Some-start is clamped to the floor on its diagonal coordinates only
-    // (off-diagonals pass through verbatim) and searched by `solver_warm`, at
-    // `RHO_BEGIN_WARM`; the blind start by `solver`, at `RHO_BEGIN`
-    // (`search_theta`).
+    // (off-diagonals pass through verbatim; no floor when `exact`) and
+    // searched by `solver_warm`, at `RHO_BEGIN_WARM`; the blind start by
+    // `solver`, at `RHO_BEGIN` (`search_theta`).
     match theta_start {
         Some(ts) => {
             debug_assert_eq!(ts.len(), theta.len());
@@ -3028,8 +3031,10 @@ pub fn fit_lmm(
             for (t, &v) in theta.iter_mut().zip(ts) {
                 *t = v;
             }
-            for &i in kernel.groupings().diagonal_theta() {
-                theta[i] = theta[i].max(THETA_TRUTH_FLOOR);
+            if !exact {
+                for &i in kernel.groupings().diagonal_theta() {
+                    theta[i] = theta[i].max(THETA_TRUTH_FLOOR);
+                }
             }
         }
         None => {
@@ -3280,5 +3285,13 @@ pub(crate) fn fit_lmm_unhinted(
     theta_start: Option<&[f64]>,
     map: &ColumnScaling,
 ) -> LmmFit {
-    fit_lmm(ws, target_indices, theta_start, None, map, Units::IDENTITY)
+    fit_lmm(
+        ws,
+        target_indices,
+        theta_start,
+        false,
+        None,
+        map,
+        Units::IDENTITY,
+    )
 }

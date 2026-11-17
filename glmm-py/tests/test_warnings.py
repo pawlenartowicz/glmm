@@ -321,11 +321,11 @@ def test_too_few_rows_end_to_end():
     )
 
 
-def test_port_parity_sequence_adds_four_more_kinds():
+def test_port_parity_sequence_adds_three_more_kinds():
     # Same PARITY fixture and call in glmm-r/tests/testthat/test-warnings.R —
     # change together. argument_ignored fires twice, from two different
-    # arguments, plus the fit's own singular, variance_at_limit and
-    # satterthwaite_curvature cautions.
+    # arguments, plus the fit's own singular and satterthwaite_curvature
+    # cautions.
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         m = glmm.fit(PARITY, "y ~ z + (1 + z | g)", dispersion=2.0, nagq=3)
@@ -334,23 +334,43 @@ def test_port_parity_sequence_adds_four_more_kinds():
         ("note", "argument_ignored", "Argument ignored"),
         ("note", "argument_ignored", "Argument ignored"),
         ("caution", "singular", "Singular fit"),
-        ("caution", "variance_at_limit", "Variance at its search limit"),
-        # Added by the rescale retry (loglik 311.47 to 547.14): a Hessian direction drops as flat.
+        # Added by the rescale retry (loglik 311.47 to 550.45): a Hessian direction drops as flat.
         ("caution", "satterthwaite_curvature", "Satterthwaite df uncertain"),
     ]
-    assert only(m, "variance_at_limit")["message"] == (
+
+
+def test_port_parity_variance_at_limit():
+    # Same fixture and call in glmm-r/tests/testthat/test-warnings.R - change together.
+    # Mirrors the Rust unit test glmm_theta_on_its_upper_limit_is_reported_not_interior
+    # (glmm-rs/src/fit/glmm_tests.rs): y is 0, 1, 0, 1 in each of 4 groups with group offsets
+    # of +1500 and -1500, which the random effects cancel at an SD near 1500, past the
+    # search limit.
+    data = {
+        "y": [float(i % 2) for i in range(16)],
+        "g": [f"g{i // 4}" for i in range(16)],
+    }
+    off = [1500.0 if (i // 4) % 2 == 0 else -1500.0 for i in range(16)]
+    with pytest.warns(glmm.VarianceAtLimitWarning) as caught:
+        m = glmm.fit(data, "y ~ 1 + (1 | g)", "binomial", offset=off)
+    assert m.converged
+    assert m.diagnostics["boundary"] == "upper_limit"
+    assert [w["kind"] for w in m.warnings] == ["variance_at_limit"]
+    entry = only(m, "variance_at_limit")
+    assert (entry["tier"], entry["title"]) == ("caution", "Variance at its search limit")
+    assert entry["message"] == (
         "A random-effect parameter reached the upper limit of the search (1000 on glmm's "
         "internal scale). On a Gaussian model this usually means the residual variance is "
         "estimated at or near zero; on other families the random-effect variance has no "
         "finite estimate. The estimates are at that limit, not at an optimum. Check for a "
         "response that the predictors and groups explain exactly."
     )
+    assert printed(entry) in [str(w.message) for w in caught]
 
 
 def test_port_parity_non_integer_response():
     # Same fixture and call in glmm-r/tests/testthat/test-warnings.R — change
     # together. Intercept-only Poisson, mirrors the Rust unit test
-    # poisson_non_integer_response_is_noted (src/fit/common_tests.rs).
+    # poisson_non_integer_response_is_noted (glmm-rs/src/fit/common_tests.rs).
     with pytest.warns(glmm.NonIntegerResponseWarning, match="not a whole number"):
         m = glmm.fit({"y": [1.0, 2.5, 3.0, 4.0]}, "y ~ 1", "poisson")
     assert m.converged

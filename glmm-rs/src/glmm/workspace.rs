@@ -926,17 +926,18 @@ pub struct GlmmWorkspace {
     pub nagq: u8,
     /// FitOptions::parallel_inner, copied per fit by the fit.rs adapter (the
     /// nb_theta pattern). Runtime gate for the parallel kernels in `parallel`
-    /// builds: when false — or in any serial build — the per-fit
-    /// ClusterRowIndex is never built, agq_deviance runs the original
-    /// node-outer loop, and the FD-Hessian grids stay serial; a batch caller
-    /// pays nothing.
+    /// builds: when false the fit hands no ClusterRowIndex to the AGQ kernels,
+    /// so scalar AGQ runs the node-outer loop and vector AGQ its serial
+    /// cluster loop, and the FD-Hessian grids stay serial.
     pub parallel_inner: bool,
     /// Per-cluster row CSR for the cluster-outer AGQ loop — rayon's
     /// work-splitting substrate. Built once per fit in fit_glmm (cluster_ids
-    /// is fit-fixed) iff the `parallel` feature is compiled in AND
-    /// `nagq > 1 && parallel_inner`; None otherwise. Serial builds are always
-    /// node-outer: cluster-outer serially regresses many-tiny-cluster shapes
-    /// (see the build site in fit_glmm).
+    /// is fit-fixed) when the `parallel` feature is compiled in and
+    /// `nagq > 1 && parallel_inner`, where `Some` selects the rayon arms. A
+    /// build without `parallel` builds it for vector AGQ only, which is
+    /// cluster-outer on every build; its scalar AGQ stays node-outer, because
+    /// cluster-outer serially regresses many-tiny-cluster shapes (see the
+    /// build site in fit_glmm). None otherwise.
     pub(crate) cluster_rows: Option<super::agq::ClusterRowIndex>,
     /// The exact AGQ gradient's row index and buffers, shared by the gradient
     /// route's search (`fit_glmm`) and the SE step's gradient-difference

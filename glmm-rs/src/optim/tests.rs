@@ -78,6 +78,30 @@ fn bfgs_solves_a_quadratic_and_certifies() {
     assert!(out.certified(&x, &[0, 2]), "{out:?}");
 }
 
+/// A start outside the box is projected onto it before the first value.
+/// From x = 3 on `(x − 5)²` over `[0, 1]`, unprojected, the start counts as
+/// held on its upper bound (x ≥ 1 with a negative gradient), so the search
+/// stops there at once, outside the box and below every value inside it.
+#[test]
+fn bfgs_projects_a_start_outside_the_box() {
+    let mut obj = closed(
+        |x: &[f64]| (x[0] - 5.0).powi(2),
+        |x: &[f64], g: &mut [f64]| g[0] = 2.0 * (x[0] - 5.0),
+    );
+    let mut x = [3.0];
+    let out = bfgs_minimize(
+        &mut obj,
+        &mut x,
+        &[0.0],
+        &[1.0],
+        &BfgsConfig::LMM,
+        &mut BfgsState::default(),
+        None,
+        &[],
+    );
+    assert_eq!((x[0], out.f), (1.0, 16.0), "{out:?}");
+}
+
 /// The decrease floor (`Fdelta`, `NoiseFloor`) is per route: on a flat
 /// quartic valley, whose decreases shrink geometrically while the gradient
 /// stays above `pgrad_tol`, the GLMM route's 1e-10 searches past the LMM

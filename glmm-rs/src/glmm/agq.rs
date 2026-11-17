@@ -786,6 +786,9 @@ pub(crate) fn agq_deviance_vec<T: Scalar>(
             T::as_f64s(node_tbl),
         ) {
             if let Some(sum_f) = T::as_f64s_mut(sum) {
+                // A handed-in index runs the clusters on rayon, the transient one
+                // serially, as the generic loop below does.
+                let parallel = cluster_rows.is_some();
                 let owned;
                 let idx = match cluster_rows {
                     Some(idx) => idx,
@@ -796,7 +799,7 @@ pub(crate) fn agq_deviance_vec<T: Scalar>(
                 };
                 super::agq_fast::vector_sums(
                     kind, family, nb_theta, y, prior_w, z_buf, q, n, eta_f, prob_f, ef_f, u_f,
-                    ab_f, lam_f, nodes, tbl_f, agq_rows, sum_f, idx,
+                    ab_f, lam_f, nodes, tbl_f, agq_rows, sum_f, idx, parallel,
                 );
                 done = true;
             }
