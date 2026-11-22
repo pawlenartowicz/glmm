@@ -121,7 +121,7 @@ pub(crate) fn psd_pseudo_inverse(
     // triangle mirrored: a product's two triangles round differently.
     let vk = v.subcols(n - rank, rank);
     let vk_scaled = Mat::from_fn(n, rank, |i, m| vk[(i, m)] / values[n - rank + m]);
-    let mut inv = super::cr2::mul(vk_scaled.as_ref(), vk.transpose());
+    let mut inv = crate::linalg::mul(vk_scaled.as_ref(), vk.transpose());
     for j in 1..n {
         for i in 0..j {
             inv[(i, j)] = inv[(j, i)];

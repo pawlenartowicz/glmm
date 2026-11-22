@@ -159,7 +159,7 @@ fn objective(f: &Fit) -> f64 {
 /// Whether the fit tells the user its numbers may be off: a
 /// `precision_limited` or `variance_at_limit` note, or the ports'
 /// `search_limit` (not converged, yet a finite deviance and every estimated β
-/// finite; the rule of `glmm-bind`'s `notes.rs`).
+/// finite: what the kernel's budget stop leaves on the public fit).
 fn flagged(f: &Fit) -> bool {
     let noted = f
         .diagnostics()
@@ -304,11 +304,17 @@ fn every_varcorr(f: &Fit) -> Vec<f64> {
 /// weights `w/s` are the same bits, so the fit is the same bit for bit. At any
 /// other `c` they differ by a factor in [1/√2, √2] and the search may stop
 /// elsewhere on the same optimum: there the same entries are compared to
-/// `TOL` relative, and the objective to `DEV_EPS` and `TOL·max(1, |dev|)`.
+/// `TOL` relative (`varcorr` to its own measured band), and the objective to
+/// `DEV_EPS` and `TOL·max(1, |dev|)`.
 #[test]
 fn weights_times_c_leave_the_dispersion_families_unchanged() {
-    // Largest seen: 4.5e-6 relative (a `varcorr` entry of the Gamma inverse
-    // nAGQ 5 fit at c = 1e-12), the log-likelihood equal to 1.6e-10.
+    // Largest gap seen, apart from the x86_64 `varcorr` entry below: 4.5e-6
+    // relative (a `varcorr` entry of the Gamma inverse nAGQ 5 fit at
+    // c = 1e-12), with the log-likelihood equal to 1.6e-10. `varcorr` on
+    // x86_64: 1.5e-5 relative (measured 2026-11-18: the Gamma log nAGQ 5 fit
+    // at c = 1 stops on its flat optimum 5.2e-10 above the scaled fits'
+    // objective), so its band is twice that, rounded up.
+    const VARCORR_TOL: f64 = 3e-5;
     let gamma_log = Family::Gamma {
         link: GammaLink::Log,
     };
@@ -458,21 +464,21 @@ fn weights_times_c_leave_the_dispersion_families_unchanged() {
             if d.is_nan() || d > DEV_EPS.min(TOL * objective(&base).abs().max(1.0)) {
                 failures.push(at(&format!("objective moved by {d:e}")));
             }
-            let mut check = |what: &str, a: f64, b: f64| {
+            let mut check = |what: &str, a: f64, b: f64, tol: f64| {
                 compared += 1;
                 let d = rel(a, b);
-                if d.is_nan() || d > TOL {
+                if d.is_nan() || d > tol {
                     failures.push(at(&format!("{what} {a:e} vs {b:e} (rel {d:e})")));
                 }
             };
             for j in 0..P {
-                check("beta", f.beta()[j], base.beta()[j]);
-                check("se", f.se()[j], base.se()[j]);
+                check("beta", f.beta()[j], base.beta()[j], TOL);
+                check("se", f.se()[j], base.se()[j], TOL);
             }
             for (a, b) in every_varcorr(&f).iter().zip(every_varcorr(&base)) {
-                check("varcorr", *a, b);
+                check("varcorr", *a, b, VARCORR_TOL);
             }
-            check("dispersion", f.dispersion(), c * base.dispersion());
+            check("dispersion", f.dispersion(), c * base.dispersion(), TOL);
             tol_cases += 1;
         }
     }
@@ -1833,4 +1839,110 @@ fn warm_starts_end_at_the_cold_optimum_or_carry_a_note() {
     }
     t.assert_clean();
     assert_eq!((t.cases, t.compared, t.flagged), (47, 331, 0));
+}
+
+fn small_count_responses() -> (Vec<f64>, Vec<f64>) {
+    let (g, _) = ids();
+    let binary: Vec<f64> = (0..N)
+        .map(|i| {
+            let eta = 0.2 + 0.8 * x_seq(i) + U_G[g[i] as usize] + 0.8 * noise(i);
+            f64::from(u8::from(eta > 0.0))
+        })
+        .collect();
+    let counts: Vec<f64> = (0..N)
+        .map(|i| {
+            (0.5 + 0.3 * x_seq(i) + 0.5 * U_G[g[i] as usize] + 0.3 * noise(i))
+                .exp()
+                .round()
+        })
+        .collect();
+    (binary, counts)
+}
+
+/// Binomial and Poisson `(1 | g)` GLMMs whose prior weights are all far below
+/// 1 leave their start (θ₀ = 1). At these weights the data carry almost no
+/// information against the random-effect prior, so the answer is σ = 0 with
+/// β at the same model's GLM fit; the objective is of size Σw, and a search
+/// whose absolute stop tests are sized for an objective near 1 ends at its
+/// start or on a fixed path from it, reporting converged.
+///
+/// Laplace rows (logit, Poisson, and probit for an observed-weight link) at
+/// 1e-14 and 1e-100, and nAGQ 5 rows (logit and Poisson) at 1e-8, 1e-12,
+/// 1e-14 and 1e-100: converged, singular (σ̂ = 0), β at the GLM within 1e-6.
+#[test]
+fn small_uniform_count_weights_move_the_glmm_off_its_start() {
+    const TOL: f64 = 1e-6;
+    let (g, _) = ids();
+    let (binary, counts) = small_count_responses();
+    let logit = Family::Binomial {
+        link: BinomialLink::Logit,
+    };
+    let probit = Family::Binomial {
+        link: BinomialLink::Probit,
+    };
+    let poisson = Family::Poisson {
+        link: PoissonLink::Log,
+    };
+    let rows = [
+        ("binomial logit", logit, &binary, 1, &[1e-14, 1e-100][..]),
+        ("poisson", poisson, &counts, 1, &[1e-14, 1e-100]),
+        ("binomial probit", probit, &binary, 1, &[1e-14]),
+        (
+            "binomial logit",
+            logit,
+            &binary,
+            5,
+            &[1e-8, 1e-12, 1e-14, 1e-100],
+        ),
+        (
+            "poisson",
+            poisson,
+            &counts,
+            5,
+            &[1e-8, 1e-12, 1e-14, 1e-100],
+        ),
+    ];
+    let x = design();
+    let gids = GroupIds::new(g.clone());
+    let (mut cases, mut failures) = (0, Vec::new());
+    for (name, family, y, nagq, weights) in rows {
+        let mut opts = FitOptions::default();
+        opts.nagq = nagq;
+        for &wi in weights {
+            let w = vec![wi; N];
+            let data = Data::new(&x, y, N, P).weights(&w);
+            let label = format!("{name}, nAGQ {nagq}, w = {wi:e}");
+            let glm = fit(&data, &ModelSpec::fixed(family), &FitOptions::default())
+                .unwrap_or_else(|e| panic!("{label} GLM: {e}"));
+            assert!(glm.converged(), "{label}: the GLM converges");
+            let f = fit(
+                &data.ids(&gids),
+                &ModelSpec::mixed(family, Re::intercept()),
+                &opts,
+            )
+            .unwrap_or_else(|e| panic!("{label} (1 | g): {e}"));
+            if !f.converged() {
+                failures.push(format!("{label}: not converged"));
+            }
+            if !f.singular() {
+                failures.push(format!(
+                    "{label}: not singular, varcorr {:?}",
+                    every_varcorr(&f)
+                ));
+            }
+            for j in 0..P {
+                let d = rel(f.beta()[j], glm.beta()[j]);
+                if d.is_nan() || d > TOL {
+                    failures.push(format!(
+                        "{label}: beta[{j}] {:e} vs the GLM's {:e} (rel {d:e})",
+                        f.beta()[j],
+                        glm.beta()[j]
+                    ));
+                }
+            }
+            cases += 1;
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert_eq!(cases, 13);
 }

@@ -54,13 +54,12 @@ se_table <- function(title, coefs, cols) {
                 paste(vapply(cols, function(v) sprintf("%12s", se_cell(v, i)), ""), collapse = " ")))
 }
 
-# The report's OWN truth-error floor, deliberately separate from tol.R's
-# TOL$truth_floor: that constant is filled by the pilot and tol_for() stops on
-# an NA one, but this script must run BEFORE the pilot exists. Same rule
-# compare.R's --dev-floor mode uses to measure the pinned constant in the
-# first place, over the same coordinate set (near_zero_truth_coords, runs.R):
-# ceil1(2 x max nonzero |truth| under 0.1 on the deliberate near-zero
-# coordinates the `nearzero`/`boundary` regimes generate).
+# The truth-error floor when TOL$truth_floor cannot be read (tol_for stops on an
+# unmeasured constant, and a report must still run then). Same rule compare.R's
+# --dev-floor mode uses to measure the pinned constant in the first place, over
+# the same coordinate set (near_zero_truth_coords, runs.R): ceil1(2 x max nonzero
+# |truth| under 0.1 on the deliberate near-zero coordinates the
+# `nearzero`/`boundary` regimes generate).
 truth_floor_probe <- function(cells) {
   small <- near_zero_truth_coords(cells)
   nz <- small[small > 0]
@@ -180,7 +179,10 @@ main <- function() {
     if (!length(gen)) {
       cat("  no generated cell in this selection has a glmm record\n")
     } else {
-      floor_ <- truth_floor_probe(cells_all)
+      # Gate 3's floor, so the report scores truth error as compare.R does.
+      floor_ <- safe(tol_for(gen[[1]][["cell"]], "truth_floor"), "TOL$truth_floor")
+      if (is.null(floor_)) floor_ <- truth_floor_probe(cells_all)
+      cat(sprintf("  truth floor: %s\n", floor_))
       orec_by_cell <- setNames(lapply(names(cells_all), function(cid)
         setNames(lapply(ORACLES, function(o) runs[[o]]$recs[[cid]]), ORACLES)),
         names(cells_all))

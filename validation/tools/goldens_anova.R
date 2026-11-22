@@ -58,6 +58,9 @@
 # car's Type II Wald on the lmer fit, car's Type II on the lm): each has the
 # table `rows` (R's column names as keys, NA cells left out) or the `error`
 # message, and `conditions`, the warning and message texts the call raised.
+# type2_units has no `reference` and one member, an lmer fit; it records
+# lmerTest's Type II table (as nonmarginal records it) on the entry's data with
+# the column `scale_column` multiplied by `scale_by`.
 #
 # The likelihood-ratio case (lrt_terms) has one member, a glmer or a glm fit,
 # and the entry's `engine` and `ss_type` (2 or 3). Engine afex::mixed (a glmer
@@ -460,6 +463,20 @@ case_nonmarginal <- function(entry) {
        car_type2_lm = record_call(function() car::Anova(twin, type = 2)))
 }
 
+# lmerTest's Type II table on the lmer member (member 1), fitted with one column
+# of the data rescaled.
+case_type2_units <- function(entry) {
+  data <- read_entry_data(entry)
+  data[[entry$scale_column]] <- data[[entry$scale_column]] * entry$scale_by
+  m <- lmerTest::as_lmerModLmerTest(fit_member(entry$members[[1]], data))
+  list(case = entry$case,
+       term_labels = I(attr(terms(m), "term.labels")),
+       coef_names = I(names(lme4::fixef(m))),
+       scale_column = entry$scale_column,
+       scale_by = entry$scale_by,
+       lmertest_type2 = record_call(function() anova(m, type = 2)))
+}
+
 # car's Type II on a glmer member as likelihood-ratio pairs of glmer refits,
 # with the member's family, link, nAGQ and tolPwrss and contr.sum on the
 # entry's factors in each formula. Term A is tested by the model of every
@@ -594,6 +611,7 @@ CASES <- list(
   car_lm = case_car_lm,
   linear_hypothesis = case_linear_hypothesis,
   nonmarginal = case_nonmarginal,
+  type2_units = case_type2_units,
   lrt_terms = case_lrt_terms
 )
 

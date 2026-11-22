@@ -91,11 +91,14 @@ test_that("anova(m) stops with the stored refusal, and the fit itself stands", {
   m <- fastglmm(y ~ x + x:f, d)
   expect_true(m$converged)
   expect_type(m$term_table_type3$error, "character")
-  expect_error(anova(m), m$term_table_type3$error, fixed = TRUE)
+  expect_error(anova(m), m$term_table_type3$error, fixed = TRUE,
+               class = "fastglmm_error_fit_error")
   expect_error(anova(m, type = "II"), m$term_table_type2$error, fixed = TRUE)
-  # A table that failed inside the crate is an error too, with its own text.
-  m$term_table_type3 <- list(error = "internal error while building the per-term table")
-  expect_error(anova(m), "internal error while building the per-term table", fixed = TRUE)
+  # A table that failed inside the crate is an error of its own class.
+  m$term_table_type3 <- list(error = "internal error while building the per-term table",
+                             error_code = "internal")
+  expect_error(anova(m), "internal error while building the per-term table", fixed = TRUE,
+               class = "fastglmm_error_internal")
 })
 
 test_that("the likelihood-ratio rows of a Poisson GLMM on large counts carry a note", {
@@ -203,14 +206,6 @@ test_that("two Gamma GLMs with an estimated dispersion get the Wald F and car's 
   h <- attr(tab, "heading")
   expect_identical(h[1L], "Model comparison: F test")
   expect_true("Reference: F(2, 316)." %in% h)
-})
-
-test_that("a df in a reference line has no padding and no scientific notation", {
-  df <- c(2.5, 0.5, 9.99995, 999.95, 5.00004, 12.3456, 3, 10007, 12345.6)
-  expect_identical(vapply(df, .fmt_df, ""),
-                   c("2.5", "0.5", "10", "1000", "5", "12.35", "3", "10007", "12346"))
-  # Not finite, as R prints it (the Python port's fmt_df agrees).
-  expect_identical(vapply(c(Inf, -Inf, NaN, NA), .fmt_df, ""), c("Inf", "-Inf", "NA", "NA"))
 })
 
 test_that("broom::tidy reads the term table and the comparison table", {
@@ -622,9 +617,11 @@ test_that("the heading names the likelihood-ratio test and why; Wald keeps its h
     "are not reliable. Change the model until it converges (a simpler random part often",
     "helps), then test again."))
   # A stored refusal is an error with its own text.
-  m_lrt$term_table_type2_lrt <- list(error = "internal error while building the per-term table")
+  m_lrt$term_table_type2_lrt <- list(error = "internal error while building the per-term table",
+                                     error_code = "internal")
   expect_error(anova(m_lrt, type = "II", test = "LRT"),
-               "internal error while building the per-term table", fixed = TRUE)
+               "internal error while building the per-term table", fixed = TRUE,
+               class = "fastglmm_error_internal")
 })
 
 test_that("Wald or LRT on a fit with F rows is an error naming its F test; the fit stands", {
@@ -714,21 +711,19 @@ test_that("auto on a Poisson GLMM fitted with anova_test = \"Wald\" says so", {
 test_that("auto names the Wald test and the reason on every other chi-squared fit", {
   d <- benchmark_data(seed = 323, family = "poisson")
   d$pos <- exp(0.3 * d$t + 0.2 * d$d + rnorm(nrow(d), sd = 0.3))
-  other <- "Gamma model with random effects"
   cases <- list(
     list(fastglmm(y ~ t * d + (1 | g), d, family = "negativebinomial"),
-         "negative_binomial_mixed", "negative binomial model with random effects"),
-    list(fastglmm(pos ~ t * d + (1 | g), d, family = Gamma(link = "log")), "other_mixed", other))
+         "negative_binomial_mixed"),
+    list(fastglmm(pos ~ t * d + (1 | g), d, family = Gamma(link = "log")), "other_mixed"))
   for (k in cases) {
     m <- k[[1L]]
     expect_identical(m$term_test_auto, list(test = "chisq", reason = k[[2L]]))
     expect_null(m$term_table_type3_lrt)
     for (type in c("III", "II")) {
+      # glmm-bind words each reason (its anova_text tests); the binomial
+      # and no-random-effects headings are rendered above.
       auto <- anova(m, type = type)
       wald <- anova(m, type = type, test = "Wald")
-      expect_identical(attr(auto, "heading"), c(
-        sprintf("Type %s Analysis of Deviance Table", type),
-        paste0('Wald chi-squared tests; test = "auto": ', k[[3L]])))
       expect_identical(columns(auto), columns(wald))
     }
   }

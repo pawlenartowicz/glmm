@@ -49,12 +49,12 @@ The recurring symbols on this page, defined once here before first use:
 Three real routing decisions sit between `fit`/`fit_with_start` and a returned
 `Fit`:
 
-1. **Solver class** — `classify_design` (`src/fit/mod.rs`) returns `Solver::NoZ` (dense, bounded stack scratch) or `Solver::Sparse` (heap sparse-Z). A design routes to `Sparse` iff it is over the dense envelope (`extra_groupings.len() > MAX_EXTRA_GROUPINGS`, primary width `q_p > MAX_PRIMARY_Q`, or any extra grouping width `q_g > MAX_EXTRA_Q` — the caps in `src/consts.rs`), **or** any extra grouping carries a random slope, **or** the crossed tail is past its limit for the fit's `condvar`: with `condvar` on, more than `MAX_CROSSED_LEVELS` (500) `Crossed` levels; with `condvar` off, more than `DENSE_KERNEL_MAX_TAIL` (64) levels at a coupling fill below `DENSE_KERNEL_MIN_FILL` (0.023), or dense tail buffers past `DENSE_TAIL_MAX_BYTES` (1 GiB). Otherwise `NoZ`. Before this check the fit picks the reading and order of the groupings from the ids: nests kept up to 7 children per parent, then the grouping with the most columns first ([dispatch map](algorithms.md#full-dispatch-map)).
+1. **Solver class** — `classify_design` (`src/fit/mod.rs`) returns `Solver::NoZ` (dense, bounded stack scratch) or `Solver::Sparse` (heap sparse-Z). A design routes to `Sparse` iff it is over the dense envelope (`extra_groupings.len() > MAX_EXTRA_GROUPINGS` or primary width `q_p > MAX_PRIMARY_Q` — the caps in `src/consts.rs`), **or** any extra grouping carries a random slope, **or** the crossed tail is past its limit for the fit's `condvar`: with `condvar` on, more than `MAX_CROSSED_LEVELS` (500) `Crossed` levels; with `condvar` off, more than `DENSE_KERNEL_MAX_TAIL` (64) levels at a coupling fill below `DENSE_KERNEL_MIN_FILL` (0.023), or dense tail buffers past `DENSE_TAIL_MAX_BYTES` (1 GiB). Otherwise `NoZ`. Before this check the fit picks the reading and order of the groupings from the ids: nests kept up to 7 children per parent, then the grouping with the most columns first ([dispatch map](algorithms.md#full-dispatch-map)).
 2. **Kernel** — every Gaussian design goes to `accumulate_lmm_rows` +
-   `lmm_run_on` (`src/fit/lmm.rs`) → `fit_lmm` (`src/lmm/mod.rs`), which
+   `lmm_fit_with_retries` (`src/fit/lmm.rs`) → `fit_lmm` (`src/lmm/mod.rs`), then `lmm_view`, which
    evaluates the profiled objective of the fit's criterion through the dense
    sufficient statistics (`NoZ`) or the sparse-Z Gram/Schur workspace (`Sparse`,
-   `src/sparse/mod.rs`). One seed, one θ search, one recovery block over both;
+   `src/sparse/mod.rs`). One seed and one recovery block over both, and the θ searches of [the precision retries](#precision-retries-the-qr-kernel-and-the-rescale);
    the sparse kernel is a superset that reproduces the
    dense fit to machine precision on any in-envelope design (see
    [the sparse section](#the-sparse-kernel-two-level-schur-block-cholesky)
@@ -64,15 +64,12 @@ Three real routing decisions sit between `fit`/`fit_with_start` and a returned
    closed-form collapse shortcut; random slopes on the primary grouping alone
    take the per-group regression route when every level's random-effect Gram
    is well conditioned; everything else takes the general
-   family-by-family elimination. `reml_deviance` also has a
-   `reml_deviance_blocked` branch for extra-grouping random slopes, but
-   decision 1 sends every such design to `Sparse`, so from `fit`/`fit_with_start`
-   that branch is unreachable; only in-crate tests call it.
+   family-by-family elimination.
 
 ```mermaid
 flowchart TD
     A["Gaussian, re: Some"] --> B{"classify_design"}
-    B --> N["lmm_run_on -> fit_lmm"]
+    B --> N["lmm_fit_with_retries -> fit_lmm, then lmm_view"]
     N -->|"Solver::Sparse: over envelope / slope on extra / crossed tail past its limit"| S["sparse kernel: sparse_reml_deviance"]
     N -->|"Solver::NoZ: in envelope"| C{"reml_deviance sub-path"}
     C -->|"intercept-only primary, balanced"| CO["balanced collapse shortcut"]
@@ -80,18 +77,9 @@ flowchart TD
     C -->|"otherwise"| GP["general family elimination"]
 ```
 
-The blocked sub-path (test-only from the public entry points, see decision 3)
-is a different, more expensive factorization, not a
-variant of the general one. The general path
-eliminates family-by-family and never materialises a joint RE system; the
-**blocked** path builds the full `k_total × k_total` block-diagonal Λ
-(component-scattered for the primary, contiguous per-level for nested/crossed
-extras), forms the raw RE Gram `G = ZᵀZ`, and takes **one dense Cholesky** of
-`P = ΛᵀGΛ + I` augmented with `[X y]` — `O(k_total³)` per evaluation.
-
 **Code**: `classify_design` (`src/fit/mod.rs`); `build_workspace`/`fit_on`
-(`src/fit/core.rs`); `accumulate_lmm_rows`, `lmm_run_on` (`src/fit/lmm.rs`);
-`fit_lmm` (`src/lmm/mod.rs`); `reml_deviance`, `reml_deviance_blocked`,
+(`src/fit/core.rs`); `accumulate_lmm_rows`, `lmm_fit_with_retries`, `lmm_view` (`src/fit/lmm.rs`);
+`fit_lmm` (`src/lmm/mod.rs`); `reml_deviance`,
 `precompute_balanced_collapse`, `precompute_group_regressions` (`src/lmm/kernel.rs`); `SparseLmmWorkspace`,
 `sparse_reml_deviance` (`src/sparse/mod.rs`); caps in `src/consts.rs`.
 **Convention**: the NoZ/Sparse split is a scratch-capacity boundary, not a model
@@ -342,20 +330,20 @@ variances take `c²`, the random effects `c`, and the deviance `+2ν·ln c`
 (`ν = n` on ML, `n − p` on REML). θ, relative to σ, does not move.
 
 The objective returns `f64::INFINITY` on any Cholesky failure or non-positive σ̂²
-(every Gram kernel — dense, blocked and sparse — also on a residual r² ≤ dim·ε·yᵀy,
+(every Gram kernel — dense and sparse — also on a residual r² ≤ dim·ε·yᵀy,
 an exact fit whose last pivot is round-off of either sign) — that value is the deviance failure surface BOBYQA is driven over. The QR kernel of [the precision retries](#precision-retries-the-qr-kernel-and-the-rescale) has no such floor test: it computes `r` directly, and fails only on a non-finite or zero pivot or `r = 0`.
 
-**Code**: `reml_deviance`, `reml_deviance_blocked`, `LmmSuffStats::add_rows_multi`
+**Code**: `reml_deviance`, `LmmSuffStats::add_rows_multi`
 (`src/lmm/kernel.rs`); `accumulate_lmm_rows`, `lmm_view_to_fit` (`src/fit/lmm.rs`); `sparse_reml_deviance`
 (`src/sparse/mod.rs`); `resolve_criterion`, `lmm_loglik` (`src/fit/common.rs`).
-The three tails (`reml_deviance`, `reml_deviance_blocked`,
-`sparse_reml_deviance`) evaluate either criterion; their names predate ML.
+The two tails (`reml_deviance`, `sparse_reml_deviance`) evaluate either
+criterion; their names predate ML.
 **Convention**: lme4's profiled `devfun`, REML or ML: β and σ² profiled out,
 optimiser on θ. **Validation**: the loglik gate is near-exact for LMM rungs (absolute
 `2e-6` on the shared scale, `loglik_abs_lmm` in `validation/grid/tol.R`; ~1e-9 observed) across Dyestuff, sleepstudy,
 Penicillin, Pastes; sim_slope_extra pins the sparse objective against the same
 references. The ML criterion is checked against a brute-force
-`ln|V| + N·ln(r²/N)` on the dense routes, the dense, blocked and sparse
+`ln|V| + N·ln(r²/N)` on the dense routes, the dense and sparse
 kernels against each other, and against the balanced one-way ANOVA estimators
 (`balanced_one_way_matches_the_anova_estimators`); an ML fit pinned at zero
 has the OLS ML log-likelihood (`ml_fit_pinned_at_zero_has_the_ols_loglik`).
@@ -374,10 +362,10 @@ producing a wrong answer. The collapse is a reassociation of the same
 criterion, not a different one, so it moves the deviance only in its last
 ulps. No analytic gradient reads it: the shortcut needs an intercept-only
 primary, and the per-group gradient route needs slopes, so a collapsed fit
-always searches θ with BOBYQA. The value finite differences of the
-[Satterthwaite pass](#satterthwaite-degrees-of-freedom) do evaluate on it, at
-every stencil point: the arming depends only on the level counts, so a pass
-runs on one route from its first point to its last. When armed,
+always searches θ with BOBYQA. The
+[Satterthwaite pass](#satterthwaite-degrees-of-freedom) evaluates the deviance
+on it once, at θ̂, and takes its derivatives from one walk over the families,
+as the conditional-mode recovery does. When armed,
 it accumulates the θ-independent
 cross-Grams `G_rr′` once; each θ-evaluation then replaces the per-family loop
 with three cheap pieces: a single Crout of the common block `A(θ)`, an
@@ -516,8 +504,8 @@ route) is:
 | `rho_begin` (initial trust radius) | `RHO_BEGIN = 0.5` from the blind start; `RHO_BEGIN_WARM = 0.1` from a caller's θ₀, on a second solver built at the first warm fit | `for_cluster_spec_ext`, `fit_lmm` |
 | `rho_end` (final trust radius) | `RHO_END = 1e-6` | `src/lmm/mod.rs` |
 | `npt` (interpolation points) | `2·n_θ + 1` for `n_θ < 3`, else `⌈3·n_θ/2⌉ + 1` (`(3·n_θ).div_ceil(2) + 1`) | `for_cluster_spec_ext` |
-| `max_fun` | `1000·n_θ` (twice PRIMA's default; with the restart trigger at 1/8 of the remaining budget, the first cycle restarts at 750 evaluations for n_θ = 6) | `apply_campaign_overrides` |
-| `prima_parity` | `false`: Powell's RESCUE factor `0.5` on a fully determined model (every n_θ = 1 search), where PRIMA's test is decided by rounding; every other `npt` runs PRIMA's path bit for bit | `apply_campaign_overrides` |
+| `max_fun` | `1000·n_θ` (twice PRIMA's default; with the restart trigger at 1/8 of the remaining budget, the first cycle restarts at 750 evaluations for n_θ = 6) | `apply_shipped_schedule` |
+| `prima_parity` | `false`: Powell's RESCUE factor `0.5` on a fully determined model (every n_θ = 1 search), where PRIMA's test is decided by rounding; every other `npt` runs PRIMA's path bit for bit | `apply_shipped_schedule` |
 
 The blind start's radius is 0.5 and a warm start's 0.1: a search from far
 needs a wide first model, one from near the optimum spends evaluations on it.
@@ -556,8 +544,8 @@ PIN_THETA (1e-4)` is set to exactly `0.0`, the fit is still counted as converged
 and the component's bit is recorded in `pinned_components`. Off-diagonal
 covariances are never pinned — a correlation running to `±1` shows up as the
 *diagonal* `λ_dd → 0` under the Cholesky parameterization, so pinning the
-diagonal is the complete policy. `PIN_THETA = 1e-4` is kept at the value the
-scalar q=1 Brent kernel used for its τ̂≈0 detection threshold. The test is on the **internal**
+diagonal is the complete policy. `PIN_THETA = 1e-4` is the default tolerance
+of lme4's `isSingular`. The test is on the **internal**
 (scaled) θ — see
 [Random-effect design column scaling](#random-effect-design-column-scaling) — so
 its verdict does not change when a random-slope covariate is re-expressed in
@@ -655,7 +643,7 @@ The Gram kernels read `r²` and the `X̃'V⁻¹X̃` pivots off differences of ac
 `fit::lmm::lmm_fit_with_retries` runs every fit of the fit core in this order:
 
 1. Accumulate at the plain weight scale on the Gram kernel and search, as above.
-2. **QR switch.** On a finite endpoint that `precision_limited` flags, on a shape the QR kernel covers, build the QR kernel from the rows and search again, warm from θ̂. The covered shapes are the dense family path: a primary grouping of any width up to `MAX_PRIMARY_Q`, with or without nested intercept children, weighted or not, with no crossed factor, no slope on an extra grouping, and at least one fixed-effect column. The switch is accepted as it ends, with no comparison against the Gram value, which by the trigger is not known to 0.01.
+2. **QR switch.** On a finite endpoint that `precision_limited` flags, on a shape the QR kernel covers, build the QR kernel from the rows and search again, warm from exactly θ̂, without the `THETA_TRUTH_FLOOR` a caller's start gets. The covered shapes are the dense family path: a primary grouping of any width up to `MAX_PRIMARY_Q`, with or without nested intercept children, weighted or not, with no crossed factor, no slope on an extra grouping, and at least one fixed-effect column. The switch is accepted as it ends, with no comparison against the Gram value, which by the trigger is not known to 0.01.
 3. **Rescale**, on every shape, sparse and crossed included. While the endpoint is finite and a diagonal θ̂ is on the box (the test of `note_theta_at_limit`, shared as `at_theta_limit`) or a pin was undone (a diagonal in `(0, PIN_THETA]`, which a kept pin never leaves), at most 4 times: with `t` that diagonal (the largest on the box, else the smallest nonzero) and `k = round(log₂ t)`, set `s′ = s·4^−k` in `Units` (`set_weight_scale`). Then `ŵ′ = ŵ·4^k` and `θ′ = θ̂·2^−k` exactly; the rows are accumulated again and the search runs warm from exactly `θ′`, without the `THETA_TRUTH_FLOOR` a caller's start gets, so the round starts at the last round's criterion. **Keep-lower:** the criterion in caller units, `deviance + n·ln s`, is compared with the round before; a round that is higher by more than the two endpoints' rounding estimates (`r_sq_floor/σ̂² + pivot_noise` each), or not finite, is undone (the previous `s` restored, the rows accumulated again, the search run again from exactly that round's θ̂) and the loop stops. The restored search starts at that θ̂ and pins again, so "never worse" holds to `PIN_DEVIANCE_SLACK`. After each kept round on the Gram kernel, step 2 runs again: a rescale can let the search walk to the precision wall.
 4. The fit reports the last search's endpoint, with `n_eval` the sum over every search (the `counters` feature reports the last search's counts). `variance_at_limit` and `precision_limited` are computed on the final kernel and scale, so they mean "still at the limit after the retries".
 
@@ -670,7 +658,7 @@ A fit that triggers neither retry runs exactly the code it ran before, bit for b
 
 Once per accumulation (every rescale round refills it), each primary level's rows `√ŵᵢ·[z_f,i | x̃ᵢ | yᵢ]` are merged one at a time by Givens rotations into an upper triangle of width `w + m` (`w` the family width, `m = p + 1`); only its first `w` rows are kept per level, `w(w+1)/2 + w·m` numbers, and the rest of each row, which does not depend on θ, goes into one shared `m × m` triangle `R_within`. It uses the `U` the Gram accumulation set, so the two kernels share `X̃`. Per θ each level's `w` rows, times its relative factor `Λ_f`, are merged into the penalty rows `[I_w | 0]`: `2·Σ ln` of the diagonal of the triangle they leave is the level's share of `ln|I + ΛᵀZᵀŴZΛ|` (`ln|L_ZZ|²`), and its `m`-wide remainder is merged into the tail `T`, which starts as `R_within`. Then `log|X̃'V⁻¹X̃| = 2·Σ_{j<p} ln T_jj` and `r = T_pp`, so `r` is known to about `ε·‖√Ŵy‖` rather than `r²` to `ε·y'Wy`, and the pivots are products of rotations, not differences (Golub & Van Loan 2013, §5.1–5.3). Nothing is allocated per evaluation; the buffers are allocated the first time a workspace takes the switch and refilled in place after.
 
-The fit reads the kernel through the same calls as the Gram one. The factor is `Tᵀ` with a positive diagonal, so β̂, the SEs and the Wald statistics read it unchanged; the conditional modes back-substitute per level on the triangle each level leaves at θ̂ (`qr_recover_ranef`). Its precision estimate is `2ε·(ν·√C_pp/r + 1[REML]·Σ_{j<p} √C_jj/T_jj)` (`LmmKernel::pivot_noise`; `C` the accumulated `[X̃ y]'Ŵ[X̃ y]`, so `√C_pp = ‖√Ŵy‖`), one rounding of each norm to first order, and `r_sq_floor` is 0. It has no conditional variances: `Fit::condvar` is empty on a fit that ended on it, even with `condvar = true`. The per-group gradient route is not armed while it is on, so the search runs BOBYQA and the Satterthwaite pass takes the value route; the pass's response shift moves the `y` column of the stored triangles by their `X̃` columns times `b`, exactly as the rows would, and puts it back bit for bit. Profile intervals and the Satterthwaite pass run on the kernel and weight scale the fit ended on; on a rescaled fit with a θ left on the box, the curvature in the other θ coordinates grows by `4^k` while the box coordinate's does not, so the pass can drop that direction as flat and raise `satterthwaite_curvature`.
+The fit reads the kernel through the same calls as the Gram one. The factor is `Tᵀ` with a positive diagonal, so β̂, the SEs and the Wald statistics read it unchanged; the conditional modes back-substitute per level on the triangle each level leaves at θ̂ (`qr_recover_ranef`). Its precision estimate is `2ε·(ν·√C_pp/r + 1[REML]·Σ_{j<p} √C_jj/T_jj)` (`LmmKernel::pivot_noise`; `C` the accumulated `[X̃ y]'Ŵ[X̃ y]`, so `√C_pp = ‖√Ŵy‖`), one rounding of each norm to first order, and `r_sq_floor` is 0. It has no conditional variances: `Fit::condvar` is empty on a fit that ended on it, even with `condvar = true`. The per-group gradient route is not armed while it is on, so the search runs BOBYQA. The Satterthwaite pass takes its exact derivatives from the same level triangles, with no subtraction (`QrKernel::family_inputs`; see [Satterthwaite degrees of freedom](#satterthwaite-degrees-of-freedom)). Profile intervals and the Satterthwaite pass run on the kernel and weight scale the fit ended on. The exact derivatives scale exactly with a power-of-two rescale (`4^k` on `H_p`, `2^k` on `g_p`), so the df of a rescaled fit equal those of the same pass at the plain scale (`rescaled_fit_df_match_the_pass_at_the_plain_scale`, `src/fit/lmm_tests.rs`, bit for bit on its two fixtures). The value route that a wide crossed tail takes keeps the same property: its step on each θ̃ coordinate is the step factor times the largest free `|θ̃|` of the coordinate's covariance block, with no absolute floor, so the steps scale with θ̃. The ports' fixture `_PARITY_*` (`glmm-py/tests/test_warnings.py`, the same data in `glmm-r/tests/testthat/test-warnings.R`: `y ~ z + (1 + z | g)` with `z` near 1e4 and `y` exact in `z` and `g`) takes both retries, the QR switch and a rescale with `k = 20`; its df are 38.0 (intercept) and 11.75 (slope) under REML, and 40.0 and 12.17 under ML.
 
 **Reuse across draws.** Every draw starts at its plain `s` on the Gram kernel. A draw after one that retried accumulates in full, even under `set_fixed_design(true)`, whose shortcut keeps statistics built at the previous draw's scale (`LmmWorkspace::retried`). `FitView::theta` reports θ̂ at the plain scale (`θ̂·2^rescale_exp`), so a carry into the next draw keeps its meaning, and `curvature_hint` returns `None` after a fit that rescaled.
 
@@ -690,8 +678,8 @@ sparse Z. Per θ-evaluation, `sparse_schur_factor` runs:
    switches to fill-reducing compact panels and faer's AMD sparse LLT — the
    same analyze-once/factorize-per-eval split CHOLMOD gives lme4;
 4. **Fixed tail** — a forward-solve-only `U = L⁻¹B` (never backsolved — the
-   deviance and recovery need only `BᵀA⁻¹B = UᵀU`), and a final Crout of
-   `S = C_xy − UᵀU` into the augmented `[X y]` factor.
+   deviance and recovery need only `BᵀA⁻¹B = UᵀU`), and a dense Cholesky
+   (`cholesky_in_place`) of `S = C_xy − UᵀU` into the augmented `[X y]` factor.
 
 The dense-equivalence claim from the dispatch section is structural: at the
 same θ both kernels factor the same SPD system, and by
@@ -710,8 +698,8 @@ the sparse kernel does not carry is the per-group analytic gradient
 (`pg_gradient` reads dense-kernel state), so a sparse fit always searches θ
 with BOBYQA.
 
-**Code**: `sparse_reml_deviance`, `sparse_schur_factor`,
-`schur_phase_b`, `TAIL_SPARSE_MIN` (`src/sparse/mod.rs`). **Validation**:
+**Code**: `sparse_reml_deviance`, `TAIL_SPARSE_MIN` (`src/sparse/mod.rs`);
+`sparse_schur_factor`, `schur_phase_b` (`src/sparse/schur.rs`). **Validation**:
 sim_slope_extra (rung 7) externally; the dense-vs-sparse deviance equivalence
 by in-crate cross-checks.
 
@@ -753,7 +741,7 @@ skips it. On the loop tier it runs only when called:
 a call after the first allocates only the pseudo-inverse's blocks.
 `loop_advanced::satterthwaite_with_contrasts` runs the same pass and also
 gives the df of each requested pairwise contrast (`l = e_p − e_n` in the
-identity below), from the stencil the unit contrasts use, with no extra
+identity below), from the same pass the unit contrasts use, with no extra
 deviance evaluation.
 
 **The identity.** lmerTest differentiates the deviance of the fit's criterion
@@ -791,56 +779,93 @@ orthogonalization mapped out.
 factor on the standardized design, see
 [Random-effect design column scaling](#random-effect-design-column-scaling)),
 a fixed smooth reparameterization of the caller's θ; at a stationary θ̂ the
-quantity `gᵀH⁻¹g` does not depend on it. Each coordinate's step is
-`h_k = η·max(|θ̃_k|, 1)`, one η per route because θ̃ is unit-free.
+quantity `gᵀH⁻¹g` does not depend on it. The route depends only on the
+design: a crossed tail of at most `EXACT_TAIL_MAX` = 500 random-effect columns
+(levels, on intercept-only crossed factors) takes the exact pass, a wider one
+the value route (`exact::covers`). Every draw of one design on the loop tier
+takes the same route. The GLMM's exact Hessian stops at the same width
+(`glmm::derivative::DUAL_TAIL_MAX`).
 
-- **Value route** (every kernel and every shape; the reference). `H_p` comes
-  from central finite differences of the same `f64` profiled deviance the
-  search minimized (`LmmKernel::deviance`), and `∂C_p/∂θ_k` from central
+- **Exact pass** (every kernel and layout within the width: the family loop,
+  nested children, the balanced collapse, the per-group regression shapes,
+  the QR kernel, and the crossed tail on the dense and the sparse kernel).
+  `H_p` and `∂C_p/∂θ_k` are closed forms (Harville 1977; Searle, Casella &
+  McCulloch 1992, ch. 6; Wolfinger, Tobias & Sall 1994). In the kernel's
+  units, with `V = I + ZΛΛᵀZᵀ`, `Φ = (X̃ᵀV⁻¹X̃)⁻¹`,
+  `P = V⁻¹ − V⁻¹X̃ΦX̃ᵀV⁻¹`, `r² = yᵀPy`, `D_k = ∂(ΛΛᵀ)/∂θ_k`, `V_k = ZD_kZᵀ`,
+  `V_kl = Z·∂²(ΛΛᵀ)/∂θ_k∂θ_l·Zᵀ` and `a_k = yᵀPV_kPy`, the REML forms are
+
+  ```text
+  H_kl      = tr(P V_kl) − tr(P V_k P V_l) + (ν/r²)·(2·yᵀPV_kPV_lPy − yᵀPV_klPy) − (ν/r⁴)·a_k·a_l
+  ∂C_p/∂θ_k = −(a_k/ν)·Φ + σ̂²·ΦX̃ᵀV⁻¹V_kV⁻¹X̃Φ
+  ```
+
+  and under ML `V⁻¹` takes the place of `P` in the two trace terms. `V` is
+  quadratic in θ, so `V_kl ≠ 0`. This is the observed Hessian, the one
+  lmerTest's numerical Hessian estimates. No `n × n` matrix is formed: every
+  product moves into the random-effect space (`S = ZᵀV⁻¹Z`, `F = ZᵀV⁻¹X̃`,
+  `w = ZᵀPy`). The terms with `S` between two `D_k` become sums over the
+  pairs of levels that `S` couples, and the rest sums over single levels
+  (the formulas are in the header of `src/lmm/satterthwaite_exact.rs`).
+  Without a crossed factor `S` is block-diagonal by family (a primary level
+  and its nested children), so the pass is one walk over the families. Per
+  family it forms `S_ff = Z_fᵀV_f⁻¹Z_f` and `Z_fᵀV_f⁻¹[X̃ r]`, with the
+  residual `r = y − X̃β̂` contracted before any product with θ, from the
+  factors that layout's own deviance reads. On the Gram kernels these come
+  from Woodbury (Henderson & Searle 1981) on the family's Gram statistics,
+  with its factor `L_f` rebuilt at θ̂ as the conditional-mode recovery
+  rebuilds it, also on the collapse and the per-group shapes. On the QR kernel
+  they come from the level triangles with no subtraction
+  (`QrKernel::family_inputs`). A crossed tail of `e` columns adds the
+  Woodbury correction `S = S⁰ − U·T_c⁻¹·Uᵀ`, `S⁰` the same product with the
+  families' covariance alone and `T_c` the crossed tail the kernels already
+  factor. The blocks of `S` a family reads (its own block, its rows against
+  every crossed column, and the crossed block) are formed whole, and two
+  different families couple only through the low-rank remainder, which pairs
+  every two crossed columns through `T_c⁻¹`. Splitting the crossed block the
+  same way would cancel by about `T_c²`, large for a crossed factor with many
+  rows per level. The remainder needs `T_c⁻¹` in full, which a sparse
+  factor's pattern does not give, so the pass holds `6 + n` dense `e × e`
+  buffers (`n` the free coordinates, 2 MB each at `e = 500`) and costs
+  `O(n·e³)`; that is the reason for the width. The pass is one deviance
+  evaluation at θ̂ and the walk, with no step, so its df depend on no step
+  factor and scale exactly with a rescale.
+- **Value route** (a crossed tail wider than `EXACT_TAIL_MAX`; also the
+  in-crate reference the exact pass is checked against). `H_p` comes from
+  central finite differences of the same `f64` profiled deviance the search
+  minimized (`LmmKernel::deviance`), and `∂C_p/∂θ_k` from central
   differences of `C_p` at the axis points. The stencil is the axis pairs
   `θ̃ ± h_k e_k` plus, for each pair of coordinates, the two points
   `θ̃ ± (h_i e_i + h_j e_j)` (numDeriv's `genD` pairing without its Richardson
   ladder): `n² + n + 1` deviances for `n` free coordinates, `θ̂` included,
   re-evaluated at the start so the pass never depends on what an earlier call
-  left in the kernel. The step factor is `ETA = 3e-4`, pinned by a step sweep
-  over which the df stay flat.
-- **Gradient route** (where the per-group gradient is armed for the fit, on
-  either criterion: the dense kernel on the
-  [per-group regression route](#random-slopes-on-the-primary-alone-per-group-regressions),
-  the shapes the search runs BFGS on). Column `k` of `H_p` is
-  `(∇d_p(θ̃ + h_k e_k) − ∇d_p(θ̃ − h_k e_k))/(2h_k)` on the free coordinates,
-  symmetrized, from the analytic gradient of
-  [Gradient search on the per-group route](#gradient-search-on-the-per-group-route-bfgs)
-  (`pg_gradient`). Each axis point is one deviance, which leaves the factor
-  and `σ̂²` the gradient reads, and one gradient, so `∂C_p/∂θ_k` comes from the
-  same points: `2n + 1` evaluations and no mixed points. Its step factor is
-  its own, `ETA_GRAD`, set by the gradient route's step sweep. A non-finite
-  deviance or an unavailable gradient at any axis point sends the whole pass
-  to the value route.
+  left in the kernel. Each free coordinate's step is `h_k = ETA·m_b`, with
+  `m_b` the largest `|θ̃|` over the free coordinates of the coordinate's
+  covariance block (`vech(Λ_g)`); with no absolute floor the steps scale with
+  θ̃, so a rescale retry leaves the df unchanged
+  ([Precision retries](#precision-retries-the-qr-kernel-and-the-rescale)). The step factor is `ETA = 3e-4`, set by the step sweep (`step_sweep_is_flat_at_eta`): over the steps 3e-5, 1e-4, 3e-4 and 1e-3 the df is flattest between 3e-4 and 1e-3 (largest change 1.9e-5), while the deviance's round-off from the random effects moves it by up to 6.6e-5 between 1e-4 and 3e-4 and 1.3e-3 between 3e-5 and 1e-4. The
+  stencil evaluates on the response shifted by the fit's own fitted fixed
+  part (`y − X̃β̂`, exact algebra on the sufficient statistics): the profiled
+  deviance does not depend on the shift, but its round-off does, because each
+  evaluation reads `r²` off a downdate of `y′y`, and the second differences
+  divide that round-off by `h²`. The statistics are restored bit for bit
+  afterwards. Steps across zero are interior evaluations: the box is
+  symmetric ([Covariance parameterization](#covariance-parameterization-θ-cholesky))
+  and the deviance is even in each Λ column. A step past `THETA_HI` is
+  evaluated as is. On a block whose θ̂ is small next to its group size the
+  deviance's rounding swamps the curvature at this step, and the df come out
+  too large (53 instead of the exact 29 on the one-way design of
+  `small_theta_df_match_the_closed_form`); the exact pass has no such error.
 
-The route is chosen per fit, from the kernel's arming for that dataset, so
-loop draws of one shape can take different routes. On the dense kernel the
-balanced collapse and the per-group route stay armed after the fit, so every
-stencil point evaluates on the route the search used.
-
-**What each point evaluates.** `C_p` at a point is
-`C̃ = σ̂²(L̃_XX L̃_XXᵀ)⁻¹`, formed from the augmented factor and `σ̂²` the
-kernel's evaluation left, in the kernel's coordinates, and mapped once to the
-caller's columns (`C = M·C̃·Mᵀ`, `M` the standardization times the inverse of
-the orthogonalization factor `U`); the pass never maps the factor in place.
-No prior-weight factor enters `C`: the kernel's `σ̂²` and its
-`(L̃_XX L̃_XXᵀ)⁻¹` carry the weight scale in opposite directions. The stencil
-evaluates on the response shifted by the fit's own fitted fixed part
-(`y − X̃β̂`, exact algebra on the sufficient statistics): the profiled deviance
-does not depend on the shift, but its round-off does, because each
-evaluation reads `r²` off a downdate of `y′y`, and the second differences
-divide that round-off by `h²`. The statistics are restored bit for bit
-afterwards. The pass reads θ̂ from `LmmWorkspace::theta` and never writes it,
-like the curvature hint, so the two run in either order. Steps across zero
-are interior evaluations: the box is symmetric
-([Covariance parameterization](#covariance-parameterization-θ-cholesky)) and
-the deviance is even in each Λ column. A step past `THETA_HI` is evaluated as
-is.
+**What the pass evaluates.** `C_p` is `C̃ = σ̂²(L̃_XX L̃_XXᵀ)⁻¹`, formed from
+the augmented factor and `σ̂²` the kernel's evaluation left, in the kernel's
+coordinates, and mapped once to the caller's columns (`C = M·C̃·Mᵀ`, `M` the
+standardization times the inverse of the orthogonalization factor `U`); the
+exact `∂C_p/∂θ_k` is mapped the same way, and the pass never maps the factor
+in place. No prior-weight factor enters `C`: the kernel's `σ̂²` and its
+`(L̃_XX L̃_XXᵀ)⁻¹` carry the weight scale in opposite directions. The pass
+reads θ̂ from `LmmWorkspace::theta` and never writes it, like the curvature
+hint, so the two run in either order.
 
 **Boundary fits and the note.** The deviance and `C_p` depend on Λ only
 through `ΛΛᵀ`, so both are even in each Λ column. At a column that is exactly
@@ -852,20 +877,30 @@ own curvature block can be singular, which is the second reason to drop them.
 The test is on the value of the column, not on the pinned bit. The θ entries
 a grouping's terms hold at zero (between two terms, as in `(x || g)`, and the
 intercept column of a block without a random intercept) are not coordinates
-at all: `free_coordinates_into` leaves them out, so the pass never steps them.
+at all: `free_coordinates_into` leaves them out, so the pass never differentiates in them.
 The remaining
-`H_p` is inverted by an eigendecomposition that keeps only eigenvalues above
+`H_p` is scaled to a unit diagonal, `D^−½·H_p·D^−½` with `D` its diagonal,
+and inverted by an eigendecomposition that keeps only eigenvalues above
 `1e-8·λ_max`, counts those below `−1e-8·λ_max` as negative and the rest as
-dropped, as lmerTest inverts only its positive eigenvalues (lmerTest's own
-threshold is absolute, `1e-8` on its `(θ, σ)` Hessian). On a block wider
+dropped; the inverse is mapped back by `D^−½`. When a diagonal entry is not
+positive and finite, `H_p` is inverted unscaled. lmerTest cuts its unscaled
+`(θ, σ)` Hessian at an absolute `1e-8`. The two cuts differ only where a
+coordinate's scale alone puts an eigenvalue below the threshold. Measured
+(2026-11-21) on the ports' fixture `_PARITY_*` (`glmm-py/tests/test_warnings.py`;
+`H_p` eigenvalue ratio 9e-14 under REML, scaled eigenvalues `1 ± 4e-10`),
+the slope's df are 11.75 (38, which is ν, under the unscaled cut; 12.8 over
+1000 simulated replicates) and `satterthwaite_curvature` is not raised. On
+no Gaussian mixed cell of the `--fast` grid do the two cuts differ (measured
+2026-11-18). On a block wider
 than `MAX_PRIMARY_Q`, which the canonical form skips, a pinned diagonal can
 sit above a live entry; the flat rotation direction there is a zero
 eigenvalue that the pseudo-inverse removes. The pass raises
 `Note::SatterthwaiteCurvature { dropped, negative, converged, nonfinite }`
 when a direction was dropped or negative, when the endpoint did not converge
 (a `MaxFunReached` endpoint, where the df are computed at the last point), and
-when the pass failed. It fails for the whole fit when a deviance or `C` on
-the stencil is not finite, when the eigendecomposition fails, or when the fit
+when the pass failed. It fails for the whole fit when the deviance, a
+family factor or `C` at θ̂ is not finite (on the value route, a deviance or
+`C` on the stencil), when the eigendecomposition fails, or when the fit
 has no finite endpoint at all (no pass runs then): every `coef_df` is NaN,
 `nonfinite` is set, and the contrasts return `NoDfReason::Failed`. The ports
 then test with z and give normal intervals (`df_method = "failed"`).
@@ -905,29 +940,43 @@ NaN where the df was lost under `residual`, `satterthwaite`,
 `bell_mccaffrey` or `pustejovsky_tipton`, and the normal quantile under
 `none`, `disabled` or `failed`, taken at `(1 − level)/2` and its complement as `confint.lm` takes them.
 
-**Code**: `pass`, `pass_targets`, `stencil`, `assemble`, `ETA`, `ETA_GRAD`
-(`src/lmm/satterthwaite.rs`); `contest_1d`, `contest_md`, `fstat_ddf`
+**Code**: `pass`, `pass_targets`, `collect_into`, `exact_into`, `stencil`,
+`assemble`, `ETA` (`src/lmm/satterthwaite.rs`); `exact_terms`, `walk`,
+`EXACT_TAIL_MAX` (`src/lmm/satterthwaite_exact.rs`); `contest_1d`, `contest_md`, `fstat_ddf`
 (`src/inference/contest.rs`); `Fit::contrast_t`, `Fit::contrast_f`
 (`src/inference/contrast.rs`); `attach_satterthwaite`, `satterthwaite`
-(`src/fit/core.rs`); `confint` (`src/orchestrate.rs`). **Convention**:
+(`src/fit/core.rs`); `confint` (`src/orchestrate/stored.rs`). **Convention**:
 lmerTest 3.2-1's `summary()`, `contest()` and `anova()` df; its Hessian is
-numDeriv's Richardson extrapolation on `(θ, σ)`, the crate's a single-step
-central stencil on the profiled θ̃. **Validation**: the contest layer
+numDeriv's Richardson extrapolation on `(θ, σ)`, the crate's the exact
+observed Hessian on the profiled θ̃ (a single-step central stencil above the
+tail width). **Validation**: the contest layer
 reproduces lmerTest's frozen `contest1D`, `contestMD` and `get_Fstat_ddf`
 outputs from its own frozen inputs (`src/inference/contest_tests.rs`); the
 pass at lme4's θ̂ is checked against lmerTest's df on every frozen fixture,
-REML and `REML = FALSE` alike, within a band that adds lmerTest's own finite-difference spread, and
+REML and `REML = FALSE` alike, on the exact pass and on the value route,
+within a band of lmerTest's own finite-difference spread (the value route's
+band adds its own step error), and
 on the three boundary fixtures the directions it drops are checked against
 lmerTest's (`gate1_at_lme4_theta`, `--features oracle-tests`); the df and
 the interval bounds at the crate's own θ̂ are gated end to end in
 `tests/inference_oracle.rs`, registry-backed like the SEs, which also gates
-each ML fixture's deviance against lmerTest's hard; the two routes
-agree on the same fit under both criteria (`gradient_route_agrees_with_value_route`), the dense
-and sparse kernels agree (`dense_and_sparse_kernels_agree`), and the step
+each ML fixture's deviance against lmerTest's hard. The exact pass gives
+the closed forms of balanced designs: `K − 1` on a one-way design
+(`balanced_one_way_intercept_df_is_k_minus_one`), the small-θ̂ one-way and
+random-slope designs within 1e-9 at the closed-form θ̂
+(`small_theta_df_match_the_closed_form`), and the classical Satterthwaite df
+of a two-way crossed design on both kernels
+(`two_way_crossed_df_match_the_closed_form`). It agrees with the value route
+on the same fit under both criteria within the value route's band
+(`exact_pass_agrees_with_value_route`); the dense and sparse kernels agree,
+and so do the QR and Gram kernels, to round-off
+(`dense_and_sparse_kernels_agree`, `qr_pass_df_match_the_gram_pass`); the
+width holds at its edge (`exact_pass_stops_at_the_tail_width`); and the step
 sweep pins `ETA` (`step_sweep_is_flat_at_eta`). On the 26 frozen
 `REML = FALSE` references (lmerTest 3.2-1) the ML rows sit inside the REML
-bands, with no registered exception: at lme4's θ̂ the worst df is 0.38 of its
-band (relative 1.65e-5), end to end the df agree to 3.5e-4 (band 1e-3) and the
+bands, with no registered exception: at lme4's θ̂ the exact pass's df come
+closest to their band at 0.63 of it (relative 2.28e-6; the largest relative
+gap is 3.50e-6), end to end the df agree to 3.5e-4 (band 1e-3) and the
 interval bounds to 4.0e-5 of the width, the per-term F denominator df to
 2.5e-5, and a pinned fit (`Dyestuff2`, `REML = FALSE`) gets `df = ν = N`
 exactly. On
@@ -1018,27 +1067,36 @@ held problem away from the global one, so once the path has moved, each point
 also runs a held search from the estimate and keeps the lower minimum (a
 search that did not converge never wins); this roughly doubles the held
 searches of such a side (`path`, `src/inference/profile.rs`). A side that never brackets, a held search that
-does not converge, or a `|ζ|` that falls by more than `ZETA_TOL` from one
-expansion step to the next gives NaN. A held deviance below the fit's by more
+does not converge, a `|ζ|` that falls by more than `ZETA_TOL` from one
+expansion step to the next, or a Brent search that does not reach `ZETA_TOL`
+gives NaN, and the row's `lower_note` or `upper_note` names the cause as a
+`ProfileNote`: `NoBracket`, `HeldSearchFailed`, `ZetaFell` or `RootNotFound`
+(`bound` and `root`, `src/inference/profile.rs`). A side with a bound has no
+note. A held deviance below the fit's by more
 than `BETTER_OPTIMUM_TOL = 1e-6` is `ProfileError::BetterOptimum`, as lme4
 stops on "profiling detected new, lower deviance"; a smaller drop reads as
 `ζ = 0`. A correlation next to an SD estimated at 0 is not identified: its row
-is NaN on both sides, and it stays a free coordinate of the other searches.
+is NaN on both sides with no note, and it stays a free coordinate of the
+other searches.
 
 **Refusals.** Before any work: `level` outside `(0, 1)` and a `which` naming a
 parameter the model does not have (`FitError::OptionValue`); a model without
 random effects, a family other than Gaussian, or an aliased fixed-effect
-column (`FitError::Unsupported`). An ML refit that does not converge is
+column (`FitError::Unsupported`); a fit whose weight power was estimated or
+fixed at a value other than 1 (`FitError::Unsupported`, `weight_power_refusal`:
+the profiles refit on the weights as given, another model); `data` with
+another `n` or `p` than the fit, or `spec` with another set of random-effect
+blocks (`FitError::Shape`). An ML refit that does not converge is
 `ProfileError::NotConverged`. The GLMM path has no closed form for β and σ
 at θ and is not profiled.
 
-**Code**: `Fit::profile_intervals`, `profile_on`, `profile_params`, `bound`,
+**Code**: `Fit::profile_intervals`, `weight_power_refusal`, `profile_on`, `profile_params`, `bound`,
 `root`, `path` (`src/inference/profile.rs`); `ProfileKernel`, `hold_var`,
 `hold_beta`, `var_dev`, `beta_dev`, `theta_into` (`src/lmm/profile.rs`);
 `caller_map_into` (`src/lmm/satterthwaite.rs`); `semidef_lower_chol`,
 `LmmGroupings::block_std` (`src/lmm/re_map.rs`); `fit_keep_workspace`
 (`src/fit/mod.rs`); `FitWorkspace::profile_kernel` (`src/fit/core.rs`); `profile_intervals`, `profile_names`
-(`src/orchestrate.rs`). **Convention**: lme4 2.0-6's
+(`src/orchestrate/stored.rs`). **Convention**: lme4 2.0-6's
 `confint(method = "profile")` with `signames = FALSE` names; its cutoff, its
 ML refit of a REML fit, and its one-sided intervals at a limit; not its ζ
 spline. **Validation**: four frozen lme4 references (sleepstudy, Penicillin,
@@ -1161,10 +1219,12 @@ through the LMM's own `lmm_loglik(d, ν) = −½·(d + ν·(1 + ln 2π))` with
 the constants cancel in the difference. An exact OLS fit (`RSS = 0`) reports
 `+∞`.
 
-**The observed statistic** (`rlrt_statistic`). It takes `loglik_full`, the
-REML `Fit::loglik` of the `(1 | g)` fit; `loglik_reduced`, the θ = 0 value
-above; and `pinned`, whether the `(1 | g)` fit pinned its one component at
-zero (`Diagnostics::pinned`, see
+**The observed statistic** (`lr_statistic` in `src/inference/lr.rs`, the
+comparison's statistic, which `exact_rlrt` takes as given). Here it takes
+`loglik_full`, the REML `Fit::loglik` of the `(1 | g)` fit, as the larger
+model's; `loglik_reduced`, the θ = 0 value above, as the smaller model's; and
+`pinned`, whether the `(1 | g)` fit's variance is exactly zero (`compare`
+reads it from the fit's variance; see
 [Boundary handling](#boundary-handling-pin_theta)). The rules, in the order
 the code applies them:
 
@@ -1322,9 +1382,9 @@ symmetric eigendecomposition (order `K'³`); `GridTables::new` fills
 multiply-adds, one division and one `log1p`. No `n`-sized work is done at
 all.
 
-**Code**: `rlrt_design`, `rlrt_statistic`, `LAMBDA_GRID`, `GridTables`,
+**Code**: `rlrt_design`, `LAMBDA_GRID`, `GridTables`,
 `max_on_grid`, `null_draws`, `rlrt_null`, `RlrtNull::p_value`, `exact_rlrt`,
-`RlrtRefusal` (`src/inference/rlrt.rs`); `DesignSummary` (`src/fit/mod.rs`);
+`RlrtRefusal` (`src/inference/rlrt.rs`); `lr_statistic` (`src/inference/lr.rs`); `DesignSummary` (`src/fit/mod.rs`);
 `design_summary`, `lmm_view_to_fit` (`src/fit/lmm.rs`); `ols_view_to_fit`
 (`src/fit/ols.rs`). **Convention**: RLRsim's `exactRLRT` (Scheipl, Greven &
 Küchenhoff 2008), with the same normalization and grid, and four

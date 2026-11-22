@@ -13,11 +13,10 @@
 #   oracle  GLS with the true variances; exact SE; normal quantile.
 # HC2 with Bell–McCaffrey df is CR2 with one-row clusters and Pustejovsky–Tipton df
 # (clubSandwich, inverse_var = TRUE); checked against clubSandwich at the start.
-# Model: y = βx + ε, Var(εᵢ) = v(wᵢ), no random effect. Cells: the 16 cells of the
-# design-only screen's LM design, built at n rows (n/10 blocks of 10 rows, the
-# grouping dropped; junk adds 5 rows with w = 1e-8 per block, so 1.5n rows), design
-# seed 20261039 (Mersenne-Twister) at every n. At n = 100 these are the screen's
-# designs, so the results line up with its exact sizes at the pseudo-true δ.
+# Model: y = βx + ε, Var(εᵢ) = v(wᵢ), no random effect. Cells: 16 cells of an
+# LM design, built at n rows (n/10 blocks of 10 rows, the grouping dropped; junk
+# adds 5 rows with w = 1e-8 per block, so 1.5n rows), design seed 20261039
+# (Mersenne-Twister) at every n.
 # Effect sizes: β = 0 and β = 2 × the oracle's SE, on the same ε draw.
 # Seeds: data from seed 20261001 + n, L'Ecuyer-CMRG, one stream per cell.
 # Run: Rscript wls_delta_mc.R [R [n ...]]  (defaults 1000; n = 20 50 100 500).
@@ -33,7 +32,7 @@ ns <- if (length(args) > 1) as.integer(args[-1]) else c(20L, 50L, 100L, 500L)
 stopifnot(all(ns %% 10 == 0))
 t_start <- proc.time()[3]
 
-# ---- designs and noise curves (the screen's; noise variance per row) --------
+# ---- designs and noise curves (noise variance per row) ----------------------
 make_design <- function(pattern, seed = 20261039, G = 10, m = 10) {
   set.seed(seed)
   n <- G * m

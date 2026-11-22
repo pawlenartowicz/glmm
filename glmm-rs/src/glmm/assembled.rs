@@ -61,9 +61,10 @@ use crate::lmm::LmmGroupings;
 use crate::scalar::Scalar;
 use crate::spec::{BinomialLink, Family};
 
+use super::agq::agq_eligible;
 use super::derivative::{
-    agq_eligible, supports_shape, DerivStatus, GlmmDualBufs, GlmmDualScratch, NLanes, Seed,
-    MAX_DUAL_REFINEMENTS,
+    supports_shape, DerivStatus, DualLanes, GlmmDualBufs, GlmmDualScratch, NLanes, Seed,
+    DUAL_SETTLE_REL, MAX_DUAL_REFINEMENTS,
 };
 use super::deviance::{blocked_laplace_deviance, structured_laplace_deviance};
 use super::pirls::{
@@ -451,7 +452,6 @@ pub(super) fn mode_solve_f64(
             BetaStep::Fixed,
             offset,
             Some(tol),
-            p,
             n,
             &mut mode_counters,
         );
@@ -479,10 +479,10 @@ pub(super) fn mode_solve_f64(
 /// — one `Dual` set and one `f64` set of the same shape terms, plus the `f64`
 /// half's own `U` (`m·k`, `û`'s first-order response), gradient (`m`),
 /// `∂m/∂θ` row scratch (`width`) and two mode snapshots (`2k`).
-/// [`packed_peak_bytes`] is that expression, and it is now an upper bound in
-/// two terms: `A_obs` is sized only on a non-canonical link (`k²` less on a
-/// canonical one), and the assembly no longer stores `ρ`, `w'`, `w_obs`, `h`
-/// per row (its row passes are fused, so `4n` less). Both stay in the
+/// [`packed_peak_bytes`] is that expression, an upper bound in two terms:
+/// `A_obs` is sized only on a non-canonical link (`k²` less on a canonical
+/// one), and the assembly does not store `ρ`, `w'`, `w_obs`, `h` per row (its
+/// row passes are fused, so `4n` less). Both stay in the
 /// expression on purpose: a smaller figure would let more packed shapes pass
 /// this ceiling and so change which SE path they take, a routing change left
 /// to its own study. What it leaves out
@@ -748,7 +748,7 @@ pub(crate) fn gradient_f64_with_dev(
 /// (`a_blocks`; `core_blocks` and `coupling` on the structured layout) and the
 /// packed `M` rows at the returned iterate û, which is exactly what
 /// [`assemble`] reads. The caller vouches that nothing moved them since: the
-/// GLMM gradient objective (`glmm::GradSearch`) calls this only right after the
+/// GLMM gradient objective (`glmm::grad_route::GradSearch`) calls this only right after the
 /// value evaluation at the point it accepts. Where [`gradient_f64`] re-solves
 /// the mode on the dense tail factor, this reads the value pass's own: on the
 /// structured layout with the cached sparse Schur factor in use, `schur_blk`
@@ -851,7 +851,8 @@ pub(crate) fn gradient_at_mode(
         ..
     } = pattern;
     // The factor the value pass used: the sparse one exactly when the
-    // structured solve took it (`Some(ss) if !force_dense`, blocked_extras.rs).
+    // structured solve's layout carried it (`pirls_solve_blocked_extras`
+    // drops it under `force_dense_schur`).
     let mut ss = if extras && e > 0 && !force_dense {
         structured_schur.as_mut()
     } else {
@@ -909,7 +910,7 @@ pub(crate) fn gradient_at_mode(
 /// entry. `None` also on a shape the assembly does not route (packed, AGQ,
 /// past the dual tail bound). On a dispersion-scaled workspace it reads the
 /// weights `prior_wᵢ/φ` the value evaluation left in `prior_w_phi`, and
-/// `prior_w` itself at φ = 1, as `glmm::GradSearch` does.
+/// `prior_w` itself at φ = 1, as `glmm::grad_route::GradSearch` does.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gradient_at_mode_ws(
@@ -1199,10 +1200,10 @@ pub(crate) fn joint_hessian_columns(
         .dual_scratch
         .take()
         .expect("just built or confirmed present above");
-    scratch.mode_bufs_mut().saved_u[..kk].copy_from_slice(&ws.pirls.u[..kk]);
+    scratch.mode.saved_u[..kk].copy_from_slice(&ws.pirls.u[..kk]);
     let mode_ok = mode_solve_f64(ws, x, y, cluster_ids, extra_ids, p, n, tol);
     {
-        let mode = scratch.mode_bufs_mut();
+        let mode = &mut scratch.mode;
         if !mode_ok {
             ws.pirls.u[..kk].copy_from_slice(&mode.saved_u[..kk]);
             ws.dual_scratch = Some(scratch);
@@ -1294,20 +1295,21 @@ pub(crate) fn joint_hessian_columns(
             }
         };
     }
-    let st = match &mut *scratch {
-        GlmmDualScratch::D4(bufs, idx, mode) => hess_arm!(bufs, idx, mode),
-        GlmmDualScratch::D5(bufs, idx, mode) => hess_arm!(bufs, idx, mode),
-        GlmmDualScratch::D6(bufs, idx, mode) => hess_arm!(bufs, idx, mode),
-        GlmmDualScratch::D8(bufs, idx, mode) => hess_arm!(bufs, idx, mode),
-        GlmmDualScratch::D12(bufs, idx, mode) => hess_arm!(bufs, idx, mode),
+    let GlmmDualScratch { lanes, idx, mode } = &mut *scratch;
+    let st = match lanes {
+        DualLanes::D4(bufs) => hess_arm!(bufs, idx, mode),
+        DualLanes::D5(bufs) => hess_arm!(bufs, idx, mode),
+        DualLanes::D6(bufs) => hess_arm!(bufs, idx, mode),
+        DualLanes::D8(bufs) => hess_arm!(bufs, idx, mode),
+        DualLanes::D12(bufs) => hess_arm!(bufs, idx, mode),
         // Unreachable: this slot is written only from `pick(m, false)`, so it
         // only ever holds a `Dual` variant. The arm exists because the match
         // is exhaustive over the one shared enum; decline rather than panic.
-        GlmmDualScratch::H4(..)
-        | GlmmDualScratch::H5(..)
-        | GlmmDualScratch::H6(..)
-        | GlmmDualScratch::H8(..)
-        | GlmmDualScratch::H12(..) => DerivStatus::Unsupported,
+        DualLanes::H4(..)
+        | DualLanes::H5(..)
+        | DualLanes::H6(..)
+        | DualLanes::H8(..)
+        | DualLanes::H12(..) => DerivStatus::Unsupported,
     };
     ws.dual_scratch = Some(scratch);
     st
@@ -1324,7 +1326,7 @@ pub(crate) fn joint_hessian_columns(
 /// size tried from 2048 to 65536 rows is faster than the whole-data pass on
 /// the binomial and Gamma blocked series from 30k to 3M rows, and 4096 is the
 /// fastest or within noise of it on each. The gain is cache residency and the
-/// first-touch page faults the block-sized scratch no longer takes, not less
+/// first-touch page faults the block-sized scratch avoids, not less
 /// work: user instructions move by under 2%.
 ///
 /// A pinned constant, the same on every target, so a fit splits its rows the
@@ -1668,7 +1670,6 @@ fn run_assembled_hessian<T: Seed>(
                     BetaStep::Fixed,
                     offset,
                     Some(tol),
-                    p,
                     n,
                     &mut counters,
                 );
@@ -1737,15 +1738,13 @@ fn run_assembled_hessian<T: Seed>(
             if assembled.is_none() {
                 return DerivStatus::Unsupported;
             }
-            // Same band shape as `run_gradient`'s and `run_hessian`'s own
-            // settle checks (`derivative.rs`): relative, with an absolute
-            // floor so a near-zero lane still settles.
             let settled = (pass == 0 && bufs.dual.exact)
                 || (have_prev
                     && (0..m).all(|r| {
                         let d = bufs.grad_t[r].dslice();
                         (0..width).all(|j| {
-                            (d[j] - hess[(r, base + j)]).abs() < 1e-10 * (1.0 + d[j].abs())
+                            (d[j] - hess[(r, base + j)]).abs()
+                                < DUAL_SETTLE_REL * (1.0 + d[j].abs())
                         })
                     }));
             for r in 0..m {
@@ -1986,7 +1985,6 @@ fn blocked_chunks<T: Seed>(
                     BetaStep::Fixed,
                     off_b,
                     Some(tol),
-                    p,
                     nb,
                     &mut counters,
                 );
@@ -2038,13 +2036,13 @@ fn blocked_chunks<T: Seed>(
                     bufs.grad_t[r] += rb.grad[r];
                 }
             }
-            // Same band as `run_assembled_hessian`'s settle check.
             let settled = (pass == 0 && all_exact)
                 || (have_prev
                     && (0..m).all(|r| {
                         let d = bufs.grad_t[r].dslice();
                         (0..width).all(|j| {
-                            (d[j] - hess[(r, base + j)]).abs() < 1e-10 * (1.0 + d[j].abs())
+                            (d[j] - hess[(r, base + j)]).abs()
+                                < DUAL_SETTLE_REL * (1.0 + d[j].abs())
                         })
                     }));
             for r in 0..m {
@@ -2147,7 +2145,7 @@ fn assemble<T: TailKernel>(
     // Set by [`gradient_at_mode`] only: `S⁻¹` is already in `asm.tail_inv`,
     // inverted off the value evaluation's sparse Schur factor, and `ss` is
     // that factor, for the canonical adjoint solve. Every other caller
-    // passes `false, None` and runs exactly as before.
+    // passes `false, None`.
     tail_ready: bool,
     ss: Option<&mut StructuredSchur>,
 ) -> Option<()> {
@@ -2673,20 +2671,11 @@ fn assemble<T: TailKernel>(
             );
         }
     } else {
-        for f in 0..s {
-            for r in 0..qc {
-                obs_core[f * qc * qc + r * qc + r] += T::ONE;
-            }
-        }
-        for b in 0..e {
-            obs_schur[b * e + b] += T::ONE;
-        }
+        // The +I is added at each pivot, by both factors below.
         if e == 0 {
             for f in 0..s {
                 let cb = f * qc * qc;
-                if !glmm_block_chol(&mut obs_core[cb..cb + qc * qc], qc) {
-                    return None;
-                }
+                crate::linalg::block_chol_unit_shift(&mut obs_core[cb..cb + qc * qc], qc)?;
             }
             solve_core_blocks(obs_core, qc, s, adj);
         } else {
@@ -2729,13 +2718,13 @@ fn solve_core_blocks<T: Scalar>(fac: &[T], qc: usize, s: usize, rhs: &mut [T]) {
 /// THROWAWAY counters, over the same `fill_lambda_small` → `fill_m_vals` →
 /// `pirls_solve_packed` sequence the packed arm of `laplace_deviance` runs.
 ///
-/// Warm from whatever `ws.pirls.u` holds, NOT the cold `u = 0` that arm takes
-/// under a tolerance override: this is a derivative request at the fit's own
+/// Warm from whatever `ws.pirls.u` holds, NOT the cold `u = 0` that
+/// `deviance::laplace_deviance_at` seeds the packed FD stencil from: this is a derivative request at the fit's own
 /// γ̂, so the fit's mode is the best seed there is, and the objective it
 /// converges to is the same fixed point either way.
 ///
-/// Returns the Laplace objective — `Φ(D) + ‖û‖² + log|A|`, with Gamma's `aic`
-/// substitution, exactly as that arm assembles it — or `None` when the solve
+/// Returns the Laplace objective `D + ‖û‖² + log|A|` (the bare deviance, as the
+/// packed arm of `laplace_deviance` forms it), or `None` when the solve
 /// did not converge or the objective is not finite. Leaves `ws.pirls.u` at the
 /// mode and the η-dependent state, `ws.packed.m_vals`, `ws.packed.a` and
 /// `ws.packed.a_chol` at the solve's values; the caller restores `u`.
@@ -3345,20 +3334,20 @@ fn packed_joint_hessian_columns(
             packed_hessian_chunks($bufs, ws_ro, x, y, p, n, &f64_bufs, objective, grad, hess)
         };
     }
-    let st = match &mut *scratch {
-        GlmmDualScratch::D4(bufs, ..) => chunk_arm!(bufs),
-        GlmmDualScratch::D5(bufs, ..) => chunk_arm!(bufs),
-        GlmmDualScratch::D6(bufs, ..) => chunk_arm!(bufs),
-        GlmmDualScratch::D8(bufs, ..) => chunk_arm!(bufs),
-        GlmmDualScratch::D12(bufs, ..) => chunk_arm!(bufs),
+    let st = match &mut scratch.lanes {
+        DualLanes::D4(bufs) => chunk_arm!(bufs),
+        DualLanes::D5(bufs) => chunk_arm!(bufs),
+        DualLanes::D6(bufs) => chunk_arm!(bufs),
+        DualLanes::D8(bufs) => chunk_arm!(bufs),
+        DualLanes::D12(bufs) => chunk_arm!(bufs),
         // Unreachable: this slot is written only from `pick(m, false)`, so it
         // only ever holds a `Dual` variant. The arm exists because the match
         // is exhaustive over the one shared enum; decline rather than panic.
-        GlmmDualScratch::H4(..)
-        | GlmmDualScratch::H5(..)
-        | GlmmDualScratch::H6(..)
-        | GlmmDualScratch::H8(..)
-        | GlmmDualScratch::H12(..) => DerivStatus::Unsupported,
+        DualLanes::H4(..)
+        | DualLanes::H5(..)
+        | DualLanes::H6(..)
+        | DualLanes::H8(..)
+        | DualLanes::H12(..) => DerivStatus::Unsupported,
     };
     ws.dual_scratch = Some(scratch);
     ws.packed_asm = Some(f64_bufs);

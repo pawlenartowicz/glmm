@@ -6,20 +6,8 @@
 //! (`extendr_module! { mod fastglmm; use glmm_r; }`).
 
 use extendr_api::prelude::*;
+use glmm_bind::fields::{COLUMN_MAPS, R_INDEX_FIELDS, R_INT_FIELDS};
 use glmm_bind::{BindError, Port, Record, Value};
-
-/// Fields holding positions, counted from 1 in R and from 0 in `glmm-bind`.
-/// Only these are read -1; an `Index` result is written +1 whatever
-/// its name.
-const INDEX_FIELDS: &[&str] = &["retained", "re_term_index", "null_cluster"];
-
-/// Arguments whose list maps a column name to its data: their entries are
-/// named `column "x"`, so a column's name is never read as a field's.
-const COLUMN_MAPS: &[&str] = &["numeric", "factors", "new_numeric", "new_factors"];
-
-/// Counts a fit object stores as integers; every other count leaves as a
-/// double, as the fit objects saved by earlier versions hold them.
-const INT_FIELDS: &[&str] = &["objective_nodes", "evals"];
 
 fn bad(what: &str, why: &str) -> BindError {
     BindError::invalid_argument(format!("{what} {why}"))
@@ -77,7 +65,7 @@ fn to_value(x: &Robj, what: &str) -> std::result::Result<Value, BindError> {
         }
         Rtype::Doubles => {
             let v = x.as_real_slice().unwrap_or_default();
-            if INDEX_FIELDS.contains(&what) {
+            if R_INDEX_FIELDS.contains(&what) {
                 return index(v.iter().copied(), what);
             }
             Ok(Value::Vec(v.to_vec()))
@@ -90,7 +78,7 @@ fn to_value(x: &Robj, what: &str) -> std::result::Result<Value, BindError> {
             if v.contains(&i32::MIN) {
                 return Err(bad(what, "has a missing value"));
             }
-            if INDEX_FIELDS.contains(&what) {
+            if R_INDEX_FIELDS.contains(&what) {
                 return index(v.iter().map(|&k| f64::from(k)), what);
             }
             Ok(Value::IntVec(v.iter().map(|&k| i64::from(k)).collect()))
@@ -141,13 +129,13 @@ fn index(v: impl Iterator<Item = f64>, what: &str) -> std::result::Result<Value,
 }
 
 /// A [`Value`] as an R value; `what` is its field name. Counts (`I64`,
-/// `U64`, `IntVec`) become doubles except the [`INT_FIELDS`]; an `Index`
-/// becomes 1-based integers.
+/// `U64`, `IntVec`) become doubles except the [`R_INT_FIELDS`]; an `Index`
+/// becomes 1-based integers (only the [`R_INDEX_FIELDS`] are read back −1).
 fn to_r(v: Value, what: &str) -> Robj {
     match v {
         Value::Null => r!(NULL),
         Value::Bool(b) => r!(b),
-        Value::I64(n) if INT_FIELDS.contains(&what) => {
+        Value::I64(n) if R_INT_FIELDS.contains(&what) => {
             i32::try_from(n).map_or_else(|_| r!(n as f64), |k| r!(k))
         }
         Value::I64(n) => r!(n as f64),

@@ -35,7 +35,7 @@
 set -euo pipefail
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CRATE_ROOT="$(cd "$SELF/../../.." && pwd)"       # GLMM/
+CRATE_ROOT="$(cd "$SELF/../../.." && pwd)"       # repo root
 PATCH_FILE="$SELF/pulp-0.22.2-scalar-force.patch"
 PULP_VERSION="0.22.2"
 

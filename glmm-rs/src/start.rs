@@ -1,9 +1,8 @@
 //! `StartValues` — the warm-start primitive.
 //!
 //! Raw optimizer state, *not* high-level variances: the dominant use is threading
-//! the previous fit's state into the next refit (loop tier / future inference
-//! layer), so it mirrors what the kernels already hold (`ws.params`/`theta`, the β
-//! estimate). The stable `fit_with_start` takes this as its warm start; `fit`
+//! the previous fit's state into the next refit (loop tier), so it mirrors what
+//! the kernels already hold (`ws.params`/`theta`, the β estimate). The stable `fit_with_start` takes this as its warm start; `fit`
 //! omits it and cold-starts the kernels with `theta_start = None`. A stable
 //! input, so `pub`.
 //!

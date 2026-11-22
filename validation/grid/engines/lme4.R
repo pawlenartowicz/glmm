@@ -83,18 +83,16 @@ CALC_DERIVS <- TRUE
 
 # The manifest's family + link pair -> an R family object.
 #
-# Two traps live here and nowhere else. R's Gamma() defaults to the INVERSE
-# link, so the link is always passed explicitly rather than defaulted. And the
-# manifest spells the inverse-Gaussian second link `inverse_squared` where R
-# spells it `1/mu^2`; this is the one place that mapping is applied.
+# R's Gamma() defaults to the INVERSE link, so the link is always passed
+# explicitly rather than defaulted; common.R's r_link spells the
+# inverse-Gaussian one R's way.
 fam_obj <- function(family, link) {
   switch(family,
     gaussian = stats::gaussian(link = link),
     binomial = stats::binomial(link = link),
     poisson  = stats::poisson(link = link),
     gamma    = stats::Gamma(link = link),
-    inversegaussian = stats::inverse.gaussian(
-      link = if (identical(link, "inverse_squared")) "1/mu^2" else link),
+    inversegaussian = stats::inverse.gaussian(link = r_link(link)),
     stop("unsupported family: ", family))
 }
 
@@ -224,20 +222,6 @@ record_glm <- function(cell, m, rec) {
   rec
 }
 
-# Runs `expr` and returns its value together with every warning it raised,
-# instead of letting the warnings go to the console where nothing records them.
-# lme4's vcov signals a warning and still RETURNS A VALUE when it substitutes
-# one estimator for another, so the warning is the only evidence that the number
-# is not the one that was asked for.
-with_warnings <- function(expr) {
-  w <- character(0)
-  v <- withCallingHandlers(expr, warning = function(cond) {
-    w <<- c(w, conditionMessage(cond))
-    invokeRestart("muffleWarning")
-  })
-  list(value = v, warnings = w)
-}
-
 se_of <- function(V) I(unname(sqrt(diag(as.matrix(V)))))
 
 record_mixed <- function(cell, m, rec) {
@@ -247,18 +231,11 @@ record_mixed <- function(cell, m, rec) {
   # of hundreds cannot proceed without knowing which one fired, so the text is
   # carried through verbatim.
   msgs <- as.character(unlist(m@optinfo$conv$lme4$messages))
-  # lme4 skips its own gradient checks above `check.conv.nobsmax` rows, so on
-  # most grid cells its messages are empty even when the optimizer stopped at its
-  # evaluation budget. The optimizer's return code and warnings (in `optinfo`)
-  # are the only record of that, and either one makes the fit unconverged.
-  opt_code <- m@optinfo$conv$opt
-  opt_warn <- as.character(unlist(m@optinfo$warnings))
-  opt_failed <- (!is.null(opt_code) && !identical(as.numeric(opt_code), 0)) ||
-                length(opt_warn) > 0
-  rec$converged <- length(msgs) == 0 && !opt_failed
-  notes <- c(msgs, opt_warn)
-  if (!is.null(opt_code) && !identical(as.numeric(opt_code), 0) && !length(opt_warn))
-    notes <- c(notes, sprintf("optimizer return code %s", format(opt_code)))
+  opt <- lme4_opt_status(m)
+  rec$converged <- length(msgs) == 0 && !opt$failed
+  notes <- c(msgs, opt$warnings)
+  if (opt$failed && !length(opt$warnings))
+    notes <- c(notes, sprintf("optimizer return code %s", format(opt$code)))
   rec$singular <- lme4::isSingular(m)
   # On a negative-binomial cell this is the FINAL inner glmer's evaluation count,
   # which is the only one the fitted object keeps: glmer.nb's outer profiling over

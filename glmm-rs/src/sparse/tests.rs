@@ -167,13 +167,55 @@ fn run_nested_route_matches_forced_crossed_sparse() {
     }
 }
 
+/// A design with more than 64 variance components is refused as
+/// `FitError::Envelope`, on the LMM and the GLMM: `Diagnostics::pinned` is
+/// read off a 64-bit mask, so a pinned component past the 64th could not be
+/// reported. 70 intercept groupings, crossed; 64 pass the shape check.
+#[test]
+fn more_than_64_variance_components_are_refused() {
+    let n = 80;
+    let x = vec![1.0f64; n];
+    let mut st = 5u64;
+    let y: Vec<f64> = (0..n).map(|_| 1.0 + 0.5 * lcg(&mut st)).collect();
+    let counts: Vec<f64> = (0..n).map(|i| (i % 3) as f64).collect();
+    let spec = |n_extra: usize, family: Family| {
+        ModelSpec::mixed(
+            family,
+            ReStructure {
+                terms: Vec::new(),
+                slopes: vec![],
+                extra_groupings: vec![Grouping::crossed(); n_extra],
+            },
+        )
+    };
+    let ids = |n_extra: usize| crate::GroupIds {
+        primary: (0..n).map(|i| (i % 4) as u32).collect(),
+        extra: (0..n_extra)
+            .map(|g| (0..n).map(|i| ((i + g) % (2 + g % 3)) as u32).collect())
+            .collect(),
+    };
+    let opts = crate::FitOptions::default();
+    let (ids69, ids63) = (ids(69), ids(63));
+    let poisson = Family::Poisson {
+        link: crate::PoissonLink::Log,
+    };
+    for (family, y) in [(Family::Gaussian, &y), (poisson, &counts)] {
+        let data = crate::Data::new(&x, y, n, 1).ids(&ids69);
+        let refused = crate::fit(&data, &spec(69, family), &opts);
+        assert!(
+            matches!(refused, Err(crate::FitError::Envelope(_))),
+            "{family:?}: {:?}",
+            refused.map(|f| f.converged())
+        );
+        let data = crate::Data::new(&x, y, n, 1).ids(&ids63);
+        assert!(crate::fit::validate(&data, &spec(63, family), None, &opts).is_ok());
+    }
+}
+
 /// A >32-variance-component design (over-envelope-by-count ⇒ sparse) fits
-/// through the sparse-Z path without the two grouping-cap panics the shared
-/// NoZ structures would hit: `add_rows_multi`'s fixed `[usize; 1+MAX_EXTRA_
-/// GROUPINGS]` gid array (dropped from `SparseLmmWorkspace::new`)
-/// and `from_cluster_spec_ext`'s `n_extras <= MAX_EXTRA_GROUPINGS` guard
-/// (removed). 33 components (1 primary + 32 crossed) also exceeds
-/// the old 32-bit `pinned_components` ceiling (u64 now).
+/// through the sparse-Z path, which has no fixed-size gid array and no
+/// `n_extras <= MAX_EXTRA_GROUPINGS` guard. 33 components (1 primary + 32
+/// crossed) also exceed 32 bits of `pinned_components` (a u64).
 #[test]
 fn sparse_over_32_components_no_overflow() {
     const N_EXTRA: usize = 32; // > MAX_EXTRA_GROUPINGS=6 ⇒ Sparse; +1 primary ⇒ 33 comps
@@ -566,7 +608,8 @@ fn run_sparse_deviance_equals_dense_crossed() {
         p,
         None,
         crate::lmm::Criterion::Reml,
-    );
+    )
+    .unwrap();
 
     // θ has 2 scalar components here (primary intercept var, crossed var).
     for criterion in [crate::lmm::Criterion::Reml, crate::lmm::Criterion::Ml] {
@@ -742,7 +785,8 @@ fn sparse_deviance_equals_dense_primary_slope_balanced_zero() {
         p,
         None,
         crate::lmm::Criterion::Reml,
-    );
+    )
+    .unwrap();
 
     // θ = vech(Λ) with all three components nonzero → Λ genuinely non-diagonal.
     for theta in [[0.8f64, 0.3, 0.6], [1.0, 0.5, 0.4], [0.2, 0.7, 0.9]] {
@@ -814,6 +858,7 @@ fn sparse_tail_pattern_two_family_cliques_unobserved_level() {
             None,
             crate::lmm::Criterion::Reml,
         )
+        .unwrap()
     });
     let tail = ws_sparse.tail.as_ref().expect("forced sparse tail");
     let sym = tail.axx.symbolic();
@@ -840,7 +885,8 @@ fn sparse_tail_pattern_two_family_cliques_unobserved_level() {
         p,
         None,
         crate::lmm::Criterion::Reml,
-    );
+    )
+    .unwrap();
     assert!(ws_dense.tail.is_none(), "e=5 stays on the dense tail bare");
     for theta in [[0.5f64, 0.7], [1.0, 0.2], [0.1, 1.3]] {
         let d = super::sparse_reml_deviance(&theta, &mut ws_dense);
@@ -947,7 +993,8 @@ fn sparse_tail_natural_over_cutover_matches_noz() {
             p,
             None,
             crate::lmm::Criterion::Reml,
-        );
+        )
+        .unwrap();
         assert!(ws.tail.is_some(), "e=150 routes sparse naturally");
     }
     let sp = crate::fit::fit_mle_sparse_pub(
@@ -1061,8 +1108,8 @@ fn build_case(
         "primary_random_slope_q2" => {
             // (1 + x | g): q_p=2 primary with random slope on col 1. The key
             // q_p>1 runtime gate — exercises the non-diagonal primary Λ block
-            // in both the dense (general family elimination; no extra
-            // groupings, so not the blocked tail) and sparse paths.
+            // in both the dense (general family elimination) and sparse
+            // paths.
             let n = 24;
             let p = 2;
             let (xflat, y, pid) = build_case_fill(17, 4, 0.5, 0.3);
@@ -1501,6 +1548,7 @@ fn family_downdate_dense_route_matches_scatter_route() {
                 None,
                 crate::lmm::Criterion::Reml,
             )
+            .unwrap()
         })
     });
     assert!(
@@ -1563,6 +1611,7 @@ fn family_downdate_dense_route_matches_scatter_route() {
                 None,
                 crate::lmm::Criterion::Reml,
             )
+            .unwrap()
         })
     });
     assert!(
@@ -1628,6 +1677,7 @@ fn family_downdate_dense_route_vetoed_above_the_memory_cap() {
             None,
             crate::lmm::Criterion::Reml,
         )
+        .unwrap()
     };
     let is_dense = |ws: &super::SparseLmmWorkspace| {
         matches!(
@@ -1823,11 +1873,11 @@ fn run_sparse_vs_noz_cross_check_table(cases: &[&str]) {
             noz.varcorr.len(),
             "{label}: varcorr block count"
         );
-        // The dense kernel searches the per-group route's shape with BFGS
-        // (since 0.5.0), the sparse kernel with BOBYQA, so there the two
-        // endpoints agree to the optimizers' tolerance rather than to one
-        // search path: on `primary_random_slope_q2` the deviances differ by
-        // 3.4e-11 (BFGS above) and varcorr by 1.2e-6 (x86, 2026-10-07).
+        // The dense kernel searches the per-group route's shape with BFGS,
+        // the sparse kernel with BOBYQA, so there the two endpoints agree to
+        // the optimizers' tolerance rather than to one search path: on
+        // `primary_random_slope_q2` the deviances differ by 3.4e-11 (BFGS
+        // above) and varcorr by 1.2e-6 (x86).
         let band = if *label == "primary_random_slope_q2" {
             1e-5
         } else {
@@ -1851,9 +1901,10 @@ fn run_sparse_vs_noz_cross_check_table(cases: &[&str]) {
 
 /// One cell of the crossover grid. All structural cells sit inside the NoZ
 /// overlap envelope (`q_p ≤ MAX_PRIMARY_Q`, `n_extra ≤ MAX_EXTRA_GROUPINGS`,
-/// `q_g ≤ MAX_EXTRA_Q`) so both kernels are valid on every cell; each side
-/// is forced directly (`fit_mle_noz_pub` / `fit_mle_sparse_pub`), bypassing
-/// `classify_design` — whose q_g performance boundary these sweeps set.
+/// intercept-only extras, `q_g = 1`) so both kernels are valid on every
+/// cell; each side is forced directly (`fit_mle_noz_pub` /
+/// `fit_mle_sparse_pub`), bypassing `classify_design`. A cell with `q_g > 1`
+/// fits only on the sparse kernel (`crossover_worst_cell_deviance_matches_brute_force`).
 /// Widths include the intercept: `q_p = 1 + primary slopes`,
 /// `q_g = 1 + per-extra slopes`.
 #[derive(Clone, Copy)]
@@ -1889,23 +1940,24 @@ fn re_cols(c: &GridCell) -> usize {
             .sum::<usize>()
 }
 
-/// Cells too slow for the default `cargo test` gate; they run in the
-/// `#[ignore]`d `noz_sparse_grid_agrees_heavy`. Cut from the 2026-07-01
-/// release calibration timings: these eight cells cost 27–242s each in
-/// release (wide-θ BOBYQA — q_g=4 puts 10 vech entries per extra grouping —
-/// or big dense primary patches); the remaining 13 cells total ~4s release.
-/// The default subset still spans every axis endpoint except q_g=4, whose
-/// only always-on coverage is the over-width pin
-/// (`fit_wide_slopes_sparse_is_pinned`, q_g=5) vs Sparse — that anchors
-/// Sparse to a validated answer, not Sparse to NoZ, so the on-demand heavy run is the
-/// only place the NoZ↔Sparse comparison reaches q_g=4.
+/// The cells that run in `noz_sparse_grid_agrees_heavy`
+/// (big dense primary patches), cut from the 2026-07-01 release calibration
+/// timings. Measured 2026-11-19 they take 0.0–0.3s each in release. The
+/// default subset still spans every axis endpoint.
 fn is_heavy_cell(c: &GridCell) -> bool {
-    c.q_g >= 4 || (c.q_p >= 4 && c.n_primary >= 200) || (c.q_p >= 6 && c.n_primary >= 50)
+    (c.q_p >= 4 && c.n_primary >= 200) || (c.q_p >= 6 && c.n_primary >= 50)
 }
 
 /// The structural grid: a 2D `q_p × n_primary` patch
 /// (`n_extra = 0`) catching the interaction pure OAT would miss, plus a
-/// crossed slice (`n_extra × q_g` at `q_p=2, n_primary=50`). 21 cells.
+/// slice of crossed intercept-only extras (`n_extra ∈ {2, 4, 6}` at `q_p=2,
+/// n_primary=50`). 18 cells. A slope on an extra grouping has no dense
+/// kernel, so the grid has none.
+///
+/// The position of a cell in this vector is load-bearing — it seeds that
+/// cell's data (`build_grid_case`), so the list is built whole and then
+/// filtered by weight. A cell therefore gets the same data whichever of the
+/// two gates runs it.
 fn crossover_structures() -> Vec<GridCell> {
     let mut cells = Vec::new();
     for &q_p in &[1usize, 2, 4, 6, 8] {
@@ -1919,16 +1971,14 @@ fn crossover_structures() -> Vec<GridCell> {
             });
         }
     }
-    for &q_g in &[1usize, 4] {
-        for &n_extra in &[2usize, 4, 6] {
-            cells.push(GridCell {
-                n: 0,
-                n_primary: 50,
-                q_p: 2,
-                n_extra,
-                q_g,
-            });
-        }
+    for &n_extra in &[2usize, 4, 6] {
+        cells.push(GridCell {
+            n: 0,
+            n_primary: 50,
+            q_p: 2,
+            n_extra,
+            q_g: 1,
+        });
     }
     for c in cells.iter_mut() {
         c.n = TIMING_ROWS_PER_RE_COL * re_cols(c);
@@ -2038,32 +2088,6 @@ fn build_grid_case(
     (xflat, y, n, p, model, ids, opts)
 }
 
-/// The cells both grid-agreement gates draw from: the 21 structural cells
-/// plus two appended q_g ∈ {2,3} boundary cells.
-///
-/// The position of a cell in this vector is load-bearing — it seeds that
-/// cell's data (`build_grid_case`), so the list is built whole and then
-/// filtered by weight. A cell therefore gets the same data whichever of the
-/// two gates runs it, and appending (never inserting) keeps the original 21
-/// on the indices their 2026-07-01 calibration was measured at.
-fn grid_agreement_cells() -> Vec<GridCell> {
-    let mut cells = crossover_structures();
-    // q_g ∈ {2,3} coverage at the routing boundary: these widths now route
-    // to Sparse (`classify_design`'s slope-extra clause), so NoZ=Sparse
-    // parity must hold here too. n_extra=2 keeps both cheap enough
-    // (~4 s release combined) for the default gate.
-    for &q_g in &[2usize, 3] {
-        cells.push(GridCell {
-            n: 0,
-            n_primary: 50,
-            q_p: 2,
-            n_extra: 2,
-            q_g,
-        });
-    }
-    cells
-}
-
 /// Accuracy gate: NoZ = Sparse across the overlap envelope.
 /// A disagreement is a bug in exactly one path, never a tuning knob (NoZ is
 /// the oracle for the overlap; Sparse is separately anchored to lme4 by the
@@ -2082,12 +2106,10 @@ fn grid_agreement_cells() -> Vec<GridCell> {
 /// sparse profiled-REML objectives agree to ≤1.3e-14 relative —
 /// essentially the same function. With the diagonal θ boxed at `[0,
 /// THETA_HI]` that cell split (sparse stopped on a face Λ_jj = 0 at
-/// −202.142398734 while dense reached −207.553008925, and the heavy half's
-/// cell 20 split the same way, 1.9 deviance units apart); under the signed
+/// −202.142398734 while dense reached −207.553008925); under the signed
 /// box (`blind_theta_and_bounds`) both routes reach the lower basin cold
-/// (cell 12: −207.553008931 / −207.553008925; cell 20: −737.059439657 /
-/// −737.059439629, measured 2026-09-10). Cell 12 has a saddle a sparse
-/// search can stop on (see `noz_sparse_grid_agrees`); cell 20 does not.
+/// (−207.553008931 / −207.553008925, measured 2026-09-10). Cell 12 has a
+/// saddle a sparse search can stop on (see `noz_sparse_grid_agrees`).
 ///
 /// The per-quantity checks below only run when the two routes' deviances
 /// agree (same basin, `DEV_TOL`); on a split, β/se/varcorr comparison would
@@ -2102,16 +2124,13 @@ fn grid_agreement_cells() -> Vec<GridCell> {
 /// `expected_splits` is the exact, frozen set of cell indices (within this
 /// `heavy` half) allowed to basin-split.
 fn run_grid_agreement(heavy: bool, label: &str, expected_splits: &[usize]) {
-    // Frozen after the 2026-07-01 full-grid calibration run (release):
-    // observed max rel |Δ| = 2.37e-5, at the q_g=4 crossed cells whose
-    // θ-space is 23–63-dimensional. That exceeds the 1e-6 starting bound,
-    // so the worst cell was investigated before loosening:
-    // `crossover_worst_cell_deviance_parity` shows dense and sparse
-    // deviance agree there to rel ~1e-15 at arbitrary θ, so the gap is
-    // purely BOBYQA termination scatter between two independent
-    // high-dimensional minimizations — not a path bug. 1e-4 gives ~4×
-    // margin over the observed max. Loosen further ONLY with a comparable
-    // documented numerical reason.
+    // The bound comes from a full-grid calibration whose grid held cells with
+    // a slope on an extra grouping (q_g = 4): their max rel |Δ| was 2.37e-5,
+    // BOBYQA termination scatter between two independent minimizations of
+    // one objective, and 1e-4 gives ~4× margin over it. On the current grid
+    // the max is 4.7e-7: 4.668e-7 on the cheap half (cell 17, varcorr) and
+    // 3.463e-7 on the heavy half (cell 13, varcorr), measured 2026-11-19 on
+    // x86_64. Loosen ONLY with a documented numerical reason.
     //
     // Shared by both weights deliberately: the bound is a statement about the
     // two kernels, not about cell size, and the cheap gate having slack under
@@ -2124,7 +2143,7 @@ fn run_grid_agreement(heavy: bool, label: &str, expected_splits: &[usize]) {
     const DEV_TOL: f64 = 1e-6;
     let mut max_rel = 0f64;
     let mut worst = String::new();
-    let cells = grid_agreement_cells();
+    let cells = crossover_structures();
     let mut checked = 0usize;
     let mut splits = Vec::new();
     for (idx, c) in cells
@@ -2220,6 +2239,8 @@ fn run_grid_agreement(heavy: bool, label: &str, expected_splits: &[usize]) {
         "{label}: {checked} cells checked, {} basin splits, max rel |Δ| = {max_rel:.3e} at {worst}",
         splits.len()
     );
+    // An edit that empties or reshapes a half fails here.
+    assert_eq!(checked, if heavy { 5 } else { 13 }, "{label}: cell count");
     // A basin split is not a silent skip: the exact set that's allowed to
     // split is frozen here, so an unexpected split (new cell, or a listed
     // one converging to one basin again) fails the test instead of passing
@@ -2230,10 +2251,8 @@ fn run_grid_agreement(heavy: bool, label: &str, expected_splits: &[usize]) {
     );
 }
 
-/// The always-on half of the accuracy gate: the 15 cheap cells, ~4s release.
-/// Spans every axis endpoint except q_g=4 — see `is_heavy_cell` for what
-/// covers that width instead. Any other split fails loudly (see
-/// `run_grid_agreement`'s doc comment).
+/// The always-on half of the accuracy gate: the 13 cheap cells, ~4s release.
+/// Any split fails loudly (see `run_grid_agreement`'s doc comment).
 ///
 /// No cell splits. Cell 12 (n_primary=10, q_p=8) has a saddle at
 /// −207.552516350 (finite-difference Hessian minimum eigenvalue −0.053) next
@@ -2241,131 +2260,28 @@ fn run_grid_agreement(heavy: bool, label: &str, expected_splits: &[usize]) {
 /// sparse search can stop on it: a flat-surface stopping point, not a path
 /// disagreement (a restart from the saddle reaches the minimum). From the
 /// blind start at `RHO_BEGIN` = 0.5 both routes reach the minimum.
-/// Re-pinned 2026-10-02 (x86_64) with the per-search BOBYQA start radii:
-/// cell 12's sparse deviance moved from −207.552516350 to −207.553008921
-/// (Δdev −4.9e-4) and NoZ's by +3.9e-9, both converged and singular with the
-/// same pinned component, so cell 12 left the frozen split list.
-/// Measured 2026-10-02 on x86_64, with the dense route reading `U` off the
-/// Gram (`GRAM_PIVOT_MIN`) and the sparse route through its Givens pass:
-/// 15 cells, splits [], max rel |Δ| = 2.091e-6 at cell 9 (varcorr).
+/// Measured 2026-11-19 on x86_64: splits [], max rel |Δ| = 4.668e-7 at cell
+/// 17 (varcorr).
 #[test]
 fn noz_sparse_grid_agrees() {
     run_grid_agreement(false, "noz_sparse_grid_agrees", &[]);
 }
 
-/// The other half: the 8 cells of `is_heavy_cell`, 27–242s each in release.
-/// `#[ignore]`d purely on cost — nothing here needs a feature or a locked
-/// machine, it is the same comparison as the cheap half on wider cells.
-/// Run it when a change could move the NoZ or Sparse θ-search:
-///
-/// ```sh
-/// cargo test --release noz_sparse_grid_agrees_heavy -- --ignored --nocapture
-/// ```
-///
-/// No cell splits (cell 20, the grid's widest θ space at 63 coordinates,
-/// did with the diagonal θ boxed at ≥ 0 — see `run_grid_agreement`'s doc
-/// comment); the eight cells agree at max rel 3.1e-6 (cell 20, varcorr),
-/// measured 2026-09-10 on x86_64.
+/// The other half: the 5 cells of `is_heavy_cell`, 0.0–0.3s each in release
+/// (measured 2026-11-19): the same comparison as the cheap half on wider
+/// cells. No cell splits; the five cells agree at max rel 3.463e-7 (cell 13,
+/// varcorr), measured 2026-11-19 on x86_64.
 #[test]
-#[ignore = "8 heavy cells, 27–242s each — run on demand (see doc-comment)"]
 fn noz_sparse_grid_agrees_heavy() {
-    // Serialized under alloc-tests so its allocations can't land in a
-    // concurrent dhat profiler window on an `-- --ignored` run.
-    #[cfg(feature = "alloc-tests")]
-    let _serial = crate::test_support::alloc_test_guard();
     run_grid_agreement(true, "noz_sparse_grid_agrees_heavy", &[]);
 }
 
-/// Conditional-mode parity on the blocked dense path. `classify_design`
-/// sends any design with an extra-grouping slope to the sparse solver, so
-/// `recover_ranef_blocked` is unreachable from `fit_cold` — the only way in
-/// is the forced-NoZ entry point, exactly as `noz_sparse_grid_agrees` reaches
-/// the blocked deviance. The sparse side is the reference here because
-/// `tests/lmm_ranef.rs` anchors it to a brute-force dense BLUP solve.
-///
-/// Same relative bound and same reason as `noz_sparse_grid_agrees`: the two
-/// paths are separate BOBYQA minimizations, so θ* — and with it b̂ — may
-/// legitimately differ a little more than round-off.
+/// The sparse deviance on a wide extra-slope design (q_p = 2, two crossed
+/// extras with q_g = 4, n = 576) against the brute-force deviance on the
+/// explicit marginal `V` at the same θ, under both criteria. Cheap (8
+/// deviance evaluations per criterion, no optimization).
 #[test]
-fn noz_sparse_ranef_agrees() {
-    const TOL: f64 = 1e-4;
-    let c = GridCell {
-        n: 0,
-        n_primary: 20,
-        q_p: 2,
-        n_extra: 1,
-        q_g: 2,
-    };
-    let cell = GridCell {
-        n: ACCURACY_ROWS_PER_RE_COL * re_cols(&c),
-        ..c
-    };
-    let (xflat, y, n, p, model, ids, opts) = build_grid_case(&cell, 0x5eed_ba1d);
-    let (sized, ids, _perm) = crate::fit::spec_sized_from_ids(&model, &ids, true);
-    let noz = crate::fit::fit_mle_noz_pub(
-        &xflat,
-        &y,
-        None,
-        None,
-        n,
-        p,
-        &sized,
-        &ids.primary,
-        &ids.extra,
-        None,
-        &opts,
-    );
-    let sp = crate::fit::fit_mle_sparse_pub(
-        &xflat,
-        &y,
-        None,
-        None,
-        n,
-        p,
-        &sized,
-        &ids.primary,
-        &ids.extra,
-        None,
-        &opts,
-    );
-    assert!(
-        noz.converged() && sp.converged(),
-        "both paths must converge"
-    );
-    assert_eq!(
-        noz.ranef_levels, sp.ranef_levels,
-        "blocked and sparse must report the same per-grouping level counts"
-    );
-    assert_eq!(noz.ranef.len(), sp.ranef.len(), "ranef length");
-    assert!(
-        !noz.ranef.is_empty() && noz.ranef.iter().all(|v| v.is_finite()),
-        "blocked path must recover ranef"
-    );
-    let mut max_rel = 0f64;
-    for (k, (a, b)) in noz.ranef.iter().zip(sp.ranef.iter()).enumerate() {
-        let rel = (a - b).abs() / (1.0 + b.abs());
-        max_rel = max_rel.max(rel);
-        assert!(rel <= TOL, "ranef[{k}]: noz={a} sparse={b} rel={rel:.3e}");
-    }
-    assert_eq!(noz.fitted.len(), n, "blocked path must report fitted");
-    for (i, (a, b)) in noz.fitted.iter().zip(sp.fitted.iter()).enumerate() {
-        let rel = (a - b).abs() / (1.0 + b.abs());
-        max_rel = max_rel.max(rel);
-        assert!(rel <= TOL, "fitted[{i}]: noz={a} sparse={b} rel={rel:.3e}");
-    }
-    eprintln!("noz_sparse_ranef_agrees: max rel |Δ| = {max_rel:.3e}");
-}
-
-/// Deviance-level parity on the grid's worst-disagreeing cell (q_p=2,
-/// n_extra=2, q_g=4 — the max-|Δ| cell of the 2026-07-01 calibration run).
-/// Dense and sparse deviance agree here to rel ~1e-15 at arbitrary θ, which
-/// is the evidence behind `noz_sparse_grid_agrees`' frozen 1e-4 tolerance:
-/// the fit-level gap on this cell (2.4e-5) is BOBYQA termination scatter,
-/// not a path bug. Cheap (8 deviance evals per criterion, no optimization),
-/// so it stays in the default gate as the standing witness for that
-/// calibration argument.
-#[test]
-fn crossover_worst_cell_deviance_parity() {
+fn crossover_worst_cell_deviance_matches_brute_force() {
     use faer::Mat;
     let c = GridCell {
         n: 0,
@@ -2378,6 +2294,7 @@ fn crossover_worst_cell_deviance_parity() {
         n: ACCURACY_ROWS_PER_RE_COL * re_cols(&c),
         ..c
     };
+    // The seed of grid cell 18 when the grid still held this cell.
     let (xflat, y, n, p, model, ids, _opts) = build_grid_case(&cell, 0x5eed_0000 + 18);
     let x = Mat::<f64>::from_fn(n, p, |i, j| xflat[i * p + j]);
     let prim_slopes: Vec<usize> = (1..cell.q_p).collect();
@@ -2385,16 +2302,7 @@ fn crossover_worst_cell_deviance_parity() {
         (0..cell.n_extra).map(|_| (1..cell.q_g).collect()).collect();
     let sized = crate::fit::spec_sized_from_ids(&model, &ids, true).0;
     let g = crate::lmm::LmmGroupings::from_cluster_spec_ext(&sized, &prim_slopes, &extra_slopes);
-    let mut suff = crate::lmm::LmmSuffStats::with_groupings(p, g.clone());
-    suff.add_rows_multi(
-        x.as_ref(),
-        x.as_ref().subcols(0, 0),
-        &y,
-        &ids.primary,
-        &ids.extra,
-        None,
-    );
-    let mut fit = crate::lmm::LmmFitScratch::with_groupings(p, &g);
+    assert!(g.extra_slopes_any);
     let mut ws = super::SparseLmmWorkspace::new(
         &g,
         x.as_ref(),
@@ -2406,39 +2314,46 @@ fn crossover_worst_cell_deviance_parity() {
         p,
         None,
         crate::lmm::Criterion::Reml,
-    );
-    let n_theta = 3 + 2 * 10; // vech(2x2) + 2·vech(4x4)
-
-    // The dense side is `reml_deviance_blocked` (slopes on the extras), so this
-    // is also its parity with the sparse kernel under each criterion.
-    assert!(g.extra_slopes_any);
+    )
+    .unwrap();
+    let (n_prim, n_ext) = (3, 10); // vech(2×2), vech(4×4)
+    let n_theta = n_prim + 2 * n_ext;
+    let mut checks = 0;
     for criterion in [crate::lmm::Criterion::Reml, crate::lmm::Criterion::Ml] {
-        fit.criterion = criterion;
         ws.criterion = criterion;
         let mut st = 99u64;
         let mut max_rel = 0.0f64;
-        for t in 0..8 {
+        for _ in 0..8 {
             let theta: Vec<f64> = (0..n_theta).map(|_| 0.3 + 0.6 * lcg(&mut st)).collect();
-            let dense = crate::lmm::reml_deviance(&theta, &suff, &mut fit);
             let sparse = super::sparse_reml_deviance(&theta, &mut ws);
-            let rel = (dense - sparse).abs() / (1.0 + dense.abs());
-            eprintln!(
-                "{criterion:?} θ set {t}: dense={dense:.12e} sparse={sparse:.12e} rel={rel:.3e}"
+            let brute = crate::test_support::brute_force_deviance(
+                &x,
+                &y,
+                None,
+                &[
+                    (&ids.primary, &prim_slopes, &theta[..n_prim]),
+                    (
+                        &ids.extra[0],
+                        &extra_slopes[0],
+                        &theta[n_prim..n_prim + n_ext],
+                    ),
+                    (&ids.extra[1], &extra_slopes[1], &theta[n_prim + n_ext..]),
+                ],
+                criterion,
             );
-            max_rel = max_rel.max(rel);
+            max_rel = max_rel.max((sparse - brute).abs() / (1.0 + brute.abs()));
+            checks += 1;
         }
-        eprintln!("{criterion:?} worst-cell deviance parity: max rel = {max_rel:.3e}");
-        assert!(
-            max_rel < 1e-8,
-            "{criterion:?}: deviance functions disagree, a real path bug"
-        );
+        eprintln!("{criterion:?}: sparse against brute force, max rel = {max_rel:.3e}");
+        assert!(max_rel < 1e-8, "{criterion:?}: max rel {max_rel:.3e}");
     }
+    assert_eq!(checks, 16);
 }
 
 /// OVER-WIDTH lme4 REML golden: `y ~ 1 + x1+x2+x3+x4 + (1|gp) + (1 + x1+x2+x3+x4 | ge)`.
-/// `ge` carries q_g = 5 (intercept + 4 slopes) > `MAX_EXTRA_Q = 4`, so the design is
-/// over-envelope by a single grouping's WIDTH — the one over-cap axis with NO dense
-/// (NoZ) twin, since NoZ physically cannot run q_g>4. The sparse-vs-NoZ cross-check
+/// `ge` carries q_g = 5 (intercept + 4 slopes). A slope on an extra grouping routes
+/// Sparse, and the dense (NoZ) kernels build intercept-only extras, so this design
+/// has NO dense twin. The sparse-vs-NoZ cross-check
 /// (`sparse_vs_noz_cross_check_table`) therefore never reaches q_g>1, so this rung is
 /// the *sole* check on the extras LEVEL-MAJOR multi-slope Z column layout at width 5.
 /// A wrong layout corrupts the whole fit, so the full 15-element vech of the `ge`
@@ -2448,22 +2363,6 @@ fn crossover_worst_cell_deviance_parity() {
 /// Values recorded from glmm. They are validated by `sim_wide_slopes_lmm`, whose
 /// cross-engine cell checks the same fit against lme4.
 ///
-/// Re-pinned 2026-08-23 with random-effect design column scaling: `ge` carries
-/// four real column scales, so this fit sits in the reassociation band the change
-/// allows (worst move here 1.2e-4 on the `ge` off-diagonal covariance).
-/// Re-pinned 2026-09-10 with every θ coordinate boxed [−THETA_HI, THETA_HI]
-/// (`blind_theta_and_bounds`): the box changes BOBYQA's interpolation set on
-/// every fit, and here the deviance moved 1.9e-9 (−433.5431481841 →
-/// −433.5431481822, 796 → 610 evaluations), worst move 4.0e-6 absolute on
-/// the `ge` off-diagonal covariance −0.02568 — 1.6e-4 relative, over `BAND`
-/// only because that entry is small.
-/// Re-pinned 2026-09-28 with the fixed-effect orthogonalization
-/// (`lmm::DesignQr`): the objective's last bits change, so BOBYQA stops at a
-/// neighbouring point of the same optimum. The deviance improved by 1.7e-9
-/// (−433.5431481822 → −433.5431481840, 610 → 569 evaluations); worst move
-/// 2.9e-6 absolute on the same `ge` off-diagonal covariance (1.1e-4 relative),
-/// then 5.1e-5 on the smallest `ge` entry, everything else ≤ 1.6e-5.
-///
 /// Relative-tolerance, not bit-equal. These values reproduce BIT-EXACTLY on the
 /// anchor machine (see `fit::common_tests::assert_pinned`, "which machine the
 /// pins are frozen on"); `BAND` is margin for aarch64-apple-darwin, which drifts
@@ -2471,13 +2370,13 @@ fn crossover_worst_cell_deviance_parity() {
 /// kernel's long reductions. ~36x that: loose enough to absorb cross-arch
 /// reassociation, tight enough that a real change in the fit still trips it.
 ///
-/// Re-measured 2026-10-07 on aarch64-apple-darwin (Apple M4) against the 0.5.0
-/// tree: beta 9.9e-8, se 1.3e-6, gp varcorr 5.0e-6, sigma2 2.3e-7, but the `ge`
-/// block's smallest entry (vech[13], 0.00838) drifts 5.06e-5 relative (4.2e-7
-/// absolute), just over `BAND`. That entry is small, so its relative drift is
+/// Measured on aarch64-apple-darwin (Apple M4): beta 9.9e-8, se 1.3e-6, gp
+/// varcorr 5.0e-6, sigma2 2.3e-7, but the `ge` block's smallest entry
+/// (vech[13], 0.00838) drifts 5.06e-5 relative (4.2e-7 absolute), just over
+/// `BAND`. That entry is small, so its relative drift is
 /// large; the `ge` block gets its own band at 4x its measured drift, and every
-/// other quantity keeps `BAND`. The anchor values are unchanged and still
-/// reproduce bit-exactly on the anchor machine.
+/// other quantity keeps `BAND`. The anchor values reproduce bit-exactly on
+/// the anchor machine.
 #[test]
 fn fit_wide_slopes_sparse_is_pinned() {
     const BAND: f64 = 5e-5;
@@ -2571,7 +2470,7 @@ fn fit_wide_slopes_sparse_is_pinned() {
                 extra_groupings: vec![crate::Grouping {
                     terms: Vec::new(),
                     relation: crate::GroupingRelation::Crossed,
-                    slopes: vec![1, 2, 3, 4], // q_g = 5 > MAX_EXTRA_Q=4 ⇒ over-WIDTH
+                    slopes: vec![1, 2, 3, 4], // q_g = 5
                 }],
             }),
         },
@@ -2637,8 +2536,8 @@ fn dense_ids(raw: &[String]) -> Vec<u32> {
 }
 
 /// `sim_sparse_gamma` as a hand-built model: `y ~ 1 + x1..x4 + (1|gp) + (1 +
-/// x1..x4 | ge)`, gamma/log. `ge` carries q_g = 5 > `MAX_EXTRA_Q`, which routes
-/// the design to the sparse solver. Returns `(x, y, n, p, model, ids)`, `x`
+/// x1..x4 | ge)`, gamma/log. `ge` carries random slopes, which route the design
+/// to the sparse solver. Returns `(x, y, n, p, model, ids)`, `x`
 /// row-major with an intercept column.
 pub(crate) fn sparse_gamma_design() -> (
     Vec<f64>,
@@ -2681,7 +2580,7 @@ pub(crate) fn sparse_gamma_design() -> (
             extra_groupings: vec![Grouping {
                 terms: Vec::new(),
                 relation: GroupingRelation::Crossed,
-                slopes: vec![1, 2, 3, 4], // q_g = 5 > MAX_EXTRA_Q ⇒ Sparse
+                slopes: vec![1, 2, 3, 4], // q_g = 5; extra slopes ⇒ Sparse
             }],
         }),
     };
@@ -2696,11 +2595,10 @@ pub(crate) fn sparse_gamma_design() -> (
 /// with `x1` (a slope of the crossed q = 5 block) shifted by 1000. The q = 5
 /// grouping is the only one with slopes and is written second, so the size
 /// rule moves it first and the fit takes the dense route, not the sparse one.
-/// Before the design was standardized internally, the same fit on the sparse
-/// route ran out of budget (`converged = false`, 39000 evaluations) 3.67e-4
-/// short of the optimum. Now both designs reach the search as the same
-/// centered column, so the shifted fit reaches the unshifted optimum. Rx SEs:
-/// the case is about the search, and the FD-Hessian would only add time.
+/// The design is standardized internally, so both designs reach the search as
+/// the same centered column and the shifted fit reaches the unshifted optimum.
+/// Rx SEs: the case is about the search, and the FD-Hessian would only add
+/// time.
 /// Measured on the x86_64 anchor (2026-11-11): converged in 33 evaluations
 /// (33 unshifted), logLik 6.8e-13 apart.
 #[test]
@@ -2740,30 +2638,25 @@ fn fit_sparse_gamma_shifted_x1_reaches_the_optimum() {
 /// reports, is pinned to glmm's own values. This pin catches an FD-Hessian seeding regression class that
 /// moves `se_hessian` by −27% and `stddev_se` to NaN — a class the rest of the
 /// default tier cannot see, since this cell has no other default-tier
-/// Hessian coverage. (Since 2026-09-24 `se_hessian` is the glmmTMB comparison:
-/// the ML objective made one possible.)
+/// Hessian coverage.
 ///
 /// Same design and data as the corpus cell `sim_sparse_gamma_tmb` (there
 /// lowered from its formula), built here by hand in the sparse orientation —
-/// `ge` carries q_g = 5 > `MAX_EXTRA_Q`.
+/// `ge` carries q_g = 5.
 ///
 /// Values are the x86_64 anchor's (`x86_64-unknown-linux-gnu`, Intel Core
-/// Ultra 7 265H — see `fit::common_tests::assert_pinned`, "which machine the
-/// pins are frozen on"), re-anchored 2026-08-05. First frozen on
-/// `aarch64-apple-darwin` with a "re-pin on anchor" marker on every `REF_*`
-/// below; both pin sets passed on the anchor unchanged, so this swap is a
-/// re-freeze, not a regression fix.
+/// Ultra 7 265H; see `fit::common_tests::assert_pinned`, "which machine the
+/// pins are frozen on").
 ///
 /// **Band derivation, measured not assumed.** This fixture has no other
 /// default-tier Hessian pin to reuse a cross-platform figure from (unlike the
 /// NB test below, which already documents one). The
 /// substitute measured here is the same mechanism that produced the NB
 /// fixture's own documented drift: a NEON-vs-scalar-forced-pulp lane-width
-/// swap on this host, via the committed harness
-/// (`validation/tools/lanewidth/run_lanewidth.sh`, its `pulp-0.22.2-scalar-force.patch`
-/// and scratch-tree procedure — run here through a scratch-local probe that
-/// refits this exact design under `WaldSe::Hessian` instead of the
-/// committed probe's `WaldSe::Rx`; the harness itself was not modified).
+/// swap on this host
+/// (`validation/tools/lanewidth/run_lanewidth.sh` with its
+/// `pulp-0.22.2-scalar-force.patch`, refitting this design under
+/// `WaldSe::Hessian`).
 /// Measured worst movement over both quantities: `se_hessian` 3.85e-4
 /// (β[1]'s SE), `stddev_se` 1.20e-3 (θ coordinate 1 of 16 — the `ge`
 /// random-slope block). `BAND_HESSIAN = 1.5e-2` clears the measured worst
@@ -2775,27 +2668,13 @@ fn fit_sparse_gamma_shifted_x1_reaches_the_optimum() {
 /// `se_hessian`, NaN on `stddev_se`) with 18×–∞ margin.
 #[test]
 fn fit_sparse_gamma_hessian_is_pinned() {
-    // Band unchanged on re-pin (2026-08-05) — its derivation above measured
-    // headroom, not a machine-specific value.
+    // The band is measured headroom (see the doc comment), not a
+    // machine-specific value.
     const BAND_HESSIAN: f64 = 1.5e-2;
-    // Re-anchored 2026-08-05 on x86_64-unknown-linux-gnu; was aarch64-apple-darwin.
-    //
-    // Re-pinned 2026-09-16: the packed-row layout's joint Hessian is the exact
-    // assembled one — first-order lanes over the `F`/`G` adjoint — not the
-    // central stencil at `SPARSE_FD_STEP_REL`. `se_hessian` moves by at most
-    // 2.2e-4 relative (`se[2]`, and 2.1e-4 on `se[0]`), `stddev_se` by at most
-    // 8.1e-4 (coordinate 0), both more than an order inside `BAND_HESSIAN`,
-    // which is therefore untouched. Part of that is older than this change:
-    // the 2026-08-05 values were never re-pinned through the PIRLS exit-iterate
-    // refresh, which the weighted twin below records as a 1.0e-3 move on its
-    // own `se[0]`. This engine's own contribution, measured at one γ̂ on this
-    // dataset by `fit::glmm_tests::packed_assembled_se_matches_the_packed_stencil`,
-    // is 1.4e-5 on `se` and 2.5e-6 on `theta_se` — inside the 2.0e-5 δ-vs-δ/2
-    // agreement `src/sparse/fd_margin.rs`'s header records for the stencil on
-    // this very dataset, so the stencil's own step error covers it.
-    // glmmTMB's joint-Hessian SEs (`validation/goldens/sim_sparse_gamma_tmb.json`),
-    // replacing the 2026-09-16 self-pin when the mixed-Gamma objective became
-    // the ML one on 2026-09-24.
+    // glmmTMB's joint-Hessian SEs (`validation/goldens/sim_sparse_gamma_tmb.json`).
+    // The packed-row layout's joint Hessian is the exact assembled one
+    // (first-order lanes over the `F`/`G` adjoint), not the central stencil at
+    // `SPARSE_FD_STEP_REL`.
     const REF_SE_HESSIAN: [f64; 5] = [
         0.180567282953059,
         0.0849545743176868,
@@ -2804,22 +2683,11 @@ fn fit_sparse_gamma_hessian_is_pinned() {
         0.0413199887386425,
     ];
     const SE_REL: f64 = 1e-3;
-    // Re-anchored 2026-08-05 on x86_64-unknown-linux-gnu; was aarch64-apple-darwin.
-    // Re-pinned 2026-09-16 with `REF_SE_HESSIAN` above — same mechanism, same
-    // measurement.
     // 16 θ slots: gp's 1 (scalar intercept) then ge's 15 (vech of the 5×5
     // slope block); a stddev's SE sits at its diagonal slot, NaN elsewhere.
-    // Re-pinned 2026-09-24 on x86_64-unknown-linux-gnu: the mixed-Gamma
-    // objective became the ML one (φ a coordinate of the outer search, the
-    // joint Hessian gaining its `ln φ` row, observed curvature in the
-    // log-determinant), which moves every coordinate.
-    // Re-pinned 2026-10-01: `stddev_se` on a
-    // q ≥ 2 block became the SE of the reported stddev, so the four slope
-    // rows (slots 6, 10, 13, 15) took the new quantity's values and the
-    // off-diagonal slots are NaN. Slots 0 and 1 (the scalar and ge's
-    // intercept, whose map did not change) keep their 2026-09-24 pins: they
-    // sit 3.6e-4 and 8.2e-5 from them, the drift of the earlier batches of
-    // this round, inside `BAND_HESSIAN`.
+    // On a q ≥ 2 block `stddev_se` is the SE of the reported stddev, so
+    // off-diagonal slots are NaN. Slots 0 and 1 sit 3.6e-4 and 8.2e-5 from
+    // the current fit, inside `BAND_HESSIAN`.
     const STDDEV_SLOTS: [usize; 6] = [0, 1, 6, 10, 13, 15];
     const REF_STDDEV_SE: [f64; 6] = [
         0.09644560433696432,
@@ -2840,7 +2708,7 @@ fn fit_sparse_gamma_hessian_is_pinned() {
         se_for: SeFor::Only(vec![0, 1, 2, 3, 4]),
         ..crate::FitOptions::default() // default WaldSe::Hessian
     };
-    let (f, _, _) = crate::fit::fit_glmm_packed(
+    let f = crate::fit::fit_glmm_packed(
         &x,
         &y,
         None,
@@ -2901,15 +2769,14 @@ fn fit_sparse_gamma_hessian_is_pinned() {
 /// to the sparse solver; every block is scalar on purpose, which is what
 /// keeps `stddev_se` a reported quantity on the lme4 side. Data from
 /// `validation/tools/prep/gen_large_theta_data.R` block R4, a Bernoulli design
-/// (chosen over an earlier Poisson candidate — see that block's comment for
-/// why) tuned so the fitted θ̂ on `g1` lands near 3.9 while the seven extras
+/// tuned so the fitted θ̂ on `g1` lands near 3.9 while the seven extras
 /// sit in 0.25..0.67.
 ///
 /// Anchor provenance: values frozen 2026-08-06 on
 /// `x86_64-unknown-linux-gnu` (see `fit::common_tests::assert_pinned`,
 /// "which machine the pins are frozen on").
 ///
-/// **Band derivation, measured not assumed, and wider than first hoped.** A
+/// **Band derivation, measured not assumed.** A
 /// 1-ULP input sweep (K = 64 draws on `x`; the 0/1 response has no
 /// meaningful 1-ULP nudge that stays inside `{0,1}`) measured worst relative
 /// movement `se` 2.017e-4, `beta` 2.726e-5, `stddev_se` 3.059e-5, `var`
@@ -2926,39 +2793,22 @@ fn fit_sparse_gamma_hessian_is_pinned() {
 /// rounded to `2e-3` — do not copy this band to another test, it is this
 /// design's own measured floor, not a house default.
 ///
-/// **Injection proof: a pin nobody has seen fail is not evidence.**
-/// On a scratch copy, `SPARSE_FD_STEP_REL` was bumped from `1e-4`; at 100×
-/// (`1e-2`) this fixture's Hessian barely moved (worst `stddev_se` 3.47e-4,
-/// still under `BAND_HESSIAN`) — this design is markedly less step-sensitive
-/// at moderate perturbations than the gamma/NB pins, consistent with the
-/// self-noise measurement above. At 3000× (`3e-1`) the pin fails cleanly
-/// (worst `stddev_se` movement 38%, `stddev_se[4]`). The real tree's
-/// `SPARSE_FD_STEP_REL` is never touched by this test — only
-/// the scratch copy used for this proof.
+/// **Sensitivity.** With `SPARSE_FD_STEP_REL` at 100× (`1e-2`) this fixture's
+/// Hessian barely moves (worst `stddev_se` 3.47e-4, under `BAND_HESSIAN`); at
+/// 3000× (`3e-1`) the pin fails (worst `stddev_se` movement 38%,
+/// `stddev_se[4]`).
 #[test]
 fn fit_sparse_binomial_bigsd_hessian_is_pinned() {
     const BAND_HESSIAN: f64 = 2e-3;
-    // Frozen 2026-08-06 on x86_64-unknown-linux-gnu.
-    //
-    // Re-pinned 2026-09-16: the packed-row layout's joint Hessian is the exact
-    // assembled one, not the central stencil at `SPARSE_FD_STEP_REL`.
-    // `se_hessian` moves 8.8e-5 relative on `se[0]` and ≤6.8e-6 on the other
-    // two, `stddev_se` by at most 1.7e-5 (coordinate 7) — an order and a half
-    // inside `BAND_HESSIAN`, which is untouched. This is the large-θ̂ cell
-    // where the stencil is at its worst: `src/sparse/fd_margin.rs`'s header
-    // records its truncation-dominated δ sequence here with the two
-    // extrapolations 20% apart and the shipped step 1.4e-4 from the limit, and
-    // `fit::glmm_tests::packed_assembled_se_matches_the_packed_stencil`
-    // measures the two engines 1.65e-4 apart on `se` at one γ̂ — the same size,
-    // so the movement is the stencil's error being removed.
+    // The packed-row layout's joint Hessian is the exact assembled one, not
+    // the central stencil at `SPARSE_FD_STEP_REL`; on this large-θ̂ cell the
+    // stencil is at its worst (`src/sparse/fd_margin.rs`'s header).
     const REF_SE_HESSIAN: [f64; 3] = [
         0.49102955618526756,
         0.06080867980871085,
         0.12165239214737847,
     ];
-    // Frozen 2026-08-06 on x86_64-unknown-linux-gnu. Eight q=1 blocks, glmm
-    // order [g1 | c1..c7]. Re-pinned 2026-09-16 with `REF_SE_HESSIAN` above —
-    // same mechanism, same measurement.
+    // Eight q=1 blocks, glmm order [g1 | c1..c7].
     const REF_STDDEV_SE: [f64; 8] = [
         0.2572895795273598,
         0.14371665545468593,
@@ -3142,15 +2992,15 @@ fn fit_warm_sparse_glmm_partial_start_cold_starts_the_missing_component() {
 /// regression from rounding, which a pin on THIS fixture cannot. A second
 /// copy of that same gate here, on the crate's worst-conditioned NB fit,
 /// would buy nothing beyond what those
-/// well-conditioned fixtures already gate. What replaces the bit-exact
-/// pin below is oracle agreement: the fixture converges and its `Rx` arm's
+/// well-conditioned fixtures already gate. In place of a bit-exact pin, the
+/// test checks oracle agreement: the fixture converges and its `Rx` arm's
 /// β, SDs and θ̂ agree with frozen `glmmTMB(family = nbinom2)`
 /// (`validation/goldens/sim_sparse_nb_tmb.json`) at the same relative bands
 /// `validation/grid/tol.R` uses for every other cross-engine cell (1e-3), and
 /// so does the Hessian arm's `se_hessian`. (glmmTMB reports no Rx SE, and
 /// lme4's `glmer.nb` optimises a Fisher-weight objective on this link) — a
 /// live reference the sparse route's own routing (`classify_design`
-/// below) still gets checked against, with no frozen-Rust value left in this
+/// below) still gets checked against, with no frozen Rust value in this
 /// test to drift across machines. The sparse NB route's coverage does not
 /// end here: `sparse_glmm_deviance_matches_dense` (fixed θ=5.0, NB among its
 /// families) and `sparse_glmm_fit_matches_dense_in_envelope` (β/SE/τ² against
@@ -3158,9 +3008,7 @@ fn fit_warm_sparse_glmm_partial_start_cold_starts_the_missing_component() {
 /// differently from dense, against a live reference each time — no
 /// cross-machine drift accumulates in either.
 ///
-/// **Hessian arm unchanged.** Everything below is about the `Rx`
-/// arm this test already ran (`wald_se: WaldSe::Rx` below). Without this
-/// pin the crate's default tier does not exercise this fixture's
+/// **Hessian arm.** Without it the crate's default tier does not exercise this fixture's
 /// `WaldSe::Hessian` SEs at all, so an FD-Hessian seeding regression class
 /// that moves this exact fixture's Hessian `se`/`stddev_se` by -61% would go
 /// unnoticed in `cargo test`. One extra `fit_cold` under
@@ -3168,11 +3016,8 @@ fn fit_warm_sparse_glmm_partial_start_cold_starts_the_missing_component() {
 /// gate on `se` and a pin on `stddev_se` close that.
 ///
 /// Values are the x86_64 anchor's (`x86_64-unknown-linux-gnu`, Intel Core
-/// Ultra 7 265H — see `fit::common_tests::assert_pinned`, "which machine the
-/// pins are frozen on"), re-anchored 2026-08-05. First frozen on
-/// `aarch64-apple-darwin` with a "re-pin on anchor" marker on the
-/// `REF_*_HESSIAN` constants below; both pin sets passed on the anchor
-/// unchanged, so this swap is a re-freeze, not a regression fix.
+/// Ultra 7 265H; see `fit::common_tests::assert_pinned`, "which machine the
+/// pins are frozen on").
 ///
 /// **Band derivation, honest not copied.** This arm's band is measured,
 /// not inherited from `BAND` (3e-3). Measured directly with
@@ -3282,30 +3127,15 @@ fn fit_sparse_nb_glmm_is_pinned() {
     // Hessian arm (see the doc comment above for the band
     // derivation). Same data, same model, one extra `fit_cold` under
     // default options (glmm's default IS `WaldSe::Hessian`).
-    // Band unchanged on re-pin (2026-08-05) — its derivation above measured
-    // headroom, not a machine-specific value.
+    // The band is measured headroom (see the doc comment), not a
+    // machine-specific value.
     const BAND_HESSIAN: f64 = 1e-2;
-    // Re-anchored 2026-08-05 on x86_64-unknown-linux-gnu; was aarch64-apple-darwin.
-    //
-    // Re-pinned 2026-09-16: the packed-row layout's joint Hessian is the exact
-    // assembled one, not the central stencil at `SPARSE_FD_STEP_REL`.
-    // `se_hessian` moves 1.5e-4 relative on `se[0]` and 2.2e-5 on `se[1]`,
-    // `stddev_se` by at most 7.9e-4 (coordinate 2) — inside `BAND_HESSIAN`,
-    // which is untouched. Negative binomial is a non-canonical link, so this
-    // is one of the two packed cells where the engine builds and factors its
-    // own observed `A_obs`; the other, `sim_sparse_gamma`, moves by the same
-    // order.
-    // glmmTMB's joint-Hessian SEs (`validation/goldens/sim_sparse_nb_tmb.json`),
-    // replacing the self-pin on 2026-09-24 when the joint Hessian gained the
-    // `ln θ_NB` row glmmTMB's carries.
+    // Negative binomial is a non-canonical link, so this is one of the two
+    // packed cells where the engine builds and factors its own observed
+    // `A_obs` (the other is `sim_sparse_gamma`). glmmTMB's joint-Hessian SEs
+    // (`validation/goldens/sim_sparse_nb_tmb.json`).
     const REF_SE_HESSIAN: [f64; 2] = [0.374653728834932, 0.0633571047853308];
-    // Re-anchored 2026-08-05 on x86_64-unknown-linux-gnu; was aarch64-apple-darwin.
-    // Re-pinned 2026-09-16 with `REF_SE_HESSIAN` above — same mechanism, same
-    // measurement.
     // θ-scale SE, 8 coordinates (one per scalar grouping: g1, c1..c7).
-    // Re-pinned 2026-09-24 on x86_64-unknown-linux-gnu: observed curvature in
-    // the log-determinant and the joint Hessian's new `ln θ_NB` row move every
-    // coordinate.
     const REF_STDDEV_SE: [f64; 8] = [
         0.14940150076383626,
         0.10553128536683287,
@@ -3401,7 +3231,7 @@ fn fit_sparse_gamma_glmm_weighted_matches_glmmtmb() {
         se_for: SeFor::Only(vec![0, 1, 2, 3, 4]),
         ..crate::FitOptions::default() // default WaldSe::Hessian
     };
-    let (f, _, _) = crate::fit::fit_glmm_packed(
+    let f = crate::fit::fit_glmm_packed(
         &x,
         &y,
         Some(&weights),
@@ -3528,8 +3358,7 @@ fn sparse_weighted_nb_matches_replicated() {
 
 /// Rung-18 shape: binomial logit, primary (1 + x | g1) + crossed extra
 /// (1 + x | g2), prior weights = size — the first non-Gaussian design with
-/// a slope-carrying extra grouping. IN-envelope (q_g = 2 ≤ MAX_EXTRA_Q):
-/// reaches Sparse purely through classify_design's slope-extras clause.
+/// a slope-carrying extra grouping, which routes it to Sparse.
 ///
 /// Values recorded from glmm. They are validated by
 /// `sim_binomial_slope_crossed`, whose cross-engine cell checks the same fit
@@ -3760,7 +3589,7 @@ fn sparse_glmm_deviance_matches_dense() {
         let sized = crate::fit::spec_sized_from_ids(&model, &ids, true).0;
         let mut dws = crate::glmm::GlmmWorkspace::for_cluster_spec(p, &sized, n, &[], 1);
         dws.pattern.structured_schur = if dws.groupings.structured_extras_eligible() {
-            crate::glmm::StructuredSchur::new(&dws.groupings, &ids.primary, &ids.extra, n)
+            crate::glmm::StructuredSchur::new(&dws.groupings, &ids.primary, &ids.extra, n).unwrap()
         } else {
             None
         };
@@ -3770,12 +3599,12 @@ fn sparse_glmm_deviance_matches_dense() {
         // shape would not otherwise take.
         let mut sws = crate::glmm::GlmmWorkspace::for_cluster_spec_packed(p, &sized, n, &[], 1);
         sws.nb_theta = nb_theta;
-        crate::glmm::fill_packed_cols(&mut sws, &ids.primary, &ids.extra, n);
+        crate::glmm::fill_packed_cols(&mut sws, &ids.primary, &ids.extra, n).unwrap();
 
         // (θ, β) probe points: [θ_primary, θ_extra, β0, β1]. The inverse link
         // gets its own β probes with β₀ well inside the η > 0 domain (μ = 1/η):
-        // the shared probes' β₀ leave η_fixed ≤ 0 rows, where PIRLS now
-        // correctly refuses a boundary answer (`family::eta_infeasible`) and
+        // the shared probes' β₀ leave η_fixed ≤ 0 rows, where PIRLS refuses
+        // a boundary answer (`family::eta_infeasible`) and
         // both paths return ∞ — true agreement, but a vacuous probe.
         let probes: [[f64; 4]; 3] = if matches!(
             family,
@@ -3880,8 +3709,7 @@ fn sparse_glmm_fit_matches_dense_in_envelope() {
                 f64::NAN,
                 None,
                 &opts,
-            )
-            .0;
+            );
             let tag = format!("{family:?}/{wald_se:?}");
             assert!(
                 dense.converged() && sp.converged(),
@@ -3994,7 +3822,7 @@ fn sparse_glmm_gamma_inverse_fit_matches_dense_and_glmmtmb() {
         };
         let dense = fit_cold(&x, &y, n, p, &model, &ids, &opts);
         let (sized, ids, _perm) = crate::fit::spec_sized_from_ids(&model, &ids, true);
-        let (sp, _mu, _dev) = crate::fit::fit_glmm_packed(
+        let sp = crate::fit::fit_glmm_packed(
             &x,
             &y,
             None,
@@ -4419,12 +4247,12 @@ fn sparse_weighted_binomial_deviance_matches_expanded() {
     // own; pin that, or a fixture drift would quietly move this onto the
     // blocked kernel and stop testing the Λ-block application.
     assert_eq!(ws_a.layout, crate::glmm::GlmmLayout::Packed);
-    crate::glmm::fill_packed_cols(&mut ws_a, &ids_a.primary, &ids_a.extra, n_a);
+    crate::glmm::fill_packed_cols(&mut ws_a, &ids_a.primary, &ids_a.extra, n_a).unwrap();
     ws_a.prior_w[..n_a].copy_from_slice(&wa);
     ws_a.weighted = true;
     let mut ws_e = crate::glmm::GlmmWorkspace::for_cluster_spec(p, &sized, n_e, &[], 1);
     assert_eq!(ws_e.layout, crate::glmm::GlmmLayout::Packed);
-    crate::glmm::fill_packed_cols(&mut ws_e, &ids_e.primary, &ids_e.extra, n_e);
+    crate::glmm::fill_packed_cols(&mut ws_e, &ids_e.primary, &ids_e.extra, n_e).unwrap();
     let xam = Mat::<f64>::from_fn(n_a, p, |i, j| xa[i * p + j]);
     let xem = Mat::<f64>::from_fn(n_e, p, |i, j| xe[i * p + j]);
     // (θ×8, β×2) probe points spanning small/moderate RE scales.
@@ -4625,7 +4453,7 @@ fn sparse_glmm_over_envelope_converges_binomial() {
     // so the layout follows; pin it, so a fixture drift cannot move this onto
     // the blocked kernel.
     assert_eq!(sws.layout, crate::glmm::GlmmLayout::Packed);
-    crate::glmm::fill_packed_cols(&mut sws, &ids.primary, &ids.extra, n);
+    crate::glmm::fill_packed_cols(&mut sws, &ids.primary, &ids.extra, n).unwrap();
     let recomputed = crate::glmm::glmm_laplace_deviance(
         &params,
         &mut sws,
@@ -4754,7 +4582,7 @@ fn sparse_glmm_over_envelope_converges_poisson() {
     // Same pin as the binomial twin: the layout follows from the over-envelope
     // shape, and a fixture drift must not move it onto the blocked kernel.
     assert_eq!(sws.layout, crate::glmm::GlmmLayout::Packed);
-    crate::glmm::fill_packed_cols(&mut sws, &ids.primary, &ids.extra, n);
+    crate::glmm::fill_packed_cols(&mut sws, &ids.primary, &ids.extra, n).unwrap();
     let recomputed = crate::glmm::glmm_laplace_deviance(
         &params,
         &mut sws,
@@ -4771,8 +4599,8 @@ fn sparse_glmm_over_envelope_converges_poisson() {
     );
 }
 
-/// Over-envelope non-Gaussian smoke, gamma half: one over-width slope-block
-/// extra (`(1 + x1..x4 | ge)`, `q_g = 5 > MAX_EXTRA_Q`) CONVERGES with a
+/// Sparse-routed non-Gaussian smoke, gamma half: one wide slope-block
+/// extra (`(1 + x1..x4 | ge)`, `q_g = 5`) CONVERGES with a
 /// finite, real-signal fit. Unlike the binomial/Poisson twins above, no
 /// deviance self-consistency check here: with a q=5 covariance block AND a
 /// free Gamma dispersion, `f.tau2` alone can't reconstruct the converged Λ
@@ -4819,7 +4647,7 @@ fn sparse_glmm_over_envelope_converges_gamma() {
                 extra_groupings: vec![Grouping {
                     terms: Vec::new(),
                     relation: GroupingRelation::Crossed,
-                    slopes: vec![1, 2, 3, 4], // q_g = 5 > MAX_EXTRA_Q ⇒ over-width
+                    slopes: vec![1, 2, 3, 4], // q_g = 5
                 }],
             }),
         },
@@ -4839,7 +4667,7 @@ fn sparse_glmm_over_envelope_converges_gamma() {
         se_for: SeFor::Only(vec![0, 1, 2, 3, 4]),
         ..crate::FitOptions::default()
     };
-    let (f, _, _) = crate::fit::fit_glmm_packed(
+    let f = crate::fit::fit_glmm_packed(
         &x,
         &y,
         None,
@@ -5822,7 +5650,7 @@ fn sparse_glmm_pinned_names_the_collapsed_component() {
         se_for: SeFor::Only(vec![0, 1]),
         ..crate::FitOptions::default()
     };
-    let (f, _, _) = crate::fit::fit_glmm_packed(
+    let f = crate::fit::fit_glmm_packed(
         &x,
         &y,
         None,
@@ -5970,15 +5798,14 @@ fn sparse_glmm_counters_split_stages_and_histogram() {
 }
 
 /// One measured sign-trap draw per sparse route, each a simulated 300-row
-/// draw of `y ~ x1 + (1 | g1) + (1 + x1 | g2)` frozen as a fixture from the
-/// 2026-09-10 sign-trap simulation study (the slope on the extra grouping is
-/// what routes these sparse). `stopped` is where the search
-/// ended with the diagonal θ boxed at `[0, THETA_HI]`: the `g2` intercept
-/// diagonal on the face Λ_jj = 0 with the entry below it of the wrong sign,
-/// which no re-run on this route ever addressed. `reached` is what the signed
+/// draw of `y ~ x1 + (1 | g1) + (1 + x1 | g2)` kept as a fixture (the slope on
+/// the extra grouping is what routes these sparse). `stopped` is where the
+/// search ended with the diagonal θ boxed at `[0, THETA_HI]`: the `g2`
+/// intercept diagonal on the face Λ_jj = 0 with the entry below it of the
+/// wrong sign. `reached` is what the signed
 /// box (`blind_theta_and_bounds`) reaches in one search. Deviance here is
 /// `−2·loglik`, the corpus convention, so the Gaussian draw compares on the
-/// same scale the study recorded.
+/// same scale as the corpus.
 #[cfg(feature = "formula")]
 fn assert_sparse_sign_trap_escaped(
     what: &str,
@@ -6018,7 +5845,6 @@ fn assert_sparse_sign_trap_escaped(
             None,
             &opts,
         )
-        .0
     };
     assert!(
         f.converged(),
@@ -6206,7 +6032,7 @@ fn packed_and_dense_assembled_hessians_agree() {
         let sized = crate::fit::spec_sized_from_ids(&model, &ids, true).0;
         let mut dws = crate::glmm::GlmmWorkspace::for_cluster_spec(p, &sized, n, slope_cols, 1);
         dws.pattern.structured_schur = if dws.groupings.structured_extras_eligible() {
-            crate::glmm::StructuredSchur::new(&dws.groupings, &ids.primary, &ids.extra, n)
+            crate::glmm::StructuredSchur::new(&dws.groupings, &ids.primary, &ids.extra, n).unwrap()
         } else {
             None
         };
@@ -6222,7 +6048,7 @@ fn packed_and_dense_assembled_hessians_agree() {
             dws.weighted = true;
             sws.weighted = true;
         }
-        crate::glmm::fill_packed_cols(&mut sws, &ids.primary, &ids.extra, n);
+        crate::glmm::fill_packed_cols(&mut sws, &ids.primary, &ids.extra, n).unwrap();
 
         // `[θ vech | β]`. The slope cells carry the primary block's full 3-entry
         // vech in place of its single variance.

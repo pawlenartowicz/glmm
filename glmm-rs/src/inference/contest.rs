@@ -9,9 +9,9 @@
 //! `g_k = lᵀ Jac_k l` (Satterthwaite, 1946; Kuznetsova, Brockhoff and
 //! Christensen, 2017).
 
-use super::cr2::mul;
 use super::evd::{sym_eigen, EvdError};
 use super::tails::{f_upper_p, t_two_sided_p};
+use crate::linalg::mul;
 use faer::{Mat, MatRef};
 
 /// lmerTest's Satterthwaite inputs: `β` (`p`), `C` (`p × p`, lmerTest's

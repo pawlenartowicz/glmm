@@ -75,9 +75,10 @@ pub enum LrNote {
     /// weights keeps none, even all equal to 1). The mixture is used.
     NoDesignSummary,
     /// The exact test refused the larger fit's design summary, for
-    /// `reason`. The mixture is used. A grouping with more than 100 levels
-    /// with rows is refused by the comparison (`TooManyLevels`), never by
-    /// the core's `rlrt_design`; the core refuses the rest.
+    /// `reason`. The mixture is used. A grouping with more than
+    /// `RLRT_MAX_LEVELS` (100) levels with rows is refused by the comparison
+    /// (`TooManyLevels`), never by the core's `rlrt_design`; the core refuses
+    /// the rest.
     ExactRlrtRefused {
         /// The refusal's reason, one plain sentence.
         reason: &'static str,
@@ -121,11 +122,24 @@ pub(crate) const NEGATIVE_LR_ROUNDOFF: f64 = 8e-5;
 /// `loglik_smaller` (ℓ₀) and the larger model's `loglik_larger` (ℓ₁), and the
 /// note it takes.
 ///
-/// A raw value below zero is floored at `0.0` (as lme4's `anova` does); below
-/// `−NEGATIVE_LR_ROUNDOFF` the floor carries [`LrNote::NegativeStatistic`]
-/// with the raw value. A NaN log-likelihood, or a `−∞` one on either side (a
-/// fit that collapsed), gives NaN with no note, never the floor.
-pub(crate) fn lr_statistic(loglik_smaller: f64, loglik_larger: f64) -> (f64, Option<LrNote>) {
+/// A NaN log-likelihood, or a `−∞` one on either side (a fit that failed or
+/// collapsed), gives NaN with no note, never `0.0`. Else `dropped_at_zero`
+/// (the larger fit put every variance the smaller model drops at exactly
+/// zero) gives `0.0` with no note, by rule: there the two log-likelihoods
+/// agree to round-off, and the sign of that round-off must not decide a test
+/// whose null has an atom at 0. Otherwise a raw value below zero is floored
+/// at `0.0` (as lme4's `anova` does); below `−NEGATIVE_LR_ROUNDOFF` the floor
+/// carries [`LrNote::NegativeStatistic`] with the raw value.
+pub(crate) fn lr_statistic(
+    loglik_smaller: f64,
+    loglik_larger: f64,
+    dropped_at_zero: bool,
+) -> (f64, Option<LrNote>) {
+    // `> −∞` is false for NaN.
+    let usable = |l: f64| l > f64::NEG_INFINITY;
+    if dropped_at_zero && usable(loglik_smaller) && usable(loglik_larger) {
+        return (0.0, None);
+    }
     if loglik_larger == f64::NEG_INFINITY || loglik_smaller == f64::NEG_INFINITY {
         return (f64::NAN, None);
     }

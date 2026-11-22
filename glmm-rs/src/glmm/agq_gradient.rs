@@ -2,7 +2,7 @@
 //! `γ = [λ | β]`, from the state an AGQ value evaluation leaves: the converged
 //! per-cluster modes `û_c` (`pirls.u`) and the fixed part of the predictor
 //! `η_fix = Xβ + offset` (`pirls.eta_fixed`). Two callers: the gradient
-//! route's search objective (`GradSearch` in `glmm/mod.rs`), which takes it
+//! route's search objective (`GradSearch` in `glmm/grad_route.rs`), which takes it
 //! off each accepted point's value evaluation, and the SE step's
 //! gradient-difference Hessian (`se::agq_gradient_difference_hessian`), which
 //! differences it instead of carrying hyper-dual lanes per row.
@@ -330,7 +330,8 @@ pub(crate) fn assemble(
 /// The conditional modes `û_c` and `η_fix` at `ws.params`, into `ws.pirls`, by
 /// the same blocked PIRLS solve the AGQ value evaluation runs first
 /// (`agq::agq_deviance`), seeded the way `deviance::laplace_deviance_at` seeds
-/// (from `ws.u_seed` under `warm_seed_active`, else from zero), at
+/// (from `ws.u_seed` under `warm_seed_active`, else from zero; its packed-row
+/// exception never applies here, as this solve is the blocked one), at
 /// `ws.fd.pirls_tol_override`. Everything [`assemble`] reads, without the node
 /// sum the value itself needs: the gradient-difference Hessian never reads a
 /// value at its perturbed points, and on probit that sum was 60% of each

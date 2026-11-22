@@ -189,11 +189,12 @@ test_that("a separated GLM stores glm_diverged last", {
 })
 
 test_that("a GLM whose first solve fails returns no coefficients", {
-  # A 1e-100 weight, the smallest allowed, on the only row that tells x1 from x2
+  # A weight near 1e-100, the smallest allowed (2^-332 = 1.14e-100: R can parse
+  # a 1e-100 literal below the bound on arm64 macOS), on the only row that tells x1 from x2
   # makes X'WX singular to rounding: no step is taken, so no coefficient is reported.
   d <- data.frame(x1 = 1, x2 = c(0, 1, 1, 1), y = c(1, 2, 3, 2.5))
   got <- fit_catching(fastglmm(y ~ 0 + x1 + x2, d, family = Gamma(link = "log"),
-                               weights = c(1e-100, 1, 1, 1)), "fastglmm_design_unsolvable")
+                               weights = c(2^-332, 1, 1, 1)), "fastglmm_design_unsolvable")
   expect_false(got$fit$converged)
   expect_true(all(is.nan(fixef(got$fit))))
   expect_false(is.null(got$cond))
@@ -243,13 +244,12 @@ test_that("summary of an object without $warnings prints no section", {
 # One fixture: argument_ignored fires twice (dispersion=/nAGQ=, both
 # inapplicable on a Gaussian model, from two different arguments). Its declared
 # but empty group level ("g_mid", between two used ones) is dropped and raises
-# nothing. Five groups, eight rows each, with a random slope on z, whose values sit far from zero. The fit adds two cautions
+# nothing. Five groups, eight rows each, with a random slope on z, whose values sit far from zero. The fit adds one caution
 # of its own: y has no random slope, so the slope's variance comes out at
 # zero, and glmm compares standard deviations on its internally standardized
 # design, where that is a singular fit (on the raw design z's distance from
-# zero hid it); and y is exact in z and g, so the residual variance goes to
-# zero and the intercept's theta ends on the upper limit of its search. Same
-# fixture and call in glmm-py/tests/test_warnings.py - change together.
+# zero hid it). y is exact in z and g, so the residual variance goes to zero.
+# Same fixture and call in glmm-py/tests/test_warnings.py - change together.
 PARITY <- local({
   n_groups <- 5L
   per_group <- 8L
@@ -271,14 +271,9 @@ PARITY <- local({
 test_that("port parity sequence adds three more kinds", {
   fit <- suppressWarnings(fastglmm(y ~ z + (1 + z | g), PARITY, dispersion = 2, nAGQ = 3))
   expect_true(fit$converged)
-  # satterthwaite_curvature added by the rescale retry (loglik 311.47 to 550.45).
-  expect_identical(fit$warnings$tier, c("note", "note", "caution", "caution"))
-  expect_identical(fit$warnings$kind, c(
-    "argument_ignored", "argument_ignored", "singular", "satterthwaite_curvature"
-  ))
-  expect_identical(fit$warnings$title, c(
-    "Argument ignored", "Argument ignored", "Singular fit", "Satterthwaite df uncertain"
-  ))
+  expect_identical(fit$warnings$tier, c("note", "note", "caution"))
+  expect_identical(fit$warnings$kind, c("argument_ignored", "argument_ignored", "singular"))
+  expect_identical(fit$warnings$title, c("Argument ignored", "Argument ignored", "Singular fit"))
 })
 
 test_that("port parity variance_at_limit", {

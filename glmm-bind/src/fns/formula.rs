@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use glmm::formula;
-use glmm::orchestrate;
+use glmm::orchestrate::{self, FormulaColumns};
 
 use crate::coerce;
 use crate::error::BindError;
@@ -26,12 +26,12 @@ pub(crate) fn same_fixed_part(inp: &mut Inputs) -> Result<Value, BindError> {
     Ok(Value::Bool(same))
 }
 
-fn columns_record((used, missing, numeric_only): (Vec<String>, Vec<String>, Vec<String>)) -> Value {
+fn columns_record(c: FormulaColumns) -> Value {
     Value::Record(
         Record::new()
-            .with("used", Value::StrVec(used))
-            .with("missing", Value::StrVec(missing))
-            .with("numeric_only", Value::StrVec(numeric_only)),
+            .with("used", Value::StrVec(c.used))
+            .with("missing", Value::StrVec(c.missing))
+            .with("numeric_only", Value::StrVec(c.numeric_only)),
     )
 }
 
@@ -43,11 +43,11 @@ pub(crate) fn formula_columns(inp: &mut Inputs) -> Result<Value, BindError> {
     let ast = formula::parse(&inp.string("formula")?)
         .map_err(|e| BindError::invalid_argument(e.to_string()))?;
     let available = inp.strs("available")?;
-    Ok(columns_record((
-        formula::referenced_columns(&ast, &available),
-        formula::unresolved_columns(&ast, &available),
-        formula::numeric_only_columns(&ast, &available),
-    )))
+    Ok(columns_record(FormulaColumns {
+        used: formula::referenced_columns(&ast, &available),
+        missing: formula::unresolved_columns(&ast, &available),
+        numeric_only: formula::numeric_only_columns(&ast, &available),
+    }))
 }
 
 /// `formula_columns` for a design formula (`orchestrate::model_matrix_columns`).

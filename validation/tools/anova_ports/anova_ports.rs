@@ -49,23 +49,21 @@
 //! fit's tags of the test `"auto"` gives it.
 //! `compare_anova_ports.R` pins the call list and the expected refusals.
 //!
-//! The Rust side has no table object, so this file lays each table out the
-//! way both ports do (`glmm-py/glmm/anova.py`, `glmm-r/R/fastglmm-anova.R`): R's
-//! column names, one row per model with the smaller model first, rows named
-//! after the models as given (`m0`/`m1` from `anova`, `f0`/`f1` from
-//! `compare`); and it writes a per-term table's heading as both ports do,
-//! from copies of their texts.
+//! This front end makes every call through `glmm_bind::call`, the entry point
+//! both ports call, with the arguments a port passes, and lays each table out
+//! the way both ports do (`glmm-py/glmm/anova.py`, `glmm-r/R/fastglmm-anova.R`):
+//! R's column names, one row per model with the smaller model first, rows
+//! named after the models as given (`m0`/`m1` from `anova`, `f0`/`f1` from
+//! `compare`). Its text cells are the lines glmm-bind returns, so the gate
+//! checks that each port prints them unaltered.
 //!
 //! Run from the repository root:
 //! `cargo run --release -p validation --example anova_ports > anova_rust.jsonl`
 
 use std::collections::{BTreeSet, HashMap};
 
-use glmm::formula::anova::{compare_stored, Comparison, ComparisonTest, Model, ModelInfo, Side};
-use glmm::inference::{Objective, Reference};
-use glmm::orchestrate::{self, FitResult, StoredParts};
-use glmm::WeightPower;
-use serde_json::{json, Value};
+use glmm_bind::{Port, Record, Value};
+use serde_json::{json, Value as Json};
 
 /// `validation/`, so the example runs from any working directory.
 const VALIDATION_DIR: &str = env!("CARGO_MANIFEST_DIR");
@@ -254,42 +252,13 @@ const TERM_CALLS: &[TermCall] = &[
     },
 ];
 
-// The per-term headings' texts as both ports write them
-// (`glmm-py/glmm/anova.py`, `glmm-r/R/fastglmm-anova.R`), copied so that the gate
-// compares each port's heading with this one: change together with both.
-const LRT_LINE: &str = "Likelihood-ratio chi-squared tests (each term's model refitted without it)";
-const WALD_LINE: &str = "Wald chi-squared tests";
-/// The heading's name of each denominator-df source, in heading order (the
-/// ports' `_DF_METHODS` and `.DF_METHODS`).
-const DF_METHODS: &[(&str, &str)] = &[
-    ("pustejovsky_tipton", "Pustejovsky-Tipton's"),
-    ("bell_mccaffrey", "Bell-McCaffrey's"),
-    ("satterthwaite", "Satterthwaite's"),
-];
-const ETA2_LINE: &str =
-    "Partial eta-squared uses the Satterthwaite denominator df, so it is approximate.";
-const NOT_CONVERGED: &str = "The fit did not converge, so its estimates are not at a maximum \
-     and these tests are not reliable. Change the model until it converges (a simpler random \
-     part often helps), then test again.";
-/// Why `"auto"` gave a chi-squared table its test, by the fit's
-/// `term_test_auto` reason (the ports' `_AUTO_REASONS` and `.AUTO_REASONS`).
-const AUTO_REASONS: &[(&str, &str)] = &[
-    ("poisson_mixed", "Poisson model with random effects"),
-    ("binomial_mixed", "binomial model with random effects"),
-    (
-        "negative_binomial_mixed",
-        "negative binomial model with random effects",
-    ),
-    ("other_mixed", "Gamma model with random effects"),
-    ("no_random_effects", "model without random effects"),
-];
-
 /// The row of `wls_basic.csv` (0-based) whose `x2` is made missing.
 const MISSING_ROW: usize = 4;
 
 /// The columns of one CSV, typed as the grid's engines type them: a column
 /// named in `factors`, or one with a cell that is not a number, is a factor
-/// with its distinct labels in byte order as levels.
+/// with its distinct labels in byte order as levels. `read_data` mirrors
+/// `grid/engines/common.rs`'s `read_csv_path` and `build_table` -- change together.
 struct Data {
     numeric: HashMap<String, Vec<f64>>,
     factor: HashMap<String, (Vec<String>, Vec<u32>)>,
@@ -372,7 +341,7 @@ struct Member {
     nagq: u8,
 }
 
-fn member(m: &Value, data: &mut Data) -> Member {
+fn member(m: &Json, data: &mut Data) -> Member {
     let s = |k: &str| m[k].as_str().unwrap_or_else(|| panic!("member {k}"));
     Member {
         formula: aggregated(s("formula"), data),
@@ -415,163 +384,221 @@ fn refused(call: &str, why: &str) {
     table(call, &[""], &[("error", vec![f64::NAN])]);
 }
 
-/// A comparison's table as both ports lay it out; `labels` names the two
-/// sides as given, `rss` their residual sums of squares (NaN off OLS).
-fn comparison_table(call: &str, c: &Comparison, labels: [&str; 2], rss: [f64; 2]) {
-    let order = match c.larger {
-        Side::First => [1, 0],
-        Side::Second => [0, 1],
+/// `glmm_bind::call` as the Python port makes it; a refusal as its message.
+fn call(name: &str, args: Vec<(&str, Value)>) -> Result<Value, String> {
+    let mut rec = Record::new();
+    for (k, v) in args {
+        rec.push(k, v);
+    }
+    glmm_bind::call(Port::Python, name, rec).map_err(|e| format!("{} ({})", e.message, e.code))
+}
+
+fn text_value(s: &str) -> Value {
+    Value::Str(s.to_string())
+}
+
+/// A field of a record.
+fn get<'a>(v: &'a Value, key: &str) -> &'a Value {
+    match v {
+        Value::Record(r) => r.get(key).unwrap_or(&Value::Null),
+        other => panic!("{key}: not a record: {other:?}"),
+    }
+}
+
+/// A number field (a count crosses as an integer).
+fn num(v: &Value, key: &str) -> f64 {
+    match get(v, key) {
+        Value::F64(x) => *x,
+        Value::I64(n) => *n as f64,
+        Value::U64(n) => *n as f64,
+        other => panic!("{key}: not a number: {other:?}"),
+    }
+}
+
+/// A float-vector field.
+fn nums(v: &Value, key: &str) -> Vec<f64> {
+    match get(v, key) {
+        Value::Vec(x) => x.clone(),
+        Value::List(x) if x.is_empty() => Vec::new(),
+        other => panic!("{key}: not a float vector: {other:?}"),
+    }
+}
+
+/// A string-vector field.
+fn strs(v: &Value, key: &str) -> Vec<String> {
+    match get(v, key) {
+        Value::StrVec(x) => x.clone(),
+        Value::List(x) if x.is_empty() => Vec::new(),
+        other => panic!("{key}: not a string vector: {other:?}"),
+    }
+}
+
+/// A string field.
+fn string(v: &Value, key: &str) -> String {
+    match get(v, key) {
+        Value::Str(s) => s.clone(),
+        other => panic!("{key}: not a string: {other:?}"),
+    }
+}
+
+/// The columns of `data` as a port passes them: `numeric` and `factors`.
+fn columns(data: &Data) -> [Value; 2] {
+    let mut numeric = Record::new();
+    let mut names: Vec<&String> = data.numeric.keys().collect();
+    names.sort();
+    for name in names {
+        numeric.push(name, Value::Vec(data.numeric[name].clone()));
+    }
+    let mut factors = Record::new();
+    let mut names: Vec<&String> = data.factor.keys().collect();
+    names.sort();
+    for name in names {
+        factors.push(name, factor_value(&data.factor[name]));
+    }
+    [Value::Record(numeric), Value::Record(factors)]
+}
+
+fn factor_value((levels, codes): &(Vec<String>, Vec<u32>)) -> Value {
+    Value::Factor {
+        levels: levels.clone(),
+        codes: codes.iter().map(|&c| c as i32).collect(),
+    }
+}
+
+/// A comparison record's table as both ports lay it out; `labels` names the
+/// two sides as given.
+fn comparison_table(call: &str, r: &Value, labels: [&str; 2]) {
+    let large = num(r, "larger") as usize;
+    let order = [1 - large, large];
+    let Value::List(all) = get(r, "sides") else {
+        panic!("{call}: no sides")
     };
-    let infos = [&c.m0, &c.m1];
-    let sides = order.map(|i| infos[i]);
+    let sides = order.map(|i| &all[i]);
     let rows = order.map(|i| labels[i]);
     let tested = |x: f64| vec![f64::NAN, x];
-    let both = |f: fn(&ModelInfo) -> f64| sides.map(f).to_vec();
+    let both = |key: &str| sides.iter().map(|s| num(s, key)).collect::<Vec<f64>>();
+    let (statistic, df, p) = (num(r, "statistic"), num(r, "df"), num(r, "p_value"));
     let mut cols: Vec<(&str, Vec<f64>)> = Vec::new();
-    match &c.test {
-        ComparisonTest::Lr(t) => {
-            cols.push(("npar", both(|s| s.npar as f64)));
-            if sides.iter().all(|s| s.aic.is_some()) {
-                cols.push(("AIC", both(|s| s.aic.unwrap_or(f64::NAN))));
-                cols.push(("BIC", both(|s| s.bic.unwrap_or(f64::NAN))));
-            }
-            cols.push(("logLik", both(|s| s.loglik)));
-            cols.push(("Chisq", tested(t.statistic)));
-            // The exact reference is not a chi-squared: no Df.
-            let df = match t.reference {
-                Reference::ExactRlrt { .. } => f64::NAN,
-                _ => t.df as f64,
-            };
-            cols.push(("Df", tested(df)));
-            cols.push(("Pr(>Chisq)", tested(t.p_value)));
+    if string(r, "test") == "lr" {
+        cols.push(("npar", both("npar")));
+        if sides.iter().all(|s| !get(s, "aic").is_null()) {
+            cols.push(("AIC", both("aic")));
+            cols.push(("BIC", both("bic")));
         }
-        ComparisonTest::Linear(t) => {
-            // The residual df n - p, p the retained columns (npar counts
-            // sigma or phi too).
-            cols.push(("Res.Df", both(|s| s.nobs as f64 - (s.npar as f64 - 1.0))));
-            let ols = sides.iter().all(|s| s.objective == Objective::LeastSquares);
-            let rss = order.map(|i| rss[i]);
-            if ols {
-                cols.push(("RSS", rss.to_vec()));
-            }
-            cols.push(("Df", tested(t.num_df)));
-            if ols {
-                cols.push(("Sum of Sq", tested(rss[0] - rss[1])));
-            }
-            cols.push(("F", tested(t.statistic)));
-            cols.push(("Pr(>F)", tested(t.p_value)));
+        cols.push(("logLik", both("loglik")));
+        cols.push(("Chisq", tested(statistic)));
+        // The exact reference is not a chi-squared: no Df.
+        let exact = string(r, "reference_kind") == "exact";
+        cols.push(("Df", tested(if exact { f64::NAN } else { df })));
+        cols.push(("Pr(>Chisq)", tested(p)));
+    } else {
+        cols.push(("Res.Df", both("res_df")));
+        let ols = matches!(get(r, "ols"), Value::Bool(true));
+        if ols {
+            cols.push(("RSS", both("rss")));
         }
-        other => panic!("{call}: no table for the test {other:?}"),
+        cols.push(("Df", tested(df)));
+        if ols {
+            cols.push(("Sum of Sq", tested(num(r, "sum_sq"))));
+        }
+        cols.push(("F", tested(statistic)));
+        cols.push(("Pr(>F)", tested(p)));
     }
     table(call, &rows, &cols);
 }
 
-/// What `anova(m0, m1)` reads of a stored fit, as both ports build it.
-fn model_of(m: &Member, r: &FitResult) -> Model {
-    Model {
-        formula: m.formula.clone(),
-        family: orchestrate::family_from_str(&m.family, &m.link).expect("a family"),
-        loglik: r.loglik,
-        df: r.df,
-        nobs: r.nobs,
-        reml: r.reml,
-        objective: r.objective,
-        converged: r.converged,
-        varcorr: r.varcorr.clone(),
-        re_groups: r.re_groups.clone(),
-        y: r.y.clone(),
-        weights: r.weights.clone(),
-        weight_power: r.weight_power,
-        weight_power_estimated: r.weight_power_estimated,
-        offset: r.offset.clone(),
-        dispersion_held: None,
-        design_summary: r.design_summary.clone(),
-        rss: r.rss,
-        coef_names: r.names.clone(),
-        coef: r.beta.clone(),
-        vcov: r.vcov.clone(),
-        aliased: r.aliased.clone(),
-    }
-}
-
+/// The native `fit` of member `m` on `data`, as `glmm.fit` passes it.
 fn fit(
     data: &Data,
     m: &Member,
     weights: Option<Vec<f64>>,
     anova_test: &str,
-) -> Result<FitResult, String> {
-    orchestrate::run_fit(
-        &m.formula,
-        data.numeric.clone(),
-        data.factor.clone(),
-        &m.family,
-        &m.link,
-        "hessian",
-        m.nagq,
-        None,
-        weights,
-        None,
-        None,
-        true,
-        true,
-        m.reml,
-        anova_test,
-        // The weighted members check the weights as given.
-        Some(WeightPower::Fixed(1.0)),
-        None,
+) -> Result<Value, String> {
+    let [numeric, factors] = columns(data);
+    call(
+        "fit",
+        vec![
+            ("formula", text_value(&m.formula)),
+            ("numeric", numeric),
+            ("factors", factors),
+            ("family", text_value(&m.family)),
+            ("link", text_value(&m.link)),
+            // `glmm.fit`'s defaults.
+            ("wald_se", text_value("hessian")),
+            ("satterthwaite", Value::Bool(true)),
+            ("condvar", Value::Bool(true)),
+            ("nagq", Value::I64(i64::from(m.nagq))),
+            ("weights", weights.map_or(Value::Null, Value::Vec)),
+            ("reml", m.reml.map_or(Value::Null, Value::Bool)),
+            ("anova_test", text_value(anova_test)),
+            // The weighted members check the weights as given.
+            ("weight_power", Value::F64(1.0)),
+            ("row_base", Value::I64(0)),
+        ],
     )
-    .map_err(String::from)
+}
+
+/// What `anova(m0, m1)` reads of a stored fit: its record and its formula.
+fn side(m: &Member, r: Value) -> Value {
+    let Value::Record(mut rec) = r else {
+        panic!("a fit record")
+    };
+    rec.set("formula", text_value(&m.formula));
+    Value::Record(rec)
 }
 
 /// `anova(m0, m1)` on the two members fitted one by one.
-fn anova_call(call: &str, data: &Data, m: [&Member; 2], weights: Option<Vec<f64>>) {
+fn anova_call(name: &str, data: &Data, m: [&Member; 2], weights: Option<Vec<f64>>) {
     let fits = match (
         fit(data, m[0], weights.clone(), "Wald"),
         fit(data, m[1], weights, "Wald"),
     ) {
         (Ok(a), Ok(b)) => [a, b],
-        (Err(e), _) | (_, Err(e)) => return refused(call, &e),
+        (Err(e), _) | (_, Err(e)) => return refused(name, &e),
     };
-    let opts = orchestrate::compare_options(None, None).expect("the default options");
-    let (a, b) = (model_of(m[0], &fits[0]), model_of(m[1], &fits[1]));
-    match compare_stored(&a, &b, &opts) {
-        Ok(c) => comparison_table(call, &c, ["m0", "m1"], [fits[0].rss, fits[1].rss]),
-        Err(e) => refused(call, &e.to_string()),
+    let [a, b] = fits;
+    match call(
+        "compare_fits",
+        vec![("m0", side(m[0], a)), ("m1", side(m[1], b))],
+    ) {
+        Ok(r) => comparison_table(name, &r, ["m0", "m1"]),
+        Err(e) => refused(name, &e),
     }
 }
 
 /// `compare(data, f0, f1)`; with `nobs`, each fit's `nobs` as two more cells
 /// (call `<call>:nobs`).
-fn compare_call(call: &str, data: &Data, m: [&Member; 2], weights: Option<Vec<f64>>, nobs: bool) {
-    let r = orchestrate::run_compare(
-        &m[0].formula,
-        &m[1].formula,
-        data.numeric.clone(),
-        data.factor.clone(),
-        &m[0].family,
-        &m[0].link,
-        m[0].nagq.max(m[1].nagq),
-        weights,
-        None,
-        None,
-        None,
-        Some(WeightPower::Fixed(1.0)),
-        None,
+fn compare_call(name: &str, data: &Data, m: [&Member; 2], weights: Option<Vec<f64>>, nobs: bool) {
+    let [numeric, factors] = columns(data);
+    let r = call(
+        "compare",
+        vec![
+            ("f0", text_value(&m[0].formula)),
+            ("f1", text_value(&m[1].formula)),
+            ("numeric", numeric),
+            ("factors", factors),
+            ("family", text_value(&m[0].family)),
+            ("link", text_value(&m[0].link)),
+            ("nagq", Value::I64(i64::from(m[0].nagq.max(m[1].nagq)))),
+            ("weights", weights.map_or(Value::Null, Value::Vec)),
+            ("weight_power", Value::F64(1.0)),
+            ("row_base", Value::I64(0)),
+        ],
     );
     match r {
         Ok(r) => {
-            comparison_table(call, &r.comparison, ["f0", "f1"], [r.fit0.rss, r.fit1.rss]);
+            comparison_table(name, &r, ["f0", "f1"]);
             if nobs {
-                let n = vec![r.fit0.nobs as f64, r.fit1.nobs as f64];
-                table(&format!("{call}:nobs"), &["fit0", "fit1"], &[("nobs", n)]);
+                let n = vec![num(get(&r, "fit0"), "nobs"), num(get(&r, "fit1"), "nobs")];
+                table(&format!("{name}:nobs"), &["fit0", "fit1"], &[("nobs", n)]);
             }
         }
-        Err(e) => refused(call, &e),
+        Err(e) => refused(name, &e),
     }
 }
 
 fn pairs() {
-    let manifest: Value = serde_json::from_str(
+    let manifest: Json = serde_json::from_str(
         &std::fs::read_to_string(format!("{VALIDATION_DIR}/manifest.json")).expect("manifest"),
     )
     .expect("manifest JSON");
@@ -633,170 +660,109 @@ fn term_calls() {
         let anova_test = if c.test == "LRT" { "LRT" } else { "auto" };
         let r = fit(&data, &m, None, anova_test);
         for ss in c.types {
-            let call = if c.named {
+            let name = if c.named {
                 format!("terms:{}:{ss}:{}", c.model, c.test)
             } else {
                 format!("terms:{}:{ss}", c.model)
             };
-            match &r {
-                Ok(r) => term_table(&call, r, ss, c.test),
-                Err(e) => refused(&call, e),
+            let done = match &r {
+                Ok(r) => term_table(&name, r, ss, c.test),
+                Err(e) => Err(e.clone()),
+            };
+            if let Err(e) = done {
+                refused(&name, &e);
             }
         }
     }
 }
 
-/// `anova(m, type = ss, test = test)` on a stored fit, as both ports read it:
-/// the formula's refusal (the Wald slot's) first, then the refusal of an
-/// explicit `"Wald"` or `"LRT"` on F rows; then the likelihood-ratio table
-/// for `"LRT"`, and for `"auto"` where the fit's auto choice is the
+/// `anova(m, type = ss, test = test)` on the fit record `r`, as both ports
+/// read it: the formula's refusal (the Wald slot's) first, then the refusal
+/// of an explicit `"Wald"` or `"LRT"` on F rows; then the likelihood-ratio
+/// table for `"LRT"`, and for `"auto"` where the fit's auto choice is the
 /// likelihood-ratio test; the Wald table otherwise. Laid out as both ports
 /// lay it out (lmerTest's columns with `Eta2_partial` before `Pr(>F)` on F
 /// rows, car's on chi-squared rows, Wald or likelihood-ratio), then the text
-/// cells: the heading and the fit's `term_test_auto` tags.
-fn term_table(call: &str, r: &FitResult, ss: &str, test: &str) {
-    let (wald, lrt) = if ss == "III" {
-        (&r.term_table_type3, &r.term_table_type3_lrt)
+/// cells: the heading and notes `term_table_text` gives, and the fit's
+/// `term_test_auto` tags.
+fn term_table(name: &str, r: &Value, ss: &str, test: &str) -> Result<(), String> {
+    let field = if ss == "III" {
+        "term_table_type3"
     } else {
-        (&r.term_table_type2, &r.term_table_type2_lrt)
+        "term_table_type2"
     };
-    let (auto_test, auto_reason) = orchestrate::choice_tags(&r.term_test_auto);
-    let wald = match wald {
-        Ok(t) => t,
-        Err(e) => return refused(call, e),
+    let auto = get(r, "term_test_auto");
+    let words = |table: &Value| {
+        call(
+            "term_table_text",
+            vec![
+                ("table", table.clone()),
+                ("test", text_value(test)),
+                ("df_method", get(r, "df_method").clone()),
+                ("converged", get(r, "converged").clone()),
+                ("term_test_auto", auto.clone()),
+            ],
+        )
     };
-    if test != "auto" && f_rows(&orchestrate::term_columns(wald), r.df_method) {
-        // Both ports refuse with the crate's text, which no cell carries.
-        return refused(call, "an explicit test on F rows");
+    let wald = get(r, field);
+    if !get(wald, "error").is_null() {
+        words(wald)?;
     }
-    let stored = if test == "LRT" || (test == "auto" && auto_test == "lrt") {
-        match lrt {
-            Some(Ok(t)) => t,
-            Some(Err(e)) => return refused(call, e),
-            None => return refused(call, "no likelihood-ratio table stored"),
+    if test != "auto" && get(wald, "reason") == &text_value("f_test") {
+        // Both ports refuse with the crate's text, which no cell carries.
+        return Err("an explicit test on F rows".to_string());
+    }
+    let stored = if test == "LRT" || (test == "auto" && string(auto, "test") == "lrt") {
+        match get(r, &format!("{field}_lrt")) {
+            Value::Null => return Err("no likelihood-ratio table stored".to_string()),
+            t => t,
         }
     } else {
         wald
     };
-    let tc = orchestrate::term_columns(stored);
-    let heading = heading(&tc, r.df_method, test, auto_reason, r.converged);
-    let rows: Vec<&str> = tc.label.iter().map(String::as_str).collect();
-    let cols = if f_rows(&tc, r.df_method) {
+    let words = words(stored)?;
+    let labels = strs(stored, "label");
+    let f_rows = match strs(stored, "kind").first() {
+        Some(kind) => kind == "F",
+        None => string(r, "df_method") != "none",
+    };
+    let cols = if f_rows {
         vec![
-            ("Sum Sq", tc.sum_sq),
-            ("Mean Sq", tc.mean_sq),
-            ("NumDF", tc.num_df),
-            ("DenDF", tc.den_df),
-            ("F value", tc.statistic),
-            ("Eta2_partial", tc.eta2_partial),
-            ("Pr(>F)", tc.p_value),
+            ("Sum Sq", nums(stored, "sum_sq")),
+            ("Mean Sq", nums(stored, "mean_sq")),
+            ("NumDF", nums(stored, "num_df")),
+            ("DenDF", nums(stored, "den_df")),
+            ("F value", nums(stored, "statistic")),
+            ("Eta2_partial", nums(stored, "eta2_partial")),
+            ("Pr(>F)", nums(stored, "p_value")),
         ]
     } else {
         vec![
-            ("Chisq", tc.statistic),
-            ("Df", tc.num_df),
-            ("Pr(>Chisq)", tc.p_value),
+            ("Chisq", nums(stored, "statistic")),
+            ("Df", nums(stored, "num_df")),
+            ("Pr(>Chisq)", nums(stored, "p_value")),
         ]
     };
+    let rows: Vec<&str> = labels.iter().map(String::as_str).collect();
     let (n, k) = (rows.len(), cols.len());
-    table(call, &rows, &cols);
-    text(call, "heading", "text", [n, k], &heading);
-    text(call, "term_test_auto", "test", [n + 1, k + 1], auto_test);
+    table(name, &rows, &cols);
+    let lines = [strs(&words, "heading"), strs(&words, "notes")].concat();
+    text(name, "heading", "text", [n, k], &lines.join("\n"));
     text(
-        call,
+        name,
+        "term_test_auto",
+        "test",
+        [n + 1, k + 1],
+        &string(auto, "test"),
+    );
+    text(
+        name,
         "term_test_auto",
         "reason",
         [n + 1, k + 2],
-        auto_reason,
+        &string(auto, "reason"),
     );
-}
-
-/// Whether a per-term table has F rows, as both ports tell: by its rows, or
-/// on a table with none by the fit's `df_method`.
-fn f_rows(tc: &orchestrate::TermColumns, df_method: &str) -> bool {
-    match tc.kind.first() {
-        Some(kind) => *kind == "F",
-        None => df_method != "none",
-    }
-}
-
-/// A per-term table's heading and notes, one line each, as both ports print
-/// them: the title (an F table names the df method of its rows that have df,
-/// or on a table with no rows the fit's `df_method`, the residual df unnamed; a likelihood-ratio table, or any chi-squared table under
-/// `"auto"`, takes a second line naming the test and why it ran; an explicit
-/// `"Wald"` keeps one line), then the not-converged note, the table's notes,
-/// each row's notes, and on a Satterthwaite F table the note on its partial
-/// eta-squared.
-fn heading(
-    tc: &orchestrate::TermColumns,
-    df_method: &str,
-    test: &str,
-    auto_reason: &str,
-    converged: bool,
-) -> String {
-    let ss = tc.ss_type;
-    let mut lines = Vec::new();
-    let kinds: Vec<&str> = if tc.label.is_empty() {
-        vec![df_method]
-    } else {
-        tc.den_df_kind
-            .iter()
-            .zip(&tc.den_df)
-            .filter(|(_, d)| d.is_finite())
-            .map(|(kind, _)| *kind)
-            .collect()
-    };
-    let satterthwaite = kinds.contains(&"satterthwaite");
-    if f_rows(tc, df_method) {
-        let names: Vec<&str> = DF_METHODS
-            .iter()
-            .filter(|(kind, _)| kinds.contains(kind))
-            .map(|(_, name)| *name)
-            .collect();
-        let method = match names.len() {
-            0 => String::new(),
-            1 => format!(" with {} method", names[0]),
-            _ => format!(" with {} methods", names.join(" and ")),
-        };
-        lines.push(format!("Type {ss} Analysis of Variance Table{method}"));
-    } else if tc.test == "lrt" || test == "auto" {
-        let line = if tc.test == "lrt" {
-            let reduced = if ss == "III" {
-                " on the reduced design"
-            } else {
-                ""
-            };
-            format!("{LRT_LINE}{reduced}")
-        } else {
-            WALD_LINE.to_string()
-        };
-        let why = if test == "LRT" {
-            "test = \"LRT\"".to_string()
-        } else {
-            let reason = AUTO_REASONS
-                .iter()
-                .find(|(tag, _)| *tag == auto_reason)
-                .unwrap_or_else(|| panic!("no text for the reason {auto_reason}"));
-            format!("test = \"auto\": {}", reason.1)
-        };
-        lines.push(format!("Type {ss} Analysis of Deviance Table"));
-        lines.push(format!("{line}; {why}"));
-    } else {
-        lines.push(format!(
-            "Type {ss} Analysis of Deviance Table (Wald chi-squared tests)"
-        ));
-    }
-    if !converged {
-        lines.push(NOT_CONVERGED.to_string());
-    }
-    lines.extend(tc.notes.iter().cloned());
-    for (label, notes) in tc.label.iter().zip(&tc.row_notes) {
-        lines.extend(notes.iter().map(|n| format!("{label}: {n}")));
-    }
-    if f_rows(tc, df_method) && satterthwaite {
-        lines.push(ETA2_LINE.to_string());
-    }
-    lines.join("\n")
+    Ok(())
 }
 
 /// One text cell (a heading, a tag) at `[row_index, col_index]`.
@@ -808,9 +774,9 @@ fn text(call: &str, row: &str, col: &str, at: [usize; 2], s: &str) {
     );
 }
 
-/// `compare` on `wls_basic` with `x2` missing at [`MISSING_ROW`]: the caller
-/// of `run_compare` drops the row from every column and the weights, as both
-/// ports do before they call it.
+/// `compare` on `wls_basic` with `x2` missing at [`MISSING_ROW`]: the row is
+/// dropped from every column and the weights, as both ports drop it before
+/// they call `compare`.
 fn missing_value_call() {
     let mut data = read_data("data/simulated/wls_basic.csv", &[]);
     for v in data.numeric.values_mut() {
@@ -886,138 +852,145 @@ fn post_fit_calls() {
     }
 }
 
-/// One post-fit call on a stored fit, through the orchestrate functions both
-/// ports call, with the parts both ports store.
-fn post_fit(call: &str, kind: &str, data: &Data, m: &Member, r: &FitResult) -> Result<(), String> {
-    let parts = StoredParts {
-        beta: r.beta.clone(),
-        vcov: r.vcov.clone(),
-        model_vcov: r.model_vcov.clone(),
-        varcorr: r.varcorr.clone(),
-        ranef: r.ranef.clone(),
-        ranef_levels: r.ranef_levels.clone(),
-        condvar: r.condvar.clone(),
-        condvar_x: r.condvar_x.clone(),
-        condvar_cross: r.condvar_cross.clone(),
-        dispersion: r.dispersion,
-        weight_power: r.weight_power,
+/// One post-fit call on the fit record `r`, with the training data and the
+/// stored numbers both ports pass back.
+fn post_fit(name: &str, kind: &str, data: &Data, m: &Member, r: &Value) -> Result<(), String> {
+    let [numeric, factors] = columns(data);
+    let model_data = vec![
+        ("formula", text_value(&m.formula)),
+        ("numeric", numeric),
+        ("factors", factors),
+        ("family", text_value(&m.family)),
+        ("link", text_value(&m.link)),
+    ];
+    let mut parts = Record::new();
+    for key in [
+        "beta",
+        "vcov",
+        "model_vcov",
+        "varcorr",
+        "ranef",
+        "ranef_levels",
+        "condvar",
+        "condvar_x",
+        "condvar_cross",
+        "dispersion",
+        "weight_power",
+    ] {
+        parts.push(key, get(r, key).clone());
+    }
+    let with_parts = |rest: Vec<(&'static str, Value)>| {
+        let mut args = model_data.clone();
+        args.push(("parts", Value::Record(parts.clone())));
+        args.extend(rest);
+        args
     };
-    let (numeric, factor) = (data.numeric.clone(), data.factor.clone());
     let numbered = |n: usize| (1..=n).map(|i| i.to_string()).collect::<Vec<_>>();
     match kind {
         "predict" => {
-            let new_numeric = HashMap::from([("x".to_string(), NEW_X.to_vec())]);
-            let new_factor = HashMap::from([
-                ("subj".to_string(), factor_of(&NEW_SUBJ)),
-                ("g".to_string(), factor_of(&NEW_G)),
-                ("h".to_string(), factor_of(&NEW_H)),
-            ]);
-            let p = orchestrate::predict(
-                &m.formula,
-                numeric,
-                factor,
-                &m.family,
-                &m.link,
-                None,
-                None,
-                &parts,
-                Some((new_numeric, new_factor, NEW_X.len())),
-                "link",
-                false,
-                true,
-                "allow_new_levels=True",
-                true,
-                0.95,
-                false,
+            let new_numeric = Record::new().with("x", Value::Vec(NEW_X.to_vec()));
+            let new_factors = Record::new()
+                .with("subj", factor_value(&factor_of(&NEW_SUBJ)))
+                .with("g", factor_value(&factor_of(&NEW_G)))
+                .with("h", factor_value(&factor_of(&NEW_H)));
+            let p = call(
+                "predict",
+                with_parts(vec![
+                    ("new_numeric", Value::Record(new_numeric)),
+                    ("new_factors", Value::Record(new_factors)),
+                    ("n_rows", Value::I64(NEW_X.len() as i64)),
+                    ("scale", text_value("link")),
+                    ("allow_new_levels", Value::Bool(true)),
+                    ("se", Value::Bool(true)),
+                    ("level", Value::F64(0.95)),
+                    ("future", Value::Bool(false)),
+                    ("row_base", Value::I64(0)),
+                ]),
             )?;
             let rows = numbered(NEW_X.len());
             let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
             let cols = [
-                ("fit", p.fit),
-                ("se.fit", p.se),
-                ("lower", p.lower),
-                ("upper", p.upper),
+                ("fit", nums(&p, "fit")),
+                ("se.fit", nums(&p, "se")),
+                ("lower", nums(&p, "lower")),
+                ("upper", nums(&p, "upper")),
             ];
-            table(call, &rows, &cols);
+            table(name, &rows, &cols);
         }
         "simulate" => {
-            let draws = orchestrate::simulate(
-                &m.formula, numeric, factor, &m.family, &m.link, None, None, &parts, 2, 1,
+            let draws = call(
+                "simulate",
+                with_parts(vec![
+                    ("nsim", Value::I64(2)),
+                    ("seed", Value::I64(1)),
+                    ("row_base", Value::I64(0)),
+                ]),
             )?;
-            let (first, second) = draws.split_at(r.nobs);
-            let rows = numbered(r.nobs);
+            let Value::Vec(draws) = draws else {
+                panic!("{name}: draws {draws:?}")
+            };
+            let nobs = num(r, "nobs") as usize;
+            let (first, second) = draws.split_at(nobs);
+            let rows = numbered(nobs);
             let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
             table(
-                call,
+                name,
                 &rows,
                 &[("sim_1", first.to_vec()), ("sim_2", second.to_vec())],
             );
         }
         "r2" | "icc" => {
-            let (r2, icc) = orchestrate::effect_sizes(
-                &m.formula,
-                numeric,
-                factor,
-                &m.family,
-                &m.link,
-                None,
-                None,
-                &parts,
-                &r.aliased,
-                r.converged,
-                orchestrate::objective_parts(r.objective),
-                true,
-            )?
-            .expect("a null refit is allowed");
-            let cols = if kind == "r2" {
-                [
-                    ("marginal", vec![r2.marginal]),
-                    ("conditional", vec![r2.conditional]),
-                ]
+            let e = call(
+                "effect_sizes",
+                with_parts(vec![
+                    ("aliased", get(r, "aliased").clone()),
+                    ("converged", get(r, "converged").clone()),
+                    ("objective", get(r, "objective").clone()),
+                    ("objective_nodes", get(r, "objective_nodes").clone()),
+                    ("null_refit", Value::Bool(true)),
+                ]),
+            )?;
+            let keys = if kind == "r2" {
+                ["marginal", "conditional"]
             } else {
-                [
-                    ("adjusted", vec![icc.adjusted]),
-                    ("unadjusted", vec![icc.unadjusted]),
-                ]
+                ["adjusted", "unadjusted"]
             };
-            table(call, &["fit"], &cols);
+            let cols = keys.map(|k| (k, vec![num(&e, k)]));
+            table(name, &["fit"], &cols);
         }
         adjust => {
-            let pw = orchestrate::pairwise(
-                &m.formula,
-                numeric,
-                factor,
-                &m.family,
-                &m.link,
-                r.df_method,
-                &r.beta,
-                &r.vcov,
-                &r.model_vcov,
-                &r.aliased,
-                r.nobs,
-                r.satterthwaite_record.clone(),
-                r.robust.clone(),
-                "g",
-                None,
-                None,
-                adjust,
-            )?;
-            let pc = orchestrate::pairwise_columns(&pw, &r.names);
-            let rows: Vec<&str> = pc.contrast.iter().map(String::as_str).collect();
-            let statistic = if r.df_method == "none" {
+            let mut args = model_data;
+            args.extend([
+                ("df_method", get(r, "df_method").clone()),
+                ("beta", get(r, "beta").clone()),
+                ("vcov", get(r, "vcov").clone()),
+                ("model_vcov", get(r, "model_vcov").clone()),
+                ("robust", get(r, "robust").clone()),
+                ("aliased", get(r, "aliased").clone()),
+                ("nobs", get(r, "nobs").clone()),
+                ("record", get(r, "satterthwaite_record").clone()),
+                ("names", get(r, "names").clone()),
+                ("factor", text_value("g")),
+                ("adjust", text_value(adjust)),
+                ("converged", get(r, "converged").clone()),
+            ]);
+            let pw = call("pairwise", args)?;
+            let contrast = strs(&pw, "contrast");
+            let rows: Vec<&str> = contrast.iter().map(String::as_str).collect();
+            let statistic = if string(r, "df_method") == "none" {
                 "z.ratio"
             } else {
                 "t.ratio"
             };
             // No ratio columns: the Gaussian model's identity link has none.
             let cols = [
-                ("estimate", pc.estimate),
-                ("SE", pc.se),
-                ("df", pc.df),
-                (statistic, pc.statistic),
-                ("p.value", pc.p_adjusted),
+                ("estimate", nums(&pw, "estimate")),
+                ("SE", nums(&pw, "se")),
+                ("df", nums(&pw, "df")),
+                (statistic, nums(&pw, "statistic")),
+                ("p.value", nums(&pw, "p_adjusted")),
             ];
-            table(call, &rows, &cols);
+            table(name, &rows, &cols);
         }
     }
     Ok(())

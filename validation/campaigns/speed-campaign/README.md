@@ -118,8 +118,7 @@ a Gaussian mixed cell.
 
 Under the `counters` feature (`GRID_COUNTERS`), each record also carries
 `stage1_evals`, `stage2_evals`, `stage1_shrink_evals`, `stage2_shrink_evals`,
-`pirls_hist`, `agq_evals`, `agq_node_evals`, `nb_nodes`, `nb_evals_total`,
-`post_pin_searches`.
+`pirls_hist`, `agq_evals`, `agq_node_evals`, `post_pin_searches`.
 
 A cell that times out or whose launch fails twice with no output gets a
 smaller stub record written by `run.sh` itself: `case_id`, `seed`, `engine`,
@@ -245,9 +244,9 @@ shapes, with the slope SD shrunk 50-fold so that singular fits occur).
 
 **Starts.** `cold` (no start), `truth` (β and θ of the generating model),
 `carry` (the previous converged draw's `FitView::theta` and `betas`, starting
-from the truth on the first measured draw) and `theta0` (MCPower's start when
+from the truth on the first measured draw) and `theta0` (the start a caller uses when
 it has neither a truth nor a carried start: θ = `[THETA0; n_θ]`, β the
-generating β, MCPower's effect sizes). The default is `cold,truth,carry`;
+generating β). The default is `cold,truth,carry`;
 `--start all` adds `theta0`. θ is in the crate's start
 convention: per grouping in declaration order, the column-major vech of the
 lower Cholesky factor of Σ, relative to σ on the LMM and absolute on the GLMM.
@@ -283,7 +282,7 @@ full` (the default) also `deviance`, `loglik`, `objective` (the deviance, or
 −2·loglik on OLS/GLM), `singular`, `boundary`, `dispersion`, `varcorr`, read
 through `FitView::into_fit` after the timer stopped; and under `counters`
 `stage_evals`, `shrink_evals`, `pirls_hist`, `pirls_iters`, `agq_evals`,
-`agq_node_evals`, `nb_nodes`, `nb_evals_total` and the observed `route`.
+`agq_node_evals` and the observed `route`.
 Warm-up draws (`--warmup`, own stream) are recorded with `warmup: true`.
 
 Every call into the crate sits in `loop_bench.rs`'s `mod api`; a build

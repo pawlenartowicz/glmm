@@ -943,10 +943,10 @@ are in `glmm::orchestrate` (feature `orchestrate`): `run_compare`, with the
 constants `DEFAULT_SEED`, `DEFAULT_NSIM` and `MAX_NSIM`, and the per-term
 tables `run_fit` stores on `FitResult`. `TermTestOptions::test` takes
 `TermTest::{Auto, Wald, Lrt}`, and `TermTable::choice` (a `TestChoice`) says
-which test ran and why (`ChoiceReason`); `run_fit`'s `anova_test` (`"auto"`,
-`"Wald"` or `"LRT"`) decides whether `FitResult::term_table_type3_lrt` and
+which test ran and why (`ChoiceReason`); `run_fit`'s `anova_test` (a
+`TermTest`) decides whether `FitResult::term_table_type3_lrt` and
 `term_table_type2_lrt` are built, and `FitResult::term_test_auto` records
-what `"auto"` gives. The ports' own `"auto"` sends `run_fit` `"Wald"`, and
+what `"auto"` gives. The ports' own `"auto"` sends `run_fit` `TermTest::Wald`, and
 repeats the call with the tables' value when `anova()` needs them.
 `FixedRow::eta2_partial()` gives a row's partial η²
 (NaN on a row with no F), and `orchestrate::TermColumns::eta2_partial` holds

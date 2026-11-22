@@ -9,7 +9,8 @@
 /// `[lower[j], upper[j]]`), and the gain the two probes predict along it is
 /// the larger of the drop from `f0` to the lower probe and the parabola's
 /// `g²/(2c)` through the three points. Returns the largest gain over the
-/// coordinates and the evaluations run, and writes into `curv[j]` the
+/// coordinates, the number of probed coordinates with no finite probe (whose
+/// gain is unknown, not 0), and the evaluations run, and writes into `curv[j]` the
 /// curvature `c = (f₊ + f₋ − 2·f0)/step²` the three points give along
 /// coordinate `j`, NaN where the coordinate is skipped or a side is not
 /// evaluated or not finite. `theta` and `scratch` have the same length, which
@@ -27,8 +28,9 @@ pub(crate) fn stationarity_gain(
     step: f64,
     curv: &mut [f64],
     eval: &mut impl FnMut(&[f64]) -> f64,
-) -> (f64, u32) {
+) -> (f64, u32, u32) {
     let mut gain = 0.0f64;
+    let mut unprobed = 0u32;
     let mut evals = 0u32;
     scratch.copy_from_slice(theta);
     for j in 0..lower.len() {
@@ -51,6 +53,8 @@ pub(crate) fn stationarity_gain(
         let lower_probe = f[0].min(f[1]);
         if lower_probe.is_finite() {
             gain = gain.max(f0 - lower_probe);
+        } else {
+            unprobed += 1;
         }
         if f[0].is_finite() && f[1].is_finite() {
             let h = step;
@@ -62,5 +66,32 @@ pub(crate) fn stationarity_gain(
             }
         }
     }
-    (gain, evals)
+    (gain, unprobed, evals)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stationarity_gain;
+
+    /// An objective that is NaN everywhere probes nothing: every coordinate
+    /// the probe does not skip is counted unprobed, and the gain stays 0.
+    #[test]
+    fn coordinates_with_no_finite_probe_are_counted() {
+        let theta = [0.5, 0.0, 0.7];
+        let mut scratch = [0.0; 3];
+        let mut curv = [0.0; 3];
+        let (gain, unprobed, evals) = stationarity_gain(
+            &theta,
+            &mut scratch,
+            &|j| j == 1,
+            &[0.0; 3],
+            &[10.0; 3],
+            1.0,
+            1e-3,
+            &mut curv,
+            &mut |_| f64::NAN,
+        );
+        assert_eq!((gain, unprobed, evals), (0.0, 2, 4));
+        assert!(curv.iter().all(|c| c.is_nan()));
+    }
 }

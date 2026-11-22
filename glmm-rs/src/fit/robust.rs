@@ -125,7 +125,7 @@ pub(crate) fn pieces(
 /// `vcov` and `coef_df` of `fit.robust` on the `targets` columns (NaN on the
 /// rest, and where one cluster alone identifies a coefficient), and the
 /// robust notes. A fit without pieces (no endpoint, an exact fit) has NaN
-/// SEs, `vcov` and df.
+/// SEs, `vcov` and df, and one with an endpoint also [`Note::SeUnavailable`].
 pub(crate) fn apply(fit: &mut Fit, targets: &[u32], se_type: Option<SeType>, spec: &ModelSpec) {
     if se_type != Some(SeType::Robust) {
         return;
@@ -139,6 +139,11 @@ pub(crate) fn apply(fit: &mut Fit, targets: &[u32], se_type: Option<SeType>, spe
     fit.se = vec![f64::NAN; p];
     fit.vcov = vec![f64::NAN; p * p];
     let Some(pc) = &fit.robust else {
+        // An endpoint has a log-likelihood or deviance that is not NaN; an
+        // exact fit's log-likelihood is +∞.
+        if !fit.loglik.is_nan() || !fit.deviance.is_nan() {
+            fit.diagnostics.notes.push(Note::SeUnavailable);
+        }
         return;
     };
     let v = pc.vcov();

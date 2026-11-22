@@ -40,18 +40,6 @@ V <- grid_versions(env$grid_dir)
 # the recorded string is the one packageVersion() gave (versions.R).
 ENGINE_VERSION <- assert_pkg_version("lmerTest", V[["lmerTest"]])
 
-# Every warning `expr` raises, kept instead of printed: lmerTest signals a
-# variance-parameter Hessian with a negative or near-zero eigenvalue as a
-# warning and still returns a fit, so the warning is the only record of it.
-with_warnings <- function(expr) {
-  w <- character(0)
-  v <- withCallingHandlers(expr, warning = function(cond) {
-    w <<- c(w, conditionMessage(cond))
-    invokeRestart("muffleWarning")
-  })
-  list(value = v, warnings = w)
-}
-
 # The fit as a closure, as lme4.R::make_fit's Gaussian branch builds it: the
 # prior-weight column when the cell has one, REML from the cell. A trials or
 # offset cell is never Gaussian, so neither case arises here.
@@ -73,19 +61,13 @@ SINGULAR_NOTE <- "boundary (singular) fit"
 
 record_fit <- function(m, warns, rec, s = with_warnings(summary(m))) {
   msgs <- as.character(unlist(m@optinfo$conv$lme4$messages))
-  # The optimizer's own return code and warnings, read as lme4.R reads them:
-  # lme4 skips its gradient checks above check.conv.nobsmax rows, so these are
-  # the only record of an optimizer that stopped at its budget.
-  opt_code <- m@optinfo$conv$opt
-  opt_warn <- as.character(unlist(m@optinfo$warnings))
-  opt_failed <- (!is.null(opt_code) && !identical(as.numeric(opt_code), 0)) ||
-                length(opt_warn) > 0
+  opt <- lme4_opt_status(m)
   conv_msgs <- msgs[!grepl(SINGULAR_NOTE, msgs, fixed = TRUE)]
-  rec$converged <- length(conv_msgs) == 0 && !opt_failed
+  rec$converged <- length(conv_msgs) == 0 && !opt$failed
   rec$singular <- lme4::isSingular(m)
-  notes <- c(msgs, opt_warn, warns)
-  if (!is.null(opt_code) && !identical(as.numeric(opt_code), 0) && !length(opt_warn))
-    notes <- c(notes, sprintf("optimizer return code %s", format(opt_code)))
+  notes <- c(msgs, opt$warnings, warns)
+  if (opt$failed && !length(opt$warnings))
+    notes <- c(notes, sprintf("optimizer return code %s", format(opt$code)))
   # Every column of the formula's design, a column lme4 dropped as aliased
   # included (beta and df NA there, written null), as glmm records it: gate 5
   # pairs the two by name and drops a coordinate null on both sides.

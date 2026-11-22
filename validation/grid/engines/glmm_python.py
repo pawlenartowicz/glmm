@@ -42,9 +42,8 @@ ONLY = [c for c in os.environ.get("GRID_CELLS", "").split(",") if c]
 VERSION = version("glmm")
 
 # Manifest family string -> the Python port's family string. The grid
-# manifest already spells every family the crate's own way (unlike the old
-# per-rung validation manifest, which used "negbin"), so this is an identity
-# table kept for the same shape as glmm.rs::family_of / the old port.
+# manifest already spells every family the crate's own way, so this is an
+# identity table kept for the same shape as glmm.rs::family_of.
 _FAMILY = {
     "gaussian": "gaussian",
     "binomial": "binomial",
@@ -342,7 +341,7 @@ def main():
             # default), which is already the shortest round-trip
             # representation -- full precision, not a display rounding, so
             # the 1e-12 port band is meaningful.
-            out.write(json.dumps(rec) + "\n")
+            out.write(json.dumps(rec, allow_nan=False) + "\n")
             out.flush()  # line-per-fit flush: the watchdog watches mtime
 
 

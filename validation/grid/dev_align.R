@@ -117,10 +117,9 @@ binomial_response <- function(cell, df) {
   list(y = y, n = rep(1, nrow(df)))
 }
 
-# Saturated-model loglik, in the verified closed form of 2026-08-24. That
-# derivation computes sat_* = -2 * logLik(saturated), an AIC-style constant; this
-# returns the loglik itself (that value / -2), which is what aligned_dev ADDS to
-# lme4's reported nAGQ>1 loglik. Adding the un-halved, unnegated sat_* instead
+# Saturated-model loglik in closed form. -2 * logLik(saturated) (sat_*) is an
+# AIC-style constant; this returns the loglik itself (that value / -2), which
+# is what aligned_dev ADDS to lme4's reported nAGQ>1 loglik. Adding the un-halved, unnegated sat_* instead
 # overshoots by 2x; that is the failure mode the cbpp and grouseticks nAGQ=1
 # goldens were kept to catch.
 # Signature (rec, df, cell), like every ALIGN addend. Returns NA_real_ -- never
@@ -150,33 +149,6 @@ saturated_loglik <- function(rec, df, cell) {
     return(-sat / 2)
   }
   NA_real_
-}
-
-# Binomial-trials normalising constant, sum(lchoose(n_i, y_i)). An engine that
-# fits the aggregated form as a PROPORTION with prior weights drops this term
-# from its loglik while one that fits cbind(successes, failures) keeps it; the
-# two objectives differ by exactly this data-only constant and by nothing else,
-# so they share an argmin and every parameter estimate. Zero on a Bernoulli cell
-# (lchoose(1, y) = 0), so it is safe to apply to the whole binomial family.
-# No ALIGN entry reads it yet; it lives here so the closed form has one place to
-# live, for an engine whose pilot measurement shows it drops the term.
-lchoose_binomial <- function(rec, df, cell) {
-  r <- binomial_response(cell, df)
-  sum(lchoose(r$n, r$y))
-}
-
-# Gaussian REML constant, df_reml * (1 + log(2*pi)) / 2 with df_reml = n - p, on
-# the loglik scale. An engine reporting a profiled REML DEVIANCE rather than the
-# REML criterion is short by exactly this. lme4's logLik on a REML fit already
-# carries the term, which is why lme4's gaussian entry is "none"; the constant
-# exists for an engine whose pilot measurement shows it does not.
-# Signature is (rec, df, cell) like every other ALIGN entry -- NOT a closure over
-# a variable from aligned_dev's frame. `p` comes from the RECORD's own
-# coef_names, so a rank-deficient fit that dropped an aliased column is counted
-# as the engine actually counted it.
-reml_gaussian_const <- function(rec, df, cell) {
-  df_reml <- nrow(df) - length(rec$coef_names)
-  df_reml * (1 + log(2 * pi)) / 2
 }
 
 # --- prior-weight gaussian cells: excluded, not aligned ---------------------
@@ -325,10 +297,9 @@ ALIGN <- list(
       note = "same reporting mechanism as the confirmed gaussian, binomial and poisson entries for this engine: R's logLik is one generic over lm, glm and merMod and the family enters only the density it sums. Mixed cells return NA and are excluded: glmer.nb's Fisher-weight Laplace is not glmm's objective (see lme4_objective above)"),
     inversegaussian  = align("none", "derived",
       note = "same reporting mechanism as the confirmed gaussian, binomial and poisson entries for this engine: R's logLik is one generic over lm, glm and merMod and the family enters only the density it sums"),
-    # lme4's nAGQ>1 logLik omits the saturated term. Verified 2026-08-24 against
-    # the frozen cbpp and grouseticks goldens: adding it closes an 84-unit /
-    # 931-unit raw deviance gap to under 1 unit. Carried over CONFIRMED, with
-    # that date, because the measurement is on file. The manifest's oracle lists
+    # lme4's nAGQ>1 logLik omits the saturated term: against the frozen cbpp and
+    # grouseticks goldens, adding it closes an 84-unit / 931-unit raw deviance gap
+    # to under 1 unit, so the entry is CONFIRMED. The manifest's oracle lists
     # keep lme4 off gamma and NB AGQ cells, where saturated_loglik has no closed
     # form.
     agq = align(lme4_agq, "confirmed", "2026-08-24",

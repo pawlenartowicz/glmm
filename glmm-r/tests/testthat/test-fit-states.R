@@ -199,7 +199,7 @@ fs_calls <- list(
   }),
   summary = list(estimate = TRUE, run = function(ctx) {
     s <- summary(ctx$fit)
-    c(s$coefficients, s$criterion)
+    c(s$coefficients, s$criterion, s$sigma)
   }),
   terms = list(estimate = FALSE, run = function(ctx) terms(ctx$fit)),
   tidy = list(estimate = TRUE, run = function(ctx) {
@@ -358,6 +358,12 @@ test_that("every fit state reaches its state", {
                                       paste(fit$beta, collapse = " "),
                                       paste(kinds, collapse = " ")))
     }
+    # The singular warning comes exactly with a singular converged fit.
+    warned <- sum(fit$warnings$kind == "singular")
+    if (warned != as.integer(fit$converged && fit$singular)) {
+      failures <- c(failures, sprintf("%s: %d singular warnings, singular %s",
+                                      ctx$label, warned, fit$singular))
+    }
   }
   expect_identical(length(fs_contexts), 39L)
   fs_expect_none(failures)
@@ -426,7 +432,10 @@ test_that("every call on every fit returns or raises the package's error", {
       tab <- tryCatch(suppressWarnings(pairwise(fit, "f")), error = function(e) NULL)
       if (!is.null(tab)) {
         pw_returned <- c(pw_returned, ctx$label)
-        if (!identical(attr(tab, "footer")[1L], fastglmm:::.NOT_CONVERGED)) {
+        if (!identical(attr(tab, "footer")[1L], paste(
+          "The fit did not converge, so its estimates are not at a maximum and these tests",
+          "are not reliable. Change the model until it converges (a simpler random part often",
+          "helps), then test again."))) {
           fail(ctx, sprintf("pairwise note: %s", attr(tab, "footer")[1L]))
         }
         ci_note <- attr(suppressWarnings(confint(tab)), "footer")[1L]

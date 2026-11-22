@@ -74,7 +74,7 @@ fam_obj <- function(family, link) {
 #
 # No `offset =` argument: the `offset(...)` term is already inside `ma_fixed`.
 #
-# Wrapped in with_warnings (below), the same construction lme4.R uses: a
+# Wrapped in with_warnings (common.R): a
 # convergence or numerical-quality warning from mixed_model() would otherwise
 # go to the console where nothing records it, so it is captured here and
 # routed into `message` by record_glmmadaptive.
@@ -111,18 +111,6 @@ make_fit <- function(cell, df) {
                                 n_phis = 1,
                                 initial_values = list(betas = stats::Gamma(link = "log")))
     }))
-}
-
-# Runs `expr` and returns its value together with every warning it raised,
-# instead of letting the warnings go to the console where nothing records
-# them.
-with_warnings <- function(expr) {
-  w <- character(0)
-  v <- withCallingHandlers(expr, warning = function(cond) {
-    w <<- c(w, conditionMessage(cond))
-    invokeRestart("muffleWarning")
-  })
-  list(value = v, warnings = w)
 }
 
 # `m$D` -> stddev + correlation (`cov2cor`), the RE covariance on the absolute

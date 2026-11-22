@@ -27,7 +27,9 @@ per coefficient, aliased coefficients \code{NaN} rows; with
 (per grouping the SDs and correlations column-major, each SD followed by
 its correlations, then \code{sigma}, then the coefficients; lme4 2.0 lists a
 block's SDs before its correlations, so match rows to lme4's by name),
-\code{NA} for an undetermined bound.
+\code{NA} for an undetermined bound, and the attribute \code{notes}: a character
+vector that says the profiles ran on the ML fit (and that a REML fit was
+refitted by ML), then names each row with an \code{NA} bound.
 }
 \description{
 \code{method = "Wald"} (the default) gives intervals off the Wald standard errors

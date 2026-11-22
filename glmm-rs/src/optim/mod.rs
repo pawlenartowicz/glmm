@@ -307,25 +307,6 @@ pub(crate) enum OuterOptimizer {
     Bfgs,
 }
 
-/// The optimizer a route's θ search runs on a cold fit and on a warm one,
-/// fixed per workspace from the shape alone (the GLMM gradient route). A
-/// fit reads the member for its start kind.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct RoutePlan {
-    /// A fit from the blind start.
-    pub cold: OuterOptimizer,
-    /// A fit from a caller's start (the start guard runs).
-    pub warm: OuterOptimizer,
-}
-
-impl RoutePlan {
-    /// BOBYQA on both start kinds: every shape outside a gradient rule.
-    pub(crate) const BOBYQA: Self = Self {
-        cold: OuterOptimizer::Bobyqa,
-        warm: OuterOptimizer::Bobyqa,
-    };
-}
-
 /// Runs `solver` on `obj` from `x` within `[lower, upper]`, handing the
 /// objective the trust radius ρ as its resolution. A `None` from the
 /// objective reaches BOBYQA as `+∞`, its failed-trial value; a non-finite
@@ -434,6 +415,43 @@ impl<O: GradObjective> GradObjective for Masked<'_, O> {
         self.inner.start_curvature(&mut full);
         for (c, &i) in inv_curv.iter_mut().zip(&self.free) {
             *c = full[i];
+        }
+    }
+}
+
+/// An objective divided by `div`, a power of two, so the division is exact:
+/// value and gradient times `1/div`, the start's inverse curvature times
+/// `div`. The GLMM searches run on it (`GlmmWorkspace::search_div`).
+pub(crate) struct Scaled<'a, O> {
+    inner: &'a mut O,
+    div: f64,
+}
+
+impl<'a, O> Scaled<'a, O> {
+    pub(crate) fn new(inner: &'a mut O, div: f64) -> Self {
+        Self { inner, div }
+    }
+}
+
+impl<O: Objective> Objective for Scaled<'_, O> {
+    fn value(&mut self, x: &[f64], resolution: f64) -> Option<f64> {
+        self.inner.value(x, resolution).map(|v| v / self.div)
+    }
+}
+
+impl<O: GradObjective> GradObjective for Scaled<'_, O> {
+    fn gradient(&mut self, g: &mut [f64]) -> bool {
+        let ok = self.inner.gradient(g);
+        for v in g.iter_mut() {
+            *v /= self.div;
+        }
+        ok
+    }
+
+    fn start_curvature(&self, inv_curv: &mut [f64]) {
+        self.inner.start_curvature(inv_curv);
+        for c in inv_curv.iter_mut() {
+            *c *= self.div;
         }
     }
 }

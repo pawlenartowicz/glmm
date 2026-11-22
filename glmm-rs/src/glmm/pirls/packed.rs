@@ -95,12 +95,16 @@ impl LaplaceFactor<f64> for PackedFactor<'_> {
             let mut probit_rows = crate::family::ProbitRows::new(family, eta, prob);
             for i in 0..n {
                 let wi = w[i];
-                let rho = match probit_rows.as_mut() {
-                    Some(rows) => rows.score(i, y[i], prior_w[i]),
-                    None => crate::family::row_score(
-                        family, nb_theta, y[i], prior_w[i], eta[i], prob[i],
-                    ),
-                };
+                let rho = super::row_rho(
+                    family,
+                    nb_theta,
+                    i,
+                    y[i],
+                    prior_w[i],
+                    eta[i],
+                    prob[i],
+                    probit_rows.as_mut(),
+                );
                 let base = i * width;
                 for ta in base..base + width {
                     let ca = m_cols[ta] as usize;
@@ -126,21 +130,24 @@ impl LaplaceFactor<f64> for PackedFactor<'_> {
             a_rhs[c] = 0.0;
         }
         // `wᵢmᵢmᵢ'` into A and `mᵢ·ρᵢ` into the RHS, from each row's
-        // `width` nonzeros. This pass is scalar per row for every family — no
-        // logit shortcut and no batched kernel but probit's `φ`, a tile at a
-        // time (`family::ProbitRows`): the effective residual
-        // `ρ = w·(dμ/dη)·(y−μ)/V` is formed here beside the gather. The exit
-        // refresh's μ/W/deviance pass is `Scalar::family_pass`, which does take
+        // `width` nonzeros. This pass is scalar per row, with no batched kernel
+        // but probit's `φ`, a tile at a time (`family::ProbitRows`): the row
+        // score ρᵢ (`row_rho`) is formed here beside the gather. The
+        // μ/W/deviance pass before it is `Scalar::family_pass`, which does take
         // the fused logit and SIMD arms.
         let mut probit_rows = crate::family::ProbitRows::new(family, eta, prob);
         for i in 0..n {
             let wi = w[i];
-            let rho = match probit_rows.as_mut() {
-                Some(rows) => rows.score(i, y[i], prior_w[i]),
-                None => {
-                    crate::family::row_score(family, nb_theta, y[i], prior_w[i], eta[i], prob[i])
-                }
-            };
+            let rho = super::row_rho(
+                family,
+                nb_theta,
+                i,
+                y[i],
+                prior_w[i],
+                eta[i],
+                prob[i],
+                probit_rows.as_mut(),
+            );
             let base = i * width;
             for ta in base..base + width {
                 let ca = m_cols[ta] as usize;
@@ -258,8 +265,10 @@ impl LaplaceFactor<f64> for PackedFactor<'_> {
 /// times. A within-band rise is FP noise near the optimum and is accepted — it
 /// never burns a halving. In `Profile` mode the joint `(u, β)` step is
 /// backtracked in lockstep, halving β toward `beta_prev` alongside u. A
-/// trial η past the link's clamp bounds (`family::eta_infeasible`) halves
-/// regardless of the band. Convergence is the mixed
+/// trial whose raw η passes the link's clamp (`family::eta_infeasible`) is
+/// rejected regardless of the band and pulled back, in one evaluation, to the
+/// largest power-of-two fraction of the step that is inside the clamp
+/// (`clamp_jump`), which counts as one halving. Convergence is the mixed
 /// `dev(uⱼ) + ‖uⱼ₊₁‖²` band on successive steps, checked after the step.
 ///
 /// Iterates from whatever `scratch.u` holds on entry — the caller owns reset
@@ -282,9 +291,9 @@ pub(crate) fn pirls_solve_packed(
     // it holding the raw symmetric `M'WM + I`, so the Cholesky runs on the
     // separate `a_chol`.
     packed: &mut PackedScratch,
-    // n × p = W∘X GEMM scratch for the Profile β-Schur border's C = X'WX
-    // (rebuilt fresh from this iteration's `w` each Profile step, so no
-    // stale-value hazard across PIRLS iterations).
+    // n×p scratch: the design residual rows `rᵢ = xᵢ − Tᵀmᵢ` of the Profile β
+    // border (`residual_border`), rebuilt each Profile step, so no stale-value
+    // hazard across PIRLS iterations.
     wx: &mut Mat<f64>,
     // Per-row linear-predictor offset (`Data::offset`), added into
     // `eta_fixed` by every `refresh_eta_fixed` call. `None` ⇒ no offset.
@@ -354,31 +363,31 @@ pub(crate) fn pirls_solve_packed(
     for it in 0..PIRLS_MAX_ITERS {
         counters.set_pirls_iters(it + 1);
         // --- trial evaluation at the CURRENT u: (Mu)ᵢ and the raw η, then
-        // μ/W/deviance per row. On a fresh accept this is the newly-stepped u;
-        // after a halving `continue` it is the backtracked u. `infeasible` flags
-        // any RAW η past the link's clamp bounds (`family::eta_infeasible`). ---
-        // The returned `Σ yᵢηᵢ` is dropped: this loop forms the deviance row by
-        // row below instead of calling `T::family_pass`, so nothing consumes it.
-        layout.eta_from_mode(&u[..], &eta_fixed[..], &mut eta[..], y, n);
-        dev = 0.0;
-        let mut infeasible = false;
-        for i in 0..n {
-            let raw = eta[i];
-            infeasible |= crate::family::eta_infeasible(family, y[i], raw);
-            let e = crate::family::clamp_eta(family, raw);
-            eta[i] = e;
-            // Canonical-link shortcut (Poisson-log) lives inside this call — see
-            // `irls_weight_and_resid`'s doc comment.
-            let (mui, wi, _) = crate::family::irls_weight_and_resid(family, nb_theta, y[i], e);
-            prob[i] = mui;
-            w[i] = (prior_w[i] * wi).max(crate::glm::WEIGHT_CLAMP);
-            dev += prior_w[i] * crate::family::dev_resid_at(family, nb_theta, y[i], e, mui);
-        }
+        // μ/W/deviance through the family kernel the exit refresh
+        // (`evaluate_at_mode`) also runs, so the band and the stop rule read
+        // the deviance it returns. On a fresh accept this is the newly-stepped
+        // u; after a halving `continue` it is the backtracked u. `infeasible`
+        // flags any RAW η past the link's clamp bounds
+        // (`family::eta_infeasible`) or NaN on a link that clamps η. ---
+        let yeta = layout.eta_from_mode(&u[..], &eta_fixed[..], &mut eta[..], y, n);
+        let (d, infeasible) = f64::family_pass(
+            family,
+            nb_theta,
+            &mut eta[..n],
+            &y[..n],
+            &prior_w[..n],
+            weighted,
+            yeta,
+            &mut prob[..n],
+            &mut w[..n],
+            &mut [],
+        );
+        dev = d;
         // Band-tolerant retrospective step-halving: the convergence band is
         // consulted before any halving, because near the optimum the iteration
         // is not strictly monotone — a step can land ε above `pen_accepted` yet
-        // inside the tol band, and that must converge rather than burn all ten
-        // halvings against FP noise. Only a rise EXCEEDING the band is a genuine
+        // inside the tol band, and that must converge rather than burn the
+        // halving budget (`PIRLS_MAX_HALVINGS`) against FP noise. Only a rise EXCEEDING the band is a genuine
         // overshoot. A domain-infeasible trial is a step failure regardless of
         // the band: accepting it would let `clamp_eta`'s boundary projection
         // define the converged answer.
@@ -390,6 +399,31 @@ pub(crate) fn pirls_solve_packed(
         {
             if halvings < PIRLS_MAX_HALVINGS {
                 halvings += 1;
+                if infeasible {
+                    // Past the η clamp: one jump back inside it.
+                    jump_back(
+                        &mut layout,
+                        family,
+                        y,
+                        &FixedPart {
+                            x,
+                            rows: None,
+                            n,
+                            p,
+                            offset,
+                        },
+                        &beta_step,
+                        u,
+                        u_prev,
+                        beta,
+                        eta_fixed,
+                        prob,
+                        eta,
+                        w,
+                        k,
+                    );
+                    continue;
+                }
                 for c in 0..k {
                     u[c] = 0.5 * (u[c] + u_prev[c]);
                 }
@@ -506,16 +540,10 @@ pub(crate) fn pirls_solve_packed(
                     wx[(i, c)] = r;
                 }
             }
-            let probit_rows =
-                std::cell::RefCell::new(crate::family::ProbitRows::new(family, eta, prob));
+            let scores = ProfileScores::new(family, nb_theta, y, prior_w, eta, prob);
             residual_border(
                 |i| w[i],
-                |i| match probit_rows.borrow_mut().as_mut() {
-                    Some(rows) => rows.score(i, y[i], prior_w[i]),
-                    None => crate::family::row_score(
-                        family, nb_theta, y[i], prior_w[i], eta[i], prob[i],
-                    ),
-                },
+                |i| scores.at(i),
                 wx.as_ref().subrows(0, n),
                 ainv_mtwx.as_ref().subrows(0, k),
                 |j| u_prev[j],
@@ -523,23 +551,9 @@ pub(crate) fn pirls_solve_packed(
                 &mut beta_rhs[..p],
             );
             // δβ = S_β⁻¹·rhs in place. Non-PD S_β ⇒ the (NaN,…,false) failure surface.
-            if cholesky_in_place(
-                schur.as_mut(),
-                LltRegularization::default(),
-                Par::Seq,
-                MemStack::new(schur_llt_mem),
-                Spec::default(),
-            )
-            .is_err()
-            {
+            if !border_solve(schur, &mut beta_rhs[..p], schur_llt_mem, None) {
                 return (f64::NAN, f64::NAN, f64::NAN, false);
             }
-            solve_in_place(
-                schur.as_ref(),
-                MatMut::from_column_major_slice_mut(&mut beta_rhs[..p], p, 1),
-                Par::Seq,
-                MemStack::new(schur_llt_mem),
-            );
             // Apply: β += δβ; u = u_joint = u_new − T·δβ.
             for j in 0..p {
                 beta[j] += beta_rhs[j];
@@ -625,11 +639,10 @@ pub(crate) fn pirls_solve_packed(
 }
 
 /// Refill the packed `M` values at the current Λ (`packed.lam_small` must be
-/// filled for this θ): entry `c` of a row's block is the lower-tri fold
-/// `Σ_{r≥c} z[r]·Λ[r,c]` with `z = [1, slopes…]`, the same `ZΛ` sandwich
-/// every other layout writes. The Z-side factor is indexed by the Λ ROW `r`,
-/// not the column `c`. The slopes come from `z_buf` (`workspace::fill_z_f64`,
-/// whose row order this walk shares), never from the fixed-effect design.
+/// filled for this θ): each grouping's block of a row is [`super::zlam_row`],
+/// the same `ZΛ` fold every other layout writes. The slopes come from `z_buf`
+/// (`workspace::fill_z_f64`, whose row order this walk shares), never from the
+/// fixed-effect design.
 pub(crate) fn fill_m_vals(
     packed: &mut PackedScratch,
     g: &crate::lmm::LmmGroupings,
@@ -641,28 +654,24 @@ pub(crate) fn fill_m_vals(
     let mut zt = 0;
     for i in 0..n {
         let mut t = i * width;
-        for c in 0..q_p {
-            let mut acc = 0.0;
-            for r in c..q_p {
-                let z = if r == 0 { 1.0 } else { z_buf[zt + r - 1] };
-                acc += z * packed.lam_small[r * q_p + c];
-            }
-            packed.m_vals[t] = acc;
-            t += 1;
-        }
+        super::zlam_row(
+            &z_buf[zt..],
+            &packed.lam_small,
+            q_p,
+            &mut packed.m_vals[t..t + q_p],
+        );
+        t += q_p;
         zt += q_p - 1;
         for e in 0..g.extra_offsets.len() {
             let q_g = g.extra_q[e];
             let lo = packed.lam_off_decl[e];
-            for c in 0..q_g {
-                let mut acc = 0.0;
-                for r in c..q_g {
-                    let z = if r == 0 { 1.0 } else { z_buf[zt + r - 1] };
-                    acc += z * packed.lam_small[lo + r * q_g + c];
-                }
-                packed.m_vals[t] = acc;
-                t += 1;
-            }
+            super::zlam_row(
+                &z_buf[zt..],
+                &packed.lam_small[lo..],
+                q_g,
+                &mut packed.m_vals[t..t + q_g],
+            );
+            t += q_g;
             zt += q_g - 1;
         }
     }
@@ -742,167 +751,5 @@ pub(crate) fn packed_m_vals_theta_deriv(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::fit::SizedSpec;
-    use crate::lmm::LmmGroupings;
-
-    /// [`packed_m_vals_theta_deriv`] must reproduce a central difference of
-    /// [`fill_m_vals`] in every θ coordinate and every slot of every row, on
-    /// a packed shape carrying a random slope on the PRIMARY grouping and a
-    /// random slope on an EXTRA one — the two blocks whose vech walks, `Λ`
-    /// offsets and `z` columns the selection has to keep apart.
-    #[test]
-    fn packed_m_vals_theta_deriv_matches_fill_m_vals_difference() {
-        let n = 16;
-        let mut x = Mat::<f64>::zeros(n, 3);
-        for i in 0..n {
-            x[(i, 0)] = 1.0;
-            x[(i, 1)] = 0.7 + 0.31 * i as f64;
-            x[(i, 2)] = 2.5 - 0.17 * (i % 7) as f64;
-        }
-        let spec = SizedSpec {
-            spec: crate::ModelSpec {
-                family: Family::Binomial {
-                    link: BinomialLink::Logit,
-                },
-                re: Some(crate::ReStructure {
-                    terms: Vec::new(),
-                    slopes: vec![1],
-                    extra_groupings: vec![crate::Grouping {
-                        terms: Vec::new(),
-                        relation: crate::GroupingRelation::Crossed,
-                        slopes: vec![2],
-                    }],
-                }),
-            },
-            n_primary: 4,
-            extra_counts: vec![3],
-            tail_fill: 0.0,
-        };
-        let g = LmmGroupings::from_cluster_spec_ext(&spec, &[1], &[vec![2]]);
-        let mut packed = PackedScratch::for_shape(&g, n, g.k_total);
-        let width = packed.width;
-        let n_theta = g.n_theta();
-        let mut theta: Vec<f64> = (0..n_theta).map(|k| 0.4 + 0.11 * k as f64).collect();
-        let eps = 1e-6;
-        let mut z = vec![0.0; n * 2];
-        crate::glmm::workspace::fill_z_f64(&g, x.as_ref(), x.as_ref().subcols(0, 0), &mut z, n);
-
-        for a in 0..n_theta {
-            let base = theta[a];
-            theta[a] = base + eps;
-            crate::sparse::fill_lambda_small(&theta, &g, &mut packed.lam_small);
-            fill_m_vals(&mut packed, &g, &z, n);
-            let plus = packed.m_vals[..n * width].to_vec();
-            theta[a] = base - eps;
-            crate::sparse::fill_lambda_small(&theta, &g, &mut packed.lam_small);
-            fill_m_vals(&mut packed, &g, &z, n);
-            let minus = packed.m_vals[..n * width].to_vec();
-            theta[a] = base;
-
-            let mut d = vec![0.0; width];
-            for i in 0..n {
-                packed_m_vals_theta_deriv(&g, a, &z, i, &mut d);
-                for t in 0..width {
-                    let want = (plus[i * width + t] - minus[i * width + t]) / (2.0 * eps);
-                    assert!(
-                        (d[t] - want).abs() < 1e-8,
-                        "a={a} i={i} t={t}: selection {} vs central diff {want}",
-                        d[t]
-                    );
-                }
-            }
-        }
-    }
-
-    /// The exit refresh evaluates the loop's post-step iterate, which no trial
-    /// evaluation has passed, so a raw η outside the link's open domain can
-    /// reach [`evaluate_at_mode`]. It must refuse such a point instead of
-    /// reporting the `clamp_eta`-projected boundary point's deviance and
-    /// `log|A|` as the converged answer. Gamma-inverse here: `η = 1/μ`, so
-    /// `η ≤ 0` is outside the domain (`family::eta_infeasible`).
-    #[test]
-    fn evaluate_at_mode_refuses_an_infeasible_eta() {
-        let (n, s) = (6usize, 2usize);
-        let spec = SizedSpec {
-            spec: crate::ModelSpec {
-                family: Family::Gamma {
-                    link: crate::GammaLink::Inverse,
-                },
-                re: Some(crate::ReStructure {
-                    terms: Vec::new(),
-                    slopes: vec![],
-                    extra_groupings: vec![],
-                }),
-            },
-            n_primary: s,
-            extra_counts: vec![],
-            tail_fill: 0.0,
-        };
-        let g = LmmGroupings::from_cluster_spec_ext(&spec, &[], &[]);
-        let k = g.k_total;
-        let mut packed = PackedScratch::for_shape(&g, n, k);
-        // The test drives `PackedFactor` directly with `sp: None`, so it sizes
-        // the dense pair itself, as `fill_packed_cols` would.
-        packed.set_factor(None, k);
-        crate::sparse::fill_lambda_small(&[0.5], &g, &mut packed.lam_small);
-        fill_m_vals(&mut packed, &g, &[], n);
-        // Intercept-only primary: one nonzero per row, at that row's cluster.
-        for (i, m) in packed.m_cols[..n].iter_mut().enumerate() {
-            *m = (i % s) as u32;
-        }
-        let width = packed.width;
-        let y = vec![1.0; n];
-        let prior_w = vec![1.0; n];
-        let u = vec![0.0; k];
-        // u = 0, so η is η_fixed. The refused case has one row past the
-        // boundary, the shape a post-step iterate takes when the step overshoots.
-        let mut eta_fixed = vec![1.0; n];
-        let mut eta = vec![0.0; n];
-        let mut prob = vec![0.0; n];
-        let mut w = vec![0.0; n];
-        let mut a_rhs = vec![0.0; k];
-        let mut layout = PackedFactor {
-            m_cols: &packed.m_cols[..n * width],
-            m_vals: &packed.m_vals[..n * width],
-            a: &mut packed.a,
-            a_chol: &mut packed.a_chol,
-            a_llt_mem: &mut packed.a_llt_mem,
-            a_rhs: &mut a_rhs[..],
-            family: spec.spec.family,
-            nb_theta: f64::NAN,
-            width,
-            k,
-            sp: None,
-        };
-        let mut evaluates = |eta_fixed: &[f64]| {
-            evaluate_at_mode(
-                &mut layout,
-                spec.spec.family,
-                f64::NAN,
-                &y,
-                &prior_w,
-                false,
-                eta_fixed,
-                &u,
-                &mut eta,
-                &mut prob,
-                &mut w,
-                n,
-            )
-            .is_some()
-        };
-        // Positive control: the same call on an all-feasible η evaluates, so the
-        // refusal below is the infeasible row and nothing else.
-        assert!(
-            evaluates(&eta_fixed),
-            "an all-feasible iterate must be evaluated"
-        );
-        eta_fixed[2] = -0.25;
-        assert!(
-            !evaluates(&eta_fixed),
-            "a refreshed iterate with η outside the link's domain must not be reported as an evaluation"
-        );
-    }
-}
+#[path = "packed_tests.rs"]
+mod tests;

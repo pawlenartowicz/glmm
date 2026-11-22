@@ -195,7 +195,7 @@ fn fit_ols_offset_matches_r_lm() {
 /// The `min|L_ii| / max|L_ii|` statistic conflates collinearity with column
 /// scale and never fires here (measured 4.8e-8, four orders above its own
 /// 1e-12 threshold), so the route does not guard on it. It is not fixed by refusing on the
-/// right statistic either: the 2026-07-31 1-ULP sweep showed this route's
+/// right statistic either: a 1-ULP perturbation sweep shows this route's
 /// standard errors stay stable to 1.3e-13 relative and never understate the
 /// error, all the way past total loss of β̂. So the deliverable is the
 /// combination asserted below — the estimates are returned, and the SE beside
@@ -878,8 +878,8 @@ fn shifted_line(shift: f64) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
 }
 
 /// σ̂² and the SEs do not depend on how far y sits from 0: at a shift of
-/// 1e8 the closed-form RSS `y′y − β′X′y` cancelled to 0, at 1e9 it was off
-/// 165×. Weighted with an offset too. The 1e-5 band: the residuals keep
+/// 1e8 the closed-form RSS `y′y − β′X′y` would cancel to 0, at 1e9 it would
+/// be off 165×. Weighted with an offset too. The 1e-5 band: the residuals keep
 /// about shift·ε/sd(e) ≈ 1e-7 of their relative precision at 1e9.
 #[test]
 fn ols_dispersion_survives_a_large_response_shift() {

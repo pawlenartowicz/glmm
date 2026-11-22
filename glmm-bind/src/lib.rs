@@ -2,8 +2,9 @@
 //!
 //! A port converts its native values into a [`Record`] of [`Value`]s, calls
 //! [`call`] with a registered function name, and converts the result (or
-//! [`BindError`]) back. Argument checks, defaults, result records and the
-//! error codes live here once; the engine work is `glmm::orchestrate`'s.
+//! [`BindError`]) back. Argument checks, result records and error codes live
+//! here once; the fit defaults live in each port's own signature, and the
+//! engine work is `glmm::orchestrate`'s.
 
 #![forbid(unsafe_code)]
 // Counts cross as i64 and f64; the casts are range-checked where it matters
@@ -15,8 +16,10 @@
     clippy::cast_sign_loss
 )]
 
+mod anova_text;
 mod coerce;
 mod error;
+pub mod fields;
 mod fns;
 mod inputs;
 mod notes;

@@ -73,7 +73,8 @@ so by Cholesky uniqueness they produce the same fit to machine precision.
 
 **What.** All solver scratch lives in one workspace sized by model *shape*
 (groupings, family, p, max rows), not by data values. Refitting the same shape
-on new data allocates nothing; caller-supplied β/θ start values feed the
+on new data reuses it, with at most a small fixed count of allocations per fit
+on the shapes the allocation tests cover ([warm starts](algorithms-glmm.md#warm-starts-and-workspace-reuse)); caller-supplied β/θ start values feed the
 optimizer directly. The `loop_advanced` feature exposes this reuse explicitly.
 
 **Why it is faster.** This targets the regime `glmm` was built for: thousands

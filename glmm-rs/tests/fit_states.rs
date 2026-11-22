@@ -794,6 +794,7 @@ fn a_fit_refused_before_fitting_is_an_err() {
 #[cfg(feature = "orchestrate")]
 #[test]
 fn satterthwaite_record_on_every_gaussian_fit() {
+    use glmm::formula::anova::TermTest;
     use glmm::orchestrate::run_fit;
     use std::collections::HashMap;
     let mut failures = Vec::new();
@@ -815,20 +816,16 @@ fn satterthwaite_record_on_every_gaussian_fit() {
             &row.formula(),
             numeric,
             factors,
-            "gaussian",
-            "identity",
-            "hessian",
-            1,
+            Family::Gaussian,
+            {
+                let mut o = FitOptions::default();
+                o.condvar = true;
+                o
+            },
             None,
             None,
             None,
-            None,
-            true,
-            true,
-            None,
-            "Wald",
-            None,
-            None,
+            TermTest::Wald,
         );
         let Ok(r) = fitted else { continue };
         let Some(rec) = r.satterthwaite_record else {

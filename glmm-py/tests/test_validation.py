@@ -9,7 +9,7 @@ import glmm
 
 DATA = {"y": [1.0, 2.0, 3.0], "x": [0.0, 1.0, 2.0], "g": ["a", "b", "a"]}
 
-# A larger, family-appropriate dataset for tests whose call now reaches the
+# A larger, family-appropriate dataset for tests whose call reaches the
 # kernel (unlike DATA above, which is deliberately too small/malformed to fit
 # — it only exercises the pure-Python validation that runs before any native
 # call, so it must stay unchanged for those tests).
@@ -34,7 +34,7 @@ FIT_DATA = {
     "x": _X.tolist(),
     "g": [f"g{i}" for i in _GROUPS.tolist()],
     "y_gauss": (1.0 + 2.0 * _X + _rng.normal(scale=0.5, size=_N)).tolist(),
-    # Binomial's kernel domain is {0, 1} (see GLMM/glmm-rs/src/glm.rs) — a proper 0/1
+    # Binomial's kernel domain is {0, 1} (see glmm-rs/src/glm.rs) — a proper 0/1
     # draw, unlike the count-valued y_pois below, which must never be fit as
     # family="binomial".
     "y_bin": _rng.binomial(1, 1.0 / (1.0 + _np.exp(-(0.2 + 0.8 * _X)))).astype(float).tolist(),
@@ -334,11 +334,11 @@ def _at_row_2(fill, value):
     ("data", "formula", "family", "kwargs", "message"),
     [
         pytest.param(
-            {**_RANGE_DATA, "x": _at_row_2(0.0, 2e100)},
+            {**_RANGE_DATA, "x": _at_row_2(0.0, 2.0**333)},
             "y ~ x",
             "gaussian",
             {},
-            "x must be finite with |x| <= 1e100 (row 2, column 1, value 2e100; "
+            "x must be finite with |x| <= 1e100 (row 2, column 1, value 1.7498005798264095e100; "
             "glmm::limits::MAX_DATA_ABS)",
             id="x_past_data_bound",
         ),
@@ -346,8 +346,8 @@ def _at_row_2(fill, value):
             _RANGE_DATA,
             "y ~ x",
             "gaussian",
-            {"weights": _at_row_2(1.0, 1e-101)},
-            "Data weights must be within [1e-100, 1e100] (row 2, value 1e-101; "
+            {"weights": _at_row_2(1.0, 2.0**-336)},
+            "Data weights must be within [1e-100, 1e100] (row 2, value 7.143671195514219e-102; "
             "glmm::limits::MAX_DATA_ABS)",
             id="weight_below_its_interval",
         ),
@@ -382,9 +382,9 @@ def _at_row_2(fill, value):
             _RANGE_DATA,
             "y ~ x",
             "inversegaussian",
-            {"link": "log", "dispersion": 1e101},
+            {"link": "log", "dispersion": 2.0**335},
             "dispersion on an inverse-Gaussian model must be within [1e-100, 1e100] "
-            "(value 1e101; glmm::limits::MAX_DATA_ABS)",
+            "(value 6.999202319305638e100; glmm::limits::MAX_DATA_ABS)",
             id="inverse_gaussian_dispersion_outside_its_interval",
         ),
         pytest.param(

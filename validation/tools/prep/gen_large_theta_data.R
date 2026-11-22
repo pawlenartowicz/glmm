@@ -23,8 +23,8 @@
 # away from a rewritten CSV. gen_weights_data.R already set the precedent of a
 # self-contained per-tier script (rungs 29-43); this follows it.
 #
-# EVERY sd_g below is a TUNED value, not the target theta-hat. The spec's
-# targets are on the FITTED theta-hat (glmer nAGQ = 1, tolPwrss = 1e-13 -- the
+# EVERY sd_g below is a TUNED value, not the target theta-hat. The targets
+# are on the FITTED theta-hat (glmer nAGQ = 1, tolPwrss = 1e-13 -- the
 # control the oracle scripts pin), and the Laplace approximation is
 # biased LOW in exactly this regime: it is what these rungs exist to exercise.
 # Measured at freeze, one continuous (x) + one binary (z) fixed effect throughout:
@@ -49,8 +49,8 @@ emit <- function(name, df) {
 # 300 groups x 6 Bernoulli rows: MANY SMALL clusters is the half of the shape
 # that matters as much as the large sd. It is the standard hard cell for Laplace
 # (little per-cluster information, so the mode's normal approximation is at its
-# worst) and it is the shape lme4 issue #289 / toenail (294 patients,
-# theta-hat 4.708) has. At this sd most clusters are all-0 or all-1, which is
+# worst) and it is the shape of the toenail data (294 patients,
+# theta-hat 4.708). At this sd most clusters are all-0 or all-1, which is
 # the point: the FD Hessian's truncation error grows as theta-hat^2 and nothing
 # else in the corpus sits above 1.34.
 # b0 = 0.5 (not ~0) on sim_binomial_slope2's recorded rationale: a near-zero

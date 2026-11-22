@@ -8,8 +8,8 @@
 #     x1, x2 ~ N(0, 1); intercept 14, x1 0.1, x2 -0.1; intercept SD 0.5, both
 #     slope SDs 0. Columns y, x1, x2, g. Dataset 143 of a seed search over 300
 #     datasets of this design (base seed 202610314, dataset seed 1617775066),
-#     chosen on 2026-10-30 because, with the trough polish of that day (theta not
-#     scaled), the re-pin of a polished endpoint lowered it by more than 0.5
+#     chosen because, under a trough polish that does not scale theta, the
+#     re-pin of a polished endpoint lowered it by more than 0.5
 #     deviance units both on aarch64 macOS (-0.642, the largest there) and on
 #     x86_64 Linux (-0.614). Only dataset 202 also moved by more than 0.5 on
 #     both; dataset 229 moved more on x86_64 alone. Its search pins both
@@ -17,7 +17,7 @@
 #     boundary_pin_lme4_reference.R computes with lme4.
 #
 #   sim_poisson_precise_ridge  The same design, dataset 8 of the same 300
-#     (dataset seed 485970320), chosen on 2026-11-01: the model without x1 in
+#     (dataset seed 485970320), chosen because the model without x1 in
 #     its fixed part, slope kept, runs out along a ridge where the profiled
 #     deviance fails around a point the gradient search evaluated. Its CSV is
 #     the Mac arm64 run's, as the other's: R 4.5.3 on x86_64 Linux prints 18 and

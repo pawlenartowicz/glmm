@@ -197,6 +197,37 @@ grid_set_loglik <- function(rec, ll) {
   rec
 }
 
+# Runs `expr` and returns list(value, warnings): its value together with every
+# warning it raised, instead of letting the warnings go to the console where
+# nothing records them. lme4's and glmmTMB's vcov, glmmTMB's fit and lmerTest's
+# Hessian check all signal a warning and still RETURN A VALUE when the number is
+# not the one asked for or not reliable, so the warning is the only record of it.
+with_warnings <- function(expr) {
+  w <- character(0)
+  v <- withCallingHandlers(expr, warning = function(cond) {
+    w <<- c(w, conditionMessage(cond))
+    invokeRestart("muffleWarning")
+  })
+  list(value = v, warnings = w)
+}
+
+# lme4's optimizer outcome, as list(code, warnings, failed). lme4 skips its own
+# gradient checks above `check.conv.nobsmax` rows, so on most grid cells its
+# convergence messages are empty even when the optimizer stopped at its
+# evaluation budget. The optimizer's return code and warnings (in `optinfo`) are
+# the only record of that, and either one makes the fit unconverged. Read by
+# lme4.R and lmertest.R.
+lme4_opt_status <- function(m) {
+  code <- m@optinfo$conv$opt
+  warnings <- as.character(unlist(m@optinfo$warnings))
+  list(code = code, warnings = warnings,
+       failed = (!is.null(code) && !identical(as.numeric(code), 0)) || length(warnings) > 0)
+}
+
+# The manifest spells the inverse-Gaussian second link `inverse_squared` where R
+# spells it `1/mu^2`; every other link name is R's own.
+r_link <- function(link) if (identical(link, "inverse_squared")) "1/mu^2" else link
+
 # THE JSONL WRITER. All four keyword arguments are load-bearing:
 #   auto_unbox     scalars are scalars, not length-1 arrays
 #   digits = I(17) every double comes back bit-identical -- see below

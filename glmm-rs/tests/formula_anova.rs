@@ -33,8 +33,7 @@ use glmm::formula::anova::{
 use glmm::formula::{lower, pairwise, Adjust, Column, Lowered, Model, Table};
 use glmm::inference::contrast::NoDfReason;
 use glmm::inference::{
-    DenDf, LinearKind, LinearNote, LinearTest, LrNote, LrTest, Objective, ProfileInterval,
-    ProfileParam, Reference,
+    DenDf, LinearKind, LinearNote, LinearTest, LrNote, LrTest, Objective, ProfileParam, Reference,
 };
 use glmm::{
     BinomialLink, Dispersion, Family, Fit, FitOptions, GammaLink, InverseGaussianLink, Note,
@@ -75,44 +74,38 @@ fn nested(larger: Side, differs: Differs) -> Nesting {
     Nesting::Nested { larger, differs }
 }
 
+/// Pairs whose smaller formula is nested in the larger, the larger side and the
+/// part that differs: the fixed part, the random part (a slope, a grouping,
+/// the whole random part), both, and a nested grouping against its inner
+/// grouping (the Pastes `ranova` row: dropping `(1 | batch)` from
+/// `(1 | batch/cask)` leaves `(1 | cask:batch)`, the smaller model).
 #[test]
-fn a_smaller_fixed_part_is_nested() {
-    assert_eq!(
-        nest("y ~ x + (1 | g)", "y ~ x + z + (1 | g)"),
-        nested(Side::Second, Differs::Fixed)
-    );
-    assert_eq!(
-        nest("y ~ a * b", "y ~ a + b"),
-        nested(Side::First, Differs::Fixed)
-    );
-}
-
-#[test]
-fn a_smaller_random_part_is_nested() {
-    assert_eq!(
-        nest("y ~ x + (1 | g)", "y ~ x + (1 + x | g)"),
-        nested(Side::Second, Differs::Random)
-    );
-    assert_eq!(
-        nest("y ~ x + (1 | g) + (1 | h)", "y ~ x + (1 | g)"),
-        nested(Side::First, Differs::Random)
-    );
-    assert_eq!(
-        nest("y ~ x", "y ~ x + (1 | g)"),
-        nested(Side::Second, Differs::Random)
-    );
-}
-
-#[test]
-fn both_parts_smaller_is_nested() {
-    assert_eq!(
-        nest("y ~ x + (1 | g)", "y ~ x + z + (1 + x | g)"),
-        nested(Side::Second, Differs::Both)
-    );
-    assert_eq!(
-        nest("y ~ 1", "y ~ x + (1 | g)"),
-        nested(Side::Second, Differs::Both)
-    );
+fn nested_pairs() {
+    use Differs::{Both, Fixed, Random};
+    use Side::{First, Second};
+    let cases = [
+        ("y ~ x + (1 | g)", "y ~ x + z + (1 | g)", Second, Fixed),
+        ("y ~ a * b", "y ~ a + b", First, Fixed),
+        ("y ~ x + (1 | g)", "y ~ x + (1 + x | g)", Second, Random),
+        (
+            "y ~ x + (1 | g) + (1 | h)",
+            "y ~ x + (1 | g)",
+            First,
+            Random,
+        ),
+        ("y ~ x", "y ~ x + (1 | g)", Second, Random),
+        ("y ~ x + (1 | g)", "y ~ x + z + (1 + x | g)", Second, Both),
+        ("y ~ 1", "y ~ x + (1 | g)", Second, Both),
+        (
+            "strength ~ 1 + (1 | batch/cask)",
+            "strength ~ 1 + (1 | cask:batch)",
+            First,
+            Random,
+        ),
+    ];
+    for (f0, f1, larger, differs) in cases {
+        assert_eq!(nest(f0, f1), nested(larger, differs), "{f0} against {f1}");
+    }
 }
 
 #[test]
@@ -188,19 +181,6 @@ fn the_fixed_intercept_is_a_term() {
     assert_eq!(
         nest("y ~ 0 + f + (1 | g)", "y ~ f + (1 + x | g)"),
         nested(Side::Second, Differs::Both)
-    );
-}
-
-#[test]
-fn a_nested_grouping_contains_its_inner_grouping() {
-    // The Pastes `ranova` row: dropping `(1 | batch)` from `(1 | batch/cask)`
-    // leaves `(1 | cask:batch)`, the smaller model.
-    assert_eq!(
-        nest(
-            "strength ~ 1 + (1 | batch/cask)",
-            "strength ~ 1 + (1 | cask:batch)"
-        ),
-        nested(Side::First, Differs::Random)
     );
 }
 
@@ -1800,7 +1780,7 @@ fn pairwise_matches_the_frozen_oats_reference() {
 /// `(parameter, lower, upper)` per row in any order: the same parameters
 /// both ways, each bound within `PROFILE_CI_REL` of lme4's interval width,
 /// and a bound lme4 puts at exactly 0 exactly 0 here too.
-fn profile_rows_match(m: &Model, want: &[(ProfileParam, f64, f64)]) -> Vec<ProfileInterval> {
+fn profile_rows_match(m: &Model, want: &[(ProfileParam, f64, f64)]) {
     let (lo, fit) = (m.lowered(), m.fit());
     let ci = fit
         .profile_intervals(&lo.data(), lo.spec(), 0.95, None)
@@ -1827,7 +1807,6 @@ fn profile_rows_match(m: &Model, want: &[(ProfileParam, f64, f64)]) -> Vec<Profi
             );
         }
     }
-    ci.rows
 }
 
 /// The profile-likelihood intervals of the REML LMM
@@ -1875,7 +1854,7 @@ fn profile_intervals_match_the_frozen_sleepstudy_reference() {
         Family::Gaussian,
         Some(true),
     );
-    assert_eq!(profile_rows_match(&m, &want).len(), 6);
+    profile_rows_match(&m, &want);
 }
 
 /// The profile-likelihood intervals of the REML LMM `Yield ~ 1 + (1 | Batch)`
@@ -1908,11 +1887,5 @@ fn profile_intervals_match_the_frozen_dyestuff2_reference() {
         Family::Gaussian,
         Some(true),
     );
-    let rows = profile_rows_match(&m, &want);
-    assert_eq!(rows.len(), 3);
-    let sd = rows
-        .iter()
-        .find(|r| r.param == ProfileParam::Sd { group: 0, term: 0 })
-        .unwrap();
-    assert_eq!(sd.lower, 0.0);
+    profile_rows_match(&m, &want);
 }

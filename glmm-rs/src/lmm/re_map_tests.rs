@@ -230,7 +230,8 @@ fn stddev_se_matches_finite_differences_of_the_reported_stddevs() {
         &model,
         None,
         &crate::FitOptions::default(),
-    );
+    )
+    .unwrap();
     let (ws, cs) = fws
         .glmm_parts()
         .expect("a Gamma mixed fit has a GLMM workspace");

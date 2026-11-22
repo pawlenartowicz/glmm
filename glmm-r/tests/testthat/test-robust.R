@@ -119,11 +119,13 @@ test_that("the weight-power search notes warn with their class and text", {
                  "The fitted weight power, .* is not a maximum",
                  class = "fastglmm_weight_power_at_bound")
   # Weights near 1e100, the largest allowed: no fit in the weight-power search fails.
+  # 2^318 * 1e4 is 5.3e99: R can parse a 1e96 literal an ulp high (arm64 macOS),
+  # which would put 1e96 * 1e4 past the bound.
   n <- 60
   x <- runif(n, -1, 1)
   r <- 1e4^runif(n)
   r[1:2] <- c(1, 1e4)
-  d <- data.frame(x = x, y = 1 + 0.5 * x + rnorm(n) * r^-0.5, w = 1e96 * r)
+  d <- data.frame(x = x, y = 1 + 0.5 * x + rnorm(n) * r^-0.5, w = 2^318 * r)
   failures <- 0
   m <- withCallingHandlers(fastglmm(y ~ x, d, weights = w),
                            fastglmm_weight_power_search_failures = function(w) failures <<- failures + 1,
@@ -219,7 +221,7 @@ test_that("summary prints the weight power and the SE footnote", {
 })
 
 test_that("contrast_test() and pairwise() read the robust pieces", {
-  # D12: a one-row test is the robust t squared on the robust df (on a unit
+  # A one-row test is the robust t squared on the robust df (on a unit
   # vector the fit's own se and coef_df), with the Satterthwaite pass off too;
   # a comparison is the robust contrast of its L; the same after saveRDS. A
   # joint test is the model fit's F, with a warning.

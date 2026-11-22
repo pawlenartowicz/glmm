@@ -213,11 +213,17 @@ def test_a_fit_stored_by_0_6_x_prints_its_anova_without_eta2_partial(lmm):
 
 
 def test_anova_raises_a_stored_internal_error_as_an_error_not_a_refusal(lmm):
-    broken = dataclasses.replace(
-        lmm, term_table_type3={"error": "internal error while building the per-term table: x"}
-    )
-    with pytest.raises(RuntimeError, match="internal error"):
+    message = "internal error while building the per-term table: x"
+    broken = dataclasses.replace(lmm, term_table_type3={"error": message, "error_code": "internal"})
+    with pytest.raises(RuntimeError, match="internal error") as err:
         glmm.anova(broken)
+    assert err.value.code == "internal"
+    refused = dataclasses.replace(
+        lmm, term_table_type3={"error": "a refusal", "error_code": "fit_error"}
+    )
+    with pytest.raises(ValueError, match="a refusal") as err:
+        glmm.anova(refused)
+    assert err.value.code == "fit_error"
 
 
 # -- the test argument ----------------------------------------------------------
@@ -355,28 +361,33 @@ def test_auto_names_the_wald_test_and_its_reason_on_every_other_chi_squared_fit(
         (quiet_fit("n ~ x + f", family="poisson"), "no_random_effects",
          "model without random effects"),
     )  # fmt: skip
-    for m, tag, reason in cases:
+    for m, tag, _ in cases:
         assert m.term_test_auto == {"test": "chisq", "reason": tag}
         assert m.term_table_type3_lrt is None and m.term_table_type2_lrt is None
         for ss in ("III", "II"):
-            heading = [
-                f"Type {ss} Analysis of Deviance Table",
-                f'Wald chi-squared tests; test = "auto": {reason}',
-            ]
             tab = glmm.anova(m, type=ss)
             assert glmm.anova(m, type=ss, test="auto").text() == tab.text()
-            assert tab.heading.split("\n") == heading
-            assert tab.text().splitlines()[:2] == heading
-            assert tab.latex().splitlines()[:2] == [f"% {h}" for h in heading]
-            assert tab.typst().splitlines()[:2] == [f"// {h}" for h in heading]
-            # Explicit Wald keeps today's heading; the numbers are the same.
+            # Explicit Wald gives the same rows, notes and numbers.
             wald = glmm.anova(m, type=ss, test="Wald")
-            assert wald.heading == f"Type {ss} Analysis of Deviance Table (Wald chi-squared tests)"
             assert (tab.columns, tab.row_names, tab.notes) == (
                 wald.columns, wald.row_names, wald.notes,
             )  # fmt: skip
             for c in tab.columns:
                 np.testing.assert_array_equal(tab[c], wald[c])
+    # glmm-bind words every reason (its anova_text tests); one is rendered here.
+    m, _, reason = cases[0]
+    heading = [
+        "Type III Analysis of Deviance Table",
+        f'Wald chi-squared tests; test = "auto": {reason}',
+    ]
+    tab = glmm.anova(m)
+    assert tab.heading.split("\n") == heading
+    assert tab.text().splitlines()[:2] == heading
+    assert tab.latex().splitlines()[:2] == [f"% {h}" for h in heading]
+    assert tab.typst().splitlines()[:2] == [f"// {h}" for h in heading]
+    assert glmm.anova(m, test="Wald").heading == (
+        "Type III Analysis of Deviance Table (Wald chi-squared tests)"
+    )
 
 
 def test_a_fit_without_the_auto_choice_still_takes_an_explicit_test(pois):
@@ -504,7 +515,10 @@ def test_wald_or_lrt_on_an_f_table_is_refused_naming_its_test(lmm):
     # A fit that asked for the likelihood-ratio tables stands, and stores the
     # same refusal in their place.
     asked = quiet_fit("y ~ x + f + (1 | g)", anova_test="LRT")
-    assert asked.term_table_type3_lrt == {"error": _f_refusal(_MIXED_F, "likelihood-ratio")}
+    assert asked.term_table_type3_lrt == {
+        "error": _f_refusal(_MIXED_F, "likelihood-ratio"),
+        "error_code": "fit_error",
+    }
     with pytest.raises(ValueError) as err:
         glmm.anova(asked, test="LRT")
     assert str(err.value) == _f_refusal(_MIXED_F, "likelihood-ratio")

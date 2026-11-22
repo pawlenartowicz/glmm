@@ -1,9 +1,9 @@
 [package]
 name = "validation"
-# Lockstep with the crate: must equal GLMM/glmm-rs/Cargo.toml [package] version.
+# Lockstep with the crate: must equal glmm-rs/Cargo.toml [package] version.
 # grid/engines/glmm.rs stamps CARGO_PKG_VERSION into each result record's
 # engine_version, and that macro reads THIS manifest, not glmm's.
-version = "0.9.3"
+version = "0.9.4"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -15,14 +15,14 @@ publish = false
 # No lib/bin — this package exists only to own the example targets below (examples
 # satisfy Cargo's at-least-one-target requirement).
 
-# `formula`: the drivers lower R-style formulas. `orchestrate`: the anova port
-# gate's Rust front end calls the ports' own entry points (`run_fit`,
-# `run_compare`). Both are enabled here on the dep rather than per-example
-# `required-features` so every example always builds (and stays under the
-# workspace clippy deny gate) in `cargo clippy --workspace --all-targets`; the
-# workspace members glmm-py and glmm-r/rust turn `orchestrate` on already.
+# `formula`: the drivers lower R-style formulas. Enabled here on the dep
+# rather than per-example `required-features` so every example always builds
+# (and stays under the workspace clippy deny gate) in `cargo clippy
+# --workspace --all-targets`. `glmm-bind`: the anova port gate's Rust front end
+# calls `glmm_bind::call`, the entry point both ports call.
 [dependencies]
-glmm = { path = "../glmm-rs", features = ["formula", "orchestrate"] }
+glmm = { path = "../glmm-rs", features = ["formula"] }
+glmm-bind = { path = "../glmm-bind" }
 
 # Dev-only pass-through of the kernel's optimizer counters, for the speed
 # grid's counter pass. OFF by default: the counters perturb wall time
@@ -87,9 +87,9 @@ name = "bit_identity"
 path = "tools/bit_identity/dump.rs"
 
 # The glmm side of the accuracy grid (grid/manifest.json): one JSONL record per
-# cell, appended to $GRID_OUT. Has its own grid/engines/common.rs -- tools/common.rs
-# reads the per-rung manifest shape and stays the #[path] target of the examples
-# above.
+# cell, appended to $GRID_OUT. Its helpers are grid/engines/common.rs, which
+# tools/common.rs includes for the CSV reading and lowering; tools/common.rs adds
+# the per-rung manifest readers and stays the #[path] target of the examples above.
 [[example]]
 name = "grid_glmm"
 path = "grid/engines/glmm.rs"

@@ -11,10 +11,11 @@
 
 use faer::Mat;
 
-use super::contrast::{unit_rows, ContrastF, ContrastNote, NoDfReason};
+use super::contrast::{notes_on, unit_rows, ContrastF, ContrastNote, NoDfReason};
 use super::evd::psd_pseudo_inverse;
 use super::reference::{DenDf, Reference};
 use super::tails::chisq_upper_p;
+use crate::linalg::{mul, sym};
 
 /// The eigenvalue threshold of `L V Lᵀ`, relative to its largest eigenvalue:
 /// directions at or below it are not tested.
@@ -164,48 +165,23 @@ pub(crate) fn wald_chisq(
         p_value: f64::NAN,
         notes,
     };
-    let notes: Vec<LinearNote> = (0..p)
-        .filter(|&j| aliased[j] && l.chunks(p).any(|row| row[j] != 0.0))
-        .map(|column| LinearNote::AliasedColumn { column })
+    let notes: Vec<LinearNote> = notes_on(|j| aliased[j], l, p)
+        .into_iter()
+        .map(linear_note)
         .collect();
     if !notes.is_empty() {
         return untested(notes);
     }
     let kept: Vec<usize> = (0..p).filter(|&j| !aliased[j]).collect();
     let (l, _) = unit_rows(l, p);
-    let row = |i: usize| &l[i * p..(i + 1) * p];
+    let lk = Mat::from_fn(rows, kept.len(), |i, k| l[i * p + kept[k]]);
+    let vk = Mat::from_fn(kept.len(), kept.len(), |a, b| vcov[kept[a]][kept[b]]);
     let lb: Vec<f64> = (0..rows)
-        .map(|i| kept.iter().map(|&j| row(i)[j] * beta[j]).sum())
+        .map(|i| kept.iter().map(|&j| l[i * p + j] * beta[j]).sum())
         .collect();
-    // `L V` is an axpy per kept `a`, so the inner loop runs along `vcov[a]`.
-    // Started at −0.0 (the start `Iterator::sum` uses), each entry equals the
-    // dot product over `a` bit for bit.
-    let lv: Vec<Vec<f64>> = (0..rows)
-        .map(|i| {
-            let mut acc = vec![-0.0; kept.len()];
-            for &a in &kept {
-                let (s, va) = (row(i)[a], &vcov[a]);
-                for (out, &b) in acc.iter_mut().zip(&kept) {
-                    *out += s * va[b];
-                }
-            }
-            acc
-        })
-        .collect();
-    // `L V Lᵀ` over the kept columns, the lower triangle mirrored so the
-    // matrix is exactly symmetric.
-    let mut m = Mat::<f64>::zeros(rows, rows);
-    for i in 0..rows {
-        for j in 0..=i {
-            let v: f64 = kept
-                .iter()
-                .enumerate()
-                .map(|(k, &b)| lv[i][k] * row(j)[b])
-                .sum();
-            m[(i, j)] = v;
-            m[(j, i)] = v;
-        }
-    }
+    // `L V Lᵀ` over the kept columns, symmetrized: the two triangles round
+    // differently.
+    let m = sym(mul(lk.as_ref(), mul(vk.as_ref(), lk.transpose()).as_ref()).as_ref());
     let Ok(pinv) = psd_pseudo_inverse(m.as_ref(), RANK_REL_TOL) else {
         return untested(Vec::new());
     };

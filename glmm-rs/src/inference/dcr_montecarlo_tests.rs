@@ -30,8 +30,9 @@
 use super::mc_calibration_tests::env_count;
 use super::mc_data::{bands, DcrDesign, DCR_LRT_CELLS, DCR_TYPE1_CELLS};
 use crate::formula::anova::ComparisonTest;
+use crate::formula::anova::TermTest;
 use crate::orchestrate::{run_compare, run_fit, FitResult};
-use crate::{SeType, WeightPower};
+use crate::{Family, FitOptions, SeType, WeightPower};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -105,7 +106,7 @@ fn arm(f: &FitResult) -> String {
         format!("w^{}", f.weight_power)
     };
     let criterion = if f.reml { "REML" } else { "ML" };
-    format!("{power}/{criterion}/{}", f.df_method)
+    format!("{power}/{criterion}/{}", f.df_method.as_str())
 }
 
 /// The Type I of `x` check on dataset `r` of `d`.
@@ -116,20 +117,12 @@ fn type1_of_x(d: &DcrDesign, r: u64) -> Outcome {
         &formula,
         numeric,
         factors,
-        "gaussian",
-        "identity",
-        "hessian",
-        1,
-        None,
+        Family::Gaussian,
+        FitOptions::default(),
         Some(d.w.clone()),
         None,
         None,
-        true,
-        false,
-        None,
-        "auto",
-        None,
-        None,
+        TermTest::Auto,
     )
     .map_err(|e| e.to_string())?;
     let j = f.names.iter().position(|n| n == "x").expect("a column x");
@@ -155,20 +148,16 @@ fn lrt_null(d: &DcrDesign, r: u64) -> Outcome {
             &format!("y ~ x{re}"),
             numeric.clone(),
             factors.clone(),
-            "gaussian",
-            "identity",
-            "hessian",
-            1,
-            None,
+            Family::Gaussian,
+            FitOptions {
+                satterthwaite: false,
+                se_type: Some(SeType::Model),
+                ..FitOptions::default()
+            },
             Some(d.w.clone()),
             None,
             None,
-            false,
-            false,
-            None,
-            "auto",
-            None,
-            Some(SeType::Model),
+            TermTest::Auto,
         )
         .map_err(|e| e.to_string())?;
         Some(WeightPower::Fixed(f.weight_power))
@@ -180,14 +169,15 @@ fn lrt_null(d: &DcrDesign, r: u64) -> Outcome {
         &format!("y ~ x{re}"),
         numeric,
         factors,
-        "gaussian",
-        "identity",
-        1,
+        Family::Gaussian,
+        FitOptions {
+            condvar: true,
+            weight_power: power,
+            ..FitOptions::default()
+        },
         Some(d.w.clone()),
         None,
         None,
-        None,
-        power,
         None,
     )
     .map_err(|e| e.to_string())?;

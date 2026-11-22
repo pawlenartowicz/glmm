@@ -3759,6 +3759,33 @@
       ]
     },
     {
+      "name": "anova_type2_units_sim_factorial",
+      "kind": "anova",
+      "data": "data/simulated/sim_factorial.csv",
+      "r_formula": "y ~ g * x + (1 | subj)",
+      "factors": [
+        "subj",
+        "g",
+        "h"
+      ],
+      "generator": "goldens_anova.R",
+      "case": "type2_units",
+      "//": "lmerTest's Type II with x in small units, where glmm departs from it: lmerTest zeroes at an absolute 1e-6 on the unscaled Gram (x's pivot here), glmm on the equilibrated one, so glmm's rows match lmerTest's on the unscaled data (lmertest_anova_sim_factorial_gx).",
+      "scale_column": "x",
+      "scale_by": 1e-5,
+      "members": [
+        {
+          "fun": "lme4::lmer",
+          "formula": "y ~ g * x + (1 | subj)",
+          "family": "gaussian",
+          "link": "identity",
+          "REML": true,
+          "nAGQ": null,
+          "weights": null
+        }
+      ]
+    },
+    {
       "name": "anova_lrt3_glmm_cbpp",
       "kind": "anova",
       "data": "data/empirical/cbpp.csv",
@@ -6764,6 +6791,7 @@
     {"name": "warm_start_fallback", "consumers": ["src/fit/glmm_tests.rs::a_far_warm_start_that_fails_falls_back_to_the_cold_fit", "src/fit/glmm_tests.rs::a_huge_warm_beta_is_not_reported_converged_at_the_start"], "fixture": ["tests/fixtures/warm_start_far.csv", "tests/fixtures/warm_start_huge_beta.csv"], "data": "simulated by the generator: warm_start_far.csv, 160 rows from a 64-bit xorshift (seed 99 for x, g, h; seeds 3 and 2 for y_poisson and y_gamma); warm_start_huge_beta.csv, 60 rows from numpy.random.default_rng(1)", "r_formula": "y_poisson ~ x + (1 + x | g); y_gamma ~ x + (1 | g) + (1 | h); y ~ x + (1 | g)", "seed": 99, "generator": "tests/fixtures/gen_warm_start_fixtures.py", "engine": "glmm itself: the cold fit (crate::fit) of each model, Poisson log, Gamma log and binomial logit, Laplace; the tests compare the warm fit from a failing start with it, measured on x86_64 Linux", "frozen": "2026-11-08, Python 3.14.2, numpy 2.5.4 (x86_64 Linux)", "reproduced": "2026-11-08, Python 3.14.2, numpy 2.5.4 x86_64 Linux: CSVs byte-identical"},
     {"name": "nb_tiny_shape_profile", "consumers": ["src/fit/glm_tests.rs::nb_glm_tiny_shape_matches_the_base_r_profile", "src/fit/glm_tests.rs::nb_glm_on_the_lower_shape_limit_carries_the_note"], "fixture": null, "data": "validation/data/simulated/sim_nb_tinytheta.csv (validation/tools/prep/gen_nb_tinytheta_data.py, the last of five gamma-Poisson draws; one positive count in 400 rows); the note fixture, 99999 zeros and one count of 1e9, is built by the test and by the generator", "r_formula": "y ~ x; y ~ 1", "seed": 8, "generator": "validation/tools/prep/nb_tiny_shape_profile_reference.R", "engine": "base R: stats::optimize over ln θ of the profile log-likelihood sum(dnbinom(y, size = θ, mu, log = TRUE)), β by Fisher scoring at each θ", "frozen": "2026-11-15, R 4.5.3, data numpy 2.5.4, Python 3.14.2 (x86_64 Linux)", "reproduced": "2026-11-15, R 4.5.3, numpy 2.5.4, Python 3.14.2 x86_64 Linux: CSV byte-identical; same output"},
     {"name": "ln_gamma_tiny_mpmath", "consumers": ["src/simd_transcendental.rs::ln_gamma_is_accurate_at_tiny_shapes", "src/fit/glm_tests.rs::nb_saturated_loglik_is_accurate_at_any_count"], "fixture": null, "data": "none: lnΓ at a = 1e-6, 1e-5, 1e-4 and the NB saturated log-likelihood of one count at (y, θ) = (1, 1e-6) and (1e10, 1e-6)", "r_formula": null, "seed": null, "generator": "validation/tools/prep/ln_gamma_tiny_reference.py", "engine": "mpmath loggamma, 50 digits", "frozen": "2026-11-15, mpmath 1.4.1, Python 3.14.2 (x86_64 Linux)", "reproduced": "2026-11-15, mpmath 1.4.1, Python 3.14.2 x86_64 Linux: same output"},
+    {"name": "agq_tiny_weight_mpmath", "consumers": ["src/glmm/tests.rs::agq_deviance_keeps_its_digits_at_tiny_weights"], "fixture": null, "data": "none: the test's 40 rows (test_support::tiny_weight_data, binary response), eight groups of five, every prior weight 1e-100, rebuilt by the generator", "r_formula": "y ~ x + (1 | g), binomial logit, nAGQ = 5", "seed": null, "generator": "validation/tools/prep/agq_tiny_weight_reference.py", "engine": "mpmath, 160 digits: exact mode and curvature per cluster, the 5-node adaptive Gauss-Hermite deviance on the f64 GH table, bracket normalised by the table's weight sum", "frozen": "2026-11-19, mpmath 1.4.1, Python 3.14.2 (x86_64 Linux)", "reproduced": "2026-11-19, mpmath 1.4.1, Python 3.14.2 x86_64 Linux: same output"},
     {"name": "profile_crossed_uncentered", "consumers": ["src/inference/profile_tests.rs::a_slope_sd_interval_does_not_depend_on_centering"], "fixture": null, "data": "validation/data/simulated/profile_crossed_uncentered.csv, simulated by the generator: 735 cells of a 23 x 32 crossing of Date and image, trial = image mod 8 + 1, prob ~ U(2, 5), random intercepts and prob slopes per grouping", "r_formula": "sig ~ prob + val + aro + (prob | Date) + (prob | image) + (prob | trial)", "seed": 203, "generator": "validation/tools/prep/gen_profile_crossed_data.R", "engine": "none: the test compares glmm's profile intervals on two centerings of the same data", "frozen": "2026-11-15, data R 4.5.3 (x86_64 Linux)", "reproduced": "2026-11-15, R 4.5.3 x86_64 Linux: CSV byte-identical"},
     {"name": "delta_reml_110_digit", "consumers": ["src/fit/delta_tests.rs::fixed_power_one_point_five_reaches_the_reference", "src/fit/delta_tests.rs::fixed_powers_one_and_point_seven_reach_the_reference", "src/fit/delta_tests.rs::negative_powers_reach_the_reference_from_every_start", "src/fit/delta_tests.rs::upper_powers_leave_the_box_from_every_start", "src/fit/delta_tests.rs::reml_search_reaches_the_grid_best", "src/fit/delta_tests.rs::the_reference_data_is_the_test_dataset"], "fixture": null, "data": "validation/data/simulated/delta_weights_seed13.csv: the rows of dataset(13, 150, 10, 1.0, 1e16, 1.5) in src/fit/delta_tests.rs (x1, y, w, g), written on x86_64; the_reference_data_is_the_test_dataset checks it against the generator", "r_formula": "y ~ 1 + x1 + (1 | g), weights w^delta, REML", "seed": 13, "generator": "validation/tools/prep/delta_reml_reference.py", "engine": "Python decimal at 110 digits: lme4's weighted REML deviance from a Cholesky of the Gram matrix, maximized over ln theta by a coarse scan and a golden section", "frozen": "2026-11-07 (macOS arm64, data from that platform's generator)", "reproduced": "2026-11-15, Python 3.14.2 x86_64 Linux on the x86_64 data: the five HI_PREC_REF values to all ten printed decimals except delta = 1.5 (1601.8485274519 against 1601.8485274969); the arm64 data differ from the x86_64 data in 15 y values by at most 16 ulp"}
   ],

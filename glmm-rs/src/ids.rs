@@ -43,3 +43,19 @@ impl GroupIds {
         self
     }
 }
+
+/// `ids` renumbered `0..k` in id order, and `k`, the number of distinct ids.
+/// `Simulator` draws a level's effect only when a row carries it, so its
+/// draw count is at most `n` whatever the id values: sizing by
+/// `max(id) + 1` would let one huge id ask for billions of draws and abort
+/// the process.
+pub(crate) fn dense_ids(ids: &[u32]) -> (Vec<u32>, usize) {
+    let mut levels = ids.to_vec();
+    levels.sort_unstable();
+    levels.dedup();
+    let dense = ids
+        .iter()
+        .map(|id| levels.binary_search(id).expect("an id of `ids`") as u32)
+        .collect();
+    (dense, levels.len())
+}

@@ -23,10 +23,10 @@ pub(crate) struct Inputs {
     port: Port,
 }
 
+// `read!(req, opt, T, f)` makes both readers; `read!(req name, ..)` or
+// `read!(opt name, ..)` makes only the one in use.
 macro_rules! read {
-    ($(#[$m:meta])* $req:ident, $opt:ident, $t:ty, $f:expr) => {
-        $(#[$m])*
-        #[allow(dead_code)]
+    (req $req:ident, $t:ty, $f:expr) => {
         pub(crate) fn $req(&mut self, name: &str) -> Result<$t, BindError> {
             let v = self.rec.take(name);
             if v.is_null() {
@@ -34,15 +34,18 @@ macro_rules! read {
             }
             $f(v).map_err(|w: String| self.bad(name, &w))
         }
-
-        $(#[$m])*
-        #[allow(dead_code)]
+    };
+    (opt $opt:ident, $t:ty, $f:expr) => {
         pub(crate) fn $opt(&mut self, name: &str) -> Result<Option<$t>, BindError> {
             match self.rec.take(name) {
                 Value::Null => Ok(None),
                 v => $f(v).map(Some).map_err(|w: String| self.bad(name, &w)),
             }
         }
+    };
+    ($req:ident, $opt:ident, $t:ty, $f:expr) => {
+        read!(req $req, $t, $f);
+        read!(opt $opt, $t, $f);
     };
 }
 
@@ -65,21 +68,16 @@ impl Inputs {
 
     read!(string, opt_string, String, coerce::to_string);
     read!(f64, opt_f64, f64, |v: Value| coerce::to_f64(&v));
-    read!(usize, opt_usize, usize, |v: Value| coerce::to_usize(&v));
+    read!(req usize, usize, |v: Value| coerce::to_usize(&v));
     read!(bool, opt_bool, bool, |v: Value| coerce::to_bool(&v));
     read!(vec, opt_vec, Vec<f64>, coerce::to_vec);
     read!(vecs, opt_vecs, Vec<Vec<f64>>, coerce::to_vecs);
     read!(usizes, opt_usizes, Vec<usize>, coerce::to_usizes);
-    read!(i64s, opt_i64s, Vec<i64>, coerce::to_i64s);
+    read!(opt opt_i64s, Vec<i64>, coerce::whole_ints);
     read!(strs, opt_strs, Vec<String>, coerce::to_strs);
-    read!(bools, opt_bools, Vec<bool>, coerce::to_bools);
-    read!(
-        weight_power,
-        opt_weight_power,
-        glmm::WeightPower,
-        coerce::to_weight_power
-    );
-    read!(se_type, opt_se_type, glmm::SeType, coerce::to_se_type);
+    read!(req bools, Vec<bool>, coerce::to_bools);
+    read!(opt opt_weight_power, glmm::WeightPower, coerce::to_weight_power);
+    read!(opt opt_se_type, glmm::SeType, coerce::to_se_type);
 
     /// A small count (`nagq`, `objective_nodes`).
     pub(crate) fn u8(&mut self, name: &str) -> Result<u8, BindError> {
@@ -132,6 +130,13 @@ impl Inputs {
     /// True when the record has a non-null `name`.
     pub(crate) fn has(&self, name: &str) -> bool {
         self.rec.get(name).is_some_and(|v| !v.is_null())
+    }
+
+    /// True when the call takes `name`: [`crate::call`] fills every optional
+    /// argument it declares that the caller left out, and refuses one it does
+    /// not declare, so a call's own arguments are always present.
+    pub(crate) fn takes(&self, name: &str) -> bool {
+        self.rec.get(name).is_some()
     }
 
     /// Numeric columns: a record of name to vector.

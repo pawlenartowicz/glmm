@@ -18,20 +18,6 @@ pub enum DefaultValue {
     Required,
     /// `None` / `NULL`.
     Null,
-    /// A bool literal.
-    Bool(bool),
-    /// A string literal.
-    Str(&'static str),
-}
-
-impl DefaultValue {
-    fn to_value(self) -> Value {
-        match self {
-            Self::Required | Self::Null => Value::Null,
-            Self::Bool(b) => Value::Bool(b),
-            Self::Str(s) => Value::Str(s.to_owned()),
-        }
-    }
 }
 
 /// One parameter of a registered function.
@@ -66,10 +52,6 @@ const fn opt(name: &'static str) -> Param {
         name,
         default: DefaultValue::Null,
     }
-}
-
-const fn def(name: &'static str, default: DefaultValue) -> Param {
-    Param { name, default }
 }
 
 /// The training data of a stored fit, as `fit` took it.
@@ -205,6 +187,17 @@ static REGISTRY: &[FnSpec] = &[
         run: fns::inference::term_test_refusal,
     },
     FnSpec {
+        name: "term_table_text",
+        params: &[
+            req("table"),
+            req("test"),
+            opt("df_method"),
+            req("converged"),
+            opt("term_test_auto"),
+        ],
+        run: crate::anova_text::term_table_text,
+    },
+    FnSpec {
         name: "predict",
         params: model_data![
             req("parts"),
@@ -324,12 +317,18 @@ static REGISTRY: &[FnSpec] = &[
     },
     FnSpec {
         name: "summary",
-        params: &[
-            req("fit"),
-            opt("effect_sizes"),
-            def("need_refit", DefaultValue::Bool(false)),
-        ],
+        params: &[req("fit"), opt("effect_sizes"), opt("need_refit")],
         run: crate::summary::summary,
+    },
+    FnSpec {
+        name: "stddev_corr",
+        params: &[req("vech"), req("group")],
+        run: crate::summary::stddev_corr_call,
+    },
+    FnSpec {
+        name: "criteria",
+        params: &[req("loglik"), req("df"), req("nobs")],
+        run: crate::summary::criteria_call,
     },
 ];
 
@@ -376,7 +375,7 @@ fn call_spec(port: Port, spec: &FnSpec, mut inputs: Record) -> Result<Value, Bin
                     spec.name, p.name
                 )));
             }
-            inputs.set(p.name, p.default.to_value());
+            inputs.set(p.name, Value::Null);
         }
     }
     let mut inp = Inputs::new(inputs, port);

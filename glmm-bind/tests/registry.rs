@@ -80,6 +80,8 @@ fn side(fit: &Value, formula: &str) -> Value {
         "offset",
         "design_summary",
         "rss",
+        "names",
+        "beta",
         "vcov",
         "aliased",
     ];
@@ -88,8 +90,6 @@ fn side(fit: &Value, formula: &str) -> Value {
         ("family", text("gaussian")),
         ("link", text("identity")),
         ("dispersion_held", Value::Null),
-        ("coef_names", field(fit, "names").clone()),
-        ("coef", field(fit, "beta").clone()),
     ]);
     for k in keep {
         r.push(k, field(fit, k).clone());
@@ -143,4 +143,73 @@ fn nsim_out_of_range_gets_the_range_message_whatever_its_sign() {
             format!("nsim must be a whole number from 1 to 1000000, got {shown}")
         );
     }
+}
+
+/// A comparison record carries its heading, reference and notes in words,
+/// and an OLS pair its `ols` flag and `Sum of Sq`; `compare` adds the ML note
+/// on a Gaussian pair whose fixed parts differ, `compare_fits` never.
+#[test]
+fn a_comparison_record_carries_its_texts() {
+    let strs = |v: &Value| match v {
+        Value::StrVec(s) => s.clone(),
+        other => panic!("{other:?}"),
+    };
+    let y = vec![1.0, 2.5, 2.0, 4.0, 5.5, 5.0, 7.5, 7.0];
+    let (f0, f1) = ("y ~ x", "y ~ x + z");
+    let (small, large) = (ols(y.clone(), f0), ols(y, f1));
+    let c = compare_fits(Port::Python, side(&small, f0), side(&large, f1)).unwrap();
+    assert_eq!(strs(field(&c, "heading")), ["Model comparison: F test"]);
+    assert_eq!(field(&c, "reference"), &text("F(1, 5)"));
+    assert_eq!(field(&c, "ols"), &Value::Bool(true));
+    let rss = |f: &Value| match field(f, "rss") {
+        Value::F64(v) => *v,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(field(&c, "sum_sq"), &Value::F64(rss(&small) - rss(&large)));
+
+    let (reaction, days, subject) = common::sleepstudy();
+    let (levels, codes) = common::factor(&subject);
+    let compare = |f0: &str| {
+        let args = rec(vec![
+            ("f0", text(f0)),
+            ("f1", text("Reaction ~ Days + (1 | Subject)")),
+            (
+                "numeric",
+                Value::Record(rec(vec![
+                    ("Reaction", Value::Vec(reaction.clone())),
+                    ("Days", Value::Vec(days.clone())),
+                ])),
+            ),
+            (
+                "factors",
+                Value::Record(rec(vec![(
+                    "Subject",
+                    Value::Factor {
+                        levels: levels.clone(),
+                        codes: codes.iter().map(|&c| c as i32).collect(),
+                    },
+                )])),
+            ),
+            ("family", text("gaussian")),
+            ("link", text("identity")),
+            ("nagq", Value::I64(1)),
+            ("row_base", Value::I64(0)),
+        ]);
+        call(Port::Python, "compare", args).unwrap()
+    };
+    let ml_note = "Both models were fitted by ML because their fixed parts differ.".to_string();
+    let fixed = compare("Reaction ~ 1 + (1 | Subject)");
+    assert_eq!(
+        strs(field(&fixed, "heading")),
+        ["Model comparison: likelihood ratio test (ML)"]
+    );
+    assert_eq!(field(&fixed, "reference"), &text("χ²(1)"));
+    assert_eq!(field(&fixed, "ols"), &Value::Bool(false));
+    assert!(strs(field(&fixed, "notes")).contains(&ml_note));
+    let random = compare("Reaction ~ Days");
+    assert_eq!(
+        strs(field(&random, "heading")),
+        ["Model comparison: likelihood ratio test on the REML criterion"]
+    );
+    assert!(!strs(field(&random, "notes")).contains(&ml_note));
 }

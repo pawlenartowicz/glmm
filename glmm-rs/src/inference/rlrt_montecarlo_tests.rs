@@ -7,7 +7,8 @@
 //! The test is pivotal in `β` and `σ²` under the null, so every dataset is
 //! `y = ε`, `ε` iid `N(0, 1)`, on the design's `X` and groups.
 
-use super::rlrt::{rlrt_design, rlrt_null, rlrt_statistic, RlrtConfig};
+use super::lr::lr_statistic;
+use super::rlrt::{rlrt_design, rlrt_null, RlrtConfig};
 use super::rlrt_refs::{bands, design};
 use super::tails::chisq_upper_p;
 use crate::test_support::fit_cold;
@@ -95,7 +96,7 @@ fn level_rejection_rates() {
             let reduced = fit_cold(&x, &y, n, p, &ols, &GroupIds::default(), &ols_opts);
             assert!(full.reml && reduced.reml, "{name}, dataset {r}: REML");
             let pinned = full.diagnostics.pinned.iter().flatten().any(|&b| b);
-            let t = rlrt_statistic(full.loglik, reduced.loglik, pinned);
+            let (t, _) = lr_statistic(reduced.loglik, full.loglik, pinned);
             if !full.converged() || t.is_nan() {
                 failed += 1;
                 continue;

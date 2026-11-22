@@ -1,4 +1,4 @@
-# glmm
+# GLMM
 
 [![CI](https://github.com/pawlenartowicz/glmm/actions/workflows/ci.yml/badge.svg)](https://github.com/pawlenartowicz/glmm/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/glmm.svg)](https://crates.io/crates/glmm)
@@ -8,23 +8,33 @@
 [![License: LGPL-3.0-or-later](https://img.shields.io/badge/license-LGPL--3.0--or--later-blue.svg)](https://www.gnu.org/licenses/lgpl-3.0)
 ![MSRV](https://img.shields.io/badge/MSRV-1.85-blue.svg)
 
-**`glmm`: mixed models in Rust, Python and R, from one engine.**
+**GLMM: mixed models in Rust, Python and R, from one engine.**
 
-**glmm** fits ordinary least squares, generalized linear models, linear mixed
+**GLMM** fits ordinary least squares, generalized linear models, linear mixed
 models and generalized linear mixed models. One engine, written in Rust, sits
 behind the Rust crate, the Python package (`glmm`) and the R package
 (`fastglmm`), and also runs in the browser through WASM.
 
 ## The idea
 
-- **Accuracy first.** glmm reaches the same log-likelihood as lme4, glmmTMB,
+- **Accuracy first.** GLMM reaches the same log-likelihood as lme4, glmmTMB,
   MixedModels.jl and GLMMadaptive, or a better one.
 - **Multi-solver.** Each model gets a method that suits it. Least squares uses
-  a closed form, and GLMs use IRLS. Mixed models use BFGS where glmm has a cheap
+  a closed form, and GLMs use IRLS. Mixed models use BFGS where GLMM has a cheap
   exact gradient, and BOBYQA, which needs no gradient, elsewhere.
-- **Fast.** glmm is faster than these four packages on every model in the speed
+- **Fast.** GLMM is faster than these four packages on every model in the speed
   tests, and it uses little memory. Part of the time saved goes to extra checks
   during a fit, which catch hard models where a search would stop too early.
+
+## Beta status and plans
+
+GLMM is in beta. Not all features are implemented yet, and not all edge cases are tested. Every release is strictly tested on almost 1,000 test models and compared with other packages.
+
+Planned next:
+- survey weights for mixed models
+- parallel fits by default and lower memory use
+- more than one start for fits that can stop at a worse local optimum
+- an HTML report of a fit
 
 ## Pick your language
 
@@ -48,12 +58,12 @@ install.packages("fastglmm", repos = c("https://pawlenartowicz.r-universe.dev", 
 
 ## Validation
 
-glmm is checked on 947 test models before every release. They cover the
+GLMM is checked on 947 test models before every release. They cover the
 Gaussian, binomial, Poisson, Gamma and negative binomial families, random
 intercepts, correlated slopes, nested and crossed groupings, and data from 60 to
 30,000 rows. Each model is also fitted by lme4, glmmTMB, MixedModels.jl and
-GLMMadaptive, where they support it. glmm is compared with the best of their
-results, not with one chosen package. If glmm reaches a worse log-likelihood
+GLMMadaptive, where they support it. GLMM is compared with the best of their
+results, not with one chosen package. If GLMM reaches a worse log-likelihood
 than that best result, the release fails. If its estimates differ from the
 other packages, the difference passes only once it is explained in writing.
 
@@ -61,18 +71,18 @@ Standard errors of mixed models come from the exact second derivatives of the
 likelihood, not from a finite-difference approximation. On the test models they
 differ from a high-precision lme4 run by at most 0.002% (relative).
 
-glmm was also stress-tested on many hard and borderline models. On such models
+GLMM was also stress-tested on many hard and borderline models. On such models
 it returns a result with flags that say what happened, instead of only printing
 a warning. A variance that falls to zero is set to exactly zero and flagged. A
 redundant column is dropped and marked, as in lme4. When a fit fails, the
-`converged` flag says so. glmm does not crash.
+`converged` flag says so. GLMM does not crash.
 
 The package versions, the checks and how to rerun them are in
 [`validation.md`](documentation/validation.md).
 
 ## Multi-solver paradigm
 
-glmm combines several optimizers for mixed models. Where it has a cheap exact
+GLMM combines several optimizers for mixed models. Where it has a cheap exact
 gradient, it uses BFGS. Elsewhere it uses BOBYQA, which needs no gradient.
 BOBYQA also refines the BFGS result and takes over when BFGS fails.
 
@@ -88,12 +98,12 @@ both return the same answer. The choice affects speed only.
 
 ## Speed
 
-glmm moves as little data as it can. One pass over the data builds a small
+GLMM moves as little data as it can. One pass over the data builds a small
 summary per group, and every later step of the search works on those summaries.
 The cost of each step therefore grows with the number of groups, not the number
 of rows.
 
-glmm is also designed for refitting the same model many times. Its working
+GLMM is also designed for refitting the same model many times. Its working
 memory depends only on the shape of the model. So refitting the same model on
 new data, as in a power simulation or a bootstrap, needs no new memory. Each
 refit can also start from the previous answer.
@@ -147,7 +157,7 @@ Details per family are in
 | `loop_advanced` | off | Unstable. A low-level API for refitting one model many times, as in a simulation loop. |
 
 For the kernel only, with no formula parser and no `regex`, turn the defaults
-off: `glmm = { version = "0.8", default-features = false }`. Details are in
+off: `glmm = { version = "0.9", default-features = false }`. Details are in
 [`installation.md`](documentation/installation.md).
 
 ## WASM and stability
@@ -158,7 +168,7 @@ wheel of the Python package is attached to each
 model fitted on Linux, on macOS or in WebAssembly gives the same fit: across the
 test models the log-likelihoods differ by at most 3e-7.
 
-glmm is in beta. Semver covers the matrix door (`fit`, `fit_with_start`,
+Semver covers the matrix door (`fit`, `fit_with_start`,
 `predict` and its types, `Data`, `ModelSpec`, `GroupIds`, `FitOptions`, `Fit`
 and its methods, `FitError`, `limits` and the types around them), the
 `formula` frontend (`lower`, `fit`, `fit_lowered`, `predict`,
@@ -187,14 +197,14 @@ main ones:
 
 ## Citation
 
-If you use glmm in research, please cite:
+If you use GLMM in research, please cite:
 
-Lenartowicz, P. (2026). glmm: Mixed-model fitting in Rust, Python and R [Computer software]. https://github.com/pawlenartowicz/glmm
+Lenartowicz, P. (2026). GLMM: Mixed-model fitting in Rust, Python and R [Computer software]. https://github.com/pawlenartowicz/glmm
 
 ```bibtex
 @software{glmm2026,
   author = {Lenartowicz, Pawe{\l}},
-  title  = {{glmm}: Mixed-Model Fitting in Rust, Python and R},
+  title  = {{GLMM}: Mixed-Model Fitting in Rust, Python and R},
   year   = {2026},
   url    = {https://github.com/pawlenartowicz/glmm}
 }

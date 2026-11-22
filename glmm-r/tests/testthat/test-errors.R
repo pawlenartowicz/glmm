@@ -539,16 +539,18 @@ test_that("simulate() names the caller's row of the fit's rows", {
 
 test_that("an input outside its range is refused with the limit name", {
   # Same table and inputs in glmm-py/tests/test_validation.py - change together.
+  # Bound-scale values are powers of two: R's parser can land a 1e100-scale
+  # decimal literal an ulp off (arm64 macOS), which changes the printed value.
   d <- data.frame(y = c(0.5, 1.25, 2.0, 1.5, 3.0, 2.25, 1.0, 2.75),
                   x = 0.25 * (0:7),
                   k = c(0, 1, 2, 1, 3, 2, 4, 3),
                   p = c(0, 0.5, 1, 0.5, 0.5, 0, 1, 0.5))
   at_row_3 <- function(fill, value) replace(rep(fill, 8), 3, value)
-  expect_error(fastglmm(y ~ x, transform(d, x = at_row_3(0, 2e100))),
-               "x must be finite with |x| <= 1e100 (row 3, column 2, value 2e100; glmm::limits::MAX_DATA_ABS)",
+  expect_error(fastglmm(y ~ x, transform(d, x = at_row_3(0, 2^333))),
+               "x must be finite with |x| <= 1e100 (row 3, column 2, value 1.7498005798264095e100; glmm::limits::MAX_DATA_ABS)",
                fixed = TRUE)
-  expect_error(fastglmm(y ~ x, d, weights = at_row_3(1, 1e-101)),
-               "Data weights must be within [1e-100, 1e100] (row 3, value 1e-101; glmm::limits::MAX_DATA_ABS)",
+  expect_error(fastglmm(y ~ x, d, weights = at_row_3(1, 2^-336)),
+               "Data weights must be within [1e-100, 1e100] (row 3, value 7.143671195514219e-102; glmm::limits::MAX_DATA_ABS)",
                fixed = TRUE)
   expect_error(fastglmm(k ~ x, d, family = poisson(), offset = at_row_3(0, 231)),
                "Data offset must be finite with |offset| <= 2.3e2 on this link (row 3, value 2.31e2; glmm::limits::MAX_LOG_OFFSET_ABS)",
@@ -559,8 +561,8 @@ test_that("an input outside its range is refused with the limit name", {
   expect_error(fastglmm(y ~ x, d, family = Gamma(link = "log"), dispersion = 1e7),
                "dispersion on a Gamma model must be within [1e-6, 1e6] (value 1e7; glmm::limits::GAMMA_PHI_LO, glmm::limits::GAMMA_PHI_HI)",
                fixed = TRUE)
-  expect_error(fastglmm(y ~ x, d, family = inverse.gaussian(link = "log"), dispersion = 1e101),
-               "dispersion on an inverse-Gaussian model must be within [1e-100, 1e100] (value 1e101; glmm::limits::MAX_DATA_ABS)",
+  expect_error(fastglmm(y ~ x, d, family = inverse.gaussian(link = "log"), dispersion = 2^335),
+               "dispersion on an inverse-Gaussian model must be within [1e-100, 1e100] (value 6.999202319305638e100; glmm::limits::MAX_DATA_ABS)",
                fixed = TRUE)
   expect_error(fastglmm(k ~ x, d, family = "negativebinomial", init.theta = 1e-7),
                "warm-start dispersion (the negative-binomial shape seed) must be within [1e-6, 1e4] (value 1e-7; glmm::limits::NB_THETA_LO, glmm::limits::NB_THETA_HI)",

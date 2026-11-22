@@ -221,7 +221,8 @@ fn into_fit_without_pass_is_state_missing() {
             &lmm_model(),
             None,
             &opts,
-        );
+        )
+        .unwrap();
         assert_eq!(fit.reml, reml.is_none(), "reml {reml:?}");
         assert!(
             fit.satterthwaite.as_ref().is_some_and(|st| st.is_not_run()),
@@ -466,4 +467,28 @@ fn assert_zero_l(fit: &Fit) {
 #[test]
 fn contrast_f_zero_l_has_rank_zero() {
     assert_zero_l(&lmm_fit(None, &all_targets(3)));
+}
+
+/// An all-zero `l` tests nothing, as on `contrast_f`: the estimate and se of
+/// a zero row are 0, t and p NaN, and the rank-0 note, on the model route
+/// (an LMM) and the robust route (a CR2 LMM).
+#[test]
+fn contrast_t_zero_l_has_rank_zero() {
+    let robust = FitOptions {
+        se_type: Some(crate::SeType::Robust),
+        ..all_targets(3)
+    };
+    for (what, fit) in [
+        ("model", lmm_fit(None, &all_targets(3))),
+        ("robust", lmm_fit(None, &robust)),
+    ] {
+        let got = fit.contrast_t(&[0.0; 3]).unwrap();
+        assert_eq!((got.estimate, got.se), (0.0, 0.0), "{what}: {got:?}");
+        assert!(got.t.is_nan() && got.p_value.is_nan(), "{what}: {got:?}");
+        assert_eq!(
+            got.notes,
+            [ContrastNote::RankDeficientL { rank: 0, rows: 1 }],
+            "{what}"
+        );
+    }
 }

@@ -77,7 +77,7 @@ fn check_pair(
     frozen: &Value,
 ) {
     let (ll0, ll1) = (num(small, "logLik", what), num(large, "logLik", what));
-    let (t, note) = lr_statistic(ll0, ll1);
+    let (t, note) = lr_statistic(ll0, ll1, false);
     assert_eq!(note, None, "{what}: no note on a positive statistic");
     assert_stat(t, num(frozen, stat_key, what), ll0, ll1, what);
 
@@ -110,7 +110,7 @@ fn pairs_reproduce_the_frozen_statistics_and_p_values() {
         "ols_pair",
         "random_pair",
     ];
-    const SKIPPED_CASES: [&str; 7] = [
+    const SKIPPED_CASES: [&str; 8] = [
         "car_glm",
         "car_glmm",
         "car_lm",
@@ -118,6 +118,7 @@ fn pairs_reproduce_the_frozen_statistics_and_p_values() {
         "lrt_terms",
         "mixture_points",
         "nonmarginal",
+        "type2_units",
     ];
     let mut cases = BTreeSet::new();
     for e in test_refs::entries(Kind::Anova) {
@@ -177,7 +178,7 @@ fn mixture_matches_the_frozen_grid() {
 
 #[test]
 fn zero_statistic_gives_p_one() {
-    assert_eq!(lr_statistic(-12.5, -12.5), (0.0, None));
+    assert_eq!(lr_statistic(-12.5, -12.5, false), (0.0, None));
     for k in 0..5 {
         assert_eq!(chibar_upper_p(0.0, k), 1.0, "mixture df_low = {k}");
         assert_eq!(
@@ -197,13 +198,13 @@ fn negative_raw_value_is_floored_with_a_note_beyond_round_off() {
     // Within round-off: 0, no note.
     let ll1 = ll0 - 0.4 * NEGATIVE_LR_ROUNDOFF;
     assert!(2.0 * (ll1 - ll0) < 0.0);
-    assert_eq!(lr_statistic(ll0, ll1), (0.0, None));
+    assert_eq!(lr_statistic(ll0, ll1, false), (0.0, None));
 
     // Beyond it: 0, with a note carrying the raw value.
     let ll1 = ll0 - NEGATIVE_LR_ROUNDOFF;
     let raw = 2.0 * (ll1 - ll0);
     assert!(raw < -NEGATIVE_LR_ROUNDOFF);
-    let (t, note) = lr_statistic(ll0, ll1);
+    let (t, note) = lr_statistic(ll0, ll1, false);
     assert_eq!(t, 0.0);
     assert_eq!(note, Some(LrNote::NegativeStatistic { raw }));
     assert_eq!(lr_p_value(t, &Reference::ChiSquared { df: 1 }), 1.0);

@@ -5,14 +5,18 @@
 #
 #   Rscript compare_anova_ports.R <rust.jsonl> <python.jsonl> <r.jsonl>
 #
-# The three front ends call the same kernel, so the band is the grid's port
+# The three front ends make the same calls through glmm-bind (the Rust one
+# calls glmm_bind::call directly, the other two through their ports), so the
+# numbers check each port's marshalling, and the band is the grid's port
 # band, TOL$port_rel with port_rel_max (grid/tol.R, the metric compare.R
 # --ports-only applies): round-off, diagnostic at 0, never widened. A value is
 # a number or one of the strings "NaN", "Inf", "-Inf"; two non-finite cells
 # agree only when they are the same of the three, and a number against a
 # non-finite value does not. A text cell (a `text` in place of the `value`:
 # a per-term table's heading with its notes, and the fit's term_test_auto
-# tags) agrees only when the texts are identical. The gate fails on:
+# tags) agrees only when the texts are identical: glmm-bind words the
+# heading and notes, and the Rust front end writes them as bind returns them,
+# so this checks that each port prints them unaltered. The gate fails on:
 #   - a front end whose calls are not exactly EXPECTED_CALLS (a call missing
 #     from all three, or one all three added, fails too);
 #   - a refused call (one `error` cell) outside EXPECTED_REFUSED, and a call in
@@ -26,7 +30,7 @@
 #   - a value past the band, or two texts that differ;
 #   - a table whose column names, or row names, differ in name or order between
 #     any two front ends (both ports give R's column names, and the Rust front
-#     end lays its tables out the same way).
+#     end lays bind's records out the same way).
 #
 # Not compared here: the exact test's `nsim` and `seed`, a comparison's
 # heading (its model order among others), and the refusal messages, whose

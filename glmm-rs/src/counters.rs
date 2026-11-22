@@ -60,12 +60,6 @@ pub struct EvalCounters {
     /// Sum over AGQ evaluations of (clusters x nodes-per-cluster) — the
     /// evaluations-x-nodes product the AGQ counter asks for.
     pub agq_node_evals: u64,
-    /// Inner GLMM fits an NB marginal-θ bracket ran. Always 0: every route
-    /// searches `ln θ_NB` as a coordinate of the outer search instead, so
-    /// `Fit::n_eval` already counts the whole fit.
-    pub nb_nodes: u32,
-    /// `n_eval` summed over those inner fits. Always 0, for the same reason.
-    pub nb_evals_total: u64,
     /// Searches run after the pin: the trough polish, 0 or 1 per fit (a
     /// GLMM polishes a pinned endpoint at most once).
     pub post_pin_searches: u32,
@@ -82,8 +76,6 @@ impl EvalCounters {
             pending_pirls_iters: 0,
             agq_evals: 0,
             agq_node_evals: 0,
-            nb_nodes: 0,
-            nb_evals_total: 0,
             post_pin_searches: 0,
         }
     }

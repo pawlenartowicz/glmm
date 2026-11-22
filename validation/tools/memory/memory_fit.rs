@@ -52,11 +52,13 @@ fn main() {
 
     let family = match family_str.as_str() {
         "gaussian" => Family::Gaussian,
+        // An omitted link is logit; any other unlisted one panics rather than
+        // being fitted as logit.
         "binomial" => Family::Binomial {
-            link: if link == "probit" {
-                BinomialLink::Probit
-            } else {
-                BinomialLink::Logit
+            link: match link {
+                "" | "logit" => BinomialLink::Logit,
+                "probit" => BinomialLink::Probit,
+                other => panic!("unsupported binomial link {other}"),
             },
         },
         "poisson" => Family::Poisson {

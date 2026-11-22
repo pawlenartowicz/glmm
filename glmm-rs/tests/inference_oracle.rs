@@ -89,7 +89,7 @@ use glmm::formula::anova::{
 };
 use glmm::formula::{fit_lowered, pairwise, Adjust, By, Column, Model, Pairwise};
 use glmm::inference::{LinearKind, LinearTest, LrTest, Reference};
-use glmm::orchestrate::{profile_names, run_fit};
+use glmm::orchestrate::{family_from_str, profile_names, run_fit};
 use glmm::{
     BinomialLink, Family, Fit, FitOptions, GammaLink, NegBinomialLink, Note, PoissonLink, WaldSe,
     WeightPower,
@@ -133,7 +133,7 @@ fn numbers(v: &Value, what: &str) -> Vec<f64> {
 /// its coefficients.
 type RefFit = (String, Value, Fit, Vec<usize>);
 
-/// The per-coefficient lmerTest references of both criteria (X7: kind
+/// The per-coefficient lmerTest references of both criteria (kind
 /// `lmertest` with `proposal_dependent` false; `reml` true or false), each
 /// fitted end to end by `glmm::fit` on its lowered formula (the ML ones with
 /// `reml = Some(false)`), with its JSON and the caller column of each of the
@@ -203,9 +203,10 @@ fn is_ml(json: &Value) -> bool {
 /// Gate 1 end to end: glmm's `coef_df` at its own θ̂ against lmerTest's df,
 /// per coefficient, within `DF_E2E_REL` (the cross-engine SE band: df moves
 /// with θ̂ as the SE does). t and p follow from df, β̂ and SE. Each fit's pass
-/// takes the derivative route the fit arms (the gradient route where the
-/// per-group gradient is armed, the value route elsewhere), here and in
-/// [`lmertest_confint`]; the in-crate gate at lme4's θ̂ runs both routes. On
+/// takes the derivative route its kernel takes (the exact pass up to the
+/// crossed-tail width, the value route on a wider tail), here and in
+/// [`lmertest_confint`]; the in-crate gate at lme4's θ̂ runs the value route
+/// on every fit and the exact pass where it covers the fit. On
 /// an ML reference, first the ML criterion against lme4's: `−2·Fit::loglik`
 /// against the frozen `deviance`, two-sided (see the module doc).
 fn lmertest_end_to_end(compared: &mut BTreeSet<String>) {
@@ -257,9 +258,14 @@ fn lmertest_confint(compared: &mut BTreeSet<String>) {
     for (name, json, fit, cols) in lmertest_fits() {
         let level = json["level"].as_f64().expect("level");
         let (lower, upper) = (numbers(&json["lower"], name), numbers(&json["upper"], name));
-        let ci =
-            glmm::orchestrate::confint(fit.beta(), fit.se(), fit.coef_df(), "satterthwaite", level)
-                .unwrap_or_else(|err| panic!("{name}: {err}"));
+        let ci = glmm::orchestrate::confint(
+            fit.beta(),
+            fit.se(),
+            fit.coef_df(),
+            glmm::orchestrate::DfMethod::Satterthwaite,
+            level,
+        )
+        .unwrap_or_else(|err| panic!("{name}: {err}"));
         let worst = cols
             .iter()
             .enumerate()
@@ -881,20 +887,17 @@ fn anova_lrt_rows(compared: &mut BTreeSet<String>) {
             &formula,
             numeric,
             factors,
-            text("family"),
-            text("link"),
-            "hessian",
-            nagq,
+            family_from_str(text("family"), text("link")).unwrap(),
+            {
+                let mut o = FitOptions::default();
+                o.nagq = nagq;
+                o.condvar = true;
+                o
+            },
             None,
             None,
             None,
-            None,
-            true,
-            true,
-            None,
-            "LRT",
-            None,
-            None,
+            TermTest::Lrt,
         )
         .unwrap_or_else(|err| panic!("{name} ({formula}): {err}"));
         assert!(r.converged, "{name}: the fit did not converge");
@@ -1839,7 +1842,7 @@ mod conditioning {
     }
 
     fn fit_band(ws: &mut FitWorkspace, data: &Data<'_>, opts: &FitOptions) -> BandFit {
-        let v = fit_on(ws, data, None, opts);
+        let v = fit_on(ws, data, None, opts).unwrap();
         BandFit {
             diag: v.diagnostics(),
             beta: v.betas().to_vec(),

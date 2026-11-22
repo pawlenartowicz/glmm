@@ -85,7 +85,7 @@ write.csv(data.frame(cluster = nb$cl, x = nb$x, grp = nb$grp, y = y_nb),
           file.path(suite_dir, "data", "simulated", "sim_nb.csv"), row.names = FALSE)
 cat(sprintf("wrote %-12s  %3d rows x %d cols\n", "sim_nb", length(y_nb), 4L))
 
-# --- Simulated crossed random-slope dataset for the #3 VarCorr synthetic -------
+# --- Simulated crossed random-slope dataset for the VarCorr synthetic ----------
 # g1 carries a random intercept + slope on x (q=2); g2 is a crossed intercept.
 # Reference = R's lme4 fit on THIS committed CSV (fixed seed -> reproducible).
 set.seed(20260701)
@@ -104,7 +104,7 @@ d_slope <- make_slope()
 write.csv(d_slope, file.path(suite_dir, "data", "simulated", "sim_slope.csv"), row.names = FALSE)
 cat(sprintf("wrote %-12s  %3d rows x %d cols\n", "sim_slope", nrow(d_slope), 4L))
 
-# --- Simulated near-collinear fixed design for the #4 rank-deficiency golden ----
+# --- Simulated near-collinear fixed design for the rank-deficiency golden -------
 # x3 = x1 + x2 + tiny jitter -> R drops the last collinear column (aliased) and
 # fits the reduced model. Reference = R's glm(gaussian) on THIS committed CSV.
 # Jitter sd 1e-13 (NOT 1e-9): glm.fit's QR drop tolerance is min(1e-7,
@@ -543,11 +543,11 @@ write.csv(d_cl, file.path(suite_dir, "data", "simulated", "sim_collinear_lmm.csv
 cat(sprintf("wrote %-12s  %3d rows x %d cols\n", "sim_collinear_lmm", nrow(d_cl), ncol(d_cl)))
 
 # --- High-mean Poisson GLM dataset ------------------------------
-# Regression dataset for the IRLS log-link cold start: from the old mu = 1 seed
-# (eta = 0) any count data with ybar over ~25-30 made the first WLS step
-# overshoot and IRLS run away (beta -> ~9e304); R converges via its
-# mustart = y + 0.1 initialize, which glmm now mirrors. ybar ~ 90 here puts the
-# data far past the old divergence threshold while keeping glm() warning-free.
+# Regression dataset for the IRLS log-link cold start: from a mu = 1 seed
+# (eta = 0), count data with ybar over ~25-30 makes the first WLS step overshoot
+# and IRLS run away (beta -> ~9e304); glmm seeds the null model instead, and R
+# starts from mustart = y + 0.1. ybar ~ 90 puts the data far past that
+# threshold while keeping glm() warning-free.
 set.seed(20260725)
 make_poisson_highmean <- function(n = 300, b0 = 4.3) {
   x   <- rnorm(n)

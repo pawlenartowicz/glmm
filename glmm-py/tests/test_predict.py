@@ -1,6 +1,6 @@
 """Fit.predict, Fit.simulate and the conditional variances in ranef_blocks:
 what crosses the port boundary and how it is worded. The numbers themselves
-are checked in the crate (RULE 6)."""
+are checked in the crate."""
 
 import pickle
 import warnings

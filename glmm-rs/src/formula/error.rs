@@ -1,9 +1,8 @@
-//! The crate's error surface. `ParseError`'s four variants and their Display
+//! The formula door's errors. `ParseError`'s four variants and their Display
 //! strings are a fixed contract — the parse test suite matches error
 //! substrings against them, so both change together with `parse.rs`; `Error`
-//! wraps it and adds the materialize-stage (data-dependent) failures. No
-//! `thiserror` dep — Display is hand-written so the crate's only third-party
-//! dependency stays `regex`.
+//! wraps it and adds the materialize-stage (data-dependent) failures. Display
+//! is hand-written, with no `thiserror`.
 
 use std::fmt;
 

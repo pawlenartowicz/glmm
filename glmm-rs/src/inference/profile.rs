@@ -29,6 +29,7 @@ use std::fmt;
 
 use super::tails::normal_quantile;
 use crate::fit::{detect_aliased, fit_keep_workspace, validate};
+use crate::ids::dense_ids;
 use crate::lmm::profile::ProfileKernel;
 use crate::{ColumnId, Data, Design, Family, Fit, FitError, FitOptions, ModelSpec, ReTerm};
 
@@ -86,6 +87,31 @@ pub struct ProfileInterval {
     /// The upper bound: NaN when undetermined, 1 on a correlation whose
     /// bound is the limit.
     pub upper: f64,
+    /// Why `lower` is NaN; `None` when it is a number, and on a correlation
+    /// next to an SD estimated at 0, which has no interval.
+    pub lower_note: Option<ProfileNote>,
+    /// Why `upper` is NaN, as `lower_note`.
+    pub upper_note: Option<ProfileNote>,
+}
+
+/// Why one side of a [`ProfileInterval`] is undetermined (NaN).
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProfileNote {
+    /// A held search (the fit with the parameter held at a trial value) did
+    /// not converge.
+    HeldSearchFailed,
+    /// `|ζ|` fell by more than its tolerance from one expansion step to the
+    /// next: the profile turns back down on that side.
+    ZetaFell,
+    /// `|ζ|` rose but did not reach the quantile within the expansion steps:
+    /// the likelihood does not drop far enough on that side, so the interval
+    /// is open there.
+    NoBracket,
+    /// The root search between a bracket's ends did not reach `|ζ|` within
+    /// its tolerance: the bracket shrank to rounding, or the evaluations ran
+    /// out.
+    RootNotFound,
 }
 
 /// The profile-likelihood intervals of a fit, from
@@ -270,6 +296,8 @@ pub(crate) fn weight_power_refusal(power: f64, estimated: bool) -> Result<(), Pr
 /// block (the intercept, if any, then the slopes).
 fn block_terms(spec: &ModelSpec) -> Vec<Vec<usize>> {
     let one = |terms: &[ReTerm], slopes: &[ColumnId]| -> Vec<usize> {
+        // Empty `terms` is one term with the intercept, as
+        // `lmm::block_hidden` reads it; change together.
         if terms.is_empty() {
             return vec![0; 1 + slopes.len()];
         }
@@ -353,19 +381,14 @@ pub(crate) fn profile_on(
         .into());
     }
 
-    let (fit, mut fws) = fit_keep_workspace(data, spec, None, &opts);
+    let (fit, mut fws) = fit_keep_workspace(data, spec, None, &opts)?;
     if !fit.converged() {
         return Err(ProfileError::NotConverged);
     }
     let ids = ids.expect("validate requires ids on a mixed model");
     let level_counts: Vec<f64> = std::iter::once(&ids.primary)
         .chain(&ids.extra)
-        .map(|g| {
-            let mut l = g.clone();
-            l.sort_unstable();
-            l.dedup();
-            l.len() as f64
-        })
+        .map(|g| dense_ids(g).1 as f64)
         .collect();
     let mut k = fws
         .profile_kernel()
@@ -412,6 +435,7 @@ pub(crate) fn profile_on(
         }
         let e = est[i];
         let mut side = |toward: Toward<'_>| var_bound(&mut k, i, param, &est, base, z, toward);
+        let none = (f64::NAN, None);
         let (estimate, lower, upper) = match param {
             ProfileParam::Sd { group, .. } => {
                 let lower = side(Toward::Limit(0.0))?;
@@ -425,7 +449,7 @@ pub(crate) fn profile_on(
             }
             ProfileParam::Cor { group, row, col } => {
                 if sd_at(group, row) == 0.0 || sd_at(group, col) == 0.0 {
-                    (f64::NAN, f64::NAN, f64::NAN)
+                    (f64::NAN, none, none)
                 } else {
                     (e, side(Toward::Limit(-1.0))?, side(Toward::Limit(1.0))?)
                 }
@@ -443,8 +467,10 @@ pub(crate) fn profile_on(
         rows.push(ProfileInterval {
             param,
             estimate,
-            lower,
-            upper,
+            lower: lower.0,
+            upper: upper.0,
+            lower_note: lower.1,
+            upper_note: upper.1,
         });
     }
 
@@ -461,13 +487,15 @@ pub(crate) fn profile_on(
             });
             bound(z, b_hat, Toward::Expand(&|t| b_hat + s * z * se * t), zeta)
         };
-        let lower = side(-1.0)?;
-        let upper = side(1.0)?;
+        let (lower, lower_note) = side(-1.0)?;
+        let (upper, upper_note) = side(1.0)?;
         rows.push(ProfileInterval {
             param,
             estimate: b_hat,
             lower,
             upper,
+            lower_note,
+            upper_note,
         });
     }
 
@@ -495,7 +523,7 @@ fn var_bound(
     base: f64,
     z: f64,
     toward: Toward<'_>,
-) -> Result<f64, ProfileError> {
+) -> Result<(f64, Option<ProfileNote>), ProfileError> {
     let zeta = path(z, base, param, k.start(i), |v, start| {
         k.hold_var(i, v, start)
     });
@@ -561,29 +589,30 @@ fn zeta_of(
     Ok(converged.then(|| (d - base).max(0.0).sqrt()))
 }
 
-/// One side's bound from the estimate `est`; `zeta(v)` is `|ζ|` at `v`
-/// (`None` when its held search failed, which makes the side NaN). Toward a
-/// limit: the limit when `est` is on it or `|ζ(limit)| ≤ z`, else the root
-/// between them. Otherwise the expansion points are tried in turn until one
-/// has `|ζ| ≥ z`, and the root lies between it and the point before; a side
-/// that does not bracket in [`MAX_EXPAND`] steps, or whose `|ζ|` falls by
-/// more than [`ZETA_TOL`] from one step to the next, is NaN.
+/// One side's bound from the estimate `est`, and why it is NaN; `zeta(v)` is
+/// `|ζ|` at `v` (`None` when its held search failed, which makes the side
+/// NaN). Toward a limit: the limit when `est` is on it or `|ζ(limit)| ≤ z`,
+/// else the root between them. Otherwise the expansion points are tried in
+/// turn until one has `|ζ| ≥ z`, and the root lies between it and the point
+/// before; a side that does not bracket in [`MAX_EXPAND`] steps, or whose
+/// `|ζ|` falls by more than [`ZETA_TOL`] from one step to the next, is NaN.
 pub(super) fn bound(
     z: f64,
     est: f64,
     toward: Toward<'_>,
     mut zeta: impl FnMut(f64) -> Result<Option<f64>, ProfileError>,
-) -> Result<f64, ProfileError> {
+) -> Result<(f64, Option<ProfileNote>), ProfileError> {
+    let undetermined = |note| Ok((f64::NAN, Some(note)));
     match toward {
         Toward::Limit(lim) => {
             if est == lim {
-                return Ok(lim);
+                return Ok((lim, None));
             }
             let Some(r) = zeta(lim)? else {
-                return Ok(f64::NAN);
+                return undetermined(ProfileNote::HeldSearchFailed);
             };
             if r <= z {
-                return Ok(lim);
+                return Ok((lim, None));
             }
             root(&mut zeta, z, est, -z, lim, r - z)
         }
@@ -592,25 +621,25 @@ pub(super) fn bound(
             for _ in 0..MAX_EXPAND {
                 let b = step(t);
                 let Some(rb) = zeta(b)? else {
-                    return Ok(f64::NAN);
+                    return undetermined(ProfileNote::HeldSearchFailed);
                 };
                 if rb < ra - ZETA_TOL {
-                    return Ok(f64::NAN);
+                    return undetermined(ProfileNote::ZetaFell);
                 }
                 if rb >= z {
                     return root(&mut zeta, z, a, ra - z, b, rb - z);
                 }
                 (a, ra, t) = (b, rb, 2.0 * t);
             }
-            Ok(f64::NAN)
+            undetermined(ProfileNote::NoBracket)
         }
     }
 }
 
 /// Brent's method on `g(v) = |ζ(v)| − z` over the bracket `[a, b]`, given
-/// `g(a) = ga < 0 ≤ g(b) = gb`: the first point with `|g| ≤ ZETA_TOL`. NaN
-/// when a held search fails, the bracket shrinks to rounding first, or
-/// [`MAX_ROOT_EVALS`] evaluations do not reach it.
+/// `g(a) = ga < 0 ≤ g(b) = gb`: the first point with `|g| ≤ ZETA_TOL`. NaN,
+/// with its [`ProfileNote`], when a held search fails, the bracket shrinks to
+/// rounding first, or [`MAX_ROOT_EVALS`] evaluations do not reach it.
 fn root(
     zeta: &mut impl FnMut(f64) -> Result<Option<f64>, ProfileError>,
     z: f64,
@@ -618,7 +647,7 @@ fn root(
     mut ga: f64,
     mut b: f64,
     mut gb: f64,
-) -> Result<f64, ProfileError> {
+) -> Result<(f64, Option<ProfileNote>), ProfileError> {
     let (mut c, mut gc) = (b, gb);
     let (mut d, mut e) = (b - a, b - a);
     let mut evals = 0;
@@ -634,12 +663,12 @@ fn root(
             (c, gc) = (a, ga);
         }
         if gb.abs() <= ZETA_TOL {
-            return Ok(b);
+            return Ok((b, None));
         }
         let tol = 2.0 * f64::EPSILON * b.abs().max(c.abs());
         let m = 0.5 * (c - b);
         if m.abs() <= tol || evals == MAX_ROOT_EVALS {
-            return Ok(f64::NAN);
+            return Ok((f64::NAN, Some(ProfileNote::RootNotFound)));
         }
         if e.abs() >= tol && ga.abs() > gb.abs() {
             // Inverse quadratic interpolation, or the secant when two of the
@@ -673,7 +702,7 @@ fn root(
         (a, ga) = (b, gb);
         b += if d.abs() > tol { d } else { tol.copysign(m) };
         let Some(r) = zeta(b)? else {
-            return Ok(f64::NAN);
+            return Ok((f64::NAN, Some(ProfileNote::HeldSearchFailed)));
         };
         gb = r - z;
         evals += 1;

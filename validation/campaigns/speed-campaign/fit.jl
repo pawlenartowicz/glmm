@@ -2,7 +2,7 @@
 # MixedModels side of the optimizer-grid campaign -> one JSONL line per cell.
 # Resume-safe (skips case_ids already in GRID_OUT); eval cap set per cell from
 # the manifest's pre-registered max_fun via optsum.maxfeval. Run inside the
-# pinned env: julia --project=GLMM/validation GLMM/validation/campaigns/speed-campaign/fit.jl
+# pinned env: julia --project=validation validation/campaigns/speed-campaign/fit.jl
 using MixedModels, CSV, DataFrames, JSON3, LinearAlgebra
 
 # Per-cell hard timeout, enforced from inside Julia: run.sh's watchdog only
@@ -35,8 +35,8 @@ const OK_RETURN = Set([:FTOL_REACHED, :XTOL_REACHED, :SUCCESS, :STOPVAL_REACHED]
 # varcomp_of (mirrors lme4's VarCorr: group/terms/stddev/corr) so
 # analyze_diligent.R's stddevs_of/corrs_of read this field unmodified. GLM
 # reterms carry no residual scale (σ folds into the family dispersion, held at
-# 1 upstream of λ) — only called on gaussian LMM cells (boundary-37 spec, Part
-# A), so unconditionally uses m.σ.
+# 1 upstream of λ) — only called on gaussian LMM cells, so unconditionally uses
+# m.σ.
 function varcomp_of(m)
     map(m.reterms) do t
         sigma = m.σ^2 * t.λ * t.λ'
@@ -73,7 +73,7 @@ function fit_cell(cell)
         m
     end
     # REML iff the manifest cell says so (gaussian grid cells carry reml=true;
-    # the glmm engine's LMM path is REML-only) — mirrors fit.jl's `spec.reml === true`.
+    # the glmm engine's LMM path is REML-only) — mirrors fit.R's `isTRUE(cell$reml)`.
     dofit!(m) = fam == "gaussian" ?
         fit!(m; REML = get(cell, :reml, false) === true, progress = false) :
         fit!(m; progress = false)
@@ -92,7 +92,7 @@ function fit_cell(cell)
     conv = m.optsum.returnvalue in OK_RETURN
     status = m.optsum.returnvalue == :MAXEVAL_REACHED ? "maxeval" :
              conv ? "ok" : "engine-fail"
-    # θ̂ capture (mismatch-adjudication spec): m.θ is the concatenated
+    # θ̂ capture: m.θ is the concatenated
     # column-major lower-triangle vech per reterm, MM's term order (descending
     # level count — NOT formula order); re_groups/re_qs make the mapping to
     # glmm's declaration-order layout explicit downstream.

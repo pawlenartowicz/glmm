@@ -1,26 +1,16 @@
 //! General-machine LMM solver core: family-blocked profiled REML or ML deviance
 //! (primary + nested children eliminated family-by-family, crossed factors in
-//! a dense tail Cholesky with [X y]) + BOBYQA θ-search over one diagonal θ
-//! component per grouping. A degenerate single-intercept `ClusterSpec`
+//! a dense tail Cholesky with [X y]), minimized over θ = the column-major vech
+//! of each block's Λ, by BOBYQA, or by BFGS on the per-group route
+//! ([`lmm_outer_optimizer`]). A degenerate single-intercept `ClusterSpec`
 //! collapses to the per-cluster shrink-downdate arithmetic (up to FP
 //! reassociation), so the q=1 validation corpus re-proves on this machine.
-//!
-//! Engine-resident: ALL Gaussian mixed (LMM) specs dispatch here through the
-//! unified fit core — the single-random-intercept shape is a `FitKind::Lmm`/BOBYQA
-//! case like any other, from every tier (stable and loop). A scalar closed-form
-//! solve for this shape would only save the per-call workspace allocation that
-//! the reusable `FitWorkspace` (allocated once per (p, max_clusters) shape)
-//! already avoids for every shape, so BOBYQA's θ-search itself costs under 6%
-//! of runtime here. BOBYQA also scales better at high cluster counts than a
-//! scalar per-cluster downdate (`O(n_clusters·P)` per evaluation, with no
-//! counterpart in `reml_deviance`'s balanced-collapse path), and matches a
-//! scalar solve's β̂ to ~1e-9, so there is no accuracy axis to trade either.
 //!
 //! Hot-loop invariants:
 //!  * Bounded allocations on the warm path (twin test in `lmm::tests`): all
 //!    scratch and the BOBYQA solver live in `LmmWorkspace`, allocated once
 //!    per (p, max_clusters) shape; the only per-call allocations are faer
-//!    `llt` internals — the same acceptance the shipped path carries.
+//!    `llt` internals.
 //!  * Inference is squared statistics (`t_sq = β̂²/Var(β̂)`); never sqrt the
 //!    SE, never call a CDF on the per-fit path.
 //!  * `f64::INFINITY` is the deviance failure surface.
@@ -31,7 +21,7 @@
 use bobyqa::{Bobyqa, Config, RestartConfig, Status};
 use faer::{Mat, MatMut, MatRef};
 
-use crate::fit::{CondvarBlocks, CondvarCross, SizedSpec};
+use crate::fit::{vech_at, CondvarBlocks, CondvarCross, SizedSpec};
 use crate::scalar::Scalar;
 use crate::standardize::{ColumnScaling, Units};
 
@@ -88,22 +78,20 @@ pub const RHO_BEGIN: f64 = 0.5;
 /// the warm total by −1% to +4%.
 pub const RHO_BEGIN_WARM: f64 = 0.1;
 /// Final trust radius = θ̂ target accuracy. 1e-6 measured equivalent to 1e-8
-/// on every validation check under the amended abs floors (stat 1e-4 /
+/// on every validation check under the abs floors (stat 1e-4 /
 /// β̂ 1e-5), at 15.1–15.7 vs 19.5–20.7 evals/fit — a ~25% eval cut for free.
 pub const RHO_END: f64 = 1e-6;
 /// GLMM-path final trust radius (θ AND β jointly, not θ-only like `RHO_END`).
-/// Re-measured 2026-08-06 (full `cargo test --release` across all five
-/// feature configs plus a 20-rung validation sweep with tightening-only noise
-/// floors): 3e-6 fully green; 1e-5 fails 5 tests, the one oracle-band
+/// Measured with `cargo test --release` across all five feature configs
+/// plus a 20-rung validation sweep with tightening-only noise floors: 3e-6
+/// fully green; 1e-5 fails 5 tests, the one oracle-band
 /// casualty being `fit_glmm_poisson_agq_matches_lme4` — grouseticks AGQ k=7
 /// β[0] at 1.9331e-3 vs its 1e-3 lme4 band (1.93×, and ~9× the rung's
 /// 1.03e-4 optimizer noise floor, so a real accuracy loss, not path wander);
-/// the other four are Rust-vs-Rust bit-exact pins. The 2026-07-03 sweep's
-/// 1e-5 casualty (`two_stage_matches_single_stage_on_grouseticks`) now
-/// passes at 1e-5; that sweep also saw 3e-5 and 1e-4 add further oracle
-/// failures. 3e-6 is the boundary-adjacent candidate — do NOT loosen past
-/// it. Original timing rationale (vs 1e-6): 0.265–0.269s vs 0.288s on
-/// `grouseticks` (n=403, 7 free params), a ~7–8% wall-time cut for free.
+/// the other four are Rust-vs-Rust bit-exact pins. 3e-6 is the
+/// boundary-adjacent candidate — do NOT loosen past it. Against 1e-6 it cuts
+/// wall time by about 7 to 8% on `grouseticks` (n=403, 7 free params): 0.265
+/// to 0.269 s against 0.288 s.
 pub const GLMM_RHO_END: f64 = 3e-6;
 /// Initial trust radius of a GLMM search from the blind θ₀: the θ-only stage-1
 /// search (`PqlThenJoint` and `ExactProfile`) and the joint search on the
@@ -137,9 +125,8 @@ pub const POLISH_NEAR_SINGULAR: f64 = 1e-2;
 /// component.
 pub const THETA_TRUTH_FLOOR: f64 = 0.01;
 /// Pin threshold: a Converged diagonal component ≤ this is deterministically
-/// pinned at exactly 0 and counted converged. 1e-4 aligns the class boundary
-/// with the shipped τ̂≈0 detection, which pins `boundary_hit=1` fits at
-/// θ = 1e-4.
+/// pinned at exactly 0 and counted converged. 1e-4 is the default tolerance
+/// of lme4's `isSingular`.
 ///
 /// **Tested on the INTERNAL θ**, the coordinate the solver minimizes over on
 /// the fitted design (`crate::standardize`), not on θ in the design's own units.
@@ -205,7 +192,10 @@ pub(crate) const PIN_PROBE_STEP: f64 = 1e-3;
 /// objectives they compare each carry a rounding error that grows with |D|.
 /// The floor takes over past |D| ≈ 7e6 for the drop and 7e7 for the slack, so
 /// the pin check and the trough polish do not act on that noise. Below those
-/// both thresholds keep their measured values.
+/// both thresholds keep their measured values. The GLMM's floor is the larger
+/// of this and its deviance's rounding estimate `ε·(|D| + tr_x)`, whose `tr_x`
+/// term counts the `log|A|` rounding an extra grouping factor brings
+/// (`glmm::pin::post_pin`); the LMM's floor is this alone.
 pub(crate) const PIN_NOISE_ULPS: f64 = 64.0;
 
 /// Ill-conditioning DETECTION floor for the LMM and GLMM routes, on the
@@ -300,7 +290,7 @@ pub(crate) fn apply_shipped_schedule(config: &mut Config, n: usize) {
 /// Capacity ceilings — single-sourced in `crate::consts` and re-exported here
 /// as `crate::lmm::MAX_*` so callers can validate a spec against them before
 /// a fit is ever built.
-pub use crate::consts::{MAX_EXTRA_GROUPINGS, MAX_EXTRA_Q, MAX_PRIMARY_Q};
+pub use crate::consts::{MAX_EXTRA_GROUPINGS, MAX_PRIMARY_Q};
 
 // ---------------------------------------------------------------------------
 // LmmGroupings — grouping-structure metadata shared by suff stats + deviance.
@@ -368,8 +358,8 @@ pub struct LmmGroupings {
     /// then the extra-grouping scalars. q_p=1 ⇒ `[0, extras…]`; q_p=2 ⇒
     /// `[0, 2, extras…]`; off-diagonal vech entries excluded, and so is a
     /// diagonal in `structural_theta` (a hidden column 0). Computed once per
-    /// workspace by `compute_diagonal_theta` (the vech-diagonal walk lives there,
-    /// single-sourced) so the per-fit pin pass borrows instead of reallocating.
+    /// workspace from [`Self::lambda_columns`] so the per-fit pin pass borrows
+    /// instead of reallocating.
     pub diagonal_theta: Vec<usize>,
     /// Parallel to `diagonal_theta`: for diagonal `k` at column `d` of a
     /// `q`-wide vech block, `q − d` — the diagonal's own vech run, diagonal
@@ -377,8 +367,7 @@ pub struct LmmGroupings {
     /// in the same column, contiguous at `diagonal_theta[k] + 1 ..
     /// diagonal_theta[k] + diagonal_run_len[k]` (column-major vech packs a
     /// column's rows contiguously). `1` when the diagonal has no off-diagonal
-    /// below it. Computed once per workspace by `compute_diagonal_run_len`,
-    /// the companion walk to `compute_diagonal_theta`.
+    /// below it. Computed with `diagonal_theta`, from the same walk.
     pub diagonal_run_len: Vec<usize>,
     /// θ-indices held at exactly zero by the spec's terms, ascending: the
     /// entries between two terms of one block, and the whole column 0 of a
@@ -388,9 +377,8 @@ pub struct LmmGroupings {
     /// block has no intercept term, so its column 0 is an idle RE dimension
     /// (its θ entries are structural) that no output reports.
     pub(crate) hidden: Vec<bool>,
-    /// Solver-path gate: true iff any extra grouping carries a random slope
-    /// (`q_g > 1`). The scalar tail in `reml_deviance` stays byte-identical when
-    /// false; the blocked per-factor `Λ_g` tail is taken when true.
+    /// True iff any extra grouping carries a random slope (`q_g > 1`). Such a
+    /// design routes to the sparse kernel; the dense kernels assert it is false.
     pub extra_slopes_any: bool,
     /// Per-extra-grouping RE width `q_g = 1 + #slopes`, DECLARATION order (parallel
     /// to `extra_offsets`). Sizes each grouping's RE-column block (`level·q_g + d`)
@@ -399,66 +387,9 @@ pub struct LmmGroupings {
     /// Per-extra-grouping `[X y]` row indices of that grouping's slope covariates
     /// (resolved x columns), DECLARATION order — the crossed/nested analogue of
     /// `primary_slope_cols`. `extra_slope_cols[e]` has `extra_q[e] − 1` entries.
-    /// Empty (or empty inner) for intercept-only extras. Used by `add_rows_multi`
-    /// (covariate-weighted scatter) and the blocked tail Gram recovery.
+    /// Empty (or empty inner) for intercept-only extras. Read by the sparse
+    /// kernel and the random-effect map.
     pub extra_slope_cols: Vec<Vec<usize>>,
-}
-
-/// The vech-diagonal θ-index walk, single source of truth for
-/// `LmmGroupings::diagonal_theta`. Each factor (the primary, then every extra in
-/// declaration order) contributes its `q` diagonal entries (column-major: the
-/// diagonal of column d sits at offset `Σ_{j<d}(q−j)` within the factor's vech
-/// block), and the next factor's block starts `q(q+1)/2` θ-slots later. With
-/// every extra `q == 1` this is `[primary diagonals, base+0, base+1, …]`. A
-/// diagonal in `structural` (ascending) is held at zero, not a variance
-/// component, and is left out.
-fn compute_diagonal_theta(
-    primary_q: usize,
-    extra_qs: &[usize],
-    structural: &[usize],
-) -> Vec<usize> {
-    let mut idx = Vec::with_capacity(primary_q + extra_qs.len());
-    let mut start = 0usize;
-    for &q in std::iter::once(&primary_q).chain(extra_qs.iter()) {
-        let mut off = start;
-        for d in 0..q {
-            if structural.binary_search(&off).is_err() {
-                idx.push(off);
-            }
-            off += q - d; // advance past column d's vech block (length q−d)
-        }
-        start += q * (q + 1) / 2; // next factor's vech block
-    }
-    idx
-}
-
-/// Companion walk to `compute_diagonal_theta`, single source of truth for
-/// `LmmGroupings::diagonal_run_len`: for each diagonal, `q − d` where `d` is
-/// its column within its `q`-wide vech block. Must walk the same
-/// `(primary_q, extra_qs)` factor/column loop, and leave out the same
-/// structural diagonals, as `compute_diagonal_theta` —
-/// the two are kept as separate loops rather than one returning both, so a
-/// future edit to the walk itself has to be made in two obviously-named
-/// functions instead of silently drifting between a tuple and a caller
-/// working out which half is which.
-fn compute_diagonal_run_len(
-    primary_q: usize,
-    extra_qs: &[usize],
-    structural: &[usize],
-) -> Vec<usize> {
-    let mut run_len = Vec::with_capacity(primary_q + extra_qs.len());
-    let mut start = 0usize;
-    for &q in std::iter::once(&primary_q).chain(extra_qs.iter()) {
-        let mut off = start;
-        for d in 0..q {
-            if structural.binary_search(&off).is_err() {
-                run_len.push(q - d);
-            }
-            off += q - d;
-        }
-        start += q * (q + 1) / 2;
-    }
-    run_len
 }
 
 /// Appends to `structural` the θ-indices of one `q`-wide block, its vech at
@@ -502,7 +433,8 @@ fn block_mask(
 
 /// Whether a block with these `terms` hides its column 0: some term is
 /// declared and none holds the intercept. Empty `terms` is one unstructured
-/// term with the intercept.
+/// term with the intercept; `inference::profile`'s `block_terms` counts that
+/// intercept column itself, so change together.
 pub(crate) fn block_hidden(terms: &[crate::ReTerm]) -> bool {
     !terms.is_empty() && !terms.iter().any(|t| t.intercept)
 }
@@ -625,7 +557,7 @@ impl LmmGroupings {
                 v
             })
             .collect();
-        LmmGroupings {
+        let mut g = LmmGroupings {
             n_primary,
             nested_per_parent,
             nested,
@@ -634,24 +566,29 @@ impl LmmGroupings {
             k_total: off,
             primary_q: q_p,
             primary_slope_cols: slope_cols.to_vec(),
-            diagonal_theta: compute_diagonal_theta(q_p, &extra_qs, &structural_theta),
-            diagonal_run_len: compute_diagonal_run_len(q_p, &extra_qs, &structural_theta),
+            diagonal_theta: Vec::new(),
+            diagonal_run_len: Vec::new(),
             structural_theta,
             hidden,
             extra_slopes_any,
             extra_q: extra_qs,
             extra_slope_cols,
-        }
+        };
+        // Each Λ column's run starts at its diagonal; a structural diagonal is
+        // held at zero, not a variance component, and is left out.
+        (g.diagonal_theta, g.diagonal_run_len) = g
+            .lambda_columns()
+            .filter(|col| g.structural_theta.binary_search(&col.start).is_err())
+            .map(|col| (col.start, col.len()))
+            .unzip();
+        g
     }
 
     /// Primary vech (`q_p(q_p+1)/2`) + a `vech(Λ_g)` block per extra grouping
     /// (`q_g(q_g+1)/2` each). With every `q_g == 1` this is
     /// `primary vech + #extras`.
     pub fn n_theta(&self) -> usize {
-        let prim = self.primary_q * (self.primary_q + 1) / 2;
-        let nested = self.nested.map(|nf| nf.q * (nf.q + 1) / 2).unwrap_or(0);
-        let crossed: usize = self.crossed.iter().map(|cf| cf.q * (cf.q + 1) / 2).sum();
-        prim + nested + crossed
+        self.vech_start(self.n_blocks())
     }
     /// Columns eliminated family-by-family: the `q_p` primary RE cols per level
     /// plus nested children (`q_nested` cols each). (`k_crossed = k_total −
@@ -673,15 +610,57 @@ impl LmmGroupings {
     /// any extra-slopes shape to `Solver::Sparse` for every family, so no
     /// slopes-on-extras check is needed. A non-eligible extras shape
     /// (oversized core) falls through to the packed `glmm::pirls_solve_packed`.
+    /// The `lands` closure in `fit::common::spec_sized_from_ids` restates this
+    /// test on a `SizedSpec` — change together.
     pub fn structured_extras_eligible(&self) -> bool {
         !self.extra_offsets.is_empty() && self.primary_q + self.nested_per_parent <= MAX_PRIMARY_Q
     }
-    /// Borrow of the cached diagonal θ-index map (computed once per workspace by
-    /// `compute_diagonal_theta`). Zero-alloc: the per-fit pin pass and the
+    /// Borrow of the cached diagonal θ-index map (computed once per
+    /// workspace). Zero-alloc: the per-fit pin pass and the
     /// rho-schedule fold read this slice without reallocating. See the
     /// `diagonal_theta` field doc for the column-major vech layout.
     pub fn diagonal_theta(&self) -> &[usize] {
         &self.diagonal_theta
+    }
+
+    /// Blocks in θ order: the primary, then each extra in declaration order.
+    pub(crate) fn n_blocks(&self) -> usize {
+        1 + self.extra_q.len()
+    }
+
+    /// Width `q` of block `b` (`b == 0` the primary, `b` the extra `b − 1`).
+    pub(crate) fn block_q(&self, b: usize) -> usize {
+        if b == 0 {
+            self.primary_q
+        } else {
+            self.extra_q[b - 1]
+        }
+    }
+
+    /// θ index where block `b`'s vech begins; `b == n_blocks()` gives
+    /// `n_theta`.
+    pub(crate) fn vech_start(&self, b: usize) -> usize {
+        (0..b)
+            .map(|i| {
+                let q = self.block_q(i);
+                q * (q + 1) / 2
+            })
+            .sum()
+    }
+
+    /// The θ-index range of every Λ column, block by block (primary, then each
+    /// extra in declaration order). Column-major vech: column d of a q-wide
+    /// block is the run of q − d entries starting at its diagonal.
+    pub(crate) fn lambda_columns(&self) -> impl Iterator<Item = std::ops::Range<usize>> + '_ {
+        let mut start = 0usize;
+        std::iter::once(&self.primary_q)
+            .chain(self.extra_q.iter())
+            .flat_map(|&q| (0..q).map(move |d| q - d))
+            .map(move |len| {
+                let col = start..start + len;
+                start = col.end;
+                col
+            })
     }
 
     /// The structural θ-indices (see the `structural_theta` field), ascending.
@@ -724,19 +703,22 @@ impl LmmGroupings {
     /// every fit, boundary or not.
     pub fn blind_theta_and_bounds(&self) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
         let n = self.n_theta();
-        let mut theta = vec![THETA0; n];
+        let mut theta = vec![0.0; n];
+        self.blind_theta(&mut theta);
         let lower = vec![-THETA_HI; n];
         let upper = vec![THETA_HI; n];
-        let diag = self.diagonal_theta();
-        // Off-diagonal vech entries (primary AND every extra factor's Λ_g) get a
-        // blind start of 0; diagonals keep θ₀ = THETA0. q_g=1 extras are
-        // all-diagonal, so they are untouched.
-        for (i, t) in theta.iter_mut().enumerate() {
-            if !diag.contains(&i) {
-                *t = 0.0; // off-diagonal blind start
-            }
-        }
         (theta, lower, upper)
+    }
+
+    /// The blind θ₀ into `theta` (full layout): THETA0 at every entry of
+    /// `diagonal_theta`, 0 elsewhere (structural diagonals too). The GLMM
+    /// writes the same point in `glmm::start` (its cold start, its warm arm's
+    /// `blind` closure and the start guard's `set_blind`) — change together.
+    pub(crate) fn blind_theta(&self, theta: &mut [f64]) {
+        theta.fill(0.0);
+        for &i in self.diagonal_theta() {
+            theta[i] = THETA0;
+        }
     }
 }
 
@@ -776,8 +758,7 @@ pub struct LmmFitScratch {
     /// Stacked forward-solved family couplings, t_dim × W_tot column-major
     /// (W_tot = n_primary·w): column f·w+r is family f's L_f⁻¹B_f row r,
     /// contiguous. Filled and solved per family, consumed by ONE triangular
-    /// GEMM downdate after the family loop — the per-family tail re-traversals
-    /// are gone.
+    /// GEMM downdate after the family loop.
     pub bt: Vec<f64>,
     /// (k_crossed+m)² tail [[H, B_x],[B_xᵀ, C]] over [crossed | X y],
     /// column-major lower triangle (entry (i,j) at j·t_dim+i); GEMM-downdated
@@ -810,7 +791,7 @@ pub struct LmmFitScratch {
     /// w×w row-major A(θ)⁻¹, rebuilt per eval on the collapse path.
     pub a_inv: Vec<f64>,
     /// Active balanced families (prefix length). 0 = collapse off → the
-    /// per-family loop runs (the fallback and the pre-F behaviour).
+    /// per-family loop runs (the fallback).
     pub collapse_n_active: usize,
     /// Per-group regression route (`precompute_group_regressions`): for each
     /// active group, `B_g = G_g⁻¹` as a row-major `q×q` block (lower triangle
@@ -867,23 +848,6 @@ pub struct LmmFitScratch {
     /// σ̂² at the last evaluation's θ, by the criterion: `r²/(n − p)` under
     /// REML, `r²/n` under ML (`r² = L[p,p]²` off the augmented factor).
     pub sigma_sq: f64,
-    // --- crossed/nested-slopes blocked path (`reml_deviance_blocked`) ---
-    // All empty unless `extra_slopes_any`; sized once here so the blocked warm
-    // path stays zero-alloc. `k = k_total`, `dim = k + m`.
-    /// k×k materialized block-diagonal relative-covariance factor Λ (column-major
-    /// lower-tri), refreshed per θ-eval.
-    pub blocked_lam: Vec<f64>,
-    /// k×k raw RE design Gram ZᵀZ (column-major), refreshed per θ-eval.
-    pub blocked_g: Vec<f64>,
-    /// k×k scratch holding Λᵀ·ZᵀZ between the two Λ-applications.
-    pub blocked_tmp: Vec<f64>,
-    /// dim×dim penalized augmented matrix [[ΛᵀZᵀZΛ+I, ΛᵀZᵀ[Xy]],[·, [Xy]ᵀ[Xy]]]
-    /// (column-major lower-tri). Read again by `recover_ranef_blocked` after the
-    /// fit, so it must stay unfactored — the Cholesky factor goes in `blocked_l`.
-    pub blocked_p: Vec<f64>,
-    /// dim×dim Cholesky factor of `blocked_p`, filled per θ-eval by a copy +
-    /// in-place factor at `Par::Seq` (see `reml_deviance_blocked` in kernel.rs).
-    pub blocked_l: Vec<f64>,
     /// The criterion the deviance evaluates. `Criterion::Reml` from
     /// [`Self::with_groupings`]; the fit core sets it at build.
     pub(crate) criterion: Criterion,
@@ -899,10 +863,8 @@ impl LmmFitScratch {
         let m = p + 1;
         let w = g.primary_q + g.nested_per_parent; // q_p primary cols + nested children
         let t_dim = g.k_crossed() + m;
-        // prim_lam / prim_gram hold the q_p×q_p primary Λ/Gram on the slope path
-        // AND on the blocked crossed/nested-slopes path (which unpacks the primary
-        // Λ even when q_p == 1), so size them whenever either path can run.
-        let q2 = if g.primary_q > 1 || g.extra_slopes_any {
+        // prim_lam / prim_gram hold the q_p×q_p primary Λ/Gram on the slope path.
+        let q2 = if g.primary_q > 1 {
             g.primary_q * g.primary_q
         } else {
             0
@@ -911,13 +873,6 @@ impl LmmFitScratch {
         // mis-size it and the path never collapses. The t_dim² buffers and
         // `bt` here are counted by `fit::gaussian_dense_fits` (change together).
         let npairs = if g.primary_q == 1 { w * (w + 1) / 2 } else { 0 };
-        // Blocked crossed/nested-slopes scratch only when that path is taken.
-        let blocked_kk = if g.extra_slopes_any {
-            g.k_total * g.k_total
-        } else {
-            0
-        };
-        let blocked_dim = if g.extra_slopes_any { g.k_total + m } else { 0 };
         // Per-group regression scratch only on the shape that route admits.
         let pg_groups = if group_regression_shape(g) {
             g.n_primary
@@ -963,11 +918,6 @@ impl LmmFitScratch {
             ranef_ux: vec![0.0; g.k_crossed()],
             ranef_rhs: vec![0.0; w],
             sigma_sq: f64::NAN,
-            blocked_lam: vec![0.0; blocked_kk],
-            blocked_g: vec![0.0; blocked_kk],
-            blocked_tmp: vec![0.0; blocked_kk],
-            blocked_p: vec![0.0; blocked_dim * blocked_dim],
-            blocked_l: vec![0.0; blocked_dim * blocked_dim],
             criterion: Criterion::Reml,
             qr: None,
         }
@@ -1063,7 +1013,7 @@ impl LmmKernel {
     }
 
     /// Whether the QR kernel covers the accumulated design: the dense
-    /// family path with no crossed factor and no extra-grouping slope, and
+    /// family path with no crossed factor, and
     /// `n > p > 0`.
     pub(crate) fn qr_covers(&self) -> bool {
         let LmmKernel::Dense { suff, .. } = self else {
@@ -1071,7 +1021,7 @@ impl LmmKernel {
         };
         let g = &suff.groupings;
         let p = suff.m - 1;
-        !g.extra_slopes_any && g.k_crossed() == 0 && suff.n_rows > p && p > 0
+        g.k_crossed() == 0 && suff.n_rows > p && p > 0
     }
 
     /// Switch the deviance to the QR kernel, built from the rows the Gram
@@ -1111,8 +1061,8 @@ impl LmmKernel {
 
     /// Keep back what the NEXT evaluation would otherwise throw away, so
     /// [`Self::recover_ranef`] can back-substitute the conditional modes off
-    /// it. The dense kernel needs nothing: it re-factors from `fit.tail` /
-    /// `fit.blocked_p`, which every evaluation leaves behind.
+    /// it. The dense kernel needs nothing: it re-factors from `fit.tail`,
+    /// which every evaluation leaves behind.
     pub(crate) fn prepare_recovery(&mut self) {
         match self {
             LmmKernel::Dense { .. } => {}
@@ -1194,14 +1144,13 @@ impl LmmKernel {
     /// `Fit::condvar_cross` are assembled from, at the θ̂ the last evaluation
     /// factored ([`condvar_family`]). Allocates its own buffers and leaves the
     /// kernel's untouched. `None` where they are not computed: the sparse
-    /// kernel, the QR kernel, the blocked crossed/nested-slopes path, an empty
-    /// design, or a factor that is not positive definite.
+    /// kernel, the QR kernel, an empty design, or a factor that is not positive definite.
     pub(crate) fn condvar_blocks(&self, theta: &[f64]) -> Option<CondvarBlocks> {
         let LmmKernel::Dense { suff, fit } = self else {
             return None;
         };
         let g = &suff.groupings;
-        if fit.qr_on() || g.extra_slopes_any || g.k_total == 0 || suff.n_rows == 0 {
+        if fit.qr_on() || g.k_total == 0 || suff.n_rows == 0 {
             return None;
         }
         condvar_family(theta, suff, &fit.tail)
@@ -1248,10 +1197,9 @@ impl LmmKernel {
         }
     }
 
-    /// The exact-fit floor `(k_total + p + 1)·ε·y′Wy` of r² that every
-    /// kernel's deviance tests against (change together): r² is known only
-    /// to about this, so `ν·ln σ̂²` in the deviance to about this over σ̂².
-    /// 0 on the QR kernel, which computes `r` directly.
+    /// The [`exact_fit_floor`] of r² that the kernel's deviance tests
+    /// against: r² is known only to about this, so `ν·ln σ̂²` in the deviance
+    /// to about this over σ̂². 0 on the QR kernel, which computes `r` directly.
     pub(crate) fn r_sq_floor(&self) -> f64 {
         if self.qr_on() {
             return 0.0;
@@ -1262,7 +1210,7 @@ impl LmmKernel {
             LmmKernel::Sparse { ws, .. } => &Self::sparse_ws(ws).cxy,
         };
         let m = c.nrows();
-        (self.groupings().k_total + m) as f64 * f64::EPSILON * c[(m - 1, m - 1)]
+        exact_fit_floor(self.groupings().k_total, m, c[(m - 1, m - 1)])
     }
 
     /// The REML deviance's rounding from the pivots of X̃′V⁻¹X̃, read off the
@@ -1408,8 +1356,8 @@ impl LmmWorkspace {
 
     /// As [`for_cluster_spec`], plus each extra grouping's resolved slope x-columns
     /// (`extra_slope_cols`, declaration order; `&[]` for intercept-only extras) —
-    /// the crossed/nested-slopes entry. Both `glmm::fit` (standalone) and
-    /// `glmm::mcpower` bind through here.
+    /// the crossed/nested-slopes entry, which `fit::core` and `fit::lmm` bind
+    /// through.
     ///
     /// `sparse` picks the kernel: it is `fit::classify_design(spec) ==
     /// Solver::Sparse` on the live path, and the sparse kernel is a superset of
@@ -1452,6 +1400,9 @@ impl LmmWorkspace {
                 ws: None,
             }
         } else {
+            // The dense kernel has no slope-carrying extra grouping;
+            // `classify_design` routes those designs to the sparse one.
+            debug_assert!(!groupings.extra_slopes_any);
             let fit = Box::new(LmmFitScratch::with_groupings(p, &groupings));
             LmmKernel::Dense {
                 suff: Box::new(LmmSuffStats::with_groupings(p, groupings)),
@@ -1590,10 +1541,8 @@ pub(crate) fn canonicalize_pinned_blocks(
     floor: PivotFloor,
 ) -> bool {
     let mut changed = false;
-    let mut start = 0usize;
-    // Same factor walk as `compute_diagonal_theta` / `fix_column_signs`
-    // (primary, then each extra in declaration order) — change together.
-    for &q in std::iter::once(&g.primary_q).chain(g.extra_q.iter()) {
+    for b in 0..g.n_blocks() {
+        let (q, start) = (g.block_q(b), g.vech_start(b));
         let len = q * (q + 1) / 2;
         // q == 1 has nothing below a diagonal to fold. Past MAX_PRIMARY_Q the
         // stack scratch below would not hold the block; only the sparse route
@@ -1610,7 +1559,6 @@ pub(crate) fn canonicalize_pinned_blocks(
         {
             changed = true;
         }
-        start += len;
     }
     changed
 }
@@ -1626,27 +1574,18 @@ pub(crate) fn canonicalize_pinned_blocks(
 /// every pin site on the raw endpoint, before the pin test, the canonical
 /// block and the SE pass. Returns whether any column was negated.
 ///
-/// Same block walk as [`canonicalize_pinned_blocks`] and [`fix_mode_signs`] —
-/// change together. It
-/// needs no scratch, so unlike that one it has no block-width limit and
-/// covers the sparse route's wide blocks too.
+/// Same block walk as [`fix_mode_signs`] — change together. It needs no
+/// scratch, so unlike [`canonicalize_pinned_blocks`] it has no block-width
+/// limit and covers the sparse route's wide blocks too.
 pub(crate) fn fix_column_signs(g: &LmmGroupings, theta: &mut [f64]) -> bool {
     let mut changed = false;
-    let mut start = 0usize;
-    for &q in std::iter::once(&g.primary_q).chain(g.extra_q.iter()) {
-        // Column-major vech: column d of a q-wide block is the run of q − d
-        // entries starting at its diagonal.
-        let mut off = start;
-        for d in 0..q {
-            if theta[off] < 0.0 {
-                for v in theta[off..off + (q - d)].iter_mut() {
-                    *v = -*v;
-                }
-                changed = true;
+    for col in g.lambda_columns() {
+        if theta[col.start] < 0.0 {
+            for v in theta[col].iter_mut() {
+                *v = -*v;
             }
-            off += q - d;
+            changed = true;
         }
-        start += q * (q + 1) / 2;
     }
     changed
 }
@@ -1669,9 +1608,8 @@ pub(crate) fn fix_mode_signs(
     primary_slope_major: bool,
 ) {
     let q_p = g.primary_q;
-    let mut off = 0usize;
     for d in 0..q_p {
-        if theta[off] < 0.0 {
+        if theta[vech_at(q_p, d, d)] < 0.0 {
             for lvl in 0..g.n_primary {
                 let c = if primary_slope_major {
                     d * g.n_primary + lvl
@@ -1681,7 +1619,6 @@ pub(crate) fn fix_mode_signs(
                 u[c] = -u[c];
             }
         }
-        off += q_p - d;
     }
     let nested = g.nested.map(|nf| {
         (
@@ -1697,15 +1634,13 @@ pub(crate) fn fix_mode_signs(
         .map(|cf| (cf.vech_start, cf.q, cf.decl, cf.n_levels));
     for (vech_start, q, decl, n_levels) in nested.into_iter().chain(crossed) {
         let base = g.extra_offsets[decl];
-        let mut off = vech_start;
         for d in 0..q {
-            if theta[off] < 0.0 {
+            if theta[vech_start + vech_at(q, d, d)] < 0.0 {
                 for lvl in 0..n_levels {
                     let c = base + lvl * q + d;
                     u[c] = -u[c];
                 }
             }
-            off += q - d;
         }
     }
 }
@@ -1714,7 +1649,7 @@ pub(crate) fn fix_mode_signs(
 /// sign fix, pin of every diagonal ≤ [`PIN_THETA`], then one canonical fold
 /// with the pin inside the factorization. Returns (any pinned,
 /// `pinned_components`), bit `k` for the `k`-th entry of `diagonal_theta()`
-/// (the first 64 only).
+/// (at most 64 entries, [`crate::consts::MAX_VARIANCE_COMPONENTS`]).
 ///
 /// Sign fix first ([`fix_column_signs`]): the box lets a diagonal end
 /// negative, so a block column whose diagonal did is negated whole. Σ and the
@@ -1915,13 +1850,15 @@ fn assemble_fam_a(
         let q = g.primary_q;
         primary_gram(suff, g, f, q, prim_gram);
         assemble_primary_a(fam_a, w, prim_lam, prim_gram, q); // I + Λ′GΛ
-                                                              // Composed nested children (rows/cols q..q+np). Scalar child λ = θ_n;
-                                                              // child–child off-diagonals are 0 (children never
-                                                              // co-occur). The primary↔child off-diagonal A[(q+c, e)] folds the raw
-                                                              // cross-Gram (intercept = counts[child]; slope d = s_raw[(slope_col_d,
-                                                              // child_re_col)]) through Λ_p, mirroring how the scalar path reads counts for the
-                                                              // intercept↔child term. n_primary = primary level count (slope RE
-                                                              // stride); np = children per parent (nested width) — kept distinct.
+
+        // Composed nested children (rows/cols q..q+np). Scalar child λ = θ_n;
+        // child–child off-diagonals are 0 (children never co-occur). The
+        // primary↔child off-diagonal A[(q+c, e)] folds the raw cross-Gram
+        // (intercept = counts[child]; slope d = s_raw[(slope_col_d,
+        // child_re_col)]) through Λ_p, mirroring how the scalar path reads
+        // counts for the intercept↔child term. n_primary = primary level count
+        // (slope RE stride); np = children per parent (nested width) — kept
+        // distinct.
         for c in 0..np {
             // Nested child RE col = prim_width + f·np + c (prim_width = q_p·n_primary).
             let gcol = g.n_primary * g.primary_q + f * np + c;
@@ -2069,11 +2006,10 @@ fn assemble_fam_b(
 
 /// Forward-solve `L_f⁻¹B_f` in place on one family's `w` tail-coupling columns
 /// — axpy over contiguous `t_dim`-slices; per element the k-order subtractions
-/// and the final divide are unchanged from the old row-sweep (solved `k<r`
-/// values are final in both orders). Extracted alongside [`assemble_fam_b`].
-/// The divide is deliberately NOT hoisted into a reciprocal the way the sparse
-/// path's `schur_phase_b` does it — that is a ≤1-ulp change, and this path's
-/// values are pinned.
+/// and the final divide match a row sweep (solved `k<r` values are final in
+/// both orders). A divide per entry is correctly rounded; the sparse path's
+/// `schur_phase_b` multiplies by one reciprocal instead, a difference of at
+/// most 1 ulp, inside the dense-vs-sparse parity band.
 fn fam_forward_solve(bt_fam: &mut [f64], t_dim: usize, w: usize, fam_a: &[f64]) {
     for r in 0..w {
         let (done, rest) = bt_fam.split_at_mut(r * t_dim);
@@ -2116,8 +2052,7 @@ fn fam_forward_solve(bt_fam: &mut [f64], t_dim: usize, w: usize, fam_a: &[f64]) 
 /// deviance evaluation's work against the 50–300 the θ-search already spent.
 ///
 /// Caller contract: run AFTER the pin evaluation at θ̂ and after the β̂ backsolve
-/// and the standard-error block. `betas` must hold β̂; `fit.tail` (general path)
-/// or `fit.blocked_p` (crossed/nested-slopes path) must hold the state that
+/// and the standard-error block. `betas` must hold β̂; `fit.tail` must hold the state that
 /// evaluation left. Nothing on the fit path is read back afterwards, so this
 /// moves no reported estimate.
 pub(crate) fn recover_ranef(
@@ -2132,57 +2067,7 @@ pub(crate) fn recover_ranef(
         return;
     }
     fit.ranef_u[..k].fill(0.0);
-    fit.ranef_ok = if suff.groupings.extra_slopes_any {
-        recover_ranef_blocked(theta, suff, fit, betas)
-    } else {
-        recover_ranef_family(theta, suff, fit, betas)
-    };
-}
-
-/// Recovery on the crossed/nested-slopes blocked path. `fit.blocked_p` still
-/// holds the UNFACTORED penalized augmented matrix at θ̂ (`SeqLlt` builds a
-/// fresh factor rather than working in place), so one re-factorization hands
-/// back both halves at once: `L_ZZ` is its leading `k×k` block and `U` its
-/// `[X y]` rows, `U[a][j] = L[(k+j), a]`.
-fn recover_ranef_blocked(
-    theta: &[f64],
-    suff: &LmmSuffStats,
-    fit: &mut LmmFitScratch,
-    betas: &[f64],
-) -> bool {
-    let _ = theta; // Λ is reconstructed by the caller; only the factor is read here
-    let g = &suff.groupings;
-    let m = suff.m;
-    let p = m - 1;
-    let k = g.k_total;
-    let dim = k + m;
-    let pref = faer::MatRef::from_column_major_slice(&fit.blocked_p[..dim * dim], dim, dim);
-    let Some(chol) = crate::linalg::SeqLlt::new(pref) else {
-        return false;
-    };
-    let l = chol.L();
-    // rhs = U_y − U_X β̂, then one upper-triangular back-substitution against
-    // L_ZZᵀ over the whole RE-column set.
-    let u = &mut fit.ranef_u;
-    for a in 0..k {
-        let mut acc = l[(k + p, a)];
-        for j in 0..p {
-            acc -= l[(k + j, a)] * betas[j];
-        }
-        u[a] = acc;
-    }
-    for a in (0..k).rev() {
-        let mut acc = u[a];
-        for i in (a + 1)..k {
-            acc -= l[(i, a)] * u[i];
-        }
-        let laa = l[(a, a)];
-        if !(laa.is_finite() && laa > 0.0) {
-            return false;
-        }
-        u[a] = acc / laa;
-    }
-    true
+    fit.ranef_ok = recover_ranef_family(theta, suff, fit, betas);
 }
 
 /// Recovery on the family-blocked path (general dense AND balanced-collapse).
@@ -2248,17 +2133,10 @@ fn recover_ranef_family(
             }
             u_x[b] = acc;
         }
-        for b in (0..kx).rev() {
-            let mut acc = u_x[b];
-            for i in (b + 1)..kx {
-                acc -= l[(i, b)] * u_x[i];
-            }
-            let lbb = l[(b, b)];
-            if !(lbb.is_finite() && lbb > 0.0) {
-                return false;
-            }
-            u_x[b] = acc / lbb;
+        if (0..kx).any(|b| !(l[(b, b)].is_finite() && l[(b, b)] > 0.0)) {
+            return false;
         }
+        back_solve(l, kx, u_x);
         for (b, &v) in u_x.iter().enumerate() {
             fit.ranef_u[kf + b] = v;
         }
@@ -2309,13 +2187,7 @@ fn recover_ranef_family(
             }
             rhs[r] = acc;
         }
-        for r in (0..w).rev() {
-            let mut acc = rhs[r];
-            for (i, &solved) in rhs.iter().enumerate().take(w).skip(r + 1) {
-                acc -= fit.fam_a[i * w + r] * solved;
-            }
-            rhs[r] = acc / fit.fam_a[r * w + r];
-        }
+        fam_back_solve(&fit.fam_a, w, &mut rhs[..w]);
         // Scatter into the RE-column layout `from_cluster_spec_ext` defines:
         // primary component d at `d·n_primary + f`, nested child c at
         // `prim_width + f·n_per + c` — change together.
@@ -2329,6 +2201,20 @@ fn recover_ranef_family(
     true
 }
 
+/// The exact-fit floor `(k_total + m)·ε·C_yy` of r², `m` the width of
+/// `[X y]` and `C_yy = y′Wy` the last diagonal entry of its accumulated Gram.
+/// An exact fit (X spans y) leaves r² as pure round-off: the last pivot is the
+/// y–y entry minus the other squared entries of its row, so it is known only
+/// to about `dim·ε·C_yy` (`dim = k_total + m`), and its sign depends on the
+/// platform's rounding (native faer fails the factorization on a negative
+/// pivot; wasm32 gets a tiny positive one). r² at or below the floor is an
+/// exact fit. `reml_deviance`, `sparse_reml_deviance` and
+/// `LmmKernel::r_sq_floor` all read it, so `lmm_fit_with_retries`'s
+/// keep-lower test sees the floor the kernels refused at.
+pub(crate) fn exact_fit_floor(k_total: usize, m: usize, c_yy: f64) -> f64 {
+    (k_total + m) as f64 * f64::EPSILON * c_yy
+}
+
 /// Back-substitution `v ← L⁻ᵀv` against a family's row-major lower `w×w`
 /// factor (`fam_a` after `block_chol`).
 fn fam_back_solve(fam_a: &[f64], w: usize, v: &mut [f64]) {
@@ -2338,6 +2224,46 @@ fn fam_back_solve(fam_a: &[f64], w: usize, v: &mut [f64]) {
             acc -= fam_a[i * w + r] * v[i];
         }
         v[r] = acc / fam_a[r * w + r];
+    }
+}
+
+// The three triangular solves below do no pivot or finiteness check: each
+// caller keeps its own, before the call or on the result, because the failure
+// path differs between callers.
+
+/// `β̃` by the backward solve `L_XXᵀβ̃ = l_yX` on the augmented `[X y]` factor
+/// `f` (lower, the `y` row at index `p`), into `beta[..p]`.
+pub(crate) fn beta_backward(f: MatRef<'_, f64>, p: usize, beta: &mut [f64]) {
+    for j in (0..p).rev() {
+        let mut acc = f[(p, j)];
+        for k in (j + 1)..p {
+            acc -= f[(k, j)] * beta[k];
+        }
+        beta[j] = acc / f[(j, j)];
+    }
+}
+
+/// Forward solve `u ← L⁻¹u` in place, `L` the leading `p×p` lower block of
+/// `f`.
+pub(crate) fn forward_solve(f: MatRef<'_, f64>, p: usize, u: &mut [f64]) {
+    for i in 0..p {
+        let mut acc = u[i];
+        for k in 0..i {
+            acc -= f[(i, k)] * u[k];
+        }
+        u[i] = acc / f[(i, i)];
+    }
+}
+
+/// Back-substitution `v ← L⁻ᵀv` in place, `L` the leading `n×n` lower block
+/// of `l`.
+pub(crate) fn back_solve(l: MatRef<'_, f64>, n: usize, v: &mut [f64]) {
+    for b in (0..n).rev() {
+        let mut acc = v[b];
+        for i in (b + 1)..n {
+            acc -= l[(i, b)] * v[i];
+        }
+        v[b] = acc / l[(b, b)];
     }
 }
 
@@ -2414,13 +2340,7 @@ fn condvar_family(theta: &[f64], suff: &LmmSuffStats, tail: &[f64]) -> Option<Co
             for (b, vb) in v.iter_mut().enumerate() {
                 *vb = l[(kx + j, b)];
             }
-            for b in (0..kx).rev() {
-                let mut acc = v[b];
-                for i in (b + 1)..kx {
-                    acc -= l[(i, b)] * v[i];
-                }
-                v[b] = acc / l[(b, b)];
-            }
+            back_solve(l, kx, &mut v);
             for (b, &vb) in v.iter().enumerate() {
                 kc[b * p + j] = vb;
             }
@@ -2608,9 +2528,8 @@ pub struct LmmFit {
     pub boundary_hit: u8,
     /// Objective evaluations consumed (diagnostics only).
     pub n_eval: usize,
-    /// Observation-only evaluation counters for this fit. Gated because
-    /// `LmmFit` is re-exported `pub` under `loop_advanced`: with `counters`
-    /// off, that tier's surface must be unchanged.
+    /// Observation-only evaluation counters for this fit, present only under
+    /// the `counters` feature.
     #[cfg(feature = "counters")]
     pub counters: crate::counters::EvalCounters,
     /// Joint Wald-χ² over the target set (the shared `joint_wald_chi_sq` helper). Under
@@ -2622,7 +2541,8 @@ pub struct LmmFit {
     /// is reported as a point, not an accepted boundary, so it never sets
     /// this mask even though its near-zero diagonals are still numerically
     /// pinned for FP stability. u64 mask: over-envelope sparse designs can
-    /// exceed the 32-component NoZ ceiling (up to 64).
+    /// exceed the 32-component NoZ ceiling, up to
+    /// [`crate::consts::MAX_VARIANCE_COMPONENTS`].
     pub pinned_components: u64,
     /// Minimized profiled deviance of the kernel's criterion (REML or ML) at
     /// the accepted (or capped) θ̂ (the `reml_deviance` value after the pin
@@ -2650,6 +2570,10 @@ pub struct LmmFit {
     /// The REML deviance's rounding from the pivots of X̃′V⁻¹X̃
     /// ([`LmmKernel::pivot_noise`]) at θ̂; 0 under ML and without an endpoint.
     pub(crate) pivot_noise: f64,
+    /// Why the fit did not converge: `StopReason::NoEndPoint` on the NaN-fill
+    /// exit, `StopReason::SearchBudget` at a reported end point. `None`
+    /// when `converged`.
+    pub(crate) stop: Option<crate::fit::StopReason>,
 }
 
 /// Joint Wald-χ² statistic over the target set `T`,
@@ -2928,8 +2852,8 @@ fn warm_bobyqa<'a>(slot: &'a mut Option<Bobyqa>, config: &Config, n: usize) -> &
 /// `kernel` for the accumulated dataset: the dense kernel with the per-group
 /// regression route on. The condition [`LmmObjective::gradient`] and
 /// [`lmm_outer_optimizer`] test (the route admits `q_p ≥ 2` only, so its
-/// `n_θ ≥ 3` holds wherever this does); the Satterthwaite pass reads it to
-/// choose its derivative route.
+/// `n_θ ≥ 3` holds wherever this does); the tests read it to name the route.
+#[cfg(test)]
 pub(crate) fn per_group_gradient_armed(kernel: &LmmKernel) -> bool {
     matches!(kernel, LmmKernel::Dense { fit, .. } if fit.pg_n_active > 0)
 }
@@ -2970,8 +2894,9 @@ fn lmm_outer_optimizer(kernel: &LmmKernel, n_theta: usize) -> crate::optim::Oute
 /// per-scenario constant — determinism and chunk merging are unaffected. The
 /// DGP-derived hint is a deliberate, recorded exception to the
 /// generation↔estimation split. `exact` skips that floor: the start is a
-/// previous endpoint (the rescale rounds of `fit::lmm::lmm_fit_with_retries`),
-/// so the search starts at that endpoint's deviance.
+/// previous endpoint (the QR switch and the rescale rounds of
+/// `fit::lmm::lmm_fit_with_retries`), so the search starts at exactly that
+/// endpoint's θ̂.
 ///
 /// `map` is the column standardization the rows were accumulated under, and
 /// `units` the units of their response: β̂, `var_diag`, `t_sq` and the joint
@@ -3039,26 +2964,18 @@ pub fn fit_lmm(
         }
         None => {
             // Blind start: diagonals THETA0, off-diagonals 0 (the
-            // `blind_theta_and_bounds` shape, zero-alloc). The former
-            // all-THETA0 start put off-diagonal vech entries at 1.0 — off the
-            // lme4/MixedModels unit-diagonal convention — and on the wide-slope
-            // grid stratum that start funnels BOBYQA into a second-best optimum
-            // in 8/9 cells (regression goldens at
-            // validation/campaigns/speed-campaign/optima/ pin
-            // the correct optimum). Mirrors the GLMM joint seed
-            // (`glmm::fit_glmm`'s θ cold start), which carries the same rule.
-            for t in theta.iter_mut() {
-                *t = 0.0;
-            }
-            for &i in kernel.groupings().diagonal_theta() {
-                theta[i] = THETA0;
-            }
+            // `blind_theta_and_bounds` shape, zero-alloc), the lme4/MixedModels
+            // unit-diagonal convention. An all-THETA0 start funnels BOBYQA into
+            // a second-best optimum in 8/9 wide-slope grid cells (the goldens
+            // at validation/campaigns/speed-campaign/optima/ pin the correct
+            // optimum).
+            kernel.groupings().blind_theta(theta);
         }
     }
     // A start's structural entries are ignored: the search never moves them.
     kernel.groupings().zero_structural(theta);
     let mut counters = crate::counters::EvalCounters::new();
-    // mirrors the stage-1 read in glmm/mod.rs — change together.
+    // mirrors the stage-1 read in glmm/bobyqa_route.rs — change together.
     let mut finite_evals = 0usize;
     let (out, gradient_search_fallback, certified, grad_report) = search_theta(
         kernel,
@@ -3113,13 +3030,14 @@ pub fn fit_lmm(
     } else {
         f64::INFINITY
     };
-    // Incumbent check, the rule of `fit_glmm`'s (mirrors it — change
+    // Incumbent check, the rule of `glmm::pin::post_pin`'s (mirrors it — change
     // together). `PIN_THETA` is absolute on the internal θ, but under weights
     // spanning many orders a θ of 7e-5 is a real variance, and zeroing it
     // cost 281 log-likelihood units on a weight-power fit. A pin that leaves
     // the deviance non-finite or more than `PIN_DEVIANCE_SLACK` above the
     // search's best is undone, and the fit is reported at the search's
-    // endpoint.
+    // endpoint. The GLMM's floor under the slack also carries `ε·tr_x`
+    // (`PIN_NOISE_ULPS`); this one does not.
     let slack = PIN_DEVIANCE_SLACK.max(PIN_NOISE_ULPS * f64::EPSILON * out.f.abs());
     // False on a NaN deviance too.
     let kept = dev <= out.f + slack;
@@ -3138,14 +3056,7 @@ pub fn fit_lmm(
     // joint Wald below read.
     let mut pivot_noise = 0.0;
     if dev.is_finite() {
-        let factor = kernel.factor();
-        for j in (0..p).rev() {
-            let mut acc = factor[(p, j)];
-            for k in (j + 1)..p {
-                acc -= factor[(k, j)] * recovery.beta_tilde[k];
-            }
-            recovery.beta_tilde[j] = acc / factor[(j, j)];
-        }
+        beta_backward(kernel.factor(), p, &mut recovery.beta_tilde);
         pivot_noise = kernel.pivot_noise();
         kernel.map_factor_to_design();
     }
@@ -3166,8 +3077,7 @@ pub fn fit_lmm(
     //
     // `dev.is_finite()` still gates the measurement: a ModelDegenerate exit, or
     // a θ̂ whose deviance re-eval is non-finite, leaves no trustworthy factor.
-    // Those two remain the only NaN-fill conditions, and they are what they
-    // always were — no honest endpoint at all.
+    // Those two remain the only NaN-fill conditions: no honest endpoint at all.
     let (pivot, pivot_col) = if dev.is_finite() {
         crate::ols::min_pivot_ratio(kernel.factor(), p)
     } else {
@@ -3197,6 +3107,7 @@ pub fn fit_lmm(
             gradient_search_fallback,
             grad_report,
             pivot_noise: 0.0,
+            stop: Some(crate::fit::StopReason::NoEndPoint),
         };
     }
 
@@ -3219,17 +3130,10 @@ pub fn fit_lmm(
     let sigma_var = sigma_sq * units.var_scale();
     for &tj in target_indices {
         let tj = tj as usize;
-        for v in recovery.u[..p].iter_mut() {
-            *v = 0.0;
+        for (i, v) in recovery.u[..p].iter_mut().enumerate() {
+            *v = map.rhs(tj, i);
         }
-        for i in 0..p {
-            let b_i = map.rhs(tj, i);
-            let mut acc = b_i;
-            for k in 0..i {
-                acc -= factor[(i, k)] * recovery.u[k];
-            }
-            recovery.u[i] = acc / factor[(i, i)];
-        }
+        forward_solve(factor, p, &mut recovery.u);
         let norm_sq: f64 = recovery.u[..p].iter().map(|v| v * v).sum();
         for i in 0..p {
             recovery.joint_cols[(i, tj)] = recovery.u[i];
@@ -3274,6 +3178,7 @@ pub fn fit_lmm(
         gradient_search_fallback,
         grad_report,
         pivot_noise,
+        stop: (!converged).then_some(crate::fit::StopReason::SearchBudget),
     }
 }
 

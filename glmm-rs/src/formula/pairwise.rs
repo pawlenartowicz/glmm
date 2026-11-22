@@ -17,7 +17,7 @@ use super::materialize::{new_fixed_design, Column, Lowered, Model, Table};
 use super::parse::parse;
 use super::Error;
 use crate::inference::contrast::{
-    contrast_t_of, robust_t_of, ContrastError, ContrastT, DfSource, NoDfReason,
+    contrast_t_with, robust_t_of, ContrastError, ContrastT, DfSource, Inputs, NoDfReason,
 };
 use crate::inference::tails::{
     chisq_upper_p, normal_quantile, t_quantile, tukey_quantile, tukey_upper_p,
@@ -84,6 +84,10 @@ pub struct Pairwise {
     /// One row per pair of levels `i < j` in the factor's level order,
     /// within each `by` level in its order.
     pub rows: Vec<PairwiseRow>,
+    /// One entry per `by` family, in row order: the family size its
+    /// adjustment used, Tukey's `k` (the levels with an estimable mean),
+    /// otherwise the family's rows with a p-value.
+    pub family_sizes: Vec<usize>,
     /// The factor's number of levels: each `by` family holds
     /// `levels·(levels − 1)/2` rows.
     pub(crate) levels: usize,
@@ -137,6 +141,10 @@ pub struct PairwiseIntervals {
     pub adjust: Adjust,
     /// One interval per row of [`Pairwise::rows`], in its order.
     pub rows: Vec<PairwiseInterval>,
+    /// One entry per `by` family, in row order: the family size the
+    /// intervals' adjustment used, Tukey's `k` (the levels with an estimable
+    /// mean), otherwise the family's rows with a p-value.
+    pub family_sizes: Vec<usize>,
 }
 
 /// The confidence interval of one comparison.
@@ -192,9 +200,11 @@ impl Pairwise {
         let family = (k * k.saturating_sub(1) / 2).max(1);
         let mut tukey: Option<(f64, f64, f64)> = None;
         let mut rows = Vec::with_capacity(self.rows.len());
+        let mut family_sizes = Vec::new();
         for chunk in self.rows.chunks(family) {
             let m = chunk.iter().filter(|r| !r.p_value.is_nan()).count() as f64;
             let k_tested = tukey_k(chunk.iter().map(|r| r.p_value), k);
+            family_sizes.push(if adjust == Adjust::Tukey { k_tested } else { m } as usize);
             for row in chunk {
                 let crit = match adjust {
                     Adjust::Tukey if k_tested < 2.0 => f64::NAN,
@@ -227,6 +237,7 @@ impl Pairwise {
             level,
             adjust,
             rows,
+            family_sizes,
         })
     }
 }
@@ -251,6 +262,11 @@ pub(crate) struct CellLabels {
     pub(crate) by: Option<Vec<String>>,
 }
 
+/// Most entries (rows × design columns) of the reference grid's dense
+/// design, 256 MiB of `f64`: the design is built only to be averaged per
+/// cell, so a larger one costs memory with nothing to gain from it.
+const MAX_GRID_ENTRIES: usize = 1 << 25;
+
 const FACTOR: &str = "a factor of the fixed part";
 const VALUES: &str = "a numeric variable with chosen values";
 
@@ -264,7 +280,9 @@ const VALUES: &str = "a numeric variable with chosen values";
 /// `factor`, a numeric [`By::Levels`] or a factor [`By::Values`];
 /// [`Error::Fit`] with [`FitError::OptionValue`] when `by` names `factor`;
 /// and the lowering errors of a grid row ([`Error::TransformNotFinite`] for a
-/// transform that is not finite at the mean).
+/// transform that is not finite at the mean); [`Error::Fit`] with
+/// [`FitError::Envelope`] when the reference grid's rows times the design
+/// width pass 2^25 entries.
 pub fn pairwise(
     model: &Model,
     factor: &str,
@@ -310,6 +328,7 @@ pub(crate) fn pairwise_of(
         &lowered.numeric_means,
         factor,
         by,
+        lowered.p,
     )?;
     // The fixed design alone: the grid holds no grouping column, though a
     // fixed factor may also name a grouping (`(1 | Block/Variety)`).
@@ -330,6 +349,8 @@ pub(crate) fn pairwise_of(
         })
         .collect();
     let ratio = ratio_kind(lowered.spec().family);
+    let (rows, family_sizes) =
+        pairwise_rows(beta, vcov, aliased, df, &cells, &labels, ratio, adjust);
     Ok(Pairwise {
         factor: factor.to_string(),
         by: by.map(|b| match b {
@@ -337,7 +358,8 @@ pub(crate) fn pairwise_of(
         }),
         adjust,
         ratio,
-        rows: pairwise_rows(beta, vcov, aliased, df, &cells, &labels, ratio, adjust),
+        rows,
+        family_sizes,
         levels: labels.levels.len(),
     })
 }
@@ -391,12 +413,15 @@ fn ratio_kind(family: Family) -> Option<RatioKind> {
 /// ([`CellLabels`]).
 ///
 /// # Errors
-/// The refusals of [`pairwise`] on `factor` and `by`.
+/// The refusals of [`pairwise`] on `factor` and `by`, and
+/// [`FitError::Envelope`] when the grid's rows times `p`, the design's
+/// width, pass [`MAX_GRID_ENTRIES`], before anything is allocated.
 pub(crate) fn reference_grid(
     levels: &[(String, Vec<String>)],
     means: &[(String, f64)],
     factor: &str,
     by: Option<By<'_>>,
+    p: usize,
 ) -> Result<(Table, Vec<Vec<usize>>, CellLabels), Error> {
     let levels_of = |name: &str| levels.iter().find(|(n, _)| n == name).map(|(_, l)| l);
     let is_numeric = |name: &str| means.iter().any(|(n, _)| n == name);
@@ -437,7 +462,23 @@ pub(crate) fn reference_grid(
         .iter()
         .filter(|(n, _)| n != factor && Some(n.as_str()) != by_name)
         .collect();
-    let n = k * nb * others.iter().map(|(_, l)| l.len()).product::<usize>();
+    let n = [k, nb]
+        .into_iter()
+        .chain(others.iter().map(|(_, l)| l.len()))
+        .try_fold(1usize, usize::checked_mul);
+    let n = match n.filter(|n| n.checked_mul(p).is_some_and(|e| e <= MAX_GRID_ENTRIES)) {
+        Some(n) => n,
+        None => {
+            let rows = n.map_or_else(|| "more than usize::MAX".to_string(), |n| n.to_string());
+            return Err(Error::Fit(FitError::Envelope(
+                format!(
+                    "the reference grid of {factor:?} has {rows} rows of {p} design columns, \
+                     past the limit of 2^25 entries; compare within one variable with by"
+                )
+                .into(),
+            )));
+        }
+    };
     let factor_column = |levels: &[String], code: &dyn Fn(usize) -> usize| Column::Factor {
         levels: levels.to_vec(),
         codes: (0..n).map(|r| code(r) as u32).collect(),
@@ -491,7 +532,8 @@ fn t_row(t: ContrastT) -> Test {
 /// [`NoDfReason::NotGaussianMixed`] takes the z test from `beta` and `vcov`,
 /// any other reason gives rows with NaN df, statistic and p-values and
 /// [`LinearNote::NoDf`]; or a robust fit's pieces, which give each row the
-/// robust t of [`crate::Fit::contrast_t`].
+/// robust t of [`crate::Fit::contrast_t`]. Also each family's size, as
+/// [`Pairwise::family_sizes`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn pairwise_rows(
     beta: &[f64],
@@ -502,13 +544,16 @@ pub(crate) fn pairwise_rows(
     labels: &CellLabels,
     ratio: Option<RatioKind>,
     adjust: Adjust,
-) -> Vec<PairwiseRow> {
+) -> (Vec<PairwiseRow>, Vec<usize>) {
     let k = labels.levels.len();
     let families: Vec<Option<&String>> = match &labels.by {
         None => vec![None],
         Some(by) => by.iter().map(Some).collect(),
     };
     let mut out = Vec::new();
+    let mut sizes = Vec::new();
+    // Built at the first model-df pair, then shared by every pair.
+    let mut model: Option<Inputs<'_>> = None;
     for (b, by_level) in families.into_iter().enumerate() {
         let start = out.len();
         for i in 0..k {
@@ -519,7 +564,10 @@ pub(crate) fn pairwise_rows(
                     .map(|(u, v)| u - v)
                     .collect();
                 let row = match &df {
-                    DfSource::Model(Ok(st)) => t_row(contrast_t_of(beta, st, &l)),
+                    DfSource::Model(Ok(st)) => t_row(contrast_t_with(
+                        model.get_or_insert_with(|| Inputs::new(beta, st)),
+                        &l,
+                    )),
                     DfSource::Robust(r) => t_row(robust_t_of(beta, r, &l)),
                     &DfSource::Model(Err(reason)) => {
                         let mut z = z_test(beta, vcov, aliased, &l);
@@ -556,6 +604,7 @@ pub(crate) fn pairwise_rows(
         }
         if adjust == Adjust::Tukey {
             let k_tested = tukey_k(out[start..].iter().map(|r| r.p_value), k);
+            sizes.push(k_tested as usize);
             for row in &mut out[start..] {
                 let q = std::f64::consts::SQRT_2 * row.statistic.abs();
                 row.p_adjusted = if k_tested >= 2.0 {
@@ -566,12 +615,14 @@ pub(crate) fn pairwise_rows(
             }
         } else {
             let p: Vec<f64> = out[start..].iter().map(|r| r.p_value).collect();
-            for (row, q) in out[start..].iter_mut().zip(adjust_p(&p, adjust)) {
+            let (adjusted, m) = adjust_p(&p, adjust);
+            sizes.push(m);
+            for (row, q) in out[start..].iter_mut().zip(adjusted) {
                 row.p_adjusted = q;
             }
         }
     }
-    out
+    (out, sizes)
 }
 
 /// Tukey's `k` of one `by` family: the levels with an estimable mean, those
@@ -637,11 +688,12 @@ fn z_test(beta: &[f64], vcov: &[Vec<f64>], aliased: &[bool], l: &[f64]) -> Test 
     }
 }
 
-/// `p` adjusted by `adjust` as one family, R's `p.adjust`: NaN entries stay
-/// NaN and the family size `m` counts the others.
-fn adjust_p(p: &[f64], adjust: Adjust) -> Vec<f64> {
+/// `p` adjusted by `adjust` as one family, R's `p.adjust`, and the family
+/// size `m`: NaN entries stay NaN and `m` counts the others.
+fn adjust_p(p: &[f64], adjust: Adjust) -> (Vec<f64>, usize) {
     let tested: Vec<usize> = (0..p.len()).filter(|&i| !p[i].is_nan()).collect();
-    let m = tested.len() as f64;
+    let size = tested.len();
+    let m = size as f64;
     let mut out = p.to_vec();
     match adjust {
         Adjust::None => {}
@@ -664,7 +716,7 @@ fn adjust_p(p: &[f64], adjust: Adjust) -> Vec<f64> {
         }
         Adjust::Tukey => unreachable!("Tukey reads each row's df and statistic, in pairwise_rows"),
     }
-    out
+    (out, size)
 }
 
 #[cfg(test)]

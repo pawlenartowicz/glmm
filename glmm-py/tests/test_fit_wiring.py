@@ -253,7 +253,7 @@ def test_pinned_detail_is_reported_on_a_sparse_route_fit():
 
     assert result.singular
     assert result.diagnostics["pinned"] == [[True], [False, False]]
-    # One flag per stddev, per block — the alignment `_pinned_detail` walks.
+    # One flag per stddev, per block — the alignment glmm-bind's `singular_message` walks.
     for idx, flags in enumerate(result.diagnostics["pinned"]):
         sd, _ = result.stddev_corr(idx)
         assert len(flags) == len(sd)

@@ -24,7 +24,7 @@ jobs:
   # ── fmt + clippy + the regex-free-kernel guard, on the pinned toolchain ───
   # Rust is pinned like wasmtime and ruff below, so a new release cannot break
   # CI mid-release. Move the pin on purpose and fix what the new clippy flags.
-  # Split out from the #[test] suite so the four feature-variant test runs can
+  # Split out from the #[test] suite so the six feature-variant test runs can
   # go wide in a matrix (below) instead of recompiling serially behind clippy.
   lint:
     name: lint
@@ -55,8 +55,8 @@ jobs:
           cargo clippy -p validation --example loop_bench --features loop_advanced
           cargo clippy -p validation --example loop_bench --features "loop_advanced os_counters"
       - name: guard — the default-off kernel links no regex
-        # `formula` is on by default (semver-covered surface), so the kernel's
-        # regex-free property is no longer structural — this assertion IS the
+        # `formula` is on by default (semver-covered surface), so nothing
+        # structural keeps the kernel regex-free; this assertion IS the
         # guarantee.
         run: |
           if cargo tree -e normal -p glmm --no-default-features | grep -q regex; then
@@ -66,7 +66,7 @@ jobs:
           fi
           echo "Kernel is regex-free with default features off."
 
-  # ── the full #[test] suite across all four feature configs, in parallel ───
+  # ── the full #[test] suite across all six feature configs, in parallel ────
   test:
     name: test
     runs-on: ubuntu-latest
@@ -95,7 +95,7 @@ jobs:
         #                    and cfg'd out entirely without the feature, so no
         #                    other leg even compiles this code; fit output is
         #                    pinned bit-identical with the feature on.
-        #   orchestrate    — string-typed fit orchestration shared by the FFI
+        #   orchestrate    — typed fit orchestration shared by the FFI
         #                    ports, off by default; not exercised by any other
         #                    leg, so its own tests need this one.
         include:
@@ -326,16 +326,26 @@ jobs:
         run: pip install --find-links glmm-py/dist glmm
       - name: Install test + lint deps
         # ruff pinned so a new release's rule/formatter changes can't break CI
-        # mid-release (0.16.0 did exactly that); bump deliberately. pandas,
+        # mid-release; bump deliberately. pandas,
         # pyarrow and polars are not package dependencies — they are installed
         # here only so the pandas-categorical `.cat`-accessor branch, the
         # pyarrow Table/ChunkedArray branches and the polars tests run under
         # test instead of skipping themselves.
         run: pip install pytest pandas pyarrow polars ruff==0.16.0
       - name: pytest against the installed wheel, run outside the source tree
+        shell: bash
         run: |
           cd "$RUNNER_TEMP"
-          python -m pytest "$GITHUB_WORKSPACE/glmm-py/tests" -v
+          python -m pytest "$GITHUB_WORKSPACE/glmm-py/tests" -v -rs | tee pytest.log
+          # A test that skips itself (a pytest.importorskip whose package is
+          # missing) is a test that did not run, so a skip fails the step, as in
+          # the R job. Copied into release.yml's two suite steps -- change
+          # together.
+          if tail -n 1 pytest.log | grep -qE '[0-9]+ skipped'; then
+            echo "::error::pytest skipped tests -- a test dependency is missing"
+            grep '^SKIPPED' pytest.log || true
+            exit 1
+          fi
       - name: ruff check
         run: ruff check glmm-py/
       - name: ruff format --check
@@ -349,7 +359,7 @@ jobs:
   # transposed — which is exactly the class of bug no single-language test can
   # see.
   #
-  # It runs the accuracy grid's `fast` subset (117 cells) through all three, then
+  # It runs the accuracy grid's `fast` subset (116 cells) through all three, then
   # compares with the grid's own comparator. No statistics package is installed:
   # --ports-only skips every oracle lookup, and jsonlite and Rcpp (compiler
   # glue, not a statistics engine) are the only R dependencies it has.

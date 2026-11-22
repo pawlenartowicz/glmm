@@ -253,7 +253,7 @@ fn nan_coefficient_contributes_zero() {
     let mut ws = crate::fit::build_workspace(&model, &GroupIds::default(), n, p, &opts);
     ws.set_prestandardized(true);
     let data = Data::new(&x, &y, n, p);
-    let view = crate::fit::fit_on(&mut ws, &data, None, &opts);
+    let view = crate::fit::fit_on(&mut ws, &data, None, &opts).unwrap();
     let fit = view.into_fit(&data, &model, &opts);
     assert!(fit.beta[3].is_nan() && fit.beta[..3].iter().all(|b| b.is_finite()));
     let new = Design::new(&x, n, p);
@@ -1198,4 +1198,13 @@ mod montecarlo {
         }
         assert_eq!(checked, 12);
     }
+}
+
+/// A quantile below the smallest subnormal ends the bisection: on a step CDF
+/// (0 at 0, 1 above it) the median's bracket shrinks to `[0, 5e-324]`, whose
+/// midpoint rounds to 0, and the bound is 0.
+#[test]
+fn a_quantile_below_the_subnormals_returns_zero() {
+    let step = |y: f64| if y > 0.0 { 1.0 } else { 0.0 };
+    assert_eq!(continuous_quantile(&step, 0.5, 1.0), 0.0);
 }

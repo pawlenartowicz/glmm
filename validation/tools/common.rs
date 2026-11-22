@@ -3,81 +3,24 @@
 //! and the speed campaign's `fit.rs` and `agq_par_probe.rs`.
 //! Included via `#[path = ...]` rather than a library module — every example here is
 //! dev-only, so this stays a plain shared source file rather than adding a crate for
-//! four consumers. `validation/grid/engines/common.rs` is a separate file for the
-//! accuracy grid's per-cell manifest shape; neither is a drop-in for the other.
+//! four consumers. The CSV reader, `build_table`, `num`/`nums`, `rx_options` and
+//! `lower_dataset_generic` are the accuracy grid's own, from
+//! `grid/engines/common.rs`; this file adds the readers of the per-rung manifest
+//! (`validation/manifest.json`) and of the speed campaign's cells.
 
-use glmm::formula::{lower, Column, Lowered, Table};
-use glmm::{BinomialLink, Family, FitOptions, GammaLink, NegBinomialLink, PoissonLink, WaldSe};
-use serde_json::{json, Value};
+use glmm::formula::{Lowered, Table};
+use glmm::{BinomialLink, Family, GammaLink, NegBinomialLink, PoissonLink};
+use serde_json::Value;
 
-/// Read a validation CSV at an explicit path (unquoted header + rows, `,`-split).
-/// The grid corpus has no empirical/simulated split, only a flat `grid/` dir
-/// keyed by `case_id`, so the path is the only thing that varies.
-pub fn read_csv_path(path: &str) -> (Vec<String>, Vec<Vec<String>>) {
-    let raw = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read csv {path}: {e}"));
-    let mut lines = raw.lines().filter(|l| !l.trim().is_empty());
-    let header = lines.next().unwrap().split(',').map(unquote).collect();
-    let rows = lines.map(|l| l.split(',').map(unquote).collect()).collect();
-    (header, rows)
-}
-
-pub fn unquote(s: &str) -> String {
-    s.trim().trim_matches('"').to_string()
-}
-
-/// A `Table` built by column NAME: manifest `factors` become `Column::Factor`,
-/// everything else `Column::Numeric` — except a column that fails to parse as
-/// `f64` anywhere (e.g. Pastes' `sample`, a categorical helper column the validation
-/// corpus carries but no jl_formula references) falls back to `Column::Factor`
-/// rather than panicking, since it may be present in the CSV without being
-/// referenced by the formula at all.
-pub fn build_table(header: &[String], rows: &[Vec<String>], factors: &[String]) -> Table {
-    let n = rows.len();
-    let columns = header
-        .iter()
-        .enumerate()
-        .map(|(j, name)| {
-            let is_factor = factors.iter().any(|f| f == name)
-                || rows.iter().any(|r| r[j].parse::<f64>().is_err());
-            let col = if is_factor {
-                // A CSV column carries no declared level order, so the
-                // lexicographic default is the whole of what the oracle can
-                // know — and it is what R's own `factor()` did on the reference
-                // side when the golden was frozen.
-                let labels: Vec<String> = rows.iter().map(|r| r[j].clone()).collect();
-                Column::factor_from_labels(&labels)
-            } else {
-                Column::Numeric(rows.iter().map(|r| r[j].parse().unwrap()).collect())
-            };
-            // R-origin CSV headers can carry dots (Arabidopsis's `total.fruits`)
-            // that validation/manifest.json's jl_formula field already writes with
-            // underscores, because Julia's @formula reader can't parse a dot as
-            // part of an identifier. Rename here so the Table's column names
-            // match jl_formula's (already-underscored) reference.
-            (name.replace('.', "_"), col)
-        })
-        .collect();
-    Table { columns, n }
-}
-
-/// NaN/Inf → JSON null (serde_json cannot serialize non-finite floats, and a
-/// non-converged fit leaves NaN-filled estimates) so an unconverged run still
-/// writes valid JSON the comparators read as "missing", not a crash. Used by
-/// every driver that emits comparison JSON — allow(dead_code) because
-/// `memory_fit` includes this file without calling either (it prints one
-/// status line, never a result record).
+// Relative to this file's directory, whichever example includes it. The grid
+// engine's own helpers (its record builder, cell loop) are unused here.
 #[allow(dead_code)]
-pub fn num(x: f64) -> Value {
-    if x.is_finite() {
-        json!(x)
-    } else {
-        Value::Null
-    }
-}
-#[allow(dead_code)]
-pub fn nums(xs: &[f64]) -> Value {
-    Value::Array(xs.iter().map(|&x| num(x)).collect())
-}
+#[path = "../grid/engines/common.rs"]
+mod grid_common;
+#[allow(unused_imports)]
+pub use grid_common::{
+    build_table, lower_dataset_generic, num, nums, read_csv_path, rx_options, unquote,
+};
 
 /// Load a grid cell's CSV → lower. Returns the lowered inputs, whether the
 /// family is Gaussian, and the cell's pre-registered eval cap. `data_dir` holds
@@ -123,57 +66,19 @@ pub fn lower_grid_cell(cell: &Value, data_dir: &str) -> (Lowered, bool, usize) {
     };
     // aggregated binomial reuses the tier-0 lowering (weights/prop/expansion);
     // the grid driver does not time lowering, so the Table is dropped here.
-    let (lo, _table) = lower_dataset_generic(cell, &header, &rows, &factors, formula, family);
+    let (lo, _table) = lower_dataset_generic(
+        cell,
+        &header,
+        &rows,
+        &factors,
+        formula,
+        family,
+        // The speed campaign's manifests name no response; their aggregated
+        // binomial column is `incidence`, as `lower_rung` assumes.
+        Some(cell["response"].as_str().unwrap_or("incidence")),
+    );
     let max_fun = cell["max_fun"].as_u64().unwrap_or(0) as usize;
     (lo, matches!(family, Family::Gaussian), max_fun)
-}
-
-/// Build the lowered fit inputs for one manifest entry (dataset or grid cell).
-/// Handles the one genuinely data-shape-dependent branch in the corpus: an
-/// aggregated-binomial rung (manifest `weights` field) synthesizes `prop =
-/// incidence/weights_col` so jl_formula's `prop ~ ...`
-/// response resolves, then passes `Some(sizes)` into `Lowered::weights`,
-/// one row per aggregate observation — every RE shape honors prior weights,
-/// AGQ included, so no dense-vs-sparse split or per-trial Bernoulli expansion
-/// is needed to keep the two argmins in agreement.
-///
-/// Returns the built `Table` alongside the `Lowered`, so a caller that wants to
-/// TIME the lowering (construction-inclusive timing, matching how lme4 /
-/// MixedModels / the Python port measure `formula+data -> model -> fit`) can
-/// re-run `lower(formula, &table, family)` in a loop without re-parsing the CSV.
-/// The Table is the typed-columns analogue of an lme4/Julia DataFrame — built
-/// once, then lowered repeatedly.
-pub fn lower_dataset_generic(
-    spec: &Value,
-    header: &[String],
-    rows: &[Vec<String>],
-    factors: &[String],
-    formula_str: &str,
-    family: Family,
-) -> (Lowered, Table) {
-    let Some(w_name) = spec["weights"].as_str() else {
-        let table = build_table(header, rows, factors);
-        let lo = lower(formula_str, &table, family).unwrap_or_else(|e| panic!("lower: {e}"));
-        return (lo, table);
-    };
-
-    let w_idx = header
-        .iter()
-        .position(|h| h == w_name)
-        .expect("weights column in header");
-    let inc_idx = header
-        .iter()
-        .position(|h| h == "incidence")
-        .expect("incidence column in header");
-    let sizes: Vec<f64> = rows.iter().map(|r| r[w_idx].parse().unwrap()).collect();
-    let incid: Vec<f64> = rows.iter().map(|r| r[inc_idx].parse().unwrap()).collect();
-    let prop: Vec<f64> = incid.iter().zip(&sizes).map(|(i, s)| i / s).collect();
-
-    let mut table = build_table(header, rows, factors);
-    table.columns.push(("prop".into(), Column::Numeric(prop)));
-    let mut lo = lower(formula_str, &table, family).unwrap_or_else(|e| panic!("lower: {e}"));
-    lo.weights = Some(sizes);
-    (lo, table)
 }
 
 /// Load one manifest rung's CSV, build its formula string and `Family` from the manifest
@@ -239,7 +144,7 @@ pub fn lower_rung(spec: &Value, manifest_dir: &str) -> (Lowered, Table, Family, 
     // (checked: only cake's RE term), so a global replace is safe and generic.
     let formula_str = formula_str.replace(" & ", ":");
     // Julia's @formula requires an explicit `1` intercept term; this crate's
-    // parser (mirroring MCPower's) treats the intercept as always-implicit and
+    // parser treats the intercept as always-implicit and
     // has no term for a literal `1`, so strip it — every jl_formula in the
     // manifest writes it as the fixed side's leading term, `"<dep> ~ 1 + ..."`.
     let formula_str = formula_str.replacen(" ~ 1 + ", " ~ ", 1);
@@ -273,8 +178,17 @@ pub fn lower_rung(spec: &Value, manifest_dir: &str) -> (Lowered, Table, Family, 
         other => panic!("unsupported family: {other}"),
     };
 
-    let (mut lo, table) =
-        lower_dataset_generic(spec, &header, &rows, &factors, &formula_str, family);
+    // The rungs' aggregated-binomial response is always `incidence`; the per-rung
+    // manifest carries no `response` field.
+    let (mut lo, table) = lower_dataset_generic(
+        spec,
+        &header,
+        &rows,
+        &factors,
+        &formula_str,
+        family,
+        Some("incidence"),
+    );
     // `weights_col`: plain per-row prior weights read off the named CSV column
     // (every weights-suite rung except the aggregated-binomial ones, which use
     // the `weights` field lower_dataset_generic already routes -- the two are
@@ -301,18 +215,6 @@ pub fn lower_rung(spec: &Value, manifest_dir: &str) -> (Lowered, Table, Family, 
     }
 
     (lo, table, family, formula_str)
-}
-
-/// The `WaldSe::Rx` twin of a rung's fit options, for the GLMM SE
-/// comparison `bit_identity/dump.rs` emits. Every
-/// field that shapes the fit is carried over, NOT defaulted: `nagq` is 1 on a
-/// normal run, but on an AGQ pass a defaulted twin would silently run the Rx
-/// arm at Laplace while the Hessian arm ran quadrature.
-#[allow(dead_code)]
-pub fn rx_options(opts: &FitOptions) -> FitOptions {
-    let mut o = opts.clone();
-    o.wald_se = WaldSe::Rx;
-    o
 }
 
 /// Manifest's per-rung AGQ order (`spec["agq"]`), present only on rungs glmm's

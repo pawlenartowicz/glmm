@@ -56,6 +56,11 @@ use super::{
 ///   2`, "no optimum"), and `has_negligible_component` is checked only when
 ///   materializing a converged `Fit`, so singularity is not assessed at all on
 ///   a non-converged one.
+/// - [`Note::NbShapeUnsettled`]: the GLM-NB alternation decides it on the
+///   assembled `Fit`, after any view, and the `Prebuilt` arm does not read it
+///   back.
+/// - [`Note::SatterthwaiteCurvature`]: the inference pass decides it after the
+///   view.
 #[derive(Clone, Copy)]
 pub struct FitDiagnostics {
     /// Whether the fit reached its convergence criterion.
@@ -64,7 +69,8 @@ pub struct FitDiagnostics {
     /// **Meaningless on OLS/GLM and on the GLM-NB route** (no θ): 0, on GLM-NB
     /// back-derived from its `Fit::singular`.
     pub boundary_hit: u8,
-    /// Bitmask of θ components pinned to the boundary, `diagonal_theta` order.
+    /// Bitmask of θ components pinned to the boundary, `diagonal_theta` order;
+    /// a model has at most 64.
     /// `FitView::diagnostics` reports it in the caller's declaration order, as
     /// `FitView::theta`.
     /// **Meaningless on OLS/GLM and on the GLM-NB route** (no θ): always 0.
@@ -138,6 +144,19 @@ pub struct FitDiagnostics {
     /// decrease left; the certificate accepts an endpoint below 1e-8. NaN on
     /// every fit that ran no gradient search.
     pub outer_decrement: f64,
+    /// LMM and GLMM: a θ entry of a fit with an endpoint ended on the upper
+    /// limit of its search box — see [`crate::Note::VarianceAtLimit`].
+    /// `false` on OLS and GLM routes.
+    pub theta_at_limit: bool,
+    /// Negative-binomial GLM and GLMM: the shape ended on a limit of its
+    /// search range — see [`crate::Note::NbShapeAtLimit`], which carries the
+    /// limit. `false` on every other family.
+    pub nb_shape_at_limit: bool,
+    /// Gamma GLMM: the dispersion ended on a limit of its search — see
+    /// [`crate::Note::DispersionAtLimit`]. `false` on every other route.
+    pub dispersion_at_limit: bool,
+    /// Why the fit did not converge; `None` exactly when `converged`.
+    pub(crate) stop: Option<StopReason>,
 }
 
 /// Why a gradient (BFGS) outer search stopped, as [`Diagnostics::outer_stop`]
@@ -178,6 +197,24 @@ impl From<crate::optim::bfgs::BfgsStop> for OuterStop {
     }
 }
 
+/// Why a fit did not converge, recorded at the kernel exit that stopped it.
+/// `pub` only through the unstable `orchestrate` re-export; `glmm-bind`'s
+/// `notes::failure` words one severe warning per variant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StopReason {
+    /// The variance search used its evaluation budget, or stopped short of
+    /// its criterion, at a finite end point; the estimates are that point's.
+    SearchBudget,
+    /// The variance search ended with no finite end point: every estimate is
+    /// NaN.
+    NoEndPoint,
+    /// The IRLS steps stopped without converging after a step was taken (or
+    /// at the start the link could not evaluate), as on separation.
+    IrlsDiverged,
+    /// The first solve failed and no step was taken: every coefficient is NaN.
+    FirstSolveFailed,
+}
+
 impl FitDiagnostics {
     /// The no-θ, no-detection carrier: `converged` and nothing else. OLS and GLM
     /// build on this (GLM adds its pivot), and it is what every "this route has
@@ -201,6 +238,10 @@ impl FitDiagnostics {
             n_grad: 0,
             outer_stop: None,
             outer_decrement: f64::NAN,
+            theta_at_limit: false,
+            nb_shape_at_limit: false,
+            dispersion_at_limit: false,
+            stop: None,
         }
     }
 }
@@ -251,8 +292,14 @@ pub(super) fn materialize_diagnostics(
     if d.separated {
         notes.push(Note::Separated);
     }
+    debug_assert_eq!(
+        d.converged,
+        d.stop.is_none(),
+        "a fit records a stop reason exactly when it did not converge"
+    );
     Diagnostics {
         converged: d.converged,
+        stop: d.stop,
         // `boundary_hit == 1` is the optimizer's own pin decision; the two
         // mixed mappers OR the post-hoc negligible-component check on top of
         // this, which is why `singular` is not simply `boundary == AtBoundary`.
@@ -295,9 +342,10 @@ pub(super) fn at_theta_limit(t: f64) -> bool {
 /// which the box applies to: `units` is 1 except on a Gamma inverse-link GLMM
 /// searched on rescaled data (`GlmmWorkspace::search_units`). The two mixed
 /// view mappers call this on a fit with a finite endpoint, after
-/// [`materialize_diagnostics`].
+/// [`materialize_diagnostics`], and the two views set
+/// [`FitDiagnostics::theta_at_limit`] from [`theta_at_limit`].
 pub(super) fn note_theta_at_limit(diagnostics: &mut Diagnostics, theta: &[f64], units: f64) {
-    if theta.iter().any(|t| at_theta_limit(units * t)) {
+    if theta_at_limit(theta, units) {
         diagnostics.notes.push(Note::VarianceAtLimit);
         if diagnostics.boundary == Boundary::Interior {
             diagnostics.boundary = Boundary::UpperLimit;
@@ -305,17 +353,29 @@ pub(super) fn note_theta_at_limit(diagnostics: &mut Diagnostics, theta: &[f64], 
     }
 }
 
-/// Flag a negative-binomial shape on a limit of its search range: θ̂ within
-/// 1e-6 of [`NB_THETA_LO`] or [`NB_THETA_HI`] on the log scale
-/// (the relative tolerance of [`note_theta_at_limit`]) pushes
-/// [`Note::NbShapeAtLimit`] carrying that limit. A NaN θ matches neither.
+/// Whether some kernel θ entry, in the units the search ran in (`units·θ`),
+/// is on the upper limit of its search box ([`at_theta_limit`]).
+pub(super) fn theta_at_limit(theta: &[f64], units: f64) -> bool {
+    theta.iter().any(|t| at_theta_limit(units * t))
+}
+
+/// The limit of the negative-binomial shape's search range θ̂ ended on: θ̂
+/// within 1e-6 of [`NB_THETA_LO`] or [`NB_THETA_HI`] on the log scale (the
+/// relative tolerance of [`note_theta_at_limit`]). A NaN θ matches neither.
+pub(super) fn nb_shape_limit(theta: f64) -> Option<f64> {
+    [NB_THETA_LO, NB_THETA_HI]
+        .into_iter()
+        .find(|limit| (theta.ln() - limit.ln()).abs() <= 1e-6)
+}
+
+/// Flag a negative-binomial shape on a limit of its search range
+/// ([`nb_shape_limit`]): pushes [`Note::NbShapeAtLimit`] carrying that limit.
 /// Called by the NB GLM on a converged fit and by the GLMM view mapper on an
-/// NB fit with a finite endpoint.
+/// NB fit with a finite endpoint; the GLMM view sets
+/// [`FitDiagnostics::nb_shape_at_limit`] from the same function.
 pub(super) fn note_nb_shape_at_limit(diagnostics: &mut Diagnostics, theta: f64) {
-    for limit in [NB_THETA_LO, NB_THETA_HI] {
-        if (theta.ln() - limit.ln()).abs() <= 1e-6 {
-            diagnostics.notes.push(Note::NbShapeAtLimit { limit });
-        }
+    if let Some(limit) = nb_shape_limit(theta) {
+        diagnostics.notes.push(Note::NbShapeAtLimit { limit });
     }
 }
 
@@ -1402,6 +1462,10 @@ pub(crate) fn spec_sized_from_ids<'a>(
         }
         s
     };
+    // The non-Gaussian arm restates on a `SizedSpec` the layout rule that
+    // `GlmmLayout::for_design` applies to `LmmGroupings`, with
+    // `LmmGroupings::structured_extras_eligible`'s core width spelled
+    // `1 + slopes + child_slots` — change together.
     let lands = |s: &SizedSpec| match model.family {
         Family::Gaussian => !condvar || super::classify_design(s, true) == super::Solver::NoZ,
         _ => {
@@ -1495,9 +1559,8 @@ pub(crate) fn sized_as_declared(model: &ModelSpec, ids: &GroupIds) -> SizedSpec 
                 // or not the frontend's ids are contiguous per-parent blocks),
                 // unlike deriving from a single global `max(extra)+1` divided
                 // by `n_primary`, which under-sizes any parent with an
-                // above-average child count (the true fix for unbalanced
-                // nesting: the count must be the TRUE max, not a
-                // `children.div_ceil(n_primary)` global average).
+                // above-average child count (the count must be the TRUE max,
+                // not a `children.div_ceil(n_primary)` global average).
                 nested_width(&ids.primary, &ids.extra[g], n_primary)
             }
         })
@@ -1714,7 +1777,7 @@ pub(super) fn fit_rank_deficient(
     start: Option<&StartValues>,
     opts: &FitOptions,
     aliased: &[bool],
-) -> Fit {
+) -> Result<Fit, FitError> {
     let Design { x, n, p, re, s, .. } = data.design;
     let kept: Vec<usize> = (0..p).filter(|&j| !aliased[j]).collect();
     let pk = kept.len();
@@ -1782,7 +1845,7 @@ pub(super) fn fit_rank_deficient(
     if !sources.is_empty() {
         reduced = reduced.re_columns(&zr, sources.len());
     }
-    let fr = super::fit_checked(&reduced, &model_r, start_r.as_ref(), &opts_r);
+    let fr = super::fit_checked(&reduced, &model_r, start_r.as_ref(), &opts_r)?;
     // Scatter reduced β/se to full width; aliased slots stay NaN.
     //
     // `aliased_out` starts as THIS level's mask and takes the reduced fit's mask
@@ -1888,7 +1951,7 @@ pub(super) fn fit_rank_deficient(
             row[orig] = row_r[r];
         }
     }
-    Fit {
+    Ok(Fit {
         beta,
         se,
         vcov,
@@ -1928,7 +1991,7 @@ pub(super) fn fit_rank_deficient(
         design_summary: fr.design_summary,
         // Filled by `fit_checked`, the salvage's only caller.
         null_basis: Vec::new(),
-    }
+    })
 }
 /// The grouping ids of a mixed model checked against it: the primary id
 /// vector is length `n`, the extra vectors align 1:1 with the declared extra
@@ -2641,20 +2704,54 @@ fn one_grouping_gaussian(spec: &ModelSpec, what: &str, instead: &str) -> Result<
     Ok(())
 }
 
+/// Why a mixed model's shape cannot take adaptive quadrature (`nagq > 1`), one
+/// variant per condition, checked in this order.
+#[derive(Debug)]
+pub(crate) enum AgqRefusal {
+    /// Not a binomial, Poisson, negative-binomial or Gamma model.
+    Family,
+    /// More than one grouping factor.
+    ExtraGroupings,
+    /// `q_p = 1 + #primary slopes` past [`crate::consts::MAX_AGQ_Q`].
+    OverCap { q_p: usize },
+}
+
+/// The model shapes adaptive quadrature takes: an AGQ family
+/// (`glmm::agq_family`), a single grouping factor, and `q_p ≤ MAX_AGQ_Q`.
+/// [`check_model_shape`] refuses each failure with its own message;
+/// `orchestrate::lower_with` strips `nagq` with a warning instead. The kernel's
+/// own gate (`glmm::agq::agq_eligible`) reads the same family list and cap.
+/// glmm-bind's `argument_notes` names the family list in its `agq_fallback`
+/// warning — change together.
+pub(crate) fn agq_shape(family: Family, re: &ReStructure) -> Result<(), AgqRefusal> {
+    if !crate::glmm::agq_family(family) {
+        return Err(AgqRefusal::Family);
+    }
+    if !re.extra_groupings.is_empty() {
+        return Err(AgqRefusal::ExtraGroupings);
+    }
+    let q_p = 1 + re.slopes.len();
+    if q_p > crate::consts::MAX_AGQ_Q {
+        return Err(AgqRefusal::OverCap { q_p });
+    }
+    Ok(())
+}
+
 /// The model-shape part of [`validate`], which `build_workspace` also runs
-/// (and panics on): the node count, the shapes no kernel fits and each
-/// grouping's terms ([`check_terms`]). The slope columns are checked against
-/// the data in [`check_slope_columns`]. The RE-envelope
-/// caps are not checked here: over them a design routes to the sparse path
+/// (and panics on): the node count, the shapes no kernel fits, each
+/// grouping's terms ([`check_terms`]) and the variance-component count
+/// ([`crate::consts::MAX_VARIANCE_COMPONENTS`]). The slope columns are checked
+/// against the data in [`check_slope_columns`]. The RE-envelope caps are not
+/// checked here: over them a design routes to the sparse path
 /// ([`super::classify_design`]).
 pub(crate) fn check_model_shape(model: &ModelSpec, nagq: u8) -> Result<(), FitError> {
     // nAGQ: odd, 1..=MAX_NAGQ; >1 only on a single grouping factor (no extras),
-    // q_p ≤ 3, binomial/Poisson/negative-binomial/Gamma GLMM — the shapes whose
+    // q_p ≤ MAX_AGQ_Q, binomial/Poisson/negative-binomial/Gamma GLMM — the shapes whose
     // marginal likelihood is a product of independent per-cluster q-D integrals of
     // a `−½·Σ dev_resid` integrand (`glmm::agq`). NB qualifies because θ_NB enters
     // the conditional density only through a per-row saturated term that is
     // constant in u, so it factors out of every cluster integral and the driver
-    // adds it back outside (`nb_term`). Gamma qualifies too: φ divides the
+    // adds it back outside (`Dispersion::term`). Gamma qualifies too: φ divides the
     // deviance inside the integral, which the kernels carry through the prior
     // weights `wᵢ/φ`, and the rest of the log-density depends on φ alone and sits
     // outside, as NB's term does. The range is checked on every model, so even
@@ -2662,8 +2759,9 @@ pub(crate) fn check_model_shape(model: &ModelSpec, nagq: u8) -> Result<(), FitEr
     // fixed-only model has no integral to approximate, and its kernels never
     // read nagq, so a valid nagq > 1 there fits at Laplace's answer.
     // `nagq` controls how the fit is computed, not what model is being fit, so
-    // it is sourced from `FitOptions`, not the spec. Mirrors the ports'
-    // warn-and-strip boundary (`orchestrate::lower_with`) — change together.
+    // it is sourced from `FitOptions`, not the spec. The shape rule is
+    // [`agq_shape`], which the ports' warn-and-strip boundary
+    // (`orchestrate::lower_with`) reads too.
     let nagq_range = || {
         format!(
             "nagq={} must be odd in 1..={}",
@@ -2681,40 +2779,31 @@ pub(crate) fn check_model_shape(model: &ModelSpec, nagq: u8) -> Result<(), FitEr
         return Ok(());
     };
     if nagq > 1 && model.family != Family::Gaussian {
-        let agq_family = matches!(
-            model.family,
-            Family::Binomial { .. }
-                | Family::Poisson { .. }
-                | Family::NegativeBinomial { .. }
-                | Family::Gamma { .. }
-        );
         // Each refusal names the condition that failed.
-        if !agq_family {
-            return Err(FitError::Unsupported(format!(
-                "nagq>1 applies only to binomial, Poisson, negative-binomial and Gamma GLMMs, not {:?}",
-                model.family
-            ).into()));
-        }
-        if !re.extra_groupings.is_empty() {
-            return Err(FitError::Unsupported(
-                "nagq>1 needs a single grouping factor (no crossed or nested extra groupings)"
+        match agq_shape(model.family, re) {
+            Ok(()) => {}
+            Err(AgqRefusal::Family) => {
+                return Err(FitError::Unsupported(format!(
+                    "nagq>1 applies only to binomial, Poisson, negative-binomial and Gamma GLMMs, not {:?}",
+                    model.family
+                ).into()));
+            }
+            Err(AgqRefusal::ExtraGroupings) => {
+                return Err(FitError::Unsupported(
+                    "nagq>1 needs a single grouping factor (no crossed or nested extra groupings)"
+                        .into(),
+                ));
+            }
+            Err(AgqRefusal::OverCap { q_p }) => {
+                return Err(FitError::Unsupported(
+                    format!(
+                        "nagq>1 with q_p={q_p} random effects per group exceeds the temporary \
+                         q_p≤{} cap (a cost/oracle-coverage boundary, not a code limit)",
+                        crate::consts::MAX_AGQ_Q
+                    )
                     .into(),
-            ));
-        }
-        // q_p = 1 + #primary slopes. The q_p ≥ 4 refusal is a TEMPORARY cost /
-        // oracle-coverage boundary (the k^q product grid and the dimension-generic
-        // loop have no q limit), not a code limit — lifting it later is deleting
-        // this one check. Locked decision: cap AGQ to q_p≤3 until oracle coverage
-        // extends past it, rather than let uncapped q_p through untested.
-        let q_p = 1 + re.slopes.len();
-        if q_p > 3 {
-            return Err(FitError::Unsupported(
-                format!(
-                    "nagq>1 with q_p={q_p} random effects per group exceeds the temporary \
-                 q_p≤3 cap (a cost/oracle-coverage boundary, not a code limit)"
-                )
-                .into(),
-            ));
+                ));
+            }
         }
     }
     // Inverse-Gaussian mixed models are deliberately not built: the GLMM
@@ -2729,6 +2818,22 @@ pub(crate) fn check_model_shape(model: &ModelSpec, nagq: u8) -> Result<(), FitEr
     check_terms(&re.slopes, &re.terms, "primary grouping")?;
     for (k, g) in re.extra_groupings.iter().enumerate() {
         check_terms(&g.slopes, &g.terms, &format!("extra grouping {k}"))?;
+    }
+    // One component per random-effect column, a hidden intercept excluded
+    // (`LmmGroupings::diagonal_theta`).
+    let components: usize = std::iter::once((&re.slopes, &re.terms))
+        .chain(re.extra_groupings.iter().map(|g| (&g.slopes, &g.terms)))
+        .map(|(slopes, terms)| 1 + slopes.len() - usize::from(crate::lmm::block_hidden(terms)))
+        .sum();
+    if components > crate::consts::MAX_VARIANCE_COMPONENTS {
+        return Err(FitError::Envelope(
+            format!(
+                "the random effects have {components} variance components; at most {} are \
+                 supported",
+                crate::consts::MAX_VARIANCE_COMPONENTS
+            )
+            .into(),
+        ));
     }
     // The kernel holds ONE nested slot (`LmmGroupings.nested`) and
     // `from_cluster_spec_ext` would silently let a later `NestedWithin` extra

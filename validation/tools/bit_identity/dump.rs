@@ -110,7 +110,7 @@ fn main() {
 
 /// One record for `rung` (a manifest rung id, or a twin's `TWIN_RUNG_OFFSET`-shifted
 /// id), field order fixed by hand (not `serde_json::Map`'s default alphabetical
-/// order) to match the spec's `{rung, config, deviance, varcorr, beta, se_hessian,
+/// order), in the order `{rung, config, deviance, varcorr, beta, se_hessian,
 /// se_rx, n_eval, converged, singular}`. `nagq` is the caller's choice, not
 /// derived from `spec`, so a twin can reuse its parent's `spec` at a different
 /// AGQ order.

@@ -4,33 +4,12 @@
 # Engine-blocked accessors error with the reason rather than
 # returning something silently different from what an lme4 user expects.
 
-# vech-packed (column-major lower-triangular) covariance block -> list of
-# per-dimension stddevs + full correlation matrix. Mirrors Rust
-# `Fit::stddev_corr` (GLMM/glmm-rs/src/fit/mod.rs) - change together. 0-based r/c in
-# idx() to keep the formula identical to the Rust side; +1 shifts into R.
-# `group` (1-based, R's own indexing convention) names which varcorr block
-# failed; mirrors the Python port's `Fit.stddev_corr` (glmm-py/glmm/__init__.py),
-# which reports the same thing 0-based.
-.stddev_corr <- function(vech, group = NA_integer_) {
-  m <- length(vech)
-  q <- as.integer((sqrt(1 + 8 * m) - 1) / 2)
-  if (q * (q + 1L) / 2L != m) {
-    label <- if (is.na(group)) "varcorr block" else sprintf("varcorr[[%d]]", group)
-    stop(sprintf("%s is not a valid vech (length %d)", label, m), call. = FALSE)
-  }
-  idx <- function(r, c) c * q - (c * c - c) / 2 + (r - c) + 1L
-  sd <- vapply(0:(q - 1L), function(i) sqrt(vech[idx(i, i)]), 0)
-  corr <- diag(1, q)
-  if (q > 1L) {
-    for (c in 0:(q - 2L)) {
-      for (r in (c + 1L):(q - 1L)) {
-        rho <- vech[idx(r, c)] / (sd[r + 1L] * sd[c + 1L])
-        corr[r + 1L, c + 1L] <- rho
-        corr[c + 1L, r + 1L] <- rho
-      }
-    }
-  }
-  list(stddev = sd, correlation = corr)
+# Block `group` (1-based) of a fit's varcorr, `vech` (vech-packed:
+# column-major lower-triangular), as its stddevs and correlation matrix, from
+# the native stddev_corr.
+.stddev_corr <- function(vech, group = 1L) {
+  r <- .glmm_call("stddev_corr", list(vech = as.double(vech), group = group - 1L))
+  list(stddev = r$stddev, correlation = r$corr)
 }
 
 # Whether the fit has variance estimates to print: a fit with random effects
@@ -71,7 +50,7 @@ print.fastglmm <- function(x, digits = max(3L, getOption("digits") - 3L), ...) {
   }
   .obs_line(x$nobs, s$groups)
   cat("Fixed effects:\n")
-  print(round(x$beta, digits))
+  print.default(format(x$beta, digits = digits), print.gap = 2L, quote = FALSE)
   if (!x$converged) cat("Warning: fit did not converge\n")
   if (x$singular) cat("boundary (singular) fit: see help('isSingular')\n")
   invisible(x)
@@ -149,7 +128,7 @@ summary.fastglmm <- function(object, ...) {
   # A fit saved before .kernel_parts cannot lower its rows again, so it has
   # no R-squared line.
   e <- if (is.null(object$.kernel_parts)) list() else .effect_sizes(object, null_refit = FALSE)
-  s <- .summary_record(object, if (length(e)) e, is.null(e))
+  s <- .summary_record(object, if (length(e)) e, is.null(e), residuals = TRUE)
   coefficients <- cbind(Estimate = s$estimate, `Std. Error` = s$std_error)
   if (!is.null(s$coef_df)) coefficients <- cbind(coefficients, df = s$coef_df)
   coefficients <- cbind(coefficients, s$statistic, s$p_value)
@@ -178,15 +157,20 @@ summary.fastglmm <- function(object, ...) {
     effect_sizes = effect_sizes,
     r2_need_refit = s$r2_need_refit,
     residual_df = if (!is.null(s$residual_df)) as.integer(s$residual_df),
+    sigma = s$sigma,
+    random_effects = s$random_effects,
+    residual_variance = s$residual_variance,
     dispersion_label = s$dispersion_label,
     weight_power_lines = as.character(s$weight_power_lines),
     footnote = s$footnote
   ), class = "summary.fastglmm")
 }
 
-# The native summary record of a fit, which summary() and tidy() read.
-# `%||%` keeps objects saved before a field existed printable.
-.summary_record <- function(object, effect_sizes = NULL, need_refit = FALSE) {
+# The native summary record of a fit, which summary(), print() and tidy()
+# read. Its scaled residuals need the rows `y` and `fitted`, sent only when
+# `residuals` is TRUE (summary()). `%||%` keeps objects saved before a field
+# existed printable.
+.summary_record <- function(object, effect_sizes = NULL, need_refit = FALSE, residuals = FALSE) {
   .glmm_call("summary", list(
     fit = list(
       formula = object$formula, family = object$family_name, link = object$link,
@@ -204,7 +188,7 @@ summary.fastglmm <- function(object, ...) {
       re_term_index = object$re_term_index,
       ranef_levels = object$.kernel_parts$ranef_levels,
       re_group_levels = object$.kernel_parts$re_group_levels,
-      y = as.double(object$y), fitted = as.double(object$fitted),
+      y = if (residuals) as.double(object$y), fitted = if (residuals) as.double(object$fitted),
       weights = .optional(object$weights),
       weight_power = as.double(object$weight_power %||% 1),
       weight_power_estimated = isTRUE(object$estimated_weight_power),
@@ -213,6 +197,20 @@ summary.fastglmm <- function(object, ...) {
       rss = object$rss %||% NaN, r_squared = object$r_squared %||% NaN,
       adj_r_squared = object$adj_r_squared %||% NaN),
     effect_sizes = effect_sizes, need_refit = need_refit))
+}
+
+# The summary record's random effects and residual variance as the
+# VarCorr.fastglmm object its print method lays out. The residual row keeps
+# VarCorr's own arithmetic: its standard deviation is sqrt(phi) and its
+# variance that value squared.
+.varcorr_of_summary <- function(x) {
+  out <- lapply(x$random_effects, function(b) {
+    structure(list(), stddev = stats::setNames(b$stddev, b$terms),
+              correlation = b$corr, term_index = b$term_index)
+  })
+  names(out) <- vapply(x$random_effects, `[[`, character(1), "group")
+  structure(out, class = "VarCorr.fastglmm",
+            sc = if (is.null(x$residual_variance)) NA_real_ else sqrt(x$residual_variance))
 }
 
 #' @export
@@ -237,9 +235,9 @@ print.summary.fastglmm <- function(x,
     print(x$scaled_residuals, digits = digits)
     cat("\n")
   }
-  if (.varcorr_estimated(object)) {
+  if (length(x$random_effects)) {
     cat("Random effects:\n")
-    print(VarCorr(object), digits = digits, variance = TRUE)
+    print(.varcorr_of_summary(x), digits = digits, variance = TRUE)
   }
   .obs_line(object$nobs, x$groups)
   # Mirrors Summary._effect_size_lines() (glmm-py/glmm/summary.py) - change
@@ -253,11 +251,16 @@ print.summary.fastglmm <- function(x,
   }
   cat("\n")
   cat("Fixed effects:\n")
+  # printCoefmat prints a lone NaN p-value (an infinite statistic) as "NaN";
+  # it is printed "NA", as the Python port prints it.
+  cf <- x$coefficients
+  p_col <- ncol(cf)
+  cf[is.nan(cf[, p_col]), p_col] <- NA
   # The df column is zapped as lme4's print.summary.merMod zaps it.
-  if ("df" %in% colnames(x$coefficients)) {
-    stats::printCoefmat(x$coefficients, digits = digits, na.print = "NA", zap.ind = 3L)
+  if ("df" %in% colnames(cf)) {
+    stats::printCoefmat(cf, digits = digits, na.print = "NA", zap.ind = 3L)
   } else {
-    stats::printCoefmat(x$coefficients, digits = digits, na.print = "NA")
+    stats::printCoefmat(cf, digits = digits, na.print = "NA")
   }
   if (any(object$aliased)) {
     cat("(", sum(object$aliased),
@@ -269,8 +272,7 @@ print.summary.fastglmm <- function(x,
     # that a value that is not finite prints NA. The Python port prints the
     # same - change together.
     num <- function(v, f) if (is.finite(v)) f(v) else "NA"
-    sigma <- if (isTRUE(rdf > 0)) sqrt(object$rss / rdf) else NaN
-    cat("\nResidual standard error: ", num(sigma, function(v) format(signif(v, digits))),
+    cat("\nResidual standard error: ", num(x$sigma, function(v) format(signif(v, digits))),
         " on ", rdf, " degrees of freedom\n", sep = "")
     cat("Multiple R-squared: ", num(object$r_squared, function(v) formatC(v, digits = digits)))
     cat(",\tAdjusted R-squared: ",
@@ -281,7 +283,9 @@ print.summary.fastglmm <- function(x,
     # port prints the same; change together.
     cat("\nCorrelation of Fixed Effects:\n")
     p <- nrow(x$corr_fixed)
-    m <- format(round(x$corr_fixed, 3), nsmall = 3)
+    cf <- round(x$corr_fixed, 3)
+    cf[is.nan(cf)] <- NA  # prints NA, as the Python port does
+    m <- format(cf, nsmall = 3)
     m[upper.tri(m, diag = TRUE)] <- ""
     print(noquote(m[-1L, -p, drop = FALSE]), right = TRUE)
   }
@@ -411,7 +415,9 @@ print.VarCorr.fastglmm <- function(x,
       same <- seq_len(i - 1L)
       if (i <= length(term)) same <- same[term[same] == term[i]]
       corr_cells <- if (length(same)) {
-        paste(format(round(corr[i, same], 2), nsmall = 2), collapse = " ")
+        v <- round(corr[i, same], 2)
+        v[is.nan(v)] <- NA  # prints NA, as the Python port does
+        paste(format(v, nsmall = 2), collapse = " ")
       } else {
         ""
       }
@@ -586,7 +592,9 @@ model.frame.fastglmm <- function(formula, ...) formula$frame
 #'   (per grouping the SDs and correlations column-major, each SD followed by
 #'   its correlations, then `sigma`, then the coefficients; lme4 2.0 lists a
 #'   block's SDs before its correlations, so match rows to lme4's by name),
-#'   `NA` for an undetermined bound.
+#'   `NA` for an undetermined bound, and the attribute `notes`: a character
+#'   vector that says the profiles ran on the ML fit (and that a REML fit was
+#'   refitted by ML), then names each row with an `NA` bound.
 #' @export
 confint.fastglmm <- function(object, parm, level = 0.95,
                              method = c("Wald", "profile"), ...) {
@@ -623,7 +631,7 @@ confint.fastglmm <- function(object, parm, level = 0.95,
 
 # confint(method = "profile"): the native profile_intervals on the fit's
 # training columns, as lme4's bounds matrix; NaN (an undetermined bound)
-# becomes NA.
+# becomes NA, and the native notes ride as the attribute "notes".
 .profile_confint <- function(object, parm, level) {
   r <- .glmm_call("profile_intervals", c(.training_columns(object), list(
     reml = isTRUE(object$reml), weight_power = as.double(object$weight_power %||% 1),
@@ -632,6 +640,7 @@ confint.fastglmm <- function(object, parm, level = 0.95,
   out <- cbind(r$lower, r$upper)
   out[is.nan(out)] <- NA_real_
   dimnames(out) <- list(r$names, .ci_colnames(level))
+  attr(out, "notes") <- r$notes
   out
 }
 
@@ -872,8 +881,11 @@ predict.fastglmm <- function(object, newdata, re.form = NULL, type = c("link", "
     rows <- .row_labels(object)
   } else {
     newdata <- as.data.frame(newdata)
-    f <- stats::as.formula(object$formula)
-    vars <- intersect(setdiff(all.vars(f), all.vars(f[[2L]])), names(newdata))
+    # The columns the formula reads on new rows, the response left out (the
+    # native predict_columns); one it reads but newdata lacks is left to the
+    # native predict to name, as a grouping column may be absent.
+    vars <- .glmm_call("predict_columns", list(formula = object$formula,
+                                               available = names(newdata)))
     # Mirrors `_prepare_columns` in the Python port: change together.
     dup <- intersect(names(newdata)[duplicated(names(newdata))], vars)
     if (length(dup)) {
@@ -884,7 +896,7 @@ predict.fastglmm <- function(object, newdata, re.form = NULL, type = c("link", "
            call. = FALSE)
     }
     has_new <- TRUE
-    new <- .marshal(newdata, vars, .offset_vars(f))
+    new <- .marshal(newdata, vars, .formula_columns(object$formula, newdata)$numeric_only)
     rows <- rownames(newdata)
   }
   r <- .glmm_call("predict", c(train, list(
@@ -895,40 +907,11 @@ predict.fastglmm <- function(object, newdata, re.form = NULL, type = c("link", "
     # New rows are the caller's own: newdata with a missing value is refused.
     row_index = if (has_new) integer() else .row_index(object), row_base = 1L)))
   for (note in r$notes) {
-    if (identical(note$kind, "predict_se_model_based")) {
-      # Mirrors the Python port's Fit.predict wording - change together.
-      warning(warningCondition(paste(
-        "The standard errors and intervals are model-based, not robust: their formula holds",
-        "only with the model's covariance."),
-        class = c("fastglmm_predict_se_model_based", "fastglmm_diagnostic"), call = NULL))
+    if (note$kind %in% c("predict_se_model_based", "rows_not_estimable",
+                         "new_grouping_levels")) {
+      warning(warningCondition(note$message,
+        class = c(paste0("fastglmm_", note$kind), "fastglmm_diagnostic"), call = NULL))
     }
-    if (identical(note$kind, "rows_not_estimable")) {
-      shown <- strsplit(note$detail, ", ", fixed = TRUE)[[1L]]
-      n <- length(shown)
-      shown <- paste0(paste(shown[seq_len(min(n, 10L))], collapse = ", "),
-                      if (n > 10L) sprintf(", and %d more", n - 10L) else "")
-      # Mirrors the Python port's Fit.predict wording - change together.
-      warning(warningCondition(if (n == 1L) {
-        sprintf("Row %s is not estimable from this rank-deficient fit, so its prediction is NaN.",
-                shown)
-      } else {
-        sprintf("Rows %s are not estimable from this rank-deficient fit, so their predictions are NaN.",
-                shown)
-      }, class = c("fastglmm_rows_not_estimable", "fastglmm_diagnostic"), call = NULL))
-      next
-    }
-    if (!identical(note$kind, "new_grouping_levels")) next
-    parts <- strsplit(note$detail, ": ", fixed = TRUE)[[1L]]
-    name <- object$re_group_names[[as.integer(parts[[1L]]) + 1L]]
-    shown <- strsplit(parts[[2L]], ", ", fixed = TRUE)[[1L]]
-    n <- length(shown)
-    shown <- paste0(paste(shown[seq_len(min(n, 10L))], collapse = ", "),
-                    if (n > 10L) sprintf(", and %d more", n - 10L) else "")
-    # Mirrors the Python port's Fit.predict wording - change together.
-    warning(warningCondition(sprintf(
-      "%s of newdata %s a level of %s the fit did not see (rows %s). Their random effect for %s is 0.",
-      .count(n, "row"), if (n == 1L) "has" else "have", name, shown, name),
-      class = c("fastglmm_new_grouping_levels", "fastglmm_diagnostic"), call = NULL))
   }
   named <- function(v) stats::setNames(as.double(v), rows)
   fit <- named(r$fit)
@@ -991,18 +974,19 @@ simulate.fastglmm <- function(object, nsim = 1, seed = NULL, ...) {
 }
 
 # The fit's training data as fastglmm() passed it to the native code: the
-# formula, the model frame marshalled again, the family, the weights and the
-# offset.
+# formula, the factor columns the fit kept, the other columns of the model
+# frame marshalled again, the family, the weights and the offset.
 .training_columns <- function(object) {
   if (is.null(object$.kernel_parts)) {
     stop("this fit was made by a fastglmm version that did not keep what predict(), ",
          "simulate(), pairwise(), r2() and icc() read. Refit the model with this version.",
          call. = FALSE)
   }
-  f <- stats::as.formula(object$formula)
   frame <- object$frame
-  cols <- .marshal(frame, all.vars(f), c(all.vars(f[[2L]]), .offset_vars(f)))
-  list(formula = object$formula, numeric = cols$numeric, factors = cols$factors,
+  read <- .formula_columns(object$formula, frame)
+  kept <- object$.factor_columns
+  cols <- .marshal(frame, setdiff(read$used, names(kept)), read$numeric_only)
+  list(formula = object$formula, numeric = cols$numeric, factors = c(kept, cols$factors),
        family = object$family_name, link = object$link,
        weights = .optional(frame[["(weights)"]]), offset = .optional(frame[["(offset)"]]))
 }
@@ -1361,16 +1345,14 @@ glance.fastglmm <- function(x, ...) {
 # argument `satterthwaite=False`.
 .DF_NOT_COMPUTED <- "df not computed (satterthwaite = FALSE)"
 
-# AIC / BIC / deviance (-2 logLik) / residual df, as glance() reports them.
+# AIC / BIC / deviance (-2 logLik) / residual df, as glance() reports them,
+# from the native criteria.
 .ml_criteria <- function(object) {
-  ll <- object$loglik
-  list(
-    AIC = -2 * ll + 2 * object$df,
-    BIC = -2 * ll + log(object$nobs) * object$df,
-    deviance = -2 * ll,
-    # df is 0 where it is not counted (a fit without estimates).
-    df.residual = if (object$df == 0) NA_real_ else object$nobs - object$df
-  )
+  ic <- .glmm_call("criteria", list(loglik = as.double(object$loglik), df = object$df,
+                                    nobs = object$nobs))
+  # df.resid is NaN where df is not counted (a fit without estimates); NA here.
+  list(AIC = ic$AIC, BIC = ic$BIC, deviance = ic$deviance,
+       df.residual = if (is.nan(ic$df.resid)) NA_real_ else ic$df.resid)
 }
 
 #' @export

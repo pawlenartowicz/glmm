@@ -1,12 +1,12 @@
 // The parser and its AST are public only with `orchestrate`.
 #![cfg(feature = "orchestrate")]
-//! Proves the parser is a superset of MCPower's — the 28 canonical cases parse
-//! identically; everything below the canonical suite is glmm-only grammar.
+//! Proves the parser parses the 28 canonical cases of MCPower's parser
+//! identically to it; everything below the canonical suite is glmm-only
+//! grammar.
 //! Two corpora:
-//!   - the 28-case canonical suite (`configs/formula-fixtures/canonical-suite.json`),
-//!     inlined here as Rust data and checked via the same canonical normalization
-//!     the app-spec `formula_suite.rs` harness uses;
-//!   - the random-effects cases (`random_effects_parse.rs`) as direct AST asserts.
+//!   - the 28-case canonical suite, inlined here as Rust data and checked via
+//!     the canonical normalization below;
+//!   - the random-effects cases as direct AST asserts.
 //!
 //! Pure — no data table, except `repeated_random_column_is_refused`, whose
 //! refusal needs the lowering.
@@ -22,8 +22,7 @@ type SuccessCase = (
     &'static [&'static str],
 );
 
-/// Normalize an AST to the port-neutral canonical shape (mirrors app-spec's
-/// `canonical`): each term → its coefficient-name string, each RE → `intercept|g`
+/// Normalize an AST to the port-neutral canonical shape: each term → its coefficient-name string, each RE → `intercept|g`
 /// / `slope(v1,v2)|g`.
 fn canonical(p: &ParsedFormula) -> (String, Vec<String>, Vec<String>) {
     let fixed = p
@@ -294,7 +293,7 @@ fn canonical_suite_matches_mirror() {
     }
 }
 
-// ── The random-effects cases (random_effects_parse.rs), as direct AST asserts ──
+// ── The random-effects cases, as direct AST asserts ──
 
 #[test]
 fn interaction_grouping_combined_with_plain_intercept() {
@@ -496,28 +495,29 @@ fn a_slope_term_of_only_plus_signs_is_an_empty_slope_term() {
     }
 }
 
+/// Random-effect terms parse to their canonical shape: a multi-variable
+/// implicit-intercept slope, a redundant `1` in the implicit form dropped,
+/// transform slopes, a transform fixed term beside a random intercept (the
+/// slope regexes exclude parens, so `(x)+(1|g)` is not an implicit-intercept
+/// slope term), and a slope variable repeated, which counts once as lme4's
+/// `lFormula` collapses `(1+x+x|g)` (the random-effects mirror of
+/// `a_variable_repeated_within_a_term_counts_once`).
 #[test]
-fn implicit_intercept_multivar_slope() {
-    let p = parse("y ~ x + z + (x+z|g)").unwrap();
-    assert_eq!(
-        p.random_effects,
-        vec![RandomEffect::Slope {
-            group: "g".into(),
-            vars: vec!["x".into(), "z".into()]
-        }]
-    );
-}
-
-#[test]
-fn redundant_explicit_one_in_implicit_form_is_dropped() {
-    let p = parse("y ~ x + (x+1|g)").unwrap();
-    assert_eq!(
-        p.random_effects,
-        vec![RandomEffect::Slope {
-            group: "g".into(),
-            vars: vec!["x".into()]
-        }]
-    );
+fn random_terms_parse_to_their_canonical_shape() {
+    for (f, want) in [
+        ("y ~ x + z + (x+z|g)", &["slope(x,z)|g"][..]),
+        ("y ~ x + (x+1|g)", &["slope(x)|g"]),
+        (
+            "y ~ log(x) + (1 + log(x) | g) + (I(z^2) | h)",
+            &["slope(log(x))|g", "slope(I(z^2))|h"],
+        ),
+        ("y ~ log(x) + (1|g)", &["intercept|g"]),
+        ("y ~ x + (1 + x + x | g)", &["slope(x)|g"]),
+        ("y ~ x + (x + x | g)", &["slope(x)|g"]),
+    ] {
+        let p = parse(f).unwrap_or_else(|e| panic!("{f}: {e}"));
+        assert_eq!(canonical(&p).2, want, "{f}");
+    }
 }
 
 #[test]
@@ -575,14 +575,6 @@ fn minus_one_and_zero_plus_drop_the_intercept() {
 }
 
 #[test]
-fn other_term_removal_still_rejected() {
-    for f in ["y ~ x - z", "y ~ x - 10", "y ~ x - 1 - z"] {
-        let msg = parse(f).expect_err(f).to_string();
-        assert!(msg.contains("term removal"), "{f}: {msg}");
-    }
-}
-
-#[test]
 fn intercept_only_removal_leaves_no_terms() {
     let p = parse("y ~ -1 + (1|g)").unwrap();
     assert!(!p.has_intercept);
@@ -610,14 +602,6 @@ fn explicit_one_is_the_implied_intercept() {
     }
 }
 
-#[test]
-fn explicit_one_beside_an_intercept_removal_is_rejected() {
-    for f in ["y ~ 1 + x - 1", "y ~ 0 + 1 + x", "y ~ 1 + x + 0"] {
-        let msg = parse(f).expect_err(f).to_string();
-        assert!(msg.contains("intercept"), "{f}: {msg}");
-    }
-}
-
 // ── Whitelist transforms ────────────────────────────────────────────────────
 
 #[test]
@@ -629,51 +613,6 @@ fn whitelist_transforms_are_terms_named_as_r_spells_them() {
         ["log(x)", "I(z^2)", "sqrt(w):f", "exp(x)", "z", "exp(x):z"].map(String::from)
     );
     assert_eq!(p.predictors[0], "log(x)");
-}
-
-#[test]
-fn transform_random_slope_parses() {
-    let p = parse("y ~ log(x) + (1 + log(x) | g) + (I(z^2) | h)").unwrap();
-    assert_eq!(
-        p.random_effects,
-        vec![
-            RandomEffect::Slope {
-                group: "g".into(),
-                vars: vec!["log(x)".into()]
-            },
-            RandomEffect::Slope {
-                group: "h".into(),
-                vars: vec!["I(z^2)".into()]
-            },
-        ]
-    );
-}
-
-#[test]
-fn transform_term_beside_a_random_intercept_does_not_confuse_re_extraction() {
-    // The slope regexes exclude parens, so `(x)+(1|g)` is not an
-    // implicit-intercept slope term.
-    let p = parse("y ~ log(x) + (1|g)").unwrap();
-    let (_, fixed, re) = canonical(&p);
-    assert_eq!(fixed, vec!["log(x)".to_string()]);
-    assert_eq!(re, vec!["intercept|g".to_string()]);
-}
-
-#[test]
-fn non_whitelist_calls_are_rejected() {
-    for f in [
-        "y ~ poly(x, 2)",
-        "y ~ log(x, 10)",
-        "y ~ log(sqrt(x))",
-        "y ~ I(x^2 + z)",
-        "y ~ I(x^1)",
-        "y ~ I(x^2.5)",
-        "y ~ log(x + z)",
-        "y ~ abs(x)",
-    ] {
-        let msg = parse(f).expect_err(f).to_string();
-        assert!(msg.contains("formula syntax error"), "{f}: {msg}");
-    }
 }
 
 // ── offset() term ───────────────────────────────────────────────────────────
@@ -692,22 +631,6 @@ fn offset_term_is_recorded_and_removed_from_the_design() {
     assert!(parse("y ~ x").unwrap().offset.is_none());
 }
 
-#[test]
-fn offset_term_rejections() {
-    for (f, needle) in [
-        ("y ~ x + offset(a) + offset(b)", "one offset"),
-        ("y ~ x + offset(a + b)", "formula syntax error"),
-        ("y ~ x + offset(poly(a, 2))", "formula syntax error"),
-        ("y ~ x + offset()", "formula syntax error"),
-        ("y ~ foffset(e) + x", "formula syntax error"),
-        ("y ~ x*offset(e)", "formula syntax error"),
-        ("y ~ a:offset(e)", "formula syntax error"),
-    ] {
-        let msg = parse(f).expect_err(f).to_string();
-        assert!(msg.contains(needle), "{f}: {msg}");
-    }
-}
-
 // ── cbind() response ────────────────────────────────────────────────────────
 
 #[test]
@@ -718,19 +641,6 @@ fn cbind_response_is_recorded() {
     assert_eq!(p.cbind, Some(("inc".to_string(), "fail".to_string())));
     assert_eq!(p.dependent, "cbind(inc,fail)");
     assert!(parse("y ~ x").unwrap().cbind.is_none());
-}
-
-#[test]
-fn cbind_rejections() {
-    for f in [
-        "cbind(a) ~ x",
-        "cbind(a, b, c) ~ x",
-        "cbind(a, log(b)) ~ x",
-        "y ~ cbind(a, b)",
-    ] {
-        let msg = parse(f).expect_err(f).to_string();
-        assert!(msg.contains("formula syntax error"), "{f}: {msg}");
-    }
 }
 
 // ── Repeated terms ──────────────────────────────────────────────────────────
@@ -789,21 +699,6 @@ fn an_empty_name_in_an_interaction_is_a_syntax_error() {
             "expected a syntax error for {f}, got {:?}",
             parse(f)
         );
-    }
-}
-
-#[test]
-fn a_random_slope_variable_repeated_counts_once() {
-    // Mirrors `a_variable_repeated_within_a_term_counts_once` on the
-    // random-effects side: lme4's `lFormula` also collapses `(1+x+x|g)` to a
-    // single `x` slope.
-    for (f, want) in [
-        ("y ~ x + (1 + x + x | g)", "slope(x)|g"),
-        ("y ~ x + (x + x | g)", "slope(x)|g"),
-    ] {
-        let p = parse(f).unwrap();
-        let (_, _, re) = canonical(&p);
-        assert_eq!(re, [want], "{f}");
     }
 }
 
@@ -936,6 +831,7 @@ fn crossing_operator_follows_r_terms() {
             &["a", "b", "c", "a:b", "a:c", "b:c", "a:b:c"],
         ),
         ("y ~ (ł + b)^2", &["ł", "b", "ł:b"]),
+        ("y ~ a*b:c", &["a", "b:c", "a:b:c"]),
     ] {
         let p = parse(f).unwrap_or_else(|e| panic!("{f}: {e}"));
         assert_eq!(canonical(&p).1, r_labels, "{f}");
@@ -1050,6 +946,8 @@ fn an_unbalanced_or_empty_group_is_a_syntax_error() {
         ),
         ("y ~ a*()", "empty parentheses in term 'a*()'"),
         ("y ~ a*(b + ())", "empty parentheses in term 'a*(b+())'"),
+        ("y ~ x)", "unbalanced parentheses in term 'x)'"),
+        ("y ~ log(x", "unbalanced parentheses in term 'log(x'"),
     ] {
         assert_eq!(parse(f), syntax_error(0, msg), "{f}");
     }
@@ -1139,19 +1037,64 @@ fn huge_expansions_and_deep_nesting_are_syntax_errors() {
     assert!(parse(&ok).is_ok(), "{:?}", parse(&ok));
 }
 
-/// Nor glued to the term after it: `(1|g)x` would parse as `x + (1|g)`.
+/// Fourteen variables give 16,383 terms: refused in parentheses as without.
 #[test]
-fn a_random_effect_term_before_a_term_without_a_plus_is_a_syntax_error() {
-    for f in [
-        "y ~ (1 | g)x",
-        "y ~ x + (1 | g)(1 | h)",
-        "y ~ x + (1 | g) x",
+fn a_parenthesised_product_has_the_plain_products_term_cap() {
+    let product = (0..14)
+        .map(|i| format!("x{i}"))
+        .collect::<Vec<_>>()
+        .join("*");
+    for piece in [product.clone(), format!("({product})")] {
+        let msg = format!("'{piece}' expands to more than 10000 terms");
+        assert_eq!(
+            parse(&format!("y ~ {piece}")),
+            syntax_error(0, &msg),
+            "{piece}"
+        );
+    }
+}
+
+/// Refusals name their problem: a term removal other than the intercept's,
+/// an explicit `1` beside an intercept removal, a call outside the whitelist
+/// (in the formula or inside `offset()`), a misplaced or malformed `offset()`
+/// or `cbind()`, a second offset, and a random-effect term glued to the term
+/// after it (`(1|g)x` would parse as `x + (1|g)`).
+#[test]
+fn refusals_name_their_problem() {
+    let syntax = "formula syntax error";
+    let glued = "must stand alone, not before another term";
+    for (f, needle) in [
+        ("y ~ x - z", "term removal"),
+        ("y ~ x - 10", "term removal"),
+        ("y ~ x - 1 - z", "term removal"),
+        ("y ~ 1 + x - 1", "intercept"),
+        ("y ~ 0 + 1 + x", "intercept"),
+        ("y ~ 1 + x + 0", "intercept"),
+        ("y ~ poly(x, 2)", syntax),
+        ("y ~ log(x, 10)", syntax),
+        ("y ~ log(sqrt(x))", syntax),
+        ("y ~ I(x^2 + z)", syntax),
+        ("y ~ I(x^1)", syntax),
+        ("y ~ I(x^2.5)", syntax),
+        ("y ~ log(x + z)", syntax),
+        ("y ~ abs(x)", syntax),
+        ("y ~ x + offset(a) + offset(b)", "one offset"),
+        ("y ~ x + offset(a + b)", syntax),
+        ("y ~ x + offset(poly(a, 2))", syntax),
+        ("y ~ x + offset()", syntax),
+        ("y ~ foffset(e) + x", syntax),
+        ("y ~ x*offset(e)", syntax),
+        ("y ~ a:offset(e)", syntax),
+        ("cbind(a) ~ x", syntax),
+        ("cbind(a, b, c) ~ x", syntax),
+        ("cbind(a, log(b)) ~ x", syntax),
+        ("y ~ cbind(a, b)", syntax),
+        ("y ~ (1 | g)x", glued),
+        ("y ~ x + (1 | g)(1 | h)", glued),
+        ("y ~ x + (1 | g) x", glued),
     ] {
         let msg = parse(f).expect_err(f).to_string();
-        assert!(
-            msg.contains("must stand alone, not before another term"),
-            "{f}: {msg}"
-        );
+        assert!(msg.contains(needle), "{f}: {msg}");
     }
 }
 

@@ -1,11 +1,11 @@
 [package]
 name = "glmm-bind"
-version = "0.9.3"
+version = "0.9.4"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
-description = "Language-neutral half of the glmm ports: one call() entry point, argument checks, defaults, result records and error codes, used by the Python and R wrappers."
+description = "Language-neutral half of the glmm ports: one call() entry point, argument checks, result records and error codes, used by the Python and R wrappers."
 
 [dependencies]
 glmm = { path = "../glmm-rs", features = ["orchestrate"] }

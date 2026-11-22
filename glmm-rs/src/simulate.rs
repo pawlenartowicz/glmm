@@ -10,7 +10,8 @@ use commonstats::rng::{CommonStatsRng, STREAM_TAG_SIMULATE};
 use faer::MatRef;
 
 use crate::family::{clamp_eta, link_inv, mean_out_of_range, PROB_EPS};
-use crate::fit::validate_design;
+use crate::fit::{validate_design, vech_at};
+use crate::ids::dense_ids;
 use crate::lmm::re_map::{semidef_lower_chol, PivotFloor};
 use crate::lmm::slope_value;
 use crate::predict::{predict_parts, reported_columns, FitParts, PredictOptions};
@@ -18,21 +19,6 @@ use crate::{
     BinomialLink, Design, ErrorMessage, Family, Fit, FitError, GammaLink, InverseGaussianLink,
     ModelSpec,
 };
-
-/// `ids` renumbered `0..k` in id order, and `k`. A level's effect is drawn
-/// only when a row carries it, so the draw count is at most `n` whatever the
-/// id values: sizing by `max(id) + 1` would let one huge id ask for billions
-/// of draws and abort the process.
-fn dense_ids(ids: &[u32]) -> (Vec<u32>, usize) {
-    let mut levels = ids.to_vec();
-    levels.sort_unstable();
-    levels.dedup();
-    let dense = ids
-        .iter()
-        .map(|id| levels.binary_search(id).expect("an id of `ids`") as u32)
-        .collect();
-    (dense, levels.len())
-}
 
 /// Draws of the response of a fitted model on a design, lme4's
 /// `μ = g⁻¹(η)` of a draw: [`link_inv`], with `libm`'s `exp`, `expm1` and
@@ -87,10 +73,10 @@ fn draw_mean(family: Family, eta: f64) -> f64 {
 /// only its own Philox stream, `commonstats`'
 /// `CommonStatsRng::new_tagged(seed, d, STREAM_TAG_SIMULATE)`, so the same
 /// pair gives the same response on every target and thread count. The stream
-/// is read in a fixed order: per grouping in declaration order, per level
-/// `0..=max id` of the design, `q` standard normals `z` and the effects
-/// `b = Lz`, `L` the lower Cholesky factor of the grouping's covariance block
-/// (a column whose pivot vanishes at round-off is zero, so a variance at the
+/// is read in a fixed order: per grouping in declaration order, per distinct
+/// id of the design, in ascending id order, `q` standard normals `z` and the
+/// effects `b = Lz`, `L` the lower Cholesky factor of the grouping's
+/// covariance block (a column whose pivot vanishes at round-off is zero, so a variance at the
 /// boundary draws zero); then one family draw per row, in row order.
 ///
 /// The weights, raised to [`Fit::weight_power`], are read as R's family
@@ -239,11 +225,9 @@ impl<'a> Simulator<'a> {
                 }
                 // The column-major vech into the row-major lower triangle.
                 let mut sig = vec![0.0; q * q];
-                let mut t = 0;
                 for c in 0..q {
                     for r in c..q {
-                        sig[r * q + c] = vech[t];
-                        t += 1;
+                        sig[r * q + c] = vech[vech_at(q, r, c)];
                     }
                 }
                 // Factored as correlations, Σ = D·R·D with L = D·chol(R): on Σ

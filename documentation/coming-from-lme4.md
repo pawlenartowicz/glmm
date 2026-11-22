@@ -141,6 +141,10 @@ four oracles (lme4, glmmTMB, MixedModels.jl, GLMMadaptive).
   depend on the treatment coding (car's Type III on a treatment-coded `glm`
   tests a different hypothesis); Type II uses lmerTest's `X'X` metric on
   Gaussian mixed models and car's covariance metric on OLS, GLMs and GLMMs.
+  lmerTest's 1e-6 cutoff in that metric is applied to the Gram scaled to the
+  data, so Type II, and Type III on a model with one term or one column
+  (lmerTest's Type I construction), depart from lmerTest where lmerTest's
+  cutoff depends on a predictor's units.
   An interaction without its marginal terms gets no table.
 - **Likelihood-ratio rows of the fixed terms are refitted once, and Type II
   is car's.** As afex's `mixed(method = "LRT")` on a GLMM and car's

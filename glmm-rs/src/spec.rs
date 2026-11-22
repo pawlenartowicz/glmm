@@ -3,7 +3,11 @@
 //! level counts come from the [`crate::GroupIds`] of each fit, and magnitudes
 //! are fitted, not spec-carried (see [`ModelSpec`]).
 
-/// Predictor column index — indexes into the `p`-wide design matrix `x`.
+use crate::lmm::block_hidden;
+
+/// A random slope's design column index, on a design with `p` columns of `x`
+/// and `s` of [`crate::Design::re_columns`]: `c < p` reads column `c` of `x`;
+/// `p ≤ c < p + s` reads column `c − p` of `Design::re_columns`.
 pub type ColumnId = u32;
 
 /// One random-effect term on a grouping: the random intercept or not, and a
@@ -17,7 +21,7 @@ pub type ColumnId = u32;
 pub struct ReTerm {
     /// Whether the term holds the grouping's random intercept.
     pub intercept: bool,
-    /// The term's random-slope columns (0-based indices into `x`).
+    /// The term's random-slope columns (see [`ColumnId`]).
     pub slopes: Vec<ColumnId>,
 }
 
@@ -38,7 +42,7 @@ impl ReTerm {
         }
     }
 
-    /// Sets the term's random-slope columns (0-based indices into `x`).
+    /// Sets the term's random-slope columns (see [`ColumnId`]).
     pub fn slopes(mut self, cols: impl IntoIterator<Item = ColumnId>) -> ReTerm {
         self.slopes = cols.into_iter().collect();
         self
@@ -62,7 +66,7 @@ fn ordered_terms(terms: impl IntoIterator<Item = ReTerm>) -> (Vec<ReTerm>, Vec<C
 /// one term over the intercept and `slopes`): the intercept term, if the block
 /// has a random intercept, then one term per slope in `slopes` order.
 fn uncorrelated_terms(terms: &[ReTerm], slopes: &[ColumnId]) -> Vec<ReTerm> {
-    let intercept = terms.is_empty() || terms.iter().any(|t| t.intercept);
+    let intercept = !block_hidden(terms);
     intercept
         .then(ReTerm::intercept)
         .into_iter()
@@ -124,7 +128,7 @@ pub(crate) fn remap_slopes(
 pub struct Grouping {
     /// How this grouping's clusters relate to the primary grouping's rows.
     pub relation: GroupingRelation,
-    /// Random-slope design columns for this grouping (0-based indices into `x`);
+    /// Random-slope design columns for this grouping (see [`ColumnId`]);
     /// empty means random-intercept only; a column listed twice is refused with
     /// [`crate::FitError::Shape`].
     pub slopes: Vec<ColumnId>,
@@ -151,7 +155,7 @@ impl Grouping {
         }
     }
 
-    /// Sets this grouping's random-slope columns (0-based indices into `x`).
+    /// Sets this grouping's random-slope columns (see [`ColumnId`]).
     pub fn slopes(mut self, cols: impl IntoIterator<Item = ColumnId>) -> Grouping {
         self.slopes = cols.into_iter().collect();
         self
@@ -179,26 +183,28 @@ pub enum GroupingRelation {
     /// any primary cluster (e.g. items crossed with subjects).
     Crossed,
     /// Nested within the primary grouping: each level belongs to exactly one
-    /// primary cluster. Its ids are global child levels, dense over all
-    /// parents.
+    /// primary cluster. Its ids are `parent·W + position within the parent`
+    /// (see [`crate::GroupIds`]).
     NestedWithin,
 }
 
 /// Outcome distribution + link. Selects the fit kernel together with
 /// [`ModelSpec::re`] (`re.is_some()` ⇒ mixed): `Gaussian` → OLS / LMM,
-/// `Binomial{Logit}` → GLM / GLMM. Every variant here has a wired kernel, so no
-/// kernel-less variant is reachable through [`crate::fit`].
+/// `Binomial{Logit}` → GLM / GLMM. Every variant has a fixed-effects kernel;
+/// [`Family::InverseGaussian`] has no mixed one, and [`crate::fit`] refuses it
+/// with `re: Some(..)` ([`crate::FitError::Unsupported`]).
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Family {
     /// Normal response, identity link → OLS (`re: None`) or LMM (`re: Some`).
     Gaussian,
-    /// Bernoulli/binomial response → logistic/probit GLM (`re: None`) or GLMM
-    /// (`re: Some`). Counts are fit as expanded 0/1 rows (the kernel is
-    /// Bernoulli; see [`crate::fit`]). Variance `V(μ)=μ(1−μ)`,
-    /// dispersion `φ≡1`.
+    /// Bernoulli/binomial response → GLM (`re: None`) or GLMM (`re: Some`).
+    /// `y` is the success proportion in `[0, 1]`; aggregated trials pass their
+    /// count in [`crate::Data::weights`]. Variance `V(μ)=μ(1−μ)`, dispersion
+    /// `φ≡1`.
     Binomial {
-        /// Link function — [`BinomialLink::Logit`] (canonical) or `Probit`.
+        /// Link function — [`BinomialLink::Logit`] (canonical), `Probit` or
+        /// `Cloglog`.
         link: BinomialLink,
     },
     /// Poisson count response → log-link GLM/GLMM. Variance `V(μ)=μ`, dispersion
@@ -385,8 +391,8 @@ pub enum WaldSe {
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReStructure {
-    /// Random-slope design columns for the primary grouping (0-based indices
-    /// into `x`); empty means random-intercept only; a column listed twice is
+    /// Random-slope design columns for the primary grouping (see
+    /// [`ColumnId`]); empty means random-intercept only; a column listed twice is
     /// refused with [`crate::FitError::Shape`].
     pub slopes: Vec<ColumnId>,
     /// The primary grouping's random-effect terms. Empty means one
@@ -412,8 +418,7 @@ impl ReStructure {
         }
     }
 
-    /// Sets the primary grouping's random-slope columns (0-based indices into
-    /// `x`).
+    /// Sets the primary grouping's random-slope columns (see [`ColumnId`]).
     pub fn slopes(mut self, cols: impl IntoIterator<Item = ColumnId>) -> ReStructure {
         self.slopes = cols.into_iter().collect();
         self
@@ -507,87 +512,5 @@ impl ModelSpec {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{Data, FitError, FitOptions, GroupIds};
-
-    /// A spec whose terms do not describe its blocks returns
-    /// `FitError::Shape` naming the grouping and the reason, on the primary
-    /// and on an extra. Each row breaks one rule, so the reason names the
-    /// guard that refused it.
-    #[test]
-    fn bad_terms_are_a_shape_error() {
-        let n = 12;
-        let x: Vec<f64> = (0..n)
-            .flat_map(|i| [1.0, (i % 5) as f64, (i % 3) as f64])
-            .collect();
-        let y: Vec<f64> = (0..n).map(|i| ((i * 7) % 11) as f64).collect();
-        let ids = GroupIds::new((0..n as u32).map(|i| i % 4).collect())
-            .extra((0..n as u32).map(|i| i % 3).collect());
-        let data = Data::new(&x, &y, n, 3).ids(&ids);
-        let shape_error = |re: Re, grouping: &str, reason: &str| {
-            let spec = ModelSpec::mixed(Family::Gaussian, re);
-            match crate::fit(&data, &spec, &FitOptions::default()) {
-                Err(FitError::Shape(m)) => {
-                    assert!(m.contains(grouping) && m.contains(reason), "{m}")
-                }
-                Err(e) => panic!("{spec:?}: {e:?}"),
-                Ok(_) => panic!("{spec:?}: fitted"),
-            }
-        };
-        let crossed = || Re::intercept().extra(Grouping::crossed());
-        let not_in_order = "not the terms' columns in term order";
-        let empty = "neither the intercept nor a slope";
-
-        // `slopes` changed after the terms were set.
-        shape_error(
-            Re::intercept()
-                .terms([ReTerm::intercept().slopes([1])])
-                .slopes([2]),
-            "primary grouping",
-            not_in_order,
-        );
-        // A slope column in two terms.
-        shape_error(
-            Re::intercept().terms([
-                ReTerm::intercept().slopes([1]),
-                ReTerm::no_intercept().slopes([1]),
-            ]),
-            "primary grouping",
-            "slope column 1 is in two terms",
-        );
-        // The intercept in two terms.
-        shape_error(
-            Re::intercept().terms([ReTerm::intercept(), ReTerm::intercept().slopes([1])]),
-            "primary grouping",
-            "must be in term 0",
-        );
-        // An empty term.
-        shape_error(
-            Re::intercept().terms([ReTerm::intercept(), ReTerm::no_intercept()]),
-            "primary grouping",
-            empty,
-        );
-        // The intercept term not first, which only a field write can do.
-        // `slopes` is swapped too, so it still lists the terms' columns in
-        // term order and only the intercept guard can refuse the spec.
-        let mut re = Re::intercept().terms([
-            ReTerm::intercept().slopes([1]),
-            ReTerm::no_intercept().slopes([2]),
-        ]);
-        re.terms.swap(0, 1);
-        re.slopes.swap(0, 1);
-        shape_error(re, "primary grouping", "must be in term 0");
-        // The same checks reach an extra grouping.
-        shape_error(
-            crossed().extra(Grouping::crossed().terms([ReTerm::no_intercept()])),
-            "extra grouping 1",
-            empty,
-        );
-        let mut re = crossed();
-        re.extra_groupings[0] = Grouping::crossed()
-            .terms([ReTerm::no_intercept().slopes([1])])
-            .slopes([1, 2]);
-        shape_error(re, "extra grouping 0", not_in_order);
-    }
-}
+#[path = "spec_tests.rs"]
+mod tests;

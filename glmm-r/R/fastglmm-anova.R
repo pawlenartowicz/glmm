@@ -6,9 +6,8 @@
 # the native compare_fits and compare, the joint test in contrast_test, the
 # comparisons and their intervals in pairwise and pairwise_confint, R-squared
 # and the ICC in effect_sizes); this file only lays them out. Mirrors the Python port's
-# glmm/anova.py - change together. The per-term heading and note texts are
-# also copied in validation/tools/anova_ports/anova_ports.rs, which the anova
-# port gate compares with both ports.
+# glmm/anova.py - change together. The headings, notes and references come
+# from the native code (term_table_text, and the comparison record).
 
 #' Tests of fixed terms, and comparisons of two fits
 #'
@@ -170,7 +169,7 @@ anova.fastglmm <- function(object, ..., type = c("III", "II"), test = c("auto", 
   res <- .glmm_call("compare_fits", list(m0 = .compare_side(fits[[1L]]),
                                           m1 = .compare_side(fits[[2L]]),
                                           nsim = nsim, seed = seed))
-  .comparison_table(res, c("m0", "m1"), fits, NULL)
+  .comparison_table(res, c("m0", "m1"))
 }
 
 #' Compare two models fitted to the same data
@@ -260,9 +259,10 @@ compare <- function(data, f0, f1, ..., family = gaussian(), weights = NULL,
 
   # One row mask over the variables of both formulas, the weights and the
   # offset, so both models are fitted to the same rows.
-  vars <- unique(unlist(lapply(forms, all.vars)))
+  cols <- .formula_columns(f_strs, data)
+  vars <- cols$used
   data <- .as_data_frame(data, vars)
-  frame <- .data_columns(data, vars)
+  frame <- .data_columns(data, cols)
   for (f in forms) .check_contrasts(f, frame)
   # A missing weight or offset drops its row too, as a missing value in a
   # formula's variable does.
@@ -292,11 +292,7 @@ compare <- function(data, f0, f1, ..., family = gaussian(), weights = NULL,
   row_index <- which(keep)
   w <- frame[["(weights)"]]
   o <- frame[["(offset)"]]
-  # A one-sided formula has no response; the native code refuses it.
-  numeric_only <- unlist(lapply(forms, function(f) {
-    c(if (length(f) == 3L) all.vars(f[[2L]]), .offset_vars(f))
-  }))
-  cols <- .marshal(frame, vars, numeric_only)
+  cols <- .marshal(frame, vars, cols$numeric_only)
 
   res <- .glmm_call("compare", list(
     f0 = f_strs[[1L]], f1 = f_strs[[2L]], numeric = cols$numeric, factors = cols$factors,
@@ -309,13 +305,15 @@ compare <- function(data, f0, f1, ..., family = gaussian(), weights = NULL,
   fit <- function(r, i) {
     s <- new.env(parent = emptyenv())
     s$rows <- store$rows
-    own <- intersect(c(all.vars(forms[[i]]), "(weights)", "(offset)"), names(frame))
-    .fit_object(r, s, fam$object, f_strs[[i]], frame[own], row_index, call, data_name)
+    own <- c(.formula_columns(f_strs[[i]], frame)$used,
+             intersect(c("(weights)", "(offset)"), names(frame)))
+    .fit_object(r, s, fam$object, f_strs[[i]], frame[own],
+                cols$factors[names(cols$factors) %in% own], row_index, call, data_name)
   }
   fit0 <- fit(res$fit0, 1L)
   fit1 <- fit(res$fit1, 2L)
   structure(list(
-    table = .comparison_table(res, c("f0", "f1"), list(fit0, fit1), fit0$family_name),
+    table = .comparison_table(res, c("f0", "f1")),
     fit0 = fit0,
     fit1 = fit1
   ), class = "fastglmm_comparison")
@@ -405,7 +403,7 @@ contrast_test <- function(object, L) {
   # A contrast is not a term, so its row has no partial eta-squared.
   res$eta2_partial <- NULL
   # "Wald": the one-line heading of an explicitly asked chi-squared table.
-  .term_anova(object, res, "Wald", identical(res$kind, "F"), FALSE)
+  .term_anova(object, res, "Wald", identical(res$kind, "F"))
 }
 
 # A robust fit's model covariance as the native contrast_test, pairwise and
@@ -666,48 +664,6 @@ print.fastglmm_pairwise_ci <- function(x, ...) print.fastglmm_pairwise(x, ...)
   dots
 }
 
-# A df for a reference line, never in scientific notation and never padded:
-# an integer when integral or 1e4 and above, else four significant digits
-# (2.5, 12.35); NA and NaN print as NA, an infinite df as Inf or -Inf.
-# Mirrors the Python port's fmt_df - change together.
-.fmt_df <- function(df) {
-  if (is.na(df)) return("NA")
-  if (is.infinite(df)) return(if (df > 0) "Inf" else "-Inf")
-  if (df == round(df) || abs(df) >= 1e4) return(sprintf("%.0f", df))
-  trimws(formatC(df, digits = 4L, format = "fg"))
-}
-
-# One notation for a reference distribution, as the Python port writes it. A
-# df that is NaN (an aliased term, a row with no denominator df) names none.
-.f_reference <- function(num_df, den_df) {
-  if (is.nan(num_df) || is.nan(den_df)) "" else
-    sprintf("F(%s, %s)", .fmt_df(num_df), .fmt_df(den_df))
-}
-.chisq_reference <- function(df) if (is.nan(df)) "" else sprintf("\u03c7\u00b2(%s)", .fmt_df(df))
-
-# Why "auto" gave a chi-squared table its test, by the fit's term_test_auto
-# reason. Mirrors the Python port's _AUTO_REASONS and
-# validation/tools/anova_ports/anova_ports.rs - change together.
-.AUTO_REASONS <- c(
-  poisson_mixed = "Poisson model with random effects",
-  binomial_mixed = "binomial model with random effects",
-  negative_binomial_mixed = "negative binomial model with random effects",
-  other_mixed = "Gamma model with random effects",
-  no_random_effects = "model without random effects")
-
-# The last note of a Satterthwaite F table with the Eta2_partial column.
-# Mirrors the Python port's _ETA2_LINE and
-# validation/tools/anova_ports/anova_ports.rs - change together.
-.ETA2_LINE <- "Partial eta-squared uses the Satterthwaite denominator df, so it is approximate."
-
-# The first note of a fit that did not converge. Mirrors the Python port's
-# _NOT_CONVERGED and validation/tools/anova_ports/anova_ports.rs - change
-# together.
-.NOT_CONVERGED <- paste(
-  "The fit did not converge, so its estimates are not at a maximum and these tests",
-  "are not reliable. Change the model until it converges (a simpler random part often",
-  "helps), then test again.")
-
 # Stops on a fit made by a fastglmm version without these tests, naming the
 # fields it lacks.
 .check_fields <- function(fit, fields) {
@@ -749,7 +705,7 @@ print.fastglmm_pairwise_ci <- function(x, ...) print.fastglmm_pairwise(x, ...)
   # takes an explicit test.
   .check_fields(object, c(field, if (identical(test, "auto")) "term_test_auto"))
   res <- object[[field]]
-  if (!is.null(res$error)) stop(res$error, call. = FALSE)
+  if (!is.null(res$error)) .term_text(object, res, test)
   dm <- .df_method(object)
   f_rows <- if (length(res$kind)) res$kind[[1L]] == "F" else dm != "none"
   if (f_rows && !identical(test, "auto")) {
@@ -773,9 +729,9 @@ print.fastglmm_pairwise_ci <- function(x, ...) print.fastglmm_pairwise(x, ...)
                  'Use test = "Wald", or refit with fastglmm(..., anova_test = "auto").'),
            call. = FALSE)
     }
-    if (!is.null(res$error)) stop(res$error, call. = FALSE)
+    if (!is.null(res$error)) .term_text(object, res, test)
   }
-  .term_anova(object, res, test, f_rows, lrt)
+  .term_anova(object, res, test, f_rows)
 }
 
 # The two likelihood-ratio tables of a fit made with anova_test = "auto",
@@ -799,63 +755,26 @@ print.fastglmm_pairwise_ci <- function(x, ...) print.fastglmm_pairwise(x, ...)
   cache$tables
 }
 
-# The heading's name of each denominator-df source, in heading order. Mirrors
-# the Python port's _DF_METHODS and validation/tools/anova_ports/anova_ports.rs -
-# change together.
-.DF_METHODS <- c(pustejovsky_tipton = "Pustejovsky-Tipton's",
-                 bell_mccaffrey = "Bell-McCaffrey's",
-                 satterthwaite = "Satterthwaite's")
-
-# " with X's method" (or "X's and Y's methods") for the df sources in `kinds`,
-# "" for none (the residual df is not named).
-.df_methods_phrase <- function(kinds) {
-  names <- unname(.DF_METHODS[names(.DF_METHODS) %in% kinds])
-  if (!length(names)) return("")
-  paste0(" with ", paste(names, collapse = " and "),
-         if (length(names) > 1L) " methods" else " method")
+# The heading lines, notes and per-row references the native code words for
+# a stored per-term result `res` of `object` read for test `test`; a stored
+# refusal is raised as an error of class fastglmm_error_<code> (internal for
+# a bug in the crate, fit_error for the model's refusal).
+.term_text <- function(object, res, test) {
+  .glmm_call("term_table_text", list(
+    table = res, test = test, df_method = .df_method(object),
+    converged = isTRUE(object$converged), term_test_auto = object$term_test_auto))
 }
 
 # The anova data frame of a stored per-term result `res` of `object`, read
 # for test `test`, or of contrast_test()'s row, whose ss_type is NULL, so its
-# heading names no type. `f_rows` says the rows are F tests, `lrt` that `res`
-# is a likelihood-ratio table.
-.term_anova <- function(object, res, test, f_rows, lrt) {
-  # The heading names the df method of the rows that have df: on a fit with
-  # the pass switched off or failed, no row does.
-  kinds <- if (length(res$label)) {
-    res$den_df_kind[is.finite(res$den_df)]
-  } else {
-    .df_method(object)
-  }
-  satterthwaite <- "satterthwaite" %in% kinds
-  # The likelihood-ratio heading's second line names the test and why it
-  # ran. Mirrors the Python port's heading and
-  # validation/tools/anova_ports/anova_ports.rs - change together.
-  # An explicit "Wald" keeps the one-line heading.
-  title <- if (lrt || (!f_rows && identical(test, "auto"))) {
-    why <- if (identical(test, "LRT")) {
-      'test = "LRT"'
-    } else {
-      paste0('test = "auto": ', .AUTO_REASONS[[object$term_test_auto$reason]])
-    }
-    line <- if (lrt) {
-      paste0("Likelihood-ratio chi-squared tests (each term's model refitted without it)",
-             if (identical(res$ss_type, "III")) " on the reduced design")
-    } else {
-      "Wald chi-squared tests"
-    }
-    c("Analysis of Deviance Table", paste0(line, "; ", why))
-  } else if (!f_rows) {
-    "Analysis of Deviance Table (Wald chi-squared tests)"
-  } else {
-    paste0("Analysis of Variance Table", .df_methods_phrase(kinds))
-  }
+# heading names no type. `f_rows` says the rows are F tests.
+.term_anova <- function(object, res, test, f_rows) {
+  words <- .term_text(object, res, test)
   # An untested cell is NA, not NaN, so print.anova leaves it blank, as on
   # lmerTest's and car's tables.
   na <- function(v) replace(v, is.nan(v), NA_real_)
   # A fit saved before the Eta2_partial column, and a contrast, have none.
   # It sits before the p-value, which print.anova needs last for its stars.
-  eta2 <- f_rows && !is.null(res$eta2_partial)
   tab <- if (f_rows) {
     data.frame(`Sum Sq` = na(res$sum_sq), `Mean Sq` = na(res$mean_sq),
                NumDF = na(res$num_df), DenDF = na(res$den_df),
@@ -865,18 +784,11 @@ print.fastglmm_pairwise_ci <- function(x, ...) print.fastglmm_pairwise(x, ...)
                `Pr(>Chisq)` = na(res$p_value), check.names = FALSE)
   }
   if (f_rows) {
-    if (eta2) tab$Eta2_partial <- na(res$eta2_partial)
+    if (!is.null(res$eta2_partial)) tab$Eta2_partial <- na(res$eta2_partial)
     tab[["Pr(>F)"]] <- na(res$p_value)
   }
   rownames(tab) <- res$label
-  row_notes <- unlist(Map(function(label, notes) {
-    if (length(notes)) paste0(label, ": ", notes)
-  }, res$label, res$row_notes), use.names = FALSE)
-  if (!is.null(res$ss_type)) title[1L] <- paste("Type", res$ss_type, title[1L])
-  structure(tab, heading = c(title,
-                            if (!isTRUE(object$converged)) .NOT_CONVERGED, res$notes, row_notes,
-                            if (eta2 && satterthwaite) .ETA2_LINE),
-            class = c("anova", "data.frame"))
+  structure(tab, heading = c(words$heading, words$notes), class = c("anova", "data.frame"))
 }
 
 # What anova(m0, m1) reads of one stored fit, named as the native
@@ -905,8 +817,8 @@ print.fastglmm_pairwise_ci <- function(x, ...) print.fastglmm_pairwise(x, ...)
     dispersion_held = .optional(fit$dispersion_held),
     design_summary = fit$design_summary,
     rss = as.double(fit$rss),
-    coef_names = names(fit$beta),
-    coef = unname(as.double(fit$beta)),
+    names = names(fit$beta),
+    beta = unname(as.double(fit$beta)),
     vcov = as.double(t(fit$vcov)),
     aliased = unname(as.logical(fit$aliased))
   )
@@ -914,63 +826,34 @@ print.fastglmm_pairwise_ci <- function(x, ...) print.fastglmm_pairwise(x, ...)
 
 # The comparison table from the native compare_fits' or compare's record
 # `cmp`: one row per model, the smaller first, named by `labels` (the models
-# as given); `fits` are the two fit objects (the OLS pair reads their RSS).
-# The heading names the test, the two formulas, the reference (with the draws
-# made) and the notes; `nsim` (the draws asked for) and `seed` are
-# attributes. `family` is compare()'s, NULL from anova(m0, m1): compare()
-# says why it fitted a Gaussian pair by ML.
-.comparison_table <- function(cmp, labels, fits, family) {
+# as given). The heading names the test, the two formulas, the reference (with
+# the draws made) and the notes; `nsim` (the draws asked for) and `seed` are
+# attributes.
+.comparison_table <- function(cmp, labels) {
   ord <- if (cmp$larger == 0) 2:1 else 1:2
   sides <- cmp$sides[ord]
-  ref <- cmp$reference
   labels <- labels[ord]
   num <- function(name) vapply(sides, function(s) as.double(s[[name]]), numeric(1))
   tested <- function(x) c(NA_real_, x)
   lr <- identical(cmp$test, "lr")
-  ols <- !lr && identical(cmp$sides[[1L]]$objective, "least_squares")
   cols <- if (lr) {
     c(list(npar = num("npar")),
       if (!any(vapply(sides, function(s) is.null(s$aic), NA))) {
         list(AIC = num("aic"), BIC = num("bic"))
       },
       list(logLik = num("loglik"), Chisq = tested(cmp$statistic),
-           Df = tested(if (identical(ref$kind, "exact")) NA_real_ else cmp$df),
+           Df = tested(if (identical(cmp$reference_kind, "exact")) NA_real_ else cmp$df),
            `Pr(>Chisq)` = tested(cmp$p_value)))
   } else {
-    res_df <- num("nobs") - (num("npar") - 1)
-    rss <- vapply(fits[ord], function(f) as.double(f$rss), numeric(1))
-    c(list(Res.Df = res_df),
-      if (ols) list(RSS = rss),
+    c(list(Res.Df = num("res_df")),
+      if (cmp$ols) list(RSS = num("rss")),
       list(Df = tested(cmp$df)),
-      if (ols) list(`Sum of Sq` = tested(rss[[1L]] - rss[[2L]])),
+      if (cmp$ols) list(`Sum of Sq` = tested(cmp$sum_sq)),
       list(F = tested(cmp$statistic), `Pr(>F)` = tested(cmp$p_value)))
   }
   tab <- as.data.frame(cols, check.names = FALSE, row.names = labels)
-  title <- if (lr) {
-    switch(cmp$objective,
-      reml = "Model comparison: likelihood ratio test on the REML criterion",
-      laplace = "Model comparison: likelihood ratio test (Laplace)",
-      agq = sprintf("Model comparison: likelihood ratio test (AGQ %d)", cmp$objective_nodes),
-      "Model comparison: likelihood ratio test (ML)")
-  } else {
-    "Model comparison: F test"
-  }
-  rlrt <- "exact RLRT null distribution (Crainiceanu & Ruppert 2004)"
-  reference <- switch(ref$kind,
-    chisq = .chisq_reference(ref$df),
-    chibar = sprintf("50:50 mixture of %s and %s", .chisq_reference(ref$df),
-                     .chisq_reference(ref$df + 1)),
-    exact = if (ref$nsim > 0) {
-      sprintf("%s, %.0f draws", rlrt, ref$nsim)
-    } else {
-      paste0(rlrt, "; no draws needed: the statistic is 0, so p = 1")
-    },
-    f = .f_reference(ref$df, ref$den_df))
-  notes <- cmp$notes
-  if (identical(family, "gaussian") && lr && !identical(cmp$differs, "random")) {
-    notes <- c(notes, "Both models were fitted by ML because their fixed parts differ.")
-  }
   models <- paste0(labels, ": ", vapply(sides, `[[`, character(1), "formula"))
-  structure(tab, heading = c(title, models, paste0("Reference: ", reference, "."), notes),
+  structure(tab, heading = c(cmp$heading, models, paste0("Reference: ", cmp$reference, "."),
+                             cmp$notes),
             nsim = cmp$nsim, seed = cmp$seed, class = c("anova", "data.frame"))
 }

@@ -27,7 +27,7 @@
 //! against the reference-band numerator), which this module measures alongside
 //! `M` so the two can be compared. On this corpus `M*` is 1.1e-7 to 6.5e-5 on
 //! the five rungs whose gap grows, and at most 4.4e-10 on the others. It is
-//! reported, not enforced: adopting it is a separate decision.
+//! reported, not enforced.
 //!
 //! The reference deviance comes from PIRLS with its exit band shrunk until the
 //! penalized deviance stops changing, never from "the same solve a few decades
@@ -48,10 +48,7 @@ use serde_json::Value;
 
 use crate::fit::SizedSpec;
 use crate::formula::{lower, Column, Table};
-use crate::glmm::{
-    fd_mixed_diff, fd_second_diff, glmm_laplace_deviance, pirls_tol_fd, GlmmLayout, FD_STEP_BASE,
-    SPARSE_FD_STEP_REL,
-};
+use crate::glmm::{fd_mixed_diff, fd_second_diff, fd_step, glmm_laplace_deviance, pirls_tol_fd};
 use crate::test_support::table_from_rows;
 use crate::{BinomialLink, Family, GammaLink, GroupIds, ModelSpec, NegBinomialLink, PoissonLink};
 
@@ -647,18 +644,9 @@ fn measure_fit(r: &Rung, sized: &SizedSpec, ids: &GroupIds) -> Measured {
     let seed: Vec<f64> = ws.pirls.u[..kk].to_vec();
     ws.u_seed[..kk].copy_from_slice(&seed);
     ws.fd.warm_seed_active = true;
-    // Whichever step rule the layout's shipped stencil uses — the packed-row one
-    // is relative on every coordinate, the other two absolute on the θ block.
+    // The layout's shipped step rule.
     let steps: Vec<f64> = (0..m)
-        .map(|k| {
-            if ws.layout == GlmmLayout::Packed {
-                SPARSE_FD_STEP_REL * gamma[k].abs().max(1.0)
-            } else if k < n_theta {
-                FD_STEP_BASE
-            } else {
-                FD_STEP_BASE * gamma[k].abs().max(1.0)
-            }
-        })
+        .map(|k| fd_step(ws.layout, k, n_theta, gamma[k]))
         .collect();
 
     let (xr, y, cid, eid) = (x_mat.as_ref(), &r.y, &ids.primary, &ids.extra);

@@ -1,12 +1,11 @@
 //! Shared helpers for the glmm side of the accuracy grid (`grid/manifest.json`).
-//! Included via `#[path = ...]` rather than a library module, by two callers:
-//! `glmm.rs`, the grid's dev-only example engine, and `tests/grid_reference.rs`,
-//! the crate's saved-reference check over the `fast` cells. Sharing this file is
-//! what keeps both callers' record shape identical.
-//!
-//! `validation/tools/common.rs` is a SEPARATE file that reads the per-rung
-//! manifest shape of `validation/manifest.json` and is the `#[path]` target of the
-//! examples built on it. Neither file is a drop-in for the other.
+//! Included via `#[path = ...]` rather than a library module, by three callers:
+//! `glmm.rs`, the grid's dev-only example engine, `tests/grid_reference.rs`, the
+//! crate's saved-reference check over the `fast` cells, and
+//! `validation/tools/common.rs`, which takes its CSV reader, `build_table`,
+//! `num`/`nums`, `rx_options` and `lower_dataset_generic` from here and adds the
+//! readers of the per-rung manifest. Sharing this file is what keeps the grid
+//! engine's and the saved-reference check's record shape identical.
 
 use glmm::formula::{lower, Column, Lowered, ReGroupInfo, Table};
 use glmm::{
@@ -19,7 +18,8 @@ use std::time::Instant;
 /// Read a grid CSV at an explicit path (unquoted header + rows, `,`-split).
 /// Every cell names its own file through the manifest's `data` field, so the
 /// path is the only thing that varies between a generated cell and a crate
-/// fixture.
+/// fixture. `tools/anova_ports/anova_ports.rs`'s `read_data` keeps its own copy
+/// of this parse and of `build_table`'s typing -- change together.
 pub fn read_csv_path(path: &str) -> (Vec<String>, Vec<Vec<String>>) {
     let raw = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read csv {path}: {e}"));
     let mut lines = raw.lines().filter(|l| !l.trim().is_empty());
@@ -104,7 +104,15 @@ pub fn lower_grid_cell(cell: &Value, grid_dir: &str) -> (Lowered, FitOptions, bo
     // theirs rewritten when `glmm_formula` was built.
     let formula = cell["glmm_formula"].as_str().expect("cell.glmm_formula");
     let family = family_of(cell);
-    let (mut lo, _table) = lower_dataset_generic(cell, &header, &rows, &factors, formula, family);
+    let (mut lo, _table) = lower_dataset_generic(
+        cell,
+        &header,
+        &rows,
+        &factors,
+        formula,
+        family,
+        cell["response"].as_str(),
+    );
     // Prior (precision) weights. Mutually exclusive with the aggregated-binomial
     // `weights` field lower_dataset_generic already routed, and the manifest
     // generator asserts the exclusion, so this cannot overwrite trial counts.
@@ -171,13 +179,18 @@ pub fn family_of(cell: &Value) -> Family {
     }
 }
 
-/// Build the lowered fit inputs for one cell, handling the one genuinely
-/// data-shape-dependent branch: an aggregated-binomial cell (manifest `weights`)
+/// Build the lowered fit inputs for one cell or rung, handling the one genuinely
+/// data-shape-dependent branch: an aggregated-binomial entry (its `weights` field)
 /// synthesizes `prop = <response>/<weights column>` so the formula's `prop ~ ...`
 /// response resolves, then passes the trial counts into `Data::weights`,
 /// one row per aggregate observation -- exactly lme4's `cbind(s, m-s)`
 /// objective, whose deviance differs from the expanded-Bernoulli one only by a
-/// data-only saturated constant.
+/// data-only saturated constant. `response` names the success-count column; it
+/// is read only on an aggregated-binomial entry, which must supply it.
+///
+/// Returns the built `Table` alongside the `Lowered`, so a caller that wants to
+/// time the lowering can re-run `lower(formula, &table, family)` in a loop
+/// without re-parsing the CSV.
 pub fn lower_dataset_generic(
     cell: &Value,
     header: &[String],
@@ -185,13 +198,14 @@ pub fn lower_dataset_generic(
     factors: &[String],
     formula_str: &str,
     family: Family,
+    response: Option<&str>,
 ) -> (Lowered, Table) {
     let Some(w_name) = cell["weights"].as_str() else {
         let table = build_table(header, rows, factors);
         let lo = lower(formula_str, &table, family).unwrap_or_else(|e| panic!("lower: {e}"));
         return (lo, table);
     };
-    let resp = cell["response"].as_str().expect("cell.response");
+    let resp = response.expect("an aggregated-binomial entry needs its response column");
     let w_idx = header
         .iter()
         .position(|h| h == w_name)
@@ -242,6 +256,9 @@ pub fn done_cells(path: &str) -> std::collections::HashSet<String> {
 /// record the comparator would have to guess about. `se_rx` and `se_hessian`
 /// are NOT seeded: they are the two keys that are legitimately ABSENT where an
 /// engine has none, so the caller inserts them only when it has them.
+/// `run.sh`'s `stub_record` writes this schema for a cell the engine never
+/// wrote, as do the twins `glmm_python.py::base_record`,
+/// `common.R::grid_record` and `mixedmodels.jl::fail_record`: change together.
 pub fn base_record(cell_id: &str, engine: &str, engine_version: &str) -> Value {
     json!({
         "cell": cell_id, "engine": engine, "engine_version": engine_version,

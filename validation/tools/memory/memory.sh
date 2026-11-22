@@ -199,9 +199,8 @@ emit() {
   printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$engine" "$dataset" "$rung" "$n" "$levels" "$kb" >> "$out"
 }
 
-# Peak RSS in KB via /usr/bin/time -f '%M' -- the same max-RSS source
-# toy28/ram.sh reads (there via -v's "Maximum resident set size"); -f '%M'
-# reports just the number, which is all this harness needs.
+# Peak RSS in KB via /usr/bin/time -f '%M', which reports just the number
+# (the value -v prints as "Maximum resident set size").
 #
 # Two separate files, not one: GNU time's -o file is opened in truncate mode
 # once the child exits and its own report is written into it, so a single

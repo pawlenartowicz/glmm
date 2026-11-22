@@ -12,9 +12,9 @@ use faer::MatRef;
 use crate::consts::{GH_NODES, GH_OFFSETS, GH_WEIGHTS};
 use crate::family::{link_inv, mean_out_of_range, mu_eta};
 use crate::fit::validate_design;
-use crate::fit::CondvarCross;
+use crate::fit::{vech_at, vech_quad_into, CondvarCross};
 use crate::inference::tails::normal_quantile;
-use crate::lmm::slope_value;
+use crate::lmm::{block_hidden, slope_value};
 use crate::{
     Design, ErrorMessage, Family, Fit, FitError, GroupIds, GroupingRelation, ModelSpec, Note,
     ReStructure,
@@ -293,7 +293,7 @@ pub(crate) fn reported_columns<'a>(
                 .map(|(g, e)| (&g.slopes, &g.terms, &e[..])),
         )
         .map(|(slopes, terms, ids)| {
-            let intercept = terms.is_empty() || terms.iter().any(|t| t.intercept);
+            let intercept = !block_hidden(terms);
             let cols = intercept
                 .then_some(None)
                 .into_iter()
@@ -434,6 +434,8 @@ pub(crate) fn predict_parts(
             if id < b.levels {
                 continue;
             }
+            // Mirrored in `orchestrate::predict` for the ports' wording, which
+            // names the grouping; change together.
             if !opts.allow_new_levels {
                 return Err(FitError::Ids(ErrorMessage::at_row(
                     format!("grouping {g} has a level the fit did not see at row "),
@@ -523,14 +525,7 @@ pub(crate) fn predict_parts(
             // `condvar` holds the level's block as a column-major vech.
             let v = q * (q + 1) / 2;
             let c = &parts.condvar[b.condvar + level * v..b.condvar + (level + 1) * v];
-            let mut t = 0;
-            for col in 0..q {
-                for r in col..q {
-                    let both = if r == col { 1.0 } else { 2.0 };
-                    var_b += both * c[t] * z[r] * z[col];
-                    t += 1;
-                }
-            }
+            vech_quad_into(&mut var_b, c, z);
             let k =
                 &parts.condvar_x[b.condvar_x + level * q * p..b.condvar_x + (level + 1) * q * p];
             for (r, &zr) in z.iter().enumerate() {
@@ -836,12 +831,6 @@ impl<'a> Cross<'a> {
     }
 }
 
-/// The index of entry `(r, c)`, `r ≥ c`, in the column-major lower-triangle
-/// vech of an `n × n` matrix.
-fn vech_at(n: usize, r: usize, c: usize) -> usize {
-    c * (2 * n - c + 1) / 2 + r - c
-}
-
 /// The Gauss-Hermite order of the future-observation mixture.
 const FUTURE_NODES: usize = 21;
 
@@ -954,7 +943,9 @@ fn discrete_quantile(cdf: &dyn Fn(i64) -> f64, p: f64, start: i64, max: i64) -> 
 }
 
 /// The `y > 0` with `cdf(y) = p` for a CDF on the positive half-line: an
-/// upper bracket doubled from `start`, then bisection to 1e-12 relative.
+/// upper bracket doubled from `start`, then bisection to 1e-12 relative, or
+/// until the bracket holds no double between its ends (a quantile below the
+/// smallest subnormal ends at 0).
 fn continuous_quantile(cdf: &dyn Fn(f64) -> f64, p: f64, start: f64) -> f64 {
     let mut hi = if start > 0.0 { start } else { 1.0 };
     while cdf(hi) < p {
@@ -966,6 +957,9 @@ fn continuous_quantile(cdf: &dyn Fn(f64) -> f64, p: f64, start: f64) -> f64 {
     let mut lo = 0.0f64;
     while hi - lo > 1e-12 * hi {
         let mid = 0.5 * (lo + hi);
+        if mid == lo || mid == hi {
+            break;
+        }
         if cdf(mid) >= p {
             hi = mid;
         } else {

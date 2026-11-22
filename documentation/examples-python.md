@@ -106,7 +106,7 @@ Correlation of Fixed Effects:
 Days              -0.138
 
 Optimizer evaluations: 12, converged: True
-t tests use Satterthwaite degrees of freedom (finite-difference θ-Hessian).
+t tests use Satterthwaite degrees of freedom.
 Subject stddevs: [24.74045614  5.92213187]
 Subject corr: [[1.0, 0.06555150641110637], [0.06555150641110637, 1.0]]
 loglik (REML crit): -871.8141359792539  reml: True
@@ -191,7 +191,7 @@ Fixed effects:
 Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
 
 Optimizer evaluations: 46, converged: True
-t tests use Satterthwaite degrees of freedom (finite-difference θ-Hessian).
+t tests use Satterthwaite degrees of freedom.
 plate stddev: 0.8467045342
 sample stddev: 1.931557938
 loglik (REML crit): -165.43029449553177  reml: True
@@ -270,7 +270,7 @@ Fixed effects:
 Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
 
 Optimizer evaluations: 31, converged: True
-t tests use Satterthwaite degrees of freedom (finite-difference θ-Hessian).
+t tests use Satterthwaite degrees of freedom.
 loglik (REML crit): -123.49537292741952
 
 oracle cross-check vs goldens/pastes_lmm.json (manifest rung 4):
@@ -665,7 +665,7 @@ recipeB:temp        0.676       -0.956       -0.478       -0.707
 recipeC:temp        0.676       -0.478       -0.956       -0.707        0.500
 
 Optimizer evaluations: 12, converged: True
-t tests use Satterthwaite degrees of freedom (finite-difference θ-Hessian).
+t tests use Satterthwaite degrees of freedom.
 
 === base = B (pandas.Categorical(categories=['B', 'A', 'C'])) ===
 Linear mixed model fit by REML [glmm]
@@ -704,7 +704,7 @@ recipeA:temp        0.676       -0.956       -0.478       -0.707
 recipeC:temp        0.676       -0.478       -0.956       -0.707        0.500
 
 Optimizer evaluations: 12, converged: True
-t tests use Satterthwaite degrees of freedom (finite-difference θ-Hessian).
+t tests use Satterthwaite degrees of freedom.
 
 Same fit, different parameterization: fitted values and loglik agree (loglik A=-851.63374, loglik B=-851.63374, delta=-6.82e-13); only which contrasts are directly readable off beta changes.
 

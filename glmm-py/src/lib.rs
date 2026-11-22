@@ -5,6 +5,7 @@
 //! attribute `code`: `invalid_argument`, `fit_error` or `compare_error` on a
 //! `ValueError`, `internal` on a `RuntimeError`.
 
+use glmm_bind::fields::{COLUMN_MAPS, PY_BYTES, PY_INT64_ARG, PY_NESTED_BYTES};
 use glmm_bind::{BindError, Port, Record, Value};
 
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
@@ -50,12 +51,8 @@ fn values_bytes<'py, T: Copy, const N: usize>(
     })
 }
 
-/// Arguments whose dict maps a column name to its data: their entries are
-/// named `column "x"` in a bytes error.
-const COLUMN_MAPS: &[&str] = &["numeric", "factors", "new_numeric", "new_factors"];
-
 /// A Python value as a [`Value`]; `what` names it in a bytes error. Bytes are
-/// float64 values, except `row_index`'s int64 ones; a `(levels, codes)` tuple
+/// float64 values, except [`PY_INT64_ARG`]'s int64 ones; a `(levels, codes)` tuple
 /// whose codes are uint32 bytes is a factor; a list of one scalar type is that
 /// type's vector. A numpy array or scalar crosses through its `tolist()`.
 fn to_value(obj: &Bound<'_, PyAny>, what: &str) -> PyResult<Value> {
@@ -83,7 +80,7 @@ fn to_value(obj: &Bound<'_, PyAny>, what: &str) -> PyResult<Value> {
         });
     }
     if let Ok(b) = obj.cast::<PyBytes>() {
-        return Ok(if what == "row_index" {
+        return Ok(if what == PY_INT64_ARG {
             Value::IntVec(from_bytes(b.as_bytes(), what, i64::from_ne_bytes)?)
         } else {
             Value::Vec(from_bytes(b.as_bytes(), what, f64::from_ne_bytes)?)
@@ -176,45 +173,18 @@ fn typed_list(items: Vec<Value>) -> Value {
     Value::List(items)
 }
 
-/// The fit record's per-row fields `glmm/__init__.py` reads as bytes.
-const FIT_BYTES: &[&str] = &[
-    "fitted",
-    "ranef",
-    "ranef_levels",
-    "y",
-    "weights",
-    "offset",
-    "condvar",
-    "condvar_x",
-];
-
-/// The fit record's `robust` fields `glmm/__init__.py` reads as bytes: the
-/// ones that grow with the rows (HC2 has one cluster per row).
-const ROBUST_BYTES: &[&str] = &["er", "row_e", "row_x", "row_phi"];
-
 /// The fields of function `name`'s result that cross back as bytes.
 fn bytes_fields(name: &str) -> &'static [&'static str] {
-    match name {
-        "fit" => FIT_BYTES,
-        "predict" => &[
-            "fit",
-            "se",
-            "lower",
-            "upper",
-            "future_lower",
-            "future_upper",
-        ],
-        "model_matrix" => &["x"],
-        "plain_column" => &["values", "codes"],
-        _ => &[],
-    }
+    PY_BYTES
+        .iter()
+        .find(|(call, _)| *call == name)
+        .map_or(&[], |&(_, fields)| fields)
 }
 
 /// A [`Value`] as a Python value: a record as a dict, a vector as a list, or
 /// as bytes (float64, int64 for an integer vector) with `as_bytes`. `bytes`
-/// names the fields of a record that cross as bytes; a fit record nested in
-/// it (`compare`'s `fit0` and `fit1`) takes [`FIT_BYTES`], and a fit's
-/// `robust` record [`ROBUST_BYTES`].
+/// names the fields of a record that cross as bytes; a record nested in it
+/// takes its own from [`PY_NESTED_BYTES`].
 fn to_py<'py>(
     py: Python<'py>,
     v: Value,
@@ -246,11 +216,10 @@ fn to_py<'py>(
         Value::Record(r) => {
             let d = PyDict::new(py);
             for (k, v) in r.into_fields() {
-                let inner = match k.as_str() {
-                    "fit0" | "fit1" => FIT_BYTES,
-                    "robust" => ROBUST_BYTES,
-                    _ => &[],
-                };
+                let inner = PY_NESTED_BYTES
+                    .iter()
+                    .find(|(field, _)| *field == k)
+                    .map_or(&[][..], |&(_, fields)| fields);
                 let as_bytes = bytes.contains(&k.as_str());
                 d.set_item(k, to_py(py, v, inner, as_bytes)?)?;
             }

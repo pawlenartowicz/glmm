@@ -3,7 +3,7 @@
 The same Rust parser (`glmm::formula`, the `formula` cargo feature, on by
 default) backs the formula string wherever `glmm` takes one: Rust callers
 using `glmm::formula::lower`, Python's `glmm.fit`, and R's `fastglmm`. It
-follows R-style conventions — `~` separates response from predictors, `+`
+follows R-style conventions — `~` (or `=`) separates response from predictors, `+`
 adds terms, `:` and `*` build interactions — plus a small, closed whitelist of
 R's function-call syntax: `log()`/`sqrt()`/`exp()`/`I(x^k)` on one bare column,
 `offset()`, `cbind()` on the response, and `zerocorr()` around a random-effect
@@ -13,6 +13,8 @@ term.
 
 | Construct | Meaning | Example |
 |---|---|---|
+| `y = …` | Read as `y ~ …` | `y = x1 + x2` → `y ~ x1 + x2` |
+| No response (no `~` and no `=`, or nothing before the `~` or `=`) | The response is the column named `explained_variable`; on data without that column the formula is refused with "the formula has no response; write it as y ~ x" | `x1 + x2`, `~ x1 + x2` |
 | Bare column name | A fixed-effect main effect | `x1` |
 | Column names | ASCII names follow R's syntactic-name rule: a letter, `_`, or a `.` not followed by a digit, then letters, digits, `_` or `.`. Any non-ASCII character that is not whitespace or a control character is also a name character, so accented (also NFD), CJK and emoji names work; a name does not start with a digit. In Python, a `.` between two emoji (`😀.😀`), or at the start of a name before an emoji (`.😀`), is refused as the unsupported `.` shorthand. In R, a name R's own parser needs backticks for is refused. | `age.years`, `(1 \| school.id)`, `体重` |
 | `+` | Add another term | `x1 + x2` |

@@ -1312,8 +1312,6 @@ struct Counters {
     pirls_hist: Vec<u32>,
     agq_evals: u32,
     agq_node_evals: u64,
-    nb_nodes: u32,
-    nb_evals_total: u64,
 }
 
 mod api {
@@ -1438,7 +1436,7 @@ mod api {
         }
         let sv: Option<&StartValues> = start.map(|_| &*sv);
         probe.begin();
-        let view = fit_on(ws, &Data::new(x, y, *n, *p), sv, opts);
+        let view = fit_on(ws, &Data::new(x, y, *n, *p), sv, opts).unwrap();
         probe.end();
         let diag = view.diagnostics();
         let mut out = Out {
@@ -1497,8 +1495,6 @@ mod api {
             pirls_hist: c.pirls_hist[..last].to_vec(),
             agq_evals: c.agq_evals,
             agq_node_evals: c.agq_node_evals,
-            nb_nodes: c.nb_nodes,
-            nb_evals_total: c.nb_evals_total,
         })
     }
     #[cfg(not(feature = "counters"))]
@@ -1875,7 +1871,7 @@ fn start_for(
     let raw = match mode {
         "cold" => return (None, "cold"),
         "truth" => (truth(), "truth"),
-        // MCPower's GLMM start when it has neither a truth nor a carried
+        // The GLMM start of a caller with neither a truth nor a carried
         // start: θ = [THETA0; n] in caller units, β = the generating β (its
         // effect sizes).
         "theta0" => (
@@ -2003,8 +1999,6 @@ fn draw_record(
                 .u("pirls_iters", iters)
                 .u("agq_evals", u64::from(c.agq_evals))
                 .u("agq_node_evals", c.agq_node_evals)
-                .u("nb_nodes", u64::from(c.nb_nodes))
-                .u("nb_evals_total", c.nb_evals_total)
                 .s("route", route);
         }
     }
@@ -2155,7 +2149,7 @@ fn run_block(d: &Design, start: &'static str, cli: &Cli, sink: &mut dyn std::io:
                 ),
                 None => (out.beta.clone(), out.theta.clone(), varcorr, 0.0),
             };
-            // MCPower's carry rule: only a converged θ̂ is carried; a view
+            // Carry rule: only a converged θ̂ is carried; a view
             // that exposes no θ̂ (the NB route) keeps the last good carry.
             if out.converged && beta_raw.iter().all(|b| b.is_finite()) {
                 let theta = if theta_raw.is_empty() {

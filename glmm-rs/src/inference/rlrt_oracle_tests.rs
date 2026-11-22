@@ -4,6 +4,7 @@
 //! simulated null, and the observed statistic and p-value of `exact_rlrt`
 //! with the REML log-likelihood at `θ = 0` (against R's `lm`).
 
+use super::lr::lr_statistic;
 use super::rlrt::{
     exact_rlrt, max_on_grid, profile, rlrt_design, rlrt_null, GridTables, RlrtConfig, LAMBDA_GRID,
     MU_ZERO_REL,
@@ -353,16 +354,9 @@ fn rlrt_observed_matches_rlrsim() {
             seed: 20261021 + index as u64,
             parallel_inner: true,
         };
-        let res = exact_rlrt(
-            &ds.counts,
-            &ds.s,
-            &ds.c,
-            full.loglik,
-            reduced.loglik,
-            pinned,
-            &cfg,
-        )
-        .unwrap_or_else(|e| panic!("{name}: {}", e.reason()));
+        let (statistic, _) = lr_statistic(reduced.loglik, full.loglik, pinned);
+        let res = exact_rlrt(&ds.counts, &ds.s, &ds.c, statistic, &cfg)
+            .unwrap_or_else(|e| panic!("{name}: {}", e.reason()));
 
         let dt = (res.statistic - sim.statistic).abs();
         let p_ref = sim.p_value;

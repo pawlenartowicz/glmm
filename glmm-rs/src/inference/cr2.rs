@@ -37,13 +37,12 @@
 
 use faer::dyn_stack::{MemBuffer, MemStack};
 use faer::linalg::lu::partial_pivoting::{factor, solve as lu_solve};
-use faer::linalg::matmul::matmul;
-use faer::traits::{math_utils::one, ComplexField};
-use faer::{c64, Accum, Conj, Mat, MatRef, Par};
+use faer::traits::ComplexField;
+use faer::{c64, Conj, Mat, MatRef, Par};
 
 use crate::inference::contest::qform;
 use crate::inference::evd::sym_eigen;
-use crate::linalg::SeqLlt;
+use crate::linalg::{mul, sym, SeqLlt};
 
 /// The cut on T_k's eigenvalues, which have no units and lie in [0, 1].
 const CUT: f64 = 1e-12;
@@ -109,13 +108,18 @@ pub(crate) fn cr2_pieces_with(
     r: MatRef<'_, f64>,
     dense: (usize, f64),
 ) -> Option<Cr2Pieces> {
+    // Checked before the fold: `f64::min`/`max` pass over a NaN.
+    if !blocks
+        .iter()
+        .flat_map(|b| b.lambda)
+        .all(|&l| l.is_finite() && l > 0.0)
+    {
+        return None;
+    }
     let (lo, hi) = blocks
         .iter()
         .flat_map(|b| b.lambda)
         .fold((f64::INFINITY, 0.0f64), |(a, b), &l| (a.min(l), b.max(l)));
-    if !(lo > 0.0 && hi.is_finite()) {
-        return None;
-    }
     let p = r.nrows();
     // No sign is assumed on R's diagonal: a factor from a Givens QR may carry
     // negative entries there.
@@ -837,10 +841,6 @@ fn n_poles(ratio: f64) -> usize {
 
 // ---- small dense helpers, at `Par::Seq` (see `linalg::SeqLlt` for why) ----
 
-fn sym(a: MatRef<'_, f64>) -> Mat<f64> {
-    Mat::from_fn(a.nrows(), a.ncols(), |i, j| 0.5 * (a[(i, j)] + a[(j, i)]))
-}
-
 fn eye_plus(s: MatRef<'_, f64>) -> Mat<f64> {
     Mat::from_fn(s.nrows(), s.ncols(), |i, j| {
         s[(i, j)] + f64::from(u8::from(i == j))
@@ -854,12 +854,6 @@ fn add_scaled(acc: &mut Mat<f64>, b: &Mat<f64>, s: f64) {
             acc[(i, j)] += s * b[(i, j)];
         }
     }
-}
-
-pub(crate) fn mul<T: ComplexField>(a: MatRef<'_, T>, b: MatRef<'_, T>) -> Mat<T> {
-    let mut c = Mat::<T>::zeros(a.nrows(), b.ncols());
-    matmul(c.as_mut(), Accum::Replace, a, b, one::<T>(), Par::Seq);
-    c
 }
 
 /// A⁻¹B by LU with partial pivoting.

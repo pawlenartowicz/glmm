@@ -3,7 +3,7 @@
 use super::*;
 use crate::fit::common_tests::lcg;
 use crate::test_support::{
-    cluster_of_row, extra_level_of_row, intercept_only_spec, model_atom, Sizing,
+    cluster_of_row, extra_level_of_row, intercept_only_spec, model_atom, profile_from_v, Sizing,
 };
 use crate::{Family, Grouping, GroupingRelation, ModelSpec, Re, ReStructure, ReTerm};
 
@@ -164,12 +164,12 @@ fn maxfun_cap_reports_honest_endpoint() {
 }
 
 /// End-to-end q=1 parity on the hand dataset: the general machine against
-/// frozen literal endpoints, at the amended tolerances (rel 1e-4, abs floors
+/// frozen literal endpoints, at the tolerances (rel 1e-4, abs floors
 /// β̂ 1e-5 / stat 1e-4 — the measured Brent θ̂-placement-noise floor).
 ///
 /// `PINNED_BETAS`/`PINNED_STATS`/`PINNED_JOINT_T_SQ` are frozen reference
 /// outputs on `hand_dataset` (targets `[1, 2]`), pinned so `fit_lmm`'s
-/// general θ-search agrees with a fixed reference at the amended tolerances
+/// general θ-search agrees with a fixed reference at the tolerances
 /// above.
 #[test]
 fn fit_matches_pinned_q1_endpoint_on_hand_dataset() {
@@ -269,7 +269,7 @@ fn rank_deficient_design_is_flagged_not_refused() {
 /// A truth-started fit (`theta_start: Some`) reaches the same answer as the
 /// blind fit on the same bytes — and Some(0.0) exercises the
 /// THETA_TRUTH_FLOOR clamp rather than starting on the 0 boundary.
-/// Bands are the amended floors: two BOBYQA runs from different
+/// Bands are the floors: two BOBYQA runs from different
 /// starts each place θ̂ within the rho_end band of the same minimum.
 #[test]
 fn theta_start_some_matches_blind_fit() {
@@ -695,8 +695,9 @@ fn q3_groupings() -> LmmGroupings {
 /// Vech positions of the q = 3 block's diagonals.
 const Q3_DIAG: [usize; 3] = [0, 3, 5];
 
-/// The pin pass with the pin outside the factorization, as `pin_endpoint`
-/// ran it before: pin, the Σ-preserving fold, pin the fold's diagonals again.
+/// The pin pass with the pin outside the factorization (pin, the Σ-preserving
+/// fold, pin the fold's diagonals again), the reference `pin_endpoint` is
+/// checked against.
 fn pin_fold_pin(g: &LmmGroupings, theta: &mut [f64]) {
     let pin = |theta: &mut [f64]| {
         for &ti in g.diagonal_theta() {
@@ -786,8 +787,8 @@ fn pin_endpoint_leaves_no_zero_diagonal_above_a_live_entry() {
     assert!((th[5] - 0.38f64.sqrt()).abs() <= 1e-15);
 }
 
-/// On a pinned block the old pass (`pin_fold_pin`) left no zero diagonal above
-/// a live entry on, `pin_endpoint` returns the old result bit for bit: with
+/// On a pinned block that `pin_fold_pin` leaves with no zero diagonal above a
+/// live entry, `pin_endpoint` returns its result bit for bit: with
 /// nothing below a pinned diagonal, the skipped pivot's column is +0 either
 /// way, and the skip test is the second pin's. One fold, not a fold repeated
 /// until nothing changes: on this block (flags `[T, F, F]`) a second fold of
@@ -1421,69 +1422,6 @@ fn multislope_dataset() -> (Mat<f64>, Vec<f64>, Vec<u32>) {
     (x, y, ids)
 }
 
-/// Textbook deviance under `criterion` with a q×q D over the slope columns
-/// of Z_p. `theta` is the column-major vech of Λ (q×q lower-tri); D_rel =
-/// ΛΛ′ (σ-relative); V = I + Z·D_rel·Z′ with Z_i = [1, x[i, slope_cols]].
-/// The f32 data is widened to f64 so the oracle reads the same bytes the
-/// suff stats accumulated.
-fn brute_force_slope_deviance(
-    theta: &[f64],
-    x: &Mat<f64>,
-    y: &[f64],
-    ids: &[u32],
-    slope_cols: &[usize],
-    q: usize,
-    criterion: Criterion,
-) -> f64 {
-    let n = x.nrows();
-    // Λ (q×q lower-tri) from column-major vech, then D = ΛΛ′.
-    let mut lam = vec![0.0f64; q * q];
-    let mut t = 0;
-    for c in 0..q {
-        for r in c..q {
-            lam[r * q + c] = theta[t];
-            t += 1;
-        }
-    }
-    let mut d = vec![0.0f64; q * q];
-    for i in 0..q {
-        for j in 0..q {
-            let mut s = 0.0;
-            for k in 0..q {
-                s += lam[i * q + k] * lam[j * q + k];
-            }
-            d[i * q + j] = s;
-        }
-    }
-    let zrow = |i: usize| -> Vec<f64> {
-        let mut z = vec![1.0];
-        for &sc in slope_cols {
-            z.push(x[(i, sc)]);
-        }
-        z
-    };
-    let mut v = Mat::<f64>::zeros(n, n);
-    for i in 0..n {
-        v[(i, i)] += 1.0;
-    }
-    for i in 0..n {
-        let zi = zrow(i);
-        for j in 0..n {
-            if ids[i] == ids[j] {
-                let zj = zrow(j);
-                let mut acc = 0.0;
-                for a in 0..q {
-                    for b in 0..q {
-                        acc += zi[a] * d[a * q + b] * zj[b];
-                    }
-                }
-                v[(i, j)] += acc;
-            }
-        }
-    }
-    profile_from_v(&v, x, y, criterion)
-}
-
 fn slope_groupings() -> LmmGroupings {
     LmmGroupings::from_cluster_spec(&slope_sized(), &[1])
 }
@@ -1539,7 +1477,7 @@ fn check_slope_routes_against_brute_force(
     slope_cols: &[usize],
     thetas: &[Vec<f64>],
 ) {
-    let (p, q) = (x.ncols(), g.primary_q);
+    let p = x.ncols();
     let mut suff = LmmSuffStats::with_groupings(p, g.clone());
     suff.add_rows_multi(x.as_ref(), x.as_ref().subcols(0, 0), y, ids, &[], None);
     let mut loop_fit = LmmFitScratch::with_groupings(p, g);
@@ -1549,7 +1487,13 @@ fn check_slope_routes_against_brute_force(
         loop_fit.criterion = criterion;
         route_fit.criterion = criterion;
         for th in thetas {
-            let oracle = brute_force_slope_deviance(th, x, y, ids, slope_cols, q, criterion);
+            let oracle = crate::test_support::brute_force_deviance(
+                x,
+                y,
+                None,
+                &[(ids, slope_cols, th)],
+                criterion,
+            );
             let d_loop = reml_deviance(th, &suff, &mut loop_fit);
             let d_route = reml_deviance(th, &suff, &mut route_fit);
             for dev in [d_loop, d_route] {
@@ -1935,99 +1879,6 @@ fn extra_theta_layout_qg1_and_qg2() {
     assert!(!diag.contains(&2));
 }
 
-// --- Extra-slope sufficient statistics ---
-
-/// Brute-force the `s` columns for a crossed factor carrying a slope: the
-/// intercept subcol is Σ_{rows∈level} [X y]; the slope subcol is Σ x_slope·[X y].
-#[test]
-fn extra_crossed_slope_s_columns_match_bruteforce() {
-    let n = 6usize;
-    let p = 3; // [1, x1, x2]
-    let xd = [
-        (0.5, -0.2),
-        (-0.3, 0.7),
-        (0.9, 0.1),
-        (-0.6, -0.4),
-        (0.2, 0.8),
-        (0.4, -0.5),
-    ];
-    let cluster_ids = [0u32, 1, 0, 1, 0, 1];
-    let crossed_ids = [0u32, 1, 2, 0, 1, 2];
-    let y = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
-    let mut x = Mat::<f64>::zeros(n, p);
-    for i in 0..n {
-        x[(i, 0)] = 1.0;
-        x[(i, 1)] = xd[i].0;
-        x[(i, 2)] = xd[i].1;
-    }
-    let cluster = SizedSpec {
-        spec: ModelSpec {
-            family: Family::Gaussian,
-            re: Some(ReStructure {
-                terms: Vec::new(),
-                slopes: vec![],
-                extra_groupings: vec![Grouping {
-                    terms: Vec::new(),
-                    relation: GroupingRelation::Crossed,
-                    slopes: vec![1],
-                }],
-            }),
-        },
-        n_primary: 2,
-        extra_counts: vec![3],
-        tail_fill: 0.0,
-    };
-    // crossed slope on x_full col 1.
-    let g = LmmGroupings::from_cluster_spec_ext(&cluster, &[], &[vec![1]]);
-    // crossed block: q_g=2, offset = prim_width = 2 (n_primary=2, q_p=1).
-    assert_eq!(g.extra_offsets[0], 2);
-    assert_eq!(g.extra_q[0], 2);
-    let mut suff = LmmSuffStats::with_groupings(p, g);
-    suff.add_rows_multi(
-        x.as_ref(),
-        x.as_ref().subcols(0, 0),
-        &y,
-        &cluster_ids,
-        &[crossed_ids.to_vec()],
-        None,
-    );
-    let m = p + 1;
-    for c in 0..3usize {
-        let icol = 2 + c * 2;
-        let scol = icol + 1;
-        let mut s_int = vec![0.0; m];
-        let mut s_slope = vec![0.0; m];
-        for i in 0..n {
-            if crossed_ids[i] as usize == c {
-                let w = [x[(i, 0)], x[(i, 1)], x[(i, 2)], y[i]];
-                let x1 = x[(i, 1)];
-                for j in 0..m {
-                    s_int[j] += w[j];
-                    s_slope[j] += x1 * w[j];
-                }
-            }
-        }
-        for j in 0..m {
-            assert!(
-                (suff.s[(j, icol)] - s_int[j]).abs() < 1e-12,
-                "intercept col level {c} row {j}: got {} want {}",
-                suff.s[(j, icol)],
-                s_int[j]
-            );
-            assert!(
-                (suff.s[(j, scol)] - s_slope[j]).abs() < 1e-12,
-                "slope col level {c} row {j}: got {} want {}",
-                suff.s[(j, scol)],
-                s_slope[j]
-            );
-        }
-        // counts only on the intercept subcol.
-        let n_c = crossed_ids.iter().filter(|&&l| l as usize == c).count() as f64;
-        assert_eq!(suff.counts[icol], n_c);
-        assert_eq!(suff.counts[scol], 0.0);
-    }
-}
-
 /// REML deviance on the explicit n×n V for the composed model: the 2×2
 /// primary slope block (D_p = ΛΛ′ over [1, x1]) PLUS the extra-grouping
 /// intercept block (θ_e² when the extra ids match). The f32 data is widened
@@ -2064,103 +1915,29 @@ fn brute_force_composed_deviance(
     profile_from_v(&v, x, y, Criterion::Reml)
 }
 
-/// Profiled deviance from an explicit n×n marginal V (in residual-σ²
-/// units), r² = y′V⁻¹y − β̂′X′V⁻¹y: under REML `log|V| + log|XᵀV⁻¹X| +
-/// (N−P)·log(r²/(N−P))`, under ML `log|V| + N·log(r²/N)`. The shared
-/// V→deviance back end for every brute-force oracle (composed, crossed-slope, …).
-fn profile_from_v(v: &Mat<f64>, x: &Mat<f64>, y: &[f64], criterion: Criterion) -> f64 {
-    use faer::linalg::solvers::Solve;
-    let (n, p) = (x.nrows(), x.ncols());
-    let vc = v.as_ref().llt(faer::Side::Lower).unwrap();
-    let mut ldv = 0.0;
-    for i in 0..n {
-        ldv += vc.L()[(i, i)].ln();
-    }
-    let ldv = 2.0 * ldv;
-    let mut vix = (*x).clone();
-    vc.solve_in_place(vix.as_mut());
-    let mut viy = Mat::<f64>::zeros(n, 1);
-    for i in 0..n {
-        viy[(i, 0)] = y[i];
-    }
-    vc.solve_in_place(viy.as_mut());
-    let mut xtvix = Mat::<f64>::zeros(p, p);
-    let mut xtviy = vec![0.0; p];
-    for aa in 0..p {
-        for bb in 0..p {
-            let mut s = 0.0;
-            for i in 0..n {
-                s += x[(i, aa)] * vix[(i, bb)];
-            }
-            xtvix[(aa, bb)] = s;
-        }
-        let mut s = 0.0;
-        for i in 0..n {
-            s += x[(i, aa)] * viy[(i, 0)];
-        }
-        xtviy[aa] = s;
-    }
-    let kc = xtvix.as_ref().llt(faer::Side::Lower).unwrap();
-    let mut ldk = 0.0;
-    for aa in 0..p {
-        ldk += kc.L()[(aa, aa)].ln();
-    }
-    let ldk = 2.0 * ldk;
-    let mut beta = Mat::<f64>::zeros(p, 1);
-    for aa in 0..p {
-        beta[(aa, 0)] = xtviy[aa];
-    }
-    kc.solve_in_place(beta.as_mut());
-    let mut ytviy = 0.0;
-    for i in 0..n {
-        ytviy += y[i] * viy[(i, 0)];
-    }
-    let mut bxy = 0.0;
-    for aa in 0..p {
-        bxy += beta[(aa, 0)] * xtviy[aa];
-    }
-    let r_sq = ytviy - bxy;
-    match criterion {
-        Criterion::Reml => {
-            let df = (n - p) as f64;
-            ldv + ldk + df * (r_sq / df).ln()
-        }
-        Criterion::Ml => ldv + n as f64 * (r_sq / n as f64).ln(),
-    }
-}
-
-/// Brute-force REML deviance for a CROSSED-SLOPE model
-/// `y ~ x1 + (1+x1 | primary) + (1+x1 | crossed)`: V = I + Z_p D_p Z_pᵀ +
-/// Z_e D_e Z_eᵀ, each D a 2×2 from its vech θ over [1, x1]. θ =
-/// [primary vech (3) ; crossed vech (3)].
-fn brute_force_crossed_slope_deviance(
-    theta: &[f64],
+/// The sparse kernel on the design `(g, x, y, ids)`: the only kernel that
+/// fits a slope on an extra grouping (`classify_design` routes those designs
+/// to it).
+fn sparse_ws(
+    g: &LmmGroupings,
     x: &Mat<f64>,
     y: &[f64],
     pid: &[u32],
-    eid: &[u32],
-) -> f64 {
-    let n = x.nrows();
-    let (ap, bp, cp) = (theta[0], theta[1], theta[2]);
-    let (dp00, dp01, dp11) = (ap * ap, ap * bp, bp * bp + cp * cp);
-    let (ae, be, ce) = (theta[3], theta[4], theta[5]);
-    let (de00, de01, de11) = (ae * ae, ae * be, be * be + ce * ce);
-    let mut v = Mat::<f64>::zeros(n, n);
-    for i in 0..n {
-        v[(i, i)] += 1.0;
-    }
-    for i in 0..n {
-        for j in 0..n {
-            let (zi, zj) = (x[(i, 1)], x[(j, 1)]);
-            if pid[i] == pid[j] {
-                v[(i, j)] += dp00 + dp01 * (zi + zj) + dp11 * zi * zj;
-            }
-            if eid[i] == eid[j] {
-                v[(i, j)] += de00 + de01 * (zi + zj) + de11 * zi * zj;
-            }
-        }
-    }
-    profile_from_v(&v, x, y, Criterion::Reml)
+    extra: &[Vec<u32>],
+) -> crate::sparse::SparseLmmWorkspace {
+    crate::sparse::SparseLmmWorkspace::new(
+        g,
+        x.as_ref(),
+        x.as_ref().subcols(0, 0),
+        pid,
+        extra,
+        y,
+        x.nrows(),
+        x.ncols(),
+        None,
+        Criterion::Reml,
+    )
+    .unwrap()
 }
 
 /// Slope + crossed: the composed deviance matches the brute-force oracle to
@@ -2196,11 +1973,11 @@ fn composed_deviance_matches_brute_force() {
     }
 }
 
-/// CROSSED SLOPES (the headline lme4-agreement case): `y ~ x1 + (1+x1 | primary)
-/// + (1+x1 | item)` — both grouping factors carry a random slope on x1, so the
-/// gated blocked path runs. Deviance must match the explicit-V oracle to 1e-7
-/// across θ, including the primary-slope↔crossed-slope coupling (the x1²
-/// weighted co-occurrence) the blocked `zx` fill captures.
+/// CROSSED SLOPES (the headline lme4-agreement case):
+/// `y ~ x1 + (1+x1 | primary) + (1+x1 | item)` — both grouping factors carry a
+/// random slope on x1, so the design routes to the sparse kernel. Its deviance
+/// must match the explicit-V oracle to 1e-7 across θ, including the
+/// primary-slope↔crossed-slope coupling (the x1² weighted co-occurrence).
 #[test]
 fn crossed_slope_deviance_matches_brute_force() {
     let cluster = SizedSpec {
@@ -2248,26 +2025,22 @@ fn crossed_slope_deviance_matches_brute_force() {
             + 0.8 * lcg(&mut st);
     }
     let g = LmmGroupings::from_cluster_spec_ext(&cluster, &[1], &[vec![1]]);
-    assert!(g.extra_slopes_any, "must route to the blocked path");
-    let mut suff = LmmSuffStats::with_groupings(2, g);
-    suff.add_rows_multi(
-        x.as_ref(),
-        x.as_ref().subcols(0, 0),
-        &y,
-        &pid,
-        &[eid.clone()],
-        None,
-    );
-    let gref = LmmGroupings::from_cluster_spec_ext(&cluster, &[1], &[vec![1]]);
-    let mut fit = LmmFitScratch::with_groupings(2, &gref);
+    assert!(g.extra_slopes_any, "must route to the sparse kernel");
+    let mut ws = sparse_ws(&g, &x, &y, &pid, &[eid.clone()]);
     // θ = [primary vech (λ₀₀,λ₁₀,λ₁₁) ; crossed vech (λ₀₀,λ₁₀,λ₁₁)].
     for th in [
         vec![1.0, 0.0, 1.0, 1.0, 0.0, 1.0],
         vec![0.7, 0.2, 0.5, 0.6, 0.1, 0.4],
         vec![1.3, -0.3, 0.6, 0.9, -0.2, 0.5],
     ] {
-        let dev = reml_deviance(&th, &suff, &mut fit);
-        let oracle = brute_force_crossed_slope_deviance(&th, &x, &y, &pid, &eid);
+        let dev = crate::sparse::sparse_reml_deviance(&th, &mut ws);
+        let oracle = crate::test_support::brute_force_deviance(
+            &x,
+            &y,
+            None,
+            &[(&pid, &[1], &th[..3]), (&eid, &[1], &th[3..])],
+            Criterion::Reml,
+        );
         assert!(dev.is_finite(), "θ={th:?}");
         assert!(
             (dev - oracle).abs() <= 1e-7 * oracle.abs().max(1.0),
@@ -2278,12 +2051,10 @@ fn crossed_slope_deviance_matches_brute_force() {
 
 /// NESTED SLOPES: `y ~ x1 + (1+x1 | grp) + (1+x1 | class)`,
 /// class nested in grp — both grouping factors carry a random slope on x1, so
-/// the gated blocked path runs with a nested factor of q_n = 2. A blocked path
-/// that assembles the nested children intercept-only (scalar θ_n) diverges to
-/// NaN here. The marginal V is grouping-agnostic (Σ_g Z_g D_g Z_gᵀ
-/// over rows sharing a level id), so the crossed-slope oracle is reused with the
-/// GLOBAL nested child id as the extra level. Matches the explicit-V oracle to
-/// 1e-7 across θ.
+/// the sparse kernel runs with a nested factor of q_n = 2. The marginal V is
+/// grouping-agnostic (Σ_g Z_g D_g Z_gᵀ over rows sharing a level id), so the
+/// oracle takes the GLOBAL nested child id as the extra level. Matches the
+/// explicit-V oracle to 1e-7 across θ.
 #[test]
 fn nested_slope_deviance_matches_brute_force() {
     let n_per_parent = 3u32;
@@ -2333,57 +2104,29 @@ fn nested_slope_deviance_matches_brute_force() {
             + 0.8 * lcg(&mut st);
     }
     let g = LmmGroupings::from_cluster_spec_ext(&cluster, &[1], &[vec![1]]);
-    assert!(g.extra_slopes_any, "must route to the blocked path");
+    assert!(g.extra_slopes_any, "must route to the sparse kernel");
     assert!(g.nested.is_some(), "must carry a nested factor");
-    let mut suff = LmmSuffStats::with_groupings(2, g);
-    suff.add_rows_multi(
-        x.as_ref(),
-        x.as_ref().subcols(0, 0),
-        &y,
-        &pid,
-        &[eid.clone()],
-        None,
-    );
-    let gref = LmmGroupings::from_cluster_spec_ext(&cluster, &[1], &[vec![1]]);
-    let mut fit = LmmFitScratch::with_groupings(2, &gref);
+    let mut ws = sparse_ws(&g, &x, &y, &pid, &[eid.clone()]);
     // θ = [primary vech (λ₀₀,λ₁₀,λ₁₁) ; nested vech (λ₀₀,λ₁₀,λ₁₁)].
     for th in [
         vec![1.0, 0.0, 1.0, 1.0, 0.0, 1.0],
         vec![0.7, 0.2, 0.5, 0.6, 0.1, 0.4],
         vec![1.3, -0.3, 0.6, 0.9, -0.2, 0.5],
     ] {
-        let dev = reml_deviance(&th, &suff, &mut fit);
-        let oracle = brute_force_crossed_slope_deviance(&th, &x, &y, &pid, &eid);
+        let dev = crate::sparse::sparse_reml_deviance(&th, &mut ws);
+        let oracle = crate::test_support::brute_force_deviance(
+            &x,
+            &y,
+            None,
+            &[(&pid, &[1], &th[..3]), (&eid, &[1], &th[3..])],
+            Criterion::Reml,
+        );
         assert!(dev.is_finite(), "θ={th:?}");
         assert!(
             (dev - oracle).abs() <= 1e-7 * oracle.abs().max(1.0),
             "θ={th:?}: {dev} vs {oracle}"
         );
     }
-}
-
-/// General brute-force REML deviance: V = I + Σ_g Z_g D_g Z_gᵀ where each
-/// factor `(ids, vech)` contributes a 2×2 D over [1, x1] (an intercept-only
-/// factor passes `[θ, 0, 0]`). Used for the multi-crossed-factor oracle.
-fn brute_force_slopes_deviance(x: &Mat<f64>, y: &[f64], factors: &[(&[u32], [f64; 3])]) -> f64 {
-    let n = x.nrows();
-    let mut v = Mat::<f64>::zeros(n, n);
-    for i in 0..n {
-        v[(i, i)] += 1.0;
-    }
-    for &(ids, vech) in factors {
-        let (a, b, c) = (vech[0], vech[1], vech[2]);
-        let (d00, d01, d11) = (a * a, a * b, b * b + c * c);
-        for i in 0..n {
-            for j in 0..n {
-                if ids[i] == ids[j] {
-                    let (zi, zj) = (x[(i, 1)], x[(j, 1)]);
-                    v[(i, j)] += d00 + d01 * (zi + zj) + d11 * zi * zj;
-                }
-            }
-        }
-    }
-    profile_from_v(&v, x, y, Criterion::Reml)
 }
 
 /// TWO crossed factors with slopes:
@@ -2452,32 +2195,24 @@ fn two_crossed_slopes_deviance_matches_brute_force() {
     }
     let g = LmmGroupings::from_cluster_spec_ext(&cluster, &[], &[vec![1], vec![1]]);
     assert!(g.extra_slopes_any);
-    let mut suff = LmmSuffStats::with_groupings(2, g);
-    suff.add_rows_multi(
-        x.as_ref(),
-        x.as_ref().subcols(0, 0),
-        &y,
-        &pid,
-        &[c1.clone(), c2.clone()],
-        None,
-    );
-    let gref = LmmGroupings::from_cluster_spec_ext(&cluster, &[], &[vec![1], vec![1]]);
-    let mut fit = LmmFitScratch::with_groupings(2, &gref);
+    let mut ws = sparse_ws(&g, &x, &y, &pid, &[c1.clone(), c2.clone()]);
     // θ = [primary scalar ; c1 vech (3) ; c2 vech (3)].
     for th in [
         vec![1.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0],
         vec![0.6, 0.7, 0.2, 0.4, 0.6, -0.1, 0.35],
         vec![0.8, 1.2, -0.3, 0.5, 0.9, 0.25, 0.45],
     ] {
-        let dev = reml_deviance(&th, &suff, &mut fit);
-        let oracle = brute_force_slopes_deviance(
+        let dev = crate::sparse::sparse_reml_deviance(&th, &mut ws);
+        let oracle = crate::test_support::brute_force_deviance(
             &x,
             &y,
+            None,
             &[
-                (&pid, [th[0], 0.0, 0.0]),
-                (&c1, [th[1], th[2], th[3]]),
-                (&c2, [th[4], th[5], th[6]]),
+                (&pid, &[], &th[..1]),
+                (&c1, &[1], &th[1..4]),
+                (&c2, &[1], &th[4..]),
             ],
+            Criterion::Reml,
         );
         assert!(dev.is_finite(), "θ={th:?}");
         assert!(
@@ -2574,16 +2309,17 @@ fn crossed_slope_fit_matches_lme4_golden() {
         extra_counts: vec![6],
         tail_fill: 0.0,
     };
-    let mut ws = LmmWorkspace::for_cluster_spec_ext(2, &cluster, &[1], &[vec![1]], false);
-    ws.suff_mut().reset();
-    ws.suff_mut().add_rows_multi(
-        x.as_ref(),
-        x.as_ref().subcols(0, 0),
+    let mut ws = LmmWorkspace::for_cluster_spec_ext(2, &cluster, &[1], &[vec![1]], true);
+    let LmmKernel::Sparse { g, ws: slot } = &mut ws.kernel else {
+        panic!("a slope on an extra grouping builds the sparse kernel");
+    };
+    *slot = Some(Box::new(sparse_ws(
+        g,
+        &x,
         &y,
         &pid,
         std::slice::from_ref(&eid),
-        None,
-    );
+    )));
     let fit = fit_lmm_unhinted(&mut ws, &[1], None, ColumnScaling::IDENTITY);
     assert!(fit.converged, "golden fit must converge");
     let s2 = fit.sigma_sq;
@@ -2861,10 +2597,9 @@ fn fix_mode_signs_negates_the_modes_of_negative_columns() {
 
 /// A search that exits with a negative diagonal, and the exit sign fix on it.
 /// `tests/fixtures/sign_trap_lmm_dense_slope.csv` is a simulated Gaussian
-/// draw from the 2026-09-10 sign-trap simulation study: `y ~ x1 +
-/// (1 + x1 | g1)`, 300 rows, 30 groups, random-slope SD 0.05, dense LMM
-/// route. The raw BOBYQA endpoint under the
-/// signed box (`blind_theta_and_bounds`) carries a negative diagonal; the
+/// draw: `y ~ x1 + (1 + x1 | g1)`, 300 rows, 30 groups, random-slope SD 0.05,
+/// dense LMM route. The raw BOBYQA endpoint under the signed box
+/// (`blind_theta_and_bounds`) carries a negative diagonal; the
 /// fixed θ has non-negative diagonals and the same REML deviance to the bit,
 /// and it is exactly the θ̂ `fit_lmm` reports (no diagonal is near the pin
 /// here, so the pin and the canonical block do nothing).
@@ -3200,7 +2935,8 @@ fn reml_deviance_infinity_guards() {
         2,
         None,
         crate::lmm::Criterion::Reml,
-    );
+    )
+    .unwrap();
     for th in [0.0, 0.5, 1.0] {
         assert_eq!(
             reml_deviance(&[th], &suff_exact, &mut fit_exact),
@@ -3215,17 +2951,14 @@ fn reml_deviance_infinity_guards() {
     }
 }
 
-/// The blocked twin (`reml_deviance_blocked`, crossed/nested random slopes)
-/// hits the same failure surface: a perfect fit (X exactly spans y, no
-/// residual) makes the augmented `[Λ′ZᵀZΛ+I | Λ′Zᵀ[Xy]; · | [Xy]ᵀ[Xy]]`
-/// factor exactly rank-deficient at θ = 0 (Λ = 0 collapses the RE penalty to
-/// the identity, so the trailing [X y] block alone is singular at the exact
-/// fit). In floating point its last pivot is round-off of either sign
-/// (174 − 147 − 27 here), so which guard fires is platform rounding: a
-/// non-positive pivot fails `chol_lower` (native), a tiny positive one is
-/// caught by the r² round-off floor (wasm32). Either must give +inf.
+/// The exact-fit guard on a slope-carrying extra grouping, which only the
+/// sparse kernel fits: X exactly spans y (no residual), so at θ = 0 the
+/// trailing [X y] block of the augmented factor is singular. In floating
+/// point its last pivot is round-off of either sign, so which guard fires is
+/// platform rounding: a non-positive pivot fails the factorization, a tiny
+/// positive one is caught by the r² round-off floor. Either must give +inf.
 #[test]
-fn reml_deviance_blocked_infinity_guard() {
+fn sparse_extra_slope_exact_fit_guard() {
     let cluster = SizedSpec {
         spec: ModelSpec {
             family: Family::Gaussian,
@@ -3257,20 +2990,13 @@ fn reml_deviance_blocked_infinity_guard() {
         y[i] = 2.0 + 3.0 * x1; // exact linear fit, zero residual
     }
     let g = LmmGroupings::from_cluster_spec_ext(&cluster, &[], &[vec![1]]);
-    assert!(g.extra_slopes_any, "must route to the blocked path");
-    let mut suff = LmmSuffStats::with_groupings(2, g);
-    suff.add_rows_multi(
-        x.as_ref(),
-        x.as_ref().subcols(0, 0),
-        &y,
-        &pid,
-        &[eid.clone()],
-        None,
+    assert!(g.extra_slopes_any, "must route to the sparse kernel");
+    let mut ws = sparse_ws(&g, &x, &y, &pid, &[eid.clone()]);
+    let th = vec![0.0; g.n_theta()];
+    assert_eq!(
+        crate::sparse::sparse_reml_deviance(&th, &mut ws),
+        f64::INFINITY
     );
-    let gref = LmmGroupings::from_cluster_spec_ext(&cluster, &[], &[vec![1]]);
-    let mut fit = LmmFitScratch::with_groupings(2, &gref);
-    let th = vec![0.0; gref.n_theta()];
-    assert_eq!(reml_deviance(&th, &suff, &mut fit), f64::INFINITY);
 }
 
 /// With a single target, the joint Wald-χ² collapses to the per-target `t²`
@@ -3460,11 +3186,9 @@ fn pg_dataset(
 }
 
 /// The gradient against central differences of the deviance at each θ,
-/// under `criterion`. The differences are read off three evaluators of the
+/// under `criterion`. The differences are read off two evaluators of the
 /// same deviance, each checked against the route's value first: the route's
-/// own dense scratch, the dense blocked elimination (`reml_deviance_blocked`,
-/// reached by setting `extra_slopes_any` on the same groupings) and the
-/// sparse workspace. Only free coordinates are differenced: on a masked `g`
+/// own dense scratch and the sparse workspace. Only free coordinates are differenced: on a masked `g`
 /// each θ has its structural entries zeroed first, and those entries are
 /// never stepped. Returns the number of coordinate checks.
 #[allow(clippy::too_many_arguments)]
@@ -3483,12 +3207,6 @@ fn check_pg_gradient(
     let mut fit = LmmFitScratch::with_groupings(p, g);
     fit.criterion = criterion;
     assert!(precompute_group_regressions(&suff, &mut fit));
-    let mut gb = g.clone();
-    gb.extra_slopes_any = true;
-    let mut suff_b = LmmSuffStats::with_groupings(p, gb.clone());
-    suff_b.add_rows_multi(x.as_ref(), x.as_ref().subcols(0, 0), y, ids, &[], w);
-    let mut fit_b = LmmFitScratch::with_groupings(p, &gb);
-    fit_b.criterion = criterion;
     let sqrt_w: Option<Vec<f64>> = w.map(|w| w.iter().map(|v| v.sqrt()).collect());
     let mut sp = crate::sparse::SparseLmmWorkspace::new(
         g,
@@ -3501,7 +3219,8 @@ fn check_pg_gradient(
         p,
         sqrt_w.as_deref(),
         criterion,
-    );
+    )
+    .unwrap();
     let mut checks = 0;
     for th in thetas {
         let mut th = th.clone();
@@ -3517,10 +3236,9 @@ fn check_pg_gradient(
         );
         let mut eval = |kernel: usize, t: &[f64]| match kernel {
             0 => reml_deviance(t, &suff, &mut fit),
-            1 => reml_deviance(t, &suff_b, &mut fit_b),
             _ => crate::sparse::sparse_reml_deviance(t, &mut sp),
         };
-        for (kernel, name) in ["route", "blocked", "sparse"].into_iter().enumerate() {
+        for (kernel, name) in ["route", "sparse"].into_iter().enumerate() {
             let fk = eval(kernel, th);
             assert!(
                 (fk - f0).abs() <= 1e-8 * f0.abs().max(1.0),
@@ -3621,8 +3339,8 @@ fn pg_gradient_matches_finite_differences() {
     for (q, masked, checks) in &counts {
         println!("pg_gradient FD gate: q {q} masked {masked}: {checks} checks");
     }
-    // Two criteria × six θ × three evaluators × four free coordinates.
-    assert_eq!(counts.last(), Some(&(3, true, 2 * 6 * 3 * 4)));
+    // Two criteria × six θ × two evaluators × four free coordinates.
+    assert_eq!(counts.last(), Some(&(3, true, 2 * 6 * 2 * 4)));
 }
 
 #[test]

@@ -289,32 +289,39 @@ any_fail <- FALSE
 # gate that skips itself is not a gate that passed, and this is the check a CI
 # job calls, where "no run directory" and "the ports agree" must never produce
 # the same green.
+#
+# A port is compared only with a glmm run built from the same code: the same
+# commit and the same uncommitted sources (run.sh's glmm_tree_hash). So the port
+# run read is the newest one whose tree hash and bare rev match the glmm run's,
+# never simply the newest or the newest full one, which may come from other code.
+# The rev's `-dirty` suffix is dropped: it counts the whole tree, so a promote
+# into the tracked runs/ between the two runs would set it on one side only.
 port_gate <- function(grid_dir, rust, engine) {
-  pr <- newest_glmm_run(grid_dir, engine, NULL)
-  if (is.null(pr)) {
+  bare_rev <- function(m) sub("-dirty$", "", if (is.null(m$glmm_git_rev)) "" else m$glmm_git_rev)
+  stamp <- function(m) sprintf("rev %s, tree %s", if (is.null(m$glmm_git_rev)) "-" else m$glmm_git_rev,
+                               if (is.null(m$glmm_tree_hash)) "-" else m$glmm_tree_hash)
+  runs <- list_runs(grid_dir, engine)
+  if (!length(runs$dirs)) {
     cat(sprintf(paste0("FAIL: no %s run under runs/%s/ (scratch included), so its port ",
                        "gate did not run. Run that port over the same cells first.\n"),
                 engine, engine))
     any_fail <<- TRUE
     return(invisible(NULL))
   }
-  cat(sprintf("\n=== glmm (Rust)  vs  %s (port) ===\n", engine))
-  # A port is compared only with a glmm run built from the same code: the same
-  # commit and the same uncommitted sources (run.sh's glmm_tree_hash). The rev's
-  # `-dirty` suffix is dropped: it counts the whole tree, so a promote into the
-  # tracked runs/ between the two runs would set it on one side only. A run made
-  # before run.sh recorded the hash carries none and is not checked.
-  ha <- rust$meta$glmm_tree_hash; hb <- pr$meta$glmm_tree_hash
-  bare_rev <- function(m) sub("-dirty$", "", if (is.null(m$glmm_git_rev)) "" else m$glmm_git_rev)
-  if (!is.null(ha) && !is.null(hb) &&
-      (!identical(ha, hb) || !identical(bare_rev(rust$meta), bare_rev(pr$meta)))) {
-    cat(sprintf(paste0("FAIL: the %s run was built from other code than the glmm run ",
-                       "(rev %s, tree %s against rev %s, tree %s). Rerun the port on ",
-                       "this tree.\n"), engine, pr$meta$glmm_git_rev, hb,
-                rust$meta$glmm_git_rev, ha))
+  same_code <- vapply(runs$metas, function(m)
+    !is.null(rust$meta$glmm_tree_hash) && identical(m$glmm_tree_hash, rust$meta$glmm_tree_hash) &&
+      identical(bare_rev(m), bare_rev(rust$meta)), TRUE)
+  if (!any(same_code)) {
+    cat(sprintf(paste0("FAIL: no %s run was built from the glmm run's code (%s). Rerun the ",
+                       "port on this tree. Candidates:\n"), engine, stamp(rust$meta)))
+    for (i in seq_along(runs$dirs)) cat(sprintf("  %s (%s)\n", runs$dirs[[i]], stamp(runs$metas[[i]])))
     any_fail <<- TRUE
     return(invisible(NULL))
   }
+  dirs <- runs$dirs[same_code]
+  dates <- run_time(vapply(runs$metas[same_code], `[[`, "", "date"))
+  pr <- say_run(engine, read_run(dirs[[order(dates, decreasing = TRUE)[1]]]))
+  cat(sprintf("\n=== glmm (Rust)  vs  %s (port) ===\n", engine))
   cat(sprintf("%-34s  %-10s %-10s %-10s %-10s %-10s %-10s %-10s %-10s %-10s %-10s  %s\n",
               "cell", "beta", "se_rx", "se_hess", "stddev", "corr", "sigma", "nb_theta",
               "coef_df", "deviance", "loglik", "coef"))
@@ -394,13 +401,26 @@ port_gate <- function(grid_dir, rust, engine) {
   # from a different cell selection shares no cell with this one, prints an empty
   # table and would otherwise read as a clean pass -- the same "a gate that
   # skipped itself is not a gate that passed" rule as the missing-run case above.
-  # A PARTIAL overlap is legitimate (the ports are run on the fast subset), so it
-  # is reported, not failed; only zero overlap fails.
+  # A PARTIAL overlap is legitimate when the port ran a smaller selection (the
+  # ports are run on the fast subset against a full glmm run), so it is reported;
+  # zero overlap fails. When both runs were asked for the same cells (same subset,
+  # same --ml, the same list on a named-cell run), every glmm record must find its
+  # port record: a missing one is a cell the port engine lost or wrote unreadably.
   cat(sprintf("compared: %d of %d cells in the glmm run\n", compared, length(rust$recs)))
+  same_cells <- identical(rust$meta$subset, pr$meta$subset) &&
+    identical(isTRUE(rust$meta$ml), isTRUE(pr$meta$ml)) &&
+    (!identical(rust$meta$subset, "cells") ||
+       identical(sort(unlist(rust$meta$cell_list)), sort(unlist(pr$meta$cell_list))))
   if (compared == 0L) {
     cat(sprintf(paste0("FAIL: the %s run shares no cell with the glmm run, so its port ",
                        "gate compared nothing. Run that port over the same cells.\n"),
                 engine))
+    any_fail <<- TRUE
+  } else if (same_cells && compared < length(rust$recs)) {
+    cat(sprintf(paste0("FAIL: the %s run covers the same cells as the glmm run but has no ",
+                       "readable record for %d of them: %s\n"), engine,
+                length(rust$recs) - compared,
+                paste(setdiff(names(rust$recs), names(pr$recs)), collapse = ", ")))
     any_fail <<- TRUE
   }
 }
@@ -875,6 +895,41 @@ load_inputs <- function(grid_dir) {
        orec_by_cell = orec_by_cell, no_record = no_record)
 }
 
+# How many cells gates 1 and 2 compared, overall and per family x arm. Gate 1
+# compared a cell it marked DEV-OK, DEV-WIN or FAIL; gate 2 one where at least one
+# quantity came out ok, DOC or FAIL. A gate that compared no cell fails, and so
+# does one that compared none in a family x arm group holding a cell with a
+# converged oracle record: a fault that hits one family (a renamed alignment key,
+# a field the reader stops finding) leaves every other family comparing, so the
+# overall count alone would hide it. A group with no converged oracle record has
+# nothing to compare against and is listed, not failed. No-MLE cells are gated on
+# glmm's refusal and are counted by neither gate.
+compared_block <- function(grp_all, grp_ref, grp_g1, grp_g2) {
+  cat("\n=== gates 1 and 2: cells compared, per family and arm ===\n")
+  n <- function(v, g) sum(v == g)
+  cat(sprintf("gate 1 compared: %d of %d cells\n", length(grp_g1), length(grp_all)))
+  cat(sprintf("gate 2 compared: %d of %d cells\n", length(grp_g2), length(grp_all)))
+  cat(sprintf("  %-26s %6s %12s %7s %7s\n", "family arm", "cells", "with oracle",
+              "gate 1", "gate 2"))
+  for (g in sort(unique(grp_all))) {
+    cat(sprintf("  %-26s %6d %12d %7d %7d\n", g, n(grp_all, g), n(grp_ref, g),
+                n(grp_g1, g), n(grp_g2, g)))
+  }
+  for (gate in 1:2) {
+    done <- if (gate == 1) grp_g1 else grp_g2
+    if (!length(done)) {
+      cat(sprintf("FAIL: gate %d compared no cell\n", gate))
+      any_fail <<- TRUE
+      next
+    }
+    for (g in sort(setdiff(unique(grp_ref), done))) {
+      cat(sprintf(paste0("FAIL: gate %d compared no cell in %s, which has %d cell(s) ",
+                         "with a converged oracle record\n"), gate, g, n(grp_ref, g)))
+      any_fail <<- TRUE
+    }
+  }
+}
+
 # ── the main flow ────────────────────────────────────────────────────────────
 run_gates <- function() {
   grid_dir <- script_dir
@@ -908,6 +963,10 @@ run_gates <- function() {
   glmm_fail <- vapply(inp$no_record,
                       function(cid) sprintf("%s: glmm produced no record", cid), "")
   if (length(glmm_fail)) any_fail <<- TRUE
+  # One family x arm label per gated cell, per cell with a converged oracle
+  # record, and per cell gate 1 / gate 2 actually compared (compared_block below).
+  grp_all <- character(0); grp_ref <- character(0)
+  grp_g1 <- character(0); grp_g2 <- character(0)
 
   cat("\n=== gates 1 and 2: per cell ===\n")
   cat(sprintf("%-34s %-17s %-8s %-18s %-10s %-20s %-10s %-10s %-10s %-14s %s\n",
@@ -1031,6 +1090,12 @@ run_gates <- function() {
                                   cid, length(orec), length(orec_conv),
                                   paste(no_ref_q, collapse = ", ")))
 
+    grp <- paste(cl[["family"]], cell_arm(cl))
+    grp_all <- c(grp_all, grp)
+    if (length(orec_conv)) grp_ref <- c(grp_ref, grp)
+    if (m_dev %in% c("DEV-OK", "DEV-WIN") || startsWith(m_dev, "FAIL")) grp_g1 <- c(grp_g1, grp)
+    if (any(marks %in% c("ok", "DOC") | startsWith(marks, "FAIL"))) grp_g2 <- c(grp_g2, grp)
+
     # The deviance mark is a HARD gate with no registry escape; DEV-NA never
     # fails but is collected below for the loud-exclusion summary.
     failed <- any(marks %in% c("FAIL", "FAIL(len)")) ||
@@ -1105,6 +1170,8 @@ run_gates <- function() {
                      "estimate, so glmm must refuse; a converged glmm fit fails) ===\n"),
               length(no_mle)))
   if (length(no_mle)) for (line in no_mle) cat(sprintf("  %s\n", line)) else cat("  none\n")
+
+  compared_block(grp_all, grp_ref, grp_g1, grp_g2)
 
   # Every oracle record on the selected cells that is not a converged fit, per
   # oracle and grouped by message. Reported, not gated: "at least one oracle"

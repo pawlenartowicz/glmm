@@ -20,13 +20,13 @@ pub(crate) mod wald;
 
 pub use effect_size::{Icc, R2};
 pub use lr::{LrNote, LrTest};
-pub use profile::{ProfileError, ProfileInterval, ProfileIntervals, ProfileParam};
+pub use profile::{ProfileError, ProfileInterval, ProfileIntervals, ProfileNote, ProfileParam};
 pub use reference::{DenDf, Objective, Reference};
 pub use wald::{LinearKind, LinearNote, LinearTest};
 
 // The reader of the frozen inference references, for in-crate tests on
 // `pub(crate)` items. `dead_code` is allowed because each test file uses only
-// part of it, and its consumers arrive with the steps that freeze references.
+// part of it.
 #[cfg(test)]
 #[allow(dead_code)]
 pub(crate) mod test_refs;

@@ -120,11 +120,10 @@ Points worth knowing at this layer:
   so treat this as opt-in experimentation only. Leave it off if you run your
   own parallel loop over many fits (the outer loop should own the cores).
 - **The envelope.** The dense ("NoZ") solver has capacity limits:
-  `re.slopes.len() + 1 <= 8` (primary width), up to 6 extra groupings, and
-  `slopes.len() + 1 <= 4` per extra grouping (`glmm::limits::{MAX_PRIMARY_Q,
-  MAX_EXTRA_GROUPINGS, MAX_EXTRA_Q}`).
-  Within that envelope, a **Gaussian** extra grouping that carries a random slope is routed internally to a sparse solver instead (still just works — no API change). Which grouping comes first is the fit's choice, not the order you write them in: the grouping with the most random-effect columns (levels × (1 + slopes)) goes first, and a GLMM, or a Gaussian model fitted with `condvar` on, puts first a grouping that keeps the model on the dense solver when one does. So a lone slope grouping often goes first and fits on the dense solver.
-  Outside the envelope, a mixed model with an extra grouping carrying a random slope, or a design with too many crossed levels, is likewise routed to the sparse solver automatically. Every family fits either way, with no reachable panic.
+  `re.slopes.len() + 1 <= 8` (primary width) and up to 6 extra groupings
+  (`glmm::limits::{MAX_PRIMARY_Q, MAX_EXTRA_GROUPINGS}`).
+  An extra grouping that carries a random slope is routed internally to a sparse solver in every family (still just works — no API change). Which grouping comes first is the fit's choice, not the order you write them in: the grouping with the most random-effect columns (levels × (1 + slopes)) goes first, and a GLMM, or a Gaussian model fitted with `condvar` on, puts first a grouping that keeps the model on the dense solver when one does. So a lone slope grouping often goes first and fits on the dense solver.
+  Outside the envelope, or with too many crossed levels, a mixed model is likewise routed to the sparse solver automatically. Every family fits either way, with no reachable panic.
 
 **Degrees of freedom and contrasts.** A Gaussian mixed fit also carries
 lmerTest's Satterthwaite degrees of freedom: one derivative pass after the
@@ -259,7 +258,7 @@ let mut ws = build_workspace(&model, &ids, n, p, &opts);
 
 for draw in draws {
     let data = Data::new(&draw.x, &draw.y, n, p);
-    let view = fit_on(&mut ws, &data, start.as_ref(), &opts);
+    let view = fit_on(&mut ws, &data, start.as_ref(), &opts)?;
     // Hot-loop reads, straight off the workspace slots — no `Fit` allocated:
     let significant = view.t_sq()[0] > crit && view.converged();
     // Or pay for the full result when you actually need it:
@@ -276,7 +275,7 @@ need them, after `fit_on` (or `fit_on_hinted`) and with the view dropped:
 use glmm::loop_advanced::satterthwaite;
 
 let mut df_out = vec![0.0; p];
-let view = fit_on(&mut ws, &Data::new(&draw.x, &draw.y, n, p), start.as_ref(), &opts);
+let view = fit_on(&mut ws, &Data::new(&draw.x, &draw.y, n, p), start.as_ref(), &opts)?;
 let converged = view.converged();
 drop(view);
 if converged {
@@ -301,7 +300,7 @@ A pairwise contrast `β_p − β_n` has both reads too: its Wald t² from
 use glmm::loop_advanced::satterthwaite_with_contrasts;
 
 let (mut scratch, mut contrast_df) = (vec![0.0; p], vec![0.0; 1]);
-let view = fit_on(&mut ws, &Data::new(&draw.x, &draw.y, n, p), start.as_ref(), &opts);
+let view = fit_on(&mut ws, &Data::new(&draw.x, &draw.y, n, p), start.as_ref(), &opts)?;
 let t_sq = view.contrast_t_sq(1, 0, &mut scratch); // β_1 − β_0
 let converged = view.converged();
 drop(view);
@@ -321,7 +320,9 @@ the options frozen at build (`nagq`, the criterion `reml` resolves to on an
 LMM, the number of SE columns, `parallel_inner`) must match the workspace
 every call, and a `Data` with ids panics. On a mixed workspace every draw has
 the row count you built with; on a fixed-only one row counts may vary below
-it. Weights and offsets may change from call to call.
+it. Weights and offsets may change from call to call. Its one `Err` is
+`FitError::Envelope`, on the draw that builds a sparse factor for a
+random-effect pattern too large for it.
 
 What it does **not** do is validate your data. `fit_with_start` checks start-value
 lengths, weight and offset lengths and finiteness (returning a `FitError`), and it drops rank-deficient
@@ -334,8 +335,8 @@ weights or offsets turn the fit into NaN, and the GLMM route panics on a length 
 outside your loop.
 
 This is the **unstable** surface — no semver guarantees, and it changes in any
-release. It exists to serve one class of caller (warm-start simulation loops
-like MCPower's); reach for it only once you've measured that `fit_with_start`'s
+release. It exists to serve one class of caller (warm-start simulation
+loops); reach for it only once you've measured that `fit_with_start`'s
 per-call cost actually matters for your loop. `fit`/`fit_with_start` route
 through this same `build_workspace`/`fit_on` core — they allocate a throwaway
 workspace per call and always assemble the full `Fit`. That shared core is the

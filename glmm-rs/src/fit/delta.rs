@@ -4,7 +4,10 @@
 
 use super::common::{first_bad_power, weight_spread};
 use super::glm::golden_max;
-use super::{fit_checked, Fit, FitError, FitOptions, Note, SeFor, SeType, WeightPower};
+use super::{
+    alias_gate, fit_checked, fit_past_gate, Fit, FitError, FitOptions, Note, SeFor, SeType,
+    WeightPower,
+};
 use crate::{Data, ModelSpec, StartValues};
 
 /// The search's stop width on δ, far below the noise in δ̂.
@@ -40,13 +43,15 @@ pub(crate) fn probe_options(opts: &FitOptions, reml: bool) -> FitOptions {
 
 /// The profile at `delta`: the caller-scale [`Fit::loglik`] of the fit with
 /// `probe` on `w^delta` (NaN when `w^delta` is not finite and `> 0`), and
-/// whether that fit converged.
+/// whether that fit converged. `aliased` is the alias gate's verdict on
+/// `data`'s X ([`alias_gate`]), which no power changes.
 pub(crate) fn profile(
     data: &Data<'_>,
     spec: &ModelSpec,
     probe: &FitOptions,
     start: Option<&StartValues>,
     delta: f64,
+    aliased: &[bool],
 ) -> (f64, bool) {
     let w = data.design.weights.unwrap_or(&[]);
     if first_bad_power(w, delta).is_some() {
@@ -56,8 +61,11 @@ pub(crate) fn profile(
         weight_power: Some(WeightPower::Fixed(delta)),
         ..probe.clone()
     };
-    let f = fit_checked(data, spec, start, &opts);
-    (f.loglik, f.converged())
+    // A refused fit (a pattern too large to factor) fails as the probe.
+    match fit_past_gate(data, spec, start, &opts, aliased) {
+        Ok(f) => (f.loglik, f.converged()),
+        Err(_) => (f64::NAN, false),
+    }
 }
 
 /// The fit at the power that maximizes [`profile`] under REML (`reml`) or ML
@@ -80,11 +88,12 @@ pub(crate) fn fit_delta(
         .expect("a fitted weight power has weights");
     let (lower, upper) = delta_bracket(w);
     let probe = probe_options(opts, reml);
+    let aliased = alias_gate(&data.design);
     let (mut failed, mut not_converged) = (0u32, 0u32);
     // The best finite probe: δ = 0 always has finite weights.
     let mut best = (f64::NEG_INFINITY, 0.0);
     let delta = golden_max(
-        |d| match profile(data, spec, &probe, start, d) {
+        |d| match profile(data, spec, &probe, start, d, &aliased) {
             (ll, converged) if ll.is_finite() => {
                 not_converged += u32::from(!converged);
                 if ll > best.0 {
@@ -113,7 +122,7 @@ pub(crate) fn fit_delta(
         reml: Some(reml),
         ..opts.clone()
     };
-    let mut fit = fit_checked(data, spec, start, &at);
+    let mut fit = fit_checked(data, spec, start, &at)?;
     // It can fail where its probe did not (it computes what the probes skip).
     // Where no probe had a finite log-likelihood the model fails at every
     // power, as a fixed one would: that fit stands, with the failures note.
@@ -129,8 +138,8 @@ pub(crate) fn fit_delta(
     // A profile that rises toward the nearer end, or goes flat there to
     // rounding, has no maximum inside the bracket, wherever the search stopped.
     let end = if delta > 0.0 { upper } else { lower };
-    let at_bound =
-        profile(data, spec, &probe, start, end).0 >= fit.loglik - 1e-9 * fit.loglik.abs().max(1.0);
+    let at_bound = profile(data, spec, &probe, start, end, &aliased).0
+        >= fit.loglik - 1e-9 * fit.loglik.abs().max(1.0);
     fit.weight_power = delta;
     fit.weight_power_estimated = true;
     if fit.df > 0 {

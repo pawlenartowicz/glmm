@@ -10,7 +10,7 @@ pub struct BindError {
     /// `invalid_argument` (a bad argument, found by bind or the engine),
     /// `fit_error` (lowering or fitting the caller's data failed),
     /// `compare_error` (two stored fits cannot be compared) or `internal`
-    /// (a panic, or a function not implemented yet).
+    /// (a panic).
     pub code: &'static str,
     /// The message, the caller's row and design column already in it.
     pub message: String,

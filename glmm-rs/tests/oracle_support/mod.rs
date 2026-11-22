@@ -59,7 +59,7 @@ pub mod tol {
     pub const AGQ_CORR_ABS: f64 = 4e-3;
     pub const AGQ_SE_HESSIAN_REL: f64 = 2e-2;
 
-    // Inference (0.6.0): mirrors `TOL_INFERENCE` in `grid/tol.R`, where each step
+    // Inference: mirrors `TOL_INFERENCE` in `grid/tol.R`, where each step
     // enters the bands it sets. A band read by an integration gate in
     // `tests/inference_oracle.rs` gets its constant here; one read by an in-crate
     // test sits beside that test. Change together; the measurement, rule and date
@@ -710,7 +710,7 @@ fn csv_for(g: &Golden) -> String {
 
 /// An inference reference's formula lowered on its data: the CSV under
 /// `validation/` (the entry's `data`), the entry's `factors` as factor columns
-/// and every other column that parses as numbers numeric (X1, the goldens'
+/// and every other column that parses as numbers numeric (the goldens'
 /// `refit_with` rule), the entry's `weights` column, when it names one, as
 /// the prior weights; and the fit options with `FitOptions::reml` from the
 /// entry's `reml` (`None` on an entry without one). A Gaussian model;

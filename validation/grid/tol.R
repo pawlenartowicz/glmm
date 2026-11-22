@@ -125,7 +125,7 @@ TOL <- list(
   #          cells; per family gaussian 3.8e-06, negativebinomial 1.7e-06,
   #          binomial 8.4e-07, inversegaussian 3.1e-08, poisson 7.5e-09, gamma
   #          4.5e-12 -- no family stands an order of magnitude above the rest,
-  #          so ONE value, as the old corpus also used.
+  #          so ONE value.
   #
   #          MEASURED AGAINST lme4, not against the best oracle, because that is
   #          what the rule measures: glmm's own round-off floor. The same pilot
@@ -150,15 +150,13 @@ TOL <- list(
   #          on both kept runs named below, inside dev_eps.
   #          Rule: ceil1(10 x max benign |Delta dev|) over the 8 vector-AGQ
   #          cells, benign = beta/se/stddev in band against GLMMadaptive.
-  #          Measured 2026-10-01 on the glmm run of that day (which
-  #          centered the slopes) against the kept glmm run of 2026-09-30
-  #          (committed in 27318ef):
+  #          Measured between two glmm runs that standardize the design
+  #          differently (slopes centered or not):
   #          4.307e-05 on binb_q2s_g3000p20_bal_base_agq7 (beta 1.3e-05,
   #          se_hessian 2.1e-04, stddev 5.3e-05 from GLMMadaptive); the other
   #          seven gaml_q2s_g60p5 +8.0e-06, nb_q2s_g3000p20 -3.2e-06,
-  #          pois_q2s_g3000p20 +3.5e-07, the rest below 6e-08. The later
-  #          kept run of 2026-10-01 (committed in b8d2efd, same standardization)
-  #          against the earlier run of that day: at most 6.3e-10 on these cells.
+  #          pois_q2s_g3000p20 +3.5e-07, the rest below 6e-08. Two runs with
+  #          the same standardization differ by at most 6.3e-10 on these cells.
   dev_eps_agq_vec = 5e-04,
   # dev_big  a convention-mismatch constant, not a fit difference. It must sit
   #          far above the benign |Delta dev| spread and far below the smallest
@@ -215,7 +213,9 @@ TOL <- list(
   #          but the parameters of 10 of the 116 records (four-way crossed and
   #          nested fits, the NB theta search, vector AGQ) drift 1.5e-7 to
   #          3.8e-6. Those cells carry their own measured band in
-  #          CROSS_CPU_CELL_BANDS in tests/grid_reference.rs; this number stays.
+  #          CROSS_CPU_CELL_BANDS in tests/grid_reference.rs, applied only on
+  #          a CPU other than the kept run's (x86_64 CI runners stay within
+  #          1.7e-16 of an Intel-fitted run on the ten cells); this number stays.
   ci_ref_rel  = 1e-7,
   # coef_df_rel  compare.R gate 5: glmm's per-coefficient Satterthwaite df against
   #          lmerTest's on the Gaussian LMM cells, by rel_max_by_coef. The df moves
@@ -223,21 +223,8 @@ TOL <- list(
   #          only to their optimizers' tolerance, so this is an agreement band
   #          between two fits, not a round-off band on one.
   #          Rule: ceil1(2 x max rel_max_by_coef) over the cells gate 5 compares.
-  #          Measured 2026-10-12 (dell-fedora) on the 19 fast Gaussian LMM cells,
-  #          every one compared (no failed-pass, no no-ref), a --fast glmm run of the
-  #          0.6.0 tree with coef_df (scratch, not kept; any --fast run of that
-  #          tree re-measures it) against the first full lmertest run (lmerTest
-  #          3.2.1, ra-ml-twins): 3.30e-04 on lmm_cross4_g3000p20_bal_base,
-  #          (Intercept) (glmm 87.934, lmerTest 87.905); next Machines 2.96e-04
-  #          (MachineC), sim_max_q_slope 1.43e-04, Penicillin 9.2e-05,
-  #          lmm_q8_g3000p20_bal_base 6.9e-05, the other 14 cells at or below
-  #          1.6e-05. On the seven largest, lmerTest's df evaluated at glmm's own
-  #          theta-hat agrees with glmm's to 5.1e-07 or better (Penicillin; the
-  #          others at or below 3.2e-07), so the spread is the two theta-hats',
-  #          not the df computation. ceil1(2 x 3.30e-04) = 7e-04.
-  #          RE-MEASURED (2026-10-27, dell-fedora) on the full grid: the kept 0.7.0
-  #          glmm run against the lmerTest 3.2.1 run (sim_dynrange_lmm and its twin
-  #          refitted after the engines' weights fix), 257 of the 263 Gaussian mixed
+  #          MEASURED on the full grid: the kept 0.7.0 glmm run against the
+  #          lmerTest 3.2.1 run, 257 of the 263 Gaussian mixed
   #          cells (132 REML, 131 ML twins) compared at glmm's optimum; the other six
   #          are lmerTest failures or lmerTest fits above glmm's optimum, listed as
   #          no-ref. Worst 7.50e-04 on lmm_q4sx2_g30000p20_bal_base_ml, (Intercept)
@@ -255,8 +242,8 @@ TOL <- list(
 # what makes it a band about the glmm-versus-oracle gap rather than about the
 # spread between a 60-row and a 30000-row cell.
 #
-# RE-MEASURED (2026-10-27) on the full grid (compare.R --dev-floor, kept 0.7.0 run),
-# not re-pinned. The largest best-oracle 2*SEM per family, over groups with n >= 2:
+# MEASURED on the full grid (compare.R --dev-floor, kept 0.7.0 run).
+# The largest best-oracle 2*SEM per family, over groups with n >= 2:
 # binomial 1.70e-04 (agq / beta, n = 13), gamma 2.18e-04 (agq / corr, n = 2),
 # gaussian 1.06e-05 (laplace / stddev, n = 214), negativebinomial 1.89e-05
 # (laplace / corr, n = 46), poisson 1.49e-04 (agq / stddev, n = 3). Bands at
@@ -309,7 +296,7 @@ tol_for <- function(cell_id, quantity) {
   band
 }
 
-# ── inference (0.6.0) ────────────────────────────────────────────────────────
+# ── inference ────────────────────────────────────────────────────────────────
 # The bands of the inference tests (df, p-values, test statistics), which fall in
 # three classes:
 #   fit-free arithmetic  a formula evaluated on frozen inputs: a hard band, and
@@ -336,9 +323,10 @@ tol_for <- function(cell_id, quantity) {
 TOL_INFERENCE <- list(
   # Floor of lmerTest's own FD spread in the per-coefficient Satterthwaite df
   # (end-to-end class; the gate at lme4's theta-hat, whose per-fixture band is
-  # max(spread, floor) + df_fd_rel + nonstat on the value route and
-  # max(spread, floor) + df_gd_rel + nonstat on the gradient route, which the
-  # gate also runs on every reference whose fit arms the per-group gradient).
+  # max(spread, floor) + nonstat on the exact pass, which the gate runs on every
+  # reference whose crossed tail is within its width (all 26 of them), and
+  # max(spread, floor) + df_fd_rel + nonstat on the value route, which it runs
+  # on every reference).
   # The spread is |df - df_second| / df,
   # the larger of the two settings, read from each reference's frozen `df` and
   # `df_second` (goldens/inference/lmertest/, tools/goldens_lmertest.R: the df
@@ -364,68 +352,45 @@ TOL_INFERENCE <- list(
   # (lmertest_sim_wide_crossed, (Intercept)); nonstat up to 2.99e-4
   # (lmertest_Machines, MachineC, where the df error is 5.4e-8). Per-term rows
   # (8 REML references, Type III and II): DenDF worst 1.25e-6
-  # (lmertest_anova_sleepstudy, Days), F worst 1.3e-12. The gradient route,
-  # MEASURED (2026-10-11, pawel, x86_64) on the 7 references whose fit arms it
-  # (sleepstudy, Machines, sim_max_q_slope, lmm_slope, all_ones,
-  # sim_corr_boundary, sim_factorial): worst 1.01e-6 (lmertest_all_ones, x; band
-  # 7.48e-5), and the closest to its band 9.97e-7 against 1.04e-6
-  # (lmertest_sleepstudy, Days: spread 1.36e-8, nonstat 4.1e-8, so the floor
-  # carries it). That gap is shared by both routes (value 1.25e-6, gradient
-  # 9.97e-7) and lies outside the crate's FD: the routes agree to 4e-9 there once
-  # Richardson removes the value route's truncation. lmerTest's df does not move
-  # across its numDeriv settings (spread 1.36e-8), so the cause is open; the
-  # floor carries it. Per-term rows on the gradient
-  # route: DenDF worst 9.97e-7 (lmertest_anova_sleepstudy, Days; band 1.04e-6),
-  # F worst 1.3e-12.
+  # (lmertest_anova_sleepstudy, Days), F worst 1.3e-12. These are the value
+  # route's. The exact pass, MEASURED (2026-11-21, pawel, x86_64) on the 26 REML
+  # references (71 coefficients): worst 1.18e-6 (lmertest_sim_dynrange_lmm, u),
+  # at its band 1.18e-6 (spread 7.56e-7 under the floor, nonstat 1.84e-7), and
+  # 9.97e-7 against 1.33e-6 (lmertest_sleepstudy, Days); on the 26 ML references
+  # worst 3.50e-6 (lmertest_sim_max_q_slope_ml, x3), the closest to its band
+  # 2.28e-6 against 3.62e-6 (lmertest_sim_dynrange_lmm_ml, (Intercept)). The
+  # sleepstudy gap lies outside the crate's derivatives: the exact pass and the
+  # value route agree there once Richardson removes the value route's
+  # truncation, and lmerTest's df does not move across its numDeriv settings
+  # (spread 1.36e-8), so the cause is open; the floor carries it. Per-term rows
+  # on the exact pass: DenDF worst 9.97e-7 (lmertest_anova_sleepstudy, Days;
+  # band 1.33e-6) under REML and 2.96e-6 (lmertest_anova_sleepstudy_ml, Days)
+  # under ML, F worst 1.8e-13.
   df_lmertest_floor_rel = 1e-6,
-  # Value-route finite-difference band of the per-coefficient Satterthwaite df
-  # (hard class, no registry entry). Gate 3, step stability: the df at the pass's
-  # step eta = 3e-4 (h_k = eta * max(|theta_k|, 1), ETA in src/lmm/satterthwaite.rs)
-  # against the df at 1e-3, per coefficient; also gate 4 (dense against sparse
-  # kernel at one theta; the sparse kernel has the value route only, so on a
-  # per-group design both the dense gradient route and the dense value route
-  # are held to this band against it), the df_fd_rel term of the gate at
-  # lme4's theta-hat (band max(spread, floor) + df_fd_rel + nonstat), and the
-  # gradient route against the value route on the same fit
-  # (gradient_route_agrees_with_value_route: every df, and each H_p entry (i, j)
-  # at df_fd_rel x sqrt(H_ii H_jj); MEASURED 2026-10-11 at ETA_GRAD = 3e-6, df
-  # 4.5e-7 on q3s near-zero, H_p 5.1e-7 on sim_max_q_slope; MEASURED 2026-10-12
-  # under ML on its 9 fixtures, df 1.7e-6 and H_p 1.5e-6 on q3s near-zero).
+  # Finite-difference band of the per-coefficient Satterthwaite df on the value
+  # route, which the pass takes on a crossed tail wider than EXACT_TAIL_MAX
+  # (src/lmm/satterthwaite_exact.rs), and of the reference checks against it
+  # (hard class, no registry entry). Gate 3, step stability: the df at the
+  # pass's step eta = 3e-4 (h_k = eta * m_b, m_b the largest |theta| of the
+  # coordinate's block; ETA in src/lmm/satterthwaite.rs) against the df at 1e-3,
+  # per coefficient; also the value route's term of the gate at lme4's
+  # theta-hat (band max(spread, floor) + df_fd_rel + nonstat), gate 4 on the
+  # value route (dense against sparse kernel at one theta), and the exact pass
+  # against the value route on the same fit (exact_pass_agrees_with_value_route:
+  # every df at this band; its H_p entries have their own Rust-only band,
+  # H_FD_REL; MEASURED over 56 fits under REML and ML, the largest df gap:
+  # 1.7e-5 on x86_64 (2026-11-21), 1.75e-5 on plain wasm32-wasip1
+  # (2026-11-22, sim_dynrange_lmm under REML)).
   # Gated in src/lmm/satterthwaite_tests.rs, which holds the Rust copy. MEASURED
-  # (2026-10-11, pawel, x86_64) by step_sweep_is_flat_at_eta over its 17 fixtures
+  # (2026-11-18, macOS arm64) by step_sweep_is_flat_at_eta over its fixtures
   # (the toy 300 + y/4; sim_dynrange_lmm, sim_nested_crossed_mix,
   # sim_near_singular, sim_corr_boundary; the speed-campaign shapes int1, nest2,
-  # q2s, q3s, cross4 and cross6, a base and a near-zero draw each): maximum 8.7e-6
-  # (sim_nested_crossed_mix), every speed-campaign shape at or below 5.9e-6 (q3s
-  # near-zero). Rule ceil1(2 x 8.7e-6) = 2e-5. The smaller steps are not gated:
-  # round-off from the random effects moves the df by 2.9e-5 between 1e-4 and
-  # 3e-4 (sim_nested_crossed_mix) and 1.5e-3 between 3e-5 and 1e-4
-  # (sim_dynrange_lmm). As a diagnostic only, Richardson extrapolation from the
-  # steps 5e-4 and 1e-3 puts the error at 3e-4 at 3.0e-6 or below.
-  df_fd_rel = 2e-5,
-  # Gradient-route band of the per-coefficient Satterthwaite df (hard class, no
-  # registry entry): H_p from central differences of the per-group analytic
-  # gradient, on the fits that arm it. Gate 3, step stability: the df at the
-  # route's step eta = 3e-6 (h_k = eta * max(|theta_k|, 1), ETA_GRAD in
-  # src/lmm/satterthwaite.rs) against the df at 1e-5, per coefficient; also the
-  # df_gd_rel term of the gate at lme4's theta-hat on that route (band
-  # max(spread, floor) + df_gd_rel + nonstat). Gated in
-  # src/lmm/satterthwaite_tests.rs, which holds the Rust copy. Guessed a priori
-  # at 1e-9.
-  # MEASURED (2026-10-11, pawel, x86_64) by gradient_step_sweep_is_flat_at_eta_grad
-  # over the steps 1e-6, 3e-6, 1e-5, 3e-5 and 1e-4 on 9 per-group fixtures
-  # (sleepstudy, sim_max_q_slope, the weighted lmm_slope and all_ones,
-  # sim_corr_boundary; the speed-campaign shapes q2s and q3s, a base and a
-  # near-zero draw each), the largest change of a df per pair of steps: 1.5e-9
-  # (1e-6 to 3e-6, sim_max_q_slope), 1.2e-9 (3e-6 to 1e-5, q3s near-zero), 6.9e-9
-  # (1e-5 to 3e-5) and 7.8e-8 (3e-5 to 1e-4, both q3s near-zero): round-off below
-  # 3e-6, truncation growing as eta^2 above 1e-5. Rule ceil1(2 x 1.2e-9) = 3e-9,
-  # above the a-priori 1e-9: no pinned step holds 1e-9 against either
-  # neighbour. As a diagnostic only, Richardson extrapolation from the steps 1e-5
-  # and 3e-5 puts the error at 3e-6 at 3.1e-10 or below (8.7e-10 at 1e-5). On the
-  # same fits the gradient route's df is within 4.5e-7 of the value route's (q3s
-  # near-zero), inside df_fd_rel: the gap is the value route's error.
-  df_gd_rel = 3e-9,
+  # q2s, q3s, cross4 and cross6, a base and a near-zero draw each): the largest
+  # spread between eta = 3e-4 and 1e-3 is 1.9e-5 (sim_nested_crossed_mix). Rule
+  # ceil1(2 x 1.9e-5) = 4e-5. The smaller steps are not gated: round-off from
+  # the random effects moves the df by up to 6.6e-5 between 1e-4 and 3e-4
+  # (sim_dynrange_lmm) and 1.3e-3 between 3e-5 and 1e-4 (sim_nested_crossed_mix).
+  df_fd_rel = 4e-5,
   # Contest layer, fit-free class (gate 2, src/inference/contest_tests.rs, which
   # holds the Rust copies). The crate's contest1D and get_Fstat_ddf, fed lmerTest's
   # frozen beta, vcov_beta, vcov_varpar and Jac_list, against lmerTest's own
@@ -482,10 +447,10 @@ TOL_INFERENCE <- list(
   # 5.4e-8, so the gap is the two theta-hats'), every other reference at or below
   # 1.64e-4 (lmertest_sim_wide_crossed, (Intercept)). Per-term rows: DenDF
   # maximum 2.91e-4 and F 1.18e-4 (lmertest_anova_Machines, Machine). Each fit
-  # takes its own derivative route here, the gradient route on the 7 fits that
-  # arm the per-group gradient; RE-MEASURED (2026-10-11, pawel) on those routes:
-  # maximum unchanged at 2.96e-4 (lmertest_Machines, gradient route), the
-  # value-route fits at or below 1.64e-4.
+  # takes the derivative route its kernel takes, the exact pass on all 26;
+  # RE-MEASURED (2026-11-21, pawel, x86_64) on it: maximum unchanged at 2.96e-4
+  # (lmertest_Machines), every other reference at or below 1.64e-4
+  # (lmertest_sim_wide_crossed).
   df_e2e_rel = TOL$se_rel,
   # Gate 1's interval comparison (end-to-end class, registry quantity
   # `confint`): the bounds beta-hat -/+ qt(1 - (1 - level)/2, df) * SE at glmm's
@@ -499,10 +464,9 @@ TOL_INFERENCE <- list(
   # over the same 71 coefficients: maximum 8.61e-5 (lmertest_Machines,
   # MachineB), every other reference at or below 2.61e-5 (lmertest_Penicillin).
   # On the scale of the bound itself the maximum is 6.14e-4 (the same bound,
-  # 1.74 against a width of 12.4). RE-MEASURED (2026-10-11, pawel) with each fit
-  # on its own derivative route: maximum 8.60e-5 (lmertest_Machines, MachineB,
-  # gradient route), the value-route fits at or below 2.61e-5
-  # (lmertest_Penicillin).
+  # 1.74 against a width of 12.4). RE-MEASURED (2026-11-21, pawel, x86_64) with
+  # each fit on the exact pass: maximum 8.60e-5 (lmertest_Machines), every other
+  # reference at or below 2.59e-5 (lmertest_Penicillin).
   confint_rel = TOL$se_rel,
   # Exact RLRT, the design eigenvalues (hard: no registry entry excuses a miss).
   # glmm's normalized nonzero eigenvalues of Z'P0Z, from a (1 | g) fit's design
@@ -557,7 +521,7 @@ TOL_INFERENCE <- list(
   # (rlrt_sleepstudy), every other reference at or below 5.49e-12
   # (rlrt_large_k); on rlrt_dyestuff2 glmm's pinned fit gives exactly 0 against
   # RLRsim's 5.68e-14, inside the band, so the statistic needs no entry.
-  rlrt_stat_abs = 4e-6,
+  rlrt_stat_abs = 2 * TOL$loglik_abs_lmm,
   # Exact RLRT, gate 1's fit-free part (Monte Carlo): on four balanced
   # intercept-only designs, (K, J) = (6, 5), (3, 4), (4, 5) and (10, 3) with
   # seeds 20261011 to 20261014, glmm's null at B = 1e5 against the one-way
@@ -694,8 +658,8 @@ TOL_INFERENCE <- list(
   # (wasm plain; x86_64 1.57e-12; binomial GLMM nAGQ 5, Type II g, T = 12.84,
   # 2.02e-11 absolute); the GLM rows agree exactly. Rule ceil1(2 x worst):
   # lt_compare_abs from the T < 1 rows, lt_compare_rel from the T >= 1 rows.
-  # Measured far below the 1e-7 to 1e-6 the plan guessed for two optimizations
-  # from different starts. The Type III null basis is taken from the
+  # Measured far below the 1e-7 to 1e-6 expected of two optimizations from
+  # different starts. The Type III null basis is taken from the
   # unrounded hypothesis (formula::hypotheses::type3_unrounded): from the
   # zapsmall-rounded one the statistic of anova_lrt3_glmm_sim_factorial_bern's
   # h row is 0.02446281944 against 0.02446285055, a move of 3.1e-8 (afex
@@ -710,9 +674,6 @@ TOL_INFERENCE <- list(
   # optimizer's stopping residue on these fixtures (it scales with |l|, the
   # curvature and the stopping rule), so a new gate-2 fixture with a much
   # larger |l| needs its own measurement rather than this constant.
-  # RE-MEASURED (2026-10-13, pawel, x86_64) after the refits dropped their
-  # standard errors (Rx covariance, no SE targets): all 40 statistics
-  # unchanged bit for bit.
   lt_compare_abs = 2e-11,
   lt_compare_rel = 4e-12,
   # The F and Wald rows (end-to-end class, registry quantities `f` and
@@ -873,16 +834,28 @@ rel_max <- function(x, y, atol = TOL$near_zero_abs) {
 # compare.R's two port blocks call this and nothing else -- change together.
 port_rel_max <- function(x, y) rel_max(x, y, atol = 0)
 
-# Torn-line tolerant (kill -9 watchdog can truncate the final line) -- a run
-# killed mid-write still yields every complete record before the tear.
+# Tolerant of a torn LAST line only (the kill -9 watchdog can truncate the line
+# being written), so a run killed mid-write still yields every complete record
+# before the tear, with a warning naming the dropped line. Any other unparseable
+# line stops: it is a record an engine wrote wrongly (a bare NaN, say), and
+# dropping it would take its cell out of every gate without a word.
 # Namespaced fromJSON so this file works when sourced on its own, without a
 # caller that has already attached jsonlite.
 read_jsonl <- function(path) {
   lines <- readLines(path); lines <- lines[nzchar(lines)]
   recs <- list()
-  for (ln in lines) {
-    rec <- tryCatch(jsonlite::fromJSON(ln, simplifyVector = TRUE), error = function(e) NULL)
-    if (!is.null(rec)) recs[[length(recs) + 1L]] <- rec
+  bad <- integer(0)
+  for (i in seq_along(lines)) {
+    rec <- tryCatch(jsonlite::fromJSON(lines[[i]], simplifyVector = TRUE), error = function(e) NULL)
+    if (is.null(rec)) bad <- c(bad, i) else recs[[length(recs) + 1L]] <- rec
+  }
+  if (length(bad)) {
+    if (any(bad < length(lines)))
+      stop(sprintf("%s: %d unparseable line(s) before the last (non-empty line %s)", path,
+                   sum(bad < length(lines)), paste(bad[bad < length(lines)], collapse = ", ")),
+           call. = FALSE)
+    warning(sprintf("%s: dropped 1 unparseable line, the last (a torn write)", path),
+            call. = FALSE)
   }
   setNames(recs, vapply(recs, `[[`, "", "cell"))
 }

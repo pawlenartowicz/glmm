@@ -14,6 +14,23 @@ use crate::lmm::LmmGroupings;
 use crate::scalar::Scalar;
 use crate::spec::Family;
 
+/// The Laplace objective from one PIRLS solve: `d + pen + 2·log|L|`, or
+/// `+∞` when PIRLS did not converge or its raw deviance is not finite.
+/// Returns `(objective, d + pen, conv, raw deviance finite)`.
+fn fold_laplace<T: Scalar>(dev: T, pen: T, logdet: T, conv: bool) -> (T, T, bool, bool) {
+    let raw_dev_finite = dev.value().is_finite();
+    let pen_dev = dev + pen;
+    if !conv || !raw_dev_finite {
+        return (T::from_f64(f64::INFINITY), pen_dev, conv, raw_dev_finite);
+    }
+    (
+        pen_dev + T::from_f64(2.0) * logdet,
+        pen_dev,
+        conv,
+        raw_dev_finite,
+    )
+}
+
 /// The blocked (`extra_offsets` empty) Laplace objective at (θ, β), generic
 /// over the scalar: build Λ_p, solve the blocked PIRLS conditional modes, and
 /// return `d(y,ũ) + ‖ũ‖² + log|A|` — the same three terms `laplace_deviance`
@@ -43,10 +60,6 @@ pub(crate) fn blocked_laplace_deviance<T: Scalar>(
     beta_step: BetaStep,
     offset: Option<&[f64]>,
     pirls_tol_override: Option<f64>,
-    // Unused on the blocked path (`pirls_solve_blocked` reads `p` off
-    // `beta.len()`) — kept so the signature matches the packed/structured arms'
-    // shape.
-    _p: usize,
     n: usize,
     counters: &mut crate::counters::EvalCounters,
 ) -> (T, T, bool, bool) {
@@ -75,17 +88,7 @@ pub(crate) fn blocked_laplace_deviance<T: Scalar>(
         n,
         counters,
     );
-    let raw_dev_finite = dev.value().is_finite();
-    let pen_dev = dev + pen;
-    if !conv || !raw_dev_finite {
-        return (T::from_f64(f64::INFINITY), pen_dev, conv, raw_dev_finite);
-    }
-    (
-        pen_dev + T::from_f64(2.0) * logdet,
-        pen_dev,
-        conv,
-        raw_dev_finite,
-    )
+    fold_laplace(dev, pen, logdet, conv)
 }
 
 /// The structured (`extra_offsets` non-empty, `structured_extras_eligible()`)
@@ -188,17 +191,47 @@ pub(crate) fn structured_laplace_deviance<T: TailKernel>(
         n,
         counters,
     );
-    let raw_dev_finite = dev.value().is_finite();
-    let pen_dev = dev + pen;
-    if !conv || !raw_dev_finite {
-        return (T::from_f64(f64::INFINITY), pen_dev, conv, raw_dev_finite);
-    }
-    (
-        pen_dev + T::from_f64(2.0) * logdet,
-        pen_dev,
-        conv,
-        raw_dev_finite,
-    )
+    fold_laplace(dev, pen, logdet, conv)
+}
+
+/// The mutable buffers one [`laplace_deviance`] evaluation reads and writes,
+/// borrowed from the workspace once and shared by every evaluation of a fit.
+///
+/// The β buffer roles follow the β mode, and [`laplace_deviance`] picks them:
+/// under `BetaMode::Fixed`, β is `beta_rhs` (a transient scratch, never
+/// `ws.betas`: `betas` is the fit's reported β output, and the FD-Hessian SE
+/// path re-evals many times, so clobbering `betas` would corrupt the reported
+/// coefficients) and `beta_prof` is the spare; under
+/// `ProfilePql`/`ProfileExact`, β is `beta_prof` (the caller's β in/out state,
+/// the stage-1 warm-start buffer) and `beta_rhs` is the δβ RHS/solution scratch
+/// (`BetaStep::Profile.beta_rhs`). The two must never alias.
+pub(crate) struct EvalScratch<'a> {
+    pub(crate) wx: &'a mut Mat<f64>,
+    /// Row- and RE-sized PIRLS scratch every route writes — see [`PirlsScratch`].
+    pub(crate) pirls: &'a mut PirlsScratch<f64>,
+    /// Structured crossed/nested route scratch — see [`StructuredScratch`].
+    pub(crate) structured: &'a mut StructuredScratch<f64>,
+    /// Structured route's θ-independent index pattern — see [`StructuredPattern`].
+    pub(crate) pattern: &'a mut StructuredPattern,
+    /// Packed-row layout scratch — see [`PackedScratch`]. Zero-length on the
+    /// blocked/structured branches, which never read it.
+    pub(crate) packed: &'a mut PackedScratch,
+    /// Profile-mode (β-profiling / stage-1) scratch — the β-Schur border buffers
+    /// each PIRLS variant's Profile δβ step reads (mirrors `packed/blocked/structured
+    /// _schur_fill` in se.rs). All inert when `beta_mode == BetaMode::Fixed`.
+    pub(crate) border: &'a mut BorderScratch,
+    /// Row-sized scratch for `prior_wᵢ/φ`, rewritten on every Gamma evaluation
+    /// at `gamma_phi ≠ 1` and untouched on every other family.
+    pub(crate) prior_w_phi: &'a mut [f64],
+    pub(crate) beta_rhs: &'a mut [f64],
+    pub(crate) beta_prof: &'a mut [f64],
+    /// Exact-profile scratch (`pirls::ExactProfileBufs`), threaded into
+    /// `BetaStep::Profile { exact: .. }` only under `BetaMode::ProfileExact` — inert
+    /// (unread) under `Fixed`/`ProfilePql`.
+    pub(crate) exact_prof: &'a mut super::pirls::ExactProfileBufs,
+    /// Cluster-outer AGQ substrate (`agq::ClusterRowIndex`), forwarded verbatim to
+    /// `agq_deviance`'s early return; `None` on every non-AGQ path (unread).
+    pub(crate) cluster_rows: Option<&'a super::agq::ClusterRowIndex>,
 }
 
 /// Laplace deviance at (θ, β): rebuild M = ZΛ, solve the PIRLS conditional
@@ -222,43 +255,18 @@ pub(crate) fn structured_laplace_deviance<T: TailKernel>(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn laplace_deviance(
     data: &FitData,
+    sc: &mut EvalScratch,
     nb_theta: f64,
     // The Gamma dispersion this evaluation runs at (1.0 on every other family,
     // unread there) — see the Gamma note in the body.
     gamma_phi: f64,
     nagq: u8,
     params: &[f64],
-    beta: &mut [f64],
-    wx: &mut Mat<f64>,
-    // Row- and RE-sized PIRLS scratch every route writes — see [`PirlsScratch`].
-    pirls: &mut PirlsScratch<f64>,
-    // Structured crossed/nested route scratch — see [`StructuredScratch`].
-    structured: &mut StructuredScratch<f64>,
-    // Structured route's θ-independent index pattern — see [`StructuredPattern`].
-    pattern: &mut StructuredPattern,
-    // Packed-row layout scratch — see [`PackedScratch`]. Zero-length on the
-    // blocked/structured branches, which never read it.
-    packed: &mut PackedScratch,
-    // Profile-mode (β-profiling / stage-1) scratch — the β-Schur border buffers
-    // each PIRLS variant's Profile δβ step reads (mirrors `packed/blocked/structured
-    // _schur_fill` in se.rs). All inert when `beta_mode == BetaMode::Fixed`.
-    border: &mut BorderScratch,
-    // Row-sized scratch for `prior_wᵢ/φ`, rewritten on every Gamma evaluation
-    // at `gamma_phi ≠ 1` and untouched on every other family.
-    prior_w_phi: &mut [f64],
-    // The caller-owned δβ RHS/solution scratch (BetaStep::Profile.beta_rhs) and
-    // MUST be a distinct buffer from `beta` — Fixed callers pass `ws.beta_prof` here
-    // (spare) and `ws.beta_rhs` as `beta`; the Profile caller passes `ws.beta_rhs`
-    // here and `ws.beta_prof` as `beta`.
-    beta_step_rhs: &mut [f64],
-    // Exact-profile scratch (`pirls::ExactProfileBufs`), threaded into
-    // `BetaStep::Profile { exact: .. }` only under `BetaMode::ProfileExact` — inert
-    // (unread) under `Fixed`/`ProfilePql`.
-    exact_prof: &mut super::pirls::ExactProfileBufs,
     // β mode: `ProfilePql`/`ProfileExact` build `BetaStep::Profile` (joint (u,β) step,
     // converged β written back through `beta`); `Fixed` builds `BetaStep::Fixed` (β
     // held at the caller's input — the FD-Hessian and stage-2 contract). No default:
-    // every call site chooses.
+    // every call site chooses. It also picks which buffer of `sc` plays β (see
+    // [`EvalScratch`]).
     beta_mode: BetaMode,
     // PIRLS exit-tol override, forwarded verbatim to whichever PIRLS variant (or
     // `agq_deviance`) runs. `Some(pirls_tol_fd(family))` under the FD-Hessian SE
@@ -266,9 +274,6 @@ pub(crate) fn laplace_deviance(
     // path `None`, except the `ExactProfile` search's radius-tied tolerance
     // (`RHO_TOL_C` in `glmm/mod.rs`), which is always looser than `pirls_tol`.
     pirls_tol_override: Option<f64>,
-    // Cluster-outer AGQ substrate (`agq::ClusterRowIndex`), forwarded verbatim to
-    // `agq_deviance`'s early return below; `None` on every non-AGQ path (unread).
-    cluster_rows: Option<&super::agq::ClusterRowIndex>,
     // Observation-only: incremented below when a fit-path PIRLS solve (the
     // Laplace branch only — AGQ's own per-cluster PIRLS, above, is not
     // instrumented) runs the full iteration cap without converging. Never read
@@ -294,6 +299,20 @@ pub(crate) fn laplace_deviance(
         n,
         p,
     } = *data;
+    let wx = &mut *sc.wx;
+    let pirls = &mut *sc.pirls;
+    let structured = &mut *sc.structured;
+    let pattern = &mut *sc.pattern;
+    let packed = &mut *sc.packed;
+    let border = &mut *sc.border;
+    let prior_w_phi = &mut *sc.prior_w_phi;
+    let exact_prof = &mut *sc.exact_prof;
+    let cluster_rows = sc.cluster_rows;
+    let (beta, beta_step_rhs): (&mut [f64], &mut [f64]) = if beta_mode == BetaMode::Fixed {
+        (&mut *sc.beta_rhs, &mut *sc.beta_prof)
+    } else {
+        (&mut *sc.beta_prof, &mut *sc.beta_rhs)
+    };
     let BorderScratch {
         xtwx: _,
         xtwm,
@@ -306,13 +325,10 @@ pub(crate) fn laplace_deviance(
     // Fixed-mode β: a value-exact copy of `params[n_theta..n_theta+p]` into the
     // caller's β buffer. β is never sliced out of `params` below — the PIRLS
     // variants (and `agq_deviance`) read it from `beta`, and every call is
-    // `BetaStep::Fixed`, so β is read-only and this stays bit-identical to the
-    // pre-plumbing path. The Fixed-mode callers pass `ws.beta_rhs` (a transient
-    // scratch), NOT `ws.betas`: `betas` is the fit's reported β output, and the
-    // FD-Hessian SE path re-evals this fn many times — clobbering `betas` would
-    // corrupt the reported coefficients. In Profile mode `beta` is the caller's β
-    // in/out state (the stage-1 warm-start buffer, `ws.beta_prof`): it must NOT be
-    // reseeded from params — the joint (u,β) step drives it, so this copy is gated
+    // `BetaStep::Fixed`, so β is read-only (which buffer is β:
+    // [`EvalScratch`]). In Profile mode
+    // `beta` is the caller's β in/out state: it must NOT be reseeded from params
+    // — the joint (u,β) step drives it, so this copy is gated
     // `beta_mode == BetaMode::Fixed`.
     if beta_mode == BetaMode::Fixed {
         beta[..p].copy_from_slice(&params[n_theta..n_theta + p]);
@@ -325,8 +341,8 @@ pub(crate) fn laplace_deviance(
     // conditional modes minimize `D(b)/φ + ‖u‖²`, and `log|A|` is built from
     // working weights carrying that same `1/φ`, while the ridge `‖u‖²` — the
     // prior on b, which has no dispersion in it — does not. lme4 omits φ from
-    // both (1.1-38 `src/respModule.cpp` builds the PIRLS weights as
-    // `muEta·sqrt(weights/variance)`, no dispersion anywhere), which makes the
+    // both (its PIRLS weights are `muEta·sqrt(weights/variance)`, no
+    // dispersion anywhere), which makes the
     // data look `1/φ` times less informative, makes the ridge look `1/φ` times
     // too expensive, and inflates θ̂ by roughly that factor; glmmTMB and
     // GLMMadaptive both report the absolute-unit θ̂ the form below produces.
@@ -340,7 +356,7 @@ pub(crate) fn laplace_deviance(
     // φ is the caller's: the outer search carries `ln φ` as its trailing
     // coordinate (`glmm::fit_glmm`) and adds the φ-only rest of the Gamma
     // log-density (`family::gamma_dispersion_term`) itself, the way it adds
-    // NB's `nb_term`. So the value returned here is `D/φ + ‖u‖² + log|A|` on
+    // NB's term (`Dispersion::term`). So the value returned here is `D/φ + ‖u‖² + log|A|` on
     // every family, and φ = 1 hands PIRLS the caller's own slice untouched.
     // The gradient search's `GradSearch::gradient` and the tests'
     // `gradient_at_mode_ws` pick the same slice back — change together.
@@ -352,15 +368,16 @@ pub(crate) fn laplace_deviance(
     } else {
         prior_w
     };
-    // AGQ (nagq>1) only on a single grouping factor (no extras), q_p ≤ 3,
-    // binomial/Poisson/negative-binomial — the shapes where the marginal likelihood factorizes into
-    // independent per-cluster q-D integrals (a k^q product quadrature). The
-    // family/nagq/q_p terms are `derivative::agq_eligible`, shared with the
-    // derivative path. Route by
+    // AGQ (nagq>1) only on a single grouping factor (no extras), q_p ≤
+    // MAX_AGQ_Q, binomial/Poisson/negative-binomial/Gamma — the shapes where
+    // the marginal likelihood factorizes into independent per-cluster q-D
+    // integrals (a k^q product quadrature). The family/nagq/q_p terms are
+    // `agq::agq_eligible`. The derivative path's copy of this router is
+    // `derivative::eval_objective` — change together. Route by
     // q_p: scalar (q_p==1) → agq_deviance (verbatim, frozen goldens), vector
     // (q_p∈2..=3) → agq_deviance_vec. Every other shape (and nagq==1) uses the
     // Laplace path below unchanged (nagq==1 IS Laplace, so it is bit-identical).
-    if super::derivative::agq_eligible(family, nagq, groupings.primary_q)
+    if super::agq::agq_eligible(family, nagq, groupings.primary_q)
         && groupings.extra_offsets.is_empty()
     {
         let kernel = if groupings.primary_q == 1 {
@@ -405,21 +422,6 @@ pub(crate) fn laplace_deviance(
     if layout == GlmmLayout::Packed {
         crate::sparse::fill_lambda_small(&params[..n_theta], groupings, &mut packed.lam_small);
         fill_m_vals(packed, groupings, z_buf, n);
-        // Fit-path evals (`pirls_tol_override == None`; packed layout only,
-        // which `ExactProfile` never uses) carry the previous call's
-        // converged û forward as the starting point — fewer iterations to
-        // reconverge, same fixed point. Tight-tol evals (the FD-Hessian stencil)
-        // cold-seed û = 0, overriding the `u_seed` that `laplace_deviance_at` copied
-        // in. Both seeds are constant over the grid, so either makes every cell a
-        // pure function of `(γ̂, steps, design)` whatever order it runs in; the cold
-        // one is the one whose second differences match the assembled Hessian.
-        // Measured on `sim_sparse_gamma` (Gamma-log), diagonal entry of the first β
-        // coordinate: assembled 60.971162, stencil from û = 0 60.972707, stencil
-        // from `u_seed` −94.968163, which is indefinite and costs the fit its
-        // Hessian SE. The cold f0 there is 3427.047583 against the fit's 3427.047586.
-        if pirls_tol_override.is_some() {
-            pirls.u.fill(0.0);
-        }
     }
     // The branches are mutually exclusive, so the one `BetaStep` moves into
     // whichever runs. Fixed leaves the border buffers untouched.
@@ -456,7 +458,6 @@ pub(crate) fn laplace_deviance(
                 beta_step,
                 offset,
                 pirls_tol_override,
-                p,
                 n,
                 counters,
             );
@@ -510,12 +511,7 @@ pub(crate) fn laplace_deviance(
                 n,
                 counters,
             );
-            let pen_dev = dev + pen;
-            if !conv || !dev.is_finite() {
-                (f64::INFINITY, pen_dev, conv, dev.is_finite())
-            } else {
-                (pen_dev + 2.0 * logdet, pen_dev, conv, true)
-            }
+            fold_laplace(dev, pen, logdet, conv)
         }
     };
     pirls.pen_dev = pen_dev;
@@ -537,10 +533,11 @@ pub(crate) fn laplace_deviance(
 
 /// Evaluate the joint Laplace deviance at the params CURRENTLY in `ws.params`
 /// (the FD loop in `joint_hessian_cov` writes them before each call). Borrow-split
-/// twin of `fit_glmm`'s BOBYQA-closure body: destructures the workspace into the
+/// twin of `bobyqa_route::Stage1Objective::eval`'s body: destructures the workspace into the
 /// disjoint borrows `laplace_deviance` needs and calls it. Seeds the PIRLS conditional modes from û = 0 each call — UNLESS
 /// `ws.fd.warm_seed_active`, in which case it seeds from the fixed shared `ws.u_seed`
-/// (the fitted mode û(γ̂), set by `joint_hessian_cov`). Same fixed-seed FD-derivative
+/// (the fitted mode û(γ̂), set by `joint_hessian_cov`), except on the packed-row
+/// layout while `ws.fd.pirls_tol_override` is set (see the body). Same fixed-seed FD-derivative
 /// invariant as `joint_hessian_cov` in se.rs — see there for the derivation.
 ///
 /// Caller must have filled `ws.z_buf` for this fit's `x` (blocked path) — `x` is
@@ -556,7 +553,20 @@ pub(crate) fn laplace_deviance_at(
     counters: &mut crate::counters::EvalCounters,
 ) -> f64 {
     let kk = ws.k.max(1);
-    if ws.fd.warm_seed_active {
+    // The packed-row layout's FD-pass evals (`pirls_tol_override` set: the
+    // stencil in `se::packed_fd_hessian_cov` and the `sparse::fd_margin`
+    // harness) seed from û = 0 even under `warm_seed_active`. Both seeds are
+    // constant over the grid, so either makes every cell a pure function of
+    // `(γ̂, steps, design)` whatever order it runs in; on this layout the cold
+    // one is the one whose second differences match the assembled Hessian.
+    // Measured on `sim_sparse_gamma` (Gamma-log), diagonal entry of the first β
+    // coordinate: assembled 60.971162, stencil from û = 0 60.972707, stencil
+    // from `u_seed` −94.968163, which is indefinite and costs the fit its
+    // Hessian SE. The cold f0 there is 3427.047583 against the fit's 3427.047586.
+    // The non-packed seeding below is mirrored by `agq_gradient::mode_at`;
+    // change together.
+    let packed_fd = ws.layout == GlmmLayout::Packed && ws.fd.pirls_tol_override.is_some();
+    if ws.fd.warm_seed_active && !packed_fd {
         ws.pirls.u[..kk].copy_from_slice(&ws.u_seed[..kk]);
     } else {
         for v in ws.pirls.u[..kk].iter_mut() {
@@ -564,8 +574,7 @@ pub(crate) fn laplace_deviance_at(
         }
     }
     // Fixed mode: β = ws.beta_rhs (transient scratch, never ws.betas — see
-    // laplace_deviance's doc). `beta_step_rhs` just needs a distinct spare
-    // buffer (inert under Fixed) — ws.beta_prof is it.
+    // [`EvalScratch`]).
     laplace_deviance_ws(
         ws,
         x,
@@ -580,10 +589,8 @@ pub(crate) fn laplace_deviance_at(
 
 /// Borrow-split body of `laplace_deviance_at`: destructures the workspace into the
 /// disjoint borrows `laplace_deviance` needs and calls it. `beta_mode`
-/// selects both `laplace_deviance`'s β mode AND which workspace buffer plays
-/// β vs. the spare `beta_step_rhs` (Fixed: β = `beta_rhs`, spare = `beta_prof`;
-/// Profile: β = `beta_prof`, spare = `beta_rhs` — the two must never alias).
-/// Callers own all u/β seeding — this helper seeds nothing.
+/// selects `laplace_deviance`'s β mode, and with it the buffer roles
+/// ([`EvalScratch`]). Callers own all u/β seeding — this helper seeds nothing.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn laplace_deviance_ws(
     ws: &mut GlmmWorkspace,
@@ -623,11 +630,6 @@ pub(crate) fn laplace_deviance_ws(
         pirls_exhausted,
         ..
     } = ws;
-    let (beta, beta_step_rhs): (&mut [f64], &mut [f64]) = if beta_mode == BetaMode::Fixed {
-        (beta_rhs, beta_prof)
-    } else {
-        (beta_prof, beta_rhs)
-    };
     // Read-only design view `laplace_deviance` takes below — see [`FitData`].
     let data = FitData {
         family,
@@ -644,13 +646,7 @@ pub(crate) fn laplace_deviance_ws(
         n,
         p: *p,
     };
-    laplace_deviance(
-        &data,
-        nb_theta,
-        gamma_phi,
-        nagq,
-        &prm[..],
-        beta,
+    let mut sc = EvalScratch {
         wx,
         pirls,
         structured,
@@ -658,11 +654,20 @@ pub(crate) fn laplace_deviance_ws(
         packed,
         border,
         prior_w_phi,
-        beta_step_rhs,
+        beta_rhs,
+        beta_prof,
         exact_prof,
+        cluster_rows: cluster_rows.as_ref(),
+    };
+    laplace_deviance(
+        &data,
+        &mut sc,
+        nb_theta,
+        gamma_phi,
+        nagq,
+        &prm[..],
         beta_mode,
         pirls_tol_override,
-        cluster_rows.as_ref(),
         pirls_exhausted,
         counters,
     )
@@ -671,8 +676,8 @@ pub(crate) fn laplace_deviance_ws(
 /// Workspace-bound wrapper for `laplace_deviance`: copies `params` into the
 /// workspace, fills `z_buf`, then delegates to the shared `laplace_deviance_at`.
 /// Test-only entry point — the production fit (`fit_glmm`) destructures the
-/// workspace and calls `laplace_deviance` directly (the BOBYQA closure and the
-/// pinned-γ̂ re-eval both inline it), so this exists purely to drive the deviance
+/// workspace and calls `laplace_deviance` directly (`bobyqa_route::Stage1Objective::eval`
+/// and the pinned-γ̂ re-eval in `pin::post_pin` both inline it), so this exists purely to drive the deviance
 /// from a `&[f64]` in tests.
 #[cfg(test)]
 pub(crate) fn glmm_laplace_deviance(

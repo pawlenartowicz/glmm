@@ -18,10 +18,9 @@ use std::cmp::Reverse;
 
 use faer::{Mat, MatRef};
 
-use super::materialize::Lowered;
-use crate::inference::cr2::mul;
+use super::materialize::{margin_present, Lowered};
 use crate::inference::evd::sym_eigen;
-use crate::linalg::SeqLlt;
+use crate::linalg::{mul, SeqLlt};
 
 /// One term's hypothesis matrix, in lmerTest's basis.
 pub(crate) struct TermHypothesis {
@@ -42,7 +41,8 @@ pub(crate) struct TermHypothesis {
 /// on the columns of the terms containing it; a term's rows are the `rdX`
 /// rows named like the retained columns, and rows with `Σ|·| ≤ 1e-8` are
 /// dropped. With at most one retained column or one term it is Type I, as in
-/// lmerTest; when the retained design is the intercept alone, each term gets
+/// lmerTest but with [`doolittle_l`]'s cutoff on the Gram scaled to the data;
+/// when the retained design is the intercept alone, each term gets
 /// a 0-row entry, where lmerTest returns one unnamed 0-row matrix. A design
 /// that is singular on `retained` (outside the contract) gives NaN entries.
 pub(crate) fn type3(lo: &Lowered, retained: &[usize]) -> Vec<TermHypothesis> {
@@ -94,7 +94,8 @@ fn type3_with(lo: &Lowered, retained: &[usize], round: fn(&mut Mat<f64>)) -> Vec
         }
     }
 
-    // `L[colnames(X), ]`: the rdX row of each retained column, by name.
+    // `L[colnames(X), ]`: the rdX row of each retained column, by name. Every
+    // design column has one: `rdx` and `col_names` come from one lowering.
     let rows: Vec<usize> = retained
         .iter()
         .map(|&c| {
@@ -126,7 +127,9 @@ fn type3_with(lo: &Lowered, retained: &[usize], round: fn(&mut Mat<f64>)) -> Vec
 /// no other term contains; for a contained term, its rows of
 /// `t(doolittle(crossprod(Xnew))$L)`, `Xnew` the design with the term's and
 /// its containers' columns moved last. Type I with at most one retained
-/// column or one term.
+/// column or one term. `doolittle`'s cutoff is applied on the equilibrated
+/// Gram ([`doolittle_l`]), so the rows depart from lmerTest's where lmerTest's
+/// cutoff depends on a predictor's units.
 pub(crate) fn type2_xtx(lo: &Lowered, retained: &[usize]) -> Vec<TermHypothesis> {
     let d = Design::new(lo, retained);
     if d.type1_fallback() {
@@ -466,10 +469,8 @@ impl<'a> Design<'a> {
             })
             .collect();
         // `term_contain` reads a term's variables off `attr(terms, "factors")`
-        // where the code is 1, and R's `TermCode` codes a variable 1 when the
-        // term without it is empty or lies inside an earlier term (2 otherwise,
-        // its margin absent). Per term: those variables, and the numeric ones
-        // among them, sorted.
+        // where R's `TermCode` ([`margin_present`]) is 1. Per term: those
+        // variables, and the numeric ones among them, sorted.
         let coded: Vec<(Vec<&str>, Vec<&str>)> = lo
             .terms
             .iter()
@@ -478,12 +479,8 @@ impl<'a> Design<'a> {
                 let mut vars = Vec::new();
                 let mut numerics = Vec::new();
                 for (v, &num) in term.vars.iter().zip(&term.numeric) {
-                    let rest: Vec<&String> = term.vars.iter().filter(|&u| u != v).collect();
-                    let margin = rest.is_empty()
-                        || lo.terms[..t]
-                            .iter()
-                            .any(|e| rest.iter().all(|&u| e.vars.contains(u)));
-                    if margin {
+                    let earlier = lo.terms[..t].iter().map(|e| e.vars.as_slice());
+                    if margin_present(&term.vars, v, earlier) {
                         vars.push(v.as_str());
                         if num {
                             numerics.push(v.as_str());
@@ -622,10 +619,30 @@ fn xtx_upper<const P: usize>(x: &[f64]) -> Vec<f64> {
 
 /// The unit lower factor `L` of lmerTest's `doolittle(x, eps = 1e-6)`: a
 /// pivot `|U[i, i]| < eps` zeroes its column below the diagonal, and every
-/// `|L| < eps` is set to zero. Same loop order as the R code.
+/// `|L| < eps` is set to zero. Same loop order as the R code, but run on the
+/// equilibrated Gram `D·x·D`, `d_i = 2^round(−½·log₂ x[i, i])` (1 where that
+/// diagonal is not positive and finite), and mapped back as
+/// `L[j, i] = L̃[j, i]·d_i/d_j`. The cutoffs are then relative to the columns'
+/// scales within a factor of 2: a predictor rescaled by a power of two gives
+/// the same `L` bit for bit, any other rescale can flip only a decision within
+/// a factor of 2 of the cutoff, and `L` departs from lmerTest where lmerTest's
+/// absolute cutoff depends on the units. Powers of two make the scaling and the map back exact, so
+/// wherever no cutoff decision changes, `L` is bit for bit the factor of the
+/// unscaled `x`.
 fn doolittle_l(x: &Mat<f64>) -> Mat<f64> {
     const EPS: f64 = 1e-6;
     let n = x.nrows();
+    let d: Vec<f64> = (0..n)
+        .map(|i| {
+            let g = x[(i, i)];
+            if g > 0.0 && g.is_finite() {
+                2f64.powi((-0.5 * g.log2()).round() as i32)
+            } else {
+                1.0
+            }
+        })
+        .collect();
+    let x = &Mat::from_fn(n, n, |i, j| d[i] * x[(i, j)] * d[j]);
     let mut l = Mat::<f64>::identity(n, n);
     let mut u = Mat::<f64>::zeros(n, n);
     for i in 0..n {
@@ -655,7 +672,7 @@ fn doolittle_l(x: &Mat<f64>) -> Mat<f64> {
             }
         }
     }
-    l
+    Mat::from_fn(n, n, |j, i| l[(j, i)] * d[i] / d[j])
 }
 
 /// R's `zapsmall(x)` at the default 7 digits: every entry rounded to

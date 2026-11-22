@@ -10,7 +10,7 @@ use super::hypotheses::{
     missing_cells_note, type2_lr_sets, type2_vcov, type2_xtx, type3, type3_null_basis,
     type3_unrounded, untouched_columns, ReducedDesignError, TermHypothesis,
 };
-use super::{lower, Lowered, Table};
+use super::{lower, Column, Lowered, Table};
 use crate::inference::test_refs::{self, Entry, Kind};
 use crate::spec::remap_slopes;
 use crate::test_support::csv_table;
@@ -45,6 +45,16 @@ pub(crate) fn table_of(e: &Entry) -> Table {
     let raw = std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("{path}: {err}"));
     let factors: Vec<&str> = e.factors.iter().map(String::as_str).collect();
     csv_table(&raw, &factors)
+}
+
+/// [`table_of`] with the numeric column `column` multiplied by `by`.
+pub(crate) fn scaled_table(e: &Entry, column: &str, by: f64) -> Table {
+    let mut table = table_of(e);
+    let Some((_, Column::Numeric(v))) = table.columns.iter_mut().find(|(n, _)| n == column) else {
+        panic!("{}: no numeric column {column}", e.name);
+    };
+    v.iter_mut().for_each(|z| *z *= by);
+    table
 }
 
 fn lowered(e: &Entry) -> Lowered {
@@ -224,6 +234,44 @@ fn type2_xtx_matches_lmertest_hypotheses() {
             &kept,
             lo.p,
         );
+    }
+}
+
+/// The rows do not depend on a predictor's units: on
+/// `lmertest_anova_sim_factorial_gx` (`y ~ g * x`, `x` contained in `g:x`),
+/// the rows with `x` multiplied by 2⁻²⁰, once its columns are mapped back,
+/// span the rows on the original data. An absolute 1e-6 cutoff on the
+/// unscaled Gram zeroes `x`'s pivot there.
+#[test]
+fn type2_xtx_does_not_depend_on_units() {
+    let by = 2f64.powi(-20);
+    let e = anova_entries()
+        .into_iter()
+        .find(|e| e.name == "lmertest_anova_sim_factorial_gx")
+        .expect("the g * x entry is registered");
+    let formula = e.r_formula.as_ref().expect("anova entry has a formula");
+    let lo = lowered(&e);
+    let small = lower(formula, &scaled_table(&e, "x", by), Family::Gaussian)
+        .unwrap_or_else(|err| panic!("{err}"));
+    // A column built from `x` shrinks by `by` in every row, the others not.
+    let ratio: Vec<f64> = (0..lo.p)
+        .map(|c| {
+            let i = (0..lo.n)
+                .find(|&i| lo.x[i * lo.p + c] != 0.0)
+                .expect("no all-zero column");
+            small.x[i * lo.p + c] / lo.x[i * lo.p + c]
+        })
+        .collect();
+    assert_eq!(
+        ratio,
+        [1.0, 1.0, 1.0, by, by, by],
+        "x's columns: x, gb:x, gc:x"
+    );
+    let all: Vec<usize> = (0..lo.p).collect();
+    for (want, got) in type2_xtx(&lo, &all).iter().zip(type2_xtx(&small, &all)) {
+        let back = Mat::from_fn(got.l.nrows(), lo.p, |i, c| got.l[(i, c)] / ratio[c]);
+        let d = max_abs_diff(&projector(&want.l), &projector(&back));
+        assert!(d <= PROJ_ABS, "{}: projector off by {d:e}", want.term);
     }
 }
 

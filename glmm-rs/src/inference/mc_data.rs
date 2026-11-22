@@ -426,8 +426,8 @@ pub(crate) mod bands {
     /// 0.10). From exact binomial tails a check calibrated exactly fails with
     /// probability 2.3e-5, 1.3e-5 and 8.3e-6 at the three α (two-sided,
     /// δ = 0; the normal value is 6.8e-6), so about 0.065 expected noise
-    /// failures over the 4416 gated checks of [`GATED`] (4446 when frozen,
-    /// before two Deviations) if all had δ = 0, and 0.014 with the declared δ
+    /// failures over the 4416 gated checks of [`GATED`] if all had δ = 0, and
+    /// 0.014 with the declared δ
     /// (the Satterthwaite rows keep δ = 0 and carry nearly all of it); at
     /// `k = 4` about 0.55, at `k = 3` about 11 (δ = 0). At δ = 0 the lower
     /// bound at α = 0.01 is 0.000, so a conservative error is caught only at
@@ -550,14 +550,13 @@ pub(crate) mod bands {
     /// quantity) was checked against its declared band (its δ, `k = 4.5`, the
     /// pilot's `R_kept`) and against [`MC_FAIL_MAX`] (failed fits only), and a
     /// candidate the pilot fails is reported. The band moved none; the cap
-    /// moved 21 mixture candidates, named under their families. Two Deviations
-    /// approved after the measurement (2026-10-13) moved the `f3` F row on the
-    /// random-slope Gaussian cells with `K ≤ 30` (Satterthwaite's F on a
-    /// 3-level between-cluster factor is anti-conservative there, as
-    /// lmerTest's is on the same data) and the boundary test on
-    /// `k20_m9_bern22_rdi` (21 of 2000 datasets separated) to reported; the
-    /// set holds 4416 checks (0.0143 expected noise failures with the declared
-    /// δ).
+    /// moved 21 mixture candidates, named under their families. Two parts are
+    /// reported, not gated: the `f3` F row on the random-slope Gaussian cells
+    /// with `K ≤ 30` (Satterthwaite's F on a 3-level between-cluster factor is
+    /// anti-conservative there, as lmerTest's is on the same data) and the
+    /// boundary test on `k20_m9_bern22_rdi` (21 of 2000 datasets separated).
+    /// The set holds 4416 checks (0.0143 expected noise failures with the
+    /// declared δ).
     pub(crate) const GATED: [Gate; 9] = [
         // Satterthwaite t and F rows and t intervals on the Gaussian cells
         // with K ≥ 20: two-sided, δ = 0. The t and F references with
@@ -609,8 +608,8 @@ pub(crate) mod bands {
         },
         // The Satterthwaite F of the null factor `f3` (2 df, between
         // clusters) on the satt_two cells, two-sided, δ = 0, less the
-        // random-slope cells with K ≤ 30, which are reported (a Deviation
-        // approved 2026-10-13, after the measurement): on `(1 + time | id)` at
+        // random-slope cells with K ≤ 30, which are reported
+        // (documentation/validation.md says why): on `(1 + time | id)` at
         // K ≤ 30 the row is anti-conservative (0.059 to 0.098 at α = 0.05,
         // R = 2000; five cells outside the band), and lmerTest's Satterthwaite
         // F gives the same rates on the same datasets, so the error is the
@@ -917,7 +916,7 @@ pub(crate) mod bands {
         // 13.2%, k10_m9_pois034_rdi 11.5%, k10_m17_bern54_rdi 1.5%,
         // k10_m17_bern22_rdi 3.6%, k10_m17_bern10_rdi 19.2%,
         // k10_m17_pois034_rdi 2.2%, k20_m17_bern10_rdi 1.8%. Reported after
-        // the measurement (a Deviation approved 2026-10-13):
+        // the measurement:
         // k20_m9_bern22_rdi, whose boundary-test fits failed on 21 of 2000
         // datasets (1.05%, above MC_FAIL_MAX), every one separated (no
         // maximum-likelihood estimate); its rate passes.

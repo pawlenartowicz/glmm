@@ -131,6 +131,14 @@ function timed_median(build_and_fit, n)
     median(samples[2:end])
 end
 
+# Every binomial link is named: a catch-all would fit an unlisted link (cloglog)
+# as one of these inside an oracle run that is then frozen.
+function binomial_link(cell)
+    cell.link == "logit" && return LogitLink()
+    cell.link == "probit" && return ProbitLink()
+    error("unsupported binomial link for MixedModels: $(cell.link)")
+end
+
 # Construct (never fit) the mixed model for one cell. weights/offset are
 # passed uniformly to every branch rather than special-cased per family: the
 # manifest never pairs an offset with a gaussian cell, and if it ever did,
@@ -148,8 +156,7 @@ function build_mixed(cell, df, gaussian)
     if gaussian
         LinearMixedModel(f, df; kw...)
     elseif fam == "binomial"
-        link = cell.link == "logit" ? LogitLink() : ProbitLink()
-        GeneralizedLinearMixedModel(f, df, Binomial(), link; kw...)
+        GeneralizedLinearMixedModel(f, df, Binomial(), binomial_link(cell); kw...)
     elseif fam == "poisson"
         GeneralizedLinearMixedModel(f, df, Poisson(); kw...)
     else
@@ -192,7 +199,7 @@ end
 # MixedModels for on a fixed-only cell (never gamma, NB or inverse-Gaussian).
 function glm_dist_link(cell)
     fam = String(cell.family)
-    fam == "binomial" && return Binomial(), (cell.link == "logit" ? LogitLink() : ProbitLink())
+    fam == "binomial" && return Binomial(), binomial_link(cell)
     fam == "poisson" && return Poisson(), LogLink()
     error("unsupported GLM family for MixedModels' GLM.jl branch: $fam")
 end

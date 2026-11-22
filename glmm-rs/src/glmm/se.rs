@@ -4,8 +4,10 @@ use super::derivative::DerivStatus;
 use super::deviance::laplace_deviance_at;
 use super::pirls::{schur_from_residuals, structured_ainv_solve};
 use super::workspace::{fill_z_f64, glmm_block_solve, GlmmLayout, GlmmWorkspace};
-use super::{FdHessianStatus, FD_STEP_BASE};
+use super::{nan_fill_vcov, FdHessianStatus, FD_STEP_BASE};
 use crate::fit::{CondvarBlocks, CondvarCross};
+use crate::standardize::ColumnScaling;
+use crate::WaldSe;
 
 /// Evaluate the joint Laplace deviance at `fd_saved + Σ deltaₖ·e_{coordₖ}`,
 /// reusing `ws.fd.fd_saved` (distinct field from `ws.params`, so the disjoint
@@ -220,51 +222,24 @@ pub(crate) fn fd_mixed_diff(
 /// step calibration in the large-θ̂ regime, measured separately.
 pub(crate) const SPARSE_FD_STEP_REL: f64 = 1e-4;
 
-/// Dense-path adapter: builds the `fd_eval` closure over `ws`/design and applies
-/// the shared `fd_second_diff` stencil. Keeps the per-thread worker workspace and
-/// β-fixed deviance wiring local to this side.
-#[allow(clippy::too_many_arguments)]
-fn second_diff(
-    ws: &mut GlmmWorkspace,
-    k: usize,
-    s: f64,
-    f0: f64,
-    x: MatRef<f64>,
-    y: &[f64],
-    cluster_ids: &[u32],
-    extra_ids: &[Vec<u32>],
-    n: usize,
-) -> f64 {
-    let mut eval = |coords: &[usize], deltas: &[f64]| {
-        fd_eval(ws, coords, deltas, x, y, cluster_ids, extra_ids, n)
-    };
-    fd_second_diff(&mut eval, k, s, f0)
-}
-
-/// Dense-path adapter for the 4-point mixed partial; see `second_diff`.
-#[allow(clippy::too_many_arguments)]
-fn mixed_diff(
-    ws: &mut GlmmWorkspace,
-    i: usize,
-    j: usize,
-    si: f64,
-    sj: f64,
-    x: MatRef<f64>,
-    y: &[f64],
-    cluster_ids: &[u32],
-    extra_ids: &[Vec<u32>],
-    n: usize,
-) -> f64 {
-    let mut eval = |coords: &[usize], deltas: &[f64]| {
-        fd_eval(ws, coords, deltas, x, y, cluster_ids, extra_ids, n)
-    };
-    fd_mixed_diff(&mut eval, i, j, si, sj)
+/// The FD step of coordinate `k` of `γ̂` (`gamma_k = γ̂_k`), one rule per
+/// layout: on the packed-row layout `SPARSE_FD_STEP_REL·max(1, |γ̂_k|)` on
+/// every coordinate, otherwise `FD_STEP_BASE` absolute on the θ block
+/// (`k < n_theta`) and `FD_STEP_BASE·max(1, |γ̂_k|)` relative on the β block.
+/// The two constants' docs say why the rules differ.
+pub(crate) fn fd_step(layout: GlmmLayout, k: usize, n_theta: usize, gamma_k: f64) -> f64 {
+    if layout == GlmmLayout::Packed {
+        SPARSE_FD_STEP_REL * gamma_k.abs().max(1.0)
+    } else if k < n_theta {
+        FD_STEP_BASE
+    } else {
+        FD_STEP_BASE * gamma_k.abs().max(1.0)
+    }
 }
 
 /// One Hessian entry `(i, j)` of an FD grid: diagonal → `fd_second_diff`,
-/// off-diagonal → `fd_mixed_diff`, through the `fd_eval` adapters. Shared by
-/// both arms of `packed_fd_hessian_cov` and the rayon arm of
-/// `joint_hessian_cov`.
+/// off-diagonal → `fd_mixed_diff`, over `fd_eval`. Shared by both arms of
+/// [`fd_hessian_grid`].
 #[allow(clippy::too_many_arguments)]
 fn fd_hess_entry(
     ws: &mut GlmmWorkspace,
@@ -279,14 +254,17 @@ fn fd_hess_entry(
     extra_ids: &[Vec<u32>],
     n: usize,
 ) -> f64 {
+    let mut eval = |coords: &[usize], deltas: &[f64]| {
+        fd_eval(ws, coords, deltas, x, y, cluster_ids, extra_ids, n)
+    };
     if i == j {
-        second_diff(ws, i, si, f0, x, y, cluster_ids, extra_ids, n)
+        fd_second_diff(&mut eval, i, si, f0)
     } else {
-        mixed_diff(ws, i, j, si, sj, x, y, cluster_ids, extra_ids, n)
+        fd_mixed_diff(&mut eval, i, j, si, sj)
     }
 }
 
-/// The parallel arm of both FD-Hessian grids: the `m(m+1)/2` upper-triangle
+/// The parallel arm of [`fd_hessian_grid`]: the `m(m+1)/2` upper-triangle
 /// cells in one contiguous chunk per rayon thread, each chunk evaluated on ONE
 /// worker workspace built for it (`fd_worker_ws`). Rayon's `map_init` builds a
 /// worker per split job instead, several per thread: on a packed `k = 2,000`
@@ -298,7 +276,9 @@ fn fd_hess_entry(
 /// `t` threads still hold `t` of them at once (measured 2026-10-07, packed
 /// `k = 5,000`: 472 MB serial, 3.07 GB on 6 threads). Every cell is a pure
 /// function of the frozen FD seed (`joint_hessian_cov`'s doc), so how the cells
-/// are split over workers changes no value.
+/// are split over workers changes no value. A worker that cannot be built (an
+/// allocation failure) gives its cells NaN, which the callers' non-finite
+/// check sends where a non-finite step goes.
 #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
 #[allow(clippy::too_many_arguments)]
 fn fd_grid_par(
@@ -326,11 +306,14 @@ fn fd_grid_par(
     cells
         .par_chunks(chunk)
         .flat_map_iter(|part| {
-            let mut wws = fd_worker_ws(ws_ro, n);
+            let mut wws = fd_worker_ws(ws_ro, n).ok();
             part.iter()
                 .map(|&(i, j)| {
+                    let Some(wws) = wws.as_mut() else {
+                        return (i, j, f64::NAN);
+                    };
                     let h = fd_hess_entry(
-                        &mut wws,
+                        wws,
                         i,
                         j,
                         ws_ro.fd.fd_steps[i],
@@ -361,7 +344,7 @@ fn fd_grid_par(
 /// declines gets instead — a refused fit keeps a finite-difference Hessian
 /// standard error rather than dropping to Rx.
 ///
-/// Every eval here cold-seeds û = 0 inside the packed arm of `laplace_deviance`,
+/// Every eval here cold-seeds û = 0 (`deviance::laplace_deviance_at`),
 /// so each grid cell is a pure function of `(γ̂, steps, design)` and the
 /// per-thread workspaces reproduce the serial values bit-for-bit.
 ///
@@ -377,12 +360,35 @@ fn packed_fd_hessian_cov(
     y: &[f64],
     cluster_ids: &[u32],
     extra_ids: &[Vec<u32>],
+    structural: &[usize],
     m: usize,
     n: usize,
 ) -> bool {
     for k in 0..m {
-        ws.fd.fd_steps[k] = SPARSE_FD_STEP_REL * ws.fd.fd_saved[k].abs().max(1.0);
+        ws.fd.fd_steps[k] = fd_step(ws.layout, k, ws.n_theta, ws.fd.fd_saved[k]);
     }
+    fd_hessian_grid(ws, x, y, cluster_ids, extra_ids, structural, m, n)
+}
+
+/// The FD Hessian over the steps in `ws.fd.fd_steps`, into
+/// `ws.inference.hess_scratch` (symmetric, `m×m`): the central value `f0`,
+/// then every upper-triangle cell `(i, j ≥ i)` off the `structural` θ entries
+/// (sorted), row by row, mirrored. Rayon's arm (`fd_grid_par`) when
+/// `ws.parallel_inner`, the serial loop otherwise; every cell is a pure
+/// function of the frozen FD seed, so both give the same values. False on a
+/// non-finite value, which sends the caller to its Rx fallback. Shared by the
+/// packed-row stencil and `joint_hessian_cov_at`'s blocked/structured one.
+#[allow(clippy::too_many_arguments)]
+fn fd_hessian_grid(
+    ws: &mut GlmmWorkspace,
+    x: MatRef<f64>,
+    y: &[f64],
+    cluster_ids: &[u32],
+    extra_ids: &[Vec<u32>],
+    structural: &[usize],
+    m: usize,
+    n: usize,
+) -> bool {
     let f0 = fd_eval(ws, &[], &[], x, y, cluster_ids, extra_ids, n);
     if !f0.is_finite() {
         return false;
@@ -404,7 +410,6 @@ fn packed_fd_hessian_cov(
             }
         }
     } else {
-        let structural = ws.groupings.structural_theta().to_vec();
         let free = |k: &usize| structural.binary_search(k).is_err();
         for i in (0..m).filter(free) {
             let hi = ws.fd.fd_steps[i];
@@ -589,18 +594,20 @@ pub(crate) fn rx_cov_into(
 /// `vcov(use.hessian = TRUE)` (factor of 2: deviance = −2logL, so observed
 /// info = H_dev/2 and cov = info⁻¹ = 2·H_dev⁻¹).
 ///
-/// Three rungs, and the body's own routing comment says what sends a cell
-/// down each. On every shape `assembled::assembly_routes` takes — the blocked
-/// path (no extra groupings), the structured extras path and the packed-row
-/// layout, at every `m`, an AGQ-routed shape excepted — the joint Hessian is
-/// EXACT, from the assembled pass's first-order lanes: no step, no stencil,
-/// no per-cell PIRLS re-solve. Where that pass declines, a shape with a dual
-/// kernel (`derivative::supports_shape`) takes the exact hyper-dual pass
-/// instead, up to that pass's own lane cap `MAX_DUAL_N`; the AGQ envelope is
-/// always that pass's, differentiating the AGQ deviance where the fit used
-/// AGQ. The FD stencil is what is left below both: `packed_fd_hessian_cov`
-/// at its own step on the packed-row layout, the `FD_STEP_BASE` grid in this
-/// function on the other two. Everything below about `FD_STEP_BASE`, step-invariance, the corpus
+/// Four rungs (1, 2a, 2, 3), and the body's own routing comment says what
+/// sends a cell down each. Rung 1: on every shape `assembled::assembly_routes`
+/// takes — the blocked path (no extra groupings), the structured extras path
+/// and the packed-row layout, at every `m`, an AGQ-routed shape excepted — the
+/// joint Hessian is EXACT, from the assembled pass's first-order lanes: no
+/// step, no stencil, no per-cell PIRLS re-solve. Rung 2a: on the AGQ shapes
+/// `agq_gradient::covers` accepts, central differences of the exact f64 AGQ
+/// gradient (`agq_gradient_difference_hessian`), with no lane cap. Rung 2: a
+/// shape with a dual kernel (`derivative::supports_shape`) takes the exact
+/// hyper-dual pass, up to that pass's own lane cap `MAX_DUAL_N`; it takes the
+/// rest of the AGQ envelope and what rung 2a declined, differentiating the AGQ
+/// deviance where the fit used AGQ. Rung 3, the FD stencil, is what is left
+/// below them: `packed_fd_hessian_cov` at its own step on the packed-row
+/// layout, the `FD_STEP_BASE` grid in this function on the other two. Everything below about `FD_STEP_BASE`, step-invariance, the corpus
 /// margin measurement and the comparison against lme4's own `deriv12`
 /// describes that grid.
 ///
@@ -608,10 +615,9 @@ pub(crate) fn rx_cov_into(
 /// 12-cluster `y ~ x1 + (1|grp)` glmer fit): single-step central second
 /// differences at `h_θ = FD_STEP_BASE` (ABSOLUTE on the θ block) and
 /// `h_β = FD_STEP_BASE·max(1, |β̂_k|)` — see the step-construction comment in the
-/// body for why θ does not take the relative form. No Richardson extrapolation
-/// (dropped 2026-07-04 — the deviance is step-invariant to ~7 sig figs across
-/// h ∈ [1e-4, 1e-1] on this fixture, so a second-order correction bought no
-/// measurable accuracy). Every eval here runs PIRLS at `pirls_tol_fd(family)` —
+/// body for why θ does not take the relative form. No Richardson extrapolation:
+/// the deviance is step-invariant to ~7 sig figs across h ∈ [1e-4, 1e-1] on
+/// this fixture, so a second-order correction buys no measurable accuracy. Every eval here runs PIRLS at `pirls_tol_fd(family)` —
 /// the tighter of the `PIRLS_TOL_REL_FD` ceiling and the family's own fit
 /// tolerance — via `ws.fd.pirls_tol_override`, set on entry and reset on every
 /// exit, so the stencil never differences a deviance looser than the one the
@@ -621,7 +627,7 @@ pub(crate) fn rx_cov_into(
 /// step-invariant to ~5–6 sig figs across h ∈ [1e-4, 1e-2] and sits on the
 /// tight-tol (1e-12) limit, so the accuracy is by construction, not by luck.
 /// The fit path never sees the override.
-/// One accepted divergence: on the RX fallback below, the central re-eval that
+/// One known difference: on the RX fallback below, the central re-eval that
 /// repopulates the Schur factors also runs at the FD-pass tol, so fallback RX
 /// numbers differ from the plain `WaldSe::Rx` arm's at tolerance level
 /// (never LESS converged — harmless).
@@ -633,7 +639,7 @@ pub(crate) fn rx_cov_into(
 /// `sim_poisson_bigsd` θ̂ = 2.97, 1.4e-5).
 ///
 /// Both engines' numbers carry FD error of their own, and ours is the larger.
-/// Re-measured 2026-08-24 over the whole GLMM corpus by
+/// Measured 2026-08-24 over the whole GLMM corpus by
 /// `fd_hessian_margin_corpus_measurement` (`src/sparse/fd_margin.rs`), which
 /// rebuilds the joint Hessian at δ, δ/2 and δ/4 and extrapolates the β SEs to
 /// h = 0 on the central difference's own O(δ²), S = (4·SE(δ/2) − SE(δ))/3.
@@ -996,9 +1002,9 @@ fn joint_hessian_cov_at(
     // pinned-γ̂ re-eval in `fit_glmm_ws` just left in `ws.pirls.u`. Every eval below — f0
     // included — warm-starts from this one fixed seed (`ws.u_seed`, set once here,
     // read by every `laplace_deviance_at` call via `warm_seed_active`), never from
-    // the previous eval's own mode. The packed-row layout is the exception: its arm
-    // of `laplace_deviance` replaces the seed with û = 0 on every stencil eval, for
-    // the reason measured there. That makes each f(γ) a function of γ alone: the
+    // the previous eval's own mode. The packed-row layout is the exception:
+    // `laplace_deviance_at` seeds its stencil evals from û = 0 instead, for the
+    // reason measured there. That makes each f(γ) a function of γ alone: the
     // second differences that build the Hessian only stay valid if every f± sees
     // the same seed, because a *chained* seed (eval k warm-started from eval k−1's
     // mode) would make f(γ) depend on evaluation order and corrupt them. f0 shares
@@ -1151,7 +1157,7 @@ fn joint_hessian_cov_at(
         // contract as the arm below, its own relative step on every
         // coordinate (`SPARSE_FD_STEP_REL`).
         ws.fd.pirls_tol_override = Some(super::pirls_tol_fd(ws.family));
-        if !packed_fd_hessian_cov(ws, xd, y, cluster_ids, extra_ids, m, n) {
+        if !packed_fd_hessian_cov(ws, xd, y, cluster_ids, extra_ids, &structural, m, n) {
             fallback!();
         }
     } else if !used_exact {
@@ -1181,61 +1187,15 @@ fn joint_hessian_cov_at(
         // converged value; at h_θ = 1e-2 it is 2.2e-5, against a noise floor near
         // h = 2.5e-3.
         for k in 0..m {
-            ws.fd.fd_steps[k] = if k < n_theta {
-                FD_STEP_BASE
-            } else {
-                FD_STEP_BASE * ws.fd.fd_saved[k].abs().max(1.0)
-            };
+            ws.fd.fd_steps[k] = fd_step(ws.layout, k, n_theta, ws.fd.fd_saved[k]);
         }
-
-        let f0 = fd_eval(ws, &[], &[], xd, y, cluster_ids, extra_ids, n);
-        if !f0.is_finite() {
-            fallback!();
-        }
-
-        // Build the symmetric m×m Hessian into ws.inference.hess_scratch (upper, then mirror).
         // Each grid cell is a pure function of the frozen FD seed (fd_saved, fd_steps,
         // u_seed) — see `joint_hessian_cov`'s doc comment — so per-thread worker
         // workspaces compute bit-identical values in any order. Diagonal cells use a
         // single-step central second difference (no Richardson — the fixture is
         // step-invariant to ~7 sig figs across h ∈ [1e-4, 1e-1], see the doc comment).
-        let use_par =
-            cfg!(all(feature = "parallel", not(target_arch = "wasm32"))) && ws.parallel_inner;
-        if use_par {
-            #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
-            {
-                let results = fd_grid_par(ws, m, f0, xd, y, cluster_ids, extra_ids, n);
-                // The serial arm fallback!()s on the FIRST non-finite eval; here the
-                // whole grid ran first, then we check — same destination (RX fallback),
-                // extra work only on the already-failing path. `results` is collected
-                // before this point, ending `fd_grid_par`'s immutable borrow of `ws` so
-                // the fallback (which needs `&mut ws`) is legal.
-                if results.iter().any(|&(_, _, h)| !h.is_finite()) {
-                    fallback!();
-                }
-                for (i, j, h) in results {
-                    ws.inference.hess_scratch[(i, j)] = h;
-                    ws.inference.hess_scratch[(j, i)] = h;
-                }
-            }
-        } else {
-            for i in (0..m).filter(free) {
-                let hi = ws.fd.fd_steps[i];
-                let hii = second_diff(ws, i, hi, f0, xd, y, cluster_ids, extra_ids, n);
-                if !hii.is_finite() {
-                    fallback!();
-                }
-                ws.inference.hess_scratch[(i, i)] = hii;
-                for j in ((i + 1)..m).filter(free) {
-                    let hj = ws.fd.fd_steps[j];
-                    let hij = mixed_diff(ws, i, j, hi, hj, xd, y, cluster_ids, extra_ids, n);
-                    if !hij.is_finite() {
-                        fallback!();
-                    }
-                    ws.inference.hess_scratch[(i, j)] = hij;
-                    ws.inference.hess_scratch[(j, i)] = hij;
-                }
-            }
+        if !fd_hessian_grid(ws, xd, y, cluster_ids, extra_ids, &structural, m, n) {
+            fallback!();
         }
     }
 
@@ -1458,20 +1418,22 @@ fn joint_hessian_cov_at(
         }
     }
 
-    // Restore the converged PIRLS state at γ̂ (W̃/û/μ̂/factors): the stencil leaves
-    // the LAST perturbed eval's state in ws, and the caller reads ws.pirls.prob/
-    // ws.pirls.u AFTER this returns, on every layout (mu_hat and the reported
-    // fit) — off the perturbed state rung 23's stddev once came out ~2e-3 high. Same central re-eval the RX fallback uses; the empty
-    // perturbation evaluates exactly at γ̂ (fd_saved).
+    // The stencil leaves the LAST perturbed eval's state in ws (W̃, η, factors).
+    // Re-solve at γ̂ (the empty perturbation evaluates exactly at fd_saved) so the
+    // workspace is left at γ̂: a later call on the same workspace reads that
+    // state on entry, through `xtwx_fill`'s `ws.pirls.w` (which decides the
+    // `BetaScale` route) and through the assembled rung, which differentiates
+    // the iterate in place. The RX fallback re-solves for the same reason and
+    // because its Schur inverse reads the factors.
     let _ = fd_eval(ws, &[], &[], xd, y, cluster_ids, extra_ids, n);
 
     ws.params[..m].copy_from_slice(&ws.fd.fd_saved[..m]);
     // That re-eval lands on û(γ̂) again but at the FD-pass tol, which is never
     // looser than the fit's, so it is at least as converged as the mode this call
     // was handed. Take the handed one back verbatim, so a second call on the same
-    // workspace seeds from the same vector and returns the same bits. `ws.pirls.prob`
-    // is put back beside `ws.pirls.u` (`fd_saved_prob`, snapshotted above) so the pair
-    // the caller reads comes from one solve, not this re-eval's separate one.
+    // workspace seeds from the same vector. `ws.pirls.prob` is put back beside
+    // `ws.pirls.u` (`fd_saved_prob`, snapshotted above) so the pair the caller
+    // reads comes from one solve, not this re-eval's separate one.
     restore_fd_mode!();
     ws.fd.warm_seed_active = false; // never leak the FD seed into a later fit / BOBYQA
     ws.fd.pirls_tol_override = None; // nor the FD-pass tol
@@ -1557,6 +1519,66 @@ fn xtwx_fill(ws: &mut GlmmWorkspace, x: MatRef<f64>, n: usize) {
     );
 }
 
+/// Most nonzeros a row of `M = ZΛ` has on any layout: the packed row width
+/// `q_p + Σ q_g` is the variance components plus at most one hidden intercept
+/// column per grouping, and every grouping has a component, so it is at most
+/// twice the component cap.
+const ROW_NNZ_MAX: usize = 2 * crate::consts::MAX_VARIANCE_COMPONENTS;
+
+/// The Rx Schur fill every layout runs: `X'W̃M` (p×k) by scattering `xᵢ·wᵢ·mᵢ`
+/// over each row's nonzeros, `A⁻¹M'W̃X` into `ws.border.ainv_mtwx` by the
+/// layout's `ainv`, the residual rows `rᵢ = xᵢ − (A⁻¹M'W̃X)ᵀmᵢ` into `ws.wx`,
+/// and `ws.border.schur` from them ([`schur_from_residuals`]). `xd` is the
+/// design the Schur is built on. `row_nnz(ws, i, buf)` writes row `i`'s
+/// `(column, value)` pairs of `M` into `buf` and returns their count; both
+/// passes read them in that order, which fixes the order each entry's sum
+/// runs in. Returns false where `ainv` does (a non-PD `A`).
+fn schur_fill_rows(
+    ws: &mut GlmmWorkspace,
+    xd: MatRef<f64>,
+    n: usize,
+    row_nnz: impl Fn(&GlmmWorkspace, usize, &mut [(usize, f64)]) -> usize,
+    ainv: impl FnOnce(&mut GlmmWorkspace) -> bool,
+) -> bool {
+    let (k, p) = (ws.k, ws.p);
+    let mut buf = [(0usize, 0.0f64); ROW_NNZ_MAX];
+    for r in 0..p {
+        for c in 0..k {
+            ws.border.xtwm[(r, c)] = 0.0;
+        }
+    }
+    for i in 0..n {
+        let nz = row_nnz(ws, i, &mut buf);
+        let wi = ws.pirls.w[i];
+        for r in 0..p {
+            let xw = xd[(i, r)] * wi;
+            for &(c, v) in &buf[..nz] {
+                ws.border.xtwm[(r, c)] += xw * v;
+            }
+        }
+    }
+    if !ainv(ws) {
+        return false;
+    }
+    for i in 0..n {
+        let nz = row_nnz(ws, i, &mut buf);
+        for c in 0..p {
+            let mut r = xd[(i, c)];
+            for &(col, v) in &buf[..nz] {
+                r -= v * ws.border.ainv_mtwx[(col, c)];
+            }
+            ws.wx[(i, c)] = r;
+        }
+    }
+    schur_from_residuals(
+        |i| ws.pirls.w[i],
+        ws.wx.as_ref().subrows(0, n),
+        ws.border.ainv_mtwx.as_ref().subrows(0, k),
+        &mut ws.border.schur,
+    );
+    true
+}
+
 /// Packed-row Schur fill: `X'W̃M`, `A⁻¹M'W̃X` through `A`'s factor, and
 /// `ws.border.schur = X'W̃X − X'W̃M·A⁻¹M'W̃X` (formed by
 /// [`schur_from_residuals`]) — the Rx (closed-form Schur) fixed-effect
@@ -1578,65 +1600,44 @@ fn xtwx_fill(ws: &mut GlmmWorkspace, x: MatRef<f64>, n: usize) {
 /// δβ = S_β⁻¹·(X'ρ − B'δu₀) and folds `u_joint = u_new − T·δβ` back into the
 /// conditional-mode iterate — the joint (u, β) Newton step within one PIRLS solve.
 fn packed_schur_fill(ws: &mut GlmmWorkspace, x: MatRef<f64>, n: usize) -> bool {
-    let (k, p, width) = (ws.k, ws.p, ws.packed.width);
-    // X'W̃M (p×k) by per-row scatter over the packed nonzeros.
-    for r in 0..p {
-        for c in 0..k {
-            ws.border.xtwm[(r, c)] = 0.0;
-        }
-    }
-    for i in 0..n {
-        let wi = ws.pirls.w[i];
+    let width = ws.packed.width;
+    let row_nnz = |ws: &GlmmWorkspace, i: usize, buf: &mut [(usize, f64)]| {
         let base = i * width;
-        for r in 0..p {
-            let xw = x[(i, r)] * wi;
-            for t in base..base + width {
-                ws.border.xtwm[(r, ws.packed.m_cols[t] as usize)] += xw * ws.packed.m_vals[t];
+        for (t, e) in (base..base + width).zip(&mut buf[..width]) {
+            *e = (ws.packed.m_cols[t] as usize, ws.packed.m_vals[t]);
+        }
+        width
+    };
+    let ainv = |ws: &mut GlmmWorkspace| {
+        let (k, p) = (ws.k, ws.p);
+        for r in 0..k {
+            for c in 0..p {
+                ws.border.ainv_mtwx[(r, c)] = ws.border.xtwm[(c, r)];
             }
         }
-    }
-    for r in 0..k {
-        for c in 0..p {
-            ws.border.ainv_mtwx[(r, c)] = ws.border.xtwm[(c, r)];
-        }
-    }
-    if let Some(sp) = ws.packed.sparse.as_deref_mut() {
-        if !sp.factor_ok {
-            return false;
-        }
-        // `solve_mem` is sized for `p.max(1)` right-hand sides, this k×p solve
-        // being the widest the packed layout takes (same as the PIRLS β border).
-        faer::sparse::linalg::cholesky::LltRef::new(&sp.symbolic, &sp.l_values)
-            .solve_in_place_with_conj(
-                faer::Conj::No,
-                ws.border.ainv_mtwx.as_mut(),
-                faer::Par::Seq,
-                faer::dyn_stack::MemStack::new(&mut sp.solve_mem),
-            );
-    } else {
-        let ac = match crate::linalg::SeqLlt::new(ws.packed.a.as_ref()) {
-            Some(c) => c,
-            None => return false,
-        };
-        ac.solve_in_place(ws.border.ainv_mtwx.as_mut());
-    }
-    for i in 0..n {
-        let base = i * width;
-        for c in 0..p {
-            let mut r = x[(i, c)];
-            for t in base..base + width {
-                r -= ws.packed.m_vals[t] * ws.border.ainv_mtwx[(ws.packed.m_cols[t] as usize, c)];
+        if let Some(sp) = ws.packed.sparse.as_deref_mut() {
+            if !sp.factor_ok {
+                return false;
             }
-            ws.wx[(i, c)] = r;
+            // `solve_mem` is sized for `p.max(1)` right-hand sides, this k×p solve
+            // being the widest the packed layout takes (same as the PIRLS β border).
+            faer::sparse::linalg::cholesky::LltRef::new(&sp.symbolic, &sp.l_values)
+                .solve_in_place_with_conj(
+                    faer::Conj::No,
+                    ws.border.ainv_mtwx.as_mut(),
+                    faer::Par::Seq,
+                    faer::dyn_stack::MemStack::new(&mut sp.solve_mem),
+                );
+        } else {
+            let ac = match crate::linalg::SeqLlt::new(ws.packed.a.as_ref()) {
+                Some(c) => c,
+                None => return false,
+            };
+            ac.solve_in_place(ws.border.ainv_mtwx.as_mut());
         }
-    }
-    schur_from_residuals(
-        |i| ws.pirls.w[i],
-        ws.wx.as_ref().subrows(0, n),
-        ws.border.ainv_mtwx.as_ref().subrows(0, k),
-        &mut ws.border.schur,
-    );
-    true
+        true
+    };
+    schur_fill_rows(ws, x, n, row_nnz, ainv)
 }
 
 /// Blocked Schur fill (no-extras path): reconstruct mᵢ = Λ_p'·zᵢ per row to build
@@ -1645,8 +1646,9 @@ fn packed_schur_fill(ws: &mut GlmmWorkspace, x: MatRef<f64>, n: usize) -> bool {
 /// `ws.pirls.a_blocks` the converged blocked PIRLS left behind (W̃ in `ws.pirls.w`, Λ̂ in
 /// `ws.pirls.lam`), and `ws.border.schur = X'W̃X − Σ_f (X'W̃M)_f·T_f` (formed by
 /// [`schur_from_residuals`]). Only the trailing `p×p` Schur LLT (done by the
-/// common code after this) stays dense. Returns false if a stored block is not
-/// usable (defensive — the PIRLS already proved them PD).
+/// common code after this) stays dense. Writes the mᵢ rows into
+/// `ws.pirls.m_buf`. Never returns false (the PIRLS already proved the blocks
+/// PD); kept `-> bool` to match the dispatch arms.
 fn blocked_schur_fill(
     ws: &mut GlmmWorkspace,
     x: MatRef<f64>,
@@ -1656,64 +1658,45 @@ fn blocked_schur_fill(
     n: usize,
 ) -> bool {
     let (p, q, s) = (ws.p, ws.groupings.primary_q, ws.groupings.n_primary);
-    let k = q * s;
-    // X'W̃M, blocked: zero then scatter the q_p coupling columns per row.
-    for r in 0..p {
-        for c in 0..k {
-            ws.border.xtwm[(r, c)] = 0.0;
-        }
-    }
+    // mᵢ once per row, from `x`/`z` (not `xd`), into `m_buf`: both passes of
+    // the shared fill read it. The values are the ones the blocked PIRLS left
+    // there at this Λ (`zlam_row`, the same reduction), and every other
+    // reader of `m_buf` runs a PIRLS solve first.
     for i in 0..n {
-        let f = cluster_ids[i] as usize;
         let m_row = blocked_m_row(ws, x, z, i);
-        let wi = ws.pirls.w[i];
-        for r in 0..p {
-            let xw = xd[(i, r)] * wi;
-            #[allow(clippy::needless_range_loop)]
-            for c in 0..q {
-                ws.border.xtwm[(r, f * q + c)] += xw * m_row[c];
-            }
-        }
+        ws.pirls.m_buf[i * q..(i + 1) * q].copy_from_slice(&m_row[..q]);
     }
+    // Row i couples to its cluster's q columns only.
+    let row_nnz = |ws: &GlmmWorkspace, i: usize, buf: &mut [(usize, f64)]| {
+        let f = cluster_ids[i] as usize;
+        let m_row = &ws.pirls.m_buf[i * q..(i + 1) * q];
+        for (c, (e, &v)) in buf[..q].iter_mut().zip(m_row).enumerate() {
+            *e = (f * q + c, v);
+        }
+        q
+    };
     // T_f = A_f⁻¹ (M'W̃X)_f, per block, reusing the stored factor; ainv_mtwx rows
     // f·q_p.. hold T_f. (M'W̃X)_f[c, col] = (X'W̃M)_f[col, c] = ws.border.xtwm[(col, f·q+c)].
-    for f in 0..s {
-        let ablk = f * q * q;
-        for col in 0..p {
-            let mut rhs = [0.0_f64; crate::lmm::MAX_PRIMARY_Q];
-            #[allow(clippy::needless_range_loop)]
-            for c in 0..q {
-                rhs[c] = ws.border.xtwm[(col, f * q + c)];
-            }
-            glmm_block_solve(&ws.pirls.a_blocks[ablk..ablk + q * q], q, &mut rhs[..q]);
-            #[allow(clippy::needless_range_loop)]
-            for c in 0..q {
-                ws.border.ainv_mtwx[(f * q + c, col)] = rhs[c];
+    // Exact: A is block-diagonal, so the per-block solves equal the full A⁻¹M'W̃X.
+    let ainv = |ws: &mut GlmmWorkspace| {
+        for f in 0..s {
+            let ablk = f * q * q;
+            for col in 0..p {
+                let mut rhs = [0.0_f64; crate::lmm::MAX_PRIMARY_Q];
+                #[allow(clippy::needless_range_loop)]
+                for c in 0..q {
+                    rhs[c] = ws.border.xtwm[(col, f * q + c)];
+                }
+                glmm_block_solve(&ws.pirls.a_blocks[ablk..ablk + q * q], q, &mut rhs[..q]);
+                #[allow(clippy::needless_range_loop)]
+                for c in 0..q {
+                    ws.border.ainv_mtwx[(f * q + c, col)] = rhs[c];
+                }
             }
         }
-    }
-    // Residual rows rᵢ = xᵢ − T_fᵀmᵢ. Exact: A is block-diagonal, so the per-block
-    // solves above equal the full A⁻¹M'W̃X, and row i couples to its cluster's
-    // q columns only.
-    for i in 0..n {
-        let f = cluster_ids[i] as usize;
-        let m_row = blocked_m_row(ws, x, z, i);
-        for col in 0..p {
-            let mut r = xd[(i, col)];
-            #[allow(clippy::needless_range_loop)]
-            for c in 0..q {
-                r -= m_row[c] * ws.border.ainv_mtwx[(f * q + c, col)];
-            }
-            ws.wx[(i, col)] = r;
-        }
-    }
-    schur_from_residuals(
-        |i| ws.pirls.w[i],
-        ws.wx.as_ref().subrows(0, n),
-        ws.border.ainv_mtwx.as_ref().subrows(0, k),
-        &mut ws.border.schur,
-    );
-    true
+        true
+    };
+    schur_fill_rows(ws, xd, n, row_nnz, ainv)
 }
 
 /// Row `i` of `M = ZΛ` on the blocked layout: its cluster's `q_p` entries.
@@ -1767,19 +1750,16 @@ fn structured_schur_fill(
     let e = g.k_crossed();
     let prim_width = q * s;
     let k_family = qc * s;
-    let k = ws.k;
-    let g_cap = crate::lmm::MAX_EXTRA_GROUPINGS;
-    let core_col = |f: usize, local: usize| -> usize {
+    let core_col = move |f: usize, local: usize| -> usize {
         if local < q {
             f * q + local
         } else {
             prim_width + f * np + (local - q)
         }
     };
-    // X'W̃M: zero then scatter each row's core + crossed columns. Reads the PACKED
-    // M nonzeros (`m_core_buf` core slice + `cross_*`/`n_cross` crossed entries) the
-    // converged re-eval's `build_packed_m` left behind — a dense `M` is no
-    // longer maintained on the structured path.
+    // X'W̃M and the residual rows read the PACKED M nonzeros (`m_core_buf` core
+    // slice + `cross_*`/`n_cross` crossed entries) the converged re-eval's
+    // `build_packed_m` left behind; the structured path keeps no dense `M`.
     //
     // This is the one `f64` reader of the `cross_col`/`n_cross`/`cross_theta`
     // triple that does not evaluate the deviance itself, so it depends on its
@@ -1792,89 +1772,78 @@ fn structured_schur_fill(
     // `f64` `cross_theta`. Reading it un-refreshed does not panic — it picks up
     // a stale θ from an earlier optimizer trial and returns a plausible wrong
     // SE.
-    for r in 0..p {
-        for c in 0..k {
-            ws.border.xtwm[(r, c)] = 0.0;
-        }
-    }
-    for i in 0..n {
-        let f = cluster_ids[i] as usize;
-        let wi = ws.pirls.w[i];
-        let cbase = i * g_cap;
-        let ncz = ws.pattern.n_cross[i] as usize;
-        for r in 0..p {
-            let xw = x[(i, r)] * wi;
-            for local in 0..qc {
-                ws.border.xtwm[(r, core_col(f, local))] +=
-                    xw * ws.structured.m_core_buf[i * qc + local];
-            }
-            for z in 0..ncz {
-                let b = ws.pattern.cross_col[cbase + z] as usize;
-                ws.border.xtwm[(r, k_family + b)] += xw * ws.structured.cross_theta[z];
-            }
-        }
-    }
+    let row_nnz = |ws: &GlmmWorkspace, i: usize, buf: &mut [(usize, f64)]| {
+        structured_row_nnz(ws, cluster_ids, i, core_col, buf)
+    };
     // ainv_mtwx[:, c] = A⁻¹ (M'W̃X)[:, c], one fixed-effect column at a time.
-    for c in 0..p {
-        for f in 0..s {
-            for local in 0..qc {
-                ws.pirls.a_rhs[f * qc + local] = ws.border.xtwm[(c, core_col(f, local))];
-            }
-        }
-        for b in 0..e {
-            ws.pirls.a_rhs[k_family + b] = ws.border.xtwm[(c, k_family + b)];
-        }
-        structured_ainv_solve(
-            &ws.groupings,
-            &ws.structured.core_blocks,
-            &ws.structured.coupling,
-            &ws.structured.schur_blk,
-            &ws.pattern.coup_cols,
-            &ws.pattern.coup_ptr,
-            // force_dense → ss fold: see the structured_ainv_solve calls in
-            // pirls_solve_blocked_extras (pirls/blocked_extras.rs).
-            if ws.pattern.force_dense_schur() {
-                None
-            } else {
-                ws.pattern.structured_schur.as_mut()
-            },
-            &mut ws.pirls.a_rhs,
-        );
-        for f in 0..s {
-            for local in 0..qc {
-                ws.border.ainv_mtwx[(core_col(f, local), c)] = ws.pirls.a_rhs[f * qc + local];
-            }
-        }
-        for b in 0..e {
-            ws.border.ainv_mtwx[(k_family + b, c)] = ws.pirls.a_rhs[k_family + b];
-        }
-    }
-    // Residual rows rᵢ = xᵢ − Tᵀmᵢ over the same packed nonzeros the scatter
-    // above read.
-    for i in 0..n {
-        let f = cluster_ids[i] as usize;
-        let cbase = i * g_cap;
-        let ncz = ws.pattern.n_cross[i] as usize;
+    let ainv = |ws: &mut GlmmWorkspace| {
         for c in 0..p {
-            let mut r = x[(i, c)];
-            for local in 0..qc {
-                r -= ws.structured.m_core_buf[i * qc + local]
-                    * ws.border.ainv_mtwx[(core_col(f, local), c)];
+            for f in 0..s {
+                for local in 0..qc {
+                    ws.pirls.a_rhs[f * qc + local] = ws.border.xtwm[(c, core_col(f, local))];
+                }
             }
-            for z in 0..ncz {
-                let b = ws.pattern.cross_col[cbase + z] as usize;
-                r -= ws.structured.cross_theta[z] * ws.border.ainv_mtwx[(k_family + b, c)];
+            for b in 0..e {
+                ws.pirls.a_rhs[k_family + b] = ws.border.xtwm[(c, k_family + b)];
             }
-            ws.wx[(i, c)] = r;
+            structured_ainv_solve(
+                &ws.groupings,
+                &ws.structured.core_blocks,
+                &ws.structured.coupling,
+                &ws.structured.schur_blk,
+                &ws.pattern.coup_cols,
+                &ws.pattern.coup_ptr,
+                // The same `force_dense_schur` fold as the layout
+                // `pirls_solve_blocked_extras` builds.
+                if ws.pattern.force_dense_schur() {
+                    None
+                } else {
+                    ws.pattern.structured_schur.as_mut()
+                },
+                &mut ws.pirls.a_rhs,
+            );
+            for f in 0..s {
+                for local in 0..qc {
+                    ws.border.ainv_mtwx[(core_col(f, local), c)] = ws.pirls.a_rhs[f * qc + local];
+                }
+            }
+            for b in 0..e {
+                ws.border.ainv_mtwx[(k_family + b, c)] = ws.pirls.a_rhs[k_family + b];
+            }
         }
+        true
+    };
+    schur_fill_rows(ws, x, n, row_nnz, ainv)
+}
+
+/// Row `i`'s nonzeros of `M = ZΛ` on the structured layout, written into `buf`
+/// as `(column, value)` pairs; returns their count. The `q_core` core entries
+/// come first, at the columns `core(f, local)` maps the row's cluster `f` and
+/// slot `local` to (the RE-column index in the Schur fill, the solve's packing
+/// `f·q_core + local` in [`structured_condvar`]), then the row's crossed
+/// entries at `k_family + b`.
+fn structured_row_nnz(
+    ws: &GlmmWorkspace,
+    cluster_ids: &[u32],
+    i: usize,
+    core: impl Fn(usize, usize) -> usize,
+    buf: &mut [(usize, f64)],
+) -> usize {
+    let g = &ws.groupings;
+    let qc = g.primary_q + g.nested_per_parent;
+    let k_family = qc * g.n_primary;
+    let f = cluster_ids[i] as usize;
+    let ncz = ws.pattern.n_cross[i] as usize;
+    let cbase = i * crate::lmm::MAX_EXTRA_GROUPINGS;
+    let core_vals = &ws.structured.m_core_buf[i * qc..(i + 1) * qc];
+    for (local, (e, &v)) in buf[..qc].iter_mut().zip(core_vals).enumerate() {
+        *e = (core(f, local), v);
     }
-    schur_from_residuals(
-        |i| ws.pirls.w[i],
-        ws.wx.as_ref().subrows(0, n),
-        ws.border.ainv_mtwx.as_ref().subrows(0, k),
-        &mut ws.border.schur,
-    );
-    true
+    for (z, e) in buf[qc..qc + ncz].iter_mut().enumerate() {
+        let b = ws.pattern.cross_col[cbase + z] as usize;
+        *e = (k_family + b, ws.structured.cross_theta[z]);
+    }
+    qc + ncz
 }
 
 /// The kernel-coordinate blocks `Fit::condvar`, `Fit::condvar_x` and
@@ -2006,7 +1975,6 @@ fn structured_condvar(
     let prim_width = q * s;
     let k_family = qc * s;
     let k = ws.k;
-    let g_cap = crate::lmm::MAX_EXTRA_GROUPINGS;
     let st = &ws.structured;
     let pat = &ws.pattern;
     // Packing `[f·q_core + local | k_family + b]` to the RE-column index.
@@ -2090,19 +2058,15 @@ fn structured_condvar(
 
     // MᵀWx in the solve's packing, column-major k×p.
     let mut mtwx = vec![0.0f64; k * p];
+    let mut buf = [(0usize, 0.0f64); ROW_NNZ_MAX];
     for i in 0..n {
-        let f = cluster_ids[i] as usize;
+        let nz = structured_row_nnz(ws, cluster_ids, i, |f, local| f * qc + local, &mut buf);
         let wi = ws.pirls.w[i];
-        let ncz = pat.n_cross[i] as usize;
         for j in 0..p {
             let xw = x[(i, j)] * wi;
             let colj = &mut mtwx[j * k..(j + 1) * k];
-            for local in 0..qc {
-                colj[f * qc + local] += xw * st.m_core_buf[i * qc + local];
-            }
-            for zz in 0..ncz {
-                let b = pat.cross_col[i * g_cap + zz] as usize;
-                colj[k_family + b] += xw * st.cross_theta[zz];
+            for &(c, v) in &buf[..nz] {
+                colj[c] += xw * v;
             }
         }
     }
@@ -2156,4 +2120,254 @@ fn structured_condvar(
         }
     }
     Some((blocks, rows, Some(cross)))
+}
+
+/// The fixed-effect covariance at a fitted `fit_glmm` endpoint, by `wald_se`:
+/// `Var(β̂)` and `t²` on the targets, every `vcov` pair and the joint Wald χ²,
+/// all on the caller's columns through `map`. Returns the joint Wald χ²,
+/// whether the Hessian arm fell back to the RX block, and whether no covariance
+/// could be formed at the endpoint (the SE outputs are then NaN-filled).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn wald_cov(
+    ws: &mut GlmmWorkspace,
+    x: MatRef<f64>,
+    z: MatRef<f64>,
+    y: &[f64],
+    cluster_ids: &[u32],
+    extra_ids: &[Vec<u32>],
+    target_indices: &[u32],
+    n: usize,
+    wald_se: WaldSe,
+    map: &ColumnScaling,
+) -> (f64, bool, bool) {
+    let p = ws.p;
+    // Var(β̂): `Rx` inverts the β-information (Schur) directly — fast, but the
+    // Schur complement of the information at the mode assumes β–θ orthogonality (exact for
+    // the Gaussian LMM, anticonservative for the GLMM where IRLS weights couple
+    // β,θ). `Hessian` (default) sources Var(β̂) from the Hessian of the joint
+    // Laplace deviance (glmer `use.hessian = TRUE`), the lme4 "correct" denom —
+    // exact wherever an exact rung answers (`joint_hessian_cov`),
+    // finite-difference otherwise.
+    let mut hessian_fallback = false;
+    // A covariance that cannot be formed at the endpoint takes the SE outputs
+    // with it and nothing else: the search's optimum does not depend on the
+    // curvature read off it afterwards. Each arm breaks out with NaN, and the
+    // outputs are NaN-filled below.
+    let mut se_unavailable = false;
+    // Reset the θ-block covariance each fit (the workspace is reused across
+    // fits). Only the Hessian arm's `joint_hessian_cov` refills it; the Rx arm
+    // leaves it NaN. The pivot likewise: each arm records it where it factors
+    // the β information, and an arm that forms no factor leaves it NaN.
+    ws.inference.theta_cov.fill(f64::NAN);
+    ws.inference.pivot = f64::NAN;
+    let joint_t_sq = match wald_se {
+        WaldSe::Rx => rx_cov(
+            ws,
+            x,
+            z,
+            cluster_ids,
+            target_indices,
+            n,
+            map,
+            &mut se_unavailable,
+        ),
+        WaldSe::Hessian => hessian_cov(
+            ws,
+            x,
+            z,
+            y,
+            cluster_ids,
+            extra_ids,
+            target_indices,
+            n,
+            map,
+            &mut se_unavailable,
+            &mut hessian_fallback,
+        ),
+    };
+    if se_unavailable {
+        nan_fill_vcov(ws, p);
+        for &t in target_indices {
+            ws.inference.var_diag[t as usize] = f64::NAN;
+            ws.inference.t_sq[t as usize] = f64::NAN;
+        }
+    }
+    (joint_t_sq, hessian_fallback, se_unavailable)
+}
+
+/// The `WaldSe::Rx` arm of [`wald_cov`]: NaN, with `se_unavailable` set, when
+/// the Schur complement has no Cholesky factor.
+#[allow(clippy::too_many_arguments)]
+fn rx_cov(
+    ws: &mut GlmmWorkspace,
+    x: MatRef<f64>,
+    z: MatRef<f64>,
+    cluster_ids: &[u32],
+    target_indices: &[u32],
+    n: usize,
+    map: &ColumnScaling,
+    se_unavailable: &mut bool,
+) -> f64 {
+    let p = ws.p;
+    // No scale factor on any family: on Gamma the Schur is built from
+    // the working weights of the pinned re-eval, which carry `1/φ̂`
+    // (PIRLS runs on `prior_wᵢ/φ̂`), so Schur⁻¹ is already `φ̂·RX⁻¹` —
+    // the fitted objective's own information, φ̂ its ML value. lme4's
+    // `pwrss/n` belongs to lme4's φ-free objective and does not apply.
+    // Var(β̂)_jj from chol(Schur) forward-solve (mirrors fit_lmm's recovery).
+    let (sc, qr) = match rx_schur_llt(ws, x, z, cluster_ids, n) {
+        Some(f) => f,
+        None => {
+            *se_unavailable = true;
+            return f64::NAN;
+        }
+    };
+    let lschur = sc.L();
+    // Right-hand side row t of the column map B (eₜ when the design is
+    // fitted as given), read as U⁻ᵀbₜ against a factor built on X·U⁻¹:
+    // Var(βₜ) = ‖L⁻¹bₜ‖², and the Gram of these columns below is
+    // B·Schur⁻¹·Bᵀ. Every column is solved, so `vcov` holds every pair
+    // (a contrast's columns need not be targets); `var_diag` and `t_sq`
+    // stay on the targets. Each column's solve is independent of the
+    // others, so a target's values do not depend on the target set.
+    for tj in 0..p {
+        for (i, v) in ws.inference.fwd_solve[..p].iter_mut().enumerate() {
+            *v = map.rhs(tj, i);
+        }
+        if let Some(qr) = &qr {
+            qr.solve_row(&mut ws.inference.fwd_solve[..p]);
+        }
+        // Forward-solve in place: fwd_solve[i] is overwritten after the
+        // rows above it were, and read only as fwd_solve[kk] (kk < i).
+        for i in 0..p {
+            let mut acc = ws.inference.fwd_solve[i];
+            for kk in 0..i {
+                acc -= lschur[(i, kk)] * ws.inference.fwd_solve[kk];
+            }
+            ws.inference.fwd_solve[i] = acc / lschur[(i, i)];
+        }
+        if target_indices.contains(&(tj as u32)) {
+            let vd: f64 = ws.inference.fwd_solve[..p]
+                .iter()
+                .map(|v| v * v)
+                .sum::<f64>();
+            ws.inference.var_diag[tj] = vd;
+            ws.inference.t_sq[tj] = if vd.is_finite() && vd > 0.0 {
+                ws.betas[tj] * ws.betas[tj] / vd
+            } else {
+                f64::NAN
+            };
+        }
+        // Keep this column of L⁻¹: Schur⁻¹ = L⁻ᵀL⁻¹, so the pairwise
+        // dots below are `vcov`'s off-diagonals — the same arithmetic
+        // `vd` takes the norm of, not thrown away.
+        for i in 0..p {
+            ws.inference.vcov_cols[(i, tj)] = ws.inference.fwd_solve[i];
+        }
+    }
+    // Symmetric: fill both cells from the lower pair.
+    for a in 0..p {
+        for b in 0..=a {
+            let mut acc = 0.0;
+            for i in 0..p {
+                acc += ws.inference.vcov_cols[(i, a)] * ws.inference.vcov_cols[(i, b)];
+            }
+            ws.inference.vcov[(a, b)] = acc;
+            ws.inference.vcov[(b, a)] = acc;
+        }
+    }
+    // Joint Wald-χ² from the same columns: `vcov = CᵀC`.
+    crate::lmm::joint_wald_chi_sq(
+        ws.inference.vcov_cols.as_ref(),
+        &ws.betas,
+        1.0,
+        target_indices,
+        ws.inference.joint_qr.as_mut(),
+        &mut ws.inference.joint_z,
+    )
+}
+
+/// The `WaldSe::Hessian` arm of [`wald_cov`]: NaN, with `se_unavailable` set,
+/// when neither the joint Hessian nor its RX fallback gives a covariance.
+#[allow(clippy::too_many_arguments)]
+fn hessian_cov(
+    ws: &mut GlmmWorkspace,
+    x: MatRef<f64>,
+    z: MatRef<f64>,
+    y: &[f64],
+    cluster_ids: &[u32],
+    extra_ids: &[Vec<u32>],
+    target_indices: &[u32],
+    n: usize,
+    map: &ColumnScaling,
+    se_unavailable: &mut bool,
+    hessian_fallback: &mut bool,
+) -> f64 {
+    let p = ws.p;
+    // Joint-Hessian covariance into a LOCAL p×p Mat — NOT a ws field: the kernel
+    // takes `&mut ws`, so `&mut ws.<field>` for out_cov would alias it. The
+    // allocation is acceptable on this default path (the zero-alloc gate
+    // pins the Rx warm path). The kernel re-evals PIRLS itself and its
+    // RX fallback runs schur_fill internally, so skip the schur_fill above.
+    let mut cov = Mat::<f64>::zeros(p, p);
+    let status = joint_hessian_cov(ws, x, z, y, cluster_ids, extra_ids, p, n, &mut cov);
+    // Double-failure sentinel: the kernel NaN-fills `cov` when BOTH the joint
+    // Hessian and the RX fallback fail.
+    if !cov[(0, 0)].is_finite() {
+        *se_unavailable = true;
+        return f64::NAN;
+    }
+    // `cov` is Var(β̃) on the fitted design; the caller's is B·cov·Bᵀ.
+    map.congruence(cov.as_mut());
+    *hessian_fallback = matches!(status, FdHessianStatus::NonPdFellBackToRx);
+    // Marginal var/t² straight off the covariance diagonal.
+    for &tj in target_indices {
+        let tj = tj as usize;
+        let vd = cov[(tj, tj)];
+        ws.inference.var_diag[tj] = vd;
+        ws.inference.t_sq[tj] = if vd.is_finite() && vd > 0.0 {
+            ws.betas[tj] * ws.betas[tj] / vd
+        } else {
+            f64::NAN
+        };
+    }
+    // `cov` IS Cov(β̂) in full — keep every pair rather than only the
+    // diagonal just read (a contrast's columns need not be targets).
+    // The RX fallback (`NonPdFellBackToRx`) fills `cov` through
+    // `rx_cov_into`, which forms a complete p×p inverse too, so it
+    // carries a real vcov and is NOT NaN-filled here.
+    //
+    // Mirror the lower triangle instead of copying both cells: `cov`
+    // comes from a solve against an identity, which leaves (a,b) and
+    // (b,a) differing in the last bits. The matrix is symmetric
+    // mathematically, and every other path builds it symmetric by
+    // construction, so pick one value per pair rather than hand a
+    // consumer an almost-symmetric vcov.
+    for a in 0..p {
+        for b in 0..=a {
+            ws.inference.vcov[(a, b)] = cov[(a, b)];
+            ws.inference.vcov[(b, a)] = cov[(a, b)];
+        }
+    }
+    // Joint Wald-χ² from a square root of the covariance: `joint_hessian_cov`
+    // leaves `cov_root` (`RᵀR` = the fitted design's Cov(β̂)), so the
+    // caller's column `t` is `R·bₜ`, `bₜ` row `t` of the map.
+    for &tj in target_indices {
+        let tj = tj as usize;
+        for i in 0..p {
+            let mut acc = 0.0;
+            for j in 0..p {
+                acc += ws.inference.cov_root[(i, j)] * map.rhs(tj, j);
+            }
+            ws.inference.vcov_cols[(i, tj)] = acc;
+        }
+    }
+    crate::lmm::joint_wald_chi_sq(
+        ws.inference.vcov_cols.as_ref(),
+        &ws.betas,
+        1.0,
+        target_indices,
+        ws.inference.joint_qr.as_mut(),
+        &mut ws.inference.joint_z,
+    )
 }

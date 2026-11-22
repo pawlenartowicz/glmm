@@ -520,9 +520,7 @@ fn unasserted_by_convention(g: &Golden) -> Vec<(&'static str, &'static str)> {
 
 // ── Structural gates ─────────────────────────────────────────────────────────
 
-/// Every golden has a manifest entry, and therefore a generator. Three
-/// goldens (sleepstudy, penicillin, pastes) sat unregistered and unregenerable
-/// until 2026-07-21; this is what stops a fourth appearing.
+/// Every golden has a manifest entry, and therefore a generator.
 #[test]
 fn all_goldens_are_registered() {
     let registered: std::collections::BTreeSet<String> =
@@ -665,31 +663,8 @@ fn goldens_agree_with_the_references() {
     // moved — would leave this test green while asserting nothing, which is the
     // failure mode the whole tier is built against.
     //
-    // 53 -> 55 on 2026-07-30: the two `sim_binomial_bigsd_agq_k{7,11}` references
-    // were frozen, so their specs lost `pending_reference` and rejoined
-    // `m3_corpus()`. 55 -> 56 on 2026-08-01: `sim_dynrange_lmm` joined: this
-    // design now fits instead of NaN-filling on conditioning grounds, which is
-    // what made a reference possible at all. 56 -> 61 on 2026-08-06: the five
-    // `sim_scale_*_glm` goldens joined, pinning that the GLM divergence guard's
-    // switch from bounding |β| to bounding |η| gives the same accept/reject
-    // decision `stats::glm` does on the three-unit-system, separated, and
-    // Gamma-inverse-large-η design classes. 61 -> 62 on 2026-08-26:
-    // `sim_cloglog_glm` joined (the cloglog GLM arm). 62 -> 63 on 2026-08-26:
-    // `sim_cloglog_glmm` joined (the cloglog GLMM arm — no kernel change, PIRLS
-    // reaches the link through `family_pass`). 63 -> 65 on 2026-08-26:
-    // `sim_igauss_glm` and `sim_igauss_inv_sq_glm` joined (the two inverse-Gaussian
-    // GLM link cells, log and 1/μ², on the new `sim_igauss` fixture — GLM-only,
-    // no glmm cell, since the family faults at the model-shape gate with random
-    // effects). 65 -> 73 on 2026-09-24: the eight glmmTMB `<name>_tmb` twins of
-    // the lme4 GLMM goldens whose objective is not glmm's (`objective_differs`)
-    // joined, as the exact-Laplace references those fits are gated against. The
-    // 58 is what `all_goldens_are_registered` proves against the goldens
-    // directory; the 15 is asserted inside `corpus()` itself. 73 -> 76 on
-    // 2026-09-24: the three `_ml` twins of the `stats::glm` Gamma GLM goldens
-    // joined when glmm's Gamma GLM moved to the ML dispersion, and the 58 became
-    // 61. 76 -> 98 on 2026-10-22: the 22 goldens of uncorrelated and
-    // intercept-free random effects (`||`, `zerocorr`, `(0 + x | g)`, several
-    // terms on one grouping) were frozen, and the 61 became 83.
+    // The 83 is what `all_goldens_are_registered` proves against the goldens
+    // directory; the 15 is asserted inside `corpus()` itself.
     assert_eq!(corpus().len(), 98, "the cross-engine corpus changed size");
     for (g, factors) in corpus() {
         let shape = shape_of(&g);

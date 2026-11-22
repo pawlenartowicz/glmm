@@ -19,7 +19,6 @@ import numpy as np
 import pytest
 
 import glmm
-from glmm.anova import _NOT_CONVERGED
 
 N = 96
 
@@ -32,6 +31,12 @@ _FAILURE_KIND = {
     "separated": "glm_diverged",
     "too_few_rows": "too_few_rows",
 }
+
+_TESTS_NOT_CONVERGED = (
+    "The fit did not converge, so its estimates are not at a maximum and these tests "
+    "are not reliable. Change the model until it converges (a simpler random part often "
+    "helps), then test again."
+)
 
 _INTERVALS_NOT_CONVERGED = (
     "The fit did not converge, so its estimates are not at a maximum and these intervals "
@@ -233,6 +238,7 @@ def _summary_numbers(m):
         s.statistic,
         s.p_value,
         s.residual_df,
+        s.sigma,
         s.rss,
         s.r_squared,
         s.adj_r_squared,
@@ -410,7 +416,7 @@ def _pairwise_problems(c, returned):
         return []
     returned.append(c.label)
     bad = []
-    if table.notes[:1] != [_NOT_CONVERGED]:
+    if table.notes[:1] != [_TESTS_NOT_CONVERGED]:
         bad.append(f"pairwise notes {table.notes}")
     ci = _quiet(table.confint)
     if ci.notes[:1] != [_INTERVALS_NOT_CONVERGED]:
@@ -443,6 +449,10 @@ def test_every_fit_state_reaches_its_state():
                 f"{c.label}: converged {m.converged}, singular {m.singular}, beta {m.beta}, "
                 f"aliased {m.aliased}, notes {[n['kind'] for n in m.diagnostics['notes']]}"
             )
+        # The singular warning comes exactly with a singular converged fit.
+        warned = [w["kind"] for w in m.warnings].count("singular")
+        if warned != int(m.converged and m.singular):
+            failures.append(f"{c.label}: {warned} singular warnings, singular {m.singular}")
     assert len(fits) == 39
     assert not failures, "\n".join(failures)
 

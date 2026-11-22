@@ -13,8 +13,8 @@
 //! caller's over `c²`, and each block's `Σ = D·R·D` divided by `σ²/s` is
 //! moved onto the fitted design (`Σ̃ = M⁻¹·Σ·M⁻ᵀ`, `M` the map
 //! `crate::lmm::re_map` documents as `N`) and factored there by
-//! [`semidef_lower_chol`] (trace floor). A factor that does not reproduce
-//! `Σ̃` to `1e-8·tr` means `R` is not positive semidefinite, and the point is
+//! [`semidef_lower_chol`] (trace floor). A factor that fails [`reproduces`]
+//! on `Σ̃` means `R` is not positive semidefinite, and the point is
 //! infeasible. The factor, packed, is the kernel's θ̃, structural entries
 //! zeroed. With
 //! `d_p = kernel.deviance(θ̃)` (ML, σ profiled), `σ̂² = kernel.sigma_sq()` and
@@ -62,10 +62,13 @@
 use bobyqa::Status;
 use faer::Mat;
 
-use super::re_map::{pack_vech, semidef_lower_chol, PivotFloor};
+use super::re_map::{pack_vech, reproduces, semidef_lower_chol, PivotFloor};
 use super::satterthwaite::caller_map_into;
-use super::{warm_bobyqa, Criterion, LmmGroupings, LmmKernel, LmmWorkspace, THETA_HI};
-use crate::fit::varcorr_block;
+use super::{
+    beta_backward, forward_solve, warm_bobyqa, Criterion, LmmGroupings, LmmKernel, LmmWorkspace,
+    THETA_HI,
+};
+use crate::fit::{varcorr_block, vech_at};
 use crate::inference::profile::ProfileParam;
 use crate::optim::{bobyqa_minimize, ValueFn};
 use crate::standardize::{ColumnScaling, Units};
@@ -150,11 +153,6 @@ impl CholScratch {
     }
 }
 
-/// Offset of entry `(r, c)`, `r ≥ c`, in a `q`-wide block's column-major vech.
-fn vech_at(q: usize, r: usize, c: usize) -> usize {
-    c * q - (c * c - c) / 2 + (r - c)
-}
-
 /// The profile objectives over a workspace an ML fit just left at θ̂.
 pub(crate) struct ProfileKernel<'a> {
     ws: &'a mut LmmWorkspace,
@@ -211,19 +209,17 @@ impl<'a> ProfileKernel<'a> {
         );
         let lay = {
             let g = ws.kernel.groupings();
-            let blocks: Vec<usize> = std::iter::once(g.primary_q)
-                .chain(g.extra_q.iter().copied())
-                .collect();
+            let blocks: Vec<usize> = (0..g.n_blocks()).map(|b| g.block_q(b)).collect();
             debug_assert_eq!(group_of_slot.len(), blocks.len());
             let structural = g.structural_theta();
             let mut coords = Vec::new();
             let mut params = Vec::new();
             let mut slot = vec![None; g.n_theta()];
-            let mut t = 0usize;
             for (block, &q) in blocks.iter().enumerate() {
                 let (group, h) = (group_of_slot[block], usize::from(g.hidden[block]));
                 for col in 0..q {
                     for row in col..q {
+                        let t = g.vech_start(block) + vech_at(q, row, col);
                         if structural.binary_search(&t).is_err() {
                             slot[t] = Some(coords.len());
                             // A block without an intercept reports without its
@@ -252,7 +248,6 @@ impl<'a> ProfileKernel<'a> {
                                 });
                             }
                         }
-                        t += 1;
                     }
                 }
             }
@@ -548,9 +543,8 @@ fn lme4_of(
     sigma_var: f64,
     out: &mut [f64],
 ) {
-    let mut cur = 0usize;
     for (b, &q) in lay.blocks.iter().enumerate() {
-        let len = q * (q + 1) / 2;
+        let (cur, len) = (g.vech_start(b), q * (q + 1) / 2);
         let vc = varcorr_block(&theta[cur..cur + len], q, sigma_var, g, b, map);
         for col in 0..q {
             for row in col..q {
@@ -568,7 +562,6 @@ fn lme4_of(
                 };
             }
         }
-        cur += len;
     }
 }
 
@@ -592,9 +585,8 @@ fn theta_into(
         return false;
     }
     let sigma_s_sq = sigma * sigma / lay.weight_scale;
-    let mut cur = 0usize;
     for (b, &q) in lay.blocks.iter().enumerate() {
-        let len = q * (q + 1) / 2;
+        let (cur, len) = (g.vech_start(b), q * (q + 1) / 2);
         if Some(b) != own {
             for t in cur..cur + len {
                 theta[t] = lay.slot[t].map_or(0.0, |i| v[i]);
@@ -602,7 +594,6 @@ fn theta_into(
                     return false;
                 }
             }
-            cur += len;
             continue;
         }
         let read = |r: usize, c: usize| lay.slot[cur + vech_at(q, r, c)].map(|i| v[i]);
@@ -654,18 +645,10 @@ fn theta_into(
             }
         }
         semidef_lower_chol(sig, q, lam, PivotFloor::Trace);
-        let trace: f64 = (0..q).map(|r| sig[r * q + r]).sum();
-        let reproduced = (0..q).all(|r| {
-            (0..=r).all(|c| {
-                let s: f64 = (0..=c).map(|k| lam[r * q + k] * lam[c * q + k]).sum();
-                (s - sig[r * q + c]).abs() <= 1e-8 * trace
-            })
-        });
-        if !reproduced {
+        if !reproduces(sig, lam, q) {
             return false;
         }
         pack_vech(lam, q, &mut theta[cur..cur + len]);
-        cur += len;
     }
     g.zero_structural(theta);
     true
@@ -720,22 +703,13 @@ fn beta_dev(
     let p = beta.len();
     let f = kernel.factor();
     // β̃ by the backward solve `L̃_XXᵀβ̃ = l_yX̃` (the y row is index p).
-    for i in (0..p).rev() {
-        let mut acc = f[(p, i)];
-        for k in (i + 1)..p {
-            acc -= f[(k, i)] * beta[k];
-        }
-        beta[i] = acc / f[(i, i)];
-    }
+    beta_backward(f, p, beta);
     let beta_j: f64 = (0..p).map(|i| m[(j, i)] * beta[i]).sum();
     // `w = L̃⁻¹M_jᵀ`.
-    for i in 0..p {
-        let mut acc = m[(j, i)];
-        for k in 0..i {
-            acc -= f[(i, k)] * w[k];
-        }
-        w[i] = acc / f[(i, i)];
+    for (i, wi) in w.iter_mut().enumerate() {
+        *wi = m[(j, i)];
     }
+    forward_solve(f, p, w);
     let var_j = kernel.sigma_sq() * w.iter().map(|x| x * x).sum::<f64>();
     let d = b - beta_j;
     let out = dev + n * (d * d / (n * var_j)).ln_1p();

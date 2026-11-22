@@ -10,8 +10,7 @@ harness's smoke test to run a large shape at a fraction of its real row count --
 the group/level counts, and so k_total, are unchanged by the override, only the
 row count and therefore memory shrink).
 
-Fixed seed per model (rng seeded on the model id, mirroring
-toy28/ram_scaling.py's `np.random.default_rng(0)` precedent) -- deterministic,
+Fixed seed per model (rng seeded on the model id) -- deterministic,
 reproducible, and irrelevant to what is being measured (peak RSS depends on
 shape, not on the values).
 """

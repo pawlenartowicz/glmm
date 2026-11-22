@@ -21,8 +21,8 @@ hold the full list.
 Default features build the `formula` frontend (R-style formula strings, the
 only thing that pulls in `regex`) — everything else is off by default. The
 `loop_advanced` feature exposes an unstable, scratch-explicit hot-path
-surface for warm-start callers like MCPower's simulation loop, with no
-semver guarantees. The `orchestrate` feature exposes the string-typed fit
+surface for warm-start callers such as simulation loops, with no
+semver guarantees. The `orchestrate` feature exposes the typed fit
 orchestration the Python and R packages are built on (the family/link string
 vocabulary, the formula-and-data lowering, and the flattened result both
 ports publish), also with no semver guarantees: its shape follows the ports'

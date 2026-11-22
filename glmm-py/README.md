@@ -1,26 +1,36 @@
-# glmm
+# GLMM
 
 [![License: LGPL-3.0-or-later](https://img.shields.io/badge/license-LGPL--3.0--or--later-blue.svg)](https://www.gnu.org/licenses/lgpl-3.0)
 
-**`glmm`: mixed models from an R-style formula, with NumPy as the only dependency.**
+**GLMM: mixed models from an R-style formula, with NumPy as the only dependency.**
 
-**glmm** fits ordinary least squares, generalized linear models, linear mixed
+**GLMM** fits ordinary least squares, generalized linear models, linear mixed
 models and generalized linear mixed models from an R-style formula. It is the
-Python package of the [glmm engine](https://github.com/pawlenartowicz/glmm),
+Python package of the [GLMM engine](https://github.com/pawlenartowicz/glmm),
 which also serves Rust and R.
 
 ## The idea
 
-- **Accuracy first.** glmm reaches the same log-likelihood as lme4, glmmTMB,
+- **Accuracy first.** GLMM reaches the same log-likelihood as lme4, glmmTMB,
   MixedModels.jl and GLMMadaptive, or a better one.
 - **Multi-solver.** Each model gets a method that suits it. Least squares uses
-  a closed form, and GLMs use IRLS. Mixed models use BFGS where glmm has a cheap
+  a closed form, and GLMs use IRLS. Mixed models use BFGS where GLMM has a cheap
   exact gradient, and BOBYQA, which needs no gradient, elsewhere.
-- **Fast.** glmm is faster than these four packages on every model in the speed
+- **Fast.** GLMM is faster than these four packages on every model in the speed
   tests, and it uses little memory. Part of the time saved goes to extra checks
   during a fit, which catch hard models where a search would stop too early.
 
 More in the [project README](https://github.com/pawlenartowicz/glmm#readme).
+
+## Beta status and plans
+
+GLMM is in beta. Not all features are implemented yet, and not all edge cases are tested. Every release is strictly tested on almost 1,000 test models and compared with other packages.
+
+Planned next:
+- survey weights for mixed models
+- parallel fits by default and lower memory use
+- more than one start for fits that can stop at a worse local optimum
+- an HTML report of a fit
 
 ## Install
 
@@ -28,18 +38,18 @@ More in the [project README](https://github.com/pawlenartowicz/glmm#readme).
 pip install glmm
 ```
 
-Requires Python 3.10+. The only runtime dependency is NumPy. glmm also runs in
+Requires Python 3.10+. The only runtime dependency is NumPy. GLMM also runs in
 the browser under Pyodide: a Pyodide wheel is attached to each
 [GitHub release](https://github.com/pawlenartowicz/glmm/releases).
 
 ## Validation
 
-glmm is checked on 947 test models before every release. They cover the
+GLMM is checked on 947 test models before every release. They cover the
 Gaussian, binomial, Poisson, Gamma and negative binomial families, random
 intercepts, correlated slopes, nested and crossed groupings, and data from 60 to
 30,000 rows. Each model is also fitted by lme4, glmmTMB, MixedModels.jl and
-GLMMadaptive, where they support it. glmm is compared with the best of their
-results, not with one chosen package. If glmm reaches a worse log-likelihood
+GLMMadaptive, where they support it. GLMM is compared with the best of their
+results, not with one chosen package. If GLMM reaches a worse log-likelihood
 than that best result, the release fails. If its estimates differ from the
 other packages, the difference passes only once it is explained in writing.
 
@@ -47,18 +57,18 @@ Standard errors of mixed models come from the exact second derivatives of the
 likelihood, not from a finite-difference approximation. On the test models they
 differ from a high-precision lme4 run by at most 0.002% (relative).
 
-glmm was also stress-tested on many hard and borderline models. On such models
+GLMM was also stress-tested on many hard and borderline models. On such models
 it returns a result with flags that say what happened, instead of only printing
 a warning. A variance that falls to zero is set to exactly zero and flagged. A
 redundant column is dropped and marked, as in lme4. When a fit fails, the
-`converged` flag says so. glmm does not crash.
+`converged` flag says so. GLMM does not crash.
 
 The package versions, the checks and how to rerun them are in
 [`validation.md`](https://github.com/pawlenartowicz/glmm/blob/main/documentation/validation.md).
 
 ## Multi-solver paradigm
 
-glmm combines several optimizers for mixed models. Where it has a cheap exact
+GLMM combines several optimizers for mixed models. Where it has a cheap exact
 gradient, it uses BFGS. Elsewhere it uses BOBYQA, which needs no gradient.
 BOBYQA also refines the BFGS result and takes over when BFGS fails.
 
@@ -74,12 +84,12 @@ both return the same answer. The choice affects speed only.
 
 ## Speed
 
-glmm moves as little data as it can. One pass over the data builds a small
+GLMM moves as little data as it can. One pass over the data builds a small
 summary per group, and every later step of the search works on those summaries.
 The cost of each step therefore grows with the number of groups, not the number
 of rows.
 
-glmm is also designed for refitting the same model many times. Its working
+GLMM is also designed for refitting the same model many times. Its working
 memory depends only on the shape of the model. So refitting the same model on
 new data, as in a power simulation or a bootstrap, needs no new memory. Each
 refit can also start from the previous answer.
@@ -135,14 +145,14 @@ fit.predict(new_data)             # predictions on new rows
 
 ## Citation
 
-If you use glmm in research, please cite:
+If you use GLMM in research, please cite:
 
-Lenartowicz, P. (2026). glmm: Mixed-model fitting in Rust, Python and R [Computer software]. https://github.com/pawlenartowicz/glmm
+Lenartowicz, P. (2026). GLMM: Mixed-model fitting in Rust, Python and R [Computer software]. https://github.com/pawlenartowicz/glmm
 
 ```bibtex
 @software{glmm2026,
   author = {Lenartowicz, Pawe{\l}},
-  title  = {{glmm}: Mixed-Model Fitting in Rust, Python and R},
+  title  = {{GLMM}: Mixed-Model Fitting in Rust, Python and R},
   year   = {2026},
   url    = {https://github.com/pawlenartowicz/glmm}
 }

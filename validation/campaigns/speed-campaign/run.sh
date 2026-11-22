@@ -51,8 +51,8 @@ case "$ENGINE" in
                # in-process protocol — their per-launch startup/JIT cost
                # dwarfs a per-fit budget.
                export GRID_ONE_CELL=1 ;;
-  glmm_wasm)   # The glmm driver built for wasm32-wasip1 with simd128 (the
-               # build MCPower ships), run under wasmtime. Same soft budget and
+  glmm_wasm)   # The glmm driver built for wasm32-wasip1 with simd128, run
+               # under wasmtime. Same soft budget and
                # one-cell-per-launch protocol as glmm above — change together.
                # WASI passes no host environment unless named, so every GRID_*
                # variable fit.rs reads is forwarded.
@@ -159,9 +159,8 @@ while MISSING=$(next_missing); do
   done
   RC=0; wait "$ENGPID" 2>/dev/null || RC=$?
   # The engine exited on its own with cells remaining. Its exit code decides
-  # what that means, and conflating the two poisoned a whole pass once
-  # (2026-08-06 npt-mid: 24 consecutive cells, one of them a 4 ms 300-row fit,
-  # recorded engine-fail with n_eval=0 — the launches never ran).
+  # what that means; conflating the two records cells whose launch never ran
+  # as engine-fail with n_eval=0.
   #   RC != 0 — the LAUNCH failed before reaching the cell: build error, OOM
   #     kill, panic at startup. Nothing whatever is known about the cell, so
   #     writing a result for it fabricates data. Two strikes, then stop.

@@ -1,6 +1,6 @@
 //! The exact restricted likelihood ratio test (RLRT) of one random intercept
 //! against the model without it (Crainiceanu & Ruppert 2004): the design's
-//! eigenvalues, the observed statistic, the refusals a caller reports in place
+//! eigenvalues, the refusals a caller reports in place
 //! of an exact reference, the grid kernel that evaluates one null draw, the
 //! simulated null with its p-value, and [`exact_rlrt`], which composes them.
 //!
@@ -14,7 +14,7 @@
 //! not enter, so the null depends on the design alone.
 //!
 //! Everything here takes numbers: the design summary a `(1 | g)` fit keeps
-//! (`crate::fit::DesignSummary`) and the two REML log-likelihoods. It reads no
+//! (`crate::fit::DesignSummary`) and the comparison's statistic. It reads no
 //! `Fit`, no `x` and no `y`. The method, with a worked example, is in
 //! `documentation/algorithms-lmm.md` (Exact RLRT for one random intercept).
 //!
@@ -58,7 +58,9 @@ pub(crate) const MU_ZERO_REL: f64 = 1e-10;
 /// exact null approaches the 50:50 mixture, while its cost grows (a
 /// `K' × K'` eigendecomposition and a grid sweep over up to `K'` eigenvalues
 /// per draw), so above this the comparison refuses with
-/// [`RlrtRefusal::TooManyLevels`]. The functions here take any `K`.
+/// [`RlrtRefusal::TooManyLevels`]. The functions here take any `K`. The value
+/// is written out in [`RlrtRefusal::reason`]'s text and in
+/// `LrNote::ExactRlrtRefused`'s doc; change together.
 pub(crate) const RLRT_MAX_LEVELS: usize = 100;
 
 /// Why the exact RLRT cannot be computed from a design summary. The caller
@@ -96,6 +98,7 @@ impl RlrtRefusal {
             Self::MalformedSummary => {
                 "the design summary is not one a fit gives (sizes that disagree, a non-finite entry, a count that is not a row count, an X'X that is not positive definite, or more nonzero eigenvalues than n - p)"
             }
+            // Mirrors `RLRT_MAX_LEVELS`; change together.
             Self::TooManyLevels => {
                 "the grouping factor has more than 100 groups (levels with rows); there the exact test is close to the 50:50 mixture and takes more time than it gains"
             }
@@ -211,40 +214,6 @@ pub(crate) fn rlrt_design(counts: &[f64], s: &[f64], c: &[f64]) -> Result<RlrtDe
         n_minus_p,
         tail_df,
     })
-}
-
-/// The observed RLRT from the REML log-likelihood of the `(1 | g)` fit
-/// (`loglik_full`) and of the OLS fit with the same `X` made with
-/// `reml = Some(true)` (`loglik_reduced`, the value at `θ = 0`), and whether
-/// the `(1 | g)` fit pinned its one component at zero.
-///
-/// NaN, pinned or not, when either log-likelihood is NaN or `−∞` (a fit that
-/// failed or collapsed), never `0.0`. Else `0.0` when `pinned`, by rule: on a
-/// pinned fit the two log-likelihoods agree to round-off, and the sign of
-/// that round-off must not decide a test whose null has an atom at 0.
-/// Otherwise `2·(loglik_full − loglik_reduced)` floored at `0.0`: a search
-/// that ended at a lower log-likelihood than at `θ = 0` still tests as 0, and
-/// so does a finite `loglik_full` against `loglik_reduced = +∞` (an exact OLS
-/// fit). `loglik_full = +∞` against a finite `loglik_reduced` gives `+∞`
-/// (`0.0` when pinned), though no `(1 | g)` fit reports `+∞`: `lmm_loglik`
-/// maps a non-finite deviance to NaN. So on an exact fit (`y` in the column
-/// space of `X`), where the `(1 | g)` fit's deviance is non-finite, the pair
-/// tests as NaN.
-pub(crate) fn rlrt_statistic(loglik_full: f64, loglik_reduced: f64, pinned: bool) -> f64 {
-    let failed = |l: f64| l.is_nan() || l == f64::NEG_INFINITY;
-    if failed(loglik_full) || failed(loglik_reduced) {
-        return f64::NAN;
-    }
-    if pinned {
-        return 0.0;
-    }
-    let t = 2.0 * (loglik_full - loglik_reduced);
-    // `f64::max` would turn a NaN (`+∞ − +∞`) into 0.0.
-    if t > 0.0 || t.is_nan() {
-        t
-    } else {
-        0.0
-    }
 }
 
 /// The `λ` grid of the null's supremum, in units of `1/μ_max` (the design's
@@ -416,9 +385,9 @@ pub(crate) fn null_draws(design: &RlrtDesign, cfg: &RlrtConfig) -> Vec<(f64, usi
     let tail = (design.tail_df > 0)
         .then(|| ChiSquared::new(design.tail_df as f64).expect("a positive df is valid"));
     // No draw needs a guard against `D = 0` (a NaN profile): every `χ²₁` is
-    // positive, as `Normal`'s sampler is `norm_quantile((w + 0.5)/2³²)` for a
-    // 32-bit word `w`, never at 1/2, and the two words nearest 1/2 give
-    // `|z| = 2.9e-10` (commonstats 0.2.2), so `z² ≥ 8.5e-20`; a design has
+    // positive, as `Normal::sample` maps a 32-bit uniform word `w` to
+    // `norm_quantile((w + 0.5)/2³²)`, never at 1/2, and the two words nearest
+    // 1/2 give `|z| = 2.9e-10`, so `z² ≥ 8.5e-20`; a design has
     // `k ≥ 1` (or, with `k = 0`, a positive `tail_df`), so `D_i > 0`.
     let fill = |first: usize, out: &mut [(f64, usize)]| {
         let mut chi1 = vec![0.0; design.mu.len()];
@@ -468,7 +437,7 @@ pub(crate) fn rlrt_null(design: &RlrtDesign, cfg: &RlrtConfig) -> RlrtNull {
 /// The exact RLRT of one fit, as [`exact_rlrt`] returns it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct RlrtResult {
-    /// The observed statistic ([`rlrt_statistic`]).
+    /// The observed statistic, as the caller passed it.
     pub(crate) statistic: f64,
     /// The p-value: [`RlrtNull::p_value`] on a positive statistic, exactly
     /// `1` on a zero one, NaN on a NaN one.
@@ -481,31 +450,28 @@ pub(crate) struct RlrtResult {
 }
 
 /// The exact RLRT of a `(1 | g)` fit against the OLS fit with the same `X`:
-/// [`rlrt_design`] on the fit's design summary (`counts`, `s`, `c`), then
-/// [`rlrt_statistic`] on `loglik_full` (the REML log-likelihood of the
-/// `(1 | g)` fit), `loglik_reduced` (that of the OLS fit made with
-/// `reml = Some(true)`, the value at `θ = 0`) and `pinned` (the `(1 | g)`
-/// fit pinned its one component at zero), and, only when the statistic is
-/// positive, the null of `cfg` ([`rlrt_null`]) and its p-value.
+/// [`rlrt_design`] on the fit's design summary (`counts`, `s`, `c`), then,
+/// only when `statistic` is positive, the null of `cfg` ([`rlrt_null`]) and
+/// its p-value. `statistic` is the comparison's likelihood-ratio statistic
+/// (`inference::lr::lr_statistic` on the REML log-likelihoods of the OLS
+/// fit made with `reml = Some(true)`, the value at `θ = 0`, and of the
+/// `(1 | g)` fit), never negative: NaN, zero or positive.
 ///
-/// A zero statistic (pinned, or the full fit no better than `θ = 0`) gives
-/// `p = 1` with no draws: `nsim = 0`, so no caller reports a draw count that
-/// was never made. A NaN statistic gives a NaN p-value, also with no draws.
-/// `cfg.nsim = 0` on a positive statistic is a caller error that gives a NaN
-/// p-value. A refusal comes before the statistic is read, so a pinned fit on
-/// a design the test cannot handle is still refused.
+/// A zero statistic (a pinned fit, or the full fit no better than `θ = 0`)
+/// gives `p = 1` with no draws: `nsim = 0`, so no caller reports a draw count
+/// that was never made. A NaN statistic gives a NaN p-value, also with no
+/// draws. `cfg.nsim = 0` on a positive statistic is a caller error that gives
+/// a NaN p-value. A refusal comes before the statistic is read, so a pinned
+/// fit on a design the test cannot handle is still refused.
 pub(crate) fn exact_rlrt(
     counts: &[f64],
     s: &[f64],
     c: &[f64],
-    loglik_full: f64,
-    loglik_reduced: f64,
-    pinned: bool,
+    statistic: f64,
     cfg: &RlrtConfig,
 ) -> Result<RlrtResult, RlrtRefusal> {
     let design = rlrt_design(counts, s, c)?;
-    let statistic = rlrt_statistic(loglik_full, loglik_reduced, pinned);
-    // Zero or NaN: no draws. The statistic is never negative.
+    // Zero or NaN: no draws.
     if statistic.is_nan() || statistic <= 0.0 {
         let p_value = if statistic == 0.0 { 1.0 } else { f64::NAN };
         return Ok(RlrtResult {

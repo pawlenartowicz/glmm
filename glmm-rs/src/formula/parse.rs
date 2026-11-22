@@ -125,10 +125,9 @@ static EXPLICIT_INTERCEPT: LazyLock<Regex> =
 /// The response name a formula with no left-hand side parses to.
 pub(crate) const DEFAULT_RESPONSE: &str = "explained_variable";
 
-/// The parsed formula AST. A frozen contract — its shape must stay stable
-/// since the parse test suite depends on it. The suite proves a superset of
-/// MCPower's grammar, not a mirror: fields like `has_intercept` widen the
-/// grammar past what MCPower's own parser accepts.
+/// The parsed formula AST. A frozen contract: its shape must stay stable
+/// since the parse test suite depends on it. Fields like `has_intercept` widen
+/// the grammar past the 28-case canonical suite.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedFormula {
     /// Dependent-variable name (`"y"`; `"explained_variable"` when the LHS is empty).
@@ -810,21 +809,7 @@ fn parse_rhs(rhs: &str) -> Result<(Vec<String>, Vec<Term>), ParseError> {
     let mut terms: Vec<Term> = Vec::new();
     let mut seen_term: BTreeSet<String> = BTreeSet::new();
 
-    // A piece with a group or a `^` goes through `expand_group`; every other
-    // piece is split on `+` and read term by term. A piece with a `|` is a
-    // random-effect term no regex took, left to fail below as a plain syntax
-    // error.
     for piece in split_outside_parens(rhs) {
-        if !(has_group(piece) || has_power(piece)) || piece.contains('|') {
-            parse_plain_terms(
-                piece,
-                &mut predictors,
-                &mut seen_pred,
-                &mut terms,
-                &mut seen_term,
-            )?;
-            continue;
-        }
         let (vars, expanded) = expand_group(piece)?;
         register_vars(&vars, &mut predictors, &mut seen_pred);
         for t in expanded {
@@ -838,63 +823,6 @@ fn parse_rhs(rhs: &str) -> Result<(Vec<String>, Vec<Term>), ParseError> {
     }
 
     Ok((predictors, terms))
-}
-
-/// The `+`-separated terms of a piece with no group: a main effect, an
-/// `a:b` interaction, or an `a*b` product.
-fn parse_plain_terms(
-    piece: &str,
-    predictors: &mut Vec<String>,
-    seen_pred: &mut std::collections::BTreeSet<String>,
-    terms: &mut Vec<Term>,
-    seen_term: &mut std::collections::BTreeSet<String>,
-) -> Result<(), ParseError> {
-    for raw_term in piece.split('+') {
-        let term = raw_term.trim();
-        if term.is_empty() {
-            continue;
-        }
-
-        if term.contains('*') {
-            let vars = distinct(parse_identifier_list(term, &['*'])?);
-            // `a*b*…` lists every subset of its variables, `2^k − 1` terms.
-            if vars.len() > MAX_TERMS.ilog2() as usize {
-                return Err(too_many_terms(term));
-            }
-            register_vars(&vars, predictors, seen_pred);
-            for v in &vars {
-                if seen_term.insert(v.clone()) {
-                    terms.push(Term::Main { name: v.clone() });
-                }
-            }
-            for r in 2..=vars.len() {
-                for combo in combinations(&vars, r) {
-                    if seen_term.insert(interaction_key(&combo)) {
-                        terms.push(Term::Interaction { vars: combo });
-                    }
-                }
-            }
-        } else if term.contains(':') {
-            let vars = distinct(parse_identifier_list(term, &[':'])?);
-            register_vars(&vars, predictors, seen_pred);
-            if let [name] = &vars[..] {
-                if seen_term.insert(name.clone()) {
-                    terms.push(Term::Main { name: name.clone() });
-                }
-            } else if seen_term.insert(interaction_key(&vars)) {
-                terms.push(Term::Interaction { vars });
-            }
-        } else {
-            let name = parse_single_identifier(term)?;
-            if seen_pred.insert(name.clone()) {
-                predictors.push(name.clone());
-            }
-            if seen_term.insert(name.clone()) {
-                terms.push(Term::Main { name });
-            }
-        }
-    }
-    Ok(())
 }
 
 /// `s` split on the `+` signs outside any parentheses. A stray `)` does not
@@ -928,37 +856,6 @@ fn is_name_char(c: char) -> bool {
 // Change together with `ident_start!`.
 fn is_name_start(c: char) -> bool {
     c == '_' || c.is_ascii_alphabetic() || (!c.is_ascii() && is_name_char(c) && !c.is_numeric())
-}
-
-/// Whether `s` has a grouping `(`: one not directly after a name, where it
-/// would open a call (`log(x)`, `I(x^2)`).
-fn has_group(s: &str) -> bool {
-    let mut prev = None;
-    s.chars().any(|c| {
-        let group = c == '(' && !prev.is_some_and(is_name_char);
-        prev = Some(c);
-        group
-    })
-}
-
-/// Whether `s` has a `^` outside every call's parentheses, where it crosses
-/// terms; inside a call it belongs to the call (`I(x^2)`).
-fn has_power(s: &str) -> bool {
-    // Per open `(`: whether it opens a call.
-    let mut open: Vec<bool> = Vec::new();
-    let mut prev = None;
-    for c in s.chars() {
-        match c {
-            '(' => open.push(prev.is_some_and(is_name_char)),
-            ')' => {
-                open.pop();
-            }
-            '^' if !open.contains(&true) => return true,
-            _ => {}
-        }
-        prev = Some(c);
-    }
-    false
 }
 
 /// Refuses a `1`, `0` or `-1` term directly inside a group. R's term algebra
@@ -1017,14 +914,16 @@ fn too_many_terms(piece: &str) -> ParseError {
 /// per level, and a stack overflow would end the process past any error.
 const MAX_DEPTH: usize = 200;
 
-/// A piece with grouping parentheses or a `^`, desugared by R's term algebra
-/// (`EncodeVars` in R's `model.c`): `+` joins two term lists, `l:r` is every
-/// term of `l` with every term of `r`, `l*r` is `l + r + l:r`, and `l^k` is
-/// every interaction of `l`'s terms up to order `k`, each step dropping a
-/// term already listed. `^` binds tighter than `:`, `:` tighter than `*`, and
-/// `*` tighter than `+`, as in R. Returns the variables in written order, which
-/// is how R numbers them, and the terms stably sorted by degree, so that
-/// `(a*b*c)` gives the terms of `a*b*c` in the order its `*` lists them.
+/// One piece of the fixed part (see [`split_outside_parens`]), desugared by
+/// R's term algebra (`EncodeVars` in R's `model.c`): `+` joins two term
+/// lists, `l:r` is every term of `l` with every term of `r`, `l*r` is
+/// `l + r + l:r`, and `l^k` is every interaction of `l`'s terms up to order
+/// `k`, each step dropping a term already listed. `^` binds tighter than `:`,
+/// `:` tighter than `*`, and `*` tighter than `+`, as in R. Returns the
+/// variables in written order, which is how R numbers them, and the terms
+/// stably sorted by degree, R's order: `a*b*c*d` gives `a b c d`, then
+/// `a:b a:c b:c a:d b:d c:d`, and so on (`CrossTerms` appends each new
+/// variable's products after everything before it).
 fn expand_group(piece: &str) -> Result<(Vec<String>, Vec<TermVars>), ParseError> {
     let mut p = GroupParser {
         s: piece,
@@ -1073,11 +972,15 @@ impl GroupParser<'_> {
         while self.peek() == Some('+') {
             self.pos += 1;
             out.extend(self.product()?);
+            out = drop_repeats(out);
+            if out.len() > MAX_TERMS {
+                return Err(too_many_terms(self.s));
+            }
         }
         if self.peek() == Some('-') {
             return Err(ParseError::TermRemovalUnsupported);
         }
-        Ok(drop_repeats(out))
+        Ok(out)
     }
 
     fn product(&mut self) -> Result<Vec<TermVars>, ParseError> {
@@ -1089,6 +992,9 @@ impl GroupParser<'_> {
             out.extend(right);
             out.extend(both);
             out = drop_repeats(out);
+            if out.len() > MAX_TERMS {
+                return Err(too_many_terms(self.s));
+            }
         }
         Ok(out)
     }
@@ -1284,29 +1190,6 @@ pub(super) fn parse_transform(s: &str) -> Option<(Transform, &str)> {
     Some((Transform::Pow(k), m.get(1).unwrap().as_str()))
 }
 
-fn parse_identifier_list(s: &str, seps: &[char]) -> Result<Vec<String>, ParseError> {
-    let mut parts: Vec<&str> = vec![s];
-    for sep in seps {
-        parts = parts.into_iter().flat_map(|p| p.split(*sep)).collect();
-    }
-    // An empty piece (`:`, `x:`, `x**z`) is refused as R refuses it; skipping
-    // it would turn `y ~ :` into an interaction of no variables.
-    parts
-        .into_iter()
-        .map(str::trim)
-        .map(|p| {
-            if p.is_empty() {
-                Err(ParseError::Syntax {
-                    pos: 0,
-                    msg: format!("missing variable name in term '{s}'"),
-                })
-            } else {
-                parse_single_identifier(p)
-            }
-        })
-        .collect()
-}
-
 // The same class as `ident!`; change together.
 fn is_identifier(s: &str) -> bool {
     let mut chars = s.chars().peekable();
@@ -1329,37 +1212,4 @@ fn register_vars(
             predictors.push(v.clone());
         }
     }
-}
-
-/// The `r`-element combinations of `items`, in the order R's `*` lists them
-/// (`CrossTerms` in R's `model.c`): `a*b*c*d` is built as `((a*b)*c)*d`, each
-/// step appending the new variable's products after everything before it, so
-/// within one degree a combination sorts by its last element, then the one
-/// before it, and so on (`a:b a:c b:c a:d b:d c:d`). Up to three variables
-/// this is also the lexicographic order.
-fn combinations<T: Clone>(items: &[T], r: usize) -> Vec<Vec<T>> {
-    let n = items.len();
-    if r == 0 || r > n {
-        return vec![];
-    }
-    let mut idx: Vec<usize> = (0..r).collect();
-    let mut all: Vec<Vec<usize>> = Vec::new();
-    loop {
-        all.push(idx.clone());
-        let mut i = r;
-        while i > 0 && idx[i - 1] == n - r + (i - 1) {
-            i -= 1;
-        }
-        if i == 0 {
-            break;
-        }
-        idx[i - 1] += 1;
-        for j in i..r {
-            idx[j] = idx[j - 1] + 1;
-        }
-    }
-    all.sort_by(|a, b| a.iter().rev().cmp(b.iter().rev()));
-    all.into_iter()
-        .map(|c| c.iter().map(|&i| items[i].clone()).collect())
-        .collect()
 }

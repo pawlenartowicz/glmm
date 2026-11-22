@@ -121,6 +121,14 @@ fn an_exact_fit_has_nan_robust_ses() {
     assert!(fit.se.iter().all(|v| v.is_nan()), "{:?}", fit.se);
     assert!(fit.vcov.iter().all(|v| v.is_nan()));
     assert!(fit.coef_df.iter().all(|v| v.is_nan()));
+    assert!(
+        fit.diagnostics
+            .notes
+            .iter()
+            .any(|n| matches!(n, crate::Note::SeUnavailable)),
+        "{:?}",
+        fit.diagnostics.notes
+    );
 }
 
 /// CR2 on y·c for c far from 1: the SEs scale by c and the df do not move,
@@ -143,6 +151,14 @@ fn robust_ses_scale_with_y() {
         let fit = fit_at(c);
         if fit.robust.is_none() {
             assert!(fit.se.iter().all(|v| v.is_nan()), "{c}: {:?}", fit.se);
+            assert!(
+                fit.diagnostics
+                    .notes
+                    .iter()
+                    .any(|n| matches!(n, crate::Note::SeUnavailable)),
+                "{c}: {:?}",
+                fit.diagnostics.notes
+            );
             continue;
         }
         for j in 0..p {

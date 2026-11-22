@@ -121,8 +121,8 @@ fn fit_lmm_rank_deficient_drops_the_aliased_column() {
 // f64 and the R reference builder reproduces it bit for bit.
 // ---------------------------------------------------------------------------
 
-/// `s_{k+1} = (75·s_k + 74) mod 65537`, value `s/65537 − 0.5`. Local to the Gap A
-/// designs (the shared `lcg` helper is a different, 64-bit generator).
+/// `s_{k+1} = (75·s_k + 74) mod 65537`, value `s/65537 − 0.5`. Local to the two
+/// ill-conditioned designs below (the shared `lcg` helper is a different, 64-bit generator).
 fn gap_a_stream(k: usize) -> Vec<f64> {
     let mut s = 1u64;
     (0..k)
@@ -146,13 +146,13 @@ fn intercept_only_lmm() -> ModelSpec {
 /// at 1.6e-10 while X'X's own ratio (1.5e-8) is four orders clear of even the
 /// OLS guard.
 ///
-/// This is the control that condemned the old statistic. Every per-column pivot
+/// This is the control for the min/max L-diagonal statistic. Every per-column pivot
 /// ratio here is O(1) — the columns are mutually
 /// distinguishable to full precision — yet the min/max L-diagonal ratio sits at
-/// 1.6e-10 purely because one column is 8 orders smaller than another. The old
-/// guard therefore threw the whole fit away over a choice of units: rescaling
-/// `u` alone moved its statistic by six decades while β̂ did not move by one part
-/// in 1e10 (measured 2026-07-31 across `c` = 1e-4 … 1e-10).
+/// 1.6e-10 purely because one column is 8 orders smaller than another. A guard
+/// on that ratio would throw the whole fit away over a choice of units:
+/// rescaling `u` alone moves it six decades while β̂ does not move by one part
+/// in 1e10 (across `c` = 1e-4 … 1e-10).
 ///
 /// So the fit must converge with all three columns, and `u`'s coefficient must
 /// carry an enormous standard error — that SE is the correct report on a column
@@ -170,8 +170,8 @@ fn intercept_only_lmm() -> ModelSpec {
 /// golden is possible because the fit returns all three columns rather than
 /// NaN-filling one: a NaN-filled column would leave nothing for a reference to
 /// agree with. The two engines land within 6e-11 on β
-/// and 1.1e-7 on the SEs — this design is ill-conditioned in the old statistic's
-/// eyes only, and both engines say so.
+/// and 1.1e-7 on the SEs — this design is ill-conditioned only by the min/max
+/// L-diagonal statistic, and both engines say so.
 #[test]
 fn lmm_pure_dynamic_range_design_fits_in_full() {
     let (jn, m, c, s_scale, tau, sigma) = (25usize, 40usize, 3e-7f64, 20.0f64, 16.0f64, 1.0f64);
@@ -251,9 +251,9 @@ fn lmm_pure_dynamic_range_design_fits_in_full() {
     );
     assert!(f.df > 0, "a converged fit reports its parameter count");
 
-    // The flag itself. This design is the control that condemned the old
-    // statistic, so the verdict under the NEW one must be "not flagged": no
-    // note on the stable surface.
+    // The flag itself. This design is the min/max-ratio control, so the pivot
+    // statistic's verdict must be "not flagged": no note on the stable
+    // surface.
     assert!(
         f.diagnostics.notes.is_empty(),
         "no column is entangled here, so no note may be raised: {:?}",
@@ -331,9 +331,8 @@ fn build_gap_a_salvage_design(
 ///   * alias gate must NOT trip — `v`'s X'X pivot ratio 8.98e-12 vs 1e-14: 898×
 ///   * the design is not even flagged — `v`'s pivot ratio in X'V⁻¹X is 8.76e-12,
 ///     8.76× above `lmm::PIVOT_MIN`
-///   * the old min/max L-diag statistic sat at 2.96e-11, 338× INSIDE the old
-///     `EPS_RANK`, and threw the fit away — the whole gap between the two
-///     verdicts on one design
+///   * the min/max L-diag statistic sits at 2.96e-11 and would throw the fit
+///     away — the whole gap between the two verdicts on one design
 ///
 /// `t` and `v` are not separately identified to any useful precision, and the
 /// fit says so: each gets a coefficient near ±3.8e7 with a standard error of the
@@ -480,7 +479,9 @@ fn lmm_entangled_pair_fits_in_full_with_honest_ses() {
         f.diagnostics.notes
     );
     let mut ws = build_workspace(&intercept_only_lmm(), &ids, n, p, &opts);
-    let d = fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts).diagnostics();
+    let d = fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts)
+        .unwrap()
+        .diagnostics();
     assert!(!d.ill_conditioned, "pivot {} must clear the floor", d.pivot);
     // A 2× band, not a pin. This pivot is a cancelled quantity and the doc's
     // own margins are stated at 100×, so banding it tighter would buy a flaky
@@ -499,7 +500,7 @@ fn lmm_entangled_pair_fits_in_full_with_honest_ses() {
     //
     // Two alternating sign patterns, not the calibration's worst-of-16
     // pseudorandom ones: alternating signs cancel heavily in the accumulation,
-    // so this is a weaker probe than the 2026-07-31 measurement and must not be
+    // so this is a weaker probe than that calibration sweep and must not be
     // read as reproducing its `betaRel`. It is a tripwire against a guard placed
     // low enough to accept arithmetic noise, where the movement would be O(1).
     for flip in [false, true] {
@@ -737,7 +738,7 @@ fn exact_alias_is_dropped_and_the_entangled_pair_is_kept() {
 /// perturbed θ must land on the cold optimum — β, SE, and the varcorr
 /// stddevs — and warm must never degrade convergence status. Extends
 /// `fit_warm_start_reaches_cold_beta` (β-only, hand-built n_theta=1) to a
-/// realistic q≥2 rung; MCPower's hot loop rides this contract.
+/// realistic q≥2 rung. The loop tier's warm starts rely on this contract.
 #[test]
 fn fit_warm_sleepstudy_slope_matches_cold_optimum() {
     // Parsing mirrors `fit_sleepstudy_slope_varcorr_matches_lme4`.
@@ -908,8 +909,8 @@ fn fit_sleepstudy_slope_varcorr_matches_lme4() {
     // BOBYQA's rho_end floor — θ10 is small relative to θ00/θ11, so it lands
     // with less relative precision than either variance. Measured against this
     // reference: D10 1.8e-5 relative, against 4.7e-7 on the Days stddev, so the
-    // effect is real but worth about a factor of 40 — not the factor of 1e5 the
-    // previous absolute-scale band (0.20·sd0·sd1) encoded. 1e-3 relative is the
+    // effect is real but worth about a factor of 40 — not the factor of 1e5 an
+    // absolute-scale band (0.20·sd0·sd1) would encode. 1e-3 relative is the
     // cross-engine varcomp band this file's other glmm↔lme4 claims use.
     // The weighted analog (`fit_lmm_weighted_matches_lme4`) hits the same floor
     // on the same coordinate and states the band the same way — change together.
@@ -1122,8 +1123,7 @@ fn fit_lmm_weighted_matches_lme4() {
 /// tell those from a wrong-power bug, and a constant weight is rescaled away
 /// before the kernel runs (`accumulate_lmm_rows` divides by
 /// `family::weight_scale`), so the weights vary by row. The dense side is
-/// forced through `fit_mle_noz_pub`, as in
-/// `fit_lmm_crossed_slope_extra_varying_weights_noz_matches_sparse`.
+/// forced through `fit_mle_noz_pub`.
 #[test]
 fn fit_lmm_scalar_crossed_varying_weights_noz_matches_sparse() {
     let csv = include_str!("../../../validation/data/simulated/sim_slope.csv");
@@ -1423,17 +1423,13 @@ fn ml_deviance_at_ml_theta_is_below_ml_deviance_at_reml_theta() {
 
 /// Varying prior weights on a design where the EXTRA (crossed) grouping
 /// itself carries a random slope: `y ~ 1 + x1 + (1+x1 | primary) + (1+x1 |
-/// extra)`. `extra_slopes_any` is true, so the dense kernel's `zx` fill takes
-/// the family-blocked path (`kernel.rs`'s "Blocked crossed/nested-slopes
-/// path"), not the scalar `zx`/`zx_slope` branch the other crossed weighted
-/// tests exercise. A per-row weight applied to the wrong factor in that fill
-/// would move the dense fit off the sparse kernel's answer; a constant weight
-/// cannot show that, since w≡c only rescales θ̂ uniformly. `classify_design`
-/// always routes `extra_slopes_any` to Sparse, so the dense side is forced
-/// through `fit_mle_noz_pub`, the same forced-NoZ entry the grid cross-checks
-/// in `src/sparse/tests.rs` use.
+/// extra)`, which only the sparse kernel fits. Its weighted deviance matches
+/// the brute-force deviance on the explicit `V = diag(1/wᵢ) + Σ_g Z_g D_g Z_gᵀ`
+/// at three θ. A per-row weight applied to the wrong factor would move it; a
+/// constant weight cannot show that. The weighted sparse fit on this shape is
+/// pinned to lme4 by `fit_sparse_lmm_weighted_matches_lme4`.
 #[test]
-fn fit_lmm_crossed_slope_extra_varying_weights_noz_matches_sparse() {
+fn crossed_slope_extra_varying_weights_sparse_deviance_matches_brute_force() {
     let cluster = ModelSpec {
         family: Family::Gaussian,
         re: Some(ReStructure {
@@ -1453,7 +1449,7 @@ fn fit_lmm_crossed_slope_extra_varying_weights_noz_matches_sparse() {
     let u0e: Vec<f64> = (0..4).map(|_| 0.4 * lcg(&mut st)).collect();
     let u1e: Vec<f64> = (0..4).map(|_| 0.3 * lcg(&mut st)).collect();
     let p = 2;
-    let mut x = vec![0.0f64; n * p];
+    let mut x = Mat::<f64>::zeros(n, p);
     let mut y = vec![0.0f64; n];
     let mut pid = vec![0u32; n];
     let mut eid = vec![0u32; n];
@@ -1465,8 +1461,8 @@ fn fit_lmm_crossed_slope_extra_varying_weights_noz_matches_sparse() {
         pid[i] = par as u32;
         eid[i] = item as u32;
         let x1 = lcg(&mut st);
-        x[i * p] = 1.0;
-        x[i * p + 1] = x1;
+        x[(i, 0)] = 1.0;
+        x[(i, 1)] = x1;
         y[i] = 0.5
             + 0.4 * x1
             + u0p[par]
@@ -1474,82 +1470,63 @@ fn fit_lmm_crossed_slope_extra_varying_weights_noz_matches_sparse() {
             + u0e[item]
             + u1e[item] * x1
             + 0.8 * lcg(&mut st);
-        // Varies by row — a weight folded into the wrong RE column shows up
-        // as a β/varcorr mismatch here, where a constant factor would only
-        // rescale both routes alike.
+        // Varies by row: a weight folded into the wrong RE column moves the
+        // sparse deviance off the brute-force one, which a constant weight
+        // need not show.
         w[i] = 1.0 + (i % 3) as f64;
     }
     let ids = GroupIds {
         primary: pid,
         extra: vec![eid],
     };
-    let opts = FitOptions {
-        se_for: SeFor::Only(vec![0, 1]),
-        ..FitOptions::default()
-    };
     let (sized, ids, _) = spec_sized_from_ids(&cluster, &ids, true);
-    let noz = fit_mle_noz_pub(
-        &x,
-        &y,
-        Some(&w),
-        None,
-        n,
-        p,
-        &sized,
+    let g = crate::lmm::LmmGroupings::from_cluster_spec_ext(&sized, &[1], &[vec![1]]);
+    assert!(g.extra_slopes_any);
+    let sqrt_w: Vec<f64> = w.iter().map(|v| v.sqrt()).collect();
+    let mut ws = crate::sparse::SparseLmmWorkspace::new(
+        &g,
+        x.as_ref(),
+        x.as_ref().subcols(0, 0),
         &ids.primary,
         &ids.extra,
-        None,
-        &opts,
-    );
-    let sp = fit_mle_sparse_pub(
-        &x,
         &y,
-        Some(&w),
-        None,
         n,
         p,
-        &sized,
-        &ids.primary,
-        &ids.extra,
-        None,
-        &opts,
-    );
-    assert!(
-        noz.converged() && sp.converged(),
-        "both routes must converge"
-    );
-    // Two independent BOBYQA solves, not a shared trajectory — bounded by the
-    // solver's own rho_end floor, same order as the unweighted grid
-    // cross-check in `src/sparse/tests.rs` (`run_grid_agreement`'s 1e-4).
-    let rel = |a: f64, b: f64| (a - b).abs() / (1.0 + b.abs());
-    for j in 0..p {
+        Some(&sqrt_w),
+        crate::lmm::Criterion::Reml,
+    )
+    .unwrap();
+    let sum_ln_w: f64 = w.iter().map(|v| v.ln()).sum();
+    // θ = [primary vech (λ₀₀,λ₁₀,λ₁₁) ; crossed vech (λ₀₀,λ₁₀,λ₁₁)].
+    let thetas = [
+        [1.0, 0.0, 1.0, 1.0, 0.0, 1.0],
+        [0.7, 0.2, 0.5, 0.6, 0.1, 0.4],
+        [1.3, -0.3, 0.6, 0.9, -0.2, 0.5],
+    ];
+    for th in &thetas {
+        let dev = crate::sparse::sparse_reml_deviance(th, &mut ws);
+        let brute = crate::test_support::brute_force_deviance(
+            &x,
+            &y,
+            Some(&w),
+            &[
+                (&ids.primary, &[1], &th[..3]),
+                (&ids.extra[0], &[1], &th[3..]),
+            ],
+            crate::lmm::Criterion::Reml,
+        ) + sum_ln_w;
+        assert!(dev.is_finite(), "θ={th:?}");
         assert!(
-            rel(sp.beta[j], noz.beta[j]) < 1e-4,
-            "β[{j}] sparse={} noz={}",
-            sp.beta[j],
-            noz.beta[j]
+            (dev - brute).abs() <= 1e-7 * brute.abs().max(1.0),
+            "θ={th:?}: sparse {dev} vs brute force {brute}"
         );
-        assert!(
-            rel(sp.se[j], noz.se[j]) < 1e-4,
-            "se[{j}] sparse={} noz={}",
-            sp.se[j],
-            noz.se[j]
-        );
-    }
-    assert_eq!(sp.varcorr.len(), noz.varcorr.len(), "varcorr block count");
-    for (bi, (sb, nb)) in sp.varcorr.iter().zip(noz.varcorr.iter()).enumerate() {
-        assert_eq!(sb.len(), nb.len(), "varcorr[{bi}] len");
-        for (ei, (a, b)) in sb.iter().zip(nb.iter()).enumerate() {
-            assert!(rel(*a, *b) < 1e-4, "varcorr[{bi}][{ei}] sparse={a} noz={b}");
-        }
     }
 }
 
 /// Weight-SCALE invariance: varying base weights
 /// `w`, rescaled by `c ∈ {2^20, 2^-20, 1e8, 1e-8}`, must reproduce the `c = 1`
 /// fit's β, SE and τ² (both routes forced via `fit_mle_noz_pub`/
-/// `fit_mle_sparse_pub`, the same forced entries the crossed-slope test above
-/// uses), move `dispersion` by exactly `c` (up to solver noise), and leave
+/// `fit_mle_sparse_pub`), move `dispersion` by exactly `c` (up to solver noise), and leave
 /// `loglik` unchanged. BOBYQA searches `ŵ = w/family::weight_scale(w)`, not
 /// raw `w`: searching raw `w` would move the internal θ at `c = 2^20`/`2^-20`
 /// far enough to hit `THETA_HI`/`PIN_THETA` (`lmm::mod::THETA_HI`,
@@ -1809,22 +1786,9 @@ fn fit_lmm_weighted_boundary_matches_wls() {
 /// Values recorded from glmm. They are validated by `sim_slope_lmm`, whose
 /// cross-engine cell checks the same fit against lme4.
 ///
-/// Re-pinned 2026-08-23 with random-effect design column scaling: `x` has a
-/// column scale of 0.9688, so this fit carries a real scale factor and sits in
-/// the reassociation band the change allows (worst move here 1.3e-6 on the
-/// `g1` covariance, on a criterion that improved by 4.9e-8).
+/// `x` has a column scale of 0.9688, so this fit carries a real scale factor.
 #[test]
 fn fit_sim_slope_varcorr_is_pinned() {
-    // Re-pinned 2026-10-01: the design is standardized internally before the fit (x̃ = (x − m)/s, results mapped back).
-    // The REML criterion is unchanged to 1e-12 (27.615443411970); the θ search
-    // stops at another point of a flat direction: g1's covariance moved 1.6e-6
-    // relative, its variances 3.3e-7 and 1.4e-7, σ̂² 8.2e-8, g2 5.5e-8, the SEs
-    // 7.8e-8, β 5.7e-10.
-    // Re-pinned 2026-10-02 with the per-search BOBYQA start radii (LMM blind
-    // start 0.5): the search takes another path to the same optimum, worst move
-    // here 1.4e-6 on the g1 covariance (variances 5.8e-7 and 4.5e-7, σ̂² 1.9e-7,
-    // g2 1.6e-7, the SEs 1.5e-7, β 3.8e-9), REML criterion 1.1e-13 lower, no
-    // converged, singular or pinned flag changed.
     const REF_BETA: [f64; 2] = [1.0380272315443226, 0.8009679255408596];
     const REF_SE: [f64; 2] = [0.33893198001615327, 0.17067326068596858];
     // varcorr[0] = g1, packed lower triangle [v00, c01, v11]; varcorr[1] = g2.
@@ -2223,7 +2187,7 @@ fn lmm_warm_start_theta_is_a_fixed_point_of_the_forward_map() {
     };
     let mut ws = build_workspace(&model, &ids, n, p, &opts);
 
-    let cold_view = fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts);
+    let cold_view = fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts).unwrap();
     let cold_theta = cold_view.theta().to_vec();
     let cold_n_eval = cold_view.n_eval();
     let cold_fit = cold_view.into_fit(&Data::new(&x, &y, n, p), &model, &opts);
@@ -2237,7 +2201,7 @@ fn lmm_warm_start_theta_is_a_fixed_point_of_the_forward_map() {
         theta: cold_theta.clone(),
         dispersion: None,
     };
-    let warm_view = fit_on(&mut ws, &Data::new(&x, &y, n, p), Some(&start), &opts);
+    let warm_view = fit_on(&mut ws, &Data::new(&x, &y, n, p), Some(&start), &opts).unwrap();
     let warm_theta = warm_view.theta().to_vec();
     let warm_n_eval = warm_view.n_eval();
     let warm_fit = warm_view.into_fit(&Data::new(&x, &y, n, p), &model, &opts);
@@ -2471,8 +2435,7 @@ fn lmm_maxfun_cap_q2_reports_honest_endpoint_and_not_singular() {
         let mut c = Config::new(n_theta);
         c.npt = npt;
         // 41 evals short of the unlimited-budget optimum (191 evals on this
-        // fixture, probed 2026-10-07 once the single-row cluster above kept it
-        // on BOBYQA): the reported point already carries a negligible
+        // fixture, which the single-row cluster above keeps on BOBYQA): the reported point already carries a negligible
         // slope-to-intercept stddev ratio (2.5e-4) well before BOBYQA's own
         // Converged confirmation fires.
         c.max_fun = 150;
@@ -2608,7 +2571,8 @@ fn accumulate_lmm_rows_gram_route_matches_the_givens_route() {
             w.as_deref(),
             false,
             crate::lmm::Criterion::Reml,
-        );
+        )
+        .unwrap();
         let b = givens.suff_mut();
         b.reset();
         b.set_design_qr(x.as_ref(), w.as_deref());
@@ -2717,7 +2681,8 @@ fn accumulate_lmm_rows_weighted_reuse_allocates_nothing() {
             Some(&w),
             false,
             crate::lmm::Criterion::Reml,
-        );
+        )
+        .unwrap();
     };
     run(&mut ws);
     crate::test_support::settle_background_allocs();
@@ -2808,7 +2773,8 @@ fn accumulate_lmm_rows_sparse_reuse_matches_a_fresh_workspace() {
             w,
             false,
             crate::lmm::Criterion::Reml,
-        );
+        )
+        .unwrap();
         let mut fresh = sparse_accumulation_workspace(&ids, &extra);
         accumulate_lmm_rows(
             &mut fresh,
@@ -2822,7 +2788,8 @@ fn accumulate_lmm_rows_sparse_reuse_matches_a_fresh_workspace() {
             w,
             false,
             crate::lmm::Criterion::Reml,
-        );
+        )
+        .unwrap();
         let (a, b) = (ws.kernel.deviance(&theta), fresh.kernel.deviance(&theta));
         assert!(a.is_finite(), "shift={shift} seed={seed}: deviance {a}");
         assert_eq!(
@@ -2861,7 +2828,8 @@ fn accumulate_lmm_rows_sparse_weighted_reuse_allocates_nothing() {
             Some(&w),
             false,
             crate::lmm::Criterion::Reml,
-        );
+        )
+        .unwrap();
     };
     run(&mut ws);
     crate::test_support::settle_background_allocs();
@@ -2909,7 +2877,7 @@ fn curvature_hint_results_do_not_depend_on_call_order() {
     };
     let build = || build_workspace(&model, &ids, n, p, &opts);
     let mut pilot_ws = build();
-    let pilot = fit_on(&mut pilot_ws, &Data::new(&x, &y, n, p), None, &opts);
+    let pilot = fit_on(&mut pilot_ws, &Data::new(&x, &y, n, p), None, &opts).unwrap();
     assert!(pilot.diagnostics().converged);
     let hint = curvature_hint(&mut pilot_ws).expect("sleepstudy takes the gradient route");
     assert_eq!(hint.dim(), 3);
@@ -2917,42 +2885,29 @@ fn curvature_hint_results_do_not_depend_on_call_order() {
     let (y1, y2) = (shifted(&y, 0.3), shifted(&y, -0.2));
 
     let mut ab = build();
-    let a1 = fit_bits(&fit_on_hinted(
-        &mut ab,
-        &Data::new(&x, &y1, n, p),
-        None,
-        Some(&hint),
-        &opts,
-    ));
-    let a2 = fit_bits(&fit_on_hinted(
-        &mut ab,
-        &Data::new(&x, &y2, n, p),
-        None,
-        Some(&hint),
-        &opts,
-    ));
+    let a1 = fit_bits(
+        &fit_on_hinted(&mut ab, &Data::new(&x, &y1, n, p), None, Some(&hint), &opts).unwrap(),
+    );
+    let a2 = fit_bits(
+        &fit_on_hinted(&mut ab, &Data::new(&x, &y2, n, p), None, Some(&hint), &opts).unwrap(),
+    );
     let mut ba = build();
-    let b2 = fit_bits(&fit_on_hinted(
-        &mut ba,
-        &Data::new(&x, &y2, n, p),
-        None,
-        Some(&hint),
-        &opts,
-    ));
-    let b1 = fit_bits(&fit_on_hinted(
-        &mut ba,
-        &Data::new(&x, &y1, n, p),
-        None,
-        Some(&hint),
-        &opts,
-    ));
-    let f1 = fit_bits(&fit_on_hinted(
-        &mut build(),
-        &Data::new(&x, &y1, n, p),
-        None,
-        Some(&hint),
-        &opts,
-    ));
+    let b2 = fit_bits(
+        &fit_on_hinted(&mut ba, &Data::new(&x, &y2, n, p), None, Some(&hint), &opts).unwrap(),
+    );
+    let b1 = fit_bits(
+        &fit_on_hinted(&mut ba, &Data::new(&x, &y1, n, p), None, Some(&hint), &opts).unwrap(),
+    );
+    let f1 = fit_bits(
+        &fit_on_hinted(
+            &mut build(),
+            &Data::new(&x, &y1, n, p),
+            None,
+            Some(&hint),
+            &opts,
+        )
+        .unwrap(),
+    );
     assert_eq!(a1, b1);
     assert_eq!(a2, b2);
     assert_eq!(a1, f1);
@@ -2971,7 +2926,7 @@ fn curvature_hint_rebuilds_from_its_parts() {
     let (x, y, n, p, model, ids) = sleepstudy_slope_design();
     let opts = FitOptions::default();
     let mut ws = build_workspace(&model, &ids, n, p, &opts);
-    let _ = fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts);
+    let _ = fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts).unwrap();
     let hint = curvature_hint(&mut ws).expect("sleepstudy takes the gradient route");
     let rebuilt =
         crate::optim::CurvatureHint::from_parts(hint.dim(), hint.inv_hessian(), hint.units())
@@ -2994,13 +2949,14 @@ fn curvature_hint_reaches_the_unhinted_optimum() {
         ..FitOptions::default()
     };
     let mut ws = build_workspace(&model, &ids, n, p, &opts);
-    let _ = fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts);
+    let _ = fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts).unwrap();
     let hint = curvature_hint(&mut ws).unwrap();
     let y1 = shifted(&y, 0.3);
     let plain = fit_on(&mut ws, &Data::new(&x, &y1, n, p), None, &opts)
+        .unwrap()
         .into_fit(&Data::new(&x, &y1, n, p), &model, &opts)
         .deviance;
-    let v = fit_on_hinted(&mut ws, &Data::new(&x, &y1, n, p), None, Some(&hint), &opts);
+    let v = fit_on_hinted(&mut ws, &Data::new(&x, &y1, n, p), None, Some(&hint), &opts).unwrap();
     assert!(v.diagnostics().converged);
     let hinted = v
         .into_fit(&Data::new(&x, &y1, n, p), &model, &opts)
@@ -3022,7 +2978,7 @@ fn curvature_hint_of_another_dimension_is_rejected() {
         ..FitOptions::default()
     };
     let mut ws = build_workspace(&model, &ids, n, p, &opts);
-    let _ = fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts);
+    let _ = fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts).unwrap();
     let hint = curvature_hint(&mut ws).unwrap();
     // The same data as a random-intercept model: n_θ = 1.
     let intercept = ModelSpec {
@@ -3034,7 +2990,7 @@ fn curvature_hint_of_another_dimension_is_rejected() {
         }),
     };
     let mut ws1 = build_workspace(&intercept, &ids, n, p, &opts);
-    let _ = fit_on_hinted(&mut ws1, &Data::new(&x, &y, n, p), None, Some(&hint), &opts);
+    let _ = fit_on_hinted(&mut ws1, &Data::new(&x, &y, n, p), None, Some(&hint), &opts).unwrap();
 }
 
 /// No hint where the fit has no gradient: a random-intercept LMM searches
@@ -3056,7 +3012,7 @@ fn curvature_hint_is_none_off_the_gradient_route() {
         }),
     };
     let mut ws = build_workspace(&intercept, &ids, n, p, &opts);
-    let _ = fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts);
+    let _ = fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts).unwrap();
     assert!(curvature_hint(&mut ws).is_none());
 }
 
@@ -3102,11 +3058,9 @@ fn note_on_maxfun_endpoint() {
         config.max_fun = 5;
         lmm.solver = Bobyqa::new(1, config).expect("legal minimal config");
     }
-    let mut fit = fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts).into_fit(
-        &Data::new(&x, &y, n, p),
-        &model,
-        &opts,
-    );
+    let mut fit = fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts)
+        .unwrap()
+        .into_fit(&Data::new(&x, &y, n, p), &model, &opts);
     assert_eq!(fit.diagnostics.boundary, Boundary::NoOptimum);
     assert!(fit.deviance.is_finite());
     super::core::attach_satterthwaite(&mut ws, &mut fit, &opts);
@@ -3135,33 +3089,37 @@ fn note_on_maxfun_endpoint() {
     );
 }
 
-/// A direction of `H_p` the pseudo-inverse drops raises the note; a positive
-/// definite `H_p` at a converged endpoint raises none. `H_p` is read off an
-/// exact quadratic at steps of 1/2, so every difference is exact.
-#[test]
-fn note_on_dropped_direction() {
+/// The pass's state on the two-coordinate `H_p` `h`, read off an exact
+/// quadratic at steps of 1/2, so every difference is exact.
+fn quadratic_state(h: [[f64; 2]; 2]) -> crate::lmm::satterthwaite::SatterthwaiteState {
     use crate::lmm::satterthwaite::{assemble, Collected};
 
-    let state = |h: [[f64; 2]; 2]| {
-        let f = |a: f64, b: f64| 0.5 * (h[0][0] * a * a + 2.0 * h[0][1] * a * b + h[1][1] * b * b);
-        let s = 0.5;
-        assemble(&Collected {
-            free: vec![0, 1],
-            h: vec![s, s],
-            f0: 0.0,
-            f_axis: vec![[f(s, 0.0), f(-s, 0.0)], [f(0.0, s), f(0.0, -s)]],
-            f_mixed: vec![[f(s, s), f(-s, -s)]],
-            g_axis: None,
-            c0: Mat::identity(1, 1),
-            c_axis: vec![
-                [Mat::identity(1, 1), Mat::identity(1, 1)],
-                [Mat::identity(1, 1), Mat::identity(1, 1)],
-            ],
-            tau: 1.0,
-            nu: 10.0,
-        })
-    };
-    let singular = state([[1.0, 1.0], [1.0, 1.0]]);
+    let f = |a: f64, b: f64| 0.5 * (h[0][0] * a * a + 2.0 * h[0][1] * a * b + h[1][1] * b * b);
+    let s = 0.5;
+    assemble(&Collected {
+        free: vec![0, 1],
+        h: vec![s, s],
+        f0: 0.0,
+        f_axis: vec![[f(s, 0.0), f(-s, 0.0)], [f(0.0, s), f(0.0, -s)]],
+        f_mixed: vec![[f(s, s), f(-s, -s)]],
+        exact: false,
+        hess: Mat::zeros(0, 0),
+        jac: vec![],
+        c0: Mat::identity(1, 1),
+        c_axis: vec![
+            [Mat::identity(1, 1), Mat::identity(1, 1)],
+            [Mat::identity(1, 1), Mat::identity(1, 1)],
+        ],
+        tau: 1.0,
+        nu: 10.0,
+    })
+}
+
+/// A direction of `H_p` the pseudo-inverse drops raises the note; a positive
+/// definite `H_p` at a converged endpoint raises none.
+#[test]
+fn note_on_dropped_direction() {
+    let singular = quadratic_state([[1.0, 1.0], [1.0, 1.0]]);
     assert!(
         matches!(
             super::core::curvature_note(&singular, true),
@@ -3176,8 +3134,57 @@ fn note_on_dropped_direction() {
         singular.dropped,
         singular.negative
     );
-    let clean = state([[2.0, 1.0], [1.0, 2.0]]);
+    let clean = quadratic_state([[2.0, 1.0], [1.0, 2.0]]);
     assert!(super::core::curvature_note(&clean, true).is_none());
+}
+
+/// The pseudo-inverse cuts on `H_p` scaled to a unit diagonal. `H = [[4e10,
+/// 1e5], [1e5, 1]]` scales to `[[1, 0.5], [0.5, 1]]` (eigenvalues 0.5 and
+/// 1.5): the cut on `H` itself drops a direction (eigenvalue ratio 1.9e-11),
+/// the scaled cut drops none, `A_eff`'s θ block is `2·H⁻¹` and no note is
+/// raised. A zero diagonal entry is left unscaled: `diag(0, 1)` drops the
+/// zero direction, inverts the other and raises the note. A negative one is
+/// scaled by its magnitude and counted as negative.
+#[test]
+fn cut_on_the_unit_diagonal_hessian() {
+    use crate::inference::evd::psd_pseudo_inverse;
+
+    let h = [[4e10, 1e5], [1e5, 1.0]];
+    let unscaled = psd_pseudo_inverse(Mat::from_fn(2, 2, |i, j| h[i][j]).as_ref(), 1e-8).unwrap();
+    assert_eq!(unscaled.dropped, 1, "the unscaled cut at the pass's 1e-8");
+    let st = quadratic_state(h);
+    assert!(!st.is_failed());
+    assert_eq!((st.dropped, st.negative), (0, 0));
+    let h_inv = [[1.0, -1e5], [-1e5, 4e10]].map(|r| r.map(|v| v / 3e10));
+    for (i, row) in h_inv.iter().enumerate() {
+        for (j, &want) in row.iter().enumerate() {
+            let a = st.a_eff[(i, j)];
+            assert!(
+                (a - 2.0 * want).abs() <= 1e-12 * (2.0 * want).abs(),
+                "A_eff[{i},{j}] {a} against {}",
+                2.0 * want
+            );
+        }
+    }
+    assert!(super::core::curvature_note(&st, true).is_none());
+
+    let st = quadratic_state([[0.0, 0.0], [0.0, 1.0]]);
+    assert!(!st.is_failed());
+    assert_eq!((st.dropped, st.negative), (1, 0));
+    assert!(st.a_eff[(0, 0)].abs() <= 1e-15, "{}", st.a_eff[(0, 0)]);
+    assert!(
+        (st.a_eff[(1, 1)] - 2.0).abs() <= 1e-15,
+        "{}",
+        st.a_eff[(1, 1)]
+    );
+    assert!(super::core::curvature_note(&st, true).is_some());
+
+    // A negative diagonal entry is scaled by its magnitude, so the large
+    // coordinate's units do not turn the negative direction into a dropped one
+    // (the unscaled cut at 1e-8·4e10 would).
+    let st = quadratic_state([[-1.0, 0.0], [0.0, 4e10]]);
+    assert!(!st.is_failed());
+    assert_eq!((st.dropped, st.negative), (0, 1));
 }
 
 /// A non-finite deviance on the stencil (here forced through θ̂ itself) fails
@@ -3194,7 +3201,7 @@ fn failed_pass_gives_no_df_failed() {
         ..FitOptions::default()
     };
     let (mut fit, mut ws) =
-        fit_keep_workspace(&Data::new(&x, &y, n, p).ids(&ids), &model, None, &opts);
+        fit_keep_workspace(&Data::new(&x, &y, n, p).ids(&ids), &model, None, &opts).unwrap();
     assert!(fit.converged());
     ws.lmm_parts().expect("a Gaussian mixed workspace").0.theta[0] = f64::NAN;
     super::core::attach_satterthwaite(&mut ws, &mut fit, &opts);
@@ -3424,11 +3431,9 @@ fn design_summary_kept_inside_envelope() {
             config.max_fun = 5;
             lmm.solver = Bobyqa::new(1, config).expect("legal minimal config");
         }
-        let fit = fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts).into_fit(
-            &Data::new(&x, &y, n, p),
-            &model,
-            &opts,
-        );
+        let fit = fit_on(&mut ws, &Data::new(&x, &y, n, p), None, &opts)
+            .unwrap()
+            .into_fit(&Data::new(&x, &y, n, p), &model, &opts);
         assert!(!fit.converged());
         check_design_summary("max_fun", &fit, &x, p, &ids);
     }
@@ -3458,7 +3463,8 @@ fn design_summary_kept_inside_envelope() {
             None,
             false,
             crate::lmm::Criterion::Reml,
-        );
+        )
+        .unwrap();
         assert_eq!(ws.suff_mut().counts.len(), 9, "the kernel's capacity");
         let gids = GroupIds {
             primary: ids.clone(),
@@ -3655,7 +3661,7 @@ fn a_theta_without_a_finite_optimum_is_noted_and_an_interior_one_is_not() {
     let f = ports_mixed_fit(false);
     assert!(f.converged());
     assert!(!f.singular());
-    // Was UpperLimit, VarianceAtLimit, loglik 58.97; moved by the rescale retry (loglik 447.07).
+    // Without the rescale retry: UpperLimit, VarianceAtLimit, loglik 58.97; with it, loglik 447.07.
     assert_eq!(f.diagnostics.boundary, Boundary::Interior);
     assert!(
         f.diagnostics
@@ -3873,7 +3879,8 @@ impl QrCase {
             reml: Some(self.reml),
             ..FitOptions::default()
         };
-        let (fit, mut fws) = super::fit_keep_workspace(&self.data(), &self.model, None, &opts);
+        let (fit, mut fws) =
+            super::fit_keep_workspace(&self.data(), &self.model, None, &opts).unwrap();
         assert!(fit.converged(), "{}: the Gram fit converges", self.name);
         // A retried fit would end on the QR kernel or another scale, and the
         // tests would compare QR with QR.
@@ -4040,7 +4047,7 @@ fn qr_refill_at_a_new_weight_scale_keeps_the_caller_deviance() {
             Some(w) => w.iter().map(|v| v * c).collect(),
             None => vec![c; case.n],
         };
-        fws.lmm_accumulate(&data, Some(&w_hat));
+        fws.lmm_accumulate(&data, Some(&w_hat)).unwrap();
         let (ws, _, _) = fws.lmm_parts().unwrap();
         assert!(ws.kernel.qr_on(), "{}", case.name);
         let scaled: Vec<f64> = theta.iter().map(|t| t * 2f64.powi(-K)).collect();
@@ -4069,8 +4076,9 @@ fn a_rescaled_unweighted_fit_matches_unit_weights() {
     let (x, y, n, ids) = ports_mixed_data(false);
     let ones = vec![1.0; n];
     let data = Data::new(&x, &y, n, 2).ids(&ids);
-    let (plain, mut ws_plain) = super::fit_keep_workspace(&data, &model, None, &opts);
-    let (unit, mut ws_unit) = super::fit_keep_workspace(&data.weights(&ones), &model, None, &opts);
+    let (plain, mut ws_plain) = super::fit_keep_workspace(&data, &model, None, &opts).unwrap();
+    let (unit, mut ws_unit) =
+        super::fit_keep_workspace(&data.weights(&ones), &model, None, &opts).unwrap();
     for fws in [&mut ws_plain, &mut ws_unit] {
         assert_ne!(fws.lmm_parts().unwrap().0.rescale_exp, 0);
     }
@@ -4084,7 +4092,7 @@ fn a_rescaled_unweighted_fit_matches_unit_weights() {
     assert!(plain.design_summary.is_none());
     let (x, y, n, ids) = ports_mixed_data(true);
     let (pairs, _) =
-        super::fit_keep_workspace(&Data::new(&x, &y, n, 2).ids(&ids), &model, None, &opts);
+        super::fit_keep_workspace(&Data::new(&x, &y, n, 2).ids(&ids), &model, None, &opts).unwrap();
     assert!(pairs.design_summary.is_some());
 }
 
@@ -4284,7 +4292,8 @@ fn a_triggered_fit_on_slopes_and_nesting_matches_a_householder_reference() {
                 };
                 StartValues::new(vec![], theta)
             });
-            let (f, mut fws) = super::fit_keep_workspace(&data, &model, sv.as_ref(), &opts);
+            let (f, mut fws) =
+                super::fit_keep_workspace(&data, &model, sv.as_ref(), &opts).unwrap();
             assert!(f.converged(), "{name} {start:?}: {:?}", f.diagnostics.notes);
             let e = fws.lmm_endpoint_precision();
             let zl = if name == "sleepstudy" {
@@ -4323,29 +4332,20 @@ fn a_triggered_fit_on_slopes_and_nesting_matches_a_householder_reference() {
 /// rounding of its stored values) the intercept's θ̂ is on the box after the
 /// first round (k = 10), and the second round (k = 10 again) reaches the
 /// optimum that rounding leaves, inside the box, 6.63 lower in caller units
-/// natively and under WebAssembly with and without simd128 (measured
-/// 2026-11-16). Raising the pinned slope diagonal to `THETA_TRUTH_FLOOR` at a
-/// round's start would end the second round a few units above or below the
-/// first with the platform's round-off, and the fit's notes would change with it.
+/// natively and under WebAssembly with and without simd128. A start that
+/// raises the pinned slope diagonal to `THETA_TRUTH_FLOOR` would end the
+/// second round a few units above or below the first with platform round-off.
 /// The test refits at the first round's scale by hand, warm from θ̂·2^10
 /// (past the box, so on it), and checks that the fit ended lower than that
 /// by more than both rounding estimates.
 #[test]
 fn a_rescale_round_starts_at_the_last_endpoint() {
     let n = 40;
-    let (mut x, mut y, mut g) = (Vec::new(), Vec::new(), Vec::new());
-    for gi in 0..5u32 {
-        for j in 0..8 {
-            let z = 1.0e4 + (j as f64 - 3.5);
-            x.extend_from_slice(&[1.0, z]);
-            y.push(1.0 + 0.1 * z / 1.0e4 + 0.05 * gi as f64);
-            g.push(gi);
-        }
-    }
-    let ids = GroupIds::new(g);
+    let (x, y, ids) = parity_fixture();
     let model = ModelSpec::mixed(Family::Gaussian, ReStructure::intercept().slopes([1]));
     let data = Data::new(&x, &y, n, 2).ids(&ids);
-    let (fit, mut fws) = super::fit_keep_workspace(&data, &model, None, &FitOptions::default());
+    let (fit, mut fws) =
+        super::fit_keep_workspace(&data, &model, None, &FitOptions::default()).unwrap();
     assert!(fit.converged() && fit.singular());
     assert!(
         !fit.diagnostics
@@ -4365,7 +4365,7 @@ fn a_rescale_round_starts_at_the_last_endpoint() {
     let w_back = vec![4f64.powi(-10) / s; n];
 
     // The first round's scale: s·4^10, warm from θ̂·2^10.
-    fws.lmm_accumulate(&data, Some(&w_back));
+    fws.lmm_accumulate(&data, Some(&w_back)).unwrap();
     let (ws, map, _) = fws.lmm_parts().unwrap();
     let warm: Vec<f64> = theta.iter().map(|t| t * 2f64.powi(10)).collect();
     let back = crate::lmm::fit_lmm_unhinted(ws, &[], Some(&warm), map);
@@ -4375,4 +4375,89 @@ fn a_rescale_round_starts_at_the_last_endpoint() {
         kept < at_back - (e + e_back),
         "kept {kept} against {at_back} at the first round's scale (E {e:e}, {e_back:e})"
     );
+}
+
+/// The ports' PARITY fixture: `(x, y, ids)` of `y ~ z + (1 + z | g)`, 40 rows
+/// in 5 groups, z near 1e4 and y linear in z and g.
+fn parity_fixture() -> (Vec<f64>, Vec<f64>, GroupIds) {
+    let (mut x, mut y, mut g) = (Vec::new(), Vec::new(), Vec::new());
+    for gi in 0..5u32 {
+        for j in 0..8 {
+            let z = 1.0e4 + (j as f64 - 3.5);
+            x.extend_from_slice(&[1.0, z]);
+            y.push(1.0 + 0.1 * z / 1.0e4 + 0.05 * gi as f64);
+            g.push(gi);
+        }
+    }
+    (x, y, GroupIds::new(g))
+}
+
+/// The Satterthwaite df of a fit that ended on a rescale retry equal those of
+/// the same pass at the plain scale: at θ̂·2^k on the rows re-accumulated at
+/// ŵ·4^−k, where the kernel holds no rescale. The reference is another scale
+/// of the same data, which the pass does not share; the two deviances round
+/// differently, so the band is the dense one of
+/// `slope_rescale_keeps_df_and_all_pinned_gives_nu`. Fixtures: the ports'
+/// PARITY fit (k = 20, on the QR kernel) and the δ = −2 fit of
+/// `negative_powers_reach_the_reference_from_every_start` (k < 0, on the
+/// Gram kernel). Both take the exact pass, whose derivatives scale exactly
+/// with a power-of-two rescale: measured 2026-11-21, bit-identical on both.
+#[test]
+fn rescaled_fit_df_match_the_pass_at_the_plain_scale() {
+    use crate::lmm::satterthwaite::{pass, pass_at};
+
+    let (x, y, ids) = parity_fixture();
+    let set = super::delta_tests::dataset(13, 150, 10, 1.0, 1e16, 1.5);
+    let w = working_weights(&set.w, -2.0);
+    let reml = FitOptions {
+        reml: Some(true),
+        ..FitOptions::default()
+    };
+    // The kept exponent is round-off (the δ = −2 fit keeps −18 on aarch64 and
+    // −21 on x86_64), so only its sign is asserted: one fit per side.
+    for (name, data, model, opts, positive) in [
+        (
+            "PARITY",
+            Data::new(&x, &y, 40, 2).ids(&ids),
+            ModelSpec::mixed(Family::Gaussian, ReStructure::intercept().slopes([1])),
+            FitOptions::default(),
+            true,
+        ),
+        (
+            "δ = −2",
+            Data::new(&set.x, &set.y, set.n, 2)
+                .ids(&set.ids)
+                .weights(&w),
+            ModelSpec::mixed(Family::Gaussian, ReStructure::intercept()),
+            reml,
+            false,
+        ),
+    ] {
+        let n = data.design.n;
+        let (fit, mut fws) = super::fit_keep_workspace(&data, &model, None, &opts).unwrap();
+        assert!(fit.converged(), "{name}");
+        let (ws, map, units) = fws.lmm_parts().unwrap();
+        let k = ws.rescale_exp;
+        assert!(
+            k != 0 && (k > 0) == positive,
+            "{name}: the kept rescale {k}"
+        );
+        let kernel = pass(ws, map, units).coef_df();
+        let theta: Vec<f64> = ws.theta.iter().map(|t| t * 2f64.powi(k)).collect();
+        let w_plain: Vec<f64> = units
+            .weights(data.design.weights)
+            .map_or_else(|| vec![1.0; n], |w| w[..n].to_vec())
+            .iter()
+            .map(|w| w * 4f64.powi(-k))
+            .collect();
+        fws.lmm_accumulate(&data, Some(&w_plain)).unwrap();
+        let (ws, map, units) = fws.lmm_parts().unwrap();
+        let plain = pass_at(ws, &theta, map, units).coef_df();
+        for (i, (&a, &b)) in kernel.iter().zip(&plain).enumerate() {
+            assert!(
+                (a - b).abs() <= 1e-6 * b.abs(),
+                "{name}: df[{i}] {a} at the kernel scale, {b} at the plain scale"
+            );
+        }
+    }
 }

@@ -25,7 +25,7 @@ use super::common::{
 use super::common::{as_given_design, start_to_design, warm_theta};
 #[cfg(test)]
 use super::SizedSpec;
-use super::{DesignSummary, Fit, FitOptions, SeType};
+use super::{DesignSummary, Fit, FitError, FitOptions, SeType};
 
 // ---------------------------------------------------------------------------
 // LMM dispatch (Estimator::Mle)
@@ -42,7 +42,9 @@ use super::{DesignSummary, Fit, FitOptions, SeType};
 /// the `n × s` random-effect-only columns, standardized like `x_mat`.
 /// `weights` are the ones the fit runs on, `ŵ = w/s` (`Units::weights`): the
 /// θ-search runs on them, which keeps θ's internal box (`PIN_THETA`/
-/// `THETA_HI`) meaningful whatever the raw scale of `w`.
+/// `THETA_HI`) meaningful whatever the raw scale of `w`. Errs only when the
+/// sparse kernel is built and its pattern is too large to factor
+/// ([`crate::sparse::pattern_too_large`]).
 #[allow(clippy::too_many_arguments)] // marshals the kernel's (x_mat, y, n, p, ids…) surface
 pub(super) fn accumulate_lmm_rows(
     ws: &mut LmmWorkspace,
@@ -56,7 +58,7 @@ pub(super) fn accumulate_lmm_rows(
     weights: Option<&[f64]>,
     same_design: bool,
     criterion: Criterion,
-) {
+) -> Result<(), FitError> {
     let w_for_rows = weights.map(|w| &w[..n]);
 
     // The kernel carries the criterion the workspace froze: set at build on the
@@ -132,11 +134,12 @@ pub(super) fn accumulate_lmm_rows(
                         p,
                         sqrt_w,
                         criterion,
-                    )));
+                    )?));
                 }
             }
         }
     }
+    Ok(())
 }
 
 /// Borrowed result of [`lmm_view`]: the [`LmmFit`] summary plus the workspace
@@ -243,6 +246,12 @@ impl LmmResultView<'_> {
             n_grad: self.fit.grad_report.map_or(0, |r| r.1 as u32),
             outer_stop: self.fit.grad_report.map(|r| r.0.into()),
             outer_decrement: self.fit.grad_report.map_or(f64::NAN, |r| r.2),
+            // `lmm_view_to_fit` notes it on the same condition.
+            theta_at_limit: self.fit.deviance.is_finite()
+                && super::common::theta_at_limit(self.theta, 1.0),
+            nb_shape_at_limit: false,
+            dispersion_at_limit: false,
+            stop: self.fit.stop,
         }
     }
     /// Joint Wald-χ² over the target set (the omnibus significance read).
@@ -370,8 +379,8 @@ const MAX_RESCALES: usize = 4;
 /// 2. QR switch: on a finite endpoint whose deviance is known only to worse
 ///    than `DEVIANCE_FLOOR_MAX` (`precision_limited`), on a shape the QR kernel
 ///    covers, build the QR kernel from the rows and search again warm from
-///    θ̂. Accepted as it ends: the Gram deviance it would be compared with is
-///    not known to that precision.
+///    exactly θ̂, with no `THETA_TRUTH_FLOOR`. Accepted as it ends: the Gram
+///    deviance it would be compared with is not known to that precision.
 /// 3. Rescale: while a diagonal θ̂ is on the box or a pin was undone
 ///    ([`rescale_trigger`], `t`), at most [`MAX_RESCALES`] times, move `s` to
 ///    `s·4^−k`, `k = round(log₂ t)`, so ŵ becomes `ŵ·4^k` and θ̂ `θ̂·2^−k`
@@ -407,7 +416,7 @@ pub(super) fn lmm_fit_with_retries(
     theta_start: Option<&[f64]>,
     hint: Option<&crate::optim::CurvatureHint>,
     map: &ColumnScaling,
-) -> LmmFit {
+) -> Result<LmmFit, FitError> {
     let accumulate = |ws: &mut LmmWorkspace, units: &Units, same: bool| {
         accumulate_lmm_rows(
             ws,
@@ -421,7 +430,7 @@ pub(super) fn lmm_fit_with_retries(
             units.weights(weights),
             same,
             criterion,
-        );
+        )
     };
     // The criterion in caller units, up to the constant −Σ ln w.
     let caller_dev = |fit: &LmmFit, units: &Units| fit.deviance + n as f64 * units.s().ln();
@@ -453,13 +462,13 @@ pub(super) fn lmm_fit_with_retries(
                 units.weights(weights),
             );
             ws.theta_warm.copy_from_slice(&ws.theta);
-            *fit = search_warm(ws, units, spent, false);
+            *fit = search_warm(ws, units, spent, true);
         }
     };
 
     ws.kernel.stop_qr();
     ws.rescale_exp = 0;
-    accumulate(ws, units, same_design);
+    accumulate(ws, units, same_design)?;
     let mut fit = fit_lmm(ws, targets, theta_start, false, hint, map, units);
     let mut spent = fit.n_eval;
     qr_switch(ws, units, &mut fit, &mut spent);
@@ -485,7 +494,7 @@ pub(super) fn lmm_fit_with_retries(
         ws.theta_prev.copy_from_slice(&ws.theta);
         units.set_weight_scale(weights, n, prev_s * 4f64.powi(-k));
         ws.rescale_exp += k;
-        accumulate(ws, units, false);
+        accumulate(ws, units, false)?;
         let theta_step = 2f64.powi(-k);
         for (w, &t) in ws.theta_warm.iter_mut().zip(&ws.theta) {
             *w = t * theta_step;
@@ -498,7 +507,7 @@ pub(super) fn lmm_fit_with_retries(
         if !no_worse {
             units.set_weight_scale(weights, n, prev_s);
             ws.rescale_exp = prev_exp;
-            accumulate(ws, units, false);
+            accumulate(ws, units, false)?;
             std::mem::swap(&mut ws.theta_warm, &mut ws.theta_prev);
             fit = search_warm(ws, units, &mut spent, true);
             break;
@@ -506,7 +515,7 @@ pub(super) fn lmm_fit_with_retries(
         qr_switch(ws, units, &mut fit, &mut spent);
     }
     fit.n_eval = spent;
-    fit
+    Ok(fit)
 }
 
 /// The design summary of [`Fit::design_summary`], copied out of the dense
@@ -565,16 +574,13 @@ pub(crate) fn lmm_view_to_fit(
     let mut se = vec![f64::NAN; p];
     fill_se_by_predictor(view.var_diag, &opts.se_for.columns(p), &mut se);
 
-    // tau2[k] = theta[k]^2 * sigma_sq — the k-th variance component in original scale.
-    // θ̂ holds the fitted Cholesky parameters; diagonal entries satisfy
-    // theta[k] = sqrt(tau_k / sigma_sq), so theta[k]^2 * sigma_sq = tau_k.
-    // Gated on the finite endpoint (`deviance`), not `converged` — the plateau
-    // policy: a `MaxFunReached` cap-out reports an honest θ̂ (its finite
-    // endpoint) with `converged == false` rather than NaN-filling.
+    // `tau2` is gated on the finite endpoint (`deviance`), not `converged` —
+    // the plateau policy: a `MaxFunReached` cap-out reports an honest θ̂ (its
+    // finite endpoint) with `converged == false` rather than NaN-filling.
     let has_endpoint = lmm_fit.deviance.is_finite();
     // θ̂ in the caller's coordinates (slot order): the column standardization
-    // mapped out (`LmmGroupings::theta_kernel_to_caller`), so `tau2` is a
-    // variance in the user's scale.
+    // mapped out (`LmmGroupings::theta_kernel_to_caller`), so `tau2` is in the
+    // user's scale.
     let (theta_caller, caller_pins) =
         view.groupings
             .theta_to_caller_vec(view.theta, diag.converged, view.map);
@@ -730,7 +736,13 @@ pub(crate) fn lmm_view_to_fit(
         // deviance; the weighted correction below rewrites both together
         // (using `n`, not `n_rows`: see the note above `n_rows`).
         loglik: super::common::lmm_loglik(deviance, criterion.nu(n_rows, p)),
-        df: if has_endpoint { p + n_free + 1 } else { 0 },
+        // Gated on the endpoint, where the GLMM's `glmm_view_to_fit` gates on
+        // `converged`; `Fit::df`'s doc records the difference.
+        df: if has_endpoint {
+            super::common::model_df(crate::Family::Gaussian, p, n_free, false)
+        } else {
+            0
+        },
         reml: criterion == Criterion::Reml,
         weight_power: f64::NAN,
         weight_power_estimated: false,
@@ -916,8 +928,8 @@ fn fit_mle(
     // slope_cols: x column indices for the primary RE slopes (empty = intercept-only)
     let slope_cols: Vec<usize> = re.slopes.iter().map(|&c| c as usize).collect();
     // Extra-grouping slope x-columns, declaration order. On the standalone path the
-    // ModelSpec's slope columns ARE x-matrix indices (unlike MCPower, which resolves
-    // them separately), so they are read directly here.
+    // ModelSpec's slope columns ARE x-matrix indices, so they are read directly
+    // here.
     let extra_slope_cols: Vec<Vec<usize>> = re
         .extra_groupings
         .iter()
@@ -965,7 +977,8 @@ fn fit_mle(
         units.weights(weights),
         false,
         criterion,
-    );
+    )
+    .expect("the test design's pattern factorizes");
 
     let ids = crate::GroupIds {
         primary: cluster_ids.to_vec(),

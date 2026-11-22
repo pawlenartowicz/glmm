@@ -136,6 +136,15 @@ test_that("VarCorr prints a diverged binomial mixed fit, which has no variance r
   expect_identical(capture.output(print(VarCorr(fit))), "No variance estimates.")
 })
 
+test_that("VarCorr prints a NaN correlation as NA", {
+  # A correlation next to an SD at 0 is NaN; the Python port prints NA too.
+  v <- structure(matrix(c(4, 0, 0, 0), 2), stddev = c("(Intercept)" = 2, Days = 0),
+                 correlation = matrix(c(1, NaN, NaN, 1), 2), term_index = c(1L, 1L))
+  vc <- structure(list(Subject = v), class = "VarCorr.fastglmm", sc = NA_real_)
+  out <- capture.output(print(vc))
+  expect_identical(strsplit(trimws(out[3]), " +")[[1]], c("Days", "0", "NA"))
+})
+
 test_that("accessors: nobs, formula, family, model.frame", {
   d <- benchmark_data(seed = 105, family = "binomial")
   fit <- fastglmm(y ~ t + d + (1 | g), d, family = binomial())
@@ -290,6 +299,30 @@ test_that("print and summary on a non-mixed fit skip the random-effects block", 
   expect_true(grepl("Number of obs: 50", sout, fixed = TRUE))
   expect_false(grepl("Random effects:", sout, fixed = TRUE))
   expect_false(grepl("groups:", sout, fixed = TRUE))
+})
+
+test_that("print shows a small coefficient, not 0", {
+  set.seed(115)
+  d <- data.frame(x = rnorm(50, sd = 1e4))
+  d$y <- 1 + 3e-5 * d$x + rnorm(50, sd = 0.01)
+  fit <- fastglmm(y ~ x, d)
+  out <- capture.output(print(fit))
+  expect_true(any(grepl("e-05", out, fixed = TRUE)), info = paste(out, collapse = "\n"))
+})
+
+test_that("summary prints NA for the p-value of an infinite z", {
+  set.seed(115)
+  d <- data.frame(x = rnorm(50))
+  d$y <- rbinom(50, 1, plogis(d$x))
+  fit <- fastglmm(y ~ x, d, family = binomial())
+  fit$se[2] <- 0
+  s <- summary(fit)
+  expect_true(is.infinite(s$coefficients[2, "z value"]))
+  expect_true(is.na(s$coefficients[2, "Pr(>|z|)"]))
+  out <- capture.output(print(s))
+  # The coefficient row; a later "x" row is the correlation table's.
+  row <- grep("^x ", out, value = TRUE)[1]
+  expect_match(row, "NA *$")
 })
 
 test_that("a failed mixed fit keeps the mixed title and the groups line, with no df.residual", {
@@ -531,7 +564,7 @@ test_that("a pin is named on a sparse-route fit too", {
     "\\(Intercept\\) in g"
   )
   expect_equal(fit$diagnostics$pinned, list(TRUE, c(FALSE, FALSE)))
-  # One flag per stddev, per block - the alignment .pinned_detail walks.
+  # One flag per stddev, per block - the alignment glmm-bind's singular_message walks.
   for (nm in names(VarCorr(fit))) {
     sd <- attr(VarCorr(fit)[[nm]], "stddev")
     expect_length(fit$diagnostics$pinned[[match(nm, names(VarCorr(fit)))]],
@@ -720,7 +753,7 @@ test_that("a Gaussian LMM summary has lmerTest's columns with the crate's df and
   out <- capture.output(print(s))
   expect_true(any(grepl("^ +Estimate Std. Error +df t value Pr\\(>\\|t\\|\\)", out)))
   expect_identical(tail(out, 1L),
-                   "t tests use Satterthwaite degrees of freedom (finite-difference θ-Hessian).")
+                   "t tests use Satterthwaite degrees of freedom.")
 })
 
 test_that("tidy() has a df column exactly where summary() has one", {
@@ -886,7 +919,7 @@ test_that("confint(method = \"profile\") gives lme4's row names and takes parm a
 
   beta <- confint(m, parm = "beta_", method = "profile")
   expect_identical(rownames(beta), c("(Intercept)", "Days"))
-  expect_equal(beta, ci[5:6, ], tolerance = 1e-10)
+  expect_equal(beta, ci[5:6, ], tolerance = 1e-10, ignore_attr = "notes")
 
   s <- confint(m, parm = "sigma", level = 0.9, method = "profile")
   expect_identical(dimnames(s), list("sigma", c("5 %", "95 %")))
@@ -894,6 +927,20 @@ test_that("confint(method = \"profile\") gives lme4's row names and takes parm a
 
   expect_error(confint(m, parm = "nope", method = "profile"),
                "\"nope\".*\"sd_Days\\|Subject\"")
+})
+
+test_that("confint(method = \"profile\") names a NaN row in its notes", {
+  # No group variance: the fit pins both SDs at 0, so the correlation between
+  # them is not identified.
+  set.seed(2)
+  x <- runif(96)
+  d <- data.frame(y = 1 + 0.5 * x + 0.3 * runif(96), x = x, g = factor(rep(1:12, each = 8)))
+  fit <- suppressWarnings(fastglmm(y ~ x + (x | g), d))
+  ci <- confint(fit, method = "profile")
+  expect_true(all(is.na(ci["cor_x.(Intercept)|g", ])))
+  notes <- attr(ci, "notes")
+  expect_identical(notes[1], "Profile intervals on the ML fit; the REML fit was refitted by ML.")
+  expect_identical(sum(startsWith(notes, "cor_x.(Intercept)|g: ")), 1L)
 })
 
 # AIC()/BIC() refuse only the comparisons that are always wrong: a REML fit

@@ -9,7 +9,7 @@ use crate::ols::{OlsFitView, OlsScratch, OlsSuffStats, PANEL_ROWS};
 use crate::standardize::{ColumnScaling, Units};
 
 use super::common::{
-    fill_se_compact, lmm_loglik, nan_vcov, residual_df, vcov_from_chol, FitDiagnostics,
+    fill_se_compact, lmm_loglik, nan_vcov, residual_df, vcov_from_chol, FitDiagnostics, StopReason,
 };
 use super::{Fit, FitOptions, SeType};
 
@@ -23,6 +23,9 @@ impl OlsFitView<'_> {
             pivot: self.pivot,
             pivot_col: self.pivot_col,
             ill_conditioned: self.pivot < crate::ols::PIVOT_MIN,
+            // The kernel's one non-converged exit, `nonconverged_view`, is a
+            // factorization that failed before any estimate (or `n ≤ p`).
+            stop: (!self.converged).then_some(StopReason::FirstSolveFailed),
             ..FitDiagnostics::fixed_only(self.converged)
         }
     }
@@ -455,7 +458,11 @@ pub(crate) fn ols_view_to_fit(
         deviance: f64::NAN,
         loglik,
         // p fixed effects + σ² (R logLik.lm's df).
-        df: if converged { p + 1 } else { 0 },
+        df: if converged {
+            super::common::model_df(crate::Family::Gaussian, p, 0, false)
+        } else {
+            0
+        },
         reml,
         weight_power: f64::NAN,
         weight_power_estimated: false,

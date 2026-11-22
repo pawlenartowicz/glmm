@@ -313,9 +313,10 @@ fastglmm <- function(formula, data, family = gaussian(),
 
   # --- data prep: row filtering (subset, na.action) happens HERE, on the
   # data.frame, before marshalling - data prep, not parsing. ---
-  vars <- all.vars(formula)
+  cols <- .formula_columns(f_str, data)
+  vars <- cols$used
   data <- .as_data_frame(data, vars)
-  frame <- .data_columns(data, vars)
+  frame <- .data_columns(data, cols)
   .check_contrasts(formula, frame)
   e <- substitute(weights)
   if (!is.null(e)) frame <- .add_weights(frame, eval(e, data, parent.frame()), nrow(data))
@@ -372,9 +373,7 @@ fastglmm <- function(formula, data, family = gaussian(),
   w <- frame[["(weights)"]]
   o <- frame[["(offset)"]]
 
-  # A one-sided formula has no response; the native code refuses it.
-  response <- if (length(formula) == 3L) all.vars(formula[[2L]])
-  cols <- .marshal(frame, vars, c(response, .offset_vars(formula)))
+  cols <- .marshal(frame, vars, cols$numeric_only)
 
   r <- .glmm_call("fit", list(
     formula = f_str, numeric = cols$numeric, factors = cols$factors,
@@ -387,7 +386,8 @@ fastglmm <- function(formula, data, family = gaussian(),
     row_index = row_index, row_base = 1L
   ))
 
-  fit <- .fit_object(r, store, fam$object, f_str, frame, row_index, match.call(), data_name)
+  fit <- .fit_object(r, store, fam$object, f_str, frame, cols$factors, row_index, match.call(),
+                     data_name)
   if (identical(anova_test, "auto")) {
     # An environment, so the tables `.lrt_tables` makes stay with every copy
     # of the fit.
@@ -403,23 +403,15 @@ fastglmm <- function(formula, data, family = gaussian(),
 # (into `store`, which already holds the data-prep ones) and builds the
 # "fastglmm" list. fastglmm() and compare() share it, so a fit made by
 # compare() is the object fastglmm() makes. `row_index` is each frame row's
-# 1-based position in the caller's data.
-.fit_object <- function(r, store, family, f_str, frame, row_index, call, data_name) {
+# 1-based position in the caller's data; `factors` the factor columns of
+# `frame` as .marshal() built them for the fit.
+.fit_object <- function(r, store, family, f_str, frame, factors, row_index, call, data_name) {
   # The options the fit did not use, worded by the native code in this port's
   # spelling, after the data-prep warning and before the fit's own.
   for (w in r$argument_notes) .warn_entry(store, w, .note_class(w$kind))
-  # Singularity is not assessed on a fit that did not converge: the kernel never sets
-  # `singular` there (the post-hoc check and the boundary flags are gated on
-  # `converged`), so `r$singular` reads FALSE on a non-converged fit. `isTRUE(r$converged)`
-  # below is a defensive guard, not load-bearing on the current kernel.
-  if (r$singular && isTRUE(r$converged)) {
-    affected <- .pinned_detail(r$pinned, r$re_group_names, r$re_group_terms)
-    .warn_keep(store, "singular", paste0(
-      "The random effects are too complex for the data: a variance is estimated at or ",
-      "near zero, or a correlation at or near \u22121 or 1. Consider removing the ",
-      "affected random effect.",
-      if (length(affected)) paste0(" Affected: ", paste(affected, collapse = ", "), ".")),
-      c("fastglmm_singular", "fastglmm_diagnostic"))
+  # The singular warning of a converged fit, worded by the native code.
+  if (!is.null(r$singular_warning)) {
+    .warn_entry(store, r$singular_warning, c("fastglmm_singular", "fastglmm_diagnostic"))
   }
   # The notes and the non-convergence warning come with their text
   # (glmm-bind/src/notes.rs); a note without a message raises nothing.
@@ -551,12 +543,15 @@ fastglmm <- function(formula, data, family = gaussian(),
     # What predict() and simulate() read besides the public fields, private:
     # the flat conditional modes and their level counts, the conditional
     # variances in the kernel's layout (glmm-bind's fit record), and each
-    # grouping's observed level count, which summary() prints. The
-    # training columns are `frame`, marshalled again on each call. NULL on a
+    # grouping's observed level count, which summary() prints. NULL on a
     # fit saved before them. Mirrors the Python port's `Fit._kernel_parts` -
     # change together.
     .kernel_parts = r[c("ranef", "ranef_levels", "condvar", "condvar_x", "condvar_cross",
                         "re_group_levels")],
+    # The training columns that .marshal() sent as factors, kept so
+    # .training_columns() does not run factor() again on every call; the
+    # numeric columns are read from `frame`.
+    .factor_columns = factors,
     # Each frame row's 1-based position in the caller's data, so an error of
     # predict() or simulate() on the frame's rows names the caller's row. NULL
     # when no row was dropped, and on a fit saved before it. Mirrors the
@@ -669,8 +664,8 @@ fastglmm <- function(formula, data, family = gaussian(),
   if (is.data.frame(data)) return(data)
   # as.data.frame() recycles a short list column whose length divides the
   # longest one; model.frame() (glm, lme4) refuses that, and so does this.
-  # Same message as run_fit's length check in src/orchestrate.rs - change
-  # together.
+  # Same message as table_of's length check (glmm's orchestrate module) -
+  # change together.
   if (is.list(data)) {
     len <- vapply(data[intersect(vars, names(data))], NROW, integer(1))
     if (length(unique(len)) > 1L) {
@@ -684,17 +679,36 @@ fastglmm <- function(formula, data, family = gaussian(),
   as.data.frame(data)
 }
 
-# The columns `vars` of `data`, every one of them present.
-.data_columns <- function(data, vars) {
+# What the formulas `f_strs` read from `data`, from the shared parser (the
+# native formula_columns, one call per formula), each the union over the
+# formulas: `used` (the data columns read), `missing` (the names read that
+# `data` lacks) and `numeric_only` (the response and offset() columns).
+# `used` is in the formulas' order, as model.frame() lists the columns; the
+# parser gives them in data order.
+.formula_columns <- function(f_strs, data) {
+  available <- as.character(if (is.list(data)) names(data) else colnames(data))
+  cols <- lapply(f_strs, function(f) {
+    .glmm_call("formula_columns", list(formula = f, available = available))
+  })
+  union_of <- function(k) as.character(unique(unlist(lapply(cols, `[[`, k))))
+  used <- union_of("used")
+  in_formula <- unlist(lapply(f_strs, function(f) all.vars(str2lang(f))))
+  list(used = used[order(match(used, in_formula))], missing = union_of("missing"),
+       numeric_only = union_of("numeric_only"))
+}
+
+# The columns `cols$used` of `data`, refusing a name in `cols$missing`
+# (.formula_columns).
+.data_columns <- function(data, cols) {
+  vars <- cols$used
   # Mirrors `_prepare_columns` in the Python port: change together. Without
   # it, .subset() would silently read the first of two same-named columns.
   dup <- intersect(names(data)[duplicated(names(data))], vars)
   if (length(dup)) {
     stop("data has duplicate column name(s): ", paste(dup, collapse = ", "), call. = FALSE)
   }
-  missing_cols <- setdiff(vars, names(data))
-  if (length(missing_cols)) {
-    stop("column(s) not found in data: ", paste(missing_cols, collapse = ", "),
+  if (length(cols$missing)) {
+    stop("column(s) not found in data: ", paste(cols$missing, collapse = ", "),
          call. = FALSE)
   }
   # Builds what `[.data.frame` returns, without its dispatch overhead. Only for
@@ -829,36 +843,6 @@ fastglmm <- function(formula, data, family = gaussian(),
                message = col("message")))
 }
 
-# Names of the RE components the optimizer pinned at the boundary, as
-# "<term> in <group>", for the singular warning.
-#
-# Read straight off the kernel's own record of what it pinned. Do NOT
-# reconstruct it from varcorr: on a grouping with q >= 2 the pin fixes the
-# DIAGONAL of the Cholesky factor while the reported stddev is
-# sqrt(lambda_offdiag^2 + lambda_diag^2), which lands at ~1e-9 rather than at 0,
-# so a scan for exactly-zero stddevs misses those pins entirely.
-#
-# character(0) means nothing was pinned - including a model with no variance
-# components to pin. `singular` can still be TRUE with nothing pinned (the
-# post-hoc negligible-stddev check is independent of the optimizer's own pin
-# decision), so the bare warning text stands regardless - character(0) is
-# never evidence that the fit is not singular.
-# Mirrors glmm-py/glmm/__init__.py::_pinned_detail - change together.
-.pinned_detail <- function(pinned, group_names, group_terms) {
-  parts <- character()
-  for (g in seq_along(pinned)) {
-    terms <- group_terms[[g]]
-    grp <- group_names[[g]]
-    for (i in which(as.logical(pinned[[g]]))) {
-      term <- if (i <= length(terms)) terms[[i]] else sprintf("component %d", i)
-      parts <- c(parts, sprintf("%s in %s", term, grp))
-    }
-  }
-  parts
-}
-
-.count <- function(n, word) sprintf("%d %s%s", as.integer(n), word, if (n == 1) "" else "s")
-
 # `...` exists only to intercept known lme4 arguments with designed errors
 # - an unknown argument must never be silently swallowed
 # (error, never silently differ).
@@ -925,13 +909,6 @@ fastglmm <- function(formula, data, family = gaussian(),
     return(term)
   }
   term
-}
-
-# The variables read inside offset() calls anywhere in `term`.
-.offset_vars <- function(term) {
-  if (!is.call(term)) return(character())
-  if (identical(term[[1L]], as.name("offset"))) return(all.vars(term))
-  unlist(lapply(as.list(term)[-1L], .offset_vars))
 }
 
 # Refuses a formula whose fixed-effects factors would fit a different model

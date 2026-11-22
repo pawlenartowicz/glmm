@@ -210,6 +210,17 @@ fn an_aliased_row_is_nan_and_counted() {
     assert_eq!(field(&r, "n_aliased"), &Value::I64(1));
 }
 
+/// A zero SE beside a nonzero estimate is an infinite z, whose p-value is
+/// NaN in the record that both ports print.
+#[test]
+fn an_infinite_z_has_a_nan_p_value() {
+    let r = summary(fit(vec![("se", Value::Vec(vec![1.0, 0.0]))]));
+    let z = f64s(field(&r, "statistic"));
+    let p = f64s(field(&r, "p_value"));
+    assert!(z[1] == f64::NEG_INFINITY && p[1].is_nan(), "{z:?} {p:?}");
+    assert!(p[0].is_finite(), "{p:?}");
+}
+
 #[test]
 fn a_fit_stored_by_0_8_0_without_the_optional_fields_summarizes_as_a_z_table() {
     let optional = [
@@ -604,4 +615,23 @@ fn narrow_weights_print_the_out_of_range_line_with_the_mild_note() {
     assert_eq!(l.len(), 2, "{l:?}");
     assert!(l[0].ends_with(" (estimated)") && l[1].contains("outside [-1, 2]"));
     assert!(s(field(&r, "footnote")).starts_with("Standard errors: HC2"));
+}
+
+/// `criteria` has no BIC at `nobs` 0 (ln 0 is −∞): NaN, beside a finite AIC.
+#[test]
+fn criteria_at_nobs_zero_gives_a_nan_bic() {
+    let r = rec(vec![
+        ("loglik", Value::F64(-10.0)),
+        ("df", Value::I64(3)),
+        ("nobs", Value::I64(0)),
+    ]);
+    let got = call(Port::Python, "criteria", r).unwrap();
+    assert!(
+        matches!(field(&got, "BIC"), Value::F64(b) if b.is_nan()),
+        "{got:?}"
+    );
+    assert!(
+        matches!(field(&got, "AIC"), Value::F64(a) if *a == 26.0),
+        "{got:?}"
+    );
 }

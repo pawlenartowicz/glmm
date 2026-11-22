@@ -9,7 +9,7 @@ use super::*;
 use crate::{Grouping, PoissonLink, ReStructure};
 
 /// δ̂'s deviance over the best of the 2001-point grid on a random-intercept
-/// dataset (P4). Measured on [`mixed_sets`]: δ̂ beat the grid on every one (the
+/// dataset. Measured on [`mixed_sets`]: δ̂ beat the grid on every one (the
 /// closest by 1.35e-4), so the bound is the WLS one.
 const MIXED_TOL: f64 = 1e-7;
 
@@ -100,7 +100,7 @@ impl Set {
         (0..2001)
             .map(|k| {
                 let d = lo + (hi - lo) * k as f64 / 2000.0;
-                -2.0 * profile(&data, &self.spec(), &probe, None, d).0
+                -2.0 * profile(&data, &self.spec(), &probe, None, d, &[]).0
             })
             .filter(|v| v.is_finite())
             .fold(f64::INFINITY, f64::min)
@@ -166,7 +166,15 @@ fn reml_search_reaches_the_grid_best() {
             let gap = -2.0 * fit.loglik() - set.grid_best(true);
             assert!(gap <= tol, "groups {}: gap {gap:e}", set.groups);
             let probe = probe_options(&FitOptions::default(), true);
-            let at = profile(&set.data(Some(&set.w)), &set.spec(), &probe, None, delta).0;
+            let at = profile(
+                &set.data(Some(&set.w)),
+                &set.spec(),
+                &probe,
+                None,
+                delta,
+                &[],
+            )
+            .0;
             assert!((fit.loglik() - at).abs() <= 1e-12 * at.abs(), "{at}");
             let claimed = set.fit(&FitOptions {
                 weight_power: Some(WeightPower::Fixed(1.0)),
@@ -333,7 +341,7 @@ fn profile_at_one_and_zero_is_the_claimed_and_the_unweighted_fit() {
             .unwrap()
             .loglik();
         for (d, want) in [(1.0, claimed), (0.0, plain)] {
-            let got = profile(&data, &set.spec(), &probe, None, d).0;
+            let got = profile(&data, &set.spec(), &probe, None, d, &[]).0;
             assert!(
                 (got - want).abs() <= 1e-12 * want.abs().max(1.0),
                 "δ = {d}: {got} vs {want}"
@@ -422,7 +430,7 @@ fn search_notes(fit: &Fit) -> (bool, bool) {
 /// any power keeping `wᵢ^δ` within 1e±250: the bracket narrows to
 /// ±ln(1e250)/ln(1e100) = ±2.5 (the spread alone gives ±7), no probe
 /// fails, and the fit ends at the bound with its note and finite model and
-/// robust SEs (before, XᵀWX overflowed at δ̂ near 3: NaN SEs or a failed refit).
+/// robust SEs.
 #[test]
 fn huge_weights_narrow_the_bracket_and_the_fit_ends_at_the_bound() {
     for (seed, delta0) in [(6, 5.0), (13, 4.0), (0, 3.0)] {
@@ -455,9 +463,9 @@ fn huge_weights_narrow_the_bracket_and_the_fit_ends_at_the_bound() {
 }
 
 /// Weights in [1e12, 1e13] on noise steeper than the bracket: the spread alone
-/// gives ±28, past the overflow of `w^δ` near 23.6, where the bound probe was
-/// NaN and only the failures note fired; the bracket now stops at
-/// ln(1e250)/ln(1e13) ≈ 19.2, and the fit there carries the bound note alone.
+/// gives ±28, past the overflow of `w^δ` near 23.6; the bracket stops at
+/// ln(1e250)/ln(1e13) ≈ 19.2, so the probe stays finite and the fit there
+/// carries the bound note alone.
 #[test]
 fn large_weights_keep_the_bound_probe_finite() {
     let set = dataset(3, 60, 0, 1e12, 10.0, 25.0);
@@ -798,7 +806,8 @@ fn upper_powers_leave_the_box_from_every_start() {
         let mut rows = Vec::new();
         for &start in starts {
             let sv = start.map(|t| StartValues::new(vec![], vec![t]));
-            let (fit, mut fws) = super::fit_keep_workspace(&data, &set.spec(), sv.as_ref(), &opts);
+            let (fit, mut fws) =
+                super::fit_keep_workspace(&data, &set.spec(), sv.as_ref(), &opts).unwrap();
             let notes = &fit.diagnostics.notes;
             assert!(
                 fit.converged() && !notes.iter().any(|n| matches!(n, Note::VarianceAtLimit)),
@@ -828,8 +837,8 @@ fn upper_powers_leave_the_box_from_every_start() {
 
 /// δ = −2 and −1.5: the kernel θ̂ at the plain weight scale is tiny (about
 /// 8.5e-7 at δ = −2, below the final search radius and the pin threshold),
-/// so on the Gram search alone the endpoint depended on the start and the pin
-/// was undone with no note. The rescale retry brings θ near 1 and every start
+/// so on the Gram search alone the endpoint depends on the start and the pin
+/// is undone with no note. The rescale retry brings θ near 1 and every start
 /// reaches the reference: the cold start and the caller-unit starts 1e-3,
 /// 1e-2, 0.1, 1, 10 and 100. From 10 and 100 the Gram search stops in the
 /// noise of the intercept's pivot (`LmmKernel::pivot_noise`), and the QR

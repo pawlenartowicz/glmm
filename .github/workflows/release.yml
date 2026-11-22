@@ -15,8 +15,9 @@ name: Publish
 #
 # PREREQUISITES:
 #   - crates.io: crate exists and has a Trusted Publisher pointing at THIS repo +
-#     release.yml + the `release` environment. (No pending-publisher flow there,
-#     so 0.0.1 was published manually; this covers 0.0.2+.)
+#     release.yml + the `release` environment. (crates.io has no
+#     pending-publisher flow, so a crate's first version is published by hand;
+#     this workflow publishes every later one.)
 #   - PyPI: a pending publisher for project `glmm` bound to this repo +
 #     release.yml + the same `release` environment (shared with crates.io —
 #     protection rules on it gate both uploads).
@@ -34,14 +35,15 @@ jobs:
   verify:
     uses: ./.github/workflows/ci.yml
 
-  # The six versions are lockstep-coupled but otherwise enforced only by a
-  # comment in pyproject.toml. This makes drift a release-time failure.
+  # The eight versions are lockstep-coupled but otherwise enforced only by
+  # comments. This makes drift a release-time failure. validation/Cargo.toml's
+  # is the version the grid's glmm engine stamps into every record.
   version-check:
-    name: Verify tag matches all six versions
+    name: Verify tag matches all eight versions
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Check 6-way version lockstep
+      - name: Check 8-way version lockstep
         shell: bash
         run: |
           TAG="${GITHUB_REF#refs/tags/v}"
@@ -58,14 +60,18 @@ jobs:
           RCRATE=$(grep -m1 '^version = ' glmm-r/rust/Cargo.toml | cut -d'"' -f2)
           # rextendr writes this manifest with single quotes.
           RVENDOR=$(grep -m1 '^version = ' glmm-r/src/rust/Cargo.toml | cut -d"'" -f2)
+          BIND=$(grep -m1 '^version = ' glmm-bind/Cargo.toml | cut -d'"' -f2)
+          VALID=$(grep -m1 '^version = ' validation/Cargo.toml | cut -d'"' -f2)
           check "$CRATE" glmm-rs/Cargo.toml
           check "$PYCRATE" glmm-py/Cargo.toml
           check "$PYPROJ" glmm-py/pyproject.toml
           check "$RDESC" glmm-r/DESCRIPTION
           check "$RCRATE" glmm-r/rust/Cargo.toml
           check "$RVENDOR" glmm-r/src/rust/Cargo.toml
+          check "$BIND" glmm-bind/Cargo.toml
+          check "$VALID" validation/Cargo.toml
           [ "$fail" = 0 ] || exit 1
-          echo "All six at $TAG."
+          echo "All eight at $TAG."
 
   build_wheels:
     name: Build & test wheel (${{ matrix.target }} on ${{ matrix.os }})
@@ -136,7 +142,13 @@ jobs:
           # Scratch dir + absolute tests path: `import glmm` must resolve to the
           # installed wheel, never glmm-py/glmm/ in the source tree.
           cd "$RUNNER_TEMP"
-          python -m pytest "$GITHUB_WORKSPACE/glmm-py/tests" -v
+          python -m pytest "$GITHUB_WORKSPACE/glmm-py/tests" -v -rs | tee pytest.log
+          # A skip fails the step: the check of ci.yml's python job -- change together.
+          if tail -n 1 pytest.log | grep -qE '[0-9]+ skipped'; then
+            echo "::error::pytest skipped tests -- a test dependency is missing"
+            grep '^SKIPPED' pytest.log || true
+            exit 1
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-${{ matrix.os }}-${{ matrix.target }}
@@ -169,7 +181,13 @@ jobs:
           python -m pip install glmm-py/dist/*.tar.gz
           python -m pip install pytest pandas pyarrow polars
           cd "$RUNNER_TEMP"
-          python -m pytest "$GITHUB_WORKSPACE/glmm-py/tests" -v
+          python -m pytest "$GITHUB_WORKSPACE/glmm-py/tests" -v -rs | tee pytest.log
+          # A skip fails the step: the check of ci.yml's python job -- change together.
+          if tail -n 1 pytest.log | grep -qE '[0-9]+ skipped'; then
+            echo "::error::pytest skipped tests -- a test dependency is missing"
+            grep '^SKIPPED' pytest.log || true
+            exit 1
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: sdist

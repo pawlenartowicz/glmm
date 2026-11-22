@@ -33,7 +33,7 @@ The core is the *only* dispatch body. `fit_checked` allocates a throwaway
 workspace per call and always assembles the full `Fit`; a `loop_advanced`
 caller builds once per shape and reads the lean `FitView` per draw. Both walk
 the identical tree, so routing cannot drift between the two tiers. The
-`orchestrate` feature (`src/orchestrate.rs`, off by default, no semver
+`orchestrate` feature (`src/orchestrate/`, off by default, no semver
 guarantee) is a third caller and not a fourth tier: it lowers a formula and a
 data table, calls `fit` or `fit_with_start`, and flattens the result for the
 Python and R packages, so it enters the tree at the same door they do.
@@ -50,7 +50,7 @@ flowchart TD
   BW -->|"NegativeBinomial, None"| GLMNB["fit_glm_nb (outer theta loop)"]
   BW -->|"any family, Some(re)"| CD{"classify_design: NoZ or Sparse"}
 
-  CD -->|Gaussian| MLE["lmm_run_on (Dense or Sparse LmmKernel)"]
+  CD -->|Gaussian| MLE["lmm_fit_with_retries -> fit_lmm, then lmm_view (Dense or Sparse LmmKernel)"]
   CD -->|NegativeBinomial| GNB["run_glmm_nb_on (blocked, structured or packed layout)"]
   CD -->|"Binomial/Poisson/Gamma"| GMM["run_glmm_on (blocked, structured or packed layout)"]
 ```
@@ -76,9 +76,9 @@ same values: in the reduced fit it is a random-effect-only column (`Z_r`),
 one per dropped column, shared by every grouping that names it. This
 preprocessing is path-agnostic: it serves OLS, GLM, LMM and GLMM alike.
 
-**Identification notes.** Next to the alias check, `fit_checked` runs `identification_notes` (`src/fit/common.rs`), which reads only the ids, the slope columns and the response, compares values exactly, and adds a note for each random-effect structure the data cannot identify: a single-level grouping, two groupings with the same groups that share a random-effect column, slopes constant within the levels of a block with a random intercept that take too few distinct values for their covariance parameters, and a binomial response constant within every level when some level holds more than one trial. No estimate depends on it. On the aliased path the reduced re-entry runs it on the reduced design, and those notes are the ones reported.
+**Identification notes.** `fit_resolved` (`src/fit/mod.rs`) runs `identification_notes` (`src/fit/common.rs`) once per user fit, on the caller's design; the aliased re-entry and the trial fits of the weight-power search (`fit_delta`, `src/fit/delta.rs`) do not. It reads only the ids, the slope columns and the response, compares values exactly, and adds a note for each random-effect structure the data cannot identify: a single-level grouping, two groupings with the same groups that share a random-effect column, slopes constant within the levels of a block with a random intercept that take too few distinct values for their covariance parameters, and a binomial response constant within every level when some level holds more than one trial. No estimate depends on it.
 
-**`classify_design` routing (mixed arm only).** A mixed design routes to `Solver::Sparse` when it is over the dense envelope (primary width `q_p > MAX_PRIMARY_Q`, more than `MAX_EXTRA_GROUPINGS` extra groupings, or any extra grouping width `1 + slopes.len() > MAX_EXTRA_Q`), **or** any extra grouping carries a random slope. Otherwise the crossed tail decides, with `e` the total `Crossed` level count, and the design stays `Solver::NoZ` when:
+**`classify_design` routing (mixed arm only).** A mixed design routes to `Solver::Sparse` when it is over the dense envelope (primary width `q_p > MAX_PRIMARY_Q`, or more than `MAX_EXTRA_GROUPINGS` extra groupings), **or** any extra grouping carries a random slope. Otherwise the crossed tail decides, with `e` the total `Crossed` level count, and the design stays `Solver::NoZ` when:
 
 - a non-Gaussian family: the structured layout's `e × e` buffers (four, counting the packed conditional-variance triangle as one) fit in `DENSE_TAIL_MAX_BYTES` (1 GiB, 256 MiB on wasm32), which is `e ≤ 5,792`, or 2,896 on wasm32;
 - a Gaussian fitted with `FitOptions::condvar` on: `e ≤ MAX_CROSSED_LEVELS` (500), because only the dense kernel forms conditional variances;
@@ -130,9 +130,10 @@ Hessian count and differentiate free θ only. A masked block counts its full
 triangle against the dense envelope and the vector-AGQ limit `q_p ≤ 3`, so a
 block without a random intercept reaches them one slope sooner.
 
-The one hard rejection is a shape check: `check_model_shape` returns a
-`FitError` on inputs no model takes (a bad `nagq`, an out-of-range slope
-column, a slope column repeated within one grouping, more than one nested grouping) — and, as a family × random-effects
+The hard rejections are shape checks. `check_slope_columns` returns a
+`FitError` on a slope index `c ≥ p + s` and on a random-effect-only column no
+slope reads. `check_model_shape` returns a
+`FitError` on inputs no model takes (a bad `nagq`, a slope column repeated within one grouping, more than one nested grouping, more than 64 variance components, which the pin flags' 64-bit mask cannot hold) — and, as a family × random-effects
 gate, on `(Family::InverseGaussian, Some(re))`: the GLMM objective needs a
 profiled `inverse.gaussian()$aic` term that is not built, so the entry refuses
 it before `build_workspace` allocates anything (`InverseGaussian` reaches only
@@ -142,7 +143,7 @@ level counts and the coupling fill, so `build_workspace` sizes the spec from the
 
 **Code:** `fit`/`fit_with_start`, `fit_checked`, `FitError`, `Solver`,
 `FitOptions` (`src/fit/mod.rs`); `validate`, `detect_aliased`,
-`fit_rank_deficient`, `check_model_shape`,
+`fit_rank_deficient`, `check_model_shape`, `check_slope_columns`,
 `spec_sized_from_ids` (`src/fit/common.rs`); `ReTerm` (`src/spec.rs`);
 `LmmGroupings::{structural_theta, zero_structural}` (`src/lmm/mod.rs`),
 `drop_hidden` (`src/lmm/re_map.rs`); `Masked` (`src/optim/mod.rs`);
@@ -183,8 +184,7 @@ grows with the families and with `t²` for `t` tail levels, never with `n²`.
 The solves cost far more than one deviance evaluation on a large crossed
 model: on `lmm_cross4_g30000p20_bal_base` (four crossed groupings of 1 500
 levels) about 9 ms against about 90 µs for one evaluation, close to the
-16 ms of the whole fit, which is why they are off by default. The sparse LMM solver, the dense LMM path with a slope
-on an extra grouping (`recover_ranef_blocked`) and the GLMM's packed layout
+16 ms of the whole fit, which is why they are off by default. The sparse LMM solver and the GLMM's packed layout
 form none (`condvar` is empty), since they would need a selected inverse of
 the whole `A`.
 
@@ -343,7 +343,7 @@ as given.
 ## Legend
 
 - **Node** = a named function the dispatch actually calls; the terminal leaves
-  (`fit_ols_prebuilt`, `fit_glm_prebuilt`, `fit_glm_nb`, `lmm_run_on`,
+  (`fit_ols_prebuilt`, `fit_glm_prebuilt`, `fit_glm_nb`, `lmm_fit_with_retries`,
   `run_glmm_on`, `run_glmm_nb_on`) are the solvers.
   **Diamond** = a real branch in the code (`match`, `classify_design`, a guard).
   **Edge label** = the condition under which that branch is taken.
@@ -396,26 +396,26 @@ and are not user-facing.
 | BOBYQA `npt` | `2·n_θ + 1` for `n_θ < 3`, else `(3·n_θ).div_ceil(2) + 1` | [`algorithms-lmm.md`](algorithms-lmm.md#general-path-bobyqa-over-θ) (`src/lmm/mod.rs`) |
 | `rho_begin` per search | LMM `RHO_BEGIN = 0.5` blind, `RHO_BEGIN_WARM = 0.1` warm; GLMM stage 1 and the `Joint` route `GLMM_RHO_BEGIN = 0.2` (stage 1 from a kept warm θ₀ 0.1), the polish `GLMM_RHO_POLISH = 0.03` (0.1 after a stage-1 optimum with a diagonal below `POLISH_NEAR_SINGULAR = 1e-2`, and 0.1 for the polish of an AGQ gradient-search endpoint) | [`algorithms-lmm.md`](algorithms-lmm.md#general-path-bobyqa-over-θ), [`algorithms-glmm.md`](algorithms-glmm.md) (`src/lmm/mod.rs`) |
 | `rho_end` | LMM `RHO_END = 1e-6`; GLMM searches `GLMM_RHO_END = 3e-6` | [`algorithms-lmm.md`](algorithms-lmm.md#general-path-bobyqa-over-θ), [`algorithms-glmm.md`](algorithms-glmm.md) (`src/lmm/mod.rs`) |
-| BOBYQA `prima_parity` | `false` on every search: Powell's RESCUE factor at a fully determined model (one-dimensional searches); no effect at any other `npt` | [`algorithms-lmm.md`](algorithms-lmm.md#general-path-bobyqa-over-θ) (`apply_campaign_overrides`, `src/lmm/mod.rs`) |
+| BOBYQA `prima_parity` | `false` on every search: Powell's RESCUE factor at a fully determined model (one-dimensional searches); no effect at any other `npt` | [`algorithms-lmm.md`](algorithms-lmm.md#general-path-bobyqa-over-θ) (`apply_shipped_schedule`, `src/lmm/mod.rs`) |
 | LMM outer optimizer | BFGS where the per-group regression route is armed (slopes on the primary only, `n_θ ≥ 3`), BOBYQA elsewhere and as its polish/fallback | [`algorithms-lmm.md`](algorithms-lmm.md#gradient-search-on-the-per-group-route-bfgs) (`lmm_outer_optimizer`, `src/lmm/mod.rs`) |
 | GLMM outer optimizer | BFGS over `[θ \| β̃]` on binomial (any link), Poisson and Gamma (log and inverse link) Laplace fits with `n_θ ≥ 2` on the blocked or structured layout, cold or warm (on the loop tier's `FitWorkspace::set_beta_info_scaling`, off by default, β̃ whitened by the β information at the start, `BetaScale::set_info`, one `ProfilePql` solve, and its start curvature seeded with `1/(2·Σ prior weight)` unless a curvature hint is given), with a free Gamma `ln φ` as one more coordinate (its start curvature seeded on the inverse link), and on the exact AGQ gradient on binomial logit/probit and Poisson AGQ fits with one scalar random intercept below 50 rows per primary level, cold or warm (a warm one only from every diagonal θ₀ ≥ 0.05); BOBYQA elsewhere and as its polish/fallback; 2000 iterations | [`algorithms-glmm.md`](algorithms-glmm.md#gradient-search-bfgs-on-laplace-and-scalar-intercept-agq-fits) (`gradient_route_plan`, `src/glmm/mod.rs`) |
 | BFGS stops and certificate | projected gradient `< 1e-6`; decrease `< max(fdelta_abs, FDELTA_ULPS = 16 · ε·\|f\|)`, `fdelta_abs` = 1e-9 on the LMM route, 1e-10 on the GLMM route; accepted when the decrement `½·gᵀHg ≤ CERT_DECREMENT = 1e-8` and no diagonal θ `< CERT_NEAR_ZERO = 1e-3`; Armijo `c = 1e-4`, 30 halvings (a failure from an updated `H` restarts once from the start matrix), first step capped at 0.5 and stopped `ZERO_LANDING_SHORT = 1e-4` of the step short of an exact 0; 1000 iterations on the LMM route, 2000 on the GLMM route | [`algorithms-lmm.md`](algorithms-lmm.md#gradient-search-on-the-per-group-route-bfgs), [`algorithms-glmm.md`](algorithms-glmm.md#gradient-search-bfgs-on-laplace-and-scalar-intercept-agq-fits) (`BfgsConfig`, `src/optim/bfgs.rs`) |
-| `GRAD_WARM_THETA_MAX` / `GRAD_THETA_FAR` | `10` / `100` (`0.1·THETA_HI`): a warm GLMM fit whose θ start has a diagonal above 10 takes the BOBYQA route; a gradient-search endpoint with a diagonal θ at or above 100 hands over to BOBYQA | [`algorithms-glmm.md`](algorithms-glmm.md#gradient-search-bfgs-on-laplace-and-scalar-intercept-agq-fits) (`src/glmm/mod.rs`) |
-| `GRAD_WARM_AGQ_THETA_MIN` | `0.05`: a warm AGQ fit on a covered shape whose θ start has a diagonal below 0.05 keeps the joint BOBYQA search: from at or near a zero variance the endpoint is never certified and the polish costs more than warm BOBYQA | [`algorithms-glmm.md`](algorithms-glmm.md#gradient-search-bfgs-on-laplace-and-scalar-intercept-agq-fits) (`src/glmm/mod.rs`) |
+| `GRAD_WARM_THETA_MAX` / `GRAD_THETA_FAR` / `PLATEAU_PROBE_THETA` | `10` / `100` (`0.1·THETA_HI`) / `10`: a warm GLMM fit whose θ start has a diagonal above 10 takes the BOBYQA route; a gradient-search endpoint with a diagonal θ at or above 100 hands over to BOBYQA; the post-pin plateau probe tries each diagonal θ at or above 10 at θ/e and θ·e | [`algorithms-glmm.md`](algorithms-glmm.md#gradient-search-bfgs-on-laplace-and-scalar-intercept-agq-fits) (`src/glmm/grad_route.rs`; `PLATEAU_PROBE_THETA` in `src/glmm/pin.rs`) |
+| `GRAD_WARM_AGQ_THETA_MIN` | `0.05`: a warm AGQ fit on a covered shape whose θ start has a diagonal below 0.05 keeps the joint BOBYQA search: from at or near a zero variance the endpoint is never certified and the polish costs more than warm BOBYQA | [`algorithms-glmm.md`](algorithms-glmm.md#gradient-search-bfgs-on-laplace-and-scalar-intercept-agq-fits) (`src/glmm/grad_route.rs`) |
 | `PG_GRAD_BLOCK` | 512 groups per stacked solve of the LMM gradient | [`algorithms-lmm.md`](algorithms-lmm.md#gradient-search-on-the-per-group-route-bfgs) (`src/lmm/pg_grad.rs`) |
-| Satterthwaite steps `ETA` / `ETA_GRAD` | the pass's step on each free θ̃ coordinate, `h_k = η·max(\|θ̃_k\|, 1)`: `ETA = 3e-4` on the value route (central differences of the deviance), pinned by a step sweep over which the df stay flat; `ETA_GRAD` on the gradient route (central differences of the per-group gradient), set by that route's own sweep. The pseudo-inverse of the profiled Hessian keeps eigenvalues above `1e-8·λ_max` | [`algorithms-lmm.md`](algorithms-lmm.md#satterthwaite-degrees-of-freedom) (`src/lmm/satterthwaite.rs`) |
+| Satterthwaite `EXACT_TAIL_MAX` / `ETA` | `500` / `3e-4`: the pass takes exact derivatives of the profiled deviance on every model whose crossed tail has at most 500 random-effect columns, and the value route above that, with the step `h_k = ETA·m_b` on each free θ̃ coordinate (`m_b` the largest free `\|θ̃\|` of the coordinate's covariance block, central differences of the deviance), pinned by a step sweep over which the df stay flat. The pseudo-inverse of the profiled Hessian, scaled to a unit diagonal, keeps eigenvalues above `1e-8·λ_max` | [`algorithms-lmm.md`](algorithms-lmm.md#satterthwaite-degrees-of-freedom) (`src/lmm/satterthwaite.rs`, `EXACT_TAIL_MAX` in `src/lmm/satterthwaite_exact.rs`) |
 | `THETA0` / `THETA_HI` | `1.0` — blind θ start on each diagonal entry (off-diagonals start at `0`); `1e3` — the symmetric search box `[−THETA_HI, THETA_HI]` on every θ entry | [`algorithms-lmm.md`](algorithms-lmm.md#covariance-parameterization-θ-cholesky) (`src/lmm/mod.rs`) |
 | `THETA_TRUTH_FLOOR` | `0.01` — a truth-seeded θ start is clamped to at least this, above `PIN_THETA`, so it never starts on the boundary | [`algorithms-lmm.md`](algorithms-lmm.md#boundary-handling-pin_theta) (`src/lmm/mod.rs`) |
 | `PIN_THETA` | `1e-4`: diagonal variance component pinned to `0`, tested on the internal (scaled) θ, and again inside the canonical fold, so no pinned diagonal sits above a live entry | [`algorithms-lmm.md`](algorithms-lmm.md#boundary-handling-pin_theta) (`src/lmm/mod.rs`) |
-| `PIN_DEVIANCE_SLACK` / `PIN_POLISH_DROP` / `PIN_PROBE_STEP` / `PIN_NOISE_ULPS` | `1e-6` / `1e-7` / `1e-3` / `64`: GLMM only. A pin more than `1e-6` above the incumbent is undone; one that lowers it by more than `1e-7`, or whose free θ coordinates a probe `1e-3` either way finds that far off their optimum, runs the one trough polish (a θ coordinate the probe finds stiffer than the β̃ axes is rescaled to their curvature), whose endpoint, when lower, is pinned again and judged by the same incumbent check, with no second polish; both thresholds are floored at 64 ULPs of the incumbent | [`algorithms-glmm.md`](algorithms-glmm.md#boundary-handling-and-the-singular-flag) (`src/lmm/mod.rs`) |
+| `PIN_DEVIANCE_SLACK` / `PIN_POLISH_DROP` / `PIN_PROBE_STEP` / `PIN_NOISE_ULPS` | `1e-6` / `1e-7` / `1e-3` / `64`: GLMM only. A pin more than `1e-6` above the incumbent is undone; one that lowers it by more than `1e-7`, or whose free θ coordinates a probe `1e-3` either way finds that far off their optimum, runs the one trough polish (a θ coordinate the probe finds stiffer than the β̃ axes is rescaled to their curvature), whose endpoint, when lower, is pinned again and judged by the same incumbent check, with no second polish; both thresholds are floored at the larger of 64 ULPs of the incumbent and the deviance's rounding estimate `ε·(|D| + tr_x)` | [`algorithms-glmm.md`](algorithms-glmm.md#boundary-handling-and-the-singular-flag) (`src/lmm/mod.rs`) |
 | `SINGULAR_REL_TOL` | `1e-3` — post-hoc relative check: any RE stddev `≤ 1e-3 ×` the largest ⇒ `singular`, on the internal (scaled) stddevs | [`algorithms-lmm.md`](algorithms-lmm.md#boundary-handling-pin_theta) (`src/fit/mod.rs`) |
 | RE design column scale | per random-slope column of the standardized design, `√(Σ wᵢx̃ᵢ²/Σ wᵢ)`; intercept subcolumns exactly `1.0`; always on, no trigger | [`algorithms-lmm.md`](algorithms-lmm.md#random-effect-design-column-scaling) (`src/lmm/mod.rs`) |
 | `GRAM_PIVOT_MIN` | `1e-3`: the smallest pivot ratio `R_jj²/(X'WX)_jj` at which the dense LMM route reads its fixed-effect factor off the accumulated Gram; below it the Givens QR runs | [`algorithms-lmm.md`](algorithms-lmm.md#fixed-effect-orthogonalization) (`src/lmm/kernel.rs`) |
 | `TAIL_SPARSE_MIN` | `128` — crossed Schur tails of size `e ≤ 128` keep the dense factor; larger tails take the fill-reducing sparse LLT | [`algorithms-lmm.md`](algorithms-lmm.md#the-sparse-kernel-two-level-schur-block-cholesky) (`src/sparse/mod.rs`) |
 | `outer_search` route | `ExactProfile` on the `exact_profile_shape` shapes (nAGQ=1 on the blocked or structured layout, not the packed one; canonical or not, Gamma included); else `Joint` when `nAGQ>1 \|\| (n_θ ≤ 2 && p ≤ 4)`; else `PqlThenJoint` | [`algorithms-glmm.md`](algorithms-glmm.md#β-profiling--the-three-outer-routes) (`src/glmm/workspace.rs`, `src/glmm/mod.rs`) |
-| `ExactProfile` stage-1 PIRLS tolerance | `clamp(RHO_TOL_C·ρ², pirls_tol, RHO_TOL_MAX)` with BOBYQA's ρ, `RHO_TOL_C = 1e-2`, `RHO_TOL_MAX = 1e-5`; `pirls_tol` on the first evaluation and once ρ ≤ `RHO_TOL_FULL_FACTOR·GLMM_RHO_END` (3e-5); a loose incumbent re-solved at `pirls_tol` | [`algorithms-glmm.md`](algorithms-glmm.md) (`src/glmm/mod.rs`) |
-| `JOINT_RECHECK_TOL` | `1e-9` relative: after a converged joint `[θ \| β̃]` search (on AGQ, also after a gradient-search finish), a PQL re-solve of β at the incumbent (then, on AGQ, the AGQ objective there) lower by more than this starts a second pass from it, on β̃ scaled by the β information | [`algorithms-glmm.md`](algorithms-glmm.md#β-profiling--the-three-outer-routes) (`src/glmm/mod.rs`) |
-| Gamma-inverse response units | first search on the draw's `y/c` while the largest cluster η is in `[1/64, 64]`, else on `y/c` rescaled by a further power of two to bring it into `[4, 8]`; a search that fails or ends no lower than the GLM point (`UNITS_RETRY_TOL = 1e-6` relative) is retried with the smallest start η in `[1/2, 64]` and the largest cluster η in `[4, 8]` and `[8, 16]` | [`algorithms-glmm.md`](algorithms-glmm.md#response-units) (`src/fit/glmm.rs`) |
+| `ExactProfile` stage-1 PIRLS tolerance | `clamp(RHO_TOL_C·ρ², pirls_tol, RHO_TOL_MAX)` with BOBYQA's ρ, `RHO_TOL_C = 1e-2`, `RHO_TOL_MAX = 1e-5`; `pirls_tol` on the first evaluation and once ρ ≤ `RHO_TOL_FULL_FACTOR·GLMM_RHO_END` (3e-5); a loose incumbent re-solved at `pirls_tol` | [`algorithms-glmm.md`](algorithms-glmm.md) (defined in `src/glmm/mod.rs`, used in `src/glmm/bobyqa_route.rs`) |
+| `JOINT_RECHECK_TOL` | `1e-9` relative: after a converged joint `[θ \| β̃]` search (on AGQ, also after a gradient-search finish), a PQL re-solve of β at the incumbent (then, on AGQ, the AGQ objective there) lower by more than this starts a second pass from it, on β̃ scaled by the β information | [`algorithms-glmm.md`](algorithms-glmm.md#β-profiling--the-three-outer-routes) (`src/glmm/bobyqa_route.rs`) |
+| Gamma-inverse response units | first search on `y/c` rescaled by the power of two nearest 1 that brings the largest cluster η into `[8, 16]`; a search that fails or ends no lower than the GLM point (`UNITS_RETRY_TOL = 1e-6` relative) is retried with the smallest start η in `[1/2, 64]` and the largest cluster η in `[4, 8]` and `[8, 16]`, skipping the first search's units | [`algorithms-glmm.md`](algorithms-glmm.md#response-units) (`src/fit/glmm.rs`) |
 | `ETA_DIVERGENCE_CAP` | `30` — GLM divergence guard: a fit that ends unsettled (at `MAX_IRLS_ITERS`, on an η its link does not evaluate, or on a failed solve) with some `|η_i − η₀| > 30` and a last step that still moves some η by more than `SEPARATION_STEP` → non-converged and separated; crossing 30 alone stops nothing, `η₀ = oᵢ` on the binomial links and `oᵢ + ln μ₀` (the null-model seed) on the log links; skipped under the Gamma inverse and inverse-Gaussian `1/μ²` links | [GLM](#generalised-linear-models-glm) (`src/glm.rs`) |
 | `PROB_EPS` / `UPPER_TAIL_Q` / `LOG_TAIL_ETA` | `1e-12` / `1e-4` / `230` — tail-row switch: binomial μ within `1e-12` of 0 or `1e-4` of 1, NB/Gamma/IG-log `\|η\| > 230` → deviance, score and weights from their η forms | [GLM](#generalised-linear-models-glm) (`src/family.rs`) |
 | `STEP_ULPS` | `16` — GLM round-off stop: a step that moved no η by more than 16 ULPs of max \|η\| ends the fit as converged | [GLM](#generalised-linear-models-glm) (`src/glm.rs`) |
@@ -519,7 +519,7 @@ deviance and dispersion, and `MASS::glm.nb` for the NB θ profile.
 validation rung of its own; the cbpp/grouseticks rungs exercise the same family
 math through the GLMM cold-start GLM fit.
 
-`fit_glm_prebuilt` runs adaptive IRLS cold-started at β = 0, converging on
+`fit_glm_prebuilt` runs adaptive IRLS cold-started at β = 0 (at the null-model β on the reciprocal links, see below), converging on
 R's `glm.fit` rule `|Δ deviance| / (|deviance| + 0.1) < DEVIANCE_TOL` with a
 `MAX_IRLS_ITERS` safety cap. On Gamma and inverse-Gaussian the floor
 (`dev_floor`) is R's plain `0.1`: the core fits these families on `ŵ` and
@@ -595,20 +595,11 @@ end of a binomial, Poisson or NB fit as running off, the view's `separated`
 flag is set; the GLMM cold start reads it (see
 [`algorithms-glmm.md`](algorithms-glmm.md#warm-starts-and-workspace-reuse)).
 
-The η seed at
-that β = 0 start is **family-specific** — a plain η = 0 start is wrong for most
+The cold seed is **family-specific** — a plain η = 0 start is wrong for most
 of the regimes:
 
 - **Logit/probit/cloglog binomial:** η = 0 (μ = ½), the standard start.
-- **Gamma with the inverse link:** η = 0 is singular under `g(μ) = 1/μ`, so
-  each row seeds `η = 1/yᵢ` (R's `etastart = 1/y` convention), clamped to the
-  link's own η bounds (`clamp_eta`) so a zero or tiny row cannot produce an
-  infinite seed; the response itself is not floored, so the seed does not
-  depend on y's units.
-- **Inverse-Gaussian with the `InverseSquared` link:** η = 0 puts μ at ∞ under
-  `g(μ) = 1/μ²`, so each row seeds `η = 1/yᵢ²` clamped to the link's η bounds
-  (R's `mustart = y` convention), the same shape of fix as the Gamma-inverse
-  seed above.
+- **The reciprocal links, Gamma's inverse `g(μ) = 1/μ` and inverse-Gaussian's `InverseSquared` `g(μ) = 1/μ²`:** η = 0 puts μ at ∞ and η ≤ 0 is outside the domain. With an intercept column the seed is the null-model β (intercept `link(ȳ)`, every slope 0), a real β: its deviance is accepted at pass 0, so a first Fisher step that leaves the domain is halved back toward it like any later step. Without an intercept, a column whose entries all share one sign gives a β in the domain the same way, `βⱼ = link(ȳ)/x̄ⱼ`. With neither, or when `o + Xβ` at that β leaves the domain on some row, η seeds per row at μ₀ = y (`η = 1/yᵢ` on Gamma, `1/yᵢ²` on inverse-Gaussian; R's `mustart = y`) with β = 0, clamped to the link's own η bounds (`clamp_eta`). The response itself is not floored, so neither seed depends on y's units.
 - **Log-link families (Poisson, NB, Gamma, inverse-Gaussian):** each row seeds
   the null model with the offset, `η₀ᵢ = oᵢ + ln r` with `r = Σwy / Σw·e^o`
   (`r = ȳ` without an offset; R starts every row at `μ₀ = y`, or `y + 0.1` for
@@ -630,8 +621,7 @@ rather than once per row:
   `pw_and_log1pexp_sum`, which computes the probability `p`, the working weight
   `W`, and the `Σ log1pexp(η)` deviance fold in one vectorised pass, sharing a
   single `exp(−|η|)` evaluation between the probability and the deviance term.
-  This is the MCPower hot path and is byte-identical to the standalone fast path
-  it grew out of. Its deviance identity `2·(Σ log1pexp(η) − Σ y·η)` holds only
+  This is the loop tier's hot path. Its deviance identity `2·(Σ log1pexp(η) − Σ y·η)` holds only
   for unweighted Bernoulli rows, which is why prior weights, and a response
   with a value other than 0 and 1, route elsewhere (`glm_irls_fit`'s
   `weighted` flag, which also picks the null deviance's form).
@@ -647,11 +637,11 @@ rather than once per row:
   fallback.
 - **Inverse-Gaussian `InverseSquared`** (`μ = η^(−1/2)`) uses pulp's
   `sqrt_f64s`, which is IEEE-exact, so this arm's SIMD and scalar halves agree
-  to the bit — the same domain-infeasibility handling as Gamma-inverse below
-  (`η > 0`).
-- **Weighted logit** and **Gamma-inverse** have arms of the same shape; the
-  Gamma-inverse one carries one of the two live domain-infeasibility flags
-  (`μ = 1/η` needs `η > 0`), reduced lane-wise rather than OR'd per row.
+  to the bit.
+- **Weighted logit** and **Gamma-inverse** have arms of the same shape. On
+  both reciprocal links (`μ = 1/η` and `μ = η^(−1/2)` need `η > 0`), an
+  `η ≤ 0` row is flagged by `family_pass`'s `out_of_range` scan of the raw η,
+  not inside the arm.
 
 Every arm is a `pulp` SIMD body plus a bit-identical scalar tail for the
 sub-lane remainder, and reads its formulas from `src/family.rs`, which stays the
@@ -768,12 +758,15 @@ accepted β and the deviance is re-evaluated, up to `PIRLS_MAX_HALVINGS = 16`
 times per pass. R's `glm.fit` halves only on the last two. Fisher steps raise
 the deviance where the observed curvature is far from the expected one: from
 the null-model start an inverse-Gaussian/log fit can run off to β ~ 1e74 while
-a finite maximum exists. A finite rise that outlasts all 16 halvings is kept;
-within the PIRLS band (`pirls_tol`) it is the deviance's own round-off (the
-Fisher step is a descent direction), and the round-off stop ends the fit as
-converged — at large NB counts that round-off sits above `DEVIANCE_TOL`. An
-infeasible or non-finite one ends the fit non-converged. A cold seed's η is not
-`Xβ`, so the first solve is never halved. On the canonical links (logit,
+a finite maximum exists. When a finite rise outlasts all 16 halvings, within
+the PIRLS band (`pirls_tol`) the fit returns to the accepted β and the
+round-off stop ends it there as converged: the Fisher step is a descent
+direction, so such a rise is the deviance's own round-off, which at large NB
+counts sits above `DEVIANCE_TOL`. A larger finite rise is kept. An
+infeasible or non-finite one ends the fit non-converged. A per-row or
+null-location seed's η is not `Xβ`, so the first solve from it is never halved;
+the null-model β of the reciprocal links is a real β, whose deviance is the
+halving reference from pass 0. On the canonical links (logit,
 Poisson/log) the deviance is convex and Fisher scoring is Newton's method, but
 from a far start on a nearly singular `XᵀWX` a Newton step can still overshoot
 and the fit runs off: on an ill-conditioned logit design the first bad pass
@@ -805,7 +798,9 @@ never run the detector, and a fit it does not fire on is bit-identical.
 inverse-Gaussian/log) each pass after the first also solves the weighted
 normal equations on the observed weight `W_obs = −∂²ℓᵢ/∂ηᵢ²`
 (`family::observed_weight`, the weight the PIRLS Newton step uses) with the
-score `ρ = −½·∂dᵢ/∂η` (`family::row_score`) on the right-hand side, and steps
+score `ρ = −½·∂dᵢ/∂η` (`family::row_score`) on the right-hand side (on probit
+both are read through `family::ProbitRows`, which takes φ(η) from the
+vectorised `exp`), and steps
 with that solution: Newton's method, quadratic near the maximum. Fisher
 scoring converges only linearly there, slowly enough on flat
 inverse-Gaussian/log surfaces to run out the 50-pass budget, and on a cloglog

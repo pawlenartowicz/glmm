@@ -329,6 +329,56 @@ fn bfgs_reaches_the_rosenbrock_minimum() {
     assert!(out.f < 1e-8, "{out:?}");
 }
 
+/// The inverse update keeps `H` bitwise symmetric: the curvature callers read
+/// it as a symmetric matrix.
+#[test]
+fn bfgs_inverse_hessian_stays_bitwise_symmetric() {
+    let w = [0.7, -1.3, 2.1, 0.4];
+    let f = |x: &[f64]| {
+        let t: f64 = (0..4).map(|i| w[i] * x[i]).sum();
+        (0..4)
+            .map(|i| (x[i] * (1.0 + 0.3 * i as f64)).exp())
+            .sum::<f64>()
+            + 0.25 * t.powi(4)
+    };
+    let g = |x: &[f64], g: &mut [f64]| {
+        let t: f64 = (0..4).map(|i| w[i] * x[i]).sum();
+        for i in 0..4 {
+            let a = 1.0 + 0.3 * i as f64;
+            g[i] = a * (a * x[i]).exp() + t.powi(3) * w[i];
+        }
+    };
+    let mut obj = closed(f, g);
+    let mut x = [0.9, -0.4, 0.6, 1.1];
+    let mut st = BfgsState::default();
+    let cfg = BfgsConfig {
+        max_iter: 3,
+        ..BfgsConfig::LMM
+    };
+    let out = bfgs_minimize(
+        &mut obj,
+        &mut x,
+        &[-5.0; 4],
+        &[5.0; 4],
+        &cfg,
+        &mut st,
+        None,
+        &[],
+    );
+    assert_eq!(out.stop, BfgsStop::MaxIter, "{out:?}");
+    let h = st.inv_hessian();
+    assert!(h[1] != 0.0, "no off-diagonal update: {h:?}");
+    for i in 0..4 {
+        for j in 0..i {
+            assert_eq!(
+                h[i * 4 + j].to_bits(),
+                h[j * 4 + i].to_bits(),
+                "H[{i},{j}]: {h:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn bfgs_stops_on_an_active_bound() {
     // Unconstrained optimum (3, −2) lies outside [−1, 1]²; the box optimum is
@@ -356,7 +406,7 @@ fn bfgs_stops_on_an_active_bound() {
     assert_eq!(out.decrement, 0.0);
 }
 
-/// Contract C1: the gradient is asked for only right after a full-tolerance
+/// Contract: the gradient is asked for only right after a full-tolerance
 /// value call that returned a finite value, and that point is where the
 /// search goes next (or the start).
 #[test]

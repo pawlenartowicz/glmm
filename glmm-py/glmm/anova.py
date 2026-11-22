@@ -28,33 +28,10 @@ from glmm import (
     _native,
     _prepare_columns,
 )
-from glmm.summary import Rendered, fmt, fmt_df, fmt_p, stars
+from glmm.summary import Rendered, _f64_bytes, fmt, fmt_df, fmt_p, stars
 
 _LEGEND = "Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1"
-_RLRT = "exact RLRT null distribution (Crainiceanu & Ruppert 2004)"
-# The per-term heading and note texts (_NOT_CONVERGED, _LRT_LINE,
-# _AUTO_REASONS, _WALD_LINE, _ETA2_LINE, and `_term_table`'s heading) are copied in
-# validation/tools/anova_ports/anova_ports.rs, which the anova port gate
-# compares with both ports - change together.
-_NOT_CONVERGED = (
-    "The fit did not converge, so its estimates are not at a maximum and these tests "
-    "are not reliable. Change the model until it converges (a simpler random part often "
-    "helps), then test again."
-)
-_LRT_LINE = "Likelihood-ratio chi-squared tests (each term's model refitted without it)"
 _TESTS = ("auto", "Wald", "LRT")
-# Why "auto" gave a chi-squared table its test, by the fit's `term_test_auto`
-# reason. Mirrors the R port's .AUTO_REASONS and
-# validation/tools/anova_ports/anova_ports.rs - change together.
-_AUTO_REASONS = {
-    "poisson_mixed": "Poisson model with random effects",
-    "binomial_mixed": "binomial model with random effects",
-    "negative_binomial_mixed": "negative binomial model with random effects",
-    "other_mixed": "Gamma model with random effects",
-    "no_random_effects": "model without random effects",
-}
-_WALD_LINE = "Wald chi-squared tests"
-_ETA2_LINE = "Partial eta-squared uses the Satterthwaite denominator df, so it is approximate."
 
 
 class _Default(str):
@@ -139,6 +116,7 @@ class TermTable(_Table):
     heading: str
     notes: list
     ss_type: str | None  # "III" or "II"; None on `Fit.contrast_test`'s row
+    _references: list  # each row's reference distribution, "" for none
 
     def _cells(self):
         p_col = "Pr(>F)" if "Pr(>F)" in self._values else "Pr(>Chisq)"
@@ -162,14 +140,9 @@ class TermTable(_Table):
 
     def _tables(self):
         header, cells, marks = self._cells()
-        # Each row's reference, from its own df columns.
-        if "DenDF" in self._values:
-            refs = [_f_reference(a, b) for a, b in zip(self["NumDF"], self["DenDF"])]
-        else:
-            refs = [_chisq_reference(a) for a in self["Df"]]
         rows = [
             [name, *row, mark, ref]
-            for name, row, mark, ref in zip(self.row_names, cells, marks, refs)
+            for name, row, mark, ref in zip(self.row_names, cells, marks, self._references)
         ]
         return [("Terms", ["", *header, "", "Reference"], rows)]
 
@@ -320,22 +293,11 @@ class ProfileTable(_Table):
         return list(self.notes)
 
 
-def _profile_table(r, reml):
-    """The `ProfileTable` of the native `profile_intervals`' dict `r`; `reml`
-    says the fit was made by REML, so the profiles ran on its ML refit."""
+def _profile_table(r):
+    """The `ProfileTable` of the native `profile_intervals`' dict `r`."""
     est, lo, hi = (np.asarray(r[k], dtype=float) for k in ("estimate", "lower", "upper"))
-    level = float(r["level"])
-    note = "Profile intervals on the ML fit"
-    notes = [note + ("; the REML fit was refitted by ML." if reml else ".")]
-    for name, e, a, b in zip(r["names"], est, lo, hi):
-        sides = [s for s, v in (("lower", a), ("upper", b)) if math.isnan(v)]
-        if math.isnan(e):
-            notes.append(f"{name}: not identified next to an SD estimated at 0, so NaN.")
-        elif sides:
-            notes.append(f"{name}: the {' and '.join(sides)} bound is undetermined (NaN).")
-    heading = f"Profile-likelihood confidence intervals, level {level:g}"
     values = {"estimate": est, "lower": lo, "upper": hi}
-    return ProfileTable(values, list(r["names"]), heading, notes, level)
+    return ProfileTable(values, list(r["names"]), r["heading"], list(r["notes"]), float(r["level"]))
 
 
 @dataclass(repr=False, eq=False)
@@ -552,7 +514,7 @@ def anova(*fits, type=None, test=_AUTO, nsim=None, seed=None):
         )
     args = {"m0": _side(fits[0]), "m1": _side(fits[1]), "nsim": nsim, "seed": seed}
     r = _native.call("compare_fits", args)
-    return _comparison_table(r, ("m0", "m1"), None)
+    return _comparison_table(r, ("m0", "m1"))
 
 
 def compare(
@@ -650,7 +612,7 @@ def compare(
     fit0, fit1 = (
         _fit_from_native(r[key], f, list(store), kept) for key, f in (("fit0", f0), ("fit1", f1))
     )
-    return Comparison(_comparison_table(r, ("f0", "f1"), r["fit0"]["family"]), fit0, fit1)
+    return Comparison(_comparison_table(r, ("f0", "f1")), fit0, fit1)
 
 
 def _type_name(x):
@@ -689,67 +651,45 @@ def _side(m):
         "converged": bool(m.converged),
         "varcorr": [rows(b) for b in m.varcorr],
         "re_groups": [(name, list(terms)) for name, terms in m.re_groups],
-        "y": rows(m.y),
-        "weights": rows(m.weights),
+        "y": _f64_bytes(m.y),
+        "weights": _f64_bytes(m.weights),
         "weight_power": float(m.weight_power),
         "weight_power_estimated": bool(m.estimated_weight_power),
-        "offset": rows(m.offset),
+        "offset": _f64_bytes(m.offset),
         "dispersion_held": None if m.dispersion_held is None else float(m.dispersion_held),
         "design_summary": None
         if ds is None
         else (rows(ds["counts"]), rows(ds["s"]), rows(ds["c"])),
         "rss": float(m.rss),
-        "coef_names": list(m.names),
-        "coef": rows(m.beta),
+        "names": list(m.names),
+        "beta": rows(m.beta),
         "vcov": np.asarray(m.vcov, dtype=float).reshape(len(m.beta), len(m.beta)).tolist(),
         "aliased": [bool(a) for a in m.aliased],
     }
 
 
-# The heading's name of each denominator-df source, in heading order. Mirrors
-# the R port's .DF_METHODS and validation/tools/anova_ports/anova_ports.rs -
-# change together.
-_DF_METHODS = (
-    ("pustejovsky_tipton", "Pustejovsky-Tipton's"),
-    ("bell_mccaffrey", "Bell-McCaffrey's"),
-    ("satterthwaite", "Satterthwaite's"),
-)
-
-
-def _df_methods_phrase(kinds):
-    """ " with X's method" (or "X's and Y's methods") for the df sources in
-    `kinds`, "" for none (the residual df is not named)."""
-    names = [name for kind, name in _DF_METHODS if kind in kinds]
-    if not names:
-        return ""
-    return " with " + " and ".join(names) + (" methods" if len(names) > 1 else " method")
-
-
 def _term_table(m, stored, test):
     """The `TermTable` of a stored per-term result (`Fit.term_table_type3`),
     read for `glmm.anova(m, test=test)`, or of `Fit.contrast_test`'s row, whose
-    `ss_type` is None, so its heading names no type."""
-    error = stored["error"]
-    if error is not None:
-        # A panic caught while the table was built is the crate's fault, not
-        # the model's: an error, not a refusal.
-        raise (RuntimeError if error.startswith("internal error") else ValueError)(error)
+    `ss_type` is None, so its heading names no type. The native
+    `term_table_text` words the heading and notes, and raises a stored
+    refusal (`RuntimeError` for a crate bug, else `ValueError`, each with its
+    `.code`)."""
+    auto = getattr(m, "term_test_auto", None)
+    words = _native.call(
+        "term_table_text",
+        {
+            "table": stored,
+            "test": test,
+            "df_method": m.df_method,
+            "converged": bool(m.converged),
+            "term_test_auto": auto,
+        },
+    )
     ss = stored["ss_type"]
-    prefix = "" if ss is None else f"Type {ss} "
     labels = list(stored["label"])
-    if labels:
-        f_rows = stored["kind"][0] == "F"
-        # The heading names the df method of the rows that have df: on a fit
-        # with the pass switched off or failed, no row does.
-        kinds = {
-            kind for kind, d in zip(stored["den_df_kind"], stored["den_df"]) if math.isfinite(d)
-        }
-    else:
-        f_rows = m.df_method != "none"
-        kinds = {m.df_method}
-    satterthwaite = "satterthwaite" in kinds
+    f_rows = stored["kind"][0] == "F" if labels else m.df_method != "none"
     if f_rows:
-        heading = f"{prefix}Analysis of Variance Table" + _df_methods_phrase(kinds)
         values = {
             "Sum Sq": stored["sum_sq"],
             "Mean Sq": stored["mean_sq"],
@@ -759,80 +699,22 @@ def _term_table(m, stored, test):
         }
         # A fit stored before the column, and a contrast, have none. It sits
         # before the p-value, which R's print.anova needs last for its stars.
-        eta2 = "eta2_partial" in stored
-        if eta2:
+        if "eta2_partial" in stored:
             values["Eta2_partial"] = stored["eta2_partial"]
         values["Pr(>F)"] = stored["p_value"]
     else:
-        if stored.get("test") == "lrt" or test == "auto":
-            # The second line names the test and why it ran, as the R port's;
-            # an explicit "Wald" keeps the one-line heading.
-            if stored.get("test") == "lrt":
-                line = _LRT_LINE + (" on the reduced design" if ss == "III" else "")
-            else:
-                line = _WALD_LINE
-            why = (
-                'test = "LRT"'
-                if test == "LRT"
-                else f'test = "auto": {_AUTO_REASONS[m.term_test_auto["reason"]]}'
-            )
-            heading = f"Type {ss} Analysis of Deviance Table\n{line}; {why}"
-        else:
-            heading = f"{prefix}Analysis of Deviance Table (Wald chi-squared tests)"
         values = {
             "Chisq": stored["statistic"],
             "Df": stored["num_df"],
             "Pr(>Chisq)": stored["p_value"],
         }
-    row_notes = [
-        f"{label}: {note}" for label, notes in zip(labels, stored["row_notes"]) for note in notes
-    ]
-    notes = ([] if m.converged else [_NOT_CONVERGED]) + list(stored["notes"]) + row_notes
-    if f_rows and eta2 and satterthwaite:
-        notes.append(_ETA2_LINE)
-    return TermTable(values, labels, heading, notes, ss)
+    heading = "\n".join(words["heading"])
+    return TermTable(values, labels, heading, list(words["notes"]), ss, list(words["references"]))
 
 
-# One notation for a reference distribution in both tables. A row with no df
-# (an aliased term, a row with no denominator df) names none: an empty cell.
-def _f_reference(num_df, den_df):
-    if math.isnan(num_df) or math.isnan(den_df):
-        return ""
-    return f"F({fmt_df(num_df)}, {fmt_df(den_df)})"
-
-
-def _chisq_reference(df):
-    return "" if math.isnan(df) else f"χ²({fmt_df(df)})"
-
-
-def _reference(ref):
-    """The distribution a comparison's p-value is read from, in words."""
-    kind = ref["kind"]
-    if kind == "chisq":
-        return _chisq_reference(ref["df"])
-    if kind == "chibar":
-        k = ref["df"]
-        return f"50:50 mixture of {_chisq_reference(k)} and {_chisq_reference(k + 1)}"
-    if kind == "exact":
-        if ref["nsim"] == 0:
-            return f"{_RLRT}; no draws needed: the statistic is 0, so p = 1"
-        return f"{_RLRT}, {ref['nsim']} draws"
-    return _f_reference(ref["df"], ref["den_df"])
-
-
-def _heading(r):
-    if r["test"] == "f":
-        return "Model comparison: F test"
-    objective = r["objective"]
-    if objective == "reml":
-        return "Model comparison: likelihood ratio test on the REML criterion"
-    label = {"laplace": "Laplace", "agq": f"AGQ {r['objective_nodes']}"}.get(objective, "ML")
-    return f"Model comparison: likelihood ratio test ({label})"
-
-
-def _comparison_table(r, labels, family):
+def _comparison_table(r, labels):
     """The `ComparisonTable` of a native comparison dict; `labels` names the two
-    sides as given, `family` is `compare`'s (None from `anova`)."""
+    sides as given."""
     nan = math.nan
     large = r["larger"]
     order = [1 - large, large]
@@ -848,31 +730,26 @@ def _comparison_table(r, labels, family):
         values["logLik"] = [s["loglik"] for s in sides]
         values.update({"Chisq": test, "Df": df, "Pr(>Chisq)": p})
         blank = {(0, "Chisq"), (0, "Df"), (0, "Pr(>Chisq)")}
-        if r["reference"]["kind"] == "exact":
+        if r["reference_kind"] == "exact":
             # The exact reference is not a chi-squared: no Df.
             values["Df"] = [nan, nan]
             blank.add((1, "Df"))
     else:
-        # The residual df n - p, p the retained columns (npar counts sigma or phi too).
-        values = {"Res.Df": [s["nobs"] - (s["npar"] - 1) for s in sides]}
-        ols = all(math.isfinite(s["rss"]) for s in sides)
-        if ols:
+        values = {"Res.Df": [s["res_df"] for s in sides]}
+        if r["ols"]:
             values["RSS"] = [s["rss"] for s in sides]
         values["Df"] = df
-        if ols:
-            values["Sum of Sq"] = [nan, sides[0]["rss"] - sides[1]["rss"]]
+        if r["ols"]:
+            values["Sum of Sq"] = [nan, r["sum_sq"]]
         values.update({"F": test, "Pr(>F)": p})
         blank = {(0, c) for c in ("Df", "Sum of Sq", "F", "Pr(>F)")}
-    notes = list(r["notes"])
-    if family == "gaussian" and r["test"] == "lr" and r["differs"] != "random":
-        notes.append("Both models were fitted by ML because their fixed parts differ.")
     return ComparisonTable(
         {k: np.asarray(v, dtype=float) for k, v in values.items()},
         [labels[i] for i in order],
-        _heading(r),
-        notes,
+        "\n".join(r["heading"]),
+        list(r["notes"]),
         [(labels[i], r["sides"][i]["formula"]) for i in order],
-        _reference(r["reference"]),
+        r["reference"],
         r["nsim"],
         r["seed"],
         blank,

@@ -1,6 +1,6 @@
 # predict(), simulate() and ranef(condVar = TRUE): what crosses the port
 # boundary and how it is worded. The numbers themselves are checked in the
-# crate (RULE 6).
+# crate.
 
 predict_data <- function() {
   set.seed(20261026)

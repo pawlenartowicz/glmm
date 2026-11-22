@@ -53,7 +53,12 @@ suppressMessages({
 suite_dir <- normalizePath(file.path(dirname(sub(
   "--file=", "", grep("--file=", commandArgs(FALSE), value = TRUE))), ".."))
 source(file.path(suite_dir, "grid", "engines", "versions.R"))
+source(file.path(suite_dir, "grid", "engines", "common.R"))   # r_link
 pins <- grid_versions(file.path(suite_dir, "grid"))
+# The packages that write numbers into these references, at their pins; glmmTMB
+# and GLMMadaptive are checked where they are attached (see above).
+assert_pkg_version("lme4", pins[["lme4"]])
+assert_pkg_version("MASS", pins[["MASS"]])
 
 manifest <- fromJSON(file.path(suite_dir, "manifest.json"), simplifyDataFrame = FALSE)
 out_dir  <- file.path(suite_dir, "goldens")
@@ -64,9 +69,7 @@ fam_obj <- function(family, link) switch(family,
   poisson  = poisson(link = link),
   binomial = binomial(link = link),
   gamma    = Gamma(link = link),
-  # "inverse_squared" is the port's spelling of R's "1/mu^2" -- the same mapping
-  # .normalize_family applies on the R port side; keep the two spellings consistent.
-  inversegaussian = inverse.gaussian(link = if (link == "inverse_squared") "1/mu^2" else link),
+  inversegaussian = inverse.gaussian(link = r_link(link)),
   stop("fam_obj: unsupported family ", family))
 
 # VarCorr blocks -> per grouping factor: term names, stddevs, correlation matrix.
@@ -127,6 +130,7 @@ read_dataset <- function(spec) {
 # not this oracle.
 fit_one_glmmadaptive <- function(spec, df) {
   # Attached here rather than at the top of the file -- see the header note.
+  assert_pkg_version("GLMMadaptive", pins[["GLMMadaptive"]])
   suppressMessages(library(GLMMadaptive))
   nagq <- as.integer(spec$nagq)
   # Tightened controls, recorded per JSON (the lme4.R tolPwrss=1e-13 precedent):
@@ -186,6 +190,7 @@ fit_one_glmmadaptive <- function(spec, df) {
 # at the row's `reml` and writes the lmer row's fields (se, sigma), so it reads
 # like the other LMM goldens.
 fit_one_glmmtmb <- function(spec, df) {
+  assert_pkg_version("glmmTMB", pins[["glmmTMB"]])
   suppressMessages(library(glmmTMB))
   fam <- switch(spec$family,
     gaussian = stats::gaussian(),
@@ -198,10 +203,16 @@ fit_one_glmmtmb <- function(spec, df) {
   # glmmTMB's default start is beta = 0; on an inverse link (sim_gamma_inv_glmm)
   # that is eta = 0, mu = Inf, and the fit stops at "negative log-likelihood is
   # NaN at starting parameter values". Only then is the fit retried from the
-  # fixed-effects GLM's beta, so every golden that converges from the default
-  # start is unaffected by this branch.
+  # fixed-effects GLM's beta, with a warning naming the spec (the JSON records no
+  # trace of the retry), so every golden that converges from the default start is
+  # unaffected by this branch and any other error stops the spec. Same rule as
+  # grid/engines/glmmtmb.R.
   reml <- isTRUE(spec$reml)
   m <- tryCatch(glmmTMB::glmmTMB(fm, data = df, family = fam, REML = reml), error = function(e) {
+    msg <- conditionMessage(e)
+    if (!grepl("NaN at starting parameter values", msg, fixed = TRUE)) stop(e)
+    warning(sprintf("%s: glmmTMB's default start failed (%s); refitted from the fixed-effects GLM beta",
+                    spec$name, msg), call. = FALSE, immediate. = TRUE)
     b0 <- coef(glm(lme4::nobars(fm), data = df, family = fam))
     glmmTMB::glmmTMB(fm, data = df, family = fam, REML = reml, start = list(beta = unname(b0)))
   })
@@ -280,8 +291,8 @@ fit_one_lme4 <- function(spec, df) {
   # `engine` records the function that actually produced the fit, not the package
   # that owns the branch: only 23 of these 32 goldens come from lme4. Six kind=glm
   # rungs are stats::glm and three are MASS::glm.nb, and a doc line claiming "matches
-  # lme4" over a MASS-generated fixture is a silent convention mismatch (the review's
-  # Axis 2). Metadata only -- nothing downstream reads this field.
+  # lme4" over a MASS-generated fixture is a silent convention mismatch.
+  # Metadata only -- nothing downstream reads this field.
   if (spec$kind == "glm") {
     m <- if (spec$family == "negbin") MASS::glm.nb(fm, data = df)
          else glm(fm, data = df, family = fam_obj(spec$family, spec$link))
@@ -298,7 +309,7 @@ fit_one_lme4 <- function(spec, df) {
   } else if (spec$kind == "lmm") {
     # Gaussian LMM via lmer (glmer has no gaussian family). Schema mirrors the
     # curated LMM goldens (se + varcomp + sigma), NOT the glmer se_hessian/se_rx
-    # form -- the #3 VarCorr test reads beta + varcomp only.
+    # form -- the VarCorr test reads beta + varcomp only.
     reml <- if (is.null(spec$reml)) TRUE else isTRUE(spec$reml)
     m <- lme4::lmer(fm, data = df, REML = reml)
     engine <- "lme4::lmer"

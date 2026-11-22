@@ -1,6 +1,6 @@
 [package]
 name = "glmm"
-version = "0.9.3"
+version = "0.9.4"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -34,11 +34,13 @@ formula = ["dep:regex"]
 # kernels and their workspaces). Capability-named, multi-consumer. OFF by
 # default and NOT part of the semver-covered surface.
 loop_advanced = []
-# String-typed fit orchestration shared by the FFI ports (`glmm-python`,
-# `glmm-r`): one definition of the family/link string vocabulary and the
-# result flattening both ports publish, instead of two mirrored copies, plus
-# the formula internals they use (`formula::parse`, `materialize`,
-# `label_ranef`, `anova::compare_stored`). OFF by default and, like
+# Fit orchestration that `glmm-bind` calls for the FFI ports (`glmm-python`,
+# `glmm-r`): typed entry points (`run_fit` takes a `Family` and `FitOptions`;
+# its result carries `NoteInfo` records, a `DfMethod` and a `StopReason`), the
+# family/link string map, and the result flattening both ports publish,
+# instead of two mirrored copies, plus the formula internals they use
+# (`formula::parse`, `materialize`, `label_ranef`, `anova::compare_stored`).
+# OFF by default and, like
 # `loop_advanced`, NOT part of the semver-covered surface: its shape follows
 # the ports' needs. Needs `formula`, which `run_fit` lowers through.
 orchestrate = ["formula"]
@@ -80,7 +82,7 @@ oracle-tests = ["orchestrate"]
 # `run_compare`, whose default calls they check.
 montecarlo-tests = ["formula", "orchestrate"]
 # In-fit parallelism (AGQ cluster loop, FD-Hessian grid) via rayon's global pool.
-# OFF by default: a batch/MCPower caller running its own outer rayon loop over
+# OFF by default: a batch caller running its own outer rayon loop over
 # many fits should pay nothing for this, not even rayon's per-split overhead.
 # Compile-excluded on wasm32 (`dep:rayon` only pulled in on non-wasm targets
 # below) — a no-op there, not a broken build. Gated at runtime by

@@ -1,5 +1,6 @@
 //! Block-diagonal PIRLS solve for the no-extras regime (`pirls_solve_blocked`).
 
+use super::control::{Merit, PirlsControl, Trial};
 use super::*;
 
 /// The block-diagonal Laplace layout: `A = M'WM + I` is `s` independent
@@ -23,6 +24,13 @@ pub(crate) struct BlockedFactor<'a, T> {
     pub(crate) s: usize,
     /// `q·s`, the packed RE length.
     pub(crate) k: usize,
+    /// len `s`: each cluster's half `log|A_f|`, written by `factor_logdet`
+    /// (the AGQ scale term reads it; `L`'s diagonal has lost its digits where
+    /// `A_f` is within ε of `I`).
+    pub(crate) half_logdet: &'a mut [T],
+    /// `s·q²`, the layout of `a_blocks`: `factor_logdet` copies each block
+    /// (`A_f − I`) into it before factoring (`PirlsScratch::a_excess`).
+    pub(crate) excess: &'a mut [T],
 }
 
 impl<T: Scalar> LaplaceFactor<T> for BlockedFactor<'_, T> {
@@ -37,7 +45,7 @@ impl<T: Scalar> LaplaceFactor<T> for BlockedFactor<'_, T> {
                 e += m_row[c] * u[ubase + c];
             }
             eta[i] = e;
-            yeta += T::from_f64(y[i]) * eta[i];
+            yeta += eta[i].scale(y[i]);
         }
         yeta
     }
@@ -68,9 +76,8 @@ impl<T: Scalar> LaplaceFactor<T> for BlockedFactor<'_, T> {
                 *v = T::ZERO;
             }
         }
-        // --- scatter-pass (scalar): wᵢmᵢmᵢ' and rᵢ·mᵢ into the blocks.
-        // The effective residual rᵢ is logit's (yᵢ−pᵢ) or the general W·working_resid
-        // (probit's through `family::ProbitRows`). ---
+        // --- scatter-pass (scalar): wᵢmᵢmᵢ' and ρᵢ·mᵢ into the blocks, ρᵢ the
+        // row score (`row_rho`). ---
         let mut probit_rows = crate::family::ProbitRows::new(family, eta, prob);
         for i in 0..n {
             let m_row = &m_buf[i * q..i * q + q];
@@ -78,18 +85,16 @@ impl<T: Scalar> LaplaceFactor<T> for BlockedFactor<'_, T> {
             let ubase = f * q;
             let ablk = f * q * q;
             let wi = w[i];
-            let resid = T::from_f64(prior_w[i])
-                * match family {
-                    Family::Binomial {
-                        link: BinomialLink::Logit,
-                    } => T::from_f64(y[i]) - prob[i],
-                    other => match probit_rows.as_mut() {
-                        Some(rows) => T::from_f64(rows.score(i, y[i], 1.0)),
-                        None => {
-                            crate::family::row_score(other, nb_theta, y[i], 1.0, eta[i], prob[i])
-                        }
-                    },
-                };
+            let resid = super::row_rho(
+                family,
+                nb_theta,
+                i,
+                y[i],
+                prior_w[i],
+                eta[i],
+                prob[i],
+                probit_rows.as_mut(),
+            );
             for r in 0..q {
                 a_rhs[ubase + r] += m_row[r] * resid;
                 let wr = wi * m_row[r];
@@ -120,15 +125,10 @@ impl<T: Scalar> LaplaceFactor<T> for BlockedFactor<'_, T> {
         let mut logdet = T::ZERO;
         for f in 0..s {
             let ablk = f * q * q;
-            for r in 0..q {
-                a_blocks[ablk + r * q + r] += T::ONE;
-            }
-            if !glmm_block_chol(&mut a_blocks[ablk..ablk + q * q], q) {
-                return None;
-            }
-            for r in 0..q {
-                logdet += a_blocks[ablk + r * q + r].ln();
-            }
+            self.excess[ablk..ablk + q * q].copy_from_slice(&a_blocks[ablk..ablk + q * q]);
+            let h = crate::linalg::block_chol_unit_shift(&mut a_blocks[ablk..ablk + q * q], q)?;
+            self.half_logdet[f] = h;
+            logdet += h;
         }
         Some(logdet)
     }
@@ -165,8 +165,9 @@ impl<T: Scalar> LaplaceFactor<T> for BlockedFactor<'_, T> {
 /// block ⇒ `(NaN, NaN, NaN, false)`. Iterates from the caller-provided `u` (the
 /// warm-start seed); the caller owns resetting it per fit.
 ///
-/// Step-halving: see `pirls_solve_packed`'s doc — identical mechanism, `a_blocks` here
-/// plays the role of `pirls_solve_packed`'s `A`. A converged solve ends by
+/// Step-halving: as the step-halving paragraph of `pirls_solve_blocked_extras`'
+/// doc describes for each `beta_step`, with `a_blocks` in place of the
+/// structured factor. A converged solve ends by
 /// re-evaluating η/μ/W at the returned `u` and rebuilding and refactoring the
 /// blocks there ([`evaluate_at_mode`]), so `a_blocks`, `log|A|` and `dev` on
 /// return describe that iterate, preserving the `blocked_schur_fill` contract
@@ -195,9 +196,9 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
     // Dual derivative kernels' per-solve controls (see `DualStep`); `None` on
     // every f64 fit-path call.
     mut dual: Option<&mut DualStep<T>>,
-    // n × p = W∘X GEMM scratch for the Profile β-Schur border's C = X'WX
-    // (mirrors `pirls_solve_packed`'s `wx`; this variant has no dense M so there is no
-    // `wm` twin here — B' = X'WM is filled by cluster-scatter instead).
+    // n×p scratch: the design residual rows `rᵢ = xᵢ − Tᵀmᵢ` of the Profile β
+    // border (`residual_border`). This variant has no dense M, so B' = X'WM is
+    // filled by cluster-scatter.
     wx: &mut Mat<f64>,
     // Per-row linear-predictor offset (`Data::offset`), added into
     // `eta_fixed` by every `refresh_eta_fixed` call. `None` ⇒ no offset.
@@ -208,10 +209,10 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
     // the contract is stated.
     counters: &mut crate::counters::EvalCounters,
 ) -> (T, T, T, bool) {
-    // The β-Schur border below runs in f64 (its X'WX GEMM and p×p Cholesky are
-    // faer's, and reproducing them generically would move f64 bits). A non-f64
-    // instantiation must use BetaStep::Fixed — the derivative entry points do;
-    // exact generic β-profiling comes later. Loud, not silent: dropping
+    // The β-Schur border below runs in f64 (its p×p Cholesky is faer's, and
+    // reproducing it generically would move f64 bits). A non-f64
+    // instantiation must use BetaStep::Fixed — the derivative entry points do.
+    // Loud, not silent: dropping
     // derivatives here would be a wrong gradient, not a slow one.
     assert!(
         T::IS_F64 || matches!(beta_step, BetaStep::Fixed),
@@ -228,6 +229,8 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
         lam,
         a_blocks,
         a_rhs,
+        a_half_logdet,
+        a_excess,
         x_rows,
         bt_rows,
         ..
@@ -251,39 +254,25 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
         fill_x_rows(x, &mut x_rows[..n * p], n, p);
     }
     let xr_all: &[f64] = if rows_ok { &x_rows[..n * p] } else { &[] };
-    macro_rules! refresh {
-        () => {
-            if rows_ok {
-                refresh_eta_fixed_rows(xr_all, p, beta, eta_fixed, n, offset)
-            } else {
-                refresh_eta_fixed(x, beta, eta_fixed, n, p, offset)
-            }
-        };
-    }
+    let fx = FixedPart {
+        x,
+        rows: rows_ok.then_some(xr_all),
+        n,
+        p,
+        offset,
+    };
     // η_fixed,ᵢ = Σ_j x·β, hoisted out of the iteration (β fixed within the solve).
-    refresh!();
+    refresh_fixed(&fx, beta, eta_fixed);
     // M = ZΛ_p (mᵢ = Λ_p'·zᵢ, zᵢ = [1, x[i, slope_cols]] pre-widened into z_buf
     // per fit) is invariant within one solve — Λ and x are fixed; the iteration
-    // only mutates u/η/prob/w/blocks. Fill it once per solve. Measured on the
-    // glmm_slope profile (2026-06): the former per-row recompute closure was
-    // ~57% of fit runtime, >90% of that MatRef indexing / bounds checks / 64-byte
-    // return-by-value copies rather than FMA — buffering removes the overhead,
-    // not the math. Bit-identical: the same `Σ_{r≥c} z_r·lam[r·q+c]` reduction
-    // runs once per (i,c) in the same inner order, and both consumers below read
-    // the same f64 values in the same order.
+    // only mutates u/η/prob/w/blocks. Fill it once per solve. A per-row
+    // recompute costs ~57% of fit runtime on the glmm_slope profile, over 90% of
+    // that MatRef indexing, bounds checks and 64-byte return-by-value copies
+    // rather than FMA: buffering removes the overhead, not the math. Bit-identical: the same `zlam_row` reduction runs once per
+    // (i,c) in the same inner order, and both consumers below read the same f64
+    // values in the same order.
     for i in 0..n {
-        for c in 0..q {
-            let mut acc = T::ZERO;
-            for r in c..q {
-                let zr = if r == 0 {
-                    T::ONE
-                } else {
-                    T::from_f64(z_buf[i * (q - 1) + (r - 1)])
-                };
-                acc += zr * lam[r * q + c];
-            }
-            m_buf[i * q + c] = acc;
-        }
+        super::zlam_row(&z_buf[i * (q - 1)..], lam, q, &mut m_buf[i * q..i * q + q]);
     }
     // The `A`-layout view over the buffers the assembly, the factor and the
     // `A⁻¹` solve own. `m_buf` is complete above and read-only from here, so
@@ -298,6 +287,8 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
         q,
         s,
         k,
+        half_logdet: &mut a_half_logdet[..],
+        excess: &mut a_excess[..],
     };
     // First-trial backtrack seeds (u_prev = 0, beta_prev = caller's β) — only
     // the domain-infeasibility trigger can read them; see `pirls_solve_packed`.
@@ -318,54 +309,10 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
     {
         ex.u_acc[..k].fill(0.0);
     }
-    let mut pen_accepted = f64::INFINITY; // same-point penalized deviance at the last ACCEPTED iterate
-    let mut mixed_prev = f64::INFINITY; // the mixed `dev(uⱼ) + ‖uⱼ₊₁‖²` from the previous step
-    let mut halvings = 0usize;
     let mut converged = false;
-    // Period-2 damping state — see `PIRLS_OSC_RATIO`.
-    let mut dmix_prev = f64::NAN;
-    let mut osc_flips = 0usize;
-    let mut damp = false;
-    let min_iters = match dual.as_deref_mut() {
-        Some(d) => {
-            // Optimistic seed: paired with `observed = !canonical` the step
-            // this path takes IS the Hessian step, so one call suffices unless
-            // the non-PD observed factor further down takes it back. Mirrors
-            // `pirls_solve_blocked_extras`'s `exact` contract — change
-            // together; the reasoning is written out there.
-            d.exact = true;
-            d.min_iters
-        }
-        None => 0,
-    };
+    let mut ctl = PirlsControl::new(family, &beta_step, dual.as_deref_mut(), pirls_tol_override);
     let (mut dev, mut pen, mut logdet) = (T::from_f64(f64::NAN), T::from_f64(f64::NAN), T::ZERO);
-    let tol = pirls_tol_override.unwrap_or_else(|| super::super::pirls_tol(family));
-    // Exact-Laplace β-profile: the accept/halve decision moves from the
-    // penalized-deviance band (below) to the FULL Laplace merit `dev + pen_u +
-    // 2·log|A|` after the block sweep, since log|A| depends on this iteration's
-    // A and is not known until the factor is formed. `l_acc` is that merit at
-    // the last ACCEPTED (u, β) — cold start accepts unconditionally.
-    let exact = matches!(beta_step, BetaStep::Profile { exact: Some(_), .. });
-    let mut l_acc = f64::INFINITY;
-    // `|g_u'·δu₀|` at the point `l_acc` was measured at — how far that stored
-    // merit may itself be off. One half of the accept band below; see it for why
-    // both endpoints of the comparison are charged. Unread while `l_acc = ∞`
-    // (the first trial accepts unconditionally).
-    let mut l_acc_slack = 0.0_f64;
-    // Careful-mode state (see the exact merit test below). `acc_judged` says
-    // whether the stored `l_acc` was itself accepted by a comparison (the
-    // first trial is accepted unjudged); `refine` marks an iteration that
-    // re-steps u alone at the trial's β; `l_ref` is the merit at the previous
-    // iterate of that β and `pen_ref` its `dev + ‖u‖²`, the merit that u-only
-    // step backtracks on. `trust` is the border step's trust region.
-    let mut careful = false;
-    let mut acc_judged = false;
-    let mut refine = false;
-    let mut l_ref = f64::INFINITY;
-    let mut pen_ref = f64::INFINITY;
-    let mut ref_halvings = 0usize;
-    let mut trust = BorderTrust::new();
-    'iters: for it in 0..PIRLS_MAX_ITERS {
+    for it in 0..PIRLS_MAX_ITERS {
         counters.set_pirls_iters(it + 1);
         // --- trial evaluation at the CURRENT u: η-pass then η→prob/w/dev. On a
         // fresh accept this is the newly-stepped u; after a halving `continue` it
@@ -391,105 +338,88 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
             &mut [],
         );
         dev = d;
-        // Retrospective step-halving (lme4 `pwrssUpdate`, mirrors `pirls_solve_packed`):
-        // convergence band checked BEFORE the overshoot test (near the optimum
-        // the iteration is not strictly monotone — a step can land ε above
-        // `pen_accepted` yet inside the tol band, and that must converge, not burn
-        // all 10 halvings against FP noise). ‖u‖² is at the CURRENT trial u.
-        let mut pen_u = T::ZERO;
-        #[allow(clippy::needless_range_loop)]
-        for c in 0..k {
-            pen_u += u[c] * u[c];
-        }
+        // ‖u‖² is at the CURRENT trial u.
+        let pen_u = pen_sq(&u[..k]);
         let penalized = dev + pen_u;
-        // A careful-mode u-only step (β fixed) is judged the way lme4's
-        // `pwrssUpdate` judges a u-only PIRLS step: on `dev + ‖u‖²` against its
-        // origin, halving toward that origin with β untouched, never toward the
-        // accepted (u, β) the β line search below backtracks to.
-        if refine
-            && (infeasible
-                || !penalized.value().is_finite()
-                || penalized.value() - pen_ref > tol * (1.0 + penalized.value().abs()))
-        {
-            if ref_halvings < PIRLS_MAX_HALVINGS {
-                ref_halvings += 1;
-                for c in 0..k {
-                    u[c] = T::from_f64(0.5) * (u[c] + u_prev[c]);
-                }
+        match ctl.trial(penalized.value(), infeasible) {
+            Trial::Proceed => {}
+            Trial::RefineJump => {
+                // Past the η clamp: one jump back inside it, toward `u_prev`.
+                jump_back(
+                    &mut layout,
+                    family,
+                    y,
+                    &fx,
+                    &BetaStep::Fixed,
+                    u,
+                    u_prev,
+                    beta,
+                    eta_fixed,
+                    prob,
+                    eta,
+                    w,
+                    k,
+                );
                 continue;
             }
-            return (
-                T::from_f64(f64::NAN),
-                T::from_f64(f64::NAN),
-                T::from_f64(f64::NAN),
-                false,
-            );
-        }
-        // BAND-TOLERANT overshoot test, mirrors `pirls_solve_packed` (see its comments
-        // for why a within-band rise is accepted rather than converged-on or
-        // halved): only a rise EXCEEDING the tol band backtracks. A
-        // domain-infeasible trial halves regardless of the band (see
-        // `pirls_solve_packed`'s comment).
-        // Exact mode: the retrospective band above is on `dev + pen_u` alone,
-        // which is not the profiled objective (missing 2·log|A|) — only a
-        // domain-infeasible trial halves here; an overshoot on `dev + pen_u`
-        // is judged later, after log|A| is known, against the FULL merit.
-        if infeasible
-            || !penalized.value().is_finite()
-            || (!exact && penalized.value() - pen_accepted > tol * (1.0 + penalized.value().abs()))
-        {
-            trust.fail(acc_judged);
-            if halvings < PIRLS_MAX_HALVINGS {
+            Trial::RefineHalve => {
+                halve_u(&mut u[..k], &u_prev[..k]);
+                continue;
+            }
+            Trial::Jump => {
+                // Past the η clamp: one jump to the largest power-of-two
+                // fraction of the step that is back inside it
+                // (`clamp_jump`), where halving could take more than the
+                // cap allows.
+                jump_back(
+                    &mut layout,
+                    family,
+                    y,
+                    &fx,
+                    &beta_step,
+                    u,
+                    u_prev,
+                    beta,
+                    eta_fixed,
+                    prob,
+                    eta,
+                    w,
+                    k,
+                );
+                continue;
+            }
+            Trial::Halve => {
                 // Last full step overshot: halve δu toward the halving target
                 // and re-enter the top (the recompute above is the trial
                 // evaluation of the halved step). Exact mode halves toward the
                 // last ACCEPTED u (`u_acc`, set by the post-sweep merit test
                 // below) since `u_prev` there holds the just-rejected trial,
                 // not an accepted point.
-                halvings += 1;
                 if let BetaStep::Profile {
                     exact: Some(ex), ..
                 } = &beta_step
                 {
-                    #[allow(clippy::needless_range_loop)]
-                    for c in 0..k {
-                        u[c] = T::from_f64(0.5 * (u[c].value() + ex.u_acc[c]));
-                    }
+                    halve_u_to_acc(&mut u[..k], &ex.u_acc[..k]);
                 } else {
-                    for c in 0..k {
-                        u[c] = T::from_f64(0.5) * (u[c] + u_prev[c]);
-                    }
+                    halve_u(&mut u[..k], &u_prev[..k]);
                 }
                 // Profile mode: the trial point is the JOINT (u,β) step, so the
                 // backtrack halves β toward `beta_prev` in lockstep with u, then
                 // refreshes η_fixed for the re-evaluation at the top. Mirrors
                 // `pirls_solve_packed`'s Profile backtrack.
                 if let BetaStep::Profile { beta_prev, .. } = &beta_step {
-                    for j in 0..p {
-                        beta[j] = T::from_f64(0.5 * (beta[j].value() + beta_prev[j]));
-                    }
-                    refresh!();
+                    halve_beta(beta, beta_prev);
+                    refresh_fixed(&fx, beta, eta_fixed);
                 }
                 continue;
             }
-            return (
-                T::from_f64(f64::NAN),
-                T::from_f64(f64::NAN),
-                T::from_f64(f64::NAN),
-                false,
-            ); // halvings exhausted
+            Trial::Fail => return fail(),
         }
-        // Accept this iterate, snapshot it for the next backtrack, and take a
-        // fresh full step from it (cold start: pen_accepted = ∞ ⇒ always
-        // accepts). `u_prev` is unconditional — the β-Schur border needs
-        // δu₀ = u_new − u_prev regardless of mode. Exact mode defers
-        // `halvings`/`pen_accepted`/`beta_prev` bookkeeping to the post-sweep
-        // merit test below, since this trial has not been judged against the
-        // full Laplace objective yet.
+        // Snapshot the accepted iterate for the next backtrack, and take a
+        // fresh full step from it. `u_prev` is unconditional — the β-Schur
+        // border needs δu₀ = u_new − u_prev regardless of mode.
         u_prev[..k].copy_from_slice(&u[..k]);
-        if !exact {
-            halvings = 0;
-            pen_accepted = penalized.value();
+        if !ctl.exact {
             // Profile mode: snapshot the accepted β as the β-halving twin of u_prev.
             if let BetaStep::Profile { beta_prev, .. } = &mut beta_step {
                 for j in 0..p {
@@ -586,37 +516,22 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
         logdet = match layout.factor_logdet() {
             Some(ld) => ld,
             None => {
-                // Mirrors the `structured_factor` failure arm in
-                // `pirls_solve_blocked_extras` (`blocked_extras.rs`, the extras
-                // twin) — see its comment for why: an unevaluable trial here is
-                // a REJECTED trial, not a failed solve. Change together.
-                if let BetaStep::Profile {
-                    exact: Some(ex),
-                    beta_prev,
-                    ..
-                } = &beta_step
-                {
-                    trust.fail(acc_judged);
-                    if halvings < PIRLS_MAX_HALVINGS {
-                        halvings += 1;
-                        refine = false;
-                        l_ref = f64::INFINITY;
-                        for c in 0..k {
-                            u[c] = T::from_f64(0.5 * (u_prev[c].value() + ex.u_acc[c]));
-                        }
-                        for j in 0..p {
-                            beta[j] = T::from_f64(0.5 * (beta[j].value() + beta_prev[j]));
-                        }
-                        refresh!();
-                        continue 'iters;
+                // An unevaluable trial in exact mode is a REJECTED trial, not
+                // a failed solve ([`PirlsControl::factor_failed`]).
+                if ctl.factor_failed() {
+                    if let BetaStep::Profile {
+                        exact: Some(ex),
+                        beta_prev,
+                        ..
+                    } = &beta_step
+                    {
+                        halve_prev_to_acc(&mut u[..k], &u_prev[..k], &ex.u_acc[..k]);
+                        halve_beta(beta, beta_prev);
+                        refresh_fixed(&fx, beta, eta_fixed);
                     }
+                    continue;
                 }
-                return (
-                    T::from_f64(f64::NAN),
-                    T::from_f64(f64::NAN),
-                    T::from_f64(f64::NAN),
-                    false,
-                );
+                return fail();
             }
         };
         layout.solve_in_place();
@@ -654,12 +569,7 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
                 pen += u[ubase + r] * u[ubase + r];
             }
         }
-        // Where the exact curvature differs from Fisher, the objective's `log|A|`
-        // is `log|A_obs|` (`evaluate_at_mode`), and the Newton step above already
-        // built `a_blocks` from `W_obs`: the factor just taken is `A_obs`'s. The
-        // exact profile is `f64`-only (`dual` is `None`), so this holds on every
-        // exact-mode solve.
-        let exact_obj = exact && crate::family::exact_curvature_differs(family);
+        let exact_obj = ctl.exact_obj;
         // Exact mode: assemble c_β off THIS iteration's factors, then judge the
         // trial against the full Laplace merit. Both live here rather than in the
         // β-Schur border below: the assembly reads only the block factors and the
@@ -745,10 +655,8 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
                             link: BinomialLink::Logit,
                         } if !exact_obj => pa.run(curv_h, logdet_beta, logdet_u, |i| {
                             let pr = prob[i].value();
-                            // `family::in_tail` on a binomial link.
-                            if pr <= crate::family::PROB_EPS
-                                || pr >= 1.0 - crate::family::UPPER_TAIL_Q
-                            {
+                            // The binomial arm of `in_tail` does not read η.
+                            if crate::family::in_tail(family, 0.0, pr) {
                                 general(i)
                             } else {
                                 w[i].value() * (1.0 - 2.0 * pr)
@@ -834,103 +742,17 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
             // the corrected merit equals the Laplace deviance to second order in
             // δu₀ (the residual is what the accept band below absorbs).
             let l_trial = (dev + pen_u).value() + 2.0 * logdet.value() + gu_dot_du;
-            // Being first-order, that correction leaves its own O(‖δu₀‖²)
-            // residual behind, either sign, so a merit is only good to about the
-            // size of the correction it carries. The comparison has TWO
-            // endpoints and each carries its own — hence both are charged:
-            // `gu_dot_du.abs()` for this trial, `l_acc_slack` for the stored
-            // `l_acc`. Charging the trial alone would only accidentally cover
-            // the failure, since the deficit that deadlocks the loop belongs to
-            // the ACCEPTED point: a warm (u, β) is accepted unjudged as the first
-            // trial, and if its merit sits under the value the solve can reach,
-            // every later (correct) iterate is rejected until the iteration cap
-            // turns the whole evaluation into a non-convergence. Measured on the
-            // single-intercept NB-log shape: a warm start carried from θ = 0.55674
-            // to θ = 0.55692 left `l_acc` 3.2e-5 under the value the cold solve
-            // reaches, every iteration went to halving, and the θ-only outer
-            // search read the `inf` that came back as a wall — with the seed's own
-            // 1.4e-4 correction charged, that deficit is inside the band. Both
-            // terms shrink with their δu₀, so at the mode the test is the value
-            // band again, and the convergence test below is untouched.
-            // A non-finite merit (an overflowed step) is an overshoot: every
-            // comparison with NaN is false, so without this test it would be
-            // accepted and poison `l_acc` for the rest of the solve.
-            // Careful mode. The slack above trusts `|g_u'·δu₀|` to size a merit's
-            // error, which holds only while δu₀ is small. Far from the mode it is
-            // not: at a large θ with few clusters the Laplace profile is nearly
-            // flat in the β direction the random effects nearly span, the border
-            // step can move β by several units, and u lands a long Newton step off
-            // its mode. The slack then grows with that step and lets real rises
-            // through, while a first-order
-            // merit can also sit far below the value its β reaches once u has
-            // converged (measured on a 4-cluster NB-log fit at θ = 50: 2.0 under
-            // it, with a correction of 0.07), so a stored `l_acc` can refuse every
-            // later trial. So the first time the slack alone lets through a rise
-            // over a stored merit that was itself judged (a rise over the unjudged
-            // first trial is the warm-start case the slack was written for) and the
-            // trial's own correction is past the band, the solve stops comparing
-            // first-order merits for good: it drops `l_acc`, and judges each later
-            // trial only once u-only steps at that trial's β (lme4's `pwrssUpdate`
-            // with `uOnly`, backtracking on `dev + ‖u‖²` above) have made its merit
-            // stationary, against a stored merit that was converged the same way,
-            // on the plain tol band. lme4's `pwrssUpdate` and MixedModels.jl's
-            // `pirls!` accept a step only on a real decrease of the objective,
-            // which they can evaluate exactly at every iterate; here it is exact
-            // only where u sits at its mode, and the u-only steps are what buy
-            // that.
-            let band = tol * (1.0 + l_trial.abs());
-            if careful && (l_trial - l_ref).abs() > band {
-                refine = true;
-                l_ref = l_trial;
-                pen_ref = penalized.value();
-                ref_halvings = 0;
-                continue;
-            }
-            let allow = if careful {
-                band
-            } else {
-                band + gu_dot_du.abs() + l_acc_slack
-            };
-            let reject = !l_trial.is_finite() || l_trial - l_acc > allow;
-            if !careful && acc_judged && !reject && l_trial - l_acc > band && gu_dot_du.abs() > band
-            {
-                careful = true;
-                l_acc = f64::INFINITY;
-                refine = true;
-                l_ref = l_trial;
-                pen_ref = penalized.value();
-                ref_halvings = 0;
-                continue;
-            }
-            refine = false;
-            l_ref = f64::INFINITY;
-            // The trust region reads the merit change the border step's trial
-            // made against its model (`BorderTrust`), under the same allowance
-            // for the merits' own error as the accept test.
-            trust.judge(l_acc, acc_judged, l_trial, allow);
-            if reject {
-                if halvings < PIRLS_MAX_HALVINGS {
-                    halvings += 1;
-                    for c in 0..k {
-                        u[c] = T::from_f64(0.5 * (u_prev[c].value() + ex.u_acc[c]));
-                    }
-                    for j in 0..p {
-                        beta[j] = T::from_f64(0.5 * (beta[j].value() + beta_prev[j]));
-                    }
-                    refresh!();
+            match ctl.merit(l_trial, gu_dot_du, penalized.value()) {
+                Merit::Refine => continue,
+                Merit::Reject => {
+                    halve_prev_to_acc(&mut u[..k], &u_prev[..k], &ex.u_acc[..k]);
+                    halve_beta(beta, beta_prev);
+                    refresh_fixed(&fx, beta, eta_fixed);
                     continue;
                 }
-                return (
-                    T::from_f64(f64::NAN),
-                    T::from_f64(f64::NAN),
-                    T::from_f64(f64::NAN),
-                    false,
-                );
+                Merit::Fail => return fail(),
+                Merit::Accept => {}
             }
-            halvings = 0;
-            acc_judged = l_acc.is_finite();
-            l_acc = l_trial;
-            l_acc_slack = gu_dot_du.abs();
             #[allow(clippy::needless_range_loop)]
             for c in 0..k {
                 ex.u_acc[c] = u_prev[c].value();
@@ -990,7 +812,8 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
             }
             // T_f = A_f⁻¹ (M'WX)_f per block, reusing this iteration's factor left in
             // `a_blocks`; ainv_mtwx rows f·q.. hold T_f. (M'WX)_f[c, col] = xtwm[(col, f·q+c)].
-            // Mirrors blocked_schur_fill:360-374. On the row-major path the
+            // Mirrors `se::blocked_schur_fill`'s `T_f` solve; change together.
+            // On the row-major path the
             // solve runs on all p columns at once, in place on `bt_rows`
             // (which holds (M'WX)_f row-major, `[(f·q + c)·p + col]`, and then
             // T row-major for the residual-row kernel): the same operations,
@@ -1088,7 +911,7 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
                 for r in 0..p {
                     beta_rhs[r] -= 0.5 * ex.logdet_beta[r];
                 }
-                if trust.wants_curvature(it, careful, damp, &mut ex.curv_memory) {
+                if ctl.wants_curvature(it, &mut ex.curv_memory) {
                     logdet_beta_curvature(
                         ex,
                         x,
@@ -1117,91 +940,23 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
                 schur,
                 &mut beta_rhs[..p],
                 schur_llt_mem,
-                exact.as_deref_mut().map(|ex| (ex, &mut trust)),
+                exact.as_deref_mut().map(|ex| (ex, &mut ctl.trust)),
             ) {
-                return (
-                    T::from_f64(f64::NAN),
-                    T::from_f64(f64::NAN),
-                    T::from_f64(f64::NAN),
-                    false,
-                );
+                return fail();
             }
-            // Apply: β += δβ; u = u_joint = u_new − T·δβ, i.e.
-            // u[f·q+c] −= Σ_j T[(f·q+c, j)]·δβ[j].
-            for j in 0..p {
-                beta[j] += T::from_f64(beta_rhs[j]);
-            }
-            for c in 0..k {
-                let mut acc = 0.0;
-                for j in 0..p {
-                    acc += ainv_mtwx[(c, j)] * beta_rhs[j];
-                }
-                u[c] -= T::from_f64(acc);
-            }
-            // η_fixed depends on β; refresh for the next trial. `pen` must track the
-            // moved u (‖u_joint‖²), so recompute it.
-            refresh!();
-            pen = T::ZERO;
-            #[allow(clippy::needless_range_loop)]
-            for c in 0..k {
-                pen += u[c] * u[c];
-            }
+            apply_border(&fx, ainv_mtwx, beta_rhs, u, beta, eta_fixed, k);
+            // `pen` must track the moved u (‖u_joint‖²), so recompute it.
+            pen = pen_sq(&u[..k]);
         }
-        // Relaxed step once the period-2 detector has fired (`PIRLS_OSC_RATIO`):
-        // move half way from the pre-step iterate, β in lockstep with u.
-        if damp {
-            trust.scale(0.5);
-            let half = T::from_f64(0.5);
-            for c in 0..k {
-                u[c] = u_prev[c] + half * (u[c] - u_prev[c]);
-            }
-            if let BetaStep::Profile { beta_prev, .. } = &beta_step {
-                for j in 0..p {
-                    beta[j] = T::from_f64(beta_prev[j] + 0.5 * (beta[j].value() - beta_prev[j]));
-                }
-                refresh!();
-            }
-            pen = T::ZERO;
-            #[allow(clippy::needless_range_loop)]
-            for c in 0..k {
-                pen += u[c] * u[c];
-            }
+        if ctl.damp {
+            ctl.trust.scale(0.5);
+            damp_step(&fx, &beta_step, u, u_prev, beta, eta_fixed, k);
+            pen = pen_sq(&u[..k]);
         }
-        // The stopping rule, verbatim: the mixed `dev(uⱼ) + ‖uⱼ₊₁‖²` band on
-        // successive steps — bit-identical iterate path and returned values to the
-        // pre-halving loop when no halving fires. The same-point band cannot be a
-        // converge trigger: on a solve that cycles it stops at one point of the
-        // cycle rather than at the mode, and it broke the AGQ(k=1) ≡ Laplace
-        // reduction when it was one.
-        // Exact mode: the exit band must track the same merit the accept/halve
-        // decision above uses (dev + pen + 2·log|A|), or the loop could settle
-        // on a point that is a fixed point of dev+pen alone but still moving in
-        // log|A| — the whole reason the merit moved off the PQL band. The merit's
-        // mode-consistency term is deliberately absent here: it is proportional to
-        // δu₀, which the band already forces to zero, so including it would change
-        // no fixed point and only the iterate count.
-        let mixed = (dev + pen).value() + if exact { 2.0 * logdet.value() } else { 0.0 };
-        if it + 1 >= min_iters && (mixed - mixed_prev).abs() < tol * (1.0 + mixed.abs()) {
+        if ctl.stop(it, (dev + pen).value(), logdet.value()) {
             converged = true;
             break;
         }
-        // Period-2 detector — see `PIRLS_OSC_RATIO`. Off on a dual
-        // solve: a halved step is not the one-step Hessian step `DualStep::exact`
-        // promises.
-        let dmix = mixed - mixed_prev;
-        if dual.is_none()
-            && dmix.is_finite()
-            && dmix_prev.is_finite()
-            && dmix * dmix_prev < 0.0
-            && dmix.abs() > PIRLS_OSC_RATIO * dmix_prev.abs()
-        {
-            osc_flips += 1;
-        } else {
-            osc_flips = 0;
-        }
-        damp |= osc_flips >= PIRLS_OSC_TRIGGER;
-        dmix_prev = dmix;
-        mixed_prev = mixed;
     }
     // The returned `dev`, `log|A|` and per-block factor at the returned iterate,
     // so the objective's three terms and the factor `blocked_schur_fill`
@@ -1225,14 +980,7 @@ pub(crate) fn pirls_solve_blocked<T: Scalar>(
                 dev = d;
                 logdet = ld;
             }
-            None => {
-                return (
-                    T::from_f64(f64::NAN),
-                    T::from_f64(f64::NAN),
-                    T::from_f64(f64::NAN),
-                    false,
-                )
-            }
+            None => return fail(),
         }
     }
     (dev, pen, logdet, converged)
@@ -1387,27 +1135,22 @@ fn fused_profile_rows_p<T: Scalar, const P: usize>(
     a_blocks[..s * q * q].fill(T::ZERO);
     a_rhs[..k].fill(T::ZERO);
     bt[..k * p].fill(0.0);
-    let logit = matches!(
-        family,
-        Family::Binomial {
-            link: BinomialLink::Logit
-        }
-    );
     let mut probit_rows = crate::family::ProbitRows::new(family, eta, prob);
     for i in 0..n {
         let xr = &xr_all[i * p..i * p + p];
         let f = cluster_ids[i] as usize;
         let ubase = f * q;
         let wi = w[i];
-        let pw = prior_w[i];
-        let resid = T::from_f64(pw)
-            * if logit {
-                T::from_f64(y[i]) - prob[i]
-            } else if let Some(rows) = probit_rows.as_mut() {
-                T::from_f64(rows.score(i, y[i], 1.0))
-            } else {
-                crate::family::row_score(family, nb_theta, y[i], 1.0, eta[i], prob[i])
-            };
+        let resid = super::row_rho(
+            family,
+            nb_theta,
+            i,
+            y[i],
+            prior_w[i],
+            eta[i],
+            prob[i],
+            probit_rows.as_mut(),
+        );
         let wf = wi.value();
         if q == 1 {
             let m0 = m_buf[i];
@@ -1682,7 +1425,7 @@ fn refresh_rows_p<T: Scalar, const P: usize>(
     for (e_out, row) in eta_fixed[..n].iter_mut().zip(xr.chunks_exact(p)) {
         let mut e = T::ZERO;
         for j in 0..p {
-            e += T::from_f64(row[j]) * beta[j];
+            e += beta[j].scale(row[j]);
         }
         *e_out = e;
     }

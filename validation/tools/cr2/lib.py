@@ -2,7 +2,7 @@
 # Its scipy.linalg calls are numpy ones here, so the validation venv needs no scipy.
 """CR2 on large clusters: shared code. Dense reference, data generator, quadrature method.
 
-Notation matches the spec: Phi_k = diag(lam) + U U' (U = Z L, L L' = sigma^2 D), M = (sum H_k)^-1,
+Notation: Phi_k = diag(lam) + U U' (U = Z L, L L' = sigma^2 D), M = (sum H_k)^-1,
 H_k = X' Phi^-1 X, C = Phi - X M X', E_k = M X' Phi^-1 A_k.
 Stored per cluster: e = E r, EPE = E Phi E', EX = E X.
 """
@@ -75,7 +75,7 @@ def gls(cl):
 
 
 def summarize(st, M, Mi=None, contrasts=None):
-    """st: list of dicts (e, EPE, EX). Returns SE and df per coefficient (spec's formulas)."""
+    """st: list of dicts (e, EPE, EX). Returns SE and df per coefficient (the dense formulas)."""
     p = M.shape[0]
     cs = np.eye(p) if contrasts is None else contrasts
     V = sum(np.outer(s["e"], s["e"]) for s in st)
@@ -90,7 +90,7 @@ def summarize(st, M, Mi=None, contrasts=None):
 
 
 def dense_cluster(c, M, ret_A=False):
-    """The spec's dense formula with the T-eigenvalue cut. Port of cr2_phi()."""
+    """The dense formula with the T-eigenvalue cut. Port of cr2_phi()."""
     X, U, lam, r = c["X"], c["U"], c["lam"], c["r"]
     n = len(lam)
     Phi = np.diag(lam) + U @ U.T
@@ -284,7 +284,7 @@ def quad_cluster_deflated(c, M, Mi, Vnull, zmin, zmax, N, s, w):
 
 
 def whitened_cluster(c, M):
-    """Closed form: CR2 applied after whitening. NOT the spec's estimator unless Phi is a multiple of I.
+    """Closed form: CR2 applied after whitening. NOT the dense estimator unless Phi is a multiple of I.
     Uses (I-RR')^a R = R (I-R'R)^a (Niccodemi et al. 2020 eq. 6) on the whitened X."""
     Lm = np.linalg.cholesky(M)
     S = Lm.T @ c["H"] @ Lm

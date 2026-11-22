@@ -25,8 +25,8 @@ glmm <- read_jsonl(args[1]); mm <- read_jsonl(args[2])
 # for the timed fit as proof it ran hot. Any nonzero (>1 ms) compile time in a
 # timed fit means JIT leaked into wall_seconds — HARD STOP, the walls are not
 # quotable. Records without the field (watchdog timeout stubs, engine-fail
-# stubs, pre-2026-07-11 passes) are skipped, but a whole pass without the
-# field gets a loud warning: its walls predate the warm-up fix.
+# stubs, passes run without the warm-up) are skipped, but a whole pass without
+# the field gets a loud warning: its walls include JIT.
 mm_compile <- vapply(mm, function(r)
   if (is.null(r$compile_seconds)) NA_real_ else r$compile_seconds, 0)
 if (any(mm_compile > 1e-3, na.rm = TRUE))
@@ -43,9 +43,8 @@ cells <- manifest_cells(file.path(suite_dir, "manifest.json"))
 # ---- deviance alignment to MixedModels' objective() scale ----------------------
 # glmm's deviance conventions, pinned empirically on grid cells: poisson,
 # binary binomial AND aggregated binomial are ALL on MixedModels'
-# unit-deviance scale -- identity, no constant. On the 2026-07-11 Study-A run
-# identity agrees with MixedModels to 1.7e-9 worst-case across all 36 agreed
-# aggregated cells (the align-check hard stop below catches any drift).
+# unit-deviance scale -- identity, no constant. Identity agrees with
+# MixedModels to 1.7e-9 worst case across all 36 agreed aggregated cells (the align-check hard stop below catches any drift).
 # Gaussian: REML offset df*(1+log(2pi)) validated in-crate against lme4.
 glmm_dev_aligned <- function(cell, dev) {
   # timeout/engine-fail records carry deviance:null -> NULL here; is.finite(NULL)
@@ -138,8 +137,8 @@ write.csv(do.call(rbind, prof), file.path(out_dir, "data_profiles.csv"), row.nam
 # ---- lme4 to-do: mismatches + rival engine-fails + seeded 20-cell audit --------
 # Manifest order (not case_id sort or sample order) -- the watchdog's lme4
 # timeout-attribution keys off this file's line order.
-# Rival engine-fail cells (glmm ok, MM crashes -- 2026-07-11: all nest2s
-# PosDefException) get status "ok" above with glmm's answer unverified; anchor
+# Rival engine-fail cells (glmm ok, MM crashes, e.g. a PosDefException on
+# every nest2s cell) get status "ok" above with glmm's answer unverified; anchor
 # them all so "converges where MM can't" also means "to the right answer".
 # MM *timeouts* are excluded: expected-heavy 30000-row cells, lme4 would
 # mostly burn its 120 s budget the same way.

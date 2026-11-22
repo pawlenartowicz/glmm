@@ -19,7 +19,7 @@ use std::fmt;
 
 use faer::Mat;
 
-use super::contest::{contest_1d, contest_md, fstat_ddf, ContestInputs};
+use super::contest::{contest_1d, contest_md, ContestInputs};
 use super::cr2::{Cr2Pieces, DF_SMALL};
 use super::tails::{f_upper_p, t_two_sided_p};
 use crate::lmm::satterthwaite::SatterthwaiteState;
@@ -82,7 +82,8 @@ pub enum ContrastNote {
     },
     /// `L·C·Lᵀ` has rank `rank < rows`: the test is on the `rank` directions
     /// lmerTest keeps. Rank 0 (an all-zero `L`) tests nothing: the statistic,
-    /// denominator df and p-value are NaN on the F test.
+    /// denominator df and p-value are NaN on the F test, and t, df and the
+    /// p-value on the t test.
     RankDeficientL {
         /// The rank kept (the numerator df).
         rank: usize,
@@ -117,10 +118,11 @@ pub enum NoDfReason {
     /// A Gaussian LMM `Fit` no pass ran on, such as one built by the loop
     /// tier's `FitView::into_fit`, REML or ML.
     StateMissing,
-    /// The pass failed: a deviance or covariance on its stencil was not
-    /// finite, the eigendecomposition of its Hessian failed, or the fit has no
-    /// finite endpoint to run it at (`Note::SatterthwaiteCurvature` with
-    /// `nonfinite` set).
+    /// The pass failed: the deviance, its derivatives or `C` at θ̂ were not
+    /// finite (on the finite-difference route of a wide crossed tail, a
+    /// deviance or `C` at any of its points), the eigendecomposition of its
+    /// Hessian failed, or the fit has no finite endpoint to run it at
+    /// (`Note::SatterthwaiteCurvature` with `nonfinite` set).
     Failed,
 }
 
@@ -137,7 +139,7 @@ impl fmt::Display for NoDfReason {
                 "the fit carries no Satterthwaite record (a Gaussian LMM fit assembled without the Satterthwaite pass)"
             }
             NoDfReason::Failed => {
-                "the Satterthwaite pass failed: the fit has no finite endpoint, or a deviance or covariance on its stencil was not finite"
+                "the Satterthwaite pass failed: the fit has no finite endpoint, or the deviance, its derivatives or the covariance were not finite"
             }
         })
     }
@@ -167,7 +169,9 @@ impl Fit {
     /// dispersion GLMs with φ estimated, the residual df `n − p`. On a robust
     /// fit the robust SE and df, with [`ContrastNote::RobustUnidentified`] or
     /// [`ContrastNote::RobustDfSmall`]; a contrast touching a column outside
-    /// [`crate::FitOptions::se_for`] is NaN there, with no note.
+    /// [`crate::FitOptions::se_for`] is NaN there, with no note. An all-zero
+    /// `l` has estimate and se 0, NaN elsewhere, and
+    /// [`ContrastNote::RankDeficientL`] with rank 0 on every route.
     ///
     /// # Errors
     ///
@@ -252,7 +256,14 @@ impl Fit {
 /// `p` finite entries. `l` is tested as [`unit_rows`] scales it, so `lᵀCl`
 /// stays in range at any scale of `l`; the estimate and se are scaled back.
 pub(crate) fn contrast_t_of(beta: &[f64], st: &SatterthwaiteState, l: &[f64]) -> ContrastT {
-    let p = beta.len();
+    contrast_t_with(&Inputs::new(beta, st), l)
+}
+
+/// [`contrast_t_of`] on inputs already built, for a caller that tests many
+/// contrasts against one state.
+pub(crate) fn contrast_t_with(inputs: &Inputs<'_>, l: &[f64]) -> ContrastT {
+    let st = inputs.st;
+    let p = l.len();
     let notes = aliased_notes(st, l, p);
     if !notes.is_empty() {
         return ContrastT {
@@ -264,7 +275,9 @@ pub(crate) fn contrast_t_of(beta: &[f64], st: &SatterthwaiteState, l: &[f64]) ->
             notes,
         };
     }
-    let inputs = Inputs::new(beta, st);
+    if l.iter().all(|&v| v == 0.0) {
+        return zero_t();
+    }
     let (l, s) = unit_rows(l, p);
     let r = contest_1d(&inputs.contest(), &inputs.restrict(&l));
     // A residual-only record has no variance parameters: its df is ν.
@@ -321,10 +334,8 @@ pub(crate) fn contrast_f_of(
     let Ok(md) = contest_md(&inputs.contest(), lr.as_ref()) else {
         return nan(Vec::new());
     };
-    // A residual-only record: every direction's df is ν, so the mean
-    // rule gives ν exactly.
     let (den_df, p_value) = if st.residual_only() {
-        let den = fstat_ddf(&vec![st.nu; md.num_df], 1e-8);
+        let den = if md.num_df == 0 { f64::NAN } else { st.nu };
         (den, f_upper_p(md.f_value, md.num_df as f64, den))
     } else {
         (md.den_df, md.p_value)
@@ -342,6 +353,19 @@ pub(crate) fn contrast_f_of(
         den_df,
         p_value,
         notes,
+    }
+}
+
+/// The test of an all-zero `l`, as [`zero_l`]'s one row: the estimate and se
+/// of a zero row are exactly 0, and there is nothing to test.
+fn zero_t() -> ContrastT {
+    ContrastT {
+        estimate: 0.0,
+        se: 0.0,
+        t: f64::NAN,
+        df: f64::NAN,
+        p_value: f64::NAN,
+        notes: vec![ContrastNote::RankDeficientL { rank: 0, rows: 1 }],
     }
 }
 
@@ -395,7 +419,7 @@ fn aliased_notes(st: &SatterthwaiteState, l: &[f64], p: usize) -> Vec<ContrastNo
 
 /// [`ContrastNote::AliasedColumn`] for every column `aliased` where a row of
 /// `l` is non-zero, ascending.
-fn notes_on(aliased: impl Fn(usize) -> bool, l: &[f64], p: usize) -> Vec<ContrastNote> {
+pub(super) fn notes_on(aliased: impl Fn(usize) -> bool, l: &[f64], p: usize) -> Vec<ContrastNote> {
     (0..p)
         .filter(|&j| aliased(j) && l.chunks(p).any(|row| row[j] != 0.0))
         .map(|column| ContrastNote::AliasedColumn { column })
@@ -448,6 +472,9 @@ pub(crate) fn robust_t_of(beta: &[f64], r: &RobustInputs<'_>, l: &[f64]) -> Cont
     let notes = notes_on(|j| r.aliased[j], l, p);
     if !notes.is_empty() {
         return untested(f64::NAN, notes);
+    }
+    if l.iter().all(|&v| v == 0.0) {
+        return zero_t();
     }
     let on: Vec<usize> = (0..p).filter(|&j| l[j] != 0.0).collect();
     let estimate = on.iter().map(|&j| l[j] * beta[j]).sum();
@@ -520,14 +547,14 @@ pub(crate) fn robust_f_of(
 /// `Jac = [∂C/∂θ_k …, C/τ̂]`, the τ entry formed here. A residual-only record
 /// has neither (`A` 0 × 0, no `Jac`): the contest layer then gives the
 /// estimate, se and statistic, and the df is ν.
-struct Inputs<'a> {
+pub(crate) struct Inputs<'a> {
     beta: Vec<f64>,
     st: &'a SatterthwaiteState,
     jac: Vec<Mat<f64>>,
 }
 
 impl<'a> Inputs<'a> {
-    fn new(beta: &[f64], st: &'a SatterthwaiteState) -> Self {
+    pub(crate) fn new(beta: &[f64], st: &'a SatterthwaiteState) -> Self {
         let beta = match st.retained.as_deref() {
             Some(kept) => kept.iter().map(|&j| beta[j]).collect(),
             None => beta.to_vec(),

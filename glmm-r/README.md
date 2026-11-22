@@ -1,16 +1,16 @@
 # fastglmm
 
-**`fastglmm`: lme4-style formulas on the `glmm` engine.**
+**`fastglmm`: lme4-style formulas on the GLMM engine.**
 
 **fastglmm** fits ordinary least squares, generalized linear models, linear
 mixed models and generalized linear mixed models from an lme4-style formula. It
-is the R package of the [glmm engine](https://github.com/pawlenartowicz/glmm),
+is the R package of the [GLMM engine](https://github.com/pawlenartowicz/glmm),
 which also serves Rust and Python. It is called fastglmm because CRAN already
 has a different package named `glmm`.
 
 ## The idea
 
-- **Accuracy first.** The glmm engine reaches the same log-likelihood as lme4,
+- **Accuracy first.** The GLMM engine reaches the same log-likelihood as lme4,
   glmmTMB, MixedModels.jl and GLMMadaptive, or a better one.
 - **Multi-solver.** Each model gets a method that suits it. Least squares uses
   a closed form, and GLMs use IRLS. Mixed models use BFGS where the engine has
@@ -22,9 +22,19 @@ has a different package named `glmm`.
 
 More in the [project README](https://github.com/pawlenartowicz/glmm#readme).
 
+## Beta status and plans
+
+GLMM is in beta. Not all features are implemented yet, and not all edge cases are tested. Every release is strictly tested on almost 1,000 test models and compared with other packages.
+
+Planned next:
+- survey weights for mixed models
+- parallel fits by default and lower memory use
+- more than one start for fits that can stop at a worse local optimum
+- an HTML report of a fit
+
 ## Validation
 
-The glmm engine is checked on 947 test models before every release. They cover
+The GLMM engine is checked on 947 test models before every release. They cover
 the Gaussian, binomial, Poisson, Gamma and negative binomial families, random
 intercepts, correlated slopes, nested and crossed groupings, and data from 60 to
 30,000 rows. Each model is also fitted by lme4, glmmTMB, MixedModels.jl and
@@ -49,7 +59,7 @@ The package versions, the checks and how to rerun them are in
 
 ## Multi-solver paradigm
 
-The glmm engine combines several optimizers for mixed models. Where it has a
+The GLMM engine combines several optimizers for mixed models. Where it has a
 cheap exact gradient, it uses BFGS. Elsewhere it uses BOBYQA, which needs no
 gradient. BOBYQA also refines the BFGS result and takes over when BFGS fails.
 
@@ -65,7 +75,7 @@ both return the same answer. The choice affects speed only.
 
 ## Speed
 
-The glmm engine moves as little data as it can. One pass over the data builds
+The GLMM engine moves as little data as it can. One pass over the data builds
 a small summary per group, and every later step of the search works on those
 summaries. The cost of each step therefore grows with the number of groups, not
 the number of rows.
@@ -149,12 +159,12 @@ instead**. lme4 stops with an error here, so watch for the warning.
 
 If you use fastglmm in research, please cite:
 
-Lenartowicz, P. (2026). glmm: Mixed-model fitting in Rust, Python and R [Computer software]. https://github.com/pawlenartowicz/glmm
+Lenartowicz, P. (2026). GLMM: Mixed-model fitting in Rust, Python and R [Computer software]. https://github.com/pawlenartowicz/glmm
 
 ```bibtex
 @software{glmm2026,
   author = {Lenartowicz, Pawe{\l}},
-  title  = {{glmm}: Mixed-Model Fitting in Rust, Python and R},
+  title  = {{GLMM}: Mixed-Model Fitting in Rust, Python and R},
   year   = {2026},
   url    = {https://github.com/pawlenartowicz/glmm}
 }

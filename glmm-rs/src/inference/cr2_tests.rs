@@ -687,3 +687,21 @@ fn g6_aca_is_phi_at_100k_rows() {
     );
     assert!(gap <= 4e-13 * 10.0, "gap {gap:.2e}");
 }
+
+/// A NaN λ (a NaN σ̂²) has no pieces, as a zero or an infinite one has none.
+#[test]
+fn a_nan_lambda_has_no_pieces() {
+    let x = Mat::from_fn(2, 1, |_, _| 1.0);
+    let u = Mat::<f64>::zeros(2, 0);
+    let r = [0.5, -0.5];
+    let r_mat = Mat::from_fn(1, 1, |_, _| 1.0);
+    for lam in [[f64::NAN, f64::NAN], [1.0, f64::NAN]] {
+        let block = ClusterBlock {
+            x: x.as_ref(),
+            r: &r,
+            lambda: &lam,
+            u: u.as_ref(),
+        };
+        assert!(cr2_pieces(&[block], r_mat.as_ref()).is_none(), "{lam:?}");
+    }
+}

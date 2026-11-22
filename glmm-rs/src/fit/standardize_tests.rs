@@ -538,7 +538,7 @@ fn fit_on_reuse_recomputes_statistics_per_draw() {
         ];
         let mut joint = vec![];
         for (d, x) in draws.iter().enumerate() {
-            let view = fit_on(&mut ws, &c.data(x), None, &c.opts);
+            let view = fit_on(&mut ws, &c.data(x), None, &c.opts).unwrap();
             joint.push(view.joint_t_sq());
             let got = view.into_fit(&c.data(x), &c.model, &c.opts);
             let want = fit(&c, x);
@@ -582,6 +582,7 @@ fn warm_theta_carry_across_draws_matches_cold() {
         super::core::force_bobyqa_route(&mut ws);
         let x1 = with_column(&c, 1.0, 1000.0);
         let theta = fit_on(&mut ws, &c.data(&c.x), None, &c.opts)
+            .unwrap()
             .theta()
             .to_vec();
         let start = StartValues {
@@ -589,16 +590,16 @@ fn warm_theta_carry_across_draws_matches_cold() {
             theta,
             dispersion: None,
         };
-        let warm = fit_on(&mut ws, &c.data(&x1), Some(&start), &c.opts).into_fit(
-            &c.data(&x1),
-            &c.model,
-            &c.opts,
-        );
+        let warm = fit_on(&mut ws, &c.data(&x1), Some(&start), &c.opts)
+            .unwrap()
+            .into_fit(&c.data(&x1), &c.model, &c.opts);
         // The cold reference on the same route as the warm fits above.
         let cold = {
             let mut wc = build_workspace(&c.model, &c.ids, c.n, c.p, &c.opts);
             super::core::force_bobyqa_route(&mut wc);
-            fit_on(&mut wc, &c.data(&x1), None, &c.opts).into_fit(&c.data(&x1), &c.model, &c.opts)
+            fit_on(&mut wc, &c.data(&x1), None, &c.opts)
+                .unwrap()
+                .into_fit(&c.data(&x1), &c.model, &c.opts)
         };
         assert!(
             close(warm.deviance, cold.deviance, 1e-7),
@@ -612,6 +613,7 @@ fn warm_theta_carry_across_draws_matches_cold() {
         // read in the wrong units (the intercept variance at x = 0 taken as the
         // one at the mean) it is far from it.
         let theta1 = fit_on(&mut ws, &c.data(&x1), None, &c.opts)
+            .unwrap()
             .theta()
             .to_vec();
         let again = fit_on(
@@ -624,6 +626,7 @@ fn warm_theta_carry_across_draws_matches_cold() {
             }),
             &c.opts,
         )
+        .unwrap()
         .into_fit(&c.data(&x1), &c.model, &c.opts);
         assert!(
             close(again.deviance, cold.deviance, 1e-7),
@@ -650,18 +653,14 @@ fn warm_theta_carry_across_draws_matches_cold() {
             theta: vec![0.5],
             dispersion: None,
         };
-        let s = fit_on(&mut ws, &c.data(&x1), Some(&short), &c.opts).into_fit(
-            &c.data(&x1),
-            &c.model,
-            &c.opts,
-        );
+        let s = fit_on(&mut ws, &c.data(&x1), Some(&short), &c.opts)
+            .unwrap()
+            .into_fit(&c.data(&x1), &c.model, &c.opts);
         let mut fresh = build_workspace(&c.model, &c.ids, c.n, c.p, &c.opts);
         super::core::force_bobyqa_route(&mut fresh);
-        let f0 = fit_on(&mut fresh, &c.data(&x1), None, &c.opts).into_fit(
-            &c.data(&x1),
-            &c.model,
-            &c.opts,
-        );
+        let f0 = fit_on(&mut fresh, &c.data(&x1), None, &c.opts)
+            .unwrap()
+            .into_fit(&c.data(&x1), &c.model, &c.opts);
         let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
         assert_eq!(bits(&s.beta), bits(&f0.beta), "{}: short θ start β", c.name);
         assert_eq!(
@@ -681,16 +680,12 @@ fn warm_theta_carry_across_draws_matches_cold() {
             theta: vec![0.5],
             dispersion: None,
         };
-        let s = fit_on(&mut ws, &c.data(&x1), Some(&short), &c.opts).into_fit(
-            &c.data(&x1),
-            &c.model,
-            &c.opts,
-        );
-        let f0 = fit_on(&mut fresh, &c.data(&x1), None, &c.opts).into_fit(
-            &c.data(&x1),
-            &c.model,
-            &c.opts,
-        );
+        let s = fit_on(&mut ws, &c.data(&x1), Some(&short), &c.opts)
+            .unwrap()
+            .into_fit(&c.data(&x1), &c.model, &c.opts);
+        let f0 = fit_on(&mut fresh, &c.data(&x1), None, &c.opts)
+            .unwrap()
+            .into_fit(&c.data(&x1), &c.model, &c.opts);
         assert_eq!(bits(&s.beta), bits(&f0.beta), "{}: as given, β", c.name);
         assert_eq!(
             s.deviance.to_bits(),
@@ -721,7 +716,7 @@ fn non_finite_start_is_dropped_to_a_cold_start() {
         };
         let mut ws = new_ws();
         let mut fresh = new_ws();
-        let n_theta = fit_on(&mut ws, &data, None, &c.opts).theta().len();
+        let n_theta = fit_on(&mut ws, &data, None, &c.opts).unwrap().theta().len();
         let nan = StartValues {
             beta: vec![f64::NAN; c.p],
             theta: vec![f64::NAN; n_theta],
@@ -730,8 +725,12 @@ fn non_finite_start_is_dropped_to_a_cold_start() {
         for as_given in [false, true] {
             ws.set_prestandardized(as_given);
             fresh.set_prestandardized(as_given);
-            let s = fit_on(&mut ws, &data, Some(&nan), &c.opts).into_fit(&data, &c.model, &c.opts);
-            let f0 = fit_on(&mut fresh, &data, None, &c.opts).into_fit(&data, &c.model, &c.opts);
+            let s = fit_on(&mut ws, &data, Some(&nan), &c.opts)
+                .unwrap()
+                .into_fit(&data, &c.model, &c.opts);
+            let f0 = fit_on(&mut fresh, &data, None, &c.opts)
+                .unwrap()
+                .into_fit(&data, &c.model, &c.opts);
             let at = format!("{} (as given: {as_given})", c.name);
             assert_eq!(bits(&s.beta), bits(&f0.beta), "{at}: NaN start β");
             assert_eq!(
@@ -794,7 +793,7 @@ fn pinned_fixture_reports_caller_coordinates() {
         ..FitOptions::default()
     };
     let mut ws = build_workspace(&spec, &ids, n, 2, &opts);
-    let view = fit_on(&mut ws, &Data::new(&x, &y, n, 2), None, &opts);
+    let view = fit_on(&mut ws, &Data::new(&x, &y, n, 2), None, &opts).unwrap();
     assert_eq!(view.theta()[2], 0.0, "θ̂ {:?}", view.theta());
     assert_eq!(view.diagnostics().pinned_components, 0b10);
     // varcorr is PSD and finite (no false zero from the map).
@@ -819,7 +818,7 @@ fn glmm_view_dispersion_is_the_caller_intercept_variance() {
         .unwrap();
     let x = with_column(&c, 1.0, 1000.0);
     let mut ws = build_workspace(&c.model, &c.ids, c.n, c.p, &c.opts);
-    let view = fit_on(&mut ws, &c.data(&x), None, &c.opts);
+    let view = fit_on(&mut ws, &c.data(&x), None, &c.opts).unwrap();
     let d = view.dispersion();
     let f = view.into_fit(&c.data(&x), &c.model, &c.opts);
     let v = f.varcorr[0][0];
@@ -872,7 +871,9 @@ fn uncorrelated_slope_is_not_centered() {
     let data = Data::new(&x, &y, n, p);
     let mut ws = build_workspace(&model, &ids, n, p, &opts);
     ws.set_prestandardized(true);
-    let as_given = fit_on(&mut ws, &data, None, &opts).into_fit(&data, &model, &opts);
+    let as_given = fit_on(&mut ws, &data, None, &opts)
+        .unwrap()
+        .into_fit(&data, &model, &opts);
     assert!(standardized.converged() && as_given.converged());
     assert_eq!(
         standardized.deviance.to_bits(),

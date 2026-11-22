@@ -1,5 +1,5 @@
 //! UNSTABLE scratch-explicit hot-path surface (the loop tier) for warm-start
-//! consumers like MCPower. Gated by the `loop_advanced` cargo feature (off by
+//! consumers. Gated by the `loop_advanced` cargo feature (off by
 //! default). NO semver guarantees: it may change in ANY release.
 //! [`crate::StartValues`] (crate root, semver-covered) seeds these kernels too.
 
@@ -17,7 +17,6 @@ pub use crate::glmm::GlmmFit;
 /// A caller that builds a full θ for [`crate::StartValues`] by hand starts its
 /// variance components here to match the cold start.
 pub use crate::lmm::THETA0;
-pub use crate::lmm::{LmmFit, LmmGroupings, LmmSuffStats};
 pub use crate::ols::{
     fit_suff_stats_t_sq, ols_contrast_t_sq, OlsFitView, OlsScratch, OlsSuffStats, PANEL_ROWS,
 };

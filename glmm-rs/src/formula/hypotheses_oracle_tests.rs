@@ -3,8 +3,8 @@
 //! as the `_ml` ones, on ML fits, each fitted under its own `reml`) against the
 //! crate's hypothesis matrices through the contest layer, in both parts of
 //! gate 1. At lme4's θ̂: the pass at the reference's θ̂ (its twin's) on each
-//! route the fit can take (the value route, and the gradient route on a
-//! per-group fit), with lme4's β̂, NumDF equal and DenDF and F within gate 1's
+//! route the fit can take (the value route, and the exact pass where it
+//! covers the fit's kernel), with lme4's β̂, NumDF equal and DenDF and F within gate 1's
 //! band there for the route, the spread read from the term's frozen
 //! `DenDF_second`. End to end the pass takes whichever route the fit does: `fit_cold`
 //! and [`Fit::contrast_f`](crate::Fit::contrast_f), NumDF equal and DenDF and
@@ -22,6 +22,8 @@ use faer::Mat;
 use serde_json::Value;
 
 use super::hypotheses::{type2_xtx, type3, TermHypothesis};
+use super::hypotheses_tests::scaled_table;
+use super::lower;
 use crate::inference::contest::{contest_md, ContestInputs};
 use crate::inference::test_refs::{self, Kind};
 use crate::lmm::satterthwaite::tests::gate1::{
@@ -29,10 +31,30 @@ use crate::lmm::satterthwaite::tests::gate1::{
     spread, strings, Driver,
 };
 use crate::lmm::satterthwaite::{DerivRoute, SatterthwaiteState};
+use crate::{Family, FitOptions};
 
 /// `df_e2e_rel` in `validation/grid/tol.R` (`TOL_INFERENCE`): gate 1's
 /// end-to-end band on a df, at the crate's own θ̂. Change together.
 const DF_E2E_REL: f64 = 1e-3;
+
+/// The per-term references whose fit the exact pass covers (a crossed tail
+/// within its width).
+const PERTERM_EXACT: &[&str] = &[
+    "lmertest_anova_Machines",
+    "lmertest_anova_Machines_ml",
+    "lmertest_anova_Oats",
+    "lmertest_anova_Oats_ml",
+    "lmertest_anova_cake",
+    "lmertest_anova_cake_ml",
+    "lmertest_anova_sim_factorial",
+    "lmertest_anova_sim_factorial_empty",
+    "lmertest_anova_sim_factorial_gx",
+    "lmertest_anova_sim_factorial_ml",
+    "lmertest_anova_sim_slope",
+    "lmertest_anova_sim_slope_ml",
+    "lmertest_anova_sleepstudy",
+    "lmertest_anova_sleepstudy_ml",
+];
 
 /// The tables of each reference, as their JSON keys.
 const TABLES: [&str; 2] = ["type3", "type2"];
@@ -129,10 +151,91 @@ fn nonmarginal_f_matches_anova() {
     end_to_end.finish();
 }
 
+/// Type II on `y ~ g * x + (1 | subj)` with `x` in small units
+/// (`anova_type2_units_sim_factorial`, `x` times the entry's `scale_by`), end
+/// to end: glmm's rows match lmerTest's on the unscaled data
+/// (`lmertest_anova_sim_factorial_gx`), NumDF equal and F and DenDF within
+/// [`DF_E2E_REL`], and do not match lmerTest's on the scaled data. lmerTest
+/// zeroes at an absolute 1e-6 on the unscaled Gram, where `x`'s pivot falls
+/// under it; glmm zeroes on the equilibrated Gram.
+#[test]
+fn type2_on_small_units_matches_lmertest_on_the_unscaled_data() {
+    let e = test_refs::entries(Kind::Anova)
+        .into_iter()
+        .find(|e| e.name == "anova_type2_units_sim_factorial")
+        .expect("the units entry is registered");
+    let json = test_refs::load(Kind::Anova, &e.name);
+    let by = e.raw["scale_by"].as_f64().expect("scale_by");
+    let column = e.raw["scale_column"].as_str().expect("scale_column");
+    let formula = e.r_formula.as_ref().expect("anova entry has a formula");
+    let lo = lower(formula, &scaled_table(&e, column, by), Family::Gaussian)
+        .unwrap_or_else(|err| panic!("{}: {err}", e.name));
+    let fit_opts = FitOptions {
+        reml: Some(true),
+        ..FitOptions::default()
+    };
+    let fit = fit_warm_wo(
+        &lo.x,
+        &lo.y,
+        lo.n,
+        lo.p,
+        &lo.model,
+        &lo.ids,
+        None,
+        lo.weights.as_deref(),
+        lo.offset.as_deref(),
+        &fit_opts,
+    );
+    assert!(fit.converged(), "the fit converges");
+    let unscaled = test_refs::load(Kind::Lmertest, "lmertest_anova_sim_factorial_gx");
+    let want = &unscaled["type2"];
+    let scaled = json["lmertest_type2"]["rows"].as_array().expect("rows");
+    let all: Vec<usize> = (0..lo.p).collect();
+    let hyps = type2_xtx(&lo, &all);
+    assert_eq!(hyps.len(), scaled.len(), "terms");
+    let rel = |g: f64, w: f64| (g - w).abs() / w.abs();
+    let mut departs = false;
+    for (t, (h, row)) in hyps.iter().zip(scaled).enumerate() {
+        assert_eq!(want["terms"][t].as_str(), Some(h.term.as_str()));
+        assert_eq!(row["term"].as_str(), Some(h.term.as_str()));
+        let flat: Vec<f64> = (0..h.l.nrows())
+            .flat_map(|i| (0..lo.p).map(move |j| (i, j)))
+            .map(|(i, j)| h.l[(i, j)])
+            .collect();
+        let got = fit
+            .contrast_f(&flat, h.l.nrows())
+            .unwrap_or_else(|err| panic!("{}: {err}", h.term));
+        assert_eq!(
+            Some(got.num_df),
+            want["NumDF"][t].as_f64(),
+            "{}: NumDF",
+            h.term
+        );
+        for (what, g, w) in [
+            ("F", got.f, want["F"][t].as_f64().expect("F")),
+            (
+                "DenDF",
+                got.den_df,
+                want["DenDF"][t].as_f64().expect("DenDF"),
+            ),
+        ] {
+            let r = rel(g, w);
+            assert!(r <= DF_E2E_REL, "{} {what}: {g} vs {w}, rel {r:e}", h.term);
+        }
+        let f_scaled = row["F value"].as_f64().expect("F value");
+        let df_scaled = row["DenDF"].as_f64().expect("DenDF");
+        departs |= rel(got.f, f_scaled) > DF_E2E_REL || rel(got.den_df, df_scaled) > DF_E2E_REL;
+    }
+    assert!(
+        departs,
+        "glmm's rows match lmerTest's on the scaled data too"
+    );
+}
+
 #[test]
 fn per_term_f_matches_anova() {
     let mut at_lme4 = Driver::new(&["dendf_at_lme4", "f_at_lme4"]);
-    let mut per_group = Vec::new();
+    let mut exact = Vec::new();
     let mut end_to_end = Driver::new(&["df", "f"]);
     let entries: Vec<_> = [true, false]
         .into_iter()
@@ -161,8 +264,8 @@ fn per_term_f_matches_anova() {
             &fit_json,
             |kept, ws, map, units, theta| {
                 let routes = routes(ws);
-                if routes.contains(&DerivRoute::GradientDiff) {
-                    per_group.push(name.to_string());
+                if routes.contains(&DerivRoute::Exact) {
+                    exact.push(name.to_string());
                 }
                 for route in routes {
                     let st0 = route_pass_at(ws, theta, map, units, route);
@@ -285,19 +388,10 @@ fn per_term_f_matches_anova() {
         end_to_end.compared(name);
     }
     at_lme4.finish();
-    per_group.sort();
+    exact.sort();
     assert_eq!(
-        per_group,
-        [
-            "lmertest_anova_Machines",
-            "lmertest_anova_Machines_ml",
-            "lmertest_anova_sim_factorial",
-            "lmertest_anova_sim_factorial_empty",
-            "lmertest_anova_sim_factorial_ml",
-            "lmertest_anova_sleepstudy",
-            "lmertest_anova_sleepstudy_ml",
-        ],
-        "the references whose fit arms the per-group gradient"
+        exact, PERTERM_EXACT,
+        "the references whose fit the exact pass covers"
     );
     end_to_end.finish();
 }

@@ -29,8 +29,8 @@
 #            twins with no flag and a cell run names them, so --ml is refused there.
 #   --jobs N split the cell list into N chunks and run N workers, worker i pinned
 #            with `taskset` to the i-th core this script inherits (a timed run: core
-#            0). P-cores on this box are 0-5, so N > 6 is refused, and so is N above
-#            the inherited core count.
+#            0). N above the inherited core count is refused (without `taskset`,
+#            N above the machine's core count).
 #   --label  free text purpose of the run ("release 0.4.0 baseline"), stored in
 #            run_meta and slugged into the directory name.
 #   --keep   a finished glmm / glmm_wasm / glmm_python / glmm_r run replaces the
@@ -142,8 +142,8 @@ else
   CELL_LIST_JSON='[]'
 fi
 
-[[ "$JOBS" =~ ^[0-9]+$ ]] && (( JOBS >= 1 && JOBS <= 6 )) \
-  || { echo "--jobs must be 1..6 (P-cores are 0-5 on this box)" >&2; exit 2; }
+[[ "$JOBS" =~ ^[0-9]+$ ]] && (( JOBS >= 1 )) \
+  || { echo "--jobs must be an integer >= 1" >&2; exit 2; }
 if [[ -n "$TIMED_N" ]]; then
   [[ "$TIMED_N" =~ ^[0-9]+$ ]] && (( TIMED_N >= 2 )) \
     || { echo "--timed=N needs an integer N >= 2; N=2 keeps 1 sample after the warm-up discard" >&2; exit 2; }
@@ -202,7 +202,11 @@ if command -v taskset >/dev/null; then
   fi
   PIN_CORES=$(IFS=,; echo "${PIN_LIST[*]:0:JOBS}")
 fi
-[[ "$PIN_CORES" == none ]] && echo ">> taskset not found -- workers run unpinned" >&2
+if [[ "$PIN_CORES" == none ]]; then
+  echo ">> taskset not found -- workers run unpinned" >&2
+  NCPU="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1)"
+  (( JOBS <= NCPU )) || { echo "--jobs $JOBS exceeds the $NCPU cores of this machine" >&2; exit 2; }
+fi
 
 # ---- cell selection --------------------------------------------------------
 # SELECTED is built in one deterministic order and is the ONLY input to the
@@ -334,13 +338,18 @@ mkdir -p "$RUN_DIR"
 # Every value here is RECORDED, never set -- no_turbo especially: clock locking
 # is the user's bench-l/bench-u, and this script only writes down what it found.
 write_run_meta() {   # $1 = the cell_list JSON array
-  local cell_list="$1" no_turbo loadavg rev tree crate r_ver jl_ver
+  local cell_list="$1" no_turbo loadavg cpu rev tree crate r_ver jl_ver
   no_turbo="$(cat /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null || echo '?')"
   # The 1/5/15-minute load averages as the run starts: foreign load is invisible
   # to no_turbo and to the pin, and it is what makes two locked runs disagree.
   # No /proc on macOS: sysctl vm.loadavg prints "{ 1.0 2.0 3.0 }".
   loadavg="$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null \
     || sysctl -n vm.loadavg 2>/dev/null | awk '{print $2, $3, $4}' || echo '?')"
+  # The CPU model: tests/grid_reference.rs holds a run to its strict band only on
+  # the CPU that fitted the kept run, and reads the model the same way
+  # (`model name` in /proc/cpuinfo; sysctl on macOS) -- change together.
+  cpu="$(sed -n 's/^model name[[:space:]]*: //p' /proc/cpuinfo 2>/dev/null | head -n 1)"
+  [[ -n "$cpu" ]] || cpu="$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo '?')"
   # The commit the run started from, suffixed `-dirty` (git describe's spelling)
   # when tracked files differ from it: a bare hash would claim that commit's
   # code built the run. Untracked files are not counted.
@@ -355,7 +364,8 @@ write_run_meta() {   # $1 = the cell_list JSON array
   local code=(Cargo.toml glmm-rs/src glmm-rs/Cargo.toml glmm-bind glmm-py/Cargo.toml glmm-py/src glmm-py/glmm
               glmm-r/rust glmm-r/R glmm-r/src
               validation/grid/engines/common.rs validation/grid/engines/glmm.rs
-              validation/grid/engines/glmm_python.py validation/grid/engines/glmm_r.R)
+              validation/grid/engines/glmm_python.py validation/grid/engines/glmm_r.R
+              validation/grid/engines/common.R)
   tree="$( { git -C "$ROOT" diff HEAD -- "${code[@]}"
              git -C "$ROOT" ls-files -z --others --exclude-standard -- "${code[@]}" \
                | (cd "$ROOT" && xargs -0 cat); } 2>/dev/null | git hash-object --stdin)"
@@ -364,7 +374,7 @@ write_run_meta() {   # $1 = the cell_list JSON array
   jl_ver="$(julia --version 2>/dev/null | awk '{print $3}' || echo '?')"
   jq -n \
     --arg engine "$ENGINE" --arg engine_version "$ENGINE_VERSION" \
-    --arg machine "$MACHINE" --arg date "$(date -Iseconds)" \
+    --arg machine "$MACHINE" --arg cpu "$cpu" --arg date "$(date -Iseconds)" \
     --arg crate "$crate" --arg rev "$rev" --arg tree "$tree" --arg subset "$SUBSET" \
     --arg no_turbo "$no_turbo" --arg pin "$PIN_CORES" \
     --arg loadavg "$loadavg" --arg r "$r_ver" --arg jl "$jl_ver" \
@@ -375,7 +385,7 @@ write_run_meta() {   # $1 = the cell_list JSON array
     --argjson pipeline "$([[ "$PIPELINE" == 1 ]] && echo true || echo false)" \
     --argjson jobs "$JOBS" --argjson cells "${#SELECTED[@]}" \
     --argjson cell_list "$cell_list" \
-    '{engine: $engine, engine_version: $engine_version, machine: $machine, date: $date,
+    '{engine: $engine, engine_version: $engine_version, machine: $machine, cpu: $cpu, date: $date,
       glmm_crate_version: $crate, glmm_git_rev: $rev, glmm_tree_hash: $tree,
       subset: $subset, ml: $ml,
       timed: $timed, pipeline: $pipeline, timed_unlocked: $unlocked, no_turbo: $no_turbo,
@@ -456,6 +466,14 @@ next_missing() {
 
 done_count() { jq -rR 'fromjson? | .cell' "$out" 2>/dev/null | sort -u | wc -l; }
 
+# The result line for "$CELL" (the caller's) when the engine wrote none: the
+# record schema with every estimate empty. Mirrors base_record in
+# engines/common.rs: change together.
+stub_record() {   # $1 = status, $2 = message
+  printf '{"cell":"%s","engine":"%s","engine_version":"%s","converged":false,"singular":false,"status":"%s","message":"%s","coef_names":[],"beta":[],"coef_df":null,"varcomp":[],"sigma":null,"nb_theta":null,"loglik":null,"deviance":null,"n_eval":null,"wall_seconds":null,"fits_per_sample":1}\n' \
+    "$CELL" "$ENGINE" "$ENGINE_VERSION" "$1" "$2"
+}
+
 # One worker: its own part file, its own slice of the cell list, its own
 # watchdog. Run as a background subshell, so the exports below are this worker's.
 run_worker() {   # $1 = part index
@@ -486,8 +504,7 @@ run_worker() {   # $1 = part index
         if [[ -n "${CELL:-}" ]]; then
           # EFF, not the budget: a launch killed during the startup grace waited
           # that long, and the message has to say what was actually spent.
-          printf '{"cell":"%s","engine":"%s","engine_version":"%s","converged":false,"singular":false,"status":"timeout","message":"watchdog killed the engine after %ss","coef_names":[],"beta":[],"coef_df":null,"varcomp":[],"sigma":null,"nb_theta":null,"loglik":null,"deviance":null,"n_eval":null,"wall_seconds":null,"fits_per_sample":1}\n' \
-            "$CELL" "$ENGINE" "$ENGINE_VERSION" "$EFF" >> "$out"
+          stub_record timeout "watchdog killed the engine after ${EFF}s" >> "$out"
         fi
         KILLED=1
         break
@@ -514,8 +531,7 @@ run_worker() {   # $1 = part index
         echo ">> (build failure or OOM; nothing is recorded for this cell)" >&2
         return 1
       else
-        printf '{"cell":"%s","engine":"%s","engine_version":"%s","converged":false,"singular":false,"status":"engine-fail","message":"launch declined the cell","coef_names":[],"beta":[],"coef_df":null,"varcomp":[],"sigma":null,"nb_theta":null,"loglik":null,"deviance":null,"n_eval":null,"wall_seconds":null,"fits_per_sample":1}\n' \
-          "$CELL" "$ENGINE" "$ENGINE_VERSION" >> "$out"
+        stub_record engine-fail "launch declined the cell" >> "$out"
         LAST_STUCK=""
       fi
     fi

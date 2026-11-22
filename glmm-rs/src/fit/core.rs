@@ -2,10 +2,9 @@
 //! `loop_advanced` hot path, so a change to glmm's model/routing lands in every
 //! caller identically and no caller can re-implement the routing and drift.
 //!
-//! Two reusable pieces, mirroring the existing `build_glmm`/`fit_glmm_prebuilt`
-//! split: [`build_workspace`] classifies the design once (family × RE × solver)
-//! and allocates the per-shape [`FitWorkspace`]; [`fit_on`] accumulates + solves
-//! on that workspace and returns a lean borrowed [`FitView`]. `fit_checked` is
+//! Two reusable pieces: [`build_workspace`] classifies the design once
+//! (family × RE × solver) and allocates the per-shape [`FitWorkspace`];
+//! [`fit_on`] accumulates + solves on that workspace and returns a lean borrowed [`FitView`]. `fit_checked` is
 //! re-expressed over these (build a throwaway ws, `fit_on`, `FitView::into_fit`);
 //! the loop tier builds once per shape and calls `fit_on` per draw.
 //!
@@ -29,7 +28,7 @@ use super::common::{
 use super::glm::GlmScratchBuf;
 use super::lmm::LmmResultView;
 use super::ols::OlsWorkspace;
-use super::{classify_design, Fit, FitOptions, SeFor, Solver};
+use super::{classify_design, Fit, FitError, FitOptions, SeFor, Solver};
 use crate::optim::CurvatureHint;
 
 // ---------------------------------------------------------------------------
@@ -63,7 +62,8 @@ pub struct FitView<'a> {
     /// `pinned` in the caller's coordinates, when a centered slope moved the
     /// zero pattern of Λ away from the kernel's.
     pinned_override: Option<u64>,
-    /// [`Self::dispersion`] on the GLM route, which the kernel does not compute.
+    /// [`Self::dispersion`] on the GLM route, which the kernel does not compute,
+    /// on the internal scale (`φ_int`, [`super::glm::glm_dispersion`]).
     glm_dispersion: f64,
     /// The fitted design's column map (`β = B·β̃`), for `into_fit`.
     map: &'a ColumnScaling,
@@ -73,9 +73,8 @@ pub struct FitView<'a> {
 }
 
 // The `Prebuilt` arm is ~2× the next-largest variant because it owns a whole
-// assembled `Fit` — which is the arm's entire reason to exist, and got wider
-// again when `Fit`'s diagnostics moved behind `Diagnostics`. Clippy's fix is to
-// box it, and that is the wrong trade here: the enum lives for one call frame,
+// assembled `Fit` — which is the arm's entire reason to exist. Clippy's fix is
+// to box it, and that is the wrong trade here: the enum lives for one call frame,
 // while `Box::new` would add a heap block PER DRAW on the loop tier, and that
 // per-draw allocation is the one cost this crate keeps off the loop tier.
 #[allow(clippy::large_enum_variant)]
@@ -102,9 +101,9 @@ enum FitViewKind<'a> {
 }
 
 // `t_sq`/`converged`/`betas`/`var_diag` are the loop-tier hot-path reads
-// (MCPower's warm loop, via the `loop_advanced` re-export). Unused by the stable
-// single-fit path (which calls `into_fit`), so they read as dead code in a
-// default build; `into_fit` in the same surface stays live.
+// (a batch caller's warm loop, via the `loop_advanced` re-export). Unused by
+// the stable single-fit path (which calls `into_fit`), so they read as dead
+// code in a default build; `into_fit` in the same surface stays live.
 #[allow(dead_code)]
 impl FitView<'_> {
     /// Per-target Wald statistic — the hot-loop significance read. Layout follows
@@ -179,12 +178,13 @@ impl FitView<'_> {
                     n_grad: fit.diagnostics.n_grad as u32,
                     outer_stop: fit.diagnostics.outer_stop,
                     outer_decrement: fit.diagnostics.outer_decrement,
+                    stop: fit.diagnostics.stop,
                     ..FitDiagnostics::fixed_only(fit.converged())
                 };
-                // The inverse of `common::materialize_diagnostics`: every note it
-                // raises off a carrier field sets that field back — change
-                // together. Walking the notes reads the `Vec`, it allocates
-                // nothing.
+                // The inverse of `common::materialize_diagnostics` and of the
+                // at-limit notes the view mappers push: every note raised off a
+                // carrier field sets that field back — change together.
+                // Walking the notes reads the `Vec`, it allocates nothing.
                 for note in &fit.diagnostics.notes {
                     match note {
                         Note::IllConditioned { columns, pivot } => {
@@ -202,9 +202,11 @@ impl FitView<'_> {
                         Note::SeUnavailable => d.se_unavailable = true,
                         Note::PrecisionLimited => d.precision_limited = true,
                         Note::Separated => d.separated = true,
+                        Note::VarianceAtLimit => d.theta_at_limit = true,
+                        Note::NbShapeAtLimit { .. } => d.nb_shape_at_limit = true,
+                        Note::DispersionAtLimit { .. } => d.dispersion_at_limit = true,
                         // No carrier field.
                         Note::NbShapeUnsettled { .. }
-                        | Note::NbShapeAtLimit { .. }
                         | Note::NonIntegerResponse { .. }
                         | Note::SingleLevelGroupingDropped { .. }
                         | Note::FewRowsForRandomEffects { .. }
@@ -213,8 +215,6 @@ impl FitView<'_> {
                         | Note::SlopeConstantWithinLevels { .. }
                         | Note::SeparatedByGrouping { .. }
                         | Note::OneTrialPerLevel { .. }
-                        | Note::VarianceAtLimit
-                        | Note::DispersionAtLimit { .. }
                         | Note::SatterthwaiteCurvature { .. }
                         | Note::NewGroupingLevels { .. }
                         | Note::RowsNotEstimable { .. }
@@ -345,7 +345,7 @@ impl FitView<'_> {
     pub fn dispersion(&self) -> f64 {
         match &self.kind {
             FitViewKind::Ols(_) => f64::NAN,
-            FitViewKind::Glm(_) => self.glm_dispersion,
+            FitViewKind::Glm(_) => self.units.dispersion_scale() * self.glm_dispersion,
             FitViewKind::Lmm(v) => v.dispersion(),
             FitViewKind::Glmm(v) if v.is_nb() => v.dispersion_estimate().unwrap_or(f64::NAN),
             FitViewKind::Glmm(v) if v.has_endpoint() => self.theta()[0].powi(2),
@@ -454,6 +454,7 @@ impl FitView<'_> {
                 weights,
                 model.family,
                 f64::NAN,
+                self.glm_dispersion,
                 n,
                 p,
                 opts,
@@ -464,9 +465,7 @@ impl FitView<'_> {
                 let z = re.unwrap_or(&[]);
                 super::lmm::lmm_view_to_fit(&v, x, y, z, s, weights, offset, ids, n, p, opts)
             }
-            FitViewKind::Glmm(mut v) => {
-                super::glmm::glmm_view_to_fit(&mut v, y, n, p, model, opts).0
-            }
+            FitViewKind::Glmm(mut v) => super::glmm::glmm_view_to_fit(&mut v, y, n, p, model, opts),
             FitViewKind::Prebuilt { fit, .. } => fit,
         };
         // `ids` above is the workspace's SLOT-order copy (`fitted` sums over
@@ -901,7 +900,11 @@ impl FitWorkspace {
 
     /// Re-accumulate the last draw's rows (`data` is that draw's) on the
     /// weights `w_hat` in place of ŵ, a full accumulation.
-    pub(crate) fn lmm_accumulate(&mut self, data: &Data<'_>, w_hat: Option<&[f64]>) {
+    pub(crate) fn lmm_accumulate(
+        &mut self,
+        data: &Data<'_>,
+        w_hat: Option<&[f64]>,
+    ) -> Result<(), FitError> {
         let FitKind::Lmm { ws } = &mut self.kind else {
             panic!("lmm_accumulate: not an LMM workspace");
         };
@@ -918,7 +921,7 @@ impl FitWorkspace {
             w_hat,
             false,
             self.criterion.expect("an LMM workspace has a criterion"),
-        );
+        )
     }
 
     /// The current kernel's rounding estimate of the deviance at the fit's
@@ -1281,22 +1284,29 @@ pub(super) fn draw_units(
 /// - **Separation.** A GLMM β start is used as given; the stable entry first
 ///   fits the fixed-effects GLM and stops as `separated` when that GLM has no
 ///   finite maximum, as a cold start does.
+///
+/// # Errors
+///
+/// [`FitError::Envelope`] when the random-effect pattern of a sparse LMM or
+/// GLMM is too large for the sparse factorization (an index overflow or an
+/// allocation failure in faer's symbolic Cholesky), on the draw that builds
+/// the factor.
 pub fn fit_on<'a>(
     ws: &'a mut FitWorkspace,
     data: &Data<'_>,
     start: Option<&StartValues>,
     opts: &FitOptions,
-) -> FitView<'a> {
+) -> Result<FitView<'a>, FitError> {
     fit_on_hinted(ws, data, start, None, opts)
 }
 
-/// Test-only: route a GLMM workspace's outer search to BOBYQA on both start
-/// kinds (the gradient route off), so a test of a BOBYQA-route property runs
+/// Test-only: route a GLMM workspace's outer search to BOBYQA (the gradient
+/// route off), so a test of a BOBYQA-route property runs
 /// on that route whatever the shape. A no-op on every other workspace kind.
 #[cfg(test)]
 pub(crate) fn force_bobyqa_route(ws: &mut FitWorkspace) {
     if let FitKind::Glmm { ws, .. } = &mut ws.kind {
-        ws.route_plan = crate::optim::RoutePlan::BOBYQA;
+        ws.route_plan = crate::optim::OuterOptimizer::Bobyqa;
     }
 }
 
@@ -1321,10 +1331,11 @@ pub fn curvature_hint(ws: &mut FitWorkspace) -> Option<CurvatureHint> {
 /// `se_for` selects): the stable path's [`Fit::coef_df`], run on demand (equal
 /// to round-off, not bit for bit, when the fit reorders the groupings). Call
 /// it after [`fit_on`] or [`fit_on_hinted`], with the view dropped; nothing
-/// runs it otherwise. It reads θ̂ and never writes it, and it leaves the
-/// kernel's factor and `σ̂²` off θ̂, at its last stencil point, as
-/// [`curvature_hint`] does, so the two give the same answers in either order
-/// and the next `fit_on` refits from scratch. The pass's buffers live on the
+/// runs it otherwise. It reads θ̂ and never writes it, and it can leave the
+/// kernel's factor and `σ̂²` off θ̂ (the finite-difference route of a wide
+/// crossed tail ends at its last point), as [`curvature_hint`] does, so the
+/// two give the same answers in either order and the next `fit_on` refits
+/// from scratch. The pass's buffers live on the
 /// workspace, built on the first call, so each later call allocates only the
 /// pseudo-inverse's blocks: the same count whichever variance parameters the
 /// draw pins at zero while at least one stays free, and none when the draw
@@ -1366,9 +1377,9 @@ pub fn satterthwaite(
 ///
 /// `df_out` and `contrast_df_out` are then all NaN:
 /// [`NoDfReason::NotGaussianMixed`] on any workspace but a Gaussian LMM's
-/// (OLS included); [`NoDfReason::Failed`] when the pass failed (a stencil
-/// deviance, `C` or `σ̂²` not finite) or the fit had no finite endpoint to
-/// run it at.
+/// (OLS included); [`NoDfReason::Failed`] when the pass failed (the
+/// deviance, its derivatives, `C` or `σ̂²` not finite) or the fit had no
+/// finite endpoint to run it at.
 ///
 /// # Panics
 ///
@@ -1549,13 +1560,17 @@ pub(crate) fn curvature_note(
 /// to GLMM workspaces of its own `n_θ + p`, + 1 on a Gamma fit whose
 /// dispersion is not held; `n_θ` without the θ entries a grouping's terms hold
 /// at zero).
+///
+/// # Errors
+///
+/// As [`fit_on`].
 pub fn fit_on_hinted<'a>(
     ws: &'a mut FitWorkspace,
     data: &Data<'_>,
     start: Option<&StartValues>,
     hint: Option<&CurvatureHint>,
     opts: &FitOptions,
-) -> FitView<'a> {
+) -> Result<FitView<'a>, FitError> {
     if let Some(h) = hint {
         let dim = match &ws.kind {
             FitKind::Lmm { ws, .. } => ws.kernel.groupings().n_free_theta(),
@@ -1794,7 +1809,7 @@ pub fn fit_on_hinted<'a>(
             warm_theta(start),
             hint,
             scaling,
-        )),
+        )?),
         _ => None,
     };
     let units: &'a Units = units;
@@ -1853,7 +1868,7 @@ pub fn fit_on_hinted<'a>(
                 offset,
                 n,
                 opts,
-            );
+            )?;
             glmm_ws.grad_hint_in = hint.cloned();
             FitViewKind::Glmm(super::glmm::run_glmm_on(
                 glmm_ws,
@@ -1894,7 +1909,7 @@ pub fn fit_on_hinted<'a>(
             opts,
             scaling,
             units,
-        )),
+        )?),
         FitKind::GlmNb => {
             let seed = start.and_then(|s| s.dispersion);
             let (mut fit, _) =
@@ -1908,8 +1923,7 @@ pub fn fit_on_hinted<'a>(
     };
     let glm_dispersion = match &kind {
         FitViewKind::Glm(v) => {
-            units.dispersion_scale()
-                * super::glm::glm_dispersion(v, y, weights, sized.spec.family, n, opts, units)
+            super::glm::glm_dispersion(v, y, weights, sized.spec.family, n, opts, units)
         }
         _ => f64::NAN,
     };
@@ -1924,7 +1938,7 @@ pub fn fit_on_hinted<'a>(
         units,
     );
     view.glm_dispersion = glm_dispersion;
-    view
+    Ok(view)
 }
 
 #[cfg(test)]

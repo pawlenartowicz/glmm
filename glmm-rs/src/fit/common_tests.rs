@@ -63,21 +63,19 @@ pub(crate) const PIN_REL_ITER: f64 = 1e-7;
 /// `glmm_tests.rs` and `sparse/tests.rs` — reproduces there BIT-EXACTLY, worst
 /// relative spread 0.0, across all four feature configs (default,
 /// `loop_advanced`, `parallel`, `--no-default-features`) in both debug and
-/// release: eight legs, zero non-exact pins. Verified 2026-07-31 by rewriting
-/// every band to `1e-300` and re-running the suite, so a bit-exact pin passes
-/// and one off by a single ULP fails. (`1e-300` and not `0.0` because the
-/// comparison was strict then; it is `rel <= band` now, so `0.0` does the
-/// same.) That is the `pin-bands`
-/// workflow's procedure, and it rewrites this band list — keep the two in step.
+/// release: eight legs, zero non-exact pins. Verified by rewriting every band
+/// to `0.0` (the comparison is `rel <= band`) and re-running the suite, so a
+/// bit-exact pin passes and one off by a single ULP fails. That is the
+/// `pin-bands` workflow's procedure, and it rewrites this band list — keep the two in step.
 ///
-/// **The bands are margin for a different CPU, and that cost is now measured.**
+/// **The bands are margin for a different CPU, and that cost is measured.**
 /// The second machine is aarch64-apple-darwin, where `simd_transcendental.rs`
 /// dispatches differently and the compiler contracts multiply-adds into FMA at
 /// other points in this kernel's long reductions. Drift off the anchor values,
 /// worst per test: 1.4e-7 (`fit_wide_crossed_sparse_is_pinned`), 1.5e-7
 /// (`fit_glmm_binomial_slope1_vector_agq_is_pinned`), 5.1e-5
 /// (`fit_wide_slopes_sparse_is_pinned`, its smallest `ge` covariance entry;
-/// 1.4e-6 before the 0.5.0 re-pins, everything else in it ≤ 5.0e-6), 3.6e-6
+/// everything else in it ≤ 5.0e-6), 3.6e-6
 /// (`fit_glmm_binomial_slope2_vector_agq_is_pinned`), 7.7e-6
 /// (`fit_sparse_binomial_slope_crossed_is_pinned`), 7.1e-5
 /// (`fit_glmm_poisson_slope1_vector_agq_is_pinned`), 7.9e-4
@@ -92,8 +90,7 @@ pub(crate) const PIN_REL_ITER: f64 = 1e-7;
 /// machine is as arithmetically valid as the anchor's, but mixing the two splits
 /// the corpus across two references and makes "bit-exact on the anchor" stop
 /// being checkable — which is the property that lets a real regression be told
-/// apart from a port. Four `se` vectors were re-anchored on 2026-07-31 for
-/// exactly that reason; each says so at its own site.
+/// apart from a port.
 ///
 /// **Not covered by any of this: pins asserted against a frozen R/Julia
 /// reference** (`fit_glmm_binomial_bigsd_agq_matches_lme4`, and everything in
@@ -393,8 +390,7 @@ fn nonfinite_x_is_rejected() {
 }
 
 /// An `ErrorMessage` compares with the text in either order and with a
-/// `String`, and gives its text back as a `String`, as the `String` payload
-/// it replaced did.
+/// `String`, and gives its text back as a `String`, as a `String` does.
 #[test]
 fn error_message_reads_as_its_text() {
     let (mut x, y, model) = shape_check_fixture();
@@ -1732,8 +1728,8 @@ fn spec_sized_from_ids_derives_counts() {
 }
 
 /// UNBALANCED nesting (3 parents with 3, 2 and 1 distinct children), the
-/// WIDEST parent first in primary order (id 0 → 3 children `{0,1,2}`, id 1 → 2 `{3,4}`, id 2 → 1 `{5}`). The old
-/// `children.div_ceil(n_primary)` formula computed `⌈6/3⌉ = 2` from the
+/// WIDEST parent first in primary order (id 0 → 3 children `{0,1,2}`, id 1 → 2 `{3,4}`, id 2 → 1 `{5}`). A
+/// `children.div_ceil(n_primary)` formula would compute `⌈6/3⌉ = 2` from the
 /// global `max(extra)+1 = 6` — under-sizing parent 0's true 3-wide block
 /// because the fullest parent isn't the one that sets the global max id.
 /// The true per-parent count (grouping rows by `(primary, extra)` pairs)
@@ -1754,7 +1750,7 @@ fn spec_sized_from_ids_nested_unbalanced_first_parent_widest() {
         family: Family::Gaussian,
         re: Some(re),
     };
-    // Widest parent first (where the old `div_ceil` formula under-sized it)
+    // Widest parent first (where a global `div_ceil` formula under-sizes it)
     // and widest parent last (padded contiguous ids, as `grouping_ids` emits):
     // the width is the true per-parent maximum either way.
     for ids in [
@@ -1773,34 +1769,9 @@ fn spec_sized_from_ids_nested_unbalanced_first_parent_widest() {
     }
 }
 
-/// A `q_g = 5` (intercept + 4 slopes) extra grouping is over the `MAX_EXTRA_Q = 4`
-/// NoZ-scratch envelope and routes to Sparse; the over-envelope anti-panic
-/// test below fits that shape.
-#[test]
-fn fit_extra_grouping_q_too_large_routes_sparse() {
-    let model = SizedSpec {
-        spec: ModelSpec {
-            family: Family::Gaussian,
-            re: Some(ReStructure {
-                terms: Vec::new(),
-                slopes: vec![],
-                extra_groupings: vec![Grouping {
-                    terms: Vec::new(),
-                    relation: GroupingRelation::Crossed,
-                    slopes: vec![1, 2, 3, 4], // q_g = 5 > MAX_EXTRA_Q
-                }],
-            }),
-        },
-        n_primary: 4,
-        extra_counts: vec![4],
-        tail_fill: 0.0,
-    };
-    assert!(matches!(classify_design(&model, true), Solver::Sparse));
-}
-
 /// Anti-panic floor: an over-envelope mixed model must return a `Fit`, never
-/// panic — for both over-envelope shapes (over-count: 7 crossed extras >
-/// MAX_EXTRA_GROUPINGS; over-width: a q_g=5 slope block > MAX_EXTRA_Q) across
+/// panic — for both Sparse-routed shapes (over-count: 7 crossed extras >
+/// MAX_EXTRA_GROUPINGS; a q_g = 5 slope block on an extra grouping) across
 /// every family. `classify_design` routes both shapes to Sparse, and the sparse
 /// path builds its own cap-free structures (`SparseLmmWorkspace::new` does not
 /// call `add_rows_multi`, and `from_cluster_spec_ext` carries no
@@ -4245,8 +4216,9 @@ fn ranef_blocks_partition_the_stored_modes() {
         lmm.solver = bobyqa::Bobyqa::new(1, config).expect("legal minimal config");
     }
     let data = Data::new(&x, &y, n, p);
-    let unconverged_fit =
-        super::core::fit_on(&mut ws, &data, None, &opts).into_fit(&data, &model, &opts);
+    let unconverged_fit = super::core::fit_on(&mut ws, &data, None, &opts)
+        .unwrap()
+        .into_fit(&data, &model, &opts);
     assert!(!unconverged_fit.converged());
     assert!(unconverged_fit.n_groupings() > 0);
     for g in 0..unconverged_fit.n_groupings() {
@@ -4463,8 +4435,7 @@ fn vcov_is_nan_outside_the_target_block() {
 }
 
 // ---------------------------------------------------------------------------
-// The public `Diagnostics` surface: the three moved fields, the two
-// reshaped ones, and the notes channel.
+// The public `Diagnostics` surface: its fields and the notes channel.
 // ---------------------------------------------------------------------------
 
 /// `Boundary` at both ends of the range the dense LMM route can report:

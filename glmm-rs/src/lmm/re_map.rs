@@ -12,6 +12,7 @@
 use faer::MatRef;
 
 use super::{primary_lambda, LmmGroupings, PIN_THETA};
+use crate::fit::vech_at;
 use crate::standardize::ColumnScaling;
 
 /// Pivot floor of [`semidef_lower_chol`]. A pivot at or below it is a removed
@@ -42,8 +43,8 @@ pub(crate) enum PivotFloor {
     /// `√residual`. So when more than `max_rank` pivots pass, the surplus ones
     /// with the smallest `L_cc²/Σ_cc` (a residual is `O(eps)`, a real direction
     /// is not) are set to zero and the factorization is redone. The result is
-    /// kept only if it still reproduces `Σ` (to `1e-8·tr Σ`); otherwise the
-    /// uncapped factor stands.
+    /// kept only if it still [`reproduces`] `Σ`; otherwise the uncapped factor
+    /// stands.
     Column { max_rank: usize },
 }
 
@@ -71,16 +72,29 @@ pub(crate) fn semidef_lower_chol(sig: &[f64], q: usize, l: &mut [f64], floor: Pi
         }
     }
     chol_pass(sig, q, l, floor, forced);
-    let trace: f64 = (0..q).map(|r| sig[r * q + r]).sum();
-    let preserved = (0..q).all(|r| {
-        (0..=r).all(|c| {
-            let v: f64 = (0..=c).map(|k| l[r * q + k] * l[c * q + k]).sum();
-            (v - sig[r * q + c]).abs() <= 1e-8 * trace
-        })
-    });
-    if !preserved {
+    if !reproduces(sig, l, q) {
         chol_pass(sig, q, l, floor, 0);
     }
+}
+
+/// Relative tolerance of [`reproduces`], on `tr Σ`. It separates a factor
+/// that is `Σ`'s up to rounding (entries off by `O(q·eps·tr Σ)`) from one
+/// that dropped a real direction (a rank cap that cut too deep, or a
+/// correlation block that is not positive semidefinite). Not tuned: any value
+/// well above the rounding and well below a real direction's mass serves.
+pub(crate) const REPRODUCE_REL: f64 = 1e-8;
+
+/// Whether the lower factor `l` (row-major `q×q`) reproduces the lower
+/// triangle of `sig` (`sig[r·q + c]`, c ≤ r): every entry of `l·lᵀ` within
+/// `REPRODUCE_REL·tr Σ` of it.
+pub(crate) fn reproduces(sig: &[f64], l: &[f64], q: usize) -> bool {
+    let trace: f64 = (0..q).map(|r| sig[r * q + r]).sum();
+    (0..q).all(|r| {
+        (0..=r).all(|c| {
+            let v: f64 = (0..=c).map(|k| l[r * q + k] * l[c * q + k]).sum();
+            (v - sig[r * q + c]).abs() <= REPRODUCE_REL * trace
+        })
+    })
 }
 
 /// One factorization pass of [`semidef_lower_chol`] that also leaves out the
@@ -164,18 +178,6 @@ impl LmmGroupings {
             self.extra_slope_cols[b - 1][r - 1]
         };
         (cs.shift(c), cs.scale(c))
-    }
-
-    fn block_q(&self, b: usize) -> usize {
-        if b == 0 {
-            self.primary_q
-        } else {
-            self.extra_q[b - 1]
-        }
-    }
-
-    fn n_blocks(&self) -> usize {
-        1 + self.extra_q.len()
     }
 
     pub(crate) fn block_has_shift(&self, b: usize, cs: &ColumnScaling) -> bool {
@@ -316,9 +318,8 @@ impl LmmGroupings {
         scratch: &mut [f64],
         cs: &ColumnScaling,
     ) {
-        let mut cur = 0usize;
         for b in 0..self.n_blocks() {
-            let q = self.block_q(b);
+            let (q, cur) = (self.block_q(b), self.vech_start(b));
             let len = q * (q + 1) / 2;
             if q == 1 {
                 out[cur] = theta[cur];
@@ -328,7 +329,6 @@ impl LmmGroupings {
                 self.lambda_kernel_to_caller(b, q, lam, rest, cs);
                 pack_vech(lam, q, &mut out[cur..cur + len]);
             }
-            cur += len;
         }
     }
 
@@ -373,9 +373,8 @@ impl LmmGroupings {
         if !self.any_column_std(cs) {
             return;
         }
-        let mut cur = 0usize;
         for b in 0..self.n_blocks() {
-            let q = self.block_q(b);
+            let (q, cur) = (self.block_q(b), self.vech_start(b));
             let len = q * (q + 1) / 2;
             if q > 1 {
                 let (lam, rest) = scratch.split_at_mut(q * q);
@@ -383,7 +382,6 @@ impl LmmGroupings {
                 self.lambda_caller_to_design(b, q, lam, rest, cs);
                 pack_vech(lam, q, &mut theta[cur..cur + len]);
             }
-            cur += len;
         }
     }
 
@@ -409,17 +407,15 @@ impl LmmGroupings {
     /// a component that went to zero.
     pub(crate) fn kernel_stddevs(&self, theta_kernel: &[f64]) -> Vec<Vec<f64>> {
         let mut out = Vec::with_capacity(self.n_blocks());
-        let mut cur = 0usize;
         for b in 0..self.n_blocks() {
             let q = self.block_q(b);
             let mut lam = vec![0.0; q * q];
-            primary_lambda(&theta_kernel[cur..], q, &mut lam);
+            primary_lambda(&theta_kernel[self.vech_start(b)..], q, &mut lam);
             out.push(
                 (usize::from(self.hidden[b])..q)
                     .map(|r| (0..=r).map(|c| lam[r * q + c].powi(2)).sum::<f64>().sqrt())
                     .collect(),
             );
-            cur += q * (q + 1) / 2;
         }
         out
     }
@@ -433,15 +429,13 @@ impl LmmGroupings {
         if v.is_empty() || !self.hidden.contains(&true) {
             return;
         }
-        let (mut cur, mut kept) = (0usize, 0usize);
+        let mut kept = 0usize;
         for b in 0..self.n_blocks() {
-            let q = self.block_q(b);
-            let skip = if self.hidden[b] { q } else { 0 };
-            for i in cur + skip..cur + q * (q + 1) / 2 {
+            let skip = if self.hidden[b] { self.block_q(b) } else { 0 };
+            for i in self.vech_start(b) + skip..self.vech_start(b + 1) {
                 v[kept] = v[i];
                 kept += 1;
             }
-            cur += q * (q + 1) / 2;
         }
         v.truncate(kept);
     }
@@ -466,9 +460,8 @@ impl LmmGroupings {
         out: &mut [f64],
         cs: &ColumnScaling,
     ) {
-        let mut cur = 0usize;
         for b in 0..self.n_blocks() {
-            let q = self.block_q(b);
+            let (q, cur) = (self.block_q(b), self.vech_start(b));
             let len = q * (q + 1) / 2;
             let cov = cov.submatrix(cur, cur, len, len);
             let mut m = vec![0.0; q * q];
@@ -486,7 +479,7 @@ impl LmmGroupings {
             out[cur..cur + len].fill(f64::NAN);
             for k in 0..q {
                 let sd = (0..q).map(|c| m[k * q + c].powi(2)).sum::<f64>().sqrt();
-                let slot = cur + k * q - k * k.saturating_sub(1) / 2;
+                let slot = cur + vech_at(q, k, k);
                 if sd == 0.0 {
                     let mut reads = pos
                         .iter()
@@ -508,7 +501,6 @@ impl LmmGroupings {
                 }
                 out[slot] = sd_of(v);
             }
-            cur += len;
         }
     }
 }

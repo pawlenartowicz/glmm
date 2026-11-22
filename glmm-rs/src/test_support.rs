@@ -90,9 +90,8 @@ pub(crate) fn assert_near(got: &[f64], want: &[f64], ctx: &str) {
 
 /// Serializes every `#[ignore]` lib test under `--features alloc-tests`.
 /// `dhat::Profiler` counts process-wide allocations and permits one live
-/// profiler at a time, so concurrent tests attribute each other's allocations
-/// (an OLS route with no optimizer once "regressed" this way). The
-/// bounded-alloc tests hold this for their whole body; the non-alloc
+/// profiler at a time, so concurrent tests attribute each other's allocations.
+/// The bounded-alloc tests hold this for their whole body; the non-alloc
 /// `#[ignore]` tests take it too (feature-gated), since their allocations
 /// would otherwise land in a concurrent profiler window on an `-- --ignored`
 /// run. It serializes test bodies only: libtest spawns each test's OS thread
@@ -232,6 +231,30 @@ impl TestWs {
     }
 }
 
+/// n = 40 rows in 8 groups of 5, row-major `[1, x]`, a 0/1 response and a
+/// count response built from fixed effects, group effects and a noise
+/// sequence; returns `(x, binary, counts, group ids)`.
+pub(crate) fn tiny_weight_data() -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<u32>) {
+    const U_G: [f64; 8] = [-0.6, 0.4, 0.1, -0.3, 0.7, -0.2, 0.5, -0.4];
+    let n = 40;
+    let x_seq = |i: usize| (1.7 * i as f64 + 0.3).sin();
+    let noise = |i: usize| (2.3 * i as f64 + 0.7).sin();
+    let g: Vec<u32> = (0..n as u32).map(|i| i / 5).collect();
+    let x = (0..n).flat_map(|i| [1.0, x_seq(i)]).collect();
+    let u = |i: usize| U_G[g[i] as usize];
+    let binary = (0..n)
+        .map(|i| f64::from(u8::from(0.2 + 0.8 * x_seq(i) + u(i) + 0.8 * noise(i) > 0.0)))
+        .collect();
+    let counts = (0..n)
+        .map(|i| {
+            (0.5 + 0.3 * x_seq(i) + 0.5 * u(i) + 0.3 * noise(i))
+                .exp()
+                .round()
+        })
+        .collect();
+    (x, binary, counts, g)
+}
+
 /// Intercept-only Gaussian mixed `ModelSpec` — mirrors
 /// `engine_contract::ClusterSpec::intercept_only`.
 pub(crate) fn intercept_only_spec() -> crate::ModelSpec {
@@ -239,8 +262,8 @@ pub(crate) fn intercept_only_spec() -> crate::ModelSpec {
 }
 
 /// Cluster sizing regime of the positional test layout: a fixed cluster
-/// count, or a fixed per-cluster size. The layout helpers below mirror
-/// MCPower's data generation; they build `GroupIds` for tests from counts.
+/// count, or a fixed per-cluster size. The layout helpers below build
+/// `GroupIds` for tests from counts.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum Sizing {
     /// Fixed number of clusters; per-cluster size grows with total N.
@@ -449,4 +472,133 @@ pub(crate) fn cluster_of_row(sizing: &Sizing, i: usize) -> usize {
         Sizing::FixedClusters { n_clusters } => i % (*n_clusters).max(1) as usize,
         Sizing::FixedSize { cluster_size } => i / (*cluster_size).max(1) as usize,
     }
+}
+
+/// Profiled deviance from an explicit n×n marginal V (in residual-σ²
+/// units), r² = y′V⁻¹y − β̂′X′V⁻¹y: under REML `log|V| + log|XᵀV⁻¹X| +
+/// (N−P)·log(r²/(N−P))`, under ML `log|V| + N·log(r²/N)`. The shared
+/// V→deviance back end for every brute-force oracle (composed, crossed-slope, …).
+pub(crate) fn profile_from_v(
+    v: &Mat<f64>,
+    x: &Mat<f64>,
+    y: &[f64],
+    criterion: crate::lmm::Criterion,
+) -> f64 {
+    use faer::linalg::solvers::Solve;
+    let (n, p) = (x.nrows(), x.ncols());
+    let vc = v.as_ref().llt(faer::Side::Lower).unwrap();
+    let mut ldv = 0.0;
+    for i in 0..n {
+        ldv += vc.L()[(i, i)].ln();
+    }
+    let ldv = 2.0 * ldv;
+    let mut vix = (*x).clone();
+    vc.solve_in_place(vix.as_mut());
+    let mut viy = Mat::<f64>::zeros(n, 1);
+    for i in 0..n {
+        viy[(i, 0)] = y[i];
+    }
+    vc.solve_in_place(viy.as_mut());
+    let mut xtvix = Mat::<f64>::zeros(p, p);
+    let mut xtviy = vec![0.0; p];
+    for aa in 0..p {
+        for bb in 0..p {
+            let mut s = 0.0;
+            for i in 0..n {
+                s += x[(i, aa)] * vix[(i, bb)];
+            }
+            xtvix[(aa, bb)] = s;
+        }
+        let mut s = 0.0;
+        for i in 0..n {
+            s += x[(i, aa)] * viy[(i, 0)];
+        }
+        xtviy[aa] = s;
+    }
+    let kc = xtvix.as_ref().llt(faer::Side::Lower).unwrap();
+    let mut ldk = 0.0;
+    for aa in 0..p {
+        ldk += kc.L()[(aa, aa)].ln();
+    }
+    let ldk = 2.0 * ldk;
+    let mut beta = Mat::<f64>::zeros(p, 1);
+    for aa in 0..p {
+        beta[(aa, 0)] = xtviy[aa];
+    }
+    kc.solve_in_place(beta.as_mut());
+    let mut ytviy = 0.0;
+    for i in 0..n {
+        ytviy += y[i] * viy[(i, 0)];
+    }
+    let mut bxy = 0.0;
+    for aa in 0..p {
+        bxy += beta[(aa, 0)] * xtviy[aa];
+    }
+    let r_sq = ytviy - bxy;
+    match criterion {
+        crate::lmm::Criterion::Reml => {
+            let df = (n - p) as f64;
+            ldv + ldk + df * (r_sq / df).ln()
+        }
+        crate::lmm::Criterion::Ml => ldv + n as f64 * (r_sq / n as f64).ln(),
+    }
+}
+
+/// Brute-force profiled deviance on the explicit n×n marginal
+/// `V = diag(1/wᵢ) + Σ_g Z_g D_g Z_gᵀ` (unit weights when `w` is `None`), in
+/// residual-σ² units. Each factor `(ids, slope_cols, vech)` is one grouping:
+/// rows with equal ids share a level, row i of `Z_g` is
+/// `[1, x[i, slope_cols]]`, and `D_g = ΛΛᵀ` from the column-major vech of the
+/// lower-triangular `Λ` (`q = 1 + slope_cols.len()`). The kernels work on the
+/// √w-scaled rows, so a weighted kernel deviance is this value plus `Σ ln wᵢ`.
+pub(crate) fn brute_force_deviance(
+    x: &Mat<f64>,
+    y: &[f64],
+    w: Option<&[f64]>,
+    factors: &[(&[u32], &[usize], &[f64])],
+    criterion: crate::lmm::Criterion,
+) -> f64 {
+    let n = x.nrows();
+    let mut v = Mat::<f64>::zeros(n, n);
+    for i in 0..n {
+        v[(i, i)] = w.map_or(1.0, |w| 1.0 / w[i]);
+    }
+    for &(ids, slope_cols, vech) in factors {
+        let q = 1 + slope_cols.len();
+        assert_eq!(vech.len(), q * (q + 1) / 2, "vech length for q = {q}");
+        let mut lam = vec![0.0f64; q * q];
+        let mut t = 0;
+        for c in 0..q {
+            for r in c..q {
+                lam[r * q + c] = vech[t];
+                t += 1;
+            }
+        }
+        let mut d = vec![0.0f64; q * q];
+        for i in 0..q {
+            for j in 0..q {
+                d[i * q + j] = (0..q).map(|k| lam[i * q + k] * lam[j * q + k]).sum();
+            }
+        }
+        let zrow = |i: usize| -> Vec<f64> {
+            std::iter::once(1.0)
+                .chain(slope_cols.iter().map(|&c| x[(i, c)]))
+                .collect()
+        };
+        let z: Vec<Vec<f64>> = (0..n).map(zrow).collect();
+        for i in 0..n {
+            for j in 0..n {
+                if ids[i] == ids[j] {
+                    let mut acc = 0.0;
+                    for a in 0..q {
+                        for b in 0..q {
+                            acc += z[i][a] * d[a * q + b] * z[j][b];
+                        }
+                    }
+                    v[(i, j)] += acc;
+                }
+            }
+        }
+    }
+    profile_from_v(&v, x, y, criterion)
 }

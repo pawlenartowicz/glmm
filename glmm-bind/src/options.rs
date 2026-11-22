@@ -3,8 +3,8 @@
 //! ends in the value given.
 
 use glmm::limits::MAX_NAGQ;
-use glmm::orchestrate::{FitResult, MAX_NSIM};
-use glmm::WeightPower;
+use glmm::orchestrate::{FitResult, MAX_AGQ_Q, MAX_NSIM};
+use glmm::{Dispersion, FitOptions, StartValues, WaldSe, WeightPower};
 
 use crate::coerce::{self, describe};
 use crate::error::BindError;
@@ -24,24 +24,67 @@ const FAMILIES: &[(&str, &str, &[&str])] = &[
     ("inversegaussian", "log", &["log", "inverse_squared"]),
 ];
 
-/// The warm start as `orchestrate::run_fit` takes it: `beta` and `theta`
-/// (each empty to cold-start that part) and the dispersion seed.
-pub(crate) type WarmStart = (Vec<f64>, Vec<f64>, Option<f64>);
-
-/// `fit`'s options after parsing, which the fit record echoes.
+/// `fit`'s options after parsing ([`fit_options`]), which the fit record
+/// echoes.
 pub(crate) struct FitArgs {
     pub family: &'static str,
     pub link: &'static str,
-    /// The nodes asked for.
-    pub nagq: u8,
-    /// The dispersion held fixed, after the families that do not read it
-    /// dropped it.
-    pub dispersion: Option<f64>,
-    pub warm_start: Option<WarmStart>,
-    /// The weight power asked for, which a fit without weights does not use.
-    pub weight_power: Option<WeightPower>,
+    /// The kernel options: the nodes asked for, the dispersion held fixed
+    /// after the families that do not read it dropped it, and the weight
+    /// power asked for, which a fit without weights does not use.
+    pub options: FitOptions,
+    /// The warm start, each of `beta` and `theta` empty to cold-start that
+    /// part.
+    pub warm_start: Option<StartValues>,
     /// The `argument_ignored` notes of the options dropped before the fit.
     pub notes: Vec<Value>,
+}
+
+/// The kernel options of `fit` and `compare`, read in this order: `wald_se`,
+/// `nagq`, `dispersion` with `init_theta` and `warm_start`
+/// ([`dispersion_and_start`]), `satterthwaite`, `condvar`, `reml`,
+/// `weight_power` and `se_type`. An option the call does not take keeps
+/// [`FitOptions`]' default. `formulas` are the call's formulas.
+pub(crate) fn fit_options(
+    inp: &mut Inputs,
+    family: &'static str,
+    link: &'static str,
+    formulas: &[&str],
+) -> Result<FitArgs, BindError> {
+    let mut options = FitOptions::default();
+    let mut warm_start = None;
+    let mut notes = Vec::new();
+    if inp.takes("wald_se") {
+        options.wald_se = wald_se(inp)?;
+    }
+    if inp.takes("nagq") {
+        options.nagq = nagq(inp)?;
+    }
+    if inp.takes("dispersion") {
+        let mixed = formulas.iter().any(|f| f.contains('|'));
+        let (dispersion, start, dropped) = dispersion_and_start(inp, family, mixed)?;
+        options.dispersion = dispersion.map_or(Dispersion::Default, Dispersion::Fixed);
+        warm_start = start;
+        notes = dropped;
+    }
+    if inp.takes("satterthwaite") {
+        options.satterthwaite = flag(inp, "satterthwaite", "satterthwaite")?;
+    }
+    if inp.takes("condvar") {
+        options.condvar = flag(inp, "condvar", "condvar")?;
+    }
+    if inp.takes("reml") {
+        options.reml = reml(inp)?;
+    }
+    options.weight_power = inp.opt_weight_power("weight_power")?;
+    options.se_type = inp.opt_se_type("se_type")?;
+    Ok(FitArgs {
+        family,
+        link,
+        options,
+        warm_start,
+        notes,
+    })
 }
 
 fn refuse(message: String) -> BindError {
@@ -108,7 +151,7 @@ pub(crate) fn family_link(
 }
 
 /// `nagq`: odd, in `1..=MAX_NAGQ`.
-pub(crate) fn nagq(inp: &mut Inputs) -> Result<u8, BindError> {
+fn nagq(inp: &mut Inputs) -> Result<u8, BindError> {
     let v = inp.value("nagq");
     coerce::to_usize(&v)
         .ok()
@@ -138,7 +181,7 @@ pub(crate) fn flag(inp: &mut Inputs, name: &str, shown_as: &str) -> Result<bool,
 }
 
 /// `reml`: absent, or a bool.
-pub(crate) fn reml(inp: &mut Inputs) -> Result<Option<bool>, BindError> {
+fn reml(inp: &mut Inputs) -> Result<Option<bool>, BindError> {
     let v = inp.value("reml");
     if v.is_null() {
         return Ok(None);
@@ -157,11 +200,15 @@ pub(crate) fn reml(inp: &mut Inputs) -> Result<Option<bool>, BindError> {
 }
 
 /// `wald_se`: `"hessian"` or `"rx"`.
-pub(crate) fn wald_se(inp: &mut Inputs) -> Result<String, BindError> {
+fn wald_se(inp: &mut Inputs) -> Result<WaldSe, BindError> {
     let v = inp.value("wald_se");
     coerce::to_string(v.clone())
         .ok()
-        .filter(|s| s == "hessian" || s == "rx")
+        .and_then(|s| match s.as_str() {
+            "hessian" => Some(WaldSe::Hessian),
+            "rx" => Some(WaldSe::Rx),
+            _ => None,
+        })
         .ok_or_else(|| {
             refuse(format!(
                 "{} must be 'hessian' or 'rx', got {}",
@@ -187,11 +234,11 @@ fn is_estimate(v: &Value) -> bool {
 /// warm start's dispersion. Only the form is checked here;
 /// `orchestrate::run_fit` checks the values.
 #[allow(clippy::type_complexity)]
-pub(crate) fn dispersion_and_start(
+fn dispersion_and_start(
     inp: &mut Inputs,
     family: &str,
     mixed: bool,
-) -> Result<(Option<f64>, Option<WarmStart>, Vec<Value>), BindError> {
+) -> Result<(Option<f64>, Option<StartValues>, Vec<Value>), BindError> {
     let port = inp.port();
     let mut notes = Vec::new();
     let quasi = matches!(family, "binomial" | "poisson");
@@ -312,7 +359,9 @@ pub(crate) fn dispersion_and_start(
             ))
         })?),
     };
-    Ok((dispersion.flatten(), Some((beta, theta, seed)), notes))
+    let mut start = StartValues::new(beta, theta);
+    start.dispersion = seed;
+    Ok((dispersion.flatten(), Some(start), notes))
 }
 
 /// The fit record's `argument_notes`: the notes of `args`, then those of
@@ -321,7 +370,7 @@ pub(crate) fn dispersion_and_start(
 /// not apply (`agq_fallback`), and `reml` off a Gaussian model.
 pub(crate) fn argument_notes(port: Port, args: &FitArgs, r: &FitResult) -> Vec<Value> {
     let mut notes = args.notes.clone();
-    if let Some(WeightPower::Fixed(v)) = args.weight_power {
+    if let Some(WeightPower::Fixed(v)) = args.options.weight_power {
         if v != 1.0 && r.weight_power.is_nan() {
             notes.push(ignored(format!(
                 "weight_power = {} has no effect without weights.",
@@ -330,7 +379,7 @@ pub(crate) fn argument_notes(port: Port, args: &FitArgs, r: &FitResult) -> Vec<V
         }
     }
     if r.agq_warning {
-        let nagq = format!("{}={}", spell(port, "nagq"), args.nagq);
+        let nagq = format!("{}={}", spell(port, "nagq"), args.options.nagq);
         let reason = if args.family == "gaussian" {
             Some("a Gaussian model")
         } else if r.re_groups.is_empty() {
@@ -342,12 +391,13 @@ pub(crate) fn argument_notes(port: Port, args: &FitArgs, r: &FitResult) -> Vec<V
             Some(reason) => ignored(format!(
                 "{nagq} has no effect for {reason}, because nothing is approximated."
             )),
+            // The family list mirrors `fit::common::agq_shape` — change together.
             None => warning_record(
                 "agq_fallback",
                 format!(
                     "{nagq} works only for binomial, Poisson, negative-binomial or Gamma models \
-                     whose random effects are in one grouping factor, with at most 3 random \
-                     effects in it. This model was fitted without adaptive quadrature."
+                     whose random effects are in one grouping factor, with at most {MAX_AGQ_Q} \
+                     random effects in it. This model was fitted without adaptive quadrature."
                 ),
             ),
         });
@@ -414,27 +464,31 @@ pub(crate) fn opt_seed(inp: &mut Inputs) -> Result<Option<u64>, BindError> {
     }
 }
 
-/// A string option, one of `allowed`, `shown_as` the argument as the
-/// message names it. A string given is quoted as it was typed.
-pub(crate) fn choice(
+/// A string option, one of the names of `allowed`, as the value paired with
+/// it; `shown_as` the argument as the message names it. A string given is
+/// quoted as it was typed.
+pub(crate) fn choice<T: Copy>(
     inp: &mut Inputs,
     name: &str,
     shown_as: &str,
-    allowed: &[&str],
-) -> Result<String, BindError> {
+    allowed: &[(&str, T)],
+) -> Result<T, BindError> {
     let v = inp.value(name);
-    match coerce::to_string(v.clone()) {
-        Ok(s) if allowed.contains(&s.as_str()) => Ok(s),
-        given => {
-            let given = given.map_or_else(|_| shown(inp.port(), &v), |s| format!("{s:?}"));
-            let quoted: Vec<String> = allowed.iter().map(|a| format!("{a:?}")).collect();
-            let (last, rest) = quoted.split_last().expect("a choice has options");
-            Err(refuse(format!(
-                "{shown_as} must be {} or {last}, got {given}",
-                rest.join(", ")
-            )))
-        }
+    let given = coerce::to_string(v.clone());
+    if let Some(&(_, value)) = given
+        .as_ref()
+        .ok()
+        .and_then(|s| allowed.iter().find(|(a, _)| a == s))
+    {
+        return Ok(value);
     }
+    let given = given.map_or_else(|_| shown(inp.port(), &v), |s| format!("{s:?}"));
+    let quoted: Vec<String> = allowed.iter().map(|(a, _)| format!("{a:?}")).collect();
+    let (last, rest) = quoted.split_last().expect("a choice has options");
+    Err(refuse(format!(
+        "{shown_as} must be {} or {last}, got {given}",
+        rest.join(", ")
+    )))
 }
 
 /// `re_form`: absent for the random effects of every grouping, `"NA"` for

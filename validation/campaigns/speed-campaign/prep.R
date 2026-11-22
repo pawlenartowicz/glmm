@@ -229,7 +229,7 @@ for (sname in names(STRUCTURES)) {
     }
   }
 }
-# NB and Gamma arms (added 2026-09-06): same structures, sizes and
+# NB and Gamma arms: same structures, sizes and
 # variant stripe as the GLMM arms above. Appended AFTER every earlier cell on
 # purpose: seed = SEED_BASE + cell index, so inserting these into the loop above
 # would reseed the whole grid and void the recorded baselines keyed on those

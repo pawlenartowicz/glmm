@@ -6,13 +6,14 @@
 use glmm::formula::anova::{
     Comparison, ComparisonTest, Differs, Model, ModelInfo, Side, TermTable,
 };
-use glmm::inference::Reference;
+use glmm::inference::{Objective, Reference};
 use glmm::orchestrate::{
     self, CondvarCrossRecord, FitResult, NoteInfo, PairwiseColumns, RobustRecord,
-    SatterthwaiteRecord, StoredParts, TermColumns,
+    SatterthwaiteRecord, StoredParts, TermColumns, TermTableError,
 };
-use glmm::SeType;
+use glmm::{Dispersion, SeType};
 
+use crate::anova_text;
 use crate::error::BindError;
 use crate::inputs::Inputs;
 use crate::notes::{self, Failed, FitText};
@@ -55,77 +56,130 @@ fn statics(v: Vec<&'static str>) -> Value {
 /// A note with its `tier`, `title` and `message` (`Null` on a note that
 /// raises nothing).
 fn note_record(n: NoteInfo, message: Option<String>) -> Value {
-    let (tier, title) = notes::tier_title(n.kind);
+    let detail = notes::detail(&n);
+    let NoteInfo {
+        kind,
+        columns,
+        pivot,
+        evals,
+        final_eval,
+        // Published through `detail`.
+        names: _,
+        rows: _,
+        dropped: _,
+        negative: _,
+        converged: _,
+        nonfinite: _,
+        delta,
+        factor,
+        lower,
+        upper,
+        failed,
+        not_converged,
+        df,
+    } = n;
+    let (tier, title) = notes::tier_title(kind);
     Value::Record(
         Record::new()
-            .with("kind", text(n.kind))
+            .with("kind", text(kind))
             .with("tier", text(tier))
             .with("title", text(title))
             .with("message", message.map_or(Value::Null, Value::Str))
             .with(
                 "columns",
-                Value::Index(n.columns.into_iter().map(|c| c as usize).collect()),
+                Value::Index(columns.into_iter().map(|c| c as usize).collect()),
             )
-            .with("pivot", Value::F64(n.pivot))
-            .with("evals", Value::I64(i64::from(n.evals)))
-            .with("final_eval", Value::Bool(n.final_eval))
-            .with("detail", Value::Str(n.detail))
-            .with("delta", Value::F64(n.delta))
-            .with("factor", Value::F64(n.factor))
-            .with("lower", Value::F64(n.lower))
-            .with("upper", Value::F64(n.upper))
-            .with("failed", Value::I64(i64::from(n.failed)))
-            .with("not_converged", Value::I64(i64::from(n.not_converged)))
-            .with("df", Value::Vec(n.df)),
+            .with("pivot", Value::F64(pivot))
+            .with("evals", Value::I64(i64::from(evals)))
+            .with("final_eval", Value::Bool(final_eval))
+            .with("detail", Value::Str(detail))
+            .with("delta", Value::F64(delta))
+            .with("factor", Value::F64(factor))
+            .with("lower", Value::F64(lower))
+            .with("upper", Value::F64(upper))
+            .with("failed", Value::I64(i64::from(failed)))
+            .with("not_converged", Value::I64(i64::from(not_converged)))
+            .with("df", Value::Vec(df)),
     )
 }
 
 fn cross_record(c: &CondvarCrossRecord) -> Value {
+    let CondvarCrossRecord {
+        family_grouping,
+        family,
+        tail,
+        coupling_at,
+        coupling_cols,
+        coupling,
+        nested_grouping,
+        nested_slots,
+        pair_slots,
+    } = c;
     Value::Record(
         Record::new()
-            .with("family_grouping", int(c.family_grouping))
-            .with("family", Value::Vec(c.family.clone()))
-            .with("tail", Value::Vec(c.tail.clone()))
-            .with("coupling_at", ints(c.coupling_at.iter().copied()))
-            .with("coupling_cols", ints(c.coupling_cols.iter().copied()))
-            .with("coupling", Value::Vec(c.coupling.clone()))
-            .with("nested_grouping", int(c.nested_grouping))
-            .with("nested_slots", ints(c.nested_slots.iter().copied()))
-            .with("pair_slots", ints(c.pair_slots.iter().copied())),
+            .with("family_grouping", int(*family_grouping))
+            .with("family", Value::Vec(family.clone()))
+            .with("tail", Value::Vec(tail.clone()))
+            .with("coupling_at", ints(coupling_at.iter().copied()))
+            .with("coupling_cols", ints(coupling_cols.iter().copied()))
+            .with("coupling", Value::Vec(coupling.clone()))
+            .with("nested_grouping", int(*nested_grouping))
+            .with("nested_slots", ints(nested_slots.iter().copied()))
+            .with("pair_slots", ints(pair_slots.iter().copied())),
     )
 }
 
 fn satterthwaite_record(rec: SatterthwaiteRecord) -> Value {
+    let SatterthwaiteRecord {
+        a_eff,
+        jac_theta,
+        c,
+        tau,
+        nu,
+        retained,
+    } = rec;
     Value::Record(
         Record::new()
-            .with("a_eff", Value::Vec(rec.a_eff))
-            .with("jac_theta", vecs(rec.jac_theta))
-            .with("c", Value::Vec(rec.c))
-            .with("tau", Value::F64(rec.tau))
-            .with("nu", Value::F64(rec.nu))
-            .with("retained", rec.retained.map_or(Value::Null, Value::Index)),
+            .with("a_eff", Value::Vec(a_eff))
+            .with("jac_theta", vecs(jac_theta))
+            .with("c", Value::Vec(c))
+            .with("tau", Value::F64(tau))
+            .with("nu", Value::F64(nu))
+            .with("retained", retained.map_or(Value::Null, Value::Index)),
     )
 }
 
 /// A robust fit's pieces ([`RobustRecord`]), the cluster of each null
 /// direction an index.
 fn robust_record(rec: RobustRecord) -> Value {
+    let RobustRecord {
+        t,
+        er,
+        f,
+        epe,
+        row_e,
+        row_x,
+        row_phi,
+        null_cluster,
+        null,
+    } = rec;
     Value::Record(
         Record::new()
-            .with("t", Value::Vec(rec.t))
-            .with("er", Value::Vec(rec.er))
-            .with("f", vecs(rec.f))
-            .with("epe", vecs(rec.epe))
-            .with("row_e", Value::Vec(rec.row_e))
-            .with("row_x", Value::Vec(rec.row_x))
-            .with("row_phi", Value::Vec(rec.row_phi))
-            .with("null_cluster", Value::Index(rec.null_cluster))
-            .with("null", vecs(rec.null)),
+            .with("t", Value::Vec(t))
+            .with("er", Value::Vec(er))
+            .with("f", vecs(f))
+            .with("epe", vecs(epe))
+            .with("row_e", Value::Vec(row_e))
+            .with("row_x", Value::Vec(row_x))
+            .with("row_phi", Value::Vec(row_phi))
+            .with("null_cluster", Value::Index(null_cluster))
+            .with("null", vecs(null)),
     )
 }
 
-/// A [`FitResult`] as the fit record, the warning text of its notes and of
-/// its non-convergence (`failure`, `Null` on a converged fit) rendered for
+/// A [`FitResult`] as the fit record, the warning text of its notes, of its
+/// non-convergence (`failure`, `Null` on a converged fit) and of a singular
+/// converged fit (`singular_warning`, otherwise `Null`) rendered for
 /// the family and link the call fitted and the port's `row_base`. The record
 /// echoes the parsed options: `family`, `link`, `nagq` (the nodes used, 1
 /// when the model fell back from adaptive quadrature), `dispersion_held`
@@ -135,154 +189,222 @@ fn robust_record(rec: RobustRecord) -> Value {
 pub(crate) fn fit_record(r: FitResult, args: &FitArgs, port: Port, row_base: usize) -> Value {
     let (family, link) = (args.family, args.link);
     let argument_notes = options::argument_notes(port, args, &r);
+    let FitResult {
+        beta,
+        se,
+        vcov,
+        tau2,
+        varcorr,
+        stddev_se,
+        aliased,
+        dispersion,
+        converged,
+        stop,
+        n_eval,
+        n_grad,
+        outer_stop,
+        outer_decrement,
+        deviance,
+        singular,
+        names,
+        re_groups,
+        re_term_index,
+        agq_warning,
+        // Read by `argument_notes`.
+        reml_warning: _,
+        loglik,
+        df,
+        reml,
+        fitted,
+        ranef,
+        ranef_levels,
+        re_group_levels,
+        ranef_blocks,
+        condvar,
+        condvar_x,
+        condvar_cross,
+        y,
+        weights,
+        weight_power,
+        weight_power_estimated,
+        se_type,
+        model_vcov,
+        robust,
+        offset,
+        design_summary,
+        nobs,
+        boundary,
+        pinned,
+        notes,
+        coef_df,
+        coef_p,
+        df_method,
+        satterthwaite_record: satterthwaite,
+        rss,
+        r_squared,
+        adj_r_squared,
+        objective,
+        term_table_type3,
+        term_table_type2,
+        term_table_type3_lrt,
+        term_table_type2_lrt,
+        term_test_auto,
+    } = r;
     let messages = notes::note_messages(
-        &r.notes,
-        &r.beta,
+        &notes,
+        &beta,
         &FitText {
-            names: &r.names,
-            converged: r.converged,
-            nobs: r.nobs,
+            names: &names,
+            converged,
+            nobs,
             row_base,
+            robust: se_type == SeType::Robust,
         },
     );
-    let failure = if r.converged {
+    let failure = if converged {
         Value::Null
     } else {
         let (kind, message) = notes::failure(&Failed {
             family,
-            mixed: !r.re_groups.is_empty(),
-            notes: &r.notes,
-            beta: &r.beta,
-            aliased: &r.aliased,
-            deviance: r.deviance,
-            y: &r.y,
+            mixed: !re_groups.is_empty(),
+            notes: &notes,
+            aliased: &aliased,
+            y: &y,
+            stop,
         });
         notes::warning_record(kind, message)
     };
-    let (objective, nodes) = orchestrate::objective_parts(r.objective);
-    let (auto_test, auto_reason) = orchestrate::choice_tags(&r.term_test_auto);
-    let cross = r.condvar_cross.as_ref().map_or(Value::Null, cross_record);
+    // A fit that did not converge is not assessed for singularity.
+    let singular_warning = if singular && converged {
+        notes::warning_record("singular", notes::singular_message(&pinned, &re_groups))
+    } else {
+        Value::Null
+    };
+    let (objective, nodes) = orchestrate::objective_parts(objective);
+    let (auto_test, auto_reason) = orchestrate::choice_tags(&term_test_auto);
+    let cross = condvar_cross.as_ref().map_or(Value::Null, cross_record);
     let ranef_levels = Value::IntVec(
-        r.ranef_levels
+        ranef_levels
             .iter()
             .map(|&n| i64::try_from(n).unwrap_or(i64::MAX))
             .collect(),
     );
     let re_group_levels = Value::IntVec(
-        r.re_group_levels
+        re_group_levels
             .iter()
             .map(|&n| i64::try_from(n).unwrap_or(i64::MAX))
             .collect(),
     );
     let (re_group_names, re_group_terms): (Vec<String>, Vec<Vec<String>>) =
-        r.re_groups.into_iter().unzip();
-    let design_summary = r.design_summary.map_or(Value::Null, |(counts, s, c)| {
+        re_groups.into_iter().unzip();
+    let design_summary = design_summary.map_or(Value::Null, |d| {
         Value::Record(
             Record::new()
-                .with("counts", Value::Vec(counts))
-                .with("s", Value::Vec(s))
-                .with("c", Value::Vec(c)),
+                .with("counts", Value::Vec(d.counts))
+                .with("s", Value::Vec(d.s))
+                .with("c", Value::Vec(d.c)),
         )
     });
-    let ranef_blocks = r
-        .ranef_blocks
+    let ranef_blocks = ranef_blocks
         .into_iter()
-        .map(|(group, terms, levels, values, condvar)| {
+        .map(|b| {
             Value::Record(
                 Record::new()
-                    .with("group", Value::Str(group))
-                    .with("terms", Value::StrVec(terms))
-                    .with("levels", Value::StrVec(levels))
-                    .with("values", Value::Vec(values))
-                    .with("condvar", Value::Vec(condvar)),
+                    .with("group", Value::Str(b.group))
+                    .with("terms", Value::StrVec(b.terms))
+                    .with("levels", Value::StrVec(b.levels))
+                    .with("values", Value::Vec(b.values))
+                    .with("condvar", Value::Vec(b.condvar)),
             )
         })
         .collect();
-    let lrt = |t: &Option<Result<TermTable, String>>| t.as_ref().map_or(Value::Null, term_record);
+    let lrt =
+        |t: &Option<Result<TermTable, TermTableError>>| t.as_ref().map_or(Value::Null, term_record);
     Value::Record(
         Record::new()
-            .with("beta", Value::Vec(r.beta))
-            .with("se", Value::Vec(r.se))
-            .with("vcov", vecs(r.vcov))
-            .with("tau2", Value::Vec(r.tau2))
-            .with("varcorr", vecs(r.varcorr))
-            .with("stddev_se", Value::Vec(r.stddev_se))
-            .with("aliased", Value::BoolVec(r.aliased))
-            .with("dispersion", Value::F64(r.dispersion))
-            .with("converged", Value::Bool(r.converged))
-            .with("n_eval", int(r.n_eval))
-            .with("n_grad", int(r.n_grad))
-            .with("outer_stop", opt_text(r.outer_stop))
-            .with("outer_decrement", Value::F64(r.outer_decrement))
-            .with("deviance", Value::F64(r.deviance))
-            .with("singular", Value::Bool(r.singular))
-            .with("names", Value::StrVec(r.names))
+            .with("beta", Value::Vec(beta))
+            .with("se", Value::Vec(se))
+            .with("vcov", vecs(vcov))
+            .with("tau2", Value::Vec(tau2))
+            .with("varcorr", vecs(varcorr))
+            .with("stddev_se", Value::Vec(stddev_se))
+            .with("aliased", Value::BoolVec(aliased))
+            .with("dispersion", Value::F64(dispersion))
+            .with("converged", Value::Bool(converged))
+            .with("n_eval", int(n_eval))
+            .with("n_grad", int(n_grad))
+            .with("outer_stop", opt_text(outer_stop))
+            .with("outer_decrement", Value::F64(outer_decrement))
+            .with("deviance", Value::F64(deviance))
+            .with("singular", Value::Bool(singular))
+            .with("names", Value::StrVec(names))
             .with("re_group_names", Value::StrVec(re_group_names))
             .with("re_group_terms", str_lists(re_group_terms))
             .with(
                 "re_term_index",
-                Value::List(r.re_term_index.into_iter().map(Value::Index).collect()),
+                Value::List(re_term_index.into_iter().map(Value::Index).collect()),
             )
             .with("family", text(family))
             .with("link", text(link))
             .with(
                 "nagq",
-                Value::I64(if r.agq_warning {
+                Value::I64(if agq_warning {
                     1
                 } else {
-                    i64::from(args.nagq)
+                    i64::from(args.options.nagq)
                 }),
             )
             .with(
                 "dispersion_held",
-                args.dispersion.map_or(Value::Null, Value::F64),
+                match args.options.dispersion {
+                    Dispersion::Fixed(v) => Value::F64(v),
+                    _ => Value::Null,
+                },
             )
             .with(
                 "warm_start",
-                args.warm_start
-                    .as_ref()
-                    .map_or(Value::Null, |(beta, theta, dispersion)| {
-                        Value::Record(
-                            Record::new()
-                                .with("beta", Value::Vec(beta.clone()))
-                                .with("theta", Value::Vec(theta.clone()))
-                                .with("dispersion", dispersion.map_or(Value::Null, Value::F64)),
-                        )
-                    }),
+                args.warm_start.as_ref().map_or(Value::Null, |w| {
+                    Value::Record(
+                        Record::new()
+                            .with("beta", Value::Vec(w.beta.clone()))
+                            .with("theta", Value::Vec(w.theta.clone()))
+                            .with("dispersion", w.dispersion.map_or(Value::Null, Value::F64)),
+                    )
+                }),
             )
             .with("argument_notes", Value::List(argument_notes))
-            .with("loglik", Value::F64(r.loglik))
-            .with("df", int(r.df))
-            .with("reml", Value::Bool(r.reml))
-            .with("fitted", Value::Vec(r.fitted))
-            .with("ranef", Value::Vec(r.ranef))
+            .with("loglik", Value::F64(loglik))
+            .with("df", int(df))
+            .with("reml", Value::Bool(reml))
+            .with("fitted", Value::Vec(fitted))
+            .with("ranef", Value::Vec(ranef))
             .with("ranef_levels", ranef_levels)
             .with("re_group_levels", re_group_levels)
-            .with("y", Value::Vec(r.y))
-            .with("weights", opt_vec(r.weights))
-            .with("weight_power", Value::F64(r.weight_power))
+            .with("y", Value::Vec(y))
+            .with("weights", opt_vec(weights))
+            .with("weight_power", Value::F64(weight_power))
             .with(
                 "weight_power_estimated",
-                Value::Bool(r.weight_power_estimated),
+                Value::Bool(weight_power_estimated),
             )
-            .with("se_type", text(se_type_name(r.se_type)))
-            .with("model_vcov", vecs(r.model_vcov))
-            .with("robust", r.robust.map_or(Value::Null, robust_record))
+            .with("se_type", text(se_type_name(se_type)))
+            .with("model_vcov", vecs(model_vcov))
+            .with("robust", robust.map_or(Value::Null, robust_record))
             .with("design_summary", design_summary)
-            .with("nobs", int(r.nobs))
+            .with("nobs", int(nobs))
             .with("ranef_blocks", Value::List(ranef_blocks))
-            .with("condvar", Value::Vec(r.condvar))
-            .with("condvar_x", Value::Vec(r.condvar_x))
+            .with("condvar", Value::Vec(condvar))
+            .with("condvar_x", Value::Vec(condvar_x))
             .with("condvar_cross", cross)
-            .with("boundary", text(r.boundary))
+            .with("boundary", text(boundary))
             .with(
                 "pinned",
-                Value::List(r.pinned.into_iter().map(Value::BoolVec).collect()),
+                Value::List(pinned.into_iter().map(Value::BoolVec).collect()),
             )
             .with(
                 "notes",
                 Value::List(
-                    r.notes
+                    notes
                         .into_iter()
                         .zip(messages)
                         .map(|(n, m)| note_record(n, m))
@@ -290,24 +412,24 @@ pub(crate) fn fit_record(r: FitResult, args: &FitArgs, port: Port, row_base: usi
                 ),
             )
             .with("failure", failure)
-            .with("coef_df", Value::Vec(r.coef_df))
-            .with("coef_p", Value::Vec(r.coef_p))
-            .with("df_method", text(r.df_method))
+            .with("singular_warning", singular_warning)
+            .with("coef_df", Value::Vec(coef_df))
+            .with("coef_p", Value::Vec(coef_p))
+            .with("df_method", text(df_method.as_str()))
             .with(
                 "satterthwaite_record",
-                r.satterthwaite_record
-                    .map_or(Value::Null, satterthwaite_record),
+                satterthwaite.map_or(Value::Null, satterthwaite_record),
             )
-            .with("rss", Value::F64(r.rss))
-            .with("r_squared", Value::F64(r.r_squared))
-            .with("adj_r_squared", Value::F64(r.adj_r_squared))
-            .with("offset", opt_vec(r.offset))
+            .with("rss", Value::F64(rss))
+            .with("r_squared", Value::F64(r_squared))
+            .with("adj_r_squared", Value::F64(adj_r_squared))
+            .with("offset", opt_vec(offset))
             .with("objective", text(objective))
             .with("objective_nodes", Value::I64(i64::from(nodes)))
-            .with("term_table_type3", term_record(&r.term_table_type3))
-            .with("term_table_type2", term_record(&r.term_table_type2))
-            .with("term_table_type3_lrt", lrt(&r.term_table_type3_lrt))
-            .with("term_table_type2_lrt", lrt(&r.term_table_type2_lrt))
+            .with("term_table_type3", term_record(&term_table_type3))
+            .with("term_table_type2", term_record(&term_table_type2))
+            .with("term_table_type3_lrt", lrt(&term_table_type3_lrt))
+            .with("term_table_type2_lrt", lrt(&term_table_type2_lrt))
             .with(
                 "term_test_auto",
                 Value::Record(
@@ -327,11 +449,18 @@ fn se_type_name(t: SeType) -> &'static str {
     }
 }
 
-/// A stored per-term result: `error` the refusal's message, or `Null` beside
-/// the table's columns.
-pub(crate) fn term_record(result: &Result<TermTable, String>) -> Value {
+/// A stored per-term result: `error` the refusal's message with its
+/// `error_code` (`internal` for a caught panic, `fit_error` for a refusal),
+/// or `error` `Null` beside the table's columns.
+pub(crate) fn term_record(result: &Result<TermTable, TermTableError>) -> Value {
     Value::Record(match result {
-        Err(message) => Record::new().with("error", text(message)),
+        Err(e) => Record::new().with("error", text(&e.to_string())).with(
+            "error_code",
+            text(match e {
+                TermTableError::Internal(_) => "internal",
+                TermTableError::Refused(_) => "fit_error",
+            }),
+        ),
         Ok(table) => term_table_record(orchestrate::term_columns(table)),
     })
 }
@@ -385,6 +514,10 @@ fn side_record(m: &ModelInfo, rss: f64) -> Value {
             .with("formula", text(&m.formula_label))
             .with("npar", int(m.npar))
             .with("nobs", int(m.nobs))
+            // The residual df n - p of the F test's table: `ModelInfo::npar`
+            // counts the coefficients and one scale parameter, sigma or phi;
+            // change together.
+            .with("res_df", Value::I64(m.nobs as i64 - (m.npar as i64 - 1)))
             .with("loglik", Value::F64(m.loglik))
             .with("aic", m.aic.map_or(Value::Null, Value::F64))
             .with("bic", m.bic.map_or(Value::Null, Value::F64))
@@ -397,15 +530,20 @@ fn side_record(m: &ModelInfo, rss: f64) -> Value {
 }
 
 /// A [`Comparison`]: `sides` holds `m0` and `m1` as given (each with its
-/// residual sum of squares `rss`, NaN off OLS), `larger` the index of the
-/// larger one, the test (`"lr"` or `"f"`) with `objective` and
-/// `objective_nodes` (`""` and 0 on `"f"`), its `reference` record and notes,
-/// and the `nsim` and `seed` the call used.
+/// residual df `res_df` and residual sum of squares `rss`, NaN off OLS),
+/// `larger` the index of the larger one, the test (`"lr"` or `"f"`) with
+/// `objective` and `objective_nodes` (`""` and 0 on `"f"`), the `heading` lines, the
+/// `reference` in words with its `reference_kind`, the `notes` (with
+/// `ml_note`, `compare`'s on a Gaussian pair, the note that both were fitted
+/// by ML when their fixed parts differ), `ols` (an F test of two OLS fits)
+/// with `sum_sq` (the smaller fit's RSS minus the larger's, NaN unless
+/// `ols`), and the `nsim` and `seed` the call used.
 pub(crate) fn comparison_record(
     c: &Comparison,
     rss: [f64; 2],
     nsim: usize,
     seed: u64,
+    ml_note: bool,
 ) -> Result<Record, BindError> {
     let (test, statistic, df, p_value, reference, (objective, nodes)) = match &c.test {
         ComparisonTest::Lr(t) => (
@@ -423,39 +561,36 @@ pub(crate) fn comparison_record(
             )))
         }
     };
-    let reference = match reference {
-        Reference::ChiSquared { df } => Record::new()
-            .with("kind", text("chisq"))
-            .with("df", int(df)),
-        Reference::ChiBarSquared { df_low } => Record::new()
-            .with("kind", text("chibar"))
-            .with("df", int(df_low)),
-        Reference::ExactRlrt { nsim, seed } => Record::new()
-            .with("kind", text("exact"))
-            .with("nsim", int(nsim))
-            .with("seed", Value::U64(seed)),
-        Reference::F { num_df, den_df, .. } => Record::new()
-            .with("kind", text("f"))
-            .with("df", Value::F64(num_df))
-            .with("den_df", Value::F64(den_df)),
+    let reference_kind = match reference {
+        Reference::ChiSquared { .. } => "chisq",
+        Reference::ChiBarSquared { .. } => "chibar",
+        Reference::ExactRlrt { .. } => "exact",
+        Reference::F { .. } => "f",
         other => {
             return Err(BindError::internal(format!(
                 "no rendering for the reference {other:?}"
             )))
         }
     };
+    let (small, large) = match c.larger {
+        Side::First => (1, 0),
+        Side::Second => (0, 1),
+    };
+    let ols = test == "f"
+        && [&c.m0, &c.m1]
+            .iter()
+            .all(|m| m.objective == Objective::LeastSquares);
+    let sum_sq = if ols {
+        rss[small] - rss[large]
+    } else {
+        f64::NAN
+    };
     Ok(Record::new()
         .with(
             "sides",
             Value::List(vec![side_record(&c.m0, rss[0]), side_record(&c.m1, rss[1])]),
         )
-        .with(
-            "larger",
-            Value::I64(match c.larger {
-                Side::First => 0,
-                Side::Second => 1,
-            }),
-        )
+        .with("larger", Value::I64(large as i64))
         .with(
             "differs",
             text(match c.differs {
@@ -470,8 +605,21 @@ pub(crate) fn comparison_record(
         .with("statistic", Value::F64(statistic))
         .with("df", Value::F64(df))
         .with("p_value", Value::F64(p_value))
-        .with("reference", Value::Record(reference))
-        .with("notes", Value::StrVec(c.note_lines()))
+        .with(
+            "heading",
+            Value::StrVec(vec![anova_text::comparison_heading(&c.test)]),
+        )
+        .with(
+            "reference",
+            Value::Str(anova_text::comparison_reference(&reference)?),
+        )
+        .with("reference_kind", text(reference_kind))
+        .with(
+            "notes",
+            Value::StrVec(anova_text::comparison_notes(c, ml_note)),
+        )
+        .with("ols", Value::Bool(ols))
+        .with("sum_sq", Value::F64(sum_sq))
         .with("nsim", int(nsim))
         .with("seed", Value::U64(seed)))
 }
@@ -633,7 +781,7 @@ pub(crate) fn read_model(mut m: Inputs) -> Result<Model, BindError> {
         }
         _ => return Err(bad("design_summary")),
     };
-    let coef = m.vec("coef")?;
+    let coef = m.vec("beta")?;
     let vcov = m.rows("vcov", coef.len())?;
     Ok(Model {
         formula: m.string("formula")?,
@@ -655,7 +803,7 @@ pub(crate) fn read_model(mut m: Inputs) -> Result<Model, BindError> {
         dispersion_held: m.opt_f64("dispersion_held")?,
         design_summary,
         rss: m.f64("rss")?,
-        coef_names: m.strs("coef_names")?,
+        coef_names: m.strs("names")?,
         coef,
         vcov,
         aliased: m.bools("aliased")?,

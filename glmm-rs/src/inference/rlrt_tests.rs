@@ -1,16 +1,17 @@
 //! The design eigenvalues, the observed statistic and the refusals of the
 //! exact RLRT: the Z-free route against `ZᵀP₀Z` formed densely from the raw
-//! design, every refusal the core returns, the floor and NaN rules of the
-//! statistic, the grid kernel's profile and maximum, and the simulated null:
-//! against the balanced design's F test, its determinism, the zero-eigenvalue
-//! merge, the zero-tail branch and the p-value rules; and `exact_rlrt`: its
-//! zero, floor and NaN results, its fields, and Dyestuff's p-value against the
-//! F test.
+//! design, every refusal the core returns, the zero, floor and NaN rules of
+//! the statistic (`lr_statistic`) on a `(1 | g)` pair, the grid kernel's
+//! profile and maximum, and the simulated null: against the balanced design's
+//! F test, its determinism, the zero-eigenvalue merge, the zero-tail branch
+//! and the p-value rules; and `exact_rlrt`: its zero and NaN results, its
+//! fields, and Dyestuff's p-value against the F test.
 
 use super::evd::{sym_eigen, EvdError};
+use super::lr::lr_statistic;
 use super::rlrt::{
-    exact_rlrt, max_on_grid, null_draws, profile, rlrt_design, rlrt_null, rlrt_statistic,
-    GridTables, RlrtConfig, RlrtDesign, RlrtRefusal, RlrtResult, LAMBDA_GRID, MU_ZERO_REL,
+    exact_rlrt, max_on_grid, null_draws, profile, rlrt_design, rlrt_null, GridTables, RlrtConfig,
+    RlrtDesign, RlrtRefusal, RlrtResult, LAMBDA_GRID, MU_ZERO_REL,
 };
 use super::rlrt_refs::{bands, csv};
 use crate::fit::common_tests::lcg;
@@ -315,24 +316,16 @@ fn refusals() {
     // An intercept-only summary: `X̃ = 1`, so `s` holds the counts and `c = n`.
     let good = rlrt_design(&[3.0, 4.0], &[3.0, 4.0], &[7.0]).expect("a valid summary");
     assert_eq!((good.mu.len(), good.n_minus_p, good.tail_df), (1, 6, 5));
-    // `exact_rlrt` refuses before it reads the statistic: pinned or not,
-    // with a positive or a NaN statistic.
+    // `exact_rlrt` refuses before it reads the statistic: a positive, a zero
+    // or a NaN one.
     let cfg = config(1000, 20261043, false);
-    let logliks = [
-        (-10.0, -12.5, false),
-        (-10.0, -12.5, true),
-        (f64::NAN, -12.5, false),
-    ];
+    let statistics = [5.0, 0.0, f64::NAN];
 
     for (i, (counts, s, c, want)) in refusal_cases().into_iter().enumerate() {
         assert_eq!(rlrt_design(&counts, &s, &c), Err(want), "case {i}");
-        for (l1, l0, pinned) in logliks {
-            let got = exact_rlrt(&counts, &s, &c, l1, l0, pinned, &cfg);
-            assert_eq!(
-                got,
-                Err(want),
-                "case {i}, exact_rlrt ({l1}, {l0}, {pinned})"
-            );
+        for t in statistics {
+            let got = exact_rlrt(&counts, &s, &c, t, &cfg);
+            assert_eq!(got, Err(want), "case {i}, exact_rlrt ({t})");
         }
     }
 
@@ -350,13 +343,9 @@ fn refusals() {
         .design_summary
         .as_ref()
         .expect("a (1 | g) fit keeps its design summary");
-    for (l1, l0, pinned) in logliks {
-        let got = exact_rlrt(&ds.counts, &ds.s, &ds.c, l1, l0, pinned, &cfg);
-        assert_eq!(
-            got,
-            Err(NoGroupVariation),
-            "dummies, exact_rlrt ({l1}, {l0}, {pinned})"
-        );
+    for t in statistics {
+        let got = exact_rlrt(&ds.counts, &ds.s, &ds.c, t, &cfg);
+        assert_eq!(got, Err(NoGroupVariation), "dummies, exact_rlrt ({t})");
     }
 
     // No fixed effects: `M = diag(counts)`.
@@ -401,11 +390,15 @@ const NAN_PAIRS: [(f64, f64); 6] = [
     (-10.0, f64::NEG_INFINITY),
 ];
 
+/// The zero, floor and NaN rules of the statistic on a `(1 | g)` pair:
+/// `lr_statistic` with the full fit as the larger model and `pinned` as its
+/// dropped variance at zero.
 #[test]
 fn statistic_rules() {
+    let statistic = |l1: f64, l0: f64, pinned: bool| lr_statistic(l0, l1, pinned).0;
     for (l1, l0) in NAN_PAIRS {
         for pinned in [false, true] {
-            let t = rlrt_statistic(l1, l0, pinned);
+            let t = statistic(l1, l0, pinned);
             assert!(t.is_nan(), "({l1}, {l0}), pinned {pinned}: {t}");
         }
     }
@@ -417,22 +410,19 @@ fn statistic_rules() {
         (1.0, f64::INFINITY),
         (f64::INFINITY, -4.0),
     ] {
-        assert_eq!(rlrt_statistic(l1, l0, true).to_bits(), 0.0f64.to_bits());
+        assert_eq!(statistic(l1, l0, true).to_bits(), 0.0f64.to_bits());
     }
-    assert_eq!(rlrt_statistic(-10.0, -12.5, false), 5.0);
+    assert_eq!(statistic(-10.0, -12.5, false), 5.0);
     // The floor: exactly +0.0, never a negative value or -0.0.
-    assert_eq!(
-        rlrt_statistic(-12.5, -10.0, false).to_bits(),
-        0.0f64.to_bits()
-    );
-    assert_eq!(rlrt_statistic(3.0, 3.0, false).to_bits(), 0.0f64.to_bits());
+    assert_eq!(statistic(-12.5, -10.0, false).to_bits(), 0.0f64.to_bits());
+    assert_eq!(statistic(3.0, 3.0, false).to_bits(), 0.0f64.to_bits());
     // An exact OLS fit reports `+∞`.
     assert_eq!(
-        rlrt_statistic(-4.0, f64::INFINITY, false).to_bits(),
+        statistic(-4.0, f64::INFINITY, false).to_bits(),
         0.0f64.to_bits()
     );
     // The mirror: `loglik_full = +∞` stays `+∞` unpinned (0 pinned, above).
-    assert_eq!(rlrt_statistic(f64::INFINITY, -4.0, false), f64::INFINITY);
+    assert_eq!(statistic(f64::INFINITY, -4.0, false), f64::INFINITY);
 
     // Real fits against the OLS fit made with `reml = Some(true)`.
     let ols_of = |x: &[f64], y: &[f64], p: usize| {
@@ -458,7 +448,7 @@ fn statistic_rules() {
     let x = vec![1.0; 30];
     let full = fit_of(&x, &y, &ids, 1, &FitOptions::default());
     assert!(full.converged() && pinned_of(&full), "a pinned fit");
-    let t = rlrt_statistic(full.loglik, ols_of(&x, &y, 1).loglik, pinned_of(&full));
+    let t = statistic(full.loglik, ols_of(&x, &y, 1).loglik, pinned_of(&full));
     assert_eq!(t.to_bits(), 0.0f64.to_bits());
 
     // An exact fit, `y` constant on `x = 1`: the OLS fit reports `+∞`, and the
@@ -473,12 +463,12 @@ fn statistic_rules() {
         "the (1 | g) fit of an exact fit: loglik {}",
         full.loglik
     );
-    assert!(rlrt_statistic(full.loglik, reduced.loglik, false).is_nan());
+    assert!(statistic(full.loglik, reduced.loglik, false).is_nan());
 
     let (x, y, ids, p) = design(&[5, 6, 4, 7, 5, 6], 3.0, |_, st| vec![1.0, lcg(st)]);
     let full = fit_of(&x, &y, &ids, p, &FitOptions::default());
     assert!(full.converged() && !pinned_of(&full), "an interior fit");
-    let t = rlrt_statistic(full.loglik, ols_of(&x, &y, p).loglik, pinned_of(&full));
+    let t = statistic(full.loglik, ols_of(&x, &y, p).loglik, pinned_of(&full));
     assert!(t > 0.0, "interior statistic {t}");
 }
 
@@ -840,25 +830,8 @@ fn exact_of(full: &Fit, reduced: &Fit, cfg: &RlrtConfig) -> Result<RlrtResult, R
         .design_summary
         .as_ref()
         .expect("a (1 | g) fit keeps its design summary");
-    exact_rlrt(
-        &ds.counts,
-        &ds.s,
-        &ds.c,
-        full.loglik,
-        reduced.loglik,
-        is_pinned(full),
-        cfg,
-    )
-}
-
-/// Every field to the bit, so two results with a NaN field compare.
-fn result_bits(r: &RlrtResult) -> [u64; 4] {
-    [
-        r.statistic.to_bits(),
-        r.p_value.to_bits(),
-        r.nsim as u64,
-        r.seed,
-    ]
+    let (statistic, _) = lr_statistic(reduced.loglik, full.loglik, is_pinned(full));
+    exact_rlrt(&ds.counts, &ds.s, &ds.c, statistic, cfg)
 }
 
 /// The result of a zero statistic: `+0.0`, `p = 1`, no draws.
@@ -869,44 +842,22 @@ fn assert_zero_result(tag: &str, r: &RlrtResult, cfg: &RlrtConfig) {
     assert_eq!(r.seed, cfg.seed, "{tag}: seed");
 }
 
-/// The floor: a full fit no better than `θ = 0`, not pinned, gives the zero
-/// statistic's result, and so do a pinned fit whatever the two
-/// log-likelihoods say and an exact OLS fit, pinned or not; every pair of
-/// [`NAN_PAIRS`], pinned or not, gives a NaN statistic and p-value with no draws.
+/// A zero statistic gives `+0.0`, `p = 1` and no draws; a NaN one a NaN
+/// statistic and p-value with no draws.
 #[test]
 fn exact_rlrt_floor() {
     let (counts, s, c) = (vec![5.0; 6], vec![5.0; 6], [30.0]);
     let cfg = config(1000, 20261041, false);
-    let zero = exact_rlrt(&counts, &s, &c, -10.0, -10.0, true, &cfg).unwrap();
-    assert_zero_result("pinned", &zero, &cfg);
-    for (l1, l0, pinned) in [
-        (-12.5, -10.0, false),
-        (-10.0, -10.0, false),
-        (-10.0, -12.5, true),
-        (-4.0, f64::INFINITY, false),
-        (-4.0, f64::INFINITY, true),
-    ] {
-        let r = exact_rlrt(&counts, &s, &c, l1, l0, pinned, &cfg).unwrap();
-        assert_eq!(
-            result_bits(&r),
-            result_bits(&zero),
-            "({l1}, {l0}, {pinned})"
-        );
-    }
-    for (l1, l0) in NAN_PAIRS {
-        for pinned in [false, true] {
-            let tag = format!("({l1}, {l0}), pinned {pinned}");
-            let r = exact_rlrt(&counts, &s, &c, l1, l0, pinned, &cfg).unwrap();
-            assert!(
-                r.statistic.is_nan() && r.p_value.is_nan(),
-                "{tag}: statistic {}, p {}",
-                r.statistic,
-                r.p_value
-            );
-            assert_eq!(r.nsim, 0, "{tag}: no draws");
-            assert_eq!(r.seed, cfg.seed, "{tag}");
-        }
-    }
+    let zero = exact_rlrt(&counts, &s, &c, 0.0, &cfg).unwrap();
+    assert_zero_result("zero", &zero, &cfg);
+    let r = exact_rlrt(&counts, &s, &c, f64::NAN, &cfg).unwrap();
+    assert!(
+        r.statistic.is_nan() && r.p_value.is_nan(),
+        "statistic {}, p {}",
+        r.statistic,
+        r.p_value
+    );
+    assert_eq!((r.nsim, r.seed), (0, cfg.seed));
 }
 
 /// An interior fit: the statistic and the null's p-value as the parts give
@@ -921,7 +872,7 @@ fn exact_rlrt_fields() {
     let r = exact_of(&full, &reduced, &cfg).expect("no refusal");
 
     let d = design_of("interior", &full).unwrap();
-    let t = rlrt_statistic(full.loglik, reduced.loglik, false);
+    let (t, _) = lr_statistic(reduced.loglik, full.loglik, false);
     let null = rlrt_null(&d, &cfg);
     eprintln!("interior: t = {t}, p = {}, k = {}", r.p_value, d.mu.len());
     assert!(t > 0.0, "interior statistic {t}");

@@ -1,12 +1,7 @@
 # Uses the scale-free cut of efficiency_lib.R's bmh(); see validation/manifest.json `copied_tools`.
-# One more arm for f2_extensions_mc.R, on the same data, 10-group cells only:
-#   F1S slope_cr2  δ profiled on y ~ x + (1 + x | g); CR2 SE and Pustejovsky–Tipton df with
-#                  that fit as the working model. Gap: F1's df come from a working model with
-#                  no slope, so they do not fall when slopes are real.
-# Cells: the 10 × 10 cells of Parts A, B, D, E and S (175). Measures as in f2_extensions_mc.R.
-# This file takes the cells, seeds and helpers from f2_extensions_mc.R (every line before its
-# `# The S and G cells run first`), so the two cannot drift. cr2_phi() is cr2() of
-# efficiency_lib.R with Φ_k given.
+# Only cr2_phi() is read from this file (goldens_cr2.R parses it out): cr2() of
+# efficiency_lib.R with Φ_k given. The rest of the script needs a simulation script
+# that is not in this repo.
 # Run: Rscript f2_slope_cr2_mc.R [R] [cores] [cache_dir]
 here <- dirname(normalizePath(sub("^--file=", "", grep("^--file=", commandArgs(FALSE), value = TRUE))))
 src <- readLines(file.path(here, "f2_extensions_mc.R"), encoding = "UTF-8")

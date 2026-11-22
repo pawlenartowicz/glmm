@@ -1,10 +1,11 @@
 //! Crate-wide limits, the single source for each.
 //!
-//! - Capacity. The five scratch constants `MAX_PRIMARY_Q`, `MAX_EXTRA_GROUPINGS`,
-//!   `MAX_EXTRA_Q`, `MAX_THETA` and `MAX_NAGQ` size the solver's stack
-//!   buffers, so they are HARD ceilings. They define the NoZ-scratch envelope
-//!   (the dense no-Z-matrix path in `fit::classify_design`), not a model
-//!   ceiling: designs over-envelope route to the sparse-Z path instead.
+//! - Capacity. The scratch constants `MAX_PRIMARY_Q`, `MAX_EXTRA_GROUPINGS`,
+//!   `MAX_THETA` and `MAX_NAGQ` size the solver's stack buffers, so they are
+//!   HARD ceilings. They define the NoZ-scratch envelope (the dense
+//!   no-Z-matrix path in `fit::classify_design`), not a model ceiling:
+//!   designs over-envelope route to the sparse-Z path instead. `MAX_EXTRA_Q`
+//!   sizes no buffer itself; it only enters `MAX_THETA`.
 //!   `MAX_CROSSED_LEVELS` is a routing boundary of the Gaussian dense kernel
 //!   with `condvar` on, not a buffer size.
 //! - Input ranges. `MAX_DATA_ABS`, `MAX_LOG_OFFSET_ABS` and `MAX_TRIALS` bound
@@ -13,8 +14,9 @@
 //!   doors (`fit`, `fit_with_start`, `predict`) refuse an input outside them
 //!   with the constant's name in the message (`fit::common::validate`).
 //!
-//! Crate-private. Both groups reach callers through `crate::limits`; the
-//! Gauss–Hermite tables stay inside the crate.
+//! Crate-private. Both groups reach callers through `crate::limits`, except
+//! `MAX_AGQ_Q`, which the ports read through `orchestrate`; the Gauss–Hermite
+//! tables stay inside the crate.
 
 /// Max primary RE width `q_p = 1 + #slopes` (≤ 7 random slopes).
 /// See the module header for the NoZ-scratch envelope distinction.
@@ -23,17 +25,22 @@ pub const MAX_PRIMARY_Q: usize = 8;
 /// Max extra grouping factors. Mirrors the solver's per-row level-id buffer
 /// width `1 + MAX_EXTRA_GROUPINGS`. 6 keeps the NoZ envelope's total variance
 /// components `MAX_PRIMARY_Q + MAX_EXTRA_GROUPINGS·MAX_EXTRA_Q = 8 + 6·4 = 32`
-/// well within the `pinned_components` bitmask. The mask is now `u64`, so the
-/// sparse path safely pins up to 64 components; raising MAX_* past 64 total
-/// components would require replacing the bitmask with a bitset.
+/// within the 64 variance components a model may have. The sparse path takes
+/// more groupings, up to that total.
 /// See the module header for the NoZ-scratch envelope distinction.
 pub const MAX_EXTRA_GROUPINGS: usize = 6;
 
-/// Max random-effect dimension per EXTRA grouping factor: `q_g = 1 + #slopes`
-/// (intercept + up to 3 random slopes). Bounds the per-factor `vech(Λ_g)` θ block
-/// and every stack buffer sized off `MAX_THETA`. 4 covers the realistic ceiling
-/// (a crossed factor with intercept + 3 slopes); raise only with a benchmark.
-/// See the module header for the NoZ-scratch envelope distinction.
+/// Max variance components (diagonal θ entries a fit estimates, one per
+/// random-effect column of every grouping) in one model. The pin flags
+/// (`pinned_components`) are a `u64` bitmask, one bit per component, so a
+/// design past 64 is refused (`fit::common::check_model_shape`) rather than
+/// reported with a pinned component missing.
+pub(crate) const MAX_VARIANCE_COMPONENTS: usize = 64;
+
+/// Random-effect width per EXTRA grouping factor, `q_g = 1 + #slopes`, counted
+/// into `MAX_THETA`. It bounds no solver: a slope on an extra grouping always
+/// routes to the sparse path (`fit::classify_design`), which takes any width,
+/// and the dense kernels see `q_g = 1` only.
 pub const MAX_EXTRA_Q: usize = 4;
 
 /// Max θ length: full primary `vech(Λ_p)` plus a `vech(Λ_g)` block per extra
@@ -62,9 +69,17 @@ pub const MAX_CROSSED_LEVELS: usize = 500;
 /// only; the GH table below covers orders `1,3,…,MAX_NAGQ`. Uniform across the
 /// scalar and vector (`agq::agq_deviance_vec`, q_p≤3) AGQ paths: the vector path
 /// uses a `k^q` **product** grid, so k=25 at q=3 is 15,625 nodes/cluster/eval —
-/// legal but self-punishing; the k^q cost is the user's to pay (the q_p≤3 cap in
-/// `assert_model_shape` bounds the exponent).
+/// legal but self-punishing; the k^q cost is the user's to pay ([`MAX_AGQ_Q`]
+/// bounds the exponent).
 pub const MAX_NAGQ: u8 = 25;
+
+/// Max primary random-effect width `q_p = 1 + #slopes` that adaptive
+/// quadrature (`nagq > 1`) takes. A cost and oracle-coverage cap, not a code
+/// limit: the `k^q` product grid and the dimension-generic node loop have no
+/// q limit, but the grid grows as `nagq^q_p` and no reference covers
+/// `q_p ≥ 4`. Read by `fit::common::agq_shape` and `glmm::agq::agq_eligible`.
+/// Not in `crate::limits`; the ports reach it through `orchestrate`.
+pub const MAX_AGQ_Q: usize = 3;
 
 /// The largest |value| of `y`, of an `x` or `re_columns` entry and of an
 /// offset on a link other than log. Weights and the inverse-Gaussian held
@@ -76,7 +91,7 @@ pub const MAX_DATA_ABS: f64 = 1e100;
 /// The largest |offset| on a log link (Poisson, negative binomial, Gamma and
 /// inverse-Gaussian log). An offset is the log of an exposure, and
 /// `e^230 ≈ 7.7e99` keeps that exposure inside [`MAX_DATA_ABS`]. It leaves 470
-/// below the log links' clamp on η (700, under the overflow at `e^709.8`) for
+/// below the log links' clamp on η (`family::ETA_MAX`, under the overflow at `e^709.8`) for
 /// `Xβ + Zb`, so a valid offset does not put its row past the clamp.
 pub const MAX_LOG_OFFSET_ABS: f64 = 230.0;
 
@@ -300,8 +315,11 @@ pub const GH_NODES: [f64; 169] = [
 ];
 
 /// GH weights `w_j` (physicists'), aligned 1:1 with [`GH_NODES`]. Per order they
-/// sum to √π; the AGQ log-sum-exp uses `ln w_j` and the `√π` normalization is
-/// what makes the k=1 node collapse exactly to the Laplace term.
+/// sum to √π, the `f64` values to within an ulp-level rounding. The AGQ node
+/// sums weight each node term `expm1(x_j)` by `w_j` and normalise the bracket by
+/// the block's own sum `Σ_j w_j` (`glmm::agq::agq_deviance`), so the order-1
+/// block, the single node `z = 0` with weight √π, collapses exactly to the
+/// Laplace term.
 #[allow(clippy::excessive_precision)]
 pub const GH_WEIGHTS: [f64; 169] = [
     1.77245385090551588e+00,

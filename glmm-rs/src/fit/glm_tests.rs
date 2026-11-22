@@ -367,7 +367,7 @@ fn fit_glm_smoke() {
     // Rust-vs-Rust pin, not an R oracle — logit accuracy against R is covered
     // separately by `fit_glm_binomial_weighted_aggregated_matches_r`. This
     // catches a 2x-scaled or otherwise-wrong-but-finite-positive β̂ that the
-    // old finiteness/sign-only checks let through.
+    // that finiteness/sign-only checks would let through.
     const REF_BETA: [f64; 2] = [0.491837142677357, 0.872230971652398];
     const REF_SE1: f64 = 0.187677151494303;
     assert_pinned(&f.beta, &REF_BETA, PIN_REL_OLS, "beta");
@@ -706,8 +706,8 @@ fn fit_glm_poisson_weighted_offset_matches_r() {
 /// frozen R `glm(family=poisson)` oracle
 /// (`validation/goldens/sim_poisson_highmean_glm.json`): `y ~ 1 + x + grp` on
 /// sim_poisson_highmean (ȳ ≈ 85). Regression gate for the IRLS log-link cold
-/// start: from the old μ = 1 seed (η = 0) any count data with ȳ ≳ ~25–30 made
-/// the first WLS step overshoot and IRLS run away (β → ~9e304,
+/// start: from a μ = 1 seed (η = 0), count data with ȳ ≳ ~25–30 makes the
+/// first WLS step overshoot and IRLS run away (β → ~9e304,
 /// `converged = false`); the μ₀ = y + 0.1 seed (R's family `initialize`)
 /// converges here. The oracle is sacred.
 #[test]
@@ -1286,7 +1286,7 @@ fn fit_glm_dispersion_family_stop_rule_is_scale_free() {
 /// floor carries ȳ's units below ȳ = 1, so the fit is the y·1 fit with the
 /// intercept shifted by ln c. The cold seed and the divergence guard's centre
 /// are ln ȳ with no `+ 0.1` either: centred on ln(ȳ + 0.1) ≈ ln 0.1, the fit at
-/// y·1e-16 (ln μ̂ near −36) sat more than 30 from it and was refused. The data
+/// y·1e-16 (ln μ̂ near −36) would sit more than 30 from it and be refused. The data
 /// are `sim_gamma_xy`'s positive y.
 #[test]
 fn fit_glm_poisson_small_mean_stop_rule_is_scale_free() {
@@ -1561,7 +1561,7 @@ fn fit_glm_tiny_uniform_weights_match_unit_weights() {
 /// Log-link fits whose exposures differ by many decades between rows. The
 /// divergence guard and the cold seed are centred on the null model with the
 /// offset, oᵢ + ln(Σy / Σe^o); centred on ln ȳ alone, rows with exposure
-/// 1e-16 of the rest sit about 37 from it and the fit was refused.
+/// 1e-16 of the rest would sit about 37 from it and the fit would be refused.
 /// - Poisson on the `fit_glm_small_unit_weights_converge` fixture with
 ///   exposure 1e-16 and 1e16 on its 30 zero rows. Frozen R 4.5.3 fits:
 ///   `glm(y ~ x1 + offset(log(e)), poisson, epsilon = 1e-14)`.
@@ -2499,8 +2499,7 @@ fn fit_glm_igauss_log_slow_fisher_surface_reaches_the_maximum() {
 /// `glm(inverse.gaussian("log"), offset=)` on `sim_igauss.csv`, the same
 /// `o_i = 0.1·(i mod 7)` offset shape as the Poisson/Gamma offset goldens. Log
 /// is non-canonical for inverse-Gaussian, exercising the general
-/// Fisher-scoring branch's offset fold on the second family that never
-/// touched it before this test.
+/// Fisher-scoring branch's offset fold on a second family.
 #[test]
 fn fit_glm_igauss_offset_matches_r() {
     // R 4.5.3 oracle:
@@ -2785,7 +2784,7 @@ fn fit_glm_nb_matches_mass() {
 }
 
 /// Weighted negative-binomial GLM vs `MASS::glm.nb(weights=)`. Convention:
-/// prior weight multiplies both the IRLS working weight (β/SE, per Task 2)
+/// prior weight multiplies both the IRLS working weight (β/SE)
 /// and the per-row θ profile term (`nb_profile_loglik`'s `weights` — matches
 /// `theta.ml`'s weighted profile, the outer loop MASS::glm.nb alternates on).
 #[test]

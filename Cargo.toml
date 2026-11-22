@@ -1,9 +1,7 @@
 # ───────────────────────── standalone workspace root ─────────────────────────
-# glmm was carved out of the mcpower workspace (Stage 2). This virtual workspace
-# holds the shared package fields, lints and profiles, so the members'
-# `.workspace = true` inheritances resolve here and the clippy/unsafe lint gate
-# carried over from mcpower stays in one place. Values copied verbatim from the
-# mcpower workspace at carve time.
+# This virtual workspace holds the shared package fields, lints and profiles,
+# so the members' `.workspace = true` inheritances resolve here and the
+# clippy/unsafe lint gate stays in one place.
 [workspace]
 resolver = "2"
 # `glmm-rs` (package `glmm`) is the kernel plus, behind the default-on `formula`
@@ -13,7 +11,7 @@ resolver = "2"
 # PyO3/maturin extension, never `cargo publish`ed. `glmm-r/rust` (package
 # `glmm-r`) is its R-side twin (extendr wiring), re-exported by `glmm-r/src/rust`
 # (which stays OUT of this workspace: R drives that staticlib build with its own
-# resolver, mirroring mcpower's ports/r layout). `validation` is the
+# resolver). `validation` is the
 # publish = false crate owning the oracle-harness examples, outside the packaged
 # glmm crate.
 members = ["glmm-rs", "glmm-bind", "glmm-py", "glmm-r/rust", "validation"]
@@ -27,21 +25,19 @@ rust-version = "1.85"      # floor set by the bobyqa dep (edition 2024, MSRV 1.8
 license = "LGPL-3.0-or-later"
 
 [workspace.lints.rust]
-# glmm is pure-Rust and uses no `unsafe`; this baseline matches the mcpower
-# engine crates (which harden further to forbid in lib.rs — glmm does not).
+# glmm is pure-Rust and uses no `unsafe`; the lint warns, and lib.rs does not
+# forbid it.
 unsafe_code = "warn"
 
 [workspace.lints.clippy]
 # priority -1 lets item-level #[allow]/#[expect] override; deny makes clippy::all
-# a correctness gate that fails a plain `cargo clippy` — the validation-numeric guard
-# this crate shipped with inside mcpower.
+# a correctness gate that fails a plain `cargo clippy`.
 all = { level = "deny", priority = -1 }
 
-# Match the mcpower release profile so glmm's OWN release/bench builds keep the
-# codegen (lto + single codegen-unit) that the bobyqa/pulp version-pin comments
-# tie the fitted-MLE low bits / goldens to. Ignored when glmm is consumed as a
-# dependency (the consumer's profile wins), so it does not affect the mcpower
-# build path — only standalone `cargo build --release` / benchmarks in this repo.
+# The release profile (lto + single codegen-unit) that the bobyqa/pulp
+# version-pin comments tie the fitted-MLE low bits and goldens to. Ignored when
+# glmm is a dependency (the consumer's profile wins), so it governs only
+# standalone release builds and benchmarks in this repo.
 [profile.release]
 lto = "thin"
 codegen-units = 1

@@ -120,6 +120,23 @@ def _mixed_fit(**kw):
     return make_fit(**base)
 
 
+def test_a_nan_correlation_prints_na():
+    # A correlation next to an SD at 0 is NaN; so is a fixed-effect
+    # correlation off a NaN covariance.
+    f = _mixed_fit(
+        varcorr=[np.array([4.0, 0.0, 0.0])],
+        vcov=np.array([[1.0, np.nan], [np.nan, 0.0625]]),
+    )
+    lines = f.summary_object().text().splitlines()
+    assert lines[lines.index(" Groups   Name        Variance Std.Dev. Corr") + 2].split() == [
+        "Days",
+        "0",
+        "0",
+        "NA",
+    ]
+    assert lines[lines.index("Correlation of Fixed Effects:") + 2].split() == ["x", "NA"]
+
+
 def test_summary_object_blocks_lmm():
     s = _mixed_fit().summary_object()
     assert s.method == "Linear mixed model fit by REML [glmm]"
@@ -428,7 +445,7 @@ def test_lmm_summary_has_lmertest_columns_with_the_crates_df_and_p():
     assert row.rstrip().endswith(".")
     x_row = next(ln for ln in text.splitlines() if ln.startswith("x "))
     assert "16.25" in x_row and "0.0526" in x_row
-    assert text.splitlines()[-1] == glmm.summary.FOOTNOTE
+    assert text.splitlines()[-1] == "t tests use Satterthwaite degrees of freedom."
     for render in (s.html(), s.latex(), s.typst()):
         assert "t value" in render
         assert "t tests use Satterthwaite degrees of freedom" in render

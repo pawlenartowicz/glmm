@@ -1,0 +1,63 @@
+{
+  "provenance": {
+    "r_version": "4.5.3",
+    "packages": {
+      "lme4": "2.0.6",
+      "lmerTest": "3.2.1",
+      "RLRsim": "3.1.9",
+      "car": "3.1.5",
+      "numDeriv": "2016.8.1.1",
+      "MASS": "7.3.65",
+      "jsonlite": "2.0.0",
+      "glmmTMB": "1.1.14"
+    },
+    "rng_kind": ["Mersenne-Twister", "Inversion", "Rejection"],
+    "blas": "FlexiBLAS OPENBLAS-OPENMP",
+    "lapack": "FlexiBLAS OPENBLAS-OPENMP",
+    "threads": {
+      "OMP_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "FLEXIBLAS_NUM_THREADS": "1"
+    },
+    "generator": "goldens_anova.R"
+  },
+  "case": "type2_units",
+  "term_labels": ["g", "x", "g:x"],
+  "coef_names": ["(Intercept)", "gb", "gc", "x", "gb:x", "gc:x"],
+  "scale_column": "x",
+  "scale_by": 1e-05,
+  "lmertest_type2": {
+    "rows": [
+      {
+        "term": "g",
+        "Sum Sq": 86.0463972500275,
+        "Mean Sq": 43.0231986250138,
+        "NumDF": 2,
+        "DenDF": 100.147054358523,
+        "F value": 33.1606895881104,
+        "Pr(>F)": 8.89380009307339e-12
+      },
+      {
+        "term": "x",
+        "Sum Sq": 24.4932109011974,
+        "Mean Sq": 24.4932109011974,
+        "NumDF": 1,
+        "DenDF": 100.320232357309,
+        "F value": 18.8784606832675,
+        "Pr(>F)": 3.34159998594068e-05
+      },
+      {
+        "term": "g:x",
+        "Sum Sq": 1.81774091970895,
+        "Mean Sq": 0.908870459854475,
+        "NumDF": 2,
+        "DenDF": 100.605453219882,
+        "F value": 0.700523721114373,
+        "Pr(>F)": 0.498729837666139
+      }
+    ],
+    "conditions": []
+  },
+  "name": "anova_type2_units_sim_factorial"
+}

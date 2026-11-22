@@ -58,13 +58,18 @@ const CI_REF_REL: f64 = 1e-7;
 /// with long outer searches on flat directions (four-way crossed and nested
 /// fits, the NB θ search, vector AGQ): on aarch64-apple-darwin they reach the same
 /// deviance as the anchor's run within `CI_REF_REL` while β, SEs, stddevs and
-/// θ sit further off. Measured 2026-10-16 on an Apple Silicon Mac against the
-/// 0.6.0 release run (`runs/glmm/last/`, fitted on the anchor), worst
-/// relative gap per cell (10 of the 116 records; the 2026-10-11 measurement
-/// against the 0.5.0 run had the same 3.8e-6 top). Band = 10x the measured gap,
+/// θ sit further off. Measured 2026-10-16 on an Apple Silicon Mac against a
+/// kept run fitted on the anchor, worst relative gap per cell (10 of the 116
+/// records). Band = 10x the measured gap,
 /// rounded up to one significant digit. A cell not listed here that drifts
 /// past `CI_REF_REL` on a new CPU is measured and added with its own line,
 /// never absorbed by raising `CI_REF_REL`.
+///
+/// The bands apply only on a CPU other than the one that fitted the kept run
+/// ([`cross_cpu`]); on that CPU every quantity is held at `CI_REF_REL`. CI's
+/// x86_64 runners (AMD EPYC 7763, 9V45 and 9V74, 2026-11-07 to 2026-11-17)
+/// printed gaps of at most 1.7e-16 on these ten cells against a kept run fitted
+/// on an Intel CPU.
 const CROSS_CPU_CELL_BANDS: [(&str, f64); 10] = [
     ("binb_cross4_g60p5_bal_base", 2e-6), // 1.54e-7 varcomp[2].stddev
     ("binb_q2s_g60p5_bal_base_agq7", 5e-6), // 4.71e-7 beta[0]
@@ -78,11 +83,44 @@ const CROSS_CPU_CELL_BANDS: [(&str, f64); 10] = [
     ("sim_nb_hightheta_glm", 4e-6),       // 3.68e-7 nb_theta
 ];
 
+/// The CPU model this test runs on, read as `run.sh` records it in
+/// `run_meta.json` (`model name` in /proc/cpuinfo, else `sysctl -n
+/// machdep.cpu.brand_string` on macOS) -- change together. `None` where
+/// neither gives one.
+fn this_cpu() -> Option<String> {
+    if let Ok(info) = std::fs::read_to_string("/proc/cpuinfo") {
+        return info.lines().find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            (k.trim() == "model name").then(|| v.trim().to_owned())
+        });
+    }
+    let out = std::process::Command::new("sysctl")
+        .args(["-n", "machdep.cpu.brand_string"])
+        .output()
+        .ok()?;
+    let cpu = String::from_utf8(out.stdout).ok()?.trim().to_owned();
+    (!cpu.is_empty()).then_some(cpu)
+}
+
+/// Whether the cross-CPU bands apply: this CPU differs from the one that
+/// fitted the kept run (`cpu` in its `run_meta.json`), or either is unknown.
+/// `GRID_REF_STRICT=1` holds every quantity at `CI_REF_REL` on any CPU.
+fn cross_cpu(meta: &Value) -> bool {
+    if std::env::var("GRID_REF_STRICT").is_ok_and(|v| v == "1") {
+        return false;
+    }
+    match (meta["cpu"].as_str(), this_cpu()) {
+        (Some(kept), Some(here)) => kept.trim() != here,
+        _ => true,
+    }
+}
+
 /// The band `key` of cell `id` is compared at: `CI_REF_REL` for the
 /// likelihood on every cell (the grid's hard gate reads it), the cell's
-/// cross-CPU band for its other quantities where it has one.
-fn band_for(id: &str, key: &str) -> f64 {
-    if matches!(key, "deviance" | "loglik") {
+/// cross-CPU band for its other quantities where it has one and `cross` holds
+/// ([`cross_cpu`]).
+fn band_for(id: &str, key: &str, cross: bool) -> f64 {
+    if matches!(key, "deviance" | "loglik") || !cross {
         return CI_REF_REL;
     }
     CROSS_CPU_CELL_BANDS
@@ -258,9 +296,15 @@ fn fast_cells_match_the_committed_glmm_run() {
     let manifest = read_json(&format!("{GRID}/manifest.json"));
     let (run_dir, meta) = committed_run();
     // Printed so the run being gated against is never a guess.
+    let cross = cross_cpu(&meta);
     println!(
-        "reference run: {run_dir}\n  subset: {}   label: {}   cells: {}",
-        meta["subset"], meta["label"], meta["cells"]
+        "reference run: {run_dir}\n  subset: {}   label: {}   cells: {}\n  \
+         kept run's CPU: {}   this CPU: {}   cross-CPU bands: {cross}",
+        meta["subset"],
+        meta["label"],
+        meta["cells"],
+        meta["cpu"],
+        this_cpu().as_deref().unwrap_or("unknown"),
     );
 
     // The reference has to have been fitted by this crate's minor line
@@ -342,7 +386,7 @@ fn fast_cells_match_the_committed_glmm_run() {
                 got.get(key).unwrap_or(&Value::Null),
                 want.get(key).unwrap_or(&Value::Null),
                 &format!("{id}.{key}"),
-                band_for(id, key),
+                band_for(id, key, cross),
                 &mut fails,
                 &mut cell_worst,
             );
@@ -369,7 +413,7 @@ fn fast_cells_match_the_committed_glmm_run() {
     for (id, gap) in &banded_gaps {
         println!(
             "  banded cell {id}: worst relative gap {gap:.2e}, band {:.0e}",
-            band_for(id, "beta")
+            band_for(id, "beta", cross)
         );
     }
     assert!(

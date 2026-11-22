@@ -3,13 +3,14 @@ name: pin-bands
 # Measures the Tier 1 pin bands on a third CPU.
 #
 # Every pin in the crate reproduces BIT-EXACTLY on the anchor machine across
-# debug/release and all four feature configs (`assert_pinned` in
+# debug/release and the four feature configs it measures (default,
+# loop_advanced, parallel, no-default; `assert_pinned` in
 # glmm-rs/src/fit/common_tests.rs names the anchor and holds the full account). The bands
 # are margin for a different microarchitecture, where `glmm-rs/src/simd_transcendental.rs`
 # dispatches on CPU feature detection and the compiler contracts multiply-adds
 # elsewhere in the kernel's long reductions. A second machine
-# (aarch64-apple-darwin) has since been measured by hand and is what currently
-# sizes them; this job is the third, and the only one that covers CI's own pool.
+# (aarch64-apple-darwin), measured by hand, sizes them; this job is the third,
+# and the only one that covers CI's own pool.
 #
 # NOT a gate. It is expected to "fail" some of the tests it runs — that is the
 # mechanism. It rewrites every band so no pin can pass bar a bit-exact one, and
@@ -39,9 +40,9 @@ name: pin-bands
 # 4.0e-6 from its lme4 golden on any machine. That is cross-engine disagreement,
 # not CPU drift; do not fold it into a band.
 #
-# A pin that moves ONLY under `parallel` is not a band problem. RULE 1 requires
-# parallel results to stay bit-identical to serial, so that is a RULE 1 bug and
-# is fixed there, never absorbed into the tolerance.
+# A pin that moves ONLY under `parallel` is not a band problem. Parallel results
+# must stay bit-identical to serial, so that is a parallelism bug and is fixed
+# there, never absorbed into the tolerance.
 #
 # Manual trigger only: it burns eight runners and produces no pass/fail signal.
 on:

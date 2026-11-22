@@ -25,9 +25,6 @@ import numpy as np
 
 from glmm import _native
 
-# The footer of a Gaussian mixed model's t tests, as the native summary record
-# carries it.
-FOOTNOTE = "t tests use Satterthwaite degrees of freedom (finite-difference θ-Hessian)."
 # The footer of a Gaussian mixed model fitted with satterthwaite=False; the R port
 # prints "df not computed (satterthwaite = FALSE)", its own argument spelling.
 DF_NOT_COMPUTED = "df not computed (satterthwaite=False)"
@@ -41,13 +38,19 @@ def fmt(x, digits=4):
     return f"{x:.{digits}g}"
 
 
+def fmt_fixed(x, decimals):
+    """A correlation cell: `decimals` fixed decimals, NaN as NA, as `fmt`."""
+    x = float(x)
+    return "NA" if math.isnan(x) else f"{x:.{decimals}f}"
+
+
 def fmt_df(x):
-    """The one degrees-of-freedom formatter, for the df cells and every
-    reference string: a whole df (a residual df, a numerator df, a chi-squared
-    df) prints as an integer at any size, a Satterthwaite df with four
-    significant digits, or as the nearest whole number from 10000 up, always
+    """The degrees-of-freedom formatter for the df cells: a whole df (a
+    residual df, a numerator df, a chi-squared df) prints as an integer at any
+    size, a Satterthwaite df with four significant digits, or as the nearest whole number from 10000 up, always
     in fixed notation. NaN prints as NA and an infinite df as Inf or -Inf,
-    as R prints them."""
+    as R prints them. Mirrors `fmt_df` in glmm-bind's `anova_text.rs`, which
+    formats the reference strings in the same tables: change together."""
     x = float(x)
     if math.isnan(x):
         return "NA"
@@ -308,10 +311,6 @@ def build_summary(fit, effect_sizes=None, need_refit=False):
     for re in r["random_effects"]:
         for k in ("variance", "stddev", "corr"):
             re[k] = np.asarray(re[k], dtype=float)
-    if r["test"] == "z":
-        # This port prints NA for an infinite z, where the record (as R's
-        # 2 * pnorm(-Inf)) has 0.
-        r["p_value"][np.isinf(r["statistic"])] = math.nan
     r["groups"] = list(zip(r["groups"]["names"], r["groups"]["levels"]))
     r["aliased"] = np.asarray(r["aliased"], dtype=bool)
     if df_method == "disabled":
@@ -344,6 +343,7 @@ class Summary(Rendered):
     residual_df: (
         int | float | None
     )  # n - p on OLS and the dispersion GLMs (NaN on a fit with no estimates), else None
+    sigma: float | None  # the residual standard error where residual_df is set on a Gaussian fit
     rss: float
     r_squared: float
     adj_r_squared: float
@@ -461,7 +461,7 @@ class Summary(Rendered):
         out += self.weight_power_lines
         out.append(f"Optimizer evaluations: {self.n_eval}, converged: {self.converged}")
         if self.singular:
-            out.append("boundary (singular) fit: see help('isSingular')")
+            out.append("boundary (singular) fit: see Fit.singular")
         if self.footnote is not None:
             out.append(self.footnote)
         if self.warnings:
@@ -500,10 +500,9 @@ class Summary(Rendered):
         switches to e-notation ("1.235e+04")."""
         if self.residual_df is None or self.family != "gaussian":
             return []
-        sigma = math.sqrt(self.rss / self.residual_df) if self.residual_df > 0 else math.nan
         df = "NA" if math.isnan(self.residual_df) else self.residual_df
         return [
-            f"Residual standard error: {fmt(sigma)} on {df} degrees of freedom",
+            f"Residual standard error: {fmt(self.sigma)} on {df} degrees of freedom",
             (
                 f"Multiple R-squared:  {fmt(self.r_squared)},\t"
                 f"Adjusted R-squared:  {fmt(self.adj_r_squared)}"
@@ -559,7 +558,7 @@ class Summary(Rendered):
                     # term, whose columns are contiguous; two terms are
                     # uncorrelated by the model.
                     corr = " ".join(
-                        f"{re['corr'][i, j]:.2f}"
+                        fmt_fixed(re["corr"][i, j], 2)
                         for j in range(i)
                         if i >= len(term) or term[j] == term[i]
                     )
@@ -614,7 +613,7 @@ class Summary(Rendered):
             names = self.coef_names
             rows = [
                 [names[i]]
-                + [f"{self.corr_fixed[i, j]:.3f}" for j in range(i)]
+                + [fmt_fixed(self.corr_fixed[i, j], 3) for j in range(i)]
                 + [""] * (len(names) - 1 - i)
                 for i in range(1, len(names))
             ]
@@ -649,7 +648,7 @@ class Summary(Rendered):
         lines += self.weight_power_lines
         lines.append(f"Optimizer evaluations: {self.n_eval}, converged: {self.converged}")
         if self.singular:
-            lines.append("boundary (singular) fit: see help('isSingular')")
+            lines.append("boundary (singular) fit: see Fit.singular")
         if self.n_aliased:
             lines.append(f"{self.n_aliased} coefficient(s) not defined because of singularities")
         if self.footnote is not None:

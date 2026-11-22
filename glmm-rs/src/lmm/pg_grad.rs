@@ -40,7 +40,7 @@
 //! (pawel P-core, REML): value plus gradient 1.35x a value at `q = 2`, 1.43x
 //! at `q = 4`, 1.99x at `q = 8`.
 
-use super::{Criterion, LmmFitScratch, LmmSuffStats, MAX_PRIMARY_Q};
+use super::{beta_backward, Criterion, LmmFitScratch, LmmSuffStats, MAX_PRIMARY_Q};
 
 /// Groups per stacked triangular solve. Bounds the gradient's scratch
 /// (`pg_nt`, `p·q·PG_GRAD_BLOCK` f64) independently of the group count; the
@@ -65,18 +65,11 @@ pub(crate) fn pg_gradient(suff: &LmmSuffStats, fit: &mut LmmFitScratch, grad: &m
     // Rows of each `N_g` staged and solved: `p` under REML, none under ML
     // (no `ln|T_xx|` term).
     let pn = if reml { p } else { 0 };
-    // β̂ off the border factor: L_xx′ β = l_yx (column-major, read by columns).
-    for j in (0..p).rev() {
-        let col = fit.factor.col_as_slice(j);
-        let mut acc = col[p];
-        for k in (j + 1)..p {
-            acc -= col[k] * fit.pg_beta[k];
-        }
-        if col[j].is_nan() || col[j] <= 0.0 {
-            return false;
-        }
-        fit.pg_beta[j] = acc / col[j];
+    // β̂ off the border factor: L_xx′ β = l_yx.
+    if (0..p).any(|j| fit.factor[(j, j)].is_nan() || fit.factor[(j, j)] <= 0.0) {
+        return false;
     }
+    beta_backward(fit.factor.as_ref(), p, &mut fit.pg_beta);
     let lyy = fit.factor.col_as_slice(p)[p];
     if lyy.is_nan() || lyy <= 0.0 {
         return false;

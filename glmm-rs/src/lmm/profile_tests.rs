@@ -103,7 +103,8 @@ impl Case {
         &self,
         f: impl FnOnce(&Fit, &mut LmmWorkspace, &ColumnScaling, &Units) -> R,
     ) -> R {
-        let (fit, mut fws) = fit_keep_workspace(&self.data(), &self.model, None, &ml_opts());
+        let (fit, mut fws) =
+            fit_keep_workspace(&self.data(), &self.model, None, &ml_opts()).unwrap();
         assert!(fit.converged(), "the ML fit converges");
         let (ws, map, units) = fws.lmm_parts().expect("a Gaussian mixed fit");
         f(&fit, ws, map, units)

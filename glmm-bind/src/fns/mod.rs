@@ -7,7 +7,8 @@ pub(crate) mod formula;
 pub(crate) mod inference;
 pub(crate) mod predict;
 
-use glmm::orchestrate::PortError;
+use glmm::orchestrate::{self, PortError};
+use glmm::Family;
 
 use crate::error::BindError;
 use crate::inputs::{FactorColumns, Inputs, NumericColumns};
@@ -121,5 +122,10 @@ impl ModelData {
             weights: inp.opt_vec("weights")?,
             offset: inp.opt_vec("offset")?,
         })
+    }
+
+    /// The stored `family` and `link` as the kernel's [`Family`].
+    pub(crate) fn family(&self) -> Result<Family, String> {
+        orchestrate::family_from_str(&self.family, &self.link)
     }
 }

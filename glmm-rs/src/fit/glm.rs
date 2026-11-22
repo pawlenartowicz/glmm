@@ -27,6 +27,7 @@ impl GlmFitView<'_> {
             ill_conditioned: self.pivot < crate::ols::PIVOT_MIN,
             separated: self.separated,
             se_unavailable: self.se_unavailable,
+            stop: self.stop,
             ..FitDiagnostics::fixed_only(self.converged)
         }
     }
@@ -110,10 +111,9 @@ impl GlmScratchBuf {
 }
 
 /// GLM dispatch adapter. Owns the `irls_*` scratch inline (the analog of
-/// `OlsWorkspace::new`'s `OlsScratch` allocation; on the simulation path these live in
-/// `SimWorkspace`), converts the row-major input to a column-major faer `Mat`,
-/// runs the `family`-selected IRLS kernel cold-started at β=0, and maps the view
-/// to `Fit`. No random effects ⇒ `tau2` empty. Binomial/Poisson keep
+/// `OlsWorkspace::new`'s `OlsScratch` allocation), converts the row-major
+/// input to a column-major faer `Mat`, runs the `family`-selected IRLS kernel
+/// cold-started at β=0, and maps the view to `Fit`. No random effects ⇒ `tau2` empty. Binomial/Poisson keep
 /// `dispersion = 1.0`; Gamma/NB recover their dispersion in their own arms.
 /// Test-only baseline since the stable path dispatches through the unified core
 /// ([`super::core::fit_on`]) over `fit_glm_prebuilt`/`glm_view_to_fit`.
@@ -153,6 +153,7 @@ pub(super) fn fit_glm(
     );
     let mut beta = view.betas.to_vec();
     units.beta_to_caller(ColumnScaling::IDENTITY, &mut beta);
+    let phi_int = glm_dispersion(&view, y, weights, family, n, opts, &units);
     glm_view_to_fit(
         &view,
         beta,
@@ -160,6 +161,7 @@ pub(super) fn fit_glm(
         weights,
         family,
         nb_theta,
+        phi_int,
         n,
         p,
         opts,
@@ -260,6 +262,7 @@ pub(crate) fn glm_dispersion(
 /// caller's and `units` the units the view was fitted in: on Gamma and inverse
 /// Gaussian the kernel ran on `y/c` and `ŵ = w/s`, so its deviance, means,
 /// factor `l` and dispersion `φ_int` are internal, and `Units` maps them.
+/// `phi_int` is the view's [`glm_dispersion`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn glm_view_to_fit(
     view: &GlmFitView<'_>,
@@ -268,6 +271,7 @@ pub(crate) fn glm_view_to_fit(
     weights: Option<&[f64]>,
     family: Family,
     nb_theta: f64,
+    phi_int: f64,
     n: usize,
     p: usize,
     opts: &FitOptions,
@@ -296,7 +300,6 @@ pub(crate) fn glm_view_to_fit(
     // Var(β̂)=φ·(XᵀWX)⁻¹, `var_diag` the caller's `(XᵀWX)⁻¹`, and `vcov` the
     // internal factor's `(X̃ᵀŴX̃)⁻¹`, which takes `k²·φ_int`. A no-op for the
     // φ≡1 families.
-    let phi_int = glm_dispersion(view, y, weights, family, n, opts, units);
     let dispersion = units.dispersion_scale() * phi_int;
     let var_int = phi_int * units.var_scale();
     // Scaled inside, so a variance that leaves f64's range is NaN. `view.l` is
@@ -705,9 +708,11 @@ pub(super) fn fit_glm_nb_capped(
     // two values (5e-5 apart on a 20-row fit at μ ≈ 1.6e5) and never settles.
     // From the last β the rounds continue one iteration instead.
     let mut beta_start: Vec<f64> = Vec::with_capacity(p);
-    // Replaced by the first round's fit, as `max_outer >= 1`.
+    // Replaced on every exit, as `max_outer >= 1`: a `Fit` is built only for
+    // the round that ends the loop; the others need only their view.
     let mut fit_result = Fit::empty(n, p, None);
     let mut settled = false;
+    let mut last_converged = false;
     let mut rounds: u32 = 0;
     for _ in 0..max_outer {
         rounds += 1;
@@ -726,27 +731,29 @@ pub(super) fn fit_glm_nb_capped(
             Units::IDENTITY,
             start,
         );
-        fit_result = glm_view_to_fit(
-            &view,
-            caller_beta(&view),
-            y,
-            weights,
-            family,
-            theta,
-            n,
-            p,
-            opts,
-            map,
-            Units::IDENTITY,
-        );
-        if !fit_result.converged() {
+        last_converged = view.converged;
+        if !last_converged {
+            fit_result = glm_view_to_fit(
+                &view,
+                caller_beta(&view),
+                y,
+                weights,
+                family,
+                theta,
+                glm_dispersion(&view, y, weights, family, n, opts, Units::IDENTITY),
+                n,
+                p,
+                opts,
+                map,
+                Units::IDENTITY,
+            );
             break;
         }
         beta_start.clear();
         beta_start.extend_from_slice(view.betas);
         // μ̂ = exp(o + Xβ̂) for the θ optimisation. `x` is the design the
         // kernel fitted and `view.betas` its β̃, so `x·β̃ = x_caller·β` with no
-        // map (`fit_result.beta` is the caller's β, for the caller's design).
+        // map.
         for (i, mi) in mu.iter_mut().enumerate() {
             let mut eta: f64 = (0..p).map(|j| x[(i, j)] * view.betas[j]).sum();
             if let Some(o) = offset {
@@ -780,6 +787,7 @@ pub(super) fn fit_glm_nb_capped(
                 weights,
                 family,
                 theta,
+                glm_dispersion(&view, y, weights, family, n, opts, Units::IDENTITY),
                 n,
                 p,
                 opts,
@@ -789,7 +797,7 @@ pub(super) fn fit_glm_nb_capped(
             break;
         }
     }
-    if !settled && rounds == max_outer as u32 && fit_result.converged() {
+    if !settled && rounds == max_outer as u32 && last_converged {
         // Cap exit: refit β̂/SE at the θ this fit reports, so the returned Fit is
         // one model, and say that θ never settled (`Note::NbShapeUnsettled`).
         let view = fit_glm_prebuilt(
@@ -812,6 +820,7 @@ pub(super) fn fit_glm_nb_capped(
             weights,
             family,
             theta,
+            glm_dispersion(&view, y, weights, family, n, opts, Units::IDENTITY),
             n,
             p,
             opts,

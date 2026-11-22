@@ -1,5 +1,8 @@
-//! The lme4-shaped summary record both ports print (`summary`), and the
-//! Pearson residuals its scaled-residual block reads (`pearson_residuals`).
+//! The lme4-shaped summary record both ports print (`summary`), the
+//! Pearson residuals its scaled-residual block reads (`pearson_residuals`),
+//! and two of its numbers the ports also print outside it: a covariance
+//! block's SDs and correlations (`stddev_corr`) and the information criteria
+//! (`criteria`).
 //! Each port renders the record. The title with the port's name, the ML
 //! note and the groups line come from here; the footer of a fit with
 //! Satterthwaite switched off, which spells the port's own argument, stays
@@ -7,13 +10,13 @@
 
 use std::f64::consts::SQRT_2;
 
-use glmm::orchestrate;
+use glmm::orchestrate::{self, DfMethod};
 use glmm::WEIGHT_POWER_SIMULATED;
 
 use crate::coerce;
 use crate::error::BindError;
 use crate::inputs::Inputs;
-use crate::port::spell;
+use crate::port::{spell, Port};
 use crate::records::{int, opt_text, read_re_groups, text};
 use crate::value::{Record, Value};
 
@@ -21,11 +24,10 @@ use crate::value::{Record, Value};
 const ML_NOTE: &str = "Note: p-values can be somewhat anticonservative.";
 
 /// The footer of a Gaussian mixed model's t tests.
-const SATTERTHWAITE_FOOTNOTE: &str =
-    "t tests use Satterthwaite degrees of freedom (finite-difference θ-Hessian).";
+const SATTERTHWAITE_FOOTNOTE: &str = "t tests use Satterthwaite degrees of freedom.";
 
 /// `x` to four significant digits, trailing zeros dropped.
-fn sig4(x: f64) -> String {
+pub(crate) fn sig4(x: f64) -> String {
     if x == 0.0 || !x.is_finite() {
         return format!("{x}");
     }
@@ -40,14 +42,14 @@ fn sig4(x: f64) -> String {
 
 /// The footer of a robust fit's t tests, by its df method: CR2 clustered by
 /// the grouping factor, or HC2.
-fn robust_footnote(df_method: &str, group: Option<&str>) -> Option<String> {
+fn robust_footnote(df_method: DfMethod, group: Option<&str>) -> Option<String> {
     match df_method {
-        "pustejovsky_tipton" => Some(format!(
+        DfMethod::PustejovskyTipton => Some(format!(
             "Standard errors: CR2, clustered by {}; t tests use Pustejovsky-Tipton degrees of \
              freedom.",
             group.unwrap_or("the grouping factor")
         )),
-        "bell_mccaffrey" => {
+        DfMethod::BellMcCaffrey => {
             Some("Standard errors: HC2; t tests use Bell-McCaffrey degrees of freedom.".to_owned())
         }
         _ => None,
@@ -209,18 +211,80 @@ fn five_numbers(mut r: Vec<f64>) -> Vec<f64> {
 
 /// A vech-packed (column-major lower-triangular) covariance block as its
 /// standard deviations and its correlation matrix (column-major), after the
-/// check the engine's `vech_stddev_corr` leaves to its caller.
-fn stddev_corr(vech: &[f64], group: usize) -> Result<(Vec<f64>, Vec<f64>), BindError> {
+/// check the engine's `vech_stddev_corr` leaves to its caller; `label` names
+/// the block in that check's refusal.
+fn stddev_corr(vech: &[f64], label: &str) -> Result<(Vec<f64>, Vec<f64>), BindError> {
     let m = vech.len();
     let q = ((1 + 8 * m).isqrt() - 1) / 2;
     if q * (q + 1) / 2 != m {
         return Err(BindError::invalid_argument(format!(
-            "fit.varcorr[{group}] is not a valid vech (length {m})"
+            "{label} is not a valid vech (length {m})"
         )));
     }
     let (sd, corr) = orchestrate::vech_stddev_corr(vech);
     // Symmetric, so its rows laid end to end are its columns.
     Ok((sd, corr.concat()))
+}
+
+/// `stddev_corr`: block `group` (from 0) of a fit's `varcorr`, `vech`, as its
+/// `stddev` and its correlation matrix `corr`. The refusal of an invalid
+/// vech names the block as the port indexes it.
+pub(crate) fn stddev_corr_call(inp: &mut Inputs) -> Result<Value, BindError> {
+    let vech = inp.vec("vech")?;
+    let group = inp.usize("group")?;
+    let label = match inp.port() {
+        Port::Python => format!("varcorr[{group}]"),
+        Port::R => format!("varcorr[[{}]]", group + 1),
+    };
+    let (sd, corr) = stddev_corr(&vech, &label)?;
+    let q = sd.len();
+    Ok(Value::Record(
+        Record::new().with("stddev", Value::Vec(sd)).with(
+            "corr",
+            Value::Mat {
+                nrow: q,
+                ncol: q,
+                data: corr,
+            },
+        ),
+    ))
+}
+
+/// AIC, BIC, deviance (`-2 * loglik`) and residual df (`nobs - df`) of a fit
+/// with log-likelihood `loglik` and `df` parameters. BIC is NaN at `nobs` 0,
+/// and the residual df NaN at `df` 0, where the parameters are not counted (a
+/// fit without estimates).
+fn criteria(loglik: f64, df: usize, nobs: usize) -> (f64, f64, f64, Value) {
+    let bic = if nobs == 0 {
+        f64::NAN
+    } else {
+        -2.0 * loglik + df as f64 * (nobs as f64).ln()
+    };
+    let df_resid = if df == 0 {
+        Value::F64(f64::NAN)
+    } else {
+        Value::I64(nobs as i64 - df as i64)
+    };
+    (
+        -2.0 * loglik + 2.0 * df as f64,
+        bic,
+        -2.0 * loglik,
+        df_resid,
+    )
+}
+
+/// `criteria`: `AIC`, `BIC`, `deviance` and `df.resid` of a fit's `loglik`,
+/// `df` and `nobs`, as the summary's criterion row gives them.
+pub(crate) fn criteria_call(inp: &mut Inputs) -> Result<Value, BindError> {
+    let (aic, bic, deviance, df_resid) =
+        criteria(inp.f64("loglik")?, inp.usize("df")?, inp.usize("nobs")?);
+    Ok(Value::Record(
+        Record::new()
+            .with("AIC", Value::F64(aic))
+            .with("BIC", Value::F64(bic))
+            .with("deviance", Value::F64(deviance))
+            .with("df.resid", df_resid),
+    ))
 }
 
 fn method_line(family: &str, mixed: bool, reml: bool, nagq: usize) -> String {
@@ -275,8 +339,10 @@ fn opt_f64(x: Option<f64>) -> Value {
 /// `dispersion_held`, `rss`, `r_squared`, `adj_r_squared`, `warnings`,
 /// `weight_power`, `weight_power_estimated`, the groupings) are optional:
 /// such a fit summarizes as the table its version printed, at power 1.
+/// Without `y` or `fitted`, `scaled_residuals` is `Null`: a caller that does
+/// not read it need not send the rows.
 pub(crate) fn summary(inp: &mut Inputs) -> Result<Value, BindError> {
-    let need_refit = inp.bool("need_refit")?;
+    let need_refit = inp.opt_bool("need_refit")?.unwrap_or(false);
     let sizes = match inp.opt_record("effect_sizes")? {
         Some(mut e) => [
             e.opt_f64("marginal")?,
@@ -313,9 +379,10 @@ pub(crate) fn summary(inp: &mut Inputs) -> Result<Value, BindError> {
     // still print.
     let re_groups = read_re_groups(&mut fit)?;
     let mixed = !re_groups.is_empty();
-    let df_method = fit
-        .opt_string("df_method")?
-        .unwrap_or_else(|| "none".to_owned());
+    let df_method = match fit.opt_string("df_method")? {
+        Some(m) => DfMethod::parse(&m)?,
+        None => DfMethod::NoDf,
+    };
     let per_row = |fit: &mut Inputs, name: &str| -> Result<Vec<f64>, BindError> {
         let v = fit.vec(name)?;
         if v.len() == p {
@@ -331,18 +398,23 @@ pub(crate) fn summary(inp: &mut Inputs) -> Result<Value, BindError> {
     // t (with the fit's p) where the fit has a df, Wald z on the normal
     // elsewhere; a df column only for the Satterthwaite and robust df, which
     // differ per row.
-    let per_row_df = matches!(
-        df_method.as_str(),
-        "satterthwaite" | "pustejovsky_tipton" | "bell_mccaffrey"
-    );
-    let t_test = per_row_df || df_method == "residual";
+    let per_row_df = df_method.per_row_df();
+    let t_test = df_method.tests_with_t();
     let statistic: Vec<f64> = beta.iter().zip(&se).map(|(b, s)| b / s).collect();
     let p_value = if t_test {
         per_row(&mut fit, "coef_p")?
     } else {
+        // An infinite z (a zero SE beside a nonzero estimate) has no
+        // meaningful p-value: NaN, where the normal tail would give 0.
         statistic
             .iter()
-            .map(|z| libm::erfc(z.abs() / SQRT_2))
+            .map(|z| {
+                if z.is_infinite() {
+                    f64::NAN
+                } else {
+                    libm::erfc(z.abs() / SQRT_2)
+                }
+            })
             .collect()
     };
     let coef_df = if per_row_df {
@@ -356,7 +428,7 @@ pub(crate) fn summary(inp: &mut Inputs) -> Result<Value, BindError> {
     // its contrast df does. A robust OLS fit (Bell-McCaffrey) keeps n - p: its
     // σ̂ is rss / (n - p) as on the model SE, also at an estimated weight power,
     // which `df` counts instead.
-    let residual_df = if !matches!(df_method.as_str(), "residual" | "bell_mccaffrey") {
+    let residual_df = if !df_method.residual_df() {
         Value::Null
     } else if beta.iter().all(|b| b.is_nan()) {
         Value::F64(f64::NAN)
@@ -367,43 +439,34 @@ pub(crate) fn summary(inp: &mut Inputs) -> Result<Value, BindError> {
     let criterion = if reml {
         Record::new().with("REML criterion at convergence", Value::F64(-2.0 * loglik))
     } else {
-        let bic = if nobs == 0 {
-            f64::NAN
-        } else {
-            -2.0 * loglik + df as f64 * (nobs as f64).ln()
-        };
+        let (aic, bic, deviance, df_resid) = criteria(loglik, df, nobs);
         Record::new()
-            .with("AIC", Value::F64(-2.0 * loglik + 2.0 * df as f64))
+            .with("AIC", Value::F64(aic))
             .with("BIC", Value::F64(bic))
             .with("logLik", Value::F64(loglik))
-            .with("deviance", Value::F64(-2.0 * loglik))
-            // `df` is 0 where it is not counted (a fit without estimates).
-            .with(
-                "df.resid",
-                if df == 0 {
-                    Value::F64(f64::NAN)
-                } else {
-                    Value::I64(nobs as i64 - df as i64)
-                },
-            )
+            .with("deviance", Value::F64(deviance))
+            .with("df.resid", df_resid)
     };
 
-    let y = fit.vec("y")?;
-    let fitted = fit.vec("fitted")?;
+    let y = fit.opt_vec("y")?;
+    let fitted = fit.opt_vec("fitted")?;
     let weights = fit.opt_vec("weights")?;
     let power = fit.opt_f64("weight_power")?.unwrap_or(1.0);
     let estimated = fit.opt_bool("weight_power_estimated")?.unwrap_or(false);
-    let scaled = if fitted.len() == y.len() && !fitted.iter().any(|v| v.is_nan()) {
-        Value::Vec(five_numbers(pearson(
-            &family,
-            &y,
-            &fitted,
-            weights.as_deref(),
-            dispersion,
-            power,
-        )?))
-    } else {
-        Value::Null
+    let scaled = match (y, fitted) {
+        (Some(y), Some(fitted))
+            if fitted.len() == y.len() && !fitted.iter().any(|v| v.is_nan()) =>
+        {
+            Value::Vec(five_numbers(pearson(
+                &family,
+                &y,
+                &fitted,
+                weights.as_deref(),
+                dispersion,
+                power,
+            )?))
+        }
+        _ => Value::Null,
     };
 
     let term_index = match fit.value("re_term_index") {
@@ -423,7 +486,7 @@ pub(crate) fn summary(inp: &mut Inputs) -> Result<Value, BindError> {
     };
     let mut random_effects = Vec::with_capacity(estimated_blocks.len());
     for (g, vech) in estimated_blocks.iter().enumerate() {
-        let (sd, corr) = stddev_corr(vech, g)?;
+        let (sd, corr) = stddev_corr(vech, &format!("fit.varcorr[{g}]"))?;
         let (group, terms) = re_groups.get(g).cloned().unwrap_or_default();
         let q = sd.len();
         random_effects.push(Value::Record(
@@ -482,9 +545,16 @@ pub(crate) fn summary(inp: &mut Inputs) -> Result<Value, BindError> {
     let held = fit.has("dispersion_held");
     let nan_or = |fit: &mut Inputs, name: &str| fit.opt_f64(name).map(|x| x.unwrap_or(f64::NAN));
     let rss = nan_or(&mut fit, "rss")?;
+    // The residual standard error of a Gaussian fit with a residual df.
+    let sigma = match residual_df {
+        _ if family != "gaussian" => Value::Null,
+        Value::Null => Value::Null,
+        Value::I64(rdf) if rdf > 0 => Value::F64((rss / rdf as f64).sqrt()),
+        _ => Value::F64(f64::NAN),
+    };
     let r_squared = nan_or(&mut fit, "r_squared")?;
     let adj_r_squared = nan_or(&mut fit, "adj_r_squared")?;
-    let robust_note = robust_footnote(&df_method, re_groups.first().map(|g| g.0.as_str()));
+    let robust_note = robust_footnote(df_method, re_groups.first().map(|g| g.0.as_str()));
     let power_lines = weight_power_lines(power, estimated, robust_note.is_some(), reml);
     let warnings = match fit.value("warnings") {
         Value::Null => Value::List(Vec::new()),
@@ -523,6 +593,7 @@ pub(crate) fn summary(inp: &mut Inputs) -> Result<Value, BindError> {
             .with("test", text(if t_test { "t" } else { "z" }))
             .with("p_value", Value::Vec(mask(p_value, &aliased)))
             .with("residual_df", residual_df)
+            .with("sigma", sigma)
             .with("rss", Value::F64(rss))
             .with("r_squared", Value::F64(r_squared))
             .with("adj_r_squared", Value::F64(adj_r_squared))
@@ -544,7 +615,12 @@ pub(crate) fn summary(inp: &mut Inputs) -> Result<Value, BindError> {
             .with(
                 "footnote",
                 robust_note.map_or_else(
-                    || opt_text((df_method == "satterthwaite").then_some(SATTERTHWAITE_FOOTNOTE)),
+                    || {
+                        opt_text(
+                            (df_method == DfMethod::Satterthwaite)
+                                .then_some(SATTERTHWAITE_FOOTNOTE),
+                        )
+                    },
                     Value::Str,
                 ),
             )

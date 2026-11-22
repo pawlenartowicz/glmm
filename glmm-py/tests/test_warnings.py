@@ -24,12 +24,11 @@ MIXED_PAIRS = {"x": _X, "g": _G_PAIRS, "y": [y + _OFF[g] for y, g in zip(_Y, _G_
 # (dispersion=, nagq=, both inapplicable on a Gaussian model). Its declared but
 # empty group level ("g_mid", between two used ones) is dropped and raises
 # nothing. Five groups, eight rows each, with a random slope on z, whose values
-# sit far from zero. The fit adds two cautions of its own: y has no random slope, so
+# sit far from zero. The fit adds one caution of its own: y has no random slope, so
 # the slope's variance comes out at zero, and glmm compares standard
 # deviations on its internally standardized design, where that is a singular
-# fit (on the raw design z's distance from zero hid it); and y is exact in z
-# and g, so the residual variance goes to zero and the intercept's theta ends
-# on the upper limit of its search.
+# fit (on the raw design z's distance from zero hid it). y is exact in z and
+# g, so the residual variance goes to zero.
 _PARITY_Z_SCALE = 1.0e4
 _PARITY_N_GROUPS = 5
 _PARITY_PER_GROUP = 8
@@ -324,8 +323,7 @@ def test_too_few_rows_end_to_end():
 def test_port_parity_sequence_adds_three_more_kinds():
     # Same PARITY fixture and call in glmm-r/tests/testthat/test-warnings.R —
     # change together. argument_ignored fires twice, from two different
-    # arguments, plus the fit's own singular and satterthwaite_curvature
-    # cautions.
+    # arguments, plus the fit's own singular caution.
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         m = glmm.fit(PARITY, "y ~ z + (1 + z | g)", dispersion=2.0, nagq=3)
@@ -334,8 +332,6 @@ def test_port_parity_sequence_adds_three_more_kinds():
         ("note", "argument_ignored", "Argument ignored"),
         ("note", "argument_ignored", "Argument ignored"),
         ("caution", "singular", "Singular fit"),
-        # Added by the rescale retry (loglik 311.47 to 550.45): a Hessian direction drops as flat.
-        ("caution", "satterthwaite_curvature", "Satterthwaite df uncertain"),
     ]
 
 

@@ -707,6 +707,40 @@ fn pairwise_options_are_checked_in_bind() {
     );
 }
 
+/// A stored pairwise table whose `adjust` or `ratio_kind` is not one
+/// `pairwise` writes is refused by name.
+#[test]
+fn a_stored_pairwise_tables_adjust_and_ratio_are_checked_in_bind() {
+    let intervals = |adjust: &str, ratio: Value| {
+        let one = Value::Vec(vec![0.5]);
+        let table = rec(vec![
+            ("estimate", one.clone()),
+            ("se", one.clone()),
+            ("df", one.clone()),
+            ("p_value", one),
+            ("adjust", text(adjust)),
+            ("levels", Value::I64(2)),
+            ("ratio_kind", ratio),
+        ]);
+        call(
+            Port::Python,
+            "pairwise_confint",
+            rec(vec![
+                ("table", Value::Record(table)),
+                ("level", Value::F64(0.95)),
+            ]),
+        )
+    };
+    assert_eq!(
+        refused(intervals("sidak", Value::Null)),
+        r#"adjust must be "holm", "bonferroni", "tukey" or "none", got "sidak""#
+    );
+    assert_eq!(
+        refused(intervals("none", text("rr"))),
+        r#"ratio must be "odds_ratio" or "ratio", got "rr""#
+    );
+}
+
 #[test]
 fn a_one_sided_formula_gets_the_parser_text() {
     let want = "formula syntax error: the formula has no response; write it as y ~ x";
@@ -1089,4 +1123,131 @@ fn an_unseen_level_is_found_row_by_row_then_grouping_by_grouping() {
         refusal(Port::R, &rows),
         (shown("Subject", 3, "allow.new.levels = TRUE"), Some(3))
     );
+}
+
+/// Every field name of `v` and of the records nested in it.
+fn field_names(v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::Record(r) => {
+            for (k, inner) in r.clone().into_fields() {
+                field_names(&inner, out);
+                out.push(k);
+            }
+        }
+        Value::List(items) => items.iter().for_each(|i| field_names(i, out)),
+        _ => {}
+    }
+}
+
+/// Every name in `glmm_bind::fields` is an argument the registry declares or
+/// a field of the record its call returns, so a rename on either side fails
+/// here.
+#[test]
+fn every_binding_field_name_is_an_argument_or_a_record_field() {
+    use glmm_bind::fields;
+    let arguments: Vec<&str> = glmm_bind::registry()
+        .iter()
+        .flat_map(|f| f.params.iter().map(|p| p.name))
+        .collect();
+    for name in fields::COLUMN_MAPS.iter().chain([&fields::PY_INT64_ARG]) {
+        assert!(arguments.contains(name), "{name} is no argument");
+    }
+
+    let top = |v: &Value| match v {
+        Value::Record(r) => r
+            .clone()
+            .into_fields()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect(),
+        other => panic!("not a record: {other:?}"),
+    };
+    let all = |v: &Value| {
+        let mut out = Vec::new();
+        field_names(v, &mut out);
+        out
+    };
+    let lmm = fit(
+        Port::R,
+        "y ~ Days + (1 | Subject)",
+        reaction(),
+        "gaussian",
+        vec![],
+    )
+    .unwrap();
+    let robust = fit(
+        Port::R,
+        "y ~ Days",
+        reaction(),
+        "gaussian",
+        vec![
+            ("weights", Value::Vec(vec![1.0; 180])),
+            ("se_type", text("robust")),
+        ],
+    )
+    .unwrap();
+    let days = sleepstudy().1;
+    let separated: Vec<f64> = days.iter().map(|&d| f64::from(u8::from(d > 4.0))).collect();
+    let noted = fit(Port::R, "y ~ Days", separated, "binomial", vec![]).unwrap();
+    let compared = compare(
+        Port::Python,
+        "y ~ Days + (1 | Subject)",
+        "y ~ Days + (Days | Subject)",
+        vec![],
+    )
+    .unwrap();
+    let predicted = predict(Port::Python, vec![("se", Value::Bool(true))]).unwrap();
+    let matrix = call(
+        Port::Python,
+        "model_matrix",
+        rec(vec![
+            ("formula", text("y ~ Days")),
+            ("numeric", Value::Record(numeric(reaction()))),
+            ("factors", Value::Record(Record::new())),
+            ("n_rows", Value::I64(180)),
+            ("row_base", Value::I64(0)),
+        ]),
+    )
+    .unwrap();
+    let column = |elements: Value| {
+        call(
+            Port::Python,
+            "plain_column",
+            rec(vec![("elements", elements)]),
+        )
+        .unwrap()
+    };
+    let plain = [
+        top(&column(Value::Vec(vec![1.0, 2.0]))),
+        top(&column(Value::StrVec(vec!["a".into(), "b".into()]))),
+    ]
+    .concat();
+
+    for &(name, want) in fields::PY_BYTES {
+        let have: Vec<String> = match name {
+            "fit" => top(&lmm),
+            "predict" => top(&predicted),
+            "model_matrix" => top(&matrix),
+            "plain_column" => plain.clone(),
+            other => panic!("no record checked for {other}"),
+        };
+        for f in want {
+            assert!(have.iter().any(|h| h == f), "{name} returns no {f}");
+        }
+    }
+    for &(nested, want) in fields::PY_NESTED_BYTES {
+        let outer = if nested == "robust" {
+            &robust
+        } else {
+            &compared
+        };
+        let inner = field(outer, nested);
+        for f in want {
+            assert!(top(inner).iter().any(|h| h == f), "{nested} has no {f}");
+        }
+    }
+    let fit_fields = [all(&lmm), all(&robust), all(&noted)].concat();
+    for f in fields::R_INDEX_FIELDS.iter().chain(fields::R_INT_FIELDS) {
+        assert!(fit_fields.iter().any(|h| h == f), "no fit record has {f}");
+    }
 }

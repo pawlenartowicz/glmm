@@ -102,7 +102,7 @@ build_family <- function(cell) {
     binomial = link %||% "logit",
     poisson  = "log",
     gamma    = link %||% "log",
-    inversegaussian = if (identical(link, "inverse_squared")) "1/mu^2" else (link %||% "log"),
+    inversegaussian = r_link(link %||% "log"),
     stop("unsupported family: ", fam)
   )
   switch(fam,

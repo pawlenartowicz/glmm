@@ -14,9 +14,13 @@
 //! cannot make, because it only ever fits through the frontend: that the
 //! frontend agrees with the hand-built spec.
 
+#[cfg(feature = "orchestrate")]
+use glmm::formula::anova::TermTest;
 use glmm::formula::{lower, Column, Table};
 #[cfg(feature = "orchestrate")]
 use glmm::orchestrate::run_fit;
+#[cfg(feature = "orchestrate")]
+use glmm::BinomialLink;
 use glmm::{
     Family, Fit, FitOptions, GroupIds, Grouping, GroupingRelation, ModelSpec, Note, ReStructure,
 };
@@ -487,6 +491,7 @@ fn cbind_response_equals_proportion_plus_weights() {
     assert_eq!(lo_c.weights, lo_w.weights);
     let a = glmm::fit(&lo_c.data(), lo_c.spec(), &FitOptions::default()).unwrap();
     let b = glmm::fit(&lo_w.data(), lo_w.spec(), &FitOptions::default()).unwrap();
+    assert_eq!(a.se().len(), 4);
     assert_same_fit(&a, &b, "cbind");
 }
 
@@ -511,18 +516,6 @@ fn logit() -> Family {
     Family::Binomial {
         link: glmm::BinomialLink::Logit,
     }
-}
-
-/// A default-options fit reports the SEs of every coefficient through the
-/// formula door.
-#[test]
-fn default_options_report_every_se_through_the_formula_door() {
-    let table = cbpp();
-    let f = "cbind(incidence, failures) ~ period + (1 | herd)";
-    let model = glmm::formula::fit(f, &table, logit(), &FitOptions::default()).unwrap();
-    let se = model.fit().se();
-    assert_eq!(se.len(), 4);
-    assert!(se.iter().all(|s| s.is_finite()), "{se:?}");
 }
 
 /// A nested child id is `parent·W + within`, `W` the widest parent's child
@@ -635,49 +628,6 @@ fn formula_fit_returns_unsupported_for_nagq_on_a_crossed_glmm() {
         ),
         "{:?}",
         got.err()
-    );
-}
-
-#[test]
-fn cbind_rejects_zero_trials_and_non_binomial() {
-    let table = Table {
-        columns: vec![
-            ("s".into(), Column::Numeric(vec![1.0, 0.0, 2.0])),
-            ("f".into(), Column::Numeric(vec![1.0, 0.0, 1.0])),
-            ("x".into(), Column::Numeric(vec![0.1, 0.2, 0.3])),
-        ],
-        n: 3,
-    };
-    let fam = Family::Binomial {
-        link: glmm::BinomialLink::Logit,
-    };
-    let err = match lower("cbind(s, f) ~ x", &table, fam) {
-        Ok(_) => panic!("expected the zero-trials row to be rejected"),
-        Err(e) => e.to_string(),
-    };
-    assert!(err.contains("row 1"), "{err}");
-    let err = match lower("cbind(s, f) ~ x", &table, Family::Gaussian) {
-        Ok(_) => panic!("expected a non-binomial cbind() response to be rejected"),
-        Err(e) => e.to_string(),
-    };
-    assert!(err.contains("binomial"), "{err}");
-    // A negative count passes the positive-sum check (-2 + 10 = 8) and would
-    // lower to a proportion outside [0, 1]; it must be its own rejection.
-    let table = Table {
-        columns: vec![
-            ("s".into(), Column::Numeric(vec![1.0, -2.0, 2.0])),
-            ("f".into(), Column::Numeric(vec![1.0, 10.0, 1.0])),
-            ("x".into(), Column::Numeric(vec![0.1, 0.2, 0.3])),
-        ],
-        n: 3,
-    };
-    let err = match lower("cbind(s, f) ~ x", &table, fam) {
-        Ok(_) => panic!("expected the negative-count row to be rejected"),
-        Err(e) => e.to_string(),
-    };
-    assert!(
-        err.contains("non-negative") && err.contains("row 1"),
-        "{err}"
     );
 }
 
@@ -1291,13 +1241,6 @@ fn formula_door_shares_the_identification_check() {
 #[test]
 fn re_groups_align_with_varcorr_blocks() {
     // Pinned from glmm; validated by the `penicillin_lmm` oracle cell.
-    // Re-pinned 2026-10-02 with the per-search BOBYQA start radii (LMM blind
-    // start 0.5): the search takes another path to the same optimum, plate sd
-    // 1.2e-7 and sample sd 1.9e-7 relative, REML criterion 1.5e-12 lower, no
-    // converged, singular or pinned flag changed. Moved by round-off when the
-    // response got one units step (shift and scale): plate sd 2.5e-7 and
-    // sample sd 2.3e-7 relative, REML criterion 2.2e-11 higher, no flag
-    // changed.
     const PLATE_SD: f64 = 0.8467043253286997;
     const SAMPLE_SD: f64 = 1.9315583874608409;
 
@@ -1499,20 +1442,18 @@ fn run_fit_returns_lowered_response_and_nobs() {
         "cbind(s, f) ~ x",
         numeric,
         factor,
-        "binomial",
-        "logit",
-        "hessian",
-        1,
+        Family::Binomial {
+            link: BinomialLink::Logit,
+        },
+        {
+            let mut o = FitOptions::default();
+            o.condvar = true;
+            o
+        },
         None,
         None,
         None,
-        None,
-        true,
-        true,
-        None,
-        "Wald",
-        None,
-        None,
+        TermTest::Wald,
     )
     .unwrap();
     assert_eq!(r.nobs, 6);
@@ -1582,13 +1523,7 @@ mod reml_rule {
 
     /// `run_fit` on `table`'s columns with Hessian SEs, Laplace and the
     /// Satterthwaite pass on.
-    fn run(
-        formula: &str,
-        table: &Table,
-        family: &str,
-        link: &str,
-        reml: Option<bool>,
-    ) -> FitResult {
+    fn run(formula: &str, table: &Table, family: Family, reml: Option<bool>) -> FitResult {
         let (mut numeric, mut factors) = (HashMap::new(), HashMap::new());
         for (name, col) in &table.columns {
             match col {
@@ -1601,18 +1536,33 @@ mod reml_rule {
             }
         }
         run_fit(
-            formula, numeric, factors, family, link, "hessian", 1, None, None, None, None, true,
-            true, reml, "Wald", None, None,
+            formula,
+            numeric,
+            factors,
+            family,
+            {
+                let mut o = FitOptions::default();
+                o.condvar = true;
+                o.reml = reml;
+                o
+            },
+            None,
+            None,
+            None,
+            TermTest::Wald,
         )
         .unwrap_or_else(|e| panic!("{formula}, reml {reml:?}: {e}"))
     }
 
     fn gaussian(formula: &str, reml: Option<bool>) -> FitResult {
-        run(formula, &sleepstudy(), "gaussian", "identity", reml)
+        run(formula, &sleepstudy(), Family::Gaussian, reml)
     }
 
     fn binomial(formula: &str, reml: Option<bool>) -> FitResult {
-        run(formula, &cbpp(), "binomial", "logit", reml)
+        let family = Family::Binomial {
+            link: BinomialLink::Logit,
+        };
+        run(formula, &cbpp(), family, reml)
     }
 
     /// `glmm::fit` on the lowered formula with `FitOptions::reml` set.
@@ -1654,7 +1604,7 @@ mod reml_rule {
             .chain(vectors.into_iter().flatten())
             .chain(r.vcov.iter().flatten())
             .chain(r.varcorr.iter().flatten())
-            .chain(r.ranef_blocks.iter().flat_map(|b| &b.3))
+            .chain(r.ranef_blocks.iter().flat_map(|b| &b.values))
             .chain(r.weights.iter().flatten())
             .chain(r.notes.iter().map(|n| &n.pivot))
             .copied()
@@ -1823,7 +1773,7 @@ mod reml_rule {
             .collect();
         assert_eq!(bits(&r.coef_p), bits(&coef_p));
         assert!(r.rss.is_nan());
-        assert_eq!(r.df_method, "satterthwaite");
+        assert_eq!(r.df_method.as_str(), "satterthwaite");
         assert!(r
             .coef_df
             .iter()
@@ -1867,20 +1817,17 @@ mod weight_power_readers {
             "Reaction ~ Days",
             numeric,
             HashMap::new(),
-            "gaussian",
-            "identity",
-            "hessian",
-            1,
-            None,
+            Family::Gaussian,
+            {
+                let mut o = FitOptions::default();
+                o.condvar = true;
+                o.weight_power = power;
+                o
+            },
             Some(w),
             None,
             None,
-            true,
-            true,
-            None,
-            "Wald",
-            power,
-            None,
+            TermTest::Wald,
         )
         .unwrap()
     }
@@ -1921,14 +1868,16 @@ mod weight_power_readers {
                 "Reaction ~ Days",
                 numeric.clone(),
                 HashMap::new(),
-                "gaussian",
-                "identity",
-                1,
+                Family::Gaussian,
+                {
+                    let mut o = FitOptions::default();
+                    o.condvar = true;
+                    o.weight_power = power;
+                    o
+                },
                 Some(w),
                 None,
                 None,
-                None,
-                power,
                 None,
             )
             .unwrap()
@@ -1941,8 +1890,7 @@ mod weight_power_readers {
                 "Reaction ~ Days",
                 numeric.clone(),
                 HashMap::new(),
-                "gaussian",
-                "identity",
+                Family::Gaussian,
                 Some(w),
                 None,
                 &parts(r),
@@ -2114,7 +2062,7 @@ mod robust_fits {
     const ONE: Option<WeightPower> = Some(WeightPower::Fixed(1.0));
     const ROBUST: Option<SeType> = Some(SeType::Robust);
 
-    /// G4 through the formula door: claimed weights with a named robust SE
+    /// Through the formula door: claimed weights with a named robust SE
     /// are HC2 with the Bell–McCaffrey df, to 1e-10 of clubSandwich on `lm`.
     #[test]
     fn claimed_weights_with_robust_se_are_hc2() {
@@ -2262,7 +2210,9 @@ mod robust_fits {
 
     /// An aliased column on a robust fit is NaN in `se`,
     /// `vcov` and `coef_df`, the rest equals the fit without it, a contrast
-    /// on it gets `AliasedColumn`, and the robust notes name caller columns.
+    /// on it gets `AliasedColumn`, the robust notes name caller columns, and
+    /// a contrast that leaves it out equals the fit without the column, in
+    /// caller indices.
     #[test]
     fn an_aliased_column_on_a_robust_fit() {
         let path = format!(
@@ -2329,12 +2279,20 @@ mod robust_fits {
         );
         assert!(cols.contains(&3));
         assert_eq!(df, want_df);
+        let a = aliased.fit().contrast_t(&[0.0, 1.0, 0.0, -1.0]).unwrap();
+        let b = plain.fit().contrast_t(&[0.0, 1.0, -1.0]).unwrap();
+        assert!(rel(a.estimate, b.estimate) < 1e-12);
+        assert!(rel(a.se, b.se) < 1e-12 && rel(a.df, b.df) < 1e-12);
+        assert_eq!(a.notes, b.notes);
     }
 
     /// The robust notes: a named robust SE on a random slope, a coefficient
-    /// only one cluster informs, and a df below 4.
+    /// only one cluster informs, and a df below 4. A contrast that one
+    /// cluster alone identifies gets a NaN SE and df with
+    /// `RobustUnidentified`; one that leaves that column out keeps its CR2.
     #[test]
     fn robust_notes() {
+        use glmm::inference::contrast::ContrastNote;
         let kinds = |fit: &Fit| -> Vec<String> {
             fit.diagnostics()
                 .notes
@@ -2386,6 +2344,17 @@ mod robust_fits {
             .notes
             .iter()
             .any(|n| matches!(n, Note::RobustSeUnidentified { columns } if columns == &[2])));
+        for l in [[0.0, 0.0, 1.0], [0.0, 1.0, 1.0]] {
+            let t = fit.contrast_t(&l).unwrap();
+            assert!(t.estimate.is_finite());
+            assert!(t.se.is_nan() && t.df.is_nan() && t.p_value.is_nan());
+            assert_eq!(t.notes, vec![ContrastNote::RobustUnidentified]);
+            let f = fit.contrast_f(&l, 1).unwrap();
+            assert!(f.f.is_nan() && f.den_df.is_nan());
+            assert_eq!(f.notes, vec![ContrastNote::RobustUnidentified]);
+        }
+        let t = fit.contrast_t(&[0.0, 1.0, 0.0]).unwrap();
+        assert_eq!((t.se, t.df), (fit.se()[1], fit.coef_df()[1]));
     }
 
     fn unit(p: usize, j: usize) -> Vec<f64> {
@@ -2473,44 +2442,6 @@ mod robust_fits {
         );
     }
 
-    /// A contrast one cluster alone identifies gets a NaN SE and df with
-    /// `RobustUnidentified`; one that leaves that column out keeps its CR2.
-    #[test]
-    fn a_contrast_one_cluster_identifies() {
-        use glmm::inference::contrast::ContrastNote;
-        let path = format!(
-            "{}/../validation/data/inference/cr2_ri_s10.csv",
-            env!("CARGO_MANIFEST_DIR")
-        );
-        let d = rows(&std::fs::read_to_string(&path).unwrap());
-        let first: Vec<f64> = d.iter().map(|r| f64::from(r[0] == "1")).collect();
-        let table = Table {
-            columns: vec![
-                ("g".to_string(), factor(&d, 0)),
-                ("x1".to_string(), numeric(&d, 1)),
-                ("one".to_string(), Column::Numeric(first)),
-                ("y".to_string(), numeric(&d, 6)),
-            ],
-            n: d.len(),
-        };
-        let formula = "y ~ 1 + x1 + one + (1 | g)";
-        let mut lo = lower(formula, &table, Family::Gaussian).unwrap();
-        lo.weights = Some(nums(&d, 4));
-        let m = glmm::formula::fit_lowered(formula, lo, &opts(ONE, ROBUST, None)).unwrap();
-        let fit = m.fit();
-        for l in [[0.0, 0.0, 1.0], [0.0, 1.0, 1.0]] {
-            let t = fit.contrast_t(&l).unwrap();
-            assert!(t.estimate.is_finite());
-            assert!(t.se.is_nan() && t.df.is_nan() && t.p_value.is_nan());
-            assert_eq!(t.notes, vec![ContrastNote::RobustUnidentified]);
-            let f = fit.contrast_f(&l, 1).unwrap();
-            assert!(f.f.is_nan() && f.den_df.is_nan());
-            assert_eq!(f.notes, vec![ContrastNote::RobustUnidentified]);
-        }
-        let t = fit.contrast_t(&[0.0, 1.0, 0.0]).unwrap();
-        assert_eq!((t.se, t.df), (fit.se()[1], fit.coef_df()[1]));
-    }
-
     /// For contrasts, with `se_for` naming x1 only, a robust
     /// contrast on x1 equals the full fit's, and one touching another
     /// column is NaN.
@@ -2530,44 +2461,6 @@ mod robust_fits {
                 "{l:?}"
             );
         }
-    }
-
-    /// For contrasts, on a robust fit with an aliased column,
-    /// a contrast that leaves it out equals the fit without the column, in
-    /// caller indices.
-    #[test]
-    fn a_contrast_beside_an_aliased_column_on_a_robust_fit() {
-        let path = format!(
-            "{}/../validation/data/inference/cr2_ri_s10.csv",
-            env!("CARGO_MANIFEST_DIR")
-        );
-        let d = rows(&std::fs::read_to_string(&path).unwrap());
-        let x1 = nums(&d, 1);
-        let table = Table {
-            columns: vec![
-                ("g".to_string(), factor(&d, 0)),
-                ("x1".to_string(), Column::Numeric(x1.clone())),
-                (
-                    "x1b".to_string(),
-                    Column::Numeric(x1.iter().map(|v| 2.0 * v).collect()),
-                ),
-                ("x2".to_string(), numeric(&d, 2)),
-                ("y".to_string(), numeric(&d, 6)),
-            ],
-            n: d.len(),
-        };
-        let fit_of = |formula: &str| {
-            let mut lo = lower(formula, &table, Family::Gaussian).unwrap();
-            lo.weights = Some(nums(&d, 4));
-            glmm::formula::fit_lowered(formula, lo, &opts(ONE, ROBUST, None)).unwrap()
-        };
-        let plain = fit_of(RI);
-        let aliased = fit_of("y ~ 1 + x1 + x1b + x2 + (1 | g)");
-        let a = aliased.fit().contrast_t(&[0.0, 1.0, 0.0, -1.0]).unwrap();
-        let b = plain.fit().contrast_t(&[0.0, 1.0, -1.0]).unwrap();
-        assert!(rel(a.estimate, b.estimate) < 1e-12);
-        assert!(rel(a.se, b.se) < 1e-12 && rel(a.df, b.df) < 1e-12);
-        assert_eq!(a.notes, b.notes);
     }
 }
 
@@ -2644,4 +2537,45 @@ fn duplicate_column_names_and_factor_levels_are_refused() {
         e.contains(r#"factor column "x" has the level "a" more than once"#),
         "{e}"
     );
+}
+
+/// A formula and a lowering that do not match are refused by `fit_lowered`,
+/// and a lowering whose `x` was edited after `lower` is fitted but refused by
+/// `predict` and the per-term tables, which read the original design.
+#[test]
+fn fit_lowered_refuses_a_formula_its_lowering_does_not_match() {
+    use glmm::formula::{fit_lowered, Error};
+    use glmm::FitError;
+    let n = 12;
+    let x: Vec<f64> = (0..n).map(|i| i as f64).collect();
+    let z: Vec<f64> = (0..n).map(|i| ((i * 7) % 5) as f64).collect();
+    let y: Vec<f64> = (0..n)
+        .map(|i| 1.0 + 0.5 * i as f64 + ((i * 3) % 4) as f64)
+        .collect();
+    let g: Vec<String> = (0..n).map(|i| format!("g{}", i % 3)).collect();
+    let table = Table {
+        columns: vec![
+            ("y".into(), Column::Numeric(y)),
+            ("x".into(), Column::Numeric(x)),
+            ("z".into(), Column::Numeric(z)),
+            ("g".into(), Column::factor_from_labels(&g)),
+        ],
+        n,
+    };
+    let opts = FitOptions::default();
+    let refused = |formula: &str, lowered_from: &str| {
+        let lo = lower(lowered_from, &table, Family::Gaussian).unwrap();
+        matches!(
+            fit_lowered(formula, lo, &opts),
+            Err(Error::Fit(FitError::Shape(_)))
+        )
+    };
+    assert!(refused("y ~ z", "y ~ x"));
+    assert!(refused("y ~ 0 + x", "y ~ x"));
+    assert!(refused("y ~ x + (1 | g)", "y ~ x"));
+    assert!(refused("y ~ x", "y ~ x + (1 | g)"));
+    assert!(refused("y ~ x + (1 + x | g)", "y ~ x + (1 | g)"));
+    assert!(refused("y ~ x + (x || g)", "y ~ x + (1 + x | g)"));
+    assert!(refused("y ~ x + (0 + x | g)", "y ~ x + (1 + x | g)"));
+    assert!(!refused("y ~ x", "y ~ x"));
 }

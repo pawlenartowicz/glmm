@@ -291,7 +291,7 @@ string. Its test follows lmerTest, `lm` and `glm`:
 - **Gaussian mixed model:** `Estimate`, `Std. Error`, `df`, `t value`,
   `Pr(>|t|)`, with each coefficient's Satterthwaite df (`coef_df`) and the
   kernel's p (`coef_p`), on lmerTest's layout. The footer says "t tests use
-  Satterthwaite degrees of freedom (finite-difference θ-Hessian).".
+  Satterthwaite degrees of freedom.".
 - **OLS, and gamma or inverse-gaussian GLMs with φ estimated:** `t value` and
   `Pr(>|t|)` on the residual df `n − p`, printed in the footer (on OLS as
   `summary.lm`'s "Residual standard error: … on n − p degrees of freedom" and

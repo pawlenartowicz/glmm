@@ -7,7 +7,7 @@
 //! or whose `|ζ|` falls is undetermined.
 
 use super::profile::{
-    bound, path, ProfileError, ProfileInterval, ProfileIntervals, ProfileParam, Toward,
+    bound, path, ProfileError, ProfileInterval, ProfileIntervals, ProfileNote, ProfileParam, Toward,
 };
 use crate::fit::common_tests::{lcg, nested_slope_case, nested_slope_spellings};
 use crate::fit::fit_keep_workspace;
@@ -321,7 +321,7 @@ fn the_sparse_route_profiles_too() {
                 .extra(Grouping::crossed().slopes([1])),
         ),
     };
-    let (_, fws) = fit_keep_workspace(&case.data(), &case.model, None, &ml_opts());
+    let (_, fws) = fit_keep_workspace(&case.data(), &case.model, None, &ml_opts()).unwrap();
     assert!(
         fws.is_lmm_sparse(),
         "a slope on an extra grouping routes sparse"
@@ -588,7 +588,7 @@ fn a_held_minimum_below_the_fit_is_a_better_optimum() {
         other => panic!("expected BetterOptimum, got {other:?}"),
     }
     // ζ = 0 at every point never brackets the root.
-    assert!(side(5e-7).expect("within the tolerance").is_nan());
+    assert!(side(5e-7).expect("within the tolerance").0.is_nan());
 }
 
 /// Once the path has moved, each point also runs a held search from the
@@ -641,7 +641,7 @@ fn a_side_that_never_brackets_is_nan() {
         calls += 1;
         Ok(Some(1.0 - 1.0 / (1.0 + v)))
     };
-    let b = bound(Z95, 0.0, Toward::Expand(&|t| t), zeta).expect("no error");
+    let (b, _) = bound(Z95, 0.0, Toward::Expand(&|t| t), zeta).expect("no error");
     assert!(b.is_nan() && calls > 1, "{b} after {calls} points");
 }
 
@@ -662,7 +662,9 @@ fn a_falling_zeta_makes_the_side_nan() {
                 1.0 - drop + 2.0 * (v - 2.0)
             }))
         };
-        bound(Z95, 0.0, Toward::Expand(&|t| t), zeta).expect("no error")
+        bound(Z95, 0.0, Toward::Expand(&|t| t), zeta)
+            .expect("no error")
+            .0
     };
     assert!(side(2e-5).is_nan());
     let kept = side(5e-7);
@@ -670,6 +672,35 @@ fn a_falling_zeta_makes_the_side_nan() {
         (kept - (2.0 + (Z95 - 1.0 + 5e-7) / 2.0)).abs() < 1e-6,
         "the root past the small fall, got {kept}"
     );
+}
+
+/// Each way a side ends undetermined carries its own note, and a side with a
+/// bound carries none: a held search that fails, `|ζ|` falling between
+/// expansion steps, `|ζ|` that never reaches the quantile, and a root search
+/// on a jump that never reaches `|ζ| = z`.
+#[test]
+fn an_undetermined_side_says_why() {
+    let expand = |zeta: &dyn Fn(f64) -> Option<f64>| {
+        bound(Z95, 0.0, Toward::Expand(&|t| t), |v| Ok(zeta(v))).expect("no error")
+    };
+    let undetermined = |zeta: &dyn Fn(f64) -> Option<f64>, note: ProfileNote| {
+        let (b, got) = expand(zeta);
+        assert!(b.is_nan(), "{note:?}: {b}");
+        assert_eq!(got, Some(note));
+    };
+    undetermined(&|_| None, ProfileNote::HeldSearchFailed);
+    undetermined(
+        &|v| Some(if v <= 1.0 { 1.0 } else { 0.5 }),
+        ProfileNote::ZetaFell,
+    );
+    undetermined(&|v| Some(1.0 - 1.0 / (1.0 + v)), ProfileNote::NoBracket);
+    let jump = |v: f64| Ok(Some(if v < 0.5 { 0.0 } else { 2.0 * Z95 }));
+    let (b, got) = bound(Z95, 0.0, Toward::Limit(1.0), jump).expect("no error");
+    assert!(b.is_nan(), "{b}");
+    assert_eq!(got, Some(ProfileNote::RootNotFound));
+    let (b, got) = expand(&|v| Some(v));
+    assert!((b - Z95).abs() <= 1e-6, "{b}");
+    assert_eq!(got, None);
 }
 
 /// Profile intervals refit on the weights as given, so a fit
@@ -746,6 +777,7 @@ fn grouping_reorder_keeps_each_interval_on_its_grouping() {
     let ba_case = case(GroupIds::new(b).extra(a));
     let reordered = |c: &Case| {
         !fit_keep_workspace(&c.data(), &c.model, None, &ml_opts())
+            .unwrap()
             .1
             .perm()
             .is_identity()

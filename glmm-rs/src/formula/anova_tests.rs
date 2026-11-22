@@ -82,15 +82,16 @@ fn dyestuff() -> (Model, Model) {
     )
 }
 
-/// The exact test of the larger side's design summary, called directly.
-fn direct(ols: &Model, full: &Model) -> crate::inference::rlrt::RlrtResult {
+/// The exact test of the larger side's design summary on `statistic`,
+/// called directly.
+fn direct(full: &Model, statistic: f64) -> crate::inference::rlrt::RlrtResult {
     let (counts, s, c) = full.design_summary.as_ref().expect("inside the envelope");
     let cfg = RlrtConfig {
         nsim: OPTS.nsim,
         seed: OPTS.seed,
         parallel_inner: false,
     };
-    exact_rlrt(counts, s, c, full.loglik, ols.loglik, false, &cfg).unwrap()
+    exact_rlrt(counts, s, c, statistic, &cfg).unwrap()
 }
 
 /// Six groups of eight rows, a numeric `x1` and a response with a group
@@ -125,7 +126,6 @@ fn the_envelope_pair_gets_the_exact_test_as_exact_rlrt_computes_it() {
     let (ols, full) = dyestuff();
     let c = compare_stored(&ols, &full, &OPTS).unwrap();
     let t = lr(&c);
-    let r = direct(&ols, &full);
     assert_eq!(
         t.reference,
         Reference::ExactRlrt {
@@ -135,11 +135,42 @@ fn the_envelope_pair_gets_the_exact_test_as_exact_rlrt_computes_it() {
     );
     let own = (2.0 * (full.loglik - ols.loglik)).max(0.0);
     assert!(own > 0.0);
+    let r = direct(&full, own);
     assert_eq!(t.statistic.to_bits(), own.to_bits());
     assert_eq!(t.statistic.to_bits(), r.statistic.to_bits());
     assert_eq!(t.p_value.to_bits(), r.p_value.to_bits());
     assert_eq!(t.df, 1);
     assert!(t.notes.is_empty());
+}
+
+/// The exact branch with a larger fit that is not pinned and a raw statistic
+/// just below zero: the floor gives `+0.0` and `p = 1` with no draws, and
+/// below round-off the floor's note.
+#[test]
+fn a_raw_statistic_just_below_zero_on_the_exact_test_is_floored() {
+    let (ols, mut full) = dyestuff();
+    assert!(full.varcorr[0][0] > 0.0, "not pinned");
+    for below in [1e-9, 1e-4] {
+        full.loglik = ols.loglik - below;
+        let raw = 2.0 * (full.loglik - ols.loglik);
+        assert!(raw < 0.0);
+        let t = lr(&compare_stored(&ols, &full, &OPTS).unwrap()).clone();
+        assert_eq!(t.statistic.to_bits(), 0.0f64.to_bits(), "{below}");
+        assert_eq!(t.p_value.to_bits(), 1.0f64.to_bits(), "{below}");
+        assert_eq!(
+            t.reference,
+            Reference::ExactRlrt {
+                nsim: 0,
+                seed: OPTS.seed
+            }
+        );
+        let notes = if below > 1e-6 {
+            vec![LrNote::NegativeStatistic { raw }]
+        } else {
+            vec![]
+        };
+        assert_eq!(t.notes, notes, "{below}");
+    }
 }
 
 #[test]
@@ -822,15 +853,18 @@ fn rows_of(t: &super::anova::TermTable) -> String {
     format!("{:?}", (t.ss_type, &t.fixed, &t.notes, &t.coef_names))
 }
 
-/// On fits whose rows are χ² tests, a Poisson model with random effects
-/// aside (a binomial GLM and GLMM, a Poisson GLM, a negative binomial GLMM,
-/// and a Gamma GLM with φ held, whose family has F rows when φ is
-/// estimated, a binomial GLMM with trials and a Gamma GLMM), the default test
-/// gives the rows an explicit Wald gives, bit for bit, with the reason of
-/// each: the family with random effects, or none. An explicit Wald is
-/// accepted, and every row is of the table's test.
+/// The default test gives each fit the rows of its family's explicit test,
+/// bit for bit, with the reason of the choice; the explicit test is accepted
+/// and every row is of the table's test. χ² Wald rows: a binomial GLM and
+/// GLMM, a binomial GLMM with trials, a Gamma GLM with φ held (its family has
+/// F rows when φ is estimated), a Poisson GLM, a negative binomial GLMM and a
+/// Gamma GLMM, each at both types, with the reason the family with random
+/// effects, or none. Likelihood-ratio rows: a Poisson model with random
+/// effects, whatever its size or shape: 15 clusters with prior weights, two
+/// groupings of 10 and 4 levels, a 3-df term, and 118 broods with a 2-df
+/// term.
 #[test]
-fn the_default_test_gives_the_wald_rows_bit_for_bit() {
+fn the_default_test_gives_its_familys_explicit_rows() {
     let bern = csv_table(
         include_str!("../../../validation/data/simulated/sim_factorial_bern.csv"),
         &["subj", "g", "h"],
@@ -868,6 +902,18 @@ fn the_default_test_gives_the_wald_rows_bit_for_bit() {
         include_str!("../../../validation/data/empirical/cbpp.csv"),
         &["herd", "period"],
     );
+    let weighted = csv_table(
+        include_str!("../../../validation/data/simulated/glmm_poisson.csv"),
+        &["g"],
+    );
+    let two = csv_table(
+        include_str!("../../../validation/data/simulated/sim_poisson_nested.csv"),
+        &["g1", "g2"],
+    );
+    let grouse = csv_table(
+        include_str!("../../../validation/data/empirical/grouseticks.csv"),
+        &["YEAR", "BROOD"],
+    );
     let column = |t: &Table, name: &str| match &t.columns.iter().find(|(n, _)| n == name).unwrap().1
     {
         Column::Numeric(v) => v.clone(),
@@ -880,67 +926,143 @@ fn the_default_test_gives_the_wald_rows_bit_for_bit() {
         .collect();
     cbpp.columns
         .push(("failures".into(), Column::Numeric(failures)));
+    let w = column(&weighted, "w");
     let fixed = ChoiceReason::NoRandomEffects;
+    let both = [SsType::Type3, SsType::Type2];
+    let wald = (TermTest::Wald, LinearKind::ChiSquared);
+    let lrt = (TermTest::Lrt, LinearKind::LikelihoodRatio);
+    let held = Dispersion::Fixed(0.5);
+    let dflt = Dispersion::Default;
+    // (formula, data, family, dispersion, prior weights, SS types, explicit
+    // test and its kind, reason, term count of the Wald rows)
     let cases = [
         (
             "y ~ g * h + x",
             &bern,
             binomial,
-            Dispersion::Default,
-            4,
+            dflt.clone(),
+            None,
+            &both[..],
+            wald,
             fixed,
+            Some(4),
         ),
         (
             "y ~ g * h + x + (1 | subj)",
             &bern,
             binomial,
-            Dispersion::Default,
-            4,
+            dflt.clone(),
+            None,
+            &both[..],
+            wald,
             ChoiceReason::BinomialMixed,
+            Some(4),
         ),
         (
             "cbind(incidence, failures) ~ period + (1 | herd)",
             &cbpp,
             binomial,
-            Dispersion::Default,
-            1,
+            dflt.clone(),
+            None,
+            &both[..],
+            wald,
             ChoiceReason::BinomialMixed,
+            Some(1),
         ),
         (
             "y ~ x + grp",
             &gamma_data,
             gamma,
-            Dispersion::Fixed(0.5),
-            2,
+            held,
+            None,
+            &both[..],
+            wald,
             fixed,
+            Some(2),
         ),
         (
             "y ~ x * grp",
             &counts,
             poisson,
-            Dispersion::Default,
-            3,
+            dflt.clone(),
+            None,
+            &both[..],
+            wald,
             fixed,
+            Some(3),
         ),
         (
             "y ~ x + grp + (1 | cluster)",
             &nb_data,
             nb,
-            Dispersion::Default,
-            2,
+            dflt.clone(),
+            None,
+            &both[..],
+            wald,
             ChoiceReason::NegativeBinomialMixed,
+            Some(2),
         ),
         (
             "y ~ x + grp + (1 | cluster)",
             &gamma_clustered,
             gamma,
-            Dispersion::Default,
-            2,
+            dflt.clone(),
+            None,
+            &both[..],
+            wald,
             ChoiceReason::OtherMixed,
+            Some(2),
+        ),
+        (
+            "y ~ x + (1 | g)",
+            &weighted,
+            poisson,
+            dflt.clone(),
+            Some(w),
+            &both[..],
+            lrt,
+            ChoiceReason::PoissonMixed,
+            None,
+        ),
+        (
+            "y ~ x + (1 | g1) + (1 | g2)",
+            &two,
+            poisson,
+            dflt.clone(),
+            None,
+            &both[..1],
+            lrt,
+            ChoiceReason::PoissonMixed,
+            None,
+        ),
+        (
+            "y ~ x + g2 + (1 | g1)",
+            &two,
+            poisson,
+            dflt.clone(),
+            None,
+            &both[..1],
+            lrt,
+            ChoiceReason::PoissonMixed,
+            None,
+        ),
+        (
+            "TICKS ~ YEAR + cHEIGHT + (1 | BROOD)",
+            &grouse,
+            poisson,
+            dflt,
+            None,
+            &both[..1],
+            lrt,
+            ChoiceReason::PoissonMixed,
+            None,
         ),
     ];
-    for (formula, table, family, dispersion, terms, reason) in cases {
-        let lo = lower(formula, table, family).unwrap();
+    for (formula, table, family, dispersion, weights, types, (test, kind), reason, terms) in cases {
+        let mut lo = lower(formula, table, family).unwrap();
+        if weights.is_some() {
+            lo.weights = weights;
+        }
         let fit_opts = FitOptions {
             dispersion,
             ..FitOptions::default()
@@ -958,34 +1080,34 @@ fn the_default_test_gives_the_wald_rows_bit_for_bit() {
             &fit_opts,
         );
         assert!(fit.converged(), "{formula}");
-        for ss_type in [SsType::Type3, SsType::Type2] {
-            let auto = term_tests_cached(
-                &lo,
-                &fit_opts,
-                &fit,
-                &term_options(ss_type, TermTest::Auto),
-                &mut RefitCache::default(),
-            )
-            .unwrap();
-            let wald = term_tests_cached(
-                &lo,
-                &fit_opts,
-                &fit,
-                &term_options(ss_type, TermTest::Wald),
-                &mut RefitCache::default(),
-            )
-            .unwrap();
+        for &ss_type in types {
+            let table_of = |test| {
+                term_tests_cached(
+                    &lo,
+                    &fit_opts,
+                    &fit,
+                    &term_options(ss_type, test),
+                    &mut RefitCache::default(),
+                )
+                .unwrap()
+            };
+            let (auto, explicit) = (table_of(TermTest::Auto), table_of(test));
             let at = format!("{formula}, {ss_type:?}");
-            assert_eq!(auto.choice.test, LinearKind::ChiSquared, "{at}");
-            assert_eq!(auto.choice.reason, reason, "{at}");
-            assert_eq!(wald.choice.test, LinearKind::ChiSquared, "{at}");
-            assert_eq!(wald.choice.reason, ChoiceReason::Requested, "{at}");
-            assert_eq!(auto.fixed.len(), terms, "{at}");
-            assert!(
-                wald.fixed.iter().all(|r| r.test.kind == wald.choice.test),
+            assert_eq!(
+                (auto.choice.test, auto.choice.reason),
+                (kind, reason),
                 "{at}"
             );
-            assert_eq!(rows_of(&auto), rows_of(&wald), "{at}");
+            assert_eq!(
+                (explicit.choice.test, explicit.choice.reason),
+                (kind, ChoiceReason::Requested),
+                "{at}"
+            );
+            if let Some(terms) = terms {
+                assert_eq!(auto.fixed.len(), terms, "{at}");
+            }
+            assert!(auto.fixed.iter().all(|r| r.test.kind == kind), "{at}");
+            assert_eq!(rows_of(&auto), rows_of(&explicit), "{at}");
         }
     }
 }
@@ -1056,121 +1178,6 @@ fn large_poisson_counts_note_the_likelihood_ratio_rows() {
             );
         }
     }
-}
-
-/// The default test gives a Poisson model with random effects the
-/// likelihood-ratio rows, those of an explicit likelihood-ratio test bit for
-/// bit, whatever its size or shape: 15 clusters with prior weights, two
-/// groupings of 10 and 4 levels, a 3-df term, and 118 broods with a 2-df
-/// term. The same
-/// data without the random effect keeps the Wald rows.
-#[test]
-fn the_default_test_gives_a_poisson_glmm_the_likelihood_ratio_rows() {
-    let poisson = Family::Poisson {
-        link: PoissonLink::Log,
-    };
-    let weighted = csv_table(
-        include_str!("../../../validation/data/simulated/glmm_poisson.csv"),
-        &["g"],
-    );
-    let two = csv_table(
-        include_str!("../../../validation/data/simulated/sim_poisson_nested.csv"),
-        &["g1", "g2"],
-    );
-    let grouse = csv_table(
-        include_str!("../../../validation/data/empirical/grouseticks.csv"),
-        &["YEAR", "BROOD"],
-    );
-    let w = match &weighted.columns.iter().find(|(n, _)| n == "w").unwrap().1 {
-        Column::Numeric(v) => v.clone(),
-        _ => unreachable!("w is numeric"),
-    };
-    let both = [SsType::Type3, SsType::Type2];
-    let cases = [
-        ("y ~ x + (1 | g)", &weighted, Some(w), &both[..]),
-        ("y ~ x + (1 | g1) + (1 | g2)", &two, None, &both[..1]),
-        ("y ~ x + g2 + (1 | g1)", &two, None, &both[..1]),
-        (
-            "TICKS ~ YEAR + cHEIGHT + (1 | BROOD)",
-            &grouse,
-            None,
-            &both[..1],
-        ),
-    ];
-    for (formula, table, weights, types) in cases {
-        let mut lo = lower(formula, table, poisson).unwrap();
-        lo.weights = weights;
-        let fit = fit_warm_wo(
-            &lo.x,
-            &lo.y,
-            lo.n,
-            lo.p,
-            &lo.model,
-            &lo.ids,
-            None,
-            lo.weights.as_deref(),
-            lo.offset.as_deref(),
-            &FitOptions::default(),
-        );
-        assert!(fit.converged(), "{formula}");
-        for &ss_type in types {
-            let at = format!("{formula}, {ss_type:?}");
-            let auto = term_tests_cached(
-                &lo,
-                &FitOptions::default(),
-                &fit,
-                &term_options(ss_type, TermTest::Auto),
-                &mut RefitCache::default(),
-            )
-            .unwrap();
-            let lrt = term_tests_cached(
-                &lo,
-                &FitOptions::default(),
-                &fit,
-                &term_options(ss_type, TermTest::Lrt),
-                &mut RefitCache::default(),
-            )
-            .unwrap();
-            assert_eq!(
-                (auto.choice.test, auto.choice.reason),
-                (LinearKind::LikelihoodRatio, ChoiceReason::PoissonMixed),
-                "{at}"
-            );
-            assert_eq!(lrt.choice.reason, ChoiceReason::Requested, "{at}");
-            assert!(
-                auto.fixed
-                    .iter()
-                    .all(|r| r.test.kind == LinearKind::LikelihoodRatio),
-                "{at}"
-            );
-            assert_eq!(rows_of(&auto), rows_of(&lrt), "{at}");
-        }
-    }
-    let lo = lower("y ~ x", &weighted, poisson).unwrap();
-    let fit = fit_warm_wo(
-        &lo.x,
-        &lo.y,
-        lo.n,
-        lo.p,
-        &lo.model,
-        &lo.ids,
-        None,
-        lo.weights.as_deref(),
-        lo.offset.as_deref(),
-        &FitOptions::default(),
-    );
-    let t = term_tests_cached(
-        &lo,
-        &FitOptions::default(),
-        &fit,
-        &TermTestOptions::default(),
-        &mut RefitCache::default(),
-    )
-    .unwrap();
-    assert_eq!(
-        (t.choice.test, t.choice.reason),
-        (LinearKind::ChiSquared, ChoiceReason::NoRandomEffects)
-    );
 }
 
 /// On fits whose rows are F tests (the Gaussian LMM, OLS, a Gamma GLM with φ
@@ -1961,59 +1968,17 @@ fn type_ii_lrt_rows_do_not_read_the_covariance() {
     assert_eq!(format!("{:?}", got.fixed), format!("{:?}", want.fixed));
 }
 
-/// The Type III rows whose reduced design mixes columns (`g` and `h`, whose
-/// `L` reaches into `g:h`), and the column drops (`x`, `g:h`), against afex's
-/// `mixed(type = 3, method = "LRT")` on the same model, frozen in
-/// `anova_lrt3_glmm_sim_factorial_bern`: the statistic within the
-/// registry's `lrt` band, the df exactly.
+/// Type III likelihood-ratio rows against afex's `mixed(type = 3, method =
+/// "LRT")` on the same model, frozen per row: the statistic within the
+/// registry's `lrt` band, the df exactly. On the binomial GLMM of
+/// `sim_factorial_bern` with `(1 | subj)`, the rows whose reduced design
+/// mixes columns (`g` and `h`, whose `L` reaches into `g:h`) and the column
+/// drops (`x`, `g:h`); on `y ~ x + (1 + x | g)`, binomial logit on
+/// `sim_binomial_slope1`, the row `x`, whose refit moves the slope on `x` to
+/// a random-effect-only column, also a likelihood-ratio row with no notes.
 #[test]
-fn type_iii_lrt_rows_match_afex_on_the_frozen_glmm() {
-    let json = crate::inference::test_refs::load(
-        crate::inference::test_refs::Kind::Anova,
-        "anova_lrt3_glmm_sim_factorial_bern",
-    );
-    let case = factorial_case("binomial GLMM", " + (1 | subj)", 1, "");
-    let (lo, fit) = case.fit(&case.formula);
-    let t = term_tests_cached(
-        &lo,
-        &case.options(),
-        &fit,
-        &term_options(SsType::Type3, TermTest::Lrt),
-        &mut RefitCache::default(),
-    )
-    .unwrap();
-    let rows = json["rows"].as_array().expect("frozen rows");
-    assert_eq!(rows.len(), t.fixed.len());
-    for (row, want) in t.fixed.iter().zip(rows) {
-        assert_eq!(row.label, want["term"].as_str().unwrap());
-        assert_eq!(
-            row.test.num_df,
-            want["df"].as_f64().unwrap(),
-            "{}",
-            row.label
-        );
-        let gap = (row.test.statistic - want["statistic"].as_f64().unwrap()).abs();
-        assert!(
-            gap <= LRT_ABS,
-            "{}: {:?} off afex by {gap:e}",
-            row.label,
-            row.test
-        );
-    }
-}
-
-/// The Type III likelihood-ratio row `x` of `y ~ x + (1 + x | g)`, binomial
-/// logit on `sim_binomial_slope1`, whose refit moves the slope on `x` to a
-/// random-effect-only column, against afex's `mixed(type = 3, method =
-/// "LRT")`, frozen in `anova_lrt3_glmm_sim_binomial_slope1`: the statistic
-/// within the registry's `lrt` band, the df exactly.
-#[test]
-fn type_iii_lrt_rows_with_a_random_slope_match_afex() {
-    let json = crate::inference::test_refs::load(
-        crate::inference::test_refs::Kind::Anova,
-        "anova_lrt3_glmm_sim_binomial_slope1",
-    );
-    let case = LrtCase {
+fn type_iii_lrt_rows_match_afex() {
+    let slope = LrtCase {
         name: "binomial slope GLMM",
         table: csv_table(
             include_str!("../../../validation/data/simulated/sim_binomial_slope1.csv"),
@@ -2029,34 +1994,41 @@ fn type_iii_lrt_rows_with_a_random_slope_match_afex() {
         type2: Vec::new(),
         type3: Vec::new(),
     };
-    let (lo, fit) = case.fit(&case.formula);
-    let t = term_tests_cached(
-        &lo,
-        &case.options(),
-        &fit,
-        &term_options(SsType::Type3, TermTest::Lrt),
-        &mut RefitCache::default(),
-    )
-    .unwrap();
-    let rows = json["rows"].as_array().expect("frozen rows");
-    assert_eq!(rows.len(), t.fixed.len());
-    for (row, want) in t.fixed.iter().zip(rows) {
-        assert_eq!(row.label, want["term"].as_str().unwrap());
-        assert_eq!(row.test.kind, LinearKind::LikelihoodRatio, "{}", row.label);
-        assert!(row.test.notes.is_empty(), "{}: {:?}", row.label, row.test);
-        assert_eq!(
-            row.test.num_df,
-            want["df"].as_f64().unwrap(),
-            "{}",
-            row.label
-        );
-        let gap = (row.test.statistic - want["statistic"].as_f64().unwrap()).abs();
-        assert!(
-            gap <= LRT_ABS,
-            "{}: {:?} off afex by {gap:e}",
-            row.label,
-            row.test
-        );
+    // (frozen reference, case, rows checked as likelihood-ratio rows without
+    // notes)
+    let cases = [
+        (
+            "anova_lrt3_glmm_sim_factorial_bern",
+            factorial_case("binomial GLMM", " + (1 | subj)", 1, ""),
+            false,
+        ),
+        ("anova_lrt3_glmm_sim_binomial_slope1", slope, true),
+    ];
+    for (reference, case, plain_lr) in cases {
+        let json =
+            crate::inference::test_refs::load(crate::inference::test_refs::Kind::Anova, reference);
+        let (lo, fit) = case.fit(&case.formula);
+        let t = term_tests_cached(
+            &lo,
+            &case.options(),
+            &fit,
+            &term_options(SsType::Type3, TermTest::Lrt),
+            &mut RefitCache::default(),
+        )
+        .unwrap();
+        let rows = json["rows"].as_array().expect("frozen rows");
+        assert_eq!(rows.len(), t.fixed.len(), "{reference}");
+        for (row, want) in t.fixed.iter().zip(rows) {
+            let at = format!("{reference}: {}", row.label);
+            assert_eq!(row.label, want["term"].as_str().unwrap(), "{reference}");
+            if plain_lr {
+                assert_eq!(row.test.kind, LinearKind::LikelihoodRatio, "{at}");
+                assert!(row.test.notes.is_empty(), "{at}: {:?}", row.test);
+            }
+            assert_eq!(row.test.num_df, want["df"].as_f64().unwrap(), "{at}");
+            let gap = (row.test.statistic - want["statistic"].as_f64().unwrap()).abs();
+            assert!(gap <= LRT_ABS, "{at}: {:?} off afex by {gap:e}", row.test);
+        }
     }
 }
 
@@ -2374,89 +2346,93 @@ fn a_side_that_did_not_converge_refuses() {
     );
 }
 
+/// A pair `y ~ x` / `y ~ x + z` whose second side differs in its data is
+/// refused, the message naming the difference: one row fewer, the response
+/// one ULP up at one row, the weights, the offset, the family. All-ones
+/// weights are no weights and a zero offset no offset, so those still
+/// compare.
 #[test]
-fn different_row_counts_refuse() {
-    let m0 = model("y ~ x", None);
-    let mut m1 = model("y ~ x + z", None);
-    m1.nobs -= 1;
-    m1.y.pop();
-    let e = refusal(&m0, &m1);
-    assert_eq!(e, CompareError::DifferentRows { m0: 30, m1: 29 });
-    assert_eq!(
-        e.to_string(),
-        "the first model has 30 rows and the second has 29; a comparison needs both fits \
-         on the same rows. Fit both models to the same rows, dropping the rows with a \
-         missing value in any variable of either formula first."
-    );
-}
-
-#[test]
-fn a_response_differing_in_one_entry_refuses() {
-    let m0 = model("y ~ x", None);
-    let mut m1 = model("y ~ x + z", None);
-    m1.y[17] = f64::from_bits(m1.y[17].to_bits() + 1);
-    let e = refusal(&m0, &m1);
-    assert_eq!(e, CompareError::DifferentY);
-    assert_eq!(
-        e.to_string(),
-        "the two models have different responses y (the same row count, different \
-         values); a comparison needs both fits on the same data. Fit both models to the \
-         same data."
-    );
-}
-
-#[test]
-fn different_weights_refuse() {
-    let m0 = model("y ~ x", None);
-    let mut m1 = model("y ~ x + z", None);
-    let mut w = vec![1.0; 30];
-    // All-ones weights are no weights.
-    m1.weights = Some(w.clone());
-    assert!(cmp(&m0, &m1).is_ok());
-    w[4] = 2.0;
-    m1.weights = Some(w);
-    let e = refusal(&m0, &m1);
-    assert_eq!(e, CompareError::DifferentWeights);
-    assert_eq!(
-        e.to_string(),
-        "the two models were fitted with different weights; a comparison needs the same \
-         weights in both. Fit both models with the same weights."
-    );
-}
-
-#[test]
-fn different_offsets_refuse() {
-    let m0 = model("y ~ x", None);
-    let mut m1 = model("y ~ x + z", None);
-    let mut o = vec![0.0; 30];
-    m1.offset = Some(o.clone());
-    assert!(cmp(&m0, &m1).is_ok());
-    o[9] = 0.5;
-    m1.offset = Some(o);
-    let e = refusal(&m0, &m1);
-    assert_eq!(e, CompareError::DifferentOffset);
-    assert_eq!(
-        e.to_string(),
-        "the two models were fitted with different offsets; a comparison needs the same \
-         offset in both. Fit both models with the same offset."
-    );
-}
-
-#[test]
-fn a_different_family_or_link_refuses() {
-    let m0 = model("y ~ x", None);
-    let mut m1 = model("y ~ x + z", None);
-    m1.family = Family::Poisson {
-        link: PoissonLink::Log,
-    };
-    let e = refusal(&m0, &m1);
-    assert!(matches!(e, CompareError::DifferentFamily { .. }), "{e:?}");
-    assert_eq!(
-        e.to_string(),
-        "the first model was fitted as gaussian with identity link and the second as \
-         poisson with log link; a comparison needs the same family and link in both. Fit \
-         both models with the same family and link."
-    );
+fn a_side_differing_in_its_data_refuses() {
+    type Change = fn(&mut Model);
+    // (case, a change that must still compare, the refused change, error,
+    // message)
+    let cases: [(&str, Option<Change>, Change, CompareError, &str); 5] = [
+        (
+            "one row fewer",
+            None,
+            |m| {
+                m.nobs -= 1;
+                m.y.pop();
+            },
+            CompareError::DifferentRows { m0: 30, m1: 29 },
+            "the first model has 30 rows and the second has 29; a comparison needs both fits \
+             on the same rows. Fit both models to the same rows, dropping the rows with a \
+             missing value in any variable of either formula first.",
+        ),
+        (
+            "y[17] one ULP up",
+            None,
+            |m| m.y[17] = f64::from_bits(m.y[17].to_bits() + 1),
+            CompareError::DifferentY,
+            "the two models have different responses y (the same row count, different \
+             values); a comparison needs both fits on the same data. Fit both models to the \
+             same data.",
+        ),
+        (
+            "w[4] = 2",
+            Some(|m| m.weights = Some(vec![1.0; 30])),
+            |m| {
+                let mut w = vec![1.0; 30];
+                w[4] = 2.0;
+                m.weights = Some(w);
+            },
+            CompareError::DifferentWeights,
+            "the two models were fitted with different weights; a comparison needs the same \
+             weights in both. Fit both models with the same weights.",
+        ),
+        (
+            "o[9] = 0.5",
+            Some(|m| m.offset = Some(vec![0.0; 30])),
+            |m| {
+                let mut o = vec![0.0; 30];
+                o[9] = 0.5;
+                m.offset = Some(o);
+            },
+            CompareError::DifferentOffset,
+            "the two models were fitted with different offsets; a comparison needs the same \
+             offset in both. Fit both models with the same offset.",
+        ),
+        (
+            "Poisson",
+            None,
+            |m| {
+                m.family = Family::Poisson {
+                    link: PoissonLink::Log,
+                }
+            },
+            CompareError::DifferentFamily {
+                m0: Family::Gaussian,
+                m1: Family::Poisson {
+                    link: PoissonLink::Log,
+                },
+            },
+            "the first model was fitted as gaussian with identity link and the second as \
+             poisson with log link; a comparison needs the same family and link in both. Fit \
+             both models with the same family and link.",
+        ),
+    ];
+    for (case, neutral, change, want, text) in cases {
+        let m0 = model("y ~ x", None);
+        let mut m1 = model("y ~ x + z", None);
+        if let Some(neutral) = neutral {
+            neutral(&mut m1);
+            assert!(cmp(&m0, &m1).is_ok(), "{case}: the unchanged data");
+        }
+        change(&mut m1);
+        let e = refusal(&m0, &m1);
+        assert_eq!(e, want, "{case}");
+        assert_eq!(e.to_string(), text, "{case}");
+    }
 }
 
 #[test]

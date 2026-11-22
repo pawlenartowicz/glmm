@@ -1,12 +1,12 @@
-//! The text of every warning a fit raises: each kind's tier and title, the
-//! message of each kernel note, and the one severe warning of a fit that did
-//! not converge. Both ports raise these as given; each keeps only its own
-//! warning class per kind and words only `rows_dropped_na` (its own data
-//! preparation), `singular` and the predict notes.
+//! The text of every warning a fit or a prediction raises: each kind's tier
+//! and title, the message of each kernel note, a stored note's `detail`, and
+//! the one severe warning of a fit that did not converge. Both ports raise
+//! these as given; each keeps only its own warning class per kind and words
+//! only `rows_dropped_na` (its own data preparation).
 //! `documentation/warnings.md` documents the same table and text — change
 //! together.
 
-use glmm::orchestrate::NoteInfo;
+use glmm::orchestrate::{NoteInfo, StopReason, THETA_HI};
 
 use crate::error::BindError;
 use crate::inputs::Inputs;
@@ -231,6 +231,8 @@ pub(crate) struct FitText<'a> {
     pub converged: bool,
     pub nobs: usize,
     pub row_base: usize,
+    /// The fit's standard errors are robust (`se_type` `"robust"`).
+    pub robust: bool,
 }
 
 impl FitText<'_> {
@@ -323,22 +325,21 @@ fn note_message(n: &NoteInfo, columns: &[u32], cx: &FitText) -> Option<String> {
             "Grouping factor '{}' has only one level, so no variance between groups can be \
              estimated from it. Its random effect was dropped; the rest of the model was fitted \
              without it.",
-            n.detail
+            n.names[0]
         ),
-        // `detail` is the term as "<terms> | <grouping>" and `evals` its
-        // random-effect count; the rows are the fit's own.
+        // `evals` is the term's random-effect count; the rows are the fit's
+        // own.
         "few_rows_for_random_effects" => format!(
             "The term ({}) has {} random effects for {}, so its variance parameters probably \
              cannot be estimated from these data; lme4 stops on such a model by default. The \
              estimates are shown; read the variance components with care, or simplify the \
              random-effects structure.",
-            n.detail,
+            detail(n),
             n.evals,
             count(cx.nobs, "row")
         ),
-        // `detail` is "<first>, <second>": two grouping names.
         "repeated_grouping" => {
-            let (a, b) = n.detail.split_once(", ").unwrap_or((&n.detail, ""));
+            let (a, b) = (&n.names[0], &n.names[1]);
             format!(
                 "Grouping factors '{a}' and '{b}' put the rows into exactly the same groups and \
                  share a random effect, so the data cannot tell their variances apart. How the \
@@ -346,9 +347,8 @@ fn note_message(n: &NoteInfo, columns: &[u32], cx: &FitText) -> Option<String> {
                  model."
             )
         }
-        // `detail` is "<slope labels> | <grouping>".
         "slope_constant_within_levels" => {
-            let (labels, g) = n.detail.rsplit_once(" | ").unwrap_or((&n.detail, ""));
+            let (labels, g) = labels_and_grouping(&n.names);
             format!(
                 "The random slope on {labels} does not vary within any group of '{g}', so \
                  within each group it cannot be told apart from the random intercept. Its \
@@ -362,19 +362,20 @@ fn note_message(n: &NoteInfo, columns: &[u32], cx: &FitText) -> Option<String> {
              Any reported variance is a stopping point, not an estimate, and the fixed effects \
              depend on it. Consider dropping this grouping, or a model with a prior on the \
              variance.",
-            n.detail
+            n.names[0]
         ),
         "one_trial_per_level" => format!(
             "Every level of '{}' has one binary trial, so its variance is not identified: it \
              trades against the fixed effects. Drop this grouping, or aggregate rows.",
-            n.detail
+            n.names[0]
         ),
-        "variance_at_limit" => "A random-effect parameter reached the upper limit of the search \
-             (1000 on glmm's internal scale). On a Gaussian model this usually means the residual \
+        "variance_at_limit" => format!(
+            "A random-effect parameter reached the upper limit of the search ({THETA_HI} on \
+             glmm's internal scale). On a Gaussian model this usually means the residual \
              variance is estimated at or near zero; on other families the random-effect variance \
              has no finite estimate. The estimates are at that limit, not at an optimum. Check \
              for a response that the predictors and groups explain exactly."
-            .to_owned(),
+        ),
         // The upper limit (`lower` NaN) is a near-Poisson fit: stored, no warning.
         "nb_shape_at_limit" if n.lower.is_nan() => return None,
         "nb_shape_at_limit" => format!(
@@ -396,6 +397,10 @@ fn note_message(n: &NoteInfo, columns: &[u32], cx: &FitText) -> Option<String> {
              reported. Check for predictors that are copies or near-copies of each other.",
             cx.columns(columns)
         ),
+        "se_unavailable" if cx.robust => "Robust standard errors could not be formed: the \
+             residuals are all zero, or their pieces left f64's range. The estimates are usable; \
+             standard errors, p-values and confidence intervals are not reported."
+            .to_owned(),
         "se_unavailable" => "Standard errors could not be computed at the fit's end point: the \
              fixed effects carry too little separate information. The estimates are usable; \
              standard errors, p-values and confidence intervals are not reported. Check for \
@@ -424,7 +429,7 @@ fn note_message(n: &NoteInfo, columns: &[u32], cx: &FitText) -> Option<String> {
              whether this is the right family for the data.",
             count(n.evals as usize, "row")
         ),
-        "satterthwaite_curvature" => satterthwaite_message(&n.detail),
+        "satterthwaite_curvature" => satterthwaite_message(n),
         "weight_power_at_bound" => format!(
             "The fitted weight power, {}, is not a maximum: the log-likelihood rises, or stays \
              flat, toward the end of the search range [{}, {}]. This happens when at most as \
@@ -493,37 +498,28 @@ fn note_message(n: &NoteInfo, columns: &[u32], cx: &FitText) -> Option<String> {
     Some(s)
 }
 
-/// The `satterthwaite_curvature` message from the kernel's detail string,
-/// "dropped <n>, negative <n>, converged <bool>, nonfinite <bool>".
-fn satterthwaite_message(detail: &str) -> String {
-    let field = |name: &str| {
-        detail
-            .split(", ")
-            .find_map(|part| part.strip_prefix(name)?.strip_prefix(' '))
-            .unwrap_or("")
-    };
-    if field("nonfinite") == "true" {
+/// The `satterthwaite_curvature` message.
+fn satterthwaite_message(n: &NoteInfo) -> String {
+    if n.nonfinite {
         return "The Satterthwaite degrees of freedom could not be computed: the fit has no \
                 finite end point, or the deviance near it was not finite. Every coefficient is \
                 tested with z, and its confidence interval uses the normal distribution."
             .to_owned();
     }
-    let dropped: u64 = field("dropped").parse().unwrap_or(0);
-    let negative: u64 = field("negative").parse().unwrap_or(0);
     let mut parts = Vec::new();
-    if dropped > 0 {
+    if n.dropped > 0 {
         parts.push(format!(
             "the curvature of the deviance in the variance parameters has {}, left out",
-            count(dropped as usize, "flat direction")
+            count(n.dropped as usize, "flat direction")
         ));
     }
-    if negative > 0 {
+    if n.negative > 0 {
         parts.push(format!(
             "it has {}, so the fit may not be at a minimum",
-            count(negative as usize, "negative direction")
+            count(n.negative as usize, "negative direction")
         ));
     }
-    if field("converged") != "true" {
+    if !n.converged {
         parts.push(
             "the variance search stopped at its step limit, so they are computed at its last \
              point"
@@ -535,6 +531,81 @@ fn satterthwaite_message(detail: &str) -> String {
          intervals use them as computed.",
         parts.join("; ")
     )
+}
+
+/// `names` with its last entry, the grouping, apart: the labels before it
+/// joined by ", ".
+fn labels_and_grouping(names: &[String]) -> (String, &str) {
+    match names.split_last() {
+        Some((g, labels)) => (labels.join(", "), g),
+        None => (String::new(), ""),
+    }
+}
+
+/// A stored note's `detail`, the published text of its payload: the
+/// grouping name of a note on one grouping; `"<terms> | <grouping>"` for
+/// `few_rows_for_random_effects`; `"<first>, <second>"` for
+/// `repeated_grouping`; `"<slope label>, <slope label> | <grouping>"` for
+/// `slope_constant_within_levels`; `"dropped <n>, negative <n>, converged
+/// <bool>, nonfinite <bool>"` for `satterthwaite_curvature`; empty on every
+/// other kind.
+pub(crate) fn detail(n: &NoteInfo) -> String {
+    match n.kind {
+        "few_rows_for_random_effects" | "slope_constant_within_levels" => {
+            let (labels, g) = labels_and_grouping(&n.names);
+            format!("{labels} | {g}")
+        }
+        "satterthwaite_curvature" => format!(
+            "dropped {}, negative {}, converged {}, nonfinite {}",
+            n.dropped, n.negative, n.converged, n.nonfinite
+        ),
+        _ => n.names.join(", "),
+    }
+}
+
+/// The message of a predict note, its rows counted from `row_base` (0 from
+/// Python, 1 from R); `None` on a kind that is not one.
+pub(crate) fn predict_message(n: &NoteInfo, row_base: usize) -> Option<String> {
+    // The first ten rows, then how many more.
+    let shown = || {
+        let mut s = n
+            .rows
+            .iter()
+            .take(10)
+            .map(|&r| (r as usize + row_base).to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if n.rows.len() > 10 {
+            s.push_str(&format!(", and {} more", n.rows.len() - 10));
+        }
+        s
+    };
+    let one = n.rows.len() == 1;
+    Some(match n.kind {
+        "predict_se_model_based" => "The standard errors and intervals are model-based, not \
+             robust: their formula holds only with the model's covariance."
+            .to_owned(),
+        "new_grouping_levels" => {
+            let g = &n.names[0];
+            format!(
+                "{} of newdata {} a level of {g} the fit did not see (rows {}). Their random \
+                 effect for {g} is 0.",
+                count(n.rows.len(), "row"),
+                if one { "has" } else { "have" },
+                shown()
+            )
+        }
+        "rows_not_estimable" if one => format!(
+            "Row {} is not estimable from this rank-deficient fit, so its prediction is NaN.",
+            shown()
+        ),
+        "rows_not_estimable" => format!(
+            "Rows {} are not estimable from this rank-deficient fit, so their predictions are \
+             NaN.",
+            shown()
+        ),
+        _ => return None,
+    })
 }
 
 const INNER_STEPS: &str = "Some of its inner steps ran out of iterations.";
@@ -556,43 +627,70 @@ const DIVERGED_CONTINUOUS: &str = "The fit did not settle on an answer: the fitt
     reported. Check predictors with extreme values; with a link other than log, the log link is \
     usually more stable.";
 
+/// The message of the `singular` warning: lme4's advice, then the variance
+/// components the optimizer pinned at 0, as `"<term> in <group>"`, read off
+/// `pinned` (`FitResult::pinned`, one row per grouping of `re_groups`).
+/// Never rebuilt from `varcorr`: on a grouping with q >= 2 the pin fixes a
+/// diagonal of the Cholesky factor, while the reported stddev is
+/// `sqrt(offdiag^2 + diag^2)` and lands near 1e-9 rather than at 0. A
+/// singular fit can have nothing pinned (the negligible-stddev check is
+/// separate from the pin), and then the message has no Affected list.
+pub(crate) fn singular_message(
+    pinned: &[Vec<bool>],
+    re_groups: &[(String, Vec<String>)],
+) -> String {
+    let affected: Vec<String> = pinned
+        .iter()
+        .zip(re_groups)
+        .flat_map(|(flags, (group, terms))| {
+            flags
+                .iter()
+                .enumerate()
+                .filter(|(_, &p)| p)
+                .map(move |(i, _)| {
+                    let term = terms
+                        .get(i)
+                        .cloned()
+                        .unwrap_or_else(|| format!("component {i}"));
+                    format!("{term} in {group}")
+                })
+        })
+        .collect();
+    let mut message = "The random effects are too complex for the data: a variance is estimated \
+                       at or near zero, or a correlation at or near \u{2212}1 or 1. Consider \
+                       removing the affected random effect."
+        .to_owned();
+    if !affected.is_empty() {
+        message.push_str(&format!(" Affected: {}.", affected.join(", ")));
+    }
+    message
+}
+
 /// What [`failure`] reads off a fit that did not converge.
 pub(crate) struct Failed<'a> {
     pub family: &'a str,
     /// Whether the fitted model kept a random effect.
     pub mixed: bool,
     pub notes: &'a [NoteInfo],
-    pub beta: &'a [f64],
     pub aliased: &'a [bool],
-    pub deviance: f64,
     pub y: &'a [f64],
+    /// The kernel's stop reason (`FitResult::stop`).
+    pub stop: Option<StopReason>,
 }
 
 /// The one severe warning of a fit that did not converge, as `(kind,
-/// message)`. The kernel does not say which stopping rule fired, so the cause
-/// is read off what the fit reports, most specific first: no coefficient (on
-/// a mixed model, only when columns were dropped as aliased, which means
-/// every fixed-effect column is all zero, since the alias check never drops
-/// the first column that is not), too few rows (a one-row response is
-/// trivially constant, so this comes first), a constant response, a Gamma
-/// dispersion refused on an edge of its search range (the
-/// `dispersion_at_limit` note, which names the edge), then the model. A model with random effects whose fixed-effects-only GLM stopped on
-/// separation (the `separated` note) never ran its search; its coefficients
-/// are that GLM's last step, so it gets the GLM's message. Otherwise, with
-/// random effects, a finite deviance means the kernel reached an end point
-/// (the budget stop, reported at its best point), and finite estimated
-/// coefficients (aliased slots are NaN by contract) confirm it; anything else
-/// failed. The deviance is what decides a model with no fixed-effect column
-/// at all. A GLMM inner cap-out during the search is one extra sentence
-/// rather than a second warning.
+/// message)`, most specific first: no coefficient (on a mixed model, only
+/// when columns were dropped as aliased, which means every fixed-effect
+/// column is all zero, since the alias check never drops the first column
+/// that is not), too few rows (a one-row response is trivially constant, so
+/// this comes first), a constant response, a Gamma dispersion refused on an
+/// edge of its search range (the `dispersion_at_limit` note, which names the
+/// edge), then the stop reason the kernel recorded. A model with random
+/// effects whose fixed-effects-only GLM stopped on separation (the
+/// `separated` note) never ran its search; the kernel records that stop as
+/// the GLM's divergence, so it gets the GLM's message. A GLMM inner cap-out
+/// during the search is one extra sentence rather than a second warning.
 pub(crate) fn failure(f: &Failed) -> (&'static str, String) {
-    let estimated = || {
-        f.beta
-            .iter()
-            .zip(f.aliased)
-            .filter(|(_, &a)| !a)
-            .map(|(&b, _)| b)
-    };
     let n_est = f.aliased.iter().filter(|&&a| !a).count();
     if !f.mixed && n_est == 0 {
         return (
@@ -655,44 +753,41 @@ pub(crate) fn failure(f: &Failed) -> (&'static str, String) {
         };
         return ("dispersion_at_limit", message);
     }
-    let has = |kind: &str| f.notes.iter().any(|n| n.kind == kind);
-    if !f.mixed || has("separated") {
-        // A GLM whose first solve failed took no step: no coefficient at all.
-        if f.family == "gaussian" || (!f.mixed && estimated().all(f64::is_nan)) {
-            return (
-                "design_unsolvable",
-                "The predictors could not be separated numerically, so no estimates were \
-                 computed. Check for predictors that are copies or near-copies of each other."
-                    .to_owned(),
-            );
-        }
-        let message = match f.family {
-            "binomial" => DIVERGED_BINOMIAL.to_owned(),
-            "poisson" | "negativebinomial" => DIVERGED_COUNTS.to_owned(),
-            _ => DIVERGED_CONTINUOUS.to_owned(),
-        };
-        return ("glm_diverged", message);
-    }
-    let inner = if has("pirls_exhausted") {
+    let advice = "Try a simpler random-effects structure or check for nearly collinear predictors.";
+    let inner = if f.notes.iter().any(|n| n.kind == "pirls_exhausted") {
         format!(" {INNER_STEPS}")
     } else {
         String::new()
     };
-    let advice = "Try a simpler random-effects structure or check for nearly collinear predictors.";
-    if f.deviance.is_finite() && estimated().all(f64::is_finite) {
-        return (
+    match f.stop {
+        Some(StopReason::FirstSolveFailed) => (
+            "design_unsolvable",
+            "The predictors could not be separated numerically, so no estimates were \
+             computed. Check for predictors that are copies or near-copies of each other."
+                .to_owned(),
+        ),
+        Some(StopReason::IrlsDiverged) => {
+            let message = match f.family {
+                "binomial" => DIVERGED_BINOMIAL,
+                "poisson" | "negativebinomial" => DIVERGED_COUNTS,
+                _ => DIVERGED_CONTINUOUS,
+            };
+            ("glm_diverged", message.to_owned())
+        }
+        Some(StopReason::SearchBudget) => (
             "search_limit",
             format!(
                 "The search for the variance estimates reached its step limit before it \
                  settled.{inner} The estimates shown are the best point found; they are often \
                  close, but this is not checked. Do not use them until the fit converges. {advice}"
             ),
-        );
+        ),
+        // `None` only on a converged fit, which has no failure to word.
+        Some(StopReason::NoEndPoint) | None => (
+            "fit_failed",
+            format!("The fitting algorithm failed and returned no estimates.{inner} {advice}"),
+        ),
     }
-    (
-        "fit_failed",
-        format!("The fitting algorithm failed and returned no estimates.{inner} {advice}"),
-    )
 }
 
 #[cfg(test)]
@@ -736,7 +831,12 @@ mod tests {
             pivot: f64::NAN,
             evals: 0,
             final_eval: false,
-            detail: String::new(),
+            names: Vec::new(),
+            rows: Vec::new(),
+            dropped: 0,
+            negative: 0,
+            converged: false,
+            nonfinite: false,
             delta: f64::NAN,
             factor: f64::NAN,
             lower: f64::NAN,
@@ -747,11 +847,128 @@ mod tests {
         }
     }
 
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn stored_detail_keeps_its_published_format() {
+        let cases = [
+            (
+                NoteInfo {
+                    names: names(&["Subject"]),
+                    ..note("single_level_grouping_dropped")
+                },
+                "Subject",
+            ),
+            (
+                NoteInfo {
+                    names: names(&["1 + x", "g"]),
+                    evals: 6,
+                    ..note("few_rows_for_random_effects")
+                },
+                "1 + x | g",
+            ),
+            (
+                NoteInfo {
+                    names: names(&["g2"]),
+                    ..note("single_level_grouping")
+                },
+                "g2",
+            ),
+            (
+                NoteInfo {
+                    names: names(&["word", "g2"]),
+                    ..note("repeated_grouping")
+                },
+                "word, g2",
+            ),
+            (
+                NoteInfo {
+                    names: names(&["catB", "catC", "word"]),
+                    ..note("slope_constant_within_levels")
+                },
+                "catB, catC | word",
+            ),
+            (
+                NoteInfo {
+                    names: names(&["word"]),
+                    ..note("separated_by_grouping")
+                },
+                "word",
+            ),
+            (
+                NoteInfo {
+                    names: names(&["herd"]),
+                    ..note("one_trial_per_level")
+                },
+                "herd",
+            ),
+            (
+                NoteInfo {
+                    dropped: 1,
+                    negative: 2,
+                    nonfinite: true,
+                    ..note("satterthwaite_curvature")
+                },
+                "dropped 1, negative 2, converged false, nonfinite true",
+            ),
+            (
+                NoteInfo {
+                    columns: vec![1],
+                    pivot: 1e-9,
+                    ..note("ill_conditioned")
+                },
+                "",
+            ),
+        ];
+        for (n, want) in &cases {
+            assert_eq!(detail(n), *want, "{}", n.kind);
+        }
+    }
+
+    #[test]
+    fn predict_notes_count_rows_from_the_port_base() {
+        let new = NoteInfo {
+            names: names(&["plate"]),
+            rows: vec![0, 4],
+            ..note("new_grouping_levels")
+        };
+        assert_eq!(
+            predict_message(&new, 1).as_deref(),
+            Some(
+                "2 rows of newdata have a level of plate the fit did not see (rows 1, 5). Their \
+                 random effect for plate is 0."
+            )
+        );
+        let one = NoteInfo {
+            rows: vec![3],
+            ..note("rows_not_estimable")
+        };
+        assert_eq!(
+            predict_message(&one, 0).as_deref(),
+            Some("Row 3 is not estimable from this rank-deficient fit, so its prediction is NaN.")
+        );
+        let many = NoteInfo {
+            rows: (0..12).collect(),
+            ..note("rows_not_estimable")
+        };
+        assert_eq!(
+            predict_message(&many, 1).as_deref(),
+            Some(
+                "Rows 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, and 2 more are not estimable from this \
+                 rank-deficient fit, so their predictions are NaN."
+            )
+        );
+        assert_eq!(predict_message(&note("separated"), 0), None);
+    }
+
     const NO_NAMES: FitText = FitText {
         names: &[],
         converged: true,
         nobs: 0,
         row_base: 0,
+        robust: false,
     };
 
     fn message(n: &NoteInfo, cx: &FitText) -> Option<String> {
@@ -778,7 +995,7 @@ mod tests {
         let cases = [
             (
                 NoteInfo {
-                    detail: "g, g2".into(),
+                    names: names(&["g", "g2"]),
                     ..note("repeated_grouping")
                 },
                 "Grouping factors 'g' and 'g2' put the rows into exactly the same groups and \
@@ -788,7 +1005,7 @@ mod tests {
             ),
             (
                 NoteInfo {
-                    detail: "catB | word".into(),
+                    names: names(&["catB", "word"]),
                     ..note("slope_constant_within_levels")
                 },
                 "The random slope on catB does not vary within any group of 'word', so within \
@@ -798,7 +1015,7 @@ mod tests {
             ),
             (
                 NoteInfo {
-                    detail: "g".into(),
+                    names: names(&["g"]),
                     ..note("separated_by_grouping")
                 },
                 "The response is all 0 or all 1 within every group of 'g', so the likelihood \
@@ -809,7 +1026,7 @@ mod tests {
             ),
             (
                 NoteInfo {
-                    detail: "onegroup".into(),
+                    names: names(&["onegroup"]),
                     ..note("single_level_grouping_dropped")
                 },
                 "Grouping factor 'onegroup' has only one level, so no variance between groups \
@@ -872,7 +1089,7 @@ mod tests {
             ),
             (
                 NoteInfo {
-                    detail: "dropped 0, negative 0, converged false, nonfinite true".into(),
+                    nonfinite: true,
                     ..note("satterthwaite_curvature")
                 },
                 "The Satterthwaite degrees of freedom could not be computed: the fit has no \
@@ -881,7 +1098,8 @@ mod tests {
             ),
             (
                 NoteInfo {
-                    detail: "dropped 1, negative 2, converged false, nonfinite false".into(),
+                    dropped: 1,
+                    negative: 2,
                     ..note("satterthwaite_curvature")
                 },
                 "The Satterthwaite degrees of freedom are approximate: the curvature of the \
@@ -950,6 +1168,21 @@ mod tests {
             .starts_with("Standard errors could not be computed at the fit's end point:"));
     }
 
+    /// A robust fit with no CR2 or HC2 pieces names the robust standard errors,
+    /// not the fixed effects' information.
+    #[test]
+    fn se_unavailable_on_a_robust_fit_has_its_own_wording() {
+        let robust = FitText {
+            robust: true,
+            ..NO_NAMES
+        };
+        let m = message(&note("se_unavailable"), &robust).unwrap();
+        assert!(
+            m.starts_with("Robust standard errors could not be formed:"),
+            "{m}"
+        );
+    }
+
     #[test]
     fn pirls_exhausted_prints_only_on_a_converged_final_eval() {
         let trial = NoteInfo {
@@ -995,7 +1228,7 @@ mod tests {
             factor: 1e6,
             ..note("dispersion_at_limit")
         }];
-        let (fin, nan, none) = ([1.5, -2.0], [f64::NAN; 2], [false; 2]);
+        let none = [false; 2];
         let advice =
             "Try a simpler random-effects structure or check for nearly collinear predictors.";
         let inner = " Some of its inner steps ran out of iterations.";
@@ -1027,22 +1260,30 @@ mod tests {
             family: "gaussian",
             mixed: false,
             notes: &[],
-            beta: &fin,
             aliased: &none,
-            deviance: f64::NAN,
             y: &yy,
+            stop: Some(StopReason::FirstSolveFailed),
         };
+        let diverged = Some(StopReason::IrlsDiverged);
+        let budget = Some(StopReason::SearchBudget);
+        let no_end = Some(StopReason::NoEndPoint);
         let one_aliased = [false, true];
         let first_aliased = [true, false];
-        let cases: Vec<(Failed, &str, String)> = vec![
+        let cases: Vec<(Failed, &str, String)> =
+            vec![
+            (Failed { ..base }, "design_unsolvable", unsolvable.to_owned()),
             (
-                Failed { beta: &nan, ..base },
+                Failed {
+                    family: "gamma",
+                    ..base
+                },
                 "design_unsolvable",
                 unsolvable.to_owned(),
             ),
             (
                 Failed {
                     family: "binomial",
+                    stop: diverged,
                     ..base
                 },
                 "glm_diverged",
@@ -1051,16 +1292,18 @@ mod tests {
             (
                 Failed {
                     family: "poisson",
+                    stop: diverged,
                     ..base
                 },
                 "glm_diverged",
                 DIVERGED_COUNTS.to_owned(),
             ),
-            // No inner-steps sentence without random effects.
+            // No inner-steps sentence on a divergence.
             (
                 Failed {
                     family: "negativebinomial",
                     notes: &pirls,
+                    stop: diverged,
                     ..base
                 },
                 "glm_diverged",
@@ -1069,32 +1312,37 @@ mod tests {
             (
                 Failed {
                     family: "gamma",
+                    stop: diverged,
                     ..base
                 },
                 "glm_diverged",
                 DIVERGED_CONTINUOUS.to_owned(),
-            ),
-            (
-                Failed {
-                    family: "gamma",
-                    beta: &nan,
-                    ..base
-                },
-                "design_unsolvable",
-                unsolvable.to_owned(),
             ),
             (
                 Failed {
                     family: "inversegaussian",
+                    stop: diverged,
                     ..base
                 },
                 "glm_diverged",
                 DIVERGED_CONTINUOUS.to_owned(),
             ),
+            // A mixed model whose fixed-effects-only GLM stopped on separation.
+            (
+                Failed {
+                    family: "binomial",
+                    mixed: true,
+                    notes: &separated,
+                    stop: diverged,
+                    ..base
+                },
+                "glm_diverged",
+                DIVERGED_BINOMIAL.to_owned(),
+            ),
             (
                 Failed {
                     mixed: true,
-                    deviance: 12.5,
+                    stop: budget,
                     ..base
                 },
                 "search_limit",
@@ -1105,17 +1353,38 @@ mod tests {
                     family: "binomial",
                     mixed: true,
                     notes: &pirls,
-                    deviance: 12.5,
+                    stop: budget,
                     ..base
                 },
                 "search_limit",
                 search(inner),
             ),
+            // No fixed effects at all (y ~ 0 + (1 | g)): the stop decides.
+            (
+                Failed {
+                    mixed: true,
+                    aliased: &[],
+                    stop: budget,
+                    ..base
+                },
+                "search_limit",
+                search(""),
+            ),
+            (
+                Failed {
+                    mixed: true,
+                    aliased: &one_aliased,
+                    stop: budget,
+                    ..base
+                },
+                "search_limit",
+                search(""),
+            ),
             (
                 Failed {
                     family: "poisson",
                     mixed: true,
-                    beta: &nan,
+                    stop: no_end,
                     ..base
                 },
                 "fit_failed",
@@ -1126,81 +1395,26 @@ mod tests {
                     family: "poisson",
                     mixed: true,
                     notes: &pirls,
-                    beta: &nan,
+                    stop: no_end,
                     ..base
                 },
                 "fit_failed",
                 failed(inner),
             ),
-            // Finite coefficients but no end point: failed, not a search limit.
             (
                 Failed {
                     mixed: true,
+                    aliased: &[],
+                    stop: no_end,
                     ..base
                 },
                 "fit_failed",
                 failed(""),
             ),
-            // ... unless the fixed-effects-only GLM stopped on separation.
+            // A constant response wins over every stop reason.
             (
                 Failed {
                     family: "binomial",
-                    mixed: true,
-                    notes: &separated,
-                    ..base
-                },
-                "glm_diverged",
-                DIVERGED_BINOMIAL.to_owned(),
-            ),
-            (
-                Failed {
-                    family: "poisson",
-                    mixed: true,
-                    notes: &separated,
-                    ..base
-                },
-                "glm_diverged",
-                DIVERGED_COUNTS.to_owned(),
-            ),
-            // No fixed effects at all (y ~ 0 + (1 | g)): the deviance decides.
-            (
-                Failed {
-                    mixed: true,
-                    beta: &[],
-                    aliased: &[],
-                    ..base
-                },
-                "fit_failed",
-                failed(""),
-            ),
-            (
-                Failed {
-                    mixed: true,
-                    beta: &[],
-                    aliased: &[],
-                    deviance: 12.5,
-                    ..base
-                },
-                "search_limit",
-                search(""),
-            ),
-            // An aliased NaN slot is not a failed coefficient.
-            (
-                Failed {
-                    mixed: true,
-                    beta: &[1.0, f64::NAN],
-                    aliased: &one_aliased,
-                    deviance: 12.5,
-                    ..base
-                },
-                "search_limit",
-                search(""),
-            ),
-            // A constant response wins over every model-based kind.
-            (
-                Failed {
-                    family: "binomial",
-                    beta: &nan,
                     y: &[0.0; 20],
                     ..base
                 },
@@ -1212,8 +1426,8 @@ mod tests {
                     family: "poisson",
                     mixed: true,
                     notes: &pirls,
-                    beta: &nan,
                     y: &[3.0; 20],
+                    stop: no_end,
                     ..base
                 },
                 "constant_response",
@@ -1221,7 +1435,6 @@ mod tests {
             ),
             (
                 Failed {
-                    beta: &[],
                     aliased: &[],
                     ..base
                 },
@@ -1233,8 +1446,8 @@ mod tests {
             (
                 Failed {
                     mixed: true,
-                    beta: &[f64::NAN],
                     aliased: &[true],
+                    stop: no_end,
                     ..base
                 },
                 "no_coefficients",
@@ -1245,7 +1458,6 @@ mod tests {
             ),
             (
                 Failed {
-                    beta: &nan,
                     y: &[1.0, 2.0],
                     ..base
                 },
@@ -1256,8 +1468,8 @@ mod tests {
                 Failed {
                     family: "binomial",
                     mixed: true,
-                    beta: &nan,
                     y: &[1.0],
+                    stop: no_end,
                     ..base
                 },
                 "too_few_rows",
@@ -1265,7 +1477,6 @@ mod tests {
             ),
             (
                 Failed {
-                    beta: &[f64::NAN, 1.0],
                     aliased: &first_aliased,
                     y: &[4.0],
                     ..base
@@ -1279,7 +1490,7 @@ mod tests {
                     family: "gamma",
                     mixed: true,
                     notes: &phi_lower,
-                    beta: &nan,
+                    stop: no_end,
                     ..base
                 },
                 "dispersion_at_limit",
@@ -1293,7 +1504,7 @@ mod tests {
                     family: "gamma",
                     mixed: true,
                     notes: &phi_upper,
-                    beta: &nan,
+                    stop: no_end,
                     ..base
                 },
                 "dispersion_at_limit",
@@ -1303,10 +1514,35 @@ mod tests {
                     .to_owned(),
             ),
         ];
-        assert_eq!(cases.len(), 26);
+        assert_eq!(cases.len(), 24);
         for (f, kind, message) in &cases {
             assert_eq!(failure(f), (*kind, message.clone()), "{kind}");
             assert_eq!(tier_title(kind).0, "severe");
+        }
+    }
+
+    #[test]
+    fn each_stop_reason_maps_to_its_kind() {
+        let y = [1.0, 2.0, 4.0];
+        let kind = |stop| {
+            failure(&Failed {
+                family: "binomial",
+                mixed: true,
+                notes: &[],
+                aliased: &[false],
+                y: &y,
+                stop,
+            })
+            .0
+        };
+        let reasons = [
+            (StopReason::SearchBudget, "search_limit"),
+            (StopReason::NoEndPoint, "fit_failed"),
+            (StopReason::IrlsDiverged, "glm_diverged"),
+            (StopReason::FirstSolveFailed, "design_unsolvable"),
+        ];
+        for (reason, expected) in reasons {
+            assert_eq!(kind(Some(reason)), expected, "{reason:?}");
         }
     }
 
@@ -1328,11 +1564,17 @@ mod tests {
     fn note_infos_kinds_have_a_kinds_row_or_a_reason() {
         // Kinds the ports never raise through this table, with the reason.
         const SKIP: &[(&str, &str)] = &[
-            ("new_grouping_levels", "a predict note, worded by each port"),
-            ("rows_not_estimable", "a predict note, worded by each port"),
+            (
+                "new_grouping_levels",
+                "a predict note, worded by predict_message",
+            ),
+            (
+                "rows_not_estimable",
+                "a predict note, worded by predict_message",
+            ),
             (
                 "predict_se_model_based",
-                "a predict note, worded by each port",
+                "a predict note, worded by predict_message",
             ),
             (
                 "single_level_grouping",
@@ -1340,7 +1582,7 @@ mod tests {
                  single_level_grouping_dropped",
             ),
         ];
-        let src = include_str!("../../glmm-rs/src/orchestrate.rs");
+        let src = include_str!("../../glmm-rs/src/orchestrate/fit.rs");
         let body: Vec<&str> = src
             .lines()
             .skip_while(|l| !l.contains("fn note_infos("))

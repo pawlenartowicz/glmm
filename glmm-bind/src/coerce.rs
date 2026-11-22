@@ -145,8 +145,9 @@ pub(crate) fn to_vec(v: Value) -> Result<Vec<f64>, String> {
     }
 }
 
-/// Whole numbers, each read as [`to_i64s`] reads it.
-fn whole_ints(v: Value) -> Result<Vec<i64>, String> {
+/// Whole numbers, each read as it is, or refused. Read for row numbers and,
+/// through [`to_usizes`], for counts.
+pub(crate) fn whole_ints(v: Value) -> Result<Vec<i64>, String> {
     let what = describe(&v);
     let bad = || format!("must be whole numbers, got {what}");
     match v {
@@ -171,11 +172,6 @@ fn whole_ints(v: Value) -> Result<Vec<i64>, String> {
         }
         _ => Err(bad()),
     }
-}
-
-/// Integers taken as they are (the caller's row numbers).
-pub(crate) fn to_i64s(v: Value) -> Result<Vec<i64>, String> {
-    whole_ints(v)
 }
 
 /// Non-negative whole numbers: an `Index` (0-based), or counts.

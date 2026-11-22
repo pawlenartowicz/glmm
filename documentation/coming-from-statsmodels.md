@@ -141,7 +141,7 @@ the installed package:
   `Dispersion (phi, Pearson): …`, `Dispersion (phi, fixed): …` or
   `Shape (theta): …`; see [`conventions.md`](conventions.md)), then
   `Optimizer evaluations: <n>, converged: <bool>`, and on a singular fit
-  `boundary (singular) fit: see help('isSingular')`. A Gaussian mixed fit
+  `boundary (singular) fit: see Fit.singular`. A Gaussian mixed fit
   shows σ² as the `Residual` row of the random-effects table instead.
   `converged` and the singular flag are covered in more depth in
   [`coming-from-lme4.md`](coming-from-lme4.md#behavioral-differences-to-watch).

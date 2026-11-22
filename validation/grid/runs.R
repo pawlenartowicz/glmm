@@ -141,8 +141,8 @@ newest_oracle_run <- function(grid_dir, oracle, want_version, required_cells) {
 # cap rather than at an optimum. lme4 itself still calls such a fit converged on
 # every cell above `check.conv.nobsmax` rows (10000): it skips its own gradient
 # checks there, and the optimizer's nonzero return code and its "failure to
-# converge in 10000 evaluations" warning live in `optinfo`, which the engine did
-# not read before 2026-10-07. The frozen references (RULE 0) are not rewritten:
+# converge in 10000 evaluations" warning live in `optinfo`, which the frozen
+# records do not carry. The frozen references are not rewritten:
 # the record is reclassified as it is read, from the n_eval it already carries.
 # A Gaussian cell is fitted by lmer (nloptwrap, a different budget) and is left
 # alone.
@@ -195,25 +195,9 @@ reclassify_lme4_on_read <- function(run, oracle, cells) {
 # references. Whatever it picks, it PRINTS -- directory, subset and label -- so
 # the choice is never invisible.
 newest_glmm_run <- function(grid_dir, engine = "glmm", override = NULL) {
-  say <- function(r) {
-    cat(sprintf("%s run:  %s\n", engine, r$dir))
-    cat(sprintf("  subset:  %s   label: %s   cells: %s\n",
-                r$meta$subset, r$meta$label, r$meta$cells))
-    r
-  }
-  if (!is.null(override)) return(say(read_run(override)))
-  root <- file.path(grid_dir, "runs", engine)
-  dirs <- c(list.dirs(root, recursive = FALSE),
-            list.dirs(file.path(root, "scratch"), recursive = FALSE))
-  dirs <- Filter(function(d) file.exists(file.path(d, "run_meta.json")) &&
-                             file.exists(file.path(d, "results.jsonl")), dirs)
-  if (!length(dirs)) return(NULL)
-  metas <- lapply(dirs, function(d)
-    jsonlite::fromJSON(file.path(d, "run_meta.json"), simplifyVector = TRUE))
-  # A --pipeline run times fit + tests for summarize_timing.R --pipeline only,
-  # and is never the run a gate or the accuracy report reads.
-  keep <- !vapply(metas, function(m) isTRUE(m$pipeline), TRUE)
-  dirs <- dirs[keep]; metas <- metas[keep]
+  if (!is.null(override)) return(say_run(engine, read_run(override)))
+  runs <- list_runs(grid_dir, engine)
+  dirs <- runs$dirs; metas <- runs$metas
   if (!length(dirs)) return(NULL)
   full <- vapply(metas, function(m) identical(m$subset, "full"), TRUE)
   dates <- run_time(vapply(metas, `[[`, "", "date"))
@@ -223,7 +207,30 @@ newest_glmm_run <- function(grid_dir, engine = "glmm", override = NULL) {
     cat(sprintf("NOTE: no %s run with subset \"full\" -- falling back to the newest partial run.\n",
                 engine))
   }
-  say(read_run(dirs[ord][1]))
+  say_run(engine, read_run(dirs[ord][1]))
+}
+
+say_run <- function(engine, r) {
+  cat(sprintf("%s run:  %s\n", engine, r$dir))
+  cat(sprintf("  subset:  %s   label: %s   cells: %s\n",
+              r$meta$subset, r$meta$label, r$meta$cells))
+  r
+}
+
+# Every run directory of `engine` (its fixed slots and scratch/) with its parsed
+# run_meta.json, as list(dirs, metas). A --pipeline run times fit + tests for
+# summarize_timing.R --pipeline only, and is never the run a gate or the accuracy
+# report reads, so it is left out.
+list_runs <- function(grid_dir, engine) {
+  root <- file.path(grid_dir, "runs", engine)
+  dirs <- c(list.dirs(root, recursive = FALSE),
+            list.dirs(file.path(root, "scratch"), recursive = FALSE))
+  dirs <- Filter(function(d) file.exists(file.path(d, "run_meta.json")) &&
+                             file.exists(file.path(d, "results.jsonl")), dirs)
+  metas <- lapply(dirs, function(d)
+    jsonlite::fromJSON(file.path(d, "run_meta.json"), simplifyVector = TRUE))
+  keep <- !vapply(metas, function(m) isTRUE(m$pipeline), TRUE)
+  list(dirs = dirs[keep], metas = metas[keep])
 }
 
 # ── coefficient alignment ────────────────────────────────────────────────────

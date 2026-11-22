@@ -29,7 +29,6 @@ and the warning categories the diagnostics channel raises (`DiagnosticWarning`, 
 `WeightPowerSearchFailuresWarning`).
 """
 
-import math
 import os
 import random
 import re
@@ -114,374 +113,316 @@ class DiagnosticWarning(UserWarning):
 
 
 class IllConditionedWarning(DiagnosticWarning):
-    """Two or more fixed-effect columns are entangled — near-collinear, but not
-    redundant.
+    """Two or more fixed-effect columns are entangled: near-collinear, but not redundant.
 
-    The fit is real and the estimates are honest; the standard errors are large
-    because the data cannot separate the columns. Distinct from an *aliased*
-    column, which is exactly redundant and is dropped (`Fit.aliased`).
+    See the `ill_conditioned` row of documentation/warnings.md.
     """
 
 
 class PirlsExhaustedWarning(DiagnosticWarning):
-    """The final re-evaluation of a converged fit ran its full PIRLS iteration
-    cap without converging.
+    """The final re-evaluation of a converged fit ran its full PIRLS iteration cap without
+    converging.
 
-    Every other cap-out is either observation-only (a rejected trial point
-    during the search, kept in the fit's notes and never raised) or folded
-    into the non-convergence warning (`search_limit` / `fit_failed`) instead,
-    since the non-convergence warning already says not to use them.
+    See the `pirls_exhausted` row of documentation/warnings.md.
     """
 
 
 class NewGroupingLevelsWarning(DiagnosticWarning):
     """`Fit.predict` met grouping levels the fit did not see.
 
-    Those rows get a random effect of zero for that grouping (the population
-    value), while their other groupings keep theirs. Raised by `predict`, not
-    by `fit`, so it is not in `Fit.warnings`. `allow_new_levels=False` makes
-    such a level an error instead.
+    See "The warnings of `predict`" in documentation/warnings.md.
     """
 
 
 class RowsNotEstimableWarning(DiagnosticWarning):
     """`Fit.predict` met rows the rank-deficient fit cannot estimate.
 
-    A row outside the row space of the fit's design (a fit with aliased
-    columns) has no prediction from the data, so its prediction, standard
-    error, interval and future bounds are NaN, as R's
-    `predict.lm(rankdeficient = "NA")` gives NA. Raised by `predict`, not by
-    `fit`, so it is not in `Fit.warnings`.
+    See "The warnings of `predict`" in documentation/warnings.md.
     """
 
 
 class SingleLevelGroupingDroppedWarning(DiagnosticWarning):
-    """A random-effect term's grouping factor has only one observed level, so
-    no between-group variance is identifiable from it.
+    """A random-effect term's grouping factor has only one observed level, so the term was
+    dropped.
 
-    lme4 errors here ("grouping factors must have > 1 sampled level"); this
-    port drops the term instead and fits the rest of the model. When every
-    random-effect term is dropped this way, the model fits as though the
-    formula had declared none.
+    See the `single_level_grouping_dropped` row of documentation/warnings.md.
     """
 
 
 class FewRowsForRandomEffectsWarning(DiagnosticWarning):
-    """A random-effect term has at least as many random effects as the fit has
-    rows (more than the rows, on a family other than Gaussian), so its variance
+    """A random-effect term has too many random effects for the fit's rows, so its variance
     parameters probably cannot be estimated from these data.
 
-    A term's random effects are its observed levels times its columns (the
-    intercept, one per numeric slope, one per non-base level of a factor
-    slope): `(1 + x | g)` on 10 levels has 20. Each term is checked on its own
-    against all rows. lme4 stops on such a model by default
-    (`check.nobs.vs.nRE`); this port fits it as usual and warns.
+    See the `few_rows_for_random_effects` row of documentation/warnings.md.
     """
 
 
 class RepeatedGroupingWarning(DiagnosticWarning):
-    """Two grouping factors put the rows into exactly the same groups and
-    share a random effect, so the data cannot tell their variances apart.
+    """Two grouping factors put the rows into exactly the same groups and share a random effect,
+    so the data cannot tell their variances apart.
 
-    "Share" means both have a random intercept, or the same slope is in both.
-    The groups are compared exactly, whatever the levels are called. The fit
-    runs as usual; how it splits the variance between the two is arbitrary.
+    See the `repeated_grouping` row of documentation/warnings.md.
     """
 
 
 class SlopeConstantWithinLevelsWarning(DiagnosticWarning):
-    """A random slope takes one value within every group of a grouping that
-    also has a random intercept, and too few distinct values across the
-    groups to identify its variance and correlations.
+    """A random slope takes one value within every group of its grouping, so the data cannot
+    identify its variance and correlations.
 
-    Raised when the distinct value combinations of such slopes are fewer than
-    the covariance parameters among the intercept and them, as for
-    `(1 + category | word)` with each word in one of two categories. The fit
-    runs as usual.
+    See the `slope_constant_within_levels` row of documentation/warnings.md.
     """
 
 
 class SeparatedByGroupingWarning(DiagnosticWarning):
-    """A binomial response is all 0 or all 1 within every group of a grouping
-    with a random intercept, so that grouping's variance has no finite
-    estimate.
+    """A binomial response is all 0 or all 1 within every group of a grouping with a random
+    intercept, so that grouping's variance has no finite estimate.
 
-    Checked on every group, not most, and only when some group holds more
-    than one trial: a grouping with one 0/1 row per group raises
-    `OneTrialPerLevelWarning` instead. The fit runs as usual; any reported
-    variance is a stopping point, and the fixed effects depend on it.
+    See the `separated_by_grouping` row of documentation/warnings.md.
     """
 
 
 class OneTrialPerLevelWarning(DiagnosticWarning):
-    """Every level of a binomial grouping holds one trial, so that grouping's
-    variance only moves each row's marginal success probability and trades
-    against the fixed effects: it is not identified.
+    """Every level of a binomial grouping holds one trial, so that grouping's variance is not
+    identified.
 
-    A level's trials are the sum of its rows' weights (1 per row without
-    weights). The estimates are reported as fitted.
+    See the `one_trial_per_level` row of documentation/warnings.md.
     """
 
 
 class HessianSeFallbackWarning(DiagnosticWarning):
-    """`wald_se="hessian"` was requested, but the joint Hessian was not usable
-    (not positive definite, or the fit took the finite-difference Hessian and a
-    perturbed deviance evaluation was non-finite).
+    """`wald_se="hessian"` was requested, but the joint Hessian was not usable, so simpler
+    standard errors were used.
 
-    The standard errors reported are the RX/Schur ones instead, and
-    `Fit.stddev_se` (the random-effect standard deviations' own standard
-    errors) comes back `NaN` — only the joint Hessian route fills it.
+    See the `hessian_se_fallback` row of documentation/warnings.md.
     """
 
 
 class GradientSearchFallbackWarning(DiagnosticWarning):
-    """The gradient search (used on linear mixed models whose random slopes
-    are all on one grouping, on binomial, Poisson and Gamma GLMMs fitted by
-    the Laplace approximation, and on logit and probit binomial and Poisson
-    GLMMs with a random intercept only and fewer than 50 rows per group,
-    fitted with `nagq` above 1) did not converge, so the standard
-    derivative-free search continued from the best point it had reached.
+    """The gradient search did not converge, so the standard derivative-free search continued
+    from the best point it had reached.
 
-    The reported estimates and `converged` come from that second search,
-    which ran with its own full evaluation budget; `n_eval` counts both.
+    See the `gradient_search_fallback` row of documentation/warnings.md.
     """
 
 
 class ExactProfileFallbackWarning(DiagnosticWarning):
-    """A GLMM's exact-profile outer search did not converge, so the fit reran
-    once with a different search strategy (`PqlThenJoint`) from the same
-    start.
+    """A GLMM's exact-profile outer search did not converge, so the fit reran once with a
+    different search strategy from the same start.
 
-    The reported estimates come from that rerun when it converged. When the
-    rerun also failed, they come from whichever of the two attempts reached
-    the lower deviance, and `converged` stays `False` either way. Only
-    affects mixed models fitted with the default Laplace approximation, and
-    not those with random slopes on two or more groupings or too large for
-    the dense layout, which take another route.
+    See the `exact_profile_fallback` row of documentation/warnings.md.
     """
 
 
 class SeUnavailableWarning(DiagnosticWarning):
-    """No covariance of a mixed model's fixed effects could be formed at the
-    search's end point: the information matrix is not
-    positive definite to rounding (under `wald_se="hessian"`, after the joint
-    Hessian failed too).
+    """The standard errors could not be computed at the fit's end point.
 
-    The estimates, the variance components and the deviance are the search's
-    own and `converged` is unchanged; `Fit.se`, `Fit.vcov` and
-    `Fit.stddev_se` are `NaN`.
+    See the `se_unavailable` rows of documentation/warnings.md.
     """
 
 
 class PrecisionLimitedWarning(DiagnosticWarning):
-    """A mixed model's deviance is too large for double precision to resolve
-    its optimum: the estimated rounding error of the deviance at the end point
-    is above 0.01, so the variance estimates may be off by about a tenth of a
-    standard error or more.
+    """A mixed model's deviance is too large for double precision to resolve its optimum.
 
-    Every estimate and `converged` are the search's own. Raised on counts in
-    the billions or more, either through the deviance itself (a model that
-    misses a large effect) or, with more than one grouping factor, through the
-    log-determinant of the random-effect system; on a Gaussian mixed model,
-    when the residuals are tiny against the response (a response far from
-    zero next to its residual spread), with weights spanning many orders of
-    magnitude, or, under REML, when a fixed-effect column lies near the span
-    of a random-effect column with a large variance, so the pivot of X'V⁻¹X
-    cancels (an intercept beside a random intercept).
+    See the `precision_limited` row of documentation/warnings.md.
     """
 
 
 class VarianceAtLimitWarning(DiagnosticWarning):
-    """A random-effect parameter ended on the upper limit of the variance search
-    (1000 on glmm's internal scale), so the estimates are at that limit, not at
-    an optimum.
+    """A random-effect parameter ended on the upper limit of the variance search, so the
+    estimates are at that limit, not at an optimum.
 
-    On a Gaussian model this usually means the residual variance is estimated
-    at or near zero; on other families the random-effect variance has no
-    finite estimate. `converged` and `singular` are the search's own, and
-    `diagnostics["boundary"]` reads "upper_limit" when it would otherwise read
-    "interior".
+    See the `variance_at_limit` row of documentation/warnings.md.
     """
 
 
 class DispersionAtLimitWarning(DiagnosticWarning):
-    """A Gamma mixed model's dispersion ended on an edge of its search range,
-    so the fit was refused and returned no estimates.
+    """A Gamma mixed model's dispersion ended on an edge of its search range, so the fit was
+    refused and returned no estimates.
 
-    The message says which edge. A dispersion given with `dispersion=` is not
-    searched and never raises it.
+    See the `dispersion_at_limit` rows of documentation/warnings.md.
     """
 
 
 class WeightPowerAtBoundWarning(DiagnosticWarning):
-    """The fitted weight power (`weight_power="estimate"`, or `None` resolved
-    to it) is not a maximum: the log-likelihood at the end of the search range
-    nearer to it is at least its own, so the profile rises, or stays flat,
-    toward that end.
+    """The fitted weight power is not a maximum: the log-likelihood rises, or stays flat, toward
+    the end of the search range.
 
-    With at most as many rows as coefficients off the common weight the
-    profile goes flat and can have no finite maximum, and on weights that vary
-    little the maximum can lie past the range.
+    See the `weight_power_at_bound` row of documentation/warnings.md.
     """
 
 
 class WeightPowerSearchFailuresWarning(DiagnosticWarning):
     """Fits inside the weight-power search failed or did not converge.
 
-    A failed one counts as the worst value at its power, which steers the
-    search toward 0 (the weights ignored); the reported fit is the one at the
-    power found, with its own convergence.
+    See the `weight_power_search_failures` row of documentation/warnings.md.
     """
 
 
 class WeightPowerOutsideUnitWarning(DiagnosticWarning):
-    """The fitted weight power is outside [0, 1] (0: the weights carry no
-    variance information; 1: the weights as claimed).
+    """The fitted weight power is outside [0, 1] (0: the weights carry no variance information;
+    1: the weights as claimed).
 
-    With few rows or a weak fit (low R²) this happens by chance and is not by
-    itself a problem. Not raised alongside `WeightPowerImplausibleWarning` or
-    `WeightPowerAtBoundWarning`.
+    See the `weight_power_outside_unit` row of documentation/warnings.md.
     """
 
 
 class WeightPowerImplausibleWarning(DiagnosticWarning):
-    """The fitted weight power is outside [-1, 2], the range the simulations
-    behind it covered, and the fitted variances differ from the claimed
-    weights by more than 10 times across the data (s^|power - 1| > 10, s the
-    largest weight over the smallest).
+    """The fitted weight power is outside the range the simulations behind it covered, and the
+    fitted variances differ widely from the claimed weights.
+
+    See the `weight_power_implausible` row of documentation/warnings.md.
     """
 
 
 class RobustWithRandomSlopeWarning(DiagnosticWarning):
-    """Robust standard errors (`se_type="robust"`) were asked for on a model
-    with a random slope. Their arithmetic is checked there, but in simulations
-    with 10 groups their Type I error ran at .056 to .066; the model-based
-    standard errors are the default on such a model.
+    """Robust standard errors (`se_type="robust"`) were asked for on a model with a random
+    slope.
+
+    See the `robust_with_random_slope` row of documentation/warnings.md.
     """
 
 
 class RobustSeUnidentifiedWarning(DiagnosticWarning):
-    """One group alone carries the information on a coefficient, so its robust
-    standard error and df are NaN: that group has no residual left to measure
-    it with. More groups are needed; `se_type="model"` assumes the groups
-    share one variance.
+    """One group alone carries the information on a coefficient or test, so its robust standard
+    error and df are NaN.
+
+    See the `robust_se_unidentified` rows of documentation/warnings.md.
     """
 
 
 class RobustDfSmallWarning(DiagnosticWarning):
-    """Robust degrees of freedom below 4, where the robust test gives no
-    assurance on its error rate (Pustejovsky and Tipton 2018). If such a
-    predictor is constant within groups, `se_type="model"` is the better route.
-    Raised by `fit` per coefficient, and by `Fit.contrast_test` and `pairwise`
-    per test (where `RobustSeUnidentifiedWarning` also names a test one group
-    alone identifies).
+    """Robust degrees of freedom below 4, where the robust test gives no assurance on its error
+    rate.
+
+    See the `robust_df_small` rows of documentation/warnings.md.
     """
 
 
 class ModelBasedJointTestWarning(DiagnosticWarning):
-    """`Fit.contrast_test` of more than one row on a robust fit: there is no
-    evidence for a robust joint test, so the F uses the model-based standard
-    errors. Not in `Fit.warnings`.
+    """`Fit.contrast_test` of more than one row on a robust fit uses the model-based standard
+    errors.
+
+    See the `model_based_joint_test` row of documentation/warnings.md.
     """
 
 
 class PredictSeModelBasedWarning(DiagnosticWarning):
-    """`Fit.predict` with `se_fit=True` on a robust fit: the standard error and
-    interval are model-based, since their formula holds only with the model's
-    covariance. Not in `Fit.warnings`.
+    """`Fit.predict` with `se_fit=True` on a robust fit gives model-based standard errors and
+    intervals.
+
+    See the `predict_se_model_based` row of documentation/warnings.md.
     """
 
 
 class SatterthwaiteCurvatureWarning(DiagnosticWarning):
-    """The Satterthwaite degrees of freedom of a Gaussian linear mixed model are
-    approximate or could not be computed.
+    """The Satterthwaite degrees of freedom of a Gaussian linear mixed model are approximate or
+    could not be computed.
 
-    They are approximate when the curvature of the deviance in the variance
-    parameters has flat directions (left out) or negative ones, or when the
-    search stopped at its step limit. They could not be computed when the fit
-    has no finite end point or the deviance near it was not finite: then
-    `Fit.df_method` is "failed", every coefficient is tested with z and
-    `Fit.confint` gives normal intervals.
+    See the `satterthwaite_curvature` row of documentation/warnings.md.
     """
 
 
 class SearchLimitWarning(DiagnosticWarning):
-    """The search for the variance parameters used its evaluation budget before it
-    settled, and `converged` is False. Everything is reported at the best point found;
-    nothing checks how close that point is to the optimum."""
+    """The search for the variance parameters used its evaluation budget before it settled, and
+    `converged` is False.
+
+    See the `search_limit` row of documentation/warnings.md.
+    """
 
 
 class FitFailedWarning(DiagnosticWarning):
-    """A mixed-model fit stopped on a degenerate configuration: `converged` is False and
-    every estimate is NaN."""
+    """A mixed-model fit stopped on a degenerate configuration: `converged` is False and every
+    estimate is NaN.
+
+    See the `fit_failed` row of documentation/warnings.md.
+    """
 
 
 class GlmDivergedWarning(DiagnosticWarning):
-    """A GLM without random effects diverged, usually from separation. The coefficients
-    are the last IRLS step; the standard errors and the deviance are NaN."""
+    """The fit diverged, usually from separation.
+
+    See the `glm_diverged` rows of documentation/warnings.md.
+    """
 
 
 class DesignUnsolvableWarning(DiagnosticWarning):
-    """A fit without random effects could not factor X'WX (columns redundant up to
-    rounding, on a GLM possibly only under the weights). No estimates are returned."""
+    """A fit without random effects could not factor X'X or X'WX, so no estimates are returned.
+
+    See the `design_unsolvable` row of documentation/warnings.md.
+    """
 
 
 class SingularFitWarning(DiagnosticWarning):
-    """Boundary (singular) fit, lme4's `isSingular`: a variance component at or near zero
-    or a correlation at or near -1 or 1."""
+    """Boundary (singular) fit, lme4's `isSingular`: a variance component at or near zero or a
+    correlation at or near -1 or 1.
+
+    See the `singular` row of documentation/warnings.md.
+    """
 
 
 class AgqFallbackWarning(DiagnosticWarning):
-    """`nagq` above 1 on a model adaptive quadrature does not cover. The fit ran the
-    Laplace approximation and `Fit.nagq` is 1."""
+    """`nagq` above 1 on a model adaptive quadrature does not cover, so the fit ran the Laplace
+    approximation.
+
+    See the `agq_fallback` row of documentation/warnings.md.
+    """
 
 
 class ArgumentIgnoredWarning(DiagnosticWarning):
-    """An argument that does not apply to this model was cleared before fitting."""
+    """An argument that does not apply to this model was cleared before fitting.
+
+    See the `argument_ignored` rows of documentation/warnings.md.
+    """
 
 
 class RowsDroppedWarning(DiagnosticWarning):
-    """A column the formula uses was missing a value on some rows, and those
-    rows were dropped before fitting (R's default na.action = na.omit,
-    applied the same way in Python since there is no `model.frame` here to do
-    it for free)."""
+    """A column the formula uses was missing a value on some rows, and those rows were dropped
+    before fitting.
+
+    See the `rows_dropped_na` row of documentation/warnings.md.
+    """
 
 
 class ConstantResponseWarning(DiagnosticWarning):
-    """The fit did not converge and every row of the response has the same value."""
+    """The fit did not converge and every row of the response has the same value.
+
+    See the `constant_response` row of documentation/warnings.md.
+    """
 
 
 class TooFewRowsWarning(DiagnosticWarning):
-    """The fit did not converge and there are no more rows than estimated coefficients."""
+    """The fit did not converge and there are no more rows than estimated coefficients.
+
+    See the `too_few_rows` row of documentation/warnings.md.
+    """
 
 
 class NoCoefficientsWarning(DiagnosticWarning):
-    """A model without random effects and without any fixed-effect column."""
+    """The model has no fixed-effect coefficient to estimate.
+
+    See the `no_coefficients` rows of documentation/warnings.md.
+    """
 
 
 class NbShapeAtLimitWarning(DiagnosticWarning):
-    """The negative-binomial shape ended on the lower limit of its search (1e-6), so
-    the shape and the estimates computed at it are at that limit, not at an optimum. At
-    the upper limit (10000, a fit with no overdispersion the shape can measure) the note
-    is stored in `diagnostics["notes"]` and raises nothing."""
+    """The negative-binomial shape ended on the lower limit of its search, so the shape and the
+    estimates computed at it are at that limit, not at an optimum.
+
+    See the `nb_shape_at_limit` row of documentation/warnings.md.
+    """
 
 
 class NbShapeUnsettledWarning(DiagnosticWarning):
-    """A negative-binomial GLM's shape search stopped at its round limit before it
-    settled. The fit is reported at the last shape value, with the coefficients and
-    standard errors refit there."""
+    """A negative-binomial GLM's shape search stopped at its round limit before it settled.
+
+    See the `nb_shape_unsettled` row of documentation/warnings.md.
+    """
 
 
 class NonIntegerResponseWarning(DiagnosticWarning):
-    """A Poisson, negative-binomial or binomial response is not within 1e-3 of an
-    integer count (binomial: the derived number of successes, `y * weights`).
+    """A Poisson, negative-binomial or binomial response is not an integer count.
 
-    The fit still runs — the deviance and score are continuous in `y` — but the
-    reported numbers describe a distribution that assumes integer counts. The 1e-3
-    tolerance matches R's `binomial()$initialize` non-integer-count check. R's
-    Poisson/NB warning is unrelated and much tighter (it comes from `dpois`/`dnbinom`
-    inside `poisson()$aic`, at `1e-7 * max(1, abs(y))`), so R warns on e.g.
-    `y = 2.0005` where glmm stays silent.
+    See the `non_integer_response` row of documentation/warnings.md.
     """
 
 
@@ -620,8 +561,8 @@ def _plain_column(col):
     the per-row path for it, so its result never depends on which path ran.
 
     A list of `_PLAIN_TYPES` is read by the native `plain_column` in one pass
-    in Rust; when it answers None, the numpy and dict code below reads the
-    list instead."""
+    in Rust; when it answers None, the dict code below reads the list
+    instead."""
     dtype = getattr(col, "dtype", None)
     if getattr(dtype, "kind", None) in ("i", "u", "f"):
         try:
@@ -652,9 +593,6 @@ def _plain_column(col):
         return ("num", values, ~np.isnan(values))
     if native is not None:
         codes, keys = np.frombuffer(native["codes"], dtype=np.int64), native["keys"]
-    elif set(map(type, elements)) <= _NUMBER_TYPES:
-        values = np.array(elements, dtype=float)
-        return ("num", values, ~np.isnan(values))
     else:
         index = {}
         codes = np.fromiter(
@@ -731,8 +669,8 @@ def _formula_columns(formula, names):
     `names`, from one parse in the Rust formula frontend
     (the native `formula_columns`).
 
-    - `used`: `names` restricted to the ones the formula reads as data,
-      mirroring R's own `data[all.vars(formula)]` (`glmm-r/R/fastglmm.R`) so a
+    - `used`: `names` restricted to the ones the formula reads as data (the R
+      port reads the same call, `.formula_columns` in `glmm-r/R/fastglmm.R`), so a
       column the formula never uses — a datetime, or anything the
       numeric/factor branches below cannot convert — is never read at all.
       It is a filter: a name it cannot resolve is silently dropped.
@@ -743,9 +681,8 @@ def _formula_columns(formula, names):
     - `numeric_only`: names the formula always reads as plain numbers — the
       response (both count columns of a `cbind()` response) and the offset()
       term's column. A bool column crosses as a `FALSE`/`TRUE` factor
-      everywhere else (`_is_bool_column`/`_bool_values` below); the R port
-      keeps the same columns numeric off its own formula AST
-      (`all.vars(formula[[2L]])` plus a small `offset()` walk).
+      everywhere else (`_is_bool_column`/`_bool_values` below), as in the R
+      port.
 
     The Rust frontend answers rather than a scan of the formula text: it
     already knows its own identifier grammar (Unicode-aware, unlike an
@@ -820,7 +757,7 @@ class Fit:
     names from the formula. Returned by `fit`, not constructed by callers.
 
     `converged`, `singular` and `aliased` are properties over `diagnostics`,
-    not dataclass fields: read them off the Fit as before, but reach for
+    not dataclass fields: read them off the Fit as attributes, but reach for
     `diagnostics` when reflecting over the dataclass (`asdict`, `fields`).
     `aic` and `bic` are properties too, computed from `loglik`, `df` and
     `nobs`."""
@@ -1028,7 +965,8 @@ class Fit:
     objective_nodes: int = 0
     # The per-term tables `glmm.anova(m)` reads (Type III and Type II), built
     # when the fit was made. Each is a dict: "error" holds the message when the
-    # fit gets no table (an interaction without its marginal terms), else None
+    # fit gets no table (an interaction without its marginal terms), with
+    # "error_code" ("fit_error", or "internal" for a bug in glmm), else None
     # beside "ss_type", the table's "test" ("F", "chisq" or "lrt") and its
     # "reason" ("requested", "f_test", or what "auto" found: "poisson_mixed",
     # "binomial_mixed", "negative_binomial_mixed", "other_mixed" or
@@ -1146,7 +1084,7 @@ class Fit:
         On a fit that did not converge the value is not an AIC: a GLMM that
         stopped at MaxFunReached has a finite `loglik` and `df` 0, so this is
         `-2 * loglik` (as R's `AIC()` gives); check `converged` first."""
-        return -2.0 * self.loglik + 2.0 * self.df
+        return self._criteria()["AIC"]
 
     @property
     def bic(self):
@@ -1158,9 +1096,12 @@ class Fit:
         `glmm.compare(data, f0, f1)`, to compare fixed parts. The
         non-converged caveat of `aic` applies too: at MaxFunReached on a GLMM
         `df` is 0 and this is `-2 * loglik`."""
-        if self.nobs <= 0:
-            return math.nan
-        return -2.0 * self.loglik + self.df * math.log(self.nobs)
+        return self._criteria()["BIC"]
+
+    def _criteria(self):
+        return _native.call(
+            "criteria", {"loglik": float(self.loglik), "df": self.df, "nobs": self.nobs}
+        )
 
     def stddev_corr(self, group_idx):
         """Split grouping `group_idx`'s vech-packed covariance into
@@ -1175,21 +1116,11 @@ class Fit:
                 "stddev_corr is unavailable: the fit has no variance estimates, "
                 "because it stopped before estimating anything"
             )
-        m = len(vech)
-        q = (math.isqrt(1 + 8 * m) - 1) // 2
-        if q * (q + 1) // 2 != m:
-            raise ValueError(f"varcorr[{group_idx}] is not a valid vech (length {m})")
-
-        def idx(r, c):
-            return c * q - (c * c - c) // 2 + (r - c)
-
-        stddev = np.array([math.sqrt(vech[idx(i, i)]) for i in range(q)])
-        corr = np.eye(q)
-        for c in range(q):
-            for r in range(c + 1, q):
-                rho = vech[idx(r, c)] / (stddev[r] * stddev[c])
-                corr[r, c] = corr[c, r] = rho
-        return stddev, corr
+        r = _native.call(
+            "stddev_corr",
+            {"vech": vech.tolist(), "group": range(len(self.varcorr))[group_idx]},
+        )
+        return np.asarray(r["stddev"], dtype=float), np.asarray(r["corr"], dtype=float)
 
     def summary(self):
         """Print the lme4-shaped summary and return it as text. The blocks as
@@ -1299,7 +1230,7 @@ class Fit:
                 "parm": parm,
             },
         )
-        return _profile_table(r, bool(self.reml))
+        return _profile_table(r)
 
     def contrast_test(self, L):
         """One Wald test of the linear hypothesis `L @ beta = 0`, as a `TermTable`
@@ -1457,42 +1388,14 @@ class Fit:
                 "row_base": 0,
             },
         )
+        classes = {
+            "predict_se_model_based": PredictSeModelBasedWarning,
+            "new_grouping_levels": NewGroupingLevelsWarning,
+            "rows_not_estimable": RowsNotEstimableWarning,
+        }
         for note in r["notes"]:
-            if note["kind"] == "predict_se_model_based":
-                # Mirrors the R port's predict wording - change together.
-                warnings.warn(
-                    "The standard errors and intervals are model-based, not robust: their "
-                    "formula holds only with the model's covariance.",
-                    PredictSeModelBasedWarning,
-                    stacklevel=2,
-                )
-            if note["kind"] == "new_grouping_levels":
-                grouping, rows = note["detail"].split(": ", 1)
-                name = self.re_groups[int(grouping)][0]
-                rows = rows.split(", ")
-                n = len(rows)
-                rows = ", ".join(rows[:10]) + (f", and {n - 10} more" if n > 10 else "")
-                warnings.warn(
-                    f"{_count(n, 'row')} of newdata {'has' if n == 1 else 'have'} a level of "
-                    f"{name} the fit did not see (rows {rows}). Their random effect for "
-                    f"{name} is 0.",
-                    NewGroupingLevelsWarning,
-                    stacklevel=2,
-                )
-            if note["kind"] == "rows_not_estimable":
-                # Mirrors the R port's predict wording - change together.
-                rows = note["detail"].split(", ")
-                n = len(rows)
-                rows = ", ".join(rows[:10]) + (f", and {n - 10} more" if n > 10 else "")
-                if n == 1:
-                    rows, verb, result = f"Row {rows}", "is", "its prediction is"
-                else:
-                    rows, verb, result = f"Rows {rows}", "are", "their predictions are"
-                warnings.warn(
-                    f"{rows} {verb} not estimable from this rank-deficient fit, so {result} NaN.",
-                    RowsNotEstimableWarning,
-                    stacklevel=2,
-                )
+            if note["kind"] in classes:
+                warnings.warn(note["message"], classes[note["kind"]], stacklevel=2)
         fit = _f64(r["fit"])
         if not (se_fit or future):
             return fit
@@ -1629,17 +1532,16 @@ class Fit:
         take them, None when the fit has none (a model fit, or one pickled
         before them). A key missing from a record pickled before it is left
         out, so the native call names it."""
+        from glmm.summary import _f64_bytes
+
         rec = self.robust
         return {
             "model_vcov": self._model_vcov_arg(),
             "robust": None
             if rec is None
             else {
-                **{
-                    k: np.asarray(rec[k], dtype=float).tolist()
-                    for k in ("t", "er", "row_e", "row_x", "row_phi")
-                    if k in rec
-                },
+                **{k: np.asarray(rec[k], dtype=float).tolist() for k in ("t",) if k in rec},
+                **{k: _f64_bytes(rec[k]) for k in ("er", "row_e", "row_x", "row_phi") if k in rec},
                 **{
                     k: [np.asarray(v, dtype=float).tolist() for v in rec[k]]
                     for k in ("f", "epe", "null")
@@ -1808,36 +1710,6 @@ def _raise(store, entry, category):
         category=category,
         stacklevel=level,
     )
-
-
-def _pinned_detail(res):
-    """Names of the RE components the optimizer pinned at the boundary, as
-    `<term> in <group>`, for the singular warning.
-
-    Read straight off `diagnostics["pinned"]`, which is the kernel's own record
-    of what it pinned. Do NOT reconstruct it from `varcorr`: on a grouping with
-    q >= 2 the pin fixes the diagonal of the Cholesky factor, while the reported
-    stddev is sqrt(lambda_offdiag^2 + lambda_diag^2) and so lands at ~1e-9
-    rather than at 0 — a scan for exactly-zero stddevs misses those pins.
-
-    An empty result means nothing was pinned — including a model with no
-    variance components to pin. `singular` can still be `True` with nothing
-    pinned (the post-hoc negligible-stddev check is independent of the
-    optimizer's own pin decision), so the bare lme4 text stands regardless;
-    the caller must not read an empty result as "not singular"."""
-    parts = []
-    # strict: the kernel emits one flag row per varcorr block, so a length
-    # mismatch is a bug to surface, not groupings to drop quietly.
-    for flags, (group, terms) in zip(res.diagnostics["pinned"], res.re_groups, strict=True):
-        for i, is_pinned in enumerate(flags):
-            if is_pinned:
-                term = terms[i] if i < len(terms) else f"component {i}"
-                parts.append(f"{term} in {group}")
-    return parts
-
-
-def _count(n, word):
-    return f"{n} {word}" if n == 1 else f"{n} {word}s"
 
 
 def _check_call(formula):
@@ -2067,8 +1939,8 @@ def _prepare_columns(
 
 def _check_lengths(lengths):
     """Raise when the `{name: length}` columns of `lengths` differ in length."""
-    # Same message as `table_of`'s length check in `src/orchestrate.rs` — change
-    # together.
+    # Same message as `table_of`'s length check (glmm's orchestrate module) —
+    # change together.
     if len(set(lengths.values())) > 1:
         detail = ", ".join(f'"{name}": {n}' for name, n in sorted(lengths.items()))
         raise ValueError(
@@ -2097,7 +1969,7 @@ def _term_result(t):
     """A stored per-term result (the native `fit`'s dict) with its numeric columns
     as float arrays; see `Fit.term_table_type3`."""
     if t["error"] is not None:
-        return {"error": t["error"]}
+        return {"error": t["error"], "error_code": t["error_code"]}
     numeric = ("statistic", "num_df", "den_df", "p_value", "sum_sq", "mean_sq", "eta2_partial")
     return {k: np.asarray(v, dtype=float) if k in numeric else v for k, v in t.items()}
 
@@ -2214,7 +2086,7 @@ def _fit_from_native(r, formula, store, kept):
         reml=r["reml"],
         fitted=_f64(r["fitted"]),
         ranef=_f64(r["ranef"]),
-        ranef_levels=np.frombuffer(r["ranef_levels"], dtype=np.uint64).astype(int),
+        ranef_levels=np.frombuffer(r["ranef_levels"], dtype=np.int64).copy(),
         ranef_blocks=[_ranef_block(b) for b in r["ranef_blocks"]],
         formula=formula,
         family=r["family"],
@@ -2260,20 +2132,9 @@ def _fit_from_native(r, formula, store, kept):
     # code, after the data's own (`rows_dropped_na`).
     for w in r["argument_notes"]:
         _raise(store, w, _CATEGORIES.get(w["kind"], DiagnosticWarning))
-    # Singularity is not assessed on a fit that did not converge: the kernel never sets
-    # `singular` there (the post-hoc check and the boundary flags are gated on
-    # `converged`), so `m.singular` reads False on a non-converged fit. `and res.converged`
-    # below is a defensive guard, not load-bearing on the current kernel.
-    if res.singular and res.converged:
-        affected = _pinned_detail(res)
-        _warn(
-            store,
-            "singular",
-            "The random effects are too complex for the data: a variance is estimated at "
-            "or near zero, or a correlation at or near −1 or 1. Consider removing the "
-            "affected random effect." + (f" Affected: {', '.join(affected)}." if affected else ""),
-            SingularFitWarning,
-        )
+    # The singular warning of a converged fit, worded by the native code.
+    if r["singular_warning"] is not None:
+        _raise(store, r["singular_warning"], SingularFitWarning)
     # The notes and the non-convergence warning come with their text
     # (glmm-bind/src/notes.rs); a note without a message raises nothing.
     for note in res.diagnostics["notes"]:
@@ -2405,8 +2266,6 @@ def fit(
     treated the same way, with levels `FALSE`/`TRUE` — so a bool `x` gives a
     coefficient `xTRUE`, as in lme4 — except as the response or the `offset()`
     column, which stay 0/1 numbers.
-
-    See the API spec for the remaining knobs.
     """
     _check_call(formula)
     store = []

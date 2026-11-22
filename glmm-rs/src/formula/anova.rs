@@ -74,7 +74,7 @@ use super::hypotheses::{
 };
 use super::parse::{parse, ParsedFormula, RandomEffect};
 use super::{fixed_part_relation, FixedPartRelation, FixedTerm, Lowered, ParseError};
-use crate::fit::vech_q;
+use crate::fit::{vech_at, vech_q};
 use crate::inference::contrast::ContrastError;
 use crate::inference::lr::{lr_p_value, lr_statistic};
 use crate::inference::rlrt::{exact_rlrt, RlrtConfig, RlrtRefusal, RLRT_MAX_LEVELS};
@@ -287,7 +287,7 @@ fn random_inside(
 /// [`Fit::varcorr()`]): the variances.
 fn diagonal(block: &[f64]) -> impl Iterator<Item = f64> + '_ {
     let q = vech_q(block.len());
-    (0..q).map(move |i| block[i * q - (i * i - i) / 2])
+    (0..q).map(move |i| block[vech_at(q, i, i)])
 }
 
 /// The options of a comparison: the draws and the seed of the exact
@@ -310,6 +310,9 @@ pub struct ModelInfo {
     /// The side's formula.
     pub formula_label: String,
     /// The parameter count ([`Fit::df`]).
+    // On the F test's fits it counts one scale parameter (sigma or phi) beside
+    // the coefficients, which glmm-bind's `side_record` subtracts for the
+    // residual df; change together.
     pub npar: usize,
     /// The row count.
     pub nobs: usize,
@@ -854,15 +857,8 @@ fn lr_test(
     mut notes: Vec<LrNote>,
 ) -> LrTest {
     let df = large.df.saturating_sub(small.df);
-    // The zero-component rule needs both log-likelihoods above `−∞` (false
-    // for NaN): a fit that failed or collapsed gives NaN, never T = 0.
-    let usable = |l: f64| l > f64::NEG_INFINITY;
     let zero = differs == Differs::Random && dropped_at_zero(small, large);
-    let (statistic, floor) = if zero && usable(small.loglik) && usable(large.loglik) {
-        (0.0, None)
-    } else {
-        lr_statistic(small.loglik, large.loglik)
-    };
+    let (statistic, floor) = lr_statistic(small.loglik, large.loglik, zero);
     notes.extend(floor);
     let reference = match large.random_dims().saturating_sub(small.random_dims()) {
         0 => Reference::ChiSquared { df },
@@ -881,9 +877,7 @@ fn lr_test(
                                 seed: opts.seed,
                                 parallel_inner: false,
                             };
-                            let pinned =
-                                large.varcorr.first().and_then(|b| b.first()) == Some(&0.0);
-                            exact_rlrt(counts, s, c, large.loglik, small.loglik, pinned, &cfg)
+                            exact_rlrt(counts, s, c, statistic, &cfg)
                         };
                         match exact {
                             Ok(r) => {
@@ -1710,7 +1704,7 @@ pub(super) fn lrt_test(larger: &Fit, smaller: &Fit, df: usize) -> LinearTest {
     let reference = Reference::ChiSquared { df };
     let usable = |f: &Fit| f.converged() && f.loglik.is_finite();
     let (statistic, notes) = if usable(larger) && usable(smaller) {
-        let (statistic, floor) = lr_statistic(smaller.loglik, larger.loglik);
+        let (statistic, floor) = lr_statistic(smaller.loglik, larger.loglik, false);
         let note = floor.is_some().then_some(LinearNote::NegativeStatistic);
         (statistic, note.into_iter().collect())
     } else {
@@ -1816,7 +1810,10 @@ fn refit(
         ..full
     }
     .re_columns(&z, sources.len());
+    // The refit's random-effect pattern is the checked fit's (the same ids and
+    // block widths), which factored, so the refusal cannot fire here.
     crate::fit::fit_checked(&data, &model, Some(&start), &opts)
+        .expect("the checked fit's random-effect pattern factors")
 }
 
 /// Every grouping's random-slope columns in `lowered`'s model: the primary
@@ -1862,8 +1859,7 @@ pub(super) fn theta_start(fit: &Fit) -> Vec<f64> {
             return Vec::new();
         }
         let q = vech_q(block.len());
-        // Column-major vech: column `c` holds rows `c..q`.
-        let at = |r: usize, c: usize| block[c * q - c * c.saturating_sub(1) / 2 + r - c];
+        let at = |r: usize, c: usize| block[vech_at(q, r, c)];
         let floor = q as f64 * f64::EPSILON * diagonal(block).sum::<f64>();
         let mut l = vec![0.0; q * q];
         for c in 0..q {

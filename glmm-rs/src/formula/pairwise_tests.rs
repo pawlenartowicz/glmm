@@ -38,7 +38,7 @@ fn close(a: f64, b: f64) -> bool {
 #[test]
 fn holm_and_bonferroni_follow_p_adjust() {
     let check = |p: &[f64], adjust, want: &[f64]| {
-        let got = adjust_p(p, adjust);
+        let (got, _) = adjust_p(p, adjust);
         assert_eq!(got.len(), want.len());
         for (g, w) in got.iter().zip(want) {
             assert!(
@@ -435,4 +435,28 @@ fn pairwise_ignores_unused_levels() {
         assert_eq!(key(&b), key(&a), "{factor}");
     }
     assert_eq!(pairwise(&m1, "g", None, Adjust::Holm).unwrap().levels, 3);
+}
+
+/// A reference grid whose dense design would pass 2^25 entries is refused
+/// before it is built: a 4-level factor beside a 500-level and a 100-level
+/// fixed factor is 200,000 rows, at 600 columns 1.2e8 entries. A column count
+/// whose entry count overflows `usize` is refused the same way.
+#[test]
+fn an_oversized_reference_grid_is_refused() {
+    let levels = |name: &str, k: usize| {
+        (
+            name.to_string(),
+            (0..k).map(|i| format!("{name}{i}")).collect::<Vec<_>>(),
+        )
+    };
+    let refused = |lv: &[(String, Vec<String>)], p: usize| {
+        matches!(
+            super::reference_grid(lv, &[], "a", None, p),
+            Err(Error::Fit(FitError::Envelope(_)))
+        )
+    };
+    let big = [levels("a", 4), levels("b", 500), levels("c", 100)];
+    assert!(refused(&big, 600));
+    assert!(refused(&big[..2], usize::MAX));
+    assert!(!refused(&[levels("a", 4), levels("b", 5)], 10));
 }

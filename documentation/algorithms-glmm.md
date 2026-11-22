@@ -44,7 +44,7 @@ The recurring symbols on this page, defined once here before first use:
 **Code:** `classify_design` (`src/fit/mod.rs`) and the `(family, Some(_))` arm
 of the dispatch match in `build_workspace` (`src/fit/core.rs`); `check_model_shape`
 (`src/fit/common.rs`); envelope caps in `src/consts.rs` (`MAX_PRIMARY_Q`,
-`MAX_EXTRA_GROUPINGS`, `MAX_EXTRA_Q`); the dense-tail bound `DENSE_TAIL_MAX_BYTES` (`src/fit/mod.rs`).
+`MAX_EXTRA_GROUPINGS`); the dense-tail bound `DENSE_TAIL_MAX_BYTES` (`src/fit/mod.rs`).
 
 `classify_design` returns `Solver::NoZ` (the dense clustered kernel) or `Solver::Sparse`. A design routes **Sparse** when it is over the dense envelope (`q_p > 8`, more than 6 extra groupings, or any extra grouping with `1 + slopes.len() > 4`), when *any* extra grouping carries a random slope, or when the structured layout's `e × e` crossed-tail buffers (`schur_blk`, the exact β-profile's `tail_inv`, the conditional variances' `sinv` and its packed lower triangle, counted as four) would pass `DENSE_TAIL_MAX_BYTES` (1 GiB, 256 MiB on wasm32: more than 5,792 crossed levels, 2,896 on wasm32); otherwise it stays **NoZ**. A GLMM has no crossed-level cap below that bound, and `condvar` does not change its layout. (For a slope-carrying extra `Solver::Sparse` is not a speed choice: only the packed-row `A`-layout applies a full `q_g×q_g` Λ block per extra level.)
 Before this check the fit picks the reading and order of the groupings from the ids: a nest keeps its nested reading up to 5 children per parent, only the readings that land on the blocked or structured layout are kept when any does, and the grouping with the most columns goes first ([dispatch map](algorithms.md#full-dispatch-map)).
@@ -70,9 +70,10 @@ once dispatch is inside the GLMM path. The hard rejections are the shape
 checks at the stable boundary (`check_model_shape`, `src/fit/common.rs`):
 `nAGQ` must be odd in `1..=25`, and `nAGQ>1` is allowed only on a single
 grouping factor (no extras), `q_p ≤ 3` random effects per group,
-binomial/Poisson/negative-binomial/Gamma GLMM. The same check also covers the engine invariants that
-hold at `nAGQ = 1`: every primary/extra slope column must index within `p`,
-and at most one `NestedWithin` extra grouping is accepted. It also rejects
+binomial/Poisson/negative-binomial/Gamma GLMM. The same check also covers an engine invariant that
+holds at `nAGQ = 1`: at most one `NestedWithin` extra grouping is accepted.
+The slope columns are checked against the data in `check_slope_columns`
+(`src/fit/common.rs`): every primary/extra slope index must be below `p + s`. It also rejects
 `(Family::InverseGaussian, Some(re))` outright — a family × random-effects
 gate rather than a shape gate — because the GLMM objective needs a profiled
 `inverse.gaussian()$aic` term that is not built, so `InverseGaussian` never
@@ -96,7 +97,8 @@ crossed extra → `fit_sparse_binomial_slope_crossed_is_pinned` in
 **Code:** `pirls_solve_packed` (packed-row, `src/glmm/pirls/packed.rs`),
 `pirls_solve_blocked` (no extras, `src/glmm/pirls/blocked.rs`) and
 `pirls_solve_blocked_extras` (structured crossed/nested,
-`src/glmm/pirls/blocked_extras.rs`); caps `PIRLS_MAX_ITERS = 200`,
+`src/glmm/pirls/blocked_extras.rs`; the two blocked solves share their
+accept/halve/stop decisions through `PirlsControl`, `src/glmm/pirls/control.rs`); caps `PIRLS_MAX_ITERS = 200`,
 `PIRLS_MAX_HALVINGS = 16`, the period-2 detector's `PIRLS_OSC_RATIO = 0.8` and
 `PIRLS_OSC_TRIGGER = 3`, and the tolerance selector `pirls_tol` in
 `src/glmm/mod.rs`.
@@ -111,9 +113,9 @@ IRLS step `u_new = A⁻¹(Mᵀ(W·Mu) + Mᵀρ)` written as an increment: that f
 carries `(A − I)u`, of size `θ²·Σwᵢ·|u|`, whose rounding lands in `u` along
 any direction `M` nearly annihilates (crossed intercepts, a slope constant
 within a cluster) and stalled the solve at counts near `e³³`; in the increment
-form the rounding shrinks with `δu`. `log|A|` is read off that same factor, so the
-deviance term needs no re-factorization. The factor is built from W at the
-iterate the last step started from, not at the returned `u` — see
+form the rounding shrinks with `δu`. A converged solve re-evaluates η, μ and W
+at the returned `u` and refactors `A` there (`pirls::evaluate_at_mode`), so the
+deviance, the penalty and `log|A|` describe one iterate; see
 [§Laplace approximation](#laplace-approximation). Three variants handle the RE
 structure:
 
@@ -226,9 +228,17 @@ times, after which the solve reports failure `(NaN, NaN, NaN, false)`. A
 within-band rise is treated as FP noise near the optimum and accepted without
 burning a halving. A non-finite trial (an overflowed step) always counts as an
 overshoot and is halved, as lme4's `ISNAN(pdev)` branch does; on the exact
-profile the same holds for a non-finite merit. In Profile mode (below) the joint
-`(u, β)` step is backtracked in lockstep, halving β toward `beta_prev` alongside
-`u`.
+profile the same holds for a non-finite merit. A trial whose raw η passes the
+link's clamp where the row's data pull it back (`family::eta_infeasible`) is
+not halved blindly: η is affine along the step, so the fraction `s` at which
+the first such row reaches its bound is known, and the trial is pulled back in
+one evaluation to `2^−m`, the largest power of two not above `s` (at most ½).
+Repeated halving reaches the same fraction whenever it gets back inside; being
+at or below `s`, it needs no margin to stay inside the bound; and a step that
+overshoots by more than `2^16` no longer exhausts the cap. The jump counts as
+one halving; other rejected trials halve as before. In Profile mode (below) the
+joint `(u, β)` step is backtracked in lockstep, halving β toward `beta_prev`
+alongside `u`.
 
 **Period-2 damping.** An undamped step can overshoot the mode so that the
 iteration map has an eigenvalue at or below −1, and the iterates settle into a
@@ -274,7 +284,8 @@ pinned by `fit_glmm_cbpp_aggregated_matches_lme4`,
 
 **Code:** `BetaMode::{Fixed, ProfilePql, ProfileExact}` and
 `BetaStep::{Fixed, Profile { exact, .. }}` in `src/glmm/pirls/mod.rs`; the
-route driver in `glmm::fit_glmm` (`src/glmm/mod.rs`), fixed per shape at
+route driver in `glmm::fit_glmm` (`src/glmm/mod.rs`) and `bobyqa_route::bobyqa_route`
+(`src/glmm/bobyqa_route.rs`), fixed per shape at
 construction by `GlmmWorkspace.outer_search: OuterSearch` and
 `exact_profile_shape` (`src/glmm/mod.rs`).
 
@@ -344,7 +355,8 @@ never mixed within a fit:
   deviance at θ, not the PQL objective — with the correction term controlling
   for the trial `u` sitting off the conditional mode (see the PIRLS solvers'
   own comments for the full derivation: `src/glmm/pirls/blocked.rs`,
-  `src/glmm/pirls/blocked_extras.rs`). Because this θ-only pass already
+  `src/glmm/pirls/blocked_extras.rs`, and the accept test itself,
+  `PirlsControl::merit` in `src/glmm/pirls/control.rs`). Because this θ-only pass already
   reaches the Laplace optimum, no joint polish follows — its status alone
   gates convergence, on the shapes `exact_profile_shape` selects (nAGQ=1 on
   any layout but the packed one — the blocked layout with no extra groupings,
@@ -363,6 +375,47 @@ starts at 0.1 instead when the stage-1 optimum has a diagonal |θ̃| below
 small radius can stop on the flat boundary surface short of the optimum.
 `bobyqa` fixes the radius when a solver is built, so the warm stage-1 and the
 near-singular polish searches run on their own solvers, built on first use.
+
+**Search scale.** Every search of a fit (stage 1 and its polish, the joint
+search, the gradient search and its polish, the trough polish) sees the
+objective divided by `GlmmWorkspace::search_div`: the power of two nearest the
+arithmetic mean of the prior weights the fit runs on when that power is below
+1, and 1 otherwise. BOBYQA's step test in `trsbox` and its reduction test, and
+the gradient search's projected-gradient, decrease and certificate tests, are
+absolute and sized for an objective near 1, while a binomial, Poisson or
+negative-binomial objective is of size Σw. Undivided, at uniform weights far
+below 1 BOBYQA refuses every trust-region step (at 1e-14 the model gradient is
+about 1e-13 against a threshold of 3e-9) and the gradient search stops at its
+start, so the fit ends at its start or on a fixed path from it and reports
+converged. A power of two keeps the division exact, so a fit whose mean weight
+rounds to 1 or more, every unweighted fit among them, is not divided at
+all. Gamma and inverse-Gaussian weights reach the fit already divided by
+their weight scale, a power of two near their geometric mean, so their
+arithmetic mean is at least about 0.7 and their divisor is 1 on any weights.
+The reported
+deviance, the searches' incumbents, the pin and saddle checks and every band
+outside the optimizers (`PIN_DEVIANCE_SLACK`, `JOINT_RECHECK_ABS`, the
+dispersion scale probe) keep the unscaled values; at tiny weights those bands
+are only looser against the objective. The curvature hint is the search's
+inverse Hessian as it is, in the search's units: β̃ is whitened by the weighted
+design (the β coordinates below), so the searched objective's curvature does
+not follow the weights, and a hint taken at one weight scale serves a draw at
+another. Measured 2026-11-17 on 40 rows in 8 groups
+with every weight equal: Laplace fits at 1e-14 and 1e-100 end at σ̂ = 0,
+singular, with β at the GLM fit within 1e-14, and nAGQ 5 fits at 1e-8 to
+1e-100 end at σ̂ = 0, singular, with β at the GLM fit within 2e-7. Undivided,
+the Laplace fits stop at σ̂ = 0.7556 and the AGQ fits at their start after one
+evaluation. Divided, but without the digits `log|A|` keeps
+([Laplace approximation](#laplace-approximation)) and the quadrature sums keep
+for the data part and `A − 1`
+([Adaptive Gauss–Hermite quadrature](#adaptive-gausshermite-quadrature-agq)),
+the Laplace fits stop at σ̂ from 1.2e-4 to 5.4e-4, above the pin threshold, and
+the AGQ fits at σ̂ up to 8.8e-3 at 1e-14 and at their start at 1e-100. **Validation:**
+`small_uniform_count_weights_move_the_glmm_off_its_start`
+(`tests/invariance.rs`),
+`tiny_uniform_weights_end_no_higher_than_the_glm_at_theta_zero` and
+`a_hint_from_any_weight_scale_serves_a_tiny_weight_draw`
+(`src/fit/glmm_tests.rs`).
 
 **Saddle check after `ExactProfile`.** The deviance is even in each column of
 a block's Λ (Σ = ΛΛᵀ sums `l_d·l_dᵀ` over the columns), so a zero column is a
@@ -423,7 +476,7 @@ eleven other joint-search cells measured the median counts agree to 5%, but
 for one wide Gamma cell on the singular boundary (+22%), whose own count spans
 16802 to 23113 across six nudges.
 **Code:** `BetaScale` (`src/glmm/workspace.rs`), its call sites in
-`fit_glmm` and in the SE block (`src/glmm/se.rs`). **Validation:** the Gamma GLMM cases of
+the search stages (`src/glmm/grad_route.rs`, `src/glmm/bobyqa_route.rs`, `src/glmm/pin.rs`) and in the SE block (`src/glmm/se.rs`). **Validation:** the Gamma GLMM cases of
 `unit_invariance_on_every_route` (`src/fit/standardize_tests.rs`).
 
 The design Gram leaves out the working weights `W`. Where they span decades
@@ -488,7 +541,7 @@ converge, which ends the fit. **Validation:**
 `any_within_flags_an_optimum_next_to_a_non_finite_eval` (`src/glmm/tests.rs`) drives
 this check directly, below the fit level: a plain 1-D `Bobyqa` run on a
 synthetic objective with a `+INFINITY` region next to (but not at) its true
-minimum, checked with `any_within` exactly as `fit_glmm` does.
+minimum, checked with `any_within` exactly as the searches do (`src/glmm/bobyqa_route.rs`).
 
 **Warm-start guard and `PqlThenJoint` fallback.** A warm fit
 (`theta_start.is_some()`) first evaluates the outer objective — the route's
@@ -569,8 +622,8 @@ starts that fail without the trust region.
 
 ### Gradient search (BFGS) on Laplace and scalar-intercept AGQ fits
 
-**Code:** `gradient_route_plan`, `GradSearch` and the gradient-route block of
-`fit_glmm` (`src/glmm/mod.rs`); `assembled::gradient_at_mode`
+**Code:** `gradient_route_plan` (`src/glmm/mod.rs`); `GradSearch` and
+`gradient_route` (`src/glmm/grad_route.rs`); `assembled::gradient_at_mode`
 (`src/glmm/assembled.rs`); `agq_gradient::{covers_shape, assemble}`
 (`src/glmm/agq_gradient.rs`); the driver `optim::bfgs::bfgs_minimize`
 (`src/optim/bfgs.rs`), shared with the LMM's per-group route
@@ -702,7 +755,9 @@ the re-solve one cost 1.83.
 
 **Stops, certificate and fallback ladder.** The driver stops on a projected
 gradient below `1e-6`, an accepted decrease below
-`max(fdelta_abs = 1e-10, 16·ε·|f|)` (deviance units: a relative stop grows
+`max(fdelta_abs = 1e-10, 16·ε·|f|)` (in units of the objective the search
+sees, "Search scale" under
+[β profiling](#β-profiling--the-three-outer-routes); a relative stop grows
 with n and ended a 300k-row fit 4.7e-4 above its optimum), or at the deviance's
 noise floor, every trial's predicted decrease below the same threshold. The
 LMM route uses 1e-9; the GLMM route's is 1e-10 (`BfgsConfig::GLMM`). Along a
@@ -733,10 +788,11 @@ reaches it. Then:
    no stage 1, the joint search restarts at `GLMM_RHO_BEGIN`. Only a failed
    line search or the iteration cap raise `Note::GradientSearchFallback`; where
    the gradient is not defined the BOBYQA route is the designed handler. When
-   that route ends with no result, a finite incumbent is the fit's capped
-   endpoint (`converged = false`, `boundary_hit = 2`, no fallback note): BFGS
-   holds β at its point while stage 1 profiles it, and on a ridge the profile
-   can fail around a point BFGS evaluated.
+   that route ends more than the joint recheck band above the incumbent, the
+   incumbent is the fit's capped endpoint (`converged = false`,
+   `boundary_hit = 2`, no fallback note); from the plateau the route restarts
+   at the search's start and can end higher than the point it was handed. A
+   route that ends with no result is a failed fit, as on every other route.
 
 On AGQ a fit that steps 2 or 3 finish then goes through the joint search's
 check and second pass (`JOINT_RECHECK_TOL`, see
@@ -868,7 +924,20 @@ the kernel's own factor, which is `A_obs`, with `dW_obs/dη` from
 `pen_dev + 2·logdet`, with `pen_dev = dev + pen` (the deviance plus the
 penalty `‖ũ‖²`) — `logdet` accumulates `Σ ln L_ii` off the
 Cholesky factor, i.e. `½·log|A|`, so `2·logdet` *is* the `log|A|` of the
-formula. All three terms come from the returned mode ũ: a converged PIRLS solve
+formula. On the crate's own factors (the blocked layout's per-cluster blocks,
+the structured layout's core blocks and its dense tail) the `+I` is added at
+each pivot instead of before the factor (`linalg::block_chol_unit_shift`):
+with `B = MᵀWM`, the pivot's excess over 1 is `e_j = B_jj − Σ_k L_jk²`,
+`L_jj = √(1 + e_j)`, and `logdet` gains `½·ln_1p(e_j)`. The factor is the
+same one, by the same operations; only its log-determinant keeps the digits of
+an `e_j` below ε, which adding the 1 first rounds away. At prior weights all
+1e-100 that lost all of `log|A|`, so the objective was flat in θ apart from
+the penalty; at 1e-14 it kept one or two digits. The AGQ scale term reads the
+same per-cluster half log-determinant (`PirlsScratch::a_half_logdet`) rather
+than `ln` of the factor's diagonal. The faer-factored arms (the packed layout,
+dense and sparse, and the structured layout's sparse tail, the production
+route for a crossed tail) add the identity first and take `Σ ln L_ii` off
+faer's factor, so they still lose an `MᵀWM` far below 1. All three terms come from the returned mode ũ: a converged PIRLS solve
 ends by re-evaluating η/μ/W there, rebuilding `A = MᵀWM + I` from that W and
 refactoring it, so `dev`, `pen`, `logdet` and the factor the standard-error
 pass inherits describe one iterate. That last rebuild is what the objective needs:
@@ -923,10 +992,36 @@ flowchart TD
 `agq_deviance` first converges each cluster's mode ũ_c and curvature A_c via the
 same blocked PIRLS, then integrates the conditional likelihood with `k = nAGQ`
 adaptive Gauss–Hermite nodes `u_cj = ũ_c + √2·σ_c·z_j` (`σ_c = 1/√A_c`),
-combined by log-sum-exp with the Liu–Pierce (1994) reweight `w_j·e^{z_j²}`. At
-`k = 1` the single node sits at the mode with weight √π and the bracket
-collapses to the Laplace term exactly — so `nagq == 1` routes to
-`laplace_deviance` verbatim. `nAGQ` must be **odd** (the GH table stores orders
+combined with the Liu–Pierce (1994) reweight `w_j·e^{z_j²}`.
+Each cluster contributes
+
+```text
+−2·ℓ_c(ũ_c) + ln_1p(A_c − 1) − 2·ln_1p[ Σ_j w_j·expm1(x_cj) / Σ_j w_j ],
+x_cj = z_j² + ℓ_c(u_cj) − ℓ_c(ũ_c) = −h_cj·(ũ_c − ½·(A_c − 1)·h_cj) + [data part],
+```
+
+with `h_cj = u_cj − ũ_c` and the data part the change of the data loglik from
+the mode to the node (the row-term difference of the node sums below, or the
+node's data sum minus the mode's). This is
+`log[(1/√π)·Σ_j w_j·e^{x_cj}]` less the constant `ln Σ_j w_j − ln √π`, which is
+zero for the exact GH weights and an ulp-level rounding of the `f64` table,
+the same at every θ and β, so it is dropped. The node sum is centred on the
+mode, not max-shifted: each node enters the bracket as `w_j·expm1(x_cj)`. It
+stays finite because the converged mode maximises `ℓ_c` on these log-concave
+families, so every `x_cj` is at most the node's own `z_j²` (bounded by the
+grid), and an odd `k` puts a node at the mode (`x = 0`), so the `ln_1p`
+argument stays above −1. `A_c − 1` is kept apart from the
+factor (`PirlsScratch::a_excess`, copied before the Cholesky overwrites the
+block). Every term of `x_cj` is then of the size of the data part and of
+`A_c − 1`, and `expm1` and `ln_1p` keep their digits where both are far below
+ε, as at prior weights near 1e-100; a node sum of `exp` against an O(1)
+center, or a bracket `ln Σ_j − ln √π`, would round them to a constant.
+`agq_deviance_vec` takes the same form with `B_c = A_c − I` in place of
+`A_c − 1`: `x_cj = −h_cj·(ũ_c − ½·B_c h_cj) + [data part]`, the product weights
+`W_j = Π_d w_{j_d}`, and `log|A_c|` for the scale term. At `k = 1` the single
+node sits at the mode with weight √π, `x = 0`, and the bracket collapses to
+the Laplace term exactly — so `nagq == 1` routes to `laplace_deviance`
+verbatim. `nAGQ` must be **odd** (the GH table stores orders
 `1, 3, …, 25`), enforced by `check_model_shape`. Prior weights thread through
 unchanged — the per-row `dev_resid` sums carry `wᵢ` and PIRLS folds the weights
 into each cluster's mode and curvature, so aggregated binomial with AGQ
@@ -1020,9 +1115,11 @@ No layout materializes a dense `Z`. `GlmmLayout::for_design` reads
 | packed | one `k×k`, dense (`a`/`a_chol`) or sparse-factored (`PackedSparse`), never both | `pirls_solve_packed` (`f64`) | no | no | everything `classify_design` sends to `Solver::Sparse`, plus an extras design whose core is too wide for the structured route |
 
 The outer search, the NB coordinate search, the SE dispatch and the
-diagnostics are one code path over all three layouts: `fit_glmm` and
-`run_glmm_nb_on` never branch on which layout a fit took, only
-`GlmmLayout::for_design` does. The packed layout has no dual kernel — its
+diagnostics are one code path over all three layouts. Only
+`GlmmLayout::for_design` makes the routing decision; `fit_glmm` reads it for
+the mode-sign order, the extra-slopes guard and the rounding estimate, and the
+assembled engine keeps packed shapes off its blocked/structured dispatch by
+explicit checks. The packed layout has no dual kernel — its
 PIRLS is `f64`-only — but its derivatives come from the assembled engine,
 which rebuilds `M`, `η`, `W` and the dense `A` at `Dual<N>` around û's
 explicitly solved lanes `U = −G_u⁻¹G_γ`, so its Hessian standard error is
@@ -1102,7 +1199,7 @@ conditions on θ̂. `WaldSe::Rx` conditions on θ̂ by construction. **Validatio
 
 ## Gamma dispersion
 
-**Code:** `glmm::fit_glmm` (the `ln φ` coordinate and its seed),
+**Code:** `glmm::fit_glmm` (the `ln φ` coordinate), `start::seed_start` (its seed, `src/glmm/start.rs`),
 `family::gamma_dispersion_term`, `assembled::gamma_ln_phi_gradient` (its
 gradient entry), `GlmmWorkspace::gamma_phi` and
 `GlmmWorkspace::at_fixed_dispersion` in `src/glmm/workspace.rs`, and the
@@ -1272,14 +1369,7 @@ The likelihood can have two basins whose θ live on scales decades apart:
 cluster η (`Σw/Σwy` over a primary-grouping level). Read off the data and the
 GLM start, before any search:
 
-- **The first search** runs on the draw's `y/c` while the largest cluster η
-  (read on `y/c`) lies in `[1/64, 64]`, and on `y/c` rescaled by a further
-  power of two to bring it into `[4, 8]` outside. Measured
-  on y·k, k over 2⁻²⁰ to 2²⁰, for a 12-row design whose four cluster means
-  span up to nine decades and for 15-row corpus fits: on y as given the
-  interior optimum is reached with that η from about 2 to 12, and the search
-  ends converged short of it, with no sign the retry reads, mostly outside
-  `[1/64, 64]`.
+- **The first search** runs on `y/c` rescaled by the power of two nearest 1 that brings the largest cluster η (read on `y/c`) into `[8, 16]`. Measured on y·k, k over 2⁻²⁰ to 2²⁰, for a 12-row design whose four cluster means span up to nine decades and for 15-row corpus fits: on y as given the interior optimum is reached with that η from about 2 to 12, and the search ends converged short of it, with no sign the retry reads, mostly where that η is below 1/64 or above 64. `[8, 16]` lies inside that band at any scale of y, and on the accuracy grid's 24 Gamma-inverse cells it took the fewest evaluations (`[4, 8]` and `[16, 32]` took more).
 - **The GLM point**: the objective at θ = 0, the β start and its best φ (the
   held φ when there is one), a point every search could reach.
 
@@ -1319,8 +1409,8 @@ units above the optimum.
 ## Warm starts and workspace reuse
 
 **Code:** `GlmmWorkspace::for_cluster_spec` / `from_groupings` in
-`src/glmm/workspace.rs`; within-fit seeding in `glmm::fit_glmm`
-(`src/glmm/mod.rs`); `glm_warm_start_beta` (`src/fit/glmm.rs`). A
+`src/glmm/workspace.rs`; within-fit seeding in `start::seed_start` and
+`start::choose_start` (`src/glmm/start.rs`); `glm_warm_start_beta` (`src/fit/glmm.rs`). A
 `loop_advanced` caller reaches this reuse through `build_workspace`/`fit_on`
 (see [`tutorial-rust.md`](tutorial-rust.md) §3), which owns the `GlmmWorkspace`
 rather than handing it over.
@@ -1346,8 +1436,7 @@ only once `fill_packed_cols` settles on the dense factor; a sparse-factored
 packed fit keeps them `0 × 0` and holds `A` in CSC form with its sparse
 Cholesky (`PackedSparse`), so its footprint is the fill of `L`, not `8k²`
 bytes. A single workspace is reused across every BOBYQA
-evaluation and PIRLS iteration of one fit with no reallocation; the warm path
-is zero-alloc (each BOBYQA solver is constructed once: the cold ones with the workspace, the warm stage-1, the near-singular polish (also the AGQ gradient route's polish) and the saddle-check restart solvers on first use). The shape-compatibility rule is a **contract, not a runtime check**: the
+evaluation and PIRLS iteration of one fit with no reallocation. On the shapes the warm-path allocation tests cover (`fit_glmm_warm_path_bounded_alloc` and `fit_glmm_structured_warm_path_bounded_alloc`: logit, blocked and structured) the warm path allocates a small fixed count per fit (each `Bobyqa` is built once: the cold solvers with the workspace, the warm stage-1 and the near-singular polish solver on their first use), except that the record of non-finite evaluations grows on a fit that has one. The free-φ Gamma `ExactProfile` route allocates in every fit (its dispersion probe memo and its scaled-box copies); no test bounds the other shapes. The shape-compatibility rule is a **contract, not a runtime check**: the
 buffers are fixed at construction, and nothing in the crate detects a mismatch
 — a `loop_advanced` caller must construct a fresh workspace whenever the row
 count would exceed `max_n`, `p` changes, or the RE topology changes (any shift
@@ -1410,14 +1499,16 @@ Differentiating around the wrong basin produced an indefinite Hessian and cost
 the fit its SEs entirely.
 
 **Validation:** the warm/cold equivalence is a MLE property (start-independent
-optimum), exercised implicitly by every rung; the zero-alloc reuse discipline is
-the `loop_advanced` MCPower hot-loop surface.
+optimum), exercised implicitly by every rung; the allocation bound of the
+`loop_advanced` hot-loop surface by the two warm-path allocation tests above
+(`alloc-tests` feature, `src/glmm/tests.rs`).
 
 ## Boundary handling and the `singular` flag
 
 **Code:** the post-pin pass after the outer search ends (converged or out
-of budget) in `glmm::fit_glmm` (`src/glmm/mod.rs`), which runs the pin pass
-`lmm::pin_endpoint` shared with `fit_lmm`, the stationarity probe
+of budget) in `pin::post_pin` (`src/glmm/pin.rs`), which runs the pin pass
+`lmm::pin_endpoint` shared with `fit_lmm`, the plateau probe
+(`PLATEAU_PROBE_THETA`, same file), the stationarity probe
 `optim::post_pin::stationarity_gain` (`src/optim/post_pin.rs`) and
 `lmm::fold_endpoint`; `PIN_THETA`, `PIN_DEVIANCE_SLACK`, `PIN_POLISH_DROP`,
 `PIN_PROBE_STEP` and `PIN_NOISE_ULPS` in `src/lmm/mod.rs`; the flag assembly
@@ -1486,9 +1577,16 @@ the pin is undone: θ goes back to the search's point, the flags are cleared,
 and the fit is re-evaluated and reported there, still `converged`. On the
 grid's pinned cells a pin costs at most 2.6e-8, so no pin there is undone.
 The slack is absolute until the objective's own round-off is larger: both
-it and `PIN_POLISH_DROP` below are floored at `PIN_NOISE_ULPS = 64` ULPs of
-the incumbent, which takes over past |D| ≈ 7e7 for the slack and 7e6 for
-the drop.
+it and `PIN_POLISH_DROP` below are floored at the larger of `PIN_NOISE_ULPS
+= 64` ULPs of the incumbent and the deviance's rounding estimate
+`ε·(|D| + tr_x)` (`deviance_rounding`, the hand-over's floor). The ULP term
+takes over past |D| ≈ 7e7 for the slack and 7e6 for the drop; the `tr_x`
+term, the extra grouping factors' `M'WM` trace read once after the search,
+takes over on crossed and nested fits with very precise data, where
+`log|A|` rounds at the size of those factors' columns. The LMM's incumbent
+check uses the ULP floor alone.
+
+**Plateau probe.** Out on the plateau toward the θ box a search can stop well above the optimum and still meet its own test, since the deviance there changes by ratios of the SD, not by the trust radius. So after the incumbent check, unless the search's budget is spent, each diagonal θⱼ at or above `PLATEAU_PROBE_THETA = 10` (a structural coordinate excluded) is evaluated at θⱼ/e and θⱼ·e with β held, skipping a point past the box; each evaluation counts in `n_eval`. When the lowest probed point is below the endpoint by more than `PIN_POLISH_DROP`, floored as above, the fit moves there and the trough polish below runs from it. Measured from an intercept loading of 20 on precise Poisson fits whose optimum is 0.5: 115 of 300 BOBYQA-route fits ended converged at about 20, 114 to 208 deviance units above the optimum (2026-11-03). The threshold is the gradient route's warm-start gate (`GRAD_WARM_THETA_MAX`, `src/glmm/grad_route.rs`), not tuned for the probe.
 
 A pin that *lowers* the objective by more than `PIN_POLISH_DROP = 1e-7`, or
 whose corner the stationarity probe below finds off the optimum of the free
@@ -1633,7 +1731,7 @@ tests in `src/lmm/tests.rs` pin the shared pin loop; the accuracy study
 
 ## Standard errors
 
-**Code:** the `WaldSe` arms in `glmm::fit_glmm` and `joint_hessian_cov` /
+**Code:** the `WaldSe` arms (`se::wald_cov`, `rx_cov` and `hessian_cov`) and `joint_hessian_cov` /
 `rx_cov_into` in `src/glmm/se.rs`; the assembled exact-Hessian engine
 `assembled::joint_hessian` (body `joint_hessian_columns`, `f64` gradient
 `packed_gradient`, routing gate `assembly_routes`, memory guard
@@ -1690,7 +1788,7 @@ Two genuinely different Wald covariances are offered, selected by `WaldSe`:
   solved. On the blocked and structured layouts the dual kernel's own step
   is inexact only on a non-PD observed factor (`DualStep::exact`); then
   `run_assembled_hessian` re-enters the kernel from the returned `u` until
-  the assembled columns stop moving (band `1e-10·(1 + |h|)` per entry, at
+  the assembled columns stop moving (band `DUAL_SETTLE_REL·(1 + |h|)` per entry, `DUAL_SETTLE_REL = 1e-10`, at
   most `MAX_DUAL_REFINEMENTS` calls, a spent cap is `NotConverged`); a clean
   fit takes one call.
 
@@ -1915,7 +2013,8 @@ cells' `se_hessian` at `2e-2`), with lme4's references generated at a tightened
 
 ## Opt-in parallelism (`parallel` + `parallel_inner`)
 
-**Code:** the rayon arms in `src/glmm/agq.rs` (cluster-outer AGQ over
+**Code:** the rayon arms in `src/glmm/agq.rs` and `src/glmm/agq_fast.rs`
+(`scalar_sums`, `probit_sums`, `vector_sums`; cluster-outer AGQ over
 `ClusterRowIndex`) and `src/glmm/se.rs::joint_hessian_cov` (the FD grid over
 `(i, j)` Hessian cells), both gated on the `parallel` cargo feature **and**
 `FitOptions::parallel_inner` at runtime. Neither exact Hessian rung has rayon

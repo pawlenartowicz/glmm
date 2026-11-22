@@ -16,8 +16,7 @@
 //! with `C_p(θ) = σ̂²(θ)·(X'V⁻¹X)⁻¹` the profiled covariance the fit reports
 //! and `ν` the divisor of `σ̂²`: `N − p` under REML and `N` under ML, read from
 //! the kernel's criterion ([`LmmKernel::criterion`]), never from the fit's
-//! options. The pass evaluates whatever criterion the kernel carries, and the
-//! gradient route's [`pg_gradient`] differentiates that criterion too. The
+//! options. The pass differentiates whatever criterion the kernel carries. The
 //! residual-only record of OLS and the dispersion GLMs
 //! ([`SatterthwaiteState::residual`]) keeps `ν = n − p` on either criterion.
 //! `0 < df ≤ ν` whenever `H_p⁺` is PSD, and a fit with no free variance
@@ -25,7 +24,15 @@
 //! has coordinates `(θ_free, τ)`, `A_eff = 2·blockdiag(H_p⁺, τ̂²/ν)` and
 //! `Jac_eff = [∂C_p/∂θ_k …, C/τ̂]`.
 //!
-//! **The value route.** `H_p` comes from central finite differences of the
+//! **The exact pass.** On either kernel, with a crossed tail of at most
+//! `exact::EXACT_TAIL_MAX` columns, `H_p` and `∂C_p/∂θ_k` are the closed
+//! forms of `exact` (`satterthwaite_exact.rs`), from one deviance evaluation
+//! at θ̃ and one walk over the families and the crossed tail, with no step:
+//! they depend on no step factor and scale exactly with a rescale.
+//!
+//! **The value route.** On a wider crossed tail, and as the in-crate
+//! reference the exact pass is checked against, `H_p` comes from central
+//! finite differences of the
 //! same `f64` profiled deviance the θ search minimized
 //! ([`LmmKernel::deviance`]), and `∂C_p/∂θ_k` from central differences of `C_p`
 //! at the stencil's axis points, on either kernel. The stencil is the axis
@@ -34,27 +41,25 @@
 //! ladder): `n² + n + 1` evaluations for `n` free coordinates. The pass runs on
 //! the kernel's θ̃ (the relative Cholesky factor on the standardized design);
 //! `gᵀH⁻¹g` is invariant to that smooth reparameterization at a stationary θ̂.
-//!
-//! **The gradient route.** Where the per-group θ-gradient is armed for the fit
-//! ([`per_group_gradient_armed`]: the dense kernel on its per-group regression
-//! route), `H_p` comes from central differences of that analytic gradient
-//! ([`pg_gradient`]) instead: column `k` is `(∇d_p(θ̃ + h_k e_k) −
-//! ∇d_p(θ̃ − h_k e_k))/(2h_k)` on the free coordinates, symmetrized. Each of
-//! the `2n` axis points is one deviance (which leaves the state the gradient
-//! reads, the factor and `σ̂²` included, so `∂C_p/∂θ_k` comes from the same
-//! points) and one gradient: `2n + 1` evaluations in all, with no mixed
-//! points. A non-finite deviance or a gradient that is not available sends the
-//! whole pass to the value route, which stays the reference.
+//! Each free coordinate's step is the step factor times the largest `|θ̃|` of
+//! its covariance block, with no absolute floor, so a uniform rescale of θ̃
+//! (the kernel's rescale retry) scales every step with it and leaves the df
+//! unchanged.
 //!
 //! **Free coordinates.** The deviance and `C_p` depend on Λ only through
 //! `ΛΛᵀ`, so both are even in each Λ column. At a column that is exactly zero
 //! in θ̂ (a pinned boundary, canonicalized by `fit_lmm`) the gradient and every
 //! mixed second derivative with that column vanish, so dropping its
 //! coordinates leaves `gᵀH⁺g` unchanged; its own curvature block can be
-//! singular, which is the second reason to drop it. The rest of `H_p` goes
-//! through [`psd_pseudo_inverse`], which drops directions at or below
-//! `1e-8·λ_max` and counts the negative ones, as lmerTest inverts only its
-//! positive eigenvalues.
+//! singular, which is the second reason to drop it. The rest of `H_p` is scaled
+//! to a unit diagonal, `D^−½·H_p·D^−½` with `D = |diag(H_p)|` (1 where a
+//! diagonal entry is zero or not finite), and goes through
+//! [`psd_pseudo_inverse`], which drops directions at or below `1e-8·λ_max` and
+//! counts the negative ones; the result is mapped back by `D^−½`. lmerTest cuts
+//! its unscaled Hessian instead; the two differ only where a coordinate's
+//! scale alone puts an eigenvalue below the threshold (measured: the ports'
+//! fixture `_PARITY_*` in `glmm-py/tests/test_warnings.py`, and no Gaussian
+//! mixed cell of the fast grid, whose lmerTest df comparison is unchanged).
 //!
 //! The pass reads θ̂ from [`LmmWorkspace::theta`] and never writes it. It
 //! overwrites the factor and `σ̂²` the kernel holds, so it runs after the fit
@@ -64,46 +69,38 @@
 
 use faer::{Mat, MatRef};
 
-use super::pg_grad::pg_gradient;
 use super::{
-    per_group_gradient_armed, precompute_balanced_collapse, precompute_group_regressions,
-    LmmGroupings, LmmKernel, LmmWorkspace,
+    forward_solve, precompute_balanced_collapse, precompute_group_regressions, LmmGroupings,
+    LmmKernel, LmmWorkspace,
 };
 use crate::inference::evd::psd_pseudo_inverse;
 use crate::standardize::{ColumnScaling, Units};
 
-/// The finite-difference step factor: `h_k = ETA·max(|θ̃_k|, 1)` on the
-/// kernel's unit-free θ̃. Pinned 2026-10-11 by the step sweep
-/// (`satterthwaite_tests.rs::step_sweep_is_flat_at_eta`, its table there):
-/// over the steps 3e-5, 1e-4, 3e-4 and 1e-3 the df is flattest between 3e-4
-/// and 1e-3 (largest change 8.7e-6), while the deviance's round-off from the
-/// random effects moves it by up to 2.9e-5 between 1e-4 and 3e-4 and 1.5e-3
-/// between 3e-5 and 1e-4. Of the two flat steps 3e-4 has the smaller
-/// truncation error (at most 3.0e-6 against 6.3e-6, a Richardson diagnostic).
+#[path = "satterthwaite_exact.rs"]
+mod exact;
+
+/// The finite-difference step factor: `h_k = ETA·m_b` on the kernel's θ̃,
+/// `m_b` the largest `|θ̃|` of the coordinate's block ([`steps_into`]). Set by
+/// the step sweep (`satterthwaite_tests.rs::step_sweep_is_flat_at_eta`, its
+/// table there): over the steps 3e-5, 1e-4, 3e-4 and 1e-3 the df is flattest
+/// between 3e-4 and 1e-3 (largest change 1.9e-5), while the deviance's
+/// round-off from the random effects moves it by up to 6.6e-5 between 1e-4
+/// and 3e-4 and 1.3e-3 between 3e-5 and 1e-4. The largest change at 3e-4 is
+/// round-off on `sim_nested_crossed_mix`.
 const ETA: f64 = 3e-4;
 
-/// The gradient route's step factor, `h_k = ETA_GRAD·max(|θ̃_k|, 1)`. Pinned
-/// 2026-10-11 by the gradient route's step sweep
-/// (`satterthwaite_tests.rs::gradient_step_sweep_is_flat_at_eta_grad`): over
-/// the steps 1e-6, 3e-6, 1e-5, 3e-5 and 1e-4 the df is flattest between 3e-6
-/// and 1e-5 (largest change 1.2e-9); below 3e-6 round-off moves it by up to
-/// 1.5e-9, above 1e-5 truncation by up to 7.8e-8. Of the two flat steps 3e-6
-/// has the smaller truncation error (at most 3.1e-10 against 8.7e-10, a
-/// Richardson diagnostic).
-const ETA_GRAD: f64 = 3e-6;
-
-/// The pseudo-inverse threshold on `H_p`, relative to its largest eigenvalue.
+/// The pseudo-inverse threshold on `H_p` scaled to a unit diagonal
+/// ([`assemble_into`]), relative to its largest eigenvalue.
 const REL_TOL: f64 = 1e-8;
 
 /// How `H_p` and `∂C/∂θ` were differentiated (a record the tests read).
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DerivRoute {
+    /// The closed forms of `exact`.
+    Exact,
     /// Central finite differences of the deviance value and of `C_p`.
     Value,
-    /// Central differences of the per-group analytic gradient for `H_p`, and
-    /// of `C_p` at the same axis points.
-    GradientDiff,
 }
 
 /// What the Satterthwaite pass leaves for the df and the contrasts. Every
@@ -129,13 +126,15 @@ pub(crate) struct SatterthwaiteState {
     /// columns) on a REML fit, `N` on an ML fit. The residual-only record of
     /// OLS and the dispersion GLMs carries `n − p` whatever the criterion.
     pub(crate) nu: f64,
-    /// Directions of `H_p` dropped by the pseudo-inverse as null.
+    /// Directions of `H_p` dropped by the pseudo-inverse as null, counted on
+    /// `H_p` scaled to a unit diagonal ([`assemble_into`]).
     pub(crate) dropped: usize,
-    /// Directions of `H_p` below `−REL_TOL·λ_max`, not inverted.
+    /// Directions below `−REL_TOL·λ_max`, not inverted, counted on the same
+    /// scaled `H_p`.
     pub(crate) negative: usize,
     /// The derivative route the pass took, recorded for the tests only: the
-    /// pass chooses the route itself (`stencil`, from the kernel's arming and
-    /// the gradient's success), and no non-test code reads it.
+    /// pass chooses the route itself (`collect_into`, from the kernel), and no
+    /// non-test code reads it.
     #[cfg(test)]
     pub(crate) route: DerivRoute,
     /// Which record this is; one status, so no two of failed, switched off
@@ -152,7 +151,7 @@ pub(crate) struct SatterthwaiteState {
 enum Status {
     /// A pass that succeeded, or a residual-only record.
     Live,
-    /// The pass failed: a stencil value, `C` or τ̂ was not finite (or the
+    /// The pass failed: a deviance, `H_p`, `C` or τ̂ was not finite (or the
     /// eigendecomposition of `H_p` failed). Every df is then NaN.
     Failed,
     /// The pass was switched off (`FitOptions::satterthwaite = false`): the
@@ -164,24 +163,28 @@ enum Status {
     NotRun,
 }
 
-/// What the stencil collected at θ̂; [`assemble`] is a pure function of it.
+/// What the pass collected at θ̂; [`assemble`] is a pure function of it. The
+/// exact pass fills `hess` and `jac` (and `f0`, `c0`, `tau`, `nu`); the value
+/// route fills the stencil's values.
 #[derive(Clone, Debug)]
 pub(crate) struct Collected {
     /// θ̃ indices of the free coordinates.
     pub(crate) free: Vec<usize>,
-    /// The step `h_k` of each free coordinate.
+    /// Whether the exact pass filled `hess` and `jac`.
+    pub(crate) exact: bool,
+    /// The exact `H_p` over the free coordinates.
+    pub(crate) hess: Mat<f64>,
+    /// The exact `∂C/∂θ̃_k`, one per free coordinate.
+    pub(crate) jac: Vec<Mat<f64>>,
+    /// The step `h_k` of each free coordinate (value route).
     pub(crate) h: Vec<f64>,
     /// The deviance at θ̂.
     pub(crate) f0: f64,
     /// `[f(θ̂ + h_k e_k), f(θ̂ − h_k e_k)]` per free coordinate.
     pub(crate) f_axis: Vec<[f64; 2]>,
     /// `[f(θ̂ + h_i e_i + h_j e_j), f(θ̂ − h_i e_i − h_j e_j)]` per pair `i < j`
-    /// of free coordinates, `i` major. Empty on the gradient route.
+    /// of free coordinates, `i` major.
     pub(crate) f_mixed: Vec<[f64; 2]>,
-    /// The gradient route's `[∇f(θ̂ + h_k e_k), ∇f(θ̂ − h_k e_k)]` per free
-    /// coordinate, each restricted to the free coordinates; `None` on the value
-    /// route.
-    pub(crate) g_axis: Option<Vec<[Vec<f64>; 2]>>,
     /// `C` at θ̂.
     pub(crate) c0: Mat<f64>,
     /// `[C(θ̂ + h_k e_k), C(θ̂ − h_k e_k)]` per free coordinate.
@@ -360,15 +363,16 @@ pub(crate) fn pass(
         map,
         nu,
         ETA,
-        Some(ETA_GRAD),
+        true,
     ))
 }
 
 /// The loop tier's [`pass`]: the same evaluations and arithmetic, so the same
 /// df bit for bit, on the buffers of [`LmmWorkspace::pass_scratch`]. They are
 /// built on the first call, sized for every θ coordinate free, so each later
-/// call on the workspace allocates only the pseudo-inverse's blocks, whatever
-/// the draw's free coordinates. Writes the df of each `targets` column into
+/// call on the workspace allocates only the pseudo-inverse's blocks (and, with
+/// a crossed tail, the exact pass's tail-inverse scratch), whatever the draw's
+/// free coordinates. Writes the df of each `targets` column into
 /// `df_out` and leaves its other entries alone, and the df of each pair's
 /// contrast `e_p − e_n` into `contrast_df_out` (NaN for a pair with an index
 /// at least the column count, or with its two indices equal, which is no
@@ -399,11 +403,6 @@ pub(crate) fn pass_targets(
         recovery.beta_tilde.len(),
         "pass scratch: p changed"
     );
-    debug_assert_eq!(
-        s.stencil.grad.len(),
-        theta.len(),
-        "pass scratch: n_θ changed"
-    );
     collect_into(
         kernel,
         theta,
@@ -412,11 +411,17 @@ pub(crate) fn pass_targets(
         map,
         nu,
         ETA,
-        Some(ETA_GRAD),
+        true,
         &mut s.col,
         &mut s.stencil,
     );
-    assemble_into(&s.col, &mut s.state, &mut s.hess, &mut s.spare_jac);
+    assemble_into(
+        &s.col,
+        &mut s.state,
+        &mut s.hess,
+        &mut s.spare_jac,
+        &mut s.diag_sqrt,
+    );
     if s.state.is_failed() {
         return false;
     }
@@ -449,8 +454,9 @@ pub(crate) struct PassScratch {
     col: Collected,
     stencil: StencilScratch,
     state: SatterthwaiteState,
-    /// `H_p`.
+    /// `H_p`, and `√diag(H_p)`, as [`assemble_into`] leaves them.
     hess: Mat<f64>,
+    diag_sqrt: Vec<f64>,
     /// The `∂C/∂θ̃_k` matrices `state.jac_theta` does not hold this call.
     spare_jac: Vec<Mat<f64>>,
     /// `g_p` of [`SatterthwaiteState::df_into`], and the contrast it takes:
@@ -471,6 +477,7 @@ impl PassScratch {
                 ..SatterthwaiteState::switched_off()
             },
             hess: Mat::zeros(n_theta, n_theta),
+            diag_sqrt: Vec::with_capacity(n_theta),
             spare_jac: (0..n_theta).map(|_| Mat::zeros(p, p)).collect(),
             g: Vec::with_capacity(n_theta),
             e: vec![0.0; p],
@@ -478,7 +485,7 @@ impl PassScratch {
     }
 }
 
-/// The stencil's buffers besides the values it collects, sized for `p`
+/// The pass's buffers besides the values it collects, sized for `p`
 /// columns and `n_θ` coordinates.
 struct StencilScratch {
     /// `M = B·U⁻¹` (see [`stencil`]), and one row of it.
@@ -486,15 +493,14 @@ struct StencilScratch {
     row: Vec<f64>,
     /// `W` of [`c_at_into`].
     w: Mat<f64>,
-    /// The evaluation point, and the gradient there.
+    /// The evaluation point.
     point: Vec<f64>,
-    grad: Vec<f64>,
-    /// The gradient route's per-axis gradients while [`Collected::g_axis`]
-    /// does not hold them, and the pairs neither holds this call.
-    g_store: Vec<[Vec<f64>; 2]>,
-    spare_g: Vec<[Vec<f64>; 2]>,
-    /// The `C` pairs [`Collected::c_axis`] does not hold this call.
+    /// The `C` pairs [`Collected::c_axis`] and the `∂C/∂θ̃_k`
+    /// [`Collected::jac`] do not hold this call.
     spare_c: Vec<[Mat<f64>; 2]>,
+    spare_jac: Vec<Mat<f64>>,
+    /// The exact pass's buffers.
+    exact: exact::ExactScratch,
     /// What [`shift_response_into`] replaced, and its shifted Gram row.
     saved: SavedResponse,
     gram_row: Vec<f64>,
@@ -507,14 +513,11 @@ impl StencilScratch {
             row: vec![0.0; p],
             w: Mat::zeros(p, p),
             point: Vec::with_capacity(n_theta),
-            grad: vec![0.0; n_theta],
-            g_store: Vec::with_capacity(n_theta),
-            spare_g: (0..n_theta)
-                .map(|_| [Vec::with_capacity(n_theta), Vec::with_capacity(n_theta)])
-                .collect(),
             spare_c: (0..n_theta)
                 .map(|_| [Mat::zeros(p, p), Mat::zeros(p, p)])
                 .collect(),
+            spare_jac: (0..n_theta).map(|_| Mat::zeros(p, p)).collect(),
+            exact: exact::ExactScratch::default(),
             saved: SavedResponse::default(),
             gram_row: Vec::new(),
         }
@@ -526,11 +529,13 @@ impl Collected {
     fn with_capacity(p: usize, n_theta: usize) -> Self {
         Collected {
             free: Vec::with_capacity(n_theta),
+            exact: false,
+            hess: Mat::zeros(n_theta, n_theta),
+            jac: Vec::with_capacity(n_theta),
             h: Vec::with_capacity(n_theta),
             f0: f64::NAN,
             f_axis: Vec::with_capacity(n_theta),
             f_mixed: Vec::with_capacity(n_theta * n_theta.saturating_sub(1) / 2),
-            g_axis: None,
             c0: Mat::zeros(p, p),
             c_axis: Vec::with_capacity(n_theta),
             tau: f64::NAN,
@@ -568,12 +573,12 @@ pub(crate) fn pass_at(
         map,
         nu,
         ETA,
-        Some(ETA_GRAD),
+        true,
     ))
 }
 
-/// [`pass_at`] on the value route, whatever the kernel's arming: the reference
-/// the gradient route is checked against.
+/// [`pass_at`] on the value route, whatever the kernel: the reference the
+/// exact pass is checked against.
 #[cfg(all(test, feature = "formula"))]
 pub(crate) fn pass_value_at(
     ws: &mut LmmWorkspace,
@@ -590,7 +595,7 @@ pub(crate) fn pass_value_at(
         map,
         nu,
         ETA,
-        None,
+        false,
     ))
 }
 
@@ -628,16 +633,15 @@ fn free_coordinates_into(g: &LmmGroupings, theta: &[f64], free: &mut Vec<usize>)
     }
 }
 
-/// Re-evaluate the deviance and `C` at θ̂ and on the stencil around it, on
-/// the response shifted by `X̃·beta_tilde` ([`shift_response_into`]), and put
-/// the kernel's statistics back afterwards. `beta_tilde` is the fit's β̂ on the
+/// The pass's values at θ̂: the exact pass where it covers the kernel and
+/// `exact` allows it ([`exact_into`]), the value route otherwise, on the
+/// response shifted by `X̃·beta_tilde` ([`shift_response_into`]) with the
+/// kernel's statistics put back afterwards. `beta_tilde` is the fit's β̂ on the
 /// kernel's design and in its units. `units` are the rows' units: τ̂ is
 /// reported in the caller's (`Units::dispersion_scale`), and `C` takes `k²`
 /// (`Units::var_scale`; the weight scale cancels between the kernel's σ̂² and
 /// its `(X̃'V⁻¹X̃)⁻¹`). `eta` is the value route's step factor ([`ETA`] in
-/// the pass); `eta_grad`, when given, lets the pass take the gradient route
-/// where it is armed, at that step factor ([`ETA_GRAD`] in the pass). The
-/// gradient reads the same shifted statistics.
+/// the pass).
 #[allow(clippy::too_many_arguments)] // the pass's inputs, split off the workspace
 fn collect(
     kernel: &mut LmmKernel,
@@ -647,7 +651,7 @@ fn collect(
     map: &ColumnScaling,
     nu: f64,
     eta: f64,
-    eta_grad: Option<f64>,
+    exact: bool,
 ) -> Collected {
     let (p, n_theta) = (beta_tilde.len(), theta.len());
     let mut col = Collected::with_capacity(p, n_theta);
@@ -659,7 +663,7 @@ fn collect(
         map,
         nu,
         eta,
-        eta_grad,
+        exact,
         &mut col,
         &mut StencilScratch::new(p, n_theta),
     );
@@ -677,12 +681,16 @@ fn collect_into(
     map: &ColumnScaling,
     nu: f64,
     eta: f64,
-    eta_grad: Option<f64>,
+    exact: bool,
     col: &mut Collected,
     s: &mut StencilScratch,
 ) {
+    if exact && exact::covers(kernel) {
+        exact_into(kernel, theta, units, map, nu, col, s);
+        return;
+    }
     shift_response_into(kernel, beta_tilde, &mut s.saved, &mut s.gram_row);
-    stencil(kernel, theta, units, map, nu, eta, eta_grad, col, s);
+    stencil(kernel, theta, units, map, nu, eta, col, s);
     restore_response(kernel, &s.saved);
 }
 
@@ -708,10 +716,71 @@ pub(crate) fn caller_map_into(
     }
 }
 
-/// [`collect_into`]'s evaluations, on whatever response the kernel holds: the
-/// gradient route at `eta_grad` when it is given, the kernel's per-group
-/// gradient is armed and every axis point serves a gradient, the value route
-/// at `eta` otherwise.
+/// The exact pass: the deviance, `C` and τ̂ at θ̂, then `H_p`
+/// ([`exact::exact_terms`]) and `∂C/∂θ̃_k = k²·Wᵀ(σ̂²·NᵀD_kN − (a_k/ν)·I)W`
+/// with `W = L̃⁻¹Mᵀ` as [`c_at_into`] leaves it (the kernel's
+/// `∂C̃/∂θ̃_k = L̃⁻ᵀ(σ̂²·NᵀD_kN − (a_k/ν)·I)L̃⁻¹`, mapped as `C` is). A deviance
+/// or a family factor that fails leaves NaN for [`assemble_into`] to fail on.
+#[allow(clippy::too_many_arguments)] // as `stencil`
+fn exact_into(
+    kernel: &mut LmmKernel,
+    theta: &[f64],
+    units: &Units,
+    map: &ColumnScaling,
+    nu: f64,
+    col: &mut Collected,
+    s: &mut StencilScratch,
+) {
+    let p = s.m.nrows();
+    let k2 = units.var_scale();
+    free_coordinates_into(kernel.groupings(), theta, &mut col.free);
+    let n = col.free.len();
+    caller_map_into(kernel, map, &mut s.row, &mut s.m);
+    col.exact = true;
+    col.h.clear();
+    col.f_axis.clear();
+    col.f_mixed.clear();
+    pooled_resize(&mut col.c_axis, &mut s.spare_c, 0, || {
+        [Mat::zeros(p, p), Mat::zeros(p, p)]
+    });
+    pooled_resize(&mut col.jac, &mut s.spare_jac, n, || Mat::zeros(p, p));
+    col.f0 = kernel.deviance(theta);
+    c_at_into(kernel, &s.m, &mut s.w, &mut col.c0, k2);
+    let s2 = kernel.sigma_sq();
+    col.tau = s2 * units.dispersion_scale();
+    col.nu = nu;
+    if !col.f0.is_finite() || n == 0 {
+        col.hess.resize_with(n, n, |_, _| f64::NAN);
+        return;
+    }
+    if !exact::exact_terms(kernel, theta, &col.free, nu, &mut s.exact, &mut col.hess) {
+        return;
+    }
+    let x = &mut s.exact;
+    for (k, jac) in col.jac.iter_mut().enumerate() {
+        jac.resize_with(p, p, |_, _| 0.0);
+        let ndn = &x.sums.ndn[k * p * p..(k + 1) * p * p];
+        let ak = x.sums.a[k] / nu;
+        // prod = (σ̂²·NᵀD_kN − (a_k/ν)·I)·W, then jac = k²·Wᵀ·prod.
+        for i in 0..p {
+            for j in 0..p {
+                x.prod[i * p + j] = (0..p)
+                    .map(|u| (s2 * ndn[i * p + u] - if u == i { ak } else { 0.0 }) * s.w[(u, j)])
+                    .sum();
+            }
+        }
+        for a in 0..p {
+            for b in a..p {
+                let v = k2 * (0..p).map(|i| s.w[(i, a)] * x.prod[i * p + b]).sum::<f64>();
+                jac[(a, b)] = v;
+                jac[(b, a)] = v;
+            }
+        }
+    }
+}
+
+/// The value route's evaluations, on whatever response the kernel holds, at
+/// the step factor `eta`.
 #[allow(clippy::too_many_arguments)] // as `collect_into`
 fn stencil(
     kernel: &mut LmmKernel,
@@ -720,7 +789,6 @@ fn stencil(
     map: &ColumnScaling,
     nu: f64,
     eta: f64,
-    eta_grad: Option<f64>,
     col: &mut Collected,
     s: &mut StencilScratch,
 ) {
@@ -728,11 +796,9 @@ fn stencil(
     let k2 = units.var_scale();
     free_coordinates_into(kernel.groupings(), theta, &mut col.free);
     let n = col.free.len();
-    let steps = |h: &mut Vec<f64>, free: &[usize], eta: f64| {
-        h.clear();
-        h.extend(free.iter().map(|&k| eta * theta[k].abs().max(1.0)));
-    };
     caller_map_into(kernel, map, &mut s.row, &mut s.m);
+    col.exact = false;
+    pooled_resize(&mut col.jac, &mut s.spare_jac, 0, || Mat::zeros(p, p));
 
     s.point.clear();
     s.point.extend_from_slice(theta);
@@ -741,19 +807,8 @@ fn stencil(
     col.tau = kernel.sigma_sq() * units.dispersion_scale();
     col.nu = nu;
     col.f_mixed.clear();
-    if let Some(g) = col.g_axis.take() {
-        s.g_store = g;
-    }
 
-    if let Some(eta_grad) = eta_grad.filter(|_| per_group_gradient_armed(kernel)) {
-        steps(&mut col.h, &col.free, eta_grad);
-        if gradient_axis(kernel, theta, col, s, k2) {
-            col.g_axis = Some(std::mem::take(&mut s.g_store));
-            return;
-        }
-    }
-
-    steps(&mut col.h, &col.free, eta);
+    steps_into(kernel.groupings(), theta, &col.free, eta, &mut col.h);
     col.f_axis.clear();
     pooled_resize(&mut col.c_axis, &mut s.spare_c, n, || {
         [Mat::zeros(p, p), Mat::zeros(p, p)]
@@ -785,46 +840,22 @@ fn stencil(
     }
 }
 
-/// The gradient route's axis points `θ̂ ± h_k e_k`, at `col.h`'s steps: at
-/// each, the deviance (which must be finite), then [`pg_gradient`] on the
-/// state it left, kept on the free coordinates (into `s.g_store`), then `C`
-/// (times `k2`, as [`c_at_into`]). Fills `col.f_axis` and `col.c_axis`;
-/// `false` at the first non-finite deviance or unavailable gradient.
-fn gradient_axis(
-    kernel: &mut LmmKernel,
-    theta: &[f64],
-    col: &mut Collected,
-    s: &mut StencilScratch,
-    k2: f64,
-) -> bool {
-    let (p, n, n_theta) = (s.m.nrows(), col.free.len(), theta.len());
-    col.f_axis.clear();
-    pooled_resize(&mut col.c_axis, &mut s.spare_c, n, || {
-        [Mat::zeros(p, p), Mat::zeros(p, p)]
-    });
-    pooled_resize(&mut s.g_store, &mut s.spare_g, n, || {
-        [Vec::with_capacity(n_theta), Vec::with_capacity(n_theta)]
-    });
-    for (a, (&k, &hk)) in col.free.iter().zip(&col.h).enumerate() {
-        let mut f = [0.0; 2];
-        for (side, step) in [hk, -hk].into_iter().enumerate() {
-            s.point[k] = theta[k] + step;
-            f[side] = kernel.deviance(&s.point);
-            s.point[k] = theta[k];
-            let LmmKernel::Dense { suff, fit } = &mut *kernel else {
-                return false;
-            };
-            if !f[side].is_finite() || !pg_gradient(suff, fit, &mut s.grad) {
-                return false;
-            }
-            let g = &mut s.g_store[a][side];
-            g.clear();
-            g.extend(col.free.iter().map(|&i| s.grad[i]));
-            c_at_into(kernel, &s.m, &mut s.w, &mut col.c_axis[a][side], k2);
-        }
-        col.f_axis.push(f);
+/// The steps of the free coordinates `free` (ascending) into `h`: `eta·m_b`,
+/// with `m_b` the largest `|θ̃|` over the free coordinates of the coordinate's
+/// `vech(Λ_g)` block (the primary grouping's, then each extra grouping's in
+/// declaration order). A rescale of θ̃ by `2^−k` scales every step with it, so
+/// it leaves the df unchanged; a free coordinate's diagonal run is nonzero, so
+/// `m_b > 0`.
+fn steps_into(g: &LmmGroupings, theta: &[f64], free: &[usize], eta: f64, h: &mut Vec<f64>) {
+    h.clear();
+    let mut rest = free;
+    for b in 0..g.n_blocks() {
+        let end = g.vech_start(b + 1);
+        let (block, tail) = rest.split_at(rest.partition_point(|&k| k < end));
+        let m_b = block.iter().fold(0.0, |m: f64, &k| m.max(theta[k].abs()));
+        h.extend(block.iter().map(|_| eta * m_b));
+        rest = tail;
     }
-    true
 }
 
 /// The kernel's statistics that hold the response, as they were before
@@ -971,13 +1002,11 @@ fn c_at_into(kernel: &LmmKernel, m: &Mat<f64>, w: &mut Mat<f64>, c: &mut Mat<f64
     let p = m.nrows();
     let (l, s2) = (kernel.factor(), kernel.sigma_sq() * k2);
     for t in 0..p {
-        for i in 0..p {
-            let mut acc = m[(t, i)];
-            for k in 0..i {
-                acc -= l[(i, k)] * w[(k, t)];
-            }
-            w[(i, t)] = acc / l[(i, i)];
+        let col = w.col_as_slice_mut(t);
+        for (i, v) in col.iter_mut().enumerate() {
+            *v = m[(t, i)];
         }
+        forward_solve(l, p, col);
     }
     for a in 0..p {
         for b in a..p {
@@ -1003,17 +1032,30 @@ fn qform(x: &[f64], a: MatRef<'_, f64>) -> f64 {
 /// collected values.
 pub(crate) fn assemble(col: &Collected) -> SatterthwaiteState {
     let mut st = SatterthwaiteState::switched_off();
-    assemble_into(col, &mut st, &mut Mat::zeros(0, 0), &mut Vec::new());
+    assemble_into(
+        col,
+        &mut st,
+        &mut Mat::zeros(0, 0),
+        &mut Vec::new(),
+        &mut Vec::new(),
+    );
     st
 }
 
 /// [`assemble`] into `st`, every field rewritten, with `hess` the buffer of
-/// `H_p` and `spare_jac` the pool `st.jac_theta` resizes through.
+/// `H_p` (left scaled to its unit diagonal), `spare_jac` the pool
+/// `st.jac_theta` resizes through and `diag_sqrt` the buffer of `√diag(H_p)`.
+///
+/// The pseudo-inverse cuts on `D^−½·H_p·D^−½`, `D` the diagonal of `H_p`, and
+/// its result is mapped back by `D^−½`, so a coordinate's units alone drop no
+/// direction. When a diagonal entry is not positive and finite, `D` is the
+/// identity: the cut on `H_p` itself.
 fn assemble_into(
     col: &Collected,
     st: &mut SatterthwaiteState,
     hess: &mut Mat<f64>,
     spare_jac: &mut Vec<Mat<f64>>,
+    diag_sqrt: &mut Vec<f64>,
 ) {
     let n = col.free.len();
     let finite = |m: &Mat<f64>| m.col_iter().all(|c| c.iter().all(|v| v.is_finite()));
@@ -1025,23 +1067,27 @@ fn assemble_into(
             .flatten()
             .any(|v| !v.is_finite())
         || col.c_axis.iter().flatten().any(|c| !finite(c))
-        || col
-            .g_axis
-            .iter()
-            .flatten()
-            .flatten()
-            .flatten()
-            .any(|v| !v.is_finite());
+        || (col.exact && (!finite(&col.hess) || col.jac.iter().any(|j| !finite(j))));
 
     hessian_into(col, hess);
-    let n_jac = col.c_axis.len().min(col.h.len());
     let (pr, pc) = (col.c0.nrows(), col.c0.ncols());
-    pooled_resize(&mut st.jac_theta, spare_jac, n_jac, || Mat::zeros(pr, pc));
-    for (jac, ([cp, cm], &hk)) in st.jac_theta.iter_mut().zip(col.c_axis.iter().zip(&col.h)) {
-        jac.resize_with(cp.nrows(), cp.ncols(), |_, _| 0.0);
-        for b in 0..cp.ncols() {
-            for a in 0..cp.nrows() {
-                jac[(a, b)] = (cp[(a, b)] - cm[(a, b)]) / (2.0 * hk);
+    if col.exact {
+        pooled_resize(&mut st.jac_theta, spare_jac, col.jac.len(), || {
+            Mat::zeros(pr, pc)
+        });
+        for (jac, src) in st.jac_theta.iter_mut().zip(&col.jac) {
+            jac.resize_with(pr, pc, |_, _| 0.0);
+            jac.as_mut().copy_from(src.as_ref());
+        }
+    } else {
+        let n_jac = col.c_axis.len().min(col.h.len());
+        pooled_resize(&mut st.jac_theta, spare_jac, n_jac, || Mat::zeros(pr, pc));
+        for (jac, ([cp, cm], &hk)) in st.jac_theta.iter_mut().zip(col.c_axis.iter().zip(&col.h)) {
+            jac.resize_with(cp.nrows(), cp.ncols(), |_, _| 0.0);
+            for b in 0..cp.ncols() {
+                for a in 0..cp.nrows() {
+                    jac[(a, b)] = (cp[(a, b)] - cm[(a, b)]) / (2.0 * hk);
+                }
             }
         }
     }
@@ -1055,6 +1101,22 @@ fn assemble_into(
     }
     let (mut dropped, mut negative) = (0, 0);
     if !failed {
+        diag_sqrt.clear();
+        // `√|H_ii|`, so a negative curvature keeps its sign and is counted as
+        // negative; a zero or non-finite diagonal entry is left unscaled.
+        diag_sqrt.extend((0..n).map(|i| {
+            let d = hess[(i, i)].abs().sqrt();
+            if d.is_finite() && d > 0.0 {
+                d
+            } else {
+                1.0
+            }
+        }));
+        for j in 0..n {
+            for i in 0..n {
+                hess[(i, j)] /= diag_sqrt[i] * diag_sqrt[j];
+            }
+        }
         match psd_pseudo_inverse(hess.as_ref(), REL_TOL) {
             Ok(pinv) => {
                 for j in 0..=n {
@@ -1064,7 +1126,7 @@ fn assemble_into(
                 }
                 for j in 0..n {
                     for i in 0..n {
-                        a_eff[(i, j)] = 2.0 * pinv.inv[(i, j)];
+                        a_eff[(i, j)] = 2.0 * pinv.inv[(i, j)] / (diag_sqrt[i] * diag_sqrt[j]);
                     }
                 }
                 a_eff[(n, n)] = 2.0 * col.tau * col.tau / col.nu;
@@ -1082,8 +1144,8 @@ fn assemble_into(
     st.negative = negative;
     #[cfg(test)]
     {
-        st.route = if col.g_axis.is_some() {
-            DerivRoute::GradientDiff
+        st.route = if col.exact {
+            DerivRoute::Exact
         } else {
             DerivRoute::Value
         };
@@ -1105,14 +1167,8 @@ fn hessian(col: &Collected) -> Mat<f64> {
 fn hessian_into(col: &Collected, hess: &mut Mat<f64>) {
     let n = col.free.len();
     hess.resize_with(n, n, |_, _| 0.0);
-    if let Some(g) = &col.g_axis {
-        // Column k is (∇f(+k) − ∇f(−k))/(2h_k); the mean with its transpose.
-        let d = |k: usize, r: usize| (g[k][0][r] - g[k][1][r]) / (2.0 * col.h[k]);
-        for j in 0..n {
-            for i in 0..n {
-                hess[(i, j)] = 0.5 * (d(j, i) + d(i, j));
-            }
-        }
+    if col.exact {
+        hess.as_mut().copy_from(col.hess.as_ref());
         return;
     }
     // Central differences: the axis pairs on the diagonal, and per pair

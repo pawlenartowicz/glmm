@@ -24,14 +24,15 @@
 //! - The [`inference`] types the two doors return, and [`Simulator`], covered
 //!   by semver.
 //! - `loop_advanced` (cargo feature, off by default): the unstable
-//!   scratch-explicit hot path (loop tier) for warm-start callers like
-//!   MCPower, exposing the kernels and their workspaces. NO semver guarantees;
+//!   scratch-explicit hot path (loop tier) for warm-start callers, exposing
+//!   the kernels and their workspaces. NO semver guarantees;
 //!   its items are named for a capability, never for a caller.
-//! - `orchestrate` (cargo feature, off by default): the string-typed fit
-//!   orchestration the FFI ports (`glmm-python`, `glmm-r`) share, and the
-//!   formula internals they use (`formula::parse`, `formula::materialize`,
-//!   `formula::label_ranef`, `formula::anova::compare_stored` and the like).
-//!   NO semver guarantees.
+//! - `orchestrate` (cargo feature, off by default): the fit orchestration the
+//!   FFI ports (`glmm-python`, `glmm-r`) share, on typed values (a `Family`
+//!   and `FitOptions` in; a `FitResult` with its notes, `DfMethod` and
+//!   `StopReason` out), and the formula internals they use (`formula::parse`,
+//!   `formula::materialize`, `formula::label_ranef`,
+//!   `formula::anova::compare_stored` and the like). NO semver guarantees.
 //! - `parallel` (cargo feature, off by default, **experimental**, outside
 //!   semver): enables in-fit parallelism (AGQ cluster loop, FD-Hessian grid)
 //!   via rayon's global pool; a no-op on wasm32; gated at runtime by
@@ -57,8 +58,7 @@
 // Every fit route (OLS, GLM, LMM, GLMM) is wired into the stable `fit` module
 // regardless of this feature — see `documentation/algorithms.md` for the full
 // dispatch. What goes dead with the feature OFF is mainly the narrower
-// `loop_advanced` surface: the `FitView` hot-loop accessors and the
-// gradient/Hessian kernels in `src/glmm/derivative.rs`,
+// `loop_advanced` surface: the `FitView` hot-loop accessors,
 // plus a few other loop-only helpers scattered through `src/lmm/mod.rs`,
 // `src/glmm/assembled.rs`, and `src/ols.rs`. So suppress dead_code only in
 // that build. The `loop_advanced` build uses all of it, so genuinely dead
@@ -76,11 +76,13 @@ mod scalar;
 /// The kernels' capacity constants and the input ranges. A limit may grow in
 /// a minor release; a name does not disappear.
 ///
-/// - `MAX_PRIMARY_Q`, `MAX_EXTRA_GROUPINGS` and `MAX_EXTRA_Q` bound the dense
-///   (no-Z) solver: the primary grouping's random-effect width, the number of
-///   extra groupings, and the width of each extra grouping. A design past any
-///   of them is not refused: it routes to the sparse solver and still fits.
-///   `MAX_THETA` is the θ length those three bounds imply on the dense path.
+/// - `MAX_PRIMARY_Q` and `MAX_EXTRA_GROUPINGS` bound the dense (no-Z) solver:
+///   the primary grouping's random-effect width and the number of extra
+///   groupings. A design past either is not refused: it routes to the sparse
+///   solver and still fits. `MAX_EXTRA_Q`, the width of an extra grouping,
+///   bounds no solver: a slope on an extra grouping always routes to the
+///   sparse solver, and the constant only enters `MAX_THETA`. `MAX_THETA` is
+///   the θ length the three imply.
 /// - `MAX_CROSSED_LEVELS` bounds the total level count over crossed extra
 ///   groupings on the dense solver of a Gaussian model fitted with
 ///   `FitOptions::condvar` on; past it the model routes to the sparse solver,
@@ -147,9 +149,9 @@ pub use spec::*;
 #[cfg(feature = "loop_advanced")]
 pub mod loop_advanced;
 
-// String-typed fit orchestration shared by the FFI ports (`orchestrate`
-// feature, off by default). Like `loop_advanced`: real surface, no semver
-// promise — its shape follows the ports' needs.
+// Fit orchestration shared by the FFI ports (`orchestrate` feature, off by
+// default). Like `loop_advanced`: real surface, no semver promise — its shape
+// follows the ports' needs.
 #[cfg(feature = "orchestrate")]
 pub mod orchestrate;
 

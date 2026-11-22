@@ -1,8 +1,9 @@
 use glmm::formula::anova::{TermTest, TermTestError};
-use glmm::formula::PairwiseInterval;
+use glmm::formula::{Adjust, PairwiseInterval, RatioKind};
 use glmm::inference::DenDf;
-use glmm::orchestrate;
+use glmm::orchestrate::{self, DfMethod};
 
+use crate::anova_text::NOT_CONVERGED;
 use crate::coerce;
 use crate::error::BindError;
 use crate::fns::ModelData;
@@ -20,13 +21,12 @@ use crate::value::{Record, Value};
 
 /// `orchestrate::confint`: per coefficient `lower` and `upper`.
 pub(crate) fn confint(inp: &mut Inputs) -> Result<Value, BindError> {
-    let ci = orchestrate::confint(
-        &inp.vec("beta")?,
-        &inp.vec("se")?,
-        &inp.vec("coef_df")?,
-        &inp.string("df_method")?,
-        inp.f64("level")?,
-    )?;
+    let beta = inp.vec("beta")?;
+    let se = inp.vec("se")?;
+    let coef_df = inp.vec("coef_df")?;
+    let df_method = inp.string("df_method")?;
+    let level = inp.f64("level")?;
+    let ci = orchestrate::confint(&beta, &se, &coef_df, DfMethod::parse(&df_method)?, level)?;
     Ok(Value::Record(
         Record::new()
             .with("lower", Value::Vec(ci.iter().map(|b| b[0]).collect()))
@@ -107,7 +107,7 @@ pub(crate) fn contrast_test(inp: &mut Inputs) -> Result<Value, BindError> {
     let s = stored_test(inp, beta.len())?;
     let names = inp.strs("names")?;
     let table = orchestrate::contrast_test(
-        &df_method,
+        DfMethod::parse(&df_method)?,
         &beta,
         &s.vcov,
         &s.model_vcov,
@@ -182,10 +182,13 @@ fn pairwise_options(inp: &mut Inputs) -> Result<PairwiseOptions, BindError> {
     Ok((factor, by, at))
 }
 
-/// The first note of a pairwise table of a fit that did not converge.
-const TESTS_NOT_CONVERGED: &str = "The fit did not converge, so its estimates are not at a \
-     maximum and these tests are not reliable. Change the model until it converges (a simpler \
-     random part often helps), then test again.";
+/// The adjustments, as the ports name them ([`orchestrate::adjust_tag`]).
+const ADJUSTS: &[(&str, Adjust)] = &[
+    ("holm", Adjust::Holm),
+    ("bonferroni", Adjust::Bonferroni),
+    ("tukey", Adjust::Tukey),
+    ("none", Adjust::None),
+];
 
 /// The first note of the intervals of such a table.
 const INTERVALS_NOT_CONVERGED: &str = "The fit did not converge, so its estimates are not at a \
@@ -195,44 +198,12 @@ const INTERVALS_NOT_CONVERGED: &str = "The fit did not converge, so its estimate
 /// Holm adjusts p-values step by step, so it has no simultaneous interval.
 const HOLM_INTERVALS: &str = "Holm has no simultaneous interval; Bonferroni intervals shown.";
 
-/// The rows of each `by` group of a pairwise table over `levels` levels:
-/// `p` cut into runs of `levels·(levels − 1)/2`, the pairs `(i, j)`, `i < j`,
-/// in row order within each run.
-fn by_groups(p: &[f64], levels: usize) -> std::slice::Chunks<'_, f64> {
-    p.chunks((levels * levels.saturating_sub(1) / 2).max(1))
-}
-
-/// Each `by` group's family size under `adjust`, the distinct sizes in
-/// ascending order. Holm and Bonferroni count the tested rows (a p-value
-/// that is not NaN); Tukey counts the levels in at least one tested row, as
-/// the crate's `tukey_k` does.
-fn family_sizes(p: &[f64], levels: usize, tukey: bool) -> Vec<usize> {
-    let pairs: Vec<(usize, usize)> = (0..levels)
-        .flat_map(|i| (i + 1..levels).map(move |j| (i, j)))
-        .collect();
-    let mut sizes: Vec<usize> = by_groups(p, levels)
-        .map(|group| {
-            let tested = group.iter().zip(&pairs).filter(|(v, _)| !v.is_nan());
-            if tukey {
-                let mut seen = vec![false; levels];
-                for (_, &(i, j)) in tested {
-                    seen[i] = true;
-                    seen[j] = true;
-                }
-                seen.iter().filter(|&&s| s).count()
-            } else {
-                tested.count()
-            }
-        })
-        .collect();
+/// The note naming `adjust` and its family sizes, each `by` family's
+/// (`Pairwise::family_sizes`), emmeans' words; `None` for `"none"`.
+fn adjust_line(family_sizes: &[usize], adjust: &str, intervals: bool) -> Option<String> {
+    let mut sizes = family_sizes.to_vec();
     sizes.sort_unstable();
     sizes.dedup();
-    sizes
-}
-
-/// The note naming `adjust` and its family size, emmeans' words; `None` for
-/// `"none"`.
-fn adjust_line(p: &[f64], levels: usize, adjust: &str, intervals: bool) -> Option<String> {
     let lead = if intervals {
         "Conf-level adjustment"
     } else {
@@ -240,15 +211,12 @@ fn adjust_line(p: &[f64], levels: usize, adjust: &str, intervals: bool) -> Optio
     };
     match adjust {
         "none" => None,
-        "tukey" => Some(match family_sizes(p, levels, true)[..] {
+        "tukey" => Some(match sizes[..] {
             [k] => format!("{lead}: tukey method for comparing a family of {k} estimates"),
             _ => format!("{lead}: tukey method for varying family sizes"),
         }),
         _ => {
-            let sizes: Vec<String> = family_sizes(p, levels, false)
-                .iter()
-                .map(ToString::to_string)
-                .collect();
+            let sizes: Vec<String> = sizes.iter().map(ToString::to_string).collect();
             let what = if intervals { "estimates" } else { "tests" };
             Some(format!(
                 "{lead}: {adjust} method for {} {what}",
@@ -288,13 +256,14 @@ pub(crate) fn pairwise(inp: &mut Inputs) -> Result<Value, BindError> {
     let beta = inp.vec("beta")?;
     let s = stored_test(inp, beta.len())?;
     let names = inp.strs("names")?;
+    let adjust = options::choice(inp, "adjust", "adjust", ADJUSTS)?;
+    let family = d.family()?;
     let pw = orchestrate::pairwise(
         &d.formula,
         d.numeric,
         d.factors,
-        &d.family,
-        &d.link,
-        &df_method,
+        family,
+        DfMethod::parse(&df_method)?,
         &beta,
         &s.vcov,
         &s.model_vcov,
@@ -305,12 +274,7 @@ pub(crate) fn pairwise(inp: &mut Inputs) -> Result<Value, BindError> {
         &factor,
         by.as_deref(),
         at,
-        &options::choice(
-            inp,
-            "adjust",
-            "adjust",
-            &["holm", "bonferroni", "tukey", "none"],
-        )?,
+        adjust,
     )?;
     let c = orchestrate::pairwise_columns(&pw, &names);
     let labels: Vec<String> = c
@@ -331,9 +295,9 @@ pub(crate) fn pairwise(inp: &mut Inputs) -> Result<Value, BindError> {
         true,
     );
     let notes: Vec<String> = (!converged)
-        .then(|| TESTS_NOT_CONVERGED.to_owned())
+        .then(|| NOT_CONVERGED.to_owned())
         .into_iter()
-        .chain(adjust_line(&c.p_value, c.levels, c.adjust, false))
+        .chain(adjust_line(&c.family_sizes, c.adjust, false))
         .chain(row_notes(
             &c.contrast,
             c.by.as_deref(),
@@ -357,17 +321,30 @@ pub(crate) fn pairwise_confint(inp: &mut Inputs) -> Result<Value, BindError> {
     let level = inp.f64("level")?;
     let mut t = inp.record("table")?;
     let p_value = t.vec("p_value")?;
-    let adjust = t.string("adjust")?;
+    let adjust_kind = options::choice(&mut t, "adjust", "adjust", ADJUSTS)?;
     let levels = t.usize("levels")?;
-    let ratio = t.opt_string("ratio_kind")?;
+    let (estimate, se, df) = (t.vec("estimate")?, t.vec("se")?, t.vec("df")?);
+    let ratio = if t.has("ratio_kind") {
+        Some(options::choice(
+            &mut t,
+            "ratio_kind",
+            "ratio",
+            &[
+                ("odds_ratio", RatioKind::OddsRatio),
+                ("ratio", RatioKind::Ratio),
+            ],
+        )?)
+    } else {
+        None
+    };
     let ci = orchestrate::pairwise_confint(
-        &t.vec("estimate")?,
-        &t.vec("se")?,
-        &t.vec("df")?,
+        &estimate,
+        &se,
+        &df,
         &p_value,
-        &adjust,
+        adjust_kind,
         levels,
-        ratio.as_deref(),
+        ratio,
         level,
     )?;
     let by = t.opt_string("by")?;
@@ -389,10 +366,10 @@ pub(crate) fn pairwise_confint(inp: &mut Inputs) -> Result<Value, BindError> {
         .then(|| INTERVALS_NOT_CONVERGED.to_owned())
         .into_iter()
         .chain([format!("Confidence level used: {}", fmt_g(level, 6))])
-        .chain(if adjust == "holm" {
+        .chain(if adjust_kind == Adjust::Holm {
             Some(HOLM_INTERVALS.to_owned())
         } else {
-            adjust_line(&p_value, levels, interval_adjust, true)
+            adjust_line(&ci.family_sizes, interval_adjust, true)
         })
         .chain(row_notes(
             &t.strs("contrast")?,
@@ -445,19 +422,15 @@ pub(crate) fn effect_sizes(inp: &mut Inputs) -> Result<Value, BindError> {
     let d = ModelData::read(inp)?;
     let parts = read_parts(inp.record("parts")?)?;
     let objective = inp.string("objective")?;
+    let aliased = inp.bools("aliased")?;
+    let converged = inp.bool("converged")?;
+    let nodes = inp.u8("objective_nodes")?;
+    let null_refit = inp.bool("null_refit")?;
+    let objective = orchestrate::objective_from_parts(&objective, nodes)?;
+    let family = d.family()?;
     let sizes = orchestrate::effect_sizes(
-        &d.formula,
-        d.numeric,
-        d.factors,
-        &d.family,
-        &d.link,
-        d.weights,
-        d.offset,
-        &parts,
-        &inp.bools("aliased")?,
-        inp.bool("converged")?,
-        (&objective, inp.u8("objective_nodes")?),
-        inp.bool("null_refit")?,
+        &d.formula, d.numeric, d.factors, family, d.weights, d.offset, &parts, &aliased, converged,
+        objective, null_refit,
     )?;
     Ok(sizes.map_or(Value::Null, |(r2, icc)| {
         Value::Record(
@@ -471,30 +444,64 @@ pub(crate) fn effect_sizes(inp: &mut Inputs) -> Result<Value, BindError> {
 }
 
 /// `orchestrate::profile_intervals`: `names`, `estimate`, `lower`, `upper`
-/// and `level`.
+/// and `level`, plus the printed `heading` and `notes`: the ML-fit note,
+/// then one note per NaN row.
 pub(crate) fn profile_intervals(inp: &mut Inputs) -> Result<Value, BindError> {
     let d = ModelData::read(inp)?;
+    let reml = inp.bool("reml")?;
+    // A fit stored before the weight power used the weights as given.
+    let weight_power = inp.opt_f64("weight_power")?.unwrap_or(1.0);
+    let weight_power_estimated = inp.opt_bool("weight_power_estimated")?.unwrap_or(false);
+    let level = inp.f64("level")?;
+    let parm = inp.opt_strs("parm")?;
+    let family = d.family()?;
     let r = orchestrate::profile_intervals(
         &d.formula,
         d.numeric,
         d.factors,
-        &d.family,
-        &d.link,
+        family,
         d.weights,
         d.offset,
-        inp.bool("reml")?,
-        // A fit stored before the weight power used the weights as given.
-        inp.opt_f64("weight_power")?.unwrap_or(1.0),
-        inp.opt_bool("weight_power_estimated")?.unwrap_or(false),
-        inp.f64("level")?,
-        inp.opt_strs("parm")?,
+        reml,
+        weight_power,
+        weight_power_estimated,
+        level,
+        parm,
     )?;
+    let refit = if reml {
+        "; the REML fit was refitted by ML."
+    } else {
+        "."
+    };
+    let mut notes = vec![format!("Profile intervals on the ML fit{refit}")];
+    for (i, name) in r.names.iter().enumerate() {
+        let sides: Vec<&str> = [("lower", r.lower[i]), ("upper", r.upper[i])]
+            .into_iter()
+            .filter_map(|(side, v)| v.is_nan().then_some(side))
+            .collect();
+        if r.estimate[i].is_nan() {
+            notes.push(format!(
+                "{name}: not identified next to an SD estimated at 0, so NaN."
+            ));
+        } else if !sides.is_empty() {
+            notes.push(format!(
+                "{name}: the {} bound is undetermined (NaN).",
+                sides.join(" and ")
+            ));
+        }
+    }
+    let heading = format!(
+        "Profile-likelihood confidence intervals, level {}",
+        fmt_g(r.level, 6)
+    );
     Ok(Value::Record(
         Record::new()
             .with("names", Value::StrVec(r.names))
             .with("estimate", Value::Vec(r.estimate))
             .with("lower", Value::Vec(r.lower))
             .with("upper", Value::Vec(r.upper))
-            .with("level", Value::F64(r.level)),
+            .with("level", Value::F64(r.level))
+            .with("heading", text(&heading))
+            .with("notes", Value::StrVec(notes)),
     ))
 }

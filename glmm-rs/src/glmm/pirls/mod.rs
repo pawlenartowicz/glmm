@@ -16,6 +16,7 @@ use crate::spec::{BinomialLink, Family};
 
 mod blocked;
 mod blocked_extras;
+mod control;
 mod packed;
 
 pub(crate) use blocked::pirls_solve_blocked;
@@ -189,7 +190,10 @@ pub(crate) trait LaplaceFactor<T: Scalar> {
         n: usize,
         dual: Option<&mut DualStep<T>>,
     );
-    /// `+I`, factor in place, return `log|A|`; `None` when not PD. Leaves the
+    /// Factor `A = I + M'WM` in place and return half `log|A|`: the blocked
+    /// and structured layouts add the identity at each pivot
+    /// (`linalg::block_chol_unit_shift`); the packed layout and the sparse
+    /// crossed tail add it to `A`'s diagonal and sum `ln L_ii`; `None` when not PD. Leaves the
     /// factor for [`LaplaceFactor::solve_in_place`] and for the `se.rs` Schur
     /// fill.
     fn factor_logdet(&mut self) -> Option<T>;
@@ -565,8 +569,8 @@ pub(crate) struct CrossedTail<'a, T> {
 /// upper bound keeps the step no longer than the exact Newton step, which
 /// is the side that matters: an overstated curvature only slows the
 /// iteration (its rate is `1 − H_true/H_model`), while one below half the
-/// true curvature makes plain Newton diverge. Their cost was `p·e³ + p²·e²`
-/// per iteration for the dense `S⁻¹Uⱼ` products plus `p·Σ_f q·e_f²` for the
+/// true curvature makes plain Newton diverge. The exact form costs
+/// `p·e³ + p²·e²` per iteration for the dense `S⁻¹Uⱼ` products plus `p·Σ_f q·e_f²` for the
 /// `V` blocks, several times the solve's own tail work; measured on the fits
 /// where log|A| dominates, the bound needs no more PIRLS iterations than the
 /// exact form.
@@ -1113,8 +1117,7 @@ fn simd_dot<S: pulp::Simd, const FUSED: bool>(simd: S, x: &[f64], y: &[f64]) -> 
 /// tile. Unfused (`FUSED = false`, plain mul/add) on every target: with
 /// hardware fma the sums moved enough to fail
 /// `joint_search_reaches_the_optimum_when_working_weights_span_decades` on
-/// x86 (and, before the pinned corner was probed for stationarity in
-/// `fit_glmm`, `crossed_zero_variance_reaches_the_single_grouping_optimum`).
+/// x86.
 struct BorderTileOp<'a, const FUSED: bool> {
     acc: &'a mut BorderAcc,
     cols: &'a [&'a [f64]],
@@ -1341,29 +1344,40 @@ impl pulp::WithSimd for RhsTileOp<'_> {
     }
 }
 
-/// Row `i`'s score `ρᵢ` on the Profile border's right-hand side: logit's
-/// `wᵢ(yᵢ − μᵢ)`, `row_score` with the prior weight otherwise — the residual
-/// the u-step's right-hand side scatters.
-pub(crate) fn profile_row_score(
+/// Row `i`'s score `ρᵢ = wᵢ(dμ/dη)(yᵢ − μᵢ)/V(μᵢ)`, prior weight `wᵢ`
+/// inside: the one form every u-step scatters into `M'ρ` and the Profile
+/// border reads, so the two halves of one Newton step agree to the bit
+/// ([`residual_border`]'s cancellation argument assumes it). Logit's is
+/// `wᵢ(yᵢ − μᵢ)`, exact where the general quotient would divide `μ(1 − μ)`
+/// out again; probit's comes from `probit`, the pass's
+/// [`crate::family::ProbitRows`] (`Some` only on a probit `f64` pass); every
+/// other row is [`crate::family::row_score`].
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(crate) fn row_rho<T: Scalar>(
     family: Family,
     nb_theta: f64,
+    i: usize,
     y: f64,
     prior_w: f64,
-    eta: f64,
-    prob: f64,
-) -> f64 {
+    eta: T,
+    prob: T,
+    probit: Option<&mut crate::family::ProbitRows>,
+) -> T {
+    if let Some(rows) = probit {
+        return T::from_f64(rows.score(i, y, prior_w));
+    }
     match family {
         Family::Binomial {
             link: BinomialLink::Logit,
-        } => prior_w * (y - prob),
+        } => (T::from_f64(y) - prob).scale(prior_w),
         other => crate::family::row_score(other, nb_theta, y, prior_w, eta, prob),
     }
 }
 
-/// [`profile_row_score`] over one pass's rows, by row index: through
-/// [`crate::family::ProbitRows`] on a probit `f64` pass, the generic function
-/// otherwise. The tile sits in a `RefCell` so the `Fn` row closures
-/// ([`residual_border`]) can read it.
+/// [`row_rho`] over one pass's rows, by row index, read at `f64`. The probit
+/// tile sits in a `RefCell` so the `Fn` row closures ([`residual_border`])
+/// can read it.
 pub(crate) struct ProfileScores<'a, T: Scalar> {
     family: Family,
     nb_theta: f64,
@@ -1394,19 +1408,18 @@ impl<'a, T: Scalar> ProfileScores<'a, T> {
         }
     }
 
-    /// Row `i`'s [`profile_row_score`].
+    /// Row `i`'s [`row_rho`].
     #[inline]
     pub(crate) fn at(&self, i: usize) -> f64 {
-        if let Some(rows) = self.probit.borrow_mut().as_mut() {
-            return rows.score(i, self.y[i], self.prior_w[i]);
-        }
-        profile_row_score(
+        row_rho(
             self.family,
             self.nb_theta,
+            i,
             self.y[i],
             self.prior_w[i],
             self.eta[i].value(),
             self.prob[i].value(),
+            self.probit.borrow_mut().as_mut(),
         )
     }
 }
@@ -1634,17 +1647,11 @@ fn trust_region_step(
     last
 }
 
-/// `h = ‖L⁻¹ m‖²` for one row: the forward half of `glmm_block_solve` on the
-/// row-major lower factor `l` (q×q), `m` the row's `q` RE-design entries.
+/// `h = ‖L⁻¹ m‖²` for one row: [`block_forward_solve`] on the row-major
+/// lower factor `l` (q×q), `m` the row's `q` RE-design entries.
 pub(crate) fn block_leverage(l: &[f64], q: usize, m: &[f64]) -> f64 {
     let mut t = [0.0_f64; crate::consts::MAX_PRIMARY_Q];
-    for r in 0..q {
-        let mut v = m[r];
-        for c in 0..r {
-            v -= l[r * q + c] * t[c];
-        }
-        t[r] = v / l[r * q + r];
-    }
+    block_forward_solve(l, q, m, &mut t[..q]);
     t[..q].iter().map(|x| x * x).sum()
 }
 
@@ -1662,6 +1669,26 @@ pub(crate) fn block_forward_solve<T: Scalar>(l: &[T], q: usize, m: &[T], t: &mut
     }
 }
 
+/// One row of `M = ZΛ` for a `q`-wide grouping: `out[c] = Σ_{r≥c} z_r·Λ[r,c]`,
+/// `z_0 = 1` (the intercept) and `z_r = z[r−1]` (the row's pre-widened slopes,
+/// `workspace::fill_z_f64`), `lam` the grouping's row-major `q×q` lower `Λ`.
+/// The Z side is indexed by the Λ ROW `r`, not the column `c`. The blocked,
+/// structured and packed layouts all fill `M` through this one fold.
+#[inline]
+pub(crate) fn zlam_row<T: Scalar>(z: &[f64], lam: &[T], q: usize, out: &mut [T]) {
+    for c in 0..q {
+        let mut acc = T::ZERO;
+        for r in c..q {
+            acc += if r == 0 {
+                lam[r * q + c]
+            } else {
+                lam[r * q + c].scale(z[r - 1])
+            };
+        }
+        out[c] = acc;
+    }
+}
+
 /// Refill `eta_fixed[i] = offset[i] + Σ_j x[i,j]·β[j]` (the fixed-effect linear
 /// predictor). Called once at entry of each PIRLS solve and, in `BetaStep::Profile`,
 /// after every β update (the accepted δβ step and each β halving) — the trial
@@ -1675,18 +1702,285 @@ fn refresh_eta_fixed<T: crate::scalar::Scalar>(
     p: usize,
     offset: Option<&[f64]>,
 ) {
-    for i in 0..n {
-        let mut e = T::ZERO;
-        for j in 0..p {
-            e += T::from_f64(x[(i, j)]) * beta[j];
+    // `j` outer walks `x` down its columns; each row still sums `j = 0..p` in
+    // order from zero, so the bits match a row-by-row loop.
+    eta_fixed[..n].fill(T::ZERO);
+    for j in 0..p {
+        for i in 0..n {
+            eta_fixed[i] += beta[j].scale(x[(i, j)]);
         }
-        eta_fixed[i] = e;
     }
     if let Some(o) = offset {
         for i in 0..n {
             eta_fixed[i] += T::from_f64(o[i]);
         }
     }
+}
+
+/// [`refresh_eta_fixed`] at an `f64` β into a buffer of any scalar: the fixed
+/// part at a Profile-mode halving target (`beta_prev`), which the solve's
+/// `eta_fixed` no longer holds.
+fn fixed_part_at<T: Scalar>(
+    x: MatRef<f64>,
+    beta: &[f64],
+    out: &mut [T],
+    n: usize,
+    p: usize,
+    offset: Option<&[f64]>,
+) {
+    // Column order as in `refresh_eta_fixed`. The sum is held in `T`, whose
+    // value part takes the same `f64` adds and whose other parts stay zero.
+    out[..n].fill(T::ZERO);
+    for j in 0..p {
+        for i in 0..n {
+            out[i] += T::from_f64(x[(i, j)] * beta[j]);
+        }
+    }
+    for i in 0..n {
+        out[i] += T::from_f64(offset.map_or(0.0, |o| o[i]));
+    }
+}
+
+/// The step fraction at which a trial past the η clamp first reaches a bound:
+/// `min_i (b_i − η_t,i)/(η_x,i − η_t,i)` over the rows whose raw η at the
+/// trial, `eta_x`, is infeasible ([`crate::family::eta_infeasible`]), with
+/// `eta_t` the raw η at the halving target and `b_i` the bound `η_x,i`
+/// passed; η is affine along the step. `∞` when no row is infeasible, and a
+/// row whose fraction is not finite counts as 0. Read off `.value()`, so a
+/// dual solve takes the `f64` solve's fraction.
+pub(crate) fn clamp_fraction<T: Scalar>(
+    family: Family,
+    y: &[f64],
+    eta_t: &[T],
+    eta_x: &[T],
+) -> f64 {
+    let (lo, hi) = crate::family::clamp_eta_bounds(family);
+    let mut s = f64::INFINITY;
+    for ((&yi, et), ex) in y.iter().zip(eta_t).zip(eta_x) {
+        if crate::family::eta_infeasible(family, yi, *ex) {
+            let (et, ex) = (et.value(), ex.value());
+            let b = if ex < lo { lo } else { hi };
+            let si = (b - et) / (ex - et);
+            s = s.min(if si.is_finite() { si } else { 0.0 });
+        }
+    }
+    s
+}
+
+/// The fraction of the step a trial past the η clamp is pulled back to: the
+/// largest power of two `2^−m` not above `s` ([`clamp_fraction`]), at most ½.
+/// Halving reaches the same fraction after `m` evaluations whenever it gets
+/// back inside, so this lands where halving does, in one evaluation; it also
+/// needs no margin to stay strictly inside the bound. ½, one ordinary halving,
+/// when `s` is not a normal number in (0, 1).
+pub(crate) fn clamp_jump(s: f64) -> f64 {
+    if s.is_normal() && s > 0.0 && s < 1.0 {
+        // Clearing the mantissa leaves the largest power of two not above `s`.
+        f64::from_bits(s.to_bits() & 0x7ff0_0000_0000_0000).min(0.5)
+    } else {
+        0.5
+    }
+}
+
+/// [`clamp_jump`] for the trial `u` (fixed part `eta_fixed`) toward the
+/// halving target `u_t` (fixed part `fixed_t`). The raw η of both go into
+/// `raw_x` and `raw_t`, row buffers the rejected trial no longer needs.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn clamp_jump_from<T: Scalar, L: LaplaceFactor<T>>(
+    layout: &mut L,
+    family: Family,
+    y: &[f64],
+    n: usize,
+    (u, eta_fixed): (&[T], &[T]),
+    (u_t, fixed_t): (&[T], &[T]),
+    raw_x: &mut [T],
+    raw_t: &mut [T],
+) -> f64 {
+    layout.eta_from_mode(u, eta_fixed, raw_x, y, n);
+    layout.eta_from_mode(u_t, fixed_t, raw_t, y, n);
+    clamp_jump(clamp_fraction(family, &y[..n], &raw_t[..n], &raw_x[..n]))
+}
+
+/// What `η_fixed = Xβ + offset` is rebuilt from within one blocked solve:
+/// `x`, or `rows`, the row-major copy of it the `f64` β-Profile solve takes
+/// (`PirlsScratch::x_rows`), with every accumulator in the same row order.
+#[derive(Clone, Copy)]
+struct FixedPart<'a> {
+    x: MatRef<'a, f64>,
+    rows: Option<&'a [f64]>,
+    n: usize,
+    p: usize,
+    offset: Option<&'a [f64]>,
+}
+
+/// Refill `eta_fixed` at the current `beta` ([`refresh_eta_fixed`]).
+fn refresh_fixed<T: Scalar>(fx: &FixedPart, beta: &[T], eta_fixed: &mut [T]) {
+    match fx.rows {
+        Some(xr) => blocked::refresh_eta_fixed_rows(xr, fx.p, beta, eta_fixed, fx.n, fx.offset),
+        None => refresh_eta_fixed(fx.x, beta, eta_fixed, fx.n, fx.p, fx.offset),
+    }
+}
+
+/// `‖u‖²`, summed in index order.
+fn pen_sq<T: Scalar>(u: &[T]) -> T {
+    let mut pen = T::ZERO;
+    for &uc in u {
+        pen += uc * uc;
+    }
+    pen
+}
+
+/// Halve `u` toward `u_prev`, in `T`.
+fn halve_u<T: Scalar>(u: &mut [T], u_prev: &[T]) {
+    for (uc, &pc) in u.iter_mut().zip(u_prev) {
+        *uc = T::from_f64(0.5) * (*uc + pc);
+    }
+}
+
+/// Halve the trial `u` toward the last accepted `u_acc`, in `f64`.
+fn halve_u_to_acc<T: Scalar>(u: &mut [T], u_acc: &[f64]) {
+    for (uc, &a) in u.iter_mut().zip(u_acc) {
+        *uc = T::from_f64(0.5 * (uc.value() + a));
+    }
+}
+
+/// `u` half way between `u_prev` and the last accepted `u_acc`, in `f64`.
+fn halve_prev_to_acc<T: Scalar>(u: &mut [T], u_prev: &[T], u_acc: &[f64]) {
+    for ((uc, pc), &a) in u.iter_mut().zip(u_prev).zip(u_acc) {
+        *uc = T::from_f64(0.5 * (pc.value() + a));
+    }
+}
+
+/// Halve `beta` toward `beta_prev`, in `f64`.
+fn halve_beta<T: Scalar>(beta: &mut [T], beta_prev: &[f64]) {
+    for (b, &bp) in beta.iter_mut().zip(beta_prev) {
+        *b = T::from_f64(0.5 * (b.value() + bp));
+    }
+}
+
+/// One jump of a trial past the η clamp back inside it ([`clamp_jump_from`]),
+/// toward the halving target of `step`: `u_prev` at the current β under
+/// `BetaStep::Fixed`; under `Profile`, β moves in lockstep toward
+/// `beta_prev`, and in exact mode the target `u` is the last accepted `u_acc`.
+/// `u_prev` is free until the next accept overwrites it, so it carries the
+/// exact-mode target; `w` holds the target's fixed part, and `prob`/`eta` the
+/// raw η of the two ends.
+#[allow(clippy::too_many_arguments)]
+fn jump_back<T: Scalar, L: LaplaceFactor<T>>(
+    layout: &mut L,
+    family: Family,
+    y: &[f64],
+    fx: &FixedPart,
+    step: &BetaStep,
+    u: &mut [T],
+    u_prev: &mut [T],
+    beta: &mut [T],
+    eta_fixed: &mut [T],
+    prob: &mut [T],
+    eta: &mut [T],
+    w: &mut [T],
+    k: usize,
+) {
+    let FixedPart {
+        x, n, p, offset, ..
+    } = *fx;
+    if let BetaStep::Profile {
+        exact: Some(ex), ..
+    } = step
+    {
+        for (t, &a) in u_prev[..k].iter_mut().zip(&ex.u_acc[..k]) {
+            *t = T::from_f64(a);
+        }
+    }
+    let beta_t = match step {
+        BetaStep::Profile { beta_prev, .. } => Some(&beta_prev[..p]),
+        BetaStep::Fixed => None,
+    };
+    let fixed_t = match beta_t {
+        Some(bt) => {
+            fixed_part_at(x, bt, &mut w[..], n, p, offset);
+            &w[..]
+        }
+        None => &eta_fixed[..],
+    };
+    let f = clamp_jump_from(
+        layout,
+        family,
+        y,
+        n,
+        (&u[..], &eta_fixed[..]),
+        (&u_prev[..], fixed_t),
+        &mut prob[..],
+        &mut eta[..],
+    );
+    for c in 0..k {
+        u[c] = u_prev[c] + T::from_f64(f) * (u[c] - u_prev[c]);
+    }
+    if let Some(bt) = beta_t {
+        for j in 0..p {
+            beta[j] = T::from_f64(bt[j] + f * (beta[j].value() - bt[j]));
+        }
+        refresh_fixed(fx, beta, eta_fixed);
+    }
+}
+
+/// The period-2 relaxed step (`PIRLS_OSC_RATIO`): move half way from the
+/// pre-step iterate, β in lockstep with u.
+fn damp_step<T: Scalar>(
+    fx: &FixedPart,
+    step: &BetaStep,
+    u: &mut [T],
+    u_prev: &[T],
+    beta: &mut [T],
+    eta_fixed: &mut [T],
+    k: usize,
+) {
+    let half = T::from_f64(0.5);
+    for c in 0..k {
+        u[c] = u_prev[c] + half * (u[c] - u_prev[c]);
+    }
+    if let BetaStep::Profile { beta_prev, .. } = step {
+        for j in 0..fx.p {
+            beta[j] = T::from_f64(beta_prev[j] + 0.5 * (beta[j].value() - beta_prev[j]));
+        }
+        refresh_fixed(fx, beta, eta_fixed);
+    }
+}
+
+/// Apply the border step `δβ` (in `beta_rhs`): β += δβ; u = u_joint =
+/// u_new − T·δβ, i.e. u[c] −= Σ_j T[(c, j)]·δβ[j] over the u layout, with
+/// `T = ainv_mtwx`; then η_fixed, which depends on β, for the next trial.
+fn apply_border<T: Scalar>(
+    fx: &FixedPart,
+    ainv_mtwx: &Mat<f64>,
+    beta_rhs: &[f64],
+    u: &mut [T],
+    beta: &mut [T],
+    eta_fixed: &mut [T],
+    k: usize,
+) {
+    let p = fx.p;
+    for j in 0..p {
+        beta[j] += T::from_f64(beta_rhs[j]);
+    }
+    for c in 0..k {
+        let mut acc = 0.0;
+        for j in 0..p {
+            acc += ainv_mtwx[(c, j)] * beta_rhs[j];
+        }
+        u[c] -= T::from_f64(acc);
+    }
+    refresh_fixed(fx, beta, eta_fixed);
+}
+
+/// The failed-solve return, `(NaN, NaN, NaN, false)`.
+fn fail<T: Scalar>() -> (T, T, T, bool) {
+    (
+        T::from_f64(f64::NAN),
+        T::from_f64(f64::NAN),
+        T::from_f64(f64::NAN),
+        false,
+    )
 }
 
 /// Per-cluster crossed-column pattern (CSR over f): the union of cluster f's
@@ -1769,5 +2063,37 @@ pub(crate) fn build_coupling_csr(
                 .expect("a row's crossed column is in its cluster's CSR")
                 as u32;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spec::PoissonLink;
+
+    #[test]
+    fn clamp_jump_takes_the_largest_power_of_two_inside_the_bound() {
+        let poisson = Family::Poisson {
+            link: PoissonLink::Log,
+        };
+        let jump = |eta_x: f64| clamp_jump(clamp_fraction(poisson, &[1e99], &[0.0], &[eta_x]));
+        // s = 700/8.3e98 ≈ 8.4e-97, between 2^-320 and 2^-319.
+        assert_eq!(jump(8.3e98), 2f64.powi(-320));
+        // Exactly four times the bound: s = ¼, below the ½ cap and the fallback.
+        assert_eq!(jump(2800.0), 0.25);
+        // Inside the bound: no infeasible row, one ordinary halving.
+        assert_eq!(jump(600.0), 0.5);
+    }
+
+    /// The family pass flags a NaN η as infeasible on a clamped link, so the
+    /// packed solve sends such a trial to the clamp jump; with no row truly
+    /// past the clamp the jump is one ordinary halving.
+    #[test]
+    fn clamp_jump_halves_a_nan_trial_with_no_row_past_the_clamp() {
+        let poisson = Family::Poisson {
+            link: PoissonLink::Log,
+        };
+        let s = clamp_fraction(poisson, &[1.0, 2.0], &[0.0, 0.5], &[f64::NAN, 600.0]);
+        assert_eq!(clamp_jump(s), 0.5);
     }
 }

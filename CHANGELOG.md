@@ -6,6 +6,53 @@ All notable changes to the `glmm` crate are recorded here. Format follows
 The Python package (`glmm` on PyPI) is versioned in lockstep with the crate and
 shares these entries; Python-specific notes are called out where they differ.
 
+## [0.9.4] — 2026-11-21
+
+### Added
+
+- `inference::ProfileNote`, and the `lower_note` and `upper_note` fields of `inference::ProfileInterval`: why a side of a profile interval is undetermined (a held search that did not converge, a profile that turns back down, a profile that does not reach the quantile, or a root search that did not converge). `None` on a side with a bound.
+- `formula::Pairwise::family_sizes` and `formula::PairwiseIntervals::family_sizes`: the size of each `by` family that the p-value or interval adjustment used (Tukey's number of levels, otherwise the number of tested comparisons).
+- `loop_advanced` (unstable): `FitDiagnostics::theta_at_limit`, `nb_shape_at_limit` and `dispersion_at_limit`, the conditions of `Note::VarianceAtLimit`, `Note::NbShapeAtLimit` and `Note::DispersionAtLimit`.
+
+### Fixed
+
+- A precision-limited Gaussian mixed fit that switches to the QR kernel now restarts there from its own estimate, so a variance parameter at or near zero is no longer moved off it first.
+- A PIRLS step that overshoots the η clamp by more than 2^16 no longer fails the inner solve; it is pulled back inside the clamp in one evaluation.
+- Binomial, Poisson and negative binomial GLMMs whose prior weights are all far below 1 no longer stop at their start and report converged, on the Laplace path or with adaptive quadrature (nAGQ > 1).
+- On GLMMs with prior weights far below 1, the random-effect log-determinant keeps its digits on every layout except the sparse ones (many random slopes, or large crossed groupings) (it is summed as `ln_1p` of each pivot's excess), so such fits can reach a variance of zero.
+- The Satterthwaite df of Gaussian mixed models are now computed from exact derivatives, not finite differences, so they no longer depend on a step size or on a rescale retry (models with more than 500 crossed levels still use finite differences). Most df move by less than 1e-4; a fit with a small random-effect variance and large groups could get df far too large before (53 instead of 29 on a test case). The Python and R summary footer now reads `t tests use Satterthwaite degrees of freedom.`, without `(finite-difference θ-Hessian)`.
+- `predict` with `future = true` on a Gamma fit no longer loops forever when the lower bound is below the smallest positive double; the bound is 0.
+- A robust OLS or LMM fit whose CR2 or HC2 pieces cannot be formed (an exact fit, or pieces that leave f64's range) carries `Note::SeUnavailable`, with its own wording in Python and R. Its standard errors and df were NaN with no note.
+- `Fit::contrast_t` on an all-zero row carries `ContrastNote::RankDeficientL` with rank 0, as `Fit::contrast_f` does; its estimate and standard error stay 0.
+- A model with more than 64 variance components (random-effect columns over all groupings) is refused as `FitError::Envelope`. Before, a pinned component past the 64th was reported as not pinned, and such a model could panic.
+- A sparse random-effect pattern too large for faer's sparse Cholesky (an index overflow or an allocation failure) is refused as `FitError::Envelope` instead of a panic.
+- `formula::fit_lowered` refuses a formula whose fixed terms, intercept or groupings differ from its lowering's. Before, such a model could panic in `predict` or give a Type III table of the original design.
+- `formula::pairwise` refuses a reference grid of more than 2^25 entries (rows times design columns) as `FitError::Envelope` before building it.
+- A GLMM whose stationarity probe at a pinned endpoint could not evaluate a coordinate now runs the trough polish, which keeps the pinned point unless it finds a lower deviance.
+- On crossed and nested GLMMs with very precise data, the checks after the search (whether to keep a variance pinned at zero, the probe of large variances, and whether to run the last polish) no longer act on deviance changes smaller than the deviance's own rounding error, which the switch between the two optimizers already ignores.
+- Python and R: a crate bug that panics is reported as an internal error (Python `RuntimeError`, R `fastglmm_error_internal`), not as a refused argument or a failed fit.
+- Python and R: `r2()`, `icc()` and `summary()` on a stored fit whose coefficients or variance components do not match its data raise an error instead of returning NaN.
+- Python and R: the p-value of an infinite z statistic is NaN in both packages; R's `summary` prints `NA` where it printed `<2e-16`.
+- R: `print()` of a fit shows small coefficients, such as 3e-5, with `digits` significant digits; it printed them rounded to 0.
+- Docs: the API docs now describe what the fit does. A random-slope index `c` with `p ≤ c < p + s` reads column `c − p` of `Design::re_columns`; `NestedWithin` ids are `parent·W + position within the parent`; a binomial `y` is the success proportion in [0, 1], with trial counts passed as weights (counts were never expanded to 0/1 rows); `Simulator` draws its random effects per distinct id in ascending order, so an id with no row draws nothing.
+
+### Changed
+
+- The formula parser reads every fixed term with one set of rules. A sum or product in parentheses with more than 10,000 terms, such as `(x1*x2*…*x14)`, is now refused, as the same product without parentheses already was. A term that mixes `*` and `:` without parentheses, such as `a*b:c`, is now accepted with R's meaning (`a + b:c + a:b:c`); it was refused. A parenthesis with no partner, as in `y ~ x)` or `y ~ log(x`, now gives "unbalanced parentheses" instead of "expected identifier", and a few other syntax errors now quote the whole term, such as `log(x+1)` instead of `log(x`.
+- The Satterthwaite pass decides which curvature directions are flat after scaling the Hessian to a unit diagonal, so a coordinate's units alone no longer drop a direction.
+- Type II tests on Gaussian mixed models no longer depend on the units of the predictors (except, rarely, within a factor of 2 of the cutoff). They now differ from lmerTest's in the cases where lmerTest's tests depend on the units. The same holds for Type III tests on a model with one term or one column, which use lmerTest's Type I construction.
+- A GLMM whose BOBYQA search after a gradient hand-over ends with no result now reports a failed fit, as other routes do, instead of the gradient search's point.
+- `loop_advanced`: `fit_on` and `fit_on_hinted` return `Result<FitView, FitError>`; a random-effect pattern too large for the sparse factorization is `FitError::Envelope` instead of a panic.
+- Unstable surfaces: `orchestrate`'s entry points take the crate's own types (`Family`, `TermTest`, `Adjust`, `RatioKind`, `Scale`, `StartValues` and one `FitOptions`) instead of option strings, and return named structs (`RanefBlock`, `DesignSummary`, `FormulaColumns`) instead of tuples. `FitResult::df_method` is a `DfMethod`, `NoteInfo` carries typed fields instead of `detail`, `FitResult` gains `stop` (a `StopReason`), and a per-term table's error is a `TermTableError`. `loop_advanced`'s `FitDiagnostics` and `GlmFitView` gain a crate-private field, so neither can be built with a struct literal outside the crate.
+- Binomial fits on the cloglog link compute a small μ with its full relative precision in the vectorized family pass, as the scalar link does (`−expm1(−e^η)`). It was `1 − e^(−e^η)`, off by about 1e-10 relative at μ = 1e-6 and by up to about 1e-4 near the lower bound of 1e-12. Cloglog GLM and GLMM fits with rows of small μ move slightly.
+- Python and R: where the two packages differed, they now give the same output. `anova(m)` on a fit whose stored per-term table failed raises in R an error of class `fastglmm_error_internal` (a bug in glmm) or `fastglmm_error_fit_error` (the model's refusal), where it raised a plain error; in Python the error keeps its class and gains `.code`. R's `glance()` gives a BIC of `NaN` for a fit with no rows, as Python's `bic` does. R's `confint(method = "profile")` carries the notes Python prints, as the attribute `notes` of the matrix. R now asks the same formula parser as Python which columns a formula reads: a column named like a transform, such as `log(x)`, is read as that column, and a formula the parser refuses is refused before the data are checked, with the class `fastglmm_error_invalid_argument`, as in Python. Python's summary prints `NA` for a correlation that is NaN, where it printed `nan`, and its singular-fit line now reads `boundary (singular) fit: see Fit.singular` instead of pointing to an R help page.
+- Lowering a formula holds one term's columns at a time while it forms its cross-products, so a model with a large factor needs less memory: a fit with a 500-level fixed factor at n = 100,000 peaks at 0.87 GB instead of 1.22 GB. Results are unchanged.
+
+### Removed
+
+- `loop_advanced` (unstable): the re-exports `LmmFit`, `LmmGroupings` and `LmmSuffStats`. No `loop_advanced` function takes or returns them.
+- `counters` (unstable): `EvalCounters::nb_nodes` and `EvalCounters::nb_evals_total`, which were always 0.
+
 ## [0.9.3] — 2026-11-16
 
 ### Added

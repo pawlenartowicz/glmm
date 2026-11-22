@@ -1,10 +1,8 @@
 # Uses the scale-free cut in bmh() below; see validation/manifest.json `copied_tools`.
-# Shared helpers for efficiency_mc.R, efficiency_followup_mc.R and
-# formula_search_mc.R: the fastglmm fit, the B^(-1/2) of CR2 with its cut, the CR2 SE
-# with Pustejovsky–Tipton df, the REML profile fit over one weight parameter,
-# and the follow-up run's noise processes, cells and streams. Sourcing this file
-# draws no random numbers. The calling script loads fastglmm. efficiency_mc.R
-# defines its own make_cells() after sourcing, which replaces the one here.
+# Shared helpers: the fastglmm fit, the B^(-1/2) of CR2 with its cut, the CR2 SE
+# with Pustejovsky–Tipton df, the REML profile fit over one weight parameter, and
+# the noise processes, cells and streams of followup_cells(). Sourcing this file
+# draws no random numbers. The calling script loads fastglmm.
 
 # fastglmm evaluates `weights` in `data` first, so the argument must not share
 # a name with a data column (here `w`).
@@ -69,7 +67,7 @@ profile_fit <- function(d, wfun, interval, form = y ~ x + (1 | g)) {
   m <- fit(d, wfun(ph), form = form); m$p_hat <- ph; m$prof_nonconv <- nc; m
 }
 
-# ---- the follow-up run's designs (efficiency_followup_mc.R) -------------------
+# ---- followup_cells()'s designs ----------------------------------------------
 # Noise SD per row.
 procs_a <- list(precision = function(w) 1 / sqrt(w),
                 honest    = function(w) rep(1, length(w)),
@@ -107,7 +105,7 @@ make_cells <- function(G, draw) {
   cells
 }
 
-# The follow-up run's cells and streams: seed 20261031, L'Ecuyer-CMRG; one
+# followup_cells(): seed 20261031, L'Ecuyer-CMRG; one
 # stream per design draw, then one per cell, then one for the CR2 checks.
 # Returns the cells (sorted by part), their ids, their seeds and the check stream.
 followup_cells <- function() {

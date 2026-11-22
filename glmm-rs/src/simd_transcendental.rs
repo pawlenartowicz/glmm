@@ -17,14 +17,13 @@
 //!     exact → tail-safe (never forms `1+z`) and ≤1 ULP.
 //!
 //! Coefficients were derived offline by Remez minimax against an MPFR-class
-//! oracle; the `≤1 ULP` accuracy is re-asserted in-repo by the L1 guard test
+//! oracle; the `≤1 ULP` accuracy is re-asserted in-repo by the ULP guard test
 //! below (vs system libm, the same bar the scalar path meets). The composed
 //! sigmoid `p = 1/(1+z)` inherits one extra division → 2 ULP, identical to the
-//! scalar `sigmoid_stable` it replaces.
+//! scalar `sigmoid_stable`.
 //!
-//! **Not** bit-identical to the previous libm helper (different polynomial + a
-//! lane-wise deviance reduction): the GLMM goldens move by ≤ a few ULP and are
-//! re-frozen. Determinism is within-platform per engine version; SIMD lane width
+//! **Not** bit-identical to libm (different polynomial and a lane-wise deviance
+//! reduction): results differ from a libm build by at most a few ULP. Determinism is within-platform per engine version; SIMD lane width
 //! is runtime-dispatched (AVX2→4, AVX-512→8, wasm128→2), so a horizontal
 //! reduction sums a µarch-dependent number of partials — cross-µarch results
 //! agree only to the last bits, by design (not gated on byte-identity).
@@ -40,10 +39,9 @@
 //! `mul_add` lowers to the soft-float compiler-builtins libcall there (measured
 //! 9–41× on the GLM/GLMM wasm rows). Every fused site therefore goes through
 //! `fmadd`/`fmadd_scalar`, keyed by a `const FUSED: bool` generic: native
-//! instantiates `FUSED = true` (hardware fma, byte-identical to the pre-policy
-//! code), wasm32 instantiates `FUSED = false` (plain mul/add, vectorizable
-//! simd128). Native↔wasm byte-equality is deliberately dropped — the wasm bench
-//! gate is tier-2 |Δk| instead. **All future fused ops in owned kernels go
+//! instantiates `FUSED = true` (hardware fma), wasm32 instantiates
+//! `FUSED = false` (plain mul/add, vectorizable simd128). Native and wasm
+//! results are not byte-equal; the wasm bench gate compares |Δk| instead. **All future fused ops in owned kernels go
 //! through `fmadd`/`fmadd_scalar` — never raw `mul_add`.**
 //! The unfused path is safe by construction: Cody-Waite's whole point is that
 //! `kf·LN2HI` is exactly representable (≤11-bit integer × 33-bit mantissa), so
@@ -97,8 +95,8 @@ const MANT_MASK: u64 = 0x000F_FFFF_FFFF_FFFF;
 const SHIFT52: u64 = 1u64 << 52;
 // exp(-|η|) underflows below ~e⁻⁷⁴⁵; clamp the argument so the FP-magic 2^k build
 // stays in-domain (k ≥ -1022). For |η| > 700, z ≈ 0 and the saturated p/w/lp match
-// the old libm path to rounding — this only guards the (off-fit-path) extreme tail,
-// where the libm code saturated sigmoid → {0,1} anyway.
+// libm to rounding; this only guards the (off-fit-path) extreme tail, where libm
+// saturates sigmoid to {0,1} anyway.
 const EXP_ARG_FLOOR: f64 = -700.0;
 // Upper clamp twin for the full-domain entries (`exp_clamped`/`exp_fill`): the
 // Cody-Waite reduction and the EXP_C polynomial are sign-agnostic (r ∈
@@ -106,6 +104,10 @@ const EXP_ARG_FLOOR: f64 = -700.0;
 // (x ≤ ~709) — 700 keeps symmetric headroom. exp(700) ≈ 1e304, finite; where
 // it saturates, libm would be approaching f64::MAX/inf anyway.
 const EXP_ARG_CEIL: f64 = 700.0;
+// The family kernel clamps η at `family::ETA_MAX`, not at these, before the
+// owned `exp`, so that bound must lie inside them.
+const _: () =
+    assert!(crate::family::ETA_MAX <= EXP_ARG_CEIL && -crate::family::ETA_MAX >= EXP_ARG_FLOOR);
 
 // fma policy: see the module header ("fma policy"). `FUSED` is a const generic
 // rather than a bare `cfg!` check so the native test suite can instantiate and
@@ -411,6 +413,53 @@ fn scalar_ln_pos<const FUSED: bool>(x: f64) -> f64 {
     fmadd_scalar::<FUSED>(kf, LN2HI, fmadd_scalar::<FUSED>(kf, LN2LO, l))
 }
 
+/// [`scalar_ln_pos`] on every lane of `x`, bit for bit: the SIMD body of
+/// [`ln_pos_fill`] and of the cloglog arm of `family_pass`.
+#[inline(always)]
+fn simd_ln_pos<S: Simd, const FUSED: bool>(simd: S, x: S::f64s) -> S::f64s {
+    // The exponent shift reinterprets a 64-bit lane as two 32-bit ones; a
+    // backend whose `u32s` is not the same width as its `u64s` (pulp's
+    // scalar fallback) runs the scalar twin on each lane.
+    if core::mem::size_of::<S::u32s>() != core::mem::size_of::<S::u64s>() {
+        let mut v = x;
+        for l in pulp::bytemuck::cast_slice_mut::<S::f64s, f64>(core::slice::from_mut(&mut v)) {
+            *l = scalar_ln_pos::<FUSED>(*l);
+        }
+        return v;
+    }
+    let one = simd.splat_f64s(1.0);
+    let x = simd.max_f64s(x, simd.splat_f64s(LN_POS_FLOOR));
+    let b = simd.transmute_u64s_f64s(x);
+    let hi: S::u32s = pulp::bytemuck::cast(b);
+    let hi = simd.wrapping_dyn_shr_u32s(hi, simd.splat_u32s(20));
+    let hi: S::u64s = pulp::bytemuck::cast(hi);
+    let ebits = simd.or_u64s(
+        simd.and_u64s(hi, simd.splat_u64s(0x0000_07FF_0000_0000)),
+        simd.splat_u64s(0x4330_0000_0000_0000),
+    );
+    // 2⁵² + E·2³² → E − 1023, exact.
+    let e = simd.sub_f64s(
+        simd.mul_f64s(
+            simd.sub_f64s(
+                simd.transmute_f64s_u64s(ebits),
+                simd.splat_f64s(4_503_599_627_370_496.0),
+            ),
+            simd.splat_f64s(1.0 / 4_294_967_296.0),
+        ),
+        simd.splat_f64s(1023.0),
+    );
+    let m = simd.transmute_f64s_u64s(simd.or_u64s(
+        simd.and_u64s(b, simd.splat_u64s(MANT_MASK)),
+        simd.splat_u64s(ONE_BITS),
+    ));
+    let lt = simd.less_than_f64s(m, simd.splat_f64s(std::f64::consts::SQRT_2));
+    let m = simd.select_f64s(lt, m, simd.mul_f64s(simd.splat_f64s(0.5), m));
+    let kf = simd.select_f64s(lt, e, simd.add_f64s(e, one));
+    let l = simd_log1p_unit::<S, FUSED>(simd, simd.sub_f64s(m, one));
+    let inner = fmadd::<S, FUSED>(simd, kf, simd.splat_f64s(LN2LO), l);
+    fmadd::<S, FUSED>(simd, kf, simd.splat_f64s(LN2HI), inner)
+}
+
 struct LnPosInplaceOp<'a, const FUSED: bool> {
     buf: &'a mut [f64],
 }
@@ -418,48 +467,9 @@ impl<const FUSED: bool> pulp::WithSimd for LnPosInplaceOp<'_, FUSED> {
     type Output = ();
     #[inline(always)]
     fn with_simd<S: Simd>(self, simd: S) {
-        // The exponent shift reinterprets a 64-bit lane as two 32-bit ones;
-        // a backend whose `u32s` is not the same width as its `u64s` (pulp's
-        // scalar fallback) runs the scalar twin on every element.
-        if core::mem::size_of::<S::u32s>() != core::mem::size_of::<S::u64s>() {
-            for v in self.buf.iter_mut() {
-                *v = scalar_ln_pos::<FUSED>(*v);
-            }
-            return;
-        }
-        let one = simd.splat_f64s(1.0);
         let (head, tail) = S::as_mut_simd_f64s(self.buf);
         for v in head.iter_mut() {
-            let x = simd.max_f64s(*v, simd.splat_f64s(LN_POS_FLOOR));
-            let b = simd.transmute_u64s_f64s(x);
-            let hi: S::u32s = pulp::bytemuck::cast(b);
-            let hi = simd.wrapping_dyn_shr_u32s(hi, simd.splat_u32s(20));
-            let hi: S::u64s = pulp::bytemuck::cast(hi);
-            let ebits = simd.or_u64s(
-                simd.and_u64s(hi, simd.splat_u64s(0x0000_07FF_0000_0000)),
-                simd.splat_u64s(0x4330_0000_0000_0000),
-            );
-            // 2⁵² + E·2³² → E − 1023, exact.
-            let e = simd.sub_f64s(
-                simd.mul_f64s(
-                    simd.sub_f64s(
-                        simd.transmute_f64s_u64s(ebits),
-                        simd.splat_f64s(4_503_599_627_370_496.0),
-                    ),
-                    simd.splat_f64s(1.0 / 4_294_967_296.0),
-                ),
-                simd.splat_f64s(1023.0),
-            );
-            let m = simd.transmute_f64s_u64s(simd.or_u64s(
-                simd.and_u64s(b, simd.splat_u64s(MANT_MASK)),
-                simd.splat_u64s(ONE_BITS),
-            ));
-            let lt = simd.less_than_f64s(m, simd.splat_f64s(std::f64::consts::SQRT_2));
-            let m = simd.select_f64s(lt, m, simd.mul_f64s(simd.splat_f64s(0.5), m));
-            let kf = simd.select_f64s(lt, e, simd.add_f64s(e, one));
-            let l = simd_log1p_unit::<S, FUSED>(simd, simd.sub_f64s(m, one));
-            let inner = fmadd::<S, FUSED>(simd, kf, simd.splat_f64s(LN2LO), l);
-            *v = fmadd::<S, FUSED>(simd, kf, simd.splat_f64s(LN2HI), inner);
+            *v = simd_ln_pos::<S, FUSED>(simd, *v);
         }
         for v in tail.iter_mut() {
             *v = scalar_ln_pos::<FUSED>(*v);
@@ -486,8 +496,8 @@ pub(crate) fn ln_pos_fill(buf: &mut [f64]) {
 /// short form such as A&S 7.1.26 (~7.5e-8): the probit Hessian SE
 /// differentiates Φ twice and amplifies its error, so the fit needs a Φ good
 /// to machine precision. `erfc` is W. J. Cody's rational
-/// Chebyshev approximation (CALERF, Netlib SPECFUN), the same algorithm libm
-/// uses; coefficients verbatim from the reference.
+/// Chebyshev approximation (CALERF, Netlib SPECFUN); coefficients verbatim
+/// from the reference.
 #[inline]
 pub(crate) fn phi_hp(z: f64) -> f64 {
     0.5 * erfc_cody(-z * std::f64::consts::FRAC_1_SQRT_2)
@@ -1051,8 +1061,10 @@ fn scalar_sigmoid_owned<const FUSED: bool>(eta: f64) -> f64 {
 /// - `weighted` (weights given, or a binomial response with a value other
 ///   than 0 and 1) selects between the two logit forms: unweighted 0/1
 ///   Bernoulli logit keeps the fused `2·(Σ log1pexp(η) − Σ y·η)` deviance (hence
-///   `yeta`, which the caller's η-pass accumulates), the rest goes through
-///   `family::dev_resid` because that identity does not hold for proportions.
+///   `yeta`, which the caller's η-pass accumulates on this arm only — change
+///   the arm's test together with `glm::evaluate_with_halving`'s), the rest
+///   goes through `family::dev_resid` because that identity does not hold for
+///   proportions.
 #[allow(clippy::too_many_arguments)] // marshals (family, nb_theta, eta, y, prior_w, weighted, yeta, prob, w, z)
 pub(crate) fn family_pass(
     family: Family,
@@ -1075,8 +1087,7 @@ pub(crate) fn family_pass(
     debug_assert!(z.is_empty() || z.len() == n);
     debug_assert!(prior_w.is_empty() || prior_w.len() == n);
 
-    // Unweighted Bernoulli logit: the pre-existing fused kernel, untouched, so
-    // this route stays byte-identical to the fast path it replaces.
+    // Unweighted Bernoulli logit takes the fused kernel.
     if matches!(
         family,
         Family::Binomial {
@@ -1115,12 +1126,13 @@ pub(crate) fn family_pass(
     }
 
     // Raw η past the link's clamp bounds (`family::eta_infeasible`), read
-    // before the arms overwrite η with its projection. The two inverse-link
-    // arms also count their `η ≤ 0` rows lane-wise; this covers them too.
-    // A NaN η counts here as well: the arms' SIMD clamp is a `max`/`min`
-    // pair, which on x86 and on pulp's scalar backend drops the NaN and
-    // projects the row onto the lower bound, so its μ, weight and deviance
-    // come out finite, as if the row had sat at that bound.
+    // before the arms overwrite η with its projection: on the two inverse
+    // links that is `η < 1e-75 || η > 1e75`, which takes in every `η ≤ 0`
+    // row their mean has no value at. A NaN η counts here as well: the arms'
+    // SIMD clamp is a `max`/`min` pair, which on x86 and on pulp's scalar
+    // backend drops the NaN and projects the row onto the lower bound, so its
+    // μ, weight and deviance come out finite, as if the row had sat at that
+    // bound.
     let out_of_range = !matches!(
         family,
         Family::Binomial {
@@ -1130,7 +1142,7 @@ pub(crate) fn family_pass(
         .iter()
         .zip(y)
         .any(|(&e, &yi)| e.is_nan() || crate::family::eta_infeasible(family, yi, e));
-    let infeasible = pulp::Arch::new().dispatch(FamilyMuWOp::<{ FUSED_DEFAULT }> {
+    pulp::Arch::new().dispatch(FamilyMuWOp::<{ FUSED_DEFAULT }> {
         family,
         nb_theta,
         eta,
@@ -1242,19 +1254,19 @@ pub(crate) fn family_pass(
             start = end;
         }
         let dev = if nan_mu { f64::NAN } else { dev };
-        return (dev, infeasible || out_of_range);
+        return (dev, out_of_range);
     }
     if let Family::Binomial { .. } = family {
         return (
             binomial_dev_fold(family, eta, y, prior_w, prob),
-            infeasible || out_of_range,
+            out_of_range,
         );
     }
     for i in 0..n {
         let pw = if prior_w.is_empty() { 1.0 } else { prior_w[i] };
         dev += pw * crate::family::dev_resid_at(family, nb_theta, y[i], eta[i], prob[i]);
     }
-    (dev, infeasible || out_of_range)
+    (dev, out_of_range)
 }
 
 /// The binomial deviance fold of [`family_pass`] (probit, cloglog, and
@@ -1379,9 +1391,9 @@ struct FamilyMuWOp<'a, const FUSED: bool> {
 }
 
 impl<const FUSED: bool> pulp::WithSimd for FamilyMuWOp<'_, FUSED> {
-    type Output = bool; // any raw η ≤ 0 on the two inverse links
+    type Output = ();
     #[inline(always)]
-    fn with_simd<S: Simd>(self, simd: S) -> bool {
+    fn with_simd<S: Simd>(self, simd: S) {
         let (eh, et) = S::as_mut_simd_f64s(self.eta);
         let (ph, pt) = S::as_mut_simd_f64s(self.prob);
         let (wh, wt) = S::as_mut_simd_f64s(self.w);
@@ -1390,11 +1402,8 @@ impl<const FUSED: bool> pulp::WithSimd for FamilyMuWOp<'_, FUSED> {
         let (gh, gt) = S::as_simd_f64s(self.prior_w);
         let nb_theta = self.nb_theta;
 
-        let zero = simd.splat_f64s(0.0);
         let one = simd.splat_f64s(1.0);
         let clampv = simd.splat_f64s(crate::glm::WEIGHT_CLAMP);
-        let mut bad = zero; // lane-wise count of domain-infeasible rows
-        let mut bad_tail = false;
 
         // Each arm supplies a lane function `η_raw → (η_clamped, μ, W_raw, r)`;
         // the assembly below is common — the prior-weight multiply, the
@@ -1405,10 +1414,10 @@ impl<const FUSED: bool> pulp::WithSimd for FamilyMuWOp<'_, FUSED> {
         // here is not a style choice: the AVX intrinsics pulp calls are
         // `#[target_feature]` functions, which inline only into a caller that
         // carries the same feature. A closure boundary blocks that, and every
-        // `_mm256_mul_pd`/`_mm256_fmadd_pd` degrades into a real call — measured
-        // 2026-08-23 on the toy28 probit fit at 23.9 s against 2.05 s for the
-        // scalar path this replaces, with the intrinsics showing up as their own
-        // symbols in `perf report`. Keep the bodies inline.
+        // `_mm256_mul_pd`/`_mm256_fmadd_pd` degrades into a real call (measured
+        // on a probit fit at 23.9 s against 2.05 s for the scalar path, with the
+        // intrinsics showing up as their own symbols in `perf report`). Keep the
+        // bodies inline.
         macro_rules! run_arm {
             (|$e:ident, $yi:ident| $simd_body:block, |$es:ident, $ys:ident| $scalar_body:block) => {{
                 for i in 0..eh.len() {
@@ -1474,10 +1483,13 @@ impl<const FUSED: bool> pulp::WithSimd for FamilyMuWOp<'_, FUSED> {
             // below 1e-304, μ is on its `PROB_EPS` bound, and the row is a tail
             // row whose weight and residual are refilled after the arm, as is
             // every row with `s ≤ UPPER_TAIL_Q`, where `1 − μ` has lost digits.
-            // μ is `1 − s`, not `−expm1(−t)` as in `family::link_inv`: no owned
-            // SIMD expm1 exists, so μ below ~1e-8 differs from the scalar
-            // statement in relative terms (same class of gap as the owned `exp`,
-            // see this file's preamble).
+            // μ = −expm1(−t), as in `family::link_inv`, by Kahan's identity on
+            // the values in hand: `expm1(x) = (u − 1)·x / ln u` with `u` the
+            // rounded `eˣ`, so μ = (1 − s)·t/(−ln s), and μ = t where `s`
+            // rounds to 1 (Goldberg 1991, Theorem 4, as `ln_1p` below). `1 − s`
+            // alone cancels at small μ (relative error about ε/μ). Below
+            // s = ½ (μ above ½) `1 − s` is exact enough and is kept: there `−t`
+            // can be floored, so `ln s` need not be `−t`.
             Family::Binomial {
                 link: BinomialLink::Cloglog,
             } => {
@@ -1486,6 +1498,7 @@ impl<const FUSED: bool> pulp::WithSimd for FamilyMuWOp<'_, FUSED> {
                 let lo = simd.splat_f64s(crate::family::PROB_EPS);
                 let hi = simd.splat_f64s(1.0 - crate::family::PROB_EPS);
                 let afl = simd.splat_f64s(EXP_ARG_FLOOR);
+                let half = simd.splat_f64s(0.5);
                 run_arm!(
                     |e, yi| {
                         let ec = simd.min_f64s(simd.max_f64s(e, elo), ehi);
@@ -1494,7 +1507,14 @@ impl<const FUSED: bool> pulp::WithSimd for FamilyMuWOp<'_, FUSED> {
                             simd,
                             simd.max_f64s(simd.neg_f64s(t), afl),
                         );
-                        let mu = simd.min_f64s(simd.max_f64s(simd.sub_f64s(one, s), lo), hi);
+                        let one_s = simd.sub_f64s(one, s);
+                        let kahan = simd.div_f64s(
+                            simd.mul_f64s(one_s, t),
+                            simd.neg_f64s(simd_ln_pos::<S, FUSED>(simd, s)),
+                        );
+                        let kahan = simd.select_f64s(simd.equal_f64s(s, one), t, kahan);
+                        let raw = simd.select_f64s(simd.less_than_f64s(s, half), one_s, kahan);
+                        let mu = simd.min_f64s(simd.max_f64s(raw, lo), hi);
                         let dmu = simd.mul_f64s(t, s);
                         let v = simd.mul_f64s(mu, simd.sub_f64s(one, mu));
                         let w_raw = simd.div_f64s(simd.mul_f64s(dmu, dmu), v);
@@ -1504,8 +1524,14 @@ impl<const FUSED: bool> pulp::WithSimd for FamilyMuWOp<'_, FUSED> {
                         let ec = e.clamp(-crate::family::ETA_MAX, crate::family::ETA_MAX);
                         let t = scalar_exp_reduced::<FUSED>(ec);
                         let s = scalar_exp_reduced::<FUSED>((-t).max(EXP_ARG_FLOOR));
-                        let mu =
-                            (1.0 - s).clamp(crate::family::PROB_EPS, 1.0 - crate::family::PROB_EPS);
+                        let raw = if s < 0.5 {
+                            1.0 - s
+                        } else if s == 1.0 {
+                            t
+                        } else {
+                            (1.0 - s) * t / -scalar_ln_pos::<FUSED>(s)
+                        };
+                        let mu = raw.clamp(crate::family::PROB_EPS, 1.0 - crate::family::PROB_EPS);
                         let dmu = t * s;
                         let v = mu * (1.0 - mu);
                         (ec, mu, dmu * dmu / v, (yi - mu) / dmu)
@@ -1593,52 +1619,31 @@ impl<const FUSED: bool> pulp::WithSimd for FamilyMuWOp<'_, FUSED> {
                     }
                 );
             }
-            // Gamma inverse link: no transcendental, but one of the two live
-            // `eta_infeasible` cases (μ = 1/η needs η > 0). The infeasible rows are
-            // counted lane-wise and reduced once, rather than OR'd per row.
+            // Gamma inverse link: no transcendental. Its `η ≤ 0` rows, where
+            // μ = 1/η has no value, are flagged by `family_pass`'s
+            // `out_of_range` scan.
             Family::Gamma {
                 link: GammaLink::Inverse,
             } => {
                 let elo = simd.splat_f64s(crate::family::INV_ETA_MIN);
                 let ehi = simd.splat_f64s(crate::family::INV_ETA_MAX);
-                for i in 0..eh.len() {
-                    let raw = eh[i];
-                    // `family::eta_infeasible` is `raw <= 0.0`, which is FALSE on
-                    // NaN; `less_than_or_equal` keeps that, where negating a
-                    // `0 < raw` test would flip it. Counted as 1.0/0.0 per lane and
-                    // reduced once — pulp 0.22 exposes no mask reduction.
-                    bad = simd.add_f64s(
-                        bad,
-                        simd.select_f64s(simd.less_than_or_equal_f64s(raw, zero), one, zero),
-                    );
-                    let ec = simd.min_f64s(simd.max_f64s(raw, elo), ehi);
-                    let mu = simd.div_f64s(one, ec);
-                    let dmu = simd.neg_f64s(simd.mul_f64s(mu, mu));
-                    let v = simd.mul_f64s(mu, mu);
-                    let w_raw = simd.div_f64s(simd.mul_f64s(dmu, dmu), v);
-                    eh[i] = ec;
-                    ph[i] = mu;
-                    let pw = if gh.is_empty() { one } else { gh[i] };
-                    wh[i] = simd.max_f64s(simd.mul_f64s(pw, w_raw), clampv);
-                    if let Some(slot) = zh.get_mut(i) {
-                        *slot = simd.add_f64s(ec, simd.div_f64s(simd.sub_f64s(yh[i], mu), dmu));
+                run_arm!(
+                    |e, yi| {
+                        let ec = simd.min_f64s(simd.max_f64s(e, elo), ehi);
+                        let mu = simd.div_f64s(one, ec);
+                        let dmu = simd.neg_f64s(simd.mul_f64s(mu, mu));
+                        let v = simd.mul_f64s(mu, mu);
+                        let w_raw = simd.div_f64s(simd.mul_f64s(dmu, dmu), v);
+                        (ec, mu, w_raw, simd.div_f64s(simd.sub_f64s(yi, mu), dmu))
+                    },
+                    |e, yi| {
+                        let ec = e.clamp(crate::family::INV_ETA_MIN, crate::family::INV_ETA_MAX);
+                        let mu = 1.0 / ec;
+                        let dmu = -(mu * mu);
+                        let v = mu * mu;
+                        (ec, mu, dmu * dmu / v, (yi - mu) / dmu)
                     }
-                }
-                for i in 0..et.len() {
-                    let raw = et[i];
-                    bad_tail |= raw <= 0.0;
-                    let ec = raw.clamp(crate::family::INV_ETA_MIN, crate::family::INV_ETA_MAX);
-                    let mu = 1.0 / ec;
-                    let dmu = -(mu * mu);
-                    let v = mu * mu;
-                    et[i] = ec;
-                    pt[i] = mu;
-                    let pw = if gt.is_empty() { 1.0 } else { gt[i] };
-                    wt[i] = (pw * (dmu * dmu / v)).max(crate::glm::WEIGHT_CLAMP);
-                    if let Some(slot) = zt.get_mut(i) {
-                        *slot = ec + (yt[i] - mu) / dmu;
-                    }
-                }
+                );
             }
             // IG log link: `exp(η)` once, reused for μ and dμ/dη. V(μ) = μ³, so
             // the general Fisher weight is exp(η)²/μ³; tail rows (|η| past
@@ -1667,944 +1672,39 @@ impl<const FUSED: bool> pulp::WithSimd for FamilyMuWOp<'_, FUSED> {
                 );
             }
             // IG 1/μ² link: μ = η^(−1/2), dμ/dη = −μ³/2, V = μ³ ⇒ W_raw = μ³/4.
-            // The second live `eta_infeasible` case (η > 0 required), counted
-            // lane-wise exactly as the Gamma-inverse arm above does. `sqrt` is
-            // IEEE-exact on both paths, so head and tail agree to the bit. Spelled
-            // out by hand rather than through `run_arm!`, which has no channel to
-            // carry the `bad`/`bad_tail` accumulation out of its lane closures —
-            // same reason the Gamma-inverse arm above bypasses the macro.
+            // Its `η ≤ 0` rows are flagged by `out_of_range`, as on the
+            // Gamma-inverse arm above. `sqrt` is IEEE-exact on both paths, so
+            // head and tail agree to the bit.
             Family::InverseGaussian {
                 link: InverseGaussianLink::InverseSquared,
             } => {
                 let elo = simd.splat_f64s(crate::family::INV_ETA_MIN);
                 let ehi = simd.splat_f64s(crate::family::INV_ETA_MAX);
                 let half = simd.splat_f64s(0.5);
-                for i in 0..eh.len() {
-                    let raw = eh[i];
-                    bad = simd.add_f64s(
-                        bad,
-                        simd.select_f64s(simd.less_than_or_equal_f64s(raw, zero), one, zero),
-                    );
-                    let ec = simd.min_f64s(simd.max_f64s(raw, elo), ehi);
-                    let mu = simd.div_f64s(one, simd.sqrt_f64s(ec));
-                    let mu3 = simd.mul_f64s(simd.mul_f64s(mu, mu), mu);
-                    let dmu = simd.neg_f64s(simd.mul_f64s(half, mu3));
-                    let w_raw = simd.div_f64s(simd.mul_f64s(dmu, dmu), mu3);
-                    eh[i] = ec;
-                    ph[i] = mu;
-                    let pw = if gh.is_empty() { one } else { gh[i] };
-                    wh[i] = simd.max_f64s(simd.mul_f64s(pw, w_raw), clampv);
-                    if let Some(slot) = zh.get_mut(i) {
-                        *slot = simd.add_f64s(ec, simd.div_f64s(simd.sub_f64s(yh[i], mu), dmu));
+                run_arm!(
+                    |e, yi| {
+                        let ec = simd.min_f64s(simd.max_f64s(e, elo), ehi);
+                        let mu = simd.div_f64s(one, simd.sqrt_f64s(ec));
+                        let mu3 = simd.mul_f64s(simd.mul_f64s(mu, mu), mu);
+                        let dmu = simd.neg_f64s(simd.mul_f64s(half, mu3));
+                        let w_raw = simd.div_f64s(simd.mul_f64s(dmu, dmu), mu3);
+                        (ec, mu, w_raw, simd.div_f64s(simd.sub_f64s(yi, mu), dmu))
+                    },
+                    |e, yi| {
+                        let ec = e.clamp(crate::family::INV_ETA_MIN, crate::family::INV_ETA_MAX);
+                        let mu = 1.0 / ec.sqrt();
+                        let mu3 = mu * mu * mu;
+                        let dmu = -0.5 * mu3;
+                        let w_raw = dmu * dmu / mu3;
+                        (ec, mu, w_raw, (yi - mu) / dmu)
                     }
-                }
-                for i in 0..et.len() {
-                    let raw = et[i];
-                    bad_tail |= raw <= 0.0;
-                    let ec = raw.clamp(crate::family::INV_ETA_MIN, crate::family::INV_ETA_MAX);
-                    let mu = 1.0 / ec.sqrt();
-                    let mu3 = mu * mu * mu;
-                    let dmu = -0.5 * mu3;
-                    let w_raw = dmu * dmu / mu3;
-                    et[i] = ec;
-                    pt[i] = mu;
-                    let pw = if gt.is_empty() { 1.0 } else { gt[i] };
-                    wt[i] = (pw * w_raw).max(crate::glm::WEIGHT_CLAMP);
-                    if let Some(slot) = zt.get_mut(i) {
-                        *slot = ec + (yt[i] - mu) / dmu;
-                    }
-                }
+                );
             }
             Family::Gaussian => unreachable!("Gaussian is handled before dispatch"),
         }
-        bad_tail || simd.reduce_sum_f64s(bad) > 0.0
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Reference: system libm (std f64). Accuracy against an MPFR oracle
-    // (primitives ≤1 ULP) is verified offline; in-repo we re-assert SIMD == scalar-libm
-    // accuracy (exp/log1p ≤1 ULP, composed p ≤2 ULP) — the regression net for the coeffs.
-    fn ulp(a: f64, b: f64) -> i128 {
-        let o = |x: f64| {
-            let b = x.to_bits() as i64;
-            (if b < 0 { i64::MIN.wrapping_sub(b) } else { b }) as i128
-        };
-        (o(a) - o(b)).abs()
-    }
-    fn libm_fused(eta: f64) -> (f64, f64) {
-        if eta >= 0.0 {
-            let z = (-eta).exp();
-            (1.0 / (1.0 + z), eta + z.ln_1p())
-        } else {
-            let z = eta.exp();
-            (z / (1.0 + z), z.ln_1p())
-        }
-    }
-
-    #[test]
-    fn simd_kernel_within_1ulp_of_libm() {
-        // Dense grid straddling the η=0 seam, widened to the certified ±700
-        // domain (the exp/log1p reduction's clamp bound) — the deep tail is
-        // reachable during the first three IRLS iterations, before the
-        // divergence guard in `glm.rs` engages. One extra point past the clamp
-        // (1e3) checks the saturated regime.
-        let n = 20_002usize;
-        let mut eta: Vec<f64> = (0..n)
-            .map(|k| -700.0 + 1400.0 * k as f64 / n as f64)
-            .collect();
-        eta.push(1.0e3);
-        let n = eta.len(); // 20_003 -> not a multiple of any lane count, exercises the SIMD tail too
-
-        // Per-element accuracy of the kernel formula. `scalar_fused` is bit-identical
-        // op-for-op to the SIMD path, so this guards the coefficients directly. The
-        // primitives are ≤1 ULP of the true value (proved offline vs an MPFR oracle);
-        // in-repo we bound the kernel-vs-libm difference (both ≤1 ULP of truth → ≤2 apart).
-        let (mut pmax, mut lpmax, mut wmax) = (0i128, 0i128, 0i128);
-        for &e in &eta {
-            let (p, w, lp) = scalar_fused::<{ FUSED_DEFAULT }>(e);
-            let (libp, liblp) = libm_fused(e);
-            pmax = pmax.max(ulp(p, libp));
-            lpmax = lpmax.max(ulp(lp, liblp));
-            assert!(w >= crate::glm::WEIGHT_CLAMP && w.is_finite());
-            // `w` is only clamp/finite-checked above, which a wrong-but-in-range
-            // weight formula would still pass — recompute p(1-p) from the libm
-            // reference p, floored the same way, and ULP-check against it.
-            // `w = p(1-p)`'s derivative `1-2p` amplifies the p gap at interior
-            // η (see the unfused twin below): measured 1 ULP against glibc,
-            // 6 ULP against wasm32's libm (η ≈ 1.68, where the kernel and libm
-            // p sit 1 ULP either side of the true value). Each target is pinned
-            // at its own measurement + 1.
-            let w_ref = (libp * (1.0 - libp)).max(crate::glm::WEIGHT_CLAMP);
-            wmax = wmax.max(ulp(w, w_ref));
-        }
-        assert!(pmax <= 2, "sigmoid p drifted {pmax} ULP from libm");
-        assert!(lpmax <= 2, "log1pexp drifted {lpmax} ULP from libm");
-        let w_bound = if cfg!(target_arch = "wasm32") { 7 } else { 2 };
-        assert!(
-            wmax <= w_bound,
-            "IRLS weight w drifted {wmax} ULP from libm p(1-p)"
-        );
-
-        // End-to-end SIMD dispatch path: p filled within the same band, and the
-        // lane-reduced Σlog1pexp tracks the scalar Σ (the reorder moves only last bits).
-        let mut p = vec![0.0; n];
-        let mut w = vec![0.0; n];
-        let lp_sum = pw_and_log1pexp_sum(&eta, &mut p, &mut w);
-        let mut p_simd_max = 0i128;
-        let mut ref_sum = 0.0;
-        for i in 0..n {
-            let (libp, liblp) = libm_fused(eta[i]);
-            p_simd_max = p_simd_max.max(ulp(p[i], libp));
-            ref_sum += liblp;
-        }
-        assert!(
-            p_simd_max <= 2,
-            "SIMD-path p drifted {p_simd_max} ULP from libm"
-        );
-        assert!(
-            (lp_sum - ref_sum).abs() <= 1e-9 * ref_sum.abs().max(1.0),
-            "Σlog1pexp drift {lp_sum} vs {ref_sum}"
-        );
-    }
-
-    #[test]
-    fn unfused_kernel_within_3ulp_of_libm() {
-        // The wasm32 arithmetic (plain mul/add, no fma), instantiated on native.
-        // Cody-Waite reduction is fma-free-safe by design; only the Horner steps
-        // double-round. Measured 2026-06-11 on the 20,003-pt grid: p 2 ULP,
-        // log1pexp 2 ULP, SIMD p 2 ULP — bound pinned at measured+1 = 3. If it
-        // ever exceeds that, a reduction step has become fma-dependent and the
-        // policy is wrong — investigate before shipping.
-        let n = 20_003usize;
-        let eta: Vec<f64> = (0..n).map(|k| -40.0 + 80.0 * k as f64 / n as f64).collect();
-        let (mut pmax, mut lpmax, mut wmax) = (0i128, 0i128, 0i128);
-        for &e in &eta {
-            let (p, w, lp) = scalar_fused::<false>(e);
-            let (libp, liblp) = libm_fused(e);
-            pmax = pmax.max(ulp(p, libp));
-            lpmax = lpmax.max(ulp(lp, liblp));
-            assert!(w >= crate::glm::WEIGHT_CLAMP && w.is_finite());
-            // Same libm-formula ULP check as the fused kernel test, against the
-            // unfused (plain mul/add) weight. `w = p(1-p)`'s derivative `1-2p`
-            // amplifies whatever ULP gap the unfused `p` already carries (up to
-            // 3 ULP here) at interior η, well away from either tail. Measured
-            // 29 ULP; pinned at measured+1.
-            let w_ref = (libp * (1.0 - libp)).max(crate::glm::WEIGHT_CLAMP);
-            wmax = wmax.max(ulp(w, w_ref));
-        }
-        assert!(pmax <= 3, "unfused sigmoid p drifted {pmax} ULP from libm");
-        assert!(lpmax <= 3, "unfused log1pexp drifted {lpmax} ULP from libm");
-        assert!(
-            wmax <= 30,
-            "unfused IRLS weight w drifted {wmax} ULP from libm p(1-p)"
-        );
-
-        // End-to-end dispatch of the unfused op on native SIMD lanes.
-        let mut p = vec![0.0; n];
-        let mut w = vec![0.0; n];
-        let lp_sum = pulp::Arch::new().dispatch(PwLog1pexpOp::<false> {
-            eta: &eta,
-            p: &mut p,
-            w: &mut w,
-        });
-        let mut ref_sum = 0.0;
-        let mut p_simd_max = 0i128;
-        for i in 0..n {
-            let (libp, liblp) = libm_fused(eta[i]);
-            p_simd_max = p_simd_max.max(ulp(p[i], libp));
-            ref_sum += liblp;
-        }
-        assert!(
-            p_simd_max <= 3,
-            "unfused SIMD p drifted {p_simd_max} ULP from libm"
-        );
-        assert!((lp_sum - ref_sum).abs() <= 1e-9 * ref_sum.abs().max(1.0));
-    }
-
-    #[test]
-    fn exp_fill_within_1ulp_of_libm_full_domain() {
-        // Full certified domain [−700, 700] — positive arguments exercise the
-        // same Cody-Waite reduction (sign-agnostic) and the 2^k build up to
-        // k+1023 = 2033. Measured 2026-06-11 over this 20,003-pt grid: scalar
-        // and SIMD both ≤1 ULP of libm — pinned at measured (1).
-        let n = 20_003usize;
-        let xs: Vec<f64> = (0..n)
-            .map(|k| -700.0 + 1400.0 * k as f64 / n as f64)
-            .collect();
-        let mut emax = 0i128;
-        for &x in &xs {
-            emax = emax.max(ulp(exp_clamped(x), x.exp()));
-        }
-        assert!(emax <= 1, "exp_clamped drifted {emax} ULP from libm");
-        let mut buf = xs.clone();
-        exp_fill(&mut buf);
-        let mut smax = 0i128;
-        for i in 0..n {
-            smax = smax.max(ulp(buf[i], xs[i].exp()));
-        }
-        assert!(smax <= 1, "exp_fill drifted {smax} ULP from libm");
-        // Clamp bound itself, not just "still finite": a wrong clamp constant
-        // would still pass a finite/positive check.
-        let mut edge = vec![-1.0e9, 1.0e9];
-        exp_fill(&mut edge);
-        assert_eq!(edge[0].to_bits(), exp_clamped(EXP_ARG_FLOOR).to_bits());
-        assert_eq!(edge[1].to_bits(), exp_clamped(EXP_ARG_CEIL).to_bits());
-    }
-
-    #[test]
-    fn phi_hp_full_double_precision() {
-        // Reference Φ values (R `pnorm`, 16 figs). The probit FD-Hessian SE needs
-        // Φ to ~machine precision — A&S 7.1.26's ~7.5e-8 is far too coarse here.
-        let cases = [
-            (-6.0, 9.865_876_450_376_968e-10),
-            (-3.0, 1.349_898_031_630_095e-3),
-            (-1.959_963_984_540_054, 0.025),
-            (-1.0, 0.158_655_253_931_457_05),
-            (0.0, 0.5),
-            (0.5, 0.691_462_461_274_013_1),
-            (1.0, 0.841_344_746_068_542_9),
-            (1.959_963_984_540_054, 0.975),
-            (3.0, 0.998_650_101_968_369_9),
-            (6.0, 0.999_999_999_013_412_3),
-        ];
-        for (z, want) in cases {
-            let got = phi_hp(z);
-            assert!(
-                (got - want).abs() <= 1e-14 * want.abs().max(1e-12),
-                "phi_hp({z}) = {got}, want {want}"
-            );
-        }
-        // Tail symmetry Φ(−z) = 1 − Φ(z) to full precision.
-        for &z in &[0.3, 1.7, 4.2, 8.0] {
-            assert!((phi_hp(-z) - (1.0 - phi_hp(z))).abs() <= 1e-15);
-        }
-    }
-
-    #[test]
-    fn ln_gamma_full_double_precision() {
-        // Reference lnΓ values (R `lgamma`, 16 figs), spanning the range the Gamma
-        // dispersion 1/φ visits (small, ~1, integer factorials, large).
-        let cases = [
-            (0.5, 0.572_364_942_924_700_1), // ln(√π)
-            (1.0, 0.0),
-            (1.5, -0.120_782_237_635_245_22),
-            (1.9, -0.038_984_275_923_082_73),
-            (2.0, 0.0),
-            (5.0, 3.178_053_830_347_945_6), // ln(4!) = ln 24
-            (10.0, 12.801_827_480_081_469), // ln(9!)
-            (100.0, 359.134_205_369_575_4),
-        ];
-        for (x, want) in cases {
-            let got = ln_gamma(x);
-            assert!(
-                (got - want).abs() <= 1e-13 * want.abs().max(1.0),
-                "ln_gamma({x}) = {got}, want {want}"
-            );
-        }
-    }
-
-    /// `lnΓ(x) = −ln x − γx + O(x²)`, so below 1e-12 `lnΓ(x) + ln x` is under
-    /// 1e-12. Without the small-x branch the series divides by zero below
-    /// about 1.1e-16 and returns +inf.
-    #[test]
-    fn ln_gamma_is_finite_for_tiny_x() {
-        for x in [1e-20, 1e-100, 1e-300] {
-            let got = ln_gamma(x);
-            assert!(got.is_finite(), "ln_gamma({x}) = {got}");
-            assert!((got + x.ln()).abs() <= 1e-12, "ln_gamma({x}) = {got}");
-        }
-    }
-
-    /// The NB row terms take `lnΓ(θ)` down to the shape's lower search
-    /// limit, 1e-6. References: mpmath `loggamma` at 50 digits, rounded to
-    /// the nearest double (validation/tools/prep/ln_gamma_tiny_reference.py).
-    #[test]
-    fn ln_gamma_is_accurate_at_tiny_shapes() {
-        let cases = [
-            (1e-6, 13.815509980749432),
-            (1e-5, 11.512919692895826),
-            (1e-4, 9.210282658633963),
-        ];
-        let errs: Vec<f64> = cases
-            .iter()
-            .map(|&(x, want)| (ln_gamma(x) - want).abs() / want)
-            .collect();
-        assert!(
-            errs.iter().all(|&e| e <= 1e-14),
-            "relative errors at 1e-6, 1e-5, 1e-4: {errs:?}"
-        );
-    }
-
-    #[test]
-    fn erfc_blend_accuracy_and_head_tail_identity() {
-        // The probit arm's Φ must stay near machine precision (the FD-Hessian SE
-        // differentiates it twice), so the branch-free blend is measured against
-        // `erfc_cody` — the branching reference `phi_hp` itself calls. The grid
-        // covers all three |x| regions and both seams (0.46875, 4.0); the
-        // certified domain stops at √700, so 26 is the top.
-        //
-        // Measured 2026-08-23 on this 20,003-pt grid: 4 ULP, pinned at
-        // measured+1. The blend's rationals are Cody's op-for-op, so the whole
-        // gap is the `exp(−⌊16y⌋²/16²)·exp(−δ)` factor: two of this module's
-        // owned `exp`s (≤1 ULP each) where Cody calls libm (≤0.5 ULP each),
-        // composed through a product. That is the floor for this construction —
-        // a tighter bound needs a sharper owned `exp`, not a better blend. 4 ULP
-        // on Φ is 9e-16 relative, inside `phi_hp`'s own documented ~1e-15.
-        let n = 20_003usize;
-        let xs: Vec<f64> = (0..n).map(|k| -26.0 + 52.0 * k as f64 / n as f64).collect();
-        let mut smax = 0i128;
-        for &x in &xs {
-            smax = smax.max(ulp(scalar_erfc_blend::<{ FUSED_DEFAULT }>(x), erfc_cody(x)));
-        }
-        assert!(smax <= 5, "scalar erfc blend drifted {smax} ULP from Cody");
-        // SIMD head vs its scalar twin: bit-identical, the
-        // `simd_fused`/`scalar_fused` discipline.
-        let mut buf = xs.clone();
-        erfc_fill(&mut buf);
-        for i in 0..n {
-            assert_eq!(
-                buf[i].to_bits(),
-                scalar_erfc_blend::<{ FUSED_DEFAULT }>(xs[i]).to_bits(),
-                "erfc SIMD head diverged from its scalar twin at x={}",
-                xs[i]
-            );
-        }
-        // Composed through the probit link, over the whole range where μ is not
-        // already clamped to `family::PROB_EPS` (|η| ≲ 7.03). Measured 4 ULP.
-        let mut zmax = 0i128;
-        for k in 0..n {
-            let z = -8.0 + 16.0 * k as f64 / n as f64;
-            let (mu, _) = scalar_probit::<{ FUSED_DEFAULT }>(z);
-            zmax = zmax.max(ulp(mu, phi_hp(z)));
-        }
-        assert!(zmax <= 5, "probit μ drifted {zmax} ULP from phi_hp");
-    }
-
-    #[test]
-    fn family_pass_simd_head_matches_scalar_tail() {
-        // The `simd_fused`/`scalar_fused` discipline, applied per family arm: a
-        // whole-slice call (SIMD head + tail) must agree TO THE BIT with the same
-        // rows run one at a time (which is pure tail, every lane width).
-        use crate::spec::{
-            BinomialLink, Family, GammaLink, InverseGaussianLink, NegBinomialLink, PoissonLink,
-        };
-        let n = 1_003usize;
-        let eta: Vec<f64> = (0..n).map(|k| -4.0 + 8.0 * k as f64 / n as f64).collect();
-        let pw: Vec<f64> = (0..n).map(|k| 1.0 + (k % 5) as f64).collect();
-        let cases: [(Family, f64); 8] = [
-            (
-                Family::Binomial {
-                    link: BinomialLink::Probit,
-                },
-                f64::NAN,
-            ),
-            (
-                Family::Binomial {
-                    link: BinomialLink::Cloglog,
-                },
-                f64::NAN,
-            ),
-            (
-                Family::Binomial {
-                    link: BinomialLink::Logit,
-                },
-                f64::NAN,
-            ),
-            (
-                Family::Poisson {
-                    link: PoissonLink::Log,
-                },
-                f64::NAN,
-            ),
-            (
-                Family::Gamma {
-                    link: GammaLink::Log,
-                },
-                f64::NAN,
-            ),
-            (
-                Family::NegativeBinomial {
-                    link: NegBinomialLink::Log,
-                },
-                1.7,
-            ),
-            (
-                Family::InverseGaussian {
-                    link: InverseGaussianLink::Log,
-                },
-                f64::NAN,
-            ),
-            (
-                Family::InverseGaussian {
-                    link: InverseGaussianLink::InverseSquared,
-                },
-                f64::NAN,
-            ),
-        ];
-        for (family, nb_theta) in cases {
-            let y: Vec<f64> = match family {
-                Family::Binomial { .. } => (0..n).map(|k| (k % 3) as f64 / 2.0).collect(),
-                Family::Gamma { .. } | Family::InverseGaussian { .. } => {
-                    (0..n).map(|k| 0.5 + (k % 7) as f64).collect()
-                }
-                _ => (0..n).map(|k| (k % 9) as f64).collect(),
-            };
-            let run = |lo: usize,
-                       hi: usize,
-                       e: &mut [f64],
-                       p: &mut [f64],
-                       w: &mut [f64],
-                       z: &mut [f64]| {
-                family_pass(
-                    family,
-                    nb_theta,
-                    &mut e[lo..hi],
-                    &y[lo..hi],
-                    &pw[lo..hi],
-                    true,
-                    0.0,
-                    &mut p[lo..hi],
-                    &mut w[lo..hi],
-                    &mut z[lo..hi],
-                )
-            };
-            let (mut e1, mut p1, mut w1, mut z1) =
-                (eta.clone(), vec![0.0; n], vec![0.0; n], vec![0.0; n]);
-            run(0, n, &mut e1, &mut p1, &mut w1, &mut z1);
-            let (mut e2, mut p2, mut w2, mut z2) =
-                (eta.clone(), vec![0.0; n], vec![0.0; n], vec![0.0; n]);
-            for i in 0..n {
-                run(i, i + 1, &mut e2, &mut p2, &mut w2, &mut z2);
-            }
-            for i in 0..n {
-                for (a, b, what) in [
-                    (e1[i], e2[i], "eta"),
-                    (p1[i], p2[i], "mu"),
-                    (w1[i], w2[i], "w"),
-                    (z1[i], z2[i], "z"),
-                ] {
-                    assert_eq!(
-                        a.to_bits(),
-                        b.to_bits(),
-                        "{family:?} {what} head/tail split at row {i}: {a} vs {b}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn family_pass_gamma_inverse_flags_infeasible_eta() {
-        use crate::spec::{Family, GammaLink};
-        let f = Family::Gamma {
-            link: GammaLink::Inverse,
-        };
-        let n = 37usize;
-        let y = vec![1.5; n];
-        let ok: Vec<f64> = (0..n).map(|k| 0.1 + 0.05 * k as f64).collect();
-        let run = |eta: &[f64]| {
-            let (mut e, mut p, mut w, mut z) =
-                (eta.to_vec(), vec![0.0; n], vec![0.0; n], vec![0.0; n]);
-            family_pass(
-                f,
-                f64::NAN,
-                &mut e,
-                &y,
-                &[],
-                false,
-                0.0,
-                &mut p,
-                &mut w,
-                &mut z,
-            )
-            .1
-        };
-        assert!(!run(&ok));
-        // One negative η anywhere in the head, and one in the sub-lane tail.
-        let mut head_bad = ok.clone();
-        head_bad[2] = -0.5;
-        assert!(run(&head_bad));
-        let mut tail_bad = ok.clone();
-        tail_bad[n - 1] = -0.5;
-        assert!(run(&tail_bad));
-    }
-
-    #[test]
-    fn exp_fill_infinity_saturates_the_domain_clamp() {
-        // ±inf sits past [-700, 700] on either side, ordered normally against
-        // the clamp bounds (no NaN ambiguity), so the SIMD head's `min_f64s`/
-        // `max_f64s` and the scalar tail's `f64::clamp` agree: both floor/ceil
-        // it exactly like any other out-of-range finite input.
-        let mut short = vec![f64::NEG_INFINITY, f64::INFINITY]; // scalar tail only
-        exp_fill(&mut short);
-        assert_eq!(short[0].to_bits(), exp_clamped(EXP_ARG_FLOOR).to_bits());
-        assert_eq!(short[1].to_bits(), exp_clamped(EXP_ARG_CEIL).to_bits());
-
-        let mut long = vec![0.0; 16]; // forces indices 0,1 through the SIMD head
-        long[0] = f64::NEG_INFINITY;
-        long[1] = f64::INFINITY;
-        for (i, x) in long.iter_mut().enumerate().skip(2) {
-            *x = -4.0 + i as f64;
-        }
-        exp_fill(&mut long);
-        assert_eq!(long[0].to_bits(), exp_clamped(EXP_ARG_FLOOR).to_bits());
-        assert_eq!(long[1].to_bits(), exp_clamped(EXP_ARG_CEIL).to_bits());
-    }
-
-    /// A NaN comes out of `exp_fill` as NaN or as exp(−700), never as any
-    /// other value. Which one depends on where it lands and on the backend:
-    /// the scalar tail's `f64::clamp` keeps NaN; a SIMD lane clamps with the
-    /// backend's `min`/`max`, which drop the NaN on x86_64 (AVX2/AVX-512) and
-    /// on pulp's scalar backend (lane width 1: plain wasm32, x86_64 without
-    /// AVX2) but propagate it on wasm32 `+simd128`.
-    #[test]
-    fn exp_fill_nan_comes_out_nan_or_floored() {
-        let floor = exp_clamped(EXP_ARG_FLOOR);
-        let mut short = vec![f64::NAN];
-        exp_fill(&mut short);
-        let mut long = vec![0.0; 16];
-        long[0] = f64::NAN;
-        for (i, x) in long.iter_mut().enumerate().skip(1) {
-            *x = -4.0 + i as f64;
-        }
-        exp_fill(&mut long);
-        for v in [short[0], long[0]] {
-            assert!(v.is_nan() || v.to_bits() == floor.to_bits(), "{v}");
-        }
-    }
-
-    /// `ln_pos_fill` against libm over the whole positive normal range
-    /// (log-spaced from `f64::MIN_POSITIVE` to `1e300`, plus values next to 1,
-    /// the NB deviance's ratio near the mode): within 2 ULP everywhere, and the
-    /// SIMD head equals its scalar tail element by element.
-    #[test]
-    fn ln_pos_fill_matches_libm_within_2ulp() {
-        let mut xs: Vec<f64> = (0..20_000)
-            .map(|k| 10f64.powf(-307.0 + 607.0 * k as f64 / 19_999.0))
-            .collect();
-        for k in 1..2000 {
-            xs.push(1.0 + (k as f64 - 1000.0) * 1e-6);
-            xs.push(1.0 + (k as f64 - 1000.0) * 1e-14);
-        }
-        xs.push(f64::MIN_POSITIVE);
-        xs.push(1.0);
-        xs.push(2.0);
-        xs.push(std::f64::consts::SQRT_2);
-        let mut got = xs.clone();
-        ln_pos_fill(&mut got);
-        for (&x, &g) in xs.iter().zip(&got) {
-            let r = x.ln();
-            let ulp = if r == 0.0 {
-                f64::MIN_POSITIVE
-            } else {
-                (f64::from_bits(r.abs().to_bits() + 1) - r.abs()).abs()
-            };
-            assert!((g - r).abs() <= 2.0 * ulp, "ln({x}) = {g}, libm {r}");
-            assert_eq!(
-                g.to_bits(),
-                scalar_ln_pos::<{ FUSED_DEFAULT }>(x).to_bits(),
-                "x={x}"
-            );
-        }
-    }
-
-    /// `ln_pos_fill` outside its domain: no NaN or infinity comes out on any
-    /// backend. The scalar tail floors a NaN to `MIN_POSITIVE` and reads `+∞`
-    /// as `2¹⁰²⁴`; a SIMD lane gives a finite value whose bits depend on the
-    /// backend's `max` (see the function's doc), so only finiteness is pinned
-    /// there.
-    #[test]
-    fn ln_pos_fill_non_finite_input_comes_out_finite() {
-        let mut tail_only = vec![f64::NAN];
-        ln_pos_fill(&mut tail_only);
-        assert_eq!(tail_only[0].to_bits(), f64::MIN_POSITIVE.ln().to_bits());
-        let mut tail_inf = vec![f64::INFINITY];
-        ln_pos_fill(&mut tail_inf);
-        assert!((tail_inf[0] - 1024.0 * std::f64::consts::LN_2).abs() < 1e-12);
-
-        let mut head = vec![0.5; 16];
-        head[0] = f64::NAN;
-        head[1] = f64::INFINITY;
-        ln_pos_fill(&mut head);
-        assert!(head.iter().all(|v| v.is_finite()), "{head:?}");
-    }
-
-    /// The NB arm of `family_pass` reads its `ln`s through `ln_pos_fill`,
-    /// which maps a NaN to a finite value; a NaN μ must still give the NaN
-    /// deviance `family::dev_resid` gives. A NaN η reaches μ as NaN on the
-    /// scalar tail (`f64::clamp` keeps NaN), which a 1-row call and the last
-    /// row of a 17-row call are on the lane-width 2, 4 and 8 backends. Pulp's
-    /// scalar backend (lane width 1) has no tail and floors the NaN η, giving a
-    /// finite μ; the deviance must then be finite too.
-    #[test]
-    fn family_pass_nb_nan_mu_gives_nan_deviance() {
-        let fam = Family::NegativeBinomial {
-            link: crate::spec::NegBinomialLink::Log,
-        };
-        for len in [1usize, 17] {
-            let mut eta = vec![0.3; len];
-            eta[len - 1] = f64::NAN;
-            let y = vec![2.0; len];
-            let (mut prob, mut w) = (vec![0.0; len], vec![0.0; len]);
-            let (dev, _) = family_pass(
-                fam,
-                5.0,
-                &mut eta,
-                &y,
-                &[],
-                false,
-                0.0,
-                &mut prob,
-                &mut w,
-                &mut [],
-            );
-            assert_eq!(
-                dev.is_nan(),
-                prob[len - 1].is_nan(),
-                "len {len}: deviance {dev}, μ {}",
-                prob[len - 1]
-            );
-        }
-    }
-
-    /// At θ = 1e-6 and η = 700 the ratio θ/(μ+θ) is about 1e-310, subnormal,
-    /// and `ln_pos_fill` floors it to `f64::MIN_POSITIVE`; a fold that kept
-    /// that log would be 0.76% off. With y = 0 each row's deviance is
-    /// `2θ·ln((μ+θ)/θ)`. 17 rows put rows on the SIMD head and the scalar
-    /// tail on lane widths 2, 4 and 8.
-    #[test]
-    fn family_pass_nb_tiny_shape_at_eta_max_is_exact() {
-        let fam = Family::NegativeBinomial {
-            link: crate::spec::NegBinomialLink::Log,
-        };
-        let th = 1e-6;
-        let len = 17;
-        let mut eta = vec![crate::family::ETA_MAX; len];
-        let y = vec![0.0; len];
-        let (mut prob, mut w) = (vec![0.0; len], vec![0.0; len]);
-        let (dev, _) = family_pass(
-            fam,
-            th,
-            &mut eta,
-            &y,
-            &[],
-            false,
-            0.0,
-            &mut prob,
-            &mut w,
-            &mut [],
-        );
-        let want = len as f64 * 2.0 * th * ((700f64.exp() + th).ln() - th.ln());
-        assert!(
-            ((dev - want) / want).abs() <= 1e-12,
-            "deviance {dev}, want {want}"
-        );
-    }
-
-    /// A NaN η on a link that clamps η is flagged as not evaluable, wherever
-    /// it lands: row 0 of a 17-row call is a SIMD lane on every backend, row
-    /// 16 and a 1-row call are the scalar tail on lane widths 2, 4 and 8. The
-    /// SIMD clamp drops the NaN on x86 and on pulp's scalar backend, so without
-    /// the flag that row would give a finite μ and deviance at the lower clamp
-    /// bound.
-    #[test]
-    fn family_pass_flags_nan_eta_on_clamped_links() {
-        use crate::spec::{NegBinomialLink, PoissonLink};
-        let fams = [
-            Family::Binomial {
-                link: BinomialLink::Cloglog,
-            },
-            Family::Poisson {
-                link: PoissonLink::Log,
-            },
-            Family::NegativeBinomial {
-                link: NegBinomialLink::Log,
-            },
-            Family::Gamma {
-                link: GammaLink::Log,
-            },
-            Family::Gamma {
-                link: GammaLink::Inverse,
-            },
-            Family::InverseGaussian {
-                link: InverseGaussianLink::Log,
-            },
-            Family::InverseGaussian {
-                link: InverseGaussianLink::InverseSquared,
-            },
-        ];
-        let mut checked = 0;
-        for fam in fams {
-            for (len, at) in [(1usize, 0usize), (17, 0), (17, 16)] {
-                let mut eta = vec![0.3; len];
-                eta[at] = f64::NAN;
-                let y = vec![1.0; len];
-                let (mut prob, mut w) = (vec![0.0; len], vec![0.0; len]);
-                let (dev, infeasible) = family_pass(
-                    fam,
-                    5.0,
-                    &mut eta,
-                    &y,
-                    &[],
-                    false,
-                    0.0,
-                    &mut prob,
-                    &mut w,
-                    &mut [],
-                );
-                assert!(infeasible, "{fam:?} len {len}, NaN at {at}: deviance {dev}");
-                checked += 1;
-            }
-        }
-        assert_eq!(checked, 21);
-    }
-
-    /// A NaN η makes `Σ log1pexp` NaN wherever it lands: the scalar tail (a
-    /// 1-row call, the last row of a 17-row call on lane widths 2, 4 and 8)
-    /// and a SIMD lane (row 0 of the 17-row call). So the unweighted-logit
-    /// deviance `2·(Σ log1pexp − Σ y·η)` is NaN through this sum as well as
-    /// through `Σ y·η`. `+∞` gives `+∞`.
-    #[test]
-    fn pw_and_log1pexp_sum_nan_eta_gives_nan_sum() {
-        assert!(scalar_log1pexp(f64::NAN).is_nan());
-        for (len, at) in [(1usize, 0usize), (17, 0), (17, 16)] {
-            let mut eta = vec![0.3; len];
-            eta[at] = f64::NAN;
-            let (mut p, mut w) = (vec![0.0; len], vec![0.0; len]);
-            let sum = pw_and_log1pexp_sum(&eta, &mut p, &mut w);
-            assert!(sum.is_nan(), "len {len}, NaN at {at}: sum {sum}");
-        }
-
-        let eta = [f64::INFINITY];
-        let mut p = [0.0];
-        let mut w = [0.0];
-        let sum = pw_and_log1pexp_sum(&eta, &mut p, &mut w);
-        assert_eq!(p[0], 1.0);
-        assert_eq!(w[0], crate::glm::WEIGHT_CLAMP);
-        assert!(sum.is_infinite() && sum > 0.0);
-    }
-
-    /// Separated rows at `|η|` up to 3e296: `Σ log1pexp(η)` and `Σ y·η` are
-    /// both near 5e297 and agree to their last bit, so the fused
-    /// `2·(Σ log1pexp − Σ y·η)` keeps only rounding noise. The exact deviance
-    /// is `2·ln 2`, all from the `η = 0, y = 0` row, and both the SIMD route
-    /// and its generic mirror must return it.
-    #[test]
-    fn unweighted_logit_deviance_survives_cancelling_sums() {
-        let fam = Family::Binomial {
-            link: BinomialLink::Logit,
-        };
-        let n = 61;
-        let eta0: Vec<f64> = (0..n).map(|i| 1e295 * (i as f64 - 30.0)).collect();
-        let y: Vec<f64> = (0..n).map(|i| f64::from(u8::from(i > 30))).collect();
-        let yeta: f64 = eta0.iter().zip(&y).map(|(e, yi)| e * yi).sum();
-        let want = 2.0 * std::f64::consts::LN_2;
-        let (mut prob, mut w) = (vec![0.0; n], vec![0.0; n]);
-        let mut eta = eta0.clone();
-        let (simd, _) = family_pass(
-            fam,
-            f64::NAN,
-            &mut eta,
-            &y,
-            &[],
-            false,
-            yeta,
-            &mut prob,
-            &mut w,
-            &mut [],
-        );
-        let mut eta = eta0;
-        let (generic, _) = crate::scalar::generic_family_pass(
-            fam,
-            f64::NAN,
-            &mut eta,
-            &y,
-            &[],
-            false,
-            yeta,
-            &mut prob,
-            &mut w,
-            &mut [],
-        );
-        for (route, dev) in [("simd", simd), ("generic", generic)] {
-            assert!(
-                (dev - want).abs() < 1e-12,
-                "{route}: deviance {dev:e}, want {want}"
-            );
-        }
-    }
-}
-
-#[cfg(test)]
-mod ln_phi_tests {
-    use super::*;
-
-    /// `ln_phi_fill` against `family::probit_side`'s `ln Φ` (Cody `erfc`, the
-    /// asymptotic form past `x = −4√2`, `ln_1p(−Φ(−x))` on `x ≥ 0`) over the
-    /// whole served range `[−37, 37]`, both `erfc` seams (`|x|/√2` = 0.46875
-    /// and 4) and `probit_side`'s own seam at `−4√2`, as relative error; and
-    /// the SIMD head against the scalar tail (one-element calls are all tail)
-    /// to the bit.
-    #[test]
-    fn ln_phi_fill_matches_probit_side() {
-        let n = 200_001usize;
-        let mut xs: Vec<f64> = (0..n)
-            .map(|k| -LN_PHI_X_MAX + 2.0 * LN_PHI_X_MAX * k as f64 / (n - 1) as f64)
-            .collect();
-        let r2 = std::f64::consts::SQRT_2;
-        for c in [0.46875 * r2, 4.0 * r2, 0.0, 1e-300, 1e-17, 1e-8, 36.999] {
-            for d in [-1e-12, 0.0, 1e-12] {
-                xs.push(c + d);
-                xs.push(-(c + d));
-            }
-        }
-        let mut buf = xs.clone();
-        let mut nq = vec![0.0; buf.len()];
-        ln_phi_fill(&mut buf, &mut nq);
-        let mut worst = 0.0f64;
-        let mut worst_x = 0.0;
-        for (&x, &got) in xs.iter().zip(&buf) {
-            let want = crate::family::probit_side(x).0;
-            let rel = (got - want).abs() / want.abs().max(f64::MIN_POSITIVE);
-            if rel > worst {
-                worst = rel;
-                worst_x = x;
-            }
-        }
-        eprintln!("ln_phi_fill: worst relative error {worst:e} at x = {worst_x}");
-        assert!(
-            worst <= LN_PHI_REL_BOUND,
-            "ln_phi_fill off by {worst:e} at x = {worst_x}"
-        );
-        for (k, &x) in xs.iter().enumerate() {
-            let mut one = [x];
-            let mut nq1 = [0.0];
-            ln_phi_fill(&mut one, &mut nq1);
-            assert_eq!(
-                one[0].to_bits(),
-                buf[k].to_bits(),
-                "head and tail differ at x = {x}"
-            );
-        }
-    }
-}
-
-#[cfg(test)]
-mod binomial_fold_tests {
-    use crate::spec::{BinomialLink, Family};
-
-    /// The binomial deviance fold against `family::dev_resid_at` row by row
-    /// (probit, cloglog and logit; η over both tails; y = 0, 1 and a
-    /// proportion), its weighted sum against the scalar sum, and a NaN μ. The
-    /// per-row bounds are about 4x the maxima measured 2026-10-07 on x86
-    /// (absolute 1.4e-14; relative 2.1e-13 on rows with d > 1e-6): a row's
-    /// deviance runs to 0 at y = μ, where its error is the `ln`'s ULP times a
-    /// term of order |y − μ|, not of d.
-    #[test]
-    fn binomial_dev_fold_matches_dev_resid_at() {
-        let (mut worst_abs, mut worst_big) = (0.0f64, 0.0f64);
-        for link in [
-            BinomialLink::Probit,
-            BinomialLink::Cloglog,
-            BinomialLink::Logit,
-        ] {
-            let fam = Family::Binomial { link };
-            let mut eta = Vec::new();
-            let mut e = -12.0;
-            while e <= 12.0 {
-                eta.push(crate::family::clamp_eta(fam, e));
-                e += 0.000_917;
-            }
-            let prob: Vec<f64> = eta
-                .iter()
-                .map(|&e| crate::family::link_inv(fam, e))
-                .collect();
-            let n = eta.len();
-            for yv in [0.0, 1.0, 0.3, 0.999] {
-                let y = vec![yv; n];
-                let pw: Vec<f64> = (0..n).map(|i| 1.0 + (i % 7) as f64 * 0.25).collect();
-                for i in 0..n {
-                    let a = super::binomial_dev_fold(
-                        fam,
-                        &eta[i..i + 1],
-                        &y[i..i + 1],
-                        &[],
-                        &prob[i..i + 1],
-                    );
-                    let b = crate::family::dev_resid_at(fam, f64::NAN, yv, eta[i], prob[i]);
-                    if crate::family::in_tail(fam, eta[i], prob[i]) {
-                        assert_eq!(a.to_bits(), b.to_bits(), "{link:?} tail row η = {}", eta[i]);
-                    }
-                    worst_abs = worst_abs.max((a - b).abs());
-                    if b.abs() > 1e-6 {
-                        worst_big = worst_big.max((a - b).abs() / b.abs());
-                    }
-                }
-                let sum = super::binomial_dev_fold(fam, &eta, &y, &pw, &prob);
-                let want: f64 = (0..n)
-                    .map(|i| {
-                        pw[i] * crate::family::dev_resid_at(fam, f64::NAN, yv, eta[i], prob[i])
-                    })
-                    .sum();
-                assert!(
-                    (sum - want).abs() <= 1e-12 * want.abs().max(1.0),
-                    "{link:?} y={yv}: {sum} vs {want}"
-                );
-            }
-        }
-        eprintln!(
-            "binomial fold vs dev_resid_at: abs {worst_abs:.3e}, rel(d > 1e-6) {worst_big:.3e}"
-        );
-        assert!(worst_abs <= 6e-14, "fold abs {worst_abs:e}");
-        assert!(worst_big <= 1e-12, "fold rel {worst_big:e}");
-        let fam = Family::Binomial {
-            link: BinomialLink::Probit,
-        };
-        let d = super::binomial_dev_fold(fam, &[0.0, 0.1], &[1.0, 0.0], &[], &[0.5, f64::NAN]);
-        assert!(d.is_nan());
-    }
-}
+#[path = "simd_transcendental_tests.rs"]
+mod tests;

@@ -9,11 +9,14 @@ use std::f64::consts::PI;
 use faer::MatRef;
 
 use super::Objective;
+use crate::fit::vech_quad_into;
+use crate::ids::dense_ids;
 use crate::lmm::slope_value;
+use crate::predict::reported_columns;
 use crate::spec::set_term_slopes;
 use crate::{
     BinomialLink, ColumnId, Data, Design, Family, Fit, FitError, FitOptions, GammaLink, ModelSpec,
-    ReTerm, SeFor,
+    SeFor,
 };
 
 /// Marginal and conditional R² of a mixed model ([`Fit::r2`]).
@@ -98,6 +101,9 @@ impl Fit {
     /// the groupings with a random intercept that are not observation-level),
     /// with the fit's node count and no standard errors.
     ///
+    /// On Poisson and negative-binomial fits each call refits the null model,
+    /// and so does [`Fit::icc`]: asking for both costs two refits.
+    ///
     /// Zero random variance gives a conditional R² equal to the marginal one,
     /// singular or not. On a fit that did not converge, or whose null refit
     /// did not, both fields are NaN.
@@ -118,6 +124,9 @@ impl Fit {
     /// as `performance::icc` computes them, from the variances of
     /// [`Fit::r2`] (Johnson 2014 for random slopes; the lognormal
     /// approximation of the distribution-specific variance on a GLMM).
+    ///
+    /// On Poisson and negative-binomial fits each call refits the null model,
+    /// and so does [`Fit::r2`]: asking for both costs two refits.
     ///
     /// Zero random variance gives 0, singular or not. On a fit that did not
     /// converge, or whose null refit did not, both fields are NaN.
@@ -147,22 +156,6 @@ impl Fit {
             spec,
         )
     }
-}
-
-/// Each grouping's random-effect block, primary first: whether its reported
-/// block has the intercept column, and its slope indices.
-fn blocks(spec: &ModelSpec) -> Vec<(bool, &[ColumnId])> {
-    let has_intercept = |terms: &[ReTerm]| terms.is_empty() || terms.iter().any(|t| t.intercept);
-    spec.re
-        .iter()
-        .flat_map(|re| {
-            std::iter::once((has_intercept(&re.terms), re.slopes.as_slice())).chain(
-                re.extra_groupings
-                    .iter()
-                    .map(|g| (has_intercept(&g.terms), g.slopes.as_slice())),
-            )
-        })
-        .collect()
 }
 
 /// The fixed, random and residual variances of a fit made on `data` and
@@ -235,9 +228,13 @@ pub(crate) fn variance_parts(
     if !converged {
         return Ok(VarianceParts::NAN);
     }
-    let blocks = blocks(spec);
-    let width_ok = |(&(intercept, slopes), vech): (&(bool, &[ColumnId]), &Vec<f64>)| {
-        let q = usize::from(intercept) + slopes.len();
+    let ids = data
+        .design
+        .ids
+        .expect("validate requires ids on a mixed model");
+    let blocks = reported_columns(spec.re.as_ref().expect("a mixed model"), ids);
+    let width_ok = |((_, cols), vech): (&(_, Vec<_>), &Vec<f64>)| {
+        let q = cols.len();
         vech.len() == q * (q + 1) / 2
     };
     if blocks.len() != varcorr.len() || !blocks.iter().zip(varcorr).all(width_ok) {
@@ -262,45 +259,24 @@ pub(crate) fn variance_parts(
     // A grouping with one level per row is an observation-level random
     // effect: insight counts its variance as residual (dispersion) on a GLMM
     // and leaves it out on an LMM, whose σ̂² already holds that variation.
-    let ids = data
-        .design
-        .ids
-        .expect("validate requires ids on a mixed model");
     let observation_level: Vec<bool> = std::iter::once(&ids.primary)
         .chain(&ids.extra)
-        .map(|g| {
-            let mut levels = g.clone();
-            levels.sort_unstable();
-            levels.dedup();
-            levels.len() == n
-        })
+        .map(|g| dense_ids(g).1 == n)
         .collect();
 
-    // Johnson's (2014) row mean of zᵢᵀ D zᵢ, walking each vech block in its
-    // column-major order: an off-diagonal entry counts twice.
+    // Johnson's (2014) row mean of zᵢᵀ D zᵢ.
     let mut random = 0.0;
     let mut obs_variance = 0.0;
     let mut z = Vec::new();
-    for ((&(intercept, slopes), vech), &obs) in blocks.iter().zip(varcorr).zip(&observation_level) {
+    for (((_, cols), vech), &obs) in blocks.iter().zip(varcorr).zip(&observation_level) {
         let mut sum = 0.0;
         for i in 0..n {
             z.clear();
-            if intercept {
-                z.push(1.0);
-            }
-            z.extend(
-                slopes
-                    .iter()
-                    .map(|&c| slope_value(x_mat, z_mat, p, i, c as usize)),
-            );
-            let mut k = 0;
-            for c in 0..z.len() {
-                for r in c..z.len() {
-                    let times = if r == c { 1.0 } else { 2.0 };
-                    sum += times * vech[k] * z[r] * z[c];
-                    k += 1;
-                }
-            }
+            z.extend(cols.iter().map(|&c| match c {
+                None => 1.0,
+                Some(c) => slope_value(x_mat, z_mat, p, i, c),
+            }));
+            vech_quad_into(&mut sum, vech, &z);
         }
         if obs {
             obs_variance += sum / n as f64;
@@ -365,7 +341,7 @@ pub(crate) fn variance_parts(
             .iter()
             .zip(&null.varcorr)
             .zip(&observation_level)
-            .filter(|(((intercept, _), _), &obs)| *intercept && !obs)
+            .filter(|(((_, cols), _), &obs)| cols.first() == Some(&None) && !obs)
             .map(|((_, vech), _)| vech[0])
             .sum();
         Ok((null.beta[0] + 0.5 * d00).exp())

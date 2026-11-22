@@ -123,7 +123,7 @@ fn done_case_ids(path: &str) -> std::collections::HashSet<String> {
 /// which reflects the frontend's flat-nesting detection outcome) and slope
 /// widths from `lo.model.re`, crossed level counts from `lo.ids.extra[g]`
 /// (`max+1`; the lowered spec itself carries placeholder counts) — by mirroring
-/// src/fit.rs's classify_design: over-envelope, any slope-carrying extra
+/// glmm-rs/src/fit/mod.rs's classify_design: over-envelope, any slope-carrying extra
 /// grouping, or Σ crossed levels past MAX_CROSSED_LEVELS routes Sparse
 /// (mirrors classify_design — change together).
 fn config_tag(lo: &glmm::formula::Lowered, gaussian: bool, user_tag: &str) -> String {
@@ -209,7 +209,7 @@ fn fit_cell(cell: &Value, data_dir: &str, user_tag: &str, budget: f64) -> Value 
         lower_grid_cell(cell, data_dir)
     }));
     let lower_seconds = t_lower.elapsed().as_secs_f64();
-    // Diligent manifests stamp `nagq` on the 33 AGQ-eligible cells (spec Part 6);
+    // Diligent manifests stamp `nagq` on the 33 AGQ-eligible cells;
     // absent on every other cell (shipped/eval-efficiency manifests included),
     // where this is a no-op leaving `FitOptions::nagq`'s default (1 = Laplace).
     let mut fit_opts = FitOptions::default();
@@ -311,8 +311,6 @@ fn fit_cell(cell: &Value, data_dir: &str, user_tag: &str, budget: f64) -> Value 
                 rec["pirls_hist"] = json!(c.pirls_hist.to_vec());
                 rec["agq_evals"] = json!(c.agq_evals);
                 rec["agq_node_evals"] = json!(c.agq_node_evals);
-                rec["nb_nodes"] = json!(c.nb_nodes);
-                rec["nb_evals_total"] = json!(c.nb_evals_total);
                 rec["post_pin_searches"] = json!(c.post_pin_searches);
             }
             rec["converged"] = json!(f.converged());
@@ -328,7 +326,7 @@ fn fit_cell(cell: &Value, data_dir: &str, user_tag: &str, budget: f64) -> Value 
             rec["dispersion"] = num(f.dispersion());
             rec["beta"] = nums(f.beta());
             rec["se"] = nums(f.se());
-            // theta hat (diligent-run recording, spec Part 6): reduced to
+            // theta hat (diligent-run recording): reduced to
             // stddev+corr per grouping via `Fit::stddev_corr`, mirroring
             // `grid/engines/glmm.rs::varcomp`/R's `varcomp_of` schema so the three
             // runners join on the same field. Empty for fixed-only fits (no

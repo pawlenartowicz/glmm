@@ -32,7 +32,8 @@
 //!   [`BfgsConfig::pgrad_tol`];
 //! - `Fdelta`: after the second iteration, the accepted decrease is below
 //!   `max(fdelta_abs, FDELTA_ULPS·ε·|f|)` ([`BfgsConfig::fdelta_abs`]). The
-//!   absolute part is in deviance units: a relative stop (`1e-11·(1 + |f|)`)
+//!   absolute part is in the objective's units (on the GLMM route, the
+//!   deviance divided by `GlmmWorkspace::search_div`): a relative stop (`1e-11·(1 + |f|)`)
 //!   grows with n, because the deviance is O(n), and ended a 300k-row GLMM
 //!   4.7e-4 above its optimum (2026-10-07 measurements). The ulp part
 //!   keeps the stop reachable where the absolute part is below the
@@ -70,8 +71,8 @@ pub(crate) const FDELTA_ULPS: f64 = 16.0;
 /// capped steps from θ = 1).
 const ZERO_LANDING_SHORT: f64 = 1e-4;
 
-/// The certificate's bound on the BFGS decrement `½·gᵀHg` (free set, deviance
-/// units). Measured endpoint maximum on the LMM route: 1.7e-9 cold.
+/// The certificate's bound on the BFGS decrement `½·gᵀHg` (free set, the
+/// objective's units). Measured endpoint maximum on the LMM route: 1.7e-9 cold.
 pub(crate) const CERT_DECREMENT: f64 = 1e-8;
 
 /// A diagonal θ with `|θ| <` this fails the certificate: near a variance
@@ -79,6 +80,11 @@ pub(crate) const CERT_DECREMENT: f64 = 1e-8;
 /// GLMM boundary cell), so such an endpoint is polished. Shared with the GLMM
 /// route.
 pub(crate) const CERT_NEAR_ZERO: f64 = 1e-3;
+
+/// A secant pair with `cos∠(s, y)` at or below this carries no usable
+/// curvature, and the inverse-Hessian update skips it. A round-off guard, not
+/// a tuned value.
+const CURVATURE_PAIR_COS: f64 = 1e-12;
 
 /// Per-route search settings.
 #[derive(Clone, Copy, Debug)]
@@ -93,8 +99,8 @@ pub(crate) struct BfgsConfig {
     pub pgrad_tol: f64,
     /// Max-norm cap of the first step after a (re)start of `H`.
     pub first_step_cap: f64,
-    /// Absolute part of the `Fdelta` and `NoiseFloor` threshold, in deviance
-    /// units (see the module doc).
+    /// Absolute part of the `Fdelta` and `NoiseFloor` threshold, in the
+    /// objective's units (see the module doc).
     pub fdelta_abs: f64,
 }
 
@@ -111,8 +117,8 @@ impl BfgsConfig {
     };
 
     /// The GLMM Laplace route's settings, over `[θ | β̃]` and a free Gamma
-    /// `ln φ`: the measured prototype's (308 grid and 32 stress cells,
-    /// 2026-10-06/07), whose largest iteration count was about 90 (q8 cells).
+    /// `ln φ`: settings measured on 308 grid and 32 stress cells, whose
+    /// largest iteration count was about 90 (q8 cells).
     ///
     /// `max_iter` is 2000 for the long valleys of precise counts. Past about
     /// 1/√Σw a slope's θ has negative curvature, so a step there makes no
@@ -176,7 +182,7 @@ pub(crate) struct BfgsOutcome {
     pub iters: usize,
     /// Why it stopped.
     pub stop: BfgsStop,
-    /// `½·gᵀHg` over the free set at the incumbent (deviance units), the
+    /// `½·gᵀHg` over the free set at the incumbent (the objective's units), the
     /// quasi-Newton estimate of the decrease left.
     pub decrement: f64,
 }
@@ -357,7 +363,7 @@ impl BfgsState {
         for i in 0..n {
             for j in 0..n {
                 self.h[i * n + j] += -rho * (self.hy[i] * self.s[j] + self.s[i] * self.hy[j])
-                    + ss * self.s[i] * self.s[j];
+                    + ss * (self.s[i] * self.s[j]);
             }
         }
     }
@@ -568,7 +574,7 @@ fn bfgs_run(
         let sy: f64 = st.s.iter().zip(&st.y).map(|(s, y)| s * y).sum();
         let sn = st.s.iter().map(|v| v * v).sum::<f64>().sqrt();
         let yy: f64 = st.y.iter().map(|v| v * v).sum();
-        if sy > 1e-12 * sn * yy.sqrt() {
+        if sy > CURVATURE_PAIR_COS * sn * yy.sqrt() {
             let mut update = true;
             if first {
                 // Shanno's scale reads the unseeded coordinates only. Read

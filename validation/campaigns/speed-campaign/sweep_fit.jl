@@ -1,6 +1,6 @@
 #!/usr/bin/env julia
-# MixedModels side of the mismatch-adjudication multi-start sweep (oracle spec
-# 2026-07-11, Step B). Reads $SWEEP_STARTS (JSON: case_id -> label -> θ₀ in
+# MixedModels side of the mismatch-adjudication multi-start sweep.
+# Reads $SWEEP_STARTS (JSON: case_id -> label -> θ₀ in
 # glmm's declaration-order vech layout), maps each start to MM's reterm order
 # by grouping name, fits under a tightened schedule (maxfeval 100k, ftol/xtol
 # tightened — NLopt has no rho_end; endpoints are re-scored on glmm's

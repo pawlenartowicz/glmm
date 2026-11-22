@@ -88,7 +88,7 @@ is_glm <- function(cell) identical(cell[["structure"]], "glm")
 # cell's `reml` flag (true whenever its family is gaussian, per gen_manifest.R)
 # is ignored here rather than passed through.
 #
-# Wrapped in with_warnings (below): glmmTMB can warn DURING THE FIT ITSELF --
+# Wrapped in with_warnings (common.R): glmmTMB can warn DURING THE FIT ITSELF --
 # "non-positive-definite Hessian matrix", "extreme or very small eigenvalues
 # detected", "failed to invert Hessian from numDeriv::jacobian(), falling back
 # to internal vcov estimate" -- without touching `m$fit$convergence`, so the
@@ -130,20 +130,6 @@ make_fit <- function(cell, df) {
     warning("default start failed (", msg, "); refitted from the fixed-effects GLM beta")
     fit_from(list(beta = unname(b0)))
   }))
-}
-
-# Runs `expr` and returns its value together with every warning it raised,
-# instead of letting the warnings go to the console where nothing records
-# them. glmmTMB's fit and vcov calls both signal a warning and still RETURN A
-# VALUE when something about the fit is unreliable, so the warning is the only
-# evidence the number is not what it claims to be.
-with_warnings <- function(expr) {
-  w <- character(0)
-  v <- withCallingHandlers(expr, warning = function(cond) {
-    w <<- c(w, conditionMessage(cond))
-    invokeRestart("muffleWarning")
-  })
-  list(value = v, warnings = w)
 }
 
 # `se`, the single Rx-and-Hessian-indistinguishable SE from `vcov(m)$cond`:

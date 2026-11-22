@@ -68,7 +68,7 @@
 use super::agq::{compress_ok, ClusterRowIndex};
 use crate::family::{ETA_MAX, LOG_TAIL_ETA};
 use crate::simd_transcendental::{ln_phi_fill, LN_PHI_X_MAX};
-use crate::spec::{BinomialLink, Family, GammaLink};
+use crate::spec::{BinomialLink, Family, GammaLink, NegBinomialLink, PoissonLink};
 use std::f64::consts::SQRT_2;
 
 /// Largest node shift `|δ|` a fast row takes: `expm1(±δ)` stays far from
@@ -88,14 +88,18 @@ pub(crate) enum Kind {
 /// keep the generic node loop.
 pub(crate) fn kind(family: Family) -> Option<Kind> {
     match family {
-        Family::Poisson { .. }
+        Family::Poisson {
+            link: PoissonLink::Log,
+        }
         | Family::Gamma {
             link: GammaLink::Log,
         } => Some(Kind::Lin),
         Family::Binomial {
             link: BinomialLink::Logit,
         }
-        | Family::NegativeBinomial { .. } => Some(Kind::Log1p),
+        | Family::NegativeBinomial {
+            link: NegBinomialLink::Log,
+        } => Some(Kind::Log1p),
         _ => None,
     }
 }
@@ -111,12 +115,17 @@ fn eta_limit(family: Family) -> f64 {
     }
 }
 
-/// Whether a row with center `eta0` and node-shift bound `b` is a fast row.
-/// The `1e-12` widening covers the rounding between the bound and the node
-/// predictors the loop forms. False on a NaN.
+/// Relative widening of a row's node reach `|η0| + b` before it is compared
+/// with a limit: it covers the rounding between the bound and the node
+/// predictors the loop forms. A round-off guard, not a tuned value. Read by
+/// [`is_fast`] and [`probit_is_fast`].
+const NODE_REACH_SLACK: f64 = 1e-12;
+
+/// Whether a row with center `eta0` and node-shift bound `b` is a fast row,
+/// its reach widened by [`NODE_REACH_SLACK`]. False on a NaN.
 #[inline]
 fn is_fast(family: Family, eta0: f64, b: f64) -> bool {
-    let reach = (eta0.abs() + b) * (1.0 + 1e-12);
+    let reach = (eta0.abs() + b) * (1.0 + NODE_REACH_SLACK);
     reach < eta_limit(family) && b <= DELTA_MAX
 }
 
@@ -137,7 +146,7 @@ const TERM_MAG_MAX: f64 = 1_048_576.0;
 /// [`TERM_MAG_MAX`]. `None` on a NaN.
 #[inline]
 #[allow(clippy::too_many_arguments)]
-fn fast_consts(
+pub(super) fn fast_consts(
     family: Family,
     nb_theta: f64,
     y: f64,
@@ -158,7 +167,7 @@ fn fast_consts(
 /// `expm1(b)` for `Lin`, `b` for `Log1p` (`p ≤ ½`). Computed once per bound
 /// (per cluster on the scalar route), not per row.
 #[inline]
-fn mag_factor(kind: Kind, b: f64) -> f64 {
+pub(super) fn mag_factor(kind: Kind, b: f64) -> f64 {
     if kind == Kind::Lin {
         b.exp_m1()
     } else {
@@ -236,17 +245,28 @@ fn split_rows(buf: &mut Vec<f64>, m: usize, extra: usize) -> [&mut [f64]; 5] {
     [a, p, sg, h, rest]
 }
 
-/// One node of a compressed cluster: `ℓ_c(u_cj) − ℓ_c(ũ_c)` from the cluster's
-/// sums `sa = Σa_i`, `sh = Σh_i` of its `Lin` row constants, `sg` the family's
-/// `s` (module docs). The prior part is `−h·(ũ_c + ½h)` with `h = √2·σ_c·z_j`,
-/// as the row-term arms form it. Shared by both arms of [`scalar_sums`], so a
-/// compressed cluster's sum is the same bits on either.
+/// One node of a compressed cluster: its exponent `x_cj = z_j² + ℓ_c(u_cj) −
+/// ℓ_c(ũ_c)` from the cluster's sums `sa = Σa_i`, `sh = Σh_i` of its `Lin` row
+/// constants, `sg` the family's `s` (module docs). The prior part is
+/// `−h·(ũ_c − ½·(A_c − 1)·h)` with `h = √2·σ_c·z_j` and `excess = A_c − 1`
+/// (`agq::agq_deviance`'s doc), as the row-term arms form it. Shared by both
+/// arms of [`scalar_sums`], so a compressed cluster's sum is the same bits on
+/// either.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn compressed_node(sa: f64, sh: f64, sg: f64, u_c: f64, a_block: f64, lambda: f64, zj: f64) -> f64 {
+fn compressed_node(
+    sa: f64,
+    sh: f64,
+    sg: f64,
+    u_c: f64,
+    a_block: f64,
+    excess: f64,
+    lambda: f64,
+    zj: f64,
+) -> f64 {
     let hc = SQRT_2 * (1.0 / a_block) * zj;
     let d = lambda * hc;
-    -(hc * (u_c + 0.5 * hc)) - (sa * (sg * d).exp_m1() + sh * d)
+    -(hc * (u_c - 0.5 * excess * hc)) - (sa * (sg * d).exp_m1() + sh * d)
 }
 
 /// Elements of one SIMD tile: bounded stack scratch, never an `n × k^q`
@@ -283,12 +303,14 @@ fn log1p_tile(r: &mut [f64], l: &mut [f64]) {
     }
 }
 
-/// Scalar-intercept node sums: fills `sum[c] = Σ_j exp(ln w_j + z_j² +
-/// ℓ_c(u_cj) − ℓ_c(ũ_c))`, the quantity both arms of `agq_deviance`'s node
-/// loop leave in `sum`. `eta`/`prob` are the PIRLS mode the center term was
-/// read at; `dl` and `acc` are `s`-long scratch. With a cluster index the
-/// sums run cluster-outer (rayon under `parallel`), without one node-outer,
-/// bit-identical to each other as the generic arms are.
+/// Scalar-intercept node sums: fills `sum[c] = Σ_j w_j·expm1(x_cj)`,
+/// `x_cj = z_j² + ℓ_c(u_cj) − ℓ_c(ũ_c)`, the quantity both arms of
+/// `agq_deviance`'s node loop leave in `sum` (its doc gives the form of
+/// `x_cj`). `eta`/`prob` are the PIRLS mode the center term was read at,
+/// `a_excess` each cluster's `A_c − 1`; `dl` and `acc` are `s`-long scratch.
+/// With a cluster index the sums run cluster-outer (rayon under `parallel`),
+/// without one node-outer, bit-identical to each other as the generic arms
+/// are.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn scalar_sums(
     kind: Kind,
@@ -303,6 +325,7 @@ pub(crate) fn scalar_sums(
     eta_fixed: &[f64],
     u: &[f64],
     a_blocks: &[f64],
+    a_excess: &[f64],
     lambda: f64,
     nodes: &[f64],
     wts: &[f64],
@@ -315,11 +338,6 @@ pub(crate) fn scalar_sums(
 ) {
     let s = sum.len();
     let k = nodes.len();
-    let mut tbl = [0.0f64; 2 * crate::consts::MAX_NAGQ as usize];
-    for (j, (&zj, &wj)) in nodes.iter().zip(wts).enumerate() {
-        tbl[2 * j] = zj;
-        tbl[2 * j + 1] = wj.ln() + zj * zj;
-    }
     let zmax = max_abs_node(nodes);
     // Per-cluster bound on |δ| = |λ|·√2·σ_c·|z_j| over the nodes.
     // `acc[c]` holds the bound's magnitude factor for the row pass
@@ -367,6 +385,8 @@ pub(crate) fn scalar_sums(
     }
     // Compressed clusters (module docs): `cflag[c] = 1`. Their rows' constants
     // are zeroed for the node-outer arm, whose tiles then add exact zeros.
+    // Mirrors the dual route's gate in `agq::agq_deviance`
+    // (`agq::compression_gather`) — change together.
     let mut any_rows = !lin;
     if lin {
         for c in 0..s {
@@ -415,10 +435,11 @@ pub(crate) fn scalar_sums(
                         sg_lin,
                         u[c],
                         a_blocks[c],
+                        a_excess[c],
                         lambda,
                         nodes[j],
                     );
-                    acc_sum += (tbl[2 * j + 1] + a_c).exp();
+                    acc_sum += wts[j] * a_c.exp_m1();
                 }
                 *sum_c = acc_sum;
                 return;
@@ -438,7 +459,7 @@ pub(crate) fn scalar_sums(
                 for gi in 0..ng {
                     let hc = SQRT_2 * (1.0 / a_blocks[c]) * nodes[j0 + gi];
                     d_g[gi] = lambda * hc;
-                    acc_g[gi] = -(hc * (u[c] + 0.5 * hc));
+                    acc_g[gi] = -(hc * (u[c] - 0.5 * a_excess[c] * hc));
                 }
                 let chunk = TILE / ng;
                 let mut p0 = 0;
@@ -480,7 +501,7 @@ pub(crate) fn scalar_sums(
                             }
                         }
                     }
-                    acc_sum += (tbl[2 * (j0 + gi) + 1] + acc_c).exp();
+                    acc_sum += wts[j0 + gi] * acc_c.exp_m1();
                 }
                 j0 = j1;
             }
@@ -507,9 +528,18 @@ pub(crate) fn scalar_sums(
             let hc = SQRT_2 * (1.0 / a_blocks[c]) * zj;
             dl[c] = lambda * hc;
             acc[c] = if lin && cflag[c] != 0.0 {
-                compressed_node(csa[c], csh[c], sg_lin, u[c], a_blocks[c], lambda, zj)
+                compressed_node(
+                    csa[c],
+                    csh[c],
+                    sg_lin,
+                    u[c],
+                    a_blocks[c],
+                    a_excess[c],
+                    lambda,
+                    zj,
+                )
             } else {
-                -(hc * (u[c] + 0.5 * hc))
+                -(hc * (u[c] - 0.5 * a_excess[c] * hc))
             };
         }
         let mut i0 = if any_rows { 0 } else { n };
@@ -540,9 +570,9 @@ pub(crate) fn scalar_sums(
             let c = cluster_ids[i] as usize;
             acc[c] -= slow_add(i, c, zj);
         }
-        let ln_wj = tbl[2 * j + 1];
+        let wj = wts[j];
         for c in 0..s {
-            sum[c] += (ln_wj + acc[c]).exp();
+            sum[c] += wj * acc[c].exp_m1();
         }
     }
 }
@@ -560,11 +590,11 @@ pub(crate) fn is_probit(family: Family) -> bool {
 
 /// Whether a probit row with center `eta0` and node-shift bound `b` is a fast
 /// row: its node predictors stay inside [`LN_PHI_X_MAX`], the range
-/// `ln_phi_fill` is certified on. The `1e-12` widening covers the rounding
-/// between the bound and the node predictors the loop forms. False on a NaN.
+/// `ln_phi_fill` is certified on, its reach widened by [`NODE_REACH_SLACK`].
+/// False on a NaN.
 #[inline]
 fn probit_is_fast(eta0: f64, b: f64) -> bool {
-    (eta0.abs() + b) * (1.0 + 1e-12) < LN_PHI_X_MAX
+    (eta0.abs() + b) * (1.0 + NODE_REACH_SLACK) < LN_PHI_X_MAX
 }
 
 /// Split the probit row buffer: `x0 | sg | ta | tb | c1 | c2` (`n` each).
@@ -582,7 +612,7 @@ fn split_probit_rows(buf: &mut Vec<f64>, n: usize) -> [&mut [f64]; 6] {
 }
 
 /// [`scalar_sums`] for binomial probit (module docs, "Probit"): fills the same
-/// `sum[c] = Σ_j exp(ln w_j + z_j² + ℓ_c(u_cj) − ℓ_c(ũ_c))`. Each fast row
+/// `sum[c] = Σ_j w_j·expm1(x_cj)`. Each fast row
 /// adds its loglik change from the center,
 ///
 /// ```text
@@ -612,6 +642,7 @@ pub(crate) fn probit_sums(
     eta_fixed: &[f64],
     u: &[f64],
     a_blocks: &[f64],
+    a_excess: &[f64],
     lambda: f64,
     nodes: &[f64],
     wts: &[f64],
@@ -627,11 +658,6 @@ pub(crate) fn probit_sums(
     };
     let s = sum.len();
     let k = nodes.len();
-    let mut tbl = [0.0f64; 2 * crate::consts::MAX_NAGQ as usize];
-    for (j, (&zj, &wj)) in nodes.iter().zip(wts).enumerate() {
-        tbl[2 * j] = zj;
-        tbl[2 * j + 1] = wj.ln() + zj * zj;
-    }
     let zmax = max_abs_node(nodes);
     for c in 0..s {
         dl[c] = lambda.abs() * SQRT_2 * (1.0 / a_blocks[c]) * zmax;
@@ -714,7 +740,7 @@ pub(crate) fn probit_sums(
                 for gi in 0..ng {
                     let hc = SQRT_2 * (1.0 / a_blocks[c]) * nodes[j0 + gi];
                     d_g[gi] = lambda * hc;
-                    acc_g[gi] = -(hc * (u[c] + 0.5 * hc));
+                    acc_g[gi] = -(hc * (u[c] - 0.5 * a_excess[c] * hc));
                 }
                 let chunk = TILE / ng;
                 let mut p0 = 0;
@@ -756,7 +782,7 @@ pub(crate) fn probit_sums(
                             }
                         }
                     }
-                    acc_sum += (tbl[2 * (j0 + gi) + 1] + acc_c).exp();
+                    acc_sum += wts[j0 + gi] * acc_c.exp_m1();
                 }
                 j0 = j1;
             }
@@ -784,7 +810,7 @@ pub(crate) fn probit_sums(
         for c in 0..s {
             let hc = SQRT_2 * (1.0 / a_blocks[c]) * zj;
             dl[c] = lambda * hc;
-            acc[c] = -(hc * (u[c] + 0.5 * hc));
+            acc[c] = -(hc * (u[c] - 0.5 * a_excess[c] * hc));
         }
         let mut i0 = 0;
         while i0 < n {
@@ -812,17 +838,19 @@ pub(crate) fn probit_sums(
             let c = cluster_ids[i] as usize;
             acc[c] -= slow_add(i, c, zj);
         }
-        let ln_wj = tbl[2 * j + 1];
+        let wj = wts[j];
         for c in 0..s {
-            sum[c] += (ln_wj + acc[c]).exp();
+            sum[c] += wj * acc[c].exp_m1();
         }
     }
 }
 
-/// Vector-RE node sums (`q ∈ 2..=3`): fills `sum[c]` as `agq_deviance_vec`'s
-/// per-cluster closure does. `node_tbl` is its `k^q·(q+1)` product-grid
-/// table (z-vector, then the summed Liu–Pierce reweight). Row constants are
-/// laid out in the CSR order of `idx`, so a cluster's rows are contiguous;
+/// Vector-RE node sums (`q ∈ 2..=3`): fills `sum[c] = Σ_j W_j·expm1(x_cj)` as
+/// `agq_deviance_vec`'s per-cluster closure does. `node_tbl` is its
+/// `k^q·(q+1)` product-grid table (z-vector, then the product weight `W_j`);
+/// `a_excess` holds each cluster's `A_c − I` as `a_blocks` holds `L_c`. Row
+/// constants are laid out in the CSR order of `idx`, so a cluster's rows are
+/// contiguous;
 /// its node shifts are evaluated a tile at a time (several nodes per tile on
 /// a small cluster). With `parallel` set the clusters split over rayon under
 /// the `parallel` feature; otherwise, and in any other build, they run serially.
@@ -842,6 +870,7 @@ pub(crate) fn vector_sums(
     eta_fixed: &[f64],
     u: &[f64],
     a_blocks: &[f64],
+    a_excess: &[f64],
     lam: &[f64],
     nodes: &[f64],
     node_tbl: &[f64],
@@ -904,6 +933,7 @@ pub(crate) fn vector_sums(
         let range = idx.cluster_range(c);
         let (r0, m) = (range.start, range.len());
         let lblk = &a_blocks[c * q * q..(c + 1) * q * q];
+        let bblk = &a_excess[c * q * q..(c + 1) * q * q];
         let ubase = c * q;
         // δ at CSR position `pos` for node shift `dv` (= Λ_p·h).
         let delta = |pos: usize, dv: &[f64; 3]| {
@@ -937,13 +967,10 @@ pub(crate) fn vector_sums(
                     }
                     hh[r] = v / lblk[r * q + r];
                 }
-                let mut acc_c = 0.0;
-                for r in 0..q {
-                    hh[r] *= SQRT_2;
-                    // −½(‖ũ+h‖² − ‖ũ‖²) = −h·(ũ + ½h)
-                    acc_c -= hh[r] * (u[ubase + r] + 0.5 * hh[r]);
+                for hr in &mut hh[..q] {
+                    *hr *= SQRT_2;
                 }
-                acc_g[gi] = acc_c;
+                acc_g[gi] = super::agq::vec_prior(hh, &u[ubase..ubase + q], bblk, q);
                 for r in 0..q {
                     let mut vv = 0.0;
                     for cc in 0..=r {
@@ -1013,7 +1040,7 @@ pub(crate) fn vector_sums(
                             slow_term(family, nb_theta, y[i], prior_w[i], eta_i, eta[i], prob[i]);
                     }
                 }
-                acc_sum += (node_tbl[(t0 + gi) * (q + 1) + q] + acc_c).exp();
+                acc_sum += node_tbl[(t0 + gi) * (q + 1) + q] * acc_c.exp_m1();
             }
             t0 = t1;
         }
@@ -1036,304 +1063,5 @@ pub(crate) fn vector_sums(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::family::{dev_resid_eta, link_inv};
-    use crate::spec::{NegBinomialLink, PoissonLink};
-
-    /// The module docs' row term `a·expm1(s·δ) + h·δ` (`LOG1P`: `a·ln(1 + p·expm1(s·δ)) + h·δ`),
-    /// the reference `row_consts` is checked against. The shipped tiles inline their
-    /// own per-tile form; their values are checked against the generic node loop by
-    /// `glmm::tests::agq_fast_route_value_matches_the_generic_dual_route`.
-    fn term<const LOG1P: bool>(a: f64, p: f64, s: f64, h: f64, d: f64) -> f64 {
-        let e = (s * d).exp_m1();
-        if LOG1P {
-            a * (p * e).ln_1p() + h * d
-        } else {
-            a * e + h * d
-        }
-    }
-
-    /// The row term against the generic `½w·(dev_resid_eta(η₀+δ) − dev_resid_eta(η₀))`
-    /// over a grid of y, η₀ and δ: zero counts, binomial proportions, the logit
-    /// tail (`in_tail` past μ = 1 − 1e-4), and log-link rows up to the fast
-    /// guard's edge (Poisson's clamp, the NB/Gamma-log tail switch). Within
-    /// 1e-12 of the larger deviance, floored at 1. This checks `row_consts`
-    /// (production) and the identity; the tiles themselves are checked at the
-    /// value level by `glmm::tests::agq_fast_route_value_matches_the_generic_dual_route`.
-    #[test]
-    fn row_term_matches_dev_resid_eta() {
-        let w = 1.7;
-        let deltas: [f64; 11] = [
-            -6.0, -2.5, -1.0, -1e-3, -1e-9, 0.0, 1e-7, 0.01, 0.7, 3.0, 6.0,
-        ];
-        let cases: Vec<(Family, f64, Vec<f64>, Vec<f64>)> = vec![
-            (
-                Family::Poisson {
-                    link: PoissonLink::Log,
-                },
-                0.0,
-                vec![0.0, 1.0, 2.0, 7.0, 40.0, 1e4],
-                vec![-30.0, -5.0, -0.5, 0.0, 0.3, 2.0, 9.0, 690.0],
-            ),
-            (
-                Family::Gamma {
-                    link: GammaLink::Log,
-                },
-                0.0,
-                vec![1e-3, 0.4, 1.0, 3.0, 250.0],
-                vec![-220.0, -20.0, -1.0, 0.0, 0.8, 5.0, 220.0],
-            ),
-            (
-                Family::Binomial {
-                    link: BinomialLink::Logit,
-                },
-                0.0,
-                vec![0.0, 0.2, 0.5, 1.0],
-                vec![-40.0, -9.5, -2.0, -0.1, 0.0, 0.1, 2.0, 9.5, 40.0],
-            ),
-            (
-                Family::NegativeBinomial {
-                    link: NegBinomialLink::Log,
-                },
-                0.7,
-                vec![0.0, 1.0, 3.0, 50.0, 1e4],
-                vec![-30.0, -3.0, -0.2, 0.0, 0.5, 4.0, 12.0, 220.0],
-            ),
-            (
-                Family::NegativeBinomial {
-                    link: NegBinomialLink::Log,
-                },
-                25.0,
-                vec![0.0, 2.0, 30.0],
-                vec![-5.0, 0.0, 3.2, 3.3, 8.0],
-            ),
-        ];
-        let mut worst = 0.0f64;
-        for (family, theta, ys, etas) in cases {
-            let k = kind(family).unwrap();
-            for &y in &ys {
-                for &e0 in &etas {
-                    let mu0 = link_inv(family, e0);
-                    let [a, p, s, h] = row_consts(family, theta, y, w, e0, mu0);
-                    for &d in &deltas {
-                        if !is_fast(family, e0, d.abs()) {
-                            continue;
-                        }
-                        let fast = match k {
-                            Kind::Lin => term::<false>(a, p, s, h, d),
-                            Kind::Log1p => term::<true>(a, p, s, h, d),
-                        };
-                        let d1 = dev_resid_eta(family, theta, y, e0 + d);
-                        let d0 = dev_resid_eta(family, theta, y, e0);
-                        let slow = 0.5 * w * (d1 - d0);
-                        let scale = (0.5 * w * d1.abs().max(d0.abs())).max(1.0);
-                        let err = (fast - slow).abs() / scale;
-                        worst = worst.max(err);
-                        assert!(
-                            err <= 1e-12,
-                            "{family:?} θ={theta} y={y} η₀={e0} δ={d}: fast {fast} generic {slow} (rel {err:e})"
-                        );
-                    }
-                }
-            }
-        }
-        eprintln!("row_term_matches_dev_resid_eta: worst scaled error {worst:e}");
-    }
-
-    /// The guard sends a row whose node range reaches the clamp or the
-    /// log-link tail to the generic path, and keeps logit rows whatever η₀.
-    #[test]
-    fn guard_stops_short_of_clamp_and_tail() {
-        let pois = Family::Poisson {
-            link: PoissonLink::Log,
-        };
-        let gam = Family::Gamma {
-            link: GammaLink::Log,
-        };
-        let logit = Family::Binomial {
-            link: BinomialLink::Logit,
-        };
-        assert!(is_fast(pois, 690.0, 9.0));
-        assert!(!is_fast(pois, 690.0, 10.0));
-        assert!(!is_fast(pois, -695.0, 5.0));
-        assert!(is_fast(gam, 220.0, 9.0));
-        assert!(!is_fast(gam, -225.0, 5.0));
-        assert!(is_fast(logit, 500.0, 50.0));
-        assert!(!is_fast(logit, 0.0, 700.0));
-        assert!(!is_fast(pois, f64::NAN, 1.0));
-    }
-
-    /// The magnitude guard: a Poisson row at η₀ = 205 (a count near e^205,
-    /// whose parts `μ₀·expm1(δ)` and `y·δ` cancel to O(1) from O(√μ₀)) is a
-    /// slow row; the same row at η₀ = 2 stays fast; a NaN center is slow.
-    #[test]
-    fn magnitude_guard_sends_huge_counts_to_the_generic_path() {
-        let pois = Family::Poisson {
-            link: PoissonLink::Log,
-        };
-        let big = 205f64.exp();
-        let b = 3.0 / big.sqrt();
-        assert!(
-            fast_consts(pois, 0.0, big, 1.0, 205.0, big, b, mag_factor(Kind::Lin, b)).is_none()
-        );
-        let small = 2f64.exp();
-        assert!(fast_consts(pois, 0.0, 7.0, 1.0, 2.0, small, 1.0, 1f64.exp_m1()).is_some());
-        assert!(fast_consts(pois, 0.0, 7.0, 1.0, f64::NAN, small, 1.0, 1f64.exp_m1()).is_none());
-    }
-
-    /// `probit_sums` against the generic node loop (`dev_resid_eta` per row
-    /// and node, minus the center `dev_resid_at`) on clusters of 1, 2, 3 and 5
-    /// rows, Bernoulli and aggregated binomial (weights up to 1e4), at
-    /// θ = 0, near 0 and large, with slow rows past `LN_PHI_X_MAX` in the mix;
-    /// and the cluster-outer arm against the node-outer arm, to the bit.
-    #[test]
-    fn probit_sums_match_the_generic_node_loop() {
-        let family = Family::Binomial {
-            link: BinomialLink::Probit,
-        };
-        let sizes = [2usize, 3, 5, 1, 2, 3, 5, 5, 3, 2, 140];
-        let s = sizes.len();
-        let mut cluster_ids = Vec::new();
-        for (c, &m) in sizes.iter().enumerate() {
-            cluster_ids.extend(std::iter::repeat_n(c as u32, m));
-        }
-        let n = cluster_ids.len();
-        // A deterministic spread of values (no RNG dependency in the crate).
-        let frac = |i: usize, a: f64| ((i as f64 * a).sin() * 43758.5453).fract().abs();
-        let k = 7usize;
-        let blk = crate::consts::GH_OFFSETS[(k - 1) / 2];
-        let nodes = &crate::consts::GH_NODES[blk..blk + k];
-        let wts = &crate::consts::GH_WEIGHTS[blk..blk + k];
-        let idx = ClusterRowIndex::build(&cluster_ids, s);
-        let mut worst = 0.0f64;
-        for aggregated in [false, true] {
-            for &lambda in &[0.0, 1e-6, 0.8, 2.5] {
-                let mut y = vec![0.0; n];
-                let mut w = vec![1.0; n];
-                let mut ef = vec![0.0; n];
-                for (i, e) in ef.iter_mut().enumerate() {
-                    *e = -3.0 + 6.0 * frac(i, 12.9898);
-                }
-                // Slow rows: centers whose node range passes 37, on both sides.
-                ef[3] = 36.9;
-                ef[7] = -36.95;
-                ef[n - 1] = 40.0;
-                for i in 0..n {
-                    if aggregated {
-                        // Proportions near each row's own fitted value, as at
-                        // a mode, so the node sums stay finite at 1e4 trials.
-                        let trials: f64 = [1.0, 3.0, 20.0, 1e4][i % 4];
-                        w[i] = trials;
-                        let c = cluster_ids[i] as usize;
-                        let e0 = ef[i] + lambda * (-1.5 + 3.0 * frac(c + 7, 3.17));
-                        let p0 = link_inv(family, e0);
-                        let jitter = 0.3 * (frac(i, 78.233) - 0.5);
-                        y[i] = ((p0 + jitter * (p0 * (1.0 - p0) / trials).sqrt()).clamp(0.0, 1.0)
-                            * trials)
-                            .round()
-                            / trials;
-                    } else {
-                        y[i] = if frac(i, 78.233) < 0.4 { 1.0 } else { 0.0 };
-                    }
-                }
-                let u: Vec<f64> = (0..s).map(|c| -1.5 + 3.0 * frac(c + 7, 3.17)).collect();
-                let a_blocks: Vec<f64> = (0..s).map(|c| 0.6 + 2.0 * frac(c + 11, 5.3)).collect();
-                let eta: Vec<f64> = (0..n)
-                    .map(|i| ef[i] + lambda * u[cluster_ids[i] as usize])
-                    .collect();
-                let prob: Vec<f64> = eta.iter().map(|&e| link_inv(family, e)).collect();
-                // Generic reference, as agq_deviance's node loop computes it.
-                let mut want = vec![0.0; s];
-                let mut mag = vec![0.0f64; s];
-                for c in 0..s {
-                    let mut ctr = -0.5 * u[c] * u[c];
-                    for i in 0..n {
-                        if cluster_ids[i] as usize == c {
-                            ctr -= 0.5
-                                * w[i]
-                                * crate::family::dev_resid_at(family, 0.0, y[i], eta[i], prob[i]);
-                        }
-                    }
-                    for (&zj, &wj) in nodes.iter().zip(wts) {
-                        let u_cj = u[c] + SQRT_2 * (1.0 / a_blocks[c]) * zj;
-                        let mut a = -0.5 * u_cj * u_cj;
-                        for i in 0..n {
-                            if cluster_ids[i] as usize == c {
-                                a -= 0.5
-                                    * w[i]
-                                    * dev_resid_eta(family, 0.0, y[i], ef[i] + lambda * u_cj);
-                            }
-                        }
-                        mag[c] = mag[c].max(a.abs() + ctr.abs());
-                        want[c] += (wj.ln() + zj * zj + a - ctr).exp();
-                    }
-                }
-                let run = |rows: Option<&ClusterRowIndex>| {
-                    let (mut rb, mut sl) = (Vec::new(), Vec::new());
-                    let (mut dl, mut acc, mut sum) = (vec![0.0; s], vec![0.0; s], vec![0.0; s]);
-                    probit_sums(
-                        &y,
-                        &w,
-                        &cluster_ids,
-                        n,
-                        &eta,
-                        &prob,
-                        &ef,
-                        &u,
-                        &a_blocks,
-                        lambda,
-                        nodes,
-                        wts,
-                        &mut rb,
-                        &mut sl,
-                        &mut dl,
-                        &mut acc,
-                        &mut sum,
-                        rows,
-                    );
-                    (sum, sl)
-                };
-                let (got_c, slow) = run(Some(&idx));
-                let (got_n, _) = run(None);
-                assert!(slow.contains(&(n as u32 - 1)));
-                if lambda >= 0.8 {
-                    assert!(slow.contains(&3) && slow.contains(&7));
-                }
-                for c in 0..s {
-                    assert_eq!(
-                        got_c[c].to_bits(),
-                        got_n[c].to_bits(),
-                        "arms differ: cluster {c}, λ={lambda}, aggregated={aggregated}"
-                    );
-                    // The generic reference subtracts the center from the
-                    // node loglik, so it carries eps times their magnitude.
-                    assert!(want[c].is_finite(), "reference overflowed: cluster {c}");
-                    let rel = (got_c[c] - want[c]).abs() / want[c].abs() / (1.0 + mag[c]);
-                    worst = worst.max(rel);
-                    assert!(
-                        rel <= 1e-13,
-                        "cluster {c} (size {}), λ={lambda}, aggregated={aggregated}: fast {} generic {} (rel {rel:e})",
-                        sizes[c],
-                        got_c[c],
-                        want[c]
-                    );
-                }
-            }
-        }
-        eprintln!(
-            "probit_sums_match_the_generic_node_loop: worst error per unit magnitude {worst:e}"
-        );
-    }
-
-    /// The probit guard: a center at 36 with a node reach of 0.9 is fast,
-    /// with 1.1 it is slow, both sides; a NaN center is slow.
-    #[test]
-    fn probit_guard_stops_inside_the_certified_range() {
-        assert!(probit_is_fast(36.0, 0.9));
-        assert!(!probit_is_fast(36.0, 1.1));
-        assert!(probit_is_fast(-36.0, 0.9));
-        assert!(!probit_is_fast(-36.0, 1.1));
-        assert!(!probit_is_fast(f64::NAN, 0.1));
-    }
-}
+#[path = "agq_fast_tests.rs"]
+mod tests;

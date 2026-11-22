@@ -260,6 +260,96 @@ impl QrKernel {
         }
         (0..w).map(|j| self.s[row_start(j, d)].ln()).sum()
     }
+
+    /// Level `f`'s `S_ff = Z_fᵀV_f⁻¹Z_f` (`w × w`) into `s` and `T_f =
+    /// Z_fᵀV_f⁻¹[X̃ r]` (`w × m`) into `t`, row-major, at `Λ_f` as
+    /// [`Self::reduce_level`] reads it, for the exact Satterthwaite pass; `r =
+    /// y − X̃β̃` with `ev = [−β̃; 1]`. With `R = R_ZZ,f` and `R_y = R_Z·,f`
+    /// (`Z_fᵀŴZ_f = RᵀR`, `Z_fᵀŴ[X̃ y] = RᵀR_y`, every other row of the level
+    /// orthogonal to `Z_f`) and `R̃` the triangle with `R̃ᵀR̃ = I + RΛ_fΛ_fᵀRᵀ`,
+    /// left by merging the rows of `(RΛ_f)ᵀ` into `I_w`,
+    /// `Z_fᵀV_f⁻¹Z_f = Rᵀ(I + RΛ_fΛ_fᵀRᵀ)⁻¹R = YᵀY` with `Y = R̃⁻ᵀR`, and `T_f =
+    /// Yᵀ·R̃⁻ᵀ[R_y,X̃ R_y·ev]`: rotations, triangular solves and sums of
+    /// products, with no subtraction of Gram terms (Golub & Van Loan 2013
+    /// §5.1–5.3). The residual column is contracted with `ev` first. `yz`
+    /// (`w × (w + m)`) is scratch. `false` on a non-positive pivot of `R̃`.
+    #[allow(clippy::too_many_arguments)] // `reduce_level`'s inputs and the outputs
+    pub(crate) fn family_inputs(
+        &mut self,
+        f: usize,
+        q: usize,
+        prim_lam: &[f64],
+        th_p: f64,
+        th_n: f64,
+        ev: &[f64],
+        yz: &mut [f64],
+        s: &mut [f64],
+        t: &mut [f64],
+    ) -> bool {
+        let (w, m) = (self.w, self.m);
+        let (p, d) = (m - 1, w + m);
+        let lvl = self.level_len();
+        let lam = |k: usize, c: usize| if q == 1 { th_p } else { prim_lam[k * q + c] };
+        let rz = &self.rz[f * lvl..(f + 1) * lvl];
+        // A = R·Λ_f (w × w at stride w), as `reduce_level` forms its rows.
+        for r in 0..w {
+            let rr = &rz[row_start(r, d)..row_start(r + 1, d)];
+            for c in 0..w {
+                yz[r * w + c] = if c < q {
+                    (r.max(c)..q).map(|k| rr[k - r] * lam(k, c)).sum()
+                } else if c >= r {
+                    rr[c - r] * th_n
+                } else {
+                    0.0
+                };
+            }
+        }
+        // R̃, packed with width w, from the columns of A merged into I_w.
+        let tri = &mut self.s[..row_start(w, w)];
+        tri.fill(0.0);
+        for j in 0..w {
+            tri[row_start(j, w)] = 1.0;
+        }
+        for i in 0..w {
+            let row = &mut self.row[..w];
+            for (k, v) in row.iter_mut().enumerate() {
+                *v = yz[k * w + i];
+            }
+            merge_row(tri, w, w, row);
+        }
+        // [Y | Z] = R̃⁻ᵀ[R | R_y,X̃ R_y·ev] by forward substitution on R̃ᵀ.
+        for i in 0..w {
+            let rr = &rz[row_start(i, d)..row_start(i + 1, d)];
+            let o = i * d;
+            for c in 0..w {
+                yz[o + c] = if c >= i { rr[c - i] } else { 0.0 };
+            }
+            yz[o + w..o + w + p].copy_from_slice(&rr[w - i..w - i + p]);
+            yz[o + w + p] = (0..m).map(|j| rr[w - i + j] * ev[j]).sum();
+            for k in 0..i {
+                let rki = tri[row_start(k, w) + i - k];
+                for c in 0..d {
+                    yz[o + c] -= rki * yz[k * d + c];
+                }
+            }
+            let rii = tri[row_start(i, w)];
+            if !(rii.is_finite() && rii > 0.0) {
+                return false;
+            }
+            for v in &mut yz[o..o + d] {
+                *v /= rii;
+            }
+        }
+        for a in 0..w {
+            for b in 0..w {
+                s[a * w + b] = (0..w).map(|i| yz[i * d + a] * yz[i * d + b]).sum();
+            }
+            for j in 0..m {
+                t[a * m + j] = (0..w).map(|i| yz[i * d + a] * yz[i * d + w + j]).sum();
+            }
+        }
+        true
+    }
 }
 
 /// The profiled deviance at `theta` under `fit.criterion` on the QR kernel

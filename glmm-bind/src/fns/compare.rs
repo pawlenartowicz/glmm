@@ -4,7 +4,7 @@ use glmm::orchestrate;
 use crate::error::BindError;
 use crate::fns::{check_response, check_rows, Rows};
 use crate::inputs::Inputs;
-use crate::options::{self, FitArgs};
+use crate::options;
 use crate::port::{spell, Port};
 use crate::records::{comparison_record, fit_record, read_model};
 use crate::value::Value;
@@ -17,11 +17,13 @@ pub(crate) fn compare(inp: &mut Inputs) -> Result<Value, BindError> {
     check_response(&f0)?;
     check_response(&f1)?;
     let (family, link) = options::family_link(inp, &[&f0, &f1])?;
-    let nagq = options::nagq(inp)?;
+    let mut args = options::fit_options(inp, family, link, &[&f0, &f1])?;
+    // The ports hand both fits back as fits of their own, with no `condvar`
+    // argument, so they carry the conditional variances a port fit has by
+    // default.
+    args.options.condvar = true;
     let nsim = options::opt_nsim(inp)?;
     let seed = options::opt_seed(inp)?;
-    let weight_power = inp.opt_weight_power("weight_power")?;
-    let se_type = inp.opt_se_type("se_type")?;
     let numeric = inp.numeric("numeric")?;
     let factors = inp.factors("factors")?;
     let weights = inp.opt_vec("weights")?;
@@ -33,29 +35,26 @@ pub(crate) fn compare(inp: &mut Inputs) -> Result<Value, BindError> {
         &f1,
         numeric,
         factors,
-        family,
-        link,
-        nagq,
+        orchestrate::family_from_str(family, link)?,
+        args.options.clone(),
         weights,
         offset,
         nsim,
         seed,
-        weight_power,
-        se_type,
     )
     .map_err(|e| rows.error(e))?;
-    let args = FitArgs {
-        family,
-        link,
-        nagq,
-        dispersion: None,
-        warm_start: None,
-        weight_power: None,
-        notes: Vec::new(),
-    };
-    let rec = comparison_record(&r.comparison, [r.fit0.rss, r.fit1.rss], r.nsim, r.seed)?
-        .with("fit0", fit_record(r.fit0, &args, inp.port(), rows.base()))
-        .with("fit1", fit_record(r.fit1, &args, inp.port(), rows.base()));
+    // Each side's record echoes no weight power: `compare` resolves one for
+    // both fits, and a side raises no `weight_power` note of its own.
+    args.options.weight_power = None;
+    let rec = comparison_record(
+        &r.comparison,
+        [r.fit0.rss, r.fit1.rss],
+        r.nsim,
+        r.seed,
+        family == "gaussian",
+    )?
+    .with("fit0", fit_record(r.fit0, &args, inp.port(), rows.base()))
+    .with("fit1", fit_record(r.fit1, &args, inp.port(), rows.base()));
     Ok(Value::Record(rec))
 }
 
@@ -123,5 +122,6 @@ pub(crate) fn compare_fits(inp: &mut Inputs) -> Result<Value, BindError> {
         [a.rss, b.rss],
         opts.nsim,
         opts.seed,
+        false,
     )?))
 }
